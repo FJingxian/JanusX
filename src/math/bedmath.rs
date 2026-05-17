@@ -70,6 +70,45 @@ pub(crate) fn packed_byte_lut() -> &'static PackedByteLut {
     })
 }
 
+#[inline]
+pub(crate) fn packed_row_missing_count(row: &[u8], n_samples: usize) -> usize {
+    let byte_lut = packed_byte_lut();
+    let full_bytes = n_samples / 4;
+    let rem = n_samples % 4;
+    let mut non_missing = 0usize;
+    for &b in row.iter().take(full_bytes) {
+        non_missing += byte_lut.nonmiss[b as usize] as usize;
+    }
+    if rem > 0 {
+        let codes = &byte_lut.code4[row[full_bytes] as usize];
+        for &code in codes.iter().take(rem) {
+            if code != 0b01 {
+                non_missing += 1;
+            }
+        }
+    }
+    n_samples.saturating_sub(non_missing)
+}
+
+#[inline]
+pub(crate) fn packed_row_missing_count_selected(
+    row: &[u8],
+    n_samples: usize,
+    sample_idx: &[usize],
+) -> usize {
+    if is_identity_indices(sample_idx, n_samples) {
+        return packed_row_missing_count(row, n_samples);
+    }
+    let mut missing = 0usize;
+    for &sid in sample_idx.iter() {
+        let code = (row[sid >> 2] >> ((sid & 3) * 2)) & 0b11;
+        if code == 0b01 {
+            missing += 1;
+        }
+    }
+    missing
+}
+
 pub(crate) struct PackedPairLut {
     pub(crate) dot_obs0: [u8; 65536],
     pub(crate) obs_ct: [u8; 65536],

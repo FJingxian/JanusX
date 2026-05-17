@@ -22,6 +22,7 @@ use std::sync::OnceLock;
 use crate::bitwise::and_popcount;
 use crate::gfcore as core;
 use crate::gfcore::{BedSnpIter, HmpSnpIter, TxtSnpIter, VcfSnpIter};
+use crate::linalg::{chi2_stat_df1_from_sf, format_chisq_value};
 use crate::vcfout::VcfOut;
 
 // -------- Py-exposed SiteInfo (wrapper) --------
@@ -119,6 +120,7 @@ impl GwasAssocTsvWriter {
         &mut self,
         sites: Vec<SiteInfo>,
         maf: PyReadonlyArray1<'_, f32>,
+        miss: PyReadonlyArray1<'_, f32>,
         results: PyReadonlyArray2<'_, f64>,
     ) -> PyResult<usize> {
         if sites.is_empty() {
@@ -134,6 +136,14 @@ impl GwasAssocTsvWriter {
             return Err(PyValueError::new_err(format!(
                 "maf length mismatch: maf={}, sites={}",
                 maf_arr.len(),
+                sites.len()
+            )));
+        }
+        let miss_arr = miss.as_slice()?;
+        if miss_arr.len() != sites.len() {
+            return Err(PyValueError::new_err(format!(
+                "miss length mismatch: miss={}, sites={}",
+                miss_arr.len(),
                 sites.len()
             )));
         }
@@ -162,11 +172,11 @@ impl GwasAssocTsvWriter {
                 self.with_plrt = Some(has_plrt);
                 if has_plrt {
                     writer
-                        .write_all(b"chrom\tpos\tallele0\tallele1\tmaf\tbeta\tse\tpwald\tplrt\n")
+                        .write_all(b"chrom\tpos\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n")
                         .map_err(|e| PyIOError::new_err(e.to_string()))?;
                 } else {
                     writer
-                        .write_all(b"chrom\tpos\tallele0\tallele1\tmaf\tbeta\tse\tpwald\n")
+                        .write_all(b"chrom\tpos\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\n")
                         .map_err(|e| PyIOError::new_err(e.to_string()))?;
                 }
             }
@@ -183,17 +193,30 @@ impl GwasAssocTsvWriter {
             let s = &sites[i];
             let (a0, a1) =
                 transform_alleles_by_model_local(&s.ref_allele, &s.alt_allele, &self.model_key);
+            let beta = res[[i, 0]];
+            let se = res[[i, 1]];
+            let chisq = if has_plrt {
+                chi2_stat_df1_from_sf(res[[i, 3]])
+            } else if beta.is_finite() && se.is_finite() && se > 0.0 {
+                let z = beta / se;
+                z * z
+            } else {
+                f64::NAN
+            };
+            let chisq_txt = format_chisq_value(chisq);
             if has_plrt {
                 writeln!(
                     writer,
-                    "{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4e}\t{:.4e}",
+                    "{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\t{:.4e}",
                     s.chrom,
                     s.pos,
                     a0,
                     a1,
                     maf_arr[i],
-                    res[[i, 0]],
-                    res[[i, 1]],
+                    miss_arr[i].round() as i64,
+                    beta,
+                    se,
+                    chisq_txt,
                     res[[i, 2]],
                     res[[i, 3]]
                 )
@@ -201,14 +224,16 @@ impl GwasAssocTsvWriter {
             } else {
                 writeln!(
                     writer,
-                    "{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4e}",
+                    "{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}",
                     s.chrom,
                     s.pos,
                     a0,
                     a1,
                     maf_arr[i],
-                    res[[i, 0]],
-                    res[[i, 1]],
+                    miss_arr[i].round() as i64,
+                    beta,
+                    se,
+                    chisq_txt,
                     res[[i, 2]],
                 )
                 .map_err(|e| PyIOError::new_err(e.to_string()))?;
@@ -2854,10 +2879,11 @@ impl BedChunkReader {
     /// Return chunk with model-coding + row-centering prepared in Rust.
     ///
     /// Output tuple:
-    ///   (geno_centered, sites, maf)
+    ///   (geno_centered, sites, maf, miss)
     /// where `maf` is:
     ///   - additive: mean(additive dosage)/2
     ///   - dom/rec/het: mean(coded value)
+    /// and `miss` is the per-site missing genotype count on the selected samples.
     #[pyo3(signature = (chunk_size, coding=None, snps_only=false))]
     fn next_chunk_prepared<'py>(
         &mut self,
@@ -2869,6 +2895,7 @@ impl BedChunkReader {
         Option<(
             Bound<'py, PyArray2<f32>>,
             Vec<SiteInfo>,
+            Bound<'py, PyArray1<f32>>,
             Bound<'py, PyArray1<f32>>,
         )>,
     > {
@@ -2906,6 +2933,7 @@ impl BedChunkReader {
         let mut out: Vec<f32> = Vec::with_capacity(chunk_size * n);
         let mut sites: Vec<SiteInfo> = Vec::with_capacity(chunk_size);
         let mut maf: Vec<f32> = Vec::with_capacity(chunk_size);
+        let mut miss: Vec<f32> = Vec::with_capacity(chunk_size);
         let mut m = 0usize;
         let maf_thr = self.maf;
         let miss_thr = self.miss;
@@ -2914,7 +2942,7 @@ impl BedChunkReader {
         let het_thr = self.het_threshold;
 
         let prepare_one = |mut row_sub: Vec<f32>, mut site: core::SiteInfo| {
-            let keep = core::process_snp_row(
+            let stats = core::process_snp_row_with_stats(
                 &mut row_sub,
                 &mut site.ref_allele,
                 &mut site.alt_allele,
@@ -2924,9 +2952,9 @@ impl BedChunkReader {
                 apply_het_filter,
                 het_thr,
             );
-            if !keep {
+            let Some(stats) = stats else {
                 return None;
-            }
+            };
             if snps_only
                 && (!_is_simple_snp_allele(&site.ref_allele)
                     || !_is_simple_snp_allele(&site.alt_allele))
@@ -2944,12 +2972,13 @@ impl BedChunkReader {
             for v in row_sub.iter_mut() {
                 *v -= mean;
             }
+            let coded_mean = (sum / n as f64) as f32;
             let maf_v = if additive_mode {
-                (sum / n as f64 / 2.0) as f32
+                stats.maf
             } else {
-                (sum / n as f64) as f32
+                coded_mean
             };
-            Some((row_sub, site.into(), maf_v))
+            Some((row_sub, site.into(), maf_v, stats.missing_count as f32))
         };
 
         if let Some(ref snp_indices) = self.snp_indices {
@@ -2964,7 +2993,7 @@ impl BedChunkReader {
                 let batch = &snp_indices[self.snp_pos..end];
                 self.snp_pos = end;
 
-                let decoded: Vec<Option<(Vec<f32>, SiteInfo, f32)>> = if can_parallel_random {
+                let decoded: Vec<Option<(Vec<f32>, SiteInfo, f32, f32)>> = if can_parallel_random {
                     let it = &self.it;
                     let sample_indices = &self.sample_indices;
                     batch
@@ -2979,7 +3008,7 @@ impl BedChunkReader {
                         })
                         .collect()
                 } else {
-                    let mut tmp: Vec<Option<(Vec<f32>, SiteInfo, f32)>> =
+                    let mut tmp: Vec<Option<(Vec<f32>, SiteInfo, f32, f32)>> =
                         Vec::with_capacity(batch.len());
                     for &snp_idx in batch.iter() {
                         let maybe = if full_samples {
@@ -2994,10 +3023,11 @@ impl BedChunkReader {
                 };
 
                 for item in decoded.into_iter().flatten() {
-                    let (row_sub, site, maf_v) = item;
+                    let (row_sub, site, maf_v, miss_v) = item;
                     out.extend_from_slice(&row_sub);
                     sites.push(site);
                     maf.push(maf_v);
+                    miss.push(miss_v);
                     m += 1;
                 }
             }
@@ -3009,7 +3039,7 @@ impl BedChunkReader {
                 self.it.set_cursor(end);
                 let it = &self.it;
                 let sample_indices = &self.sample_indices;
-                let decoded: Vec<Option<(Vec<f32>, SiteInfo, f32)>> = (start..end)
+                let decoded: Vec<Option<(Vec<f32>, SiteInfo, f32, f32)>> = (start..end)
                     .into_par_iter()
                     .map(|snp_idx| {
                         let maybe = if full_samples {
@@ -3021,10 +3051,11 @@ impl BedChunkReader {
                     })
                     .collect();
                 for item in decoded.into_iter().flatten() {
-                    let (row_sub, site, maf_v) = item;
+                    let (row_sub, site, maf_v, miss_v) = item;
                     out.extend_from_slice(&row_sub);
                     sites.push(site);
                     maf.push(maf_v);
+                    miss.push(miss_v);
                     m += 1;
                 }
             }
@@ -3047,7 +3078,7 @@ impl BedChunkReader {
                 if raw_rows.is_empty() {
                     break;
                 }
-                let decoded: Vec<Option<(Vec<f32>, SiteInfo, f32)>> = if raw_rows.len() >= 64 {
+                let decoded: Vec<Option<(Vec<f32>, SiteInfo, f32, f32)>> = if raw_rows.len() >= 64 {
                     raw_rows
                         .into_par_iter()
                         .map(|(row_sub, site)| prepare_one(row_sub, site))
@@ -3059,10 +3090,11 @@ impl BedChunkReader {
                         .collect()
                 };
                 for item in decoded.into_iter().flatten() {
-                    let (row_sub, site, maf_v) = item;
+                    let (row_sub, site, maf_v, miss_v) = item;
                     out.extend_from_slice(&row_sub);
                     sites.push(site);
                     maf.push(maf_v);
+                    miss.push(miss_v);
                     m += 1;
                 }
             }
@@ -3074,10 +3106,11 @@ impl BedChunkReader {
                     self.it.next_snp_selected_raw(&self.sample_indices)
                 };
                 if let Some((row_sub, site)) = maybe {
-                    if let Some((row_sub2, site2, maf_v)) = prepare_one(row_sub, site) {
+                    if let Some((row_sub2, site2, maf_v, miss_v)) = prepare_one(row_sub, site) {
                         out.extend_from_slice(&row_sub2);
                         sites.push(site2);
                         maf.push(maf_v);
+                        miss.push(miss_v);
                         m += 1;
                     }
                 } else {
@@ -3096,7 +3129,9 @@ impl BedChunkReader {
         let py_mat = PyArray2::from_owned_array(py, mat).into_bound();
         #[allow(deprecated)]
         let maf_arr = PyArray1::from_owned_array(py, Array1::from_vec(maf)).into_bound();
-        Ok(Some((py_mat, sites, maf_arr)))
+        #[allow(deprecated)]
+        let miss_arr = PyArray1::from_owned_array(py, Array1::from_vec(miss)).into_bound();
+        Ok(Some((py_mat, sites, maf_arr, miss_arr)))
     }
 }
 
@@ -3788,6 +3823,118 @@ pub fn load_bed_2bit_packed<'py>(
     #[allow(deprecated)]
     let denom_arr = PyArray1::from_owned_array(py, Array1::from_vec(std_denom)).into_bound();
     Ok((packed_arr, miss_arr, maf_arr, denom_arr, n_samples))
+}
+
+pub(crate) struct PackedBedSubsetOwned {
+    pub packed: Vec<u8>,
+    pub maf: Vec<f32>,
+    pub row_flip: Vec<bool>,
+    pub n_samples: usize,
+    pub bytes_per_snp: usize,
+}
+
+pub(crate) fn load_bed_2bit_packed_subset_owned(
+    prefix: &str,
+    site_keep: &[bool],
+) -> Result<PackedBedSubsetOwned, String> {
+    let mut bed_prefix = prefix.to_string();
+    let lower = bed_prefix.to_ascii_lowercase();
+    if lower.ends_with(".bed") || lower.ends_with(".bim") || lower.ends_with(".fam") {
+        bed_prefix.truncate(bed_prefix.len() - 4);
+    }
+
+    let samples = core::read_fam(&bed_prefix).map_err(|e| e.to_string())?;
+    let n_samples = samples.len();
+    if n_samples == 0 {
+        return Err("no samples found in PLINK input".to_string());
+    }
+    emit_gfreader_rss_debug(
+        "load_bed_2bit_packed_subset_owned/read_fam",
+        &format!("prefix={bed_prefix} n_samples={n_samples}"),
+    );
+
+    let bed_path = format!("{bed_prefix}.bed");
+    let bed_file =
+        File::open(&bed_path).map_err(|e| format!("failed to open {bed_path}: {e}"))?;
+    let mmap =
+        unsafe { Mmap::map(&bed_file) }.map_err(|e| format!("failed to mmap {bed_path}: {e}"))?;
+    if mmap.len() < 3 {
+        return Err("BED too small".to_string());
+    }
+    if mmap[0] != 0x6C || mmap[1] != 0x1B || mmap[2] != 0x01 {
+        return Err("Only SNP-major BED supported".to_string());
+    }
+
+    let bytes_per_snp = (n_samples + 3) / 4;
+    let data_len = mmap.len() - 3;
+    if bytes_per_snp == 0 || data_len % bytes_per_snp != 0 {
+        return Err(format!(
+            "invalid BED payload length: data_len={data_len}, bytes_per_snp={bytes_per_snp}"
+        ));
+    }
+    let n_snps_total = data_len / bytes_per_snp;
+    if site_keep.len() != n_snps_total {
+        return Err(format!(
+            "site_keep length mismatch: got {}, expected {n_snps_total}",
+            site_keep.len()
+        ));
+    }
+
+    let keep_idx: Vec<usize> = site_keep
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &keep)| if keep { Some(i) } else { None })
+        .collect();
+    if keep_idx.is_empty() {
+        return Err("No SNPs remained after applying site_keep mask.".to_string());
+    }
+
+    let packed_src = &mmap[3..];
+    emit_gfreader_rss_debug(
+        "load_bed_2bit_packed_subset_owned/mmap_ready",
+        &format!(
+            "prefix={bed_prefix} n_samples={n_samples} n_snps={n_snps_total} kept_n={} bytes_per_snp={bytes_per_snp} payload={}",
+            keep_idx.len(),
+            format_debug_bytes_local(packed_src.len() as u64),
+        ),
+    );
+
+    let kept_n = keep_idx.len();
+    let mut packed_keep = vec![0u8; kept_n * bytes_per_snp];
+    let mut maf_keep = vec![0.0_f32; kept_n];
+    let mut row_flip_keep = vec![false; kept_n];
+
+    for (dst_row, &src_row) in keep_idx.iter().enumerate() {
+        let src_off = src_row * bytes_per_snp;
+        let dst_off = dst_row * bytes_per_snp;
+        let row = &packed_src[src_off..src_off + bytes_per_snp];
+        packed_keep[dst_off..dst_off + bytes_per_snp].copy_from_slice(row);
+
+        let (missing, het, hom_alt) = count_packed_row_counts(row, n_samples);
+        let non_missing = n_samples.saturating_sub(missing);
+        let alt_sum = het.saturating_add(hom_alt.saturating_mul(2));
+        let (_, maf_v, _) = packed_row_stats_from_counts(n_samples, non_missing, alt_sum);
+        maf_keep[dst_row] = maf_v.clamp(0.0, 0.5);
+        row_flip_keep[dst_row] = non_missing > 0 && alt_sum > non_missing;
+    }
+
+    emit_gfreader_rss_debug(
+        "load_bed_2bit_packed_subset_owned/subset_copy_done",
+        &format!(
+            "kept_n={kept_n} packed_bytes={} maf_bytes={} row_flip_bytes={}",
+            format_debug_bytes_local(packed_keep.len() as u64),
+            format_debug_bytes_local((maf_keep.len() * std::mem::size_of::<f32>()) as u64),
+            format_debug_bytes_local((row_flip_keep.len() * std::mem::size_of::<bool>()) as u64),
+        ),
+    );
+
+    Ok(PackedBedSubsetOwned {
+        packed: packed_keep,
+        maf: maf_keep,
+        row_flip: row_flip_keep,
+        n_samples,
+        bytes_per_snp,
+    })
 }
 
 #[pyfunction]

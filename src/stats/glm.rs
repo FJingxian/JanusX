@@ -16,6 +16,7 @@ use crate::bedmath::{decode_plink_bed_hardcall, is_identity_indices, packed_byte
 use crate::gfcore;
 use crate::gfcore::BedSnpIter;
 use crate::gfreader::build_sample_selection;
+use crate::linalg::format_chisq_value;
 use crate::stats_common::{get_cached_pool, parse_index_vec_i64};
 
 #[inline]
@@ -464,7 +465,7 @@ pub fn lm_stream_bed_to_tsv(
                 .map_err(|e| format!("create {out_tsv_path_for_writer}: {e}"))?;
             let mut writer = BufWriter::with_capacity(64 * 1024 * 1024, out_file);
             writer
-                .write_all(b"chrom\tpos\tallele0\tallele1\tmaf\tbeta\tse\tpwald\tplrt\n")
+                .write_all(b"chrom\tpos\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n")
                 .map_err(|e| format!("write header {out_tsv_path_for_writer}: {e}"))?;
             for block in rx {
                 if !block.is_empty() {
@@ -482,6 +483,7 @@ pub fn lm_stream_bed_to_tsv(
         let mut chunk_rows: Vec<f32> = Vec::with_capacity(chunk_size * n);
         let mut chunk_sites: Vec<gfcore::SiteInfo> = Vec::with_capacity(chunk_size);
         let mut chunk_maf: Vec<f32> = Vec::with_capacity(chunk_size);
+        let mut chunk_miss: Vec<f32> = Vec::with_capacity(chunk_size);
         let mut kept_total: usize = 0;
         let mut seen_total: usize = 0;
         let mut scan_idx: usize = 0;
@@ -490,8 +492,8 @@ pub fn lm_stream_bed_to_tsv(
 
         let prepare_row = |mut row_sub: Vec<f32>,
                            mut site: gfcore::SiteInfo|
-         -> Option<(Vec<f32>, gfcore::SiteInfo, f32)> {
-            let keep = gfcore::process_snp_row(
+         -> Option<(Vec<f32>, gfcore::SiteInfo, f32, f32)> {
+            let stats = gfcore::process_snp_row_with_stats(
                 &mut row_sub,
                 &mut site.ref_allele,
                 &mut site.alt_allele,
@@ -501,9 +503,9 @@ pub fn lm_stream_bed_to_tsv(
                 model.as_str() != "add",
                 het_threshold,
             );
-            if !keep {
+            let Some(stats) = stats else {
                 return None;
-            }
+            };
             if snps_only
                 && (!is_simple_snp_allele(&site.ref_allele)
                     || !is_simple_snp_allele(&site.alt_allele))
@@ -524,17 +526,18 @@ pub fn lm_stream_bed_to_tsv(
                 *v -= mean_model;
             }
             let maf_val = if model.as_str() == "add" {
-                (maf_sum / n as f64 / 2.0) as f32
+                stats.maf
             } else {
                 (maf_sum / n as f64) as f32
             };
-            Some((row_sub, site, maf_val))
+            Some((row_sub, site, maf_val, stats.missing_count as f32))
         };
 
         loop {
             chunk_rows.clear();
             chunk_sites.clear();
             chunk_maf.clear();
+            chunk_miss.clear();
             if scan_idx >= total_scan {
                 break;
             }
@@ -557,8 +560,8 @@ pub fn lm_stream_bed_to_tsv(
                 }
             }
 
-            let decoded: Vec<(Vec<f32>, gfcore::SiteInfo, f32)> = if windowed_mode {
-                let mut tmp: Vec<(Vec<f32>, gfcore::SiteInfo, f32)> = Vec::with_capacity(batch_len);
+            let decoded: Vec<(Vec<f32>, gfcore::SiteInfo, f32, f32)> = if windowed_mode {
+                let mut tmp: Vec<(Vec<f32>, gfcore::SiteInfo, f32, f32)> = Vec::with_capacity(batch_len);
                 for _ in 0..batch_len {
                     let maybe = if full_samples {
                         it.next_snp_raw()
@@ -590,7 +593,8 @@ pub fn lm_stream_bed_to_tsv(
                         .collect()
                 })
             } else {
-                let mut tmp: Vec<(Vec<f32>, gfcore::SiteInfo, f32)> = Vec::with_capacity(batch_len);
+                let mut tmp: Vec<(Vec<f32>, gfcore::SiteInfo, f32, f32)> =
+                    Vec::with_capacity(batch_len);
                 let end_idx = (scan_idx + batch_len).min(total_scan);
                 for snp_idx in scan_idx..end_idx {
                     let maybe = if full_samples {
@@ -608,20 +612,21 @@ pub fn lm_stream_bed_to_tsv(
             };
             scan_idx = scan_idx.saturating_add(batch_len);
 
-            for (row_sub, site, maf_val) in decoded.into_iter() {
+            for (row_sub, site, maf_val, miss_val) in decoded.into_iter() {
                 chunk_rows.extend_from_slice(&row_sub);
                 chunk_sites.push(site);
                 chunk_maf.push(maf_val);
+                chunk_miss.push(miss_val);
             }
 
             let m = chunk_sites.len();
             if m == 0 {
                 continue;
             }
-            let mut out = vec![0.0_f64; m * 4];
+            let mut out = vec![0.0_f64; m * 5];
 
             let mut runner = || {
-                out.par_chunks_mut(4).enumerate().for_each_init(
+                out.par_chunks_mut(5).enumerate().for_each_init(
                     || GlmScratch::new(q0),
                     |scr, (idx, row_out)| {
                         let grow = &chunk_rows[idx * n..(idx + 1) * n];
@@ -671,11 +676,13 @@ pub fn lm_stream_bed_to_tsv(
                         }
                         let t = beta_snp / se_snp;
                         let pwald = student_t_p_two_sided(t, df);
+                        let stat = (n as f64) * (1.0 + (t * t) / (df as f64)).ln();
                         let plrt = lm_plrt_from_t2(t * t, n, df);
                         row_out[0] = beta_snp;
                         row_out[1] = se_snp;
-                        row_out[2] = pwald;
-                        row_out[3] = plrt;
+                        row_out[2] = stat;
+                        row_out[3] = pwald;
+                        row_out[4] = plrt;
                     },
                 );
             };
@@ -691,11 +698,22 @@ pub fn lm_stream_bed_to_tsv(
                 let site = &chunk_sites[i];
                 let (a0, a1) =
                     transform_alleles_by_model(&site.ref_allele, &site.alt_allele, model.as_str());
-                let r = &out[i * 4..(i + 1) * 4];
+                let r = &out[i * 5..(i + 1) * 5];
+                let chisq_txt = format_chisq_value(r[2]);
                 let _ = write!(
                     text,
-                    "{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4e}\t{:.4e}\n",
-                    site.chrom, site.pos, a0, a1, chunk_maf[i], r[0], r[1], r[2], r[3]
+                    "{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\t{:.4e}\n",
+                    site.chrom,
+                    site.pos,
+                    a0,
+                    a1,
+                    chunk_maf[i],
+                    chunk_miss[i].round() as i64,
+                    r[0],
+                    r[1],
+                    chisq_txt,
+                    r[3],
+                    r[4]
                 );
             }
             let payload = text.into_bytes();
@@ -1244,6 +1262,7 @@ pub fn glmf32_packed_assoc<'py>(
     n_samples,
     row_flip,
     row_maf,
+    row_missing,
     chrom,
     pos,
     allele0,
@@ -1265,6 +1284,7 @@ pub fn glmf32_packed_assoc_to_tsv(
     n_samples: usize,
     row_flip: PyReadonlyArray1<'_, bool>,
     row_maf: PyReadonlyArray1<'_, f32>,
+    row_missing: PyReadonlyArray1<'_, f32>,
     chrom: Vec<String>,
     pos: Vec<i64>,
     allele0: Vec<String>,
@@ -1300,6 +1320,7 @@ pub fn glmf32_packed_assoc_to_tsv(
 
     let row_flip = row_flip.as_slice()?;
     let row_maf = row_maf.as_slice()?;
+    let row_missing = row_missing.as_slice()?;
     let row_idx: Option<Vec<usize>> = if let Some(ridx) = row_indices {
         Some(parse_index_vec_i64(
             ridx.as_slice()?,
@@ -1321,6 +1342,12 @@ pub fn glmf32_packed_assoc_to_tsv(
         return Err(PyRuntimeError::new_err(format!(
             "row_maf length mismatch: got {}, expected {m}",
             row_maf.len()
+        )));
+    }
+    if row_missing.len() != m {
+        return Err(PyRuntimeError::new_err(format!(
+            "row_missing length mismatch: got {}, expected {m}",
+            row_missing.len()
         )));
     }
     if chrom.len() != m || pos.len() != m || allele0.len() != m || allele1.len() != m {
@@ -1418,7 +1445,7 @@ pub fn glmf32_packed_assoc_to_tsv(
                 .map_err(|e| format!("create {out_path_for_writer}: {e}"))?;
             let mut writer = BufWriter::with_capacity(64 * 1024 * 1024, out_file);
             writer
-                .write_all(b"chrom\tpos\tallele0\tallele1\tmaf\tbeta\tse\tpwald\tplrt\n")
+                .write_all(b"chrom\tpos\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n")
                 .map_err(|e| format!("write header {out_path_for_writer}: {e}"))?;
             for block in rx {
                 if !block.is_empty() {
@@ -1433,7 +1460,8 @@ pub fn glmf32_packed_assoc_to_tsv(
             Ok(())
         });
 
-        let mut out_block = vec![0.0_f64; step * 4];
+        let mut out_block = vec![0.0_f64; step * 5];
+        let mut miss_block = vec![0usize; step];
         let mut text_buf = String::with_capacity(step * 96);
         let code4_lut = &packed_byte_lut().code4;
 
@@ -1441,10 +1469,15 @@ pub fn glmf32_packed_assoc_to_tsv(
             let mut i_marker = 0usize;
             while i_marker < m {
                 let cnt = std::cmp::min(step, m - i_marker);
-                let block = &mut out_block[..cnt * 4];
-                block.par_chunks_mut(4).enumerate().for_each_init(
+                let block = &mut out_block[..cnt * 5];
+                let miss_sub = &mut miss_block[..cnt];
+                block
+                    .par_chunks_mut(5)
+                    .zip(miss_sub.par_iter_mut())
+                    .enumerate()
+                    .for_each_init(
                     || GlmScratch::new(q0),
-                    |scr, (l, row_out)| {
+                    |scr, (l, (row_out, miss_out))| {
                         let idx = i_marker + l;
                         let src_row = row_idx.as_ref().map(|v| v[idx]).unwrap_or(idx);
                         scr.reset_xs();
@@ -1456,6 +1489,7 @@ pub fn glmf32_packed_assoc_to_tsv(
 
                         let mut sy = 0.0_f64;
                         let mut ss = 0.0_f64;
+                        let mut missing_ct = 0usize;
                         if sample_idx_is_identity {
                             let full_bytes = n_samples / 4;
                             let rem = n_samples % 4;
@@ -1463,6 +1497,9 @@ pub fn glmf32_packed_assoc_to_tsv(
                             for &b in row.iter().take(full_bytes) {
                                 let codes = &code4_lut[b as usize];
                                 for &code in codes.iter().take(4) {
+                                    if code == 0b01 {
+                                        missing_ct += 1;
+                                    }
                                     let gv = decode_plink_dosage_with_mean(code, mean_g, flip);
                                     sy += gv * y[k];
                                     ss += gv * gv;
@@ -1476,6 +1513,9 @@ pub fn glmf32_packed_assoc_to_tsv(
                             if rem > 0 {
                                 let codes = &code4_lut[row[full_bytes] as usize];
                                 for &code in codes.iter().take(rem) {
+                                    if code == 0b01 {
+                                        missing_ct += 1;
+                                    }
                                     let gv = decode_plink_dosage_with_mean(code, mean_g, flip);
                                     sy += gv * y[k];
                                     ss += gv * gv;
@@ -1490,6 +1530,9 @@ pub fn glmf32_packed_assoc_to_tsv(
                             for k in 0..n {
                                 let b = row[sample_byte_idx[k]];
                                 let code = code4_lut[b as usize][sample_lane_idx[k]];
+                                if code == 0b01 {
+                                    missing_ct += 1;
+                                }
                                 let gv = decode_plink_dosage_with_mean(code, mean_g, flip);
 
                                 sy += gv * y[k];
@@ -1530,17 +1573,21 @@ pub fn glmf32_packed_assoc_to_tsv(
                             || !se_snp.is_finite()
                             || se_snp <= 0.0
                         {
+                            *miss_out = missing_ct;
                             row_out.fill(f64::NAN);
                             return;
                         }
 
                         let t = beta_snp / se_snp;
                         let pwald = student_t_p_two_sided(t, df);
+                        let stat = (n as f64) * (1.0 + (t * t) / (df as f64)).ln();
                         let plrt = lm_plrt_from_t2(t * t, n, df);
                         row_out[0] = beta_snp;
                         row_out[1] = se_snp;
-                        row_out[2] = pwald;
-                        row_out[3] = plrt;
+                        row_out[2] = stat;
+                        row_out[3] = pwald;
+                        row_out[4] = plrt;
+                        *miss_out = missing_ct;
                     },
                 );
 
@@ -1550,19 +1597,22 @@ pub fn glmf32_packed_assoc_to_tsv(
                 }
                 for l in 0..cnt {
                     let idx = i_marker + l;
-                    let base = l * 4;
+                    let base = l * 5;
+                    let chisq_txt = format_chisq_value(block[base + 2]);
                     let _ = write!(
-                        text_buf,
-                        "{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4e}\t{:.4e}\n",
-                        chrom[idx],
-                        pos[idx],
-                        allele0[idx],
-                        allele1[idx],
-                        row_maf[idx],
-                        block[base],
-                        block[base + 1],
-                        block[base + 2],
+                    text_buf,
+                    "{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\t{:.4e}\n",
+                    chrom[idx],
+                    pos[idx],
+                    allele0[idx],
+                    allele1[idx],
+                    row_maf[idx],
+                    miss_block[l],
+                    block[base],
+                    block[base + 1],
+                    chisq_txt,
                         block[base + 3],
+                        block[base + 4],
                     );
                 }
                 let payload = std::mem::take(&mut text_buf).into_bytes();

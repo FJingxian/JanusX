@@ -106,7 +106,13 @@ pub fn open_text_maybe_gz(path: &Path) -> Result<Box<dyn BufRead + Send + Sync>,
 // ---------------------------
 // SNP row processing
 // ---------------------------
-pub fn process_snp_row(
+#[derive(Clone, Copy, Debug)]
+pub struct ProcessedSnpRowStats {
+    pub missing_count: u32,
+    pub maf: f32,
+}
+
+pub fn process_snp_row_with_stats(
     row: &mut [f32],
     ref_allele: &mut String,
     alt_allele: &mut String,
@@ -115,7 +121,7 @@ pub fn process_snp_row(
     fill_missing: bool,
     apply_het_filter: bool,
     het_threshold: f32,
-) -> bool {
+) -> Option<ProcessedSnpRowStats> {
     let mut alt_sum: f64 = 0.0;
     let mut non_missing: i64 = 0;
     let mut het_count: i64 = 0;
@@ -132,22 +138,26 @@ pub fn process_snp_row(
 
     let n_samples = row.len() as f64;
     if n_samples == 0.0 {
-        return false;
+        return None;
     }
 
-    let missing_rate = 1.0 - (non_missing as f64 / n_samples);
-    if missing_rate > max_missing_rate as f64 {
-        return false;
+    let missing_rate = (1.0 - (non_missing as f64 / n_samples)) as f32;
+    let missing_count = row.len().saturating_sub(non_missing as usize) as u32;
+    if missing_rate > max_missing_rate {
+        return None;
     }
 
     if non_missing == 0 {
         if maf_threshold > 0.0 {
-            return false;
+            return None;
         } else {
             if fill_missing {
                 row.fill(0.0);
             }
-            return true;
+            return Some(ProcessedSnpRowStats {
+                missing_count,
+                maf: 0.0,
+            });
         }
     }
 
@@ -156,7 +166,7 @@ pub fn process_snp_row(
         let low = het_threshold as f64;
         let high = 1.0 - low;
         if het_rate < low || het_rate > high {
-            return false;
+            return None;
         }
     }
 
@@ -173,9 +183,9 @@ pub fn process_snp_row(
         alt_freq = alt_sum / (2.0 * non_missing as f64);
     }
 
-    let maf = alt_freq.min(1.0 - alt_freq);
-    if maf < maf_threshold as f64 {
-        return false;
+    let maf = alt_freq.min(1.0 - alt_freq) as f32;
+    if maf < maf_threshold {
+        return None;
     }
 
     if fill_missing {
@@ -188,7 +198,33 @@ pub fn process_snp_row(
         }
     }
 
-    true
+    Some(ProcessedSnpRowStats {
+        missing_count,
+        maf,
+    })
+}
+
+pub fn process_snp_row(
+    row: &mut [f32],
+    ref_allele: &mut String,
+    alt_allele: &mut String,
+    maf_threshold: f32,
+    max_missing_rate: f32,
+    fill_missing: bool,
+    apply_het_filter: bool,
+    het_threshold: f32,
+) -> bool {
+    process_snp_row_with_stats(
+        row,
+        ref_allele,
+        alt_allele,
+        maf_threshold,
+        max_missing_rate,
+        fill_missing,
+        apply_het_filter,
+        het_threshold,
+    )
+    .is_some()
 }
 
 fn parse_delimiter_char(delimiter: Option<&str>) -> Result<Option<char>, String> {

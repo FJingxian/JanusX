@@ -87,6 +87,8 @@ mod math_ld;
 mod ml;
 #[path = "math/pcg.rs"]
 mod pcg;
+#[path = "sim/g2p.rs"]
+mod sim_g2p;
 
 use admixture::{
     admx_adam_optimize_f32, admx_adam_update_p, admx_adam_update_p_inplace,
@@ -171,6 +173,7 @@ use score::{
     score_binary_ba_mcc_batch_py, score_binary_ba_py, score_binary_mcc_py, score_cont_corr_py,
     score_cont_mean_diff_corr_batch_py, score_cont_mean_diff_py,
 };
+use sim_g2p::g2p_simulate_py;
 use sim::{sim_trait_accumulate_i8_f32, SimChunkGenerator, SimEngine, SimTraitAccumulator};
 use top::{top_fit_model_py, top_rank_to_target_sample_py, top_rank_to_target_values_py};
 use tree::{
@@ -246,6 +249,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(load_site_info, m)?)?;
     m.add_function(wrap_pyfunction!(gfd_packbits_from_dosage_block, m)?)?;
     m.add_function(wrap_pyfunction!(sim_trait_accumulate_i8_f32, m)?)?;
+    m.add_function(wrap_pyfunction!(g2p_simulate_py, m)?)?;
     m.add_function(wrap_pyfunction!(load_gwas_triplet_fast, m)?)?;
     m.add_function(wrap_pyfunction!(glmf32, m)?)?;
     m.add_function(wrap_pyfunction!(glmf32_full, m)?)?;

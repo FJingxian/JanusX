@@ -747,111 +747,128 @@ pub fn gblup_reml_packed_bed<'py>(
         return Err(PyRuntimeError::new_err("tol must be finite and > 0"));
     }
 
-    let (packed_arr, _miss_arr, maf_arr, _std_arr, n_samples) =
-        crate::gfreader::load_bed_2bit_packed(py, prefix)?;
-    if n_samples == 0 {
-        return Err(PyRuntimeError::new_err("No samples found in BED input."));
-    }
-
-    let packed_ro = packed_arr.readonly();
-    let packed_view = packed_ro.as_array();
-    if packed_view.ndim() != 2 {
-        return Err(PyRuntimeError::new_err(
-            "packed BED payload must be 2D (m, bytes_per_snp).",
-        ));
-    }
-    let m_total = packed_view.shape()[0];
-    if m_total == 0 {
-        return Err(PyRuntimeError::new_err("No SNP rows found in BED input."));
-    }
-    let bytes_per_snp = packed_view.shape()[1];
-    let expected_bps = (n_samples + 3) / 4;
-    if bytes_per_snp != expected_bps {
-        return Err(PyRuntimeError::new_err(format!(
-            "packed second dimension mismatch: got {bytes_per_snp}, expected {expected_bps}"
-        )));
-    }
-    let packed_flat: Cow<[u8]> = match packed_ro.as_slice() {
-        Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(packed_view.iter().copied().collect()),
-    };
-
-    let maf_ro = maf_arr.readonly();
-    let maf_full: Vec<f32> = match maf_ro.as_slice() {
-        Ok(s) => s.to_vec(),
-        Err(_) => maf_ro.as_array().iter().copied().collect(),
-    };
-    if maf_full.len() != m_total {
-        return Err(PyRuntimeError::new_err(format!(
-            "maf length mismatch: got {}, expected {m_total}",
-            maf_full.len()
-        )));
-    }
-
-    let row_flip_full_arr = bed_packed_row_flip_mask(py, packed_arr.readonly(), n_samples)?;
-    let row_flip_full: Vec<bool> = match row_flip_full_arr.readonly().as_slice() {
-        Ok(s) => s.to_vec(),
-        Err(_) => row_flip_full_arr
-            .readonly()
-            .as_array()
-            .iter()
-            .copied()
-            .collect(),
-    };
-    if row_flip_full.len() != m_total {
-        return Err(PyRuntimeError::new_err(format!(
-            "row_flip length mismatch: got {}, expected {m_total}",
-            row_flip_full.len()
-        )));
-    }
-
-    let mut eff_m = m_total;
-    let mut packed_keep: Cow<[u8]> = Cow::Borrowed(packed_flat.as_ref());
-    let mut maf_keep: Cow<[f32]> = Cow::Borrowed(maf_full.as_slice());
-    let mut row_flip_keep: Cow<[bool]> = Cow::Borrowed(row_flip_full.as_slice());
-    if let Some(mask) = site_keep {
-        let mask_vec: Vec<bool> = match mask.as_slice() {
+    let site_keep_vec: Option<Vec<bool>> = if let Some(mask) = site_keep {
+        Some(match mask.as_slice() {
             Ok(s) => s.to_vec(),
             Err(_) => mask.as_array().iter().copied().collect(),
-        };
-        if mask_vec.len() != m_total {
-            return Err(PyRuntimeError::new_err(format!(
-                "site_keep length mismatch: got {}, expected {m_total}",
-                mask_vec.len()
-            )));
+        })
+    } else {
+        None
+    };
+    let subset_requested = site_keep_vec
+        .as_ref()
+        .map(|mask| mask.iter().any(|&keep| !keep))
+        .unwrap_or(false);
+
+    let mut loaded_packed_arr: Option<Bound<'py, PyArray2<u8>>> = None;
+    let mut loaded_maf_arr: Option<Bound<'py, PyArray1<f32>>> = None;
+    let mut loaded_row_flip_arr: Option<Bound<'py, PyArray1<bool>>> = None;
+    let mut subset_packed_keep: Option<Vec<u8>> = None;
+    let mut subset_maf_keep: Option<Vec<f32>> = None;
+    let mut subset_row_flip_keep: Option<Vec<bool>> = None;
+
+    let n_samples: usize;
+    let bytes_per_snp: usize;
+    let eff_m: usize;
+    let reuse_loaded_arrays_for_grm: bool;
+
+    if subset_requested {
+        let subset = py
+            .detach({
+                let prefix = prefix.clone();
+                let mask_vec = site_keep_vec
+                    .clone()
+                    .expect("subset path requires site_keep vector");
+                move || crate::gfreader::load_bed_2bit_packed_subset_owned(&prefix, &mask_vec)
+            })
+            .map_err(map_err_string_to_py)?;
+        if subset.n_samples == 0 {
+            return Err(PyRuntimeError::new_err("No samples found in BED input."));
         }
-        let keep_idx: Vec<usize> = mask_vec
-            .iter()
-            .enumerate()
-            .filter_map(|(i, &k)| if k { Some(i) } else { None })
-            .collect();
-        if keep_idx.is_empty() {
+        n_samples = subset.n_samples;
+        bytes_per_snp = subset.bytes_per_snp;
+        eff_m = subset.maf.len();
+        subset_packed_keep = Some(subset.packed);
+        subset_maf_keep = Some(subset.maf);
+        subset_row_flip_keep = Some(subset.row_flip);
+        reuse_loaded_arrays_for_grm = false;
+    } else {
+        let (packed_arr, _miss_arr, maf_arr, _std_arr, n_samples_loaded) =
+            crate::gfreader::load_bed_2bit_packed(py, prefix)?;
+        if n_samples_loaded == 0 {
+            return Err(PyRuntimeError::new_err("No samples found in BED input."));
+        }
+        n_samples = n_samples_loaded;
+        loaded_packed_arr = Some(packed_arr);
+        loaded_maf_arr = Some(maf_arr);
+
+        let packed_ro = loaded_packed_arr
+            .as_ref()
+            .expect("packed array must exist")
+            .readonly();
+        let packed_view = packed_ro.as_array();
+        if packed_view.ndim() != 2 {
             return Err(PyRuntimeError::new_err(
-                "No SNPs remained after applying site_keep mask.",
+                "packed BED payload must be 2D (m, bytes_per_snp).",
             ));
         }
-        let keep_is_identity = (keep_idx.len() == m_total)
-            && keep_idx
-                .iter()
-                .enumerate()
-                .all(|(dst_row, &src_row)| dst_row == src_row);
-        if !keep_is_identity {
-            eff_m = keep_idx.len();
-            let mut packed_subset = vec![0_u8; eff_m * bytes_per_snp];
-            let mut maf_subset = vec![0.0_f32; eff_m];
-            let mut row_flip_subset = vec![false; eff_m];
-            for (dst_row, &src_row) in keep_idx.iter().enumerate() {
-                let src_off = src_row * bytes_per_snp;
-                let dst_off = dst_row * bytes_per_snp;
-                packed_subset[dst_off..dst_off + bytes_per_snp]
-                    .copy_from_slice(&packed_flat[src_off..src_off + bytes_per_snp]);
-                maf_subset[dst_row] = maf_full[src_row].clamp(0.0, 0.5);
-                row_flip_subset[dst_row] = row_flip_full[src_row];
-            }
-            packed_keep = Cow::Owned(packed_subset);
-            maf_keep = Cow::Owned(maf_subset);
-            row_flip_keep = Cow::Owned(row_flip_subset);
+        let m_total = packed_view.shape()[0];
+        if m_total == 0 {
+            return Err(PyRuntimeError::new_err("No SNP rows found in BED input."));
         }
+        bytes_per_snp = packed_view.shape()[1];
+        let expected_bps = (n_samples + 3) / 4;
+        if bytes_per_snp != expected_bps {
+            return Err(PyRuntimeError::new_err(format!(
+                "packed second dimension mismatch: got {bytes_per_snp}, expected {expected_bps}"
+            )));
+        }
+        if let Some(mask_vec) = site_keep_vec.as_ref() {
+            if mask_vec.len() != m_total {
+                return Err(PyRuntimeError::new_err(format!(
+                    "site_keep length mismatch: got {}, expected {m_total}",
+                    mask_vec.len()
+                )));
+            }
+        }
+
+        let maf_len = loaded_maf_arr
+            .as_ref()
+            .expect("maf array must exist")
+            .readonly()
+            .as_array()
+            .len();
+        if maf_len != m_total {
+            return Err(PyRuntimeError::new_err(format!(
+                "maf length mismatch: got {}, expected {m_total}",
+                maf_len
+            )));
+        }
+
+        let row_flip_full_arr = bed_packed_row_flip_mask(
+            py,
+            loaded_packed_arr
+                .as_ref()
+                .expect("packed array must exist")
+                .readonly(),
+            n_samples,
+        )?;
+        loaded_row_flip_arr = Some(row_flip_full_arr);
+        let row_flip_len = loaded_row_flip_arr
+            .as_ref()
+            .expect("row_flip array must exist")
+            .readonly()
+            .as_array()
+            .len();
+        if row_flip_len != m_total {
+            return Err(PyRuntimeError::new_err(format!(
+                "row_flip length mismatch: got {}, expected {m_total}",
+                row_flip_len
+            )));
+        }
+
+        eff_m = m_total;
+        reuse_loaded_arrays_for_grm = true;
     }
 
     let train_idx = parse_index_vec_i64(
@@ -903,6 +920,58 @@ pub fn gblup_reml_packed_bed<'py>(
     if use_marker_fast {
         let pool_owned = get_cached_pool(threads)?;
         let pool_ref = pool_owned.as_ref();
+        let packed_keep: Cow<[u8]> = if reuse_loaded_arrays_for_grm {
+            let packed_ro = loaded_packed_arr
+                .as_ref()
+                .expect("packed array must exist for marker-fast path")
+                .readonly();
+            let packed_view = packed_ro.as_array();
+            Cow::Owned(match packed_ro.as_slice() {
+                Ok(s) => s.to_vec(),
+                Err(_) => packed_view.iter().copied().collect(),
+            })
+        } else {
+            Cow::Borrowed(
+                subset_packed_keep
+                    .as_ref()
+                    .expect("subset packed payload must exist")
+                    .as_slice(),
+            )
+        };
+        let maf_keep: Cow<[f32]> = if reuse_loaded_arrays_for_grm {
+            let maf_ro = loaded_maf_arr
+                .as_ref()
+                .expect("maf array must exist for marker-fast path")
+                .readonly();
+            Cow::Owned(match maf_ro.as_slice() {
+                Ok(s) => s.to_vec(),
+                Err(_) => maf_ro.as_array().iter().copied().collect(),
+            })
+        } else {
+            Cow::Borrowed(
+                subset_maf_keep
+                    .as_ref()
+                    .expect("subset maf payload must exist")
+                    .as_slice(),
+            )
+        };
+        let row_flip_keep: Cow<[bool]> = if reuse_loaded_arrays_for_grm {
+            let row_flip_ro = loaded_row_flip_arr
+                .as_ref()
+                .expect("row_flip array must exist for marker-fast path")
+                .readonly();
+            Cow::Owned(match row_flip_ro.as_slice() {
+                Ok(s) => s.to_vec(),
+                Err(_) => row_flip_ro.as_array().iter().copied().collect(),
+            })
+        } else {
+            Cow::Borrowed(
+                subset_row_flip_keep
+                    .as_ref()
+                    .expect("subset row_flip payload must exist")
+                    .as_slice(),
+            )
+        };
         let train_pred_abs: Vec<usize> = if let Some(local_idx) = &train_pred_pick {
             local_idx.iter().map(|&i| train_idx[i]).collect()
         } else {
@@ -955,10 +1024,10 @@ pub fn gblup_reml_packed_bed<'py>(
                         &test_idx,
                         &train_pred_abs,
                         sample_chunk,
-                        &packed_keep,
+                        packed_keep.as_ref(),
                         bytes_per_snp,
-                        &row_flip_keep,
-                        &maf_keep,
+                        row_flip_keep.as_ref(),
+                        maf_keep.as_ref(),
                         g_eps,
                         low,
                         high,
@@ -1021,34 +1090,108 @@ pub fn gblup_reml_packed_bed<'py>(
         ));
     }
 
-    let packed_keep_arr = PyArray2::from_owned_array(
-        py,
-        Array2::from_shape_vec((eff_m, bytes_per_snp), packed_keep.into_owned())
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
-    )
-    .into_bound();
-    let row_flip_keep_arr =
-        PyArray1::from_owned_array(py, Array1::from_vec(row_flip_keep.into_owned())).into_bound();
-    let maf_keep_arr =
-        PyArray1::from_owned_array(py, Array1::from_vec(maf_keep.into_owned())).into_bound();
-
     let train_idx_i64: Vec<i64> = train_idx.iter().map(|&v| v as i64).collect();
     let train_idx_arr =
         PyArray1::from_owned_array(py, Array1::from_vec(train_idx_i64)).into_bound();
 
-    let (grm_arr, row_sum_arr, var_sum_raw) = crate::grm::grm_packed_f64_with_stats(
-        py,
-        packed_keep_arr.readonly(),
-        n_samples,
-        row_flip_keep_arr.readonly(),
-        maf_keep_arr.readonly(),
-        Some(train_idx_arr.readonly()),
-        1,
-        block_rows.max(1),
-        threads,
-        None,
-        0,
-    )?;
+    let mut owned_packed_keep_arr: Option<Bound<'py, PyArray2<u8>>> = None;
+    let mut owned_row_flip_keep_arr: Option<Bound<'py, PyArray1<bool>>> = None;
+    let mut owned_maf_keep_arr: Option<Bound<'py, PyArray1<f32>>> = None;
+    if !reuse_loaded_arrays_for_grm {
+        owned_packed_keep_arr = Some(
+            PyArray2::from_owned_array(
+                py,
+                Array2::from_shape_vec(
+                    (eff_m, bytes_per_snp),
+                    subset_packed_keep
+                        .take()
+                        .expect("subset packed payload must exist for GRM path"),
+                )
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+            )
+            .into_bound(),
+        );
+        owned_row_flip_keep_arr = Some(
+            PyArray1::from_owned_array(
+                py,
+                Array1::from_vec(
+                    subset_row_flip_keep
+                        .take()
+                        .expect("subset row_flip payload must exist for GRM path"),
+                ),
+            )
+            .into_bound(),
+        );
+        owned_maf_keep_arr = Some(
+            PyArray1::from_owned_array(
+                py,
+                Array1::from_vec(
+                    subset_maf_keep
+                        .take()
+                        .expect("subset maf payload must exist for GRM path"),
+                ),
+            )
+            .into_bound(),
+        );
+    }
+
+    let packed_keep_arr_ref = if reuse_loaded_arrays_for_grm {
+        loaded_packed_arr
+            .as_ref()
+            .expect("packed array must exist for direct GRM reuse")
+    } else {
+        owned_packed_keep_arr
+            .as_ref()
+            .expect("subset packed array must exist")
+    };
+    let row_flip_keep_arr_ref = if reuse_loaded_arrays_for_grm {
+        loaded_row_flip_arr
+            .as_ref()
+            .expect("row_flip array must exist for direct GRM reuse")
+    } else {
+        owned_row_flip_keep_arr
+            .as_ref()
+            .expect("subset row_flip array must exist")
+    };
+    let maf_keep_arr_ref = if reuse_loaded_arrays_for_grm {
+        loaded_maf_arr
+            .as_ref()
+            .expect("maf array must exist for direct GRM reuse")
+    } else {
+        owned_maf_keep_arr
+            .as_ref()
+            .expect("subset maf array must exist")
+    };
+
+    let (grm_arr, row_sum_arr, var_sum_raw) = if reuse_loaded_arrays_for_grm {
+        crate::grm::grm_packed_f64_with_stats(
+            py,
+            packed_keep_arr_ref.readonly(),
+            n_samples,
+            row_flip_keep_arr_ref.readonly(),
+            maf_keep_arr_ref.readonly(),
+            Some(train_idx_arr.readonly()),
+            1,
+            block_rows.max(1),
+            threads,
+            None,
+            0,
+        )?
+    } else {
+        crate::grm::grm_packed_f64_with_stats(
+            py,
+            packed_keep_arr_ref.readonly(),
+            n_samples,
+            row_flip_keep_arr_ref.readonly(),
+            maf_keep_arr_ref.readonly(),
+            Some(train_idx_arr.readonly()),
+            1,
+            block_rows.max(1),
+            threads,
+            None,
+            0,
+        )?
+    };
     let n_train = train_idx.len();
     let grm_ro = grm_arr.readonly();
     let grm_slice = grm_ro
@@ -1259,10 +1402,10 @@ pub fn gblup_reml_packed_bed<'py>(
 
     let m_alpha_arr = packed_malpha_f64(
         py,
-        packed_keep_arr.readonly(),
+        packed_keep_arr_ref.readonly(),
         n_samples,
-        row_flip_keep_arr.readonly(),
-        maf_keep_arr.readonly(),
+        row_flip_keep_arr_ref.readonly(),
+        maf_keep_arr_ref.readonly(),
         train_idx_arr.readonly(),
         alpha_arr.readonly(),
         block_rows.max(1),
@@ -1304,10 +1447,10 @@ pub fn gblup_reml_packed_bed<'py>(
     } else {
         let train_pred_all_arr = cross_grm_times_alpha_packed_f64(
             py,
-            packed_keep_arr.readonly(),
+            packed_keep_arr_ref.readonly(),
             n_samples,
-            row_flip_keep_arr.readonly(),
-            maf_keep_arr.readonly(),
+            row_flip_keep_arr_ref.readonly(),
+            maf_keep_arr_ref.readonly(),
             train_idx_arr.readonly(),
             m_alpha_arr.readonly(),
             m_mean_arr.readonly(),
@@ -1345,10 +1488,10 @@ pub fn gblup_reml_packed_bed<'py>(
                 PyArray1::from_owned_array(py, Array1::from_vec(test_idx_i64)).into_bound();
             let test_pred_arr = cross_grm_times_alpha_packed_f64(
                 py,
-                packed_keep_arr.readonly(),
+                packed_keep_arr_ref.readonly(),
                 n_samples,
-                row_flip_keep_arr.readonly(),
-                maf_keep_arr.readonly(),
+                row_flip_keep_arr_ref.readonly(),
+                maf_keep_arr_ref.readonly(),
                 test_idx_arr.readonly(),
                 m_alpha_arr.readonly(),
                 m_mean_arr.readonly(),

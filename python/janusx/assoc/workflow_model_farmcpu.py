@@ -51,6 +51,21 @@ from .workflow import (
 )
 
 
+def _format_chisq_scalar(value: float) -> str:
+    if np.isnan(value):
+        return "NaN"
+    if np.isposinf(value):
+        return "inf"
+    if np.isneginf(value):
+        return "-inf"
+    return f"{float(value):.4e}"
+
+
+def _format_chisq_output(values: np.ndarray) -> np.ndarray:
+    arr = np.asarray(values, dtype=np.float64).reshape(-1)
+    return np.asarray([_format_chisq_scalar(v) for v in arr], dtype=object)
+
+
 def _normalize_packed_ctx_for_farmcpu_cache(
     packed_obj: dict[str, object],
 ) -> dict[str, object]:
@@ -1113,6 +1128,10 @@ def run_farmcpu_fullmem(
             m_input = np.ascontiguousarray(geno[:, keep_idx], dtype=np.float32)
             sample_idx_arg = None
             maf = (m_input.mean(axis=1) / 2.0).astype(np.float32, copy=False)
+            miss_arr = np.ascontiguousarray(
+                np.sum(~np.isfinite(m_input), axis=1, dtype=np.int64).astype(np.float32, copy=False),
+                dtype=np.float32,
+            )
             eff_snp = int(m_input.shape[0])
         else:
             m_input = packed_ctx
@@ -1124,6 +1143,14 @@ def run_farmcpu_fullmem(
             else:
                 sample_idx_arg = keep_idx
             maf = np.asarray(packed_ctx["maf"], dtype=np.float32).reshape(-1)
+            tested_n = int(sample_idx_arg.shape[0]) if sample_idx_arg is not None else int(packed_ctx["n_samples"])
+            miss_arr = np.ascontiguousarray(
+                np.rint(
+                    np.asarray(packed_ctx["missing_rate"], dtype=np.float64).reshape(-1)
+                    * float(tested_n)
+                ).astype(np.float32, copy=False),
+                dtype=np.float32,
+            )
             eff_snp = int(maf.shape[0])
 
         if bool(emit_trait_header):
@@ -1194,6 +1221,19 @@ def run_farmcpu_fullmem(
                 packed_arr = packed_payload["packed"]
                 row_flip_arr = packed_payload["row_flip"]
                 maf_arr = packed_payload["maf"]
+                sample_idx_use = (
+                    None
+                    if sample_idx_arg is None
+                    else np.ascontiguousarray(np.asarray(sample_idx_arg, dtype=np.int64).reshape(-1))
+                )
+                tested_n = int(sample_idx_use.shape[0]) if sample_idx_use is not None else int(packed_payload["n_samples"])
+                miss_arr = np.ascontiguousarray(
+                    np.rint(
+                        np.asarray(packed_payload["missing_rate"], dtype=np.float64).reshape(-1)
+                        * float(tested_n)
+                    ).astype(np.float32, copy=False),
+                    dtype=np.float32,
+                )
                 row_idx_arr = np.ascontiguousarray(
                     np.asarray(
                         packed_payload.get(
@@ -1206,12 +1246,6 @@ def run_farmcpu_fullmem(
                 )
                 packed_rows = int(np.asarray(packed_arr, dtype=np.uint8).shape[0])
                 meta_rows = int(len(chrom_col))
-                sample_idx_use = (
-                    None
-                    if sample_idx_arg is None
-                    else np.ascontiguousarray(np.asarray(sample_idx_arg, dtype=np.int64).reshape(-1))
-                )
-
                 def _compact_packed_for_metadata_alignment() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
                     row_idx_local = np.ascontiguousarray(
                         np.asarray(row_idx_arr, dtype=np.int64).reshape(-1),
@@ -1266,6 +1300,7 @@ def run_farmcpu_fullmem(
                             int(packed_payload["n_samples"]),
                             row_flip_arr,
                             maf_arr,
+                            miss_arr,
                             chrom_col,
                             pos_col,
                             allele0_col,
@@ -1292,6 +1327,7 @@ def run_farmcpu_fullmem(
                             int(packed_payload["n_samples"]),
                             row_flip_compact,
                             maf_compact,
+                            miss_arr,
                             chrom_col,
                             pos_col,
                             allele0_col,
@@ -1318,6 +1354,7 @@ def run_farmcpu_fullmem(
                         int(packed_payload["n_samples"]),
                         row_flip_arr,
                         maf_arr,
+                        miss_arr,
                         out_tsv,
                         sample_idx_use,
                         row_indices=row_idx_arr,
@@ -1380,6 +1417,7 @@ def run_farmcpu_fullmem(
             se_arr = np.ascontiguousarray(farm_out[:, 1], dtype=np.float64)
             pwald_arr = np.ascontiguousarray(farm_out[:, 2], dtype=np.float64)
             maf_arr = np.ascontiguousarray(np.asarray(maf, dtype=np.float32).reshape(-1), dtype=np.float32)
+            miss_out_arr = np.ascontiguousarray(np.asarray(miss_arr, dtype=np.float32).reshape(-1), dtype=np.float32)
             if int(maf_arr.shape[0]) != int(eff_snp):
                 raise ValueError(
                     f"FarmCPU dense MAF length mismatch: maf={maf_arr.shape[0]}, eff_snp={eff_snp}."
@@ -1393,6 +1431,7 @@ def run_farmcpu_fullmem(
                     [str(x) for x in allele0_col],
                     [str(x) for x in allele1_col],
                     maf_arr,
+                    miss_out_arr,
                     beta_arr,
                     se_arr,
                     pwald_arr,
@@ -1413,8 +1452,10 @@ def run_farmcpu_fullmem(
                         "allele0": [str(x) for x in allele0_col],
                         "allele1": [str(x) for x in allele1_col],
                         "maf": maf_arr,
+                        "miss": np.rint(miss_out_arr).astype(np.int64),
                         "beta": beta_arr,
                         "se": se_arr,
+                        "chisq": _format_chisq_output(np.square(beta_arr / se_arr)),
                         "pwald": pwald_arr,
                         "plrt": np.full((eff_snp,), np.nan, dtype=np.float64),
                     }

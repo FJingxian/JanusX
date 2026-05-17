@@ -19,9 +19,12 @@ use std::io::{BufWriter, Write};
 use std::time::Instant;
 
 use crate::aireml::ai_reml_null_from_spectral;
+use crate::bedmath::packed_row_missing_count_selected;
 use crate::brent::{brent_minimize, brent_minimize_with_init};
 use crate::linalg::{
-    chi2_sf_df1, cholesky_inplace, cholesky_logdet, cholesky_solve_into, normal_sf,
+    chi2_sf_df1, chi2_stat_df1_from_sf, cholesky_inplace, cholesky_logdet, cholesky_solve_into,
+    format_chisq_value,
+    normal_sf,
 };
 use crate::stats_common::{env_truthy, get_cached_pool, parse_index_vec_i64};
 
@@ -2843,6 +2846,7 @@ pub fn lmm_reml_assoc_packed_f32<'py>(
     n_samples,
     row_flip,
     row_maf,
+    row_missing,
     s,
     xcov,
     y_rot,
@@ -2872,6 +2876,7 @@ pub fn lmm_reml_assoc_packed_f32_to_tsv<'py>(
     n_samples: usize,
     row_flip: PyReadonlyArray1<'py, bool>,
     row_maf: PyReadonlyArray1<'py, f32>,
+    row_missing: PyReadonlyArray1<'py, f32>,
     s: PyReadonlyArray1<'py, f64>,
     xcov: PyReadonlyArray2<'py, f64>,
     y_rot: PyReadonlyArray1<'py, f64>,
@@ -2925,6 +2930,7 @@ pub fn lmm_reml_assoc_packed_f32_to_tsv<'py>(
     }
     let row_flip = row_flip.as_slice()?;
     let row_maf = row_maf.as_slice()?;
+    let row_missing = row_missing.as_slice()?;
     let row_idx: Option<Vec<usize>> = if let Some(ridx) = row_indices {
         Some(parse_index_vec_i64(
             ridx.as_slice()?,
@@ -2935,9 +2941,9 @@ pub fn lmm_reml_assoc_packed_f32_to_tsv<'py>(
         None
     };
     let m = row_idx.as_ref().map(|v| v.len()).unwrap_or(m_packed);
-    if row_flip.len() != m || row_maf.len() != m {
+    if row_flip.len() != m || row_maf.len() != m || row_missing.len() != m {
         return Err(PyRuntimeError::new_err(
-            "row_flip/row_maf length mismatch with packed rows",
+            "row_flip/row_maf/row_missing length mismatch with packed rows",
         ));
     }
     if chrom.len() != m || pos.len() != m || allele0.len() != m || allele1.len() != m {
@@ -3059,11 +3065,11 @@ pub fn lmm_reml_assoc_packed_f32_to_tsv<'py>(
             let mut writer = BufWriter::with_capacity(64 * 1024 * 1024, out_file);
             if with_plrt {
                 writer
-                    .write_all(b"chrom\tpos\tallele0\tallele1\tmaf\tbeta\tse\tpwald\tplrt\n")
+                    .write_all(b"chrom\tpos\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n")
                     .map_err(|e| format!("write header {out_tsv_path_for_writer}: {e}"))?;
             } else {
                 writer
-                    .write_all(b"chrom\tpos\tallele0\tallele1\tmaf\tbeta\tse\tpwald\n")
+                    .write_all(b"chrom\tpos\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\n")
                     .map_err(|e| format!("write header {out_tsv_path_for_writer}: {e}"))?;
             }
             for block in rx {
@@ -3082,6 +3088,7 @@ pub fn lmm_reml_assoc_packed_f32_to_tsv<'py>(
         let mut snp_buf = vec![0.0_f32; block_rows * n];
         let mut rot_buf = vec![0.0_f32; block_rows * n];
         let mut out_block = vec![0.0_f64; block_rows * out_cols];
+        let mut miss_block = vec![0usize; block_rows];
         let mut text_buf = String::with_capacity(block_rows * 128);
 
         let run_rows = |g_block: &[f32], out_block: &mut [f64]| {
@@ -3171,6 +3178,27 @@ pub fn lmm_reml_assoc_packed_f32_to_tsv<'py>(
                 );
                 decode_secs += dt0.elapsed().as_secs_f64();
 
+                let miss_sub = &mut miss_block[..rows];
+                if let Some(tp) = &pool {
+                    tp.install(|| {
+                        miss_sub.par_iter_mut().enumerate().for_each(|(off, dst)| {
+                            let idx = start + off;
+                            let src_row = row_idx.as_ref().map(|v| v[idx]).unwrap_or(idx);
+                            let row = &packed_flat
+                                [src_row * bytes_per_snp..(src_row + 1) * bytes_per_snp];
+                            *dst = packed_row_missing_count_selected(row, n_samples, &sample_idx);
+                        });
+                    });
+                } else {
+                    miss_sub.iter_mut().enumerate().for_each(|(off, dst)| {
+                        let idx = start + off;
+                        let src_row = row_idx.as_ref().map(|v| v[idx]).unwrap_or(idx);
+                        let row =
+                            &packed_flat[src_row * bytes_per_snp..(src_row + 1) * bytes_per_snp];
+                        *dst = packed_row_missing_count_selected(row, n_samples, &sample_idx);
+                    });
+                }
+
                 let rotate_tile_rows = choose_rotate_tile_rows(
                     rows,
                     if threads > 0 {
@@ -3220,31 +3248,46 @@ pub fn lmm_reml_assoc_packed_f32_to_tsv<'py>(
                 for off in 0..rows {
                     let idx = start + off;
                     let base = off * out_cols;
+                    let beta = out_sub[base];
+                    let se = out_sub[base + 1];
+                    let chisq = if with_plrt {
+                        chi2_stat_df1_from_sf(out_sub[base + 3])
+                    } else if beta.is_finite() && se.is_finite() && se > 0.0 {
+                        let z = beta / se;
+                        z * z
+                    } else {
+                        f64::NAN
+                    };
+                    let chisq_txt = format_chisq_value(chisq);
                     if with_plrt {
                         let _ = write!(
                             text_buf,
-                            "{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4e}\t{:.4e}\n",
+                            "{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\t{:.4e}\n",
                             chrom[idx],
                             pos[idx],
                             allele0[idx],
                             allele1[idx],
                             row_maf[idx],
-                            out_sub[base],
-                            out_sub[base + 1],
+                            miss_sub[off],
+                            beta,
+                            se,
+                            chisq_txt,
                             out_sub[base + 2],
                             out_sub[base + 3]
                         );
                     } else {
                         let _ = write!(
                             text_buf,
-                            "{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4e}\n",
+                            "{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\n",
                             chrom[idx],
                             pos[idx],
                             allele0[idx],
                             allele1[idx],
                             row_maf[idx],
-                            out_sub[base],
-                            out_sub[base + 1],
+                            miss_sub[off],
+                            beta,
+                            se,
+                            chisq_txt,
                             out_sub[base + 2]
                         );
                     }
@@ -4232,6 +4275,7 @@ pub fn fastlmm_assoc_packed_f32_to_tsv<'py>(
     n_samples: usize,
     row_flip: PyReadonlyArray1<'py, bool>,
     row_maf: PyReadonlyArray1<'py, f32>,
+    row_missing: PyReadonlyArray1<'py, f32>,
     u: PyReadonlyArray2<'py, f32>,
     s: PyReadonlyArray1<'py, f32>,
     y: PyReadonlyArray1<'py, f64>,
@@ -4286,6 +4330,7 @@ pub fn fastlmm_assoc_packed_f32_to_tsv<'py>(
 
     let row_flip = row_flip.as_slice()?;
     let row_maf = row_maf.as_slice()?;
+    let row_missing = row_missing.as_slice()?;
     let row_idx: Option<Vec<usize>> = if let Some(ridx) = row_indices {
         Some(parse_index_vec_i64(
             ridx.as_slice()?,
@@ -4306,6 +4351,12 @@ pub fn fastlmm_assoc_packed_f32_to_tsv<'py>(
         return Err(PyRuntimeError::new_err(format!(
             "row_maf length mismatch: got {}, expected {m}",
             row_maf.len()
+        )));
+    }
+    if row_missing.len() != m {
+        return Err(PyRuntimeError::new_err(format!(
+            "row_missing length mismatch: got {}, expected {m}",
+            row_missing.len()
         )));
     }
     if chrom.len() != m || pos.len() != m || allele0.len() != m || allele1.len() != m {
@@ -4567,7 +4618,7 @@ pub fn fastlmm_assoc_packed_f32_to_tsv<'py>(
                 .map_err(|e| format!("create {out_tsv_path_for_writer}: {e}"))?;
             let mut writer = BufWriter::with_capacity(64 * 1024 * 1024, out_file);
             writer
-                .write_all(b"chrom\tpos\tallele0\tallele1\tmaf\tbeta\tse\tpwald\tplrt\n")
+                .write_all(b"chrom\tpos\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n")
                 .map_err(|e| format!("write header {out_tsv_path_for_writer}: {e}"))?;
             for block in rx {
                 if !block.is_empty() {
@@ -4643,6 +4694,7 @@ pub fn fastlmm_assoc_packed_f32_to_tsv<'py>(
         let mut g_block = vec![0.0_f32; rotate_block_rows * n];
         let mut rot_block = vec![0.0_f32; rotate_block_rows * n];
         let mut out_block = vec![0.0_f64; rotate_block_rows * out_cols];
+        let mut miss_block = vec![0usize; rotate_block_rows];
         let mut text_buf = String::with_capacity(rotate_block_rows * 128);
 
         for row_start in (0..m).step_by(progress_block) {
@@ -4776,6 +4828,27 @@ pub fn fastlmm_assoc_packed_f32_to_tsv<'py>(
                 }
                 assoc_secs += at0.elapsed().as_secs_f64();
 
+                let miss_sub = &mut miss_block[..rows];
+                if let Some(tp) = &pool {
+                    tp.install(|| {
+                        miss_sub.par_iter_mut().enumerate().for_each(|(off, dst)| {
+                            let idx = start + off;
+                            let src_row = row_idx.as_ref().map(|v| v[idx]).unwrap_or(idx);
+                            let row = &packed_flat
+                                [src_row * bytes_per_snp..(src_row + 1) * bytes_per_snp];
+                            *dst = packed_row_missing_count_selected(row, n_samples, &sample_idx);
+                        });
+                    });
+                } else {
+                    miss_sub.iter_mut().enumerate().for_each(|(off, dst)| {
+                        let idx = start + off;
+                        let src_row = row_idx.as_ref().map(|v| v[idx]).unwrap_or(idx);
+                        let row =
+                            &packed_flat[src_row * bytes_per_snp..(src_row + 1) * bytes_per_snp];
+                        *dst = packed_row_missing_count_selected(row, n_samples, &sample_idx);
+                    });
+                }
+
                 let tt0 = Instant::now();
                 text_buf.clear();
                 if text_buf.capacity() < rows * 128 {
@@ -4784,16 +4857,22 @@ pub fn fastlmm_assoc_packed_f32_to_tsv<'py>(
                 for off in 0..rows {
                     let idx = start + off;
                     let base = off * out_cols;
+                    let beta = out_sub[base];
+                    let se = out_sub[base + 1];
+                    let chisq = chi2_stat_df1_from_sf(out_sub[base + 3]);
+                    let chisq_txt = format_chisq_value(chisq);
                     let _ = write!(
                         text_buf,
-                        "{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4e}\t{:.4e}\n",
+                        "{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\t{:.4e}\n",
                         chrom[idx],
                         pos[idx],
                         allele0[idx],
                         allele1[idx],
                         row_maf[idx],
-                        out_sub[base],
-                        out_sub[base + 1],
+                        miss_sub[off],
+                        beta,
+                        se,
+                        chisq_txt,
                         out_sub[base + 2],
                         out_sub[base + 3]
                     );

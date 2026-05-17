@@ -14,6 +14,7 @@ from typing import Optional, Union
 import numpy as np
 import pandas as pd
 import psutil
+from scipy.stats import chi2
 
 from .workflow import (
     CliStatus,
@@ -50,6 +51,58 @@ from .workflow import (
 
 _WARNED_BED_MMAP_LIMIT_LEGACY = False
 _WARNED_BED_PREPARED_SNPS_ONLY_LEGACY = False
+
+
+def _chisq_from_gwas_results(results: np.ndarray) -> np.ndarray:
+    """Return the chi-square statistic aligned with GWAS TSV output semantics."""
+    res = np.asarray(results, dtype=np.float64)
+    chisq = np.full((int(res.shape[0]),), np.nan, dtype=np.float64)
+    if res.ndim != 2 or res.shape[1] < 2:
+        return chisq
+
+    beta = np.asarray(res[:, 0], dtype=np.float64)
+    se = np.asarray(res[:, 1], dtype=np.float64)
+    valid_wald = np.isfinite(beta) & np.isfinite(se) & (se > 0.0)
+    if np.any(valid_wald):
+        z = beta[valid_wald] / se[valid_wald]
+        chisq[valid_wald] = np.square(z)
+
+    if res.shape[1] <= 3:
+        return chisq
+
+    plrt = np.asarray(res[:, 3], dtype=np.float64)
+    valid_plrt = np.isfinite(plrt) & (plrt >= 0.0) & (plrt <= 1.0)
+    if not np.any(valid_plrt):
+        return chisq
+
+    one_mask = valid_plrt & (plrt >= 1.0)
+    if np.any(one_mask):
+        chisq[one_mask] = 0.0
+
+    zero_mask = valid_plrt & (plrt <= 0.0)
+    if np.any(zero_mask):
+        chisq[zero_mask] = np.inf
+
+    mid_mask = valid_plrt & (plrt > 0.0) & (plrt < 1.0)
+    if np.any(mid_mask):
+        chisq[mid_mask] = chi2.isf(plrt[mid_mask], 1)
+
+    return chisq
+
+
+def _format_chisq_scalar(value: float) -> str:
+    if np.isnan(value):
+        return "NaN"
+    if np.isposinf(value):
+        return "inf"
+    if np.isneginf(value):
+        return "-inf"
+    return f"{float(value):.4e}"
+
+
+def _format_chisq_output(values: np.ndarray) -> np.ndarray:
+    arr = np.asarray(values, dtype=np.float64).reshape(-1)
+    return np.asarray([_format_chisq_scalar(v) for v in arr], dtype=object)
 
 
 def _new_bed_chunk_reader_for_stream(
@@ -712,7 +765,7 @@ def run_chunked_gwas_lmm_lm(
                 mode = "a" if self._wrote_header else "w"
                 with open(self.path, mode, encoding="utf-8", newline="") as fh:
                     if not self._wrote_header:
-                        header = "chrom\tpos\tallele0\tallele1\tmaf\tbeta\tse\tpwald"
+                        header = "chrom\tpos\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald"
                         if bool(self._has_plrt):
                             header += "\tplrt"
                         fh.write(header + "\n")
@@ -739,6 +792,7 @@ def run_chunked_gwas_lmm_lm(
             results: np.ndarray,
             info_chunk: list[tuple[str, int, str, str]],
             maf_chunk: np.ndarray,
+            miss_chunk: np.ndarray,
         ) -> tuple[str, bool, int]:
             if len(info_chunk) == 0:
                 return "", bool(np.asarray(results).shape[1] > 3), 0
@@ -751,14 +805,20 @@ def run_chunked_gwas_lmm_lm(
                     allele0_list, allele1_list, genetic_model
                 )
             res = np.asarray(results, dtype=np.float64)
+            chisq = _chisq_from_gwas_results(res)
             cols = [
                 np.asarray(chroms, dtype=object),
                 np.asarray(poss, dtype=np.int64).astype(str),
                 np.asarray(allele0_list, dtype=object),
                 np.asarray(allele1_list, dtype=object),
                 np.char.mod("%.4f", np.asarray(maf_chunk, dtype=np.float64)),
+                np.char.mod(
+                    "%d",
+                    np.rint(np.asarray(miss_chunk, dtype=np.float64)).astype(np.int64),
+                ),
                 np.char.mod("%.4f", res[:, 0]),
                 np.char.mod("%.4f", res[:, 1]),
+                _format_chisq_output(chisq),
                 np.char.mod("%.4e", res[:, 2]),
             ]
             has_plrt = bool(res.shape[1] > 3)
@@ -785,17 +845,18 @@ def run_chunked_gwas_lmm_lm(
             done_seq = sorted(
                 [
                     seq
-                    for seq, (fut, _m, _meta, _maf) in inflight.items()
+                    for seq, (fut, _m, _meta, _maf, _miss) in inflight.items()
                     if fut in done_set
                 ]
             )
             for seq in done_seq:
-                fut, m_chunk, meta_chunk, maf_chunk = inflight.pop(seq)
+                fut, m_chunk, meta_chunk, maf_chunk, miss_chunk = inflight.pop(seq)
                 results = fut.result()
                 if use_rust_assoc_writer:
                     writer.write_chunk(
                         meta_chunk,
                         np.asarray(maf_chunk, dtype=np.float32),
+                        np.asarray(miss_chunk, dtype=np.float32),
                         np.asarray(results, dtype=np.float64),
                     )
                 else:
@@ -803,6 +864,7 @@ def run_chunked_gwas_lmm_lm(
                         results,
                         meta_chunk,
                         maf_chunk,
+                        miss_chunk,
                     )
                     writer.append(chunk_text, has_plrt=has_plrt, rows=n_rows)
                 done_snps += int(m_chunk)
@@ -864,18 +926,20 @@ def run_chunked_gwas_lmm_lm(
                     )
                     if out is None:
                         break
-                    geno_center_raw, sites, maf_chunk_raw = out
+                    geno_center_raw, sites, maf_chunk_raw, miss_chunk_raw = out
                     geno_center = np.ascontiguousarray(
                         np.asarray(geno_center_raw, dtype=np.float32),
                         dtype=np.float32,
                     )
                     maf_chunk = np.asarray(maf_chunk_raw, dtype=np.float32).reshape(-1)
+                    miss_chunk = np.asarray(miss_chunk_raw, dtype=np.float32).reshape(-1)
                     if legacy_snps_only and bool(snps_only):
                         geno_center, maf_chunk, sites = _filter_snps_only_chunk_python_fallback(
                             geno_center=geno_center,
                             maf_chunk=maf_chunk,
                             sites=sites,
                         )
+                        miss_chunk = miss_chunk[: int(maf_chunk.shape[0])]
 
                     m_chunk = int(geno_center.shape[0])
                     if m_chunk == 0:
@@ -890,7 +954,7 @@ def run_chunked_gwas_lmm_lm(
                         raise RuntimeError("Rust-only GWAS mode requires Rust TSV writer path.")
 
                     fut = ex.submit(mod.gwas, geno_center, threads=threads_per_worker)
-                    inflight[chunk_seq] = (fut, int(m_chunk), meta_chunk, maf_chunk)
+                    inflight[chunk_seq] = (fut, int(m_chunk), meta_chunk, maf_chunk, miss_chunk)
                     chunk_seq += 1
 
                     if len(inflight) >= max_inflight:
@@ -911,7 +975,7 @@ def run_chunked_gwas_lmm_lm(
                     pbar.finish()
             except KeyboardInterrupt:
                 interrupted = True
-                for fut, _m, _meta, _maf in inflight.values():
+                for fut, _m, _meta, _maf, _miss in inflight.values():
                     try:
                         fut.cancel()
                     except Exception:
@@ -1210,7 +1274,7 @@ def run_chunked_gwas_streaming_shared(
             mode = "a" if self._wrote_header else "w"
             with open(self.path, mode, encoding="utf-8", newline="") as fh:
                 if not self._wrote_header:
-                    header = "chrom\tpos\tallele0\tallele1\tmaf\tbeta\tse\tpwald"
+                    header = "chrom\tpos\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald"
                     if bool(self._has_plrt):
                         header += "\tplrt"
                     fh.write(header + "\n")
@@ -1226,6 +1290,7 @@ def run_chunked_gwas_streaming_shared(
         results: np.ndarray,
         info_chunk: list[tuple[str, int, str, str]],
         maf_chunk: np.ndarray,
+        miss_chunk: np.ndarray,
     ) -> tuple[str, bool]:
         if len(info_chunk) == 0:
             return "", bool(np.asarray(results).shape[1] > 3)
@@ -1239,14 +1304,20 @@ def run_chunked_gwas_streaming_shared(
             )
 
         res = np.asarray(results, dtype=np.float64)
+        chisq = _chisq_from_gwas_results(res)
         cols = [
             np.asarray(chroms, dtype=object),
             np.asarray(poss, dtype=np.int64).astype(str),
             np.asarray(allele0_list, dtype=object),
             np.asarray(allele1_list, dtype=object),
             np.char.mod("%.4f", np.asarray(maf_chunk, dtype=np.float64)),
+            np.char.mod(
+                "%d",
+                np.rint(np.asarray(miss_chunk, dtype=np.float64)).astype(np.int64),
+            ),
             np.char.mod("%.4f", res[:, 0]),
             np.char.mod("%.4f", res[:, 1]),
+            _format_chisq_output(chisq),
             np.char.mod("%.4e", res[:, 2]),
         ]
         has_plrt = bool(res.shape[1] > 3)
@@ -1523,6 +1594,7 @@ def run_chunked_gwas_streaming_shared(
         geno_center: np.ndarray,
         sites: list[object],
         maf_chunk: np.ndarray,
+        miss_chunk: np.ndarray,
     ) -> None:
         m_chunk = int(np.asarray(geno_center).shape[0])
         if m_chunk == 0:
@@ -1548,6 +1620,7 @@ def run_chunked_gwas_streaming_shared(
                 writer.write_chunk(
                     sites,
                     np.asarray(maf_chunk, dtype=np.float32),
+                    np.asarray(miss_chunk, dtype=np.float32),
                     np.asarray(results, dtype=np.float64),
                 )
             else:
@@ -1557,7 +1630,12 @@ def run_chunked_gwas_streaming_shared(
                 ]
                 if len(info_chunk) == 0:
                     continue
-                chunk_text, has_plrt = _format_chunk_tsv_text(results, info_chunk, maf_chunk)
+                chunk_text, has_plrt = _format_chunk_tsv_text(
+                    results,
+                    info_chunk,
+                    maf_chunk,
+                    miss_chunk,
+                )
                 writer.append(chunk_text, has_plrt=bool(has_plrt), rows=m_chunk)
             ctx["has_results"] = True
 
@@ -1616,17 +1694,24 @@ def run_chunked_gwas_streaming_shared(
                 )
                 if out is None:
                     break
-                geno_center_raw, sites, maf_chunk_raw = out
+                geno_center_raw, sites, maf_chunk_raw, miss_chunk_raw = out
                 geno_center = np.asarray(geno_center_raw, dtype=np.float32)
                 maf_chunk = np.asarray(maf_chunk_raw, dtype=np.float32).reshape(-1)
+                miss_chunk = np.asarray(miss_chunk_raw, dtype=np.float32).reshape(-1)
                 if legacy_snps_only and bool(snps_only):
                     geno_center, maf_chunk, sites = _filter_snps_only_chunk_python_fallback(
                         geno_center=geno_center,
                         maf_chunk=maf_chunk,
                         sites=sites,
                     )
+                    miss_chunk = miss_chunk[: int(maf_chunk.shape[0])]
                 geno_center = np.ascontiguousarray(geno_center, dtype=np.float32)
-                _consume_chunk(geno_center=geno_center, sites=sites, maf_chunk=maf_chunk)
+                _consume_chunk(
+                    geno_center=geno_center,
+                    sites=sites,
+                    maf_chunk=maf_chunk,
+                    miss_chunk=miss_chunk,
+                )
 
             for ctx in model_ctxs:
                 writer = ctx.get("writer")

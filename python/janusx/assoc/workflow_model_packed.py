@@ -84,11 +84,17 @@ def _lm_precompute_ixx_qr(x_design: np.ndarray) -> np.ndarray:
 
 def _packed_ctx_active_view_for_gwas(
     packed_ctx: dict[str, object],
-) -> tuple[np.ndarray, int, np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, int, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     packed = np.ascontiguousarray(np.asarray(packed_ctx["packed"], dtype=np.uint8))
     packed_n = int(packed_ctx["n_samples"])
     if packed.ndim != 2:
         raise ValueError("Packed GWAS context requires packed ndim=2.")
+    miss_full = np.ascontiguousarray(
+        np.asarray(packed_ctx["missing_rate"], dtype=np.float32).reshape(-1),
+        dtype=np.float32,
+    )
+    if int(miss_full.shape[0]) != int(packed.shape[0]):
+        raise ValueError("Packed GWAS context mismatch: missing_rate length != packed rows.")
     maf_full = np.ascontiguousarray(
         np.asarray(packed_ctx["maf"], dtype=np.float32).reshape(-1),
         dtype=np.float32,
@@ -135,8 +141,9 @@ def _packed_ctx_active_view_for_gwas(
         if int(site_keep.shape[0]) < int(active_row_idx.shape[0]):
             raise ValueError("Packed GWAS context mismatch: active_row_idx exceeds site_keep length.")
     maf_active = np.ascontiguousarray(maf_full[active_row_idx], dtype=np.float32)
+    miss_active = np.ascontiguousarray(miss_full[active_row_idx], dtype=np.float32)
     row_flip_active = np.ascontiguousarray(row_flip_full[active_row_idx], dtype=np.bool_)
-    return packed, packed_n, active_row_idx, maf_active, row_flip_active
+    return packed, packed_n, active_row_idx, maf_active, miss_active, row_flip_active
 
 
 def _prepare_packed_bed_once_for_gwas(
@@ -408,12 +415,16 @@ def run_fastlmm_packed_fullrank(
     except KeyError as e:
         raise ValueError("Some aligned sample IDs are not present in packed BED sample order.") from e
 
-    packed, packed_n, packed_row_idx, maf, row_flip = _packed_ctx_active_view_for_gwas(
+    packed, packed_n, packed_row_idx, maf, miss, row_flip = _packed_ctx_active_view_for_gwas(
         packed_ctx
     )
     if packed_n <= 0:
         raise ValueError("Packed BED reported invalid sample count.")
-    if int(packed_row_idx.shape[0]) != int(maf.shape[0]) or int(packed_row_idx.shape[0]) != int(row_flip.shape[0]):
+    if (
+        int(packed_row_idx.shape[0]) != int(maf.shape[0])
+        or int(packed_row_idx.shape[0]) != int(miss.shape[0])
+        or int(packed_row_idx.shape[0]) != int(row_flip.shape[0])
+    ):
         raise ValueError("Packed BED arrays have inconsistent SNP dimensions.")
 
     if int(len(sites_all)) != int(packed_row_idx.shape[0]):
@@ -694,6 +705,7 @@ def run_fastlmm_packed_fullrank(
                             int(packed_n),
                             row_flip,
                             maf,
+                            miss,
                             chrom_all,
                             pos_all,
                             allele0_all,
@@ -722,6 +734,7 @@ def run_fastlmm_packed_fullrank(
                         int(packed_n),
                         row_flip,
                         maf,
+                        miss,
                         u_trait,
                         s_trait,
                         y_vec,
@@ -872,12 +885,16 @@ def run_lm_packed_fullrank(
     except KeyError as e:
         raise ValueError("Some aligned sample IDs are not present in packed BED sample order.") from e
 
-    packed, packed_n, packed_row_idx, maf, row_flip = _packed_ctx_active_view_for_gwas(
+    packed, packed_n, packed_row_idx, maf, miss, row_flip = _packed_ctx_active_view_for_gwas(
         packed_ctx
     )
     if packed_n <= 0:
         raise ValueError("Packed BED reported invalid sample count.")
-    if int(packed_row_idx.shape[0]) != int(maf.shape[0]) or int(packed_row_idx.shape[0]) != int(row_flip.shape[0]):
+    if (
+        int(packed_row_idx.shape[0]) != int(maf.shape[0])
+        or int(packed_row_idx.shape[0]) != int(miss.shape[0])
+        or int(packed_row_idx.shape[0]) != int(row_flip.shape[0])
+    ):
         raise ValueError("Packed BED arrays have inconsistent SNP dimensions.")
 
     if int(len(sites_all)) != int(packed_row_idx.shape[0]):
@@ -1017,6 +1034,7 @@ def run_lm_packed_fullrank(
                             int(packed_n),
                             row_flip,
                             maf,
+                            miss,
                             chrom_all,
                             pos_all,
                             allele0_all,
@@ -1050,6 +1068,7 @@ def run_lm_packed_fullrank(
                             int(packed_n),
                             row_flip,
                             maf,
+                            miss,
                             chrom_all,
                             pos_all,
                             allele0_all,
@@ -1072,6 +1091,7 @@ def run_lm_packed_fullrank(
                             int(packed_n),
                             row_flip,
                             maf,
+                            miss,
                             chrom_all,
                             pos_all,
                             allele0_all,
@@ -1551,12 +1571,16 @@ def run_lmm_packed_fullrank(
     except KeyError as e:
         raise ValueError("Some aligned sample IDs are not present in packed BED sample order.") from e
 
-    packed, packed_n, packed_row_idx, maf, row_flip = _packed_ctx_active_view_for_gwas(
+    packed, packed_n, packed_row_idx, maf, miss, row_flip = _packed_ctx_active_view_for_gwas(
         packed_ctx
     )
     if packed_n <= 0:
         raise ValueError("Packed BED reported invalid sample count.")
-    if int(packed_row_idx.shape[0]) != int(maf.shape[0]) or int(packed_row_idx.shape[0]) != int(row_flip.shape[0]):
+    if (
+        int(packed_row_idx.shape[0]) != int(maf.shape[0])
+        or int(packed_row_idx.shape[0]) != int(miss.shape[0])
+        or int(packed_row_idx.shape[0]) != int(row_flip.shape[0])
+    ):
         raise ValueError("Packed BED arrays have inconsistent SNP dimensions.")
 
     if int(len(sites_all)) != int(packed_row_idx.shape[0]):
@@ -1728,6 +1752,7 @@ def run_lmm_packed_fullrank(
                     int(packed_n),
                     row_flip,
                     maf,
+                    miss,
                     s_trait,
                     x_rot,
                     y_rot,

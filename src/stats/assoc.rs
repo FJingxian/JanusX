@@ -1,5 +1,5 @@
-use crate::bedmath::decode_plink_bed_hardcall;
-use crate::linalg::chi2_sf_df1;
+use crate::bedmath::{decode_plink_bed_hardcall, packed_row_missing_count_selected};
+use crate::linalg::{chi2_sf_df1, chi2_stat_df1_from_sf, format_chisq_value};
 use crate::math_farmcpu::{
     decode_dense_rows_to_sample_major, decode_packed_rows_to_sample_major,
     farmcpu_ll_score_from_sample_major, farmcpu_super_keep_from_sample_major, select_lead_indices,
@@ -384,6 +384,136 @@ fn scan_packed_full_matrix(
         runner();
     }
     Ok((out, m, row_stride))
+}
+
+fn fit_packed_full_rows(
+    y: &[f64],
+    x_flat: &[f64],   // row-major (n, q0)
+    ixx_flat: &[f64], // row-major (q0, q0)
+    packed_flat: &[u8],
+    n_samples: usize,
+    row_flip: &[bool],
+    row_maf: &[f32],
+    row_indices: Option<&[usize]>,
+    sample_idx: &[usize],
+    selected_rows: &[usize],
+) -> Result<(Vec<f64>, usize), String> {
+    let n = y.len();
+    if n == 0 {
+        return Err("empty y".to_string());
+    }
+    if sample_idx.len() != n {
+        return Err("sample_idx length mismatch".to_string());
+    }
+    if n_samples == 0 {
+        return Err("n_samples must be > 0".to_string());
+    }
+    let bytes_per_snp = (n_samples + 3) / 4;
+    if bytes_per_snp == 0 {
+        return Err("invalid packed shape".to_string());
+    }
+    if packed_flat.len() % bytes_per_snp != 0 {
+        return Err("packed length is not divisible by bytes_per_snp".to_string());
+    }
+    let m_packed = packed_flat.len() / bytes_per_snp;
+    let m = row_indices.map(|v| v.len()).unwrap_or(m_packed);
+    if row_flip.len() != m || row_maf.len() != m {
+        return Err("row_flip/row_maf length mismatch".to_string());
+    }
+    let q0 = if n == 0 { 0 } else { x_flat.len() / n };
+    if x_flat.len() != n * q0 {
+        return Err("X shape mismatch".to_string());
+    }
+    if ixx_flat.len() != q0 * q0 {
+        return Err("ixx shape mismatch".to_string());
+    }
+    if n <= q0 + 1 {
+        return Err(format!("n too small for LM core: n={n}, q={q0}"));
+    }
+
+    let dim = q0 + 1;
+    let row_stride = dim * 3;
+    let mut xy = vec![0.0_f64; q0];
+    for i in 0..n {
+        let yi = y[i];
+        let row = &x_flat[i * q0..(i + 1) * q0];
+        for j in 0..q0 {
+            xy[j] += row[j] * yi;
+        }
+    }
+    let yy: f64 = y.iter().map(|v| v * v).sum();
+    let mut out = vec![f64::NAN; selected_rows.len() * row_stride];
+    let mut scr = GlmScratch::new(q0);
+    for (row_idx, &idx) in selected_rows.iter().enumerate() {
+        if idx >= m {
+            return Err(format!(
+                "selected row index out of bounds: idx={idx}, m={m}"
+            ));
+        }
+        scr.reset_xs();
+        let src_row = row_indices.map(|v| v[idx]).unwrap_or(idx);
+        if src_row >= m_packed {
+            return Err(format!(
+                "packed row index out of bounds: idx={src_row}, packed_rows={m_packed}"
+            ));
+        }
+        let row = &packed_flat[src_row * bytes_per_snp..(src_row + 1) * bytes_per_snp];
+        let flip = row_flip[idx];
+        let mean_g = (2.0_f64 * row_maf[idx] as f64).max(0.0);
+        let mut sy = 0.0_f64;
+        let mut ss = 0.0_f64;
+        for (k, &sidx) in sample_idx.iter().enumerate() {
+            let b = row[sidx >> 2];
+            let code = (b >> ((sidx & 3) * 2)) & 0b11;
+            let mut gv = match decode_plink_bed_hardcall(code) {
+                Some(v) => v,
+                None => mean_g,
+            };
+            if flip && code != 0b01 {
+                gv = 2.0 - gv;
+            }
+            sy += gv * y[k];
+            ss += gv * gv;
+            let xrow = &x_flat[k * q0..(k + 1) * q0];
+            for j in 0..q0 {
+                scr.xs[j] += xrow[j] * gv;
+            }
+        }
+        xs_t_ixx_into(&scr.xs, ixx_flat, q0, &mut scr.b21);
+        let t2 = dot(&scr.b21, &scr.xs);
+        let b22 = ss - t2;
+        let (invb22, df) = if b22 < 1e-8 {
+            (0.0, (n as i32) - (q0 as i32))
+        } else {
+            (1.0 / b22, (n as i32) - (q0 as i32) - 1)
+        };
+        let row_out = &mut out[row_idx * row_stride..(row_idx + 1) * row_stride];
+        if df <= 0 {
+            row_out.fill(f64::NAN);
+            continue;
+        }
+        build_ixxs_into(ixx_flat, &scr.b21, invb22, q0, &mut scr.ixxs);
+        scr.rhs[..q0].copy_from_slice(&xy);
+        scr.rhs[q0] = sy;
+        matvec_into(&scr.ixxs, dim, &scr.rhs, &mut scr.beta);
+        let beta_rhs = dot(&scr.beta, &scr.rhs);
+        let ve = (yy - beta_rhs) / (df as f64);
+        for ff in 0..dim {
+            let se = (scr.ixxs[ff * dim + ff] * ve).sqrt();
+            let t = scr.beta[ff] / se;
+            let base = 3 * ff;
+            row_out[base] = scr.beta[ff];
+            row_out[base + 1] = se;
+            row_out[base + 2] = student_t_p_two_sided(t, df);
+        }
+        if invb22 == 0.0 {
+            let base = 3 * q0;
+            row_out[base] = f64::NAN;
+            row_out[base + 1] = f64::NAN;
+            row_out[base + 2] = f64::NAN;
+        }
+    }
+    Ok((out, row_stride))
 }
 
 #[pyfunction]
@@ -772,6 +902,7 @@ pub fn farmcpu_super_dense<'py>(
     n_samples,
     row_flip,
     row_maf,
+    row_missing,
     out_tsv,
     sample_indices=None,
     row_indices=None,
@@ -796,6 +927,7 @@ pub fn farmcpu_packed_to_tsv(
     n_samples: usize,
     row_flip: PyReadonlyArray1<'_, bool>,
     row_maf: PyReadonlyArray1<'_, f32>,
+    row_missing: PyReadonlyArray1<'_, f32>,
     out_tsv: &str,
     sample_indices: Option<PyReadonlyArray1<'_, i64>>,
     row_indices: Option<PyReadonlyArray1<'_, i64>>,
@@ -883,11 +1015,13 @@ pub fn farmcpu_packed_to_tsv(
     }
     let row_flip = row_flip.as_slice()?;
     let row_maf = row_maf.as_slice()?;
-    if row_flip.len() != m || row_maf.len() != m {
+    let row_missing = row_missing.as_slice()?;
+    if row_flip.len() != m || row_maf.len() != m || row_missing.len() != m {
         return Err(PyRuntimeError::new_err(format!(
-            "row metadata length mismatch: row_flip={}, row_maf={}, m={m}",
+            "row metadata length mismatch: row_flip={}, row_maf={}, row_missing={}, m={m}",
             row_flip.len(),
             row_maf.len(),
+            row_missing.len(),
         )));
     }
     let packed_flat: Cow<[u8]> = match packed.as_slice() {
@@ -1238,9 +1372,64 @@ pub fn farmcpu_packed_to_tsv(
                 }
             }
         }
+        let mut qtn_beta = vec![f64::NAN; k_qtn];
+        let mut qtn_se = vec![f64::NAN; k_qtn];
+        if k_qtn > 0 {
+            let mut qtn_best_rows = vec![0usize; k_qtn];
+            for j in 0..k_qtn {
+                let col = 2 + q_base + j;
+                let mut best_idx = 0usize;
+                let mut best_p = f64::INFINITY;
+                for i in 0..m {
+                    let p = fem[i * row_stride + col];
+                    if p.is_finite() && p < best_p {
+                        best_p = p;
+                        best_idx = i;
+                    }
+                }
+                qtn_best_rows[j] = best_idx;
+            }
+            let (qtn_full, qtn_full_stride) = fit_packed_full_rows(
+                y,
+                &x_qtn,
+                &ixx,
+                &packed_flat,
+                n_samples,
+                row_flip,
+                row_maf,
+                row_idx.as_deref(),
+                &sample_idx,
+                &qtn_best_rows,
+            )
+            .map_err(PyRuntimeError::new_err)?;
+            for j in 0..k_qtn {
+                let coef_idx = q_base + j;
+                let base = j * qtn_full_stride + 3 * coef_idx;
+                qtn_beta[j] = qtn_full[base];
+                qtn_se[j] = qtn_full[base + 1];
+            }
+        }
         let mut qtn_lookup: HashMap<usize, usize> = HashMap::with_capacity(k_qtn);
         for (j, &idx) in qtn_idx.iter().enumerate() {
             qtn_lookup.insert(idx, j);
+        }
+
+        let mut miss_counts = vec![0usize; m];
+        let mut fill_miss = || {
+            miss_counts
+                .par_iter_mut()
+                .enumerate()
+                .for_each(|(idx, dst)| {
+                    let src_row = row_idx.as_ref().map(|v| v[idx]).unwrap_or(idx);
+                    let row =
+                        &packed_flat[src_row * bytes_per_snp..(src_row + 1) * bytes_per_snp];
+                    *dst = packed_row_missing_count_selected(row, n_samples, &sample_idx);
+                });
+        };
+        if let Some(tp) = &pool {
+            tp.install(fill_miss);
+        } else {
+            fill_miss();
         }
 
         let df = (n as i32) - (q_total as i32) - 1;
@@ -1253,7 +1442,7 @@ pub fn farmcpu_packed_to_tsv(
                 .map_err(|e| format!("create {out_path_for_writer}: {e}"))?;
             let mut writer = BufWriter::with_capacity(64 * 1024 * 1024, out_file);
             writer
-                .write_all(b"chrom\tpos\tallele0\tallele1\tmaf\tbeta\tse\tpwald\tplrt\n")
+                .write_all(b"chrom\tpos\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n")
                 .map_err(|e| format!("write header {out_path_for_writer}: {e}"))?;
             for block in rx {
                 if !block.is_empty() {
@@ -1280,7 +1469,7 @@ pub fn farmcpu_packed_to_tsv(
                     let qf = File::create(&qtn_path_for_writer)
                         .map_err(|e| format!("create {qtn_path_for_writer}: {e}"))?;
                     let mut qw = BufWriter::with_capacity(16 * 1024 * 1024, qf);
-                    qw.write_all(b"chrom\tpos\tallele0\tallele1\tmaf\tbeta\tse\tpwald\tplrt\n")
+                    qw.write_all(b"chrom\tpos\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n")
                         .map_err(|e| format!("write header {qtn_path_for_writer}: {e}"))?;
                     for block in qrx {
                         if !block.is_empty() {
@@ -1312,10 +1501,12 @@ pub fn farmcpu_packed_to_tsv(
             }
             for i in row_start..row_end {
                 let base = i * row_stride;
-                let beta = fem[base];
-                let se = fem[base + 1];
+                let mut beta = fem[base];
+                let mut se = fem[base + 1];
                 let mut pwald = fem[base + row_stride - 1];
                 if let Some(&j) = qtn_lookup.get(&i) {
+                    beta = qtn_beta[j];
+                    se = qtn_se[j];
                     if qtn_min_p[j].is_finite() {
                         pwald = qtn_min_p[j];
                     }
@@ -1326,23 +1517,44 @@ pub fn farmcpu_packed_to_tsv(
                 } else {
                     f64::NAN
                 };
+                let chisq = if plrt.is_finite() {
+                    chi2_stat_df1_from_sf(plrt)
+                } else if beta.is_finite() && se.is_finite() && se > 0.0 {
+                    let z = beta / se;
+                    z * z
+                } else {
+                    f64::NAN
+                };
+                let chisq_txt = format_chisq_value(chisq);
                 let _ = write!(
                     text_buf,
-                    "{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4e}\t{:.4e}\n",
-                    chrom[i], pos[i], allele0[i], allele1[i], row_maf[i], beta, se, pwald, plrt
+                    "{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\t{:.4e}\n",
+                    chrom[i],
+                    pos[i],
+                    allele0[i],
+                    allele1[i],
+                    row_maf[i],
+                    miss_counts[i],
+                    beta,
+                    se,
+                    chisq_txt,
+                    pwald,
+                    plrt
                 );
                 if let Some(ref mut qtn_text_buf) = qtn_text_buf_opt {
                     if qtn_lookup.contains_key(&i) {
                         let _ = write!(
                             qtn_text_buf,
-                            "{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4e}\t{:.4e}\n",
+                            "{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\t{:.4e}\n",
                             chrom[i],
                             pos[i],
                             allele0[i],
                             allele1[i],
                             row_maf[i],
+                            miss_counts[i],
                             beta,
                             se,
+                            chisq_txt,
                             pwald,
                             plrt
                         );
@@ -1397,6 +1609,7 @@ pub fn farmcpu_packed_to_tsv(
     allele0,
     allele1,
     maf,
+    row_missing,
     beta,
     se,
     pwald,
@@ -1412,6 +1625,7 @@ pub fn farmcpu_write_assoc_tsv(
     allele0: Vec<String>,
     allele1: Vec<String>,
     maf: PyReadonlyArray1<'_, f32>,
+    row_missing: PyReadonlyArray1<'_, f32>,
     beta: PyReadonlyArray1<'_, f64>,
     se: PyReadonlyArray1<'_, f64>,
     pwald: PyReadonlyArray1<'_, f64>,
@@ -1432,13 +1646,15 @@ pub fn farmcpu_write_assoc_tsv(
         )));
     }
     let maf = maf.as_slice()?;
+    let row_missing = row_missing.as_slice()?;
     let beta = beta.as_slice()?;
     let se = se.as_slice()?;
     let pwald = pwald.as_slice()?;
-    if maf.len() != m || beta.len() != m || se.len() != m || pwald.len() != m {
+    if maf.len() != m || row_missing.len() != m || beta.len() != m || se.len() != m || pwald.len() != m {
         return Err(PyRuntimeError::new_err(format!(
-            "FarmCPU vector length mismatch: m={m}, maf={}, beta={}, se={}, pwald={}",
+            "FarmCPU vector length mismatch: m={m}, maf={}, miss={}, beta={}, se={}, pwald={}",
             maf.len(),
+            row_missing.len(),
             beta.len(),
             se.len(),
             pwald.len()
@@ -1453,7 +1669,7 @@ pub fn farmcpu_write_assoc_tsv(
         .map_err(|e| PyRuntimeError::new_err(format!("create {out_tsv}: {e}")))?;
     let mut writer = BufWriter::with_capacity(4 * 1024 * 1024, out_file);
     writer
-        .write_all(b"chrom\tpos\tallele0\tallele1\tmaf\tbeta\tse\tpwald\tplrt\n")
+        .write_all(b"chrom\tpos\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n")
         .map_err(|e| PyRuntimeError::new_err(format!("write header {out_tsv}: {e}")))?;
 
     for i in 0..m {
@@ -1466,10 +1682,29 @@ pub fn farmcpu_write_assoc_tsv(
         } else {
             f64::NAN
         };
+        let chisq = if plrt.is_finite() {
+            chi2_stat_df1_from_sf(plrt)
+        } else if b.is_finite() && s.is_finite() && s > 0.0 {
+            let z = b / s;
+            z * z
+        } else {
+            f64::NAN
+        };
+        let chisq_txt = format_chisq_value(chisq);
         writeln!(
             writer,
-            "{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4e}\t{:.4e}",
-            chrom[i], pos[i], allele0[i], allele1[i], maf[i], b, s, pwald[i], plrt
+            "{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\t{:.4e}",
+            chrom[i],
+            pos[i],
+            allele0[i],
+            allele1[i],
+            maf[i],
+            row_missing[i].round() as i64,
+            b,
+            s,
+            chisq_txt,
+            pwald[i],
+            plrt
         )
         .map_err(|e| PyRuntimeError::new_err(format!("write row {i} to {out_tsv}: {e}")))?;
     }
@@ -1499,7 +1734,7 @@ pub fn farmcpu_write_assoc_tsv(
                 .map_err(|e| PyRuntimeError::new_err(format!("create {pseudo_path}: {e}")))?;
             let mut q_writer = BufWriter::with_capacity(512 * 1024, q_file);
             q_writer
-                .write_all(b"chrom\tpos\tallele0\tallele1\tmaf\tbeta\tse\tpwald\tplrt\n")
+                .write_all(b"chrom\tpos\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n")
                 .map_err(|e| PyRuntimeError::new_err(format!("write header {pseudo_path}: {e}")))?;
             for &idx in uniq.iter() {
                 let b = beta[idx];
@@ -1511,16 +1746,27 @@ pub fn farmcpu_write_assoc_tsv(
                 } else {
                     f64::NAN
                 };
+                let chisq = if plrt.is_finite() {
+                    chi2_stat_df1_from_sf(plrt)
+                } else if b.is_finite() && s.is_finite() && s > 0.0 {
+                    let z = b / s;
+                    z * z
+                } else {
+                    f64::NAN
+                };
+                let chisq_txt = format_chisq_value(chisq);
                 writeln!(
                     q_writer,
-                    "{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4e}\t{:.4e}",
+                    "{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\t{:.4e}",
                     chrom[idx],
                     pos[idx],
                     allele0[idx],
                     allele1[idx],
                     maf[idx],
+                    row_missing[idx].round() as i64,
                     b,
                     s,
+                    chisq_txt,
                     pwald[idx],
                     plrt
                 )

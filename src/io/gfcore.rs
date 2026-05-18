@@ -163,9 +163,8 @@ pub fn process_snp_row_with_stats(
 
     if apply_het_filter {
         let het_rate = het_count as f64 / non_missing as f64;
-        let low = het_threshold as f64;
-        let high = 1.0 - low;
-        if het_rate < low || het_rate > high {
+        let max_het = het_threshold as f64;
+        if het_rate > max_het {
             return None;
         }
     }
@@ -198,10 +197,7 @@ pub fn process_snp_row_with_stats(
         }
     }
 
-    Some(ProcessedSnpRowStats {
-        missing_count,
-        maf,
-    })
+    Some(ProcessedSnpRowStats { missing_count, maf })
 }
 
 pub fn process_snp_row(

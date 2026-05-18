@@ -370,9 +370,9 @@ pub fn lm_stream_bed_to_tsv(
             "max_missing_rate must be within [0, 1.0]",
         ));
     }
-    if !(0.0..=0.5).contains(&het_threshold) {
+    if !(0.0..=1.0).contains(&het_threshold) {
         return Err(PyValueError::new_err(
-            "het_threshold must be within [0, 0.5]",
+            "het_threshold must be within [0, 1.0]",
         ));
     }
     let model = genetic_model.trim().to_ascii_lowercase();
@@ -465,7 +465,9 @@ pub fn lm_stream_bed_to_tsv(
                 .map_err(|e| format!("create {out_tsv_path_for_writer}: {e}"))?;
             let mut writer = BufWriter::with_capacity(64 * 1024 * 1024, out_file);
             writer
-                .write_all(b"chrom\tpos\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n")
+                .write_all(
+                    b"chrom\tpos\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n",
+                )
                 .map_err(|e| format!("write header {out_tsv_path_for_writer}: {e}"))?;
             for block in rx {
                 if !block.is_empty() {
@@ -561,7 +563,8 @@ pub fn lm_stream_bed_to_tsv(
             }
 
             let decoded: Vec<(Vec<f32>, gfcore::SiteInfo, f32, f32)> = if windowed_mode {
-                let mut tmp: Vec<(Vec<f32>, gfcore::SiteInfo, f32, f32)> = Vec::with_capacity(batch_len);
+                let mut tmp: Vec<(Vec<f32>, gfcore::SiteInfo, f32, f32)> =
+                    Vec::with_capacity(batch_len);
                 for _ in 0..batch_len {
                     let maybe = if full_samples {
                         it.next_snp_raw()
@@ -1445,7 +1448,9 @@ pub fn glmf32_packed_assoc_to_tsv(
                 .map_err(|e| format!("create {out_path_for_writer}: {e}"))?;
             let mut writer = BufWriter::with_capacity(64 * 1024 * 1024, out_file);
             writer
-                .write_all(b"chrom\tpos\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n")
+                .write_all(
+                    b"chrom\tpos\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n",
+                )
                 .map_err(|e| format!("write header {out_path_for_writer}: {e}"))?;
             for block in rx {
                 if !block.is_empty() {
@@ -1476,120 +1481,120 @@ pub fn glmf32_packed_assoc_to_tsv(
                     .zip(miss_sub.par_iter_mut())
                     .enumerate()
                     .for_each_init(
-                    || GlmScratch::new(q0),
-                    |scr, (l, (row_out, miss_out))| {
-                        let idx = i_marker + l;
-                        let src_row = row_idx.as_ref().map(|v| v[idx]).unwrap_or(idx);
-                        scr.reset_xs();
+                        || GlmScratch::new(q0),
+                        |scr, (l, (row_out, miss_out))| {
+                            let idx = i_marker + l;
+                            let src_row = row_idx.as_ref().map(|v| v[idx]).unwrap_or(idx);
+                            scr.reset_xs();
 
-                        let row =
-                            &packed_flat[src_row * bytes_per_snp..(src_row + 1) * bytes_per_snp];
-                        let flip = row_flip[idx];
-                        let mean_g = (2.0_f64 * row_maf[idx] as f64).max(0.0);
+                            let row = &packed_flat
+                                [src_row * bytes_per_snp..(src_row + 1) * bytes_per_snp];
+                            let flip = row_flip[idx];
+                            let mean_g = (2.0_f64 * row_maf[idx] as f64).max(0.0);
 
-                        let mut sy = 0.0_f64;
-                        let mut ss = 0.0_f64;
-                        let mut missing_ct = 0usize;
-                        if sample_idx_is_identity {
-                            let full_bytes = n_samples / 4;
-                            let rem = n_samples % 4;
-                            let mut k = 0usize;
-                            for &b in row.iter().take(full_bytes) {
-                                let codes = &code4_lut[b as usize];
-                                for &code in codes.iter().take(4) {
+                            let mut sy = 0.0_f64;
+                            let mut ss = 0.0_f64;
+                            let mut missing_ct = 0usize;
+                            if sample_idx_is_identity {
+                                let full_bytes = n_samples / 4;
+                                let rem = n_samples % 4;
+                                let mut k = 0usize;
+                                for &b in row.iter().take(full_bytes) {
+                                    let codes = &code4_lut[b as usize];
+                                    for &code in codes.iter().take(4) {
+                                        if code == 0b01 {
+                                            missing_ct += 1;
+                                        }
+                                        let gv = decode_plink_dosage_with_mean(code, mean_g, flip);
+                                        sy += gv * y[k];
+                                        ss += gv * gv;
+                                        let xrow = &x_flat[k * q0..(k + 1) * q0];
+                                        for j in 0..q0 {
+                                            scr.xs[j] += xrow[j] * gv;
+                                        }
+                                        k += 1;
+                                    }
+                                }
+                                if rem > 0 {
+                                    let codes = &code4_lut[row[full_bytes] as usize];
+                                    for &code in codes.iter().take(rem) {
+                                        if code == 0b01 {
+                                            missing_ct += 1;
+                                        }
+                                        let gv = decode_plink_dosage_with_mean(code, mean_g, flip);
+                                        sy += gv * y[k];
+                                        ss += gv * gv;
+                                        let xrow = &x_flat[k * q0..(k + 1) * q0];
+                                        for j in 0..q0 {
+                                            scr.xs[j] += xrow[j] * gv;
+                                        }
+                                        k += 1;
+                                    }
+                                }
+                            } else {
+                                for k in 0..n {
+                                    let b = row[sample_byte_idx[k]];
+                                    let code = code4_lut[b as usize][sample_lane_idx[k]];
                                     if code == 0b01 {
                                         missing_ct += 1;
                                     }
                                     let gv = decode_plink_dosage_with_mean(code, mean_g, flip);
+
                                     sy += gv * y[k];
                                     ss += gv * gv;
                                     let xrow = &x_flat[k * q0..(k + 1) * q0];
                                     for j in 0..q0 {
                                         scr.xs[j] += xrow[j] * gv;
                                     }
-                                    k += 1;
                                 }
                             }
-                            if rem > 0 {
-                                let codes = &code4_lut[row[full_bytes] as usize];
-                                for &code in codes.iter().take(rem) {
-                                    if code == 0b01 {
-                                        missing_ct += 1;
-                                    }
-                                    let gv = decode_plink_dosage_with_mean(code, mean_g, flip);
-                                    sy += gv * y[k];
-                                    ss += gv * gv;
-                                    let xrow = &x_flat[k * q0..(k + 1) * q0];
-                                    for j in 0..q0 {
-                                        scr.xs[j] += xrow[j] * gv;
-                                    }
-                                    k += 1;
-                                }
+
+                            xs_t_ixx_into(&scr.xs, &ixx_flat, q0, &mut scr.b21);
+                            let t2 = dot(&scr.b21, &scr.xs);
+                            let b22 = ss - t2;
+
+                            let (invb22, df) = if b22 < 1e-8 {
+                                (0.0, (n as i32) - (q0 as i32))
+                            } else {
+                                (1.0 / b22, (n as i32) - (q0 as i32) - 1)
+                            };
+                            if df <= 0 {
+                                row_out.fill(f64::NAN);
+                                return;
                             }
-                        } else {
-                            for k in 0..n {
-                                let b = row[sample_byte_idx[k]];
-                                let code = code4_lut[b as usize][sample_lane_idx[k]];
-                                if code == 0b01 {
-                                    missing_ct += 1;
-                                }
-                                let gv = decode_plink_dosage_with_mean(code, mean_g, flip);
 
-                                sy += gv * y[k];
-                                ss += gv * gv;
-                                let xrow = &x_flat[k * q0..(k + 1) * q0];
-                                for j in 0..q0 {
-                                    scr.xs[j] += xrow[j] * gv;
-                                }
+                            build_ixxs_into(&ixx_flat, &scr.b21, invb22, q0, &mut scr.ixxs);
+                            scr.rhs[..q0].copy_from_slice(&xy);
+                            scr.rhs[q0] = sy;
+                            matvec_into(&scr.ixxs, dim, &scr.rhs, &mut scr.beta);
+
+                            let beta_rhs = dot(&scr.beta, &scr.rhs);
+                            let ve = (yy - beta_rhs) / (df as f64);
+                            let beta_snp = scr.beta[q0];
+                            let se_snp = (scr.ixxs[q0 * dim + q0] * ve).sqrt();
+
+                            if invb22 == 0.0
+                                || !beta_snp.is_finite()
+                                || !se_snp.is_finite()
+                                || se_snp <= 0.0
+                            {
+                                *miss_out = missing_ct;
+                                row_out.fill(f64::NAN);
+                                return;
                             }
-                        }
 
-                        xs_t_ixx_into(&scr.xs, &ixx_flat, q0, &mut scr.b21);
-                        let t2 = dot(&scr.b21, &scr.xs);
-                        let b22 = ss - t2;
-
-                        let (invb22, df) = if b22 < 1e-8 {
-                            (0.0, (n as i32) - (q0 as i32))
-                        } else {
-                            (1.0 / b22, (n as i32) - (q0 as i32) - 1)
-                        };
-                        if df <= 0 {
-                            row_out.fill(f64::NAN);
-                            return;
-                        }
-
-                        build_ixxs_into(&ixx_flat, &scr.b21, invb22, q0, &mut scr.ixxs);
-                        scr.rhs[..q0].copy_from_slice(&xy);
-                        scr.rhs[q0] = sy;
-                        matvec_into(&scr.ixxs, dim, &scr.rhs, &mut scr.beta);
-
-                        let beta_rhs = dot(&scr.beta, &scr.rhs);
-                        let ve = (yy - beta_rhs) / (df as f64);
-                        let beta_snp = scr.beta[q0];
-                        let se_snp = (scr.ixxs[q0 * dim + q0] * ve).sqrt();
-
-                        if invb22 == 0.0
-                            || !beta_snp.is_finite()
-                            || !se_snp.is_finite()
-                            || se_snp <= 0.0
-                        {
+                            let t = beta_snp / se_snp;
+                            let pwald = student_t_p_two_sided(t, df);
+                            let stat = (n as f64) * (1.0 + (t * t) / (df as f64)).ln();
+                            let plrt = lm_plrt_from_t2(t * t, n, df);
+                            row_out[0] = beta_snp;
+                            row_out[1] = se_snp;
+                            row_out[2] = stat;
+                            row_out[3] = pwald;
+                            row_out[4] = plrt;
                             *miss_out = missing_ct;
-                            row_out.fill(f64::NAN);
-                            return;
-                        }
-
-                        let t = beta_snp / se_snp;
-                        let pwald = student_t_p_two_sided(t, df);
-                        let stat = (n as f64) * (1.0 + (t * t) / (df as f64)).ln();
-                        let plrt = lm_plrt_from_t2(t * t, n, df);
-                        row_out[0] = beta_snp;
-                        row_out[1] = se_snp;
-                        row_out[2] = stat;
-                        row_out[3] = pwald;
-                        row_out[4] = plrt;
-                        *miss_out = missing_ct;
-                    },
-                );
+                        },
+                    );
 
                 text_buf.clear();
                 if text_buf.capacity() < cnt * 96 {
@@ -1600,17 +1605,17 @@ pub fn glmf32_packed_assoc_to_tsv(
                     let base = l * 5;
                     let chisq_txt = format_chisq_value(block[base + 2]);
                     let _ = write!(
-                    text_buf,
-                    "{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\t{:.4e}\n",
-                    chrom[idx],
-                    pos[idx],
-                    allele0[idx],
-                    allele1[idx],
-                    row_maf[idx],
-                    miss_block[l],
-                    block[base],
-                    block[base + 1],
-                    chisq_txt,
+                        text_buf,
+                        "{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\t{:.4e}\n",
+                        chrom[idx],
+                        pos[idx],
+                        allele0[idx],
+                        allele1[idx],
+                        row_maf[idx],
+                        miss_block[l],
+                        block[base],
+                        block[base + 1],
+                        chisq_txt,
                         block[base + 3],
                         block[base + 4],
                     );

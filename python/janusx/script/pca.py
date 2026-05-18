@@ -1136,7 +1136,7 @@ def main(log: bool = True):
                 )
                 with CliStatus(
                     f"Loading genotype from {load_src_disp}...",
-                    enabled=use_spinner,
+                    enabled=(use_spinner and (not mmap_limit_effective)),
                     use_process=True,
                 ) as task:
                     try:
@@ -1240,7 +1240,7 @@ def main(log: bool = True):
         else:
             with CliStatus(
                 f"Loading genotype from {load_src_disp}...",
-                enabled=use_spinner,
+                enabled=(use_spinner and (not mmap_limit_effective)),
                 use_process=True,
             ) as task:
                 try:

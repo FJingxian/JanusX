@@ -73,6 +73,10 @@ def eigh(
     - For best performance, pass a contiguous ``float64`` matrix.
     - ``inplace=True`` typically reduces extra copy overhead in large problems.
     - Numerical behavior follows LAPACK backend semantics.
+    - For benchmarking, keep the returned arrays alive or use
+      ``return_meta=True`` and inspect the final ``elapsed_seconds`` field.
+      If the result is discarded immediately, Python may spend noticeable time
+      destroying large eigenvector arrays inside the same wall-clock timer.
 
     Examples
     --------
@@ -95,6 +99,12 @@ def eigh(
     10
     >>> ret[3]  # evd backend label, e.g. 'lapack_dsyevd'
     'lapack_dsyevd'
+
+    Benchmarking large problems
+    >>> vals, vecs = jx.linalg.eigh(A_large, threads=4)
+    >>> meta = jx.linalg.eigh(A_large, threads=4, return_meta=True)
+    >>> meta[-1]  # native solve time in seconds
+    0.123
     """
     import numpy as np
     from .. import janusx as _jx

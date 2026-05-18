@@ -1,5 +1,5 @@
-use nalgebra::{DMatrix, SymmetricEigen};
 use memmap2::Mmap;
+use nalgebra::{DMatrix, SymmetricEigen};
 use numpy::ndarray::ArrayView2;
 use numpy::{
     PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods,
@@ -314,10 +314,8 @@ fn try_build_packed_bed_backend(cfg: &StreamRsvdConfig) -> Result<Option<PackedB
     let expected_payload = n_snps_total
         .checked_mul(bytes_per_snp)
         .ok_or_else(|| "BED payload size overflow".to_string())?;
-    let file_size = usize::try_from(
-        file.metadata().map_err(|e| e.to_string())?.len()
-    )
-    .map_err(|_| "BED file size overflow".to_string())?;
+    let file_size = usize::try_from(file.metadata().map_err(|e| e.to_string())?.len())
+        .map_err(|_| "BED file size overflow".to_string())?;
     let expected_size = 3usize
         .checked_add(expected_payload)
         .ok_or_else(|| "BED file size overflow".to_string())?;
@@ -850,7 +848,11 @@ pub fn admx_rsvd_stream<'py>(
         "stream/backend_ready",
         &format!(
             "mode={} n_samples={} n_snps={} kp={} row_freq={}{}",
-            if packed_backend.is_some() { "packed_mmap" } else { "stream" },
+            if packed_backend.is_some() {
+                "packed_mmap"
+            } else {
+                "stream"
+            },
             n,
             m,
             kp,
@@ -862,7 +864,12 @@ pub fn admx_rsvd_stream<'py>(
     let omega = random_omega(m, kp, seed);
     emit_rsvd_rss_debug(
         "stream/omega_ready",
-        &format!("omega_shape=({}, {}) omega={}", m, kp, format_f32_vec_bytes(omega.len())),
+        &format!(
+            "omega_shape=({}, {}) omega={}",
+            m,
+            kp,
+            format_f32_vec_bytes(omega.len())
+        ),
     );
     let mut y = if let Some(backend) = packed_backend.as_ref() {
         compute_at_omega_packed(backend, &omega, kp, tile_cols)
@@ -872,12 +879,22 @@ pub fn admx_rsvd_stream<'py>(
     .map_err(PyRuntimeError::new_err)?;
     emit_rsvd_rss_debug(
         "stream/y_ready",
-        &format!("y_shape=({}, {}) y={}", n, kp, format_f32_vec_bytes(y.len())),
+        &format!(
+            "y_shape=({}, {}) y={}",
+            n,
+            kp,
+            format_f32_vec_bytes(y.len())
+        ),
     );
     let (mut q, _, _) = thin_svd_from_tall(&y, n, kp).map_err(PyRuntimeError::new_err)?;
     emit_rsvd_rss_debug(
         "stream/q_ready",
-        &format!("q_shape=({}, {}) q={}", n, kp, format_f32_vec_bytes(q.len())),
+        &format!(
+            "q_shape=({}, {}) q={}",
+            n,
+            kp,
+            format_f32_vec_bytes(q.len())
+        ),
     );
 
     let mut sk = vec![0.0_f32; kp];
@@ -1090,7 +1107,11 @@ pub fn admx_rsvd_stream_sample<'py>(
         "stream_sample/backend_ready",
         &format!(
             "mode={} n_samples={} n_snps={} kp={} row_freq={} varsum={:.6e}{}",
-            if packed_backend.is_some() { "packed_mmap" } else { "stream" },
+            if packed_backend.is_some() {
+                "packed_mmap"
+            } else {
+                "stream"
+            },
             n,
             m,
             kp,
@@ -1103,7 +1124,12 @@ pub fn admx_rsvd_stream_sample<'py>(
     let omega = random_omega(m, kp, seed);
     emit_rsvd_rss_debug(
         "stream_sample/omega_ready",
-        &format!("omega_shape=({}, {}) omega={}", m, kp, format_f32_vec_bytes(omega.len())),
+        &format!(
+            "omega_shape=({}, {}) omega={}",
+            m,
+            kp,
+            format_f32_vec_bytes(omega.len())
+        ),
     );
     let mut y = if let Some(backend) = packed_backend.as_ref() {
         compute_at_omega_packed(backend, &omega, kp, tile_cols)
@@ -1113,12 +1139,22 @@ pub fn admx_rsvd_stream_sample<'py>(
     .map_err(PyRuntimeError::new_err)?;
     emit_rsvd_rss_debug(
         "stream_sample/y_ready",
-        &format!("y_shape=({}, {}) y={}", n, kp, format_f32_vec_bytes(y.len())),
+        &format!(
+            "y_shape=({}, {}) y={}",
+            n,
+            kp,
+            format_f32_vec_bytes(y.len())
+        ),
     );
     let (mut q, _, _) = thin_svd_from_tall(&y, n, kp).map_err(PyRuntimeError::new_err)?;
     emit_rsvd_rss_debug(
         "stream_sample/q_ready",
-        &format!("q_shape=({}, {}) q={}", n, kp, format_f32_vec_bytes(q.len())),
+        &format!(
+            "q_shape=({}, {}) q={}",
+            n,
+            kp,
+            format_f32_vec_bytes(q.len())
+        ),
     );
 
     let mut sk = vec![0.0_f32; kp];

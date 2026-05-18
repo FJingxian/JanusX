@@ -1,5 +1,7 @@
-use crate::ml::common::ResponseKind;
+use crate::ml::common::{ImportanceKind, PermutationConfig, ResponseKind};
 use crate::ml::extra_trees::{feature_scores_extra_trees, ExtraTreesConfig};
+use crate::ml::gbdt::{feature_scores_gbdt, feature_scores_gbdt_permutation};
+use crate::ml::rf::{feature_scores_random_forest, feature_scores_random_forest_permutation};
 use crate::ml::univariate::{
     feature_scores_abs_corr_binary_x, feature_scores_abs_mcc_binary_x,
     feature_scores_abs_mean_diff_binary_x, feature_scores_fisher_binary_x,
@@ -11,6 +13,7 @@ pub enum MlEngine {
     ExtraTrees,
     RandomForest,
     Gbdt,
+    Gbdt2,
     Corr,
     Mcc,
     MeanDiff,
@@ -25,13 +28,14 @@ pub fn parse_ml_engine(method: &str) -> Result<MlEngine, String> {
         "et" | "extratrees" | "extra_trees" => Ok(MlEngine::ExtraTrees),
         "rf" | "random_forest" | "randomforest" => Ok(MlEngine::RandomForest),
         "gbdt" | "gradient_boosting" | "gradientboosting" => Ok(MlEngine::Gbdt),
+        "gbdt2" | "gradient_boosting2" | "gradientboosting2" => Ok(MlEngine::Gbdt2),
         "corr" | "pearson" => Ok(MlEngine::Corr),
         "mcc" => Ok(MlEngine::Mcc),
         "mean_diff" | "meandiff" | "mean-diff" => Ok(MlEngine::MeanDiff),
         "fisher" | "fisher_score" | "fisherscore" => Ok(MlEngine::Fisher),
         "lgbm" | "lightgbm" => Ok(MlEngine::LightGbm),
         _ => Err(format!(
-            "unsupported ML engine: {method}. supported: auto, et, rf, gbdt, corr, mcc, mean_diff, fisher, lightgbm"
+            "unsupported ML engine: {method}. supported: auto, et, rf, gbdt, gbdt2, corr, mcc, mean_diff, fisher, lightgbm"
         )),
     }
 }
@@ -42,27 +46,58 @@ pub fn compute_feature_scores(
     response: ResponseKind,
     engine: MlEngine,
     cfg: ExtraTreesConfig,
+    importance: ImportanceKind,
+    perm_cfg: PermutationConfig,
 ) -> Result<Vec<f64>, String> {
     let resolved = match engine {
-        MlEngine::Auto => MlEngine::ExtraTrees,
+        MlEngine::Auto => match importance {
+            ImportanceKind::Imp => MlEngine::ExtraTrees,
+            ImportanceKind::Permutation => MlEngine::RandomForest,
+        },
         other => other,
     };
 
-    let scores = match resolved {
-        MlEngine::ExtraTrees | MlEngine::RandomForest | MlEngine::Gbdt => {
+    let scores = match (resolved, importance) {
+        (MlEngine::ExtraTrees, ImportanceKind::Imp) => {
             feature_scores_extra_trees(x_rows, y, response, cfg)
         }
-        MlEngine::Corr => feature_scores_abs_corr_binary_x(x_rows, y),
-        MlEngine::Mcc => feature_scores_abs_mcc_binary_x(x_rows, y),
-        MlEngine::MeanDiff => feature_scores_abs_mean_diff_binary_x(x_rows, y),
-        MlEngine::Fisher => feature_scores_fisher_binary_x(x_rows, y, response),
-        MlEngine::LightGbm => {
+        (MlEngine::ExtraTrees, ImportanceKind::Permutation) => {
             return Err(
-                "lightgbm engine is not yet implemented in Rust. please use: et/rf/gbdt/corr/mcc/mean_diff/fisher"
+                "permutation importance is not implemented for extra_trees; use rf or gbdt"
                     .to_string(),
             );
         }
-        MlEngine::Auto => unreachable!(),
+        (MlEngine::RandomForest, ImportanceKind::Imp) => {
+            feature_scores_random_forest(x_rows, y, response, cfg)
+        }
+        (MlEngine::RandomForest, ImportanceKind::Permutation) => {
+            feature_scores_random_forest_permutation(x_rows, y, response, cfg, perm_cfg)
+        }
+        (MlEngine::Gbdt, ImportanceKind::Imp)
+        | (MlEngine::Gbdt2, ImportanceKind::Imp)
+        | (MlEngine::LightGbm, ImportanceKind::Imp) => {
+            feature_scores_gbdt(x_rows, y, response, cfg)
+        }
+        (MlEngine::Gbdt, ImportanceKind::Permutation)
+        | (MlEngine::Gbdt2, ImportanceKind::Permutation)
+        | (MlEngine::LightGbm, ImportanceKind::Permutation) => {
+            feature_scores_gbdt_permutation(x_rows, y, response, cfg, perm_cfg)
+        }
+        (MlEngine::Corr, ImportanceKind::Imp) | (MlEngine::Corr, ImportanceKind::Permutation) => {
+            feature_scores_abs_corr_binary_x(x_rows, y)
+        }
+        (MlEngine::Mcc, ImportanceKind::Imp) | (MlEngine::Mcc, ImportanceKind::Permutation) => {
+            feature_scores_abs_mcc_binary_x(x_rows, y)
+        }
+        (MlEngine::MeanDiff, ImportanceKind::Imp)
+        | (MlEngine::MeanDiff, ImportanceKind::Permutation) => {
+            feature_scores_abs_mean_diff_binary_x(x_rows, y)
+        }
+        (MlEngine::Fisher, ImportanceKind::Imp)
+        | (MlEngine::Fisher, ImportanceKind::Permutation) => {
+            feature_scores_fisher_binary_x(x_rows, y, response)
+        }
+        (MlEngine::Auto, _) => unreachable!(),
     };
     Ok(scores)
 }

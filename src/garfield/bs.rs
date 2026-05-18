@@ -1,0 +1,1543 @@
+#![allow(dead_code)]
+
+use super::score::{
+    score_cont_weighted_mean_diff_packed, validate_continuous_y, ContinuousRuleScore,
+};
+use crate::bitwise::{bitand_assign, bitnot_masked, bitor_into};
+use rayon::prelude::*;
+use std::collections::HashMap;
+
+#[cfg(test)]
+use std::collections::HashSet;
+
+const GARFIELD_BEAM_PAR_MIN_TOTAL_CANDS: usize = 1_024;
+const GARFIELD_BEAM_PAR_CHUNK_CANDS: usize = 128;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum BeamBinaryOp {
+    And,
+    Or,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum BeamLogicGateMode {
+    AndOnly,
+    OrOnly,
+    AndOr,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum BeamRankMode {
+    Raw,
+    InteractionGain,
+}
+
+impl BeamLogicGateMode {
+    #[inline]
+    fn allowed_ops(self) -> &'static [BeamBinaryOp] {
+        match self {
+            BeamLogicGateMode::AndOnly => &[BeamBinaryOp::And],
+            BeamLogicGateMode::OrOnly => &[BeamBinaryOp::Or],
+            BeamLogicGateMode::AndOr => &[BeamBinaryOp::And, BeamBinaryOp::Or],
+        }
+    }
+
+    #[inline]
+    fn op_count(self) -> usize {
+        self.allowed_ops().len()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct BeamLiteral {
+    pub row_index: usize,
+    pub group_id: usize,
+    pub negated: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BeamRule {
+    pub first: BeamLiteral,
+    pub rest: Vec<(BeamBinaryOp, BeamLiteral)>,
+}
+
+impl BeamRule {
+    #[inline]
+    pub fn len(&self) -> usize {
+        1 + self.rest.len()
+    }
+
+    #[inline]
+    pub fn not_count(&self) -> usize {
+        usize::from(self.first.negated)
+            + self
+                .rest
+                .iter()
+                .map(|(_, lit)| usize::from(lit.negated))
+                .sum::<usize>()
+    }
+
+    #[inline]
+    pub fn last_row_index(&self) -> usize {
+        self.rest
+            .last()
+            .map(|(_, lit)| lit.row_index)
+            .unwrap_or(self.first.row_index)
+    }
+
+    #[inline]
+    pub fn uses_group(&self, group_id: usize) -> bool {
+        if self.first.group_id == group_id {
+            return true;
+        }
+        self.rest.iter().any(|(_, lit)| lit.group_id == group_id)
+    }
+
+    #[inline]
+    fn lexical_key(&self) -> Vec<(usize, bool, u8)> {
+        let mut out = Vec::with_capacity(self.len());
+        out.push((self.first.row_index, self.first.negated, 0u8));
+        for (op, lit) in self.rest.iter() {
+            let op_code = match op {
+                BeamBinaryOp::And => 1u8,
+                BeamBinaryOp::Or => 2u8,
+            };
+            out.push((lit.row_index, lit.negated, op_code));
+        }
+        out
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BeamSearchParams {
+    pub max_pick: usize,
+    pub beam_width: usize,
+    pub candidate_keep_ratio: f64,
+    pub lambda_len: f64,
+    pub lambda_not: f64,
+    pub exhaustive_depth: usize,
+    pub logic_gate_mode: BeamLogicGateMode,
+    pub rank_mode: BeamRankMode,
+}
+
+impl Default for BeamSearchParams {
+    fn default() -> Self {
+        Self {
+            max_pick: 3,
+            beam_width: 5,
+            candidate_keep_ratio: 0.10,
+            lambda_len: 0.0,
+            lambda_not: 0.0,
+            exhaustive_depth: 1,
+            logic_gate_mode: BeamLogicGateMode::AndOr,
+            rank_mode: BeamRankMode::InteractionGain,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct BeamRuleCandidate {
+    pub rule: BeamRule,
+    pub train_score: f64,
+    pub test_score: f64,
+    pub train: ContinuousRuleScore,
+    pub test: ContinuousRuleScore,
+}
+
+#[derive(Clone, Debug)]
+struct BeamState {
+    rule: BeamRule,
+    combined_train: Vec<u64>,
+    train: ContinuousRuleScore,
+    train_score: f64,
+    max_singleton_train_raw: f64,
+    max_singleton_test_raw: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LiteralSingletonScore {
+    train: ContinuousRuleScore,
+    test: ContinuousRuleScore,
+}
+
+#[inline]
+fn words_for_samples(n_samples: usize) -> usize {
+    n_samples.div_ceil(64).max(1)
+}
+
+#[inline]
+fn tail_mask(n_samples: usize) -> Option<u64> {
+    let rem = n_samples & 63;
+    if rem == 0 {
+        None
+    } else {
+        Some((1u64 << rem) - 1u64)
+    }
+}
+
+#[inline]
+fn apply_tail_mask(bits: &mut [u64], mask: Option<u64>) {
+    if let Some(m) = mask {
+        if let Some(last) = bits.last_mut() {
+            *last &= m;
+        }
+    }
+}
+
+#[inline]
+fn row_prefix<'a>(
+    bits_flat: &'a [u64],
+    row_words: usize,
+    row_idx: usize,
+    needed_words: usize,
+) -> &'a [u64] {
+    let st = row_idx * row_words;
+    &bits_flat[st..st + needed_words]
+}
+
+#[inline]
+fn score_key(s: f64) -> f64 {
+    if s.is_nan() {
+        f64::NEG_INFINITY
+    } else {
+        s
+    }
+}
+
+#[inline]
+fn penalty_for_rule(rule: &BeamRule, params: &BeamSearchParams) -> f64 {
+    let len_pen = if rule.len() > 1 {
+        params.lambda_len * ((rule.len() - 1) as f64)
+    } else {
+        0.0
+    };
+    let not_pen = params.lambda_not * (rule.not_count() as f64);
+    len_pen + not_pen
+}
+
+#[inline]
+fn train_score_for_rule(
+    rule: &BeamRule,
+    train_raw: ContinuousRuleScore,
+    max_singleton_raw: f64,
+    params: &BeamSearchParams,
+) -> f64 {
+    let base = match params.rank_mode {
+        BeamRankMode::Raw => train_raw.raw_score,
+        BeamRankMode::InteractionGain => {
+            if rule.len() >= 2 {
+                train_raw.raw_score - max_singleton_raw
+            } else {
+                train_raw.raw_score
+            }
+        }
+    };
+    base - penalty_for_rule(rule, params)
+}
+
+#[inline]
+fn support_balance(sc: &ContinuousRuleScore) -> usize {
+    sc.n_hit.min(sc.n_miss)
+}
+
+#[inline]
+fn cmp_rule_lex(a: &BeamRule, b: &BeamRule) -> std::cmp::Ordering {
+    a.lexical_key().cmp(&b.lexical_key())
+}
+
+#[inline]
+fn literal_score_index(row_index: usize, negated: bool) -> usize {
+    row_index
+        .saturating_mul(2)
+        .saturating_add(usize::from(negated))
+}
+
+#[inline]
+fn cmp_state(a: &BeamState, b: &BeamState) -> std::cmp::Ordering {
+    let sa = score_key(a.train_score);
+    let sb = score_key(b.train_score);
+    match sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal) {
+        std::cmp::Ordering::Equal => match a.rule.len().cmp(&b.rule.len()) {
+            std::cmp::Ordering::Equal => {
+                match support_balance(&b.train).cmp(&support_balance(&a.train)) {
+                    std::cmp::Ordering::Equal => {
+                        match a.rule.not_count().cmp(&b.rule.not_count()) {
+                            std::cmp::Ordering::Equal => cmp_rule_lex(&a.rule, &b.rule),
+                            other => other,
+                        }
+                    }
+                    other => other,
+                }
+            }
+            other => other,
+        },
+        other => other,
+    }
+}
+
+#[inline]
+fn cmp_candidate(a: &BeamRuleCandidate, b: &BeamRuleCandidate) -> std::cmp::Ordering {
+    let sa = score_key(a.test_score);
+    let sb = score_key(b.test_score);
+    match sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal) {
+        std::cmp::Ordering::Equal => match a.rule.len().cmp(&b.rule.len()) {
+            std::cmp::Ordering::Equal => {
+                match support_balance(&b.test).cmp(&support_balance(&a.test)) {
+                    std::cmp::Ordering::Equal => {
+                        let ta = score_key(a.train_score);
+                        let tb = score_key(b.train_score);
+                        match tb.partial_cmp(&ta).unwrap_or(std::cmp::Ordering::Equal) {
+                            std::cmp::Ordering::Equal => {
+                                match a.rule.not_count().cmp(&b.rule.not_count()) {
+                                    std::cmp::Ordering::Equal => cmp_rule_lex(&a.rule, &b.rule),
+                                    other => other,
+                                }
+                            }
+                            other => other,
+                        }
+                    }
+                    other => other,
+                }
+            }
+            other => other,
+        },
+        other => other,
+    }
+}
+
+#[inline]
+fn push_top_k_states(nodes: &mut Vec<BeamState>, cand: BeamState, k: usize) {
+    if k == 0 {
+        return;
+    }
+    if nodes.len() < k {
+        nodes.push(cand);
+        return;
+    }
+    let mut worst_idx = 0usize;
+    for i in 1..nodes.len() {
+        if cmp_state(&nodes[i], &nodes[worst_idx]) == std::cmp::Ordering::Greater {
+            worst_idx = i;
+        }
+    }
+    if cmp_state(&cand, &nodes[worst_idx]) == std::cmp::Ordering::Less {
+        nodes[worst_idx] = cand;
+    }
+}
+
+#[inline]
+fn state_scores_tied(a: f64, b: f64) -> bool {
+    let aa = score_key(a);
+    let bb = score_key(b);
+    if aa == bb {
+        return true;
+    }
+    if !aa.is_finite() || !bb.is_finite() {
+        return false;
+    }
+    let scale = aa.abs().max(bb.abs()).max(1.0);
+    (aa - bb).abs() <= 1e-12 * scale
+}
+
+#[inline]
+fn sort_truncate_states(mut nodes: Vec<BeamState>, k: usize) -> Vec<BeamState> {
+    nodes.sort_by(cmp_state);
+    if nodes.len() > k {
+        let mut keep = k;
+        let cutoff = nodes[keep - 1].train_score;
+        while keep < nodes.len() && state_scores_tied(nodes[keep].train_score, cutoff) {
+            keep += 1;
+        }
+        nodes.truncate(keep);
+    }
+    nodes
+}
+
+#[inline]
+fn should_parallel(total_cands: usize) -> bool {
+    rayon::current_num_threads() > 1 && total_cands >= GARFIELD_BEAM_PAR_MIN_TOTAL_CANDS
+}
+
+fn validate_bit_matrix(
+    bits_flat: &[u64],
+    row_words: usize,
+    n_rows: usize,
+    n_samples: usize,
+    ctx: &str,
+) -> Result<usize, String> {
+    if n_rows == 0 {
+        return Err(format!("{ctx}: n_rows must be > 0"));
+    }
+    if n_samples == 0 {
+        return Err(format!("{ctx}: n_samples must be > 0"));
+    }
+    if row_words == 0 {
+        return Err(format!("{ctx}: row_words must be > 0"));
+    }
+    let needed_words = words_for_samples(n_samples);
+    if row_words < needed_words {
+        return Err(format!(
+            "{ctx}: row_words={} smaller than required {}",
+            row_words, needed_words
+        ));
+    }
+    let total_words = n_rows
+        .checked_mul(row_words)
+        .ok_or_else(|| format!("{ctx}: n_rows*row_words overflow"))?;
+    if bits_flat.len() < total_words {
+        return Err(format!(
+            "{ctx}: bits length={} smaller than required {}",
+            bits_flat.len(),
+            total_words
+        ));
+    }
+    Ok(needed_words)
+}
+
+fn validate_search_inputs(
+    y_train: &[f64],
+    bits_train: &[u64],
+    row_words_train: usize,
+    n_rows: usize,
+    n_train: usize,
+    y_test: &[f64],
+    bits_test: &[u64],
+    row_words_test: usize,
+    n_test: usize,
+    group_ids: &[usize],
+    params: &BeamSearchParams,
+) -> Result<(usize, usize), String> {
+    let ctx = "garfield::beam_search_train_test_continuous";
+    validate_continuous_y(y_train, n_train, ctx)?;
+    validate_continuous_y(y_test, n_test, ctx)?;
+    let need_train = validate_bit_matrix(bits_train, row_words_train, n_rows, n_train, ctx)?;
+    let need_test = validate_bit_matrix(bits_test, row_words_test, n_rows, n_test, ctx)?;
+    if group_ids.len() != n_rows {
+        return Err(format!(
+            "{ctx}: group_ids length mismatch: {} vs n_rows={}",
+            group_ids.len(),
+            n_rows
+        ));
+    }
+    if params.max_pick == 0 {
+        return Err(format!("{ctx}: max_pick must be > 0"));
+    }
+    if params.beam_width == 0 {
+        return Err(format!("{ctx}: beam_width must be > 0"));
+    }
+    if !(0.0 < params.candidate_keep_ratio && params.candidate_keep_ratio <= 1.0) {
+        return Err(format!(
+            "{ctx}: candidate_keep_ratio must be within (0, 1], got {}",
+            params.candidate_keep_ratio
+        ));
+    }
+    if !params.lambda_len.is_finite() || !params.lambda_not.is_finite() {
+        return Err(format!("{ctx}: penalty parameters must be finite"));
+    }
+    Ok((need_train, need_test))
+}
+
+#[inline]
+fn apply_first_literal(
+    row: &[u64],
+    needed_words: usize,
+    n_samples: usize,
+    negated: bool,
+) -> Vec<u64> {
+    let mut out = row[..needed_words].to_vec();
+    if negated {
+        bitnot_masked(&mut out, n_samples);
+    } else {
+        apply_tail_mask(&mut out, tail_mask(n_samples));
+    }
+    out
+}
+
+fn precompute_literal_singleton_scores(
+    y_train: &[f64],
+    bits_train: &[u64],
+    row_words_train: usize,
+    needed_words_train: usize,
+    n_train: usize,
+    y_test: &[f64],
+    bits_test: &[u64],
+    row_words_test: usize,
+    needed_words_test: usize,
+    n_test: usize,
+    n_rows: usize,
+) -> Vec<LiteralSingletonScore> {
+    let mut out = Vec::<LiteralSingletonScore>::with_capacity(n_rows.saturating_mul(2));
+    for row_idx in 0..n_rows {
+        let row_train = row_prefix(bits_train, row_words_train, row_idx, needed_words_train);
+        let row_test = row_prefix(bits_test, row_words_test, row_idx, needed_words_test);
+        for &negated in &[false, true] {
+            let train_bits = apply_first_literal(row_train, needed_words_train, n_train, negated);
+            let test_bits = apply_first_literal(row_test, needed_words_test, n_test, negated);
+            out.push(LiteralSingletonScore {
+                train: score_cont_weighted_mean_diff_packed(y_train, &train_bits, n_train),
+                test: score_cont_weighted_mean_diff_packed(y_test, &test_bits, n_test),
+            });
+        }
+    }
+    out
+}
+
+#[inline]
+fn bitand_not_assign_masked(dst: &mut [u64], rhs: &[u64], n_valid_bits: usize) {
+    debug_assert_eq!(dst.len(), rhs.len());
+    let needed_words = words_for_samples(n_valid_bits);
+    if needed_words == 0 {
+        return;
+    }
+    let full_words = n_valid_bits >> 6;
+    let rem = n_valid_bits & 63;
+    for i in 0..full_words {
+        dst[i] &= !rhs[i];
+    }
+    if rem != 0 {
+        let mask = (1u64 << rem) - 1u64;
+        dst[full_words] &= (!rhs[full_words]) & mask;
+    } else if full_words < needed_words {
+        dst[full_words] &= !rhs[full_words];
+    }
+    if needed_words < dst.len() {
+        for v in dst[needed_words..].iter_mut() {
+            *v = 0u64;
+        }
+    }
+}
+
+#[inline]
+fn bitor_not_into_masked(dst: &mut [u64], rhs: &[u64], n_valid_bits: usize) {
+    debug_assert_eq!(dst.len(), rhs.len());
+    let needed_words = words_for_samples(n_valid_bits);
+    if needed_words == 0 {
+        return;
+    }
+    let full_words = n_valid_bits >> 6;
+    let rem = n_valid_bits & 63;
+    for i in 0..full_words {
+        dst[i] |= !rhs[i];
+    }
+    if rem != 0 {
+        let mask = (1u64 << rem) - 1u64;
+        dst[full_words] |= (!rhs[full_words]) & mask;
+    } else if full_words < needed_words {
+        dst[full_words] |= !rhs[full_words];
+    }
+    apply_tail_mask(dst, tail_mask(n_valid_bits));
+}
+
+#[inline]
+fn apply_literal_inplace(
+    dst: &mut [u64],
+    row: &[u64],
+    op: BeamBinaryOp,
+    negated: bool,
+    n_samples: usize,
+) {
+    match (op, negated) {
+        (BeamBinaryOp::And, false) => {
+            bitand_assign(dst, row);
+            apply_tail_mask(dst, tail_mask(n_samples));
+        }
+        (BeamBinaryOp::And, true) => bitand_not_assign_masked(dst, row, n_samples),
+        (BeamBinaryOp::Or, false) => {
+            bitor_into(dst, row);
+            apply_tail_mask(dst, tail_mask(n_samples));
+        }
+        (BeamBinaryOp::Or, true) => bitor_not_into_masked(dst, row, n_samples),
+    }
+}
+
+pub fn materialize_rule_bits(
+    rule: &BeamRule,
+    bits_flat: &[u64],
+    row_words: usize,
+    n_rows: usize,
+    n_samples: usize,
+) -> Result<Vec<u64>, String> {
+    let ctx = "garfield::materialize_rule_bits";
+    let needed_words = validate_bit_matrix(bits_flat, row_words, n_rows, n_samples, ctx)?;
+    if rule.first.row_index >= n_rows {
+        return Err(format!(
+            "{ctx}: first literal row index {} out of range for n_rows={}",
+            rule.first.row_index, n_rows
+        ));
+    }
+    let mut combined = apply_first_literal(
+        row_prefix(bits_flat, row_words, rule.first.row_index, needed_words),
+        needed_words,
+        n_samples,
+        rule.first.negated,
+    );
+    for (op, lit) in rule.rest.iter() {
+        if lit.row_index >= n_rows {
+            return Err(format!(
+                "{ctx}: literal row index {} out of range for n_rows={}",
+                lit.row_index, n_rows
+            ));
+        }
+        let row = row_prefix(bits_flat, row_words, lit.row_index, needed_words);
+        apply_literal_inplace(&mut combined, row, *op, lit.negated, n_samples);
+    }
+    Ok(combined)
+}
+
+pub fn evaluate_rule_continuous(
+    rule: &BeamRule,
+    y: &[f64],
+    bits_flat: &[u64],
+    row_words: usize,
+    n_rows: usize,
+    n_samples: usize,
+    lambda_len: f64,
+    lambda_not: f64,
+) -> Result<ContinuousRuleScore, String> {
+    let ctx = "garfield::evaluate_rule_continuous";
+    validate_continuous_y(y, n_samples, ctx)?;
+    let combined = materialize_rule_bits(rule, bits_flat, row_words, n_rows, n_samples)?;
+    let mut sc = score_cont_weighted_mean_diff_packed(y, &combined, n_samples);
+    let penalty = if rule.len() > 1 {
+        lambda_len * ((rule.len() - 1) as f64)
+    } else {
+        0.0
+    } + lambda_not * (rule.not_count() as f64);
+    sc.score = sc.raw_score - penalty;
+    Ok(sc)
+}
+
+fn build_initial_beam(
+    _y_train: &[f64],
+    bits_train: &[u64],
+    row_words_train: usize,
+    n_rows: usize,
+    needed_words_train: usize,
+    n_train: usize,
+    group_ids: &[usize],
+    literal_scores: &[LiteralSingletonScore],
+    params: &BeamSearchParams,
+) -> Result<Vec<BeamState>, String> {
+    let layer_cap = params.beam_width.min(n_rows.saturating_mul(2));
+    let total_cands = n_rows.saturating_mul(2);
+    let beam = if should_parallel(total_cands) {
+        let mut work = Vec::<(usize, usize)>::new();
+        let chunk = GARFIELD_BEAM_PAR_CHUNK_CANDS.max(1);
+        let mut start = 0usize;
+        while start < n_rows {
+            let end = (start + chunk).min(n_rows);
+            work.push((start, end));
+            start = end;
+        }
+        let local_tops: Vec<Vec<BeamState>> = work
+            .into_par_iter()
+            .map(|(start, end)| {
+                let mut local = Vec::<BeamState>::with_capacity(layer_cap);
+                for row_idx in start..end {
+                    let row = row_prefix(bits_train, row_words_train, row_idx, needed_words_train);
+                    for &negated in &[false, true] {
+                    let literal = BeamLiteral {
+                        row_index: row_idx,
+                        group_id: group_ids[row_idx],
+                        negated,
+                    };
+                        let rule = BeamRule {
+                            first: literal,
+                            rest: Vec::new(),
+                        };
+                        let combined =
+                            apply_first_literal(row, needed_words_train, n_train, negated);
+                        let single = literal_scores[literal_score_index(row_idx, negated)];
+                        let train = single.train;
+                        if support_balance(&train) == 0 {
+                            continue;
+                        }
+                        let train_score =
+                            train_score_for_rule(&rule, train, train.raw_score, params);
+                        push_top_k_states(
+                            &mut local,
+                            BeamState {
+                                rule,
+                                combined_train: combined,
+                                train,
+                                train_score,
+                                max_singleton_train_raw: single.train.raw_score,
+                                max_singleton_test_raw: single.test.raw_score,
+                            },
+                            layer_cap,
+                        );
+                    }
+                }
+                local
+            })
+            .collect();
+        let mut merged = Vec::<BeamState>::with_capacity(layer_cap);
+        for local in local_tops {
+            for cand in local {
+                push_top_k_states(&mut merged, cand, layer_cap);
+            }
+        }
+        merged
+    } else {
+        let mut seq = Vec::<BeamState>::with_capacity(layer_cap);
+        for row_idx in 0..n_rows {
+            let row = row_prefix(bits_train, row_words_train, row_idx, needed_words_train);
+            for &negated in &[false, true] {
+                let literal = BeamLiteral {
+                    row_index: row_idx,
+                    group_id: group_ids[row_idx],
+                    negated,
+                };
+                let rule = BeamRule {
+                    first: literal,
+                    rest: Vec::new(),
+                };
+                let combined = apply_first_literal(row, needed_words_train, n_train, negated);
+                let single = literal_scores[literal_score_index(row_idx, negated)];
+                let train = single.train;
+                if support_balance(&train) == 0 {
+                    continue;
+                }
+                let train_score = train_score_for_rule(&rule, train, train.raw_score, params);
+                push_top_k_states(
+                    &mut seq,
+                    BeamState {
+                        rule,
+                        combined_train: combined,
+                        train,
+                        train_score,
+                        max_singleton_train_raw: single.train.raw_score,
+                        max_singleton_test_raw: single.test.raw_score,
+                    },
+                    layer_cap,
+                );
+            }
+        }
+        seq
+    };
+    if beam.is_empty() {
+        return Err("garfield::build_initial_beam: no valid initial literals".to_string());
+    }
+    Ok(sort_truncate_states(beam, layer_cap))
+}
+
+fn build_initial_states_exhaustive(
+    _y_train: &[f64],
+    bits_train: &[u64],
+    row_words_train: usize,
+    n_rows: usize,
+    needed_words_train: usize,
+    n_train: usize,
+    group_ids: &[usize],
+    literal_scores: &[LiteralSingletonScore],
+    params: &BeamSearchParams,
+) -> Result<Vec<BeamState>, String> {
+    let mut all = Vec::<BeamState>::with_capacity(n_rows.saturating_mul(2));
+    for row_idx in 0..n_rows {
+        let row = row_prefix(bits_train, row_words_train, row_idx, needed_words_train);
+        for &negated in &[false, true] {
+            let literal = BeamLiteral {
+                row_index: row_idx,
+                group_id: group_ids[row_idx],
+                negated,
+            };
+            let rule = BeamRule {
+                first: literal,
+                rest: Vec::new(),
+            };
+            let combined = apply_first_literal(row, needed_words_train, n_train, negated);
+            let single = literal_scores[literal_score_index(row_idx, negated)];
+            let train = single.train;
+            if support_balance(&train) == 0 {
+                continue;
+            }
+            let train_score = train_score_for_rule(&rule, train, train.raw_score, params);
+            all.push(BeamState {
+                rule,
+                combined_train: combined,
+                train,
+                train_score,
+                max_singleton_train_raw: single.train.raw_score,
+                max_singleton_test_raw: single.test.raw_score,
+            });
+        }
+    }
+    let out = dedup_states_by_train_bits(all);
+    if out.is_empty() {
+        return Err(
+            "garfield::build_initial_states_exhaustive: no valid initial literals".to_string(),
+        );
+    }
+    Ok(out)
+}
+
+fn expand_beam_once(
+    beam: &[BeamState],
+    y_train: &[f64],
+    bits_train: &[u64],
+    row_words_train: usize,
+    n_rows: usize,
+    needed_words_train: usize,
+    n_train: usize,
+    group_ids: &[usize],
+    literal_scores: &[LiteralSingletonScore],
+    params: &BeamSearchParams,
+) -> Vec<BeamState> {
+    let next_cap = params.beam_width.min(n_rows.saturating_mul(4).max(1));
+    let op_count = params.logic_gate_mode.op_count();
+    let total_expand = beam
+        .iter()
+        .map(|node| {
+            n_rows
+                .saturating_sub(node.rule.last_row_index().saturating_add(1))
+                .saturating_mul(2usize.saturating_mul(op_count))
+        })
+        .sum::<usize>();
+
+    let next = if should_parallel(total_expand) {
+        let mut work = Vec::<(usize, usize, usize)>::new();
+        let chunk = GARFIELD_BEAM_PAR_CHUNK_CANDS.max(1);
+        for (bi, node) in beam.iter().enumerate() {
+            let mut start = node.rule.last_row_index() + 1;
+            while start < n_rows {
+                let end = (start + chunk).min(n_rows);
+                work.push((bi, start, end));
+                start = end;
+            }
+        }
+        let local_tops: Vec<Vec<BeamState>> = work
+            .into_par_iter()
+            .map(|(bi, start, end)| {
+                let node = &beam[bi];
+                let mut local = Vec::<BeamState>::with_capacity(next_cap);
+                for cand in start..end {
+                    let gid = group_ids[cand];
+                    if node.rule.uses_group(gid) {
+                        continue;
+                    }
+                    let row = row_prefix(bits_train, row_words_train, cand, needed_words_train);
+                    for &op in params.logic_gate_mode.allowed_ops() {
+                        for &negated in &[false, true] {
+                            let mut combined = node.combined_train.clone();
+                            apply_literal_inplace(&mut combined, row, op, negated, n_train);
+                            let train =
+                                score_cont_weighted_mean_diff_packed(y_train, &combined, n_train);
+                            if support_balance(&train) == 0 {
+                                continue;
+                            }
+                            let literal = BeamLiteral {
+                                row_index: cand,
+                                group_id: gid,
+                                negated,
+                            };
+                            let mut rule = node.rule.clone();
+                            rule.rest.push((op, literal));
+                            let single = literal_scores[literal_score_index(cand, negated)];
+                            let max_singleton_train_raw =
+                                node.max_singleton_train_raw.max(single.train.raw_score);
+                            let max_singleton_test_raw =
+                                node.max_singleton_test_raw.max(single.test.raw_score);
+                            let train_score = train_score_for_rule(
+                                &rule,
+                                train,
+                                max_singleton_train_raw,
+                                params,
+                            );
+                            push_top_k_states(
+                                &mut local,
+                                BeamState {
+                                    rule,
+                                    combined_train: combined,
+                                    train,
+                                    train_score,
+                                    max_singleton_train_raw,
+                                    max_singleton_test_raw,
+                                },
+                                next_cap,
+                            );
+                        }
+                    }
+                }
+                local
+            })
+            .collect();
+        let mut merged = Vec::<BeamState>::with_capacity(next_cap);
+        for local in local_tops {
+            for cand in local {
+                push_top_k_states(&mut merged, cand, next_cap);
+            }
+        }
+        merged
+    } else {
+        let mut seq = Vec::<BeamState>::with_capacity(next_cap);
+        for node in beam.iter() {
+            for cand in (node.rule.last_row_index() + 1)..n_rows {
+                let gid = group_ids[cand];
+                if node.rule.uses_group(gid) {
+                    continue;
+                }
+                let row = row_prefix(bits_train, row_words_train, cand, needed_words_train);
+                for &op in params.logic_gate_mode.allowed_ops() {
+                    for &negated in &[false, true] {
+                        let mut combined = node.combined_train.clone();
+                        apply_literal_inplace(&mut combined, row, op, negated, n_train);
+                        let train =
+                            score_cont_weighted_mean_diff_packed(y_train, &combined, n_train);
+                        if support_balance(&train) == 0 {
+                            continue;
+                        }
+                        let literal = BeamLiteral {
+                            row_index: cand,
+                            group_id: gid,
+                            negated,
+                        };
+                        let mut rule = node.rule.clone();
+                        rule.rest.push((op, literal));
+                        let single = literal_scores[literal_score_index(cand, negated)];
+                        let max_singleton_train_raw =
+                            node.max_singleton_train_raw.max(single.train.raw_score);
+                        let max_singleton_test_raw =
+                            node.max_singleton_test_raw.max(single.test.raw_score);
+                        let train_score = train_score_for_rule(
+                            &rule,
+                            train,
+                            max_singleton_train_raw,
+                            params,
+                        );
+                        push_top_k_states(
+                            &mut seq,
+                            BeamState {
+                                rule,
+                                combined_train: combined,
+                                train,
+                                train_score,
+                                max_singleton_train_raw,
+                                max_singleton_test_raw,
+                            },
+                            next_cap,
+                        );
+                    }
+                }
+            }
+        }
+        seq
+    };
+    sort_truncate_states(next, next_cap)
+}
+
+fn dedup_states_by_train_bits(states: Vec<BeamState>) -> Vec<BeamState> {
+    let mut best = HashMap::<Vec<u64>, BeamState>::with_capacity(states.len());
+    for state in states.into_iter() {
+        match best.entry(state.combined_train.clone()) {
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(state);
+            }
+            std::collections::hash_map::Entry::Occupied(mut slot) => {
+                if cmp_state(&state, slot.get()) == std::cmp::Ordering::Less {
+                    slot.insert(state);
+                }
+            }
+        }
+    }
+    let mut out = best.into_values().collect::<Vec<_>>();
+    out.sort_by(cmp_state);
+    out
+}
+
+fn expand_states_exhaustive(
+    frontier: &[BeamState],
+    y_train: &[f64],
+    bits_train: &[u64],
+    row_words_train: usize,
+    n_rows: usize,
+    needed_words_train: usize,
+    n_train: usize,
+    group_ids: &[usize],
+    literal_scores: &[LiteralSingletonScore],
+    params: &BeamSearchParams,
+) -> Vec<BeamState> {
+    let mut best = HashMap::<Vec<u64>, BeamState>::new();
+    for node in frontier.iter() {
+        for cand in (node.rule.last_row_index() + 1)..n_rows {
+            let gid = group_ids[cand];
+            if node.rule.uses_group(gid) {
+                continue;
+            }
+            let row = row_prefix(bits_train, row_words_train, cand, needed_words_train);
+            for &op in params.logic_gate_mode.allowed_ops() {
+                for &negated in &[false, true] {
+                    let mut combined = node.combined_train.clone();
+                    apply_literal_inplace(&mut combined, row, op, negated, n_train);
+                    let train = score_cont_weighted_mean_diff_packed(y_train, &combined, n_train);
+                    if support_balance(&train) == 0 {
+                        continue;
+                    }
+                    let literal = BeamLiteral {
+                        row_index: cand,
+                        group_id: gid,
+                        negated,
+                    };
+                    let mut rule = node.rule.clone();
+                    rule.rest.push((op, literal));
+                    let single = literal_scores[literal_score_index(cand, negated)];
+                    let max_singleton_train_raw =
+                        node.max_singleton_train_raw.max(single.train.raw_score);
+                    let max_singleton_test_raw =
+                        node.max_singleton_test_raw.max(single.test.raw_score);
+                    let train_score = train_score_for_rule(
+                        &rule,
+                        train,
+                        max_singleton_train_raw,
+                        params,
+                    );
+                    let state = BeamState {
+                        rule,
+                        combined_train: combined,
+                        train,
+                        train_score,
+                        max_singleton_train_raw,
+                        max_singleton_test_raw,
+                    };
+                    match best.entry(state.combined_train.clone()) {
+                        std::collections::hash_map::Entry::Vacant(slot) => {
+                            slot.insert(state);
+                        }
+                        std::collections::hash_map::Entry::Occupied(mut slot) => {
+                            if cmp_state(&state, slot.get()) == std::cmp::Ordering::Less {
+                                slot.insert(state);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut out = best.into_values().collect::<Vec<_>>();
+    out.sort_by(cmp_state);
+    out
+}
+
+pub fn beam_search_train_test_continuous(
+    y_train: &[f64],
+    bits_train: &[u64],
+    row_words_train: usize,
+    n_rows: usize,
+    n_train: usize,
+    y_test: &[f64],
+    bits_test: &[u64],
+    row_words_test: usize,
+    n_test: usize,
+    group_ids: &[usize],
+    params: BeamSearchParams,
+) -> Result<Vec<BeamRuleCandidate>, String> {
+    let (needed_words_train, needed_words_test) = validate_search_inputs(
+        y_train,
+        bits_train,
+        row_words_train,
+        n_rows,
+        n_train,
+        y_test,
+        bits_test,
+        row_words_test,
+        n_test,
+        group_ids,
+        &params,
+    )?;
+
+    let max_depth = params.max_pick.min(n_rows);
+    let exhaustive_depth = params.exhaustive_depth.max(1).min(max_depth);
+    let literal_scores = precompute_literal_singleton_scores(
+        y_train,
+        bits_train,
+        row_words_train,
+        needed_words_train,
+        n_train,
+        y_test,
+        bits_test,
+        row_words_test,
+        needed_words_test,
+        n_test,
+        n_rows,
+    );
+
+    let mut kept_all = Vec::<BeamState>::new();
+    let mut beam = if exhaustive_depth > 1 {
+        let exhaustive_initial = build_initial_states_exhaustive(
+            y_train,
+            bits_train,
+            row_words_train,
+            n_rows,
+            needed_words_train,
+            n_train,
+            group_ids,
+            literal_scores.as_slice(),
+            &params,
+        )?;
+        kept_all.extend(exhaustive_initial.iter().cloned());
+        let mut frontier = exhaustive_initial;
+        for _depth in 2..=exhaustive_depth {
+            let next = expand_states_exhaustive(
+                frontier.as_slice(),
+                y_train,
+                bits_train,
+                row_words_train,
+                n_rows,
+                needed_words_train,
+                n_train,
+                group_ids,
+                literal_scores.as_slice(),
+                &params,
+            );
+            if next.is_empty() {
+                frontier = Vec::new();
+                break;
+            }
+            kept_all.extend(next.iter().cloned());
+            frontier = next;
+        }
+        sort_truncate_states(frontier, params.beam_width.max(1))
+    } else {
+        let beam = build_initial_beam(
+            y_train,
+            bits_train,
+            row_words_train,
+            n_rows,
+            needed_words_train,
+            n_train,
+            group_ids,
+            literal_scores.as_slice(),
+            &params,
+        )?;
+        kept_all.extend(beam.iter().cloned());
+        beam
+    };
+
+    for _depth in (exhaustive_depth + 1)..=max_depth {
+        let next = expand_beam_once(
+            &beam,
+            y_train,
+            bits_train,
+            row_words_train,
+            n_rows,
+            needed_words_train,
+            n_train,
+            group_ids,
+            literal_scores.as_slice(),
+            &params,
+        );
+        if next.is_empty() {
+            break;
+        }
+        kept_all.extend(next.iter().cloned());
+        beam = next;
+    }
+
+    let pooled = dedup_states_by_train_bits(kept_all);
+    let keep_total = ((pooled.len()) as f64 * params.candidate_keep_ratio)
+        .ceil()
+        .max(1.0) as usize;
+    let retained = sort_truncate_states(pooled, keep_total);
+
+    let mut out = Vec::<BeamRuleCandidate>::with_capacity(retained.len());
+    for state in retained.into_iter() {
+        let test = evaluate_rule_continuous(
+            &state.rule,
+            y_test,
+            bits_test,
+            row_words_test,
+            n_rows,
+            n_test,
+            params.lambda_len,
+            params.lambda_not,
+        )?;
+        let test_score = match params.rank_mode {
+            BeamRankMode::Raw => test.score,
+            BeamRankMode::InteractionGain => {
+                if state.rule.len() >= 2 {
+                    test.raw_score - state.max_singleton_test_raw - penalty_for_rule(&state.rule, &params)
+                } else {
+                    test.score
+                }
+            }
+        };
+        out.push(BeamRuleCandidate {
+            rule: state.rule,
+            train_score: state.train_score,
+            test_score,
+            train: state.train,
+            test,
+        });
+    }
+    out.sort_by(cmp_candidate);
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pack_rows(rows: &[Vec<u8>], n_samples: usize) -> (Vec<u64>, usize) {
+        let row_words = words_for_samples(n_samples);
+        let mut out = vec![0u64; rows.len() * row_words];
+        for (ri, row) in rows.iter().enumerate() {
+            for (i, &v) in row.iter().take(n_samples).enumerate() {
+                if v != 0 {
+                    out[ri * row_words + (i >> 6)] |= 1u64 << (i & 63);
+                }
+            }
+        }
+        (out, row_words)
+    }
+
+    #[test]
+    fn test_materialize_rule_bits_or_and_not() {
+        let rows = vec![
+            vec![1, 1, 0, 0, 0, 0],
+            vec![0, 0, 1, 1, 0, 0],
+            vec![0, 1, 0, 1, 1, 0],
+        ];
+        let (bits, row_words) = pack_rows(&rows, 6);
+        let rule = BeamRule {
+            first: BeamLiteral {
+                row_index: 0,
+                group_id: 0,
+                negated: false,
+            },
+            rest: vec![
+                (
+                    BeamBinaryOp::Or,
+                    BeamLiteral {
+                        row_index: 1,
+                        group_id: 1,
+                        negated: false,
+                    },
+                ),
+                (
+                    BeamBinaryOp::And,
+                    BeamLiteral {
+                        row_index: 2,
+                        group_id: 2,
+                        negated: true,
+                    },
+                ),
+            ],
+        };
+        let combined = materialize_rule_bits(&rule, &bits, row_words, rows.len(), 6).unwrap();
+        let got = (0..6)
+            .map(|i| usize::from(((combined[i >> 6] >> (i & 63)) & 1u64) != 0))
+            .collect::<Vec<_>>();
+        assert_eq!(got, vec![1, 0, 1, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_beam_search_finds_or_rule() {
+        let rows = vec![
+            vec![1, 1, 0, 0, 0, 0, 0, 0],
+            vec![0, 0, 1, 1, 0, 0, 0, 0],
+            vec![0, 0, 0, 0, 1, 1, 0, 0],
+            vec![0, 0, 0, 0, 0, 0, 1, 1],
+        ];
+        let y = vec![4.0, 4.2, 3.8, 4.1, -1.0, -1.2, -1.1, -0.9];
+        let (bits, row_words) = pack_rows(&rows, y.len());
+        let group_ids = vec![0usize, 1, 2, 3];
+        let out = beam_search_train_test_continuous(
+            &y,
+            &bits,
+            row_words,
+            rows.len(),
+            y.len(),
+            &y,
+            &bits,
+            row_words,
+            y.len(),
+            &group_ids,
+            BeamSearchParams {
+                max_pick: 2,
+                beam_width: 8,
+                candidate_keep_ratio: 1.0,
+                rank_mode: BeamRankMode::Raw,
+                ..BeamSearchParams::default()
+            },
+        )
+        .unwrap();
+        assert!(!out.is_empty());
+        assert!(out.iter().any(|cand| {
+            cand.rule.len() == 2
+                && cand.rule.first.row_index == 0
+                && cand.rule.rest.len() == 1
+                && cand.rule.rest[0].0 == BeamBinaryOp::Or
+                && cand.rule.rest[0].1.row_index == 1
+        }));
+    }
+
+    #[test]
+    fn test_beam_search_respects_group_exclusion() {
+        let rows = vec![
+            vec![1, 0, 1, 0, 1, 0, 1, 0],
+            vec![0, 1, 0, 1, 0, 1, 0, 1],
+            vec![1, 1, 0, 0, 1, 1, 0, 0],
+        ];
+        let y = vec![3.0, -2.0, 3.1, -2.1, 3.2, -2.2, 3.0, -2.0];
+        let (bits, row_words) = pack_rows(&rows, y.len());
+        let group_ids = vec![5usize, 5usize, 9usize];
+        let out = beam_search_train_test_continuous(
+            &y,
+            &bits,
+            row_words,
+            rows.len(),
+            y.len(),
+            &y,
+            &bits,
+            row_words,
+            y.len(),
+            &group_ids,
+            BeamSearchParams {
+                max_pick: 3,
+                beam_width: 12,
+                candidate_keep_ratio: 0.5,
+                ..BeamSearchParams::default()
+            },
+        )
+        .unwrap();
+        assert!(!out.is_empty());
+        for cand in out.iter() {
+            let mut used = HashSet::new();
+            assert!(used.insert(cand.rule.first.group_id));
+            for (_, lit) in cand.rule.rest.iter() {
+                assert!(used.insert(lit.group_id));
+            }
+        }
+    }
+
+    #[test]
+    fn test_beam_search_logic_gate_and_only() {
+        let rows = vec![
+            vec![1, 1, 0, 0, 0, 0, 0, 0],
+            vec![0, 0, 1, 1, 0, 0, 0, 0],
+            vec![1, 1, 1, 1, 0, 0, 0, 0],
+        ];
+        let y = vec![4.0, 4.0, 4.0, 4.0, -1.0, -1.0, -1.0, -1.0];
+        let (bits, row_words) = pack_rows(&rows, y.len());
+        let group_ids = vec![0usize, 1, 2];
+        let out = beam_search_train_test_continuous(
+            &y,
+            &bits,
+            row_words,
+            rows.len(),
+            y.len(),
+            &y,
+            &bits,
+            row_words,
+            y.len(),
+            &group_ids,
+            BeamSearchParams {
+                max_pick: 2,
+                beam_width: 8,
+                candidate_keep_ratio: 0.5,
+                logic_gate_mode: BeamLogicGateMode::AndOnly,
+                ..BeamSearchParams::default()
+            },
+        )
+        .unwrap();
+        assert!(!out.is_empty());
+        assert!(out.iter().all(|cand| {
+            cand.rule
+                .rest
+                .iter()
+                .all(|(op, _)| *op == BeamBinaryOp::And)
+        }));
+    }
+
+    #[test]
+    fn test_beam_search_logic_gate_or_only() {
+        let rows = vec![
+            vec![1, 1, 0, 0, 0, 0, 0, 0],
+            vec![0, 0, 1, 1, 0, 0, 0, 0],
+            vec![0, 0, 0, 0, 1, 1, 0, 0],
+            vec![0, 0, 0, 0, 0, 0, 1, 1],
+        ];
+        let y = vec![4.0, 4.2, 3.8, 4.1, -1.0, -1.2, -1.1, -0.9];
+        let (bits, row_words) = pack_rows(&rows, y.len());
+        let group_ids = vec![0usize, 1, 2, 3];
+        let out = beam_search_train_test_continuous(
+            &y,
+            &bits,
+            row_words,
+            rows.len(),
+            y.len(),
+            &y,
+            &bits,
+            row_words,
+            y.len(),
+            &group_ids,
+            BeamSearchParams {
+                max_pick: 2,
+                beam_width: 8,
+                candidate_keep_ratio: 0.5,
+                logic_gate_mode: BeamLogicGateMode::OrOnly,
+                ..BeamSearchParams::default()
+            },
+        )
+        .unwrap();
+        assert!(!out.is_empty());
+        assert!(out.iter().all(|cand| {
+            cand.rule
+                .rest
+                .iter()
+                .all(|(op, _)| *op == BeamBinaryOp::Or)
+        }));
+    }
+
+    #[test]
+    fn test_exhaustive_pair_depth_recovers_weak_single_strong_pair() {
+        let rows = vec![
+            vec![1, 1, 0, 0, 0, 0, 0, 0],
+            vec![1, 0, 1, 0, 0, 0, 0, 0],
+            vec![1, 0, 0, 1, 0, 0, 0, 0],
+        ];
+        let y = vec![2.0, -0.2, -0.2, 0.1, -0.1, -0.1, 0.0, 0.0];
+        let (bits, row_words) = pack_rows(&rows, y.len());
+        let group_ids = vec![0usize, 1, 2];
+
+        let out_beam = beam_search_train_test_continuous(
+            &y,
+            &bits,
+            row_words,
+            rows.len(),
+            y.len(),
+            &y,
+            &bits,
+            row_words,
+            y.len(),
+            &group_ids,
+            BeamSearchParams {
+                max_pick: 2,
+                beam_width: 1,
+                candidate_keep_ratio: 1.0,
+                logic_gate_mode: BeamLogicGateMode::AndOnly,
+                exhaustive_depth: 1,
+                ..BeamSearchParams::default()
+            },
+        )
+        .unwrap();
+        assert!(out_beam.iter().all(|cand| {
+            !(cand.rule.first.row_index == 1
+                && cand.rule.rest.len() == 1
+                && cand.rule.rest[0].1.row_index == 2)
+        }));
+
+        let out_exh = beam_search_train_test_continuous(
+            &y,
+            &bits,
+            row_words,
+            rows.len(),
+            y.len(),
+            &y,
+            &bits,
+            row_words,
+            y.len(),
+            &group_ids,
+            BeamSearchParams {
+                max_pick: 2,
+                beam_width: 1,
+                candidate_keep_ratio: 1.0,
+                logic_gate_mode: BeamLogicGateMode::AndOnly,
+                exhaustive_depth: 2,
+                ..BeamSearchParams::default()
+            },
+        )
+        .unwrap();
+        assert!(out_exh.iter().any(|cand| {
+            cand.rule.first.row_index == 1
+                && cand.rule.rest.len() == 1
+                && cand.rule.rest[0].1.row_index == 2
+                && cand.rule.rest[0].0 == BeamBinaryOp::And
+        }));
+    }
+
+    #[test]
+    fn test_interaction_gain_scoring_subtracts_strongest_singleton() {
+        let rule = BeamRule {
+            first: BeamLiteral {
+                row_index: 1,
+                group_id: 1,
+                negated: false,
+            },
+            rest: vec![(
+                BeamBinaryOp::And,
+                BeamLiteral {
+                    row_index: 2,
+                    group_id: 2,
+                    negated: false,
+                },
+            )],
+        };
+        let train = ContinuousRuleScore {
+            score: 0.8,
+            raw_score: 0.8,
+            mean_hit: 1.0,
+            mean_miss: 0.0,
+            support_frac: 0.25,
+            n_hit: 2,
+            n_miss: 6,
+        };
+        let raw_score = train_score_for_rule(
+            &rule,
+            train,
+            0.6,
+            &BeamSearchParams {
+                rank_mode: BeamRankMode::Raw,
+                ..BeamSearchParams::default()
+            },
+        );
+        let gain_score = train_score_for_rule(
+            &rule,
+            train,
+            0.6,
+            &BeamSearchParams {
+                rank_mode: BeamRankMode::InteractionGain,
+                ..BeamSearchParams::default()
+            },
+        );
+        assert!((raw_score - 0.8).abs() < 1e-12);
+        assert!((gain_score - 0.2).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_exhaustive_seed_still_allows_singleton_to_win() {
+        let rows = vec![
+            vec![1, 1, 1, 1, 0, 0, 0, 0],
+            vec![1, 0, 1, 0, 1, 0, 1, 0],
+            vec![0, 1, 0, 1, 0, 1, 0, 1],
+        ];
+        let y = vec![3.0, 3.1, 2.9, 3.2, -3.0, -2.9, -3.1, -3.2];
+        let (bits, row_words) = pack_rows(&rows, y.len());
+        let group_ids = vec![0usize, 1, 2];
+        let out = beam_search_train_test_continuous(
+            &y,
+            &bits,
+            row_words,
+            rows.len(),
+            y.len(),
+            &y,
+            &bits,
+            row_words,
+            y.len(),
+            &group_ids,
+            BeamSearchParams {
+                max_pick: 3,
+                beam_width: 16,
+                candidate_keep_ratio: 1.0,
+                logic_gate_mode: BeamLogicGateMode::AndOnly,
+                exhaustive_depth: 2,
+                rank_mode: BeamRankMode::InteractionGain,
+                ..BeamSearchParams::default()
+            },
+        )
+        .unwrap();
+        assert!(!out.is_empty());
+        assert_eq!(out[0].rule.len(), 1);
+        assert_eq!(out[0].rule.first.row_index, 0);
+        assert!(!out[0].rule.first.negated);
+    }
+}

@@ -527,7 +527,7 @@ def _filter_chunk_by_site(
 
 def _heter_keep_mask(geno: np.ndarray, het_threshold: float) -> np.ndarray:
     """
-    Keep SNP rows whose heterozygosity rate is within [het, 1-het].
+    Keep SNP rows whose heterozygosity rate is at most `het`.
 
     - Heterozygous call is defined as genotype == 1 (within tolerance).
     - Missing calls (NaN/Inf/<0) are ignored in the denominator.
@@ -552,9 +552,8 @@ def _heter_keep_mask(geno: np.ndarray, het_threshold: float) -> np.ndarray:
         het_count[has_obs].astype(np.float64) / non_missing[has_obs].astype(np.float64)
     )
 
-    low = float(h)
-    high = 1.0 - low
-    keep &= has_obs & (het_rate >= low) & (het_rate <= high)
+    max_het = float(h)
+    keep &= has_obs & (het_rate <= max_het)
     return keep
 
 
@@ -1282,8 +1281,8 @@ def _iter_vcf_direct_chunks(
     if model_key not in {"add", "dom", "rec", "het"}:
         raise ValueError("model must be one of: add, dom, rec, het")
     het_val = float(het_threshold)
-    if not (0.0 <= het_val <= 0.5):
-        raise ValueError("het_threshold must be within [0, 0.5]")
+    if not (0.0 <= het_val <= 1.0):
+        raise ValueError("het_threshold must be within [0, 1.0]")
 
     chr_list = sorted(list(chr_keys)) if chr_keys else None
     try:
@@ -1337,8 +1336,8 @@ def _iter_hmp_direct_chunks(
     if model_key not in {"add", "dom", "rec", "het"}:
         raise ValueError("model must be one of: add, dom, rec, het")
     het_val = float(het_threshold)
-    if not (0.0 <= het_val <= 0.5):
-        raise ValueError("het_threshold must be within [0, 0.5]")
+    if not (0.0 <= het_val <= 1.0):
+        raise ValueError("het_threshold must be within [0, 1.0]")
 
     chr_list = sorted(list(chr_keys)) if chr_keys else None
     try:
@@ -1394,8 +1393,8 @@ def _iter_txt_direct_chunks(
     if model_key not in {"add", "dom", "rec", "het"}:
         raise ValueError("model must be one of: add, dom, rec, het")
     het_val = float(het_threshold)
-    if not (0.0 <= het_val <= 0.5):
-        raise ValueError("het_threshold must be within [0, 0.5]")
+    if not (0.0 <= het_val <= 1.0):
+        raise ValueError("het_threshold must be within [0, 1.0]")
 
     # Keep explicit sidecar resolution in caller for early validation,
     # but sink per-site filtering into the unified Rust kernel.
@@ -1565,8 +1564,8 @@ def build_parser() -> CliArgumentParser:
         type=float,
         default=0.0,
         help=(
-            "Filter variants by heterozygosity rate. Keep only variants with het rate "
-            "between het and (1-het) (default: %(default)s; no filtering)."
+            "Filter variants by maximum heterozygosity rate. Drop variants with het rate "
+            "greater than this threshold (default: %(default)s; no filtering)."
         ),
     )
     opt.add_argument(

@@ -1,6 +1,10 @@
 use pyo3::prelude::*;
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+use std::ffi::OsString;
 #[cfg(target_os = "macos")]
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
@@ -2007,10 +2011,10 @@ pub(crate) unsafe fn lapack_dsyevd_dispatch(
     {
         if should_try_openblas_lapack_on_macos() {
             if let Some(ob) = openblas_lapack_dyn() {
-                if let Some(setter) = ob.set_threads {
-                    setter(preferred_openblas_thread_cap().min(i32::MAX as usize) as CblasInt);
-                }
+                let (prev_threads, prev_omp_threads) =
+                    openblas_lapack_dyn_threads_guard(ob, preferred_openblas_thread_cap());
                 (ob.dsyevd)(jobz, uplo, n, a, lda, w, work, lwork, iwork, liwork, info);
+                openblas_lapack_dyn_threads_restore(ob, prev_threads, prev_omp_threads);
                 return Ok(());
             }
             if matches!(mac_eigh_lapack_pref(), MacEighLapackPref::OpenBlas) {
@@ -2108,13 +2112,13 @@ pub(crate) unsafe fn lapack_dsyevr_dispatch(
     {
         if should_try_openblas_lapack_on_macos() {
             if let Some(ob) = openblas_lapack_dyn() {
-                if let Some(setter) = ob.set_threads {
-                    setter(preferred_openblas_thread_cap().min(i32::MAX as usize) as CblasInt);
-                }
+                let (prev_threads, prev_omp_threads) =
+                    openblas_lapack_dyn_threads_guard(ob, preferred_openblas_thread_cap());
                 (ob.dsyevr)(
                     jobz, range, uplo, n, a, lda, vl, vu, il, iu, abstol, m, w, z, ldz, isuppz,
                     work, lwork, iwork, liwork, info,
                 );
+                openblas_lapack_dyn_threads_restore(ob, prev_threads, prev_omp_threads);
                 return Ok(());
             }
             if matches!(mac_eigh_lapack_pref(), MacEighLapackPref::OpenBlas) {
@@ -2330,6 +2334,44 @@ fn apply_blas_thread_env_hints(threads: usize) {
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+type SavedEnvVar = (&'static str, Option<OsString>);
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+const BLAS_THREAD_ENV_HINT_KEYS: [&str; 10] = [
+    "OMP_NUM_THREADS",
+    "OMP_MAX_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "OPENBLAS_MAX_THREADS",
+    "MKL_NUM_THREADS",
+    "MKL_MAX_THREADS",
+    "BLIS_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+    "JX_MLM_BLAS_THREADS",
+];
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+#[inline]
+fn capture_blas_thread_env_hints() -> Vec<SavedEnvVar> {
+    BLAS_THREAD_ENV_HINT_KEYS
+        .iter()
+        .map(|&key| (key, std::env::var_os(key)))
+        .collect()
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+#[inline]
+fn restore_blas_thread_env_hints(saved: &[SavedEnvVar]) {
+    for (key, val) in saved.iter() {
+        if let Some(v) = val {
+            std::env::set_var(key, v);
+        } else {
+            std::env::remove_var(key);
+        }
+    }
+}
+
 #[cfg(target_os = "macos")]
 #[inline]
 fn accelerate_blas_set_threading_mode(multithreaded: bool) -> Option<bool> {
@@ -2443,16 +2485,30 @@ type OpenBlasLapackDsyevrFn = unsafe extern "C" fn(
 type OpenBlasSetThreadsFn = unsafe extern "C" fn(CblasInt);
 
 #[cfg(target_os = "macos")]
+type OpenBlasGetThreadsFn = unsafe extern "C" fn() -> CblasInt;
+
+#[cfg(target_os = "macos")]
+type OmpSetNumThreadsFn = unsafe extern "C" fn(std::os::raw::c_int);
+
+#[cfg(target_os = "macos")]
+type OmpGetMaxThreadsFn = unsafe extern "C" fn() -> std::os::raw::c_int;
+
+#[cfg(target_os = "macos")]
 struct OpenBlasLapackDyn {
     #[allow(dead_code)]
     handle: usize,
     dsyevd: OpenBlasLapackDsyevdFn,
     dsyevr: OpenBlasLapackDsyevrFn,
     set_threads: Option<OpenBlasSetThreadsFn>,
+    get_threads: Option<OpenBlasGetThreadsFn>,
+    omp_set_threads: Option<OmpSetNumThreadsFn>,
+    omp_get_max_threads: Option<OmpGetMaxThreadsFn>,
 }
 
 #[cfg(target_os = "macos")]
 static OPENBLAS_LAPACK_DYN: OnceLock<Option<OpenBlasLapackDyn>> = OnceLock::new();
+#[cfg(target_os = "macos")]
+static EIGH_OPENBLAS_DYN_THREAD_HINT: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(target_os = "macos")]
 unsafe extern "C" {
@@ -2509,6 +2565,10 @@ fn should_try_openblas_lapack_on_macos() -> bool {
 #[cfg(target_os = "macos")]
 #[inline]
 fn preferred_openblas_thread_cap() -> usize {
+    let hinted = EIGH_OPENBLAS_DYN_THREAD_HINT.load(Ordering::SeqCst);
+    if hinted > 0 {
+        return hinted;
+    }
     for key in [
         "JX_MLM_BLAS_THREADS",
         "OPENBLAS_NUM_THREADS",
@@ -2727,7 +2787,7 @@ fn openblas_lapack_candidates(pref: MacEighLapackPref) -> Vec<String> {
         }
     }
 
-    // 2) Wheel-local candidates (preferred in auto mode):
+    // 2) Wheel-local candidates:
     //    janusx/.dylibs, janusx/.libs, and sibling janusx.libs.
     if let Some(mod_dir) = extension_module_dir() {
         for rel in [".dylibs", ".libs", ""] {
@@ -2743,8 +2803,10 @@ fn openblas_lapack_candidates(pref: MacEighLapackPref) -> Vec<String> {
         }
     }
 
-    // 3) System-wide/provisioned OpenBLAS fallbacks (explicit openblas mode).
-    if matches!(pref, MacEighLapackPref::OpenBlas) {
+    // 3) System-wide / provisioned OpenBLAS fallbacks. Keep these in auto
+    //    mode too so editable/dev installs on macOS can still use OpenBLAS
+    //    LAPACK without requiring wheel-bundled dylibs.
+    if matches!(pref, MacEighLapackPref::Auto | MacEighLapackPref::OpenBlas) {
         if let Ok(prefix) = std::env::var("CONDA_PREFIX") {
             let base = Path::new(&prefix).join("lib");
             for leaf in [
@@ -2762,7 +2824,9 @@ fn openblas_lapack_candidates(pref: MacEighLapackPref) -> Vec<String> {
         }
         for p in [
             "/opt/homebrew/opt/openblas/lib/libopenblas.dylib",
+            "/opt/homebrew/opt/openblas/lib/libopenblas.0.dylib",
             "/usr/local/opt/openblas/lib/libopenblas.dylib",
+            "/usr/local/opt/openblas/lib/libopenblas.0.dylib",
             "libopenblas.dylib",
             "libopenblas.0.dylib",
         ] {
@@ -2805,10 +2869,43 @@ unsafe fn openblas_lapack_dyn_load_once() -> Option<OpenBlasLapackDyn> {
         handle,
         b"openblas_set_num_threads_\0".as_ptr() as *const std::os::raw::c_char,
     );
+    let d_get = libc::dlsym(
+        handle,
+        b"openblas_get_num_threads\0".as_ptr() as *const std::os::raw::c_char,
+    );
+    let d_get_alt = libc::dlsym(
+        handle,
+        b"openblas_get_num_threads_\0".as_ptr() as *const std::os::raw::c_char,
+    );
+    let d_omp_set = libc::dlsym(
+        handle,
+        b"omp_set_num_threads\0".as_ptr() as *const std::os::raw::c_char,
+    );
+    let d_omp_get_max = libc::dlsym(
+        handle,
+        b"omp_get_max_threads\0".as_ptr() as *const std::os::raw::c_char,
+    );
     let set_threads = if !d_set.is_null() {
         Some(std::mem::transmute::<*mut libc::c_void, OpenBlasSetThreadsFn>(d_set))
     } else if !d_set_alt.is_null() {
         Some(std::mem::transmute::<*mut libc::c_void, OpenBlasSetThreadsFn>(d_set_alt))
+    } else {
+        None
+    };
+    let get_threads = if !d_get.is_null() {
+        Some(std::mem::transmute::<*mut libc::c_void, OpenBlasGetThreadsFn>(d_get))
+    } else if !d_get_alt.is_null() {
+        Some(std::mem::transmute::<*mut libc::c_void, OpenBlasGetThreadsFn>(d_get_alt))
+    } else {
+        None
+    };
+    let omp_set_threads = if !d_omp_set.is_null() {
+        Some(std::mem::transmute::<*mut libc::c_void, OmpSetNumThreadsFn>(d_omp_set))
+    } else {
+        None
+    };
+    let omp_get_max_threads = if !d_omp_get_max.is_null() {
+        Some(std::mem::transmute::<*mut libc::c_void, OmpGetMaxThreadsFn>(d_omp_get_max))
     } else {
         None
     };
@@ -2818,6 +2915,9 @@ unsafe fn openblas_lapack_dyn_load_once() -> Option<OpenBlasLapackDyn> {
         dsyevd: std::mem::transmute::<*mut libc::c_void, OpenBlasLapackDsyevdFn>(d_dsyevd),
         dsyevr: std::mem::transmute::<*mut libc::c_void, OpenBlasLapackDsyevrFn>(d_dsyevr),
         set_threads,
+        get_threads,
+        omp_set_threads,
+        omp_get_max_threads,
     })
 }
 
@@ -2827,6 +2927,149 @@ fn openblas_lapack_dyn() -> Option<&'static OpenBlasLapackDyn> {
     OPENBLAS_LAPACK_DYN
         .get_or_init(|| unsafe { openblas_lapack_dyn_load_once() })
         .as_ref()
+}
+
+#[cfg(target_os = "macos")]
+#[inline]
+pub(crate) fn prewarm_eigh_openblas_dyn_runtime() {
+    if should_try_openblas_lapack_on_macos() {
+        let _ = openblas_lapack_dyn();
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+#[inline]
+pub(crate) fn prewarm_eigh_openblas_dyn_runtime() {}
+
+#[cfg(target_os = "macos")]
+#[inline]
+pub(crate) fn macos_eigh_uses_openblas_dyn() -> bool {
+    should_try_openblas_lapack_on_macos() && openblas_lapack_dyn().is_some()
+}
+
+#[cfg(not(target_os = "macos"))]
+#[inline]
+pub(crate) fn macos_eigh_uses_openblas_dyn() -> bool {
+    false
+}
+
+#[cfg(target_os = "macos")]
+#[inline]
+fn macos_openblas_dyn_current_threads() -> isize {
+    let Some(ob) = openblas_lapack_dyn() else {
+        return -1;
+    };
+    if let Some(getter) = ob.get_threads {
+        let v = unsafe { getter() };
+        if v > 0 {
+            return v as isize;
+        }
+    }
+    if let Some(getter) = ob.omp_get_max_threads {
+        let v = unsafe { getter() };
+        if v > 0 {
+            return v as isize;
+        }
+    }
+    -1
+}
+
+#[cfg(not(target_os = "macos"))]
+#[inline]
+fn macos_openblas_dyn_current_threads() -> isize {
+    -1
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+#[inline]
+pub(crate) fn with_eigh_thread_stage<T, F>(threads: usize, f: F) -> (isize, isize, T, isize)
+where
+    F: FnOnce() -> T,
+{
+    #[cfg(target_os = "macos")]
+    {
+        prewarm_eigh_openblas_dyn_runtime();
+        if macos_eigh_uses_openblas_dyn() {
+            let before = macos_openblas_dyn_current_threads();
+            let new_hint = if threads > 0 { threads.max(1) } else { 0 };
+            let prev_hint = EIGH_OPENBLAS_DYN_THREAD_HINT.swap(new_hint, Ordering::SeqCst);
+            let in_stage = if threads > 0 {
+                threads as isize
+            } else {
+                before
+            };
+            let out = f();
+            EIGH_OPENBLAS_DYN_THREAD_HINT.store(prev_hint, Ordering::SeqCst);
+            let after = macos_openblas_dyn_current_threads();
+            return (before, in_stage, out, after);
+        }
+    }
+
+    let before = rust_blas_get_num_threads();
+    let (in_stage, out, after) = {
+        let _guard = BlasThreadGuard::enter(threads);
+        let in_stage = rust_blas_get_num_threads();
+        let out = f();
+        let after = rust_blas_get_num_threads();
+        (in_stage, out, after)
+    };
+    (before, in_stage, out, after)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+#[inline]
+pub(crate) fn with_eigh_thread_stage<T, F>(_threads: usize, f: F) -> (isize, isize, T, isize)
+where
+    F: FnOnce() -> T,
+{
+    let out = f();
+    (-1, -1, out, -1)
+}
+
+#[cfg(target_os = "macos")]
+#[inline]
+unsafe fn openblas_lapack_dyn_threads_guard(
+    ob: &OpenBlasLapackDyn,
+    target_threads: usize,
+) -> (Option<usize>, Option<usize>) {
+    let prev = ob.get_threads.and_then(|getter| {
+        let v = getter();
+        if v > 0 {
+            Some(v as usize)
+        } else {
+            None
+        }
+    });
+    let prev_omp = ob.omp_get_max_threads.and_then(|getter| {
+        let v = getter();
+        if v > 0 {
+            Some(v as usize)
+        } else {
+            None
+        }
+    });
+    if let Some(setter) = ob.omp_set_threads {
+        setter(target_threads.max(1).min(i32::MAX as usize) as std::os::raw::c_int);
+    }
+    if let Some(setter) = ob.set_threads {
+        setter(target_threads.max(1).min(i32::MAX as usize) as CblasInt);
+    }
+    (prev, prev_omp)
+}
+
+#[cfg(target_os = "macos")]
+#[inline]
+unsafe fn openblas_lapack_dyn_threads_restore(
+    ob: &OpenBlasLapackDyn,
+    prev_threads: Option<usize>,
+    prev_omp_threads: Option<usize>,
+) {
+    if let (Some(prev), Some(setter)) = (prev_omp_threads, ob.omp_set_threads) {
+        setter(prev.min(i32::MAX as usize) as std::os::raw::c_int);
+    }
+    if let (Some(prev), Some(setter)) = (prev_threads, ob.set_threads) {
+        setter(prev.min(i32::MAX as usize) as CblasInt);
+    }
 }
 
 #[cfg(all(feature = "blas-openblas", jx_openblas_available))]
@@ -2897,11 +3140,107 @@ impl Drop for OpenBlasThreadGuard {
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+enum BlasThreadState {
+    OpenBlas { prev_threads: Option<usize> },
+    Accelerate { prev_mode: Option<isize> },
+    Other,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+pub(crate) struct BlasThreadGuard {
+    saved_env: Vec<SavedEnvVar>,
+    state: BlasThreadState,
+    active: bool,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+impl BlasThreadGuard {
+    #[inline]
+    pub(crate) fn enter(target_threads: usize) -> Self {
+        let saved_env = capture_blas_thread_env_hints();
+        if target_threads == 0 {
+            return Self {
+                saved_env,
+                state: BlasThreadState::Other,
+                active: false,
+            };
+        }
+
+        let backend = selected_sgemm_backend();
+        let state = match backend {
+            SgemmBackend::OpenBlas => BlasThreadState::OpenBlas {
+                prev_threads: rust_openblas_get_threads_impl(),
+            },
+            SgemmBackend::Accelerate => BlasThreadState::Accelerate {
+                prev_mode: accelerate_blas_get_threading_mode(),
+            },
+            _ => BlasThreadState::Other,
+        };
+
+        let t = target_threads.max(1);
+        apply_blas_thread_env_hints(t);
+        match backend {
+            SgemmBackend::OpenBlas => {
+                let _ = rust_openblas_set_threads_impl(t);
+            }
+            SgemmBackend::Accelerate => {
+                let _ = accelerate_blas_set_threading_mode(t > 1);
+            }
+            _ => {}
+        }
+
+        Self {
+            saved_env,
+            state,
+            active: true,
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+impl Drop for BlasThreadGuard {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        restore_blas_thread_env_hints(&self.saved_env);
+        match self.state {
+            BlasThreadState::OpenBlas { prev_threads } => {
+                if let Some(prev) = prev_threads {
+                    let _ = rust_openblas_set_threads_impl(prev);
+                }
+            }
+            BlasThreadState::Accelerate { prev_mode } => match prev_mode {
+                Some(1) => {
+                    let _ = accelerate_blas_set_threading_mode(false);
+                }
+                Some(_) => {
+                    let _ = accelerate_blas_set_threading_mode(true);
+                }
+                None => {}
+            },
+            BlasThreadState::Other => {}
+        }
+    }
+}
+
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 pub(crate) struct OpenBlasThreadGuard;
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 impl OpenBlasThreadGuard {
+    #[inline]
+    pub(crate) fn enter(_target_threads: usize) -> Self {
+        Self
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+pub(crate) struct BlasThreadGuard;
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+impl BlasThreadGuard {
     #[inline]
     pub(crate) fn enter(_target_threads: usize) -> Self {
         Self

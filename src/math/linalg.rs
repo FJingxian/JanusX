@@ -17,6 +17,98 @@ pub(crate) fn chi2_sf_df1(stat: f64) -> f64 {
 }
 
 #[inline]
+fn betacf(a: f64, b: f64, x: f64) -> f64 {
+    let qab = a + b;
+    let qap = a + 1.0;
+    let qam = a - 1.0;
+    let mut c = 1.0;
+    let mut d = 1.0 - qab * x / qap;
+    let fpmin = 1e-300;
+    if d.abs() < fpmin {
+        d = fpmin;
+    }
+    d = 1.0 / d;
+    let mut h = d;
+    let eps = 3e-7;
+    for m in 1..=200 {
+        let m2 = 2 * m;
+        let mut aa =
+            (m as f64) * (b - (m as f64)) * x / ((qam + m2 as f64) * (a + m2 as f64));
+        d = 1.0 + aa * d;
+        if d.abs() < fpmin {
+            d = fpmin;
+        }
+        c = 1.0 + aa / c;
+        if c.abs() < fpmin {
+            c = fpmin;
+        }
+        d = 1.0 / d;
+        h *= d * c;
+
+        aa = -(a + (m as f64)) * (qab + (m as f64)) * x / ((a + m2 as f64) * (qap + m2 as f64));
+        d = 1.0 + aa * d;
+        if d.abs() < fpmin {
+            d = fpmin;
+        }
+        c = 1.0 + aa / c;
+        if c.abs() < fpmin {
+            c = fpmin;
+        }
+        d = 1.0 / d;
+        let del = d * c;
+        h *= del;
+        if (del - 1.0).abs() < eps {
+            break;
+        }
+    }
+    h
+}
+
+#[inline]
+fn betai(a: f64, b: f64, x: f64) -> f64 {
+    if !(0.0..=1.0).contains(&x) {
+        return f64::NAN;
+    }
+    if x == 0.0 {
+        return 0.0;
+    }
+    if x == 1.0 {
+        return 1.0;
+    }
+    let ln_beta = libm::lgamma(a) + libm::lgamma(b) - libm::lgamma(a + b);
+    if x < (a + 1.0) / (a + b + 2.0) {
+        let front = ((a * x.ln()) + (b * (1.0 - x).ln()) - ln_beta).exp() / a;
+        front * betacf(a, b, x)
+    } else {
+        let front = ((b * (1.0 - x).ln()) + (a * x.ln()) - ln_beta).exp() / b;
+        1.0 - front * betacf(b, a, 1.0 - x)
+    }
+}
+
+#[inline]
+pub(crate) fn student_t_p_two_sided(t: f64, df: i32) -> f64 {
+    if df <= 0 {
+        return f64::NAN;
+    }
+    if !t.is_finite() {
+        return if t.is_nan() {
+            f64::NAN
+        } else {
+            f64::MIN_POSITIVE
+        };
+    }
+    let v = df as f64;
+    let x = v / (v + t * t);
+    let a = v / 2.0;
+    let b = 0.5;
+    let mut p = betai(a, b, x);
+    if !p.is_finite() {
+        p = 1.0;
+    }
+    p.clamp(f64::MIN_POSITIVE, 1.0)
+}
+
+#[inline]
 fn normal_ppf_acklam(p: f64) -> f64 {
     const A: [f64; 6] = [
         -3.969_683_028_665_376e1,

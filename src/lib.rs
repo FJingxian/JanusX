@@ -120,8 +120,10 @@ use eigh::{
     rust_eigh_from_matrix_file_f64,
 };
 use garfield::{
-    garfield_eval_rule_bin_py, garfield_prepare_input_bin_py, garfield_scan_groups_bin_py,
-    garfield_scan_windows_bin_py, garfield_subset_bin_samples_py,
+    garfield_eval_rule_bin_py, garfield_logic_search_bed_py, garfield_prepare_input_bin_py,
+    garfield_residualize_bed_py, garfield_residualize_grm_py, garfield_scan_groups_bin_py,
+    garfield_scan_windows_bin_py, garfield_subset_bin_samples_py, load_bin01_packed_py,
+    load_mbin_packed_py,
 };
 use gfreader::{
     bed_filter_stream_to_plink_rust, bed_filter_to_plink_rust, bed_mmap_filter_to_plink_rust,
@@ -173,8 +175,8 @@ use score::{
     score_binary_ba_mcc_batch_py, score_binary_ba_py, score_binary_mcc_py, score_cont_corr_py,
     score_cont_mean_diff_corr_batch_py, score_cont_mean_diff_py,
 };
-use sim_g2p::g2p_simulate_py;
 use sim::{sim_trait_accumulate_i8_f32, SimChunkGenerator, SimEngine, SimTraitAccumulator};
+use sim_g2p::g2p_simulate_py;
 use top::{top_fit_model_py, top_rank_to_target_sample_py, top_rank_to_target_values_py};
 use tree::{
     geno_chunk_to_alignment_u8, geno_chunk_to_alignment_u8_siteinfo,
@@ -243,6 +245,8 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(count_vcf_snps, m)?)?;
     m.add_function(wrap_pyfunction!(count_hmp_snps, m)?)?;
     m.add_function(wrap_pyfunction!(load_bed_2bit_packed, m)?)?;
+    m.add_function(wrap_pyfunction!(load_bin01_packed_py, m)?)?;
+    m.add_function(wrap_pyfunction!(load_mbin_packed_py, m)?)?;
     m.add_function(wrap_pyfunction!(scan_bed_2bit_packed_stats, m)?)?;
     m.add_function(wrap_pyfunction!(prepare_bed_2bit_packed, m)?)?;
     m.add_function(wrap_pyfunction!(load_bed_u8_matrix, m)?)?;
@@ -363,7 +367,10 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(garfield_scan_groups_bin_py, m)?)?;
     m.add_function(wrap_pyfunction!(garfield_scan_windows_bin_py, m)?)?;
     m.add_function(wrap_pyfunction!(garfield_eval_rule_bin_py, m)?)?;
+    m.add_function(wrap_pyfunction!(garfield_logic_search_bed_py, m)?)?;
     m.add_function(wrap_pyfunction!(garfield_prepare_input_bin_py, m)?)?;
+    m.add_function(wrap_pyfunction!(garfield_residualize_grm_py, m)?)?;
+    m.add_function(wrap_pyfunction!(garfield_residualize_bed_py, m)?)?;
     m.add_function(wrap_pyfunction!(preprocess_bsa, m)?)?;
     m.add_function(wrap_pyfunction!(geno_chunk_to_alignment_u8, m)?)?;
     m.add_function(wrap_pyfunction!(geno_chunk_to_alignment_u8_siteinfo, m)?)?;

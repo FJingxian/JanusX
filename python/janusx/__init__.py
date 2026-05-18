@@ -66,6 +66,14 @@ def _init_macos_openblas_path() -> None:
     cands.extend(sorted((pkg_dir / ".dylibs").glob("libopenblas*.dylib")))
     cands.extend(sorted((pkg_dir.parent / "janusx.libs").glob("libopenblas*.dylib")))
     cands.extend(sorted((pkg_dir / ".libs").glob("libopenblas*.dylib")))
+    conda_prefix = str(os.environ.get("CONDA_PREFIX", "")).strip()
+    if conda_prefix:
+        cands.extend(sorted((Path(conda_prefix) / "lib").glob("libopenblas*.dylib")))
+    for root in (
+        Path("/opt/homebrew/opt/openblas/lib"),
+        Path("/usr/local/opt/openblas/lib"),
+    ):
+        cands.extend(sorted(root.glob("libopenblas*.dylib")))
     if len(cands) == 0:
         return
 
@@ -75,10 +83,12 @@ def _init_macos_openblas_path() -> None:
         "libopenblas.dylib",
     ]
     picked: Path | None = None
-    by_name = {p.name: p for p in cands}
     for name in preferred_order:
-        if name in by_name:
-            picked = by_name[name]
+        for cand in cands:
+            if cand.name == name:
+                picked = cand
+                break
+        if picked is not None:
             break
     if picked is None:
         picked = cands[0]
@@ -245,7 +255,7 @@ def maybe_emit_macos_eigh_fallback_hint(
 
     backend_line = "  backend: Accelerate LAPACK"
     warning_body = (
-        "Bundled OpenBLAS LAPACK was unavailable or skipped due to a runtime conflict; "
+        "OpenBLAS LAPACK was unavailable or skipped due to a runtime conflict; "
         "JanusX used Accelerate instead.\n"
         "  Set JX_RUST_EIGH_LAPACK_BACKEND=accelerate to silence this fallback."
     )

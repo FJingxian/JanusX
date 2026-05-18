@@ -8,11 +8,11 @@ use numpy::PyArray1;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
-use rayon::prelude::*;
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 use rand_distr::{Distribution, Exp, Gamma, StandardNormal};
+use rayon::prelude::*;
 
 use crate::gfcore as core;
 use crate::gfcore::{BedSnpIter, HmpSnpIter, TxtSnpIter, VcfSnpIter};
@@ -37,6 +37,12 @@ enum BackgroundDist {
 enum LogicOp {
     And,
     Or,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LogicEffectModel {
+    Gate,
+    CenteredInteraction,
 }
 
 #[derive(Clone, Debug)]
@@ -82,6 +88,7 @@ struct G2pSimConfig {
     logic_af_max: f64,
     logic_max_iter: usize,
     logic_window_bp: Option<i32>,
+    logic_effect_model: LogicEffectModel,
     snps_only: bool,
     pheno_prefix: Option<String>,
     fixed_effects_path: Option<String>,
@@ -105,6 +112,7 @@ struct G2pSimResult {
     bg_pve: f64,
     causal_pve: f64,
     residual_var: f64,
+    logic_effect_model: String,
 }
 
 enum SourceReader {
@@ -175,6 +183,7 @@ fn variance_f64(x: &[f64]) -> f64 {
     acc / x.len() as f64
 }
 
+
 #[inline]
 fn centered_row_to_owned_f64(row: &[f32]) -> Vec<f64> {
     if row.is_empty() {
@@ -237,6 +246,14 @@ fn background_dist_name(dist: BackgroundDist) -> &'static str {
         BackgroundDist::Normal => "normal",
         BackgroundDist::Gamma => "gamma",
         BackgroundDist::Laplace => "laplace",
+    }
+}
+
+#[inline]
+fn logic_effect_model_name(model: LogicEffectModel) -> &'static str {
+    match model {
+        LogicEffectModel::Gate => "gate",
+        LogicEffectModel::CenteredInteraction => "centered_interaction",
     }
 }
 
@@ -318,12 +335,12 @@ fn binary_r2(a: &[u8], b: &[u8]) -> f64 {
     }
 }
 
-fn logic_gate_values(rows: &[Vec<u8>], op: LogicOp) -> Vec<f64> {
+fn logic_gate_indicator(rows: &[Vec<u8>], op: LogicOp) -> Vec<u8> {
     if rows.is_empty() {
         return Vec::new();
     }
     let n = rows[0].len();
-    let mut raw = vec![0.0_f64; n];
+    let mut raw = vec![0u8; n];
     match op {
         LogicOp::And => {
             for i in 0..n {
@@ -334,7 +351,7 @@ fn logic_gate_values(rows: &[Vec<u8>], op: LogicOp) -> Vec<f64> {
                         break;
                     }
                 }
-                raw[i] = if ok { 1.0 } else { 0.0 };
+                raw[i] = if ok { 1u8 } else { 0u8 };
             }
         }
         LogicOp::Or => {
@@ -346,12 +363,122 @@ fn logic_gate_values(rows: &[Vec<u8>], op: LogicOp) -> Vec<f64> {
                         break;
                     }
                 }
-                raw[i] = if ok { 1.0 } else { 0.0 };
+                raw[i] = if ok { 1u8 } else { 0u8 };
             }
         }
     }
+    raw
+}
+
+fn logic_gate_centered_values(indicator: &[u8]) -> Vec<f64> {
+    let raw = indicator.iter().map(|&v| v as f64).collect::<Vec<_>>();
     let mu = mean_f64(&raw);
     raw.into_iter().map(|v| v - mu).collect()
+}
+
+fn solve_linear_system(mut a: Vec<f64>, mut b: Vec<f64>, n: usize) -> Option<Vec<f64>> {
+    if a.len() != n * n || b.len() != n {
+        return None;
+    }
+    for k in 0..n {
+        let mut pivot = k;
+        let mut pivot_abs = a[k * n + k].abs();
+        for i in (k + 1)..n {
+            let cand = a[i * n + k].abs();
+            if cand > pivot_abs {
+                pivot = i;
+                pivot_abs = cand;
+            }
+        }
+        if pivot_abs <= 1e-12 {
+            return None;
+        }
+        if pivot != k {
+            for j in 0..n {
+                a.swap(k * n + j, pivot * n + j);
+            }
+            b.swap(k, pivot);
+        }
+        let diag = a[k * n + k];
+        for i in (k + 1)..n {
+            let factor = a[i * n + k] / diag;
+            if factor == 0.0 {
+                continue;
+            }
+            a[i * n + k] = 0.0;
+            for j in (k + 1)..n {
+                a[i * n + j] -= factor * a[k * n + j];
+            }
+            b[i] -= factor * b[k];
+        }
+    }
+    let mut x = vec![0.0_f64; n];
+    for i_rev in 0..n {
+        let i = n - 1 - i_rev;
+        let mut rhs = b[i];
+        for j in (i + 1)..n {
+            rhs -= a[i * n + j] * x[j];
+        }
+        let diag = a[i * n + i];
+        if diag.abs() <= 1e-12 {
+            return None;
+        }
+        x[i] = rhs / diag;
+    }
+    Some(x)
+}
+
+fn residualize_logic_indicator_against_main_effects(
+    indicator: &[u8],
+    member_rows: &[Vec<u8>],
+) -> Result<Vec<f64>, String> {
+    if indicator.is_empty() {
+        return Err("logic indicator values are empty".to_string());
+    }
+    let n = indicator.len();
+    let p = 1usize + member_rows.len();
+    for row in member_rows.iter() {
+        if row.len() != n {
+            return Err("logic gate member rows have inconsistent sample lengths".to_string());
+        }
+    }
+
+    let mut gram = vec![0.0_f64; p * p];
+    let mut rhs = vec![0.0_f64; p];
+    let ridge = 1e-8_f64;
+    for i in 0..n {
+        let yi = indicator[i] as f64;
+        rhs[0] += yi;
+        gram[0] += 1.0;
+        for a in 0..member_rows.len() {
+            let xa = member_rows[a][i] as f64;
+            rhs[a + 1] += xa * yi;
+            gram[(a + 1) * p] += xa;
+            gram[a + 1] += xa;
+            gram[(a + 1) * p + (a + 1)] += xa * xa;
+            for b in (a + 1)..member_rows.len() {
+                let xb = member_rows[b][i] as f64;
+                let v = xa * xb;
+                gram[(a + 1) * p + (b + 1)] += v;
+                gram[(b + 1) * p + (a + 1)] += v;
+            }
+        }
+    }
+    for d in 0..p {
+        gram[d * p + d] += ridge;
+    }
+    let beta = solve_linear_system(gram, rhs, p).ok_or_else(|| {
+        "failed to solve centered-interaction projection system".to_string()
+    })?;
+    let mut resid = vec![0.0_f64; n];
+    for i in 0..n {
+        let mut fit = beta[0];
+        for (j, row) in member_rows.iter().enumerate() {
+            fit += beta[j + 1] * row[i] as f64;
+        }
+        resid[i] = indicator[i] as f64 - fit;
+    }
+    Ok(resid)
 }
 
 fn term_label(sites: &[SimSiteRecord], members: &[usize], op: Option<LogicOp>) -> String {
@@ -386,7 +513,10 @@ fn normalize_plink_prefix_local(p: &str) -> String {
     p.to_string()
 }
 
-fn open_source_reader(path_or_prefix: &str, delimiter: Option<&str>) -> Result<SourceReader, String> {
+fn open_source_reader(
+    path_or_prefix: &str,
+    delimiter: Option<&str>,
+) -> Result<SourceReader, String> {
     let p = path_or_prefix.trim();
     if p.is_empty() {
         return Err("path_or_prefix must not be empty".to_string());
@@ -538,7 +668,10 @@ fn select_additive_indices(
             .filter(|idx| !used.contains(idx))
             .collect();
         if avail.is_empty() {
-            return Err("explicit bimrange pools overlap completely; no unique causal site can be drawn".to_string());
+            return Err(
+                "explicit bimrange pools overlap completely; no unique causal site can be drawn"
+                    .to_string(),
+            );
         }
         let pick = avail[rng.random_range(0..avail.len())];
         used.insert(pick);
@@ -623,7 +756,9 @@ fn build_logic_pool_specs(
             op: logic_op_from_mode(logic_mode, rng)?,
         });
     }
-    let target = logic_gate_count.unwrap_or(causal_count.max(1)).max(out.len());
+    let target = logic_gate_count
+        .unwrap_or(causal_count.max(1))
+        .max(out.len());
     while out.len() < target {
         let pool = if let Some(window_bp) = logic_window_bp {
             let mut tries = 0usize;
@@ -704,6 +839,7 @@ fn select_logic_terms(
     logic_af_min: f64,
     logic_af_max: f64,
     logic_max_iter: usize,
+    logic_effect_model: LogicEffectModel,
     rng: &mut StdRng,
 ) -> Result<Vec<CausalTerm>, String> {
     if logic_k_min == 0 {
@@ -795,9 +931,19 @@ fn select_logic_terms(
                         .ok_or_else(|| "missing logic row".to_string())
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            let gate = logic_gate_values(&gate_rows, spec.op);
-            let raw_af = gate.iter().filter(|&&v| v > 0.0).count() as f64 / gate.len() as f64;
-            let var = variance_f64(&gate);
+            let gate_indicator = logic_gate_indicator(&gate_rows, spec.op);
+            let raw_af = gate_indicator.iter().filter(|&&v| v != 0).count() as f64
+                / gate_indicator.len() as f64;
+            let gate_values = match logic_effect_model {
+                LogicEffectModel::Gate => logic_gate_centered_values(&gate_indicator),
+                LogicEffectModel::CenteredInteraction => {
+                    residualize_logic_indicator_against_main_effects(
+                        &gate_indicator,
+                        gate_rows.as_slice(),
+                    )?
+                }
+            };
+            let var = variance_f64(&gate_values);
             if var <= 1e-12 {
                 continue;
             }
@@ -806,7 +952,7 @@ fn select_logic_terms(
                 .map(|(_, _, af)| (raw_af - af_center).abs() < (*af - af_center).abs())
                 .unwrap_or(true)
             {
-                best = Some((members.clone(), gate.clone(), raw_af));
+                best = Some((members.clone(), gate_values.clone(), raw_af));
             }
             if raw_af >= logic_af_min && raw_af <= logic_af_max {
                 let label = term_label(sites, &members, Some(spec.op));
@@ -816,7 +962,7 @@ fn select_logic_terms(
                 out.push(CausalTerm {
                     members,
                     op: Some(spec.op),
-                    values: gate,
+                    values: gate_values,
                     effect: 0.0,
                     label,
                 });
@@ -951,11 +1097,19 @@ fn write_random_effects(
     Ok(())
 }
 
-fn write_fixed_effects(path: &str, terms: &[CausalTerm], sites: &[SimSiteRecord]) -> Result<(), String> {
+fn write_fixed_effects(
+    path: &str,
+    terms: &[CausalTerm],
+    sites: &[SimSiteRecord],
+) -> Result<(), String> {
     let mut w = BufWriter::new(File::create(path).map_err(|e| e.to_string())?);
     writeln!(w, "term_id\tkind\tlogic\tsites\tlabel\teffect").map_err(|e| e.to_string())?;
     for (i, term) in terms.iter().enumerate() {
-        let kind = if term.op.is_some() { "logic_gate" } else { "additive" };
+        let kind = if term.op.is_some() {
+            "logic_gate"
+        } else {
+            "additive"
+        };
         let logic = match term.op {
             Some(LogicOp::And) => "and",
             Some(LogicOp::Or) => "or",
@@ -970,12 +1124,7 @@ fn write_fixed_effects(path: &str, terms: &[CausalTerm], sites: &[SimSiteRecord]
         writeln!(
             w,
             "{}\t{}\t{}\t{}\t{}\t{:.10}",
-            i + 1,
-            kind,
-            logic,
-            site_text,
-            term.label,
-            term.effect
+            i + 1, kind, logic, site_text, term.label, term.effect,
         )
         .map_err(|e| e.to_string())?;
     }
@@ -983,7 +1132,11 @@ fn write_fixed_effects(path: &str, terms: &[CausalTerm], sites: &[SimSiteRecord]
     Ok(())
 }
 
-fn write_causal_sites(path: &str, terms: &[CausalTerm], sites: &[SimSiteRecord]) -> Result<(), String> {
+fn write_causal_sites(
+    path: &str,
+    terms: &[CausalTerm],
+    sites: &[SimSiteRecord],
+) -> Result<(), String> {
     let mut w = BufWriter::new(File::create(path).map_err(|e| e.to_string())?);
     let mut seen: HashSet<(String, i32)> = HashSet::new();
     for term in terms.iter() {
@@ -1006,6 +1159,16 @@ fn parse_background_dist(name: &str) -> Result<BackgroundDist, String> {
         "gamma" => Ok(BackgroundDist::Gamma),
         "laplace" => Ok(BackgroundDist::Laplace),
         other => Err(format!("unsupported background distribution: {other}")),
+    }
+}
+
+fn parse_logic_effect_model(name: &str) -> Result<LogicEffectModel, String> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "" | "gate" | "raw" | "mean_centered_gate" => Ok(LogicEffectModel::Gate),
+        "centered" | "centered_interaction" | "interaction" | "orthogonal" => {
+            Ok(LogicEffectModel::CenteredInteraction)
+        }
+        other => Err(format!("unsupported logic effect model: {other}")),
     }
 }
 
@@ -1056,9 +1219,7 @@ fn g2p_simulate_core(config: G2pSimConfig) -> Result<G2pSimResult, String> {
     if !(0.0..=1.0).contains(&config.logic_het_max) {
         return Err("logic_het_max must be within [0, 1].".to_string());
     }
-    if !(0.0..=1.0).contains(&config.logic_af_min)
-        || !(0.0..=1.0).contains(&config.logic_af_max)
-    {
+    if !(0.0..=1.0).contains(&config.logic_af_min) || !(0.0..=1.0).contains(&config.logic_af_max) {
         return Err("logic_af_min/logic_af_max must be within [0, 1].".to_string());
     }
     if config.logic_af_min > config.logic_af_max {
@@ -1066,9 +1227,10 @@ fn g2p_simulate_core(config: G2pSimConfig) -> Result<G2pSimResult, String> {
     }
 
     let gamma_dist = if matches!(config.background_dist, BackgroundDist::Gamma) {
-        Some(Gamma::new(config.gamma_shape, config.gamma_scale).map_err(|e| {
-            format!("invalid gamma params: {e}")
-        })?)
+        Some(
+            Gamma::new(config.gamma_shape, config.gamma_scale)
+                .map_err(|e| format!("invalid gamma params: {e}"))?,
+        )
     } else {
         None
     };
@@ -1076,9 +1238,10 @@ fn g2p_simulate_core(config: G2pSimConfig) -> Result<G2pSimResult, String> {
         if !(config.laplace_scale > 0.0) || !config.laplace_scale.is_finite() {
             return Err("laplace_scale must be finite and > 0.".to_string());
         }
-        Some(Exp::new(1.0 / config.laplace_scale).map_err(|e| {
-            format!("invalid laplace scale: {e}")
-        })?)
+        Some(
+            Exp::new(1.0 / config.laplace_scale)
+                .map_err(|e| format!("invalid laplace scale: {e}"))?,
+        )
     } else {
         None
     };
@@ -1089,7 +1252,9 @@ fn g2p_simulate_core(config: G2pSimConfig) -> Result<G2pSimResult, String> {
         .map(|s| !s.trim().is_empty())
         .unwrap_or(false);
     let base_term_count = if logic_requested {
-        config.logic_gate_count.unwrap_or(config.causal_count.max(1))
+        config
+            .logic_gate_count
+            .unwrap_or(config.causal_count.max(1))
     } else {
         config.causal_count
     };
@@ -1281,6 +1446,7 @@ fn g2p_simulate_core(config: G2pSimConfig) -> Result<G2pSimResult, String> {
                 config.logic_af_min,
                 config.logic_af_max,
                 config.logic_max_iter,
+                config.logic_effect_model,
                 &mut logic_rng,
             )?;
         } else {
@@ -1354,11 +1520,21 @@ fn g2p_simulate_core(config: G2pSimConfig) -> Result<G2pSimResult, String> {
         }
     }
 
+    let logic_suffix = if logic_requested
+        && matches!(
+            config.logic_effect_model,
+            LogicEffectModel::CenteredInteraction
+        ) {
+        "_centered"
+    } else {
+        ""
+    };
     let default_trait = format!(
-        "sim_bg{:.3}_cs{:.3}_{}",
+        "sim_bg{:.3}_cs{:.3}_{}{}",
         config.bg_pve,
         causal_pve_target,
-        background_dist_name(config.background_dist)
+        background_dist_name(config.background_dist),
+        logic_suffix,
     );
     let trait_name = config
         .trait_name
@@ -1367,7 +1543,14 @@ fn g2p_simulate_core(config: G2pSimConfig) -> Result<G2pSimResult, String> {
         .unwrap_or(default_trait);
 
     if let Some(prefix) = config.pheno_prefix.as_ref() {
-        write_pheno_files(prefix, &sample_ids, &y, &trait_name, config.na_rate, config.seed)?;
+        write_pheno_files(
+            prefix,
+            &sample_ids,
+            &y,
+            &trait_name,
+            config.na_rate,
+            config.seed,
+        )?;
     }
     if let Some(path) = config.random_effects_path.as_ref() {
         write_random_effects(path, &sites, &bg_effects_scaled)?;
@@ -1426,7 +1609,14 @@ fn g2p_simulate_core(config: G2pSimConfig) -> Result<G2pSimResult, String> {
                 .map(|&idx| format!("{}:{}", sites[idx].chrom, sites[idx].pos))
                 .collect::<Vec<String>>()
                 .join(";");
-            (i + 1, kind, logic, site_text, term.label.clone(), term.effect)
+            (
+                i + 1,
+                kind,
+                logic,
+                site_text,
+                term.label.clone(),
+                term.effect,
+            )
         })
         .collect();
 
@@ -1441,6 +1631,7 @@ fn g2p_simulate_core(config: G2pSimConfig) -> Result<G2pSimResult, String> {
         bg_pve: config.bg_pve,
         causal_pve: causal_pve_target,
         residual_var: residual_var_eff,
+        logic_effect_model: logic_effect_model_name(config.logic_effect_model).to_string(),
     })
 }
 
@@ -1470,6 +1661,7 @@ fn g2p_simulate_core(config: G2pSimConfig) -> Result<G2pSimResult, String> {
     logic_af_max=1.0_f64,
     logic_max_iter=256_usize,
     logic_window_bp=None,
+    logic_effect_model="gate",
     delimiter=None,
     snps_only=true,
     pheno_prefix=None,
@@ -1508,6 +1700,7 @@ pub fn g2p_simulate_py<'py>(
     logic_af_max: f64,
     logic_max_iter: usize,
     logic_window_bp: Option<i32>,
+    logic_effect_model: &str,
     delimiter: Option<String>,
     snps_only: bool,
     pheno_prefix: Option<String>,
@@ -1535,9 +1728,7 @@ pub fn g2p_simulate_py<'py>(
         return Err(PyValueError::new_err("logic_k_min must be > 0."));
     }
     if logic_k_max < logic_k_min {
-        return Err(PyValueError::new_err(
-            "logic_k_max must be >= logic_k_min.",
-        ));
+        return Err(PyValueError::new_err("logic_k_max must be >= logic_k_min."));
     }
     if !(0.0..=1.0).contains(&logic_ld_max) {
         return Err(PyValueError::new_err("logic_ld_max must be within [0, 1]."));
@@ -1561,6 +1752,8 @@ pub fn g2p_simulate_py<'py>(
     let _ = chunk_size;
     let bg_dist =
         parse_background_dist(background_dist).map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let logic_effect_model = parse_logic_effect_model(logic_effect_model)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
     let config = G2pSimConfig {
         path_or_prefix,
         delimiter,
@@ -1586,6 +1779,7 @@ pub fn g2p_simulate_py<'py>(
         logic_af_max,
         logic_max_iter,
         logic_window_bp,
+        logic_effect_model,
         snps_only,
         pheno_prefix,
         fixed_effects_path,
@@ -1612,6 +1806,7 @@ pub fn g2p_simulate_py<'py>(
         bg_pve,
         causal_pve,
         residual_var,
+        logic_effect_model,
     } = sim;
 
     #[allow(deprecated)]
@@ -1628,5 +1823,35 @@ pub fn g2p_simulate_py<'py>(
     out.set_item("causal_pve", causal_pve)?;
     out.set_item("ve", residual_var)?;
     out.set_item("residual_var", residual_var)?;
+    out.set_item("logic_effect_model", logic_effect_model)?;
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_centered_interaction_is_orthogonal_to_main_effects() {
+        let a = vec![0u8, 0, 1, 1, 0, 1];
+        let b = vec![0u8, 1, 0, 1, 1, 1];
+        let gate = logic_gate_indicator(&[a.clone(), b.clone()], LogicOp::And);
+        let z = residualize_logic_indicator_against_main_effects(&gate, &[a.clone(), b.clone()])
+            .expect("centered interaction residualization");
+        let sum_z = z.iter().sum::<f64>();
+        let dot_a = z
+            .iter()
+            .zip(a.iter())
+            .map(|(zi, &xi)| zi * xi as f64)
+            .sum::<f64>();
+        let dot_b = z
+            .iter()
+            .zip(b.iter())
+            .map(|(zi, &xi)| zi * xi as f64)
+            .sum::<f64>();
+        assert!(sum_z.abs() < 1e-8);
+        assert!(dot_a.abs() < 1e-8);
+        assert!(dot_b.abs() < 1e-8);
+        assert!(variance_f64(&z) > 1e-12);
+    }
 }

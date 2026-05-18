@@ -46,8 +46,7 @@ pub(crate) fn decode_packed_rows_to_sample_major(
         if packed_row_idx >= packed_rows {
             return Err(format!(
                 "packed row index out of bounds in packed decode: idx={}, packed_rows={}",
-                packed_row_idx,
-                packed_rows
+                packed_row_idx, packed_rows
             ));
         }
         let row =

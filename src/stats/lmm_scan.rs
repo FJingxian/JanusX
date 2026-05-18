@@ -23,8 +23,7 @@ use crate::bedmath::packed_row_missing_count_selected;
 use crate::brent::{brent_minimize, brent_minimize_with_init};
 use crate::linalg::{
     chi2_sf_df1, chi2_stat_df1_from_sf, cholesky_inplace, cholesky_logdet, cholesky_solve_into,
-    format_chisq_value,
-    normal_sf,
+    format_chisq_value, normal_sf,
 };
 use crate::stats_common::{env_truthy, get_cached_pool, parse_index_vec_i64};
 

@@ -1,5 +1,6 @@
 use crate::ml::common::{
-    matrix_i8_to_binary_rows, parse_response, readonly_f64_to_vec, topk_indices, validate_xy,
+    matrix_i8_to_binary_rows, parse_importance, parse_permutation_scoring, parse_response,
+    readonly_f64_to_vec, topk_indices, validate_xy, PermutationConfig,
 };
 use crate::ml::engine::{compute_feature_scores, parse_ml_engine};
 use crate::ml::extra_trees::ExtraTreesConfig;
@@ -19,7 +20,10 @@ use pyo3::prelude::*;
     min_samples_leaf=1,
     bootstrap=true,
     seed=0,
-    feature_subsample=0.0
+    feature_subsample=0.0,
+    importance="imp",
+    permutation_repeats=5,
+    permutation_scoring="auto"
 ))]
 pub fn garfield_ml_feature_scores_py(
     x: PyReadonlyArray2<'_, i8>,
@@ -32,9 +36,15 @@ pub fn garfield_ml_feature_scores_py(
     bootstrap: bool,
     seed: u64,
     feature_subsample: f64,
+    importance: &str,
+    permutation_repeats: usize,
+    permutation_scoring: &str,
 ) -> PyResult<Vec<f64>> {
     let resp = parse_response(response).map_err(PyRuntimeError::new_err)?;
     let engine = parse_ml_engine(method).map_err(PyRuntimeError::new_err)?;
+    let importance_kind = parse_importance(importance).map_err(PyRuntimeError::new_err)?;
+    let perm_scoring =
+        parse_permutation_scoring(permutation_scoring).map_err(PyRuntimeError::new_err)?;
     let (x_rows, _m, _n) = matrix_i8_to_binary_rows(x).map_err(PyRuntimeError::new_err)?;
     let y_vec = readonly_f64_to_vec(&y);
     validate_xy(&x_rows, &y_vec, resp).map_err(PyRuntimeError::new_err)?;
@@ -48,7 +58,21 @@ pub fn garfield_ml_feature_scores_py(
         feature_subsample,
         seed,
     };
-    compute_feature_scores(&x_rows, &y_vec, resp, engine, cfg).map_err(PyRuntimeError::new_err)
+    let perm_cfg = PermutationConfig {
+        n_repeats: permutation_repeats.max(1),
+        scoring: perm_scoring,
+        seed,
+    };
+    compute_feature_scores(
+        &x_rows,
+        &y_vec,
+        resp,
+        engine,
+        cfg,
+        importance_kind,
+        perm_cfg,
+    )
+    .map_err(PyRuntimeError::new_err)
 }
 
 #[pyfunction(name = "garfield_ml_select_topk")]
@@ -63,7 +87,10 @@ pub fn garfield_ml_feature_scores_py(
     min_samples_leaf=1,
     bootstrap=true,
     seed=0,
-    feature_subsample=0.0
+    feature_subsample=0.0,
+    importance="imp",
+    permutation_repeats=5,
+    permutation_scoring="auto"
 ))]
 pub fn garfield_ml_select_topk_py(
     x: PyReadonlyArray2<'_, i8>,
@@ -77,6 +104,9 @@ pub fn garfield_ml_select_topk_py(
     bootstrap: bool,
     seed: u64,
     feature_subsample: f64,
+    importance: &str,
+    permutation_repeats: usize,
+    permutation_scoring: &str,
 ) -> PyResult<(Vec<usize>, Vec<f64>)> {
     let scores = garfield_ml_feature_scores_py(
         x,
@@ -89,6 +119,9 @@ pub fn garfield_ml_select_topk_py(
         bootstrap,
         seed,
         feature_subsample,
+        importance,
+        permutation_repeats,
+        permutation_scoring,
     )?;
     let idx = topk_indices(&scores, topk);
     let picked_scores = idx.iter().map(|&i| scores[i]).collect::<Vec<_>>();

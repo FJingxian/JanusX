@@ -7,12 +7,25 @@ import numpy as np
 import pandas as pd
 from janusx._optional_deps import format_missing_dependency_message
 try:
-    from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
+    from sklearn.ensemble import (
+        ExtraTreesClassifier,
+        ExtraTreesRegressor,
+        GradientBoostingClassifier,
+        GradientBoostingRegressor,
+        RandomForestClassifier,
+        RandomForestRegressor,
+    )
+    from sklearn.inspection import permutation_importance as _sklearn_permutation_importance
     _HAS_SKLEARN = True
     _SKLEARN_IMPORT_ERROR: Exception | None = None
 except Exception as _sklearn_exc:
+    ExtraTreesClassifier = None  # type: ignore[assignment]
+    ExtraTreesRegressor = None  # type: ignore[assignment]
+    GradientBoostingClassifier = None  # type: ignore[assignment]
     GradientBoostingRegressor = None  # type: ignore[assignment]
+    RandomForestClassifier = None  # type: ignore[assignment]
     RandomForestRegressor = None  # type: ignore[assignment]
+    _sklearn_permutation_importance = None  # type: ignore[assignment]
     _HAS_SKLEARN = False
     _SKLEARN_IMPORT_ERROR = _sklearn_exc
 from janusx.gfreader import (
@@ -36,6 +49,8 @@ _TQDM_SPINNER_FRAMES: tuple[str, ...] = ("/", "-", "\\", "|")
 _TQDM_REFRESH_SECONDS = 0.3
 _TQDM_GREEN = "\033[32m"
 _TQDM_RESET = "\033[0m"
+GarfieldImportance = Literal["imp", "permutation"]
+GarfieldPermutationScoring = Literal["auto", "r2", "neg_mse", "accuracy", "neg_logloss"]
 
 
 def _require_sklearn(context: str) -> None:
@@ -49,6 +64,143 @@ def _require_sklearn(context: str) -> None:
             original_error=_SKLEARN_IMPORT_ERROR,
         )
     ) from _SKLEARN_IMPORT_ERROR
+
+
+def _binaryize_carrier_matrix(M: np.ndarray) -> np.ndarray:
+    return np.ascontiguousarray((np.asarray(M) > 0).astype(np.int8))
+
+
+def _resolve_sklearn_max_features(
+    feature_subsample: float,
+    n_features: int,
+) -> Union[str, int, float]:
+    if n_features <= 1:
+        return 1
+    try:
+        frac = float(feature_subsample)
+    except Exception:
+        frac = 0.0
+    if np.isfinite(frac) and frac > 0.0:
+        if frac < 1.0:
+            return float(frac)
+        return int(max(1, min(int(round(frac)), int(n_features))))
+    return "sqrt"
+
+
+def _resolve_sklearn_core(
+    core_name: str,
+    importance: GarfieldImportance,
+) -> str:
+    core_norm = str(core_name).strip().lower() or "auto"
+    if core_norm in {"auto", "sklearn"}:
+        return "et" if importance == "imp" else "rf"
+    return core_norm
+
+
+def _resolve_sklearn_permutation_scoring(
+    response: Literal["binary", "continuous"],
+    scoring: GarfieldPermutationScoring,
+) -> str:
+    scoring_norm = str(scoring).strip().lower() or "auto"
+    if scoring_norm == "auto":
+        return "accuracy" if response == "binary" else "r2"
+    mapping = {
+        "r2": "r2",
+        "neg_mse": "neg_mean_squared_error",
+        "accuracy": "accuracy",
+        "neg_logloss": "neg_log_loss",
+    }
+    if scoring_norm not in mapping:
+        raise ValueError(
+            "permutation_scoring must be one of: auto, r2, neg_mse, accuracy, neg_logloss"
+        )
+    return mapping[scoring_norm]
+
+
+def _build_sklearn_garfield_model(
+    core_name: str,
+    response: Literal["binary", "continuous"],
+    n_estimators: int,
+    max_depth: int,
+    min_samples_leaf: int,
+    bootstrap: bool,
+    seed: int,
+    feature_subsample: float,
+    n_features: int,
+):
+    resolved_core = _resolve_sklearn_core(core_name, "imp")
+    max_features = _resolve_sklearn_max_features(feature_subsample, n_features)
+    min_leaf = max(1, int(min_samples_leaf))
+    min_split = max(2, min_leaf * 2)
+    if resolved_core == "rf":
+        if response == "binary":
+            return RandomForestClassifier(
+                n_estimators=int(max(1, n_estimators)),
+                max_depth=int(max(1, max_depth)),
+                min_samples_leaf=min_leaf,
+                min_samples_split=min_split,
+                bootstrap=bool(bootstrap),
+                n_jobs=1,
+                random_state=int(seed),
+                max_features=max_features,
+            )
+        return RandomForestRegressor(
+            n_estimators=int(max(1, n_estimators)),
+            max_depth=int(max(1, max_depth)),
+            min_samples_leaf=min_leaf,
+            min_samples_split=min_split,
+            bootstrap=bool(bootstrap),
+            n_jobs=1,
+            random_state=int(seed),
+            max_features=max_features,
+        )
+    if resolved_core == "et":
+        if response == "binary":
+            return ExtraTreesClassifier(
+                n_estimators=int(max(1, n_estimators)),
+                max_depth=int(max(1, max_depth)),
+                min_samples_leaf=min_leaf,
+                min_samples_split=min_split,
+                bootstrap=bool(bootstrap),
+                n_jobs=1,
+                random_state=int(seed),
+                max_features=max_features,
+            )
+        return ExtraTreesRegressor(
+            n_estimators=int(max(1, n_estimators)),
+            max_depth=int(max(1, max_depth)),
+            min_samples_leaf=min_leaf,
+            min_samples_split=min_split,
+            bootstrap=bool(bootstrap),
+            n_jobs=1,
+            random_state=int(seed),
+            max_features=max_features,
+        )
+    if resolved_core == "gbdt":
+        subsample = 0.7 if bootstrap else 1.0
+        if response == "binary":
+            return GradientBoostingClassifier(
+                n_estimators=int(max(1, n_estimators)),
+                max_depth=int(max(1, max_depth)),
+                min_samples_leaf=min_leaf,
+                min_samples_split=min_split,
+                learning_rate=0.05,
+                subsample=float(subsample),
+                max_features=max_features,
+                random_state=int(seed),
+                loss="log_loss",
+            )
+        return GradientBoostingRegressor(
+            n_estimators=int(max(1, n_estimators)),
+            max_depth=int(max(1, max_depth)),
+            min_samples_leaf=min_leaf,
+            min_samples_split=min_split,
+            learning_rate=0.05,
+            subsample=float(subsample),
+            max_features=max_features,
+            random_state=int(seed),
+        )
+    raise RuntimeError(f"unsupported sklearn GARFIELD core: {core_name}")
 
 
 class _TqdmSpinnerAdapter:
@@ -457,6 +609,9 @@ def getLogicgate(
     gsetmode:bool = True,
     gset_groups: Union[None, List[np.ndarray], List[list[int]]] = None,
     min_literals: int = 2,
+    importance: GarfieldImportance = "imp",
+    permutation_repeats: int = 5,
+    permutation_scoring: GarfieldPermutationScoring = "auto",
 ):
     """
     Find logic combinations (xcombine) in a genotype block using
@@ -521,13 +676,14 @@ def getLogicgate(
         M,sites = ldprune(M,sites)
 
     Imp = None
+    importance_name = str(importance).strip().lower() or "imp"
+    if importance_name not in {"imp", "permutation"}:
+        raise ValueError("importance must be 'imp' or 'permutation'")
+    carrier_M = _binaryize_carrier_matrix(M)
     # 1) Rust ML engine path (preferred).
     rust_method = core_name
     if rust_method == "auto":
-        rust_method = "et"
-    if rust_method in {"rf", "gbdt"}:
-        # Keep old user terms, route to Rust tree engine.
-        rust_method = "et"
+        rust_method = "auto"
     if _garfield_ml_feature_scores is not None and core_name != "sklearn":
         try:
             Imp = np.asarray(
@@ -542,6 +698,9 @@ def getLogicgate(
                     bootstrap=True,
                     seed=0,
                     feature_subsample=0.0,
+                    importance=importance_name,
+                    permutation_repeats=int(max(1, int(permutation_repeats))),
+                    permutation_scoring=str(permutation_scoring),
                 ),
                 dtype=np.float64,
             ).reshape(-1)
@@ -554,33 +713,53 @@ def getLogicgate(
     # 2) sklearn fallback path.
     if Imp is None:
         _require_sklearn("GARFIELD core models (rf/gbdt)")
-        if core_name not in {"rf", "gbdt", "auto", "sklearn"}:
+        if core_name not in {"rf", "gbdt", "et", "auto", "sklearn"}:
             # User asked an unsupported Rust-only engine but Rust path is unavailable.
             raise RuntimeError(
                 f"Rust ML engine '{core_name}' is unavailable in this build; "
-                "use {auto, sklearn, rf, gbdt} fallback or rebuild janusx extension "
-                "to enable {et, corr, mcc, mean_diff, fisher}."
+                "use {auto, sklearn, rf, gbdt, et} fallback or rebuild janusx extension "
+                "to enable {corr, mcc, mean_diff, fisher}."
             )
-        sk_core = "gbdt" if core_name in {"auto", "sklearn"} else core_name
-        if sk_core == 'rf':
-            model = RandomForestRegressor(
-                n_estimators=n_estimators,
-                max_depth=nsnp,
-                min_samples_leaf=nsnp,
-                bootstrap=True,
-                n_jobs=1,
-                random_state=0,
+        sk_core = _resolve_sklearn_core(core_name, importance_name)
+        if core_name == "et" and importance_name != "imp":
+            raise RuntimeError(
+                "permutation importance is not implemented for extra_trees in the Rust GARFIELD engine; "
+                "use rf or gbdt for permutation importance."
             )
+        model = _build_sklearn_garfield_model(
+            sk_core,
+            response=response,
+            n_estimators=int(max(1, int(n_estimators))),
+            max_depth=int(max(1, int(nsnp))),
+            min_samples_leaf=1,
+            bootstrap=True,
+            seed=0,
+            feature_subsample=0.0,
+            n_features=int(carrier_M.shape[0]),
+        )
+        y_fit: np.ndarray = (
+            np.ascontiguousarray(np.asarray(y, dtype=np.int8).reshape(-1))
+            if response == "binary"
+            else np.ascontiguousarray(np.asarray(y, dtype=np.float64).reshape(-1))
+        )
+        model.fit(carrier_M.T, y_fit)
+        if importance_name == "imp":
+            Imp = np.asarray(model.feature_importances_, dtype=np.float64).reshape(-1)
         else:
-            model = GradientBoostingRegressor(
-                n_estimators=n_estimators,
-                max_depth=nsnp,
-                learning_rate=0.05,
-                subsample=0.7,
-                random_state=0,
+            scoring_name = _resolve_sklearn_permutation_scoring(
+                response=response,
+                scoring=permutation_scoring,
             )
-        model.fit(M.T, y)
-        Imp = np.asarray(model.feature_importances_, dtype=np.float64).reshape(-1)
+            perm = _sklearn_permutation_importance(
+                model,
+                carrier_M.T,
+                y_fit,
+                scoring=scoring_name,
+                n_repeats=int(max(1, int(permutation_repeats))),
+                random_state=0,
+                n_jobs=1,
+            )
+            Imp = np.asarray(perm.importances_mean, dtype=np.float64).reshape(-1)
 
     topk = nsnp
     if gsetmode and gset_groups is not None:

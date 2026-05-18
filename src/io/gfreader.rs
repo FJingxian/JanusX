@@ -176,7 +176,9 @@ impl GwasAssocTsvWriter {
                         .map_err(|e| PyIOError::new_err(e.to_string()))?;
                 } else {
                     writer
-                        .write_all(b"chrom\tpos\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\n")
+                        .write_all(
+                            b"chrom\tpos\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\n",
+                        )
                         .map_err(|e| PyIOError::new_err(e.to_string()))?;
                 }
             }
@@ -1388,9 +1390,8 @@ fn evaluate_packed_row_keep_and_flip(
 
     if apply_het_filter {
         let het_rate = (het_count as f64) / non_missing_f;
-        let low = het_threshold as f64;
-        let high = 1.0 - low;
-        if het_rate < low || het_rate > high {
+        let max_het = het_threshold as f64;
+        if het_rate > max_het {
             return (false, false);
         }
     }
@@ -1994,9 +1995,9 @@ pub fn bed_filter_stream_to_plink_rust(
         ));
     }
     let het = het_threshold.unwrap_or(0.02);
-    if !(0.0..=0.5).contains(&het) {
+    if !(0.0..=1.0).contains(&het) {
         return Err(PyValueError::new_err(
-            "het_threshold must be within [0, 0.5]",
+            "het_threshold must be within [0, 1.0]",
         ));
     }
     let apply_het_filter = model_key != "add";
@@ -2119,9 +2120,9 @@ pub fn bed_mmap_filter_to_plink_rust(
             "max_missing_rate must be within [0, 1.0]",
         ));
     }
-    if !(0.0..=0.5).contains(&het_threshold) {
+    if !(0.0..=1.0).contains(&het_threshold) {
         return Err(PyValueError::new_err(
-            "het_threshold must be within [0, 0.5]",
+            "het_threshold must be within [0, 1.0]",
         ));
     }
 
@@ -2381,9 +2382,9 @@ pub fn bed_filter_to_plink_rust(
         ));
     }
     let het = het_threshold.unwrap_or(0.02);
-    if !(0.0..=0.5).contains(&het) {
+    if !(0.0..=1.0).contains(&het) {
         return Err(PyValueError::new_err(
-            "het_threshold must be within [0, 0.5]",
+            "het_threshold must be within [0, 1.0]",
         ));
     }
     if fill_missing {
@@ -2537,9 +2538,9 @@ impl BedChunkReader {
             ));
         }
         let het = het_threshold.unwrap_or(0.02);
-        if !(0.0..=0.5).contains(&het) {
+        if !(0.0..=1.0).contains(&het) {
             return Err(pyo3::exceptions::PyValueError::new_err(
-                "het_threshold must be within [0, 0.5]",
+                "het_threshold must be within [0, 1.0]",
             ));
         }
         let apply_het_filter = model_key != "add";
@@ -2973,11 +2974,7 @@ impl BedChunkReader {
                 *v -= mean;
             }
             let coded_mean = (sum / n as f64) as f32;
-            let maf_v = if additive_mode {
-                stats.maf
-            } else {
-                coded_mean
-            };
+            let maf_v = if additive_mode { stats.maf } else { coded_mean };
             Some((row_sub, site.into(), maf_v, stats.missing_count as f32))
         };
 
@@ -3194,9 +3191,9 @@ impl VcfChunkReader {
             ));
         }
         let het = het_threshold.unwrap_or(0.02);
-        if !(0.0..=0.5).contains(&het) {
+        if !(0.0..=1.0).contains(&het) {
             return Err(pyo3::exceptions::PyValueError::new_err(
-                "het_threshold must be within [0, 0.5]",
+                "het_threshold must be within [0, 1.0]",
             ));
         }
         let apply_het_filter = model_key != "add";
@@ -3344,9 +3341,9 @@ impl HmpChunkReader {
             ));
         }
         let het = het_threshold.unwrap_or(0.02);
-        if !(0.0..=0.5).contains(&het) {
+        if !(0.0..=1.0).contains(&het) {
             return Err(pyo3::exceptions::PyValueError::new_err(
-                "het_threshold must be within [0, 0.5]",
+                "het_threshold must be within [0, 1.0]",
             ));
         }
         let apply_het_filter = model_key != "add";
@@ -3525,9 +3522,9 @@ impl TxtChunkReader {
             ));
         }
         let het = het_threshold.unwrap_or(0.02);
-        if !(0.0..=0.5).contains(&het) {
+        if !(0.0..=1.0).contains(&het) {
             return Err(pyo3::exceptions::PyValueError::new_err(
-                "het_threshold must be within [0, 0.5]",
+                "het_threshold must be within [0, 1.0]",
             ));
         }
         let apply_het_filter = model_key != "add";
@@ -3833,6 +3830,20 @@ pub(crate) struct PackedBedSubsetOwned {
     pub bytes_per_snp: usize,
 }
 
+pub(crate) struct PreparedBedPackedOwned {
+    pub packed: Vec<u8>,
+    pub missing_rate: Vec<f32>,
+    pub maf: Vec<f32>,
+    pub std_denom: Vec<f32>,
+    pub row_flip: Vec<bool>,
+    pub site_keep: Vec<bool>,
+    pub sample_ids: Vec<String>,
+    pub sites: Vec<core::SiteInfo>,
+    pub n_samples: usize,
+    pub n_snps_total: usize,
+    pub bytes_per_snp: usize,
+}
+
 pub(crate) fn load_bed_2bit_packed_subset_owned(
     prefix: &str,
     site_keep: &[bool],
@@ -3854,8 +3865,7 @@ pub(crate) fn load_bed_2bit_packed_subset_owned(
     );
 
     let bed_path = format!("{bed_prefix}.bed");
-    let bed_file =
-        File::open(&bed_path).map_err(|e| format!("failed to open {bed_path}: {e}"))?;
+    let bed_file = File::open(&bed_path).map_err(|e| format!("failed to open {bed_path}: {e}"))?;
     let mmap =
         unsafe { Mmap::map(&bed_file) }.map_err(|e| format!("failed to mmap {bed_path}: {e}"))?;
     if mmap.len() < 3 {
@@ -3933,6 +3943,265 @@ pub(crate) fn load_bed_2bit_packed_subset_owned(
         maf: maf_keep,
         row_flip: row_flip_keep,
         n_samples,
+        bytes_per_snp,
+    })
+}
+
+pub(crate) fn prepare_bed_2bit_packed_owned(
+    prefix: &str,
+    maf_threshold: f32,
+    max_missing_rate: f32,
+    het_threshold: f32,
+    snps_only: bool,
+) -> Result<PreparedBedPackedOwned, String> {
+    if !(0.0..=0.5).contains(&maf_threshold) {
+        return Err("maf_threshold must be within [0, 0.5]".to_string());
+    }
+    if !(0.0..=1.0).contains(&max_missing_rate) {
+        return Err("max_missing_rate must be within [0, 1.0]".to_string());
+    }
+    if !(0.0..=1.0).contains(&het_threshold) {
+        return Err("het_threshold must be within [0, 1.0]".to_string());
+    }
+
+    let mut bed_prefix = prefix.to_string();
+    let lower = bed_prefix.to_ascii_lowercase();
+    if lower.ends_with(".bed") || lower.ends_with(".bim") || lower.ends_with(".fam") {
+        bed_prefix.truncate(bed_prefix.len() - 4);
+    }
+
+    let samples = core::read_fam(&bed_prefix).map_err(|e| e.to_string())?;
+    let n_samples = samples.len();
+    if n_samples == 0 {
+        return Err("no samples found in PLINK input".to_string());
+    }
+    emit_gfreader_rss_debug(
+        "prepare_bed_2bit_packed/read_fam",
+        &format!("prefix={bed_prefix} n_samples={n_samples}"),
+    );
+    let sites_all = core::read_bim(&bed_prefix).map_err(|e| e.to_string())?;
+    let n_snps = sites_all.len();
+    if n_snps == 0 {
+        return Err("no SNP sites found in PLINK BIM input".to_string());
+    }
+    emit_gfreader_rss_debug(
+        "prepare_bed_2bit_packed/read_bim",
+        &format!("prefix={bed_prefix} n_snps={n_snps}"),
+    );
+
+    let bed_path = format!("{bed_prefix}.bed");
+    let bed_file = File::open(&bed_path).map_err(|e| format!("failed to open {bed_path}: {e}"))?;
+    let mmap =
+        unsafe { Mmap::map(&bed_file) }.map_err(|e| format!("failed to mmap {bed_path}: {e}"))?;
+    if mmap.len() < 3 {
+        return Err("BED too small".to_string());
+    }
+    if mmap[0] != 0x6C || mmap[1] != 0x1B || mmap[2] != 0x01 {
+        return Err("Only SNP-major BED supported".to_string());
+    }
+
+    let bytes_per_snp = (n_samples + 3) / 4;
+    let data_len = mmap.len() - 3;
+    if bytes_per_snp == 0 || data_len % bytes_per_snp != 0 {
+        return Err(format!(
+            "invalid BED payload length: data_len={data_len}, bytes_per_snp={bytes_per_snp}"
+        ));
+    }
+    let n_snps_bed = data_len / bytes_per_snp;
+    if n_snps_bed != n_snps {
+        return Err(format!(
+            "BED/BIM SNP count mismatch: bed={n_snps_bed}, bim={n_snps}"
+        ));
+    }
+
+    let packed_full = &mmap[3..];
+    emit_gfreader_rss_debug(
+        "prepare_bed_2bit_packed/mmap_ready",
+        &format!(
+            "prefix={bed_prefix} n_samples={n_samples} n_snps={n_snps} bytes_per_snp={bytes_per_snp} payload={}",
+            format_debug_bytes_local(packed_full.len() as u64),
+        ),
+    );
+
+    let apply_het_filter = het_threshold > 0.0_f32;
+    #[derive(Clone, Copy)]
+    struct RowScanLite {
+        non_missing: u32,
+        alt_sum: u32,
+        keep: bool,
+        flip: bool,
+    }
+
+    let row_scan: Vec<RowScanLite> = packed_full
+        .par_chunks(bytes_per_snp)
+        .enumerate()
+        .map(|(i, row)| {
+            let (missing, het, hom_alt) = count_packed_row_counts(row, n_samples);
+            let non_missing = n_samples.saturating_sub(missing);
+            let alt_sum = het.saturating_add(hom_alt.saturating_mul(2));
+            let het_count = if apply_het_filter { het } else { 0usize };
+            let (pass_num, flip) = evaluate_packed_row_keep_and_flip(
+                n_samples,
+                non_missing,
+                alt_sum,
+                het_count,
+                maf_threshold,
+                max_missing_rate,
+                apply_het_filter,
+                het_threshold,
+            );
+            let pass_snp = if snps_only {
+                _is_simple_snp_allele(&sites_all[i].ref_allele)
+                    && _is_simple_snp_allele(&sites_all[i].alt_allele)
+            } else {
+                true
+            };
+            RowScanLite {
+                non_missing: non_missing as u32,
+                alt_sum: alt_sum as u32,
+                keep: pass_num && pass_snp,
+                flip,
+            }
+        })
+        .collect();
+    if row_scan.len() != n_snps {
+        return Err(format!(
+            "internal error: stats rows {} != n_snps {n_snps}",
+            row_scan.len()
+        ));
+    }
+    let row_scan_bytes = (row_scan.len() * std::mem::size_of::<RowScanLite>()) as u64;
+    emit_gfreader_rss_debug(
+        "prepare_bed_2bit_packed/row_scan_ready",
+        &format!(
+            "n_snps={n_snps} row_scan_bytes={} het_filter={} snps_only={}",
+            format_debug_bytes_local(row_scan_bytes),
+            if apply_het_filter { 1 } else { 0 },
+            if snps_only { 1 } else { 0 },
+        ),
+    );
+
+    let site_keep: Vec<bool> = row_scan.iter().map(|x| x.keep).collect();
+    let kept_n = site_keep.iter().filter(|&&x| x).count();
+    if kept_n == 0 {
+        return Err(
+            "No SNPs left after packed BED filtering. Please relax thresholds.".to_string(),
+        );
+    }
+    emit_gfreader_rss_debug(
+        "prepare_bed_2bit_packed/site_keep_ready",
+        &format!(
+            "n_snps={n_snps} kept_n={kept_n} dropped={} keep_ratio={:.6}",
+            n_snps.saturating_sub(kept_n),
+            (kept_n as f64) / (n_snps as f64),
+        ),
+    );
+
+    let (packed_keep, miss_keep, maf_keep, std_keep, row_flip_keep, sites_keep) =
+        if kept_n == n_snps {
+            let mut miss_keep = Vec::<f32>::with_capacity(kept_n);
+            let mut maf_keep = Vec::<f32>::with_capacity(kept_n);
+            let mut std_keep = Vec::<f32>::with_capacity(kept_n);
+            let mut row_flip_keep = Vec::<bool>::with_capacity(kept_n);
+            for rs in row_scan.iter() {
+                let (miss_v, maf_v, std_v) = packed_row_stats_from_counts(
+                    n_samples,
+                    rs.non_missing as usize,
+                    rs.alt_sum as usize,
+                );
+                miss_keep.push(miss_v);
+                maf_keep.push(maf_v);
+                std_keep.push(std_v);
+                row_flip_keep.push(rs.flip);
+            }
+            let packed_keep = packed_full.to_vec();
+            emit_gfreader_rss_debug(
+                "prepare_bed_2bit_packed/full_copy_done",
+                &format!(
+                    "kept_n={kept_n} packed_bytes={} stats_bytes={} row_flip_bytes={}",
+                    format_debug_bytes_local(packed_keep.len() as u64),
+                    format_debug_bytes_local(
+                        ((miss_keep.len() + maf_keep.len() + std_keep.len())
+                            * std::mem::size_of::<f32>()) as u64
+                    ),
+                    format_debug_bytes_local(
+                        (row_flip_keep.len() * std::mem::size_of::<bool>()) as u64
+                    ),
+                ),
+            );
+            (
+                packed_keep,
+                miss_keep,
+                maf_keep,
+                std_keep,
+                row_flip_keep,
+                sites_all,
+            )
+        } else {
+            let mut packed_keep = vec![0u8; kept_n * bytes_per_snp];
+            let mut miss_keep = Vec::<f32>::with_capacity(kept_n);
+            let mut maf_keep = Vec::<f32>::with_capacity(kept_n);
+            let mut std_keep = Vec::<f32>::with_capacity(kept_n);
+            let mut row_flip_keep = Vec::<bool>::with_capacity(kept_n);
+            let mut sites_keep = Vec::<core::SiteInfo>::with_capacity(kept_n);
+            let mut dst = 0usize;
+            for i in 0..n_snps {
+                if !site_keep[i] {
+                    continue;
+                }
+                let rs = row_scan[i];
+                let src_off = i * bytes_per_snp;
+                let dst_off = dst * bytes_per_snp;
+                packed_keep[dst_off..dst_off + bytes_per_snp]
+                    .copy_from_slice(&packed_full[src_off..src_off + bytes_per_snp]);
+                let (miss_v, maf_v, std_v) = packed_row_stats_from_counts(
+                    n_samples,
+                    rs.non_missing as usize,
+                    rs.alt_sum as usize,
+                );
+                miss_keep.push(miss_v);
+                maf_keep.push(maf_v);
+                std_keep.push(std_v);
+                row_flip_keep.push(rs.flip);
+                sites_keep.push(sites_all[i].clone());
+                dst = dst.saturating_add(1);
+            }
+            debug_assert_eq!(dst, kept_n);
+            emit_gfreader_rss_debug(
+                "prepare_bed_2bit_packed/subset_copy_done",
+                &format!(
+                    "kept_n={kept_n} packed_bytes={} stats_bytes={} row_flip_bytes={}",
+                    format_debug_bytes_local(packed_keep.len() as u64),
+                    format_debug_bytes_local(
+                        ((miss_keep.len() + maf_keep.len() + std_keep.len())
+                            * std::mem::size_of::<f32>()) as u64
+                    ),
+                    format_debug_bytes_local(
+                        (row_flip_keep.len() * std::mem::size_of::<bool>()) as u64
+                    ),
+                ),
+            );
+            (
+                packed_keep,
+                miss_keep,
+                maf_keep,
+                std_keep,
+                row_flip_keep,
+                sites_keep,
+            )
+        };
+
+    Ok(PreparedBedPackedOwned {
+        packed: packed_keep,
+        missing_rate: miss_keep,
+        maf: maf_keep,
+        std_denom: std_keep,
+        row_flip: row_flip_keep,
+        site_keep,
+        sample_ids: samples,
+        sites: sites_keep,
+        n_samples,
+        n_snps_total: n_snps,
         bytes_per_snp,
     })
 }
@@ -4137,255 +4406,31 @@ pub fn prepare_bed_2bit_packed<'py>(
             "max_missing_rate must be within [0, 1.0]",
         ));
     }
-    if !(0.0..=0.5).contains(&het_threshold) {
+    if !(0.0..=1.0).contains(&het_threshold) {
         return Err(PyValueError::new_err(
-            "het_threshold must be within [0, 0.5]",
+            "het_threshold must be within [0, 1.0]",
         ));
     }
-
-    let mut bed_prefix = prefix;
-    let lower = bed_prefix.to_ascii_lowercase();
-    if lower.ends_with(".bed") || lower.ends_with(".bim") || lower.ends_with(".fam") {
-        bed_prefix.truncate(bed_prefix.len() - 4);
-    }
-
-    let (packed_keep, miss_keep, maf_keep, std_keep, row_flip_keep, site_keep, n_samples, n_snps, bytes_per_snp) = py
-        .detach(move || -> Result<
-            (
-                Vec<u8>,
-                Vec<f32>,
-                Vec<f32>,
-                Vec<f32>,
-                Vec<bool>,
-                Vec<bool>,
-                usize,
-                usize,
-                usize,
-            ),
-            String,
-        > {
-            let samples = core::read_fam(&bed_prefix).map_err(|e| e.to_string())?;
-            let n_samples = samples.len();
-            if n_samples == 0 {
-                return Err("no samples found in PLINK input".to_string());
-            }
-            emit_gfreader_rss_debug(
-                "prepare_bed_2bit_packed/read_fam",
-                &format!("prefix={bed_prefix} n_samples={n_samples}"),
-            );
-            let sites = core::read_bim(&bed_prefix).map_err(|e| e.to_string())?;
-            let n_snps = sites.len();
-            if n_snps == 0 {
-                return Err("no SNP sites found in PLINK BIM input".to_string());
-            }
-            emit_gfreader_rss_debug(
-                "prepare_bed_2bit_packed/read_bim",
-                &format!("prefix={bed_prefix} n_snps={n_snps}"),
-            );
-
-            let bed_path = format!("{bed_prefix}.bed");
-            let bed_file = File::open(&bed_path)
-                .map_err(|e| format!("failed to open {bed_path}: {e}"))?;
-            let mmap = unsafe { Mmap::map(&bed_file) }
-                .map_err(|e| format!("failed to mmap {bed_path}: {e}"))?;
-            if mmap.len() < 3 {
-                return Err("BED too small".to_string());
-            }
-            if mmap[0] != 0x6C || mmap[1] != 0x1B || mmap[2] != 0x01 {
-                return Err("Only SNP-major BED supported".to_string());
-            }
-
-            let bytes_per_snp = (n_samples + 3) / 4;
-            let data_len = mmap.len() - 3;
-            if bytes_per_snp == 0 || data_len % bytes_per_snp != 0 {
-                return Err(format!(
-                    "invalid BED payload length: data_len={data_len}, bytes_per_snp={bytes_per_snp}"
-                ));
-            }
-            let n_snps_bed = data_len / bytes_per_snp;
-            if n_snps_bed != n_snps {
-                return Err(format!(
-                    "BED/BIM SNP count mismatch: bed={n_snps_bed}, bim={n_snps}"
-                ));
-            }
-
-            let packed_full = &mmap[3..];
-            emit_gfreader_rss_debug(
-                "prepare_bed_2bit_packed/mmap_ready",
-                &format!(
-                    "prefix={bed_prefix} n_samples={n_samples} n_snps={n_snps} bytes_per_snp={bytes_per_snp} payload={}",
-                    format_debug_bytes_local(packed_full.len() as u64),
-                ),
-            );
-
-            let apply_het_filter = het_threshold > 0.0_f32;
-            #[derive(Clone, Copy)]
-            struct RowScanLite {
-                non_missing: u32,
-                alt_sum: u32,
-                keep: bool,
-                flip: bool,
-            }
-
-            let row_scan: Vec<RowScanLite> = packed_full
-                .par_chunks(bytes_per_snp)
-                .enumerate()
-                .map(|(i, row)| {
-                    let (missing, het, hom_alt) = count_packed_row_counts(row, n_samples);
-                    let non_missing = n_samples.saturating_sub(missing);
-                    let alt_sum = het.saturating_add(hom_alt.saturating_mul(2));
-                    let het_count = if apply_het_filter { het } else { 0usize };
-                    let (pass_num, flip) = evaluate_packed_row_keep_and_flip(
-                        n_samples,
-                        non_missing,
-                        alt_sum,
-                        het_count,
-                        maf_threshold,
-                        max_missing_rate,
-                        apply_het_filter,
-                        het_threshold,
-                    );
-                    let pass_snp = if snps_only {
-                        _is_simple_snp_allele(&sites[i].ref_allele)
-                            && _is_simple_snp_allele(&sites[i].alt_allele)
-                    } else {
-                        true
-                    };
-                    RowScanLite {
-                        non_missing: non_missing as u32,
-                        alt_sum: alt_sum as u32,
-                        keep: pass_num && pass_snp,
-                        flip,
-                    }
-                })
-                .collect();
-            if row_scan.len() != n_snps {
-                return Err(format!(
-                    "internal error: stats rows {} != n_snps {n_snps}",
-                    row_scan.len()
-                ));
-            }
-            let row_scan_bytes =
-                (row_scan.len() * std::mem::size_of::<RowScanLite>()) as u64;
-            emit_gfreader_rss_debug(
-                "prepare_bed_2bit_packed/row_scan_ready",
-                &format!(
-                    "n_snps={n_snps} row_scan_bytes={} het_filter={} snps_only={}",
-                    format_debug_bytes_local(row_scan_bytes),
-                    if apply_het_filter { 1 } else { 0 },
-                    if snps_only { 1 } else { 0 },
-                ),
-            );
-
-            let site_keep: Vec<bool> = row_scan.iter().map(|x| x.keep).collect();
-            let kept_n = site_keep.iter().filter(|&&x| x).count();
-            if kept_n == 0 {
-                return Err(
-                    "No SNPs left after packed BED filtering. Please relax thresholds."
-                        .to_string(),
-                );
-            }
-            emit_gfreader_rss_debug(
-                "prepare_bed_2bit_packed/site_keep_ready",
-                &format!(
-                    "n_snps={n_snps} kept_n={kept_n} dropped={} keep_ratio={:.6}",
-                    n_snps.saturating_sub(kept_n),
-                    (kept_n as f64) / (n_snps as f64),
-                ),
-            );
-
-            let (packed_keep, miss_keep, maf_keep, std_keep, row_flip_keep) = if kept_n == n_snps {
-                let mut miss_keep = Vec::<f32>::with_capacity(kept_n);
-                let mut maf_keep = Vec::<f32>::with_capacity(kept_n);
-                let mut std_keep = Vec::<f32>::with_capacity(kept_n);
-                let mut row_flip_keep = Vec::<bool>::with_capacity(kept_n);
-                for rs in row_scan.iter() {
-                    let (miss_v, maf_v, std_v) =
-                        packed_row_stats_from_counts(
-                            n_samples,
-                            rs.non_missing as usize,
-                            rs.alt_sum as usize,
-                        );
-                    miss_keep.push(miss_v);
-                    maf_keep.push(maf_v);
-                    std_keep.push(std_v);
-                    row_flip_keep.push(rs.flip);
-                }
-                let packed_keep = packed_full.to_vec();
-                emit_gfreader_rss_debug(
-                    "prepare_bed_2bit_packed/full_copy_done",
-                    &format!(
-                        "kept_n={kept_n} packed_bytes={} stats_bytes={} row_flip_bytes={}",
-                        format_debug_bytes_local(packed_keep.len() as u64),
-                        format_debug_bytes_local(
-                            ((miss_keep.len() + maf_keep.len() + std_keep.len())
-                                * std::mem::size_of::<f32>()) as u64
-                        ),
-                        format_debug_bytes_local(
-                            (row_flip_keep.len() * std::mem::size_of::<bool>()) as u64
-                        ),
-                    ),
-                );
-                (packed_keep, miss_keep, maf_keep, std_keep, row_flip_keep)
-            } else {
-                let mut packed_keep = vec![0u8; kept_n * bytes_per_snp];
-                let mut miss_keep = Vec::<f32>::with_capacity(kept_n);
-                let mut maf_keep = Vec::<f32>::with_capacity(kept_n);
-                let mut std_keep = Vec::<f32>::with_capacity(kept_n);
-                let mut row_flip_keep = Vec::<bool>::with_capacity(kept_n);
-                let mut dst = 0usize;
-                for i in 0..n_snps {
-                    if !site_keep[i] {
-                        continue;
-                    }
-                    let rs = row_scan[i];
-                    let src_off = i * bytes_per_snp;
-                    let dst_off = dst * bytes_per_snp;
-                    packed_keep[dst_off..dst_off + bytes_per_snp]
-                        .copy_from_slice(&packed_full[src_off..src_off + bytes_per_snp]);
-                    let (miss_v, maf_v, std_v) =
-                        packed_row_stats_from_counts(
-                            n_samples,
-                            rs.non_missing as usize,
-                            rs.alt_sum as usize,
-                        );
-                    miss_keep.push(miss_v);
-                    maf_keep.push(maf_v);
-                    std_keep.push(std_v);
-                    row_flip_keep.push(rs.flip);
-                    dst = dst.saturating_add(1);
-                }
-                debug_assert_eq!(dst, kept_n);
-                emit_gfreader_rss_debug(
-                    "prepare_bed_2bit_packed/subset_copy_done",
-                    &format!(
-                        "kept_n={kept_n} packed_bytes={} stats_bytes={} row_flip_bytes={}",
-                        format_debug_bytes_local(packed_keep.len() as u64),
-                        format_debug_bytes_local(
-                            ((miss_keep.len() + maf_keep.len() + std_keep.len())
-                                * std::mem::size_of::<f32>()) as u64
-                        ),
-                        format_debug_bytes_local(
-                            (row_flip_keep.len() * std::mem::size_of::<bool>()) as u64
-                        ),
-                    ),
-                );
-                (packed_keep, miss_keep, maf_keep, std_keep, row_flip_keep)
-            };
-
-            Ok((
-                packed_keep,
-                miss_keep,
-                maf_keep,
-                std_keep,
-                row_flip_keep,
-                site_keep,
-                n_samples,
-                n_snps,
-                bytes_per_snp,
-            ))
+    let prepared = py
+        .detach(move || {
+            prepare_bed_2bit_packed_owned(
+                &prefix,
+                maf_threshold,
+                max_missing_rate,
+                het_threshold,
+                snps_only,
+            )
         })
         .map_err(PyRuntimeError::new_err)?;
+    let packed_keep = prepared.packed;
+    let miss_keep = prepared.missing_rate;
+    let maf_keep = prepared.maf;
+    let std_keep = prepared.std_denom;
+    let row_flip_keep = prepared.row_flip;
+    let site_keep = prepared.site_keep;
+    let n_samples = prepared.n_samples;
+    let n_snps = prepared.n_snps_total;
+    let bytes_per_snp = prepared.bytes_per_snp;
 
     let packed_mat = Array2::from_shape_vec((maf_keep.len(), bytes_per_snp), packed_keep)
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
@@ -4815,8 +4860,8 @@ impl BedMmapEngine {
         if !(0.0..=1.0).contains(&max_missing_rate) {
             return Err("max_missing_rate must be within [0, 1.0]".to_string());
         }
-        if !(0.0..=0.5).contains(&het_threshold) {
-            return Err("het_threshold must be within [0, 0.5]".to_string());
+        if !(0.0..=1.0).contains(&het_threshold) {
+            return Err("het_threshold must be within [0, 1.0]".to_string());
         }
 
         let remaining = self.n_snps.saturating_sub(self.cursor);

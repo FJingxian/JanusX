@@ -134,6 +134,7 @@ def _run_rust_simulation(
     logic_af_max: float,
     logic_max_iter: int,
     logic_window_bp: Optional[int],
+    logic_effect_model: str,
     background_dist: str,
     gamma_shape: float,
     gamma_scale: float,
@@ -178,6 +179,7 @@ def _run_rust_simulation(
             logic_af_max=float(logic_af_max),
             logic_max_iter=int(logic_max_iter),
             logic_window_bp=logic_window_bp,
+            logic_effect_model=str(logic_effect_model),
             delimiter=None,
             snps_only=True,
             pheno_prefix=outprefix,
@@ -213,6 +215,7 @@ def simulate_phenotype_from_genofile(
     and_af_max: float = 0.98,
     and_target_pve: float = 0.2,
     and_max_iter: int = 100,
+    logic_effect_model: Literal["gate", "centered_interaction"] = "gate",
 ) -> tuple[np.ndarray, list[tuple[str, int, int]]]:
     logic_mode = "and" if str(mode).lower() == "garfield" else None
     gate_count = 1 if logic_mode is not None else None
@@ -236,6 +239,7 @@ def simulate_phenotype_from_genofile(
         logic_af_max=float(and_af_max),
         logic_max_iter=int(and_max_iter),
         logic_window_bp=int(windows) if logic_mode is not None else None,
+        logic_effect_model=str(logic_effect_model),
         background_dist="normal",
         gamma_shape=1.0,
         gamma_scale=1.0,
@@ -491,6 +495,17 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     causal_group.add_argument(
+        "--logic-effect-model",
+        type=str,
+        choices=["gate", "centered_interaction"],
+        default="gate",
+        help=(
+            "Logic-term effect model. 'gate' keeps the current mean-centered gate effect; "
+            "'centered_interaction' removes member main effects and builds a weak-marginal "
+            "interaction benchmark."
+        ),
+    )
+    causal_group.add_argument(
         "-bimrange",
         "--bimrange",
         action="append",
@@ -560,6 +575,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     logic_af_min = 0.0
     logic_af_max = 1.0
     logic_max_iter = 256
+    logic_effect_model = str(args.logic_effect_model).strip().lower()
 
     emit_cli_configuration(
         logger,
@@ -580,6 +596,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                     ("Logic gate", "None" if logic_mode is None else f"{logic_mode} ({logic_k_min},{logic_k_max})"),
                     ("Logic gate count", logic_gate_count),
                     ("Logic window bp", logic_window_bp),
+                    ("Logic effect model", logic_effect_model if logic_mode is not None else "None"),
                     ("Background dist", bg_dist),
                     ("Gamma shape", gamma_shape if bg_dist == "gamma" else "None"),
                     # ("Laplace scale", laplace_scale if bg_dist == "laplace" else "None"),
@@ -717,6 +734,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             logic_af_max=float(logic_af_max),
             logic_max_iter=int(logic_max_iter),
             logic_window_bp=logic_window_bp,
+            logic_effect_model=logic_effect_model,
             background_dist=bg_dist,
             gamma_shape=float(gamma_shape),
             gamma_scale=float(gamma_scale),

@@ -1107,7 +1107,7 @@ pub fn gblup_reml_packed_bed<'py>(
                         .take()
                         .expect("subset packed payload must exist for GRM path"),
                 )
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
             )
             .into_bound(),
         );

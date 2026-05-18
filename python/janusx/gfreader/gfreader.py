@@ -21,6 +21,14 @@ from janusx.janusx import (
     SiteInfo,
 )
 try:
+    from janusx.janusx import load_bin01_packed as _load_bin01_packed
+except Exception:
+    _load_bin01_packed = None
+try:
+    from janusx.janusx import load_mbin_packed as _load_mbin_packed
+except Exception:
+    _load_mbin_packed = None
+try:
     from janusx.janusx import scan_bed_2bit_packed_stats as _scan_bed_2bit_packed_stats
 except Exception:
     _scan_bed_2bit_packed_stats = None
@@ -91,6 +99,47 @@ def load_bed_2bit_packed(prefix: str):
     n_samples : int
     """
     return _load_bed_2bit_packed(str(prefix))
+
+
+def load_bin01_packed(path: str):
+    """
+    Load JanusX BIN01 cache as packed 0/1 bit matrix plus per-row group ids.
+
+    Returns
+    -------
+    packed : np.ndarray[uint8], shape (n_rows, ceil(n_samples/8))
+        1-bit packed payload, row-major.
+    group_ids : np.ndarray[uint64], shape (n_rows,)
+        Feature-group ids derived from site sidecar; rows sharing the same
+        source SNP get the same id when sidecar metadata is available.
+    n_samples : int
+    """
+    if _load_bin01_packed is None:
+        raise RuntimeError(
+            "load_bin01_packed is unavailable in Rust extension. "
+            "Please rebuild/install JanusX."
+        )
+    return _load_bin01_packed(str(path))
+
+
+def load_mbin_packed(path: str):
+    """
+    Load JanusX MBIN cache as packed 0/1 bit matrix plus per-row group ids.
+
+    Returns
+    -------
+    packed : np.ndarray[uint8], shape (n_rows, ceil(n_samples/8))
+        1-bit packed payload, row-major.
+    group_ids : np.ndarray[uint64], shape (n_rows,)
+        Feature-group ids where DOM/REC/HET rows from the same SNP share one id.
+    n_samples : int
+    """
+    if _load_mbin_packed is None:
+        raise RuntimeError(
+            "load_mbin_packed is unavailable in Rust extension. "
+            "Please rebuild/install JanusX."
+        )
+    return _load_mbin_packed(str(path))
 
 
 def scan_bed_2bit_packed_stats(prefix: str):
@@ -1200,8 +1249,8 @@ def _process_txt_like_chunk(
             het_count[has_obs].astype(np.float64)
             / non_missing[has_obs].astype(np.float64)
         )
-        low = float(het)
-        keep &= has_obs & (het_rate >= low) & (het_rate <= (1.0 - low))
+        max_het = float(het)
+        keep &= has_obs & (het_rate <= max_het)
 
     # MAF flip for ALT freq > 0.5 and swap REF/ALT labels.
     flip = has_obs & (alt_freq > 0.5)

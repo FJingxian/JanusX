@@ -814,19 +814,14 @@ pub fn rust_eigh_debug_f64(
     }
 
     let backend = crate::blas::rust_sgemm_backend();
-    let threads_before = crate::blas::rust_blas_get_num_threads();
-    if threads > 0 {
-        let _ = crate::blas::rust_blas_set_num_threads(threads);
-    }
-    let threads_in_stage = crate::blas::rust_blas_get_num_threads();
-
-    let t0 = Instant::now();
-    let run = symmetric_eigh_f64_row_major_with_driver(&a, n, driver_sel, jobz_sel);
-    if threads > 0 && threads_before > 0 {
-        let _ = crate::blas::rust_blas_set_num_threads(threads_before as usize);
-    }
-    let elapsed = t0.elapsed().as_secs_f64();
-    let threads_after = crate::blas::rust_blas_get_num_threads();
+    let (threads_before, threads_in_stage, run, threads_after) =
+        crate::blas::with_eigh_thread_stage(threads, || {
+            let t0 = Instant::now();
+            let run = symmetric_eigh_f64_row_major_with_driver(&a, n, driver_sel, jobz_sel);
+            let elapsed = t0.elapsed().as_secs_f64();
+            (run, elapsed)
+        });
+    let (run, elapsed) = run;
 
     let (evals, _evecs, evd_backend) = run.map_err(PyRuntimeError::new_err)?;
     let lapack_used = is_lapack_backend(evd_backend);
@@ -889,24 +884,19 @@ pub fn rust_eigh_from_array_f64<'py>(
     let jobz_sel = parse_eigh_jobz_token(jobz);
 
     let backend = crate::blas::rust_sgemm_backend();
-    let threads_before = crate::blas::rust_blas_get_num_threads();
-    if threads > 0 {
-        let _ = crate::blas::rust_blas_set_num_threads(threads);
-    }
-    let threads_in_stage = crate::blas::rust_blas_get_num_threads();
-
-    let t0 = Instant::now();
-    let run = if let Some(a_contig) = a_view.as_slice_memory_order() {
-        symmetric_eigh_f64_row_major_with_driver(a_contig, n, driver_sel, jobz_sel)
-    } else {
-        let a_tmp: Vec<f64> = a_view.iter().copied().collect();
-        symmetric_eigh_f64_row_major_with_driver(&a_tmp, n, driver_sel, jobz_sel)
-    };
-    if threads > 0 && threads_before > 0 {
-        let _ = crate::blas::rust_blas_set_num_threads(threads_before as usize);
-    }
-    let elapsed = t0.elapsed().as_secs_f64();
-    let threads_after = crate::blas::rust_blas_get_num_threads();
+    let (threads_before, threads_in_stage, run, threads_after) =
+        crate::blas::with_eigh_thread_stage(threads, || {
+            let t0 = Instant::now();
+            let run = if let Some(a_contig) = a_view.as_slice_memory_order() {
+                symmetric_eigh_f64_row_major_with_driver(a_contig, n, driver_sel, jobz_sel)
+            } else {
+                let a_tmp: Vec<f64> = a_view.iter().copied().collect();
+                symmetric_eigh_f64_row_major_with_driver(&a_tmp, n, driver_sel, jobz_sel)
+            };
+            let elapsed = t0.elapsed().as_secs_f64();
+            (run, elapsed)
+        });
+    let (run, elapsed) = run;
 
     let (evals, evecs_opt, evd_backend) = run.map_err(PyRuntimeError::new_err)?;
     let lapack_used = is_lapack_backend(evd_backend);
@@ -974,19 +964,15 @@ pub fn rust_eigh_from_matrix_file_f64<'py>(
     let jobz_sel = parse_eigh_jobz_token(jobz);
 
     let backend = crate::blas::rust_sgemm_backend();
-    let threads_before = crate::blas::rust_blas_get_num_threads();
-    if threads > 0 {
-        let _ = crate::blas::rust_blas_set_num_threads(threads);
-    }
-    let threads_in_stage = crate::blas::rust_blas_get_num_threads();
-
-    let t0 = Instant::now();
-    let run = symmetric_eigh_f64_row_major_with_driver(&a_row_major, n, driver_sel, jobz_sel);
-    if threads > 0 && threads_before > 0 {
-        let _ = crate::blas::rust_blas_set_num_threads(threads_before as usize);
-    }
-    let elapsed = t0.elapsed().as_secs_f64();
-    let threads_after = crate::blas::rust_blas_get_num_threads();
+    let (threads_before, threads_in_stage, run, threads_after) =
+        crate::blas::with_eigh_thread_stage(threads, || {
+            let t0 = Instant::now();
+            let run =
+                symmetric_eigh_f64_row_major_with_driver(&a_row_major, n, driver_sel, jobz_sel);
+            let elapsed = t0.elapsed().as_secs_f64();
+            (run, elapsed)
+        });
+    let (run, elapsed) = run;
 
     let (evals, evecs_opt, evd_backend) = run.map_err(PyRuntimeError::new_err)?;
     let lapack_used = is_lapack_backend(evd_backend);
@@ -1066,20 +1052,19 @@ pub fn rust_eigh_from_array_f64_inplace<'py>(
     let jobz_sel = parse_eigh_jobz_token(jobz);
 
     let backend = crate::blas::rust_sgemm_backend();
-    let threads_before = crate::blas::rust_blas_get_num_threads();
-    if threads > 0 {
-        let _ = crate::blas::rust_blas_set_num_threads(threads);
-    }
-    let threads_in_stage = crate::blas::rust_blas_get_num_threads();
-
-    let t0 = Instant::now();
-    let run =
-        symmetric_eigh_f64_row_major_inplace_single_driver(a_row_major, n, driver_sel, jobz_sel);
-    if threads > 0 && threads_before > 0 {
-        let _ = crate::blas::rust_blas_set_num_threads(threads_before as usize);
-    }
-    let elapsed = t0.elapsed().as_secs_f64();
-    let threads_after = crate::blas::rust_blas_get_num_threads();
+    let (threads_before, threads_in_stage, run, threads_after) =
+        crate::blas::with_eigh_thread_stage(threads, || {
+            let t0 = Instant::now();
+            let run = symmetric_eigh_f64_row_major_inplace_single_driver(
+                a_row_major,
+                n,
+                driver_sel,
+                jobz_sel,
+            );
+            let elapsed = t0.elapsed().as_secs_f64();
+            (run, elapsed)
+        });
+    let (run, elapsed) = run;
 
     let (evals, evecs_opt, evd_backend) = run.map_err(PyRuntimeError::new_err)?;
     let lapack_used = is_lapack_backend(evd_backend);

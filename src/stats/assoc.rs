@@ -1421,8 +1421,7 @@ pub fn farmcpu_packed_to_tsv(
                 .enumerate()
                 .for_each(|(idx, dst)| {
                     let src_row = row_idx.as_ref().map(|v| v[idx]).unwrap_or(idx);
-                    let row =
-                        &packed_flat[src_row * bytes_per_snp..(src_row + 1) * bytes_per_snp];
+                    let row = &packed_flat[src_row * bytes_per_snp..(src_row + 1) * bytes_per_snp];
                     *dst = packed_row_missing_count_selected(row, n_samples, &sample_idx);
                 });
         };
@@ -1442,7 +1441,9 @@ pub fn farmcpu_packed_to_tsv(
                 .map_err(|e| format!("create {out_path_for_writer}: {e}"))?;
             let mut writer = BufWriter::with_capacity(64 * 1024 * 1024, out_file);
             writer
-                .write_all(b"chrom\tpos\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n")
+                .write_all(
+                    b"chrom\tpos\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n",
+                )
                 .map_err(|e| format!("write header {out_path_for_writer}: {e}"))?;
             for block in rx {
                 if !block.is_empty() {
@@ -1469,8 +1470,10 @@ pub fn farmcpu_packed_to_tsv(
                     let qf = File::create(&qtn_path_for_writer)
                         .map_err(|e| format!("create {qtn_path_for_writer}: {e}"))?;
                     let mut qw = BufWriter::with_capacity(16 * 1024 * 1024, qf);
-                    qw.write_all(b"chrom\tpos\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n")
-                        .map_err(|e| format!("write header {qtn_path_for_writer}: {e}"))?;
+                    qw.write_all(
+                        b"chrom\tpos\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n",
+                    )
+                    .map_err(|e| format!("write header {qtn_path_for_writer}: {e}"))?;
                     for block in qrx {
                         if !block.is_empty() {
                             qw.write_all(&block)
@@ -1650,7 +1653,12 @@ pub fn farmcpu_write_assoc_tsv(
     let beta = beta.as_slice()?;
     let se = se.as_slice()?;
     let pwald = pwald.as_slice()?;
-    if maf.len() != m || row_missing.len() != m || beta.len() != m || se.len() != m || pwald.len() != m {
+    if maf.len() != m
+        || row_missing.len() != m
+        || beta.len() != m
+        || se.len() != m
+        || pwald.len() != m
+    {
         return Err(PyRuntimeError::new_err(format!(
             "FarmCPU vector length mismatch: m={m}, maf={}, miss={}, beta={}, se={}, pwald={}",
             maf.len(),
@@ -1734,7 +1742,9 @@ pub fn farmcpu_write_assoc_tsv(
                 .map_err(|e| PyRuntimeError::new_err(format!("create {pseudo_path}: {e}")))?;
             let mut q_writer = BufWriter::with_capacity(512 * 1024, q_file);
             q_writer
-                .write_all(b"chrom\tpos\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n")
+                .write_all(
+                    b"chrom\tpos\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n",
+                )
                 .map_err(|e| PyRuntimeError::new_err(format!("write header {pseudo_path}: {e}")))?;
             for &idx in uniq.iter() {
                 let b = beta[idx];

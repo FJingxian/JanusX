@@ -332,6 +332,8 @@ def _summary_rows_frame(summary: dict[str, Any]) -> pd.DataFrame:
         "pearsonr_cv_mean",
         "spearmanr_cv_mean",
         "r2_cv_mean",
+        "mse_cv_mean",
+        "mae_cv_mean",
         "pve_final",
         "time_cv_mean_sec",
     ]

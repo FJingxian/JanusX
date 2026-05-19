@@ -560,6 +560,60 @@ def _gblup_mode_label(mode: str) -> str:
     return "additive"
 
 
+def _regression_metric_pack(
+    y_true: typing.Any,
+    y_pred: typing.Any,
+) -> dict[str, float]:
+    yt = np.asarray(y_true, dtype=np.float64).reshape(-1)
+    yp = np.asarray(y_pred, dtype=np.float64).reshape(-1)
+    mask = np.isfinite(yt) & np.isfinite(yp)
+    if int(mask.sum()) == 0:
+        nan = float("nan")
+        return {
+            "pearson": nan,
+            "spearman": nan,
+            "r2": nan,
+            "mse": nan,
+            "mae": nan,
+            "rmse": nan,
+            "nrmse": nan,
+        }
+    yt = yt[mask]
+    yp = yp[mask]
+    n_obs = int(yt.shape[0])
+    diff = yt - yp
+    ss_res = float(np.sum(diff ** 2))
+    mse = float(ss_res / max(1, n_obs))
+    mae = float(np.mean(np.abs(diff)))
+    rmse = float(np.sqrt(mse))
+    ss_tot = float(np.sum((yt - float(np.mean(yt))) ** 2))
+    r2 = float(1.0 - ss_res / ss_tot) if ss_tot > 0.0 else 0.0
+    y_std = float(np.std(yt, ddof=0))
+    nrmse = float(rmse / y_std) if np.isfinite(y_std) and y_std > 0.0 else float("nan")
+    pear = float("nan")
+    spear = float("nan")
+    if n_obs >= 2:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            try:
+                pear = float(pearsonr(yt, yp).statistic)
+            except Exception:
+                pear = float("nan")
+            try:
+                spear = float(spearmanr(yt, yp).statistic)
+            except Exception:
+                spear = float("nan")
+    return {
+        "pearson": pear,
+        "spearman": spear,
+        "r2": r2,
+        "mse": mse,
+        "mae": mae,
+        "rmse": rmse,
+        "nrmse": nrmse,
+    }
+
+
 def _select_top_method_for_trait(
     methods: list[str],
     method_result_map: dict[str, dict[str, typing.Any]],
@@ -569,7 +623,7 @@ def _select_top_method_for_trait(
     metric_key = str(metric).strip().lower()
     scores: dict[str, dict[str, float]] = {}
     best_method = ""
-    best_score = np.inf if metric_key in {"rmse", "nrmse"} else -np.inf
+    best_score = np.inf if metric_key in {"mse", "mae", "rmse", "nrmse"} else -np.inf
     for m in methods:
         key = str(m)
         res = method_result_map.get(key)
@@ -586,25 +640,11 @@ def _select_top_method_for_trait(
             continue
         yt = y_true[mask]
         yp = y_pred[mask]
-        pear = float(pearsonr(yt, yp).statistic)
-        spear = float(spearmanr(yt, yp).statistic)
-        ss_res = float(np.sum((yt - yp) ** 2))
-        ss_tot = float(np.sum((yt - float(np.mean(yt))) ** 2))
-        r2 = float(1.0 - ss_res / ss_tot) if ss_tot > 0 else float("nan")
-        rmse = float(np.sqrt(ss_res / max(1, int(mask.sum()))))
-        y_std = float(np.std(yt, ddof=0))
-        nrmse = float(rmse / y_std) if np.isfinite(y_std) and y_std > 0.0 else float("nan")
-        scores[key] = {
-            "pearson": pear,
-            "spearman": spear,
-            "r2": r2,
-            "rmse": rmse,
-            "nrmse": nrmse,
-        }
+        scores[key] = _regression_metric_pack(yt, yp)
         score = scores[key].get(metric_key, float("nan"))
         if not np.isfinite(score):
             continue
-        if metric_key in {"rmse", "nrmse"}:
+        if metric_key in {"mse", "mae", "rmse", "nrmse"}:
             better = (best_method == "") or (score < best_score)
         else:
             better = (best_method == "") or (score > best_score)
@@ -7803,7 +7843,7 @@ def _run_method_task(
         predict_elapsed = 0.0
         return cv_elapsed, fit_elapsed, predict_elapsed
 
-    fold_rows: list[tuple[str, int, float, float, float, float, float]] = []
+    fold_rows: list[tuple[str, int, float, float, float, float, float, float, float]] = []
     oof_pred: np.ndarray | None = None
     oof_truth: np.ndarray | None = None
     rrblup_pve_rows: list[dict[str, typing.Any]] = []
@@ -8485,13 +8525,14 @@ def _run_method_task(
                     y_train_fold = y_train_fold[fold_train_pred_local_idx]
                 ttrain = np.concatenate([y_train_fold, yhat_train], axis=1)
 
-            ss_res = np.sum((ttest[:, 0] - ttest[:, 1]) ** 2)
-            ss_tot = np.sum((ttest[:, 0] - ttest[:, 0].mean()) ** 2)
-            r2 = float(1 - ss_res / ss_tot) if ss_tot > 0 else 0.0
-            pear = float(pearsonr(ttest[:, 0], ttest[:, 1]).statistic)
-            spear = float(spearmanr(ttest[:, 0], ttest[:, 1]).statistic)
+            fold_metrics = _regression_metric_pack(ttest[:, 0], ttest[:, 1])
+            pear = float(fold_metrics.get("pearson", np.nan))
+            spear = float(fold_metrics.get("spearman", np.nan))
+            r2 = float(fold_metrics.get("r2", np.nan))
+            mse = float(fold_metrics.get("mse", np.nan))
+            mae = float(fold_metrics.get("mae", np.nan))
             elapsed = float(time.time() - t_fold)
-            fold_rows.append((method, int(fold_id), pear, spear, r2, float(pve), elapsed))
+            fold_rows.append((method, int(fold_id), pear, spear, r2, float(pve), elapsed, mse, mae))
             if progress_queue is not None:
                 try:
                     progress_queue.put((method, 1))
@@ -9199,7 +9240,7 @@ def _run_loaded_model_task(
     limit_predtrain: int | None,
 ) -> dict[str, typing.Any]:
     _t_loaded_begin = time.time()
-    fold_rows: list[tuple[str, int, float, float, float, float, float]] = []
+    fold_rows: list[tuple[str, int, float, float, float, float, float, float, float]] = []
     best_test = None
     best_train = None
     best_r2 = -np.inf
@@ -9297,13 +9338,14 @@ def _run_loaded_model_task(
                 ttrain = np.zeros((0, 2), dtype=np.float64)
 
             ttest = np.concatenate([y_test, yhat_test], axis=1)
-            ss_res = np.sum((ttest[:, 0] - ttest[:, 1]) ** 2)
-            ss_tot = np.sum((ttest[:, 0] - ttest[:, 0].mean()) ** 2)
-            r2 = float(1 - ss_res / ss_tot) if ss_tot > 0 else 0.0
-            pear = float(pearsonr(ttest[:, 0], ttest[:, 1]).statistic)
-            spear = float(spearmanr(ttest[:, 0], ttest[:, 1]).statistic)
+            fold_metrics = _regression_metric_pack(ttest[:, 0], ttest[:, 1])
+            pear = float(fold_metrics.get("pearson", np.nan))
+            spear = float(fold_metrics.get("spearman", np.nan))
+            r2 = float(fold_metrics.get("r2", np.nan))
+            mse = float(fold_metrics.get("mse", np.nan))
+            mae = float(fold_metrics.get("mae", np.nan))
             elapsed = float(time.time() - t0)
-            fold_rows.append((method, int(fold_id), pear, spear, r2, float(pve_final), elapsed))
+            fold_rows.append((method, int(fold_id), pear, spear, r2, float(pve_final), elapsed, mse, mae))
             if r2 > best_r2:
                 best_r2 = r2
                 best_test = ttest
@@ -14047,9 +14089,15 @@ def _run_gs_pipeline(
     _file_only_logger.handlers.clear()
     _file_only_logger.setLevel(logging.INFO)
     _file_only_logger.propagate = False
+    _stream_only_logger = logging.getLogger("janusx.gs.stream_only")
+    _stream_only_logger.handlers.clear()
+    _stream_only_logger.setLevel(logging.INFO)
+    _stream_only_logger.propagate = False
     for _h in list(logger.handlers):
         if isinstance(_h, logging.FileHandler):
             _file_only_logger.addHandler(_h)
+        elif isinstance(_h, logging.StreamHandler):
+            _stream_only_logger.addHandler(_h)
 
     def _log_file_only(msg: str) -> None:
         text = str(msg).strip()
@@ -16195,6 +16243,8 @@ def _run_gs_pipeline(
                         "r2": float(row[4]),
                         "pve": float(row[5]),
                         "elapsed_sec": float(row[6]),
+                        "mse": float(row[7]) if len(row) > 7 else float("nan"),
+                        "mae": float(row[8]) if len(row) > 8 else float("nan"),
                     }
                 )
             rrblup_pcg_traces_safe: list[dict[str, typing.Any]] = []
@@ -16606,7 +16656,7 @@ def _run_gs_pipeline(
             if isinstance(state_sel, dict) and len(state_sel) > 0:
                 top_trait_model_state[str(trait_name)] = dict(state_sel)
 
-        all_rows: list[tuple[str, int, float, float, float, float, float]] = []
+        all_rows: list[tuple[str, int, float, float, float, float, float, float, float]] = []
         if cv_splits is not None:
             method_order = {str(m): i for i, m in enumerate(trait_methods)}
             for method in trait_methods:
@@ -16708,11 +16758,20 @@ def _run_gs_pipeline(
 
         if cv_splits is not None:
             gs_output.emit_cv_fold_table(
-                logger,
+                (_stream_only_logger if len(_stream_only_logger.handlers) > 0 else logger),
                 all_rows=all_rows,
                 method_result_map=typing.cast(dict[str, dict[str, typing.Any]], method_result_map),
                 method_display_map=method_display_map,
             )
+            if len(_file_only_logger.handlers) > 0:
+                gs_output.emit_cv_fold_table(
+                    _file_only_logger,
+                    all_rows=all_rows,
+                    method_result_map=typing.cast(dict[str, dict[str, typing.Any]], method_result_map),
+                    method_display_map=method_display_map,
+                    extended_metrics=True,
+                    section_title="Detailed CV fold metrics (log only)",
+                )
 
         for m in trait_methods:
             res = method_result_map.get(m)
@@ -16723,11 +16782,23 @@ def _run_gs_pipeline(
                 pear_mean = float(np.nanmean([float(x[2]) for x in fold_rows]))
                 spear_mean = float(np.nanmean([float(x[3]) for x in fold_rows]))
                 r2_mean = float(np.nanmean([float(x[4]) for x in fold_rows]))
+                mse_mean = float(
+                    np.nanmean(
+                        [float(x[7]) if len(x) > 7 else float("nan") for x in fold_rows]
+                    )
+                )
+                mae_mean = float(
+                    np.nanmean(
+                        [float(x[8]) if len(x) > 8 else float("nan") for x in fold_rows]
+                    )
+                )
                 elapsed_mean = float(np.nanmean([float(x[6]) for x in fold_rows]))
             else:
                 pear_mean = float("nan")
                 spear_mean = float("nan")
                 r2_mean = float("nan")
+                mse_mean = float("nan")
+                mae_mean = float("nan")
                 elapsed_mean = float("nan")
             pve_raw = res.get("pve_final")
             try:
@@ -16746,6 +16817,8 @@ def _run_gs_pipeline(
                     "pearsonr_cv_mean": pear_mean,
                     "spearmanr_cv_mean": spear_mean,
                     "r2_cv_mean": r2_mean,
+                    "mse_cv_mean": mse_mean,
+                    "mae_cv_mean": mae_mean,
                     "pve_final": pve_val,
                     "time_cv_mean_sec": elapsed_mean,
                 }

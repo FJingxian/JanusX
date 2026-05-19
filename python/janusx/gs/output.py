@@ -12,6 +12,7 @@ import math
 import typing
 
 SuccessLogger = typing.Callable[..., None]
+FoldRow = tuple[str, int, float, float, float, float, float, float, float]
 
 
 def _is_gblup_family(method_key: str) -> bool:
@@ -26,8 +27,36 @@ def _model_priority_for_tie(method_key: str) -> int:
     return 1
 
 
+def _unpack_fold_row(row: tuple[typing.Any, ...]) -> FoldRow:
+    if len(row) < 7:
+        raise ValueError(f"fold row has too few fields: {len(row)}")
+    mse = float(row[7]) if len(row) > 7 else float("nan")
+    mae = float(row[8]) if len(row) > 8 else float("nan")
+    return (
+        str(row[0]),
+        int(row[1]),
+        float(row[2]),
+        float(row[3]),
+        float(row[4]),
+        float(row[5]),
+        float(row[6]),
+        mse,
+        mae,
+    )
+
+
+def _fmt_num(value: float, *, digits: int = 3, na: str = "NA") -> str:
+    try:
+        v = float(value)
+    except Exception:
+        return na
+    if not math.isfinite(v):
+        return na
+    return f"{v:.{digits}f}"
+
+
 def _best_row_idx_by_fold(
-    all_rows: list[tuple[str, int, float, float, float, float, float]],
+    all_rows: list[tuple[typing.Any, ...]],
 ) -> dict[int, int]:
     # Per-fold best rule:
     # 1) Pearsonr (.3f) descending
@@ -39,7 +68,7 @@ def _best_row_idx_by_fold(
     best_prio_by_fold: dict[int, int] = {}
     best_r2_by_fold: dict[int, float] = {}
     for idx, row in enumerate(all_rows):
-        m_name, fold_id, pear, _, r2, _, _ = row
+        m_name, fold_id, pear, _, r2, _, _, _, _ = _unpack_fold_row(row)
         fid = int(fold_id)
         pear3 = float(f"{float(pear):.3f}")
         prio = int(_model_priority_for_tie(str(m_name)))
@@ -71,7 +100,7 @@ def _best_row_idx_by_fold(
 
 def select_cv_best_model(
     *,
-    all_rows: list[tuple[str, int, float, float, float, float, float]],
+    all_rows: list[tuple[typing.Any, ...]],
     method_order: dict[str, int],
 ) -> str | None:
     idx_by_fold = _best_row_idx_by_fold(all_rows)
@@ -207,23 +236,48 @@ def emit_method_detail_lines(
 def emit_cv_fold_table(
     logger: logging.Logger,
     *,
-    all_rows: list[tuple[str, int, float, float, float, float, float]],
+    all_rows: list[tuple[typing.Any, ...]],
     method_result_map: dict[str, dict[str, typing.Any]],
     method_display_map: dict[str, str],
+    extended_metrics: bool = False,
+    section_title: str | None = None,
 ) -> None:
     del method_result_map
-    logger.info("-" * 60)
+    if section_title is not None and str(section_title).strip() != "":
+        logger.info(str(section_title))
+    logger.info("-" * (92 if extended_metrics else 60))
     best_row_idx_by_fold = _best_row_idx_by_fold(all_rows)
 
-    row_fmt = (
-        "{fold:<4} "
-        "{method:<10} "
-        "{pear:<8} "
-        "{spear:<9} "
-        "{r2:<6} "
-        "{time:<8} "
-        "{best}"
+    method_w = max(
+        10,
+        min(
+            18,
+            max((len(str(method_display_map.get(str(row[0]), str(row[0])))) for row in all_rows), default=10),
+        ),
     )
+    if extended_metrics:
+        row_fmt = (
+            "{fold:<4} "
+            f"{{method:<{method_w}}} "
+            "{pear:<8} "
+            "{spear:<9} "
+            "{r2:<6} "
+            "{mse:<10} "
+            "{mae:<10} "
+            "{pve:<8} "
+            "{time:<8} "
+            "{best}"
+        )
+    else:
+        row_fmt = (
+            "{fold:<4} "
+            f"{{method:<{method_w}}} "
+            "{pear:<8} "
+            "{spear:<9} "
+            "{r2:<6} "
+            "{time:<8} "
+            "{best}"
+        )
     logger.info(
         row_fmt.format(
             fold="Fold",
@@ -231,21 +285,26 @@ def emit_cv_fold_table(
             pear="Pearsonr",
             spear="Spearmanr",
             r2="R2",
+            mse=("MSE" if extended_metrics else ""),
+            mae=("MAE" if extended_metrics else ""),
+            pve=("PVE" if extended_metrics else ""),
             time="time(s)",
             best="Best",
         )
     )
     for idx, row in enumerate(all_rows):
-        m_name, fold_id, pear, spear, r2, _pve, t_fold = row
+        m_name, fold_id, pear, spear, r2, pve, t_fold, mse, mae = _unpack_fold_row(row)
         is_best = int(best_row_idx_by_fold.get(int(fold_id), -1)) == int(idx)
-        logger.info(
-            row_fmt.format(
-                fold=int(fold_id),
-                method=method_display_map.get(str(m_name), str(m_name)),
-                pear=f"{float(pear):.3f}",
-                spear=f"{float(spear):.3f}",
-                r2=f"{float(r2):.3f}",
-                time=f"{float(t_fold):.3f}",
-                best=("*" if is_best else ""),
-            )
+        row_data = dict(
+            fold=int(fold_id),
+            method=method_display_map.get(str(m_name), str(m_name)),
+            pear=_fmt_num(float(pear), digits=3),
+            spear=_fmt_num(float(spear), digits=3),
+            r2=_fmt_num(float(r2), digits=3),
+            time=_fmt_num(float(t_fold), digits=3),
+            best=("*" if is_best else ""),
+            mse=_fmt_num(float(mse), digits=6),
+            mae=_fmt_num(float(mae), digits=6),
+            pve=_fmt_num(float(pve), digits=3),
         )
+        logger.info(row_fmt.format(**row_data))

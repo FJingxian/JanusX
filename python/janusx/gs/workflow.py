@@ -1748,6 +1748,8 @@ def _decode_packed_subset_to_dense_raw_f32(
     if int(maf.shape[0]) != int(packed.shape[0]):
         raise ValueError("Packed payload mismatch: maf length does not match packed SNP rows.")
     sidx = np.ascontiguousarray(np.asarray(sample_indices, dtype=np.int64).reshape(-1), dtype=np.int64)
+    if int(sidx.size) == 0:
+        return np.zeros((int(packed.shape[0]), 0), dtype=np.float32)
     if np.any(sidx < 0) or np.any(sidx >= int(n_samples)):
         raise ValueError("Packed sample_indices are out of range.")
     ridx = np.ascontiguousarray(np.arange(int(packed.shape[0]), dtype=np.int64), dtype=np.int64)

@@ -177,6 +177,9 @@ pub fn bed_packed_decode_rows_f32<'py>(
         (0..n_samples).collect()
     };
     let n_out = sample_idx.len();
+    if n_out == 0 {
+        return Ok(PyArray2::<f32>::zeros(py, [row_idx.len(), 0], false).into_bound());
+    }
 
     let packed_flat: Cow<[u8]> = match packed.as_slice() {
         Ok(s) => Cow::Borrowed(s),
@@ -1988,6 +1991,43 @@ pub fn packed_malpha_f64<'py>(
 
     let out_arr = PyArray1::from_owned_array(py, Array1::from_vec(out)).into_bound();
     Ok(out_arr)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pyo3::Python;
+
+    #[test]
+    fn bed_packed_decode_rows_f32_allows_empty_sample_subset() {
+        Python::attach(|py| {
+            let packed = PyArray2::from_owned_array(
+                py,
+                Array2::from_shape_vec((2, 1), vec![0u8, 0u8]).expect("packed shape"),
+            );
+            let row_indices =
+                PyArray1::from_owned_array(py, Array1::from_vec(vec![0_i64, 1_i64]));
+            let row_flip =
+                PyArray1::from_owned_array(py, Array1::from_vec(vec![false, false]));
+            let row_maf =
+                PyArray1::from_owned_array(py, Array1::from_vec(vec![0.0_f32, 0.25_f32]));
+            let sample_indices = PyArray1::from_owned_array(py, Array1::from_vec(Vec::<i64>::new()));
+
+            let decoded = bed_packed_decode_rows_f32(
+                py,
+                packed.readonly(),
+                4,
+                row_indices.readonly(),
+                row_flip.readonly(),
+                row_maf.readonly(),
+                Some(sample_indices.readonly()),
+            )
+            .expect("empty sample subset should decode to an empty matrix");
+
+            let out = decoded.readonly().as_array().to_owned();
+            assert_eq!(out.shape(), &[2, 0]);
+        });
+    }
 }
 
 #[pyfunction]

@@ -2669,6 +2669,76 @@ fn packed_row_genotype(row: &[u8], sample_idx: usize) -> Option<u8> {
     }
 }
 
+#[inline]
+fn fill_bin_logic_row_bits(row: &[u8], sample_indices: &[usize], dst_words: &mut [u64]) {
+    let mut c0 = 0usize;
+    let mut c2 = 0usize;
+    for &src_s in sample_indices.iter() {
+        match packed_row_genotype(row, src_s) {
+            Some(0) => c0 += 1,
+            Some(2) => c2 += 1,
+            _ => {}
+        }
+    }
+    let mode02 = if c2 > c0 { 2u8 } else { 0u8 };
+    for (dst_s, &src_s) in sample_indices.iter().enumerate() {
+        let g = packed_row_genotype(row, src_s).unwrap_or(mode02);
+        let is_one = if g == 0 {
+            false
+        } else if g == 2 {
+            true
+        } else {
+            mode02 == 2
+        };
+        if is_one {
+            dst_words[dst_s >> 6] |= 1u64 << (dst_s & 63);
+        }
+    }
+}
+
+#[inline]
+fn fill_mbin_logic_row_bits(
+    row: &[u8],
+    sample_indices: &[usize],
+    row_words: usize,
+    dst_words: &mut [u64],
+) {
+    let mut c0 = 0usize;
+    let mut c1 = 0usize;
+    let mut c2 = 0usize;
+    for &src_s in sample_indices.iter() {
+        match packed_row_genotype(row, src_s) {
+            Some(0) => c0 += 1,
+            Some(1) => c1 += 1,
+            Some(2) => c2 += 1,
+            _ => {}
+        }
+    }
+    let mode3 = if c2 >= c1 && c2 >= c0 {
+        2u8
+    } else if c1 >= c0 {
+        1u8
+    } else {
+        0u8
+    };
+    let (dom_bits, rem) = dst_words.split_at_mut(row_words);
+    let (rec_bits, het_bits) = rem.split_at_mut(row_words);
+    for (dst_s, &src_s) in sample_indices.iter().enumerate() {
+        let g = packed_row_genotype(row, src_s).unwrap_or(mode3);
+        let word_idx = dst_s >> 6;
+        let bit = 1u64 << (dst_s & 63);
+        if g > 0 {
+            dom_bits[word_idx] |= bit;
+        }
+        if g == 2 {
+            rec_bits[word_idx] |= bit;
+        }
+        if g == 1 {
+            het_bits[word_idx] |= bit;
+        }
+    }
+}
+
 #[allow(dead_code)]
 fn convert_prepared_bed_to_logic_bits(
     packed: &[u8],
@@ -2870,95 +2940,52 @@ fn convert_bed_prefix_to_logic_bits(
     };
     let n_rows = sites.len().saturating_mul(row_mul);
     let mut bits_flat = vec![0u64; n_rows.saturating_mul(row_words)];
-    let mut out_sites = Vec::<SiteInfo>::with_capacity(n_rows);
+    let keep_src_rows = site_keep
+        .iter()
+        .enumerate()
+        .filter_map(|(src_row, &keep)| if keep { Some(src_row) } else { None })
+        .collect::<Vec<_>>();
+    if keep_src_rows.len() != sites.len() {
+        return Err(format!(
+            "decoded kept site count mismatch: decoded={}, expected={}",
+            keep_src_rows.len(),
+            sites.len()
+        ));
+    }
 
-    let mut kept_idx = 0usize;
-    for (src_row, &keep) in site_keep.iter().enumerate() {
-        if !keep {
-            continue;
-        }
-        let row = &packed_full[src_row * bytes_per_snp..(src_row + 1) * bytes_per_snp];
-        let site = sites
-            .get(kept_idx)
-            .ok_or_else(|| "filtered site index out of range while decoding BED".to_string())?;
-        match mode {
-            GarfieldBinMode::Bin => {
-                let mut c0 = 0usize;
-                let mut c2 = 0usize;
-                for &src_s in sample_indices.iter() {
-                    match packed_row_genotype(row, src_s) {
-                        Some(0) => c0 += 1,
-                        Some(2) => c2 += 1,
-                        _ => {}
-                    }
+    // Each kept site owns a disjoint row (or MBIN triplet), so row-wise conversion can
+    // safely fan out across Rayon workers without synchronization.
+    bits_flat
+        .par_chunks_mut(row_mul * row_words)
+        .enumerate()
+        .for_each(|(kept_idx, dst_rows)| {
+            let src_row = keep_src_rows[kept_idx];
+            let row = &packed_full[src_row * bytes_per_snp..(src_row + 1) * bytes_per_snp];
+            match mode {
+                GarfieldBinMode::Bin => fill_bin_logic_row_bits(row, sample_indices, dst_rows),
+                GarfieldBinMode::Mbin => {
+                    fill_mbin_logic_row_bits(row, sample_indices, row_words, dst_rows)
                 }
-                let mode02 = if c2 > c0 { 2u8 } else { 0u8 };
-                let dst_row = kept_idx;
-                for (dst_s, &src_s) in sample_indices.iter().enumerate() {
-                    let g = packed_row_genotype(row, src_s).unwrap_or(mode02);
-                    let is_one = if g == 0 {
-                        false
-                    } else if g == 2 {
-                        true
-                    } else {
-                        mode02 == 2
-                    };
-                    if is_one {
-                        bits_flat[dst_row * row_words + (dst_s >> 6)] |= 1u64 << (dst_s & 63);
-                    }
-                }
+            }
+        });
+
+    let mut out_sites = Vec::<SiteInfo>::with_capacity(n_rows);
+    match mode {
+        GarfieldBinMode::Bin => {
+            for site in sites.iter() {
                 let mut site_bin = site.clone();
                 site_bin.alt_allele = format!("{}|BIN", site_bin.alt_allele);
                 out_sites.push(site_bin);
             }
-            GarfieldBinMode::Mbin => {
-                let mut c0 = 0usize;
-                let mut c1 = 0usize;
-                let mut c2 = 0usize;
-                for &src_s in sample_indices.iter() {
-                    match packed_row_genotype(row, src_s) {
-                        Some(0) => c0 += 1,
-                        Some(1) => c1 += 1,
-                        Some(2) => c2 += 1,
-                        _ => {}
-                    }
-                }
-                let mode3 = if c2 >= c1 && c2 >= c0 {
-                    2u8
-                } else if c1 >= c0 {
-                    1u8
-                } else {
-                    0u8
-                };
-                let base = kept_idx * 3;
+        }
+        GarfieldBinMode::Mbin => {
+            for site in sites.iter() {
                 let [dom_site, rec_site, het_site] = mbin_site_variants(site);
-                for (dst_s, &src_s) in sample_indices.iter().enumerate() {
-                    let g = packed_row_genotype(row, src_s).unwrap_or(mode3);
-                    let word_idx = dst_s >> 6;
-                    let bit = 1u64 << (dst_s & 63);
-                    if g > 0 {
-                        bits_flat[base * row_words + word_idx] |= bit;
-                    }
-                    if g == 2 {
-                        bits_flat[(base + 1) * row_words + word_idx] |= bit;
-                    }
-                    if g == 1 {
-                        bits_flat[(base + 2) * row_words + word_idx] |= bit;
-                    }
-                }
                 out_sites.push(dom_site);
                 out_sites.push(rec_site);
                 out_sites.push(het_site);
             }
         }
-        kept_idx = kept_idx.saturating_add(1);
-    }
-    if kept_idx != sites.len() {
-        return Err(format!(
-            "decoded kept site count mismatch: decoded={}, expected={}",
-            kept_idx,
-            sites.len()
-        ));
     }
 
     let group_ids = build_feature_group_ids(&out_sites, out_sites.len());

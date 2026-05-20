@@ -32,8 +32,7 @@ fn betacf(a: f64, b: f64, x: f64) -> f64 {
     let eps = 3e-7;
     for m in 1..=200 {
         let m2 = 2 * m;
-        let mut aa =
-            (m as f64) * (b - (m as f64)) * x / ((qam + m2 as f64) * (a + m2 as f64));
+        let mut aa = (m as f64) * (b - (m as f64)) * x / ((qam + m2 as f64) * (a + m2 as f64));
         d = 1.0 + aa * d;
         if d.abs() < fpmin {
             d = fpmin;

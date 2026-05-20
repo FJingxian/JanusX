@@ -113,7 +113,6 @@ from janusx.gfreader import (
 )
 from janusx.pyBLUP.kfold import kfold
 from janusx.pyBLUP.mlm import BLUP as MLMBLUP
-from janusx.pyBLUP.QK2 import GRM as _QK2_GRM
 from janusx.pyBLUP.bayes import BAYES
 from janusx.pyBLUP.ml import (
     MLGS,
@@ -160,6 +159,11 @@ from janusx.script._common.threads import (
     maybe_warn_non_openblas,
     require_openblas_by_default,
     runtime_thread_stage,
+)
+from janusx.script._common.grmstable import (
+    build_dense_grm_f64,
+    build_stable_packed_ctx_grm_f64,
+    stable_grm_builder_available,
 )
 from janusx.script._common.packedctx import prepare_packed_ctx_from_plink
 from janusx.gs import output as gs_output
@@ -2516,71 +2520,89 @@ def _build_gblup_cv_grm_once(
             raise ValueError("Packed GBLUP-CV requires train sample indices.")
         if _jxrs is None:
             return None
-        if (not hasattr(_jxrs, "grm_packed_f32")) or (
-            not hasattr(_jxrs, "bed_packed_row_flip_mask")
+        if (not stable_grm_builder_available()) and (
+            (not hasattr(_jxrs, "grm_packed_f32"))
+            or (not hasattr(_jxrs, "bed_packed_row_flip_mask"))
         ):
             return None
 
-        packed = np.ascontiguousarray(np.asarray(packed_ctx["packed"], dtype=np.uint8))
-        maf = np.ascontiguousarray(np.asarray(packed_ctx["maf"], dtype=np.float32).reshape(-1))
-        n_samples = int(packed_ctx["n_samples"])
-        if packed.ndim != 2:
-            raise ValueError("Invalid packed payload: packed must be 2D.")
-        if maf.shape[0] != packed.shape[0]:
-            raise ValueError(
-                f"Packed payload mismatch: maf={maf.shape[0]}, packed_rows={packed.shape[0]}."
-            )
-        exp_bps = (n_samples + 3) // 4
-        if int(packed.shape[1]) != int(exp_bps):
-            raise ValueError(
-                f"Packed payload mismatch: bytes_per_snp={packed.shape[1]}, expected={exp_bps}."
-            )
-
-        row_flip_raw = packed_ctx.get("row_flip", None)
-        if row_flip_raw is None:
-            row_flip = np.asarray(
-                _jxrs.bed_packed_row_flip_mask(packed, int(n_samples)),
-                dtype=np.bool_,
-            )
-            row_flip = np.ascontiguousarray(row_flip.reshape(-1), dtype=np.bool_)
-            packed_ctx["row_flip"] = row_flip
-        else:
-            row_flip = np.ascontiguousarray(
-                np.asarray(row_flip_raw, dtype=np.bool_).reshape(-1),
-                dtype=np.bool_,
-            )
-            if row_flip.shape[0] != packed.shape[0]:
-                raise ValueError(
-                    "Packed payload mismatch: row_flip length does not match packed rows."
-                )
-
         sidx = np.ascontiguousarray(np.asarray(train_sample_indices, dtype=np.int64).reshape(-1))
+        n_samples = int(packed_ctx["n_samples"])
         if np.any(sidx < 0) or np.any(sidx >= int(n_samples)):
             raise ValueError("train sample indices contain out-of-range values.")
         full_identity = bool(
             int(sidx.size) == int(n_samples)
             and np.array_equal(sidx, np.arange(n_samples, dtype=np.int64))
         )
-        sidx_arg = None if full_identity else sidx
         block_cols = max(1, min(4096, int(sidx.size) if sidx.size > 0 else int(n_samples)))
 
-        grm_raw = _jxrs.grm_packed_f32(
-            packed,
-            int(n_samples),
-            row_flip,
-            maf,
-            sample_indices=sidx_arg,
-            method=1,
-            block_cols=int(block_cols),
-            threads=max(1, int(n_jobs)),
-            progress_callback=None,
-            progress_every=0,
-        )
-        grm = np.asarray(grm_raw, dtype=np.float64)
+        if stable_grm_builder_available():
+            try:
+                grm, _eff_m = build_stable_packed_ctx_grm_f64(
+                    packed_ctx=packed_ctx,
+                    sample_indices=(None if full_identity else sidx),
+                    block_cols=int(block_cols),
+                    threads=max(1, int(n_jobs)),
+                )
+            except Exception:
+                grm = None
+        else:
+            grm = None
+
+        if grm is None:
+            packed = np.ascontiguousarray(np.asarray(packed_ctx["packed"], dtype=np.uint8))
+            maf = np.ascontiguousarray(np.asarray(packed_ctx["maf"], dtype=np.float32).reshape(-1))
+            if packed.ndim != 2:
+                raise ValueError("Invalid packed payload: packed must be 2D.")
+            if maf.shape[0] != packed.shape[0]:
+                raise ValueError(
+                    f"Packed payload mismatch: maf={maf.shape[0]}, packed_rows={packed.shape[0]}."
+                )
+            exp_bps = (n_samples + 3) // 4
+            if int(packed.shape[1]) != int(exp_bps):
+                raise ValueError(
+                    f"Packed payload mismatch: bytes_per_snp={packed.shape[1]}, expected={exp_bps}."
+                )
+
+            row_flip_raw = packed_ctx.get("row_flip", None)
+            if row_flip_raw is None:
+                row_flip = np.asarray(
+                    _jxrs.bed_packed_row_flip_mask(packed, int(n_samples)),
+                    dtype=np.bool_,
+                )
+                row_flip = np.ascontiguousarray(row_flip.reshape(-1), dtype=np.bool_)
+                packed_ctx["row_flip"] = row_flip
+            else:
+                row_flip = np.ascontiguousarray(
+                    np.asarray(row_flip_raw, dtype=np.bool_).reshape(-1),
+                    dtype=np.bool_,
+                )
+                if row_flip.shape[0] != packed.shape[0]:
+                    raise ValueError(
+                        "Packed payload mismatch: row_flip length does not match packed rows."
+                    )
+
+            sidx_arg = None if full_identity else sidx
+            grm_raw = _jxrs.grm_packed_f32(
+                packed,
+                int(n_samples),
+                row_flip,
+                maf,
+                sample_indices=sidx_arg,
+                method=1,
+                block_cols=int(block_cols),
+                threads=max(1, int(n_jobs)),
+                progress_callback=None,
+                progress_every=0,
+            )
+            grm = np.asarray(grm_raw, dtype=np.float64)
     else:
         if train_snp is None:
             return None
-        grm = np.asarray(_QK2_GRM(np.asarray(train_snp, dtype=np.float32), log=False), dtype=np.float64)
+        grm = build_dense_grm_f64(
+            np.asarray(train_snp, dtype=np.float32),
+            block_rows=4096,
+        )
 
     if grm.ndim != 2 or grm.shape[0] != grm.shape[1]:
         raise ValueError(f"GBLUP CV GRM must be square; got shape={grm.shape}.")
@@ -2743,14 +2765,14 @@ def _build_gblup_test_train_cross_from_markers(
 
     for st in range(0, int(m), step):
         ed = min(st + step, int(m))
-        tr_blk = np.asarray(train_snp[st:ed], dtype=np.float32)
-        te_blk = np.asarray(test_snp[st:ed], dtype=np.float32)
-        mu_blk = np.mean(tr_blk, axis=1, dtype=np.float32, keepdims=True)
-        var_blk = np.var(tr_blk, axis=1, dtype=np.float32, keepdims=True)
+        tr_blk = np.asarray(train_snp[st:ed], dtype=np.float64)
+        te_blk = np.asarray(test_snp[st:ed], dtype=np.float64)
+        mu_blk = np.mean(tr_blk, axis=1, dtype=np.float64, keepdims=True)
+        var_blk = np.var(tr_blk, axis=1, dtype=np.float64, keepdims=True)
         var_sum_total += float(np.sum(var_blk, dtype=np.float64))
         tr_ctr = tr_blk - mu_blk
         te_ctr = te_blk - mu_blk
-        cross += np.asarray(te_ctr.T @ tr_ctr, dtype=np.float64)
+        cross += te_ctr.T @ tr_ctr
 
     if (not np.isfinite(var_sum_total)) or (var_sum_total <= 0.0):
         raise ValueError("Invalid GBLUP denominator in cross kernel build (sum(var)<=0).")
@@ -15657,9 +15679,9 @@ def _run_gs_pipeline(
                         enabled=use_spinner,
                     ) as task:
                         try:
-                            train_grm = np.asarray(
-                                _QK2_GRM(np.asarray(z_train, dtype=np.float32), log=False),
-                                dtype=np.float64,
+                            train_grm = build_dense_grm_f64(
+                                np.asarray(z_train, dtype=np.float32),
+                                block_rows=4096,
                             )
                             if int(z_test.shape[1]) > 0:
                                 test_train_grm = _build_gblup_test_train_cross_from_markers(

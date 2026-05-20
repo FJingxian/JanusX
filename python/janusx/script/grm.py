@@ -56,6 +56,11 @@ from ._common.threads import (
     maybe_warn_non_openblas,
     require_openblas_by_default,
 )
+from ._common.grmstable import (
+    build_stable_packed_grm_f64,
+    save_grm_npy_blocked,
+    stable_grm_builder_available,
+)
 
 try:
     from janusx.janusx import (
@@ -462,7 +467,11 @@ def main(log: bool = True):
     # )
 
     if log:
-        bed_backend_policy = "memmap (default; packed fallback)"
+        bed_backend_policy = (
+            "stable packed-f64 (default when available)"
+            if stable_grm_builder_available()
+            else "memmap (default; packed fallback)"
+        )
         emit_cli_configuration(
             logger,
             app_title="JanusX - GRM",
@@ -551,7 +560,35 @@ def main(log: bool = True):
         _is_plink_prefix_path(str(grm_input))
         and (_grm_stream_bed_f32 is not None)
     )
-    if use_memmap_kernel:
+    use_stable_packed_f64 = bool(
+        _is_plink_prefix_path(str(grm_input))
+        and stable_grm_builder_available()
+    )
+    if use_stable_packed_f64:
+        logger.info(
+            "GRM backend: stable packed-bed f64 kernel "
+            "(aligned with stable GWAS-cache GRM behavior)."
+        )
+        if args.block_target_mb is not None:
+            logger.info(
+                "Stable packed-bed f64 GRM ignores --block-target-mb; "
+                "Rust packed-f64 path controls its own blocking."
+            )
+        if bool(args.stage_timing):
+            logger.info(
+                "Stable packed-bed f64 GRM ignores --stage-timing; "
+                "timing breakdown is only available for f32 memmap/packed kernels."
+            )
+        grm, eff_m = build_stable_packed_grm_f64(
+            prefix=str(grm_input),
+            maf_threshold=maf_threshold,
+            max_missing_rate=max_missing_rate,
+            method=int(args.method),
+            block_cols=chunk_size,
+            threads=int(args.thread),
+            snps_only=False,
+        )
+    elif use_memmap_kernel:
         # logger.info(
         #     "GRM backend: streaming BED kernel"
         # )
@@ -622,7 +659,11 @@ def main(log: bool = True):
     method_tag = _grm_method_tag(args.method)
     if args.npy:
         grm_path = f"{outprefix}.{method_tag}.npy"
-        np.save(grm_path, grm)
+        save_grm_npy_blocked(
+            grm_path,
+            grm,
+            dtype=np.float32,
+        )
         id_path = f"{grm_path}.id"
         np.savetxt(id_path, sample_ids, fmt="%s")
         log_success(

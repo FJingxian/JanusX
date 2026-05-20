@@ -17,6 +17,7 @@ Modules:
     Genome-wide Association Studies (GWAS):
     grm           Build genomic relationship matrix
     pca           Principal component analysis for population structure
+    gstats        Genotype basic statistics and LD score
     gwas          Run genome-wide association analysis
     postgwas      Post-process GWAS results and downstream plots
 
@@ -113,7 +114,7 @@ __version__ = (
 
 _MODULE_NAMES = [
     "gwas", "postgwas", "postgarfield", "postbsa",
-    "garfield", "grm", "pca", "gs", "reml", "postgs",
+    "garfield", "grm", "pca", "gstats", "gs", "reml", "postgs",
     "sim", "simulation", "benchmark", "gblupbench", "bayesbench", "garfieldbench", "adamixture", "tree", "gformat", "gmerge", "hybrid", "webui",
     "fastq2vcf", "fastq2count", "kmer", "kmerge", "view", "treeplot",
 ]

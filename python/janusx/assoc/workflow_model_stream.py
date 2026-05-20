@@ -660,6 +660,12 @@ def run_chunked_gwas_lmm_lm(
                         f"Warning: FastLMM switch to LM for trait {pname}: "
                         f"null LRT stat={float(lrt_stat):.4g}, p={float(lrt_p):.4g} (>=0.05)."
                     )
+                    stage_threads = max(1, int(threads))
+                    with _gwas_evd_stage_ctx(stage_threads):
+                        mod = LM(y=y_vec, X=X_cov)
+                    init_log_message = (
+                        f"switched from FastLMM null to LM [{evd_elapsed}]"
+                    )
                     effective_model_key = "lm"
                     effective_model_label = "LM"
                     effective_model_tag = "lm"
@@ -1438,6 +1444,12 @@ def run_chunked_gwas_streaming_shared(
                 logger.warning(
                     f"Warning: FastLMM switch to LM for trait {pname}: "
                     f"null LRT stat={float(lrt_stat):.4g}, p={float(lrt_p):.4g} (>=0.05)."
+                )
+                stage_threads = max(1, int(threads))
+                with _gwas_evd_stage_ctx(stage_threads):
+                    mod = LM(y=y_vec, X=X_cov)
+                ctx["init_log"] = (
+                    f"switched from FastLMM null to LM [{format_elapsed(float(ctx['evd_secs']))}]"
                 )
                 effective_model_key = "lm"
                 effective_model_label = "LM"

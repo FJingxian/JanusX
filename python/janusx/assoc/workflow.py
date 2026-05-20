@@ -120,6 +120,11 @@ from janusx.script._common.genoio import (
     determine_genotype_source_from_args as determine_genotype_source,
     read_id_file as _read_id_file,
 )
+from janusx.script._common.grmstable import (
+    build_stable_packed_grm_f64,
+    save_grm_npy_blocked,
+    stable_grm_builder_available,
+)
 
 
 def _resolve_pyblup_assoc_symbol(name: str):
@@ -1617,6 +1622,24 @@ def build_grm_streaming(
         raise RuntimeError(
             "Rust-only GWAS GRM build requires PLINK BED input/prefix."
         )
+    if stable_grm_builder_available():
+        _log_info(
+            logger,
+            "Building GRM (stable packed-bed f64 single-entry), method="
+            f"{method}",
+            use_spinner=use_spinner,
+        )
+        grm, eff_m = build_stable_packed_grm_f64(
+            prefix=str(packed_prefix),
+            maf_threshold=float(maf_threshold),
+            max_missing_rate=float(max_missing_rate),
+            method=int(method),
+            block_cols=max(1, int(chunk_size)),
+            threads=max(1, int(threads)),
+            snps_only=bool(snps_only),
+        )
+        _log_info(logger, "GRM construction finished.", use_spinner=use_spinner)
+        return grm, int(eff_m)
     use_packed_kernel = bool(allow_packed_full_load)
     if use_packed_kernel:
         if not hasattr(jxrs, "grm_packed_bed_f32"):
@@ -1969,7 +1992,11 @@ def load_or_build_grm_with_cache(
                             "Rust GRM stream-to-NPY cache writer did not produce the "
                             f"expected tmp file: {tmp_grm}"
                         )
-                    np.save(tmp_grm, grm)
+                    save_grm_npy_blocked(
+                        tmp_grm,
+                        grm,
+                        dtype=np.float32,
+                    )
                 _replace_file_with_retry(tmp_grm, grm_path)
                 tmp_id = f"{id_path}.tmp.{os.getpid()}"
                 pd.Series(ids).to_csv(tmp_id, sep="\t", index=False, header=False)

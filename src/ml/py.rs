@@ -57,6 +57,7 @@ pub fn garfield_ml_feature_scores_py(
         bootstrap,
         feature_subsample,
         seed,
+        allow_parallel: true,
     };
     let perm_cfg = PermutationConfig {
         n_repeats: permutation_repeats.max(1),

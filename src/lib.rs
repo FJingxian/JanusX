@@ -20,6 +20,8 @@ mod glm;
 mod grm;
 #[path = "stats/gs_native.rs"]
 pub(crate) mod gs_native;
+#[path = "stats/gstats.rs"]
+mod gstats;
 #[path = "stats/gwas_unified.rs"]
 mod gwas_unified;
 #[path = "stats/he.rs"]
@@ -143,6 +145,9 @@ use grm::{
 };
 use gs_native::{
     farmcpu_q_packed_grm_pca_f32, gblup_reml_packed_bed, packed_mtm_f64, rrblup_pcg_bed,
+};
+use gstats::{
+    gstats_bed_individual_stats, gstats_bed_joint_stats, gstats_bed_ldscore, gstats_bed_site_stats,
 };
 use gwas_unified::{
     gwas_lmm_lm_null_lrt_decision, gwas_packed_unified_to_tsv, gwas_trait_model_dispatch_v2,
@@ -299,6 +304,10 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(grm_packed_f32, m)?)?;
     m.add_function(wrap_pyfunction!(grm_packed_f32_with_stats, m)?)?;
     m.add_function(wrap_pyfunction!(grm_packed_f64_with_stats, m)?)?;
+    m.add_function(wrap_pyfunction!(gstats_bed_site_stats, m)?)?;
+    m.add_function(wrap_pyfunction!(gstats_bed_joint_stats, m)?)?;
+    m.add_function(wrap_pyfunction!(gstats_bed_individual_stats, m)?)?;
+    m.add_function(wrap_pyfunction!(gstats_bed_ldscore, m)?)?;
     m.add_function(wrap_pyfunction!(packed_mtm_f64, m)?)?;
     m.add_function(wrap_pyfunction!(farmcpu_q_packed_grm_pca_f32, m)?)?;
     m.add_function(wrap_pyfunction!(farmcpu_rem_dense, m)?)?;

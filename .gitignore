@@ -63,3 +63,5 @@ benchmark
 *.exe
 *.pdb
 out
+
+Tgarfield_out

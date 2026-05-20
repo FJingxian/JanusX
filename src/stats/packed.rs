@@ -2005,13 +2005,11 @@ mod tests {
                 py,
                 Array2::from_shape_vec((2, 1), vec![0u8, 0u8]).expect("packed shape"),
             );
-            let row_indices =
-                PyArray1::from_owned_array(py, Array1::from_vec(vec![0_i64, 1_i64]));
-            let row_flip =
-                PyArray1::from_owned_array(py, Array1::from_vec(vec![false, false]));
-            let row_maf =
-                PyArray1::from_owned_array(py, Array1::from_vec(vec![0.0_f32, 0.25_f32]));
-            let sample_indices = PyArray1::from_owned_array(py, Array1::from_vec(Vec::<i64>::new()));
+            let row_indices = PyArray1::from_owned_array(py, Array1::from_vec(vec![0_i64, 1_i64]));
+            let row_flip = PyArray1::from_owned_array(py, Array1::from_vec(vec![false, false]));
+            let row_maf = PyArray1::from_owned_array(py, Array1::from_vec(vec![0.0_f32, 0.25_f32]));
+            let sample_indices =
+                PyArray1::from_owned_array(py, Array1::from_vec(Vec::<i64>::new()));
 
             let decoded = bed_packed_decode_rows_f32(
                 py,

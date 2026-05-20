@@ -288,12 +288,40 @@ fn fit_random_forest(
         bootstrap: cfg.bootstrap,
         feature_subsample: cfg.feature_subsample,
         seed: cfg.seed,
+        allow_parallel: cfg.allow_parallel,
     };
     let mtry = compute_mtry(n_features, cfg_use.feature_subsample);
 
-    let parts = (0..n_estimators)
-        .into_par_iter()
-        .map(|t| {
+    let parts = if cfg_use.allow_parallel {
+        (0..n_estimators)
+            .into_par_iter()
+            .map(|t| {
+                let mut importance = vec![0.0f64; n_features];
+                let mut rng = StdRng::seed_from_u64(
+                    cfg_use.seed ^ ((t as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)),
+                );
+                let root_samples = if cfg_use.bootstrap {
+                    bootstrap_indices(n_samples, &mut rng)
+                } else {
+                    (0..n_samples).collect()
+                };
+                let tree = grow_tree(
+                    x_rows,
+                    y,
+                    response,
+                    cfg_use,
+                    &root_samples,
+                    0,
+                    &mut rng,
+                    &mut importance,
+                    mtry,
+                );
+                (tree, importance)
+            })
+            .collect::<Vec<_>>()
+    } else {
+        let mut out = Vec::with_capacity(n_estimators);
+        for t in 0..n_estimators {
             let mut importance = vec![0.0f64; n_features];
             let mut rng = StdRng::seed_from_u64(
                 cfg_use.seed ^ ((t as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)),
@@ -314,9 +342,10 @@ fn fit_random_forest(
                 &mut importance,
                 mtry,
             );
-            (tree, importance)
-        })
-        .collect::<Vec<_>>();
+            out.push((tree, importance));
+        }
+        out
+    };
 
     let mut trees = Vec::with_capacity(parts.len());
     let mut importance = vec![0.0f64; n_features];
@@ -384,6 +413,7 @@ fn permutation_importance(
     y: &[f64],
     response: ResponseKind,
     perm_cfg: PermutationConfig,
+    allow_parallel: bool,
 ) -> Vec<f64> {
     if x_rows.is_empty() || y.is_empty() {
         return vec![0.0; x_rows.len()];
@@ -392,9 +422,27 @@ fn permutation_importance(
     let baseline_score = score_predictions(y, &baseline_pred, response, perm_cfg.scoring);
     let repeats = perm_cfg.n_repeats.max(1);
 
-    (0..x_rows.len())
-        .into_par_iter()
-        .map(|feat| {
+    if allow_parallel {
+        (0..x_rows.len())
+            .into_par_iter()
+            .map(|feat| {
+                let mut rng = StdRng::seed_from_u64(
+                    perm_cfg.seed ^ ((feat as u64).wrapping_mul(0xD6E8_FD93_5A4D_94A5)),
+                );
+                let mut drops = 0.0f64;
+                for _ in 0..repeats {
+                    let mut perm_row = x_rows[feat].clone();
+                    perm_row.shuffle(&mut rng);
+                    let perm_pred = predict_forest(model, x_rows, Some(feat), Some(&perm_row));
+                    let perm_score = score_predictions(y, &perm_pred, response, perm_cfg.scoring);
+                    drops += baseline_score - perm_score;
+                }
+                drops / (repeats as f64)
+            })
+            .collect()
+    } else {
+        let mut out = Vec::with_capacity(x_rows.len());
+        for feat in 0..x_rows.len() {
             let mut rng = StdRng::seed_from_u64(
                 perm_cfg.seed ^ ((feat as u64).wrapping_mul(0xD6E8_FD93_5A4D_94A5)),
             );
@@ -406,9 +454,10 @@ fn permutation_importance(
                 let perm_score = score_predictions(y, &perm_pred, response, perm_cfg.scoring);
                 drops += baseline_score - perm_score;
             }
-            drops / (repeats as f64)
-        })
-        .collect()
+            out.push(drops / (repeats as f64));
+        }
+        out
+    }
 }
 
 pub fn feature_scores_random_forest(
@@ -429,7 +478,7 @@ pub fn feature_scores_random_forest_permutation(
     perm_cfg: PermutationConfig,
 ) -> Vec<f64> {
     let (model, _importance) = fit_random_forest(x_rows, y, response, cfg);
-    permutation_importance(&model, x_rows, y, response, perm_cfg)
+    permutation_importance(&model, x_rows, y, response, perm_cfg, cfg.allow_parallel)
 }
 
 #[cfg(test)]
@@ -457,6 +506,7 @@ mod tests {
             bootstrap: true,
             feature_subsample: 0.0,
             seed: 7,
+            allow_parallel: true,
         }
     }
 

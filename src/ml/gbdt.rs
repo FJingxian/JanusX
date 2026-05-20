@@ -323,6 +323,7 @@ fn fit_gbdt(
         bootstrap: cfg.bootstrap,
         feature_subsample: cfg.feature_subsample,
         seed: cfg.seed,
+        allow_parallel: cfg.allow_parallel,
     };
     let mtry = compute_mtry(n_features, cfg_use.feature_subsample);
 
@@ -393,6 +394,7 @@ fn permutation_importance(
     y: &[f64],
     response: ResponseKind,
     perm_cfg: PermutationConfig,
+    allow_parallel: bool,
 ) -> Vec<f64> {
     if x_rows.is_empty() || y.is_empty() {
         return vec![0.0; x_rows.len()];
@@ -401,9 +403,27 @@ fn permutation_importance(
     let baseline_score = score_predictions(y, &baseline_pred, response, perm_cfg.scoring);
     let repeats = perm_cfg.n_repeats.max(1);
 
-    (0..x_rows.len())
-        .into_par_iter()
-        .map(|feat| {
+    if allow_parallel {
+        (0..x_rows.len())
+            .into_par_iter()
+            .map(|feat| {
+                let mut rng = StdRng::seed_from_u64(
+                    perm_cfg.seed ^ ((feat as u64).wrapping_mul(0x94D0_49BB_1331_11EB)),
+                );
+                let mut drops = 0.0f64;
+                for _ in 0..repeats {
+                    let mut perm_row = x_rows[feat].clone();
+                    perm_row.shuffle(&mut rng);
+                    let perm_pred = predict_model(model, x_rows, Some(feat), Some(&perm_row));
+                    let perm_score = score_predictions(y, &perm_pred, response, perm_cfg.scoring);
+                    drops += baseline_score - perm_score;
+                }
+                drops / (repeats as f64)
+            })
+            .collect()
+    } else {
+        let mut out = Vec::with_capacity(x_rows.len());
+        for feat in 0..x_rows.len() {
             let mut rng = StdRng::seed_from_u64(
                 perm_cfg.seed ^ ((feat as u64).wrapping_mul(0x94D0_49BB_1331_11EB)),
             );
@@ -415,9 +435,10 @@ fn permutation_importance(
                 let perm_score = score_predictions(y, &perm_pred, response, perm_cfg.scoring);
                 drops += baseline_score - perm_score;
             }
-            drops / (repeats as f64)
-        })
-        .collect()
+            out.push(drops / (repeats as f64));
+        }
+        out
+    }
 }
 
 pub fn feature_scores_gbdt(
@@ -438,7 +459,7 @@ pub fn feature_scores_gbdt_permutation(
     perm_cfg: PermutationConfig,
 ) -> Vec<f64> {
     let (model, _importance) = fit_gbdt(x_rows, y, response, cfg);
-    permutation_importance(&model, x_rows, y, response, perm_cfg)
+    permutation_importance(&model, x_rows, y, response, perm_cfg, cfg.allow_parallel)
 }
 
 #[cfg(test)]
@@ -466,6 +487,7 @@ mod tests {
             bootstrap: true,
             feature_subsample: 0.0,
             seed: 17,
+            allow_parallel: true,
         }
     }
 

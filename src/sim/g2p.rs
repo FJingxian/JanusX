@@ -4,7 +4,7 @@ use std::io::{BufWriter, Write};
 use std::path::Path;
 
 use numpy::ndarray::Array1;
-use numpy::PyArray1;
+use numpy::{PyArray1, PyReadonlyArray2};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -14,6 +14,7 @@ use rand::{Rng, SeedableRng};
 use rand_distr::{Distribution, Exp, Gamma, StandardNormal};
 use rayon::prelude::*;
 
+use crate::eigh::symmetric_eigh_f64_row_major;
 use crate::gfcore as core;
 use crate::gfcore::{BedSnpIter, HmpSnpIter, TxtSnpIter, VcfSnpIter};
 
@@ -94,6 +95,8 @@ struct G2pSimConfig {
     fixed_effects_path: Option<String>,
     random_effects_path: Option<String>,
     causal_sites_path: Option<String>,
+    grm: Option<Vec<f64>>,
+    grm_n: Option<usize>,
     trait_name: Option<String>,
     na_rate: f64,
     progress_callback: Option<Py<PyAny>>,
@@ -113,6 +116,7 @@ struct G2pSimResult {
     causal_pve: f64,
     residual_var: f64,
     logic_effect_model: String,
+    background_source: String,
 }
 
 enum SourceReader {
@@ -183,6 +187,16 @@ fn variance_f64(x: &[f64]) -> f64 {
     acc / x.len() as f64
 }
 
+#[inline]
+fn center_inplace(x: &mut [f64]) {
+    if x.is_empty() {
+        return;
+    }
+    let mu = mean_f64(x);
+    for v in x.iter_mut() {
+        *v -= mu;
+    }
+}
 
 #[inline]
 fn centered_row_to_owned_f64(row: &[f32]) -> Vec<f64> {
@@ -255,6 +269,67 @@ fn logic_effect_model_name(model: LogicEffectModel) -> &'static str {
         LogicEffectModel::Gate => "gate",
         LogicEffectModel::CenteredInteraction => "centered_interaction",
     }
+}
+
+fn validate_grm_matrix(grm: &[f64], n: usize) -> Result<(), String> {
+    if n == 0 {
+        return Err("GRM must not be empty.".to_string());
+    }
+    if grm.len() != n.saturating_mul(n) {
+        return Err(format!(
+            "GRM payload length mismatch: got {}, expected {}",
+            grm.len(),
+            n.saturating_mul(n)
+        ));
+    }
+    for i in 0..n {
+        if !grm[i * n + i].is_finite() {
+            return Err(format!(
+                "GRM diagonal contains non-finite value at row {i}."
+            ));
+        }
+        for j in 0..=i {
+            let a = grm[i * n + j];
+            let b = grm[j * n + i];
+            if !a.is_finite() || !b.is_finite() {
+                return Err(format!("GRM contains non-finite value at ({i}, {j})."));
+            }
+            if (a - b).abs() > 1e-8_f64 {
+                return Err(format!("GRM must be symmetric; mismatch at ({i}, {j})."));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn sample_background_effects_from_grm(
+    grm: &[f64],
+    n: usize,
+    rng: &mut StdRng,
+) -> Result<Vec<f64>, String> {
+    validate_grm_matrix(grm, n)?;
+    let (evals, evecs, _backend) = symmetric_eigh_f64_row_major(grm, n)?;
+    if evals.len() != n || evecs.len() != n.saturating_mul(n) {
+        return Err("GRM eigen-decomposition output shape mismatch.".to_string());
+    }
+    let mut z = vec![0.0_f64; n];
+    for zi in z.iter_mut() {
+        *zi = StandardNormal.sample(rng);
+    }
+    let mut rot = vec![0.0_f64; n];
+    for i in 0..n {
+        rot[i] = evals[i].max(0.0).sqrt() * z[i];
+    }
+    let mut out = vec![0.0_f64; n];
+    for i in 0..n {
+        let mut acc = 0.0_f64;
+        for k in 0..n {
+            acc += evecs[i * n + k] * rot[k];
+        }
+        out[i] = acc;
+    }
+    center_inplace(out.as_mut_slice());
+    Ok(out)
 }
 
 fn collapse_to_logic_bin01(row: &[f32], het_max: f64) -> Option<Vec<u8>> {
@@ -467,9 +542,8 @@ fn residualize_logic_indicator_against_main_effects(
     for d in 0..p {
         gram[d * p + d] += ridge;
     }
-    let beta = solve_linear_system(gram, rhs, p).ok_or_else(|| {
-        "failed to solve centered-interaction projection system".to_string()
-    })?;
+    let beta = solve_linear_system(gram, rhs, p)
+        .ok_or_else(|| "failed to solve centered-interaction projection system".to_string())?;
     let mut resid = vec![0.0_f64; n];
     for i in 0..n {
         let mut fit = beta[0];
@@ -1071,7 +1145,7 @@ fn write_pheno_files(
     Ok(())
 }
 
-fn write_random_effects(
+fn write_site_background_effects(
     path: &str,
     sites: &[SimSiteRecord],
     effects: &[f64],
@@ -1092,6 +1166,27 @@ fn write_random_effects(
             site.chrom, site.pos, site.ref_allele, site.alt_allele
         )
         .map_err(|e| e.to_string())?;
+    }
+    w.flush().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn write_sample_background_effects(
+    path: &str,
+    sample_ids: &[String],
+    effects: &[f64],
+) -> Result<(), String> {
+    if sample_ids.len() != effects.len() {
+        return Err(format!(
+            "sample background effect length mismatch: sample_ids={}, effects={}",
+            sample_ids.len(),
+            effects.len()
+        ));
+    }
+    let mut w = BufWriter::new(File::create(path).map_err(|e| e.to_string())?);
+    writeln!(w, "sample_index\tsample_id\tsource\trole\teffect").map_err(|e| e.to_string())?;
+    for (i, (sid, &eff)) in sample_ids.iter().zip(effects.iter()).enumerate() {
+        writeln!(w, "{}\t{}\tgrm\tbackground\t{eff:.10}", i + 1, sid).map_err(|e| e.to_string())?;
     }
     w.flush().map_err(|e| e.to_string())?;
     Ok(())
@@ -1124,7 +1219,12 @@ fn write_fixed_effects(
         writeln!(
             w,
             "{}\t{}\t{}\t{}\t{}\t{:.10}",
-            i + 1, kind, logic, site_text, term.label, term.effect,
+            i + 1,
+            kind,
+            logic,
+            site_text,
+            term.label,
+            term.effect,
         )
         .map_err(|e| e.to_string())?;
     }
@@ -1288,6 +1388,7 @@ fn g2p_simulate_core(config: G2pSimConfig) -> Result<G2pSimResult, String> {
     let mut sites: Vec<SimSiteRecord> = Vec::new();
     let mut bg_raw_effects: Vec<f64> = Vec::new();
     let mut bg_score: Vec<f64> = Vec::new();
+    let use_grm_background = config.grm.is_some();
     let mut bg_progress_seen = 0usize;
     let mut bg_last_notified = 0usize;
 
@@ -1310,21 +1411,23 @@ fn g2p_simulate_core(config: G2pSimConfig) -> Result<G2pSimResult, String> {
                     false,
                 )?;
             }
-            if bg_score.is_empty() {
+            if !use_grm_background && bg_score.is_empty() {
                 bg_score.resize(row.len(), 0.0);
             }
-            let draw = if config.bg_pve > 0.0 {
-                draw_background_effect(
-                    config.background_dist,
-                    gamma_dist.as_ref(),
-                    laplace_exp.as_ref(),
-                    &mut rng,
-                )
-            } else {
-                0.0
-            };
-            add_scaled_centered_row(&mut bg_score, row, draw);
-            bg_raw_effects.push(draw);
+            if !use_grm_background {
+                let draw = if config.bg_pve > 0.0 {
+                    draw_background_effect(
+                        config.background_dist,
+                        gamma_dist.as_ref(),
+                        laplace_exp.as_ref(),
+                        &mut rng,
+                    )
+                } else {
+                    0.0
+                };
+                add_scaled_centered_row(&mut bg_score, row, draw);
+                bg_raw_effects.push(draw);
+            }
             sites.push(SimSiteRecord {
                 chrom: site.chrom.clone(),
                 chrom_norm: normalize_chrom(&site.chrom),
@@ -1364,14 +1467,45 @@ fn g2p_simulate_core(config: G2pSimConfig) -> Result<G2pSimResult, String> {
         }
     }
     let bg_var_target = config.bg_pve;
-    let bg_score_var = variance_f64(&bg_score);
-    let bg_scale = if bg_var_target > 0.0 && bg_score_var > 1e-12 {
-        (bg_var_target / bg_score_var).sqrt()
+    let (bg_effects_scaled, background_source) = if let Some(grm_vec) = config.grm.as_ref() {
+        let grm_n = config
+            .grm_n
+            .ok_or_else(|| "internal error: grm_n missing for provided GRM".to_string())?;
+        if grm_n != n {
+            return Err(format!(
+                "GRM size mismatch: got n={}, expected {} genotype samples",
+                grm_n, n
+            ));
+        }
+        let mut raw = if bg_var_target > 0.0 {
+            sample_background_effects_from_grm(grm_vec.as_slice(), n, &mut rng)?
+        } else {
+            vec![0.0_f64; n]
+        };
+        let raw_var = variance_f64(&raw);
+        let bg_scale = if bg_var_target > 0.0 && raw_var > 1e-12 {
+            (bg_var_target / raw_var).sqrt()
+        } else {
+            0.0
+        };
+        for v in raw.iter_mut() {
+            *v *= bg_scale;
+        }
+        axpy_inplace(&mut y, raw.as_slice(), 1.0);
+        (raw, "grm".to_string())
     } else {
-        0.0
+        let bg_score_var = variance_f64(&bg_score);
+        let bg_scale = if bg_var_target > 0.0 && bg_score_var > 1e-12 {
+            (bg_var_target / bg_score_var).sqrt()
+        } else {
+            0.0
+        };
+        axpy_inplace(&mut y, &bg_score, bg_scale);
+        (
+            bg_raw_effects.iter().map(|&v| v * bg_scale).collect(),
+            background_dist_name(config.background_dist).to_string(),
+        )
     };
-    axpy_inplace(&mut y, &bg_score, bg_scale);
-    let bg_effects_scaled: Vec<f64> = bg_raw_effects.iter().map(|&v| v * bg_scale).collect();
 
     let mut causal_terms: Vec<CausalTerm> = Vec::new();
     if needs_causal_scan {
@@ -1531,10 +1665,7 @@ fn g2p_simulate_core(config: G2pSimConfig) -> Result<G2pSimResult, String> {
     };
     let default_trait = format!(
         "sim_bg{:.3}_cs{:.3}_{}{}",
-        config.bg_pve,
-        causal_pve_target,
-        background_dist_name(config.background_dist),
-        logic_suffix,
+        config.bg_pve, causal_pve_target, background_source, logic_suffix,
     );
     let trait_name = config
         .trait_name
@@ -1553,7 +1684,11 @@ fn g2p_simulate_core(config: G2pSimConfig) -> Result<G2pSimResult, String> {
         )?;
     }
     if let Some(path) = config.random_effects_path.as_ref() {
-        write_random_effects(path, &sites, &bg_effects_scaled)?;
+        if use_grm_background {
+            write_sample_background_effects(path, &sample_ids, &bg_effects_scaled)?;
+        } else {
+            write_site_background_effects(path, &sites, &bg_effects_scaled)?;
+        }
     }
     if let Some(path) = config.fixed_effects_path.as_ref() {
         write_fixed_effects(path, &causal_terms, &sites)?;
@@ -1626,12 +1761,13 @@ fn g2p_simulate_core(config: G2pSimConfig) -> Result<G2pSimResult, String> {
         trait_name,
         causal_sites,
         fixed_rows,
-        n_background_sites: sites.len(),
+        n_background_sites: if use_grm_background { 0 } else { sites.len() },
         n_causal_terms: causal_terms.len(),
         bg_pve: config.bg_pve,
         causal_pve: causal_pve_target,
         residual_var: residual_var_eff,
         logic_effect_model: logic_effect_model_name(config.logic_effect_model).to_string(),
+        background_source,
     })
 }
 
@@ -1668,6 +1804,7 @@ fn g2p_simulate_core(config: G2pSimConfig) -> Result<G2pSimResult, String> {
     fixed_effects_path=None,
     random_effects_path=None,
     causal_sites_path=None,
+    grm=None,
     trait_name=None,
     na_rate=0.1_f64,
     progress_callback=None,
@@ -1707,6 +1844,7 @@ pub fn g2p_simulate_py<'py>(
     fixed_effects_path: Option<String>,
     random_effects_path: Option<String>,
     causal_sites_path: Option<String>,
+    grm: Option<PyReadonlyArray2<'py, f64>>,
     trait_name: Option<String>,
     na_rate: f64,
     progress_callback: Option<Py<PyAny>>,
@@ -1754,6 +1892,22 @@ pub fn g2p_simulate_py<'py>(
         parse_background_dist(background_dist).map_err(|e| PyValueError::new_err(e.to_string()))?;
     let logic_effect_model = parse_logic_effect_model(logic_effect_model)
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let (grm_vec, grm_n) = if let Some(arr) = grm {
+        let mat = arr.as_array();
+        if mat.ndim() != 2 || mat.shape()[0] != mat.shape()[1] {
+            return Err(PyValueError::new_err(
+                "grm must be a square float64 matrix.",
+            ));
+        }
+        let n = mat.shape()[0];
+        let vec = match arr.as_slice() {
+            Ok(s) => s.to_vec(),
+            Err(_) => mat.iter().copied().collect(),
+        };
+        (Some(vec), Some(n))
+    } else {
+        (None, None)
+    };
     let config = G2pSimConfig {
         path_or_prefix,
         delimiter,
@@ -1785,6 +1939,8 @@ pub fn g2p_simulate_py<'py>(
         fixed_effects_path,
         random_effects_path,
         causal_sites_path,
+        grm: grm_vec,
+        grm_n,
         trait_name,
         na_rate,
         progress_callback,
@@ -1807,6 +1963,7 @@ pub fn g2p_simulate_py<'py>(
         causal_pve,
         residual_var,
         logic_effect_model,
+        background_source,
     } = sim;
 
     #[allow(deprecated)]
@@ -1824,6 +1981,7 @@ pub fn g2p_simulate_py<'py>(
     out.set_item("ve", residual_var)?;
     out.set_item("residual_var", residual_var)?;
     out.set_item("logic_effect_model", logic_effect_model)?;
+    out.set_item("background_source", background_source)?;
     Ok(out)
 }
 

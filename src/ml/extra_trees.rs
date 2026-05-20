@@ -13,6 +13,7 @@ pub struct ExtraTreesConfig {
     pub bootstrap: bool,
     pub feature_subsample: f64,
     pub seed: u64,
+    pub allow_parallel: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -272,12 +273,48 @@ pub fn feature_scores_extra_trees(
         bootstrap: cfg.bootstrap,
         feature_subsample: cfg.feature_subsample,
         seed: cfg.seed,
+        allow_parallel: cfg.allow_parallel,
     };
     let mtry = compute_mtry(n_features, cfg_use.feature_subsample);
 
-    let merged = (0..n_estimators)
-        .into_par_iter()
-        .map(|t| {
+    let merged = if cfg_use.allow_parallel {
+        (0..n_estimators)
+            .into_par_iter()
+            .map(|t| {
+                let mut imp = vec![0.0f64; n_features];
+                let mut rng = StdRng::seed_from_u64(
+                    cfg_use.seed ^ ((t as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)),
+                );
+                let root_samples: Vec<usize> = if cfg_use.bootstrap {
+                    bootstrap_indices(n_samples, &mut rng)
+                } else {
+                    (0..n_samples).collect()
+                };
+                grow_tree(
+                    x_rows,
+                    y,
+                    response,
+                    cfg_use,
+                    &root_samples,
+                    0,
+                    &mut rng,
+                    &mut imp,
+                    mtry,
+                );
+                imp
+            })
+            .reduce(
+                || vec![0.0f64; n_features],
+                |mut a, b| {
+                    for i in 0..a.len() {
+                        a[i] += b[i];
+                    }
+                    a
+                },
+            )
+    } else {
+        let mut merged = vec![0.0f64; n_features];
+        for t in 0..n_estimators {
             let mut imp = vec![0.0f64; n_features];
             let mut rng = StdRng::seed_from_u64(
                 cfg_use.seed ^ ((t as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)),
@@ -298,17 +335,12 @@ pub fn feature_scores_extra_trees(
                 &mut imp,
                 mtry,
             );
-            imp
-        })
-        .reduce(
-            || vec![0.0f64; n_features],
-            |mut a, b| {
-                for i in 0..a.len() {
-                    a[i] += b[i];
-                }
-                a
-            },
-        );
+            for i in 0..n_features {
+                merged[i] += imp[i];
+            }
+        }
+        merged
+    };
 
     let sum_imp: f64 = merged.iter().sum();
     if sum_imp.is_finite() && sum_imp > 0.0 {

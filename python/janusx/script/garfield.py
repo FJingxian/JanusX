@@ -15,6 +15,7 @@ from janusx.script._common.colspec import parse_zero_based_index_specs
 from janusx.script._common.config_render import emit_cli_configuration
 from janusx.script._common.genoio import determine_genotype_source_from_args as determine_genotype_source
 from janusx.script._common.genocache import configure_genotype_cache_from_out
+from janusx.script._common.grmio import load_and_align_grm
 from janusx.script._common.helptext import CliArgumentParser, cli_help_formatter
 from janusx.script._common.log import setup_logging
 from janusx.script._common.pathcheck import (
@@ -25,7 +26,7 @@ from janusx.script._common.pathcheck import (
 )
 from janusx.script._common.progress import ProgressAdapter
 from janusx.script._common.status import CliStatus, log_success, print_failure, stdout_is_tty
-from janusx.script._common.threads import apply_blas_thread_env, detect_effective_threads
+from janusx.script._common.threads import apply_outer_thread_cap, detect_effective_threads
 
 
 try:
@@ -260,6 +261,75 @@ def _parse_beam_topk_spec(value: object) -> tuple[int | None, float | None]:
     return (count, None)
 
 
+def _parse_positive_layer(value: object, *, label: str) -> int:
+    try:
+        out = int(value)
+    except Exception as exc:  # pragma: no cover - parser surface
+        raise ValueError(f"{label} must be an integer >= 1.") from exc
+    if out < 1:
+        raise ValueError(f"{label} must be >= 1.")
+    return out
+
+
+def _describe_rank_schedule(rank_score_runtime: str) -> str:
+    mode = str(rank_score_runtime).strip().lower()
+    if mode == "raw":
+        return "all raw"
+    m = re.fullmatch(r"gain_from_layer:(\d+)", mode)
+    if m is not None:
+        gain_start = int(m.group(1))
+        if gain_start <= 1:
+            return "gain from layer 1 (all gain)"
+        return f"raw through layer {gain_start - 1}, gain from layer {gain_start}"
+    return mode
+
+
+def _resolve_rank_score_runtime(
+    *,
+    raw_layer_requested: object | None,
+    logic_gate: object,
+    exhaustive_depth: int,
+    rank_score_compat: object | None = None,
+) -> tuple[str, str, int | None]:
+    gate = str(logic_gate).strip().lower()
+    compat = "" if rank_score_compat is None else str(rank_score_compat).strip().lower()
+
+    if compat != "":
+        if compat in {"raw", "score"}:
+            return ("raw", "rank-score-compat", None)
+        if compat in {"interaction_gain", "gain", "interaction-gain", "interactiongain"}:
+            return ("gain_from_layer:2", "rank-score-compat", 2)
+        if compat in {
+            "exhaustive_then_gain",
+            "exhaustive-then-gain",
+            "exhaustivethengain",
+            "staged_gain",
+            "staged-gain",
+            "stagedgain",
+            "beam_gain",
+            "beam-gain",
+            "beamgain",
+        }:
+            start = max(1, int(exhaustive_depth) + 1)
+            return (f"gain_from_layer:{start}", "rank-score-compat", start)
+        m = re.fullmatch(r"gain_from_layer:(\d+)", compat)
+        if m is not None:
+            start = _parse_positive_layer(m.group(1), label="--rank-score gain_from_layer")
+            return (f"gain_from_layer:{start}", "rank-score-compat", start)
+        raise ValueError(
+            "--rank-score compatibility value must be one of: raw, interaction_gain, "
+            "exhaustive_then_gain, gain_from_layer:<N>."
+        )
+
+    if raw_layer_requested is not None:
+        start = _parse_positive_layer(raw_layer_requested, label="-raw/--raw")
+        return (f"gain_from_layer:{start}", "raw-flag", start)
+
+    if gate == "or":
+        return ("raw", "default-or", None)
+    return ("gain_from_layer:2", "default-non-or", 2)
+
+
 def _write_logic_pseudo_map(path: str, result: dict) -> None:
     unit_kinds = [str(x) for x in result.get("unit_kinds", [])]
     positions = [int(x) for x in result.get("positions", [])]
@@ -402,7 +472,23 @@ def main() -> None:
     optional_group.add_argument("-dev", "--dev", action="store_true", help="Use MBIN (HET/DOM/REC) encoding instead of BIN.")
     optional_group.add_argument(
         "-k",
+        "--grm",
+        type=str,
+        default=None,
+        help="Optional precomputed GRM/kernel (.npy or text). If set, GARFIELD residualization uses this matrix and slices it for full/train/test subsets instead of rebuilding GRM from BED.",
+    )
+    optional_group.add_argument(
+        "-kid",
+        "--grm-id",
+        type=str,
+        default=None,
+        help="Optional GRM sample ID file. Default auto-detect: <grm>.id.",
+    )
+    optional_group.add_argument(
+        "-cv",
         "--fold",
+        "--cv",
+        dest="fold",
         type=int,
         default=None,
         help="Optional stratified holdout fold. If omitted, GARFIELD uses the full data without train/test split.",
@@ -447,12 +533,18 @@ def main() -> None:
         help="Allowed binary operators in beam search: and, or, or and_or.",
     )
     optional_group.add_argument(
-        "--rank-score",
-        type=str,
-        choices=["interaction_gain", "raw"],
-        default="interaction_gain",
-        help="Beam ranking score. 'interaction_gain' favors weak-marginal but strong-combination rules; 'raw' keeps the original absolute score.",
+        "-raw",
+        "--raw",
+        type=int,
+        default=None,
+        help=(
+            "Rule-ranking schedule. If omitted: logic-gate=or uses all raw; other logic gates "
+            "use raw for layer 1 and interaction-gain from layer 2. If set to N, rules with "
+            "layer < N use raw, and layer >= N use interaction-gain (e.g. --raw 3 keeps 1/2-site "
+            "raw and starts gain at 3-site)."
+        ),
     )
+    optional_group.add_argument("--rank-score", type=str, default=None, dest="rank_score_compat", help=argparse.SUPPRESS)
     optional_group.add_argument(
         "-beam-topk",
         "--beam-topk",
@@ -510,6 +602,13 @@ def main() -> None:
         parser.error("-geno/--geno must be in [0, 1]")
     if not (0.0 <= float(args.het) <= 1.0):
         parser.error("-het/--het must be in [0, 1]")
+    if (
+        args.grm is not None
+        and args.fold is None
+        and str(args.grm).strip().isdigit()
+        and not os.path.exists(str(args.grm).strip())
+    ):
+        parser.error("-k/--grm now expects a GRM path. For holdout split use -cv/--fold.")
 
     explicit_scan_flags = int(bool(args.mode_window)) + int(args.gene_mode_file is not None) + int(args.geneset_mode_file is not None)
     if explicit_scan_flags > 1:
@@ -552,7 +651,7 @@ def main() -> None:
         args.holdout_frac_requested = 1.0 / float(args.fold)
         args.split_requested = True
     if args.fold is not None and int(args.fold) < 2:
-        parser.error("-k/--fold must be >= 2")
+        parser.error("-cv/--fold must be >= 2")
     args.fold_runtime = int(args.fold) if args.fold is not None else 0
 
     args.beam_width = (
@@ -575,6 +674,8 @@ def main() -> None:
     if int(args.exh) <= 0:
         parser.error("-exh/--exh must be >= 1")
     args.exh = max(1, int(args.exh))
+    if args.raw is not None and int(args.raw) < 1:
+        parser.error("-raw/--raw must be >= 1")
 
     if args.engine is None:
         if args.topk is None:
@@ -621,6 +722,19 @@ def main() -> None:
     if logic_gate_key not in logic_gate_map:
         parser.error("-logic-gate must be one of: and, or, and_or")
     args.logic_gate = logic_gate_map[logic_gate_key]
+    try:
+        (
+            args.rank_score,
+            args.rank_schedule_source,
+            args.gain_start_layer_runtime,
+        ) = _resolve_rank_score_runtime(
+            raw_layer_requested=args.raw,
+            logic_gate=args.logic_gate,
+            exhaustive_depth=int(args.exh),
+            rank_score_compat=args.rank_score_compat,
+        )
+    except ValueError as e:
+        parser.error(str(e))
 
     try:
         args.ncol = parse_zero_based_index_specs(args.ncol, label="-n/--n")
@@ -643,15 +757,25 @@ def main() -> None:
 
     log_path = os.path.join(args.out, f"{prefix}.garfield.log")
     logger = setup_logging(log_path)
-    apply_blas_thread_env(int(args.thread))
+    apply_outer_thread_cap(int(args.thread))
 
     ml_skipped = args.engine is None
     engine_runtime = "none" if ml_skipped else str(args.engine)
     logic_gate_runtime = args.logic_gate
+    rank_score_runtime = str(args.rank_score)
+    rank_schedule_source = str(args.rank_schedule_source)
+    gain_start_layer_runtime = (
+        None if args.gain_start_layer_runtime is None else int(args.gain_start_layer_runtime)
+    )
+    rank_schedule_runtime = _describe_rank_schedule(rank_score_runtime)
 
     checks: list[bool] = []
     checks.append(ensure_plink_prefix_exists(logger, gfile, "Genotype PLINK prefix"))
     checks.append(ensure_file_exists(logger, args.pheno, "Phenotype file"))
+    if args.grm:
+        checks.append(ensure_file_exists(logger, args.grm, "GARFIELD GRM"))
+    if args.grm_id:
+        checks.append(ensure_file_exists(logger, args.grm_id, "GARFIELD GRM ID file"))
     if args.genefile:
         checks.append(ensure_file_exists(logger, args.genefile, "Gene file"))
     if args.gff3:
@@ -672,6 +796,7 @@ def main() -> None:
         ("Input kind", input_kind),
         ("Execution route", "direct Rust BED pipeline"),
         ("Encoding", feature_source),
+        ("Residualization GRM", args.grm),
         ("Phenotype", args.pheno),
         ("Scan mode", args.scan_mode),
         ("Gene file", args.genefile),
@@ -689,7 +814,7 @@ def main() -> None:
         ("Layer", int(args.layer)),
         ("Exhaustive depth", int(args.exh)),
         ("Logic gate", args.logic_gate),
-        ("Rank score", str(args.rank_score)),
+        ("Rule ranking", rank_schedule_runtime),
         ("Beam top-k", str(args.beam_topk)),
         ("Sim bench", args.simbench),
         ("Seed", int(args.seed)),
@@ -704,10 +829,42 @@ def main() -> None:
         footer_rows=[("Threads", f"{int(args.thread)} ({int(detected_threads)} available)"), ("Output prefix", outprefix)],
         line_max_chars=60,
     )
+    # logger.info(
+    #     "Rule-ranking resolution: logic_gate=%s, source=%s -> %s",
+    #     logic_gate_runtime,
+    #     rank_schedule_source,
+    #     rank_schedule_runtime,
+    # )
 
     sample_ids = np.asarray(sample_ids, dtype=str)
     if len(sample_ids) == 0:
         raise ValueError("No sample IDs found in genotype input.")
+    sample_index_map = {sid: i for i, sid in enumerate(sample_ids.tolist())}
+
+    aligned_grm = None
+    resolved_grm_id = None
+    if args.grm:
+        with CliStatus("Loading GARFIELD GRM...", enabled=use_spinner) as task:
+            try:
+                aligned_grm, resolved_grm_id = load_and_align_grm(
+                    str(args.grm),
+                    sample_ids.tolist(),
+                    grm_id_path=args.grm_id,
+                    label="GARFIELD GRM",
+                )
+            except Exception:
+                task.fail("Loading GARFIELD GRM ...Failed")
+                raise
+            task.complete("Loading GARFIELD GRM ...Finished")
+        # logger.info(
+        #     "GARFIELD residualization GRM: %s%s",
+        #     format_path_for_display(str(args.grm)),
+        #     (
+        #         f" (ID: {format_path_for_display(str(resolved_grm_id))})"
+        #         if resolved_grm_id is not None
+        #         else " (sample order assumed to match genotype input)"
+        #     ),
+        # )
 
     with CliStatus("Loading phenotype...", enabled=use_spinner) as task:
         try:
@@ -721,28 +878,28 @@ def main() -> None:
         raise ValueError("No phenotype columns to analyze.")
     pheno, trait_names = _normalize_trait_names_from_header(pheno, args.pheno)
     logger.info("Phenotype columns: " + ", ".join(trait_names))
-    if args.split_requested:
-        if ml_skipped:
-            logger.info(
-                "Rust GARFIELD pipeline: stratified split -> residualize train/test -> "
-                "direct beam search on full unit variants -> test ranking."
-            )
-        else:
-            logger.info(
-                "Rust GARFIELD pipeline: stratified split -> residualize train/test -> "
-                "ML on residualized train phenotype -> beam search -> test ranking."
-            )
-    else:
-        if ml_skipped:
-            logger.info(
-                "Rust GARFIELD pipeline: no train/test split -> residualize full phenotype -> "
-                "direct beam search on full unit variants -> full-data ranking."
-            )
-        else:
-            logger.info(
-                "Rust GARFIELD pipeline: no train/test split -> residualize full phenotype -> "
-                "ML + beam search on full data -> full-data ranking."
-            )
+    # if args.split_requested:
+    #     if ml_skipped:
+    #         logger.info(
+    #             "Rust GARFIELD pipeline: stratified split -> residualize train/test -> "
+    #             "direct beam search on full unit variants -> test ranking."
+    #         )
+    #     else:
+    #         logger.info(
+    #             "Rust GARFIELD pipeline: stratified split -> residualize train/test -> "
+    #             "ML on residualized train phenotype -> beam search -> test ranking."
+    #         )
+    # else:
+    #     if ml_skipped:
+    #         logger.info(
+    #             "Rust GARFIELD pipeline: no train/test split -> residualize full phenotype -> "
+    #             "direct beam search on full unit variants -> full-data ranking."
+    #         )
+    #     else:
+    #         logger.info(
+    #             "Rust GARFIELD pipeline: no train/test split -> residualize full phenotype -> "
+    #             "ML + beam search on full data -> full-data ranking."
+    #         )
 
     pheno_all_ids = set(pheno.index.astype(str).to_numpy())
     sample_pool = [sid for sid in sample_ids.tolist() if sid in pheno_all_ids]
@@ -806,11 +963,21 @@ def main() -> None:
         suffix = base_trait if count == 1 else f"{base_trait}.{count}"
         trait_outprefix = f"{outprefix}.{suffix}"
         trait_seed = int(args.seed) + trait_idx
+        trait_grm = None
+        if aligned_grm is not None:
+            common_positions = np.asarray(
+                [sample_index_map[sid] for sid in common_ids],
+                dtype=np.intp,
+            )
+            trait_grm = np.asarray(
+                aligned_grm[np.ix_(common_positions, common_positions)],
+                dtype=np.float64,
+            )
         scan_desc = {
-            "window": f"Scanning windows for '{trait_name}'",
-            "gene": f"Scanning genes for '{trait_name}'",
-            "genepair": f"Scanning gene pairs for '{trait_name}'",
-            "geneset": f"Scanning gene sets for '{trait_name}'",
+            "window": f"Scanning windows",
+            "gene": f"Scanning genes",
+            "genepair": f"Scanning gene pairs",
+            "geneset": f"Scanning gene sets",
         }.get(str(args.scan_mode), f"Rust GARFIELD search for '{trait_name}'")
         logic_unit_kind = _scan_mode_to_logic_unit_kind(args.scan_mode)
         rust_groups = group_intervals if args.scan_mode != "window" else None
@@ -824,6 +991,7 @@ def main() -> None:
             invoke=lambda progress_cb: garfield_logic_search_bed(
                 gfile,
                 np.asarray(y_common, dtype=np.float64),
+                grm=trait_grm,
                 sample_ids=list(common_ids),
                 unit_kind=logic_unit_kind,
                 groups=rust_groups,
@@ -896,7 +1064,12 @@ def main() -> None:
                     "layer": int(args.layer),
                     "exhaustive_depth": int(args.exh),
                     "beam_width": int(args.beam_width),
-                    "rank_score": str(args.rank_score),
+                    "raw_requested": (None if args.raw is None else int(args.raw)),
+                    "rank_schedule_source": rank_schedule_source,
+                    "gain_start_layer_runtime": gain_start_layer_runtime,
+                    "rank_schedule_runtime": rank_schedule_runtime,
+                    "rank_score": rank_score_runtime,
+                    "rank_score_runtime": rank_score_runtime,
                     "ml_top_k": (None if ml_skipped else int(args.topk)),
                     "extension": int(args.extension),
                     "step": int(args.step),
@@ -918,6 +1091,8 @@ def main() -> None:
                     ),
                     "ranking_dataset": "test" if split_applied else "full",
                     "feature_source": feature_source,
+                    "grm_path": args.grm,
+                    "grm_id_path": resolved_grm_id,
                     "maf": float(args.maf),
                     "geno": float(args.geno),
                     "het": float(args.het),

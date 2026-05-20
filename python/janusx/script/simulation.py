@@ -12,7 +12,7 @@ import os
 import socket
 import time
 from datetime import datetime
-from typing import Any, Literal, Optional
+from typing import Any, Callable, Literal, Optional
 
 import numpy as np
 
@@ -22,6 +22,7 @@ from janusx.janusx import g2p_simulate
 from ._common.config_render import emit_cli_configuration
 from ._common.genocache import configure_genotype_cache_from_out
 from ._common.genoio import determine_genotype_source_from_args as determine_genotype_source
+from ._common.grmio import load_and_align_grm
 from ._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 from ._common.log import setup_logging
 from ._common.pathcheck import (
@@ -142,6 +143,7 @@ def _run_rust_simulation(
     outprefix: Optional[str] = None,
     trait_name: Optional[str] = None,
     write_effect_tables: bool = False,
+    grm: np.ndarray | None = None,
     progress_callback: Any | None = None,
     progress_total_hint: Optional[int] = None,
     progress_every: int = 10_000,
@@ -188,6 +190,7 @@ def _run_rust_simulation(
             causal_sites_path=None,
             trait_name=trait_name,
             na_rate=0.1,
+            grm=grm,
             progress_callback=progress_callback,
             progress_total_hint=(
                 None if progress_total_hint is None else int(max(0, progress_total_hint))
@@ -247,6 +250,7 @@ def simulate_phenotype_from_genofile(
         outprefix=None,
         trait_name=None,
         write_effect_tables=False,
+        grm=None,
     )
     y = np.asarray(res["phenotype"], dtype=np.float64).reshape(-1, 1)
     outsites = [(str(c), int(s), int(e)) for c, s, e in list(res.get("causal_sites", []))]
@@ -320,13 +324,34 @@ def _histogram_edges(values: np.ndarray) -> np.ndarray:
     return np.asarray(edges, dtype=np.float64)
 
 
+def _background_effect_label(background_source: str) -> str:
+    if str(background_source).strip().lower() == "grm":
+        return "breeding values"
+    return "background effects"
+
+
+def _background_effect_axis_label(background_source: str) -> str:
+    if str(background_source).strip().lower() == "grm":
+        return "Breeding value"
+    return "Effect"
+
+
 def _plot_random_effect_distribution(
     *,
     effects_tsv: str,
     out_pdf: str,
     trait_name: str,
     background_dist: str,
+    background_source: str = "marker",
+    progress_callback: Callable[[str, int, int], None] | None = None,
 ) -> None:
+    phase_total = 5
+    is_grm = str(background_source).strip().lower() == "grm"
+
+    def _report(phase: str, step: int) -> None:
+        if progress_callback is not None:
+            progress_callback(str(phase), int(step), phase_total)
+
     if not os.path.exists(effects_tsv):
         raise FileNotFoundError(f"Random effects table not found: {effects_tsv}")
 
@@ -343,6 +368,7 @@ def _plot_random_effect_distribution(
     effects = effects[np.isfinite(effects)]
     if effects.size == 0:
         raise ValueError("No finite random effects found for plotting.")
+    _report("load-table", 1)
 
     import matplotlib
 
@@ -351,16 +377,39 @@ def _plot_random_effect_distribution(
     matplotlib.rcParams["ps.fonttype"] = 42
 
     import matplotlib.pyplot as plt
-
-    try:
-        from scipy.stats import gaussian_kde
-    except Exception:
-        gaussian_kde = None
+    _report("init-plotting", 2)
 
     fig, ax_hist = plt.subplots(1, 1, figsize=(7.4, 4.8))
     fig.patch.set_facecolor("white")
 
     edges = _histogram_edges(effects)
+    curve_xs = None
+    curve_ys = None
+    curve_color = "#C44E52"
+    curve_label = None
+    if is_grm:
+        _report("fit-normal-curve", 2)
+        sigma = float(np.std(effects))
+        if effects.size >= 2 and sigma > 1e-12:
+            mu = float(np.mean(effects))
+            curve_xs = np.linspace(float(edges[0]), float(edges[-1]), 256)
+            z = (curve_xs - mu) / sigma
+            curve_ys = np.exp(-0.5 * z * z) / (sigma * np.sqrt(2.0 * np.pi))
+            curve_label = "normal fit"
+        _report("fit-normal-curve", 3)
+    else:
+        _report("fit-kde-curve", 2)
+        try:
+            from scipy.stats import gaussian_kde
+        except Exception:
+            gaussian_kde = None
+        if gaussian_kde is not None and effects.size >= 8 and float(np.std(effects)) > 1e-12:
+            curve_xs = np.linspace(float(edges[0]), float(edges[-1]), 256)
+            kde = gaussian_kde(effects)
+            curve_ys = kde(curve_xs)
+            curve_label = "kde"
+        _report("fit-kde-curve", 3)
+
     ax_hist.hist(
         effects,
         bins=edges,
@@ -372,29 +421,35 @@ def _plot_random_effect_distribution(
     )
     ax_hist.axvline(0.0, color="#111827", linestyle="--", linewidth=1.0, alpha=0.85)
 
-    if gaussian_kde is not None and effects.size >= 8 and float(np.std(effects)) > 1e-12:
-        xs = np.linspace(float(edges[0]), float(edges[-1]), 256)
-        kde = gaussian_kde(effects)
-        ax_hist.plot(xs, kde(xs), color="#C44E52", linewidth=1.8)
+    if curve_xs is not None and curve_ys is not None:
+        ax_hist.plot(curve_xs, curve_ys, color=curve_color, linewidth=1.8, label=curve_label)
 
-    ax_hist.set_title(f"{trait_name} background effects", fontsize=12)
-    ax_hist.set_xlabel("Effect")
+    ax_hist.set_title(f"{trait_name} {_background_effect_label(background_source)}", fontsize=12)
+    ax_hist.set_xlabel(_background_effect_axis_label(background_source))
     ax_hist.set_ylabel("Density")
     ax_hist.grid(axis="y", color="#D1D5DB", alpha=0.55, linewidth=0.8)
     ax_hist.text(
         0.98,
         0.97,
-        f"{background_dist}, marker={effects.size:,}",
+        (
+            f"normal (grm), entries={effects.size:,}"
+            if str(background_source).strip().lower() == "grm"
+            else f"{background_dist}, entries={effects.size:,}"
+        ),
         transform=ax_hist.transAxes,
         va="top",
         ha="right",
         fontsize=9.2,
         color="#374151",
     )
+    if curve_label is not None:
+        ax_hist.legend(loc="upper left", frameon=False, fontsize=9.0)
+    _report("render-figure", 4)
 
     fig.tight_layout()
     fig.savefig(out_pdf, format="pdf", bbox_inches="tight")
     plt.close(fig)
+    _report("write-pdf", 5)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -406,6 +461,7 @@ def build_parser() -> argparse.ArgumentParser:
                 "jx sim -bfile geno_prefix -o out -prefix demo",
                 "jx sim -vcf geno.vcf.gz -causal 3 -cs-pve 0.15 -o out",
                 "jx sim -bfile geno_prefix -logic-gate 3,2 and -bg-pve 0.4 -o out",
+                "jx sim -bfile geno_prefix -k panel.grm.npy -o out -prefix demo",
             ]
         ),
         description="JanusX simulation: phenotype from existing genotype (Rust-first)",
@@ -435,6 +491,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     optional_group.add_argument("-o", "--out", type=str, default=".", help="Output directory for results (default: .).")
     optional_group.add_argument("-prefix", "--prefix", type=str, default=None, help="Prefix for output files (default: None).")
+    optional_group.add_argument(
+        "-k",
+        "--grm",
+        type=str,
+        default=None,
+        help="Optional precomputed GRM/kernel (.npy or text). If set, background effects are drawn from this kernel instead of marker-wise genotype effects.",
+    )
+    optional_group.add_argument(
+        "-kid",
+        "--grm-id",
+        type=str,
+        default=None,
+        help="Optional GRM sample ID file. Default auto-detect: <grm>.id.",
+    )
     optional_group.add_argument("--seed", type=int, default=None, help="Random seed. If omitted, use current time.")
 
     filter_group.add_argument(
@@ -562,6 +632,13 @@ def main(argv: Optional[list[str]] = None) -> int:
     seed = int(args.seed) if args.seed is not None else int(time.time()) & 0x7FFFFFFF
     bimranges = [_parse_bimrange(x) for x in list(args.bimrange or [])]
     bg_dist, gamma_shape, gamma_scale, laplace_scale = _resolve_distribution(args)
+    requested_bg_dist = bg_dist
+    grm_forced_normal = bool(args.grm and bg_dist != "normal")
+    if args.grm:
+        bg_dist = "normal"
+        gamma_shape = 1.0
+        gamma_scale = 1.0
+        laplace_scale = 1.0
     if bg_dist == "gamma":
         if not (0.0 < float(gamma_shape) <= 1.0):
             logger.error("--gamma SHAPE must be in (0, 1].")
@@ -591,6 +668,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                     ("Missing threshold", args.geno),
                     ("Background PVE", args.bg_pve),
                     ("Residual input (deprecated)", args.ve),
+                    ("Background GRM", args.grm),
                     ("Causal count", args.causal),
                     ("Causal PVE", cs_pve),
                     ("Logic gate", "None" if logic_mode is None else f"{logic_mode} ({logic_k_min},{logic_k_max})"),
@@ -616,6 +694,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         checks.append(ensure_file_input_exists(logger, gfile, "Genotype FILE input"))
     else:
         checks.append(ensure_file_exists(logger, gfile, "Genotype file"))
+    if args.grm:
+        checks.append(ensure_file_exists(logger, args.grm, "Background GRM"))
+    if args.grm_id:
+        checks.append(ensure_file_exists(logger, args.grm_id, "Background GRM ID file"))
     if not ensure_all_true(checks):
         raise SystemExit(1)
 
@@ -644,6 +726,32 @@ def main(argv: Optional[list[str]] = None) -> int:
             missing_rate=float(args.geno),
         )
         task.complete("Inspecting genotype input ...Finished")
+    sample_ids = np.asarray(sample_ids, dtype=str)
+
+    aligned_grm = None
+    if args.grm:
+        with CliStatus("Loading background GRM...", enabled=True) as task:
+            aligned_grm, resolved_grm_id = load_and_align_grm(
+                str(args.grm),
+                sample_ids.tolist(),
+                grm_id_path=args.grm_id,
+                label="Background GRM",
+            )
+            task.complete("Loading background GRM ...Finished")
+        logger.info(
+            "Background GRM mode: using %s%s",
+            format_path_for_display(str(args.grm)),
+            (
+                f" (ID: {format_path_for_display(str(resolved_grm_id))})"
+                if resolved_grm_id is not None
+                else " (sample order assumed to match genotype input)"
+            ),
+        )
+        if grm_forced_normal:
+            logger.warning(
+                "Background distribution '%s' is ignored when --grm is provided; JanusX switches to Gaussian sample-level breeding values from the GRM.",
+                requested_bg_dist,
+            )
 
     scan_passes = _estimate_simulation_scan_passes(
         causal_count=int(args.causal),
@@ -742,6 +850,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             outprefix=outprefix,
             trait_name=None,
             write_effect_tables=True,
+            grm=aligned_grm,
             progress_callback=_simulation_progress,
             progress_total_hint=progress_total_hint,
             progress_every=max(1, min(10_000, progress_total_hint // 200 if progress_total_hint > 0 else 10_000)),
@@ -754,14 +863,55 @@ def main(argv: Optional[list[str]] = None) -> int:
     random_effects_tsv = f"{outprefix}.random.effects.tsv"
     random_effects_pdf = f"{outprefix}.random.effects.pdf"
     try:
-        with CliStatus("Plotting random effect distribution...", enabled=True) as task:
+        vis_source = str(res.get("background_source", "marker"))
+        vis_label = (
+            "GRM breeding values"
+            if vis_source.strip().lower() == "grm"
+            else _background_effect_label(vis_source)
+        )
+        vis_total = 5
+        vis_pbar = ProgressAdapter(
+            total=vis_total,
+            desc=f"Visualizing {vis_label}",
+            show_remaining=False,
+            force_animate=True,
+        )
+        vis_phase_labels = {
+            "load-table": "loading effects",
+            "init-plotting": "initializing matplotlib",
+            "fit-normal-curve": "fitting normal curve",
+            "fit-kde-curve": "estimating density curve",
+            "render-figure": "rendering figure",
+            "write-pdf": "writing pdf",
+        }
+
+        def _visualization_progress(phase: str, done: int, total: int) -> None:
+            total_now = max(1, int(total))
+            done_now = max(0, min(int(done), total_now))
+            vis_pbar.update(done_now - getattr(_visualization_progress, "last_done", 0))
+            _visualization_progress.last_done = done_now
+            vis_pbar.set_postfix(
+                stage=vis_phase_labels.get(str(phase), str(phase)),
+                step=f"{done_now}/{total_now}",
+            )
+
+        _visualization_progress.last_done = 0  # type: ignore[attr-defined]
+        vis_pbar.set_postfix(stage="queued", step=f"0/{vis_total}")
+        vis_success = False
+        try:
             _plot_random_effect_distribution(
                 effects_tsv=random_effects_tsv,
                 out_pdf=random_effects_pdf,
                 trait_name=str(res.get("trait_name", "PHENO")),
                 background_dist=str(bg_dist),
+                background_source=str(res.get("background_source", "marker")),
+                progress_callback=_visualization_progress,
             )
-            task.complete("Plotting random effect distribution ...Finished")
+            vis_success = True
+        finally:
+            if vis_success:
+                vis_pbar.finish()
+            vis_pbar.close()
     except Exception as exc:
         logger.warning("Random effect distribution PDF was skipped: %s", exc)
 

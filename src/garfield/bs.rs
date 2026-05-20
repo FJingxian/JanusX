@@ -30,6 +30,8 @@ pub enum BeamLogicGateMode {
 pub enum BeamRankMode {
     Raw,
     InteractionGain,
+    ExhaustiveThenGain,
+    GainFromLayer(usize),
 }
 
 impl BeamLogicGateMode {
@@ -118,6 +120,7 @@ pub struct BeamSearchParams {
     pub exhaustive_depth: usize,
     pub logic_gate_mode: BeamLogicGateMode,
     pub rank_mode: BeamRankMode,
+    pub allow_parallel: bool,
 }
 
 impl Default for BeamSearchParams {
@@ -131,6 +134,7 @@ impl Default for BeamSearchParams {
             exhaustive_depth: 1,
             logic_gate_mode: BeamLogicGateMode::AndOr,
             rank_mode: BeamRankMode::InteractionGain,
+            allow_parallel: true,
         }
     }
 }
@@ -216,23 +220,60 @@ fn penalty_for_rule(rule: &BeamRule, params: &BeamSearchParams) -> f64 {
 }
 
 #[inline]
+pub fn rank_rule_score_components(
+    rule_len: usize,
+    not_count: usize,
+    raw_score: f64,
+    max_singleton_raw: f64,
+    params: &BeamSearchParams,
+) -> f64 {
+    let base = match params.rank_mode {
+        BeamRankMode::Raw => raw_score,
+        BeamRankMode::InteractionGain => {
+            if rule_len >= 2 {
+                raw_score - max_singleton_raw
+            } else {
+                raw_score
+            }
+        }
+        BeamRankMode::ExhaustiveThenGain => {
+            if rule_len > params.exhaustive_depth.max(1) {
+                raw_score - max_singleton_raw
+            } else {
+                raw_score
+            }
+        }
+        BeamRankMode::GainFromLayer(start_layer) => {
+            if rule_len >= start_layer.max(1) {
+                raw_score - max_singleton_raw
+            } else {
+                raw_score
+            }
+        }
+    };
+    let len_pen = if rule_len > 1 {
+        params.lambda_len * ((rule_len - 1) as f64)
+    } else {
+        0.0
+    };
+    let not_pen = params.lambda_not * (not_count as f64);
+    base - len_pen - not_pen
+}
+
+#[inline]
 fn train_score_for_rule(
     rule: &BeamRule,
     train_raw: ContinuousRuleScore,
     max_singleton_raw: f64,
     params: &BeamSearchParams,
 ) -> f64 {
-    let base = match params.rank_mode {
-        BeamRankMode::Raw => train_raw.raw_score,
-        BeamRankMode::InteractionGain => {
-            if rule.len() >= 2 {
-                train_raw.raw_score - max_singleton_raw
-            } else {
-                train_raw.raw_score
-            }
-        }
-    };
-    base - penalty_for_rule(rule, params)
+    rank_rule_score_components(
+        rule.len(),
+        rule.not_count(),
+        train_raw.raw_score,
+        max_singleton_raw,
+        params,
+    )
 }
 
 #[inline]
@@ -354,8 +395,10 @@ fn sort_truncate_states(mut nodes: Vec<BeamState>, k: usize) -> Vec<BeamState> {
 }
 
 #[inline]
-fn should_parallel(total_cands: usize) -> bool {
-    rayon::current_num_threads() > 1 && total_cands >= GARFIELD_BEAM_PAR_MIN_TOTAL_CANDS
+fn should_parallel(total_cands: usize, allow_parallel: bool) -> bool {
+    allow_parallel
+        && rayon::current_num_threads() > 1
+        && total_cands >= GARFIELD_BEAM_PAR_MIN_TOTAL_CANDS
 }
 
 fn validate_bit_matrix(
@@ -620,7 +663,7 @@ fn build_initial_beam(
 ) -> Result<Vec<BeamState>, String> {
     let layer_cap = params.beam_width.min(n_rows.saturating_mul(2));
     let total_cands = n_rows.saturating_mul(2);
-    let beam = if should_parallel(total_cands) {
+    let beam = if should_parallel(total_cands, params.allow_parallel) {
         let mut work = Vec::<(usize, usize)>::new();
         let chunk = GARFIELD_BEAM_PAR_CHUNK_CANDS.max(1);
         let mut start = 0usize;
@@ -636,11 +679,11 @@ fn build_initial_beam(
                 for row_idx in start..end {
                     let row = row_prefix(bits_train, row_words_train, row_idx, needed_words_train);
                     for &negated in &[false, true] {
-                    let literal = BeamLiteral {
-                        row_index: row_idx,
-                        group_id: group_ids[row_idx],
-                        negated,
-                    };
+                        let literal = BeamLiteral {
+                            row_index: row_idx,
+                            group_id: group_ids[row_idx],
+                            negated,
+                        };
                         let rule = BeamRule {
                             first: literal,
                             rest: Vec::new(),
@@ -794,7 +837,7 @@ fn expand_beam_once(
         })
         .sum::<usize>();
 
-    let next = if should_parallel(total_expand) {
+    let next = if should_parallel(total_expand, params.allow_parallel) {
         let mut work = Vec::<(usize, usize, usize)>::new();
         let chunk = GARFIELD_BEAM_PAR_CHUNK_CANDS.max(1);
         for (bi, node) in beam.iter().enumerate() {
@@ -837,12 +880,8 @@ fn expand_beam_once(
                                 node.max_singleton_train_raw.max(single.train.raw_score);
                             let max_singleton_test_raw =
                                 node.max_singleton_test_raw.max(single.test.raw_score);
-                            let train_score = train_score_for_rule(
-                                &rule,
-                                train,
-                                max_singleton_train_raw,
-                                params,
-                            );
+                            let train_score =
+                                train_score_for_rule(&rule, train, max_singleton_train_raw, params);
                             push_top_k_states(
                                 &mut local,
                                 BeamState {
@@ -898,12 +937,8 @@ fn expand_beam_once(
                             node.max_singleton_train_raw.max(single.train.raw_score);
                         let max_singleton_test_raw =
                             node.max_singleton_test_raw.max(single.test.raw_score);
-                        let train_score = train_score_for_rule(
-                            &rule,
-                            train,
-                            max_singleton_train_raw,
-                            params,
-                        );
+                        let train_score =
+                            train_score_for_rule(&rule, train, max_singleton_train_raw, params);
                         push_top_k_states(
                             &mut seq,
                             BeamState {
@@ -942,6 +977,11 @@ fn dedup_states_by_train_bits(states: Vec<BeamState>) -> Vec<BeamState> {
     let mut out = best.into_values().collect::<Vec<_>>();
     out.sort_by(cmp_state);
     out
+}
+
+#[inline]
+fn same_rule(a: &BeamRule, b: &BeamRule) -> bool {
+    a == b
 }
 
 fn expand_states_exhaustive(
@@ -984,12 +1024,8 @@ fn expand_states_exhaustive(
                         node.max_singleton_train_raw.max(single.train.raw_score);
                     let max_singleton_test_raw =
                         node.max_singleton_test_raw.max(single.test.raw_score);
-                    let train_score = train_score_for_rule(
-                        &rule,
-                        train,
-                        max_singleton_train_raw,
-                        params,
-                    );
+                    let train_score =
+                        train_score_for_rule(&rule, train, max_singleton_train_raw, params);
                     let state = BeamState {
                         rule,
                         combined_train: combined,
@@ -1133,10 +1169,24 @@ pub fn beam_search_train_test_continuous(
     }
 
     let pooled = dedup_states_by_train_bits(kept_all);
+    let best_singleton = pooled
+        .iter()
+        .filter(|state| state.rule.len() == 1)
+        .min_by(|a, b| cmp_state(a, b))
+        .cloned();
     let keep_total = ((pooled.len()) as f64 * params.candidate_keep_ratio)
         .ceil()
         .max(1.0) as usize;
-    let retained = sort_truncate_states(pooled, keep_total);
+    let mut retained = sort_truncate_states(pooled, keep_total);
+    if let Some(single) = best_singleton {
+        if !retained
+            .iter()
+            .any(|state| same_rule(&state.rule, &single.rule))
+        {
+            retained.push(single);
+            retained.sort_by(cmp_state);
+        }
+    }
 
     let mut out = Vec::<BeamRuleCandidate>::with_capacity(retained.len());
     for state in retained.into_iter() {
@@ -1150,16 +1200,13 @@ pub fn beam_search_train_test_continuous(
             params.lambda_len,
             params.lambda_not,
         )?;
-        let test_score = match params.rank_mode {
-            BeamRankMode::Raw => test.score,
-            BeamRankMode::InteractionGain => {
-                if state.rule.len() >= 2 {
-                    test.raw_score - state.max_singleton_test_raw - penalty_for_rule(&state.rule, &params)
-                } else {
-                    test.score
-                }
-            }
-        };
+        let test_score = rank_rule_score_components(
+            state.rule.len(),
+            state.rule.not_count(),
+            test.raw_score,
+            state.max_singleton_test_raw,
+            &params,
+        );
         out.push(BeamRuleCandidate {
             rule: state.rule,
             train_score: state.train_score,
@@ -1380,12 +1427,9 @@ mod tests {
         )
         .unwrap();
         assert!(!out.is_empty());
-        assert!(out.iter().all(|cand| {
-            cand.rule
-                .rest
-                .iter()
-                .all(|(op, _)| *op == BeamBinaryOp::Or)
-        }));
+        assert!(out
+            .iter()
+            .all(|cand| { cand.rule.rest.iter().all(|(op, _)| *op == BeamBinaryOp::Or) }));
     }
 
     #[test]
@@ -1504,6 +1548,35 @@ mod tests {
     }
 
     #[test]
+    fn test_exhaustive_then_gain_delays_gain_until_after_exhaustive_depth() {
+        let params = BeamSearchParams {
+            rank_mode: BeamRankMode::ExhaustiveThenGain,
+            exhaustive_depth: 2,
+            ..BeamSearchParams::default()
+        };
+        let single_score = rank_rule_score_components(1, 0, 0.8, 0.6, &params);
+        let pair_score = rank_rule_score_components(2, 0, 0.8, 0.6, &params);
+        let triple_score = rank_rule_score_components(3, 0, 0.8, 0.6, &params);
+        assert!((single_score - 0.8).abs() < 1e-12);
+        assert!((pair_score - 0.8).abs() < 1e-12);
+        assert!((triple_score - 0.2).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_gain_from_layer_starts_gain_at_requested_depth() {
+        let params = BeamSearchParams {
+            rank_mode: BeamRankMode::GainFromLayer(3),
+            ..BeamSearchParams::default()
+        };
+        let single_score = rank_rule_score_components(1, 0, 0.8, 0.6, &params);
+        let pair_score = rank_rule_score_components(2, 0, 0.8, 0.6, &params);
+        let triple_score = rank_rule_score_components(3, 0, 0.8, 0.6, &params);
+        assert!((single_score - 0.8).abs() < 1e-12);
+        assert!((pair_score - 0.8).abs() < 1e-12);
+        assert!((triple_score - 0.2).abs() < 1e-12);
+    }
+
+    #[test]
     fn test_exhaustive_seed_still_allows_singleton_to_win() {
         let rows = vec![
             vec![1, 1, 1, 1, 0, 0, 0, 0],
@@ -1539,5 +1612,42 @@ mod tests {
         assert_eq!(out[0].rule.len(), 1);
         assert_eq!(out[0].rule.first.row_index, 0);
         assert!(!out[0].rule.first.negated);
+    }
+
+    #[test]
+    fn test_best_singleton_is_retained_even_with_small_keep_ratio() {
+        let rows = vec![
+            vec![1, 1, 1, 1, 0, 0, 0, 0],
+            vec![1, 0, 1, 0, 1, 0, 1, 0],
+            vec![0, 1, 0, 1, 0, 1, 0, 1],
+        ];
+        let y = vec![3.0, 3.1, 2.9, 3.2, -3.0, -2.9, -3.1, -3.2];
+        let (bits, row_words) = pack_rows(&rows, y.len());
+        let group_ids = vec![0usize, 1, 2];
+        let out = beam_search_train_test_continuous(
+            &y,
+            &bits,
+            row_words,
+            rows.len(),
+            y.len(),
+            &y,
+            &bits,
+            row_words,
+            y.len(),
+            &group_ids,
+            BeamSearchParams {
+                max_pick: 3,
+                beam_width: 16,
+                candidate_keep_ratio: 0.05,
+                logic_gate_mode: BeamLogicGateMode::AndOnly,
+                exhaustive_depth: 2,
+                rank_mode: BeamRankMode::InteractionGain,
+                ..BeamSearchParams::default()
+            },
+        )
+        .unwrap();
+        assert!(out.iter().any(|cand| {
+            cand.rule.len() == 1 && cand.rule.first.row_index == 0 && !cand.rule.first.negated
+        }));
     }
 }

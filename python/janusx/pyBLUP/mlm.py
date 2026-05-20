@@ -24,7 +24,7 @@ try:
     from threadpoolctl import threadpool_limits as _threadpool_limits
 except Exception:
     _threadpool_limits = None
-from .QK2 import GRM
+from janusx.script._common.grmstable import build_dense_grm_f64
 
 try:
     from janusx.janusx import (
@@ -653,9 +653,9 @@ class BLUP:
             )
         if self.kinship is not None:
             t_k = time.time()
-            self._m_mean = np.mean(self.M, axis=1, dtype=np.float32, keepdims=True)
-            m_var = np.var(self.M, axis=1, dtype=np.float32, keepdims=True)
-            self._m_var_sum = float(np.sum(m_var, dtype=np.float32))
+            self._m_mean = np.mean(self.M, axis=1, dtype=np.float64, keepdims=True)
+            m_var = np.var(self.M, axis=1, dtype=np.float64, keepdims=True)
+            self._m_var_sum = float(np.sum(m_var, dtype=np.float64))
             if self._m_var_sum <= 0.0:
                 self._m_var_sum = 1e-12
             if usefastlmm and z_is_identity:
@@ -665,8 +665,11 @@ class BLUP:
                 self.G = None
                 self.Z = None
             else:
-                self.G = GRM(self.M, log=self.log).astype(np.float32, copy=False)
-                self.G += np.float32(self._g_eps) * np.eye(self.n, dtype=np.float32)  # Add regular item
+                self.G = build_dense_grm_f64(
+                    self.M,
+                    block_rows=4096,
+                )
+                self.G += np.float64(self._g_eps) * np.eye(self.n, dtype=np.float64)  # Add regular item
                 self.Z = np.eye(self.n, dtype=np.float64) if z_is_identity else Z
             if self._debug_stage:
                 print(
@@ -687,9 +690,11 @@ class BLUP:
             # do eigendecomposition on m x m Gram (M M^T) instead of SVD on n x m.
             # This avoids materializing U of size n x m for large n.
             t_svd = time.time()
-            gram = np.asarray(self.M @ self.M.T, dtype=np.float64)
-            mx = np.asarray(self.M @ self.X, dtype=np.float64)
-            my = np.asarray(self.M @ self.y, dtype=np.float64)
+            m64 = np.asarray(self.M, dtype=np.float64)
+            gram = np.asarray(m64 @ m64.T, dtype=np.float64)
+            mx = np.asarray(m64 @ self.X, dtype=np.float64)
+            my = np.asarray(m64 @ self.y, dtype=np.float64)
+            del m64
             if self.kinship is not None:
                 # Keep FaST path on the same GRM scale as the explicit-kinship path:
                 # G = (M_c^T M_c) / sum(var_train).

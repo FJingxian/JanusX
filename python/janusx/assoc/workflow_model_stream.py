@@ -498,7 +498,7 @@ def run_chunked_gwas_lmm_lm(
         het_rate = np.zeros(geno_chunk.shape[0], dtype=np.float32)
         idx = non_missing > 0
         het_rate[idx] = het_count[idx] / non_missing[idx]
-        keep &= (het_rate >= het) & (het_rate <= (1.0 - het))
+        keep &= het_rate <= het
         return keep
 
     process = psutil.Process()
@@ -1234,7 +1234,7 @@ def run_chunked_gwas_streaming_shared(
         het_rate = np.zeros(geno_chunk.shape[0], dtype=np.float32)
         idx = non_missing > 0
         het_rate[idx] = het_count[idx] / non_missing[idx]
-        keep &= (het_rate >= het) & (het_rate <= (1.0 - het))
+        keep &= het_rate <= het
         return keep
 
     use_rust_assoc_writer = bool(hasattr(jxrs, "GwasAssocTsvWriter"))

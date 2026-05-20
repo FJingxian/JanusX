@@ -12,6 +12,12 @@ from typing import Optional, Union
 import numpy as np
 import pandas as pd
 import psutil
+from janusx.script._common.packedctx import (
+    prepare_packed_ctx_from_plink,
+    packed_preload_is_disabled,
+    packed_preload_is_ready,
+    packed_preload_reason,
+)
 
 from .workflow import (
     CliStatus,
@@ -37,7 +43,6 @@ from .workflow import (
     detect_effective_threads,
     format_elapsed,
     jxrs,
-    prepare_packed_ctx_from_plink,
 )
 
 _WARNED_LM_STREAM_MMAP_LEGACY = False
@@ -170,7 +175,14 @@ def _prepare_packed_bed_once_for_gwas(
             "(prefix with .bed/.bim/.fam)."
         )
 
-    pre = preloaded_packed if isinstance(preloaded_packed, dict) else None
+    if packed_preload_is_disabled(preloaded_packed):
+        reason = packed_preload_reason(preloaded_packed)
+        raise RuntimeError(
+            "Packed BED preload is disabled for this run. "
+            f"reason={reason or 'unknown'}"
+        )
+
+    pre = preloaded_packed if packed_preload_is_ready(preloaded_packed) else None
     if pre is not None and str(pre.get("prefix", "")) == str(prefix):
         full_ids = np.asarray(pre.get("full_ids", []), dtype=str)
         packed_ctx_obj = pre.get("packed_ctx")

@@ -122,6 +122,7 @@ from janusx.script._common.genoio import (
 )
 from janusx.script._common.grmstable import (
     build_stable_packed_grm_f64,
+    prefer_stable_packed_grm,
     save_grm_npy_blocked,
     stable_grm_builder_available,
 )
@@ -154,7 +155,12 @@ LM = _LazyPyBlupAssocSymbol("LM")
 LMM = _LazyPyBlupAssocSymbol("LMM")
 FastLMM = _LazyPyBlupAssocSymbol("FastLMM")
 farmcpu = _LazyPyBlupAssocSymbol("farmcpu")
-from janusx.script._common.packedctx import prepare_packed_ctx_from_plink
+from janusx.script._common.packedctx import (
+    packed_preload_failure_state,
+    packed_preload_is_disabled,
+    packed_preload_is_ready,
+    prepare_packed_ctx_from_plink,
+)
 
 from janusx.script._common.colspec import parse_zero_based_index_specs
 from janusx.assoc.workflow_ui import (
@@ -1622,22 +1628,53 @@ def build_grm_streaming(
         raise RuntimeError(
             "Rust-only GWAS GRM build requires PLINK BED input/prefix."
         )
-    if stable_grm_builder_available():
+    if prefer_stable_packed_grm():
+        pbar = _ProgressAdapter(
+            total=n_snps,
+            desc="GRM (stable-f64)",
+            force_animate=True,
+        )
+        process = psutil.Process()
+        mem_tick_span = max(1, 10 * int(chunk_size))
+        last_done = 0
+        last_total = int(max(0, n_snps))
+
+        def _on_stable_progress(done: int, total: int) -> None:
+            nonlocal last_done, last_total
+            d = int(max(0, done))
+            t = int(max(0, total))
+            if t > 0 and t != last_total:
+                pbar.set_total(t)
+                last_total = t
+            if d > last_done:
+                pbar.update(d - last_done)
+                last_done = d
+            if (d % mem_tick_span == 0) or (t > 0 and d >= t):
+                mem = process.memory_info().rss / 1024**3
+                pbar.set_postfix(memory=f"{mem:.2f}GB")
         _log_info(
             logger,
-            "Building GRM (stable packed-bed f64 single-entry), method="
+            "Building GRM (stable packed-bed f64 single-entry, opt-in), method="
             f"{method}",
             use_spinner=use_spinner,
         )
-        grm, eff_m = build_stable_packed_grm_f64(
-            prefix=str(packed_prefix),
-            maf_threshold=float(maf_threshold),
-            max_missing_rate=float(max_missing_rate),
-            method=int(method),
-            block_cols=max(1, int(chunk_size)),
-            threads=max(1, int(threads)),
-            snps_only=bool(snps_only),
-        )
+        try:
+            grm, eff_m = build_stable_packed_grm_f64(
+                prefix=str(packed_prefix),
+                maf_threshold=float(maf_threshold),
+                max_missing_rate=float(max_missing_rate),
+                method=int(method),
+                block_cols=max(1, int(chunk_size)),
+                threads=max(1, int(threads)),
+                snps_only=bool(snps_only),
+                progress_callback=_on_stable_progress,
+                progress_every=max(1, int(chunk_size)),
+            )
+            mem = process.memory_info().rss / 1024**3
+            pbar.set_postfix(memory=f"{mem:.2f}GB")
+            pbar.finish()
+        finally:
+            pbar.close(show_done=False)
         _log_info(logger, "GRM construction finished.", use_spinner=use_spinner)
         return grm, int(eff_m)
     use_packed_kernel = bool(allow_packed_full_load)
@@ -1693,7 +1730,7 @@ def build_grm_streaming(
         eff_m = 0
         cache_target = str(cache_write_path).strip() if cache_write_path is not None else ""
         if use_packed_kernel:
-            pre = preloaded_packed if isinstance(preloaded_packed, dict) else None
+            pre = preloaded_packed if packed_preload_is_ready(preloaded_packed) else None
             used_preloaded = False
             if (
                 pre is not None
@@ -1960,6 +1997,7 @@ def load_or_build_grm_with_cache(
                 stream_direct_cache = bool(
                     (not bool(allow_packed_full_load))
                     and hasattr(jxrs, "grm_stream_bed_f32_to_npy")
+                    and (not prefer_stable_packed_grm())
                 )
                 grm, eff_m = build_grm_streaming(
                     genofile=genofile_for_grm,
@@ -2397,7 +2435,7 @@ def prepare_streaming_context(
                 f"Fast mode packed preload unavailable; fallback to on-demand packed load. reason={ex}",
                 use_spinner=bool(use_spinner),
             )
-            preloaded_packed = None
+            preloaded_packed = packed_preload_failure_state(stream_genofile, ex)
 
     need_generate_q = False
     if pcdim in np.arange(1, n_samples).astype(str):
@@ -2509,7 +2547,12 @@ def prepare_streaming_context(
                 )
                 break
 
-    if preloaded_packed is None and bool(allow_packed_grm) and bool(preload_packed_context):
+    if (
+        (not packed_preload_is_ready(preloaded_packed))
+        and (not packed_preload_is_disabled(preloaded_packed))
+        and bool(allow_packed_grm)
+        and bool(preload_packed_context)
+    ):
         try:
             prefix1, full_ids1, packed_ctx1, sites1 = _prepare_packed_bed_once_for_gwas(
                 genofile=stream_genofile,
@@ -2527,8 +2570,8 @@ def prepare_streaming_context(
                 "sites_all": sites1,
             }
             stream_genofile = str(prefix1)
-        except Exception:
-            preloaded_packed = None
+        except Exception as ex:
+            preloaded_packed = packed_preload_failure_state(stream_genofile, ex)
 
     # -----------------------------------------
     # Align all data sources to shared IDs
@@ -3777,9 +3820,7 @@ def _run_file_dense_fast_once(
         het_rate = np.zeros((m,), dtype=np.float32)
         idx = non_missing > 0
         het_rate[idx] = het_count[idx] / non_missing[idx]
-        keep &= (het_rate >= float(het_threshold)) & (
-            het_rate <= (1.0 - float(het_threshold))
-        )
+        keep &= het_rate <= float(het_threshold)
         return keep
 
     def _apply_genetic_model(geno_add: np.ndarray, model: str) -> np.ndarray:
@@ -4396,9 +4437,10 @@ def parse_args(argv: Optional[list[str]] = None):
              "(default: %(default)s).",
     )
     optional_group.add_argument(
-        "-het", "--het", type=float, default=0.02,
-        help="Heterozygosity filter threshold for non-additive models. "
-             "Sites with het rate outside [het, 1-het] are removed (default: %(default)s).",
+        "-het", "--het", type=float, default=0.0,
+        help="Maximum allowed heterozygosity rate threshold. "
+             "Sites with het rate greater than this threshold are removed; 0 disables this filter "
+             "(default: %(default)s).",
     )
     optional_group.add_argument(
         "--farmcpu-iter", type=int, default=20,
@@ -4808,7 +4850,11 @@ def _run_gwas_pipeline(
                     allow_packed_grm=bool(allow_packed_grm_effective),
                     preload_packed_context=bool(fast_mode),
                 )
-                if bool(fast_mode) and (not isinstance(preloaded_packed, dict)):
+                if (
+                    bool(fast_mode)
+                    and (not packed_preload_is_ready(preloaded_packed))
+                    and (not packed_preload_is_disabled(preloaded_packed))
+                ):
                     try:
                         prefix0, full_ids0, packed_ctx0, sites0 = _prepare_packed_bed_once_for_gwas(
                             genofile=genofile_stream,
@@ -4829,7 +4875,7 @@ def _run_gwas_pipeline(
                         logger.warning(
                             f"Fast mode packed preload unavailable; falling back to on-demand packed load. reason={ex}"
                         )
-                        preloaded_packed = None
+                        preloaded_packed = packed_preload_failure_state(genofile_stream, ex)
                 _phase_split(logger)
             else:
                 if args.farmcpu:
@@ -4866,10 +4912,11 @@ def _run_gwas_pipeline(
                 if use_trait_grouped_fast:
                     farmcpu_cache_prefill: Union[dict[str, object], None] = None
                     farmcpu_cache_runtime: Union[dict[str, object], None] = None
+                    packed_preload_ready = packed_preload_is_ready(preloaded_packed)
                     if has_farmcpu:
                         context_prepared = bool(pheno is not None and ids is not None and n_snps is not None)
                         if (
-                            isinstance(preloaded_packed, dict)
+                            packed_preload_ready
                             and pheno is not None
                             and ids is not None
                             and qmatrix is not None
@@ -4948,7 +4995,9 @@ def _run_gwas_pipeline(
                             preloaded_packed=preloaded_packed,
                         )
                     use_packed_fastlmm_scan = bool(
-                        fast_mode and _gwas_use_packed_fastlmm_scan()
+                        fast_mode
+                        and packed_preload_ready
+                        and _gwas_use_packed_fastlmm_scan()
                     )
                     task_plan = None
                     rust_plan_errors: list[str] = []
@@ -5222,9 +5271,9 @@ def _run_gwas_pipeline(
                         route = str(task_item.get("route", "")).lower().strip()
                         if not route:
                             if mk == "lm":
-                                route = "lm_packed" if bool(fast_mode) else "lm_stream"
+                                route = "lm_packed" if packed_preload_ready else "lm_stream"
                             elif mk == "lmm":
-                                route = "lmm_packed" if bool(fast_mode) else "lmm_stream"
+                                route = "lmm_packed" if packed_preload_ready else "lmm_stream"
                             elif mk == "fastlmm":
                                 route = (
                                     "fastlmm_packed"
@@ -5240,6 +5289,16 @@ def _run_gwas_pipeline(
                         # only -fast/-farmcpu runs may use packed single-entry routes.
                         # Non-fast LM/LMM/FastLMM must stay on memmap/stream path.
                         if (not bool(fast_mode)) and route in {
+                            "lm_packed",
+                            "lmm_packed",
+                            "fastlmm_packed",
+                        }:
+                            route = {
+                                "lm_packed": "lm_stream",
+                                "lmm_packed": "lmm_stream",
+                                "fastlmm_packed": "fastlmm_stream",
+                            }[route]
+                        if (not packed_preload_ready) and route in {
                             "lm_packed",
                             "lmm_packed",
                             "fastlmm_packed",
@@ -5278,7 +5337,7 @@ def _run_gwas_pipeline(
             farmcpu_cache_prefill: Union[dict[str, object], None] = None
             if (
                 bool(fast_mode)
-                and isinstance(preloaded_packed, dict)
+                and packed_preload_is_ready(preloaded_packed)
                 and pheno is not None
                 and ids is not None
                 and qmatrix is not None

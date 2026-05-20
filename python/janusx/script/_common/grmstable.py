@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 import numpy as np
 
 from janusx.gfreader import prepare_bed_2bit_packed
@@ -13,6 +15,20 @@ def stable_grm_builder_available() -> bool:
     )
 
 
+def prefer_stable_packed_grm() -> bool:
+    """
+    Opt-in switch for the packed in-memory stable f64 GRM path.
+
+    Default is False so CLI workflows stay on the original streaming/memmap
+    backend and avoid eagerly materializing the filtered packed BED in memory.
+    """
+    raw = os.environ.get("JX_GRM_PREFER_STABLE_PACKED", "")
+    key = str(raw).strip().lower()
+    if key in {"1", "true", "yes", "on"}:
+        return stable_grm_builder_available()
+    return False
+
+
 def build_stable_packed_grm_f64(
     *,
     prefix: str,
@@ -22,6 +38,8 @@ def build_stable_packed_grm_f64(
     block_cols: int,
     threads: int,
     snps_only: bool = False,
+    progress_callback=None,
+    progress_every: int = 0,
 ) -> tuple[np.ndarray, int]:
     if not stable_grm_builder_available():
         raise RuntimeError(
@@ -58,8 +76,8 @@ def build_stable_packed_grm_f64(
         method=int(method),
         block_cols=max(1, int(block_cols)),
         threads=max(1, int(threads)),
-        progress_callback=None,
-        progress_every=0,
+        progress_callback=progress_callback,
+        progress_every=max(0, int(progress_every)),
     )
     grm = np.ascontiguousarray(np.asarray(grm_raw, dtype=np.float64), dtype=np.float64)
     if grm.ndim != 2 or grm.shape[0] != grm.shape[1]:
@@ -73,6 +91,8 @@ def build_stable_packed_ctx_grm_f64(
     sample_indices: np.ndarray | None,
     block_cols: int,
     threads: int,
+    progress_callback=None,
+    progress_every: int = 0,
 ) -> tuple[np.ndarray, int]:
     if not stable_grm_builder_available():
         raise RuntimeError(
@@ -149,8 +169,8 @@ def build_stable_packed_ctx_grm_f64(
         method=1,
         block_cols=max(1, int(block_cols)),
         threads=max(1, int(threads)),
-        progress_callback=None,
-        progress_every=0,
+        progress_callback=progress_callback,
+        progress_every=max(0, int(progress_every)),
     )
     grm = np.ascontiguousarray(np.asarray(grm_raw, dtype=np.float64), dtype=np.float64)
     if grm.ndim != 2 or grm.shape[0] != grm.shape[1]:

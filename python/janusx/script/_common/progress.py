@@ -210,6 +210,15 @@ class ProgressAdapter:
         elif self._backend == "tqdm" and self._tqdm is not None:
             self._tqdm.set_description_str(self.desc)
 
+    def set_total(self, total: int) -> None:
+        new_total = int(max(0, total))
+        self.total = new_total
+        if self._backend == "rich" and self._progress is not None and self._task_id is not None:
+            self._progress.update(self._task_id, total=self.total)
+        elif self._backend == "tqdm" and self._tqdm is not None:
+            self._tqdm.total = self.total
+            self._tqdm.refresh()
+
     def finish(self) -> None:
         if self._backend == "rich" and self._progress is not None and self._task_id is not None:
             self._progress.update(self._task_id, completed=self.total)

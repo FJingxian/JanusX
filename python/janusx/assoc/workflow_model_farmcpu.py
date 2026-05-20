@@ -12,6 +12,11 @@ import numpy as np
 import pandas as pd
 import psutil
 from janusx.pyBLUP.assoc import farmcpu
+from janusx.script._common.packedctx import (
+    packed_preload_is_disabled,
+    packed_preload_is_ready,
+    prepare_packed_ctx_from_plink,
+)
 
 from .workflow import (
     CliStatus,
@@ -47,7 +52,6 @@ from .workflow import (
     jxrs,
     load_genotype_chunks,
     latest_genotype_mtime,
-    prepare_packed_ctx_from_plink,
 )
 
 
@@ -796,7 +800,7 @@ def run_farmcpu_fullmem(
         if can_use_packed:
             packed_load_t0 = time.monotonic()
             packed_ctx_raw = None
-            pre = preloaded_packed if isinstance(preloaded_packed, dict) else None
+            pre = preloaded_packed if packed_preload_is_ready(preloaded_packed) else None
             if pre is not None and str(pre.get("prefix", "")) == str(packed_prefix):
                 packed_ctx_obj = pre.get("packed_ctx")
                 if isinstance(packed_ctx_obj, dict):
@@ -806,7 +810,7 @@ def run_farmcpu_fullmem(
                         logging.INFO,
                         "Reusing preloaded packed BED genotype for FarmCPU.",
                     )
-            if packed_ctx_raw is None:
+            if packed_ctx_raw is None and (not packed_preload_is_disabled(preloaded_packed)):
                 packed_status = CliStatus(
                     "Loading genotype (Full)...",
                     enabled=bool(use_spinner),
@@ -824,6 +828,11 @@ def run_farmcpu_fullmem(
                     except Exception:
                         task.fail("Loading genotype (Full) ...Failed")
                         raise
+            if packed_ctx_raw is None and packed_preload_is_disabled(preloaded_packed):
+                raise RuntimeError(
+                    "Packed BED preload is disabled for this run; FarmCPU packed "
+                    "cache path is unavailable."
+                )
             _log_file_only(
                 logger,
                 logging.INFO,
@@ -1173,7 +1182,7 @@ def run_farmcpu_fullmem(
         farm_qtn_bound = None if farm_qtn_bound_raw is None else int(farm_qtn_bound_raw)
         farm_nbin = max(1, int(getattr(args, "farmcpu_nbin", 5)))
         farm_szbin = [float(x) for x in getattr(args, "farmcpu_bin_size", [5e5, 5e6, 5e7])]
-        farm_label = f"FarmCPU-{phename} (n={n_idv})"
+        farm_label = "FarmCPU"
         farm_pbar = _ProgressAdapter(
             total=farm_iter,
             desc=farm_label,

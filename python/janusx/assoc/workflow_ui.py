@@ -271,6 +271,15 @@ class _ProgressAdapter:
         elif self._backend == "tqdm" and self._tqdm is not None:
             self._tqdm.set_description_str(self.desc)
 
+    def set_total(self, total: int) -> None:
+        self.total = int(max(0, total))
+        self._done = int(min(self._done, self.total))
+        if self._backend == "rich" and self._progress is not None and self._task_id is not None:
+            self._progress.update(self._task_id, total=self.total, metric=self._metric_text())
+        elif self._backend == "tqdm" and self._tqdm is not None:
+            self._tqdm.total = self.total
+            self._tqdm.refresh()
+
     def finish(self) -> None:
         if self._finished:
             return

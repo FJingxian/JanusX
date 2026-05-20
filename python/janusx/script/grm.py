@@ -27,6 +27,7 @@ import os
 import time
 import socket
 import argparse
+import logging
 from typing import Union
 
 import numpy as np
@@ -58,6 +59,7 @@ from ._common.threads import (
 )
 from ._common.grmstable import (
     build_stable_packed_grm_f64,
+    prefer_stable_packed_grm,
     save_grm_npy_blocked,
     stable_grm_builder_available,
 )
@@ -317,7 +319,7 @@ def build_grm_packed_bed(
     stream_elapsed = max(0.0, time.monotonic() - stream_t0)
     log_success(
         logger,
-        f"GRM (Effective SNPs: {eff_m}, packed-bed kernel) ...Finished "
+        f"GRM (Effective SNPs: {eff_m}) ...Finished "
         f"[{format_elapsed(stream_elapsed)}]",
         force_color=True,
     )
@@ -468,7 +470,7 @@ def main(log: bool = True):
 
     if log:
         bed_backend_policy = (
-            "stable packed-f64 (default when available)"
+            "memmap (default); stable packed-f64 opt-in via JX_GRM_PREFER_STABLE_PACKED=1"
             if stable_grm_builder_available()
             else "memmap (default; packed fallback)"
         )
@@ -546,7 +548,8 @@ def main(log: bool = True):
     chunk_size = int(args.chunksize)
     mmap_limit_effective = bool(args.mmap_limit or _is_plink_prefix_path(str(grm_input)))
     if mmap_limit_effective and (not bool(args.mmap_limit)):
-        logger.info("GRM backend policy: memmap (default).")
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("GRM backend policy: memmap (default).")
     mmap_window_mb = (
         auto_mmap_window_mb(grm_input, n_samples, n_snps, chunk_size)
         if mmap_limit_effective else None
@@ -562,31 +565,71 @@ def main(log: bool = True):
     )
     use_stable_packed_f64 = bool(
         _is_plink_prefix_path(str(grm_input))
-        and stable_grm_builder_available()
+        and prefer_stable_packed_grm()
     )
     if use_stable_packed_f64:
-        logger.info(
-            "GRM backend: stable packed-bed f64 kernel "
-            "(aligned with stable GWAS-cache GRM behavior)."
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "GRM backend: stable packed-bed f64 kernel "
+                "(aligned with stable GWAS-cache GRM behavior)."
+            )
+            if args.block_target_mb is not None:
+                logger.debug(
+                    "Stable packed-bed f64 GRM ignores --block-target-mb; "
+                    "Rust packed-f64 path controls its own blocking."
+                )
+            if bool(args.stage_timing):
+                logger.debug(
+                    "Stable packed-bed f64 GRM ignores --stage-timing; "
+                    "timing breakdown is only available for f32 memmap/packed kernels."
+                )
+
+        pbar = ProgressAdapter(
+            total=n_snps,
+            desc="GRM (Streaming)",
+            emit_done=False,
+            force_animate=True,
         )
-        if args.block_target_mb is not None:
-            logger.info(
-                "Stable packed-bed f64 GRM ignores --block-target-mb; "
-                "Rust packed-f64 path controls its own blocking."
+        stable_t0 = time.monotonic()
+        process = psutil.Process()
+        mem_tick_span = max(1, 10 * int(chunk_size))
+        last_done = 0
+        last_total = int(max(0, n_snps))
+
+        def _stable_progress_cb(done: int, total: int) -> None:
+            nonlocal last_done, last_total
+            d = int(max(0, done))
+            t = int(max(0, total))
+            if t > 0 and t != last_total:
+                pbar.set_total(t)
+                last_total = t
+            if d > last_done:
+                pbar.update(d - last_done)
+                last_done = d
+            if (d % mem_tick_span == 0) or (t > 0 and d >= t):
+                mem = process.memory_info().rss / 1024**3
+                pbar.set_postfix(memory=f"{mem:.2f} GB")
+
+        try:
+            grm, eff_m = build_stable_packed_grm_f64(
+                prefix=str(grm_input),
+                maf_threshold=maf_threshold,
+                max_missing_rate=max_missing_rate,
+                method=int(args.method),
+                block_cols=chunk_size,
+                threads=int(args.thread),
+                snps_only=False,
+                progress_callback=_stable_progress_cb,
+                progress_every=max(1, int(chunk_size)),
             )
-        if bool(args.stage_timing):
-            logger.info(
-                "Stable packed-bed f64 GRM ignores --stage-timing; "
-                "timing breakdown is only available for f32 memmap/packed kernels."
-            )
-        grm, eff_m = build_stable_packed_grm_f64(
-            prefix=str(grm_input),
-            maf_threshold=maf_threshold,
-            max_missing_rate=max_missing_rate,
-            method=int(args.method),
-            block_cols=chunk_size,
-            threads=int(args.thread),
-            snps_only=False,
+        finally:
+            pbar.finish()
+            pbar.close()
+        stable_elapsed = max(0.0, time.monotonic() - stable_t0)
+        log_success(
+            logger,
+            f"GRM (Effective SNPs: {eff_m}) ...Finished [{format_elapsed(stable_elapsed)}]",
+            force_color=True,
         )
     elif use_memmap_kernel:
         # logger.info(

@@ -138,6 +138,47 @@ def _normalize_filter_mode(mode: str) -> str:
     raise ValueError(f"Unsupported packed filter_mode: {mode!r}")
 
 
+def packed_preload_failure_state(prefix: str | None, reason: object) -> dict[str, typing.Any]:
+    return {
+        "_packed_preload_disabled": True,
+        "prefix": "" if prefix is None else str(prefix),
+        "reason": str(reason),
+    }
+
+
+def packed_preload_is_disabled(obj: object) -> bool:
+    return isinstance(obj, dict) and bool(obj.get("_packed_preload_disabled", False))
+
+
+def packed_preload_is_ready(obj: object) -> bool:
+    return (
+        isinstance(obj, dict)
+        and (not packed_preload_is_disabled(obj))
+        and isinstance(obj.get("packed_ctx"), dict)
+    )
+
+
+def packed_preload_reason(obj: object) -> str:
+    if isinstance(obj, dict):
+        return str(obj.get("reason", ""))
+    return ""
+
+
+def _raise_packed_prepare_error(
+    plink_prefix: str,
+    attempt_errors: list[tuple[str, Exception]],
+) -> typing.NoReturn:
+    if len(attempt_errors) == 0:
+        raise RuntimeError(f"Packed BED preparation failed for {plink_prefix}.")
+    detail = "; ".join(
+        f"{name}: {type(ex).__name__}: {ex}" for name, ex in attempt_errors
+    )
+    last_ex = attempt_errors[-1][1]
+    raise RuntimeError(
+        f"Packed BED preparation failed for {plink_prefix}. attempts={detail}"
+    ) from last_ex
+
+
 def prepare_packed_ctx_from_plink(
     prefix: str,
     *,
@@ -158,6 +199,7 @@ def prepare_packed_ctx_from_plink(
     plink_prefix = _normalize_plink_prefix(prefix)
     sample_ids, _ = inspect_genotype_file(str(plink_prefix))
     sample_ids_arr = np.asarray(sample_ids, dtype=str)
+    attempt_errors: list[tuple[str, Exception]] = []
 
     if expected_n_samples is not None and int(expected_n_samples) != int(sample_ids_arr.shape[0]):
         raise ValueError(
@@ -219,9 +261,8 @@ def prepare_packed_ctx_from_plink(
                 "source_prefix": str(plink_prefix),
             }
             return sample_ids_arr, packed_ctx
-        except Exception:
-            # Fall through to legacy path for compatibility.
-            pass
+        except Exception as ex:
+            attempt_errors.append(("prepare_bed_2bit_packed", ex))
 
     if scan_bed_2bit_packed_stats is not None:
         try:
@@ -252,7 +293,7 @@ def prepare_packed_ctx_from_plink(
                 keep &= miss_arr <= miss_thr
             het_thr = float(het_threshold)
             if het_thr > 0.0:
-                keep &= (het_arr >= het_thr) & (het_arr <= (1.0 - het_thr))
+                keep &= het_arr <= het_thr
             if bool(snps_only):
                 snp_mask = _plink_snp_mask(str(plink_prefix))
                 if snp_mask.shape[0] != keep.shape[0]:
@@ -350,10 +391,14 @@ def prepare_packed_ctx_from_plink(
                 "source_prefix": str(plink_prefix),
             }
             return sample_ids_arr, packed_ctx
-        except Exception:
-            pass
+        except Exception as ex:
+            attempt_errors.append(("scan_bed_2bit_packed_stats", ex))
 
-    packed_raw, miss_raw, maf_raw, std_raw, packed_n = load_bed_2bit_packed(str(plink_prefix))
+    try:
+        packed_raw, miss_raw, maf_raw, std_raw, packed_n = load_bed_2bit_packed(str(plink_prefix))
+    except Exception as ex:
+        attempt_errors.append(("load_bed_2bit_packed", ex))
+        _raise_packed_prepare_error(str(plink_prefix), attempt_errors)
     if int(packed_n) != int(sample_ids_arr.shape[0]):
         raise ValueError(
             f"Packed sample size mismatch: packed n={int(packed_n)}, expected {sample_ids_arr.shape[0]}"
@@ -374,7 +419,7 @@ def prepare_packed_ctx_from_plink(
     het_thr = float(het_threshold)
     if het_thr > 0.0:
         het_arr = _packed_row_het_rate(packed, int(packed_n))
-        keep &= (het_arr >= het_thr) & (het_arr <= (1.0 - het_thr))
+        keep &= het_arr <= het_thr
     if bool(snps_only):
         snp_mask = _plink_snp_mask(str(plink_prefix))
         if snp_mask.shape[0] != keep.shape[0]:

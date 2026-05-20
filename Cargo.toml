@@ -40,3 +40,7 @@ pkg-config = "0.3"
 
 [dev-dependencies]
 criterion = "0.5.1"
+
+[[bench]]
+name = "grm_dtype"
+harness = false

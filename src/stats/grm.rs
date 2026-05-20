@@ -27,11 +27,6 @@ use crate::gfcore::BedSnpIter;
 use crate::stats_common::{
     check_ctrlc, env_truthy, get_cached_pool, map_err_string_to_py, parse_index_vec_i64,
 };
-
-#[path = "../math/grm.rs"]
-mod grm_math;
-use grm_math::{grm_packed_f32_with_stats_impl, grm_packed_f64_with_stats_impl};
-
 #[allow(clippy::too_many_arguments)]
 fn decode_grm_block(
     packed_flat: &[u8],
@@ -147,217 +142,31 @@ fn decode_grm_block(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn decode_grm_block_f64(
-    packed_flat: &[u8],
-    bytes_per_snp: usize,
-    n_samples: usize,
-    row_flip_vec: &[bool],
+#[inline]
+fn grm_packed_centered_varsum_full(
     row_maf_vec: &[f32],
-    sample_idx: &[usize],
-    full_sample_fast: bool,
     method: usize,
-    eps: f64,
-    code4_lut: &[[u8; 4]; 256],
-    row_start: usize,
-    row_end: usize,
-    n: usize,
-    out_block: &mut [f64],
-    out_varsum: &mut [f64],
-    pool: Option<&Arc<rayon::ThreadPool>>,
-) -> Result<(), String> {
-    let cur_rows = row_end.saturating_sub(row_start);
-    if cur_rows == 0 {
-        return Ok(());
+    full_sample_fast: bool,
+) -> Result<f64, String> {
+    if method != 1 || !full_sample_fast {
+        return Ok(0.0_f64);
     }
-    if out_block.len() < cur_rows.saturating_mul(n) {
-        return Err("decode_grm_block_f64: out_block too small".to_string());
-    }
-    if out_varsum.len() < cur_rows {
-        return Err("decode_grm_block_f64: out_varsum too small".to_string());
-    }
-    let block = &mut out_block[..cur_rows * n];
-    let varsum = &mut out_varsum[..cur_rows];
-
-    let mut decode_run = || {
-        if full_sample_fast {
-            block
-                .par_chunks_mut(n)
-                .zip(varsum.par_iter_mut())
-                .enumerate()
-                .for_each(|(off, (out_row, row_varsum_dst))| {
-                    let idx = row_start + off;
-                    let row = &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
-                    let flip = row_flip_vec[idx];
-                    let p = row_maf_vec[idx].clamp(0.0, 0.5) as f64;
-                    let mean_g = 2.0_f64 * p;
-                    let var = 2.0_f64 * p * (1.0_f64 - p);
-                    let std_scale = if method == 2 {
-                        if var > eps {
-                            1.0_f64 / var.sqrt()
-                        } else {
-                            0.0_f64
-                        }
-                    } else {
-                        1.0_f64
-                    };
-                    let value_lut: [f64; 4] = if flip {
-                        [
-                            (2.0_f64 - mean_g) * std_scale,
-                            0.0_f64,
-                            (1.0_f64 - mean_g) * std_scale,
-                            (0.0_f64 - mean_g) * std_scale,
-                        ]
-                    } else {
-                        [
-                            (0.0_f64 - mean_g) * std_scale,
-                            0.0_f64,
-                            (1.0_f64 - mean_g) * std_scale,
-                            (2.0_f64 - mean_g) * std_scale,
-                        ]
-                    };
-                    decode_row_centered_full_lut_f64(
-                        row, n_samples, code4_lut, &value_lut, out_row,
-                    );
-                    if method == 1 {
-                        *row_varsum_dst = var;
-                    }
-                });
-        } else {
-            block
-                .par_chunks_mut(n)
-                .zip(varsum.par_iter_mut())
-                .enumerate()
-                .for_each_init(
-                    || vec![0.0_f64; n_samples],
-                    |full_row, (off, (out_row, row_varsum_dst))| {
-                        let idx = row_start + off;
-                        let row = &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
-                        let flip = row_flip_vec[idx];
-                        let p = row_maf_vec[idx].clamp(0.0, 0.5) as f64;
-                        let default_mean_g = 2.0_f64 * p;
-                        let (var_centered, _row_sum) = decode_subset_row_from_full_scratch_f64(
-                            row,
-                            n_samples,
-                            sample_idx,
-                            flip,
-                            default_mean_g,
-                            method,
-                            eps,
-                            code4_lut,
-                            full_row.as_mut_slice(),
-                            out_row,
-                        );
-                        if method == 1 {
-                            *row_varsum_dst = var_centered;
-                        }
-                    },
-                );
+    let mut acc = 0.0_f64;
+    for &maf in row_maf_vec {
+        let p = maf as f64;
+        let v = 2.0_f64 * p * (1.0_f64 - p);
+        if v.is_finite() && v > 0.0 {
+            acc += v;
         }
-    };
-
-    if let Some(tp) = pool {
-        tp.install(&mut decode_run);
-    } else {
-        decode_run();
     }
-    Ok(())
+    if !(acc.is_finite() && acc > 0.0) {
+        return Err("invalid centered GRM denominator: sum(2p(1-p)) <= 0".to_string());
+    }
+    Ok(acc)
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn grm_packed_f64_from_stats_rust(
-    packed_flat: &[u8],
-    bytes_per_snp: usize,
-    n_samples: usize,
-    row_flip: &[bool],
-    row_maf: &[f32],
-    sample_indices: &[usize],
-    method: usize,
-    block_cols: usize,
-    threads: usize,
-) -> Result<(Vec<f64>, f64), String> {
-    if n_samples == 0 {
-        return Err("n_samples must be > 0".to_string());
-    }
-    if method != 1 && method != 2 {
-        return Err(format!(
-            "unsupported method={method}; expected 1 (centered) or 2 (standardized)"
-        ));
-    }
-    if bytes_per_snp == 0 {
-        return Err("bytes_per_snp must be > 0".to_string());
-    }
-    let expected_bps = n_samples.div_ceil(4);
-    if bytes_per_snp != expected_bps {
-        return Err(format!(
-            "bytes_per_snp mismatch: got {bytes_per_snp}, expected {expected_bps}"
-        ));
-    }
-
-    let m = row_flip.len();
-    if m == 0 {
-        return Err("row_flip must contain at least one SNP row".to_string());
-    }
-    if row_maf.len() != m {
-        return Err(format!(
-            "row_maf length mismatch: got {}, expected {m}",
-            row_maf.len()
-        ));
-    }
-    if packed_flat.len() != m.saturating_mul(bytes_per_snp) {
-        return Err(format!(
-            "packed size mismatch: got {}, expected {}",
-            packed_flat.len(),
-            m.saturating_mul(bytes_per_snp)
-        ));
-    }
-    if sample_indices.is_empty() {
-        return Err("sample_indices must not be empty".to_string());
-    }
-    if let Some(&bad) = sample_indices.iter().find(|&&sid| sid >= n_samples) {
-        return Err(format!("sample index out of range: {bad} >= {n_samples}"));
-    }
-
-    let sample_idx = sample_indices;
-    let n = sample_idx.len();
-    let full_sample_fast = is_identity_indices(sample_idx, n_samples);
-
-    let varsum_full = if method == 1 && full_sample_fast {
-        let mut acc = 0.0_f64;
-        for &maf in row_maf {
-            let p = maf as f64;
-            let v = 2.0_f64 * p * (1.0_f64 - p);
-            if v.is_finite() && v > 0.0 {
-                acc += v;
-            }
-        }
-        if !(acc.is_finite() && acc > 0.0) {
-            return Err("invalid centered GRM denominator: sum(2p(1-p)) <= 0".to_string());
-        }
-        acc
-    } else {
-        0.0_f64
-    };
-
-    let total_threads = effective_threads(threads);
-    let pool = if total_threads > 1 {
-        Some(Arc::new(
-            rayon::ThreadPoolBuilder::new()
-                .num_threads(total_threads)
-                .build()
-                .map_err(|e| format!("rayon pool: {e}"))?,
-        ))
-    } else {
-        None
-    };
-    let row_step = adaptive_grm_block_rows(
-        block_cols.max(1),
-        m.max(1),
-        n,
-        if full_sample_fast { 0 } else { n_samples },
-        total_threads,
-    )
-    .max(1);
+#[inline]
+fn grm_packed_cblas_flags() -> (bool, bool) {
     let cblas_copy_rhs = std::env::var("JX_GRM_PACKED_CBLAS_COPY_RHS")
         .ok()
         .map(|s| s.trim().eq_ignore_ascii_case("1") || s.trim().eq_ignore_ascii_case("true"))
@@ -369,44 +178,208 @@ pub fn grm_packed_f64_from_stats_rust(
             matches!(t.as_str(), "1" | "true" | "yes" | "on")
         })
         .unwrap_or(false);
+    (cblas_copy_rhs, cblas_force_tmp_accum)
+}
 
-    let mut grm = vec![0.0_f64; n * n];
-    let mut block = vec![0.0_f64; row_step * n];
-    let mut block_varsum = vec![0.0_f64; row_step];
+#[inline]
+fn grm_packed_core_prelude(
+    packed_flat: &[u8],
+    n_samples: usize,
+    row_flip_vec: &[bool],
+    row_maf_vec: &[f32],
+    sample_idx: &[usize],
+    method: usize,
+) -> Result<(usize, usize, usize, bool, f64), String> {
+    if n_samples == 0 {
+        return Err("n_samples must be > 0".to_string());
+    }
+    if method != 1 && method != 2 {
+        return Err(format!(
+            "unsupported method={method}; expected 1 (centered) or 2 (standardized)"
+        ));
+    }
+    let m = row_flip_vec.len();
+    if m == 0 {
+        return Err("packed must contain at least one SNP row".to_string());
+    }
+    if row_maf_vec.len() != m {
+        return Err(format!(
+            "row_maf length mismatch: got {}, expected {m}",
+            row_maf_vec.len()
+        ));
+    }
+    if sample_idx.is_empty() {
+        return Err("sample_indices must not be empty".to_string());
+    }
+    if let Some(&bad) = sample_idx.iter().find(|&&sid| sid >= n_samples) {
+        return Err(format!("sample index out of range: {bad} >= {n_samples}"));
+    }
+    let bytes_per_snp = n_samples.div_ceil(4);
+    let expected_len = m
+        .checked_mul(bytes_per_snp)
+        .ok_or_else(|| "packed length overflow".to_string())?;
+    if packed_flat.len() != expected_len {
+        return Err(format!(
+            "packed length mismatch: got {}, expected {expected_len}",
+            packed_flat.len()
+        ));
+    }
+
+    let n = sample_idx.len();
+    let full_sample_fast = is_identity_indices(sample_idx, n_samples);
+    let varsum_full = grm_packed_centered_varsum_full(row_maf_vec, method, full_sample_fast)?;
+    Ok((m, bytes_per_snp, n, full_sample_fast, varsum_full))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn grm_packed_f32_core_impl<P>(
+    packed_flat: &[u8],
+    n_samples: usize,
+    row_flip_vec: &[bool],
+    row_maf_vec: &[f32],
+    sample_idx: &[usize],
+    method: usize,
+    block_cols: usize,
+    threads: usize,
+    progress_every: usize,
+    mut progress: Option<P>,
+) -> Result<(Vec<f32>, Vec<f64>, f64), String>
+where
+    P: FnMut(usize, usize) -> Result<(), String>,
+{
+    let (m, bytes_per_snp, n, full_sample_fast, varsum_full) = grm_packed_core_prelude(
+        packed_flat,
+        n_samples,
+        row_flip_vec,
+        row_maf_vec,
+        sample_idx,
+        method,
+    )?;
+    let pool = get_cached_pool(threads).map_err(|e| e.to_string())?;
+    let row_step = adaptive_grm_block_rows(
+        block_cols.max(1),
+        m.max(1),
+        n,
+        if full_sample_fast { 0 } else { n_samples },
+        threads,
+    )
+    .max(1);
+    let notify_step = if progress_every == 0 {
+        row_step
+    } else {
+        progress_every.max(1)
+    };
+    let (cblas_copy_rhs, cblas_force_tmp_accum) = grm_packed_cblas_flags();
+
+    let _blas_guard = OpenBlasThreadGuard::enter(threads.max(1));
+    let mut grm = vec![0.0_f32; n * n];
+    let mut block = vec![0.0_f32; row_step * n];
     let mut varsum_acc = varsum_full;
-    let mut is_first_block = true;
-    let eps = 1e-12_f64;
+    let eps = 1e-12_f32;
     let byte_lut = packed_byte_lut();
+    let mut row_sum_all = vec![0.0_f64; m];
+    let mut last_notified = 0usize;
+    let mut is_first_block = true;
 
     for row_start in (0..m).step_by(row_step) {
         let row_end = (row_start + row_step).min(m);
-        let cur_rows = row_end.saturating_sub(row_start);
-        if cur_rows == 0 {
-            continue;
+        let cur_rows = row_end - row_start;
+        let cur_block = &mut block[..cur_rows * n];
+        let mut block_varsum = vec![0.0_f64; cur_rows];
+        let mut block_rowsum = vec![0.0_f64; cur_rows];
+
+        let mut decode_run = || {
+            if full_sample_fast {
+                cur_block
+                    .par_chunks_mut(n)
+                    .zip(block_varsum.par_iter_mut())
+                    .zip(block_rowsum.par_iter_mut())
+                    .enumerate()
+                    .for_each(|(off, ((out_row, row_varsum_dst), row_sum_dst))| {
+                        let idx = row_start + off;
+                        let row = &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
+                        let p = row_maf_vec[idx].clamp(0.0_f32, 0.5_f32);
+                        let mean_g = 2.0_f32 * p;
+                        let var = 2.0_f32 * p * (1.0_f32 - p);
+                        let std_scale = if method == 2 {
+                            if var > eps {
+                                1.0_f32 / var.sqrt()
+                            } else {
+                                0.0_f32
+                            }
+                        } else {
+                            1.0_f32
+                        };
+                        let value_lut: [f32; 4] = if row_flip_vec[idx] {
+                            [
+                                (2.0_f32 - mean_g) * std_scale,
+                                0.0_f32,
+                                (1.0_f32 - mean_g) * std_scale,
+                                (0.0_f32 - mean_g) * std_scale,
+                            ]
+                        } else {
+                            [
+                                (0.0_f32 - mean_g) * std_scale,
+                                0.0_f32,
+                                (1.0_f32 - mean_g) * std_scale,
+                                (2.0_f32 - mean_g) * std_scale,
+                            ]
+                        };
+                        decode_row_centered_full_lut(
+                            row,
+                            n_samples,
+                            &byte_lut.code4,
+                            &value_lut,
+                            out_row,
+                        );
+                        if method == 1 {
+                            *row_varsum_dst = var as f64;
+                        }
+                        *row_sum_dst = (mean_g as f64) * (n as f64);
+                    });
+            } else {
+                cur_block
+                    .par_chunks_mut(n)
+                    .zip(block_varsum.par_iter_mut())
+                    .zip(block_rowsum.par_iter_mut())
+                    .enumerate()
+                    .for_each_init(
+                        || vec![0.0_f32; n_samples],
+                        |full_row, (off, ((out_row, row_varsum_dst), row_sum_dst))| {
+                            let idx = row_start + off;
+                            let row = &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
+                            let p = row_maf_vec[idx].clamp(0.0_f32, 0.5_f32);
+                            let default_mean_g = 2.0_f32 * p;
+                            let (var_centered, row_sum) = decode_subset_row_from_full_scratch(
+                                row,
+                                n_samples,
+                                sample_idx,
+                                row_flip_vec[idx],
+                                default_mean_g,
+                                method,
+                                eps,
+                                &byte_lut.code4,
+                                full_row.as_mut_slice(),
+                                out_row,
+                            );
+                            if method == 1 {
+                                *row_varsum_dst = var_centered;
+                            }
+                            *row_sum_dst = row_sum;
+                        },
+                    );
+            }
+        };
+
+        if let Some(tp) = &pool {
+            tp.install(&mut decode_run);
+        } else {
+            decode_run();
         }
 
-        decode_grm_block_f64(
-            packed_flat,
-            bytes_per_snp,
-            n_samples,
-            row_flip,
-            row_maf,
-            sample_idx,
-            full_sample_fast,
-            method,
-            eps,
-            &byte_lut.code4,
-            row_start,
-            row_end,
-            n,
-            &mut block,
-            &mut block_varsum,
-            pool.as_ref(),
-        )?;
-
-        grm_rankk_update_f64(
+        grm_rankk_update(
             &mut grm,
-            &block[..cur_rows * n],
+            cur_block,
             cur_rows,
             n,
             cblas_copy_rhs,
@@ -415,7 +388,213 @@ pub fn grm_packed_f64_from_stats_rust(
         )?;
         is_first_block = false;
         if method == 1 && !full_sample_fast {
-            varsum_acc += block_varsum[..cur_rows].iter().sum::<f64>();
+            varsum_acc += block_varsum.iter().sum::<f64>();
+        }
+        row_sum_all[row_start..row_end].copy_from_slice(&block_rowsum);
+
+        let done = row_end;
+        if (done >= last_notified.saturating_add(notify_step)) || (done == m) {
+            last_notified = done;
+            if let Some(cb) = progress.as_mut() {
+                cb(done, m)?;
+            }
+        }
+    }
+
+    let scale = if method == 1 {
+        if !(varsum_acc.is_finite() && varsum_acc > 0.0) {
+            return Err("invalid centered GRM denominator in subset path".to_string());
+        }
+        varsum_acc as f32
+    } else {
+        m as f32
+    };
+    if !(scale.is_finite() && scale > 0.0) {
+        return Err("invalid GRM scale factor".to_string());
+    }
+    let inv_scale = 1.0_f32 / scale;
+    for i in 0..n {
+        let ii = i * n + i;
+        grm[ii] *= inv_scale;
+        for j in 0..i {
+            let idx_lo = i * n + j;
+            let idx_up = j * n + i;
+            let v = grm[idx_lo] * inv_scale;
+            grm[idx_lo] = v;
+            grm[idx_up] = v;
+        }
+    }
+    let varsum_ret = if method == 1 { varsum_acc } else { m as f64 };
+    Ok((grm, row_sum_all, varsum_ret))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn grm_packed_f64_core_impl<P>(
+    packed_flat: &[u8],
+    n_samples: usize,
+    row_flip_vec: &[bool],
+    row_maf_vec: &[f32],
+    sample_idx: &[usize],
+    method: usize,
+    block_cols: usize,
+    threads: usize,
+    progress_every: usize,
+    mut progress: Option<P>,
+) -> Result<(Vec<f64>, Vec<f64>, f64), String>
+where
+    P: FnMut(usize, usize) -> Result<(), String>,
+{
+    let (m, bytes_per_snp, n, full_sample_fast, varsum_full) = grm_packed_core_prelude(
+        packed_flat,
+        n_samples,
+        row_flip_vec,
+        row_maf_vec,
+        sample_idx,
+        method,
+    )?;
+    let pool = get_cached_pool(threads).map_err(|e| e.to_string())?;
+    let row_step = adaptive_grm_block_rows(
+        block_cols.max(1),
+        m.max(1),
+        n,
+        if full_sample_fast { 0 } else { n_samples },
+        threads,
+    )
+    .max(1);
+    let notify_step = if progress_every == 0 {
+        row_step
+    } else {
+        progress_every.max(1)
+    };
+    let (cblas_copy_rhs, cblas_force_tmp_accum) = grm_packed_cblas_flags();
+
+    let _blas_guard = OpenBlasThreadGuard::enter(threads.max(1));
+    let mut grm = vec![0.0_f64; n * n];
+    let mut block = vec![0.0_f64; row_step * n];
+    let mut varsum_acc = varsum_full;
+    let eps = 1e-12_f64;
+    let byte_lut = packed_byte_lut();
+    let mut row_sum_all = vec![0.0_f64; m];
+    let mut last_notified = 0usize;
+    let mut is_first_block = true;
+
+    for row_start in (0..m).step_by(row_step) {
+        let row_end = (row_start + row_step).min(m);
+        let cur_rows = row_end - row_start;
+        let cur_block = &mut block[..cur_rows * n];
+        let mut block_varsum = vec![0.0_f64; cur_rows];
+        let mut block_rowsum = vec![0.0_f64; cur_rows];
+
+        let mut decode_run = || {
+            if full_sample_fast {
+                cur_block
+                    .par_chunks_mut(n)
+                    .zip(block_varsum.par_iter_mut())
+                    .zip(block_rowsum.par_iter_mut())
+                    .enumerate()
+                    .for_each(|(off, ((out_row, row_varsum_dst), row_sum_dst))| {
+                        let idx = row_start + off;
+                        let row = &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
+                        let p = row_maf_vec[idx].clamp(0.0_f32, 0.5_f32) as f64;
+                        let mean_g = 2.0_f64 * p;
+                        let var = 2.0_f64 * p * (1.0_f64 - p);
+                        let std_scale = if method == 2 {
+                            if var > eps {
+                                1.0_f64 / var.sqrt()
+                            } else {
+                                0.0_f64
+                            }
+                        } else {
+                            1.0_f64
+                        };
+                        let value_lut: [f64; 4] = if row_flip_vec[idx] {
+                            [
+                                (2.0_f64 - mean_g) * std_scale,
+                                0.0_f64,
+                                (1.0_f64 - mean_g) * std_scale,
+                                (0.0_f64 - mean_g) * std_scale,
+                            ]
+                        } else {
+                            [
+                                (0.0_f64 - mean_g) * std_scale,
+                                0.0_f64,
+                                (1.0_f64 - mean_g) * std_scale,
+                                (2.0_f64 - mean_g) * std_scale,
+                            ]
+                        };
+                        decode_row_centered_full_lut_f64(
+                            row,
+                            n_samples,
+                            &byte_lut.code4,
+                            &value_lut,
+                            out_row,
+                        );
+                        if method == 1 {
+                            *row_varsum_dst = var;
+                        }
+                        *row_sum_dst = mean_g * (n as f64);
+                    });
+            } else {
+                cur_block
+                    .par_chunks_mut(n)
+                    .zip(block_varsum.par_iter_mut())
+                    .zip(block_rowsum.par_iter_mut())
+                    .enumerate()
+                    .for_each_init(
+                        || vec![0.0_f64; n_samples],
+                        |full_row, (off, ((out_row, row_varsum_dst), row_sum_dst))| {
+                            let idx = row_start + off;
+                            let row = &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
+                            let p = row_maf_vec[idx].clamp(0.0_f32, 0.5_f32) as f64;
+                            let default_mean_g = 2.0_f64 * p;
+                            let (var_centered, row_sum) = decode_subset_row_from_full_scratch_f64(
+                                row,
+                                n_samples,
+                                sample_idx,
+                                row_flip_vec[idx],
+                                default_mean_g,
+                                method,
+                                eps,
+                                &byte_lut.code4,
+                                full_row.as_mut_slice(),
+                                out_row,
+                            );
+                            if method == 1 {
+                                *row_varsum_dst = var_centered;
+                            }
+                            *row_sum_dst = row_sum;
+                        },
+                    );
+            }
+        };
+
+        if let Some(tp) = &pool {
+            tp.install(&mut decode_run);
+        } else {
+            decode_run();
+        }
+
+        grm_rankk_update_f64(
+            &mut grm,
+            cur_block,
+            cur_rows,
+            n,
+            cblas_copy_rhs,
+            is_first_block,
+            cblas_force_tmp_accum,
+        )?;
+        is_first_block = false;
+        if method == 1 && !full_sample_fast {
+            varsum_acc += block_varsum.iter().sum::<f64>();
+        }
+        row_sum_all[row_start..row_end].copy_from_slice(&block_rowsum);
+
+        let done = row_end;
+        if (done >= last_notified.saturating_add(notify_step)) || (done == m) {
+            last_notified = done;
+            if let Some(cb) = progress.as_mut() {
+                cb(done, m)?;
+            }
         }
     }
 
@@ -430,198 +609,323 @@ pub fn grm_packed_f64_from_stats_rust(
     if !(scale.is_finite() && scale > 0.0) {
         return Err("invalid GRM scale factor".to_string());
     }
-
     let inv_scale = 1.0_f64 / scale;
     for i in 0..n {
         let ii = i * n + i;
         grm[ii] *= inv_scale;
         for j in 0..i {
             let idx_lo = i * n + j;
+            let idx_up = j * n + i;
             let v = grm[idx_lo] * inv_scale;
             grm[idx_lo] = v;
-            grm[j * n + i] = v;
+            grm[idx_up] = v;
         }
     }
-
     let varsum_ret = if method == 1 { varsum_acc } else { m as f64 };
-    Ok((grm, varsum_ret))
+    Ok((grm, row_sum_all, varsum_ret))
 }
 
-#[inline]
-fn decode_grm_stream_block_into(
-    it: &mut BedSnpIter,
-    out_block: &mut [f32],
-    row_step: usize,
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn grm_packed_f32_with_stats_impl<'py>(
+    py: Python<'py>,
+    packed: PyReadonlyArray2<'py, u8>,
     n_samples: usize,
+    row_flip: PyReadonlyArray1<'py, bool>,
+    row_maf: PyReadonlyArray1<'py, f32>,
+    sample_indices: Option<PyReadonlyArray1<'py, i64>>,
     method: usize,
-    maf_thr: f32,
-    miss_thr: f32,
-    eps: f64,
-) -> (usize, usize, f64, bool) {
-    let mut cur_rows = 0usize;
-    let mut scanned_add = 0usize;
-    let mut varsum_add = 0.0_f64;
-    let mut reached_eof = false;
-    while cur_rows < row_step {
-        let dst = &mut out_block[cur_rows * n_samples..(cur_rows + 1) * n_samples];
-        let (scanned_now, maybe_var, eof_now) =
-            it.next_snp_grm_row_into(dst, method, maf_thr, miss_thr, eps);
-        scanned_add = scanned_add.saturating_add(scanned_now);
-        let Some(var) = maybe_var else {
-            if eof_now {
-                reached_eof = true;
-                break;
-            }
-            continue;
-        };
-        if method == 1 {
-            varsum_add += var;
-        }
-        cur_rows += 1;
+    block_cols: usize,
+    threads: usize,
+    progress_callback: Option<Py<PyAny>>,
+    progress_every: usize,
+) -> PyResult<(Bound<'py, PyArray2<f32>>, Bound<'py, PyArray1<f64>>, f64)> {
+    if n_samples == 0 {
+        return Err(PyRuntimeError::new_err("n_samples must be > 0"));
     }
-    (cur_rows, scanned_add, varsum_add, reached_eof)
-}
-
-#[inline]
-fn decode_grm_stream_block_parallel_into(
-    it: &mut BedSnpIter,
-    out_block: &mut [f32],
-    row_step: usize,
-    n_samples: usize,
-    method: usize,
-    maf_thr: f32,
-    miss_thr: f32,
-    eps: f64,
-    decode_batch_snps: usize,
-    pool: Option<&Arc<rayon::ThreadPool>>,
-) -> (usize, usize, f64, bool) {
-    let mut cur_rows = 0usize;
-    let mut scanned_add = 0usize;
-    let mut varsum_add = 0.0_f64;
-    let mut reached_eof = false;
-    let n_total = it.n_snps();
-    let batch_cap = decode_batch_snps.max(1);
-    let mut keep_flags = vec![0_u8; batch_cap];
-    let mut vars = vec![0.0_f64; batch_cap];
-
-    while cur_rows < row_step {
-        let base = it.cursor();
-        if base >= n_total {
-            reached_eof = true;
-            break;
-        }
-        let need_rows = row_step - cur_rows;
-        let scan_rows = (n_total - base).min(batch_cap).min(need_rows);
-        if scan_rows == 0 {
-            reached_eof = true;
-            break;
-        }
-
-        keep_flags[..scan_rows].fill(0);
-        if method == 1 {
-            vars[..scan_rows].fill(0.0_f64);
-        }
-        let row_base = cur_rows;
-        let scan_slice = &mut out_block[row_base * n_samples..(row_base + scan_rows) * n_samples];
-
-        let mut run = || {
-            let it_ref: &BedSnpIter = &*it;
-            scan_slice
-                .par_chunks_mut(n_samples)
-                .zip(keep_flags[..scan_rows].par_iter_mut())
-                .zip(vars[..scan_rows].par_iter_mut())
-                .enumerate()
-                .for_each(|(off, ((row_dst, keep_dst), var_dst))| {
-                    let snp_idx = base + off;
-                    let Some((alt_sum, non_missing)) =
-                        it_ref.decode_snp_raw_into_with_stats_at(snp_idx, row_dst)
-                    else {
-                        return;
-                    };
-                    let Some((prep, var)) = grm_stream_row_prepare_from_stats(
-                        method,
-                        maf_thr,
-                        miss_thr,
-                        eps,
-                        n_samples,
-                        alt_sum,
-                        non_missing,
-                    ) else {
-                        return;
-                    };
-                    apply_grm_stream_prepared_row_inplace(row_dst, prep);
-                    *keep_dst = 1;
-                    if method == 1 {
-                        *var_dst = var;
-                    }
-                });
-        };
-        if let Some(tp) = pool {
-            tp.install(run);
-        } else {
-            run();
-        }
-
-        let mut kept_rows = 0usize;
-        for read in 0..scan_rows {
-            if keep_flags[read] == 0 {
-                continue;
-            }
-            if kept_rows != read {
-                let src0 = read * n_samples;
-                let dst0 = kept_rows * n_samples;
-                scan_slice.copy_within(src0..src0 + n_samples, dst0);
-            }
-            if method == 1 {
-                varsum_add += vars[read];
-            }
-            kept_rows += 1;
-        }
-        cur_rows += kept_rows;
-
-        scanned_add = scanned_add.saturating_add(scan_rows);
-        it.set_cursor(base + scan_rows);
-        if base + scan_rows >= n_total {
-            reached_eof = true;
-            break;
-        }
+    let packed_arr = packed.as_array();
+    if packed_arr.ndim() != 2 {
+        return Err(PyRuntimeError::new_err(
+            "packed must be 2D (m, bytes_per_snp)",
+        ));
     }
-
-    (cur_rows, scanned_add, varsum_add, reached_eof)
-}
-
-#[inline]
-fn decode_grm_stream_block_dispatch(
-    it: &mut BedSnpIter,
-    out_block: &mut [f32],
-    row_step: usize,
-    n_samples: usize,
-    method: usize,
-    maf_thr: f32,
-    miss_thr: f32,
-    eps: f64,
-    parallel_decode: bool,
-    decode_batch_snps: usize,
-    pool: Option<&Arc<rayon::ThreadPool>>,
-) -> (usize, usize, f64, bool) {
-    if parallel_decode {
-        decode_grm_stream_block_parallel_into(
-            it,
-            out_block,
-            row_step,
-            n_samples,
-            method,
-            maf_thr,
-            miss_thr,
-            eps,
-            decode_batch_snps,
-            pool,
-        )
+    let m = packed_arr.shape()[0];
+    if m == 0 {
+        return Err(PyRuntimeError::new_err(
+            "packed must contain at least one SNP row",
+        ));
+    }
+    let bytes_per_snp = packed_arr.shape()[1];
+    let expected_bps = n_samples.div_ceil(4);
+    if bytes_per_snp != expected_bps {
+        return Err(PyRuntimeError::new_err(format!(
+            "packed second dimension mismatch: got {bytes_per_snp}, expected {expected_bps} for n_samples={n_samples}"
+        )));
+    }
+    let row_flip_vec: Cow<[bool]> = match row_flip.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(row_flip.as_array().iter().copied().collect()),
+    };
+    let row_maf_vec: Cow<[f32]> = match row_maf.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(row_maf.as_array().iter().copied().collect()),
+    };
+    if row_flip_vec.len() != m {
+        return Err(PyRuntimeError::new_err(format!(
+            "row_flip length mismatch: got {}, expected {m}",
+            row_flip_vec.len()
+        )));
+    }
+    if row_maf_vec.len() != m {
+        return Err(PyRuntimeError::new_err(format!(
+            "row_maf length mismatch: got {}, expected {m}",
+            row_maf_vec.len()
+        )));
+    }
+    let sample_idx: Vec<usize> = if let Some(sidx) = sample_indices {
+        parse_index_vec_i64(sidx.as_slice()?, n_samples, "sample_indices")?
     } else {
-        decode_grm_stream_block_into(
-            it, out_block, row_step, n_samples, method, maf_thr, miss_thr, eps,
-        )
+        (0..n_samples).collect()
+    };
+    let n = sample_idx.len();
+    if n == 0 {
+        return Err(PyRuntimeError::new_err("sample_indices must not be empty"));
     }
+    let packed_flat: Cow<[u8]> = match packed.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(packed_arr.iter().copied().collect()),
+    };
+
+    let (grm_vec, row_sum_vec, varsum_ret) = py
+        .detach(move || -> Result<(Vec<f32>, Vec<f64>, f64), String> {
+            let progress = move |done: usize, total: usize| -> Result<(), String> {
+                if let Some(cb) = progress_callback.as_ref() {
+                    Python::attach(|py2| -> PyResult<()> {
+                        py2.check_signals()?;
+                        cb.call1(py2, (done, total))?;
+                        Ok(())
+                    })
+                    .map_err(|e| e.to_string())?;
+                } else {
+                    Python::attach(|py2| py2.check_signals()).map_err(|e| e.to_string())?;
+                }
+                Ok(())
+            };
+            grm_packed_f32_core_impl(
+                packed_flat.as_ref(),
+                n_samples,
+                row_flip_vec.as_ref(),
+                row_maf_vec.as_ref(),
+                sample_idx.as_slice(),
+                method,
+                block_cols,
+                threads,
+                progress_every,
+                Some(progress),
+            )
+        })
+        .map_err(map_err_string_to_py)?;
+
+    let grm_arr = PyArray2::from_owned_array(
+        py,
+        Array2::from_shape_vec((n, n), grm_vec)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+    )
+    .into_bound();
+    let row_sum_arr = PyArray1::from_owned_array(py, Array1::from_vec(row_sum_vec)).into_bound();
+    Ok((grm_arr, row_sum_arr, varsum_ret))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn grm_packed_f64_with_stats_impl<'py>(
+    py: Python<'py>,
+    packed: PyReadonlyArray2<'py, u8>,
+    n_samples: usize,
+    row_flip: PyReadonlyArray1<'py, bool>,
+    row_maf: PyReadonlyArray1<'py, f32>,
+    sample_indices: Option<PyReadonlyArray1<'py, i64>>,
+    method: usize,
+    block_cols: usize,
+    threads: usize,
+    progress_callback: Option<Py<PyAny>>,
+    progress_every: usize,
+) -> PyResult<(Bound<'py, PyArray2<f64>>, Bound<'py, PyArray1<f64>>, f64)> {
+    if n_samples == 0 {
+        return Err(PyRuntimeError::new_err("n_samples must be > 0"));
+    }
+    let packed_arr = packed.as_array();
+    if packed_arr.ndim() != 2 {
+        return Err(PyRuntimeError::new_err(
+            "packed must be 2D (m, bytes_per_snp)",
+        ));
+    }
+    let m = packed_arr.shape()[0];
+    if m == 0 {
+        return Err(PyRuntimeError::new_err(
+            "packed must contain at least one SNP row",
+        ));
+    }
+    let bytes_per_snp = packed_arr.shape()[1];
+    let expected_bps = n_samples.div_ceil(4);
+    if bytes_per_snp != expected_bps {
+        return Err(PyRuntimeError::new_err(format!(
+            "packed second dimension mismatch: got {bytes_per_snp}, expected {expected_bps} for n_samples={n_samples}"
+        )));
+    }
+    let row_flip_vec: Cow<[bool]> = match row_flip.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(row_flip.as_array().iter().copied().collect()),
+    };
+    let row_maf_vec: Cow<[f32]> = match row_maf.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(row_maf.as_array().iter().copied().collect()),
+    };
+    if row_flip_vec.len() != m {
+        return Err(PyRuntimeError::new_err(format!(
+            "row_flip length mismatch: got {}, expected {m}",
+            row_flip_vec.len()
+        )));
+    }
+    if row_maf_vec.len() != m {
+        return Err(PyRuntimeError::new_err(format!(
+            "row_maf length mismatch: got {}, expected {m}",
+            row_maf_vec.len()
+        )));
+    }
+    let sample_idx: Vec<usize> = if let Some(sidx) = sample_indices {
+        parse_index_vec_i64(sidx.as_slice()?, n_samples, "sample_indices")?
+    } else {
+        (0..n_samples).collect()
+    };
+    let n = sample_idx.len();
+    if n == 0 {
+        return Err(PyRuntimeError::new_err("sample_indices must not be empty"));
+    }
+    let packed_flat: Cow<[u8]> = match packed.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(packed_arr.iter().copied().collect()),
+    };
+
+    let (grm_vec, row_sum_vec, varsum_ret) = py
+        .detach(move || -> Result<(Vec<f64>, Vec<f64>, f64), String> {
+            let progress = move |done: usize, total: usize| -> Result<(), String> {
+                if let Some(cb) = progress_callback.as_ref() {
+                    Python::attach(|py2| -> PyResult<()> {
+                        py2.check_signals()?;
+                        cb.call1(py2, (done, total))?;
+                        Ok(())
+                    })
+                    .map_err(|e| e.to_string())?;
+                } else {
+                    Python::attach(|py2| py2.check_signals()).map_err(|e| e.to_string())?;
+                }
+                Ok(())
+            };
+            grm_packed_f64_core_impl(
+                packed_flat.as_ref(),
+                n_samples,
+                row_flip_vec.as_ref(),
+                row_maf_vec.as_ref(),
+                sample_idx.as_slice(),
+                method,
+                block_cols,
+                threads,
+                progress_every,
+                Some(progress),
+            )
+        })
+        .map_err(map_err_string_to_py)?;
+
+    let grm_arr = PyArray2::from_owned_array(
+        py,
+        Array2::from_shape_vec((n, n), grm_vec)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+    )
+    .into_bound();
+    let row_sum_arr = PyArray1::from_owned_array(py, Array1::from_vec(row_sum_vec)).into_bound();
+    Ok((grm_arr, row_sum_arr, varsum_ret))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn grm_packed_f32_core_no_progress(
+    packed_flat: &[u8],
+    n_samples: usize,
+    row_flip_vec: &[bool],
+    row_maf_vec: &[f32],
+    sample_idx: &[usize],
+    method: usize,
+    block_cols: usize,
+    threads: usize,
+) -> Result<(Vec<f32>, Vec<f64>, f64), String> {
+    let progress: Option<fn(usize, usize) -> Result<(), String>> = None;
+    grm_packed_f32_core_impl(
+        packed_flat,
+        n_samples,
+        row_flip_vec,
+        row_maf_vec,
+        sample_idx,
+        method,
+        block_cols,
+        threads,
+        0,
+        progress,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn grm_packed_f64_core_no_progress(
+    packed_flat: &[u8],
+    n_samples: usize,
+    row_flip_vec: &[bool],
+    row_maf_vec: &[f32],
+    sample_idx: &[usize],
+    method: usize,
+    block_cols: usize,
+    threads: usize,
+) -> Result<(Vec<f64>, Vec<f64>, f64), String> {
+    let progress: Option<fn(usize, usize) -> Result<(), String>> = None;
+    grm_packed_f64_core_impl(
+        packed_flat,
+        n_samples,
+        row_flip_vec,
+        row_maf_vec,
+        sample_idx,
+        method,
+        block_cols,
+        threads,
+        0,
+        progress,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn grm_packed_f64_from_stats_rust(
+    packed_flat: &[u8],
+    bytes_per_snp: usize,
+    n_samples: usize,
+    row_flip: &[bool],
+    row_maf: &[f32],
+    sample_indices: &[usize],
+    method: usize,
+    block_cols: usize,
+    threads: usize,
+) -> Result<(Vec<f64>, f64), String> {
+    let expected_bps = n_samples.div_ceil(4);
+    if bytes_per_snp != expected_bps {
+        return Err(format!(
+            "bytes_per_snp mismatch: got {bytes_per_snp}, expected {expected_bps}"
+        ));
+    }
+    let (grm, _row_sum, varsum) = grm_packed_f64_core_no_progress(
+        packed_flat,
+        n_samples,
+        row_flip,
+        row_maf,
+        sample_indices,
+        method,
+        block_cols,
+        effective_threads(threads),
+    )?;
+    Ok((grm, varsum))
 }
 
 #[inline]
@@ -811,30 +1115,16 @@ fn decode_grm_stream_block_dispatch_f64(
         )
     } else {
         decode_grm_stream_block_into_f64(
-            it,
-            out_block,
-            row_step,
-            n_samples,
-            method,
-            maf_thr,
-            miss_thr,
-            eps,
+            it, out_block, row_step, n_samples, method, maf_thr, miss_thr, eps,
         )
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum GrmAccumMode {
+pub(crate) enum GrmAccumMode {
     Auto,
     Syrk,
     Gemm,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct GrmStreamRowPrepared {
-    mean_g: f32,
-    std_scale: f32,
-    flip_major: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -842,14 +1132,6 @@ struct GrmStreamRowPreparedF64 {
     mean_g: f64,
     std_scale: f64,
     flip_major: bool,
-}
-
-#[derive(Debug)]
-struct GrmStreamPreStats {
-    keep_indices: Vec<usize>,
-    prepared_rows: Vec<GrmStreamRowPrepared>,
-    eff_m: usize,
-    varsum: f64,
 }
 
 #[derive(Debug)]
@@ -892,78 +1174,6 @@ fn grm_accum_mode_name(mode: GrmAccumMode) -> &'static str {
         GrmAccumMode::Auto => "auto",
         GrmAccumMode::Syrk => "syrk",
         GrmAccumMode::Gemm => "gemm",
-    }
-}
-
-#[inline]
-fn grm_stream_row_prepare_from_stats(
-    method: usize,
-    maf_thr: f32,
-    miss_thr: f32,
-    eps: f64,
-    n_samples: usize,
-    mut alt_sum: f64,
-    non_missing: usize,
-) -> Option<(GrmStreamRowPrepared, f64)> {
-    if n_samples == 0 {
-        return None;
-    }
-    let missing_rate = 1.0_f64 - (non_missing as f64 / n_samples as f64);
-    if missing_rate > miss_thr as f64 {
-        return None;
-    }
-    if non_missing == 0 {
-        if maf_thr > 0.0_f32 {
-            return None;
-        }
-        let prep = GrmStreamRowPrepared {
-            mean_g: 0.0_f32,
-            std_scale: if method == 2 { 0.0_f32 } else { 1.0_f32 },
-            flip_major: false,
-        };
-        return Some((prep, 0.0_f64));
-    }
-
-    let mut alt_freq = alt_sum / (2.0_f64 * non_missing as f64);
-    let flip_major = alt_freq > 0.5_f64;
-    if flip_major {
-        alt_sum = 2.0_f64 * non_missing as f64 - alt_sum;
-        alt_freq = alt_sum / (2.0_f64 * non_missing as f64);
-    }
-    let maf = alt_freq.min(1.0_f64 - alt_freq);
-    if maf < maf_thr as f64 {
-        return None;
-    }
-
-    let mean_g = (alt_sum / non_missing as f64) as f32;
-    let var = (2.0_f64 * alt_freq * (1.0_f64 - alt_freq)).max(0.0_f64);
-    let std_scale = if method == 2 {
-        if var > eps {
-            (1.0_f64 / var.sqrt()) as f32
-        } else {
-            0.0_f32
-        }
-    } else {
-        1.0_f32
-    };
-
-    let prep = GrmStreamRowPrepared {
-        mean_g,
-        std_scale,
-        flip_major,
-    };
-    Some((prep, var))
-}
-
-#[inline]
-fn apply_grm_stream_prepared_row_inplace(row: &mut [f32], prep: GrmStreamRowPrepared) {
-    for g in row.iter_mut() {
-        if *g < 0.0_f32 {
-            *g = 0.0_f32;
-            continue;
-        }
-        let gv = if prep.flip_major { 2.0_f32 - *g } else { *g };
-        *g = (gv - prep.mean_g) * prep.std_scale;
     }
 }
 
@@ -1048,71 +1258,6 @@ fn apply_grm_stream_prepared_row_copy_f64(
 }
 
 #[inline]
-fn decode_grm_stream_block_prepared_into(
-    it: &BedSnpIter,
-    out_block: &mut [f32],
-    row_step: usize,
-    n_samples: usize,
-    keep_indices: &[usize],
-    prepared_rows: &[GrmStreamRowPrepared],
-    prepared_cursor: &mut usize,
-    raw_scanned_cursor: &mut usize,
-    n_total: usize,
-    parallel_decode: bool,
-    pool: Option<&Arc<rayon::ThreadPool>>,
-) -> (usize, usize, bool) {
-    let remain = keep_indices.len().saturating_sub(*prepared_cursor);
-    if remain == 0 {
-        let scanned_add = n_total.saturating_sub(*raw_scanned_cursor);
-        *raw_scanned_cursor = n_total;
-        return (0, scanned_add, true);
-    }
-
-    let rows = remain.min(row_step);
-    let start = *prepared_cursor;
-    let end = start + rows;
-    let idx_slice = &keep_indices[start..end];
-    let prep_slice = &prepared_rows[start..end];
-    let out_slice = &mut out_block[..rows * n_samples];
-    let mut run = || {
-        out_slice
-            .par_chunks_mut(n_samples)
-            .zip(idx_slice.par_iter())
-            .zip(prep_slice.par_iter())
-            .for_each(|((dst, &snp_idx), &prep)| {
-                it.decode_snp_raw_into_with_stats_at(snp_idx, dst)
-                    .expect("pre-stat keep index out of BED range");
-                apply_grm_stream_prepared_row_inplace(dst, prep);
-            });
-    };
-    if parallel_decode {
-        if let Some(tp) = pool {
-            tp.install(&mut run);
-        } else {
-            run();
-        }
-    } else {
-        for off in 0..rows {
-            let snp_idx = idx_slice[off];
-            let prep = prep_slice[off];
-            let dst = &mut out_slice[off * n_samples..(off + 1) * n_samples];
-            it.decode_snp_raw_into_with_stats_at(snp_idx, dst)
-                .expect("pre-stat keep index out of BED range");
-            apply_grm_stream_prepared_row_inplace(dst, prep);
-        }
-    }
-    *prepared_cursor = end;
-    let reached_eof = end >= keep_indices.len();
-    let mut raw_target = keep_indices[end - 1].saturating_add(1).min(n_total);
-    if reached_eof {
-        raw_target = n_total;
-    }
-    let scanned_add = raw_target.saturating_sub(*raw_scanned_cursor);
-    *raw_scanned_cursor = raw_target;
-    (rows, scanned_add, reached_eof)
-}
-
-#[inline]
 fn decode_grm_stream_block_prepared_into_f64(
     it: &BedSnpIter,
     out_block: &mut [f64],
@@ -1145,11 +1290,14 @@ fn decode_grm_stream_block_prepared_into_f64(
                 .par_chunks_mut(n_samples)
                 .zip(idx_slice.par_iter())
                 .zip(prep_slice.par_iter())
-                .for_each_init(|| vec![0.0_f32; n_samples], |raw_row, ((dst, &snp_idx), &prep)| {
-                    it.decode_snp_raw_into_with_stats_at(snp_idx, raw_row.as_mut_slice())
-                        .expect("pre-stat keep index out of BED range");
-                    apply_grm_stream_prepared_row_copy_f64(raw_row.as_slice(), dst, prep);
-                });
+                .for_each_init(
+                    || vec![0.0_f32; n_samples],
+                    |raw_row, ((dst, &snp_idx), &prep)| {
+                        it.decode_snp_raw_into_with_stats_at(snp_idx, raw_row.as_mut_slice())
+                            .expect("pre-stat keep index out of BED range");
+                        apply_grm_stream_prepared_row_copy_f64(raw_row.as_slice(), dst, prep);
+                    },
+                );
         };
         if let Some(tp) = pool {
             tp.install(&mut run);
@@ -1319,75 +1467,6 @@ fn write_npy_f64_matrix(path: &str, data: &[f64], rows: usize, cols: usize) -> R
     w.flush()
         .map_err(|e| format!("flush npy file failed: {e}"))?;
     Ok(())
-}
-
-#[inline]
-fn grm_stream_scan_prestats(
-    it: &mut BedSnpIter,
-    n_total: usize,
-    n_samples: usize,
-    method: usize,
-    maf_thr: f32,
-    miss_thr: f32,
-    eps: f64,
-    progress_callback: Option<&Py<PyAny>>,
-    notify_step: usize,
-    last_notified: &mut usize,
-    phase1_cap: usize,
-) -> Result<GrmStreamPreStats, String> {
-    let mut keep_indices: Vec<usize> = Vec::new();
-    let mut prepared_rows: Vec<GrmStreamRowPrepared> = Vec::new();
-    let mut eff_m = 0usize;
-    let mut varsum = 0.0_f64;
-    let mut scanned = 0usize;
-
-    while let Some((snp_idx, alt_sum, non_missing)) = it.next_snp_stats_only() {
-        scanned = scanned.saturating_add(1);
-        if (scanned & 0x3FFF) == 0 {
-            check_ctrlc()?;
-        }
-        let done_mapped = grm_progress_map_ratio(scanned, n_total, phase1_cap);
-        grm_progress_notify(
-            progress_callback,
-            done_mapped,
-            n_total,
-            notify_step,
-            last_notified,
-            false,
-        )?;
-        if let Some((prep, var)) = grm_stream_row_prepare_from_stats(
-            method,
-            maf_thr,
-            miss_thr,
-            eps,
-            n_samples,
-            alt_sum,
-            non_missing,
-        ) {
-            keep_indices.push(snp_idx);
-            prepared_rows.push(prep);
-            eff_m = eff_m.saturating_add(1);
-            if method == 1 {
-                varsum += var;
-            }
-        }
-    }
-    // Pre-stat is phase-1; keep headroom for compute/finalize stages.
-    grm_progress_notify(
-        progress_callback,
-        phase1_cap,
-        n_total,
-        notify_step,
-        last_notified,
-        true,
-    )?;
-
-    Ok(GrmStreamPreStats {
-        keep_indices,
-        prepared_rows,
-        eff_m,
-        varsum,
-    })
 }
 
 #[inline]
@@ -2051,7 +2130,7 @@ unsafe fn grm_rankk_update_cblas_raw_gemm(
 }
 
 #[inline]
-fn grm_rankk_update_raw(
+pub(crate) fn grm_rankk_update_raw(
     grm_ptr: *mut f32,
     block: &[f32],
     cur_rows: usize,
@@ -2222,7 +2301,7 @@ unsafe fn grm_rankk_update_cblas_raw_gemm_f64(
 }
 
 #[inline]
-fn grm_rankk_update_raw_f64(
+pub(crate) fn grm_rankk_update_raw_f64(
     grm_ptr: *mut f64,
     block: &[f64],
     cur_rows: usize,

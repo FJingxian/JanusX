@@ -2658,40 +2658,95 @@ fn build_logic_units(
     }
 }
 
-fn packed_row_genotype(row: &[u8], sample_idx: usize) -> Option<u8> {
-    let byte = row[sample_idx >> 2];
-    let code = (byte >> ((sample_idx & 3) * 2)) & 0b11;
-    match code {
-        0b00 => Some(0u8),
-        0b10 => Some(1u8),
-        0b11 => Some(2u8),
-        _ => None,
+struct LogicSamplePlanEntry {
+    src_byte_idx: usize,
+    src_shifts: [u8; 4],
+    dst_word_idx: [usize; 4],
+    dst_bit: [u64; 4],
+    n_lanes: u8,
+}
+
+fn build_logic_sample_plan(sample_indices: &[usize]) -> Vec<LogicSamplePlanEntry> {
+    let mut lanes = sample_indices
+        .iter()
+        .enumerate()
+        .map(|(dst_idx, &src_idx)| {
+            (
+                src_idx >> 2,
+                ((src_idx & 3) * 2) as u8,
+                dst_idx >> 6,
+                1u64 << (dst_idx & 63),
+            )
+        })
+        .collect::<Vec<_>>();
+    lanes.sort_unstable_by_key(|&(src_byte_idx, _, _, _)| src_byte_idx);
+
+    let mut plan = Vec::<LogicSamplePlanEntry>::with_capacity(lanes.len().div_ceil(4));
+    let mut cur_src_byte_idx = usize::MAX;
+    let mut cur = LogicSamplePlanEntry {
+        src_byte_idx: 0,
+        src_shifts: [0; 4],
+        dst_word_idx: [0; 4],
+        dst_bit: [0; 4],
+        n_lanes: 0,
+    };
+
+    for (src_byte_idx, src_shift, dst_word_idx, dst_bit) in lanes {
+        if src_byte_idx != cur_src_byte_idx {
+            if cur_src_byte_idx != usize::MAX {
+                plan.push(cur);
+            }
+            cur_src_byte_idx = src_byte_idx;
+            cur = LogicSamplePlanEntry {
+                src_byte_idx,
+                src_shifts: [0; 4],
+                dst_word_idx: [0; 4],
+                dst_bit: [0; 4],
+                n_lanes: 0,
+            };
+        }
+        let lane = cur.n_lanes as usize;
+        cur.src_shifts[lane] = src_shift;
+        cur.dst_word_idx[lane] = dst_word_idx;
+        cur.dst_bit[lane] = dst_bit;
+        cur.n_lanes += 1;
     }
+    if cur_src_byte_idx != usize::MAX {
+        plan.push(cur);
+    }
+    plan
 }
 
 #[inline]
-fn fill_bin_logic_row_bits(row: &[u8], sample_indices: &[usize], dst_words: &mut [u64]) {
+fn fill_bin_logic_row_bits(
+    row: &[u8],
+    sample_plan: &[LogicSamplePlanEntry],
+    dst_words: &mut [u64],
+) {
     let mut c0 = 0usize;
     let mut c2 = 0usize;
-    for &src_s in sample_indices.iter() {
-        match packed_row_genotype(row, src_s) {
-            Some(0) => c0 += 1,
-            Some(2) => c2 += 1,
-            _ => {}
+    for entry in sample_plan.iter() {
+        let byte = row[entry.src_byte_idx];
+        for lane in 0..entry.n_lanes as usize {
+            match (byte >> entry.src_shifts[lane]) & 0b11 {
+                0b00 => c0 += 1,
+                0b11 => c2 += 1,
+                _ => {}
+            }
         }
     }
     let mode02 = if c2 > c0 { 2u8 } else { 0u8 };
-    for (dst_s, &src_s) in sample_indices.iter().enumerate() {
-        let g = packed_row_genotype(row, src_s).unwrap_or(mode02);
-        let is_one = if g == 0 {
-            false
-        } else if g == 2 {
-            true
-        } else {
-            mode02 == 2
-        };
-        if is_one {
-            dst_words[dst_s >> 6] |= 1u64 << (dst_s & 63);
+    for entry in sample_plan.iter() {
+        let byte = row[entry.src_byte_idx];
+        for lane in 0..entry.n_lanes as usize {
+            let is_one = match (byte >> entry.src_shifts[lane]) & 0b11 {
+                0b00 => false,
+                0b11 => true,
+                _ => mode02 == 2,
+            };
+            if is_one {
+                dst_words[entry.dst_word_idx[lane]] |= entry.dst_bit[lane];
+            }
         }
     }
 }
@@ -2699,19 +2754,22 @@ fn fill_bin_logic_row_bits(row: &[u8], sample_indices: &[usize], dst_words: &mut
 #[inline]
 fn fill_mbin_logic_row_bits(
     row: &[u8],
-    sample_indices: &[usize],
+    sample_plan: &[LogicSamplePlanEntry],
     row_words: usize,
     dst_words: &mut [u64],
 ) {
     let mut c0 = 0usize;
     let mut c1 = 0usize;
     let mut c2 = 0usize;
-    for &src_s in sample_indices.iter() {
-        match packed_row_genotype(row, src_s) {
-            Some(0) => c0 += 1,
-            Some(1) => c1 += 1,
-            Some(2) => c2 += 1,
-            _ => {}
+    for entry in sample_plan.iter() {
+        let byte = row[entry.src_byte_idx];
+        for lane in 0..entry.n_lanes as usize {
+            match (byte >> entry.src_shifts[lane]) & 0b11 {
+                0b00 => c0 += 1,
+                0b10 => c1 += 1,
+                0b11 => c2 += 1,
+                _ => {}
+            }
         }
     }
     let mode3 = if c2 >= c1 && c2 >= c0 {
@@ -2723,18 +2781,24 @@ fn fill_mbin_logic_row_bits(
     };
     let (dom_bits, rem) = dst_words.split_at_mut(row_words);
     let (rec_bits, het_bits) = rem.split_at_mut(row_words);
-    for (dst_s, &src_s) in sample_indices.iter().enumerate() {
-        let g = packed_row_genotype(row, src_s).unwrap_or(mode3);
-        let word_idx = dst_s >> 6;
-        let bit = 1u64 << (dst_s & 63);
-        if g > 0 {
-            dom_bits[word_idx] |= bit;
-        }
-        if g == 2 {
-            rec_bits[word_idx] |= bit;
-        }
-        if g == 1 {
-            het_bits[word_idx] |= bit;
+    for entry in sample_plan.iter() {
+        let byte = row[entry.src_byte_idx];
+        for lane in 0..entry.n_lanes as usize {
+            let g = match (byte >> entry.src_shifts[lane]) & 0b11 {
+                0b00 => 0u8,
+                0b10 => 1u8,
+                0b11 => 2u8,
+                _ => mode3,
+            };
+            if g > 0 {
+                dom_bits[entry.dst_word_idx[lane]] |= entry.dst_bit[lane];
+            }
+            if g == 2 {
+                rec_bits[entry.dst_word_idx[lane]] |= entry.dst_bit[lane];
+            }
+            if g == 1 {
+                het_bits[entry.dst_word_idx[lane]] |= entry.dst_bit[lane];
+            }
         }
     }
 }
@@ -2776,81 +2840,35 @@ fn convert_prepared_bed_to_logic_bits(
 
     let n_samples = sample_indices.len();
     let row_words = words_for_samples(n_samples);
+    let sample_plan = build_logic_sample_plan(sample_indices);
     let row_mul = match mode {
         GarfieldBinMode::Bin => 1usize,
         GarfieldBinMode::Mbin => 3usize,
     };
     let n_rows = sites.len().saturating_mul(row_mul);
     let mut bits_flat = vec![0u64; n_rows.saturating_mul(row_words)];
-    let mut out_sites = Vec::<SiteInfo>::with_capacity(n_rows);
+    bits_flat
+        .par_chunks_mut(row_mul * row_words)
+        .zip(packed.par_chunks(bytes_per_snp))
+        .for_each(|(dst_rows, row)| match mode {
+            GarfieldBinMode::Bin => fill_bin_logic_row_bits(row, sample_plan.as_slice(), dst_rows),
+            GarfieldBinMode::Mbin => {
+                fill_mbin_logic_row_bits(row, sample_plan.as_slice(), row_words, dst_rows)
+            }
+        });
 
-    for (src_row, site) in sites.iter().enumerate() {
-        let row = &packed[src_row * bytes_per_snp..(src_row + 1) * bytes_per_snp];
-        match mode {
-            GarfieldBinMode::Bin => {
-                let mut c0 = 0usize;
-                let mut c2 = 0usize;
-                for &src_s in sample_indices.iter() {
-                    match packed_row_genotype(row, src_s) {
-                        Some(0) => c0 += 1,
-                        Some(2) => c2 += 1,
-                        _ => {}
-                    }
-                }
-                let mode02 = if c2 > c0 { 2u8 } else { 0u8 };
-                let dst_row = src_row;
-                for (dst_s, &src_s) in sample_indices.iter().enumerate() {
-                    let g = packed_row_genotype(row, src_s).unwrap_or(mode02);
-                    let is_one = if g == 0 {
-                        false
-                    } else if g == 2 {
-                        true
-                    } else {
-                        mode02 == 2
-                    };
-                    if is_one {
-                        bits_flat[dst_row * row_words + (dst_s >> 6)] |= 1u64 << (dst_s & 63);
-                    }
-                }
+    let mut out_sites = Vec::<SiteInfo>::with_capacity(n_rows);
+    match mode {
+        GarfieldBinMode::Bin => {
+            for site in sites.iter() {
                 let mut site_bin = site.clone();
                 site_bin.alt_allele = format!("{}|BIN", site_bin.alt_allele);
                 out_sites.push(site_bin);
             }
-            GarfieldBinMode::Mbin => {
-                let mut c0 = 0usize;
-                let mut c1 = 0usize;
-                let mut c2 = 0usize;
-                for &src_s in sample_indices.iter() {
-                    match packed_row_genotype(row, src_s) {
-                        Some(0) => c0 += 1,
-                        Some(1) => c1 += 1,
-                        Some(2) => c2 += 1,
-                        _ => {}
-                    }
-                }
-                let mode3 = if c2 >= c1 && c2 >= c0 {
-                    2u8
-                } else if c1 >= c0 {
-                    1u8
-                } else {
-                    0u8
-                };
-                let base = src_row * 3;
+        }
+        GarfieldBinMode::Mbin => {
+            for site in sites.iter() {
                 let [dom_site, rec_site, het_site] = mbin_site_variants(site);
-                for (dst_s, &src_s) in sample_indices.iter().enumerate() {
-                    let g = packed_row_genotype(row, src_s).unwrap_or(mode3);
-                    let word_idx = dst_s >> 6;
-                    let bit = 1u64 << (dst_s & 63);
-                    if g > 0 {
-                        bits_flat[base * row_words + word_idx] |= bit;
-                    }
-                    if g == 2 {
-                        bits_flat[(base + 1) * row_words + word_idx] |= bit;
-                    }
-                    if g == 1 {
-                        bits_flat[(base + 2) * row_words + word_idx] |= bit;
-                    }
-                }
                 out_sites.push(dom_site);
                 out_sites.push(rec_site);
                 out_sites.push(het_site);
@@ -2934,6 +2952,7 @@ fn convert_bed_prefix_to_logic_bits(
     let packed_full = &mmap[3..];
     let n_samples = sample_indices.len();
     let row_words = words_for_samples(n_samples);
+    let sample_plan = build_logic_sample_plan(sample_indices);
     let row_mul = match mode {
         GarfieldBinMode::Bin => 1usize,
         GarfieldBinMode::Mbin => 3usize,
@@ -2962,9 +2981,11 @@ fn convert_bed_prefix_to_logic_bits(
             let src_row = keep_src_rows[kept_idx];
             let row = &packed_full[src_row * bytes_per_snp..(src_row + 1) * bytes_per_snp];
             match mode {
-                GarfieldBinMode::Bin => fill_bin_logic_row_bits(row, sample_indices, dst_rows),
+                GarfieldBinMode::Bin => {
+                    fill_bin_logic_row_bits(row, sample_plan.as_slice(), dst_rows)
+                }
                 GarfieldBinMode::Mbin => {
-                    fill_mbin_logic_row_bits(row, sample_indices, row_words, dst_rows)
+                    fill_mbin_logic_row_bits(row, sample_plan.as_slice(), row_words, dst_rows)
                 }
             }
         });
@@ -3844,19 +3865,36 @@ fn garfield_logic_search_bed_owned(
     };
 
     let mode = parse_bin_mode(&bin_mode)?;
-    drop(packed_for_grm.take());
     drop(maf_for_grm.take());
     drop(row_flip_for_grm.take());
-    let logic_bits = convert_bed_prefix_to_logic_bits(
-        &prefix,
-        bytes_per_snp,
-        n_samples_total,
-        site_keep.as_slice(),
-        filtered_sites.as_slice(),
-        selected_sample_indices.as_slice(),
-        selected_sample_ids.as_slice(),
-        mode,
-    )?;
+    let logic_bits = if using_external_grm {
+        drop(packed_for_grm.take());
+        convert_bed_prefix_to_logic_bits(
+            &prefix,
+            bytes_per_snp,
+            n_samples_total,
+            site_keep.as_slice(),
+            filtered_sites.as_slice(),
+            selected_sample_indices.as_slice(),
+            selected_sample_ids.as_slice(),
+            mode,
+        )?
+    } else {
+        let packed = packed_for_grm
+            .as_ref()
+            .ok_or_else(|| "internal error: packed BED missing for logic conversion".to_string())?;
+        let out = convert_prepared_bed_to_logic_bits(
+            packed.as_slice(),
+            bytes_per_snp,
+            n_samples_total,
+            filtered_sites.as_slice(),
+            selected_sample_indices.as_slice(),
+            selected_sample_ids.as_slice(),
+            mode,
+        )?;
+        drop(packed_for_grm.take());
+        out
+    };
     let units = build_logic_units(
         logic_bits.sites.as_slice(),
         &unit_kind,

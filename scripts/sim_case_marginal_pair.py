@@ -25,7 +25,7 @@ DEFAULT_CHUNK_PREFIX = (
 )
 DEFAULT_OUT_DIR = REPO_ROOT / "sim.case"
 DEFAULT_GRM = Path("~/cubic/cubic_All.maf0.02.cGRM.npy").expanduser()
-DEFAULT_GRM_ID = Path("~/cubic/cubic_All.maf0.02.cGRM.npy.id").expanduser()
+DEFAULT_GRM_ID = None
 DEFAULT_SITE_STATS = None
 DEFAULT_LDSC_WINDOW = "100kb"
 
@@ -202,6 +202,44 @@ def _load_grm_matrix(path: Path) -> np.ndarray:
     if not np.all(np.isfinite(arr)):
         raise ValueError(f"GRM contains non-finite values: {path}")
     return arr
+
+
+def _candidate_grm_id_paths(grm_path: Path, explicit: Path | None) -> list[Path]:
+    candidates: list[Path] = []
+    if explicit is not None:
+        candidates.append(explicit)
+    candidates.append(Path(f"{grm_path}.id"))
+    if grm_path.suffix:
+        candidates.append(grm_path.with_suffix(".id"))
+    out: list[Path] = []
+    seen: set[str] = set()
+    for path in candidates:
+        resolved = path.expanduser()
+        key = str(resolved)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(resolved)
+    return out
+
+
+def _resolve_grm_id_path(grm_path: Path, explicit: Path | None) -> Path:
+    candidates = _candidate_grm_id_paths(grm_path, explicit)
+    if explicit is not None:
+        if explicit.is_file():
+            return explicit.resolve()
+        tried = ", ".join(str(p) for p in candidates)
+        raise FileNotFoundError(
+            f"Requested GRM ID file not found: {explicit}. Tried: {tried}"
+        )
+    for path in candidates:
+        if path.is_file():
+            return path.resolve()
+    tried = ", ".join(str(p) for p in candidates)
+    raise FileNotFoundError(
+        f"Could not locate a GRM ID file for {grm_path}. Tried: {tried}. "
+        "Pass --grm-id explicitly if your ID file uses a different name."
+    )
 
 
 def _read_grm_ids(path: Path) -> list[str]:
@@ -619,7 +657,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--out-dir", default=str(DEFAULT_OUT_DIR), help="Output directory.")
     p.add_argument("--prefix", default=None, help="Output prefix stem.")
     p.add_argument("--grm", default=str(DEFAULT_GRM), help="External GRM .npy path.")
-    p.add_argument("--grm-id", default=str(DEFAULT_GRM_ID), help="External GRM ID file.")
+    p.add_argument(
+        "--grm-id",
+        default=DEFAULT_GRM_ID,
+        help="Optional external GRM ID file. Defaults to <grm>.id when omitted.",
+    )
     p.add_argument(
         "--ldsc-window",
         default=DEFAULT_LDSC_WINDOW,
@@ -767,7 +809,10 @@ def main() -> int:
     pseudo = ((b1 > 0.0) & (b2 > 0.0)).astype(np.float64)
 
     grm_path = Path(args.grm).expanduser().resolve()
-    grm_id_path = Path(args.grm_id).expanduser().resolve()
+    grm_id_path = _resolve_grm_id_path(
+        grm_path,
+        Path(args.grm_id).expanduser() if args.grm_id else None,
+    )
     grm = _load_and_align_grm(grm_path, grm_id_path, fam_ids)
     repaired_grm, grm_repair = _repair_grm_to_psd(grm)
     psd_prefix = (

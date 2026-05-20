@@ -1458,68 +1458,6 @@ fn bed_code_to_dosage(code: u8) -> f32 {
     }
 }
 
-#[inline]
-fn prepare_grm_decoded_row_inplace(
-    row: &mut [f32],
-    method: usize,
-    maf_thr: f32,
-    miss_thr: f32,
-    eps: f64,
-    mut alt_sum: f64,
-    non_missing: usize,
-) -> Option<f64> {
-    let n = row.len();
-    if n == 0 {
-        return None;
-    }
-    let missing_rate = 1.0_f64 - (non_missing as f64 / n as f64);
-    if missing_rate > miss_thr as f64 {
-        return None;
-    }
-
-    if non_missing == 0 {
-        if maf_thr > 0.0_f32 {
-            return None;
-        }
-        row.fill(0.0_f32);
-        return Some(0.0_f64);
-    }
-
-    let mut alt_freq = alt_sum / (2.0_f64 * non_missing as f64);
-    let flip_major = alt_freq > 0.5_f64;
-    if flip_major {
-        alt_sum = 2.0_f64 * non_missing as f64 - alt_sum;
-        alt_freq = alt_sum / (2.0_f64 * non_missing as f64);
-    }
-
-    let maf = alt_freq.min(1.0_f64 - alt_freq);
-    if maf < maf_thr as f64 {
-        return None;
-    }
-
-    let mean_g = (alt_sum / non_missing as f64) as f32;
-    let var = (2.0_f64 * alt_freq * (1.0_f64 - alt_freq)).max(0.0_f64);
-    let std_scale = if method == 2 {
-        if var > eps {
-            (1.0_f64 / var.sqrt()) as f32
-        } else {
-            0.0_f32
-        }
-    } else {
-        1.0_f32
-    };
-
-    for g in row.iter_mut() {
-        if *g < 0.0_f32 {
-            *g = 0.0_f32;
-            continue;
-        }
-        let gv = if flip_major { 2.0_f32 - *g } else { *g };
-        *g = (gv - mean_g) * std_scale;
-    }
-    Some(var)
-}
-
 impl BedSnpIter {
     #[inline]
     fn open_bed_and_infer_shape(
@@ -2035,37 +1973,6 @@ impl BedSnpIter {
             return Some((snp_idx, alt_sum, non_missing));
         }
         None
-    }
-
-    /// Decode + QC/filter + centering/standardization for GRM streaming.
-    /// Returns (raw_scanned_snp_count, row_var_if_kept, reached_eof).
-    pub fn next_snp_grm_row_into(
-        &mut self,
-        out: &mut [f32],
-        method: usize,
-        maf_thr: f32,
-        miss_thr: f32,
-        eps: f64,
-    ) -> (usize, Option<f64>, bool) {
-        let mut scanned = 0usize;
-        loop {
-            let Some((_snp_idx, alt_sum, non_missing)) = self.next_snp_raw_into_with_stats(out)
-            else {
-                return (scanned, None, true);
-            };
-            scanned = scanned.saturating_add(1);
-            if let Some(var) = prepare_grm_decoded_row_inplace(
-                out,
-                method,
-                maf_thr,
-                miss_thr,
-                eps,
-                alt_sum,
-                non_missing,
-            ) {
-                return (scanned, Some(var), false);
-            }
-        }
     }
 
     pub fn next_snp_raw(&mut self) -> Option<(Vec<f32>, SiteInfo)> {

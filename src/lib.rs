@@ -18,6 +18,9 @@ mod garfield;
 mod glm;
 #[path = "stats/grm.rs"]
 mod grm;
+#[doc(hidden)]
+#[path = "grm_bench_support.rs"]
+pub mod grm_bench_support;
 #[path = "stats/gs_native.rs"]
 pub(crate) mod gs_native;
 #[path = "stats/gstats.rs"]

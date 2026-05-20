@@ -4071,21 +4071,30 @@ pub(crate) fn load_bed_2bit_packed_subset_owned(
     let mut std_keep = vec![0.0_f32; kept_n];
     let mut row_flip_keep = vec![false; kept_n];
 
-    for (dst_row, &src_row) in keep_idx.iter().enumerate() {
-        let src_off = src_row * bytes_per_snp;
-        let dst_off = dst_row * bytes_per_snp;
-        let row = &packed_src[src_off..src_off + bytes_per_snp];
-        packed_keep[dst_off..dst_off + bytes_per_snp].copy_from_slice(row);
+    packed_keep
+        .par_chunks_mut(bytes_per_snp)
+        .zip(miss_keep.par_iter_mut())
+        .zip(maf_keep.par_iter_mut())
+        .zip(std_keep.par_iter_mut())
+        .zip(row_flip_keep.par_iter_mut())
+        .zip(keep_idx.par_iter())
+        .for_each(
+            |(((((dst_row, miss_v), maf_v), std_v), row_flip_v), &src_row)| {
+                let src_off = src_row * bytes_per_snp;
+                let row = &packed_src[src_off..src_off + bytes_per_snp];
+                dst_row.copy_from_slice(row);
 
-        let (missing, het, hom_alt) = count_packed_row_counts(row, n_samples);
-        let non_missing = n_samples.saturating_sub(missing);
-        let alt_sum = het.saturating_add(hom_alt.saturating_mul(2));
-        let (miss_v, maf_v, std_v) = packed_row_stats_from_counts(n_samples, non_missing, alt_sum);
-        miss_keep[dst_row] = miss_v;
-        maf_keep[dst_row] = maf_v.clamp(0.0, 0.5);
-        std_keep[dst_row] = std_v;
-        row_flip_keep[dst_row] = non_missing > 0 && alt_sum > non_missing;
-    }
+                let (missing, het, hom_alt) = count_packed_row_counts(row, n_samples);
+                let non_missing = n_samples.saturating_sub(missing);
+                let alt_sum = het.saturating_add(hom_alt.saturating_mul(2));
+                let (miss, maf, std) =
+                    packed_row_stats_from_counts(n_samples, non_missing, alt_sum);
+                *miss_v = miss;
+                *maf_v = maf.clamp(0.0, 0.5);
+                *std_v = std;
+                *row_flip_v = non_missing > 0 && alt_sum > non_missing;
+            },
+        );
 
     emit_gfreader_rss_debug(
         "load_bed_2bit_packed_subset_owned/subset_copy_done",

@@ -20,8 +20,8 @@ use crate::bedmath::{
     is_identity_indices, packed_byte_lut,
 };
 use crate::blas::{
-    cblas_dsyrk_dispatch, cblas_sgemm_dispatch, cblas_ssyrk_dispatch, CblasInt,
-    OpenBlasThreadGuard, CBLAS_COL_MAJOR, CBLAS_NO_TRANS, CBLAS_TRANS, CBLAS_UPPER,
+    cblas_dgemm_dispatch, cblas_dsyrk_dispatch, cblas_sgemm_dispatch, cblas_ssyrk_dispatch,
+    CblasInt, OpenBlasThreadGuard, CBLAS_COL_MAJOR, CBLAS_NO_TRANS, CBLAS_TRANS, CBLAS_UPPER,
 };
 use crate::gfcore::BedSnpIter;
 use crate::stats_common::{
@@ -624,6 +624,205 @@ fn decode_grm_stream_block_dispatch(
     }
 }
 
+#[inline]
+fn decode_grm_stream_block_into_f64(
+    it: &mut BedSnpIter,
+    out_block: &mut [f64],
+    row_step: usize,
+    n_samples: usize,
+    method: usize,
+    maf_thr: f32,
+    miss_thr: f32,
+    eps: f64,
+) -> (usize, usize, f64, bool) {
+    let mut cur_rows = 0usize;
+    let mut scanned_add = 0usize;
+    let mut varsum_add = 0.0_f64;
+    let mut reached_eof = false;
+    let mut raw_row = vec![0.0_f32; n_samples];
+    while cur_rows < row_step {
+        let Some((_snp_idx, alt_sum, non_missing)) =
+            it.next_snp_raw_into_with_stats(raw_row.as_mut_slice())
+        else {
+            reached_eof = true;
+            break;
+        };
+        scanned_add = scanned_add.saturating_add(1);
+        let Some((prep, var)) = grm_stream_row_prepare_from_stats_f64(
+            method,
+            maf_thr,
+            miss_thr,
+            eps,
+            n_samples,
+            alt_sum,
+            non_missing,
+        ) else {
+            continue;
+        };
+        let dst = &mut out_block[cur_rows * n_samples..(cur_rows + 1) * n_samples];
+        apply_grm_stream_prepared_row_copy_f64(raw_row.as_slice(), dst, prep);
+        if method == 1 {
+            varsum_add += var;
+        }
+        cur_rows += 1;
+    }
+    (cur_rows, scanned_add, varsum_add, reached_eof)
+}
+
+#[inline]
+fn decode_grm_stream_block_parallel_into_f64(
+    it: &mut BedSnpIter,
+    out_block: &mut [f64],
+    row_step: usize,
+    n_samples: usize,
+    method: usize,
+    maf_thr: f32,
+    miss_thr: f32,
+    eps: f64,
+    decode_batch_snps: usize,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) -> (usize, usize, f64, bool) {
+    let mut cur_rows = 0usize;
+    let mut scanned_add = 0usize;
+    let mut varsum_add = 0.0_f64;
+    let mut reached_eof = false;
+    let n_total = it.n_snps();
+    let batch_cap = decode_batch_snps.max(1);
+    let mut keep_flags = vec![0_u8; batch_cap];
+    let mut vars = vec![0.0_f64; batch_cap];
+    let mut preps = vec![
+        GrmStreamRowPreparedF64 {
+            mean_g: 0.0_f64,
+            std_scale: 1.0_f64,
+            flip_major: false,
+        };
+        batch_cap
+    ];
+    let mut raw_batch = vec![0.0_f32; batch_cap * n_samples];
+
+    while cur_rows < row_step {
+        let base = it.cursor();
+        if base >= n_total {
+            reached_eof = true;
+            break;
+        }
+        let need_rows = row_step - cur_rows;
+        let scan_rows = (n_total - base).min(batch_cap).min(need_rows);
+        if scan_rows == 0 {
+            reached_eof = true;
+            break;
+        }
+
+        keep_flags[..scan_rows].fill(0);
+        vars[..scan_rows].fill(0.0_f64);
+        let raw_slice = &mut raw_batch[..scan_rows * n_samples];
+
+        let mut run = || {
+            let it_ref: &BedSnpIter = &*it;
+            raw_slice
+                .par_chunks_mut(n_samples)
+                .zip(keep_flags[..scan_rows].par_iter_mut())
+                .zip(vars[..scan_rows].par_iter_mut())
+                .zip(preps[..scan_rows].par_iter_mut())
+                .enumerate()
+                .for_each(|(off, (((row_raw, keep_dst), var_dst), prep_dst))| {
+                    let snp_idx = base + off;
+                    let Some((alt_sum, non_missing)) =
+                        it_ref.decode_snp_raw_into_with_stats_at(snp_idx, row_raw)
+                    else {
+                        return;
+                    };
+                    let Some((prep, var)) = grm_stream_row_prepare_from_stats_f64(
+                        method,
+                        maf_thr,
+                        miss_thr,
+                        eps,
+                        n_samples,
+                        alt_sum,
+                        non_missing,
+                    ) else {
+                        return;
+                    };
+                    *keep_dst = 1;
+                    *var_dst = var;
+                    *prep_dst = prep;
+                });
+        };
+        if let Some(tp) = pool {
+            tp.install(run);
+        } else {
+            run();
+        }
+
+        let mut kept_rows = 0usize;
+        for read in 0..scan_rows {
+            if keep_flags[read] == 0 {
+                continue;
+            }
+            let src0 = read * n_samples;
+            let dst0 = (cur_rows + kept_rows) * n_samples;
+            let src = &raw_slice[src0..src0 + n_samples];
+            let dst = &mut out_block[dst0..dst0 + n_samples];
+            apply_grm_stream_prepared_row_copy_f64(src, dst, preps[read]);
+            if method == 1 {
+                varsum_add += vars[read];
+            }
+            kept_rows += 1;
+        }
+        cur_rows += kept_rows;
+
+        scanned_add = scanned_add.saturating_add(scan_rows);
+        it.set_cursor(base + scan_rows);
+        if base + scan_rows >= n_total {
+            reached_eof = true;
+            break;
+        }
+    }
+
+    (cur_rows, scanned_add, varsum_add, reached_eof)
+}
+
+#[inline]
+fn decode_grm_stream_block_dispatch_f64(
+    it: &mut BedSnpIter,
+    out_block: &mut [f64],
+    row_step: usize,
+    n_samples: usize,
+    method: usize,
+    maf_thr: f32,
+    miss_thr: f32,
+    eps: f64,
+    parallel_decode: bool,
+    decode_batch_snps: usize,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) -> (usize, usize, f64, bool) {
+    if parallel_decode {
+        decode_grm_stream_block_parallel_into_f64(
+            it,
+            out_block,
+            row_step,
+            n_samples,
+            method,
+            maf_thr,
+            miss_thr,
+            eps,
+            decode_batch_snps,
+            pool,
+        )
+    } else {
+        decode_grm_stream_block_into_f64(
+            it,
+            out_block,
+            row_step,
+            n_samples,
+            method,
+            maf_thr,
+            miss_thr,
+            eps,
+        )
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GrmAccumMode {
     Auto,
@@ -638,10 +837,25 @@ struct GrmStreamRowPrepared {
     flip_major: bool,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct GrmStreamRowPreparedF64 {
+    mean_g: f64,
+    std_scale: f64,
+    flip_major: bool,
+}
+
 #[derive(Debug)]
 struct GrmStreamPreStats {
     keep_indices: Vec<usize>,
     prepared_rows: Vec<GrmStreamRowPrepared>,
+    eff_m: usize,
+    varsum: f64,
+}
+
+#[derive(Debug)]
+struct GrmStreamPreStatsF64 {
+    keep_indices: Vec<usize>,
+    prepared_rows: Vec<GrmStreamRowPreparedF64>,
     eff_m: usize,
     varsum: f64,
 }
@@ -754,6 +968,86 @@ fn apply_grm_stream_prepared_row_inplace(row: &mut [f32], prep: GrmStreamRowPrep
 }
 
 #[inline]
+fn grm_stream_row_prepare_from_stats_f64(
+    method: usize,
+    maf_thr: f32,
+    miss_thr: f32,
+    eps: f64,
+    n_samples: usize,
+    mut alt_sum: f64,
+    non_missing: usize,
+) -> Option<(GrmStreamRowPreparedF64, f64)> {
+    if n_samples == 0 {
+        return None;
+    }
+    let missing_rate = 1.0_f64 - (non_missing as f64 / n_samples as f64);
+    if missing_rate > miss_thr as f64 {
+        return None;
+    }
+    if non_missing == 0 {
+        if maf_thr > 0.0_f32 {
+            return None;
+        }
+        let prep = GrmStreamRowPreparedF64 {
+            mean_g: 0.0_f64,
+            std_scale: if method == 2 { 0.0_f64 } else { 1.0_f64 },
+            flip_major: false,
+        };
+        return Some((prep, 0.0_f64));
+    }
+
+    let mut alt_freq = alt_sum / (2.0_f64 * non_missing as f64);
+    let flip_major = alt_freq > 0.5_f64;
+    if flip_major {
+        alt_sum = 2.0_f64 * non_missing as f64 - alt_sum;
+        alt_freq = alt_sum / (2.0_f64 * non_missing as f64);
+    }
+    let maf = alt_freq.min(1.0_f64 - alt_freq);
+    if maf < maf_thr as f64 {
+        return None;
+    }
+
+    let mean_g = alt_sum / non_missing as f64;
+    let var = (2.0_f64 * alt_freq * (1.0_f64 - alt_freq)).max(0.0_f64);
+    let std_scale = if method == 2 {
+        if var > eps {
+            1.0_f64 / var.sqrt()
+        } else {
+            0.0_f64
+        }
+    } else {
+        1.0_f64
+    };
+
+    let prep = GrmStreamRowPreparedF64 {
+        mean_g,
+        std_scale,
+        flip_major,
+    };
+    Some((prep, var))
+}
+
+#[inline]
+fn apply_grm_stream_prepared_row_copy_f64(
+    src: &[f32],
+    dst: &mut [f64],
+    prep: GrmStreamRowPreparedF64,
+) {
+    for (g_src, g_dst) in src.iter().zip(dst.iter_mut()) {
+        if *g_src < 0.0_f32 {
+            *g_dst = 0.0_f64;
+            continue;
+        }
+        let gv = if prep.flip_major {
+            2.0_f64 - (*g_src as f64)
+        } else {
+            *g_src as f64
+        };
+        *g_dst = (gv - prep.mean_g) * prep.std_scale;
+    }
+}
+
+#[inline]
 fn decode_grm_stream_block_prepared_into(
     it: &BedSnpIter,
     out_block: &mut [f32],
@@ -805,6 +1099,72 @@ fn decode_grm_stream_block_prepared_into(
             it.decode_snp_raw_into_with_stats_at(snp_idx, dst)
                 .expect("pre-stat keep index out of BED range");
             apply_grm_stream_prepared_row_inplace(dst, prep);
+        }
+    }
+    *prepared_cursor = end;
+    let reached_eof = end >= keep_indices.len();
+    let mut raw_target = keep_indices[end - 1].saturating_add(1).min(n_total);
+    if reached_eof {
+        raw_target = n_total;
+    }
+    let scanned_add = raw_target.saturating_sub(*raw_scanned_cursor);
+    *raw_scanned_cursor = raw_target;
+    (rows, scanned_add, reached_eof)
+}
+
+#[inline]
+fn decode_grm_stream_block_prepared_into_f64(
+    it: &BedSnpIter,
+    out_block: &mut [f64],
+    row_step: usize,
+    n_samples: usize,
+    keep_indices: &[usize],
+    prepared_rows: &[GrmStreamRowPreparedF64],
+    prepared_cursor: &mut usize,
+    raw_scanned_cursor: &mut usize,
+    n_total: usize,
+    parallel_decode: bool,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) -> (usize, usize, bool) {
+    let remain = keep_indices.len().saturating_sub(*prepared_cursor);
+    if remain == 0 {
+        let scanned_add = n_total.saturating_sub(*raw_scanned_cursor);
+        *raw_scanned_cursor = n_total;
+        return (0, scanned_add, true);
+    }
+
+    let rows = remain.min(row_step);
+    let start = *prepared_cursor;
+    let end = start + rows;
+    let idx_slice = &keep_indices[start..end];
+    let prep_slice = &prepared_rows[start..end];
+    let out_slice = &mut out_block[..rows * n_samples];
+    if parallel_decode {
+        let mut run = || {
+            out_slice
+                .par_chunks_mut(n_samples)
+                .zip(idx_slice.par_iter())
+                .zip(prep_slice.par_iter())
+                .for_each_init(|| vec![0.0_f32; n_samples], |raw_row, ((dst, &snp_idx), &prep)| {
+                    it.decode_snp_raw_into_with_stats_at(snp_idx, raw_row.as_mut_slice())
+                        .expect("pre-stat keep index out of BED range");
+                    apply_grm_stream_prepared_row_copy_f64(raw_row.as_slice(), dst, prep);
+                });
+        };
+        if let Some(tp) = pool {
+            tp.install(&mut run);
+        } else {
+            run();
+        }
+    } else {
+        let mut raw_row = vec![0.0_f32; n_samples];
+        for off in 0..rows {
+            let snp_idx = idx_slice[off];
+            let prep = prep_slice[off];
+            let dst = &mut out_slice[off * n_samples..(off + 1) * n_samples];
+            it.decode_snp_raw_into_with_stats_at(snp_idx, raw_row.as_mut_slice())
+                .expect("pre-stat keep index out of BED range");
+            apply_grm_stream_prepared_row_copy_f64(raw_row.as_slice(), dst, prep);
         }
     }
     *prepared_cursor = end;
@@ -912,6 +1272,55 @@ fn write_npy_f32_matrix(path: &str, data: &[f32], rows: usize, cols: usize) -> R
     Ok(())
 }
 
+fn write_npy_f64_matrix(path: &str, data: &[f64], rows: usize, cols: usize) -> Result<(), String> {
+    let expected = rows.saturating_mul(cols);
+    if data.len() != expected {
+        return Err(format!(
+            "write_npy_f64_matrix: data length mismatch, got {}, expected {}",
+            data.len(),
+            expected
+        ));
+    }
+    let f = File::create(path).map_err(|e| format!("create npy file failed: {e}"))?;
+    let mut w = BufWriter::new(f);
+
+    let mut header =
+        format!("{{'descr': '<f8', 'fortran_order': False, 'shape': ({rows}, {cols}), }}");
+    while (10 + header.len() + 1) % 16 != 0 {
+        header.push(' ');
+    }
+    header.push('\n');
+    let header_len_u16 = u16::try_from(header.len())
+        .map_err(|_| "npy header too long for v1.0 format".to_string())?;
+
+    w.write_all(b"\x93NUMPY")
+        .map_err(|e| format!("write npy magic failed: {e}"))?;
+    w.write_all(&[1_u8, 0_u8])
+        .map_err(|e| format!("write npy version failed: {e}"))?;
+    w.write_all(&header_len_u16.to_le_bytes())
+        .map_err(|e| format!("write npy header length failed: {e}"))?;
+    w.write_all(header.as_bytes())
+        .map_err(|e| format!("write npy header failed: {e}"))?;
+
+    #[cfg(target_endian = "little")]
+    {
+        let byte_len = data.len().saturating_mul(std::mem::size_of::<f64>());
+        let bytes = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, byte_len) };
+        w.write_all(bytes)
+            .map_err(|e| format!("write npy payload failed: {e}"))?;
+    }
+    #[cfg(not(target_endian = "little"))]
+    {
+        for &v in data.iter() {
+            w.write_all(&v.to_le_bytes())
+                .map_err(|e| format!("write npy payload failed: {e}"))?;
+        }
+    }
+    w.flush()
+        .map_err(|e| format!("flush npy file failed: {e}"))?;
+    Ok(())
+}
+
 #[inline]
 fn grm_stream_scan_prestats(
     it: &mut BedSnpIter,
@@ -982,6 +1391,74 @@ fn grm_stream_scan_prestats(
 }
 
 #[inline]
+fn grm_stream_scan_prestats_f64(
+    it: &mut BedSnpIter,
+    n_total: usize,
+    n_samples: usize,
+    method: usize,
+    maf_thr: f32,
+    miss_thr: f32,
+    eps: f64,
+    progress_callback: Option<&Py<PyAny>>,
+    notify_step: usize,
+    last_notified: &mut usize,
+    phase1_cap: usize,
+) -> Result<GrmStreamPreStatsF64, String> {
+    let mut keep_indices: Vec<usize> = Vec::new();
+    let mut prepared_rows: Vec<GrmStreamRowPreparedF64> = Vec::new();
+    let mut eff_m = 0usize;
+    let mut varsum = 0.0_f64;
+    let mut scanned = 0usize;
+
+    while let Some((snp_idx, alt_sum, non_missing)) = it.next_snp_stats_only() {
+        scanned = scanned.saturating_add(1);
+        if (scanned & 0x3FFF) == 0 {
+            check_ctrlc()?;
+        }
+        let done_mapped = grm_progress_map_ratio(scanned, n_total, phase1_cap);
+        grm_progress_notify(
+            progress_callback,
+            done_mapped,
+            n_total,
+            notify_step,
+            last_notified,
+            false,
+        )?;
+        if let Some((prep, var)) = grm_stream_row_prepare_from_stats_f64(
+            method,
+            maf_thr,
+            miss_thr,
+            eps,
+            n_samples,
+            alt_sum,
+            non_missing,
+        ) {
+            keep_indices.push(snp_idx);
+            prepared_rows.push(prep);
+            eff_m = eff_m.saturating_add(1);
+            if method == 1 {
+                varsum += var;
+            }
+        }
+    }
+    grm_progress_notify(
+        progress_callback,
+        phase1_cap,
+        n_total,
+        notify_step,
+        last_notified,
+        true,
+    )?;
+
+    Ok(GrmStreamPreStatsF64 {
+        keep_indices,
+        prepared_rows,
+        eff_m,
+        varsum,
+    })
+}
+
+#[inline]
 fn effective_threads(threads: usize) -> usize {
     if threads > 0 {
         threads
@@ -1021,7 +1498,7 @@ fn grm_stream_block_rows(requested_block_rows: usize, m: usize, n_samples: usize
     if target_bytes == 0 {
         return base;
     }
-    let row_bytes = n_samples.saturating_mul(std::mem::size_of::<f32>()).max(1);
+    let row_bytes = n_samples.saturating_mul(std::mem::size_of::<f64>()).max(1);
     let cap_rows = target_bytes
         .saturating_div(row_bytes.saturating_mul(2).max(1))
         .max(1);
@@ -1048,7 +1525,7 @@ fn grm_stream_decode_batch_rows(row_step: usize, n_samples: usize) -> usize {
         .filter(|v| v.is_finite() && *v > 0.0)
         .unwrap_or(32.0_f64);
     let target_bytes = (target_mb * 1024.0_f64 * 1024.0_f64) as usize;
-    let row_bytes = n_samples.saturating_mul(std::mem::size_of::<f32>()).max(1);
+    let row_bytes = n_samples.saturating_mul(std::mem::size_of::<f64>()).max(1);
     let by_mem = target_bytes.saturating_div(row_bytes).max(1);
     by_mem.max(64).min(4096).min(row_step.max(1))
 }
@@ -1232,7 +1709,37 @@ fn resolve_grm_accum_mode_f32(
 }
 
 #[inline]
+fn resolve_grm_accum_mode_f64(
+    mode: GrmAccumMode,
+    _block: &[f64],
+    _rows: usize,
+    _n: usize,
+) -> GrmAccumMode {
+    if mode == GrmAccumMode::Auto {
+        GrmAccumMode::Syrk
+    } else {
+        mode
+    }
+}
+
+#[inline]
 unsafe fn grm_scale_and_symmetrize_raw(grm_ptr: *mut f32, n: usize, inv_scale: f32) {
+    for i in 0..n {
+        let ii = i * n + i;
+        let d = *grm_ptr.add(ii) * inv_scale;
+        std::ptr::write(grm_ptr.add(ii), d);
+        for j in 0..i {
+            let idx_lo = i * n + j;
+            let v = *grm_ptr.add(idx_lo) * inv_scale;
+            std::ptr::write(grm_ptr.add(idx_lo), v);
+            let idx_up = j * n + i;
+            std::ptr::write(grm_ptr.add(idx_up), v);
+        }
+    }
+}
+
+#[inline]
+unsafe fn grm_scale_and_symmetrize_raw_f64(grm_ptr: *mut f64, n: usize, inv_scale: f64) {
     for i in 0..n {
         let ii = i * n + i;
         let d = *grm_ptr.add(ii) * inv_scale;
@@ -1443,6 +1950,177 @@ fn grm_rankk_update_raw(
                     cblas_force_tmp_accum,
                 ),
                 GrmAccumMode::Gemm => grm_rankk_update_cblas_raw_gemm(
+                    grm_ptr,
+                    block,
+                    cur_rows,
+                    n,
+                    is_first_block,
+                    cblas_force_tmp_accum,
+                ),
+            }
+        }
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        let _ = (
+            grm_ptr,
+            block,
+            cur_rows,
+            n,
+            accum_mode,
+            cblas_copy_rhs,
+            is_first_block,
+            cblas_force_tmp_accum,
+        );
+        Err(
+            "Packed GRM requires CBLAS backend on this platform; fallback to streaming GRM."
+                .to_string(),
+        )
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+#[inline]
+unsafe fn grm_rankk_update_cblas_raw_f64(
+    grm_ptr: *mut f64,
+    block: &[f64],
+    cur_rows: usize,
+    n: usize,
+    copy_rhs: bool,
+    is_first_block: bool,
+    force_tmp_accum: bool,
+) {
+    let _ = copy_rhs;
+    let beta = if is_first_block { 0.0_f64 } else { 1.0_f64 };
+    if force_tmp_accum {
+        let mut tmp = vec![0.0_f64; n * n];
+        cblas_dsyrk_dispatch(
+            CBLAS_COL_MAJOR,
+            CBLAS_UPPER,
+            CBLAS_NO_TRANS,
+            n as CblasInt,
+            cur_rows as CblasInt,
+            1.0,
+            block.as_ptr(),
+            n as CblasInt,
+            0.0,
+            tmp.as_mut_ptr(),
+            n as CblasInt,
+        );
+        for col in 0..n {
+            for row in 0..=col {
+                let idx = row + col * n;
+                let dst = grm_ptr.add(idx);
+                if is_first_block {
+                    std::ptr::write(dst, tmp[idx]);
+                } else {
+                    std::ptr::write(dst, *dst + tmp[idx]);
+                }
+            }
+        }
+    } else {
+        cblas_dsyrk_dispatch(
+            CBLAS_COL_MAJOR,
+            CBLAS_UPPER,
+            CBLAS_NO_TRANS,
+            n as CblasInt,
+            cur_rows as CblasInt,
+            1.0,
+            block.as_ptr(),
+            n as CblasInt,
+            beta,
+            grm_ptr,
+            n as CblasInt,
+        );
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+#[inline]
+unsafe fn grm_rankk_update_cblas_raw_gemm_f64(
+    grm_ptr: *mut f64,
+    block: &[f64],
+    cur_rows: usize,
+    n: usize,
+    is_first_block: bool,
+    force_tmp_accum: bool,
+) {
+    let beta = if is_first_block { 0.0_f64 } else { 1.0_f64 };
+    if force_tmp_accum {
+        let mut tmp = vec![0.0_f64; n * n];
+        cblas_dgemm_dispatch(
+            CBLAS_COL_MAJOR,
+            CBLAS_NO_TRANS,
+            CBLAS_TRANS,
+            n as CblasInt,
+            n as CblasInt,
+            cur_rows as CblasInt,
+            1.0,
+            block.as_ptr(),
+            n as CblasInt,
+            block.as_ptr(),
+            n as CblasInt,
+            0.0,
+            tmp.as_mut_ptr(),
+            n as CblasInt,
+        );
+        for i in 0..n {
+            for j in 0..=i {
+                let idx = i * n + j;
+                let dst = grm_ptr.add(idx);
+                if is_first_block {
+                    std::ptr::write(dst, tmp[idx]);
+                } else {
+                    std::ptr::write(dst, *dst + tmp[idx]);
+                }
+            }
+        }
+    } else {
+        cblas_dgemm_dispatch(
+            CBLAS_COL_MAJOR,
+            CBLAS_NO_TRANS,
+            CBLAS_TRANS,
+            n as CblasInt,
+            n as CblasInt,
+            cur_rows as CblasInt,
+            1.0,
+            block.as_ptr(),
+            n as CblasInt,
+            block.as_ptr(),
+            n as CblasInt,
+            beta,
+            grm_ptr,
+            n as CblasInt,
+        );
+    }
+}
+
+#[inline]
+fn grm_rankk_update_raw_f64(
+    grm_ptr: *mut f64,
+    block: &[f64],
+    cur_rows: usize,
+    n: usize,
+    accum_mode: GrmAccumMode,
+    cblas_copy_rhs: bool,
+    is_first_block: bool,
+    cblas_force_tmp_accum: bool,
+) -> Result<(), String> {
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    {
+        unsafe {
+            match accum_mode {
+                GrmAccumMode::Auto | GrmAccumMode::Syrk => grm_rankk_update_cblas_raw_f64(
+                    grm_ptr,
+                    block,
+                    cur_rows,
+                    n,
+                    cblas_copy_rhs,
+                    is_first_block,
+                    cblas_force_tmp_accum,
+                ),
+                GrmAccumMode::Gemm => grm_rankk_update_cblas_raw_gemm_f64(
                     grm_ptr,
                     block,
                     cur_rows,
@@ -2123,6 +2801,48 @@ blas_threads={}, overlap={}, accum={}",
 
 #[pyfunction]
 #[pyo3(signature = (
+    packed,
+    n_samples,
+    row_flip,
+    row_maf,
+    sample_indices=None,
+    method=1,
+    block_cols=65536,
+    threads=0,
+    progress_callback=None,
+    progress_every=0
+))]
+pub fn grm_packed_f64<'py>(
+    py: Python<'py>,
+    packed: PyReadonlyArray2<'py, u8>,
+    n_samples: usize,
+    row_flip: PyReadonlyArray1<'py, bool>,
+    row_maf: PyReadonlyArray1<'py, f32>,
+    sample_indices: Option<PyReadonlyArray1<'py, i64>>,
+    method: usize,
+    block_cols: usize,
+    threads: usize,
+    progress_callback: Option<Py<PyAny>>,
+    progress_every: usize,
+) -> PyResult<Bound<'py, PyArray2<f64>>> {
+    let (grm_arr, _row_sum_arr, _varsum_ret) = grm_packed_f64_with_stats_impl(
+        py,
+        packed,
+        n_samples,
+        row_flip,
+        row_maf,
+        sample_indices,
+        method,
+        block_cols,
+        threads,
+        progress_callback,
+        progress_every,
+    )?;
+    Ok(grm_arr)
+}
+
+#[pyfunction]
+#[pyo3(signature = (
     prefix,
     method=1,
     maf_threshold=0.02,
@@ -2203,10 +2923,83 @@ pub fn grm_packed_bed_f32<'py>(
     block_cols=65536,
     threads=0,
     progress_callback=None,
+    progress_every=0
+))]
+pub fn grm_packed_bed_f64<'py>(
+    py: Python<'py>,
+    prefix: String,
+    method: usize,
+    maf_threshold: f32,
+    max_missing_rate: f32,
+    block_cols: usize,
+    threads: usize,
+    progress_callback: Option<Py<PyAny>>,
+    progress_every: usize,
+) -> PyResult<(Bound<'py, PyArray2<f64>>, usize, usize)> {
+    let maf_thr = maf_threshold.clamp(0.0, 0.5);
+    let miss_thr = max_missing_rate.clamp(0.0, 1.0);
+    let (
+        packed_arr,
+        _miss_arr,
+        maf_arr,
+        _std_arr,
+        row_flip_arr,
+        _site_keep_arr,
+        n_samples,
+        _n_total_sites,
+    ) = crate::gfreader::prepare_bed_2bit_packed(py, prefix, maf_thr, miss_thr, 0.0_f32, false)?;
+    let packed_ro = packed_arr.readonly();
+    let packed_view = packed_ro.as_array();
+    if packed_view.ndim() != 2 {
+        return Err(PyRuntimeError::new_err(
+            "packed BED payload must be 2D (m, bytes_per_snp).",
+        ));
+    }
+    let eff_m = packed_view.shape()[0];
+    if eff_m == 0 {
+        return Err(PyRuntimeError::new_err(
+            "No SNPs remained after packed BED filtering; GRM is empty.",
+        ));
+    }
+    let maf_ro = maf_arr.readonly();
+    let row_flip_ro = row_flip_arr.readonly();
+    if maf_ro.len() != eff_m || row_flip_ro.len() != eff_m {
+        return Err(PyRuntimeError::new_err(format!(
+            "packed BED metadata length mismatch: packed_rows={eff_m}, maf={}, row_flip={}",
+            maf_ro.len(),
+            row_flip_ro.len()
+        )));
+    }
+
+    let grm = grm_packed_f64(
+        py,
+        packed_ro,
+        n_samples,
+        row_flip_ro,
+        maf_ro,
+        None,
+        method,
+        block_cols,
+        threads,
+        progress_callback,
+        progress_every,
+    )?;
+    Ok((grm, eff_m, n_samples))
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    prefix,
+    method=1,
+    maf_threshold=0.02,
+    max_missing_rate=0.05,
+    block_cols=65536,
+    threads=0,
+    progress_callback=None,
     progress_every=0,
     mmap_window_mb=None
 ))]
-pub fn grm_stream_bed_f32<'py>(
+pub fn grm_stream_bed_f64<'py>(
     py: Python<'py>,
     prefix: String,
     method: usize,
@@ -2217,7 +3010,7 @@ pub fn grm_stream_bed_f32<'py>(
     progress_callback: Option<Py<PyAny>>,
     progress_every: usize,
     mmap_window_mb: Option<usize>,
-) -> PyResult<(Bound<'py, PyArray2<f32>>, usize, usize)> {
+) -> PyResult<(Bound<'py, PyArray2<f64>>, usize, usize)> {
     if method != 1 && method != 2 {
         return Err(PyRuntimeError::new_err(format!(
             "unsupported method={method}; expected 1 (centered) or 2 (standardized)"
@@ -2273,7 +3066,7 @@ pub fn grm_stream_bed_f32<'py>(
                 row_flip_ro.len()
             )));
         }
-        let grm = grm_packed_f32(
+        let grm = grm_packed_f64(
             py,
             packed_ro,
             n_samples,
@@ -2371,15 +3164,15 @@ pub fn grm_stream_bed_f32<'py>(
     let stage_timing = env_truthy("JX_GRM_STREAM_STAGE_TIMING");
 
     let grm_vec = py
-        .detach(move || -> Result<(Vec<f32>, usize), String> {
+        .detach(move || -> Result<(Vec<f64>, usize), String> {
             let _blas_guard = OpenBlasThreadGuard::enter(blas_threads.max(1));
             let total_t0 = Instant::now();
             let mut decode_secs = 0.0_f64;
             let mut gemm_secs = 0.0_f64;
-            let mut grm = Vec::<f32>::with_capacity(n_samples * n_samples);
+            let mut grm = Vec::<f64>::with_capacity(n_samples * n_samples);
             let grm_ptr = grm.as_mut_ptr();
-            let mut block_a = vec![0.0_f32; row_step * n_samples];
-            let mut block_b = vec![0.0_f32; row_step * n_samples];
+            let mut block_a = vec![0.0_f64; row_step * n_samples];
+            let mut block_b = vec![0.0_f64; row_step * n_samples];
             let mut eff_m = 0usize;
             let mut scanned = 0usize;
             let mut last_notified = 0usize;
@@ -2398,11 +3191,11 @@ pub fn grm_stream_bed_f32<'py>(
             let mut accum_mode_runtime = accum_mode;
             let mut prepared_cursor = 0usize;
             let mut prepared_raw_scanned = 0usize;
-            let mut prestats: Option<GrmStreamPreStats> = None;
+            let mut prestats: Option<GrmStreamPreStatsF64> = None;
 
             let (mut cur_rows, mut cur_scanned, mut cur_varsum, mut cur_eof) = if stream_prestat_core {
                 let prep_t0 = Instant::now();
-                let ps = grm_stream_scan_prestats(
+                let ps = grm_stream_scan_prestats_f64(
                     &mut it,
                     n_total,
                     n_samples,
@@ -2424,7 +3217,7 @@ pub fn grm_stream_bed_f32<'py>(
                 }
 
                 let decode_t0 = Instant::now();
-                let (rows, scanned_now, eof_now) = decode_grm_stream_block_prepared_into(
+                let (rows, scanned_now, eof_now) = decode_grm_stream_block_prepared_into_f64(
                     &it,
                     &mut block_a,
                     row_step,
@@ -2442,7 +3235,7 @@ pub fn grm_stream_bed_f32<'py>(
                 (rows, scanned_now, 0.0_f64, eof_now)
             } else {
                 let decode_t0 = Instant::now();
-                let out = decode_grm_stream_block_dispatch(
+                let out = decode_grm_stream_block_dispatch_f64(
                     &mut it,
                     &mut block_a,
                     row_step,
@@ -2496,7 +3289,7 @@ pub fn grm_stream_bed_f32<'py>(
                             .as_ref()
                             .ok_or_else(|| "missing pre-stat cache".to_string())?;
                         if use_a {
-                            let (rows, scanned_now, eof_now) = decode_grm_stream_block_prepared_into(
+                            let (rows, scanned_now, eof_now) = decode_grm_stream_block_prepared_into_f64(
                                 &it,
                                 &mut block_a,
                                 row_step,
@@ -2511,7 +3304,7 @@ pub fn grm_stream_bed_f32<'py>(
                             );
                             (rows, scanned_now, 0.0_f64, eof_now)
                         } else {
-                            let (rows, scanned_now, eof_now) = decode_grm_stream_block_prepared_into(
+                            let (rows, scanned_now, eof_now) = decode_grm_stream_block_prepared_into_f64(
                                 &it,
                                 &mut block_b,
                                 row_step,
@@ -2527,7 +3320,7 @@ pub fn grm_stream_bed_f32<'py>(
                             (rows, scanned_now, 0.0_f64, eof_now)
                         }
                     } else if use_a {
-                        decode_grm_stream_block_dispatch(
+                        decode_grm_stream_block_dispatch_f64(
                             &mut it,
                             &mut block_a,
                             row_step,
@@ -2541,7 +3334,7 @@ pub fn grm_stream_bed_f32<'py>(
                             decode_pool.as_ref(),
                         )
                     } else {
-                        decode_grm_stream_block_dispatch(
+                        decode_grm_stream_block_dispatch_f64(
                             &mut it,
                             &mut block_b,
                             row_step,
@@ -2571,7 +3364,7 @@ pub fn grm_stream_bed_f32<'py>(
                                         let ps =
                                             prestats.as_ref().expect("missing pre-stat cache");
                                         let (rows, scanned_now, eof_now) =
-                                            decode_grm_stream_block_prepared_into(
+                                            decode_grm_stream_block_prepared_into_f64(
                                                 &it,
                                                 &mut block_b,
                                                 row_step,
@@ -2586,7 +3379,7 @@ pub fn grm_stream_bed_f32<'py>(
                                             );
                                         (rows, scanned_now, 0.0_f64, eof_now)
                                     } else {
-                                        decode_grm_stream_block_dispatch(
+                                        decode_grm_stream_block_dispatch_f64(
                                             &mut it,
                                             &mut block_b,
                                             row_step,
@@ -2604,14 +3397,14 @@ pub fn grm_stream_bed_f32<'py>(
                                 });
                                 let gt0 = Instant::now();
                                 if accum_mode_runtime == GrmAccumMode::Auto {
-                                    accum_mode_runtime = resolve_grm_accum_mode_f32(
+                                    accum_mode_runtime = resolve_grm_accum_mode_f64(
                                         accum_mode_runtime,
                                         &block_a[..cur_rows * n_samples],
                                         cur_rows,
                                         n_samples,
                                     );
                                 }
-                                grm_rankk_update_raw(
+                                grm_rankk_update_raw_f64(
                                     grm_ptr,
                                     &block_a[..cur_rows * n_samples],
                                     cur_rows,
@@ -2640,7 +3433,7 @@ pub fn grm_stream_bed_f32<'py>(
                                         let ps =
                                             prestats.as_ref().expect("missing pre-stat cache");
                                         let (rows, scanned_now, eof_now) =
-                                            decode_grm_stream_block_prepared_into(
+                                            decode_grm_stream_block_prepared_into_f64(
                                                 &it,
                                                 &mut block_a,
                                                 row_step,
@@ -2655,7 +3448,7 @@ pub fn grm_stream_bed_f32<'py>(
                                             );
                                         (rows, scanned_now, 0.0_f64, eof_now)
                                     } else {
-                                        decode_grm_stream_block_dispatch(
+                                        decode_grm_stream_block_dispatch_f64(
                                             &mut it,
                                             &mut block_a,
                                             row_step,
@@ -2673,14 +3466,14 @@ pub fn grm_stream_bed_f32<'py>(
                                 });
                                 let gt0 = Instant::now();
                                 if accum_mode_runtime == GrmAccumMode::Auto {
-                                    accum_mode_runtime = resolve_grm_accum_mode_f32(
+                                    accum_mode_runtime = resolve_grm_accum_mode_f64(
                                         accum_mode_runtime,
                                         &block_b[..cur_rows * n_samples],
                                         cur_rows,
                                         n_samples,
                                     );
                                 }
-                                grm_rankk_update_raw(
+                                grm_rankk_update_raw_f64(
                                     grm_ptr,
                                     &block_b[..cur_rows * n_samples],
                                     cur_rows,
@@ -2705,14 +3498,14 @@ pub fn grm_stream_bed_f32<'py>(
                     let gemm_t0 = Instant::now();
                     if use_a {
                         if accum_mode_runtime == GrmAccumMode::Auto {
-                            accum_mode_runtime = resolve_grm_accum_mode_f32(
+                            accum_mode_runtime = resolve_grm_accum_mode_f64(
                                 accum_mode_runtime,
                                 &block_a[..cur_rows * n_samples],
                                 cur_rows,
                                 n_samples,
                             );
                         }
-                        grm_rankk_update_raw(
+                        grm_rankk_update_raw_f64(
                             grm_ptr,
                             &block_a[..cur_rows * n_samples],
                             cur_rows,
@@ -2724,14 +3517,14 @@ pub fn grm_stream_bed_f32<'py>(
                         )?;
                     } else {
                         if accum_mode_runtime == GrmAccumMode::Auto {
-                            accum_mode_runtime = resolve_grm_accum_mode_f32(
+                            accum_mode_runtime = resolve_grm_accum_mode_f64(
                                 accum_mode_runtime,
                                 &block_b[..cur_rows * n_samples],
                                 cur_rows,
                                 n_samples,
                             );
                         }
-                        grm_rankk_update_raw(
+                        grm_rankk_update_raw_f64(
                             grm_ptr,
                             &block_b[..cur_rows * n_samples],
                             cur_rows,
@@ -2750,7 +3543,7 @@ pub fn grm_stream_bed_f32<'py>(
                                 .as_ref()
                                 .ok_or_else(|| "missing pre-stat cache".to_string())?;
                             if use_a {
-                                let (rows, scanned_now, eof_now) = decode_grm_stream_block_prepared_into(
+                                let (rows, scanned_now, eof_now) = decode_grm_stream_block_prepared_into_f64(
                                     &it,
                                     &mut block_b,
                                     row_step,
@@ -2765,7 +3558,7 @@ pub fn grm_stream_bed_f32<'py>(
                                 );
                                 (rows, scanned_now, 0.0_f64, eof_now)
                             } else {
-                                let (rows, scanned_now, eof_now) = decode_grm_stream_block_prepared_into(
+                                let (rows, scanned_now, eof_now) = decode_grm_stream_block_prepared_into_f64(
                                     &it,
                                     &mut block_a,
                                     row_step,
@@ -2781,7 +3574,7 @@ pub fn grm_stream_bed_f32<'py>(
                                 (rows, scanned_now, 0.0_f64, eof_now)
                             }
                         } else if use_a {
-                            decode_grm_stream_block_dispatch(
+                            decode_grm_stream_block_dispatch_f64(
                                 &mut it,
                                 &mut block_b,
                                 row_step,
@@ -2795,7 +3588,7 @@ pub fn grm_stream_bed_f32<'py>(
                                 decode_pool.as_ref(),
                             )
                         } else {
-                            decode_grm_stream_block_dispatch(
+                            decode_grm_stream_block_dispatch_f64(
                                 &mut it,
                                 &mut block_a,
                                 row_step,
@@ -2858,16 +3651,16 @@ pub fn grm_stream_bed_f32<'py>(
                 if !(varsum_acc.is_finite() && varsum_acc > 0.0) {
                     return Err("invalid centered GRM denominator: sum(2p(1-p)) <= 0".to_string());
                 }
-                varsum_acc as f32
+                varsum_acc
             } else {
-                eff_m as f32
+                eff_m as f64
             };
             if !(scale.is_finite() && scale > 0.0) {
                 return Err("invalid GRM scale factor".to_string());
             }
-            let inv_scale = 1.0_f32 / scale;
+            let inv_scale = 1.0_f64 / scale;
             unsafe {
-                grm_scale_and_symmetrize_raw(grm_ptr, n_samples, inv_scale);
+                grm_scale_and_symmetrize_raw_f64(grm_ptr, n_samples, inv_scale);
                 grm.set_len(n_samples * n_samples);
             }
 
@@ -2925,6 +3718,103 @@ threads_total={}, decode_threads={}, blas_threads={}, overlap={}, par_decode={},
     )
     .into_bound();
     Ok((grm_arr, eff_m, n_samples))
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    prefix,
+    method=1,
+    maf_threshold=0.02,
+    max_missing_rate=0.05,
+    block_cols=65536,
+    threads=0,
+    progress_callback=None,
+    progress_every=0,
+    mmap_window_mb=None
+))]
+pub fn grm_stream_bed_f32<'py>(
+    py: Python<'py>,
+    prefix: String,
+    method: usize,
+    maf_threshold: f32,
+    max_missing_rate: f32,
+    block_cols: usize,
+    threads: usize,
+    progress_callback: Option<Py<PyAny>>,
+    progress_every: usize,
+    mmap_window_mb: Option<usize>,
+) -> PyResult<(Bound<'py, PyArray2<f32>>, usize, usize)> {
+    let (grm64_arr, eff_m, n_samples) = grm_stream_bed_f64(
+        py,
+        prefix,
+        method,
+        maf_threshold,
+        max_missing_rate,
+        block_cols,
+        threads,
+        progress_callback,
+        progress_every,
+        mmap_window_mb,
+    )?;
+    let grm64_ro = grm64_arr.readonly();
+    let grm64 = grm64_ro
+        .as_slice()
+        .map_err(|_| PyRuntimeError::new_err("GRM array is not contiguous"))?;
+    let grm32: Vec<f32> = grm64.iter().map(|&v| v as f32).collect();
+    let grm32_arr = PyArray2::from_owned_array(
+        py,
+        Array2::from_shape_vec((n_samples, n_samples), grm32)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+    )
+    .into_bound();
+    Ok((grm32_arr, eff_m, n_samples))
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    prefix,
+    out_npy_path,
+    method=1,
+    maf_threshold=0.02,
+    max_missing_rate=0.05,
+    block_cols=65536,
+    threads=0,
+    progress_callback=None,
+    progress_every=0,
+    mmap_window_mb=None
+))]
+pub fn grm_stream_bed_f64_to_npy(
+    py: Python,
+    prefix: String,
+    out_npy_path: String,
+    method: usize,
+    maf_threshold: f32,
+    max_missing_rate: f32,
+    block_cols: usize,
+    threads: usize,
+    progress_callback: Option<Py<PyAny>>,
+    progress_every: usize,
+    mmap_window_mb: Option<usize>,
+) -> PyResult<(usize, usize)> {
+    let (grm_arr, eff_m, n_samples) = grm_stream_bed_f64(
+        py,
+        prefix,
+        method,
+        maf_threshold,
+        max_missing_rate,
+        block_cols,
+        threads,
+        progress_callback,
+        progress_every,
+        mmap_window_mb,
+    )?;
+    let grm_ro = grm_arr.readonly();
+    let data = grm_ro
+        .as_slice()
+        .map_err(|_| PyRuntimeError::new_err("GRM array is not contiguous"))?;
+    write_npy_f64_matrix(&out_npy_path, data, n_samples, n_samples)
+        .map_err(PyRuntimeError::new_err)?;
+    Ok((eff_m, n_samples))
 }
 
 #[pyfunction]

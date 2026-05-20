@@ -121,10 +121,7 @@ from janusx.script._common.genoio import (
     read_id_file as _read_id_file,
 )
 from janusx.script._common.grmstable import (
-    build_stable_packed_grm_f64,
-    prefer_stable_packed_grm,
     save_grm_npy_blocked,
-    stable_grm_builder_available,
 )
 
 
@@ -1620,88 +1617,39 @@ def build_grm_streaming(
     Build GRM in Rust-only mode from PLINK BED input.
 
     Route policy:
-    - non-fast/non-farmcpu: Rust streaming BED single-entry (`grm_stream_bed_f32`)
-    - fast/farmcpu: packed BED single-entry (`grm_packed_bed_f32` / preloaded packed reuse)
+    - non-fast/non-farmcpu: Rust memmap-BED single-entry (`grm_stream_bed_f64`)
+    - fast/farmcpu: packed BED single-entry (`grm_packed_bed_f64` / preloaded packed reuse)
     """
     packed_prefix = _as_plink_prefix(genofile)
     if packed_prefix is None:
         raise RuntimeError(
             "Rust-only GWAS GRM build requires PLINK BED input/prefix."
         )
-    if prefer_stable_packed_grm():
-        pbar = _ProgressAdapter(
-            total=n_snps,
-            desc="GRM (stable-f64)",
-            force_animate=True,
-        )
-        process = psutil.Process()
-        mem_tick_span = max(1, 10 * int(chunk_size))
-        last_done = 0
-        last_total = int(max(0, n_snps))
-
-        def _on_stable_progress(done: int, total: int) -> None:
-            nonlocal last_done, last_total
-            d = int(max(0, done))
-            t = int(max(0, total))
-            if t > 0 and t != last_total:
-                pbar.set_total(t)
-                last_total = t
-            if d > last_done:
-                pbar.update(d - last_done)
-                last_done = d
-            if (d % mem_tick_span == 0) or (t > 0 and d >= t):
-                mem = process.memory_info().rss / 1024**3
-                pbar.set_postfix(memory=f"{mem:.2f}GB")
-        _log_info(
-            logger,
-            "Building GRM (stable packed-bed f64 single-entry, opt-in), method="
-            f"{method}",
-            use_spinner=use_spinner,
-        )
-        try:
-            grm, eff_m = build_stable_packed_grm_f64(
-                prefix=str(packed_prefix),
-                maf_threshold=float(maf_threshold),
-                max_missing_rate=float(max_missing_rate),
-                method=int(method),
-                block_cols=max(1, int(chunk_size)),
-                threads=max(1, int(threads)),
-                snps_only=bool(snps_only),
-                progress_callback=_on_stable_progress,
-                progress_every=max(1, int(chunk_size)),
-            )
-            mem = process.memory_info().rss / 1024**3
-            pbar.set_postfix(memory=f"{mem:.2f}GB")
-            pbar.finish()
-        finally:
-            pbar.close(show_done=False)
-        _log_info(logger, "GRM construction finished.", use_spinner=use_spinner)
-        return grm, int(eff_m)
     use_packed_kernel = bool(allow_packed_full_load)
     if use_packed_kernel:
-        if not hasattr(jxrs, "grm_packed_bed_f32"):
+        if not hasattr(jxrs, "grm_packed_bed_f64"):
             raise RuntimeError(
-                "Rust symbol grm_packed_bed_f32 is unavailable. "
+                "Rust symbol grm_packed_bed_f64 is unavailable. "
                 "Rebuild janusx extension for Rust-only GWAS mode."
             )
     else:
-        if not hasattr(jxrs, "grm_stream_bed_f32"):
+        if not hasattr(jxrs, "grm_stream_bed_f64"):
             raise RuntimeError(
-                "Rust symbol grm_stream_bed_f32 is unavailable. "
+                "Rust symbol grm_stream_bed_f64 is unavailable. "
                 "Rebuild janusx extension for Rust-only GWAS mode."
             )
 
     _log_info(
         logger,
         (
-            f"Building GRM (Rust {'packed-bed' if use_packed_kernel else 'stream-bed'} single-entry), "
+            f"Building GRM (Rust {'packed-bed' if use_packed_kernel else 'memmap-bed'} single-entry), "
             f"method={method}"
         ),
         use_spinner=use_spinner,
     )
     pbar = _ProgressAdapter(
         total=n_snps,
-        desc=("GRM (rust-bed)" if use_packed_kernel else "GRM (rust-stream)"),
+        desc=("GRM (rust-bed)" if use_packed_kernel else "GRM (rust-memmap)"),
         force_animate=True,
     )
     process = psutil.Process()
@@ -1735,7 +1683,7 @@ def build_grm_streaming(
             if (
                 pre is not None
                 and str(pre.get("prefix", "")) == str(packed_prefix)
-                and hasattr(jxrs, "grm_packed_f32")
+                and hasattr(jxrs, "grm_packed_f64")
             ):
                 packed_ctx_obj = pre.get("packed_ctx")
                 if isinstance(packed_ctx_obj, dict):
@@ -1769,7 +1717,7 @@ def build_grm_streaming(
                         logging.INFO,
                         "Packed GRM: reusing preloaded packed payload (skip BED repack).",
                     )
-                    grm_raw = jxrs.grm_packed_f32(
+                    grm_raw = jxrs.grm_packed_f64(
                         packed_pre,
                         int(packed_n_pre),
                         row_flip_pre,
@@ -1785,7 +1733,7 @@ def build_grm_streaming(
                     used_preloaded = True
 
             if not used_preloaded:
-                grm_raw, eff_m_raw, packed_n_raw = jxrs.grm_packed_bed_f32(
+                grm_raw, eff_m_raw, packed_n_raw = jxrs.grm_packed_bed_f64(
                     str(packed_prefix),
                     method=int(method),
                     maf_threshold=float(maf_threshold),
@@ -1807,11 +1755,11 @@ def build_grm_streaming(
                 _log_file_only(
                     logger,
                     logging.INFO,
-                    "GRM stream note: JX_GRM_STREAM_TWO_STAGE=1 is enabled; "
-                    "stream entry may internally switch to packed prebuild mode.",
+                    "GRM memmap-bed note: JX_GRM_STREAM_TWO_STAGE=1 is enabled; "
+                    "memmap entry may internally switch to packed prebuild mode.",
                 )
-            if cache_target != "" and hasattr(jxrs, "grm_stream_bed_f32_to_npy"):
-                eff_m_raw, stream_n_raw = jxrs.grm_stream_bed_f32_to_npy(
+            if cache_target != "" and hasattr(jxrs, "grm_stream_bed_f64_to_npy"):
+                eff_m_raw, stream_n_raw = jxrs.grm_stream_bed_f64_to_npy(
                     str(packed_prefix),
                     str(cache_target),
                     method=int(method),
@@ -1826,16 +1774,16 @@ def build_grm_streaming(
                 stream_n = int(stream_n_raw)
                 if stream_n != int(n_samples):
                     raise RuntimeError(
-                        f"Stream sample count mismatch: stream={stream_n}, expected={int(n_samples)}"
+                        f"Memmap sample count mismatch: memmap={stream_n}, expected={int(n_samples)}"
                     )
                 eff_m = int(eff_m_raw)
                 # Keep cache writer output on disk only; caller will atomically
                 # move tmp -> final path and then reopen the final cache.
                 # This avoids holding a memmap handle on tmp cache files, which
                 # can block os.replace on Windows (WinError 32).
-                grm = np.empty((0, 0), dtype=np.float32)
+                grm = np.empty((0, 0), dtype=np.float64)
             else:
-                grm_raw, eff_m_raw, stream_n_raw = jxrs.grm_stream_bed_f32(
+                grm_raw, eff_m_raw, stream_n_raw = jxrs.grm_stream_bed_f64(
                     str(packed_prefix),
                     method=int(method),
                     maf_threshold=float(maf_threshold),
@@ -1849,12 +1797,12 @@ def build_grm_streaming(
                 stream_n = int(stream_n_raw)
                 if stream_n != int(n_samples):
                     raise RuntimeError(
-                        f"Stream sample count mismatch: stream={stream_n}, expected={int(n_samples)}"
+                        f"Memmap sample count mismatch: memmap={stream_n}, expected={int(n_samples)}"
                     )
                 eff_m = int(eff_m_raw)
 
         if grm is None:
-            grm = np.ascontiguousarray(np.asarray(grm_raw, dtype=np.float32))
+            grm = np.ascontiguousarray(np.asarray(grm_raw, dtype=np.float64))
         mem = process.memory_info().rss / 1024**3
         pbar.set_postfix(memory=f"{mem:.2f}GB")
         pbar.finish()
@@ -1958,6 +1906,19 @@ def load_or_build_grm_with_cache(
                     logger.warning(
                         "Genotype input is newer than cached GRM; rebuilding GRM cache."
                     )
+                elif str(grm_path).lower().endswith(".npy"):
+                    try:
+                        grm_probe = np.load(grm_path, mmap_mode='r')
+                        if np.dtype(grm_probe.dtype) != np.dtype(np.float64):
+                            cache_is_stale = True
+                            logger.warning(
+                                "Cached GRM dtype is not float64; rebuilding GRM cache."
+                            )
+                    except Exception:
+                        cache_is_stale = True
+                        logger.warning(
+                            "Cached GRM could not be validated; rebuilding GRM cache."
+                        )
             if cache_is_stale:
                 for p in (grm_path, id_path, legacy_grm_path, legacy_id_path):
                     if os.path.exists(p):
@@ -1996,8 +1957,7 @@ def load_or_build_grm_with_cache(
                 tmp_grm = f"{grm_path}.tmp.{os.getpid()}.npy"
                 stream_direct_cache = bool(
                     (not bool(allow_packed_full_load))
-                    and hasattr(jxrs, "grm_stream_bed_f32_to_npy")
-                    and (not prefer_stable_packed_grm())
+                    and hasattr(jxrs, "grm_stream_bed_f64_to_npy")
                 )
                 grm, eff_m = build_grm_streaming(
                     genofile=genofile_for_grm,
@@ -2033,7 +1993,7 @@ def load_or_build_grm_with_cache(
                     save_grm_npy_blocked(
                         tmp_grm,
                         grm,
-                        dtype=np.float32,
+                        dtype=np.float64,
                     )
                 _replace_file_with_retry(tmp_grm, grm_path)
                 tmp_id = f"{id_path}.tmp.{os.getpid()}"
@@ -2055,7 +2015,7 @@ def load_or_build_grm_with_cache(
                 if mgrm.endswith('.npy'):
                     grm = np.load(mgrm,mmap_mode='r')
                 else:
-                    grm = np.genfromtxt(mgrm, dtype="float32")
+                    grm = np.genfromtxt(mgrm, dtype="float64")
                 grm_ids = _read_id_file(
                     f"{mgrm}.id",
                     logger,

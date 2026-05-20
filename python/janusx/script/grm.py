@@ -11,8 +11,8 @@ Input:
 
 Implementation:
   - GRM construction is executed by Rust kernels:
-      * `grm_stream_bed_f32` (memmap/windowed BED)
-      * `grm_packed_bed_f32` (packed BED)
+      * `grm_stream_bed_f64` (memmap/windowed BED)
+      * `grm_packed_bed_f64` (packed BED)
   - For VCF/HMP/TXT-like input, CLI materializes PLINK BED cache first.
   - SNPs are filtered by MAF and missing rate inside Rust kernels.
 
@@ -58,20 +58,17 @@ from ._common.threads import (
     require_openblas_by_default,
 )
 from ._common.grmstable import (
-    build_stable_packed_grm_f64,
-    prefer_stable_packed_grm,
     save_grm_npy_blocked,
-    stable_grm_builder_available,
 )
 
 try:
     from janusx.janusx import (
-        grm_packed_bed_f32 as _grm_packed_bed_f32,
-        grm_stream_bed_f32 as _grm_stream_bed_f32,
+        grm_packed_bed_f64 as _grm_packed_bed_f64,
+        grm_stream_bed_f64 as _grm_stream_bed_f64,
     )
 except Exception:
-    _grm_packed_bed_f32 = None
-    _grm_stream_bed_f32 = None
+    _grm_packed_bed_f64 = None
+    _grm_stream_bed_f64 = None
 
 
 def _is_plink_prefix_path(path_or_prefix: str) -> bool:
@@ -163,10 +160,10 @@ def build_grm_streaming(
     eff_m : int
         Effective number of SNPs after filtering.
     """
-    if _grm_stream_bed_f32 is None:
+    if _grm_stream_bed_f64 is None:
         raise RuntimeError(
             "Rust memmap GRM kernel is unavailable. Rebuild JanusX extension to export "
-            "`grm_stream_bed_f32`."
+            "`grm_stream_bed_f64`."
         )
     pbar = ProgressAdapter(
         total=n_snps,
@@ -190,7 +187,7 @@ def build_grm_streaming(
             pbar.set_postfix(memory=f"{mem:.2f} GB")
 
     try:
-        grm_raw, eff_m, stream_n = _grm_stream_bed_f32(
+        grm_raw, eff_m, stream_n = _grm_stream_bed_f64(
             str(genofile),
             method=int(method),
             maf_threshold=float(maf_threshold),
@@ -207,9 +204,9 @@ def build_grm_streaming(
     stream_elapsed = max(0.0, time.monotonic() - stream_t0)
     if int(stream_n) != int(n_samples):
         raise RuntimeError(
-            f"Memmap sample count mismatch: stream={int(stream_n)}, expected={int(n_samples)}"
+            f"Memmap sample count mismatch: memmap={int(stream_n)}, expected={int(n_samples)}"
         )
-    grm = np.ascontiguousarray(np.asarray(grm_raw, dtype=np.float32))
+    grm = np.ascontiguousarray(np.asarray(grm_raw, dtype=np.float64))
     eff_m = int(eff_m)
 
     log_success(
@@ -233,10 +230,10 @@ def build_grm_packed_bed(
     stage_timing: bool,
     logger,
 ) -> tuple[np.ndarray, int]:
-    if _grm_packed_bed_f32 is None:
+    if _grm_packed_bed_f64 is None:
         raise RuntimeError(
             "Packed BED GRM kernel is unavailable. Rebuild JanusX extension to export "
-            "`grm_packed_bed_f32`."
+            "`grm_packed_bed_f64`."
         )
 
     pbar = ProgressAdapter(
@@ -285,7 +282,7 @@ def build_grm_packed_bed(
 
     try:
         try:
-            grm_raw, eff_m, packed_n = _grm_packed_bed_f32(
+            grm_raw, eff_m, packed_n = _grm_packed_bed_f64(
                 str(genofile),
                 method=int(method),
                 maf_threshold=float(maf_threshold),
@@ -299,7 +296,7 @@ def build_grm_packed_bed(
                 raise RuntimeError(
                     f"Packed sample count mismatch: packed={int(packed_n)}, expected={int(n_samples)}"
                 )
-            grm = np.ascontiguousarray(np.asarray(grm_raw, dtype=np.float32))
+            grm = np.ascontiguousarray(np.asarray(grm_raw, dtype=np.float64))
             eff_m = int(eff_m)
         finally:
             if block_target_set:
@@ -469,11 +466,7 @@ def main(log: bool = True):
     # )
 
     if log:
-        bed_backend_policy = (
-            "memmap (default); stable packed-f64 opt-in via JX_GRM_PREFER_STABLE_PACKED=1"
-            if stable_grm_builder_available()
-            else "memmap (default; packed fallback)"
-        )
+        bed_backend_policy = "memmap-bed (default; packed-bed fallback)"
         emit_cli_configuration(
             logger,
             app_title="JanusX - GRM",
@@ -515,7 +508,7 @@ def main(log: bool = True):
     # Resolve Rust GRM input (PLINK BED or cache-converted BED)
     # ------------------------------------------------------------------
     grm_input = str(gfile)
-    if (_grm_stream_bed_f32 is not None) or (_grm_packed_bed_f32 is not None):
+    if (_grm_stream_bed_f64 is not None) or (_grm_packed_bed_f64 is not None):
         try:
             grm_input = _resolve_rust_grm_input(
                 str(gfile),
@@ -557,83 +550,15 @@ def main(log: bool = True):
 
     # use_packed_kernel = bool(
     #     _is_plink_prefix_path(str(grm_input))
-    #     and (_grm_packed_bed_f32 is not None)
+    #     and (_grm_packed_bed_f64 is not None)
     # )
     use_memmap_kernel = bool(
         _is_plink_prefix_path(str(grm_input))
-        and (_grm_stream_bed_f32 is not None)
+        and (_grm_stream_bed_f64 is not None)
     )
-    use_stable_packed_f64 = bool(
-        _is_plink_prefix_path(str(grm_input))
-        and prefer_stable_packed_grm()
-    )
-    if use_stable_packed_f64:
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(
-                "GRM backend: stable packed-bed f64 kernel "
-                "(aligned with stable GWAS-cache GRM behavior)."
-            )
-            if args.block_target_mb is not None:
-                logger.debug(
-                    "Stable packed-bed f64 GRM ignores --block-target-mb; "
-                    "Rust packed-f64 path controls its own blocking."
-                )
-            if bool(args.stage_timing):
-                logger.debug(
-                    "Stable packed-bed f64 GRM ignores --stage-timing; "
-                    "timing breakdown is only available for f32 memmap/packed kernels."
-                )
-
-        pbar = ProgressAdapter(
-            total=n_snps,
-            desc="GRM (Streaming)",
-            emit_done=False,
-            force_animate=True,
-        )
-        stable_t0 = time.monotonic()
-        process = psutil.Process()
-        mem_tick_span = max(1, 10 * int(chunk_size))
-        last_done = 0
-        last_total = int(max(0, n_snps))
-
-        def _stable_progress_cb(done: int, total: int) -> None:
-            nonlocal last_done, last_total
-            d = int(max(0, done))
-            t = int(max(0, total))
-            if t > 0 and t != last_total:
-                pbar.set_total(t)
-                last_total = t
-            if d > last_done:
-                pbar.update(d - last_done)
-                last_done = d
-            if (d % mem_tick_span == 0) or (t > 0 and d >= t):
-                mem = process.memory_info().rss / 1024**3
-                pbar.set_postfix(memory=f"{mem:.2f} GB")
-
-        try:
-            grm, eff_m = build_stable_packed_grm_f64(
-                prefix=str(grm_input),
-                maf_threshold=maf_threshold,
-                max_missing_rate=max_missing_rate,
-                method=int(args.method),
-                block_cols=chunk_size,
-                threads=int(args.thread),
-                snps_only=False,
-                progress_callback=_stable_progress_cb,
-                progress_every=max(1, int(chunk_size)),
-            )
-        finally:
-            pbar.finish()
-            pbar.close()
-        stable_elapsed = max(0.0, time.monotonic() - stable_t0)
-        log_success(
-            logger,
-            f"GRM (Effective SNPs: {eff_m}) ...Finished [{format_elapsed(stable_elapsed)}]",
-            force_color=True,
-        )
-    elif use_memmap_kernel:
+    if use_memmap_kernel:
         # logger.info(
-        #     "GRM backend: streaming BED kernel"
+        #     "GRM backend: memmap BED kernel"
         # )
         if args.block_target_mb is not None:
             logger.info(f"Packed GRM block target override: {float(args.block_target_mb):.6g} MB.")
@@ -676,9 +601,9 @@ def main(log: bool = True):
                 "Rust GRM Packed backend requires PLINK BED input/cache prefix. "
                 f"got={grm_input}"
             )
-        if _grm_packed_bed_f32 is None:
+        if _grm_packed_bed_f64 is None:
             raise RuntimeError(
-                "Rust packed GRM kernel is unavailable (`grm_packed_bed_f32`). "
+                "Rust packed GRM kernel is unavailable (`grm_packed_bed_f64`). "
                 "Rebuild JanusX extension."
             )
         logger.info("Memmap GRM kernel unavailable; fallback to Rust Packed BED backend.")
@@ -705,7 +630,7 @@ def main(log: bool = True):
         save_grm_npy_blocked(
             grm_path,
             grm,
-            dtype=np.float32,
+            dtype=np.float64,
         )
         id_path = f"{grm_path}.id"
         np.savetxt(id_path, sample_ids, fmt="%s")

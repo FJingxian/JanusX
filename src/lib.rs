@@ -140,8 +140,9 @@ use glm::{
 };
 use gmerge::{convert_genotypes, merge_genotypes, PyConvertStats, PyMergeStats};
 use grm::{
-    grm_packed_bed_f32, grm_packed_f32, grm_packed_f32_with_stats, grm_packed_f64_with_stats,
-    grm_sim_bench_f32, grm_stream_bed_f32, grm_stream_bed_f32_to_npy,
+    grm_packed_bed_f32, grm_packed_bed_f64, grm_packed_f32, grm_packed_f32_with_stats,
+    grm_packed_f64, grm_packed_f64_with_stats, grm_sim_bench_f32, grm_stream_bed_f32,
+    grm_stream_bed_f32_to_npy, grm_stream_bed_f64, grm_stream_bed_f64_to_npy,
 };
 use gs_native::{
     farmcpu_q_packed_grm_pca_f32, gblup_reml_packed_bed, packed_mtm_f64, rrblup_pcg_bed,
@@ -299,9 +300,13 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(top_rank_to_target_sample_py, m)?)?;
     m.add_function(wrap_pyfunction!(top_rank_to_target_values_py, m)?)?;
     m.add_function(wrap_pyfunction!(grm_packed_bed_f32, m)?)?;
+    m.add_function(wrap_pyfunction!(grm_packed_bed_f64, m)?)?;
     m.add_function(wrap_pyfunction!(grm_stream_bed_f32, m)?)?;
+    m.add_function(wrap_pyfunction!(grm_stream_bed_f64, m)?)?;
     m.add_function(wrap_pyfunction!(grm_stream_bed_f32_to_npy, m)?)?;
+    m.add_function(wrap_pyfunction!(grm_stream_bed_f64_to_npy, m)?)?;
     m.add_function(wrap_pyfunction!(grm_packed_f32, m)?)?;
+    m.add_function(wrap_pyfunction!(grm_packed_f64, m)?)?;
     m.add_function(wrap_pyfunction!(grm_packed_f32_with_stats, m)?)?;
     m.add_function(wrap_pyfunction!(grm_packed_f64_with_stats, m)?)?;
     m.add_function(wrap_pyfunction!(gstats_bed_site_stats, m)?)?;

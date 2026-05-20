@@ -1301,7 +1301,7 @@ def run_pca_with_backend_report(
 
 
 def backend_thread_checks(outdir: Path, *, bench_threads: int = 0) -> None:
-    nsnp_k = env_int("JX_GGVAL_BENCH_NSNP_K", 500, min_value=1)
+    nsnp_k = env_int("JX_GGVAL_BENCH_NSNP_K", 250, min_value=1)
     n_individuals = env_int("JX_GGVAL_BENCH_NIND", 5000, min_value=2)
     step(
         "STEP 4. Backend report and 1-core/all-core timing checks "
@@ -1374,7 +1374,7 @@ def backend_thread_checks(outdir: Path, *, bench_threads: int = 0) -> None:
         eigh_backend = str(jxrs.rust_eigh_lapack_backend()).strip()
         print(f"EIGH backend             : {eigh_backend}")
 
-        def run_eigh_once(threads: int) -> tuple[float, str]:
+        def run_eigh_once(threads: int) -> tuple[float, float, float, str]:
             t0 = time.perf_counter()
             ret = jxrs.rust_eigh_from_matrix_file_f64(
                 str(grm_file),
@@ -1383,12 +1383,14 @@ def backend_thread_checks(outdir: Path, *, bench_threads: int = 0) -> None:
                 jobz="N",
                 require_lapack=False,
             )
-            elapsed = time.perf_counter() - t0
+            total_elapsed = time.perf_counter() - t0
+            solve_elapsed = float(ret[9]) if len(ret) > 9 else float(total_elapsed)
+            load_decode_elapsed = max(0.0, float(total_elapsed) - float(solve_elapsed))
             evd_backend = str(ret[3]).strip()
-            return elapsed, evd_backend
+            return total_elapsed, solve_elapsed, load_decode_elapsed, evd_backend
 
-        eigh_t1, eigh_run_backend_1 = run_eigh_once(1)
-        eigh_tn, eigh_run_backend_n = run_eigh_once(full_cores)
+        eigh_t1, eigh_solve_t1, eigh_load_t1, eigh_run_backend_1 = run_eigh_once(1)
+        eigh_tn, eigh_solve_tn, eigh_load_tn, eigh_run_backend_n = run_eigh_once(full_cores)
         if eigh_run_backend_1 == eigh_run_backend_n:
             print(f"EIGH solve backend       : {eigh_run_backend_1}")
         else:
@@ -1397,8 +1399,12 @@ def backend_thread_checks(outdir: Path, *, bench_threads: int = 0) -> None:
                 f"1-core={eigh_run_backend_1}, {full_cores}-core={eigh_run_backend_n}"
             )
 
-        print(f"EIGH runtime  (1 core)   : {eigh_t1:.3f}s")
-        print(f"EIGH runtime  ({full_cores} cores): {eigh_tn:.3f}s")
+        print(f"EIGH total wall (1 core) : {eigh_t1:.3f}s")
+        print(f"EIGH total wall ({full_cores} cores): {eigh_tn:.3f}s")
+        print(f"EIGH pure solve (1 core) : {eigh_solve_t1:.3f}s")
+        print(f"EIGH pure solve ({full_cores} cores): {eigh_solve_tn:.3f}s")
+        print(f"EIGH load/decode (1 core): {eigh_load_t1:.3f}s")
+        print(f"EIGH load/decode ({full_cores} cores): {eigh_load_tn:.3f}s")
         print(f"GRM runtime   (1 core)   : {grm_t1:.3f}s")
         print(f"GRM runtime   ({full_cores} cores): {grm_tn:.3f}s")
     finally:
@@ -1419,7 +1425,7 @@ def he_thread_checks(
     stage_log_every: int = 8,
     logdir: Path | None = None,
 ) -> None:
-    default_nsnp_k = env_int("JX_GGVAL_BENCH_NSNP_K", 500, min_value=1)
+    default_nsnp_k = env_int("JX_GGVAL_BENCH_NSNP_K", 250, min_value=1)
     default_n_individuals = env_int("JX_GGVAL_BENCH_NIND", 5000, min_value=2)
     nsnp_k = env_int("JX_GGVAL_HE_BENCH_NSNP_K", default_nsnp_k, min_value=1)
     n_individuals = env_int("JX_GGVAL_HE_BENCH_NIND", default_n_individuals, min_value=2)
@@ -1746,7 +1752,7 @@ def pcg_thread_checks(
     stage_log_every: int = 100,
     logdir: Path | None = None,
 ) -> None:
-    default_nsnp_k = env_int("JX_GGVAL_BENCH_NSNP_K", 500, min_value=1)
+    default_nsnp_k = env_int("JX_GGVAL_BENCH_NSNP_K", 250, min_value=1)
     default_n_individuals = env_int("JX_GGVAL_BENCH_NIND", 5000, min_value=2)
     nsnp_k = env_int("JX_GGVAL_PCG_BENCH_NSNP_K", default_nsnp_k, min_value=1)
     n_individuals = env_int("JX_GGVAL_PCG_BENCH_NIND", default_n_individuals, min_value=2)

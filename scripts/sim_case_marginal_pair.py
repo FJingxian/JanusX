@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,6 +12,7 @@ from pathlib import Path
 import numpy as np
 from scipy import stats
 
+from janusx import janusx as jxrs
 from janusx.janusx import bed_ldblock_r2_rust, gwas_lmm_lm_null_lrt_decision, load_bed_u8_matrix
 from janusx.pyBLUP.assoc import FastLMM
 
@@ -24,10 +26,8 @@ DEFAULT_CHUNK_PREFIX = (
 DEFAULT_OUT_DIR = REPO_ROOT / "sim.case"
 DEFAULT_GRM = Path("~/cubic/cubic_All.maf0.02.cGRM.npy").expanduser()
 DEFAULT_GRM_ID = Path("~/cubic/cubic_All.maf0.02.cGRM.npy.id").expanduser()
-DEFAULT_SITE_STATS = (
-    REPO_ROOT
-    / "test.Tgarfield_out/summary/cubic_All.maf0.02.chunk.chr1.L1.R1.36299099_36799099.site_stats.tsv"
-)
+DEFAULT_SITE_STATS = None
+DEFAULT_LDSC_WINDOW = "100kb"
 
 
 @dataclass(frozen=True)
@@ -56,8 +56,34 @@ class PairCandidate:
     score: float
 
 
+@dataclass(frozen=True)
+class LdscWindowSpec:
+    kind: str
+    value: float
+    label: str
+
+
 def _out_path(prefix: Path, suffix: str) -> Path:
     return Path(f"{prefix}{suffix}")
+
+
+def _env_positive_int(name: str) -> int | None:
+    raw = str(os.environ.get(name, "")).strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
+def _default_threads() -> int:
+    for key in ("JANUSX_THREADS", "OMP_NUM_THREADS", "SLURM_CPUS_PER_TASK", "NSLOTS", "LSB_DJOB_NUMPROC", "PBS_NP"):
+        value = _env_positive_int(key)
+        if value is not None:
+            return value
+    return 1
 
 
 def _read_fam_ids(prefix: Path) -> list[str]:
@@ -105,6 +131,70 @@ def _read_site_stats(path: Path) -> dict[int, dict[str, object]]:
     return out
 
 
+def _parse_ldsc_window(text: str | None) -> LdscWindowSpec:
+    raw = DEFAULT_LDSC_WINDOW if text is None or str(text).strip() == "" else str(text).strip().lower()
+    compact = raw.replace(" ", "")
+    import re
+
+    m = re.fullmatch(r"([0-9]*\.?[0-9]+)([a-z]*)", compact)
+    if m is None:
+        raise ValueError(
+            f"Invalid --ldsc-window: {text!r}. Use forms like 100, 100kb, 0.1mb, 100000b, or 10cm."
+        )
+    value = float(m.group(1))
+    unit = str(m.group(2) or "")
+    if not np.isfinite(value) or value <= 0.0:
+        raise ValueError(f"--ldsc-window must be > 0, got {text!r}.")
+
+    if unit in {"", "snp", "snps"}:
+        if not float(value).is_integer():
+            raise ValueError(f"SNP-count LD-score window must be an integer, got {text!r}.")
+        v = int(round(value))
+        return LdscWindowSpec(kind="variants", value=float(v), label=f"{v}snp")
+    if unit in {"b", "bp"}:
+        bp = int(round(value))
+        return LdscWindowSpec(kind="bp", value=float(bp), label=f"{bp}b")
+    if unit == "kb":
+        bp = int(round(value * 1000.0))
+        return LdscWindowSpec(kind="bp", value=float(bp), label=compact)
+    if unit == "mb":
+        bp = int(round(value * 1_000_000.0))
+        return LdscWindowSpec(kind="bp", value=float(bp), label=compact)
+    if unit == "cm":
+        return LdscWindowSpec(kind="cm", value=float(value), label=compact)
+    raise ValueError(
+        f"Unsupported --ldsc-window unit in {text!r}. Use forms like 100, 100kb, 0.1mb, 100000b, or 10cm."
+    )
+
+
+def _candidate_site_stats_paths(chunk_prefix: Path, explicit: Path | None) -> list[Path]:
+    candidates: list[Path] = []
+    if explicit is not None:
+        candidates.append(explicit)
+    candidates.append(Path(f"{chunk_prefix}.site_stats.tsv"))
+    if chunk_prefix.parent.name == "chunks":
+        candidates.append(chunk_prefix.parent.parent / "summary" / f"{chunk_prefix.name}.site_stats.tsv")
+    else:
+        candidates.append(chunk_prefix.parent / "summary" / f"{chunk_prefix.name}.site_stats.tsv")
+    out: list[Path] = []
+    seen: set[str] = set()
+    for path in candidates:
+        resolved = path.expanduser()
+        key = str(resolved)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(resolved)
+    return out
+
+
+def _resolve_site_stats_path(chunk_prefix: Path, explicit: Path | None) -> Path | None:
+    for path in _candidate_site_stats_paths(chunk_prefix, explicit):
+        if path.is_file():
+            return path.resolve()
+    return None
+
+
 def _load_grm_matrix(path: Path) -> np.ndarray:
     arr = np.asarray(np.load(path), dtype=np.float64)
     if arr.ndim != 2 or arr.shape[0] != arr.shape[1]:
@@ -147,6 +237,16 @@ def _variance(x: np.ndarray) -> float:
     if arr.size <= 1:
         return 0.0
     return float(np.var(arr, ddof=1))
+
+
+def _maf_from_dosage(row: np.ndarray) -> float:
+    arr = np.asarray(row, dtype=np.float64).reshape(-1)
+    valid = np.isfinite(arr) & (arr >= 0.0)
+    if not np.any(valid):
+        return float("nan")
+    alt_freq = float(np.mean(arr[valid]) / 2.0)
+    alt_freq = min(max(alt_freq, 0.0), 1.0)
+    return float(min(alt_freq, 1.0 - alt_freq))
 
 
 def _collapse_to_logic_bin01(row: np.ndarray) -> np.ndarray:
@@ -299,6 +399,14 @@ def _make_site_infos(
         stats_row = site_stats.get(pos)
         if stats_row is None:
             continue
+        try:
+            maf = float(str(stats_row["freq"]))
+        except Exception:
+            continue
+        try:
+            ldsc = float(str(stats_row["ldsc"]))
+        except Exception:
+            ldsc = float("nan")
         out.append(
             SiteInfo(
                 row_index=int(row["row_index"]),
@@ -308,13 +416,98 @@ def _make_site_infos(
                 pos=pos,
                 ref=str(row["ref"]),
                 alt=str(row["alt"]),
-                maf=float(stats_row["freq"]),
-                ldsc=float(stats_row["ldsc"]),
+                maf=maf,
+                ldsc=ldsc,
             )
         )
     if not out:
         raise ValueError("No overlapping BIM/site-stats rows found.")
     return out
+
+
+def _derive_site_stats_from_chunk(
+    *,
+    chunk_prefix: Path,
+    bim_rows: list[dict[str, object]],
+    geno: np.ndarray,
+    ldsc_window: str,
+    threads: int,
+) -> tuple[dict[int, dict[str, object]], dict[str, object]]:
+    if len(bim_rows) != int(geno.shape[0]):
+        raise ValueError(f"BIM/genotype row mismatch: bim={len(bim_rows)}, geno={geno.shape[0]}")
+
+    out: dict[int, dict[str, object]] = {}
+    for row in bim_rows:
+        row_index = int(row["row_index"])
+        pos = int(row["pos"])
+        out[pos] = {
+            "chrom": str(row["chrom"]),
+            "pos": pos,
+            "freq": _maf_from_dosage(geno[row_index]),
+            "M": "",
+            "ldsc": float("nan"),
+        }
+
+    meta: dict[str, object] = {
+        "mode": "chunk-derived",
+        "path": None,
+        "freq_source": "genotype-dosage",
+        "ldsc_source": "missing",
+    }
+
+    if hasattr(jxrs, "gstats_bed_ldscore"):
+        window = _parse_ldsc_window(ldsc_window)
+        try:
+            m_raw, ld_raw, ld_n_samples = jxrs.gstats_bed_ldscore(
+                str(chunk_prefix),
+                str(window.kind),
+                float(window.value),
+                threads=int(max(1, threads)),
+            )
+            m_arr = np.asarray(m_raw, dtype=np.int64).reshape(-1)
+            ld_arr = np.asarray(ld_raw, dtype=np.float64).reshape(-1)
+            if len(m_arr) != len(bim_rows) or len(ld_arr) != len(bim_rows):
+                raise ValueError(
+                    f"BIM/ldscore length mismatch: bim={len(bim_rows)}, M={len(m_arr)}, ldsc={len(ld_arr)}"
+                )
+            for row, m_value, ld_value in zip(bim_rows, m_arr, ld_arr):
+                out[int(row["pos"])]["M"] = int(m_value)
+                out[int(row["pos"])]["ldsc"] = float(ld_value)
+            meta["ldsc_source"] = f"janusx.gstats_bed_ldscore[{window.label}]"
+            meta["ldsc_n_samples"] = int(ld_n_samples)
+        except Exception as exc:
+            meta["ldsc_error"] = repr(exc)
+
+    return out, meta
+
+
+def _load_site_stats(
+    *,
+    chunk_prefix: Path,
+    requested_path: Path | None,
+    bim_rows: list[dict[str, object]],
+    geno: np.ndarray,
+    ldsc_window: str,
+    threads: int,
+) -> tuple[dict[int, dict[str, object]], dict[str, object]]:
+    resolved = _resolve_site_stats_path(chunk_prefix, requested_path)
+    if resolved is not None:
+        return _read_site_stats(resolved), {
+            "mode": "file",
+            "path": str(resolved),
+            "freq_source": "site_stats.tsv",
+            "ldsc_source": "site_stats.tsv",
+        }
+    site_stats, meta = _derive_site_stats_from_chunk(
+        chunk_prefix=chunk_prefix,
+        bim_rows=bim_rows,
+        geno=geno,
+        ldsc_window=ldsc_window,
+        threads=threads,
+    )
+    if requested_path is not None:
+        meta["requested_path"] = str(requested_path)
+    return site_stats, meta
 
 
 def _choose_pair(
@@ -329,6 +522,7 @@ def _choose_pair(
     ld_block_r2_threshold: float,
     prefer_distinct_blocks: bool,
     target_pseudo_freq: float,
+    threads: int,
 ) -> tuple[PairCandidate, dict[str, object]]:
     positions = [s.pos for s in site_infos]
     chrom = str(site_infos[0].chrom)
@@ -339,7 +533,7 @@ def _choose_pair(
         [int(max(positions))],
         [chrom] * len(positions),
         [int(p) for p in positions],
-        threads=1,
+        threads=int(max(1, threads)),
     )
     r2_arr = np.asarray(r2_mat, dtype=np.float64)
     comp, comp_sizes = _connected_components(r2_arr, float(ld_block_r2_threshold))
@@ -415,11 +609,28 @@ def build_parser() -> argparse.ArgumentParser:
         )
     )
     p.add_argument("--chunk-prefix", default=str(DEFAULT_CHUNK_PREFIX), help="PLINK prefix for the chosen chunk.")
-    p.add_argument("--site-stats", default=str(DEFAULT_SITE_STATS), help="Chunk site_stats.tsv path.")
+    p.add_argument(
+        "--site-stats",
+        default=DEFAULT_SITE_STATS,
+        help=(
+            "Optional chunk site_stats.tsv path. If missing, the script will recover site statistics from the chunk."
+        ),
+    )
     p.add_argument("--out-dir", default=str(DEFAULT_OUT_DIR), help="Output directory.")
     p.add_argument("--prefix", default=None, help="Output prefix stem.")
     p.add_argument("--grm", default=str(DEFAULT_GRM), help="External GRM .npy path.")
     p.add_argument("--grm-id", default=str(DEFAULT_GRM_ID), help="External GRM ID file.")
+    p.add_argument(
+        "--ldsc-window",
+        default=DEFAULT_LDSC_WINDOW,
+        help="LD-score window used only when site stats must be recovered from the chunk.",
+    )
+    p.add_argument(
+        "--threads",
+        type=int,
+        default=_default_threads(),
+        help="Worker threads for LD/stat kernels. Defaults to scheduler env if available, else 1.",
+    )
     p.add_argument("--bg-pve", type=float, default=0.60, help="Background variance target.")
     p.add_argument("--gate-pve", type=float, default=0.04, help="Raw AND gate variance target.")
     p.add_argument("--seed", type=int, default=20260520, help="Random seed.")
@@ -459,10 +670,11 @@ def main() -> int:
     chunk_prefix = Path(args.chunk_prefix).expanduser().resolve()
     out_dir = Path(args.out_dir).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
-    site_stats_path = Path(args.site_stats).expanduser().resolve()
+    site_stats_path = Path(args.site_stats).expanduser() if args.site_stats else None
     chunk_id = chunk_prefix.name
     prefix_stem = str(args.prefix or f"{chunk_id}.marginal_pair.raw.and")
     out_prefix = out_dir / prefix_stem
+    threads = int(max(1, int(args.threads)))
     bg_pve = float(args.bg_pve)
     gate_pve = float(args.gate_pve)
     residual_var = 1.0 - bg_pve - gate_pve
@@ -471,10 +683,17 @@ def main() -> int:
 
     fam_ids = _read_fam_ids(chunk_prefix)
     bim_rows = _read_bim_rows(chunk_prefix)
-    site_stats = _read_site_stats(site_stats_path)
-    site_infos = _make_site_infos(bim_rows, site_stats)
     geno = load_bed_u8_matrix(str(chunk_prefix)).astype(np.float64)
     geno[geno == 3.0] = np.nan
+    site_stats, site_stats_meta = _load_site_stats(
+        chunk_prefix=chunk_prefix,
+        requested_path=site_stats_path,
+        bim_rows=bim_rows,
+        geno=geno,
+        ldsc_window=str(args.ldsc_window),
+        threads=threads,
+    )
+    site_infos = _make_site_infos(bim_rows, site_stats)
 
     pos_to_site = {s.pos: s for s in site_infos}
     pair_meta: dict[str, object]
@@ -482,7 +701,7 @@ def main() -> int:
         site1 = pos_to_site.get(int(args.site1))
         site2 = pos_to_site.get(int(args.site2))
         if site1 is None or site2 is None:
-            raise KeyError("Requested site1/site2 are not both present in chunk site stats.")
+            raise KeyError("Requested site1/site2 are not both present in the chunk metadata.")
         if site1.pos > site2.pos:
             site1, site2 = site2, site1
         positions = [s.pos for s in site_infos]
@@ -494,7 +713,7 @@ def main() -> int:
             [int(max(positions))],
             [chrom] * len(positions),
             [int(p) for p in positions],
-            threads=1,
+            threads=threads,
         )
         r2_arr = np.asarray(r2_mat, dtype=np.float64)
         comp, comp_sizes = _connected_components(r2_arr, float(args.ld_block_r2_threshold))
@@ -538,6 +757,7 @@ def main() -> int:
             ld_block_r2_threshold=float(args.ld_block_r2_threshold),
             prefer_distinct_blocks=not bool(args.allow_same_ld_block),
             target_pseudo_freq=float(args.target_pseudo_freq),
+            threads=threads,
         )
 
     g1 = geno[pair.site1.row_index].copy()
@@ -663,6 +883,7 @@ def main() -> int:
         "raw_gate_coef_before_scaling": float(coef0),
         "scaled_gate_effect": float(coef0 * gate_scale),
         "pair_search": pair_meta,
+        "site_stats": site_stats_meta,
         "grm": {
             "original_path": str(grm_path),
             "original_id_path": str(grm_id_path),
@@ -678,6 +899,7 @@ def main() -> int:
 
     print(f"Chunk        : {chunk_prefix}")
     print(f"Output prefix: {out_prefix}")
+    print(f"Site stats   : {site_stats_meta['mode']}")
     print(f"Chosen sites : {pair.site1.pos}, {pair.site2.pos}")
     print(f"Distance bp  : {pair.distance}")
     print(f"Pair r2      : {pair.pair_r2:.6f}")

@@ -1578,6 +1578,13 @@ fn grm_accum_probe_cache() -> &'static Mutex<HashMap<(usize, usize), GrmAccumMod
 
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 #[inline]
+fn grm_accum_probe_cache_f64() -> &'static Mutex<HashMap<(usize, usize), GrmAccumMode>> {
+    static CACHE: OnceLock<Mutex<HashMap<(usize, usize), GrmAccumMode>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+#[inline]
 fn grm_probe_accum_mode_f32(block: &[f32], rows: usize, n: usize) -> GrmAccumMode {
     if rows == 0 || n == 0 {
         return GrmAccumMode::Syrk;
@@ -1708,15 +1715,133 @@ fn resolve_grm_accum_mode_f32(
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+#[inline]
+fn grm_probe_accum_mode_f64(block: &[f64], rows: usize, n: usize) -> GrmAccumMode {
+    if rows == 0 || n == 0 {
+        return GrmAccumMode::Syrk;
+    }
+    let gemm_min_n = std::env::var("JX_GRM_ACCUM_GEMM_MIN_N")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(1024usize);
+    if n < gemm_min_n {
+        return GrmAccumMode::Syrk;
+    }
+    if let Ok(cache) = grm_accum_probe_cache_f64().lock() {
+        if let Some(mode) = cache.get(&(n, rows)).copied() {
+            return mode;
+        }
+    }
+
+    let probe_n = std::env::var("JX_GRM_ACCUM_PROBE_N")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(n)
+        .min(n);
+    let probe_k = std::env::var("JX_GRM_ACCUM_PROBE_K")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(rows.max(1))
+        .min(rows.max(1));
+    if probe_n == 0 || probe_k == 0 {
+        return GrmAccumMode::Syrk;
+    }
+
+    let mut probe_a = vec![0.0_f64; probe_k * probe_n];
+    for r in 0..probe_k {
+        let src = &block[r * n..r * n + probe_n];
+        let dst = &mut probe_a[r * probe_n..(r + 1) * probe_n];
+        dst.copy_from_slice(src);
+    }
+
+    let reps = std::env::var("JX_GRM_ACCUM_PROBE_REPEATS")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(2usize);
+    let bench = |mode: GrmAccumMode| -> f64 {
+        let mut best = f64::INFINITY;
+        let mut c = vec![0.0_f64; probe_n * probe_n];
+        for _ in 0..reps {
+            let t0 = Instant::now();
+            unsafe {
+                match mode {
+                    GrmAccumMode::Syrk => {
+                        cblas_dsyrk_dispatch(
+                            CBLAS_COL_MAJOR,
+                            CBLAS_UPPER,
+                            CBLAS_NO_TRANS,
+                            probe_n as CblasInt,
+                            probe_k as CblasInt,
+                            1.0,
+                            probe_a.as_ptr(),
+                            probe_n as CblasInt,
+                            0.0,
+                            c.as_mut_ptr(),
+                            probe_n as CblasInt,
+                        );
+                    }
+                    GrmAccumMode::Gemm => {
+                        cblas_dgemm_dispatch(
+                            CBLAS_COL_MAJOR,
+                            CBLAS_NO_TRANS,
+                            CBLAS_TRANS,
+                            probe_n as CblasInt,
+                            probe_n as CblasInt,
+                            probe_k as CblasInt,
+                            1.0,
+                            probe_a.as_ptr(),
+                            probe_n as CblasInt,
+                            probe_a.as_ptr(),
+                            probe_n as CblasInt,
+                            0.0,
+                            c.as_mut_ptr(),
+                            probe_n as CblasInt,
+                        );
+                    }
+                    GrmAccumMode::Auto => {}
+                }
+            }
+            let dt = t0.elapsed().as_secs_f64();
+            if dt < best {
+                best = dt;
+            }
+        }
+        best
+    };
+
+    let syrk_secs = bench(GrmAccumMode::Syrk);
+    let gemm_secs = bench(GrmAccumMode::Gemm);
+    let mode = if gemm_secs > 0.0 && gemm_secs < (syrk_secs * 0.90) {
+        GrmAccumMode::Gemm
+    } else {
+        GrmAccumMode::Syrk
+    };
+    if let Ok(mut cache) = grm_accum_probe_cache_f64().lock() {
+        cache.insert((n, rows), mode);
+    }
+    mode
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+#[inline]
+fn grm_probe_accum_mode_f64(_block: &[f64], _rows: usize, _n: usize) -> GrmAccumMode {
+    GrmAccumMode::Syrk
+}
+
 #[inline]
 fn resolve_grm_accum_mode_f64(
     mode: GrmAccumMode,
-    _block: &[f64],
-    _rows: usize,
-    _n: usize,
+    block: &[f64],
+    rows: usize,
+    n: usize,
 ) -> GrmAccumMode {
     if mode == GrmAccumMode::Auto {
-        GrmAccumMode::Syrk
+        grm_probe_accum_mode_f64(block, rows, n)
     } else {
         mode
     }

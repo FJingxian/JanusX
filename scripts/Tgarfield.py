@@ -279,6 +279,49 @@ def _thread_cap_env(threads: int) -> dict[str, str]:
     }
 
 
+def _auto_concurrency(
+    total_threads: int,
+    n_items: int,
+    *,
+    min_inner_threads: int = 1,
+    max_workers_cap: int | None = None,
+) -> tuple[int, int]:
+    total = max(1, int(total_threads))
+    items = max(1, int(n_items))
+    min_inner = max(1, int(min_inner_threads))
+    workers = max(1, total // min_inner)
+    workers = min(workers, items)
+    if max_workers_cap is not None:
+        workers = min(workers, max(1, int(max_workers_cap)))
+    inner_threads = max(1, total // max(1, workers))
+    return workers, inner_threads
+
+
+def _auto_stage3_concurrency(total_threads: int, n_chunks: int) -> tuple[int, int]:
+    min_inner = 2 if int(total_threads) >= 8 else 1
+    return _auto_concurrency(
+        total_threads,
+        n_chunks,
+        min_inner_threads=min_inner,
+        max_workers_cap=4,
+    )
+
+
+def _auto_stage5_concurrency(total_threads: int, n_plans: int) -> tuple[int, int]:
+    if int(total_threads) >= 12:
+        min_inner = 3
+    elif int(total_threads) >= 4:
+        min_inner = 2
+    else:
+        min_inner = 1
+    return _auto_concurrency(
+        total_threads,
+        n_plans,
+        min_inner_threads=min_inner,
+        max_workers_cap=6,
+    )
+
+
 def _single_thread_env() -> dict[str, str]:
     return _thread_cap_env(1)
 
@@ -1854,7 +1897,7 @@ def _run_plan_experiment(
     garfield_ext: int,
     garfield_raw: int | None,
     seed: int,
-    stage5_inner_threads: int,
+    threads: int,
     force: bool,
     runtime: WorkflowRuntime,
     subset_cache: dict[str, str],
@@ -1870,7 +1913,7 @@ def _run_plan_experiment(
         plan,
         plan_chunk_bfile=plan_chunk_bfile,
         subset_dir=subset_dir,
-        subset_threads=stage5_inner_threads,
+        subset_threads=threads,
         force=force,
         runtime=runtime,
         subset_cache=subset_cache,
@@ -1890,7 +1933,7 @@ def _run_plan_experiment(
         geno=geno,
         bg_pve=bg_pve,
         cs_pve=cs_pve,
-        threads=stage5_inner_threads,
+        threads=threads,
         seed=seed + idx,
         force=force,
         runtime=runtime,
@@ -1910,7 +1953,7 @@ def _run_plan_experiment(
         het=het,
         garfield_raw=garfield_raw,
         extension=garfield_ext,
-        threads=stage5_inner_threads,
+        threads=threads,
         force=force,
         runtime=runtime,
     )
@@ -1925,8 +1968,7 @@ def _run_plan_batch(
     task_title: str,
     plans: Sequence[ExperimentPlan],
     start_plan_idx: int,
-    experiment_jobs: int,
-    stage5_inner_threads: int,
+    threads: int,
     filtered_prefix: str,
     chunk_bfile_by_id: dict[str, str],
     subset_dir: Path,
@@ -1953,14 +1995,14 @@ def _run_plan_batch(
     if not plans:
         return results, failures, start_plan_idx
 
+    max_workers, stage5_inner_threads = _auto_stage5_concurrency(int(threads), len(plans))
     task_id = runtime.ui.add_stage(
         task_title,
         max(1, len(plans)),
-        current=f"jobs={experiment_jobs}, queued={len(plans)}",
+        current=f"threads={threads}, queued={len(plans)}",
     )
-    max_workers = min(max(1, int(experiment_jobs)), len(plans))
     runtime.logger.info(
-        "%s concurrency: jobs=%d, inner_threads=%d",
+        "%s concurrency: workers=%d, inner_threads=%d",
         task_title,
         max_workers,
         stage5_inner_threads,
@@ -1998,7 +2040,7 @@ def _run_plan_batch(
                 garfield_ext=garfield_ext,
                 garfield_raw=garfield_raw,
                 seed=seed,
-                stage5_inner_threads=stage5_inner_threads,
+                threads=stage5_inner_threads,
                 force=force,
                 runtime=runtime,
                 subset_cache=subset_cache,
@@ -2057,7 +2099,7 @@ def _run_plan_batch(
                         garfield_ext=garfield_ext,
                         garfield_raw=garfield_raw,
                         seed=seed,
-                        stage5_inner_threads=stage5_inner_threads,
+                        threads=stage5_inner_threads,
                         force=force,
                         runtime=runtime,
                         subset_cache=subset_cache,
@@ -2087,8 +2129,7 @@ def _collect_chunk_stats(
     out_dir: Path,
     summary_dir: Path,
     ldsc_window: str,
-    stage3_jobs: int,
-    stage3_inner_threads: int,
+    threads: int,
     force: bool,
     runtime: WorkflowRuntime,
 ) -> tuple[dict[str, pd.DataFrame], list[dict[str, object]]]:
@@ -2100,9 +2141,12 @@ def _collect_chunk_stats(
     chunk_order = {chunk.chunk_id: i for i, chunk in enumerate(chunks)}
     chunk_stats: dict[str, pd.DataFrame] = {}
     chunk_stat_rows: list[dict[str, object]] = []
-    stage3_workers = min(max(1, int(stage3_jobs)), len(chunks)) if chunks else 1
+    stage3_workers, stage3_inner_threads = _auto_stage3_concurrency(
+        int(threads),
+        len(chunks),
+    )
     runtime.logger.info(
-        "%s concurrency: jobs=%d, inner_threads=%d",
+        "%s concurrency: workers=%d, inner_threads=%d",
         task_title,
         stage3_workers,
         stage3_inner_threads,
@@ -2862,35 +2906,17 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
+        "-t",
+        "--thread",
         "--threads",
+        dest="threads",
         type=int,
         default=4,
-        help="Thread count for setup-stage jx subcommands (filter/chunks/gstats).",
+        help="Unified thread/process budget for all workflow stages.",
     )
-    p.add_argument(
-        "--stage3-jobs",
-        type=int,
-        default=None,
-        help=(
-            "Concurrent chunk-level jx gstats jobs in the selected-chunk stats phase. "
-            "Default: auto = min(4, --threads)."
-        ),
-    )
-    p.add_argument(
-        "--jobs",
-        type=int,
-        default=None,
-        help="Concurrent simulation+GARFIELD experiments in stage 5 (default: use --threads).",
-    )
-    p.add_argument(
-        "--stage5-inner-threads",
-        type=int,
-        default=None,
-        help=(
-            "Per-experiment inner thread cap for stage 5 simulation/GARFIELD jobs. "
-            "Default: auto = max(1, floor(--threads / --jobs))."
-        ),
-    )
+    p.add_argument("--stage3-jobs", type=int, default=None, help=argparse.SUPPRESS)
+    p.add_argument("--jobs", type=int, default=None, help=argparse.SUPPRESS)
+    p.add_argument("--stage5-inner-threads", type=int, default=None, help=argparse.SUPPRESS)
     p.add_argument("--seed", type=int, default=20260518, help="Workflow random seed.")
     p.add_argument(
         "--causal-sizes",
@@ -2959,19 +2985,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.garfield_raw is not None and int(args.garfield_raw) < 1:
         parser.error("--garfield-raw must be >= 1.")
     t0 = time.time()
-    if args.stage3_jobs is None:
-        stage3_jobs = min(4, max(1, int(args.threads)))
-    else:
-        stage3_jobs = max(1, int(args.stage3_jobs))
-    stage3_inner_threads = max(1, int(args.threads) // stage3_jobs)
-    args.stage3_jobs_effective = stage3_jobs
-    args.stage3_inner_threads_effective = stage3_inner_threads
-    experiment_jobs = max(1, int(args.jobs if args.jobs is not None else args.threads))
-    if args.stage5_inner_threads is None:
-        stage5_inner_threads = max(1, int(args.threads) // experiment_jobs)
-    else:
-        stage5_inner_threads = max(1, int(args.stage5_inner_threads))
-    args.stage5_inner_threads_effective = stage5_inner_threads
 
     bfile = _normalize_prefix(str(args.bfile)) if args.bfile else ""
     prefix = str(args.prefix).strip() if args.prefix else (Path(bfile).name if bfile != "" else "")
@@ -3021,11 +3034,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             ("GRM", display_grm),
             ("Output", out_root),
             ("Prefix", display_prefix),
-            ("Setup threads", int(args.threads)),
-            ("Gstats jobs", stage3_jobs),
-            ("Gstats inner threads", stage3_inner_threads),
-            ("Experiment jobs", experiment_jobs),
-            ("Stage5 inner threads", stage5_inner_threads),
+            ("Threads", int(args.threads)),
             ("Chunk repeats", display_chunk_repeats),
             ("Chunk length", display_chunk_len),
             ("Stratified chunks", display_stratified_chunks),
@@ -3040,6 +3049,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     logger.info("Workflow prefix: %s", display_prefix)
     logger.info("Using simulation module: jx simulation")
+    if any(
+        getattr(args, name) is not None
+        for name in ("stage3_jobs", "jobs", "stage5_inner_threads")
+    ):
+        logger.warning(
+            "Deprecated concurrency options (--stage3-jobs/--jobs/--stage5-inner-threads) "
+            "are ignored; using -t/--threads only."
+        )
 
     ui.start()
     try:
@@ -3172,8 +3189,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             task_title="3/6 Chunk-random simulation + GARFIELD",
             plans=chunk_random_plans,
             start_plan_idx=next_plan_idx,
-            experiment_jobs=experiment_jobs,
-            stage5_inner_threads=stage5_inner_threads,
+            threads=int(args.threads),
             filtered_prefix=filtered_prefix,
             chunk_bfile_by_id=chunk_bfile_by_id,
             subset_dir=subset_dir,
@@ -3228,8 +3244,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 out_dir=chunk_stats_dir,
                 summary_dir=summary_dir,
                 ldsc_window=str(args.ldsc_window),
-                stage3_jobs=stage3_jobs,
-                stage3_inner_threads=stage3_inner_threads,
+                threads=int(args.threads),
                 force=bool(args.force),
                 runtime=runtime,
             )
@@ -3264,8 +3279,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             task_title="5/6 Stratified simulation + GARFIELD",
             plans=stratified_plans,
             start_plan_idx=next_plan_idx,
-            experiment_jobs=experiment_jobs,
-            stage5_inner_threads=stage5_inner_threads,
+            threads=int(args.threads),
             filtered_prefix=filtered_prefix,
             chunk_bfile_by_id=chunk_bfile_by_id,
             subset_dir=subset_dir,

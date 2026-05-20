@@ -692,7 +692,7 @@ def main() -> None:
         if args.beam_topk_compat is not None:
             args.beam_topk = str(int(args.beam_topk_compat))
         else:
-            args.beam_topk = "0.1"
+            args.beam_topk = "1"
     try:
         args.beam_topk_count, args.beam_topk_ratio = _parse_beam_topk_spec(args.beam_topk)
     except ValueError as e:

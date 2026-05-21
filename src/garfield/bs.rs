@@ -17,6 +17,7 @@ const GARFIELD_BEAM_PAR_CHUNK_CANDS: usize = 128;
 const GARFIELD_INITIAL_SINGLETON_NEGATIONS: [bool; 1] = [false];
 const GARFIELD_AND_PAIR_GAIN_SINGLETON_WEIGHT: f64 = 0.70;
 const GARFIELD_AND_PAIR_GAIN_SINGLETON_WEIGHT_WITH_NULL: f64 = 0.35;
+const GARFIELD_AND_TRIPLE_GAIN_SINGLETON_WEIGHT_WITH_NULL: f64 = 0.70;
 const GARFIELD_AND_ONLY_NOT_EXTRA_PENALTY_WITH_NULL: f64 = 0.15;
 const GARFIELD_AND_NOT_SHORTER_SUBRULE_GAIN_MAX: f64 = 0.08;
 const GARFIELD_AND_NOT_SHORTER_SUBRULE_HAMMING_FRAC_MAX: f64 = 0.05;
@@ -283,15 +284,18 @@ fn gain_singleton_baseline_weight(
     rule_len: usize,
     params: &BeamSearchParams,
 ) -> f64 {
-    if matches!(gate, GateBucket::And) && rule_len == 2 {
-        if params.null_penalties.is_some() {
-            GARFIELD_AND_PAIR_GAIN_SINGLETON_WEIGHT_WITH_NULL
-        } else {
-            GARFIELD_AND_PAIR_GAIN_SINGLETON_WEIGHT
+    if matches!(gate, GateBucket::And) {
+        if rule_len == 2 {
+            if params.null_penalties.is_some() {
+                return GARFIELD_AND_PAIR_GAIN_SINGLETON_WEIGHT_WITH_NULL;
+            }
+            return GARFIELD_AND_PAIR_GAIN_SINGLETON_WEIGHT;
         }
-    } else {
-        1.0
+        if rule_len == 3 && params.null_penalties.is_some() {
+            return GARFIELD_AND_TRIPLE_GAIN_SINGLETON_WEIGHT_WITH_NULL;
+        }
     }
+    1.0
 }
 
 #[inline]
@@ -1785,7 +1789,10 @@ fn collapse_surrogate_candidate(
                 break;
             }
         }
-        while current_rule.len() > 2 && rule_is_pure_and(&current_rule) {
+        while current_rule.len() > 2
+            && rule_is_pure_and(&current_rule)
+            && current_rule.not_count() > 0
+        {
             let mut best_subrule: Option<(BeamRuleCandidate, Vec<u64>, f64)> = None;
             for drop_idx in 0..current_rule.len() {
                 let Some(subrule) = drop_literal_from_pure_rule(&current_rule, drop_idx) else {
@@ -2569,6 +2576,21 @@ mod tests {
     }
 
     #[test]
+    fn test_interaction_gain_scoring_tempers_and_triple_with_null_penalty() {
+        let params = BeamSearchParams {
+            rank_mode: BeamRankMode::InteractionGain,
+            logic_gate_mode: BeamLogicGateMode::AndOnly,
+            null_penalties: Some(Arc::new(
+                super::super::permutation::RuleNullPenaltyLookup::default(),
+            )),
+            ..BeamSearchParams::default()
+        };
+        let triple_score =
+            rank_rule_score_components_with_gate(GateBucket::And, 3, 0, 0.8, 0.6, &params);
+        assert!((triple_score - 0.38).abs() < 1e-12);
+    }
+
+    #[test]
     fn test_or_rule_keeps_raw_score_under_gain_mode() {
         let rule = BeamRule {
             first: BeamLiteral {
@@ -3235,5 +3257,118 @@ mod tests {
         assert_eq!(collapsed.rule.first.row_index, 0);
         assert_eq!(collapsed.rule.rest[0].1.row_index, 1);
         assert!(!collapsed.rule.rest[0].1.negated);
+    }
+
+    #[test]
+    fn test_surrogate_pure_and_triple_does_not_collapse_to_pair() {
+        let mut row_a = vec![0u8; 20];
+        let mut row_b = vec![0u8; 20];
+        let mut row_c = vec![0u8; 20];
+        for idx in 0..10 {
+            row_a[idx] = 1;
+            row_b[idx] = 1;
+            row_c[idx] = 1;
+        }
+        row_c[0] = 0;
+        let rows = vec![row_a, row_b, row_c];
+        let y = vec![
+            3.0, 3.1, 2.9, 3.2, 2.8, 3.0, 3.1, 2.9, 3.0, 3.2, -3.0, -3.1, -2.9, -3.2, -2.8, -3.0,
+            -3.1, -2.9, -3.0, -3.2,
+        ];
+        let (bits, row_words) = pack_rows(&rows, y.len());
+        let params = BeamSearchParams {
+            logic_gate_mode: BeamLogicGateMode::AndOnly,
+            rank_mode: BeamRankMode::InteractionGain,
+            surrogate_test_gain_max: 0.20,
+            surrogate_hamming_frac_max: 0.20,
+            ..BeamSearchParams::default()
+        };
+        let literal_scores = precompute_literal_singleton_scores(
+            &y,
+            &bits,
+            row_words,
+            words_for_samples(y.len()),
+            y.len(),
+            &y,
+            &bits,
+            row_words,
+            words_for_samples(y.len()),
+            y.len(),
+            rows.len(),
+        );
+        let child_rule = BeamRule {
+            first: BeamLiteral {
+                row_index: 0,
+                group_id: 0,
+                negated: false,
+            },
+            rest: vec![
+                (
+                    BeamBinaryOp::And,
+                    BeamLiteral {
+                        row_index: 1,
+                        group_id: 1,
+                        negated: false,
+                    },
+                ),
+                (
+                    BeamBinaryOp::And,
+                    BeamLiteral {
+                        row_index: 2,
+                        group_id: 2,
+                        negated: false,
+                    },
+                ),
+            ],
+        };
+        let child_train = evaluate_rule_continuous(
+            &child_rule,
+            &y,
+            &bits,
+            row_words,
+            rows.len(),
+            y.len(),
+            0.0,
+            0.0,
+        )
+        .unwrap();
+        let max_singleton_train_raw =
+            rule_max_singleton_raw(&child_rule, literal_scores.as_slice(), true);
+        let max_singleton_test_raw =
+            rule_max_singleton_raw(&child_rule, literal_scores.as_slice(), false);
+        let child_bits =
+            materialize_rule_bits(&child_rule, &bits, row_words, rows.len(), y.len()).unwrap();
+        let (child_abs, child_score) = train_scores_for_rule(
+            &child_rule,
+            child_train,
+            max_singleton_train_raw,
+            Some(0.0),
+            &params,
+        );
+        let state = BeamState {
+            rule: child_rule,
+            combined_train: child_bits,
+            train: child_train,
+            train_abs_score: child_abs,
+            train_score: child_score,
+            max_singleton_train_raw,
+            max_singleton_test_raw,
+        };
+        let collapsed = collapse_surrogate_candidate(
+            &state,
+            &y,
+            &bits,
+            row_words,
+            rows.len(),
+            y.len(),
+            &y,
+            &bits,
+            row_words,
+            y.len(),
+            literal_scores.as_slice(),
+            &params,
+        )
+        .unwrap();
+        assert_eq!(collapsed.rule.len(), 3);
     }
 }

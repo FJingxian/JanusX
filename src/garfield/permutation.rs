@@ -14,6 +14,8 @@ pub const DEFAULT_RULE_STRUCTURE_BOOTSTRAP_STABLE_REPEATS: usize = 3;
 pub const DEFAULT_RULE_STRUCTURE_BOOTSTRAP_KL_THRESHOLD: f64 = 0.005;
 pub const DEFAULT_RULE_STRUCTURE_DENSITY_TOPK: usize = 10;
 const DEFAULT_RULE_NULL_QUANTILE: f64 = 0.99;
+const DEFAULT_RULE_NULL_QUANTILE_AND_LEN2: f64 = 0.975;
+const DEFAULT_RULE_NULL_QUANTILE_AND_LEN3P: f64 = 0.985;
 const PSEUDO_SNP_MAF_BOUNDARY: f64 = 0.05;
 const STRUCTURE_PRIOR_LEN_ALPHA: [f64; 5] = [16.0, 8.0, 4.0, 2.0, 1.0];
 const STRUCTURE_PRIOR_TARGET_ESS: f64 = 24.0;
@@ -133,6 +135,51 @@ impl RuleNullBucket {
             base
         }
     }
+
+    #[inline]
+    fn from_collapsed_gate_index(idx: usize) -> Self {
+        let maf = if (idx & 1) == 0 {
+            MafBucket::Low
+        } else {
+            MafBucket::High
+        };
+        let has_not = ((idx >> 1) & 1) != 0;
+        let rule_len = ((idx >> 2) + 1).clamp(1, 5);
+        Self {
+            gate: GateBucket::And,
+            rule_len,
+            has_not,
+            maf,
+        }
+    }
+
+    #[inline]
+    fn from_exact_index(idx: usize, use_gate_dim: bool) -> Self {
+        if !use_gate_dim {
+            return Self::from_collapsed_gate_index(idx);
+        }
+        let gate = if (idx & 1) == 0 {
+            GateBucket::And
+        } else {
+            GateBucket::Or
+        };
+        let mut bucket = Self::from_collapsed_gate_index(idx >> 1);
+        bucket.gate = gate;
+        bucket
+    }
+}
+
+#[inline]
+fn null_quantile_for_bucket(bucket: RuleNullBucket) -> f64 {
+    if matches!(bucket.gate, GateBucket::And) && !bucket.has_not {
+        if bucket.rule_len == 2 {
+            return DEFAULT_RULE_NULL_QUANTILE_AND_LEN2;
+        }
+        if bucket.rule_len >= 3 {
+            return DEFAULT_RULE_NULL_QUANTILE_AND_LEN3P;
+        }
+    }
+    DEFAULT_RULE_NULL_QUANTILE
 }
 
 #[inline]
@@ -450,16 +497,17 @@ impl RuleNullCalibrator {
     pub fn finalize(&self) -> RuleNullPenaltyLookup {
         let mut out = RuleNullPenaltyLookup::new(self.use_gate_dim);
         for (idx, scores) in self.exact.iter().enumerate() {
-            out.exact_train[idx] =
-                quantile_nearest_rank(scores.train.as_slice(), DEFAULT_RULE_NULL_QUANTILE);
-            out.exact_test[idx] =
-                quantile_nearest_rank(scores.test.as_slice(), DEFAULT_RULE_NULL_QUANTILE);
+            let bucket = RuleNullBucket::from_exact_index(idx, self.use_gate_dim);
+            let quantile = null_quantile_for_bucket(bucket);
+            out.exact_train[idx] = quantile_nearest_rank(scores.train.as_slice(), quantile);
+            out.exact_test[idx] = quantile_nearest_rank(scores.test.as_slice(), quantile);
         }
         for (idx, scores) in self.collapsed_gate.iter().enumerate() {
+            let bucket = RuleNullBucket::from_collapsed_gate_index(idx);
+            let quantile = null_quantile_for_bucket(bucket);
             out.collapsed_gate_train[idx] =
-                quantile_nearest_rank(scores.train.as_slice(), DEFAULT_RULE_NULL_QUANTILE);
-            out.collapsed_gate_test[idx] =
-                quantile_nearest_rank(scores.test.as_slice(), DEFAULT_RULE_NULL_QUANTILE);
+                quantile_nearest_rank(scores.train.as_slice(), quantile);
+            out.collapsed_gate_test[idx] = quantile_nearest_rank(scores.test.as_slice(), quantile);
         }
         out.global_train =
             quantile_nearest_rank(self.global.train.as_slice(), DEFAULT_RULE_NULL_QUANTILE);
@@ -683,6 +731,40 @@ mod tests {
         }
         let lookup = cal.finalize();
         assert_eq!(lookup.train_penalty(bucket).unwrap(), 100.0);
+    }
+
+    #[test]
+    fn test_and_len2_bucket_uses_gentler_null_quantile() {
+        let mut cal = RuleNullCalibrator::new(false);
+        let bucket = RuleNullBucket {
+            gate: GateBucket::And,
+            rule_len: 2,
+            has_not: false,
+            maf: MafBucket::High,
+        };
+        for v in 1..=40 {
+            let fv = v as f64;
+            cal.insert(bucket, fv, fv);
+        }
+        let lookup = cal.finalize();
+        assert_eq!(lookup.train_penalty(bucket).unwrap(), 39.0);
+    }
+
+    #[test]
+    fn test_and_not_bucket_keeps_strict_q99_null_quantile() {
+        let mut cal = RuleNullCalibrator::new(false);
+        let bucket = RuleNullBucket {
+            gate: GateBucket::And,
+            rule_len: 2,
+            has_not: true,
+            maf: MafBucket::High,
+        };
+        for v in 1..=40 {
+            let fv = v as f64;
+            cal.insert(bucket, fv, fv);
+        }
+        let lookup = cal.finalize();
+        assert_eq!(lookup.train_penalty(bucket).unwrap(), 40.0);
     }
 
     #[test]

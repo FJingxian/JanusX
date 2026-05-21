@@ -16,6 +16,8 @@ const GARFIELD_BEAM_PAR_MIN_TOTAL_CANDS: usize = 1_024;
 const GARFIELD_BEAM_PAR_CHUNK_CANDS: usize = 128;
 const GARFIELD_INITIAL_SINGLETON_NEGATIONS: [bool; 1] = [false];
 const GARFIELD_AND_PAIR_GAIN_SINGLETON_WEIGHT: f64 = 0.85;
+const GARFIELD_AND_NOT_SHORTER_SUBRULE_GAIN_MAX: f64 = 0.08;
+const GARFIELD_AND_NOT_SHORTER_SUBRULE_HAMMING_FRAC_MAX: f64 = 0.05;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum BeamBinaryOp {
@@ -257,6 +259,15 @@ fn rule_is_pure_or(rule: &BeamRule) -> bool {
             .rest
             .iter()
             .all(|(op, _)| matches!(op, BeamBinaryOp::Or))
+}
+
+#[inline]
+fn rule_is_pure_and(rule: &BeamRule) -> bool {
+    !rule.rest.is_empty()
+        && rule
+            .rest
+            .iter()
+            .all(|(op, _)| matches!(op, BeamBinaryOp::And))
 }
 
 #[inline]
@@ -1587,6 +1598,50 @@ fn singleton_literal_map(rule: &BeamRule) -> Vec<(usize, usize)> {
     out
 }
 
+fn pure_rule_literals(rule: &BeamRule) -> Option<(BeamBinaryOp, Vec<BeamLiteral>)> {
+    let op = rule.rest.first().map(|(op, _)| *op)?;
+    if !rule.rest.iter().all(|(rest_op, _)| *rest_op == op) {
+        return None;
+    }
+    let mut lits = Vec::<BeamLiteral>::with_capacity(rule.len());
+    lits.push(rule.first);
+    lits.extend(rule.rest.iter().map(|(_, lit)| *lit));
+    Some((op, lits))
+}
+
+fn drop_literal_from_pure_rule(rule: &BeamRule, drop_idx: usize) -> Option<BeamRule> {
+    let (op, mut lits) = pure_rule_literals(rule)?;
+    if lits.len() <= 1 || drop_idx >= lits.len() {
+        return None;
+    }
+    lits.remove(drop_idx);
+    let first = *lits.first()?;
+    let rest = lits
+        .into_iter()
+        .skip(1)
+        .map(|lit| (op, lit))
+        .collect::<Vec<_>>();
+    Some(BeamRule { first, rest })
+}
+
+#[inline]
+fn shorter_subrule_surrogate_limits(
+    current_rule: &BeamRule,
+    subrule: &BeamRule,
+    params: &BeamSearchParams,
+) -> (f64, f64) {
+    let mut max_gain = params.surrogate_test_gain_max;
+    let mut max_hamming = params.surrogate_hamming_frac_max;
+    if rule_is_pure_and(current_rule)
+        && rule_is_pure_and(subrule)
+        && current_rule.not_count() > subrule.not_count()
+    {
+        max_gain = max_gain.max(GARFIELD_AND_NOT_SHORTER_SUBRULE_GAIN_MAX);
+        max_hamming = max_hamming.max(GARFIELD_AND_NOT_SHORTER_SUBRULE_HAMMING_FRAC_MAX);
+    }
+    (max_gain, max_hamming)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn collapse_surrogate_candidate(
     state: &BeamState,
@@ -1705,6 +1760,112 @@ fn collapse_surrogate_candidate(
             if current_rule.len() <= 1 {
                 break;
             }
+        }
+        while current_rule.len() > 2 && rule_is_pure_and(&current_rule) {
+            let mut best_subrule: Option<(BeamRuleCandidate, Vec<u64>, f64)> = None;
+            for drop_idx in 0..current_rule.len() {
+                let Some(subrule) = drop_literal_from_pure_rule(&current_rule, drop_idx) else {
+                    continue;
+                };
+                let (gain_limit, hamming_limit) =
+                    shorter_subrule_surrogate_limits(&current_rule, &subrule, params);
+                if !(gain_limit.is_finite() && gain_limit > 0.0) {
+                    continue;
+                }
+                if !(hamming_limit.is_finite() && hamming_limit > 0.0) {
+                    continue;
+                }
+                let subrule_bits_test =
+                    materialize_rule_bits(&subrule, bits_test, row_words_test, n_rows, n_test)?;
+                let diff_frac = bit_hamming_fraction(
+                    current_bits_test.as_slice(),
+                    subrule_bits_test.as_slice(),
+                    n_test,
+                );
+                if diff_frac > hamming_limit {
+                    continue;
+                }
+                let subrule_test = evaluate_rule_continuous(
+                    &subrule,
+                    y_test,
+                    bits_test,
+                    row_words_test,
+                    n_rows,
+                    n_test,
+                    params.lambda_len,
+                    params.lambda_not,
+                )?;
+                let subrule_test_score = final_rule_score_for_eval(
+                    &subrule,
+                    &subrule_test,
+                    y_test,
+                    bits_test,
+                    row_words_test,
+                    n_rows,
+                    n_test,
+                    literal_scores,
+                    params,
+                    false,
+                )?;
+                if !surrogate_delta_small_enough(current_test_score, subrule_test_score, gain_limit)
+                {
+                    continue;
+                }
+                let subrule_train = evaluate_rule_continuous(
+                    &subrule,
+                    y_train,
+                    bits_train,
+                    row_words_train,
+                    n_rows,
+                    n_train,
+                    params.lambda_len,
+                    params.lambda_not,
+                )?;
+                let subrule_train_score = final_rule_score_for_eval(
+                    &subrule,
+                    &subrule_train,
+                    y_train,
+                    bits_train,
+                    row_words_train,
+                    n_rows,
+                    n_train,
+                    literal_scores,
+                    params,
+                    true,
+                )?;
+                let subrule_cand = BeamRuleCandidate {
+                    rule: subrule,
+                    train_score: subrule_train_score,
+                    test_score: subrule_test_score,
+                    train: subrule_train,
+                    test: subrule_test,
+                };
+                match best_subrule.as_mut() {
+                    Some((best_cand, best_bits, best_diff)) => {
+                        if cmp_candidate(&subrule_cand, best_cand) == std::cmp::Ordering::Less
+                            || (cmp_candidate(&subrule_cand, best_cand)
+                                == std::cmp::Ordering::Equal
+                                && diff_frac < *best_diff)
+                        {
+                            *best_cand = subrule_cand;
+                            *best_bits = subrule_bits_test;
+                            *best_diff = diff_frac;
+                        }
+                    }
+                    None => {
+                        best_subrule = Some((subrule_cand, subrule_bits_test, diff_frac));
+                    }
+                }
+            }
+            let Some((subrule_cand, subrule_bits_test, _)) = best_subrule else {
+                break;
+            };
+            current_rule = subrule_cand.rule;
+            current_train = subrule_cand.train;
+            current_train_score = subrule_cand.train_score;
+            current_test = subrule_cand.test;
+            current_test_score = subrule_cand.test_score;
+            current_bits_test = subrule_bits_test;
         }
         if current_rule.len() > 1 {
             let mut best_singleton: Option<(BeamRuleCandidate, f64)> = None;
@@ -2877,5 +3038,116 @@ mod tests {
         assert_eq!(collapsed.rule.len(), 1);
         assert_eq!(collapsed.rule.first.row_index, 1);
         assert!(!collapsed.rule.first.negated);
+    }
+
+    #[test]
+    fn test_surrogate_and_not_proxy_collapses_to_shorter_and_subrule() {
+        let rows = vec![
+            vec![1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            vec![1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            vec![1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        ];
+        let y = vec![
+            3.0, 3.1, 2.9, 3.2, 2.8, 3.0, 3.1, 2.9, 3.0, 3.2, -3.0, -3.1, -2.9, -3.2, -2.8, -3.0,
+            -3.1, -2.9, -3.0, -3.2,
+        ];
+        let (bits, row_words) = pack_rows(&rows, y.len());
+        let params = BeamSearchParams {
+            logic_gate_mode: BeamLogicGateMode::AndOnly,
+            rank_mode: BeamRankMode::InteractionGain,
+            surrogate_test_gain_max: 0.02,
+            surrogate_hamming_frac_max: 0.02,
+            ..BeamSearchParams::default()
+        };
+        let literal_scores = precompute_literal_singleton_scores(
+            &y,
+            &bits,
+            row_words,
+            words_for_samples(y.len()),
+            y.len(),
+            &y,
+            &bits,
+            row_words,
+            words_for_samples(y.len()),
+            y.len(),
+            rows.len(),
+        );
+        let child_rule = BeamRule {
+            first: BeamLiteral {
+                row_index: 0,
+                group_id: 0,
+                negated: false,
+            },
+            rest: vec![
+                (
+                    BeamBinaryOp::And,
+                    BeamLiteral {
+                        row_index: 1,
+                        group_id: 1,
+                        negated: false,
+                    },
+                ),
+                (
+                    BeamBinaryOp::And,
+                    BeamLiteral {
+                        row_index: 2,
+                        group_id: 2,
+                        negated: true,
+                    },
+                ),
+            ],
+        };
+        let child_train = evaluate_rule_continuous(
+            &child_rule,
+            &y,
+            &bits,
+            row_words,
+            rows.len(),
+            y.len(),
+            0.0,
+            0.0,
+        )
+        .unwrap();
+        let max_singleton_train_raw =
+            rule_max_singleton_raw(&child_rule, literal_scores.as_slice(), true);
+        let max_singleton_test_raw =
+            rule_max_singleton_raw(&child_rule, literal_scores.as_slice(), false);
+        let child_bits =
+            materialize_rule_bits(&child_rule, &bits, row_words, rows.len(), y.len()).unwrap();
+        let (child_abs, child_score) = train_scores_for_rule(
+            &child_rule,
+            child_train,
+            max_singleton_train_raw,
+            Some(0.0),
+            &params,
+        );
+        let state = BeamState {
+            rule: child_rule,
+            combined_train: child_bits,
+            train: child_train,
+            train_abs_score: child_abs,
+            train_score: child_score,
+            max_singleton_train_raw,
+            max_singleton_test_raw,
+        };
+        let collapsed = collapse_surrogate_candidate(
+            &state,
+            &y,
+            &bits,
+            row_words,
+            rows.len(),
+            y.len(),
+            &y,
+            &bits,
+            row_words,
+            y.len(),
+            literal_scores.as_slice(),
+            &params,
+        )
+        .unwrap();
+        assert_eq!(collapsed.rule.len(), 2);
+        assert_eq!(collapsed.rule.first.row_index, 0);
+        assert_eq!(collapsed.rule.rest[0].1.row_index, 1);
+        assert!(!collapsed.rule.rest[0].1.negated);
     }
 }

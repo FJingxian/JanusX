@@ -18,6 +18,8 @@ const DEFAULT_RULE_NULL_QUANTILE_AND_LEN2: f64 = 0.975;
 const DEFAULT_RULE_NULL_QUANTILE_AND_LEN3P: f64 = 0.985;
 const DEFAULT_RULE_NULL_TOPK_AND_LEN2: usize = 3;
 const DEFAULT_RULE_NULL_TOPK_AND_LEN3P: usize = 2;
+const DEFAULT_RULE_NULL_SHRINK_AND_LEN2_WEIGHTS: (f64, f64, f64) = (0.45, 0.35, 0.20);
+const DEFAULT_RULE_NULL_SHRINK_AND_LEN3P_WEIGHTS: (f64, f64, f64) = (0.55, 0.30, 0.15);
 const PSEUDO_SNP_MAF_BOUNDARY: f64 = 0.05;
 const STRUCTURE_PRIOR_LEN_ALPHA: [f64; 5] = [16.0, 8.0, 4.0, 2.0, 1.0];
 const STRUCTURE_PRIOR_TARGET_ESS: f64 = 24.0;
@@ -182,6 +184,46 @@ fn null_quantile_for_bucket(bucket: RuleNullBucket) -> f64 {
         }
     }
     DEFAULT_RULE_NULL_QUANTILE
+}
+
+#[inline]
+fn null_shrinkage_weights_for_bucket(bucket: RuleNullBucket) -> Option<(f64, f64, f64)> {
+    if !matches!(bucket.gate, GateBucket::And) || bucket.has_not || bucket.rule_len < 2 {
+        return None;
+    }
+    if bucket.rule_len == 2 {
+        Some(DEFAULT_RULE_NULL_SHRINK_AND_LEN2_WEIGHTS)
+    } else {
+        Some(DEFAULT_RULE_NULL_SHRINK_AND_LEN3P_WEIGHTS)
+    }
+}
+
+#[inline]
+fn blended_penalty(
+    exact: Option<f64>,
+    collapsed: Option<f64>,
+    global: Option<f64>,
+    weights: (f64, f64, f64),
+) -> Option<f64> {
+    let mut numer = 0.0_f64;
+    let mut denom = 0.0_f64;
+    if let Some(v) = exact {
+        numer += weights.0 * v;
+        denom += weights.0;
+    }
+    if let Some(v) = collapsed {
+        numer += weights.1 * v;
+        denom += weights.1;
+    }
+    if let Some(v) = global {
+        numer += weights.2 * v;
+        denom += weights.2;
+    }
+    if denom > 0.0 {
+        Some(numer / denom)
+    } else {
+        None
+    }
 }
 
 #[inline]
@@ -553,9 +595,6 @@ impl RuleNullPenaltyLookup {
         } else {
             self.exact_test.get(exact_idx).copied().flatten()
         };
-        if exact.is_some() {
-            return exact;
-        }
         let collapsed = if is_train {
             self.collapsed_gate_train
                 .get(collapsed_idx)
@@ -567,11 +606,19 @@ impl RuleNullPenaltyLookup {
                 .copied()
                 .flatten()
         };
-        collapsed.or(if is_train {
+        let global = if is_train {
             self.global_train
         } else {
             self.global_test
-        })
+        };
+        if let Some(weights) = null_shrinkage_weights_for_bucket(bucket) {
+            if let Some(exact_penalty) = exact {
+                let shrunk = blended_penalty(Some(exact_penalty), collapsed, global, weights)
+                    .unwrap_or(exact_penalty);
+                return Some(exact_penalty.min(shrunk));
+            }
+        }
+        exact.or(collapsed).or(global)
     }
 
     pub fn train_penalty(&self, bucket: RuleNullBucket) -> Option<f64> {
@@ -802,6 +849,58 @@ mod tests {
             maf: MafBucket::High,
         };
         assert_eq!(null_topk_per_repeat_for_bucket(bucket), 1);
+    }
+
+    #[test]
+    fn test_and_len2_penalty_shrinks_toward_collapsed_and_global() {
+        let mut lookup = RuleNullPenaltyLookup::new(true);
+        let bucket = RuleNullBucket {
+            gate: GateBucket::And,
+            rule_len: 2,
+            has_not: false,
+            maf: MafBucket::High,
+        };
+        let exact_idx = bucket.exact_index(true);
+        let collapsed_idx = bucket.collapsed_gate_index();
+        lookup.exact_train[exact_idx] = Some(100.0);
+        lookup.collapsed_gate_train[collapsed_idx] = Some(60.0);
+        lookup.global_train = Some(20.0);
+        let penalty = lookup.train_penalty(bucket).unwrap();
+        assert!((penalty - 67.0).abs() < 1e-9, "got {penalty}");
+    }
+
+    #[test]
+    fn test_and_not_penalty_does_not_shrink() {
+        let mut lookup = RuleNullPenaltyLookup::new(true);
+        let bucket = RuleNullBucket {
+            gate: GateBucket::And,
+            rule_len: 2,
+            has_not: true,
+            maf: MafBucket::High,
+        };
+        let exact_idx = bucket.exact_index(true);
+        let collapsed_idx = bucket.collapsed_gate_index();
+        lookup.exact_train[exact_idx] = Some(100.0);
+        lookup.collapsed_gate_train[collapsed_idx] = Some(60.0);
+        lookup.global_train = Some(20.0);
+        assert_eq!(lookup.train_penalty(bucket).unwrap(), 100.0);
+    }
+
+    #[test]
+    fn test_or_penalty_does_not_shrink() {
+        let mut lookup = RuleNullPenaltyLookup::new(true);
+        let bucket = RuleNullBucket {
+            gate: GateBucket::Or,
+            rule_len: 2,
+            has_not: false,
+            maf: MafBucket::High,
+        };
+        let exact_idx = bucket.exact_index(true);
+        let collapsed_idx = bucket.collapsed_gate_index();
+        lookup.exact_train[exact_idx] = Some(100.0);
+        lookup.collapsed_gate_train[collapsed_idx] = Some(60.0);
+        lookup.global_train = Some(20.0);
+        assert_eq!(lookup.train_penalty(bucket).unwrap(), 100.0);
     }
 
     #[test]

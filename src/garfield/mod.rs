@@ -72,6 +72,8 @@ const GARFIELD_NULL_ML_TOP_FRAC: f64 = 0.80;
 const GARFIELD_EB_BEAM_MIN_GAIN: f64 = 0.05;
 const GARFIELD_SCAN_BEAM_MIN_GAIN: f64 = 0.01;
 const GARFIELD_SCAN_PAIR_PARENT_ABS_GAIN_MIN: f64 = 0.01;
+const GARFIELD_SCAN_SURROGATE_TEST_GAIN_MAX: f64 = 0.02;
+const GARFIELD_SCAN_SURROGATE_HAMMING_FRAC_MAX: f64 = 0.02;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GarfieldInputKind {
@@ -5655,6 +5657,8 @@ fn garfield_logic_search_bed_owned(
         beam_width: beam_width.max(1),
         min_gain: 0.0,
         min_parent_abs_gain: 0.0,
+        surrogate_test_gain_max: 0.0,
+        surrogate_hamming_frac_max: 0.0,
         enable_diversity_pruning: false,
         candidate_keep_ratio: candidate_keep_ratio.clamp(1e-6, 1.0),
         lambda_len: 0.0,
@@ -6208,6 +6212,16 @@ fn garfield_logic_search_bed_owned(
             0.0
         } else {
             GARFIELD_SCAN_PAIR_PARENT_ABS_GAIN_MIN
+        },
+        surrogate_test_gain_max: if no_clean {
+            0.0
+        } else {
+            GARFIELD_SCAN_SURROGATE_TEST_GAIN_MAX
+        },
+        surrogate_hamming_frac_max: if no_clean {
+            0.0
+        } else {
+            GARFIELD_SCAN_SURROGATE_HAMMING_FRAC_MAX
         },
         enable_diversity_pruning: !no_clean,
         ..beam_params

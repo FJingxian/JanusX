@@ -16,7 +16,8 @@ const GARFIELD_BEAM_PAR_MIN_TOTAL_CANDS: usize = 1_024;
 const GARFIELD_BEAM_PAR_CHUNK_CANDS: usize = 128;
 const GARFIELD_INITIAL_SINGLETON_NEGATIONS: [bool; 1] = [false];
 const GARFIELD_AND_PAIR_GAIN_SINGLETON_WEIGHT: f64 = 0.70;
-const GARFIELD_AND_PAIR_GAIN_SINGLETON_WEIGHT_WITH_NULL: f64 = 0.50;
+const GARFIELD_AND_PAIR_GAIN_SINGLETON_WEIGHT_WITH_NULL: f64 = 0.35;
+const GARFIELD_AND_ONLY_NOT_EXTRA_PENALTY_WITH_NULL: f64 = 0.15;
 const GARFIELD_AND_NOT_SHORTER_SUBRULE_GAIN_MAX: f64 = 0.08;
 const GARFIELD_AND_NOT_SHORTER_SUBRULE_HAMMING_FRAC_MAX: f64 = 0.05;
 
@@ -294,6 +295,19 @@ fn gain_singleton_baseline_weight(
 }
 
 #[inline]
+fn implicit_gate_penalty(gate: GateBucket, not_count: usize, params: &BeamSearchParams) -> f64 {
+    if matches!(gate, GateBucket::And)
+        && not_count > 0
+        && params.null_penalties.is_some()
+        && matches!(params.logic_gate_mode, BeamLogicGateMode::AndOnly)
+    {
+        GARFIELD_AND_ONLY_NOT_EXTRA_PENALTY_WITH_NULL * (not_count as f64)
+    } else {
+        0.0
+    }
+}
+
+#[inline]
 fn rank_rule_score_components_with_gate(
     gate: GateBucket,
     rule_len: usize,
@@ -317,7 +331,8 @@ fn rank_rule_score_components_with_gate(
     let not_pen = params.lambda_not * (not_count as f64);
     let structure_pen =
         structure_prior_penalty(params.structure_prior.as_deref(), rule_len, not_count);
-    base - len_pen - not_pen - structure_pen
+    let implicit_pen = implicit_gate_penalty(gate, not_count, params);
+    base - len_pen - not_pen - structure_pen - implicit_pen
 }
 
 #[inline]
@@ -2533,7 +2548,24 @@ mod tests {
                 ..BeamSearchParams::default()
             },
         );
-        assert!((gain_score - 0.5).abs() < 1e-12);
+        assert!((gain_score - 0.59).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_and_only_not_rules_get_extra_penalty_with_null_penalty_enabled() {
+        let params = BeamSearchParams {
+            logic_gate_mode: BeamLogicGateMode::AndOnly,
+            rank_mode: BeamRankMode::InteractionGain,
+            null_penalties: Some(Arc::new(
+                super::super::permutation::RuleNullPenaltyLookup::default(),
+            )),
+            ..BeamSearchParams::default()
+        };
+        let no_not = rank_rule_score_components_with_gate(GateBucket::And, 2, 0, 0.8, 0.6, &params);
+        let with_not =
+            rank_rule_score_components_with_gate(GateBucket::And, 2, 1, 0.8, 0.6, &params);
+        assert!((no_not - 0.59).abs() < 1e-12);
+        assert!((with_not - 0.44).abs() < 1e-12);
     }
 
     #[test]

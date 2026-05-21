@@ -3065,6 +3065,34 @@ fn cmp_logic_rule_records(
 }
 
 #[inline]
+fn logic_rule_not_count(rec: &GarfieldLogicRuleRecord) -> usize {
+    rec.snp_name.matches('!').count()
+}
+
+#[inline]
+fn cmp_logic_rule_records_same_support(
+    a: &GarfieldLogicRuleRecord,
+    b: &GarfieldLogicRuleRecord,
+) -> std::cmp::Ordering {
+    a.selected_row_indices
+        .len()
+        .cmp(&b.selected_row_indices.len())
+        .then_with(|| logic_rule_not_count(a).cmp(&logic_rule_not_count(b)))
+        .then_with(|| {
+            b.test_score
+                .partial_cmp(&a.test_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .then_with(|| {
+            b.train_score
+                .partial_cmp(&a.train_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .then_with(|| a.snp_name.cmp(&b.snp_name))
+        .then_with(|| a.unit_name.cmp(&b.unit_name))
+}
+
+#[inline]
 fn logic_rule_output_kind_rank(unit_kind: &str) -> u8 {
     match unit_kind {
         "window" => 0,
@@ -3111,7 +3139,8 @@ fn dedup_logic_rule_records(records: Vec<GarfieldLogicRuleRecord>) -> Vec<Garfie
                 slot.insert(rec);
             }
             std::collections::hash_map::Entry::Occupied(mut slot) => {
-                if cmp_logic_rule_records(&rec, slot.get()) == std::cmp::Ordering::Less {
+                if cmp_logic_rule_records_same_support(&rec, slot.get()) == std::cmp::Ordering::Less
+                {
                     slot.insert(rec);
                 }
             }

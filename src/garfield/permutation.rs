@@ -18,8 +18,8 @@ const DEFAULT_RULE_NULL_QUANTILE_AND_LEN2: f64 = 0.975;
 const DEFAULT_RULE_NULL_QUANTILE_AND_LEN3P: f64 = 0.985;
 const DEFAULT_RULE_NULL_TOPK_AND_LEN2: usize = 3;
 const DEFAULT_RULE_NULL_TOPK_AND_LEN3P: usize = 2;
-const DEFAULT_RULE_NULL_SHRINK_AND_LEN2_WEIGHTS: (f64, f64, f64) = (0.45, 0.35, 0.20);
-const DEFAULT_RULE_NULL_SHRINK_AND_LEN3P_WEIGHTS: (f64, f64, f64) = (0.55, 0.30, 0.15);
+const DEFAULT_RULE_NULL_SHRINK_AND_LEN2_WEIGHTS: (f64, f64, f64) = (0.20, 0.50, 0.30);
+const DEFAULT_RULE_NULL_SHRINK_AND_LEN3P_WEIGHTS: (f64, f64, f64) = (0.35, 0.40, 0.25);
 const PSEUDO_SNP_MAF_BOUNDARY: f64 = 0.05;
 const STRUCTURE_PRIOR_LEN_ALPHA: [f64; 5] = [16.0, 8.0, 4.0, 2.0, 1.0];
 const STRUCTURE_PRIOR_TARGET_ESS: f64 = 24.0;
@@ -866,7 +866,7 @@ mod tests {
         lookup.collapsed_gate_train[collapsed_idx] = Some(60.0);
         lookup.global_train = Some(20.0);
         let penalty = lookup.train_penalty(bucket).unwrap();
-        assert!((penalty - 67.0).abs() < 1e-9, "got {penalty}");
+        assert!((penalty - 56.0).abs() < 1e-9, "got {penalty}");
     }
 
     #[test]

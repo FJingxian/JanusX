@@ -15,7 +15,8 @@ use std::sync::Arc;
 const GARFIELD_BEAM_PAR_MIN_TOTAL_CANDS: usize = 1_024;
 const GARFIELD_BEAM_PAR_CHUNK_CANDS: usize = 128;
 const GARFIELD_INITIAL_SINGLETON_NEGATIONS: [bool; 1] = [false];
-const GARFIELD_AND_PAIR_GAIN_SINGLETON_WEIGHT: f64 = 0.85;
+const GARFIELD_AND_PAIR_GAIN_SINGLETON_WEIGHT: f64 = 0.70;
+const GARFIELD_AND_PAIR_GAIN_SINGLETON_WEIGHT_WITH_NULL: f64 = 0.50;
 const GARFIELD_AND_NOT_SHORTER_SUBRULE_GAIN_MAX: f64 = 0.08;
 const GARFIELD_AND_NOT_SHORTER_SUBRULE_HAMMING_FRAC_MAX: f64 = 0.05;
 
@@ -276,9 +277,17 @@ fn gate_prefers_raw_score(gate: GateBucket, rule_len: usize, params: &BeamSearch
 }
 
 #[inline]
-fn gain_singleton_baseline_weight(gate: GateBucket, rule_len: usize) -> f64 {
+fn gain_singleton_baseline_weight(
+    gate: GateBucket,
+    rule_len: usize,
+    params: &BeamSearchParams,
+) -> f64 {
     if matches!(gate, GateBucket::And) && rule_len == 2 {
-        GARFIELD_AND_PAIR_GAIN_SINGLETON_WEIGHT
+        if params.null_penalties.is_some() {
+            GARFIELD_AND_PAIR_GAIN_SINGLETON_WEIGHT_WITH_NULL
+        } else {
+            GARFIELD_AND_PAIR_GAIN_SINGLETON_WEIGHT
+        }
     } else {
         1.0
     }
@@ -296,7 +305,7 @@ fn rank_rule_score_components_with_gate(
     let use_gain =
         rank_mode_uses_gain(rule_len, params) && !gate_prefers_raw_score(gate, rule_len, params);
     let base = if use_gain {
-        raw_score - gain_singleton_baseline_weight(gate, rule_len) * max_singleton_raw
+        raw_score - gain_singleton_baseline_weight(gate, rule_len, params) * max_singleton_raw
     } else {
         raw_score
     };
@@ -2479,7 +2488,52 @@ mod tests {
             },
         );
         assert!((raw_score - 0.8).abs() < 1e-12);
-        assert!((gain_score - 0.29).abs() < 1e-12);
+        assert!((gain_score - 0.38).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_interaction_gain_scoring_tempers_and_pair_more_with_null_penalty() {
+        let rule = BeamRule {
+            first: BeamLiteral {
+                row_index: 1,
+                group_id: 1,
+                negated: false,
+            },
+            rest: vec![(
+                BeamBinaryOp::And,
+                BeamLiteral {
+                    row_index: 2,
+                    group_id: 2,
+                    negated: false,
+                },
+            )],
+        };
+        let train = ContinuousRuleScore {
+            score: 0.8,
+            raw_score: 0.8,
+            mean_hit: 1.0,
+            mean_miss: 0.0,
+            support_frac: 0.25,
+            n_hit: 2,
+            n_miss: 6,
+        };
+        let mut cal = super::super::permutation::RuleNullCalibrator::new(false);
+        let bucket = bucket_from_rule(&rule, train.support_frac, BeamLogicGateMode::AndOnly);
+        cal.insert(bucket, 0.0, 0.0);
+        let lookup = cal.finalize();
+        let (_, gain_score) = train_scores_for_rule(
+            &rule,
+            train,
+            0.6,
+            None,
+            &BeamSearchParams {
+                rank_mode: BeamRankMode::InteractionGain,
+                logic_gate_mode: BeamLogicGateMode::AndOnly,
+                null_penalties: Some(Arc::new(lookup)),
+                ..BeamSearchParams::default()
+            },
+        );
+        assert!((gain_score - 0.5).abs() < 1e-12);
     }
 
     #[test]

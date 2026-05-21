@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import ast
 import argparse
+import contextlib
 import glob
 import hashlib
 import importlib.util
@@ -16,6 +17,7 @@ import sys
 import threading
 import time
 import tempfile
+import traceback
 from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -227,6 +229,7 @@ class WorkflowRuntime:
     ui: WorkflowUI
     logs_dir: Path
     dry_run: bool
+    jx_runner: str = "auto"
     cmd_counter: int = 0
     cmd_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
@@ -326,6 +329,124 @@ def _single_thread_env() -> dict[str, str]:
     return _thread_cap_env(1)
 
 
+def _resolve_jx_runner(raw: object) -> str:
+    mode = str(raw).strip().lower()
+    if mode == "":
+        mode = "auto"
+    if mode not in {"auto", "subprocess", "inprocess"}:
+        raise ValueError(f"Unsupported JX runner mode: {raw!r}")
+    return mode
+
+
+def _extract_jx_module_cmd(cmd: Sequence[str]) -> tuple[str, list[str]] | None:
+    toks = [str(x) for x in cmd]
+    if len(toks) < 4:
+        return None
+    if toks[1] != "-m" or toks[2] != "janusx.script.JanusX":
+        return None
+    return str(toks[3]), [str(x) for x in toks[4:]]
+
+
+def _tail_text_file(path: Path, *, max_lines: int = 60, max_chars: int = 5000) -> str:
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as fh:
+            lines = fh.readlines()
+    except Exception:
+        return "(unable to read command log tail)"
+    tail = "".join(lines[-max_lines:]).strip()
+    if len(tail) > max_chars:
+        tail = tail[-max_chars:]
+    return tail if tail else "(command log is empty)"
+
+
+@contextlib.contextmanager
+def _patched_environ(updates: dict[str, str]):
+    original: dict[str, str | None] = {}
+    try:
+        for key, value in updates.items():
+            original[key] = os.environ.get(key)
+            os.environ[key] = str(value)
+        yield
+    finally:
+        for key, old_value in original.items():
+            if old_value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = old_value
+
+
+@contextlib.contextmanager
+def _prepended_sys_path(path: Path):
+    text = str(path)
+    inserted = False
+    if text not in sys.path:
+        sys.path.insert(0, text)
+        inserted = True
+    try:
+        yield
+    finally:
+        if inserted:
+            try:
+                sys.path.remove(text)
+            except ValueError:
+                pass
+
+
+@contextlib.contextmanager
+def _patched_argv(argv: Sequence[str]):
+    old = list(sys.argv)
+    sys.argv = [str(x) for x in argv]
+    try:
+        yield
+    finally:
+        sys.argv = old
+
+
+@contextlib.contextmanager
+def _patched_cwd(path: Path):
+    old = Path.cwd()
+    os.chdir(str(path))
+    try:
+        yield
+    finally:
+        os.chdir(str(old))
+
+
+def _run_jx_module_inprocess(
+    cmd: Sequence[str],
+    *,
+    env: dict[str, str],
+    cwd: Path,
+    log_fh,
+) -> None:
+    parsed = _extract_jx_module_cmd(cmd)
+    if parsed is None:
+        raise ValueError("Command is not a JanusX internal module invocation.")
+    module_name, module_args = parsed
+    argv = [str(cmd[0]), module_name, *module_args]
+    with (
+        _patched_environ(env),
+        _prepended_sys_path(PYTHON_ROOT),
+        _patched_cwd(cwd),
+        _patched_argv(argv),
+        contextlib.redirect_stdout(log_fh),
+        contextlib.redirect_stderr(log_fh),
+    ):
+        from janusx.script import JanusX as jx_entry
+
+        try:
+            result = jx_entry.main()
+        except SystemExit as exc:
+            code = exc.code
+            if code in (None, 0):
+                return
+            raise RuntimeError(
+                f"In-process `jx {module_name}` exited with non-zero status {code!r}."
+            ) from exc
+        if isinstance(result, int) and int(result) != 0:
+            raise RuntimeError(f"In-process `jx {module_name}` returned non-zero exit code {int(result)}.")
+
+
 def _run_cmd(
     cmd: Sequence[str],
     *,
@@ -337,31 +458,83 @@ def _run_cmd(
 ) -> Path:
     pretty = " ".join(str(x) for x in cmd)
     log_path = runtime.next_command_log_path(log_label or desc)
+    cmd_tokens = [str(x) for x in cmd]
+    cmd_cwd = Path(cwd or REPO_ROOT)
+    cmd_env = {**_jx_env(), **(extra_env or {})}
+    jx_cmd = _extract_jx_module_cmd(cmd_tokens)
+    jx_runner = _resolve_jx_runner(runtime.jx_runner)
     runtime.logger.info("%s", desc)
     runtime.logger.info("CMD: %s", pretty)
     runtime.logger.info("LOG: %s", log_path)
     if runtime.dry_run:
         with open(log_path, "w", encoding="utf-8") as fh:
-            fh.write(f"# DRY RUN\n# DESC: {desc}\n# CWD: {cwd or REPO_ROOT}\n# CMD: {pretty}\n")
+            fh.write(f"# DRY RUN\n# DESC: {desc}\n# CWD: {cmd_cwd}\n# CMD: {pretty}\n")
         return log_path
 
     with open(log_path, "w", encoding="utf-8") as fh:
         fh.write(f"# DESC: {desc}\n")
-        fh.write(f"# CWD: {cwd or REPO_ROOT}\n")
+        fh.write(f"# CWD: {cmd_cwd}\n")
         fh.write(f"# CMD: {pretty}\n\n")
         fh.flush()
         try:
-            subprocess.run(
-                [str(x) for x in cmd],
-                check=True,
-                cwd=str(cwd or REPO_ROOT),
-                env={**_jx_env(), **(extra_env or {})},
-                stdout=fh,
-                stderr=subprocess.STDOUT,
-            )
-        except subprocess.CalledProcessError as exc:
+            if jx_cmd is not None and jx_runner == "inprocess":
+                _run_jx_module_inprocess(
+                    cmd_tokens,
+                    env=cmd_env,
+                    cwd=cmd_cwd,
+                    log_fh=fh,
+                )
+            else:
+                t_start = time.time()
+                try:
+                    subprocess.run(
+                        cmd_tokens,
+                        check=True,
+                        cwd=str(cmd_cwd),
+                        env=cmd_env,
+                        stdout=fh,
+                        stderr=subprocess.STDOUT,
+                    )
+                except subprocess.CalledProcessError:
+                    elapsed = float(time.time() - t_start)
+                    can_retry_inprocess = bool(
+                        jx_cmd is not None
+                        and jx_runner == "auto"
+                        and elapsed <= 15.0
+                        and log_path.exists()
+                        and log_path.stat().st_size <= 128 * 1024
+                    )
+                    if can_retry_inprocess:
+                        module_name = str(jx_cmd[0])
+                        runtime.logger.warning(
+                            "Subprocess launch for jx %s failed quickly (%.2fs); retrying in-process.",
+                            module_name,
+                            elapsed,
+                        )
+                        fh.write(
+                            "\n# --- subprocess failed quickly; retrying same internal JX command in-process ---\n\n"
+                        )
+                        fh.flush()
+                        _run_jx_module_inprocess(
+                            cmd_tokens,
+                            env=cmd_env,
+                            cwd=cmd_cwd,
+                            log_fh=fh,
+                        )
+                    else:
+                        raise
+        except Exception as exc:
+            try:
+                traceback.print_exc(file=fh)
+            except Exception:
+                pass
+            fh.flush()
             runtime.logger.exception("Command failed: %s", desc)
-            raise RuntimeError(f"{desc} failed; see log: {log_path}") from exc
+            tail = _tail_text_file(log_path)
+            raise RuntimeError(
+                f"{desc} failed; see log: {log_path}\n"
+                f"Last log lines:\n{tail}"
+            ) from exc
     return log_path
 
 
@@ -1789,6 +1962,7 @@ def _run_garfield_job(
         grm,
         "-t",
         max(1, int(threads)),
+        "-permutation",
     )
     if garfield_raw is not None:
         cmd.extend(["-raw", str(int(garfield_raw))])
@@ -2914,6 +3088,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=4,
         help="Unified thread/process budget for all workflow stages.",
     )
+    p.add_argument(
+        "--jx-runner",
+        default=str(os.getenv("TGARFIELD_JX_RUNNER", "auto")),
+        help=(
+            "How Tgarfield launches internal `jx` stages: auto, subprocess, or inprocess "
+            "(default: env TGARFIELD_JX_RUNNER or auto)."
+        ),
+    )
     p.add_argument("--stage3-jobs", type=int, default=None, help=argparse.SUPPRESS)
     p.add_argument("--jobs", type=int, default=None, help=argparse.SUPPRESS)
     p.add_argument("--stage5-inner-threads", type=int, default=None, help=argparse.SUPPRESS)
@@ -2979,6 +3161,10 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    try:
+        args.jx_runner = _resolve_jx_runner(args.jx_runner)
+    except ValueError as exc:
+        parser.error(str(exc))
     if not args.summary_only:
         if not args.bfile or not args.grm:
             parser.error("--bfile and --grm are required unless --summary-only is used.")
@@ -2997,6 +3183,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         ui=ui,
         logs_dir=logs_dir,
         dry_run=bool(args.dry_run),
+        jx_runner=str(args.jx_runner),
     )
 
     filtered_dir = out_root / "filtered"
@@ -3035,6 +3222,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             ("Output", out_root),
             ("Prefix", display_prefix),
             ("Threads", int(args.threads)),
+            ("JX runner", str(args.jx_runner)),
             ("Chunk repeats", display_chunk_repeats),
             ("Chunk length", display_chunk_len),
             ("Stratified chunks", display_stratified_chunks),

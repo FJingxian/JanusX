@@ -16,6 +16,8 @@ pub const DEFAULT_RULE_STRUCTURE_DENSITY_TOPK: usize = 10;
 const DEFAULT_RULE_NULL_QUANTILE: f64 = 0.99;
 const DEFAULT_RULE_NULL_QUANTILE_AND_LEN2: f64 = 0.975;
 const DEFAULT_RULE_NULL_QUANTILE_AND_LEN3P: f64 = 0.985;
+const DEFAULT_RULE_NULL_TOPK_AND_LEN2: usize = 3;
+const DEFAULT_RULE_NULL_TOPK_AND_LEN3P: usize = 2;
 const PSEUDO_SNP_MAF_BOUNDARY: f64 = 0.05;
 const STRUCTURE_PRIOR_LEN_ALPHA: [f64; 5] = [16.0, 8.0, 4.0, 2.0, 1.0];
 const STRUCTURE_PRIOR_TARGET_ESS: f64 = 24.0;
@@ -180,6 +182,19 @@ fn null_quantile_for_bucket(bucket: RuleNullBucket) -> f64 {
         }
     }
     DEFAULT_RULE_NULL_QUANTILE
+}
+
+#[inline]
+pub fn null_topk_per_repeat_for_bucket(bucket: RuleNullBucket) -> usize {
+    if matches!(bucket.gate, GateBucket::And) && !bucket.has_not {
+        if bucket.rule_len == 2 {
+            return DEFAULT_RULE_NULL_TOPK_AND_LEN2;
+        }
+        if bucket.rule_len >= 3 {
+            return DEFAULT_RULE_NULL_TOPK_AND_LEN3P;
+        }
+    }
+    1
 }
 
 #[inline]
@@ -765,6 +780,28 @@ mod tests {
         }
         let lookup = cal.finalize();
         assert_eq!(lookup.train_penalty(bucket).unwrap(), 40.0);
+    }
+
+    #[test]
+    fn test_and_len2_bucket_uses_repeat_topk_gt_one() {
+        let bucket = RuleNullBucket {
+            gate: GateBucket::And,
+            rule_len: 2,
+            has_not: false,
+            maf: MafBucket::High,
+        };
+        assert_eq!(null_topk_per_repeat_for_bucket(bucket), 3);
+    }
+
+    #[test]
+    fn test_and_not_bucket_keeps_repeat_topk_one() {
+        let bucket = RuleNullBucket {
+            gate: GateBucket::And,
+            rule_len: 2,
+            has_not: true,
+            maf: MafBucket::High,
+        };
+        assert_eq!(null_topk_per_repeat_for_bucket(bucket), 1);
     }
 
     #[test]

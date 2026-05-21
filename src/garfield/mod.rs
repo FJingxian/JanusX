@@ -5,9 +5,10 @@ mod sampling;
 mod score;
 
 use self::permutation::{
-    bucket_from_expr, bucket_from_rule, choose_representative_indices, shuffled_copy_f64,
-    RuleNullBucket, RuleNullCalibrator, RuleNullPenaltyLookup, RuleStructurePrior,
-    RuleStructurePriorCalibrator, RuleStructurePriorConfig, DEFAULT_RULE_NULL_MIN_SNPS_PER_CHUNK,
+    bucket_from_expr, bucket_from_rule, choose_representative_indices,
+    null_topk_per_repeat_for_bucket, shuffled_copy_f64, RuleNullBucket, RuleNullCalibrator,
+    RuleNullPenaltyLookup, RuleStructurePrior, RuleStructurePriorCalibrator,
+    RuleStructurePriorConfig, DEFAULT_RULE_NULL_MIN_SNPS_PER_CHUNK,
     DEFAULT_RULE_NULL_PHYSICAL_CHUNKS, DEFAULT_RULE_PERMUTATION_REPEATS,
     DEFAULT_RULE_PERMUTATION_REPRESENTATIVE_UNITS, DEFAULT_RULE_STRUCTURE_BOOTSTRAP_KL_THRESHOLD,
     DEFAULT_RULE_STRUCTURE_BOOTSTRAP_MAX_REPEATS, DEFAULT_RULE_STRUCTURE_BOOTSTRAP_MIN_REPEATS,
@@ -4591,23 +4592,55 @@ fn collect_rule_permutation_nulls_for_repeat(
         prepared.local_groups.as_slice(),
         beam_params,
     )?;
-    let mut best_by_bucket = HashMap::<RuleNullBucket, (f64, f64)>::new();
-    for cand in perm_hits.iter() {
+    let mut idxs_by_bucket = HashMap::<RuleNullBucket, Vec<usize>>::new();
+    for (cand_idx, cand) in perm_hits.iter().enumerate() {
         let bucket = bucket_from_rule(&cand.rule, cand.train.support_frac, logic_gate_mode);
-        let entry = best_by_bucket
-            .entry(bucket)
-            .or_insert((f64::NEG_INFINITY, f64::NEG_INFINITY));
-        if cand.train_score.is_finite() && cand.train_score > entry.0 {
-            entry.0 = cand.train_score;
+        idxs_by_bucket.entry(bucket).or_default().push(cand_idx);
+    }
+    let mut out = Vec::<(RuleNullBucket, f64, f64)>::new();
+    for (bucket, idxs) in idxs_by_bucket.into_iter() {
+        let keep_topk = null_topk_per_repeat_for_bucket(bucket).max(1);
+        let mut chosen = HashSet::<usize>::new();
+
+        let mut by_train = idxs.clone();
+        by_train.sort_by(|&a, &b| {
+            normalized_rank_score(perm_hits[b].train_score)
+                .partial_cmp(&normalized_rank_score(perm_hits[a].train_score))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        for idx in by_train
+            .into_iter()
+            .filter(|&idx| perm_hits[idx].train_score.is_finite())
+            .take(keep_topk)
+        {
+            chosen.insert(idx);
         }
-        if cand.test_score.is_finite() && cand.test_score > entry.1 {
-            entry.1 = cand.test_score;
+
+        let mut by_test = idxs;
+        by_test.sort_by(|&a, &b| {
+            normalized_rank_score(perm_hits[b].test_score)
+                .partial_cmp(&normalized_rank_score(perm_hits[a].test_score))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        for idx in by_test
+            .into_iter()
+            .filter(|&idx| perm_hits[idx].test_score.is_finite())
+            .take(keep_topk)
+        {
+            chosen.insert(idx);
+        }
+
+        if chosen.is_empty() {
+            continue;
+        }
+        let mut chosen_sorted = chosen.into_iter().collect::<Vec<_>>();
+        chosen_sorted.sort_unstable();
+        for idx in chosen_sorted.into_iter() {
+            let cand = &perm_hits[idx];
+            out.push((bucket, cand.train_score, cand.test_score));
         }
     }
-    Ok(best_by_bucket
-        .into_iter()
-        .map(|(bucket, (train_score, test_score))| (bucket, train_score, test_score))
-        .collect())
+    Ok(out)
 }
 
 #[derive(Clone, Debug, Default)]

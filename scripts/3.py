@@ -20,6 +20,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
 DEFAULT_INPUT_DIR = REPO_ROOT / "test.Tgarfield_out3" / "summary" / "test_breakdown"
 DEFAULT_OUT_DIR = REPO_ROOT / "test.figure3"
+LAYER_ORDER = ["1 site", "2 sites AND", "2 sites OR", "3 sites"]
 
 
 def _coerce_bool(series: pd.Series) -> pd.Series:
@@ -42,6 +43,20 @@ def _family_from_name(name: str) -> str:
     return "other"
 
 
+def _layer_from_row(row: pd.Series) -> str:
+    logic = str(row.get("logic", "")).strip().lower()
+    causal_size = pd.to_numeric(row.get("causal_size"), errors="coerce")
+    if logic == "single" or causal_size == 1:
+        return "1 site"
+    if causal_size == 2 and logic == "and":
+        return "2 sites AND"
+    if causal_size == 2 and logic == "or":
+        return "2 sites OR"
+    if causal_size == 3:
+        return "3 sites"
+    return "other"
+
+
 def _load_results(summary_dir: Path) -> pd.DataFrame:
     path = summary_dir / "results.tsv"
     df = pd.read_csv(path, sep="\t")
@@ -49,7 +64,12 @@ def _load_results(summary_dir: Path) -> pd.DataFrame:
         if col in df.columns:
             df[col] = _coerce_bool(df[col])
     df["logic"] = df["logic_mode"].fillna("").replace({"": "single"}).astype(str)
+    if "causal_size" in df.columns:
+        df["causal_size"] = pd.to_numeric(df["causal_size"], errors="coerce").fillna(0).astype(int)
+    else:
+        df["causal_size"] = 0
     df["best_window_site_count"] = pd.to_numeric(df["best_window_site_count"], errors="coerce").fillna(0).astype(int)
+    df["layer"] = df.apply(_layer_from_row, axis=1)
     return df
 
 
@@ -85,26 +105,28 @@ def _site_count_distribution(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFra
     )
     overall["prop"] = overall["n"] / max(len(df), 1)
 
-    logic_rows: list[dict[str, object]] = []
-    for logic, sub in df.groupby("logic"):
+    layer_rows: list[dict[str, object]] = []
+    layer_df = df[df["layer"].isin(LAYER_ORDER)].copy()
+    for layer, sub in layer_df.groupby("layer"):
         vc = sub["best_window_site_count"].value_counts().reindex(bins, fill_value=0)
         denom = max(len(sub), 1)
         for site_count, n in vc.items():
-            logic_rows.append(
+            layer_rows.append(
                 {
-                    "logic": logic,
+                    "layer": layer,
                     "site_count": int(site_count),
                     "n": int(n),
                     "prop": float(n) / float(denom),
                 }
             )
-    by_logic = pd.DataFrame(logic_rows)
-    return overall, by_logic
+    by_layer = pd.DataFrame(layer_rows)
+    return overall, by_layer
 
 
-def _family_logic_summary(df: pd.DataFrame) -> pd.DataFrame:
+def _family_layer_summary(df: pd.DataFrame) -> pd.DataFrame:
     return (
-        df.groupby(["family", "logic"], dropna=False)
+        df[df["layer"].isin(LAYER_ORDER)]
+        .groupby(["family", "layer"], dropna=False)
         .agg(
             n=("experiment_id", "size"),
             top_rule_match=("top_rule_match", "mean"),
@@ -117,13 +139,14 @@ def _family_logic_summary(df: pd.DataFrame) -> pd.DataFrame:
     )
 
 
-def _causal_logic_summary(df: pd.DataFrame) -> pd.DataFrame:
-    sub = df[df["logic"].isin(["and", "or"])].copy()
+def _layer_summary(df: pd.DataFrame) -> pd.DataFrame:
+    sub = df[df["layer"].isin(LAYER_ORDER)].copy()
     return (
-        sub.groupby(["causal_size", "logic"], dropna=False)
+        sub.groupby(["layer"], dropna=False)
         .agg(
             n=("experiment_id", "size"),
             top_rule_match=("top_rule_match", "mean"),
+            exact_rule_match=("exact_rule_match", "mean"),
             simbench_pwald_le_best_window=("simbench_pwald_le_best_window", "mean"),
             mean_pred_sites=("best_window_site_count", "mean"),
             median_pred_sites=("best_window_site_count", "median"),
@@ -148,7 +171,7 @@ def _pseudo_summary(pseudo_df: pd.DataFrame) -> pd.DataFrame:
     )
 
 
-def _plot_distribution(overall: pd.DataFrame, by_logic: pd.DataFrame, out_path: Path) -> None:
+def _plot_distribution(overall: pd.DataFrame, by_layer: pd.DataFrame, out_path: Path) -> None:
     try:
         sci_set()
     except Exception as exc:
@@ -157,7 +180,7 @@ def _plot_distribution(overall: pd.DataFrame, by_logic: pd.DataFrame, out_path: 
     count_plot_bins = [1, 2, 3, 4, 5]
     prop_plot_bins = [1, 2, 3, 4, 5]
     overall_plot = overall[overall["site_count"].isin(count_plot_bins)].copy()
-    by_logic_plot = by_logic[by_logic["site_count"].isin(prop_plot_bins)].copy()
+    by_layer_plot = by_layer[by_layer["site_count"].isin(prop_plot_bins)].copy()
 
     fig, axes = plt.subplots(1, 2, figsize=(11.5, 4.8))
 
@@ -176,14 +199,19 @@ def _plot_distribution(overall: pd.DataFrame, by_logic: pd.DataFrame, out_path: 
     axes[0].set_xticks(x_all)
     axes[0].grid(axis="y", linestyle=":", alpha=0.35)
 
-    logic_order = [x for x in ["single", "and", "or"] if x in set(by_logic_plot["logic"].tolist())]
+    layer_order = [x for x in LAYER_ORDER if x in set(by_layer_plot["layer"].tolist())]
     x_logic = prop_plot_bins
-    width = 0.24 if len(logic_order) >= 3 else 0.30
-    offsets = np.linspace(-width, width, len(logic_order)) if len(logic_order) > 1 else np.asarray([0.0])
-    colors = {"single": "#9E9E9E", "and": "#1F77B4", "or": "#E45756"}
-    for logic, offset in zip(logic_order, offsets):
+    width = 0.18 if len(layer_order) >= 4 else 0.24
+    offsets = np.linspace(-1.5 * width, 1.5 * width, len(layer_order)) if len(layer_order) > 1 else np.asarray([0.0])
+    colors = {
+        "1 site": "#9E9E9E",
+        "2 sites AND": "#1F77B4",
+        "2 sites OR": "#E45756",
+        "3 sites": "#59A14F",
+    }
+    for layer, offset in zip(layer_order, offsets):
         sub = (
-            by_logic_plot[by_logic_plot["logic"] == logic]
+            by_layer_plot[by_layer_plot["layer"] == layer]
             .set_index("site_count")
             .reindex(prop_plot_bins, fill_value=0)
             .reset_index()
@@ -192,13 +220,13 @@ def _plot_distribution(overall: pd.DataFrame, by_logic: pd.DataFrame, out_path: 
             np.asarray(x_logic, dtype=float) + float(offset),
             sub["prop"].to_numpy(dtype=float),
             width=width,
-            label=logic,
-            color=colors.get(logic, None),
+            label=layer,
+            color=colors.get(layer, None),
             alpha=0.85,
             edgecolor="black",
             linewidth=0.6,
         )
-    axes[1].set_title("By logic mode")
+    axes[1].set_title("By causal layer")
     axes[1].set_xlabel("GARFIELD found site count")
     axes[1].set_ylabel("Proportion")
     axes[1].set_xticks(x_logic)
@@ -228,37 +256,37 @@ def main() -> int:
     results = _load_results(summary_dir)
     pseudo_df = _load_breakdown_pseudo(input_dir)
 
-    overall, by_logic = _site_count_distribution(results)
-    fam_logic = _family_logic_summary(results)
-    causal_logic = _causal_logic_summary(results)
+    overall, by_layer = _site_count_distribution(results)
+    fam_layer = _family_layer_summary(results)
+    layer_summary = _layer_summary(results)
     pseudo_summary = _pseudo_summary(pseudo_df)
 
     overall_path = summary_dir / "garfield_site_count_distribution.overall.tsv"
-    logic_path = summary_dir / "garfield_site_count_distribution.by_logic.tsv"
-    fam_logic_path = summary_dir / "garfield_logic_diagnostic.by_family.tsv"
-    causal_logic_path = summary_dir / "garfield_logic_diagnostic.by_causal_size.tsv"
+    logic_path = summary_dir / "garfield_site_count_distribution.by_layer.tsv"
+    fam_logic_path = summary_dir / "garfield_logic_diagnostic.by_family_layer.tsv"
+    causal_logic_path = summary_dir / "garfield_logic_diagnostic.by_layer.tsv"
     pseudo_path = summary_dir / "garfield_logic_diagnostic.pseudo_maf.tsv"
 
     overall.to_csv(overall_path, sep="\t", index=False)
-    by_logic.to_csv(logic_path, sep="\t", index=False)
-    fam_logic.to_csv(fam_logic_path, sep="\t", index=False)
-    causal_logic.to_csv(causal_logic_path, sep="\t", index=False)
+    by_layer.to_csv(logic_path, sep="\t", index=False)
+    fam_layer.to_csv(fam_logic_path, sep="\t", index=False)
+    layer_summary.to_csv(causal_logic_path, sep="\t", index=False)
     if not pseudo_summary.empty:
         pseudo_summary.to_csv(pseudo_path, sep="\t", index=False)
 
     fig_path = out_dir / f"{out_root.name}.garfield_site_count_distribution.pdf"
-    _plot_distribution(overall, by_logic, fig_path)
+    _plot_distribution(overall, by_layer, fig_path)
 
     print(f"Out root   : {out_root}")
     print(f"Input dir  : {input_dir}")
     print(f"Figure dir : {out_dir}")
     print(f"Rows       : {len(results)}")
-    print("Logic counts:")
-    print(results["logic"].value_counts().to_string())
-    print("\nBy family / logic:")
-    print(fam_logic.to_csv(sep='\t', index=False))
-    print("By causal size / logic:")
-    print(causal_logic.to_csv(sep='\t', index=False))
+    print("Layer counts:")
+    print(results["layer"].value_counts().to_string())
+    print("\nBy family / layer:")
+    print(fam_layer.to_csv(sep='\t', index=False))
+    print("By layer:")
+    print(layer_summary.to_csv(sep='\t', index=False))
     if not pseudo_summary.empty:
         print("Pseudo MAF summary:")
         print(pseudo_summary.to_csv(sep='\t', index=False))

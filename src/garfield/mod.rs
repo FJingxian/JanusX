@@ -2249,6 +2249,9 @@ struct GarfieldLogicRuleRecord {
     snp_name: String,
     expr: String,
     chrom_field: String,
+    bim_snp_name: String,
+    bim_allele0: String,
+    bim_allele1: String,
     pos: i32,
     beta: f64,
     se: f64,
@@ -2263,7 +2266,6 @@ struct GarfieldLogicRuleRecord {
 struct GarfieldLogicPipelineResult {
     pseudo_prefix: Option<String>,
     rules_tsv: Option<String>,
-    posterior_tsv: Option<String>,
     posterior_json: Option<String>,
     rule_permutation_active: bool,
     null_chunk_bp: usize,
@@ -2567,6 +2569,33 @@ fn simbench_rule_name(logic: SimBenchLogic, sites: &[SiteInfo], label: &str) -> 
             .collect::<Vec<_>>()
             .join(simbench_logic_symbol(logic))
     }
+}
+
+fn simbench_rule_bim_name(logic: SimBenchLogic, sites: &[SiteInfo], label: &str) -> String {
+    let trimmed = label.trim();
+    if !trimmed.is_empty() {
+        trimmed
+            .chars()
+            .filter(|c| !c.is_ascii_whitespace())
+            .collect()
+    } else {
+        sites
+            .iter()
+            .map(|site| literal_name(site, false))
+            .collect::<Vec<_>>()
+            .join(simbench_logic_symbol_compact(logic))
+    }
+}
+
+fn simbench_rule_bim_alleles(sites: &[SiteInfo]) -> (String, String) {
+    let mut allele0 = Vec::<String>::with_capacity(sites.len());
+    let mut allele1 = Vec::<String>::with_capacity(sites.len());
+    for site in sites.iter() {
+        let (a0, a1) = literal_bim_alleles(site, false);
+        allele0.push(a0);
+        allele1.push(a1);
+    }
+    (allele0.join(","), allele1.join(","))
 }
 
 fn simbench_rule_expr(logic: SimBenchLogic, sites: &[SiteInfo]) -> Result<String, String> {
@@ -2909,6 +2938,7 @@ fn evaluate_simbench_terms(
             .ok_or_else(|| format!("simbench term {} has no sites", term.term_id))?;
         let (ml_rank, ml_feature_count) =
             resolve_simbench_ml_rank(term.logic, logic_row_candidates.as_slice(), ml_contexts);
+        let (bim_allele0, bim_allele1) = simbench_rule_bim_alleles(bench_sites.as_slice());
         out.push(GarfieldLogicRuleRecord {
             unit_name: simbench_rule_name(term.logic, bench_sites.as_slice(), &term.label),
             unit_kind: "simbench".to_string(),
@@ -2920,6 +2950,9 @@ fn evaluate_simbench_terms(
             snp_name: simbench_rule_name(term.logic, bench_sites.as_slice(), &term.label),
             expr: sim_expr_txt,
             chrom_field: first_site.chrom.clone(),
+            bim_snp_name: simbench_rule_bim_name(term.logic, bench_sites.as_slice(), &term.label),
+            bim_allele0,
+            bim_allele1,
             pos: first_site.pos,
             beta: assoc.beta,
             se: assoc.se,
@@ -3235,6 +3268,79 @@ fn literal_name(site: &SiteInfo, negated: bool) -> String {
     } else {
         base
     }
+}
+
+#[inline]
+fn logic_symbol_compact(op: BeamBinaryOp) -> &'static str {
+    match op {
+        BeamBinaryOp::And => "&",
+        BeamBinaryOp::Or => "|",
+    }
+}
+
+#[inline]
+fn simbench_logic_symbol_compact(logic: SimBenchLogic) -> &'static str {
+    match logic {
+        SimBenchLogic::Single => "",
+        SimBenchLogic::And => "&",
+        SimBenchLogic::Or => "|",
+    }
+}
+
+#[inline]
+fn clean_logic_allele_label(allele: &str) -> String {
+    allele
+        .split('|')
+        .next()
+        .unwrap_or(allele)
+        .trim()
+        .to_string()
+}
+
+#[inline]
+fn literal_bim_alleles(site: &SiteInfo, negated: bool) -> (String, String) {
+    let zero = clean_logic_allele_label(&site.ref_allele);
+    let one = clean_logic_allele_label(&site.alt_allele);
+    if negated {
+        (one, zero)
+    } else {
+        (zero, one)
+    }
+}
+
+fn rule_bim_name(rule: &BeamRule, local_sites: &[SiteInfo]) -> Result<String, String> {
+    let first = local_sites
+        .get(rule.first.row_index)
+        .ok_or_else(|| format!("rule row index out of range: {}", rule.first.row_index))?;
+    let mut out = literal_name(first, rule.first.negated);
+    for (op, lit) in rule.rest.iter() {
+        let site = local_sites
+            .get(lit.row_index)
+            .ok_or_else(|| format!("rule row index out of range: {}", lit.row_index))?;
+        out.push_str(logic_symbol_compact(*op));
+        out.push_str(&literal_name(site, lit.negated));
+    }
+    Ok(out)
+}
+
+fn rule_bim_alleles(rule: &BeamRule, local_sites: &[SiteInfo]) -> Result<(String, String), String> {
+    let mut allele0 = Vec::<String>::with_capacity(rule.len());
+    let mut allele1 = Vec::<String>::with_capacity(rule.len());
+    let first = local_sites
+        .get(rule.first.row_index)
+        .ok_or_else(|| format!("rule row index out of range: {}", rule.first.row_index))?;
+    let (a0, a1) = literal_bim_alleles(first, rule.first.negated);
+    allele0.push(a0);
+    allele1.push(a1);
+    for (_, lit) in rule.rest.iter() {
+        let site = local_sites
+            .get(lit.row_index)
+            .ok_or_else(|| format!("rule row index out of range: {}", lit.row_index))?;
+        let (a0, a1) = literal_bim_alleles(site, lit.negated);
+        allele0.push(a0);
+        allele1.push(a1);
+    }
+    Ok((allele0.join(","), allele1.join(",")))
 }
 
 #[inline]
@@ -4844,6 +4950,9 @@ fn evaluate_logic_unit_continuous(
         }
         let expr = rule_expr(&cand.rule, prepared.local_sites.as_slice())?;
         let snp_name = rule_snp_name(&cand.rule, prepared.local_sites.as_slice())?;
+        let bim_snp_name = rule_bim_name(&cand.rule, prepared.local_sites.as_slice())?;
+        let (bim_allele0, bim_allele1) =
+            rule_bim_alleles(&cand.rule, prepared.local_sites.as_slice())?;
         let first_site = prepared
             .local_sites
             .get(cand.rule.first.row_index)
@@ -4869,7 +4978,10 @@ fn evaluate_logic_unit_continuous(
             selected_row_indices,
             snp_name,
             expr,
-            chrom_field: unit_kind_lc.to_string(),
+            chrom_field: first_site.chrom.clone(),
+            bim_snp_name,
+            bim_allele0,
+            bim_allele1,
             pos: first_site.pos,
             beta: assoc.beta,
             se: assoc.se,
@@ -5005,8 +5117,8 @@ fn write_logic_pseudo_plink(
     for rec in ordered.into_iter() {
         writeln!(
             bim,
-            "{}\t{}\t0\t{}\tA\tT",
-            rec.chrom_field, rec.snp_name, rec.pos
+            "{}\t{}\t0\t{}\t{}\t{}",
+            rec.chrom_field, rec.bim_snp_name, rec.pos, rec.bim_allele0, rec.bim_allele1
         )
         .map_err(|e| e.to_string())?;
         row_buf.fill(0u8);
@@ -5049,38 +5161,6 @@ fn write_logic_rules_tsv(path: &str, records: &[GarfieldLogicRuleRecord]) -> Res
             chisq_txt,
             rec.pwald,
             rec.train_score,
-        )
-        .map_err(|e| e.to_string())?;
-    }
-    w.flush().map_err(|e| e.to_string())
-}
-
-fn write_rule_structure_prior_tsv(path: &str, prior: &RuleStructurePrior) -> Result<(), String> {
-    let mut w = BufWriter::new(File::create(path).map_err(|e| e.to_string())?);
-    let len_probs = prior.len_probs();
-    let prior_cfg = prior.config();
-    let prior_len_alpha = prior_cfg.len_alpha_array();
-    let expected_len = (1..=5usize)
-        .map(|rule_len| (rule_len as f64) * len_probs[rule_len])
-        .sum::<f64>();
-    writeln!(
-        w,
-        "rule_len\tprior_len_alpha\tlen_prob\tprior_mass\tprior_log_mass\tpenalty\texpected_rule_len\tstrength\tbest_log_mass"
-    )
-    .map_err(|e| e.to_string())?;
-    for rule_len in 1..=5usize {
-        writeln!(
-            w,
-            "{}\t{:.10}\t{:.10}\t{:.10}\t{:.10}\t{:.10}\t{:.10}\t{:.10}\t{:.10}",
-            rule_len,
-            prior_len_alpha[rule_len],
-            prior.len_prob(rule_len),
-            prior.mass(rule_len),
-            prior.log_mass(rule_len),
-            prior.penalty(rule_len, 0),
-            expected_len,
-            prior.strength(),
-            prior.best_log_mass(),
         )
         .map_err(|e| e.to_string())?;
     }
@@ -5139,13 +5219,16 @@ fn write_rule_structure_prior_json(path: &str, prior: &RuleStructurePrior) -> Re
         let suffix = if row_idx < total_rows { "," } else { "" };
         writeln!(
             w,
-            "    {{\"rule_len\": {}, \"prior_len_alpha\": {:.10}, \"len_prob\": {:.10}, \"prior_mass\": {:.10}, \"prior_log_mass\": {:.10}, \"penalty\": {:.10}}}{}",
+            "    {{\"rule_len\": {}, \"prior_len_alpha\": {:.10}, \"len_prob\": {:.10}, \"prior_mass\": {:.10}, \"prior_log_mass\": {:.10}, \"penalty\": {:.10}, \"expected_rule_len\": {:.10}, \"strength\": {:.10}, \"best_log_mass\": {:.10}}}{}",
             rule_len,
             prior_len_alpha[rule_len],
             prior.len_prob(rule_len),
             prior.mass(rule_len),
             prior.log_mass(rule_len),
             prior.penalty(rule_len, 0),
+            expected_len,
+            prior.strength(),
+            prior.best_log_mass(),
             suffix,
         )
         .map_err(|e| e.to_string())?;
@@ -6296,7 +6379,6 @@ fn garfield_logic_search_bed_owned(
     let structure_prior_for_output = rule_structure_prior.clone();
     let mut pseudo_prefix_out = None;
     let mut rules_tsv_out = None;
-    let mut posterior_tsv_out = None;
     let mut posterior_json_out = None;
     if let Some(prefix_out) = out_prefix.as_ref() {
         write_logic_pseudo_plink(
@@ -6307,11 +6389,8 @@ fn garfield_logic_search_bed_owned(
         let rules_tsv = format!("{prefix_out}.rules.tsv");
         write_logic_rules_tsv(&rules_tsv, records.as_slice())?;
         if let Some(prior) = structure_prior_for_output.as_deref() {
-            let posterior_tsv = format!("{prefix_out}.posterior.tsv");
             let posterior_json = format!("{prefix_out}.posterior.json");
-            write_rule_structure_prior_tsv(&posterior_tsv, prior)?;
             write_rule_structure_prior_json(&posterior_json, prior)?;
-            posterior_tsv_out = Some(posterior_tsv);
             posterior_json_out = Some(posterior_json);
         }
         pseudo_prefix_out = Some(prefix_out.clone());
@@ -6321,7 +6400,6 @@ fn garfield_logic_search_bed_owned(
     Ok(GarfieldLogicPipelineResult {
         pseudo_prefix: pseudo_prefix_out,
         rules_tsv: rules_tsv_out,
-        posterior_tsv: posterior_tsv_out,
         posterior_json: posterior_json_out,
         rule_permutation_active: null_permutation_active || soft_structure_mode,
         null_chunk_bp,
@@ -6575,7 +6653,7 @@ pub fn garfield_logic_search_bed_py<'py>(
     let out = PyDict::new(py);
     out.set_item("pseudo_prefix", result.pseudo_prefix)?;
     out.set_item("rules_tsv", result.rules_tsv)?;
-    out.set_item("posterior_tsv", result.posterior_tsv)?;
+    out.set_item("posterior_tsv", py.None())?;
     out.set_item("posterior_json", result.posterior_json)?;
     out.set_item("rule_permutation_active", result.rule_permutation_active)?;
     out.set_item("null_chunk_bp", result.null_chunk_bp)?;
@@ -7714,7 +7792,10 @@ mod tests {
                 selected_row_indices: vec![i],
                 snp_name: format!("snp{i}"),
                 expr: format!("expr{i}"),
-                chrom_field: "window".to_string(),
+                chrom_field: "1".to_string(),
+                bim_snp_name: format!("snp{i}"),
+                bim_allele0: "A".to_string(),
+                bim_allele1: "T".to_string(),
                 pos: i as i32,
                 beta: i as f64,
                 se: 0.1 + i as f64 * 0.01,
@@ -7749,7 +7830,10 @@ mod tests {
                 selected_row_indices: vec![1],
                 snp_name: "snp1".to_string(),
                 expr: "expr1".to_string(),
-                chrom_field: "window".to_string(),
+                chrom_field: "1".to_string(),
+                bim_snp_name: "snp1".to_string(),
+                bim_allele0: "A".to_string(),
+                bim_allele1: "T".to_string(),
                 pos: 1,
                 beta: 1.0,
                 se: 0.1,
@@ -7769,7 +7853,10 @@ mod tests {
                 selected_row_indices: vec![2],
                 snp_name: "snp2".to_string(),
                 expr: "expr2".to_string(),
-                chrom_field: "window".to_string(),
+                chrom_field: "1".to_string(),
+                bim_snp_name: "snp2".to_string(),
+                bim_allele0: "A".to_string(),
+                bim_allele1: "T".to_string(),
                 pos: 2,
                 beta: 2.0,
                 se: 0.2,
@@ -7789,7 +7876,10 @@ mod tests {
                 selected_row_indices: vec![3],
                 snp_name: "snp3".to_string(),
                 expr: "expr3".to_string(),
-                chrom_field: "window".to_string(),
+                chrom_field: "1".to_string(),
+                bim_snp_name: "snp3".to_string(),
+                bim_allele0: "A".to_string(),
+                bim_allele1: "T".to_string(),
                 pos: 3,
                 beta: 3.0,
                 se: 0.3,
@@ -7809,7 +7899,10 @@ mod tests {
                 selected_row_indices: vec![4],
                 snp_name: "snp4".to_string(),
                 expr: "expr4".to_string(),
-                chrom_field: "window".to_string(),
+                chrom_field: "1".to_string(),
+                bim_snp_name: "snp4".to_string(),
+                bim_allele0: "A".to_string(),
+                bim_allele1: "T".to_string(),
                 pos: 4,
                 beta: 4.0,
                 se: 0.4,

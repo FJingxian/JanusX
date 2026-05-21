@@ -1250,17 +1250,20 @@ def main() -> None:
         )
 
         pseudo_path = f"{trait_logic_prefix}.pseudo"
+        posterior_tsv_path = f"{trait_logic_prefix}.posterior.tsv"
         posterior_json_path = result.get("posterior_json")
         run_config_path = f"{trait_outprefix}.garfield.run_config.json"
         n_rules = int(result.get("n_rules", 0))
         if n_rules <= 0:
             _remove_file_if_exists(pseudo_path)
+            _remove_file_if_exists(posterior_tsv_path)
             _remove_file_if_exists(run_config_path)
             _remove_file_if_exists(posterior_json_path)
             logger.warning(f"No GARFIELD rules survived Rust search for trait '{trait_name}', skipped.")
             continue
 
         _remove_file_if_exists(pseudo_path)
+        _remove_file_if_exists(posterior_tsv_path)
         split_applied = bool(result.get("split_applied", False))
         prior_payload, posterior_payload = _split_structure_prior_payload(
             _load_json_if_exists(posterior_json_path)
@@ -1355,7 +1358,6 @@ def main() -> None:
             "test_sigma_e2": float(result.get("test_sigma_e2", float("nan"))),
             "outputs": {
                 "rules_tsv": result.get("rules_tsv"),
-                "posterior_tsv": result.get("posterior_tsv"),
             },
             "prior": prior_payload,
             "posterior": posterior_payload,

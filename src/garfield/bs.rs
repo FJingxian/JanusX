@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use super::permutation::{
-    bucket_from_rule, structure_prior_penalty, RuleNullBucket, RuleNullPenaltyLookup,
+    bucket_from_rule, structure_prior_penalty, GateBucket, RuleNullBucket, RuleNullPenaltyLookup,
     RuleStructurePrior,
 };
 use super::score::{
@@ -234,36 +234,45 @@ fn penalty_for_rule(rule: &BeamRule, params: &BeamSearchParams) -> f64 {
 }
 
 #[inline]
-pub fn rank_rule_score_components(
+fn rank_mode_uses_gain(rule_len: usize, params: &BeamSearchParams) -> bool {
+    match params.rank_mode {
+        BeamRankMode::Raw => false,
+        BeamRankMode::InteractionGain => rule_len >= 2,
+        BeamRankMode::ExhaustiveThenGain => rule_len > params.exhaustive_depth.max(1),
+        BeamRankMode::GainFromLayer(start_layer) => rule_len >= start_layer.max(1),
+    }
+}
+
+#[inline]
+fn rule_is_pure_or(rule: &BeamRule) -> bool {
+    !rule.rest.is_empty()
+        && rule
+            .rest
+            .iter()
+            .all(|(op, _)| matches!(op, BeamBinaryOp::Or))
+}
+
+#[inline]
+fn gate_prefers_raw_score(gate: GateBucket, rule_len: usize, params: &BeamSearchParams) -> bool {
+    rule_len >= 2
+        && matches!(gate, GateBucket::Or)
+        && rank_mode_uses_gain(rule_len, params)
+}
+
+#[inline]
+fn rank_rule_score_components_with_gate(
+    gate: GateBucket,
     rule_len: usize,
     not_count: usize,
     raw_score: f64,
     max_singleton_raw: f64,
     params: &BeamSearchParams,
 ) -> f64 {
-    let base = match params.rank_mode {
-        BeamRankMode::Raw => raw_score,
-        BeamRankMode::InteractionGain => {
-            if rule_len >= 2 {
-                raw_score - max_singleton_raw
-            } else {
-                raw_score
-            }
-        }
-        BeamRankMode::ExhaustiveThenGain => {
-            if rule_len > params.exhaustive_depth.max(1) {
-                raw_score - max_singleton_raw
-            } else {
-                raw_score
-            }
-        }
-        BeamRankMode::GainFromLayer(start_layer) => {
-            if rule_len >= start_layer.max(1) {
-                raw_score - max_singleton_raw
-            } else {
-                raw_score
-            }
-        }
+    let use_gain = rank_mode_uses_gain(rule_len, params) && !gate_prefers_raw_score(gate, rule_len, params);
+    let base = if use_gain {
+        raw_score - max_singleton_raw
+    } else {
+        raw_score
     };
     let len_pen = if rule_len > 1 {
         params.lambda_len * ((rule_len - 1) as f64)
@@ -274,6 +283,24 @@ pub fn rank_rule_score_components(
     let structure_pen =
         structure_prior_penalty(params.structure_prior.as_deref(), rule_len, not_count);
     base - len_pen - not_pen - structure_pen
+}
+
+#[inline]
+pub fn rank_rule_score_components(
+    rule_len: usize,
+    not_count: usize,
+    raw_score: f64,
+    max_singleton_raw: f64,
+    params: &BeamSearchParams,
+) -> f64 {
+    rank_rule_score_components_with_gate(
+        GateBucket::And,
+        rule_len,
+        not_count,
+        raw_score,
+        max_singleton_raw,
+        params,
+    )
 }
 
 #[inline]
@@ -302,7 +329,14 @@ pub fn rank_rule_score_components_with_bucket(
     params: &BeamSearchParams,
     is_train: bool,
 ) -> f64 {
-    rank_rule_score_components(rule_len, not_count, raw_score, max_singleton_raw, params)
+    rank_rule_score_components_with_gate(
+        bucket.gate,
+        rule_len,
+        not_count,
+        raw_score,
+        max_singleton_raw,
+        params,
+    )
         - null_penalty_for_bucket(bucket, params, is_train)
 }
 
@@ -338,7 +372,13 @@ fn train_scores_for_rule(
     params: &BeamSearchParams,
 ) -> (f64, f64) {
     let bucket = bucket_from_rule(rule, train_raw.support_frac, params.logic_gate_mode);
-    let abs_score = rank_rule_score_components(
+    let gate = if rule_is_pure_or(rule) {
+        GateBucket::Or
+    } else {
+        GateBucket::And
+    };
+    let abs_score = rank_rule_score_components_with_gate(
+        gate,
         rule.len(),
         rule.not_count(),
         train_raw.raw_score,
@@ -498,12 +538,7 @@ fn keep_child_after_parent_abs_improvement_pruning(
 
 #[inline]
 fn gain_threshold_applies(rule_len: usize, params: &BeamSearchParams) -> bool {
-    match params.rank_mode {
-        BeamRankMode::Raw => false,
-        BeamRankMode::InteractionGain => rule_len >= 2,
-        BeamRankMode::ExhaustiveThenGain => rule_len > params.exhaustive_depth.max(1),
-        BeamRankMode::GainFromLayer(start_layer) => rule_len >= start_layer.max(1),
-    }
+    rank_mode_uses_gain(rule_len, params)
 }
 
 #[inline]
@@ -1354,7 +1389,13 @@ fn final_test_score_for_state(
     params: &BeamSearchParams,
 ) -> Result<f64, String> {
     let child_bucket = bucket_from_rule(&state.rule, test.support_frac, params.logic_gate_mode);
-    let child_abs_score = rank_rule_score_components(
+    let child_gate = if rule_is_pure_or(&state.rule) {
+        GateBucket::Or
+    } else {
+        GateBucket::And
+    };
+    let child_abs_score = rank_rule_score_components_with_gate(
+        child_gate,
         state.rule.len(),
         state.rule.not_count(),
         test.raw_score,
@@ -1379,7 +1420,13 @@ fn final_test_score_for_state(
         params.lambda_not,
     )?;
     let parent_max_singleton_test_raw = rule_max_singleton_raw(&parent_rule, literal_scores, false);
-    let parent_abs_score = rank_rule_score_components(
+    let parent_gate = if rule_is_pure_or(&parent_rule) {
+        GateBucket::Or
+    } else {
+        GateBucket::And
+    };
+    let parent_abs_score = rank_rule_score_components_with_gate(
+        parent_gate,
         parent_rule.len(),
         parent_rule.not_count(),
         parent_test.raw_score,
@@ -1892,6 +1939,46 @@ mod tests {
         );
         assert!((raw_score - 0.8).abs() < 1e-12);
         assert!((gain_score - 0.2).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_or_rule_keeps_raw_score_under_gain_mode() {
+        let rule = BeamRule {
+            first: BeamLiteral {
+                row_index: 1,
+                group_id: 1,
+                negated: false,
+            },
+            rest: vec![(
+                BeamBinaryOp::Or,
+                BeamLiteral {
+                    row_index: 2,
+                    group_id: 2,
+                    negated: false,
+                },
+            )],
+        };
+        let train = ContinuousRuleScore {
+            score: 0.8,
+            raw_score: 0.8,
+            mean_hit: 1.0,
+            mean_miss: 0.0,
+            support_frac: 0.40,
+            n_hit: 3,
+            n_miss: 5,
+        };
+        let (_, gain_score) = train_scores_for_rule(
+            &rule,
+            train,
+            0.6,
+            None,
+            &BeamSearchParams {
+                rank_mode: BeamRankMode::InteractionGain,
+                logic_gate_mode: BeamLogicGateMode::OrOnly,
+                ..BeamSearchParams::default()
+            },
+        );
+        assert!((gain_score - 0.8).abs() < 1e-12);
     }
 
     #[test]

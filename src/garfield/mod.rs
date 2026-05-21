@@ -1,13 +1,26 @@
 mod bs;
+mod permutation;
 mod residual;
 mod sampling;
 mod score;
 
+use self::permutation::{
+    bucket_from_expr, bucket_from_rule, choose_representative_indices, shuffled_copy_f64,
+    RuleNullBucket, RuleNullCalibrator, RuleNullPenaltyLookup, RuleStructurePrior,
+    RuleStructurePriorCalibrator, RuleStructurePriorConfig, DEFAULT_RULE_NULL_MIN_SNPS_PER_CHUNK,
+    DEFAULT_RULE_NULL_PHYSICAL_CHUNKS, DEFAULT_RULE_PERMUTATION_REPEATS,
+    DEFAULT_RULE_PERMUTATION_REPRESENTATIVE_UNITS, DEFAULT_RULE_STRUCTURE_BOOTSTRAP_KL_THRESHOLD,
+    DEFAULT_RULE_STRUCTURE_BOOTSTRAP_MAX_REPEATS, DEFAULT_RULE_STRUCTURE_BOOTSTRAP_MIN_REPEATS,
+    DEFAULT_RULE_STRUCTURE_BOOTSTRAP_STABLE_REPEATS, DEFAULT_RULE_STRUCTURE_DENSITY_TOPK,
+};
 use crate::beam::{beam_search_and_binary_mcc, beam_search_and_continuous_abs_corr, BeamAndResult};
 use crate::bitwise::bitand_assign;
-use crate::gfcore::{process_snp_row, BedSnpIter, HmpSnpIter, SiteInfo, TxtSnpIter, VcfSnpIter};
+use crate::gfcore::{
+    process_snp_row, read_fam, BedSnpIter, HmpSnpIter, SiteInfo, TxtSnpIter, VcfSnpIter,
+};
 use crate::gfreader::{
-    build_sample_selection, prepare_bed_2bit_packed_owned, prepare_bed_logic_meta_owned,
+    build_sample_selection, prepare_bed_2bit_packed_owned_for_stats_samples,
+    prepare_bed_logic_meta_owned_for_stats_samples,
 };
 use crate::grm::grm_packed_f64_from_stats_rust;
 use crate::linalg::{format_chisq_value, student_t_p_two_sided};
@@ -25,6 +38,9 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use pyo3::BoundObject;
+use rand::rngs::StdRng;
+use rand::seq::index::sample as sample_indices_without_replacement;
+use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
 use std::collections::{HashMap, HashSet};
@@ -33,12 +49,13 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 #[allow(unused_imports)]
 pub use bs::{
     beam_search_train_test_continuous, evaluate_rule_continuous, materialize_rule_bits,
-    rank_rule_score_components, BeamBinaryOp, BeamLiteral, BeamLogicGateMode, BeamRankMode,
-    BeamRule, BeamRuleCandidate, BeamSearchParams,
+    rank_rule_score_components, rank_rule_score_components_with_bucket, BeamBinaryOp, BeamLiteral,
+    BeamLogicGateMode, BeamRankMode, BeamRule, BeamRuleCandidate, BeamSearchParams,
 };
 pub use residual::{garfield_residualize_bed_py, garfield_residualize_grm_py};
 use residual::{garfield_residualize_exact_from_grm_rust, GarfieldResidualResult};
@@ -51,6 +68,9 @@ const BIN01_MAGIC: &[u8; 8] = b"JXBIN001";
 const BIN01_HEADER_LEN: usize = 32;
 const GARFIELD_CONSTRAINED_BEAM_PAR_MIN_TOTAL_CANDS: usize = 1_024;
 const GARFIELD_CONSTRAINED_BEAM_PAR_CHUNK_CANDS: usize = 256;
+const GARFIELD_NULL_ML_TOP_FRAC: f64 = 0.80;
+const GARFIELD_EB_BEAM_MIN_GAIN: f64 = 0.05;
+const GARFIELD_SCAN_BEAM_MIN_GAIN: f64 = 0.01;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GarfieldInputKind {
@@ -65,6 +85,12 @@ enum GarfieldInputKind {
 enum GarfieldBinMode {
     Bin,
     Mbin,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum GarfieldMlKeepPolicy {
+    TopK,
+    TopKPlusRandom { top_frac: f64 },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -103,6 +129,23 @@ struct GarfieldWindow {
     bp_start: i32,
     bp_end: i32,
     indices: Vec<usize>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GarfieldNullChunk {
+    chrom_code: u32,
+    window_index: u32,
+    window_id: u64,
+    start_index: usize,
+    end_index: usize,
+    bp_start: i32,
+    bp_end: i32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GarfieldNullChunkSpan {
+    start_chunk_idx: usize,
+    end_chunk_idx: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -191,6 +234,26 @@ fn parse_beam_rank_mode(mode: &str) -> Result<BeamRankMode, String> {
 }
 
 #[inline]
+fn format_structure_alpha_meta(
+    calibrator: &RuleStructurePriorCalibrator,
+    cfg: &RuleStructurePriorConfig,
+    display_len: usize,
+) -> String {
+    let alpha = calibrator.posterior_len_alpha_preview(cfg);
+    let mut fields = Vec::<String>::with_capacity(display_len.clamp(1, 5));
+    for rule_len in 1..=display_len.clamp(1, 5) {
+        fields.push(format!("{:.2}", alpha[rule_len]));
+    }
+    format!("alpha=[{}]", fields.join(","))
+}
+
+#[inline]
+fn format_structure_alpha_placeholder(display_len: usize) -> String {
+    let fields = vec!["--"; display_len.clamp(1, 5)].join(",");
+    format!("alpha=[{}]", fields)
+}
+
+#[inline]
 fn garfield_progress_notify(
     progress_callback: Option<&Py<PyAny>>,
     done: usize,
@@ -200,6 +263,24 @@ fn garfield_progress_notify(
         Python::attach(|py2| -> PyResult<()> {
             py2.check_signals()?;
             cb.call1(py2, (done, total))?;
+            Ok(())
+        })?;
+    }
+    Ok(())
+}
+
+#[inline]
+fn garfield_stage_progress_notify(
+    progress_callback: Option<&Py<PyAny>>,
+    stage: &str,
+    done: usize,
+    total: usize,
+    meta: Option<&str>,
+) -> PyResult<()> {
+    if let Some(cb) = progress_callback {
+        Python::attach(|py2| -> PyResult<()> {
+            py2.check_signals()?;
+            cb.call1(py2, (stage, done, total, meta))?;
             Ok(())
         })?;
     }
@@ -1476,6 +1557,136 @@ fn normalize_chrom(chrom: &str) -> String {
     s.to_string()
 }
 
+#[inline]
+fn chrom_base_view(chrom: &str) -> &str {
+    let s = chrom.trim();
+    let s = if s.len() > 2 && (s.ends_with("_1") || s.ends_with("_2")) {
+        &s[..s.len() - 2]
+    } else {
+        s
+    };
+    let s = if s.len() > 1 && (s.ends_with('-') || s.ends_with('+')) {
+        &s[..s.len() - 1]
+    } else {
+        s
+    };
+    if s.len() >= 3 && s[..3].eq_ignore_ascii_case("chr") {
+        &s[3..]
+    } else {
+        s
+    }
+}
+
+#[inline]
+fn same_normalized_chrom(a: &str, b: &str) -> bool {
+    chrom_base_view(a).eq_ignore_ascii_case(chrom_base_view(b))
+}
+
+#[inline]
+fn normalize_interval_bounds(start: i32, end: i32) -> (i32, i32) {
+    if start <= end {
+        (start, end)
+    } else {
+        (end, start)
+    }
+}
+
+fn parse_scan_bimrange_item(text: &str) -> Result<GarfieldScanBimRange, String> {
+    let raw = text.trim();
+    if raw.is_empty() {
+        return Err("empty --bimrange item".to_string());
+    }
+    let (chrom_txt, coords_txt) = raw.split_once(':').ok_or_else(|| {
+        format!("Invalid --bimrange format: {raw}. Use chr:start-end (or chr:start:end) in bp.")
+    })?;
+    let (start_txt, end_txt) = if let Some((a, b)) = coords_txt.split_once('-') {
+        (a.trim(), b.trim())
+    } else if let Some((a, b)) = coords_txt.split_once(':') {
+        (a.trim(), b.trim())
+    } else {
+        return Err(format!(
+            "Invalid --bimrange format: {raw}. Use chr:start-end (or chr:start:end) in bp."
+        ));
+    };
+    let parse_bp = |label: &str, value: &str| -> Result<i32, String> {
+        let parsed = value.parse::<i64>().map_err(|_| {
+            format!("Invalid --bimrange {label}: '{value}' is not an integer bp coordinate.")
+        })?;
+        if !(0..=i64::from(i32::MAX)).contains(&parsed) {
+            return Err(format!(
+                "Invalid --bimrange {label}: '{value}' is outside the supported bp range [0, {}].",
+                i32::MAX
+            ));
+        }
+        Ok(parsed as i32)
+    };
+    let start = parse_bp("start", start_txt)?;
+    let end = parse_bp("end", end_txt)?;
+    let (bp_start, bp_end) = normalize_interval_bounds(start, end);
+    Ok(GarfieldScanBimRange {
+        chrom: normalize_chrom(chrom_txt),
+        bp_start,
+        bp_end,
+    })
+}
+
+fn parse_scan_bimranges(items: &[String]) -> Result<Vec<GarfieldScanBimRange>, String> {
+    let mut out = Vec::<GarfieldScanBimRange>::new();
+    for raw in items.iter() {
+        for item in raw.split(',') {
+            let trimmed = item.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            out.push(parse_scan_bimrange_item(trimmed)?);
+        }
+    }
+    if out.is_empty() {
+        return Err("--bimrange was provided but no valid interval was parsed.".to_string());
+    }
+    Ok(out)
+}
+
+#[inline]
+fn spans_overlap_bp(a_start: i32, a_end: i32, b_start: i32, b_end: i32) -> bool {
+    let (a_lo, a_hi) = normalize_interval_bounds(a_start, a_end);
+    let (b_lo, b_hi) = normalize_interval_bounds(b_start, b_end);
+    a_lo <= b_hi && b_lo <= a_hi
+}
+
+fn unit_overlaps_scan_bimranges(
+    unit: &GarfieldLogicUnit,
+    bimranges: &[GarfieldScanBimRange],
+) -> bool {
+    unit.spans.iter().any(|span| {
+        bimranges.iter().any(|range| {
+            same_normalized_chrom(&span.chrom, &range.chrom)
+                && spans_overlap_bp(span.bp_start, span.bp_end, range.bp_start, range.bp_end)
+        })
+    })
+}
+
+#[inline]
+fn chrom_code_for_chunk_id(chrom: &str, fallback_seq_code: u32) -> u32 {
+    let base = chrom_base_view(chrom);
+    if let Ok(v) = base.parse::<u32>() {
+        return v;
+    }
+    if base.eq_ignore_ascii_case("X") {
+        return 23;
+    }
+    if base.eq_ignore_ascii_case("Y") {
+        return 24;
+    }
+    if base.eq_ignore_ascii_case("XY") {
+        return 25;
+    }
+    if base.eq_ignore_ascii_case("M") || base.eq_ignore_ascii_case("MT") {
+        return 26;
+    }
+    fallback_seq_code.max(1)
+}
+
 fn build_chrom_index(sites: &[SiteInfo], n_rows: usize) -> HashMap<String, Vec<(i32, usize)>> {
     let mut idx: HashMap<String, Vec<(i32, usize)>> = HashMap::new();
     for (i, s) in sites.iter().take(n_rows).enumerate() {
@@ -1545,6 +1756,27 @@ fn gather_rows_by_indices(
     Ok(out)
 }
 
+fn gather_rows_by_range(
+    bits_flat: &[u64],
+    row_words: usize,
+    row_start: usize,
+    row_end: usize,
+) -> Result<Vec<u64>, String> {
+    let ctx = "garfield::gather_rows_by_range";
+    if row_end <= row_start {
+        return Ok(Vec::new());
+    }
+    let n_rows_all = bits_flat.len() / row_words;
+    if row_end > n_rows_all {
+        return Err(format!(
+            "{ctx}: row range out of bounds: [{row_start}, {row_end}) vs n_rows={n_rows_all}"
+        ));
+    }
+    let st = row_start * row_words;
+    let ed = row_end * row_words;
+    Ok(bits_flat[st..ed].to_vec())
+}
+
 fn build_feature_group_ids(sites: &[SiteInfo], n_rows: usize) -> Vec<usize> {
     let mut map: HashMap<(String, i32), usize> = HashMap::new();
     let mut out = vec![0usize; n_rows];
@@ -1560,6 +1792,190 @@ fn build_feature_group_ids(sites: &[SiteInfo], n_rows: usize) -> Vec<usize> {
         out[i] = gid;
     }
     out
+}
+
+#[inline]
+fn pos_to_physical_window_index(pos: i32, chunk_bp: u64) -> u32 {
+    if chunk_bp == 0 {
+        return 0;
+    }
+    let pos_u64 = u64::try_from(pos.max(0)).unwrap_or(0);
+    u32::try_from(pos_u64 / chunk_bp).unwrap_or(u32::MAX)
+}
+
+#[inline]
+fn physical_window_bounds(window_index: u32, chunk_bp: u64) -> (i32, i32) {
+    let start = u64::from(window_index).saturating_mul(chunk_bp);
+    let end = start.saturating_add(chunk_bp);
+    (
+        i32::try_from(start).unwrap_or(i32::MAX),
+        i32::try_from(end).unwrap_or(i32::MAX),
+    )
+}
+
+fn build_valid_null_chunks(
+    sites: &[SiteInfo],
+    chunk_bp: usize,
+    min_snp_count: usize,
+) -> (Vec<GarfieldNullChunk>, Vec<GarfieldNullChunkSpan>) {
+    if sites.is_empty() || chunk_bp == 0 {
+        return (Vec::new(), Vec::new());
+    }
+
+    let chunk_bp_u64 = u64::try_from(chunk_bp).unwrap_or(u64::MAX).max(1);
+    let mut out = Vec::<GarfieldNullChunk>::new();
+    let mut spans = Vec::<GarfieldNullChunkSpan>::new();
+    let mut chrom_seq_code = 1u32;
+    let mut i = 0usize;
+
+    while i < sites.len() {
+        let chrom_raw = sites[i].chrom.as_str();
+        let chrom_code = chrom_code_for_chunk_id(chrom_raw, chrom_seq_code);
+        let chunk_span_start = out.len();
+        let mut j = i;
+        let mut current_window_index = pos_to_physical_window_index(sites[i].pos, chunk_bp_u64);
+        let mut window_start_index = i;
+        let mut snp_count = 0usize;
+
+        while j < sites.len() && same_normalized_chrom(&sites[j].chrom, chrom_raw) {
+            let window_index = pos_to_physical_window_index(sites[j].pos, chunk_bp_u64);
+            if window_index != current_window_index {
+                if snp_count >= min_snp_count {
+                    let (bp_start, bp_end) =
+                        physical_window_bounds(current_window_index, chunk_bp_u64);
+                    out.push(GarfieldNullChunk {
+                        chrom_code,
+                        window_index: current_window_index,
+                        window_id: (u64::from(chrom_code) << 32) | u64::from(current_window_index),
+                        start_index: window_start_index,
+                        end_index: j,
+                        bp_start,
+                        bp_end,
+                    });
+                }
+                current_window_index = window_index;
+                window_start_index = j;
+                snp_count = 0;
+            }
+            snp_count = snp_count.saturating_add(1);
+            j = j.saturating_add(1);
+        }
+
+        if snp_count >= min_snp_count {
+            let (bp_start, bp_end) = physical_window_bounds(current_window_index, chunk_bp_u64);
+            out.push(GarfieldNullChunk {
+                chrom_code,
+                window_index: current_window_index,
+                window_id: (u64::from(chrom_code) << 32) | u64::from(current_window_index),
+                start_index: window_start_index,
+                end_index: j,
+                bp_start,
+                bp_end,
+            });
+        }
+
+        if out.len() > chunk_span_start {
+            spans.push(GarfieldNullChunkSpan {
+                start_chunk_idx: chunk_span_start,
+                end_chunk_idx: out.len(),
+            });
+        }
+        i = j;
+        chrom_seq_code = chrom_seq_code.saturating_add(1);
+    }
+
+    (out, spans)
+}
+
+fn allocate_stratified_chunk_quotas(
+    spans: &[GarfieldNullChunkSpan],
+    total_valid_chunks: usize,
+    target_chunks: usize,
+) -> Vec<usize> {
+    let chrom_counts = spans
+        .iter()
+        .map(|span| span.end_chunk_idx.saturating_sub(span.start_chunk_idx))
+        .collect::<Vec<_>>();
+    if total_valid_chunks == 0 || target_chunks == 0 {
+        return vec![0usize; chrom_counts.len()];
+    }
+    if total_valid_chunks <= target_chunks {
+        return chrom_counts;
+    }
+
+    let target = target_chunks.min(total_valid_chunks);
+    let total_u128 = total_valid_chunks as u128;
+    let target_u128 = target as u128;
+    let mut quotas = vec![0usize; chrom_counts.len()];
+    let mut remainders = Vec::<(u128, usize, usize)>::with_capacity(chrom_counts.len());
+    let mut assigned = 0usize;
+    for (idx, &count) in chrom_counts.iter().enumerate() {
+        let weight = (count as u128).saturating_mul(target_u128);
+        let floor_q = usize::try_from(weight / total_u128)
+            .unwrap_or(usize::MAX)
+            .min(count);
+        quotas[idx] = floor_q;
+        assigned = assigned.saturating_add(floor_q);
+        remainders.push((weight % total_u128, count, idx));
+    }
+    let mut remain = target.saturating_sub(assigned);
+    remainders.sort_by(|a, b| b.cmp(a));
+    for &(_, count, idx) in remainders.iter() {
+        if remain == 0 {
+            break;
+        }
+        if quotas[idx] < count {
+            quotas[idx] += 1;
+            remain -= 1;
+        }
+    }
+    quotas
+}
+
+fn sample_null_chunks_stratified(
+    sites: &[SiteInfo],
+    extension: usize,
+    target_chunks: usize,
+    min_snp_count: usize,
+    seed: u64,
+) -> (Vec<GarfieldNullChunk>, usize) {
+    let chunk_bp = extension.saturating_mul(2).max(1);
+    let (valid_chunks, chrom_spans) = build_valid_null_chunks(sites, chunk_bp, min_snp_count);
+    let total_valid = valid_chunks.len();
+    if total_valid == 0 || target_chunks == 0 {
+        return (Vec::new(), total_valid);
+    }
+    if total_valid <= target_chunks {
+        return (valid_chunks, total_valid);
+    }
+
+    let quotas = allocate_stratified_chunk_quotas(&chrom_spans, total_valid, target_chunks);
+    let mut rng = StdRng::seed_from_u64(seed ^ 0x9E37_79B9_7F4A_7C15);
+    let mut picked = Vec::<GarfieldNullChunk>::with_capacity(target_chunks.min(total_valid));
+    for (span, &quota) in chrom_spans.iter().zip(quotas.iter()) {
+        if quota == 0 {
+            continue;
+        }
+        let count = span.end_chunk_idx.saturating_sub(span.start_chunk_idx);
+        if quota >= count {
+            picked.extend_from_slice(&valid_chunks[span.start_chunk_idx..span.end_chunk_idx]);
+            continue;
+        }
+        let sampled = sample_indices_without_replacement(&mut rng, count, quota);
+        for local_idx in sampled.into_vec().into_iter() {
+            picked.push(valid_chunks[span.start_chunk_idx + local_idx]);
+        }
+    }
+    picked.sort_by(|a, b| {
+        a.chrom_code
+            .cmp(&b.chrom_code)
+            .then_with(|| a.window_index.cmp(&b.window_index))
+            .then_with(|| a.start_index.cmp(&b.start_index))
+    });
+    if picked.len() > target_chunks {
+        picked.truncate(target_chunks);
+    }
+    (picked, total_valid)
 }
 
 fn run_beam_with_feature_exclusion(
@@ -1780,9 +2196,17 @@ fn validate_continuous_y(y: &[f64]) -> Result<(), String> {
 }
 
 #[derive(Clone, Debug)]
+struct GarfieldUnitSpan {
+    chrom: String,
+    bp_start: i32,
+    bp_end: i32,
+}
+
+#[derive(Clone, Debug)]
 struct GarfieldLogicUnit {
     label: String,
     indices: Vec<usize>,
+    spans: Vec<GarfieldUnitSpan>,
 }
 
 #[derive(Clone, Debug)]
@@ -1796,12 +2220,31 @@ struct GarfieldLogicBits {
 }
 
 #[derive(Clone, Debug)]
+struct GarfieldUnitPrepared {
+    selected_global_rows: Vec<usize>,
+    local_sites: Vec<SiteInfo>,
+    local_groups: Vec<usize>,
+    train_bits: Vec<u64>,
+    row_words_train: usize,
+    test_bits: Vec<u64>,
+    row_words_test: usize,
+    selected_bits_full: Vec<u64>,
+}
+
+#[derive(Clone, Debug)]
+struct GarfieldUnitMlContext {
+    unit_index: usize,
+    selected_global_rows: Vec<usize>,
+}
+
+#[derive(Clone, Debug)]
 struct GarfieldLogicRuleRecord {
     unit_name: String,
     unit_kind: String,
     unit_index: usize,
     region_size: usize,
     ml_feature_count: usize,
+    ml_rank: String,
     selected_row_indices: Vec<usize>,
     snp_name: String,
     expr: String,
@@ -1820,6 +2263,18 @@ struct GarfieldLogicRuleRecord {
 struct GarfieldLogicPipelineResult {
     pseudo_prefix: Option<String>,
     rules_tsv: Option<String>,
+    posterior_tsv: Option<String>,
+    posterior_json: Option<String>,
+    rule_permutation_active: bool,
+    null_chunk_bp: usize,
+    null_chunk_min_snps: usize,
+    null_chunk_target: usize,
+    null_chunk_valid_total: usize,
+    null_chunk_selected: usize,
+    representative_units_target: usize,
+    representative_units_used: usize,
+    permutation_null_repeats: usize,
+    permutation_bootstrap_repeats: usize,
     records: Vec<GarfieldLogicRuleRecord>,
     simbench_count: usize,
     split_applied: bool,
@@ -1830,6 +2285,13 @@ struct GarfieldLogicPipelineResult {
     units_scanned: usize,
     train_fit: GarfieldResidualResult,
     test_fit: GarfieldResidualResult,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GarfieldScanBimRange {
+    chrom: String,
+    bp_start: i32,
+    bp_end: i32,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -2018,6 +2480,26 @@ fn collapse_logic_bin01_from_raw_row(row: &[f32]) -> Result<Vec<u8>, String> {
         .collect())
 }
 
+fn normalize_simbench_raw_row(row: &mut [f32], site: &mut SiteInfo) -> Result<(), String> {
+    if row.is_empty() {
+        return Err("empty genotype row".to_string());
+    }
+    let keep = process_snp_row(
+        row,
+        &mut site.ref_allele,
+        &mut site.alt_allele,
+        0.0,
+        1.0,
+        false,
+        false,
+        1.0,
+    );
+    if !keep {
+        return Err("failed to normalize genotype row".to_string());
+    }
+    Ok(())
+}
+
 fn combine_logic_bin01_rows(rows: &[Vec<u8>], logic: SimBenchLogic) -> Result<Vec<u8>, String> {
     if rows.is_empty() {
         return Err("simbench term has no genotype rows".to_string());
@@ -2109,17 +2591,162 @@ fn simbench_rule_expr(logic: SimBenchLogic, sites: &[SiteInfo]) -> Result<String
     Ok(out)
 }
 
+#[inline]
+fn unit_span_contains_site(span: &GarfieldUnitSpan, chrom: &str, pos: i32) -> bool {
+    same_normalized_chrom(&span.chrom, chrom)
+        && pos >= span.bp_start.min(span.bp_end)
+        && pos <= span.bp_start.max(span.bp_end)
+}
+
+fn unit_contains_any_simbench_site(unit: &GarfieldLogicUnit, terms: &[SimBenchTerm]) -> bool {
+    unit.spans.iter().any(|span| {
+        terms.iter().any(|term| {
+            term.sites
+                .iter()
+                .any(|(chrom, pos)| unit_span_contains_site(span, chrom, *pos))
+        })
+    })
+}
+
+fn build_simbench_ml_contexts(
+    terms: &[SimBenchTerm],
+    units: &[GarfieldLogicUnit],
+    scan_unit_indices: &[usize],
+    response: ResponseKind,
+    engine: Option<MlEngine>,
+    importance: ImportanceKind,
+    perm_cfg: PermutationConfig,
+    ml_top_k: usize,
+    ml_top_frac: f64,
+    tree_cfg: ExtraTreesConfig,
+    logic_bits: &GarfieldLogicBits,
+    train_idx_local: &[usize],
+    y_train: &[f64],
+    allow_parallel: bool,
+) -> Result<Vec<GarfieldUnitMlContext>, String> {
+    if terms.is_empty() || scan_unit_indices.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::<GarfieldUnitMlContext>::new();
+    for &ui in scan_unit_indices.iter() {
+        let unit = &units[ui];
+        if !unit_contains_any_simbench_site(unit, terms) {
+            continue;
+        }
+        let Some(selected_global_rows) = select_logic_unit_global_rows(
+            unit,
+            response,
+            engine,
+            importance,
+            perm_cfg,
+            ml_top_k,
+            ml_top_frac,
+            tree_cfg,
+            logic_bits,
+            train_idx_local,
+            y_train,
+            allow_parallel,
+        )?
+        else {
+            continue;
+        };
+        out.push(GarfieldUnitMlContext {
+            unit_index: ui,
+            selected_global_rows,
+        });
+    }
+    Ok(out)
+}
+
+fn format_simbench_ml_rank(logic: SimBenchLogic, ranks: &[Option<usize>]) -> String {
+    if ranks.is_empty() {
+        return ".".to_string();
+    }
+    let joiner = match logic {
+        SimBenchLogic::Single => "",
+        SimBenchLogic::And => " & ",
+        SimBenchLogic::Or => " | ",
+    };
+    ranks
+        .iter()
+        .map(|rank| match rank {
+            Some(v) => v.to_string(),
+            None => ".".to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(joiner)
+}
+
+fn resolve_simbench_ml_rank(
+    logic: SimBenchLogic,
+    site_row_candidates: &[Vec<usize>],
+    contexts: &[GarfieldUnitMlContext],
+) -> (String, usize) {
+    if site_row_candidates.is_empty() {
+        return (".".to_string(), 0);
+    }
+    let mut best_repr = None::<(usize, usize, usize, usize, String, usize)>;
+    for ctx in contexts.iter() {
+        let rank_map = ctx
+            .selected_global_rows
+            .iter()
+            .enumerate()
+            .map(|(i, &row)| (row, i + 1))
+            .collect::<HashMap<usize, usize>>();
+        let ranks = site_row_candidates
+            .iter()
+            .map(|cands| {
+                cands
+                    .iter()
+                    .filter_map(|idx| rank_map.get(idx).copied())
+                    .min()
+            })
+            .collect::<Vec<_>>();
+        let matched = ranks.iter().filter(|v| v.is_some()).count();
+        if matched == 0 {
+            continue;
+        }
+        let sum_rank = ranks.iter().flatten().copied().sum::<usize>();
+        let max_rank = ranks.iter().flatten().copied().max().unwrap_or(usize::MAX);
+        let ml_rank = format_simbench_ml_rank(logic, ranks.as_slice());
+        let candidate = (
+            usize::MAX - matched,
+            max_rank,
+            sum_rank,
+            ctx.unit_index,
+            ml_rank,
+            ctx.selected_global_rows.len(),
+        );
+        if best_repr
+            .as_ref()
+            .map(|best| candidate < *best)
+            .unwrap_or(true)
+        {
+            best_repr = Some(candidate);
+        }
+    }
+    if let Some((_, _, _, _, ml_rank, ml_feature_count)) = best_repr {
+        (ml_rank, ml_feature_count)
+    } else {
+        (
+            format_simbench_ml_rank(logic, &vec![None; site_row_candidates.len()]),
+            0,
+        )
+    }
+}
+
 fn evaluate_simbench_terms(
     prefix: &str,
-    simbench_path: &str,
+    terms: &[SimBenchTerm],
+    logic_site_lookup: &HashMap<(String, i32), Vec<usize>>,
     selected_sample_indices: &[usize],
     train_idx_local: &[usize],
     assoc_sample_indices: &[usize],
     y_train: &[f64],
     y_assoc: &[f64],
     beam_params: BeamSearchParams,
+    ml_contexts: &[GarfieldUnitMlContext],
 ) -> Result<Vec<GarfieldLogicRuleRecord>, String> {
-    let terms = parse_simbench_terms(simbench_path)?;
     if terms.is_empty() {
         return Ok(Vec::new());
     }
@@ -2134,11 +2761,12 @@ fn evaluate_simbench_terms(
     let n_selected = selected_sample_indices.len();
     let row_words_full = words_for_samples(n_selected);
     let mut out = Vec::<GarfieldLogicRuleRecord>::with_capacity(terms.len());
-    for term in terms.into_iter() {
+    for term in terms.iter() {
         let mut gate_rows = Vec::<Vec<u8>>::with_capacity(term.sites.len());
         let mut member_bits_full = Vec::<Vec<u64>>::with_capacity(term.sites.len());
         let mut bench_sites = Vec::<SiteInfo>::with_capacity(term.sites.len());
         let mut selected_row_indices = Vec::<usize>::with_capacity(term.sites.len());
+        let mut logic_row_candidates = Vec::<Vec<usize>>::with_capacity(term.sites.len());
         for (chrom, pos) in term.sites.iter() {
             let key = (normalize_chrom(chrom), *pos);
             let src_idx = *site_lookup.get(&key).ok_or_else(|| {
@@ -2147,7 +2775,7 @@ fn evaluate_simbench_terms(
                     term.term_id, chrom, pos
                 )
             })?;
-            let (row, site) = bed
+            let (mut row, mut site) = bed
                 .get_snp_row_selected_raw(src_idx, selected_sample_indices)
                 .ok_or_else(|| {
                     format!(
@@ -2155,12 +2783,19 @@ fn evaluate_simbench_terms(
                         term.term_id, chrom, pos
                     )
                 })?;
+            normalize_simbench_raw_row(&mut row, &mut site).map_err(|e| {
+                format!(
+                    "simbench term {} failed to normalize site {}:{} from BED: {e}",
+                    term.term_id, chrom, pos
+                )
+            })?;
             gate_rows.push(collapse_logic_bin01_from_raw_row(&row).map_err(|e| {
                 format!(
                     "simbench term {} failed to collapse site {}:{} to BIN01: {e}",
                     term.term_id, chrom, pos
                 )
             })?);
+            let row_candidates = logic_site_lookup.get(&key).cloned().unwrap_or_default();
             member_bits_full.push(pack_bin01_to_words(
                 gate_rows
                     .last()
@@ -2169,6 +2804,7 @@ fn evaluate_simbench_terms(
             ));
             bench_sites.push(site);
             selected_row_indices.push(src_idx);
+            logic_row_candidates.push(row_candidates);
         }
         let gate = combine_logic_bin01_rows(gate_rows.as_slice(), term.logic).map_err(|e| {
             format!(
@@ -2241,34 +2877,48 @@ fn evaluate_simbench_terms(
         if !max_singleton_assoc_raw.is_finite() {
             max_singleton_assoc_raw = assoc_sc.raw_score;
         }
-        let train_score = rank_rule_score_components(
+        let sim_expr_txt = simbench_rule_expr(term.logic, bench_sites.as_slice())?;
+        let sim_bucket = bucket_from_expr(
+            sim_expr_txt.as_str(),
+            term.sites.len(),
+            train_sc.support_frac,
+            beam_params.logic_gate_mode,
+        );
+        let train_score = rank_rule_score_components_with_bucket(
+            sim_bucket,
             term.sites.len(),
             0,
             train_sc.raw_score,
             max_singleton_train_raw,
             &beam_params,
+            true,
         );
-        let test_score = rank_rule_score_components(
+        let test_score = rank_rule_score_components_with_bucket(
+            sim_bucket,
             term.sites.len(),
             0,
             assoc_sc.raw_score,
             max_singleton_assoc_raw,
             &beam_params,
+            false,
         );
         let assoc =
             fit_binary_rule_wald_from_bits(y_assoc, full_bits.as_slice(), assoc_sample_indices);
         let first_site = bench_sites
             .first()
             .ok_or_else(|| format!("simbench term {} has no sites", term.term_id))?;
+        let (ml_rank, ml_feature_count) =
+            resolve_simbench_ml_rank(term.logic, logic_row_candidates.as_slice(), ml_contexts);
         out.push(GarfieldLogicRuleRecord {
             unit_name: simbench_rule_name(term.logic, bench_sites.as_slice(), &term.label),
             unit_kind: "simbench".to_string(),
             unit_index: term.term_id,
             region_size: bench_sites.len(),
-            ml_feature_count: 0,
+            ml_feature_count,
+            ml_rank,
             selected_row_indices,
             snp_name: simbench_rule_name(term.logic, bench_sites.as_slice(), &term.label),
-            expr: simbench_rule_expr(term.logic, bench_sites.as_slice())?,
+            expr: sim_expr_txt,
             chrom_field: first_site.chrom.clone(),
             pos: first_site.pos,
             beta: assoc.beta,
@@ -2377,6 +3027,45 @@ fn cmp_logic_rule_records(
         .then_with(|| a.unit_name.cmp(&b.unit_name))
 }
 
+#[inline]
+fn logic_rule_output_kind_rank(unit_kind: &str) -> u8 {
+    match unit_kind {
+        "window" => 0,
+        "gene" => 1,
+        "geneset" => 2,
+        "simbench" => 255,
+        _ => 200,
+    }
+}
+
+#[inline]
+fn cmp_logic_rule_records_output(
+    a: &GarfieldLogicRuleRecord,
+    b: &GarfieldLogicRuleRecord,
+) -> std::cmp::Ordering {
+    logic_rule_output_kind_rank(a.unit_kind.as_str())
+        .cmp(&logic_rule_output_kind_rank(b.unit_kind.as_str()))
+        .then_with(|| a.unit_kind.cmp(&b.unit_kind))
+        .then_with(|| a.unit_index.cmp(&b.unit_index))
+        .then_with(|| {
+            b.test_score
+                .partial_cmp(&a.test_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .then_with(|| {
+            b.train_score
+                .partial_cmp(&a.train_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .then_with(|| {
+            a.selected_row_indices
+                .len()
+                .cmp(&b.selected_row_indices.len())
+        })
+        .then_with(|| a.snp_name.cmp(&b.snp_name))
+        .then_with(|| a.unit_name.cmp(&b.unit_name))
+}
+
 fn dedup_logic_rule_records(records: Vec<GarfieldLogicRuleRecord>) -> Vec<GarfieldLogicRuleRecord> {
     let mut best_by_bits = HashMap::<Vec<u64>, GarfieldLogicRuleRecord>::new();
     for rec in records.into_iter() {
@@ -2470,6 +3159,17 @@ fn subset_vec_f64(values: &[f64], indices: &[usize]) -> Result<Vec<f64>, String>
     Ok(out)
 }
 
+#[inline]
+fn bootstrap_sample_indices(n_samples: usize, seed: u64) -> Vec<usize> {
+    if n_samples == 0 {
+        return Vec::new();
+    }
+    let mut rng = StdRng::seed_from_u64(seed);
+    (0..n_samples)
+        .map(|_| rng.random_range(0..n_samples))
+        .collect()
+}
+
 fn subset_cov_f64(
     x_cov: Option<&[f64]>,
     n_samples: usize,
@@ -2537,6 +3237,16 @@ fn literal_name(site: &SiteInfo, negated: bool) -> String {
     }
 }
 
+#[inline]
+fn literal_ml_rank_name(row_index: usize, negated: bool) -> String {
+    let rank = row_index.saturating_add(1);
+    if negated {
+        format!("!{rank}")
+    } else {
+        rank.to_string()
+    }
+}
+
 fn rule_expr(rule: &BeamRule, local_sites: &[SiteInfo]) -> Result<String, String> {
     let first = local_sites
         .get(rule.first.row_index)
@@ -2575,6 +3285,19 @@ fn rule_snp_name(rule: &BeamRule, local_sites: &[SiteInfo]) -> Result<String, St
         out.push_str(&literal_name(site, lit.negated));
     }
     Ok(out)
+}
+
+fn rule_ml_rank_name(rule: &BeamRule) -> String {
+    let mut out = literal_ml_rank_name(rule.first.row_index, rule.first.negated);
+    for (op, lit) in rule.rest.iter() {
+        let op_txt = match op {
+            BeamBinaryOp::And => " & ",
+            BeamBinaryOp::Or => " | ",
+        };
+        out.push_str(op_txt);
+        out.push_str(&literal_ml_rank_name(lit.row_index, lit.negated));
+    }
+    out
 }
 
 fn rule_selected_global_rows(
@@ -2616,9 +3339,21 @@ fn build_logic_units_from_groups(
         let label = group_names
             .and_then(|v| v.get(gi).cloned())
             .unwrap_or_else(|| format!("group_{}", gi + 1));
+        let spans = group
+            .iter()
+            .map(|(chrom, start, end)| {
+                let (bp_start, bp_end) = normalize_interval_bounds(*start, *end);
+                GarfieldUnitSpan {
+                    chrom: normalize_chrom(chrom),
+                    bp_start,
+                    bp_end,
+                }
+            })
+            .collect::<Vec<_>>();
         out.push(GarfieldLogicUnit {
             label,
             indices: idx_all,
+            spans,
         });
     }
     out
@@ -2640,9 +3375,22 @@ fn build_logic_units(
             let windows = build_windows_from_sites(sites, sites.len(), ext, step_eff);
             Ok(windows
                 .into_iter()
-                .map(|w| GarfieldLogicUnit {
-                    label: format!("{}:{}-{}", w.chrom, w.bp_start, w.bp_end),
-                    indices: w.indices,
+                .map(|w| {
+                    let GarfieldWindow {
+                        chrom,
+                        bp_start,
+                        bp_end,
+                        indices,
+                    } = w;
+                    GarfieldLogicUnit {
+                        label: format!("{}:{}-{}", chrom, bp_start, bp_end),
+                        indices,
+                        spans: vec![GarfieldUnitSpan {
+                            chrom,
+                            bp_start,
+                            bp_end,
+                        }],
+                    }
                 })
                 .collect())
         }
@@ -2718,8 +3466,19 @@ fn build_logic_sample_plan(sample_indices: &[usize]) -> Vec<LogicSamplePlanEntry
 }
 
 #[inline]
+fn decode_logic_bin_genotype(code: u8, flip: bool) -> Option<u8> {
+    match code {
+        0b00 => Some(if flip { 2 } else { 0 }),
+        0b10 => Some(1),
+        0b11 => Some(if flip { 0 } else { 2 }),
+        _ => None,
+    }
+}
+
+#[inline]
 fn fill_bin_logic_row_bits(
     row: &[u8],
+    flip: bool,
     sample_plan: &[LogicSamplePlanEntry],
     dst_words: &mut [u64],
 ) {
@@ -2728,9 +3487,9 @@ fn fill_bin_logic_row_bits(
     for entry in sample_plan.iter() {
         let byte = row[entry.src_byte_idx];
         for lane in 0..entry.n_lanes as usize {
-            match (byte >> entry.src_shifts[lane]) & 0b11 {
-                0b00 => c0 += 1,
-                0b11 => c2 += 1,
+            match decode_logic_bin_genotype((byte >> entry.src_shifts[lane]) & 0b11, flip) {
+                Some(0) => c0 += 1,
+                Some(2) => c2 += 1,
                 _ => {}
             }
         }
@@ -2739,11 +3498,12 @@ fn fill_bin_logic_row_bits(
     for entry in sample_plan.iter() {
         let byte = row[entry.src_byte_idx];
         for lane in 0..entry.n_lanes as usize {
-            let is_one = match (byte >> entry.src_shifts[lane]) & 0b11 {
-                0b00 => false,
-                0b11 => true,
-                _ => mode02 == 2,
-            };
+            let is_one =
+                match decode_logic_bin_genotype((byte >> entry.src_shifts[lane]) & 0b11, flip) {
+                    Some(0) => false,
+                    Some(2) => true,
+                    _ => mode02 == 2,
+                };
             if is_one {
                 dst_words[entry.dst_word_idx[lane]] |= entry.dst_bit[lane];
             }
@@ -2754,6 +3514,7 @@ fn fill_bin_logic_row_bits(
 #[inline]
 fn fill_mbin_logic_row_bits(
     row: &[u8],
+    flip: bool,
     sample_plan: &[LogicSamplePlanEntry],
     row_words: usize,
     dst_words: &mut [u64],
@@ -2764,10 +3525,10 @@ fn fill_mbin_logic_row_bits(
     for entry in sample_plan.iter() {
         let byte = row[entry.src_byte_idx];
         for lane in 0..entry.n_lanes as usize {
-            match (byte >> entry.src_shifts[lane]) & 0b11 {
-                0b00 => c0 += 1,
-                0b10 => c1 += 1,
-                0b11 => c2 += 1,
+            match decode_logic_bin_genotype((byte >> entry.src_shifts[lane]) & 0b11, flip) {
+                Some(0) => c0 += 1,
+                Some(1) => c1 += 1,
+                Some(2) => c2 += 1,
                 _ => {}
             }
         }
@@ -2784,10 +3545,8 @@ fn fill_mbin_logic_row_bits(
     for entry in sample_plan.iter() {
         let byte = row[entry.src_byte_idx];
         for lane in 0..entry.n_lanes as usize {
-            let g = match (byte >> entry.src_shifts[lane]) & 0b11 {
-                0b00 => 0u8,
-                0b10 => 1u8,
-                0b11 => 2u8,
+            let g = match decode_logic_bin_genotype((byte >> entry.src_shifts[lane]) & 0b11, flip) {
+                Some(g) => g,
                 _ => mode3,
             };
             if g > 0 {
@@ -2808,6 +3567,7 @@ fn convert_prepared_bed_to_logic_bits(
     packed: &[u8],
     bytes_per_snp: usize,
     n_samples_total: usize,
+    row_flip: &[bool],
     sites: &[SiteInfo],
     sample_indices: &[usize],
     sample_ids: &[String],
@@ -2820,6 +3580,13 @@ fn convert_prepared_bed_to_logic_bits(
         return Err(format!(
             "packed/site length mismatch: packed={}, sites={}, bytes_per_snp={bytes_per_snp}",
             packed.len(),
+            sites.len()
+        ));
+    }
+    if row_flip.len() != sites.len() {
+        return Err(format!(
+            "row_flip/site length mismatch: row_flip={}, sites={}",
+            row_flip.len(),
             sites.len()
         ));
     }
@@ -2849,11 +3616,14 @@ fn convert_prepared_bed_to_logic_bits(
     let mut bits_flat = vec![0u64; n_rows.saturating_mul(row_words)];
     bits_flat
         .par_chunks_mut(row_mul * row_words)
+        .zip(row_flip.par_iter().copied())
         .zip(packed.par_chunks(bytes_per_snp))
-        .for_each(|(dst_rows, row)| match mode {
-            GarfieldBinMode::Bin => fill_bin_logic_row_bits(row, sample_plan.as_slice(), dst_rows),
+        .for_each(|((dst_rows, flip), row)| match mode {
+            GarfieldBinMode::Bin => {
+                fill_bin_logic_row_bits(row, flip, sample_plan.as_slice(), dst_rows)
+            }
             GarfieldBinMode::Mbin => {
-                fill_mbin_logic_row_bits(row, sample_plan.as_slice(), row_words, dst_rows)
+                fill_mbin_logic_row_bits(row, flip, sample_plan.as_slice(), row_words, dst_rows)
             }
         });
 
@@ -2892,6 +3662,7 @@ fn convert_bed_prefix_to_logic_bits(
     bytes_per_snp: usize,
     n_samples_total: usize,
     site_keep: &[bool],
+    row_flip: &[bool],
     sites: &[SiteInfo],
     sample_indices: &[usize],
     sample_ids: &[String],
@@ -2920,6 +3691,13 @@ fn convert_bed_prefix_to_logic_bits(
         return Err(format!(
             "site_keep/site metadata mismatch: keep count={}, filtered sites={}",
             kept_n,
+            sites.len()
+        ));
+    }
+    if row_flip.len() != sites.len() {
+        return Err(format!(
+            "row_flip/site metadata mismatch: row_flip={}, filtered sites={}",
+            row_flip.len(),
             sites.len()
         ));
     }
@@ -2979,13 +3757,14 @@ fn convert_bed_prefix_to_logic_bits(
         .enumerate()
         .for_each(|(kept_idx, dst_rows)| {
             let src_row = keep_src_rows[kept_idx];
+            let flip = row_flip[kept_idx];
             let row = &packed_full[src_row * bytes_per_snp..(src_row + 1) * bytes_per_snp];
             match mode {
                 GarfieldBinMode::Bin => {
-                    fill_bin_logic_row_bits(row, sample_plan.as_slice(), dst_rows)
+                    fill_bin_logic_row_bits(row, flip, sample_plan.as_slice(), dst_rows)
                 }
                 GarfieldBinMode::Mbin => {
-                    fill_mbin_logic_row_bits(row, sample_plan.as_slice(), row_words, dst_rows)
+                    fill_mbin_logic_row_bits(row, flip, sample_plan.as_slice(), row_words, dst_rows)
                 }
             }
         });
@@ -3018,6 +3797,47 @@ fn convert_bed_prefix_to_logic_bits(
         group_ids,
         n_samples,
     })
+}
+
+fn dense_binary_rows_from_full_bits_range(
+    bits_flat: &[u64],
+    row_words: usize,
+    row_start: usize,
+    row_end: usize,
+    sample_indices: &[usize],
+    n_rows_all: usize,
+    n_samples_all: usize,
+) -> Result<Vec<Vec<u8>>, String> {
+    if row_end <= row_start {
+        return Ok(Vec::new());
+    }
+    if row_end > n_rows_all {
+        return Err(format!(
+            "row range out of bounds while densifying: [{row_start}, {row_end}) vs n_rows={n_rows_all}"
+        ));
+    }
+    if row_words != words_for_samples(n_samples_all) {
+        return Err(format!(
+            "row_words mismatch for full bit matrix: got {row_words}, expected {}",
+            words_for_samples(n_samples_all)
+        ));
+    }
+    if bits_flat.len() != n_rows_all.saturating_mul(row_words) {
+        return Err("full bit matrix length mismatch".to_string());
+    }
+    let mut out = Vec::<Vec<u8>>::with_capacity(row_end.saturating_sub(row_start));
+    for row_idx in row_start..row_end {
+        let row = &bits_flat[row_idx * row_words..(row_idx + 1) * row_words];
+        let mut dense = vec![0u8; sample_indices.len()];
+        for (j, &sid) in sample_indices.iter().enumerate() {
+            if sid >= n_samples_all {
+                return Err(format!("sample index out of range while densifying: {sid}"));
+            }
+            dense[j] = ((row[sid >> 6] >> (sid & 63)) & 1u64) as u8;
+        }
+        out.push(dense);
+    }
+    Ok(out)
 }
 
 fn dense_binary_rows_from_full_bits(
@@ -3055,6 +3875,52 @@ fn dense_binary_rows_from_full_bits(
         out.push(dense);
     }
     Ok(out)
+}
+
+fn packed_rows_subset_from_full_bits_range(
+    bits_flat: &[u64],
+    row_words_full: usize,
+    row_start: usize,
+    row_end: usize,
+    sample_indices: &[usize],
+    n_rows_all: usize,
+    n_samples_all: usize,
+) -> Result<(Vec<u64>, usize), String> {
+    if row_end <= row_start {
+        return Ok((Vec::new(), words_for_samples(sample_indices.len())));
+    }
+    if row_end > n_rows_all {
+        return Err(format!(
+            "row range out of bounds while subsetting: [{row_start}, {row_end}) vs n_rows={n_rows_all}"
+        ));
+    }
+    if row_words_full != words_for_samples(n_samples_all) {
+        return Err(format!(
+            "row_words mismatch for full bit matrix: got {row_words_full}, expected {}",
+            words_for_samples(n_samples_all)
+        ));
+    }
+    if bits_flat.len() != n_rows_all.saturating_mul(row_words_full) {
+        return Err("full bit matrix length mismatch".to_string());
+    }
+    let row_words_sub = words_for_samples(sample_indices.len());
+    let n_rows_sub = row_end.saturating_sub(row_start);
+    let mut out = vec![0u64; n_rows_sub.saturating_mul(row_words_sub)];
+    for (dst_r, src_r) in (row_start..row_end).enumerate() {
+        let src = &bits_flat[src_r * row_words_full..(src_r + 1) * row_words_full];
+        for (dst_s, &src_s) in sample_indices.iter().enumerate() {
+            if src_s >= n_samples_all {
+                return Err(format!(
+                    "sample index out of range while subsetting: {src_s}"
+                ));
+            }
+            let bit = (src[src_s >> 6] >> (src_s & 63)) & 1u64;
+            if bit != 0 {
+                out[dst_r * row_words_sub + (dst_s >> 6)] |= 1u64 << (dst_s & 63);
+            }
+        }
+    }
+    Ok((out, row_words_sub))
 }
 
 fn packed_rows_subset_from_full_bits(
@@ -3111,7 +3977,27 @@ fn resolve_ml_keep_k(n_region: usize, ml_top_k: usize, ml_top_frac: f64) -> usiz
     keep_k.max(1).min(n_region)
 }
 
-fn select_ml_top_local_indices(
+#[inline]
+fn resolve_ml_top_random_counts(keep_k: usize, top_frac: f64) -> (usize, usize) {
+    if keep_k == 0 {
+        return (0, 0);
+    }
+    if keep_k == 1 {
+        return (1, 0);
+    }
+    let frac = top_frac.clamp(0.0, 1.0);
+    if frac >= 1.0 {
+        return (keep_k, 0);
+    }
+    if frac <= 0.0 {
+        return (1, keep_k - 1);
+    }
+    let top_keep = ((keep_k as f64) * frac).floor() as usize;
+    let top_keep = top_keep.clamp(1, keep_k - 1);
+    (top_keep, keep_k - top_keep)
+}
+
+fn select_ml_top_only_local_indices(
     dense_train: &[Vec<u8>],
     y_train: &[f64],
     response: ResponseKind,
@@ -3184,9 +4070,157 @@ fn select_ml_top_local_indices(
     }
 }
 
+#[inline]
+fn insert_topk_density_hit(
+    bucket: &mut Vec<(usize, f64)>,
+    n_not: usize,
+    score: f64,
+    keep_k: usize,
+) {
+    bucket.push((n_not, score));
+    bucket.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    if bucket.len() > keep_k {
+        bucket.truncate(keep_k);
+    }
+}
+
+fn select_ml_top_local_indices(
+    dense_train: &[Vec<u8>],
+    y_train: &[f64],
+    response: ResponseKind,
+    engine: MlEngine,
+    tree_cfg: ExtraTreesConfig,
+    importance: ImportanceKind,
+    perm_cfg: PermutationConfig,
+    keep_k: usize,
+    keep_policy: GarfieldMlKeepPolicy,
+    selection_seed: u64,
+) -> Result<Vec<usize>, String> {
+    if keep_k == 0 || dense_train.is_empty() {
+        return Ok(Vec::new());
+    }
+    let n_region = dense_train.len();
+    let keep_k = keep_k.min(n_region).max(1);
+    match keep_policy {
+        GarfieldMlKeepPolicy::TopK => select_ml_top_only_local_indices(
+            dense_train,
+            y_train,
+            response,
+            engine,
+            tree_cfg,
+            importance,
+            perm_cfg,
+            keep_k,
+        ),
+        GarfieldMlKeepPolicy::TopKPlusRandom { top_frac } => {
+            let (top_keep, rand_keep) = resolve_ml_top_random_counts(keep_k, top_frac);
+            let mut out = select_ml_top_only_local_indices(
+                dense_train,
+                y_train,
+                response,
+                engine,
+                tree_cfg,
+                importance,
+                perm_cfg,
+                top_keep,
+            )?;
+            if rand_keep == 0 || out.len() >= n_region {
+                return Ok(out);
+            }
+            let mut picked = vec![false; n_region];
+            for &idx in out.iter() {
+                picked[idx] = true;
+            }
+            let remaining = (0..n_region)
+                .filter(|&idx| !picked[idx])
+                .collect::<Vec<_>>();
+            if remaining.is_empty() {
+                return Ok(out);
+            }
+            let sample_n = rand_keep.min(remaining.len());
+            let mut rng = StdRng::seed_from_u64(selection_seed);
+            let sampled = sample_indices_without_replacement(&mut rng, remaining.len(), sample_n);
+            let mut sampled_indices = sampled
+                .into_vec()
+                .into_iter()
+                .map(|idx| remaining[idx])
+                .collect::<Vec<_>>();
+            sampled_indices.sort_unstable();
+            out.extend(sampled_indices);
+            Ok(out)
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-fn evaluate_logic_unit_continuous(
-    ui: usize,
+fn select_logic_unit_global_rows(
+    unit: &GarfieldLogicUnit,
+    response: ResponseKind,
+    engine: Option<MlEngine>,
+    importance: ImportanceKind,
+    perm_cfg: PermutationConfig,
+    ml_top_k: usize,
+    ml_top_frac: f64,
+    tree_cfg: ExtraTreesConfig,
+    logic_bits: &GarfieldLogicBits,
+    train_idx_local: &[usize],
+    y_train: &[f64],
+    allow_parallel: bool,
+) -> Result<Option<Vec<usize>>, String> {
+    if unit.indices.is_empty() {
+        return Ok(None);
+    }
+    let selected_global_rows = if let Some(engine_one) = engine {
+        let dense_train = dense_binary_rows_from_full_bits(
+            logic_bits.bits_flat.as_slice(),
+            logic_bits.row_words,
+            unit.indices.as_slice(),
+            train_idx_local,
+            logic_bits.sites.len(),
+            logic_bits.n_samples,
+        )?;
+        if dense_train.is_empty() {
+            return Ok(None);
+        }
+        let n_region = dense_train.len();
+        let keep_k = resolve_ml_keep_k(n_region, ml_top_k, ml_top_frac);
+        let top_local = select_ml_top_local_indices(
+            dense_train.as_slice(),
+            y_train,
+            response,
+            engine_one,
+            ExtraTreesConfig {
+                allow_parallel,
+                ..tree_cfg
+            },
+            importance,
+            perm_cfg,
+            keep_k,
+            GarfieldMlKeepPolicy::TopK,
+            tree_cfg.seed ^ 0xB6D5_0C11_8E91_3F27,
+        )?;
+        if top_local.is_empty() {
+            return Ok(None);
+        }
+        top_local
+            .iter()
+            .map(|&idx| unit.indices[idx])
+            .collect::<Vec<_>>()
+    } else {
+        unit.indices.clone()
+    };
+    if selected_global_rows.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(selected_global_rows))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_logic_unit_continuous(
     unit: &GarfieldLogicUnit,
     response: ResponseKind,
     engine: Option<MlEngine>,
@@ -3199,57 +4233,25 @@ fn evaluate_logic_unit_continuous(
     train_idx_local: &[usize],
     test_idx_local: &[usize],
     y_train: &[f64],
-    y_test: &[f64],
-    assoc_y: &[f64],
-    assoc_sample_indices: &[usize],
     beam_params: BeamSearchParams,
-    top_rules_per_unit: usize,
-    unit_kind_lc: &str,
-) -> Result<Vec<GarfieldLogicRuleRecord>, String> {
-    if unit.indices.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let selected_global_rows = if let Some(engine_one) = engine {
-        let dense_train = dense_binary_rows_from_full_bits(
-            logic_bits.bits_flat.as_slice(),
-            logic_bits.row_words,
-            unit.indices.as_slice(),
-            train_idx_local,
-            logic_bits.sites.len(),
-            logic_bits.n_samples,
-        )?;
-        if dense_train.is_empty() {
-            return Ok(Vec::new());
-        }
-        let n_region = dense_train.len();
-        let keep_k = resolve_ml_keep_k(n_region, ml_top_k, ml_top_frac);
-        let top_local = select_ml_top_local_indices(
-            dense_train.as_slice(),
-            y_train,
-            response,
-            engine_one,
-            ExtraTreesConfig {
-                allow_parallel: beam_params.allow_parallel,
-                ..tree_cfg
-            },
-            importance,
-            perm_cfg,
-            keep_k,
-        )?;
-        if top_local.is_empty() {
-            return Ok(Vec::new());
-        }
-        top_local
-            .iter()
-            .map(|&idx| unit.indices[idx])
-            .collect::<Vec<_>>()
-    } else {
-        unit.indices.clone()
+) -> Result<Option<GarfieldUnitPrepared>, String> {
+    let Some(selected_global_rows) = select_logic_unit_global_rows(
+        unit,
+        response,
+        engine,
+        importance,
+        perm_cfg,
+        ml_top_k,
+        ml_top_frac,
+        tree_cfg,
+        logic_bits,
+        train_idx_local,
+        y_train,
+        beam_params.allow_parallel,
+    )?
+    else {
+        return Ok(None);
     };
-    if selected_global_rows.is_empty() {
-        return Ok(Vec::new());
-    }
 
     let local_sites = selected_global_rows
         .iter()
@@ -3275,28 +4277,552 @@ fn evaluate_logic_unit_continuous(
         logic_bits.sites.len(),
         logic_bits.n_samples,
     )?;
+    let selected_bits_full = gather_rows_by_indices(
+        logic_bits.bits_flat.as_slice(),
+        logic_bits.row_words,
+        selected_global_rows.as_slice(),
+    )?;
+
+    Ok(Some(GarfieldUnitPrepared {
+        selected_global_rows,
+        local_sites,
+        local_groups,
+        train_bits,
+        row_words_train,
+        test_bits,
+        row_words_test,
+        selected_bits_full,
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_logic_chunk_continuous(
+    chunk: GarfieldNullChunk,
+    row_mul: usize,
+    response: ResponseKind,
+    engine: Option<MlEngine>,
+    importance: ImportanceKind,
+    perm_cfg: PermutationConfig,
+    ml_top_k: usize,
+    ml_top_frac: f64,
+    tree_cfg: ExtraTreesConfig,
+    logic_bits: &GarfieldLogicBits,
+    train_idx_local: &[usize],
+    test_idx_local: &[usize],
+    y_train: &[f64],
+    beam_params: BeamSearchParams,
+) -> Result<Option<GarfieldUnitPrepared>, String> {
+    if chunk.end_index <= chunk.start_index || row_mul == 0 {
+        return Ok(None);
+    }
+    let row_start = chunk.start_index.saturating_mul(row_mul);
+    let row_end = chunk.end_index.saturating_mul(row_mul);
+    if row_end > logic_bits.sites.len() {
+        return Ok(None);
+    }
+
+    let selected_global_rows = if let Some(engine_one) = engine {
+        let dense_train = dense_binary_rows_from_full_bits_range(
+            logic_bits.bits_flat.as_slice(),
+            logic_bits.row_words,
+            row_start,
+            row_end,
+            train_idx_local,
+            logic_bits.sites.len(),
+            logic_bits.n_samples,
+        )?;
+        if dense_train.is_empty() {
+            return Ok(None);
+        }
+        let n_region = dense_train.len();
+        let keep_k = resolve_ml_keep_k(n_region, ml_top_k, ml_top_frac);
+        let top_local = select_ml_top_local_indices(
+            dense_train.as_slice(),
+            y_train,
+            response,
+            engine_one,
+            ExtraTreesConfig {
+                allow_parallel: beam_params.allow_parallel,
+                ..tree_cfg
+            },
+            importance,
+            perm_cfg,
+            keep_k,
+            GarfieldMlKeepPolicy::TopKPlusRandom {
+                top_frac: GARFIELD_NULL_ML_TOP_FRAC,
+            },
+            perm_cfg.seed ^ chunk.window_id ^ 0x94D0_49BB_1331_11EB,
+        )?;
+        if top_local.is_empty() {
+            return Ok(None);
+        }
+        top_local
+            .into_iter()
+            .map(|idx| row_start + idx)
+            .collect::<Vec<_>>()
+    } else {
+        (row_start..row_end).collect::<Vec<_>>()
+    };
+    if selected_global_rows.is_empty() {
+        return Ok(None);
+    }
+
+    let local_sites = if engine.is_none() {
+        logic_bits.sites[row_start..row_end].to_vec()
+    } else {
+        selected_global_rows
+            .iter()
+            .map(|&idx| logic_bits.sites[idx].clone())
+            .collect::<Vec<_>>()
+    };
+    let local_groups = if engine.is_none() {
+        logic_bits.group_ids[row_start..row_end].to_vec()
+    } else {
+        selected_global_rows
+            .iter()
+            .map(|&idx| logic_bits.group_ids[idx])
+            .collect::<Vec<_>>()
+    };
+    let (train_bits, row_words_train) = if engine.is_none() {
+        packed_rows_subset_from_full_bits_range(
+            logic_bits.bits_flat.as_slice(),
+            logic_bits.row_words,
+            row_start,
+            row_end,
+            train_idx_local,
+            logic_bits.sites.len(),
+            logic_bits.n_samples,
+        )?
+    } else {
+        packed_rows_subset_from_full_bits(
+            logic_bits.bits_flat.as_slice(),
+            logic_bits.row_words,
+            selected_global_rows.as_slice(),
+            train_idx_local,
+            logic_bits.sites.len(),
+            logic_bits.n_samples,
+        )?
+    };
+    let (test_bits, row_words_test) = if engine.is_none() {
+        packed_rows_subset_from_full_bits_range(
+            logic_bits.bits_flat.as_slice(),
+            logic_bits.row_words,
+            row_start,
+            row_end,
+            test_idx_local,
+            logic_bits.sites.len(),
+            logic_bits.n_samples,
+        )?
+    } else {
+        packed_rows_subset_from_full_bits(
+            logic_bits.bits_flat.as_slice(),
+            logic_bits.row_words,
+            selected_global_rows.as_slice(),
+            test_idx_local,
+            logic_bits.sites.len(),
+            logic_bits.n_samples,
+        )?
+    };
+    let selected_bits_full = if engine.is_none() {
+        gather_rows_by_range(
+            logic_bits.bits_flat.as_slice(),
+            logic_bits.row_words,
+            row_start,
+            row_end,
+        )?
+    } else {
+        gather_rows_by_indices(
+            logic_bits.bits_flat.as_slice(),
+            logic_bits.row_words,
+            selected_global_rows.as_slice(),
+        )?
+    };
+
+    Ok(Some(GarfieldUnitPrepared {
+        selected_global_rows,
+        local_sites,
+        local_groups,
+        train_bits,
+        row_words_train,
+        test_bits,
+        row_words_test,
+        selected_bits_full,
+    }))
+}
+
+fn collect_rule_permutation_nulls_for_repeat(
+    prepared: &GarfieldUnitPrepared,
+    y_train: &[f64],
+    y_test: &[f64],
+    split_applied: bool,
+    beam_params: BeamSearchParams,
+    rep_seed: u64,
+) -> Result<Vec<(RuleNullBucket, f64, f64)>, String> {
+    if prepared.selected_global_rows.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let logic_gate_mode = beam_params.logic_gate_mode;
+    let perm_train = shuffled_copy_f64(y_train, rep_seed);
+    let perm_test = if split_applied {
+        shuffled_copy_f64(y_test, rep_seed ^ 0xD1B5_4A32_D192_ED03)
+    } else {
+        perm_train.clone()
+    };
+    let perm_hits = beam_search_train_test_continuous(
+        perm_train.as_slice(),
+        prepared.train_bits.as_slice(),
+        prepared.row_words_train,
+        prepared.selected_global_rows.len(),
+        y_train.len(),
+        perm_test.as_slice(),
+        prepared.test_bits.as_slice(),
+        prepared.row_words_test,
+        y_test.len(),
+        prepared.local_groups.as_slice(),
+        beam_params,
+    )?;
+    let mut best_by_bucket = HashMap::<RuleNullBucket, (f64, f64)>::new();
+    for cand in perm_hits.iter() {
+        let bucket = bucket_from_rule(&cand.rule, cand.train.support_frac, logic_gate_mode);
+        let entry = best_by_bucket
+            .entry(bucket)
+            .or_insert((f64::NEG_INFINITY, f64::NEG_INFINITY));
+        if cand.train_score.is_finite() && cand.train_score > entry.0 {
+            entry.0 = cand.train_score;
+        }
+        if cand.test_score.is_finite() && cand.test_score > entry.1 {
+            entry.1 = cand.test_score;
+        }
+    }
+    Ok(best_by_bucket
+        .into_iter()
+        .map(|(bucket, (train_score, test_score))| (bucket, train_score, test_score))
+        .collect())
+}
+
+#[derive(Clone, Debug, Default)]
+struct AdaptiveStructurePriorUnitOutcome {
+    calibrator: RuleStructurePriorCalibrator,
+    repeats_used: usize,
+}
+
+#[inline]
+fn logsumexp_scaled_scores(scores: &[f64], temperature: f64) -> Option<f64> {
+    if scores.is_empty() {
+        return None;
+    }
+    let inv_temp = 1.0 / temperature.max(1e-12);
+    let max_scaled = scores
+        .iter()
+        .copied()
+        .filter(|x| x.is_finite())
+        .map(|score| score * inv_temp)
+        .fold(f64::NEG_INFINITY, f64::max);
+    if !max_scaled.is_finite() {
+        return None;
+    }
+    let tail = scores
+        .iter()
+        .copied()
+        .filter(|x| x.is_finite())
+        .map(|score| ((score * inv_temp) - max_scaled).exp())
+        .sum::<f64>()
+        .max(1e-12);
+    Some(max_scaled + tail.ln())
+}
+
+#[inline]
+fn len_prob_rank_signature(probs: &[f64; 6]) -> [usize; 5] {
+    let mut order = [1usize, 2usize, 3usize, 4usize, 5usize];
+    order.sort_by(|&a, &b| {
+        probs[b]
+            .partial_cmp(&probs[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.cmp(&b))
+    });
+    order
+}
+
+#[inline]
+fn kl_divergence_len_probs(p: &[f64; 6], q: &[f64; 6]) -> f64 {
+    let mut out = 0.0_f64;
+    for len in 1..=5usize {
+        let pp = p[len].max(1e-12);
+        let qq = q[len].max(1e-12);
+        out += pp * (pp / qq).ln();
+    }
+    out
+}
+
+#[inline]
+fn symmetric_kl_len_probs(a: &[f64; 6], b: &[f64; 6]) -> f64 {
+    0.5 * (kl_divergence_len_probs(a, b) + kl_divergence_len_probs(b, a))
+}
+
+fn collect_rule_structure_posterior_for_repeat(
+    prepared: &GarfieldUnitPrepared,
+    y_train: &[f64],
+    y_test: &[f64],
+    split_applied: bool,
+    beam_params: BeamSearchParams,
+    structure_prior_cfg: &RuleStructurePriorConfig,
+    rep_seed: u64,
+) -> Result<Vec<(usize, usize, f64, f64)>, String> {
+    if prepared.selected_global_rows.is_empty() || y_train.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let boot_train_idx = bootstrap_sample_indices(y_train.len(), rep_seed);
+    let boot_y_train = subset_vec_f64(y_train, boot_train_idx.as_slice())?;
+    let boot_train_bits = {
+        let row_indices = (0..prepared.selected_global_rows.len()).collect::<Vec<_>>();
+        let (bits, _) = packed_rows_subset_from_full_bits(
+            prepared.train_bits.as_slice(),
+            prepared.row_words_train,
+            row_indices.as_slice(),
+            boot_train_idx.as_slice(),
+            prepared.selected_global_rows.len(),
+            y_train.len(),
+        )?;
+        bits
+    };
+    let boot_row_words_train = words_for_samples(boot_y_train.len());
+
+    let (boot_y_test, boot_test_bits, boot_row_words_test) = if split_applied {
+        if y_test.is_empty() {
+            return Ok(Vec::new());
+        }
+        let boot_test_idx =
+            bootstrap_sample_indices(y_test.len(), rep_seed ^ 0xD1B5_4A32_D192_ED03);
+        let boot_y_test = subset_vec_f64(y_test, boot_test_idx.as_slice())?;
+        let row_indices = (0..prepared.selected_global_rows.len()).collect::<Vec<_>>();
+        let (bits, _) = packed_rows_subset_from_full_bits(
+            prepared.test_bits.as_slice(),
+            prepared.row_words_test,
+            row_indices.as_slice(),
+            boot_test_idx.as_slice(),
+            prepared.selected_global_rows.len(),
+            y_test.len(),
+        )?;
+        let boot_row_words_test = words_for_samples(boot_y_test.len());
+        (boot_y_test, bits, boot_row_words_test)
+    } else {
+        (
+            boot_y_train.clone(),
+            boot_train_bits.clone(),
+            boot_row_words_train,
+        )
+    };
+
+    let perm_hits = beam_search_train_test_continuous(
+        boot_y_train.as_slice(),
+        boot_train_bits.as_slice(),
+        boot_row_words_train,
+        prepared.selected_global_rows.len(),
+        boot_y_train.len(),
+        boot_y_test.as_slice(),
+        boot_test_bits.as_slice(),
+        boot_row_words_test,
+        boot_y_test.len(),
+        prepared.local_groups.as_slice(),
+        beam_params,
+    )?;
+
+    if perm_hits.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut topk_by_len = vec![Vec::<(usize, f64)>::new(); 6];
+    for cand in perm_hits.iter() {
+        let rule_len = cand.rule.len().clamp(1, 5);
+        let score = if split_applied {
+            cand.test_score
+        } else {
+            cand.train_score
+        };
+        if !score.is_finite() || score <= 0.0 {
+            continue;
+        }
+        let bucket = &mut topk_by_len[rule_len];
+        insert_topk_density_hit(
+            bucket,
+            cand.rule.not_count(),
+            score,
+            DEFAULT_RULE_STRUCTURE_DENSITY_TOPK,
+        );
+    }
+    let pooled_scores = topk_by_len
+        .iter()
+        .skip(1)
+        .flat_map(|hits| hits.iter().map(|(_, score)| *score))
+        .collect::<Vec<_>>();
+    if pooled_scores.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let score_scale = pooled_scores.iter().sum::<f64>() / (pooled_scores.len() as f64);
+    let temperature = (score_scale * 1.1).clamp(0.02, 0.08);
+    let observed = (1..=5usize)
+        .filter_map(|rule_len| {
+            let hits = &topk_by_len[rule_len];
+            if hits.is_empty() {
+                return None;
+            }
+            let best_n_not = hits[0].0;
+            let best_score = hits[0].1;
+            let len_scores = hits.iter().map(|(_, score)| *score).collect::<Vec<_>>();
+            let log_density = logsumexp_scaled_scores(len_scores.as_slice(), temperature)?;
+            Some((rule_len, best_n_not, best_score, log_density))
+        })
+        .collect::<Vec<_>>();
+    if observed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let max_logw = observed
+        .iter()
+        .map(|(rule_len, _, _, log_density)| {
+            structure_prior_cfg.len_alpha(*rule_len).ln() + *log_density
+        })
+        .fold(f64::NEG_INFINITY, f64::max);
+    let mut weights = Vec::<f64>::with_capacity(observed.len());
+    for (rule_len, _, _, log_density) in observed.iter() {
+        let logw = structure_prior_cfg.len_alpha(*rule_len).ln() + *log_density;
+        weights.push((logw - max_logw).exp());
+    }
+    let total = weights.iter().sum::<f64>().max(1e-12);
+    let mut out = Vec::<(usize, usize, f64, f64)>::with_capacity(observed.len());
+    for ((rule_len, n_not, score, _log_density), weight_raw) in
+        observed.into_iter().zip(weights.into_iter())
+    {
+        out.push((rule_len, n_not, score, weight_raw / total));
+    }
+    Ok(out)
+}
+
+fn collect_rule_structure_posterior_for_unit_adaptive(
+    prepared: &GarfieldUnitPrepared,
+    y_train: &[f64],
+    y_test: &[f64],
+    split_applied: bool,
+    beam_params: BeamSearchParams,
+    structure_prior_cfg: &RuleStructurePriorConfig,
+    unit_seed: u64,
+) -> Result<AdaptiveStructurePriorUnitOutcome, String> {
+    if prepared.selected_global_rows.is_empty() || y_train.is_empty() {
+        return Ok(AdaptiveStructurePriorUnitOutcome::default());
+    }
+    let mut local = RuleStructurePriorCalibrator::default();
+    let mut informative_repeats = 0usize;
+    let mut prev_probs = None::<[f64; 6]>;
+    let mut stable_streak = 0usize;
+    let mut repeats_used = 0usize;
+
+    for rep in 0..DEFAULT_RULE_STRUCTURE_BOOTSTRAP_MAX_REPEATS {
+        let rep_seed =
+            unit_seed ^ ((rep as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)) ^ 0xA24B_AED4_963E_E407;
+        let repeat_out = collect_rule_structure_posterior_for_repeat(
+            prepared,
+            y_train,
+            y_test,
+            split_applied,
+            beam_params.clone(),
+            structure_prior_cfg,
+            rep_seed,
+        )?;
+        if repeat_out.is_empty() {
+            repeats_used += 1;
+            continue;
+        }
+        for (rule_len, n_not, score, weight) in repeat_out.into_iter() {
+            local.insert(rule_len, n_not, score, weight);
+        }
+        repeats_used += 1;
+        informative_repeats += 1;
+        if informative_repeats < DEFAULT_RULE_STRUCTURE_BOOTSTRAP_MIN_REPEATS {
+            continue;
+        }
+        let Some(cur_probs) = local.observed_len_probs_preview() else {
+            continue;
+        };
+        if let Some(prev) = prev_probs {
+            let same_rank = len_prob_rank_signature(&prev) == len_prob_rank_signature(&cur_probs);
+            let kl = symmetric_kl_len_probs(&prev, &cur_probs);
+            if same_rank && kl <= DEFAULT_RULE_STRUCTURE_BOOTSTRAP_KL_THRESHOLD {
+                stable_streak += 1;
+            } else {
+                stable_streak = 0;
+            }
+            if stable_streak >= DEFAULT_RULE_STRUCTURE_BOOTSTRAP_STABLE_REPEATS {
+                break;
+            }
+        }
+        prev_probs = Some(cur_probs);
+    }
+
+    Ok(AdaptiveStructurePriorUnitOutcome {
+        calibrator: local,
+        repeats_used,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_logic_unit_continuous(
+    ui: usize,
+    unit: &GarfieldLogicUnit,
+    response: ResponseKind,
+    engine: Option<MlEngine>,
+    importance: ImportanceKind,
+    perm_cfg: PermutationConfig,
+    ml_top_k: usize,
+    ml_top_frac: f64,
+    tree_cfg: ExtraTreesConfig,
+    logic_bits: &GarfieldLogicBits,
+    train_idx_local: &[usize],
+    test_idx_local: &[usize],
+    y_train: &[f64],
+    y_test: &[f64],
+    assoc_y: &[f64],
+    assoc_sample_indices: &[usize],
+    beam_params: BeamSearchParams,
+    top_rules_per_unit: usize,
+    unit_kind_lc: &str,
+) -> Result<Vec<GarfieldLogicRuleRecord>, String> {
+    let Some(prepared) = prepare_logic_unit_continuous(
+        unit,
+        response,
+        engine,
+        importance,
+        perm_cfg,
+        ml_top_k,
+        ml_top_frac,
+        tree_cfg,
+        logic_bits,
+        train_idx_local,
+        test_idx_local,
+        y_train,
+        beam_params.clone(),
+    )?
+    else {
+        return Ok(Vec::new());
+    };
     let beam_hits = beam_search_train_test_continuous(
         y_train,
-        train_bits.as_slice(),
-        row_words_train,
-        selected_global_rows.len(),
+        prepared.train_bits.as_slice(),
+        prepared.row_words_train,
+        prepared.selected_global_rows.len(),
         train_idx_local.len(),
         y_test,
-        test_bits.as_slice(),
-        row_words_test,
+        prepared.test_bits.as_slice(),
+        prepared.row_words_test,
         test_idx_local.len(),
-        local_groups.as_slice(),
+        prepared.local_groups.as_slice(),
         beam_params,
     )?;
     if beam_hits.is_empty() {
         return Ok(Vec::new());
     }
 
-    let selected_bits_full = gather_rows_by_indices(
-        logic_bits.bits_flat.as_slice(),
-        logic_bits.row_words,
-        selected_global_rows.as_slice(),
-    )?;
     let keep_rules = if top_rules_per_unit == 0 {
         beam_hits.len()
     } else {
@@ -3316,28 +4842,30 @@ fn evaluate_logic_unit_continuous(
         if !keep {
             continue;
         }
-        let expr = rule_expr(&cand.rule, local_sites.as_slice())?;
-        let snp_name = rule_snp_name(&cand.rule, local_sites.as_slice())?;
-        let first_site = local_sites
+        let expr = rule_expr(&cand.rule, prepared.local_sites.as_slice())?;
+        let snp_name = rule_snp_name(&cand.rule, prepared.local_sites.as_slice())?;
+        let first_site = prepared
+            .local_sites
             .get(cand.rule.first.row_index)
             .ok_or_else(|| "beam result first row index out of range".to_string())?;
         let full_bits = materialize_rule_bits(
             &cand.rule,
-            selected_bits_full.as_slice(),
+            prepared.selected_bits_full.as_slice(),
             logic_bits.row_words,
-            selected_global_rows.len(),
+            prepared.selected_global_rows.len(),
             logic_bits.n_samples,
         )?;
         let assoc =
             fit_binary_rule_wald_from_bits(assoc_y, full_bits.as_slice(), assoc_sample_indices);
         let selected_row_indices =
-            rule_selected_global_rows(&cand.rule, selected_global_rows.as_slice())?;
+            rule_selected_global_rows(&cand.rule, prepared.selected_global_rows.as_slice())?;
         out.push(GarfieldLogicRuleRecord {
             unit_name: unit.label.clone(),
             unit_kind: unit_kind_lc.to_string(),
             unit_index: ui + 1,
             region_size: unit.indices.len(),
-            ml_feature_count: selected_global_rows.len(),
+            ml_feature_count: prepared.selected_global_rows.len(),
+            ml_rank: rule_ml_rank_name(&cand.rule),
             selected_row_indices,
             snp_name,
             expr,
@@ -3496,21 +5024,24 @@ fn write_logic_pseudo_plink(
 
 fn write_logic_rules_tsv(path: &str, records: &[GarfieldLogicRuleRecord]) -> Result<(), String> {
     let mut w = BufWriter::new(File::create(path).map_err(|e| e.to_string())?);
+    let mut ordered = records.iter().collect::<Vec<_>>();
+    ordered.sort_by(|a, b| cmp_logic_rule_records_output(a, b));
     writeln!(
         w,
-        "unit_kind\tunit_index\tunit_name\tregion_size\tml_feature_count\tsnp_name\texpr\tbeta\tse\tchisq\tpwald\ttrain_score"
+        "unit_kind\tunit_index\tunit_name\tregion_size\tml_feature_count\tMLrank\tsnp_name\texpr\tbeta\tse\tchisq\tpwald\ttrain_score"
     )
     .map_err(|e| e.to_string())?;
-    for rec in records.iter() {
+    for rec in ordered.into_iter() {
         let chisq_txt = format_chisq_value(rec.chisq);
         writeln!(
             w,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.10}\t{:.10}\t{}\t{:.4e}\t{:.6}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.10}\t{:.10}\t{}\t{:.4e}\t{:.6}",
             rec.unit_kind,
             rec.unit_index,
             rec.unit_name,
             rec.region_size,
             rec.ml_feature_count,
+            rec.ml_rank,
             rec.snp_name,
             rec.expr,
             rec.beta,
@@ -3521,6 +5052,106 @@ fn write_logic_rules_tsv(path: &str, records: &[GarfieldLogicRuleRecord]) -> Res
         )
         .map_err(|e| e.to_string())?;
     }
+    w.flush().map_err(|e| e.to_string())
+}
+
+fn write_rule_structure_prior_tsv(path: &str, prior: &RuleStructurePrior) -> Result<(), String> {
+    let mut w = BufWriter::new(File::create(path).map_err(|e| e.to_string())?);
+    let len_probs = prior.len_probs();
+    let prior_cfg = prior.config();
+    let prior_len_alpha = prior_cfg.len_alpha_array();
+    let expected_len = (1..=5usize)
+        .map(|rule_len| (rule_len as f64) * len_probs[rule_len])
+        .sum::<f64>();
+    writeln!(
+        w,
+        "rule_len\tprior_len_alpha\tlen_prob\tprior_mass\tprior_log_mass\tpenalty\texpected_rule_len\tstrength\tbest_log_mass"
+    )
+    .map_err(|e| e.to_string())?;
+    for rule_len in 1..=5usize {
+        writeln!(
+            w,
+            "{}\t{:.10}\t{:.10}\t{:.10}\t{:.10}\t{:.10}\t{:.10}\t{:.10}\t{:.10}",
+            rule_len,
+            prior_len_alpha[rule_len],
+            prior.len_prob(rule_len),
+            prior.mass(rule_len),
+            prior.log_mass(rule_len),
+            prior.penalty(rule_len, 0),
+            expected_len,
+            prior.strength(),
+            prior.best_log_mass(),
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    w.flush().map_err(|e| e.to_string())
+}
+
+fn write_rule_structure_prior_json(path: &str, prior: &RuleStructurePrior) -> Result<(), String> {
+    let mut w = BufWriter::new(File::create(path).map_err(|e| e.to_string())?);
+    let len_probs = prior.len_probs();
+    let prior_cfg = prior.config();
+    let prior_len_alpha = prior_cfg.len_alpha_array();
+    let expected_len = (1..=5usize)
+        .map(|rule_len| (rule_len as f64) * len_probs[rule_len])
+        .sum::<f64>();
+    writeln!(w, "{{").map_err(|e| e.to_string())?;
+    writeln!(w, "  \"not_control\": \"null_penalty_only\",").map_err(|e| e.to_string())?;
+    writeln!(w, "  \"prior\": {{").map_err(|e| e.to_string())?;
+    writeln!(w, "    \"target_ess\": {:.10},", prior_cfg.target_ess())
+        .map_err(|e| e.to_string())?;
+    writeln!(w, "    \"len_temper\": {:.10},", prior_cfg.len_temper())
+        .map_err(|e| e.to_string())?;
+    writeln!(w, "    \"len_alpha\": {{").map_err(|e| e.to_string())?;
+    for rule_len in 1..=5usize {
+        let suffix = if rule_len < 5 { "," } else { "" };
+        writeln!(
+            w,
+            "      \"{}\": {:.10}{}",
+            rule_len, prior_len_alpha[rule_len], suffix
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    writeln!(w, "    }}").map_err(|e| e.to_string())?;
+    writeln!(w, "  }},").map_err(|e| e.to_string())?;
+    writeln!(w, "  \"strength\": {:.10},", prior.strength()).map_err(|e| e.to_string())?;
+    writeln!(w, "  \"best_log_mass\": {:.10},", prior.best_log_mass())
+        .map_err(|e| e.to_string())?;
+    writeln!(w, "  \"expected_rule_len\": {:.10},", expected_len).map_err(|e| e.to_string())?;
+    writeln!(w, "  \"len_probs\": {{").map_err(|e| e.to_string())?;
+    for rule_len in 1..=5usize {
+        let suffix = if rule_len < 5 { "," } else { "" };
+        writeln!(
+            w,
+            "    \"{}\": {:.10}{}",
+            rule_len,
+            prior.len_prob(rule_len),
+            suffix
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    writeln!(w, "  }},").map_err(|e| e.to_string())?;
+    writeln!(w, "  \"rows\": [").map_err(|e| e.to_string())?;
+    let total_rows = 5usize;
+    let mut row_idx = 0usize;
+    for rule_len in 1..=5usize {
+        row_idx += 1;
+        let suffix = if row_idx < total_rows { "," } else { "" };
+        writeln!(
+            w,
+            "    {{\"rule_len\": {}, \"prior_len_alpha\": {:.10}, \"len_prob\": {:.10}, \"prior_mass\": {:.10}, \"prior_log_mass\": {:.10}, \"penalty\": {:.10}}}{}",
+            rule_len,
+            prior_len_alpha[rule_len],
+            prior.len_prob(rule_len),
+            prior.mass(rule_len),
+            prior.log_mass(rule_len),
+            prior.penalty(rule_len, 0),
+            suffix,
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    writeln!(w, "  ]").map_err(|e| e.to_string())?;
+    writeln!(w, "}}").map_err(|e| e.to_string())?;
     w.flush().map_err(|e| e.to_string())
 }
 
@@ -3573,6 +5204,7 @@ fn garfield_logic_search_bed_owned(
     group_names: Option<Vec<String>>,
     extension: usize,
     step: Option<usize>,
+    scan_bimranges: Option<Vec<String>>,
     bin_mode: String,
     ml_method: String,
     ml_importance: String,
@@ -3607,61 +5239,57 @@ fn garfield_logic_search_bed_owned(
     top_rules_per_unit: usize,
     max_output_rules: usize,
     max_output_ratio: f64,
+    rule_permutation: bool,
+    prior_len: Option<Vec<f64>>,
+    no_clean: bool,
     progress_callback: Option<Py<PyAny>>,
     progress_every: usize,
 ) -> Result<GarfieldLogicPipelineResult, String> {
     validate_continuous_y(&y)?;
     let using_external_grm = grm.is_some();
+    let fam_sample_ids = read_fam(normalize_plink_prefix(&prefix).as_str())?;
+    let (selected_sample_indices, selected_sample_ids) =
+        build_sample_selection(fam_sample_ids.as_slice(), sample_ids, sample_indices)?;
     let mut packed_for_grm: Option<Vec<u8>> = None;
     let mut maf_for_grm: Option<Vec<f32>> = None;
     let mut row_flip_for_grm: Option<Vec<bool>> = None;
-    let (
-        selected_sample_indices,
-        selected_sample_ids,
-        site_keep,
-        filtered_sites,
-        n_samples_total,
-        bytes_per_snp,
-    ) = if using_external_grm {
-        let meta = prepare_bed_logic_meta_owned(
-            &prefix,
-            maf_threshold,
-            max_missing_rate,
-            het_threshold,
-            snps_only,
-        )?;
-        let (selected_sample_indices, selected_sample_ids) =
-            build_sample_selection(meta.sample_ids.as_slice(), sample_ids, sample_indices)?;
-        (
-            selected_sample_indices,
-            selected_sample_ids,
-            meta.site_keep,
-            meta.sites,
-            meta.n_samples,
-            meta.bytes_per_snp,
-        )
-    } else {
-        let prepared = prepare_bed_2bit_packed_owned(
-            &prefix,
-            maf_threshold,
-            max_missing_rate,
-            het_threshold,
-            snps_only,
-        )?;
-        let (selected_sample_indices, selected_sample_ids) =
-            build_sample_selection(prepared.sample_ids.as_slice(), sample_ids, sample_indices)?;
-        packed_for_grm = Some(prepared.packed);
-        maf_for_grm = Some(prepared.maf);
-        row_flip_for_grm = Some(prepared.row_flip);
-        (
-            selected_sample_indices,
-            selected_sample_ids,
-            prepared.site_keep,
-            prepared.sites,
-            prepared.n_samples,
-            prepared.bytes_per_snp,
-        )
-    };
+    let (site_keep, logic_row_flip_external, filtered_sites, n_samples_total, bytes_per_snp) =
+        if using_external_grm {
+            let meta = prepare_bed_logic_meta_owned_for_stats_samples(
+                &prefix,
+                maf_threshold,
+                max_missing_rate,
+                het_threshold,
+                snps_only,
+                Some(selected_sample_indices.as_slice()),
+            )?;
+            (
+                meta.site_keep,
+                Some(meta.row_flip),
+                meta.sites,
+                meta.n_samples,
+                meta.bytes_per_snp,
+            )
+        } else {
+            let prepared = prepare_bed_2bit_packed_owned_for_stats_samples(
+                &prefix,
+                maf_threshold,
+                max_missing_rate,
+                het_threshold,
+                snps_only,
+                Some(selected_sample_indices.as_slice()),
+            )?;
+            packed_for_grm = Some(prepared.packed);
+            maf_for_grm = Some(prepared.maf);
+            row_flip_for_grm = Some(prepared.row_flip);
+            (
+                prepared.site_keep,
+                None,
+                prepared.sites,
+                prepared.n_samples,
+                prepared.bytes_per_snp,
+            )
+        };
     let n_selected = selected_sample_indices.len();
     if y.len() != n_selected {
         return Err(format!(
@@ -3865,8 +5493,11 @@ fn garfield_logic_search_bed_owned(
     };
 
     let mode = parse_bin_mode(&bin_mode)?;
+    let logic_row_mul = match mode {
+        GarfieldBinMode::Bin => 1usize,
+        GarfieldBinMode::Mbin => 3usize,
+    };
     drop(maf_for_grm.take());
-    drop(row_flip_for_grm.take());
     let logic_bits = if using_external_grm {
         drop(packed_for_grm.take());
         convert_bed_prefix_to_logic_bits(
@@ -3874,6 +5505,12 @@ fn garfield_logic_search_bed_owned(
             bytes_per_snp,
             n_samples_total,
             site_keep.as_slice(),
+            logic_row_flip_external
+                .as_ref()
+                .ok_or_else(|| {
+                    "internal error: logic row_flip missing for BED conversion".to_string()
+                })?
+                .as_slice(),
             filtered_sites.as_slice(),
             selected_sample_indices.as_slice(),
             selected_sample_ids.as_slice(),
@@ -3887,12 +5524,17 @@ fn garfield_logic_search_bed_owned(
             packed.as_slice(),
             bytes_per_snp,
             n_samples_total,
+            row_flip_for_grm
+                .as_ref()
+                .ok_or_else(|| "internal error: row_flip missing for logic conversion".to_string())?
+                .as_slice(),
             filtered_sites.as_slice(),
             selected_sample_indices.as_slice(),
             selected_sample_ids.as_slice(),
             mode,
         )?;
         drop(packed_for_grm.take());
+        drop(row_flip_for_grm.take());
         out
     };
     let units = build_logic_units(
@@ -3906,6 +5548,11 @@ fn garfield_logic_search_bed_owned(
     if units.is_empty() {
         return Err("no scan units were built from the provided input".to_string());
     }
+    let scan_bimranges = scan_bimranges
+        .as_deref()
+        .map(parse_scan_bimranges)
+        .transpose()?
+        .unwrap_or_default();
 
     let response = ResponseKind::Continuous;
     let engine = parse_optional_ml_engine(&ml_method)?;
@@ -3917,27 +5564,580 @@ fn garfield_logic_search_bed_owned(
         scoring: parse_permutation_scoring(&permutation_scoring)?,
         seed,
     };
+    let structure_prior_cfg = RuleStructurePriorConfig::from_len_alpha_values(prior_len.as_deref());
+    let structure_prior_display_len = max_pick.clamp(1, 5);
     let beam_params = BeamSearchParams {
         max_pick: max_pick.max(1),
         beam_width: beam_width.max(1),
+        min_gain: 0.0,
+        enable_diversity_pruning: false,
         candidate_keep_ratio: candidate_keep_ratio.clamp(1e-6, 1.0),
         lambda_len: 0.0,
         lambda_not: 0.0,
         exhaustive_depth: exhaustive_depth.max(1),
         logic_gate_mode,
         rank_mode,
+        null_penalties: None,
+        structure_prior: None,
+        disable_parent_delta: false,
         allow_parallel: true,
     };
     let unit_kind_lc = unit_kind.trim().to_ascii_lowercase();
-
     let total_units = units.len();
-    let notify_step = if progress_every == 0 {
-        (total_units / 200).max(1)
+    let scan_unit_indices = if scan_bimranges.is_empty() {
+        (0..total_units).collect::<Vec<_>>()
+    } else {
+        units
+            .iter()
+            .enumerate()
+            .filter_map(|(ui, unit)| {
+                if unit_overlaps_scan_bimranges(unit, scan_bimranges.as_slice()) {
+                    Some(ui)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+    if scan_unit_indices.is_empty() {
+        let joined = scan_bimranges
+            .iter()
+            .map(|r| format!("{}:{}-{}", r.chrom, r.bp_start, r.bp_end))
+            .collect::<Vec<_>>()
+            .join(",");
+        return Err(format!(
+            "--bimrange matched no scan units under unit_kind '{}': {}",
+            unit_kind_lc, joined
+        ));
+    }
+    let scanned_units = scan_unit_indices.len();
+    let progress_callback_parallel = progress_callback.as_ref();
+    let null_chunk_bp = extension.max(1).saturating_mul(2);
+    let null_chunk_target = if rule_permutation {
+        DEFAULT_RULE_NULL_PHYSICAL_CHUNKS
+    } else {
+        0
+    };
+    let (null_chunks, null_chunk_valid_total) = if rule_permutation {
+        sample_null_chunks_stratified(
+            filtered_sites.as_slice(),
+            extension.max(1),
+            DEFAULT_RULE_NULL_PHYSICAL_CHUNKS,
+            DEFAULT_RULE_NULL_MIN_SNPS_PER_CHUNK,
+            seed,
+        )
+    } else {
+        (Vec::new(), 0usize)
+    };
+    let mut null_chunk_prepared = Vec::<(GarfieldNullChunk, GarfieldUnitPrepared)>::new();
+    if !null_chunks.is_empty() {
+        let prep_beam_params = BeamSearchParams {
+            allow_parallel: false,
+            ..beam_params.clone()
+        };
+        let prep_notify_step = if progress_every == 0 {
+            (null_chunks.len().max(1) / 200).max(1)
+        } else {
+            progress_every.max(1)
+        };
+        let prep_progress_done = AtomicUsize::new(0);
+        garfield_stage_progress_notify(
+            progress_callback.as_ref(),
+            "null_prep",
+            0,
+            null_chunks.len().max(1),
+            None,
+        )
+        .map_err(|e| e.to_string())?;
+        let prep_threads = threads_eff.min(null_chunks.len().max(1));
+        let prep_results = if prep_threads > 1 {
+            let pool = ThreadPoolBuilder::new()
+                .num_threads(prep_threads)
+                .build()
+                .map_err(|e| format!("build GARFIELD null-prep thread pool: {e}"))?;
+            pool.install(|| {
+                null_chunks
+                    .par_iter()
+                    .copied()
+                    .map(|chunk| {
+                        let prepared = prepare_logic_chunk_continuous(
+                            chunk,
+                            logic_row_mul,
+                            response,
+                            engine,
+                            importance,
+                            perm_cfg,
+                            ml_top_k,
+                            ml_top_frac,
+                            tree_cfg,
+                            &logic_bits,
+                            train_idx_local.as_slice(),
+                            test_idx_local.as_slice(),
+                            train_fit.residualized_y.as_slice(),
+                            prep_beam_params.clone(),
+                        );
+                        let done = prep_progress_done.fetch_add(1, Ordering::Relaxed) + 1;
+                        if done % prep_notify_step == 0 || done == null_chunks.len() {
+                            garfield_stage_progress_notify(
+                                progress_callback_parallel,
+                                "null_prep",
+                                done,
+                                null_chunks.len().max(1),
+                                None,
+                            )
+                            .map_err(|e| e.to_string())?;
+                        }
+                        prepared.map(|opt| opt.map(|p| (chunk, p)))
+                    })
+                    .collect::<Vec<Result<Option<(GarfieldNullChunk, GarfieldUnitPrepared)>, String>>>()
+            })
+        } else {
+            let mut out = Vec::<Result<Option<(GarfieldNullChunk, GarfieldUnitPrepared)>, String>>::with_capacity(
+                null_chunks.len(),
+            );
+            for chunk in null_chunks.iter().copied() {
+                let prepared = prepare_logic_chunk_continuous(
+                    chunk,
+                    logic_row_mul,
+                    response,
+                    engine,
+                    importance,
+                    perm_cfg,
+                    ml_top_k,
+                    ml_top_frac,
+                    tree_cfg,
+                    &logic_bits,
+                    train_idx_local.as_slice(),
+                    test_idx_local.as_slice(),
+                    train_fit.residualized_y.as_slice(),
+                    prep_beam_params.clone(),
+                );
+                let done = prep_progress_done.fetch_add(1, Ordering::Relaxed) + 1;
+                if done % prep_notify_step == 0 || done == null_chunks.len() {
+                    garfield_stage_progress_notify(
+                        progress_callback.as_ref(),
+                        "null_prep",
+                        done,
+                        null_chunks.len().max(1),
+                        None,
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
+                out.push(prepared.map(|opt| opt.map(|p| (chunk, p))));
+            }
+            out
+        };
+        for prep_out in prep_results.into_iter() {
+            if let Some((chunk, prepared)) = prep_out? {
+                null_chunk_prepared.push((chunk, prepared));
+            }
+        }
+    }
+    let null_chunk_selected = null_chunk_prepared.len();
+    let null_permutation_active = rule_permutation && !null_chunk_prepared.is_empty();
+    let representative_units_target = if rule_permutation {
+        DEFAULT_RULE_PERMUTATION_REPRESENTATIVE_UNITS.min(units.len())
+    } else {
+        0
+    };
+
+    let representative_units = if rule_permutation {
+        choose_representative_indices(
+            units
+                .iter()
+                .map(|unit| unit.indices.len())
+                .collect::<Vec<_>>()
+                .as_slice(),
+            representative_units_target,
+        )
+    } else {
+        Vec::new()
+    };
+    let mut representative_prepared = Vec::<(usize, GarfieldUnitPrepared)>::new();
+    if !representative_units.is_empty() {
+        let prep_beam_params = BeamSearchParams {
+            allow_parallel: false,
+            ..beam_params.clone()
+        };
+        let prep_notify_step = if progress_every == 0 {
+            (representative_units.len().max(1) / 200).max(1)
+        } else {
+            progress_every.max(1)
+        };
+        let prep_progress_done = AtomicUsize::new(0);
+        garfield_stage_progress_notify(
+            progress_callback.as_ref(),
+            "structure_prep",
+            0,
+            representative_units.len().max(1),
+            None,
+        )
+        .map_err(|e| e.to_string())?;
+        let prep_threads = threads_eff.min(representative_units.len().max(1));
+        let prep_results = if prep_threads > 1 {
+            let pool = ThreadPoolBuilder::new()
+                .num_threads(prep_threads)
+                .build()
+                .map_err(|e| format!("build GARFIELD prior-prep thread pool: {e}"))?;
+            pool.install(|| {
+                representative_units
+                    .par_iter()
+                    .copied()
+                    .map(|ui| {
+                        let prepared = prepare_logic_unit_continuous(
+                            &units[ui],
+                            response,
+                            engine,
+                            importance,
+                            perm_cfg,
+                            ml_top_k,
+                            ml_top_frac,
+                            tree_cfg,
+                            &logic_bits,
+                            train_idx_local.as_slice(),
+                            test_idx_local.as_slice(),
+                            train_fit.residualized_y.as_slice(),
+                            prep_beam_params.clone(),
+                        );
+                        let done = prep_progress_done.fetch_add(1, Ordering::Relaxed) + 1;
+                        if done % prep_notify_step == 0 || done == representative_units.len() {
+                            garfield_stage_progress_notify(
+                                progress_callback_parallel,
+                                "structure_prep",
+                                done,
+                                representative_units.len().max(1),
+                                None,
+                            )
+                            .map_err(|e| e.to_string())?;
+                        }
+                        prepared.map(|opt| opt.map(|p| (ui, p)))
+                    })
+                    .collect::<Vec<Result<Option<(usize, GarfieldUnitPrepared)>, String>>>()
+            })
+        } else {
+            let mut out =
+                Vec::<Result<Option<(usize, GarfieldUnitPrepared)>, String>>::with_capacity(
+                    representative_units.len(),
+                );
+            for &ui in representative_units.iter() {
+                let prepared = prepare_logic_unit_continuous(
+                    &units[ui],
+                    response,
+                    engine,
+                    importance,
+                    perm_cfg,
+                    ml_top_k,
+                    ml_top_frac,
+                    tree_cfg,
+                    &logic_bits,
+                    train_idx_local.as_slice(),
+                    test_idx_local.as_slice(),
+                    train_fit.residualized_y.as_slice(),
+                    prep_beam_params.clone(),
+                );
+                let done = prep_progress_done.fetch_add(1, Ordering::Relaxed) + 1;
+                if done % prep_notify_step == 0 || done == representative_units.len() {
+                    garfield_stage_progress_notify(
+                        progress_callback.as_ref(),
+                        "structure_prep",
+                        done,
+                        representative_units.len().max(1),
+                        None,
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
+                out.push(prepared.map(|opt| opt.map(|p| (ui, p))));
+            }
+            out
+        };
+        for prep_out in prep_results.into_iter() {
+            if let Some((ui, prepared)) = prep_out? {
+                representative_prepared.push((ui, prepared));
+            }
+        }
+    }
+    let representative_units_used = representative_prepared.len();
+    let soft_structure_mode = rule_permutation && !representative_prepared.is_empty();
+    let permutation_task_total = if null_permutation_active {
+        null_chunk_prepared
+            .len()
+            .saturating_mul(DEFAULT_RULE_PERMUTATION_REPEATS)
+    } else {
+        0
+    };
+    let structure_task_total = if soft_structure_mode {
+        representative_prepared.len()
+    } else {
+        0
+    };
+
+    let rule_null_lookup: Option<Arc<RuleNullPenaltyLookup>> = if null_permutation_active {
+        let null_notify_step = if progress_every == 0 {
+            (permutation_task_total.max(1) / 200).max(1)
+        } else {
+            progress_every.max(1)
+        };
+        let null_progress_done = AtomicUsize::new(0);
+        garfield_stage_progress_notify(
+            progress_callback.as_ref(),
+            "null_penalty",
+            0,
+            permutation_task_total.max(1),
+            None,
+        )
+        .map_err(|e| e.to_string())?;
+        let perm_beam_params = BeamSearchParams {
+            allow_parallel: false,
+            disable_parent_delta: true,
+            ..beam_params.clone()
+        };
+        let mut perm_tasks = Vec::<(usize, usize, u64)>::with_capacity(permutation_task_total);
+        for (slot, (chunk, prepared)) in null_chunk_prepared.iter().enumerate() {
+            let _ = prepared;
+            for rep in 0..DEFAULT_RULE_PERMUTATION_REPEATS {
+                let rep_seed = seed
+                    ^ (chunk.window_id.wrapping_mul(0x94D0_49BB_1331_11EB))
+                    ^ ((rep as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+                    ^ ((slot as u64).wrapping_mul(0xA24B_AED4_963E_E407));
+                perm_tasks.push((slot, rep, rep_seed));
+            }
+        }
+        let perm_threads = threads_eff.min(perm_tasks.len().max(1));
+        let perm_results = if perm_threads > 1 {
+            let pool = ThreadPoolBuilder::new()
+                .num_threads(perm_threads)
+                .build()
+                .map_err(|e| format!("build GARFIELD permutation thread pool: {e}"))?;
+            pool.install(|| {
+                perm_tasks
+                    .par_iter()
+                    .map(|(slot, _rep, rep_seed)| {
+                        let (_, prepared) = &null_chunk_prepared[*slot];
+                        let out = collect_rule_permutation_nulls_for_repeat(
+                            prepared,
+                            train_fit.residualized_y.as_slice(),
+                            test_fit.residualized_y.as_slice(),
+                            split_applied,
+                            perm_beam_params.clone(),
+                            *rep_seed,
+                        )?;
+                        let done = null_progress_done.fetch_add(1, Ordering::Relaxed) + 1;
+                        if done % null_notify_step == 0 || done == permutation_task_total {
+                            garfield_stage_progress_notify(
+                                progress_callback_parallel,
+                                "null_penalty",
+                                done,
+                                permutation_task_total.max(1),
+                                None,
+                            )
+                            .map_err(|e| e.to_string())?;
+                        }
+                        Ok(out)
+                    })
+                    .collect::<Vec<Result<Vec<(RuleNullBucket, f64, f64)>, String>>>()
+            })
+        } else {
+            let mut out = Vec::<Result<Vec<(RuleNullBucket, f64, f64)>, String>>::with_capacity(
+                perm_tasks.len(),
+            );
+            for (slot, _rep, rep_seed) in perm_tasks.iter() {
+                let (_, prepared) = &null_chunk_prepared[*slot];
+                let unit_out = collect_rule_permutation_nulls_for_repeat(
+                    prepared,
+                    train_fit.residualized_y.as_slice(),
+                    test_fit.residualized_y.as_slice(),
+                    split_applied,
+                    perm_beam_params.clone(),
+                    *rep_seed,
+                );
+                let done = null_progress_done.fetch_add(1, Ordering::Relaxed) + 1;
+                if done % null_notify_step == 0 || done == permutation_task_total {
+                    garfield_stage_progress_notify(
+                        progress_callback.as_ref(),
+                        "null_penalty",
+                        done,
+                        permutation_task_total.max(1),
+                        None,
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
+                out.push(unit_out);
+            }
+            out
+        };
+        let mut bucket_scores =
+            RuleNullCalibrator::new(matches!(logic_gate_mode, BeamLogicGateMode::AndOr));
+        for task_out in perm_results.into_iter() {
+            for (bucket, train_score, test_score) in task_out? {
+                bucket_scores.insert(bucket, train_score, test_score);
+            }
+        }
+        Some(Arc::new(bucket_scores.finalize()))
+    } else {
+        None
+    };
+    let mut structure_bootstrap_repeats_used_total = 0usize;
+    let rule_structure_prior: Option<Arc<RuleStructurePrior>> = if soft_structure_mode {
+        let structure_notify_step = if progress_every == 0 {
+            (structure_task_total.max(1) / 200).max(1)
+        } else {
+            progress_every.max(1)
+        };
+        let structure_progress_done = AtomicUsize::new(0);
+        let structure_scores = Arc::new(Mutex::new(RuleStructurePriorCalibrator::default()));
+        let structure_repeats_used = AtomicUsize::new(0);
+        garfield_stage_progress_notify(
+            progress_callback.as_ref(),
+            "structure_prior",
+            0,
+            structure_task_total.max(1),
+            Some(format_structure_alpha_placeholder(structure_prior_display_len).as_str()),
+        )
+        .map_err(|e| e.to_string())?;
+        let posterior_beam_params = BeamSearchParams {
+            allow_parallel: false,
+            disable_parent_delta: true,
+            null_penalties: rule_null_lookup.clone(),
+            structure_prior: None,
+            min_gain: if no_clean {
+                0.0
+            } else {
+                GARFIELD_EB_BEAM_MIN_GAIN
+            },
+            enable_diversity_pruning: !no_clean,
+            ..beam_params.clone()
+        };
+        let bootstrap_threads = threads_eff.min(representative_prepared.len().max(1));
+        if bootstrap_threads > 1 {
+            let pool = ThreadPoolBuilder::new()
+                .num_threads(bootstrap_threads)
+                .build()
+                .map_err(|e| format!("build GARFIELD bootstrap thread pool: {e}"))?;
+            pool.install(|| {
+                representative_prepared
+                    .par_iter()
+                    .enumerate()
+                    .map(|(slot, (ui, prepared))| {
+                        let unit_seed = seed
+                            ^ ((*ui as u64).wrapping_mul(0xD134_2543_DE82_EF95))
+                            ^ ((slot as u64).wrapping_mul(0xA24B_AED4_963E_E407));
+                        let out = collect_rule_structure_posterior_for_unit_adaptive(
+                            prepared,
+                            train_fit.residualized_y.as_slice(),
+                            test_fit.residualized_y.as_slice(),
+                            split_applied,
+                            posterior_beam_params.clone(),
+                            &structure_prior_cfg,
+                            unit_seed,
+                        )?;
+                        structure_repeats_used.fetch_add(out.repeats_used, Ordering::Relaxed);
+                        let alpha_meta = {
+                            let mut guard = structure_scores.lock().map_err(|_| {
+                                "GARFIELD structure prior mutex poisoned".to_string()
+                            })?;
+                            guard.merge_from(&out.calibrator);
+                            format_structure_alpha_meta(
+                                &guard,
+                                &structure_prior_cfg,
+                                structure_prior_display_len,
+                            )
+                        };
+                        let done = structure_progress_done.fetch_add(1, Ordering::Relaxed) + 1;
+                        if done % structure_notify_step == 0 || done == structure_task_total {
+                            garfield_stage_progress_notify(
+                                progress_callback_parallel,
+                                "structure_prior",
+                                done,
+                                structure_task_total.max(1),
+                                Some(alpha_meta.as_str()),
+                            )
+                            .map_err(|e| e.to_string())?;
+                        }
+                        Ok(())
+                    })
+                    .collect::<Vec<Result<(), String>>>()
+            })
+        } else {
+            for (slot, (ui, prepared)) in representative_prepared.iter().enumerate() {
+                let unit_seed = seed
+                    ^ ((*ui as u64).wrapping_mul(0xD134_2543_DE82_EF95))
+                    ^ ((slot as u64).wrapping_mul(0xA24B_AED4_963E_E407));
+                let unit_out = collect_rule_structure_posterior_for_unit_adaptive(
+                    prepared,
+                    train_fit.residualized_y.as_slice(),
+                    test_fit.residualized_y.as_slice(),
+                    split_applied,
+                    posterior_beam_params.clone(),
+                    &structure_prior_cfg,
+                    unit_seed,
+                )?;
+                structure_repeats_used.fetch_add(unit_out.repeats_used, Ordering::Relaxed);
+                let alpha_meta = {
+                    let mut guard = structure_scores
+                        .lock()
+                        .map_err(|_| "GARFIELD structure prior mutex poisoned".to_string())?;
+                    guard.merge_from(&unit_out.calibrator);
+                    format_structure_alpha_meta(
+                        &guard,
+                        &structure_prior_cfg,
+                        structure_prior_display_len,
+                    )
+                };
+                let done = structure_progress_done.fetch_add(1, Ordering::Relaxed) + 1;
+                if done % structure_notify_step == 0 || done == structure_task_total {
+                    garfield_stage_progress_notify(
+                        progress_callback.as_ref(),
+                        "structure_prior",
+                        done,
+                        structure_task_total.max(1),
+                        Some(alpha_meta.as_str()),
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
+            }
+            Vec::<Result<(), String>>::new()
+        }
+        .into_iter()
+        .try_for_each(|res| res)?;
+        structure_bootstrap_repeats_used_total = structure_repeats_used.load(Ordering::Relaxed);
+        let final_structure_scores = structure_scores
+            .lock()
+            .map_err(|_| "GARFIELD structure prior mutex poisoned".to_string())?
+            .clone();
+        Some(Arc::new(
+            final_structure_scores.finalize(&structure_prior_cfg),
+        ))
+    } else {
+        None
+    };
+    let beam_params = BeamSearchParams {
+        null_penalties: rule_null_lookup,
+        structure_prior: rule_structure_prior.clone(),
+        disable_parent_delta: soft_structure_mode,
+        min_gain: if no_clean {
+            0.0
+        } else {
+            GARFIELD_SCAN_BEAM_MIN_GAIN
+        },
+        enable_diversity_pruning: !no_clean,
+        ..beam_params
+    };
+
+    let scan_notify_step = if progress_every == 0 {
+        (scanned_units.max(1) / 200).max(1)
     } else {
         progress_every.max(1)
     };
-    garfield_progress_notify(progress_callback.as_ref(), 0, total_units)
-        .map_err(|e| e.to_string())?;
+    let scan_progress_done = AtomicUsize::new(0);
+    garfield_stage_progress_notify(
+        progress_callback.as_ref(),
+        "scan",
+        0,
+        scanned_units.max(1),
+        None,
+    )
+    .map_err(|e| e.to_string())?;
+
     let (assoc_y, assoc_sample_indices): (&[f64], &[usize]) = if split_applied {
         (
             test_fit.residualized_y.as_slice(),
@@ -3949,23 +6149,21 @@ fn garfield_logic_search_bed_owned(
             train_idx_local.as_slice(),
         )
     };
-    let unit_parallel_threads = threads_eff.min(total_units.max(1));
+    let unit_parallel_threads = threads_eff.min(scanned_units.max(1));
     let scan_beam_params = BeamSearchParams {
         allow_parallel: unit_parallel_threads <= 1,
-        ..beam_params
+        ..beam_params.clone()
     };
-    let progress_done = AtomicUsize::new(0);
-    let progress_callback_parallel = progress_callback.as_ref();
     let unit_results = if unit_parallel_threads > 1 {
         let pool = ThreadPoolBuilder::new()
             .num_threads(unit_parallel_threads)
             .build()
             .map_err(|e| format!("build GARFIELD unit thread pool: {e}"))?;
         pool.install(|| {
-            units
+            scan_unit_indices
                 .par_iter()
-                .enumerate()
-                .map(|(ui, unit)| {
+                .map(|&ui| {
+                    let unit = &units[ui];
                     let out = evaluate_logic_unit_continuous(
                         ui,
                         unit,
@@ -3983,14 +6181,20 @@ fn garfield_logic_search_bed_owned(
                         test_fit.residualized_y.as_slice(),
                         assoc_y,
                         assoc_sample_indices,
-                        scan_beam_params,
+                        scan_beam_params.clone(),
                         top_rules_per_unit,
                         &unit_kind_lc,
                     )?;
-                    let done = progress_done.fetch_add(1, Ordering::Relaxed) + 1;
-                    if done % notify_step == 0 || done == total_units {
-                        garfield_progress_notify(progress_callback_parallel, done, total_units)
-                            .map_err(|e| e.to_string())?;
+                    let done = scan_progress_done.fetch_add(1, Ordering::Relaxed) + 1;
+                    if done % scan_notify_step == 0 || done == scanned_units {
+                        garfield_stage_progress_notify(
+                            progress_callback_parallel,
+                            "scan",
+                            done,
+                            scanned_units.max(1),
+                            None,
+                        )
+                        .map_err(|e| e.to_string())?;
                     }
                     Ok(out)
                 })
@@ -3998,8 +6202,9 @@ fn garfield_logic_search_bed_owned(
         })
     } else {
         let mut out =
-            Vec::<Result<Vec<GarfieldLogicRuleRecord>, String>>::with_capacity(total_units);
-        for (ui, unit) in units.iter().enumerate() {
+            Vec::<Result<Vec<GarfieldLogicRuleRecord>, String>>::with_capacity(scanned_units);
+        for &ui in scan_unit_indices.iter() {
+            let unit = &units[ui];
             let unit_out = evaluate_logic_unit_continuous(
                 ui,
                 unit,
@@ -4017,14 +6222,20 @@ fn garfield_logic_search_bed_owned(
                 test_fit.residualized_y.as_slice(),
                 assoc_y,
                 assoc_sample_indices,
-                scan_beam_params,
+                scan_beam_params.clone(),
                 top_rules_per_unit,
                 &unit_kind_lc,
             );
-            let done = progress_done.fetch_add(1, Ordering::Relaxed) + 1;
-            if done % notify_step == 0 || done == total_units {
-                garfield_progress_notify(progress_callback.as_ref(), done, total_units)
-                    .map_err(|e| e.to_string())?;
+            let done = scan_progress_done.fetch_add(1, Ordering::Relaxed) + 1;
+            if done % scan_notify_step == 0 || done == scanned_units {
+                garfield_stage_progress_notify(
+                    progress_callback.as_ref(),
+                    "scan",
+                    done,
+                    scanned_units.max(1),
+                    None,
+                )
+                .map_err(|e| e.to_string())?;
             }
             out.push(unit_out);
         }
@@ -4038,15 +6249,42 @@ fn garfield_logic_search_bed_owned(
     records = dedup_logic_rule_records(records);
     apply_logic_rule_output_limit(&mut records, max_output_rules, max_output_ratio)?;
     let simbench_count = if let Some(path) = simbench_path.as_ref() {
+        let simbench_terms = parse_simbench_terms(path)?;
+        let mut logic_site_lookup =
+            HashMap::<(String, i32), Vec<usize>>::with_capacity(logic_bits.sites.len());
+        for (logic_idx, site) in logic_bits.sites.iter().enumerate() {
+            logic_site_lookup
+                .entry((normalize_chrom(&site.chrom), site.pos))
+                .or_default()
+                .push(logic_idx);
+        }
+        let simbench_ml_contexts = build_simbench_ml_contexts(
+            simbench_terms.as_slice(),
+            units.as_slice(),
+            scan_unit_indices.as_slice(),
+            response,
+            engine,
+            importance,
+            perm_cfg,
+            ml_top_k,
+            ml_top_frac,
+            tree_cfg,
+            &logic_bits,
+            train_idx_local.as_slice(),
+            train_fit.residualized_y.as_slice(),
+            unit_parallel_threads <= 1,
+        )?;
         let simbench_records = evaluate_simbench_terms(
             &prefix,
-            path,
+            simbench_terms.as_slice(),
+            &logic_site_lookup,
             selected_sample_indices.as_slice(),
             train_idx_local.as_slice(),
             assoc_sample_indices,
             train_fit.residualized_y.as_slice(),
             assoc_y,
             beam_params,
+            simbench_ml_contexts.as_slice(),
         )?;
         let n = simbench_records.len();
         records.extend(simbench_records);
@@ -4055,8 +6293,11 @@ fn garfield_logic_search_bed_owned(
         0usize
     };
 
+    let structure_prior_for_output = rule_structure_prior.clone();
     let mut pseudo_prefix_out = None;
     let mut rules_tsv_out = None;
+    let mut posterior_tsv_out = None;
+    let mut posterior_json_out = None;
     if let Some(prefix_out) = out_prefix.as_ref() {
         write_logic_pseudo_plink(
             prefix_out,
@@ -4065,6 +6306,14 @@ fn garfield_logic_search_bed_owned(
         )?;
         let rules_tsv = format!("{prefix_out}.rules.tsv");
         write_logic_rules_tsv(&rules_tsv, records.as_slice())?;
+        if let Some(prior) = structure_prior_for_output.as_deref() {
+            let posterior_tsv = format!("{prefix_out}.posterior.tsv");
+            let posterior_json = format!("{prefix_out}.posterior.json");
+            write_rule_structure_prior_tsv(&posterior_tsv, prior)?;
+            write_rule_structure_prior_json(&posterior_json, prior)?;
+            posterior_tsv_out = Some(posterior_tsv);
+            posterior_json_out = Some(posterior_json);
+        }
         pseudo_prefix_out = Some(prefix_out.clone());
         rules_tsv_out = Some(rules_tsv);
     }
@@ -4072,6 +6321,26 @@ fn garfield_logic_search_bed_owned(
     Ok(GarfieldLogicPipelineResult {
         pseudo_prefix: pseudo_prefix_out,
         rules_tsv: rules_tsv_out,
+        posterior_tsv: posterior_tsv_out,
+        posterior_json: posterior_json_out,
+        rule_permutation_active: null_permutation_active || soft_structure_mode,
+        null_chunk_bp,
+        null_chunk_min_snps: DEFAULT_RULE_NULL_MIN_SNPS_PER_CHUNK,
+        null_chunk_target,
+        null_chunk_valid_total,
+        null_chunk_selected,
+        representative_units_target,
+        representative_units_used,
+        permutation_null_repeats: if null_permutation_active {
+            DEFAULT_RULE_PERMUTATION_REPEATS
+        } else {
+            0
+        },
+        permutation_bootstrap_repeats: if soft_structure_mode {
+            structure_bootstrap_repeats_used_total
+        } else {
+            0
+        },
         records,
         simbench_count,
         split_applied,
@@ -4079,7 +6348,7 @@ fn garfield_logic_search_bed_owned(
         n_test: test_idx_local.len(),
         n_samples: logic_bits.n_samples,
         units_total: total_units,
-        units_scanned: total_units,
+        units_scanned: scanned_units,
         train_fit,
         test_fit,
     })
@@ -4098,6 +6367,7 @@ fn garfield_logic_search_bed_owned(
     group_names=None,
     extension=100000,
     step=None,
+    scan_bimranges=None,
     bin_mode="bin",
     ml_method="rf",
     ml_importance="imp",
@@ -4113,9 +6383,9 @@ fn garfield_logic_search_bed_owned(
     feature_subsample=0.0,
     fold=0,
     seed=42,
-    max_pick=3,
+    max_pick=4,
     exhaustive_depth=1,
-    beam_width=5,
+    beam_width=100,
     logic_gate="ao",
     rank_score="interaction_gain",
     candidate_keep_ratio=0.10,
@@ -4137,6 +6407,9 @@ fn garfield_logic_search_bed_owned(
     top_rules_per_unit=1,
     max_output_rules=0,
     max_output_ratio=0.0,
+    rule_permutation=false,
+    prior_len=None,
+    no_clean=false,
     progress_callback=None,
     progress_every=0
 ))]
@@ -4153,6 +6426,7 @@ pub fn garfield_logic_search_bed_py<'py>(
     group_names: Option<Vec<String>>,
     extension: usize,
     step: Option<usize>,
+    scan_bimranges: Option<Vec<String>>,
     bin_mode: &str,
     ml_method: &str,
     ml_importance: &str,
@@ -4192,6 +6466,9 @@ pub fn garfield_logic_search_bed_py<'py>(
     top_rules_per_unit: usize,
     max_output_rules: usize,
     max_output_ratio: f64,
+    rule_permutation: bool,
+    prior_len: Option<Vec<f64>>,
+    no_clean: bool,
     progress_callback: Option<Py<PyAny>>,
     progress_every: usize,
 ) -> PyResult<Bound<'py, PyDict>> {
@@ -4251,6 +6528,7 @@ pub fn garfield_logic_search_bed_py<'py>(
                 group_names,
                 extension,
                 step,
+                scan_bimranges,
                 bin_mode.to_string(),
                 ml_method.to_string(),
                 ml_importance.to_string(),
@@ -4285,6 +6563,9 @@ pub fn garfield_logic_search_bed_py<'py>(
                 top_rules_per_unit,
                 max_output_rules,
                 max_output_ratio,
+                rule_permutation,
+                prior_len,
+                no_clean,
                 progress_callback,
                 progress_every,
             )
@@ -4294,6 +6575,27 @@ pub fn garfield_logic_search_bed_py<'py>(
     let out = PyDict::new(py);
     out.set_item("pseudo_prefix", result.pseudo_prefix)?;
     out.set_item("rules_tsv", result.rules_tsv)?;
+    out.set_item("posterior_tsv", result.posterior_tsv)?;
+    out.set_item("posterior_json", result.posterior_json)?;
+    out.set_item("rule_permutation_active", result.rule_permutation_active)?;
+    out.set_item("null_chunk_bp", result.null_chunk_bp)?;
+    out.set_item("null_chunk_min_snps", result.null_chunk_min_snps)?;
+    out.set_item("null_chunk_target", result.null_chunk_target)?;
+    out.set_item("null_chunk_valid_total", result.null_chunk_valid_total)?;
+    out.set_item("null_chunk_selected", result.null_chunk_selected)?;
+    out.set_item(
+        "representative_units_target",
+        result.representative_units_target,
+    )?;
+    out.set_item(
+        "representative_units_used",
+        result.representative_units_used,
+    )?;
+    out.set_item("permutation_null_repeats", result.permutation_null_repeats)?;
+    out.set_item(
+        "permutation_bootstrap_repeats",
+        result.permutation_bootstrap_repeats,
+    )?;
     out.set_item("n_rules", result.records.len())?;
     out.set_item("n_simbench", result.simbench_count)?;
     out.set_item("split_applied", result.split_applied)?;
@@ -4368,6 +6670,14 @@ pub fn garfield_logic_search_bed_py<'py>(
             .records
             .iter()
             .map(|r| r.selected_row_indices.clone())
+            .collect::<Vec<_>>(),
+    )?;
+    out.set_item(
+        "ml_ranks",
+        result
+            .records
+            .iter()
+            .map(|r| r.ml_rank.clone())
             .collect::<Vec<_>>(),
     )?;
     Ok(out)
@@ -4833,8 +7143,8 @@ pub fn garfield_subset_bin_samples_py(
     y_train,
     groups,
     response="continuous",
-    max_pick=3,
-    beam_width=5,
+    max_pick=4,
+    beam_width=100,
     enforce_feature_exclusion=true,
     progress_callback=None,
     progress_every=0
@@ -4962,8 +7272,8 @@ pub fn garfield_scan_groups_bin_py(
     bin_path,
     y_train,
     response="continuous",
-    max_pick=3,
-    beam_width=5,
+    max_pick=4,
+    beam_width=100,
     extension=50000,
     step=None,
     enforce_feature_exclusion=true,
@@ -5400,6 +7710,7 @@ mod tests {
                 unit_index: i + 1,
                 region_size: 8,
                 ml_feature_count: 4,
+                ml_rank: ".".to_string(),
                 selected_row_indices: vec![i],
                 snp_name: format!("snp{i}"),
                 expr: format!("expr{i}"),
@@ -5434,6 +7745,7 @@ mod tests {
                 unit_index: 1,
                 region_size: 8,
                 ml_feature_count: 4,
+                ml_rank: ".".to_string(),
                 selected_row_indices: vec![1],
                 snp_name: "snp1".to_string(),
                 expr: "expr1".to_string(),
@@ -5453,6 +7765,7 @@ mod tests {
                 unit_index: 2,
                 region_size: 8,
                 ml_feature_count: 4,
+                ml_rank: ".".to_string(),
                 selected_row_indices: vec![2],
                 snp_name: "snp2".to_string(),
                 expr: "expr2".to_string(),
@@ -5472,6 +7785,7 @@ mod tests {
                 unit_index: 3,
                 region_size: 8,
                 ml_feature_count: 4,
+                ml_rank: ".".to_string(),
                 selected_row_indices: vec![3],
                 snp_name: "snp3".to_string(),
                 expr: "expr3".to_string(),
@@ -5491,6 +7805,7 @@ mod tests {
                 unit_index: 4,
                 region_size: 8,
                 ml_feature_count: 4,
+                ml_rank: ".".to_string(),
                 selected_row_indices: vec![4],
                 snp_name: "snp4".to_string(),
                 expr: "expr4".to_string(),
@@ -5508,5 +7823,215 @@ mod tests {
         apply_logic_rule_output_limit(&mut records, 2, 0.0).unwrap();
         assert_eq!(records.len(), 3);
         assert_eq!(records[1].test_score, records[2].test_score);
+    }
+
+    fn test_site(chrom: &str, pos: i32) -> SiteInfo {
+        SiteInfo {
+            chrom: chrom.to_string(),
+            pos,
+            ref_allele: "A".to_string(),
+            alt_allele: "G".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_build_valid_null_chunks_uses_fixed_non_overlapping_windows() {
+        let mut sites = Vec::<SiteInfo>::new();
+        for pos in 0..55 {
+            sites.push(test_site("1", pos * 1_000));
+        }
+        for pos in 200..260 {
+            sites.push(test_site("1", pos * 1_000));
+        }
+        for pos in 500..520 {
+            sites.push(test_site("1", pos * 1_000));
+        }
+        let (chunks, spans) = build_valid_null_chunks(&sites, 200_000, 50);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].start_index, 0);
+        assert_eq!(chunks[0].end_index, 55);
+        assert_eq!(chunks[0].window_index, 0);
+        assert_eq!(chunks[1].start_index, 55);
+        assert_eq!(chunks[1].end_index, 115);
+        assert_eq!(chunks[1].window_index, 1);
+    }
+
+    #[test]
+    fn test_sample_null_chunks_stratified_preserves_chromosome_proportions() {
+        let mut sites = Vec::<SiteInfo>::new();
+        for win in 0..8 {
+            let start = win * 200_000;
+            for offset in 0..60 {
+                sites.push(test_site("1", start + offset));
+            }
+        }
+        for win in 0..2 {
+            let start = win * 200_000;
+            for offset in 0..60 {
+                sites.push(test_site("2", start + offset));
+            }
+        }
+        let (picked, total_valid) = sample_null_chunks_stratified(&sites, 100_000, 5, 50, 7);
+        assert_eq!(total_valid, 10);
+        assert_eq!(picked.len(), 5);
+        let chr1 = picked.iter().filter(|c| c.chrom_code == 1).count();
+        let chr2 = picked.iter().filter(|c| c.chrom_code == 2).count();
+        assert_eq!(chr1, 4);
+        assert_eq!(chr2, 1);
+    }
+
+    #[test]
+    fn test_resolve_ml_top_random_counts_keeps_random_slice_for_small_keep_k() {
+        assert_eq!(resolve_ml_top_random_counts(2, 0.80), (1, 1));
+        assert_eq!(resolve_ml_top_random_counts(3, 0.80), (2, 1));
+        assert_eq!(resolve_ml_top_random_counts(10, 0.80), (8, 2));
+    }
+
+    #[test]
+    fn test_parse_scan_bimrange_item_accepts_bp_interval() {
+        let parsed = parse_scan_bimrange_item("chr10:111000000-111200000").unwrap();
+        assert_eq!(parsed.chrom, "chr10");
+        assert_eq!(parsed.bp_start, 111_000_000);
+        assert_eq!(parsed.bp_end, 111_200_000);
+    }
+
+    #[test]
+    fn test_unit_overlaps_scan_bimranges_uses_any_span_overlap() {
+        let unit = GarfieldLogicUnit {
+            label: "u1".to_string(),
+            indices: vec![1, 2, 3],
+            spans: vec![
+                GarfieldUnitSpan {
+                    chrom: "10".to_string(),
+                    bp_start: 111_000_000,
+                    bp_end: 111_100_000,
+                },
+                GarfieldUnitSpan {
+                    chrom: "11".to_string(),
+                    bp_start: 222_000_000,
+                    bp_end: 222_100_000,
+                },
+            ],
+        };
+        assert!(unit_overlaps_scan_bimranges(
+            &unit,
+            &[GarfieldScanBimRange {
+                chrom: "chr10".to_string(),
+                bp_start: 111_050_000,
+                bp_end: 111_250_000,
+            }]
+        ));
+        assert!(!unit_overlaps_scan_bimranges(
+            &unit,
+            &[GarfieldScanBimRange {
+                chrom: "12".to_string(),
+                bp_start: 111_050_000,
+                bp_end: 111_250_000,
+            }]
+        ));
+    }
+
+    #[test]
+    fn test_resolve_simbench_ml_rank_preserves_site_order_and_missing_marks() {
+        let contexts = vec![GarfieldUnitMlContext {
+            unit_index: 7,
+            selected_global_rows: vec![100, 300, 200],
+        }];
+        let site_row_candidates = vec![vec![300, 301], vec![999], vec![200, 201]];
+        let (rank_txt, ml_feature_count) = resolve_simbench_ml_rank(
+            SimBenchLogic::And,
+            site_row_candidates.as_slice(),
+            contexts.as_slice(),
+        );
+        assert_eq!(rank_txt, "2 & . & 3");
+        assert_eq!(ml_feature_count, 3);
+    }
+
+    #[test]
+    fn test_simbench_raw_normalization_is_allele_orientation_invariant() {
+        let mut row_a = vec![0.0_f32, 0.0, 0.0, 1.0, 2.0];
+        let mut site_a = SiteInfo {
+            chrom: "10".to_string(),
+            pos: 111_023_852,
+            ref_allele: "C".to_string(),
+            alt_allele: "T".to_string(),
+        };
+        let mut row_b = vec![2.0_f32, 2.0, 2.0, 1.0, 0.0];
+        let mut site_b = SiteInfo {
+            chrom: "10".to_string(),
+            pos: 111_023_852,
+            ref_allele: "T".to_string(),
+            alt_allele: "C".to_string(),
+        };
+
+        normalize_simbench_raw_row(&mut row_a, &mut site_a).unwrap();
+        normalize_simbench_raw_row(&mut row_b, &mut site_b).unwrap();
+
+        let bin_a = collapse_logic_bin01_from_raw_row(&row_a).unwrap();
+        let bin_b = collapse_logic_bin01_from_raw_row(&row_b).unwrap();
+        assert_eq!(site_a.ref_allele, site_b.ref_allele);
+        assert_eq!(site_a.alt_allele, site_b.alt_allele);
+        assert_eq!(bin_a, bin_b);
+    }
+
+    #[test]
+    fn test_fill_bin_logic_row_bits_respects_row_flip() {
+        fn pack_raw_hardcalls(geno: &[u8]) -> Vec<u8> {
+            let mut out = vec![0u8; geno.len().div_ceil(4)];
+            for (i, &g) in geno.iter().enumerate() {
+                let code = match g {
+                    0 => 0b00u8,
+                    1 => 0b10u8,
+                    2 => 0b11u8,
+                    _ => 0b01u8,
+                };
+                out[i >> 2] |= code << ((i & 3) * 2);
+            }
+            out
+        }
+
+        fn unpack_bits(words: &[u64], n: usize) -> Vec<u8> {
+            (0..n)
+                .map(|i| ((words[i >> 6] >> (i & 63)) & 1u64) as u8)
+                .collect()
+        }
+
+        let raw_row = vec![2u8, 2, 2, 1, 0];
+        let packed_row = pack_raw_hardcalls(raw_row.as_slice());
+        let sample_indices = (0usize..raw_row.len()).collect::<Vec<_>>();
+        let sample_plan = build_logic_sample_plan(sample_indices.as_slice());
+        let mut dst_words = vec![0u64; words_for_samples(raw_row.len())];
+        fill_bin_logic_row_bits(
+            packed_row.as_slice(),
+            true,
+            sample_plan.as_slice(),
+            dst_words.as_mut_slice(),
+        );
+
+        let mut row = raw_row.iter().map(|&g| g as f32).collect::<Vec<_>>();
+        let mut site = SiteInfo {
+            chrom: "10".to_string(),
+            pos: 111_023_852,
+            ref_allele: "T".to_string(),
+            alt_allele: "C".to_string(),
+        };
+        normalize_simbench_raw_row(&mut row, &mut site).unwrap();
+        let expected = collapse_logic_bin01_from_raw_row(&row).unwrap();
+
+        assert_eq!(unpack_bits(dst_words.as_slice(), raw_row.len()), expected);
+    }
+
+    #[test]
+    fn test_insert_topk_density_hit_keeps_highest_scores() {
+        let mut bucket = Vec::<(usize, f64)>::new();
+        insert_topk_density_hit(&mut bucket, 2, 5.0, 3);
+        insert_topk_density_hit(&mut bucket, 1, 9.0, 3);
+        insert_topk_density_hit(&mut bucket, 4, 7.0, 3);
+        insert_topk_density_hit(&mut bucket, 0, 8.0, 3);
+        assert_eq!(bucket.len(), 3);
+        assert_eq!(bucket[0], (1, 9.0));
+        assert_eq!(bucket[1], (0, 8.0));
+        assert_eq!(bucket[2], (4, 7.0));
     }
 }

@@ -1198,6 +1198,30 @@ pub(crate) fn count_packed_row_counts(row: &[u8], n_samples: usize) -> (usize, u
 }
 
 #[inline]
+pub(crate) fn count_packed_row_counts_selected(
+    row: &[u8],
+    n_samples: usize,
+    sample_indices: &[usize],
+) -> (usize, usize, usize) {
+    if sample_indices_are_identity(sample_indices) && sample_indices.len() == n_samples {
+        return count_packed_row_counts(row, n_samples);
+    }
+    let mut missing = 0usize;
+    let mut het = 0usize;
+    let mut hom_alt = 0usize;
+    for &sid in sample_indices.iter() {
+        let code = (row[sid >> 2] >> ((sid & 3) * 2)) & 0b11;
+        match code {
+            0b01 => missing += 1,
+            0b10 => het += 1,
+            0b11 => hom_alt += 1,
+            _ => {}
+        }
+    }
+    (missing, het, hom_alt)
+}
+
+#[inline]
 fn load_u64_le_partial(bytes: &[u8], offset: usize) -> u64 {
     let mut v = 0u64;
     if offset >= bytes.len() {
@@ -3834,7 +3858,7 @@ pub(crate) struct PackedBedSubsetOwned {
 
 pub(crate) struct PreparedBedLogicMetaOwned {
     pub site_keep: Vec<bool>,
-    pub sample_ids: Vec<String>,
+    pub row_flip: Vec<bool>,
     pub sites: Vec<core::SiteInfo>,
     pub n_samples: usize,
     pub n_snps_total: usize,
@@ -3848,19 +3872,19 @@ pub(crate) struct PreparedBedPackedOwned {
     pub std_denom: Vec<f32>,
     pub row_flip: Vec<bool>,
     pub site_keep: Vec<bool>,
-    pub sample_ids: Vec<String>,
     pub sites: Vec<core::SiteInfo>,
     pub n_samples: usize,
     pub n_snps_total: usize,
     pub bytes_per_snp: usize,
 }
 
-pub(crate) fn prepare_bed_logic_meta_owned(
+pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples(
     prefix: &str,
     maf_threshold: f32,
     max_missing_rate: f32,
     het_threshold: f32,
     snps_only: bool,
+    stats_sample_indices: Option<&[usize]>,
 ) -> Result<PreparedBedLogicMetaOwned, String> {
     if !(0.0..=0.5).contains(&maf_threshold) {
         return Err("maf_threshold must be within [0, 0.5]".to_string());
@@ -3883,9 +3907,25 @@ pub(crate) fn prepare_bed_logic_meta_owned(
     if n_samples == 0 {
         return Err("no samples found in PLINK input".to_string());
     }
+    let stats_sample_indices = stats_sample_indices.unwrap_or(&[]);
+    if !stats_sample_indices.is_empty() && stats_sample_indices.iter().any(|&idx| idx >= n_samples)
+    {
+        return Err("selected sample index out of range for BED logic preparation".to_string());
+    }
+    let stats_identity = stats_sample_indices.is_empty()
+        || (stats_sample_indices.len() == n_samples
+            && sample_indices_are_identity(stats_sample_indices));
+    let stats_n_samples = if stats_identity {
+        n_samples
+    } else {
+        stats_sample_indices.len()
+    };
+    if stats_n_samples == 0 {
+        return Err("selected sample set for BED logic preparation is empty".to_string());
+    }
     emit_gfreader_rss_debug(
         "prepare_bed_logic_meta/read_fam",
-        &format!("prefix={bed_prefix} n_samples={n_samples}"),
+        &format!("prefix={bed_prefix} n_samples={n_samples} stats_n_samples={stats_n_samples}"),
     );
 
     let sites_all = core::read_bim(&bed_prefix).map_err(|e| e.to_string())?;
@@ -3933,16 +3973,20 @@ pub(crate) fn prepare_bed_logic_meta_owned(
     );
 
     let apply_het_filter = het_threshold > 0.0_f32;
-    let site_keep: Vec<bool> = packed_full
+    let keep_flip: Vec<(bool, bool)> = packed_full
         .par_chunks(bytes_per_snp)
         .enumerate()
         .map(|(i, row)| {
-            let (missing, het, hom_alt) = count_packed_row_counts(row, n_samples);
-            let non_missing = n_samples.saturating_sub(missing);
+            let (missing, het, hom_alt) = if stats_identity {
+                count_packed_row_counts(row, n_samples)
+            } else {
+                count_packed_row_counts_selected(row, n_samples, stats_sample_indices)
+            };
+            let non_missing = stats_n_samples.saturating_sub(missing);
             let alt_sum = het.saturating_add(hom_alt.saturating_mul(2));
             let het_count = if apply_het_filter { het } else { 0usize };
-            let (pass_num, _flip) = evaluate_packed_row_keep_and_flip(
-                n_samples,
+            let (pass_num, flip) = evaluate_packed_row_keep_and_flip(
+                stats_n_samples,
                 non_missing,
                 alt_sum,
                 het_count,
@@ -3957,9 +4001,11 @@ pub(crate) fn prepare_bed_logic_meta_owned(
             } else {
                 true
             };
-            pass_num && pass_snp
+            let keep = pass_num && pass_snp;
+            (keep, keep && flip)
         })
         .collect();
+    let site_keep: Vec<bool> = keep_flip.iter().map(|(keep, _)| *keep).collect();
     if site_keep.len() != n_snps {
         return Err(format!(
             "internal error: site_keep rows {} != n_snps {n_snps}",
@@ -3983,15 +4029,21 @@ pub(crate) fn prepare_bed_logic_meta_owned(
     );
 
     let mut sites_keep = Vec::<core::SiteInfo>::with_capacity(kept_n);
-    for (i, site) in sites_all.into_iter().enumerate() {
+    let mut row_flip_keep = Vec::<bool>::with_capacity(kept_n);
+    for (i, mut site) in sites_all.into_iter().enumerate() {
         if site_keep[i] {
+            let flip = keep_flip[i].1;
+            if flip {
+                std::mem::swap(&mut site.ref_allele, &mut site.alt_allele);
+            }
             sites_keep.push(site);
+            row_flip_keep.push(flip);
         }
     }
 
     Ok(PreparedBedLogicMetaOwned {
         site_keep,
-        sample_ids: samples,
+        row_flip: row_flip_keep,
         sites: sites_keep,
         n_samples,
         n_snps_total: n_snps,
@@ -3999,9 +4051,27 @@ pub(crate) fn prepare_bed_logic_meta_owned(
     })
 }
 
-pub(crate) fn load_bed_2bit_packed_subset_owned(
+pub(crate) fn prepare_bed_logic_meta_owned(
+    prefix: &str,
+    maf_threshold: f32,
+    max_missing_rate: f32,
+    het_threshold: f32,
+    snps_only: bool,
+) -> Result<PreparedBedLogicMetaOwned, String> {
+    prepare_bed_logic_meta_owned_for_stats_samples(
+        prefix,
+        maf_threshold,
+        max_missing_rate,
+        het_threshold,
+        snps_only,
+        None,
+    )
+}
+
+pub(crate) fn load_bed_2bit_packed_subset_owned_for_stats_samples(
     prefix: &str,
     site_keep: &[bool],
+    stats_sample_indices: Option<&[usize]>,
 ) -> Result<PackedBedSubsetOwned, String> {
     let mut bed_prefix = prefix.to_string();
     let lower = bed_prefix.to_ascii_lowercase();
@@ -4013,6 +4083,22 @@ pub(crate) fn load_bed_2bit_packed_subset_owned(
     let n_samples = samples.len();
     if n_samples == 0 {
         return Err("no samples found in PLINK input".to_string());
+    }
+    let stats_sample_indices = stats_sample_indices.unwrap_or(&[]);
+    if !stats_sample_indices.is_empty() && stats_sample_indices.iter().any(|&idx| idx >= n_samples)
+    {
+        return Err("selected sample index out of range for packed BED subset stats".to_string());
+    }
+    let stats_identity = stats_sample_indices.is_empty()
+        || (stats_sample_indices.len() == n_samples
+            && sample_indices_are_identity(stats_sample_indices));
+    let stats_n_samples = if stats_identity {
+        n_samples
+    } else {
+        stats_sample_indices.len()
+    };
+    if stats_n_samples == 0 {
+        return Err("selected sample set for packed BED subset stats is empty".to_string());
     }
     emit_gfreader_rss_debug(
         "load_bed_2bit_packed_subset_owned/read_fam",
@@ -4084,11 +4170,15 @@ pub(crate) fn load_bed_2bit_packed_subset_owned(
                 let row = &packed_src[src_off..src_off + bytes_per_snp];
                 dst_row.copy_from_slice(row);
 
-                let (missing, het, hom_alt) = count_packed_row_counts(row, n_samples);
-                let non_missing = n_samples.saturating_sub(missing);
+                let (missing, het, hom_alt) = if stats_identity {
+                    count_packed_row_counts(row, n_samples)
+                } else {
+                    count_packed_row_counts_selected(row, n_samples, stats_sample_indices)
+                };
+                let non_missing = stats_n_samples.saturating_sub(missing);
                 let alt_sum = het.saturating_add(hom_alt.saturating_mul(2));
                 let (miss, maf, std) =
-                    packed_row_stats_from_counts(n_samples, non_missing, alt_sum);
+                    packed_row_stats_from_counts(stats_n_samples, non_missing, alt_sum);
                 *miss_v = miss;
                 *maf_v = maf.clamp(0.0, 0.5);
                 *std_v = std;
@@ -4117,6 +4207,13 @@ pub(crate) fn load_bed_2bit_packed_subset_owned(
     })
 }
 
+pub(crate) fn load_bed_2bit_packed_subset_owned(
+    prefix: &str,
+    site_keep: &[bool],
+) -> Result<PackedBedSubsetOwned, String> {
+    load_bed_2bit_packed_subset_owned_for_stats_samples(prefix, site_keep, None)
+}
+
 pub(crate) fn prepare_bed_2bit_packed_owned(
     prefix: &str,
     maf_threshold: f32,
@@ -4139,7 +4236,41 @@ pub(crate) fn prepare_bed_2bit_packed_owned(
         std_denom: subset.std_denom,
         row_flip: subset.row_flip,
         site_keep: scanned.site_keep,
-        sample_ids: scanned.sample_ids,
+        sites: scanned.sites,
+        n_samples: scanned.n_samples,
+        n_snps_total: scanned.n_snps_total,
+        bytes_per_snp: scanned.bytes_per_snp,
+    })
+}
+
+pub(crate) fn prepare_bed_2bit_packed_owned_for_stats_samples(
+    prefix: &str,
+    maf_threshold: f32,
+    max_missing_rate: f32,
+    het_threshold: f32,
+    snps_only: bool,
+    stats_sample_indices: Option<&[usize]>,
+) -> Result<PreparedBedPackedOwned, String> {
+    let scanned = prepare_bed_logic_meta_owned_for_stats_samples(
+        prefix,
+        maf_threshold,
+        max_missing_rate,
+        het_threshold,
+        snps_only,
+        stats_sample_indices,
+    )?;
+    let subset = load_bed_2bit_packed_subset_owned_for_stats_samples(
+        prefix,
+        scanned.site_keep.as_slice(),
+        stats_sample_indices,
+    )?;
+    Ok(PreparedBedPackedOwned {
+        packed: subset.packed,
+        missing_rate: subset.missing_rate,
+        maf: subset.maf,
+        std_denom: subset.std_denom,
+        row_flip: subset.row_flip,
+        site_keep: scanned.site_keep,
         sites: scanned.sites,
         n_samples: scanned.n_samples,
         n_snps_total: scanned.n_snps_total,
@@ -5743,6 +5874,73 @@ impl PlinkStreamWriter {
     #[getter]
     fn written_snps(&self) -> usize {
         self.written_snps
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        count_packed_row_counts, count_packed_row_counts_selected,
+        evaluate_packed_row_keep_and_flip,
+    };
+
+    fn pack_plink_codes(codes: &[u8]) -> Vec<u8> {
+        let mut out = vec![0u8; (codes.len() + 3) / 4];
+        for (i, &code) in codes.iter().enumerate() {
+            out[i >> 2] |= (code & 0b11) << ((i & 3) * 2);
+        }
+        out
+    }
+
+    #[test]
+    fn selected_counts_follow_subset_indices() {
+        let row = pack_plink_codes(&[0b00, 0b11, 0b10, 0b01, 0b11, 0b00]);
+        let full = count_packed_row_counts(&row, 6);
+        assert_eq!(full, (1, 1, 2));
+
+        let selected = count_packed_row_counts_selected(&row, 6, &[1, 2, 4]);
+        assert_eq!(selected, (0, 1, 2));
+
+        let identity = count_packed_row_counts_selected(&row, 6, &[0, 1, 2, 3, 4, 5]);
+        assert_eq!(identity, full);
+    }
+
+    #[test]
+    fn subset_counts_can_change_flip_direction() {
+        let row = pack_plink_codes(&[0b00, 0b00, 0b00, 0b11]);
+
+        let (full_missing, full_het, full_hom_alt) = count_packed_row_counts(&row, 4);
+        let full_non_missing = 4usize.saturating_sub(full_missing);
+        let full_alt_sum = full_het.saturating_add(full_hom_alt.saturating_mul(2));
+        let (full_keep, full_flip) = evaluate_packed_row_keep_and_flip(
+            4,
+            full_non_missing,
+            full_alt_sum,
+            full_het,
+            0.0,
+            1.0,
+            false,
+            0.0,
+        );
+        assert!(full_keep);
+        assert!(!full_flip);
+
+        let (subset_missing, subset_het, subset_hom_alt) =
+            count_packed_row_counts_selected(&row, 4, &[3]);
+        let subset_non_missing = 1usize.saturating_sub(subset_missing);
+        let subset_alt_sum = subset_het.saturating_add(subset_hom_alt.saturating_mul(2));
+        let (subset_keep, subset_flip) = evaluate_packed_row_keep_and_flip(
+            1,
+            subset_non_missing,
+            subset_alt_sum,
+            subset_het,
+            0.0,
+            1.0,
+            false,
+            0.0,
+        );
+        assert!(subset_keep);
+        assert!(subset_flip);
     }
 }
 

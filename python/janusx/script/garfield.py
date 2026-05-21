@@ -24,8 +24,8 @@ from janusx.script._common.pathcheck import (
     ensure_plink_prefix_exists,
     format_path_for_display,
 )
-from janusx.script._common.progress import ProgressAdapter
-from janusx.script._common.status import CliStatus, log_success, print_failure, stdout_is_tty
+from janusx.script._common.progress import ProgressAdapter, build_rich_progress, rich_progress_available
+from janusx.script._common.status import CliStatus, log_success, print_failure, stdout_is_tty, success_symbol
 from janusx.script._common.threads import apply_outer_thread_cap, detect_effective_threads
 
 
@@ -36,7 +36,6 @@ except Exception as _exc:  # pragma: no cover
     _RUST_IMPORT_ERROR = _exc
 else:
     _RUST_IMPORT_ERROR = None
-
 
 # Python 仅负责 CLI 调度；训练/测试划分、null-model 残差化、ML 候选筛选、
 # beam search 与最终导出都由 Rust 端统一完成。
@@ -261,6 +260,38 @@ def _parse_beam_topk_spec(value: object) -> tuple[int | None, float | None]:
     return (count, None)
 
 
+def _default_prior_len_alpha_for_layer(layer: int) -> list[float]:
+    effective_layer = max(1, min(int(layer), 5))
+    return [float(2 ** power) for power in range(effective_layer - 1, -1, -1)]
+
+
+def _parse_prior_len_alpha_spec(value: object | None, *, layer: int) -> list[float]:
+    default_alpha = _default_prior_len_alpha_for_layer(layer)
+    effective_layer = len(default_alpha)
+    if value is None:
+        return list(default_alpha)
+    raw = str(value).strip()
+    if raw == "":
+        return list(default_alpha)
+    parts = [p.strip() for p in raw.split(",")]
+    if len(parts) > effective_layer:
+        raise ValueError(
+            f"--prior-len accepts at most {effective_layer} comma-separated alpha values when -layer={int(layer)}."
+        )
+    out = list(default_alpha)
+    for i, token in enumerate(parts):
+        if token == "":
+            raise ValueError("--prior-len contains an empty alpha value.")
+        try:
+            alpha = float(token)
+        except Exception as exc:
+            raise ValueError("--prior-len must be a comma-separated list of positive numbers.") from exc
+        if (not np.isfinite(alpha)) or alpha <= 0.0:
+            raise ValueError("--prior-len alpha values must be finite and > 0.")
+        out[i] = alpha
+    return out
+
+
 def _parse_positive_layer(value: object, *, label: str) -> int:
     try:
         out = int(value)
@@ -291,7 +322,6 @@ def _resolve_rank_score_runtime(
     exhaustive_depth: int,
     rank_score_compat: object | None = None,
 ) -> tuple[str, str, int | None]:
-    gate = str(logic_gate).strip().lower()
     compat = "" if rank_score_compat is None else str(rank_score_compat).strip().lower()
 
     if compat != "":
@@ -325,25 +355,156 @@ def _resolve_rank_score_runtime(
         start = _parse_positive_layer(raw_layer_requested, label="-raw/--raw")
         return (f"gain_from_layer:{start}", "raw-flag", start)
 
-    if gate == "or":
-        return ("raw", "default-or", None)
-    return ("gain_from_layer:2", "default-non-or", 2)
+    return ("gain_from_layer:2", "default-combination-gain", 2)
 
 
-def _write_logic_pseudo_map(path: str, result: dict) -> None:
-    unit_kinds = [str(x) for x in result.get("unit_kinds", [])]
-    positions = [int(x) for x in result.get("positions", [])]
-    exprs = [str(x) for x in result.get("expressions", [])]
-    train_scores = [float(x) for x in result.get("train_scores", [])]
-    test_scores = [float(x) for x in result.get("test_scores", [])]
-    n = min(len(unit_kinds), len(positions), len(exprs), len(train_scores), len(test_scores))
-    with open(path, "w", encoding="utf-8") as fw:
-        fw.write("chrom\tpos\texpression\ttrain_score\ttest_score\n")
-        for i in range(n):
-            fw.write(
-                f"{unit_kinds[i]}\t{positions[i]}\t{exprs[i]}\t"
-                f"{train_scores[i]:.12g}\t{test_scores[i]:.12g}\n"
+def _emit_garfield_summary_to_log(logger, summary_rows: list[dict[str, object]]) -> None:
+    if len(summary_rows) == 0:
+        return
+    logger.info("")
+    logger.info("GARFIELD summary")
+    logger.info("trait\tn_samples\tn_train\tn_holdout\tholdout_kind\tbest_holdout_score\troute")
+    for row in summary_rows:
+        logger.info(
+            f"{row['trait']}\t{int(row['n_samples'])}\t{int(row['n_train'])}\t"
+            f"{int(row['n_holdout'])}\t{row['holdout_kind']}\t"
+            f"{float(row['best_holdout_score']):.12g}\t{row['route']}"
+        )
+
+
+def _load_json_if_exists(path: Optional[str]):
+    if path is None:
+        return None
+    try:
+        if not os.path.exists(path):
+            return None
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        return None
+
+
+def _remove_file_if_exists(path: Optional[str]) -> None:
+    if path is None:
+        return
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except Exception:
+        return
+
+
+def _split_structure_prior_payload(payload):
+    if not isinstance(payload, dict):
+        return (None, payload)
+    prior_payload = payload.get("prior")
+    posterior_payload = dict(payload)
+    posterior_payload.pop("prior", None)
+    return (prior_payload, posterior_payload)
+
+
+class _GarfieldStageProgress:
+    _HIDDEN_STAGES = {"null_prep", "structure_prep"}
+
+    def __init__(self, *, scan_desc: str, enabled: bool) -> None:
+        self.scan_desc = str(scan_desc)
+        self.enabled = bool(enabled)
+        self._rich = None
+        self._tasks: dict[str, int] = {}
+        self._current_stage: str | None = None
+        self._adapter: ProgressAdapter | None = None
+        self._adapter_done = 0
+        if self.enabled and rich_progress_available():
+            self._rich = build_rich_progress(
+                show_spinner=True,
+                show_bar=True,
+                show_percentage=True,
+                show_elapsed=True,
+                show_remaining=True,
+                field_templates=["{task.fields[postfix]}"],
+                finished_text=f"[green]{success_symbol()}[/green]",
+                transient=False,
             )
+            if self._rich is not None:
+                self._rich.start()
+
+    def _label(self, stage: str) -> str:
+        if stage == "null_prep":
+            return "Preparing Bg Noise"
+        if stage == "null_penalty":
+            return "Estimating Bg Noise"
+        if stage == "structure_prep":
+            return "Preparing Priors"
+        if stage == "structure_prior":
+            return "Learning Priors"
+        return self.scan_desc
+
+    def update(self, stage: str, done: int, total: int, meta: object | None = None) -> None:
+        stage_key = str(stage).strip().lower()
+        if stage_key in self._HIDDEN_STAGES:
+            return
+        done_i = max(0, int(done))
+        total_i = max(done_i, int(total))
+        postfix = "" if meta in {None, ""} else str(meta)
+        label = self._label(stage_key)
+
+        if self._rich is not None:
+            task_id = self._tasks.get(stage_key)
+            if task_id is None:
+                task_id = self._rich.add_task(
+                    label,
+                    total=max(1, total_i),
+                    completed=min(done_i, max(1, total_i)),
+                    postfix=postfix,
+                )
+                self._tasks[stage_key] = task_id
+            else:
+                self._rich.update(
+                    task_id,
+                    description=label,
+                    total=max(1, total_i),
+                    completed=min(done_i, max(1, total_i)),
+                    postfix=postfix,
+                )
+            return
+
+        if not self.enabled:
+            return
+        if self._current_stage != stage_key or self._adapter is None:
+            if self._adapter is not None:
+                self._adapter.finish()
+                self._adapter.close()
+            self._adapter = ProgressAdapter(
+                total=max(1, total_i),
+                desc=label,
+                show_spinner=True,
+                show_postfix=True,
+                show_remaining=True,
+                emit_done=True,
+                force_animate=True,
+            )
+            self._current_stage = stage_key
+            self._adapter_done = 0
+        else:
+            self._adapter.set_total(max(1, total_i))
+
+        delta = max(0, done_i - self._adapter_done)
+        if delta > 0:
+            self._adapter.update(delta)
+        if postfix != "":
+            self._adapter.set_postfix(progress=f"{done_i}/{total_i}", detail=postfix)
+        else:
+            self._adapter.set_postfix(progress=f"{done_i}/{total_i}")
+        self._adapter_done = done_i
+
+    def close(self) -> None:
+        if self._adapter is not None:
+            self._adapter.finish()
+            self._adapter.close()
+            self._adapter = None
+        if self._rich is not None:
+            self._rich.stop()
+            self._rich = None
 
 
 def _run_scan_with_progress(
@@ -356,51 +517,27 @@ def _run_scan_with_progress(
         with CliStatus(f"{desc}...", enabled=False, timeout=0.1):
             return invoke(None)
 
-    progress: Optional[ProgressAdapter] = None
-    done_seen = 0
-    total_seen = 0
+    stage_progress = _GarfieldStageProgress(scan_desc=desc, enabled=bool(use_spinner))
 
-    def _progress_cb(done: int, total: int) -> None:
-        nonlocal progress, done_seen, total_seen
-        d = max(0, int(done))
-        t = max(d, int(total))
-        if progress is None and t > 0:
-            progress = ProgressAdapter(
-                total=t,
-                desc=desc,
-                show_spinner=True,
-                show_postfix=True,
-                show_remaining=True,
-                emit_done=True,
-                force_animate=True,
-            )
-        if progress is None:
-            done_seen = max(done_seen, d)
-            total_seen = max(total_seen, t)
+    def _progress_cb(*event) -> None:
+        if len(event) == 4:
+            stage, done, total, meta = event
+            stage_progress.update(str(stage), int(done), int(total), meta)
             return
-        delta = max(0, d - done_seen)
-        if delta > 0:
-            progress.update(delta)
-        progress.set_postfix(progress=f"{d}/{t}")
-        done_seen = max(done_seen, d)
-        total_seen = max(total_seen, t)
+        if len(event) == 2:
+            done, total = event
+            stage_progress.update("scan", int(done), int(total), None)
+            return
+        raise ValueError(f"unexpected GARFIELD progress event: {event!r}")
 
     try:
         out = invoke(_progress_cb)
     except Exception:
-        if progress is not None:
-            progress.close()
+        stage_progress.close()
         print_failure(f"{desc} ...Failed", force_color=True)
         raise
 
-    if progress is not None:
-        if total_seen > 0:
-            if done_seen < total_seen:
-                progress.update(total_seen - done_seen)
-                done_seen = total_seen
-            progress.set_postfix(progress=f"{done_seen}/{total_seen}")
-            progress.finish()
-        progress.close()
+    stage_progress.close()
     return out
 
 
@@ -502,22 +639,42 @@ def main() -> None:
         help="Optional ML engine for candidate search. If omitted, skip ML and pass all unit variants directly to beam search.",
     )
     optional_group.add_argument(
-        "-topk",
-        "--topk",
+        "-width",
+        "--width",
         type=int,
         default=None,
-        help="Top-k ML candidate features per unit. Ignored when -engine is omitted.",
+        help="Unified width controlling both ML top-k and beam width (default: 100).",
     )
     optional_group.add_argument(
         "-permutation",
         "--permutation",
-        "-premutation",
         action="store_true",
         dest="permutation",
-        help="Use permutation importance for ML candidate ranking.",
+        help=(
+            "Enable rule-level permutation null calibration on representative scan units "
+            "(up to 32 units; if fewer are available, use all of them)."
+        ),
     )
-    optional_group.add_argument("-beam-width", "--beam-width", type=int, default=None, help="Beam search width (default: 50).")
-    optional_group.add_argument("-layer", "--layer", type=int, default=None, help="Maximum beam-search rule depth (default: 5).")
+    optional_group.add_argument(
+        "-no-clean",
+        "--no-clean",
+        action="store_true",
+        dest="no_clean",
+        help="Disable structured beam pruning and fall back to the legacy unfiltered fixed-width search.",
+    )
+    optional_group.add_argument(
+        "--prior-len",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated rule-length prior alpha values for 1..5 SNP rules. "
+            "Example: --prior-len 7,3,2 sets the first three rule-length alphas. "
+            "Default follows layer depth: final layer=1 and doubles backward "
+            "(e.g. layer=4 -> 8,4,2,1)."
+        ),
+    )
+    optional_group.add_argument("--prior-not", type=float, default=None, help=argparse.SUPPRESS)
+    optional_group.add_argument("-layer", "--layer", type=int, default=None, help="Maximum beam-search rule depth (default: 4).")
     optional_group.add_argument(
         "-exh",
         "--exh",
@@ -533,15 +690,28 @@ def main() -> None:
         help="Allowed binary operators in beam search: and, or, or and_or.",
     )
     optional_group.add_argument(
+        "-bimrange",
+        "--bimrange",
+        type=str,
+        action="append",
+        default=None,
+        help=(
+            "Restrict only the final scan stage to one or more genomic bp intervals. "
+            "Repeat the flag or use comma-separated items, e.g. "
+            "--bimrange 10:110800000-111200000,10:112000000-112200000. "
+            "Null-penalty estimation and empirical-Bayes prior learning remain genome-wide."
+        ),
+    )
+    optional_group.add_argument(
         "-raw",
         "--raw",
         type=int,
         default=None,
         help=(
-            "Rule-ranking schedule. If omitted: logic-gate=or uses all raw; other logic gates "
-            "use raw for layer 1 and interaction-gain from layer 2. If set to N, rules with "
-            "layer < N use raw, and layer >= N use interaction-gain (e.g. --raw 3 keeps 1/2-site "
-            "raw and starts gain at 3-site)."
+            "Rule-ranking schedule. If omitted: all logic gates use raw for layer 1 and "
+            "interaction-gain from layer 2. If set to N, rules with layer < N use raw, "
+            "and layer >= N use interaction-gain (e.g. --raw 3 keeps 1/2-site raw and "
+            "starts gain at 3-site)."
         ),
     )
     optional_group.add_argument("--rank-score", type=str, default=None, dest="rank_score_compat", help=argparse.SUPPRESS)
@@ -552,7 +722,24 @@ def main() -> None:
         default=None,
         help="Final top-k rules after test ranking; accept integer count or fraction in (0,1].",
     )
-    optional_group.add_argument("-nsnp", "--nsnp", type=int, default=None, dest="beam_width_compat", help=argparse.SUPPRESS)
+    optional_group.add_argument(
+        "--candidate-ratio",
+        type=float,
+        default=0.10,
+        help=(
+            "Fraction of pooled beam states retained before final rule scoring "
+            "(default: 0.10). Use 1.0 to keep all pooled candidates."
+        ),
+    )
+    optional_group.add_argument(
+        "--top-rules",
+        type=int,
+        default=1,
+        help=(
+            "Number of final rules kept per scan unit after ranking (default: 1). "
+            "Use 0 to disable the per-unit cap."
+        ),
+    )
     optional_group.add_argument("-m", "--max-pick", type=int, default=None, dest="layer_compat", help=argparse.SUPPRESS)
     optional_group.add_argument(
         "--feature-source",
@@ -654,18 +841,15 @@ def main() -> None:
         parser.error("-cv/--fold must be >= 2")
     args.fold_runtime = int(args.fold) if args.fold is not None else 0
 
-    args.beam_width = (
-        int(args.beam_width) if args.beam_width is not None
-        else int(args.beam_width_compat) if args.beam_width_compat is not None
-        else 50
-    )
-    if int(args.beam_width) <= 0:
-        parser.error("-beam-width must be > 0")
+    args.width = int(args.width) if args.width is not None else 100
+    if int(args.width) <= 0:
+        parser.error("-width/--width must be > 0")
+    args.beam_width = int(args.width)
 
     args.layer = (
         int(args.layer) if args.layer is not None
         else int(args.layer_compat) if args.layer_compat is not None
-        else 5
+        else 4
     )
     if int(args.layer) <= 0:
         parser.error("-layer must be > 0")
@@ -676,17 +860,30 @@ def main() -> None:
     args.exh = max(1, int(args.exh))
     if args.raw is not None and int(args.raw) < 1:
         parser.error("-raw/--raw must be >= 1")
+    try:
+        args.prior_len_alpha = _parse_prior_len_alpha_spec(args.prior_len, layer=int(args.layer))
+    except ValueError as exc:
+        parser.error(str(exc))
+    if args.prior_not is not None:
+        try:
+            if not np.isfinite(float(args.prior_not)):
+                parser.error("--prior-not must be finite when provided")
+        except Exception:
+            parser.error("--prior-not must be finite when provided")
 
-    if args.engine is None:
-        if args.topk is None:
-            args.topk = 0
-        elif int(args.topk) < 0:
-            parser.error("-topk/--topk must be >= 0 when -engine is omitted")
-    else:
-        if args.topk is None:
-            args.topk = min(100, int(args.beam_width))
-        if int(args.topk) <= 0:
-            parser.error("-topk/--topk must be > 0")
+    args.topk = int(args.width) if args.engine is not None else 0
+    try:
+        args.candidate_ratio = float(args.candidate_ratio)
+    except Exception:
+        parser.error("--candidate-ratio must be a float within (0, 1].")
+    if (not np.isfinite(args.candidate_ratio)) or args.candidate_ratio <= 0.0 or args.candidate_ratio > 1.0:
+        parser.error("--candidate-ratio must be within (0, 1].")
+    try:
+        args.top_rules = int(args.top_rules)
+    except Exception:
+        parser.error("--top-rules must be an integer >= 0.")
+    if int(args.top_rules) < 0:
+        parser.error("--top-rules must be >= 0.")
 
     if args.beam_topk is None:
         if args.beam_topk_compat is not None:
@@ -806,11 +1003,16 @@ def main() -> None:
         ("Het max", float(args.het)),
         ("Extension", int(args.extension)),
         ("Slide", int(args.step)),
+        ("Bimrange", None if not args.bimrange else ",".join(str(x) for x in args.bimrange)),
         ("Split", f"{int(args.fold)}-fold stratified holdout" if args.split_requested else "none (full data)"),
         ("Engine", "none (skip ML)" if ml_skipped else args.engine),
         ("Permutation", bool(args.permutation)),
-        ("ML top-k", "all variants (skip ML)" if ml_skipped else int(args.topk)),
-        ("Beam width", int(args.beam_width)),
+        ("Structured pruning", not bool(args.no_clean)),
+        ("Prior len", "[" + ",".join(f"{x:g}" for x in args.prior_len_alpha) + "]"),
+        ("NOT control", "null penalty only"),
+        ("Width", int(args.width)),
+        ("Candidate ratio", float(args.candidate_ratio)),
+        ("Top rules/unit", int(args.top_rules)),
         ("Layer", int(args.layer)),
         ("Exhaustive depth", int(args.exh)),
         ("Logic gate", args.logic_gate),
@@ -924,6 +1126,7 @@ def main() -> None:
     used_trait_labels: dict[str, int] = {}
     saved = 0
     summary_rows: list[dict[str, object]] = []
+    garfield_manifest_traits: list[dict[str, object]] = []
     fold_from_val = int(args.fold_runtime)
     implied_val_frac = (1.0 / float(fold_from_val)) if fold_from_val >= 2 else None
     if (
@@ -974,10 +1177,10 @@ def main() -> None:
                 dtype=np.float64,
             )
         scan_desc = {
-            "window": f"Scanning windows",
-            "gene": f"Scanning genes",
-            "genepair": f"Scanning gene pairs",
-            "geneset": f"Scanning gene sets",
+            "window": "Scan Windows",
+            "gene": "Scan Genes",
+            "genepair": "Scan Gene Pairs",
+            "geneset": "Scan Gene Sets",
         }.get(str(args.scan_mode), f"Rust GARFIELD search for '{trait_name}'")
         logic_unit_kind = _scan_mode_to_logic_unit_kind(args.scan_mode)
         rust_groups = group_intervals if args.scan_mode != "window" else None
@@ -998,9 +1201,10 @@ def main() -> None:
                 group_names=rust_group_names,
                 extension=int(args.extension),
                 step=int(args.step),
+                scan_bimranges=args.bimrange,
                 bin_mode=feature_source,
                 ml_method=str(engine_runtime).lower(),
-                ml_importance="permutation" if bool(args.permutation) else "imp",
+                ml_importance="imp",
                 ml_top_k=int(args.topk),
                 ml_top_frac=0.0,
                 permutation_repeats=5,
@@ -1018,7 +1222,7 @@ def main() -> None:
                 beam_width=int(args.beam_width),
                 logic_gate=str(args.logic_gate).lower(),
                 rank_score=str(args.rank_score),
-                candidate_keep_ratio=0.10,
+                candidate_keep_ratio=float(args.candidate_ratio),
                 maf_threshold=float(args.maf),
                 max_missing_rate=float(args.geno),
                 het_threshold=float(args.het),
@@ -1034,76 +1238,129 @@ def main() -> None:
                 require_lapack=False,
                 out_prefix=trait_logic_prefix,
                 simbench_path=args.simbench,
-                top_rules_per_unit=1,
+                top_rules_per_unit=int(args.top_rules),
                 max_output_rules=int(args.beam_topk_count or 0),
                 max_output_ratio=float(args.beam_topk_ratio or 0.0),
+                rule_permutation=bool(args.permutation),
+                prior_len=list(args.prior_len_alpha),
+                no_clean=bool(args.no_clean),
                 progress_callback=progress_cb,
                 progress_every=0,
             ),
         )
 
+        pseudo_path = f"{trait_logic_prefix}.pseudo"
+        posterior_json_path = result.get("posterior_json")
+        run_config_path = f"{trait_outprefix}.garfield.run_config.json"
         n_rules = int(result.get("n_rules", 0))
         if n_rules <= 0:
+            _remove_file_if_exists(pseudo_path)
+            _remove_file_if_exists(run_config_path)
+            _remove_file_if_exists(posterior_json_path)
             logger.warning(f"No GARFIELD rules survived Rust search for trait '{trait_name}', skipped.")
             continue
 
-        _write_logic_pseudo_map(f"{trait_logic_prefix}.pseudo", result)
+        _remove_file_if_exists(pseudo_path)
         split_applied = bool(result.get("split_applied", False))
-        with open(f"{trait_outprefix}.garfield.run_config.json", "w", encoding="utf-8") as fw:
-            json.dump(
-                {
-                    "route": "rust-bed",
-                    "split_applied": split_applied,
-                    "scan_mode": args.scan_mode,
-                    "unit_kind": logic_unit_kind,
-                    "response": response_mode,
-                    "engine": args.engine,
-                    "engine_runtime": engine_runtime,
-                    "ml_skipped": ml_skipped,
-                    "permutation": bool(args.permutation),
-                    "layer": int(args.layer),
-                    "exhaustive_depth": int(args.exh),
-                    "beam_width": int(args.beam_width),
-                    "raw_requested": (None if args.raw is None else int(args.raw)),
-                    "rank_schedule_source": rank_schedule_source,
-                    "gain_start_layer_runtime": gain_start_layer_runtime,
-                    "rank_schedule_runtime": rank_schedule_runtime,
-                    "rank_score": rank_score_runtime,
-                    "rank_score_runtime": rank_score_runtime,
-                    "ml_top_k": (None if ml_skipped else int(args.topk)),
-                    "extension": int(args.extension),
-                    "step": int(args.step),
-                    "logic_gate_requested": args.logic_gate,
-                    "logic_gate_runtime": logic_gate_runtime,
-                    "beam_topk": str(args.beam_topk),
-                    "beam_topk_count_runtime": int(result.get("n_rules", 0)),
-                    "beam_topk_ratio_runtime": (
-                        float(args.beam_topk_ratio) if args.beam_topk_ratio is not None else None
-                    ),
-                    "val_frac_requested": (
-                        float(args.holdout_frac_requested)
-                        if args.holdout_frac_requested is not None
-                        else None
-                    ),
-                    "fold_effective": int(fold_from_val) if split_applied else None,
-                    "holdout_frac_effective": (
-                        float(implied_val_frac) if split_applied and implied_val_frac is not None else None
-                    ),
-                    "ranking_dataset": "test" if split_applied else "full",
-                    "feature_source": feature_source,
-                    "grm_path": args.grm,
-                    "grm_id_path": resolved_grm_id,
-                    "maf": float(args.maf),
-                    "geno": float(args.geno),
-                    "het": float(args.het),
-                    "simbench_path": args.simbench,
-                    "simbench_rows": int(result.get("n_simbench", 0)),
-                    "seed": trait_seed,
-                },
-                fw,
-                indent=2,
-                ensure_ascii=False,
-            )
+        prior_payload, posterior_payload = _split_structure_prior_payload(
+            _load_json_if_exists(posterior_json_path)
+        )
+        _remove_file_if_exists(run_config_path)
+        _remove_file_if_exists(posterior_json_path)
+        trait_manifest = {
+            "trait": trait_name,
+            "trait_output_prefix": trait_outprefix,
+            "garfield_prefix": trait_logic_prefix,
+            "route": "rust-bed",
+            "split_applied": split_applied,
+            "scan_mode": args.scan_mode,
+            "unit_kind": logic_unit_kind,
+            "response": response_mode,
+            "engine": args.engine,
+            "engine_runtime": engine_runtime,
+            "ml_skipped": ml_skipped,
+            "permutation": bool(args.permutation),
+            "rule_permutation_active": bool(result.get("rule_permutation_active", False)),
+            "null_chunk_bp": int(result.get("null_chunk_bp", 0)),
+            "null_chunk_min_snps": int(result.get("null_chunk_min_snps", 0)),
+            "null_chunk_target": int(result.get("null_chunk_target", 0)),
+            "null_chunk_valid_total": int(result.get("null_chunk_valid_total", 0)),
+            "null_chunk_selected": int(result.get("null_chunk_selected", 0)),
+            "representative_units_target": int(result.get("representative_units_target", 0)),
+            "representative_units_used": int(result.get("representative_units_used", 0)),
+            "permutation_null_repeats": int(result.get("permutation_null_repeats", 0)),
+            "permutation_bootstrap_repeats": int(
+                result.get("permutation_bootstrap_repeats", 0)
+            ),
+            "no_clean_requested": bool(args.no_clean),
+            "structured_pruning": not bool(args.no_clean),
+            "width": int(args.width),
+            "candidate_keep_ratio": float(args.candidate_ratio),
+            "top_rules_per_unit": int(args.top_rules),
+            "layer": int(args.layer),
+            "exhaustive_depth": int(args.exh),
+            "beam_width": int(args.beam_width),
+            "raw_requested": (None if args.raw is None else int(args.raw)),
+            "prior_len_requested": list(args.prior_len_alpha),
+            "not_control": "null_penalty_only",
+            "prior_not_ignored": (
+                None if args.prior_not is None else float(args.prior_not)
+            ),
+            "rank_schedule_source": rank_schedule_source,
+            "gain_start_layer_runtime": gain_start_layer_runtime,
+            "rank_schedule_runtime": rank_schedule_runtime,
+            "rank_score": rank_score_runtime,
+            "rank_score_runtime": rank_score_runtime,
+            "ml_top_k": (None if ml_skipped else int(args.topk)),
+            "extension": int(args.extension),
+            "step": int(args.step),
+            "bimrange": (list(args.bimrange) if args.bimrange else None),
+            "logic_gate_requested": args.logic_gate,
+            "logic_gate_runtime": logic_gate_runtime,
+            "beam_topk": str(args.beam_topk),
+            "beam_topk_count_runtime": int(result.get("n_rules", 0)),
+            "beam_topk_ratio_runtime": (
+                float(args.beam_topk_ratio) if args.beam_topk_ratio is not None else None
+            ),
+            "val_frac_requested": (
+                float(args.holdout_frac_requested)
+                if args.holdout_frac_requested is not None
+                else None
+            ),
+            "fold_effective": int(fold_from_val) if split_applied else None,
+            "holdout_frac_effective": (
+                float(implied_val_frac) if split_applied and implied_val_frac is not None else None
+            ),
+            "ranking_dataset": "test" if split_applied else "full",
+            "feature_source": feature_source,
+            "grm_path": args.grm,
+            "grm_id_path": resolved_grm_id,
+            "maf": float(args.maf),
+            "geno": float(args.geno),
+            "het": float(args.het),
+            "simbench_path": args.simbench,
+            "simbench_rows": int(result.get("n_simbench", 0)),
+            "seed": trait_seed,
+            "n_samples": len(common_ids),
+            "n_train": int(result.get("n_train", 0)),
+            "n_test": int(result.get("n_test", 0)),
+            "n_rules": int(result.get("n_rules", 0)),
+            "units_total": int(result.get("units_total", 0)),
+            "units_scanned": int(result.get("units_scanned", 0)),
+            "train_pve": float(result.get("train_pve", float("nan"))),
+            "test_pve": float(result.get("test_pve", float("nan"))),
+            "train_sigma_g2": float(result.get("train_sigma_g2", float("nan"))),
+            "train_sigma_e2": float(result.get("train_sigma_e2", float("nan"))),
+            "test_sigma_g2": float(result.get("test_sigma_g2", float("nan"))),
+            "test_sigma_e2": float(result.get("test_sigma_e2", float("nan"))),
+            "outputs": {
+                "rules_tsv": result.get("rules_tsv"),
+                "posterior_tsv": result.get("posterior_tsv"),
+            },
+            "prior": prior_payload,
+            "posterior": posterior_payload,
+        }
+        garfield_manifest_traits.append(trait_manifest)
         logger.info(
             f"GARFIELD null-model PVE for '{trait_name}': "
             f"train={float(result.get('train_pve', float('nan'))):.4g}, "
@@ -1141,15 +1398,55 @@ def main() -> None:
     if saved == 0:
         raise ValueError("No GARFIELD outputs were generated for the selected phenotype columns.")
 
-    summary_path = f"{outprefix}.garfield.summary.tsv"
-    with open(summary_path, "w", encoding="utf-8") as fw:
-        fw.write("trait\tn_samples\tn_train\tn_holdout\tholdout_kind\tbest_holdout_score\troute\n")
-        for row in summary_rows:
-            fw.write(
-                f"{row['trait']}\t{int(row['n_samples'])}\t{int(row['n_train'])}\t"
-                f"{int(row['n_holdout'])}\t{row['holdout_kind']}\t"
-                f"{float(row['best_holdout_score']):.12g}\t{row['route']}\n"
-            )
+    aggregate_json_path = f"{outprefix}.garfield.json"
+    with open(aggregate_json_path, "w", encoding="utf-8") as fw:
+        json.dump(
+            {
+                "format": "janusx.garfield.summary.v1",
+                "log_file": log_path,
+                "output_prefix": outprefix,
+                "genotype_input": gfile,
+                "input_kind": input_kind,
+                "execution_route": "direct Rust BED pipeline",
+                "encoding": feature_source,
+                "phenotype_file": args.pheno,
+                "grm_path": args.grm,
+                "grm_id_path": resolved_grm_id,
+                "scan_mode": args.scan_mode,
+                "logic_gate_runtime": logic_gate_runtime,
+                "rank_score_runtime": rank_score_runtime,
+                "rank_schedule_runtime": rank_schedule_runtime,
+                "rank_schedule_source": rank_schedule_source,
+                "split_requested": bool(args.split_requested),
+                "permutation": bool(args.permutation),
+                "null_chunk_bp": int(args.extension) * 2,
+                "null_chunk_target": 150 if bool(args.permutation) else 0,
+                "null_chunk_min_snps": 50 if bool(args.permutation) else 0,
+                "bimrange": (list(args.bimrange) if args.bimrange else None),
+                "candidate_keep_ratio": float(args.candidate_ratio),
+                "top_rules_per_unit": int(args.top_rules),
+                "prior_len_requested": list(args.prior_len_alpha),
+                "not_control": "null_penalty_only",
+                "prior_not_ignored": (
+                    None if args.prior_not is None else float(args.prior_not)
+                ),
+                "fold_runtime": int(fold_from_val),
+                "holdout_frac_requested": (
+                    float(args.holdout_frac_requested)
+                    if args.holdout_frac_requested is not None
+                    else None
+                ),
+                "thread": int(args.thread),
+                "seed": int(args.seed),
+                "summary_rows": summary_rows,
+                "traits": garfield_manifest_traits,
+            },
+            fw,
+            indent=2,
+            ensure_ascii=False,
+        )
+    logger.info(f"GARFIELD JSON: {format_path_for_display(aggregate_json_path)}")
+    _emit_garfield_summary_to_log(logger, summary_rows)
 
     lt = time.localtime()
     log_success(

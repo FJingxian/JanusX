@@ -118,6 +118,7 @@ pub struct BeamSearchParams {
     pub max_pick: usize,
     pub beam_width: usize,
     pub min_gain: f64,
+    pub min_parent_abs_gain: f64,
     pub enable_diversity_pruning: bool,
     pub candidate_keep_ratio: f64,
     pub lambda_len: f64,
@@ -137,6 +138,7 @@ impl Default for BeamSearchParams {
             max_pick: 3,
             beam_width: 5,
             min_gain: 0.0,
+            min_parent_abs_gain: 0.0,
             enable_diversity_pruning: false,
             candidate_keep_ratio: 0.10,
             lambda_len: 0.0,
@@ -254,9 +256,7 @@ fn rule_is_pure_or(rule: &BeamRule) -> bool {
 
 #[inline]
 fn gate_prefers_raw_score(gate: GateBucket, rule_len: usize, params: &BeamSearchParams) -> bool {
-    rule_len >= 2
-        && matches!(gate, GateBucket::Or)
-        && rank_mode_uses_gain(rule_len, params)
+    rule_len >= 2 && matches!(gate, GateBucket::Or) && rank_mode_uses_gain(rule_len, params)
 }
 
 #[inline]
@@ -268,7 +268,8 @@ fn rank_rule_score_components_with_gate(
     max_singleton_raw: f64,
     params: &BeamSearchParams,
 ) -> f64 {
-    let use_gain = rank_mode_uses_gain(rule_len, params) && !gate_prefers_raw_score(gate, rule_len, params);
+    let use_gain =
+        rank_mode_uses_gain(rule_len, params) && !gate_prefers_raw_score(gate, rule_len, params);
     let base = if use_gain {
         raw_score - max_singleton_raw
     } else {
@@ -336,8 +337,7 @@ pub fn rank_rule_score_components_with_bucket(
         raw_score,
         max_singleton_raw,
         params,
-    )
-        - null_penalty_for_bucket(bucket, params, is_train)
+    ) - null_penalty_for_bucket(bucket, params, is_train)
 }
 
 #[inline]
@@ -530,10 +530,18 @@ fn keep_child_after_parent_abs_improvement_pruning(
     child_abs_score: f64,
     params: &BeamSearchParams,
 ) -> bool {
-    if !use_parent_delta(child_rule_len, params) {
+    if child_rule_len != 2 {
         return true;
     }
-    score_strictly_improves(child_abs_score, parent_abs_score)
+    if !(params.min_parent_abs_gain.is_finite() && params.min_parent_abs_gain > 0.0) {
+        return true;
+    }
+    let child = score_key(child_abs_score);
+    let parent = score_key(parent_abs_score);
+    child.is_finite()
+        && parent.is_finite()
+        && (child - parent) > params.min_parent_abs_gain
+        && !state_scores_tied(child, parent)
 }
 
 #[inline]
@@ -1170,6 +1178,14 @@ fn expand_beam_once(
                                 Some(node.train_abs_score),
                                 params,
                             );
+                            if !keep_child_after_parent_abs_improvement_pruning(
+                                node.train_abs_score,
+                                rule.len(),
+                                train_abs_score,
+                                params,
+                            ) {
+                                continue;
+                            }
                             if !keep_state_after_min_gain_pruning(rule.len(), train_score, params) {
                                 continue;
                             }
@@ -1243,6 +1259,14 @@ fn expand_beam_once(
                             Some(node.train_abs_score),
                             params,
                         );
+                        if !keep_child_after_parent_abs_improvement_pruning(
+                            node.train_abs_score,
+                            rule.len(),
+                            train_abs_score,
+                            params,
+                        ) {
+                            continue;
+                        }
                         if !keep_state_after_min_gain_pruning(rule.len(), train_score, params) {
                             continue;
                         }
@@ -1342,6 +1366,14 @@ fn expand_states_exhaustive(
                         Some(node.train_abs_score),
                         params,
                     );
+                    if !keep_child_after_parent_abs_improvement_pruning(
+                        node.train_abs_score,
+                        rule.len(),
+                        train_abs_score,
+                        params,
+                    ) {
+                        continue;
+                    }
                     if !keep_state_after_min_gain_pruning(rule.len(), train_score, params) {
                         continue;
                     }
@@ -2052,6 +2084,37 @@ mod tests {
         assert!(!keep_child_after_parent_gain_pruning(4, 0.0, &params));
         assert!(!keep_child_after_parent_gain_pruning(4, -0.001, &params));
         assert!(keep_child_after_parent_gain_pruning(4, 0.01, &params));
+    }
+
+    #[test]
+    fn test_parent_abs_improvement_pruning_is_disabled_by_default() {
+        let params = BeamSearchParams::default();
+        assert!(keep_child_after_parent_abs_improvement_pruning(
+            1.0, 2, 1.0, &params
+        ));
+        assert!(keep_child_after_parent_abs_improvement_pruning(
+            1.0, 2, 0.99, &params
+        ));
+    }
+
+    #[test]
+    fn test_parent_abs_improvement_pruning_requires_margin_when_enabled() {
+        let params = BeamSearchParams {
+            min_parent_abs_gain: 0.01,
+            ..BeamSearchParams::default()
+        };
+        assert!(!keep_child_after_parent_abs_improvement_pruning(
+            1.0, 2, 1.005, &params
+        ));
+        assert!(!keep_child_after_parent_abs_improvement_pruning(
+            1.0, 2, 1.01, &params
+        ));
+        assert!(keep_child_after_parent_abs_improvement_pruning(
+            1.0, 2, 1.011, &params
+        ));
+        assert!(keep_child_after_parent_abs_improvement_pruning(
+            1.0, 3, 1.001, &params
+        ));
     }
 
     #[test]

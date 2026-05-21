@@ -1566,6 +1566,17 @@ fn surrogate_delta_small_enough(child_score: f64, parent_score: f64, max_gain: f
     child.is_finite() && parent.is_finite() && (child - parent) <= max_gain
 }
 
+fn singleton_literal_map(rule: &BeamRule) -> Vec<(usize, usize)> {
+    let mut out = Vec::<(usize, usize)>::with_capacity(rule.len());
+    out.push((rule.first.row_index, rule.first.group_id));
+    for (_, lit) in rule.rest.iter() {
+        if !out.iter().any(|(row_idx, _)| *row_idx == lit.row_index) {
+            out.push((lit.row_index, lit.group_id));
+        }
+    }
+    out
+}
+
 #[allow(clippy::too_many_arguments)]
 fn collapse_surrogate_candidate(
     state: &BeamState,
@@ -1683,6 +1694,111 @@ fn collapse_surrogate_candidate(
             current_bits_test = parent_bits_test;
             if current_rule.len() <= 1 {
                 break;
+            }
+        }
+        if current_rule.len() > 1 {
+            let mut best_singleton: Option<(BeamRuleCandidate, f64)> = None;
+            for (row_index, group_id) in singleton_literal_map(&current_rule).into_iter() {
+                let singleton_rule = BeamRule {
+                    first: BeamLiteral {
+                        row_index,
+                        group_id,
+                        negated: false,
+                    },
+                    rest: Vec::new(),
+                };
+                let singleton_bits_test = materialize_rule_bits(
+                    &singleton_rule,
+                    bits_test,
+                    row_words_test,
+                    n_rows,
+                    n_test,
+                )?;
+                let diff_frac = bit_hamming_fraction(
+                    current_bits_test.as_slice(),
+                    singleton_bits_test.as_slice(),
+                    n_test,
+                );
+                let orient_diff = diff_frac.min(1.0 - diff_frac);
+                if orient_diff > params.surrogate_hamming_frac_max {
+                    continue;
+                }
+                let singleton_test = evaluate_rule_continuous(
+                    &singleton_rule,
+                    y_test,
+                    bits_test,
+                    row_words_test,
+                    n_rows,
+                    n_test,
+                    params.lambda_len,
+                    params.lambda_not,
+                )?;
+                let singleton_test_score = final_rule_score_for_eval(
+                    &singleton_rule,
+                    &singleton_test,
+                    y_test,
+                    bits_test,
+                    row_words_test,
+                    n_rows,
+                    n_test,
+                    literal_scores,
+                    params,
+                    false,
+                )?;
+                if !surrogate_delta_small_enough(
+                    current_test_score,
+                    singleton_test_score,
+                    params.surrogate_test_gain_max,
+                ) {
+                    continue;
+                }
+                let singleton_train = evaluate_rule_continuous(
+                    &singleton_rule,
+                    y_train,
+                    bits_train,
+                    row_words_train,
+                    n_rows,
+                    n_train,
+                    params.lambda_len,
+                    params.lambda_not,
+                )?;
+                let singleton_train_score = final_rule_score_for_eval(
+                    &singleton_rule,
+                    &singleton_train,
+                    y_train,
+                    bits_train,
+                    row_words_train,
+                    n_rows,
+                    n_train,
+                    literal_scores,
+                    params,
+                    true,
+                )?;
+                let singleton_cand = BeamRuleCandidate {
+                    rule: singleton_rule,
+                    train_score: singleton_train_score,
+                    test_score: singleton_test_score,
+                    train: singleton_train,
+                    test: singleton_test,
+                };
+                match best_singleton.as_mut() {
+                    Some((best_cand, best_diff)) => {
+                        if cmp_candidate(&singleton_cand, best_cand) == std::cmp::Ordering::Less
+                            || (cmp_candidate(&singleton_cand, best_cand)
+                                == std::cmp::Ordering::Equal
+                                && orient_diff < *best_diff)
+                        {
+                            *best_cand = singleton_cand;
+                            *best_diff = orient_diff;
+                        }
+                    }
+                    None => {
+                        best_singleton = Some((singleton_cand, orient_diff));
+                    }
+                }
+            }
+            if let Some((singleton_cand, _)) = best_singleton {
+                return Ok(singleton_cand);
             }
         }
     }
@@ -2647,5 +2763,98 @@ mod tests {
         )
         .unwrap();
         assert_eq!(collapsed.rule.len(), 2);
+    }
+
+    #[test]
+    fn test_surrogate_or_not_proxy_collapses_to_positive_singleton() {
+        let rows = vec![vec![0, 0, 0, 0, 1, 0, 0, 0], vec![1, 1, 1, 1, 0, 0, 0, 0]];
+        let y = vec![-3.0, -3.1, -2.9, -3.2, 2.8, 2.9, 3.1, 3.0];
+        let (bits, row_words) = pack_rows(&rows, y.len());
+        let params = BeamSearchParams {
+            logic_gate_mode: BeamLogicGateMode::OrOnly,
+            rank_mode: BeamRankMode::Raw,
+            surrogate_test_gain_max: 0.10,
+            surrogate_hamming_frac_max: 0.20,
+            ..BeamSearchParams::default()
+        };
+        let literal_scores = precompute_literal_singleton_scores(
+            &y,
+            &bits,
+            row_words,
+            words_for_samples(y.len()),
+            y.len(),
+            &y,
+            &bits,
+            row_words,
+            words_for_samples(y.len()),
+            y.len(),
+            rows.len(),
+        );
+        let child_rule = BeamRule {
+            first: BeamLiteral {
+                row_index: 0,
+                group_id: 0,
+                negated: false,
+            },
+            rest: vec![(
+                BeamBinaryOp::Or,
+                BeamLiteral {
+                    row_index: 1,
+                    group_id: 1,
+                    negated: true,
+                },
+            )],
+        };
+        let child_train = evaluate_rule_continuous(
+            &child_rule,
+            &y,
+            &bits,
+            row_words,
+            rows.len(),
+            y.len(),
+            0.0,
+            0.0,
+        )
+        .unwrap();
+        let max_singleton_train_raw =
+            rule_max_singleton_raw(&child_rule, literal_scores.as_slice(), true);
+        let max_singleton_test_raw =
+            rule_max_singleton_raw(&child_rule, literal_scores.as_slice(), false);
+        let child_bits =
+            materialize_rule_bits(&child_rule, &bits, row_words, rows.len(), y.len()).unwrap();
+        let (child_abs, child_score) = train_scores_for_rule(
+            &child_rule,
+            child_train,
+            max_singleton_train_raw,
+            Some(0.0),
+            &params,
+        );
+        let state = BeamState {
+            rule: child_rule,
+            combined_train: child_bits,
+            train: child_train,
+            train_abs_score: child_abs,
+            train_score: child_score,
+            max_singleton_train_raw,
+            max_singleton_test_raw,
+        };
+        let collapsed = collapse_surrogate_candidate(
+            &state,
+            &y,
+            &bits,
+            row_words,
+            rows.len(),
+            y.len(),
+            &y,
+            &bits,
+            row_words,
+            y.len(),
+            literal_scores.as_slice(),
+            &params,
+        )
+        .unwrap();
+        assert_eq!(collapsed.rule.len(), 1);
+        assert_eq!(collapsed.rule.first.row_index, 1);
+        assert!(!collapsed.rule.first.negated);
     }
 }

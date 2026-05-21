@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import site
 import sys
 import tempfile
 import time
@@ -8,17 +9,118 @@ from pathlib import Path
 
 
 _DLL_DIR_HANDLES: list[object] = []
+_NATIVE_EXT_PATTERNS = ("janusx*.so", "janusx*.pyd")
+
+
+def _package_dir_has_native_extension(pkg_dir: Path) -> bool:
+    try:
+        if not pkg_dir.is_dir():
+            return False
+    except Exception:
+        return False
+    for pattern in _NATIVE_EXT_PATTERNS:
+        try:
+            for hit in pkg_dir.glob(pattern):
+                try:
+                    if hit.is_file():
+                        return True
+                except Exception:
+                    continue
+        except Exception:
+            continue
+    return False
+
+
+def _iter_janusx_package_dirs() -> list[Path]:
+    pkg_dir = Path(__file__).resolve().parent
+    pkg_name = pkg_dir.name
+    roots: list[str] = []
+    roots.extend(str(x) for x in sys.path)
+    try:
+        roots.extend(str(x) for x in site.getsitepackages())
+    except Exception:
+        pass
+    try:
+        user_site = site.getusersitepackages()
+        if isinstance(user_site, str):
+            roots.append(user_site)
+        else:
+            roots.extend(str(x) for x in user_site)
+    except Exception:
+        pass
+
+    out: list[Path] = []
+    seen: set[str] = set()
+    for raw in roots:
+        text = str(raw).strip()
+        if text == "":
+            text = os.getcwd()
+        root = Path(text)
+        candidates = [root / pkg_name]
+        try:
+            if root.name == pkg_name and root.is_dir():
+                candidates.insert(0, root)
+        except Exception:
+            pass
+        for cand in candidates:
+            try:
+                resolved = cand.resolve()
+            except Exception:
+                resolved = cand
+            key = str(resolved)
+            if key in seen or resolved == pkg_dir:
+                continue
+            seen.add(key)
+            try:
+                if resolved.is_dir():
+                    out.append(resolved)
+            except Exception:
+                continue
+    return out
+
+
+def _extend_package_path_for_native_extension() -> None:
+    pkg_dir = Path(__file__).resolve().parent
+    if _package_dir_has_native_extension(pkg_dir):
+        return
+    pkg_path = globals().get("__path__")
+    if pkg_path is None:
+        return
+    for cand in _iter_janusx_package_dirs():
+        if not _package_dir_has_native_extension(cand):
+            continue
+        cand_s = str(cand)
+        try:
+            present = {str(x) for x in pkg_path}
+        except Exception:
+            present = set()
+        if cand_s not in present:
+            pkg_path.append(cand_s)
+        return
+
+
+_extend_package_path_for_native_extension()
 
 
 def _init_windows_dll_search_path() -> None:
     if os.name != "nt" or not hasattr(os, "add_dll_directory"):
         return
-    pkg_dir = Path(__file__).resolve().parent
-    cands = [
-        pkg_dir,
-        pkg_dir / ".libs",
-        pkg_dir.parent / "janusx.libs",
-    ]
+    pkg_dirs: list[Path] = []
+    for raw in globals().get("__path__", [Path(__file__).resolve().parent]):
+        try:
+            pkg_dirs.append(Path(str(raw)))
+        except Exception:
+            continue
+    if len(pkg_dirs) == 0:
+        pkg_dirs = [Path(__file__).resolve().parent]
+
+    cands: list[Path] = []
+    for pkg_dir in pkg_dirs:
+        cands.extend([
+            pkg_dir,
+            pkg_dir / ".libs",
+            pkg_dir.parent / "janusx.libs",
+        ])
 
     # Optional external hints (useful for local editable/dev runs).
     for var in ("OPENBLAS_BIN_DIR", "OPENBLAS_LIB_DIR", "LIBRARY_BIN", "LIBRARY_LIB"):
@@ -61,11 +163,19 @@ def _init_macos_openblas_path() -> None:
     if explicit:
         return
 
-    pkg_dir = Path(__file__).resolve().parent
+    pkg_dirs: list[Path] = []
+    for raw in globals().get("__path__", [Path(__file__).resolve().parent]):
+        try:
+            pkg_dirs.append(Path(str(raw)))
+        except Exception:
+            continue
+    if len(pkg_dirs) == 0:
+        pkg_dirs = [Path(__file__).resolve().parent]
     cands: list[Path] = []
-    cands.extend(sorted((pkg_dir / ".dylibs").glob("libopenblas*.dylib")))
-    cands.extend(sorted((pkg_dir.parent / "janusx.libs").glob("libopenblas*.dylib")))
-    cands.extend(sorted((pkg_dir / ".libs").glob("libopenblas*.dylib")))
+    for pkg_dir in pkg_dirs:
+        cands.extend(sorted((pkg_dir / ".dylibs").glob("libopenblas*.dylib")))
+        cands.extend(sorted((pkg_dir.parent / "janusx.libs").glob("libopenblas*.dylib")))
+        cands.extend(sorted((pkg_dir / ".libs").glob("libopenblas*.dylib")))
     conda_prefix = str(os.environ.get("CONDA_PREFIX", "")).strip()
     if conda_prefix:
         cands.extend(sorted((Path(conda_prefix) / "lib").glob("libopenblas*.dylib")))

@@ -179,8 +179,30 @@ pub(crate) fn chi2_stat_df1_from_sf(p: f64) -> f64 {
     if p >= 1.0 {
         return 0.0;
     }
-    let z = normal_ppf_acklam(1.0 - 0.5 * p);
+    // For very small p, `1.0 - 0.5 * p` rounds to exactly 1.0 in f64,
+    // which would turn the inverse-normal call into +inf/NaN. Use the
+    // equivalent lower-tail form instead.
+    let tail = 0.5 * p;
+    if tail <= 0.0 {
+        return f64::INFINITY;
+    }
+    let z = normal_ppf_acklam(tail);
     if z.is_finite() {
+        z * z
+    } else {
+        f64::NAN
+    }
+}
+
+#[inline]
+pub(crate) fn chisq_from_beta_se_and_optional_plrt(beta: f64, se: f64, plrt: Option<f64>) -> f64 {
+    if let Some(p) = plrt {
+        if p.is_finite() {
+            return chi2_stat_df1_from_sf(p);
+        }
+    }
+    if beta.is_finite() && se.is_finite() && se > 0.0 {
+        let z = beta / se;
         z * z
     } else {
         f64::NAN
@@ -255,4 +277,23 @@ pub(crate) fn cholesky_logdet(l: &[f64], dim: usize) -> f64 {
         s += l[i * dim + i].ln();
     }
     2.0 * s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::chi2_stat_df1_from_sf;
+
+    #[test]
+    fn chi2_df1_inverse_surv_handles_tiny_p_values() {
+        let stat = chi2_stat_df1_from_sf(1.8885e-19);
+        assert!(stat.is_finite());
+        assert!((stat - 81.8).abs() < 0.5);
+    }
+
+    #[test]
+    fn chi2_df1_inverse_surv_handles_nan_and_bounds() {
+        assert!(chi2_stat_df1_from_sf(f64::NAN).is_nan());
+        assert_eq!(chi2_stat_df1_from_sf(0.0), f64::INFINITY);
+        assert_eq!(chi2_stat_df1_from_sf(1.0), 0.0);
+    }
 }

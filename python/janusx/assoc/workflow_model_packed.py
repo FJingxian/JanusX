@@ -23,6 +23,7 @@ from .workflow import (
     CliStatus,
     LMM,
     _ProgressAdapter,
+    _augment_gwas_tsv_with_snp_names,
     _align_pheno_to_sample_order,
     _as_plink_prefix,
     _display_path,
@@ -792,6 +793,7 @@ def run_fastlmm_packed_fullrank(
         except Exception:
             pve = None
 
+        _augment_gwas_tsv_with_snp_names(out_tsv, prefix, logger=logger)
         saved_paths.append(str(out_tsv))
         viz_secs = 0.0
         if plot:
@@ -1129,6 +1131,7 @@ def run_lm_packed_fullrank(
                 gwas_pbar.close(show_done=False)
 
         gwas_secs = max(time.monotonic() - gwas_t0, 0.0)
+        _augment_gwas_tsv_with_snp_names(out_tsv, prefix, logger=logger)
         saved_paths.append(str(out_tsv))
         viz_secs = 0.0
         if plot:
@@ -1484,6 +1487,7 @@ def run_lm_stream_bed_single_entry(
             use_spinner=bool(use_spinner),
             emit_done_line=False,
         )
+        _augment_gwas_tsv_with_snp_names(out_tsv, prefix, logger=logger)
         saved_paths.append(str(out_tsv))
         _log_model_line(
             logger,
@@ -1810,6 +1814,7 @@ def run_lmm_packed_fullrank(
                 gwas_pbar.close(show_done=False)
 
         gwas_secs = max(time.monotonic() - gwas_t0, 0.0)
+        _augment_gwas_tsv_with_snp_names(out_tsv, prefix, logger=logger)
         saved_paths.append(str(out_tsv))
         viz_secs = 0.0
         if plot:

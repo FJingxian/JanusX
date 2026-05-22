@@ -21,6 +21,7 @@ from janusx.script._common.packedctx import (
 from .workflow import (
     CliStatus,
     _ProgressAdapter,
+    _augment_gwas_tsv_with_snp_names,
     _align_pheno_to_sample_order,
     _as_plink_prefix,
     _basename_only,
@@ -1475,6 +1476,16 @@ def run_farmcpu_fullmem(
                     if int(uniq_idx.size) > 0:
                         out_df.iloc[uniq_idx.tolist(), :].to_csv(str(pseudo_tsv_hint), sep="\t", index=False)
                         pseudo_tsv = pseudo_tsv_hint
+
+        name_source = str(gfile)
+        if isinstance(packed_ctx, dict):
+            name_source = str(packed_ctx.get("source_prefix", name_source) or name_source)
+        elif matrix_path_cli is not None:
+            name_source = str(matrix_path_cli)
+
+        _augment_gwas_tsv_with_snp_names(out_tsv, name_source, logger=logger)
+        if pseudo_tsv is not None and os.path.exists(pseudo_tsv):
+            _augment_gwas_tsv_with_snp_names(pseudo_tsv, name_source, logger=logger)
 
         gwas_secs = max(time.time() - gwas_t0, 0.0)
         peak_rss = max(peak_rss, process.memory_info().rss)

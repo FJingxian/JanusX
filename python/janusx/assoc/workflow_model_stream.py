@@ -23,6 +23,7 @@ from .workflow import (
     LMM,
     _GWAS_PROGRESS_BAR_WIDTH,
     _ProgressAdapter,
+    _augment_gwas_tsv_with_snp_names,
     _align_pheno_to_sample_order,
     _as_plink_prefix,
     _display_path,
@@ -1055,6 +1056,7 @@ def run_chunked_gwas_lmm_lm(
             use_spinner=bool(use_spinner),
             emit_done_line=False,
         )
+        _augment_gwas_tsv_with_snp_names(out_tsv, genofile, logger=logger)
         saved_paths.append(str(out_tsv))
         _log_model_line(
             logger,
@@ -1856,6 +1858,7 @@ def run_chunked_gwas_streaming_shared(
                 use_spinner=bool(use_spinner),
                 emit_done_line=False,
             )
+            _augment_gwas_tsv_with_snp_names(out_tsv, genofile, logger=logger)
             saved_paths.append(str(out_tsv))
             _log_model_line(
                 logger,

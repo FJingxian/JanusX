@@ -22,8 +22,8 @@ use crate::aireml::ai_reml_null_from_spectral;
 use crate::bedmath::packed_row_missing_count_selected;
 use crate::brent::{brent_minimize, brent_minimize_with_init};
 use crate::linalg::{
-    chi2_sf_df1, chi2_stat_df1_from_sf, cholesky_inplace, cholesky_logdet, cholesky_solve_into,
-    format_chisq_value, normal_sf,
+    chi2_sf_df1, chisq_from_beta_se_and_optional_plrt, cholesky_inplace, cholesky_logdet,
+    cholesky_solve_into, format_chisq_value, normal_sf,
 };
 use crate::stats_common::{env_truthy, get_cached_pool, parse_index_vec_i64};
 
@@ -3249,14 +3249,11 @@ pub fn lmm_reml_assoc_packed_f32_to_tsv<'py>(
                     let base = off * out_cols;
                     let beta = out_sub[base];
                     let se = out_sub[base + 1];
-                    let chisq = if with_plrt {
-                        chi2_stat_df1_from_sf(out_sub[base + 3])
-                    } else if beta.is_finite() && se.is_finite() && se > 0.0 {
-                        let z = beta / se;
-                        z * z
-                    } else {
-                        f64::NAN
-                    };
+                    let chisq = chisq_from_beta_se_and_optional_plrt(
+                        beta,
+                        se,
+                        if with_plrt { Some(out_sub[base + 3]) } else { None },
+                    );
                     let chisq_txt = format_chisq_value(chisq);
                     if with_plrt {
                         let _ = write!(
@@ -4858,7 +4855,8 @@ pub fn fastlmm_assoc_packed_f32_to_tsv<'py>(
                     let base = off * out_cols;
                     let beta = out_sub[base];
                     let se = out_sub[base + 1];
-                    let chisq = chi2_stat_df1_from_sf(out_sub[base + 3]);
+                    let chisq =
+                        chisq_from_beta_se_and_optional_plrt(beta, se, Some(out_sub[base + 3]));
                     let chisq_txt = format_chisq_value(chisq);
                     let _ = write!(
                         text_buf,

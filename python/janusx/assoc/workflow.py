@@ -52,7 +52,7 @@ import multiprocessing as mp
 import concurrent.futures as cf
 import textwrap
 from datetime import datetime
-from typing import Any, Union, Optional
+from typing import Any, Iterator, Union, Optional
 import uuid
 from contextlib import contextmanager
 
@@ -2702,6 +2702,152 @@ def _read_bim_sites(prefix: str) -> list[tuple[str, int, str, str]]:
     return out
 
 
+def _coerce_site_pos(value: object) -> int:
+    try:
+        return int(value)
+    except Exception:
+        try:
+            return int(float(value))
+        except Exception:
+            return 0
+
+
+def _fallback_snp_name(chrom: object, pos: object) -> str:
+    return f"{str(chrom).strip()}_{_coerce_site_pos(pos)}"
+
+
+def _normalize_snp_name(raw_name: object, chrom: object, pos: object) -> str:
+    name = str(raw_name).strip()
+    if name == "" or name == "." or name.lower() == "nan":
+        return _fallback_snp_name(chrom, pos)
+    return name
+
+
+def _resolve_gwas_snp_bim_path(genofile: str) -> Union[str, None]:
+    path = str(safe_expanduser(str(genofile))).strip()
+    if path == "":
+        return None
+    if path.lower().endswith(".bim") and os.path.isfile(path):
+        return path
+
+    plink_prefix = _as_plink_prefix(path)
+    if plink_prefix is not None:
+        bim_path = f"{plink_prefix}.bim"
+        if os.path.isfile(bim_path):
+            return bim_path
+
+    file_prefix, _matrix_path = _resolve_file_input_matrix(path)
+    if file_prefix:
+        bim_path = f"{file_prefix}.bim"
+        if os.path.isfile(bim_path):
+            return bim_path
+
+    return None
+
+
+def _iter_bim_named_sites(bim_path: str) -> Iterator[tuple[str, int, str]]:
+    with open(bim_path, "r", encoding="utf-8", errors="replace") as fh:
+        for line_no, raw in enumerate(fh, start=1):
+            line = raw.strip()
+            if line == "":
+                continue
+            toks = line.split()
+            if len(toks) < 4:
+                raise ValueError(f"Malformed BIM line at {bim_path}:{line_no}")
+            chrom = str(toks[0]).strip()
+            pos = _coerce_site_pos(toks[3])
+            raw_name = toks[1] if len(toks) > 1 else "."
+            yield chrom, pos, _normalize_snp_name(raw_name, chrom, pos)
+
+
+def _augment_gwas_tsv_with_snp_names(
+    out_tsv: str,
+    genofile: str,
+    *,
+    logger: Union[logging.Logger, None] = None,
+) -> bool:
+    """
+    Ensure GWAS TSV contains an explicit `snp` column.
+
+    Naming rules:
+      1) Prefer BIM SNP ID when available
+      2) If BIM ID is blank / "." / NaN, fallback to "chr_pos"
+      3) If no BIM exists (e.g. txt/npy with only .site), fallback to "chr_pos"
+    """
+    path = str(out_tsv)
+    if not os.path.isfile(path):
+        return False
+
+    bim_path = _resolve_gwas_snp_bim_path(genofile)
+    tmp_path = f"{path}.snp.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fin:
+            header_raw = fin.readline()
+            if header_raw == "":
+                return False
+
+            header = header_raw.rstrip("\r\n")
+            cols = header.split("\t")
+            if "snp" in cols:
+                return False
+            if ("chrom" not in cols) or ("pos" not in cols):
+                return False
+
+            chrom_idx = cols.index("chrom")
+            pos_idx = cols.index("pos")
+            insert_idx = pos_idx + 1
+
+            bim_iter = _iter_bim_named_sites(bim_path) if bim_path is not None else None
+            bim_cur = next(bim_iter, None) if bim_iter is not None else None
+
+            with open(tmp_path, "w", encoding="utf-8", newline="") as fout:
+                out_cols = cols[:insert_idx] + ["snp"] + cols[insert_idx:]
+                fout.write("\t".join(out_cols) + "\n")
+
+                for raw in fin:
+                    line = raw.rstrip("\r\n")
+                    if line == "":
+                        fout.write("\n")
+                        continue
+
+                    parts = line.split("\t")
+                    if len(parts) <= max(chrom_idx, pos_idx):
+                        fout.write(line + "\n")
+                        continue
+
+                    chrom = str(parts[chrom_idx]).strip()
+                    pos = _coerce_site_pos(parts[pos_idx])
+                    snp_name = _fallback_snp_name(chrom, pos)
+
+                    while bim_cur is not None:
+                        bim_chrom, bim_pos, bim_name = bim_cur
+                        if bim_chrom == chrom and int(bim_pos) == int(pos):
+                            snp_name = str(bim_name)
+                            bim_cur = next(bim_iter, None) if bim_iter is not None else None
+                            break
+                        bim_cur = next(bim_iter, None) if bim_iter is not None else None
+
+                    out_parts = parts[:insert_idx] + [snp_name] + parts[insert_idx:]
+                    fout.write("\t".join(out_parts) + "\n")
+
+        _replace_file_with_retry(tmp_path, path)
+        return True
+    except Exception as ex:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+        if logger is not None:
+            _log_file_only(
+                logger,
+                logging.WARNING,
+                f"Unable to add SNP names to {_display_path(path)}: {ex}",
+            )
+        return False
+
+
 def _resolve_lrlmm_rank(rank_opt: Union[int, None], n_samples: int) -> int:
     n = max(1, int(n_samples))
     if rank_opt is None or int(rank_opt) <= 0:
@@ -3597,6 +3743,7 @@ def run_lrlmm_packed(
             use_spinner=bool(use_spinner),
             emit_done_line=False,
         )
+        _augment_gwas_tsv_with_snp_names(out_tsv, prefix, logger=logger)
         saved_paths.append(str(out_tsv))
 
         peak_rss = max(peak_rss, process.memory_info().rss)
@@ -4153,6 +4300,7 @@ def _run_file_dense_fast_once(
                 use_spinner=bool(use_spinner),
                 emit_done_line=False,
             )
+            _augment_gwas_tsv_with_snp_names(out_tsv, gfile, logger=logger)
             saved_paths.append(str(out_tsv))
             _log_model_line(
                 logger,

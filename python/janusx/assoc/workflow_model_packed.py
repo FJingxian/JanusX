@@ -562,6 +562,7 @@ def run_fastlmm_packed_fullrank(
                 raise ValueError(
                     f"Trait GRM shape mismatch: got {grm_fit.shape}, expected ({n_idv}, {n_idv})."
                 )
+        grm_fit_raw = np.array(grm_fit, dtype=np.float64, copy=True)
         np.fill_diagonal(grm_fit, np.diag(grm_fit) + 1e-6)
 
         evd_t0 = time.monotonic()
@@ -675,7 +676,8 @@ def run_fastlmm_packed_fullrank(
                     null_fast_mod = FastLMM(
                         y=y_vec,
                         X=x_arg,
-                        kinship=np.array(grm_fit, copy=True),
+                        # Use the raw trait GRM here; FastLMM/LMM adds its own ridge.
+                        kinship=np.array(grm_fit_raw, copy=True),
                     )
                 evd_secs += max(time.monotonic() - py_fast_t0, 0.0)
                 try:

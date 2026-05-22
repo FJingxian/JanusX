@@ -1170,8 +1170,10 @@ class LMM:
             else np.ones((y.shape[0], 1))
         )
 
-        # Eigen decomposition of kinship (stabilized, Rust-only)
-        kinship.flat[::kinship.shape[0]+1] += 1e-6
+        # Eigen decomposition of kinship (stabilized, Rust-only).
+        # Copy first so shared callers do not observe in-place ridge mutation.
+        kinship = np.array(kinship, dtype=np.float64, copy=True)
+        kinship.flat[::kinship.shape[0] + 1] += 1e-6
         t_start = time.time()
         kinship_eigh = np.ascontiguousarray(kinship, dtype=np.float64)
         eig_thr = int(_infer_blas_threads_from_env() or 0)

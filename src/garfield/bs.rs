@@ -311,7 +311,7 @@ fn use_parent_delta_with_gate(
     // Under permutation, pure positive 3-site AND rules should be judged by how much
     // they improve on their best 2-site parent, not by a second singleton-style gap.
     if matches!(gate, GateBucket::And)
-        && rule_len == 3
+        && rule_len >= 3
         && not_count == 0
         && params.null_penalties.is_some()
     {
@@ -319,6 +319,20 @@ fn use_parent_delta_with_gate(
     }
     let delta_start_len = params.exhaustive_depth.max(1).saturating_add(1).max(3);
     rule_len > delta_start_len
+}
+
+#[inline]
+fn use_raw_parent_delta_with_gate(
+    gate: GateBucket,
+    rule_len: usize,
+    not_count: usize,
+    params: &BeamSearchParams,
+) -> bool {
+    matches!(gate, GateBucket::And)
+        && rule_len >= 3
+        && not_count == 0
+        && params.null_penalties.is_some()
+        && !params.disable_parent_delta
 }
 
 #[inline]
@@ -440,6 +454,7 @@ fn train_scores_for_rule(
     train_raw: ContinuousRuleScore,
     max_singleton_raw: f64,
     parent_abs_score: Option<f64>,
+    parent_raw_score: Option<f64>,
     params: &BeamSearchParams,
 ) -> (f64, f64) {
     let bucket = bucket_from_rule(rule, train_raw.support_frac, params.logic_gate_mode);
@@ -457,7 +472,9 @@ fn train_scores_for_rule(
         params,
     );
     let threshold = null_penalty_for_bucket(bucket, params, true);
-    let rank_score = if use_parent_delta_with_gate(gate, rule.len(), rule.not_count(), params) {
+    let rank_score = if use_raw_parent_delta_with_gate(gate, rule.len(), rule.not_count(), params) {
+        train_raw.raw_score - parent_raw_score.unwrap_or(0.0) - threshold
+    } else if use_parent_delta_with_gate(gate, rule.len(), rule.not_count(), params) {
         abs_score - parent_abs_score.unwrap_or(0.0) - threshold
     } else {
         abs_score - threshold
@@ -1048,8 +1065,14 @@ fn build_initial_beam(
                         if support_balance(&train) == 0 {
                             continue;
                         }
-                        let (train_abs_score, train_score) =
-                            train_scores_for_rule(&rule, train, train.raw_score, None, params);
+                        let (train_abs_score, train_score) = train_scores_for_rule(
+                            &rule,
+                            train,
+                            train.raw_score,
+                            None,
+                            None,
+                            params,
+                        );
                         if !keep_state_after_min_gain_pruning(rule.len(), train_score, params) {
                             continue;
                         }
@@ -1099,7 +1122,7 @@ fn build_initial_beam(
                     continue;
                 }
                 let (train_abs_score, train_score) =
-                    train_scores_for_rule(&rule, train, train.raw_score, None, params);
+                    train_scores_for_rule(&rule, train, train.raw_score, None, None, params);
                 if !keep_state_after_min_gain_pruning(rule.len(), train_score, params) {
                     continue;
                 }
@@ -1157,7 +1180,7 @@ fn build_initial_states_exhaustive(
                 continue;
             }
             let (train_abs_score, train_score) =
-                train_scores_for_rule(&rule, train, train.raw_score, None, params);
+                train_scores_for_rule(&rule, train, train.raw_score, None, None, params);
             if !keep_state_after_min_gain_pruning(rule.len(), train_score, params) {
                 continue;
             }
@@ -1252,6 +1275,7 @@ fn expand_beam_once(
                                 train,
                                 max_singleton_train_raw,
                                 Some(node.train_abs_score),
+                                Some(node.train.raw_score),
                                 params,
                             );
                             if !keep_child_after_parent_abs_improvement_pruning(
@@ -1329,6 +1353,7 @@ fn expand_beam_once(
                             train,
                             max_singleton_train_raw,
                             Some(node.train_abs_score),
+                            Some(node.train.raw_score),
                             params,
                         );
                         if !keep_child_after_parent_abs_improvement_pruning(
@@ -1436,6 +1461,7 @@ fn expand_states_exhaustive(
                         train,
                         max_singleton_train_raw,
                         Some(node.train_abs_score),
+                        Some(node.train.raw_score),
                         params,
                     );
                     if !keep_child_after_parent_abs_improvement_pruning(
@@ -1539,6 +1565,10 @@ fn final_test_score_for_state(
         parent_max_singleton_test_raw,
         params,
     );
+    if use_raw_parent_delta_with_gate(child_gate, state.rule.len(), state.rule.not_count(), params)
+    {
+        return Ok(test.raw_score - parent_test.raw_score - threshold);
+    }
     Ok(
         rule_rank_score_from_abs(child_abs_score, Some(parent_abs_score), use_parent_delta)
             - threshold,
@@ -1609,6 +1639,9 @@ fn final_rule_score_for_eval(
     )?;
     let parent_abs_score =
         rule_abs_score_for_eval(&parent_rule, &parent_raw, literal_scores, is_train, params);
+    if use_raw_parent_delta_with_gate(gate, rule.len(), rule.not_count(), params) {
+        return Ok(raw.raw_score - parent_raw.raw_score - threshold);
+    }
     Ok(rule_rank_score_from_abs(abs_score, Some(parent_abs_score), use_parent_delta) - threshold)
 }
 
@@ -2519,6 +2552,7 @@ mod tests {
             train,
             0.6,
             None,
+            None,
             &BeamSearchParams {
                 rank_mode: BeamRankMode::Raw,
                 ..BeamSearchParams::default()
@@ -2528,6 +2562,7 @@ mod tests {
             &rule,
             train,
             0.6,
+            None,
             None,
             &BeamSearchParams {
                 rank_mode: BeamRankMode::InteractionGain,
@@ -2573,6 +2608,7 @@ mod tests {
             train,
             0.6,
             None,
+            None,
             &BeamSearchParams {
                 rank_mode: BeamRankMode::InteractionGain,
                 logic_gate_mode: BeamLogicGateMode::AndOnly,
@@ -2616,6 +2652,64 @@ mod tests {
     }
 
     #[test]
+    fn test_pure_and_triple_with_null_penalty_uses_raw_parent_delta() {
+        let rule = BeamRule {
+            first: BeamLiteral {
+                row_index: 0,
+                group_id: 0,
+                negated: false,
+            },
+            rest: vec![
+                (
+                    BeamBinaryOp::And,
+                    BeamLiteral {
+                        row_index: 1,
+                        group_id: 1,
+                        negated: false,
+                    },
+                ),
+                (
+                    BeamBinaryOp::And,
+                    BeamLiteral {
+                        row_index: 2,
+                        group_id: 2,
+                        negated: false,
+                    },
+                ),
+            ],
+        };
+        let train = ContinuousRuleScore {
+            score: 0.8,
+            raw_score: 0.8,
+            mean_hit: 1.0,
+            mean_miss: 0.0,
+            support_frac: 0.15,
+            n_hit: 2,
+            n_miss: 10,
+        };
+        let mut cal = super::super::permutation::RuleNullCalibrator::new(false);
+        let bucket = bucket_from_rule(&rule, train.support_frac, BeamLogicGateMode::AndOnly);
+        cal.insert(bucket, 0.0, 0.0);
+        let lookup = cal.finalize();
+        let parent_raw_score = 0.72;
+        let parent_abs_score = 0.52;
+        let (_, gain_score) = train_scores_for_rule(
+            &rule,
+            train,
+            0.79,
+            Some(parent_abs_score),
+            Some(parent_raw_score),
+            &BeamSearchParams {
+                rank_mode: BeamRankMode::InteractionGain,
+                logic_gate_mode: BeamLogicGateMode::AndOnly,
+                null_penalties: Some(Arc::new(lookup)),
+                ..BeamSearchParams::default()
+            },
+        );
+        assert!((gain_score - 0.08).abs() < 1e-12);
+    }
+
+    #[test]
     fn test_or_rule_keeps_raw_score_under_gain_mode() {
         let rule = BeamRule {
             first: BeamLiteral {
@@ -2645,6 +2739,7 @@ mod tests {
             &rule,
             train,
             0.6,
+            None,
             None,
             &BeamSearchParams {
                 rank_mode: BeamRankMode::InteractionGain,
@@ -3058,6 +3153,7 @@ mod tests {
             child_train,
             max_singleton_train_raw,
             Some(parent_abs),
+            Some(parent_train.raw_score),
             &params,
         );
         let state = BeamState {
@@ -3176,6 +3272,7 @@ mod tests {
             child_train,
             max_singleton_train_raw,
             Some(parent_abs),
+            Some(parent_train.raw_score),
             &params,
         );
         let state = BeamState {
@@ -3266,6 +3363,7 @@ mod tests {
             &child_rule,
             child_train,
             max_singleton_train_raw,
+            Some(0.0),
             Some(0.0),
             &params,
         );
@@ -3376,6 +3474,7 @@ mod tests {
             &child_rule,
             child_train,
             max_singleton_train_raw,
+            Some(0.0),
             Some(0.0),
             &params,
         );
@@ -3492,6 +3591,7 @@ mod tests {
             &child_rule,
             child_train,
             max_singleton_train_raw,
+            Some(0.0),
             Some(0.0),
             &params,
         );

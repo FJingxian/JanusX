@@ -14,7 +14,7 @@ from scipy import stats
 
 from janusx import janusx as jxrs
 from janusx.janusx import bed_ldblock_r2_rust, gwas_lmm_lm_null_lrt_decision, load_bed_u8_matrix
-from janusx.pyBLUP.assoc import FastLMM
+from janusx.pyBLUP.assoc import FastLMM, LM
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -53,6 +53,9 @@ class PairCandidate:
     pair_r2: float
     dosage_corr: float
     pseudo_freq: float
+    pseudo_specificity: float
+    max_binary_pseudo_corr: float
+    max_dosage_pseudo_corr: float
     score: float
 
 
@@ -277,6 +280,72 @@ def _variance(x: np.ndarray) -> float:
     return float(np.var(arr, ddof=1))
 
 
+def _safe_corr(x: np.ndarray, y: np.ndarray) -> float:
+    xv = np.asarray(x, dtype=np.float64).reshape(-1)
+    yv = np.asarray(y, dtype=np.float64).reshape(-1)
+    mask = np.isfinite(xv) & np.isfinite(yv)
+    if int(np.sum(mask)) <= 3:
+        return float("nan")
+    xs = xv[mask]
+    ys = yv[mask]
+    if float(np.var(xs)) <= 0.0 or float(np.var(ys)) <= 0.0:
+        return float("nan")
+    return float(np.corrcoef(xs, ys)[0, 1])
+
+
+def _residualize_indicator_against_main_effects(
+    indicator: np.ndarray,
+    member_rows: list[np.ndarray],
+) -> np.ndarray:
+    y = np.asarray(indicator, dtype=np.float64).reshape(-1)
+    xcols = [np.ones(y.shape[0], dtype=np.float64)]
+    xcols.extend(np.asarray(row, dtype=np.float64).reshape(-1) for row in member_rows)
+    x = np.column_stack(xcols)
+    mask = np.all(np.isfinite(x), axis=1) & np.isfinite(y)
+    out = np.full(y.shape[0], np.nan, dtype=np.float64)
+    if int(np.sum(mask)) <= x.shape[1]:
+        return out
+    x_fit = x[mask]
+    y_fit = y[mask]
+    gram = x_fit.T @ x_fit + 1e-8 * np.eye(x_fit.shape[1], dtype=np.float64)
+    beta = np.linalg.solve(gram, x_fit.T @ y_fit)
+    out[mask] = y_fit - x_fit @ beta
+    return out
+
+
+def _pair_leakage_metrics(
+    g1: np.ndarray,
+    g2: np.ndarray,
+    b1: np.ndarray,
+    b2: np.ndarray,
+    pseudo: np.ndarray,
+) -> dict[str, float]:
+    binary1_to_pseudo_corr = abs(_safe_corr(b1, pseudo))
+    binary2_to_pseudo_corr = abs(_safe_corr(b2, pseudo))
+    dosage1_to_pseudo_corr = abs(_safe_corr(g1, pseudo))
+    dosage2_to_pseudo_corr = abs(_safe_corr(g2, pseudo))
+    finite_binary_corrs = [v for v in (binary1_to_pseudo_corr, binary2_to_pseudo_corr) if np.isfinite(v)]
+    finite_dosage_corrs = [v for v in (dosage1_to_pseudo_corr, dosage2_to_pseudo_corr) if np.isfinite(v)]
+    resid = _residualize_indicator_against_main_effects(pseudo, [b1, b2])
+    pseudo_var = _variance(pseudo)
+    resid_var = _variance(resid)
+    specificity = (
+        float(max(0.0, min(1.0, resid_var / pseudo_var)))
+        if pseudo_var > 0.0 and np.isfinite(resid_var)
+        else 0.0
+    )
+    return {
+        "binary1_to_pseudo_corr": float(binary1_to_pseudo_corr),
+        "binary2_to_pseudo_corr": float(binary2_to_pseudo_corr),
+        "max_binary_to_pseudo_corr": float(max(finite_binary_corrs) if finite_binary_corrs else float("nan")),
+        "dosage1_to_pseudo_corr": float(dosage1_to_pseudo_corr),
+        "dosage2_to_pseudo_corr": float(dosage2_to_pseudo_corr),
+        "max_dosage_to_pseudo_corr": float(max(finite_dosage_corrs) if finite_dosage_corrs else float("nan")),
+        "pseudo_specificity": float(specificity),
+        "pseudo_residual_var": float(resid_var),
+    }
+
+
 def _maf_from_dosage(row: np.ndarray) -> float:
     arr = np.asarray(row, dtype=np.float64).reshape(-1)
     valid = np.isfinite(arr) & (arr >= 0.0)
@@ -287,19 +356,36 @@ def _maf_from_dosage(row: np.ndarray) -> float:
     return float(min(alt_freq, 1.0 - alt_freq))
 
 
-def _collapse_to_logic_bin01(row: np.ndarray) -> np.ndarray:
+def _collapse_to_logic_bin01(row: np.ndarray, mode: str = "minor_carrier") -> np.ndarray:
     arr = np.asarray(row, dtype=np.float64).reshape(-1)
     valid = np.isfinite(arr) & (arr >= 0.0)
     if not np.any(valid):
         raise ValueError("Genotype row has no valid values.")
     rounded = np.rint(arr[valid])
     geno = np.where(rounded <= 0.0, 0, np.where(rounded >= 2.0, 2, 1)).astype(np.uint8)
-    c0 = int(np.sum(geno == 0))
-    c2 = int(np.sum(geno == 2))
-    mode02 = 2 if c2 > c0 else 0
-    out = np.full(arr.shape[0], mode02, dtype=np.uint8)
-    out[np.where(valid)[0]] = np.where(geno == 1, mode02, geno)
-    return (out > 0).astype(np.float64)
+    out = np.zeros(arr.shape[0], dtype=np.uint8)
+    if mode == "minor_carrier":
+        alt_freq = float(np.mean(geno) / 2.0)
+        if alt_freq <= 0.5:
+            out[np.where(valid)[0]] = (geno > 0).astype(np.uint8)
+        else:
+            out[np.where(valid)[0]] = (geno < 2).astype(np.uint8)
+        return out.astype(np.float64)
+    if mode == "homo_minor":
+        alt_freq = float(np.mean(geno) / 2.0)
+        if alt_freq <= 0.5:
+            out[np.where(valid)[0]] = (geno == 2).astype(np.uint8)
+        else:
+            out[np.where(valid)[0]] = (geno == 0).astype(np.uint8)
+        return out.astype(np.float64)
+    if mode == "legacy_mode02":
+        c0 = int(np.sum(geno == 0))
+        c2 = int(np.sum(geno == 2))
+        mode02 = 2 if c2 > c0 else 0
+        legacy = np.full(arr.shape[0], mode02, dtype=np.uint8)
+        legacy[np.where(valid)[0]] = np.where(geno == 1, mode02, geno)
+        return (legacy > 0).astype(np.float64)
+    raise ValueError(f"Unsupported logic encoding mode: {mode!r}. Use minor_carrier, homo_minor, or legacy_mode02.")
 
 
 def _sample_background_from_grm(grm: np.ndarray, rng: np.random.Generator) -> np.ndarray:
@@ -334,6 +420,78 @@ def _ols_assoc(x: np.ndarray, y: np.ndarray) -> dict[str, float]:
         "p": pval,
         "n": int(xv.shape[0]),
     }
+
+
+def _mean_impute_feature_row(x: np.ndarray) -> np.ndarray:
+    arr = np.asarray(x, dtype=np.float64).reshape(-1).copy()
+    mask = np.isfinite(arr)
+    if not np.any(mask):
+        raise ValueError("Feature row has no finite values.")
+    mu = float(np.mean(arr[mask]))
+    arr[~mask] = mu
+    return arr
+
+
+def _chisq_from_assoc_result(beta: float, se: float, plrt: float) -> float:
+    if np.isfinite(plrt) and 0.0 <= plrt <= 1.0:
+        if plrt <= 0.0:
+            return float("inf")
+        if plrt >= 1.0:
+            return 0.0
+        return float(stats.chi2.isf(plrt, 1))
+    if np.isfinite(beta) and np.isfinite(se) and se > 0.0:
+        z = beta / se
+        return float(z * z)
+    return float("nan")
+
+
+def _mixed_assoc_rows(
+    feature_rows: list[tuple[str, np.ndarray]],
+    y: np.ndarray,
+    grm: np.ndarray,
+    threads: int,
+) -> tuple[str, list[dict[str, float | int | str]]]:
+    yv = np.asarray(y, dtype=np.float64).reshape(-1)
+    null_model = FastLMM(yv, None, np.asarray(grm, dtype=np.float64).copy())
+    switch_to_lm, _lrt_stat, _pval, _lm_ml0 = gwas_lmm_lm_null_lrt_decision(
+        yv,
+        np.ones((yv.shape[0], 1), dtype=np.float64),
+        float(null_model.ML0),
+        0.05,
+        True,
+    )
+    if switch_to_lm:
+        model_name = "lm"
+        assoc_model = LM(yv, None)
+    else:
+        model_name = "fastlmm" if 0.05 <= float(null_model.pve) <= 0.95 else "lmm_reml"
+        assoc_model = null_model
+
+    snp = np.ascontiguousarray(
+        np.vstack([_mean_impute_feature_row(row) for _, row in feature_rows]),
+        dtype=np.float64,
+    )
+    res = np.asarray(assoc_model.gwas(snp, threads=int(max(1, threads))), dtype=np.float64)
+    out: list[dict[str, float | int | str]] = []
+    for i, (name, _row) in enumerate(feature_rows):
+        beta = float(res[i, 0])
+        se = float(res[i, 1])
+        pwald = float(res[i, 2])
+        plrt = float(res[i, 3]) if res.shape[1] > 3 else float("nan")
+        chisq = _chisq_from_assoc_result(beta, se, plrt)
+        out.append(
+            {
+                "feature": name,
+                "model": model_name,
+                "beta": beta,
+                "se": se,
+                "chisq": chisq,
+                "pwald": pwald,
+                "plrt": plrt,
+                "n": int(yv.shape[0]),
+            }
+        )
+    return model_name, out
 
 
 def _write_pheno_outputs(out_prefix: Path, sample_ids: list[str], y: np.ndarray, seed: int, trait_name: str) -> None:
@@ -554,12 +712,20 @@ def _choose_pair(
     site_infos: list[SiteInfo],
     geno: np.ndarray,
     max_pair_distance: int,
+    min_pair_distance: int,
     min_site_maf: float,
     max_site_maf: float,
     min_pseudo_freq: float,
     ld_block_r2_threshold: float,
     prefer_distinct_blocks: bool,
     target_pseudo_freq: float,
+    logic_encoding: str,
+    min_binary_freq: float,
+    max_binary_freq: float,
+    max_single_to_pseudo_ratio: float,
+    max_binary_to_pseudo_corr: float,
+    max_dosage_to_pseudo_corr: float,
+    min_pseudo_specificity: float,
     threads: int,
 ) -> tuple[PairCandidate, dict[str, object]]:
     positions = [s.pos for s in site_infos]
@@ -582,12 +748,17 @@ def _choose_pair(
         if not (min_site_maf <= site1.maf <= max_site_maf):
             continue
         g1 = geno[site1.row_index].copy()
-        b1 = _collapse_to_logic_bin01(g1)
+        b1 = _collapse_to_logic_bin01(g1, mode=logic_encoding)
+        b1_freq = float(np.mean(b1))
+        if not (min_binary_freq <= b1_freq <= max_binary_freq):
+            continue
         for j in range(i + 1, len(site_infos)):
             site2 = site_infos[j]
             dist = int(site2.pos - site1.pos)
             if dist > max_pair_distance:
                 break
+            if dist < min_pair_distance:
+                continue
             seen += 1
             if not (min_site_maf <= site2.maf <= max_site_maf):
                 continue
@@ -596,20 +767,38 @@ def _choose_pair(
             if prefer_distinct_blocks and block1 == block2:
                 continue
             g2 = geno[site2.row_index].copy()
-            b2 = _collapse_to_logic_bin01(g2)
+            b2 = _collapse_to_logic_bin01(g2, mode=logic_encoding)
+            b2_freq = float(np.mean(b2))
+            if not (min_binary_freq <= b2_freq <= max_binary_freq):
+                continue
             pseudo = ((b1 > 0.0) & (b2 > 0.0)).astype(np.float64)
             pseudo_freq = float(np.mean(pseudo))
             if pseudo_freq < min_pseudo_freq:
                 continue
+            marginal_leakage = pseudo_freq / max(min(b1_freq, b2_freq), 1e-12)
+            if marginal_leakage > max_single_to_pseudo_ratio:
+                continue
             mask = np.isfinite(g1) & np.isfinite(g2)
             dosage_corr = float(np.corrcoef(g1[mask], g2[mask])[0, 1]) if int(np.sum(mask)) > 3 else float("nan")
             pair_r2 = float(r2_arr[i, j])
+            leakage = _pair_leakage_metrics(g1, g2, b1, b2, pseudo)
+            if leakage["max_binary_to_pseudo_corr"] > max_binary_to_pseudo_corr:
+                continue
+            if leakage["max_dosage_to_pseudo_corr"] > max_dosage_to_pseudo_corr:
+                continue
+            if leakage["pseudo_specificity"] < min_pseudo_specificity:
+                continue
             maf_gap = abs(site1.maf - site2.maf)
             score = (
                 abs(pseudo_freq - target_pseudo_freq)
-                + 0.25 * abs(dosage_corr if np.isfinite(dosage_corr) else 1.0)
-                + 0.25 * maf_gap
-                + 0.10 * (dist / float(max_pair_distance))
+                + 0.20 * marginal_leakage
+                + 0.70 * leakage["max_binary_to_pseudo_corr"]
+                + 0.45 * leakage["max_dosage_to_pseudo_corr"]
+                + 0.90 * (1.0 - leakage["pseudo_specificity"])
+                + 0.15 * abs(dosage_corr if np.isfinite(dosage_corr) else 1.0)
+                + 0.15 * pair_r2
+                + 0.15 * maf_gap
+                + 0.05 * (dist / float(max_pair_distance))
             )
             cand = PairCandidate(
                 site1=site1,
@@ -620,6 +809,9 @@ def _choose_pair(
                 pair_r2=pair_r2,
                 dosage_corr=dosage_corr,
                 pseudo_freq=pseudo_freq,
+                pseudo_specificity=float(leakage["pseudo_specificity"]),
+                max_binary_pseudo_corr=float(leakage["max_binary_to_pseudo_corr"]),
+                max_dosage_pseudo_corr=float(leakage["max_dosage_to_pseudo_corr"]),
                 score=float(score),
             )
             kept += 1
@@ -635,6 +827,23 @@ def _choose_pair(
             "site1": int(comp_sizes.get(best.block1, 0)),
             "site2": int(comp_sizes.get(best.block2, 0)),
         },
+        "best_binary1_freq": float(np.mean(_collapse_to_logic_bin01(geno[best.site1.row_index], mode=logic_encoding))),
+        "best_binary2_freq": float(np.mean(_collapse_to_logic_bin01(geno[best.site2.row_index], mode=logic_encoding))),
+        "best_marginal_leakage": float(best.pseudo_freq / max(min(
+            float(np.mean(_collapse_to_logic_bin01(geno[best.site1.row_index], mode=logic_encoding))),
+            float(np.mean(_collapse_to_logic_bin01(geno[best.site2.row_index], mode=logic_encoding))),
+        ), 1e-12)),
+        "best_pseudo_specificity": float(best.pseudo_specificity),
+        "best_max_binary_to_pseudo_corr": float(best.max_binary_pseudo_corr),
+        "best_max_dosage_to_pseudo_corr": float(best.max_dosage_pseudo_corr),
+        "logic_encoding": str(logic_encoding),
+        "min_pair_distance": int(min_pair_distance),
+        "min_binary_freq": float(min_binary_freq),
+        "max_binary_freq": float(max_binary_freq),
+        "max_single_to_pseudo_ratio": float(max_single_to_pseudo_ratio),
+        "max_binary_to_pseudo_corr": float(max_binary_to_pseudo_corr),
+        "max_dosage_to_pseudo_corr": float(max_dosage_to_pseudo_corr),
+        "min_pseudo_specificity": float(min_pseudo_specificity),
     }
     return best, meta
 
@@ -677,6 +886,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--gate-pve", type=float, default=0.04, help="Raw AND gate variance target.")
     p.add_argument("--seed", type=int, default=20260520, help="Random seed.")
     p.add_argument("--max-pair-distance", type=int, default=200000, help="Maximum pair distance in bp.")
+    p.add_argument("--min-pair-distance", type=int, default=50000, help="Minimum pair distance in bp.")
     p.add_argument("--min-site-maf", type=float, default=0.05, help="Minimum site MAF for pair search.")
     p.add_argument("--max-site-maf", type=float, default=0.20, help="Maximum site MAF for pair search.")
     p.add_argument("--min-pseudo-freq", type=float, default=0.025, help="Minimum raw-AND carrier frequency.")
@@ -685,6 +895,38 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.026,
         help="Pair search prefers pseudo frequencies near this value.",
+    )
+    p.add_argument(
+        "--logic-encoding",
+        choices=["minor_carrier", "homo_minor", "legacy_mode02"],
+        default="minor_carrier",
+        help="Binary encoding used for logic gates. minor_carrier is recommended for marginal-pair simulations.",
+    )
+    p.add_argument("--min-binary-freq", type=float, default=0.08, help="Minimum frequency for each single binary logic atom.")
+    p.add_argument("--max-binary-freq", type=float, default=0.60, help="Maximum frequency for each single binary logic atom.")
+    p.add_argument(
+        "--max-single-to-pseudo-ratio",
+        type=float,
+        default=0.40,
+        help="Maximum pseudo_freq / min(binary1_freq, binary2_freq). Smaller values make single-site marginal leakage weaker.",
+    )
+    p.add_argument(
+        "--max-binary-to-pseudo-corr",
+        type=float,
+        default=0.60,
+        help="Maximum absolute corr(binary atom, pseudo AND). Smaller values favor pseudo rules that are less recoverable from either single binary atom.",
+    )
+    p.add_argument(
+        "--max-dosage-to-pseudo-corr",
+        type=float,
+        default=0.75,
+        help="Maximum absolute corr(single-site dosage, pseudo AND). Smaller values reduce dosage-level marginal leakage from member SNPs.",
+    )
+    p.add_argument(
+        "--min-pseudo-specificity",
+        type=float,
+        default=0.10,
+        help="Minimum residual variance fraction of pseudo AND after regressing it on the two single binary atoms. Larger values favor genuinely pair-specific signals.",
     )
     p.add_argument(
         "--ld-block-r2-threshold",
@@ -762,9 +1004,10 @@ def main() -> int:
         pos_to_idx = {s.pos: i for i, s in enumerate(site_infos)}
         i = pos_to_idx[site1.pos]
         j = pos_to_idx[site2.pos]
-        b1 = _collapse_to_logic_bin01(geno[site1.row_index])
-        b2 = _collapse_to_logic_bin01(geno[site2.row_index])
+        b1 = _collapse_to_logic_bin01(geno[site1.row_index], mode=str(args.logic_encoding))
+        b2 = _collapse_to_logic_bin01(geno[site2.row_index], mode=str(args.logic_encoding))
         pseudo = ((b1 > 0.0) & (b2 > 0.0)).astype(np.float64)
+        manual_leakage = _pair_leakage_metrics(geno[site1.row_index], geno[site2.row_index], b1, b2, pseudo)
         mask = np.isfinite(geno[site1.row_index]) & np.isfinite(geno[site2.row_index])
         dosage_corr = float(np.corrcoef(geno[site1.row_index][mask], geno[site2.row_index][mask])[0, 1])
         pair = PairCandidate(
@@ -776,6 +1019,9 @@ def main() -> int:
             pair_r2=float(r2_arr[i, j]),
             dosage_corr=dosage_corr,
             pseudo_freq=float(np.mean(pseudo)),
+            pseudo_specificity=float(manual_leakage["pseudo_specificity"]),
+            max_binary_pseudo_corr=float(manual_leakage["max_binary_to_pseudo_corr"]),
+            max_dosage_pseudo_corr=float(manual_leakage["max_dosage_to_pseudo_corr"]),
             score=float("nan"),
         )
         pair_meta = {
@@ -786,6 +1032,7 @@ def main() -> int:
                 "site1": int(comp_sizes.get(pair.block1, 0)),
                 "site2": int(comp_sizes.get(pair.block2, 0)),
             },
+            "manual_pair": True,
         }
     else:
         pair, pair_meta = _choose_pair(
@@ -793,20 +1040,29 @@ def main() -> int:
             site_infos=site_infos,
             geno=geno,
             max_pair_distance=int(args.max_pair_distance),
+            min_pair_distance=int(args.min_pair_distance),
             min_site_maf=float(args.min_site_maf),
             max_site_maf=float(args.max_site_maf),
             min_pseudo_freq=float(args.min_pseudo_freq),
             ld_block_r2_threshold=float(args.ld_block_r2_threshold),
             prefer_distinct_blocks=not bool(args.allow_same_ld_block),
             target_pseudo_freq=float(args.target_pseudo_freq),
+            logic_encoding=str(args.logic_encoding),
+            min_binary_freq=float(args.min_binary_freq),
+            max_binary_freq=float(args.max_binary_freq),
+            max_single_to_pseudo_ratio=float(args.max_single_to_pseudo_ratio),
+            max_binary_to_pseudo_corr=float(args.max_binary_to_pseudo_corr),
+            max_dosage_to_pseudo_corr=float(args.max_dosage_to_pseudo_corr),
+            min_pseudo_specificity=float(args.min_pseudo_specificity),
             threads=threads,
         )
 
     g1 = geno[pair.site1.row_index].copy()
     g2 = geno[pair.site2.row_index].copy()
-    b1 = _collapse_to_logic_bin01(g1)
-    b2 = _collapse_to_logic_bin01(g2)
+    b1 = _collapse_to_logic_bin01(g1, mode=str(args.logic_encoding))
+    b2 = _collapse_to_logic_bin01(g2, mode=str(args.logic_encoding))
     pseudo = ((b1 > 0.0) & (b2 > 0.0)).astype(np.float64)
+    leakage = _pair_leakage_metrics(g1, g2, b1, b2, pseudo)
 
     grm_path = Path(args.grm).expanduser().resolve()
     grm_id_path = _resolve_grm_id_path(
@@ -863,17 +1119,42 @@ def main() -> int:
             d2_txt = "NA" if not np.isfinite(d2) else f"{d2:.0f}"
             fh.write(f"{sid}\t{d1_txt}\t{d2_txt}\t{x1:.0f}\t{x2:.0f}\t{pp:.0f}\n")
 
-    assoc_rows = [
+    assoc_ols_rows = [
         {"feature": "dosage1", **_ols_assoc(g1, y)},
         {"feature": "dosage2", **_ols_assoc(g2, y)},
         {"feature": "binary1", **_ols_assoc(b1, y)},
         {"feature": "binary2", **_ols_assoc(b2, y)},
         {"feature": "pseudo_and_raw", **_ols_assoc(pseudo, y)},
     ]
+    assoc_model_name, assoc_rows = _mixed_assoc_rows(
+        [
+            ("dosage1", g1),
+            ("dosage2", g2),
+            ("binary1", b1),
+            ("binary2", b2),
+            ("pseudo_and_raw", pseudo),
+        ],
+        y,
+        repaired_grm,
+        threads=threads,
+    )
     with _out_path(out_prefix, ".assoc.tsv").open("w", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=["feature", "beta", "se", "t", "p", "n"], delimiter="\t")
+        writer = csv.DictWriter(
+            fh,
+            fieldnames=["feature", "model", "beta", "se", "chisq", "pwald", "plrt", "n"],
+            delimiter="\t",
+        )
         writer.writeheader()
         for row in assoc_rows:
+            writer.writerow(row)
+    with _out_path(out_prefix, ".assoc.ols.tsv").open("w", encoding="utf-8") as fh:
+        writer = csv.DictWriter(
+            fh,
+            fieldnames=["feature", "beta", "se", "t", "p", "n"],
+            delimiter="\t",
+        )
+        writer.writeheader()
+        for row in assoc_ols_rows:
             writer.writerow(row)
 
     rng_na = np.random.default_rng(int(args.seed) ^ 0xD9A35C714B1E208D)
@@ -893,6 +1174,7 @@ def main() -> int:
         "seed": int(args.seed),
         "logic": "and",
         "effect_model": "raw_and",
+        "logic_encoding": str(args.logic_encoding),
         "bg_pve": float(bg_pve),
         "gate_pve": float(gate_pve),
         "residual_var": float(residual_var),
@@ -922,6 +1204,9 @@ def main() -> int:
         "pair_r2": float(pair.pair_r2),
         "dosage_corr": float(pair.dosage_corr),
         "pseudo_and_raw_freq": float(np.mean(pseudo)),
+        "pseudo_specificity": float(leakage["pseudo_specificity"]),
+        "max_binary_to_pseudo_corr": float(leakage["max_binary_to_pseudo_corr"]),
+        "max_dosage_to_pseudo_corr": float(leakage["max_dosage_to_pseudo_corr"]),
         "background_var": _variance(bg_effect),
         "gate_var": _variance(gate_effect),
         "phenotype_var": _variance(y),
@@ -936,7 +1221,9 @@ def main() -> int:
             "psd_id_path": str(Path(f"{psd_prefix}.npy.id")),
             "repair": grm_repair,
         },
+        "assoc_model": assoc_model_name,
         "assoc": assoc_rows,
+        "assoc_ols": assoc_ols_rows,
         "validation": validation,
     }
     with _out_path(out_prefix, ".case.json").open("w", encoding="utf-8") as fh:
@@ -949,8 +1236,12 @@ def main() -> int:
     print(f"Distance bp  : {pair.distance}")
     print(f"Pair r2      : {pair.pair_r2:.6f}")
     print(f"Pseudo freq  : {np.mean(pseudo):.6f}")
+    print(f"Specificity  : {leakage['pseudo_specificity']:.6f}")
+    print(f"Max bin corr : {leakage['max_binary_to_pseudo_corr']:.6f}")
+    print(f"Max dos corr : {leakage['max_dosage_to_pseudo_corr']:.6f}")
+    print(f"Assoc model  : {assoc_model_name}")
     for row in assoc_rows:
-        print(f"{row['feature']:14s} beta={row['beta']:.6f} p={row['p']:.6g}")
+        print(f"{row['feature']:14s} beta={float(row['beta']):.6f} pwald={float(row['pwald']):.6g}")
     print(f"Orig GRM eig : min={grm_repair['min_eig_before']:.6f}, neg={grm_repair['neg_eig_count_before']}")
     print(f"Orig -> LM   : full={validation['full_orig_grm'].get('switch_to_lm')}  na={validation['na_orig_grm'].get('switch_to_lm')}")
     print(f"PSD  -> LM   : full={validation['full_psd_grm'].get('switch_to_lm')}  na={validation['na_psd_grm'].get('switch_to_lm')}")

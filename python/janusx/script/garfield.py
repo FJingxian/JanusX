@@ -1008,7 +1008,7 @@ def main() -> None:
         ("Engine", "none (skip ML)" if ml_skipped else args.engine),
         ("Permutation", bool(args.permutation)),
         ("Structured pruning", not bool(args.no_clean)),
-        ("Prior len", "[" + ",".join(f"{x:g}" for x in args.prior_len_alpha) + "]"),
+        ("Prior len", "disabled (EB off)"),
         ("NOT control", "null penalty only"),
         ("Width", int(args.width)),
         ("Candidate ratio", float(args.candidate_ratio)),

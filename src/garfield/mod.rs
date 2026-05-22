@@ -75,6 +75,7 @@ const GARFIELD_SCAN_BEAM_MIN_GAIN: f64 = 0.01;
 const GARFIELD_SCAN_PAIR_PARENT_ABS_GAIN_MIN: f64 = 0.01;
 const GARFIELD_SCAN_SURROGATE_TEST_GAIN_MAX: f64 = 0.02;
 const GARFIELD_SCAN_SURROGATE_HAMMING_FRAC_MAX: f64 = 0.02;
+const GARFIELD_DISABLE_STRUCTURE_PRIOR: bool = true;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GarfieldInputKind {
@@ -5886,13 +5887,13 @@ fn garfield_logic_search_bed_owned(
     }
     let null_chunk_selected = null_chunk_prepared.len();
     let null_permutation_active = rule_permutation && !null_chunk_prepared.is_empty();
-    let representative_units_target = if rule_permutation {
+    let representative_units_target = if rule_permutation && !GARFIELD_DISABLE_STRUCTURE_PRIOR {
         DEFAULT_RULE_PERMUTATION_REPRESENTATIVE_UNITS.min(units.len())
     } else {
         0
     };
 
-    let representative_units = if rule_permutation {
+    let representative_units = if rule_permutation && !GARFIELD_DISABLE_STRUCTURE_PRIOR {
         choose_representative_indices(
             units
                 .iter()
@@ -6008,7 +6009,9 @@ fn garfield_logic_search_bed_owned(
         }
     }
     let representative_units_used = representative_prepared.len();
-    let soft_structure_mode = rule_permutation && !representative_prepared.is_empty();
+    let soft_structure_mode = rule_permutation
+        && !GARFIELD_DISABLE_STRUCTURE_PRIOR
+        && !representative_prepared.is_empty();
     let permutation_task_total = if null_permutation_active {
         null_chunk_prepared
             .len()

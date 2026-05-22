@@ -17,7 +17,7 @@ const GARFIELD_BEAM_PAR_CHUNK_CANDS: usize = 128;
 const GARFIELD_INITIAL_SINGLETON_NEGATIONS: [bool; 1] = [false];
 const GARFIELD_AND_PAIR_GAIN_SINGLETON_WEIGHT: f64 = 0.70;
 const GARFIELD_AND_PAIR_GAIN_SINGLETON_WEIGHT_WITH_NULL: f64 = 0.35;
-const GARFIELD_AND_TRIPLE_GAIN_SINGLETON_WEIGHT_WITH_NULL: f64 = 0.70;
+const GARFIELD_AND_TRIPLE_GAIN_SINGLETON_WEIGHT_WITH_NULL: f64 = 0.35;
 const GARFIELD_AND_ONLY_NOT_EXTRA_PENALTY_WITH_NULL: f64 = 0.15;
 const GARFIELD_AND_NOT_SHORTER_SUBRULE_GAIN_MAX: f64 = 0.08;
 const GARFIELD_AND_NOT_SHORTER_SUBRULE_HAMMING_FRAC_MAX: f64 = 0.05;
@@ -299,6 +299,29 @@ fn gain_singleton_baseline_weight(
 }
 
 #[inline]
+fn use_parent_delta_with_gate(
+    gate: GateBucket,
+    rule_len: usize,
+    not_count: usize,
+    params: &BeamSearchParams,
+) -> bool {
+    if params.disable_parent_delta || params.structure_prior.is_some() {
+        return false;
+    }
+    // Under permutation, pure positive 3-site AND rules should be judged by how much
+    // they improve on their best 2-site parent, not by a second singleton-style gap.
+    if matches!(gate, GateBucket::And)
+        && rule_len == 3
+        && not_count == 0
+        && params.null_penalties.is_some()
+    {
+        return true;
+    }
+    let delta_start_len = params.exhaustive_depth.max(1).saturating_add(1).max(3);
+    rule_len > delta_start_len
+}
+
+#[inline]
 fn implicit_gate_penalty(gate: GateBucket, not_count: usize, params: &BeamSearchParams) -> f64 {
     if matches!(gate, GateBucket::And)
         && not_count > 0
@@ -395,21 +418,16 @@ pub fn rank_rule_score_components_with_bucket(
 
 #[inline]
 fn use_parent_delta(rule_len: usize, params: &BeamSearchParams) -> bool {
-    if params.disable_parent_delta || params.structure_prior.is_some() {
-        return false;
-    }
-    let delta_start_len = params.exhaustive_depth.max(1).saturating_add(1).max(3);
-    rule_len > delta_start_len
+    use_parent_delta_with_gate(GateBucket::And, rule_len, 0, params)
 }
 
 #[inline]
 fn rule_rank_score_from_abs(
     abs_score: f64,
     parent_abs_score: Option<f64>,
-    rule_len: usize,
-    params: &BeamSearchParams,
+    use_parent_delta: bool,
 ) -> f64 {
-    if use_parent_delta(rule_len, params) {
+    if use_parent_delta {
         abs_score - parent_abs_score.unwrap_or(0.0)
     } else {
         abs_score
@@ -439,8 +457,8 @@ fn train_scores_for_rule(
         params,
     );
     let threshold = null_penalty_for_bucket(bucket, params, true);
-    let rank_score = if use_parent_delta(rule.len(), params) {
-        rule_rank_score_from_abs(abs_score, parent_abs_score, rule.len(), params) - threshold
+    let rank_score = if use_parent_delta_with_gate(gate, rule.len(), rule.not_count(), params) {
+        abs_score - parent_abs_score.unwrap_or(0.0) - threshold
     } else {
         abs_score - threshold
     };
@@ -566,11 +584,16 @@ fn score_strictly_improves(child_score: f64, parent_score: f64) -> bool {
 
 #[inline]
 fn keep_child_after_parent_gain_pruning(
-    child_rule_len: usize,
+    child_rule: &BeamRule,
     child_rank_score: f64,
     params: &BeamSearchParams,
 ) -> bool {
-    if !use_parent_delta(child_rule_len, params) {
+    let gate = if rule_is_pure_or(child_rule) {
+        GateBucket::Or
+    } else {
+        GateBucket::And
+    };
+    if !use_parent_delta_with_gate(gate, child_rule.len(), child_rule.not_count(), params) {
         return true;
     }
     score_strictly_improves(child_rank_score, 0.0)
@@ -1242,11 +1265,7 @@ fn expand_beam_once(
                             if !keep_state_after_min_gain_pruning(rule.len(), train_score, params) {
                                 continue;
                             }
-                            if !keep_child_after_parent_gain_pruning(
-                                rule.len(),
-                                train_score,
-                                params,
-                            ) {
+                            if !keep_child_after_parent_gain_pruning(&rule, train_score, params) {
                                 continue;
                             }
                             push_top_k_states(
@@ -1323,7 +1342,7 @@ fn expand_beam_once(
                         if !keep_state_after_min_gain_pruning(rule.len(), train_score, params) {
                             continue;
                         }
-                        if !keep_child_after_parent_gain_pruning(rule.len(), train_score, params) {
+                        if !keep_child_after_parent_gain_pruning(&rule, train_score, params) {
                             continue;
                         }
                         push_top_k_states(
@@ -1430,7 +1449,7 @@ fn expand_states_exhaustive(
                     if !keep_state_after_min_gain_pruning(rule.len(), train_score, params) {
                         continue;
                     }
-                    if !keep_child_after_parent_gain_pruning(rule.len(), train_score, params) {
+                    if !keep_child_after_parent_gain_pruning(&rule, train_score, params) {
                         continue;
                     }
                     let state = BeamState {
@@ -1488,7 +1507,9 @@ fn final_test_score_for_state(
         params,
     );
     let threshold = null_penalty_for_bucket(child_bucket, params, false);
-    if !use_parent_delta(state.rule.len(), params) {
+    let use_parent_delta =
+        use_parent_delta_with_gate(child_gate, state.rule.len(), state.rule.not_count(), params);
+    if !use_parent_delta {
         return Ok(child_abs_score - threshold);
     }
     let Some(parent_rule) = rule_parent(&state.rule) else {
@@ -1518,12 +1539,10 @@ fn final_test_score_for_state(
         parent_max_singleton_test_raw,
         params,
     );
-    Ok(rule_rank_score_from_abs(
-        child_abs_score,
-        Some(parent_abs_score),
-        state.rule.len(),
-        params,
-    ) - threshold)
+    Ok(
+        rule_rank_score_from_abs(child_abs_score, Some(parent_abs_score), use_parent_delta)
+            - threshold,
+    )
 }
 
 #[inline]
@@ -1566,7 +1585,13 @@ fn final_rule_score_for_eval(
     let bucket = bucket_from_rule(rule, raw.support_frac, params.logic_gate_mode);
     let abs_score = rule_abs_score_for_eval(rule, raw, literal_scores, is_train, params);
     let threshold = null_penalty_for_bucket(bucket, params, is_train);
-    if !use_parent_delta(rule.len(), params) {
+    let gate = if rule_is_pure_or(rule) {
+        GateBucket::Or
+    } else {
+        GateBucket::And
+    };
+    let use_parent_delta = use_parent_delta_with_gate(gate, rule.len(), rule.not_count(), params);
+    if !use_parent_delta {
         return Ok(abs_score - threshold);
     }
     let Some(parent_rule) = rule_parent(rule) else {
@@ -1584,7 +1609,7 @@ fn final_rule_score_for_eval(
     )?;
     let parent_abs_score =
         rule_abs_score_for_eval(&parent_rule, &parent_raw, literal_scores, is_train, params);
-    Ok(rule_rank_score_from_abs(abs_score, Some(parent_abs_score), rule.len(), params) - threshold)
+    Ok(rule_rank_score_from_abs(abs_score, Some(parent_abs_score), use_parent_delta) - threshold)
 }
 
 #[inline]
@@ -2587,7 +2612,7 @@ mod tests {
         };
         let triple_score =
             rank_rule_score_components_with_gate(GateBucket::And, 3, 0, 0.8, 0.6, &params);
-        assert!((triple_score - 0.38).abs() < 1e-12);
+        assert!((triple_score - 0.59).abs() < 1e-12);
     }
 
     #[test]
@@ -2701,17 +2726,142 @@ mod tests {
 
     #[test]
     fn test_parent_gain_pruning_requires_triple_to_beat_pair() {
-        let params = BeamSearchParams {
+        let pair_rule = BeamRule {
+            first: BeamLiteral {
+                row_index: 0,
+                group_id: 0,
+                negated: false,
+            },
+            rest: vec![(
+                BeamBinaryOp::And,
+                BeamLiteral {
+                    row_index: 1,
+                    group_id: 1,
+                    negated: false,
+                },
+            )],
+        };
+        let triple_rule = BeamRule {
+            first: BeamLiteral {
+                row_index: 0,
+                group_id: 0,
+                negated: false,
+            },
+            rest: vec![
+                (
+                    BeamBinaryOp::And,
+                    BeamLiteral {
+                        row_index: 1,
+                        group_id: 1,
+                        negated: false,
+                    },
+                ),
+                (
+                    BeamBinaryOp::And,
+                    BeamLiteral {
+                        row_index: 2,
+                        group_id: 2,
+                        negated: false,
+                    },
+                ),
+            ],
+        };
+        let quad_rule = BeamRule {
+            first: BeamLiteral {
+                row_index: 0,
+                group_id: 0,
+                negated: false,
+            },
+            rest: vec![
+                (
+                    BeamBinaryOp::And,
+                    BeamLiteral {
+                        row_index: 1,
+                        group_id: 1,
+                        negated: false,
+                    },
+                ),
+                (
+                    BeamBinaryOp::And,
+                    BeamLiteral {
+                        row_index: 2,
+                        group_id: 2,
+                        negated: false,
+                    },
+                ),
+                (
+                    BeamBinaryOp::And,
+                    BeamLiteral {
+                        row_index: 3,
+                        group_id: 3,
+                        negated: false,
+                    },
+                ),
+            ],
+        };
+        let params_default = BeamSearchParams {
             exhaustive_depth: 2,
             ..BeamSearchParams::default()
         };
-        assert!(keep_child_after_parent_gain_pruning(3, 0.0, &params));
-        assert!(keep_child_after_parent_gain_pruning(3, -0.001, &params));
-        assert!(keep_child_after_parent_gain_pruning(3, 0.01, &params));
-        assert!(keep_child_after_parent_gain_pruning(2, 0.0, &params));
-        assert!(!keep_child_after_parent_gain_pruning(4, 0.0, &params));
-        assert!(!keep_child_after_parent_gain_pruning(4, -0.001, &params));
-        assert!(keep_child_after_parent_gain_pruning(4, 0.01, &params));
+        assert!(keep_child_after_parent_gain_pruning(
+            &triple_rule,
+            0.0,
+            &params_default
+        ));
+        assert!(keep_child_after_parent_gain_pruning(
+            &triple_rule,
+            -0.001,
+            &params_default
+        ));
+        assert!(keep_child_after_parent_gain_pruning(
+            &triple_rule,
+            0.01,
+            &params_default
+        ));
+        assert!(keep_child_after_parent_gain_pruning(
+            &pair_rule,
+            0.0,
+            &params_default
+        ));
+        assert!(!keep_child_after_parent_gain_pruning(
+            &quad_rule,
+            0.0,
+            &params_default
+        ));
+        assert!(!keep_child_after_parent_gain_pruning(
+            &quad_rule,
+            -0.001,
+            &params_default
+        ));
+        assert!(keep_child_after_parent_gain_pruning(
+            &quad_rule,
+            0.01,
+            &params_default
+        ));
+
+        let params_perm = BeamSearchParams {
+            exhaustive_depth: 2,
+            logic_gate_mode: BeamLogicGateMode::AndOnly,
+            null_penalties: Some(Arc::new(
+                super::super::permutation::RuleNullPenaltyLookup::default(),
+            )),
+            ..BeamSearchParams::default()
+        };
+        assert!(!keep_child_after_parent_gain_pruning(
+            &triple_rule,
+            0.0,
+            &params_perm
+        ));
+        assert!(!keep_child_after_parent_gain_pruning(
+            &triple_rule,
+            -0.001,
+            &params_perm
+        ));
+        assert!(keep_child_after_parent_gain_pruning(
+            &triple_rule,
+            0.01,
+            &params_perm
+        ));
     }
 
     #[test]

@@ -22,7 +22,7 @@ use std::sync::OnceLock;
 use crate::bitwise::and_popcount;
 use crate::gfcore as core;
 use crate::gfcore::{BedSnpIter, HmpSnpIter, TxtSnpIter, VcfSnpIter};
-use crate::linalg::{chi2_stat_df1_from_sf, format_chisq_value};
+use crate::linalg::{chisq_from_beta_se_and_optional_plrt, format_chisq_value};
 use crate::vcfout::VcfOut;
 
 // -------- Py-exposed SiteInfo (wrapper) --------
@@ -197,14 +197,11 @@ impl GwasAssocTsvWriter {
                 transform_alleles_by_model_local(&s.ref_allele, &s.alt_allele, &self.model_key);
             let beta = res[[i, 0]];
             let se = res[[i, 1]];
-            let chisq = if has_plrt {
-                chi2_stat_df1_from_sf(res[[i, 3]])
-            } else if beta.is_finite() && se.is_finite() && se > 0.0 {
-                let z = beta / se;
-                z * z
-            } else {
-                f64::NAN
-            };
+            let chisq = chisq_from_beta_se_and_optional_plrt(
+                beta,
+                se,
+                if has_plrt { Some(res[[i, 3]]) } else { None },
+            );
             let chisq_txt = format_chisq_value(chisq);
             if has_plrt {
                 writeln!(

@@ -976,6 +976,10 @@ def _ld_prune_with_rust_filtered_pipeline(
     bp_max: int | None,
     ranges: list[tuple[str, int, int]] | None,
     logger,
+    filter_progress_callback=None,
+    filter_progress_every: int = 0,
+    prune_progress_callback=None,
+    prune_progress_every: int = 0,
 ) -> tuple[int, int, int, float, int]:
     if _bed_filter_to_plink_rust is None or _bed_prune_to_plink_rust is None:
         raise RuntimeError(
@@ -993,7 +997,7 @@ def _ld_prune_with_rust_filtered_pipeline(
     ]
     t0 = time.time()
     try:
-        filt_keep, _filt_scanned, out_n = _bed_filter_to_plink_rust(
+        filter_args = dict(
             src_prefix=str(src_prefix),
             out_prefix=str(tmp_prefix),
             maf_threshold=float(maf_threshold),
@@ -1009,6 +1013,20 @@ def _ld_prune_with_rust_filtered_pipeline(
             bp_max=bp_max,
             ranges=ranges,
         )
+        if filter_progress_callback is not None:
+            try:
+                filt_keep, _filt_scanned, out_n = _bed_filter_to_plink_rust(
+                    **filter_args,
+                    progress_callback=filter_progress_callback,
+                    progress_every=max(0, int(filter_progress_every)),
+                )
+            except TypeError as ex:
+                emsg = str(ex).lower()
+                if ("keyword" not in emsg) and ("argument" not in emsg) and ("positional" not in emsg):
+                    raise
+                filt_keep, _filt_scanned, out_n = _bed_filter_to_plink_rust(**filter_args)
+        else:
+            filt_keep, _filt_scanned, out_n = _bed_filter_to_plink_rust(**filter_args)
         filt_keep = int(filt_keep)
         out_n = int(out_n)
         if filt_keep <= 0:
@@ -1017,7 +1035,7 @@ def _ld_prune_with_rust_filtered_pipeline(
                 "(-extract/-chr/-from-bp/-to-bp/-maf/-geno/-het)."
             )
 
-        keep_n, total_n = _bed_prune_to_plink_rust(
+        prune_args = dict(
             src_prefix=str(tmp_prefix),
             out_prefix=str(out_prefix),
             window_bp=(
@@ -1034,6 +1052,20 @@ def _ld_prune_with_rust_filtered_pipeline(
             r2_threshold=float(spec.r2_threshold),
             threads=int(threads),
         )
+        if prune_progress_callback is not None:
+            try:
+                keep_n, total_n = _bed_prune_to_plink_rust(
+                    **prune_args,
+                    progress_callback=prune_progress_callback,
+                    progress_every=max(0, int(prune_progress_every)),
+                )
+            except TypeError as ex:
+                emsg = str(ex).lower()
+                if ("keyword" not in emsg) and ("argument" not in emsg) and ("positional" not in emsg):
+                    raise
+                keep_n, total_n = _bed_prune_to_plink_rust(**prune_args)
+        else:
+            keep_n, total_n = _bed_prune_to_plink_rust(**prune_args)
         keep_n = int(keep_n)
         total_n = int(total_n)
         if total_n != filt_keep:
@@ -1830,7 +1862,7 @@ def main() -> None:
                 total=1,
                 desc="Applying filters/slices",
                 force_animate=True,
-                keep_display=False,
+                keep_display=True,
                 show_remaining=True,
                 emit_done=False,
             )
@@ -2169,7 +2201,7 @@ def main() -> None:
                 total=pbar_total,
                 desc="Applying LD prune",
                 force_animate=True,
-                keep_display=False,
+                keep_display=True,
                 show_remaining=True,
                 emit_done=False,
             )
@@ -2223,6 +2255,119 @@ def main() -> None:
                 selected_n_sites = int(keep_n)
                 rust_prune_direct_done = True
                 prune_direct_backend = "rust-packed-io"
+                if keep_n <= 0:
+                    raise ValueError(
+                        "All variants were filtered out by LD prune; "
+                        "try a looser --prune r^2 threshold or larger window."
+                    )
+                log_success(
+                    logger,
+                    "Applying LD prune ...Finished "
+                    f"(backend={prune_direct_backend}, kept={keep_n}, dropped={int(prune_pre_sites - keep_n)})",
+                )
+            finally:
+                pbar.close()
+        elif use_rust_prune_filtered_direct and status_enabled:
+            pbar = ProgressAdapter(
+                total=max(1, int(n_sites)),
+                desc="Applying LD prune",
+                force_animate=True,
+                keep_display=True,
+                show_remaining=True,
+                emit_done=False,
+            )
+            filter_done = 0
+            filter_total = max(1, int(n_sites))
+            prune_done = 0
+            prune_total = 0
+            phase_offset = 0
+
+            def _on_filter_progress(done: int, total: int) -> None:
+                nonlocal filter_done, filter_total
+                try:
+                    d = int(done)
+                    t = int(total)
+                except Exception:
+                    return
+                t = int(max(1, t))
+                if filter_done == 0 and t != filter_total:
+                    filter_total = t
+                    pbar.set_total(filter_total)
+                d = int(max(0, min(d, filter_total)))
+                if d > filter_done:
+                    pbar.update(d - filter_done)
+                    filter_done = d
+
+            def _on_prune_progress(done: int, total: int) -> None:
+                nonlocal filter_done, prune_done, prune_total, phase_offset
+                try:
+                    d = int(done)
+                    t = int(total)
+                except Exception:
+                    return
+                if phase_offset <= 0:
+                    if filter_done < filter_total:
+                        pbar.update(filter_total - filter_done)
+                        filter_done = filter_total
+                    phase_offset = int(max(filter_done, filter_total))
+                prune_total = int(max(1, t))
+                pbar.set_total(int(max(1, phase_offset + prune_total)))
+                d = int(max(0, min(d, prune_total)))
+                combined_done = phase_offset + d
+                current_done = phase_offset + prune_done
+                if combined_done > current_done:
+                    pbar.update(combined_done - current_done)
+                    prune_done = d
+
+            try:
+                keep_n, total_n, pre_n, wall, out_n = _ld_prune_with_rust_filtered_pipeline(
+                    src_prefix=str(gfile),
+                    out_prefix=str(out_prefix),
+                    spec=prune_spec,
+                    threads=int(args.thread),
+                    maf_threshold=float(args.maf),
+                    max_missing_rate=float(args.geno),
+                    model=reader_model,
+                    het_threshold=reader_het,
+                    sample_ids=keep_sample_ids,
+                    snp_sites=push_snp_sites,
+                    bim_range=push_bim_range,
+                    chr_keys=(
+                        sorted(list(post_filter.chr_keys))
+                        if post_filter.chr_keys
+                        else None
+                    ),
+                    bp_min=(int(post_filter.bp_min) if post_filter.bp_min is not None else None),
+                    bp_max=(int(post_filter.bp_max) if post_filter.bp_max is not None else None),
+                    ranges=post_filter.ranges,
+                    logger=logger,
+                    filter_progress_callback=_on_filter_progress,
+                    filter_progress_every=0,
+                    prune_progress_callback=_on_prune_progress,
+                    prune_progress_every=max(1000, int(max(1, int(n_sites) // 200))),
+                )
+                rust_prune_direct_wall = float(wall)
+                prune_pre_sites = int(pre_n)
+                selected_n_sites = int(keep_n)
+                rust_prune_direct_done = True
+                prune_direct_backend = "rust-filter+prune-packed-io"
+                if keep_sample_ids is not None and int(out_n) != int(len(keep_sample_ids)):
+                    logger.warning(
+                        "Rust filtered-prune sample count mismatch: "
+                        f"writer={int(out_n)}, expected={int(len(keep_sample_ids))}"
+                    )
+                if filter_done < filter_total:
+                    pbar.update(filter_total - filter_done)
+                    filter_done = filter_total
+                phase_offset = int(max(filter_done, filter_total))
+                prune_total = int(max(1, int(total_n)))
+                pbar.set_total(int(max(1, phase_offset + prune_total)))
+                combined_done = phase_offset + int(total_n)
+                current_done = phase_offset + prune_done
+                if combined_done > current_done:
+                    pbar.update(combined_done - current_done)
+                    prune_done = int(total_n)
+                pbar.finish()
                 if keep_n <= 0:
                     raise ValueError(
                         "All variants were filtered out by LD prune; "

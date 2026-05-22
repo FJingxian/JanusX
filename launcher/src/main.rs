@@ -39,21 +39,26 @@ const LAUNCHER_VERSION_MARKER: &str = ".launcher_version";
 const RUNTIME_OWNER_MARKER: &str = ".launcher_runtime_owner";
 const UNINSTALL_HELPER_NAME: &str = "jx_uninstall_cleanup.cmd";
 const GWAS_HISTORY_DB_FILE: &str = "janusx_tasks.db";
-const KNOWN_MODULES: [&str; 21] = [
+const KNOWN_MODULES: [&str; 29] = [
     "grm",
     "pca",
     "gwas",
     "postgwas",
+    "gstats",
     "gs",
     "reml",
+    "postgs",
     "garfield",
     "postgarfield",
     "postbsa",
     "fastq2count",
     "fastq2vcf",
     "kmer",
+    "kmerge",
+    "view",
     "adamixture",
     "tree",
+    "treeplot",
     "hybrid",
     "gformat",
     "gmerge",
@@ -61,8 +66,11 @@ const KNOWN_MODULES: [&str; 21] = [
     "sim",
     "simulation",
     "benchmark",
+    "gblupbench",
+    "bayesbench",
+    "garfieldbench",
 ];
-const MODULE_LIST_ENTRIES: [(&str, &str); 21] = [
+const MODULE_LIST_ENTRIES: [(&str, &str); 29] = [
     ("grm", "Build genomic relationship matrix"),
     (
         "pca",
@@ -70,11 +78,13 @@ const MODULE_LIST_ENTRIES: [(&str, &str); 21] = [
     ),
     ("gwas", "Run genome-wide association analysis"),
     ("postgwas", "Post-process GWAS results and downstream plots"),
+    ("gstats", "Genotype statistics and QC summaries"),
     ("gs", "Genomic prediction and model-based selection"),
     (
         "reml",
         "Estimate heritability/effect components by REML-BLUP",
     ),
+    ("postgs", "Summarize and visualize GS results"),
     ("garfield", "Random-forest based marker-trait association"),
     ("postgarfield", "Summarize and visualize GARFIELD outputs"),
     ("postbsa", "Post-process and visualize BSA results"),
@@ -84,11 +94,17 @@ const MODULE_LIST_ENTRIES: [(&str, &str); 21] = [
     ),
     ("fastq2vcf", "Variant-calling pipeline from FASTQ to VCF"),
     ("kmer", "K-mer counting from FASTQ/FASTA to KMC database"),
+    (
+        "kmerge",
+        "Merge multi-sample KMC databases into genotype matrix",
+    ),
+    ("view", "View .bin/.bin.site as plain text for shell pipes"),
     ("adamixture", "ADAMIXTURE ancestry inference"),
     (
         "tree",
         "Tree workflow entry (-nj Neighbor-Joining / -ml Rust ML v1)",
     ),
+    ("treeplot", "Visualize Newick/GRM trees with toytree"),
     (
         "hybrid",
         "Build pairwise hybrid genotype matrix from parent lists",
@@ -104,6 +120,15 @@ const MODULE_LIST_ENTRIES: [(&str, &str); 21] = [
     (
         "benchmark",
         "FarmCPU benchmark workflow (JanusX/GAPIT/rMVP)",
+    ),
+    (
+        "gblupbench",
+        "GBLUP benchmark workflow (JanusX/sommer/rrBLUP)",
+    ),
+    ("bayesbench", "Packed Bayes kernel benchmark workflow"),
+    (
+        "garfieldbench",
+        "GARFIELD local-interval benchmark workflow",
     ),
 ];
 const MIN_PYTHON_MAJOR: u32 = 3;
@@ -246,20 +271,10 @@ fn run() -> Result<i32, String> {
     if head == "fastq2vcf" {
         return fastq2vcf::run_fastq2vcf_module(&args[1..]);
     }
-    if !is_known_module(head) {
-        println!("{}", style_yellow(&format!("Unknown module: {head}")));
-        print_cli_help();
-        return Ok(1);
-    }
-
     let home = runtime_home()?;
     let python = ensure_runtime(false)?;
     let _ = maybe_auto_warmup(&home)?;
     run_python_janusx(&python, &args)
-}
-
-fn is_known_module(name: &str) -> bool {
-    KNOWN_MODULES.contains(&name)
 }
 
 fn is_installer_binary() -> bool {
@@ -5596,6 +5611,13 @@ fn print_cli_help() {
         12,
         width,
     );
+    print_help_entry(
+        4,
+        "gstats",
+        "Genotype statistics and QC summaries",
+        12,
+        width,
+    );
     println!();
     println!("  {}", style_blue("Genomic Selection (GS):"));
     print_help_entry(
@@ -5612,6 +5634,7 @@ fn print_cli_help() {
         12,
         width,
     );
+    print_help_entry(4, "postgs", "Summarize and visualize GS results", 12, width);
     println!();
     println!(
         "  {}",
@@ -5665,11 +5688,32 @@ fn print_cli_help() {
         12,
         width,
     );
+    print_help_entry(
+        4,
+        "kmerge",
+        "Merge multi-sample KMC databases into genotype matrix",
+        12,
+        width,
+    );
+    print_help_entry(
+        4,
+        "view",
+        "View .bin/.bin.site as plain text for shell pipes",
+        12,
+        width,
+    );
     print_help_entry(4, "adamixture", "ADAMIXTURE ancestry inference", 12, width);
     print_help_entry(
         4,
         "tree",
         "Tree workflow entry (-nj Neighbor-Joining / -ml Rust ML v1)",
+        12,
+        width,
+    );
+    print_help_entry(
+        4,
+        "treeplot",
+        "Visualize Newick/GRM trees with toytree",
         12,
         width,
     );
@@ -5712,6 +5756,27 @@ fn print_cli_help() {
         12,
         width,
     );
+    print_help_entry(
+        4,
+        "gblupbench",
+        "GBLUP benchmark workflow (JanusX/sommer/rrBLUP)",
+        12,
+        width,
+    );
+    print_help_entry(
+        4,
+        "bayesbench",
+        "Packed Bayes kernel benchmark workflow",
+        12,
+        width,
+    );
+    print_help_entry(
+        4,
+        "garfieldbench",
+        "GARFIELD local-interval benchmark workflow",
+        12,
+        width,
+    );
 }
 
 fn run_list(args: &[String]) -> Result<i32, String> {
@@ -5740,6 +5805,50 @@ fn print_module_list() {
     for (name, desc) in MODULE_LIST_ENTRIES {
         print_help_entry(2, name, desc, 14, width);
     }
+    let extra_modules = runtime_only_module_names();
+    if !extra_modules.is_empty() {
+        println!();
+        println!("{}", style_orange("Additional Runtime Modules:"));
+        for name in extra_modules {
+            print_help_entry(2, &name, "Python runtime module", 14, width);
+        }
+    }
+}
+
+fn runtime_only_module_names() -> Vec<String> {
+    let home = match runtime_home() {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let python = match ready_core_python(&home) {
+        Some(v) => v,
+        None => return Vec::new(),
+    };
+    let output = match Command::new(&python)
+        .env("JANUSX_ENTRYPOINT", "jx")
+        .arg("-c")
+        .arg("from janusx.script.JanusX import _MODULE_NAMES as M; print('\\n'.join(M))")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+    {
+        Ok(v) if v.status.success() => v,
+        _ => return Vec::new(),
+    };
+    let stdout = match String::from_utf8(output.stdout) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let known: BTreeSet<&str> = KNOWN_MODULES.iter().copied().collect();
+    let mut extras = BTreeSet::new();
+    for line in stdout.lines() {
+        let name = line.trim();
+        if name.is_empty() || known.contains(name) {
+            continue;
+        }
+        extras.insert(name.to_string());
+    }
+    extras.into_iter().collect()
 }
 
 fn print_dlc_list() -> Result<(), String> {

@@ -21,6 +21,7 @@ from janusx.script._common.packedctx import (
 
 from .workflow import (
     CliStatus,
+    FastLMM,
     LMM,
     _ProgressAdapter,
     _augment_gwas_tsv_with_snp_names,
@@ -29,11 +30,13 @@ from .workflow import (
     _display_path,
     _emit_trait_header,
     _emit_warning_line,
+    _fastlmm_should_switch_to_lmm,
     _gwas_eigh_from_grm,
     _gwas_evd_stage_ctx,
     _gwas_scan_stage_ctx,
     _log_file_only,
     _log_model_line,
+    _mixed_model_switch_to_lm_decision,
     _read_bim_sites,
     _resolve_stream_scan_chunk_size,
     _rich_success,
@@ -298,6 +301,21 @@ def _prepare_packed_bed_once_for_gwas(
     return str(prefix), full_ids, packed_ctx, sites_all
 
 
+def _packed_preload_ready_state(
+    *,
+    prefix: str,
+    full_ids: np.ndarray,
+    packed_ctx: dict[str, object],
+    sites_all: list[tuple[str, int, str, str]],
+) -> dict[str, object]:
+    return {
+        "prefix": str(prefix),
+        "full_ids": np.asarray(full_ids, dtype=str),
+        "packed_ctx": packed_ctx,
+        "sites_all": list(sites_all),
+    }
+
+
 def prepare_memmap_filtered_bed_for_gwas(
     *,
     genofile: str,
@@ -401,6 +419,7 @@ def run_fastlmm_packed_fullrank(
     trait_names: Union[list[str], None] = None,
     emit_trait_header: bool = True,
     preloaded_packed: Union[dict[str, object], None] = None,
+    force_model: bool = False,
 ) -> None:
     required_symbols = [
         "grm_packed_f64_with_stats",
@@ -421,6 +440,12 @@ def run_fastlmm_packed_fullrank(
         snps_only=bool(snps_only),
         use_spinner=bool(use_spinner),
         preloaded_packed=preloaded_packed,
+    )
+    packed_preload_ready = _packed_preload_ready_state(
+        prefix=prefix,
+        full_ids=full_ids,
+        packed_ctx=packed_ctx,
+        sites_all=sites_all,
     )
     id_to_idx = {sid: i for i, sid in enumerate(full_ids)}
     try:
@@ -627,6 +652,147 @@ def run_fastlmm_packed_fullrank(
                 )
                 fixed_lbd = None
                 fixed_ml0 = None
+
+        null_pve: Optional[float] = None
+        null_ml0: Optional[float] = fixed_ml0
+        try:
+            vg0 = float(np.mean(np.asarray(s_trait, dtype=np.float64)))
+            if (
+                fixed_lbd is not None
+                and np.isfinite(vg0)
+                and np.isfinite(float(fixed_lbd))
+                and (vg0 + float(fixed_lbd)) > 0.0
+            ):
+                null_pve = float(vg0 / (vg0 + float(fixed_lbd)))
+        except Exception:
+            null_pve = None
+
+        if (not bool(force_model)) and (null_pve is None or null_ml0 is None):
+            try:
+                py_fast_t0 = time.monotonic()
+                stage_threads = max(1, int(threads))
+                with _gwas_evd_stage_ctx(stage_threads):
+                    null_fast_mod = FastLMM(
+                        y=y_vec,
+                        X=x_arg,
+                        kinship=np.array(grm_fit, copy=True),
+                    )
+                evd_secs += max(time.monotonic() - py_fast_t0, 0.0)
+                try:
+                    pve_tmp = float(getattr(null_fast_mod, "pve"))
+                    if np.isfinite(pve_tmp):
+                        null_pve = pve_tmp
+                except Exception:
+                    pass
+                try:
+                    ml0_tmp = float(getattr(null_fast_mod, "ML0"))
+                    if np.isfinite(ml0_tmp):
+                        null_ml0 = ml0_tmp
+                except Exception:
+                    pass
+            except Exception as ex:
+                _emit_warning_line(
+                    logger,
+                    f"FastLMM Python null fallback unavailable for switch decision; continuing without pre-scan switch. reason={ex}",
+                    use_spinner=bool(use_spinner),
+                )
+
+        if (not bool(force_model)) and _fastlmm_should_switch_to_lmm(null_pve):
+            prev_pve = float(null_pve) if null_pve is not None else float("nan")
+            logger.warning(
+                f"Warning: FastLMM switch to LMM for trait {pname}: "
+                f"null PVE={prev_pve:.4f} (>0.995)."
+            )
+            _log_model_line(
+                logger,
+                "LMM",
+                (
+                    f"switched from FastLMM null to LMM: "
+                    f"PVE(null)={prev_pve:.4f} (>0.995) "
+                    f"[{format_elapsed(evd_secs)}]"
+                ),
+                use_spinner=bool(use_spinner),
+            )
+            run_lmm_packed_fullrank(
+                genofile=genofile,
+                pheno=pheno,
+                ids=ids,
+                grm=grm,
+                outprefix=outprefix,
+                maf_threshold=maf_threshold,
+                max_missing_rate=max_missing_rate,
+                genetic_model=genetic_model,
+                het_threshold=het_threshold,
+                chunk_size=chunk_size,
+                qmatrix=qmatrix,
+                cov_all=cov_all,
+                plot=plot,
+                threads=threads,
+                logger=logger,
+                use_spinner=use_spinner,
+                snps_only=bool(snps_only),
+                eff_snp_by_trait=eff_snp_by_trait,
+                summary_rows=summary_rows,
+                saved_paths=saved_paths,
+                trait_names=[str(pname)],
+                emit_trait_header=False,
+                preloaded_packed=packed_preload_ready,
+                force_model=bool(force_model),
+            )
+            if multi_trait_mode:
+                logger.info("")
+            continue
+
+        if (not bool(force_model)) and (null_ml0 is not None):
+            switch_to_lm, lrt_stat, lrt_p = _mixed_model_switch_to_lm_decision(
+                y_vec=y_vec,
+                x_cov=x_cov,
+                lmm_ml0=null_ml0,
+                alpha=0.05,
+            )
+            if switch_to_lm:
+                logger.warning(
+                    f"Warning: FastLMM switch to LM for trait {pname}: "
+                    f"null LRT stat={float(lrt_stat):.4g}, p={float(lrt_p):.4g} (>=0.05)."
+                )
+                _log_model_line(
+                    logger,
+                    "LM",
+                    (
+                        f"switched from FastLMM null to LM "
+                        f"(LRT stat={float(lrt_stat):.4g}, p={float(lrt_p):.4g}) "
+                        f"[{format_elapsed(evd_secs)}]"
+                    ),
+                    use_spinner=bool(use_spinner),
+                )
+                run_lm_packed_fullrank(
+                    genofile=genofile,
+                    pheno=pheno,
+                    ids=ids,
+                    outprefix=outprefix,
+                    maf_threshold=maf_threshold,
+                    max_missing_rate=max_missing_rate,
+                    genetic_model=genetic_model,
+                    het_threshold=het_threshold,
+                    chunk_size=chunk_size,
+                    qmatrix=qmatrix,
+                    cov_all=cov_all,
+                    plot=plot,
+                    threads=threads,
+                    logger=logger,
+                    use_spinner=use_spinner,
+                    snps_only=bool(snps_only),
+                    eff_snp_by_trait=eff_snp_by_trait,
+                    summary_rows=summary_rows,
+                    saved_paths=saved_paths,
+                    trait_names=[str(pname)],
+                    emit_trait_header=False,
+                    preloaded_packed=packed_preload_ready,
+                    force_model=bool(force_model),
+                )
+                if multi_trait_mode:
+                    logger.info("")
+                continue
 
         gwas_total = int(len(sites_all))
         gwas_last_done = 0
@@ -874,6 +1040,7 @@ def run_lm_packed_fullrank(
     trait_names: Union[list[str], None] = None,
     emit_trait_header: bool = True,
     preloaded_packed: Union[dict[str, object], None] = None,
+    force_model: bool = False,
 ) -> None:
     if not hasattr(jxrs, "glmf32_packed_assoc_to_tsv"):
         raise RuntimeError(
@@ -892,6 +1059,12 @@ def run_lm_packed_fullrank(
         snps_only=bool(snps_only),
         use_spinner=bool(use_spinner),
         preloaded_packed=preloaded_packed,
+    )
+    packed_preload_ready = _packed_preload_ready_state(
+        prefix=prefix,
+        full_ids=full_ids,
+        packed_ctx=packed_ctx,
+        sites_all=sites_all,
     )
     id_to_idx = {sid: i for i, sid in enumerate(full_ids)}
     try:
@@ -1560,6 +1733,7 @@ def run_lmm_packed_fullrank(
     trait_names: Union[list[str], None] = None,
     emit_trait_header: bool = True,
     preloaded_packed: Union[dict[str, object], None] = None,
+    force_model: bool = False,
 ) -> None:
     if not hasattr(jxrs, "lmm_reml_assoc_packed_f32_to_tsv"):
         raise RuntimeError(
@@ -1580,6 +1754,12 @@ def run_lmm_packed_fullrank(
         snps_only=bool(snps_only),
         use_spinner=bool(use_spinner),
         preloaded_packed=preloaded_packed,
+    )
+    packed_preload_ready = _packed_preload_ready_state(
+        prefix=prefix,
+        full_ids=full_ids,
+        packed_ctx=packed_ctx,
+        sites_all=sites_all,
     )
     id_to_idx = {sid: i for i, sid in enumerate(full_ids)}
     try:
@@ -1670,6 +1850,56 @@ def run_lmm_packed_fullrank(
                 header_pve = pve_tmp
         except Exception:
             header_pve = None
+        if not bool(force_model):
+            switch_to_lm, lrt_stat, lrt_p = _mixed_model_switch_to_lm_decision(
+                y_vec=y_vec,
+                x_cov=x_cov,
+                lmm_ml0=getattr(mod, "ML0", None),
+                alpha=0.05,
+            )
+            if switch_to_lm:
+                logger.warning(
+                    f"Warning: LMM switch to LM for trait {pname}: "
+                    f"null LRT stat={float(lrt_stat):.4g}, p={float(lrt_p):.4g} (>=0.05)."
+                )
+                _log_model_line(
+                    logger,
+                    "LM",
+                    (
+                        f"switched from LMM null to LM "
+                        f"(LRT stat={float(lrt_stat):.4g}, p={float(lrt_p):.4g}) "
+                        f"[{format_elapsed(evd_secs)}]"
+                    ),
+                    use_spinner=bool(use_spinner),
+                )
+                run_lm_packed_fullrank(
+                    genofile=genofile,
+                    pheno=pheno,
+                    ids=ids,
+                    outprefix=outprefix,
+                    maf_threshold=maf_threshold,
+                    max_missing_rate=max_missing_rate,
+                    genetic_model=genetic_model,
+                    het_threshold=het_threshold,
+                    chunk_size=chunk_size,
+                    qmatrix=qmatrix,
+                    cov_all=cov_all,
+                    plot=plot,
+                    threads=threads,
+                    logger=logger,
+                    use_spinner=use_spinner,
+                    snps_only=bool(snps_only),
+                    eff_snp_by_trait=eff_snp_by_trait,
+                    summary_rows=summary_rows,
+                    saved_paths=saved_paths,
+                    trait_names=[str(pname)],
+                    emit_trait_header=False,
+                    preloaded_packed=packed_preload_ready,
+                    force_model=bool(force_model),
+                )
+                if multi_trait_mode:
+                    logger.info("")
+                continue
         _log_model_line(
             logger,
             "LMM",

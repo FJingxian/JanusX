@@ -189,7 +189,7 @@ from janusx.assoc.workflow_cache import (
 )
 
 _FASTLMM_PVE_LOW = 0.05
-_FASTLMM_PVE_HIGH = 0.95
+_FASTLMM_PVE_HIGH = 0.995
 _SECTION_WIDTH = 60
 _GWAS_PROGRESS_BAR_WIDTH = 30
 
@@ -236,7 +236,7 @@ def _replace_file_with_retry(
             raise
 
 
-def _fastlmm_pve_is_degenerate(pve: Optional[float]) -> bool:
+def _fastlmm_should_switch_to_lmm(pve: Optional[float]) -> bool:
     if pve is None:
         return False
     try:
@@ -245,7 +245,49 @@ def _fastlmm_pve_is_degenerate(pve: Optional[float]) -> bool:
         return False
     if not np.isfinite(v):
         return False
-    return bool(v < _FASTLMM_PVE_LOW or v > _FASTLMM_PVE_HIGH)
+    return bool(v > _FASTLMM_PVE_HIGH)
+
+
+def _mixed_model_switch_to_lm_decision(
+    *,
+    y_vec: np.ndarray,
+    x_cov: np.ndarray,
+    lmm_ml0: Optional[float],
+    alpha: float = 0.05,
+) -> tuple[bool, float, float]:
+    """
+    Decide whether a mixed-model null fit should collapse to LM.
+
+    This compares the null-model log-likelihood against the plain LM null
+    model under the boundary test H0: Va = 0.
+    """
+    ml0 = None
+    try:
+        if lmm_ml0 is not None:
+            ml0_tmp = float(lmm_ml0)
+            if np.isfinite(ml0_tmp):
+                ml0 = ml0_tmp
+    except Exception:
+        ml0 = None
+
+    if ml0 is None:
+        raise RuntimeError(
+            "Mixed-model -> LM switch decision requires finite null ML (ml0)."
+        )
+    if not hasattr(jxrs, "gwas_lmm_lm_null_lrt_decision"):
+        raise RuntimeError(
+            "Rust symbol gwas_lmm_lm_null_lrt_decision is unavailable."
+        )
+    y_arr = np.ascontiguousarray(np.asarray(y_vec, dtype=np.float64).reshape(-1))
+    x_arr = np.ascontiguousarray(np.asarray(x_cov, dtype=np.float64))
+    switch_to_lm, lrt_stat, pval, _lm_ml0 = jxrs.gwas_lmm_lm_null_lrt_decision(
+        y_arr,
+        x_arr,
+        float(ml0),
+        float(alpha),
+        True,
+    )
+    return bool(switch_to_lm), float(lrt_stat), float(pval)
 
 
 def _chi2_sf_df1_vec(stat: np.ndarray) -> np.ndarray:
@@ -2260,6 +2302,7 @@ def prepare_streaming_context(
     snps_only: bool = True,
     allow_packed_grm: bool = False,
     preload_packed_context: bool = False,
+    require_bed_stream: bool = False,
 ):
     """
     Prepare all shared resources for streaming LMM/LM once:
@@ -2340,7 +2383,12 @@ def prepare_streaming_context(
             stream_genofile = str(cp)
             break
 
-    need_bed_cache_now = bool(require_kinship or allow_packed_grm or preload_packed_context)
+    need_bed_cache_now = bool(
+        require_kinship
+        or allow_packed_grm
+        or preload_packed_context
+        or require_bed_stream
+    )
     if need_bed_cache_now and (_as_plink_prefix(stream_genofile) is None):
         try:
             delim = "," if str(stream_genofile).lower().endswith(".csv") else None
@@ -2367,10 +2415,17 @@ def prepare_streaming_context(
                 f"continuing with source input. reason={ex}",
                 use_spinner=bool(use_spinner),
             )
+        if bool(require_bed_stream) and (_as_plink_prefix(stream_genofile) is None):
+            raise RuntimeError(
+                "Streaming GWAS requires PLINK BED input/prefix or successful BED cache "
+                "materialization from the source genotype file."
+            )
 
     # In fast/farmcpu mode, preload packed BED once right after genotype meta
-    # is known, then reuse for GRM and downstream GWAS/FarmCPU stages.
-    if bool(allow_packed_grm) and bool(preload_packed_context):
+    # is known, then reuse for downstream GWAS/FarmCPU stages. This keeps the
+    # packed-BED loading step adjacent to genotype inspection even for LM-only
+    # fast runs that do not need a packed GRM.
+    if bool(preload_packed_context):
         try:
             prefix0, full_ids0, packed_ctx0, sites0 = _prepare_packed_bed_once_for_gwas(
                 genofile=stream_genofile,
@@ -2510,7 +2565,6 @@ def prepare_streaming_context(
     if (
         (not packed_preload_is_ready(preloaded_packed))
         and (not packed_preload_is_disabled(preloaded_packed))
-        and bool(allow_packed_grm)
         and bool(preload_packed_context)
     ):
         try:
@@ -4602,6 +4656,13 @@ def parse_args(argv: Optional[list[str]] = None):
         ),
     )
     optional_group.add_argument(
+        "-force-model", "--force-model", action="store_true", default=False,
+        help=(
+            "Force the requested GWAS model(s) and disable automatic "
+            "FastLMM->LMM / mixed-model->LM switching."
+        ),
+    )
+    optional_group.add_argument(
         "-t", "--thread", type=int, default=detect_effective_threads(),
         help="Number of CPU threads (default: %(default)s).",
     )
@@ -4957,6 +5018,7 @@ def _run_gwas_pipeline(
                     snps_only=bool(args.snps_only),
                     allow_packed_grm=bool(allow_packed_grm_effective),
                     preload_packed_context=bool(fast_mode),
+                    require_bed_stream=bool(stream_selected),
                 )
                 if (
                     bool(fast_mode)
@@ -5160,6 +5222,7 @@ def _run_gwas_pipeline(
                             trait_names=trait_one,
                             emit_trait_header=bool(emit_trait_header_model),
                             preloaded_packed=preloaded_packed,
+                            force_model=bool(args.force_model),
                         )
 
                     def _run_route_lmm_packed(
@@ -5189,6 +5252,7 @@ def _run_gwas_pipeline(
                             trait_names=trait_one,
                             emit_trait_header=bool(emit_trait_header_model),
                             preloaded_packed=preloaded_packed,
+                            force_model=bool(args.force_model),
                         )
 
                     def _run_route_fastlmm_packed(
@@ -5218,6 +5282,7 @@ def _run_gwas_pipeline(
                             trait_names=trait_one,
                             emit_trait_header=bool(emit_trait_header_model),
                             preloaded_packed=preloaded_packed,
+                            force_model=bool(args.force_model),
                         )
 
                     def _run_route_fastlmm_stream(
@@ -5254,6 +5319,7 @@ def _run_gwas_pipeline(
                                 getattr(args, "_chunksize_user_set", True)
                             ),
                             prefer_packed_fullrust=bool(fast_mode),
+                            force_model=bool(args.force_model),
                         )
 
                     def _run_route_lm_stream(
@@ -5290,6 +5356,7 @@ def _run_gwas_pipeline(
                                 getattr(args, "_chunksize_user_set", True)
                             ),
                             prefer_packed_fullrust=bool(fast_mode),
+                            force_model=bool(args.force_model),
                         )
 
                     def _run_route_lmm_stream(
@@ -5326,6 +5393,7 @@ def _run_gwas_pipeline(
                                 getattr(args, "_chunksize_user_set", True)
                             ),
                             prefer_packed_fullrust=bool(fast_mode),
+                            force_model=bool(args.force_model),
                         )
 
                     def _run_route_farmcpu(

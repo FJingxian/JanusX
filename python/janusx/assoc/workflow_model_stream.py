@@ -28,7 +28,9 @@ from .workflow import (
     _as_plink_prefix,
     _display_path,
     _emit_trait_header,
+    _fastlmm_should_switch_to_lmm,
     _format_progress_metric,
+    _mixed_model_switch_to_lm_decision,
     _gwas_evd_stage_ctx,
     _gwas_scan_stage_ctx,
     _log_file_only,
@@ -198,47 +200,6 @@ def _filter_snps_only_chunk_python_fallback(
     )
 
 
-def _fastlmm_switch_to_lm_decision(
-    *,
-    y_vec: np.ndarray,
-    x_cov: np.ndarray,
-    lmm_ml0: Optional[float],
-    alpha: float = 0.05,
-) -> tuple[bool, Optional[float], Optional[float]]:
-    """
-    Decide whether FastLMM should switch to LM for a trait.
-
-    Rust null-LRT decision (H0: Va=0 boundary test), Rust-only mode.
-    """
-    ml0 = None
-    try:
-        if lmm_ml0 is not None:
-            ml0_tmp = float(lmm_ml0)
-            if np.isfinite(ml0_tmp):
-                ml0 = ml0_tmp
-    except Exception:
-        ml0 = None
-
-    if ml0 is None:
-        raise RuntimeError(
-            "FastLMM Rust-only switch decision requires finite LMM null ML (ml0)."
-        )
-    if not hasattr(jxrs, "gwas_lmm_lm_null_lrt_decision"):
-        raise RuntimeError(
-            "Rust symbol gwas_lmm_lm_null_lrt_decision is unavailable."
-        )
-    y_arr = np.ascontiguousarray(np.asarray(y_vec, dtype=np.float64).reshape(-1))
-    x_arr = np.ascontiguousarray(np.asarray(x_cov, dtype=np.float64))
-    switch_to_lm, lrt_stat, pval, _lm_ml0 = jxrs.gwas_lmm_lm_null_lrt_decision(
-        y_arr,
-        x_arr,
-        float(ml0),
-        float(alpha),
-        True,  # boundary mixture: 0.5*chi2_1 for H0: Va=0
-    )
-    return bool(switch_to_lm), float(lrt_stat), float(pval)
-
-
 def run_chunked_gwas_lmm_lm(
     model_name: str,
     genofile: str,
@@ -269,6 +230,7 @@ def run_chunked_gwas_lmm_lm(
     emit_trait_header: bool = True,
     chunk_size_user_set: bool = True,
     prefer_packed_fullrust: bool = False,
+    force_model: bool = False,
 ) -> None:
     """
     Run LMM/FastLMM/LM GWAS using a streaming pipeline.
@@ -429,6 +391,7 @@ def run_chunked_gwas_lmm_lm(
                 saved_paths=saved_paths,
                 trait_names=trait_names,
                 emit_trait_header=emit_trait_header,
+                force_model=bool(force_model),
             )
             return
         reasons: list[str] = []
@@ -557,6 +520,7 @@ def run_chunked_gwas_lmm_lm(
                 summary_rows=summary_rows,
                 saved_paths=saved_paths,
                 chunk_size_user_set=bool(chunk_size_user_set),
+                force_model=bool(force_model),
             )
             if multi_trait_mode and trait_idx < len(trait_iter) - 1:
                 logger.info("")
@@ -649,8 +613,35 @@ def run_chunked_gwas_lmm_lm(
                 header_pve = None
             evd_secs = time.monotonic() - evd_t0
             evd_elapsed = format_elapsed(evd_secs)
-            if model_key == "fastlmm":
-                switch_to_lm, lrt_stat, lrt_p = _fastlmm_switch_to_lm_decision(
+            init_log_message = None
+            if (not bool(force_model)) and model_key == "fastlmm" and _fastlmm_should_switch_to_lmm(header_pve):
+                prev_pve = float(header_pve) if header_pve is not None else float("nan")
+                logger.warning(
+                    f"Warning: FastLMM switch to LMM for trait {pname}: "
+                    f"null PVE={prev_pve:.4f} (>0.995)."
+                )
+                lmm_t0 = time.monotonic()
+                stage_threads = max(1, int(threads))
+                with _gwas_evd_stage_ctx(stage_threads):
+                    mod = LMM(y=y_vec, X=X_cov, kinship=Ksub)
+                evd_secs += max(time.monotonic() - lmm_t0, 0.0)
+                evd_elapsed = format_elapsed(evd_secs)
+                effective_model_key = "lmm"
+                effective_model_label = "LMM"
+                effective_model_tag = "lmm"
+                try:
+                    pve_tmp = float(mod.pve)
+                    header_pve = pve_tmp if np.isfinite(pve_tmp) else None
+                except Exception:
+                    header_pve = None
+                init_log_message = (
+                    f"switched from FastLMM null to LMM: "
+                    f"PVE(null)={prev_pve:.4f} (>0.995) [{evd_elapsed}]"
+                )
+
+            if (not bool(force_model)) and effective_model_key in {"lmm", "fastlmm"}:
+                source_label = str(effective_model_label)
+                switch_to_lm, lrt_stat, lrt_p = _mixed_model_switch_to_lm_decision(
                     y_vec=y_vec,
                     x_cov=X_cov,
                     lmm_ml0=getattr(mod, "ML0", None),
@@ -658,19 +649,24 @@ def run_chunked_gwas_lmm_lm(
                 )
                 if switch_to_lm:
                     logger.warning(
-                        f"Warning: FastLMM switch to LM for trait {pname}: "
+                        f"Warning: {source_label} switch to LM for trait {pname}: "
                         f"null LRT stat={float(lrt_stat):.4g}, p={float(lrt_p):.4g} (>=0.05)."
                     )
                     stage_threads = max(1, int(threads))
                     with _gwas_evd_stage_ctx(stage_threads):
                         mod = LM(y=y_vec, X=X_cov)
                     init_log_message = (
-                        f"switched from FastLMM null to LM [{evd_elapsed}]"
+                        f"switched from {source_label} null to LM "
+                        f"(LRT stat={float(lrt_stat):.4g}, p={float(lrt_p):.4g}) "
+                        f"[{evd_elapsed}]"
                     )
                     effective_model_key = "lm"
                     effective_model_label = "LM"
                     effective_model_tag = "lm"
-            init_log_message = f"PVE(null) ~ {mod.pve:.3f}; eigen-decomposition [{evd_elapsed}]"
+                    header_pve = None
+
+            if init_log_message is None:
+                init_log_message = f"PVE(null) ~ {mod.pve:.3f}; eigen-decomposition [{evd_elapsed}]"
         else:
             mod = ModelCls(y=y_vec, X=X_cov)
             init_log_message = "streaming scan initialized"
@@ -1135,6 +1131,7 @@ def run_chunked_gwas_streaming_shared(
     summary_rows: Union[list[dict[str, object]], None] = None,
     saved_paths: Union[list[str], None] = None,
     chunk_size_user_set: bool = True,
+    force_model: bool = False,
 ) -> None:
     """
     Shared-chunk streaming GWAS for multiple models on one trait.
@@ -1435,8 +1432,41 @@ def run_chunked_gwas_streaming_shared(
             except Exception:
                 pve_now = None
 
-        if mkey == "fastlmm":
-            switch_to_lm, lrt_stat, lrt_p = _fastlmm_switch_to_lm_decision(
+        if (not bool(force_model)) and mkey == "fastlmm" and _fastlmm_should_switch_to_lmm(pve_now):
+            prev_pve = float(pve_now) if pve_now is not None else float("nan")
+            logger.warning(
+                f"Warning: FastLMM switch to LMM for trait {pname}: "
+                f"null PVE={prev_pve:.4f} (>0.995)."
+            )
+            if share_evd_lmm_fast and shared_lmm_model is not None:
+                mod = shared_lmm_model
+            else:
+                if shared_ksub is None:
+                    shared_ksub = grm[np.ix_(keep_idx, keep_idx)]
+                lmm_t0 = time.monotonic()
+                stage_threads = max(1, int(threads))
+                with _gwas_evd_stage_ctx(stage_threads):
+                    mod = LMM(y=y_vec, X=X_cov, kinship=shared_ksub)
+                ctx["evd_secs"] = float(ctx["evd_secs"]) + max(time.monotonic() - lmm_t0, 0.0)
+                if share_evd_lmm_fast and shared_lmm_model is None:
+                    shared_lmm_model = mod
+            effective_model_key = "lmm"
+            effective_model_label = "LMM"
+            effective_model_tag = "lmm"
+            try:
+                pve_tmp = float(getattr(mod, "pve"))
+                pve_now = pve_tmp if np.isfinite(pve_tmp) else None
+            except Exception:
+                pve_now = None
+            ctx["init_log"] = (
+                f"switched from FastLMM null to LMM: "
+                f"PVE(null)={prev_pve:.4f} (>0.995) "
+                f"[{format_elapsed(float(ctx['evd_secs']))}]"
+            )
+
+        if (not bool(force_model)) and effective_model_key in {"lmm", "fastlmm"}:
+            source_label = str(effective_model_label)
+            switch_to_lm, lrt_stat, lrt_p = _mixed_model_switch_to_lm_decision(
                 y_vec=y_vec,
                 x_cov=X_cov,
                 lmm_ml0=getattr(mod, "ML0", None),
@@ -1444,18 +1474,21 @@ def run_chunked_gwas_streaming_shared(
             )
             if switch_to_lm:
                 logger.warning(
-                    f"Warning: FastLMM switch to LM for trait {pname}: "
+                    f"Warning: {source_label} switch to LM for trait {pname}: "
                     f"null LRT stat={float(lrt_stat):.4g}, p={float(lrt_p):.4g} (>=0.05)."
                 )
                 stage_threads = max(1, int(threads))
                 with _gwas_evd_stage_ctx(stage_threads):
                     mod = LM(y=y_vec, X=X_cov)
                 ctx["init_log"] = (
-                    f"switched from FastLMM null to LM [{format_elapsed(float(ctx['evd_secs']))}]"
+                    f"switched from {source_label} null to LM "
+                    f"(LRT stat={float(lrt_stat):.4g}, p={float(lrt_p):.4g}) "
+                    f"[{format_elapsed(float(ctx['evd_secs']))}]"
                 )
                 effective_model_key = "lm"
                 effective_model_label = "LM"
                 effective_model_tag = "lm"
+                pve_now = None
 
         cpu_after = process.cpu_times()
         ctx["cpu_used"] = float(
@@ -1466,6 +1499,10 @@ def run_chunked_gwas_streaming_shared(
         ctx["model_tag"] = effective_model_tag
         if effective_model_tag != model_tag:
             out_base = _stream_model_outbase(effective_model_tag)
+            existing_out = {str(prev.get("out_tsv", "")) for prev in model_ctxs}
+            candidate_out = f"{out_base}.tsv"
+            if candidate_out in existing_out:
+                out_base = _stream_model_outbase(f"{model_tag}_to_{effective_model_tag}")
             ctx["tmp_tsv"] = (
                 f"{out_base}.tsv.tmp.{os.getpid()}.{uuid.uuid4().hex}"
             )

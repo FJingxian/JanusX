@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import math
 import os
 import re
@@ -717,6 +718,20 @@ def check_jx_available() -> None:
 
 
 def import_janusx_runtime() -> tuple[object, object]:
+    def _purge_janusx_modules() -> None:
+        stale = [
+            name
+            for name in list(sys.modules.keys())
+            if name == "janusx" or name.startswith("janusx.")
+        ]
+        for name in stale:
+            sys.modules.pop(name, None)
+
+    def _import_pair() -> tuple[object, object]:
+        janusx = importlib.import_module("janusx")  # type: ignore
+        jxrs = importlib.import_module("janusx.janusx")  # type: ignore
+        return janusx, jxrs
+
     use_local_py = env_truthy("JX_GGVAL_USE_LOCAL_PYTHON", False)
     if use_local_py:
         py_root = ROOT_DIR / "python"
@@ -738,17 +753,16 @@ def import_janusx_runtime() -> tuple[object, object]:
         sys.path[:] = cleaned
 
     try:
-        import janusx  # type: ignore
-        from janusx import janusx as jxrs  # type: ignore
-        return janusx, jxrs
+        _purge_janusx_modules()
+        return _import_pair()
     except Exception as ex:  # pragma: no cover - runtime environment dependent
         if not use_local_py:
             py_root = ROOT_DIR / "python"
             if str(py_root) not in sys.path:
                 sys.path.insert(0, str(py_root))
             try:
-                import janusx  # type: ignore
-                from janusx import janusx as jxrs  # type: ignore
+                _purge_janusx_modules()
+                janusx, jxrs = _import_pair()
                 print("NOTE: janusx site-packages import failed; fallback to local python/janusx.")
                 return janusx, jxrs
             except Exception as ex2:

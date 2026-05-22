@@ -1805,39 +1805,82 @@ def main() -> None:
         filter_desc = "Applying filters/slices..."
         if not status_enabled:
             logger.info(filter_desc)
-        with CliStatus(filter_desc, enabled=status_enabled) as task:
+        call_args = dict(
+            src_prefix=str(gfile),
+            out_prefix=str(out_prefix),
+            maf_threshold=float(args.maf),
+            max_missing_rate=float(args.geno),
+            fill_missing=False,
+            model=reader_model,
+            het_threshold=reader_het,
+            sample_ids=direct_keep_sample_ids,
+            snp_sites=push_snp_sites,
+            bim_range=push_bim_range,
+            chr_keys=(
+                sorted(list(post_filter.chr_keys))
+                if post_filter.chr_keys
+                else None
+            ),
+            bp_min=(int(post_filter.bp_min) if post_filter.bp_min is not None else None),
+            bp_max=(int(post_filter.bp_max) if post_filter.bp_max is not None else None),
+            ranges=post_filter.ranges,
+        )
+        if status_enabled:
+            pbar = ProgressAdapter(
+                total=1,
+                desc="Applying filters/slices",
+                force_animate=True,
+                keep_display=False,
+                show_remaining=True,
+                emit_done=False,
+            )
+            direct_done = 0
+            direct_total = 1
+
+            def _on_direct_filter_progress(done: int, total: int) -> None:
+                nonlocal direct_done, direct_total
+                try:
+                    d = int(done)
+                    t = int(total)
+                except Exception:
+                    return
+                if t > 0 and t != direct_total and direct_done == 0:
+                    direct_total = t
+                    pbar.set_total(int(max(1, direct_total)))
+                d = int(max(0, d))
+                d = int(min(d, max(1, direct_total)))
+                if d > direct_done:
+                    pbar.update(d - direct_done)
+                    direct_done = d
+
             try:
                 t_direct = time.time()
-                keep_n, scanned_n, out_n = _bed_filter_to_plink_rust(
-                    src_prefix=str(gfile),
-                    out_prefix=str(out_prefix),
-                    maf_threshold=float(args.maf),
-                    max_missing_rate=float(args.geno),
-                    fill_missing=False,
-                    model=reader_model,
-                    het_threshold=reader_het,
-                    sample_ids=direct_keep_sample_ids,
-                    snp_sites=push_snp_sites,
-                    bim_range=push_bim_range,
-                    chr_keys=(
-                        sorted(list(post_filter.chr_keys))
-                        if post_filter.chr_keys
-                        else None
-                    ),
-                    bp_min=(int(post_filter.bp_min) if post_filter.bp_min is not None else None),
-                    bp_max=(int(post_filter.bp_max) if post_filter.bp_max is not None else None),
-                    ranges=post_filter.ranges,
-                )
-                rust_filter_direct_wall = float(time.time() - t_direct)
-                selected_n_sites = int(keep_n)
-                dropped_n = int(max(0, int(scanned_n) - int(keep_n)))
-                task.complete(
-                    "Applying filters/slices ...Finished "
-                    f"(backend=rust-packed-io, kept={int(keep_n)}, dropped={dropped_n})"
-                )
-            except Exception:
-                task.fail("Applying filters/slices ...Failed")
-                raise
+                try:
+                    keep_n, scanned_n, out_n = _bed_filter_to_plink_rust(
+                        **call_args,
+                        progress_callback=_on_direct_filter_progress,
+                        progress_every=0,
+                    )
+                except TypeError as ex:
+                    emsg = str(ex).lower()
+                    if ("keyword" not in emsg) and ("argument" not in emsg) and ("positional" not in emsg):
+                        raise
+                    keep_n, scanned_n, out_n = _bed_filter_to_plink_rust(**call_args)
+                scanned_n = int(scanned_n)
+                if scanned_n > 0 and direct_done < scanned_n:
+                    pbar.set_total(scanned_n)
+                    pbar.update(scanned_n - direct_done)
+                    direct_done = scanned_n
+                if scanned_n > 0:
+                    pbar.finish()
+            finally:
+                pbar.close()
+        else:
+            t_direct = time.time()
+            keep_n, scanned_n, out_n = _bed_filter_to_plink_rust(**call_args)
+        rust_filter_direct_wall = float(time.time() - t_direct)
+        selected_n_sites = int(keep_n)
+        dropped_n = int(max(0, int(scanned_n) - int(keep_n)))
         if not status_enabled:
             logger.info(
                 "Applying filters/slices ...Finished "

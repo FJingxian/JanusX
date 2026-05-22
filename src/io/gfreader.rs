@@ -1465,6 +1465,8 @@ fn write_plink_subset_filtered_packed(
     max_missing_rate: f32,
     apply_het_filter: bool,
     het_threshold: f32,
+    progress_callback: Option<&Py<PyAny>>,
+    progress_every: usize,
 ) -> Result<usize, String> {
     if out_sample_ids.is_empty() {
         return Err("No samples selected.".to_string());
@@ -1560,6 +1562,39 @@ fn write_plink_subset_filtered_packed(
 
     let mut kept = 0usize;
     let mut out_row = vec![0u8; out_bytes_per_snp];
+    let total_selected = selected_snp_indices.len();
+    let notify_step = if progress_every == 0 {
+        (total_selected / 200).max(1)
+    } else {
+        progress_every.max(1)
+    };
+    let mut last_notified = 0usize;
+    if let Some(cb) = progress_callback {
+        Python::attach(|py2| -> PyResult<()> {
+            py2.check_signals()?;
+            cb.call1(py2, (0usize, total_selected))?;
+            Ok(())
+        })
+        .map_err(|e| e.to_string())?;
+    }
+    let mut notify_progress = |done: usize| -> Result<(), String> {
+        let done_clamped = done.min(total_selected);
+        if done_clamped < last_notified.saturating_add(notify_step)
+            && done_clamped != total_selected
+        {
+            return Ok(());
+        }
+        last_notified = done_clamped;
+        Python::attach(|py2| -> PyResult<()> {
+            py2.check_signals()?;
+            if let Some(cb) = progress_callback {
+                cb.call1(py2, (done_clamped, total_selected))?;
+            }
+            Ok(())
+        })
+        .map_err(|e| e.to_string())
+    };
+    let mut processed = 0usize;
 
     if prefix_identity {
         let block_target_bytes = 8 * 1024 * 1024usize;
@@ -1677,6 +1712,8 @@ fn write_plink_subset_filtered_packed(
                 }
                 kept = kept.saturating_add(1);
             }
+            processed = processed.saturating_add(rows_n);
+            notify_progress(processed)?;
         }
     } else {
         let n_words_src = n_source_samples.div_ceil(64);
@@ -1816,6 +1853,8 @@ fn write_plink_subset_filtered_packed(
                         .map_err(|e| format!("{out_bed}: {e}"))?;
                     kept = kept.saturating_add(1);
                 }
+                processed = processed.saturating_add(rows_n);
+                notify_progress(processed)?;
             }
             wbed.flush().map_err(|e| format!("{out_bed}: {e}"))?;
             wbim.flush().map_err(|e| format!("{out_bim}: {e}"))?;
@@ -1922,7 +1961,9 @@ fn write_plink_subset_filtered_packed(
                 apply_het_filter,
                 het_threshold,
             );
+            processed = processed.saturating_add(1);
             if !keep {
+                notify_progress(processed)?;
                 continue;
             }
 
@@ -1954,6 +1995,7 @@ fn write_plink_subset_filtered_packed(
             wbed.write_all(&out_row)
                 .map_err(|e| format!("{out_bed}: {e}"))?;
             kept = kept.saturating_add(1);
+            notify_progress(processed)?;
         }
     }
 
@@ -2361,6 +2403,8 @@ pub fn bed_mmap_filter_to_plink_rust(
     bp_min=None,
     bp_max=None,
     ranges=None,
+    progress_callback=None,
+    progress_every=0,
 ))]
 pub fn bed_filter_to_plink_rust(
     py: Python<'_>,
@@ -2378,6 +2422,8 @@ pub fn bed_filter_to_plink_rust(
     bp_min: Option<i32>,
     bp_max: Option<i32>,
     ranges: Option<Vec<(String, i32, i32)>>,
+    progress_callback: Option<Py<PyAny>>,
+    progress_every: usize,
 ) -> PyResult<(usize, usize, usize)> {
     let src = normalize_plink_prefix_local(&src_prefix);
     let out = normalize_plink_prefix_local(&out_prefix);
@@ -2452,6 +2498,8 @@ pub fn bed_filter_to_plink_rust(
                 max_missing_rate,
                 apply_het_filter,
                 het,
+                progress_callback.as_ref(),
+                progress_every,
             )?;
             Ok((n_kept, n_scanned, n_out_samples))
         })

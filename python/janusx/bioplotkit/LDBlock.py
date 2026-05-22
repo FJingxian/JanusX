@@ -1,10 +1,10 @@
 import numpy as np
 import matplotlib.patches as mpathes
-import itertools
 import matplotlib.pyplot as plt
 from matplotlib import colors as mcolors
 from matplotlib.colorbar import ColorbarBase
 from matplotlib.ticker import FixedLocator
+from matplotlib.transforms import Affine2D
 from typing import Optional
 
 from janusx.gfreader.gfreader import load_genotype_chunks
@@ -27,19 +27,18 @@ def LDblock(
     '''
     ax.set_xlim(0,n), 0.5 ~ n-0.5 n points, n=C.shape[0]=C.shape[1]
     '''
-    mask = np.triu(np.ones_like(C, dtype=bool), k=0) # 不包括对角线的上三角
-    C[mask] = np.nan
-    n = C.shape[0]
+    C_arr = np.asarray(C)
+    if C_arr.ndim != 2 or C_arr.shape[0] != C_arr.shape[1]:
+        raise ValueError(f"LDblock expects a square 2D matrix, got shape={C_arr.shape}")
+    n = C_arr.shape[0]
     if rasterized is None:
         do_rasterized = False
         if rasterize_threshold is not None:
             do_rasterized = bool(n > int(rasterize_threshold))
     else:
         do_rasterized = bool(rasterized)
-    # 创建旋转/缩放矩阵 (45度旋转伴随缩放)
-    t = np.array([[1, 0.5], [-1, 0.5]])
-    # 创建坐标矩阵并变换它
-    A = np.dot(np.array([(i[1], i[0]) for i in itertools.product(range(n,-1,-1), range(0,n+1,1))]), t)
+    mask = np.triu(np.ones((n, n), dtype=bool), k=0)  # 不包括对角线的上三角
+    C_plot = np.ma.array(C_arr, mask=mask, copy=False)
     # 绘制
     cmap_obj = plt.get_cmap(cmap) if isinstance(cmap, str) else cmap
     # Enforce "light -> dark" mapping so 0 is light and 1 is dark.
@@ -50,14 +49,20 @@ def LDblock(
             cmap_obj = cmap_obj.reversed()
     except Exception:
         pass
-    ax.pcolormesh(
-        A[:, 1].reshape(n + 1, n + 1),
-        A[:, 0].reshape(n + 1, n + 1),
-        np.flipud(C),
+    # Use an affine-transformed image instead of building an (n+1)^2 coordinate mesh.
+    # This keeps the diamond LD geometry but avoids the large temporary grid allocation.
+    cmap_obj = cmap_obj.with_extremes(bad=(1.0, 1.0, 1.0, 0.0))
+    image_transform = Affine2D.from_values(0.5, 1.0, 0.5, -1.0, 0.0, 0.0) + ax.transData
+    ax.imshow(
+        C_plot,
+        origin="lower",
+        extent=(0.0, float(n), 0.0, float(n)),
         cmap=cmap_obj,
         vmin=vmin,
         vmax=vmax,
         rasterized=do_rasterized,
+        interpolation="nearest",
+        transform=image_transform,
     )
     # Discrete 10-step vertical colorbar in a dedicated inset axis.
     # This avoids clipping/transform issues and guarantees visible tick labels.

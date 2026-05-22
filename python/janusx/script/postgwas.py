@@ -3157,7 +3157,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
 
             def _draw_ld_axis(ax: plt.Axes) -> None:
                 LDblock(
-                    ld_mat.copy(),
+                    ld_mat,
                     ax=ax,
                     vmin=0,
                     vmax=1,
@@ -4168,7 +4168,7 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
         ld_h_in = max(float(ld_h_in), float(width_in * _ld_min_height_over_width(max(2, int(ld_mat.shape[0])))))
         fig_ld = plt.figure(figsize=(width_in, ld_h_in), dpi=300)
         ax_ld = fig_ld.add_subplot(111)
-        LDblock(ld_mat.copy(), ax=ax_ld, vmin=0, vmax=1, cmap=ld_cmap, rasterize_threshold=100)
+        LDblock(ld_mat, ax=ax_ld, vmin=0, vmax=1, cmap=ld_cmap, rasterize_threshold=100)
         n_ld = max(2, int(ld_mat.shape[0]))
         # Keep LD triangle body filling the whole panel width.
         ax_ld.set_xlim(0.5, float(n_ld) - 0.5)
@@ -4422,7 +4422,7 @@ def _run_postgwas_ldblock_only(args, logger: logging.Logger) -> None:
         ax_ld = fig_ld.add_subplot(111)
         ax_gene = None
 
-    LDblock(ld_mat.copy(), ax=ax_ld, vmin=0, vmax=1, cmap=ld_cmap, rasterize_threshold=100)
+    LDblock(ld_mat, ax=ax_ld, vmin=0, vmax=1, cmap=ld_cmap, rasterize_threshold=100)
     n_ld = max(2, int(ld_mat.shape[0]))
     ax_ld.set_xlim(0.5, float(n_ld) - 0.5)
     ax_ld.margins(x=0.0)

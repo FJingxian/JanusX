@@ -9,8 +9,8 @@ use self::permutation::{
     null_topk_per_repeat_for_bucket, shuffled_copy_f64, RuleNullBucket, RuleNullCalibrator,
     RuleNullPenaltyLookup, RuleStructurePrior, RuleStructurePriorCalibrator,
     RuleStructurePriorConfig, DEFAULT_RULE_NULL_MIN_SNPS_PER_CHUNK,
-    DEFAULT_RULE_NULL_PHYSICAL_CHUNKS, DEFAULT_RULE_PERMUTATION_REPEATS,
-    DEFAULT_RULE_PERMUTATION_REPRESENTATIVE_UNITS, DEFAULT_RULE_STRUCTURE_BOOTSTRAP_KL_THRESHOLD,
+    DEFAULT_RULE_NULL_PHYSICAL_CHUNKS, DEFAULT_RULE_PERMUTATION_REPRESENTATIVE_UNITS,
+    DEFAULT_RULE_STRUCTURE_BOOTSTRAP_KL_THRESHOLD,
     DEFAULT_RULE_STRUCTURE_BOOTSTRAP_MAX_REPEATS, DEFAULT_RULE_STRUCTURE_BOOTSTRAP_MIN_REPEATS,
     DEFAULT_RULE_STRUCTURE_BOOTSTRAP_STABLE_REPEATS, DEFAULT_RULE_STRUCTURE_DENSITY_TOPK,
 };
@@ -6248,7 +6248,7 @@ fn garfield_logic_search_bed_owned(
     let permutation_task_total = if null_permutation_active {
         null_chunk_prepared
             .len()
-            .saturating_mul(DEFAULT_RULE_PERMUTATION_REPEATS)
+            .saturating_mul(perm_cfg.n_repeats.max(1))
     } else {
         0
     };
@@ -6281,7 +6281,7 @@ fn garfield_logic_search_bed_owned(
         let mut perm_tasks = Vec::<(usize, usize, u64)>::with_capacity(permutation_task_total);
         for (slot, (chunk, prepared)) in null_chunk_prepared.iter().enumerate() {
             let _ = prepared;
-            for rep in 0..DEFAULT_RULE_PERMUTATION_REPEATS {
+            for rep in 0..perm_cfg.n_repeats.max(1) {
                 let rep_seed = seed
                     ^ (chunk.window_id.wrapping_mul(0x94D0_49BB_1331_11EB))
                     ^ ((rep as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
@@ -6756,7 +6756,7 @@ fn garfield_logic_search_bed_owned(
         representative_units_target,
         representative_units_used,
         permutation_null_repeats: if null_permutation_active {
-            DEFAULT_RULE_PERMUTATION_REPEATS
+            perm_cfg.n_repeats.max(1)
         } else {
             0
         },

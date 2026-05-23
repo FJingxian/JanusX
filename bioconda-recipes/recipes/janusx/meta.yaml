@@ -14,23 +14,7 @@ build:
   number: 0
   skip: true  # [win or py<310]
   script_env:
-    - JANUSX_NET_MODE
-    - JANUSX_CARGO_REGISTRY
-    - JANUSX_CARGO_REGISTRIES
-    - JANUSX_CARGO_PROBE
-    - JANUSX_CARGO_PROBE_TIMEOUT
-    - CARGO_HTTP_TIMEOUT
-    - CARGO_HTTP_LOW_SPEED_LIMIT
-    - CARGO_HTTP_MULTIPLEXING
-    - CARGO_NET_RETRY
-    - HTTP_PROXY
-    - HTTPS_PROXY
-    - ALL_PROXY
-    - NO_PROXY
-    - http_proxy
-    - https_proxy
-    - all_proxy
-    - no_proxy
+    - CARGO_BUILD_JOBS
   run_exports:
     - {{ pin_subpackage('janusx', max_pin='x') }}
 

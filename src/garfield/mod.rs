@@ -6291,7 +6291,19 @@ fn garfield_logic_search_bed_owned(
             .min(perm_cfg.n_repeats.max(1));
         let mut stable_rounds = 0usize;
         let mut prev_lookup: Option<RuleNullPenaltyLookup> = None;
-        let perm_threads = threads_eff.min(null_chunk_prepared.len().max(1));
+        let perm_threads = threads_eff.min(
+            null_chunk_prepared
+                .len()
+                .saturating_mul(perm_cfg.n_repeats.max(1))
+                .max(1),
+        );
+        let repeats_per_batch = if null_chunk_prepared.is_empty() {
+            1usize
+        } else {
+            threads_eff
+                .div_ceil(null_chunk_prepared.len().max(1))
+                .clamp(1, 4)
+        };
         let perm_pool = if perm_threads > 1 {
             Some(
                 ThreadPoolBuilder::new()
@@ -6302,24 +6314,34 @@ fn garfield_logic_search_bed_owned(
         } else {
             None
         };
-        for rep in 0..perm_cfg.n_repeats.max(1) {
-            let rep_results = if let Some(pool) = perm_pool.as_ref() {
+        let max_perm_repeats = perm_cfg.n_repeats.max(1);
+        let mut rep_start = 0usize;
+        'perm_batches: while rep_start < max_perm_repeats {
+            let rep_end = (rep_start + repeats_per_batch).min(max_perm_repeats);
+            let mut batch_tasks =
+                Vec::<(usize, usize, u64)>::with_capacity(null_chunk_prepared.len() * (rep_end - rep_start));
+            for rep in rep_start..rep_end {
+                for (slot, (chunk, _prepared)) in null_chunk_prepared.iter().enumerate() {
+                    let rep_seed = seed
+                        ^ (chunk.window_id.wrapping_mul(0x94D0_49BB_1331_11EB))
+                        ^ ((rep as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+                        ^ ((slot as u64).wrapping_mul(0xA24B_AED4_963E_E407));
+                    batch_tasks.push((slot, rep, rep_seed));
+                }
+            }
+            let batch_results = if let Some(pool) = perm_pool.as_ref() {
                 pool.install(|| {
-                    null_chunk_prepared
+                    batch_tasks
                         .par_iter()
-                        .enumerate()
-                        .map(|(slot, (chunk, prepared))| {
-                            let rep_seed = seed
-                                ^ (chunk.window_id.wrapping_mul(0x94D0_49BB_1331_11EB))
-                                ^ ((rep as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
-                                ^ ((slot as u64).wrapping_mul(0xA24B_AED4_963E_E407));
+                        .map(|(slot, rep, rep_seed)| {
+                            let (_, prepared) = &null_chunk_prepared[*slot];
                             let out = collect_rule_permutation_nulls_for_repeat(
                                 prepared,
                                 train_fit.residualized_y.as_slice(),
                                 test_fit.residualized_y.as_slice(),
                                 split_applied,
                                 perm_beam_params.clone(),
-                                rep_seed,
+                                *rep_seed,
                             )?;
                             let done = null_progress_done.fetch_add(1, Ordering::Relaxed) + 1;
                             if done % null_notify_step == 0 || done == permutation_task_total {
@@ -6332,26 +6354,23 @@ fn garfield_logic_search_bed_owned(
                                 )
                                 .map_err(|e| e.to_string())?;
                             }
-                            Ok(out)
+                            Ok((*rep, out))
                         })
-                        .collect::<Vec<Result<Vec<(RuleNullBucket, f64, f64)>, String>>>()
+                        .collect::<Vec<Result<(usize, Vec<(RuleNullBucket, f64, f64)>), String>>>()
                 })
             } else {
-                let mut out = Vec::<Result<Vec<(RuleNullBucket, f64, f64)>, String>>::with_capacity(
-                    null_chunk_prepared.len(),
+                let mut out = Vec::<Result<(usize, Vec<(RuleNullBucket, f64, f64)>), String>>::with_capacity(
+                    batch_tasks.len(),
                 );
-                for (slot, (chunk, prepared)) in null_chunk_prepared.iter().enumerate() {
-                    let rep_seed = seed
-                        ^ (chunk.window_id.wrapping_mul(0x94D0_49BB_1331_11EB))
-                        ^ ((rep as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
-                        ^ ((slot as u64).wrapping_mul(0xA24B_AED4_963E_E407));
+                for (slot, rep, rep_seed) in batch_tasks.iter() {
+                    let (_, prepared) = &null_chunk_prepared[*slot];
                     let unit_out = collect_rule_permutation_nulls_for_repeat(
                         prepared,
                         train_fit.residualized_y.as_slice(),
                         test_fit.residualized_y.as_slice(),
                         split_applied,
                         perm_beam_params.clone(),
-                        rep_seed,
+                        *rep_seed,
                     );
                     let done = null_progress_done.fetch_add(1, Ordering::Relaxed) + 1;
                     if done % null_notify_step == 0 || done == permutation_task_total {
@@ -6364,31 +6383,37 @@ fn garfield_logic_search_bed_owned(
                         )
                         .map_err(|e| e.to_string())?;
                     }
-                    out.push(unit_out);
+                    out.push(unit_out.map(|v| (*rep, v)));
                 }
                 out
             };
-            for task_out in rep_results.into_iter() {
-                for (bucket, train_score, test_score) in task_out? {
+            let mut by_rep = vec![Vec::<(RuleNullBucket, f64, f64)>::new(); rep_end - rep_start];
+            for task_out in batch_results.into_iter() {
+                let (rep, vals) = task_out?;
+                by_rep[rep - rep_start].extend(vals);
+            }
+            for (rep_offset, rep_vals) in by_rep.into_iter().enumerate() {
+                for (bucket, train_score, test_score) in rep_vals.into_iter() {
                     bucket_scores.insert(bucket, train_score, test_score);
                 }
-            }
-            permutation_null_repeats_used = rep + 1;
-            if permutation_null_repeats_used < min_perm_repeats {
-                continue;
-            }
-            let current_lookup = bucket_scores.finalize();
-            if let Some(prev) = prev_lookup.as_ref() {
-                if current_lookup.q99_converged_against(prev) {
-                    stable_rounds += 1;
-                } else {
-                    stable_rounds = 0;
+                permutation_null_repeats_used = rep_start + rep_offset + 1;
+                if permutation_null_repeats_used < min_perm_repeats {
+                    continue;
+                }
+                let current_lookup = bucket_scores.finalize();
+                if let Some(prev) = prev_lookup.as_ref() {
+                    if current_lookup.q99_converged_against(prev) {
+                        stable_rounds += 1;
+                    } else {
+                        stable_rounds = 0;
+                    }
+                }
+                prev_lookup = Some(current_lookup);
+                if stable_rounds >= DEFAULT_RULE_NULL_ADAPTIVE_STABLE_REPEATS {
+                    break 'perm_batches;
                 }
             }
-            prev_lookup = Some(current_lookup);
-            if stable_rounds >= DEFAULT_RULE_NULL_ADAPTIVE_STABLE_REPEATS {
-                break;
-            }
+            rep_start = rep_end;
         }
         if null_progress_done.load(Ordering::Relaxed) < permutation_task_total {
             garfield_stage_progress_notify(
@@ -6591,7 +6616,7 @@ fn garfield_logic_search_bed_owned(
     };
     let unit_parallel_threads = threads_eff.min(scanned_units.max(1));
     let scan_beam_params = BeamSearchParams {
-        allow_parallel: unit_parallel_threads <= 1,
+        allow_parallel: unit_parallel_threads < threads_eff,
         ..beam_params.clone()
     };
     let skipped_messages = Arc::new(Mutex::new(Vec::<String>::new()));

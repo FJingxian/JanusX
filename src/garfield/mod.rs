@@ -6616,7 +6616,10 @@ fn garfield_logic_search_bed_owned(
     };
     let unit_parallel_threads = threads_eff.min(scanned_units.max(1));
     let scan_beam_params = BeamSearchParams {
-        allow_parallel: unit_parallel_threads < threads_eff,
+        // Keep nested parallelism enabled during scan. Rayon will reuse the same
+        // pool and lets a few heavy tail units fan out when outer unit-level
+        // parallelism no longer saturates all workers.
+        allow_parallel: true,
         ..beam_params.clone()
     };
     let skipped_messages = Arc::new(Mutex::new(Vec::<String>::new()));

@@ -9,14 +9,14 @@ pub const DEFAULT_RULE_NULL_PHYSICAL_CHUNKS: usize = 150;
 pub const DEFAULT_RULE_NULL_MIN_SNPS_PER_CHUNK: usize = 50;
 pub const DEFAULT_RULE_NULL_MAX_REPEATS: usize = 20;
 pub const DEFAULT_RULE_NULL_ADAPTIVE_MIN_REPEATS: usize = 5;
-pub const DEFAULT_RULE_NULL_ADAPTIVE_STABLE_REPEATS: usize = 3;
+pub const DEFAULT_RULE_NULL_ADAPTIVE_STABLE_REPEATS: usize = 2;
 pub const DEFAULT_RULE_STRUCTURE_BOOTSTRAP_MIN_REPEATS: usize = 5;
 pub const DEFAULT_RULE_STRUCTURE_BOOTSTRAP_MAX_REPEATS: usize = 30;
 pub const DEFAULT_RULE_STRUCTURE_BOOTSTRAP_STABLE_REPEATS: usize = 3;
 pub const DEFAULT_RULE_STRUCTURE_BOOTSTRAP_KL_THRESHOLD: f64 = 0.005;
 pub const DEFAULT_RULE_STRUCTURE_DENSITY_TOPK: usize = 10;
 const DEFAULT_RULE_NULL_QUANTILE: f64 = 0.99;
-const DEFAULT_RULE_NULL_Q99_REL_TOL: f64 = 0.02;
+const DEFAULT_RULE_NULL_Q99_REL_TOL: f64 = 0.05;
 const DEFAULT_RULE_NULL_TOPK_AND_LEN2: usize = 3;
 const DEFAULT_RULE_NULL_TOPK_AND_LEN3P: usize = 2;
 const DEFAULT_RULE_NULL_SHRINK_AND_LEN2_WEIGHTS: (f64, f64, f64) = (0.20, 0.50, 0.30);
@@ -654,18 +654,28 @@ impl RuleNullPenaltyLookup {
         if self.max_rule_len != prev.max_rule_len || self.use_gate_dim != prev.use_gate_dim {
             return false;
         }
-        let mut saw_bucket = false;
-        for idx in 0..rule_null_bucket_count(self.max_rule_len, self.use_gate_dim) {
-            let bucket = RuleNullBucket::from_exact_index(idx, self.max_rule_len, self.use_gate_dim);
-            saw_bucket = true;
-            if !penalty_value_converged(prev.train_penalty(bucket), self.train_penalty(bucket)) {
+        let mut saw_signal = false;
+        for idx in 0..rule_null_bucket_count(self.max_rule_len, false) {
+            let prev_train = prev.collapsed_gate_train.get(idx).copied().flatten();
+            let curr_train = self.collapsed_gate_train.get(idx).copied().flatten();
+            let prev_test = prev.collapsed_gate_test.get(idx).copied().flatten();
+            let curr_test = self.collapsed_gate_test.get(idx).copied().flatten();
+            saw_signal |= prev_train.is_some()
+                || curr_train.is_some()
+                || prev_test.is_some()
+                || curr_test.is_some();
+            if !penalty_value_converged(prev_train, curr_train) {
                 return false;
             }
-            if !penalty_value_converged(prev.test_penalty(bucket), self.test_penalty(bucket)) {
+            if !penalty_value_converged(prev_test, curr_test) {
                 return false;
             }
         }
-        saw_bucket
+        saw_signal |= prev.global_train.is_some()
+            || self.global_train.is_some()
+            || prev.global_test.is_some()
+            || self.global_test.is_some();
+        saw_signal
             && penalty_value_converged(prev.global_train, self.global_train)
             && penalty_value_converged(prev.global_test, self.global_test)
     }

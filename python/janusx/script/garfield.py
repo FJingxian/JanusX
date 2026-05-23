@@ -8,8 +8,11 @@ from typing import Optional
 
 import numpy as np
 
-from janusx.assoc.workflow import load_phenotype
-from janusx.gfreader import inspect_genotype_file
+from janusx.assoc.workflow import (
+    _inspect_genotype_with_status,
+    _load_covariates_for_models,
+    _load_phenotype_with_status,
+)
 from janusx.gtools.reader import readanno
 from janusx.script._common.colspec import parse_zero_based_index_specs
 from janusx.script._common.config_render import emit_cli_configuration
@@ -27,6 +30,7 @@ from janusx.script._common.pathcheck import (
 from janusx.script._common.progress import ProgressAdapter, build_rich_progress, rich_progress_available
 from janusx.script._common.status import CliStatus, log_success, print_failure, stdout_is_tty, success_symbol
 from janusx.script._common.threads import apply_outer_thread_cap, detect_effective_threads
+from janusx.assoc.workflow_ui import _emit_plain_info_line
 
 
 try:
@@ -604,15 +608,41 @@ def main() -> None:
     optional_group.add_argument("-ext", "--extension", type=int, default=100_000, help="Window extension in bp.")
     optional_group.add_argument("-slide", "-step", "--slide", "--step", dest="step", type=int, default=None, help="Window step size (default: extension/2).")
     optional_group.add_argument("-maf", "--maf", type=float, default=0.02, help="Minor allele frequency threshold.")
-    optional_group.add_argument("-geno", "--geno", type=float, default=0.05, help="Maximum missing rate threshold.")
-    optional_group.add_argument("-het", "--het", type=float, default=0.05, help="Maximum heterozygosity rate threshold; variants with het > threshold are dropped.")
-    optional_group.add_argument("-dev", "--dev", action="store_true", help="Use MBIN (HET/DOM/REC) encoding instead of BIN.")
+    optional_group.add_argument(
+        "-geno",
+        "--geno",
+        type=float,
+        default=0.05,
+        help="Maximum pure-line missing rate threshold; heterozygotes (1) and true missing (NA) are both counted as missing.",
+    )
+    optional_group.add_argument(
+        "-dev",
+        "--dev",
+        action="store_true",
+        help="Deprecated compatibility flag. Under pure-line GARFIELD it aliases BIN encoding.",
+    )
     optional_group.add_argument(
         "-k",
         "--grm",
         type=str,
         default=None,
         help="Optional precomputed GRM/kernel (.npy or text). If set, GARFIELD residualization uses this matrix and slices it for full/train/test subsets instead of rebuilding GRM from BED.",
+    )
+    optional_group.add_argument(
+        "-c",
+        "--cov",
+        action="append",
+        type=str,
+        default=None,
+        dest="cov_inputs",
+        help=(
+            "Additional covariate input (repeatable). Each -c accepts either: "
+            "(1) covariate file path, or "
+            "    covariate file format: first column sample ID, remaining columns numeric covariates; or "
+            "(2) single-site token chr:pos / chr:start:end (start must equal end, "
+            "supports full-width colon). "
+            "Examples: -c cov.tsv -c 1:1000 -c 1:1000:1000."
+        ),
     )
     optional_group.add_argument(
         "-kid",
@@ -787,8 +817,6 @@ def main() -> None:
         parser.error("-maf/--maf must be in [0, 0.5]")
     if not (0.0 <= float(args.geno) <= 1.0):
         parser.error("-geno/--geno must be in [0, 1]")
-    if not (0.0 <= float(args.het) <= 1.0):
-        parser.error("-het/--het must be in [0, 1]")
     if (
         args.grm is not None
         and args.fold is None
@@ -902,6 +930,9 @@ def main() -> None:
     )
     if args.feature_source not in {"bin", "mbin"}:
         parser.error("--feature-source must be one of: bin, mbin")
+    args.feature_source_requested = str(args.feature_source)
+    if args.feature_source == "mbin":
+        args.feature_source = "bin"
 
     if args.engine is not None:
         args.engine = str(args.engine).upper()
@@ -955,6 +986,11 @@ def main() -> None:
     log_path = os.path.join(args.out, f"{prefix}.garfield.log")
     logger = setup_logging(log_path)
     apply_outer_thread_cap(int(args.thread))
+    if args.feature_source_requested == "mbin":
+        logger.warning(
+            "MBIN encoding is deprecated for GARFIELD pure-line mode; using BIN instead "
+            "(heterozygotes and NA are both treated as missing before binary decoding)."
+        )
 
     ml_skipped = args.engine is None
     engine_runtime = "none" if ml_skipped else str(args.engine)
@@ -986,21 +1022,19 @@ def main() -> None:
     if feature_source not in {"bin", "mbin"}:
         raise ValueError(f"Unsupported feature-source: {args.feature_source}")
 
-    sample_ids, _ = inspect_genotype_file(gfile)
-
     general_rows = [
         ("Genotype input", gfile),
         ("Input kind", input_kind),
         ("Execution route", "direct Rust BED pipeline"),
         ("Encoding", feature_source),
-        ("Residualization GRM", args.grm),
+        ("Residualization GRM", args.grm if args.grm else "auto from genotype"),
+        ("Covariates", None if not args.cov_inputs else ",".join(str(x) for x in args.cov_inputs)),
         ("Phenotype", args.pheno),
         ("Scan mode", args.scan_mode),
         ("Gene file", args.genefile),
         ("GFF3", args.gff3),
         ("MAF", float(args.maf)),
-        ("Missing max", float(args.geno)),
-        ("Het max", float(args.het)),
+        ("Missing max (1+NA)", float(args.geno)),
         ("Extension", int(args.extension)),
         ("Slide", int(args.step)),
         ("Bimrange", None if not args.bimrange else ",".join(str(x) for x in args.bimrange)),
@@ -1038,6 +1072,23 @@ def main() -> None:
     #     rank_schedule_runtime,
     # )
 
+    pheno = _load_phenotype_with_status(
+        args.pheno,
+        args.ncol,
+        _GarfieldPhenoLogger(logger),
+        id_col=0,
+        use_spinner=use_spinner,
+    )
+
+    sample_ids, _n_snps = _inspect_genotype_with_status(
+        gfile,
+        logger,
+        use_spinner=use_spinner,
+        snps_only=False,
+        maf_threshold=float(args.maf),
+        max_missing_rate=float(args.geno),
+        het_threshold=0.0,
+    )
     sample_ids = np.asarray(sample_ids, dtype=str)
     if len(sample_ids) == 0:
         raise ValueError("No sample IDs found in genotype input.")
@@ -1046,7 +1097,8 @@ def main() -> None:
     aligned_grm = None
     resolved_grm_id = None
     if args.grm:
-        with CliStatus("Loading GARFIELD GRM...", enabled=use_spinner) as task:
+        grm_src = os.path.basename(str(args.grm))
+        with CliStatus(f"Loading GRM from {grm_src}...", enabled=use_spinner) as task:
             try:
                 aligned_grm, resolved_grm_id = load_and_align_grm(
                     str(args.grm),
@@ -1055,26 +1107,24 @@ def main() -> None:
                     label="GARFIELD GRM",
                 )
             except Exception:
-                task.fail("Loading GARFIELD GRM ...Failed")
+                task.fail(f"Loading GRM from {grm_src} ...Failed")
                 raise
-            task.complete("Loading GARFIELD GRM ...Finished")
-        # logger.info(
-        #     "GARFIELD residualization GRM: %s%s",
-        #     format_path_for_display(str(args.grm)),
-        #     (
-        #         f" (ID: {format_path_for_display(str(resolved_grm_id))})"
-        #         if resolved_grm_id is not None
-        #         else " (sample order assumed to match genotype input)"
-        #     ),
-        # )
+            task.complete(f"Loading GRM from {grm_src} (n={aligned_grm.shape[0]})")
 
-    with CliStatus("Loading phenotype...", enabled=use_spinner) as task:
-        try:
-            pheno = load_phenotype(args.pheno, args.ncol, _GarfieldPhenoLogger(logger), id_col=0)
-        except Exception:
-            task.fail("Loading phenotype ...Failed")
-            raise
-        task.complete("Loading phenotype ...Finished")
+    cov_all, cov_ids = _load_covariates_for_models(
+        cov_inputs=args.cov_inputs,
+        genofile=gfile,
+        sample_ids=sample_ids,
+        chunk_size=65536,
+        logger=logger,
+        context="streaming",
+        use_spinner=use_spinner,
+        snps_only=False,
+    )
+    if cov_all is not None:
+        cov_all = np.asarray(cov_all, dtype=np.float64, order="C")
+    if cov_ids is not None:
+        cov_ids = np.asarray(cov_ids, dtype=str)
 
     if pheno.shape[1] == 0:
         raise ValueError("No phenotype columns to analyze.")
@@ -1102,11 +1152,33 @@ def main() -> None:
     #             "Rust GARFIELD pipeline: no train/test split -> residualize full phenotype -> "
     #             "ML + beam search on full data -> full-data ranking."
     #         )
-
-    pheno_all_ids = set(pheno.index.astype(str).to_numpy())
-    sample_pool = [sid for sid in sample_ids.tolist() if sid in pheno_all_ids]
+    geno_ids = sample_ids.astype(str)
+    pheno_ids_all = pheno.index.astype(str).to_numpy()
+    common = set(geno_ids) & set(pheno_ids_all)
+    if aligned_grm is not None:
+        common &= set(geno_ids)
+    if cov_ids is not None:
+        common &= set(cov_ids.astype(str))
+    sample_pool = [sid for sid in geno_ids.tolist() if sid in common]
     if len(sample_pool) == 0:
-        raise ValueError("No overlapping samples between genotype and phenotype.")
+        raise ValueError("No overlapping samples across genotype/phenotype/GRM/cov.")
+
+    grm_n: int | str = "NA" if aligned_grm is None else int(aligned_grm.shape[0])
+    cov_n: int | str = "NA" if cov_ids is None else int(len(cov_ids))
+    _emit_plain_info_line(
+        logger,
+        (
+            f"geno={len(geno_ids)}, pheno={len(pheno_ids_all)}, "
+            f"grm={grm_n}, q=NA, cov={cov_n} -> {len(sample_pool)}"
+        ),
+        use_spinner=use_spinner,
+    )
+
+    cov_index = (
+        None
+        if cov_ids is None
+        else {sid: i for i, sid in enumerate(cov_ids.astype(str).tolist())}
+    )
 
     group_labels: list[str] = []
     group_intervals: list[list[tuple[str, int, int]]] = []
@@ -1176,6 +1248,10 @@ def main() -> None:
                 aligned_grm[np.ix_(common_positions, common_positions)],
                 dtype=np.float64,
             )
+        trait_cov = None
+        if cov_all is not None and cov_index is not None:
+            cov_take = np.asarray([cov_index[sid] for sid in common_ids], dtype=np.intp)
+            trait_cov = np.asarray(cov_all[cov_take, :], dtype=np.float64, order="C")
         scan_desc = {
             "window": "Scan Windows",
             "gene": "Scan Genes",
@@ -1195,6 +1271,7 @@ def main() -> None:
                 gfile,
                 np.asarray(y_common, dtype=np.float64),
                 grm=trait_grm,
+                x_cov=trait_cov,
                 sample_ids=list(common_ids),
                 unit_kind=logic_unit_kind,
                 groups=rust_groups,
@@ -1225,7 +1302,6 @@ def main() -> None:
                 candidate_keep_ratio=float(args.candidate_ratio),
                 maf_threshold=float(args.maf),
                 max_missing_rate=float(args.geno),
-                het_threshold=float(args.het),
                 snps_only=False,
                 block_cols=65536,
                 threads=int(args.thread),
@@ -1253,6 +1329,13 @@ def main() -> None:
         posterior_tsv_path = f"{trait_logic_prefix}.posterior.tsv"
         posterior_json_path = result.get("posterior_json")
         run_config_path = f"{trait_outprefix}.garfield.run_config.json"
+        skipped_messages = result.get("skipped_messages") or []
+        if len(skipped_messages) > 0:
+            logger.warning(
+                f"GARFIELD skipped {len(skipped_messages)} unit(s) for trait '{trait_name}'."
+            )
+            for msg in skipped_messages:
+                logger.warning(str(msg))
         n_rules = int(result.get("n_rules", 0))
         if n_rules <= 0:
             _remove_file_if_exists(pseudo_path)
@@ -1340,7 +1423,7 @@ def main() -> None:
             "grm_id_path": resolved_grm_id,
             "maf": float(args.maf),
             "geno": float(args.geno),
-            "het": float(args.het),
+            "pure_line_missing_rule": "heterozygote_or_na",
             "simbench_path": args.simbench,
             "simbench_rows": int(result.get("n_simbench", 0)),
             "seed": trait_seed,

@@ -928,6 +928,7 @@ pub fn grm_packed_f64_from_stats_rust(
     Ok((grm, varsum))
 }
 
+
 #[inline]
 fn decode_grm_stream_block_into_f64(
     it: &mut BedSnpIter,

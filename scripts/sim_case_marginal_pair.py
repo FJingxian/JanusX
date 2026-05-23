@@ -356,7 +356,18 @@ def _maf_from_dosage(row: np.ndarray) -> float:
     return float(min(alt_freq, 1.0 - alt_freq))
 
 
-def _collapse_to_logic_bin01(row: np.ndarray, mode: str = "minor_carrier") -> np.ndarray:
+def _logic_missing_rate(row: np.ndarray, mode: str = "pure_line_bin") -> float:
+    arr = np.asarray(row, dtype=np.float64).reshape(-1)
+    valid = np.isfinite(arr) & (arr >= 0.0)
+    if mode == "pure_line_bin":
+        rounded = np.rint(np.where(valid, arr, 0.0))
+        geno = np.where(rounded <= 0.0, 0, np.where(rounded >= 2.0, 2, 1)).astype(np.uint8)
+        logic_missing = (~valid) | (geno == 1)
+        return float(np.mean(logic_missing))
+    return float(np.mean(~valid))
+
+
+def _collapse_to_logic_bin01(row: np.ndarray, mode: str = "pure_line_bin") -> np.ndarray:
     arr = np.asarray(row, dtype=np.float64).reshape(-1)
     valid = np.isfinite(arr) & (arr >= 0.0)
     if not np.any(valid):
@@ -364,6 +375,20 @@ def _collapse_to_logic_bin01(row: np.ndarray, mode: str = "minor_carrier") -> np
     rounded = np.rint(arr[valid])
     geno = np.where(rounded <= 0.0, 0, np.where(rounded >= 2.0, 2, 1)).astype(np.uint8)
     out = np.zeros(arr.shape[0], dtype=np.uint8)
+    if mode == "pure_line_bin":
+        valid_idx = np.where(valid)[0]
+        homo_mask = geno != 1
+        if not np.any(homo_mask):
+            raise ValueError("Pure-line logic encoding requires at least one homozygous observation.")
+        hom = geno[homo_mask]
+        hom_alt = int(np.sum(hom == 2))
+        usable_homo = int(hom.shape[0])
+        flip = hom_alt > (usable_homo / 2.0)
+        if flip:
+            out[valid_idx[homo_mask]] = (hom == 0).astype(np.uint8)
+        else:
+            out[valid_idx[homo_mask]] = (hom == 2).astype(np.uint8)
+        return out.astype(np.float64)
     if mode == "minor_carrier":
         alt_freq = float(np.mean(geno) / 2.0)
         if alt_freq <= 0.5:
@@ -385,7 +410,10 @@ def _collapse_to_logic_bin01(row: np.ndarray, mode: str = "minor_carrier") -> np
         legacy = np.full(arr.shape[0], mode02, dtype=np.uint8)
         legacy[np.where(valid)[0]] = np.where(geno == 1, mode02, geno)
         return (legacy > 0).astype(np.float64)
-    raise ValueError(f"Unsupported logic encoding mode: {mode!r}. Use minor_carrier, homo_minor, or legacy_mode02.")
+    raise ValueError(
+        f"Unsupported logic encoding mode: {mode!r}. "
+        "Use pure_line_bin, minor_carrier, homo_minor, or legacy_mode02."
+    )
 
 
 def _sample_background_from_grm(grm: np.ndarray, rng: np.random.Generator) -> np.ndarray:
@@ -720,6 +748,7 @@ def _choose_pair(
     prefer_distinct_blocks: bool,
     target_pseudo_freq: float,
     logic_encoding: str,
+    max_logic_missing_rate: float,
     min_binary_freq: float,
     max_binary_freq: float,
     max_single_to_pseudo_ratio: float,
@@ -742,13 +771,68 @@ def _choose_pair(
     r2_arr = np.asarray(r2_mat, dtype=np.float64)
     comp, comp_sizes = _connected_components(r2_arr, float(ld_block_r2_threshold))
     best: PairCandidate | None = None
+    best_relaxed: PairCandidate | None = None
+    best_relaxed_stage = -1
+    best_relaxed_violation = float("inf")
+    best_relaxed_filter: str | None = None
+    best_relaxed_metric = float("nan")
+    best_relaxed_threshold = float("nan")
     seen = 0
     kept = 0
+    fail_counts = {
+        "site2_maf": 0,
+        "same_block": 0,
+        "site2_logic_missing": 0,
+        "site2_binary_freq": 0,
+        "pseudo_freq": 0,
+        "marginal_leakage": 0,
+        "binary_corr": 0,
+        "dosage_corr": 0,
+        "specificity": 0,
+    }
+
+    def _consider_relaxed(
+        *,
+        stage: int,
+        violation: float,
+        failed_filter: str,
+        metric: float,
+        threshold: float,
+        cand: PairCandidate,
+    ) -> None:
+        nonlocal best_relaxed, best_relaxed_stage, best_relaxed_violation
+        nonlocal best_relaxed_filter, best_relaxed_metric, best_relaxed_threshold
+        if (
+            stage > best_relaxed_stage
+            or (
+                stage == best_relaxed_stage
+                and (
+                    violation < best_relaxed_violation
+                    or (
+                        np.isclose(violation, best_relaxed_violation, atol=1e-12, rtol=1e-9)
+                        and (best_relaxed is None or cand.score < best_relaxed.score)
+                    )
+                )
+            )
+        ):
+            best_relaxed = cand
+            best_relaxed_stage = int(stage)
+            best_relaxed_violation = float(violation)
+            best_relaxed_filter = str(failed_filter)
+            best_relaxed_metric = float(metric)
+            best_relaxed_threshold = float(threshold)
+
     for i, site1 in enumerate(site_infos):
         if not (min_site_maf <= site1.maf <= max_site_maf):
             continue
         g1 = geno[site1.row_index].copy()
-        b1 = _collapse_to_logic_bin01(g1, mode=logic_encoding)
+        g1_logic_missing = _logic_missing_rate(g1, mode=logic_encoding)
+        if g1_logic_missing > max_logic_missing_rate:
+            continue
+        try:
+            b1 = _collapse_to_logic_bin01(g1, mode=logic_encoding)
+        except ValueError:
+            continue
         b1_freq = float(np.mean(b1))
         if not (min_binary_freq <= b1_freq <= max_binary_freq):
             continue
@@ -761,45 +845,34 @@ def _choose_pair(
                 continue
             seen += 1
             if not (min_site_maf <= site2.maf <= max_site_maf):
+                fail_counts["site2_maf"] += 1
                 continue
             block1 = int(comp[i])
             block2 = int(comp[j])
             if prefer_distinct_blocks and block1 == block2:
+                fail_counts["same_block"] += 1
                 continue
             g2 = geno[site2.row_index].copy()
-            b2 = _collapse_to_logic_bin01(g2, mode=logic_encoding)
+            g2_logic_missing = _logic_missing_rate(g2, mode=logic_encoding)
+            if g2_logic_missing > max_logic_missing_rate:
+                fail_counts["site2_logic_missing"] += 1
+                continue
+            try:
+                b2 = _collapse_to_logic_bin01(g2, mode=logic_encoding)
+            except ValueError:
+                fail_counts["site2_binary_freq"] += 1
+                continue
             b2_freq = float(np.mean(b2))
             if not (min_binary_freq <= b2_freq <= max_binary_freq):
+                fail_counts["site2_binary_freq"] += 1
                 continue
             pseudo = ((b1 > 0.0) & (b2 > 0.0)).astype(np.float64)
             pseudo_freq = float(np.mean(pseudo))
-            if pseudo_freq < min_pseudo_freq:
-                continue
-            marginal_leakage = pseudo_freq / max(min(b1_freq, b2_freq), 1e-12)
-            if marginal_leakage > max_single_to_pseudo_ratio:
-                continue
             mask = np.isfinite(g1) & np.isfinite(g2)
             dosage_corr = float(np.corrcoef(g1[mask], g2[mask])[0, 1]) if int(np.sum(mask)) > 3 else float("nan")
             pair_r2 = float(r2_arr[i, j])
             leakage = _pair_leakage_metrics(g1, g2, b1, b2, pseudo)
-            if leakage["max_binary_to_pseudo_corr"] > max_binary_to_pseudo_corr:
-                continue
-            if leakage["max_dosage_to_pseudo_corr"] > max_dosage_to_pseudo_corr:
-                continue
-            if leakage["pseudo_specificity"] < min_pseudo_specificity:
-                continue
-            maf_gap = abs(site1.maf - site2.maf)
-            score = (
-                abs(pseudo_freq - target_pseudo_freq)
-                + 0.20 * marginal_leakage
-                + 0.70 * leakage["max_binary_to_pseudo_corr"]
-                + 0.45 * leakage["max_dosage_to_pseudo_corr"]
-                + 0.90 * (1.0 - leakage["pseudo_specificity"])
-                + 0.15 * abs(dosage_corr if np.isfinite(dosage_corr) else 1.0)
-                + 0.15 * pair_r2
-                + 0.15 * maf_gap
-                + 0.05 * (dist / float(max_pair_distance))
-            )
+            marginal_leakage = pseudo_freq / max(min(b1_freq, b2_freq), 1e-12)
             cand = PairCandidate(
                 site1=site1,
                 site2=site2,
@@ -812,16 +885,90 @@ def _choose_pair(
                 pseudo_specificity=float(leakage["pseudo_specificity"]),
                 max_binary_pseudo_corr=float(leakage["max_binary_to_pseudo_corr"]),
                 max_dosage_pseudo_corr=float(leakage["max_dosage_to_pseudo_corr"]),
-                score=float(score),
+                score=float(
+                    abs(pseudo_freq - target_pseudo_freq)
+                    + 0.20 * marginal_leakage
+                    + 0.70 * leakage["max_binary_to_pseudo_corr"]
+                    + 0.45 * leakage["max_dosage_to_pseudo_corr"]
+                    + 0.90 * (1.0 - leakage["pseudo_specificity"])
+                    + 0.15 * abs(dosage_corr if np.isfinite(dosage_corr) else 1.0)
+                    + 0.15 * pair_r2
+                    + 0.15 * abs(site1.maf - site2.maf)
+                    + 0.05 * (dist / float(max_pair_distance))
+                ),
             )
+            if pseudo_freq < min_pseudo_freq:
+                fail_counts["pseudo_freq"] += 1
+                _consider_relaxed(
+                    stage=0,
+                    violation=float(min_pseudo_freq - pseudo_freq),
+                    failed_filter="min_pseudo_freq",
+                    metric=float(pseudo_freq),
+                    threshold=float(min_pseudo_freq),
+                    cand=cand,
+                )
+                continue
+            if marginal_leakage > max_single_to_pseudo_ratio:
+                fail_counts["marginal_leakage"] += 1
+                _consider_relaxed(
+                    stage=1,
+                    violation=float(marginal_leakage - max_single_to_pseudo_ratio),
+                    failed_filter="max_single_to_pseudo_ratio",
+                    metric=float(marginal_leakage),
+                    threshold=float(max_single_to_pseudo_ratio),
+                    cand=cand,
+                )
+                continue
+            if leakage["max_binary_to_pseudo_corr"] > max_binary_to_pseudo_corr:
+                fail_counts["binary_corr"] += 1
+                _consider_relaxed(
+                    stage=2,
+                    violation=float(leakage["max_binary_to_pseudo_corr"] - max_binary_to_pseudo_corr),
+                    failed_filter="max_binary_to_pseudo_corr",
+                    metric=float(leakage["max_binary_to_pseudo_corr"]),
+                    threshold=float(max_binary_to_pseudo_corr),
+                    cand=cand,
+                )
+                continue
+            if leakage["max_dosage_to_pseudo_corr"] > max_dosage_to_pseudo_corr:
+                fail_counts["dosage_corr"] += 1
+                _consider_relaxed(
+                    stage=3,
+                    violation=float(leakage["max_dosage_to_pseudo_corr"] - max_dosage_to_pseudo_corr),
+                    failed_filter="max_dosage_to_pseudo_corr",
+                    metric=float(leakage["max_dosage_to_pseudo_corr"]),
+                    threshold=float(max_dosage_to_pseudo_corr),
+                    cand=cand,
+                )
+                continue
+            if leakage["pseudo_specificity"] < min_pseudo_specificity:
+                fail_counts["specificity"] += 1
+                _consider_relaxed(
+                    stage=4,
+                    violation=float(min_pseudo_specificity - leakage["pseudo_specificity"]),
+                    failed_filter="min_pseudo_specificity",
+                    metric=float(leakage["pseudo_specificity"]),
+                    threshold=float(min_pseudo_specificity),
+                    cand=cand,
+                )
+                continue
             kept += 1
             if best is None or cand.score < best.score:
                 best = cand
+    selection_mode = "exact"
     if best is None:
-        raise ValueError("No pair candidate passed the requested filters.")
+        if best_relaxed is None:
+            raise ValueError(
+                "No pair candidate passed the requested filters. "
+                f"seen={seen}, failures={json.dumps(fail_counts, sort_keys=True)}"
+            )
+        best = best_relaxed
+        selection_mode = "relaxed"
     meta = {
         "pairs_seen_within_distance": int(seen),
         "pairs_kept_after_filters": int(kept),
+        "filter_failures": fail_counts,
+        "selection_mode": selection_mode,
         "ld_block_r2_threshold": float(ld_block_r2_threshold),
         "block_sizes": {
             "site1": int(comp_sizes.get(best.block1, 0)),
@@ -829,6 +976,8 @@ def _choose_pair(
         },
         "best_binary1_freq": float(np.mean(_collapse_to_logic_bin01(geno[best.site1.row_index], mode=logic_encoding))),
         "best_binary2_freq": float(np.mean(_collapse_to_logic_bin01(geno[best.site2.row_index], mode=logic_encoding))),
+        "best_logic_missing1": float(_logic_missing_rate(geno[best.site1.row_index], mode=logic_encoding)),
+        "best_logic_missing2": float(_logic_missing_rate(geno[best.site2.row_index], mode=logic_encoding)),
         "best_marginal_leakage": float(best.pseudo_freq / max(min(
             float(np.mean(_collapse_to_logic_bin01(geno[best.site1.row_index], mode=logic_encoding))),
             float(np.mean(_collapse_to_logic_bin01(geno[best.site2.row_index], mode=logic_encoding))),
@@ -837,6 +986,7 @@ def _choose_pair(
         "best_max_binary_to_pseudo_corr": float(best.max_binary_pseudo_corr),
         "best_max_dosage_to_pseudo_corr": float(best.max_dosage_pseudo_corr),
         "logic_encoding": str(logic_encoding),
+        "max_logic_missing_rate": float(max_logic_missing_rate),
         "min_pair_distance": int(min_pair_distance),
         "min_binary_freq": float(min_binary_freq),
         "max_binary_freq": float(max_binary_freq),
@@ -845,6 +995,11 @@ def _choose_pair(
         "max_dosage_to_pseudo_corr": float(max_dosage_to_pseudo_corr),
         "min_pseudo_specificity": float(min_pseudo_specificity),
     }
+    if selection_mode == "relaxed":
+        meta["relaxed_filter"] = str(best_relaxed_filter)
+        meta["relaxed_violation"] = float(best_relaxed_violation)
+        meta["relaxed_metric"] = float(best_relaxed_metric)
+        meta["relaxed_threshold"] = float(best_relaxed_threshold)
     return best, meta
 
 
@@ -898,9 +1053,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--logic-encoding",
-        choices=["minor_carrier", "homo_minor", "legacy_mode02"],
-        default="minor_carrier",
-        help="Binary encoding used for logic gates. minor_carrier is recommended for marginal-pair simulations.",
+        choices=["pure_line_bin", "minor_carrier", "homo_minor", "legacy_mode02"],
+        default="pure_line_bin",
+        help="Binary encoding used for logic gates. pure_line_bin matches GARFIELD pure-line handling (1/NA counted as missing, then imputed to the major homozygote).",
+    )
+    p.add_argument(
+        "--geno",
+        type=float,
+        default=0.05,
+        help="Maximum pure-line missing rate for candidate sites; heterozygotes (1) and NA are both counted as missing.",
     )
     p.add_argument("--min-binary-freq", type=float, default=0.08, help="Minimum frequency for each single binary logic atom.")
     p.add_argument("--max-binary-freq", type=float, default=0.60, help="Maximum frequency for each single binary logic atom.")
@@ -961,6 +1122,8 @@ def main() -> int:
     threads = int(max(1, int(args.threads)))
     bg_pve = float(args.bg_pve)
     gate_pve = float(args.gate_pve)
+    if not (0.0 <= float(args.geno) <= 1.0):
+        raise ValueError("--geno must be within [0, 1].")
     residual_var = 1.0 - bg_pve - gate_pve
     if residual_var < 0.0:
         raise ValueError("bg_pve + gate_pve must be <= 1.0")
@@ -1004,6 +1167,14 @@ def main() -> int:
         pos_to_idx = {s.pos: i for i, s in enumerate(site_infos)}
         i = pos_to_idx[site1.pos]
         j = pos_to_idx[site2.pos]
+        site1_logic_missing = _logic_missing_rate(geno[site1.row_index], mode=str(args.logic_encoding))
+        site2_logic_missing = _logic_missing_rate(geno[site2.row_index], mode=str(args.logic_encoding))
+        if site1_logic_missing > float(args.geno) or site2_logic_missing > float(args.geno):
+            raise ValueError(
+                "Requested site1/site2 fail pure-line missing filter: "
+                f"site1={site1_logic_missing:.4f}, site2={site2_logic_missing:.4f}, "
+                f"threshold={float(args.geno):.4f}"
+            )
         b1 = _collapse_to_logic_bin01(geno[site1.row_index], mode=str(args.logic_encoding))
         b2 = _collapse_to_logic_bin01(geno[site2.row_index], mode=str(args.logic_encoding))
         pseudo = ((b1 > 0.0) & (b2 > 0.0)).astype(np.float64)
@@ -1033,6 +1204,9 @@ def main() -> int:
                 "site2": int(comp_sizes.get(pair.block2, 0)),
             },
             "manual_pair": True,
+            "best_logic_missing1": float(site1_logic_missing),
+            "best_logic_missing2": float(site2_logic_missing),
+            "max_logic_missing_rate": float(args.geno),
         }
     else:
         pair, pair_meta = _choose_pair(
@@ -1048,6 +1222,7 @@ def main() -> int:
             prefer_distinct_blocks=not bool(args.allow_same_ld_block),
             target_pseudo_freq=float(args.target_pseudo_freq),
             logic_encoding=str(args.logic_encoding),
+            max_logic_missing_rate=float(args.geno),
             min_binary_freq=float(args.min_binary_freq),
             max_binary_freq=float(args.max_binary_freq),
             max_single_to_pseudo_ratio=float(args.max_single_to_pseudo_ratio),
@@ -1056,6 +1231,13 @@ def main() -> int:
             min_pseudo_specificity=float(args.min_pseudo_specificity),
             threads=threads,
         )
+        if str(pair_meta.get("selection_mode", "exact")) == "relaxed":
+            print(
+                "Warning: no pair satisfied every requested filter; "
+                f"using nearest near-miss by relaxing {pair_meta.get('relaxed_filter')} "
+                f"(metric={float(pair_meta.get('relaxed_metric', float('nan'))):.6f}, "
+                f"threshold={float(pair_meta.get('relaxed_threshold', float('nan'))):.6f})."
+            )
 
     g1 = geno[pair.site1.row_index].copy()
     g2 = geno[pair.site2.row_index].copy()
@@ -1175,6 +1357,7 @@ def main() -> int:
         "logic": "and",
         "effect_model": "raw_and",
         "logic_encoding": str(args.logic_encoding),
+        "geno_threshold": float(args.geno),
         "bg_pve": float(bg_pve),
         "gate_pve": float(gate_pve),
         "residual_var": float(residual_var),
@@ -1186,6 +1369,7 @@ def main() -> int:
             "alt": pair.site1.alt,
             "maf": float(pair.site1.maf),
             "ldsc": float(pair.site1.ldsc),
+            "logic_missing_rate": float(_logic_missing_rate(g1, mode=str(args.logic_encoding))),
             "binary_freq": float(np.mean(b1)),
             "ld_block_id": int(pair.block1),
         },
@@ -1197,6 +1381,7 @@ def main() -> int:
             "alt": pair.site2.alt,
             "maf": float(pair.site2.maf),
             "ldsc": float(pair.site2.ldsc),
+            "logic_missing_rate": float(_logic_missing_rate(g2, mode=str(args.logic_encoding))),
             "binary_freq": float(np.mean(b2)),
             "ld_block_id": int(pair.block2),
         },

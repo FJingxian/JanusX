@@ -1219,6 +1219,58 @@ pub(crate) fn count_packed_row_counts_selected(
 }
 
 #[inline]
+pub(crate) fn count_packed_row_pure_line_counts(
+    row: &[u8],
+    n_samples: usize,
+) -> (usize, usize) {
+    let full_bytes = n_samples / 4;
+    let rem_pairs = n_samples & 3;
+    let mut logic_missing = 0usize;
+    let mut hom_alt = 0usize;
+
+    for &b in row.iter().take(full_bytes) {
+        let word = b as u64;
+        let odd = (word >> 1) & 0x55_u64;
+        let even = word & 0x55_u64;
+        logic_missing = logic_missing.saturating_add((odd ^ even).count_ones() as usize);
+        hom_alt = hom_alt.saturating_add((odd & even).count_ones() as usize);
+    }
+
+    if rem_pairs > 0 {
+        let b = row[full_bytes];
+        let mask = (1u8 << (rem_pairs * 2)) - 1u8;
+        let word = (b & mask) as u64;
+        let odd = (word >> 1) & 0x55_u64;
+        let even = word & 0x55_u64;
+        logic_missing = logic_missing.saturating_add((odd ^ even).count_ones() as usize);
+        hom_alt = hom_alt.saturating_add((odd & even).count_ones() as usize);
+    }
+    (logic_missing, hom_alt)
+}
+
+#[inline]
+pub(crate) fn count_packed_row_pure_line_counts_selected(
+    row: &[u8],
+    n_samples: usize,
+    sample_indices: &[usize],
+) -> (usize, usize) {
+    if sample_indices_are_identity(sample_indices) && sample_indices.len() == n_samples {
+        return count_packed_row_pure_line_counts(row, n_samples);
+    }
+    let mut logic_missing = 0usize;
+    let mut hom_alt = 0usize;
+    for &sid in sample_indices.iter() {
+        let code = (row[sid >> 2] >> ((sid & 3) * 2)) & 0b11;
+        match code {
+            0b01 | 0b10 => logic_missing += 1,
+            0b11 => hom_alt += 1,
+            _ => {}
+        }
+    }
+    (logic_missing, hom_alt)
+}
+
+#[inline]
 fn load_u64_le_partial(bytes: &[u8], offset: usize) -> u64 {
     let mut v = 0u64;
     if offset >= bytes.len() {
@@ -1430,6 +1482,40 @@ fn evaluate_packed_row_keep_and_flip(
 }
 
 #[inline]
+fn evaluate_packed_row_keep_and_flip_pure_line(
+    n_samples: usize,
+    logic_missing: usize,
+    hom_alt: usize,
+    maf_threshold: f32,
+    max_missing_rate: f32,
+) -> (bool, bool) {
+    if n_samples == 0 {
+        return (false, false);
+    }
+    let logic_missing = logic_missing.min(n_samples);
+    let missing_rate = (logic_missing as f64) / (n_samples as f64);
+    if missing_rate > (max_missing_rate as f64) {
+        return (false, false);
+    }
+
+    let usable_homo = n_samples.saturating_sub(logic_missing);
+    if usable_homo == 0 {
+        return (false, false);
+    }
+
+    let mut alt_freq = (hom_alt as f64) / (usable_homo as f64);
+    let flip = alt_freq > 0.5;
+    if flip {
+        alt_freq = 1.0 - alt_freq;
+    }
+    let maf = alt_freq.min(1.0 - alt_freq);
+    if maf < (maf_threshold as f64) {
+        return (false, false);
+    }
+    (true, flip)
+}
+
+#[inline]
 fn packed_row_stats_from_counts(
     n_samples: usize,
     non_missing: usize,
@@ -1444,6 +1530,29 @@ fn packed_row_stats_from_counts(
         return (miss, 0.0_f32, 0.0_f32);
     }
     let p = alt_sum as f64 / (2.0_f64 * non_missing as f64);
+    let maf = p.min(1.0_f64 - p) as f32;
+    let d = (2.0_f64 * p * (1.0_f64 - p)).sqrt() as f32;
+    let std = if d.is_finite() { d } else { 0.0_f32 };
+    (miss, maf, std)
+}
+
+#[inline]
+fn packed_row_stats_from_counts_pure_line(
+    n_samples: usize,
+    logic_missing: usize,
+    hom_alt: usize,
+) -> (f32, f32, f32) {
+    let logic_missing = logic_missing.min(n_samples);
+    let miss = if n_samples > 0 {
+        (logic_missing as f32) / (n_samples as f32)
+    } else {
+        0.0_f32
+    };
+    let usable_homo = n_samples.saturating_sub(logic_missing);
+    if usable_homo == 0 {
+        return (miss, 0.0_f32, 0.0_f32);
+    }
+    let p = (hom_alt as f64) / (usable_homo as f64);
     let maf = p.min(1.0_f64 - p) as f32;
     let d = (2.0_f64 * p * (1.0_f64 - p)).sqrt() as f32;
     let std = if d.is_finite() { d } else { 0.0_f32 };
@@ -3917,6 +4026,7 @@ pub(crate) struct PreparedBedPackedOwned {
     pub std_denom: Vec<f32>,
     pub row_flip: Vec<bool>,
     pub site_keep: Vec<bool>,
+    #[allow(dead_code)]
     pub sites: Vec<core::SiteInfo>,
     pub n_samples: usize,
     pub n_snps_total: usize,
@@ -4113,6 +4223,162 @@ pub(crate) fn prepare_bed_logic_meta_owned(
     )
 }
 
+pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples_pure_line(
+    prefix: &str,
+    maf_threshold: f32,
+    max_missing_rate: f32,
+    snps_only: bool,
+    stats_sample_indices: Option<&[usize]>,
+) -> Result<PreparedBedLogicMetaOwned, String> {
+    if !(0.0..=0.5).contains(&maf_threshold) {
+        return Err("maf_threshold must be within [0, 0.5]".to_string());
+    }
+    if !(0.0..=1.0).contains(&max_missing_rate) {
+        return Err("max_missing_rate must be within [0, 1.0]".to_string());
+    }
+
+    let mut bed_prefix = prefix.to_string();
+    let lower = bed_prefix.to_ascii_lowercase();
+    if lower.ends_with(".bed") || lower.ends_with(".bim") || lower.ends_with(".fam") {
+        bed_prefix.truncate(bed_prefix.len() - 4);
+    }
+
+    let samples = core::read_fam(&bed_prefix).map_err(|e| e.to_string())?;
+    let n_samples = samples.len();
+    if n_samples == 0 {
+        return Err("no samples found in PLINK input".to_string());
+    }
+    let stats_sample_indices = stats_sample_indices.unwrap_or(&[]);
+    if !stats_sample_indices.is_empty() && stats_sample_indices.iter().any(|&idx| idx >= n_samples)
+    {
+        return Err(
+            "selected sample index out of range for BED pure-line logic preparation".to_string(),
+        );
+    }
+    let stats_identity = stats_sample_indices.is_empty()
+        || (stats_sample_indices.len() == n_samples
+            && sample_indices_are_identity(stats_sample_indices));
+    let stats_n_samples = if stats_identity {
+        n_samples
+    } else {
+        stats_sample_indices.len()
+    };
+    if stats_n_samples == 0 {
+        return Err("selected sample set for BED pure-line logic preparation is empty".to_string());
+    }
+
+    let sites_all = core::read_bim(&bed_prefix).map_err(|e| e.to_string())?;
+    let n_snps = sites_all.len();
+    if n_snps == 0 {
+        return Err("no SNP sites found in PLINK BIM input".to_string());
+    }
+
+    let bed_path = format!("{bed_prefix}.bed");
+    let bed_file = File::open(&bed_path).map_err(|e| format!("failed to open {bed_path}: {e}"))?;
+    let mmap =
+        unsafe { Mmap::map(&bed_file) }.map_err(|e| format!("failed to mmap {bed_path}: {e}"))?;
+    if mmap.len() < 3 {
+        return Err("BED too small".to_string());
+    }
+    if mmap[0] != 0x6C || mmap[1] != 0x1B || mmap[2] != 0x01 {
+        return Err("Only SNP-major BED supported".to_string());
+    }
+
+    let bytes_per_snp = (n_samples + 3) / 4;
+    let data_len = mmap.len() - 3;
+    if bytes_per_snp == 0 || data_len % bytes_per_snp != 0 {
+        return Err(format!(
+            "invalid BED payload length: data_len={data_len}, bytes_per_snp={bytes_per_snp}"
+        ));
+    }
+    let n_snps_bed = data_len / bytes_per_snp;
+    if n_snps_bed != n_snps {
+        return Err(format!(
+            "BED/BIM SNP count mismatch: bed={n_snps_bed}, bim={n_snps}"
+        ));
+    }
+
+    let packed_full = &mmap[3..];
+    let keep_flip: Vec<(bool, bool)> = packed_full
+        .par_chunks(bytes_per_snp)
+        .enumerate()
+        .map(|(i, row)| {
+            let (logic_missing, hom_alt) = if stats_identity {
+                count_packed_row_pure_line_counts(row, n_samples)
+            } else {
+                count_packed_row_pure_line_counts_selected(row, n_samples, stats_sample_indices)
+            };
+            let (pass_num, flip) = evaluate_packed_row_keep_and_flip_pure_line(
+                stats_n_samples,
+                logic_missing,
+                hom_alt,
+                maf_threshold,
+                max_missing_rate,
+            );
+            let pass_snp = if snps_only {
+                _is_simple_snp_allele(&sites_all[i].ref_allele)
+                    && _is_simple_snp_allele(&sites_all[i].alt_allele)
+            } else {
+                true
+            };
+            let keep = pass_num && pass_snp;
+            (keep, keep && flip)
+        })
+        .collect();
+    let site_keep: Vec<bool> = keep_flip.iter().map(|(keep, _)| *keep).collect();
+    if site_keep.len() != n_snps {
+        return Err(format!(
+            "internal error: site_keep rows {} != n_snps {n_snps}",
+            site_keep.len()
+        ));
+    }
+
+    let kept_n = site_keep.iter().filter(|&&x| x).count();
+    if kept_n == 0 {
+        return Err(
+            "No SNPs left after pure-line BED filtering. Please relax thresholds.".to_string(),
+        );
+    }
+
+    let mut sites_keep = Vec::<core::SiteInfo>::with_capacity(kept_n);
+    let mut row_flip_keep = Vec::<bool>::with_capacity(kept_n);
+    for (i, mut site) in sites_all.into_iter().enumerate() {
+        if site_keep[i] {
+            let flip = keep_flip[i].1;
+            if flip {
+                std::mem::swap(&mut site.ref_allele, &mut site.alt_allele);
+            }
+            sites_keep.push(site);
+            row_flip_keep.push(flip);
+        }
+    }
+
+    Ok(PreparedBedLogicMetaOwned {
+        site_keep,
+        row_flip: row_flip_keep,
+        sites: sites_keep,
+        n_samples,
+        n_snps_total: n_snps,
+        bytes_per_snp,
+    })
+}
+
+#[allow(dead_code)]
+pub(crate) fn prepare_bed_logic_meta_owned_pure_line(
+    prefix: &str,
+    maf_threshold: f32,
+    max_missing_rate: f32,
+    snps_only: bool,
+) -> Result<PreparedBedLogicMetaOwned, String> {
+    prepare_bed_logic_meta_owned_for_stats_samples_pure_line(
+        prefix,
+        maf_threshold,
+        max_missing_rate,
+        snps_only,
+        None,
+    )
+}
+
 pub(crate) fn load_bed_2bit_packed_subset_owned_for_stats_samples(
     prefix: &str,
     site_keep: &[bool],
@@ -4259,6 +4525,136 @@ pub(crate) fn load_bed_2bit_packed_subset_owned(
     load_bed_2bit_packed_subset_owned_for_stats_samples(prefix, site_keep, None)
 }
 
+pub(crate) fn load_bed_2bit_packed_subset_owned_for_stats_samples_pure_line(
+    prefix: &str,
+    site_keep: &[bool],
+    stats_sample_indices: Option<&[usize]>,
+) -> Result<PackedBedSubsetOwned, String> {
+    let mut bed_prefix = prefix.to_string();
+    let lower = bed_prefix.to_ascii_lowercase();
+    if lower.ends_with(".bed") || lower.ends_with(".bim") || lower.ends_with(".fam") {
+        bed_prefix.truncate(bed_prefix.len() - 4);
+    }
+
+    let samples = core::read_fam(&bed_prefix).map_err(|e| e.to_string())?;
+    let n_samples = samples.len();
+    if n_samples == 0 {
+        return Err("no samples found in PLINK input".to_string());
+    }
+    let stats_sample_indices = stats_sample_indices.unwrap_or(&[]);
+    if !stats_sample_indices.is_empty() && stats_sample_indices.iter().any(|&idx| idx >= n_samples)
+    {
+        return Err("selected sample index out of range for packed BED subset stats".to_string());
+    }
+    let stats_identity = stats_sample_indices.is_empty()
+        || (stats_sample_indices.len() == n_samples
+            && sample_indices_are_identity(stats_sample_indices));
+    let stats_n_samples = if stats_identity {
+        n_samples
+    } else {
+        stats_sample_indices.len()
+    };
+    if stats_n_samples == 0 {
+        return Err("selected sample set for packed BED subset stats is empty".to_string());
+    }
+
+    let bed_path = format!("{bed_prefix}.bed");
+    let bed_file = File::open(&bed_path).map_err(|e| format!("failed to open {bed_path}: {e}"))?;
+    let mmap =
+        unsafe { Mmap::map(&bed_file) }.map_err(|e| format!("failed to mmap {bed_path}: {e}"))?;
+    if mmap.len() < 3 {
+        return Err("BED too small".to_string());
+    }
+    if mmap[0] != 0x6C || mmap[1] != 0x1B || mmap[2] != 0x01 {
+        return Err("Only SNP-major BED supported".to_string());
+    }
+
+    let bytes_per_snp = (n_samples + 3) / 4;
+    let data_len = mmap.len() - 3;
+    if bytes_per_snp == 0 || data_len % bytes_per_snp != 0 {
+        return Err(format!(
+            "invalid BED payload length: data_len={data_len}, bytes_per_snp={bytes_per_snp}"
+        ));
+    }
+    let n_snps_total = data_len / bytes_per_snp;
+    if site_keep.len() != n_snps_total {
+        return Err(format!(
+            "site_keep length mismatch: got {}, expected {n_snps_total}",
+            site_keep.len()
+        ));
+    }
+
+    let keep_idx: Vec<usize> = site_keep
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &keep)| if keep { Some(i) } else { None })
+        .collect();
+    if keep_idx.is_empty() {
+        return Err("No SNPs remained after applying site_keep mask.".to_string());
+    }
+
+    let packed_src = &mmap[3..];
+    let kept_n = keep_idx.len();
+    let mut packed_keep = vec![0u8; kept_n * bytes_per_snp];
+    let mut miss_keep = vec![0.0_f32; kept_n];
+    let mut maf_keep = vec![0.0_f32; kept_n];
+    let mut std_keep = vec![0.0_f32; kept_n];
+    let mut row_flip_keep = vec![false; kept_n];
+
+    packed_keep
+        .par_chunks_mut(bytes_per_snp)
+        .zip(miss_keep.par_iter_mut())
+        .zip(maf_keep.par_iter_mut())
+        .zip(std_keep.par_iter_mut())
+        .zip(row_flip_keep.par_iter_mut())
+        .zip(keep_idx.par_iter())
+        .for_each(
+            |(((((dst_row, miss_v), maf_v), std_v), row_flip_v), &src_row)| {
+                let src_off = src_row * bytes_per_snp;
+                let row = &packed_src[src_off..src_off + bytes_per_snp];
+                dst_row.copy_from_slice(row);
+
+                let (logic_missing, hom_alt) = if stats_identity {
+                    count_packed_row_pure_line_counts(row, n_samples)
+                } else {
+                    count_packed_row_pure_line_counts_selected(
+                        row,
+                        n_samples,
+                        stats_sample_indices,
+                    )
+                };
+                let (miss, maf, std) = packed_row_stats_from_counts_pure_line(
+                    stats_n_samples,
+                    logic_missing,
+                    hom_alt,
+                );
+                *miss_v = miss;
+                *maf_v = maf.clamp(0.0, 0.5);
+                *std_v = std;
+                let usable_homo = stats_n_samples.saturating_sub(logic_missing.min(stats_n_samples));
+                *row_flip_v = usable_homo > 0 && hom_alt > (usable_homo / 2);
+            },
+        );
+
+    Ok(PackedBedSubsetOwned {
+        packed: packed_keep,
+        missing_rate: miss_keep,
+        maf: maf_keep,
+        std_denom: std_keep,
+        row_flip: row_flip_keep,
+        n_samples,
+        bytes_per_snp,
+    })
+}
+
+#[allow(dead_code)]
+pub(crate) fn load_bed_2bit_packed_subset_owned_pure_line(
+    prefix: &str,
+    site_keep: &[bool],
+) -> Result<PackedBedSubsetOwned, String> {
+    load_bed_2bit_packed_subset_owned_for_stats_samples_pure_line(prefix, site_keep, None)
+}
+
 pub(crate) fn prepare_bed_2bit_packed_owned(
     prefix: &str,
     maf_threshold: f32,
@@ -4288,6 +4684,35 @@ pub(crate) fn prepare_bed_2bit_packed_owned(
     })
 }
 
+#[allow(dead_code)]
+pub(crate) fn prepare_bed_2bit_packed_owned_pure_line(
+    prefix: &str,
+    maf_threshold: f32,
+    max_missing_rate: f32,
+    snps_only: bool,
+) -> Result<PreparedBedPackedOwned, String> {
+    let scanned = prepare_bed_logic_meta_owned_pure_line(
+        prefix,
+        maf_threshold,
+        max_missing_rate,
+        snps_only,
+    )?;
+    let subset = load_bed_2bit_packed_subset_owned_pure_line(prefix, scanned.site_keep.as_slice())?;
+    Ok(PreparedBedPackedOwned {
+        packed: subset.packed,
+        missing_rate: subset.missing_rate,
+        maf: subset.maf,
+        std_denom: subset.std_denom,
+        row_flip: subset.row_flip,
+        site_keep: scanned.site_keep,
+        sites: scanned.sites,
+        n_samples: scanned.n_samples,
+        n_snps_total: scanned.n_snps_total,
+        bytes_per_snp: scanned.bytes_per_snp,
+    })
+}
+
+#[allow(dead_code)]
 pub(crate) fn prepare_bed_2bit_packed_owned_for_stats_samples(
     prefix: &str,
     maf_threshold: f32,
@@ -4305,6 +4730,40 @@ pub(crate) fn prepare_bed_2bit_packed_owned_for_stats_samples(
         stats_sample_indices,
     )?;
     let subset = load_bed_2bit_packed_subset_owned_for_stats_samples(
+        prefix,
+        scanned.site_keep.as_slice(),
+        stats_sample_indices,
+    )?;
+    Ok(PreparedBedPackedOwned {
+        packed: subset.packed,
+        missing_rate: subset.missing_rate,
+        maf: subset.maf,
+        std_denom: subset.std_denom,
+        row_flip: subset.row_flip,
+        site_keep: scanned.site_keep,
+        sites: scanned.sites,
+        n_samples: scanned.n_samples,
+        n_snps_total: scanned.n_snps_total,
+        bytes_per_snp: scanned.bytes_per_snp,
+    })
+}
+
+#[allow(dead_code)]
+pub(crate) fn prepare_bed_2bit_packed_owned_for_stats_samples_pure_line(
+    prefix: &str,
+    maf_threshold: f32,
+    max_missing_rate: f32,
+    snps_only: bool,
+    stats_sample_indices: Option<&[usize]>,
+) -> Result<PreparedBedPackedOwned, String> {
+    let scanned = prepare_bed_logic_meta_owned_for_stats_samples_pure_line(
+        prefix,
+        maf_threshold,
+        max_missing_rate,
+        snps_only,
+        stats_sample_indices,
+    )?;
+    let subset = load_bed_2bit_packed_subset_owned_for_stats_samples_pure_line(
         prefix,
         scanned.site_keep.as_slice(),
         stats_sample_indices,

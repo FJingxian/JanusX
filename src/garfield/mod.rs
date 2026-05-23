@@ -20,8 +20,8 @@ use crate::gfcore::{
     process_snp_row, read_fam, BedSnpIter, HmpSnpIter, SiteInfo, TxtSnpIter, VcfSnpIter,
 };
 use crate::gfreader::{
-    build_sample_selection, prepare_bed_2bit_packed_owned_for_stats_samples,
-    prepare_bed_logic_meta_owned_for_stats_samples,
+    build_sample_selection, load_bed_2bit_packed_subset_owned_for_stats_samples,
+    prepare_bed_logic_meta_owned_for_stats_samples_pure_line,
 };
 use crate::grm::grm_packed_f64_from_stats_rust;
 use crate::linalg::{format_chisq_value, student_t_p_two_sided};
@@ -2240,6 +2240,7 @@ struct GarfieldUnitPrepared {
 struct GarfieldUnitMlContext {
     unit_index: usize,
     selected_global_rows: Vec<usize>,
+    ranked_global_rows: Vec<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -2290,6 +2291,7 @@ struct GarfieldLogicPipelineResult {
     n_samples: usize,
     units_total: usize,
     units_scanned: usize,
+    skipped_messages: Vec<String>,
     train_fit: GarfieldResidualResult,
     test_fit: GarfieldResidualResult,
 }
@@ -2317,6 +2319,18 @@ fn nan_garfield_rule_wald() -> GarfieldRuleWald {
         chisq: f64::NAN,
         pwald: f64::NAN,
     }
+}
+
+#[inline]
+fn is_no_valid_initial_literals_error(err: &str) -> bool {
+    err.contains("no valid initial literals")
+}
+
+#[inline]
+fn format_skipped_unit_message(phase: &str, unit_name: &str, reason: &str) -> String {
+    format!(
+        "GARFIELD skipped unit [{phase}] {unit_name}: {reason}"
+    )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2667,26 +2681,71 @@ fn build_simbench_ml_contexts(
         if !unit_contains_any_simbench_site(unit, terms) {
             continue;
         }
-        let Some(selected_global_rows) = select_logic_unit_global_rows(
-            unit,
-            response,
-            engine,
-            importance,
-            perm_cfg,
-            ml_top_k,
-            ml_top_frac,
-            tree_cfg,
-            logic_bits,
-            train_idx_local,
-            y_train,
-            allow_parallel,
-        )?
-        else {
+        if unit.indices.is_empty() {
             continue;
+        }
+        let dense_train = dense_binary_rows_from_full_bits(
+            logic_bits.bits_flat.as_slice(),
+            logic_bits.row_words,
+            unit.indices.as_slice(),
+            train_idx_local,
+            logic_bits.sites.len(),
+            logic_bits.n_samples,
+        )?;
+        if dense_train.is_empty() {
+            continue;
+        }
+        let n_region = dense_train.len();
+        let (selected_global_rows, ranked_global_rows) = if let Some(engine_one) = engine {
+            let keep_k = resolve_ml_keep_k(n_region, ml_top_k, ml_top_frac);
+            let top_local = select_ml_top_local_indices(
+                dense_train.as_slice(),
+                y_train,
+                response,
+                engine_one,
+                ExtraTreesConfig {
+                    allow_parallel,
+                    ..tree_cfg
+                },
+                importance,
+                perm_cfg,
+                keep_k,
+                GarfieldMlKeepPolicy::TopK,
+                tree_cfg.seed ^ 0xB6D5_0C11_8E91_3F27,
+            )?;
+            if top_local.is_empty() {
+                continue;
+            }
+            let ranked_local = select_ml_top_only_local_indices(
+                dense_train.as_slice(),
+                y_train,
+                response,
+                engine_one,
+                ExtraTreesConfig {
+                    allow_parallel,
+                    ..tree_cfg
+                },
+                importance,
+                perm_cfg,
+                n_region,
+            )?;
+            (
+                top_local
+                    .iter()
+                    .map(|&idx| unit.indices[idx])
+                    .collect::<Vec<_>>(),
+                ranked_local
+                    .iter()
+                    .map(|&idx| unit.indices[idx])
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            (unit.indices.clone(), unit.indices.clone())
         };
         out.push(GarfieldUnitMlContext {
             unit_index: ui,
             selected_global_rows,
+            ranked_global_rows,
         });
     }
     Ok(out)
@@ -2719,47 +2778,97 @@ fn resolve_simbench_ml_rank(
     if site_row_candidates.is_empty() {
         return (".".to_string(), 0);
     }
-    let mut best_repr = None::<(usize, usize, usize, usize, String, usize)>;
+    let mut best_selected = None::<(usize, usize, usize, usize, String, usize)>;
+    let mut best_ranked = None::<(usize, usize, usize, usize, String, usize)>;
     for ctx in contexts.iter() {
-        let rank_map = ctx
+        let selected_rank_map = ctx
             .selected_global_rows
             .iter()
             .enumerate()
             .map(|(i, &row)| (row, i + 1))
             .collect::<HashMap<usize, usize>>();
-        let ranks = site_row_candidates
+        let selected_ranks = site_row_candidates
             .iter()
             .map(|cands| {
                 cands
                     .iter()
-                    .filter_map(|idx| rank_map.get(idx).copied())
+                    .filter_map(|idx| selected_rank_map.get(idx).copied())
                     .min()
             })
             .collect::<Vec<_>>();
-        let matched = ranks.iter().filter(|v| v.is_some()).count();
-        if matched == 0 {
+        let selected_matched = selected_ranks.iter().filter(|v| v.is_some()).count();
+        if selected_matched > 0 {
+            let sum_rank = selected_ranks.iter().flatten().copied().sum::<usize>();
+            let max_rank = selected_ranks
+                .iter()
+                .flatten()
+                .copied()
+                .max()
+                .unwrap_or(usize::MAX);
+            let ml_rank = format_simbench_ml_rank(logic, selected_ranks.as_slice());
+            let candidate = (
+                usize::MAX - selected_matched,
+                max_rank,
+                sum_rank,
+                ctx.unit_index,
+                ml_rank,
+                ctx.selected_global_rows.len(),
+            );
+            if best_selected
+                .as_ref()
+                .map(|best| candidate < *best)
+                .unwrap_or(true)
+            {
+                best_selected = Some(candidate);
+            }
+        }
+
+        let ranked_rank_map = ctx
+            .ranked_global_rows
+            .iter()
+            .enumerate()
+            .map(|(i, &row)| (row, i + 1))
+            .collect::<HashMap<usize, usize>>();
+        let ranked_ranks = site_row_candidates
+            .iter()
+            .map(|cands| {
+                cands
+                    .iter()
+                    .filter_map(|idx| ranked_rank_map.get(idx).copied())
+                    .min()
+            })
+            .collect::<Vec<_>>();
+        let ranked_matched = ranked_ranks.iter().filter(|v| v.is_some()).count();
+        if ranked_matched == 0 {
             continue;
         }
-        let sum_rank = ranks.iter().flatten().copied().sum::<usize>();
-        let max_rank = ranks.iter().flatten().copied().max().unwrap_or(usize::MAX);
-        let ml_rank = format_simbench_ml_rank(logic, ranks.as_slice());
+        let sum_rank = ranked_ranks.iter().flatten().copied().sum::<usize>();
+        let max_rank = ranked_ranks
+            .iter()
+            .flatten()
+            .copied()
+            .max()
+            .unwrap_or(usize::MAX);
+        let ml_rank = format_simbench_ml_rank(logic, ranked_ranks.as_slice());
         let candidate = (
-            usize::MAX - matched,
+            usize::MAX - ranked_matched,
             max_rank,
             sum_rank,
             ctx.unit_index,
             ml_rank,
-            ctx.selected_global_rows.len(),
+            ctx.ranked_global_rows.len(),
         );
-        if best_repr
+        if best_ranked
             .as_ref()
             .map(|best| candidate < *best)
             .unwrap_or(true)
         {
-            best_repr = Some(candidate);
+            best_ranked = Some(candidate);
         }
     }
-    if let Some((_, _, _, _, ml_rank, ml_feature_count)) = best_repr {
+    if let Some((_, _, _, _, ml_rank, ml_feature_count)) = best_selected {
+        (ml_rank, ml_feature_count)
+    } else if let Some((_, _, _, _, ml_rank, ml_feature_count)) = best_ranked {
         (ml_rank, ml_feature_count)
     } else {
         (
@@ -3616,6 +3725,7 @@ fn decode_logic_bin_genotype(code: u8, flip: bool) -> Option<u8> {
 }
 
 #[inline]
+#[allow(dead_code)]
 fn fill_bin_logic_row_bits(
     row: &[u8],
     flip: bool,
@@ -3644,6 +3754,25 @@ fn fill_bin_logic_row_bits(
                     Some(2) => true,
                     _ => mode02 == 2,
                 };
+            if is_one {
+                dst_words[entry.dst_word_idx[lane]] |= entry.dst_bit[lane];
+            }
+        }
+    }
+}
+
+#[inline]
+fn fill_bin_logic_row_bits_pure_line(
+    row: &[u8],
+    flip: bool,
+    sample_plan: &[LogicSamplePlanEntry],
+    dst_words: &mut [u64],
+) {
+    for entry in sample_plan.iter() {
+        let byte = row[entry.src_byte_idx];
+        for lane in 0..entry.n_lanes as usize {
+            let code = (byte >> entry.src_shifts[lane]) & 0b11;
+            let is_one = if flip { code == 0b00 } else { code == 0b11 };
             if is_one {
                 dst_words[entry.dst_word_idx[lane]] |= entry.dst_bit[lane];
             }
@@ -3760,7 +3889,7 @@ fn convert_prepared_bed_to_logic_bits(
         .zip(packed.par_chunks(bytes_per_snp))
         .for_each(|((dst_rows, flip), row)| match mode {
             GarfieldBinMode::Bin => {
-                fill_bin_logic_row_bits(row, flip, sample_plan.as_slice(), dst_rows)
+                fill_bin_logic_row_bits_pure_line(row, flip, sample_plan.as_slice(), dst_rows)
             }
             GarfieldBinMode::Mbin => {
                 fill_mbin_logic_row_bits(row, flip, sample_plan.as_slice(), row_words, dst_rows)
@@ -3901,7 +4030,7 @@ fn convert_bed_prefix_to_logic_bits(
             let row = &packed_full[src_row * bytes_per_snp..(src_row + 1) * bytes_per_snp];
             match mode {
                 GarfieldBinMode::Bin => {
-                    fill_bin_logic_row_bits(row, flip, sample_plan.as_slice(), dst_rows)
+                    fill_bin_logic_row_bits_pure_line(row, flip, sample_plan.as_slice(), dst_rows)
                 }
                 GarfieldBinMode::Mbin => {
                     fill_mbin_logic_row_bits(row, flip, sample_plan.as_slice(), row_words, dst_rows)
@@ -5372,7 +5501,6 @@ fn garfield_logic_search_bed_owned(
     candidate_keep_ratio: f64,
     maf_threshold: f32,
     max_missing_rate: f32,
-    het_threshold: f32,
     snps_only: bool,
     block_cols: usize,
     threads: usize,
@@ -5404,11 +5532,10 @@ fn garfield_logic_search_bed_owned(
     let mut row_flip_for_grm: Option<Vec<bool>> = None;
     let (site_keep, logic_row_flip_external, filtered_sites, n_samples_total, bytes_per_snp) =
         if using_external_grm {
-            let meta = prepare_bed_logic_meta_owned_for_stats_samples(
+            let meta = prepare_bed_logic_meta_owned_for_stats_samples_pure_line(
                 &prefix,
                 maf_threshold,
                 max_missing_rate,
-                het_threshold,
                 snps_only,
                 Some(selected_sample_indices.as_slice()),
             )?;
@@ -5420,23 +5547,27 @@ fn garfield_logic_search_bed_owned(
                 meta.bytes_per_snp,
             )
         } else {
-            let prepared = prepare_bed_2bit_packed_owned_for_stats_samples(
+            let meta = prepare_bed_logic_meta_owned_for_stats_samples_pure_line(
                 &prefix,
                 maf_threshold,
                 max_missing_rate,
-                het_threshold,
                 snps_only,
                 Some(selected_sample_indices.as_slice()),
             )?;
-            packed_for_grm = Some(prepared.packed);
-            maf_for_grm = Some(prepared.maf);
-            row_flip_for_grm = Some(prepared.row_flip);
+            let subset = load_bed_2bit_packed_subset_owned_for_stats_samples(
+                &prefix,
+                meta.site_keep.as_slice(),
+                Some(selected_sample_indices.as_slice()),
+            )?;
+            packed_for_grm = Some(subset.packed);
+            maf_for_grm = Some(subset.maf);
+            row_flip_for_grm = Some(subset.row_flip);
             (
-                prepared.site_keep,
+                meta.site_keep,
                 None,
-                prepared.sites,
-                prepared.n_samples,
-                prepared.bytes_per_snp,
+                meta.sites,
+                meta.n_samples,
+                meta.bytes_per_snp,
             )
         };
     let n_selected = selected_sample_indices.len();
@@ -6323,17 +6454,19 @@ fn garfield_logic_search_bed_owned(
         allow_parallel: unit_parallel_threads <= 1,
         ..beam_params.clone()
     };
+    let skipped_messages = Arc::new(Mutex::new(Vec::<String>::new()));
     let unit_results = if unit_parallel_threads > 1 {
         let pool = ThreadPoolBuilder::new()
             .num_threads(unit_parallel_threads)
             .build()
             .map_err(|e| format!("build GARFIELD unit thread pool: {e}"))?;
+        let skipped_messages_parallel = skipped_messages.clone();
         pool.install(|| {
             scan_unit_indices
                 .par_iter()
                 .map(|&ui| {
                     let unit = &units[ui];
-                    let out = evaluate_logic_unit_continuous(
+                    let out = match evaluate_logic_unit_continuous(
                         ui,
                         unit,
                         response,
@@ -6353,7 +6486,21 @@ fn garfield_logic_search_bed_owned(
                         scan_beam_params.clone(),
                         top_rules_per_unit,
                         &unit_kind_lc,
-                    )?;
+                    ) {
+                        Ok(v) => v,
+                        Err(err) if is_no_valid_initial_literals_error(&err) => {
+                            let msg =
+                                format_skipped_unit_message("scan", &unit.label, &err);
+                            skipped_messages_parallel
+                                .lock()
+                                .map_err(|_| {
+                                    "GARFIELD skipped-messages mutex poisoned".to_string()
+                                })?
+                                .push(msg);
+                            Vec::new()
+                        }
+                        Err(err) => return Err(err),
+                    };
                     let done = scan_progress_done.fetch_add(1, Ordering::Relaxed) + 1;
                     if done % scan_notify_step == 0 || done == scanned_units {
                         garfield_stage_progress_notify(
@@ -6374,7 +6521,7 @@ fn garfield_logic_search_bed_owned(
             Vec::<Result<Vec<GarfieldLogicRuleRecord>, String>>::with_capacity(scanned_units);
         for &ui in scan_unit_indices.iter() {
             let unit = &units[ui];
-            let unit_out = evaluate_logic_unit_continuous(
+            let unit_out = match evaluate_logic_unit_continuous(
                 ui,
                 unit,
                 response,
@@ -6394,7 +6541,17 @@ fn garfield_logic_search_bed_owned(
                 scan_beam_params.clone(),
                 top_rules_per_unit,
                 &unit_kind_lc,
-            );
+            ) {
+                Ok(v) => Ok(v),
+                Err(err) if is_no_valid_initial_literals_error(&err) => {
+                    skipped_messages
+                        .lock()
+                        .map_err(|_| "GARFIELD skipped-messages mutex poisoned".to_string())?
+                        .push(format_skipped_unit_message("scan", &unit.label, &err));
+                    Ok(Vec::new())
+                }
+                Err(err) => Err(err),
+            };
             let done = scan_progress_done.fetch_add(1, Ordering::Relaxed) + 1;
             if done % scan_notify_step == 0 || done == scanned_units {
                 garfield_stage_progress_notify(
@@ -6414,6 +6571,10 @@ fn garfield_logic_search_bed_owned(
     for unit_out in unit_results.into_iter() {
         records.extend(unit_out?);
     }
+    let skipped_messages = Arc::try_unwrap(skipped_messages)
+        .map_err(|_| "GARFIELD skipped-messages still shared".to_string())?
+        .into_inner()
+        .map_err(|_| "GARFIELD skipped-messages mutex poisoned".to_string())?;
 
     records = dedup_logic_rule_records(records);
     apply_logic_rule_output_limit(&mut records, max_output_rules, max_output_ratio)?;
@@ -6513,6 +6674,7 @@ fn garfield_logic_search_bed_owned(
         n_samples: logic_bits.n_samples,
         units_total: total_units,
         units_scanned: scanned_units,
+        skipped_messages,
         train_fit,
         test_fit,
     })
@@ -6555,7 +6717,6 @@ fn garfield_logic_search_bed_owned(
     candidate_keep_ratio=0.10,
     maf_threshold=0.02,
     max_missing_rate=0.05,
-    het_threshold=0.0,
     snps_only=false,
     block_cols=65536,
     threads=0,
@@ -6614,7 +6775,6 @@ pub fn garfield_logic_search_bed_py<'py>(
     candidate_keep_ratio: f64,
     maf_threshold: f32,
     max_missing_rate: f32,
-    het_threshold: f32,
     snps_only: bool,
     block_cols: usize,
     threads: usize,
@@ -6711,7 +6871,6 @@ pub fn garfield_logic_search_bed_py<'py>(
                 candidate_keep_ratio,
                 maf_threshold,
                 max_missing_rate,
-                het_threshold,
                 snps_only,
                 block_cols,
                 threads,
@@ -6768,6 +6927,8 @@ pub fn garfield_logic_search_bed_py<'py>(
     out.set_item("n_samples", result.n_samples)?;
     out.set_item("units_total", result.units_total)?;
     out.set_item("units_scanned", result.units_scanned)?;
+    out.set_item("n_skipped_units", result.skipped_messages.len())?;
+    out.set_item("skipped_messages", result.skipped_messages.clone())?;
     out.set_item("train_pve", result.train_fit.pve)?;
     out.set_item("test_pve", result.test_fit.pve)?;
     out.set_item("train_sigma_g2", result.train_fit.sigma_g2)?;
@@ -8116,6 +8277,7 @@ mod tests {
         let contexts = vec![GarfieldUnitMlContext {
             unit_index: 7,
             selected_global_rows: vec![100, 300, 200],
+            ranked_global_rows: vec![100, 300, 200],
         }];
         let site_row_candidates = vec![vec![300, 301], vec![999], vec![200, 201]];
         let (rank_txt, ml_feature_count) = resolve_simbench_ml_rank(
@@ -8125,6 +8287,23 @@ mod tests {
         );
         assert_eq!(rank_txt, "2 & . & 3");
         assert_eq!(ml_feature_count, 3);
+    }
+
+    #[test]
+    fn test_resolve_simbench_ml_rank_falls_back_to_full_ranking_when_not_selected() {
+        let contexts = vec![GarfieldUnitMlContext {
+            unit_index: 9,
+            selected_global_rows: vec![100, 200],
+            ranked_global_rows: vec![400, 300, 200, 100],
+        }];
+        let site_row_candidates = vec![vec![300], vec![400]];
+        let (rank_txt, ml_feature_count) = resolve_simbench_ml_rank(
+            SimBenchLogic::And,
+            site_row_candidates.as_slice(),
+            contexts.as_slice(),
+        );
+        assert_eq!(rank_txt, "2 & 1");
+        assert_eq!(ml_feature_count, 4);
     }
 
     #[test]

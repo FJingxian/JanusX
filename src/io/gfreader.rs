@@ -1219,10 +1219,7 @@ pub(crate) fn count_packed_row_counts_selected(
 }
 
 #[inline]
-pub(crate) fn count_packed_row_pure_line_counts(
-    row: &[u8],
-    n_samples: usize,
-) -> (usize, usize) {
+pub(crate) fn count_packed_row_pure_line_counts(row: &[u8], n_samples: usize) -> (usize, usize) {
     let full_bytes = n_samples / 4;
     let rem_pairs = n_samples & 3;
     let mut logic_missing = 0usize;
@@ -4617,21 +4614,15 @@ pub(crate) fn load_bed_2bit_packed_subset_owned_for_stats_samples_pure_line(
                 let (logic_missing, hom_alt) = if stats_identity {
                     count_packed_row_pure_line_counts(row, n_samples)
                 } else {
-                    count_packed_row_pure_line_counts_selected(
-                        row,
-                        n_samples,
-                        stats_sample_indices,
-                    )
+                    count_packed_row_pure_line_counts_selected(row, n_samples, stats_sample_indices)
                 };
-                let (miss, maf, std) = packed_row_stats_from_counts_pure_line(
-                    stats_n_samples,
-                    logic_missing,
-                    hom_alt,
-                );
+                let (miss, maf, std) =
+                    packed_row_stats_from_counts_pure_line(stats_n_samples, logic_missing, hom_alt);
                 *miss_v = miss;
                 *maf_v = maf.clamp(0.0, 0.5);
                 *std_v = std;
-                let usable_homo = stats_n_samples.saturating_sub(logic_missing.min(stats_n_samples));
+                let usable_homo =
+                    stats_n_samples.saturating_sub(logic_missing.min(stats_n_samples));
                 *row_flip_v = usable_homo > 0 && hom_alt > (usable_homo / 2);
             },
         );
@@ -4691,12 +4682,8 @@ pub(crate) fn prepare_bed_2bit_packed_owned_pure_line(
     max_missing_rate: f32,
     snps_only: bool,
 ) -> Result<PreparedBedPackedOwned, String> {
-    let scanned = prepare_bed_logic_meta_owned_pure_line(
-        prefix,
-        maf_threshold,
-        max_missing_rate,
-        snps_only,
-    )?;
+    let scanned =
+        prepare_bed_logic_meta_owned_pure_line(prefix, maf_threshold, max_missing_rate, snps_only)?;
     let subset = load_bed_2bit_packed_subset_owned_pure_line(prefix, scanned.site_keep.as_slice())?;
     Ok(PreparedBedPackedOwned {
         packed: subset.packed,

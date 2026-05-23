@@ -238,74 +238,6 @@ def _scan_mode_to_logic_unit_kind(scan_mode: str) -> str:
     raise ValueError(f"unsupported scan_mode: {scan_mode}")
 
 
-def _derive_fold_from_holdout(val_frac: float) -> int:
-    vf = float(val_frac)
-    if not (0.0 < vf < 1.0):
-        raise ValueError("--val-frac must be within (0, 1).")
-    fold = max(2, int(round(1.0 / vf)))
-    return fold
-
-
-def _parse_beam_topk_spec(value: object) -> tuple[int | None, float | None]:
-    raw = str(value).strip()
-    if raw == "":
-        return (None, None)
-    try:
-        num = float(raw)
-    except Exception as exc:  # pragma: no cover - parser surface
-        raise ValueError("-beam-topk must be a positive integer or a fraction within (0, 1].") from exc
-    if not np.isfinite(num) or num <= 0.0:
-        raise ValueError("-beam-topk must be > 0.")
-    if num <= 1.0:
-        return (None, float(num))
-    count = int(round(num))
-    if count <= 0:
-        raise ValueError("-beam-topk count must be >= 1.")
-    return (count, None)
-
-
-def _default_prior_len_alpha_for_layer(layer: int) -> list[float]:
-    effective_layer = max(1, min(int(layer), 5))
-    return [float(2 ** power) for power in range(effective_layer - 1, -1, -1)]
-
-
-def _parse_prior_len_alpha_spec(value: object | None, *, layer: int) -> list[float]:
-    default_alpha = _default_prior_len_alpha_for_layer(layer)
-    effective_layer = len(default_alpha)
-    if value is None:
-        return list(default_alpha)
-    raw = str(value).strip()
-    if raw == "":
-        return list(default_alpha)
-    parts = [p.strip() for p in raw.split(",")]
-    if len(parts) > effective_layer:
-        raise ValueError(
-            f"--prior-len accepts at most {effective_layer} comma-separated alpha values when -layer={int(layer)}."
-        )
-    out = list(default_alpha)
-    for i, token in enumerate(parts):
-        if token == "":
-            raise ValueError("--prior-len contains an empty alpha value.")
-        try:
-            alpha = float(token)
-        except Exception as exc:
-            raise ValueError("--prior-len must be a comma-separated list of positive numbers.") from exc
-        if (not np.isfinite(alpha)) or alpha <= 0.0:
-            raise ValueError("--prior-len alpha values must be finite and > 0.")
-        out[i] = alpha
-    return out
-
-
-def _parse_positive_layer(value: object, *, label: str) -> int:
-    try:
-        out = int(value)
-    except Exception as exc:  # pragma: no cover - parser surface
-        raise ValueError(f"{label} must be an integer >= 1.") from exc
-    if out < 1:
-        raise ValueError(f"{label} must be >= 1.")
-    return out
-
-
 def _describe_rank_schedule(rank_score_runtime: str) -> str:
     mode = str(rank_score_runtime).strip().lower()
     if mode == "raw":
@@ -318,61 +250,16 @@ def _describe_rank_schedule(rank_score_runtime: str) -> str:
         return f"raw through layer {gain_start - 1}, gain from layer {gain_start}"
     return mode
 
-
-def _resolve_rank_score_runtime(
-    *,
-    raw_layer_requested: object | None,
-    logic_gate: object,
-    exhaustive_depth: int,
-    rank_score_compat: object | None = None,
-) -> tuple[str, str, int | None]:
-    compat = "" if rank_score_compat is None else str(rank_score_compat).strip().lower()
-
-    if compat != "":
-        if compat in {"raw", "score"}:
-            return ("raw", "rank-score-compat", None)
-        if compat in {"interaction_gain", "gain", "interaction-gain", "interactiongain"}:
-            return ("gain_from_layer:2", "rank-score-compat", 2)
-        if compat in {
-            "exhaustive_then_gain",
-            "exhaustive-then-gain",
-            "exhaustivethengain",
-            "staged_gain",
-            "staged-gain",
-            "stagedgain",
-            "beam_gain",
-            "beam-gain",
-            "beamgain",
-        }:
-            start = max(1, int(exhaustive_depth) + 1)
-            return (f"gain_from_layer:{start}", "rank-score-compat", start)
-        m = re.fullmatch(r"gain_from_layer:(\d+)", compat)
-        if m is not None:
-            start = _parse_positive_layer(m.group(1), label="--rank-score gain_from_layer")
-            return (f"gain_from_layer:{start}", "rank-score-compat", start)
-        raise ValueError(
-            "--rank-score compatibility value must be one of: raw, interaction_gain, "
-            "exhaustive_then_gain, gain_from_layer:<N>."
-        )
-
-    if raw_layer_requested is not None:
-        start = _parse_positive_layer(raw_layer_requested, label="-raw/--raw")
-        return (f"gain_from_layer:{start}", "raw-flag", start)
-
-    return ("gain_from_layer:2", "default-combination-gain", 2)
-
-
 def _emit_garfield_summary_to_log(logger, summary_rows: list[dict[str, object]]) -> None:
     if len(summary_rows) == 0:
         return
     logger.info("")
     logger.info("GARFIELD summary")
-    logger.info("trait\tn_samples\tn_train\tn_holdout\tholdout_kind\tbest_holdout_score\troute")
+    logger.info("trait\tn_samples\tbest_score\troute")
     for row in summary_rows:
         logger.info(
-            f"{row['trait']}\t{int(row['n_samples'])}\t{int(row['n_train'])}\t"
-            f"{int(row['n_holdout'])}\t{row['holdout_kind']}\t"
-            f"{float(row['best_holdout_score']):.12g}\t{row['route']}"
+            f"{row['trait']}\t{int(row['n_samples'])}\t"
+            f"{float(row['best_score']):.12g}\t{row['route']}"
         )
 
 
@@ -606,7 +493,7 @@ def main() -> None:
     )
     optional_group.add_argument("--ncol", action="extend", nargs="+", metavar="COL", default=None, type=str, dest="ncol", help=argparse.SUPPRESS)
     optional_group.add_argument("-ext", "--extension", type=int, default=100_000, help="Window extension in bp.")
-    optional_group.add_argument("-slide", "-step", "--slide", "--step", dest="step", type=int, default=None, help="Window step size (default: extension/2).")
+    optional_group.add_argument("-step", "--step", dest="step", type=int, default=None, help="Window step size (default: extension/2).")
     optional_group.add_argument("-maf", "--maf", type=float, default=0.02, help="Minor allele frequency threshold.")
     optional_group.add_argument(
         "-geno",
@@ -626,7 +513,7 @@ def main() -> None:
         "--grm",
         type=str,
         default=None,
-        help="Optional precomputed GRM/kernel (.npy or text). If set, GARFIELD residualization uses this matrix and slices it for full/train/test subsets instead of rebuilding GRM from BED.",
+        help="Optional precomputed GRM/kernel (.npy or text). If set, GARFIELD residualization uses this matrix on the aligned sample set instead of rebuilding GRM from BED.",
     )
     optional_group.add_argument(
         "-c",
@@ -643,22 +530,6 @@ def main() -> None:
             "supports full-width colon). "
             "Examples: -c cov.tsv -c 1:1000 -c 1:1000:1000."
         ),
-    )
-    optional_group.add_argument(
-        "-kid",
-        "--grm-id",
-        type=str,
-        default=None,
-        help="Optional GRM sample ID file. Default auto-detect: <grm>.id.",
-    )
-    optional_group.add_argument(
-        "-cv",
-        "--fold",
-        "--cv",
-        dest="fold",
-        type=int,
-        default=None,
-        help="Optional stratified holdout fold. If omitted, GARFIELD uses the full data without train/test split.",
     )
     optional_group.add_argument(
         "-engine",
@@ -692,26 +563,8 @@ def main() -> None:
         dest="no_clean",
         help="Disable structured beam pruning and fall back to the legacy unfiltered fixed-width search.",
     )
-    optional_group.add_argument(
-        "--prior-len",
-        type=str,
-        default=None,
-        help=(
-            "Comma-separated rule-length prior alpha values for 1..5 SNP rules. "
-            "Example: --prior-len 7,3,2 sets the first three rule-length alphas. "
-            "Default follows layer depth: final layer=1 and doubles backward "
-            "(e.g. layer=4 -> 8,4,2,1)."
-        ),
-    )
     optional_group.add_argument("--prior-not", type=float, default=None, help=argparse.SUPPRESS)
     optional_group.add_argument("-layer", "--layer", type=int, default=None, help="Maximum beam-search rule depth (default: 4).")
-    optional_group.add_argument(
-        "-exh",
-        "--exh",
-        type=int,
-        default=None,
-        help="Exact exhaustive depth before beam pruning. Default is auto: `2` when -layer>=2, otherwise `1`.",
-    )
     optional_group.add_argument(
         "-logic-gate",
         "--logic-gate",
@@ -729,45 +582,7 @@ def main() -> None:
             "Restrict only the final scan stage to one or more genomic bp intervals. "
             "Repeat the flag or use comma-separated items, e.g. "
             "--bimrange 10:110800000-111200000,10:112000000-112200000. "
-            "Null-penalty estimation and empirical-Bayes prior learning remain genome-wide."
-        ),
-    )
-    optional_group.add_argument(
-        "-raw",
-        "--raw",
-        type=int,
-        default=None,
-        help=(
-            "Rule-ranking schedule. If omitted: all logic gates use raw for layer 1 and "
-            "interaction-gain from layer 2. If set to N, rules with layer < N use raw, "
-            "and layer >= N use interaction-gain (e.g. --raw 3 keeps 1/2-site raw and "
-            "starts gain at 3-site)."
-        ),
-    )
-    optional_group.add_argument("--rank-score", type=str, default=None, dest="rank_score_compat", help=argparse.SUPPRESS)
-    optional_group.add_argument(
-        "-beam-topk",
-        "--beam-topk",
-        type=str,
-        default=None,
-        help="Final top-k rules after test ranking; accept integer count or fraction in (0,1].",
-    )
-    optional_group.add_argument(
-        "--candidate-ratio",
-        type=float,
-        default=0.10,
-        help=(
-            "Fraction of pooled beam states retained before final rule scoring "
-            "(default: 0.10). Use 1.0 to keep all pooled candidates."
-        ),
-    )
-    optional_group.add_argument(
-        "--top-rules",
-        type=int,
-        default=1,
-        help=(
-            "Number of final rules kept per scan unit after ranking (default: 1). "
-            "Use 0 to disable the per-unit cap."
+            "Background-noise calibration remains genome-wide."
         ),
     )
     optional_group.add_argument("-m", "--max-pick", type=int, default=None, dest="layer_compat", help=argparse.SUPPRESS)
@@ -779,9 +594,7 @@ def main() -> None:
         dest="feature_source_compat",
         help=argparse.SUPPRESS,
     )
-    optional_group.add_argument("--top-k-validate", type=int, default=None, dest="beam_topk_compat", help=argparse.SUPPRESS)
-    optional_group.add_argument("--val-frac", type=float, default=None, dest="val_frac_compat", help=argparse.SUPPRESS)
-    optional_group.add_argument("--seed", type=int, default=42, help="Random seed for split.")
+    optional_group.add_argument("--seed", type=int, default=42, help="Random seed.")
     optional_group.add_argument("-t", "--thread", dest="thread", type=int, default=detect_effective_threads(), help="CPU threads.")
     optional_group.add_argument("--threads", dest="thread", type=int, default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     optional_group.add_argument("-o", "--out", type=str, default=".", help="Output directory.")
@@ -812,18 +625,17 @@ def main() -> None:
     if args.step is None:
         args.step = max(1, int(args.extension) // 2)
     elif int(args.step) <= 0:
-        parser.error("-slide/--slide must be > 0")
+        parser.error("-step/--step must be > 0")
     if not (0.0 <= float(args.maf) <= 0.5):
         parser.error("-maf/--maf must be in [0, 0.5]")
     if not (0.0 <= float(args.geno) <= 1.0):
         parser.error("-geno/--geno must be in [0, 1]")
     if (
         args.grm is not None
-        and args.fold is None
         and str(args.grm).strip().isdigit()
         and not os.path.exists(str(args.grm).strip())
     ):
-        parser.error("-k/--grm now expects a GRM path. For holdout split use -cv/--fold.")
+        parser.error("-k/--grm now expects a GRM path.")
 
     explicit_scan_flags = int(bool(args.mode_window)) + int(args.gene_mode_file is not None) + int(args.geneset_mode_file is not None)
     if explicit_scan_flags > 1:
@@ -851,24 +663,6 @@ def main() -> None:
     if args.scan_mode in {"gene", "geneset"} and not args.genefile:
         parser.error(f"scan-mode={args.scan_mode} requires -Gene/-GeneSet or --genefile.")
 
-    args.split_requested = False
-    if args.fold is None:
-        if args.val_frac_compat is not None:
-            try:
-                args.fold = _derive_fold_from_holdout(float(args.val_frac_compat))
-            except ValueError as e:
-                parser.error(str(e))
-            args.holdout_frac_requested = float(args.val_frac_compat)
-            args.split_requested = True
-        else:
-            args.holdout_frac_requested = None
-    else:
-        args.holdout_frac_requested = 1.0 / float(args.fold)
-        args.split_requested = True
-    if args.fold is not None and int(args.fold) < 2:
-        parser.error("-cv/--fold must be >= 2")
-    args.fold_runtime = int(args.fold) if args.fold is not None else 0
-
     args.width = int(args.width) if args.width is not None else 100
     if int(args.width) <= 0:
         parser.error("-width/--width must be > 0")
@@ -881,17 +675,7 @@ def main() -> None:
     )
     if int(args.layer) <= 0:
         parser.error("-layer must be > 0")
-    if args.exh is None:
-        args.exh = 2 if int(args.layer) >= 2 else 1
-    if int(args.exh) <= 0:
-        parser.error("-exh/--exh must be >= 1")
-    args.exh = max(1, int(args.exh))
-    if args.raw is not None and int(args.raw) < 1:
-        parser.error("-raw/--raw must be >= 1")
-    try:
-        args.prior_len_alpha = _parse_prior_len_alpha_spec(args.prior_len, layer=int(args.layer))
-    except ValueError as exc:
-        parser.error(str(exc))
+    args.exhaustive_depth_runtime = 2 if int(args.layer) >= 2 else 1
     if args.prior_not is not None:
         try:
             if not np.isfinite(float(args.prior_not)):
@@ -900,28 +684,9 @@ def main() -> None:
             parser.error("--prior-not must be finite when provided")
 
     args.topk = int(args.width) if args.engine is not None else 0
-    try:
-        args.candidate_ratio = float(args.candidate_ratio)
-    except Exception:
-        parser.error("--candidate-ratio must be a float within (0, 1].")
-    if (not np.isfinite(args.candidate_ratio)) or args.candidate_ratio <= 0.0 or args.candidate_ratio > 1.0:
-        parser.error("--candidate-ratio must be within (0, 1].")
-    try:
-        args.top_rules = int(args.top_rules)
-    except Exception:
-        parser.error("--top-rules must be an integer >= 0.")
-    if int(args.top_rules) < 0:
-        parser.error("--top-rules must be >= 0.")
-
-    if args.beam_topk is None:
-        if args.beam_topk_compat is not None:
-            args.beam_topk = str(int(args.beam_topk_compat))
-        else:
-            args.beam_topk = "1"
-    try:
-        args.beam_topk_count, args.beam_topk_ratio = _parse_beam_topk_spec(args.beam_topk)
-    except ValueError as e:
-        parser.error(str(e))
+    args.top_rules_runtime = 1
+    args.max_output_rules_runtime = 0
+    args.max_output_ratio_runtime = 0.0
 
     args.feature_source = (
         str(args.feature_source_compat).lower()
@@ -950,19 +715,9 @@ def main() -> None:
     if logic_gate_key not in logic_gate_map:
         parser.error("-logic-gate must be one of: and, or, and_or")
     args.logic_gate = logic_gate_map[logic_gate_key]
-    try:
-        (
-            args.rank_score,
-            args.rank_schedule_source,
-            args.gain_start_layer_runtime,
-        ) = _resolve_rank_score_runtime(
-            raw_layer_requested=args.raw,
-            logic_gate=args.logic_gate,
-            exhaustive_depth=int(args.exh),
-            rank_score_compat=args.rank_score_compat,
-        )
-    except ValueError as e:
-        parser.error(str(e))
+    args.rank_score = "gain_from_layer:2"
+    args.rank_schedule_source = "fixed-combination-gain"
+    args.gain_start_layer_runtime = 2
 
     try:
         args.ncol = parse_zero_based_index_specs(args.ncol, label="-n/--n")
@@ -1007,8 +762,6 @@ def main() -> None:
     checks.append(ensure_file_exists(logger, args.pheno, "Phenotype file"))
     if args.grm:
         checks.append(ensure_file_exists(logger, args.grm, "GARFIELD GRM"))
-    if args.grm_id:
-        checks.append(ensure_file_exists(logger, args.grm_id, "GARFIELD GRM ID file"))
     if args.genefile:
         checks.append(ensure_file_exists(logger, args.genefile, "Gene file"))
     if args.gff3:
@@ -1036,22 +789,19 @@ def main() -> None:
         ("MAF", float(args.maf)),
         ("Missing max (1+NA)", float(args.geno)),
         ("Extension", int(args.extension)),
-        ("Slide", int(args.step)),
+        ("Step", int(args.step)),
         ("Bimrange", None if not args.bimrange else ",".join(str(x) for x in args.bimrange)),
-        ("Split", f"{int(args.fold)}-fold stratified holdout" if args.split_requested else "none (full data)"),
+        ("Split", "none (full data)"),
         ("Engine", "none (skip ML)" if ml_skipped else args.engine),
         ("Permutation", bool(args.permutation)),
         ("Structured pruning", not bool(args.no_clean)),
-        ("Prior len", "disabled (EB off)"),
         ("NOT control", "null penalty only"),
         ("Width", int(args.width)),
-        ("Candidate ratio", float(args.candidate_ratio)),
-        ("Top rules/unit", int(args.top_rules)),
+        ("Rules/unit", int(args.top_rules_runtime)),
         ("Layer", int(args.layer)),
-        ("Exhaustive depth", int(args.exh)),
+        ("Pair seed depth", int(args.exhaustive_depth_runtime)),
         ("Logic gate", args.logic_gate),
         ("Rule ranking", rank_schedule_runtime),
-        ("Beam top-k", str(args.beam_topk)),
         ("Sim bench", args.simbench),
         ("Seed", int(args.seed)),
     ]
@@ -1103,7 +853,7 @@ def main() -> None:
                 aligned_grm, resolved_grm_id = load_and_align_grm(
                     str(args.grm),
                     sample_ids.tolist(),
-                    grm_id_path=args.grm_id,
+                    grm_id_path=None,
                     label="GARFIELD GRM",
                 )
             except Exception:
@@ -1129,29 +879,6 @@ def main() -> None:
     if pheno.shape[1] == 0:
         raise ValueError("No phenotype columns to analyze.")
     pheno, trait_names = _normalize_trait_names_from_header(pheno, args.pheno)
-    logger.info("Phenotype columns: " + ", ".join(trait_names))
-    # if args.split_requested:
-    #     if ml_skipped:
-    #         logger.info(
-    #             "Rust GARFIELD pipeline: stratified split -> residualize train/test -> "
-    #             "direct beam search on full unit variants -> test ranking."
-    #         )
-    #     else:
-    #         logger.info(
-    #             "Rust GARFIELD pipeline: stratified split -> residualize train/test -> "
-    #             "ML on residualized train phenotype -> beam search -> test ranking."
-    #         )
-    # else:
-    #     if ml_skipped:
-    #         logger.info(
-    #             "Rust GARFIELD pipeline: no train/test split -> residualize full phenotype -> "
-    #             "direct beam search on full unit variants -> full-data ranking."
-    #         )
-    #     else:
-    #         logger.info(
-    #             "Rust GARFIELD pipeline: no train/test split -> residualize full phenotype -> "
-    #             "ML + beam search on full data -> full-data ranking."
-    #         )
     geno_ids = sample_ids.astype(str)
     pheno_ids_all = pheno.index.astype(str).to_numpy()
     common = set(geno_ids) & set(pheno_ids_all)
@@ -1165,11 +892,13 @@ def main() -> None:
 
     grm_n: int | str = "NA" if aligned_grm is None else int(aligned_grm.shape[0])
     cov_n: int | str = "NA" if cov_ids is None else int(len(cov_ids))
+    split_line = "-"*60
     _emit_plain_info_line(
         logger,
         (
             f"geno={len(geno_ids)}, pheno={len(pheno_ids_all)}, "
             f"grm={grm_n}, q=NA, cov={cov_n} -> {len(sample_pool)}"
+            f"\n{split_line}"
         ),
         use_spinner=use_spinner,
     )
@@ -1199,18 +928,6 @@ def main() -> None:
     saved = 0
     summary_rows: list[dict[str, object]] = []
     garfield_manifest_traits: list[dict[str, object]] = []
-    fold_from_val = int(args.fold_runtime)
-    implied_val_frac = (1.0 / float(fold_from_val)) if fold_from_val >= 2 else None
-    if (
-        args.split_requested
-        and args.holdout_frac_requested is not None
-        and implied_val_frac is not None
-        and abs(implied_val_frac - float(args.holdout_frac_requested)) > 0.02
-    ):
-        logger.warning(
-            f"Requested holdout={float(args.holdout_frac_requested):.4g} is approximated by stratified fold={fold_from_val} "
-            f"(holdout={implied_val_frac:.4g}) in Rust GARFIELD."
-        )
 
     for trait_idx, trait in enumerate(pheno.columns):
         if trait_idx > 0:
@@ -1262,8 +979,8 @@ def main() -> None:
         rust_groups = group_intervals if args.scan_mode != "window" else None
         rust_group_names = group_labels if args.scan_mode != "window" else None
         trait_logic_prefix = f"{trait_outprefix}.garfield"
-        # Rust handles stratified split plus train/test residualization internally
-        # before ML candidate search and beam search are executed.
+        # Rust handles full-data residualization before ML candidate search
+        # and beam search are executed.
         result = _run_scan_with_progress(
             scan_desc,
             use_spinner=use_spinner,
@@ -1287,19 +1004,18 @@ def main() -> None:
                 permutation_repeats=5,
                 permutation_scoring="auto",
                 n_estimators=100,
-                max_depth=5,
+                max_depth=int(args.layer) + 1,
                 min_samples_leaf=1,
                 min_samples_split=2,
                 bootstrap=True,
                 feature_subsample=0.0,
-                fold=fold_from_val,
+                fold=0,
                 seed=trait_seed,
                 max_pick=int(args.layer),
-                exhaustive_depth=int(args.exh),
+                exhaustive_depth=int(args.exhaustive_depth_runtime),
                 beam_width=int(args.beam_width),
                 logic_gate=str(args.logic_gate).lower(),
                 rank_score=str(args.rank_score),
-                candidate_keep_ratio=float(args.candidate_ratio),
                 maf_threshold=float(args.maf),
                 max_missing_rate=float(args.geno),
                 snps_only=False,
@@ -1314,11 +1030,11 @@ def main() -> None:
                 require_lapack=False,
                 out_prefix=trait_logic_prefix,
                 simbench_path=args.simbench,
-                top_rules_per_unit=int(args.top_rules),
-                max_output_rules=int(args.beam_topk_count or 0),
-                max_output_ratio=float(args.beam_topk_ratio or 0.0),
+                top_rules_per_unit=int(args.top_rules_runtime),
+                max_output_rules=int(args.max_output_rules_runtime),
+                max_output_ratio=float(args.max_output_ratio_runtime),
                 rule_permutation=bool(args.permutation),
-                prior_len=list(args.prior_len_alpha),
+                prior_len=None,
                 no_clean=bool(args.no_clean),
                 progress_callback=progress_cb,
                 progress_every=0,
@@ -1381,13 +1097,10 @@ def main() -> None:
             "no_clean_requested": bool(args.no_clean),
             "structured_pruning": not bool(args.no_clean),
             "width": int(args.width),
-            "candidate_keep_ratio": float(args.candidate_ratio),
-            "top_rules_per_unit": int(args.top_rules),
+            "top_rules_per_unit": int(args.top_rules_runtime),
             "layer": int(args.layer),
-            "exhaustive_depth": int(args.exh),
+            "pair_seed_depth": int(args.exhaustive_depth_runtime),
             "beam_width": int(args.beam_width),
-            "raw_requested": (None if args.raw is None else int(args.raw)),
-            "prior_len_requested": list(args.prior_len_alpha),
             "not_control": "null_penalty_only",
             "prior_not_ignored": (
                 None if args.prior_not is None else float(args.prior_not)
@@ -1403,21 +1116,7 @@ def main() -> None:
             "bimrange": (list(args.bimrange) if args.bimrange else None),
             "logic_gate_requested": args.logic_gate,
             "logic_gate_runtime": logic_gate_runtime,
-            "beam_topk": str(args.beam_topk),
-            "beam_topk_count_runtime": int(result.get("n_rules", 0)),
-            "beam_topk_ratio_runtime": (
-                float(args.beam_topk_ratio) if args.beam_topk_ratio is not None else None
-            ),
-            "val_frac_requested": (
-                float(args.holdout_frac_requested)
-                if args.holdout_frac_requested is not None
-                else None
-            ),
-            "fold_effective": int(fold_from_val) if split_applied else None,
-            "holdout_frac_effective": (
-                float(implied_val_frac) if split_applied and implied_val_frac is not None else None
-            ),
-            "ranking_dataset": "test" if split_applied else "full",
+            "ranking_dataset": "full",
             "feature_source": feature_source,
             "grm_path": args.grm,
             "grm_id_path": resolved_grm_id,
@@ -1446,37 +1145,34 @@ def main() -> None:
             "posterior": posterior_payload,
         }
         garfield_manifest_traits.append(trait_manifest)
-        logger.info(
-            f"GARFIELD null-model PVE for '{trait_name}': "
-            f"train={float(result.get('train_pve', float('nan'))):.4g}, "
-            f"test={float(result.get('test_pve', float('nan'))):.4g}"
-        )
+        logger.info(f"GARFIELD null-model PVE for '{trait_name}': full={float(result.get('train_pve', float('nan'))):.4g}")
         if args.simbench:
             logger.info(
                 f"GARFIELD simbench rows appended for '{trait_name}': "
                 f"{int(result.get('n_simbench', 0))}"
             )
-        rank_scores = (
-            [float(x) for x in result.get("test_scores", [])]
-            if split_applied
-            else [float(x) for x in result.get("train_scores", [])]
-        )
-        best_holdout = rank_scores[0] if len(rank_scores) > 0 else float("nan")
+        rank_scores = [
+            float(x)
+            for x in (
+                result.get("scores")
+                or result.get("test_scores")
+                or result.get("train_scores")
+                or []
+            )
+        ]
+        best_score = rank_scores[0] if len(rank_scores) > 0 else float("nan")
         summary_rows.append(
             {
                 "trait": trait_name,
                 "n_samples": len(common_ids),
-                "n_train": int(result.get("n_train", 0)),
-                "n_holdout": int(result.get("n_test", 0)) if split_applied else 0,
-                "holdout_kind": "test" if split_applied else "full",
-                "best_holdout_score": best_holdout,
+                "best_score": best_score,
                 "route": "rust-bed",
             }
         )
         log_success(
             logger,
-            f"Saved GARFIELD output for trait '{trait_name}': "
-            f"{format_path_for_display(trait_logic_prefix)}",
+            f"Saved GARFIELD output for trait: "
+            f"\n\t{format_path_for_display(trait_logic_prefix)}",
         )
         saved += 1
 
@@ -1502,24 +1198,16 @@ def main() -> None:
                 "rank_score_runtime": rank_score_runtime,
                 "rank_schedule_runtime": rank_schedule_runtime,
                 "rank_schedule_source": rank_schedule_source,
-                "split_requested": bool(args.split_requested),
                 "permutation": bool(args.permutation),
                 "null_chunk_bp": int(args.extension) * 2,
                 "null_chunk_target": 150 if bool(args.permutation) else 0,
                 "null_chunk_min_snps": 50 if bool(args.permutation) else 0,
                 "bimrange": (list(args.bimrange) if args.bimrange else None),
-                "candidate_keep_ratio": float(args.candidate_ratio),
-                "top_rules_per_unit": int(args.top_rules),
-                "prior_len_requested": list(args.prior_len_alpha),
+                "top_rules_per_unit": int(args.top_rules_runtime),
+                "pair_seed_depth": int(args.exhaustive_depth_runtime),
                 "not_control": "null_penalty_only",
                 "prior_not_ignored": (
                     None if args.prior_not is None else float(args.prior_not)
-                ),
-                "fold_runtime": int(fold_from_val),
-                "holdout_frac_requested": (
-                    float(args.holdout_frac_requested)
-                    if args.holdout_frac_requested is not None
-                    else None
                 ),
                 "thread": int(args.thread),
                 "seed": int(args.seed),

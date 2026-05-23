@@ -20,19 +20,16 @@ pub struct ExtraTreesConfig {
 struct NodeStats {
     n: usize,
     sum: f64,
-    sumsq: f64,
     pos: usize,
 }
 
 #[inline]
 fn make_node_stats(samples: &[usize], y: &[f64], response: ResponseKind) -> NodeStats {
     let mut sum = 0.0f64;
-    let mut sumsq = 0.0f64;
     let mut pos = 0usize;
     for &i in samples {
         let v = y[i];
         sum += v;
-        sumsq += v * v;
         if response == ResponseKind::Binary && v > 0.5 {
             pos += 1;
         }
@@ -40,17 +37,8 @@ fn make_node_stats(samples: &[usize], y: &[f64], response: ResponseKind) -> Node
     NodeStats {
         n: samples.len(),
         sum,
-        sumsq,
         pos,
     }
-}
-
-#[inline]
-fn sse(stats: NodeStats) -> f64 {
-    if stats.n == 0 {
-        return 0.0;
-    }
-    stats.sumsq - (stats.sum * stats.sum) / (stats.n as f64)
 }
 
 #[inline]
@@ -93,17 +81,21 @@ fn split_gain_for_feature(
 ) -> Option<f64> {
     let mut left_n = 0usize;
     let mut left_sum = 0.0f64;
-    let mut left_sumsq = 0.0f64;
     let mut left_pos = 0usize;
 
     for &si in samples {
         if feat_row[si] == 0 {
             left_n += 1;
             let v = y[si];
-            left_sum += v;
-            left_sumsq += v * v;
-            if response == ResponseKind::Binary && v > 0.5 {
-                left_pos += 1;
+            match response {
+                ResponseKind::Continuous => {
+                    left_sum += v;
+                }
+                ResponseKind::Binary => {
+                    if v > 0.5 {
+                        left_pos += 1;
+                    }
+                }
             }
         }
     }
@@ -116,18 +108,24 @@ fn split_gain_for_feature(
     let left = NodeStats {
         n: left_n,
         sum: left_sum,
-        sumsq: left_sumsq,
         pos: left_pos,
     };
     let right = NodeStats {
         n: right_n,
         sum: parent.sum - left_sum,
-        sumsq: parent.sumsq - left_sumsq,
         pos: parent.pos.saturating_sub(left_pos),
     };
 
     let gain = match response {
-        ResponseKind::Continuous => sse(parent) - sse(left) - sse(right),
+        // For binary 0/1 features, the SSE reduction has a closed form that only
+        // needs group counts and group sums; this is algebraically equivalent to
+        // the original variance-based split score but avoids per-candidate sumsq work.
+        ResponseKind::Continuous => {
+            let parent_term = (parent.sum * parent.sum) / (parent.n as f64);
+            let left_term = (left.sum * left.sum) / (left.n as f64);
+            let right_term = (right.sum * right.sum) / (right.n as f64);
+            left_term + right_term - parent_term
+        }
         ResponseKind::Binary => gini_n(parent) - gini_n(left) - gini_n(right),
     };
     if gain.is_finite() && gain > 0.0 {
@@ -347,5 +345,58 @@ pub fn feature_scores_extra_trees(
         merged.iter().map(|v| *v / sum_imp).collect()
     } else {
         merged
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn continuous_split_gain_matches_sse_reduction() {
+        let feat = vec![0u8, 0, 1, 1];
+        let y = vec![5.0, 4.0, -1.0, -2.0];
+        let samples = vec![0usize, 1, 2, 3];
+        let parent = make_node_stats(&samples, &y, ResponseKind::Continuous);
+        let gain = split_gain_for_feature(
+            feat.as_slice(),
+            samples.as_slice(),
+            y.as_slice(),
+            ResponseKind::Continuous,
+            1,
+            parent,
+        )
+        .unwrap();
+        let left = NodeStats {
+            n: 2,
+            sum: 9.0,
+            pos: 0,
+        };
+        let right = NodeStats {
+            n: 2,
+            sum: -3.0,
+            pos: 0,
+        };
+        let old_gain = {
+            let y = y.as_slice();
+            let mean_parent = y.iter().copied().sum::<f64>() / (y.len() as f64);
+            let mean_left = 9.0 / 2.0;
+            let mean_right = -3.0 / 2.0;
+            let parent_sse = y
+                .iter()
+                .map(|v| (v - mean_parent) * (v - mean_parent))
+                .sum::<f64>();
+            let left_sse = [5.0, 4.0]
+                .iter()
+                .map(|v| (v - mean_left) * (v - mean_left))
+                .sum::<f64>();
+            let right_sse = [-1.0, -2.0]
+                .iter()
+                .map(|v| (v - mean_right) * (v - mean_right))
+                .sum::<f64>();
+            parent_sse - left_sse - right_sse
+        };
+        assert!((gain - old_gain).abs() < 1e-12);
+        assert!((gain - 36.0).abs() < 1e-12);
     }
 }

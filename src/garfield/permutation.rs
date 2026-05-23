@@ -14,8 +14,6 @@ pub const DEFAULT_RULE_STRUCTURE_BOOTSTRAP_STABLE_REPEATS: usize = 3;
 pub const DEFAULT_RULE_STRUCTURE_BOOTSTRAP_KL_THRESHOLD: f64 = 0.005;
 pub const DEFAULT_RULE_STRUCTURE_DENSITY_TOPK: usize = 10;
 const DEFAULT_RULE_NULL_QUANTILE: f64 = 0.99;
-const DEFAULT_RULE_NULL_QUANTILE_AND_LEN2: f64 = 0.975;
-const DEFAULT_RULE_NULL_QUANTILE_AND_LEN3P: f64 = 0.980;
 const DEFAULT_RULE_NULL_TOPK_AND_LEN2: usize = 3;
 const DEFAULT_RULE_NULL_TOPK_AND_LEN3P: usize = 2;
 const DEFAULT_RULE_NULL_SHRINK_AND_LEN2_WEIGHTS: (f64, f64, f64) = (0.20, 0.50, 0.30);
@@ -54,6 +52,7 @@ struct RuleNullScores {
 #[derive(Clone, Debug)]
 pub struct RuleNullCalibrator {
     use_gate_dim: bool,
+    max_rule_len: usize,
     exact: Vec<RuleNullScores>,
     collapsed_gate: Vec<RuleNullScores>,
     global: RuleNullScores,
@@ -62,6 +61,7 @@ pub struct RuleNullCalibrator {
 #[derive(Clone, Debug, PartialEq)]
 pub struct RuleNullPenaltyLookup {
     use_gate_dim: bool,
+    max_rule_len: usize,
     exact_train: Vec<Option<f64>>,
     exact_test: Vec<Option<f64>>,
     collapsed_gate_train: Vec<Option<f64>>,
@@ -126,13 +126,14 @@ impl RuleNullBucket {
     }
 
     #[inline]
-    fn collapsed_gate_index(self) -> usize {
-        ((((self.rule_len.clamp(1, 5) - 1) * 2) + usize::from(self.has_not)) * 2) + self.maf_bin()
+    fn collapsed_gate_index(self, max_rule_len: usize) -> usize {
+        ((((self.rule_len.clamp(1, max_rule_len.max(1)) - 1) * 2) + usize::from(self.has_not)) * 2)
+            + self.maf_bin()
     }
 
     #[inline]
-    fn exact_index(self, use_gate_dim: bool) -> usize {
-        let base = self.collapsed_gate_index();
+    fn exact_index(self, max_rule_len: usize, use_gate_dim: bool) -> usize {
+        let base = self.collapsed_gate_index(max_rule_len);
         if use_gate_dim {
             (base * 2) + self.gate_bin()
         } else {
@@ -141,14 +142,14 @@ impl RuleNullBucket {
     }
 
     #[inline]
-    fn from_collapsed_gate_index(idx: usize) -> Self {
+    fn from_collapsed_gate_index(idx: usize, max_rule_len: usize) -> Self {
         let maf = if (idx & 1) == 0 {
             MafBucket::Low
         } else {
             MafBucket::High
         };
         let has_not = ((idx >> 1) & 1) != 0;
-        let rule_len = ((idx >> 2) + 1).clamp(1, 5);
+        let rule_len = ((idx >> 2) + 1).clamp(1, max_rule_len.max(1));
         Self {
             gate: GateBucket::And,
             rule_len,
@@ -158,16 +159,16 @@ impl RuleNullBucket {
     }
 
     #[inline]
-    fn from_exact_index(idx: usize, use_gate_dim: bool) -> Self {
+    fn from_exact_index(idx: usize, max_rule_len: usize, use_gate_dim: bool) -> Self {
         if !use_gate_dim {
-            return Self::from_collapsed_gate_index(idx);
+            return Self::from_collapsed_gate_index(idx, max_rule_len);
         }
         let gate = if (idx & 1) == 0 {
             GateBucket::And
         } else {
             GateBucket::Or
         };
-        let mut bucket = Self::from_collapsed_gate_index(idx >> 1);
+        let mut bucket = Self::from_collapsed_gate_index(idx >> 1, max_rule_len);
         bucket.gate = gate;
         bucket
     }
@@ -175,14 +176,7 @@ impl RuleNullBucket {
 
 #[inline]
 fn null_quantile_for_bucket(bucket: RuleNullBucket) -> f64 {
-    if matches!(bucket.gate, GateBucket::And) && !bucket.has_not {
-        if bucket.rule_len == 2 {
-            return DEFAULT_RULE_NULL_QUANTILE_AND_LEN2;
-        }
-        if bucket.rule_len >= 3 {
-            return DEFAULT_RULE_NULL_QUANTILE_AND_LEN3P;
-        }
-    }
+    let _ = bucket;
     DEFAULT_RULE_NULL_QUANTILE
 }
 
@@ -240,18 +234,29 @@ pub fn null_topk_per_repeat_for_bucket(bucket: RuleNullBucket) -> usize {
 }
 
 #[inline]
-pub fn rule_null_bucket_count(use_gate_dim: bool) -> usize {
-    5usize * 2usize * 2usize * if use_gate_dim { 2usize } else { 1usize }
+pub fn rule_null_bucket_count(max_rule_len: usize, use_gate_dim: bool) -> usize {
+    max_rule_len.max(1) * 2usize * 2usize * if use_gate_dim { 2usize } else { 1usize }
 }
 
 impl RuleNullCalibrator {
-    pub fn new(use_gate_dim: bool) -> Self {
+    pub fn with_max_rule_len(max_rule_len: usize, use_gate_dim: bool) -> Self {
         Self {
             use_gate_dim,
-            exact: vec![RuleNullScores::default(); rule_null_bucket_count(use_gate_dim)],
-            collapsed_gate: vec![RuleNullScores::default(); rule_null_bucket_count(false)],
+            max_rule_len: max_rule_len.max(1),
+            exact: vec![
+                RuleNullScores::default();
+                rule_null_bucket_count(max_rule_len.max(1), use_gate_dim)
+            ],
+            collapsed_gate: vec![
+                RuleNullScores::default();
+                rule_null_bucket_count(max_rule_len.max(1), false)
+            ],
             global: RuleNullScores::default(),
         }
+    }
+
+    pub fn new(use_gate_dim: bool) -> Self {
+        Self::with_max_rule_len(5, use_gate_dim)
     }
 }
 
@@ -546,21 +551,25 @@ pub fn maf_bucket_from_frac(support_frac: f64) -> MafBucket {
 
 impl RuleNullCalibrator {
     pub fn insert(&mut self, bucket: RuleNullBucket, train_score: f64, test_score: f64) {
-        self.exact[bucket.exact_index(self.use_gate_dim)].push(train_score, test_score);
-        self.collapsed_gate[bucket.collapsed_gate_index()].push(train_score, test_score);
+        self.exact[bucket.exact_index(self.max_rule_len, self.use_gate_dim)]
+            .push(train_score, test_score);
+        self.collapsed_gate[bucket.collapsed_gate_index(self.max_rule_len)]
+            .push(train_score, test_score);
         self.global.push(train_score, test_score);
     }
 
     pub fn finalize(&self) -> RuleNullPenaltyLookup {
-        let mut out = RuleNullPenaltyLookup::new(self.use_gate_dim);
+        let mut out =
+            RuleNullPenaltyLookup::with_max_rule_len(self.max_rule_len, self.use_gate_dim);
         for (idx, scores) in self.exact.iter().enumerate() {
-            let bucket = RuleNullBucket::from_exact_index(idx, self.use_gate_dim);
+            let bucket =
+                RuleNullBucket::from_exact_index(idx, self.max_rule_len, self.use_gate_dim);
             let quantile = null_quantile_for_bucket(bucket);
             out.exact_train[idx] = quantile_nearest_rank(scores.train.as_slice(), quantile);
             out.exact_test[idx] = quantile_nearest_rank(scores.test.as_slice(), quantile);
         }
         for (idx, scores) in self.collapsed_gate.iter().enumerate() {
-            let bucket = RuleNullBucket::from_collapsed_gate_index(idx);
+            let bucket = RuleNullBucket::from_collapsed_gate_index(idx, self.max_rule_len);
             let quantile = null_quantile_for_bucket(bucket);
             out.collapsed_gate_train[idx] =
                 quantile_nearest_rank(scores.train.as_slice(), quantile);
@@ -575,21 +584,26 @@ impl RuleNullCalibrator {
 }
 
 impl RuleNullPenaltyLookup {
-    pub fn new(use_gate_dim: bool) -> Self {
+    pub fn with_max_rule_len(max_rule_len: usize, use_gate_dim: bool) -> Self {
         Self {
             use_gate_dim,
-            exact_train: vec![None; rule_null_bucket_count(use_gate_dim)],
-            exact_test: vec![None; rule_null_bucket_count(use_gate_dim)],
-            collapsed_gate_train: vec![None; rule_null_bucket_count(false)],
-            collapsed_gate_test: vec![None; rule_null_bucket_count(false)],
+            max_rule_len: max_rule_len.max(1),
+            exact_train: vec![None; rule_null_bucket_count(max_rule_len.max(1), use_gate_dim)],
+            exact_test: vec![None; rule_null_bucket_count(max_rule_len.max(1), use_gate_dim)],
+            collapsed_gate_train: vec![None; rule_null_bucket_count(max_rule_len.max(1), false)],
+            collapsed_gate_test: vec![None; rule_null_bucket_count(max_rule_len.max(1), false)],
             global_train: None,
             global_test: None,
         }
     }
 
+    pub fn new(use_gate_dim: bool) -> Self {
+        Self::with_max_rule_len(5, use_gate_dim)
+    }
+
     fn penalty_with_fallback(&self, bucket: RuleNullBucket, is_train: bool) -> Option<f64> {
-        let exact_idx = bucket.exact_index(self.use_gate_dim);
-        let collapsed_idx = bucket.collapsed_gate_index();
+        let exact_idx = bucket.exact_index(self.max_rule_len, self.use_gate_dim);
+        let collapsed_idx = bucket.collapsed_gate_index(self.max_rule_len);
         let exact = if is_train {
             self.exact_train.get(exact_idx).copied().flatten()
         } else {
@@ -637,7 +651,7 @@ pub fn bucket_from_rule(
 ) -> RuleNullBucket {
     RuleNullBucket {
         gate: gate_bucket_from_rule(rule, logic_gate_mode),
-        rule_len: rule.len().clamp(1, 5),
+        rule_len: rule.len().max(1),
         has_not: rule.not_count() > 0,
         maf: maf_bucket_from_frac(support_frac),
     }
@@ -651,7 +665,7 @@ pub fn bucket_from_expr(
 ) -> RuleNullBucket {
     RuleNullBucket {
         gate: gate_bucket_from_expr(expr, rule_len, logic_gate_mode),
-        rule_len: rule_len.clamp(1, 5),
+        rule_len: rule_len.max(1),
         has_not: has_not_expr(expr),
         maf: maf_bucket_from_frac(support_frac),
     }
@@ -796,7 +810,7 @@ mod tests {
     }
 
     #[test]
-    fn test_and_len2_bucket_uses_gentler_null_quantile() {
+    fn test_and_len2_bucket_uses_uniform_q99_null_quantile() {
         let mut cal = RuleNullCalibrator::new(false);
         let bucket = RuleNullBucket {
             gate: GateBucket::And,
@@ -809,7 +823,7 @@ mod tests {
             cal.insert(bucket, fv, fv);
         }
         let lookup = cal.finalize();
-        assert_eq!(lookup.train_penalty(bucket).unwrap(), 39.0);
+        assert_eq!(lookup.train_penalty(bucket).unwrap(), 40.0);
     }
 
     #[test]
@@ -860,8 +874,8 @@ mod tests {
             has_not: false,
             maf: MafBucket::High,
         };
-        let exact_idx = bucket.exact_index(true);
-        let collapsed_idx = bucket.collapsed_gate_index();
+        let exact_idx = bucket.exact_index(lookup.max_rule_len, true);
+        let collapsed_idx = bucket.collapsed_gate_index(lookup.max_rule_len);
         lookup.exact_train[exact_idx] = Some(100.0);
         lookup.collapsed_gate_train[collapsed_idx] = Some(60.0);
         lookup.global_train = Some(20.0);
@@ -878,8 +892,8 @@ mod tests {
             has_not: true,
             maf: MafBucket::High,
         };
-        let exact_idx = bucket.exact_index(true);
-        let collapsed_idx = bucket.collapsed_gate_index();
+        let exact_idx = bucket.exact_index(lookup.max_rule_len, true);
+        let collapsed_idx = bucket.collapsed_gate_index(lookup.max_rule_len);
         lookup.exact_train[exact_idx] = Some(100.0);
         lookup.collapsed_gate_train[collapsed_idx] = Some(60.0);
         lookup.global_train = Some(20.0);
@@ -895,8 +909,8 @@ mod tests {
             has_not: false,
             maf: MafBucket::High,
         };
-        let exact_idx = bucket.exact_index(true);
-        let collapsed_idx = bucket.collapsed_gate_index();
+        let exact_idx = bucket.exact_index(lookup.max_rule_len, true);
+        let collapsed_idx = bucket.collapsed_gate_index(lookup.max_rule_len);
         lookup.exact_train[exact_idx] = Some(100.0);
         lookup.collapsed_gate_train[collapsed_idx] = Some(60.0);
         lookup.global_train = Some(20.0);
@@ -925,8 +939,10 @@ mod tests {
 
     #[test]
     fn test_rule_null_bucket_count_matches_20_or_40_layout() {
-        assert_eq!(rule_null_bucket_count(false), 20);
-        assert_eq!(rule_null_bucket_count(true), 40);
+        assert_eq!(rule_null_bucket_count(5, false), 20);
+        assert_eq!(rule_null_bucket_count(5, true), 40);
+        assert_eq!(rule_null_bucket_count(4, false), 16);
+        assert_eq!(rule_null_bucket_count(4, true), 32);
     }
 
     #[test]

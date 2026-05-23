@@ -54,24 +54,17 @@ pub fn validate_continuous_y(y: &[f64], n_samples: usize, ctx: &str) -> Result<(
 }
 
 #[inline]
-fn y_moments(y: &[f64], n_samples: usize) -> (f64, f64) {
-    let mut sum = 0.0_f64;
-    let mut ss = 0.0_f64;
-    for &v in y.iter().take(n_samples) {
-        sum += v;
-        ss += v * v;
-    }
-    (sum, ss)
+fn total_y_sum(y: &[f64], n_samples: usize) -> f64 {
+    y.iter().take(n_samples).copied().sum::<f64>()
 }
 
 #[inline]
-fn moments_y_where_bit1(bits: &[u64], y: &[f64], n_samples: usize) -> (usize, f64, f64) {
+fn count_sum_y_where_bit1(bits: &[u64], y: &[f64], n_samples: usize) -> (usize, f64) {
     let full_words = n_samples >> 6;
     let rem = n_samples & 63;
 
     let mut n1 = 0usize;
     let mut s1 = 0.0_f64;
-    let mut ss1 = 0.0_f64;
 
     for (w_idx, &word) in bits.iter().take(full_words).enumerate() {
         n1 += word.count_ones() as usize;
@@ -81,7 +74,6 @@ fn moments_y_where_bit1(bits: &[u64], y: &[f64], n_samples: usize) -> (usize, f6
             let tz = w.trailing_zeros() as usize;
             let v = y[base + tz];
             s1 += v;
-            ss1 += v * v;
             w &= w - 1;
         }
     }
@@ -95,12 +87,42 @@ fn moments_y_where_bit1(bits: &[u64], y: &[f64], n_samples: usize) -> (usize, f6
             let tz = w.trailing_zeros() as usize;
             let v = y[base + tz];
             s1 += v;
-            ss1 += v * v;
             w &= w - 1;
         }
     }
 
-    (n1, s1, ss1)
+    (n1, s1)
+}
+
+#[inline]
+fn sum_y_where_bit1(bits: &[u64], y: &[f64], n_samples: usize) -> f64 {
+    let full_words = n_samples >> 6;
+    let rem = n_samples & 63;
+
+    let mut s1 = 0.0_f64;
+
+    for (w_idx, &word) in bits.iter().take(full_words).enumerate() {
+        let mut w = word;
+        let base = w_idx << 6;
+        while w != 0 {
+            let tz = w.trailing_zeros() as usize;
+            s1 += y[base + tz];
+            w &= w - 1;
+        }
+    }
+
+    if rem != 0 {
+        let mask = (1u64 << rem) - 1u64;
+        let mut w = bits[full_words] & mask;
+        let base = full_words << 6;
+        while w != 0 {
+            let tz = w.trailing_zeros() as usize;
+            s1 += y[base + tz];
+            w &= w - 1;
+        }
+    }
+
+    s1
 }
 
 #[inline]
@@ -122,12 +144,128 @@ pub fn support_size_packed(bits: &[u64], n_samples: usize) -> usize {
     n1
 }
 
-pub fn score_cont_weighted_mean_diff_packed(
+#[inline]
+pub fn sum_y_where_both1(lhs: &[u64], rhs: &[u64], y: &[f64], n_samples: usize) -> f64 {
+    let full_words = n_samples >> 6;
+    let rem = n_samples & 63;
+
+    let mut s1 = 0.0_f64;
+
+    for w_idx in 0..full_words {
+        let mut w = lhs[w_idx] & rhs[w_idx];
+        let base = w_idx << 6;
+        while w != 0 {
+            let tz = w.trailing_zeros() as usize;
+            s1 += y[base + tz];
+            w &= w - 1;
+        }
+    }
+
+    if rem != 0 {
+        let mask = (1u64 << rem) - 1u64;
+        let mut w = (lhs[full_words] & rhs[full_words]) & mask;
+        let base = full_words << 6;
+        while w != 0 {
+            let tz = w.trailing_zeros() as usize;
+            s1 += y[base + tz];
+            w &= w - 1;
+        }
+    }
+
+    s1
+}
+
+#[inline]
+pub fn score_cont_centered_gain_from_sum_and_n_hit(
+    total_sum: f64,
+    sum_hit: f64,
+    n_samples: usize,
+    n_hit: usize,
+) -> ContinuousRuleScore {
+    let n_miss = n_samples.saturating_sub(n_hit);
+    if n_hit == 0 || n_miss == 0 {
+        return ContinuousRuleScore {
+            score: 0.0,
+            raw_score: 0.0,
+            mean_hit: f64::NAN,
+            mean_miss: f64::NAN,
+            support_frac: (n_hit as f64) / (n_samples as f64),
+            n_hit,
+            n_miss,
+        };
+    }
+
+    let mean_hit = sum_hit / (n_hit as f64);
+    let sum_miss = total_sum - sum_hit;
+    let mean_miss = sum_miss / (n_miss as f64);
+    let p = (n_hit as f64) / (n_samples as f64);
+    let centered_sum_hit = sum_hit - p * total_sum;
+    let raw = (n_samples as f64) * centered_sum_hit * centered_sum_hit
+        / ((n_hit as f64) * (n_miss as f64));
+    ContinuousRuleScore {
+        score: raw,
+        raw_score: raw,
+        mean_hit,
+        mean_miss,
+        support_frac: p,
+        n_hit,
+        n_miss,
+    }
+}
+
+pub fn score_cont_centered_gain_packed_with_n_hit(
     y: &[f64],
     bits: &[u64],
     n_samples: usize,
+    total_sum: f64,
+    n_hit: usize,
 ) -> ContinuousRuleScore {
-    const CTX: &str = "score_cont_weighted_mean_diff_packed";
+    const CTX: &str = "score_cont_centered_gain_packed_with_n_hit";
+    if require_n_valid(n_samples, y.len(), bits.len(), CTX).is_err() {
+        return ContinuousRuleScore {
+            score: f64::NEG_INFINITY,
+            raw_score: f64::NEG_INFINITY,
+            mean_hit: f64::NAN,
+            mean_miss: f64::NAN,
+            support_frac: f64::NAN,
+            n_hit: 0,
+            n_miss: 0,
+        };
+    }
+    if validate_continuous_y(y, n_samples, CTX).is_err() {
+        return ContinuousRuleScore {
+            score: f64::NEG_INFINITY,
+            raw_score: f64::NEG_INFINITY,
+            mean_hit: f64::NAN,
+            mean_miss: f64::NAN,
+            support_frac: f64::NAN,
+            n_hit: 0,
+            n_miss: 0,
+        };
+    }
+    if n_hit > n_samples {
+        return ContinuousRuleScore {
+            score: f64::NEG_INFINITY,
+            raw_score: f64::NEG_INFINITY,
+            mean_hit: f64::NAN,
+            mean_miss: f64::NAN,
+            support_frac: f64::NAN,
+            n_hit: 0,
+            n_miss: 0,
+        };
+    }
+
+    let sum_hit = sum_y_where_bit1(bits, y, n_samples);
+    score_cont_centered_gain_from_sum_and_n_hit(total_sum, sum_hit, n_samples, n_hit)
+}
+
+pub fn score_cont_centered_gain_packed_with_sum(
+    y: &[f64],
+    bits: &[u64],
+    n_samples: usize,
+    total_sum: f64,
+) -> ContinuousRuleScore {
+    const CTX: &str = "score_cont_centered_gain_packed_with_sum";
     if require_n_valid(n_samples, y.len(), bits.len(), CTX).is_err() {
         return ContinuousRuleScore {
             score: f64::NEG_INFINITY,
@@ -151,49 +289,16 @@ pub fn score_cont_weighted_mean_diff_packed(
         };
     }
 
-    let (sum_all, ss_all) = y_moments(y, n_samples);
-    let (n_hit, sum_hit, ss_hit) = moments_y_where_bit1(bits, y, n_samples);
-    let n_miss = n_samples.saturating_sub(n_hit);
-    if n_hit == 0 || n_miss == 0 {
-        return ContinuousRuleScore {
-            score: 0.0,
-            raw_score: 0.0,
-            mean_hit: f64::NAN,
-            mean_miss: f64::NAN,
-            support_frac: (n_hit as f64) / (n_samples as f64),
-            n_hit,
-            n_miss,
-        };
-    }
+    let n_hit = support_size_packed(bits, n_samples);
+    score_cont_centered_gain_packed_with_n_hit(y, bits, n_samples, total_sum, n_hit)
+}
 
-    let mean_hit = sum_hit / (n_hit as f64);
-    let sum_miss = sum_all - sum_hit;
-    let ss_miss = ss_all - ss_hit;
-    let mean_miss = sum_miss / (n_miss as f64);
-    let p = (n_hit as f64) / (n_samples as f64);
-    let beta_abs = (mean_hit - mean_miss).abs();
-    let sse_hit = (ss_hit - (sum_hit * sum_hit) / (n_hit as f64)).max(0.0);
-    let sse_miss = (ss_miss - (sum_miss * sum_miss) / (n_miss as f64)).max(0.0);
-    let sigma2 = if n_samples > 2 {
-        (sse_hit + sse_miss) / ((n_samples - 2) as f64)
-    } else {
-        f64::NAN
-    };
-    let scale = if sigma2.is_finite() && sigma2 > 0.0 {
-        sigma2.sqrt()
-    } else {
-        1.0
-    };
-    let raw = beta_abs * (p * (1.0 - p)).sqrt() / scale;
-    ContinuousRuleScore {
-        score: raw,
-        raw_score: raw,
-        mean_hit,
-        mean_miss,
-        support_frac: p,
-        n_hit,
-        n_miss,
-    }
+pub fn score_cont_weighted_mean_diff_packed(
+    y: &[f64],
+    bits: &[u64],
+    n_samples: usize,
+) -> ContinuousRuleScore {
+    score_cont_centered_gain_packed_with_sum(y, bits, n_samples, total_y_sum(y, n_samples))
 }
 
 #[cfg(test)]
@@ -209,8 +314,20 @@ mod tests {
         assert_eq!(sc.n_miss, 2);
         assert!((sc.mean_hit - 4.5).abs() < 1e-12);
         assert!((sc.mean_miss + 1.5).abs() < 1e-12);
-        assert!((sc.raw_score - 4.242640687119285).abs() < 1e-12);
-        assert!((sc.score - 4.242640687119285).abs() < 1e-12);
+        assert!((sc.raw_score - 36.0).abs() < 1e-12);
+        assert!((sc.score - 36.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_score_cont_weighted_mean_diff_centers_nonzero_total_sum() {
+        let y = vec![2.0, 2.0, 0.0, 0.0];
+        let bits = vec![0b0011_u64];
+        let sc = score_cont_weighted_mean_diff_packed(&y, &bits, y.len());
+        assert_eq!(sc.n_hit, 2);
+        assert_eq!(sc.n_miss, 2);
+        assert!((sc.mean_hit - 2.0).abs() < 1e-12);
+        assert!((sc.mean_miss - 0.0).abs() < 1e-12);
+        assert!((sc.raw_score - 4.0).abs() < 1e-12);
     }
 
     #[test]

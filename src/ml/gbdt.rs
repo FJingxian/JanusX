@@ -13,7 +13,6 @@ const GBDT_SUBSAMPLE: f64 = 0.7;
 struct RegStats {
     n: usize,
     sum: f64,
-    sumsq: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -63,25 +62,14 @@ fn reg_leaf_value(samples: &[usize], target: &[f64]) -> f64 {
 #[inline]
 fn make_reg_stats(samples: &[usize], target: &[f64]) -> RegStats {
     let mut sum = 0.0f64;
-    let mut sumsq = 0.0f64;
     for &i in samples {
         let v = target[i];
         sum += v;
-        sumsq += v * v;
     }
     RegStats {
         n: samples.len(),
         sum,
-        sumsq,
     }
-}
-
-#[inline]
-fn sse(stats: RegStats) -> f64 {
-    if stats.n == 0 {
-        return 0.0;
-    }
-    stats.sumsq - (stats.sum * stats.sum) / (stats.n as f64)
 }
 
 #[inline]
@@ -108,14 +96,12 @@ fn split_gain_for_feature(
 ) -> Option<f64> {
     let mut left_n = 0usize;
     let mut left_sum = 0.0f64;
-    let mut left_sumsq = 0.0f64;
 
     for &si in samples {
         if feat_row[si] == 0 {
             left_n += 1;
             let v = target[si];
             left_sum += v;
-            left_sumsq += v * v;
         }
     }
 
@@ -127,14 +113,17 @@ fn split_gain_for_feature(
     let left = RegStats {
         n: left_n,
         sum: left_sum,
-        sumsq: left_sumsq,
     };
     let right = RegStats {
         n: right_n,
         sum: parent.sum - left_sum,
-        sumsq: parent.sumsq - left_sumsq,
     };
-    let gain = sse(parent) - sse(left) - sse(right);
+    // Closed-form SSE reduction for binary 0/1 splits; this matches the
+    // ET/RF continuous split score and avoids per-candidate sumsq work.
+    let parent_term = (parent.sum * parent.sum) / (parent.n as f64);
+    let left_term = (left.sum * left.sum) / (left.n as f64);
+    let right_term = (right.sum * right.sum) / (right.n as f64);
+    let gain = left_term + right_term - parent_term;
     if gain.is_finite() && gain > 0.0 {
         Some(gain)
     } else {
@@ -588,5 +577,37 @@ mod tests {
         );
         assert_eq!(argmax(&imp), lead_feat);
         assert_eq!(argmax(&perm), lead_feat);
+    }
+
+    #[test]
+    fn gbdt_continuous_split_gain_matches_sse_reduction() {
+        let feat = vec![0u8, 0, 1, 1];
+        let y = vec![5.0, 4.0, -1.0, -2.0];
+        let samples = vec![0usize, 1, 2, 3];
+        let parent = make_reg_stats(&samples, &y);
+        let gain =
+            split_gain_for_feature(feat.as_slice(), samples.as_slice(), y.as_slice(), 1, parent)
+                .unwrap();
+        let old_gain = {
+            let y = y.as_slice();
+            let mean_parent = y.iter().copied().sum::<f64>() / (y.len() as f64);
+            let mean_left = 9.0 / 2.0;
+            let mean_right = -3.0 / 2.0;
+            let parent_sse = y
+                .iter()
+                .map(|v| (v - mean_parent) * (v - mean_parent))
+                .sum::<f64>();
+            let left_sse = [5.0, 4.0]
+                .iter()
+                .map(|v| (v - mean_left) * (v - mean_left))
+                .sum::<f64>();
+            let right_sse = [-1.0, -2.0]
+                .iter()
+                .map(|v| (v - mean_right) * (v - mean_right))
+                .sum::<f64>();
+            parent_sse - left_sse - right_sse
+        };
+        assert!((gain - old_gain).abs() < 1e-12);
+        assert!((gain - 36.0).abs() < 1e-12);
     }
 }

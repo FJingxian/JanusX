@@ -63,7 +63,10 @@ use residual::{garfield_residualize_exact_from_grm_rust, GarfieldResidualResult}
 #[allow(unused_imports)]
 pub use sampling::stratified_test_mask;
 #[allow(unused_imports)]
-pub use score::{score_cont_weighted_mean_diff_packed, ContinuousRuleScore};
+pub use score::{
+    score_cont_centered_gain_packed_with_sum, score_cont_weighted_mean_diff_packed,
+    ContinuousRuleScore,
+};
 
 const BIN01_MAGIC: &[u8; 8] = b"JXBIN001";
 const BIN01_HEADER_LEN: usize = 32;
@@ -71,11 +74,21 @@ const GARFIELD_CONSTRAINED_BEAM_PAR_MIN_TOTAL_CANDS: usize = 1_024;
 const GARFIELD_CONSTRAINED_BEAM_PAR_CHUNK_CANDS: usize = 256;
 const GARFIELD_NULL_ML_TOP_FRAC: f64 = 0.80;
 const GARFIELD_EB_BEAM_MIN_GAIN: f64 = 0.05;
-const GARFIELD_SCAN_BEAM_MIN_GAIN: f64 = 0.01;
 const GARFIELD_SCAN_PAIR_PARENT_ABS_GAIN_MIN: f64 = 0.01;
 const GARFIELD_SCAN_SURROGATE_TEST_GAIN_MAX: f64 = 0.02;
 const GARFIELD_SCAN_SURROGATE_HAMMING_FRAC_MAX: f64 = 0.02;
 const GARFIELD_DISABLE_STRUCTURE_PRIOR: bool = true;
+
+#[inline]
+fn strict_maf_support_count(n_samples: usize, maf_threshold: f32) -> usize {
+    if n_samples == 0 {
+        return 0;
+    }
+    if !maf_threshold.is_finite() || maf_threshold <= 0.0 {
+        return 1;
+    }
+    ((f64::from(maf_threshold) * (n_samples as f64)).floor() as usize).saturating_add(1)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GarfieldInputKind {
@@ -2263,8 +2276,7 @@ struct GarfieldLogicRuleRecord {
     se: f64,
     chisq: f64,
     pwald: f64,
-    train_score: f64,
-    test_score: f64,
+    score: f64,
     full_bits: Vec<u64>,
 }
 
@@ -2328,9 +2340,7 @@ fn is_no_valid_initial_literals_error(err: &str) -> bool {
 
 #[inline]
 fn format_skipped_unit_message(phase: &str, unit_name: &str, reason: &str) -> String {
-    format!(
-        "GARFIELD skipped unit [{phase}] {unit_name}: {reason}"
-    )
+    format!("GARFIELD skipped unit [{phase}] {unit_name}: {reason}")
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2972,15 +2982,19 @@ fn evaluate_simbench_terms(
             1,
             n_selected,
         )?;
-        let train_sc = score_cont_weighted_mean_diff_packed(
+        let train_sum = y_train.iter().copied().sum::<f64>();
+        let assoc_sum = y_assoc.iter().copied().sum::<f64>();
+        let train_sc = score_cont_centered_gain_packed_with_sum(
             y_train,
             train_bits.as_slice(),
             train_idx_local.len(),
+            train_sum,
         );
-        let assoc_sc = score_cont_weighted_mean_diff_packed(
+        let assoc_sc = score_cont_centered_gain_packed_with_sum(
             y_assoc,
             assoc_bits.as_slice(),
             assoc_sample_indices.len(),
+            assoc_sum,
         );
         let mut max_singleton_train_raw = f64::NEG_INFINITY;
         let mut max_singleton_assoc_raw = f64::NEG_INFINITY;
@@ -3001,15 +3015,17 @@ fn evaluate_simbench_terms(
                 1,
                 n_selected,
             )?;
-            let sc_train = score_cont_weighted_mean_diff_packed(
+            let sc_train = score_cont_centered_gain_packed_with_sum(
                 y_train,
                 member_train_bits.as_slice(),
                 train_idx_local.len(),
+                train_sum,
             );
-            let sc_assoc = score_cont_weighted_mean_diff_packed(
+            let sc_assoc = score_cont_centered_gain_packed_with_sum(
                 y_assoc,
                 member_assoc_bits.as_slice(),
                 assoc_sample_indices.len(),
+                assoc_sum,
             );
             max_singleton_train_raw = max_singleton_train_raw.max(sc_train.raw_score);
             max_singleton_assoc_raw = max_singleton_assoc_raw.max(sc_assoc.raw_score);
@@ -3020,6 +3036,102 @@ fn evaluate_simbench_terms(
         if !max_singleton_assoc_raw.is_finite() {
             max_singleton_assoc_raw = assoc_sc.raw_score;
         }
+        let direct_parent_train_raw = if term.sites.len() <= 1 {
+            0.0
+        } else if term.sites.len() == 2 {
+            max_singleton_train_raw
+        } else {
+            let mut best = f64::NEG_INFINITY;
+            for drop_idx in 0..gate_rows.len() {
+                let parent_rows = gate_rows
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, row)| {
+                        if i == drop_idx {
+                            None
+                        } else {
+                            Some(row.clone())
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let parent_gate = combine_logic_bin01_rows(parent_rows.as_slice(), term.logic)
+                    .map_err(|e| {
+                        format!(
+                            "simbench term {} failed to build parent baseline on train set: {e}",
+                            term.term_id
+                        )
+                    })?;
+                let parent_full_bits = pack_bin01_to_words(parent_gate.as_slice());
+                let (parent_train_bits, _) = packed_rows_subset_from_full_bits(
+                    parent_full_bits.as_slice(),
+                    row_words_full,
+                    &[0usize],
+                    train_idx_local,
+                    1,
+                    n_selected,
+                )?;
+                let parent_sc = score_cont_centered_gain_packed_with_sum(
+                    y_train,
+                    parent_train_bits.as_slice(),
+                    train_idx_local.len(),
+                    train_sum,
+                );
+                best = best.max(parent_sc.raw_score);
+            }
+            if best.is_finite() {
+                best
+            } else {
+                0.0
+            }
+        };
+        let direct_parent_assoc_raw = if term.sites.len() <= 1 {
+            0.0
+        } else if term.sites.len() == 2 {
+            max_singleton_assoc_raw
+        } else {
+            let mut best = f64::NEG_INFINITY;
+            for drop_idx in 0..gate_rows.len() {
+                let parent_rows = gate_rows
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, row)| {
+                        if i == drop_idx {
+                            None
+                        } else {
+                            Some(row.clone())
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let parent_gate = combine_logic_bin01_rows(parent_rows.as_slice(), term.logic)
+                    .map_err(|e| {
+                        format!(
+                            "simbench term {} failed to build parent baseline on assoc set: {e}",
+                            term.term_id
+                        )
+                    })?;
+                let parent_full_bits = pack_bin01_to_words(parent_gate.as_slice());
+                let (parent_assoc_bits, _) = packed_rows_subset_from_full_bits(
+                    parent_full_bits.as_slice(),
+                    row_words_full,
+                    &[0usize],
+                    assoc_sample_indices,
+                    1,
+                    n_selected,
+                )?;
+                let parent_sc = score_cont_centered_gain_packed_with_sum(
+                    y_assoc,
+                    parent_assoc_bits.as_slice(),
+                    assoc_sample_indices.len(),
+                    assoc_sum,
+                );
+                best = best.max(parent_sc.raw_score);
+            }
+            if best.is_finite() {
+                best
+            } else {
+                0.0
+            }
+        };
         let sim_expr_txt = simbench_rule_expr(term.logic, bench_sites.as_slice())?;
         let sim_bucket = bucket_from_expr(
             sim_expr_txt.as_str(),
@@ -3027,12 +3139,12 @@ fn evaluate_simbench_terms(
             train_sc.support_frac,
             beam_params.logic_gate_mode,
         );
-        let train_score = rank_rule_score_components_with_bucket(
+        let _train_score = rank_rule_score_components_with_bucket(
             sim_bucket,
             term.sites.len(),
             0,
             train_sc.raw_score,
-            max_singleton_train_raw,
+            direct_parent_train_raw,
             &beam_params,
             true,
         );
@@ -3041,7 +3153,7 @@ fn evaluate_simbench_terms(
             term.sites.len(),
             0,
             assoc_sc.raw_score,
-            max_singleton_assoc_raw,
+            direct_parent_assoc_raw,
             &beam_params,
             false,
         );
@@ -3072,8 +3184,7 @@ fn evaluate_simbench_terms(
             se: assoc.se,
             chisq: assoc.chisq,
             pwald: assoc.pwald,
-            train_score,
-            test_score,
+            score: test_score,
             full_bits,
         });
     }
@@ -3157,14 +3268,9 @@ fn cmp_logic_rule_records(
     a: &GarfieldLogicRuleRecord,
     b: &GarfieldLogicRuleRecord,
 ) -> std::cmp::Ordering {
-    b.test_score
-        .partial_cmp(&a.test_score)
+    b.score
+        .partial_cmp(&a.score)
         .unwrap_or(std::cmp::Ordering::Equal)
-        .then_with(|| {
-            b.train_score
-                .partial_cmp(&a.train_score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
         .then_with(|| {
             a.selected_row_indices
                 .len()
@@ -3189,13 +3295,8 @@ fn cmp_logic_rule_records_same_support(
         .cmp(&b.selected_row_indices.len())
         .then_with(|| logic_rule_not_count(a).cmp(&logic_rule_not_count(b)))
         .then_with(|| {
-            b.test_score
-                .partial_cmp(&a.test_score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
-        .then_with(|| {
-            b.train_score
-                .partial_cmp(&a.train_score)
+            b.score
+                .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
         })
         .then_with(|| a.snp_name.cmp(&b.snp_name))
@@ -3223,13 +3324,8 @@ fn cmp_logic_rule_records_output(
         .then_with(|| a.unit_kind.cmp(&b.unit_kind))
         .then_with(|| a.unit_index.cmp(&b.unit_index))
         .then_with(|| {
-            b.test_score
-                .partial_cmp(&a.test_score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
-        .then_with(|| {
-            b.train_score
-                .partial_cmp(&a.train_score)
+            b.score
+                .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
         })
         .then_with(|| {
@@ -5182,8 +5278,7 @@ fn evaluate_logic_unit_continuous(
             se: assoc.se,
             chisq: assoc.chisq,
             pwald: assoc.pwald,
-            train_score: cand.train_score,
-            test_score: cand.test_score,
+            score: cand.test_score,
             full_bits,
         });
     }
@@ -5247,9 +5342,8 @@ fn apply_logic_rule_output_limit(
 ) -> Result<(), String> {
     if max_output_rules > 0 {
         if records.len() > max_output_rules {
-            let keep_n = extend_keep_with_score_ties(records.as_slice(), max_output_rules, |rec| {
-                rec.test_score
-            });
+            let keep_n =
+                extend_keep_with_score_ties(records.as_slice(), max_output_rules, |rec| rec.score);
             records.truncate(keep_n);
         }
         return Ok(());
@@ -5265,7 +5359,7 @@ fn apply_logic_rule_output_limit(
     }
     let keep_n = ((records.len() as f64) * max_output_ratio).ceil().max(1.0) as usize;
     if records.len() > keep_n {
-        let keep_n = extend_keep_with_score_ties(records.as_slice(), keep_n, |rec| rec.test_score);
+        let keep_n = extend_keep_with_score_ties(records.as_slice(), keep_n, |rec| rec.score);
         records.truncate(keep_n);
     }
     Ok(())
@@ -5335,7 +5429,7 @@ fn write_logic_rules_tsv(path: &str, records: &[GarfieldLogicRuleRecord]) -> Res
     ordered.sort_by(|a, b| cmp_logic_rule_records_output(a, b));
     writeln!(
         w,
-        "unit_kind\tunit_index\tunit_name\tregion_size\tml_feature_count\tMLrank\tsnp_name\texpr\tbeta\tse\tchisq\tpwald\ttrain_score"
+        "unit_kind\tunit_index\tunit_name\tregion_size\tml_feature_count\tMLrank\tsnp_name\texpr\tbeta\tse\tchisq\tpwald\tscore"
     )
     .map_err(|e| e.to_string())?;
     for rec in ordered.into_iter() {
@@ -5355,7 +5449,7 @@ fn write_logic_rules_tsv(path: &str, records: &[GarfieldLogicRuleRecord]) -> Res
             rec.se,
             chisq_txt,
             rec.pwald,
-            rec.train_score,
+            rec.score,
         )
         .map_err(|e| e.to_string())?;
     }
@@ -5498,7 +5592,6 @@ fn garfield_logic_search_bed_owned(
     beam_width: usize,
     logic_gate: String,
     rank_score: String,
-    candidate_keep_ratio: f64,
     maf_threshold: f32,
     max_missing_rate: f32,
     snps_only: bool,
@@ -5617,6 +5710,15 @@ fn garfield_logic_search_bed_owned(
     let y_test = subset_vec_f64(&y, &test_idx_local)?;
     let x_train = subset_cov_f64(x_cov.as_deref(), n_selected, q_cov, &train_idx_local)?;
     let x_test = subset_cov_f64(x_cov.as_deref(), n_selected, q_cov, &test_idx_local)?;
+    let ml_min_samples_leaf = strict_maf_support_count(train_idx_local.len(), maf_threshold).max(1);
+    let tree_cfg = ExtraTreesConfig {
+        min_samples_leaf: tree_cfg.min_samples_leaf.max(ml_min_samples_leaf),
+        min_samples_split: tree_cfg
+            .min_samples_split
+            .max(ml_min_samples_leaf.saturating_mul(2))
+            .max(2),
+        ..tree_cfg
+    };
 
     let threads_eff = effective_threads_local(threads);
     let (train_fit, test_fit) = if split_applied {
@@ -5854,7 +5956,7 @@ fn garfield_logic_search_bed_owned(
         surrogate_test_gain_max: 0.0,
         surrogate_hamming_frac_max: 0.0,
         enable_diversity_pruning: false,
-        candidate_keep_ratio: candidate_keep_ratio.clamp(1e-6, 1.0),
+        maf_threshold: maf_threshold.clamp(0.0, 0.5) as f64,
         lambda_len: 0.0,
         lambda_not: 0.0,
         exhaustive_depth: exhaustive_depth.max(1),
@@ -6250,8 +6352,10 @@ fn garfield_logic_search_bed_owned(
             }
             out
         };
-        let mut bucket_scores =
-            RuleNullCalibrator::new(matches!(logic_gate_mode, BeamLogicGateMode::AndOr));
+        let mut bucket_scores = RuleNullCalibrator::with_max_rule_len(
+            beam_params.max_pick.max(1),
+            matches!(logic_gate_mode, BeamLogicGateMode::AndOr),
+        );
         for task_out in perm_results.into_iter() {
             for (bucket, train_score, test_score) in task_out? {
                 bucket_scores.insert(bucket, train_score, test_score);
@@ -6399,11 +6503,7 @@ fn garfield_logic_search_bed_owned(
         null_penalties: rule_null_lookup,
         structure_prior: rule_structure_prior.clone(),
         disable_parent_delta: soft_structure_mode,
-        min_gain: if no_clean {
-            0.0
-        } else {
-            GARFIELD_SCAN_BEAM_MIN_GAIN
-        },
+        min_gain: 0.0,
         min_parent_abs_gain: if no_clean {
             0.0
         } else {
@@ -6489,8 +6589,7 @@ fn garfield_logic_search_bed_owned(
                     ) {
                         Ok(v) => v,
                         Err(err) if is_no_valid_initial_literals_error(&err) => {
-                            let msg =
-                                format_skipped_unit_message("scan", &unit.label, &err);
+                            let msg = format_skipped_unit_message("scan", &unit.label, &err);
                             skipped_messages_parallel
                                 .lock()
                                 .map_err(|_| {
@@ -6714,7 +6813,6 @@ fn garfield_logic_search_bed_owned(
     beam_width=100,
     logic_gate="ao",
     rank_score="interaction_gain",
-    candidate_keep_ratio=0.10,
     maf_threshold=0.02,
     max_missing_rate=0.05,
     snps_only=false,
@@ -6772,7 +6870,6 @@ pub fn garfield_logic_search_bed_py<'py>(
     beam_width: usize,
     logic_gate: &str,
     rank_score: &str,
-    candidate_keep_ratio: f64,
     maf_threshold: f32,
     max_missing_rate: f32,
     snps_only: bool,
@@ -6868,7 +6965,6 @@ pub fn garfield_logic_search_bed_py<'py>(
                 beam_width,
                 logic_gate.to_string(),
                 rank_score.to_string(),
-                candidate_keep_ratio,
                 maf_threshold,
                 max_missing_rate,
                 snps_only,
@@ -6970,20 +7066,16 @@ pub fn garfield_logic_search_bed_py<'py>(
             .collect::<Vec<_>>(),
     )?;
     out.set_item(
+        "scores",
+        result.records.iter().map(|r| r.score).collect::<Vec<_>>(),
+    )?;
+    out.set_item(
         "train_scores",
-        result
-            .records
-            .iter()
-            .map(|r| r.train_score)
-            .collect::<Vec<_>>(),
+        result.records.iter().map(|r| r.score).collect::<Vec<_>>(),
     )?;
     out.set_item(
         "test_scores",
-        result
-            .records
-            .iter()
-            .map(|r| r.test_score)
-            .collect::<Vec<_>>(),
+        result.records.iter().map(|r| r.score).collect::<Vec<_>>(),
     )?;
     out.set_item(
         "positions",
@@ -8048,8 +8140,7 @@ mod tests {
                 se: 0.1 + i as f64 * 0.01,
                 chisq: 5.0 + i as f64,
                 pwald: 1e-4 * (i as f64 + 1.0),
-                train_score: 10.0 - i as f64,
-                test_score: 20.0 - i as f64,
+                score: 20.0 - i as f64,
                 full_bits: vec![i as u64 + 1],
             })
             .collect::<Vec<_>>();
@@ -8086,8 +8177,7 @@ mod tests {
                 se: 0.1,
                 chisq: 10.0,
                 pwald: 1e-4,
-                train_score: 8.0,
-                test_score: 10.0,
+                score: 10.0,
                 full_bits: vec![1],
             },
             GarfieldLogicRuleRecord {
@@ -8109,8 +8199,7 @@ mod tests {
                 se: 0.2,
                 chisq: 11.0,
                 pwald: 2e-4,
-                train_score: 7.0,
-                test_score: 9.0,
+                score: 9.0,
                 full_bits: vec![2],
             },
             GarfieldLogicRuleRecord {
@@ -8132,8 +8221,7 @@ mod tests {
                 se: 0.3,
                 chisq: 12.0,
                 pwald: 3e-4,
-                train_score: 6.0,
-                test_score: 9.0,
+                score: 9.0,
                 full_bits: vec![3],
             },
             GarfieldLogicRuleRecord {
@@ -8155,14 +8243,13 @@ mod tests {
                 se: 0.4,
                 chisq: 13.0,
                 pwald: 4e-4,
-                train_score: 5.0,
-                test_score: 8.0,
+                score: 8.0,
                 full_bits: vec![4],
             },
         ];
         apply_logic_rule_output_limit(&mut records, 2, 0.0).unwrap();
         assert_eq!(records.len(), 3);
-        assert_eq!(records[1].test_score, records[2].test_score);
+        assert_eq!(records[1].score, records[2].score);
     }
 
     fn test_site(chrom: &str, pos: i32) -> SiteInfo {

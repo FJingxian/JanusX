@@ -7,12 +7,16 @@ use std::cmp::Ordering;
 pub const DEFAULT_RULE_PERMUTATION_REPRESENTATIVE_UNITS: usize = 32;
 pub const DEFAULT_RULE_NULL_PHYSICAL_CHUNKS: usize = 150;
 pub const DEFAULT_RULE_NULL_MIN_SNPS_PER_CHUNK: usize = 50;
+pub const DEFAULT_RULE_NULL_MAX_REPEATS: usize = 20;
+pub const DEFAULT_RULE_NULL_ADAPTIVE_MIN_REPEATS: usize = 5;
+pub const DEFAULT_RULE_NULL_ADAPTIVE_STABLE_REPEATS: usize = 3;
 pub const DEFAULT_RULE_STRUCTURE_BOOTSTRAP_MIN_REPEATS: usize = 5;
 pub const DEFAULT_RULE_STRUCTURE_BOOTSTRAP_MAX_REPEATS: usize = 30;
 pub const DEFAULT_RULE_STRUCTURE_BOOTSTRAP_STABLE_REPEATS: usize = 3;
 pub const DEFAULT_RULE_STRUCTURE_BOOTSTRAP_KL_THRESHOLD: f64 = 0.005;
 pub const DEFAULT_RULE_STRUCTURE_DENSITY_TOPK: usize = 10;
 const DEFAULT_RULE_NULL_QUANTILE: f64 = 0.99;
+const DEFAULT_RULE_NULL_Q99_REL_TOL: f64 = 0.02;
 const DEFAULT_RULE_NULL_TOPK_AND_LEN2: usize = 3;
 const DEFAULT_RULE_NULL_TOPK_AND_LEN3P: usize = 2;
 const DEFAULT_RULE_NULL_SHRINK_AND_LEN2_WEIGHTS: (f64, f64, f64) = (0.20, 0.50, 0.30);
@@ -489,6 +493,18 @@ fn quantile_nearest_rank(values: &[f64], quantile: f64) -> Option<f64> {
     Some(v[idx])
 }
 
+#[inline]
+fn penalty_value_converged(prev: Option<f64>, curr: Option<f64>) -> bool {
+    match (prev, curr) {
+        (None, None) => true,
+        (Some(a), Some(b)) if a.is_finite() && b.is_finite() => {
+            let scale = a.abs().max(b.abs()).max(1.0);
+            (a - b).abs() <= (DEFAULT_RULE_NULL_Q99_REL_TOL * scale)
+        }
+        _ => false,
+    }
+}
+
 fn gate_bucket_from_ops(has_or: bool) -> GateBucket {
     if has_or {
         GateBucket::Or
@@ -632,6 +648,26 @@ impl RuleNullPenaltyLookup {
             }
         }
         exact.or(collapsed).or(global)
+    }
+
+    pub fn q99_converged_against(&self, prev: &Self) -> bool {
+        if self.max_rule_len != prev.max_rule_len || self.use_gate_dim != prev.use_gate_dim {
+            return false;
+        }
+        let mut saw_bucket = false;
+        for idx in 0..rule_null_bucket_count(self.max_rule_len, self.use_gate_dim) {
+            let bucket = RuleNullBucket::from_exact_index(idx, self.max_rule_len, self.use_gate_dim);
+            saw_bucket = true;
+            if !penalty_value_converged(prev.train_penalty(bucket), self.train_penalty(bucket)) {
+                return false;
+            }
+            if !penalty_value_converged(prev.test_penalty(bucket), self.test_penalty(bucket)) {
+                return false;
+            }
+        }
+        saw_bucket
+            && penalty_value_converged(prev.global_train, self.global_train)
+            && penalty_value_converged(prev.global_test, self.global_test)
     }
 
     pub fn train_penalty(&self, bucket: RuleNullBucket) -> Option<f64> {

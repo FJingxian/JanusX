@@ -1001,7 +1001,7 @@ def main() -> None:
                 ml_importance="imp",
                 ml_top_k=int(args.topk),
                 ml_top_frac=0.0,
-                permutation_repeats=5,
+                permutation_repeats=20,
                 permutation_scoring="auto",
                 n_estimators=100,
                 max_depth=int(args.layer) + 1,

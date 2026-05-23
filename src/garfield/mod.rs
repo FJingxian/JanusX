@@ -8,8 +8,10 @@ use self::permutation::{
     bucket_from_expr, bucket_from_rule, choose_representative_indices,
     null_topk_per_repeat_for_bucket, shuffled_copy_f64, RuleNullBucket, RuleNullCalibrator,
     RuleNullPenaltyLookup, RuleStructurePrior, RuleStructurePriorCalibrator,
-    RuleStructurePriorConfig, DEFAULT_RULE_NULL_MIN_SNPS_PER_CHUNK,
-    DEFAULT_RULE_NULL_PHYSICAL_CHUNKS, DEFAULT_RULE_PERMUTATION_REPRESENTATIVE_UNITS,
+    RuleStructurePriorConfig, DEFAULT_RULE_NULL_ADAPTIVE_MIN_REPEATS,
+    DEFAULT_RULE_NULL_ADAPTIVE_STABLE_REPEATS, DEFAULT_RULE_NULL_MAX_REPEATS,
+    DEFAULT_RULE_NULL_MIN_SNPS_PER_CHUNK, DEFAULT_RULE_NULL_PHYSICAL_CHUNKS,
+    DEFAULT_RULE_PERMUTATION_REPRESENTATIVE_UNITS,
     DEFAULT_RULE_STRUCTURE_BOOTSTRAP_KL_THRESHOLD,
     DEFAULT_RULE_STRUCTURE_BOOTSTRAP_MAX_REPEATS, DEFAULT_RULE_STRUCTURE_BOOTSTRAP_MIN_REPEATS,
     DEFAULT_RULE_STRUCTURE_BOOTSTRAP_STABLE_REPEATS, DEFAULT_RULE_STRUCTURE_DENSITY_TOPK,
@@ -5942,7 +5944,9 @@ fn garfield_logic_search_bed_owned(
     let logic_gate_mode = parse_beam_logic_gate_mode(&logic_gate)?;
     let rank_mode = parse_beam_rank_mode(&rank_score)?;
     let perm_cfg = PermutationConfig {
-        n_repeats: permutation_repeats.max(1),
+        n_repeats: permutation_repeats
+            .max(DEFAULT_RULE_NULL_ADAPTIVE_MIN_REPEATS)
+            .min(DEFAULT_RULE_NULL_MAX_REPEATS),
         scoring: parse_permutation_scoring(&permutation_scoring)?,
         seed,
     };
@@ -6258,6 +6262,7 @@ fn garfield_logic_search_bed_owned(
         0
     };
 
+    let mut permutation_null_repeats_used = 0usize;
     let rule_null_lookup: Option<Arc<RuleNullPenaltyLookup>> = if null_permutation_active {
         let null_notify_step = if progress_every == 0 {
             (permutation_task_total.max(1) / 200).max(1)
@@ -6278,90 +6283,125 @@ fn garfield_logic_search_bed_owned(
             disable_parent_delta: true,
             ..beam_params.clone()
         };
-        let mut perm_tasks = Vec::<(usize, usize, u64)>::with_capacity(permutation_task_total);
-        for (slot, (chunk, prepared)) in null_chunk_prepared.iter().enumerate() {
-            let _ = prepared;
-            for rep in 0..perm_cfg.n_repeats.max(1) {
-                let rep_seed = seed
-                    ^ (chunk.window_id.wrapping_mul(0x94D0_49BB_1331_11EB))
-                    ^ ((rep as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
-                    ^ ((slot as u64).wrapping_mul(0xA24B_AED4_963E_E407));
-                perm_tasks.push((slot, rep, rep_seed));
-            }
-        }
-        let perm_threads = threads_eff.min(perm_tasks.len().max(1));
-        let perm_results = if perm_threads > 1 {
-            let pool = ThreadPoolBuilder::new()
-                .num_threads(perm_threads)
-                .build()
-                .map_err(|e| format!("build GARFIELD permutation thread pool: {e}"))?;
-            pool.install(|| {
-                perm_tasks
-                    .par_iter()
-                    .map(|(slot, _rep, rep_seed)| {
-                        let (_, prepared) = &null_chunk_prepared[*slot];
-                        let out = collect_rule_permutation_nulls_for_repeat(
-                            prepared,
-                            train_fit.residualized_y.as_slice(),
-                            test_fit.residualized_y.as_slice(),
-                            split_applied,
-                            perm_beam_params.clone(),
-                            *rep_seed,
-                        )?;
-                        let done = null_progress_done.fetch_add(1, Ordering::Relaxed) + 1;
-                        if done % null_notify_step == 0 || done == permutation_task_total {
-                            garfield_stage_progress_notify(
-                                progress_callback_parallel,
-                                "null_penalty",
-                                done,
-                                permutation_task_total.max(1),
-                                None,
-                            )
-                            .map_err(|e| e.to_string())?;
-                        }
-                        Ok(out)
-                    })
-                    .collect::<Vec<Result<Vec<(RuleNullBucket, f64, f64)>, String>>>()
-            })
-        } else {
-            let mut out = Vec::<Result<Vec<(RuleNullBucket, f64, f64)>, String>>::with_capacity(
-                perm_tasks.len(),
-            );
-            for (slot, _rep, rep_seed) in perm_tasks.iter() {
-                let (_, prepared) = &null_chunk_prepared[*slot];
-                let unit_out = collect_rule_permutation_nulls_for_repeat(
-                    prepared,
-                    train_fit.residualized_y.as_slice(),
-                    test_fit.residualized_y.as_slice(),
-                    split_applied,
-                    perm_beam_params.clone(),
-                    *rep_seed,
-                );
-                let done = null_progress_done.fetch_add(1, Ordering::Relaxed) + 1;
-                if done % null_notify_step == 0 || done == permutation_task_total {
-                    garfield_stage_progress_notify(
-                        progress_callback.as_ref(),
-                        "null_penalty",
-                        done,
-                        permutation_task_total.max(1),
-                        None,
-                    )
-                    .map_err(|e| e.to_string())?;
-                }
-                out.push(unit_out);
-            }
-            out
-        };
         let mut bucket_scores = RuleNullCalibrator::with_max_rule_len(
             beam_params.max_pick.max(1),
             matches!(logic_gate_mode, BeamLogicGateMode::AndOr),
         );
-        for task_out in perm_results.into_iter() {
-            for (bucket, train_score, test_score) in task_out? {
-                bucket_scores.insert(bucket, train_score, test_score);
+        let min_perm_repeats = DEFAULT_RULE_NULL_ADAPTIVE_MIN_REPEATS
+            .min(perm_cfg.n_repeats.max(1));
+        let mut stable_rounds = 0usize;
+        let mut prev_lookup: Option<RuleNullPenaltyLookup> = None;
+        let perm_threads = threads_eff.min(null_chunk_prepared.len().max(1));
+        let perm_pool = if perm_threads > 1 {
+            Some(
+                ThreadPoolBuilder::new()
+                    .num_threads(perm_threads)
+                    .build()
+                    .map_err(|e| format!("build GARFIELD permutation thread pool: {e}"))?,
+            )
+        } else {
+            None
+        };
+        for rep in 0..perm_cfg.n_repeats.max(1) {
+            let rep_results = if let Some(pool) = perm_pool.as_ref() {
+                pool.install(|| {
+                    null_chunk_prepared
+                        .par_iter()
+                        .enumerate()
+                        .map(|(slot, (chunk, prepared))| {
+                            let rep_seed = seed
+                                ^ (chunk.window_id.wrapping_mul(0x94D0_49BB_1331_11EB))
+                                ^ ((rep as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+                                ^ ((slot as u64).wrapping_mul(0xA24B_AED4_963E_E407));
+                            let out = collect_rule_permutation_nulls_for_repeat(
+                                prepared,
+                                train_fit.residualized_y.as_slice(),
+                                test_fit.residualized_y.as_slice(),
+                                split_applied,
+                                perm_beam_params.clone(),
+                                rep_seed,
+                            )?;
+                            let done = null_progress_done.fetch_add(1, Ordering::Relaxed) + 1;
+                            if done % null_notify_step == 0 || done == permutation_task_total {
+                                garfield_stage_progress_notify(
+                                    progress_callback_parallel,
+                                    "null_penalty",
+                                    done,
+                                    permutation_task_total.max(1),
+                                    None,
+                                )
+                                .map_err(|e| e.to_string())?;
+                            }
+                            Ok(out)
+                        })
+                        .collect::<Vec<Result<Vec<(RuleNullBucket, f64, f64)>, String>>>()
+                })
+            } else {
+                let mut out = Vec::<Result<Vec<(RuleNullBucket, f64, f64)>, String>>::with_capacity(
+                    null_chunk_prepared.len(),
+                );
+                for (slot, (chunk, prepared)) in null_chunk_prepared.iter().enumerate() {
+                    let rep_seed = seed
+                        ^ (chunk.window_id.wrapping_mul(0x94D0_49BB_1331_11EB))
+                        ^ ((rep as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+                        ^ ((slot as u64).wrapping_mul(0xA24B_AED4_963E_E407));
+                    let unit_out = collect_rule_permutation_nulls_for_repeat(
+                        prepared,
+                        train_fit.residualized_y.as_slice(),
+                        test_fit.residualized_y.as_slice(),
+                        split_applied,
+                        perm_beam_params.clone(),
+                        rep_seed,
+                    );
+                    let done = null_progress_done.fetch_add(1, Ordering::Relaxed) + 1;
+                    if done % null_notify_step == 0 || done == permutation_task_total {
+                        garfield_stage_progress_notify(
+                            progress_callback.as_ref(),
+                            "null_penalty",
+                            done,
+                            permutation_task_total.max(1),
+                            None,
+                        )
+                        .map_err(|e| e.to_string())?;
+                    }
+                    out.push(unit_out);
+                }
+                out
+            };
+            for task_out in rep_results.into_iter() {
+                for (bucket, train_score, test_score) in task_out? {
+                    bucket_scores.insert(bucket, train_score, test_score);
+                }
+            }
+            permutation_null_repeats_used = rep + 1;
+            if permutation_null_repeats_used < min_perm_repeats {
+                continue;
+            }
+            let current_lookup = bucket_scores.finalize();
+            if let Some(prev) = prev_lookup.as_ref() {
+                if current_lookup.q99_converged_against(prev) {
+                    stable_rounds += 1;
+                } else {
+                    stable_rounds = 0;
+                }
+            }
+            prev_lookup = Some(current_lookup);
+            if stable_rounds >= DEFAULT_RULE_NULL_ADAPTIVE_STABLE_REPEATS {
+                break;
             }
         }
-        Some(Arc::new(bucket_scores.finalize()))
+        if null_progress_done.load(Ordering::Relaxed) < permutation_task_total {
+            garfield_stage_progress_notify(
+                progress_callback.as_ref(),
+                "null_penalty",
+                permutation_task_total.max(1),
+                permutation_task_total.max(1),
+                None,
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        let lookup = prev_lookup.unwrap_or_else(|| bucket_scores.finalize());
+        Some(Arc::new(lookup))
     } else {
         None
     };
@@ -6756,7 +6796,7 @@ fn garfield_logic_search_bed_owned(
         representative_units_target,
         representative_units_used,
         permutation_null_repeats: if null_permutation_active {
-            perm_cfg.n_repeats.max(1)
+            permutation_null_repeats_used
         } else {
             0
         },
@@ -6798,7 +6838,7 @@ fn garfield_logic_search_bed_owned(
     ml_importance="imp",
     ml_top_k=64,
     ml_top_frac=0.0,
-    permutation_repeats=5,
+    permutation_repeats=20,
     permutation_scoring="auto",
     n_estimators=100,
     max_depth=5,

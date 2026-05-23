@@ -190,6 +190,7 @@ struct LiteralSingletonScore {
 
 type RuleLexKey = Vec<(usize, bool, u8)>;
 type RuleRawScoreCache = HashMap<RuleLexKey, f64>;
+type RuleBitsCache = Vec<(BeamRule, Vec<u64>)>;
 
 #[inline]
 fn words_for_samples(n_samples: usize) -> usize {
@@ -808,6 +809,57 @@ fn cache_rule_raw_score(cache: &mut RuleRawScoreCache, rule: &BeamRule, raw_scor
     cache.insert(rule.lexical_key(), raw_score);
 }
 
+#[inline]
+fn ensure_rule_bits_cached(
+    rule: &BeamRule,
+    bits_flat: &[u64],
+    row_words: usize,
+    n_rows: usize,
+    n_samples: usize,
+    local_cache: &mut RuleBitsCache,
+) -> Result<(), String> {
+    if local_cache.iter().any(|(cached_rule, _)| cached_rule == rule) {
+        return Ok(());
+    }
+    let combined = materialize_rule_bits(rule, bits_flat, row_words, n_rows, n_samples)?;
+    local_cache.push((rule.clone(), combined));
+    Ok(())
+}
+
+#[inline]
+fn cached_rule_bits<'a>(rule: &BeamRule, local_cache: &'a RuleBitsCache) -> Option<&'a [u64]> {
+    local_cache
+        .iter()
+        .find(|(cached_rule, _)| cached_rule == rule)
+        .map(|(_, bits)| bits.as_slice())
+}
+
+fn evaluate_rule_continuous_cached(
+    rule: &BeamRule,
+    y: &[f64],
+    bits_flat: &[u64],
+    row_words: usize,
+    n_rows: usize,
+    n_samples: usize,
+    lambda_len: f64,
+    lambda_not: f64,
+    local_cache: &mut RuleBitsCache,
+) -> Result<ContinuousRuleScore, String> {
+    let ctx = "garfield::evaluate_rule_continuous_cached";
+    validate_continuous_y(y, n_samples, ctx)?;
+    ensure_rule_bits_cached(rule, bits_flat, row_words, n_rows, n_samples, local_cache)?;
+    let combined = cached_rule_bits(rule, local_cache)
+        .ok_or_else(|| format!("{ctx}: cached combined bits missing after materialization"))?;
+    Ok(score_rule_continuous_from_bits(
+        rule,
+        y,
+        combined,
+        n_samples,
+        lambda_len,
+        lambda_not,
+    ))
+}
+
 fn lookup_rule_raw_score_cached(
     rule: &BeamRule,
     y: &[f64],
@@ -1209,6 +1261,25 @@ pub fn materialize_rule_bits(
     Ok(combined)
 }
 
+#[inline]
+fn score_rule_continuous_from_bits(
+    rule: &BeamRule,
+    y: &[f64],
+    combined: &[u64],
+    n_samples: usize,
+    lambda_len: f64,
+    lambda_not: f64,
+) -> ContinuousRuleScore {
+    let mut sc = score_cont_weighted_mean_diff_packed(y, combined, n_samples);
+    let penalty = if rule.len() > 1 {
+        lambda_len * ((rule.len() - 1) as f64)
+    } else {
+        0.0
+    } + lambda_not * (rule.not_count() as f64);
+    sc.score = sc.raw_score - penalty;
+    sc
+}
+
 pub fn evaluate_rule_continuous(
     rule: &BeamRule,
     y: &[f64],
@@ -1222,14 +1293,14 @@ pub fn evaluate_rule_continuous(
     let ctx = "garfield::evaluate_rule_continuous";
     validate_continuous_y(y, n_samples, ctx)?;
     let combined = materialize_rule_bits(rule, bits_flat, row_words, n_rows, n_samples)?;
-    let mut sc = score_cont_weighted_mean_diff_packed(y, &combined, n_samples);
-    let penalty = if rule.len() > 1 {
-        lambda_len * ((rule.len() - 1) as f64)
-    } else {
-        0.0
-    } + lambda_not * (rule.not_count() as f64);
-    sc.score = sc.raw_score - penalty;
-    Ok(sc)
+    Ok(score_rule_continuous_from_bits(
+        rule,
+        y,
+        combined.as_slice(),
+        n_samples,
+        lambda_len,
+        lambda_not,
+    ))
 }
 
 fn build_initial_beam(
@@ -2138,8 +2209,10 @@ fn collapse_surrogate_candidate(
     let cache_capacity = current_rule.len().saturating_mul(16).max(16);
     let mut train_raw_cache = RuleRawScoreCache::with_capacity(cache_capacity);
     let mut test_raw_cache = RuleRawScoreCache::with_capacity(cache_capacity);
+    let mut train_bits_cache = RuleBitsCache::with_capacity(cache_capacity);
+    let mut test_bits_cache = RuleBitsCache::with_capacity(cache_capacity);
     cache_rule_raw_score(&mut train_raw_cache, &current_rule, current_train.raw_score);
-    let mut current_test = evaluate_rule_continuous(
+    let mut current_test = evaluate_rule_continuous_cached(
         &current_rule,
         y_test,
         bits_test,
@@ -2148,6 +2221,7 @@ fn collapse_surrogate_candidate(
         n_test,
         params.lambda_len,
         params.lambda_not,
+        &mut test_bits_cache,
     )?;
     let mut current_test_score = final_rule_score_for_eval_cached(
         &current_rule,
@@ -2165,23 +2239,39 @@ fn collapse_surrogate_candidate(
     )?;
 
     if surrogate_collapse_enabled(params) && current_rule.len() > 1 {
-        let mut current_bits_test =
-            materialize_rule_bits(&current_rule, bits_test, row_words_test, n_rows, n_test)?;
         loop {
             let Some(parent_rule) = rule_parent(&current_rule) else {
                 break;
             };
-            let parent_bits_test =
-                materialize_rule_bits(&parent_rule, bits_test, row_words_test, n_rows, n_test)?;
+            ensure_rule_bits_cached(
+                &current_rule,
+                bits_test,
+                row_words_test,
+                n_rows,
+                n_test,
+                &mut test_bits_cache,
+            )?;
+            ensure_rule_bits_cached(
+                &parent_rule,
+                bits_test,
+                row_words_test,
+                n_rows,
+                n_test,
+                &mut test_bits_cache,
+            )?;
+            let current_bits_test = cached_rule_bits(&current_rule, &test_bits_cache)
+                .ok_or_else(|| "current rule test bits cache miss".to_string())?;
+            let parent_bits_test = cached_rule_bits(&parent_rule, &test_bits_cache)
+                .ok_or_else(|| "parent rule test bits cache miss".to_string())?;
             let diff_frac = bit_hamming_fraction(
-                current_bits_test.as_slice(),
-                parent_bits_test.as_slice(),
+                current_bits_test,
+                parent_bits_test,
                 n_test,
             );
             if diff_frac > params.surrogate_hamming_frac_max {
                 break;
             }
-            let parent_test = evaluate_rule_continuous(
+            let parent_test = evaluate_rule_continuous_cached(
                 &parent_rule,
                 y_test,
                 bits_test,
@@ -2190,6 +2280,7 @@ fn collapse_surrogate_candidate(
                 n_test,
                 params.lambda_len,
                 params.lambda_not,
+                &mut test_bits_cache,
             )?;
             let parent_test_score = final_rule_score_for_eval_cached(
                 &parent_rule,
@@ -2212,7 +2303,7 @@ fn collapse_surrogate_candidate(
             ) {
                 break;
             }
-            let parent_train = evaluate_rule_continuous(
+            let parent_train = evaluate_rule_continuous_cached(
                 &parent_rule,
                 y_train,
                 bits_train,
@@ -2221,6 +2312,7 @@ fn collapse_surrogate_candidate(
                 n_train,
                 params.lambda_len,
                 params.lambda_not,
+                &mut train_bits_cache,
             )?;
             let parent_train_score = final_rule_score_for_eval_cached(
                 &parent_rule,
@@ -2241,7 +2333,6 @@ fn collapse_surrogate_candidate(
             current_train_score = parent_train_score;
             current_test = parent_test;
             current_test_score = parent_test_score;
-            current_bits_test = parent_bits_test;
             if current_rule.len() <= 1 {
                 break;
             }
@@ -2250,7 +2341,7 @@ fn collapse_surrogate_candidate(
             && rule_is_pure_and(&current_rule)
             && current_rule.not_count() > 0
         {
-            let mut best_subrule: Option<(BeamRuleCandidate, Vec<u64>, f64)> = None;
+            let mut best_subrule: Option<(BeamRuleCandidate, f64)> = None;
             for drop_idx in 0..current_rule.len() {
                 let Some(subrule) = drop_literal_from_pure_rule(&current_rule, drop_idx) else {
                     continue;
@@ -2263,17 +2354,35 @@ fn collapse_surrogate_candidate(
                 if !(hamming_limit.is_finite() && hamming_limit > 0.0) {
                     continue;
                 }
-                let subrule_bits_test =
-                    materialize_rule_bits(&subrule, bits_test, row_words_test, n_rows, n_test)?;
+                ensure_rule_bits_cached(
+                    &current_rule,
+                    bits_test,
+                    row_words_test,
+                    n_rows,
+                    n_test,
+                    &mut test_bits_cache,
+                )?;
+                ensure_rule_bits_cached(
+                    &subrule,
+                    bits_test,
+                    row_words_test,
+                    n_rows,
+                    n_test,
+                    &mut test_bits_cache,
+                )?;
+                let current_bits_test = cached_rule_bits(&current_rule, &test_bits_cache)
+                    .ok_or_else(|| "current rule test bits cache miss".to_string())?;
+                let subrule_bits_test = cached_rule_bits(&subrule, &test_bits_cache)
+                    .ok_or_else(|| "subrule test bits cache miss".to_string())?;
                 let diff_frac = bit_hamming_fraction(
-                    current_bits_test.as_slice(),
-                    subrule_bits_test.as_slice(),
+                    current_bits_test,
+                    subrule_bits_test,
                     n_test,
                 );
                 if diff_frac > hamming_limit {
                     continue;
                 }
-                let subrule_test = evaluate_rule_continuous(
+                let subrule_test = evaluate_rule_continuous_cached(
                     &subrule,
                     y_test,
                     bits_test,
@@ -2282,6 +2391,7 @@ fn collapse_surrogate_candidate(
                     n_test,
                     params.lambda_len,
                     params.lambda_not,
+                    &mut test_bits_cache,
                 )?;
                 let subrule_test_score = final_rule_score_for_eval_cached(
                     &subrule,
@@ -2301,7 +2411,7 @@ fn collapse_surrogate_candidate(
                 {
                     continue;
                 }
-                let subrule_train = evaluate_rule_continuous(
+                let subrule_train = evaluate_rule_continuous_cached(
                     &subrule,
                     y_train,
                     bits_train,
@@ -2310,6 +2420,7 @@ fn collapse_surrogate_candidate(
                     n_train,
                     params.lambda_len,
                     params.lambda_not,
+                    &mut train_bits_cache,
                 )?;
                 let subrule_train_score = final_rule_score_for_eval_cached(
                     &subrule,
@@ -2333,23 +2444,22 @@ fn collapse_surrogate_candidate(
                     test: subrule_test,
                 };
                 match best_subrule.as_mut() {
-                    Some((best_cand, best_bits, best_diff)) => {
+                    Some((best_cand, best_diff)) => {
                         if cmp_candidate(&subrule_cand, best_cand) == std::cmp::Ordering::Less
                             || (cmp_candidate(&subrule_cand, best_cand)
                                 == std::cmp::Ordering::Equal
                                 && diff_frac < *best_diff)
                         {
                             *best_cand = subrule_cand;
-                            *best_bits = subrule_bits_test;
                             *best_diff = diff_frac;
                         }
                     }
                     None => {
-                        best_subrule = Some((subrule_cand, subrule_bits_test, diff_frac));
+                        best_subrule = Some((subrule_cand, diff_frac));
                     }
                 }
             }
-            let Some((subrule_cand, subrule_bits_test, _)) = best_subrule else {
+            let Some((subrule_cand, _)) = best_subrule else {
                 break;
             };
             current_rule = subrule_cand.rule;
@@ -2357,7 +2467,6 @@ fn collapse_surrogate_candidate(
             current_train_score = subrule_cand.train_score;
             current_test = subrule_cand.test;
             current_test_score = subrule_cand.test_score;
-            current_bits_test = subrule_bits_test;
         }
         if current_rule.len() > 1 {
             let mut best_singleton: Option<(BeamRuleCandidate, f64)> = None;
@@ -2370,23 +2479,36 @@ fn collapse_surrogate_candidate(
                     },
                     rest: Vec::new(),
                 };
-                let singleton_bits_test = materialize_rule_bits(
+                ensure_rule_bits_cached(
+                    &current_rule,
+                    bits_test,
+                    row_words_test,
+                    n_rows,
+                    n_test,
+                    &mut test_bits_cache,
+                )?;
+                ensure_rule_bits_cached(
                     &singleton_rule,
                     bits_test,
                     row_words_test,
                     n_rows,
                     n_test,
+                    &mut test_bits_cache,
                 )?;
+                let current_bits_test = cached_rule_bits(&current_rule, &test_bits_cache)
+                    .ok_or_else(|| "current rule test bits cache miss".to_string())?;
+                let singleton_bits_test = cached_rule_bits(&singleton_rule, &test_bits_cache)
+                    .ok_or_else(|| "singleton test bits cache miss".to_string())?;
                 let diff_frac = bit_hamming_fraction(
-                    current_bits_test.as_slice(),
-                    singleton_bits_test.as_slice(),
+                    current_bits_test,
+                    singleton_bits_test,
                     n_test,
                 );
                 let orient_diff = diff_frac.min(1.0 - diff_frac);
                 if orient_diff > params.surrogate_hamming_frac_max {
                     continue;
                 }
-                let singleton_test = evaluate_rule_continuous(
+                let singleton_test = evaluate_rule_continuous_cached(
                     &singleton_rule,
                     y_test,
                     bits_test,
@@ -2395,6 +2517,7 @@ fn collapse_surrogate_candidate(
                     n_test,
                     params.lambda_len,
                     params.lambda_not,
+                    &mut test_bits_cache,
                 )?;
                 let singleton_test_score = final_rule_score_for_eval_cached(
                     &singleton_rule,
@@ -2417,7 +2540,7 @@ fn collapse_surrogate_candidate(
                 ) {
                     continue;
                 }
-                let singleton_train = evaluate_rule_continuous(
+                let singleton_train = evaluate_rule_continuous_cached(
                     &singleton_rule,
                     y_train,
                     bits_train,
@@ -2426,6 +2549,7 @@ fn collapse_surrogate_candidate(
                     n_train,
                     params.lambda_len,
                     params.lambda_not,
+                    &mut train_bits_cache,
                 )?;
                 let singleton_train_score = final_rule_score_for_eval_cached(
                     &singleton_rule,

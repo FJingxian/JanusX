@@ -6614,7 +6614,7 @@ fn garfield_logic_search_bed_owned(
             train_idx_local.as_slice(),
         )
     };
-    let unit_parallel_threads = threads_eff.min(scanned_units.max(1));
+    let unit_parallel_threads = threads_eff.max(1);
     let scan_beam_params = BeamSearchParams {
         // Keep nested parallelism enabled during scan. Rayon will reuse the same
         // pool and lets a few heavy tail units fan out when outer unit-level

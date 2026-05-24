@@ -111,11 +111,20 @@ def REML(
         return _OBJ_PENALTY
     return out
 
-def _testX(X:typing.Union[np.ndarray,None],n:int,) -> np.ndarray:
+def _testX(
+    X: typing.Union[np.ndarray, sparse.spmatrix, None],
+    n: int,
+) -> typing.Union[np.ndarray, sparse.csr_matrix]:
     if X is None:
         X = np.ones((n, 1))
     else:
-        if X.size == n:
+        if sparse.issparse(X):
+            xs = X.tocsr().astype(float)
+            if xs.shape[0] != n:
+                raise ValueError(f"Row number of X is not equal to {n} in y. (X.shape={xs.shape}, n={n})")
+            intercept = sparse.csr_matrix(np.ones((n, 1), dtype=float))
+            X = sparse.hstack([intercept, xs], format="csr", dtype=float)
+        elif X.size == n:
             X = X.reshape(-1,1)
             X = np.concatenate([np.ones((n, 1)), X], axis=1)
         elif X.shape[0] == n:
@@ -128,6 +137,12 @@ def _to_dense(z: typing.Union[np.ndarray, sparse.spmatrix]) -> np.ndarray:
     if sparse.issparse(z):
         return np.asarray(z.toarray(), dtype=float)
     return np.asarray(z, dtype=float)
+
+
+def _to_dense_product(x: typing.Any) -> np.ndarray:
+    if sparse.issparse(x):
+        return np.asarray(x.toarray(), dtype=float)
+    return np.asarray(x, dtype=float)
 
 
 def _testZ(
@@ -335,9 +350,11 @@ def _expand_z_theta(theta_z: np.ndarray, z_cols: list[int]) -> np.ndarray:
 def _sparse_z_reml_objective(
     theta: np.ndarray,
     y: np.ndarray,
-    X: np.ndarray,
+    X: typing.Union[np.ndarray, sparse.spmatrix],
     z_csc: sparse.csc_matrix,
     ztz_csc: sparse.csc_matrix,
+    xty: np.ndarray,
+    xtx: np.ndarray,
     zty: np.ndarray,
     ztx: np.ndarray,
     z_cols: list[int],
@@ -363,14 +380,14 @@ def _sparse_z_reml_objective(
         if tmp_x.ndim == 1:
             tmp_x = tmp_x.reshape(-1, 1)
 
-        vinvy = y * inv_lbd - (z_csc @ tmp_y) * (inv_lbd * inv_lbd)
-        vinvx = X * inv_lbd - (z_csc @ tmp_x) * (inv_lbd * inv_lbd)
-
-        xt_vinv_x = X.T @ vinvx
-        xt_vinv_y = X.T @ vinvy
+        xt_vinv_x = np.asarray(xtx, dtype=float) * inv_lbd - (np.asarray(ztx, dtype=float).T @ tmp_x) * (inv_lbd * inv_lbd)
+        xt_vinv_y = np.asarray(xty, dtype=float) * inv_lbd - (np.asarray(ztx, dtype=float).T @ tmp_y) * (inv_lbd * inv_lbd)
         beta = np.linalg.solve(xt_vinv_x, xt_vinv_y)
-        r = y - X @ beta
-        vinvr = vinvy - vinvx @ beta
+        xbeta = _to_dense_product(X @ beta).reshape(-1, 1)
+        r = y - xbeta
+        rhs_r = np.asarray(z_csc.T @ r, dtype=float).reshape(-1)
+        tmp_r = np.asarray(lu.solve(rhs_r), dtype=float).reshape(-1, 1)
+        vinvr = r * inv_lbd - (z_csc @ tmp_r) * (inv_lbd * inv_lbd)
         r_t_vinvr = float((r.T @ vinvr)[0, 0])
         if (not np.isfinite(r_t_vinvr)) or r_t_vinvr <= 0.0:
             return _OBJ_PENALTY
@@ -400,9 +417,12 @@ def _sparse_z_reml_objective(
 def _sparse_z_fit_state(
     theta: np.ndarray,
     y: np.ndarray,
-    X: np.ndarray,
+    X: typing.Union[np.ndarray, sparse.spmatrix],
     z_csc: sparse.csc_matrix,
     ztz_csc: sparse.csc_matrix,
+    xty: np.ndarray,
+    xtx: np.ndarray,
+    ztx: np.ndarray,
     z_cols: list[int],
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[np.ndarray], np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     theta = np.asarray(theta, dtype=float).reshape(-1)
@@ -414,30 +434,26 @@ def _sparse_z_fit_state(
     m = sparse.diags(1.0 / d, format="csc") + (ztz_csc * inv_lbd)
 
     zty = np.asarray(z_csc.T @ y, dtype=float).reshape(-1)
-    ztx = np.asarray(z_csc.T @ X, dtype=float)
     use_pardiso = _PREFER_PYPARDISO
     if use_pardiso:
         try:
             tmp_y = _pardiso_spsolve(m, zty).reshape(-1, 1)
-            tmp_x = _pardiso_spsolve(m, ztx)
+            tmp_x = _pardiso_spsolve(m, np.asarray(ztx, dtype=float))
         except Exception:
             use_pardiso = False
     if not use_pardiso:
         lu = splu(m)
         tmp_y = lu.solve(zty).reshape(-1, 1)
-        tmp_x = lu.solve(ztx)
+        tmp_x = lu.solve(np.asarray(ztx, dtype=float))
     tmp_x = np.asarray(tmp_x, dtype=float)
     if tmp_x.ndim == 1:
         tmp_x = tmp_x.reshape(-1, 1)
 
-    vinvy = y * inv_lbd - (z_csc @ tmp_y) * (inv_lbd * inv_lbd)
-    vinvx = X * inv_lbd - (z_csc @ tmp_x) * (inv_lbd * inv_lbd)
-
-    xt_vinv_x = X.T @ vinvx
-    xt_vinv_y = X.T @ vinvy
+    xt_vinv_x = np.asarray(xtx, dtype=float) * inv_lbd - (np.asarray(ztx, dtype=float).T @ tmp_x) * (inv_lbd * inv_lbd)
+    xt_vinv_y = np.asarray(xty, dtype=float) * inv_lbd - (np.asarray(ztx, dtype=float).T @ tmp_y) * (inv_lbd * inv_lbd)
     beta = np.linalg.solve(xt_vinv_x, xt_vinv_y)
-    r = y - X @ beta
-    vinvr = vinvy - vinvx @ beta
+    xbeta = _to_dense_product(X @ beta).reshape(-1, 1)
+    r = y - xbeta
 
     rhs_r = np.asarray(z_csc.T @ r, dtype=float).reshape(-1)
     if use_pardiso:
@@ -445,8 +461,9 @@ def _sparse_z_fit_state(
     else:
         u_hat = lu.solve(rhs_r * inv_lbd).reshape(-1, 1)
     z_fitted = np.asarray(z_csc @ u_hat, dtype=float)
-    fitted = X @ beta + z_fitted
+    fitted = xbeta + z_fitted
     residuals = y - fitted
+    vinvr = r * inv_lbd - z_fitted * inv_lbd
 
     sigma2 = float((r.T @ vinvr)[0, 0]) / max(1, int(X.shape[0]) - int(X.shape[1]))
     cov_beta = np.linalg.pinv(np.asarray(xt_vinv_x, dtype=float)) * sigma2
@@ -619,12 +636,16 @@ class BLUP:
             pass
         else:
             use_sparse_z = _can_use_sparse_z_reml(self.Z_list, self.G_list, self.n)
+            if (not use_sparse_z) and sparse.issparse(self.X):
+                self.X = np.asarray(self.X.toarray(), dtype=float)
             if use_sparse_z:
                 z_blocks = [_to_onehot_csr(z) for z in self.Z_list]
                 z_csc = sparse.hstack(z_blocks, format="csc")
                 ztz_csc = (z_csc.T @ z_csc).tocsc()
+                xty = _to_dense_product(self.X.T @ self.y).reshape(-1, 1)
+                xtx = _to_dense_product(self.X.T @ self.X)
                 zty = np.asarray(z_csc.T @ self.y, dtype=float)
-                ztx = np.asarray(z_csc.T @ self.X, dtype=float)
+                ztx = _to_dense_product(z_csc.T @ self.X)
                 z_cols = [int(z.shape[1]) for z in self.Z_list]
                 theta0 = np.ones(len(z_cols) + 1, dtype=float)
                 bounds = [(1e-12, None)] * theta0.size
@@ -641,7 +662,7 @@ class BLUP:
                 result = minimize(
                     _sparse_z_reml_objective,
                     theta0,
-                    args=(self.y, self.X, z_csc, ztz_csc, zty, ztx, z_cols),
+                    args=(self.y, self.X, z_csc, ztz_csc, xty, xtx, zty, ztx, z_cols),
                     method="L-BFGS-B",
                     bounds=bounds,
                     callback=callback,
@@ -659,6 +680,9 @@ class BLUP:
                     self.X,
                     z_csc,
                     ztz_csc,
+                    xty,
+                    xtx,
+                    ztx,
                     z_cols,
                 )
                 z_theta = theta[:-1]

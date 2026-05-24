@@ -29,11 +29,14 @@ import numpy as np
 import pandas as pd
 from scipy import sparse
 from scipy.linalg import cho_solve
+from scipy.sparse.linalg import spsolve
 from scipy.stats import t as student_t
 
+from janusx.pyBLUP.assoc import LMM
 from janusx.pyBLUP.blup import BLUP
 from ._common.log import setup_logging
 from ._common.config_render import emit_cli_configuration
+from ._common.grmio import load_grm_matrix, read_id_file, resolve_grm_id_path
 from ._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 from ._common.pathcheck import ensure_file_exists, format_path_for_display
 from ._common.genoio import strip_default_prefix_suffix
@@ -44,6 +47,28 @@ from ._common.status import log_success, print_failure, format_elapsed, success_
 class _TermSpec:
     name: str
     force_onehot: bool
+
+
+@dataclass
+class _GrmContext:
+    matrix: np.ndarray
+    ids: list[str]
+    id_path: str | None
+    index: dict[str, int]
+
+
+@dataclass
+class _LmmNullStats:
+    beta: np.ndarray
+    se: np.ndarray
+    pval: np.ndarray
+    g_blup: np.ndarray
+
+
+@dataclass
+class _Stage1BlueResult:
+    sample_ids: list[str]
+    values: np.ndarray
 
 
 def _split_tokens(values: Iterable[str] | None) -> list[str]:
@@ -151,10 +176,12 @@ def _read_table_with_optional_header(path: str) -> pd.DataFrame:
             header_like = True
 
     if header_like:
-        sample_name = str(df.iloc[0, 0]).strip() or "sample_id"
+        raw_sample_name = df.iloc[0, 0]
+        sample_name = "" if pd.isna(raw_sample_name) else str(raw_sample_name).strip()
+        sample_name = sample_name or "sample_id"
         data_names: list[str] = []
         for idx, raw_name in enumerate(df.iloc[0, 1:].tolist(), start=1):
-            name = str(raw_name).strip()
+            name = "" if pd.isna(raw_name) else str(raw_name).strip()
             data_names.append(name if name != "" else f"V{idx}")
         df = df.iloc[1:, :].reset_index(drop=True)
         df.columns = [sample_name] + data_names
@@ -382,27 +409,91 @@ def _infer_env_rep_columns(random_terms: list[_TermSpec]) -> tuple[list[str], li
     return env_cols, rep_cols
 
 
+def _unique_preserve(values: Iterable[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for v in values:
+        s = str(v)
+        if s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
+
+
+def _infer_model_env_rep_columns(
+    data_cols: list[str],
+    trait_cols: list[str],
+    fixed_terms: list[_TermSpec],
+    random_terms: list[_TermSpec],
+) -> tuple[list[str], list[str]]:
+    fixed_names = [str(t.name) for t in fixed_terms]
+    random_names = [str(t.name) for t in random_terms]
+    explicit = _unique_preserve(fixed_names + random_names)
+
+    env_cols = [c for c in explicit if _is_env_like(c)]
+    rep_cols = [c for c in explicit if _is_repeat_like(c) and c not in env_cols]
+
+    if len(env_cols) == 0:
+        env_cols = [
+            c for c in data_cols
+            if c not in trait_cols and _is_env_like(c)
+        ]
+    if len(rep_cols) == 0:
+        rep_cols = [
+            c for c in data_cols
+            if c not in trait_cols and c not in env_cols and _is_repeat_like(c)
+        ]
+
+    return _unique_preserve(env_cols), _unique_preserve(rep_cols)
+
+
+def _exclude_special_terms(
+    terms: list[_TermSpec],
+    special_cols: set[str],
+) -> list[_TermSpec]:
+    return [t for t in terms if str(t.name) not in special_cols]
+
+
+def _harmonic_mean(values: Iterable[float | int]) -> float:
+    arr = np.asarray(list(values), dtype=float)
+    arr = arr[np.isfinite(arr) & (arr > 0.0)]
+    if arr.size == 0:
+        return 1.0
+    return float(arr.size / np.sum(1.0 / arr))
+
+
+def _effective_env_plot_counts(
+    sample_ids_sub: pd.Series,
+    sub: pd.DataFrame,
+    env_cols: list[str],
+    rep_cols: list[str],
+) -> tuple[float, float, float]:
+    sid = sample_ids_sub.astype("string").fillna("NA").astype(str)
+    env_key = _combine_key(sub, env_cols, "__ENV__").astype(str)
+    env_df = pd.DataFrame({"sid": sid, "env": env_key})
+    env_per_sid = env_df.drop_duplicates().groupby("sid", sort=False)["env"].nunique()
+    h_env = max(1.0, _harmonic_mean(env_per_sid.to_numpy(dtype=float)))
+
+    if len(rep_cols) > 0:
+        rep_key = _combine_key(sub, rep_cols, "__REP__").astype(str)
+        plot_key = env_key + "@@" + rep_key
+        plot_df = pd.DataFrame({"sid": sid, "plot": plot_key})
+        plot_per_sid = plot_df.drop_duplicates().groupby("sid", sort=False)["plot"].nunique()
+    else:
+        plot_per_sid = pd.DataFrame({"sid": sid}).groupby("sid", sort=False).size()
+    h_plot = max(1.0, _harmonic_mean(plot_per_sid.to_numpy(dtype=float)))
+    r_eff = max(1.0, float(h_plot / h_env))
+    return h_env, h_plot, r_eff
+
+
 def _effective_env_rep_counts(
     sample_ids_sub: pd.Series,
     sub: pd.DataFrame,
     env_cols: list[str],
     rep_cols: list[str],
 ) -> tuple[float, float]:
-    sid = sample_ids_sub.astype("string").fillna("NA").astype(str)
-    env_key = _combine_key(sub, env_cols, "__ENV__").astype(str)
-    ge = pd.DataFrame({"sid": sid, "env": env_key})
-    e_per_sid = ge.drop_duplicates().groupby("sid", sort=False)["env"].nunique()
-    e_eff = float(e_per_sid.mean()) if len(e_per_sid) > 0 else 1.0
-    e_eff = max(1.0, e_eff)
-
-    if len(rep_cols) > 0:
-        rep_key = _combine_key(sub, rep_cols, "__REP__").astype(str)
-        ger = pd.DataFrame({"sid": sid, "env": env_key, "rep": rep_key})
-        r_per_ge = ger.drop_duplicates().groupby(["sid", "env"], sort=False)["rep"].nunique()
-    else:
-        r_per_ge = ge.groupby(["sid", "env"], sort=False).size()
-    r_eff = float(r_per_ge.mean()) if len(r_per_ge) > 0 else 1.0
-    r_eff = max(1.0, r_eff)
+    e_eff, _h_plot, r_eff = _effective_env_plot_counts(sample_ids_sub, sub, env_cols, rep_cols)
     return e_eff, r_eff
 
 
@@ -460,14 +551,472 @@ def _gls_fixed_stats_from_blup(
     return beta, se, pval
 
 
+def _fmt_metric(value: float | int | np.floating | np.integer | None) -> str:
+    try:
+        v = float(value)  # type: ignore[arg-type]
+    except Exception:
+        return "NA"
+    if not np.isfinite(v):
+        return "NA"
+    return f"{v:.6g}"
+
+
+def _resolve_trait_columns_auto(
+    df: pd.DataFrame,
+    candidate_cols: list[str],
+) -> list[str]:
+    out: list[str] = []
+    for c in candidate_cols:
+        if _is_numeric_series(df[c]):
+            out.append(str(c))
+    return out
+
+
+def _format_design_label(env_cols: list[str], fixed_cols: list[str]) -> str:
+    parts: list[str] = []
+    if len(env_cols) > 0:
+        parts.append("|".join(env_cols))
+    if len(fixed_cols) > 0:
+        parts.append(", ".join(fixed_cols))
+    return " / ".join(parts) if len(parts) > 0 else "None"
+
+
+def _format_random_label(random_cols: list[str]) -> str:
+    return ", ".join(random_cols) if len(random_cols) > 0 else "None"
+
+
+def _render_summary_table(
+    rows: list[dict[str, typing.Any]],
+    *,
+    log_style: bool,
+) -> str:
+    if len(rows) == 0:
+        return ""
+
+    if log_style:
+        headers = ["Trait", "N_Obs (Lines)", "Env / Fixed", "Random", "H2 (Broad)", "h2 (Narrow)"]
+    else:
+        headers = ["Trait", "N_Obs(Lines)", "Env/Fixed", "Random", "H2", "h2"]
+
+    body: list[list[str]] = []
+    for row in rows:
+        nobs = int(row.get("used_obs", 0))
+        nlines = int(row.get("used_lines", 0))
+        obs_label = f"{nobs:,} ({nlines:,})" if log_style else f"{nobs:,}({nlines:,})"
+        body.append(
+            [
+                str(row.get("trait", "NA")),
+                obs_label,
+                str(row.get("env_fixed_label", "None")),
+                str(row.get("random_label", "None")),
+                _fmt_metric(row.get("hsqr")),
+                _fmt_metric(row.get("h2_narrow")),
+            ]
+        )
+
+    widths = [len(h) for h in headers]
+    for rec in body:
+        for i, cell in enumerate(rec):
+            widths[i] = max(widths[i], len(cell))
+
+    fmt = " ".join("{:<" + str(w) + "}" for w in widths)
+    lines: list[str] = []
+    if log_style:
+        total_w = sum(widths) + (len(widths) - 1)
+        lines.append("============================= SUMMARY ==================================")
+        lines.append(fmt.format(*headers))
+        lines.append("-" * total_w)
+        for rec in body:
+            lines.append(fmt.format(*rec))
+        lines.append("=" * 72)
+    else:
+        lines.append(fmt.format(*headers))
+        lines.append("-" * (sum(widths) + (len(widths) - 1)))
+        for rec in body:
+            lines.append(fmt.format(*rec))
+    return "\n".join(lines)
+
+
+def _load_grm_context(
+    grm_path: str,
+    grm_id_path: str | None,
+    fallback_ids: list[str],
+) -> _GrmContext:
+    grm = np.asarray(load_grm_matrix(grm_path), dtype=np.float64)
+    id_path = resolve_grm_id_path(grm_path, grm_id_path)
+    if id_path is not None:
+        ids = [str(x) for x in read_id_file(id_path)]
+        if len(ids) != int(grm.shape[0]):
+            raise ValueError(
+                f"GRM ID count mismatch: matrix n={grm.shape[0]} but ID file has {len(ids)} rows."
+            )
+    else:
+        if int(grm.shape[0]) != len(fallback_ids):
+            raise ValueError(
+                f"GRM shape {grm.shape} does not match phenotype unique line count {len(fallback_ids)}, "
+                "and no GRM ID file was found for reordering."
+            )
+        ids = [str(x) for x in fallback_ids]
+
+    index: dict[str, int] = {}
+    for i, sid in enumerate(ids):
+        if sid in index:
+            raise ValueError(f"GRM IDs contain duplicate line ID: {sid}")
+        index[sid] = i
+    return _GrmContext(matrix=grm, ids=ids, id_path=id_path, index=index)
+
+
+def _lmm_null_stats(model: LMM) -> _LmmNullStats:
+    s = np.asarray(model.S, dtype=np.float64).reshape(-1)
+    x_rot = np.asarray(model.Xcov, dtype=np.float64)
+    y_rot = np.asarray(model.y, dtype=np.float64).reshape(-1, 1)
+    lbd = float(model.lbd_null)
+    if s.size == 0:
+        raise ValueError("LMM null model has zero samples.")
+
+    vinv = 1.0 / (s + lbd)
+    xt_vinv = x_rot.T * vinv.reshape(1, -1)
+    xt_vinv_x = xt_vinv @ x_rot
+    xt_vinv_y = xt_vinv @ y_rot
+    beta = np.linalg.solve(xt_vinv_x, xt_vinv_y)
+    r_rot = y_rot - x_rot @ beta
+
+    n = int(x_rot.shape[0])
+    p = int(x_rot.shape[1])
+    sigma2 = float((r_rot.T @ (vinv.reshape(-1, 1) * r_rot))[0, 0]) / max(1, n - p)
+    cov_beta = np.linalg.pinv(xt_vinv_x) * sigma2
+    se = np.sqrt(np.clip(np.diag(cov_beta), a_min=0.0, a_max=None)).reshape(-1, 1)
+    tval = np.divide(beta, se, out=np.zeros_like(beta), where=se > 0.0)
+    pval = 2.0 * student_t.sf(np.abs(tval), df=max(1, n - p))
+
+    u = np.asarray(model.Dh.T, dtype=np.float64)
+    g_rot = (s.reshape(-1, 1) / (s.reshape(-1, 1) + lbd)) * r_rot
+    g_blup = u @ g_rot
+    return _LmmNullStats(
+        beta=np.asarray(beta, dtype=float).reshape(-1),
+        se=np.asarray(se, dtype=float).reshape(-1),
+        pval=np.asarray(pval, dtype=float).reshape(-1),
+        g_blup=np.asarray(g_blup, dtype=float).reshape(-1),
+    )
+
+
+def _term_constant_within_line(
+    sub: pd.DataFrame,
+    line_col: str,
+    term_name: str,
+) -> bool:
+    if term_name not in sub.columns:
+        return False
+    grouped = (
+        sub[[line_col, term_name]]
+        .groupby(line_col, sort=False)[term_name]
+        .nunique(dropna=False)
+    )
+    if grouped.empty:
+        return False
+    return bool((grouped <= 1).all())
+
+
+def _encode_fixed_design(
+    df_sub: pd.DataFrame,
+    terms: list[_TermSpec],
+    *,
+    trait: str,
+    logger: typing.Any,
+) -> tuple[np.ndarray | None, list[str]]:
+    x_blocks: list[np.ndarray] = []
+    x_names: list[str] = []
+    for term in terms:
+        arr, names = _encode_term_matrix(df_sub, term, for_random=False, sparse_onehot=False)
+        arr = np.asarray(arr, dtype=float)
+        if int(arr.shape[1]) == 0:
+            logger.warning(f"Trait {trait}: fixed term `{term.name}` expanded to 0 columns; skipped.")
+            continue
+        x_blocks.append(arr)
+        x_names.extend(names)
+    if len(x_blocks) == 0:
+        return None, []
+    return np.concatenate(x_blocks, axis=1), x_names
+
+
+def _encode_random_design(
+    df_sub: pd.DataFrame,
+    terms: list[_TermSpec],
+    *,
+    trait: str,
+    logger: typing.Any,
+) -> tuple[list[typing.Union[np.ndarray, sparse.spmatrix]], list[str]]:
+    z_list: list[typing.Union[np.ndarray, sparse.spmatrix]] = []
+    z_names: list[str] = []
+    for term in terms:
+        arr, _ = _encode_term_matrix(df_sub, term, for_random=True, sparse_onehot=True)
+        if int(arr.shape[1]) == 0:
+            logger.warning(f"Trait {trait}: random term `{term.name}` expanded to 0 columns; skipped.")
+            continue
+        z_list.append(arr)
+        z_names.append(str(term.name))
+    return z_list, z_names
+
+
+def _build_stage1_blue_terms(
+    sub: pd.DataFrame,
+    *,
+    line_col: str,
+    trait: str,
+    fixed_terms_all: list[_TermSpec],
+    random_terms_all: list[_TermSpec],
+    logger: typing.Any,
+) -> tuple[list[_TermSpec], list[_TermSpec]]:
+    stage2_fixed_terms: list[_TermSpec] = []
+    dropped_varying_fixed: list[str] = []
+    for term in fixed_terms_all:
+        if _term_constant_within_line(sub, line_col, str(term.name)):
+            stage2_fixed_terms.append(term)
+        else:
+            dropped_varying_fixed.append(str(term.name))
+
+    if len(dropped_varying_fixed) > 0:
+        logger.warning(
+            f"Trait {trait}: fixed covariates varying within line are not retained for BLUE stage-2 covariates -> {', '.join(dropped_varying_fixed)}"
+        )
+    return list(random_terms_all), stage2_fixed_terms
+
+
+def _fit_stage1_blue(
+    y_obs: np.ndarray,
+    sub: pd.DataFrame,
+    *,
+    line_col: str,
+    trait: str,
+    env_cols: list[str],
+    stage1_random_terms: list[_TermSpec],
+    gxe_var: float | None = None,
+    resid_var: float | None = None,
+    maxiter: int,
+    logger: typing.Any,
+) -> _Stage1BlueResult:
+    if len(stage1_random_terms) == 0:
+        try:
+            return _fit_stage1_blue_weighted_ls(
+                y_obs=y_obs,
+                sub=sub,
+                line_col=line_col,
+                env_cols=env_cols,
+                gxe_var=gxe_var,
+                resid_var=resid_var,
+            )
+        except Exception as ex:
+            logger.warning(
+                f"Trait {trait}: fast weighted BLUE fallback to BLUP path because {type(ex).__name__}: {ex}"
+            )
+
+    line_ids_sub = sub[line_col].astype("string").fillna("NA").astype(str)
+    env_key = _combine_key(sub, env_cols, "__ENV__").astype(str)
+
+    x_blocks_sparse: list[sparse.spmatrix] = []
+    x_names: list[str] = []
+
+    env_prefix = "ENV"
+    env_levels = sorted(pd.unique(env_key.astype(str)).tolist())
+    if len(env_cols) > 0:
+        env_arr, env_names = _onehot_encode_series(
+            env_key,
+            prefix=env_prefix,
+            drop_first=True,
+            sparse_output=True,
+        )
+        if int(env_arr.shape[1]) > 0:
+            x_blocks_sparse.append(env_arr.tocsr())
+            x_names.extend(env_names)
+
+    line_prefix = str(line_col)
+    line_arr, line_names = _onehot_encode_series(
+        line_ids_sub,
+        prefix=line_prefix,
+        drop_first=True,
+        sparse_output=True,
+    )
+    if int(line_arr.shape[1]) > 0:
+        x_blocks_sparse.append(line_arr.tocsr())
+        x_names.extend(line_names)
+
+    x_stage1 = (
+        sparse.hstack(x_blocks_sparse, format="csr", dtype=float)
+        if len(x_blocks_sparse) > 0
+        else None
+    )
+
+    z_stage1: list[typing.Union[np.ndarray, sparse.spmatrix]] = []
+    z_names: list[str] = []
+    gxe_name = f"{line_col}xENV"
+    if len(env_cols) > 0 and len(env_levels) > 1:
+        gxe_key = (line_ids_sub + "@@" + env_key).astype("string")
+        gxe_dummies, _ = _onehot_encode_series(
+            gxe_key,
+            prefix=gxe_name,
+            drop_first=False,
+            sparse_output=True,
+        )
+        if int(gxe_dummies.shape[1]) > 0:
+            z_stage1.append(gxe_dummies)
+            z_names.append(gxe_name)
+
+    extra_random, extra_random_names = _encode_random_design(
+        sub,
+        stage1_random_terms,
+        trait=trait,
+        logger=logger,
+    )
+    z_stage1.extend(extra_random)
+    z_names.extend(extra_random_names)
+
+    model = BLUP(
+        y=np.asarray(y_obs, dtype=float).reshape(-1, 1),
+        X=x_stage1,
+        Z=z_stage1 if len(z_stage1) > 0 else None,
+        maxiter=max(1, int(maxiter)),
+        progress=False,
+    )
+    beta = np.asarray(model.beta, dtype=float).reshape(-1)
+    intercept = float(beta[0])
+    beta_map = {x_names[i]: float(beta[i + 1]) for i in range(len(x_names))}
+
+    env_mean = 0.0
+    if len(env_levels) > 0:
+        env_effects = [0.0]
+        for level in env_levels[1:]:
+            env_effects.append(float(beta_map.get(f"{env_prefix}-{level}", 0.0)))
+        env_mean = float(np.mean(np.asarray(env_effects, dtype=float)))
+
+    line_levels = sorted(pd.unique(line_ids_sub.astype(str)).tolist())
+    line_effect_map: dict[str, float] = {}
+    if len(line_levels) > 0:
+        line_effect_map[line_levels[0]] = 0.0
+        for level in line_levels[1:]:
+            line_effect_map[level] = float(beta_map.get(f"{line_prefix}-{level}", 0.0))
+
+    blue_vals = np.asarray(
+        [intercept + env_mean + float(line_effect_map.get(sid, 0.0)) for sid in line_levels],
+        dtype=float,
+    )
+    return _Stage1BlueResult(sample_ids=line_levels, values=blue_vals)
+
+
+def _fit_stage1_blue_weighted_ls(
+    y_obs: np.ndarray,
+    sub: pd.DataFrame,
+    *,
+    line_col: str,
+    env_cols: list[str],
+    gxe_var: float | None,
+    resid_var: float | None,
+) -> _Stage1BlueResult:
+    y_vec = np.asarray(y_obs, dtype=float).reshape(-1)
+    line_ids_sub = sub[line_col].astype("string").fillna("NA").astype(str)
+    env_key = _combine_key(sub, env_cols, "__ENV__").astype(str)
+
+    work = pd.DataFrame(
+        {
+            "line": line_ids_sub.to_numpy(dtype=object),
+            "env": env_key.to_numpy(dtype=object),
+            "y": y_vec,
+        }
+    )
+    cell = (
+        work.groupby(["line", "env"], sort=False, observed=False)
+        .agg(n=("y", "size"), y_mean=("y", "mean"))
+        .reset_index()
+    )
+    if cell.empty:
+        raise ValueError("No usable line x env cells for weighted BLUE.")
+
+    line_levels = pd.unique(line_ids_sub.astype(str)).tolist()
+    env_levels = pd.unique(env_key.astype(str)).tolist()
+    line_index = {sid: i for i, sid in enumerate(line_levels)}
+    env_index = {sid: i for i, sid in enumerate(env_levels)}
+
+    line_codes = np.asarray([line_index[str(x)] for x in cell["line"].tolist()], dtype=np.int64)
+    env_codes = np.asarray([env_index[str(x)] for x in cell["env"].tolist()], dtype=np.int64)
+    n_cell = cell["n"].to_numpy(dtype=float)
+    y_mean = cell["y_mean"].to_numpy(dtype=float)
+
+    gxe = 0.0 if gxe_var is None or (not np.isfinite(gxe_var)) or gxe_var < 0.0 else float(gxe_var)
+    resid = 1.0 if resid_var is None or (not np.isfinite(resid_var)) or resid_var <= 0.0 else float(resid_var)
+    cell_var = gxe + (resid / np.maximum(n_cell, 1.0))
+    weights = 1.0 / np.maximum(cell_var, 1e-12)
+    sqrt_w = np.sqrt(weights)
+
+    n_rows = int(cell.shape[0])
+    n_env = int(len(env_levels))
+    n_line = int(len(line_levels))
+    p = 1 + max(0, n_env - 1) + max(0, n_line - 1)
+
+    row_parts: list[np.ndarray] = [np.arange(n_rows, dtype=np.int64)]
+    col_parts: list[np.ndarray] = [np.zeros(n_rows, dtype=np.int64)]
+    data_parts: list[np.ndarray] = [np.ones(n_rows, dtype=float)]
+
+    if n_env > 1:
+        keep_env = env_codes > 0
+        if np.any(keep_env):
+            row_parts.append(np.nonzero(keep_env)[0].astype(np.int64, copy=False))
+            col_parts.append(env_codes[keep_env].astype(np.int64, copy=False))
+            data_parts.append(np.ones(int(np.sum(keep_env)), dtype=float))
+
+    if n_line > 1:
+        keep_line = line_codes > 0
+        if np.any(keep_line):
+            row_parts.append(np.nonzero(keep_line)[0].astype(np.int64, copy=False))
+            col_parts.append(
+                (1 + max(0, n_env - 1) + (line_codes[keep_line] - 1)).astype(np.int64, copy=False)
+            )
+            data_parts.append(np.ones(int(np.sum(keep_line)), dtype=float))
+
+    rows = np.concatenate(row_parts, axis=0)
+    cols = np.concatenate(col_parts, axis=0)
+    data = np.concatenate(data_parts, axis=0)
+    x = sparse.csr_matrix((data, (rows, cols)), shape=(n_rows, p), dtype=float)
+
+    xw = x.multiply(sqrt_w.reshape(-1, 1))
+    yw = y_mean * sqrt_w
+    xtwx = (xw.T @ xw).tocsc()
+    xtwx = xtwx + sparse.eye(p, format="csc", dtype=float) * 1e-10
+    xtwy = np.asarray(xw.T @ yw.reshape(-1, 1), dtype=float).reshape(-1)
+    beta = np.asarray(spsolve(xtwx, xtwy), dtype=float).reshape(-1)
+
+    intercept = float(beta[0])
+    env_effects = np.zeros(n_env, dtype=float)
+    if n_env > 1:
+        env_effects[1:] = beta[1 : 1 + (n_env - 1)]
+    env_mean = float(np.mean(env_effects)) if n_env > 0 else 0.0
+
+    line_effects = np.zeros(n_line, dtype=float)
+    line_start = 1 + max(0, n_env - 1)
+    if n_line > 1:
+        line_effects[1:] = beta[line_start : line_start + (n_line - 1)]
+
+    blue_vals = intercept + env_mean + line_effects
+    return _Stage1BlueResult(
+        sample_ids=[str(x) for x in line_levels],
+        values=np.asarray(blue_vals, dtype=float),
+    )
+
+
+def _resolve_cli_columns(
+    values: Iterable[str] | None,
+    candidates: list[str],
+    label: str,
+) -> list[str]:
+    return _resolve_columns(_split_tokens(values), candidates, label, index_base=1)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = CliArgumentParser(
         prog="jx reml",
         formatter_class=cli_help_formatter(),
         epilog=minimal_help_epilog(
             [
-                "jx reml -file test.reml.txt -rh 0 -rh 1 -rh 2 -n 3 -o test -prefix reml",
-                "jx reml -file test.reml.txt -f sex -rh family -n trait1 -n trait2",
+                "jx reml -file pheno.tsv -l sample_id -e year,loc -o outdir",
+                "jx reml -file pheno.tsv -l sample_id -e year,loc -f PCA1,PCA2 -r block -k data.cGRM.npy -p Yield",
             ]
         ),
     )
@@ -478,66 +1027,66 @@ def build_parser() -> argparse.ArgumentParser:
         "--file",
         required=True,
         type=str,
-        help="Input phenotype/effect table. First column is sample ID.",
-    )
-    req.add_argument(
-        "-n",
-        "--n",
-        action="append",
-        required=True,
-        metavar="COL",
-        help=(
-            "Phenotype column(s), zero-based index (excluding sample ID), name, "
-            "comma list (e.g. 0,2), or numeric range (e.g. 0:2 or 0-2). "
-            "Repeat this flag for multiple traits."
-        ),
+        help="Input phenotype table (.tsv/.csv/whitespace).",
     )
 
     opt = parser.add_argument_group("Optional Arguments")
     opt.add_argument(
-        "-rh",
-        "--rh",
-        action="append",
-        default=[],
+        "-l",
+        "--line",
+        default=None,
         metavar="COL",
-        help=(
-            "Random-effect categorical column(s), zero-based index (excluding sample ID), name, "
-            "comma list (e.g. 0,2), or numeric range (e.g. 0:2 or 0-2). One-hot encoded."
-        ),
+        help="Line/sample ID column. Default: first column.",
     )
     opt.add_argument(
-        "-fh",
-        "--fh",
+        "-e",
+        "--env",
         action="append",
         default=[],
         metavar="COL",
         help=(
-            "Fixed-effect categorical column(s), zero-based index (excluding sample ID), name, "
-            "comma list (e.g. 0,2), or numeric range (e.g. 0:2 or 0-2). One-hot encoded."
-        ),
-    )
-    opt.add_argument(
-        "-r",
-        "--r",
-        action="append",
-        default=[],
-        metavar="COL",
-        help=(
-            "Random-effect column(s), zero-based index (excluding sample ID), name, "
-            "comma list (e.g. 0,2), or numeric range (e.g. 0:2 or 0-2). "
-            "String columns are one-hot encoded by default."
+            "Environment factor column(s), e.g. year,loc. They are combined as one ENV factor."
         ),
     )
     opt.add_argument(
         "-f",
-        "--f",
+        "--fixed",
         action="append",
         default=[],
         metavar="COL",
         help=(
-            "Fixed-effect column(s), zero-based index (excluding sample ID), name, "
-            "comma list (e.g. 0,2), or numeric range (e.g. 0:2 or 0-2). "
-            "String columns are one-hot encoded by default."
+            "Additional fixed covariates. Numeric columns stay numeric; categorical columns are one-hot encoded."
+        ),
+    )
+    opt.add_argument(
+        "-r",
+        "--random",
+        action="append",
+        default=[],
+        metavar="COL",
+        help=(
+            "Additional random nuisance covariates. Numeric columns stay numeric; categorical columns are one-hot encoded."
+        ),
+    )
+    opt.add_argument(
+        "-p",
+        "--pheno",
+        action="append",
+        default=[],
+        metavar="COL",
+        help=(
+            "Trait column(s). If omitted, all numeric non-design columns are used."
+        ),
+    )
+    opt.add_argument(
+        "-k",
+        "-grm",
+        "--grm",
+        dest="grm",
+        default=None,
+        metavar="FILE",
+        help=(
+            "Optional GRM matrix. When provided, narrow-sense h2 and genomic BLUP are estimated in addition to broad-sense H2 and BLUE."
         ),
     )
     opt.add_argument(
@@ -576,6 +1125,8 @@ def main() -> None:
 
     if not ensure_file_exists(logger, str(args.file), "Input file"):
         return
+    if args.grm is not None and not ensure_file_exists(logger, str(args.grm), "GRM file"):
+        return
 
     load_t0 = time.time()
     try:
@@ -585,50 +1136,65 @@ def main() -> None:
     load_elapsed = format_elapsed(time.time() - load_t0)
 
     if df.shape[1] < 2:
-        raise ValueError("Input file must contain at least 2 columns: sample_id + data columns.")
+        raise ValueError("Input file must contain at least 2 columns.")
 
-    sample_col = str(df.columns[0])
-    sample_ids = df.iloc[:, 0].astype(str).str.strip()
-    n_samples_total = int(sample_ids.shape[0])
-    n_samples_unique = int(sample_ids.nunique(dropna=False))
     df = df.copy()
-    df[sample_col] = sample_ids
-    dfx = df.iloc[:, 1:].copy()
-    data_cols = [str(c) for c in dfx.columns]
+    all_cols = [str(c) for c in df.columns]
 
-    n_cols = _resolve_columns(_split_tokens(args.n), data_cols, "-n", index_base=0)
-    rh_cols = _resolve_columns(_split_tokens(args.rh), data_cols, "-rh", index_base=0)
-    fh_cols = _resolve_columns(_split_tokens(args.fh), data_cols, "-fh", index_base=0)
-    r_cols = _resolve_columns(_split_tokens(args.r), data_cols, "-r", index_base=0)
-    f_cols = _resolve_columns(_split_tokens(args.f), data_cols, "-f", index_base=0)
+    line_spec = _resolve_cli_columns(
+        [args.line] if args.line is not None else [],
+        all_cols,
+        "-l/--line",
+    )
+    if len(line_spec) > 1:
+        raise ValueError("Please specify exactly one line column with -l/--line.")
+    line_col = str(line_spec[0]) if len(line_spec) == 1 else str(all_cols[0])
+    df[line_col] = df[line_col].astype("string").fillna("NA").astype(str)
 
-    fixed_map: "OrderedDict[str, bool]" = OrderedDict()
-    for c in fh_cols:
-        fixed_map[c] = True
-    for c in f_cols:
-        fixed_map[c] = bool(fixed_map.get(c, False))
-    fixed_terms = [_TermSpec(name=k, force_onehot=v) for k, v in fixed_map.items()]
+    effect_cols = [c for c in all_cols if c != line_col]
+    env_cols = _resolve_cli_columns(args.env, effect_cols, "-e/--env")
+    fixed_cols = _resolve_cli_columns(args.fixed, effect_cols, "-f/--fixed")
+    random_cols = _resolve_cli_columns(args.random, effect_cols, "-r/--random")
 
-    random_map: "OrderedDict[str, bool]" = OrderedDict()
-    for c in rh_cols:
-        random_map[c] = True
-    for c in r_cols:
-        random_map[c] = bool(random_map.get(c, False))
-    random_terms_all = [_TermSpec(name=k, force_onehot=v) for k, v in random_map.items()]
-    env_cols_auto, rep_cols_auto = _infer_env_rep_columns(random_terms_all)
+    overlap_effects = (set(env_cols) & set(fixed_cols)) | (set(env_cols) & set(random_cols)) | (set(fixed_cols) & set(random_cols))
+    if len(overlap_effects) > 0:
+        raise ValueError(
+            "Columns cannot be assigned to multiple design groups: "
+            + ", ".join(sorted(overlap_effects))
+        )
 
-    dropped_random_onehot: dict[str, int] = {}
-    random_terms: list[_TermSpec] = []
-    for term in random_terms_all:
-        if term.name not in dfx.columns:
-            continue
-        is_onehot = bool(term.force_onehot or (not _is_numeric_series(dfx[term.name])))
-        if is_onehot:
-            lv = _onehot_level_count(dfx[term.name])
-            if lv < 2:
-                dropped_random_onehot[term.name] = lv
-                continue
-        random_terms.append(term)
+    reserved_cols = set(env_cols) | set(fixed_cols) | set(random_cols)
+    trait_tokens = _split_tokens(args.pheno)
+    if len(trait_tokens) > 0:
+        trait_cols = _resolve_cli_columns(trait_tokens, effect_cols, "-p/--pheno")
+        conflict = sorted(set(trait_cols) & reserved_cols)
+        if len(conflict) > 0:
+            raise ValueError(
+                "Trait column(s) overlap with env/fixed/random columns: "
+                + ", ".join(conflict)
+            )
+    else:
+        trait_candidates = [c for c in effect_cols if c not in reserved_cols]
+        trait_cols = _resolve_trait_columns_auto(df, trait_candidates)
+    if len(trait_cols) == 0:
+        raise ValueError("No usable trait columns were found.")
+
+    fixed_terms = [_TermSpec(name=str(c), force_onehot=False) for c in fixed_cols]
+    random_terms_all = [_TermSpec(name=str(c), force_onehot=False) for c in random_cols]
+
+    n_obs_total = int(df.shape[0])
+    unique_lines = df[line_col].drop_duplicates().reset_index(drop=True)
+    n_lines_total = int(unique_lines.shape[0])
+    env_fixed_label = _format_design_label(env_cols, fixed_cols)
+    random_label = _format_random_label(random_cols)
+
+    grm_ctx: _GrmContext | None = None
+    if args.grm is not None:
+        grm_ctx = _load_grm_context(
+            str(args.grm),
+            None,
+            unique_lines.astype(str).tolist(),
+        )
 
     emit_cli_configuration(
         logger,
@@ -640,22 +1206,29 @@ def main() -> None:
                 "Input",
                 [
                     ("File", str(args.file)),
-                    ("Sample column", sample_col),
-                    ("Samples(total)", n_samples_total),
-                    ("Samples(unique)", n_samples_unique),
+                    ("Line column", line_col),
+                    ("Rows(total)", n_obs_total),
+                    ("Lines(unique)", n_lines_total),
+                    ("Load time", load_elapsed),
                 ],
             ),
             (
                 "Columns",
                 [
-                    ("Phenotypes", ", ".join(n_cols)),
-                    ("ID random effect", f"{sample_col} (auto one-hot)"),
-                    ("Auto env columns", _format_onehot_terms_with_counts(dfx, env_cols_auto, dropped=dropped_random_onehot)),
-                    ("Auto rep columns", _format_onehot_terms_with_counts(dfx, rep_cols_auto, dropped=dropped_random_onehot)),
-                    ("Fixed onehot", _format_onehot_terms_with_counts(dfx, fh_cols)),
-                    ("Fixed", ", ".join(f_cols) if f_cols else "None"),
-                    ("Random onehot", _format_onehot_terms_with_counts(dfx, rh_cols, dropped=dropped_random_onehot)),
-                    ("Random", ", ".join(r_cols) if r_cols else "None"),
+                    ("Traits", ", ".join(trait_cols)),
+                    ("ENV", "|".join(env_cols) if len(env_cols) > 0 else "None"),
+                    ("Fixed", ", ".join(fixed_cols) if len(fixed_cols) > 0 else "None"),
+                    ("Random", ", ".join(random_cols) if len(random_cols) > 0 else "None"),
+                    ("Broad model", f"{line_col} (random) + {line_col}xENV (random)"),
+                    ("BLUE stage-1", f"{line_col} (fixed) + ENV (fixed) + {line_col}xENV (random)"),
+                ],
+            ),
+            (
+                "GRM",
+                [
+                    ("GRM file", str(args.grm) if args.grm is not None else "None"),
+                    ("GRM ID file", "auto-detect <grm>.id" if args.grm is not None else "None"),
+                    ("GRM n", int(grm_ctx.matrix.shape[0]) if grm_ctx is not None else "NA"),
                 ],
             ),
             (
@@ -663,7 +1236,9 @@ def main() -> None:
                 [
                     ("Out dir", outdir),
                     ("Prefix", prefix),
+                    ("BLUE file", f"{outprefix}.blue.txt"),
                     ("BLUP file", f"{outprefix}.blup.txt"),
+                    ("GBLUP file", f"{outprefix}.gblup.txt" if grm_ctx is not None else "None"),
                     ("Summary file", f"{outprefix}.reml.summary.tsv"),
                     ("Log file", log_path),
                 ],
@@ -671,224 +1246,370 @@ def main() -> None:
         ],
     )
 
-    unique_sample_ids = sample_ids.drop_duplicates().reset_index(drop=True)
-    blup_out = pd.DataFrame({sample_col: unique_sample_ids.to_numpy(dtype=object)})
+    blue_out = pd.DataFrame({line_col: unique_lines.to_numpy(dtype=object)})
+    gblup_out = (
+        pd.DataFrame({line_col: unique_lines.to_numpy(dtype=object)})
+        if grm_ctx is not None
+        else None
+    )
     summary_rows: list[dict[str, typing.Any]] = []
 
-    for trait in n_cols:
+    for trait in trait_cols:
         step_t0 = time.time()
-        y_all = pd.to_numeric(dfx[trait], errors="coerce")
-        mask = y_all.notna()
-        mask &= _collect_numeric_required_mask(dfx, fixed_terms)
-        mask &= _collect_numeric_required_mask(dfx, random_terms)
+        try:
+            y_all = pd.to_numeric(df[trait], errors="coerce")
+            mask = y_all.notna()
+            mask &= _collect_numeric_required_mask(df, fixed_terms)
+            mask &= _collect_numeric_required_mask(df, random_terms_all)
 
-        n_used = int(mask.sum())
-        if n_used <= 2:
-            logger.warning(f"Trait {trait}: too few valid samples after filtering ({n_used}); skip.")
-            blup_out[trait] = np.nan
-            summary_rows.append(
-                {
-                    "trait": trait,
-                    "used": n_used,
-                    "total": int(df.shape[0]),
-                    "e": np.nan,
-                    "r": np.nan,
-                    "hsqr": np.nan,
-                    "ve": np.nan,
-                    "pve_e": np.nan,
-                    "elapsed_sec": float(time.time() - step_t0),
-                    "status": "skipped_too_few_samples",
-                }
-            )
-            continue
+            used_obs = int(mask.sum())
+            used_lines = int(df.loc[mask, line_col].astype(str).nunique(dropna=False))
+            blue_out[trait] = np.nan
+            if gblup_out is not None:
+                gblup_out[trait] = np.nan
 
-        sub = dfx.loc[mask, :].copy()
-        y = pd.to_numeric(sub[trait], errors="coerce").to_numpy(dtype=float).reshape(-1, 1)
-
-        x_blocks: list[np.ndarray] = []
-        x_names: list[str] = []
-        for term in fixed_terms:
-            arr, names = _encode_term_matrix(sub, term, for_random=False, sparse_onehot=False)
-            if arr.shape[1] == 0:
-                logger.warning(f"Trait {trait}: fixed term `{term.name}` expanded to 0 columns; skipped.")
+            if used_obs <= 2 or used_lines <= 1:
+                logger.warning(
+                    f"Trait {trait}: too few observations after filtering (obs={used_obs}, lines={used_lines}); skipped."
+                )
+                summary_rows.append(
+                    {
+                        "trait": trait,
+                        "used_obs": used_obs,
+                        "used_lines": used_lines,
+                        "total_obs": n_obs_total,
+                        "total_lines": n_lines_total,
+                        "env_fixed_label": env_fixed_label,
+                        "random_label": random_label,
+                        "hsqr": np.nan,
+                        "h2_narrow": np.nan,
+                        "h2_blue_raw": np.nan,
+                        "pve": np.nan,
+                        "lambda": np.nan,
+                        "vg": np.nan,
+                        "vge": np.nan,
+                        "ve": np.nan,
+                        "h_env": np.nan,
+                        "h_plot": np.nan,
+                        "blue_n": np.nan,
+                        "missing_grm": np.nan,
+                        "elapsed_sec": float(time.time() - step_t0),
+                        "status": "skipped_too_few_observations",
+                    }
+                )
                 continue
-            x_blocks.append(np.asarray(arr, dtype=float))
-            x_names.extend(names)
-        x_mat = np.concatenate(x_blocks, axis=1) if len(x_blocks) > 0 else None
 
-        z_list: list[typing.Union[np.ndarray, sparse.spmatrix]] = []
-        z_names: list[str] = []
-        sample_ids_sub = df.loc[mask, sample_col].astype("string").fillna("NA").astype(str)
-        status = "ok"
-        single_obs_per_id = bool(int(sample_ids_sub.shape[0]) == int(sample_ids_sub.nunique(dropna=False)))
-        # Always include sample-ID random effect from the first column.
-        id_series = sample_ids_sub
-        id_dummies, id_col_names = _onehot_encode_series(
-            id_series,
-            prefix=str(sample_col),
-            drop_first=False,
-            sparse_output=True,
-        )
-        if id_dummies.shape[1] > 0:
-            z_list.append(id_dummies)
-            z_names.append(sample_col)
-        else:
-            logger.warning(
-                f"Trait {trait}: sample-ID random effect expanded to 0 columns; H2 will be unavailable."
+            sub_cols = _unique_preserve([line_col, trait, *env_cols, *fixed_cols, *random_cols])
+            sub = df.loc[mask, sub_cols].copy()
+            y = pd.to_numeric(sub[trait], errors="coerce").to_numpy(dtype=float).reshape(-1, 1)
+            line_ids_sub = sub[line_col].astype("string").fillna("NA").astype(str)
+            env_key = _combine_key(sub, env_cols, "__ENV__").astype(str)
+
+            x_blocks: list[np.ndarray] = []
+            x_names: list[str] = []
+            fixed_x, fixed_names = _encode_fixed_design(
+                sub,
+                fixed_terms,
+                trait=trait,
+                logger=logger,
             )
+            if fixed_x is not None:
+                x_blocks.append(np.asarray(fixed_x, dtype=float))
+                x_names.extend(fixed_names)
 
-        gxe_name = f"{sample_col}xenv"
-        if len(env_cols_auto) > 0:
-            env_key = _combine_key(sub, [c for c in env_cols_auto if c in sub.columns], "__ENV__").astype(str)
-            if int(env_key.nunique(dropna=False)) > 1:
-                gxe_key = (sample_ids_sub + "@@" + env_key).astype("string")
-                gxe_dummies, _ = _onehot_encode_series(
+            if len(env_cols) > 0:
+                env_arr, env_names = _onehot_encode_series(
+                    env_key,
+                    prefix="ENV",
+                    drop_first=True,
+                    sparse_output=False,
+                )
+                if int(env_arr.shape[1]) > 0:
+                    x_blocks.append(np.asarray(env_arr, dtype=float))
+                    x_names.extend(env_names)
+
+            x_broad = np.concatenate(x_blocks, axis=1) if len(x_blocks) > 0 else None
+
+            z_list: list[typing.Union[np.ndarray, sparse.spmatrix]] = []
+            z_names: list[str] = []
+            line_z, _line_names = _onehot_encode_series(
+                line_ids_sub,
+                prefix=line_col,
+                drop_first=False,
+                sparse_output=True,
+            )
+            if int(line_z.shape[1]) > 0:
+                z_list.append(line_z)
+                z_names.append(line_col)
+
+            gxe_name = f"{line_col}xENV"
+            if len(env_cols) > 0 and int(env_key.nunique(dropna=False)) > 1:
+                gxe_key = (line_ids_sub + "@@" + env_key).astype("string")
+                gxe_z, _ = _onehot_encode_series(
                     gxe_key,
                     prefix=gxe_name,
                     drop_first=False,
                     sparse_output=True,
                 )
-                if gxe_dummies.shape[1] > 0:
-                    z_list.append(gxe_dummies)
+                if int(gxe_z.shape[1]) > 0:
+                    z_list.append(gxe_z)
                     z_names.append(gxe_name)
-                else:
-                    logger.warning(
-                        f"Trait {trait}: sample×env random effect expanded to 0 columns; use fallback H2."
+
+            extra_random, extra_random_names = _encode_random_design(
+                sub,
+                random_terms_all,
+                trait=trait,
+                logger=logger,
+            )
+            z_list.extend(extra_random)
+            z_names.extend(extra_random_names)
+
+            broad_model = BLUP(
+                y=y,
+                X=x_broad,
+                Z=z_list if len(z_list) > 0 else None,
+                maxiter=int(args.maxiter),
+                progress=False,
+            )
+
+            hsqr = np.nan
+            pve_line = np.nan
+            lbd = np.nan
+            vg = np.nan
+            vge = 0.0
+            ve = np.nan
+            pve_e = np.nan
+            h_env = 1.0
+            h_plot = 1.0
+            r_eff = 1.0
+            status = "ok"
+            single_obs_per_line = bool(int(line_ids_sub.shape[0]) == int(line_ids_sub.nunique(dropna=False)))
+            if getattr(broad_model, "var", None) is not None and len(z_names) > 0:
+                var_all = np.asarray(broad_model.var, dtype=float).reshape(-1)
+                if var_all.size >= (len(z_names) + 1):
+                    rand_var = var_all[: len(z_names)]
+                    ve = float(var_all[-1])
+                    total_var = float(np.sum(rand_var) + ve)
+                    line_idx = z_names.index(line_col) if line_col in z_names else -1
+                    gxe_idx = z_names.index(gxe_name) if gxe_name in z_names else -1
+                    vg = float(rand_var[line_idx]) if line_idx >= 0 else np.nan
+                    vge = float(rand_var[gxe_idx]) if gxe_idx >= 0 else 0.0
+                    if total_var > 0.0 and line_idx >= 0:
+                        pve_line = float(rand_var[line_idx] / total_var)
+                        pve_e = float(ve / total_var)
+                    lbd = (
+                        float(ve / vg)
+                        if np.isfinite(ve) and np.isfinite(vg) and vg > 0.0
+                        else np.nan
                     )
-            else:
+                    h_env, h_plot, r_eff = _effective_env_plot_counts(
+                        line_ids_sub,
+                        sub,
+                        env_cols,
+                        [],
+                    )
+                    denom = vg + (vge / h_env) + (ve / h_plot)
+                    if np.isfinite(vg) and np.isfinite(denom) and denom > 0.0:
+                        hsqr = float(vg / denom)
+
+            if single_obs_per_line and z_names == [line_col]:
+                hsqr = np.nan
+                pve_line = np.nan
+                lbd = np.nan
+                vg = np.nan
+                status = "warning_single_obs_nonidentifiable_h2"
                 logger.warning(
-                    f"Trait {trait}: env columns have only one level after filtering; sample×env term skipped."
+                    f"Trait {trait}: only one observation per line and no ENV/random replication; broad-sense H2 is non-identifiable."
                 )
 
-        for term in random_terms:
-            arr, _ = _encode_term_matrix(sub, term, for_random=True, sparse_onehot=True)
-            if arr.shape[1] == 0:
-                logger.warning(f"Trait {trait}: random term `{term.name}` expanded to 0 columns; skipped.")
-                continue
-            z_list.append(arr)
-            z_names.append(term.name)
-
-        model = BLUP(
-            y=y,
-            X=x_mat,
-            Z=z_list if len(z_list) > 0 else None,
-            maxiter=int(args.maxiter),
-            progress=False,
-        )
-        # Export sample-level BLUP (ID random effect), one row per unique sample.
-        id_u = np.full(blup_out.shape[0], np.nan, dtype=float)
-        if getattr(model, "u_by_Z", None) is not None and len(model.u_by_Z) > 0:
-            u_id = np.asarray(model.u_by_Z[0], dtype=float).reshape(-1)
-            id_cols = [str(c) for c in id_col_names]
-            id_prefix = f"{sample_col}-"
-            id_levels = [
-                c[len(id_prefix):] if c.startswith(id_prefix) else c
-                for c in id_cols
-            ]
-            id_map = {str(k): float(v) for k, v in zip(id_levels, u_id)}
-            id_u = (
-                blup_out[sample_col]
+            stage1_random_terms, stage2_fixed_terms = _build_stage1_blue_terms(
+                sub,
+                line_col=line_col,
+                trait=trait,
+                fixed_terms_all=fixed_terms,
+                random_terms_all=random_terms_all,
+                logger=logger,
+            )
+            stage1_blue = _fit_stage1_blue(
+                y_obs=y.reshape(-1),
+                sub=sub,
+                line_col=line_col,
+                trait=trait,
+                env_cols=env_cols,
+                stage1_random_terms=stage1_random_terms,
+                gxe_var=vge,
+                resid_var=ve,
+                maxiter=int(args.maxiter),
+                logger=logger,
+            )
+            blue_map = {
+                str(sid): float(val)
+                for sid, val in zip(stage1_blue.sample_ids, stage1_blue.values)
+            }
+            blue_out[trait] = (
+                blue_out[line_col]
                 .astype(str)
-                .map(id_map)
+                .map(blue_map)
                 .to_numpy(dtype=float)
             )
-        blup_out[trait] = id_u
 
-        # Variance decomposition and heritability
-        h2 = np.nan
-        ve = np.nan
-        pve_e = np.nan
-        e_eff = 1.0
-        r_eff = 1.0
-        random_rows: list[tuple[str, float, float]] = []
-        if getattr(model, "var", None) is not None and len(z_names) > 0:
-            var_all = np.asarray(model.var, dtype=float).reshape(-1)
-            if var_all.size >= (len(z_names) + 1):
-                rand_var = var_all[: len(z_names)]
-                ve = float(var_all[-1])
-                total = float(np.sum(rand_var) + ve)
-                if total > 0.0:
-                    pve = rand_var / total
-                    # Broad-sense heritability on mean scale:
-                    # H2 = Vg / (Vg + Vge/e + Ve/(e*r))
-                    id_idx = z_names.index(sample_col) if sample_col in z_names else -1
-                    gxe_idx = z_names.index(gxe_name) if gxe_name in z_names else -1
-                    vg = float(rand_var[id_idx]) if id_idx >= 0 else np.nan
-                    vge = float(rand_var[gxe_idx]) if gxe_idx >= 0 else 0.0
-                    e_eff, r_eff = _effective_env_rep_counts(
-                        sample_ids_sub,
-                        sub,
-                        [c for c in env_cols_auto if c in sub.columns],
-                        [c for c in rep_cols_auto if c in sub.columns],
+            h2_narrow = np.nan
+            h2_blue_raw = np.nan
+            missing_grm = np.nan
+            blue_n = int(len(stage1_blue.sample_ids))
+            if grm_ctx is not None:
+                blue_trait_df = pd.DataFrame(
+                    {
+                        line_col: np.asarray(stage1_blue.sample_ids, dtype=object),
+                        trait: np.asarray(stage1_blue.values, dtype=float),
+                    }
+                )
+                if len(stage2_fixed_terms) > 0:
+                    fixed_keep = [line_col] + [str(t.name) for t in stage2_fixed_terms]
+                    fixed_line_df = (
+                        sub[fixed_keep]
+                        .drop_duplicates(subset=[line_col], keep="first")
+                        .copy()
                     )
-                    denom = vg + (vge / e_eff) + (ve / (e_eff * r_eff))
-                    if np.isfinite(denom) and denom > 0.0 and np.isfinite(vg):
-                        h2 = float(vg / denom)
+                    blue_trait_df = blue_trait_df.merge(
+                        fixed_line_df,
+                        on=line_col,
+                        how="left",
+                    )
+
+                sid_series = blue_trait_df[line_col].astype(str)
+                keep_mask = sid_series.isin(set(grm_ctx.index.keys()))
+                missing_grm = int((~keep_mask).sum())
+                if missing_grm > 0:
+                    logger.warning(
+                        f"Trait {trait}: dropped {missing_grm} BLUE lines absent from GRM."
+                    )
+                if int(keep_mask.sum()) > 2:
+                    kept = blue_trait_df.loc[keep_mask].reset_index(drop=True)
+                    kept_ids = kept[line_col].astype(str).tolist()
+                    grm_idx = [grm_ctx.index[sid] for sid in kept_ids]
+                    kinship = grm_ctx.matrix[np.ix_(grm_idx, grm_idx)]
+                    x_stage2, _ = _encode_fixed_design(
+                        kept,
+                        stage2_fixed_terms,
+                        trait=trait,
+                        logger=logger,
+                    )
+                    lmm = LMM(
+                        y=kept[trait].to_numpy(dtype=float),
+                        X=x_stage2,
+                        kinship=kinship,
+                    )
+                    h2_blue_raw = float(lmm.pve) if np.isfinite(lmm.pve) else np.nan
+                    if np.isfinite(hsqr) and np.isfinite(h2_blue_raw):
+                        h2_narrow = float(min(hsqr, h2_blue_raw))
                     else:
-                        # fallback to observation-scale id-PVE when mean-scale denominator is unstable
-                        h2 = float(pve[id_idx]) if id_idx >= 0 else np.nan
-                    pve_e = float(ve / total)
-                    random_rows = [
-                        (z_names[i], float(rand_var[i]), float(pve[i])) for i in range(len(z_names))
-                    ]
+                        h2_narrow = h2_blue_raw
+                    narrow_stats = _lmm_null_stats(lmm)
+                    g_map = {
+                        kept_ids[i]: float(narrow_stats.g_blup[i])
+                        for i in range(len(kept_ids))
+                    }
+                    assert gblup_out is not None
+                    gblup_out[trait] = (
+                        gblup_out[line_col]
+                        .astype(str)
+                        .map(g_map)
+                        .to_numpy(dtype=float)
+                    )
+                else:
+                    logger.warning(
+                        f"Trait {trait}: too few lines overlap with GRM after filtering; narrow-sense h2 skipped."
+                    )
 
-        # With one observation per ID and no additional varying random structure,
-        # Vg and Ve are not separately identifiable; the optimizer often returns
-        # an artificial ~50/50 split, which should not be reported as H2.
-        if single_obs_per_id and z_names == [sample_col]:
-            if np.isfinite(h2):
-                logger.warning(
-                    f"Trait {trait}: only one observation per sample ID with no varying env/random terms; hsqr is non-identifiable and set to NA."
-                )
-            h2 = np.nan
-            status = "warning_single_obs_nonidentifiable_h2"
-
-        # Fixed effects stats
-        beta, se, pval = _gls_fixed_stats_from_blup(model, z_list)
-        fx_names = ["Intercept"] + x_names
-
-        logger.info("-" * 60)
-        logger.info(
-            f"{success_symbol()} Trait: {trait} | used={n_used}/{df.shape[0]} | e={e_eff:.2f} | r={r_eff:.2f} | elapsed={format_elapsed(time.time()-step_t0)}"
-        )
-        logger.info(f"hsqr={h2:.6g}" if np.isfinite(h2) else "hsqr=NA")
-        logger.info("Fixed effects:")
-        for i, nm in enumerate(fx_names):
+            logger.info("-" * 72)
             logger.info(
-                f"  {nm:<12} beta={beta[i]:<12.6g} se={se[i]:<12.6g} p={pval[i]:<12.6g}"
+                f"{success_symbol()} Trait={trait} | obs={used_obs} | lines={used_lines} | H2={_fmt_metric(hsqr)} | h2={_fmt_metric(h2_narrow)} | elapsed={format_elapsed(time.time() - step_t0)}"
             )
-        if len(random_rows) > 0:
-            logger.info("Random effects:")
-            for nm, vv, pp in random_rows:
+            if np.isfinite(h2_blue_raw):
                 logger.info(
-                    f"  {nm:<12} var={vv:<12.6g} PVE={pp:<12.6g}"
+                    f"  narrow(raw BLUE scale)={_fmt_metric(h2_blue_raw)}"
                 )
-            logger.info(
-                f"  {'Residual':<12} var={ve:<12.6g} PVE={pve_e:<12.6g}"
-            )
-        else:
-            logger.info("Random effects: None")
-        summary_rows.append(
-            {
-                "trait": trait,
-                "used": n_used,
-                "total": int(df.shape[0]),
-                "e": float(e_eff),
-                "r": float(r_eff),
-                "hsqr": float(h2) if np.isfinite(h2) else np.nan,
-                "ve": float(ve) if np.isfinite(ve) else np.nan,
-                "pve_e": float(pve_e) if np.isfinite(pve_e) else np.nan,
-                "elapsed_sec": float(time.time() - step_t0),
-                "status": status,
-            }
-        )
 
+            summary_rows.append(
+                {
+                    "trait": trait,
+                    "used_obs": used_obs,
+                    "used_lines": used_lines,
+                    "total_obs": n_obs_total,
+                    "total_lines": n_lines_total,
+                    "env_fixed_label": env_fixed_label,
+                    "random_label": random_label,
+                    "hsqr": float(hsqr) if np.isfinite(hsqr) else np.nan,
+                    "h2_narrow": float(h2_narrow) if np.isfinite(h2_narrow) else np.nan,
+                    "h2_blue_raw": float(h2_blue_raw) if np.isfinite(h2_blue_raw) else np.nan,
+                    "pve": float(pve_line) if np.isfinite(pve_line) else np.nan,
+                    "lambda": float(lbd) if np.isfinite(lbd) else np.nan,
+                    "vg": float(vg) if np.isfinite(vg) else np.nan,
+                    "vge": float(vge) if np.isfinite(vge) else np.nan,
+                    "ve": float(ve) if np.isfinite(ve) else np.nan,
+                    "h_env": float(h_env),
+                    "h_plot": float(h_plot),
+                    "r": float(r_eff),
+                    "blue_n": float(blue_n),
+                    "missing_grm": float(missing_grm) if np.isfinite(missing_grm) else np.nan,
+                    "elapsed_sec": float(time.time() - step_t0),
+                    "status": status,
+                }
+            )
+        except Exception as exc:
+            logger.exception(f"Trait {trait}: REML failed: {exc}")
+            blue_out[trait] = np.nan
+            if gblup_out is not None:
+                gblup_out[trait] = np.nan
+            summary_rows.append(
+                {
+                    "trait": trait,
+                    "used_obs": np.nan,
+                    "used_lines": np.nan,
+                    "total_obs": n_obs_total,
+                    "total_lines": n_lines_total,
+                    "env_fixed_label": env_fixed_label,
+                    "random_label": random_label,
+                    "hsqr": np.nan,
+                    "h2_narrow": np.nan,
+                    "h2_blue_raw": np.nan,
+                    "pve": np.nan,
+                    "lambda": np.nan,
+                    "vg": np.nan,
+                    "vge": np.nan,
+                    "ve": np.nan,
+                    "h_env": np.nan,
+                    "h_plot": np.nan,
+                    "blue_n": np.nan,
+                    "missing_grm": np.nan,
+                    "elapsed_sec": float(time.time() - step_t0),
+                    "status": f"failed:{type(exc).__name__}",
+                }
+            )
+
+    out_blue = f"{outprefix}.blue.txt"
     out_blup = f"{outprefix}.blup.txt"
     out_summary = f"{outprefix}.reml.summary.tsv"
-    blup_out.to_csv(out_blup, sep="\t", index=False)
-    pd.DataFrame(summary_rows).to_csv(out_summary, sep="\t", index=False)
+    blue_out.to_csv(out_blue, sep="\t", index=False)
+    blue_out.to_csv(out_blup, sep="\t", index=False)
+    if gblup_out is not None:
+        out_gblup = f"{outprefix}.gblup.txt"
+        gblup_out.to_csv(out_gblup, sep="\t", index=False)
+    summary_df = pd.DataFrame(summary_rows)
+    summary_df.to_csv(out_summary, sep="\t", index=False)
+
+    summary_console = _render_summary_table(summary_rows, log_style=False)
+    summary_log = _render_summary_table(summary_rows, log_style=True)
+    if summary_console != "":
+        print(summary_console)
+    if summary_log != "":
+        logger.info(summary_log)
     logger.info("=" * 60)
+    log_success(logger, f"BLUE table saved: {format_path_for_display(out_blue)}")
     log_success(logger, f"BLUP table saved: {format_path_for_display(out_blup)}")
+    if gblup_out is not None:
+        log_success(logger, f"GBLUP table saved: {format_path_for_display(f'{outprefix}.gblup.txt')}")
     log_success(logger, f"Summary table saved: {format_path_for_display(out_summary)}")
     logger.info(f"Total elapsed: {format_elapsed(time.time() - t0)}")
 

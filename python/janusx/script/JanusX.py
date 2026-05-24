@@ -23,7 +23,7 @@ Modules:
 
     Genomic Selection (GS):
     gs            Genomic prediction and model-based selection
-    reml          Estimate heritability/effect components by REML-BLUP
+    reml          Estimate broad/narrow heritability and BLUE by REML
     postgs        Summarize and visualize GS results
 
     Genetic Association by Random Forest and InterpretivE Logic Decisions (GARFIELD):
@@ -318,7 +318,7 @@ def _print_cli_help() -> None:
 
     print(f"  {_style_blue('Genomic Selection (GS):')}")
     _print_help_entry(4, "gs", "Genomic prediction and model-based selection", 12, width)
-    _print_help_entry(4, "reml", "Estimate heritability/effect components by REML-BLUP", 12, width)
+    _print_help_entry(4, "reml", "Estimate broad/narrow heritability and BLUE by REML", 12, width)
     _print_help_entry(4, "postgs", "Summarize and visualize GS results", 12, width)
     print()
 

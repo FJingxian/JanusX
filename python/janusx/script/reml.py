@@ -613,6 +613,8 @@ def main() -> None:
         z_list: list[typing.Union[np.ndarray, sparse.spmatrix]] = []
         z_names: list[str] = []
         sample_ids_sub = df.loc[mask, sample_col].astype("string").fillna("NA").astype(str)
+        status = "ok"
+        single_obs_per_id = bool(int(sample_ids_sub.shape[0]) == int(sample_ids_sub.nunique(dropna=False)))
         # Always include sample-ID random effect from the first column.
         id_series = sample_ids_sub
         id_dummies, id_col_names = _onehot_encode_series(
@@ -632,19 +634,24 @@ def main() -> None:
         gxe_name = f"{sample_col}xenv"
         if len(env_cols_auto) > 0:
             env_key = _combine_key(sub, [c for c in env_cols_auto if c in sub.columns], "__ENV__").astype(str)
-            gxe_key = (sample_ids_sub + "@@" + env_key).astype("string")
-            gxe_dummies, _ = _onehot_encode_series(
-                gxe_key,
-                prefix=gxe_name,
-                drop_first=False,
-                sparse_output=True,
-            )
-            if gxe_dummies.shape[1] > 0:
-                z_list.append(gxe_dummies)
-                z_names.append(gxe_name)
+            if int(env_key.nunique(dropna=False)) > 1:
+                gxe_key = (sample_ids_sub + "@@" + env_key).astype("string")
+                gxe_dummies, _ = _onehot_encode_series(
+                    gxe_key,
+                    prefix=gxe_name,
+                    drop_first=False,
+                    sparse_output=True,
+                )
+                if gxe_dummies.shape[1] > 0:
+                    z_list.append(gxe_dummies)
+                    z_names.append(gxe_name)
+                else:
+                    logger.warning(
+                        f"Trait {trait}: sample×env random effect expanded to 0 columns; use fallback H2."
+                    )
             else:
                 logger.warning(
-                    f"Trait {trait}: sample×env random effect expanded to 0 columns; use fallback H2."
+                    f"Trait {trait}: env columns have only one level after filtering; sample×env term skipped."
                 )
 
         for term in random_terms:
@@ -719,6 +726,17 @@ def main() -> None:
                         (z_names[i], float(rand_var[i]), float(pve[i])) for i in range(len(z_names))
                     ]
 
+        # With one observation per ID and no additional varying random structure,
+        # Vg and Ve are not separately identifiable; the optimizer often returns
+        # an artificial ~50/50 split, which should not be reported as H2.
+        if single_obs_per_id and z_names == [sample_col]:
+            if np.isfinite(h2):
+                logger.warning(
+                    f"Trait {trait}: only one observation per sample ID with no varying env/random terms; hsqr is non-identifiable and set to NA."
+                )
+            h2 = np.nan
+            status = "warning_single_obs_nonidentifiable_h2"
+
         # Fixed effects stats
         beta, se, pval = _gls_fixed_stats_from_blup(model, z_list)
         fx_names = ["Intercept"] + x_names
@@ -755,7 +773,7 @@ def main() -> None:
                 "ve": float(ve) if np.isfinite(ve) else np.nan,
                 "pve_e": float(pve_e) if np.isfinite(pve_e) else np.nan,
                 "elapsed_sec": float(time.time() - step_t0),
-                "status": "ok",
+                "status": status,
             }
         )
 

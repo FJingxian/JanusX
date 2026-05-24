@@ -10,7 +10,8 @@ Input table
 
 Examples
 --------
-  jx reml -file test.reml.txt -rh 0 -rh 1 -rh 2 -n 3 -o test -prefix reml
+  jx reml -file pheno.tsv -l sample_id -e year,loc -o outdir
+  jx reml -file pheno.tsv -l sample_id -e year,loc -f PCA1,PCA2 -r block -k data.cGRM.npy -p Yield
 """
 
 from __future__ import annotations
@@ -29,6 +30,7 @@ import numpy as np
 import pandas as pd
 from scipy import sparse
 from scipy.linalg import cho_solve
+from scipy.optimize import minimize
 from scipy.sparse.linalg import spsolve
 from scipy.stats import t as student_t
 
@@ -69,6 +71,23 @@ class _LmmNullStats:
 class _Stage1BlueResult:
     sample_ids: list[str]
     values: np.ndarray
+
+
+@dataclass
+class _JointKernelResult:
+    va: float
+    vline: float
+    h2_raw: float
+    beta: np.ndarray
+    add_blup: np.ndarray
+    line_blup: np.ndarray
+    noise_mean: float
+
+
+_JOINT_VAR_FLOOR = 1e-10
+_JOINT_LOG_FLOOR = -24.0
+_JOINT_LOG_CEIL = 24.0
+_JOINT_OBJ_PENALTY = 1e60
 
 
 def _split_tokens(values: Iterable[str] | None) -> list[str]:
@@ -197,7 +216,7 @@ def _resolve_columns(
     data_cols: list[str],
     label: str,
     *,
-    index_base: int = 1,
+    index_base: int = 0,
 ) -> list[str]:
     if len(tokens) == 0:
         return []
@@ -211,7 +230,7 @@ def _resolve_columns(
         t = str(tk).strip()
         if t == "":
             continue
-        # Support numeric range syntax like "1:3" / "1-3" (inclusive, 1-based).
+        # Support numeric range syntax like "0:3" / "0-3" (inclusive).
         range_sep = None
         if ":" in t:
             range_sep = ":"
@@ -1001,12 +1020,317 @@ def _fit_stage1_blue_weighted_ls(
     )
 
 
+def _line_level_noise_diag(
+    sub: pd.DataFrame,
+    *,
+    line_col: str,
+    env_cols: list[str],
+    line_ids: list[str],
+    vge: float,
+    ve: float,
+) -> np.ndarray:
+    sid = sub[line_col].astype("string").fillna("NA").astype(str)
+    env_key = _combine_key(sub, env_cols, "__ENV__").astype(str)
+
+    env_per_line = (
+        pd.DataFrame({"line": sid, "env": env_key})
+        .drop_duplicates()
+        .groupby("line", sort=False)["env"]
+        .nunique()
+    )
+    plot_per_line = sid.groupby(sid, sort=False).size()
+
+    env_counts = np.asarray(
+        [float(env_per_line.get(str(sid_i), 1.0)) for sid_i in line_ids],
+        dtype=float,
+    )
+    plot_counts = np.asarray(
+        [float(plot_per_line.get(str(sid_i), 1.0)) for sid_i in line_ids],
+        dtype=float,
+    )
+    vge_use = 0.0 if (not np.isfinite(vge)) or vge < 0.0 else float(vge)
+    ve_use = 0.0 if (not np.isfinite(ve)) or ve < 0.0 else float(ve)
+    return (vge_use / np.maximum(env_counts, 1.0)) + (ve_use / np.maximum(plot_counts, 1.0))
+
+
+# Reserved for future re-activation of the joint additive + nonadditive REML path.
+# The active narrow-sense workflow is currently:
+#   stage-1 BLUE -> stage-2 GWAS null LMM (kinship only) -> h2/prediction.
+def _prepare_joint_kernel_inputs(
+    y_line: np.ndarray,
+    *,
+    kinship: np.ndarray,
+    noise_diag: np.ndarray,
+    x_fixed: np.ndarray | None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
+    y = np.asarray(y_line, dtype=float).reshape(-1, 1)
+    n = int(y.shape[0])
+    if n <= 1:
+        raise ValueError("Need at least 2 lines for joint kernel fit.")
+
+    k = np.asarray(kinship, dtype=float)
+    if k.shape != (n, n):
+        raise ValueError(f"kinship shape mismatch: got {k.shape}, expected {(n, n)}")
+    k = (k + k.T) / 2.0
+    k_diag_mean = float(np.mean(np.diag(k)))
+    if (not np.isfinite(k_diag_mean)) or k_diag_mean <= 0.0:
+        raise ValueError(f"Invalid kinship mean diagonal: {k_diag_mean}")
+    k = k / k_diag_mean
+
+    d = np.asarray(noise_diag, dtype=float).reshape(-1)
+    if d.shape[0] != n:
+        raise ValueError(f"noise_diag length mismatch: got {d.shape[0]}, expected {n}")
+    d = np.where(np.isfinite(d) & (d >= 0.0), d, 0.0)
+    d_mean = float(np.mean(d)) if d.size > 0 else 0.0
+
+    if x_fixed is None:
+        x = np.ones((n, 1), dtype=float)
+    else:
+        xf = np.asarray(x_fixed, dtype=float)
+        if xf.shape[0] != n:
+            raise ValueError(f"x_fixed row mismatch: got {xf.shape[0]}, expected {n}")
+        x = np.concatenate([np.ones((n, 1), dtype=float), xf], axis=1)
+
+    return y, x, k, d, d_mean
+
+
+def _joint_kernel_state(
+    *,
+    y: np.ndarray,
+    x: np.ndarray,
+    kinship: np.ndarray,
+    noise_diag: np.ndarray,
+    noise_mean: float,
+    va: float,
+    vline: float,
+) -> tuple[float, _JointKernelResult]:
+    va_use = float(max(float(va), _JOINT_VAR_FLOOR))
+    vline_use = float(max(float(vline), _JOINT_VAR_FLOOR))
+    n = int(y.shape[0])
+
+    v = va_use * kinship
+    v.flat[:: n + 1] += noise_diag + vline_use
+    v = (v + v.T) / 2.0
+
+    l = np.linalg.cholesky(v)
+    vinvx = cho_solve((l, True), x)
+    vinvy = cho_solve((l, True), y)
+    xt_vinv_x = (x.T @ vinvx + (x.T @ vinvx).T) / 2.0
+    lx = np.linalg.cholesky(xt_vinv_x)
+    beta = np.linalg.solve(xt_vinv_x, x.T @ vinvy)
+    r = y - x @ beta
+    vinvr = cho_solve((l, True), r)
+
+    quad = float((r.T @ vinvr)[0, 0])
+    if (not np.isfinite(quad)) or quad <= 0.0:
+        raise ValueError(f"Invalid joint REML quadratic form: {quad}")
+    log_det_v = float(2.0 * np.sum(np.log(np.diag(l))))
+    log_det_xt = float(2.0 * np.sum(np.log(np.diag(lx))))
+    nll = 0.5 * (log_det_v + log_det_xt + quad)
+    if not np.isfinite(nll):
+        raise ValueError("Joint REML objective became non-finite.")
+
+    add_blup = va_use * (kinship @ vinvr)
+    line_blup = vline_use * vinvr
+    denom = va_use + vline_use + noise_mean
+    h2_raw = float(va_use / denom) if denom > 0.0 else np.nan
+    return nll, _JointKernelResult(
+        va=va_use,
+        vline=vline_use,
+        h2_raw=h2_raw,
+        beta=np.asarray(beta, dtype=float).reshape(-1),
+        add_blup=np.asarray(add_blup, dtype=float).reshape(-1),
+        line_blup=np.asarray(line_blup, dtype=float).reshape(-1),
+        noise_mean=float(noise_mean),
+    )
+
+
+def _fit_joint_line_kernel_approx(
+    y_line: np.ndarray,
+    *,
+    kinship: np.ndarray,
+    noise_diag: np.ndarray,
+    x_fixed: np.ndarray | None,
+) -> _JointKernelResult:
+    y, x, k, d, d_mean = _prepare_joint_kernel_inputs(
+        y_line,
+        kinship=kinship,
+        noise_diag=noise_diag,
+        x_fixed=x_fixed,
+    )
+    n = int(y.shape[0])
+
+    beta_ols, *_ = np.linalg.lstsq(x, y, rcond=None)
+    r_ols = (y - x @ beta_ols).reshape(-1)
+
+    kk = float(np.sum(k * k))
+    ki = float(np.trace(k))
+    ii = float(n)
+    ks = float(r_ols @ (k @ r_ols) - np.sum(np.diag(k) * d))
+    is_ = float(np.dot(r_ols, r_ols) - np.sum(d))
+    a = np.array([[kk, ki], [ki, ii]], dtype=float)
+    b = np.array([ks, is_], dtype=float)
+
+    def _loss(va: float, vline: float) -> float:
+        return (
+            (va * va * kk)
+            + (2.0 * va * vline * ki)
+            + (vline * vline * ii)
+            - (2.0 * va * ks)
+            - (2.0 * vline * is_)
+        )
+
+    cand: list[tuple[float, float]] = []
+    try:
+        sol = np.linalg.solve(a + np.eye(2, dtype=float) * 1e-12, b)
+        cand.append((max(float(sol[0]), 0.0), max(float(sol[1]), 0.0)))
+    except Exception:
+        pass
+    cand.extend(
+        [
+            (max(ks / max(kk, 1e-12), 0.0), 0.0),
+            (0.0, max(is_ / max(ii, 1e-12), 0.0)),
+            (0.0, 0.0),
+        ]
+    )
+    va, vline = min(cand, key=lambda vv: _loss(vv[0], vv[1]))
+    _nll, state = _joint_kernel_state(
+        y=y,
+        x=x,
+        kinship=k,
+        noise_diag=d,
+        noise_mean=d_mean,
+        va=max(float(va), _JOINT_VAR_FLOOR),
+        vline=max(float(vline), _JOINT_VAR_FLOOR),
+    )
+    return state
+
+
+def _fit_joint_line_kernel_exact(
+    y_line: np.ndarray,
+    *,
+    kinship: np.ndarray,
+    noise_diag: np.ndarray,
+    x_fixed: np.ndarray | None,
+    maxiter: int,
+) -> _JointKernelResult:
+    y, x, k, d, d_mean = _prepare_joint_kernel_inputs(
+        y_line,
+        kinship=kinship,
+        noise_diag=noise_diag,
+        x_fixed=x_fixed,
+    )
+
+    y_center = y - np.mean(y, axis=0, keepdims=True)
+    y_var = float(np.var(y_center.reshape(-1), ddof=1)) if int(y.shape[0]) > 1 else 1.0
+    if (not np.isfinite(y_var)) or y_var <= 0.0:
+        y_var = 1.0
+
+    starts: list[tuple[float, float]] = []
+    try:
+        approx = _fit_joint_line_kernel_approx(
+            y.reshape(-1),
+            kinship=k,
+            noise_diag=d,
+            x_fixed=x_fixed,
+        )
+        starts.append((float(approx.va), float(approx.vline)))
+    except Exception:
+        pass
+    starts.extend(
+        [
+            (max(y_var * 0.50, _JOINT_VAR_FLOOR), max(y_var * 0.50, _JOINT_VAR_FLOOR)),
+            (max(y_var, _JOINT_VAR_FLOOR), _JOINT_VAR_FLOOR),
+            (_JOINT_VAR_FLOOR, max(y_var, _JOINT_VAR_FLOOR)),
+            (max(d_mean, _JOINT_VAR_FLOOR), max(d_mean, _JOINT_VAR_FLOOR)),
+        ]
+    )
+
+    start_unique: list[tuple[float, float]] = []
+    seen_start: set[tuple[int, int]] = set()
+    for va0, vline0 in starts:
+        key = (
+            int(np.round(np.log10(max(float(va0), _JOINT_VAR_FLOOR)) * 1000.0)),
+            int(np.round(np.log10(max(float(vline0), _JOINT_VAR_FLOOR)) * 1000.0)),
+        )
+        if key in seen_start:
+            continue
+        seen_start.add(key)
+        start_unique.append(
+            (
+                max(float(va0), _JOINT_VAR_FLOOR),
+                max(float(vline0), _JOINT_VAR_FLOOR),
+            )
+        )
+
+    best_fun = np.inf
+    best_state: _JointKernelResult | None = None
+    best_eta: np.ndarray | None = None
+
+    def _eta_to_var(eta: np.ndarray) -> tuple[float, float]:
+        eta = np.asarray(eta, dtype=float).reshape(-1)
+        eta = np.clip(eta, _JOINT_LOG_FLOOR, _JOINT_LOG_CEIL)
+        return float(np.exp(eta[0])), float(np.exp(eta[1]))
+
+    def _objective(eta: np.ndarray) -> float:
+        try:
+            va_now, vline_now = _eta_to_var(eta)
+            nll, _state = _joint_kernel_state(
+                y=y,
+                x=x,
+                kinship=k,
+                noise_diag=d,
+                noise_mean=d_mean,
+                va=va_now,
+                vline=vline_now,
+            )
+            return float(nll)
+        except Exception:
+            return _JOINT_OBJ_PENALTY
+
+    for va0, vline0 in start_unique:
+        eta0 = np.log(np.asarray([va0, vline0], dtype=float))
+        eta0 = np.clip(eta0, _JOINT_LOG_FLOOR, _JOINT_LOG_CEIL)
+        res = minimize(
+            _objective,
+            eta0,
+            method="L-BFGS-B",
+            bounds=[(_JOINT_LOG_FLOOR, _JOINT_LOG_CEIL), (_JOINT_LOG_FLOOR, _JOINT_LOG_CEIL)],
+            options={"maxiter": max(25, int(maxiter))},
+        )
+        candidates = [np.asarray(res.x, dtype=float).reshape(-1), eta0]
+        for eta_try in candidates:
+            obj = _objective(eta_try)
+            if (not np.isfinite(obj)) or obj >= best_fun:
+                continue
+            try:
+                va_now, vline_now = _eta_to_var(eta_try)
+                _nll, state = _joint_kernel_state(
+                    y=y,
+                    x=x,
+                    kinship=k,
+                    noise_diag=d,
+                    noise_mean=d_mean,
+                    va=va_now,
+                    vline=vline_now,
+                )
+            except Exception:
+                continue
+            best_fun = float(obj)
+            best_state = state
+            best_eta = np.asarray(eta_try, dtype=float).reshape(-1)
+
+    if best_state is None or best_eta is None or (not np.isfinite(best_fun)):
+        raise RuntimeError("Exact joint REML failed to converge to a finite solution.")
+    return best_state
+
+
 def _resolve_cli_columns(
     values: Iterable[str] | None,
     candidates: list[str],
     label: str,
 ) -> list[str]:
-    return _resolve_columns(_split_tokens(values), candidates, label, index_base=1)
+    return _resolve_columns(_split_tokens(values), candidates, label, index_base=0)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1036,7 +1360,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--line",
         default=None,
         metavar="COL",
-        help="Line/sample ID column. Default: first column.",
+        help="Line/sample ID column. Numeric indices are 0-based on the original input table. Default: first column.",
     )
     opt.add_argument(
         "-e",
@@ -1045,7 +1369,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         metavar="COL",
         help=(
-            "Environment factor column(s), e.g. year,loc. They are combined as one ENV factor."
+            "Environment factor column(s), e.g. year,loc. Numeric indices are 0-based on the original input table. They are combined as one ENV factor."
         ),
     )
     opt.add_argument(
@@ -1055,7 +1379,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         metavar="COL",
         help=(
-            "Additional fixed covariates. Numeric columns stay numeric; categorical columns are one-hot encoded."
+            "Additional fixed covariates. Numeric indices are 0-based on the original input table. Numeric columns stay numeric; categorical columns are one-hot encoded."
         ),
     )
     opt.add_argument(
@@ -1065,7 +1389,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         metavar="COL",
         help=(
-            "Additional random nuisance covariates. Numeric columns stay numeric; categorical columns are one-hot encoded."
+            "Additional random nuisance covariates. Numeric indices are 0-based on the original input table. Numeric columns stay numeric; categorical columns are one-hot encoded."
         ),
     )
     opt.add_argument(
@@ -1075,7 +1399,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         metavar="COL",
         help=(
-            "Trait column(s). If omitted, all numeric non-design columns are used."
+            "Trait column(s). Numeric indices are 0-based on the original input table. If omitted, all numeric non-design columns are used."
         ),
     )
     opt.add_argument(
@@ -1152,9 +1476,17 @@ def main() -> None:
     df[line_col] = df[line_col].astype("string").fillna("NA").astype(str)
 
     effect_cols = [c for c in all_cols if c != line_col]
-    env_cols = _resolve_cli_columns(args.env, effect_cols, "-e/--env")
-    fixed_cols = _resolve_cli_columns(args.fixed, effect_cols, "-f/--fixed")
-    random_cols = _resolve_cli_columns(args.random, effect_cols, "-r/--random")
+    env_cols = _resolve_cli_columns(args.env, all_cols, "-e/--env")
+    fixed_cols = _resolve_cli_columns(args.fixed, all_cols, "-f/--fixed")
+    random_cols = _resolve_cli_columns(args.random, all_cols, "-r/--random")
+
+    for label, cols in (
+        ("-e/--env", env_cols),
+        ("-f/--fixed", fixed_cols),
+        ("-r/--random", random_cols),
+    ):
+        if line_col in cols:
+            raise ValueError(f"{label} cannot reuse the line/sample column: {line_col}")
 
     overlap_effects = (set(env_cols) & set(fixed_cols)) | (set(env_cols) & set(random_cols)) | (set(fixed_cols) & set(random_cols))
     if len(overlap_effects) > 0:
@@ -1166,11 +1498,11 @@ def main() -> None:
     reserved_cols = set(env_cols) | set(fixed_cols) | set(random_cols)
     trait_tokens = _split_tokens(args.pheno)
     if len(trait_tokens) > 0:
-        trait_cols = _resolve_cli_columns(trait_tokens, effect_cols, "-p/--pheno")
-        conflict = sorted(set(trait_cols) & reserved_cols)
+        trait_cols = _resolve_cli_columns(trait_tokens, all_cols, "-p/--pheno")
+        conflict = sorted((set(trait_cols) & reserved_cols) | ({line_col} & set(trait_cols)))
         if len(conflict) > 0:
             raise ValueError(
-                "Trait column(s) overlap with env/fixed/random columns: "
+                "Trait column(s) overlap with line/env/fixed/random columns: "
                 + ", ".join(conflict)
             )
     else:
@@ -1229,6 +1561,7 @@ def main() -> None:
                     ("GRM file", str(args.grm) if args.grm is not None else "None"),
                     ("GRM ID file", "auto-detect <grm>.id" if args.grm is not None else "None"),
                     ("GRM n", int(grm_ctx.matrix.shape[0]) if grm_ctx is not None else "NA"),
+                    ("Narrow path", "BLUE -> GWAS null LMM" if args.grm is not None else "None"),
                 ],
             ),
             (
@@ -1284,6 +1617,9 @@ def main() -> None:
                         "hsqr": np.nan,
                         "h2_narrow": np.nan,
                         "h2_blue_raw": np.nan,
+                        "va_joint": np.nan,
+                        "vline_joint": np.nan,
+                        "noise_mean_joint": np.nan,
                         "pve": np.nan,
                         "lambda": np.nan,
                         "vg": np.nan,
@@ -1293,6 +1629,7 @@ def main() -> None:
                         "h_plot": np.nan,
                         "blue_n": np.nan,
                         "missing_grm": np.nan,
+                        "narrow_method": "skipped",
                         "elapsed_sec": float(time.time() - step_t0),
                         "status": "skipped_too_few_observations",
                     }
@@ -1455,7 +1792,11 @@ def main() -> None:
 
             h2_narrow = np.nan
             h2_blue_raw = np.nan
+            va_joint = np.nan
+            vline_joint = np.nan
+            noise_mean_joint = np.nan
             missing_grm = np.nan
+            narrow_method = "none"
             blue_n = int(len(stage1_blue.sample_ids))
             if grm_ctx is not None:
                 blue_trait_df = pd.DataFrame(
@@ -1495,40 +1836,66 @@ def main() -> None:
                         trait=trait,
                         logger=logger,
                     )
-                    lmm = LMM(
-                        y=kept[trait].to_numpy(dtype=float),
-                        X=x_stage2,
-                        kinship=kinship,
+                    noise_diag = _line_level_noise_diag(
+                        sub,
+                        line_col=line_col,
+                        env_cols=env_cols,
+                        line_ids=kept_ids,
+                        vge=vge,
+                        ve=ve,
                     )
-                    h2_blue_raw = float(lmm.pve) if np.isfinite(lmm.pve) else np.nan
-                    if np.isfinite(hsqr) and np.isfinite(h2_blue_raw):
-                        h2_narrow = float(min(hsqr, h2_blue_raw))
-                    else:
+                    try:
+                        # Future hook:
+                        #   exact/approx joint additive + line nonadditive REML
+                        # is intentionally disabled for now. We currently use the
+                        # BLUE phenotype directly in the GWAS null model.
+                        lmm = LMM(
+                            y=kept[trait].to_numpy(dtype=float),
+                            X=x_stage2,
+                            kinship=kinship,
+                        )
+                        h2_blue_raw = float(lmm.pve) if np.isfinite(lmm.pve) else np.nan
                         h2_narrow = h2_blue_raw
-                    narrow_stats = _lmm_null_stats(lmm)
-                    g_map = {
-                        kept_ids[i]: float(narrow_stats.g_blup[i])
-                        for i in range(len(kept_ids))
-                    }
-                    assert gblup_out is not None
-                    gblup_out[trait] = (
-                        gblup_out[line_col]
-                        .astype(str)
-                        .map(g_map)
-                        .to_numpy(dtype=float)
-                    )
+                        noise_mean_joint = float(np.mean(noise_diag)) if noise_diag.size > 0 else np.nan
+                        narrow_method = "blue_null_lmm"
+                        if np.isfinite(hsqr) and np.isfinite(h2_narrow) and (h2_narrow > hsqr * 1.02):
+                            logger.warning(
+                                f"Trait {trait}: BLUE-null narrow h2 ({h2_narrow:.6g}) exceeds broad H2 ({hsqr:.6g}); broad and narrow estimators are on different effective scales."
+                            )
+                        narrow_stats = _lmm_null_stats(lmm)
+                        g_map = {
+                            kept_ids[i]: float(narrow_stats.g_blup[i])
+                            for i in range(len(kept_ids))
+                        }
+                        assert gblup_out is not None
+                        gblup_out[trait] = (
+                            gblup_out[line_col]
+                            .astype(str)
+                            .map(g_map)
+                            .to_numpy(dtype=float)
+                        )
+                    except Exception as lmm_exc:
+                        logger.warning(
+                            f"Trait {trait}: BLUE-null GWAS LMM failed ({type(lmm_exc).__name__}: {lmm_exc}); narrow-sense h2 skipped."
+                        )
+                        narrow_method = "failed_blue_null_lmm"
                 else:
                     logger.warning(
                         f"Trait {trait}: too few lines overlap with GRM after filtering; narrow-sense h2 skipped."
                     )
+                    narrow_method = "skipped_grm_overlap"
 
             logger.info("-" * 72)
             logger.info(
-                f"{success_symbol()} Trait={trait} | obs={used_obs} | lines={used_lines} | H2={_fmt_metric(hsqr)} | h2={_fmt_metric(h2_narrow)} | elapsed={format_elapsed(time.time() - step_t0)}"
+                f"{success_symbol()} Trait={trait} | obs={used_obs} | lines={used_lines} | H2={_fmt_metric(hsqr)} | h2={_fmt_metric(h2_narrow)} | method={narrow_method} | elapsed={format_elapsed(time.time() - step_t0)}"
             )
             if np.isfinite(h2_blue_raw):
                 logger.info(
                     f"  narrow(raw BLUE scale)={_fmt_metric(h2_blue_raw)}"
+                )
+            if np.isfinite(va_joint):
+                logger.info(
+                    f"  joint additive={_fmt_metric(va_joint)} | joint line_nonadd={_fmt_metric(vline_joint)} | joint noise_mean={_fmt_metric(noise_mean_joint)}"
                 )
 
             summary_rows.append(
@@ -1543,6 +1910,9 @@ def main() -> None:
                     "hsqr": float(hsqr) if np.isfinite(hsqr) else np.nan,
                     "h2_narrow": float(h2_narrow) if np.isfinite(h2_narrow) else np.nan,
                     "h2_blue_raw": float(h2_blue_raw) if np.isfinite(h2_blue_raw) else np.nan,
+                    "va_joint": float(va_joint) if np.isfinite(va_joint) else np.nan,
+                    "vline_joint": float(vline_joint) if np.isfinite(vline_joint) else np.nan,
+                    "noise_mean_joint": float(noise_mean_joint) if np.isfinite(noise_mean_joint) else np.nan,
                     "pve": float(pve_line) if np.isfinite(pve_line) else np.nan,
                     "lambda": float(lbd) if np.isfinite(lbd) else np.nan,
                     "vg": float(vg) if np.isfinite(vg) else np.nan,
@@ -1553,6 +1923,7 @@ def main() -> None:
                     "r": float(r_eff),
                     "blue_n": float(blue_n),
                     "missing_grm": float(missing_grm) if np.isfinite(missing_grm) else np.nan,
+                    "narrow_method": narrow_method,
                     "elapsed_sec": float(time.time() - step_t0),
                     "status": status,
                 }
@@ -1574,6 +1945,9 @@ def main() -> None:
                     "hsqr": np.nan,
                     "h2_narrow": np.nan,
                     "h2_blue_raw": np.nan,
+                    "va_joint": np.nan,
+                    "vline_joint": np.nan,
+                    "noise_mean_joint": np.nan,
                     "pve": np.nan,
                     "lambda": np.nan,
                     "vg": np.nan,
@@ -1583,6 +1957,7 @@ def main() -> None:
                     "h_plot": np.nan,
                     "blue_n": np.nan,
                     "missing_grm": np.nan,
+                    "narrow_method": "failed",
                     "elapsed_sec": float(time.time() - step_t0),
                     "status": f"failed:{type(exc).__name__}",
                 }

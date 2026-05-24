@@ -1,7 +1,11 @@
 use crate::ml::common::{ImportanceKind, PermutationConfig, ResponseKind};
-use crate::ml::extra_trees::{feature_scores_extra_trees, ExtraTreesConfig};
-use crate::ml::gbdt::{feature_scores_gbdt, feature_scores_gbdt_permutation};
-use crate::ml::rf::{feature_scores_random_forest, feature_scores_random_forest_permutation};
+use crate::ml::extra_trees::{feature_scores_extra_trees_grouped, ExtraTreesConfig};
+use crate::ml::gbdt::{
+    feature_scores_gbdt_grouped, feature_scores_gbdt_permutation_grouped,
+};
+use crate::ml::rf::{
+    feature_scores_random_forest_grouped, feature_scores_random_forest_permutation_grouped,
+};
 use crate::ml::univariate::{
     feature_scores_abs_corr_binary_x, feature_scores_abs_mcc_binary_x,
     feature_scores_abs_mean_diff_binary_x, feature_scores_fisher_binary_x,
@@ -49,6 +53,38 @@ pub fn compute_feature_scores(
     importance: ImportanceKind,
     perm_cfg: PermutationConfig,
 ) -> Result<Vec<f64>, String> {
+    compute_feature_scores_grouped(
+        x_rows,
+        y,
+        response,
+        engine,
+        cfg,
+        importance,
+        perm_cfg,
+        None,
+    )
+}
+
+pub fn compute_feature_scores_grouped(
+    x_rows: &[Vec<u8>],
+    y: &[f64],
+    response: ResponseKind,
+    engine: MlEngine,
+    cfg: ExtraTreesConfig,
+    importance: ImportanceKind,
+    perm_cfg: PermutationConfig,
+    feature_group_ids: Option<&[usize]>,
+) -> Result<Vec<f64>, String> {
+    if let Some(group_ids) = feature_group_ids {
+        if group_ids.len() != x_rows.len() {
+            return Err(format!(
+                "feature_group_ids length mismatch: got {}, expected {} features",
+                group_ids.len(),
+                x_rows.len()
+            ));
+        }
+    }
+
     let resolved = match engine {
         MlEngine::Auto => match importance {
             ImportanceKind::Imp => MlEngine::ExtraTrees,
@@ -59,7 +95,7 @@ pub fn compute_feature_scores(
 
     let scores = match (resolved, importance) {
         (MlEngine::ExtraTrees, ImportanceKind::Imp) => {
-            feature_scores_extra_trees(x_rows, y, response, cfg)
+            feature_scores_extra_trees_grouped(x_rows, y, response, cfg, feature_group_ids)
         }
         (MlEngine::ExtraTrees, ImportanceKind::Permutation) => {
             return Err(
@@ -68,20 +104,34 @@ pub fn compute_feature_scores(
             );
         }
         (MlEngine::RandomForest, ImportanceKind::Imp) => {
-            feature_scores_random_forest(x_rows, y, response, cfg)
+            feature_scores_random_forest_grouped(x_rows, y, response, cfg, feature_group_ids)
         }
         (MlEngine::RandomForest, ImportanceKind::Permutation) => {
-            feature_scores_random_forest_permutation(x_rows, y, response, cfg, perm_cfg)
+            feature_scores_random_forest_permutation_grouped(
+                x_rows,
+                y,
+                response,
+                cfg,
+                perm_cfg,
+                feature_group_ids,
+            )
         }
         (MlEngine::Gbdt, ImportanceKind::Imp)
         | (MlEngine::Gbdt2, ImportanceKind::Imp)
         | (MlEngine::LightGbm, ImportanceKind::Imp) => {
-            feature_scores_gbdt(x_rows, y, response, cfg)
+            feature_scores_gbdt_grouped(x_rows, y, response, cfg, feature_group_ids)
         }
         (MlEngine::Gbdt, ImportanceKind::Permutation)
         | (MlEngine::Gbdt2, ImportanceKind::Permutation)
         | (MlEngine::LightGbm, ImportanceKind::Permutation) => {
-            feature_scores_gbdt_permutation(x_rows, y, response, cfg, perm_cfg)
+            feature_scores_gbdt_permutation_grouped(
+                x_rows,
+                y,
+                response,
+                cfg,
+                perm_cfg,
+                feature_group_ids,
+            )
         }
         (MlEngine::Corr, ImportanceKind::Imp) | (MlEngine::Corr, ImportanceKind::Permutation) => {
             feature_scores_abs_corr_binary_x(x_rows, y)

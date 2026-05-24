@@ -45,6 +45,7 @@ import time
 import socket
 import argparse
 import logging
+import re
 import sys
 import threading
 import warnings
@@ -159,7 +160,6 @@ from janusx.script._common.packedctx import (
     prepare_packed_ctx_from_plink,
 )
 
-from janusx.script._common.colspec import parse_zero_based_index_specs
 from janusx.assoc.workflow_ui import (
     _format_progress_metric,
     _log_file_only,
@@ -192,6 +192,7 @@ _FASTLMM_PVE_LOW = 0.05
 _FASTLMM_PVE_HIGH = 0.995
 _SECTION_WIDTH = 60
 _GWAS_PROGRESS_BAR_WIDTH = 30
+_GWAS_COL_RANGE_RE = re.compile(r"^\s*(\d+)\s*([:-])\s*(\d+)\s*$")
 
 # ======================================================================
 # Basic utilities
@@ -246,6 +247,72 @@ def _fastlmm_should_switch_to_lmm(pve: Optional[float]) -> bool:
     if not np.isfinite(v):
         return False
     return bool(v > _FASTLMM_PVE_HIGH)
+
+
+def _parse_gwas_pheno_col_specs(
+    values: Optional[list[object]],
+    *,
+    label: str = "-n/--n",
+) -> Optional[list[object]]:
+    """
+    Parse GWAS phenotype selectors from CLI.
+
+    Supported forms:
+      - zero-based column index: 0
+      - inclusive numeric range: 0:3 / 0-3
+      - column name: TraitA
+      - mixed use across repeated flags
+    """
+    if values is None:
+        return None
+
+    tokens: list[str] = []
+    for raw in values:
+        s = str(raw).strip()
+        if s == "":
+            continue
+        for part in s.split(","):
+            p = str(part).strip()
+            if p != "":
+                tokens.append(p)
+
+    if len(tokens) == 0:
+        return []
+
+    parsed: list[object] = []
+    for tk in tokens:
+        m = _GWAS_COL_RANGE_RE.match(tk)
+        if m is not None:
+            left = int(m.group(1))
+            right = int(m.group(3))
+            step = 1 if right >= left else -1
+            parsed.extend(int(i) for i in range(left, right + step, step))
+            continue
+        if tk.isdigit():
+            parsed.append(int(tk))
+            continue
+        parsed.append(tk)
+
+    out: list[object] = []
+    seen: set[tuple[str, str]] = set()
+    for item in parsed:
+        if isinstance(item, int):
+            if item < 0:
+                raise ValueError(
+                    f"Invalid {label} index: {item}. Indices must be >= 0 (zero-based)."
+                )
+            key = ("i", str(int(item)))
+            val: object = int(item)
+        else:
+            text = str(item).strip()
+            if text == "":
+                continue
+            key = ("s", text)
+            val = text
+        if key not in seen:
+            out.append(val)
+            seen.add(key)
+    return out
 
 
 def _mixed_model_switch_to_lm_decision(
@@ -1095,7 +1162,7 @@ def _load_covariates_for_models(
 
 def load_phenotype(
     phenofile: str,
-    ncol: Union[list[int] , None],
+    ncol: Union[list[object], None],
     logger,
     id_col: int = 0,
     use_spinner: bool = False,
@@ -1141,9 +1208,12 @@ def load_phenotype(
             return ["comma", "tab", "whitespace"]
         return ["whitespace", "tab", "comma"]
 
+    requested_specs: Union[list[object], None] = None
     ncol_requested: Union[list[int], None] = None
     if ncol is not None:
-        ncol_requested = [int(i) for i in ncol]
+        requested_specs = list(ncol)
+        if all(isinstance(i, int) for i in requested_specs):
+            ncol_requested = [int(i) for i in requested_specs]
 
     # If phenotype columns are explicitly requested, read only ID + target cols.
     # ncol indices are relative to phenotype columns (after removing ID/FID).
@@ -1252,13 +1322,23 @@ def load_phenotype(
         raise ValueError(msg)
 
     if ncol is not None:
-        requested_ncol = [int(i) for i in ncol]
-        valid_ncol: list[int]
-        invalid_ncol: list[int]
-        ncol_take: list[int]
+        if requested_specs is None:
+            requested_specs = list(ncol)
 
-        # If usecols pre-filtering is enabled, requested_ncol are global phenotype
-        # indices; map them back to local positions in the reduced pheno table.
+        if len(requested_specs) == 0:
+            msg = (
+                "No phenotype selector was provided for -n/--n. "
+                "Use zero-based indices, ranges, or column names, e.g. "
+                "-n 0 -n 3 or -n TraitA."
+            )
+            logger.error(msg)
+            raise ValueError(msg)
+
+        ncol_take: list[int] = []
+        selected_ncol = []
+        invalid_specs: list[str] = []
+        seen_local: set[int] = set()
+
         if usecols is not None and ncol_requested is not None and int(id_col) in (0, 1):
             offset = 1 if int(id_col) == 0 else 2
             selected_file_cols = [int(c) for c in usecols if int(c) != int(id_col)]
@@ -1266,37 +1346,85 @@ def load_phenotype(
                 selected_file_cols = [c for c in selected_file_cols if c != 0]
             selected_global_ncol = [int(c) - offset for c in selected_file_cols]
             global_to_local = {g: i for i, g in enumerate(selected_global_ncol)}
-            valid_ncol = [i for i in requested_ncol if i in global_to_local]
-            invalid_ncol = [i for i in requested_ncol if i not in global_to_local]
-            ncol_take = [int(global_to_local[i]) for i in valid_ncol]
+            for spec in requested_specs:
+                idx = int(spec)
+                if idx not in global_to_local:
+                    invalid_specs.append(str(spec))
+                    continue
+                local_idx = int(global_to_local[idx])
+                if local_idx in seen_local:
+                    continue
+                seen_local.add(local_idx)
+                ncol_take.append(local_idx)
+                selected_ncol.append(idx)
         else:
-            valid_ncol = [i for i in requested_ncol if 0 <= int(i) < int(pheno.shape[1])]
-            invalid_ncol = [i for i in requested_ncol if i not in valid_ncol]
-            ncol_take = [int(i) for i in valid_ncol]
+            cols = list(pheno.columns)
+            by_str: dict[str, list[int]] = {}
+            for i, col in enumerate(cols):
+                by_str.setdefault(str(col), []).append(i)
 
-        if len(requested_ncol) == 0:
-            msg = (
-                "No phenotype column index was provided for -n/--n. "
-                "Use zero-based indices, e.g. -n 0 -n 3."
-            )
-            logger.error(msg)
-            raise ValueError(msg)
+            def _resolve_name_to_index(name: object) -> Optional[int]:
+                exact = [i for i, col in enumerate(cols) if col == name]
+                if len(exact) == 1:
+                    return int(exact[0])
+                if len(exact) > 1:
+                    raise ValueError(
+                        f"Ambiguous phenotype selector '{name}': multiple columns match exactly."
+                    )
+                matched = by_str.get(str(name), [])
+                if len(matched) == 1:
+                    return int(matched[0])
+                if len(matched) > 1:
+                    raise ValueError(
+                        f"Ambiguous phenotype selector '{name}': multiple columns share this string form."
+                    )
+                return None
+
+            for spec in requested_specs:
+                local_idx: Optional[int] = None
+                global_idx: Optional[int] = None
+                if isinstance(spec, int):
+                    idx = int(spec)
+                    if 0 <= idx < int(pheno.shape[1]):
+                        local_idx = idx
+                        global_idx = idx
+                    else:
+                        fallback_idx = _resolve_name_to_index(str(spec))
+                        if fallback_idx is not None:
+                            local_idx = int(fallback_idx)
+                            global_idx = int(fallback_idx)
+                else:
+                    resolved_idx = _resolve_name_to_index(spec)
+                    if resolved_idx is not None:
+                        local_idx = int(resolved_idx)
+                        global_idx = int(resolved_idx)
+
+                if local_idx is None or global_idx is None:
+                    invalid_specs.append(str(spec))
+                    continue
+                if local_idx in seen_local:
+                    continue
+                seen_local.add(local_idx)
+                ncol_take.append(local_idx)
+                selected_ncol.append(global_idx)
+
         if len(ncol_take) == 0:
             max_idx = int(pheno.shape[1]) - 1
+            preview = ", ".join(str(c) for c in list(pheno.columns)[:10])
             msg = (
-                "Phenotype column index out of range. "
-                f"requested={requested_ncol}, valid=[0..{max_idx}]"
+                "Requested phenotype selector(s) not found. "
+                f"requested={list(requested_specs)}, valid_index=[0..{max_idx}], "
+                f"columns={preview}"
+                + (" ..." if len(pheno.columns) > 10 else "")
             )
             logger.error(msg)
             raise ValueError(msg)
-        if len(invalid_ncol) > 0:
+        if len(invalid_specs) > 0:
             max_idx = int(pheno.shape[1]) - 1
             logger.warning(
-                "Ignoring out-of-range phenotype indices: "
-                f"{invalid_ncol}. valid=[0..{max_idx}]"
+                "Ignoring unknown phenotype selectors: "
+                f"{invalid_specs}. valid_index=[0..{max_idx}]"
             )
-        ncol = [int(i) for i in valid_ncol]
-        selected_ncol = [int(i) for i in valid_ncol]
         _log_info(
             logger,
             "Phenotypes to be analyzed: " + "\t".join(map(str, pheno.columns[ncol_take])),
@@ -1401,7 +1529,7 @@ def _format_cache_size(nbytes: int) -> str:
 
 def _load_phenotype_with_status(
     phenofile: str,
-    ncol: Union[list[int], None],
+    ncol: Union[list[object], None],
     logger: logging.Logger,
     *,
     id_col: int = 0,
@@ -4629,8 +4757,9 @@ def parse_args(argv: Optional[list[str]] = None):
         "-n", "--n", action="extend", nargs="+", metavar="COL",
         default=None, type=str, dest="ncol",
         help=(
-            "Phenotype column(s), zero-based index (excluding sample ID), "
-            "comma list (e.g. 0,2), or numeric range (e.g. 0:2). "
+            "Phenotype column(s), accepted as zero-based index (excluding sample ID), "
+            "column name, comma list (e.g. 0,2 or TraitA,TraitB), "
+            "or numeric range (e.g. 0:2). "
             "Repeat this flag for multiple traits."
         ),
     )
@@ -4770,7 +4899,7 @@ def parse_args(argv: Optional[list[str]] = None):
     if len(extras) > 0:
         parser.error("unrecognized arguments: " + " ".join(extras))
     try:
-        args.ncol = parse_zero_based_index_specs(args.ncol, label="-n/--n")
+        args.ncol = _parse_gwas_pheno_col_specs(args.ncol, label="-n/--n")
     except ValueError as e:
         parser.error(str(e))
     try:

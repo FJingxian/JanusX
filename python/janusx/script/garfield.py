@@ -7,12 +7,16 @@ import time
 from typing import Optional
 
 import numpy as np
+import pandas as pd
 
 from janusx.assoc.workflow import (
     _inspect_genotype_with_status,
     _load_covariates_for_models,
     _load_phenotype_with_status,
+    load_or_build_grm_with_cache,
+    run_fastlmm_packed_fullrank,
 )
+from janusx.assoc.workflow_cache import _gwas_cache_prefix_with_params
 from janusx.gtools.reader import readanno
 from janusx.script._common.colspec import parse_zero_based_index_specs
 from janusx.script._common.config_render import emit_cli_configuration
@@ -172,6 +176,150 @@ def _safe_trait_label(label: object) -> str:
     return name.replace("/", "_").replace("\\", "_")
 
 
+def _align_square_matrix_to_ids(
+    matrix: np.ndarray,
+    source_ids: Optional[list[str] | np.ndarray],
+    target_ids: list[str] | np.ndarray,
+    *,
+    label: str,
+) -> np.ndarray:
+    target = [str(x) for x in target_ids]
+    arr = np.asarray(matrix, dtype=np.float64)
+    if arr.ndim != 2 or arr.shape[0] != arr.shape[1]:
+        raise ValueError(f"{label} must be square, got shape={arr.shape}")
+    if source_ids is None:
+        if arr.shape[0] != len(target):
+            raise ValueError(
+                f"{label} shape {arr.shape} does not match target sample count {len(target)}."
+            )
+        return np.asarray(arr, dtype=np.float64, order="C")
+
+    source = [str(x) for x in source_ids]
+    if len(source) != arr.shape[0]:
+        raise ValueError(
+            f"{label} ID count mismatch: matrix n={arr.shape[0]} but ids={len(source)}."
+        )
+    if source == target:
+        return np.asarray(arr, dtype=np.float64, order="C")
+
+    index = {sid: i for i, sid in enumerate(source)}
+    missing = [sid for sid in target if sid not in index]
+    if missing:
+        preview = ", ".join(missing[:5])
+        extra = "" if len(missing) <= 5 else f" ... (+{len(missing) - 5} more)"
+        raise ValueError(f"{label} is missing target sample IDs: {preview}{extra}")
+    order = np.asarray([index[sid] for sid in target], dtype=np.intp)
+    return np.asarray(arr[np.ix_(order, order)], dtype=np.float64, order="C")
+
+
+def _ensure_followup_grm(
+    *,
+    existing_grm: Optional[np.ndarray],
+    genofile: str,
+    sample_ids: np.ndarray,
+    n_snps: int,
+    maf_threshold: float,
+    max_missing_rate: float,
+    threads: int,
+    cache_dir: str,
+    logger,
+    use_spinner: bool,
+) -> np.ndarray:
+    if existing_grm is not None:
+        return np.asarray(existing_grm, dtype=np.float64, order="C")
+
+    cache_prefix = _gwas_cache_prefix_with_params(
+        genofile,
+        maf=float(maf_threshold),
+        geno=float(max_missing_rate),
+        snps_only=False,
+        cache_dir=cache_dir,
+        logger=logger,
+    )
+    grm_all, _eff_m, grm_ids = load_or_build_grm_with_cache(
+        genofile=genofile,
+        cache_prefix=cache_prefix,
+        mgrm="1",
+        maf_threshold=float(maf_threshold),
+        max_missing_rate=float(max_missing_rate),
+        het_threshold=0.0,
+        chunk_size=65536,
+        threads=int(threads),
+        mmap_limit=False,
+        logger=logger,
+        use_spinner=bool(use_spinner),
+        ids_preloaded=np.asarray(sample_ids, dtype=str),
+        n_snps_preloaded=int(n_snps),
+        snps_only=False,
+        allow_packed_full_load=True,
+    )
+    return _align_square_matrix_to_ids(
+        np.asarray(grm_all, dtype=np.float64),
+        grm_ids,
+        sample_ids,
+        label="GARFIELD follow-up GRM",
+    )
+
+
+def _run_garfield_pseudo_fastlmm(
+    *,
+    pseudo_prefix: str,
+    trait_label: str,
+    pheno_values: np.ndarray,
+    sample_ids: list[str],
+    trait_grm: np.ndarray,
+    trait_cov: Optional[np.ndarray],
+    maf_threshold: float,
+    max_missing_rate: float,
+    threads: int,
+    logger,
+    use_spinner: bool,
+) -> dict[str, object]:
+    pheno_df = pd.DataFrame(
+        {str(trait_label): np.asarray(pheno_values, dtype=np.float64)},
+        index=pd.Index(np.asarray(sample_ids, dtype=str), dtype=str),
+    )
+    qmatrix = np.zeros((len(sample_ids), 0), dtype=np.float64)
+    summary_rows: list[dict[str, object]] = []
+    saved_paths: list[str] = []
+    run_fastlmm_packed_fullrank(
+        genofile=str(pseudo_prefix),
+        pheno=pheno_df,
+        ids=np.asarray(sample_ids, dtype=str),
+        grm=np.asarray(trait_grm, dtype=np.float64, order="C"),
+        outprefix=str(pseudo_prefix),
+        maf_threshold=float(maf_threshold),
+        max_missing_rate=float(max_missing_rate),
+        genetic_model="add",
+        het_threshold=0.0,
+        chunk_size=65536,
+        qmatrix=qmatrix,
+        cov_all=(
+            None
+            if trait_cov is None
+            else np.asarray(trait_cov, dtype=np.float64, order="C")
+        ),
+        plot=True,
+        threads=int(threads),
+        logger=logger,
+        use_spinner=bool(use_spinner),
+        snps_only=False,
+        summary_rows=summary_rows,
+        saved_paths=saved_paths,
+        trait_names=[str(trait_label)],
+        emit_trait_header=False,
+        force_model=True,
+    )
+    tsv_paths = [p for p in saved_paths if str(p).lower().endswith(".tsv")]
+    fig_paths = [f"{os.path.splitext(p)[0]}.svg" for p in tsv_paths]
+    return {
+        "saved_paths": saved_paths,
+        "tsv_paths": tsv_paths,
+        "figure_paths": fig_paths,
+        "summary_rows": summary_rows,
+    }
+
+
 def _detect_response_mode(y: np.ndarray) -> tuple[str, np.ndarray, str]:
     y_arr = np.asarray(y, dtype=float).reshape(-1)
     if y_arr.size == 0:
@@ -201,6 +349,13 @@ def _read_geneset_lines(path: str) -> list[list[str]]:
             if genes:
                 genesets.append(genes)
     return genesets
+
+
+def _infer_scan_mode_from_genefile(path: str) -> str:
+    genesets = _read_geneset_lines(path)
+    if len(genesets) == 0:
+        raise ValueError(f"Gene file is empty: {path}")
+    return "geneset" if any(len(genes) > 1 for genes in genesets) else "gene"
 
 
 def _build_interval_groups(
@@ -234,13 +389,21 @@ def _build_interval_groups(
                 groups.append([iv])
     elif scan_mode in {"genepair", "geneset"}:
         for genes in genesets:
-            if len(genes) < 2:
-                continue
-            ivs = [iv for iv in (_iv(g) for g in genes) if iv is not None]
-            if len(ivs) < 2:
-                continue
-            labels.append("|".join(genes))
-            groups.append(ivs)
+            if len(genes) <= 1:
+                gene = genes[0] if len(genes) == 1 else None
+                if not gene:
+                    continue
+                iv = _iv(gene)
+                if iv is None:
+                    continue
+                labels.append(gene)
+                groups.append([iv])
+            else:
+                ivs = [iv for iv in (_iv(g) for g in genes) if iv is not None]
+                if len(ivs) < 2:
+                    continue
+                labels.append("|".join(genes))
+                groups.append(ivs)
     else:
         raise ValueError(f"unsupported scan_mode: {scan_mode}")
 
@@ -473,22 +636,16 @@ def main() -> None:
         help="Window scan mode.",
     )
     optional_group.add_argument(
-        "-Gene",
-        "--Gene",
+        "-g",
+        "--genefile",
         type=str,
         default=None,
-        dest="gene_mode_file",
-        help="Gene scan file (requires -gff/--gff3).",
+        help=(
+            "Gene or gene-set file. If provided together with -gff/--gff3, GARFIELD "
+            "auto-switches out of window mode: single-gene lines are treated as Gene units, "
+            "multi-gene lines as GeneSet units."
+        ),
     )
-    optional_group.add_argument(
-        "-GeneSet",
-        "--GeneSet",
-        type=str,
-        default=None,
-        dest="geneset_mode_file",
-        help="Gene-set scan file (requires -gff/--gff3).",
-    )
-    optional_group.add_argument("-g", "--genefile", type=str, default=None, help=argparse.SUPPRESS)
     optional_group.add_argument("-gff", "--gff3", type=str, default=None, help="GFF3 annotation.")
     optional_group.add_argument(
         "--scan-mode",
@@ -657,31 +814,18 @@ def main() -> None:
     ):
         parser.error("-k/--grm now expects a GRM path.")
 
-    explicit_scan_flags = int(bool(args.mode_window)) + int(args.gene_mode_file is not None) + int(args.geneset_mode_file is not None)
-    if explicit_scan_flags > 1:
-        parser.error("Use only one of -Window, -Gene, or -GeneSet.")
-    if args.scan_mode is not None and explicit_scan_flags > 0:
-        parser.error("Do not mix hidden --scan-mode with -Window/-Gene/-GeneSet.")
-    if args.gene_mode_file is not None and args.genefile is not None:
-        parser.error("Do not provide both -Gene and -g/--genefile.")
-    if args.geneset_mode_file is not None and args.genefile is not None:
-        parser.error("Do not provide both -GeneSet and -g/--genefile.")
+    if args.mode_window and args.genefile is not None:
+        parser.error("-Window cannot be combined with -g/--genefile.")
 
-    if args.gene_mode_file is not None:
-        args.scan_mode = "gene"
-        args.genefile = args.gene_mode_file
-    elif args.geneset_mode_file is not None:
-        args.scan_mode = "geneset"
-        args.genefile = args.geneset_mode_file
-    elif args.mode_window:
+    if args.genefile is not None:
+        if not args.gff3:
+            parser.error("-g/--genefile requires -gff/--gff3.")
+        try:
+            args.scan_mode = _infer_scan_mode_from_genefile(args.genefile)
+        except ValueError as e:
+            parser.error(str(e))
+    else:
         args.scan_mode = "window"
-    elif args.scan_mode is None:
-        args.scan_mode = "window"
-    elif args.scan_mode == "genepair":
-        args.scan_mode = "geneset"
-
-    if args.scan_mode in {"gene", "geneset"} and not args.genefile:
-        parser.error(f"scan-mode={args.scan_mode} requires -Gene/-GeneSet or --genefile.")
 
     args.width = int(args.width) if args.width is not None else 100
     if int(args.width) <= 0:
@@ -777,6 +921,8 @@ def main() -> None:
     )
     rank_schedule_runtime = _describe_rank_schedule(rank_score_runtime)
 
+    gff3_effective = args.gff3 if args.genefile else None
+
     checks: list[bool] = []
     checks.append(ensure_plink_prefix_exists(logger, gfile, "Genotype PLINK prefix"))
     checks.append(ensure_file_exists(logger, args.pheno, "Phenotype file"))
@@ -784,8 +930,8 @@ def main() -> None:
         checks.append(ensure_file_exists(logger, args.grm, "GARFIELD GRM"))
     if args.genefile:
         checks.append(ensure_file_exists(logger, args.genefile, "Gene file"))
-    if args.gff3:
-        checks.append(ensure_file_exists(logger, args.gff3, "GFF3 file"))
+    if gff3_effective:
+        checks.append(ensure_file_exists(logger, gff3_effective, "GFF3 file"))
     if args.simbench:
         checks.append(ensure_file_exists(logger, args.simbench, "Simulation benchmark TSV"))
     if not ensure_all_true(checks):
@@ -805,7 +951,7 @@ def main() -> None:
         ("Phenotype", args.pheno),
         ("Scan mode", args.scan_mode),
         ("Gene file", args.genefile),
-        ("GFF3", args.gff3),
+        ("GFF3", gff3_effective if gff3_effective else ("ignored" if args.gff3 else None)),
         ("MAF", float(args.maf)),
         ("Missing max (1+NA)", float(args.geno)),
         ("Extension", int(args.extension)),
@@ -814,6 +960,7 @@ def main() -> None:
         ("Split", "none (full data)"),
         ("Engine", "none (skip ML)" if ml_skipped else args.engine),
         ("Permutation", bool(args.permutation)),
+        ("Pseudo GWAS", "FastLMM follow-up"),
         ("Structured pruning", not bool(args.no_clean)),
         ("NOT control", "null penalty only"),
         ("Width", int(args.width)),
@@ -927,6 +1074,11 @@ def main() -> None:
         None
         if cov_ids is None
         else {sid: i for i, sid in enumerate(cov_ids.astype(str).tolist())}
+    )
+    followup_grm_full = (
+        None
+        if aligned_grm is None
+        else np.asarray(aligned_grm, dtype=np.float64, order="C")
     )
 
     group_labels: list[str] = []
@@ -1087,12 +1239,54 @@ def main() -> None:
         prior_payload, posterior_payload = _split_structure_prior_payload(
             _load_json_if_exists(posterior_json_path)
         )
+        pseudo_gwas_payload = None
+        pseudo_prefix = result.get("pseudo_prefix")
+        if pseudo_prefix:
+            if followup_grm_full is None:
+                followup_grm_full = _ensure_followup_grm(
+                    existing_grm=None,
+                    genofile=gfile,
+                    sample_ids=sample_ids,
+                    n_snps=_n_snps,
+                    maf_threshold=float(args.maf),
+                    max_missing_rate=float(args.geno),
+                    threads=int(args.thread),
+                    cache_dir=args.out,
+                    logger=logger,
+                    use_spinner=use_spinner,
+                )
+            common_positions = np.asarray(
+                [sample_index_map[sid] for sid in common_ids],
+                dtype=np.intp,
+            )
+            trait_grm_followup = np.asarray(
+                followup_grm_full[np.ix_(common_positions, common_positions)],
+                dtype=np.float64,
+                order="C",
+            )
+            logger.info(
+                f"Running pseudo FastLMM follow-up for '{trait_name}' on {int(n_rules)} GARFIELD rule(s)."
+            )
+            pseudo_gwas_payload = _run_garfield_pseudo_fastlmm(
+                pseudo_prefix=str(pseudo_prefix),
+                trait_label=suffix,
+                pheno_values=np.asarray(y_common, dtype=np.float64),
+                sample_ids=list(common_ids),
+                trait_grm=trait_grm_followup,
+                trait_cov=trait_cov,
+                maf_threshold=float(args.maf),
+                max_missing_rate=float(args.geno),
+                threads=int(args.thread),
+                logger=logger,
+                use_spinner=use_spinner,
+            )
         _remove_file_if_exists(run_config_path)
         _remove_file_if_exists(posterior_json_path)
         trait_manifest = {
             "trait": trait_name,
             "trait_output_prefix": trait_outprefix,
             "garfield_prefix": trait_logic_prefix,
+            "pseudo_prefix": pseudo_prefix,
             "route": "rust-bed",
             "split_applied": split_applied,
             "scan_mode": args.scan_mode,
@@ -1160,9 +1354,20 @@ def main() -> None:
             "test_sigma_e2": float(result.get("test_sigma_e2", float("nan"))),
             "outputs": {
                 "rules_tsv": result.get("rules_tsv"),
+                "pseudo_fastlmm_tsv": (
+                    None
+                    if pseudo_gwas_payload is None
+                    else pseudo_gwas_payload.get("tsv_paths")
+                ),
+                "pseudo_fastlmm_figure": (
+                    None
+                    if pseudo_gwas_payload is None
+                    else pseudo_gwas_payload.get("figure_paths")
+                ),
             },
             "prior": prior_payload,
             "posterior": posterior_payload,
+            "pseudo_fastlmm": pseudo_gwas_payload,
         }
         garfield_manifest_traits.append(trait_manifest)
         logger.info(f"GARFIELD null-model PVE for '{trait_name}': full={float(result.get('train_pve', float('nan'))):.4g}")

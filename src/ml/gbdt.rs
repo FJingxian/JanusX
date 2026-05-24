@@ -153,6 +153,8 @@ fn grow_tree(
     rng: &mut StdRng,
     importance: &mut [f64],
     mtry: usize,
+    feature_group_ids: Option<&[usize]>,
+    used_groups: &[usize],
 ) -> GbdtNode {
     let leaf = GbdtNode::Leaf(reg_leaf_value(samples, target));
     if samples.len() < cfg.min_samples_split || depth >= cfg.max_depth {
@@ -176,6 +178,11 @@ fn grow_tree(
     let mut best_feat: Option<usize> = None;
     let mut best_gain = f64::NEG_INFINITY;
     for feat in feat_candidates {
+        if let Some(group_ids) = feature_group_ids {
+            if used_groups.iter().any(|&gid| gid == group_ids[feat]) {
+                continue;
+            }
+        }
         if let Some(gain) =
             split_gain_for_feature(&x_rows[feat], samples, target, cfg.min_samples_leaf, parent)
         {
@@ -199,6 +206,10 @@ fn grow_tree(
     }
 
     importance[feat] += best_gain;
+    let mut next_used = used_groups.to_vec();
+    if let Some(group_ids) = feature_group_ids {
+        next_used.push(group_ids[feat]);
+    }
     GbdtNode::Split {
         feat,
         left: Box::new(grow_tree(
@@ -210,6 +221,8 @@ fn grow_tree(
             rng,
             importance,
             mtry,
+            feature_group_ids,
+            next_used.as_slice(),
         )),
         right: Box::new(grow_tree(
             x_rows,
@@ -220,6 +233,8 @@ fn grow_tree(
             rng,
             importance,
             mtry,
+            feature_group_ids,
+            next_used.as_slice(),
         )),
     }
 }
@@ -285,6 +300,7 @@ fn fit_gbdt(
     y: &[f64],
     response: ResponseKind,
     cfg: ExtraTreesConfig,
+    feature_group_ids: Option<&[usize]>,
 ) -> (GbdtModel, Vec<f64>) {
     let n_features = x_rows.len();
     let n_samples = y.len();
@@ -359,6 +375,8 @@ fn fit_gbdt(
             &mut rng,
             &mut importance,
             mtry,
+            feature_group_ids,
+            &[],
         );
         for (i, pi) in raw_pred.iter_mut().enumerate() {
             *pi += GBDT_LEARNING_RATE * predict_tree(&tree, x_rows, i, None, None);
@@ -430,16 +448,28 @@ fn permutation_importance(
     }
 }
 
+#[allow(dead_code)]
 pub fn feature_scores_gbdt(
     x_rows: &[Vec<u8>],
     y: &[f64],
     response: ResponseKind,
     cfg: ExtraTreesConfig,
 ) -> Vec<f64> {
-    let (_model, importance) = fit_gbdt(x_rows, y, response, cfg);
+    feature_scores_gbdt_grouped(x_rows, y, response, cfg, None)
+}
+
+pub fn feature_scores_gbdt_grouped(
+    x_rows: &[Vec<u8>],
+    y: &[f64],
+    response: ResponseKind,
+    cfg: ExtraTreesConfig,
+    feature_group_ids: Option<&[usize]>,
+) -> Vec<f64> {
+    let (_model, importance) = fit_gbdt(x_rows, y, response, cfg, feature_group_ids);
     importance
 }
 
+#[allow(dead_code)]
 pub fn feature_scores_gbdt_permutation(
     x_rows: &[Vec<u8>],
     y: &[f64],
@@ -447,7 +477,18 @@ pub fn feature_scores_gbdt_permutation(
     cfg: ExtraTreesConfig,
     perm_cfg: PermutationConfig,
 ) -> Vec<f64> {
-    let (model, _importance) = fit_gbdt(x_rows, y, response, cfg);
+    feature_scores_gbdt_permutation_grouped(x_rows, y, response, cfg, perm_cfg, None)
+}
+
+pub fn feature_scores_gbdt_permutation_grouped(
+    x_rows: &[Vec<u8>],
+    y: &[f64],
+    response: ResponseKind,
+    cfg: ExtraTreesConfig,
+    perm_cfg: PermutationConfig,
+    feature_group_ids: Option<&[usize]>,
+) -> Vec<f64> {
+    let (model, _importance) = fit_gbdt(x_rows, y, response, cfg, feature_group_ids);
     permutation_importance(&model, x_rows, y, response, perm_cfg, cfg.allow_parallel)
 }
 

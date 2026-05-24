@@ -31,7 +31,7 @@ use crate::ml::common::{
     parse_importance, parse_permutation_scoring, topk_indices, ImportanceKind, PermutationConfig,
     ResponseKind,
 };
-use crate::ml::engine::{compute_feature_scores, parse_ml_engine, MlEngine};
+use crate::ml::engine::{compute_feature_scores_grouped, parse_ml_engine, MlEngine};
 use crate::ml::extra_trees::ExtraTreesConfig;
 use crate::score::{score_binary_mcc_packed, score_cont_corr_packed};
 use memmap2::Mmap;
@@ -2658,6 +2658,48 @@ fn unit_span_contains_site(span: &GarfieldUnitSpan, chrom: &str, pos: i32) -> bo
         && pos <= span.bp_start.max(span.bp_end)
 }
 
+fn nearest_unit_span_index(unit: &GarfieldLogicUnit, chrom: &str, pos: i32) -> Option<usize> {
+    let mut best = None::<(i64, i64, usize)>;
+    for (idx, span) in unit.spans.iter().enumerate() {
+        if !unit_span_contains_site(span, chrom, pos) {
+            continue;
+        }
+        let lo = i64::from(span.bp_start.min(span.bp_end));
+        let hi = i64::from(span.bp_start.max(span.bp_end));
+        let center = (lo + hi) / 2;
+        let dist = (i64::from(pos) - center).abs();
+        let span_len = (hi - lo).abs();
+        let cand = (dist, span_len, idx);
+        if best.map(|cur| cand < cur).unwrap_or(true) {
+            best = Some(cand);
+        }
+    }
+    best.map(|(_, _, idx)| idx)
+}
+
+fn build_unit_window_group_ids(
+    unit: &GarfieldLogicUnit,
+    selected_global_rows: &[usize],
+    sites: &[SiteInfo],
+    unit_kind_lc: &str,
+) -> Option<Vec<usize>> {
+    if unit_kind_lc != "geneset" || unit.spans.len() <= 1 || selected_global_rows.is_empty() {
+        return None;
+    }
+    let mut out = Vec::<usize>::with_capacity(selected_global_rows.len());
+    let mut fallback_gid = unit.spans.len();
+    for &global_idx in selected_global_rows.iter() {
+        let site = sites.get(global_idx)?;
+        if let Some(gid) = nearest_unit_span_index(unit, &site.chrom, site.pos) {
+            out.push(gid);
+        } else {
+            out.push(fallback_gid);
+            fallback_gid = fallback_gid.saturating_add(1);
+        }
+    }
+    Some(out)
+}
+
 fn unit_contains_any_simbench_site(unit: &GarfieldLogicUnit, terms: &[SimBenchTerm]) -> bool {
     unit.spans.iter().any(|span| {
         terms.iter().any(|term| {
@@ -2672,6 +2714,7 @@ fn build_simbench_ml_contexts(
     terms: &[SimBenchTerm],
     units: &[GarfieldLogicUnit],
     scan_unit_indices: &[usize],
+    unit_kind_lc: &str,
     response: ResponseKind,
     engine: Option<MlEngine>,
     importance: ImportanceKind,
@@ -2708,6 +2751,8 @@ fn build_simbench_ml_contexts(
             continue;
         }
         let n_region = dense_train.len();
+        let ml_group_ids =
+            build_unit_window_group_ids(unit, unit.indices.as_slice(), logic_bits.sites.as_slice(), unit_kind_lc);
         let (selected_global_rows, ranked_global_rows) = if let Some(engine_one) = engine {
             let keep_k = resolve_ml_keep_k(n_region, ml_top_k, ml_top_frac);
             let top_local = select_ml_top_local_indices(
@@ -2724,6 +2769,7 @@ fn build_simbench_ml_contexts(
                 keep_k,
                 GarfieldMlKeepPolicy::TopK,
                 tree_cfg.seed ^ 0xB6D5_0C11_8E91_3F27,
+                ml_group_ids.as_deref(),
             )?;
             if top_local.is_empty() {
                 continue;
@@ -2740,6 +2786,7 @@ fn build_simbench_ml_contexts(
                 importance,
                 perm_cfg,
                 n_region,
+                ml_group_ids.as_deref(),
             )?;
             (
                 top_local
@@ -4373,6 +4420,7 @@ fn select_ml_top_only_local_indices(
     importance: ImportanceKind,
     perm_cfg: PermutationConfig,
     keep_k: usize,
+    feature_group_ids: Option<&[usize]>,
 ) -> Result<Vec<usize>, String> {
     if keep_k == 0 || dense_train.is_empty() {
         return Ok(Vec::new());
@@ -4387,7 +4435,7 @@ fn select_ml_top_only_local_indices(
                     .max(keep_k.saturating_add(8))
                     .max(32),
             );
-            let coarse_scores = compute_feature_scores(
+            let coarse_scores = compute_feature_scores_grouped(
                 dense_train,
                 y_train,
                 response,
@@ -4395,6 +4443,7 @@ fn select_ml_top_only_local_indices(
                 tree_cfg,
                 ImportanceKind::Imp,
                 perm_cfg,
+                feature_group_ids,
             )?;
             let coarse_local = topk_indices(coarse_scores.as_slice(), coarse_k);
             if coarse_local.is_empty() {
@@ -4407,7 +4456,13 @@ fn select_ml_top_only_local_indices(
                 .iter()
                 .map(|&idx| dense_train[idx].clone())
                 .collect::<Vec<_>>();
-            let refined_scores = compute_feature_scores(
+            let refined_group_ids = feature_group_ids.map(|groups| {
+                coarse_local
+                    .iter()
+                    .map(|&idx| groups[idx])
+                    .collect::<Vec<_>>()
+            });
+            let refined_scores = compute_feature_scores_grouped(
                 refined_rows.as_slice(),
                 y_train,
                 response,
@@ -4415,6 +4470,7 @@ fn select_ml_top_only_local_indices(
                 tree_cfg,
                 importance,
                 perm_cfg,
+                refined_group_ids.as_deref(),
             )?;
             let refined_local = topk_indices(refined_scores.as_slice(), keep_k);
             Ok(refined_local
@@ -4423,7 +4479,7 @@ fn select_ml_top_only_local_indices(
                 .collect())
         }
         _ => {
-            let scores = compute_feature_scores(
+            let scores = compute_feature_scores_grouped(
                 dense_train,
                 y_train,
                 response,
@@ -4431,6 +4487,7 @@ fn select_ml_top_only_local_indices(
                 tree_cfg,
                 importance,
                 perm_cfg,
+                feature_group_ids,
             )?;
             Ok(topk_indices(scores.as_slice(), keep_k))
         }
@@ -4466,6 +4523,7 @@ fn select_ml_top_local_indices(
     keep_k: usize,
     keep_policy: GarfieldMlKeepPolicy,
     selection_seed: u64,
+    feature_group_ids: Option<&[usize]>,
 ) -> Result<Vec<usize>, String> {
     if keep_k == 0 || dense_train.is_empty() {
         return Ok(Vec::new());
@@ -4482,6 +4540,7 @@ fn select_ml_top_local_indices(
             importance,
             perm_cfg,
             keep_k,
+            feature_group_ids,
         ),
         GarfieldMlKeepPolicy::TopKPlusRandom { top_frac } => {
             let (top_keep, rand_keep) = resolve_ml_top_random_counts(keep_k, top_frac);
@@ -4494,6 +4553,7 @@ fn select_ml_top_local_indices(
                 importance,
                 perm_cfg,
                 top_keep,
+                feature_group_ids,
             )?;
             if rand_keep == 0 || out.len() >= n_region {
                 return Ok(out);
@@ -4526,6 +4586,7 @@ fn select_ml_top_local_indices(
 #[allow(clippy::too_many_arguments)]
 fn select_logic_unit_global_rows(
     unit: &GarfieldLogicUnit,
+    unit_kind_lc: &str,
     response: ResponseKind,
     engine: Option<MlEngine>,
     importance: ImportanceKind,
@@ -4555,6 +4616,8 @@ fn select_logic_unit_global_rows(
         }
         let n_region = dense_train.len();
         let keep_k = resolve_ml_keep_k(n_region, ml_top_k, ml_top_frac);
+        let ml_group_ids =
+            build_unit_window_group_ids(unit, unit.indices.as_slice(), logic_bits.sites.as_slice(), unit_kind_lc);
         let top_local = select_ml_top_local_indices(
             dense_train.as_slice(),
             y_train,
@@ -4569,6 +4632,7 @@ fn select_logic_unit_global_rows(
             keep_k,
             GarfieldMlKeepPolicy::TopK,
             tree_cfg.seed ^ 0xB6D5_0C11_8E91_3F27,
+            ml_group_ids.as_deref(),
         )?;
         if top_local.is_empty() {
             return Ok(None);
@@ -4589,6 +4653,7 @@ fn select_logic_unit_global_rows(
 #[allow(clippy::too_many_arguments)]
 fn prepare_logic_unit_continuous(
     unit: &GarfieldLogicUnit,
+    unit_kind_lc: &str,
     response: ResponseKind,
     engine: Option<MlEngine>,
     importance: ImportanceKind,
@@ -4604,6 +4669,7 @@ fn prepare_logic_unit_continuous(
 ) -> Result<Option<GarfieldUnitPrepared>, String> {
     let Some(selected_global_rows) = select_logic_unit_global_rows(
         unit,
+        unit_kind_lc,
         response,
         engine,
         importance,
@@ -4624,10 +4690,18 @@ fn prepare_logic_unit_continuous(
         .iter()
         .map(|&idx| logic_bits.sites[idx].clone())
         .collect::<Vec<_>>();
-    let local_groups = selected_global_rows
-        .iter()
-        .map(|&idx| logic_bits.group_ids[idx])
-        .collect::<Vec<_>>();
+    let local_groups = build_unit_window_group_ids(
+        unit,
+        selected_global_rows.as_slice(),
+        logic_bits.sites.as_slice(),
+        unit_kind_lc,
+    )
+    .unwrap_or_else(|| {
+        selected_global_rows
+            .iter()
+            .map(|&idx| logic_bits.group_ids[idx])
+            .collect::<Vec<_>>()
+    });
     let (train_bits, row_words_train) = packed_rows_subset_from_full_bits(
         logic_bits.bits_flat.as_slice(),
         logic_bits.row_words,
@@ -4719,6 +4793,7 @@ fn prepare_logic_chunk_continuous(
                 top_frac: GARFIELD_NULL_ML_TOP_FRAC,
             },
             perm_cfg.seed ^ chunk.window_id ^ 0x94D0_49BB_1331_11EB,
+            None,
         )?;
         if top_local.is_empty() {
             return Ok(None);
@@ -5189,6 +5264,7 @@ fn evaluate_logic_unit_continuous(
 ) -> Result<Vec<GarfieldLogicRuleRecord>, String> {
     let Some(prepared) = prepare_logic_unit_continuous(
         unit,
+        unit_kind_lc,
         response,
         engine,
         importance,
@@ -6175,6 +6251,7 @@ fn garfield_logic_search_bed_owned(
                     .map(|ui| {
                         let prepared = prepare_logic_unit_continuous(
                             &units[ui],
+                            &unit_kind_lc,
                             response,
                             engine,
                             importance,
@@ -6211,6 +6288,7 @@ fn garfield_logic_search_bed_owned(
             for &ui in representative_units.iter() {
                 let prepared = prepare_logic_unit_continuous(
                     &units[ui],
+                    &unit_kind_lc,
                     response,
                     engine,
                     importance,
@@ -6759,6 +6837,7 @@ fn garfield_logic_search_bed_owned(
             simbench_terms.as_slice(),
             units.as_slice(),
             scan_unit_indices.as_slice(),
+            &unit_kind_lc,
             response,
             engine,
             importance,
@@ -8546,5 +8625,81 @@ mod tests {
         assert_eq!(bucket[0], (1, 9.0));
         assert_eq!(bucket[1], (0, 8.0));
         assert_eq!(bucket[2], (4, 7.0));
+    }
+
+    #[test]
+    fn test_build_unit_window_group_ids_assigns_geneset_spans() {
+        let unit = GarfieldLogicUnit {
+            label: "triad".to_string(),
+            indices: vec![0, 1, 2],
+            spans: vec![
+                GarfieldUnitSpan {
+                    chrom: "1".to_string(),
+                    bp_start: 100,
+                    bp_end: 200,
+                },
+                GarfieldUnitSpan {
+                    chrom: "1".to_string(),
+                    bp_start: 300,
+                    bp_end: 400,
+                },
+                GarfieldUnitSpan {
+                    chrom: "2".to_string(),
+                    bp_start: 500,
+                    bp_end: 600,
+                },
+            ],
+        };
+        let sites = vec![
+            SiteInfo {
+                chrom: "1".to_string(),
+                pos: 150,
+                ref_allele: "A".to_string(),
+                alt_allele: "G".to_string(),
+            },
+            SiteInfo {
+                chrom: "1".to_string(),
+                pos: 350,
+                ref_allele: "A".to_string(),
+                alt_allele: "G".to_string(),
+            },
+            SiteInfo {
+                chrom: "2".to_string(),
+                pos: 580,
+                ref_allele: "A".to_string(),
+                alt_allele: "G".to_string(),
+            },
+        ];
+        let gids =
+            build_unit_window_group_ids(&unit, &[0, 1, 2], sites.as_slice(), "geneset").unwrap();
+        assert_eq!(gids, vec![0usize, 1usize, 2usize]);
+    }
+
+    #[test]
+    fn test_build_unit_window_group_ids_prefers_nearest_overlap_span() {
+        let unit = GarfieldLogicUnit {
+            label: "overlap".to_string(),
+            indices: vec![0],
+            spans: vec![
+                GarfieldUnitSpan {
+                    chrom: "1".to_string(),
+                    bp_start: 100,
+                    bp_end: 300,
+                },
+                GarfieldUnitSpan {
+                    chrom: "1".to_string(),
+                    bp_start: 220,
+                    bp_end: 420,
+                },
+            ],
+        };
+        let sites = vec![SiteInfo {
+            chrom: "1".to_string(),
+            pos: 260,
+            ref_allele: "A".to_string(),
+            alt_allele: "G".to_string(),
+        }];
+        let gids = build_unit_window_group_ids(&unit, &[0], sites.as_slice(), "geneset").unwrap();
+        assert_eq!(gids, vec![1usize]);
     }
 }

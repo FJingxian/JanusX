@@ -169,6 +169,8 @@ fn grow_tree(
     rng: &mut StdRng,
     importance: &mut [f64],
     mtry: usize,
+    feature_group_ids: Option<&[usize]>,
+    used_groups: &[usize],
 ) -> RfNode {
     let leaf = RfNode::Leaf(leaf_value(samples, y));
     if samples.len() < cfg.min_samples_split || depth >= cfg.max_depth {
@@ -193,6 +195,11 @@ fn grow_tree(
     let mut best_feat: Option<usize> = None;
     let mut best_gain = f64::NEG_INFINITY;
     for feat in feat_candidates {
+        if let Some(group_ids) = feature_group_ids {
+            if used_groups.iter().any(|&gid| gid == group_ids[feat]) {
+                continue;
+            }
+        }
         if let Some(gain) = split_gain_for_feature(
             &x_rows[feat],
             samples,
@@ -221,6 +228,10 @@ fn grow_tree(
     }
 
     importance[feat] += best_gain;
+    let mut next_used = used_groups.to_vec();
+    if let Some(group_ids) = feature_group_ids {
+        next_used.push(group_ids[feat]);
+    }
     RfNode::Split {
         feat,
         left: Box::new(grow_tree(
@@ -233,6 +244,8 @@ fn grow_tree(
             rng,
             importance,
             mtry,
+            feature_group_ids,
+            next_used.as_slice(),
         )),
         right: Box::new(grow_tree(
             x_rows,
@@ -244,6 +257,8 @@ fn grow_tree(
             rng,
             importance,
             mtry,
+            feature_group_ids,
+            next_used.as_slice(),
         )),
     }
 }
@@ -261,6 +276,7 @@ fn fit_random_forest(
     y: &[f64],
     response: ResponseKind,
     cfg: ExtraTreesConfig,
+    feature_group_ids: Option<&[usize]>,
 ) -> (RandomForestModel, Vec<f64>) {
     let n_features = x_rows.len();
     let n_samples = y.len();
@@ -310,6 +326,8 @@ fn fit_random_forest(
                     &mut rng,
                     &mut importance,
                     mtry,
+                    feature_group_ids,
+                    &[],
                 );
                 (tree, importance)
             })
@@ -336,6 +354,8 @@ fn fit_random_forest(
                 &mut rng,
                 &mut importance,
                 mtry,
+                feature_group_ids,
+                &[],
             );
             out.push((tree, importance));
         }
@@ -455,16 +475,28 @@ fn permutation_importance(
     }
 }
 
+#[allow(dead_code)]
 pub fn feature_scores_random_forest(
     x_rows: &[Vec<u8>],
     y: &[f64],
     response: ResponseKind,
     cfg: ExtraTreesConfig,
 ) -> Vec<f64> {
-    let (_model, importance) = fit_random_forest(x_rows, y, response, cfg);
+    feature_scores_random_forest_grouped(x_rows, y, response, cfg, None)
+}
+
+pub fn feature_scores_random_forest_grouped(
+    x_rows: &[Vec<u8>],
+    y: &[f64],
+    response: ResponseKind,
+    cfg: ExtraTreesConfig,
+    feature_group_ids: Option<&[usize]>,
+) -> Vec<f64> {
+    let (_model, importance) = fit_random_forest(x_rows, y, response, cfg, feature_group_ids);
     importance
 }
 
+#[allow(dead_code)]
 pub fn feature_scores_random_forest_permutation(
     x_rows: &[Vec<u8>],
     y: &[f64],
@@ -472,7 +504,26 @@ pub fn feature_scores_random_forest_permutation(
     cfg: ExtraTreesConfig,
     perm_cfg: PermutationConfig,
 ) -> Vec<f64> {
-    let (model, _importance) = fit_random_forest(x_rows, y, response, cfg);
+    feature_scores_random_forest_permutation_grouped(
+        x_rows,
+        y,
+        response,
+        cfg,
+        perm_cfg,
+        None,
+    )
+}
+
+pub fn feature_scores_random_forest_permutation_grouped(
+    x_rows: &[Vec<u8>],
+    y: &[f64],
+    response: ResponseKind,
+    cfg: ExtraTreesConfig,
+    perm_cfg: PermutationConfig,
+    feature_group_ids: Option<&[usize]>,
+) -> Vec<f64> {
+    let (model, _importance) =
+        fit_random_forest(x_rows, y, response, cfg, feature_group_ids);
     permutation_importance(&model, x_rows, y, response, perm_cfg, cfg.allow_parallel)
 }
 
@@ -619,16 +670,6 @@ mod tests {
             parent,
         )
         .unwrap();
-        let left = NodeStats {
-            n: 2,
-            sum: 9.0,
-            pos: 0,
-        };
-        let right = NodeStats {
-            n: 2,
-            sum: -3.0,
-            pos: 0,
-        };
         let old_gain = {
             let y = y.as_slice();
             let mean_parent = y.iter().copied().sum::<f64>() / (y.len() as f64);

@@ -158,6 +158,8 @@ fn grow_tree(
     rng: &mut StdRng,
     importance: &mut [f64],
     mtry: usize,
+    feature_group_ids: Option<&[usize]>,
+    used_groups: &[usize],
 ) {
     if samples.len() < cfg.min_samples_split {
         return;
@@ -184,6 +186,11 @@ fn grow_tree(
     let mut best_feat: Option<usize> = None;
     let mut best_gain = f64::NEG_INFINITY;
     for feat in feat_candidates {
+        if let Some(group_ids) = feature_group_ids {
+            if used_groups.iter().any(|&gid| gid == group_ids[feat]) {
+                continue;
+            }
+        }
         if let Some(gain) = split_gain_for_feature(
             &x_rows[feat],
             samples,
@@ -207,6 +214,11 @@ fn grow_tree(
     }
     importance[feat] += best_gain;
 
+    let mut next_used = used_groups.to_vec();
+    if let Some(group_ids) = feature_group_ids {
+        next_used.push(group_ids[feat]);
+    }
+
     let (left, right) = split_samples_by_feature(&x_rows[feat], samples);
     if left.len() < cfg.min_samples_leaf || right.len() < cfg.min_samples_leaf {
         return;
@@ -222,6 +234,8 @@ fn grow_tree(
         rng,
         importance,
         mtry,
+        feature_group_ids,
+        next_used.as_slice(),
     );
     grow_tree(
         x_rows,
@@ -233,6 +247,8 @@ fn grow_tree(
         rng,
         importance,
         mtry,
+        feature_group_ids,
+        next_used.as_slice(),
     );
 }
 
@@ -244,11 +260,22 @@ fn bootstrap_indices(n_samples: usize, rng: &mut StdRng) -> Vec<usize> {
     out
 }
 
+#[allow(dead_code)]
 pub fn feature_scores_extra_trees(
     x_rows: &[Vec<u8>],
     y: &[f64],
     response: ResponseKind,
     cfg: ExtraTreesConfig,
+) -> Vec<f64> {
+    feature_scores_extra_trees_grouped(x_rows, y, response, cfg, None)
+}
+
+pub fn feature_scores_extra_trees_grouped(
+    x_rows: &[Vec<u8>],
+    y: &[f64],
+    response: ResponseKind,
+    cfg: ExtraTreesConfig,
+    feature_group_ids: Option<&[usize]>,
 ) -> Vec<f64> {
     let n_features = x_rows.len();
     if n_features == 0 {
@@ -298,6 +325,8 @@ pub fn feature_scores_extra_trees(
                     &mut rng,
                     &mut imp,
                     mtry,
+                    feature_group_ids,
+                    &[],
                 );
                 imp
             })
@@ -332,6 +361,8 @@ pub fn feature_scores_extra_trees(
                 &mut rng,
                 &mut imp,
                 mtry,
+                feature_group_ids,
+                &[],
             );
             for i in 0..n_features {
                 merged[i] += imp[i];
@@ -367,16 +398,6 @@ mod tests {
             parent,
         )
         .unwrap();
-        let left = NodeStats {
-            n: 2,
-            sum: 9.0,
-            pos: 0,
-        };
-        let right = NodeStats {
-            n: 2,
-            sum: -3.0,
-            pos: 0,
-        };
         let old_gain = {
             let y = y.as_slice();
             let mean_parent = y.iter().copied().sum::<f64>() / (y.len() as f64);

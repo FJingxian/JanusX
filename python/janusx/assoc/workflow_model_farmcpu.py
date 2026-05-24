@@ -47,6 +47,7 @@ from .workflow import (
     _resolve_file_input_matrix,
     _rich_success,
     _run_fastplot_from_tsv_with_status,
+    _safe_trait_file_label,
     _trait_values_and_mask,
     detect_effective_threads,
     format_elapsed,
@@ -1214,8 +1215,9 @@ def run_farmcpu_fullmem(
             pos_col = ref_alt["pos"].astype(np.int64, copy=False).tolist()
             allele0_col = ref_alt["allele0"].tolist()
             allele1_col = ref_alt["allele1"].tolist()
-        out_tsv = os.path.join(outfolder, f"{prefix}.{phename}.farmcpu.tsv")
-        pseudo_tsv_hint = os.path.join(outfolder, f"{prefix}.{phename}.farmcpu.qtn.tsv")
+        phename_tag = _safe_trait_file_label(phename)
+        out_tsv = os.path.join(outfolder, f"{prefix}.{phename_tag}.farmcpu.tsv")
+        pseudo_tsv_hint = os.path.join(outfolder, f"{prefix}.{phename_tag}.farmcpu.qtn.tsv")
         n_pseudo_qtn = 0
         pseudo_tsv: Union[str, None] = None
 
@@ -1502,7 +1504,7 @@ def run_farmcpu_fullmem(
                 out_tsv,
                 p_sub,
                 xlabel=phename,
-                outpdf=os.path.join(outfolder, f"{prefix}.{phename}.farmcpu.svg"),
+                outpdf=os.path.join(outfolder, f"{prefix}.{phename_tag}.farmcpu.svg"),
                 use_spinner=bool(use_spinner),
                 emit_done_line=False,
             )

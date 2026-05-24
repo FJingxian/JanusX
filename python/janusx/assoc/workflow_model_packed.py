@@ -43,6 +43,7 @@ from .workflow import (
     _rich_success,
     _run_fastplot_from_tsv_with_status,
     _run_result_write_with_status,
+    _safe_trait_file_label,
     _trait_values_and_mask,
     auto_mmap_window_mb,
     detect_effective_threads,
@@ -835,10 +836,11 @@ def run_fastlmm_packed_fullrank(
                 gwas_last_done = d
 
         gm_tag = str(genetic_model).lower()
+        pname_tag = _safe_trait_file_label(pname)
         if gm_tag == "add":
-            out_tsv = f"{outprefix}.{pname}.fastlmm.tsv"
+            out_tsv = f"{outprefix}.{pname_tag}.fastlmm.tsv"
         else:
-            out_tsv = f"{outprefix}.{pname}.{gm_tag}.fastlmm.tsv"
+            out_tsv = f"{outprefix}.{pname_tag}.{gm_tag}.fastlmm.tsv"
 
         gwas_ok = False
         lbd = float("nan")
@@ -850,7 +852,10 @@ def run_fastlmm_packed_fullrank(
             u_trait[sample_idx_trait, :] = u_sub
             scan_t0 = time.monotonic()
             with _gwas_scan_stage_ctx(max(1, int(threads))):
-                progress_kwargs: dict[str, object] = {}
+                progress_kwargs: dict[str, object] = {
+                    "progress_callback": None,
+                    "progress_every": 0,
+                }
                 if gwas_pbar is not None:
                     progress_kwargs = {
                         "progress_callback": _fastlmm_progress,
@@ -1149,10 +1154,11 @@ def run_lm_packed_fullrank(
         )
         sample_idx_trait = np.ascontiguousarray(sample_map[keep_idx], dtype=np.int64)
         gm_tag = str(genetic_model).lower()
+        pname_tag = _safe_trait_file_label(pname)
         if gm_tag == "add":
-            out_tsv = f"{outprefix}.{pname}.lm.tsv"
+            out_tsv = f"{outprefix}.{pname_tag}.lm.tsv"
         else:
-            out_tsv = f"{outprefix}.{pname}.{gm_tag}.lm.tsv"
+            out_tsv = f"{outprefix}.{pname_tag}.{gm_tag}.lm.tsv"
 
         gwas_t0 = time.monotonic()
         gwas_total = int(len(sites_all))
@@ -1467,10 +1473,11 @@ def run_lm_stream_bed_single_entry(
             )
 
         gm_tag = str(genetic_model).lower()
+        pname_tag = _safe_trait_file_label(pname)
         if gm_tag == "add":
-            out_tsv = f"{outprefix}.{pname}.lm.tsv"
+            out_tsv = f"{outprefix}.{pname_tag}.lm.tsv"
         else:
-            out_tsv = f"{outprefix}.{pname}.{gm_tag}.lm.tsv"
+            out_tsv = f"{outprefix}.{pname_tag}.{gm_tag}.lm.tsv"
         tmp_tsv = f"{out_tsv}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
 
         scan_threads = int(threads)
@@ -1965,10 +1972,11 @@ def run_lmm_packed_fullrank(
         allele0_all = [str(v) for (_c, _p, v, _a1) in sites_all]
         allele1_all = [str(v) for (_c, _p, _a0, v) in sites_all]
         gm_tag = str(genetic_model).lower()
+        pname_tag = _safe_trait_file_label(pname)
         if gm_tag == "add":
-            out_tsv = f"{outprefix}.{pname}.lmm.tsv"
+            out_tsv = f"{outprefix}.{pname_tag}.lmm.tsv"
         else:
-            out_tsv = f"{outprefix}.{pname}.{gm_tag}.lmm.tsv"
+            out_tsv = f"{outprefix}.{pname_tag}.{gm_tag}.lmm.tsv"
         try:
             progress_kwargs: dict[str, object] = {}
             if gwas_pbar is not None:

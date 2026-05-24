@@ -182,11 +182,11 @@ def native_blas_thread_limit(limit: int):
         yield
         return
     try:
-        with _threadpool_limits(limits=lim, user_api="blas"):
-            yield
+        stage_ctx = _threadpool_limits(limits=lim, user_api="blas")
     except TypeError:
-        with _threadpool_limits(limits=lim):
-            yield
+        stage_ctx = _threadpool_limits(limits=lim)
+    with stage_ctx:
+        yield
 
 
 @contextmanager

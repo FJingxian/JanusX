@@ -40,6 +40,7 @@ from .workflow import (
     _rich_success,
     _run_fastplot_from_tsv_with_status,
     _run_result_write_with_status,
+    _safe_trait_file_label,
     _trait_values_and_mask,
     auto_mmap_window_mb,
     build_rich_progress,
@@ -682,10 +683,11 @@ def run_chunked_gwas_lmm_lm(
         done_snps = 0
         has_results = False
         gm_tag = str(genetic_model).lower()
+        pname_tag = _safe_trait_file_label(pname)
         if gm_tag == "add":
-            out_tsv = f"{outprefix}.{pname}.{effective_model_tag}.tsv"
+            out_tsv = f"{outprefix}.{pname_tag}.{effective_model_tag}.tsv"
         else:
-            out_tsv = f"{outprefix}.{pname}.{gm_tag}.{effective_model_tag}.tsv"
+            out_tsv = f"{outprefix}.{pname_tag}.{gm_tag}.{effective_model_tag}.tsv"
         tmp_tsv = f"{out_tsv}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
         wrote_header = False
         mmap_window_mb = (

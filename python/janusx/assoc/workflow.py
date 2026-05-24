@@ -674,6 +674,21 @@ def _resolve_trait_iter(
     return resolved
 
 
+def _safe_trait_file_label(label: object) -> str:
+    """
+    Convert phenotype labels to filesystem-safe filename tokens.
+
+    Keep original trait labels for logs and summaries, but avoid path
+    separators and reserved filename characters in output files.
+    """
+    text = str(label).strip()
+    if text == "":
+        return "trait"
+    text = re.sub(r'[<>:"/\\\\|?*]+', "_", text)
+    text = text.rstrip(". ").strip()
+    return text if text != "" else "trait"
+
+
 def _gwas_model_sort_key(model_name: object) -> tuple[int, str]:
     model = str(model_name or "").strip()
     order = {
@@ -3971,12 +3986,13 @@ def run_lrlmm_packed(
             res_df["plrt"] = np.asarray(res[:, 3], dtype=np.float64)
 
         gm_tag = str(genetic_model).lower()
+        pname_tag = _safe_trait_file_label(pname)
         if gm_tag == "add":
-            out_tsv = f"{outprefix}.{pname}.lrlmm.tsv"
-            out_svg = f"{outprefix}.{pname}.lrlmm.svg"
+            out_tsv = f"{outprefix}.{pname_tag}.lrlmm.tsv"
+            out_svg = f"{outprefix}.{pname_tag}.lrlmm.svg"
         else:
-            out_tsv = f"{outprefix}.{pname}.{gm_tag}.lrlmm.tsv"
-            out_svg = f"{outprefix}.{pname}.{gm_tag}.lrlmm.svg"
+            out_tsv = f"{outprefix}.{pname_tag}.{gm_tag}.lrlmm.tsv"
+            out_svg = f"{outprefix}.{pname_tag}.{gm_tag}.lrlmm.svg"
         viz_secs = 0.0
         if plot:
             viz_secs = _run_fastplot_with_status(
@@ -4430,12 +4446,13 @@ def _run_file_dense_fast_once(
         for mkey in model_sequence:
             model_label = "FastLMM" if mkey == "fastlmm" else str(mkey).upper()
             model_tag = str(mkey).lower()
+            pname_tag = _safe_trait_file_label(pname)
             if gm_tag == "add":
-                out_tsv = f"{outprefix}.{pname}.{model_tag}.tsv"
-                out_svg = f"{outprefix}.{pname}.{model_tag}.svg"
+                out_tsv = f"{outprefix}.{pname_tag}.{model_tag}.tsv"
+                out_svg = f"{outprefix}.{pname_tag}.{model_tag}.svg"
             else:
-                out_tsv = f"{outprefix}.{pname}.{gm_tag}.{model_tag}.tsv"
-                out_svg = f"{outprefix}.{pname}.{gm_tag}.{model_tag}.svg"
+                out_tsv = f"{outprefix}.{pname_tag}.{gm_tag}.{model_tag}.tsv"
+                out_svg = f"{outprefix}.{pname_tag}.{gm_tag}.{model_tag}.svg"
 
             cpu_t0 = process.cpu_times()
             wall_t0 = time.monotonic()

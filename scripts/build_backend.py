@@ -23,6 +23,71 @@ os.environ.setdefault("MATURIN_NO_MISSING_BUILD_BACKEND_WARNING", "1")
 _MATURIN = importlib.import_module("maturin")
 
 
+def _detect_total_memory_bytes() -> int | None:
+    try:
+        pages = int(os.sysconf("SC_PHYS_PAGES"))
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+        if pages > 0 and page_size > 0:
+            return pages * page_size
+    except Exception:
+        pass
+
+    if sys.platform.startswith("linux"):
+        try:
+            with open("/proc/meminfo", "r", encoding="utf-8", errors="ignore") as fh:
+                for line in fh:
+                    if line.startswith("MemTotal:"):
+                        parts = line.split()
+                        if len(parts) >= 2:
+                            kib = int(parts[1])
+                            if kib > 0:
+                                return kib * 1024
+        except Exception:
+            pass
+    return None
+
+
+def _auto_cargo_build_jobs() -> int:
+    cpu = max(1, int(os.cpu_count() or 1))
+    mem_bytes = _detect_total_memory_bytes()
+    if mem_bytes is None:
+        return 1 if sys.platform.startswith("linux") else min(cpu, 4)
+
+    gib = float(mem_bytes) / float(1024 ** 3)
+    if gib < 24.0:
+        return 1
+    if gib < 48.0:
+        return min(cpu, 2)
+    if gib < 96.0:
+        return min(cpu, 4)
+    return min(cpu, 8)
+
+
+def _maybe_configure_low_mem_cargo_env() -> dict[str, str | None]:
+    saved: dict[str, str | None] = {}
+
+    auto_jobs_flag = str(os.environ.get("JANUSX_AUTO_CARGO_JOBS", "1")).strip().lower()
+    auto_jobs_enabled = auto_jobs_flag not in {"0", "false", "no", "off"}
+    if auto_jobs_enabled and str(os.environ.get("CARGO_BUILD_JOBS", "")).strip() == "":
+        jobs = max(1, int(_auto_cargo_build_jobs()))
+        saved["CARGO_BUILD_JOBS"] = os.environ.get("CARGO_BUILD_JOBS")
+        os.environ["CARGO_BUILD_JOBS"] = str(jobs)
+        print(
+            f"[build-backend] auto-set CARGO_BUILD_JOBS={jobs} for a lower-memory Rust wheel build.",
+            flush=True,
+        )
+
+    return saved
+
+
+def _restore_env(saved: dict[str, str | None]) -> None:
+    for key, old in saved.items():
+        if old is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = old
+
+
 def _prepend_path_entry(path_entry: str) -> None:
     entry = str(path_entry).strip()
     if not entry:
@@ -669,6 +734,7 @@ def build_wheel(
 
     prev = os.environ.get("JANUSX_PREBUILD_KMC_BIND")
     os.environ["JANUSX_PREBUILD_KMC_BIND"] = "0"
+    env_saved = _maybe_configure_low_mem_cargo_env()
     try:
         _ensure_maturin_on_path()
         try:
@@ -691,6 +757,7 @@ def build_wheel(
                 config_settings,
             )
     finally:
+        _restore_env(env_saved)
         if prev is None:
             os.environ.pop("JANUSX_PREBUILD_KMC_BIND", None)
         else:

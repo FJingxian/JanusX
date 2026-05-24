@@ -2279,6 +2279,8 @@ struct GarfieldLogicRuleRecord {
     chisq: f64,
     pwald: f64,
     score: f64,
+    delta_score: String,
+    delta_pwald: String,
     full_bits: Vec<u64>,
 }
 
@@ -2333,6 +2335,126 @@ fn nan_garfield_rule_wald() -> GarfieldRuleWald {
         chisq: f64::NAN,
         pwald: f64::NAN,
     }
+}
+
+#[inline]
+fn singleton_rule_from_literal(lit: BeamLiteral) -> BeamRule {
+    BeamRule {
+        first: lit,
+        rest: Vec::new(),
+    }
+}
+
+#[inline]
+fn format_delta_metric_value(value: f64) -> String {
+    if value.is_nan() {
+        return "NaN".to_string();
+    }
+    if value.is_infinite() {
+        return if value.is_sign_positive() {
+            "inf".to_string()
+        } else {
+            "-inf".to_string()
+        };
+    }
+    if value == 0.0 {
+        return "0".to_string();
+    }
+    let abs = value.abs();
+    if abs < 1e-4 || abs >= 1e4 {
+        let raw = format!("{value:.4e}");
+        if let Some((mant, exp)) = raw.split_once('e') {
+            let mant_trimmed = mant.trim_end_matches('0').trim_end_matches('.');
+            return format!("{}e{}", mant_trimmed, exp);
+        }
+        return raw;
+    }
+    let raw = format!("{value:.6}");
+    raw.trim_end_matches('0')
+        .trim_end_matches('.')
+        .to_string()
+}
+
+#[inline]
+fn literal_metric_token(value: f64, negated: bool) -> String {
+    let text = format_delta_metric_value(value);
+    if negated {
+        format!("!{text}")
+    } else {
+        text
+    }
+}
+
+fn build_rule_delta_annotations(
+    rule: &BeamRule,
+    child_score: f64,
+    child_pwald: f64,
+    y_test: &[f64],
+    bits_test: &[u64],
+    row_words_test: usize,
+    assoc_y: &[f64],
+    bits_full: &[u64],
+    row_words_full: usize,
+    n_rows: usize,
+    n_test: usize,
+    n_full: usize,
+    assoc_sample_indices: &[usize],
+    params: &BeamSearchParams,
+) -> Result<(String, String), String> {
+    let mut score_txt = String::new();
+    let mut pwald_txt = String::new();
+
+    let mut append_literal = |op: Option<BeamBinaryOp>, lit: BeamLiteral| -> Result<(), String> {
+        if let Some(op_use) = op {
+            let sym = logic_symbol_compact(op_use);
+            score_txt.push_str(sym);
+            pwald_txt.push_str(sym);
+        }
+        let singleton = singleton_rule_from_literal(lit);
+        let test_sc = evaluate_rule_continuous(
+            &singleton,
+            y_test,
+            bits_test,
+            row_words_test,
+            n_rows,
+            n_test,
+            params.lambda_len,
+            params.lambda_not,
+        )?;
+        let bucket = bucket_from_rule(&singleton, test_sc.support_frac, params.logic_gate_mode);
+        let single_score = rank_rule_score_components_with_bucket(
+            bucket,
+            singleton.len(),
+            singleton.not_count(),
+            test_sc.raw_score,
+            test_sc.raw_score,
+            params,
+            false,
+        );
+        let singleton_bits = materialize_rule_bits(
+            &singleton,
+            bits_full,
+            row_words_full,
+            n_rows,
+            n_full,
+        )?;
+        let single_assoc =
+            fit_binary_rule_wald_from_bits(assoc_y, singleton_bits.as_slice(), assoc_sample_indices);
+        score_txt.push_str(&literal_metric_token(single_score, lit.negated));
+        pwald_txt.push_str(&literal_metric_token(single_assoc.pwald, lit.negated));
+        Ok(())
+    };
+
+    append_literal(None, rule.first)?;
+    for (op, lit) in rule.rest.iter() {
+        append_literal(Some(*op), *lit)?;
+    }
+
+    score_txt.push_str("->");
+    score_txt.push_str(&format_delta_metric_value(child_score));
+    pwald_txt.push_str("->");
+    pwald_txt.push_str(&format_delta_metric_value(child_pwald));
+    Ok((score_txt, pwald_txt))
 }
 
 #[inline]
@@ -3234,6 +3356,16 @@ fn evaluate_simbench_terms(
             chisq: assoc.chisq,
             pwald: assoc.pwald,
             score: test_score,
+            delta_score: format!(
+                "{}->{}",
+                format_delta_metric_value(test_score),
+                format_delta_metric_value(test_score)
+            ),
+            delta_pwald: format!(
+                "{}->{}",
+                format_delta_metric_value(assoc.pwald),
+                format_delta_metric_value(assoc.pwald)
+            ),
             full_bits,
         });
     }
@@ -5292,7 +5424,7 @@ fn evaluate_logic_unit_continuous(
         prepared.row_words_test,
         test_idx_local.len(),
         prepared.local_groups.as_slice(),
-        beam_params,
+        beam_params.clone(),
     )?;
     if beam_hits.is_empty() {
         return Ok(Vec::new());
@@ -5335,6 +5467,22 @@ fn evaluate_logic_unit_continuous(
         )?;
         let assoc =
             fit_binary_rule_wald_from_bits(assoc_y, full_bits.as_slice(), assoc_sample_indices);
+        let (delta_score, delta_pwald) = build_rule_delta_annotations(
+            &cand.rule,
+            cand.test_score,
+            assoc.pwald,
+            y_test,
+            prepared.test_bits.as_slice(),
+            prepared.row_words_test,
+            assoc_y,
+            prepared.selected_bits_full.as_slice(),
+            logic_bits.row_words,
+            prepared.selected_global_rows.len(),
+            test_idx_local.len(),
+            logic_bits.n_samples,
+            assoc_sample_indices,
+            &beam_params,
+        )?;
         let selected_row_indices =
             rule_selected_global_rows(&cand.rule, prepared.selected_global_rows.as_slice())?;
         out.push(GarfieldLogicRuleRecord {
@@ -5357,6 +5505,8 @@ fn evaluate_logic_unit_continuous(
             chisq: assoc.chisq,
             pwald: assoc.pwald,
             score: cand.test_score,
+            delta_score,
+            delta_pwald,
             full_bits,
         });
     }
@@ -5507,14 +5657,14 @@ fn write_logic_rules_tsv(path: &str, records: &[GarfieldLogicRuleRecord]) -> Res
     ordered.sort_by(|a, b| cmp_logic_rule_records_output(a, b));
     writeln!(
         w,
-        "unit_kind\tunit_index\tunit_name\tregion_size\tml_feature_count\tMLrank\tsnp_name\texpr\tbeta\tse\tchisq\tpwald\tscore"
+        "unit_kind\tunit_index\tunit_name\tregion_size\tml_feature_count\tMLrank\tsnp_name\texpr\tbeta\tse\tchisq\tpwald\tscore\tdelta_score\tdelta_pwald"
     )
     .map_err(|e| e.to_string())?;
     for rec in ordered.into_iter() {
         let chisq_txt = format_chisq_value(rec.chisq);
         writeln!(
             w,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.10}\t{:.10}\t{}\t{:.4e}\t{:.6}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.10}\t{:.10}\t{}\t{:.4e}\t{:.6}\t{}\t{}",
             rec.unit_kind,
             rec.unit_index,
             rec.unit_name,
@@ -5528,6 +5678,8 @@ fn write_logic_rules_tsv(path: &str, records: &[GarfieldLogicRuleRecord]) -> Res
             chisq_txt,
             rec.pwald,
             rec.score,
+            rec.delta_score,
+            rec.delta_pwald,
         )
         .map_err(|e| e.to_string())?;
     }
@@ -8288,6 +8440,12 @@ mod tests {
                 chisq: 5.0 + i as f64,
                 pwald: 1e-4 * (i as f64 + 1.0),
                 score: 20.0 - i as f64,
+                delta_score: format!("{}->{}", 20.0 - i as f64, 20.0 - i as f64),
+                delta_pwald: format!(
+                    "{}->{}",
+                    1e-4 * (i as f64 + 1.0),
+                    1e-4 * (i as f64 + 1.0)
+                ),
                 full_bits: vec![i as u64 + 1],
             })
             .collect::<Vec<_>>();
@@ -8325,6 +8483,8 @@ mod tests {
                 chisq: 10.0,
                 pwald: 1e-4,
                 score: 10.0,
+                delta_score: "10->10".to_string(),
+                delta_pwald: "0.0001->0.0001".to_string(),
                 full_bits: vec![1],
             },
             GarfieldLogicRuleRecord {
@@ -8347,6 +8507,8 @@ mod tests {
                 chisq: 11.0,
                 pwald: 2e-4,
                 score: 9.0,
+                delta_score: "9->9".to_string(),
+                delta_pwald: "0.0002->0.0002".to_string(),
                 full_bits: vec![2],
             },
             GarfieldLogicRuleRecord {
@@ -8369,6 +8531,8 @@ mod tests {
                 chisq: 12.0,
                 pwald: 3e-4,
                 score: 9.0,
+                delta_score: "9->9".to_string(),
+                delta_pwald: "0.0003->0.0003".to_string(),
                 full_bits: vec![3],
             },
             GarfieldLogicRuleRecord {
@@ -8391,6 +8555,8 @@ mod tests {
                 chisq: 13.0,
                 pwald: 4e-4,
                 score: 8.0,
+                delta_score: "8->8".to_string(),
+                delta_pwald: "0.0004->0.0004".to_string(),
                 full_bits: vec![4],
             },
         ];

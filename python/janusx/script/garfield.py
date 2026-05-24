@@ -80,6 +80,23 @@ def _looks_numeric_token(token: object) -> bool:
         return False
 
 
+def _looks_sample_header_token(token: object) -> bool:
+    text = str(token).strip().lower()
+    if text == "":
+        return False
+    norm = "".join(ch for ch in text if ch.isalnum())
+    return norm in {
+        "sampleid",
+        "sample",
+        "id",
+        "iid",
+        "fid",
+        "taxa",
+        "accession",
+        "line",
+    }
+
+
 def _split_pheno_line(line: str) -> list[str]:
     if "\t" in line:
         return [x.strip() for x in line.split("\t")]
@@ -98,9 +115,12 @@ def _read_phenotype_header_names(phenofile: str) -> Optional[list[str]]:
                 parts = _split_pheno_line(line)
                 if len(parts) <= 1:
                     return None
+                first_token = str(parts[0]).strip()
                 names = [str(x).strip() for x in parts[1:]]
                 if len(names) == 0:
                     return None
+                if _looks_sample_header_token(first_token):
+                    return names
                 if any((n != "") and (not _looks_numeric_token(n)) for n in names):
                     return names
                 return None

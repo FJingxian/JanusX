@@ -2195,6 +2195,23 @@ def _candidate_orders(kind: str) -> list[str]:
     return ["whitespace", "tab", "comma"]
 
 
+def _looks_sample_header_token(token: object) -> bool:
+    text = str(token).strip().lower()
+    if text == "":
+        return False
+    norm = "".join(ch for ch in text if ch.isalnum())
+    return norm in {
+        "sampleid",
+        "sample",
+        "id",
+        "iid",
+        "fid",
+        "taxa",
+        "accession",
+        "line",
+    }
+
+
 def _load_phenotype_flexible(path: str) -> pd.DataFrame:
     """
     Load phenotype table with delimiter auto-detection.
@@ -2207,6 +2224,8 @@ def _load_phenotype_flexible(path: str) -> pd.DataFrame:
     for mode in _candidate_orders(sniffed):
         try:
             kwargs: dict[str, typing.Any] = {}
+            kwargs["header"] = None
+            kwargs["low_memory"] = False
             if mode == "tab":
                 kwargs["sep"] = "\t"
                 kwargs["engine"] = "c"
@@ -2232,9 +2251,32 @@ def _load_phenotype_flexible(path: str) -> pd.DataFrame:
     if df.empty:
         raise ValueError("Phenotype file is empty.")
 
+    header_like = False
+    if df.shape[0] > 1 and df.shape[1] > 1:
+        row0 = pd.to_numeric(df.iloc[0, 1:], errors="coerce")
+        probe_stop = min(int(df.shape[0]), 33)
+        probe_rows = df.iloc[1:probe_stop, 1:].apply(pd.to_numeric, errors="coerce")
+        probe_has_numeric = bool(probe_rows.notna().to_numpy().any())
+        if _looks_sample_header_token(df.iloc[0, 0]) or (row0.isna().all() and probe_has_numeric):
+            header_like = True
+
+    if header_like:
+        sample_name = str(df.iloc[0, 0]).strip() or "sample_id"
+        trait_names: list[str] = []
+        for idx, raw_name in enumerate(df.iloc[0, 1:].tolist(), start=1):
+            name = str(raw_name).strip()
+            trait_names.append(name if name != "" else f"V{idx}")
+        df = df.iloc[1:, :].reset_index(drop=True)
+        df.columns = [sample_name] + trait_names
+    else:
+        df = df.copy()
+        df.columns = ["sample_id"] + [f"V{i}" for i in range(1, int(df.shape[1]))]
+
     id_col = df.columns[0]
     df[id_col] = df[id_col].astype(str).str.strip()
-    out = df.groupby(id_col, sort=False).mean(numeric_only=True)
+    data = df.drop(columns=[id_col]).apply(pd.to_numeric, errors="coerce")
+    data.index = df[id_col].astype(str)
+    out = data.groupby(data.index, sort=False).mean(numeric_only=True)
     out.index = out.index.astype(str)
     return out
 

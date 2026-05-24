@@ -499,6 +499,23 @@ def _align_pheno_to_sample_order(
     return pheno.reindex(sid_index), ids
 
 
+def _looks_sample_header_token(token: object) -> bool:
+    text = str(token).strip().lower()
+    if text == "":
+        return False
+    norm = "".join(ch for ch in text if ch.isalnum())
+    return norm in {
+        "sampleid",
+        "sample",
+        "id",
+        "iid",
+        "fid",
+        "taxa",
+        "accession",
+        "line",
+    }
+
+
 def _trait_values_and_mask(
     pheno_aligned: pd.DataFrame,
     trait_name: object,
@@ -1197,14 +1214,18 @@ def load_phenotype(
     # Detect header-like first row (non-numeric phenotype columns).
     header_like = False
     header_names = None
-    if df.shape[0] > 1 and df.shape[1] > 1:
-        row0 = pd.to_numeric(df.iloc[0, 1:], errors="coerce")
+    value_col_idx = [i for i in range(int(df.shape[1])) if i != int(id_col)]
+    if int(id_col) == 1:
+        value_col_idx = [i for i in value_col_idx if i != 0]
+    if df.shape[0] > 1 and len(value_col_idx) > 0:
+        row0 = pd.to_numeric(df.iloc[0, value_col_idx], errors="coerce")
         probe_stop = min(int(df.shape[0]), 33)
-        probe_rows = df.iloc[1:probe_stop, 1:].apply(pd.to_numeric, errors="coerce")
+        probe_rows = df.iloc[1:probe_stop, value_col_idx].apply(pd.to_numeric, errors="coerce")
         probe_has_numeric = bool(probe_rows.notna().to_numpy().any())
-        if row0.isna().all() and probe_has_numeric:
+        id_header_like = _looks_sample_header_token(df.iloc[0, int(id_col)])
+        if id_header_like or (row0.isna().all() and probe_has_numeric):
             header_like = True
-            header_names = df.iloc[0, 1:].astype(str).tolist()
+            header_names = df.iloc[0, value_col_idx].astype(str).tolist()
             df = df.iloc[1:, :].reset_index(drop=True)
 
     ids = df.iloc[:, id_col].astype(str)

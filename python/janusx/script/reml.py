@@ -59,6 +59,112 @@ def _split_tokens(values: Iterable[str] | None) -> list[str]:
     return out
 
 
+def _sniff_sep(path: str) -> str:
+    sample = ""
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+            for _ in range(16):
+                line = fh.readline()
+                if not line:
+                    break
+                s = line.strip()
+                if s != "":
+                    sample = s
+                    break
+    except Exception:
+        sample = ""
+
+    if "\t" in sample:
+        return "tab"
+    if "," in sample:
+        return "comma"
+    return "whitespace"
+
+
+def _candidate_orders(kind: str) -> list[str]:
+    if kind == "tab":
+        return ["tab", "comma", "whitespace"]
+    if kind == "comma":
+        return ["comma", "tab", "whitespace"]
+    return ["whitespace", "tab", "comma"]
+
+
+def _looks_sample_header_token(token: object) -> bool:
+    text = str(token).strip().lower()
+    if text == "":
+        return False
+    norm = "".join(ch for ch in text if ch.isalnum())
+    return norm in {
+        "sampleid",
+        "sample",
+        "id",
+        "iid",
+        "fid",
+        "taxa",
+        "accession",
+        "line",
+    }
+
+
+def _read_table_with_optional_header(path: str) -> pd.DataFrame:
+    sniffed = _sniff_sep(path)
+    read_err: Exception | None = None
+    df: pd.DataFrame | None = None
+    for mode in _candidate_orders(sniffed):
+        try:
+            kwargs: dict[str, object] = {
+                "header": None,
+                "low_memory": False,
+            }
+            if mode == "tab":
+                kwargs["sep"] = "\t"
+                kwargs["engine"] = "c"
+            elif mode == "comma":
+                kwargs["sep"] = ","
+                kwargs["engine"] = "c"
+            else:
+                kwargs["sep"] = r"\s+"
+                kwargs["engine"] = "c"
+            df_try = pd.read_csv(path, **kwargs)
+            if df_try.shape[1] <= 1:
+                continue
+            df = df_try
+            break
+        except Exception as ex:
+            read_err = ex
+            continue
+
+    if df is None:
+        if read_err is not None:
+            raise read_err
+        raise ValueError("Failed to read input table.")
+    if df.empty:
+        raise ValueError("Input file is empty.")
+
+    header_like = False
+    if df.shape[0] > 1 and df.shape[1] > 1:
+        row0 = pd.to_numeric(df.iloc[0, 1:], errors="coerce")
+        probe_stop = min(int(df.shape[0]), 33)
+        probe_rows = df.iloc[1:probe_stop, 1:].apply(pd.to_numeric, errors="coerce")
+        probe_has_numeric = bool(probe_rows.notna().to_numpy().any())
+        if _looks_sample_header_token(df.iloc[0, 0]) or (row0.isna().all() and probe_has_numeric):
+            header_like = True
+
+    if header_like:
+        sample_name = str(df.iloc[0, 0]).strip() or "sample_id"
+        data_names: list[str] = []
+        for idx, raw_name in enumerate(df.iloc[0, 1:].tolist(), start=1):
+            name = str(raw_name).strip()
+            data_names.append(name if name != "" else f"V{idx}")
+        df = df.iloc[1:, :].reset_index(drop=True)
+        df.columns = [sample_name] + data_names
+    else:
+        df = df.copy()
+        df.columns = ["sample_id"] + [f"V{i}" for i in range(1, int(df.shape[1]))]
+
+    return df
+
+
 def _resolve_columns(
     tokens: list[str],
     data_cols: list[str],
@@ -473,7 +579,7 @@ def main() -> None:
 
     load_t0 = time.time()
     try:
-        df = pd.read_csv(str(args.file), sep=None, engine="python")
+        df = _read_table_with_optional_header(str(args.file))
     except Exception:
         raise
     load_elapsed = format_elapsed(time.time() - load_t0)

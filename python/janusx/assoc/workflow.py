@@ -536,6 +536,60 @@ def _trait_values_and_mask(
     return y_full, keep
 
 
+def _resolve_trait_iter(
+    pheno_aligned: pd.DataFrame,
+    trait_names: Optional[list[object]],
+) -> list[object]:
+    """
+    Resolve requested trait selectors to actual phenotype column keys.
+
+    Rust task dispatch serializes trait names as strings, while phenotype
+    tables loaded through some `-n/--n` paths may still carry integer column
+    labels. Accept either form and preserve the real column key for downstream
+    access.
+    """
+    cols = list(pheno_aligned.columns)
+    if trait_names is None:
+        return cols
+
+    requested = list(trait_names)
+    resolved: list[object] = []
+    missing: list[str] = []
+    by_str: dict[str, list[object]] = {}
+    for col in cols:
+        by_str.setdefault(str(col), []).append(col)
+
+    for trait_name in requested:
+        if trait_name in pheno_aligned.columns:
+            resolved.append(trait_name)
+            continue
+        tkey = str(trait_name)
+        if tkey in pheno_aligned.columns:
+            resolved.append(tkey)
+            continue
+        matched = by_str.get(tkey, [])
+        if len(matched) == 1:
+            resolved.append(matched[0])
+            continue
+        if len(matched) > 1:
+            raise KeyError(
+                f"Ambiguous trait selector '{tkey}': multiple columns share this string form."
+            )
+        missing.append(tkey)
+
+    if len(requested) > 0 and len(resolved) == 0:
+        raise KeyError(
+            "Requested traits not found in phenotype columns: "
+            + ", ".join(missing[:10])
+            + (
+                " ..."
+                if len(missing) > 10
+                else ""
+            )
+        )
+    return resolved
+
+
 def _gwas_model_sort_key(model_name: object) -> tuple[int, str]:
     model = str(model_name or "").strip()
     order = {
@@ -1145,8 +1199,10 @@ def load_phenotype(
     header_names = None
     if df.shape[0] > 1 and df.shape[1] > 1:
         row0 = pd.to_numeric(df.iloc[0, 1:], errors="coerce")
-        row1 = pd.to_numeric(df.iloc[1, 1:], errors="coerce")
-        if row0.isna().all() and row1.notna().any():
+        probe_stop = min(int(df.shape[0]), 33)
+        probe_rows = df.iloc[1:probe_stop, 1:].apply(pd.to_numeric, errors="coerce")
+        probe_has_numeric = bool(probe_rows.notna().to_numpy().any())
+        if row0.isna().all() and probe_has_numeric:
             header_like = True
             header_names = df.iloc[0, 1:].astype(str).tolist()
             df = df.iloc[1:, :].reset_index(drop=True)
@@ -3491,7 +3547,7 @@ def run_lrlmm_packed(
         saved_paths = []
 
     pheno_aligned, ids = _align_pheno_to_sample_order(pheno, ids)
-    trait_iter = list(pheno_aligned.columns) if trait_names is None else [t for t in trait_names if t in pheno_aligned.columns]
+    trait_iter = _resolve_trait_iter(pheno_aligned, trait_names)
     multi_trait_mode = len(trait_iter) > 1
 
     for trait_idx, pname in enumerate(trait_iter):

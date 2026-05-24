@@ -31,6 +31,7 @@ from .workflow import (
     _fastlmm_should_switch_to_lmm,
     _format_progress_metric,
     _mixed_model_switch_to_lm_decision,
+    _resolve_trait_iter,
     _gwas_evd_stage_ctx,
     _gwas_scan_stage_ctx,
     _log_file_only,
@@ -476,7 +477,7 @@ def run_chunked_gwas_lmm_lm(
         saved_paths = []
 
     pheno_aligned, ids = _align_pheno_to_sample_order(pheno, ids)
-    trait_iter = list(pheno_aligned.columns) if trait_names is None else [t for t in trait_names if t in pheno_aligned.columns]
+    trait_iter = _resolve_trait_iter(pheno_aligned, trait_names)
     multi_trait_mode = len(trait_iter) > 1
 
     # For single-model LMM/FastLMM on PLINK BED input, reuse the shared
@@ -498,7 +499,7 @@ def run_chunked_gwas_lmm_lm(
                 model_names=[model_key],
                 trait_name=str(pname),
                 genofile=genofile,
-                pheno=pheno,
+                pheno=pheno_aligned,
                 ids=ids,
                 n_snps=n_snps,
                 outprefix=outprefix,

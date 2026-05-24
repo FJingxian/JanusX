@@ -38,6 +38,7 @@ from .workflow import (
     _log_model_line,
     _mixed_model_switch_to_lm_decision,
     _read_bim_sites,
+    _resolve_trait_iter,
     _resolve_stream_scan_chunk_size,
     _rich_success,
     _run_fastplot_from_tsv_with_status,
@@ -484,7 +485,7 @@ def run_fastlmm_packed_fullrank(
         saved_paths = []
 
     pheno_aligned, ids = _align_pheno_to_sample_order(pheno, ids)
-    trait_iter = list(pheno_aligned.columns) if trait_names is None else [t for t in trait_names if t in pheno_aligned.columns]
+    trait_iter = _resolve_trait_iter(pheno_aligned, trait_names)
     multi_trait_mode = len(trait_iter) > 1
 
     for trait_idx, pname in enumerate(trait_iter):
@@ -1105,7 +1106,7 @@ def run_lm_packed_fullrank(
         saved_paths = []
 
     pheno_aligned, ids = _align_pheno_to_sample_order(pheno, ids)
-    trait_iter = list(pheno_aligned.columns) if trait_names is None else [t for t in trait_names if t in pheno_aligned.columns]
+    trait_iter = _resolve_trait_iter(pheno_aligned, trait_names)
     multi_trait_mode = len(trait_iter) > 1
 
     for pname in trait_iter:
@@ -1401,11 +1402,7 @@ def run_lm_stream_bed_single_entry(
         saved_paths = []
 
     pheno_aligned, ids = _align_pheno_to_sample_order(pheno, ids)
-    trait_iter = (
-        list(pheno_aligned.columns)
-        if trait_names is None
-        else [t for t in trait_names if t in pheno_aligned.columns]
-    )
+    trait_iter = _resolve_trait_iter(pheno_aligned, trait_names)
     multi_trait_mode = len(trait_iter) > 1
 
     for pname in trait_iter:
@@ -1796,7 +1793,7 @@ def run_lmm_packed_fullrank(
         saved_paths = []
 
     pheno_aligned, ids = _align_pheno_to_sample_order(pheno, ids)
-    trait_iter = list(pheno_aligned.columns) if trait_names is None else [t for t in trait_names if t in pheno_aligned.columns]
+    trait_iter = _resolve_trait_iter(pheno_aligned, trait_names)
     multi_trait_mode = len(trait_iter) > 1
 
     for pname in trait_iter:

@@ -42,6 +42,7 @@ from .workflow import (
     _pca_cache_path,
     _pca_cache_path_legacy,
     _read_id_file,
+    _resolve_trait_iter,
     _replace_file_with_retry,
     _resolve_file_input_matrix,
     _rich_success,
@@ -1118,7 +1119,7 @@ def run_farmcpu_fullmem(
         saved_paths = []
 
     pheno_aligned, famid = _align_pheno_to_sample_order(pheno, famid)
-    trait_iter = list(pheno_aligned.columns) if trait_names is None else [t for t in trait_names if t in pheno_aligned.columns]
+    trait_iter = _resolve_trait_iter(pheno_aligned, trait_names)
     multi_trait_mode = len(trait_iter) > 1
     for trait_idx, phename in enumerate(trait_iter):
         y_full, famidretain = _trait_values_and_mask(pheno_aligned, str(phename))

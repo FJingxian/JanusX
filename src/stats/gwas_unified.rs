@@ -3,6 +3,7 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
+use crate::algwas::algwas_packed_to_tsv;
 use crate::assoc::farmcpu_packed_to_tsv;
 use crate::glm::glmf32_packed_assoc_to_tsv;
 use crate::linalg::{chi2_sf_df1, cholesky_inplace, cholesky_solve_into};
@@ -239,6 +240,7 @@ pub fn gwas_trait_model_dispatch_v2<'py>(
             "lm" => Some("lm"),
             "lmm" => Some("lmm"),
             "fastlmm" => Some("fastlmm"),
+            "algwas" => Some("algwas"),
             _ => None,
         };
         if let Some(v) = norm {
@@ -268,6 +270,7 @@ pub fn gwas_trait_model_dispatch_v2<'py>(
                     }
                 }
                 "farmcpu" => "farmcpu",
+                "algwas" => "algwas",
                 _ => "unknown",
             };
             let item = PyDict::new(py);
@@ -620,9 +623,76 @@ pub fn gwas_packed_unified_to_tsv<'py>(
                 result_obj.set_item("pseudo_rows", pseudo_n)?;
                 result_obj.set_item("written_rows", rows_n)?;
             }
+            "algwas" => {
+                let y: PyReadonlyArray1<'py, f64> = req_item(&job, "y")?.extract()?;
+                let x_cov: PyReadonlyArray2<'py, f64> = req_item(&job, "x_cov")?.extract()?;
+                let sample_indices: Option<PyReadonlyArray1<'py, i64>> =
+                    match opt_item(&job, "sample_indices")? {
+                        Some(v) if !v.is_none() => Some(v.extract()?),
+                        _ => None,
+                    };
+                let row_indices: Option<PyReadonlyArray1<'py, i64>> =
+                    match opt_item(&job, "row_indices")? {
+                        Some(v) if !v.is_none() => Some(v.extract()?),
+                        _ => None,
+                    };
+                let qtn_bound: Option<usize> =
+                    opt_item(&job, "qtn_bound")?.and_then(|v| v.extract().ok());
+                let lambda_steps: usize = opt_item(&job, "lambda_steps")?
+                    .and_then(|v| v.extract().ok())
+                    .unwrap_or(64);
+                let lambda_min_ratio: f32 = opt_item(&job, "lambda_min_ratio")?
+                    .and_then(|v| v.extract().ok())
+                    .unwrap_or(0.001);
+                let scan_step: usize = opt_item(&job, "scan_step")?
+                    .and_then(|v| v.extract().ok())
+                    .unwrap_or(10_000);
+                let scan_progress_callback: Option<Py<PyAny>> =
+                    match opt_item(&job, "scan_progress_callback")? {
+                        Some(v) if !v.is_none() => Some(v.extract()?),
+                        _ => None,
+                    };
+                let stage1_progress_callback: Option<Py<PyAny>> =
+                    match opt_item(&job, "stage1_progress_callback")? {
+                        Some(v) if !v.is_none() => Some(v.extract()?),
+                        _ => None,
+                    };
+                let pseudo_tsv: Option<String> =
+                    opt_item(&job, "pseudo_tsv")?.and_then(|v| v.extract().ok());
+
+                let out_tsv: String = req_item(&job, "out_tsv")?.extract()?;
+                let (qtn_n, pseudo_n, rows_n) = algwas_packed_to_tsv(
+                    py,
+                    y,
+                    x_cov,
+                    chrom.clone(),
+                    pos.clone(),
+                    allele0.clone(),
+                    allele1.clone(),
+                    packed.clone(),
+                    n_samples,
+                    row_flip.clone(),
+                    row_maf.clone(),
+                    row_missing.clone(),
+                    out_tsv.as_str(),
+                    sample_indices,
+                    row_indices,
+                    qtn_bound,
+                    lambda_steps,
+                    lambda_min_ratio,
+                    scan_step,
+                    stage1_progress_callback,
+                    threads,
+                    scan_progress_callback,
+                    pseudo_tsv.as_deref(),
+                )?;
+                result_obj.set_item("qtn_count", qtn_n)?;
+                result_obj.set_item("pseudo_rows", pseudo_n)?;
+                result_obj.set_item("written_rows", rows_n)?;
+            }
             _ => {
                 return Err(PyValueError::new_err(format!(
-                    "jobs[{i}] has unsupported model '{}'; expected one of: lm, lmm, fastlmm, farmcpu",
+                    "jobs[{i}] has unsupported model '{}'; expected one of: lm, lmm, fastlmm, farmcpu, algwas",
                     model_lc
                 )));
             }

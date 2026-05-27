@@ -504,14 +504,7 @@ pub fn feature_scores_random_forest_permutation(
     cfg: ExtraTreesConfig,
     perm_cfg: PermutationConfig,
 ) -> Vec<f64> {
-    feature_scores_random_forest_permutation_grouped(
-        x_rows,
-        y,
-        response,
-        cfg,
-        perm_cfg,
-        None,
-    )
+    feature_scores_random_forest_permutation_grouped(x_rows, y, response, cfg, perm_cfg, None)
 }
 
 pub fn feature_scores_random_forest_permutation_grouped(
@@ -522,8 +515,7 @@ pub fn feature_scores_random_forest_permutation_grouped(
     perm_cfg: PermutationConfig,
     feature_group_ids: Option<&[usize]>,
 ) -> Vec<f64> {
-    let (model, _importance) =
-        fit_random_forest(x_rows, y, response, cfg, feature_group_ids);
+    let (model, _importance) = fit_random_forest(x_rows, y, response, cfg, feature_group_ids);
     permutation_importance(&model, x_rows, y, response, perm_cfg, cfg.allow_parallel)
 }
 

@@ -70,6 +70,7 @@ python-source = "python"
 cargo-extra-args = "--locked"
 include = [
     { path = "scripts/build_backend.py", format = "sdist" },
+    { path = "todo/FastTree.c", format = "sdist" },
     { path = "python/janusx/native/build_kmc_bind.py", format = "sdist" },
     { path = "python/janusx/native/kmc_count_bind.cpp", format = "sdist" },
     { path = "python/janusx/native/vendor/kmc/3rd_party/cloudflare/zlib.h", format = "sdist" },

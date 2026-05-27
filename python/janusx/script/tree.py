@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-JanusX: tree workflow entry (NJ)
+JanusX: tree workflow entry (NJ / FastTree)
 
 Current stage:
 1) `jx tree -nj`: genotype/FASTA -> MSA -> Neighbor-Joining tree
+2) `jx tree -ml`: FASTA or genotype -> FastTree ML tree
 
 Examples
 --------
@@ -12,25 +13,29 @@ Examples
   jx tree -bfile panel -o out --prefix panel_tree --write-phylip -nj
   jx tree -vcf cohort.vcf.gz -o out -nj bionj
   jx tree -vcf cohort.vcf.gz -o out -nj bionj-dist
+  jx tree -fa aln.fasta -o out -ml
+  jx tree -vcf cohort.vcf.gz -o out -ml
 """
 
 from __future__ import annotations
 
 import argparse
-import math
 import os
 import re
+import subprocess
 import sys
 import time
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Iterable
 
 import numpy as np
 
 from janusx.gfreader import inspect_genotype_file, load_genotype_chunks
 from janusx.janusx import (
+    FastTreePrepOptions,
+    fasttree_prepare_alignment,
     geno_chunk_to_alignment_u8_siteinfo,
-    ml_newick_from_alignment_u8,
     nj_newick_from_alignment_u8,
 )
 
@@ -239,6 +244,59 @@ def _fasta_to_alignment(path: str, logger) -> tuple[list[str], list[bytearray], 
     seqs = [bytearray(seq.encode("ascii")) for seq in parsed_seqs]
     logger.info(f"Alignment ready: samples={len(sample_ids)}, sites={n_sites}")
     return sample_ids, seqs, n_sites, {"read": time.time() - t0, "convert": 0.0}
+
+
+def _fasttree_executable_names() -> list[str]:
+    if os.name == "nt":
+        return ["FastTreeMP.exe", "FastTree.exe"]
+    return ["FastTree"]
+
+
+def _resolve_fasttree_executable() -> str:
+    package_dir = Path(__file__).resolve().parents[1]
+    exe_names = _fasttree_executable_names()
+    candidates: list[Path] = [package_dir / "bin" / exe_name for exe_name in exe_names]
+
+    repo_root = Path(__file__).resolve().parents[3]
+    artifact_root = repo_root / "target" / "janusx-artifacts"
+    if artifact_root.is_dir():
+        for exe_name in exe_names:
+            matches = sorted(
+                artifact_root.glob(f"**/fasttree/{exe_name}"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            candidates.extend(matches)
+
+    for cand in candidates:
+        if not cand.is_file():
+            continue
+        if os.name != "nt":
+            try:
+                mode = cand.stat().st_mode
+                if (mode & 0o111) == 0:
+                    cand.chmod(mode | 0o755)
+            except OSError:
+                pass
+        return str(cand)
+
+    raise FileNotFoundError(
+        "Bundled FastTree executable not found. Rebuild the extension/wheel so "
+        "`build.rs` can prepare `target/janusx-artifacts/.../fasttree/` with "
+        + ", ".join(exe_names)
+        + "."
+    )
+
+
+def _prepare_fasttree_env(thread: int) -> dict[str, str]:
+    env = os.environ.copy()
+    if int(thread) > 0:
+        env["OMP_NUM_THREADS"] = str(int(thread))
+    env.setdefault("OMP_DYNAMIC", "FALSE")
+    env.setdefault("OMP_MAX_ACTIVE_LEVELS", "1")
+    env.setdefault("OMP_PROC_BIND", "spread")
+    env.setdefault("OMP_PLACES", "cores")
+    return env
 
 
 def _resolve_ml_mode(mode: str | None, asc: bool) -> tuple[str, str, str]:
@@ -511,9 +569,10 @@ def build_tree_parser() -> CliArgumentParser:
     parser = CliArgumentParser(
         prog="jx tree",
         description=(
-            "Tree workflow entrypoint (NJ only).\n"
+            "Tree workflow entrypoint.\n"
             "- `-nj` (optional MODE: exact|bionj|bionj-dist|bionj-jc|bionj-binom|bionj-auto|approx): "
-            "run Neighbor-Joining workflow."
+            "run Neighbor-Joining workflow.\n"
+            "- `-ml`: run bundled FastTree maximum-likelihood workflow."
         ),
         formatter_class=cli_help_formatter(),
         epilog=minimal_help_epilog(
@@ -523,13 +582,16 @@ def build_tree_parser() -> CliArgumentParser:
                 "jx tree -vcf cohort.vcf.gz -o out --prefix cohort_tree -nj bionj",
                 "jx tree -vcf cohort.vcf.gz -o out --prefix cohort_tree -nj bionj-dist",
                 "jx tree -vcf cohort.vcf.gz -o out --prefix cohort_tree -nj approx",
+                "jx tree -fa aln.fasta -o out --prefix aln_tree -ml",
+                "jx tree -vcf cohort.vcf.gz -o out --prefix cohort_tree -ml",
                 "jx tree -bfile panel -o out --prefix panel_tree --profile -nj",
             ]
         ),
     )
     _add_tree_input_args(parser, required=False)
     model_group = parser.add_argument_group("Model arguments")
-    model_group.add_argument(
+    model_flags = model_group.add_mutually_exclusive_group(required=False)
+    model_flags.add_argument(
         "-nj", "--nj",
         nargs="?",
         const="exact",
@@ -549,6 +611,13 @@ def build_tree_parser() -> CliArgumentParser:
             "or bionj variants: bionj(dist default), bionj-dist, bionj-jc, "
             "bionj-binom, bionj-auto."
         ),
+    )
+    model_flags.add_argument(
+        "-ml", "--ml",
+        dest="ml",
+        action="store_true",
+        default=False,
+        help="Run bundled FastTree maximum-likelihood tree inference.",
     )
     _add_tree_optional_args(
         parser,
@@ -705,6 +774,11 @@ def _run_ml(args, *, log_tag: str) -> None:
     if args.fasta:
         input_path = str(args.fasta)
         input_kind = "fasta"
+    elif args.file:
+        raise ValueError(
+            "`-ml` uses bundled FastTree and currently supports only "
+            "-fa/-vcf/-hmp/-bfile inputs. Use `-nj` for `-file`."
+        )
     else:
         input_path, _ = determine_genotype_source_from_args(args)
         input_kind = "genotype"
@@ -717,243 +791,111 @@ def _run_ml(args, *, log_tag: str) -> None:
         logger.info(f"Input FASTA: {format_path_for_display(input_path)}")
     else:
         logger.info(f"Input genotype: {format_path_for_display(input_path)}")
+    fasttree_exe = _resolve_fasttree_executable()
+    env = _prepare_fasttree_env(int(args.thread))
+    logger.info(f"ML engine: FastTree ({format_path_for_display(fasttree_exe)})")
     if int(args.thread) == 0:
-        logger.info("ML threads: auto")
+        logger.info("FastTree threads: auto")
     else:
-        logger.info(f"ML threads: {int(args.thread)}")
-
-    ml_mode, ml_mode_label, ml_compat_preset = _resolve_ml_mode(
-        getattr(args, "ml", "exact"),
-        bool(args.asc),
+        logger.info(f"FastTree threads: {int(args.thread)}")
+    logger.info("FastTree model: nucleotide ML (-nt)")
+    logger.info(
+        "FastTree OpenMP policy: "
+        f"dynamic={env.get('OMP_DYNAMIC', 'default')}, "
+        f"bind={env.get('OMP_PROC_BIND', 'default')}, "
+        f"places={env.get('OMP_PLACES', 'default')}"
     )
-    logger.info(f"ML mode: {ml_mode_label}")
-    logger.info(f"ML ASC correction: {'on' if bool(args.asc) else 'off'}")
-    bootstrap_niter = int(getattr(args, "bootstrap", 0))
-    support_mode = str(getattr(args, "support", "bootstrap")).strip().lower()
-    if bootstrap_niter > 0:
-        logger.info(
-            f"ML support: on ({bootstrap_niter} resamples, mode={support_mode})"
-        )
-    else:
-        logger.info("ML support: off")
 
     t0 = time.time()
+    profile: dict[str, float] = {}
+
     if input_kind == "fasta":
         sample_ids, seqs, n_sites, prof_stream = _fasta_to_alignment(input_path, logger)
-    else:
-        sample_ids, seqs, n_sites, prof_stream = _genotype_to_alignment(args, input_path, logger)
-
-    added_asc_sites = 0
-    if bool(args.asc):
-        seqs, added_asc_sites = _apply_asc_pseudo_constant_sites(seqs)
-        n_sites += added_asc_sites
-        logger.info(
-            f"ASC pseudo correction: appended {added_asc_sites} constant sites "
-            f"(A/C/G/T each {added_asc_sites // 4})."
-        )
-
-    t_write_fasta = 0.0
-    fasta_path = f"{out_prefix}.fasta"
-    fasta_in_abs = os.path.abspath(input_path) if input_kind == "fasta" else None
-    fasta_out_abs = os.path.abspath(fasta_path)
-    if fasta_in_abs is not None and fasta_in_abs == fasta_out_abs:
-        logger.info("Input FASTA already matches output FASTA path; skipped rewrite.")
-    else:
-        t_write_fasta = time.time()
-        _write_fasta(fasta_path, sample_ids, seqs)
-        t_write_fasta = time.time() - t_write_fasta
-        logger.info(f"Wrote FASTA alignment: {format_path_for_display(fasta_path)}")
-
-    t_write_phy = 0.0
-    if bool(args.write_phylip):
-        t_write_phy = time.time()
-        phy_path = f"{out_prefix}.phy"
-        _write_phylip(phy_path, sample_ids, seqs)
-        t_write_phy = time.time() - t_write_phy
-        logger.info(f"Wrote PHYLIP alignment: {format_path_for_display(phy_path)}")
-
-    aln = _build_alignment_matrix(seqs)
-    t_ml = time.time()
-    ml_env = {}
-    if ml_mode == "compat":
-        # FastTree-compat stage-1:
-        # Use SH-like formula and avoid JanusX-specific stabilization heuristics.
-        ml_env["JANUSX_ML_SHLIKE_FASTTREE_FORMULA"] = "1"
-        ml_env["JANUSX_ML_SHLIKE_ADAPTIVE"] = "0"
-        ml_env["JANUSX_ML_SHLIKE_WEIGHTED"] = "0"
-        ml_env["JANUSX_ML_SHLIKE_WINSOR"] = "0"
-        ml_env["JANUSX_ML_SHLIKE_RECHECK"] = "0"
-        # FastTree-like NNI acceptance: local quartet decision + periodic audits.
-        ml_env["JANUSX_ML_COMPAT_STRICT_RECHECK"] = os.environ.get(
-            "JANUSX_ML_COMPAT_STRICT_RECHECK", "0"
-        )
-        ml_env["JANUSX_ML_COMPAT_AUDIT_EVERY"] = os.environ.get(
-            "JANUSX_ML_COMPAT_AUDIT_EVERY", "64"
-        )
-        ml_env["JANUSX_ML_COMPAT_AUDIT_TOL"] = os.environ.get(
-            "JANUSX_ML_COMPAT_AUDIT_TOL", "0.1"
-        )
-        ml_env["JANUSX_ML_COMPAT_ROUND_DROP_TOL"] = os.environ.get(
-            "JANUSX_ML_COMPAT_ROUND_DROP_TOL", "0.2"
-        )
-        # FastTree-like ME pre-phase (lightweight by default), then ML-NNI.
-        ml_env["JANUSX_ML_COMPAT_ME_ROUNDS"] = os.environ.get(
-            "JANUSX_ML_COMPAT_ME_ROUNDS", "0"
-        )
-        ml_env["JANUSX_ML_COMPAT_ME_BATCH"] = os.environ.get(
-            "JANUSX_ML_COMPAT_ME_BATCH", "4"
-        )
-        ml_env["JANUSX_ML_COMPAT_ME_PASSES_PER_ROUND"] = os.environ.get(
-            "JANUSX_ML_COMPAT_ME_PASSES_PER_ROUND", "1"
-        )
-        # Optional SPR-chain stage (default off to keep stable baseline).
-        ml_env["JANUSX_ML_COMPAT_SPR_ROUNDS"] = os.environ.get(
-            "JANUSX_ML_COMPAT_SPR_ROUNDS", "0"
-        )
-        ml_env["JANUSX_ML_COMPAT_SPR_LEN"] = os.environ.get(
-            "JANUSX_ML_COMPAT_SPR_LEN", "2"
-        )
-        # FastTree-like handling for ambiguous symbols in compat mode:
-        # non-ACGT(U) characters are treated as unknown.
-        ml_env["JANUSX_ML_COMPAT_STRICT_AMBIG"] = os.environ.get(
-            "JANUSX_ML_COMPAT_STRICT_AMBIG", "1"
-        )
-        if ml_compat_preset == "compat-accurate":
-            # Consistency-first CAT preset:
-            # round-wise posterior reassignment and soft-rate expectation.
-            n_taxa = max(2, int(len(sample_ids)))
-            auto_sched_on = str(
-                os.environ.get("JANUSX_ML_COMPAT_ENABLE_ME_SPR_AUTO", "0")
-            ).strip().lower() in {"1", "true", "yes", "on"}
-            if auto_sched_on:
-                # Optional FastTree-like ME/SPR schedule for large cohorts.
-                # Keep disabled by default to avoid runtime regressions.
-                if n_taxa >= 512:
-                    me_rounds_auto = max(
-                        4, int(math.ceil(1.25 * math.log2(float(n_taxa))))
-                    )
-                    me_rounds_auto = min(me_rounds_auto, 16)
-                    spr_rounds_auto = 1
-                    spr_len_auto = 6
-                else:
-                    me_rounds_auto = 0
-                    spr_rounds_auto = 0
-                    spr_len_auto = 2
-                ml_env["JANUSX_ML_COMPAT_ME_ROUNDS"] = os.environ.get(
-                    "JANUSX_ML_COMPAT_ME_ROUNDS", str(me_rounds_auto)
-                )
-                ml_env["JANUSX_ML_COMPAT_SPR_ROUNDS"] = os.environ.get(
-                    "JANUSX_ML_COMPAT_SPR_ROUNDS", str(spr_rounds_auto)
-                )
-                ml_env["JANUSX_ML_COMPAT_SPR_LEN"] = os.environ.get(
-                    "JANUSX_ML_COMPAT_SPR_LEN", str(spr_len_auto)
-                )
-            compat_cat_update_default = min(4096, int(n_sites))
-            ml_env["JANUSX_ML_COMPAT_AUDIT_EVERY"] = os.environ.get(
-                "JANUSX_ML_COMPAT_AUDIT_EVERY", "32"
-            )
-            ml_env["JANUSX_ML_COMPAT_AUDIT_TOL"] = os.environ.get(
-                "JANUSX_ML_COMPAT_AUDIT_TOL", "0.05"
-            )
-            ml_env["JANUSX_ML_COMPAT_ROUND_DROP_TOL"] = os.environ.get(
-                "JANUSX_ML_COMPAT_ROUND_DROP_TOL", "0.05"
-            )
-            ml_env["JANUSX_ML_COMPAT_FULLSCAN_ROUNDS"] = os.environ.get(
-                "JANUSX_ML_COMPAT_FULLSCAN_ROUNDS", "1"
-            )
-            ml_env["JANUSX_ML_COMPAT_ME_FULLSCAN_ROUNDS"] = os.environ.get(
-                "JANUSX_ML_COMPAT_ME_FULLSCAN_ROUNDS", "1"
-            )
-            ml_env["JANUSX_ML_COMPAT_SPR_FULLSCAN_ROUNDS"] = os.environ.get(
-                "JANUSX_ML_COMPAT_SPR_FULLSCAN_ROUNDS", "1"
-            )
-            ml_env["JANUSX_ML_COMPAT_CAT_UPDATE_EVERY"] = os.environ.get(
-                "JANUSX_ML_COMPAT_CAT_UPDATE_EVERY", "1"
-            )
-            ml_env["JANUSX_ML_COMPAT_CAT_UPDATE_SITES"] = os.environ.get(
-                "JANUSX_ML_COMPAT_CAT_UPDATE_SITES", str(compat_cat_update_default)
-            )
-            ml_env["JANUSX_ML_COMPAT_CAT_KEEP_PMIN"] = os.environ.get(
-                "JANUSX_ML_COMPAT_CAT_KEEP_PMIN", "0.15"
-            )
-            ml_env["JANUSX_ML_COMPAT_CAT_PRIOR_WEIGHT"] = os.environ.get(
-                "JANUSX_ML_COMPAT_CAT_PRIOR_WEIGHT", "0.2"
-            )
-            ml_env["JANUSX_ML_COMPAT_CAT_POST_TAU"] = os.environ.get(
-                "JANUSX_ML_COMPAT_CAT_POST_TAU", "0.9"
-            )
-            ml_env["JANUSX_ML_COMPAT_CAT_SOFT_RATE"] = os.environ.get(
-                "JANUSX_ML_COMPAT_CAT_SOFT_RATE", "1"
-            )
+        profile["read"] = float(prof_stream.get("read", 0.0))
+        fasta_path = f"{out_prefix}.fasta"
+        fasta_in_abs = os.path.abspath(input_path)
+        fasta_out_abs = os.path.abspath(fasta_path)
+        if fasta_in_abs == fasta_out_abs:
+            logger.info("Input FASTA already matches output FASTA path; skipped rewrite.")
+            profile["write_fasta"] = 0.0
         else:
-            # Speed-oriented compat CAT preset: static assignment.
-            ml_env["JANUSX_ML_COMPAT_CAT_UPDATE_EVERY"] = os.environ.get(
-                "JANUSX_ML_COMPAT_CAT_UPDATE_EVERY", "0"
-            )
-            ml_env["JANUSX_ML_COMPAT_CAT_KEEP_PMIN"] = os.environ.get(
-                "JANUSX_ML_COMPAT_CAT_KEEP_PMIN", "0.55"
-            )
-            ml_env["JANUSX_ML_COMPAT_CAT_PRIOR_WEIGHT"] = os.environ.get(
-                "JANUSX_ML_COMPAT_CAT_PRIOR_WEIGHT", "0.5"
-            )
-            ml_env["JANUSX_ML_COMPAT_CAT_POST_TAU"] = os.environ.get(
-                "JANUSX_ML_COMPAT_CAT_POST_TAU", "1.0"
-            )
-            ml_env["JANUSX_ML_COMPAT_CAT_SOFT_RATE"] = os.environ.get(
-                "JANUSX_ML_COMPAT_CAT_SOFT_RATE", "0"
-            )
-        compat_cache_cap = int(os.environ.get("JANUSX_ML_COMPAT_CACHE_SITES", "4096"))
-        compat_cache_sites = max(256, min(int(n_sites), compat_cache_cap))
-        ml_env["JANUSX_ML_SHLIKE_CACHE_SITES"] = str(compat_cache_sites)
-        ml_env["JANUSX_ML_SHLIKE_DRAW_SITES"] = str(compat_cache_sites)
-        compat_quartet_default = min(2048, int(n_sites))
-        compat_quartet_sites = int(
-            os.environ.get("JANUSX_ML_COMPAT_QUARTET_SITES", str(compat_quartet_default))
+            t_write_fasta = time.time()
+            _write_fasta(fasta_path, sample_ids, seqs)
+            profile["write_fasta"] = time.time() - t_write_fasta
+            logger.info(f"Wrote FASTA alignment: {format_path_for_display(fasta_path)}")
+
+        if bool(args.write_phylip):
+            t_write_phy = time.time()
+            phy_path = f"{out_prefix}.phy"
+            _write_phylip(phy_path, sample_ids, seqs)
+            profile["write_phylip"] = time.time() - t_write_phy
+            logger.info(f"Wrote PHYLIP alignment: {format_path_for_display(phy_path)}")
+        else:
+            profile["write_phylip"] = 0.0
+
+        n_samples = len(sample_ids)
+    else:
+        ml_kind = "vcf" if args.vcf else "hmp" if args.hmp else "bfile"
+        opts = FastTreePrepOptions(out_prefix)
+        opts.write_phylip = bool(args.write_phylip)
+        opts.maf = float(args.maf)
+        opts.missing_rate = float(args.geno)
+        opts.het = float(args.het)
+        opts.threads = int(args.thread) if int(args.thread) > 0 else 0
+        if int(args.thread) == 0:
+            logger.info("FastTree prep threads: auto")
+        else:
+            logger.info(f"FastTree prep threads: {int(args.thread)}")
+
+        t_prepare = time.time()
+        prep = fasttree_prepare_alignment(ml_kind, input_path, opts)
+        profile["prepare_alignment"] = time.time() - t_prepare
+        fasta_path = str(prep.fasta_path)
+        n_samples = int(prep.n_samples)
+        n_sites = int(prep.n_sites)
+        logger.info(f"Wrote FASTA alignment: {format_path_for_display(fasta_path)}")
+        if prep.phylip_path:
+            logger.info(f"Wrote PHYLIP alignment: {format_path_for_display(prep.phylip_path)}")
+        logger.info(
+            f"Alignment ready: samples={prep.n_samples}, sites={prep.n_sites}, "
+            f"skipped={prep.skipped_sites}"
         )
-        ml_env["JANUSX_ML_COMPAT_QUARTET_SITES"] = str(
-            max(64, min(int(n_sites), compat_quartet_sites))
-        )
-        compat_me_sites_default = min(768, int(n_sites))
-        compat_me_sites = int(
-            os.environ.get("JANUSX_ML_COMPAT_ME_SITES", str(compat_me_sites_default))
-        )
-        ml_env["JANUSX_ML_COMPAT_ME_SITES"] = str(
-            max(64, min(int(n_sites), compat_me_sites))
-        )
-    with _temporary_env(ml_env):
-        newick = ml_newick_from_alignment_u8(
-            aln,
-            sample_ids,
-            min_overlap=1,
-            max_taxa=max(2, len(sample_ids)),
-            threads=int(args.thread),
-            ml_mode=ml_mode,
-            bootstrap_niter=bootstrap_niter,
-            support_mode=support_mode,
-        )
-    t_ml = time.time() - t_ml
-    t_write_nwk = time.time()
+
     nwk_path = f"{out_prefix}.nwk"
-    txt = str(newick).strip()
-    if txt == "":
-        raise RuntimeError("Rust ML engine produced empty Newick output.")
+    stderr_path = f"{out_prefix}.fasttree.stderr.log"
+    cmd = [fasttree_exe, "-nt", "-quote", fasta_path]
+    t_fasttree = time.time()
     with open(nwk_path, "w", encoding="utf-8") as fw:
-        fw.write(txt)
-        fw.write("\n")
-    t_write_nwk = time.time() - t_write_nwk
+        proc = subprocess.run(
+            cmd,
+            stdout=fw,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+            check=False,
+        )
+    profile["fasttree"] = time.time() - t_fasttree
+
+    stderr_text = str(proc.stderr or "")
+    if stderr_text.strip():
+        with open(stderr_path, "w", encoding="utf-8") as ew:
+            ew.write(stderr_text)
+        logger.info(f"Wrote FastTree stderr log: {format_path_for_display(stderr_path)}")
+
+    if proc.returncode != 0:
+        tail = stderr_text.strip().splitlines()[-1] if stderr_text.strip() else ""
+        detail = f" {tail}" if tail else ""
+        raise RuntimeError(f"FastTree failed with exit code {proc.returncode}.{detail}")
+
+    t_write_nwk = time.time()
+    if not os.path.exists(nwk_path) or os.path.getsize(nwk_path) == 0:
+        raise RuntimeError("FastTree produced empty Newick output.")
+    profile["write_newick"] = time.time() - t_write_nwk
     logger.info(f"Wrote Newick tree: {format_path_for_display(nwk_path)}")
 
     elapsed = time.time() - t0
+    profile["total"] = float(elapsed)
     if bool(args.profile):
-        profile = {
-            "read": float(prof_stream.get("read", 0.0)),
-            "convert": float(prof_stream.get("convert", 0.0)),
-            "write_fasta": float(t_write_fasta),
-            "write_phylip": float(t_write_phy),
-            "ml": float(t_ml),
-            "write_newick": float(t_write_nwk),
-            "total": float(elapsed),
-        }
         logger.info(
             "Profile(s): "
             + ", ".join(f"{k}={v:.4f}" for k, v in profile.items())
@@ -962,12 +904,12 @@ def _run_ml(args, *, log_tag: str) -> None:
         with open(prof_path, "w", encoding="utf-8") as fw:
             fw.write("stage\tseconds\n")
             for k, v in profile.items():
-                fw.write(f"{k}\t{v:.8f}\n")
+                fw.write(f"{k}\t{float(v):.8f}\n")
         logger.info(f"Wrote profile: {format_path_for_display(prof_path)}")
 
     log_success(
         logger,
-        f"{log_tag} ml phase finished [samples={len(sample_ids)}, sites={n_sites}, time={format_elapsed(elapsed)}]",
+        f"{log_tag} ml phase finished [samples={n_samples}, sites={n_sites}, time={format_elapsed(elapsed)}]",
     )
 
 
@@ -978,10 +920,13 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv_list)
 
     if not any((args.vcf, args.hmp, args.file, args.bfile, args.fasta)):
-        parser.error("`-nj` requires one input: -vcf/-hmp/-file/-bfile/-fa.")
+        parser.error("`jx tree` requires one input: -vcf/-hmp/-file/-bfile/-fa.")
 
-    nj_mode = str(args.nj if args.nj is not None else "exact").lower()
     try:
-        _run_nj(args, log_tag="tree", nj_mode=nj_mode)
+        if bool(getattr(args, "ml", False)):
+            _run_ml(args, log_tag="tree")
+        else:
+            nj_mode = str(args.nj if args.nj is not None else "exact").lower()
+            _run_nj(args, log_tag="tree", nj_mode=nj_mode)
     except Exception as exc:
         parser.error(str(exc))

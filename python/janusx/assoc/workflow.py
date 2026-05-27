@@ -7,6 +7,7 @@ Design overview
 Models:
   - LMM     : streaming, low-memory implementation (slim.LMM)
   - LM      : streaming, low-memory implementation (slim.LM)
+  - ALGWAS  : packed/full-rust adaptive-lasso GWAS route
   - FarmCPU : in-memory implementation (pyBLUP.farmcpu) that loads the
               full genotype matrix
 
@@ -14,8 +15,8 @@ Execution mode (automatic)
 --------------------------
   - No explicit "low-memory" flag is required.
   - Default: LM/LMM/FastLMM run in memmap BED mode.
-  - With `-fast` (or when `-farmcpu` is selected), packed BED is loaded once
-    and reused for full-rust packed routes when available.
+  - With `-fast` (or when `-farmcpu` / `-algwas` is selected), packed BED is
+    loaded once and reused for full-rust packed routes when available.
   - FarmCPU always runs on the full in-memory genotype matrix.
 
 Caching
@@ -698,6 +699,7 @@ def _gwas_model_sort_key(model_name: object) -> tuple[int, str]:
         "LowRankLMM": 3,
         "LrLMM": 3,
         "LRLMM": 3,
+        "ALGWAS": 4,
         "Farm": 4,
         "FarmCPU": 4,
     }
@@ -4095,6 +4097,10 @@ def run_lmm_packed_fullrank(*args, **kwargs):
     from janusx.assoc.workflow_model_packed import run_lmm_packed_fullrank as _impl
     return _impl(*args, **kwargs)
 
+def run_algwas_packed_fullrank(*args, **kwargs):
+    from janusx.assoc.workflow_model_packed import run_algwas_packed_fullrank as _impl
+    return _impl(*args, **kwargs)
+
 def run_chunked_gwas_lmm_lm(*args, **kwargs):
     from janusx.assoc.workflow_model_stream import run_chunked_gwas_lmm_lm as _impl
     return _impl(*args, **kwargs)
@@ -4761,6 +4767,10 @@ def parse_args(argv: Optional[list[str]] = None):
         help="Run FarmCPU (full genotype in memory; default: %(default)s).",
     )
     models_group.add_argument(
+        "-algwas", "--algwas", action="store_true", default=False,
+        help="Run ALGWAS (packed full-rust adaptive-lasso GWAS; additive-only).",
+    )
+    models_group.add_argument(
         "-lm", "--lm", action="store_true", default=False,
         help="Run the linear model (memmap, low-memory; default: %(default)s).",
     )
@@ -4875,7 +4885,7 @@ def parse_args(argv: Optional[list[str]] = None):
         "-fast", "--fast", action="store_true", default=False,
         help=(
             "Use packed full-rust paths when available (loads BED-packed genotype once "
-            "and reuses it across LM/LMM/FastLMM/FarmCPU)."
+            "and reuses it across LM/LMM/FastLMM/ALGWAS/FarmCPU)."
         ),
     )
     optional_group.add_argument(
@@ -4931,6 +4941,8 @@ def parse_args(argv: Optional[list[str]] = None):
         parser.error("--farmcpu-nbin must be >= 1.")
     if args.farmcpu_qtn_bound is not None and int(args.farmcpu_qtn_bound) < 1:
         parser.error("--farmcpu-qtn-bound must be >= 1.")
+    if bool(args.algwas) and str(args.model).strip().lower() != "add":
+        parser.error("--algwas currently supports additive coding only (--model add).")
     try:
         args.farmcpu_bin_size = _parse_float_csv(
             args.farmcpu_bin_size,
@@ -4999,7 +5011,8 @@ def _run_gwas_pipeline(
     input_is_file_matrix = bool(_file_matrix_path_cli is not None)
     explicit_fast_mode = bool(getattr(args, "fast", False))
     farmcpu_auto_fast = bool(args.farmcpu)
-    fast_mode = bool(explicit_fast_mode or farmcpu_auto_fast)
+    algwas_auto_fast = bool(args.algwas)
+    fast_mode = bool(explicit_fast_mode or farmcpu_auto_fast or algwas_auto_fast)
     # FILE-input fast policy (2026-05): prefer Rust routes by materializing
     # PLINK cache then using packed/stream scans, instead of dense Python path.
     file_fast_rust_mode = bool(input_is_file_matrix and fast_mode)
@@ -5013,13 +5026,17 @@ def _run_gwas_pipeline(
             model_tokens.append("fastLMM")
         if args.lmm:
             model_tokens.append("LMM")
+        if args.algwas:
+            model_tokens.append("ALGWAS")
         if args.farmcpu:
             model_tokens.append("FarmCPU")
         cli_fast_mode = bool(fast_mode)
         if file_fast_rust_mode:
-            bed_backend_policy = "packed (-fast/-farmcpu; FILE->BED cache)"
+            bed_backend_policy = "packed (-fast/-farmcpu/-algwas; FILE->BED cache)"
         else:
-            bed_backend_policy = "packed (-fast/-farmcpu)" if cli_fast_mode else "memmap (default)"
+            bed_backend_policy = (
+                "packed (-fast/-farmcpu/-algwas)" if cli_fast_mode else "memmap (default)"
+            )
         cfg_rows: list[tuple[str, object]] = [
             ("Genotype file", gfile),
             ("Phenotype file", args.pheno),
@@ -5085,9 +5102,9 @@ def _run_gwas_pipeline(
     if not ensure_all_true(checks):
         raise SystemExit(1)
 
-    if not (args.lm or args.lmm or args.fastlmm or args.farmcpu):
+    if not (args.lm or args.lmm or args.fastlmm or args.algwas or args.farmcpu):
         logger.error(
-            "No model selected. Use -lm, -lmm, -fastlmm, and/or -farmcpu."
+            "No model selected. Use -lm, -lmm, -fastlmm, -algwas, and/or -farmcpu."
         )
         raise SystemExit(1)
     if args.farmcpu and args.model != "add":
@@ -5109,7 +5126,7 @@ def _run_gwas_pipeline(
             "FILE fast backend policy: Rust packed/stream via PLINK cache."
             if file_fast_rust_mode
             else (
-                "BED backend policy: packed (-fast/-farmcpu)."
+                "BED backend policy: packed (-fast/-farmcpu/-algwas)."
                 if fast_mode
                 else "BED backend policy: memmap (default)."
             )
@@ -5190,6 +5207,8 @@ def _run_gwas_pipeline(
             stream_models.append("lmm")
         if args.fastlmm:
             stream_models.append("fastlmm")
+        if args.algwas:
+            stream_models.append("algwas")
         has_farmcpu = bool(args.farmcpu)
         farmcpu_handled_in_trait_loop = False
         preloaded_packed: Union[dict[str, object], None] = None
@@ -5392,6 +5411,7 @@ def _run_gwas_pipeline(
                         and packed_preload_ready
                         and _gwas_use_packed_fastlmm_scan()
                     )
+                    require_dispatch_v2 = bool(args.algwas)
                     task_plan = None
                     rust_plan_errors: list[str] = []
                     if hasattr(jxrs, "gwas_trait_model_dispatch_v2"):
@@ -5404,6 +5424,16 @@ def _run_gwas_pipeline(
                             )
                         except Exception as ex:
                             rust_plan_errors.append(f"gwas_trait_model_dispatch_v2: {ex}")
+                    if (task_plan is None) and require_dispatch_v2:
+                        err_text = (
+                            "; ".join(rust_plan_errors)
+                            if len(rust_plan_errors) > 0
+                            else "gwas_trait_model_dispatch_v2 unavailable"
+                        )
+                        raise RuntimeError(
+                            "ALGWAS requires Rust GWAS dispatcher v2; "
+                            f"unable to build task plan ({err_text})."
+                        )
                     if task_plan is None and hasattr(jxrs, "gwas_trait_model_schedule"):
                         try:
                             task_plan = jxrs.gwas_trait_model_schedule(
@@ -5506,6 +5536,34 @@ def _run_gwas_pipeline(
                             emit_trait_header=bool(emit_trait_header_model),
                             preloaded_packed=preloaded_packed,
                             force_model=bool(args.force_model),
+                        )
+
+                    def _run_route_algwas_packed(
+                        trait_one: list[str], emit_trait_header_model: bool
+                    ) -> None:
+                        run_algwas_packed_fullrank(
+                            genofile=genofile_stream,
+                            pheno=pheno,
+                            ids=ids,
+                            outprefix=outprefix,
+                            maf_threshold=maf_threshold_scan,
+                            max_missing_rate=max_missing_rate_scan,
+                            genetic_model=args.model,
+                            het_threshold=het_threshold_scan,
+                            chunk_size=args.chunksize,
+                            qmatrix=qmatrix,
+                            cov_all=cov_all,
+                            plot=args.plot,
+                            threads=args.thread,
+                            logger=logger,
+                            use_spinner=use_spinner,
+                            snps_only=bool(args.snps_only),
+                            eff_snp_by_trait=eff_snp_by_trait,
+                            summary_rows=gwas_summary_rows,
+                            saved_paths=saved_result_paths,
+                            trait_names=trait_one,
+                            emit_trait_header=bool(emit_trait_header_model),
+                            preloaded_packed=preloaded_packed,
                         )
 
                     def _run_route_fastlmm_stream(
@@ -5648,6 +5706,7 @@ def _run_gwas_pipeline(
                         "lm_packed": _run_route_lm_packed,
                         "lmm_packed": _run_route_lmm_packed,
                         "fastlmm_packed": _run_route_fastlmm_packed,
+                        "algwas": _run_route_algwas_packed,
                         "lm_stream": _run_route_lm_stream,
                         "lmm_stream": _run_route_lmm_stream,
                         "fastlmm_stream": _run_route_fastlmm_stream,
@@ -5679,6 +5738,8 @@ def _run_gwas_pipeline(
                                     if bool(use_packed_fastlmm_scan)
                                     else "fastlmm_stream"
                                 )
+                            elif mk == "algwas":
+                                route = "algwas"
                             elif mk == "farmcpu":
                                 route = "farmcpu"
                             else:
@@ -5861,6 +5922,7 @@ def _run_gwas_pipeline(
                     "lmm": bool(args.lmm),
                     "fastlmm": bool(args.fastlmm),
                     "lm": bool(args.lm),
+                    "algwas": bool(args.algwas),
                     "farmcpu": bool(args.farmcpu),
                 },
                 "model": str(args.model),

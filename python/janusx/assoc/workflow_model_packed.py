@@ -24,6 +24,8 @@ from .workflow import (
     FastLMM,
     LMM,
     _ProgressAdapter,
+    _start_indeterminate_progress_bar,
+    _stop_indeterminate_progress_bar,
     _augment_gwas_tsv_with_snp_names,
     _align_pheno_to_sample_order,
     _as_plink_prefix,
@@ -495,15 +497,17 @@ def run_fastlmm_packed_fullrank(
         peak_rss = process.memory_info().rss
 
         y_full, sameidx = _trait_values_and_mask(pheno_aligned, str(pname))
-        keep_idx = np.flatnonzero(sameidx).astype(np.int64, copy=False)
-        n_idv = int(keep_idx.shape[0])
-        if n_idv == 0:
+        keep_idx_nonmissing = np.flatnonzero(sameidx).astype(np.int64, copy=False)
+        n_nonmissing = int(keep_idx_nonmissing.shape[0])
+        if n_nonmissing == 0:
             logger.warning(f"{pname}: no overlapping samples, skipped.")
             if pname not in eff_snp_by_trait:
                 eff_snp_by_trait[pname] = 0
             if multi_trait_mode:
                 logger.info("")
             continue
+        keep_idx = keep_idx_nonmissing
+        n_idv = int(keep_idx.shape[0])
 
         if bool(emit_trait_header):
             _emit_trait_header(
@@ -947,6 +951,13 @@ def run_fastlmm_packed_fullrank(
             scan_secs = max(time.monotonic() - scan_t0, 0.0)
             gwas_ok = True
         finally:
+            if stage1_pbar is not None:
+                try:
+                    stage1_pbar.finish()
+                    time.sleep(0.02)
+                except Exception:
+                    pass
+                stage1_pbar.close(show_done=False)
             if gwas_pbar is not None:
                 try:
                     if gwas_ok:
@@ -1120,15 +1131,17 @@ def run_lm_packed_fullrank(
         peak_rss = process.memory_info().rss
 
         y_full, sameidx = _trait_values_and_mask(pheno_aligned, str(pname))
-        keep_idx = np.flatnonzero(sameidx).astype(np.int64, copy=False)
-        n_idv = int(keep_idx.shape[0])
-        if n_idv == 0:
+        keep_idx_nonmissing = np.flatnonzero(sameidx).astype(np.int64, copy=False)
+        n_nonmissing = int(keep_idx_nonmissing.shape[0])
+        if n_nonmissing == 0:
             logger.warning(f"{pname}: no overlapping samples, skipped.")
             if pname not in eff_snp_by_trait:
                 eff_snp_by_trait[pname] = 0
             if multi_trait_mode:
                 logger.info("")
             continue
+        keep_idx = keep_idx_nonmissing
+        n_idv = int(keep_idx.shape[0])
 
         if bool(emit_trait_header):
             _emit_trait_header(
@@ -1417,15 +1430,18 @@ def run_lm_stream_bed_single_entry(
         peak_rss = process.memory_info().rss
 
         y_full, sameidx = _trait_values_and_mask(pheno_aligned, str(pname))
-        keep_idx = np.flatnonzero(sameidx).astype(np.int64, copy=False)
-        n_idv = int(keep_idx.shape[0])
-        if n_idv == 0:
+        keep_idx_nonmissing = np.flatnonzero(sameidx).astype(np.int64, copy=False)
+        n_nonmissing = int(keep_idx_nonmissing.shape[0])
+        n_missing = int(np.asarray(y_full).shape[0] - n_nonmissing)
+        if n_nonmissing == 0:
             logger.warning(f"{pname}: no overlapping samples, skipped.")
             if pname not in eff_snp_by_trait:
                 eff_snp_by_trait[pname] = 0
             if multi_trait_mode:
                 logger.info("")
             continue
+        keep_idx = keep_idx_nonmissing
+        n_idv = int(keep_idx.shape[0])
 
         if bool(emit_trait_header):
             _emit_trait_header(
@@ -1809,15 +1825,17 @@ def run_lmm_packed_fullrank(
         peak_rss = process.memory_info().rss
 
         y_full, sameidx = _trait_values_and_mask(pheno_aligned, str(pname))
-        keep_idx = np.flatnonzero(sameidx).astype(np.int64, copy=False)
-        n_idv = int(keep_idx.shape[0])
-        if n_idv == 0:
+        keep_idx_nonmissing = np.flatnonzero(sameidx).astype(np.int64, copy=False)
+        n_nonmissing = int(keep_idx_nonmissing.shape[0])
+        if n_nonmissing == 0:
             logger.warning(f"{pname}: no overlapping samples, skipped.")
             if pname not in eff_snp_by_trait:
                 eff_snp_by_trait[pname] = 0
             if multi_trait_mode:
                 logger.info("")
             continue
+        keep_idx = keep_idx_nonmissing
+        n_idv = int(keep_idx.shape[0])
 
         if bool(emit_trait_header):
             _emit_trait_header(
@@ -2125,6 +2143,446 @@ def run_lmm_packed_fullrank(
                 if (header_pve is not None and np.isfinite(float(header_pve)))
                 else f"LMM ...Finished [{'/'.join(done_times)}]"
             ),
+            use_spinner=bool(use_spinner),
+        )
+        if multi_trait_mode:
+            logger.info("")
+
+
+def run_algwas_packed_fullrank(
+    *,
+    genofile: str,
+    pheno: pd.DataFrame,
+    ids: np.ndarray,
+    outprefix: str,
+    maf_threshold: float,
+    max_missing_rate: float,
+    genetic_model: str,
+    het_threshold: float,
+    chunk_size: int,
+    qmatrix: np.ndarray,
+    cov_all: Union[np.ndarray, None],
+    plot: bool,
+    threads: int,
+    logger: logging.Logger,
+    use_spinner: bool = False,
+    snps_only: bool = True,
+    eff_snp_by_trait: Union[dict[str, int], None] = None,
+    summary_rows: Union[list[dict[str, object]], None] = None,
+    saved_paths: Union[list[str], None] = None,
+    trait_names: Union[list[str], None] = None,
+    emit_trait_header: bool = True,
+    preloaded_packed: Union[dict[str, object], None] = None,
+) -> None:
+    if str(genetic_model).lower() != "add":
+        raise ValueError("ALGWAS full-rust packed route currently supports additive coding only (--model add).")
+    if not hasattr(jxrs, "algwas_packed_to_tsv") and not _gwas_use_rust_unified_v1():
+        raise RuntimeError(
+            "Rust extension missing ALGWAS packed GWAS symbols. "
+            "Rebuild/install JanusX extension first."
+        )
+
+    prefix, full_ids, packed_ctx, sites_all = _prepare_packed_bed_once_for_gwas(
+        genofile=genofile,
+        maf_threshold=float(maf_threshold),
+        max_missing_rate=float(max_missing_rate),
+        het_threshold=float(het_threshold),
+        snps_only=bool(snps_only),
+        use_spinner=bool(use_spinner),
+        preloaded_packed=preloaded_packed,
+    )
+    id_to_idx = {sid: i for i, sid in enumerate(full_ids)}
+    try:
+        sample_map = np.asarray(
+            [id_to_idx[str(sid)] for sid in np.asarray(ids, dtype=str)],
+            dtype=np.int64,
+        )
+    except KeyError as e:
+        raise ValueError("Some aligned sample IDs are not present in packed BED sample order.") from e
+
+    packed_mode = str(packed_ctx.get("packed_filter_mode", "compact")).strip().lower()
+    packed_raw = np.ascontiguousarray(np.asarray(packed_ctx["packed"], dtype=np.uint8))
+    packed_n = int(packed_ctx["n_samples"])
+    maf_raw = np.ascontiguousarray(np.asarray(packed_ctx["maf"], dtype=np.float32).reshape(-1), dtype=np.float32)
+    miss_raw = np.ascontiguousarray(np.asarray(packed_ctx["missing_rate"], dtype=np.float32).reshape(-1), dtype=np.float32)
+    row_flip_raw = np.ascontiguousarray(
+        np.asarray(
+            packed_ctx.get(
+                "row_flip",
+                jxrs.bed_packed_row_flip_mask(packed_raw, int(packed_n))
+                if hasattr(jxrs, "bed_packed_row_flip_mask")
+                else np.zeros((int(packed_raw.shape[0]),), dtype=np.bool_),
+            ),
+            dtype=np.bool_,
+        ).reshape(-1),
+        dtype=np.bool_,
+    )
+    active_row_idx_raw = np.ascontiguousarray(
+        np.asarray(
+            packed_ctx.get(
+                "active_row_idx",
+                np.arange(int(packed_raw.shape[0]), dtype=np.int64),
+            ),
+            dtype=np.int64,
+        ).reshape(-1),
+        dtype=np.int64,
+    )
+    if packed_mode == "lazy_full":
+        packed = np.ascontiguousarray(packed_raw[active_row_idx_raw], dtype=np.uint8)
+        maf = np.ascontiguousarray(maf_raw[active_row_idx_raw], dtype=np.float32)
+        miss = np.ascontiguousarray(miss_raw[active_row_idx_raw], dtype=np.float32)
+        row_flip = np.ascontiguousarray(row_flip_raw[active_row_idx_raw], dtype=np.bool_)
+    else:
+        packed = packed_raw
+        maf = maf_raw
+        miss = miss_raw
+        row_flip = row_flip_raw
+        active_row_idx_raw = np.arange(int(packed.shape[0]), dtype=np.int64)
+
+    packed_row_idx = active_row_idx_raw
+    if packed_n <= 0:
+        raise ValueError("Packed BED reported invalid sample count.")
+    if (
+        int(packed_row_idx.shape[0]) != int(maf.shape[0])
+        or int(packed_row_idx.shape[0]) != int(miss.shape[0])
+        or int(packed_row_idx.shape[0]) != int(row_flip.shape[0])
+    ):
+        raise ValueError("Packed BED arrays have inconsistent SNP dimensions.")
+    if int(len(sites_all)) != int(packed_row_idx.shape[0]):
+        raise ValueError(
+            f"Packed/BIM mismatch after filtering: sites={len(sites_all)} active_rows={packed_row_idx.shape[0]}"
+        )
+
+    chrom_all = [str(c) for (c, _p, _a0, _a1) in sites_all]
+    pos_all = [int(p) for (_c, p, _a0, _a1) in sites_all]
+    allele0_all = [str(v) for (_c, _p, v, _a1) in sites_all]
+    allele1_all = [str(v) for (_c, _p, _a0, v) in sites_all]
+
+    process = psutil.Process()
+    n_cores = detect_effective_threads()
+    if eff_snp_by_trait is None:
+        eff_snp_by_trait = {}
+    if summary_rows is None:
+        summary_rows = []
+    if saved_paths is None:
+        saved_paths = []
+
+    pheno_aligned, ids = _align_pheno_to_sample_order(pheno, ids)
+    trait_iter = _resolve_trait_iter(pheno_aligned, trait_names)
+    multi_trait_mode = len(trait_iter) > 1
+
+    for pname in trait_iter:
+        cpu_t0 = process.cpu_times()
+        t0 = time.time()
+        peak_rss = process.memory_info().rss
+
+        y_full, sameidx = _trait_values_and_mask(pheno_aligned, str(pname))
+        keep_idx_nonmissing = np.flatnonzero(sameidx).astype(np.int64, copy=False)
+        n_nonmissing = int(keep_idx_nonmissing.shape[0])
+        if n_nonmissing == 0:
+            logger.warning(f"{pname}: no overlapping samples, skipped.")
+            if pname not in eff_snp_by_trait:
+                eff_snp_by_trait[pname] = 0
+            if multi_trait_mode:
+                logger.info("")
+            continue
+        keep_idx = keep_idx_nonmissing
+        n_idv = int(keep_idx.shape[0])
+
+        if bool(emit_trait_header):
+            _emit_trait_header(
+                logger,
+                str(pname),
+                int(n_idv),
+                pve=None,
+                use_spinner=bool(use_spinner),
+                width=60,
+            )
+
+        # Keep ALGWAS trait filtering consistent with other GWAS models:
+        # non-missing phenotypes are retained, missing values are dropped.
+        y_vec = np.array(y_full[keep_idx], dtype=np.float64, order="C", copy=True)
+        x_cov = np.ascontiguousarray(qmatrix[keep_idx], dtype=np.float64)
+        if cov_all is not None:
+            x_cov = np.ascontiguousarray(
+                np.concatenate([x_cov, cov_all[keep_idx]], axis=1),
+                dtype=np.float64,
+            )
+        sample_idx_trait = np.ascontiguousarray(sample_map[keep_idx], dtype=np.int64)
+
+        pname_tag = _safe_trait_file_label(pname)
+        out_tsv = f"{outprefix}.{pname_tag}.algwas.tsv"
+        pseudo_tsv_hint = f"{outprefix}.{pname_tag}.algwas.qtn.tsv"
+
+        stage1_total = 256
+        stage1_last_done = 0
+        stage1_pbar: Optional[_ProgressAdapter] = None
+        stage1_spin_handle = _start_indeterminate_progress_bar("ALGWAS stage1")
+        gwas_total = int(len(sites_all))
+        gwas_last_done = 0
+        gwas_pbar: Optional[_ProgressAdapter] = None
+
+        def _algwas_stage1_progress(done: int, total: int) -> None:
+            nonlocal stage1_last_done, stage1_pbar, stage1_spin_handle, peak_rss
+            try:
+                d = int(done)
+                t = int(total)
+            except Exception:
+                return
+            if t > 0 and stage1_spin_handle is not None:
+                try:
+                    _stop_indeterminate_progress_bar(stage1_spin_handle)
+                except Exception:
+                    pass
+                stage1_spin_handle = None
+            if stage1_pbar is None:
+                if t <= 0:
+                    try:
+                        peak_rss = max(peak_rss, process.memory_info().rss)
+                    except Exception:
+                        pass
+                    return
+                if t > 0:
+                    total_use = int(max(1, t))
+                elif d > 0:
+                    total_use = int(max(stage1_total, d + max(32, d // 4)))
+                else:
+                    total_use = int(max(1, stage1_total))
+                stage1_pbar = _ProgressAdapter(
+                    total=total_use,
+                    desc="ALGWAS stage1",
+                    force_animate=True,
+                )
+            total_use = int(max(1, stage1_pbar.total if stage1_pbar is not None else stage1_total))
+            if t > 0:
+                target_total = int(max(1, t))
+            else:
+                target_total = int(max(total_use, d + max(32, d // 4)))
+            if stage1_pbar is not None and target_total != total_use:
+                stage1_pbar.set_total(target_total)
+                total_use = int(max(1, stage1_pbar.total))
+            d = int(max(0, min(d, total_use)))
+            stepv = int(max(0, d - stage1_last_done))
+            if stepv > 0 and stage1_pbar is not None:
+                stage1_pbar.update(stepv)
+                stage1_last_done = d
+            if stage1_pbar is not None and t > 0 and d >= t:
+                stage1_pbar.finish()
+                stage1_pbar.close(show_done=False)
+                stage1_pbar = None
+            try:
+                peak_rss = max(peak_rss, process.memory_info().rss)
+            except Exception:
+                pass
+
+        def _algwas_progress(done: int, total: int) -> None:
+            nonlocal gwas_last_done, gwas_total, gwas_pbar, peak_rss, stage1_pbar, stage1_spin_handle
+            try:
+                d = int(done)
+                t = int(total)
+            except Exception:
+                return
+            if stage1_spin_handle is not None:
+                try:
+                    _stop_indeterminate_progress_bar(stage1_spin_handle)
+                except Exception:
+                    pass
+                stage1_spin_handle = None
+            if stage1_pbar is not None:
+                try:
+                    stage1_pbar.finish()
+                except Exception:
+                    pass
+                try:
+                    stage1_pbar.close(show_done=False)
+                except Exception:
+                    pass
+                stage1_pbar = None
+            if gwas_pbar is None:
+                total_use = int(max(1, t if t > 0 else gwas_total))
+                gwas_pbar = _ProgressAdapter(
+                    total=total_use,
+                    desc="ALGWAS scan",
+                    force_animate=True,
+                )
+            total_use = int(max(1, gwas_pbar.total if gwas_pbar is not None else gwas_total))
+            d = int(max(0, min(d, total_use)))
+            stepv = int(max(0, d - gwas_last_done))
+            if stepv > 0 and gwas_pbar is not None:
+                gwas_pbar.update(stepv)
+                gwas_last_done = d
+            try:
+                peak_rss = max(peak_rss, process.memory_info().rss)
+            except Exception:
+                pass
+
+        qtn_count = 0
+        pseudo_rows = 0
+        gwas_ok = False
+        gwas_t0 = time.monotonic()
+        try:
+            with _gwas_scan_stage_ctx(max(1, int(threads))):
+                unified_done = False
+                if _gwas_use_rust_unified_v1():
+                    try:
+                        jobs = [
+                            {
+                                "model": "algwas",
+                                "trait": str(pname),
+                                "out_tsv": str(out_tsv),
+                                "y": y_vec,
+                                "x_cov": x_cov,
+                                "sample_indices": sample_idx_trait,
+                                "qtn_bound": None,
+                                "lambda_steps": 64,
+                                "lambda_min_ratio": 0.001,
+                                "scan_step": int(max(1, int(chunk_size))),
+                                "stage1_progress_callback": _algwas_stage1_progress,
+                                "scan_progress_callback": _algwas_progress,
+                                "progress_every": int(max(1, int(chunk_size))),
+                                "pseudo_tsv": str(pseudo_tsv_hint),
+                            }
+                        ]
+                        _res = jxrs.gwas_packed_unified_to_tsv(
+                            jobs,
+                            packed,
+                            int(packed_n),
+                            row_flip,
+                            maf,
+                            miss,
+                            chrom_all,
+                            pos_all,
+                            allele0_all,
+                            allele1_all,
+                            int(max(1, int(chunk_size))),
+                            int(threads),
+                            None,
+                            int(max(1, int(chunk_size))),
+                            row_indices=None,
+                        )
+                        r0 = _res[0]
+                        qtn_count = int(r0.get("qtn_count", 0))
+                        pseudo_rows = int(r0.get("pseudo_rows", 0))
+                        unified_done = True
+                    except Exception as ex:
+                        _emit_warning_line(
+                            logger,
+                            f"ALGWAS unified Rust dispatcher unavailable; fallback to direct ALGWAS kernel. reason={ex}",
+                            use_spinner=bool(use_spinner),
+                        )
+                        unified_done = False
+
+                if not unified_done:
+                    qtn_count, pseudo_rows, _written_rows = jxrs.algwas_packed_to_tsv(
+                        y_vec,
+                        x_cov,
+                        chrom_all,
+                        pos_all,
+                        allele0_all,
+                        allele1_all,
+                        packed,
+                        int(packed_n),
+                        row_flip,
+                        maf,
+                        miss,
+                        out_tsv,
+                        sample_indices=sample_idx_trait,
+                        qtn_bound=None,
+                        lambda_steps=64,
+                        lambda_min_ratio=0.001,
+                        scan_step=int(max(1, int(chunk_size))),
+                        stage1_progress_callback=_algwas_stage1_progress,
+                        threads=int(threads),
+                        progress_callback=_algwas_progress,
+                        pseudo_tsv=str(pseudo_tsv_hint),
+                        row_indices=None,
+                    )
+            gwas_ok = True
+        finally:
+            if stage1_spin_handle is not None:
+                try:
+                    _stop_indeterminate_progress_bar(stage1_spin_handle)
+                except Exception:
+                    pass
+            if stage1_pbar is not None:
+                try:
+                    stage1_pbar.finish()
+                except Exception:
+                    pass
+                stage1_pbar.close(show_done=False)
+            if gwas_pbar is not None:
+                try:
+                    if gwas_ok:
+                        if int(gwas_last_done) < int(max(1, gwas_total)):
+                            gwas_pbar.update(int(max(1, gwas_total)) - int(gwas_last_done))
+                        gwas_pbar.finish()
+                        time.sleep(0.05)
+                except Exception:
+                    pass
+                gwas_pbar.close(show_done=False)
+
+        gwas_secs = max(time.monotonic() - gwas_t0, 0.0)
+        _augment_gwas_tsv_with_snp_names(out_tsv, prefix, logger=logger)
+        saved_paths.append(str(out_tsv))
+        if int(pseudo_rows) > 0 and os.path.exists(pseudo_tsv_hint):
+            _augment_gwas_tsv_with_snp_names(pseudo_tsv_hint, prefix, logger=logger)
+            saved_paths.append(str(pseudo_tsv_hint))
+
+        viz_secs = 0.0
+        if plot:
+            viz_secs = _run_fastplot_from_tsv_with_status(
+                out_tsv,
+                y_vec,
+                xlabel=str(pname),
+                outpdf=f"{os.path.splitext(out_tsv)[0]}.svg",
+                use_spinner=bool(use_spinner),
+                emit_done_line=False,
+            )
+
+        peak_rss = max(peak_rss, process.memory_info().rss)
+        cpu_t1 = process.cpu_times()
+        t1 = time.time()
+        wall = max(t1 - t0, 1e-12)
+        cpu_used = (cpu_t1.user - cpu_t0.user) + (cpu_t1.system - cpu_t0.system)
+        avg_cpu = 100.0 * cpu_used / (wall * max(1, n_cores))
+        peak_rss_gb = peak_rss / (1024 ** 3)
+
+        _log_model_line(
+            logger,
+            "ALGWAS",
+            f"avg CPU ~ {avg_cpu:.1f}% of {n_cores} c, peak RSS ~ {peak_rss_gb:.2f} G",
+            use_spinner=bool(use_spinner),
+        )
+        _log_model_line(
+            logger,
+            "ALGWAS",
+            f"Results saved to {_display_path(str(out_tsv))}",
+            use_spinner=bool(use_spinner),
+        )
+
+        eff_snp = int(len(sites_all))
+        eff_snp_by_trait[str(pname)] = eff_snp
+        summary_rows.append(
+            {
+                "phenotype": str(pname),
+                "model": "ALGWAS",
+                "nidv": int(n_idv),
+                "eff_snp": int(eff_snp),
+                "pve": None,
+                "avg_cpu": float(avg_cpu),
+                "peak_rss_gb": float(peak_rss_gb),
+                "gwas_time_s": float(gwas_secs),
+                "viz_time_s": float(viz_secs),
+                "result_file": str(out_tsv),
+            }
+        )
+
+        done_times = [format_elapsed(gwas_secs)]
+        if plot:
+            done_times.append(format_elapsed(viz_secs))
+        _rich_success(
+            logger,
+            f"ALGWAS ...Found {int(qtn_count)} QTNs [{'/'.join(done_times)}]",
             use_spinner=bool(use_spinner),
         )
         if multi_trait_mode:

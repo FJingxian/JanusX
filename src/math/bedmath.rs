@@ -5,6 +5,15 @@ use std::arch::x86 as x86_simd;
 use std::arch::x86_64 as x86_simd;
 use std::sync::{Arc, OnceLock};
 
+const BED_DECODE_SIMD_DEFAULT: &str = match option_env!("JANUSX_BED_DECODE_SIMD_DEFAULT") {
+    Some(v) => v,
+    None => "0",
+};
+const BED_SUBSET_SIMD_DEFAULT: &str = match option_env!("JANUSX_BED_SUBSET_SIMD_DEFAULT") {
+    Some(v) => v,
+    None => "1",
+};
+
 #[inline]
 pub(crate) fn decode_plink_bed_hardcall(code: u8) -> Option<f64> {
     match code {
@@ -230,7 +239,8 @@ fn decode_row_centered_full_lut_scalar(
 fn bed_decode_simd_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        let raw = std::env::var("JX_BED_DECODE_SIMD").unwrap_or_else(|_| "0".to_string());
+        let raw = std::env::var("JX_BED_DECODE_SIMD")
+            .unwrap_or_else(|_| BED_DECODE_SIMD_DEFAULT.to_string());
         let key = raw.trim().to_ascii_lowercase();
         matches!(key.as_str(), "1" | "true" | "on" | "yes")
     })
@@ -531,7 +541,8 @@ impl SubsetDecodePlan {
 fn bed_subset_decode_simd_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        let raw = std::env::var("JX_BED_SUBSET_SIMD").unwrap_or_else(|_| "1".to_string());
+        let raw = std::env::var("JX_BED_SUBSET_SIMD")
+            .unwrap_or_else(|_| BED_SUBSET_SIMD_DEFAULT.to_string());
         let key = raw.trim().to_ascii_lowercase();
         !matches!(key.as_str(), "0" | "false" | "off" | "no")
     })

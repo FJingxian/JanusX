@@ -11,8 +11,7 @@ use self::permutation::{
     RuleStructurePriorConfig, DEFAULT_RULE_NULL_ADAPTIVE_MIN_REPEATS,
     DEFAULT_RULE_NULL_ADAPTIVE_STABLE_REPEATS, DEFAULT_RULE_NULL_MAX_REPEATS,
     DEFAULT_RULE_NULL_MIN_SNPS_PER_CHUNK, DEFAULT_RULE_NULL_PHYSICAL_CHUNKS,
-    DEFAULT_RULE_PERMUTATION_REPRESENTATIVE_UNITS,
-    DEFAULT_RULE_STRUCTURE_BOOTSTRAP_KL_THRESHOLD,
+    DEFAULT_RULE_PERMUTATION_REPRESENTATIVE_UNITS, DEFAULT_RULE_STRUCTURE_BOOTSTRAP_KL_THRESHOLD,
     DEFAULT_RULE_STRUCTURE_BOOTSTRAP_MAX_REPEATS, DEFAULT_RULE_STRUCTURE_BOOTSTRAP_MIN_REPEATS,
     DEFAULT_RULE_STRUCTURE_BOOTSTRAP_STABLE_REPEATS, DEFAULT_RULE_STRUCTURE_DENSITY_TOPK,
 };
@@ -2370,9 +2369,7 @@ fn format_delta_metric_value(value: f64) -> String {
         return raw;
     }
     let raw = format!("{value:.6}");
-    raw.trim_end_matches('0')
-        .trim_end_matches('.')
-        .to_string()
+    raw.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
 #[inline]
@@ -2431,15 +2428,13 @@ fn build_rule_delta_annotations(
             params,
             false,
         );
-        let singleton_bits = materialize_rule_bits(
-            &singleton,
-            bits_full,
-            row_words_full,
-            n_rows,
-            n_full,
-        )?;
-        let single_assoc =
-            fit_binary_rule_wald_from_bits(assoc_y, singleton_bits.as_slice(), assoc_sample_indices);
+        let singleton_bits =
+            materialize_rule_bits(&singleton, bits_full, row_words_full, n_rows, n_full)?;
+        let single_assoc = fit_binary_rule_wald_from_bits(
+            assoc_y,
+            singleton_bits.as_slice(),
+            assoc_sample_indices,
+        );
         score_txt.push_str(&literal_metric_token(single_score, lit.negated));
         pwald_txt.push_str(&literal_metric_token(single_assoc.pwald, lit.negated));
         Ok(())
@@ -2873,8 +2868,12 @@ fn build_simbench_ml_contexts(
             continue;
         }
         let n_region = dense_train.len();
-        let ml_group_ids =
-            build_unit_window_group_ids(unit, unit.indices.as_slice(), logic_bits.sites.as_slice(), unit_kind_lc);
+        let ml_group_ids = build_unit_window_group_ids(
+            unit,
+            unit.indices.as_slice(),
+            logic_bits.sites.as_slice(),
+            unit_kind_lc,
+        );
         let (selected_global_rows, ranked_global_rows) = if let Some(engine_one) = engine {
             let keep_k = resolve_ml_keep_k(n_region, ml_top_k, ml_top_frac);
             let top_local = select_ml_top_local_indices(
@@ -4748,8 +4747,12 @@ fn select_logic_unit_global_rows(
         }
         let n_region = dense_train.len();
         let keep_k = resolve_ml_keep_k(n_region, ml_top_k, ml_top_frac);
-        let ml_group_ids =
-            build_unit_window_group_ids(unit, unit.indices.as_slice(), logic_bits.sites.as_slice(), unit_kind_lc);
+        let ml_group_ids = build_unit_window_group_ids(
+            unit,
+            unit.indices.as_slice(),
+            logic_bits.sites.as_slice(),
+            unit_kind_lc,
+        );
         let top_local = select_ml_top_local_indices(
             dense_train.as_slice(),
             y_train,
@@ -6517,8 +6520,8 @@ fn garfield_logic_search_bed_owned(
             beam_params.max_pick.max(1),
             matches!(logic_gate_mode, BeamLogicGateMode::AndOr),
         );
-        let min_perm_repeats = DEFAULT_RULE_NULL_ADAPTIVE_MIN_REPEATS
-            .min(perm_cfg.n_repeats.max(1));
+        let min_perm_repeats =
+            DEFAULT_RULE_NULL_ADAPTIVE_MIN_REPEATS.min(perm_cfg.n_repeats.max(1));
         let mut stable_rounds = 0usize;
         let mut prev_lookup: Option<RuleNullPenaltyLookup> = None;
         let perm_threads = threads_eff.min(
@@ -6548,8 +6551,9 @@ fn garfield_logic_search_bed_owned(
         let mut rep_start = 0usize;
         'perm_batches: while rep_start < max_perm_repeats {
             let rep_end = (rep_start + repeats_per_batch).min(max_perm_repeats);
-            let mut batch_tasks =
-                Vec::<(usize, usize, u64)>::with_capacity(null_chunk_prepared.len() * (rep_end - rep_start));
+            let mut batch_tasks = Vec::<(usize, usize, u64)>::with_capacity(
+                null_chunk_prepared.len() * (rep_end - rep_start),
+            );
             for rep in rep_start..rep_end {
                 for (slot, (chunk, _prepared)) in null_chunk_prepared.iter().enumerate() {
                     let rep_seed = seed
@@ -6589,9 +6593,10 @@ fn garfield_logic_search_bed_owned(
                         .collect::<Vec<Result<(usize, Vec<(RuleNullBucket, f64, f64)>), String>>>()
                 })
             } else {
-                let mut out = Vec::<Result<(usize, Vec<(RuleNullBucket, f64, f64)>), String>>::with_capacity(
-                    batch_tasks.len(),
-                );
+                let mut out =
+                    Vec::<Result<(usize, Vec<(RuleNullBucket, f64, f64)>), String>>::with_capacity(
+                        batch_tasks.len(),
+                    );
                 for (slot, rep, rep_seed) in batch_tasks.iter() {
                     let (_, prepared) = &null_chunk_prepared[*slot];
                     let unit_out = collect_rule_permutation_nulls_for_repeat(
@@ -8441,11 +8446,7 @@ mod tests {
                 pwald: 1e-4 * (i as f64 + 1.0),
                 score: 20.0 - i as f64,
                 delta_score: format!("{}->{}", 20.0 - i as f64, 20.0 - i as f64),
-                delta_pwald: format!(
-                    "{}->{}",
-                    1e-4 * (i as f64 + 1.0),
-                    1e-4 * (i as f64 + 1.0)
-                ),
+                delta_pwald: format!("{}->{}", 1e-4 * (i as f64 + 1.0), 1e-4 * (i as f64 + 1.0)),
                 full_bits: vec![i as u64 + 1],
             })
             .collect::<Vec<_>>();

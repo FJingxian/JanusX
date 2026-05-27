@@ -4,6 +4,8 @@ use pyo3::Bound;
 // stats
 #[path = "stats/adamixture.rs"]
 mod admixture;
+#[path = "stats/algwas.rs"]
+mod algwas;
 #[path = "stats/assoc.rs"]
 mod assoc;
 #[path = "stats/bayes.rs"]
@@ -82,6 +84,8 @@ mod blas;
 mod brent;
 #[path = "math/eigh.rs"]
 mod eigh;
+#[path = "math/lasso.rs"]
+mod lasso;
 #[path = "math/linalg.rs"]
 mod linalg;
 #[path = "math/farmcpu.rs"]
@@ -92,6 +96,8 @@ mod math_ld;
 mod ml;
 #[path = "math/pcg.rs"]
 mod pcg;
+#[path = "phylo/mod.rs"]
+mod phylo;
 #[path = "sim/g2p.rs"]
 mod sim_g2p;
 
@@ -104,6 +110,7 @@ use admixture::{
     admx_multiply_at_omega, admx_multiply_at_omega_inplace, admx_rmse_f32, admx_rmse_f64,
     admx_rsvd_power_step_inplace, admx_rsvd_stream, admx_rsvd_stream_sample, admx_set_threads,
 };
+use algwas::algwas_packed_to_tsv;
 use assoc::{
     farmcpu_packed_to_tsv, farmcpu_rem_dense, farmcpu_rem_packed, farmcpu_super_dense,
     farmcpu_super_packed, farmcpu_write_assoc_tsv,
@@ -194,12 +201,18 @@ use tree::{
 };
 
 pub use aireml::{ai_reml_null_from_spectral, AiRemlNullResult};
+pub use algwas::{AlgwasConfig, AlgwasStage1PathPoint, AlgwasStage1Result};
 pub use eigh::symmetric_eigh_f64_row_major;
 pub use grm::grm_packed_f64_from_stats_rust;
 pub use he::{
     he_variance_components_packed, he_variance_components_packed_with_covariates, HePcgResult,
     RowStdStats, HE_BOUNDARY_INTERIOR, HE_BOUNDARY_ORIGIN, HE_BOUNDARY_SIGMA_E_ZERO,
     HE_BOUNDARY_SIGMA_G_ZERO,
+};
+pub use lasso::{
+    compare_lasso_results, fit_lasso_f32, fit_lasso_f32_reference, fit_lasso_packed_active_f32,
+    DenseLassoDesign, LassoCompareStats, LassoConfig, LassoDesignMatrix, LassoResult,
+    LassoSolverKind, PackedBedLassoConfig, PackedBedLassoDesign,
 };
 // ============================================================
 // PyO3 module exports
@@ -270,6 +283,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(glmf32_packed, m)?)?;
     m.add_function(wrap_pyfunction!(glmf32_packed_assoc, m)?)?;
     m.add_function(wrap_pyfunction!(glmf32_packed_assoc_to_tsv, m)?)?;
+    m.add_function(wrap_pyfunction!(algwas_packed_to_tsv, m)?)?;
     m.add_function(wrap_pyfunction!(lm_stream_bed_to_tsv, m)?)?;
     m.add_function(wrap_pyfunction!(grm_sim_bench_f32, m)?)?;
     m.add_function(wrap_pyfunction!(bed_packed_row_flip_mask, m)?)?;
@@ -395,5 +409,6 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(nj_newick_from_alignment_u8, m)?)?;
     m.add_function(wrap_pyfunction!(nj_newick_from_distance_matrix, m)?)?;
     m.add_function(wrap_pyfunction!(ml_newick_from_alignment_u8, m)?)?;
+    phylo::register_py(m)?;
     Ok(())
 }

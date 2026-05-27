@@ -218,6 +218,12 @@ class LinearModel:
         tables: dict[str, pd.DataFrame] = {}
 
         kinship = None
+        if model_key == "algwas":
+            raise ValueError(
+                "ALGWAS is currently available only for file-mode GWAS workflows "
+                "(PLINK/BED-backed packed route)."
+            )
+
         if model_key in {"lmm", "fastlmm"}:
             kinship = cfg.extra.get("kinship") if isinstance(cfg.extra, dict) else None
             if kinship is None:
@@ -425,6 +431,22 @@ class LinearModel:
     ) -> AssociationResult:
         return self._run(
             model_key="farmcpu",
+            out=out,
+            prefix=prefix,
+            log=log,
+            write_files=write_files,
+        )
+
+    def algwas(
+        self,
+        *,
+        out: Optional[str] = None,
+        prefix: Optional[str] = None,
+        log: bool = True,
+        write_files: bool = False,
+    ) -> AssociationResult:
+        return self._run(
+            model_key="algwas",
             out=out,
             prefix=prefix,
             log=log,

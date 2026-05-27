@@ -1,8 +1,6 @@
 use crate::ml::common::{ImportanceKind, PermutationConfig, ResponseKind};
 use crate::ml::extra_trees::{feature_scores_extra_trees_grouped, ExtraTreesConfig};
-use crate::ml::gbdt::{
-    feature_scores_gbdt_grouped, feature_scores_gbdt_permutation_grouped,
-};
+use crate::ml::gbdt::{feature_scores_gbdt_grouped, feature_scores_gbdt_permutation_grouped};
 use crate::ml::rf::{
     feature_scores_random_forest_grouped, feature_scores_random_forest_permutation_grouped,
 };
@@ -53,16 +51,7 @@ pub fn compute_feature_scores(
     importance: ImportanceKind,
     perm_cfg: PermutationConfig,
 ) -> Result<Vec<f64>, String> {
-    compute_feature_scores_grouped(
-        x_rows,
-        y,
-        response,
-        engine,
-        cfg,
-        importance,
-        perm_cfg,
-        None,
-    )
+    compute_feature_scores_grouped(x_rows, y, response, engine, cfg, importance, perm_cfg, None)
 }
 
 pub fn compute_feature_scores_grouped(

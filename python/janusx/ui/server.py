@@ -856,6 +856,8 @@ class WebUIState:
         low = str(name or "").lower()
         if low.endswith(".lmm.tsv") or ".lmm." in low:
             return "LMM"
+        if low.endswith(".algwas.tsv") or ".algwas." in low:
+            return "ALGWAS"
         if low.endswith(".farmcpu.tsv") or ".farmcpu." in low:
             return "FarmCPU"
         if low.endswith(".lm.tsv") or ".lm." in low:
@@ -882,7 +884,7 @@ class WebUIState:
         parts = [p for p in base.split(".") if str(p).strip() != ""]
         if len(parts) == 0:
             return "phenotype"
-        assoc_tail = {"lmm", "lm", "farmcpu"}
+        assoc_tail = {"lmm", "lm", "farmcpu", "algwas"}
         genetic_tail = {"add", "dom", "rec", "het"}
         while len(parts) > 0 and parts[-1].lower() in assoc_tail:
             parts.pop()

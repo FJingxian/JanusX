@@ -818,7 +818,10 @@ fn ensure_rule_bits_cached(
     n_samples: usize,
     local_cache: &mut RuleBitsCache,
 ) -> Result<(), String> {
-    if local_cache.iter().any(|(cached_rule, _)| cached_rule == rule) {
+    if local_cache
+        .iter()
+        .any(|(cached_rule, _)| cached_rule == rule)
+    {
         return Ok(());
     }
     let combined = materialize_rule_bits(rule, bits_flat, row_words, n_rows, n_samples)?;
@@ -851,12 +854,7 @@ fn evaluate_rule_continuous_cached(
     let combined = cached_rule_bits(rule, local_cache)
         .ok_or_else(|| format!("{ctx}: cached combined bits missing after materialization"))?;
     Ok(score_rule_continuous_from_bits(
-        rule,
-        y,
-        combined,
-        n_samples,
-        lambda_len,
-        lambda_not,
+        rule, y, combined, n_samples, lambda_len, lambda_not,
     ))
 }
 
@@ -2263,11 +2261,7 @@ fn collapse_surrogate_candidate(
                 .ok_or_else(|| "current rule test bits cache miss".to_string())?;
             let parent_bits_test = cached_rule_bits(&parent_rule, &test_bits_cache)
                 .ok_or_else(|| "parent rule test bits cache miss".to_string())?;
-            let diff_frac = bit_hamming_fraction(
-                current_bits_test,
-                parent_bits_test,
-                n_test,
-            );
+            let diff_frac = bit_hamming_fraction(current_bits_test, parent_bits_test, n_test);
             if diff_frac > params.surrogate_hamming_frac_max {
                 break;
             }
@@ -2374,11 +2368,7 @@ fn collapse_surrogate_candidate(
                     .ok_or_else(|| "current rule test bits cache miss".to_string())?;
                 let subrule_bits_test = cached_rule_bits(&subrule, &test_bits_cache)
                     .ok_or_else(|| "subrule test bits cache miss".to_string())?;
-                let diff_frac = bit_hamming_fraction(
-                    current_bits_test,
-                    subrule_bits_test,
-                    n_test,
-                );
+                let diff_frac = bit_hamming_fraction(current_bits_test, subrule_bits_test, n_test);
                 if diff_frac > hamming_limit {
                     continue;
                 }
@@ -2499,11 +2489,8 @@ fn collapse_surrogate_candidate(
                     .ok_or_else(|| "current rule test bits cache miss".to_string())?;
                 let singleton_bits_test = cached_rule_bits(&singleton_rule, &test_bits_cache)
                     .ok_or_else(|| "singleton test bits cache miss".to_string())?;
-                let diff_frac = bit_hamming_fraction(
-                    current_bits_test,
-                    singleton_bits_test,
-                    n_test,
-                );
+                let diff_frac =
+                    bit_hamming_fraction(current_bits_test, singleton_bits_test, n_test);
                 let orient_diff = diff_frac.min(1.0 - diff_frac);
                 if orient_diff > params.surrogate_hamming_frac_max {
                     continue;

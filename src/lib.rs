@@ -31,6 +31,10 @@ mod gstats;
 mod gwas_unified;
 #[path = "stats/he.rs"]
 mod he;
+#[path = "stats/jxlmm.rs"]
+mod jxlmm;
+#[path = "stats/jxreml.rs"]
+mod jxreml;
 #[path = "stats/ld.rs"]
 mod ld;
 #[path = "stats/lmm.rs"]
@@ -45,6 +49,8 @@ mod packed;
 mod rsvd;
 #[path = "stats/score.rs"]
 pub mod score;
+#[path = "stats/spgrm.rs"]
+mod spgrm;
 #[path = "stats/common.rs"]
 mod stats_common;
 #[allow(dead_code)]
@@ -72,6 +78,8 @@ mod vcfout;
 mod workflow;
 
 // math
+#[path = "math/active_path.rs"]
+mod active_path;
 #[path = "math/aireml.rs"]
 mod aireml;
 #[path = "math/bedmath.rs"]
@@ -82,8 +90,12 @@ mod bitwise;
 mod blas;
 #[path = "math/brent.rs"]
 mod brent;
+#[path = "math/cholesky.rs"]
+mod cholesky;
 #[path = "math/eigh.rs"]
 mod eigh;
+#[path = "math/KING.rs"]
+mod king;
 #[path = "math/lasso.rs"]
 mod lasso;
 #[path = "math/linalg.rs"]
@@ -140,9 +152,10 @@ use garfield::{
 use gfreader::{
     bed_filter_stream_to_plink_rust, bed_filter_to_plink_rust, bed_mmap_filter_to_plink_rust,
     count_hmp_snps, count_vcf_snps, gfd_packbits_from_dosage_block, load_bed_2bit_packed,
-    load_bed_u8_matrix, load_site_info, prepare_bed_2bit_packed, scan_bed_2bit_packed_stats,
-    BedChunkReader, BedMmapReader, GwasAssocTsvWriter, HmpChunkReader, HmpStreamWriter,
-    NpyMmapReader, PlinkStreamWriter, SiteInfo, TxtChunkReader, VcfChunkReader, VcfStreamWriter,
+    load_bed_u8_matrix, load_site_info, prepare_bed_2bit_packed, prepare_bed_logic_meta_selected,
+    scan_bed_2bit_packed_stats, BedChunkReader, BedMmapReader, GwasAssocTsvWriter, HmpChunkReader,
+    HmpStreamWriter, NpyMmapReader, PlinkStreamWriter, SiteInfo, TxtChunkReader, VcfChunkReader,
+    VcfStreamWriter,
 };
 use glm::{
     glm_ixx_from_x_qr, glmf32, glmf32_full, glmf32_packed, glmf32_packed_assoc,
@@ -150,9 +163,9 @@ use glm::{
 };
 use gmerge::{convert_genotypes, merge_genotypes, PyConvertStats, PyMergeStats};
 use grm::{
-    grm_packed_bed_f32, grm_packed_bed_f64, grm_packed_f32, grm_packed_f32_with_stats,
-    grm_packed_f64, grm_packed_f64_with_stats, grm_sim_bench_f32, grm_stream_bed_f32,
-    grm_stream_bed_f32_to_npy, grm_stream_bed_f64, grm_stream_bed_f64_to_npy,
+    grm_bed_f64_from_meta, grm_packed_bed_f32, grm_packed_bed_f64, grm_packed_f32,
+    grm_packed_f32_with_stats, grm_packed_f64, grm_packed_f64_with_stats, grm_sim_bench_f32,
+    grm_stream_bed_f32, grm_stream_bed_f32_to_npy, grm_stream_bed_f64, grm_stream_bed_f64_to_npy,
 };
 use gs_native::{
     farmcpu_q_packed_grm_pca_f32, gblup_reml_packed_bed, packed_mtm_f64, rrblup_pcg_bed,
@@ -166,6 +179,11 @@ use gwas_unified::{
 };
 use gwasio::load_gwas_triplet_fast;
 use he::he_pcg_bed;
+use jxlmm::{
+    jxlmm_assoc_pcg_bed, jxlmm_assoc_pcg_bed_to_tsv, jxlmm_scan_exact_packed,
+    jxlmm_sparse_grm_diag_stats,
+};
+use jxreml::{jxreml_sparse_reml_brent_from_jxgrm, jxreml_sparse_reml_grid_from_jxgrm};
 use ld::{
     bed_ldblock_r2_rust, bed_packed_ld_prune_maf_priority, bed_prune_to_plink_rust,
     packed_prune_kernel_stats,
@@ -193,6 +211,7 @@ use score::{
 };
 use sim::{sim_trait_accumulate_i8_f32, SimChunkGenerator, SimEngine, SimTraitAccumulator};
 use sim_g2p::g2p_simulate_py;
+use spgrm::{spgrm_bed_to_jxgrm, spgrm_dense_f32_to_jxgrm, spgrm_packed_to_jxgrm};
 use top::{top_fit_model_py, top_rank_to_target_sample_py, top_rank_to_target_values_py};
 use tree::{
     geno_chunk_to_alignment_u8, geno_chunk_to_alignment_u8_siteinfo,
@@ -202,6 +221,11 @@ use tree::{
 
 pub use aireml::{ai_reml_null_from_spectral, AiRemlNullResult};
 pub use algwas::{AlgwasConfig, AlgwasStage1PathPoint, AlgwasStage1Result};
+pub use cholesky::{
+    read_sparse_grm_csc, sparse_cholesky_analyze_jxgrm_csc, sparse_cholesky_analyze_jxgrm_path,
+    sparse_cholesky_from_jxgrm_csc, sparse_cholesky_from_jxgrm_path, SparseJxgrmCholesky,
+    SparseJxgrmCholeskyAnalysis, SparseJxgrmSolveWorkspace,
+};
 pub use eigh::symmetric_eigh_f64_row_major;
 pub use grm::grm_packed_f64_from_stats_rust;
 pub use he::{
@@ -209,10 +233,18 @@ pub use he::{
     RowStdStats, HE_BOUNDARY_INTERIOR, HE_BOUNDARY_ORIGIN, HE_BOUNDARY_SIGMA_E_ZERO,
     HE_BOUNDARY_SIGMA_G_ZERO,
 };
+pub use king::{
+    king_bitplanes_from_packed, king_pair_stats, king_prune_related_graph,
+    king_related_graph_from_bitplanes, king_related_graph_from_packed,
+    king_related_pairs_from_bitplanes, king_related_pairs_from_packed, king_unrelated_set_from_bed,
+    king_unrelated_set_from_bed_default, king_unrelated_set_from_packed, KingBitplanes,
+    KingPairStats, KingPruneResult, KingRelatedGraph, KingRelatedPairRow,
+};
 pub use lasso::{
     compare_lasso_results, fit_lasso_f32, fit_lasso_f32_reference, fit_lasso_packed_active_f32,
-    DenseLassoDesign, LassoCompareStats, LassoConfig, LassoDesignMatrix, LassoResult,
-    LassoSolverKind, PackedBedLassoConfig, PackedBedLassoDesign,
+    fit_lasso_packed_active_path_f32, fit_lasso_path_f32, DenseLassoDesign, LassoCompareStats,
+    LassoConfig, LassoDesignMatrix, LassoPathPoint, LassoResult, LassoSolverKind,
+    PackedBedLassoConfig, PackedBedLassoDesign,
 };
 // ============================================================
 // PyO3 module exports
@@ -244,6 +276,9 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(score_binary_ba_py, m)?)?;
     m.add_function(wrap_pyfunction!(score_binary_mcc_py, m)?)?;
     m.add_function(wrap_pyfunction!(score_binary_ba_mcc_batch_py, m)?)?;
+    m.add_function(wrap_pyfunction!(spgrm_packed_to_jxgrm, m)?)?;
+    m.add_function(wrap_pyfunction!(spgrm_bed_to_jxgrm, m)?)?;
+    m.add_function(wrap_pyfunction!(spgrm_dense_f32_to_jxgrm, m)?)?;
     m.add_function(wrap_pyfunction!(score_cont_mean_diff_py, m)?)?;
     m.add_function(wrap_pyfunction!(score_cont_corr_py, m)?)?;
     m.add_function(wrap_pyfunction!(score_cont_mean_diff_corr_batch_py, m)?)?;
@@ -271,6 +306,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(load_mbin_packed_py, m)?)?;
     m.add_function(wrap_pyfunction!(scan_bed_2bit_packed_stats, m)?)?;
     m.add_function(wrap_pyfunction!(prepare_bed_2bit_packed, m)?)?;
+    m.add_function(wrap_pyfunction!(prepare_bed_logic_meta_selected, m)?)?;
     m.add_function(wrap_pyfunction!(load_bed_u8_matrix, m)?)?;
     m.add_function(wrap_pyfunction!(load_site_info, m)?)?;
     m.add_function(wrap_pyfunction!(gfd_packbits_from_dosage_block, m)?)?;
@@ -303,6 +339,13 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(packed_malpha_f64, m)?)?;
     m.add_function(wrap_pyfunction!(packed_malpha_mode_f64, m)?)?;
     m.add_function(wrap_pyfunction!(he_pcg_bed, m)?)?;
+    m.add_function(wrap_pyfunction!(jxlmm_assoc_pcg_bed, m)?)?;
+    m.add_function(wrap_pyfunction!(jxlmm_assoc_pcg_bed_to_tsv, m)?)?;
+    m.add_function(wrap_pyfunction!(jxlmm_scan_exact_packed, m)?)?;
+    m.add_function(wrap_pyfunction!(jxlmm_sparse_grm_diag_stats, m)?)?;
+    m.add_function(wrap_pyfunction!(jxreml_sparse_reml_grid_from_jxgrm, m)?)?;
+    m.add_function(wrap_pyfunction!(jxreml_sparse_reml_brent_from_jxgrm, m)?)?;
+    m.add_function(wrap_pyfunction!(king::king_unrelated_set_from_bed_py, m)?)?;
     m.add_function(wrap_pyfunction!(rrblup_pcg_bed, m)?)?;
     m.add_function(wrap_pyfunction!(gblup_reml_packed_bed, m)?)?;
     m.add_function(wrap_pyfunction!(rust_sgemm_backend, m)?)?;
@@ -318,6 +361,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(top_rank_to_target_values_py, m)?)?;
     m.add_function(wrap_pyfunction!(grm_packed_bed_f32, m)?)?;
     m.add_function(wrap_pyfunction!(grm_packed_bed_f64, m)?)?;
+    m.add_function(wrap_pyfunction!(grm_bed_f64_from_meta, m)?)?;
     m.add_function(wrap_pyfunction!(grm_stream_bed_f32, m)?)?;
     m.add_function(wrap_pyfunction!(grm_stream_bed_f64, m)?)?;
     m.add_function(wrap_pyfunction!(grm_stream_bed_f32_to_npy, m)?)?;

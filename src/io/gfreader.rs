@@ -4010,6 +4010,9 @@ pub(crate) struct PackedBedSubsetOwned {
 pub(crate) struct PreparedBedLogicMetaOwned {
     pub site_keep: Vec<bool>,
     pub row_flip: Vec<bool>,
+    pub row_source_indices: Vec<usize>,
+    pub missing_rate: Vec<f32>,
+    pub maf: Vec<f32>,
     pub sites: Vec<core::SiteInfo>,
     pub n_samples: usize,
     pub n_snps_total: usize,
@@ -4125,7 +4128,7 @@ pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples(
     );
 
     let apply_het_filter = het_threshold > 0.0_f32;
-    let keep_flip: Vec<(bool, bool)> = packed_full
+    let keep_flip_stats: Vec<(bool, bool, f32, f32)> = packed_full
         .par_chunks(bytes_per_snp)
         .enumerate()
         .map(|(i, row)| {
@@ -4137,6 +4140,8 @@ pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples(
             let non_missing = stats_n_samples.saturating_sub(missing);
             let alt_sum = het.saturating_add(hom_alt.saturating_mul(2));
             let het_count = if apply_het_filter { het } else { 0usize };
+            let (missing_rate, maf, _std) =
+                packed_row_stats_from_counts(stats_n_samples, non_missing, alt_sum);
             let (pass_num, flip) = evaluate_packed_row_keep_and_flip(
                 stats_n_samples,
                 non_missing,
@@ -4154,10 +4159,13 @@ pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples(
                 true
             };
             let keep = pass_num && pass_snp;
-            (keep, keep && flip)
+            (keep, keep && flip, missing_rate, maf)
         })
         .collect();
-    let site_keep: Vec<bool> = keep_flip.iter().map(|(keep, _)| *keep).collect();
+    let site_keep: Vec<bool> = keep_flip_stats
+        .iter()
+        .map(|(keep, _, _, _)| *keep)
+        .collect();
     if site_keep.len() != n_snps {
         return Err(format!(
             "internal error: site_keep rows {} != n_snps {n_snps}",
@@ -4182,20 +4190,29 @@ pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples(
 
     let mut sites_keep = Vec::<core::SiteInfo>::with_capacity(kept_n);
     let mut row_flip_keep = Vec::<bool>::with_capacity(kept_n);
+    let mut row_source_indices = Vec::<usize>::with_capacity(kept_n);
+    let mut missing_rate_keep = Vec::<f32>::with_capacity(kept_n);
+    let mut maf_keep = Vec::<f32>::with_capacity(kept_n);
     for (i, mut site) in sites_all.into_iter().enumerate() {
         if site_keep[i] {
-            let flip = keep_flip[i].1;
+            let (_keep, flip, missing_rate, maf) = keep_flip_stats[i];
             if flip {
                 std::mem::swap(&mut site.ref_allele, &mut site.alt_allele);
             }
             sites_keep.push(site);
             row_flip_keep.push(flip);
+            row_source_indices.push(i);
+            missing_rate_keep.push(missing_rate);
+            maf_keep.push(maf);
         }
     }
 
     Ok(PreparedBedLogicMetaOwned {
         site_keep,
         row_flip: row_flip_keep,
+        row_source_indices,
+        missing_rate: missing_rate_keep,
+        maf: maf_keep,
         sites: sites_keep,
         n_samples,
         n_snps_total: n_snps,
@@ -4296,7 +4313,7 @@ pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples_pure_line(
     }
 
     let packed_full = &mmap[3..];
-    let keep_flip: Vec<(bool, bool)> = packed_full
+    let keep_flip_stats: Vec<(bool, bool, f32, f32)> = packed_full
         .par_chunks(bytes_per_snp)
         .enumerate()
         .map(|(i, row)| {
@@ -4305,6 +4322,8 @@ pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples_pure_line(
             } else {
                 count_packed_row_pure_line_counts_selected(row, n_samples, stats_sample_indices)
             };
+            let (missing_rate, maf, _std) =
+                packed_row_stats_from_counts_pure_line(stats_n_samples, logic_missing, hom_alt);
             let (pass_num, flip) = evaluate_packed_row_keep_and_flip_pure_line(
                 stats_n_samples,
                 logic_missing,
@@ -4319,10 +4338,13 @@ pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples_pure_line(
                 true
             };
             let keep = pass_num && pass_snp;
-            (keep, keep && flip)
+            (keep, keep && flip, missing_rate, maf)
         })
         .collect();
-    let site_keep: Vec<bool> = keep_flip.iter().map(|(keep, _)| *keep).collect();
+    let site_keep: Vec<bool> = keep_flip_stats
+        .iter()
+        .map(|(keep, _, _, _)| *keep)
+        .collect();
     if site_keep.len() != n_snps {
         return Err(format!(
             "internal error: site_keep rows {} != n_snps {n_snps}",
@@ -4339,20 +4361,29 @@ pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples_pure_line(
 
     let mut sites_keep = Vec::<core::SiteInfo>::with_capacity(kept_n);
     let mut row_flip_keep = Vec::<bool>::with_capacity(kept_n);
+    let mut row_source_indices = Vec::<usize>::with_capacity(kept_n);
+    let mut missing_rate_keep = Vec::<f32>::with_capacity(kept_n);
+    let mut maf_keep = Vec::<f32>::with_capacity(kept_n);
     for (i, mut site) in sites_all.into_iter().enumerate() {
         if site_keep[i] {
-            let flip = keep_flip[i].1;
+            let (_keep, flip, missing_rate, maf) = keep_flip_stats[i];
             if flip {
                 std::mem::swap(&mut site.ref_allele, &mut site.alt_allele);
             }
             sites_keep.push(site);
             row_flip_keep.push(flip);
+            row_source_indices.push(i);
+            missing_rate_keep.push(missing_rate);
+            maf_keep.push(maf);
         }
     }
 
     Ok(PreparedBedLogicMetaOwned {
         site_keep,
         row_flip: row_flip_keep,
+        row_source_indices,
+        missing_rate: missing_rate_keep,
+        maf: maf_keep,
         sites: sites_keep,
         n_samples,
         n_snps_total: n_snps,
@@ -5018,6 +5049,115 @@ pub fn prepare_bed_2bit_packed<'py>(
         site_keep_arr,
         n_samples,
         n_snps,
+    ))
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    prefix,
+    sample_indices=None,
+    maf_threshold=0.0,
+    max_missing_rate=1.0,
+    het_threshold=0.0,
+    snps_only=false,
+))]
+pub fn prepare_bed_logic_meta_selected<'py>(
+    py: Python<'py>,
+    prefix: String,
+    sample_indices: Option<PyReadonlyArray1<'py, i64>>,
+    maf_threshold: f32,
+    max_missing_rate: f32,
+    het_threshold: f32,
+    snps_only: bool,
+) -> PyResult<(
+    Bound<'py, PyArray1<i64>>,
+    Bound<'py, PyArray1<f32>>,
+    Bound<'py, PyArray1<f32>>,
+    Bound<'py, PyArray1<bool>>,
+    Bound<'py, PyArray1<bool>>,
+    usize,
+    usize,
+)> {
+    if !(0.0..=0.5).contains(&maf_threshold) {
+        return Err(PyValueError::new_err(
+            "maf_threshold must be within [0, 0.5]",
+        ));
+    }
+    if !(0.0..=1.0).contains(&max_missing_rate) {
+        return Err(PyValueError::new_err(
+            "max_missing_rate must be within [0, 1.0]",
+        ));
+    }
+    if !(0.0..=1.0).contains(&het_threshold) {
+        return Err(PyValueError::new_err(
+            "het_threshold must be within [0, 1.0]",
+        ));
+    }
+
+    let bed_prefix = normalize_plink_prefix_local(&prefix);
+    let n_samples_full = core::read_fam(&bed_prefix)
+        .map_err(PyRuntimeError::new_err)?
+        .len();
+    if n_samples_full == 0 {
+        return Err(PyRuntimeError::new_err("no samples found in PLINK input"));
+    }
+    let sample_idx: Option<Vec<usize>> = if let Some(sample_indices) = sample_indices {
+        let idx64 = sample_indices
+            .as_slice()
+            .map_err(|_| PyRuntimeError::new_err("sample_indices must be contiguous int64"))?;
+        let mut out = Vec::with_capacity(idx64.len());
+        for &sid in idx64 {
+            if sid < 0 || (sid as usize) >= n_samples_full {
+                return Err(PyValueError::new_err(format!(
+                    "sample index out of range: {sid} for n_samples={n_samples_full}"
+                )));
+            }
+            out.push(sid as usize);
+        }
+        Some(out)
+    } else {
+        None
+    };
+
+    let prepared = py
+        .detach(move || {
+            prepare_bed_logic_meta_owned_for_stats_samples(
+                &bed_prefix,
+                maf_threshold,
+                max_missing_rate,
+                het_threshold,
+                snps_only,
+                sample_idx.as_deref(),
+            )
+        })
+        .map_err(PyRuntimeError::new_err)?;
+
+    let row_idx: Vec<i64> = prepared
+        .row_source_indices
+        .iter()
+        .map(|&v| v as i64)
+        .collect();
+    #[allow(deprecated)]
+    let row_idx_arr = PyArray1::from_owned_array(py, Array1::from_vec(row_idx)).into_bound();
+    #[allow(deprecated)]
+    let miss_arr =
+        PyArray1::from_owned_array(py, Array1::from_vec(prepared.missing_rate)).into_bound();
+    #[allow(deprecated)]
+    let maf_arr = PyArray1::from_owned_array(py, Array1::from_vec(prepared.maf)).into_bound();
+    #[allow(deprecated)]
+    let row_flip_arr =
+        PyArray1::from_owned_array(py, Array1::from_vec(prepared.row_flip)).into_bound();
+    #[allow(deprecated)]
+    let site_keep_arr =
+        PyArray1::from_owned_array(py, Array1::from_vec(prepared.site_keep)).into_bound();
+    Ok((
+        row_idx_arr,
+        miss_arr,
+        maf_arr,
+        row_flip_arr,
+        site_keep_arr,
+        prepared.n_samples,
+        prepared.n_snps_total,
     ))
 }
 

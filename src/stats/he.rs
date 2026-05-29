@@ -48,6 +48,7 @@ pub struct RowStdStats {
     pub row_mean: Vec<f32>,
     pub row_inv_sd: Vec<f32>,
     pub m_effective: usize,
+    pub sample_diag_sum: Option<Vec<f32>>,
 }
 
 #[derive(Clone, Debug)]
@@ -74,13 +75,13 @@ impl ProjectionWorkspace {
 }
 
 #[derive(Clone, Debug)]
-struct GrmApplyWorkspace {
+pub(crate) struct GrmApplyWorkspace {
     block: Vec<f32>,
     tmp: Vec<f32>,
 }
 
 impl GrmApplyWorkspace {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             block: Vec::new(),
             tmp: Vec::new(),
@@ -100,7 +101,7 @@ impl GrmApplyWorkspace {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-struct HeApplyTiming {
+pub(crate) struct HeApplyTiming {
     decode_secs: f64,
     xmul_secs: f64,
     xtmul_secs: f64,
@@ -402,7 +403,7 @@ fn accum_scaled_rhs_f32(out_row: &mut [f32], rhs_row: &[f32], a: f32) {
     }
 }
 
-pub fn build_row_standardization_stats(
+pub fn build_row_standardization_stats_with_options<F>(
     packed_flat: &[u8],
     bytes_per_snp: usize,
     row_flip: &[bool],
@@ -411,8 +412,14 @@ pub fn build_row_standardization_stats(
     packed_row_indices: Option<&[usize]>,
     std_eps32: f32,
     use_train_maf: bool,
+    compute_sample_diag: bool,
     pool: Option<&Arc<rayon::ThreadPool>>,
-) -> Result<RowStdStats, String> {
+    mut progress_callback: Option<&mut F>,
+    progress_every_rows: usize,
+) -> Result<RowStdStats, String>
+where
+    F: FnMut(usize, usize) -> Result<(), String>,
+{
     let m = row_flip.len();
     if row_maf.len() != m {
         return Err("build_row_standardization_stats: length mismatch".to_string());
@@ -431,77 +438,199 @@ pub fn build_row_standardization_stats(
     } else if m_packed != m {
         return Err("build_row_standardization_stats: packed length mismatch".to_string());
     }
+    let n_out = sample_idx.len();
     let mut row_mean = vec![0.0_f32; m];
     let mut row_inv_sd = vec![0.0_f32; m];
-    let compute_row =
-        |j: usize, mean_slot: &mut f32, inv_sd_slot: &mut f32| -> Result<usize, String> {
-            let flip = row_flip[j];
-            let mut p = oriented_minor_freq_from_input(row_maf[j], flip)?;
-            if use_train_maf {
-                let src_row = packed_row_indices.map(|idx| idx[j]).unwrap_or(j);
-                let row = &packed_flat[src_row * bytes_per_snp..(src_row + 1) * bytes_per_snp];
-                let mut non_missing = 0usize;
-                let mut alt_sum = 0usize;
-                for &sid in sample_idx {
+    let mut sample_diag_sum = if compute_sample_diag {
+        Some(vec![0.0_f32; n_out])
+    } else {
+        None
+    };
+    let compute_row = |j: usize,
+                       mean_slot: &mut f32,
+                       inv_sd_slot: &mut f32,
+                       mut diag_slot: Option<&mut [f32]>|
+     -> Result<usize, String> {
+        let flip = row_flip[j];
+        let mut p = oriented_minor_freq_from_input(row_maf[j], flip)?;
+        let src_row = packed_row_indices.map(|idx| idx[j]).unwrap_or(j);
+        let row = &packed_flat[src_row * bytes_per_snp..(src_row + 1) * bytes_per_snp];
+        if use_train_maf {
+            let mut non_missing = 0usize;
+            let mut alt_sum = 0usize;
+            for &sid in sample_idx {
+                let code = (row[sid >> 2] >> ((sid & 3) * 2)) & 0b11;
+                match code {
+                    0b00 => {
+                        non_missing += 1;
+                    }
+                    0b10 => {
+                        non_missing += 1;
+                        alt_sum += 1;
+                    }
+                    0b11 => {
+                        non_missing += 1;
+                        alt_sum += 2;
+                    }
+                    _ => {}
+                }
+            }
+            if non_missing > 0 {
+                let dosage_sum = if flip {
+                    2usize.saturating_mul(non_missing).saturating_sub(alt_sum)
+                } else {
+                    alt_sum
+                };
+                p = (dosage_sum as f32) / (2.0_f32 * non_missing as f32);
+            }
+        }
+
+        let p = p.clamp(0.0_f32, 1.0_f32);
+        let mean = 2.0_f32 * p;
+        let var = (2.0_f32 * p * (1.0_f32 - p)).max(0.0_f32);
+        *mean_slot = mean;
+        if var > std_eps32 {
+            let inv_sd = 1.0_f32 / var.sqrt();
+            *inv_sd_slot = inv_sd;
+            if let Some(diag) = diag_slot.as_deref_mut() {
+                for (k, &sid) in sample_idx.iter().enumerate() {
                     let code = (row[sid >> 2] >> ((sid & 3) * 2)) & 0b11;
-                    match code {
-                        0b00 => {
-                            non_missing += 1;
-                        }
-                        0b10 => {
-                            non_missing += 1;
-                            alt_sum += 1;
-                        }
-                        0b11 => {
-                            non_missing += 1;
-                            alt_sum += 2;
-                        }
-                        _ => {}
+                    let mut gv = match code {
+                        0b00 => 0.0_f32,
+                        0b10 => 1.0_f32,
+                        0b11 => 2.0_f32,
+                        _ => mean,
+                    };
+                    if flip && code != 0b01 {
+                        gv = 2.0_f32 - gv;
+                    }
+                    let z = (gv - mean) * inv_sd;
+                    diag[k] += z * z;
+                }
+            }
+            Ok(1usize)
+        } else {
+            *inv_sd_slot = 0.0_f32;
+            Ok(0usize)
+        }
+    };
+    if let Some(cb) = progress_callback.as_deref_mut() {
+        cb(0, m.max(1))?;
+    }
+    let chunk_rows = if progress_callback.is_some() || compute_sample_diag {
+        progress_every_rows.max(1).min(m.max(1))
+    } else {
+        m.max(1)
+    };
+    let mut m_effective = 0usize;
+    for st in (0..m).step_by(chunk_rows) {
+        let ed = (st + chunk_rows).min(m);
+        let mean_chunk = &mut row_mean[st..ed];
+        let inv_chunk = &mut row_inv_sd[st..ed];
+        if let Some(tp) = pool {
+            if compute_sample_diag {
+                let (eff_chunk, diag_chunk) = tp.install(|| {
+                    mean_chunk
+                        .par_iter_mut()
+                        .zip(inv_chunk.par_iter_mut())
+                        .enumerate()
+                        .try_fold(
+                            || (0usize, vec![0.0_f32; n_out]),
+                            |(mut acc, mut diag), (off, (mean_slot, inv_sd_slot))| {
+                                let j = st + off;
+                                acc += compute_row(
+                                    j,
+                                    mean_slot,
+                                    inv_sd_slot,
+                                    Some(diag.as_mut_slice()),
+                                )?;
+                                Ok::<(usize, Vec<f32>), String>((acc, diag))
+                            },
+                        )
+                        .try_reduce(
+                            || (0usize, vec![0.0_f32; n_out]),
+                            |(acc_a, mut diag_a), (acc_b, diag_b)| {
+                                for (dst, src) in diag_a.iter_mut().zip(diag_b.into_iter()) {
+                                    *dst += src;
+                                }
+                                Ok::<(usize, Vec<f32>), String>((acc_a + acc_b, diag_a))
+                            },
+                        )
+                })?;
+                m_effective += eff_chunk;
+                if let Some(diag_all) = sample_diag_sum.as_mut() {
+                    for (dst, src) in diag_all.iter_mut().zip(diag_chunk.into_iter()) {
+                        *dst += src;
                     }
                 }
-                if non_missing > 0 {
-                    let dosage_sum = if flip {
-                        2usize.saturating_mul(non_missing).saturating_sub(alt_sum)
-                    } else {
-                        alt_sum
-                    };
-                    p = (dosage_sum as f32) / (2.0_f32 * non_missing as f32);
-                }
-            }
-
-            let p = p.clamp(0.0_f32, 1.0_f32);
-            let mean = 2.0_f32 * p;
-            let var = (2.0_f32 * p * (1.0_f32 - p)).max(0.0_f32);
-            *mean_slot = mean;
-            if var > std_eps32 {
-                *inv_sd_slot = 1.0_f32 / var.sqrt();
-                Ok(1usize)
             } else {
-                *inv_sd_slot = 0.0_f32;
-                Ok(0usize)
+                let eff_chunk = tp.install(|| {
+                    mean_chunk
+                        .par_iter_mut()
+                        .zip(inv_chunk.par_iter_mut())
+                        .enumerate()
+                        .map(|(off, (mean_slot, inv_sd_slot))| {
+                            compute_row(st + off, mean_slot, inv_sd_slot, None)
+                        })
+                        .try_reduce(|| 0usize, |acc, v| Ok::<usize, String>(acc + v))
+                })?;
+                m_effective += eff_chunk;
             }
-        };
-    let m_effective = if let Some(tp) = pool {
-        tp.install(|| {
-            row_mean
-                .par_iter_mut()
-                .zip(row_inv_sd.par_iter_mut())
-                .enumerate()
-                .map(|(j, (mean_slot, inv_sd_slot))| compute_row(j, mean_slot, inv_sd_slot))
-                .try_reduce(|| 0usize, |acc, v| Ok(acc + v))
-        })?
-    } else {
-        let mut acc = 0usize;
-        for j in 0..m {
-            acc += compute_row(j, &mut row_mean[j], &mut row_inv_sd[j])?;
+        } else if compute_sample_diag {
+            let diag_all = sample_diag_sum.as_mut().ok_or_else(|| {
+                "build_row_standardization_stats: missing diag accumulator".to_string()
+            })?;
+            for off in 0..(ed - st) {
+                m_effective += compute_row(
+                    st + off,
+                    &mut mean_chunk[off],
+                    &mut inv_chunk[off],
+                    Some(diag_all.as_mut_slice()),
+                )?;
+            }
+        } else {
+            for off in 0..(ed - st) {
+                m_effective +=
+                    compute_row(st + off, &mut mean_chunk[off], &mut inv_chunk[off], None)?;
+            }
         }
-        acc
-    };
+        if let Some(cb) = progress_callback.as_deref_mut() {
+            cb(ed, m.max(1))?;
+        }
+    }
     Ok(RowStdStats {
         row_mean,
         row_inv_sd,
         m_effective,
+        sample_diag_sum,
     })
+}
+
+pub fn build_row_standardization_stats(
+    packed_flat: &[u8],
+    bytes_per_snp: usize,
+    row_flip: &[bool],
+    row_maf: &[f32],
+    sample_idx: &[usize],
+    packed_row_indices: Option<&[usize]>,
+    std_eps32: f32,
+    use_train_maf: bool,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) -> Result<RowStdStats, String> {
+    build_row_standardization_stats_with_options(
+        packed_flat,
+        bytes_per_snp,
+        row_flip,
+        row_maf,
+        sample_idx,
+        packed_row_indices,
+        std_eps32,
+        use_train_maf,
+        false,
+        pool,
+        None::<&mut fn(usize, usize) -> Result<(), String>>,
+        0,
+    )
 }
 
 #[inline]
@@ -606,7 +735,7 @@ fn splitmix64(mut x: u64) -> u64 {
 }
 
 #[inline]
-fn row_major_block_mul_mat_f32(
+pub(crate) fn row_major_block_mul_mat_f32(
     block: &[f32],
     rows: usize,
     cols: usize,
@@ -914,7 +1043,7 @@ fn decode_standardized_block_f32(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn apply_grm_to_mat_f32_with_workspace(
+pub(crate) fn apply_grm_to_mat_f32_with_workspace(
     packed_flat: &[u8],
     bytes_per_snp: usize,
     n_samples: usize,
@@ -1005,7 +1134,7 @@ fn apply_grm_to_mat_f32_with_workspace(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn apply_grm_to_vec_f32_with_workspace(
+pub(crate) fn apply_grm_to_vec_f32_with_workspace(
     packed_flat: &[u8],
     bytes_per_snp: usize,
     n_samples: usize,

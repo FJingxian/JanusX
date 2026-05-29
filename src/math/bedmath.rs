@@ -677,7 +677,78 @@ fn decode_subset_with_plan(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn decode_standardized_packed_block_rows_f32(
+pub(crate) fn decode_mean_imputed_additive_packed_block_rows_f32(
+    packed_flat: &[u8],
+    bytes_per_snp: usize,
+    n_samples: usize,
+    row_flip: &[bool],
+    row_maf: &[f32],
+    sample_idx: &[usize],
+    full_sample_fast: bool,
+    packed_row_indices: Option<&[usize]>,
+    row_start: usize,
+    out: &mut [f32],
+    code4_lut: &[[u8; 4]; 256],
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) -> Result<(), String> {
+    let n_out = sample_idx.len();
+    if n_out == 0 {
+        return Ok(());
+    }
+    if out.len() % n_out != 0 {
+        return Err(
+            "decode_mean_imputed_additive_packed_block_rows_f32: output length mismatch"
+                .to_string(),
+        );
+    }
+    let cur_rows = out.len() / n_out;
+    if cur_rows == 0 {
+        return Ok(());
+    }
+    let subset_plan = if full_sample_fast {
+        None
+    } else {
+        Some(SubsetDecodePlan::from_sample_idx(sample_idx))
+    };
+
+    let decode_one = |local_row: usize, out_row: &mut [f32]| {
+        let row_idx_local = row_start + local_row;
+        let row_idx_packed = packed_row_indices
+            .map(|idx| idx[row_idx_local])
+            .unwrap_or(row_idx_local);
+        let row =
+            &packed_flat[row_idx_packed * bytes_per_snp..(row_idx_packed + 1) * bytes_per_snp];
+        let mean_g = (2.0_f32 * row_maf[row_idx_local]).clamp(0.0_f32, 2.0_f32);
+        let value_lut: [f32; 4] = if row_flip[row_idx_local] {
+            [2.0_f32, mean_g, 1.0_f32, 0.0_f32]
+        } else {
+            [0.0_f32, mean_g, 1.0_f32, 2.0_f32]
+        };
+        if full_sample_fast {
+            decode_row_centered_full_lut(row, n_samples, code4_lut, &value_lut, out_row);
+            return;
+        }
+        if let Some(plan) = subset_plan.as_ref() {
+            decode_subset_with_plan(row, plan, &value_lut, out_row);
+        }
+    };
+
+    if let Some(tp) = pool {
+        tp.install(|| {
+            out.par_chunks_mut(n_out)
+                .enumerate()
+                .for_each(|(local_row, out_row)| decode_one(local_row, out_row));
+        });
+    } else {
+        for (local_row, out_row) in out.chunks_mut(n_out).enumerate() {
+            decode_one(local_row, out_row);
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_standardized_packed_block_rows_f32_with_plan(
     packed_flat: &[u8],
     bytes_per_snp: usize,
     n_samples: usize,
@@ -686,6 +757,7 @@ pub(crate) fn decode_standardized_packed_block_rows_f32(
     row_inv_sd: &[f32],
     sample_idx: &[usize],
     full_sample_fast: bool,
+    subset_plan: Option<&SubsetDecodePlan>,
     packed_row_indices: Option<&[usize]>,
     row_start: usize,
     out: &mut [f32],
@@ -703,10 +775,12 @@ pub(crate) fn decode_standardized_packed_block_rows_f32(
     if cur_rows == 0 {
         return Ok(());
     }
-    let subset_plan = if full_sample_fast {
+    let local_subset_plan = if full_sample_fast {
         None
     } else {
-        Some(SubsetDecodePlan::from_sample_idx(sample_idx))
+        subset_plan
+            .cloned()
+            .or_else(|| Some(SubsetDecodePlan::from_sample_idx(sample_idx)))
     };
 
     let decode_one = |local_row: usize, out_row: &mut [f32]| {
@@ -737,7 +811,7 @@ pub(crate) fn decode_standardized_packed_block_rows_f32(
             decode_row_centered_full_lut(row, n_samples, code4_lut, &value_lut, out_row);
             return;
         }
-        if let Some(plan) = subset_plan.as_ref() {
+        if let Some(plan) = local_subset_plan.as_ref() {
             decode_subset_with_plan(row, plan, &value_lut, out_row);
         }
     };
@@ -754,6 +828,40 @@ pub(crate) fn decode_standardized_packed_block_rows_f32(
         }
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_standardized_packed_block_rows_f32(
+    packed_flat: &[u8],
+    bytes_per_snp: usize,
+    n_samples: usize,
+    row_flip: &[bool],
+    row_mean: &[f32],
+    row_inv_sd: &[f32],
+    sample_idx: &[usize],
+    full_sample_fast: bool,
+    packed_row_indices: Option<&[usize]>,
+    row_start: usize,
+    out: &mut [f32],
+    code4_lut: &[[u8; 4]; 256],
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) -> Result<(), String> {
+    decode_standardized_packed_block_rows_f32_with_plan(
+        packed_flat,
+        bytes_per_snp,
+        n_samples,
+        row_flip,
+        row_mean,
+        row_inv_sd,
+        sample_idx,
+        full_sample_fast,
+        None,
+        packed_row_indices,
+        row_start,
+        out,
+        code4_lut,
+        pool,
+    )
 }
 
 pub(crate) fn decode_standardized_packed_block_f32(

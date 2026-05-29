@@ -2563,10 +2563,12 @@ def _build_gblup_cv_grm_once(
             raise ValueError("Packed GBLUP-CV requires train sample indices.")
         if _jxrs is None:
             return None
-        if (not stable_grm_builder_available()) and (
-            (not hasattr(_jxrs, "grm_packed_f32"))
-            or (not hasattr(_jxrs, "bed_packed_row_flip_mask"))
-        ):
+        can_build_f32 = bool(
+            hasattr(_jxrs, "grm_packed_f32")
+            and hasattr(_jxrs, "bed_packed_row_flip_mask")
+        )
+        can_build_stable_f64 = bool(stable_grm_builder_available())
+        if (not can_build_f32) and (not can_build_stable_f64):
             return None
 
         sidx = np.ascontiguousarray(np.asarray(train_sample_indices, dtype=np.int64).reshape(-1))
@@ -2579,20 +2581,9 @@ def _build_gblup_cv_grm_once(
         )
         block_cols = max(1, min(4096, int(sidx.size) if sidx.size > 0 else int(n_samples)))
 
-        if stable_grm_builder_available():
-            try:
-                grm, _eff_m = build_stable_packed_ctx_grm_f64(
-                    packed_ctx=packed_ctx,
-                    sample_indices=(None if full_identity else sidx),
-                    block_cols=int(block_cols),
-                    threads=max(1, int(n_jobs)),
-                )
-            except Exception:
-                grm = None
-        else:
-            grm = None
+        grm = None
 
-        if grm is None:
+        if can_build_f32:
             packed = np.ascontiguousarray(np.asarray(packed_ctx["packed"], dtype=np.uint8))
             maf = np.ascontiguousarray(np.asarray(packed_ctx["maf"], dtype=np.float32).reshape(-1))
             if packed.ndim != 2:
@@ -2626,19 +2617,36 @@ def _build_gblup_cv_grm_once(
                     )
 
             sidx_arg = None if full_identity else sidx
-            grm_raw = _jxrs.grm_packed_f32(
-                packed,
-                int(n_samples),
-                row_flip,
-                maf,
-                sample_indices=sidx_arg,
-                method=1,
-                block_cols=int(block_cols),
-                threads=max(1, int(n_jobs)),
-                progress_callback=None,
-                progress_every=0,
-            )
-            grm = np.asarray(grm_raw, dtype=np.float64)
+            try:
+                grm_raw = _jxrs.grm_packed_f32(
+                    packed,
+                    int(n_samples),
+                    row_flip,
+                    maf,
+                    sample_indices=sidx_arg,
+                    method=1,
+                    block_cols=int(block_cols),
+                    threads=max(1, int(n_jobs)),
+                    progress_callback=None,
+                    progress_every=0,
+                )
+                grm = np.asarray(grm_raw, dtype=np.float64)
+            except Exception:
+                grm = None
+
+        if grm is None and can_build_stable_f64:
+            try:
+                grm, _eff_m = build_stable_packed_ctx_grm_f64(
+                    packed_ctx=packed_ctx,
+                    sample_indices=(None if full_identity else sidx),
+                    block_cols=int(block_cols),
+                    threads=max(1, int(n_jobs)),
+                )
+            except Exception:
+                grm = None
+
+        if grm is None:
+            return None
     else:
         if train_snp is None:
             return None

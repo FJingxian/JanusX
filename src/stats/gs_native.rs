@@ -25,7 +25,7 @@ use crate::grm;
 use crate::packed::{
     bed_packed_row_flip_mask, cross_grm_times_alpha_packed_f64, packed_malpha_f64,
 };
-use crate::pcg::pcg_solve_f32;
+use crate::pcg::{pcg_solve, DiagonalPreconditioner, PcgOperator};
 use crate::stats_common::{
     check_ctrlc, env_truthy, get_cached_pool, map_err_string_to_py, parse_index_vec_i64,
 };
@@ -483,6 +483,91 @@ struct PcgStageTimingAccum {
     xmul_secs: f64,
     xtmul_secs: f64,
     callback_secs: f64,
+}
+
+struct RrblupPcgOperator<'a> {
+    packed_flat: &'a [u8],
+    bytes_per_snp: usize,
+    n_samples: usize,
+    row_flip: &'a [bool],
+    row_mean: &'a [f32],
+    row_inv_sd: &'a [f32],
+    sample_idx: &'a [usize],
+    full_sample_fast: bool,
+    packed_row_indices: Option<&'a [usize]>,
+    block_rows: usize,
+    code4_lut: &'a [[u8; 4]; 256],
+    pool: Option<&'a Arc<rayon::ThreadPool>>,
+    lambda_use: f32,
+    stage_timing: bool,
+    stage_accum: &'a Mutex<PcgStageTimingAccum>,
+}
+
+impl PcgOperator<f32> for RrblupPcgOperator<'_> {
+    fn apply(&mut self, input: &[f32], output: &mut [f32]) -> Result<(), String> {
+        let mut xmul_t = PcgMatvecTiming::default();
+        let xp = pcg_x_mul_samples(
+            self.packed_flat,
+            self.bytes_per_snp,
+            self.n_samples,
+            self.row_flip,
+            self.row_mean,
+            self.row_inv_sd,
+            self.sample_idx,
+            self.full_sample_fast,
+            self.packed_row_indices,
+            self.block_rows,
+            input,
+            self.code4_lut,
+            self.pool,
+            if self.stage_timing {
+                Some(&mut xmul_t)
+            } else {
+                None
+            },
+        )?;
+        let mut xtmul_t = PcgMatvecTiming::default();
+        let mut ap = pcg_xt_mul_rows(
+            self.packed_flat,
+            self.bytes_per_snp,
+            self.n_samples,
+            self.row_flip,
+            self.row_mean,
+            self.row_inv_sd,
+            self.sample_idx,
+            self.full_sample_fast,
+            self.packed_row_indices,
+            self.block_rows,
+            &xp,
+            self.code4_lut,
+            self.pool,
+            if self.stage_timing {
+                Some(&mut xtmul_t)
+            } else {
+                None
+            },
+        )?;
+        if let Some(tp) = self.pool {
+            tp.install(|| {
+                ap.par_iter_mut()
+                    .zip(input.par_iter())
+                    .for_each(|(apj, pj)| *apj += self.lambda_use * *pj);
+            });
+        } else {
+            for j in 0..ap.len() {
+                ap[j] += self.lambda_use * input[j];
+            }
+        }
+        output.copy_from_slice(&ap);
+        if self.stage_timing {
+            if let Ok(mut acc) = self.stage_accum.lock() {
+                acc.decode_secs += xmul_t.decode_secs + xtmul_t.decode_secs;
+                acc.xmul_secs += xmul_t.mul_secs;
+                acc.xtmul_secs += xtmul_t.mul_secs;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1985,80 +2070,31 @@ pub fn rrblup_pcg_bed<'py>(
 
                 let mut last_notified = 0usize;
                 let pcg_t0 = Instant::now();
-                let pcg_res = pcg_solve_f32(
+                let apply_a = RrblupPcgOperator {
+                    packed_flat: packed_keep.as_ref(),
+                    bytes_per_snp,
+                    n_samples,
+                    row_flip: row_flip_keep.as_ref(),
+                    row_mean: &row_mean,
+                    row_inv_sd: &row_inv_sd,
+                    sample_idx: &train_idx,
+                    full_sample_fast: full_train_fast,
+                    packed_row_indices: packed_row_indices.as_deref(),
+                    block_rows: row_step,
+                    code4_lut: &code4_lut,
+                    pool: pool_ref,
+                    lambda_use,
+                    stage_timing,
+                    stage_accum: stage_accum.as_ref(),
+                };
+                let pcg_res = pcg_solve(
                     &b,
+                    None,
                     max_iter,
                     tol_use,
                     1e-20_f64,
-                    |p| {
-                        let mut xmul_t = PcgMatvecTiming::default();
-                        let xp = pcg_x_mul_samples(
-                            packed_keep.as_ref(),
-                            bytes_per_snp,
-                            n_samples,
-                            row_flip_keep.as_ref(),
-                            &row_mean,
-                            &row_inv_sd,
-                            &train_idx,
-                            full_train_fast,
-                            packed_row_indices.as_deref(),
-                            row_step,
-                            p,
-                            &code4_lut,
-                            pool_ref,
-                            if stage_timing { Some(&mut xmul_t) } else { None },
-                        )?;
-                        let mut xtmul_t = PcgMatvecTiming::default();
-                        let mut ap = pcg_xt_mul_rows(
-                            packed_keep.as_ref(),
-                            bytes_per_snp,
-                            n_samples,
-                            row_flip_keep.as_ref(),
-                            &row_mean,
-                            &row_inv_sd,
-                            &train_idx,
-                            full_train_fast,
-                            packed_row_indices.as_deref(),
-                            row_step,
-                            &xp,
-                            &code4_lut,
-                            pool_ref,
-                            if stage_timing { Some(&mut xtmul_t) } else { None },
-                        )?;
-                        if let Some(tp) = pool_ref {
-                            tp.install(|| {
-                                ap.par_iter_mut()
-                                    .zip(p.par_iter())
-                                    .for_each(|(apj, pj)| *apj += lambda_use * *pj);
-                            });
-                        } else {
-                            for j in 0..m {
-                                ap[j] += lambda_use * p[j];
-                            }
-                        }
-                        if stage_timing {
-                            if let Ok(mut acc) = stage_accum.lock() {
-                                acc.decode_secs += xmul_t.decode_secs + xtmul_t.decode_secs;
-                                acc.xmul_secs += xmul_t.mul_secs;
-                                acc.xtmul_secs += xtmul_t.mul_secs;
-                            }
-                        }
-                        Ok(ap)
-                    },
-                    |r, z| {
-                        if let Some(tp) = pool_ref {
-                            tp.install(|| {
-                                z.par_iter_mut()
-                                    .zip(r.par_iter())
-                                    .zip(diag_inv.par_iter())
-                                    .for_each(|((zj, rj), dj)| *zj = *dj * *rj);
-                            });
-                        } else {
-                            for j in 0..m {
-                                z[j] = diag_inv[j] * r[j];
-                            }
-                        }
-                    },
+                    apply_a,
+                    DiagonalPreconditioner::new(&diag_inv),
                     |iters_now, iters_max, rel_res_now| {
                         let cb_t0 = Instant::now();
                         if ((iters_now == 0usize) && (last_notified == 0usize))

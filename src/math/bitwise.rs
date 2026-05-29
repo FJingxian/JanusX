@@ -124,6 +124,28 @@ enum MutateBackend {
     Neon,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct KingBitCounts {
+    pub(crate) shared_nonmissing: u64,
+    pub(crate) ibs0: u64,
+    pub(crate) same_hom: u64,
+    pub(crate) both_het: u64,
+    pub(crate) het_i_obs: u64,
+    pub(crate) het_j_obs: u64,
+}
+
+impl KingBitCounts {
+    #[inline]
+    pub(crate) fn add_assign(&mut self, rhs: Self) {
+        self.shared_nonmissing += rhs.shared_nonmissing;
+        self.ibs0 += rhs.ibs0;
+        self.same_hom += rhs.same_hom;
+        self.both_het += rhs.both_het;
+        self.het_i_obs += rhs.het_i_obs;
+        self.het_j_obs += rhs.het_j_obs;
+    }
+}
+
 #[inline]
 fn reduce_backend_name(b: ReduceBackend) -> &'static str {
     match b {
@@ -217,6 +239,42 @@ fn and_popcount_serial(lhs: &[u64], rhs: &[u64]) -> u64 {
         i += 1;
     }
     a0 + a1 + a2 + a3
+}
+
+#[inline]
+fn king_pair_counts_serial(
+    zi: &[u64],
+    hi: &[u64],
+    ai: &[u64],
+    zj: &[u64],
+    hj: &[u64],
+    aj: &[u64],
+) -> KingBitCounts {
+    debug_assert_eq!(zi.len(), hi.len());
+    debug_assert_eq!(zi.len(), ai.len());
+    debug_assert_eq!(zi.len(), zj.len());
+    debug_assert_eq!(zi.len(), hj.len());
+    debug_assert_eq!(zi.len(), aj.len());
+
+    let mut out = KingBitCounts::default();
+    let n = zi.len();
+    for w in 0..n {
+        let ziw = zi[w];
+        let hiw = hi[w];
+        let aiw = ai[w];
+        let zjw = zj[w];
+        let hjw = hj[w];
+        let ajw = aj[w];
+        let nonmiss_i = ziw | hiw | aiw;
+        let nonmiss_j = zjw | hjw | ajw;
+        out.ibs0 += (((ziw & ajw) | (aiw & zjw)).count_ones()) as u64;
+        out.same_hom += (((ziw & zjw) | (aiw & ajw)).count_ones()) as u64;
+        out.both_het += (hiw & hjw).count_ones() as u64;
+        out.het_i_obs += (hiw & nonmiss_j).count_ones() as u64;
+        out.het_j_obs += (hjw & nonmiss_i).count_ones() as u64;
+        out.shared_nonmissing += (nonmiss_i & nonmiss_j).count_ones() as u64;
+    }
+    out
 }
 
 #[inline]
@@ -343,6 +401,64 @@ unsafe fn and_popcount_simd_avx2(lhs: &[u64], rhs: &[u64]) -> u64 {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+unsafe fn king_pair_counts_simd_avx2(
+    zi: &[u64],
+    hi: &[u64],
+    ai: &[u64],
+    zj: &[u64],
+    hj: &[u64],
+    aj: &[u64],
+) -> KingBitCounts {
+    use core::arch::x86_64::*;
+    let lut4 = _mm256_setr_epi8(
+        0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4, 0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3,
+        3, 4,
+    );
+    let low_mask = _mm256_set1_epi8(0x0f_i8);
+    let zero = _mm256_setzero_si256();
+    let mut out = KingBitCounts::default();
+    let mut i = 0usize;
+    let n = zi.len();
+    while i + 4 <= n {
+        let ziv = _mm256_loadu_si256(zi.as_ptr().add(i) as *const __m256i);
+        let hiv = _mm256_loadu_si256(hi.as_ptr().add(i) as *const __m256i);
+        let aiv = _mm256_loadu_si256(ai.as_ptr().add(i) as *const __m256i);
+        let zjv = _mm256_loadu_si256(zj.as_ptr().add(i) as *const __m256i);
+        let hjv = _mm256_loadu_si256(hj.as_ptr().add(i) as *const __m256i);
+        let ajv = _mm256_loadu_si256(aj.as_ptr().add(i) as *const __m256i);
+
+        let nonmiss_i = _mm256_or_si256(ziv, _mm256_or_si256(hiv, aiv));
+        let nonmiss_j = _mm256_or_si256(zjv, _mm256_or_si256(hjv, ajv));
+        let ibs0 = _mm256_or_si256(_mm256_and_si256(ziv, ajv), _mm256_and_si256(aiv, zjv));
+        let same_hom = _mm256_or_si256(_mm256_and_si256(ziv, zjv), _mm256_and_si256(aiv, ajv));
+        let both_het = _mm256_and_si256(hiv, hjv);
+        let het_i_obs = _mm256_and_si256(hiv, nonmiss_j);
+        let het_j_obs = _mm256_and_si256(hjv, nonmiss_i);
+        let shared_nonmissing = _mm256_and_si256(nonmiss_i, nonmiss_j);
+
+        out.ibs0 += popcount_u8x32_avx2(ibs0, lut4, low_mask, zero);
+        out.same_hom += popcount_u8x32_avx2(same_hom, lut4, low_mask, zero);
+        out.both_het += popcount_u8x32_avx2(both_het, lut4, low_mask, zero);
+        out.het_i_obs += popcount_u8x32_avx2(het_i_obs, lut4, low_mask, zero);
+        out.het_j_obs += popcount_u8x32_avx2(het_j_obs, lut4, low_mask, zero);
+        out.shared_nonmissing += popcount_u8x32_avx2(shared_nonmissing, lut4, low_mask, zero);
+        i += 4;
+    }
+    if i < n {
+        out.add_assign(king_pair_counts_serial(
+            &zi[i..],
+            &hi[i..],
+            &ai[i..],
+            &zj[i..],
+            &hj[i..],
+            &aj[i..],
+        ));
+    }
+    out
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
 unsafe fn bitand_assign_simd_avx2(dst: &mut [u64], rhs: &[u64]) {
     use core::arch::x86_64::*;
     let mut i = 0usize;
@@ -430,6 +546,57 @@ unsafe fn and_popcount_simd_neon(lhs: &[u64], rhs: &[u64]) -> u64 {
 }
 
 #[cfg(target_arch = "aarch64")]
+unsafe fn king_pair_counts_simd_neon(
+    zi: &[u64],
+    hi: &[u64],
+    ai: &[u64],
+    zj: &[u64],
+    hj: &[u64],
+    aj: &[u64],
+) -> KingBitCounts {
+    use core::arch::aarch64::*;
+    let mut out = KingBitCounts::default();
+    let mut i = 0usize;
+    let n = zi.len();
+    while i + 2 <= n {
+        let ziv = vld1q_u64(zi.as_ptr().add(i));
+        let hiv = vld1q_u64(hi.as_ptr().add(i));
+        let aiv = vld1q_u64(ai.as_ptr().add(i));
+        let zjv = vld1q_u64(zj.as_ptr().add(i));
+        let hjv = vld1q_u64(hj.as_ptr().add(i));
+        let ajv = vld1q_u64(aj.as_ptr().add(i));
+
+        let nonmiss_i = vorrq_u64(ziv, vorrq_u64(hiv, aiv));
+        let nonmiss_j = vorrq_u64(zjv, vorrq_u64(hjv, ajv));
+        let ibs0 = vorrq_u64(vandq_u64(ziv, ajv), vandq_u64(aiv, zjv));
+        let same_hom = vorrq_u64(vandq_u64(ziv, zjv), vandq_u64(aiv, ajv));
+        let both_het = vandq_u64(hiv, hjv);
+        let het_i_obs = vandq_u64(hiv, nonmiss_j);
+        let het_j_obs = vandq_u64(hjv, nonmiss_i);
+        let shared_nonmissing = vandq_u64(nonmiss_i, nonmiss_j);
+
+        out.ibs0 += popcount_u64x2_neon(ibs0);
+        out.same_hom += popcount_u64x2_neon(same_hom);
+        out.both_het += popcount_u64x2_neon(both_het);
+        out.het_i_obs += popcount_u64x2_neon(het_i_obs);
+        out.het_j_obs += popcount_u64x2_neon(het_j_obs);
+        out.shared_nonmissing += popcount_u64x2_neon(shared_nonmissing);
+        i += 2;
+    }
+    if i < n {
+        out.add_assign(king_pair_counts_serial(
+            &zi[i..],
+            &hi[i..],
+            &ai[i..],
+            &zj[i..],
+            &hj[i..],
+            &aj[i..],
+        ));
+    }
+    out
+}
+
+#[cfg(target_arch = "aarch64")]
 unsafe fn bitand_assign_simd_neon(dst: &mut [u64], rhs: &[u64]) {
     use core::arch::aarch64::*;
     let mut i = 0usize;
@@ -503,6 +670,45 @@ fn popcount_chunk_by_backend(words: &[u64], backend: ReduceBackend) -> u64 {
                 unsafe { popcount_simd_neon(words) }
             } else {
                 popcount_serial(words)
+            }
+        }
+    }
+}
+
+#[inline]
+fn king_pair_counts_chunk_by_backend(
+    zi: &[u64],
+    hi: &[u64],
+    ai: &[u64],
+    zj: &[u64],
+    hj: &[u64],
+    aj: &[u64],
+    backend: ReduceBackend,
+) -> KingBitCounts {
+    match backend {
+        ReduceBackend::Scalar => king_pair_counts_serial(zi, hi, ai, zj, hj, aj),
+        #[cfg(target_arch = "x86_64")]
+        ReduceBackend::Avx2 => {
+            if avx2_runtime_available() {
+                unsafe { king_pair_counts_simd_avx2(zi, hi, ai, zj, hj, aj) }
+            } else {
+                king_pair_counts_serial(zi, hi, ai, zj, hj, aj)
+            }
+        }
+        #[cfg(all(target_arch = "x86_64", feature = "simd-avx512"))]
+        ReduceBackend::Avx512 => {
+            if avx2_runtime_available() {
+                unsafe { king_pair_counts_simd_avx2(zi, hi, ai, zj, hj, aj) }
+            } else {
+                king_pair_counts_serial(zi, hi, ai, zj, hj, aj)
+            }
+        }
+        #[cfg(target_arch = "aarch64")]
+        ReduceBackend::Neon => {
+            if neon_runtime_available() {
+                unsafe { king_pair_counts_simd_neon(zi, hi, ai, zj, hj, aj) }
+            } else {
+                king_pair_counts_serial(zi, hi, ai, zj, hj, aj)
             }
         }
     }
@@ -888,6 +1094,45 @@ pub fn and_popcount(lhs: &[u64], rhs: &[u64]) -> u64 {
     and_popcount_with_backend(lhs, rhs, resolve_reduce_backend())
 }
 
+pub(crate) fn king_pair_counts(
+    zi: &[u64],
+    hi: &[u64],
+    ai: &[u64],
+    zj: &[u64],
+    hj: &[u64],
+    aj: &[u64],
+) -> KingBitCounts {
+    assert_eq!(
+        zi.len(),
+        hi.len(),
+        "king_pair_counts: zi/hi length mismatch"
+    );
+    assert_eq!(
+        zi.len(),
+        ai.len(),
+        "king_pair_counts: zi/ai length mismatch"
+    );
+    assert_eq!(
+        zi.len(),
+        zj.len(),
+        "king_pair_counts: zi/zj length mismatch"
+    );
+    assert_eq!(
+        zi.len(),
+        hj.len(),
+        "king_pair_counts: zi/hj length mismatch"
+    );
+    assert_eq!(
+        zi.len(),
+        aj.len(),
+        "king_pair_counts: zi/aj length mismatch"
+    );
+    if zi.is_empty() {
+        return KingBitCounts::default();
+    }
+    king_pair_counts_chunk_by_backend(zi, hi, ai, zj, hj, aj, resolve_reduce_backend())
+}
+
 /// In-place `dst &= rhs` for packed `u64` bit-vectors.
 pub fn bitand_assign(dst: &mut [u64], rhs: &[u64]) {
     assert_eq!(
@@ -1110,6 +1355,23 @@ mod tests {
         let a = [0b1011u64, 0b1100u64, u64::MAX];
         let b = [0b0110u64, 0b0101u64, 0];
         assert_eq!(and_popcount(&a, &b), 1 + 1 + 0);
+    }
+
+    #[test]
+    fn test_king_pair_counts_basic() {
+        let zi = [0b0001_0010u64];
+        let hi = [0b0100_1000u64];
+        let ai = [0b1000_0000u64];
+        let zj = [0b0001_1000u64];
+        let hj = [0b0010_0100u64];
+        let aj = [0b0100_0000u64];
+        let counts = king_pair_counts(&zi, &hi, &ai, &zj, &hj, &aj);
+        assert_eq!(counts.shared_nonmissing, 6);
+        assert_eq!(counts.ibs0, 1);
+        assert_eq!(counts.same_hom, 1);
+        assert_eq!(counts.both_het, 0);
+        assert_eq!(counts.het_i_obs, 2);
+        assert_eq!(counts.het_j_obs, 2);
     }
 
     #[test]

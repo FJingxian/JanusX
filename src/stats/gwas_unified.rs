@@ -241,6 +241,7 @@ pub fn gwas_trait_model_dispatch_v2<'py>(
             "lmm" => Some("lmm"),
             "fastlmm" => Some("fastlmm"),
             "algwas" => Some("algwas"),
+            "jxlmm" => Some("jxlmm"),
             _ => None,
         };
         if let Some(v) = norm {
@@ -271,6 +272,7 @@ pub fn gwas_trait_model_dispatch_v2<'py>(
                 }
                 "farmcpu" => "farmcpu",
                 "algwas" => "algwas",
+                "jxlmm" => "jxlmm",
                 _ => "unknown",
             };
             let item = PyDict::new(py);

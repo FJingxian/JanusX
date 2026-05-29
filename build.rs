@@ -61,9 +61,7 @@ fn parse_fasttree_openmp_mode() -> FastTreeOpenMpMode {
             FastTreeOpenMpMode::Required
         }
         other => {
-            println!(
-                "cargo:warning=Unrecognized JANUSX_FASTTREE_OPENMP={other:?}; using auto."
-            );
+            println!("cargo:warning=Unrecognized JANUSX_FASTTREE_OPENMP={other:?}; using auto.");
             FastTreeOpenMpMode::Auto
         }
     }
@@ -427,7 +425,8 @@ fn compiler_print_file_name(
     name: &str,
 ) -> Option<PathBuf> {
     let mut cmd = Command::new(compiler);
-    cmd.args(compiler_args).arg(format!("-print-file-name={name}"));
+    cmd.args(compiler_args)
+        .arg(format!("-print-file-name={name}"));
     let stdout = command_stdout_trim(&mut cmd)?;
     let path = PathBuf::from(stdout);
     if path.as_os_str().is_empty() || path == Path::new(name) || !path.is_file() {
@@ -543,7 +542,12 @@ fn windows_runtime_probe_dirs(compiler: &Path) -> Vec<PathBuf> {
             out.push(dir);
         }
     }
-    for name in ["LIBRARY_BIN", "OPENBLAS_BIN_DIR", "LIBRARY_LIB", "OPENBLAS_LIB_DIR"] {
+    for name in [
+        "LIBRARY_BIN",
+        "OPENBLAS_BIN_DIR",
+        "LIBRARY_LIB",
+        "OPENBLAS_LIB_DIR",
+    ] {
         if let Some(dir) = env::var_os(name).map(PathBuf::from) {
             if dir.is_dir() {
                 out.push(dir);
@@ -583,7 +587,12 @@ fn windows_openmp_runtime_artifacts(
     is_msvc: bool,
 ) -> Vec<PathBuf> {
     let names: Vec<&str> = if is_msvc {
-        vec!["libomp.dll", "vcomp140.dll", "vcomp140_1.dll", "libiomp5md.dll"]
+        vec![
+            "libomp.dll",
+            "vcomp140.dll",
+            "vcomp140_1.dll",
+            "libiomp5md.dll",
+        ]
     } else {
         vec![
             "libgomp-1.dll",
@@ -916,7 +925,10 @@ fn compile_fasttree_executable() {
                 } else {
                     emit_command_output("fasttree-build-openmp", &out);
                     if openmp_mode == FastTreeOpenMpMode::Required {
-                        panic!("FastTree OpenMP compilation failed with status {}", out.status);
+                        panic!(
+                            "FastTree OpenMP compilation failed with status {}",
+                            out.status
+                        );
                     }
                     println!(
                         "cargo:warning=FastTree OpenMP build failed; falling back to serial binary."
@@ -982,7 +994,9 @@ fn compile_fasttree_executable() {
     ));
     if openmp_enabled {
         if target_os == "windows" {
-            println!("cargo:warning=FastTree OpenMP enabled; emitted FastTreeMP.exe and FastTree.exe.");
+            println!(
+                "cargo:warning=FastTree OpenMP enabled; emitted FastTreeMP.exe and FastTree.exe."
+            );
         } else {
             println!("cargo:warning=FastTree OpenMP enabled.");
         }

@@ -218,9 +218,9 @@ class LinearModel:
         tables: dict[str, pd.DataFrame] = {}
 
         kinship = None
-        if model_key == "algwas":
+        if model_key in {"algwas", "jxlmm"}:
             raise ValueError(
-                "ALGWAS is currently available only for file-mode GWAS workflows "
+                f"{str(model_key).upper()} is currently available only for file-mode GWAS workflows "
                 "(PLINK/BED-backed packed route)."
             )
 
@@ -447,6 +447,22 @@ class LinearModel:
     ) -> AssociationResult:
         return self._run(
             model_key="algwas",
+            out=out,
+            prefix=prefix,
+            log=log,
+            write_files=write_files,
+        )
+
+    def jxlmm(
+        self,
+        *,
+        out: Optional[str] = None,
+        prefix: Optional[str] = None,
+        log: bool = True,
+        write_files: bool = False,
+    ) -> AssociationResult:
+        return self._run(
+            model_key="jxlmm",
             out=out,
             prefix=prefix,
             log=log,

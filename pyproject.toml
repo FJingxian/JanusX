@@ -64,7 +64,7 @@ backend-path = ["scripts"]
 
 [tool.maturin]
 bindings = "pyo3"
-strip = true
+strip = false
 module-name = "janusx.janusx"
 python-source = "python"
 cargo-extra-args = "--locked"

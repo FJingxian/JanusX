@@ -7,6 +7,7 @@ Design overview
 Models:
   - LMM     : streaming, low-memory implementation (slim.LMM)
   - LM      : streaming, low-memory implementation (slim.LM)
+  - JXLMM   : sparse-GRM + sparse-Cholesky mixed-model route
   - ALGWAS  : packed/full-rust adaptive-lasso GWAS route
   - FarmCPU : in-memory implementation (pyBLUP.farmcpu) that loads the
               full genotype matrix
@@ -17,6 +18,7 @@ Execution mode (automatic)
   - Default: LM/LMM/FastLMM run in memmap BED mode.
   - With `-fast` (or when `-farmcpu` / `-algwas` is selected), packed BED is
     loaded once and reused for full-rust packed routes when available.
+  - JXLMM defaults to BED memmap / streaming metadata unless `-fast` reuses a packed preload.
   - FarmCPU always runs on the full in-memory genotype matrix.
 
 Caching
@@ -699,9 +701,10 @@ def _gwas_model_sort_key(model_name: object) -> tuple[int, str]:
         "LowRankLMM": 3,
         "LrLMM": 3,
         "LRLMM": 3,
-        "ALGWAS": 4,
-        "Farm": 4,
-        "FarmCPU": 4,
+        "JXLMM": 4,
+        "ALGWAS": 5,
+        "Farm": 5,
+        "FarmCPU": 5,
     }
     return (order.get(model, 99), model.lower())
 
@@ -1860,6 +1863,60 @@ def _inspect_genotype_with_status(
         _log_info(logger, f"Cached genotype sites: {n_snps}", use_spinner=use_spinner)
         return ids, n_snps
 
+
+def _resolve_rust_grm_backend_plan(
+    genofile: str,
+    *,
+    allow_packed_full_load: bool,
+    preloaded_packed: Union[dict[str, object], None],
+    cache_write_path: Union[str, None],
+) -> tuple[str, str, bool]:
+    packed_prefix = _as_plink_prefix(genofile)
+    if packed_prefix is None:
+        raise RuntimeError(
+            "Rust-only GWAS GRM build requires PLINK BED input/prefix."
+        )
+
+    cache_target = str(cache_write_path).strip() if cache_write_path is not None else ""
+    have_stream = hasattr(jxrs, "grm_stream_bed_f32")
+    have_stream_to_npy = hasattr(jxrs, "grm_stream_bed_f32_to_npy")
+    have_packed_bed = hasattr(jxrs, "grm_packed_bed_f32")
+    have_packed_preloaded = hasattr(jxrs, "grm_packed_f32")
+
+    pre = preloaded_packed if packed_preload_is_ready(preloaded_packed) else None
+    preload_matches = bool(
+        isinstance(pre, dict)
+        and str(pre.get("prefix", "")) == str(packed_prefix)
+        and isinstance(pre.get("packed_ctx"), dict)
+        and have_packed_preloaded
+    )
+    if preload_matches:
+        return (
+            "packed-preloaded",
+            "reusing preloaded packed payload for slice-friendly downstream workflow",
+            False,
+        )
+
+    if have_stream:
+        return (
+            "memmap-bed",
+            "full-sample GRM build without packed reuse requirement",
+            bool(cache_target != "" and have_stream_to_npy),
+        )
+
+    if have_packed_bed:
+        if bool(allow_packed_full_load):
+            reason = "memmap GRM kernel unavailable; packed full-load is allowed"
+        else:
+            reason = "memmap GRM kernel unavailable; fallback to packed full-load"
+        return ("packed-bed", reason, False)
+
+    raise RuntimeError(
+        "No Rust BED GRM kernel is available. Rebuild JanusX extension to export "
+        "`grm_stream_bed_f32` or `grm_packed_bed_f32`."
+    )
+
+
 def build_grm_streaming(
     genofile: str,
     n_samples: int,
@@ -1881,39 +1938,29 @@ def build_grm_streaming(
     Build GRM in Rust-only mode from PLINK BED input.
 
     Route policy:
-    - non-fast/non-farmcpu: Rust memmap-BED single-entry (`grm_stream_bed_f64`)
-    - fast/farmcpu: packed BED single-entry (`grm_packed_bed_f64` / preloaded packed reuse)
+    - default full-sample GRM builds prefer Rust memmap-BED
+    - when a compatible packed preload already exists, reuse it
+    - if memmap is unavailable, fallback to packed BED full-load
     """
     packed_prefix = _as_plink_prefix(genofile)
-    if packed_prefix is None:
-        raise RuntimeError(
-            "Rust-only GWAS GRM build requires PLINK BED input/prefix."
-        )
-    use_packed_kernel = bool(allow_packed_full_load)
-    if use_packed_kernel:
-        if not hasattr(jxrs, "grm_packed_bed_f64"):
-            raise RuntimeError(
-                "Rust symbol grm_packed_bed_f64 is unavailable. "
-                "Rebuild janusx extension for Rust-only GWAS mode."
-            )
-    else:
-        if not hasattr(jxrs, "grm_stream_bed_f64"):
-            raise RuntimeError(
-                "Rust symbol grm_stream_bed_f64 is unavailable. "
-                "Rebuild janusx extension for Rust-only GWAS mode."
-            )
+    backend_kind, backend_reason, stream_direct_cache = _resolve_rust_grm_backend_plan(
+        genofile,
+        allow_packed_full_load=bool(allow_packed_full_load),
+        preloaded_packed=preloaded_packed,
+        cache_write_path=cache_write_path,
+    )
 
     _log_info(
         logger,
         (
-            f"Building GRM (Rust {'packed-bed' if use_packed_kernel else 'memmap-bed'} single-entry), "
-            f"method={method}"
+            f"Building GRM (Rust {backend_kind} single-entry), method={method}. "
+            f"route={backend_reason}"
         ),
         use_spinner=use_spinner,
     )
     pbar = _ProgressAdapter(
         total=n_snps,
-        desc=("GRM (rust-bed)" if use_packed_kernel else "GRM (rust-memmap)"),
+        desc=("GRM (rust-memmap)" if backend_kind == "memmap-bed" else "GRM (rust-bed)"),
         force_animate=True,
     )
     process = psutil.Process()
@@ -1941,78 +1988,75 @@ def build_grm_streaming(
         grm: Union[np.ndarray, None] = None
         eff_m = 0
         cache_target = str(cache_write_path).strip() if cache_write_path is not None else ""
-        if use_packed_kernel:
+        if backend_kind == "packed-preloaded":
             pre = preloaded_packed if packed_preload_is_ready(preloaded_packed) else None
-            used_preloaded = False
-            if (
-                pre is not None
-                and str(pre.get("prefix", "")) == str(packed_prefix)
-                and hasattr(jxrs, "grm_packed_f64")
-            ):
-                packed_ctx_obj = pre.get("packed_ctx")
-                if isinstance(packed_ctx_obj, dict):
-                    packed_pre = np.ascontiguousarray(
-                        np.asarray(packed_ctx_obj["packed"], dtype=np.uint8),
-                        dtype=np.uint8,
-                    )
-                    maf_pre = np.ascontiguousarray(
-                        np.asarray(packed_ctx_obj["maf"], dtype=np.float32).reshape(-1),
-                        dtype=np.float32,
-                    )
-                    row_flip_pre = np.ascontiguousarray(
-                        np.asarray(packed_ctx_obj["row_flip"], dtype=np.bool_).reshape(-1),
-                        dtype=np.bool_,
-                    )
-                    packed_n_pre = int(packed_ctx_obj["n_samples"])
-                    if packed_n_pre != int(n_samples):
-                        raise RuntimeError(
-                            "Preloaded packed sample count mismatch: "
-                            f"packed={packed_n_pre}, expected={int(n_samples)}"
-                        )
-                    if int(packed_pre.shape[0]) != int(maf_pre.shape[0]) or int(
-                        packed_pre.shape[0]
-                    ) != int(row_flip_pre.shape[0]):
-                        raise RuntimeError(
-                            "Preloaded packed metadata mismatch: "
-                            f"packed_rows={packed_pre.shape[0]}, maf={maf_pre.shape[0]}, row_flip={row_flip_pre.shape[0]}"
-                        )
-                    _log_file_only(
-                        logger,
-                        logging.INFO,
-                        "Packed GRM: reusing preloaded packed payload (skip BED repack).",
-                    )
-                    grm_raw = jxrs.grm_packed_f64(
-                        packed_pre,
-                        int(packed_n_pre),
-                        row_flip_pre,
-                        maf_pre,
-                        sample_indices=None,
-                        method=int(method),
-                        block_cols=max(1, int(chunk_size)),
-                        threads=max(1, int(threads)),
-                        progress_callback=_on_packed_progress,
-                        progress_every=max(1, int(chunk_size)),
-                    )
-                    eff_m = int(packed_pre.shape[0])
-                    used_preloaded = True
-
-            if not used_preloaded:
-                grm_raw, eff_m_raw, packed_n_raw = jxrs.grm_packed_bed_f64(
-                    str(packed_prefix),
-                    method=int(method),
-                    maf_threshold=float(maf_threshold),
-                    max_missing_rate=float(max_missing_rate),
-                    block_cols=max(1, int(chunk_size)),
-                    threads=max(1, int(threads)),
-                    progress_callback=_on_packed_progress,
-                    progress_every=max(1, int(chunk_size)),
+            if not isinstance(pre, dict) or str(pre.get("prefix", "")) != str(packed_prefix):
+                raise RuntimeError(
+                    "Packed preload route selected, but compatible preloaded payload is unavailable."
                 )
-                packed_n = int(packed_n_raw)
-                if packed_n != int(n_samples):
-                    raise RuntimeError(
-                        f"Packed sample count mismatch: packed={packed_n}, expected={int(n_samples)}"
-                    )
-                eff_m = int(eff_m_raw)
+            packed_ctx_obj = pre.get("packed_ctx")
+            if not isinstance(packed_ctx_obj, dict):
+                raise RuntimeError("Packed preload route selected without a valid packed_ctx.")
+            packed_pre = np.ascontiguousarray(
+                np.asarray(packed_ctx_obj["packed"], dtype=np.uint8),
+                dtype=np.uint8,
+            )
+            maf_pre = np.ascontiguousarray(
+                np.asarray(packed_ctx_obj["maf"], dtype=np.float32).reshape(-1),
+                dtype=np.float32,
+            )
+            row_flip_pre = np.ascontiguousarray(
+                np.asarray(packed_ctx_obj["row_flip"], dtype=np.bool_).reshape(-1),
+                dtype=np.bool_,
+            )
+            packed_n_pre = int(packed_ctx_obj["n_samples"])
+            if packed_n_pre != int(n_samples):
+                raise RuntimeError(
+                    "Preloaded packed sample count mismatch: "
+                    f"packed={packed_n_pre}, expected={int(n_samples)}"
+                )
+            if int(packed_pre.shape[0]) != int(maf_pre.shape[0]) or int(
+                packed_pre.shape[0]
+            ) != int(row_flip_pre.shape[0]):
+                raise RuntimeError(
+                    "Preloaded packed metadata mismatch: "
+                    f"packed_rows={packed_pre.shape[0]}, maf={maf_pre.shape[0]}, row_flip={row_flip_pre.shape[0]}"
+                )
+            _log_file_only(
+                logger,
+                logging.INFO,
+                "Packed GRM: reusing preloaded packed payload (skip BED repack).",
+            )
+            grm_raw = jxrs.grm_packed_f32(
+                packed_pre,
+                int(packed_n_pre),
+                row_flip_pre,
+                maf_pre,
+                sample_indices=None,
+                method=int(method),
+                block_cols=max(1, int(chunk_size)),
+                threads=max(1, int(threads)),
+                progress_callback=_on_packed_progress,
+                progress_every=max(1, int(chunk_size)),
+            )
+            eff_m = int(packed_pre.shape[0])
+        elif backend_kind == "packed-bed":
+            grm_raw, eff_m_raw, packed_n_raw = jxrs.grm_packed_bed_f32(
+                str(packed_prefix),
+                method=int(method),
+                maf_threshold=float(maf_threshold),
+                max_missing_rate=float(max_missing_rate),
+                block_cols=max(1, int(chunk_size)),
+                threads=max(1, int(threads)),
+                progress_callback=_on_packed_progress,
+                progress_every=max(1, int(chunk_size)),
+            )
+            packed_n = int(packed_n_raw)
+            if packed_n != int(n_samples):
+                raise RuntimeError(
+                    f"Packed sample count mismatch: packed={packed_n}, expected={int(n_samples)}"
+                )
+            eff_m = int(eff_m_raw)
         else:
             two_stage_raw = str(os.environ.get("JX_GRM_STREAM_TWO_STAGE", "")).strip().lower()
             if two_stage_raw in {"1", "true", "yes", "on"}:
@@ -2022,8 +2066,8 @@ def build_grm_streaming(
                     "GRM memmap-bed note: JX_GRM_STREAM_TWO_STAGE=1 is enabled; "
                     "memmap entry may internally switch to packed prebuild mode.",
                 )
-            if cache_target != "" and hasattr(jxrs, "grm_stream_bed_f64_to_npy"):
-                eff_m_raw, stream_n_raw = jxrs.grm_stream_bed_f64_to_npy(
+            if stream_direct_cache:
+                eff_m_raw, stream_n_raw = jxrs.grm_stream_bed_f32_to_npy(
                     str(packed_prefix),
                     str(cache_target),
                     method=int(method),
@@ -2045,9 +2089,9 @@ def build_grm_streaming(
                 # move tmp -> final path and then reopen the final cache.
                 # This avoids holding a memmap handle on tmp cache files, which
                 # can block os.replace on Windows (WinError 32).
-                grm = np.empty((0, 0), dtype=np.float64)
+                grm = np.empty((0, 0), dtype=np.float32)
             else:
-                grm_raw, eff_m_raw, stream_n_raw = jxrs.grm_stream_bed_f64(
+                grm_raw, eff_m_raw, stream_n_raw = jxrs.grm_stream_bed_f32(
                     str(packed_prefix),
                     method=int(method),
                     maf_threshold=float(maf_threshold),
@@ -2066,7 +2110,7 @@ def build_grm_streaming(
                 eff_m = int(eff_m_raw)
 
         if grm is None:
-            grm = np.ascontiguousarray(np.asarray(grm_raw, dtype=np.float64))
+            grm = np.ascontiguousarray(np.asarray(grm_raw, dtype=np.float32))
         mem = process.memory_info().rss / 1024**3
         pbar.set_postfix(memory=f"{mem:.2f}GB")
         pbar.finish()
@@ -2173,10 +2217,10 @@ def load_or_build_grm_with_cache(
                 elif str(grm_path).lower().endswith(".npy"):
                     try:
                         grm_probe = np.load(grm_path, mmap_mode='r')
-                        if np.dtype(grm_probe.dtype) != np.dtype(np.float64):
+                        if np.dtype(grm_probe.dtype) != np.dtype(np.float32):
                             cache_is_stale = True
                             logger.warning(
-                                "Cached GRM dtype is not float64; rebuilding GRM cache."
+                                "Cached GRM dtype is not float32; rebuilding GRM cache."
                             )
                     except Exception:
                         cache_is_stale = True
@@ -2219,9 +2263,11 @@ def load_or_build_grm_with_cache(
                 method_int = int(mgrm)
                 grm_calc_t0 = time.monotonic()
                 tmp_grm = f"{grm_path}.tmp.{os.getpid()}.npy"
-                stream_direct_cache = bool(
-                    (not bool(allow_packed_full_load))
-                    and hasattr(jxrs, "grm_stream_bed_f64_to_npy")
+                _, _, stream_direct_cache = _resolve_rust_grm_backend_plan(
+                    genofile_for_grm,
+                    allow_packed_full_load=bool(allow_packed_full_load),
+                    preloaded_packed=preloaded_packed,
+                    cache_write_path=tmp_grm,
                 )
                 grm, eff_m = build_grm_streaming(
                     genofile=genofile_for_grm,
@@ -2257,7 +2303,7 @@ def load_or_build_grm_with_cache(
                     save_grm_npy_blocked(
                         tmp_grm,
                         grm,
-                        dtype=np.float64,
+                        dtype=np.float32,
                     )
                 _replace_file_with_retry(tmp_grm, grm_path)
                 tmp_id = f"{id_path}.tmp.{os.getpid()}"
@@ -4101,6 +4147,10 @@ def run_algwas_packed_fullrank(*args, **kwargs):
     from janusx.assoc.workflow_model_packed import run_algwas_packed_fullrank as _impl
     return _impl(*args, **kwargs)
 
+def run_jxlmm_packed_fullrank(*args, **kwargs):
+    from janusx.assoc.workflow_model_packed import run_jxlmm_packed_fullrank as _impl
+    return _impl(*args, **kwargs)
+
 def run_chunked_gwas_lmm_lm(*args, **kwargs):
     from janusx.assoc.workflow_model_stream import run_chunked_gwas_lmm_lm as _impl
     return _impl(*args, **kwargs)
@@ -4767,8 +4817,22 @@ def parse_args(argv: Optional[list[str]] = None):
         help="Run FarmCPU (full genotype in memory; default: %(default)s).",
     )
     models_group.add_argument(
+        "-jxlmm", "--jxlmm", nargs="?", const="__SELF__", default=None, metavar="CUTOFF",
+        help=(
+            "Run JXLMM (additive-only). JXLMM builds or reuses sparse GRM from the main genotype "
+            "input, estimates variance components, then scans via sparse Cholesky. "
+            "Optional CUTOFF sets the sparse kinship cutoff (example: -jxlmm 0.001; default: 0.05)."
+        ),
+    )
+    models_group.add_argument(
+        "-sparse", "--sparse", action="store_true", default=False,
+        help=(
+            "Force the sparse JXLMM route. This is mainly useful for testing and validation."
+        ),
+    )
+    models_group.add_argument(
         "-algwas", "--algwas", action="store_true", default=False,
-        help="Run ALGWAS (packed full-rust adaptive-lasso GWAS; additive-only).",
+        help=argparse.SUPPRESS,
     )
     models_group.add_argument(
         "-lm", "--lm", action="store_true", default=False,
@@ -4885,7 +4949,7 @@ def parse_args(argv: Optional[list[str]] = None):
         "-fast", "--fast", action="store_true", default=False,
         help=(
             "Use packed full-rust paths when available (loads BED-packed genotype once "
-            "and reuses it across LM/LMM/FastLMM/ALGWAS/FarmCPU)."
+            "and reuses it across LM/LMM/FastLMM/JXLMM/ALGWAS/FarmCPU)."
         ),
     )
     optional_group.add_argument(
@@ -4943,6 +5007,10 @@ def parse_args(argv: Optional[list[str]] = None):
         parser.error("--farmcpu-qtn-bound must be >= 1.")
     if bool(args.algwas) and str(args.model).strip().lower() != "add":
         parser.error("--algwas currently supports additive coding only (--model add).")
+    if bool(args.jxlmm) and str(args.model).strip().lower() != "add":
+        parser.error("--jxlmm currently supports additive coding only (--model add).")
+    if bool(args.sparse) and not bool(args.jxlmm):
+        parser.error("--sparse/--force-sparse only applies when --jxlmm is selected.")
     try:
         args.farmcpu_bin_size = _parse_float_csv(
             args.farmcpu_bin_size,
@@ -5012,7 +5080,9 @@ def _run_gwas_pipeline(
     explicit_fast_mode = bool(getattr(args, "fast", False))
     farmcpu_auto_fast = bool(args.farmcpu)
     algwas_auto_fast = bool(args.algwas)
-    fast_mode = bool(explicit_fast_mode or farmcpu_auto_fast or algwas_auto_fast)
+    fast_mode = bool(
+        explicit_fast_mode or farmcpu_auto_fast or algwas_auto_fast
+    )
     # FILE-input fast policy (2026-05): prefer Rust routes by materializing
     # PLINK cache then using packed/stream scans, instead of dense Python path.
     file_fast_rust_mode = bool(input_is_file_matrix and fast_mode)
@@ -5026,6 +5096,8 @@ def _run_gwas_pipeline(
             model_tokens.append("fastLMM")
         if args.lmm:
             model_tokens.append("LMM")
+        if args.jxlmm:
+            model_tokens.append("JXLMM")
         if args.algwas:
             model_tokens.append("ALGWAS")
         if args.farmcpu:
@@ -5035,7 +5107,9 @@ def _run_gwas_pipeline(
             bed_backend_policy = "packed (-fast/-farmcpu/-algwas; FILE->BED cache)"
         else:
             bed_backend_policy = (
-                "packed (-fast/-farmcpu/-algwas)" if cli_fast_mode else "memmap (default)"
+                "packed (-fast/-farmcpu/-algwas)"
+                if cli_fast_mode
+                else "memmap (default)"
             )
         cfg_rows: list[tuple[str, object]] = [
             ("Genotype file", gfile),
@@ -5067,6 +5141,8 @@ def _run_gwas_pipeline(
             )
         if args.cov:
             cfg_rows.append(("Covariates", "; ".join(args.cov)))
+        if args.jxlmm:
+            cfg_rows.append(("JXLMM sparse", True))
         emit_cli_configuration(
             logger,
             app_title="JanusX - GWAS",
@@ -5102,9 +5178,9 @@ def _run_gwas_pipeline(
     if not ensure_all_true(checks):
         raise SystemExit(1)
 
-    if not (args.lm or args.lmm or args.fastlmm or args.algwas or args.farmcpu):
+    if not (args.lm or args.lmm or args.fastlmm or args.jxlmm or args.algwas or args.farmcpu):
         logger.error(
-            "No model selected. Use -lm, -lmm, -fastlmm, -algwas, and/or -farmcpu."
+            "No model selected. Use -lm, -lmm, -fastlmm, -jxlmm, -algwas, and/or -farmcpu."
         )
         raise SystemExit(1)
     if args.farmcpu and args.model != "add":
@@ -5145,11 +5221,18 @@ def _run_gwas_pipeline(
             logging.INFO,
             "Input is not direct PLINK BED; memmap route will apply after source conversion/cache to BED.",
         )
+    if bool(args.jxlmm) and (not bool(fast_mode)):
+        _log_file_only(
+            logger,
+            logging.INFO,
+            "JXLMM default backend: BED memmap/streaming metadata; packed preload is used only with -fast.",
+        )
     qcov_needs_grm = str(getattr(args, "qcov", "0")).strip() not in {"", "0"}
     # GRM route policy:
-    # - non-fast GWAS: prefer streaming GRM path (Rust reader + streaming accumulation)
-    # - fast/farmcpu GWAS: allow packed single-entry kernel when enabled
-    prefer_packed_grm = bool(
+    # - default full-sample GRM builds prefer memmap BED
+    # - fast/qcov contexts may reuse an already-preloaded packed payload
+    # - packed full-load remains the fallback when memmap is unavailable
+    allow_packed_grm_reuse = bool(
         fast_mode
         and (args.lmm or args.fastlmm or qcov_needs_grm)
     )
@@ -5160,7 +5243,7 @@ def _run_gwas_pipeline(
     )
     allow_packed_grm_effective = bool(
         (not bool(file_fast_dense_mode))
-        and (prefer_packed_grm or force_bed_stream_scan)
+        and (allow_packed_grm_reuse or force_bed_stream_scan)
     )
     if force_bed_stream_scan and (not bool(fast_mode)):
         _log_file_only(
@@ -5173,6 +5256,13 @@ def _run_gwas_pipeline(
             logger,
             logging.INFO,
             "Non-fast GWAS: GRM uses memmap path by default (packed single-entry disabled).",
+        )
+    elif bool(args.lmm or args.fastlmm or qcov_needs_grm):
+        _log_file_only(
+            logger,
+            logging.INFO,
+            "GWAS GRM auto route: memmap stays primary for full-sample builds; packed is "
+            "reused only when a compatible preloaded packed payload is already available.",
         )
     if bool(args.farmcpu) and (not bool(explicit_fast_mode)):
         if bool(farmcpu_auto_fast):
@@ -5207,6 +5297,8 @@ def _run_gwas_pipeline(
             stream_models.append("lmm")
         if args.fastlmm:
             stream_models.append("fastlmm")
+        if args.jxlmm:
+            stream_models.append("jxlmm")
         if args.algwas:
             stream_models.append("algwas")
         has_farmcpu = bool(args.farmcpu)
@@ -5475,6 +5567,7 @@ def _run_gwas_pipeline(
                             trait_names=trait_one,
                             emit_trait_header=bool(emit_trait_header_model),
                             preloaded_packed=preloaded_packed,
+                            force_sparse_jxlmm=True,
                             force_model=bool(args.force_model),
                         )
 
@@ -5543,6 +5636,35 @@ def _run_gwas_pipeline(
                     ) -> None:
                         run_algwas_packed_fullrank(
                             genofile=genofile_stream,
+                            pheno=pheno,
+                            ids=ids,
+                            outprefix=outprefix,
+                            maf_threshold=maf_threshold_scan,
+                            max_missing_rate=max_missing_rate_scan,
+                            genetic_model=args.model,
+                            het_threshold=het_threshold_scan,
+                            chunk_size=args.chunksize,
+                            qmatrix=qmatrix,
+                            cov_all=cov_all,
+                            plot=args.plot,
+                            threads=args.thread,
+                            logger=logger,
+                            use_spinner=use_spinner,
+                            snps_only=bool(args.snps_only),
+                            eff_snp_by_trait=eff_snp_by_trait,
+                            summary_rows=gwas_summary_rows,
+                            saved_paths=saved_result_paths,
+                            trait_names=trait_one,
+                            emit_trait_header=bool(emit_trait_header_model),
+                            preloaded_packed=preloaded_packed,
+                        )
+
+                    def _run_route_jxlmm_packed(
+                        trait_one: list[str], emit_trait_header_model: bool
+                    ) -> None:
+                        run_jxlmm_packed_fullrank(
+                            genofile=genofile_stream,
+                            jxlmm_source=args.jxlmm,
                             pheno=pheno,
                             ids=ids,
                             outprefix=outprefix,
@@ -5706,6 +5828,7 @@ def _run_gwas_pipeline(
                         "lm_packed": _run_route_lm_packed,
                         "lmm_packed": _run_route_lmm_packed,
                         "fastlmm_packed": _run_route_fastlmm_packed,
+                        "jxlmm": _run_route_jxlmm_packed,
                         "algwas": _run_route_algwas_packed,
                         "lm_stream": _run_route_lm_stream,
                         "lmm_stream": _run_route_lmm_stream,
@@ -5738,6 +5861,8 @@ def _run_gwas_pipeline(
                                     if bool(use_packed_fastlmm_scan)
                                     else "fastlmm_stream"
                                 )
+                            elif mk == "jxlmm":
+                                route = "jxlmm"
                             elif mk == "algwas":
                                 route = "algwas"
                             elif mk == "farmcpu":
@@ -5922,6 +6047,7 @@ def _run_gwas_pipeline(
                     "lmm": bool(args.lmm),
                     "fastlmm": bool(args.fastlmm),
                     "lm": bool(args.lm),
+                    "jxlmm": bool(args.jxlmm),
                     "algwas": bool(args.algwas),
                     "farmcpu": bool(args.farmcpu),
                 },

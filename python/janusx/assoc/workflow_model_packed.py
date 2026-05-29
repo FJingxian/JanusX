@@ -3,10 +3,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import time
 import uuid
+import json
 from typing import Optional, Union
 
 import numpy as np
@@ -51,9 +53,18 @@ from .workflow import (
     detect_effective_threads,
     format_elapsed,
     jxrs,
+    prepare_cli_input_cache,
 )
 
 _WARNED_LM_STREAM_MMAP_LEGACY = False
+_JXLMM_EXACT_N_MAX = 15_000
+_JXLMM_SPARSE_NULL_CLIP_EIG_EXACT_N_MAX = 0
+_JXLMM_KING_THRESHOLD = 0.05
+_JXLMM_SPARSE_GRM_CUTOFF = 0.05
+_JXLMM_SPARSE_GRM_METHOD = 2
+_JXLMM_SPARSE_REML_GRID_SIZE = 17
+_JXLMM_SPARSE_REML_MAX_ITER = 20
+_JXLMM_SPGRM_SINGLE_BLOCK_N_MAX = 2048
 
 
 def _gwas_use_rust_unified_v1() -> bool:
@@ -66,6 +77,333 @@ def _gwas_use_rust_unified_v1() -> bool:
     raw = str(os.environ.get("JX_GWAS_USE_RUST_UNIFIED_V1", "")).strip().lower()
     enabled = raw not in {"0", "false", "no", "off"}
     return bool(enabled and hasattr(jxrs, "gwas_packed_unified_to_tsv"))
+
+
+def _jxlmm_sparse_meta_path(sparse_path: str) -> str:
+    return f"{sparse_path}.meta.json"
+
+
+def _jxlmm_normalize_jxgrm_path(path_or_prefix: str) -> str:
+    raw = str(path_or_prefix).strip()
+    if raw == "":
+        return raw
+    return raw if raw.lower().endswith(".jxgrm") else f"{raw}.jxgrm"
+
+
+def _jxlmm_sparse_sample_hash(sample_indices: Union[np.ndarray, None]) -> str:
+    if sample_indices is None:
+        return "all"
+    arr = np.ascontiguousarray(np.asarray(sample_indices, dtype=np.int64).reshape(-1), dtype=np.int64)
+    h = hashlib.blake2b(digest_size=12)
+    h.update(arr.tobytes(order="C"))
+    h.update(str(int(arr.shape[0])).encode("ascii"))
+    return h.hexdigest()
+
+
+def _jxlmm_sparse_out_prefix(prefix: str, sample_indices: Union[np.ndarray, None]) -> str:
+    if sample_indices is None:
+        return str(prefix)
+    arr = np.ascontiguousarray(np.asarray(sample_indices, dtype=np.int64).reshape(-1), dtype=np.int64)
+    return f"{prefix}.jxlmm.n{int(arr.shape[0])}.{_jxlmm_sparse_sample_hash(arr)}"
+
+
+def _jxlmm_sparse_layout_rebuild_reason(sparse_path: str) -> Optional[str]:
+    try:
+        file_size = int(os.path.getsize(sparse_path))
+        if file_size < 16:
+            return "file too short"
+        with open(sparse_path, "rb") as fh:
+            header = fh.read(16)
+        if len(header) != 16:
+            return "incomplete header"
+        n_samples = int.from_bytes(header[0:8], "little", signed=False)
+        nnz = int.from_bytes(header[8:16], "little", signed=False)
+        col_ptr_bytes = (n_samples + 1) * 8
+        row_bytes = nnz * 4
+        values_bytes = nnz * 8
+        values_offset_legacy = 16 + col_ptr_bytes + row_bytes
+        values_offset_padded = (values_offset_legacy + 7) & ~7
+        expected_legacy = values_offset_legacy + values_bytes
+        expected_padded = values_offset_padded + values_bytes
+        if file_size == expected_padded:
+            return None
+        if file_size == expected_legacy:
+            if values_offset_legacy % 8 != 0:
+                return "legacy unpadded values layout"
+            return None
+        return "header/layout mismatch"
+    except Exception as exc:
+        return f"layout probe failed: {exc}"
+
+
+def _jxlmm_format_stage_times(stage_times: dict[str, float]) -> str:
+    parts: list[str] = []
+    for stage, secs in stage_times.items():
+        secs_f = float(secs)
+        if np.isfinite(secs_f) and secs_f > 0.0:
+            parts.append(f"{stage}={format_elapsed(secs_f)}")
+    return ", ".join(parts)
+
+
+def _jxlmm_sparse_spec(
+    *,
+    cutoff: float,
+    abs_threshold: bool,
+    maf_threshold: float,
+    max_missing_rate: float,
+    het_threshold: float,
+    snps_only: bool,
+) -> dict[str, object]:
+    return {
+        "cutoff": float(cutoff),
+        "abs_threshold": bool(abs_threshold),
+        "maf_threshold": float(maf_threshold),
+        "max_missing_rate": float(max_missing_rate),
+        "het_threshold": float(het_threshold),
+        "snps_only": bool(snps_only),
+        "method": int(_JXLMM_SPARSE_GRM_METHOD),
+    }
+
+
+def _jxlmm_parse_sparse_cutoff(jxlmm_source: Optional[str]) -> tuple[float, Optional[str]]:
+    if jxlmm_source is None:
+        return float(_JXLMM_SPARSE_GRM_CUTOFF), None
+    raw = str(jxlmm_source).strip()
+    if raw in {"", "__SELF__"}:
+        return float(_JXLMM_SPARSE_GRM_CUTOFF), None
+    try:
+        cutoff = float(raw)
+    except Exception:
+        return float(_JXLMM_SPARSE_GRM_CUTOFF), raw
+    if (not np.isfinite(cutoff)) or cutoff < 0.0:
+        raise ValueError(f"JXLMM sparse cutoff must be a finite value >= 0, got {raw}")
+    return float(cutoff), None
+
+
+def _ensure_jxlmm_sparse_grm(
+    prefix: str,
+    *,
+    sample_indices: Union[np.ndarray, None] = None,
+    out_prefix: Optional[str] = None,
+    cutoff: float,
+    maf_threshold: float,
+    max_missing_rate: float,
+    het_threshold: float,
+    snps_only: bool,
+    threads: int,
+    logger: logging.Logger,
+    use_spinner: bool,
+) -> str:
+    threads_use = int(max(1, int(threads) if int(threads) > 0 else detect_effective_threads()))
+    sample_idx_arg = None
+    if sample_indices is not None:
+        sample_idx_arg = np.ascontiguousarray(np.asarray(sample_indices, dtype=np.int64).reshape(-1), dtype=np.int64)
+        if int(sample_idx_arg.shape[0]) == 0:
+            raise ValueError("JXLMM sparse GRM sample subset must not be empty.")
+    out_prefix_use = str(out_prefix) if out_prefix is not None else _jxlmm_sparse_out_prefix(str(prefix), sample_idx_arg)
+    sparse_path = _jxlmm_normalize_jxgrm_path(out_prefix_use)
+    meta_path = _jxlmm_sparse_meta_path(sparse_path)
+    spec = _jxlmm_sparse_spec(
+        cutoff=float(cutoff),
+        abs_threshold=False,
+        maf_threshold=float(maf_threshold),
+        max_missing_rate=float(max_missing_rate),
+        het_threshold=float(het_threshold),
+        snps_only=bool(snps_only),
+    )
+    spec["sample_hash"] = _jxlmm_sparse_sample_hash(sample_idx_arg)
+    spec["sample_n"] = int(sample_idx_arg.shape[0]) if sample_idx_arg is not None else None
+    if os.path.exists(sparse_path):
+        existing_spec = None
+        if os.path.exists(meta_path):
+            try:
+                with open(meta_path, "r", encoding="utf-8") as fh:
+                    existing_spec = json.load(fh)
+            except Exception:
+                existing_spec = None
+        layout_reason = _jxlmm_sparse_layout_rebuild_reason(sparse_path)
+        if existing_spec == spec and layout_reason is None:
+            _log_file_only(
+                logger,
+                logging.INFO,
+                f"JXLMM sparse GRM reused: {_display_path(sparse_path)}",
+            )
+            return sparse_path
+        if layout_reason is not None:
+            reason = layout_reason
+        else:
+            reason = "missing metadata" if existing_spec is None else "cutoff or filter settings changed"
+        _emit_warning_line(
+            logger,
+            f"Rebuilding sparse GRM for JXLMM: {_display_path(sparse_path)} ({reason})",
+            use_spinner=bool(use_spinner),
+        )
+        for path_rm in (sparse_path, meta_path):
+            try:
+                os.remove(path_rm)
+            except OSError:
+                pass
+    if not hasattr(jxrs, "spgrm_bed_to_jxgrm"):
+        raise RuntimeError(
+            "Rust extension missing spgrm_bed_to_jxgrm required to build sparse GRM for JXLMM. "
+            "Rebuild/install JanusX extension first."
+        )
+
+    pbar: Optional[_ProgressAdapter] = None
+    spin_handle = _start_indeterminate_progress_bar("Building sparse GRM for JXLMM") if bool(use_spinner) else None
+    last_done = 0
+    last_total = 1
+
+    def _progress_cb(done: int, total: int) -> None:
+        nonlocal pbar, spin_handle, last_done, last_total
+        d = max(0, int(done))
+        t = max(1, int(total))
+        if spin_handle is not None:
+            try:
+                _stop_indeterminate_progress_bar(spin_handle)
+            except Exception:
+                pass
+            spin_handle = None
+        if pbar is None:
+            pbar = _ProgressAdapter(
+                total=t,
+                desc="Building sparse GRM for JXLMM",
+                force_animate=True,
+            )
+            last_total = t
+        if t != last_total:
+            pbar.set_total(t)
+            last_total = t
+        d = min(d, t)
+        if d > last_done:
+            pbar.update(d - last_done)
+            last_done = d
+        try:
+            pbar.set_postfix(memory=f"{psutil.Process().memory_info().rss / 1024**3:.2f} GB")
+        except Exception:
+            pass
+
+    build_ok = False
+    build_result = None
+    build_t0 = time.monotonic()
+    try:
+        build_result = jxrs.spgrm_bed_to_jxgrm(
+            str(prefix),
+            out_prefix=str(out_prefix_use),
+            sample_indices=sample_idx_arg,
+            method=int(_JXLMM_SPARSE_GRM_METHOD),
+            threshold=float(cutoff),
+            abs_threshold=False,
+            maf_threshold=float(maf_threshold),
+            max_missing_rate=float(max_missing_rate),
+            het_threshold=float(het_threshold),
+            snps_only=bool(snps_only),
+            block_rows=0,
+            sample_block=0,
+            threads=int(threads_use),
+            progress_callback=_progress_cb,
+            progress_every=1,
+        )
+        build_ok = True
+    finally:
+        if spin_handle is not None:
+            try:
+                _stop_indeterminate_progress_bar(spin_handle)
+            except Exception:
+                pass
+            spin_handle = None
+        if pbar is not None:
+            try:
+                if build_ok and last_done < last_total:
+                    pbar.update(last_total - last_done)
+                if build_ok:
+                    pbar.finish()
+            finally:
+                pbar.close()
+    built_path = sparse_path
+    built_n_samples = None
+    built_nnz = None
+    if build_result is not None:
+        try:
+            if isinstance(build_result, (tuple, list)) and len(build_result) >= 1:
+                built_path_candidate = _jxlmm_normalize_jxgrm_path(str(build_result[0]))
+                if built_path_candidate:
+                    built_path = built_path_candidate
+            if isinstance(build_result, (tuple, list)) and len(build_result) >= 3:
+                built_n_samples = int(build_result[1])
+                built_nnz = int(build_result[2])
+        except Exception:
+            built_path = sparse_path
+            built_n_samples = None
+            built_nnz = None
+    sparse_path = built_path
+    meta_path = _jxlmm_sparse_meta_path(sparse_path)
+    if not os.path.exists(sparse_path):
+        wait_deadline = time.monotonic() + 2.0
+        while time.monotonic() < wait_deadline and not os.path.exists(sparse_path):
+            time.sleep(0.05)
+    if not os.path.exists(sparse_path):
+        raise RuntimeError(
+            "Sparse GRM build returned but output file is missing: "
+            f"expected {_display_path(sparse_path)} from out_prefix {_display_path(str(out_prefix_use))}"
+        )
+    with open(meta_path, "w", encoding="utf-8") as fh:
+        json.dump(spec, fh, ensure_ascii=True, sort_keys=True)
+    build_secs = max(time.monotonic() - build_t0, 0.0)
+    built_shape = []
+    if built_n_samples is not None:
+        built_shape.append(f"n={built_n_samples}")
+    elif sample_idx_arg is not None:
+        built_shape.append(f"n={int(sample_idx_arg.shape[0])}")
+    else:
+        built_shape.append("n=all")
+    if built_nnz is not None:
+        built_shape.append(f"nnz={built_nnz}")
+    _log_file_only(
+        logger,
+        logging.INFO,
+        (
+            f"JXLMM sparse GRM ready: {_display_path(sparse_path)} "
+            f"({', '.join(built_shape)}, "
+            f"method={'standardized' if int(_JXLMM_SPARSE_GRM_METHOD) == 2 else 'centered'}, "
+            f"BLAS=1, Rayon={int(threads_use)}, "
+            f"sample_block=auto, "
+            f"time={format_elapsed(build_secs)})"
+        ),
+    )
+    return sparse_path
+
+
+def _jxlmm_bed_logic_meta_selected(
+    prefix: str,
+    *,
+    sample_indices: np.ndarray,
+    maf_threshold: float,
+    max_missing_rate: float,
+    het_threshold: float,
+    snps_only: bool,
+) -> dict[str, object]:
+    if not hasattr(jxrs, "prepare_bed_logic_meta_selected"):
+        raise RuntimeError(
+            "Rust extension missing prepare_bed_logic_meta_selected required by JXLMM memmap path."
+        )
+    row_idx, miss, maf, row_flip, site_keep, n_samples_full, n_snps_total = jxrs.prepare_bed_logic_meta_selected(
+        str(prefix),
+        sample_indices=np.ascontiguousarray(np.asarray(sample_indices, dtype=np.int64), dtype=np.int64),
+        maf_threshold=float(maf_threshold),
+        max_missing_rate=float(max_missing_rate),
+        het_threshold=float(het_threshold),
+        snps_only=bool(snps_only),
+    )
+    return {
+        "row_indices": np.ascontiguousarray(np.asarray(row_idx, dtype=np.int64), dtype=np.int64),
+        "missing_rate": np.ascontiguousarray(np.asarray(miss, dtype=np.float32), dtype=np.float32),
+        "maf": np.ascontiguousarray(np.asarray(maf, dtype=np.float32), dtype=np.float32),
+        "row_flip": np.ascontiguousarray(np.asarray(row_flip, dtype=np.bool_), dtype=np.bool_),
+        "site_keep": np.ascontiguousarray(np.asarray(site_keep, dtype=np.bool_), dtype=np.bool_),
+        "n_samples_full": int(n_samples_full),
+        "n_snps_total": int(n_snps_total),
+    }
 
 
 def _lm_precompute_ixx_qr(x_design: np.ndarray) -> np.ndarray:
@@ -317,6 +655,1110 @@ def _packed_preload_ready_state(
         "full_ids": np.asarray(full_ids, dtype=str),
         "packed_ctx": packed_ctx,
         "sites_all": list(sites_all),
+    }
+
+
+def _jxlmm_null_components_valid(sigma_g2: float, sigma_e2: float) -> bool:
+    return bool(
+        np.isfinite(float(sigma_g2))
+        and np.isfinite(float(sigma_e2))
+        and float(sigma_g2) >= 0.0
+        and float(sigma_e2) >= 0.0
+        and (float(sigma_g2) > 0.0 or float(sigma_e2) > 0.0)
+    )
+
+
+def _jxlmm_ols_residualize(y_vec: np.ndarray, x_cov: Union[np.ndarray, None]) -> np.ndarray:
+    y = np.ascontiguousarray(np.asarray(y_vec, dtype=np.float64).reshape(-1), dtype=np.float64)
+    n = int(y.shape[0])
+    if n == 0:
+        return y
+    if x_cov is None:
+        x_design = np.ones((n, 1), dtype=np.float64)
+    else:
+        x = np.ascontiguousarray(np.asarray(x_cov, dtype=np.float64), dtype=np.float64)
+        if x.ndim != 2 or int(x.shape[0]) != n:
+            raise ValueError(
+                f"JXLMM covariate shape mismatch for residualization: got {x.shape}, expected ({n}, p)."
+            )
+        x_design = np.ascontiguousarray(
+            np.concatenate([np.ones((n, 1), dtype=np.float64), x], axis=1),
+            dtype=np.float64,
+        )
+    beta, *_rest = np.linalg.lstsq(x_design, y, rcond=None)
+    resid = y - x_design @ beta
+    return np.ascontiguousarray(resid, dtype=np.float64)
+
+
+def _jxlmm_pve_from_components(eigvals: np.ndarray, sigma_g2: float, sigma_e2: float) -> float:
+    vals = np.asarray(eigvals, dtype=np.float64).reshape(-1)
+    if vals.size == 0:
+        return float("nan")
+    mean_k = float(np.mean(np.maximum(vals, 0.0)))
+    var_g = float(sigma_g2) * max(mean_k, 0.0)
+    denom = var_g + float(sigma_e2)
+    if np.isfinite(denom) and denom > 0.0:
+        return float(var_g / denom)
+    return float("nan")
+
+
+def _jxlmm_component_ratio(sigma_g2: float, sigma_e2: float) -> float:
+    denom = float(sigma_g2) + float(sigma_e2)
+    if np.isfinite(denom) and denom > 0.0:
+        return float(float(sigma_g2) / denom)
+    return float("nan")
+
+
+def _jxlmm_load_sparse_grm_subset_dense(
+    jxgrm_path: str,
+    sample_idx: Union[np.ndarray, None] = None,
+    progress_callback=None,
+) -> np.ndarray:
+    file_size = int(os.path.getsize(jxgrm_path))
+    if file_size < 16:
+        raise RuntimeError(f"Sparse GRM CSC file is too short: {jxgrm_path}")
+    with open(jxgrm_path, "rb") as fh:
+        header = fh.read(16)
+    if len(header) != 16:
+        raise RuntimeError(f"Sparse GRM CSC header is incomplete: {jxgrm_path}")
+
+    n_samples = int.from_bytes(header[0:8], "little", signed=False)
+    nnz = int.from_bytes(header[8:16], "little", signed=False)
+    col_ptr_offset = 16
+    col_ptr_bytes = (n_samples + 1) * 8
+    row_idx_offset = col_ptr_offset + col_ptr_bytes
+    row_idx_bytes = nnz * 4
+    values_offset_legacy = row_idx_offset + row_idx_bytes
+    values_offset_padded = (values_offset_legacy + 7) & ~7
+    values_bytes = nnz * 8
+    expected_legacy = values_offset_legacy + values_bytes
+    expected_padded = values_offset_padded + values_bytes
+    if file_size == expected_padded:
+        values_offset = values_offset_padded
+    elif file_size == expected_legacy:
+        values_offset = values_offset_legacy
+    else:
+        raise RuntimeError(
+            f"Sparse GRM CSC file size mismatch for {jxgrm_path}: got {file_size}, "
+            f"expected {expected_legacy} (legacy) or {expected_padded} (padded)."
+        )
+
+    col_ptr = np.memmap(
+        jxgrm_path,
+        mode="r",
+        dtype="<u8",
+        offset=col_ptr_offset,
+        shape=(n_samples + 1,),
+        order="C",
+    )
+    row_idx = np.memmap(
+        jxgrm_path,
+        mode="r",
+        dtype="<u4",
+        offset=row_idx_offset,
+        shape=(nnz,),
+        order="C",
+    )
+    values = np.memmap(
+        jxgrm_path,
+        mode="r",
+        dtype="<f8",
+        offset=values_offset,
+        shape=(nnz,),
+        order="C",
+    )
+
+    if sample_idx is None:
+        sample_idx_arg = np.arange(n_samples, dtype=np.int64)
+    else:
+        sample_idx_arg = np.ascontiguousarray(
+            np.asarray(sample_idx, dtype=np.int64).reshape(-1),
+            dtype=np.int64,
+        )
+        if np.any(sample_idx_arg < 0) or np.any(sample_idx_arg >= n_samples):
+            raise ValueError(
+                f"JXLMM sparse GRM subset sample index out of bounds for {jxgrm_path}: "
+                f"n_samples={n_samples}"
+            )
+
+    n_sub = int(sample_idx_arg.shape[0])
+    dense = np.zeros((n_sub, n_sub), dtype=np.float64, order="C")
+    pos_map = np.full(n_samples, -1, dtype=np.int64)
+    pos_map[sample_idx_arg] = np.arange(n_sub, dtype=np.int64)
+
+    total = max(1, n_sub)
+    last_emit = -1
+    if progress_callback is not None:
+        progress_callback(0, total)
+    for j_sub, col_full in enumerate(sample_idx_arg.tolist()):
+        start = int(col_ptr[col_full])
+        end = int(col_ptr[col_full + 1])
+        if end > start:
+            rows = row_idx[start:end]
+            vals = values[start:end]
+            mapped = pos_map[rows]
+            keep = mapped >= 0
+            if np.any(keep):
+                tgt = np.asarray(mapped[keep], dtype=np.intp)
+                dat = np.asarray(vals[keep], dtype=np.float64)
+                dense[tgt, j_sub] = dat
+                dense[j_sub, tgt] = dat
+        done = j_sub + 1
+        if progress_callback is not None and (done == total or done >= last_emit + 32):
+            progress_callback(done, total)
+            last_emit = done
+    return np.ascontiguousarray(dense, dtype=np.float64)
+
+
+def _jxlmm_sparse_grm_diag_stats(
+    jxgrm_path: str,
+    sample_idx: Union[np.ndarray, None] = None,
+) -> dict[str, float]:
+    if not hasattr(jxrs, "jxlmm_sparse_grm_diag_stats"):
+        return {
+            "mean_diag": float("nan"),
+            "min_diag": float("nan"),
+            "max_diag": float("nan"),
+            "n_samples": float("nan"),
+            "nnz": float("nan"),
+        }
+    sample_idx_arg = None
+    if sample_idx is not None:
+        sample_idx_arg = np.ascontiguousarray(
+            np.asarray(sample_idx, dtype=np.int64).reshape(-1),
+            dtype=np.int64,
+        )
+    mean_diag, min_diag, max_diag, n_samples, nnz = jxrs.jxlmm_sparse_grm_diag_stats(
+        str(jxgrm_path),
+        sample_indices=sample_idx_arg,
+    )
+    return {
+        "mean_diag": float(mean_diag),
+        "min_diag": float(min_diag),
+        "max_diag": float(max_diag),
+        "n_samples": float(n_samples),
+        "nnz": float(nnz),
+    }
+
+
+def _jxlmm_sparse_lambda_boundary_flag(
+    log10_lambda: float,
+    low: float,
+    high: float,
+) -> Optional[str]:
+    x = float(log10_lambda)
+    low_f = float(low)
+    high_f = float(high)
+    if (not np.isfinite(x)) or (not np.isfinite(low_f)) or (not np.isfinite(high_f)) or low_f >= high_f:
+        return None
+    eps = max(1e-3, 0.01 * abs(high_f - low_f))
+    if x <= low_f + eps:
+        return "low"
+    if x >= high_f - eps:
+        return "high"
+    return None
+
+
+def _jxlmm_sparse_grid_local_summary(null_fit: dict, window: int = 2) -> Optional[str]:
+    try:
+        grid_log10 = np.asarray(null_fit.get("grid_log10", []), dtype=np.float64).reshape(-1)
+        grid_reml = np.asarray(null_fit.get("grid_reml", []), dtype=np.float64).reshape(-1)
+        best_log10 = float(null_fit.get("log10_lambda", float("nan")))
+    except Exception:
+        return None
+    if grid_log10.size == 0 or grid_log10.size != grid_reml.size or not np.isfinite(best_log10):
+        return None
+    best_idx = int(np.argmin(np.abs(grid_log10 - best_log10)))
+    if best_idx < 0 or best_idx >= int(grid_log10.size):
+        return None
+    lo = max(0, best_idx - max(1, int(window)))
+    hi = min(int(grid_log10.size), best_idx + max(1, int(window)) + 1)
+    parts: list[str] = []
+    for idx in range(lo, hi):
+        x = float(grid_log10[idx])
+        y = float(grid_reml[idx])
+        star = "*" if idx == best_idx else ""
+        if np.isfinite(x) and np.isfinite(y):
+            parts.append(f"{x:.2f}:{y:.6g}{star}")
+        elif np.isfinite(x):
+            parts.append(f"{x:.2f}:nan{star}")
+        else:
+            parts.append(f"nan:{y:.6g}{star}" if np.isfinite(y) else f"nan:nan{star}")
+    if not parts:
+        return None
+    return "[" + ", ".join(parts) + "]"
+
+
+def _plink_fam_sample_ids(prefix: str) -> np.ndarray:
+    fam_path = f"{prefix}.fam"
+    fam = pd.read_csv(
+        fam_path,
+        sep=r"\s+",
+        header=None,
+        engine="python",
+        usecols=[1],
+        dtype=str,
+    )
+    return np.asarray(fam.iloc[:, 0].astype(str), dtype=str)
+
+
+def _jxlmm_exact_null_fit_from_grm(
+    *,
+    grm: np.ndarray,
+    y_vec: np.ndarray,
+    x_cov: Union[np.ndarray, None],
+    threads: int,
+    stage_label: str,
+    progress_callback=None,
+    grm_secs: float = 0.0,
+    strategy: str = "fastlmm_exact_spectral",
+    pve_mode: str = "spectral",
+    keep_buffers: bool = True,
+    extra_fields: Union[dict[str, object], None] = None,
+) -> dict[str, object]:
+    if not hasattr(jxrs, "lmm_reml_null_f32"):
+        raise RuntimeError("Rust extension missing lmm_reml_null_f32 required by JXLMM exact null fit.")
+
+    y_arg = np.ascontiguousarray(np.asarray(y_vec, dtype=np.float64).reshape(-1), dtype=np.float64)
+    grm_arr = np.ascontiguousarray(np.asarray(grm, dtype=np.float64), dtype=np.float64)
+    n = int(y_arg.shape[0])
+    if grm_arr.shape != (n, n):
+        raise ValueError(f"JXLMM exact null GRM shape mismatch: got {grm_arr.shape}, expected ({n}, {n}).")
+    grm_local = np.array(grm_arr, dtype=np.float64, copy=True, order="C")
+    np.fill_diagonal(grm_local, np.diag(grm_local) + 1e-6)
+
+    progress_total = 1000
+    if progress_callback is not None:
+        progress_callback(0, progress_total)
+
+    evd_t0 = time.monotonic()
+    eigvals, eigvecs, evd_backend, evd_secs = _gwas_eigh_from_grm(
+        grm_local,
+        threads=max(1, int(threads)),
+        logger=None,
+        stage_label=stage_label,
+        require_rust=True,
+    )
+    evd_secs = max(float(evd_secs), max(time.monotonic() - evd_t0, 0.0))
+    if progress_callback is not None:
+        progress_callback(820, progress_total)
+    ord_desc = np.argsort(np.asarray(eigvals, dtype=np.float64))[::-1]
+    eigvals = np.ascontiguousarray(np.asarray(eigvals, dtype=np.float64).reshape(-1)[ord_desc], dtype=np.float64)
+    eigvecs = np.ascontiguousarray(np.asarray(eigvecs, dtype=np.float64)[:, ord_desc], dtype=np.float64)
+    if eigvecs.shape != (n, n):
+        raise ValueError(f"JXLMM exact null eigenvector shape mismatch: got {eigvecs.shape}, expected ({n}, {n}).")
+
+    x_design = _jxlmm_design_with_intercept(x_cov, n)
+    s_null = np.ascontiguousarray(np.maximum(np.asarray(eigvals, dtype=np.float64), 0.0), dtype=np.float64)
+    with _gwas_evd_stage_ctx(max(1, int(threads))):
+        utx = np.ascontiguousarray(eigvecs.T @ x_design, dtype=np.float64)
+        uty = np.ascontiguousarray((eigvecs.T @ y_arg).reshape(-1), dtype=np.float64)
+    if progress_callback is not None:
+        progress_callback(900, progress_total)
+    lbd, ml, reml = jxrs.lmm_reml_null_f32(
+        s_null,
+        utx,
+        uty,
+        -5.0,
+        5.0,
+        50,
+        1e-3,
+    )
+    sigma_g2, sigma_e2 = _jxlmm_exact_profile_vc(
+        eigvals=s_null,
+        utx=utx,
+        uty=uty,
+        lbd=float(lbd),
+    )
+    if progress_callback is not None:
+        progress_callback(progress_total, progress_total)
+
+    if str(pve_mode).strip().lower() == "components":
+        pve = _jxlmm_component_ratio(sigma_g2, sigma_e2)
+    else:
+        pve = _jxlmm_pve_from_components(eigvals, sigma_g2, sigma_e2)
+
+    out: dict[str, object] = {
+        "strategy": str(strategy),
+        "sigma_g2": sigma_g2,
+        "sigma_e2": sigma_e2,
+        "pve": pve,
+        "lambda": float(lbd),
+        "ml": float(ml),
+        "reml": float(reml),
+        "converged": True,
+        "used_iter": 0,
+        "grm_secs": float(max(grm_secs, 0.0)),
+        "evd_secs": float(evd_secs),
+        "backend": str(evd_backend),
+    }
+    if keep_buffers:
+        out["eigvals"] = eigvals
+        out["eigvecs"] = eigvecs
+        out["grm"] = grm_local
+    if extra_fields:
+        out.update(extra_fields)
+    return out
+
+
+def _jxlmm_null_progress_stage(route_desc: str, done: int, total: int) -> str:
+    route = str(route_desc).strip() or "null fit"
+    total_use = int(max(1, total))
+    frac = float(max(0, min(int(done), total_use))) / float(total_use)
+    route_l = route.lower()
+    if "sparse" in route_l:
+        if frac < 0.12:
+            stage = "analyze sparse CSC"
+        elif frac < 0.55:
+            stage = "grid lambda search"
+        else:
+            stage = "Brent REML refine"
+    else:
+        if frac < 0.60:
+            stage = "build dense GRM"
+        elif frac < 0.82:
+            stage = "eigendecompose GRM"
+        elif frac < 0.90:
+            stage = "rotate X/y"
+        else:
+            stage = "Brent variance fit"
+    return stage
+
+
+def _jxlmm_null_progress_desc(route_desc: str, done: int, total: int) -> str:
+    route = str(route_desc).strip() or "null fit"
+    stage = _jxlmm_null_progress_stage(route_desc, done, total)
+    return f"JXLMM null: {route} / {stage}"
+
+
+def _write_jxlmm_assoc_tsv(
+    *,
+    out_tsv: str,
+    sites_all: list[tuple[str, int, str, str]],
+    maf: np.ndarray,
+    miss: np.ndarray,
+    results: np.ndarray,
+    genetic_model: str,
+    chunk_rows: int = 131072,
+) -> int:
+    if not hasattr(jxrs, "GwasAssocTsvWriter") or not hasattr(jxrs, "SiteInfo"):
+        raise RuntimeError(
+            "Rust extension missing GwasAssocTsvWriter/SiteInfo required by JXLMM TSV writer."
+        )
+    n_rows = int(len(sites_all))
+    maf_arr = np.ascontiguousarray(np.asarray(maf, dtype=np.float32).reshape(-1), dtype=np.float32)
+    miss_arr = np.ascontiguousarray(np.asarray(miss, dtype=np.float32).reshape(-1), dtype=np.float32)
+    res_arr = np.ascontiguousarray(np.asarray(results, dtype=np.float64), dtype=np.float64)
+    if maf_arr.shape[0] != n_rows or miss_arr.shape[0] != n_rows:
+        raise ValueError(
+            f"JXLMM TSV writer metadata mismatch: sites={n_rows}, maf={maf_arr.shape[0]}, miss={miss_arr.shape[0]}"
+        )
+    if res_arr.shape != (n_rows, 3):
+        raise ValueError(
+            f"JXLMM TSV writer result shape mismatch: got {res_arr.shape}, expected ({n_rows}, 3)."
+        )
+    gm = str(genetic_model).strip().lower()
+
+    def _alleles(a0: str, a1: str) -> tuple[str, str]:
+        if gm == "dom":
+            return f"{a0}{a0}", f"{a0}{a1}/{a1}{a1}"
+        if gm == "rec":
+            return f"{a0}{a1}/{a0}{a0}", f"{a1}{a1}"
+        if gm == "het":
+            return f"{a0}{a0}/{a1}{a1}", f"{a0}{a1}"
+        return str(a0), str(a1)
+
+    step = int(max(1, chunk_rows))
+    written = 0
+    with open(out_tsv, "w", encoding="utf-8", newline="") as fh:
+        fh.write("chrom\tpos\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\n")
+        for start in range(0, n_rows, step):
+            end = min(start + step, n_rows)
+            chunk_text: list[str] = []
+            for off, (chrom, pos, allele0, allele1) in enumerate(sites_all[start:end]):
+                idx = start + off
+                beta = float(res_arr[idx, 0])
+                se = float(res_arr[idx, 1])
+                pwald = float(res_arr[idx, 2])
+                chisq = float("nan")
+                if np.isfinite(beta) and np.isfinite(se) and se > 0.0:
+                    chisq = float((beta / se) ** 2)
+                a0_txt, a1_txt = _alleles(str(allele0), str(allele1))
+                chunk_text.append(
+                    f"{chrom}\t{int(pos)}\t{a0_txt}\t{a1_txt}\t"
+                    f"{float(maf_arr[idx]):.4f}\t{float(miss_arr[idx]):.4f}\t"
+                    f"{beta:.4f}\t{se:.4f}\t{chisq:.6g}\t{pwald:.4e}\n"
+                )
+            fh.write("".join(chunk_text))
+            written += end - start
+    return int(written)
+
+
+def _jxlmm_fastlmm_profile_vc(
+    *,
+    s_null: np.ndarray,
+    u1tx: np.ndarray,
+    u2tx: np.ndarray,
+    u1ty: np.ndarray,
+    u2ty: np.ndarray,
+    lbd: float,
+) -> tuple[float, float]:
+    lbd_f = float(lbd)
+    if not np.isfinite(lbd_f) or lbd_f <= 0.0:
+        return float("nan"), float("nan")
+    s = np.ascontiguousarray(np.asarray(s_null, dtype=np.float64).reshape(-1), dtype=np.float64)
+    x1 = np.ascontiguousarray(np.asarray(u1tx, dtype=np.float64), dtype=np.float64)
+    x2 = np.ascontiguousarray(np.asarray(u2tx, dtype=np.float64), dtype=np.float64)
+    y1 = np.ascontiguousarray(np.asarray(u1ty, dtype=np.float64).reshape(-1), dtype=np.float64)
+    y2 = np.ascontiguousarray(np.asarray(u2ty, dtype=np.float64).reshape(-1), dtype=np.float64)
+    if x1.ndim != 2 or x2.ndim != 2:
+        raise ValueError("JXLMM FastLMM profile VC expects 2D u1tx/u2tx.")
+    k = int(s.shape[0])
+    if x1.shape[0] != k or y1.shape[0] != k:
+        raise ValueError(
+            f"JXLMM FastLMM profile VC spectral shape mismatch: len(s)={k}, u1tx={x1.shape}, u1ty={y1.shape}"
+        )
+    n2, p = int(x2.shape[0]), int(x2.shape[1])
+    if int(x1.shape[1]) != p or y2.shape[0] != n2:
+        raise ValueError(
+            f"JXLMM FastLMM profile VC residual shape mismatch: u1tx={x1.shape}, u2tx={x2.shape}, u2ty={y2.shape}"
+        )
+    n_minus_p = n2 - p
+    if n_minus_p <= 0:
+        return float("nan"), float("nan")
+
+    v1_inv = 1.0 / np.maximum(s + lbd_f, 1e-30)
+    xtv_inv_x = (x1.T * v1_inv) @ x1 + (x2.T @ x2) / lbd_f
+    xtv_inv_y = (x1.T * v1_inv) @ y1 + (x2.T @ y2) / lbd_f
+    try:
+        beta = np.linalg.solve(xtv_inv_x, xtv_inv_y)
+    except np.linalg.LinAlgError:
+        beta = np.linalg.lstsq(xtv_inv_x, xtv_inv_y, rcond=None)[0]
+
+    r1 = y1 - x1 @ beta
+    r2 = y2 - x2 @ beta
+    rtv_invr = float(np.dot(v1_inv, np.square(r1)) + np.dot(r2, r2) / lbd_f)
+    if not np.isfinite(rtv_invr) or rtv_invr <= 0.0:
+        return float("nan"), float("nan")
+    sigma_g2 = float(rtv_invr / float(n_minus_p))
+    sigma_e2 = float(lbd_f * sigma_g2)
+    return sigma_g2, sigma_e2
+
+
+def _jxlmm_exact_profile_vc(
+    *,
+    eigvals: np.ndarray,
+    utx: np.ndarray,
+    uty: np.ndarray,
+    lbd: float,
+) -> tuple[float, float]:
+    lbd_f = float(lbd)
+    if not np.isfinite(lbd_f) or lbd_f <= 0.0:
+        return float("nan"), float("nan")
+    s = np.ascontiguousarray(np.maximum(np.asarray(eigvals, dtype=np.float64).reshape(-1), 0.0), dtype=np.float64)
+    x = np.ascontiguousarray(np.asarray(utx, dtype=np.float64), dtype=np.float64)
+    y = np.ascontiguousarray(np.asarray(uty, dtype=np.float64).reshape(-1), dtype=np.float64)
+    if x.ndim != 2:
+        raise ValueError("JXLMM exact profile VC expects 2D utx.")
+    n, p = int(x.shape[0]), int(x.shape[1])
+    if int(s.shape[0]) != n or int(y.shape[0]) != n:
+        raise ValueError(
+            f"JXLMM exact profile VC spectral shape mismatch: len(s)={s.shape[0]}, utx={x.shape}, uty={y.shape}"
+        )
+    n_minus_p = n - p
+    if n_minus_p <= 0:
+        return float("nan"), float("nan")
+
+    v_inv = 1.0 / np.maximum(s + lbd_f, 1e-30)
+    xtv_inv_x = (x.T * v_inv) @ x
+    xtv_inv_y = (x.T * v_inv) @ y
+    beta = _jxlmm_solve_linear(xtv_inv_x, xtv_inv_y)
+    resid = y - (x @ beta)
+    rtv_invr = float(np.dot(v_inv, np.square(resid)))
+    if not np.isfinite(rtv_invr) or rtv_invr <= 0.0:
+        return float("nan"), float("nan")
+    sigma_g2 = float(rtv_invr / float(n_minus_p))
+    sigma_e2 = float(lbd_f * sigma_g2)
+    return sigma_g2, sigma_e2
+
+
+def _jxlmm_design_with_intercept(
+    x_cov: Union[np.ndarray, None],
+    n: int,
+) -> np.ndarray:
+    if x_cov is None:
+        return np.ones((n, 1), dtype=np.float64)
+    x = np.ascontiguousarray(np.asarray(x_cov, dtype=np.float64), dtype=np.float64)
+    if x.ndim != 2 or int(x.shape[0]) != n:
+        raise ValueError(f"JXLMM covariate shape mismatch: got {x.shape}, expected ({n}, p).")
+    return np.ascontiguousarray(
+        np.concatenate([np.ones((n, 1), dtype=np.float64), x], axis=1),
+        dtype=np.float64,
+    )
+
+
+def _jxlmm_solve_linear(lhs: np.ndarray, rhs: np.ndarray, *, ridge: float = 1e-10) -> np.ndarray:
+    a = np.ascontiguousarray(np.asarray(lhs, dtype=np.float64), dtype=np.float64)
+    b = np.ascontiguousarray(np.asarray(rhs, dtype=np.float64), dtype=np.float64)
+    try:
+        return np.ascontiguousarray(np.linalg.solve(a, b), dtype=np.float64)
+    except np.linalg.LinAlgError:
+        a_reg = np.array(a, dtype=np.float64, copy=True, order="C")
+        if a_reg.ndim != 2 or int(a_reg.shape[0]) != int(a_reg.shape[1]):
+            return np.ascontiguousarray(np.linalg.lstsq(a_reg, b, rcond=None)[0], dtype=np.float64)
+        diag_idx = np.diag_indices_from(a_reg)
+        a_reg[diag_idx] = a_reg[diag_idx] + float(max(ridge, 0.0))
+        try:
+            return np.ascontiguousarray(np.linalg.solve(a_reg, b), dtype=np.float64)
+        except np.linalg.LinAlgError:
+            return np.ascontiguousarray(np.linalg.lstsq(a_reg, b, rcond=None)[0], dtype=np.float64)
+
+
+def _jxlmm_exact_setup(
+    *,
+    null_fit: dict[str, object],
+    y_vec: np.ndarray,
+    x_cov: Union[np.ndarray, None],
+    scan_packed: np.ndarray,
+    scan_packed_n: int,
+    scan_row_idx: np.ndarray,
+    scan_maf: np.ndarray,
+    scan_row_flip: np.ndarray,
+    scan_sample_idx: np.ndarray,
+    rhat_markers: int = 30,
+    rhat_seed: int = 20260527,
+    progress_callback=None,
+) -> tuple[np.ndarray, float, int]:
+    y = np.ascontiguousarray(np.asarray(y_vec, dtype=np.float64).reshape(-1), dtype=np.float64)
+    n = int(y.shape[0])
+    if n == 0:
+        raise ValueError("JXLMM exact setup requires non-empty y.")
+    x_design = _jxlmm_design_with_intercept(x_cov, n)
+    eigvals = np.ascontiguousarray(np.asarray(null_fit["eigvals"], dtype=np.float64).reshape(-1), dtype=np.float64)
+    eigvecs = np.ascontiguousarray(np.asarray(null_fit["eigvecs"], dtype=np.float64), dtype=np.float64)
+    if eigvecs.shape != (n, n):
+        raise ValueError(f"JXLMM exact setup eigenvector shape mismatch: got {eigvecs.shape}, expected ({n}, {n}).")
+    if int(eigvals.shape[0]) != n:
+        raise ValueError(f"JXLMM exact setup eigenvalue length mismatch: got {eigvals.shape[0]}, expected {n}.")
+
+    sigma_g2 = float(null_fit["sigma_g2"])
+    sigma_e2 = float(null_fit["sigma_e2"])
+    v_diag = np.ascontiguousarray(
+        np.maximum((sigma_g2 * eigvals) + sigma_e2, 1e-12),
+        dtype=np.float64,
+    )
+
+    if progress_callback is not None:
+        progress_callback(0, 0, 1)
+    utx = np.ascontiguousarray(eigvecs.T @ x_design, dtype=np.float64)
+    uty = np.ascontiguousarray((eigvecs.T @ y).reshape(-1), dtype=np.float64)
+    vinv_x = np.ascontiguousarray(eigvecs @ (utx / v_diag[:, None]), dtype=np.float64)
+    vinv_y = np.ascontiguousarray(eigvecs @ (uty / v_diag), dtype=np.float64)
+    xt_vinv_x = np.ascontiguousarray(x_design.T @ vinv_x, dtype=np.float64)
+    xt_vinv_y = np.ascontiguousarray((x_design.T @ vinv_y).reshape(-1), dtype=np.float64)
+    beta_hat = _jxlmm_solve_linear(xt_vinv_x, xt_vinv_y)
+    py_vec = np.ascontiguousarray(vinv_y - (vinv_x @ beta_hat), dtype=np.float64)
+    if progress_callback is not None:
+        progress_callback(0, 1, 1)
+
+    if progress_callback is not None:
+        progress_callback(1, 0, max(1, int(rhat_markers)))
+    xtx = np.ascontiguousarray(x_design.T @ x_design, dtype=np.float64)
+    n_markers_total = int(scan_row_idx.shape[0])
+    n_markers_use = int(max(1, min(int(rhat_markers), n_markers_total)))
+    if n_markers_use >= n_markers_total:
+        chosen = np.arange(n_markers_total, dtype=np.int64)
+    else:
+        rng = np.random.default_rng(int(rhat_seed))
+        chosen = np.sort(rng.choice(n_markers_total, size=n_markers_use, replace=False).astype(np.int64, copy=False))
+    packed_subset = np.ascontiguousarray(
+        np.asarray(scan_packed[np.asarray(scan_row_idx[chosen], dtype=np.int64), :], dtype=np.uint8),
+        dtype=np.uint8,
+    )
+    chosen_maf = np.ascontiguousarray(np.asarray(scan_maf[chosen], dtype=np.float32).reshape(-1), dtype=np.float32)
+    chosen_flip = np.ascontiguousarray(np.asarray(scan_row_flip[chosen], dtype=np.bool_).reshape(-1), dtype=np.bool_)
+    chosen_local = np.ascontiguousarray(np.arange(n_markers_use, dtype=np.int64), dtype=np.int64)
+    sampled = np.ascontiguousarray(
+        np.asarray(
+            jxrs.bed_packed_decode_rows_f32(
+                packed_subset,
+                int(scan_packed_n),
+                chosen_local,
+                chosen_flip,
+                chosen_maf,
+                sample_indices=np.ascontiguousarray(np.asarray(scan_sample_idx, dtype=np.int64).reshape(-1), dtype=np.int64),
+            ),
+            dtype=np.float64,
+        ),
+        dtype=np.float64,
+    )
+    if sampled.shape != (n_markers_use, n):
+        raise ValueError(
+            f"JXLMM exact setup sampled marker shape mismatch: got {sampled.shape}, expected ({n_markers_use}, {n})."
+        )
+    s_mat = np.ascontiguousarray(sampled.T, dtype=np.float64)
+    xts = np.ascontiguousarray(x_design.T @ s_mat, dtype=np.float64)
+    alpha_m = _jxlmm_solve_linear(xtx, xts)
+    s_m_s = np.sum(np.square(s_mat), axis=0) - np.sum(xts * alpha_m, axis=0)
+    ut_s = np.ascontiguousarray(eigvecs.T @ s_mat, dtype=np.float64)
+    v_inv_s = np.ascontiguousarray(eigvecs @ (ut_s / v_diag[:, None]), dtype=np.float64)
+    xt_vinv_s = np.ascontiguousarray(x_design.T @ v_inv_s, dtype=np.float64)
+    alpha_p = _jxlmm_solve_linear(xt_vinv_x, xt_vinv_s)
+    s_p_s = np.sum(s_mat * v_inv_s, axis=0) - np.sum(xt_vinv_s * alpha_p, axis=0)
+    valid = np.isfinite(s_m_s) & np.isfinite(s_p_s) & (s_m_s > 1e-12) & (s_p_s >= 0.0)
+    if not np.any(valid):
+        raise RuntimeError("JXLMM exact r_hat estimation failed: no valid sampled markers.")
+    r_hat = float(np.mean(np.asarray(s_p_s[valid] / s_m_s[valid], dtype=np.float64)))
+    if progress_callback is not None:
+        progress_callback(1, n_markers_use, max(1, n_markers_use))
+    if not np.isfinite(r_hat) or r_hat <= 0.0:
+        raise RuntimeError(f"JXLMM exact r_hat is invalid: r_hat={r_hat}")
+    return py_vec, r_hat, n_markers_use
+
+
+def _jxlmm_exact_null_fit(
+    *,
+    packed: np.ndarray,
+    packed_n: int,
+    row_indices: Union[np.ndarray, None],
+    row_flip: np.ndarray,
+    maf: np.ndarray,
+    sample_idx: np.ndarray,
+    y_vec: np.ndarray,
+    x_cov: Union[np.ndarray, None],
+    block_rows: int,
+    threads: int,
+    stage_label: str,
+    progress_callback=None,
+) -> dict[str, object]:
+    if not hasattr(jxrs, "grm_packed_f64_with_stats"):
+        raise RuntimeError("Rust extension missing grm_packed_f64_with_stats required by JXLMM exact null fit.")
+
+    sample_idx_arg = np.ascontiguousarray(np.asarray(sample_idx, dtype=np.int64).reshape(-1), dtype=np.int64)
+    y_arg = np.ascontiguousarray(np.asarray(y_vec, dtype=np.float64).reshape(-1), dtype=np.float64)
+    if int(sample_idx_arg.shape[0]) != int(y_arg.shape[0]):
+        raise ValueError(
+            f"JXLMM exact null fit sample/y mismatch: sample_idx={sample_idx_arg.shape[0]} y={y_arg.shape[0]}"
+        )
+    packed_arr = np.ascontiguousarray(np.asarray(packed, dtype=np.uint8), dtype=np.uint8)
+    row_flip_arr = np.ascontiguousarray(np.asarray(row_flip, dtype=np.bool_).reshape(-1), dtype=np.bool_)
+    maf_arr = np.ascontiguousarray(np.asarray(maf, dtype=np.float32).reshape(-1), dtype=np.float32)
+    if int(packed_arr.shape[0]) != int(row_flip_arr.shape[0]) or int(packed_arr.shape[0]) != int(maf_arr.shape[0]):
+        if row_indices is None:
+            raise ValueError(
+                f"JXLMM exact null fit packed/meta mismatch without row_indices: packed_rows={packed_arr.shape[0]}, "
+                f"row_flip={row_flip_arr.shape[0]}, maf={maf_arr.shape[0]}"
+            )
+        row_idx_arr = np.ascontiguousarray(np.asarray(row_indices, dtype=np.int64).reshape(-1), dtype=np.int64)
+        if int(row_idx_arr.shape[0]) != int(row_flip_arr.shape[0]) or int(row_idx_arr.shape[0]) != int(maf_arr.shape[0]):
+            raise ValueError(
+                f"JXLMM exact null fit row_indices/meta mismatch: row_indices={row_idx_arr.shape[0]}, "
+                f"row_flip={row_flip_arr.shape[0]}, maf={maf_arr.shape[0]}"
+            )
+        packed_arr = np.ascontiguousarray(packed_arr[row_idx_arr, :], dtype=np.uint8)
+
+    grm_t0 = time.monotonic()
+    progress_total = 1000
+    if progress_callback is not None:
+        progress_callback(0, progress_total)
+
+    def _grm_progress(done: int, total: int) -> None:
+        if progress_callback is None:
+            return
+        try:
+            d = int(done)
+            t = int(total)
+        except Exception:
+            return
+        if t <= 0:
+            return
+        mapped = int((max(0, min(d, t)) * 600) / max(1, t))
+        progress_callback(mapped, progress_total)
+
+    grm_raw, _row_sum, _var_sum = jxrs.grm_packed_f64_with_stats(
+        packed_arr,
+        int(packed_n),
+        row_flip_arr,
+        maf_arr,
+        sample_idx_arg,
+        1,
+        max(1, int(block_rows)),
+        int(threads),
+        _grm_progress if progress_callback is not None else None,
+        int(max(1, min(int(packed_arr.shape[0]), int(block_rows)))),
+    )
+    grm_secs = max(time.monotonic() - grm_t0, 0.0)
+    grm = np.ascontiguousarray(np.asarray(grm_raw, dtype=np.float64), dtype=np.float64)
+    n = int(y_arg.shape[0])
+    if grm.shape != (n, n):
+        raise ValueError(f"JXLMM exact null GRM shape mismatch: got {grm.shape}, expected ({n}, {n}).")
+    if progress_callback is not None:
+        progress_callback(600, progress_total)
+    return _jxlmm_exact_null_fit_from_grm(
+        grm=grm,
+        y_vec=y_arg,
+        x_cov=x_cov,
+        threads=int(threads),
+        stage_label=stage_label,
+        progress_callback=progress_callback,
+        grm_secs=float(grm_secs),
+        strategy="fastlmm_exact_spectral",
+        pve_mode="spectral",
+        keep_buffers=True,
+    )
+
+
+def _jxlmm_exact_null_fit_memmap(
+    *,
+    prefix: str,
+    sample_idx: np.ndarray,
+    y_vec: np.ndarray,
+    x_cov: Union[np.ndarray, None],
+    block_rows: int,
+    threads: int,
+    stage_label: str,
+    maf_threshold: float,
+    max_missing_rate: float,
+    het_threshold: float,
+    snps_only: bool,
+    progress_callback=None,
+    precomputed_meta: Union[dict[str, object], None] = None,
+) -> dict[str, object]:
+    if not hasattr(jxrs, "grm_bed_f64_from_meta"):
+        raise RuntimeError("Rust extension missing grm_bed_f64_from_meta required by JXLMM memmap exact null fit.")
+
+    sample_idx_arg = np.ascontiguousarray(np.asarray(sample_idx, dtype=np.int64).reshape(-1), dtype=np.int64)
+    y_arg = np.ascontiguousarray(np.asarray(y_vec, dtype=np.float64).reshape(-1), dtype=np.float64)
+    if int(sample_idx_arg.shape[0]) != int(y_arg.shape[0]):
+        raise ValueError(
+            f"JXLMM memmap exact null fit sample/y mismatch: sample_idx={sample_idx_arg.shape[0]} y={y_arg.shape[0]}"
+        )
+    meta = precomputed_meta
+    if meta is None:
+        meta = _jxlmm_bed_logic_meta_selected(
+            str(prefix),
+            sample_indices=sample_idx_arg,
+            maf_threshold=float(maf_threshold),
+            max_missing_rate=float(max_missing_rate),
+            het_threshold=float(het_threshold),
+            snps_only=bool(snps_only),
+        )
+    row_idx_arg = np.ascontiguousarray(np.asarray(meta["row_indices"], dtype=np.int64).reshape(-1), dtype=np.int64)
+    maf_arg = np.ascontiguousarray(np.asarray(meta["maf"], dtype=np.float32).reshape(-1), dtype=np.float32)
+    miss_arg = np.ascontiguousarray(np.asarray(meta["missing_rate"], dtype=np.float32).reshape(-1), dtype=np.float32)
+    row_flip_arg = np.ascontiguousarray(np.asarray(meta["row_flip"], dtype=np.bool_).reshape(-1), dtype=np.bool_)
+    site_keep_arg = np.ascontiguousarray(np.asarray(meta["site_keep"], dtype=np.bool_).reshape(-1), dtype=np.bool_)
+    if int(row_idx_arg.shape[0]) == 0:
+        raise RuntimeError("No variant sites passed filters for JXLMM memmap exact null fit.")
+    if int(row_idx_arg.shape[0]) != int(maf_arg.shape[0]) or int(row_idx_arg.shape[0]) != int(row_flip_arg.shape[0]):
+        raise ValueError(
+            "JXLMM memmap exact null fit meta mismatch: row_indices / maf / row_flip lengths differ."
+        )
+
+    grm_t0 = time.monotonic()
+    progress_total = 1000
+    if progress_callback is not None:
+        progress_callback(0, progress_total)
+
+    def _grm_progress(done: int, total: int) -> None:
+        if progress_callback is None:
+            return
+        try:
+            d = int(done)
+            t = int(total)
+        except Exception:
+            return
+        if t <= 0:
+            return
+        mapped = int((max(0, min(d, t)) * 600) / max(1, t))
+        progress_callback(mapped, progress_total)
+
+    grm_raw = jxrs.grm_bed_f64_from_meta(
+        str(prefix),
+        row_idx_arg,
+        row_flip_arg,
+        maf_arg,
+        sample_indices=sample_idx_arg,
+        method=1,
+        block_cols=max(1, int(block_rows)),
+        threads=int(threads),
+        progress_callback=_grm_progress if progress_callback is not None else None,
+        progress_every=int(max(1, min(int(row_idx_arg.shape[0]), int(block_rows)))),
+    )
+    grm_secs = max(time.monotonic() - grm_t0, 0.0)
+    grm = np.ascontiguousarray(np.asarray(grm_raw, dtype=np.float64), dtype=np.float64)
+    n = int(y_arg.shape[0])
+    if grm.shape != (n, n):
+        raise ValueError(f"JXLMM memmap exact null GRM shape mismatch: got {grm.shape}, expected ({n}, {n}).")
+    if progress_callback is not None:
+        progress_callback(600, progress_total)
+    return _jxlmm_exact_null_fit_from_grm(
+        grm=grm,
+        y_vec=y_arg,
+        x_cov=x_cov,
+        threads=int(threads),
+        stage_label=stage_label,
+        progress_callback=progress_callback,
+        grm_secs=float(grm_secs),
+        strategy="fastlmm_exact_spectral",
+        pve_mode="spectral",
+        keep_buffers=True,
+        extra_fields={
+            "scan_row_idx": row_idx_arg,
+            "scan_maf": maf_arg,
+            "scan_miss": miss_arg,
+            "scan_row_flip": row_flip_arg,
+            "scan_site_keep": site_keep_arg,
+            "n_samples_full": int(meta["n_samples_full"]),
+            "n_snps_total": int(meta["n_snps_total"]),
+        },
+    )
+
+
+def _jxlmm_sparse_null_fit(
+    *,
+    jxgrm_path: str,
+    sample_idx: Union[np.ndarray, None],
+    y_vec: np.ndarray,
+    x_cov: Union[np.ndarray, None],
+    progress_callback=None,
+) -> dict[str, object]:
+    y_arg = np.ascontiguousarray(np.asarray(y_vec, dtype=np.float64).reshape(-1), dtype=np.float64)
+    sample_idx_arg = None
+    if sample_idx is not None:
+        sample_idx_arg = np.ascontiguousarray(np.asarray(sample_idx, dtype=np.int64).reshape(-1), dtype=np.int64)
+        if int(sample_idx_arg.shape[0]) != int(y_arg.shape[0]):
+            raise ValueError(
+                f"JXLMM sparse null fit sample/y mismatch: sample_idx={sample_idx_arg.shape[0]} y={y_arg.shape[0]}"
+            )
+    x_arg = None
+    if x_cov is not None:
+        x_arg = np.ascontiguousarray(np.asarray(x_cov, dtype=np.float64), dtype=np.float64)
+        if x_arg.ndim != 2 or int(x_arg.shape[0]) != int(y_arg.shape[0]):
+            raise ValueError(
+                f"JXLMM sparse null covariate shape mismatch: got {x_arg.shape}, expected ({y_arg.shape[0]}, p)."
+            )
+
+    n_samples_null = int(y_arg.shape[0])
+    sparse_diag = _jxlmm_sparse_grm_diag_stats(str(jxgrm_path), sample_idx_arg)
+    mean_diag_k = float(sparse_diag.get("mean_diag", float("nan")))
+    n_samples_k = int(sparse_diag.get("n_samples", float("nan")))
+    nnz_k = int(sparse_diag.get("nnz", float("nan")))
+    offdiag_nnz = max(0, int(nnz_k) - max(0, int(n_samples_k)))
+    offdiag_total = max(1, int(n_samples_k) * max(0, int(n_samples_k) - 1) // 2)
+    offdiag_density = float(offdiag_nnz / offdiag_total) if int(n_samples_k) > 1 else float("nan")
+
+    if (
+        int(_JXLMM_SPARSE_NULL_CLIP_EIG_EXACT_N_MAX) > 0
+        and n_samples_null <= int(_JXLMM_SPARSE_NULL_CLIP_EIG_EXACT_N_MAX)
+    ):
+        fit_t0 = time.monotonic()
+        progress_total = 1000
+        if progress_callback is not None:
+            progress_callback(0, progress_total)
+
+        def _dense_progress(done: int, total: int) -> None:
+            if progress_callback is None:
+                return
+            try:
+                d = int(done)
+                t = int(total)
+            except Exception:
+                return
+            if t <= 0:
+                return
+            mapped = int((max(0, min(d, t)) * 320) / max(1, t))
+            progress_callback(mapped, progress_total)
+
+        grm_t0 = time.monotonic()
+        grm_dense = _jxlmm_load_sparse_grm_subset_dense(
+            str(jxgrm_path),
+            sample_idx=sample_idx_arg,
+            progress_callback=_dense_progress if progress_callback is not None else None,
+        )
+        grm_secs = max(time.monotonic() - grm_t0, 0.0)
+
+        def _exact_progress(done: int, total: int) -> None:
+            if progress_callback is None:
+                return
+            try:
+                d = int(done)
+                t = int(total)
+            except Exception:
+                return
+            if t <= 0:
+                return
+            mapped = 320 + int((max(0, min(d, t)) * 680) / max(1, t))
+            progress_callback(mapped, progress_total)
+
+        out = _jxlmm_exact_null_fit_from_grm(
+            grm=grm_dense,
+            y_vec=y_arg,
+            x_cov=x_arg,
+            threads=max(1, int(detect_effective_threads())),
+            stage_label="JXLMM sparse exact null eigendecompose clipped sparse subset",
+            progress_callback=_exact_progress if progress_callback is not None else None,
+            grm_secs=float(grm_secs),
+            strategy="sparse_exact_spectral_clipped",
+            pve_mode="components",
+            keep_buffers=False,
+        )
+        fit_secs = max(time.monotonic() - fit_t0, 0.0)
+        lbd = float(out.get("lambda", float("nan")))
+        log10_lambda = float(np.log10(max(lbd, 1e-30))) if np.isfinite(lbd) and lbd > 0.0 else float("nan")
+        out.update(
+            {
+                "fit_secs": float(fit_secs),
+                "mean_diag_k": mean_diag_k,
+                "min_diag_k": float(sparse_diag.get("min_diag", float("nan"))),
+                "max_diag_k": float(sparse_diag.get("max_diag", float("nan"))),
+                "n_samples_k": float(n_samples_k),
+                "nnz_k": float(nnz_k),
+                "offdiag_nnz_k": float(offdiag_nnz),
+                "offdiag_density_k": float(offdiag_density),
+                "log10_lambda": log10_lambda,
+                "lambda_boundary": _jxlmm_sparse_lambda_boundary_flag(log10_lambda, -5.0, 5.0),
+            }
+        )
+        if progress_callback is not None:
+            progress_callback(progress_total, progress_total)
+        return out
+
+    if not hasattr(jxrs, "jxreml_sparse_reml_brent_from_jxgrm"):
+        raise RuntimeError(
+            "Rust extension missing jxreml_sparse_reml_brent_from_jxgrm required by JXLMM sparse null fit."
+        )
+
+    fit_t0 = time.monotonic()
+    low = -5.0
+    high = 5.0
+    out = jxrs.jxreml_sparse_reml_brent_from_jxgrm(
+        str(jxgrm_path),
+        y_arg,
+        x_cov=x_arg,
+        sample_indices=sample_idx_arg,
+        low=low,
+        high=high,
+        grid_size=int(_JXLMM_SPARSE_REML_GRID_SIZE),
+        tol=1e-3,
+        max_iter=int(_JXLMM_SPARSE_REML_MAX_ITER),
+        progress_callback=progress_callback,
+    )
+    fit_secs = max(time.monotonic() - fit_t0, 0.0)
+    (
+        lbd,
+        sigma_g2,
+        sigma_e2,
+        ml,
+        reml,
+        log10_lambda,
+        grid_log10,
+        grid_reml,
+        grid_sigma_g2,
+        grid_sigma_e2,
+    ) = tuple(out)
+    sigma_g2 = float(sigma_g2)
+    sigma_e2 = float(sigma_e2)
+    # fastGWA-style sparse h2 is interpreted directly from the profiled
+    # variance components. Scaling by mean diag(K) can materially overstate h2
+    # for thresholded sparse GRMs whose diagonal is not normalized to 1.
+    pve = _jxlmm_component_ratio(sigma_g2, sigma_e2)
+    var_g_diag_scaled = float(sigma_g2) * max(mean_diag_k, 0.0) if np.isfinite(mean_diag_k) else float("nan")
+    denom_diag_scaled = var_g_diag_scaled + sigma_e2
+    pve_diag_scaled = (
+        float(var_g_diag_scaled / denom_diag_scaled)
+        if np.isfinite(denom_diag_scaled) and denom_diag_scaled > 0.0
+        else float("nan")
+    )
+    lambda_boundary = _jxlmm_sparse_lambda_boundary_flag(float(log10_lambda), low, high)
+    return {
+        "strategy": "sparse_reml_brent",
+        "sigma_g2": sigma_g2,
+        "sigma_e2": sigma_e2,
+        "pve": pve,
+        "lambda": float(lbd),
+        "log10_lambda": float(log10_lambda),
+        "ml": float(ml),
+        "reml": float(reml),
+        "converged": True,
+        "used_iter": 0,
+        "backend": "sparse_cholesky",
+        "fit_secs": float(fit_secs),
+        "grid_log10": list(np.asarray(grid_log10, dtype=np.float64).reshape(-1)),
+        "grid_reml": list(np.asarray(grid_reml, dtype=np.float64).reshape(-1)),
+        "grid_sigma_g2": list(np.asarray(grid_sigma_g2, dtype=np.float64).reshape(-1)),
+        "grid_sigma_e2": list(np.asarray(grid_sigma_e2, dtype=np.float64).reshape(-1)),
+        "mean_diag_k": mean_diag_k,
+        "pve_diag_scaled": pve_diag_scaled,
+        "min_diag_k": float(sparse_diag.get("min_diag", float("nan"))),
+        "max_diag_k": float(sparse_diag.get("max_diag", float("nan"))),
+        "n_samples_k": float(n_samples_k),
+        "nnz_k": float(nnz_k),
+        "offdiag_nnz_k": float(offdiag_nnz),
+        "offdiag_density_k": float(offdiag_density),
+        "lambda_boundary": lambda_boundary,
+    }
+
+
+def _jxlmm_marker_fast_null_fit(
+    *,
+    prefix: str,
+    sample_idx: np.ndarray,
+    y_vec: np.ndarray,
+    x_cov: Union[np.ndarray, None],
+    site_keep: Union[np.ndarray, None],
+    block_rows: int,
+    threads: int,
+    progress_callback=None,
+) -> dict[str, object]:
+    if not hasattr(jxrs, "gblup_reml_packed_bed"):
+        raise RuntimeError("Rust extension missing gblup_reml_packed_bed required by JXLMM low-rank null fit.")
+
+    if progress_callback is not None:
+        progress_callback(0, 4)
+    y_resid = _jxlmm_ols_residualize(y_vec, x_cov)
+    if progress_callback is not None:
+        progress_callback(1, 4)
+    fit_t0 = time.monotonic()
+    g_out = jxrs.gblup_reml_packed_bed(
+        str(prefix),
+        np.ascontiguousarray(np.asarray(sample_idx, dtype=np.int64).reshape(-1), dtype=np.int64),
+        y_resid,
+        site_keep=site_keep,
+        g_eps=1e-8,
+        low=-6.0,
+        high=6.0,
+        max_iter=50,
+        tol=1e-4,
+        block_rows=max(1, int(block_rows)),
+        threads=int(threads),
+        return_variance_components=True,
+        estimate_only=True,
+        return_effect=False,
+    )
+    fit_secs = max(time.monotonic() - fit_t0, 0.0)
+    if progress_callback is not None:
+        progress_callback(4, 4)
+    g_t = tuple(g_out)
+    if len(g_t) < 11:
+        raise RuntimeError(f"Unexpected gblup_reml_packed_bed payload size for JXLMM low-rank null fit: {len(g_t)}")
+    sigma_g2 = float(g_t[9])
+    sigma_e2 = float(g_t[10])
+    return {
+        "strategy": "marker_fast_low_rank",
+        "sigma_g2": sigma_g2,
+        "sigma_e2": sigma_e2,
+        "pve": float(g_t[2]),
+        "lambda": float(g_t[3]),
+        "ml": float(g_t[4]),
+        "reml": float(g_t[5]),
+        "converged": True,
+        "used_iter": 0,
+        "grm_secs": 0.0,
+        "evd_secs": float(g_t[7]) if np.isfinite(float(g_t[7])) else float(fit_secs),
+        "backend": str(g_t[6]),
+        "fit_secs": float(fit_secs),
+        "eff_m": int(g_t[8]),
     }
 
 
@@ -742,7 +2184,7 @@ def run_fastlmm_packed_fullrank(
                 eff_snp_by_trait=eff_snp_by_trait,
                 summary_rows=summary_rows,
                 saved_paths=saved_paths,
-                trait_names=[str(pname)],
+                trait_names=[pname],
                 emit_trait_header=False,
                 preloaded_packed=packed_preload_ready,
                 force_model=bool(force_model),
@@ -793,7 +2235,7 @@ def run_fastlmm_packed_fullrank(
                     eff_snp_by_trait=eff_snp_by_trait,
                     summary_rows=summary_rows,
                     saved_paths=saved_paths,
-                    trait_names=[str(pname)],
+                    trait_names=[pname],
                     emit_trait_header=False,
                     preloaded_packed=packed_preload_ready,
                     force_model=bool(force_model),
@@ -802,6 +2244,9 @@ def run_fastlmm_packed_fullrank(
                     logger.info("")
                 continue
 
+        # FastLMM packed currently exposes only scan-stage progress. Keep a
+        # placeholder stage-1 handle so shared cleanup code remains safe.
+        stage1_pbar: Optional[_ProgressAdapter] = None
         gwas_total = int(len(sites_all))
         gwas_last_done = 0
         gwas_pbar: Optional[_ProgressAdapter] = None
@@ -999,7 +2444,7 @@ def run_fastlmm_packed_fullrank(
         avg_cpu = 100.0 * cpu_used / (wall * max(1, n_cores))
         peak_rss_gb = peak_rss / (1024 ** 3)
 
-        eff_snp = int(len(sites_all))
+        eff_snp = int(len(trait_sites_all))
         eff_snp_by_trait[pname] = eff_snp
         summary_rows.append(
             {
@@ -2313,6 +3758,7 @@ def run_algwas_packed_fullrank(
         pname_tag = _safe_trait_file_label(pname)
         out_tsv = f"{outprefix}.{pname_tag}.algwas.tsv"
         pseudo_tsv_hint = f"{outprefix}.{pname_tag}.algwas.qtn.tsv"
+        stage1_tsv_hint = f"{os.path.splitext(out_tsv)[0]}.stage1.tsv"
 
         stage1_total = 256
         stage1_last_done = 0
@@ -2524,6 +3970,8 @@ def run_algwas_packed_fullrank(
         gwas_secs = max(time.monotonic() - gwas_t0, 0.0)
         _augment_gwas_tsv_with_snp_names(out_tsv, prefix, logger=logger)
         saved_paths.append(str(out_tsv))
+        if os.path.exists(stage1_tsv_hint):
+            saved_paths.append(str(stage1_tsv_hint))
         if int(pseudo_rows) > 0 and os.path.exists(pseudo_tsv_hint):
             _augment_gwas_tsv_with_snp_names(pseudo_tsv_hint, prefix, logger=logger)
             saved_paths.append(str(pseudo_tsv_hint))
@@ -2583,6 +4031,909 @@ def run_algwas_packed_fullrank(
         _rich_success(
             logger,
             f"ALGWAS ...Found {int(qtn_count)} QTNs [{'/'.join(done_times)}]",
+            use_spinner=bool(use_spinner),
+        )
+        if multi_trait_mode:
+            logger.info("")
+
+
+def run_jxlmm_packed_fullrank(
+    *,
+    genofile: str,
+    jxlmm_source: Optional[str] = None,
+    pheno: pd.DataFrame,
+    ids: np.ndarray,
+    outprefix: str,
+    maf_threshold: float,
+    max_missing_rate: float,
+    genetic_model: str,
+    het_threshold: float,
+    chunk_size: int,
+    qmatrix: np.ndarray,
+    cov_all: Union[np.ndarray, None],
+    plot: bool,
+    threads: int,
+    logger: logging.Logger,
+    use_spinner: bool = False,
+    snps_only: bool = True,
+    eff_snp_by_trait: Union[dict[str, int], None] = None,
+    summary_rows: Union[list[dict[str, object]], None] = None,
+    saved_paths: Union[list[str], None] = None,
+    trait_names: Union[list[str], None] = None,
+    emit_trait_header: bool = True,
+    preloaded_packed: Union[dict[str, object], None] = None,
+    force_sparse_jxlmm: bool = False,
+) -> None:
+    if str(genetic_model).lower() != "add":
+        raise ValueError("JXLMM full-rust packed route currently supports additive coding only (--model add).")
+    if not hasattr(jxrs, "jxlmm_assoc_pcg_bed"):
+        raise RuntimeError(
+            "Rust extension missing jxlmm_assoc_pcg_bed. Rebuild/install JanusX extension first."
+        )
+    if not hasattr(jxrs, "jxreml_sparse_reml_brent_from_jxgrm"):
+        raise RuntimeError(
+            "Rust extension missing jxreml_sparse_reml_brent_from_jxgrm required by JXLMM sparse null fit. "
+            "Rebuild/install JanusX extension first."
+        )
+
+    pheno_aligned, ids = _align_pheno_to_sample_order(pheno, ids)
+    prefix = _as_plink_prefix(genofile)
+    if prefix is None:
+        raise ValueError("JXLMM requires PLINK BED input/prefix after genotype streaming context preparation.")
+    aligned_ids = np.asarray(ids, dtype=str)
+    full_geno_ids = _plink_fam_sample_ids(str(prefix))
+    id_to_full_idx = {sid: i for i, sid in enumerate(full_geno_ids)}
+    try:
+        scan_sample_map = np.asarray(
+            [id_to_full_idx[str(sid)] for sid in aligned_ids],
+            dtype=np.int64,
+        )
+    except KeyError as e:
+        raise ValueError("Some aligned sample IDs are not present in PLINK FAM sample order.") from e
+    sites_all_full = _read_bim_sites(str(prefix))
+    scan_sample_map = np.ascontiguousarray(scan_sample_map, dtype=np.int64)
+    packed_preload_ready = None
+    use_packed_payload = False
+    packed_ctx = None
+    scan_packed = None
+    scan_packed_n = 0
+    scan_row_idx = None
+    scan_maf = None
+    scan_miss = None
+    scan_row_flip = None
+    if packed_preload_is_ready(preloaded_packed):
+        prefix_packed, full_ids_packed, packed_ctx_packed, sites_all_packed = _prepare_packed_bed_once_for_gwas(
+            genofile=genofile,
+            maf_threshold=float(maf_threshold),
+            max_missing_rate=float(max_missing_rate),
+            het_threshold=float(het_threshold),
+            snps_only=bool(snps_only),
+            use_spinner=bool(use_spinner),
+            preloaded_packed=preloaded_packed,
+        )
+        packed_preload_ready = _packed_preload_ready_state(
+            prefix=prefix_packed,
+            full_ids=full_ids_packed,
+            packed_ctx=packed_ctx_packed,
+            sites_all=sites_all_packed,
+        )
+        packed_ctx = packed_ctx_packed
+        (
+            scan_packed,
+            scan_packed_n,
+            scan_row_idx,
+            scan_maf,
+            scan_miss,
+            scan_row_flip,
+        ) = _packed_ctx_active_view_for_gwas(packed_ctx_packed)
+        if scan_packed_n <= 0:
+            raise ValueError("Packed BED reported invalid sample count.")
+        if (
+            int(scan_row_idx.shape[0]) != int(scan_maf.shape[0])
+            or int(scan_row_idx.shape[0]) != int(scan_miss.shape[0])
+            or int(scan_row_idx.shape[0]) != int(scan_row_flip.shape[0])
+        ):
+            raise ValueError("Packed BED arrays have inconsistent SNP dimensions.")
+        if int(len(sites_all_packed)) != int(scan_row_idx.shape[0]):
+            raise ValueError(
+                f"Packed/BIM mismatch after filtering: sites={len(sites_all_packed)} active_rows={scan_row_idx.shape[0]}"
+            )
+        use_packed_payload = True
+
+    jxlmm_sparse_cutoff, ignored_jxlmm_arg = _jxlmm_parse_sparse_cutoff(jxlmm_source)
+    if ignored_jxlmm_arg is not None:
+        _emit_warning_line(
+            logger,
+            (
+                "JXLMM only accepts an optional numeric sparse cutoff via -jxlmm; "
+                f"ignoring non-numeric argument: {ignored_jxlmm_arg}"
+            ),
+            use_spinner=bool(use_spinner),
+        )
+
+    kinship_prefix = str(prefix)
+    kinship_packed_ctx = packed_ctx
+    kinship_sites_all = list(sites_all_full)
+    kinship_sample_map = np.asarray(scan_sample_map, dtype=np.int64)
+    kinship_present_mask = kinship_sample_map >= 0
+
+    kinship_packed = None
+    kinship_packed_n = 0
+    _kinship_row_idx = None
+    kinship_maf = None
+    kinship_row_flip = None
+    if use_packed_payload and kinship_packed_ctx is not None:
+        (
+            kinship_packed,
+            kinship_packed_n,
+            _kinship_row_idx,
+            kinship_maf,
+            _kinship_miss,
+            kinship_row_flip,
+        ) = _packed_ctx_active_view_for_gwas(kinship_packed_ctx)
+
+    process = psutil.Process()
+    n_cores = detect_effective_threads()
+    if eff_snp_by_trait is None:
+        eff_snp_by_trait = {}
+    if summary_rows is None:
+        summary_rows = []
+    if saved_paths is None:
+        saved_paths = []
+
+    trait_iter = _resolve_trait_iter(pheno_aligned, trait_names)
+    multi_trait_mode = len(trait_iter) > 1
+    block_rows_use = int(max(4096, int(chunk_size)))
+    sparse_kinship_cache: dict[str, str] = {}
+
+    for pname in trait_iter:
+        cpu_t0 = process.cpu_times()
+        t0 = time.time()
+        peak_rss = process.memory_info().rss
+
+        y_full, sameidx = _trait_values_and_mask(pheno_aligned, str(pname))
+        keep_idx_nonmissing = np.flatnonzero(
+            np.asarray(sameidx, dtype=np.bool_) & kinship_present_mask
+        ).astype(np.int64, copy=False)
+        n_nonmissing = int(keep_idx_nonmissing.shape[0])
+        if n_nonmissing == 0:
+            logger.warning(f"{pname}: no overlapping samples, skipped.")
+            if pname not in eff_snp_by_trait:
+                eff_snp_by_trait[pname] = 0
+            if multi_trait_mode:
+                logger.info("")
+            continue
+        dropped_missing_kin = int(np.count_nonzero(np.asarray(sameidx, dtype=np.bool_))) - n_nonmissing
+        if dropped_missing_kin > 0:
+            _log_model_line(
+                logger,
+                "JXLMM",
+                f"Trait {pname}: dropped {dropped_missing_kin} sample(s) absent from kinship source.",
+                use_spinner=bool(use_spinner),
+            )
+        keep_idx = keep_idx_nonmissing
+        n_idv = int(keep_idx.shape[0])
+
+        if bool(emit_trait_header):
+            _emit_trait_header(
+                logger,
+                str(pname),
+                int(n_idv),
+                pve=None,
+                use_spinner=bool(use_spinner),
+                width=60,
+            )
+
+        y_vec = np.ascontiguousarray(y_full[keep_idx], dtype=np.float64)
+        x_cov = np.ascontiguousarray(qmatrix[keep_idx], dtype=np.float64)
+        if cov_all is not None:
+            x_cov = np.ascontiguousarray(
+                np.concatenate([x_cov, cov_all[keep_idx]], axis=1),
+                dtype=np.float64,
+            )
+        x_arg = x_cov if int(x_cov.shape[1]) > 0 else None
+        scan_sample_idx_trait = np.ascontiguousarray(scan_sample_map[keep_idx], dtype=np.int64)
+        kinship_sample_idx_trait = np.ascontiguousarray(kinship_sample_map[keep_idx], dtype=np.int64)
+        sparse_cache_key = "__full_sample__"
+        trait_sparse_kinship_path = sparse_kinship_cache.get(sparse_cache_key)
+        if trait_sparse_kinship_path is None:
+            trait_sparse_kinship_path = _ensure_jxlmm_sparse_grm(
+                kinship_prefix,
+                sample_indices=None,
+                out_prefix=_jxlmm_sparse_out_prefix(kinship_prefix, None),
+                cutoff=float(jxlmm_sparse_cutoff),
+                maf_threshold=float(maf_threshold),
+                max_missing_rate=float(max_missing_rate),
+                het_threshold=float(het_threshold),
+                snps_only=bool(snps_only),
+                threads=int(threads),
+                logger=logger,
+                use_spinner=bool(use_spinner),
+            )
+            sparse_kinship_cache[sparse_cache_key] = str(trait_sparse_kinship_path)
+        scan_meta = None
+        if not bool(use_packed_payload):
+            scan_meta = _jxlmm_bed_logic_meta_selected(
+                str(kinship_prefix),
+                sample_indices=kinship_sample_idx_trait,
+                maf_threshold=float(maf_threshold),
+                max_missing_rate=float(max_missing_rate),
+                het_threshold=float(het_threshold),
+                snps_only=bool(snps_only),
+            )
+
+        null_route_desc = "prepare sparse REML route"
+        null_t0 = time.monotonic()
+        null_pbar: Optional[_ProgressAdapter] = None
+        null_last_done = 0
+        null_desc_current = ""
+        null_stage_times: dict[str, float] = {}
+        null_stage_current: Optional[str] = None
+        null_stage_t0: Optional[float] = None
+        null_spin_handle = (
+            _start_indeterminate_progress_bar(
+                _jxlmm_null_progress_desc(null_route_desc, 0, 1000)
+            )
+            if bool(use_spinner)
+            else None
+        )
+
+        def _close_null_stage() -> None:
+            nonlocal null_stage_current, null_stage_t0
+            if null_stage_current is not None and null_stage_t0 is not None:
+                null_stage_times[null_stage_current] = null_stage_times.get(null_stage_current, 0.0) + max(
+                    time.monotonic() - null_stage_t0,
+                    0.0,
+                )
+            null_stage_current = None
+            null_stage_t0 = None
+            
+        def _jxlmm_null_progress(done: int, total: int) -> None:
+            nonlocal null_stage_current,null_pbar, null_last_done, null_spin_handle, peak_rss, null_desc_current
+            try:
+                d = int(done)
+                t = int(total)
+            except Exception:
+                return
+            if null_spin_handle is not None:
+                try:
+                    _stop_indeterminate_progress_bar(null_spin_handle)
+                except Exception:
+                    pass
+                null_spin_handle = None
+            total_use = int(max(1, t if t > 0 else 1000))
+            desc = _jxlmm_null_progress_desc(null_route_desc, d, total_use)
+            if null_pbar is None:
+                null_pbar = _ProgressAdapter(
+                    total=total_use,
+                    desc=desc,
+                    force_animate=True,
+                )
+                null_desc_current = desc
+            total_use = int(max(1, null_pbar.total if null_pbar is not None else total_use))
+            if t > 0 and null_pbar is not None and int(t) != total_use:
+                null_pbar.set_total(int(max(1, t)))
+                total_use = int(max(1, null_pbar.total))
+            stage_name = _jxlmm_null_progress_stage(null_route_desc, d, total_use)
+            if stage_name != null_stage_current:
+                _close_null_stage()
+                null_stage_current = str(stage_name)
+                null_stage_t0 = time.monotonic()
+            desc = _jxlmm_null_progress_desc(null_route_desc, d, total_use)
+            if null_pbar is not None and desc != null_desc_current:
+                null_pbar.set_description(desc)
+                null_desc_current = desc
+            d = int(max(0, min(d, total_use)))
+            stepv = int(max(0, d - null_last_done))
+            if stepv > 0 and null_pbar is not None:
+                null_pbar.update(stepv)
+                null_last_done = d
+            try:
+                peak_rss = max(peak_rss, process.memory_info().rss)
+            except Exception:
+                pass
+
+        try:
+            null_route_desc = "sparse REML / sparse GRM"
+            null_fit = _jxlmm_sparse_null_fit(
+                jxgrm_path=str(trait_sparse_kinship_path),
+                sample_idx=kinship_sample_idx_trait,
+                y_vec=y_vec,
+                x_cov=x_arg,
+                progress_callback=_jxlmm_null_progress if bool(use_spinner) else None,
+            )
+        finally:
+            _close_null_stage()
+            if null_spin_handle is not None:
+                try:
+                    _stop_indeterminate_progress_bar(null_spin_handle)
+                except Exception:
+                    pass
+                null_spin_handle = None
+            if null_pbar is not None:
+                try:
+                    total_use = int(max(1, null_pbar.total))
+                    if int(null_last_done) < total_use:
+                        null_pbar.update(total_use - int(null_last_done))
+                    null_pbar.finish()
+                    time.sleep(0.05)
+                except Exception:
+                    pass
+                null_pbar.close(show_done=False)
+        null_secs = max(time.monotonic() - null_t0, 0.0)
+        peak_rss = max(peak_rss, process.memory_info().rss)
+
+        sigma_g2 = float(null_fit["sigma_g2"])
+        sigma_e2 = float(null_fit["sigma_e2"])
+        null_pve = float(null_fit.get("pve", float("nan")))
+        null_lbd = float(null_fit.get("lambda", float("nan")))
+        null_mean_diag_k = float(null_fit.get("mean_diag_k", float("nan")))
+        null_n_samples_k = int(null_fit.get("n_samples_k", 0) or 0)
+        null_nnz_k = int(null_fit.get("nnz_k", 0) or 0)
+        null_offdiag_density_k = float(null_fit.get("offdiag_density_k", float("nan")))
+        null_lambda_boundary = null_fit.get("lambda_boundary", None)
+        if not _jxlmm_null_components_valid(sigma_g2, sigma_e2):
+            raise RuntimeError(
+                f"JXLMM null variance estimation returned invalid components for trait {pname}: "
+                f"sigma_g2={sigma_g2}, sigma_e2={sigma_e2}"
+            )
+        null_backend = str(null_fit.get("backend", "unknown"))
+        null_strategy = str(null_fit.get("strategy", "unknown"))
+        _log_model_line(
+            logger,
+            "JXLMM",
+            (
+                f"{null_strategy} null fit h2~{float(null_pve):.3f}, "
+                f"mean_diag(K)={null_mean_diag_k:.4g}, "
+                f"nnz(K)={null_nnz_k}, "
+                f"offdiag_density={null_offdiag_density_k:.4g}, "
+                f"sparse_cutoff={float(jxlmm_sparse_cutoff):g}, "
+                f"lambda={null_lbd:.4g}, sigma_g2={sigma_g2:.4g}, "
+                f"sigma_e2={sigma_e2:.4g}, "
+                f"lambda_boundary={null_lambda_boundary or 'interior'}, "
+                f"backend={null_backend} [{format_elapsed(null_secs)}]"
+                if np.isfinite(null_pve)
+                else f"{null_strategy} null fit sigma_g2={sigma_g2:.4g}, sigma_e2={sigma_e2:.4g}, "
+                f"backend={null_backend} [{format_elapsed(null_secs)}]"
+            ),
+            use_spinner=bool(use_spinner),
+        )
+        grid_local_summary = _jxlmm_sparse_grid_local_summary(null_fit, window=2)
+        if grid_local_summary is not None:
+            _log_model_line(
+                logger,
+                "JXLMM",
+                f"sparse REML grid local log10(lambda): {grid_local_summary}",
+                use_spinner=bool(use_spinner),
+            )
+        if null_lambda_boundary in {"low", "high"}:
+            logger.warning(
+                f"Warning: JXLMM sparse REML optimum for trait {pname} is near the {null_lambda_boundary} "
+                f"log10(lambda) search boundary; inspect sparse cutoff or widen the search range."
+            )
+        if (
+            null_strategy == "sparse_reml_brent"
+            and null_n_samples_k > 1
+            and np.isfinite(null_offdiag_density_k)
+            and float(null_offdiag_density_k) < 1e-3
+        ):
+            logger.warning(
+                f"Warning: JXLMM sparse GRM for trait {pname} is nearly diagonal "
+                f"(nnz={null_nnz_k}, offdiag_density={float(null_offdiag_density_k):.4g}). "
+                "Under this sparse positive-kinship model, h2 can collapse toward 0 and LM switch is expected; "
+                "this is not comparable to dense FastLMM h2."
+            )
+        if null_stage_times:
+            _log_model_line(
+                logger,
+                "JXLMM",
+                f"null stage times: {_jxlmm_format_stage_times(null_stage_times)}",
+                use_spinner=bool(use_spinner),
+            )
+
+        pheno_trait_subset = pheno_aligned.iloc[keep_idx][[pname]].copy()
+        ids_trait_subset = np.asarray(ids[keep_idx], dtype=str)
+        if (
+            null_strategy == "fastlmm_exact_spectral"
+            and _fastlmm_should_switch_to_lmm(null_pve)
+        ):
+            prev_pve = float(null_pve) if np.isfinite(null_pve) else float("nan")
+            logger.warning(
+                f"Warning: JXLMM switch to LMM for trait {pname}: "
+                f"null PVE={prev_pve:.4f} (>0.995)."
+            )
+            _log_model_line(
+                logger,
+                "LMM",
+                (
+                    f"switched from JXLMM null to LMM: "
+                    f"PVE(null)={prev_pve:.4f} (>0.995) "
+                    f"[{format_elapsed(null_secs)}]"
+                ),
+                use_spinner=bool(use_spinner),
+            )
+            run_lmm_packed_fullrank(
+                genofile=genofile,
+                pheno=pheno_trait_subset,
+                ids=ids_trait_subset,
+                grm=np.ascontiguousarray(np.asarray(null_fit["grm"], dtype=np.float64), dtype=np.float64),
+                outprefix=outprefix,
+                maf_threshold=maf_threshold,
+                max_missing_rate=max_missing_rate,
+                genetic_model=genetic_model,
+                het_threshold=het_threshold,
+                chunk_size=chunk_size,
+                qmatrix=qmatrix[keep_idx],
+                cov_all=(None if cov_all is None else np.ascontiguousarray(cov_all[keep_idx], dtype=np.float64)),
+                plot=plot,
+                threads=threads,
+                logger=logger,
+                use_spinner=use_spinner,
+                snps_only=bool(snps_only),
+                eff_snp_by_trait=eff_snp_by_trait,
+                summary_rows=summary_rows,
+                saved_paths=saved_paths,
+                trait_names=[str(pname)],
+                emit_trait_header=False,
+                preloaded_packed=packed_preload_ready,
+                force_model=False,
+            )
+            if multi_trait_mode:
+                logger.info("")
+            continue
+
+        null_ml0 = null_fit.get("ml", None)
+        if null_ml0 is not None and np.isfinite(float(null_ml0)):
+            switch_to_lm, lrt_stat, lrt_p = _mixed_model_switch_to_lm_decision(
+                y_vec=y_vec,
+                x_cov=x_cov,
+                lmm_ml0=float(null_ml0),
+                alpha=0.05,
+            )
+            if switch_to_lm:
+                logger.warning(
+                    f"Warning: JXLMM switch to LM for trait {pname}: "
+                    f"null LRT stat={float(lrt_stat):.4g}, p={float(lrt_p):.4g} (>=0.05)."
+                )
+                _log_model_line(
+                    logger,
+                    "LM",
+                    (
+                        f"switched from JXLMM null to LM "
+                        f"(LRT stat={float(lrt_stat):.4g}, p={float(lrt_p):.4g}) "
+                        f"[{format_elapsed(null_secs)}]"
+                    ),
+                    use_spinner=bool(use_spinner),
+                )
+                if packed_preload_ready is not None:
+                    run_lm_packed_fullrank(
+                        genofile=genofile,
+                        pheno=pheno_trait_subset,
+                        ids=ids_trait_subset,
+                        outprefix=outprefix,
+                        maf_threshold=maf_threshold,
+                        max_missing_rate=max_missing_rate,
+                        genetic_model=genetic_model,
+                        het_threshold=het_threshold,
+                        chunk_size=chunk_size,
+                        qmatrix=qmatrix[keep_idx],
+                        cov_all=(None if cov_all is None else np.ascontiguousarray(cov_all[keep_idx], dtype=np.float64)),
+                        plot=plot,
+                        threads=threads,
+                        logger=logger,
+                        use_spinner=use_spinner,
+                        snps_only=bool(snps_only),
+                        eff_snp_by_trait=eff_snp_by_trait,
+                        summary_rows=summary_rows,
+                        saved_paths=saved_paths,
+                        trait_names=[str(pname)],
+                        emit_trait_header=False,
+                        preloaded_packed=packed_preload_ready,
+                        force_model=False,
+                    )
+                else:
+                    run_lm_stream_bed_single_entry(
+                        genofile=genofile,
+                        pheno=pheno_trait_subset,
+                        ids=ids_trait_subset,
+                        n_snps=int(len(kinship_sites_all)),
+                        outprefix=outprefix,
+                        maf_threshold=maf_threshold,
+                        max_missing_rate=max_missing_rate,
+                        genetic_model=genetic_model,
+                        het_threshold=het_threshold,
+                        chunk_size=chunk_size,
+                        qmatrix=qmatrix[keep_idx],
+                        cov_all=(None if cov_all is None else np.ascontiguousarray(cov_all[keep_idx], dtype=np.float64)),
+                        plot=plot,
+                        threads=threads,
+                        logger=logger,
+                        use_spinner=use_spinner,
+                        snps_only=bool(snps_only),
+                        eff_snp_by_trait=eff_snp_by_trait,
+                        summary_rows=summary_rows,
+                        saved_paths=saved_paths,
+                        trait_names=[str(pname)],
+                        emit_trait_header=False,
+                    )
+                if multi_trait_mode:
+                    logger.info("")
+                continue
+
+        for _buf_key in ("grm", "eigvals", "eigvecs"):
+            null_fit.pop(_buf_key, None)
+
+        def _make_jxlmm_stage_progress(stage_labels: list[str]):
+            current_stage = -1
+            current_total = 0
+            current_done = 0
+            current_pbar: Optional[_ProgressAdapter] = None
+            current_stage_t0: Optional[float] = None
+            stage_times: dict[str, float] = {}
+            spin_handle = _start_indeterminate_progress_bar(stage_labels[0]) if bool(use_spinner) else None
+
+            def _close_current(success: bool = False) -> None:
+                nonlocal current_pbar, current_total, current_done, current_stage_t0
+                if (
+                    current_pbar is not None
+                    and current_stage >= 0
+                    and current_stage < len(stage_labels)
+                    and current_stage_t0 is not None
+                ):
+                    stage_name = str(stage_labels[current_stage])
+                    stage_times[stage_name] = stage_times.get(stage_name, 0.0) + max(
+                        time.monotonic() - current_stage_t0,
+                        0.0,
+                    )
+                if current_pbar is not None:
+                    try:
+                        total_use = int(max(1, current_pbar.total))
+                        if success and int(current_done) < total_use:
+                            current_pbar.update(total_use - int(current_done))
+                        if success:
+                            current_pbar.finish()
+                    except Exception:
+                        pass
+                    try:
+                        current_pbar.close(show_done=False)
+                    except Exception:
+                        pass
+                    current_pbar = None
+                current_stage_t0 = None
+                current_total = 0
+                current_done = 0
+
+            def _progress(stage: int, done: int, total: int) -> None:
+                nonlocal current_stage, current_total, current_done, current_pbar, spin_handle, peak_rss, current_stage_t0
+                try:
+                    stage_i = int(stage)
+                    done_i = int(done)
+                    total_i = int(total)
+                except Exception:
+                    return
+                if stage_i < 0 or stage_i >= len(stage_labels):
+                    return
+                if spin_handle is not None:
+                    try:
+                        _stop_indeterminate_progress_bar(spin_handle)
+                    except Exception:
+                        pass
+                    spin_handle = None
+                total_use = int(max(1, total_i if total_i > 0 else 1))
+                if current_stage != stage_i:
+                    _close_current(success=False)
+                    current_stage = stage_i
+                    current_total = total_use
+                    current_pbar = _ProgressAdapter(
+                        total=total_use,
+                        desc=str(stage_labels[stage_i]),
+                        force_animate=True,
+                    )
+                    current_stage_t0 = time.monotonic()
+                elif current_pbar is not None and total_use != int(max(1, current_total)):
+                    current_pbar.set_total(total_use)
+                    current_total = total_use
+                total_use = int(max(1, current_total))
+                done_use = int(max(0, min(done_i, total_use)))
+                stepv = int(max(0, done_use - current_done))
+                if stepv > 0 and current_pbar is not None:
+                    current_pbar.update(stepv)
+                current_done = done_use
+                if done_use >= total_use:
+                    _close_current(success=True)
+                try:
+                    peak_rss = max(peak_rss, process.memory_info().rss)
+                except Exception:
+                    pass
+
+            def _finish(success: bool) -> None:
+                nonlocal spin_handle
+                if spin_handle is not None:
+                    try:
+                        _stop_indeterminate_progress_bar(spin_handle)
+                    except Exception:
+                        pass
+                    spin_handle = None
+                _close_current(success=bool(success))
+
+            def _summary() -> dict[str, float]:
+                return dict(stage_times)
+
+            return (_progress if bool(use_spinner) else None), _finish, _summary
+
+        if bool(use_packed_payload):
+            trait_row_idx = np.ascontiguousarray(np.asarray(scan_row_idx, dtype=np.int64).reshape(-1), dtype=np.int64)
+            trait_scan_maf = np.ascontiguousarray(np.asarray(scan_maf, dtype=np.float32).reshape(-1), dtype=np.float32)
+            trait_scan_miss = np.ascontiguousarray(np.asarray(scan_miss, dtype=np.float32).reshape(-1), dtype=np.float32)
+            trait_scan_row_flip = np.ascontiguousarray(np.asarray(scan_row_flip, dtype=np.bool_).reshape(-1), dtype=np.bool_)
+            trait_site_keep = None
+        else:
+            if scan_meta is None:
+                raise RuntimeError("JXLMM memmap scan metadata is missing.")
+            trait_row_idx = np.ascontiguousarray(np.asarray(scan_meta["row_indices"], dtype=np.int64).reshape(-1), dtype=np.int64)
+            trait_scan_maf = np.ascontiguousarray(np.asarray(scan_meta["maf"], dtype=np.float32).reshape(-1), dtype=np.float32)
+            trait_scan_miss = np.ascontiguousarray(np.asarray(scan_meta["missing_rate"], dtype=np.float32).reshape(-1), dtype=np.float32)
+            trait_scan_row_flip = np.ascontiguousarray(np.asarray(scan_meta["row_flip"], dtype=np.bool_).reshape(-1), dtype=np.bool_)
+            trait_site_keep = np.ascontiguousarray(np.asarray(scan_meta["site_keep"], dtype=np.bool_).reshape(-1), dtype=np.bool_)
+        trait_sites_all = [kinship_sites_all[int(idx)] for idx in trait_row_idx.tolist()]
+        chrom_all = [str(c) for (c, _p, _a0, _a1) in trait_sites_all]
+        pos_all = [int(p) for (_c, p, _a0, _a1) in trait_sites_all]
+        allele0_all = [str(v) for (_c, _p, v, _a1) in trait_sites_all]
+        allele1_all = [str(v) for (_c, _p, _a0, v) in trait_sites_all]
+
+        scan_t0 = time.monotonic()
+        scan_ok = False
+        r_hat = float("nan")
+        y_conv = True
+        y_iters = 0
+        y_rel_res = 0.0
+        x_conv_all = True
+        x_max_iters = 0
+        x_max_rel_res = 0.0
+        rhat_requested = 30
+        rhat_used = 30
+        arr = None
+        wrote_direct_tsv = False
+        scan_route_desc = (
+            "sparse Cholesky scan (packed preload)"
+            if bool(use_packed_payload)
+            else "sparse Cholesky scan (memmap)"
+        )
+        stage_labels = [
+            "JXLMM sparse stage 0: prepare scan inputs / row stats",
+            "JXLMM sparse stage 1: open sparse CSC file",
+            "JXLMM sparse stage 2: validate sparse CSC",
+            "JXLMM sparse stage 3: direct samples / subset sparse CSC",
+            "JXLMM sparse stage 4: symbolic analyze sparse CSC",
+            "JXLMM sparse stage 5: factorize sparse V = sigma_g2 K + sigma_e2 I",
+            "JXLMM sparse stage 6: solve V^-1 y",
+            "JXLMM sparse stage 7: solve V^-1 X",
+            "JXLMM sparse stage 8: estimate r_hat",
+            "JXLMM sparse stage 9: scan SNPs",
+        ]
+        sparse_progress, sparse_finish, sparse_stage_summary = _make_jxlmm_stage_progress(stage_labels)
+        pname_tag = _safe_trait_file_label(pname)
+        out_tsv = f"{outprefix}.{pname_tag}.jxlmm.tsv"
+        tmp_tsv = f"{out_tsv}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
+        try:
+            with _gwas_scan_stage_ctx(max(1, int(threads))):
+                if hasattr(jxrs, "jxlmm_assoc_pcg_bed_to_tsv"):
+                    wrote_direct_tsv = True
+                    scan_route_desc = f"{scan_route_desc}; Rust async TSV writer"
+                    jxlmm_out = jxrs.jxlmm_assoc_pcg_bed_to_tsv(
+                        str(kinship_prefix),
+                        y_vec,
+                        float(sigma_g2),
+                        float(sigma_e2),
+                        chrom_all,
+                        pos_all,
+                        allele0_all,
+                        allele1_all,
+                        str(tmp_tsv),
+                        x_cov=x_arg,
+                        sample_indices=scan_sample_idx_trait,
+                        operator_sample_indices=kinship_sample_idx_trait,
+                        site_keep=trait_site_keep,
+                        tol=1e-5,
+                        max_iter=200,
+                        block_rows=block_rows_use,
+                        std_eps=1e-12,
+                        use_train_maf=True,
+                        threads=int(threads),
+                        model="add",
+                        rhat_markers=30,
+                        rhat_seed=20260527,
+                        packed=scan_packed if bool(use_packed_payload) else None,
+                        packed_n_samples=int(scan_packed_n if bool(use_packed_payload) else 0),
+                        maf=trait_scan_maf,
+                        row_flip=trait_scan_row_flip,
+                        row_missing=trait_scan_miss,
+                        row_indices=trait_row_idx,
+                        sparse_jxgrm_path=str(trait_sparse_kinship_path),
+                        stage1_progress_callback=sparse_progress,
+                        scan_progress_callback=sparse_progress,
+                        progress_every=int(max(512, min(int(block_rows_use), 4096))),
+                        rhat_tol=1e-3,
+                        force_sparse_jxlmm=True,
+                    )
+                else:
+                    jxlmm_out = jxrs.jxlmm_assoc_pcg_bed(
+                        str(kinship_prefix),
+                        y_vec,
+                        float(sigma_g2),
+                        float(sigma_e2),
+                        x_cov=x_arg,
+                        sample_indices=scan_sample_idx_trait,
+                        operator_sample_indices=kinship_sample_idx_trait,
+                        site_keep=trait_site_keep,
+                        tol=1e-5,
+                        max_iter=200,
+                        block_rows=block_rows_use,
+                        std_eps=1e-12,
+                        use_train_maf=True,
+                        threads=int(threads),
+                        model="add",
+                        rhat_markers=30,
+                        rhat_seed=20260527,
+                        packed=scan_packed if bool(use_packed_payload) else None,
+                        packed_n_samples=int(scan_packed_n if bool(use_packed_payload) else 0),
+                        maf=trait_scan_maf,
+                        row_flip=trait_scan_row_flip,
+                        row_missing=trait_scan_miss,
+                        row_indices=trait_row_idx,
+                        sparse_jxgrm_path=str(trait_sparse_kinship_path),
+                        stage1_progress_callback=sparse_progress,
+                        scan_progress_callback=sparse_progress,
+                        progress_every=int(max(512, min(int(block_rows_use), 4096))),
+                        rhat_tol=1e-3,
+                        force_sparse_jxlmm=True,
+                    )
+            scan_ok = True
+        finally:
+            sparse_finish(scan_ok)
+            if (not scan_ok) and wrote_direct_tsv and os.path.exists(tmp_tsv):
+                try:
+                    os.remove(tmp_tsv)
+                except OSError:
+                    pass
+
+        jxlmm_t = tuple(jxlmm_out)
+        r_hat = float(jxlmm_t[0])
+        y_conv = bool(jxlmm_t[1])
+        y_iters = int(jxlmm_t[2])
+        y_rel_res = float(jxlmm_t[3])
+        x_conv_all = bool(jxlmm_t[4])
+        x_max_iters = int(jxlmm_t[5])
+        x_max_rel_res = float(jxlmm_t[6])
+        rhat_requested = int(jxlmm_t[7])
+        rhat_used = int(jxlmm_t[8])
+        written_rows = 0
+        if wrote_direct_tsv:
+            written_rows = int(jxlmm_t[9])
+        else:
+            arr = np.ascontiguousarray(np.asarray(jxlmm_t[9], dtype=np.float64), dtype=np.float64)
+
+        scan_secs = max(time.monotonic() - scan_t0, 0.0)
+        peak_rss = max(peak_rss, process.memory_info().rss)
+
+        if wrote_direct_tsv:
+            _run_result_write_with_status(
+                lambda: os.replace(tmp_tsv, out_tsv),
+                use_spinner=bool(use_spinner),
+                emit_done_line=False,
+            )
+        else:
+            if arr is None:
+                raise RuntimeError("JXLMM scan produced no result matrix.")
+            if arr.shape != (len(trait_sites_all), 3):
+                raise RuntimeError(
+                    f"JXLMM result shape mismatch: got {arr.shape}, expected ({len(trait_sites_all)}, 3)."
+                )
+
+            def _write_jxlmm() -> None:
+                nonlocal written_rows, arr
+                written_rows = int(
+                    _write_jxlmm_assoc_tsv(
+                        out_tsv=out_tsv,
+                        sites_all=trait_sites_all,
+                        maf=trait_scan_maf,
+                        miss=trait_scan_miss,
+                        results=arr,
+                        genetic_model=str(genetic_model),
+                    )
+                )
+                arr = None
+
+            _run_result_write_with_status(
+                _write_jxlmm,
+                use_spinner=bool(use_spinner),
+                emit_done_line=False,
+            )
+        if int(written_rows) != int(len(trait_sites_all)):
+            _emit_warning_line(
+                logger,
+                f"JXLMM writer row mismatch: expected={len(trait_sites_all)} wrote={int(written_rows)}",
+                use_spinner=bool(use_spinner),
+            )
+        _augment_gwas_tsv_with_snp_names(out_tsv, prefix, logger=logger)
+        saved_paths.append(str(out_tsv))
+
+        viz_secs = 0.0
+        if plot:
+            viz_secs = _run_fastplot_from_tsv_with_status(
+                out_tsv,
+                y_vec,
+                xlabel=str(pname),
+                outpdf=f"{os.path.splitext(out_tsv)[0]}.svg",
+                use_spinner=bool(use_spinner),
+                emit_done_line=False,
+            )
+
+        cpu_t1 = process.cpu_times()
+        t1 = time.time()
+        wall = max(t1 - t0, 1e-12)
+        cpu_used = (cpu_t1.user - cpu_t0.user) + (cpu_t1.system - cpu_t0.system)
+        avg_cpu = 100.0 * cpu_used / (wall * max(1, n_cores))
+        peak_rss_gb = peak_rss / (1024 ** 3)
+
+        _log_model_line(
+            logger,
+            "JXLMM",
+            (
+                f"{scan_route_desc}; r_hat={r_hat:.4g}, sampled {rhat_used}/{rhat_requested}, "
+                f"V^-1y converged={str(y_conv).lower()} ({y_iters} iters, relres={y_rel_res:.2e}), "
+                f"V^-1X converged={str(x_conv_all).lower()} ({x_max_iters} iters, relres={x_max_rel_res:.2e})"
+            ),
+            use_spinner=bool(use_spinner),
+        )
+        sparse_stage_times = sparse_stage_summary()
+        if sparse_stage_times:
+            _log_model_line(
+                logger,
+                "JXLMM",
+                f"scan stage times: {_jxlmm_format_stage_times(sparse_stage_times)}",
+                use_spinner=bool(use_spinner),
+            )
+        _log_model_line(
+            logger,
+            "JXLMM",
+            f"avg CPU ~ {avg_cpu:.1f}% of {n_cores} c, peak RSS ~ {peak_rss_gb:.2f} G",
+            use_spinner=bool(use_spinner),
+        )
+        _log_model_line(
+            logger,
+            "JXLMM",
+            f"Results saved to {_display_path(str(out_tsv))}",
+            use_spinner=bool(use_spinner),
+        )
+
+        eff_snp = int(len(trait_sites_all))
+        eff_snp_by_trait[str(pname)] = eff_snp
+        summary_rows.append(
+            {
+                "phenotype": str(pname),
+                "model": "JXLMM",
+                "nidv": int(n_idv),
+                "eff_snp": int(eff_snp),
+                "pve": (float(null_pve) if np.isfinite(null_pve) else None),
+                "avg_cpu": float(avg_cpu),
+                "peak_rss_gb": float(peak_rss_gb),
+                "gwas_time_s": float(null_secs + scan_secs),
+                "viz_time_s": float(viz_secs),
+                "result_file": str(out_tsv),
+            }
+        )
+
+        done_times = [format_elapsed(null_secs), format_elapsed(scan_secs)]
+        if plot:
+            done_times.append(format_elapsed(viz_secs))
+        _rich_success(
+            logger,
+            (
+                f"JXLMM ...r_hat {r_hat:.4g} h2 {float(null_pve):.3f} [{'/'.join(done_times)}]"
+                if np.isfinite(null_pve)
+                else f"JXLMM ...r_hat {r_hat:.4g} [{'/'.join(done_times)}]"
+            ),
             use_spinner=bool(use_spinner),
         )
         if multi_trait_mode:

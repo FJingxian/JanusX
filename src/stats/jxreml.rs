@@ -1,0 +1,818 @@
+use std::cell::RefCell;
+use std::f64::consts::PI;
+use std::sync::Arc;
+
+use numpy::{PyReadonlyArray1, PyReadonlyArray2};
+use pyo3::exceptions::PyRuntimeError;
+use pyo3::prelude::*;
+
+use crate::brent::brent_minimize_with_init;
+use crate::cholesky::{
+    sparse_cholesky_analyze_subset_jxgrm_path_cached, sparse_jxgrm_header_n_samples,
+    SparseJxgrmCholesky, SparseJxgrmCholeskyAnalysis, SparseJxgrmSolveWorkspace,
+};
+use crate::linalg::{cholesky_inplace, cholesky_logdet, cholesky_solve_into};
+use crate::stats_common::{map_err_string_to_py, parse_index_vec_i64};
+
+const JXREML_TINY: f64 = 1e-30_f64;
+
+#[derive(Clone, Debug)]
+struct SparseRemlEval {
+    log10_lambda: f64,
+    lambda: f64,
+    sigma_g2: f64,
+    sigma_e2: f64,
+    ml: f64,
+    reml: f64,
+}
+
+#[derive(Clone, Debug)]
+struct SparseRemlSearchResult {
+    best: SparseRemlEval,
+    grid: Vec<SparseRemlEval>,
+}
+
+fn sparse_reml_debug_enabled() -> bool {
+    std::env::var("JX_SPARSE_REML_DEBUG")
+        .ok()
+        .map(|v| {
+            let s = v.trim().to_ascii_lowercase();
+            !(s.is_empty() || s == "0" || s == "false" || s == "no" || s == "off")
+        })
+        .unwrap_or(false)
+}
+
+struct SparseRemlEvaluator {
+    n: usize,
+    p: usize,
+    rhs: Vec<f64>,
+    xt_vinv_y: Vec<f64>,
+    xt_vinv_x: Vec<f64>,
+    beta_hat: Vec<f64>,
+    solve_ws: Option<SparseJxgrmSolveWorkspace>,
+}
+
+impl SparseRemlEvaluator {
+    fn new(n: usize, p: usize) -> Self {
+        Self {
+            n,
+            p,
+            rhs: vec![0.0_f64; n.saturating_mul(p + 1)],
+            xt_vinv_y: vec![0.0_f64; p],
+            xt_vinv_x: vec![0.0_f64; p.saturating_mul(p)],
+            beta_hat: vec![0.0_f64; p],
+            solve_ws: None,
+        }
+    }
+
+    #[inline]
+    fn n_rhs(&self) -> usize {
+        self.p + 1
+    }
+
+    fn fill_rhs(&mut self, x_design: &[f64], y: &[f64]) {
+        self.rhs[..self.n].copy_from_slice(y);
+        for c in 0..self.p {
+            for i in 0..self.n {
+                self.rhs[(c + 1) * self.n + i] = x_design[i * self.p + c];
+            }
+        }
+    }
+
+    fn ensure_workspace<'a>(
+        &'a mut self,
+        factor: &SparseJxgrmCholesky,
+    ) -> Result<&'a mut SparseJxgrmSolveWorkspace, String> {
+        let need_rhs = self.n_rhs();
+        let needs_realloc = self
+            .solve_ws
+            .as_ref()
+            .map(|ws| ws.n_rhs_capacity() < need_rhs)
+            .unwrap_or(true);
+        if needs_realloc {
+            self.solve_ws = Some(factor.make_solve_workspace(need_rhs)?);
+        }
+        self.solve_ws
+            .as_mut()
+            .ok_or_else(|| "Sparse REML solve workspace allocation failed".to_string())
+    }
+
+    fn solve_rhs_in_place(&mut self, factor: &SparseJxgrmCholesky) -> Result<(), String> {
+        let n_rhs = self.n_rhs();
+        if self.rhs.len() != self.n.saturating_mul(n_rhs) {
+            return Err(format!(
+                "Sparse REML RHS length mismatch: got {}, expected {}",
+                self.rhs.len(),
+                self.n.saturating_mul(n_rhs)
+            ));
+        }
+        let mut rhs = std::mem::take(&mut self.rhs);
+        {
+            let solve_ws = self.ensure_workspace(factor)?;
+            factor.solve_in_place_with_workspace(&mut rhs, n_rhs, solve_ws)?;
+        }
+        self.rhs = rhs;
+        Ok(())
+    }
+}
+
+fn build_design_matrix(x_cov: Option<&[f64]>, n: usize, p0: usize) -> Result<Vec<f64>, String> {
+    if n == 0 {
+        return Err("JXREML requires n > 0".to_string());
+    }
+    let mut x = vec![0.0_f64; n * (p0 + 1)];
+    for i in 0..n {
+        x[i * (p0 + 1)] = 1.0;
+    }
+    if let Some(cov) = x_cov {
+        if cov.len() != n.saturating_mul(p0) {
+            return Err(format!(
+                "JXREML covariate length mismatch: got {}, expected {} for n={} and p0={}",
+                cov.len(),
+                n.saturating_mul(p0),
+                n,
+                p0
+            ));
+        }
+        for i in 0..n {
+            let src = &cov[i * p0..(i + 1) * p0];
+            let dst = &mut x[i * (p0 + 1) + 1..(i + 1) * (p0 + 1)];
+            dst.copy_from_slice(src);
+        }
+    }
+    Ok(x)
+}
+
+#[inline]
+fn spd_cholesky_with_jitter(matrix: &[f64], dim: usize, label: &str) -> Result<Vec<f64>, String> {
+    if dim == 0 {
+        return Err(format!("{label} requires dim > 0"));
+    }
+    if matrix.len() != dim * dim {
+        return Err(format!(
+            "{label} matrix length mismatch: got {}, expected {}",
+            matrix.len(),
+            dim * dim
+        ));
+    }
+    let mut chol = matrix.to_vec();
+    if cholesky_inplace(&mut chol, dim).is_some() {
+        return Ok(chol);
+    }
+    let trace = (0..dim).map(|i| matrix[i * dim + i].abs()).sum::<f64>();
+    let base = (trace / (dim.max(1) as f64)).max(1.0) * 1e-10_f64;
+    for k in 0..8 {
+        chol.copy_from_slice(matrix);
+        let jitter = base * 10.0_f64.powi(k);
+        for i in 0..dim {
+            chol[i * dim + i] += jitter;
+        }
+        if cholesky_inplace(&mut chol, dim).is_some() {
+            return Ok(chol);
+        }
+    }
+    Err(format!("{label} is not SPD even after diagonal jitter"))
+}
+
+fn xt_vec_row_major(x_row_major: &[f64], n: usize, p: usize, y: &[f64], out: &mut [f64]) {
+    out.fill(0.0);
+    for i in 0..n {
+        let x_row = &x_row_major[i * p..(i + 1) * p];
+        let yi = y[i];
+        for j in 0..p {
+            out[j] += x_row[j] * yi;
+        }
+    }
+}
+
+fn xt_mat_col_major_rhs(
+    x_row_major: &[f64],
+    rhs_col_major: &[f64],
+    n: usize,
+    p: usize,
+    out: &mut [f64],
+) {
+    out.fill(0.0);
+    for i in 0..n {
+        let x_row = &x_row_major[i * p..(i + 1) * p];
+        for c in 0..p {
+            let rhs_ic = rhs_col_major[c * n + i];
+            for r in 0..p {
+                out[r * p + c] += x_row[r] * rhs_ic;
+            }
+        }
+    }
+}
+
+fn evaluate_sparse_reml_at_lambda(
+    analysis: &SparseJxgrmCholeskyAnalysis,
+    x_design: &[f64],
+    y: &[f64],
+    log10_lambda: f64,
+    evaluator: &mut SparseRemlEvaluator,
+) -> Result<SparseRemlEval, String> {
+    let lambda = 10.0_f64.powf(log10_lambda);
+    if !lambda.is_finite() || lambda <= 0.0 {
+        return Err(format!(
+            "JXREML lambda is invalid at log10(lambda)={log10_lambda}"
+        ));
+    }
+    let n = y.len();
+    let p = x_design.len() / n;
+    if p == 0 || n <= p {
+        return Err(format!("JXREML requires n > p, got n={n}, p={p}"));
+    }
+    if evaluator.n != n || evaluator.p != p {
+        return Err(format!(
+            "JXREML evaluator shape mismatch: evaluator=({}, {}), data=({}, {})",
+            evaluator.n, evaluator.p, n, p
+        ));
+    }
+
+    let factor = analysis.factorize_k_plus_lambda_i(lambda)?;
+    evaluator.fill_rhs(x_design, y);
+    evaluator.solve_rhs_in_place(&factor)?;
+
+    let y_vinv = &evaluator.rhs[..n];
+    let x_vinv_col = &evaluator.rhs[n..];
+    let y_vinv_y = y.iter().zip(y_vinv.iter()).map(|(a, b)| a * b).sum::<f64>();
+
+    xt_vec_row_major(x_design, n, p, y_vinv, &mut evaluator.xt_vinv_y);
+
+    xt_mat_col_major_rhs(x_design, x_vinv_col, n, p, &mut evaluator.xt_vinv_x);
+    let xt_vinv_x_chol = spd_cholesky_with_jitter(&evaluator.xt_vinv_x, p, "JXREML XtVinvX")?;
+    cholesky_solve_into(
+        &xt_vinv_x_chol,
+        p,
+        &evaluator.xt_vinv_y,
+        &mut evaluator.beta_hat,
+    );
+
+    let ypy = y_vinv_y
+        - evaluator
+            .xt_vinv_y
+            .iter()
+            .zip(evaluator.beta_hat.iter())
+            .map(|(a, b)| a * b)
+            .sum::<f64>();
+    if !ypy.is_finite() || ypy <= JXREML_TINY {
+        return Err(format!(
+            "JXREML profiled residual quadratic form is invalid at lambda={lambda}: yPy={ypy}"
+        ));
+    }
+
+    let df = (n - p) as f64;
+    let sigma_g2 = ypy / df;
+    if !sigma_g2.is_finite() || sigma_g2 <= 0.0 {
+        return Err(format!(
+            "JXREML sigma_g2 is invalid at lambda={lambda}: sigma_g2={sigma_g2}"
+        ));
+    }
+    let sigma_e2 = lambda * sigma_g2;
+    let log_det_v = factor.logdet();
+    let log_det_xt_vinv_x = cholesky_logdet(&xt_vinv_x_chol, p);
+    let c_reml = df * (df.ln() - 1.0 - (2.0 * PI).ln()) * 0.5;
+    let reml = c_reml - 0.5 * (df * ypy.ln() + log_det_v + log_det_xt_vinv_x);
+    let n_f = n as f64;
+    let c_ml = n_f * (n_f.ln() - 1.0 - (2.0 * PI).ln()) * 0.5;
+    let ml = c_ml - 0.5 * (n_f * ypy.ln() + log_det_v);
+    if !reml.is_finite() || !ml.is_finite() {
+        return Err(format!(
+            "JXREML likelihood is invalid at lambda={lambda}: ml={ml}, reml={reml}"
+        ));
+    }
+
+    Ok(SparseRemlEval {
+        log10_lambda,
+        lambda,
+        sigma_g2,
+        sigma_e2,
+        ml,
+        reml,
+    })
+}
+
+fn sparse_reml_grid_search(
+    analysis: &SparseJxgrmCholeskyAnalysis,
+    x_design: &[f64],
+    y: &[f64],
+    low: f64,
+    high: f64,
+    grid_size: usize,
+) -> Result<SparseRemlSearchResult, String> {
+    if !low.is_finite() || !high.is_finite() || low >= high {
+        return Err(format!(
+            "JXREML grid search requires finite low < high, got low={low}, high={high}"
+        ));
+    }
+    let grid_n = grid_size.max(2);
+    let n = y.len();
+    let p = x_design.len() / n.max(1);
+    let mut evaluator = SparseRemlEvaluator::new(n, p);
+    let mut evals = Vec::<SparseRemlEval>::with_capacity(grid_n);
+    let mut best = None::<SparseRemlEval>;
+    let mut first_err = None::<String>;
+    for idx in 0..grid_n {
+        let t = if grid_n <= 1 {
+            0.0_f64
+        } else {
+            idx as f64 / (grid_n - 1) as f64
+        };
+        let log10_lambda = low + (high - low) * t;
+        match evaluate_sparse_reml_at_lambda(analysis, x_design, y, log10_lambda, &mut evaluator) {
+            Ok(eval) => {
+                if best
+                    .as_ref()
+                    .map(|cur| eval.reml > cur.reml)
+                    .unwrap_or(true)
+                {
+                    best = Some(eval.clone());
+                }
+                evals.push(eval);
+            }
+            Err(err) => {
+                if sparse_reml_debug_enabled() {
+                    eprintln!("JXREML grid eval failed at log10(lambda)={log10_lambda:.6e}: {err}");
+                }
+                if first_err.is_none() {
+                    first_err = Some(err);
+                }
+            }
+        }
+    }
+    let best = best.ok_or_else(|| match first_err {
+        Some(err) => format!(
+            "JXREML sparse grid search found no valid lambda in [{low}, {high}]; first failure: {err}"
+        ),
+        None => format!("JXREML sparse grid search found no valid lambda in [{low}, {high}]"),
+    })?;
+    Ok(SparseRemlSearchResult { best, grid: evals })
+}
+
+fn sparse_reml_grid_search_with_progress(
+    analysis: &SparseJxgrmCholeskyAnalysis,
+    x_design: &[f64],
+    y: &[f64],
+    low: f64,
+    high: f64,
+    grid_size: usize,
+    progress_callback: Option<&Py<PyAny>>,
+    progress_offset: usize,
+    progress_total: usize,
+) -> Result<SparseRemlSearchResult, String> {
+    if !low.is_finite() || !high.is_finite() || low >= high {
+        return Err(format!(
+            "JXREML grid search requires finite low < high, got low={low}, high={high}"
+        ));
+    }
+    let grid_n = grid_size.max(2);
+    let n = y.len();
+    let p = x_design.len() / n.max(1);
+    let mut evaluator = SparseRemlEvaluator::new(n, p);
+    let mut evals = Vec::<SparseRemlEval>::with_capacity(grid_n);
+    let mut best = None::<SparseRemlEval>;
+    let mut first_err = None::<String>;
+    for idx in 0..grid_n {
+        let t = if grid_n <= 1 {
+            0.0_f64
+        } else {
+            idx as f64 / (grid_n - 1) as f64
+        };
+        let log10_lambda = low + (high - low) * t;
+        match evaluate_sparse_reml_at_lambda(analysis, x_design, y, log10_lambda, &mut evaluator) {
+            Ok(eval) => {
+                if best
+                    .as_ref()
+                    .map(|cur| eval.reml > cur.reml)
+                    .unwrap_or(true)
+                {
+                    best = Some(eval.clone());
+                }
+                evals.push(eval);
+            }
+            Err(err) => {
+                if sparse_reml_debug_enabled() {
+                    eprintln!("JXREML grid eval failed at log10(lambda)={log10_lambda:.6e}: {err}");
+                }
+                if first_err.is_none() {
+                    first_err = Some(err);
+                }
+            }
+        }
+        emit_sparse_reml_progress(
+            progress_callback,
+            progress_offset.saturating_add(idx + 1),
+            progress_total,
+        )?;
+    }
+    let best = best.ok_or_else(|| match first_err {
+        Some(err) => format!(
+            "JXREML sparse grid search found no valid lambda in [{low}, {high}]; first failure: {err}"
+        ),
+        None => format!("JXREML sparse grid search found no valid lambda in [{low}, {high}]"),
+    })?;
+    Ok(SparseRemlSearchResult { best, grid: evals })
+}
+
+fn sparse_reml_brent_search_with_progress(
+    analysis: &SparseJxgrmCholeskyAnalysis,
+    x_design: &[f64],
+    y: &[f64],
+    low: f64,
+    high: f64,
+    grid_size: usize,
+    tol: f64,
+    max_iter: usize,
+    progress_callback: Option<&Py<PyAny>>,
+    progress_offset: usize,
+    progress_total: usize,
+) -> Result<SparseRemlSearchResult, String> {
+    if !(tol.is_finite() && tol > 0.0) {
+        return Err(format!(
+            "JXREML Brent tol must be finite and > 0, got {tol}"
+        ));
+    }
+    if max_iter == 0 {
+        return Err("JXREML Brent max_iter must be > 0".to_string());
+    }
+    let grid_n = grid_size.max(2);
+    let grid = sparse_reml_grid_search_with_progress(
+        analysis,
+        x_design,
+        y,
+        low,
+        high,
+        grid_size,
+        progress_callback,
+        progress_offset,
+        progress_total,
+    )?;
+    let init = Some(grid.best.log10_lambda);
+    let best_idx = grid
+        .grid
+        .iter()
+        .position(|eval| eval.log10_lambda == grid.best.log10_lambda)
+        .unwrap_or(0usize);
+    let brent_low = if best_idx > 0 {
+        grid.grid[best_idx - 1].log10_lambda
+    } else {
+        low
+    };
+    let brent_high = if best_idx + 1 < grid.grid.len() {
+        grid.grid[best_idx + 1].log10_lambda
+    } else {
+        high
+    };
+    let (brent_low, brent_high) =
+        if brent_low.is_finite() && brent_high.is_finite() && brent_low < brent_high {
+            (brent_low, brent_high)
+        } else {
+            (low, high)
+        };
+    let brent_budget = max_iter.max(1);
+    let brent_progress_err = RefCell::new(None::<String>);
+    let brent_eval_err = RefCell::new(None::<String>);
+    let n = y.len();
+    let p = x_design.len() / n.max(1);
+    let evaluator = RefCell::new(SparseRemlEvaluator::new(n, p));
+    let mut brent_done = 0usize;
+    let (best_log10, _cost) = brent_minimize_with_init(
+        |x0| {
+            if brent_progress_err.borrow().is_some() {
+                return 1e300_f64;
+            }
+            let cost = match evaluate_sparse_reml_at_lambda(
+                analysis,
+                x_design,
+                y,
+                x0,
+                &mut evaluator.borrow_mut(),
+            ) {
+                Ok(eval) => -eval.reml,
+                Err(err) => {
+                    if sparse_reml_debug_enabled() {
+                        eprintln!("JXREML Brent eval failed at log10(lambda)={x0:.6e}: {err}");
+                    }
+                    if brent_eval_err.borrow().is_none() {
+                        *brent_eval_err.borrow_mut() = Some(err);
+                    }
+                    1e300_f64
+                }
+            };
+            brent_done = (brent_done + 1).min(brent_budget);
+            if let Err(err) = emit_sparse_reml_progress(
+                progress_callback,
+                progress_offset
+                    .saturating_add(grid_n)
+                    .saturating_add(brent_done),
+                progress_total,
+            ) {
+                *brent_progress_err.borrow_mut() = Some(err);
+                return 1e300_f64;
+            }
+            cost
+        },
+        brent_low,
+        brent_high,
+        tol,
+        max_iter,
+        init,
+    );
+    if let Some(err) = brent_progress_err.into_inner() {
+        return Err(err);
+    }
+    let best_eval = evaluate_sparse_reml_at_lambda(
+        analysis,
+        x_design,
+        y,
+        best_log10,
+        &mut evaluator.into_inner(),
+    )
+    .map_err(|err| match brent_eval_err.into_inner() {
+        Some(first_err) => format!(
+            "JXREML Brent final evaluation failed at log10(lambda)={best_log10:.6e}: {err}; earlier failure: {first_err}"
+        ),
+        None => err,
+    })?;
+    Ok(SparseRemlSearchResult {
+        best: best_eval,
+        grid: grid.grid,
+    })
+}
+
+#[inline]
+fn emit_sparse_reml_progress(
+    cb: Option<&Py<PyAny>>,
+    done: usize,
+    total: usize,
+) -> Result<(), String> {
+    let total_use = total.max(1);
+    let done_use = done.min(total_use);
+    if let Some(cb) = cb {
+        Python::attach(|py| -> PyResult<()> {
+            py.check_signals()?;
+            cb.call1(py, (done_use, total_use))?;
+            Ok(())
+        })
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+fn load_subset_analysis_from_path(
+    path: &str,
+    sample_idx_raw: Option<&[i64]>,
+) -> Result<Arc<SparseJxgrmCholeskyAnalysis>, String> {
+    let sample_idx_vec = if let Some(raw) = sample_idx_raw {
+        let n_samples = sparse_jxgrm_header_n_samples(path)?;
+        Some(parse_index_vec_i64(raw, n_samples, "sample_indices").map_err(|e| e.to_string())?)
+    } else {
+        None
+    };
+    sparse_cholesky_analyze_subset_jxgrm_path_cached(path, sample_idx_vec.as_deref())
+}
+
+fn result_to_tuple(
+    result: SparseRemlSearchResult,
+) -> (
+    f64,
+    f64,
+    f64,
+    f64,
+    f64,
+    f64,
+    Vec<f64>,
+    Vec<f64>,
+    Vec<f64>,
+    Vec<f64>,
+) {
+    let mut grid_log10 = Vec::with_capacity(result.grid.len());
+    let mut grid_reml = Vec::with_capacity(result.grid.len());
+    let mut grid_sigma_g2 = Vec::with_capacity(result.grid.len());
+    let mut grid_sigma_e2 = Vec::with_capacity(result.grid.len());
+    for eval in result.grid.iter() {
+        grid_log10.push(eval.log10_lambda);
+        grid_reml.push(eval.reml);
+        grid_sigma_g2.push(eval.sigma_g2);
+        grid_sigma_e2.push(eval.sigma_e2);
+    }
+    (
+        result.best.lambda,
+        result.best.sigma_g2,
+        result.best.sigma_e2,
+        result.best.ml,
+        result.best.reml,
+        result.best.log10_lambda,
+        grid_log10,
+        grid_reml,
+        grid_sigma_g2,
+        grid_sigma_e2,
+    )
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    jxgrm_path,
+    y,
+    x_cov=None,
+    sample_indices=None,
+    low=-5.0,
+    high=5.0,
+    grid_size=33
+))]
+pub fn jxreml_sparse_reml_grid_from_jxgrm<'py>(
+    py: Python<'py>,
+    jxgrm_path: String,
+    y: PyReadonlyArray1<'py, f64>,
+    x_cov: Option<PyReadonlyArray2<'py, f64>>,
+    sample_indices: Option<PyReadonlyArray1<'py, i64>>,
+    low: f64,
+    high: f64,
+    grid_size: usize,
+) -> PyResult<(
+    f64,
+    f64,
+    f64,
+    f64,
+    f64,
+    f64,
+    Vec<f64>,
+    Vec<f64>,
+    Vec<f64>,
+    Vec<f64>,
+)> {
+    let y_vec = y
+        .as_slice()
+        .map_err(|_| PyRuntimeError::new_err("y must be contiguous"))?
+        .to_vec();
+    let n = y_vec.len();
+    let x_cov_buf: Option<(Vec<f64>, usize)> = if let Some(x) = x_cov {
+        let xa = x.as_array();
+        if xa.ndim() != 2 || xa.shape()[0] != n {
+            return Err(PyRuntimeError::new_err(format!(
+                "x_cov shape mismatch: got {:?}, expected ({n}, p)",
+                xa.shape()
+            )));
+        }
+        let p0 = xa.shape()[1];
+        let xs = x
+            .as_slice()
+            .map_err(|_| PyRuntimeError::new_err("x_cov must be contiguous (C-order)"))?
+            .to_vec();
+        Some((xs, p0))
+    } else {
+        None
+    };
+    let sample_idx_raw = if let Some(sidx) = sample_indices {
+        Some(sidx.as_slice()?.to_vec())
+    } else {
+        None
+    };
+
+    py.detach(move || {
+        let analysis = load_subset_analysis_from_path(&jxgrm_path, sample_idx_raw.as_deref())?;
+        if analysis.dim() != y_vec.len() {
+            return Err(format!(
+                "JXREML subset sample size mismatch: sparse n={}, phenotype n={}",
+                analysis.dim(),
+                y_vec.len()
+            ));
+        }
+        let (x_cov_slice, p0) = match x_cov_buf.as_ref() {
+            Some((buf, p)) => (Some(buf.as_slice()), *p),
+            None => (None, 0usize),
+        };
+        let x_design = build_design_matrix(x_cov_slice, y_vec.len(), p0)?;
+        let result = sparse_reml_grid_search(&analysis, &x_design, &y_vec, low, high, grid_size)?;
+        Ok(result_to_tuple(result))
+    })
+    .map_err(map_err_string_to_py)
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    jxgrm_path,
+    y,
+    x_cov=None,
+    sample_indices=None,
+    low=-5.0,
+    high=5.0,
+    grid_size=9,
+    tol=1e-3,
+    max_iter=20,
+    progress_callback=None
+))]
+pub fn jxreml_sparse_reml_brent_from_jxgrm<'py>(
+    py: Python<'py>,
+    jxgrm_path: String,
+    y: PyReadonlyArray1<'py, f64>,
+    x_cov: Option<PyReadonlyArray2<'py, f64>>,
+    sample_indices: Option<PyReadonlyArray1<'py, i64>>,
+    low: f64,
+    high: f64,
+    grid_size: usize,
+    tol: f64,
+    max_iter: usize,
+    progress_callback: Option<Py<PyAny>>,
+) -> PyResult<(
+    f64,
+    f64,
+    f64,
+    f64,
+    f64,
+    f64,
+    Vec<f64>,
+    Vec<f64>,
+    Vec<f64>,
+    Vec<f64>,
+)> {
+    let y_vec = y
+        .as_slice()
+        .map_err(|_| PyRuntimeError::new_err("y must be contiguous"))?
+        .to_vec();
+    let n = y_vec.len();
+    let x_cov_buf: Option<(Vec<f64>, usize)> = if let Some(x) = x_cov {
+        let xa = x.as_array();
+        if xa.ndim() != 2 || xa.shape()[0] != n {
+            return Err(PyRuntimeError::new_err(format!(
+                "x_cov shape mismatch: got {:?}, expected ({n}, p)",
+                xa.shape()
+            )));
+        }
+        let p0 = xa.shape()[1];
+        let xs = x
+            .as_slice()
+            .map_err(|_| PyRuntimeError::new_err("x_cov must be contiguous (C-order)"))?
+            .to_vec();
+        Some((xs, p0))
+    } else {
+        None
+    };
+    let sample_idx_raw = if let Some(sidx) = sample_indices {
+        Some(sidx.as_slice()?.to_vec())
+    } else {
+        None
+    };
+
+    py.detach(move || {
+        let total_progress = 1usize
+            .saturating_add(grid_size.max(2))
+            .saturating_add(max_iter.max(1));
+        emit_sparse_reml_progress(progress_callback.as_ref(), 0, total_progress)?;
+        let analysis = load_subset_analysis_from_path(&jxgrm_path, sample_idx_raw.as_deref())?;
+        emit_sparse_reml_progress(progress_callback.as_ref(), 1, total_progress)?;
+        if analysis.dim() != y_vec.len() {
+            return Err(format!(
+                "JXREML subset sample size mismatch: sparse n={}, phenotype n={}",
+                analysis.dim(),
+                y_vec.len()
+            ));
+        }
+        let (x_cov_slice, p0) = match x_cov_buf.as_ref() {
+            Some((buf, p)) => (Some(buf.as_slice()), *p),
+            None => (None, 0usize),
+        };
+        let x_design = build_design_matrix(x_cov_slice, y_vec.len(), p0)?;
+        let result = sparse_reml_brent_search_with_progress(
+            &analysis,
+            &x_design,
+            &y_vec,
+            low,
+            high,
+            grid_size,
+            tol,
+            max_iter,
+            progress_callback.as_ref(),
+            1,
+            total_progress,
+        )?;
+        emit_sparse_reml_progress(progress_callback.as_ref(), total_progress, total_progress)?;
+        Ok(result_to_tuple(result))
+    })
+    .map_err(map_err_string_to_py)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cholesky::sparse_cholesky_analyze_jxgrm_csc;
+    use crate::spgrm::SparseGrmCsc;
+
+    #[test]
+    fn sparse_reml_grid_runs_on_small_csc() {
+        let csc = SparseGrmCsc {
+            n_samples: 3,
+            nnz: 5,
+            col_ptr: vec![0, 2, 4, 5],
+            row_indices: vec![0, 1, 1, 2, 2],
+            values: vec![1.0, 0.2, 1.0, 0.1, 1.0],
+        };
+        let analysis = sparse_cholesky_analyze_jxgrm_csc(&csc).unwrap();
+        let y = vec![1.0, 0.5, -0.3];
+        let x = build_design_matrix(None, 3, 0).unwrap();
+        let res = sparse_reml_grid_search(&analysis, &x, &y, -3.0, 2.0, 9).unwrap();
+        assert!(res.best.lambda.is_finite() && res.best.lambda > 0.0);
+        assert!(res.best.sigma_g2.is_finite() && res.best.sigma_g2 > 0.0);
+        assert!(!res.grid.is_empty());
+    }
+}

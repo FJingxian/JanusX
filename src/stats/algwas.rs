@@ -14,8 +14,11 @@ use std::io::{BufWriter, Write};
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use crate::active_path::{
+    run_active_kkt_path, validate_active_path_state, ActivePathSolveConfig, ActivePathState,
+};
 use crate::bedmath::{
     adaptive_grm_block_rows, decode_plink_bed_hardcall, decode_row_centered_full_lut_f64,
     decode_standardized_packed_block_rows_f32, is_identity_indices, packed_byte_lut,
@@ -27,7 +30,7 @@ use crate::blas::{
 use crate::he::build_row_standardization_stats;
 use crate::linalg::{chi2_sf_df1, chi2_stat_df1_from_sf, format_chisq_value};
 use crate::math_farmcpu::decode_packed_rows_to_sample_major;
-use crate::pcg::pcg_solve_f64_with_guess_into;
+use crate::pcg::{pcg_solve, IdentityPreconditioner, PcgOperator};
 use crate::stats_common::{get_cached_pool, parse_index_vec_i64};
 
 const DEFAULT_STANDARDIZE_EPS32: f32 = 1e-12_f32;
@@ -42,9 +45,11 @@ const DEFAULT_STAGE1_ALASSO_WEIGHT_FLOOR: f32 = 1e-8_f32;
 const DEFAULT_STAGE1_ALASSO_WEIGHT_CAP: f32 = 1e8_f32;
 const DEFAULT_STAGE1_ALASSO_WEIGHT_SCREEN: usize = 4096usize;
 const DEFAULT_STAGE1_ALASSO_INITIAL_WORKING_SET: usize = 4096usize;
+const DEFAULT_STAGE1_ALASSO_STRONG_SET: usize = 16384usize;
 const DEFAULT_STAGE1_ALASSO_PCG_MAX_ITERS: usize = 64usize;
 const DEFAULT_STAGE1_ALASSO_PCG_TOL: f64 = 1e-5_f64;
 const DEFAULT_STAGE1_ALASSO_DENSE_WEIGHT_MAX_CELLS: usize = 32_000_000usize;
+const DEFAULT_STAGE1_EBIC_GAMMA: f64 = 0.5_f64;
 const DEFAULT_STAGE1_MSGPS_STEP: usize = 20_000usize;
 const DEFAULT_STAGE1_MSGPS_STEP_MAX: usize = 200_000usize;
 const DEFAULT_STAGE1_MSGPS_PMAX: usize = 300usize;
@@ -74,7 +79,8 @@ fn algwas_stage1_mode() -> AlgwasStage1Mode {
 fn algwas_stage1_mode_from_raw(raw: Option<&str>) -> AlgwasStage1Mode {
     let raw = raw.unwrap_or("").trim().to_ascii_lowercase();
     match raw.as_str() {
-        "" | "auto" => AlgwasStage1Mode::Auto,
+        "" => AlgwasStage1Mode::StreamActive,
+        "auto" => AlgwasStage1Mode::Auto,
         "dense" | "msgps" => AlgwasStage1Mode::DenseMsgps,
         "stream" | "approx" | "active" => AlgwasStage1Mode::StreamActive,
         "packed" | "exact" | "packed_exact" | "exact_packed" => AlgwasStage1Mode::PackedExactMsgps,
@@ -136,6 +142,49 @@ fn algwas_stage1_dense_weights_enabled() -> bool {
             !matches!(raw.as_str(), "0" | "false" | "no" | "off")
         }
         Err(_) => false,
+    }
+}
+
+#[inline]
+fn algwas_stage1_timing_enabled() -> bool {
+    env_var_truthy("JX_ALGWAS_STAGE1_TIMING")
+}
+
+#[inline]
+fn algwas_stage1_ebic_gamma() -> f64 {
+    std::env::var("JX_ALGWAS_STAGE1_EBIC_GAMMA")
+        .ok()
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0_f64)
+        .unwrap_or(DEFAULT_STAGE1_EBIC_GAMMA)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AlgwasStage1SelectCriterion {
+    Ebic,
+    Bic,
+}
+
+#[inline]
+fn algwas_stage1_select_criterion() -> AlgwasStage1SelectCriterion {
+    match std::env::var("JX_ALGWAS_STAGE1_SELECT") {
+        Ok(v) => {
+            let raw = v.trim().to_ascii_lowercase();
+            match raw.as_str() {
+                "" | "bic" => AlgwasStage1SelectCriterion::Bic,
+                "ebic" => AlgwasStage1SelectCriterion::Ebic,
+                _ => AlgwasStage1SelectCriterion::Bic,
+            }
+        }
+        Err(_) => AlgwasStage1SelectCriterion::Bic,
+    }
+}
+
+#[inline]
+fn algwas_stage1_select_criterion_label(criterion: AlgwasStage1SelectCriterion) -> &'static str {
+    match criterion {
+        AlgwasStage1SelectCriterion::Ebic => "EBIC",
+        AlgwasStage1SelectCriterion::Bic => "BIC",
     }
 }
 
@@ -220,6 +269,216 @@ fn dot_f32_f64(a: &[f32], b: &[f32], pool: Option<&Arc<rayon::ThreadPool>>) -> f
 }
 
 #[inline]
+fn log_choose_ln(n: usize, k: usize) -> f64 {
+    if k == 0 || k >= n {
+        return 0.0_f64;
+    }
+    let k_eff = k.min(n - k);
+    libm::lgamma((n + 1) as f64)
+        - libm::lgamma((k_eff + 1) as f64)
+        - libm::lgamma((n - k_eff + 1) as f64)
+}
+
+#[inline]
+fn algwas_bic_from_rss_df(n: usize, rss: f64, df: f64) -> f64 {
+    (n as f64) * (rss.max(1e-12_f64) / n as f64).ln() + df * (n as f64).ln()
+}
+
+#[inline]
+fn algwas_ebic_from_bic(bic: f64, n_features: usize, nnz: usize, gamma: f64) -> f64 {
+    bic + 2.0_f64 * gamma.max(0.0_f64) * log_choose_ln(n_features, nnz)
+}
+
+#[inline]
+fn algwas_stage1_path_score(
+    point: &AlgwasStage1PathPoint,
+    criterion: AlgwasStage1SelectCriterion,
+) -> f64 {
+    match criterion {
+        AlgwasStage1SelectCriterion::Ebic => point.ebic,
+        AlgwasStage1SelectCriterion::Bic => point.bic,
+    }
+}
+
+#[inline]
+fn best_stage1_path_index(
+    path: &[AlgwasStage1PathPoint],
+    criterion: AlgwasStage1SelectCriterion,
+) -> usize {
+    path.iter()
+        .enumerate()
+        .min_by(|a, b| {
+            algwas_stage1_path_score(a.1, criterion)
+                .total_cmp(&algwas_stage1_path_score(b.1, criterion))
+        })
+        .map(|(idx, _)| idx)
+        .unwrap_or(0usize)
+}
+
+#[inline]
+fn validate_finite_slice_f32(name: &str, x: &[f32]) -> Result<(), String> {
+    if x.iter().any(|v| !v.is_finite()) {
+        return Err(format!("{name} contains non-finite values"));
+    }
+    Ok(())
+}
+
+#[inline]
+fn standardized_value_lut_algwas(row_flip: bool, mean_g: f32, inv_sd: f32) -> [f32; 4] {
+    if row_flip {
+        [
+            (2.0_f32 - mean_g) * inv_sd,
+            0.0_f32,
+            (1.0_f32 - mean_g) * inv_sd,
+            (0.0_f32 - mean_g) * inv_sd,
+        ]
+    } else {
+        [
+            (0.0_f32 - mean_g) * inv_sd,
+            0.0_f32,
+            (1.0_f32 - mean_g) * inv_sd,
+            (2.0_f32 - mean_g) * inv_sd,
+        ]
+    }
+}
+
+#[inline]
+fn packed_row_standardized_dot_full_algwas(
+    row: &[u8],
+    n_samples: usize,
+    sample_vec: &[f32],
+    value_lut: &[f32; 4],
+    code4_lut: &[[u8; 4]; 256],
+) -> f64 {
+    let full_bytes = n_samples / 4;
+    let rem = n_samples % 4;
+    let mut sum = 0.0_f64;
+    let mut col = 0usize;
+    for &b in row.iter().take(full_bytes) {
+        let codes = &code4_lut[b as usize];
+        sum += (value_lut[codes[0] as usize] as f64) * (sample_vec[col] as f64);
+        sum += (value_lut[codes[1] as usize] as f64) * (sample_vec[col + 1] as f64);
+        sum += (value_lut[codes[2] as usize] as f64) * (sample_vec[col + 2] as f64);
+        sum += (value_lut[codes[3] as usize] as f64) * (sample_vec[col + 3] as f64);
+        col += 4;
+    }
+    if rem > 0 {
+        let codes = &code4_lut[row[full_bytes] as usize];
+        for lane in 0..rem {
+            sum += (value_lut[codes[lane] as usize] as f64) * (sample_vec[col + lane] as f64);
+        }
+    }
+    sum
+}
+
+#[inline]
+fn packed_row_standardized_dot_selected_algwas(
+    row: &[u8],
+    sample_idx: &[usize],
+    sample_vec: &[f32],
+    value_lut: &[f32; 4],
+) -> f64 {
+    let mut sum = 0.0_f64;
+    for (local_i, &sid) in sample_idx.iter().enumerate() {
+        let code = (row[sid >> 2] >> ((sid & 3) * 2)) & 0b11;
+        sum += (value_lut[code as usize] as f64) * (sample_vec[local_i] as f64);
+    }
+    sum
+}
+
+#[inline]
+fn packed_row_standardized_sum_full_algwas(
+    row: &[u8],
+    n_samples: usize,
+    value_lut: &[f32; 4],
+    code4_lut: &[[u8; 4]; 256],
+) -> f64 {
+    let full_bytes = n_samples / 4;
+    let rem = n_samples % 4;
+    let mut sum = 0.0_f64;
+    for &b in row.iter().take(full_bytes) {
+        let codes = &code4_lut[b as usize];
+        sum += value_lut[codes[0] as usize] as f64;
+        sum += value_lut[codes[1] as usize] as f64;
+        sum += value_lut[codes[2] as usize] as f64;
+        sum += value_lut[codes[3] as usize] as f64;
+    }
+    if rem > 0 {
+        let codes = &code4_lut[row[full_bytes] as usize];
+        for lane in 0..rem {
+            sum += value_lut[codes[lane] as usize] as f64;
+        }
+    }
+    sum
+}
+
+#[inline]
+fn packed_row_standardized_sum_selected_algwas(
+    row: &[u8],
+    sample_idx: &[usize],
+    value_lut: &[f32; 4],
+) -> f64 {
+    let mut sum = 0.0_f64;
+    for &sid in sample_idx {
+        let code = (row[sid >> 2] >> ((sid & 3) * 2)) & 0b11;
+        sum += value_lut[code as usize] as f64;
+    }
+    sum
+}
+
+#[inline]
+fn packed_row_standardized_sumsq_full_algwas(
+    row: &[u8],
+    n_samples: usize,
+    value_lut: &[f32; 4],
+    code4_lut: &[[u8; 4]; 256],
+) -> f64 {
+    let full_bytes = n_samples / 4;
+    let rem = n_samples % 4;
+    let value_sq = [
+        (value_lut[0] as f64) * (value_lut[0] as f64),
+        0.0_f64,
+        (value_lut[2] as f64) * (value_lut[2] as f64),
+        (value_lut[3] as f64) * (value_lut[3] as f64),
+    ];
+    let mut sum = 0.0_f64;
+    for &b in row.iter().take(full_bytes) {
+        let codes = &code4_lut[b as usize];
+        sum += value_sq[codes[0] as usize];
+        sum += value_sq[codes[1] as usize];
+        sum += value_sq[codes[2] as usize];
+        sum += value_sq[codes[3] as usize];
+    }
+    if rem > 0 {
+        let codes = &code4_lut[row[full_bytes] as usize];
+        for lane in 0..rem {
+            sum += value_sq[codes[lane] as usize];
+        }
+    }
+    sum
+}
+
+#[inline]
+fn packed_row_standardized_sumsq_selected_algwas(
+    row: &[u8],
+    sample_idx: &[usize],
+    value_lut: &[f32; 4],
+) -> f64 {
+    let value_sq = [
+        (value_lut[0] as f64) * (value_lut[0] as f64),
+        0.0_f64,
+        (value_lut[2] as f64) * (value_lut[2] as f64),
+        (value_lut[3] as f64) * (value_lut[3] as f64),
+    ];
+    let mut sum = 0.0_f64;
+    for &sid in sample_idx {
+        let code = (row[sid >> 2] >> ((sid & 3) * 2)) & 0b11;
+        sum += value_sq[code as usize];
+    }
+    sum
+}
+
+#[inline]
 fn dot_f64(a: &[f64], b: &[f64]) -> f64 {
     debug_assert_eq!(a.len(), b.len());
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
@@ -268,6 +527,7 @@ fn soft_threshold(v: f32, thr: f32) -> f32 {
     }
 }
 
+#[allow(dead_code)]
 #[inline]
 fn row_major_block_mul_vec_f32(
     block: &[f32],
@@ -1594,6 +1854,21 @@ fn algwas_stage1_initial_working_set_cap(n_features: usize) -> usize {
     env_cap.min(n_features)
 }
 
+#[inline]
+fn algwas_stage1_strong_set_cap(n_features: usize, active_cap: usize, active_len: usize) -> usize {
+    if n_features == 0 || active_len >= active_cap {
+        return 0usize;
+    }
+    let env_cap = std::env::var("JX_ALGWAS_STAGE1_STRONG_SET")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(DEFAULT_STAGE1_ALASSO_STRONG_SET);
+    env_cap
+        .min(active_cap.saturating_sub(active_len))
+        .min(n_features.saturating_sub(active_len))
+}
+
 fn top_feature_indices_by_score(scores: &[f32], k: usize) -> Vec<usize> {
     if k == 0 || scores.is_empty() {
         return Vec::new();
@@ -1677,14 +1952,67 @@ fn select_stage1_lm_screen_rows(xty: &[f32], diag_xtx: &[f32], cap: usize) -> Ve
     out
 }
 
-fn compute_msgps_alasso_penalty_weights(
+fn select_stage1_strong_rule_rows(
+    last_grad: &[f32],
+    active_mask: &[bool],
+    penalty_weights: &[f32],
+    prev_lambda: f32,
+    next_lambda: f32,
+    cap: usize,
+) -> Vec<usize> {
+    if cap == 0
+        || last_grad.is_empty()
+        || active_mask.len() != last_grad.len()
+        || penalty_weights.len() != last_grad.len()
+        || !prev_lambda.is_finite()
+        || !next_lambda.is_finite()
+        || next_lambda >= prev_lambda
+    {
+        return Vec::new();
+    }
+    let strong_thr = (2.0_f32 * next_lambda - prev_lambda).max(0.0_f32);
+    let mut heap = BinaryHeap::<Reverse<(F32TotalOrd, usize)>>::with_capacity(cap + 1);
+    for j in 0..last_grad.len() {
+        if active_mask[j] {
+            continue;
+        }
+        let w = penalty_weights[j].max(1e-12_f32);
+        let score = last_grad[j].abs() / w;
+        if !score.is_finite() || score <= strong_thr {
+            continue;
+        }
+        let item = Reverse((F32TotalOrd(score), j));
+        if heap.len() < cap {
+            heap.push(item);
+        } else if let Some(peek) = heap.peek() {
+            if item.0 .0 > peek.0 .0 {
+                let _ = heap.pop();
+                heap.push(item);
+            }
+        }
+    }
+    let mut out = Vec::<usize>::with_capacity(heap.len());
+    while let Some(Reverse((_score, idx))) = heap.pop() {
+        out.push(idx);
+    }
+    out.sort_unstable_by(|&a, &b| {
+        let wa = penalty_weights[a].max(1e-12_f32);
+        let wb = penalty_weights[b].max(1e-12_f32);
+        let sa = last_grad[a].abs() / wa;
+        let sb = last_grad[b].abs() / wb;
+        sb.total_cmp(&sa)
+    });
+    out
+}
+
+fn compute_msgps_alasso_init(
     design: &AlgwasPackedDesign<'_>,
     proj: &CovariateProjection,
     y_resid: &[f32],
     diag_xtx: &[f32],
     xty_hint: Option<&[f32]>,
     cfg: &AlgwasConfig,
-) -> Result<Vec<f32>, String> {
+) -> Result<AlgwasStage1AdaptiveInit, String> {
     let n_features = design.n_features();
     if y_resid.len() != design.n_samples() {
         return Err("alasso weight residual length mismatch".to_string());
@@ -1733,16 +2061,25 @@ fn compute_msgps_alasso_penalty_weights(
         let beta = x * alpha;
         let gamma = DEFAULT_STAGE1_ALASSO_GAMMA.max(1e-6_f32) as f64;
         let mut weights = vec![0.0_f32; n_features];
+        let mut beta_init = vec![0.0_f32; n_features];
         for j in 0..n_features {
             let b = beta[j].abs().max(DEFAULT_STAGE1_ALASSO_WEIGHT_FLOOR as f64);
             let w = b.powf(-gamma);
+            beta_init[j] = if beta[j].is_finite() {
+                beta[j] as f32
+            } else {
+                0.0_f32
+            };
             weights[j] = if w.is_finite() {
                 (w as f32).min(DEFAULT_STAGE1_ALASSO_WEIGHT_CAP)
             } else {
                 DEFAULT_STAGE1_ALASSO_WEIGHT_CAP
             };
         }
-        return Ok(weights);
+        return Ok(AlgwasStage1AdaptiveInit {
+            penalty_weights: weights,
+            beta_init,
+        });
     }
 
     let rhs_owned;
@@ -1802,15 +2139,31 @@ fn compute_msgps_alasso_penalty_weights(
             DEFAULT_STAGE1_ALASSO_WEIGHT_CAP
         };
     }
-    Ok(weights)
+    for bj in &mut beta0 {
+        if !bj.is_finite() {
+            *bj = 0.0_f32;
+        }
+    }
+    Ok(AlgwasStage1AdaptiveInit {
+        penalty_weights: weights,
+        beta_init: beta0,
+    })
+}
+
+#[derive(Clone, Debug)]
+struct AlgwasStage1AdaptiveInit {
+    penalty_weights: Vec<f32>,
+    beta_init: Vec<f32>,
 }
 
 #[derive(Clone, Debug)]
 pub struct AlgwasStage1PathPoint {
     pub lambda: f32,
     pub bic: f64,
+    pub ebic: f64,
     pub rss: f64,
     pub nnz: usize,
+    pub df: f64,
     pub converged: bool,
 }
 
@@ -1820,9 +2173,19 @@ pub struct AlgwasStage1Result {
     pub beta: Vec<f32>,
     pub lambda_best: f32,
     pub bic_best: f64,
+    pub ebic_best: f64,
+    pub best_step: usize,
     pub path: Vec<AlgwasStage1PathPoint>,
     pub converged: bool,
 }
+
+#[derive(Clone, Debug)]
+struct AlgwasStage1Aux {
+    last_kkt_grad: Option<Vec<f32>>,
+    last_lambda: Option<f32>,
+}
+
+type AlgwasStage1WarmState = ActivePathState<AlgwasStage1Aux>;
 
 #[derive(Clone, Debug)]
 pub struct AlgwasConfig {
@@ -2008,6 +2371,79 @@ struct AlgwasPackedDesign<'a> {
 }
 
 impl<'a> AlgwasPackedDesign<'a> {
+    #[inline]
+    fn standardized_row_value_lut(&self, row_idx: usize) -> [f32; 4] {
+        standardized_value_lut_algwas(
+            self.row_flip[row_idx],
+            self.row_mean[row_idx],
+            self.row_inv_sd[row_idx],
+        )
+    }
+
+    #[inline]
+    fn packed_row_slice(&self, row_idx: usize) -> &[u8] {
+        let packed_idx = self
+            .row_indices
+            .as_ref()
+            .map(|v| v[row_idx])
+            .unwrap_or(row_idx);
+        &self.packed[packed_idx * self.bytes_per_snp..(packed_idx + 1) * self.bytes_per_snp]
+    }
+
+    #[inline]
+    fn standardized_row_dot_into(
+        &self,
+        row_idx: usize,
+        sample_vec: &[f32],
+        code4_lut: &[[u8; 4]; 256],
+    ) -> f64 {
+        let row = self.packed_row_slice(row_idx);
+        let value_lut = self.standardized_row_value_lut(row_idx);
+        if self.full_sample_fast {
+            packed_row_standardized_dot_full_algwas(
+                row,
+                self.n_samples_used,
+                sample_vec,
+                &value_lut,
+                code4_lut,
+            )
+        } else {
+            packed_row_standardized_dot_selected_algwas(
+                row,
+                &self.sample_idx,
+                sample_vec,
+                &value_lut,
+            )
+        }
+    }
+
+    #[inline]
+    fn standardized_row_sum_sumsq(&self, row_idx: usize, code4_lut: &[[u8; 4]; 256]) -> (f64, f64) {
+        let row = self.packed_row_slice(row_idx);
+        let value_lut = self.standardized_row_value_lut(row_idx);
+        if self.full_sample_fast {
+            (
+                packed_row_standardized_sum_full_algwas(
+                    row,
+                    self.n_samples_used,
+                    &value_lut,
+                    code4_lut,
+                ),
+                packed_row_standardized_sumsq_full_algwas(
+                    row,
+                    self.n_samples_used,
+                    &value_lut,
+                    code4_lut,
+                ),
+            )
+        } else {
+            (
+                packed_row_standardized_sum_selected_algwas(row, &self.sample_idx, &value_lut),
+                packed_row_standardized_sumsq_selected_algwas(row, &self.sample_idx, &value_lut),
+            )
+        }
+    }
+
     fn from_parts(
         packed: Cow<'a, [u8]>,
         n_samples_full: usize,
@@ -2322,29 +2758,65 @@ impl<'a> AlgwasPackedDesign<'a> {
         if y_resid.len() != self.n_samples_used {
             return Err("residualized response length mismatch".to_string());
         }
+        validate_finite_slice_f32("residualized response", y_resid)?;
+        let code4_lut = &packed_byte_lut().code4;
+        let row_step = self.block_rows.max(1);
         let mut out = vec![0.0_f32; self.n_features];
-        let mut block = vec![0.0_f32; self.block_rows * self.n_samples_used];
-        let mut tmp = vec![0.0_f32; self.block_rows];
-        let mut row_ids = Vec::<usize>::with_capacity(self.block_rows);
-        for row_start in (0..self.n_features).step_by(self.block_rows) {
-            let row_end = (row_start + self.block_rows).min(self.n_features);
-            let rows = row_end - row_start;
-            fill_contiguous_row_ids(&mut row_ids, row_start, row_end);
-            self.decode_rows_standardized_into(&row_ids, &mut block[..rows * self.n_samples_used])?;
-            row_major_block_mul_vec_f32(
-                &block[..rows * self.n_samples_used],
-                rows,
-                self.n_samples_used,
-                y_resid,
-                &mut tmp[..rows],
-                self.pool.as_ref(),
-            );
-            out[row_start..row_end].copy_from_slice(&tmp[..rows]);
+        if let Some(tp) = self.pool.as_ref() {
+            tp.install(|| {
+                out.par_chunks_mut(row_step)
+                    .enumerate()
+                    .for_each(|(chunk_idx, out_chunk)| {
+                        let row_start = chunk_idx * row_step;
+                        for (local_row, dst) in out_chunk.iter_mut().enumerate() {
+                            let row_idx = row_start + local_row;
+                            if row_idx >= self.n_features {
+                                break;
+                            }
+                            *dst =
+                                self.standardized_row_dot_into(row_idx, y_resid, code4_lut) as f32;
+                        }
+                    });
+            });
+        } else {
+            for row_idx in 0..self.n_features {
+                out[row_idx] = self.standardized_row_dot_into(row_idx, y_resid, code4_lut) as f32;
+            }
         }
         Ok(out)
     }
 
     fn diag_xtx_residualized(&self, proj: &CovariateProjection) -> Result<Vec<f32>, String> {
+        if proj.is_intercept_only() {
+            let code4_lut = &packed_byte_lut().code4;
+            let row_step = self.block_rows.max(1);
+            let mut out = vec![0.0_f32; self.n_features];
+            if let Some(tp) = self.pool.as_ref() {
+                tp.install(|| {
+                    out.par_chunks_mut(row_step)
+                        .enumerate()
+                        .for_each(|(chunk_idx, out_chunk)| {
+                            let row_start = chunk_idx * row_step;
+                            for (local_row, dst) in out_chunk.iter_mut().enumerate() {
+                                let row_idx = row_start + local_row;
+                                if row_idx >= self.n_features {
+                                    break;
+                                }
+                                let (row_sum, row_ss) =
+                                    self.standardized_row_sum_sumsq(row_idx, code4_lut);
+                                *dst =
+                                    (row_ss - row_sum * row_sum * proj.inv_n).max(1e-12_f64) as f32;
+                            }
+                        });
+                });
+            } else {
+                for (row_idx, dst) in out.iter_mut().enumerate() {
+                    let (row_sum, row_ss) = self.standardized_row_sum_sumsq(row_idx, code4_lut);
+                    *dst = (row_ss - row_sum * row_sum * proj.inv_n).max(1e-12_f64) as f32;
+                }
+            }
+            return Ok(out);
+        }
         let mut out = vec![0.0_f32; self.n_features];
         let mut block = vec![0.0_f32; self.block_rows * self.n_samples_used];
         let mut row_ids = Vec::<usize>::with_capacity(self.block_rows);
@@ -2405,6 +2877,89 @@ impl<'a> AlgwasPackedDesign<'a> {
         Ok(out)
     }
 
+    fn scan_kkt_violators_bitwise_orthogonal(
+        &self,
+        residual: &[f32],
+        active_mask: &[bool],
+        penalty_weights: &[f32],
+        lambda: f32,
+        kkt_tol: f32,
+    ) -> Result<(Vec<usize>, Vec<f32>), String> {
+        if residual.len() != self.n_samples_used {
+            return Err(format!(
+                "residual length mismatch: got {}, expected {}",
+                residual.len(),
+                self.n_samples_used
+            ));
+        }
+        if active_mask.len() != self.n_features {
+            return Err(format!(
+                "active_mask length mismatch: got {}, expected {}",
+                active_mask.len(),
+                self.n_features
+            ));
+        }
+        if penalty_weights.len() != self.n_features {
+            return Err(format!(
+                "penalty_weights length mismatch: got {}, expected {}",
+                penalty_weights.len(),
+                self.n_features
+            ));
+        }
+        validate_finite_slice_f32("residual", residual)?;
+        let code4_lut = &packed_byte_lut().code4;
+        let row_step = self.block_rows.max(1);
+        if let Some(tp) = self.pool.as_ref() {
+            let chunks = tp.install(|| {
+                (0..self.n_features)
+                    .step_by(row_step)
+                    .collect::<Vec<_>>()
+                    .into_par_iter()
+                    .map(|row_start| {
+                        let row_end = (row_start + row_step).min(self.n_features);
+                        let mut local = Vec::<usize>::new();
+                        let mut local_grad = vec![0.0_f32; row_end - row_start];
+                        for row_idx in row_start..row_end {
+                            let grad =
+                                self.standardized_row_dot_into(row_idx, residual, code4_lut) as f32;
+                            local_grad[row_idx - row_start] = grad;
+                            if active_mask[row_idx] {
+                                continue;
+                            }
+                            let thr = (lambda * penalty_weights[row_idx] + kkt_tol) as f64;
+                            if (grad as f64).abs() > thr {
+                                local.push(row_idx);
+                            }
+                        }
+                        (row_start, local, local_grad)
+                    })
+                    .collect::<Vec<(usize, Vec<usize>, Vec<f32>)>>()
+            });
+            let mut out = Vec::<usize>::new();
+            let mut grad = vec![0.0_f32; self.n_features];
+            for (row_start, local, local_grad) in chunks {
+                out.extend(local);
+                grad[row_start..row_start + local_grad.len()].copy_from_slice(&local_grad);
+            }
+            return Ok((out, grad));
+        }
+        let mut out = Vec::<usize>::new();
+        let mut grad = vec![0.0_f32; self.n_features];
+        for row_idx in 0..self.n_features {
+            let g = self.standardized_row_dot_into(row_idx, residual, code4_lut) as f32;
+            grad[row_idx] = g;
+            if active_mask[row_idx] {
+                continue;
+            }
+            let thr = (lambda * penalty_weights[row_idx] + kkt_tol) as f64;
+            if (g as f64).abs() > thr {
+                out.push(row_idx);
+            }
+        }
+        Ok((out, grad))
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
     fn apply_xt_resid_into(
         &self,
         proj: &CovariateProjection,
@@ -2662,7 +3217,106 @@ fn ensure_msgps_xtx_cached(
     Ok(())
 }
 
-fn fit_algwas_stage1_active_from_stats(
+#[inline]
+fn algwas_stage1_active_cap(cfg: &AlgwasConfig, n_samples: usize, n_features: usize) -> usize {
+    if cfg.lasso.active_cache_max_rows > 0 {
+        cfg.lasso
+            .active_cache_max_rows
+            .clamp(1usize, n_features.max(1))
+    } else {
+        let row_bytes = n_samples
+            .saturating_mul(std::mem::size_of::<f32>())
+            .max(1usize);
+        let target_mb = std::env::var("JX_LASSO_ACTIVE_TARGET_MB")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .unwrap_or(DEFAULT_STAGE1_ACTIVE_TARGET_MB);
+        ((target_mb.saturating_mul(1024 * 1024)) / row_bytes)
+            .max(DEFAULT_STAGE1_ACTIVE_MIN_ROWS)
+            .min(n_features.max(1))
+    }
+}
+
+#[inline]
+fn decode_rows_resid_standardized_into_f32(
+    design: &AlgwasPackedDesign<'_>,
+    proj: &CovariateProjection,
+    rows: &[usize],
+    out: &mut [f32],
+) -> Result<(), String> {
+    design.decode_rows_standardized_into(rows, out)?;
+    residualize_block_rows_in_place(
+        out,
+        rows.len(),
+        design.n_samples(),
+        proj,
+        design.pool.as_ref(),
+    );
+    Ok(())
+}
+
+fn validate_algwas_stage1_warm_state(
+    state: &AlgwasStage1WarmState,
+    n_features: usize,
+    n_samples: usize,
+) -> Result<(), String> {
+    validate_active_path_state(state, n_features, n_samples, |aux| {
+        if let Some(last_grad) = aux.last_kkt_grad.as_ref() {
+            if last_grad.len() != n_features {
+                return Err(format!(
+                    "last_kkt_grad length mismatch: got {}, expected {}",
+                    last_grad.len(),
+                    n_features
+                ));
+            }
+        }
+        Ok(())
+    })
+}
+
+fn extend_algwas_stage1_active_set(
+    design: &AlgwasPackedDesign<'_>,
+    proj: &CovariateProjection,
+    state: &mut AlgwasStage1WarmState,
+    rows: &[usize],
+    diag_xtx: &[f32],
+    penalty_weights: &[f32],
+    active_cap: usize,
+) -> Result<usize, String> {
+    if rows.is_empty() {
+        return Ok(0usize);
+    }
+    let n_features = design.n_features();
+    let n_samples = design.n_samples();
+    let mut add_rows = Vec::<usize>::with_capacity(rows.len());
+    for &j in rows {
+        if j < n_features && !state.active_mask[j] {
+            add_rows.push(j);
+        }
+    }
+    if add_rows.is_empty() {
+        return Ok(0usize);
+    }
+    if let Some(ref mut dense) = state.active_dense {
+        if state.active_rows.len() + add_rows.len() <= active_cap {
+            let mut residualized = vec![0.0_f32; add_rows.len() * n_samples];
+            decode_rows_resid_standardized_into_f32(design, proj, &add_rows, &mut residualized)?;
+            dense.extend_from_slice(&residualized);
+        } else {
+            state.active_dense = None;
+        }
+    }
+    for &j in &add_rows {
+        state.active_mask[j] = true;
+        state.active_rows.push(j);
+        state.active_diag.push(diag_xtx[j].max(1e-12_f32));
+        state.active_weights.push(penalty_weights[j]);
+        state.active_beta.push(0.0_f32);
+    }
+    Ok(add_rows.len())
+}
+
+fn initialize_algwas_stage1_warm_state(
     design: &AlgwasPackedDesign<'_>,
     proj: &CovariateProjection,
     y_resid: &[f32],
@@ -2670,60 +3324,15 @@ fn fit_algwas_stage1_active_from_stats(
     diag_xtx: &[f32],
     penalty_weights: &[f32],
     lambda: f32,
-    cfg: &AlgwasConfig,
+    _cfg: &AlgwasConfig,
     beta_init: Option<&[f32]>,
     initial_working_set: Option<&[usize]>,
-) -> Result<(Vec<f32>, f64, bool, usize), String> {
+    active_cap: usize,
+    cd_tol: f32,
+    kkt_tol: f32,
+) -> Result<AlgwasStage1WarmState, String> {
     let n_samples = design.n_samples();
     let n_features = design.n_features();
-    if y_resid.len() != n_samples || xty.len() != n_features || diag_xtx.len() != n_features {
-        return Err("stage1 shape mismatch".to_string());
-    }
-    if penalty_weights.len() != n_features {
-        return Err("penalty_weights length mismatch".to_string());
-    }
-    if lambda < 0.0_f32 || !lambda.is_finite() {
-        return Err("lambda must be finite and >= 0".to_string());
-    }
-    let max_outer = if cfg.lasso.max_active_outer_iter > 0 {
-        cfg.lasso.max_active_outer_iter
-    } else {
-        cfg.lasso.max_admm_iter.max(1)
-    };
-    let max_sweeps = if cfg.lasso.max_active_cd_sweeps > 0 {
-        cfg.lasso.max_active_cd_sweeps
-    } else {
-        cfg.lasso.max_pcg_iter.max(1)
-    };
-    let cd_tol = if cfg.lasso.active_cd_tol > 0.0_f32 {
-        cfg.lasso.active_cd_tol
-    } else {
-        cfg.lasso.admm_abs_tol.max(1e-6_f32)
-    };
-    let kkt_tol = if cfg.lasso.active_kkt_tol > 0.0_f32 {
-        cfg.lasso.active_kkt_tol
-    } else {
-        cfg.lasso.admm_abs_tol.max(1e-5_f32)
-    };
-    let active_cap = {
-        if cfg.lasso.active_cache_max_rows > 0 {
-            cfg.lasso
-                .active_cache_max_rows
-                .clamp(1usize, n_features.max(1))
-        } else {
-            let row_bytes = n_samples
-                .saturating_mul(std::mem::size_of::<f32>())
-                .max(1usize);
-            let target_mb = std::env::var("JX_LASSO_ACTIVE_TARGET_MB")
-                .ok()
-                .and_then(|s| s.trim().parse::<usize>().ok())
-                .unwrap_or(DEFAULT_STAGE1_ACTIVE_TARGET_MB);
-            ((target_mb.saturating_mul(1024 * 1024)) / row_bytes)
-                .max(DEFAULT_STAGE1_ACTIVE_MIN_ROWS)
-                .min(n_features.max(1))
-        }
-    };
-
     let mut active_rows = Vec::<usize>::new();
     let mut active_mask = vec![false; n_features];
     let mut active_diag = Vec::<f32>::new();
@@ -2771,181 +3380,364 @@ fn fit_algwas_stage1_active_from_stats(
         }
     }
 
-    if active_rows.is_empty() {
-        let beta = vec![0.0_f32; n_features];
-        return Ok((
-            beta,
-            dot_f32_f64(y_resid, y_resid, design.pool.as_ref()),
-            true,
-            0usize,
-        ));
-    }
-
     let mut residual = y_resid.to_vec();
-    if beta_init.is_some() {
-        let mut fitted = vec![0.0_f32; n_samples];
-        design.apply_x_resid_into(
-            proj,
-            &active_mask_to_beta(&active_mask, beta_init.unwrap(), n_features),
-            &mut fitted,
-        )?;
-        for i in 0..n_samples {
-            residual[i] -= fitted[i];
-        }
-    }
-
-    let mut active_dense = if active_rows.len() <= active_cap {
-        Some({
-            let mut dense = vec![0.0_f32; active_rows.len() * n_samples];
-            design.decode_rows_standardized_into(&active_rows, &mut dense)?;
-            let mut sel_flip = Vec::with_capacity(active_rows.len());
-            let mut sel_mean = Vec::with_capacity(active_rows.len());
-            let mut sel_inv_sd = Vec::with_capacity(active_rows.len());
-            for &idx in &active_rows {
-                sel_flip.push(design.row_flip[idx]);
-                sel_mean.push(design.row_mean[idx]);
-                sel_inv_sd.push(design.row_inv_sd[idx]);
+    let active_dense = if !active_rows.is_empty() && active_rows.len() <= active_cap {
+        let mut dense = vec![0.0_f32; active_rows.len() * n_samples];
+        decode_rows_resid_standardized_into_f32(design, proj, &active_rows, &mut dense)?;
+        if beta_init.is_some() {
+            for (k, &bj) in active_beta.iter().enumerate() {
+                if bj == 0.0_f32 {
+                    continue;
+                }
+                let row = &dense[k * n_samples..(k + 1) * n_samples];
+                for i in 0..n_samples {
+                    residual[i] -= row[i] * bj;
+                }
             }
-            residualize_block_rows_in_place(
-                &mut dense,
-                active_rows.len(),
-                n_samples,
-                proj,
-                design.pool.as_ref(),
-            );
-            dense
-        })
+        }
+        Some(dense)
     } else {
+        if let Some(beta0) = beta_init {
+            let mut fitted = vec![0.0_f32; n_samples];
+            design.apply_x_resid_into(
+                proj,
+                &active_mask_to_beta(&active_mask, beta0, n_features),
+                &mut fitted,
+            )?;
+            for i in 0..n_samples {
+                residual[i] -= fitted[i];
+            }
+        }
         None
     };
 
-    let mut grad = vec![0.0_f32; n_features];
-    let mut xfit = vec![0.0_f32; n_samples];
-    let mut converged = false;
-    let mut outer_iters = 0usize;
-    let mut sweeps_last = 0usize;
+    Ok(AlgwasStage1WarmState {
+        active_rows,
+        active_mask,
+        active_diag,
+        active_weights,
+        active_beta,
+        active_dense,
+        residual,
+        aux: AlgwasStage1Aux {
+            last_kkt_grad: None,
+            last_lambda: None,
+        },
+    })
+}
+
+fn solve_algwas_stage1_active_from_stats(
+    design: &AlgwasPackedDesign<'_>,
+    proj: &CovariateProjection,
+    y_resid: &[f32],
+    xty: &[f32],
+    diag_xtx: &[f32],
+    penalty_weights: &[f32],
+    lambda: f32,
+    cfg: &AlgwasConfig,
+    beta_init: Option<&[f32]>,
+    initial_working_set: Option<&[usize]>,
+    warm_state: Option<AlgwasStage1WarmState>,
+) -> Result<(Vec<f32>, f64, bool, usize, AlgwasStage1WarmState), String> {
+    let stage1_timing = algwas_stage1_timing_enabled();
+    let solve_t0 = stage1_timing.then(Instant::now);
+    let mut init_secs = 0.0_f64;
+    let mut dense_restore_secs = 0.0_f64;
+    let mut cd_dense_secs = 0.0_f64;
+    let mut cd_stream_decode_secs = 0.0_f64;
+    let mut cd_stream_proj_secs = 0.0_f64;
+    let mut kkt_secs = 0.0_f64;
+    let mut expand_secs = 0.0_f64;
+    let mut strong_seed_secs = 0.0_f64;
+    let mut total_strong_seed = 0usize;
+    let n_samples = design.n_samples();
+    let n_features = design.n_features();
+    if y_resid.len() != n_samples || xty.len() != n_features || diag_xtx.len() != n_features {
+        return Err("stage1 shape mismatch".to_string());
+    }
+    if penalty_weights.len() != n_features {
+        return Err("penalty_weights length mismatch".to_string());
+    }
+    if lambda < 0.0_f32 || !lambda.is_finite() {
+        return Err("lambda must be finite and >= 0".to_string());
+    }
+    let max_outer = if cfg.lasso.max_active_outer_iter > 0 {
+        cfg.lasso.max_active_outer_iter
+    } else {
+        cfg.lasso.max_admm_iter.max(1)
+    };
+    let max_sweeps = if cfg.lasso.max_active_cd_sweeps > 0 {
+        cfg.lasso.max_active_cd_sweeps
+    } else {
+        cfg.lasso.max_pcg_iter.max(1)
+    };
+    let cd_tol = if cfg.lasso.active_cd_tol > 0.0_f32 {
+        cfg.lasso.active_cd_tol
+    } else {
+        cfg.lasso.admm_abs_tol.max(1e-6_f32)
+    };
+    let kkt_tol = if cfg.lasso.active_kkt_tol > 0.0_f32 {
+        cfg.lasso.active_kkt_tol
+    } else {
+        cfg.lasso.admm_abs_tol.max(1e-5_f32)
+    };
+    let active_cap = algwas_stage1_active_cap(cfg, n_samples, n_features);
+    let state_init_t0 = stage1_timing.then(Instant::now);
+    let state = if let Some(state) = warm_state {
+        validate_algwas_stage1_warm_state(&state, n_features, n_samples)?;
+        state
+    } else {
+        initialize_algwas_stage1_warm_state(
+            design,
+            proj,
+            y_resid,
+            xty,
+            diag_xtx,
+            penalty_weights,
+            lambda,
+            cfg,
+            beta_init,
+            initial_working_set,
+            active_cap,
+            cd_tol,
+            kkt_tol,
+        )?
+    };
+    if let Some(t0) = state_init_t0 {
+        init_secs += t0.elapsed().as_secs_f64();
+    }
     let mut ztrow = vec![0.0_f64; proj.q];
     let mut coeff = vec![0.0_f64; proj.q];
     let mut block = vec![0.0_f32; active_cap.max(1) * n_samples];
-
-    for outer in 0..max_outer {
-        sweeps_last = 0;
-        let active_len = active_rows.len();
-        for _ in 0..max_sweeps {
+    let (state, stats) = run_active_kkt_path(
+        state,
+        ActivePathSolveConfig {
+            lambda,
+            active_cap,
+            max_outer,
+            max_sweeps,
+            cd_tol,
+            kkt_tol,
+        },
+        |rows| {
+            let restore_t0 = stage1_timing.then(Instant::now);
+            let mut dense = vec![0.0_f32; rows.len() * n_samples];
+            decode_rows_resid_standardized_into_f32(design, proj, rows, &mut dense)?;
+            if let Some(t0) = restore_t0 {
+                dense_restore_secs += t0.elapsed().as_secs_f64();
+            }
+            Ok(dense)
+        },
+        |state| {
+            if let (Some(last_grad), Some(prev_lambda)) =
+                (state.aux.last_kkt_grad.as_ref(), state.aux.last_lambda)
+            {
+                let strong_cap =
+                    algwas_stage1_strong_set_cap(n_features, active_cap, state.active_rows.len());
+                if strong_cap > 0 {
+                    let strong_t0 = stage1_timing.then(Instant::now);
+                    let strong_rows = select_stage1_strong_rule_rows(
+                        last_grad,
+                        &state.active_mask,
+                        penalty_weights,
+                        prev_lambda,
+                        lambda,
+                        strong_cap,
+                    );
+                    let added = extend_algwas_stage1_active_set(
+                        design,
+                        proj,
+                        state,
+                        &strong_rows,
+                        diag_xtx,
+                        penalty_weights,
+                        active_cap,
+                    )?;
+                    total_strong_seed += added;
+                    if let Some(t0) = strong_t0 {
+                        strong_seed_secs += t0.elapsed().as_secs_f64();
+                    }
+                    return Ok(added);
+                }
+            }
+            Ok(0usize)
+        },
+        |state, lambda_now| {
+            let cd_t0 = stage1_timing.then(Instant::now);
+            let active_len = state.active_rows.len();
+            let dense = state
+                .active_dense
+                .as_ref()
+                .ok_or_else(|| "missing active_dense during ALGWAS dense CD sweep".to_string())?;
             let mut max_update = 0.0_f32;
-            if let Some(ref mut dense) = active_dense {
-                for k in 0..active_len {
-                    let row = &dense[k * n_samples..(k + 1) * n_samples];
-                    let bj_old = active_beta[k];
-                    let corr = dot_f32_f64(row, &residual, design.pool.as_ref()) as f32
-                        + active_diag[k] * bj_old;
-                    let bj_new = soft_threshold(corr, lambda * active_weights[k]) / active_diag[k];
+            for k in 0..active_len {
+                let row = &dense[k * n_samples..(k + 1) * n_samples];
+                let bj_old = state.active_beta[k];
+                let corr = dot_f32_f64(row, &state.residual, design.pool.as_ref()) as f32
+                    + state.active_diag[k] * bj_old;
+                let bj_new = soft_threshold(corr, lambda_now * state.active_weights[k])
+                    / state.active_diag[k];
+                let delta = bj_new - bj_old;
+                if delta != 0.0_f32 {
+                    for i in 0..n_samples {
+                        state.residual[i] -= row[i] * delta;
+                    }
+                    state.active_beta[k] = bj_new;
+                    max_update = max_update.max(delta.abs());
+                }
+            }
+            if let Some(t0) = cd_t0 {
+                cd_dense_secs += t0.elapsed().as_secs_f64();
+            }
+            Ok(max_update)
+        },
+        |state, lambda_now, active_cap_now| {
+            let active_len = state.active_rows.len();
+            let mut max_update = 0.0_f32;
+            for chunk_start in (0..active_len).step_by(active_cap_now.max(1)) {
+                let chunk_end = (chunk_start + active_cap_now.max(1)).min(active_len);
+                let rows = &state.active_rows[chunk_start..chunk_end];
+                let rows_len = rows.len();
+                let decode_t0 = stage1_timing.then(Instant::now);
+                design.decode_rows_standardized_into(rows, &mut block[..rows_len * n_samples])?;
+                if let Some(t0) = decode_t0 {
+                    cd_stream_decode_secs += t0.elapsed().as_secs_f64();
+                }
+                for local_k in 0..rows_len {
+                    let k = chunk_start + local_k;
+                    let row = &mut block[local_k * n_samples..(local_k + 1) * n_samples];
+                    let proj_t0 = stage1_timing.then(Instant::now);
+                    proj.ztv_f32(row, &mut ztrow);
+                    proj.apply_inv(&ztrow, &mut coeff);
+                    for i in 0..n_samples {
+                        let zrow = &proj.z[i * proj.q..(i + 1) * proj.q];
+                        let mut projv = 0.0_f64;
+                        for a in 0..proj.q {
+                            projv += zrow[a] * coeff[a];
+                        }
+                        row[i] -= projv as f32;
+                    }
+                    let bj_old = state.active_beta[k];
+                    let corr = dot_f32_f64(row, &state.residual, design.pool.as_ref()) as f32
+                        + state.active_diag[k] * bj_old;
+                    let bj_new = soft_threshold(corr, lambda_now * state.active_weights[k])
+                        / state.active_diag[k];
                     let delta = bj_new - bj_old;
                     if delta != 0.0_f32 {
                         for i in 0..n_samples {
-                            residual[i] -= row[i] * delta;
+                            state.residual[i] -= row[i] * delta;
                         }
-                        active_beta[k] = bj_new;
+                        state.active_beta[k] = bj_new;
                         max_update = max_update.max(delta.abs());
                     }
-                }
-            } else {
-                for chunk_start in (0..active_len).step_by(active_cap.max(1)) {
-                    let chunk_end = (chunk_start + active_cap.max(1)).min(active_len);
-                    let rows = &active_rows[chunk_start..chunk_end];
-                    let rows_len = rows.len();
-                    design
-                        .decode_rows_standardized_into(rows, &mut block[..rows_len * n_samples])?;
-                    for local_k in 0..rows_len {
-                        let k = chunk_start + local_k;
-                        let row = &mut block[local_k * n_samples..(local_k + 1) * n_samples];
-                        proj.ztv_f32(row, &mut ztrow);
-                        proj.apply_inv(&ztrow, &mut coeff);
-                        for i in 0..n_samples {
-                            let zrow = &proj.z[i * proj.q..(i + 1) * proj.q];
-                            let mut projv = 0.0_f64;
-                            for a in 0..proj.q {
-                                projv += zrow[a] * coeff[a];
-                            }
-                            row[i] -= projv as f32;
-                        }
-                        let bj_old = active_beta[k];
-                        let corr = dot_f32_f64(row, &residual, design.pool.as_ref()) as f32
-                            + active_diag[k] * bj_old;
-                        let bj_new =
-                            soft_threshold(corr, lambda * active_weights[k]) / active_diag[k];
-                        let delta = bj_new - bj_old;
-                        if delta != 0.0_f32 {
-                            for i in 0..n_samples {
-                                residual[i] -= row[i] * delta;
-                            }
-                            active_beta[k] = bj_new;
-                            max_update = max_update.max(delta.abs());
-                        }
+                    if let Some(t0) = proj_t0 {
+                        cd_stream_proj_secs += t0.elapsed().as_secs_f64();
                     }
                 }
             }
-            sweeps_last += 1;
-            if max_update <= cd_tol {
-                break;
+            Ok(max_update)
+        },
+        |state, lambda_now, kkt_tol_now| {
+            let kkt_t0 = stage1_timing.then(Instant::now);
+            let (violators, last_grad) = design.scan_kkt_violators_bitwise_orthogonal(
+                &state.residual,
+                &state.active_mask,
+                penalty_weights,
+                lambda_now,
+                kkt_tol_now,
+            )?;
+            state.aux.last_kkt_grad = Some(last_grad);
+            state.aux.last_lambda = Some(lambda_now);
+            if let Some(t0) = kkt_t0 {
+                kkt_secs += t0.elapsed().as_secs_f64();
             }
-        }
-
-        grad.fill(0.0_f32);
-        design.apply_xt_resid_into(proj, &residual, &mut grad)?;
-        let mut violators = Vec::<usize>::new();
-        for j in 0..n_features {
-            if !active_mask[j] {
-                let thr = lambda * penalty_weights[j] + kkt_tol;
-                if grad[j].abs() > thr {
-                    violators.push(j);
-                }
+            Ok(violators)
+        },
+        |state, rows, active_cap_now| {
+            let expand_t0 = stage1_timing.then(Instant::now);
+            let added = extend_algwas_stage1_active_set(
+                design,
+                proj,
+                state,
+                rows,
+                diag_xtx,
+                penalty_weights,
+                active_cap_now,
+            )?;
+            if let Some(t0) = expand_t0 {
+                expand_secs += t0.elapsed().as_secs_f64();
             }
-        }
+            Ok(added)
+        },
+    )?;
 
-        outer_iters = outer + 1;
-        if violators.is_empty() {
-            converged = true;
-            break;
-        }
-
-        if let Some(ref mut dense) = active_dense {
-            if active_rows.len() + violators.len() <= active_cap {
-                let mut new_dense = vec![0.0_f32; violators.len() * n_samples];
-                design.decode_rows_standardized_into(&violators, &mut new_dense)?;
-                let mut residualized = new_dense;
-                residualize_block_rows_in_place(
-                    &mut residualized,
-                    violators.len(),
-                    n_samples,
-                    proj,
-                    design.pool.as_ref(),
-                );
-                dense.extend_from_slice(&residualized);
-            } else {
-                active_dense = None;
-            }
-        }
-        for &j in &violators {
-            active_mask[j] = true;
-            active_rows.push(j);
-            active_diag.push(diag_xtx[j].max(1e-12_f32));
-            active_weights.push(penalty_weights[j]);
-            active_beta.push(0.0_f32);
-        }
-    }
+    total_strong_seed = stats.total_seed_rows;
+    let total_cd_sweeps = stats.total_sweeps;
+    let total_violators = stats.total_violators;
+    let peak_active = stats.peak_active;
 
     let mut beta = vec![0.0_f32; n_features];
-    for (k, &j) in active_rows.iter().enumerate() {
-        beta[j] = active_beta[k];
+    for (k, &j) in state.active_rows.iter().enumerate() {
+        beta[j] = state.active_beta[k];
     }
-    design.apply_x_resid_into(proj, &beta, &mut xfit)?;
-    let mut rss = 0.0_f64;
-    for i in 0..n_samples {
-        let d = xfit[i] as f64 - y_resid[i] as f64;
-        rss += d * d;
+    let rss = dot_f32_f64(&state.residual, &state.residual, design.pool.as_ref());
+    if let Some(t0) = solve_t0 {
+        eprintln!(
+            "ALGWAS stage1 solve timing lambda={:.6e} active_end={} active_peak={} outer={} sweeps={} strong_seed={} violators={} init={:.3}s restore={:.3}s strong={:.3}s cd_dense={:.3}s cd_stream_decode={:.3}s cd_stream_proj={:.3}s kkt={:.3}s expand={:.3}s total={:.3}s",
+            lambda as f64,
+            state.active_rows.len(),
+            peak_active,
+            stats.outer_iters,
+            total_cd_sweeps,
+            total_strong_seed,
+            total_violators,
+            init_secs,
+            dense_restore_secs,
+            strong_seed_secs,
+            cd_dense_secs,
+            cd_stream_decode_secs,
+            cd_stream_proj_secs,
+            kkt_secs,
+            expand_secs,
+            t0.elapsed().as_secs_f64(),
+        );
     }
-    Ok((beta, rss, converged, outer_iters.max(sweeps_last)))
+    Ok((
+        beta,
+        rss,
+        stats.converged,
+        stats.outer_iters.max(stats.sweeps_last),
+        state,
+    ))
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn fit_algwas_stage1_active_from_stats(
+    design: &AlgwasPackedDesign<'_>,
+    proj: &CovariateProjection,
+    y_resid: &[f32],
+    xty: &[f32],
+    diag_xtx: &[f32],
+    penalty_weights: &[f32],
+    lambda: f32,
+    cfg: &AlgwasConfig,
+    beta_init: Option<&[f32]>,
+    initial_working_set: Option<&[usize]>,
+) -> Result<(Vec<f32>, f64, bool, usize), String> {
+    let (beta, rss, converged, iters, _warm_state) = solve_algwas_stage1_active_from_stats(
+        design,
+        proj,
+        y_resid,
+        xty,
+        diag_xtx,
+        penalty_weights,
+        lambda,
+        cfg,
+        beta_init,
+        initial_working_set,
+        None,
+    )?;
+    Ok((beta, rss, converged, iters))
 }
 
 #[inline]
@@ -2966,6 +3758,9 @@ fn fit_stage1_path_streaming(
     cfg: &AlgwasConfig,
     progress_callback: Option<&Py<PyAny>>,
 ) -> Result<AlgwasStage1Result, String> {
+    let stage1_timing = algwas_stage1_timing_enabled();
+    let stage1_total_t0 = stage1_timing.then(Instant::now);
+    let ebic_gamma = algwas_stage1_ebic_gamma();
     let n = design.n_samples();
     let p = design.n_features();
     let lambda_steps = cfg.lambda_steps.max(1);
@@ -2976,6 +3771,8 @@ fn fit_stage1_path_streaming(
             beta: vec![0.0_f32; p],
             lambda_best: 0.0_f32,
             bic_best: f64::INFINITY,
+            ebic_best: f64::INFINITY,
+            best_step: 0usize,
             path: Vec::new(),
             converged: true,
         });
@@ -2990,8 +3787,14 @@ fn fit_stage1_path_streaming(
         .map_err(|e| e.to_string())?;
     }
 
+    let y_t0 = stage1_timing.then(Instant::now);
     let y_resid = proj.residualize_y(y)?;
+    let y_secs = y_t0.map(|t0| t0.elapsed().as_secs_f64()).unwrap_or(0.0_f64);
+    let diag_t0 = stage1_timing.then(Instant::now);
     let diag_xtx = design.diag_xtx_residualized(proj)?;
+    let diag_secs = diag_t0
+        .map(|t0| t0.elapsed().as_secs_f64())
+        .unwrap_or(0.0_f64);
     if let Some(cb) = progress_callback {
         Python::attach(|py| -> PyResult<()> {
             py.check_signals()?;
@@ -3000,7 +3803,11 @@ fn fit_stage1_path_streaming(
         })
         .map_err(|e| e.to_string())?;
     }
+    let xty_t0 = stage1_timing.then(Instant::now);
     let xty = design.xty_residualized(&y_resid)?;
+    let xty_secs = xty_t0
+        .map(|t0| t0.elapsed().as_secs_f64())
+        .unwrap_or(0.0_f64);
     if let Some(cb) = progress_callback {
         Python::attach(|py| -> PyResult<()> {
             py.check_signals()?;
@@ -3009,15 +3816,32 @@ fn fit_stage1_path_streaming(
         })
         .map_err(|e| e.to_string())?;
     }
-    let mut penalty_weights =
-        compute_msgps_alasso_penalty_weights(design, proj, &y_resid, &diag_xtx, Some(&xty), cfg)?;
+    let weight_t0 = stage1_timing.then(Instant::now);
+    let adaptive_init =
+        compute_msgps_alasso_init(design, proj, &y_resid, &diag_xtx, Some(&xty), cfg)?;
+    let mut penalty_weights = adaptive_init.penalty_weights;
+    let mut beta_init_full = adaptive_init.beta_init;
+    let weight_secs = weight_t0
+        .map(|t0| t0.elapsed().as_secs_f64())
+        .unwrap_or(0.0_f64);
     for w in &mut penalty_weights {
         if !w.is_finite() || *w <= 0.0_f32 {
             *w = 1.0_f32;
         }
     }
+    for bj in &mut beta_init_full {
+        if !bj.is_finite() {
+            *bj = 0.0_f32;
+        }
+    }
     let initial_working_cap = algwas_stage1_initial_working_set_cap(p);
     let initial_working_set = select_stage1_lm_screen_rows(&xty, &diag_xtx, initial_working_cap);
+    let mut beta_init_seed = vec![0.0_f32; p];
+    for &j in &initial_working_set {
+        if j < p {
+            beta_init_seed[j] = beta_init_full[j];
+        }
+    }
     if std::env::var_os("JX_ALGWAS_DEBUG").is_some() {
         eprintln!(
             "ALGWAS stage1 LM screen: selected {} / {} candidates (cap={})",
@@ -3050,8 +3874,10 @@ fn fit_stage1_path_streaming(
         let path = vec![AlgwasStage1PathPoint {
             lambda: 0.0_f32,
             bic: (n as f64) * (rss0.max(1e-12_f64) / n as f64).ln(),
+            ebic: (n as f64) * (rss0.max(1e-12_f64) / n as f64).ln(),
             rss: rss0,
             nnz: 0,
+            df: 0.0_f64,
             converged: true,
         }];
         return Ok(AlgwasStage1Result {
@@ -3059,6 +3885,8 @@ fn fit_stage1_path_streaming(
             beta: vec![0.0_f32; p],
             lambda_best: 0.0_f32,
             bic_best: path[0].bic,
+            ebic_best: path[0].ebic,
+            best_step: 0usize,
             path,
             converged: true,
         });
@@ -3073,20 +3901,25 @@ fn fit_stage1_path_streaming(
 
     let mut path = Vec::<AlgwasStage1PathPoint>::with_capacity(lambda_steps + 1);
     let rss0 = dot_f32_f64(&y_resid, &y_resid, design.pool.as_ref());
-    let bic0 = (n as f64) * (rss0.max(1e-12_f64) / n as f64).ln();
+    let bic0 = algwas_bic_from_rss_df(n, rss0, 0.0_f64);
+    let ebic0 = algwas_ebic_from_bic(bic0, p, 0usize, ebic_gamma);
     path.push(AlgwasStage1PathPoint {
         lambda: 0.0_f32,
         bic: bic0,
+        ebic: ebic0,
         rss: rss0,
         nnz: 0,
+        df: 0.0_f64,
         converged: true,
     });
 
-    let mut beta_prev: Option<Vec<f32>> = None;
-    let mut best_bic = bic0;
+    let selection_criterion = algwas_stage1_select_criterion();
+    let mut warm_state: Option<AlgwasStage1WarmState> = None;
+    let mut best_idx = 0usize;
+    let mut best_selected_score = algwas_stage1_path_score(&path[0], selection_criterion);
     let mut best_beta_std = vec![0.0_f32; p];
     let mut best_converged = true;
-    let mut best_lambda = 0.0_f32;
+    let mut path_solve_secs = 0.0_f64;
 
     for step in 0..lambda_steps {
         let t = if lambda_steps <= 1 {
@@ -3095,35 +3928,57 @@ fn fit_stage1_path_streaming(
             step as f32 / (lambda_steps - 1) as f32
         };
         let lambda = lambda_max * lambda_span.powf(t);
-        let (beta_std, rss, converged, _iters) = fit_algwas_stage1_active_from_stats(
-            design,
-            proj,
-            &y_resid,
-            &xty,
-            &diag_xtx,
-            &penalty_weights,
-            lambda,
-            cfg,
-            beta_prev.as_deref(),
-            Some(&initial_working_set),
-        )?;
+        let use_seed_rows = warm_state.is_none();
+        let solve_t0 = stage1_timing.then(Instant::now);
+        let (beta_std, rss, converged, _iters, next_warm_state) =
+            solve_algwas_stage1_active_from_stats(
+                design,
+                proj,
+                &y_resid,
+                &xty,
+                &diag_xtx,
+                &penalty_weights,
+                lambda,
+                cfg,
+                if use_seed_rows {
+                    Some(&beta_init_seed)
+                } else {
+                    None
+                },
+                if use_seed_rows {
+                    Some(&initial_working_set)
+                } else {
+                    None
+                },
+                warm_state.take(),
+            )?;
+        if let Some(t0) = solve_t0 {
+            path_solve_secs += t0.elapsed().as_secs_f64();
+        }
         let nnz = beta_std.iter().filter(|&&v| v != 0.0_f32).count();
-        let bic =
-            (n as f64) * (rss.max(1e-12_f64) / n as f64).ln() + (nnz as f64) * (n as f64).ln();
+        let df = nnz as f64;
+        let bic = algwas_bic_from_rss_df(n, rss, df);
+        let ebic = algwas_ebic_from_bic(bic, p, nnz, ebic_gamma);
         path.push(AlgwasStage1PathPoint {
             lambda,
             bic,
+            ebic,
             rss,
             nnz,
+            df,
             converged,
         });
-        if bic < best_bic {
-            best_bic = bic;
-            best_beta_std = beta_std.clone();
+        let point_ref = path
+            .last()
+            .ok_or_else(|| "ALGWAS stage1 path unexpectedly empty after push".to_string())?;
+        let selected_score = algwas_stage1_path_score(point_ref, selection_criterion);
+        if selected_score < best_selected_score {
+            best_selected_score = selected_score;
+            best_idx = step + 1;
+            best_beta_std.clone_from(&beta_std);
             best_converged = converged;
-            best_lambda = lambda;
         }
-        beta_prev = Some(beta_std);
+        warm_state = Some(next_warm_state);
         if let Some(cb) = progress_callback {
             let done = step + 4;
             Python::attach(|py| -> PyResult<()> {
@@ -3135,6 +3990,11 @@ fn fit_stage1_path_streaming(
         }
     }
 
+    let best_bic_idx = best_stage1_path_index(&path, AlgwasStage1SelectCriterion::Bic);
+    let best_ebic_idx = best_stage1_path_index(&path, AlgwasStage1SelectCriterion::Ebic);
+    let best_point = path
+        .get(best_idx)
+        .ok_or_else(|| "ALGWAS stage1 path unexpectedly empty".to_string())?;
     let mut beta_best = vec![0.0_f32; p];
     let mut selected_indices = Vec::<usize>::new();
     for j in 0..p {
@@ -3152,11 +4012,31 @@ fn fit_stage1_path_streaming(
         }
     }
 
+    if let Some(t0) = stage1_total_t0 {
+        let total_secs = t0.elapsed().as_secs_f64().max(1e-12_f64);
+        eprintln!(
+            "ALGWAS stage1 path timing: y_resid={:.3}s ({:.1}%) diag_xtx={:.3}s ({:.1}%) xty={:.3}s ({:.1}%) weights={:.3}s ({:.1}%) lambda_path={:.3}s ({:.1}%) total={:.3}s",
+            y_secs,
+            100.0_f64 * y_secs / total_secs,
+            diag_secs,
+            100.0_f64 * diag_secs / total_secs,
+            xty_secs,
+            100.0_f64 * xty_secs / total_secs,
+            weight_secs,
+            100.0_f64 * weight_secs / total_secs,
+            path_solve_secs,
+            100.0_f64 * path_solve_secs / total_secs,
+            total_secs,
+        );
+    }
+
     Ok(AlgwasStage1Result {
         selected_indices,
         beta: beta_best,
-        lambda_best: best_lambda,
-        bic_best: best_bic,
+        lambda_best: best_point.lambda,
+        bic_best: path[best_bic_idx].bic,
+        ebic_best: path[best_ebic_idx].ebic,
+        best_step: best_idx,
         path,
         converged: best_converged,
     })
@@ -3340,6 +4220,33 @@ fn apply_packed_sample_space_operator_into(
     Ok(())
 }
 
+struct PackedSampleSpaceOperator<'ctx, 'data> {
+    design: &'ctx AlgwasPackedDesign<'data>,
+    proj: &'ctx CovariateProjection,
+    mode: ExactPackedOperatorMode,
+    ridge_lambda: f64,
+    row_ids: &'ctx mut Vec<usize>,
+    block: &'ctx mut [f64],
+    feature_scratch: &'ctx mut [f64],
+}
+
+impl PcgOperator<f64> for PackedSampleSpaceOperator<'_, '_> {
+    #[inline]
+    fn apply(&mut self, input: &[f64], output: &mut [f64]) -> Result<(), String> {
+        apply_packed_sample_space_operator_into(
+            self.design,
+            self.proj,
+            self.mode,
+            self.ridge_lambda,
+            input,
+            self.row_ids,
+            self.block,
+            self.feature_scratch,
+            output,
+        )
+    }
+}
+
 fn solve_packed_dual_ridge_alpha_pcg(
     design: &AlgwasPackedDesign<'_>,
     proj: &CovariateProjection,
@@ -3363,26 +4270,23 @@ fn solve_packed_dual_ridge_alpha_pcg(
         DEFAULT_STAGE1_ALASSO_PCG_TOL
     };
     let tiny_use = ridge_lambda.abs().max(1e-12_f64);
-    let pcg = pcg_solve_f64_with_guess_into(
+    let apply_a = PackedSampleSpaceOperator {
+        design,
+        proj,
+        mode,
+        ridge_lambda,
+        row_ids: &mut row_ids,
+        block: &mut block,
+        feature_scratch: &mut feature_scratch,
+    };
+    let pcg = pcg_solve(
         y,
         None,
         max_iter_use,
         tol_use,
         tiny_use,
-        |v, out| {
-            apply_packed_sample_space_operator_into(
-                design,
-                proj,
-                mode,
-                ridge_lambda,
-                v,
-                &mut row_ids,
-                &mut block,
-                &mut feature_scratch,
-                out,
-            )
-        },
-        |r, out| out.copy_from_slice(r),
+        apply_a,
+        IdentityPreconditioner,
         |_iter_done, _iter_total, _rel_res| Ok(()),
     )?;
     if pcg.converged {
@@ -3669,6 +4573,7 @@ fn fit_stage1_path_exact_packed(
     cfg: &AlgwasConfig,
     progress_callback: Option<&Py<PyAny>>,
 ) -> Result<AlgwasStage1Result, String> {
+    let ebic_gamma = algwas_stage1_ebic_gamma();
     let n = design.n_samples();
     let p = design.n_features();
     if n == 0 || p == 0 {
@@ -3677,6 +4582,8 @@ fn fit_stage1_path_exact_packed(
             beta: vec![0.0_f32; p],
             lambda_best: 0.0_f32,
             bic_best: f64::INFINITY,
+            ebic_best: f64::INFINITY,
+            best_step: 0usize,
             path: Vec::new(),
             converged: true,
         });
@@ -3724,11 +4631,15 @@ fn fit_stage1_path_exact_packed(
             beta: vec![0.0_f32; p],
             lambda_best: 0.0_f32,
             bic_best: f64::INFINITY,
+            ebic_best: f64::INFINITY,
+            best_step: 0usize,
             path: vec![AlgwasStage1PathPoint {
                 lambda: 0.0_f32,
                 bic: f64::INFINITY,
+                ebic: f64::INFINITY,
                 rss: y_centered.iter().map(|v| v * v).sum(),
                 nnz: 0,
+                df: 0.0_f64,
                 converged: true,
             }],
             converged: true,
@@ -3928,28 +4839,29 @@ fn fit_stage1_path_exact_packed(
     }
     .max(1e-12_f64);
 
+    let selection_criterion = algwas_stage1_select_criterion();
     let mut path = Vec::<AlgwasStage1PathPoint>::with_capacity(step_adj + 1);
-    let mut best_step = 0usize;
-    let mut best_bic = f64::INFINITY;
     for step in 0..=step_adj {
         let beta_step = reconstruct_msgps_beta(p, &betahat_index, step, delta_t);
         let nnz = beta_step.iter().filter(|&&v| v != 0.0_f64).count();
         let bic = (n as f64) * (2.0_f64 * std::f64::consts::PI * tau2).ln()
             + (rss[step] / tau2)
             + (n as f64).ln() * df.get(step).copied().unwrap_or(0.0_f64);
+        let ebic = algwas_ebic_from_bic(bic, p, nnz, ebic_gamma);
         path.push(AlgwasStage1PathPoint {
             lambda: tuning_stand[step] as f32,
             bic,
+            ebic,
             rss: rss[step],
             nnz,
+            df: df.get(step).copied().unwrap_or(0.0_f64),
             converged,
         });
-        if bic < best_bic {
-            best_bic = bic;
-            best_step = step;
-        }
     }
 
+    let best_bic_idx = best_stage1_path_index(&path, AlgwasStage1SelectCriterion::Bic);
+    let best_ebic_idx = best_stage1_path_index(&path, AlgwasStage1SelectCriterion::Ebic);
+    let best_step = best_stage1_path_index(&path, selection_criterion);
     let beta_best_std = reconstruct_msgps_beta(p, &betahat_index, best_step, delta_t);
     let mut beta_best = vec![0.0_f32; p];
     let mut selected_indices = Vec::<usize>::new();
@@ -3987,7 +4899,15 @@ fn fit_stage1_path_exact_packed(
         selected_indices,
         beta: beta_best,
         lambda_best: path.get(best_step).map(|p| p.lambda).unwrap_or(0.0_f32),
-        bic_best: best_bic,
+        bic_best: path
+            .get(best_bic_idx)
+            .map(|p| p.bic)
+            .unwrap_or(f64::INFINITY),
+        ebic_best: path
+            .get(best_ebic_idx)
+            .map(|p| p.ebic)
+            .unwrap_or(f64::INFINITY),
+        best_step,
         path,
         converged,
     })
@@ -4000,6 +4920,7 @@ fn fit_stage1_path_dense_msgps(
     cfg: &AlgwasConfig,
     progress_callback: Option<&Py<PyAny>>,
 ) -> Result<AlgwasStage1Result, String> {
+    let ebic_gamma = algwas_stage1_ebic_gamma();
     let n = design.n_samples();
     let p = design.n_features();
     if n == 0 || p == 0 {
@@ -4008,6 +4929,8 @@ fn fit_stage1_path_dense_msgps(
             beta: vec![0.0_f32; p],
             lambda_best: 0.0_f32,
             bic_best: f64::INFINITY,
+            ebic_best: f64::INFINITY,
+            best_step: 0usize,
             path: Vec::new(),
             converged: true,
         });
@@ -4072,11 +4995,15 @@ fn fit_stage1_path_dense_msgps(
             beta: vec![0.0_f32; p],
             lambda_best: 0.0_f32,
             bic_best: f64::INFINITY,
+            ebic_best: f64::INFINITY,
+            best_step: 0usize,
             path: vec![AlgwasStage1PathPoint {
                 lambda: 0.0_f32,
                 bic: f64::INFINITY,
+                ebic: f64::INFINITY,
                 rss: y_centered.iter().map(|v| v * v).sum(),
                 nnz: 0,
+                df: 0.0_f64,
                 converged: true,
             }],
             converged: true,
@@ -4255,28 +5182,29 @@ fn fit_stage1_path_dense_msgps(
     }
     .max(1e-12_f64);
 
+    let selection_criterion = algwas_stage1_select_criterion();
     let mut path = Vec::<AlgwasStage1PathPoint>::with_capacity(step_adj + 1);
-    let mut best_step = 0usize;
-    let mut best_bic = f64::INFINITY;
     for step in 0..=step_adj {
         let beta_step = reconstruct_msgps_beta(p, &betahat_index, step, delta_t);
         let nnz = beta_step.iter().filter(|&&v| v != 0.0_f64).count();
         let bic = (n as f64) * (2.0_f64 * std::f64::consts::PI * tau2).ln()
             + (rss[step] / tau2)
             + (n as f64).ln() * df.get(step).copied().unwrap_or(0.0_f64);
+        let ebic = algwas_ebic_from_bic(bic, p, nnz, ebic_gamma);
         path.push(AlgwasStage1PathPoint {
             lambda: tuning_stand[step] as f32,
             bic,
+            ebic,
             rss: rss[step],
             nnz,
+            df: df.get(step).copied().unwrap_or(0.0_f64),
             converged,
         });
-        if bic < best_bic {
-            best_bic = bic;
-            best_step = step;
-        }
     }
 
+    let best_bic_idx = best_stage1_path_index(&path, AlgwasStage1SelectCriterion::Bic);
+    let best_ebic_idx = best_stage1_path_index(&path, AlgwasStage1SelectCriterion::Ebic);
+    let best_step = best_stage1_path_index(&path, selection_criterion);
     let beta_best_std = reconstruct_msgps_beta(p, &betahat_index, best_step, delta_t);
     let mut beta_best = vec![0.0_f32; p];
     let mut selected_indices = Vec::<usize>::new();
@@ -4363,9 +5291,8 @@ fn fit_stage1_path_dense_msgps(
             step_adj,
             best_step,
             tuning_stand[best_step],
-            best_bic,
-            selected_indices.len()
-            ,
+            path.get(best_bic_idx).map(|p| p.bic).unwrap_or(f64::NAN),
+            selected_indices.len(),
             df_144,
             df_303,
             bic_144,
@@ -4382,7 +5309,15 @@ fn fit_stage1_path_dense_msgps(
         selected_indices,
         beta: beta_best,
         lambda_best: tuning_stand[best_step] as f32,
-        bic_best: best_bic,
+        bic_best: path
+            .get(best_bic_idx)
+            .map(|p| p.bic)
+            .unwrap_or(f64::INFINITY),
+        ebic_best: path
+            .get(best_ebic_idx)
+            .map(|p| p.ebic)
+            .unwrap_or(f64::INFINITY),
+        best_step,
         path,
         converged,
     })
@@ -4957,6 +5892,64 @@ fn fit_stage1_path(
     }
 }
 
+#[inline]
+fn algwas_stage1_summary_path(out_tsv: &str) -> String {
+    if let Some(prefix) = out_tsv.strip_suffix(".tsv") {
+        format!("{prefix}.stage1.tsv")
+    } else {
+        format!("{out_tsv}.stage1.tsv")
+    }
+}
+
+fn write_algwas_stage1_summary_tsv(
+    out_tsv: &str,
+    stage1: &AlgwasStage1Result,
+) -> Result<String, String> {
+    let summary_path = algwas_stage1_summary_path(out_tsv);
+    let file = File::create(&summary_path).map_err(|e| format!("create {}: {e}", summary_path))?;
+    let mut writer = BufWriter::with_capacity(256 * 1024, file);
+    writer
+        .write_all(
+            b"step\tlambda\trss\tnnz\tdf\tbic\tebic\tconverged\tselected_by_bic\tselected_by_ebic\tselected_by_model\n",
+        )
+        .map_err(|e| format!("write header {}: {e}", summary_path))?;
+    let best_bic_idx = stage1
+        .path
+        .iter()
+        .enumerate()
+        .min_by(|a, b| a.1.bic.total_cmp(&b.1.bic))
+        .map(|(idx, _)| idx)
+        .unwrap_or(0usize);
+    let best_ebic_idx = stage1
+        .path
+        .iter()
+        .enumerate()
+        .min_by(|a, b| a.1.ebic.total_cmp(&b.1.ebic))
+        .map(|(idx, _)| idx)
+        .unwrap_or(0usize);
+    for (step, point) in stage1.path.iter().enumerate() {
+        writeln!(
+            writer,
+            "{step}\t{:.8e}\t{:.8e}\t{}\t{:.8e}\t{:.8e}\t{:.8e}\t{}\t{}\t{}\t{}",
+            point.lambda as f64,
+            point.rss,
+            point.nnz,
+            point.df,
+            point.bic,
+            point.ebic,
+            if point.converged { 1 } else { 0 },
+            if step == best_bic_idx { 1 } else { 0 },
+            if step == best_ebic_idx { 1 } else { 0 },
+            if step == stage1.best_step { 1 } else { 0 },
+        )
+        .map_err(|e| format!("write {}: {e}", summary_path))?;
+    }
+    writer
+        .flush()
+        .map_err(|e| format!("flush {}: {e}", summary_path))?;
+    Ok(summary_path)
+}
+
 #[pyfunction]
 #[pyo3(signature = (
     y,
@@ -5104,6 +6097,31 @@ pub fn algwas_packed_to_tsv(
         stage1_progress_callback.as_ref(),
     )
     .map_err(PyRuntimeError::new_err)?;
+    let stage1_summary_tsv =
+        write_algwas_stage1_summary_tsv(out_tsv, &stage1).map_err(PyRuntimeError::new_err)?;
+    if let Some(best_point) = stage1.path.get(stage1.best_step) {
+        let best_bic_idx = best_stage1_path_index(&stage1.path, AlgwasStage1SelectCriterion::Bic);
+        let best_ebic_idx = best_stage1_path_index(&stage1.path, AlgwasStage1SelectCriterion::Ebic);
+        let best_bic_point = stage1.path.get(best_bic_idx).unwrap_or(best_point);
+        let best_ebic_point = stage1.path.get(best_ebic_idx).unwrap_or(best_point);
+        let selection_criterion = algwas_stage1_select_criterion();
+        eprintln!(
+            "ALGWAS stage1 model selection: criterion={}, best_step={}, lambda={:.6e}, qtn={}, rss={:.6e}, bic={:.6e}, ebic(gamma={:.2})={:.6e}; bic_best_step={}, bic_best_qtn={}, ebic_best_step={}, ebic_best_qtn={}, summary={}",
+            algwas_stage1_select_criterion_label(selection_criterion),
+            stage1.best_step,
+            best_point.lambda as f64,
+            best_point.nnz,
+            best_point.rss,
+            best_point.bic,
+            algwas_stage1_ebic_gamma(),
+            best_point.ebic,
+            best_bic_idx,
+            best_bic_point.nnz,
+            best_ebic_idx,
+            best_ebic_point.nnz,
+            stage1_summary_tsv,
+        );
+    }
     let selected_indices = stage1.selected_indices.clone();
 
     let (qtn_count, pseudo_rows, written_rows) = write_stage2_tsv(
@@ -5244,9 +6262,9 @@ mod tests {
         let y_resid = proj.residualize_y(&y).unwrap();
         let diag_xtx = design.diag_xtx_residualized(&proj).unwrap();
         let cfg = AlgwasConfig::default();
-        let weights =
-            compute_msgps_alasso_penalty_weights(&design, &proj, &y_resid, &diag_xtx, None, &cfg)
-                .unwrap();
+        let adaptive_init =
+            compute_msgps_alasso_init(&design, &proj, &y_resid, &diag_xtx, None, &cfg).unwrap();
+        let weights = adaptive_init.penalty_weights;
 
         let y_mean = y.iter().sum::<f64>() / n_samples as f64;
         let y_centered: Vec<f64> = y.iter().map(|v| v - y_mean).collect();
@@ -5317,7 +6335,10 @@ mod tests {
 
     #[test]
     fn algwas_stage1_auto_mode_switches_by_scale() {
-        assert_eq!(algwas_stage1_mode_from_raw(None), AlgwasStage1Mode::Auto);
+        assert_eq!(
+            algwas_stage1_mode_from_raw(None),
+            AlgwasStage1Mode::StreamActive
+        );
         assert_eq!(
             algwas_stage1_mode_from_raw(Some("auto")),
             AlgwasStage1Mode::Auto
@@ -5408,6 +6429,127 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0], 1);
         assert_eq!(rows[1], 2);
+    }
+
+    #[test]
+    fn algwas_stage1_stream_warm_state_matches_independent_refits() {
+        let rows = vec![
+            vec![0u8, 0, 1, 1, 2, 2, 1, 1, 0, 0, 1, 1],
+            vec![0u8, 1, 2, 1, 0, 1, 2, 1, 0, 1, 0, 1],
+            vec![2u8, 2, 1, 1, 0, 0, 1, 1, 2, 2, 1, 1],
+            vec![1u8, 1, 0, 0, 2, 2, 1, 1, 0, 0, 2, 2],
+            vec![0u8, 1, 1, 2, 2, 1, 0, 0, 1, 2, 2, 1],
+        ];
+        let n_samples = rows[0].len();
+        let (design, row_maf) = build_test_design(&rows);
+        let x_cov: Vec<f64> = (0..n_samples)
+            .map(|i| (i as f64 - 5.5_f64) * 0.15_f64)
+            .collect();
+        let proj = CovariateProjection::new(&x_cov, n_samples, 1).unwrap();
+        let x0 = standardized_row(&rows[0], row_maf[0]);
+        let x2 = standardized_row(&rows[2], row_maf[2]);
+        let x4 = standardized_row(&rows[4], row_maf[4]);
+        let y: Vec<f64> = (0..n_samples)
+            .map(|i| {
+                2.5_f64 * x0[i] - 0.9_f64 * x2[i] + 0.35_f64 * x4[i] + 0.2_f64 * x_cov[i]
+                    - 0.03_f64 * (i as f64)
+            })
+            .collect();
+        let cfg = AlgwasConfig {
+            lambda_steps: 10,
+            lambda_min_ratio: 1e-2_f32,
+            qtn_bound: None,
+            lasso: crate::lasso::LassoConfig {
+                max_admm_iter: 128,
+                max_pcg_iter: 96,
+                active_cd_tol: 1e-6_f32,
+                active_kkt_tol: 5e-6_f32,
+                ..crate::lasso::LassoConfig::default()
+            },
+        };
+
+        let y_resid = proj.residualize_y(&y).unwrap();
+        let diag_xtx = design.diag_xtx_residualized(&proj).unwrap();
+        let xty = design.xty_residualized(&y_resid).unwrap();
+        let adaptive_init =
+            compute_msgps_alasso_init(&design, &proj, &y_resid, &diag_xtx, Some(&xty), &cfg)
+                .unwrap();
+        let mut penalty_weights = adaptive_init.penalty_weights;
+        for w in &mut penalty_weights {
+            if !w.is_finite() || *w <= 0.0_f32 {
+                *w = 1.0_f32;
+            }
+        }
+        let initial_working_set = select_stage1_lm_screen_rows(
+            &xty,
+            &diag_xtx,
+            algwas_stage1_initial_working_set_cap(design.n_features()),
+        );
+        let lambda_max = weighted_lambda_max(&xty, &penalty_weights);
+        let lambda_min = (lambda_max * cfg.lambda_min_ratio).max(lambda_max * 1e-6_f32);
+        let lambda_span = (lambda_min / lambda_max).max(1e-6_f32);
+
+        let mut beta_prev: Option<Vec<f32>> = None;
+        let mut warm_state: Option<AlgwasStage1WarmState> = None;
+        for step in 0..cfg.lambda_steps {
+            let t = if cfg.lambda_steps <= 1 {
+                0.0_f32
+            } else {
+                step as f32 / (cfg.lambda_steps - 1) as f32
+            };
+            let lambda = lambda_max * lambda_span.powf(t);
+            let (beta_refit, rss_refit, conv_refit, _iters_refit) =
+                fit_algwas_stage1_active_from_stats(
+                    &design,
+                    &proj,
+                    &y_resid,
+                    &xty,
+                    &diag_xtx,
+                    &penalty_weights,
+                    lambda,
+                    &cfg,
+                    beta_prev.as_deref(),
+                    Some(&initial_working_set),
+                )
+                .unwrap();
+            let use_seed_rows = warm_state.is_none();
+            let (beta_warm, rss_warm, conv_warm, _iters_warm, next_warm_state) =
+                solve_algwas_stage1_active_from_stats(
+                    &design,
+                    &proj,
+                    &y_resid,
+                    &xty,
+                    &diag_xtx,
+                    &penalty_weights,
+                    lambda,
+                    &cfg,
+                    None,
+                    if use_seed_rows {
+                        Some(&initial_working_set)
+                    } else {
+                        None
+                    },
+                    warm_state.take(),
+                )
+                .unwrap();
+
+            assert_eq!(conv_refit, conv_warm, "lambda step={step} lambda={lambda}");
+            for (j, (a, b)) in beta_refit.iter().zip(beta_warm.iter()).enumerate() {
+                let diff = (*a as f64 - *b as f64).abs();
+                assert!(
+                    diff < 5e-5_f64,
+                    "beta mismatch step={step} lambda={lambda} j={j} refit={a} warm={b} diff={diff}"
+                );
+            }
+            let rss_diff = (rss_refit - rss_warm).abs();
+            assert!(
+                rss_diff < 5e-5_f64,
+                "rss mismatch step={step} lambda={lambda} refit={rss_refit} warm={rss_warm} diff={rss_diff}"
+            );
+
+            beta_prev = Some(beta_refit);
+            warm_state = Some(next_warm_state);
+        }
     }
 
     #[test]

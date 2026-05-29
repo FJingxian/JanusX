@@ -693,7 +693,6 @@ def build_wheel(
     ext_path = _build_kmc_extension_for_wheel()
     win_dlls = _collect_windows_runtime_dlls()
     mac_dylibs = _collect_macos_openblas_dylibs()
-    fasttree_files = _collect_fasttree_artifacts()
     if sys.platform.startswith("win") and _env_flag("JANUSX_REQUIRE_OPENBLAS"):
         has_openblas_dll = any("openblas" in p.name.lower() for p in win_dlls)
         if not has_openblas_dll:
@@ -701,11 +700,6 @@ def build_wheel(
                 "JANUSX_REQUIRE_OPENBLAS=1 but no OpenBLAS runtime DLL was found for wheel bundling. "
                 "Set OPENBLAS_BIN_DIR/OPENBLAS_LIB_DIR or use a conda env with OpenBLAS in Library/bin."
             )
-    if len(fasttree_files) == 0:
-        raise RuntimeError(
-            "FastTree executable was not produced under target/janusx-artifacts; "
-            "build.rs did not finish the FastTree bundle step."
-        )
 
     prev = os.environ.get("JANUSX_PREBUILD_KMC_BIND")
     os.environ["JANUSX_PREBUILD_KMC_BIND"] = "0"
@@ -735,6 +729,13 @@ def build_wheel(
             os.environ.pop("JANUSX_PREBUILD_KMC_BIND", None)
         else:
             os.environ["JANUSX_PREBUILD_KMC_BIND"] = prev
+
+    fasttree_files = _collect_fasttree_artifacts()
+    if len(fasttree_files) == 0:
+        raise RuntimeError(
+            "FastTree executable was not produced under target/janusx-artifacts after wheel build; "
+            "build.rs may not have run or did not finish the FastTree bundle step."
+        )
 
     artifacts: list[tuple[Path, Path]] = []
     if ext_path is not None:

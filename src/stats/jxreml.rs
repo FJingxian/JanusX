@@ -32,6 +32,67 @@ struct SparseRemlSearchResult {
     grid: Vec<SparseRemlEval>,
 }
 
+fn refine_monotone_valid_lower_bound<F>(
+    mut is_valid: F,
+    invalid_log10: f64,
+    valid_log10: f64,
+    tol: f64,
+    max_iter: usize,
+) -> f64
+where
+    F: FnMut(f64) -> bool,
+{
+    if !(invalid_log10.is_finite() && valid_log10.is_finite() && invalid_log10 < valid_log10) {
+        return valid_log10;
+    }
+    if !is_valid(valid_log10) {
+        return valid_log10;
+    }
+    if is_valid(invalid_log10) {
+        return invalid_log10;
+    }
+    let tol_use = tol.abs().max(1e-6_f64);
+    let mut lo = invalid_log10;
+    let mut hi = valid_log10;
+    for _ in 0..max_iter.max(1) {
+        if (hi - lo).abs() <= tol_use {
+            break;
+        }
+        let mid = 0.5 * (lo + hi);
+        if is_valid(mid) {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    hi
+}
+
+#[inline]
+fn sparse_reml_lambda_factorizable(
+    analysis: &SparseJxgrmCholeskyAnalysis,
+    log10_lambda: f64,
+) -> bool {
+    let lambda = 10.0_f64.powf(log10_lambda);
+    lambda.is_finite() && lambda > 0.0 && analysis.factorize_k_plus_lambda_i(lambda).is_ok()
+}
+
+fn sparse_reml_refine_lower_feasible_log10(
+    analysis: &SparseJxgrmCholeskyAnalysis,
+    invalid_log10: f64,
+    valid_log10: f64,
+    tol: f64,
+    max_iter: usize,
+) -> f64 {
+    refine_monotone_valid_lower_bound(
+        |x| sparse_reml_lambda_factorizable(analysis, x),
+        invalid_log10,
+        valid_log10,
+        tol,
+        max_iter,
+    )
+}
+
 fn sparse_reml_debug_enabled() -> bool {
     std::env::var("JX_SPARSE_REML_DEBUG")
         .ok()
@@ -453,7 +514,7 @@ fn sparse_reml_brent_search_with_progress(
         .iter()
         .position(|eval| eval.log10_lambda == grid.best.log10_lambda)
         .unwrap_or(0usize);
-    let brent_low = if best_idx > 0 {
+    let mut brent_low = if best_idx > 0 {
         grid.grid[best_idx - 1].log10_lambda
     } else {
         low
@@ -463,6 +524,20 @@ fn sparse_reml_brent_search_with_progress(
     } else {
         high
     };
+    if best_idx == 0 && !grid.grid.is_empty() && grid_n > 1 {
+        let raw_step = (high - low) / (grid_n - 1) as f64;
+        let first_valid = grid.grid[0].log10_lambda;
+        let prev_raw = (first_valid - raw_step).max(low);
+        if prev_raw < first_valid {
+            brent_low = sparse_reml_refine_lower_feasible_log10(
+                analysis,
+                prev_raw,
+                first_valid,
+                tol.min(1e-2_f64),
+                24,
+            );
+        }
+    }
     let (brent_low, brent_high) =
         if brent_low.is_finite() && brent_high.is_finite() && brent_low < brent_high {
             (brent_low, brent_high)
@@ -814,5 +889,17 @@ mod tests {
         assert!(res.best.lambda.is_finite() && res.best.lambda > 0.0);
         assert!(res.best.sigma_g2.is_finite() && res.best.sigma_g2 > 0.0);
         assert!(!res.grid.is_empty());
+    }
+
+    #[test]
+    fn refine_monotone_valid_lower_bound_tracks_feasible_edge() {
+        let refined = refine_monotone_valid_lower_bound(
+            |x| x >= -0.137_f64,
+            -0.625_f64,
+            0.0_f64,
+            1e-6_f64,
+            64,
+        );
+        assert!((refined + 0.137_f64).abs() <= 1e-4_f64);
     }
 }

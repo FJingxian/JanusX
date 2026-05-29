@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import sqlite3
 import hashlib
 import gzip
 import shutil
@@ -16,8 +15,25 @@ from typing import Any
 
 from .pathcheck import safe_expanduser, safe_home, safe_resolve
 
+try:
+    import sqlite3
+    _SQLITE_IMPORT_ERROR: Exception | None = None
+except Exception as exc:  # pragma: no cover - environment-specific optional dependency failure
+    sqlite3 = None  # type: ignore[assignment]
+    _SQLITE_IMPORT_ERROR = exc
+
 
 _DB_NAME = "janusx_tasks.db"
+
+
+def _sqlite_unavailable_message() -> str:
+    detail = str(_SQLITE_IMPORT_ERROR or "unknown sqlite3 import failure").strip()
+    if detail == "":
+        detail = "unknown sqlite3 import failure"
+    return (
+        "sqlite3 is unavailable in this Python environment; JanusX history/registry DB "
+        f"features are disabled. underlying error: {detail}"
+    )
 
 
 def _now_str() -> str:
@@ -133,6 +149,8 @@ def _candidate_db_paths() -> list[Path]:
 
 
 def _connect(db_path: Path, *, readonly: bool = False) -> sqlite3.Connection:
+    if sqlite3 is None:
+        raise RuntimeError(_sqlite_unavailable_message())
     if readonly:
         uri = f"file:{str(db_path)}?mode=ro"
         return sqlite3.connect(uri, timeout=30, uri=True)
@@ -398,6 +416,8 @@ def upsert_postgwas_run(
     hid = str(history_id or "").strip()
     if hid == "":
         raise ValueError("history_id is required for upsert_postgwas_run")
+    if sqlite3 is None:
+        return resolve_db_path()
     db_path = resolve_db_path()
     conn = _connect(db_path)
     try:
@@ -555,6 +575,8 @@ def record_gwas_run(
     kind_norm = _normalize_genofile_kind(genofile_kind, genofile)
     g_md5 = str(genofile_md5 or "").strip() or _genotype_input_stat_fingerprint(genofile, kind_norm)
     p_md5 = str(phenofile_md5 or "").strip() or _file_stat_fingerprint(phenofile)
+    if sqlite3 is None:
+        return resolve_db_path()
     db_path = resolve_db_path()
     conn = _connect(db_path)
     try:
@@ -1594,6 +1616,8 @@ def _build_fallback_summary_rows(run: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def list_gwas_runs(limit: int = 200) -> list[dict[str, Any]]:
+    if sqlite3 is None:
+        return []
     rows_all: list[Any] = []
     for db_path in _candidate_db_paths():
         if not db_path.exists():

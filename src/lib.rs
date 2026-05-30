@@ -31,10 +31,10 @@ mod gstats;
 mod gwas_unified;
 #[path = "stats/he.rs"]
 mod he;
-#[path = "stats/jxlmm.rs"]
-mod jxlmm;
-#[path = "stats/jxreml.rs"]
-mod jxreml;
+#[path = "stats/splmm.rs"]
+mod splmm;
+#[path = "stats/spreml.rs"]
+mod spreml;
 #[path = "stats/ld.rs"]
 mod ld;
 #[path = "stats/lmm.rs"]
@@ -179,11 +179,11 @@ use gwas_unified::{
 };
 use gwasio::load_gwas_triplet_fast;
 use he::he_pcg_bed;
-use jxlmm::{
-    jxlmm_assoc_pcg_bed, jxlmm_assoc_pcg_bed_to_tsv, jxlmm_scan_exact_packed,
-    jxlmm_sparse_grm_diag_stats,
+use splmm::{
+    splmm_assoc_pcg_bed, splmm_assoc_pcg_bed_to_tsv, splmm_scan_exact_packed,
+    splmm_sparse_grm_diag_stats,
 };
-use jxreml::{jxreml_sparse_reml_brent_from_jxgrm, jxreml_sparse_reml_grid_from_jxgrm};
+use spreml::{spreml_sparse_reml_brent_from_jxgrm, spreml_sparse_reml_grid_from_jxgrm};
 use ld::{
     bed_ldblock_r2_rust, bed_packed_ld_prune_maf_priority, bed_prune_to_plink_rust,
     packed_prune_kernel_stats,
@@ -211,7 +211,10 @@ use score::{
 };
 use sim::{sim_trait_accumulate_i8_f32, SimChunkGenerator, SimEngine, SimTraitAccumulator};
 use sim_g2p::g2p_simulate_py;
-use spgrm::{spgrm_bed_to_jxgrm, spgrm_dense_f32_to_jxgrm, spgrm_packed_to_jxgrm};
+use spgrm::{
+    spgrm_bed_to_jxgrm, spgrm_dense_f32_to_jxgrm, spgrm_dense_npy_to_jxgrm,
+    spgrm_packed_to_jxgrm,
+};
 use top::{top_fit_model_py, top_rank_to_target_sample_py, top_rank_to_target_values_py};
 use tree::{
     geno_chunk_to_alignment_u8, geno_chunk_to_alignment_u8_siteinfo,
@@ -279,6 +282,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(spgrm_packed_to_jxgrm, m)?)?;
     m.add_function(wrap_pyfunction!(spgrm_bed_to_jxgrm, m)?)?;
     m.add_function(wrap_pyfunction!(spgrm_dense_f32_to_jxgrm, m)?)?;
+    m.add_function(wrap_pyfunction!(spgrm_dense_npy_to_jxgrm, m)?)?;
     m.add_function(wrap_pyfunction!(score_cont_mean_diff_py, m)?)?;
     m.add_function(wrap_pyfunction!(score_cont_corr_py, m)?)?;
     m.add_function(wrap_pyfunction!(score_cont_mean_diff_corr_batch_py, m)?)?;
@@ -339,12 +343,12 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(packed_malpha_f64, m)?)?;
     m.add_function(wrap_pyfunction!(packed_malpha_mode_f64, m)?)?;
     m.add_function(wrap_pyfunction!(he_pcg_bed, m)?)?;
-    m.add_function(wrap_pyfunction!(jxlmm_assoc_pcg_bed, m)?)?;
-    m.add_function(wrap_pyfunction!(jxlmm_assoc_pcg_bed_to_tsv, m)?)?;
-    m.add_function(wrap_pyfunction!(jxlmm_scan_exact_packed, m)?)?;
-    m.add_function(wrap_pyfunction!(jxlmm_sparse_grm_diag_stats, m)?)?;
-    m.add_function(wrap_pyfunction!(jxreml_sparse_reml_grid_from_jxgrm, m)?)?;
-    m.add_function(wrap_pyfunction!(jxreml_sparse_reml_brent_from_jxgrm, m)?)?;
+    m.add_function(wrap_pyfunction!(splmm_assoc_pcg_bed, m)?)?;
+    m.add_function(wrap_pyfunction!(splmm_assoc_pcg_bed_to_tsv, m)?)?;
+    m.add_function(wrap_pyfunction!(splmm_scan_exact_packed, m)?)?;
+    m.add_function(wrap_pyfunction!(splmm_sparse_grm_diag_stats, m)?)?;
+    m.add_function(wrap_pyfunction!(spreml_sparse_reml_grid_from_jxgrm, m)?)?;
+    m.add_function(wrap_pyfunction!(spreml_sparse_reml_brent_from_jxgrm, m)?)?;
     m.add_function(wrap_pyfunction!(king::king_unrelated_set_from_bed_py, m)?)?;
     m.add_function(wrap_pyfunction!(rrblup_pcg_bed, m)?)?;
     m.add_function(wrap_pyfunction!(gblup_reml_packed_bed, m)?)?;

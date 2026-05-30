@@ -903,9 +903,16 @@ fn read_site_sidecar_text(path: &Path) -> Result<Vec<SiteInfo>, String> {
                 toks[idx_pos]
             )
         })?;
+        let chrom = toks[idx_chr].to_string();
+        let snp = if idx_chr != 1 && toks.len() > 1 && !toks[1].trim().is_empty() {
+            toks[1].to_string()
+        } else {
+            format!("{}_{}", chrom, pos)
+        };
         sites.push(SiteInfo {
-            chrom: toks[idx_chr].to_string(),
+            chrom,
             pos,
+            snp,
             ref_allele: toks[idx_ref].to_string(),
             alt_allele: toks[idx_alt].to_string(),
         });
@@ -1333,18 +1340,21 @@ fn mbin_site_variants(site: &SiteInfo) -> [SiteInfo; 3] {
     let dom = SiteInfo {
         chrom: site.chrom.clone(),
         pos: site.pos,
+        snp: format!("{}|DOM", site.snp),
         ref_allele: site.ref_allele.clone(),
         alt_allele: format!("{}|DOM", site.alt_allele),
     };
     let rec = SiteInfo {
         chrom: site.chrom.clone(),
         pos: site.pos,
+        snp: format!("{}|REC", site.snp),
         ref_allele: site.ref_allele.clone(),
         alt_allele: format!("{}|REC", site.alt_allele),
     };
     let het = SiteInfo {
         chrom: site.chrom.clone(),
         pos: site.pos,
+        snp: format!("{}|HET", site.snp),
         ref_allele: site.ref_allele.clone(),
         alt_allele: format!("{}|HET", site.alt_allele),
     };

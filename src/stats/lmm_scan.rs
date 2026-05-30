@@ -14,8 +14,6 @@ use rayon::prelude::*;
 use std::borrow::Cow;
 use std::f64::consts::PI;
 use std::fmt::Write as _;
-use std::fs::File;
-use std::io::{BufWriter, Write};
 use std::time::Instant;
 
 use crate::aireml::ai_reml_null_from_spectral;
@@ -25,7 +23,7 @@ use crate::linalg::{
     chi2_sf_df1, chisq_from_beta_se_and_optional_plrt, cholesky_inplace, cholesky_logdet,
     cholesky_solve_into, format_chisq_value, normal_sf,
 };
-use crate::stats_common::{env_truthy, get_cached_pool, parse_index_vec_i64};
+use crate::stats_common::{env_truthy, get_cached_pool, parse_index_vec_i64, AsyncTsvWriter};
 
 /// Solve `A x = b` from the in-place Cholesky factor `L` stored in `a`.
 fn cholesky_solve(a: &[f64], dim: usize, b: &[f64]) -> Vec<f64> {
@@ -2852,6 +2850,7 @@ pub fn lmm_reml_assoc_packed_f32<'py>(
     u_t,
     chrom,
     pos,
+    snp,
     allele0,
     allele1,
     out_tsv,
@@ -2882,6 +2881,7 @@ pub fn lmm_reml_assoc_packed_f32_to_tsv<'py>(
     u_t: PyReadonlyArray2<'py, f32>,
     chrom: Vec<String>,
     pos: Vec<i64>,
+    snp: Vec<String>,
     allele0: Vec<String>,
     allele1: Vec<String>,
     out_tsv: &str,
@@ -2945,11 +2945,12 @@ pub fn lmm_reml_assoc_packed_f32_to_tsv<'py>(
             "row_flip/row_maf/row_missing length mismatch with packed rows",
         ));
     }
-    if chrom.len() != m || pos.len() != m || allele0.len() != m || allele1.len() != m {
+    if chrom.len() != m || pos.len() != m || snp.len() != m || allele0.len() != m || allele1.len() != m {
         return Err(PyRuntimeError::new_err(format!(
-            "TSV metadata length mismatch: rows={m}, chrom={}, pos={}, allele0={}, allele1={}",
+            "TSV metadata length mismatch: rows={m}, chrom={}, pos={}, snp={}, allele0={}, allele1={}",
             chrom.len(),
             pos.len(),
+            snp.len(),
             allele0.len(),
             allele1.len()
         )));
@@ -3056,33 +3057,19 @@ pub fn lmm_reml_assoc_packed_f32_to_tsv<'py>(
         let mut assoc_secs = 0.0_f64;
         let mut tsv_secs = 0.0_f64;
 
-        let out_tsv_path_for_writer = out_tsv_path.clone();
-        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(4);
-        let writer_handle = std::thread::spawn(move || -> Result<(), String> {
-            let out_file = File::create(&out_tsv_path_for_writer)
-                .map_err(|e| format!("create {out_tsv_path_for_writer}: {e}"))?;
-            let mut writer = BufWriter::with_capacity(64 * 1024 * 1024, out_file);
+        let writer = AsyncTsvWriter::with_config(
+            &out_tsv_path,
             if with_plrt {
-                writer
-                    .write_all(b"chrom\tpos\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n")
-                    .map_err(|e| format!("write header {out_tsv_path_for_writer}: {e}"))?;
+                b"chrom\tpos\tsnp\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n"
+                    .as_slice()
             } else {
-                writer
-                    .write_all(b"chrom\tpos\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\n")
-                    .map_err(|e| format!("write header {out_tsv_path_for_writer}: {e}"))?;
-            }
-            for block in rx {
-                if !block.is_empty() {
-                    writer
-                        .write_all(&block)
-                        .map_err(|e| format!("write {out_tsv_path_for_writer}: {e}"))?;
-                }
-            }
-            writer
-                .flush()
-                .map_err(|e| format!("flush {out_tsv_path_for_writer}: {e}"))?;
-            Ok(())
-        });
+                b"chrom\tpos\tsnp\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\n"
+                    .as_slice()
+            },
+            64 * 1024 * 1024,
+            4,
+        )
+        .map_err(PyRuntimeError::new_err)?;
 
         let mut snp_buf = vec![0.0_f32; block_rows * n];
         let mut rot_buf = vec![0.0_f32; block_rows * n];
@@ -3258,9 +3245,10 @@ pub fn lmm_reml_assoc_packed_f32_to_tsv<'py>(
                     if with_plrt {
                         let _ = write!(
                             text_buf,
-                            "{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\t{:.4e}\n",
+                            "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\t{:.4e}\n",
                             chrom[idx],
                             pos[idx],
+                            snp[idx],
                             allele0[idx],
                             allele1[idx],
                             row_maf[idx],
@@ -3274,9 +3262,10 @@ pub fn lmm_reml_assoc_packed_f32_to_tsv<'py>(
                     } else {
                         let _ = write!(
                             text_buf,
-                            "{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\n",
+                            "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\n",
                             chrom[idx],
                             pos[idx],
+                            snp[idx],
                             allele0[idx],
                             allele1[idx],
                             row_maf[idx],
@@ -3289,11 +3278,7 @@ pub fn lmm_reml_assoc_packed_f32_to_tsv<'py>(
                     }
                 }
                 let payload = std::mem::take(&mut text_buf).into_bytes();
-                tx.send(payload).map_err(|e| {
-                    PyRuntimeError::new_err(format!(
-                        "writer queue send failed for {out_tsv_path}: {e}"
-                    ))
-                })?;
+                writer.send(payload).map_err(PyRuntimeError::new_err)?;
                 tsv_secs += tt0.elapsed().as_secs_f64();
 
                 start += rows;
@@ -3312,14 +3297,9 @@ pub fn lmm_reml_assoc_packed_f32_to_tsv<'py>(
         }
 
         let wt0 = Instant::now();
-        drop(tx);
-        let writer_result = writer_handle.join().map_err(|_| {
-            PyRuntimeError::new_err(format!("writer thread panicked for {out_tsv_path}"))
-        })?;
+        let writer_result = writer.finish().map_err(PyRuntimeError::new_err);
         tsv_secs += wt0.elapsed().as_secs_f64();
-        if let Err(msg) = writer_result {
-            return Err(PyRuntimeError::new_err(msg));
-        }
+        writer_result?;
 
         if stage_timing {
             let total_secs = total_t0.elapsed().as_secs_f64();
@@ -4286,6 +4266,7 @@ pub fn fastlmm_assoc_packed_f32_to_tsv<'py>(
     model: &str,
     chrom: Vec<String>,
     pos: Vec<i64>,
+    snp: Vec<String>,
     allele0: Vec<String>,
     allele1: Vec<String>,
     out_tsv: &str,
@@ -4355,11 +4336,12 @@ pub fn fastlmm_assoc_packed_f32_to_tsv<'py>(
             row_missing.len()
         )));
     }
-    if chrom.len() != m || pos.len() != m || allele0.len() != m || allele1.len() != m {
+    if chrom.len() != m || pos.len() != m || snp.len() != m || allele0.len() != m || allele1.len() != m {
         return Err(PyRuntimeError::new_err(format!(
-            "TSV metadata length mismatch: rows={m}, chrom={}, pos={}, allele0={}, allele1={}",
+            "TSV metadata length mismatch: rows={m}, chrom={}, pos={}, snp={}, allele0={}, allele1={}",
             chrom.len(),
             pos.len(),
+            snp.len(),
             allele0.len(),
             allele1.len()
         )));
@@ -4607,27 +4589,13 @@ pub fn fastlmm_assoc_packed_f32_to_tsv<'py>(
         let mut assoc_secs = 0.0_f64;
         let mut tsv_secs = 0.0_f64;
 
-        let out_tsv_path_for_writer = out_tsv_path.clone();
-        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(4);
-        let writer_handle = std::thread::spawn(move || -> Result<(), String> {
-            let out_file = File::create(&out_tsv_path_for_writer)
-                .map_err(|e| format!("create {out_tsv_path_for_writer}: {e}"))?;
-            let mut writer = BufWriter::with_capacity(64 * 1024 * 1024, out_file);
-            writer
-                .write_all(b"chrom\tpos\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n")
-                .map_err(|e| format!("write header {out_tsv_path_for_writer}: {e}"))?;
-            for block in rx {
-                if !block.is_empty() {
-                    writer
-                        .write_all(&block)
-                        .map_err(|e| format!("write {out_tsv_path_for_writer}: {e}"))?;
-                }
-            }
-            writer
-                .flush()
-                .map_err(|e| format!("flush {out_tsv_path_for_writer}: {e}"))?;
-            Ok(())
-        });
+        let writer = AsyncTsvWriter::with_config(
+            &out_tsv_path,
+            b"chrom\tpos\tsnp\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n",
+            64 * 1024 * 1024,
+            4,
+        )
+        .map_err(PyRuntimeError::new_err)?;
 
         let n_f = n as f64;
         let c_ml = n_f * (n_f.ln() - 1.0 - (2.0 * PI).ln()) / 2.0;
@@ -4860,9 +4828,10 @@ pub fn fastlmm_assoc_packed_f32_to_tsv<'py>(
                     let chisq_txt = format_chisq_value(chisq);
                     let _ = write!(
                         text_buf,
-                        "{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\t{:.4e}\n",
+                        "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\t{:.4e}\n",
                         chrom[idx],
                         pos[idx],
+                        snp[idx],
                         allele0[idx],
                         allele1[idx],
                         row_maf[idx],
@@ -4875,11 +4844,7 @@ pub fn fastlmm_assoc_packed_f32_to_tsv<'py>(
                     );
                 }
                 let payload = std::mem::take(&mut text_buf).into_bytes();
-                tx.send(payload).map_err(|e| {
-                    PyRuntimeError::new_err(format!(
-                        "writer queue send failed for {out_tsv_path}: {e}"
-                    ))
-                })?;
+                writer.send(payload).map_err(PyRuntimeError::new_err)?;
                 tsv_secs += tt0.elapsed().as_secs_f64();
                 start += rows;
             }
@@ -4897,14 +4862,9 @@ pub fn fastlmm_assoc_packed_f32_to_tsv<'py>(
         }
 
         let wt0 = Instant::now();
-        drop(tx);
-        let writer_result = writer_handle.join().map_err(|_| {
-            PyRuntimeError::new_err(format!("writer thread panicked for {out_tsv_path}"))
-        })?;
+        let writer_result = writer.finish().map_err(PyRuntimeError::new_err);
         tsv_secs += wt0.elapsed().as_secs_f64();
-        if let Err(msg) = writer_result {
-            return Err(PyRuntimeError::new_err(msg));
-        }
+        writer_result?;
 
         if stage_timing {
             let total_secs = total_t0.elapsed().as_secs_f64();

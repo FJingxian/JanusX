@@ -14,7 +14,7 @@ use crate::cholesky::{
 use crate::linalg::{cholesky_inplace, cholesky_logdet, cholesky_solve_into};
 use crate::stats_common::{map_err_string_to_py, parse_index_vec_i64};
 
-const JXREML_TINY: f64 = 1e-30_f64;
+const SPREML_TINY: f64 = 1e-30_f64;
 
 #[derive(Clone, Debug)]
 struct SparseRemlEval {
@@ -179,7 +179,7 @@ impl SparseRemlEvaluator {
 
 fn build_design_matrix(x_cov: Option<&[f64]>, n: usize, p0: usize) -> Result<Vec<f64>, String> {
     if n == 0 {
-        return Err("JXREML requires n > 0".to_string());
+        return Err("SPREML requires n > 0".to_string());
     }
     let mut x = vec![0.0_f64; n * (p0 + 1)];
     for i in 0..n {
@@ -188,7 +188,7 @@ fn build_design_matrix(x_cov: Option<&[f64]>, n: usize, p0: usize) -> Result<Vec
     if let Some(cov) = x_cov {
         if cov.len() != n.saturating_mul(p0) {
             return Err(format!(
-                "JXREML covariate length mismatch: got {}, expected {} for n={} and p0={}",
+                "SPREML covariate length mismatch: got {}, expected {} for n={} and p0={}",
                 cov.len(),
                 n.saturating_mul(p0),
                 n,
@@ -275,17 +275,17 @@ fn evaluate_sparse_reml_at_lambda(
     let lambda = 10.0_f64.powf(log10_lambda);
     if !lambda.is_finite() || lambda <= 0.0 {
         return Err(format!(
-            "JXREML lambda is invalid at log10(lambda)={log10_lambda}"
+            "SPREML lambda is invalid at log10(lambda)={log10_lambda}"
         ));
     }
     let n = y.len();
     let p = x_design.len() / n;
     if p == 0 || n <= p {
-        return Err(format!("JXREML requires n > p, got n={n}, p={p}"));
+        return Err(format!("SPREML requires n > p, got n={n}, p={p}"));
     }
     if evaluator.n != n || evaluator.p != p {
         return Err(format!(
-            "JXREML evaluator shape mismatch: evaluator=({}, {}), data=({}, {})",
+            "SPREML evaluator shape mismatch: evaluator=({}, {}), data=({}, {})",
             evaluator.n, evaluator.p, n, p
         ));
     }
@@ -301,7 +301,7 @@ fn evaluate_sparse_reml_at_lambda(
     xt_vec_row_major(x_design, n, p, y_vinv, &mut evaluator.xt_vinv_y);
 
     xt_mat_col_major_rhs(x_design, x_vinv_col, n, p, &mut evaluator.xt_vinv_x);
-    let xt_vinv_x_chol = spd_cholesky_with_jitter(&evaluator.xt_vinv_x, p, "JXREML XtVinvX")?;
+    let xt_vinv_x_chol = spd_cholesky_with_jitter(&evaluator.xt_vinv_x, p, "SPREML XtVinvX")?;
     cholesky_solve_into(
         &xt_vinv_x_chol,
         p,
@@ -316,9 +316,9 @@ fn evaluate_sparse_reml_at_lambda(
             .zip(evaluator.beta_hat.iter())
             .map(|(a, b)| a * b)
             .sum::<f64>();
-    if !ypy.is_finite() || ypy <= JXREML_TINY {
+    if !ypy.is_finite() || ypy <= SPREML_TINY {
         return Err(format!(
-            "JXREML profiled residual quadratic form is invalid at lambda={lambda}: yPy={ypy}"
+            "SPREML profiled residual quadratic form is invalid at lambda={lambda}: yPy={ypy}"
         ));
     }
 
@@ -326,7 +326,7 @@ fn evaluate_sparse_reml_at_lambda(
     let sigma_g2 = ypy / df;
     if !sigma_g2.is_finite() || sigma_g2 <= 0.0 {
         return Err(format!(
-            "JXREML sigma_g2 is invalid at lambda={lambda}: sigma_g2={sigma_g2}"
+            "SPREML sigma_g2 is invalid at lambda={lambda}: sigma_g2={sigma_g2}"
         ));
     }
     let sigma_e2 = lambda * sigma_g2;
@@ -339,7 +339,7 @@ fn evaluate_sparse_reml_at_lambda(
     let ml = c_ml - 0.5 * (n_f * ypy.ln() + log_det_v);
     if !reml.is_finite() || !ml.is_finite() {
         return Err(format!(
-            "JXREML likelihood is invalid at lambda={lambda}: ml={ml}, reml={reml}"
+            "SPREML likelihood is invalid at lambda={lambda}: ml={ml}, reml={reml}"
         ));
     }
 
@@ -363,7 +363,7 @@ fn sparse_reml_grid_search(
 ) -> Result<SparseRemlSearchResult, String> {
     if !low.is_finite() || !high.is_finite() || low >= high {
         return Err(format!(
-            "JXREML grid search requires finite low < high, got low={low}, high={high}"
+            "SPREML grid search requires finite low < high, got low={low}, high={high}"
         ));
     }
     let grid_n = grid_size.max(2);
@@ -393,7 +393,7 @@ fn sparse_reml_grid_search(
             }
             Err(err) => {
                 if sparse_reml_debug_enabled() {
-                    eprintln!("JXREML grid eval failed at log10(lambda)={log10_lambda:.6e}: {err}");
+                    eprintln!("SPREML grid eval failed at log10(lambda)={log10_lambda:.6e}: {err}");
                 }
                 if first_err.is_none() {
                     first_err = Some(err);
@@ -403,9 +403,9 @@ fn sparse_reml_grid_search(
     }
     let best = best.ok_or_else(|| match first_err {
         Some(err) => format!(
-            "JXREML sparse grid search found no valid lambda in [{low}, {high}]; first failure: {err}"
+            "SPREML sparse grid search found no valid lambda in [{low}, {high}]; first failure: {err}"
         ),
-        None => format!("JXREML sparse grid search found no valid lambda in [{low}, {high}]"),
+        None => format!("SPREML sparse grid search found no valid lambda in [{low}, {high}]"),
     })?;
     Ok(SparseRemlSearchResult { best, grid: evals })
 }
@@ -423,7 +423,7 @@ fn sparse_reml_grid_search_with_progress(
 ) -> Result<SparseRemlSearchResult, String> {
     if !low.is_finite() || !high.is_finite() || low >= high {
         return Err(format!(
-            "JXREML grid search requires finite low < high, got low={low}, high={high}"
+            "SPREML grid search requires finite low < high, got low={low}, high={high}"
         ));
     }
     let grid_n = grid_size.max(2);
@@ -453,7 +453,7 @@ fn sparse_reml_grid_search_with_progress(
             }
             Err(err) => {
                 if sparse_reml_debug_enabled() {
-                    eprintln!("JXREML grid eval failed at log10(lambda)={log10_lambda:.6e}: {err}");
+                    eprintln!("SPREML grid eval failed at log10(lambda)={log10_lambda:.6e}: {err}");
                 }
                 if first_err.is_none() {
                     first_err = Some(err);
@@ -468,9 +468,9 @@ fn sparse_reml_grid_search_with_progress(
     }
     let best = best.ok_or_else(|| match first_err {
         Some(err) => format!(
-            "JXREML sparse grid search found no valid lambda in [{low}, {high}]; first failure: {err}"
+            "SPREML sparse grid search found no valid lambda in [{low}, {high}]; first failure: {err}"
         ),
-        None => format!("JXREML sparse grid search found no valid lambda in [{low}, {high}]"),
+        None => format!("SPREML sparse grid search found no valid lambda in [{low}, {high}]"),
     })?;
     Ok(SparseRemlSearchResult { best, grid: evals })
 }
@@ -490,11 +490,11 @@ fn sparse_reml_brent_search_with_progress(
 ) -> Result<SparseRemlSearchResult, String> {
     if !(tol.is_finite() && tol > 0.0) {
         return Err(format!(
-            "JXREML Brent tol must be finite and > 0, got {tol}"
+            "SPREML Brent tol must be finite and > 0, got {tol}"
         ));
     }
     if max_iter == 0 {
-        return Err("JXREML Brent max_iter must be > 0".to_string());
+        return Err("SPREML Brent max_iter must be > 0".to_string());
     }
     let grid_n = grid_size.max(2);
     let grid = sparse_reml_grid_search_with_progress(
@@ -566,7 +566,7 @@ fn sparse_reml_brent_search_with_progress(
                 Ok(eval) => -eval.reml,
                 Err(err) => {
                     if sparse_reml_debug_enabled() {
-                        eprintln!("JXREML Brent eval failed at log10(lambda)={x0:.6e}: {err}");
+                        eprintln!("SPREML Brent eval failed at log10(lambda)={x0:.6e}: {err}");
                     }
                     if brent_eval_err.borrow().is_none() {
                         *brent_eval_err.borrow_mut() = Some(err);
@@ -605,7 +605,7 @@ fn sparse_reml_brent_search_with_progress(
     )
     .map_err(|err| match brent_eval_err.into_inner() {
         Some(first_err) => format!(
-            "JXREML Brent final evaluation failed at log10(lambda)={best_log10:.6e}: {err}; earlier failure: {first_err}"
+            "SPREML Brent final evaluation failed at log10(lambda)={best_log10:.6e}: {err}; earlier failure: {first_err}"
         ),
         None => err,
     })?;
@@ -695,7 +695,7 @@ fn result_to_tuple(
     high=5.0,
     grid_size=33
 ))]
-pub fn jxreml_sparse_reml_grid_from_jxgrm<'py>(
+pub fn spreml_sparse_reml_grid_from_jxgrm<'py>(
     py: Python<'py>,
     jxgrm_path: String,
     y: PyReadonlyArray1<'py, f64>,
@@ -748,7 +748,7 @@ pub fn jxreml_sparse_reml_grid_from_jxgrm<'py>(
         let analysis = load_subset_analysis_from_path(&jxgrm_path, sample_idx_raw.as_deref())?;
         if analysis.dim() != y_vec.len() {
             return Err(format!(
-                "JXREML subset sample size mismatch: sparse n={}, phenotype n={}",
+                "SPREML subset sample size mismatch: sparse n={}, phenotype n={}",
                 analysis.dim(),
                 y_vec.len()
             ));
@@ -777,7 +777,7 @@ pub fn jxreml_sparse_reml_grid_from_jxgrm<'py>(
     max_iter=20,
     progress_callback=None
 ))]
-pub fn jxreml_sparse_reml_brent_from_jxgrm<'py>(
+pub fn spreml_sparse_reml_brent_from_jxgrm<'py>(
     py: Python<'py>,
     jxgrm_path: String,
     y: PyReadonlyArray1<'py, f64>,
@@ -838,7 +838,7 @@ pub fn jxreml_sparse_reml_brent_from_jxgrm<'py>(
         emit_sparse_reml_progress(progress_callback.as_ref(), 1, total_progress)?;
         if analysis.dim() != y_vec.len() {
             return Err(format!(
-                "JXREML subset sample size mismatch: sparse n={}, phenotype n={}",
+                "SPREML subset sample size mismatch: sparse n={}, phenotype n={}",
                 analysis.dim(),
                 y_vec.len()
             ));

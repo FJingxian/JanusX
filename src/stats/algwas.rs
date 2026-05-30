@@ -31,7 +31,7 @@ use crate::he::build_row_standardization_stats;
 use crate::linalg::{chi2_sf_df1, chi2_stat_df1_from_sf, format_chisq_value};
 use crate::math_farmcpu::decode_packed_rows_to_sample_major;
 use crate::pcg::{pcg_solve, IdentityPreconditioner, PcgOperator};
-use crate::stats_common::{get_cached_pool, parse_index_vec_i64};
+use crate::stats_common::{get_cached_pool, parse_index_vec_i64, AsyncTsvWriter};
 
 const DEFAULT_STANDARDIZE_EPS32: f32 = 1e-12_f32;
 const DEFAULT_STAGE1_PATH_STEPS: usize = 64;
@@ -159,6 +159,26 @@ fn algwas_stage1_ebic_gamma() -> f64 {
         .unwrap_or(DEFAULT_STAGE1_EBIC_GAMMA)
 }
 
+#[inline]
+fn algwas_stage1_site_cap(n: usize) -> usize {
+    let default_cap = ((n as f64).sqrt().floor() as usize).clamp(1usize, 50usize);
+    std::env::var("JX_ALGWAS_STAGE1_SITE_CAP")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(default_cap)
+}
+
+#[inline]
+fn algwas_stage1_ld_prune_r2() -> f64 {
+    std::env::var("JX_ALGWAS_STAGE1_LD_R2")
+        .ok()
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0_f64)
+        .unwrap_or(0.8_f64)
+        .clamp(1e-6_f64, 1.0_f64)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AlgwasStage1SelectCriterion {
     Ebic,
@@ -177,14 +197,6 @@ fn algwas_stage1_select_criterion() -> AlgwasStage1SelectCriterion {
             }
         }
         Err(_) => AlgwasStage1SelectCriterion::Bic,
-    }
-}
-
-#[inline]
-fn algwas_stage1_select_criterion_label(criterion: AlgwasStage1SelectCriterion) -> &'static str {
-    match criterion {
-        AlgwasStage1SelectCriterion::Ebic => "EBIC",
-        AlgwasStage1SelectCriterion::Bic => "BIC",
     }
 }
 
@@ -3751,6 +3763,107 @@ fn active_mask_to_beta(mask: &[bool], beta_init: &[f32], n_features: usize) -> V
     out
 }
 
+#[inline]
+fn algwas_pair_r2_from_rows(
+    row_i: &[f64],
+    mean_i: f64,
+    ss_i: f64,
+    row_j: &[f64],
+    mean_j: f64,
+    ss_j: f64,
+) -> f64 {
+    if !(ss_i > 0.0_f64 && ss_j > 0.0_f64) {
+        return 0.0_f64;
+    }
+    let mut cov = 0.0_f64;
+    for idx in 0..row_i.len() {
+        cov += (row_i[idx] - mean_i) * (row_j[idx] - mean_j);
+    }
+    let r2 = (cov * cov) / (ss_i * ss_j);
+    if r2.is_finite() {
+        r2.clamp(0.0_f64, 1.0_f64)
+    } else {
+        0.0_f64
+    }
+}
+
+fn algwas_stage1_ld_prune_selected(
+    design: &AlgwasPackedDesign<'_>,
+    chrom: &[String],
+    pos: &[i64],
+    beta: &[f32],
+    selected_indices: &[usize],
+) -> Result<Vec<usize>, String> {
+    let k = selected_indices.len();
+    if k <= 1 {
+        return Ok(selected_indices.to_vec());
+    }
+    let r2_threshold = algwas_stage1_ld_prune_r2();
+    if !(r2_threshold.is_finite() && r2_threshold > 0.0_f64) {
+        return Ok(selected_indices.to_vec());
+    }
+    let n = design.n_samples();
+    let mut decoded = vec![0.0_f64; k * n];
+    design.decode_rows_raw_into_f64(selected_indices, &mut decoded)?;
+    let mut row_mean = vec![0.0_f64; k];
+    let mut row_ss = vec![0.0_f64; k];
+    for local in 0..k {
+        let row = &decoded[local * n..(local + 1) * n];
+        let mean = row.iter().sum::<f64>() / (n as f64);
+        let mut ss = 0.0_f64;
+        for &v in row {
+            let d = v - mean;
+            ss += d * d;
+        }
+        row_mean[local] = mean;
+        row_ss[local] = ss;
+    }
+
+    let mut order: Vec<usize> = (0..k).collect();
+    order.sort_by(|&a, &b| {
+        let ga = selected_indices[a];
+        let gb = selected_indices[b];
+        beta[gb]
+            .abs()
+            .total_cmp(&beta[ga].abs())
+            .then_with(|| chrom[ga].cmp(&chrom[gb]))
+            .then_with(|| pos[ga].cmp(&pos[gb]))
+            .then_with(|| ga.cmp(&gb))
+    });
+
+    let mut kept_local = Vec::<usize>::with_capacity(k);
+    'candidate: for &li in &order {
+        let global_i = selected_indices[li];
+        let row_i = &decoded[li * n..(li + 1) * n];
+        for &lj in &kept_local {
+            let global_j = selected_indices[lj];
+            if chrom[global_i] != chrom[global_j] {
+                continue;
+            }
+            let row_j = &decoded[lj * n..(lj + 1) * n];
+            let r2 = algwas_pair_r2_from_rows(
+                row_i,
+                row_mean[li],
+                row_ss[li],
+                row_j,
+                row_mean[lj],
+                row_ss[lj],
+            );
+            if r2 >= r2_threshold {
+                continue 'candidate;
+            }
+        }
+        kept_local.push(li);
+    }
+
+    let mut kept = kept_local
+        .into_iter()
+        .map(|local| selected_indices[local])
+        .collect::<Vec<_>>();
+    kept.sort_unstable();
+    Ok(kept)
+}
+
 fn fit_stage1_path_streaming(
     design: &AlgwasPackedDesign<'_>,
     proj: &CovariateProjection,
@@ -3914,12 +4027,14 @@ fn fit_stage1_path_streaming(
     });
 
     let selection_criterion = algwas_stage1_select_criterion();
+    let early_stop_cap = algwas_stage1_site_cap(n);
     let mut warm_state: Option<AlgwasStage1WarmState> = None;
     let mut best_idx = 0usize;
     let mut best_selected_score = algwas_stage1_path_score(&path[0], selection_criterion);
     let mut best_beta_std = vec![0.0_f32; p];
     let mut best_converged = true;
     let mut path_solve_secs = 0.0_f64;
+    let mut last_progress_done = 3usize;
 
     for step in 0..lambda_steps {
         let t = if lambda_steps <= 1 {
@@ -3981,12 +4096,16 @@ fn fit_stage1_path_streaming(
         warm_state = Some(next_warm_state);
         if let Some(cb) = progress_callback {
             let done = step + 4;
+            last_progress_done = done;
             Python::attach(|py| -> PyResult<()> {
                 py.check_signals()?;
                 cb.call1(py, (done, progress_total))?;
                 Ok(())
             })
             .map_err(|e| e.to_string())?;
+        }
+        if nnz > early_stop_cap {
+            break;
         }
     }
 
@@ -4028,6 +4147,16 @@ fn fit_stage1_path_streaming(
             100.0_f64 * path_solve_secs / total_secs,
             total_secs,
         );
+    }
+
+    if let Some(cb) = progress_callback {
+        let done = last_progress_done.max(progress_total);
+        Python::attach(|py| -> PyResult<()> {
+            py.check_signals()?;
+            cb.call1(py, (done, progress_total))?;
+            Ok(())
+        })
+        .map_err(|e| e.to_string())?;
     }
 
     Ok(AlgwasStage1Result {
@@ -4653,6 +4782,7 @@ fn fit_stage1_path_exact_packed(
         .qtn_bound
         .unwrap_or(DEFAULT_STAGE1_MSGPS_PMAX)
         .min(p.max(1));
+    let early_stop_cap = algwas_stage1_site_cap(n);
 
     let mut g: Vec<f64> = xty0.iter().map(|v| alpha_n2 * *v).collect();
     let mut residual = DVector::<f64>::from_column_slice(&y_centered);
@@ -4672,6 +4802,7 @@ fn fit_stage1_path_exact_packed(
     let mut last_jstar: Option<usize> = None;
     let mut last_sign = 1.0_f64;
     let mut step_adj_raw = step_max + 1;
+    let mut include_last_step = false;
     let mut converged = false;
     let cache_cap = pmax.saturating_add(1).min(p.max(1));
     let block_rows = design.block_rows.max(1);
@@ -4773,6 +4904,11 @@ fn fit_stage1_path_exact_packed(
 
         last_jstar = Some(max_idx);
         last_sign = sign;
+        if selected_cols.len() > early_stop_cap {
+            step_adj_raw = step.saturating_add(1);
+            include_last_step = true;
+            break;
+        }
         if below_thr == p || max_val <= 0.0_f64 {
             converged = true;
             step_adj_raw = step;
@@ -4802,7 +4938,11 @@ fn fit_stage1_path_exact_packed(
         }
     }
 
-    let step_adj = step_adj_raw.saturating_sub(1).min(step_max);
+    let step_adj = if include_last_step {
+        step_adj_raw.min(step_max)
+    } else {
+        step_adj_raw.saturating_sub(1).min(step_max)
+    };
     let q_n = selected_cols.len();
     let df = if q_n > 0 {
         let mut x_sel = Vec::<f64>::with_capacity(n * q_n);
@@ -5017,6 +5157,7 @@ fn fit_stage1_path_dense_msgps(
         .qtn_bound
         .unwrap_or(DEFAULT_STAGE1_MSGPS_PMAX)
         .min(p.max(1));
+    let early_stop_cap = algwas_stage1_site_cap(n);
 
     let xty0 = x_std.transpose() * DVector::<f64>::from_column_slice(&y_centered);
     let mut g: Vec<f64> = xty0.iter().map(|v| alpha_n2 * *v).collect();
@@ -5038,6 +5179,7 @@ fn fit_stage1_path_dense_msgps(
     let mut last_jstar: Option<usize> = None;
     let mut last_sign = 1.0_f64;
     let mut step_adj_raw = step_max + 1;
+    let mut include_last_step = false;
     let mut converged = false;
     let beta_zero_tol = msgps_near_zero_tol(delta_t);
     if let Some(cb) = progress_callback {
@@ -5124,6 +5266,11 @@ fn fit_stage1_path_dense_msgps(
 
         last_jstar = Some(max_idx);
         last_sign = sign;
+        if selected_cols.len() > early_stop_cap {
+            step_adj_raw = step.saturating_add(1);
+            include_last_step = true;
+            break;
+        }
         if below_thr == p || max_val <= 0.0_f64 {
             converged = true;
             step_adj_raw = step;
@@ -5152,7 +5299,11 @@ fn fit_stage1_path_dense_msgps(
             }
         }
     }
-    let step_adj = step_adj_raw.saturating_sub(1).min(step_max);
+    let step_adj = if include_last_step {
+        step_adj_raw.min(step_max)
+    } else {
+        step_adj_raw.saturating_sub(1).min(step_max)
+    };
 
     let q_n = selected_cols.len();
     let df = if q_n > 0 {
@@ -5383,6 +5534,7 @@ fn write_stage2_tsv(
     x_cov: &[f64],
     chrom: &[String],
     pos: &[i64],
+    snp: &[String],
     allele0: &[String],
     allele1: &[String],
     packed: Cow<'_, [u8]>,
@@ -5410,6 +5562,7 @@ fn write_stage2_tsv(
     let q_total = q_base + k;
     if chrom.len() != row_flip.len()
         || pos.len() != row_flip.len()
+        || snp.len() != row_flip.len()
         || allele0.len() != row_flip.len()
         || allele1.len() != row_flip.len()
         || row_maf.len() != row_flip.len()
@@ -5495,19 +5648,21 @@ fn write_stage2_tsv(
     } else {
         progress_every.max(1)
     };
-    let out_file = File::create(out_tsv).map_err(|e| format!("create {out_tsv}: {e}"))?;
-    let mut writer = BufWriter::with_capacity(64 * 1024 * 1024, out_file);
-    writer
-        .write_all(b"chrom\tpos\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n")
-        .map_err(|e| format!("write header {out_tsv}: {e}"))?;
+    let writer = AsyncTsvWriter::with_config(
+        out_tsv,
+        b"chrom\tpos\tsnp\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n",
+        64 * 1024 * 1024,
+        4,
+    )?;
 
-    let mut pseudo_writer = if let Some(path) = pseudo_tsv {
+    let pseudo_writer = if let Some(path) = pseudo_tsv {
         if k > 0 {
-            let f = File::create(path).map_err(|e| format!("create {path}: {e}"))?;
-            let mut w = BufWriter::with_capacity(16 * 1024 * 1024, f);
-            w.write_all(b"chrom\tpos\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n")
-                .map_err(|e| format!("write header {path}: {e}"))?;
-            Some((path.to_string(), w))
+            Some(AsyncTsvWriter::with_config(
+                path,
+                b"chrom\tpos\tsnp\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n",
+                16 * 1024 * 1024,
+                4,
+            )?)
         } else {
             None
         }
@@ -5628,9 +5783,10 @@ fn write_stage2_tsv(
             let miss = row_missing_count_from_float(row_missing[idx]);
             let _ = write!(
                 text_buf,
-                "{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\t{:.4e}\n",
+                "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\t{:.4e}\n",
                 chrom[idx],
                 pos[idx],
+                snp[idx],
                 allele0[idx],
                 allele1[idx],
                 row_maf[idx],
@@ -5644,9 +5800,10 @@ fn write_stage2_tsv(
             if qtn_lookup.contains_key(&idx) {
                 let _ = write!(
                     pseudo_text_buf,
-                    "{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\t{:.4e}\n",
+                    "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\t{:.4e}\n",
                     chrom[idx],
                     pos[idx],
+                    snp[idx],
                     allele0[idx],
                     allele1[idx],
                     row_maf[idx],
@@ -5659,13 +5816,12 @@ fn write_stage2_tsv(
                 );
             }
         }
-        writer
-            .write_all(text_buf.as_bytes())
-            .map_err(|e| format!("write {out_tsv}: {e}"))?;
-        if let Some((path, pw)) = pseudo_writer.as_mut() {
+        if !text_buf.is_empty() {
+            writer.send(text_buf.as_bytes().to_vec())?;
+        }
+        if let Some(pw) = pseudo_writer.as_ref() {
             if !pseudo_text_buf.is_empty() {
-                pw.write_all(pseudo_text_buf.as_bytes())
-                    .map_err(|e| format!("write {path}: {e}"))?;
+                pw.send(pseudo_text_buf.as_bytes().to_vec())?;
             }
         }
 
@@ -5683,11 +5839,9 @@ fn write_stage2_tsv(
         }
         i += cnt;
     }
-    writer
-        .flush()
-        .map_err(|e| format!("flush {out_tsv}: {e}"))?;
-    if let Some((path, mut pw)) = pseudo_writer {
-        pw.flush().map_err(|e| format!("flush {path}: {e}"))?;
+    writer.finish()?;
+    if let Some(pw) = pseudo_writer {
+        pw.finish()?;
         pseudo_rows = qtn_written;
     }
     Ok((k, pseudo_rows, written_rows))
@@ -5956,6 +6110,7 @@ fn write_algwas_stage1_summary_tsv(
     x_cov,
     chrom,
     pos,
+    snp,
     allele0,
     allele1,
     packed,
@@ -5981,6 +6136,7 @@ pub fn algwas_packed_to_tsv(
     x_cov: PyReadonlyArray2<'_, f64>,
     chrom: Vec<String>,
     pos: Vec<i64>,
+    snp: Vec<String>,
     allele0: Vec<String>,
     allele1: Vec<String>,
     packed: PyReadonlyArray2<'_, u8>,
@@ -6046,7 +6202,7 @@ pub fn algwas_packed_to_tsv(
     if row_flip.len() != m || row_maf.len() != m || row_missing.len() != m {
         return Err(PyRuntimeError::new_err("row metadata length mismatch"));
     }
-    if chrom.len() != m || pos.len() != m || allele0.len() != m || allele1.len() != m {
+    if chrom.len() != m || pos.len() != m || snp.len() != m || allele0.len() != m || allele1.len() != m {
         return Err(PyRuntimeError::new_err("metadata length mismatch"));
     }
 
@@ -6089,64 +6245,52 @@ pub fn algwas_packed_to_tsv(
         lasso: crate::lasso::LassoConfig::default(),
     };
 
-    let stage1 = fit_stage1_path(
-        &design,
-        &cov_proj,
-        y,
-        &alg_cfg,
-        stage1_progress_callback.as_ref(),
-    )
-    .map_err(PyRuntimeError::new_err)?;
-    let stage1_summary_tsv =
-        write_algwas_stage1_summary_tsv(out_tsv, &stage1).map_err(PyRuntimeError::new_err)?;
-    if let Some(best_point) = stage1.path.get(stage1.best_step) {
-        let best_bic_idx = best_stage1_path_index(&stage1.path, AlgwasStage1SelectCriterion::Bic);
-        let best_ebic_idx = best_stage1_path_index(&stage1.path, AlgwasStage1SelectCriterion::Ebic);
-        let best_bic_point = stage1.path.get(best_bic_idx).unwrap_or(best_point);
-        let best_ebic_point = stage1.path.get(best_ebic_idx).unwrap_or(best_point);
-        let selection_criterion = algwas_stage1_select_criterion();
-        eprintln!(
-            "ALGWAS stage1 model selection: criterion={}, best_step={}, lambda={:.6e}, qtn={}, rss={:.6e}, bic={:.6e}, ebic(gamma={:.2})={:.6e}; bic_best_step={}, bic_best_qtn={}, ebic_best_step={}, ebic_best_qtn={}, summary={}",
-            algwas_stage1_select_criterion_label(selection_criterion),
-            stage1.best_step,
-            best_point.lambda as f64,
-            best_point.nnz,
-            best_point.rss,
-            best_point.bic,
-            algwas_stage1_ebic_gamma(),
-            best_point.ebic,
-            best_bic_idx,
-            best_bic_point.nnz,
-            best_ebic_idx,
-            best_ebic_point.nnz,
-            stage1_summary_tsv,
-        );
-    }
-    let selected_indices = stage1.selected_indices.clone();
+    let (qtn_count, pseudo_rows, written_rows) = _py
+        .detach(move || -> Result<(usize, usize, usize), String> {
+            let stage1 = fit_stage1_path(
+                &design,
+                &cov_proj,
+                y,
+                &alg_cfg,
+                stage1_progress_callback.as_ref(),
+            )?;
+            write_algwas_stage1_summary_tsv(out_tsv, &stage1)?;
+            let mut selected_indices = stage1.selected_indices.clone();
+            if selected_indices.len() > 1 {
+                selected_indices = algwas_stage1_ld_prune_selected(
+                    &design,
+                    &chrom,
+                    &pos,
+                    &stage1.beta,
+                    &selected_indices,
+                )?;
+            }
 
-    let (qtn_count, pseudo_rows, written_rows) = write_stage2_tsv(
-        y,
-        x_cov_flat.as_ref(),
-        &chrom,
-        &pos,
-        &allele0,
-        &allele1,
-        packed_flat,
-        n_samples,
-        row_flip,
-        row_maf,
-        row_missing,
-        out_tsv,
-        &sample_idx,
-        row_idx.as_deref(),
-        &selected_indices,
-        threads,
-        scan_step.max(1),
-        progress_callback,
-        scan_step.max(1),
-        pseudo_tsv,
-    )
-    .map_err(PyRuntimeError::new_err)?;
+            write_stage2_tsv(
+                y,
+                x_cov_flat.as_ref(),
+                &chrom,
+                &pos,
+                &snp,
+                &allele0,
+                &allele1,
+                packed_flat,
+                n_samples,
+                row_flip,
+                row_maf,
+                row_missing,
+                out_tsv,
+                &sample_idx,
+                row_idx.as_deref(),
+                &selected_indices,
+                threads,
+                scan_step.max(1),
+                progress_callback,
+                scan_step.max(1),
+                pseudo_tsv,
+            )
+        })
+        .map_err(PyRuntimeError::new_err)?;
 
     Ok((qtn_count, pseudo_rows, written_rows))
 }
@@ -6429,6 +6573,33 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0], 1);
         assert_eq!(rows[1], 2);
+    }
+
+    #[test]
+    fn algwas_stage1_site_cap_default_matches_spec() {
+        assert_eq!(algwas_stage1_site_cap(1), 1);
+        assert_eq!(algwas_stage1_site_cap(12), 3);
+        assert_eq!(algwas_stage1_site_cap(144), 12);
+        assert_eq!(algwas_stage1_site_cap(10_000), 50);
+    }
+
+    #[test]
+    fn algwas_stage1_ld_prune_removes_redundant_same_chrom_sites() {
+        let rows = vec![
+            vec![0u8, 0, 1, 1, 2, 2, 1, 1],
+            vec![0u8, 0, 1, 1, 2, 2, 1, 1],
+            vec![2u8, 1, 2, 1, 0, 0, 1, 1],
+        ];
+        let (design, _row_maf) = build_test_design(&rows);
+        let chrom = vec!["1".to_string(), "1".to_string(), "2".to_string()];
+        let pos = vec![100_i64, 120_i64, 200_i64];
+        let beta = vec![0.4_f32, 1.2_f32, 0.8_f32];
+        let selected = vec![0usize, 1usize, 2usize];
+
+        let kept = algwas_stage1_ld_prune_selected(&design, &chrom, &pos, &beta, &selected)
+            .expect("ld prune should succeed");
+
+        assert_eq!(kept, vec![1usize, 2usize]);
     }
 
     #[test]

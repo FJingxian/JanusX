@@ -7,7 +7,7 @@ Design overview
 Models:
   - LMM     : streaming, low-memory implementation (slim.LMM)
   - LM      : streaming, low-memory implementation (slim.LM)
-  - JXLMM   : sparse-GRM + sparse-Cholesky mixed-model route
+  - SparseLMM: sparse-GRM + sparse-Cholesky mixed-model route
   - ALGWAS  : packed/full-rust adaptive-lasso GWAS route
   - FarmCPU : in-memory implementation (pyBLUP.farmcpu) that loads the
               full genotype matrix
@@ -18,7 +18,7 @@ Execution mode (automatic)
   - Default: LM/LMM/FastLMM run in memmap BED mode.
   - With `-fast` (or when `-farmcpu` / `-algwas` is selected), packed BED is
     loaded once and reused for full-rust packed routes when available.
-  - JXLMM defaults to BED memmap / streaming metadata unless `-fast` reuses a packed preload.
+  - SparseLMM defaults to BED memmap / streaming metadata unless `-fast` reuses a packed preload.
   - FarmCPU always runs on the full in-memory genotype matrix.
 
 Caching
@@ -56,7 +56,7 @@ import multiprocessing as mp
 import concurrent.futures as cf
 import textwrap
 from datetime import datetime
-from typing import Any, Iterator, Union, Optional
+from typing import Any, Iterator, Union, Optional, Callable
 import uuid
 from contextlib import contextmanager
 
@@ -238,6 +238,21 @@ def _replace_file_with_retry(
                 time.sleep(float(base_sleep_s) * float(min(i + 1, 10)))
                 continue
             raise
+
+
+def _gwas_result_tmp_path(out_tsv: str) -> str:
+    return f"{str(out_tsv)}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
+
+
+def _cleanup_gwas_result_tmp(tmp_tsv: str) -> None:
+    path = str(tmp_tsv).strip()
+    if not path:
+        return
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except OSError:
+        pass
 
 
 def _fastlmm_should_switch_to_lmm(pve: Optional[float]) -> bool:
@@ -701,7 +716,7 @@ def _gwas_model_sort_key(model_name: object) -> tuple[int, str]:
         "LowRankLMM": 3,
         "LrLMM": 3,
         "LRLMM": 3,
-        "JXLMM": 4,
+        "SparseLMM": 4,
         "ALGWAS": 5,
         "Farm": 5,
         "FarmCPU": 5,
@@ -2137,7 +2152,7 @@ def load_or_build_grm_with_cache(
     snps_only: bool = True,
     allow_packed_full_load: bool = False,
     preloaded_packed: Union[dict[str, object], None] = None,
-) -> tuple[np.ndarray, int, Union[np.ndarray, None]]:
+) -> tuple[np.ndarray, int, Union[np.ndarray, None], Union[str, None]]:
     """
     Load or build a GRM with caching for streaming LMM/LM runs.
     """
@@ -2187,8 +2202,10 @@ def load_or_build_grm_with_cache(
     method_is_builtin = mgrm in ["1", "2"]
 
     grm_ids = None
+    grm_cache_path: Union[str, None] = None
     if method_is_builtin:
         grm_path, id_path = _grm_cache_paths(cache_prefix, mgrm=str(mgrm))
+        grm_cache_path = str(grm_path)
         legacy_grm_path, legacy_id_path = _grm_cache_paths_legacy(
             cache_prefix, mgrm=str(mgrm)
         )
@@ -2357,7 +2374,7 @@ def load_or_build_grm_with_cache(
             task.complete(f"Loading GRM from {src} (n={grm.shape[0]})")
 
     _log_info(logger, f"GRM shape: {grm.shape}", use_spinner=use_spinner)
-    return grm, eff_m, grm_ids
+    return grm, eff_m, grm_ids, grm_cache_path
 
 
 def build_pcs_from_grm(
@@ -2571,6 +2588,7 @@ def prepare_streaming_context(
     allow_packed_grm: bool = False,
     preload_packed_context: bool = False,
     require_bed_stream: bool = False,
+    post_grm_hook: Optional[Callable[[str, Optional[str]], None]] = None,
 ):
     """
     Prepare all shared resources for streaming LMM/LM once:
@@ -2756,11 +2774,13 @@ def prepare_streaming_context(
     grm: Union[np.ndarray, None] = None
     eff_m = n_snps
     grm_ids = None
+    grm_cache_path: Union[str, None] = None
+    post_grm_hook_done = False
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         if need_grm:
             # GRM stream...
-            grm, eff_m, grm_ids = load_or_build_grm_with_cache(
+            grm, eff_m, grm_ids, grm_cache_path = load_or_build_grm_with_cache(
                 genofile=stream_genofile,
                 cache_prefix=cache_prefix,
                 mgrm=mgrm,
@@ -2778,9 +2798,16 @@ def prepare_streaming_context(
                 allow_packed_full_load=bool(allow_packed_grm),
                 preloaded_packed=preloaded_packed,
             )
+            if post_grm_hook is not None:
+                post_grm_hook(str(stream_genofile), grm_cache_path)
+                post_grm_hook_done = True
         else:
             # Keep terminal output concise for non-kinship runs (LM/FarmCPU-only).
             pass
+
+        if (not post_grm_hook_done) and (post_grm_hook is not None):
+            post_grm_hook(str(stream_genofile), grm_cache_path)
+            post_grm_hook_done = True
 
         # PCA stream...
         qmatrix, q_ids = load_or_build_q_with_cache(
@@ -3002,8 +3029,46 @@ def _as_plink_prefix(path_or_prefix: str) -> Union[str, None]:
     return None
 
 
-def _read_bim_sites(prefix: str) -> list[tuple[str, int, str, str]]:
-    out: list[tuple[str, int, str, str]] = []
+def _site_tuple_parts(
+    site: tuple[object, ...],
+) -> tuple[str, int, str, str, str]:
+    if len(site) >= 5:
+        chrom, pos, a0, a1, snp = site[:5]
+        snp_name = _normalize_snp_name(snp, chrom, pos)
+    elif len(site) == 4:
+        chrom, pos, a0, a1 = site
+        snp_name = _fallback_snp_name(chrom, pos)
+    else:
+        raise ValueError(f"GWAS site tuple must have length 4 or 5, got {len(site)}")
+    return (
+        str(chrom),
+        _coerce_site_pos(pos),
+        str(a0),
+        str(a1),
+        str(snp_name),
+    )
+
+
+def _split_gwas_sites(
+    sites: list[tuple[object, ...]],
+) -> tuple[list[str], list[int], list[str], list[str], list[str]]:
+    chrom: list[str] = []
+    pos: list[int] = []
+    allele0: list[str] = []
+    allele1: list[str] = []
+    snp: list[str] = []
+    for site in sites:
+        c, p, a0, a1, sid = _site_tuple_parts(site)
+        chrom.append(c)
+        pos.append(int(p))
+        allele0.append(a0)
+        allele1.append(a1)
+        snp.append(sid)
+    return chrom, pos, allele0, allele1, snp
+
+
+def _read_bim_sites(prefix: str) -> list[tuple[str, int, str, str, str]]:
+    out: list[tuple[str, int, str, str, str]] = []
     bim_path = f"{prefix}.bim"
     with open(bim_path, "r", encoding="utf-8", errors="ignore") as fh:
         for ln, line in enumerate(fh, start=1):
@@ -3018,9 +3083,10 @@ def _read_bim_sites(prefix: str) -> list[tuple[str, int, str, str]]:
                 pos = int(float(toks[3]))
             except Exception as e:
                 raise ValueError(f"Invalid BIM POS at {bim_path}:{ln}") from e
+            snp = _normalize_snp_name(toks[1], chrom, pos)
             a0 = str(toks[4])
             a1 = str(toks[5])
-            out.append((chrom, pos, a0, a1))
+            out.append((chrom, pos, a0, a1, snp))
     return out
 
 
@@ -3168,6 +3234,16 @@ def _augment_gwas_tsv_with_snp_names(
                 f"Unable to add SNP names to {_display_path(path)}: {ex}",
             )
         return False
+
+
+def _finalize_gwas_result_tsv(
+    tmp_tsv: str,
+    out_tsv: str,
+    genofile: str,
+    *,
+    logger: Union[logging.Logger, None] = None,
+) -> None:
+    _replace_file_with_retry(str(tmp_tsv), str(out_tsv))
 
 
 def _resolve_lrlmm_rank(rank_opt: Union[int, None], n_samples: int) -> int:
@@ -3733,8 +3809,8 @@ def run_lrlmm_packed(
         if bool(snps_only):
             snp_mask = np.asarray(
                 [
-                    (len(str(a0)) == 1 and len(str(a1)) == 1)
-                    for (_c, _p, a0, a1) in sites_all_full
+                    (len(str(_site_tuple_parts(site)[2])) == 1 and len(str(_site_tuple_parts(site)[3])) == 1)
+                    for site in sites_all_full
                 ],
                 dtype=bool,
             )
@@ -4013,15 +4089,13 @@ def run_lrlmm_packed(
             use_spinner=bool(use_spinner),
         )
 
-        chrom = [str(c) for (c, _p, _a0, _a1) in sites_all]
-        pos = [int(p) for (_c, p, _a0, _a1) in sites_all]
-        a0 = [str(v) for (_c, _p, v, _a1) in sites_all]
-        a1 = [str(v) for (_c, _p, _a0, v) in sites_all]
+        chrom, pos, a0, a1, snp = _split_gwas_sites(sites_all)
 
         res_df = pd.DataFrame(
             {
                 "chrom": chrom,
                 "pos": pos,
+                "snp": snp,
                 "allele0": a0,
                 "allele1": a1,
                 "maf": np.asarray(maf_trait, dtype=np.float32),
@@ -4066,7 +4140,6 @@ def run_lrlmm_packed(
             use_spinner=bool(use_spinner),
             emit_done_line=False,
         )
-        _augment_gwas_tsv_with_snp_names(out_tsv, prefix, logger=logger)
         saved_paths.append(str(out_tsv))
 
         peak_rss = max(peak_rss, process.memory_info().rss)
@@ -4123,6 +4196,14 @@ def _prepare_packed_bed_once_for_gwas(*args, **kwargs):
     from janusx.assoc.workflow_model_packed import _prepare_packed_bed_once_for_gwas as _impl
     return _impl(*args, **kwargs)
 
+def _splmm_parse_sparse_cutoff(*args, **kwargs):
+    from janusx.assoc.workflow_model_packed import _splmm_parse_sparse_cutoff as _impl
+    return _impl(*args, **kwargs)
+
+def _ensure_splmm_sparse_grm(*args, **kwargs):
+    from janusx.assoc.workflow_model_packed import _ensure_splmm_sparse_grm as _impl
+    return _impl(*args, **kwargs)
+
 def prepare_memmap_filtered_bed_for_gwas(*args, **kwargs):
     from janusx.assoc.workflow_model_packed import prepare_memmap_filtered_bed_for_gwas as _impl
     return _impl(*args, **kwargs)
@@ -4147,8 +4228,8 @@ def run_algwas_packed_fullrank(*args, **kwargs):
     from janusx.assoc.workflow_model_packed import run_algwas_packed_fullrank as _impl
     return _impl(*args, **kwargs)
 
-def run_jxlmm_packed_fullrank(*args, **kwargs):
-    from janusx.assoc.workflow_model_packed import run_jxlmm_packed_fullrank as _impl
+def run_splmm_packed_fullrank(*args, **kwargs):
+    from janusx.assoc.workflow_model_packed import run_splmm_packed_fullrank as _impl
     return _impl(*args, **kwargs)
 
 def run_chunked_gwas_lmm_lm(*args, **kwargs):
@@ -4192,14 +4273,14 @@ def _run_file_dense_fast_once(
     def _extract_ref_alt(
         ref_alt_obj: object,
         n_markers: int,
-    ) -> tuple[np.ndarray, np.ndarray, list[str], list[str]]:
+    ) -> tuple[np.ndarray, np.ndarray, list[str], list[str], list[str]]:
         if isinstance(ref_alt_obj, pd.DataFrame):
             ref_alt_df = ref_alt_obj.reset_index(drop=True)
-            cols_need = {"chrom", "pos", "allele0", "allele1"}
+            cols_need = {"chrom", "pos", "snp", "allele0", "allele1"}
             if not cols_need.issubset(set(ref_alt_df.columns)):
                 raise ValueError(
                     "FarmCPU dense cache ref_alt missing required columns: "
-                    "chrom/pos/allele0/allele1."
+                    "chrom/pos/snp/allele0/allele1."
                 )
             if int(ref_alt_df.shape[0]) != int(n_markers):
                 raise ValueError(
@@ -4213,34 +4294,38 @@ def _run_file_dense_fast_once(
                 .astype(np.int64)
                 .to_numpy()
             )
+            snp = ref_alt_df["snp"].astype(str).tolist()
             allele0 = ref_alt_df["allele0"].astype(str).tolist()
             allele1 = ref_alt_df["allele1"].astype(str).tolist()
-            return chrom, pos, allele0, allele1
+            return chrom, pos, snp, allele0, allele1
 
         if isinstance(ref_alt_obj, dict):
             chrom_obj = ref_alt_obj.get("chrom")
             pos_obj = ref_alt_obj.get("pos")
+            snp_obj = ref_alt_obj.get("snp")
             a0_obj = ref_alt_obj.get("allele0")
             a1_obj = ref_alt_obj.get("allele1")
-            if chrom_obj is None or pos_obj is None or a0_obj is None or a1_obj is None:
+            if chrom_obj is None or pos_obj is None or snp_obj is None or a0_obj is None or a1_obj is None:
                 raise ValueError(
                     "FarmCPU dense cache ref_alt dict must contain "
-                    "chrom/pos/allele0/allele1."
+                    "chrom/pos/snp/allele0/allele1."
                 )
             chrom = np.asarray(chrom_obj, dtype=object).reshape(-1)
             pos = np.asarray(pos_obj, dtype=np.int64).reshape(-1)
+            snp = [str(x) for x in np.asarray(snp_obj, dtype=object).reshape(-1)]
             allele0 = [str(x) for x in np.asarray(a0_obj, dtype=object).reshape(-1)]
             allele1 = [str(x) for x in np.asarray(a1_obj, dtype=object).reshape(-1)]
             if (
                 int(chrom.shape[0]) != int(n_markers)
                 or int(pos.shape[0]) != int(n_markers)
+                or len(snp) != int(n_markers)
                 or len(allele0) != int(n_markers)
                 or len(allele1) != int(n_markers)
             ):
                 raise ValueError(
                     "FarmCPU dense cache ref_alt length mismatch with genotype markers."
                 )
-            return chrom, pos, allele0, allele1
+            return chrom, pos, snp, allele0, allele1
 
         raise ValueError("Unsupported FarmCPU dense cache ref_alt payload type.")
 
@@ -4373,7 +4458,7 @@ def _run_file_dense_fast_once(
         )
 
     ref_alt_obj = farmcpu_cache_runtime.get("ref_alt")
-    chrom_all, pos_all, allele0_all, allele1_all = _extract_ref_alt(ref_alt_obj, n_snps)
+    chrom_all, pos_all, snp_all, allele0_all, allele1_all = _extract_ref_alt(ref_alt_obj, n_snps)
     _phase_split(logger)
 
     model_sequence = [m for m in stream_models if m in {"lm", "lmm", "fastlmm"}]
@@ -4491,6 +4576,7 @@ def _run_file_dense_fast_once(
         chrom_keep = np.asarray(chrom_all[keep_site], dtype=object)
         pos_keep = np.asarray(pos_all[keep_site], dtype=np.int64)
         idx_keep = np.flatnonzero(keep_site).astype(np.int64, copy=False)
+        snp_keep = [snp_all[int(i)] for i in idx_keep]
         allele0_keep = [allele0_all[int(i)] for i in idx_keep]
         allele1_keep = [allele1_all[int(i)] for i in idx_keep]
         allele0_use, allele1_use = _transform_alleles(allele0_keep, allele1_keep, gm_tag)
@@ -4604,6 +4690,7 @@ def _run_file_dense_fast_once(
                 {
                     "chrom": chrom_keep.astype(str),
                     "pos": pos_keep.astype(np.int64),
+                    "snp": snp_keep,
                     "allele0": allele0_use,
                     "allele1": allele1_use,
                     "maf": np.asarray(maf, dtype=np.float32),
@@ -4632,7 +4719,6 @@ def _run_file_dense_fast_once(
                 use_spinner=bool(use_spinner),
                 emit_done_line=False,
             )
-            _augment_gwas_tsv_with_snp_names(out_tsv, gfile, logger=logger)
             saved_paths.append(str(out_tsv))
             _log_model_line(
                 logger,
@@ -4817,17 +4903,22 @@ def parse_args(argv: Optional[list[str]] = None):
         help="Run FarmCPU (full genotype in memory; default: %(default)s).",
     )
     models_group.add_argument(
-        "-jxlmm", "--jxlmm", nargs="?", const="__SELF__", default=None, metavar="CUTOFF",
+        "-splmm", "--splmm", "-jxlmm", "--jxlmm",
+        dest="splmm",
+        nargs="?",
+        const="__SELF__",
+        default=None,
+        metavar="CUTOFF",
         help=(
-            "Run JXLMM (additive-only). JXLMM builds or reuses sparse GRM from the main genotype "
+            "Run SparseLMM (additive-only). SparseLMM builds or reuses sparse GRM from the main genotype "
             "input, estimates variance components, then scans via sparse Cholesky. "
-            "Optional CUTOFF sets the sparse kinship cutoff (example: -jxlmm 0.001; default: 0.05)."
+            "Optional CUTOFF sets the sparse kinship cutoff (example: -splmm 0.001; default: 0.05)."
         ),
     )
     models_group.add_argument(
         "-sparse", "--sparse", action="store_true", default=False,
         help=(
-            "Force the sparse JXLMM route. This is mainly useful for testing and validation."
+            "Force the sparse SparseLMM route. This is mainly useful for testing and validation."
         ),
     )
     models_group.add_argument(
@@ -4949,7 +5040,7 @@ def parse_args(argv: Optional[list[str]] = None):
         "-fast", "--fast", action="store_true", default=False,
         help=(
             "Use packed full-rust paths when available (loads BED-packed genotype once "
-            "and reuses it across LM/LMM/FastLMM/JXLMM/ALGWAS/FarmCPU)."
+            "and reuses it across LM/LMM/FastLMM/SparseLMM/ALGWAS/FarmCPU)."
         ),
     )
     optional_group.add_argument(
@@ -5007,10 +5098,10 @@ def parse_args(argv: Optional[list[str]] = None):
         parser.error("--farmcpu-qtn-bound must be >= 1.")
     if bool(args.algwas) and str(args.model).strip().lower() != "add":
         parser.error("--algwas currently supports additive coding only (--model add).")
-    if bool(args.jxlmm) and str(args.model).strip().lower() != "add":
-        parser.error("--jxlmm currently supports additive coding only (--model add).")
-    if bool(args.sparse) and not bool(args.jxlmm):
-        parser.error("--sparse/--force-sparse only applies when --jxlmm is selected.")
+    if bool(args.splmm) and str(args.model).strip().lower() != "add":
+        parser.error("--splmm currently supports additive coding only (--model add).")
+    if bool(args.sparse) and not bool(args.splmm):
+        parser.error("--sparse/--force-sparse only applies when --splmm is selected.")
     try:
         args.farmcpu_bin_size = _parse_float_csv(
             args.farmcpu_bin_size,
@@ -5096,8 +5187,8 @@ def _run_gwas_pipeline(
             model_tokens.append("fastLMM")
         if args.lmm:
             model_tokens.append("LMM")
-        if args.jxlmm:
-            model_tokens.append("JXLMM")
+        if args.splmm:
+            model_tokens.append("SparseLMM")
         if args.algwas:
             model_tokens.append("ALGWAS")
         if args.farmcpu:
@@ -5141,8 +5232,8 @@ def _run_gwas_pipeline(
             )
         if args.cov:
             cfg_rows.append(("Covariates", "; ".join(args.cov)))
-        if args.jxlmm:
-            cfg_rows.append(("JXLMM sparse", True))
+        if args.splmm:
+            cfg_rows.append(("SparseLMM sparse", True))
         emit_cli_configuration(
             logger,
             app_title="JanusX - GWAS",
@@ -5178,9 +5269,9 @@ def _run_gwas_pipeline(
     if not ensure_all_true(checks):
         raise SystemExit(1)
 
-    if not (args.lm or args.lmm or args.fastlmm or args.jxlmm or args.algwas or args.farmcpu):
+    if not (args.lm or args.lmm or args.fastlmm or args.splmm or args.algwas or args.farmcpu):
         logger.error(
-            "No model selected. Use -lm, -lmm, -fastlmm, -jxlmm, -algwas, and/or -farmcpu."
+            "No model selected. Use -lm, -lmm, -fastlmm, -splmm, -algwas, and/or -farmcpu."
         )
         raise SystemExit(1)
     if args.farmcpu and args.model != "add":
@@ -5221,11 +5312,11 @@ def _run_gwas_pipeline(
             logging.INFO,
             "Input is not direct PLINK BED; memmap route will apply after source conversion/cache to BED.",
         )
-    if bool(args.jxlmm) and (not bool(fast_mode)):
+    if bool(args.splmm) and (not bool(fast_mode)):
         _log_file_only(
             logger,
             logging.INFO,
-            "JXLMM default backend: BED memmap/streaming metadata; packed preload is used only with -fast.",
+            "SparseLMM default backend: BED memmap/streaming metadata; packed preload is used only with -fast.",
         )
     qcov_needs_grm = str(getattr(args, "qcov", "0")).strip() not in {"", "0"}
     # GRM route policy:
@@ -5297,13 +5388,16 @@ def _run_gwas_pipeline(
             stream_models.append("lmm")
         if args.fastlmm:
             stream_models.append("fastlmm")
-        if args.jxlmm:
-            stream_models.append("jxlmm")
+        if args.splmm:
+            stream_models.append("splmm")
         if args.algwas:
             stream_models.append("algwas")
         has_farmcpu = bool(args.farmcpu)
         farmcpu_handled_in_trait_loop = False
         preloaded_packed: Union[dict[str, object], None] = None
+        prepared_splmm_sparse_jxgrm_path: Union[str, None] = None
+        prepared_splmm_sparse_cutoff: Union[float, None] = None
+        splmm_post_grm_hook: Optional[Callable[[str, Optional[str]], None]] = None
 
         if file_fast_dense_mode:
             pheno, ids, n_snps = _run_file_dense_fast_once(
@@ -5325,6 +5419,52 @@ def _run_gwas_pipeline(
         else:
             stream_selected = bool(len(stream_models) > 0)
             shared_context_needed = bool(stream_selected or fast_mode)
+            if args.splmm:
+                prepared_splmm_sparse_cutoff, ignored_splmm_arg = _splmm_parse_sparse_cutoff(
+                    args.splmm
+                )
+                if ignored_splmm_arg is not None:
+                    _emit_warning_line(
+                        logger,
+                        (
+                            "SparseLMM only accepts an optional numeric sparse cutoff via -splmm; "
+                            f"ignoring non-numeric argument: {ignored_splmm_arg}"
+                        ),
+                        use_spinner=bool(use_spinner),
+                    )
+
+                def _prepare_splmm_sparse_after_grm(
+                    stream_genofile_ready: str,
+                    loaded_dense_grm_path: Optional[str],
+                ) -> None:
+                    nonlocal prepared_splmm_sparse_jxgrm_path
+                    splmm_sparse_prefix = _as_plink_prefix(stream_genofile_ready)
+                    if splmm_sparse_prefix is None:
+                        return
+                    dense_grm_path = None
+                    sparse_out_prefix = str(splmm_sparse_prefix)
+                    if loaded_dense_grm_path is not None and str(loaded_dense_grm_path).strip() != "":
+                        dense_grm_path = str(loaded_dense_grm_path)
+                    elif str(getattr(args, "grm", "1")).strip() not in {"", "1", "2"}:
+                        dense_grm_path = str(getattr(args, "grm"))
+                    if dense_grm_path is not None and dense_grm_path.lower().endswith(".npy"):
+                        sparse_out_prefix = dense_grm_path[: -len(".npy")]
+                    prepared_splmm_sparse_jxgrm_path = _ensure_splmm_sparse_grm(
+                        str(splmm_sparse_prefix),
+                        sample_indices=None,
+                        out_prefix=str(sparse_out_prefix),
+                        dense_grm_path=dense_grm_path,
+                        cutoff=float(prepared_splmm_sparse_cutoff),
+                        maf_threshold=float(maf_threshold_scan),
+                        max_missing_rate=float(max_missing_rate_scan),
+                        het_threshold=float(het_threshold_scan),
+                        snps_only=bool(args.snps_only),
+                        threads=int(args.thread),
+                        logger=logger,
+                        use_spinner=bool(use_spinner),
+                    )
+
+                splmm_post_grm_hook = _prepare_splmm_sparse_after_grm
             if shared_context_needed:
                 _section(logger, "GWAS task")
                 _log_file_only(
@@ -5353,6 +5493,7 @@ def _run_gwas_pipeline(
                     allow_packed_grm=bool(allow_packed_grm_effective),
                     preload_packed_context=bool(fast_mode),
                     require_bed_stream=bool(stream_selected),
+                    post_grm_hook=splmm_post_grm_hook,
                 )
                 if (
                     bool(fast_mode)
@@ -5430,22 +5571,20 @@ def _run_gwas_pipeline(
                                 if isinstance(sites_prefill, list):
                                     chrom_prefill: list[str] = []
                                     pos_prefill: list[int] = []
+                                    snp_prefill: list[str] = []
                                     allele0_prefill: list[str] = []
                                     allele1_prefill: list[str] = []
-                                    for (c, p, a0, a1) in sites_prefill:
+                                    for site in sites_prefill:
+                                        c, p, a0, a1, sid = _site_tuple_parts(site)
                                         chrom_prefill.append(str(c))
-                                        try:
-                                            pos_prefill.append(int(p))
-                                        except Exception:
-                                            try:
-                                                pos_prefill.append(int(float(p)))
-                                            except Exception:
-                                                pos_prefill.append(0)
+                                        pos_prefill.append(int(p))
+                                        snp_prefill.append(str(sid))
                                         allele0_prefill.append(str(a0))
                                         allele1_prefill.append(str(a1))
                                     ref_alt_prefill = {
                                         "chrom": chrom_prefill,
                                         "pos": pos_prefill,
+                                        "snp": snp_prefill,
                                         "allele0": allele0_prefill,
                                         "allele1": allele1_prefill,
                                     }
@@ -5567,7 +5706,6 @@ def _run_gwas_pipeline(
                             trait_names=trait_one,
                             emit_trait_header=bool(emit_trait_header_model),
                             preloaded_packed=preloaded_packed,
-                            force_sparse_jxlmm=True,
                             force_model=bool(args.force_model),
                         )
 
@@ -5659,12 +5797,14 @@ def _run_gwas_pipeline(
                             preloaded_packed=preloaded_packed,
                         )
 
-                    def _run_route_jxlmm_packed(
+                    def _run_route_splmm_packed(
                         trait_one: list[str], emit_trait_header_model: bool
                     ) -> None:
-                        run_jxlmm_packed_fullrank(
+                        run_splmm_packed_fullrank(
                             genofile=genofile_stream,
-                            jxlmm_source=args.jxlmm,
+                            splmm_source=args.splmm,
+                            splmm_sparse_cutoff=prepared_splmm_sparse_cutoff,
+                            splmm_sparse_jxgrm_path=prepared_splmm_sparse_jxgrm_path,
                             pheno=pheno,
                             ids=ids,
                             outprefix=outprefix,
@@ -5828,7 +5968,7 @@ def _run_gwas_pipeline(
                         "lm_packed": _run_route_lm_packed,
                         "lmm_packed": _run_route_lmm_packed,
                         "fastlmm_packed": _run_route_fastlmm_packed,
-                        "jxlmm": _run_route_jxlmm_packed,
+                        "splmm": _run_route_splmm_packed,
                         "algwas": _run_route_algwas_packed,
                         "lm_stream": _run_route_lm_stream,
                         "lmm_stream": _run_route_lmm_stream,
@@ -5846,7 +5986,8 @@ def _run_gwas_pipeline(
                         "fastlmm_rust": "fastlmm_stream",
                         "farm": "farmcpu",
                     }
-
+                    stream_group_routes = {"lm_stream", "lmm_stream", "fastlmm_stream"}
+                    normalized_tasks: list[dict[str, object]] = []
                     for task_item in task_plan:
                         mk = str(task_item.get("model", "")).lower().strip()
                         route = str(task_item.get("route", "")).lower().strip()
@@ -5861,8 +6002,8 @@ def _run_gwas_pipeline(
                                     if bool(use_packed_fastlmm_scan)
                                     else "fastlmm_stream"
                                 )
-                            elif mk == "jxlmm":
-                                route = "jxlmm"
+                            elif mk == "splmm":
+                                route = "splmm"
                             elif mk == "algwas":
                                 route = "algwas"
                             elif mk == "farmcpu":
@@ -5893,11 +6034,88 @@ def _run_gwas_pipeline(
                                 "lmm_packed": "lmm_stream",
                                 "fastlmm_packed": "fastlmm_stream",
                             }[route]
+                        normalized_tasks.append(
+                            {
+                                "model": mk,
+                                "route": route,
+                                "trait": str(task_item.get("trait", "")),
+                                "emit_trait_header": bool(
+                                    task_item.get("emit_trait_header", False)
+                                ),
+                                "emit_blank_after": bool(
+                                    task_item.get("emit_blank_after", False)
+                                ),
+                            }
+                        )
+
+                    task_idx = 0
+                    while task_idx < len(normalized_tasks):
+                        task_item = normalized_tasks[task_idx]
+                        mk = str(task_item.get("model", "")).lower().strip()
+                        route = str(task_item.get("route", "")).lower().strip()
                         trait_name_use = str(task_item.get("trait", ""))
                         emit_trait_header_model = bool(
                             task_item.get("emit_trait_header", False)
                         )
                         emit_blank_after = bool(task_item.get("emit_blank_after", False))
+
+                        if route in stream_group_routes:
+                            group_end = task_idx + 1
+                            grouped_models: list[str] = [mk]
+                            while group_end < len(normalized_tasks):
+                                next_item = normalized_tasks[group_end]
+                                next_route = str(next_item.get("route", "")).lower().strip()
+                                next_trait = str(next_item.get("trait", ""))
+                                if (
+                                    next_route not in stream_group_routes
+                                    or next_trait != trait_name_use
+                                ):
+                                    break
+                                grouped_models.append(
+                                    str(next_item.get("model", "")).lower().strip()
+                                )
+                                group_end += 1
+                            if len(grouped_models) >= 2:
+                                run_chunked_gwas_streaming_shared(
+                                    model_names=grouped_models,
+                                    trait_name=trait_name_use,
+                                    genofile=genofile_stream,
+                                    pheno=pheno,
+                                    ids=ids,
+                                    n_snps=n_snps,
+                                    outprefix=outprefix,
+                                    maf_threshold=maf_threshold_scan,
+                                    max_missing_rate=max_missing_rate_scan,
+                                    genetic_model=args.model,
+                                    het_threshold=het_threshold_scan,
+                                    chunk_size=args.chunksize,
+                                    mmap_limit=mmap_limit_effective,
+                                    grm=grm,
+                                    qmatrix=qmatrix,
+                                    cov_all=cov_all,
+                                    plot=args.plot,
+                                    threads=args.thread,
+                                    logger=logger,
+                                    use_spinner=use_spinner,
+                                    snps_only=bool(args.snps_only),
+                                    eff_snp_by_trait=eff_snp_by_trait,
+                                    summary_rows=gwas_summary_rows,
+                                    saved_paths=saved_result_paths,
+                                    chunk_size_user_set=bool(
+                                        getattr(args, "_chunksize_user_set", True)
+                                    ),
+                                    force_model=bool(args.force_model),
+                                    emit_trait_header=bool(emit_trait_header_model),
+                                )
+                                if bool(
+                                    normalized_tasks[group_end - 1].get(
+                                        "emit_blank_after", False
+                                    )
+                                ):
+                                    logger.info("")
+                                task_idx = group_end
+                                continue
+
                         trait_one = [trait_name_use]
                         route_handler = route_handlers.get(route)
                         if route_handler is not None:
@@ -5909,6 +6127,7 @@ def _run_gwas_pipeline(
                             )
                         if emit_blank_after:
                             logger.info("")
+                        task_idx += 1
             else:
                 raise RuntimeError(
                     "Rust-only GWAS mode cannot enter Python streaming fallback routes."
@@ -5932,22 +6151,20 @@ def _run_gwas_pipeline(
                     if isinstance(sites_prefill, list):
                         chrom_prefill: list[str] = []
                         pos_prefill: list[int] = []
+                        snp_prefill: list[str] = []
                         allele0_prefill: list[str] = []
                         allele1_prefill: list[str] = []
-                        for (c, p, a0, a1) in sites_prefill:
+                        for site in sites_prefill:
+                            c, p, a0, a1, sid = _site_tuple_parts(site)
                             chrom_prefill.append(str(c))
-                            try:
-                                pos_prefill.append(int(p))
-                            except Exception:
-                                try:
-                                    pos_prefill.append(int(float(p)))
-                                except Exception:
-                                    pos_prefill.append(0)
+                            pos_prefill.append(int(p))
+                            snp_prefill.append(str(sid))
                             allele0_prefill.append(str(a0))
                             allele1_prefill.append(str(a1))
                         ref_alt_prefill = {
                             "chrom": chrom_prefill,
                             "pos": pos_prefill,
+                            "snp": snp_prefill,
                             "allele0": allele0_prefill,
                             "allele1": allele1_prefill,
                         }
@@ -6047,7 +6264,7 @@ def _run_gwas_pipeline(
                     "lmm": bool(args.lmm),
                     "fastlmm": bool(args.fastlmm),
                     "lm": bool(args.lm),
-                    "jxlmm": bool(args.jxlmm),
+                    "splmm": bool(args.splmm),
                     "algwas": bool(args.algwas),
                     "farmcpu": bool(args.farmcpu),
                 },

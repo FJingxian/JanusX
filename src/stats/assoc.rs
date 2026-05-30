@@ -4,7 +4,7 @@ use crate::math_farmcpu::{
     decode_dense_rows_to_sample_major, decode_packed_rows_to_sample_major,
     farmcpu_ll_score_from_sample_major, farmcpu_super_keep_from_sample_major, select_lead_indices,
 };
-use crate::stats_common::{get_cached_pool, parse_index_vec_i64};
+use crate::stats_common::{get_cached_pool, parse_index_vec_i64, AsyncTsvWriter};
 use nalgebra::DMatrix;
 use numpy::PyArray1;
 use numpy::PyArrayMethods;
@@ -17,8 +17,6 @@ use rayon::prelude::*;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
-use std::fs::File;
-use std::io::{BufWriter, Write};
 
 // FarmCPU helper kernels moved to `math/farmcpu.rs`.
 
@@ -516,6 +514,287 @@ fn fit_packed_full_rows(
     Ok((out, row_stride))
 }
 
+fn summarize_qtn_from_fem(
+    fem: &[f64],
+    m: usize,
+    row_stride: usize,
+    q_base: usize,
+    qtn_idx: &[usize],
+) -> (Vec<f64>, Vec<usize>) {
+    let k_qtn = qtn_idx.len();
+    let mut qtn_min_p = vec![1.0_f64; k_qtn];
+    let mut qtn_best_rows = vec![0usize; k_qtn];
+    for i in 0..m {
+        let base = i * row_stride;
+        for j in 0..k_qtn {
+            let col = 2 + q_base + j;
+            let p = fem[base + col];
+            if p.is_finite() && p < qtn_min_p[j] {
+                qtn_min_p[j] = p;
+                qtn_best_rows[j] = i;
+            }
+        }
+    }
+    (qtn_min_p, qtn_best_rows)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_farmcpu_packed_main_scan(
+    out_writer: &AsyncTsvWriter,
+    qtn_writer: Option<&AsyncTsvWriter>,
+    qtn_path_for_err: &str,
+    y: &[f64],
+    x_qtn: &[f64],
+    ixx_flat: &[f64],
+    packed_flat: &[u8],
+    n_samples: usize,
+    row_flip: &[bool],
+    row_maf: &[f32],
+    row_indices: Option<&[usize]>,
+    sample_idx: &[usize],
+    threads: usize,
+    chrom: &[String],
+    pos: &[i64],
+    snp: &[String],
+    allele0: &[String],
+    allele1: &[String],
+    miss_counts: &[usize],
+    _q_base: usize,
+    qtn_lookup: &HashMap<usize, usize>,
+    qtn_min_p: &[f64],
+    qtn_beta: &[f64],
+    qtn_se: &[f64],
+) -> Result<(usize, usize), String> {
+    let n = y.len();
+    if n == 0 {
+        return Err("empty phenotype vector".to_string());
+    }
+    if sample_idx.len() != n {
+        return Err("sample_idx length mismatch".to_string());
+    }
+    if n_samples == 0 {
+        return Err("n_samples must be > 0".to_string());
+    }
+    let q0 = x_qtn.len() / n;
+    if x_qtn.len() != n * q0 {
+        return Err("X shape mismatch".to_string());
+    }
+    if ixx_flat.len() != q0 * q0 {
+        return Err("ixx shape mismatch".to_string());
+    }
+    let m = chrom.len();
+    if pos.len() != m
+        || snp.len() != m
+        || allele0.len() != m
+        || allele1.len() != m
+        || row_flip.len() != m
+        || row_maf.len() != m
+        || miss_counts.len() != m
+    {
+        return Err("FarmCPU metadata length mismatch during streaming scan".to_string());
+    }
+
+    let bytes_per_snp = (n_samples + 3) / 4;
+    if bytes_per_snp == 0 {
+        return Err("invalid packed shape".to_string());
+    }
+    if packed_flat.len() % bytes_per_snp != 0 {
+        return Err("packed length is not divisible by bytes_per_snp".to_string());
+    }
+    let m_packed = packed_flat.len() / bytes_per_snp;
+    if row_indices
+        .map(|v| v.iter().any(|&idx| idx >= m_packed))
+        .unwrap_or(false)
+    {
+        return Err("row_indices out of bounds for packed rows".to_string());
+    }
+    if n <= q0 + 1 {
+        return Err(format!("n too small for LM core: n={n}, q={q0}"));
+    }
+
+    let dim = q0 + 1;
+    let mut xy = vec![0.0_f64; q0];
+    for i in 0..n {
+        let yi = y[i];
+        let row = &x_qtn[i * q0..(i + 1) * q0];
+        for j in 0..q0 {
+            xy[j] += row[j] * yi;
+        }
+    }
+    let yy: f64 = y.iter().map(|v| v * v).sum();
+    let df = (n as i32) - (q0 as i32) - 1;
+    let can_plrt = df > 0;
+    let pool = get_cached_pool(threads).map_err(|e| e.to_string())?;
+    let row_block = 8192usize;
+    let mut stats_buf = vec![f64::NAN; row_block * 3];
+    let mut text_buf = String::with_capacity(row_block * 128);
+    let mut qtn_text_buf_opt = if qtn_writer.is_some() {
+        Some(String::with_capacity(row_block.min(qtn_lookup.len().max(1)) * 128))
+    } else {
+        None
+    };
+    let mut qtn_rows_written = 0usize;
+
+    for row_start in (0..m).step_by(row_block) {
+        let row_end = (row_start + row_block).min(m);
+        let n_block = row_end - row_start;
+        let stats_slice = &mut stats_buf[..n_block * 3];
+        let mut runner = || {
+            stats_slice.par_chunks_mut(3).enumerate().for_each_init(
+                || GlmScratch::new(q0),
+                |scr, (local_idx, stat_out)| {
+                    let idx = row_start + local_idx;
+                    scr.reset_xs();
+                    let src_row = row_indices.map(|v| v[idx]).unwrap_or(idx);
+                    let row =
+                        &packed_flat[src_row * bytes_per_snp..(src_row + 1) * bytes_per_snp];
+                    let flip = row_flip[idx];
+                    let mean_g = (2.0_f64 * row_maf[idx] as f64).max(0.0);
+                    let mut sy = 0.0_f64;
+                    let mut ss = 0.0_f64;
+                    for (k, &sidx) in sample_idx.iter().enumerate() {
+                        let b = row[sidx >> 2];
+                        let code = (b >> ((sidx & 3) * 2)) & 0b11;
+                        let mut gv = match decode_plink_bed_hardcall(code) {
+                            Some(v) => v,
+                            None => mean_g,
+                        };
+                        if flip && code != 0b01 {
+                            gv = 2.0 - gv;
+                        }
+                        sy += gv * y[k];
+                        ss += gv * gv;
+                        let xrow = &x_qtn[k * q0..(k + 1) * q0];
+                        for j in 0..q0 {
+                            scr.xs[j] += xrow[j] * gv;
+                        }
+                    }
+                    xs_t_ixx_into(&scr.xs, ixx_flat, q0, &mut scr.b21);
+                    let t2 = dot(&scr.b21, &scr.xs);
+                    let b22 = ss - t2;
+                    let (invb22, df_row) = if b22 < 1e-8 {
+                        (0.0, (n as i32) - (q0 as i32))
+                    } else {
+                        (1.0 / b22, (n as i32) - (q0 as i32) - 1)
+                    };
+                    if df_row <= 0 || invb22 == 0.0 {
+                        stat_out[0] = f64::NAN;
+                        stat_out[1] = f64::NAN;
+                        stat_out[2] = f64::NAN;
+                        return;
+                    }
+                    build_ixxs_into(ixx_flat, &scr.b21, invb22, q0, &mut scr.ixxs);
+                    scr.rhs[..q0].copy_from_slice(&xy);
+                    scr.rhs[q0] = sy;
+                    matvec_into(&scr.ixxs, dim, &scr.rhs, &mut scr.beta);
+                    let beta_rhs = dot(&scr.beta, &scr.rhs);
+                    let ve = (yy - beta_rhs) / (df_row as f64);
+                    let beta = scr.beta[q0];
+                    let se = (scr.ixxs[q0 * dim + q0] * ve).sqrt();
+                    let t = beta / se;
+                    stat_out[0] = beta;
+                    stat_out[1] = se;
+                    stat_out[2] = student_t_p_two_sided(t, df_row);
+                },
+            );
+        };
+        if let Some(p) = &pool {
+            p.install(&mut runner);
+        } else {
+            runner();
+        }
+
+        text_buf.clear();
+        if let Some(ref mut qtn_text_buf) = qtn_text_buf_opt {
+            qtn_text_buf.clear();
+        }
+        for local_idx in 0..n_block {
+            let i = row_start + local_idx;
+            let stat_base = local_idx * 3;
+            let mut beta = stats_slice[stat_base];
+            let mut se = stats_slice[stat_base + 1];
+            let mut pwald = stats_slice[stat_base + 2];
+            if !pwald.is_finite() {
+                pwald = 1.0;
+            }
+            if let Some(&j) = qtn_lookup.get(&i) {
+                beta = qtn_beta[j];
+                se = qtn_se[j];
+                if qtn_min_p[j].is_finite() {
+                    pwald = qtn_min_p[j];
+                }
+            }
+            let plrt = if can_plrt && beta.is_finite() && se.is_finite() && se > 0.0 {
+                let t2 = (beta / se) * (beta / se);
+                lm_plrt_from_t2(t2, n, df)
+            } else {
+                f64::NAN
+            };
+            let chisq = if plrt.is_finite() {
+                chi2_stat_df1_from_sf(plrt)
+            } else if beta.is_finite() && se.is_finite() && se > 0.0 {
+                let z = beta / se;
+                z * z
+            } else {
+                f64::NAN
+            };
+            let chisq_txt = format_chisq_value(chisq);
+            let _ = write!(
+                text_buf,
+                "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\t{:.4e}\n",
+                chrom[i],
+                pos[i],
+                snp[i],
+                allele0[i],
+                allele1[i],
+                row_maf[i],
+                miss_counts[i],
+                beta,
+                se,
+                chisq_txt,
+                pwald,
+                plrt
+            );
+            if let Some(ref mut qtn_text_buf) = qtn_text_buf_opt {
+                if qtn_lookup.contains_key(&i) {
+                    qtn_rows_written += 1;
+                    let _ = write!(
+                        qtn_text_buf,
+                        "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\t{:.4e}\n",
+                        chrom[i],
+                        pos[i],
+                        snp[i],
+                        allele0[i],
+                        allele1[i],
+                        row_maf[i],
+                        miss_counts[i],
+                        beta,
+                        se,
+                        chisq_txt,
+                        pwald,
+                        plrt
+                    );
+                }
+            }
+        }
+
+        if !text_buf.is_empty() {
+            out_writer
+                .send(text_buf.as_bytes().to_vec())
+                .map_err(|e| e.to_string())?;
+        }
+        if let (Some(q_writer), Some(qtn_text_buf)) = (qtn_writer, qtn_text_buf_opt.as_mut()) {
+            if !qtn_text_buf.is_empty() {
+                q_writer
+                    .send(qtn_text_buf.as_bytes().to_vec())
+                    .map_err(|e| format!("{qtn_path_for_err}: {e}"))?;
+            }
+        }
+    }
+
+    Ok((m, qtn_rows_written))
+}
+
 #[pyfunction]
 #[pyo3(signature = (
     sz,
@@ -896,6 +1175,7 @@ pub fn farmcpu_super_dense<'py>(
     x_cov,
     chrom,
     pos,
+    snp,
     allele0,
     allele1,
     packed,
@@ -921,6 +1201,7 @@ pub fn farmcpu_packed_to_tsv(
     x_cov: PyReadonlyArray2<'_, f64>,
     chrom: Vec<String>,
     pos: Vec<i64>,
+    snp: Vec<String>,
     allele0: Vec<String>,
     allele1: Vec<String>,
     packed: PyReadonlyArray2<'_, u8>,
@@ -1004,11 +1285,12 @@ pub fn farmcpu_packed_to_tsv(
     if m == 0 {
         return Err(PyRuntimeError::new_err("empty packed marker matrix"));
     }
-    if chrom.len() != m || pos.len() != m || allele0.len() != m || allele1.len() != m {
+    if chrom.len() != m || pos.len() != m || snp.len() != m || allele0.len() != m || allele1.len() != m {
         return Err(PyRuntimeError::new_err(format!(
-            "metadata length mismatch: m={m}, chrom={}, pos={}, allele0={}, allele1={}",
+            "metadata length mismatch: m={m}, chrom={}, pos={}, snp={}, allele0={}, allele1={}",
             chrom.len(),
             pos.len(),
+            snp.len(),
             allele0.len(),
             allele1.len()
         )));
@@ -1094,6 +1376,8 @@ pub fn farmcpu_packed_to_tsv(
     let pool = get_cached_pool(threads)?;
 
     py.detach(|| -> PyResult<()> {
+        let mut final_model_cache: Option<(Vec<f64>, usize, Vec<f64>, Vec<f64>, Vec<usize>)> =
+            None;
         for it_idx in 0..max_iter_i {
             let (x_qtn, q_total) = build_x_with_qtn_packed(
                 &base_x,
@@ -1172,6 +1456,10 @@ pub fn farmcpu_packed_to_tsv(
                 .iter()
                 .any(|&p| p.is_finite() && p <= qtn_threshold_eff);
             if !has_signal {
+                let (final_qtn_min_p, final_qtn_best_rows) =
+                    summarize_qtn_from_fem(&fem, m, row_stride, q_base, &qtn_idx);
+                final_model_cache =
+                    Some((x_qtn, q_total, ixx, final_qtn_min_p, final_qtn_best_rows));
                 if let Some(cb) = progress_callback.as_ref() {
                     Python::attach(|py2| -> PyResult<()> {
                         py2.check_signals()?;
@@ -1189,6 +1477,10 @@ pub fn farmcpu_packed_to_tsv(
                 }
             }
             if combine.is_empty() {
+                let (final_qtn_min_p, final_qtn_best_rows) =
+                    summarize_qtn_from_fem(&fem, m, row_stride, q_base, &qtn_idx);
+                final_model_cache =
+                    Some((x_qtn, q_total, ixx, final_qtn_min_p, final_qtn_best_rows));
                 if let Some(cb) = progress_callback.as_ref() {
                     Python::attach(|py2| -> PyResult<()> {
                         py2.check_signals()?;
@@ -1308,87 +1600,73 @@ pub fn farmcpu_packed_to_tsv(
             }
 
             if qtn_next == qtn_idx {
+                let (final_qtn_min_p, final_qtn_best_rows) =
+                    summarize_qtn_from_fem(&fem, m, row_stride, q_base, &qtn_idx);
+                final_model_cache =
+                    Some((x_qtn, q_total, ixx, final_qtn_min_p, final_qtn_best_rows));
                 break;
             }
             qtn_idx = qtn_next;
         }
 
-        let (x_qtn, q_total) = build_x_with_qtn_packed(
-            &base_x,
-            n,
-            q_base,
-            &qtn_idx,
-            &packed_flat,
-            bytes_per_snp,
-            row_idx.as_deref(),
-            &sample_idx,
-            row_flip,
-            row_maf,
-        )
-        .map_err(PyRuntimeError::new_err)?;
-        let mut xtx = vec![0.0_f64; q_total * q_total];
-        for i in 0..n {
-            let row = &x_qtn[i * q_total..(i + 1) * q_total];
-            for a in 0..q_total {
-                let va = row[a];
-                for b in 0..q_total {
-                    xtx[a * q_total + b] += va * row[b];
+        let (x_qtn, _q_total, ixx, qtn_min_p, qtn_best_rows) =
+            if let Some(cached) = final_model_cache.take() {
+                cached
+            } else {
+                let (x_qtn, q_total) = build_x_with_qtn_packed(
+                    &base_x,
+                    n,
+                    q_base,
+                    &qtn_idx,
+                    &packed_flat,
+                    bytes_per_snp,
+                    row_idx.as_deref(),
+                    &sample_idx,
+                    row_flip,
+                    row_maf,
+                )
+                .map_err(PyRuntimeError::new_err)?;
+                let mut xtx = vec![0.0_f64; q_total * q_total];
+                for i in 0..n {
+                    let row = &x_qtn[i * q_total..(i + 1) * q_total];
+                    for a in 0..q_total {
+                        let va = row[a];
+                        for b in 0..q_total {
+                            xtx[a * q_total + b] += va * row[b];
+                        }
+                    }
                 }
-            }
-        }
-        let ixx = pinv_xtx(&xtx, q_total).map_err(PyRuntimeError::new_err)?;
-        let (mut fem, _m_scan, row_stride) = scan_packed_full_matrix(
-            y,
-            &x_qtn,
-            &ixx,
-            &packed_flat,
-            n_samples,
-            row_flip,
-            row_maf,
-            row_idx.as_deref(),
-            &sample_idx,
-            threads,
-        )
-        .map_err(PyRuntimeError::new_err)?;
-        for i in 0..m {
-            let base = i * row_stride;
-            for c in 2..row_stride {
-                let v = fem[base + c];
-                if !v.is_finite() {
-                    fem[base + c] = 1.0;
+                let ixx = pinv_xtx(&xtx, q_total).map_err(PyRuntimeError::new_err)?;
+                let (mut fem, _m_scan, row_stride) = scan_packed_full_matrix(
+                    y,
+                    &x_qtn,
+                    &ixx,
+                    &packed_flat,
+                    n_samples,
+                    row_flip,
+                    row_maf,
+                    row_idx.as_deref(),
+                    &sample_idx,
+                    threads,
+                )
+                .map_err(PyRuntimeError::new_err)?;
+                for i in 0..m {
+                    let base = i * row_stride;
+                    for c in 2..row_stride {
+                        let v = fem[base + c];
+                        if !v.is_finite() {
+                            fem[base + c] = 1.0;
+                        }
+                    }
                 }
-            }
-        }
-
+                let (qtn_min_p, qtn_best_rows) =
+                    summarize_qtn_from_fem(&fem, m, row_stride, q_base, &qtn_idx);
+                (x_qtn, q_total, ixx, qtn_min_p, qtn_best_rows)
+            };
         let k_qtn = qtn_idx.len();
-        let mut qtn_min_p = vec![1.0_f64; k_qtn];
-        for i in 0..m {
-            let base = i * row_stride;
-            for j in 0..k_qtn {
-                let col = 2 + q_base + j;
-                let p = fem[base + col];
-                if p.is_finite() && p < qtn_min_p[j] {
-                    qtn_min_p[j] = p;
-                }
-            }
-        }
         let mut qtn_beta = vec![f64::NAN; k_qtn];
         let mut qtn_se = vec![f64::NAN; k_qtn];
         if k_qtn > 0 {
-            let mut qtn_best_rows = vec![0usize; k_qtn];
-            for j in 0..k_qtn {
-                let col = 2 + q_base + j;
-                let mut best_idx = 0usize;
-                let mut best_p = f64::INFINITY;
-                for i in 0..m {
-                    let p = fem[i * row_stride + col];
-                    if p.is_finite() && p < best_p {
-                        best_p = p;
-                        best_idx = i;
-                    }
-                }
-                qtn_best_rows[j] = best_idx;
-            }
             let (qtn_full, qtn_full_stride) = fit_packed_full_rows(
                 y,
                 &x_qtn,
@@ -1431,184 +1709,77 @@ pub fn farmcpu_packed_to_tsv(
             fill_miss();
         }
 
-        let df = (n as i32) - (q_total as i32) - 1;
-        let can_plrt = df > 0;
         let out_path = out_tsv.to_string();
-        let out_path_for_writer = out_path.clone();
-        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(4);
-        let writer_handle = std::thread::spawn(move || -> Result<(), String> {
-            let out_file = File::create(&out_path_for_writer)
-                .map_err(|e| format!("create {out_path_for_writer}: {e}"))?;
-            let mut writer = BufWriter::with_capacity(64 * 1024 * 1024, out_file);
-            writer
-                .write_all(
-                    b"chrom\tpos\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n",
-                )
-                .map_err(|e| format!("write header {out_path_for_writer}: {e}"))?;
-            for block in rx {
-                if !block.is_empty() {
-                    writer
-                        .write_all(&block)
-                        .map_err(|e| format!("write {out_path_for_writer}: {e}"))?;
-                }
-            }
-            writer
-                .flush()
-                .map_err(|e| format!("flush {out_path_for_writer}: {e}"))?;
-            Ok(())
-        });
+        let writer = AsyncTsvWriter::with_config(
+            &out_path,
+            b"chrom\tpos\tsnp\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n",
+            64 * 1024 * 1024,
+            4,
+        )
+        .map_err(PyRuntimeError::new_err)?;
 
-        let mut qtn_tx_opt: Option<std::sync::mpsc::SyncSender<Vec<u8>>> = None;
-        let mut qtn_writer_handle_opt: Option<std::thread::JoinHandle<Result<(), String>>> = None;
+        let mut qtn_writer_opt: Option<AsyncTsvWriter> = None;
         let mut qtn_path_for_err = String::new();
         if let Some(pseudo_path) = pseudo_tsv {
             if !qtn_idx.is_empty() {
                 qtn_path_for_err = pseudo_path.to_string();
-                let qtn_path_for_writer = qtn_path_for_err.clone();
-                let (qtx, qrx) = std::sync::mpsc::sync_channel::<Vec<u8>>(4);
-                let qh = std::thread::spawn(move || -> Result<(), String> {
-                    let qf = File::create(&qtn_path_for_writer)
-                        .map_err(|e| format!("create {qtn_path_for_writer}: {e}"))?;
-                    let mut qw = BufWriter::with_capacity(16 * 1024 * 1024, qf);
-                    qw.write_all(
-                        b"chrom\tpos\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n",
+                qtn_writer_opt = Some(
+                    AsyncTsvWriter::with_config(
+                        &qtn_path_for_err,
+                        b"chrom\tpos\tsnp\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n",
+                        16 * 1024 * 1024,
+                        4,
                     )
-                    .map_err(|e| format!("write header {qtn_path_for_writer}: {e}"))?;
-                    for block in qrx {
-                        if !block.is_empty() {
-                            qw.write_all(&block)
-                                .map_err(|e| format!("write {qtn_path_for_writer}: {e}"))?;
-                        }
-                    }
-                    qw.flush()
-                        .map_err(|e| format!("flush {qtn_path_for_writer}: {e}"))?;
-                    Ok(())
-                });
-                qtn_tx_opt = Some(qtx);
-                qtn_writer_handle_opt = Some(qh);
+                    .map_err(PyRuntimeError::new_err)?,
+                );
             }
         }
 
-        let row_block = 8192usize;
-        let mut text_buf = String::with_capacity(row_block * 128);
-        let mut qtn_text_buf_opt = if qtn_tx_opt.is_some() {
-            Some(String::with_capacity(row_block.min(k_qtn.max(1)) * 128))
-        } else {
-            None
-        };
-        for row_start in (0..m).step_by(row_block) {
-            let row_end = (row_start + row_block).min(m);
-            text_buf.clear();
-            if let Some(ref mut qtn_text_buf) = qtn_text_buf_opt {
-                qtn_text_buf.clear();
-            }
-            for i in row_start..row_end {
-                let base = i * row_stride;
-                let mut beta = fem[base];
-                let mut se = fem[base + 1];
-                let mut pwald = fem[base + row_stride - 1];
-                if let Some(&j) = qtn_lookup.get(&i) {
-                    beta = qtn_beta[j];
-                    se = qtn_se[j];
-                    if qtn_min_p[j].is_finite() {
-                        pwald = qtn_min_p[j];
-                    }
-                }
-                let plrt = if can_plrt && beta.is_finite() && se.is_finite() && se > 0.0 {
-                    let t2 = (beta / se) * (beta / se);
-                    lm_plrt_from_t2(t2, n, df)
-                } else {
-                    f64::NAN
-                };
-                let chisq = if plrt.is_finite() {
-                    chi2_stat_df1_from_sf(plrt)
-                } else if beta.is_finite() && se.is_finite() && se > 0.0 {
-                    let z = beta / se;
-                    z * z
-                } else {
-                    f64::NAN
-                };
-                let chisq_txt = format_chisq_value(chisq);
-                let _ = write!(
-                    text_buf,
-                    "{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\t{:.4e}\n",
-                    chrom[i],
-                    pos[i],
-                    allele0[i],
-                    allele1[i],
-                    row_maf[i],
-                    miss_counts[i],
-                    beta,
-                    se,
-                    chisq_txt,
-                    pwald,
-                    plrt
-                );
-                if let Some(ref mut qtn_text_buf) = qtn_text_buf_opt {
-                    if qtn_lookup.contains_key(&i) {
-                        let _ = write!(
-                            qtn_text_buf,
-                            "{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\t{:.4e}\n",
-                            chrom[i],
-                            pos[i],
-                            allele0[i],
-                            allele1[i],
-                            row_maf[i],
-                            miss_counts[i],
-                            beta,
-                            se,
-                            chisq_txt,
-                            pwald,
-                            plrt
-                        );
-                    }
-                }
-            }
-            let payload = std::mem::take(&mut text_buf).into_bytes();
-            tx.send(payload).map_err(|e| {
-                PyRuntimeError::new_err(format!("writer queue send failed for {out_path}: {e}"))
+        let (_written_rows, qtn_rows_written) = write_farmcpu_packed_main_scan(
+            &writer,
+            qtn_writer_opt.as_ref(),
+            &qtn_path_for_err,
+            y,
+            &x_qtn,
+            &ixx,
+            &packed_flat,
+            n_samples,
+            row_flip,
+            row_maf,
+            row_idx.as_deref(),
+            &sample_idx,
+            threads,
+            &chrom,
+            &pos,
+            &snp,
+            &allele0,
+            &allele1,
+            &miss_counts,
+            q_base,
+            &qtn_lookup,
+            &qtn_min_p,
+            &qtn_beta,
+            &qtn_se,
+        )
+        .map_err(PyRuntimeError::new_err)?;
+        writer.finish().map_err(PyRuntimeError::new_err)?;
+        if let Some(q_writer) = qtn_writer_opt.take() {
+            q_writer.finish().map_err(|e| {
+                PyRuntimeError::new_err(format!("{qtn_path_for_err}: {e}"))
             })?;
-            if let Some(ref mut qtn_text_buf) = qtn_text_buf_opt {
-                if !qtn_text_buf.is_empty() {
-                    let qpayload = std::mem::take(qtn_text_buf).into_bytes();
-                    if let Some(qtx) = qtn_tx_opt.as_ref() {
-                        qtx.send(qpayload).map_err(|e| {
-                            PyRuntimeError::new_err(format!(
-                                "writer queue send failed for {qtn_path_for_err}: {e}"
-                            ))
-                        })?;
-                    }
-                }
-            }
         }
-        drop(tx);
-        let writer_result = writer_handle.join().map_err(|_| {
-            PyRuntimeError::new_err(format!("writer thread panicked for {out_path}"))
-        })?;
-        if let Err(msg) = writer_result {
-            return Err(PyRuntimeError::new_err(msg));
-        }
-        if let Some(qtx) = qtn_tx_opt.take() {
-            drop(qtx);
-        }
-        if let Some(qh) = qtn_writer_handle_opt.take() {
-            let qtn_writer_result = qh.join().map_err(|_| {
-                PyRuntimeError::new_err(format!("writer thread panicked for {qtn_path_for_err}"))
-            })?;
-            if let Err(msg) = qtn_writer_result {
-                return Err(PyRuntimeError::new_err(msg));
-            }
-        }
+        let _ = qtn_rows_written;
         Ok(())
     })?;
 
-    Ok((m, qtn_idx.len(), qtn_idx.len()))
+    Ok((m, qtn_idx.len(), m))
 }
 
 #[pyfunction]
 #[pyo3(signature = (
     chrom,
     pos,
+    snp,
     allele0,
     allele1,
     maf,
@@ -1625,6 +1796,7 @@ pub fn farmcpu_packed_to_tsv(
 pub fn farmcpu_write_assoc_tsv(
     chrom: Vec<String>,
     pos: Vec<i64>,
+    snp: Vec<String>,
     allele0: Vec<String>,
     allele1: Vec<String>,
     maf: PyReadonlyArray1<'_, f32>,
@@ -1639,11 +1811,12 @@ pub fn farmcpu_write_assoc_tsv(
     pseudo_tsv: Option<&str>,
 ) -> PyResult<(usize, usize)> {
     let m = chrom.len();
-    if pos.len() != m || allele0.len() != m || allele1.len() != m {
+    if pos.len() != m || snp.len() != m || allele0.len() != m || allele1.len() != m {
         return Err(PyRuntimeError::new_err(format!(
-            "FarmCPU metadata length mismatch: chrom={}, pos={}, allele0={}, allele1={}",
+            "FarmCPU metadata length mismatch: chrom={}, pos={}, snp={}, allele0={}, allele1={}",
             chrom.len(),
             pos.len(),
+            snp.len(),
             allele0.len(),
             allele1.len()
         )));
@@ -1673,12 +1846,14 @@ pub fn farmcpu_write_assoc_tsv(
     let df_f = df as f64;
     let can_plrt = n_obs > 0 && df > 0;
 
-    let out_file = File::create(out_tsv)
-        .map_err(|e| PyRuntimeError::new_err(format!("create {out_tsv}: {e}")))?;
-    let mut writer = BufWriter::with_capacity(4 * 1024 * 1024, out_file);
-    writer
-        .write_all(b"chrom\tpos\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n")
-        .map_err(|e| PyRuntimeError::new_err(format!("write header {out_tsv}: {e}")))?;
+    let writer = AsyncTsvWriter::with_config(
+        out_tsv,
+        b"chrom\tpos\tsnp\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n",
+        4 * 1024 * 1024,
+        4,
+    )
+    .map_err(PyRuntimeError::new_err)?;
+    let mut text_buf = String::with_capacity(8192 * 112);
 
     for i in 0..m {
         let b = beta[i];
@@ -1700,10 +1875,11 @@ pub fn farmcpu_write_assoc_tsv(
         };
         let chisq_txt = format_chisq_value(chisq);
         writeln!(
-            writer,
-            "{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\t{:.4e}",
+            text_buf,
+            "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\t{:.4e}",
             chrom[i],
             pos[i],
+            snp[i],
             allele0[i],
             allele1[i],
             maf[i],
@@ -1714,11 +1890,20 @@ pub fn farmcpu_write_assoc_tsv(
             pwald[i],
             plrt
         )
-        .map_err(|e| PyRuntimeError::new_err(format!("write row {i} to {out_tsv}: {e}")))?;
+        .map_err(|e| PyRuntimeError::new_err(format!("format row {i} for {out_tsv}: {e}")))?;
+        if (i + 1) % 8192 == 0 {
+            writer
+                .send(text_buf.as_bytes().to_vec())
+                .map_err(PyRuntimeError::new_err)?;
+            text_buf.clear();
+        }
     }
-    writer
-        .flush()
-        .map_err(|e| PyRuntimeError::new_err(format!("flush {out_tsv}: {e}")))?;
+    if !text_buf.is_empty() {
+        writer
+            .send(text_buf.as_bytes().to_vec())
+            .map_err(PyRuntimeError::new_err)?;
+    }
+    writer.finish().map_err(PyRuntimeError::new_err)?;
 
     let mut qtn_written = 0usize;
     if let (Some(qidx_arr), Some(pseudo_path)) = (qtn_idx, pseudo_tsv) {
@@ -1738,14 +1923,14 @@ pub fn farmcpu_write_assoc_tsv(
             }
         }
         if !uniq.is_empty() {
-            let q_file = File::create(pseudo_path)
-                .map_err(|e| PyRuntimeError::new_err(format!("create {pseudo_path}: {e}")))?;
-            let mut q_writer = BufWriter::with_capacity(512 * 1024, q_file);
-            q_writer
-                .write_all(
-                    b"chrom\tpos\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n",
-                )
-                .map_err(|e| PyRuntimeError::new_err(format!("write header {pseudo_path}: {e}")))?;
+            let q_writer = AsyncTsvWriter::with_config(
+                pseudo_path,
+                b"chrom\tpos\tsnp\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n",
+                512 * 1024,
+                4,
+            )
+            .map_err(PyRuntimeError::new_err)?;
+            let mut q_text_buf = String::with_capacity(uniq.len().min(8192).max(1) * 112);
             for &idx in uniq.iter() {
                 let b = beta[idx];
                 let s = se[idx];
@@ -1766,10 +1951,11 @@ pub fn farmcpu_write_assoc_tsv(
                 };
                 let chisq_txt = format_chisq_value(chisq);
                 writeln!(
-                    q_writer,
-                    "{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\t{:.4e}",
+                    q_text_buf,
+                    "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\t{:.4e}",
                     chrom[idx],
                     pos[idx],
+                    snp[idx],
                     allele0[idx],
                     allele1[idx],
                     maf[idx],
@@ -1781,12 +1967,23 @@ pub fn farmcpu_write_assoc_tsv(
                     plrt
                 )
                 .map_err(|e| {
-                    PyRuntimeError::new_err(format!("write qtn row {idx} to {pseudo_path}: {e}"))
+                    PyRuntimeError::new_err(format!(
+                        "format qtn row {idx} for {pseudo_path}: {e}"
+                    ))
                 })?;
+                if q_text_buf.len() >= 512 * 1024 {
+                    q_writer
+                        .send(q_text_buf.as_bytes().to_vec())
+                        .map_err(PyRuntimeError::new_err)?;
+                    q_text_buf.clear();
+                }
             }
-            q_writer
-                .flush()
-                .map_err(|e| PyRuntimeError::new_err(format!("flush {pseudo_path}: {e}")))?;
+            if !q_text_buf.is_empty() {
+                q_writer
+                    .send(q_text_buf.as_bytes().to_vec())
+                    .map_err(PyRuntimeError::new_err)?;
+            }
+            q_writer.finish().map_err(PyRuntimeError::new_err)?;
             qtn_written = uniq.len();
         }
     }

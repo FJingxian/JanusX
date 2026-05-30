@@ -21,18 +21,20 @@ from janusx.script._common.packedctx import (
 from .workflow import (
     CliStatus,
     _ProgressAdapter,
-    _augment_gwas_tsv_with_snp_names,
     _align_pheno_to_sample_order,
     _as_plink_prefix,
     _basename_only,
     _cache_lock,
+    _cleanup_gwas_result_tmp,
     _emit_plain_info_line,
     _emit_trait_header,
     _emit_warning_line,
+    _finalize_gwas_result_tsv,
     _grm_cache_paths,
     _grm_cache_paths_legacy,
     _gwas_cache_prefix_with_params,
     _gwas_eigh_from_grm,
+    _gwas_result_tmp_path,
     _inspect_genotype_with_status,
     _load_covariates_for_models,
     _load_phenotype_with_status,
@@ -48,6 +50,7 @@ from .workflow import (
     _rich_success,
     _run_fastplot_from_tsv_with_status,
     _safe_trait_file_label,
+    _site_tuple_parts,
     _trait_values_and_mask,
     detect_effective_threads,
     format_elapsed,
@@ -659,14 +662,14 @@ def run_farmcpu_fullmem(
         n_total = int(keep.shape[0])
         if n_total == 0:
             return (
-                pd.DataFrame(columns=["chrom", "pos", "allele0", "allele1"]),
+                pd.DataFrame(columns=["chrom", "pos", "snp", "allele0", "allele1"]),
                 keep,
             )
 
         n_pre_keep = int(np.sum(keep))
         if n_pre_keep == 0:
             return (
-                pd.DataFrame(columns=["chrom", "pos", "allele0", "allele1"]),
+                pd.DataFrame(columns=["chrom", "pos", "snp", "allele0", "allele1"]),
                 keep,
             )
 
@@ -674,6 +677,7 @@ def run_farmcpu_fullmem(
         # applying SNP-only filtering in the same pass.
         chrom = np.empty(n_pre_keep, dtype=object)
         pos = np.empty(n_pre_keep, dtype=np.int64)
+        snp = np.empty(n_pre_keep, dtype=object)
         allele0 = np.empty(n_pre_keep, dtype=object)
         allele1 = np.empty(n_pre_keep, dtype=object)
 
@@ -703,6 +707,7 @@ def run_farmcpu_fullmem(
                             keep[idx] = False
                         else:
                             chrom[out] = str(parts[0])
+                            raw_snp = str(parts[1]) if len(parts) > 1 else "."
                             try:
                                 pval = int(parts[3])
                             except Exception:
@@ -711,6 +716,7 @@ def run_farmcpu_fullmem(
                                 except Exception:
                                     pval = 0
                             pos[out] = int(pval)
+                            snp[out] = raw_snp if raw_snp not in {"", ".", "nan", "NaN"} else f"{chrom[out]}_{int(pval)}"
                             allele0[out] = a0
                             allele1[out] = a1
                             out += 1
@@ -728,12 +734,13 @@ def run_farmcpu_fullmem(
                 pbar.update(n_total - done)
             pbar.finish()
         finally:
-            pbar.close(success_style=True, show_done=True)
+            pbar.close()
 
         ref_alt_df = pd.DataFrame(
             {
                 "chrom": chrom[:out],
                 "pos": pos[:out].astype(int, copy=False),
+                "snp": snp[:out],
                 "allele0": allele0[:out],
                 "allele1": allele1[:out],
             }
@@ -915,6 +922,7 @@ def run_farmcpu_fullmem(
             dense_chunks: list[np.ndarray] = []
             chrom_col: list[str] = []
             pos_col: list[int] = []
+            snp_col: list[str] = []
             allele0_col: list[str] = []
             allele1_col: list[str] = []
 
@@ -953,16 +961,19 @@ def run_farmcpu_fullmem(
                             continue
                         dense_chunks.append(chunk_arr)
                         for s in site_chunk:
-                            chrom_col.append(str(getattr(s, "chrom", ".")))
-                            try:
-                                pos_col.append(int(getattr(s, "pos", 0)))
-                            except Exception:
-                                try:
-                                    pos_col.append(int(float(getattr(s, "pos", 0))))
-                                except Exception:
-                                    pos_col.append(0)
-                            allele0_col.append(str(getattr(s, "ref_allele", "N")))
-                            allele1_col.append(str(getattr(s, "alt_allele", "N")))
+                            chrom_s, pos_s, allele0_s, allele1_s = _site_tuple_parts(
+                                (
+                                    getattr(s, "chrom", "."),
+                                    getattr(s, "pos", 0),
+                                    getattr(s, "ref_allele", "N"),
+                                    getattr(s, "alt_allele", "N"),
+                                )
+                            )[:4]
+                            chrom_col.append(str(chrom_s))
+                            pos_col.append(int(pos_s))
+                            snp_col.append(f"{chrom_s}_{int(pos_s)}")
+                            allele0_col.append(str(allele0_s))
+                            allele1_col.append(str(allele1_s))
                 except Exception:
                     task.fail("Loading genotype (Full) ...Failed")
                     raise
@@ -975,6 +986,7 @@ def run_farmcpu_fullmem(
                 {
                     "chrom": chrom_col,
                     "pos": np.asarray(pos_col, dtype=np.int64),
+                    "snp": snp_col,
                     "allele0": allele0_col,
                     "allele1": allele1_col,
                 }
@@ -1066,6 +1078,7 @@ def run_farmcpu_fullmem(
             ref_alt_cache_obj = {
                 "chrom": ref_alt["chrom"].tolist(),
                 "pos": pd.to_numeric(ref_alt["pos"], errors="coerce").fillna(0).astype(np.int64).tolist(),
+                "snp": ref_alt["snp"].tolist(),
                 "allele0": ref_alt["allele0"].tolist(),
                 "allele1": ref_alt["allele1"].tolist(),
             }
@@ -1208,15 +1221,18 @@ def run_farmcpu_fullmem(
         if isinstance(ref_alt, dict):
             chrom_col = [str(x) for x in ref_alt.get("chrom", [])]
             pos_col = [int(x) for x in ref_alt.get("pos", [])]
+            snp_col = [str(x) for x in ref_alt.get("snp", [])]
             allele0_col = [str(x) for x in ref_alt.get("allele0", [])]
             allele1_col = [str(x) for x in ref_alt.get("allele1", [])]
         else:
             chrom_col = ref_alt["chrom"].tolist()
             pos_col = ref_alt["pos"].astype(np.int64, copy=False).tolist()
+            snp_col = ref_alt["snp"].tolist()
             allele0_col = ref_alt["allele0"].tolist()
             allele1_col = ref_alt["allele1"].tolist()
         phename_tag = _safe_trait_file_label(phename)
         out_tsv = os.path.join(outfolder, f"{prefix}.{phename_tag}.farmcpu.tsv")
+        tmp_tsv = _gwas_result_tmp_path(out_tsv)
         pseudo_tsv_hint = os.path.join(outfolder, f"{prefix}.{phename_tag}.farmcpu.qtn.tsv")
         n_pseudo_qtn = 0
         pseudo_tsv: Union[str, None] = None
@@ -1293,7 +1309,7 @@ def run_farmcpu_fullmem(
                         {
                             "model": "farmcpu",
                             "trait": str(phename),
-                            "out_tsv": str(out_tsv),
+                            "out_tsv": str(tmp_tsv),
                             "y": np.ascontiguousarray(p_sub, dtype=np.float64).reshape(-1),
                             "x_cov": np.ascontiguousarray(q_sub, dtype=np.float64),
                             "sample_indices": sample_idx_use,
@@ -1316,6 +1332,7 @@ def run_farmcpu_fullmem(
                             miss_arr,
                             chrom_col,
                             pos_col,
+                            snp_col,
                             allele0_col,
                             allele1_col,
                             int(max(1, int(getattr(args, "chunksize", 10000)))),
@@ -1343,6 +1360,7 @@ def run_farmcpu_fullmem(
                             miss_arr,
                             chrom_col,
                             pos_col,
+                            snp_col,
                             allele0_col,
                             allele1_col,
                             int(max(1, int(getattr(args, "chunksize", 10000)))),
@@ -1361,6 +1379,7 @@ def run_farmcpu_fullmem(
                         np.ascontiguousarray(q_sub, dtype=np.float64),
                         chrom_col,
                         pos_col,
+                        snp_col,
                         allele0_col,
                         allele1_col,
                         packed_arr,
@@ -1368,7 +1387,7 @@ def run_farmcpu_fullmem(
                         row_flip_arr,
                         maf_arr,
                         miss_arr,
-                        out_tsv,
+                        tmp_tsv,
                         sample_idx_use,
                         row_indices=row_idx_arr,
                         threshold=float(farm_threshold),
@@ -1441,6 +1460,7 @@ def run_farmcpu_fullmem(
                 _m_written, qtn_written = jxrs.farmcpu_write_assoc_tsv(
                     [str(x) for x in chrom_col],
                     [int(x) for x in pos_col],
+                    [str(x) for x in snp_col],
                     [str(x) for x in allele0_col],
                     [str(x) for x in allele1_col],
                     maf_arr,
@@ -1450,7 +1470,7 @@ def run_farmcpu_fullmem(
                     pwald_arr,
                     int(n_idv),
                     int(df_lrt),
-                    str(out_tsv),
+                    str(tmp_tsv),
                     qtn_idx=qtn_idx_arr,
                     pseudo_tsv=str(pseudo_tsv_hint),
                 )
@@ -1462,6 +1482,7 @@ def run_farmcpu_fullmem(
                     {
                         "chrom": [str(x) for x in chrom_col],
                         "pos": [int(x) for x in pos_col],
+                        "snp": [str(x) for x in snp_col],
                         "allele0": [str(x) for x in allele0_col],
                         "allele1": [str(x) for x in allele1_col],
                         "maf": maf_arr,
@@ -1473,7 +1494,7 @@ def run_farmcpu_fullmem(
                         "plrt": np.full((eff_snp,), np.nan, dtype=np.float64),
                     }
                 )
-                out_df.to_csv(str(out_tsv), sep="\t", index=False)
+                out_df.to_csv(str(tmp_tsv), sep="\t", index=False)
                 if int(qtn_idx_arr.size) > 0:
                     uniq_idx = np.unique(qtn_idx_arr[(qtn_idx_arr >= 0) & (qtn_idx_arr < eff_snp)])
                     if int(uniq_idx.size) > 0:
@@ -1486,9 +1507,7 @@ def run_farmcpu_fullmem(
         elif matrix_path_cli is not None:
             name_source = str(matrix_path_cli)
 
-        _augment_gwas_tsv_with_snp_names(out_tsv, name_source, logger=logger)
-        if pseudo_tsv is not None and os.path.exists(pseudo_tsv):
-            _augment_gwas_tsv_with_snp_names(pseudo_tsv, name_source, logger=logger)
+        _finalize_gwas_result_tsv(tmp_tsv, out_tsv, name_source, logger=logger)
 
         gwas_secs = max(time.time() - gwas_t0, 0.0)
         peak_rss = max(peak_rss, process.memory_info().rss)

@@ -27,6 +27,7 @@ pub(crate) fn decode_plink_bed_hardcall(code: u8) -> Option<f64> {
 pub(crate) struct PackedByteLut {
     pub(crate) nonmiss: [u8; 256],
     pub(crate) alt_sum: [u8; 256],
+    pub(crate) het_sum: [u8; 256],
     pub(crate) sq_sum: [u8; 256],
     pub(crate) code4: [[u8; 4]; 256],
 }
@@ -36,12 +37,14 @@ pub(crate) fn packed_byte_lut() -> &'static PackedByteLut {
     LUT.get_or_init(|| {
         let mut nonmiss = [0u8; 256];
         let mut alt_sum = [0u8; 256];
+        let mut het_sum = [0u8; 256];
         let mut sq_sum = [0u8; 256];
         let mut code4 = [[0u8; 4]; 256];
         for b in 0u16..=255 {
             let byte = b as u8;
             let mut nm = 0u8;
             let mut alt = 0u8;
+            let mut het = 0u8;
             let mut sq = 0u8;
             let mut codes = [0u8; 4];
             for lane in 0..4usize {
@@ -54,6 +57,7 @@ pub(crate) fn packed_byte_lut() -> &'static PackedByteLut {
                     0b10 => {
                         nm += 1;
                         alt += 1;
+                        het += 1;
                         sq += 1;
                     }
                     0b11 => {
@@ -67,12 +71,14 @@ pub(crate) fn packed_byte_lut() -> &'static PackedByteLut {
             let idx = byte as usize;
             nonmiss[idx] = nm;
             alt_sum[idx] = alt;
+            het_sum[idx] = het;
             sq_sum[idx] = sq;
             code4[idx] = codes;
         }
         PackedByteLut {
             nonmiss,
             alt_sum,
+            het_sum,
             sq_sum,
             code4,
         }

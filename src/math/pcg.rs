@@ -1214,7 +1214,7 @@ fn pcg_spd_cholesky_with_jitter(
         }
     }
     Err(format!(
-        "PCG JXLMM failed to factor {label} as SPD after diagonal jitter"
+        "PCG SparseLMM failed to factor {label} as SPD after diagonal jitter"
     ))
 }
 
@@ -1224,13 +1224,13 @@ fn pcg_validate_jxlmm_state(
     x_row_major: &[f64],
 ) -> Result<(), String> {
     pcg_validate_matrix_shape(
-        "JXLMM design matrix",
+        "SparseLMM design matrix",
         x_row_major,
         null_model.n_samples,
         null_model.n_covariates,
     )?;
     pcg_validate_matrix_shape(
-        "JXLMM V^{-1}X matrix",
+        "SparseLMM V^{-1}X matrix",
         &null_model.v_inv_x,
         null_model.n_samples,
         null_model.n_covariates,
@@ -1238,16 +1238,16 @@ fn pcg_validate_jxlmm_state(
     if null_model.beta_hat.len() != null_model.n_covariates
         || null_model.py.len() != null_model.n_samples
     {
-        return Err("PCG JXLMM null model state length mismatch".to_string());
+        return Err("PCG SparseLMM null model state length mismatch".to_string());
     }
     pcg_validate_matrix_shape(
-        "JXLMM XtVinvX chol",
+        "SparseLMM XtVinvX chol",
         &null_model.xt_v_inv_x_chol,
         null_model.n_covariates,
         null_model.n_covariates,
     )?;
     pcg_validate_matrix_shape(
-        "JXLMM XtX chol",
+        "SparseLMM XtX chol",
         &null_model.xtx_chol,
         null_model.n_covariates,
         null_model.n_covariates,
@@ -1275,12 +1275,12 @@ where
     FX: FnMut(usize, usize, usize, f64) -> Result<(), String>,
 {
     if n_samples == 0 || n_covariates == 0 {
-        return Err("PCG JXLMM null model requires n_samples > 0 and n_covariates > 0".to_string());
+        return Err("PCG SparseLMM null model requires n_samples > 0 and n_covariates > 0".to_string());
     }
-    pcg_validate_matrix_shape("JXLMM design matrix", x_row_major, n_samples, n_covariates)?;
+    pcg_validate_matrix_shape("SparseLMM design matrix", x_row_major, n_samples, n_covariates)?;
     if y.len() != n_samples {
         return Err(format!(
-            "PCG JXLMM y length mismatch: got {}, expected {n_samples}",
+            "PCG SparseLMM y length mismatch: got {}, expected {n_samples}",
             y.len()
         ));
     }
@@ -1303,7 +1303,7 @@ where
     }
     if !v_inv_y.converged {
         return Err(format!(
-            "PCG JXLMM V^-1 y did not converge: iters={}, rel_res={:.3e}",
+            "PCG SparseLMM V^-1 y did not converge: iters={}, rel_res={:.3e}",
             v_inv_y.iters, v_inv_y.rel_res
         ));
     }
@@ -1359,7 +1359,7 @@ where
     }
     if !v_inv_x.converged_all {
         return Err(format!(
-            "PCG JXLMM V^-1 X did not converge for all columns: max_iters={}, max_rel_res={:.3e}",
+            "PCG SparseLMM V^-1 X did not converge for all columns: max_iters={}, max_rel_res={:.3e}",
             v_inv_x.max_iters, v_inv_x.max_rel_res
         ));
     }
@@ -1382,7 +1382,8 @@ where
         n_covariates,
         &mut xt_v_inv_x,
     );
-    let xt_v_inv_x_chol = pcg_spd_cholesky_with_jitter(&xt_v_inv_x, n_covariates, "JXLMM XtVinvX")?;
+    let xt_v_inv_x_chol =
+        pcg_spd_cholesky_with_jitter(&xt_v_inv_x, n_covariates, "SparseLMM XtVinvX")?;
     let mut beta_hat = vec![0.0_f64; n_covariates];
     cholesky_solve_into(&xt_v_inv_x_chol, n_covariates, &xt_v_inv_y, &mut beta_hat);
 
@@ -1406,7 +1407,7 @@ where
         n_covariates,
         &mut xtx,
     );
-    let xtx_chol = pcg_spd_cholesky_with_jitter(&xtx, n_covariates, "JXLMM XtX")?;
+    let xtx_chol = pcg_spd_cholesky_with_jitter(&xtx, n_covariates, "SparseLMM XtX")?;
 
     Ok((
         PcgJxlmmNullModel {
@@ -1440,7 +1441,7 @@ pub(crate) fn pcg_jxlmm_s_m_s(
     pcg_validate_jxlmm_state(null_model, x_row_major)?;
     if snp.len() != null_model.n_samples {
         return Err(format!(
-            "PCG JXLMM s^T M s SNP length mismatch: got {}, expected {}",
+            "PCG SparseLMM s^T M s SNP length mismatch: got {}, expected {}",
             snp.len(),
             null_model.n_samples
         ));
@@ -1468,7 +1469,7 @@ pub(crate) fn pcg_jxlmm_s_p_s_exact(
     pcg_validate_jxlmm_state(null_model, x_row_major)?;
     if snp.len() != null_model.n_samples || v_inv_snp.len() != null_model.n_samples {
         return Err(format!(
-            "PCG JXLMM s^T P s length mismatch: snp={}, v_inv_snp={}, expected={}",
+            "PCG SparseLMM s^T P s length mismatch: snp={}, v_inv_snp={}, expected={}",
             snp.len(),
             v_inv_snp.len(),
             null_model.n_samples
@@ -1773,16 +1774,16 @@ where
 {
     pcg_validate_jxlmm_state(null_model, x_row_major)?;
     pcg_validate_matrix_shape(
-        "JXLMM sampled marker matrix",
+        "SparseLMM sampled marker matrix",
         sampled_markers_col_major,
         null_model.n_samples,
         n_markers,
     )?;
     if n_markers == 0 {
-        return Err("PCG JXLMM r-hat estimation requires at least one sampled marker".to_string());
+        return Err("PCG SparseLMM r-hat estimation requires at least one sampled marker".to_string());
     }
     let inv_diag = jacobi_inv_diag.ok_or_else(|| {
-        "PCG JXLMM r-hat batched solver requires Jacobi inverse diagonal".to_string()
+        "PCG SparseLMM r-hat batched solver requires Jacobi inverse diagonal".to_string()
     })?;
     let rhs_row_major =
         pcg_col_major_to_row_major_f64(sampled_markers_col_major, null_model.n_samples, n_markers)?;
@@ -1828,7 +1829,7 @@ where
         }
     }
     if n_used == 0 {
-        return Err("PCG JXLMM r-hat estimation found no valid sampled markers".to_string());
+        return Err("PCG SparseLMM r-hat estimation found no valid sampled markers".to_string());
     }
 
     Ok(PcgJxlmmRHatResult {

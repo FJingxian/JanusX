@@ -156,6 +156,7 @@ fn sim_generate_chunk_data(
         .map(|i| SiteInfo {
             chrom: "1".to_string(),
             pos: (base_row_idx + i) as i32,
+            snp: format!("1_{}", (base_row_idx + i) as i32),
             ref_allele: "A".to_string(),
             alt_allele: "T".to_string(),
         })

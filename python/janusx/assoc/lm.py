@@ -218,9 +218,9 @@ class LinearModel:
         tables: dict[str, pd.DataFrame] = {}
 
         kinship = None
-        if model_key in {"algwas", "jxlmm"}:
+        if model_key in {"algwas", "splmm", "jxlmm"}:
             raise ValueError(
-                f"{str(model_key).upper()} is currently available only for file-mode GWAS workflows "
+                f"{('SparseLMM' if str(model_key).lower() in {'splmm', 'jxlmm'} else str(model_key).upper())} is currently available only for file-mode GWAS workflows "
                 "(PLINK/BED-backed packed route)."
             )
 
@@ -453,7 +453,7 @@ class LinearModel:
             write_files=write_files,
         )
 
-    def jxlmm(
+    def splmm(
         self,
         *,
         out: Optional[str] = None,
@@ -462,9 +462,19 @@ class LinearModel:
         write_files: bool = False,
     ) -> AssociationResult:
         return self._run(
-            model_key="jxlmm",
+            model_key="splmm",
             out=out,
             prefix=prefix,
             log=log,
             write_files=write_files,
         )
+
+    def jxlmm(
+        self,
+        *,
+        out: Optional[str] = None,
+        prefix: Optional[str] = None,
+        log: bool = True,
+        write_files: bool = False,
+    ) -> AssociationResult:
+        return self.splmm(out=out, prefix=prefix, log=log, write_files=write_files)

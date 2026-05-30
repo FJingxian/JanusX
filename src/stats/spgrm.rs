@@ -1,4 +1,4 @@
-use memmap2::Mmap;
+use memmap2::{Mmap, MmapOptions};
 use numpy::{PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
@@ -41,6 +41,12 @@ const SPGRM_DEFAULT_BATCH_DECODED_STRIPE_FLOOR: usize = 8;
 const SPGRM_DEFAULT_BATCH_DECODED_STRIPE_THREADS_FACTOR: usize = 2;
 const SPGRM_DEFAULT_BATCH_MIN_ACCUM_BYTES: usize = 8 * 1024 * 1024;
 const SPGRM_JXGRM_VALUE_ALIGN_BYTES: usize = std::mem::size_of::<f64>();
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SpgrmNpyFloatDtype {
+    F32Le,
+    F64Le,
+}
 
 #[derive(Default)]
 struct SpgrmStageTiming {
@@ -338,6 +344,163 @@ fn spgrm_emit_timing_summary(
         spgrm_stage_secs(timing.threshold_ns()),
         spgrm_stage_secs(timing.spill_ns()),
     );
+}
+
+#[inline]
+fn spgrm_parse_npy_shape_local(header: &str) -> Result<(usize, usize), String> {
+    let shape_key_pos = header
+        .find("'shape'")
+        .or_else(|| header.find("\"shape\""))
+        .ok_or_else(|| "NPY header missing shape field".to_string())?;
+    let after = &header[shape_key_pos..];
+    let open = after
+        .find('(')
+        .ok_or_else(|| "NPY header has malformed shape tuple".to_string())?;
+    let close = after[open + 1..]
+        .find(')')
+        .ok_or_else(|| "NPY header has malformed shape tuple".to_string())?;
+    let inside = &after[open + 1..open + 1 + close];
+
+    let dims: Vec<usize> = inside
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.parse::<usize>()
+                .map_err(|_| format!("invalid NPY shape dimension: {s}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    match dims.as_slice() {
+        [rows] => Ok((*rows, 1)),
+        [rows, cols] => Ok((*rows, *cols)),
+        _ => Err(format!("unsupported NPY shape rank: {:?}", dims)),
+    }
+}
+
+#[inline]
+fn spgrm_parse_npy_descr_local(header: &str) -> Result<SpgrmNpyFloatDtype, String> {
+    let descr_key_pos = header
+        .find("'descr'")
+        .or_else(|| header.find("\"descr\""))
+        .ok_or_else(|| "NPY header missing descr field".to_string())?;
+    let after = &header[descr_key_pos..];
+    let colon = after
+        .find(':')
+        .ok_or_else(|| "NPY header has malformed descr field".to_string())?;
+    let mut tail = after[colon + 1..].trim_start();
+    let q = tail
+        .chars()
+        .next()
+        .ok_or_else(|| "NPY header has empty descr field".to_string())?;
+    if q != '\'' && q != '"' {
+        return Err("NPY header has malformed descr quote".to_string());
+    }
+    tail = &tail[1..];
+    let end = tail
+        .find(q)
+        .ok_or_else(|| "NPY header has unterminated descr field".to_string())?;
+    let descr = tail[..end].trim().to_ascii_lowercase();
+    match descr.as_str() {
+        "<f4" | "|f4" | "=f4" => Ok(SpgrmNpyFloatDtype::F32Le),
+        "<f8" | "|f8" | "=f8" => Ok(SpgrmNpyFloatDtype::F64Le),
+        d if d.starts_with(">f4") || d.starts_with(">f8") => {
+            Err("big-endian NPY float dtype is not supported".to_string())
+        }
+        _ => Err(format!(
+            "NPY dtype is not supported for sparse GRM extraction: {descr}"
+        )),
+    }
+}
+
+#[inline]
+fn spgrm_parse_npy_header_for_float_matrix(
+    bytes: &[u8],
+) -> Result<(usize, usize, usize, SpgrmNpyFloatDtype), String> {
+    if bytes.len() < 10 {
+        return Err("NPY file too small".to_string());
+    }
+    if &bytes[0..6] != b"\x93NUMPY" {
+        return Err("invalid NPY magic".to_string());
+    }
+
+    let major = bytes[6];
+    let minor = bytes[7];
+    let (header_len, header_start) = match major {
+        1 => (u16::from_le_bytes([bytes[8], bytes[9]]) as usize, 10usize),
+        2 | 3 => {
+            if bytes.len() < 12 {
+                return Err("NPY file too small for v2/v3 header".to_string());
+            }
+            (
+                u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize,
+                12usize,
+            )
+        }
+        _ => return Err(format!("unsupported NPY version: {major}.{minor}")),
+    };
+    let header_end = header_start
+        .checked_add(header_len)
+        .ok_or_else(|| "NPY header overflow".to_string())?;
+    if header_end > bytes.len() {
+        return Err("NPY header exceeds file size".to_string());
+    }
+    let header =
+        std::str::from_utf8(&bytes[header_start..header_end]).map_err(|e| e.to_string())?;
+    if header.contains("fortran_order': True") || header.contains("fortran_order\": true") {
+        return Err("fortran_order=True NPY is not supported".to_string());
+    }
+    let (rows, cols) = spgrm_parse_npy_shape_local(header)?;
+    let dtype = spgrm_parse_npy_descr_local(header)?;
+    Ok((rows, cols, header_end, dtype))
+}
+
+#[inline]
+fn spgrm_npy_read_value(
+    payload: &[u8],
+    dtype: SpgrmNpyFloatDtype,
+    elem_idx: usize,
+) -> Result<f64, String> {
+    match dtype {
+        SpgrmNpyFloatDtype::F32Le => {
+            let byte_idx = elem_idx
+                .checked_mul(4)
+                .ok_or_else(|| "NPY element byte offset overflow".to_string())?;
+            let end = byte_idx
+                .checked_add(4)
+                .ok_or_else(|| "NPY element byte end overflow".to_string())?;
+            if end > payload.len() {
+                return Err("NPY payload truncated while reading f32 element".to_string());
+            }
+            Ok(f32::from_le_bytes([
+                payload[byte_idx],
+                payload[byte_idx + 1],
+                payload[byte_idx + 2],
+                payload[byte_idx + 3],
+            ]) as f64)
+        }
+        SpgrmNpyFloatDtype::F64Le => {
+            let byte_idx = elem_idx
+                .checked_mul(8)
+                .ok_or_else(|| "NPY element byte offset overflow".to_string())?;
+            let end = byte_idx
+                .checked_add(8)
+                .ok_or_else(|| "NPY element byte end overflow".to_string())?;
+            if end > payload.len() {
+                return Err("NPY payload truncated while reading f64 element".to_string());
+            }
+            Ok(f64::from_le_bytes([
+                payload[byte_idx],
+                payload[byte_idx + 1],
+                payload[byte_idx + 2],
+                payload[byte_idx + 3],
+                payload[byte_idx + 4],
+                payload[byte_idx + 5],
+                payload[byte_idx + 6],
+                payload[byte_idx + 7],
+            ]))
+        }
+    }
 }
 
 #[inline]
@@ -2554,6 +2717,104 @@ fn spgrm_dense_f32_to_jxgrm_core(
     Ok((out_path, n_samples, nnz))
 }
 
+fn spgrm_dense_npy_to_jxgrm_core(
+    npy_path: &str,
+    out_prefix: &str,
+    threshold: f64,
+    abs_threshold: bool,
+    progress_callback: Option<&Py<PyAny>>,
+    progress_every: usize,
+) -> Result<(String, usize, usize), String> {
+    if !threshold.is_finite() {
+        return Err("Sparse GRM threshold must be finite".to_string());
+    }
+    let out_path = normalize_jxgrm_path(out_prefix);
+    if out_path.is_empty() {
+        return Err("Sparse GRM output prefix must not be empty".to_string());
+    }
+
+    let file = File::open(npy_path).map_err(|e| format!("open dense GRM NPY failed: {e}"))?;
+    let mmap = unsafe { MmapOptions::new().map(&file).map_err(|e| e.to_string())? };
+    let (rows, cols, data_offset, dtype) = spgrm_parse_npy_header_for_float_matrix(&mmap[..])?;
+    if rows == 0 || cols == 0 || rows != cols {
+        return Err(format!(
+            "Sparse GRM dense NPY must be non-empty square, got ({rows}, {cols})"
+        ));
+    }
+    let n_samples = rows;
+    let n_elem = n_samples
+        .checked_mul(n_samples)
+        .ok_or_else(|| "Sparse GRM dense NPY element count overflow".to_string())?;
+    let bytes_per = match dtype {
+        SpgrmNpyFloatDtype::F32Le => 4usize,
+        SpgrmNpyFloatDtype::F64Le => 8usize,
+    };
+    let payload_bytes = n_elem
+        .checked_mul(bytes_per)
+        .ok_or_else(|| "Sparse GRM dense NPY payload size overflow".to_string())?;
+    let data_end = data_offset
+        .checked_add(payload_bytes)
+        .ok_or_else(|| "Sparse GRM dense NPY payload end overflow".to_string())?;
+    if data_end > mmap.len() {
+        return Err("Sparse GRM dense NPY payload is truncated".to_string());
+    }
+    let payload = &mmap[data_offset..data_end];
+
+    let notify_step = if progress_every == 0 {
+        (n_samples / 128).max(1)
+    } else {
+        progress_every.max(1)
+    };
+    let mut last_notified = 0usize;
+
+    let mut nnz = 0usize;
+    for col in 0..n_samples {
+        for row in col..n_samples {
+            let elem_idx = row
+                .checked_mul(n_samples)
+                .and_then(|base| base.checked_add(col))
+                .ok_or_else(|| "Sparse GRM dense NPY index overflow".to_string())?;
+            let value = spgrm_npy_read_value(payload, dtype, elem_idx)?;
+            if !value.is_finite() {
+                return Err(format!(
+                    "Sparse GRM dense NPY found non-finite value at pair ({row}, {col})"
+                ));
+            }
+            if row == col || spgrm_keep_value(value, threshold, abs_threshold) {
+                nnz = nnz.saturating_add(1);
+            }
+        }
+    }
+
+    let mut writer = SpgrmCscStreamWriter::new(&out_path, n_samples, nnz)?;
+    for col in 0..n_samples {
+        for row in col..n_samples {
+            let elem_idx = row
+                .checked_mul(n_samples)
+                .and_then(|base| base.checked_add(col))
+                .ok_or_else(|| "Sparse GRM dense NPY index overflow".to_string())?;
+            let value = spgrm_npy_read_value(payload, dtype, elem_idx)?;
+            if row == col || spgrm_keep_value(value, threshold, abs_threshold) {
+                writer.push(SpgrmEntry {
+                    col: col as u32,
+                    row: row as u32,
+                    value,
+                })?;
+            }
+        }
+        spgrm_progress_notify(
+            progress_callback,
+            col + 1,
+            n_samples,
+            notify_step,
+            &mut last_notified,
+            col + 1 == n_samples,
+        )?;
+    }
+    writer.finish()?;
+    Ok((out_path, n_samples, nnz))
+}
+
 #[pyfunction]
 #[pyo3(signature = (
     packed,
@@ -2738,6 +2999,34 @@ pub fn spgrm_dense_f32_to_jxgrm<'py>(
     spgrm_dense_f32_to_jxgrm_core(
         grm_flat.as_ref(),
         n_samples,
+        &out_prefix,
+        threshold,
+        abs_threshold,
+        progress_callback.as_ref(),
+        progress_every,
+    )
+    .map_err(map_err_string_to_py)
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    npy_path,
+    out_prefix,
+    threshold=0.05_f64,
+    abs_threshold=false,
+    progress_callback=None,
+    progress_every=0
+))]
+pub fn spgrm_dense_npy_to_jxgrm(
+    npy_path: String,
+    out_prefix: String,
+    threshold: f64,
+    abs_threshold: bool,
+    progress_callback: Option<Py<PyAny>>,
+    progress_every: usize,
+) -> PyResult<(String, usize, usize)> {
+    spgrm_dense_npy_to_jxgrm_core(
+        &npy_path,
         &out_prefix,
         threshold,
         abs_threshold,

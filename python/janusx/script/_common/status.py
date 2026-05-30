@@ -20,10 +20,10 @@ except Exception:
     SPINNERS = {}  # type: ignore[assignment]
     _HAS_RICH = False
 
-_SPINNER_NAME = "janusx_ascii"
+_SPINNER_NAME = "dots"
 _SPINNER_FRAMES = ["/", "-", "\\", "|"]
 _SPINNER_REFRESH_SEC = 0.1
-_SPINNER_FALLBACKS = ("line", "dots", "simpleDots", "bouncingBar")
+_SPINNER_FALLBACKS = ("dots", "simpleDots", "line", "bouncingBar")
 _GREEN = "\033[32m"
 _YELLOW = "\033[33m"
 _RED = "\033[31m"
@@ -47,6 +47,7 @@ _COMPLETION_TOKENS = (
     "...finished",
     "...found",
     "...pve",
+    "...r_hat",
 )
 _SKIP_TOKENS = (
     "skip",
@@ -176,6 +177,8 @@ def spinner_refresh_interval(seconds: Optional[float]) -> float:
 def ensure_rich_spinner_registered() -> None:
     if not _HAS_RICH:
         return
+    if _SPINNER_NAME != "janusx_ascii":
+        return
     try:
         if _SPINNER_NAME not in SPINNERS:
             SPINNERS[_SPINNER_NAME] = {
@@ -190,14 +193,14 @@ def ensure_rich_spinner_registered() -> None:
 
 def _resolve_spinner_name(preferred: str) -> str:
     if (not _HAS_RICH) or (not hasattr(SPINNERS, "__contains__")):
-        return "line"
+        return "dots"
     if str(preferred) in SPINNERS:
         return str(preferred)
     for name in _SPINNER_FALLBACKS:
         if name in SPINNERS:
             return name
     # Last-resort built-in name; Rich will usually have it.
-    return "line"
+    return "dots"
 
 
 def get_rich_spinner_name() -> str:

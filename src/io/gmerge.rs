@@ -561,6 +561,11 @@ impl VcfSnpIterRaw {
             let site = SiteInfo {
                 chrom: parts[0].to_string(),
                 pos: parts[1].parse().unwrap_or(0),
+                snp: if parts.len() > 2 && !parts[2].trim().is_empty() && parts[2] != "." {
+                    parts[2].to_string()
+                } else {
+                    format!("{}_{}", parts[0], parts[1])
+                },
                 ref_allele: parts[3].to_string(),
                 alt_allele: parts[4].to_string(),
             };

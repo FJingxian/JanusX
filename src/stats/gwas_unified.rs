@@ -241,7 +241,7 @@ pub fn gwas_trait_model_dispatch_v2<'py>(
             "lmm" => Some("lmm"),
             "fastlmm" => Some("fastlmm"),
             "algwas" => Some("algwas"),
-            "jxlmm" => Some("jxlmm"),
+            "splmm" => Some("splmm"),
             _ => None,
         };
         if let Some(v) = norm {
@@ -272,7 +272,7 @@ pub fn gwas_trait_model_dispatch_v2<'py>(
                 }
                 "farmcpu" => "farmcpu",
                 "algwas" => "algwas",
-                "jxlmm" => "jxlmm",
+                "splmm" => "splmm",
                 _ => "unknown",
             };
             let item = PyDict::new(py);
@@ -303,6 +303,7 @@ pub fn gwas_trait_model_dispatch_v2<'py>(
     row_missing,
     chrom,
     pos,
+    snp,
     allele0,
     allele1,
     step=10000,
@@ -321,6 +322,7 @@ pub fn gwas_packed_unified_to_tsv<'py>(
     row_missing: PyReadonlyArray1<'py, f32>,
     chrom: Vec<String>,
     pos: Vec<i64>,
+    snp: Vec<String>,
     allele0: Vec<String>,
     allele1: Vec<String>,
     step: usize,
@@ -403,6 +405,7 @@ pub fn gwas_packed_unified_to_tsv<'py>(
                     row_missing.clone(),
                     chrom.clone(),
                     pos.clone(),
+                    snp.clone(),
                     allele0.clone(),
                     allele1.clone(),
                     out_tsv.as_str(),
@@ -465,6 +468,7 @@ pub fn gwas_packed_unified_to_tsv<'py>(
                     u_t,
                     chrom.clone(),
                     pos.clone(),
+                    snp.clone(),
                     allele0.clone(),
                     allele1.clone(),
                     out_tsv.as_str(),
@@ -553,6 +557,7 @@ pub fn gwas_packed_unified_to_tsv<'py>(
                     genetic_model.as_str(),
                     chrom.clone(),
                     pos.clone(),
+                    snp.clone(),
                     allele0.clone(),
                     allele1.clone(),
                     out_tsv.as_str(),
@@ -602,6 +607,7 @@ pub fn gwas_packed_unified_to_tsv<'py>(
                     x_cov,
                     chrom.clone(),
                     pos.clone(),
+                    snp.clone(),
                     allele0.clone(),
                     allele1.clone(),
                     packed.clone(),
@@ -669,6 +675,7 @@ pub fn gwas_packed_unified_to_tsv<'py>(
                     x_cov,
                     chrom.clone(),
                     pos.clone(),
+                    snp.clone(),
                     allele0.clone(),
                     allele1.clone(),
                     packed.clone(),

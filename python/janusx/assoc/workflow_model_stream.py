@@ -8,7 +8,6 @@ import io
 import logging
 import os
 import time
-import uuid
 from typing import Optional, Union
 
 import numpy as np
@@ -23,15 +22,17 @@ from .workflow import (
     LMM,
     _GWAS_PROGRESS_BAR_WIDTH,
     _ProgressAdapter,
-    _augment_gwas_tsv_with_snp_names,
     _align_pheno_to_sample_order,
     _as_plink_prefix,
     _display_path,
     _emit_trait_header,
     _fastlmm_should_switch_to_lmm,
+    _finalize_gwas_result_tsv,
     _format_progress_metric,
+    _cleanup_gwas_result_tmp,
     _mixed_model_switch_to_lm_decision,
     _resolve_trait_iter,
+    _gwas_result_tmp_path,
     _gwas_evd_stage_ctx,
     _gwas_scan_stage_ctx,
     _log_file_only,
@@ -56,6 +57,31 @@ from .workflow import (
 
 _WARNED_BED_MMAP_LIMIT_LEGACY = False
 _WARNED_BED_PREPARED_SNPS_ONLY_LEGACY = False
+
+
+def _stream_site_parts(site: object) -> tuple[str, int, str, str]:
+    chrom = str(getattr(site, "chrom", "."))
+    try:
+        pos = int(getattr(site, "pos", 0))
+    except Exception:
+        try:
+            pos = int(float(getattr(site, "pos", 0)))
+        except Exception:
+            pos = 0
+    allele0 = str(getattr(site, "ref_allele", "N"))
+    allele1 = str(getattr(site, "alt_allele", "N"))
+    return chrom, pos, allele0, allele1
+
+
+def _resolve_stream_chunk_snp_names(sites: list[object]) -> list[str]:
+    snp_chunk: list[str] = []
+    for site in sites:
+        snp_name = str(getattr(site, "snp", "") or "").strip()
+        if snp_name == "" or snp_name == ".":
+            chrom, pos, _allele0, _allele1 = _stream_site_parts(site)
+            snp_name = f"{chrom}_{int(pos)}"
+        snp_chunk.append(snp_name)
+    return snp_chunk
 
 
 def _chisq_from_gwas_results(results: np.ndarray) -> np.ndarray:
@@ -523,6 +549,7 @@ def run_chunked_gwas_lmm_lm(
                 saved_paths=saved_paths,
                 chunk_size_user_set=bool(chunk_size_user_set),
                 force_model=bool(force_model),
+                emit_trait_header=bool(emit_trait_header),
             )
             if multi_trait_mode and trait_idx < len(trait_iter) - 1:
                 logger.info("")
@@ -688,7 +715,7 @@ def run_chunked_gwas_lmm_lm(
             out_tsv = f"{outprefix}.{pname_tag}.{effective_model_tag}.tsv"
         else:
             out_tsv = f"{outprefix}.{pname_tag}.{gm_tag}.{effective_model_tag}.tsv"
-        tmp_tsv = f"{out_tsv}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
+        tmp_tsv = _gwas_result_tmp_path(out_tsv)
         wrote_header = False
         mmap_window_mb = (
             auto_mmap_window_mb(genofile, len(ids), n_snps, model_chunk_size)
@@ -731,7 +758,10 @@ def run_chunked_gwas_lmm_lm(
             scan_warmup_task.__enter__()
             scan_warmup_active = True
 
-        inflight: dict[int, tuple[cf.Future, int, object, np.ndarray]] = {}
+        inflight: dict[
+            int,
+            tuple[cf.Future, int, object, list[str], np.ndarray, np.ndarray],
+        ] = {}
         chunk_seq = 0
         interrupted = False
 
@@ -771,7 +801,7 @@ def run_chunked_gwas_lmm_lm(
                 mode = "a" if self._wrote_header else "w"
                 with open(self.path, mode, encoding="utf-8", newline="") as fh:
                     if not self._wrote_header:
-                        header = "chrom\tpos\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald"
+                        header = "chrom\tpos\tsnp\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald"
                         if bool(self._has_plrt):
                             header += "\tplrt"
                         fh.write(header + "\n")
@@ -797,11 +827,16 @@ def run_chunked_gwas_lmm_lm(
         def _format_chunk_tsv_text(
             results: np.ndarray,
             info_chunk: list[tuple[str, int, str, str]],
+            snp_chunk: list[str],
             maf_chunk: np.ndarray,
             miss_chunk: np.ndarray,
         ) -> tuple[str, bool, int]:
             if len(info_chunk) == 0:
                 return "", bool(np.asarray(results).shape[1] > 3), 0
+            if len(snp_chunk) != len(info_chunk):
+                raise ValueError(
+                    "SNP metadata length mismatch while formatting GWAS chunk."
+                )
 
             chroms, poss, allele0, allele1 = zip(*info_chunk)
             allele0_list = list(allele0)
@@ -815,6 +850,7 @@ def run_chunked_gwas_lmm_lm(
             cols = [
                 np.asarray(chroms, dtype=object),
                 np.asarray(poss, dtype=np.int64).astype(str),
+                np.asarray(snp_chunk, dtype=object),
                 np.asarray(allele0_list, dtype=object),
                 np.asarray(allele1_list, dtype=object),
                 np.char.mod("%.4f", np.asarray(maf_chunk, dtype=np.float64)),
@@ -849,18 +885,15 @@ def run_chunked_gwas_lmm_lm(
                     return
 
             done_seq = sorted(
-                [
-                    seq
-                    for seq, (fut, _m, _meta, _maf, _miss) in inflight.items()
-                    if fut in done_set
-                ]
+                [seq for seq, (fut, _m, _meta, _snp, _maf, _miss) in inflight.items() if fut in done_set]
             )
             for seq in done_seq:
-                fut, m_chunk, meta_chunk, maf_chunk, miss_chunk = inflight.pop(seq)
+                fut, m_chunk, meta_chunk, snp_chunk, maf_chunk, miss_chunk = inflight.pop(seq)
                 results = fut.result()
                 if use_rust_assoc_writer:
                     writer.write_chunk(
                         meta_chunk,
+                        snp_chunk,
                         np.asarray(maf_chunk, dtype=np.float32),
                         np.asarray(miss_chunk, dtype=np.float32),
                         np.asarray(results, dtype=np.float64),
@@ -869,6 +902,7 @@ def run_chunked_gwas_lmm_lm(
                     chunk_text, has_plrt, n_rows = _format_chunk_tsv_text(
                         results,
                         meta_chunk,
+                        snp_chunk,
                         maf_chunk,
                         miss_chunk,
                     )
@@ -921,7 +955,6 @@ def run_chunked_gwas_lmm_lm(
                     raise RuntimeError(
                         "Rust-only GWAS scan requires BedChunkReader.next_chunk_prepared."
                     )
-
                 while True:
                     out, legacy_snps_only = _bed_next_chunk_prepared_compat(
                         bed_reader=bed_reader,
@@ -953,6 +986,7 @@ def run_chunked_gwas_lmm_lm(
 
                     if len(sites) == 0:
                         continue
+                    snp_chunk = _resolve_stream_chunk_snp_names(list(sites))
                     meta_chunk: object
                     if use_rust_assoc_writer:
                         meta_chunk = sites
@@ -960,7 +994,14 @@ def run_chunked_gwas_lmm_lm(
                         raise RuntimeError("Rust-only GWAS mode requires Rust TSV writer path.")
 
                     fut = ex.submit(mod.gwas, geno_center, threads=threads_per_worker)
-                    inflight[chunk_seq] = (fut, int(m_chunk), meta_chunk, maf_chunk, miss_chunk)
+                    inflight[chunk_seq] = (
+                        fut,
+                        int(m_chunk),
+                        meta_chunk,
+                        snp_chunk,
+                        maf_chunk,
+                        miss_chunk,
+                    )
                     chunk_seq += 1
 
                     if len(inflight) >= max_inflight:
@@ -1044,18 +1085,16 @@ def run_chunked_gwas_lmm_lm(
                     "result_file": "",
                 }
             )
-            if os.path.exists(tmp_tsv):
-                os.remove(tmp_tsv)
+            _cleanup_gwas_result_tmp(tmp_tsv)
             if multi_trait_mode:
                 logger.info("")  # single blank line between traits
             continue
 
         _run_result_write_with_status(
-            lambda: os.replace(tmp_tsv, out_tsv),
+            lambda: _finalize_gwas_result_tsv(tmp_tsv, out_tsv, genofile, logger=logger),
             use_spinner=bool(use_spinner),
             emit_done_line=False,
         )
-        _augment_gwas_tsv_with_snp_names(out_tsv, genofile, logger=logger)
         saved_paths.append(str(out_tsv))
         _log_model_line(
             logger,
@@ -1135,6 +1174,7 @@ def run_chunked_gwas_streaming_shared(
     saved_paths: Union[list[str], None] = None,
     chunk_size_user_set: bool = True,
     force_model: bool = False,
+    emit_trait_header: bool = True,
 ) -> None:
     """
     Shared-chunk streaming GWAS for multiple models on one trait.
@@ -1147,6 +1187,15 @@ def run_chunked_gwas_streaming_shared(
     model_order = [m for m in model_order if m in model_map]
     if len(model_order) == 0:
         return
+    if len(model_order) > 1:
+        grouped_labels = "+".join(
+            "FastLMM" if m == "fastlmm" else str(m).upper() for m in model_order
+        )
+        _log_file_only(
+            logger,
+            logging.INFO,
+            f"Shared GWAS stream: grouped {grouped_labels} on one BED scan.",
+        )
 
     process = psutil.Process()
     n_cores = detect_effective_threads()
@@ -1177,14 +1226,15 @@ def run_chunked_gwas_streaming_shared(
     X_cov = qmatrix[keep_idx]
     if cov_all is not None:
         X_cov = np.concatenate([X_cov, cov_all[keep_idx]], axis=1)
-    _emit_trait_header(
-        logger,
-        pname,
-        n_idv,
-        pve=None,
-        use_spinner=bool(use_spinner),
-        width=60,
-    )
+    if bool(emit_trait_header):
+        _emit_trait_header(
+            logger,
+            pname,
+            n_idv,
+            pve=None,
+            use_spinner=bool(use_spinner),
+            width=60,
+        )
 
     def _apply_genetic_model(geno_chunk: np.ndarray, model: str) -> np.ndarray:
         m = model.lower()
@@ -1282,7 +1332,7 @@ def run_chunked_gwas_streaming_shared(
             mode = "a" if self._wrote_header else "w"
             with open(self.path, mode, encoding="utf-8", newline="") as fh:
                 if not self._wrote_header:
-                    header = "chrom\tpos\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald"
+                    header = "chrom\tpos\tsnp\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald"
                     if bool(self._has_plrt):
                         header += "\tplrt"
                     fh.write(header + "\n")
@@ -1297,11 +1347,14 @@ def run_chunked_gwas_streaming_shared(
     def _format_chunk_tsv_text(
         results: np.ndarray,
         info_chunk: list[tuple[str, int, str, str]],
+        snp_chunk: list[str],
         maf_chunk: np.ndarray,
         miss_chunk: np.ndarray,
     ) -> tuple[str, bool]:
         if len(info_chunk) == 0:
             return "", bool(np.asarray(results).shape[1] > 3)
+        if len(snp_chunk) != len(info_chunk):
+            raise ValueError("SNP metadata length mismatch while formatting GWAS chunk.")
 
         chroms, poss, allele0, allele1 = zip(*info_chunk)
         allele0_list = list(allele0)
@@ -1316,6 +1369,7 @@ def run_chunked_gwas_streaming_shared(
         cols = [
             np.asarray(chroms, dtype=object),
             np.asarray(poss, dtype=np.int64).astype(str),
+            np.asarray(snp_chunk, dtype=object),
             np.asarray(allele0_list, dtype=object),
             np.asarray(allele1_list, dtype=object),
             np.char.mod("%.4f", np.asarray(maf_chunk, dtype=np.float64)),
@@ -1375,7 +1429,7 @@ def run_chunked_gwas_streaming_shared(
             "memory_until_tick": 0,
             "pbar": None,
             "task_id": None,
-            "tmp_tsv": f"{out_base}.tsv.tmp.{os.getpid()}.{uuid.uuid4().hex}",
+            "tmp_tsv": _gwas_result_tmp_path(f"{out_base}.tsv"),
             "out_tsv": f"{out_base}.tsv",
             "writer": None,
             "init_log": None,
@@ -1506,9 +1560,7 @@ def run_chunked_gwas_streaming_shared(
             candidate_out = f"{out_base}.tsv"
             if candidate_out in existing_out:
                 out_base = _stream_model_outbase(f"{model_tag}_to_{effective_model_tag}")
-            ctx["tmp_tsv"] = (
-                f"{out_base}.tsv.tmp.{os.getpid()}.{uuid.uuid4().hex}"
-            )
+            ctx["tmp_tsv"] = _gwas_result_tmp_path(f"{out_base}.tsv")
             ctx["out_tsv"] = f"{out_base}.tsv"
             ctx["writer"] = jxrs.GwasAssocTsvWriter(
                 str(ctx["tmp_tsv"]),
@@ -1528,8 +1580,13 @@ def run_chunked_gwas_streaming_shared(
     shared_warmup_task: Optional[CliStatus] = None
     shared_warmup_active = False
     if bool(use_spinner):
+        warm_label = (
+            f"Waiting for {str(model_ctxs[0]['model_label'])} GWAS"
+            if len(model_ctxs) == 1
+            else "Waiting for shared GWAS scan"
+        )
         shared_warmup_task = CliStatus(
-            "Waiting for GWAS scan",
+            warm_label,
             enabled=True,
             use_process=True,
         )
@@ -1655,6 +1712,7 @@ def run_chunked_gwas_streaming_shared(
             return
         if len(sites) == 0:
             return
+        snp_chunk = _resolve_stream_chunk_snp_names(list(sites))
 
         for ctx in model_ctxs:
             cpu_before = process.cpu_times()
@@ -1673,6 +1731,7 @@ def run_chunked_gwas_streaming_shared(
             if use_rust_assoc_writer:
                 writer.write_chunk(
                     sites,
+                    snp_chunk,
                     np.asarray(maf_chunk, dtype=np.float32),
                     np.asarray(miss_chunk, dtype=np.float32),
                     np.asarray(results, dtype=np.float64),
@@ -1687,6 +1746,7 @@ def run_chunked_gwas_streaming_shared(
                 chunk_text, has_plrt = _format_chunk_tsv_text(
                     results,
                     info_chunk,
+                    snp_chunk,
                     maf_chunk,
                     miss_chunk,
                 )
@@ -1737,7 +1797,6 @@ def run_chunked_gwas_streaming_shared(
                 logging.INFO,
                 "Shared GWAS scan: using Rust BED prepared-chunk stream.",
             )
-
             while True:
                 out, legacy_snps_only = _bed_next_chunk_prepared_compat(
                     bed_reader=bed_reader,
@@ -1822,12 +1881,7 @@ def run_chunked_gwas_streaming_shared(
                     except Exception:
                         pass
                 if interrupted:
-                    tmp_tsv = str(ctx.get("tmp_tsv", ""))
-                    if tmp_tsv and os.path.exists(tmp_tsv):
-                        try:
-                            os.remove(tmp_tsv)
-                        except Exception:
-                            pass
+                    _cleanup_gwas_result_tmp(str(ctx.get("tmp_tsv", "")))
 
     first_done = 0
     for ctx in model_ctxs:
@@ -1894,11 +1948,10 @@ def run_chunked_gwas_streaming_shared(
                 os.remove(tmp_tsv)
         if has_results:
             _run_result_write_with_status(
-                lambda: os.replace(tmp_tsv, out_tsv),
+                lambda: _finalize_gwas_result_tsv(tmp_tsv, out_tsv, genofile, logger=logger),
                 use_spinner=bool(use_spinner),
                 emit_done_line=False,
             )
-            _augment_gwas_tsv_with_snp_names(out_tsv, genofile, logger=logger)
             saved_paths.append(str(out_tsv))
             _log_model_line(
                 logger,

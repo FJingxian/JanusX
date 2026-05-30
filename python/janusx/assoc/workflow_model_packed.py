@@ -28,13 +28,15 @@ from .workflow import (
     _ProgressAdapter,
     _start_indeterminate_progress_bar,
     _stop_indeterminate_progress_bar,
-    _augment_gwas_tsv_with_snp_names,
     _align_pheno_to_sample_order,
     _as_plink_prefix,
+    _cleanup_gwas_result_tmp,
     _display_path,
     _emit_trait_header,
     _emit_warning_line,
     _fastlmm_should_switch_to_lmm,
+    _finalize_gwas_result_tsv,
+    _gwas_result_tmp_path,
     _gwas_eigh_from_grm,
     _gwas_evd_stage_ctx,
     _gwas_scan_stage_ctx,
@@ -42,12 +44,15 @@ from .workflow import (
     _log_model_line,
     _mixed_model_switch_to_lm_decision,
     _read_bim_sites,
+    _replace_file_with_retry,
     _resolve_trait_iter,
     _resolve_stream_scan_chunk_size,
     _rich_success,
     _run_fastplot_from_tsv_with_status,
     _run_result_write_with_status,
     _safe_trait_file_label,
+    _site_tuple_parts,
+    _split_gwas_sites,
     _trait_values_and_mask,
     auto_mmap_window_mb,
     detect_effective_threads,
@@ -57,14 +62,23 @@ from .workflow import (
 )
 
 _WARNED_LM_STREAM_MMAP_LEGACY = False
-_JXLMM_EXACT_N_MAX = 15_000
-_JXLMM_SPARSE_NULL_CLIP_EIG_EXACT_N_MAX = 0
-_JXLMM_KING_THRESHOLD = 0.05
-_JXLMM_SPARSE_GRM_CUTOFF = 0.05
-_JXLMM_SPARSE_GRM_METHOD = 2
-_JXLMM_SPARSE_REML_GRID_SIZE = 17
-_JXLMM_SPARSE_REML_MAX_ITER = 20
-_JXLMM_SPGRM_SINGLE_BLOCK_N_MAX = 2048
+_SPLMM_EXACT_N_MAX = 15_000
+_SPLMM_SPARSE_NULL_CLIP_EIG_EXACT_N_MAX = 0
+_SPLMM_KING_THRESHOLD = 0.05
+_SPLMM_SPARSE_GRM_CUTOFF = 0.05
+_SPLMM_SPARSE_GRM_METHOD = 2
+_SPLMM_SPARSE_REML_GRID_SIZE = 17
+_SPLMM_SPARSE_REML_MAX_ITER = 20
+_SPLMM_SPGRM_SINGLE_BLOCK_N_MAX = 2048
+_JXLMM_EXACT_N_MAX = _SPLMM_EXACT_N_MAX
+_JXLMM_SPARSE_NULL_CLIP_EIG_EXACT_N_MAX = _SPLMM_SPARSE_NULL_CLIP_EIG_EXACT_N_MAX
+_JXLMM_KING_THRESHOLD = _SPLMM_KING_THRESHOLD
+_JXLMM_SPARSE_GRM_CUTOFF = _SPLMM_SPARSE_GRM_CUTOFF
+_JXLMM_SPARSE_GRM_METHOD = _SPLMM_SPARSE_GRM_METHOD
+_JXLMM_SPARSE_REML_GRID_SIZE = _SPLMM_SPARSE_REML_GRID_SIZE
+_JXLMM_SPARSE_REML_MAX_ITER = _SPLMM_SPARSE_REML_MAX_ITER
+_JXLMM_SPGRM_SINGLE_BLOCK_N_MAX = _SPLMM_SPGRM_SINGLE_BLOCK_N_MAX
+_ALGWAS_STAGE1_EBIC_GAMMA_DEFAULT = 0.5
 
 
 def _gwas_use_rust_unified_v1() -> bool:
@@ -77,6 +91,75 @@ def _gwas_use_rust_unified_v1() -> bool:
     raw = str(os.environ.get("JX_GWAS_USE_RUST_UNIFIED_V1", "")).strip().lower()
     enabled = raw not in {"0", "false", "no", "off"}
     return bool(enabled and hasattr(jxrs, "gwas_packed_unified_to_tsv"))
+
+
+def _algwas_stage1_ebic_gamma() -> float:
+    raw = str(os.environ.get("JX_ALGWAS_STAGE1_EBIC_GAMMA", "")).strip()
+    try:
+        val = float(raw)
+    except Exception:
+        return float(_ALGWAS_STAGE1_EBIC_GAMMA_DEFAULT)
+    if np.isfinite(val) and val >= 0.0:
+        return float(val)
+    return float(_ALGWAS_STAGE1_EBIC_GAMMA_DEFAULT)
+
+
+def _algwas_stage1_select_criterion_label() -> str:
+    raw = str(os.environ.get("JX_ALGWAS_STAGE1_SELECT", "")).strip().lower()
+    return "EBIC" if raw == "ebic" else "BIC"
+
+
+def _log_algwas_stage1_model_selection(
+    logger: logging.Logger,
+    summary_tsv: str,
+) -> None:
+    try:
+        if not os.path.exists(summary_tsv):
+            return
+        tab = pd.read_csv(summary_tsv, sep="\t")
+        if int(tab.shape[0]) <= 0:
+            return
+        for col in (
+            "step",
+            "lambda",
+            "rss",
+            "nnz",
+            "bic",
+            "ebic",
+            "selected_by_bic",
+            "selected_by_ebic",
+            "selected_by_model",
+        ):
+            if col not in tab.columns:
+                return
+
+        model_rows = tab.loc[pd.to_numeric(tab["selected_by_model"], errors="coerce").fillna(0).astype(int) == 1]
+        bic_rows = tab.loc[pd.to_numeric(tab["selected_by_bic"], errors="coerce").fillna(0).astype(int) == 1]
+        ebic_rows = tab.loc[pd.to_numeric(tab["selected_by_ebic"], errors="coerce").fillna(0).astype(int) == 1]
+        best_row = model_rows.iloc[0] if int(model_rows.shape[0]) > 0 else tab.iloc[int(pd.to_numeric(tab["bic"], errors="coerce").astype(float).idxmin())]
+        best_bic_row = bic_rows.iloc[0] if int(bic_rows.shape[0]) > 0 else tab.iloc[int(pd.to_numeric(tab["bic"], errors="coerce").astype(float).idxmin())]
+        best_ebic_row = ebic_rows.iloc[0] if int(ebic_rows.shape[0]) > 0 else tab.iloc[int(pd.to_numeric(tab["ebic"], errors="coerce").astype(float).idxmin())]
+
+        criterion = _algwas_stage1_select_criterion_label()
+        ebic_gamma = _algwas_stage1_ebic_gamma()
+        msg = (
+            "ALGWAS stage1 model selection: "
+            f"criterion={criterion}, "
+            f"best_step={int(best_row['step'])}, "
+            f"lambda={float(best_row['lambda']):.6e}, "
+            f"qtn={int(best_row['nnz'])}, "
+            f"rss={float(best_row['rss']):.6e}, "
+            f"bic={float(best_row['bic']):.6e}, "
+            f"ebic(gamma={ebic_gamma:.2f})={float(best_row['ebic']):.6e}; "
+            f"bic_best_step={int(best_bic_row['step'])}, "
+            f"bic_best_qtn={int(best_bic_row['nnz'])}, "
+            f"ebic_best_step={int(best_ebic_row['step'])}, "
+            f"ebic_best_qtn={int(best_ebic_row['nnz'])}, "
+            f"summary={_display_path(str(summary_tsv))}"
+        )
+        _log_file_only(logger, logging.INFO, msg)
+    except Exception:
+        return
 
 
 def _jxlmm_sparse_meta_path(sparse_path: str) -> str:
@@ -104,7 +187,7 @@ def _jxlmm_sparse_out_prefix(prefix: str, sample_indices: Union[np.ndarray, None
     if sample_indices is None:
         return str(prefix)
     arr = np.ascontiguousarray(np.asarray(sample_indices, dtype=np.int64).reshape(-1), dtype=np.int64)
-    return f"{prefix}.jxlmm.n{int(arr.shape[0])}.{_jxlmm_sparse_sample_hash(arr)}"
+    return f"{prefix}.splmm.n{int(arr.shape[0])}.{_jxlmm_sparse_sample_hash(arr)}"
 
 
 def _jxlmm_sparse_layout_rebuild_reason(sparse_path: str) -> Optional[str]:
@@ -176,8 +259,12 @@ def _jxlmm_parse_sparse_cutoff(jxlmm_source: Optional[str]) -> tuple[float, Opti
     except Exception:
         return float(_JXLMM_SPARSE_GRM_CUTOFF), raw
     if (not np.isfinite(cutoff)) or cutoff < 0.0:
-        raise ValueError(f"JXLMM sparse cutoff must be a finite value >= 0, got {raw}")
+        raise ValueError(f"SparseLMM sparse cutoff must be a finite value >= 0, got {raw}")
     return float(cutoff), None
+
+
+def _splmm_parse_sparse_cutoff(splmm_source: Optional[str]) -> tuple[float, Optional[str]]:
+    return _jxlmm_parse_sparse_cutoff(splmm_source)
 
 
 def _ensure_jxlmm_sparse_grm(
@@ -185,6 +272,7 @@ def _ensure_jxlmm_sparse_grm(
     *,
     sample_indices: Union[np.ndarray, None] = None,
     out_prefix: Optional[str] = None,
+    dense_grm_path: Optional[str] = None,
     cutoff: float,
     maf_threshold: float,
     max_missing_rate: float,
@@ -199,7 +287,12 @@ def _ensure_jxlmm_sparse_grm(
     if sample_indices is not None:
         sample_idx_arg = np.ascontiguousarray(np.asarray(sample_indices, dtype=np.int64).reshape(-1), dtype=np.int64)
         if int(sample_idx_arg.shape[0]) == 0:
-            raise ValueError("JXLMM sparse GRM sample subset must not be empty.")
+            raise ValueError("SparseLMM sparse GRM sample subset must not be empty.")
+    dense_grm_path_use = None
+    if dense_grm_path is not None:
+        dense_grm_path_use = str(dense_grm_path).strip()
+        if dense_grm_path_use == "":
+            dense_grm_path_use = None
     out_prefix_use = str(out_prefix) if out_prefix is not None else _jxlmm_sparse_out_prefix(str(prefix), sample_idx_arg)
     sparse_path = _jxlmm_normalize_jxgrm_path(out_prefix_use)
     meta_path = _jxlmm_sparse_meta_path(sparse_path)
@@ -213,6 +306,11 @@ def _ensure_jxlmm_sparse_grm(
     )
     spec["sample_hash"] = _jxlmm_sparse_sample_hash(sample_idx_arg)
     spec["sample_n"] = int(sample_idx_arg.shape[0]) if sample_idx_arg is not None else None
+    if dense_grm_path_use is not None and dense_grm_path_use.lower().endswith(".npy"):
+        spec["source"] = "dense_grm_npy"
+        spec["dense_grm_path"] = os.path.normpath(dense_grm_path_use)
+    else:
+        spec["source"] = "bed"
     if os.path.exists(sparse_path):
         existing_spec = None
         if os.path.exists(meta_path):
@@ -223,10 +321,16 @@ def _ensure_jxlmm_sparse_grm(
                 existing_spec = None
         layout_reason = _jxlmm_sparse_layout_rebuild_reason(sparse_path)
         if existing_spec == spec and layout_reason is None:
+            src = os.path.basename(str(sparse_path))
+            with CliStatus(
+                f"Loading sparse GRM for SparseLMM from {src}...",
+                enabled=bool(use_spinner),
+            ) as task:
+                task.complete(f"Loading sparse GRM for SparseLMM from {src} ...Finished")
             _log_file_only(
                 logger,
                 logging.INFO,
-                f"JXLMM sparse GRM reused: {_display_path(sparse_path)}",
+                f"SparseLMM sparse GRM reused: {_display_path(sparse_path)}",
             )
             return sparse_path
         if layout_reason is not None:
@@ -235,7 +339,7 @@ def _ensure_jxlmm_sparse_grm(
             reason = "missing metadata" if existing_spec is None else "cutoff or filter settings changed"
         _emit_warning_line(
             logger,
-            f"Rebuilding sparse GRM for JXLMM: {_display_path(sparse_path)} ({reason})",
+            f"Rebuilding sparse GRM for SparseLMM: {os.path.basename(str(sparse_path))} ({reason})",
             use_spinner=bool(use_spinner),
         )
         for path_rm in (sparse_path, meta_path):
@@ -243,14 +347,28 @@ def _ensure_jxlmm_sparse_grm(
                 os.remove(path_rm)
             except OSError:
                 pass
-    if not hasattr(jxrs, "spgrm_bed_to_jxgrm"):
+    have_dense_npy_sparse = hasattr(jxrs, "spgrm_dense_npy_to_jxgrm")
+    have_bed_sparse = hasattr(jxrs, "spgrm_bed_to_jxgrm")
+    if (not have_dense_npy_sparse) and (not have_bed_sparse):
         raise RuntimeError(
-            "Rust extension missing spgrm_bed_to_jxgrm required to build sparse GRM for JXLMM. "
+            "Rust extension is missing sparse GRM builders required by SparseLMM. "
             "Rebuild/install JanusX extension first."
         )
 
+    use_dense_extract = bool(
+        dense_grm_path_use is not None
+        and sample_idx_arg is None
+        and dense_grm_path_use.lower().endswith(".npy")
+        and os.path.exists(dense_grm_path_use)
+        and have_dense_npy_sparse
+    )
+    progress_desc = (
+        "Extracting sparse GRM for SparseLMM from dense GRM"
+        if use_dense_extract
+        else "Building sparse GRM for SparseLMM"
+    )
     pbar: Optional[_ProgressAdapter] = None
-    spin_handle = _start_indeterminate_progress_bar("Building sparse GRM for JXLMM") if bool(use_spinner) else None
+    spin_handle = _start_indeterminate_progress_bar(progress_desc) if bool(use_spinner) else None
     last_done = 0
     last_total = 1
 
@@ -267,7 +385,7 @@ def _ensure_jxlmm_sparse_grm(
         if pbar is None:
             pbar = _ProgressAdapter(
                 total=t,
-                desc="Building sparse GRM for JXLMM",
+                desc=progress_desc,
                 force_animate=True,
             )
             last_total = t
@@ -287,23 +405,38 @@ def _ensure_jxlmm_sparse_grm(
     build_result = None
     build_t0 = time.monotonic()
     try:
-        build_result = jxrs.spgrm_bed_to_jxgrm(
-            str(prefix),
-            out_prefix=str(out_prefix_use),
-            sample_indices=sample_idx_arg,
-            method=int(_JXLMM_SPARSE_GRM_METHOD),
-            threshold=float(cutoff),
-            abs_threshold=False,
-            maf_threshold=float(maf_threshold),
-            max_missing_rate=float(max_missing_rate),
-            het_threshold=float(het_threshold),
-            snps_only=bool(snps_only),
-            block_rows=0,
-            sample_block=0,
-            threads=int(threads_use),
-            progress_callback=_progress_cb,
-            progress_every=1,
-        )
+        if use_dense_extract:
+            build_result = jxrs.spgrm_dense_npy_to_jxgrm(
+                str(dense_grm_path_use),
+                out_prefix=str(out_prefix_use),
+                threshold=float(cutoff),
+                abs_threshold=False,
+                progress_callback=_progress_cb,
+                progress_every=1,
+            )
+        else:
+            if not have_bed_sparse:
+                raise RuntimeError(
+                    "Rust extension missing spgrm_bed_to_jxgrm required to build sparse GRM from genotype. "
+                    "Rebuild/install JanusX extension first."
+                )
+            build_result = jxrs.spgrm_bed_to_jxgrm(
+                str(prefix),
+                out_prefix=str(out_prefix_use),
+                sample_indices=sample_idx_arg,
+                method=int(_JXLMM_SPARSE_GRM_METHOD),
+                threshold=float(cutoff),
+                abs_threshold=False,
+                maf_threshold=float(maf_threshold),
+                max_missing_rate=float(max_missing_rate),
+                het_threshold=float(het_threshold),
+                snps_only=bool(snps_only),
+                block_rows=0,
+                sample_block=0,
+                threads=int(threads_use),
+                progress_callback=_progress_cb,
+                progress_every=1,
+            )
         build_ok = True
     finally:
         if spin_handle is not None:
@@ -319,7 +452,7 @@ def _ensure_jxlmm_sparse_grm(
                 if build_ok:
                     pbar.finish()
             finally:
-                pbar.close()
+                pbar.close(show_done=False)
     built_path = sparse_path
     built_n_samples = None
     built_nnz = None
@@ -363,15 +496,53 @@ def _ensure_jxlmm_sparse_grm(
         logger,
         logging.INFO,
         (
-            f"JXLMM sparse GRM ready: {_display_path(sparse_path)} "
+            f"SparseLMM sparse GRM ready: {_display_path(sparse_path)} "
             f"({', '.join(built_shape)}, "
+            f"source={'dense_grm_npy' if use_dense_extract else 'bed'}, "
             f"method={'standardized' if int(_JXLMM_SPARSE_GRM_METHOD) == 2 else 'centered'}, "
             f"BLAS=1, Rayon={int(threads_use)}, "
             f"sample_block=auto, "
             f"time={format_elapsed(build_secs)})"
         ),
     )
+    if bool(use_spinner):
+        _rich_success(
+            logger,
+            f"{progress_desc} ...Finished [{format_elapsed(build_secs)}]",
+            use_spinner=True,
+        )
     return sparse_path
+
+
+def _ensure_splmm_sparse_grm(
+    prefix: str,
+    *,
+    sample_indices: Union[np.ndarray, None] = None,
+    out_prefix: Optional[str] = None,
+    dense_grm_path: Optional[str] = None,
+    cutoff: float,
+    maf_threshold: float,
+    max_missing_rate: float,
+    het_threshold: float,
+    snps_only: bool,
+    threads: int,
+    logger: logging.Logger,
+    use_spinner: bool,
+) -> str:
+    return _ensure_jxlmm_sparse_grm(
+        prefix,
+        sample_indices=sample_indices,
+        out_prefix=out_prefix,
+        dense_grm_path=dense_grm_path,
+        cutoff=cutoff,
+        maf_threshold=maf_threshold,
+        max_missing_rate=max_missing_rate,
+        het_threshold=het_threshold,
+        snps_only=snps_only,
+        threads=threads,
+        logger=logger,
+        use_spinner=use_spinner,
+    )
 
 
 def _jxlmm_bed_logic_meta_selected(
@@ -385,7 +556,7 @@ def _jxlmm_bed_logic_meta_selected(
 ) -> dict[str, object]:
     if not hasattr(jxrs, "prepare_bed_logic_meta_selected"):
         raise RuntimeError(
-            "Rust extension missing prepare_bed_logic_meta_selected required by JXLMM memmap path."
+            "Rust extension missing prepare_bed_logic_meta_selected required by SparseLMM memmap path."
         )
     row_idx, miss, maf, row_flip, site_keep, n_samples_full, n_snps_total = jxrs.prepare_bed_logic_meta_selected(
         str(prefix),
@@ -506,7 +677,7 @@ def _prepare_packed_bed_once_for_gwas(
     snps_only: bool,
     use_spinner: bool,
     preloaded_packed: Union[dict[str, object], None] = None,
-) -> tuple[str, np.ndarray, dict[str, object], list[tuple[str, int, str, str]]]:
+) -> tuple[str, np.ndarray, dict[str, object], list[tuple[str, int, str, str, str]]]:
     """
     Resolve packed BED context for GWAS full-rust routes.
 
@@ -569,8 +740,8 @@ def _prepare_packed_bed_once_for_gwas(
         sites_pre = pre.get("sites_all")
         if isinstance(sites_pre, list) and len(sites_pre) > 0:
             sites_all = [
-                (str(c), int(p), str(a0), str(a1))
-                for (c, p, a0, a1) in sites_pre
+                _site_tuple_parts(site)
+                for site in sites_pre
             ]
             return str(prefix), full_ids, packed_ctx, sites_all
     else:
@@ -648,7 +819,7 @@ def _packed_preload_ready_state(
     prefix: str,
     full_ids: np.ndarray,
     packed_ctx: dict[str, object],
-    sites_all: list[tuple[str, int, str, str]],
+    sites_all: list[tuple[str, int, str, str, str]],
 ) -> dict[str, object]:
     return {
         "prefix": str(prefix),
@@ -679,7 +850,7 @@ def _jxlmm_ols_residualize(y_vec: np.ndarray, x_cov: Union[np.ndarray, None]) ->
         x = np.ascontiguousarray(np.asarray(x_cov, dtype=np.float64), dtype=np.float64)
         if x.ndim != 2 or int(x.shape[0]) != n:
             raise ValueError(
-                f"JXLMM covariate shape mismatch for residualization: got {x.shape}, expected ({n}, p)."
+                f"SparseLMM covariate shape mismatch for residualization: got {x.shape}, expected ({n}, p)."
             )
         x_design = np.ascontiguousarray(
             np.concatenate([np.ones((n, 1), dtype=np.float64), x], axis=1),
@@ -777,7 +948,7 @@ def _jxlmm_load_sparse_grm_subset_dense(
         )
         if np.any(sample_idx_arg < 0) or np.any(sample_idx_arg >= n_samples):
             raise ValueError(
-                f"JXLMM sparse GRM subset sample index out of bounds for {jxgrm_path}: "
+                f"SparseLMM sparse GRM subset sample index out of bounds for {jxgrm_path}: "
                 f"n_samples={n_samples}"
             )
 
@@ -814,7 +985,7 @@ def _jxlmm_sparse_grm_diag_stats(
     jxgrm_path: str,
     sample_idx: Union[np.ndarray, None] = None,
 ) -> dict[str, float]:
-    if not hasattr(jxrs, "jxlmm_sparse_grm_diag_stats"):
+    if not hasattr(jxrs, "splmm_sparse_grm_diag_stats"):
         return {
             "mean_diag": float("nan"),
             "min_diag": float("nan"),
@@ -828,7 +999,7 @@ def _jxlmm_sparse_grm_diag_stats(
             np.asarray(sample_idx, dtype=np.int64).reshape(-1),
             dtype=np.int64,
         )
-    mean_diag, min_diag, max_diag, n_samples, nnz = jxrs.jxlmm_sparse_grm_diag_stats(
+    mean_diag, min_diag, max_diag, n_samples, nnz = jxrs.splmm_sparse_grm_diag_stats(
         str(jxgrm_path),
         sample_indices=sample_idx_arg,
     )
@@ -917,13 +1088,13 @@ def _jxlmm_exact_null_fit_from_grm(
     extra_fields: Union[dict[str, object], None] = None,
 ) -> dict[str, object]:
     if not hasattr(jxrs, "lmm_reml_null_f32"):
-        raise RuntimeError("Rust extension missing lmm_reml_null_f32 required by JXLMM exact null fit.")
+        raise RuntimeError("Rust extension missing lmm_reml_null_f32 required by SparseLMM exact null fit.")
 
     y_arg = np.ascontiguousarray(np.asarray(y_vec, dtype=np.float64).reshape(-1), dtype=np.float64)
     grm_arr = np.ascontiguousarray(np.asarray(grm, dtype=np.float64), dtype=np.float64)
     n = int(y_arg.shape[0])
     if grm_arr.shape != (n, n):
-        raise ValueError(f"JXLMM exact null GRM shape mismatch: got {grm_arr.shape}, expected ({n}, {n}).")
+        raise ValueError(f"SparseLMM exact null GRM shape mismatch: got {grm_arr.shape}, expected ({n}, {n}).")
     grm_local = np.array(grm_arr, dtype=np.float64, copy=True, order="C")
     np.fill_diagonal(grm_local, np.diag(grm_local) + 1e-6)
 
@@ -946,7 +1117,7 @@ def _jxlmm_exact_null_fit_from_grm(
     eigvals = np.ascontiguousarray(np.asarray(eigvals, dtype=np.float64).reshape(-1)[ord_desc], dtype=np.float64)
     eigvecs = np.ascontiguousarray(np.asarray(eigvecs, dtype=np.float64)[:, ord_desc], dtype=np.float64)
     if eigvecs.shape != (n, n):
-        raise ValueError(f"JXLMM exact null eigenvector shape mismatch: got {eigvecs.shape}, expected ({n}, {n}).")
+        raise ValueError(f"SparseLMM exact null eigenvector shape mismatch: got {eigvecs.shape}, expected ({n}, {n}).")
 
     x_design = _jxlmm_design_with_intercept(x_cov, n)
     s_null = np.ascontiguousarray(np.maximum(np.asarray(eigvals, dtype=np.float64), 0.0), dtype=np.float64)
@@ -1028,13 +1199,13 @@ def _jxlmm_null_progress_stage(route_desc: str, done: int, total: int) -> str:
 def _jxlmm_null_progress_desc(route_desc: str, done: int, total: int) -> str:
     route = str(route_desc).strip() or "null fit"
     stage = _jxlmm_null_progress_stage(route_desc, done, total)
-    return f"JXLMM null: {route} / {stage}"
+    return f"SparseLMM null: {route} / {stage}"
 
 
 def _write_jxlmm_assoc_tsv(
     *,
     out_tsv: str,
-    sites_all: list[tuple[str, int, str, str]],
+    sites_all: list[tuple[str, int, str, str, str]],
     maf: np.ndarray,
     miss: np.ndarray,
     results: np.ndarray,
@@ -1043,7 +1214,7 @@ def _write_jxlmm_assoc_tsv(
 ) -> int:
     if not hasattr(jxrs, "GwasAssocTsvWriter") or not hasattr(jxrs, "SiteInfo"):
         raise RuntimeError(
-            "Rust extension missing GwasAssocTsvWriter/SiteInfo required by JXLMM TSV writer."
+            "Rust extension missing GwasAssocTsvWriter/SiteInfo required by SparseLMM TSV writer."
         )
     n_rows = int(len(sites_all))
     maf_arr = np.ascontiguousarray(np.asarray(maf, dtype=np.float32).reshape(-1), dtype=np.float32)
@@ -1051,11 +1222,11 @@ def _write_jxlmm_assoc_tsv(
     res_arr = np.ascontiguousarray(np.asarray(results, dtype=np.float64), dtype=np.float64)
     if maf_arr.shape[0] != n_rows or miss_arr.shape[0] != n_rows:
         raise ValueError(
-            f"JXLMM TSV writer metadata mismatch: sites={n_rows}, maf={maf_arr.shape[0]}, miss={miss_arr.shape[0]}"
+            f"SparseLMM TSV writer metadata mismatch: sites={n_rows}, maf={maf_arr.shape[0]}, miss={miss_arr.shape[0]}"
         )
     if res_arr.shape != (n_rows, 3):
         raise ValueError(
-            f"JXLMM TSV writer result shape mismatch: got {res_arr.shape}, expected ({n_rows}, 3)."
+            f"SparseLMM TSV writer result shape mismatch: got {res_arr.shape}, expected ({n_rows}, 3)."
         )
     gm = str(genetic_model).strip().lower()
 
@@ -1071,11 +1242,12 @@ def _write_jxlmm_assoc_tsv(
     step = int(max(1, chunk_rows))
     written = 0
     with open(out_tsv, "w", encoding="utf-8", newline="") as fh:
-        fh.write("chrom\tpos\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\n")
+        fh.write("chrom\tpos\tsnp\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\n")
         for start in range(0, n_rows, step):
             end = min(start + step, n_rows)
             chunk_text: list[str] = []
-            for off, (chrom, pos, allele0, allele1) in enumerate(sites_all[start:end]):
+            for off, site in enumerate(sites_all[start:end]):
+                chrom, pos, allele0, allele1, snp = _site_tuple_parts(site)
                 idx = start + off
                 beta = float(res_arr[idx, 0])
                 se = float(res_arr[idx, 1])
@@ -1085,7 +1257,7 @@ def _write_jxlmm_assoc_tsv(
                     chisq = float((beta / se) ** 2)
                 a0_txt, a1_txt = _alleles(str(allele0), str(allele1))
                 chunk_text.append(
-                    f"{chrom}\t{int(pos)}\t{a0_txt}\t{a1_txt}\t"
+                    f"{chrom}\t{int(pos)}\t{snp}\t{a0_txt}\t{a1_txt}\t"
                     f"{float(maf_arr[idx]):.4f}\t{float(miss_arr[idx]):.4f}\t"
                     f"{beta:.4f}\t{se:.4f}\t{chisq:.6g}\t{pwald:.4e}\n"
                 )
@@ -1112,16 +1284,16 @@ def _jxlmm_fastlmm_profile_vc(
     y1 = np.ascontiguousarray(np.asarray(u1ty, dtype=np.float64).reshape(-1), dtype=np.float64)
     y2 = np.ascontiguousarray(np.asarray(u2ty, dtype=np.float64).reshape(-1), dtype=np.float64)
     if x1.ndim != 2 or x2.ndim != 2:
-        raise ValueError("JXLMM FastLMM profile VC expects 2D u1tx/u2tx.")
+        raise ValueError("SparseLMM FastLMM profile VC expects 2D u1tx/u2tx.")
     k = int(s.shape[0])
     if x1.shape[0] != k or y1.shape[0] != k:
         raise ValueError(
-            f"JXLMM FastLMM profile VC spectral shape mismatch: len(s)={k}, u1tx={x1.shape}, u1ty={y1.shape}"
+            f"SparseLMM FastLMM profile VC spectral shape mismatch: len(s)={k}, u1tx={x1.shape}, u1ty={y1.shape}"
         )
     n2, p = int(x2.shape[0]), int(x2.shape[1])
     if int(x1.shape[1]) != p or y2.shape[0] != n2:
         raise ValueError(
-            f"JXLMM FastLMM profile VC residual shape mismatch: u1tx={x1.shape}, u2tx={x2.shape}, u2ty={y2.shape}"
+            f"SparseLMM FastLMM profile VC residual shape mismatch: u1tx={x1.shape}, u2tx={x2.shape}, u2ty={y2.shape}"
         )
     n_minus_p = n2 - p
     if n_minus_p <= 0:
@@ -1159,11 +1331,11 @@ def _jxlmm_exact_profile_vc(
     x = np.ascontiguousarray(np.asarray(utx, dtype=np.float64), dtype=np.float64)
     y = np.ascontiguousarray(np.asarray(uty, dtype=np.float64).reshape(-1), dtype=np.float64)
     if x.ndim != 2:
-        raise ValueError("JXLMM exact profile VC expects 2D utx.")
+        raise ValueError("SparseLMM exact profile VC expects 2D utx.")
     n, p = int(x.shape[0]), int(x.shape[1])
     if int(s.shape[0]) != n or int(y.shape[0]) != n:
         raise ValueError(
-            f"JXLMM exact profile VC spectral shape mismatch: len(s)={s.shape[0]}, utx={x.shape}, uty={y.shape}"
+            f"SparseLMM exact profile VC spectral shape mismatch: len(s)={s.shape[0]}, utx={x.shape}, uty={y.shape}"
         )
     n_minus_p = n - p
     if n_minus_p <= 0:
@@ -1190,7 +1362,7 @@ def _jxlmm_design_with_intercept(
         return np.ones((n, 1), dtype=np.float64)
     x = np.ascontiguousarray(np.asarray(x_cov, dtype=np.float64), dtype=np.float64)
     if x.ndim != 2 or int(x.shape[0]) != n:
-        raise ValueError(f"JXLMM covariate shape mismatch: got {x.shape}, expected ({n}, p).")
+        raise ValueError(f"SparseLMM covariate shape mismatch: got {x.shape}, expected ({n}, p).")
     return np.ascontiguousarray(
         np.concatenate([np.ones((n, 1), dtype=np.float64), x], axis=1),
         dtype=np.float64,
@@ -1232,14 +1404,14 @@ def _jxlmm_exact_setup(
     y = np.ascontiguousarray(np.asarray(y_vec, dtype=np.float64).reshape(-1), dtype=np.float64)
     n = int(y.shape[0])
     if n == 0:
-        raise ValueError("JXLMM exact setup requires non-empty y.")
+        raise ValueError("SparseLMM exact setup requires non-empty y.")
     x_design = _jxlmm_design_with_intercept(x_cov, n)
     eigvals = np.ascontiguousarray(np.asarray(null_fit["eigvals"], dtype=np.float64).reshape(-1), dtype=np.float64)
     eigvecs = np.ascontiguousarray(np.asarray(null_fit["eigvecs"], dtype=np.float64), dtype=np.float64)
     if eigvecs.shape != (n, n):
-        raise ValueError(f"JXLMM exact setup eigenvector shape mismatch: got {eigvecs.shape}, expected ({n}, {n}).")
+        raise ValueError(f"SparseLMM exact setup eigenvector shape mismatch: got {eigvecs.shape}, expected ({n}, {n}).")
     if int(eigvals.shape[0]) != n:
-        raise ValueError(f"JXLMM exact setup eigenvalue length mismatch: got {eigvals.shape[0]}, expected {n}.")
+        raise ValueError(f"SparseLMM exact setup eigenvalue length mismatch: got {eigvals.shape[0]}, expected {n}.")
 
     sigma_g2 = float(null_fit["sigma_g2"])
     sigma_e2 = float(null_fit["sigma_e2"])
@@ -1294,7 +1466,7 @@ def _jxlmm_exact_setup(
     )
     if sampled.shape != (n_markers_use, n):
         raise ValueError(
-            f"JXLMM exact setup sampled marker shape mismatch: got {sampled.shape}, expected ({n_markers_use}, {n})."
+            f"SparseLMM exact setup sampled marker shape mismatch: got {sampled.shape}, expected ({n_markers_use}, {n})."
         )
     s_mat = np.ascontiguousarray(sampled.T, dtype=np.float64)
     xts = np.ascontiguousarray(x_design.T @ s_mat, dtype=np.float64)
@@ -1307,12 +1479,12 @@ def _jxlmm_exact_setup(
     s_p_s = np.sum(s_mat * v_inv_s, axis=0) - np.sum(xt_vinv_s * alpha_p, axis=0)
     valid = np.isfinite(s_m_s) & np.isfinite(s_p_s) & (s_m_s > 1e-12) & (s_p_s >= 0.0)
     if not np.any(valid):
-        raise RuntimeError("JXLMM exact r_hat estimation failed: no valid sampled markers.")
+        raise RuntimeError("SparseLMM exact r_hat estimation failed: no valid sampled markers.")
     r_hat = float(np.mean(np.asarray(s_p_s[valid] / s_m_s[valid], dtype=np.float64)))
     if progress_callback is not None:
         progress_callback(1, n_markers_use, max(1, n_markers_use))
     if not np.isfinite(r_hat) or r_hat <= 0.0:
-        raise RuntimeError(f"JXLMM exact r_hat is invalid: r_hat={r_hat}")
+        raise RuntimeError(f"SparseLMM exact r_hat is invalid: r_hat={r_hat}")
     return py_vec, r_hat, n_markers_use
 
 
@@ -1332,13 +1504,13 @@ def _jxlmm_exact_null_fit(
     progress_callback=None,
 ) -> dict[str, object]:
     if not hasattr(jxrs, "grm_packed_f64_with_stats"):
-        raise RuntimeError("Rust extension missing grm_packed_f64_with_stats required by JXLMM exact null fit.")
+        raise RuntimeError("Rust extension missing grm_packed_f64_with_stats required by SparseLMM exact null fit.")
 
     sample_idx_arg = np.ascontiguousarray(np.asarray(sample_idx, dtype=np.int64).reshape(-1), dtype=np.int64)
     y_arg = np.ascontiguousarray(np.asarray(y_vec, dtype=np.float64).reshape(-1), dtype=np.float64)
     if int(sample_idx_arg.shape[0]) != int(y_arg.shape[0]):
         raise ValueError(
-            f"JXLMM exact null fit sample/y mismatch: sample_idx={sample_idx_arg.shape[0]} y={y_arg.shape[0]}"
+            f"SparseLMM exact null fit sample/y mismatch: sample_idx={sample_idx_arg.shape[0]} y={y_arg.shape[0]}"
         )
     packed_arr = np.ascontiguousarray(np.asarray(packed, dtype=np.uint8), dtype=np.uint8)
     row_flip_arr = np.ascontiguousarray(np.asarray(row_flip, dtype=np.bool_).reshape(-1), dtype=np.bool_)
@@ -1346,13 +1518,13 @@ def _jxlmm_exact_null_fit(
     if int(packed_arr.shape[0]) != int(row_flip_arr.shape[0]) or int(packed_arr.shape[0]) != int(maf_arr.shape[0]):
         if row_indices is None:
             raise ValueError(
-                f"JXLMM exact null fit packed/meta mismatch without row_indices: packed_rows={packed_arr.shape[0]}, "
+                f"SparseLMM exact null fit packed/meta mismatch without row_indices: packed_rows={packed_arr.shape[0]}, "
                 f"row_flip={row_flip_arr.shape[0]}, maf={maf_arr.shape[0]}"
             )
         row_idx_arr = np.ascontiguousarray(np.asarray(row_indices, dtype=np.int64).reshape(-1), dtype=np.int64)
         if int(row_idx_arr.shape[0]) != int(row_flip_arr.shape[0]) or int(row_idx_arr.shape[0]) != int(maf_arr.shape[0]):
             raise ValueError(
-                f"JXLMM exact null fit row_indices/meta mismatch: row_indices={row_idx_arr.shape[0]}, "
+                f"SparseLMM exact null fit row_indices/meta mismatch: row_indices={row_idx_arr.shape[0]}, "
                 f"row_flip={row_flip_arr.shape[0]}, maf={maf_arr.shape[0]}"
             )
         packed_arr = np.ascontiguousarray(packed_arr[row_idx_arr, :], dtype=np.uint8)
@@ -1391,7 +1563,7 @@ def _jxlmm_exact_null_fit(
     grm = np.ascontiguousarray(np.asarray(grm_raw, dtype=np.float64), dtype=np.float64)
     n = int(y_arg.shape[0])
     if grm.shape != (n, n):
-        raise ValueError(f"JXLMM exact null GRM shape mismatch: got {grm.shape}, expected ({n}, {n}).")
+        raise ValueError(f"SparseLMM exact null GRM shape mismatch: got {grm.shape}, expected ({n}, {n}).")
     if progress_callback is not None:
         progress_callback(600, progress_total)
     return _jxlmm_exact_null_fit_from_grm(
@@ -1425,13 +1597,13 @@ def _jxlmm_exact_null_fit_memmap(
     precomputed_meta: Union[dict[str, object], None] = None,
 ) -> dict[str, object]:
     if not hasattr(jxrs, "grm_bed_f64_from_meta"):
-        raise RuntimeError("Rust extension missing grm_bed_f64_from_meta required by JXLMM memmap exact null fit.")
+        raise RuntimeError("Rust extension missing grm_bed_f64_from_meta required by SparseLMM memmap exact null fit.")
 
     sample_idx_arg = np.ascontiguousarray(np.asarray(sample_idx, dtype=np.int64).reshape(-1), dtype=np.int64)
     y_arg = np.ascontiguousarray(np.asarray(y_vec, dtype=np.float64).reshape(-1), dtype=np.float64)
     if int(sample_idx_arg.shape[0]) != int(y_arg.shape[0]):
         raise ValueError(
-            f"JXLMM memmap exact null fit sample/y mismatch: sample_idx={sample_idx_arg.shape[0]} y={y_arg.shape[0]}"
+            f"SparseLMM memmap exact null fit sample/y mismatch: sample_idx={sample_idx_arg.shape[0]} y={y_arg.shape[0]}"
         )
     meta = precomputed_meta
     if meta is None:
@@ -1449,10 +1621,10 @@ def _jxlmm_exact_null_fit_memmap(
     row_flip_arg = np.ascontiguousarray(np.asarray(meta["row_flip"], dtype=np.bool_).reshape(-1), dtype=np.bool_)
     site_keep_arg = np.ascontiguousarray(np.asarray(meta["site_keep"], dtype=np.bool_).reshape(-1), dtype=np.bool_)
     if int(row_idx_arg.shape[0]) == 0:
-        raise RuntimeError("No variant sites passed filters for JXLMM memmap exact null fit.")
+        raise RuntimeError("No variant sites passed filters for SparseLMM memmap exact null fit.")
     if int(row_idx_arg.shape[0]) != int(maf_arg.shape[0]) or int(row_idx_arg.shape[0]) != int(row_flip_arg.shape[0]):
         raise ValueError(
-            "JXLMM memmap exact null fit meta mismatch: row_indices / maf / row_flip lengths differ."
+            "SparseLMM memmap exact null fit meta mismatch: row_indices / maf / row_flip lengths differ."
         )
 
     grm_t0 = time.monotonic()
@@ -1489,7 +1661,7 @@ def _jxlmm_exact_null_fit_memmap(
     grm = np.ascontiguousarray(np.asarray(grm_raw, dtype=np.float64), dtype=np.float64)
     n = int(y_arg.shape[0])
     if grm.shape != (n, n):
-        raise ValueError(f"JXLMM memmap exact null GRM shape mismatch: got {grm.shape}, expected ({n}, {n}).")
+        raise ValueError(f"SparseLMM memmap exact null GRM shape mismatch: got {grm.shape}, expected ({n}, {n}).")
     if progress_callback is not None:
         progress_callback(600, progress_total)
     return _jxlmm_exact_null_fit_from_grm(
@@ -1529,14 +1701,14 @@ def _jxlmm_sparse_null_fit(
         sample_idx_arg = np.ascontiguousarray(np.asarray(sample_idx, dtype=np.int64).reshape(-1), dtype=np.int64)
         if int(sample_idx_arg.shape[0]) != int(y_arg.shape[0]):
             raise ValueError(
-                f"JXLMM sparse null fit sample/y mismatch: sample_idx={sample_idx_arg.shape[0]} y={y_arg.shape[0]}"
+                f"SparseLMM sparse null fit sample/y mismatch: sample_idx={sample_idx_arg.shape[0]} y={y_arg.shape[0]}"
             )
     x_arg = None
     if x_cov is not None:
         x_arg = np.ascontiguousarray(np.asarray(x_cov, dtype=np.float64), dtype=np.float64)
         if x_arg.ndim != 2 or int(x_arg.shape[0]) != int(y_arg.shape[0]):
             raise ValueError(
-                f"JXLMM sparse null covariate shape mismatch: got {x_arg.shape}, expected ({y_arg.shape[0]}, p)."
+                f"SparseLMM sparse null covariate shape mismatch: got {x_arg.shape}, expected ({y_arg.shape[0]}, p)."
             )
 
     n_samples_null = int(y_arg.shape[0])
@@ -1596,7 +1768,7 @@ def _jxlmm_sparse_null_fit(
             y_vec=y_arg,
             x_cov=x_arg,
             threads=max(1, int(detect_effective_threads())),
-            stage_label="JXLMM sparse exact null eigendecompose clipped sparse subset",
+            stage_label="SparseLMM sparse exact null eigendecompose clipped sparse subset",
             progress_callback=_exact_progress if progress_callback is not None else None,
             grm_secs=float(grm_secs),
             strategy="sparse_exact_spectral_clipped",
@@ -1624,15 +1796,15 @@ def _jxlmm_sparse_null_fit(
             progress_callback(progress_total, progress_total)
         return out
 
-    if not hasattr(jxrs, "jxreml_sparse_reml_brent_from_jxgrm"):
+    if not hasattr(jxrs, "spreml_sparse_reml_brent_from_jxgrm"):
         raise RuntimeError(
-            "Rust extension missing jxreml_sparse_reml_brent_from_jxgrm required by JXLMM sparse null fit."
+            "Rust extension missing spreml_sparse_reml_brent_from_jxgrm required by SparseLMM sparse null fit."
         )
 
     fit_t0 = time.monotonic()
     low = -5.0
     high = 5.0
-    out = jxrs.jxreml_sparse_reml_brent_from_jxgrm(
+    out = jxrs.spreml_sparse_reml_brent_from_jxgrm(
         str(jxgrm_path),
         y_arg,
         x_cov=x_arg,
@@ -1712,7 +1884,7 @@ def _jxlmm_marker_fast_null_fit(
     progress_callback=None,
 ) -> dict[str, object]:
     if not hasattr(jxrs, "gblup_reml_packed_bed"):
-        raise RuntimeError("Rust extension missing gblup_reml_packed_bed required by JXLMM low-rank null fit.")
+        raise RuntimeError("Rust extension missing gblup_reml_packed_bed required by SparseLMM low-rank null fit.")
 
     if progress_callback is not None:
         progress_callback(0, 4)
@@ -1741,7 +1913,7 @@ def _jxlmm_marker_fast_null_fit(
         progress_callback(4, 4)
     g_t = tuple(g_out)
     if len(g_t) < 11:
-        raise RuntimeError(f"Unexpected gblup_reml_packed_bed payload size for JXLMM low-rank null fit: {len(g_t)}")
+        raise RuntimeError(f"Unexpected gblup_reml_packed_bed payload size for SparseLMM low-rank null fit: {len(g_t)}")
     sigma_g2 = float(g_t[9])
     sigma_e2 = float(g_t[10])
     return {
@@ -1915,10 +2087,7 @@ def run_fastlmm_packed_fullrank(
         raise ValueError(
             f"Packed/BIM mismatch after filtering: sites={len(sites_all)} active_rows={packed_row_idx.shape[0]}"
         )
-    chrom_all = [str(c) for (c, _p, _a0, _a1) in sites_all]
-    pos_all = [int(p) for (_c, p, _a0, _a1) in sites_all]
-    allele0_all = [str(v) for (_c, _p, v, _a1) in sites_all]
-    allele1_all = [str(v) for (_c, _p, _a0, v) in sites_all]
+    chrom_all, pos_all, allele0_all, allele1_all, snp_all = _split_gwas_sites(sites_all)
 
     process = psutil.Process()
     n_cores = detect_effective_threads()
@@ -2290,6 +2459,7 @@ def run_fastlmm_packed_fullrank(
             out_tsv = f"{outprefix}.{pname_tag}.fastlmm.tsv"
         else:
             out_tsv = f"{outprefix}.{pname_tag}.{gm_tag}.fastlmm.tsv"
+        tmp_tsv = _gwas_result_tmp_path(out_tsv)
 
         gwas_ok = False
         lbd = float("nan")
@@ -2317,7 +2487,7 @@ def run_fastlmm_packed_fullrank(
                             {
                                 "model": "fastlmm",
                                 "trait": str(pname),
-                                "out_tsv": str(out_tsv),
+                                "out_tsv": str(tmp_tsv),
                                 "y": y_vec,
                                 "x": x_arg,
                                 "u": u_trait,
@@ -2344,6 +2514,7 @@ def run_fastlmm_packed_fullrank(
                             miss,
                             chrom_all,
                             pos_all,
+                            snp_all,
                             allele0_all,
                             allele1_all,
                             int(max(1, int(chunk_size))),
@@ -2385,9 +2556,10 @@ def run_fastlmm_packed_fullrank(
                         str(genetic_model),
                         chrom_all,
                         pos_all,
+                        snp_all,
                         allele0_all,
                         allele1_all,
-                        out_tsv,
+                        tmp_tsv,
                         row_indices=packed_row_idx,
                         fixed_lbd=(float(fixed_lbd) if fixed_lbd is not None else None),
                         fixed_ml0=(float(fixed_ml0) if fixed_ml0 is not None else None),
@@ -2413,6 +2585,8 @@ def run_fastlmm_packed_fullrank(
                 except Exception:
                     pass
                 gwas_pbar.close(show_done=False)
+            if not gwas_ok:
+                _cleanup_gwas_result_tmp(tmp_tsv)
 
         pve = None
         try:
@@ -2423,7 +2597,7 @@ def run_fastlmm_packed_fullrank(
         except Exception:
             pve = None
 
-        _augment_gwas_tsv_with_snp_names(out_tsv, prefix, logger=logger)
+        _finalize_gwas_result_tsv(tmp_tsv, out_tsv, prefix, logger=logger)
         saved_paths.append(str(out_tsv))
         viz_secs = 0.0
         if plot:
@@ -2444,7 +2618,7 @@ def run_fastlmm_packed_fullrank(
         avg_cpu = 100.0 * cpu_used / (wall * max(1, n_cores))
         peak_rss_gb = peak_rss / (1024 ** 3)
 
-        eff_snp = int(len(trait_sites_all))
+        eff_snp = int(len(sites_all))
         eff_snp_by_trait[pname] = eff_snp
         summary_rows.append(
             {
@@ -2552,10 +2726,7 @@ def run_lm_packed_fullrank(
         raise ValueError(
             f"Packed/BIM mismatch after filtering: sites={len(sites_all)} active_rows={packed_row_idx.shape[0]}"
         )
-    chrom_all = [str(c) for (c, _p, _a0, _a1) in sites_all]
-    pos_all = [int(p) for (_c, p, _a0, _a1) in sites_all]
-    allele0_all = [str(v) for (_c, _p, v, _a1) in sites_all]
-    allele1_all = [str(v) for (_c, _p, _a0, v) in sites_all]
+    chrom_all, pos_all, allele0_all, allele1_all, snp_all = _split_gwas_sites(sites_all)
 
     process = psutil.Process()
     n_cores = detect_effective_threads()
@@ -2617,6 +2788,7 @@ def run_lm_packed_fullrank(
             out_tsv = f"{outprefix}.{pname_tag}.lm.tsv"
         else:
             out_tsv = f"{outprefix}.{pname_tag}.{gm_tag}.lm.tsv"
+        tmp_tsv = _gwas_result_tmp_path(out_tsv)
 
         gwas_t0 = time.monotonic()
         gwas_total = int(len(sites_all))
@@ -2672,7 +2844,7 @@ def run_lm_packed_fullrank(
                             {
                                 "model": "lm",
                                 "trait": str(pname),
-                                "out_tsv": str(out_tsv),
+                                "out_tsv": str(tmp_tsv),
                                 "y": y_vec,
                                 "x": x_design,
                                 "ixx": None,
@@ -2691,6 +2863,7 @@ def run_lm_packed_fullrank(
                             miss,
                             chrom_all,
                             pos_all,
+                            snp_all,
                             allele0_all,
                             allele1_all,
                             int(max(1, int(chunk_size))),
@@ -2725,9 +2898,10 @@ def run_lm_packed_fullrank(
                             miss,
                             chrom_all,
                             pos_all,
+                            snp_all,
                             allele0_all,
                             allele1_all,
-                            out_tsv,
+                            tmp_tsv,
                             sample_idx_trait,
                             row_indices=packed_row_idx,
                             step=int(max(1, int(chunk_size))),
@@ -2748,9 +2922,10 @@ def run_lm_packed_fullrank(
                             miss,
                             chrom_all,
                             pos_all,
+                            snp_all,
                             allele0_all,
                             allele1_all,
-                            out_tsv,
+                            tmp_tsv,
                             sample_idx_trait,
                             row_indices=packed_row_idx,
                             step=int(max(1, int(chunk_size))),
@@ -2769,9 +2944,11 @@ def run_lm_packed_fullrank(
                 except Exception:
                     pass
                 gwas_pbar.close(show_done=False)
+            if not gwas_ok:
+                _cleanup_gwas_result_tmp(tmp_tsv)
 
         gwas_secs = max(time.monotonic() - gwas_t0, 0.0)
-        _augment_gwas_tsv_with_snp_names(out_tsv, prefix, logger=logger)
+        _finalize_gwas_result_tsv(tmp_tsv, out_tsv, prefix, logger=logger)
         saved_paths.append(str(out_tsv))
         viz_secs = 0.0
         if plot:
@@ -2939,7 +3116,7 @@ def run_lm_stream_bed_single_entry(
             out_tsv = f"{outprefix}.{pname_tag}.lm.tsv"
         else:
             out_tsv = f"{outprefix}.{pname_tag}.{gm_tag}.lm.tsv"
-        tmp_tsv = f"{out_tsv}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
+        tmp_tsv = _gwas_result_tmp_path(out_tsv)
 
         scan_threads = int(threads)
         if scan_threads <= 0:
@@ -3070,6 +3247,8 @@ def run_lm_stream_bed_single_entry(
                 except Exception:
                     pass
                 pbar.close(show_done=False)
+            if not scan_ok:
+                _cleanup_gwas_result_tmp(tmp_tsv)
 
         gwas_secs = max(time.monotonic() - scan_t0, 0.0)
         peak_rss = max(peak_rss, process.memory_info().rss)
@@ -3100,8 +3279,7 @@ def run_lm_stream_bed_single_entry(
 
         done_snps = int(kept_rows)
         if done_snps <= 0:
-            if os.path.exists(tmp_tsv):
-                os.remove(tmp_tsv)
+            _cleanup_gwas_result_tmp(tmp_tsv)
             logger.info(f"LM: no SNPs passed filters for trait {pname}.")
             eff_snp_by_trait[str(pname)] = int(done_snps)
             summary_rows.append(
@@ -3122,12 +3300,7 @@ def run_lm_stream_bed_single_entry(
                 logger.info("")
             continue
 
-        _run_result_write_with_status(
-            lambda: os.replace(tmp_tsv, out_tsv),
-            use_spinner=bool(use_spinner),
-            emit_done_line=False,
-        )
-        _augment_gwas_tsv_with_snp_names(out_tsv, prefix, logger=logger)
+        _finalize_gwas_result_tsv(tmp_tsv, out_tsv, prefix, logger=logger)
         saved_paths.append(str(out_tsv))
         _log_model_line(
             logger,
@@ -3430,16 +3603,14 @@ def run_lmm_packed_fullrank(
 
         gwas_ok = False
         null_lbd = float("nan")
-        chrom_all = [str(c) for (c, _p, _a0, _a1) in sites_all]
-        pos_all = [int(p) for (_c, p, _a0, _a1) in sites_all]
-        allele0_all = [str(v) for (_c, _p, v, _a1) in sites_all]
-        allele1_all = [str(v) for (_c, _p, _a0, v) in sites_all]
+        chrom_all, pos_all, allele0_all, allele1_all, snp_all = _split_gwas_sites(sites_all)
         gm_tag = str(genetic_model).lower()
         pname_tag = _safe_trait_file_label(pname)
         if gm_tag == "add":
             out_tsv = f"{outprefix}.{pname_tag}.lmm.tsv"
         else:
             out_tsv = f"{outprefix}.{pname_tag}.{gm_tag}.lmm.tsv"
+        tmp_tsv = _gwas_result_tmp_path(out_tsv)
         try:
             progress_kwargs: dict[str, object] = {}
             if gwas_pbar is not None:
@@ -3475,9 +3646,10 @@ def run_lmm_packed_fullrank(
                     u_t,
                     chrom_all,
                     pos_all,
+                    snp_all,
                     allele0_all,
                     allele1_all,
-                    out_tsv,
+                    tmp_tsv,
                     sample_idx_trait,
                     row_indices=packed_row_idx,
                     low=-5.0,
@@ -3512,9 +3684,11 @@ def run_lmm_packed_fullrank(
                 except Exception:
                     pass
                 gwas_pbar.close(show_done=False)
+            if not gwas_ok:
+                _cleanup_gwas_result_tmp(tmp_tsv)
 
         gwas_secs = max(time.monotonic() - gwas_t0, 0.0)
-        _augment_gwas_tsv_with_snp_names(out_tsv, prefix, logger=logger)
+        _finalize_gwas_result_tsv(tmp_tsv, out_tsv, prefix, logger=logger)
         saved_paths.append(str(out_tsv))
         viz_secs = 0.0
         if plot:
@@ -3698,10 +3872,7 @@ def run_algwas_packed_fullrank(
             f"Packed/BIM mismatch after filtering: sites={len(sites_all)} active_rows={packed_row_idx.shape[0]}"
         )
 
-    chrom_all = [str(c) for (c, _p, _a0, _a1) in sites_all]
-    pos_all = [int(p) for (_c, p, _a0, _a1) in sites_all]
-    allele0_all = [str(v) for (_c, _p, v, _a1) in sites_all]
-    allele1_all = [str(v) for (_c, _p, _a0, v) in sites_all]
+    chrom_all, pos_all, allele0_all, allele1_all, snp_all = _split_gwas_sites(sites_all)
 
     process = psutil.Process()
     n_cores = detect_effective_threads()
@@ -3757,8 +3928,10 @@ def run_algwas_packed_fullrank(
 
         pname_tag = _safe_trait_file_label(pname)
         out_tsv = f"{outprefix}.{pname_tag}.algwas.tsv"
+        tmp_tsv = _gwas_result_tmp_path(out_tsv)
         pseudo_tsv_hint = f"{outprefix}.{pname_tag}.algwas.qtn.tsv"
         stage1_tsv_hint = f"{os.path.splitext(out_tsv)[0]}.stage1.tsv"
+        tmp_stage1_tsv_hint = f"{tmp_tsv}.stage1.tsv"
 
         stage1_total = 256
         stage1_last_done = 0
@@ -3875,7 +4048,7 @@ def run_algwas_packed_fullrank(
                             {
                                 "model": "algwas",
                                 "trait": str(pname),
-                                "out_tsv": str(out_tsv),
+                                "out_tsv": str(tmp_tsv),
                                 "y": y_vec,
                                 "x_cov": x_cov,
                                 "sample_indices": sample_idx_trait,
@@ -3898,6 +4071,7 @@ def run_algwas_packed_fullrank(
                             miss,
                             chrom_all,
                             pos_all,
+                            snp_all,
                             allele0_all,
                             allele1_all,
                             int(max(1, int(chunk_size))),
@@ -3924,6 +4098,7 @@ def run_algwas_packed_fullrank(
                         x_cov,
                         chrom_all,
                         pos_all,
+                        snp_all,
                         allele0_all,
                         allele1_all,
                         packed,
@@ -3931,7 +4106,7 @@ def run_algwas_packed_fullrank(
                         row_flip,
                         maf,
                         miss,
-                        out_tsv,
+                        tmp_tsv,
                         sample_indices=sample_idx_trait,
                         qtn_bound=None,
                         lambda_steps=64,
@@ -3966,14 +4141,19 @@ def run_algwas_packed_fullrank(
                 except Exception:
                     pass
                 gwas_pbar.close(show_done=False)
+            if not gwas_ok:
+                _cleanup_gwas_result_tmp(tmp_tsv)
+                _cleanup_gwas_result_tmp(tmp_stage1_tsv_hint)
 
         gwas_secs = max(time.monotonic() - gwas_t0, 0.0)
-        _augment_gwas_tsv_with_snp_names(out_tsv, prefix, logger=logger)
+        _finalize_gwas_result_tsv(tmp_tsv, out_tsv, prefix, logger=logger)
         saved_paths.append(str(out_tsv))
+        if os.path.exists(tmp_stage1_tsv_hint):
+            _replace_file_with_retry(tmp_stage1_tsv_hint, stage1_tsv_hint)
         if os.path.exists(stage1_tsv_hint):
             saved_paths.append(str(stage1_tsv_hint))
+            _log_algwas_stage1_model_selection(logger, str(stage1_tsv_hint))
         if int(pseudo_rows) > 0 and os.path.exists(pseudo_tsv_hint):
-            _augment_gwas_tsv_with_snp_names(pseudo_tsv_hint, prefix, logger=logger)
             saved_paths.append(str(pseudo_tsv_hint))
 
         viz_secs = 0.0
@@ -4037,10 +4217,12 @@ def run_algwas_packed_fullrank(
             logger.info("")
 
 
-def run_jxlmm_packed_fullrank(
+def run_splmm_packed_fullrank(
     *,
     genofile: str,
-    jxlmm_source: Optional[str] = None,
+    splmm_source: Optional[str] = None,
+    splmm_sparse_cutoff: Optional[float] = None,
+    splmm_sparse_jxgrm_path: Optional[str] = None,
     pheno: pd.DataFrame,
     ids: np.ndarray,
     outprefix: str,
@@ -4062,24 +4244,28 @@ def run_jxlmm_packed_fullrank(
     trait_names: Union[list[str], None] = None,
     emit_trait_header: bool = True,
     preloaded_packed: Union[dict[str, object], None] = None,
-    force_sparse_jxlmm: bool = False,
+    force_sparse_splmm: bool = False,
 ) -> None:
+    jxlmm_source = splmm_source
+    jxlmm_sparse_cutoff = splmm_sparse_cutoff
+    jxlmm_sparse_jxgrm_path = splmm_sparse_jxgrm_path
+    force_sparse_jxlmm = force_sparse_splmm
     if str(genetic_model).lower() != "add":
-        raise ValueError("JXLMM full-rust packed route currently supports additive coding only (--model add).")
-    if not hasattr(jxrs, "jxlmm_assoc_pcg_bed"):
+        raise ValueError("SparseLMM full-rust packed route currently supports additive coding only (--model add).")
+    if not hasattr(jxrs, "splmm_assoc_pcg_bed"):
         raise RuntimeError(
-            "Rust extension missing jxlmm_assoc_pcg_bed. Rebuild/install JanusX extension first."
+            "Rust extension missing splmm_assoc_pcg_bed. Rebuild/install JanusX extension first."
         )
-    if not hasattr(jxrs, "jxreml_sparse_reml_brent_from_jxgrm"):
+    if not hasattr(jxrs, "spreml_sparse_reml_brent_from_jxgrm"):
         raise RuntimeError(
-            "Rust extension missing jxreml_sparse_reml_brent_from_jxgrm required by JXLMM sparse null fit. "
+            "Rust extension missing spreml_sparse_reml_brent_from_jxgrm required by SparseLMM sparse null fit. "
             "Rebuild/install JanusX extension first."
         )
 
     pheno_aligned, ids = _align_pheno_to_sample_order(pheno, ids)
     prefix = _as_plink_prefix(genofile)
     if prefix is None:
-        raise ValueError("JXLMM requires PLINK BED input/prefix after genotype streaming context preparation.")
+        raise ValueError("SparseLMM requires PLINK BED input/prefix after genotype streaming context preparation.")
     aligned_ids = np.asarray(ids, dtype=str)
     full_geno_ids = _plink_fam_sample_ids(str(prefix))
     id_to_full_idx = {sid: i for i, sid in enumerate(full_geno_ids)}
@@ -4093,10 +4279,8 @@ def run_jxlmm_packed_fullrank(
     sites_all_full = _read_bim_sites(str(prefix))
     scan_sample_map = np.ascontiguousarray(scan_sample_map, dtype=np.int64)
     packed_preload_ready = None
-    use_packed_payload = False
+    use_preloaded_scan_meta = False
     packed_ctx = None
-    scan_packed = None
-    scan_packed_n = 0
     scan_row_idx = None
     scan_maf = None
     scan_miss = None
@@ -4119,7 +4303,7 @@ def run_jxlmm_packed_fullrank(
         )
         packed_ctx = packed_ctx_packed
         (
-            scan_packed,
+            _scan_packed_unused,
             scan_packed_n,
             scan_row_idx,
             scan_maf,
@@ -4138,39 +4322,30 @@ def run_jxlmm_packed_fullrank(
             raise ValueError(
                 f"Packed/BIM mismatch after filtering: sites={len(sites_all_packed)} active_rows={scan_row_idx.shape[0]}"
             )
-        use_packed_payload = True
+        use_preloaded_scan_meta = True
 
-    jxlmm_sparse_cutoff, ignored_jxlmm_arg = _jxlmm_parse_sparse_cutoff(jxlmm_source)
-    if ignored_jxlmm_arg is not None:
-        _emit_warning_line(
-            logger,
-            (
-                "JXLMM only accepts an optional numeric sparse cutoff via -jxlmm; "
-                f"ignoring non-numeric argument: {ignored_jxlmm_arg}"
-            ),
-            use_spinner=bool(use_spinner),
-        )
+    if jxlmm_sparse_cutoff is None:
+        jxlmm_sparse_cutoff, ignored_jxlmm_arg = _jxlmm_parse_sparse_cutoff(jxlmm_source)
+        if ignored_jxlmm_arg is not None:
+            _emit_warning_line(
+                logger,
+                (
+                    "SparseLMM only accepts an optional numeric sparse cutoff via -splmm; "
+                    f"ignoring non-numeric argument: {ignored_jxlmm_arg}"
+                ),
+                use_spinner=bool(use_spinner),
+            )
+    else:
+        jxlmm_sparse_cutoff = float(jxlmm_sparse_cutoff)
+        if (not np.isfinite(jxlmm_sparse_cutoff)) or float(jxlmm_sparse_cutoff) < 0.0:
+            raise ValueError(
+                f"SparseLMM sparse cutoff must be a finite value >= 0, got {jxlmm_sparse_cutoff}"
+            )
 
     kinship_prefix = str(prefix)
-    kinship_packed_ctx = packed_ctx
     kinship_sites_all = list(sites_all_full)
     kinship_sample_map = np.asarray(scan_sample_map, dtype=np.int64)
     kinship_present_mask = kinship_sample_map >= 0
-
-    kinship_packed = None
-    kinship_packed_n = 0
-    _kinship_row_idx = None
-    kinship_maf = None
-    kinship_row_flip = None
-    if use_packed_payload and kinship_packed_ctx is not None:
-        (
-            kinship_packed,
-            kinship_packed_n,
-            _kinship_row_idx,
-            kinship_maf,
-            _kinship_miss,
-            kinship_row_flip,
-        ) = _packed_ctx_active_view_for_gwas(kinship_packed_ctx)
 
     process = psutil.Process()
     n_cores = detect_effective_threads()
@@ -4184,7 +4359,19 @@ def run_jxlmm_packed_fullrank(
     trait_iter = _resolve_trait_iter(pheno_aligned, trait_names)
     multi_trait_mode = len(trait_iter) > 1
     block_rows_use = int(max(4096, int(chunk_size)))
-    sparse_kinship_cache: dict[str, str] = {}
+    shared_sparse_kinship_path: Optional[str] = None
+    if jxlmm_sparse_jxgrm_path is not None:
+        shared_sparse_kinship_path = _jxlmm_normalize_jxgrm_path(str(jxlmm_sparse_jxgrm_path))
+        if not os.path.exists(shared_sparse_kinship_path):
+            raise RuntimeError(
+                "Prebuilt SparseLMM sparse GRM path is missing: "
+                f"{_display_path(shared_sparse_kinship_path)}"
+            )
+    sparse_kinship_cache: dict[str, str] = (
+        {"__full_sample__": str(shared_sparse_kinship_path)}
+        if shared_sparse_kinship_path is not None
+        else {}
+    )
 
     for pname in trait_iter:
         cpu_t0 = process.cpu_times()
@@ -4207,7 +4394,7 @@ def run_jxlmm_packed_fullrank(
         if dropped_missing_kin > 0:
             _log_model_line(
                 logger,
-                "JXLMM",
+                "SparseLMM",
                 f"Trait {pname}: dropped {dropped_missing_kin} sample(s) absent from kinship source.",
                 use_spinner=bool(use_spinner),
             )
@@ -4251,8 +4438,24 @@ def run_jxlmm_packed_fullrank(
                 use_spinner=bool(use_spinner),
             )
             sparse_kinship_cache[sparse_cache_key] = str(trait_sparse_kinship_path)
+        prepare_handle = (
+            _start_indeterminate_progress_bar("Prepare for SparseLMM...")
+            if bool(use_spinner)
+            else None
+        )
+
+        def _stop_prepare_handle() -> None:
+            nonlocal prepare_handle
+            if prepare_handle is not None:
+                try:
+                    _stop_indeterminate_progress_bar(prepare_handle)
+                except Exception:
+                    pass
+                prepare_handle = None
+
         scan_meta = None
-        if not bool(use_packed_payload):
+        null_t0 = time.monotonic()
+        if not bool(use_preloaded_scan_meta):
             scan_meta = _jxlmm_bed_logic_meta_selected(
                 str(kinship_prefix),
                 sample_indices=kinship_sample_idx_trait,
@@ -4261,105 +4464,13 @@ def run_jxlmm_packed_fullrank(
                 het_threshold=float(het_threshold),
                 snps_only=bool(snps_only),
             )
-
-        null_route_desc = "prepare sparse REML route"
-        null_t0 = time.monotonic()
-        null_pbar: Optional[_ProgressAdapter] = None
-        null_last_done = 0
-        null_desc_current = ""
-        null_stage_times: dict[str, float] = {}
-        null_stage_current: Optional[str] = None
-        null_stage_t0: Optional[float] = None
-        null_spin_handle = (
-            _start_indeterminate_progress_bar(
-                _jxlmm_null_progress_desc(null_route_desc, 0, 1000)
-            )
-            if bool(use_spinner)
-            else None
+        null_fit = _jxlmm_sparse_null_fit(
+            jxgrm_path=str(trait_sparse_kinship_path),
+            sample_idx=kinship_sample_idx_trait,
+            y_vec=y_vec,
+            x_cov=x_arg,
+            progress_callback=None,
         )
-
-        def _close_null_stage() -> None:
-            nonlocal null_stage_current, null_stage_t0
-            if null_stage_current is not None and null_stage_t0 is not None:
-                null_stage_times[null_stage_current] = null_stage_times.get(null_stage_current, 0.0) + max(
-                    time.monotonic() - null_stage_t0,
-                    0.0,
-                )
-            null_stage_current = None
-            null_stage_t0 = None
-            
-        def _jxlmm_null_progress(done: int, total: int) -> None:
-            nonlocal null_stage_current,null_pbar, null_last_done, null_spin_handle, peak_rss, null_desc_current
-            try:
-                d = int(done)
-                t = int(total)
-            except Exception:
-                return
-            if null_spin_handle is not None:
-                try:
-                    _stop_indeterminate_progress_bar(null_spin_handle)
-                except Exception:
-                    pass
-                null_spin_handle = None
-            total_use = int(max(1, t if t > 0 else 1000))
-            desc = _jxlmm_null_progress_desc(null_route_desc, d, total_use)
-            if null_pbar is None:
-                null_pbar = _ProgressAdapter(
-                    total=total_use,
-                    desc=desc,
-                    force_animate=True,
-                )
-                null_desc_current = desc
-            total_use = int(max(1, null_pbar.total if null_pbar is not None else total_use))
-            if t > 0 and null_pbar is not None and int(t) != total_use:
-                null_pbar.set_total(int(max(1, t)))
-                total_use = int(max(1, null_pbar.total))
-            stage_name = _jxlmm_null_progress_stage(null_route_desc, d, total_use)
-            if stage_name != null_stage_current:
-                _close_null_stage()
-                null_stage_current = str(stage_name)
-                null_stage_t0 = time.monotonic()
-            desc = _jxlmm_null_progress_desc(null_route_desc, d, total_use)
-            if null_pbar is not None and desc != null_desc_current:
-                null_pbar.set_description(desc)
-                null_desc_current = desc
-            d = int(max(0, min(d, total_use)))
-            stepv = int(max(0, d - null_last_done))
-            if stepv > 0 and null_pbar is not None:
-                null_pbar.update(stepv)
-                null_last_done = d
-            try:
-                peak_rss = max(peak_rss, process.memory_info().rss)
-            except Exception:
-                pass
-
-        try:
-            null_route_desc = "sparse REML / sparse GRM"
-            null_fit = _jxlmm_sparse_null_fit(
-                jxgrm_path=str(trait_sparse_kinship_path),
-                sample_idx=kinship_sample_idx_trait,
-                y_vec=y_vec,
-                x_cov=x_arg,
-                progress_callback=_jxlmm_null_progress if bool(use_spinner) else None,
-            )
-        finally:
-            _close_null_stage()
-            if null_spin_handle is not None:
-                try:
-                    _stop_indeterminate_progress_bar(null_spin_handle)
-                except Exception:
-                    pass
-                null_spin_handle = None
-            if null_pbar is not None:
-                try:
-                    total_use = int(max(1, null_pbar.total))
-                    if int(null_last_done) < total_use:
-                        null_pbar.update(total_use - int(null_last_done))
-                    null_pbar.finish()
-                    time.sleep(0.05)
-                except Exception:
-                    pass
-                null_pbar.close(show_done=False)
         null_secs = max(time.monotonic() - null_t0, 0.0)
         peak_rss = max(peak_rss, process.memory_info().rss)
 
@@ -4373,42 +4484,54 @@ def run_jxlmm_packed_fullrank(
         null_offdiag_density_k = float(null_fit.get("offdiag_density_k", float("nan")))
         null_lambda_boundary = null_fit.get("lambda_boundary", None)
         if not _jxlmm_null_components_valid(sigma_g2, sigma_e2):
+            _stop_prepare_handle()
             raise RuntimeError(
-                f"JXLMM null variance estimation returned invalid components for trait {pname}: "
+                f"SparseLMM null variance estimation returned invalid components for trait {pname}: "
                 f"sigma_g2={sigma_g2}, sigma_e2={sigma_e2}"
             )
         null_backend = str(null_fit.get("backend", "unknown"))
         null_strategy = str(null_fit.get("strategy", "unknown"))
-        _log_model_line(
-            logger,
-            "JXLMM",
-            (
-                f"{null_strategy} null fit h2~{float(null_pve):.3f}, "
-                f"mean_diag(K)={null_mean_diag_k:.4g}, "
-                f"nnz(K)={null_nnz_k}, "
-                f"offdiag_density={null_offdiag_density_k:.4g}, "
-                f"sparse_cutoff={float(jxlmm_sparse_cutoff):g}, "
-                f"lambda={null_lbd:.4g}, sigma_g2={sigma_g2:.4g}, "
-                f"sigma_e2={sigma_e2:.4g}, "
-                f"lambda_boundary={null_lambda_boundary or 'interior'}, "
-                f"backend={null_backend} [{format_elapsed(null_secs)}]"
-                if np.isfinite(null_pve)
-                else f"{null_strategy} null fit sigma_g2={sigma_g2:.4g}, sigma_e2={sigma_e2:.4g}, "
-                f"backend={null_backend} [{format_elapsed(null_secs)}]"
-            ),
-            use_spinner=bool(use_spinner),
+        _null_fit_msg = (
+            f"{null_strategy} null fit h2~{float(null_pve):.3f}, "
+            f"mean_diag(K)={null_mean_diag_k:.4g}, "
+            f"nnz(K)={null_nnz_k}, "
+            f"offdiag_density={null_offdiag_density_k:.4g}, "
+            f"sparse_cutoff={float(jxlmm_sparse_cutoff):g}, "
+            f"lambda={null_lbd:.4g}, sigma_g2={sigma_g2:.4g}, "
+            f"sigma_e2={sigma_e2:.4g}, "
+            f"lambda_boundary={null_lambda_boundary or 'interior'}, "
+            f"backend={null_backend} [{format_elapsed(null_secs)}]"
+            if np.isfinite(null_pve)
+            else f"{null_strategy} null fit sigma_g2={sigma_g2:.4g}, sigma_e2={sigma_e2:.4g}, "
+            f"backend={null_backend} [{format_elapsed(null_secs)}]"
         )
-        grid_local_summary = _jxlmm_sparse_grid_local_summary(null_fit, window=2)
-        if grid_local_summary is not None:
+        if bool(use_spinner):
+            _log_file_only(logger, logging.INFO, f"SparseLMM: {_null_fit_msg}")
+        else:
             _log_model_line(
                 logger,
-                "JXLMM",
-                f"sparse REML grid local log10(lambda): {grid_local_summary}",
-                use_spinner=bool(use_spinner),
+                "SparseLMM",
+                _null_fit_msg,
+                use_spinner=False,
             )
+        grid_local_summary = _jxlmm_sparse_grid_local_summary(null_fit, window=2)
+        if grid_local_summary is not None:
+            if bool(use_spinner):
+                _log_file_only(
+                    logger,
+                    logging.INFO,
+                    f"SparseLMM: sparse REML grid local log10(lambda): {grid_local_summary}",
+                )
+            else:
+                _log_model_line(
+                    logger,
+                    "SparseLMM",
+                    f"sparse REML grid local log10(lambda): {grid_local_summary}",
+                    use_spinner=False,
+                )
         if null_lambda_boundary in {"low", "high"}:
             logger.warning(
-                f"Warning: JXLMM sparse REML optimum for trait {pname} is near the {null_lambda_boundary} "
+                f"Warning: SparseLMM sparse REML optimum for trait {pname} is near the {null_lambda_boundary} "
                 f"log10(lambda) search boundary; inspect sparse cutoff or widen the search range."
             )
         if (
@@ -4418,19 +4541,11 @@ def run_jxlmm_packed_fullrank(
             and float(null_offdiag_density_k) < 1e-3
         ):
             logger.warning(
-                f"Warning: JXLMM sparse GRM for trait {pname} is nearly diagonal "
+                f"Warning: SparseLMM sparse GRM for trait {pname} is nearly diagonal "
                 f"(nnz={null_nnz_k}, offdiag_density={float(null_offdiag_density_k):.4g}). "
                 "Under this sparse positive-kinship model, h2 can collapse toward 0 and LM switch is expected; "
                 "this is not comparable to dense FastLMM h2."
             )
-        if null_stage_times:
-            _log_model_line(
-                logger,
-                "JXLMM",
-                f"null stage times: {_jxlmm_format_stage_times(null_stage_times)}",
-                use_spinner=bool(use_spinner),
-            )
-
         pheno_trait_subset = pheno_aligned.iloc[keep_idx][[pname]].copy()
         ids_trait_subset = np.asarray(ids[keep_idx], dtype=str)
         if (
@@ -4439,19 +4554,20 @@ def run_jxlmm_packed_fullrank(
         ):
             prev_pve = float(null_pve) if np.isfinite(null_pve) else float("nan")
             logger.warning(
-                f"Warning: JXLMM switch to LMM for trait {pname}: "
+                f"Warning: SparseLMM switch to LMM for trait {pname}: "
                 f"null PVE={prev_pve:.4f} (>0.995)."
             )
             _log_model_line(
                 logger,
                 "LMM",
                 (
-                    f"switched from JXLMM null to LMM: "
+                    f"switched from SparseLMM null to LMM: "
                     f"PVE(null)={prev_pve:.4f} (>0.995) "
                     f"[{format_elapsed(null_secs)}]"
                 ),
                 use_spinner=bool(use_spinner),
             )
+            _stop_prepare_handle()
             run_lmm_packed_fullrank(
                 genofile=genofile,
                 pheno=pheno_trait_subset,
@@ -4480,6 +4596,7 @@ def run_jxlmm_packed_fullrank(
             )
             if multi_trait_mode:
                 logger.info("")
+            _stop_prepare_handle()
             continue
 
         null_ml0 = null_fit.get("ml", None)
@@ -4492,19 +4609,20 @@ def run_jxlmm_packed_fullrank(
             )
             if switch_to_lm:
                 logger.warning(
-                    f"Warning: JXLMM switch to LM for trait {pname}: "
+                    f"Warning: SparseLMM switch to LM for trait {pname}: "
                     f"null LRT stat={float(lrt_stat):.4g}, p={float(lrt_p):.4g} (>=0.05)."
                 )
                 _log_model_line(
                     logger,
                     "LM",
                     (
-                        f"switched from JXLMM null to LM "
+                        f"switched from SparseLMM null to LM "
                         f"(LRT stat={float(lrt_stat):.4g}, p={float(lrt_p):.4g}) "
                         f"[{format_elapsed(null_secs)}]"
                     ),
                     use_spinner=bool(use_spinner),
                 )
+                _stop_prepare_handle()
                 if packed_preload_ready is not None:
                     run_lm_packed_fullrank(
                         genofile=genofile,
@@ -4558,36 +4676,55 @@ def run_jxlmm_packed_fullrank(
                     )
                 if multi_trait_mode:
                     logger.info("")
+                _stop_prepare_handle()
                 continue
 
         for _buf_key in ("grm", "eigvals", "eigvecs"):
             null_fit.pop(_buf_key, None)
 
-        def _make_jxlmm_stage_progress(stage_labels: list[str]):
-            current_stage = -1
-            current_total = 0
+        def _make_splmm_scan_progress():
             current_done = 0
+            current_total = 1
             current_pbar: Optional[_ProgressAdapter] = None
-            current_stage_t0: Optional[float] = None
-            stage_times: dict[str, float] = {}
-            spin_handle = _start_indeterminate_progress_bar(stage_labels[0]) if bool(use_spinner) else None
 
-            def _close_current(success: bool = False) -> None:
-                nonlocal current_pbar, current_total, current_done, current_stage_t0
-                if (
-                    current_pbar is not None
-                    and current_stage >= 0
-                    and current_stage < len(stage_labels)
-                    and current_stage_t0 is not None
-                ):
-                    stage_name = str(stage_labels[current_stage])
-                    stage_times[stage_name] = stage_times.get(stage_name, 0.0) + max(
-                        time.monotonic() - current_stage_t0,
-                        0.0,
+            def _progress(_stage: int, done: int, total: int) -> None:
+                nonlocal current_done, current_total, current_pbar, peak_rss
+                try:
+                    done_i = int(done)
+                    total_i = int(total)
+                except Exception:
+                    return
+                _stop_prepare_handle()
+                total_use = int(max(1, total_i if total_i > 0 else 1))
+                if current_pbar is None:
+                    current_total = total_use
+                    current_pbar = _ProgressAdapter(
+                        total=total_use,
+                        desc="SparseLMM",
+                        force_animate=True,
                     )
+                elif total_use != int(max(1, current_total)):
+                    current_total = total_use
+                    try:
+                        current_pbar.set_total(total_use)
+                    except Exception:
+                        pass
+                done_use = int(max(0, min(done_i, total_use)))
+                stepv = int(max(0, done_use - current_done))
+                if stepv > 0 and current_pbar is not None:
+                    current_pbar.update(stepv)
+                current_done = done_use
+                try:
+                    peak_rss = max(peak_rss, process.memory_info().rss)
+                except Exception:
+                    pass
+
+            def _finish(success: bool) -> None:
+                nonlocal current_pbar
+                _stop_prepare_handle()
                 if current_pbar is not None:
                     try:
-                        total_use = int(max(1, current_pbar.total))
+                        total_use = int(max(1, current_total))
                         if success and int(current_done) < total_use:
                             current_pbar.update(total_use - int(current_done))
                         if success:
@@ -4599,69 +4736,10 @@ def run_jxlmm_packed_fullrank(
                     except Exception:
                         pass
                     current_pbar = None
-                current_stage_t0 = None
-                current_total = 0
-                current_done = 0
 
-            def _progress(stage: int, done: int, total: int) -> None:
-                nonlocal current_stage, current_total, current_done, current_pbar, spin_handle, peak_rss, current_stage_t0
-                try:
-                    stage_i = int(stage)
-                    done_i = int(done)
-                    total_i = int(total)
-                except Exception:
-                    return
-                if stage_i < 0 or stage_i >= len(stage_labels):
-                    return
-                if spin_handle is not None:
-                    try:
-                        _stop_indeterminate_progress_bar(spin_handle)
-                    except Exception:
-                        pass
-                    spin_handle = None
-                total_use = int(max(1, total_i if total_i > 0 else 1))
-                if current_stage != stage_i:
-                    _close_current(success=False)
-                    current_stage = stage_i
-                    current_total = total_use
-                    current_pbar = _ProgressAdapter(
-                        total=total_use,
-                        desc=str(stage_labels[stage_i]),
-                        force_animate=True,
-                    )
-                    current_stage_t0 = time.monotonic()
-                elif current_pbar is not None and total_use != int(max(1, current_total)):
-                    current_pbar.set_total(total_use)
-                    current_total = total_use
-                total_use = int(max(1, current_total))
-                done_use = int(max(0, min(done_i, total_use)))
-                stepv = int(max(0, done_use - current_done))
-                if stepv > 0 and current_pbar is not None:
-                    current_pbar.update(stepv)
-                current_done = done_use
-                if done_use >= total_use:
-                    _close_current(success=True)
-                try:
-                    peak_rss = max(peak_rss, process.memory_info().rss)
-                except Exception:
-                    pass
+            return (_progress if bool(use_spinner) else None), _finish
 
-            def _finish(success: bool) -> None:
-                nonlocal spin_handle
-                if spin_handle is not None:
-                    try:
-                        _stop_indeterminate_progress_bar(spin_handle)
-                    except Exception:
-                        pass
-                    spin_handle = None
-                _close_current(success=bool(success))
-
-            def _summary() -> dict[str, float]:
-                return dict(stage_times)
-
-            return (_progress if bool(use_spinner) else None), _finish, _summary
-
-        if bool(use_packed_payload):
+        if bool(use_preloaded_scan_meta):
             trait_row_idx = np.ascontiguousarray(np.asarray(scan_row_idx, dtype=np.int64).reshape(-1), dtype=np.int64)
             trait_scan_maf = np.ascontiguousarray(np.asarray(scan_maf, dtype=np.float32).reshape(-1), dtype=np.float32)
             trait_scan_miss = np.ascontiguousarray(np.asarray(scan_miss, dtype=np.float32).reshape(-1), dtype=np.float32)
@@ -4669,17 +4747,31 @@ def run_jxlmm_packed_fullrank(
             trait_site_keep = None
         else:
             if scan_meta is None:
-                raise RuntimeError("JXLMM memmap scan metadata is missing.")
+                raise RuntimeError("SparseLMM memmap scan metadata is missing.")
             trait_row_idx = np.ascontiguousarray(np.asarray(scan_meta["row_indices"], dtype=np.int64).reshape(-1), dtype=np.int64)
             trait_scan_maf = np.ascontiguousarray(np.asarray(scan_meta["maf"], dtype=np.float32).reshape(-1), dtype=np.float32)
             trait_scan_miss = np.ascontiguousarray(np.asarray(scan_meta["missing_rate"], dtype=np.float32).reshape(-1), dtype=np.float32)
             trait_scan_row_flip = np.ascontiguousarray(np.asarray(scan_meta["row_flip"], dtype=np.bool_).reshape(-1), dtype=np.bool_)
             trait_site_keep = np.ascontiguousarray(np.asarray(scan_meta["site_keep"], dtype=np.bool_).reshape(-1), dtype=np.bool_)
-        trait_sites_all = [kinship_sites_all[int(idx)] for idx in trait_row_idx.tolist()]
-        chrom_all = [str(c) for (c, _p, _a0, _a1) in trait_sites_all]
-        pos_all = [int(p) for (_c, p, _a0, _a1) in trait_sites_all]
-        allele0_all = [str(v) for (_c, _p, v, _a1) in trait_sites_all]
-        allele1_all = [str(v) for (_c, _p, _a0, v) in trait_sites_all]
+        n_trait_sites = int(trait_row_idx.shape[0])
+        supports_direct_tsv = bool(hasattr(jxrs, "splmm_assoc_pcg_bed_to_tsv"))
+        trait_sites_all: Optional[list[tuple[object, ...]]] = None
+        if supports_direct_tsv:
+            chrom_all: list[str] = []
+            pos_all: list[int] = []
+            allele0_all: list[str] = []
+            allele1_all: list[str] = []
+            snp_all: list[str] = []
+            for idx in trait_row_idx:
+                c, p, a0, a1, sid = _site_tuple_parts(kinship_sites_all[int(idx)])
+                chrom_all.append(c)
+                pos_all.append(int(p))
+                allele0_all.append(a0)
+                allele1_all.append(a1)
+                snp_all.append(sid)
+        else:
+            trait_sites_all = [kinship_sites_all[int(idx)] for idx in trait_row_idx.tolist()]
+            chrom_all, pos_all, allele0_all, allele1_all, snp_all = _split_gwas_sites(trait_sites_all)
 
         scan_t0 = time.monotonic()
         scan_ok = False
@@ -4695,38 +4787,27 @@ def run_jxlmm_packed_fullrank(
         arr = None
         wrote_direct_tsv = False
         scan_route_desc = (
-            "sparse Cholesky scan (packed preload)"
-            if bool(use_packed_payload)
+            "sparse Cholesky scan (memmap; preloaded row stats)"
+            if bool(use_preloaded_scan_meta)
             else "sparse Cholesky scan (memmap)"
         )
-        stage_labels = [
-            "JXLMM sparse stage 0: prepare scan inputs / row stats",
-            "JXLMM sparse stage 1: open sparse CSC file",
-            "JXLMM sparse stage 2: validate sparse CSC",
-            "JXLMM sparse stage 3: direct samples / subset sparse CSC",
-            "JXLMM sparse stage 4: symbolic analyze sparse CSC",
-            "JXLMM sparse stage 5: factorize sparse V = sigma_g2 K + sigma_e2 I",
-            "JXLMM sparse stage 6: solve V^-1 y",
-            "JXLMM sparse stage 7: solve V^-1 X",
-            "JXLMM sparse stage 8: estimate r_hat",
-            "JXLMM sparse stage 9: scan SNPs",
-        ]
-        sparse_progress, sparse_finish, sparse_stage_summary = _make_jxlmm_stage_progress(stage_labels)
+        sparse_progress, sparse_finish = _make_splmm_scan_progress()
         pname_tag = _safe_trait_file_label(pname)
-        out_tsv = f"{outprefix}.{pname_tag}.jxlmm.tsv"
-        tmp_tsv = f"{out_tsv}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
+        out_tsv = f"{outprefix}.{pname_tag}.splmm.tsv"
+        tmp_tsv = _gwas_result_tmp_path(out_tsv)
         try:
             with _gwas_scan_stage_ctx(max(1, int(threads))):
-                if hasattr(jxrs, "jxlmm_assoc_pcg_bed_to_tsv"):
+                if supports_direct_tsv:
                     wrote_direct_tsv = True
                     scan_route_desc = f"{scan_route_desc}; Rust async TSV writer"
-                    jxlmm_out = jxrs.jxlmm_assoc_pcg_bed_to_tsv(
+                    jxlmm_out = jxrs.splmm_assoc_pcg_bed_to_tsv(
                         str(kinship_prefix),
                         y_vec,
                         float(sigma_g2),
                         float(sigma_e2),
                         chrom_all,
                         pos_all,
+                        snp_all,
                         allele0_all,
                         allele1_all,
                         str(tmp_tsv),
@@ -4743,21 +4824,21 @@ def run_jxlmm_packed_fullrank(
                         model="add",
                         rhat_markers=30,
                         rhat_seed=20260527,
-                        packed=scan_packed if bool(use_packed_payload) else None,
-                        packed_n_samples=int(scan_packed_n if bool(use_packed_payload) else 0),
+                        packed=None,
+                        packed_n_samples=0,
                         maf=trait_scan_maf,
                         row_flip=trait_scan_row_flip,
                         row_missing=trait_scan_miss,
                         row_indices=trait_row_idx,
                         sparse_jxgrm_path=str(trait_sparse_kinship_path),
-                        stage1_progress_callback=sparse_progress,
+                        stage1_progress_callback=None,
                         scan_progress_callback=sparse_progress,
                         progress_every=int(max(512, min(int(block_rows_use), 4096))),
                         rhat_tol=1e-3,
-                        force_sparse_jxlmm=True,
+                        force_sparse_splmm=True,
                     )
                 else:
-                    jxlmm_out = jxrs.jxlmm_assoc_pcg_bed(
+                    jxlmm_out = jxrs.splmm_assoc_pcg_bed(
                         str(kinship_prefix),
                         y_vec,
                         float(sigma_g2),
@@ -4775,27 +4856,24 @@ def run_jxlmm_packed_fullrank(
                         model="add",
                         rhat_markers=30,
                         rhat_seed=20260527,
-                        packed=scan_packed if bool(use_packed_payload) else None,
-                        packed_n_samples=int(scan_packed_n if bool(use_packed_payload) else 0),
+                        packed=None,
+                        packed_n_samples=0,
                         maf=trait_scan_maf,
                         row_flip=trait_scan_row_flip,
                         row_missing=trait_scan_miss,
                         row_indices=trait_row_idx,
                         sparse_jxgrm_path=str(trait_sparse_kinship_path),
-                        stage1_progress_callback=sparse_progress,
+                        stage1_progress_callback=None,
                         scan_progress_callback=sparse_progress,
                         progress_every=int(max(512, min(int(block_rows_use), 4096))),
                         rhat_tol=1e-3,
-                        force_sparse_jxlmm=True,
+                        force_sparse_splmm=True,
                     )
             scan_ok = True
         finally:
             sparse_finish(scan_ok)
-            if (not scan_ok) and wrote_direct_tsv and os.path.exists(tmp_tsv):
-                try:
-                    os.remove(tmp_tsv)
-                except OSError:
-                    pass
+            if (not scan_ok) and wrote_direct_tsv:
+                _cleanup_gwas_result_tmp(tmp_tsv)
 
         jxlmm_t = tuple(jxlmm_out)
         r_hat = float(jxlmm_t[0])
@@ -4816,26 +4894,23 @@ def run_jxlmm_packed_fullrank(
         scan_secs = max(time.monotonic() - scan_t0, 0.0)
         peak_rss = max(peak_rss, process.memory_info().rss)
 
-        if wrote_direct_tsv:
-            _run_result_write_with_status(
-                lambda: os.replace(tmp_tsv, out_tsv),
-                use_spinner=bool(use_spinner),
-                emit_done_line=False,
-            )
-        else:
+        if not wrote_direct_tsv:
             if arr is None:
-                raise RuntimeError("JXLMM scan produced no result matrix.")
-            if arr.shape != (len(trait_sites_all), 3):
+                raise RuntimeError("SparseLMM scan produced no result matrix.")
+            if arr.shape != (n_trait_sites, 3):
                 raise RuntimeError(
-                    f"JXLMM result shape mismatch: got {arr.shape}, expected ({len(trait_sites_all)}, 3)."
+                    f"SparseLMM result shape mismatch: got {arr.shape}, expected ({n_trait_sites}, 3)."
                 )
 
             def _write_jxlmm() -> None:
                 nonlocal written_rows, arr
+                sites_use = trait_sites_all
+                if sites_use is None:
+                    sites_use = [kinship_sites_all[int(idx)] for idx in trait_row_idx.tolist()]
                 written_rows = int(
                     _write_jxlmm_assoc_tsv(
-                        out_tsv=out_tsv,
-                        sites_all=trait_sites_all,
+                        out_tsv=tmp_tsv,
+                        sites_all=sites_use,
                         maf=trait_scan_maf,
                         miss=trait_scan_miss,
                         results=arr,
@@ -4849,13 +4924,13 @@ def run_jxlmm_packed_fullrank(
                 use_spinner=bool(use_spinner),
                 emit_done_line=False,
             )
-        if int(written_rows) != int(len(trait_sites_all)):
+        if int(written_rows) != int(n_trait_sites):
             _emit_warning_line(
                 logger,
-                f"JXLMM writer row mismatch: expected={len(trait_sites_all)} wrote={int(written_rows)}",
+                f"SparseLMM writer row mismatch: expected={n_trait_sites} wrote={int(written_rows)}",
                 use_spinner=bool(use_spinner),
             )
-        _augment_gwas_tsv_with_snp_names(out_tsv, prefix, logger=logger)
+        _finalize_gwas_result_tsv(tmp_tsv, out_tsv, prefix, logger=logger)
         saved_paths.append(str(out_tsv))
 
         viz_secs = 0.0
@@ -4876,43 +4951,57 @@ def run_jxlmm_packed_fullrank(
         avg_cpu = 100.0 * cpu_used / (wall * max(1, n_cores))
         peak_rss_gb = peak_rss / (1024 ** 3)
 
-        _log_model_line(
-            logger,
-            "JXLMM",
-            (
-                f"{scan_route_desc}; r_hat={r_hat:.4g}, sampled {rhat_used}/{rhat_requested}, "
-                f"V^-1y converged={str(y_conv).lower()} ({y_iters} iters, relres={y_rel_res:.2e}), "
-                f"V^-1X converged={str(x_conv_all).lower()} ({x_max_iters} iters, relres={x_max_rel_res:.2e})"
-            ),
-            use_spinner=bool(use_spinner),
+        _scan_diag_msg = (
+            f"{scan_route_desc}; r_hat={r_hat:.4g}, sampled {rhat_used}/{rhat_requested}, "
+            f"V^-1y converged={str(y_conv).lower()} ({y_iters} iters, relres={y_rel_res:.2e}), "
+            f"V^-1X converged={str(x_conv_all).lower()} ({x_max_iters} iters, relres={x_max_rel_res:.2e})"
         )
-        sparse_stage_times = sparse_stage_summary()
-        if sparse_stage_times:
+        _assoc_test_msg = (
+            "association test uses Wald chi^2(1): chisq=(beta/se)^2, "
+            "pwald=Pr[Chi^2_1>=chisq]; SparseLMM does not currently emit a PLRT/LRT column."
+        )
+        if bool(use_spinner):
+            _log_file_only(logger, logging.INFO, f"SparseLMM: {_scan_diag_msg}")
+            _log_file_only(logger, logging.INFO, f"SparseLMM: {_assoc_test_msg}")
+        else:
             _log_model_line(
                 logger,
-                "JXLMM",
-                f"scan stage times: {_jxlmm_format_stage_times(sparse_stage_times)}",
-                use_spinner=bool(use_spinner),
+                "SparseLMM",
+                _scan_diag_msg,
+                use_spinner=False,
+            )
+            _log_model_line(
+                logger,
+                "SparseLMM",
+                _assoc_test_msg,
+                use_spinner=False,
+            )
+        if bool(use_spinner):
+            _log_file_only(
+                logger,
+                logging.INFO,
+                f"SparseLMM: avg CPU ~ {avg_cpu:.1f}% of {n_cores} c, peak RSS ~ {peak_rss_gb:.2f} G",
+            )
+        else:
+            _log_model_line(
+                logger,
+                "SparseLMM",
+                f"avg CPU ~ {avg_cpu:.1f}% of {n_cores} c, peak RSS ~ {peak_rss_gb:.2f} G",
+                use_spinner=False,
             )
         _log_model_line(
             logger,
-            "JXLMM",
-            f"avg CPU ~ {avg_cpu:.1f}% of {n_cores} c, peak RSS ~ {peak_rss_gb:.2f} G",
-            use_spinner=bool(use_spinner),
-        )
-        _log_model_line(
-            logger,
-            "JXLMM",
+            "SparseLMM",
             f"Results saved to {_display_path(str(out_tsv))}",
             use_spinner=bool(use_spinner),
         )
 
-        eff_snp = int(len(trait_sites_all))
+        eff_snp = int(n_trait_sites)
         eff_snp_by_trait[str(pname)] = eff_snp
         summary_rows.append(
             {
                 "phenotype": str(pname),
-                "model": "JXLMM",
+                "model": "SparseLMM",
                 "nidv": int(n_idv),
                 "eff_snp": int(eff_snp),
                 "pve": (float(null_pve) if np.isfinite(null_pve) else None),
@@ -4930,11 +5019,31 @@ def run_jxlmm_packed_fullrank(
         _rich_success(
             logger,
             (
-                f"JXLMM ...r_hat {r_hat:.4g} h2 {float(null_pve):.3f} [{'/'.join(done_times)}]"
+                f"SparseLMM ...pve {float(null_pve):.3f} [{'/'.join(done_times)}]"
+                # f"SparseLMM ...r_hat {r_hat:.4g} h2 {float(null_pve):.3f} [{'/'.join(done_times)}]"
                 if np.isfinite(null_pve)
-                else f"JXLMM ...r_hat {r_hat:.4g} [{'/'.join(done_times)}]"
+                else f"SparseLMM ...r_hat {r_hat:.4g} [{'/'.join(done_times)}]"
+                # else f"SparseLMM ...r_hat {r_hat:.4g} [{'/'.join(done_times)}]"
             ),
             use_spinner=bool(use_spinner),
         )
+        _stop_prepare_handle()
         if multi_trait_mode:
             logger.info("")
+
+
+def run_jxlmm_packed_fullrank(
+    *,
+    jxlmm_source: Optional[str] = None,
+    jxlmm_sparse_cutoff: Optional[float] = None,
+    jxlmm_sparse_jxgrm_path: Optional[str] = None,
+    force_sparse_jxlmm: bool = False,
+    **kwargs,
+) -> None:
+    return run_splmm_packed_fullrank(
+        splmm_source=jxlmm_source,
+        splmm_sparse_cutoff=jxlmm_sparse_cutoff,
+        splmm_sparse_jxgrm_path=jxlmm_sparse_jxgrm_path,
+        force_sparse_splmm=force_sparse_jxlmm,
+        **kwargs,
+    )

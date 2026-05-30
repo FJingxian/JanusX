@@ -41,6 +41,7 @@ fn system_page_size() -> usize {
 pub struct SiteInfo {
     pub chrom: String,
     pub pos: i32,
+    pub snp: String,
     pub ref_allele: String,
     pub alt_allele: String,
 }
@@ -112,37 +113,52 @@ pub struct ProcessedSnpRowStats {
     pub maf: f32,
 }
 
-pub fn process_snp_row_with_stats(
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct DecodedSnpRowCounts {
+    pub(crate) alt_sum: f64,
+    pub(crate) non_missing: usize,
+    pub(crate) het_count: usize,
+}
+
+#[inline]
+pub(crate) fn scan_snp_row_counts(
+    row: &[f32],
+    apply_het_filter: bool,
+) -> DecodedSnpRowCounts {
+    let mut counts = DecodedSnpRowCounts::default();
+    for &g in row.iter() {
+        if g >= 0.0 {
+            counts.alt_sum += g as f64;
+            counts.non_missing += 1;
+            if apply_het_filter && (g - 1.0).abs() < 1e-6 {
+                counts.het_count += 1;
+            }
+        }
+    }
+    counts
+}
+
+pub(crate) fn process_snp_row_with_precomputed_counts(
     row: &mut [f32],
     ref_allele: &mut String,
     alt_allele: &mut String,
+    counts: DecodedSnpRowCounts,
     maf_threshold: f32,
     max_missing_rate: f32,
     fill_missing: bool,
     apply_het_filter: bool,
     het_threshold: f32,
 ) -> Option<ProcessedSnpRowStats> {
-    let mut alt_sum: f64 = 0.0;
-    let mut non_missing: i64 = 0;
-    let mut het_count: i64 = 0;
-
-    for &g in row.iter() {
-        if g >= 0.0 {
-            alt_sum += g as f64;
-            non_missing += 1;
-            if apply_het_filter && (g - 1.0).abs() < 1e-6 {
-                het_count += 1;
-            }
-        }
-    }
-
+    let non_missing = counts.non_missing;
+    let mut alt_sum = counts.alt_sum;
+    let het_count = counts.het_count;
     let n_samples = row.len() as f64;
     if n_samples == 0.0 {
         return None;
     }
 
     let missing_rate = (1.0 - (non_missing as f64 / n_samples)) as f32;
-    let missing_count = row.len().saturating_sub(non_missing as usize) as u32;
+    let missing_count = row.len().saturating_sub(non_missing) as u32;
     if missing_rate > max_missing_rate {
         return None;
     }
@@ -150,15 +166,14 @@ pub fn process_snp_row_with_stats(
     if non_missing == 0 {
         if maf_threshold > 0.0 {
             return None;
-        } else {
-            if fill_missing {
-                row.fill(0.0);
-            }
-            return Some(ProcessedSnpRowStats {
-                missing_count,
-                maf: 0.0,
-            });
         }
+        if fill_missing {
+            row.fill(0.0);
+        }
+        return Some(ProcessedSnpRowStats {
+            missing_count,
+            maf: 0.0,
+        });
     }
 
     if apply_het_filter {
@@ -170,7 +185,6 @@ pub fn process_snp_row_with_stats(
     }
 
     let mut alt_freq = alt_sum / (2.0 * non_missing as f64);
-
     if alt_freq > 0.5 {
         for g in row.iter_mut() {
             if *g >= 0.0 {
@@ -189,7 +203,7 @@ pub fn process_snp_row_with_stats(
 
     if fill_missing {
         let mean_g = alt_sum / non_missing as f64;
-        let imputed: f32 = mean_g as f32;
+        let imputed = mean_g as f32;
         for g in row.iter_mut() {
             if *g < 0.0 {
                 *g = imputed;
@@ -198,6 +212,30 @@ pub fn process_snp_row_with_stats(
     }
 
     Some(ProcessedSnpRowStats { missing_count, maf })
+}
+
+pub fn process_snp_row_with_stats(
+    row: &mut [f32],
+    ref_allele: &mut String,
+    alt_allele: &mut String,
+    maf_threshold: f32,
+    max_missing_rate: f32,
+    fill_missing: bool,
+    apply_het_filter: bool,
+    het_threshold: f32,
+) -> Option<ProcessedSnpRowStats> {
+    let counts = scan_snp_row_counts(row, apply_het_filter);
+    process_snp_row_with_precomputed_counts(
+        row,
+        ref_allele,
+        alt_allele,
+        counts,
+        maf_threshold,
+        max_missing_rate,
+        fill_missing,
+        apply_het_filter,
+        het_threshold,
+    )
 }
 
 pub fn process_snp_row(
@@ -701,9 +739,11 @@ fn read_bin_site_file(path: &Path) -> Result<Vec<SiteInfo>, String> {
         })?;
         let alt = decode_kmer_2bit(&packed, klen);
         let pos = i32::try_from(idx + 1).unwrap_or(i32::MAX);
+        let snp = format!("KMER_{pos}");
         sites.push(SiteInfo {
             chrom: "KMER".to_string(),
             pos,
+            snp,
             ref_allele: "N".to_string(),
             alt_allele: alt,
         });
@@ -898,9 +938,11 @@ fn read_bsite_file(path: &Path) -> Result<Vec<SiteInfo>, String> {
             1 => format!("{chrom_base}_2"),
             _ => chrom_base.clone(),
         };
+        let snp = format!("{}_{}", chrom, bp);
         out.push(SiteInfo {
             chrom,
             pos: bp,
+            snp,
             ref_allele: allele0,
             alt_allele: allele1,
         });
@@ -919,6 +961,7 @@ fn read_site_file_text(path: &Path) -> Result<Vec<SiteInfo>, String> {
     let mut idx_pos = 1usize;
     let mut idx_ref = 2usize;
     let mut idx_alt = 3usize;
+    let mut idx_snp: Option<usize> = None;
 
     for (line_no, line) in reader.lines().enumerate() {
         let l = line.map_err(|e| format!("{}:{}: {}", path.display(), line_no + 1, e))?;
@@ -949,6 +992,7 @@ fn read_site_file_text(path: &Path) -> Result<Vec<SiteInfo>, String> {
                 idx_pos = pos_i;
                 idx_ref = ref_i;
                 idx_alt = alt_i;
+                idx_snp = pick(&["snp", "id", "marker", "marker_id", "rs", "rsid"]);
                 continue;
             }
         }
@@ -978,9 +1022,16 @@ fn read_site_file_text(path: &Path) -> Result<Vec<SiteInfo>, String> {
                 toks[idx_pos]
             )
         })?;
+        let snp = idx_snp
+            .and_then(|i| toks.get(i))
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty() && *s != ".")
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{}_{}", chrom, pos));
         sites.push(SiteInfo {
             chrom,
             pos,
+            snp,
             ref_allele: toks[idx_ref].to_string(),
             alt_allele: toks[idx_alt].to_string(),
         });
@@ -1012,6 +1063,7 @@ fn default_sites(n_rows: usize) -> Vec<SiteInfo> {
         sites.push(SiteInfo {
             chrom: "N".to_string(),
             pos,
+            snp: format!("N_{pos}"),
             ref_allele: "N".to_string(),
             alt_allele: "N".to_string(),
         });
@@ -1036,12 +1088,14 @@ fn read_bim_file(path: &Path) -> Result<Vec<SiteInfo>, String> {
         }
         let chrom = cols[0].to_string();
         let pos: i32 = cols[3].parse().unwrap_or(0);
+        let snp = cols[1].to_string();
         let a1 = cols[4].to_string();
         let a2 = cols[5].to_string();
 
         sites.push(SiteInfo {
             chrom,
             pos,
+            snp,
             ref_allele: a1,
             alt_allele: a2,
         });
@@ -1053,7 +1107,11 @@ fn write_bim_file(path: &Path, sites: &[SiteInfo]) -> Result<(), String> {
     let file = File::create(path).map_err(|e| e.to_string())?;
     let mut writer = BufWriter::new(file);
     for s in sites.iter() {
-        let sid = format!("{}_{}", s.chrom, s.pos);
+        let sid = if s.snp.trim().is_empty() {
+            format!("{}_{}", s.chrom, s.pos)
+        } else {
+            s.snp.clone()
+        };
         writeln!(
             writer,
             "{}\t{}\t0\t{}\t{}\t{}",
@@ -1727,19 +1785,23 @@ impl BedSnpIter {
     }
 
     #[inline]
-    fn decode_snp_bytes_into_with_stats(&self, snp_bytes: &[u8], out: &mut [f32]) -> (f64, usize) {
+    fn decode_snp_bytes_into_with_counts(
+        &self,
+        snp_bytes: &[u8],
+        out: &mut [f32],
+    ) -> DecodedSnpRowCounts {
         let byte_lut = packed_byte_lut();
         let value_lut: [f32; 4] = [0.0_f32, -9.0_f32, 1.0_f32, 2.0_f32];
-        let mut alt_sum = 0.0_f64;
-        let mut non_missing = 0usize;
+        let mut counts = DecodedSnpRowCounts::default();
         let full_bytes = self.n_samples / 4;
         let rem = self.n_samples % 4;
         let mut col = 0usize;
 
         for &b in snp_bytes.iter().take(full_bytes) {
             let idx = b as usize;
-            non_missing += byte_lut.nonmiss[idx] as usize;
-            alt_sum += byte_lut.alt_sum[idx] as f64;
+            counts.non_missing += byte_lut.nonmiss[idx] as usize;
+            counts.alt_sum += byte_lut.alt_sum[idx] as f64;
+            counts.het_count += byte_lut.het_sum[idx] as usize;
             let codes = &byte_lut.code4[idx];
             out[col] = value_lut[codes[0] as usize];
             out[col + 1] = value_lut[codes[1] as usize];
@@ -1754,12 +1816,53 @@ impl BedSnpIter {
             for lane in 0..rem {
                 out[col + lane] = value_lut[codes[lane] as usize];
                 if codes[lane] != 0b01 {
-                    non_missing += 1;
-                    alt_sum += value_lut[codes[lane] as usize] as f64;
+                    counts.non_missing += 1;
+                    counts.alt_sum += value_lut[codes[lane] as usize] as f64;
+                    if codes[lane] == 0b10 {
+                        counts.het_count += 1;
+                    }
                 }
             }
         }
-        (alt_sum, non_missing)
+        counts
+    }
+
+    #[inline]
+    fn decode_snp_bytes_into_with_stats(&self, snp_bytes: &[u8], out: &mut [f32]) -> (f64, usize) {
+        let counts = self.decode_snp_bytes_into_with_counts(snp_bytes, out);
+        (counts.alt_sum, counts.non_missing)
+    }
+
+    #[inline]
+    fn decode_snp_bytes_selected_into_with_counts(
+        &self,
+        snp_bytes: &[u8],
+        sample_indices: &[usize],
+        out: &mut [f32],
+    ) -> DecodedSnpRowCounts {
+        let value_lut: [f32; 4] = [0.0_f32, -9.0_f32, 1.0_f32, 2.0_f32];
+        let mut counts = DecodedSnpRowCounts::default();
+        for (out_i, &samp_idx) in sample_indices.iter().enumerate() {
+            let byte = snp_bytes[samp_idx >> 2];
+            let code = (byte >> ((samp_idx & 3) * 2)) & 0b11;
+            out[out_i] = value_lut[code as usize];
+            match code {
+                0b00 => {
+                    counts.non_missing += 1;
+                }
+                0b10 => {
+                    counts.non_missing += 1;
+                    counts.alt_sum += 1.0;
+                    counts.het_count += 1;
+                }
+                0b11 => {
+                    counts.non_missing += 1;
+                    counts.alt_sum += 2.0;
+                }
+                _ => {}
+            }
+        }
+        counts
     }
 
     #[inline]
@@ -1944,6 +2047,73 @@ impl BedSnpIter {
 
             let (alt_sum, non_missing) = self.decode_snp_bytes_into_with_stats(snp_bytes, out);
             return Some((snp_idx, alt_sum, non_missing));
+        }
+        None
+    }
+
+    pub(crate) fn next_snp_raw_into_with_counts(
+        &mut self,
+        out: &mut [f32],
+    ) -> Option<(usize, SiteInfo, DecodedSnpRowCounts)> {
+        if out.len() < self.n_samples {
+            return None;
+        }
+        while self.cur < self.n_snps {
+            let snp_idx = self.cur;
+            self.cur += 1;
+
+            if self.window_snps.is_some() {
+                let window_end = self.window_start_snp + self.window_len_snps;
+                if snp_idx < self.window_start_snp || snp_idx >= window_end {
+                    if let Err(e) = self.remap_window(snp_idx) {
+                        panic!("failed to remap BED window: {e}");
+                    }
+                }
+            }
+
+            let snp_bytes = match self.snp_bytes(snp_idx) {
+                Some(bytes) => bytes,
+                None => return None,
+            };
+            let counts = self.decode_snp_bytes_into_with_counts(snp_bytes, out);
+            let site = self.sites[snp_idx].clone();
+            return Some((snp_idx, site, counts));
+        }
+        None
+    }
+
+    pub(crate) fn next_snp_selected_raw_into_with_counts(
+        &mut self,
+        sample_indices: &[usize],
+        out: &mut [f32],
+    ) -> Option<(usize, SiteInfo, DecodedSnpRowCounts)> {
+        if sample_indices.len() == self.n_samples {
+            return self.next_snp_raw_into_with_counts(out);
+        }
+        if out.len() < sample_indices.len() {
+            return None;
+        }
+        while self.cur < self.n_snps {
+            let snp_idx = self.cur;
+            self.cur += 1;
+
+            if self.window_snps.is_some() {
+                let window_end = self.window_start_snp + self.window_len_snps;
+                if snp_idx < self.window_start_snp || snp_idx >= window_end {
+                    if let Err(e) = self.remap_window(snp_idx) {
+                        panic!("failed to remap BED window: {e}");
+                    }
+                }
+            }
+
+            let snp_bytes = match self.snp_bytes(snp_idx) {
+                Some(bytes) => bytes,
+                None => return None,
+            };
+            let counts =
+                self.decode_snp_bytes_selected_into_with_counts(snp_bytes, sample_indices, out);
+            let site = self.sites[snp_idx].clone();
+            return Some((snp_idx, site, counts));
         }
         None
     }
@@ -2173,6 +2343,11 @@ impl VcfSnpIter {
             let site = SiteInfo {
                 chrom: parts[0].to_string(),
                 pos: parts[1].parse().unwrap_or(0),
+                snp: if parts.len() > 2 && !parts[2].trim().is_empty() && parts[2] != "." {
+                    parts[2].to_string()
+                } else {
+                    format!("{}_{}", parts[0], parts[1])
+                },
                 ref_allele: parts[3].to_string(),
                 alt_allele: parts[4].to_string(),
             };
@@ -2493,9 +2668,11 @@ impl HmpSnpIter {
                 row.push(g);
             }
 
+            let snp = format!("{}_{}", chrom, pos);
             let site = SiteInfo {
                 chrom,
                 pos,
+                snp,
                 ref_allele: ref_a,
                 alt_allele: alt_a,
             };

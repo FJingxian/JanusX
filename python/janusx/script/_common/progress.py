@@ -90,7 +90,7 @@ def build_rich_progress(
         except Exception:
             # Absolute fallback for environment-specific Rich spinner registries.
             spinner_col = SpinnerColumn(
-                spinner_name="line",
+                spinner_name="dots",
                 style="cyan",
                 finished_text=str(finished_text),
             )

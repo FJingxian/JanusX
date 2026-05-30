@@ -13,6 +13,7 @@ use std::arch::x86 as x86_avx2;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64 as x86_avx2;
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -23,6 +24,7 @@ use crate::bitwise::and_popcount;
 use crate::gfcore as core;
 use crate::gfcore::{BedSnpIter, HmpSnpIter, TxtSnpIter, VcfSnpIter};
 use crate::linalg::{chisq_from_beta_se_and_optional_plrt, format_chisq_value};
+use crate::stats_common::AsyncTsvWriter;
 use crate::vcfout::VcfOut;
 
 // -------- Py-exposed SiteInfo (wrapper) --------
@@ -34,6 +36,8 @@ pub struct SiteInfo {
     #[pyo3(get)]
     pub pos: i32,
     #[pyo3(get)]
+    pub snp: String,
+    #[pyo3(get)]
     pub ref_allele: String,
     #[pyo3(get)]
     pub alt_allele: String,
@@ -44,6 +48,7 @@ impl From<core::SiteInfo> for SiteInfo {
         Self {
             chrom: s.chrom,
             pos: s.pos,
+            snp: s.snp,
             ref_allele: s.ref_allele,
             alt_allele: s.alt_allele,
         }
@@ -53,10 +58,11 @@ impl From<core::SiteInfo> for SiteInfo {
 #[pymethods]
 impl SiteInfo {
     #[new]
-    fn new(chrom: String, pos: i32, ref_allele: String, alt_allele: String) -> Self {
+    fn new(chrom: String, pos: i32, snp: String, ref_allele: String, alt_allele: String) -> Self {
         SiteInfo {
             chrom,
             pos,
+            snp,
             ref_allele,
             alt_allele,
         }
@@ -88,10 +94,13 @@ fn transform_alleles_by_model_local(
 
 #[pyclass]
 pub struct GwasAssocTsvWriter {
+    path: String,
     model_key: String,
     with_plrt: Option<bool>,
     rows_written: usize,
-    writer: Option<BufWriter<File>>,
+    buffer_bytes: usize,
+    text_buf: String,
+    writer: Option<AsyncTsvWriter>,
 }
 
 #[pymethods]
@@ -105,20 +114,21 @@ impl GwasAssocTsvWriter {
                 "genetic_model must be one of: add, dom, rec, het",
             ));
         }
-        let out =
-            File::create(&path).map_err(|e| PyIOError::new_err(format!("create {path}: {e}")))?;
-        let writer = BufWriter::with_capacity(64 * 1024 * 1024, out);
         Ok(Self {
+            path,
             model_key,
             with_plrt: None,
             rows_written: 0,
-            writer: Some(writer),
+            buffer_bytes: 8 * 1024 * 1024,
+            text_buf: String::with_capacity(8 * 1024 * 1024),
+            writer: None,
         })
     }
 
     fn write_chunk(
         &mut self,
         sites: Vec<SiteInfo>,
+        snp: Vec<String>,
         maf: PyReadonlyArray1<'_, f32>,
         miss: PyReadonlyArray1<'_, f32>,
         results: PyReadonlyArray2<'_, f64>,
@@ -126,10 +136,13 @@ impl GwasAssocTsvWriter {
         if sites.is_empty() {
             return Ok(0);
         }
-        let writer = self
-            .writer
-            .as_mut()
-            .ok_or_else(|| PyRuntimeError::new_err("writer is closed"))?;
+        if snp.len() != sites.len() {
+            return Err(PyValueError::new_err(format!(
+                "snp length mismatch: snp={}, sites={}",
+                snp.len(),
+                sites.len()
+            )));
+        }
 
         let maf_arr = maf.as_slice()?;
         if maf_arr.len() != sites.len() {
@@ -170,17 +183,15 @@ impl GwasAssocTsvWriter {
         match self.with_plrt {
             None => {
                 self.with_plrt = Some(has_plrt);
-                if has_plrt {
-                    writer
-                        .write_all(b"chrom\tpos\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n")
-                        .map_err(|e| PyIOError::new_err(e.to_string()))?;
+                let header: &[u8] = if has_plrt {
+                    b"chrom\tpos\tsnp\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n"
                 } else {
-                    writer
-                        .write_all(
-                            b"chrom\tpos\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\n",
-                        )
-                        .map_err(|e| PyIOError::new_err(e.to_string()))?;
-                }
+                    b"chrom\tpos\tsnp\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\n"
+                };
+                self.writer = Some(
+                    AsyncTsvWriter::with_config(&self.path, header, 64 * 1024 * 1024, 16)
+                        .map_err(PyIOError::new_err)?,
+                );
             }
             Some(prev) => {
                 if prev != has_plrt {
@@ -204,11 +215,12 @@ impl GwasAssocTsvWriter {
             );
             let chisq_txt = format_chisq_value(chisq);
             if has_plrt {
-                writeln!(
-                    writer,
-                    "{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\t{:.4e}",
+                let _ = writeln!(
+                    self.text_buf,
+                    "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\t{:.4e}",
                     s.chrom,
                     s.pos,
+                    snp[i],
                     a0,
                     a1,
                     maf_arr[i],
@@ -218,14 +230,14 @@ impl GwasAssocTsvWriter {
                     chisq_txt,
                     res[[i, 2]],
                     res[[i, 3]]
-                )
-                .map_err(|e| PyIOError::new_err(e.to_string()))?;
+                );
             } else {
-                writeln!(
-                    writer,
-                    "{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}",
+                let _ = writeln!(
+                    self.text_buf,
+                    "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}",
                     s.chrom,
                     s.pos,
+                    snp[i],
                     a0,
                     a1,
                     maf_arr[i],
@@ -234,27 +246,25 @@ impl GwasAssocTsvWriter {
                     se,
                     chisq_txt,
                     res[[i, 2]],
-                )
-                .map_err(|e| PyIOError::new_err(e.to_string()))?;
+                );
             }
         }
         self.rows_written = self.rows_written.saturating_add(sites.len());
+        if self.text_buf.len() >= self.buffer_bytes {
+            self.send_pending_block()?;
+        }
         Ok(sites.len())
     }
 
     fn flush(&mut self) -> PyResult<()> {
-        let writer = self
-            .writer
-            .as_mut()
-            .ok_or_else(|| PyRuntimeError::new_err("writer is closed"))?;
-        writer
-            .flush()
-            .map_err(|e| PyIOError::new_err(e.to_string()))
+        self.send_pending_block()?;
+        Ok(())
     }
 
     fn close(&mut self) -> PyResult<()> {
-        if let Some(mut w) = self.writer.take() {
-            w.flush().map_err(|e| PyIOError::new_err(e.to_string()))?;
+        self.send_pending_block()?;
+        if let Some(w) = self.writer.take() {
+            w.finish().map_err(PyIOError::new_err)?;
         }
         Ok(())
     }
@@ -262,6 +272,25 @@ impl GwasAssocTsvWriter {
     #[getter]
     fn rows_written(&self) -> usize {
         self.rows_written
+    }
+}
+
+impl GwasAssocTsvWriter {
+    fn send_pending_block(&mut self) -> PyResult<()> {
+        if self.text_buf.is_empty() {
+            return Ok(());
+        }
+        let writer = self
+            .writer
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("writer is closed"))?;
+        let payload = std::mem::replace(
+            &mut self.text_buf,
+            String::with_capacity(self.buffer_bytes),
+        )
+        .into_bytes();
+        writer.send(payload).map_err(PyIOError::new_err)?;
+        Ok(())
     }
 }
 

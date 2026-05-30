@@ -37,6 +37,11 @@ def _sanitize_pvalues(values) -> np.ndarray:
     return np.clip(arr, _PVALUE_EPS, 1.0)
 
 
+def _finite_positive(values) -> np.ndarray:
+    arr = np.asarray(values, dtype=np.float64).reshape(-1)
+    return arr[np.isfinite(arr) & (arr > 0.0)]
+
+
 def _integer_tick_values(
     ymin: float,
     ymax: float,
@@ -273,6 +278,13 @@ class GWASPLOT:
                 self._chr_separators = (chr_max_x[:-1] + chr_min_x[1:]) / 2.0
             else:
                 self._chr_separators = np.empty(0, dtype=np.float64)
+            chr_gaps = _finite_positive(chr_min_x[1:] - chr_max_x[:-1])
+            if chr_gaps.size > 0:
+                self._edge_padding_x = 0.5 * float(np.median(chr_gaps))
+            elif self.interval > 0:
+                self._edge_padding_x = 0.5 * float(self.interval)
+            else:
+                self._edge_padding_x = 0.0
             self.ticks_loc = (chr_min_x + chr_max_x) / 2.0
         else:
             self.interval = 0
@@ -280,6 +292,7 @@ class GWASPLOT:
             self._chr_bounds_min = np.empty(0, dtype=np.float64)
             self._chr_bounds_max = np.empty(0, dtype=np.float64)
             self._chr_separators = np.empty(0, dtype=np.float64)
+            self._edge_padding_x = 0.0
             self.ticks_loc = np.empty(0, dtype=np.float64)
 
         # rename standardized y/z columns
@@ -406,8 +419,12 @@ class GWASPLOT:
                     )
 
         ax.set_xticks(self.ticks_loc, self.chr_labels)
-        xmin = float(df["x"].min())
-        xmax = float(df["x"].max())
+        if self._chr_bounds_min.size > 0 and self._chr_bounds_max.size > 0:
+            xmin = float(self._chr_bounds_min[0]) - float(self._edge_padding_x)
+            xmax = float(self._chr_bounds_max[-1]) + float(self._edge_padding_x)
+        else:
+            xmin = float(df["x"].min())
+            xmax = float(df["x"].max())
         if xmax > xmin:
             ax.set_xlim(xmin, xmax)
         else:
@@ -619,11 +636,26 @@ class GWASPLOT:
         # Keep QQ axis lower bounds consistent between X/Y.
         x0, x1 = ax.get_xlim()
         y0, y1 = ax.get_ylim()
+        x_data_min = 0.0
+        x_data_max = float(max_lim)
+        if scatter_mask.any():
+            exp_valid = exp_scatter[scatter_mask]
+            exp_valid = exp_valid[np.isfinite(exp_valid)]
+            if exp_valid.size > 0:
+                x_data_min = min(x_data_min, float(np.min(exp_valid)))
+                x_data_max = max(x_data_max, float(np.max(exp_valid)))
+        if np.any(band_mask):
+            x_band_valid = x_band[band_mask]
+            x_band_valid = x_band_valid[np.isfinite(x_band_valid)]
+            if x_band_valid.size > 0:
+                x_data_min = min(x_data_min, float(np.min(x_band_valid)))
+                x_data_max = max(x_data_max, float(np.max(x_band_valid)))
         if np.isfinite([x0, x1, y0, y1]).all():
             if axis_min is not None and np.isfinite(float(axis_min)):
                 lo = float(axis_min)
             else:
-                lo = float(min(x0, y0))
+                right_pad = max(0.0, float(x1) - x_data_max)
+                lo = x_data_min - right_pad
             x_hi = float(x1) if float(x1) > lo else (lo + 1.0)
             y_hi = float(y1) if float(y1) > lo else (lo + 1.0)
             ax.set_xlim(lo, x_hi)

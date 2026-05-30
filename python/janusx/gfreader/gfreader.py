@@ -58,7 +58,7 @@ try:
     from janusx.script._common.status import get_rich_spinner_name as _get_rich_spinner_name
 except Exception:
     def _get_rich_spinner_name() -> str:  # type: ignore[override]
-        return "line"
+        return "dots"
 
 try:
     from janusx.script._common.progress import build_rich_progress as _build_rich_progress
@@ -1975,11 +1975,11 @@ def save_genotype_streaming(
                 )
                 progress.start()
         if progress is None:
-            spinner_name = "line"
+            spinner_name = "dots"
             try:
-                spinner_name = str(_get_rich_spinner_name() or "line")
+                spinner_name = str(_get_rich_spinner_name() or "dots")
             except Exception:
-                spinner_name = "line"
+                spinner_name = "dots"
             if total_snps is None:
                 progress = Progress(
                     SpinnerColumn(spinner_name=spinner_name, style="green", finished_text=" "),

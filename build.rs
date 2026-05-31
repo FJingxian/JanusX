@@ -354,14 +354,44 @@ fn find_command_on_path(name: &str) -> Option<PathBuf> {
     if candidate.components().count() > 1 {
         return candidate.is_file().then_some(candidate);
     }
-    let path_var = env::var_os("PATH")?;
-    for dir in env::split_paths(&path_var) {
+    find_command_in_path_var(name, env::var_os("PATH").as_ref())
+}
+
+fn find_command_in_path_var(name: &str, path_var: Option<&OsString>) -> Option<PathBuf> {
+    let candidate = PathBuf::from(name);
+    if candidate.components().count() > 1 {
+        return candidate.is_file().then_some(candidate);
+    }
+    let path_var = path_var?;
+    for dir in env::split_paths(path_var) {
         let full = dir.join(name);
         if full.is_file() {
             return Some(full);
         }
     }
     None
+}
+
+fn tool_command_is_resolvable(tool: &cc::Tool) -> bool {
+    let path = tool.path();
+    if path.is_file() {
+        return true;
+    }
+    let Some(name) = path.to_str() else {
+        return false;
+    };
+    if path.components().count() > 1 {
+        return false;
+    }
+    if find_command_on_path(name).is_some() {
+        return true;
+    }
+    let tool_path_env = tool.env().iter().find_map(|(k, v)| {
+        k.to_str()
+            .filter(|key| key.eq_ignore_ascii_case("PATH"))
+            .map(|_| v)
+    });
+    find_command_in_path_var(name, tool_path_env).is_some()
 }
 
 fn compiler_version_text(path: &Path) -> String {
@@ -752,28 +782,29 @@ fn compile_fasttree_executable() {
     let mut build = cc::Build::new();
     build.file(&src_path).warnings(false);
     let compiler_opt = build.try_get_compiler().ok();
+    let use_compiler_tool = compiler_opt
+        .as_ref()
+        .map(tool_command_is_resolvable)
+        .unwrap_or(false);
     let compiler_args: Vec<OsString> = compiler_opt
         .as_ref()
+        .filter(|_| use_compiler_tool)
         .map(|tool| tool.args().iter().map(|arg| arg.to_os_string()).collect())
         .unwrap_or_default();
-    let compiler_path = if let Some(tool) =
-        compiler_opt.as_ref().filter(|tool| tool.path().is_file())
-    {
+    let compiler_path = if let Some(tool) = compiler_opt.as_ref().filter(|_| use_compiler_tool) {
+        if !tool.path().is_file() {
+            emit_verbose_note(format!(
+                "FastTree compiler resolved via cc crate as `{}`; relying on cc::Tool command env/wrapper for execution.",
+                tool.path().to_string_lossy()
+            ));
+        }
         tool.path().to_path_buf()
     } else {
-        let mut fallbacks: Vec<&str> = if target_os == "windows" {
+        let fallbacks: Vec<&str> = if target_os == "windows" {
             vec!["cl.exe", "clang-cl.exe", "clang.exe", "gcc.exe"]
         } else {
             vec!["cc", "clang", "gcc"]
         };
-        // If the configured compiler name itself is a plain executable name, try it first via PATH.
-        if let Some(name) = compiler_opt
-            .as_ref()
-            .and_then(|tool| tool.path().file_name())
-            .and_then(|s| s.to_str())
-        {
-            fallbacks.insert(0, name);
-        }
         let found = fallbacks
             .into_iter()
             .find_map(find_command_on_path)
@@ -784,7 +815,7 @@ fn compile_fasttree_executable() {
             });
         if let Some(tool) = compiler_opt.as_ref() {
             emit_verbose_note(format!(
-                "Configured compiler {} not found; fallback to {}",
+                "Configured compiler {} was not directly runnable with the detected cc::Tool env; fallback to {}",
                 tool.path().to_string_lossy(),
                 found.to_string_lossy()
             ));
@@ -812,9 +843,17 @@ fn compile_fasttree_executable() {
     let mut openmp_enabled = false;
 
     let build_command = |use_openmp: bool| -> Result<(Command, Vec<PathBuf>), String> {
-        let mut cmd = Command::new(&compiler_path);
+        let mut cmd = if use_compiler_tool {
+            let tool = compiler_opt
+                .as_ref()
+                .expect("use_compiler_tool implies compiler_opt");
+            tool.to_command()
+        } else {
+            let mut cmd = Command::new(&compiler_path);
+            cmd.args(&compiler_args);
+            cmd
+        };
         cmd.current_dir(&manifest_dir);
-        cmd.args(&compiler_args);
         let mut runtimes: Vec<PathBuf> = Vec::new();
         if is_msvc {
             cmd.arg("/nologo")

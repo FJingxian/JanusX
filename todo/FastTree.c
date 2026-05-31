@@ -292,9 +292,51 @@
 #include <assert.h>
 #include <math.h>
 #include <stdlib.h>
-#include <sys/time.h>
 #include <ctype.h>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <io.h>
+struct timezone {
+  int tz_minuteswest;
+  int tz_dsttime;
+};
+struct timeval {
+  long tv_sec;
+  long tv_usec;
+};
+static int gettimeofday(struct timeval *tv, struct timezone *tz)
+{
+  const unsigned long long EPOCH_DELTA_100NS = 116444736000000000ULL;
+  FILETIME ft;
+  ULARGE_INTEGER tick;
+  GetSystemTimeAsFileTime(&ft);
+  tick.LowPart = ft.dwLowDateTime;
+  tick.HighPart = ft.dwHighDateTime;
+  tick.QuadPart -= EPOCH_DELTA_100NS;
+  tv->tv_sec = (long)(tick.QuadPart / 10000000ULL);
+  tv->tv_usec = (long)((tick.QuadPart % 10000000ULL) / 10ULL);
+  if (tz != NULL) {
+    tz->tz_minuteswest = 0;
+    tz->tz_dsttime = 0;
+  }
+  return 0;
+}
+#ifndef isatty
+#define isatty _isatty
+#endif
+#ifndef STDIN_FILENO
+#define STDIN_FILENO _fileno(stdin)
+#endif
+#ifndef STDERR_FILENO
+#define STDERR_FILENO _fileno(stderr)
+#endif
+#else
+#include <sys/time.h>
 #include <unistd.h>
+#endif
 #ifdef TRACK_MEMORY
 /* malloc.h apparently doesn't exist on MacOS */
 #include <malloc.h>

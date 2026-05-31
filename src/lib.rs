@@ -127,7 +127,10 @@ use assoc::{
     farmcpu_packed_to_tsv, farmcpu_rem_dense, farmcpu_rem_packed, farmcpu_super_dense,
     farmcpu_super_packed, farmcpu_write_assoc_tsv,
 };
-use bayes::{bayesa, bayesa_packed, bayesb, bayesb_packed, bayescpi, bayescpi_packed};
+use bayes::{
+    bayesa, bayesa_packed, bayesa_packed_trace, bayesb, bayesb_packed, bayesb_packed_trace,
+    bayescpi, bayescpi_packed, bayescpi_packed_trace,
+};
 use beam::{
     beam_scan_windows_binary_mcc_bin_py, beam_scan_windows_continuous_corr_bin_py,
     beam_search_and_binary_mcc_bin_indices_py, beam_search_and_binary_mcc_bin_py,
@@ -412,6 +415,9 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(bayesa_packed, m)?)?;
     m.add_function(wrap_pyfunction!(bayesb_packed, m)?)?;
     m.add_function(wrap_pyfunction!(bayescpi_packed, m)?)?;
+    m.add_function(wrap_pyfunction!(bayesa_packed_trace, m)?)?;
+    m.add_function(wrap_pyfunction!(bayesb_packed_trace, m)?)?;
+    m.add_function(wrap_pyfunction!(bayescpi_packed_trace, m)?)?;
     m.add_function(wrap_pyfunction!(admx_multiply_at_omega, m)?)?;
     m.add_function(wrap_pyfunction!(admx_multiply_a_omega, m)?)?;
     m.add_function(wrap_pyfunction!(admx_multiply_at_omega_inplace, m)?)?;

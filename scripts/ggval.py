@@ -1170,6 +1170,8 @@ def full_flow(outdir: Path, logdir: Path, postgs_enabled: bool) -> None:
             "-lmm",
             "-lm",
             "-fastlmm",
+            "-algwas",
+            "-splmm",
             "-k",
             str(grm_k),
             "-c",

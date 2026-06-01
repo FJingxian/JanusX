@@ -3,8 +3,8 @@ use numpy::{
     IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods,
 };
 use pyo3::exceptions::PyValueError;
-use pyo3::{prelude::*, BoundObject};
 use pyo3::types::PyDict;
+use pyo3::{prelude::*, BoundObject};
 use rand::rngs::{OsRng, StdRng};
 use rand::{Rng, SeedableRng, TryRngCore};
 use rand_distr::{Beta, ChiSquared, Gamma, StandardNormal};
@@ -878,7 +878,9 @@ fn bayesb_core_impl(
             } else {
                 var_b[j] = bayes_positive_floor(s / rng.sample(chi_b_inactive));
                 if !(var_b[j].is_finite() && var_b[j] > 0.0) {
-                    return Err("BayesB inactive var_b became non-finite or non-positive".to_string());
+                    return Err(
+                        "BayesB inactive var_b became non-finite or non-positive".to_string()
+                    );
                 }
             }
         }
@@ -2142,7 +2144,9 @@ fn bayesb_packed_core_impl(
         }
         tmp_rate = tmp_rate / 2.0 + rate0;
         if tmp_rate <= 0.0 {
-            return Err("Gamma rate became non-positive while updating BayesB packed S".to_string());
+            return Err(
+                "Gamma rate became non-positive while updating BayesB packed S".to_string(),
+            );
         }
         let tmp_shape = p as f64 * df0_b / 2.0 + shape0;
         s = bayes_positive_floor(sample_gamma_with_rate(&mut rng, tmp_shape, tmp_rate)?);
@@ -4299,8 +4303,7 @@ fn bayesb_packed_trace_core_impl(
         tmp_rate = tmp_rate / 2.0 + rate0;
         if tmp_rate <= 0.0 {
             return Err(
-                "Gamma rate became non-positive while updating BayesB packed trace S"
-                    .to_string(),
+                "Gamma rate became non-positive while updating BayesB packed trace S".to_string(),
             );
         }
         let tmp_shape = p as f64 * df0_b / 2.0 + shape0;
@@ -4916,7 +4919,8 @@ pub fn bayesa_packed_trace<'py>(
             sample_idx.len()
         )));
     }
-    let trace_idx = parse_optional_index_vec_i64(trace_snp_indices.as_ref(), p, "trace_snp_indices")?;
+    let trace_idx =
+        parse_optional_index_vec_i64(trace_snp_indices.as_ref(), p, "trace_snp_indices")?;
 
     let (x_vec, q): (Cow<'_, [f64]>, usize) = match &x {
         Some(arr) => {
@@ -5108,7 +5112,8 @@ pub fn bayesb_packed_trace<'py>(
             sample_idx.len()
         )));
     }
-    let trace_idx = parse_optional_index_vec_i64(trace_snp_indices.as_ref(), p, "trace_snp_indices")?;
+    let trace_idx =
+        parse_optional_index_vec_i64(trace_snp_indices.as_ref(), p, "trace_snp_indices")?;
 
     let (x_vec, q): (Cow<'_, [f64]>, usize) = match &x {
         Some(arr) => {
@@ -5305,7 +5310,8 @@ pub fn bayescpi_packed_trace<'py>(
             sample_idx.len()
         )));
     }
-    let trace_idx = parse_optional_index_vec_i64(trace_snp_indices.as_ref(), p, "trace_snp_indices")?;
+    let trace_idx =
+        parse_optional_index_vec_i64(trace_snp_indices.as_ref(), p, "trace_snp_indices")?;
 
     let (x_vec, q): (Cow<'_, [f64]>, usize) = match &x {
         Some(arr) => {

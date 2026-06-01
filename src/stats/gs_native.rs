@@ -21,6 +21,7 @@ use crate::blas::{
 };
 use crate::brent::brent_minimize;
 use crate::eigh::symmetric_eigh_f64_row_major;
+use crate::fast_math::gblup_marker_fast_packed;
 use crate::grm;
 use crate::packed::{
     bed_packed_row_flip_mask, cross_grm_times_alpha_packed_f64, packed_malpha_f64,
@@ -29,10 +30,6 @@ use crate::pcg::{pcg_solve, DiagonalPreconditioner, PcgOperator};
 use crate::stats_common::{
     check_ctrlc, env_truthy, get_cached_pool, map_err_string_to_py, parse_index_vec_i64,
 };
-
-#[path = "../math/FaST.rs"]
-mod fast_math;
-use fast_math::gblup_marker_fast_packed;
 
 #[allow(clippy::too_many_arguments)]
 fn decode_raw_block_f64(

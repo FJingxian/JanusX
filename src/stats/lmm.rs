@@ -318,7 +318,6 @@ fn fast_reml_cost(
     if n_minus_p <= 0.0 {
         return 1e100;
     }
-
     let (log_det_v, v2_inv) = match fill_xtv(log10_lbd, data, snp, scratch) {
         Some(v) => v,
         None => return 1e100,
@@ -592,6 +591,7 @@ pub fn fastlmm_reml_null_f32<'py>(
     let n_minus_p_f = n_minus_p as f64;
     let c_const = n_minus_p_f * (n_minus_p_f.ln() - 1.0 - (2.0 * PI).ln()) / 2.0;
     let n_f = n as f64;
+    let n_minus_p_f = ((n as isize) - (p1 as isize) - 1) as f64;
     let c_ml = n_f * (n_f.ln() - 1.0 - (2.0 * PI).ln()) / 2.0;
 
     let mut scratch = FastLmmScratch::new(k, p1);
@@ -686,6 +686,10 @@ pub fn fastlmm_reml_chunk_f32<'py>(
     }
 
     let m = m1;
+    let n_minus_p = (n as isize) - (p1 as isize) - 1;
+    if n_minus_p <= 0 {
+        return Err(PyRuntimeError::new_err("n must be > p+1"));
+    }
     let (u2_xtx, u2_xty) = precompute_u2_base(u2tx_cow.as_ref(), u2ty_cow.as_ref(), n, p1);
 
     let data = FastLmmData {
@@ -726,6 +730,7 @@ pub fn fastlmm_reml_chunk_f32<'py>(
     let n_minus_p_f = n_minus_p as f64;
     let c_const = n_minus_p_f * (n_minus_p_f.ln() - 1.0 - (2.0 * PI).ln()) / 2.0;
     let n_f = n as f64;
+    let n_minus_p_f = n_minus_p as f64;
     let c_ml = n_f * (n_f.ln() - 1.0 - (2.0 * PI).ln()) / 2.0;
 
     py.detach(|| {
@@ -846,4 +851,192 @@ pub fn fastlmm_reml_chunk_f32<'py>(
     });
 
     Ok(beta_se_p)
+}
+
+#[pyfunction]
+#[pyo3(signature = (s, u1tx, u2tx, u1ty, u2ty, log10_lbd, snp_chunk, u1t, threads=0, nullml=None))]
+pub fn fastlmm_assoc_from_snp_f32<'py>(
+    py: Python<'py>,
+    s: PyReadonlyArray1<'py, f64>,
+    u1tx: PyReadonlyArray2<'py, f64>,
+    u2tx: PyReadonlyArray2<'py, f64>,
+    u1ty: PyReadonlyArray1<'py, f64>,
+    u2ty: PyReadonlyArray1<'py, f64>,
+    log10_lbd: f64,
+    snp_chunk: PyReadonlyArray2<'py, f32>,
+    u1t: PyReadonlyArray2<'py, f32>,
+    threads: usize,
+    nullml: Option<f64>,
+) -> PyResult<Bound<'py, PyArray2<f64>>> {
+    let s_cow = array1_to_cow(&s)?;
+    let u1ty_cow = array1_to_cow(&u1ty)?;
+    let u2ty_cow = array1_to_cow(&u2ty)?;
+
+    let (u1tx_cow, k1, p1) = array2_to_cow(&u1tx)?;
+    let (u2tx_cow, n2, p2) = array2_to_cow(&u2tx)?;
+    let (snp_cow, m1, n3) = array2_to_cow(&snp_chunk)?;
+    let (u1t_cow, k2, n4) = array2_to_cow(&u1t)?;
+
+    let k = s_cow.len();
+    if k == 0 {
+        return Err(PyRuntimeError::new_err("empty s"));
+    }
+    if k1 != k {
+        return Err(PyRuntimeError::new_err("u1tx rows must equal len(s)"));
+    }
+    if u1ty_cow.len() != k {
+        return Err(PyRuntimeError::new_err("u1ty len must equal len(s)"));
+    }
+    if p1 == 0 {
+        return Err(PyRuntimeError::new_err("u1tx must have at least 1 column"));
+    }
+    if p1 != p2 {
+        return Err(PyRuntimeError::new_err(
+            "u1tx and u2tx must have same column count",
+        ));
+    }
+
+    let n = u2ty_cow.len();
+    if n2 != n {
+        return Err(PyRuntimeError::new_err("u2tx rows must equal len(u2ty)"));
+    }
+    if k2 != k || n4 != n {
+        return Err(PyRuntimeError::new_err(
+            "u1t must have shape (k, n) where k=len(s), n=len(u2ty)",
+        ));
+    }
+    if n3 != n {
+        return Err(PyRuntimeError::new_err(
+            "snp_chunk must have shape (m, n) where n=len(u2ty)",
+        ));
+    }
+    if n <= p1 + 1 {
+        return Err(PyRuntimeError::new_err("n must be > p+1"));
+    }
+    let lbd = 10.0_f64.powf(log10_lbd);
+    if !(lbd.is_finite() && lbd > 0.0) {
+        return Err(PyRuntimeError::new_err("invalid log10_lbd"));
+    }
+
+    let m = m1;
+    let (u2_xtx, u2_xty) = precompute_u2_base(u2tx_cow.as_ref(), u2ty_cow.as_ref(), n, p1);
+    let data = FastLmmData {
+        s: s_cow.as_ref(),
+        u1tx: u1tx_cow.as_ref(),
+        u2tx: u2tx_cow.as_ref(),
+        u1ty: u1ty_cow.as_ref(),
+        u2ty: u2ty_cow.as_ref(),
+        k,
+        n,
+        p: p1,
+        u2_xtx: &u2_xtx,
+        u2_xty: &u2_xty,
+    };
+
+    let with_plrt = nullml.is_some();
+    let nullml_val = nullml.unwrap_or(0.0);
+    let out_cols = if with_plrt { 4 } else { 3 };
+    let out = PyArray2::<f64>::zeros(py, [m, out_cols], false).into_bound();
+    let out_slice: &mut [f64] = unsafe {
+        out.as_slice_mut()
+            .map_err(|_| PyRuntimeError::new_err("out not contiguous"))?
+    };
+
+    let n_f = n as f64;
+    let n_minus_p_f = ((n as isize) - (p1 as isize) - 1) as f64;
+    let c_ml = n_f * (n_f.ln() - 1.0 - (2.0 * PI).ln()) / 2.0;
+    let pool = if threads > 0 {
+        Some(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .map_err(|e| PyRuntimeError::new_err(format!("rayon pool: {e}")))?,
+        )
+    } else {
+        None
+    };
+
+    py.detach(|| {
+        let mut compute_all = || {
+            out_slice
+                .par_chunks_mut(out_cols)
+                .enumerate()
+                .for_each_init(
+                    || ThreadScratch {
+                        core: FastLmmScratch::new(k, p1 + 1),
+                        u2_xtsnp: vec![0.0; p1],
+                        snp_model: vec![0.0; n],
+                        u1_snp: vec![0.0; k],
+                        u2_snp: vec![0.0; n],
+                    },
+                    |scratch, (idx, out_row)| {
+                        let raw_row = &snp_cow.as_ref()[idx * n..(idx + 1) * n];
+                        scratch.snp_model.copy_from_slice(raw_row);
+                        project_snp_row_u1_u2(
+                            &scratch.snp_model,
+                            u1t_cow.as_ref(),
+                            k,
+                            n,
+                            &mut scratch.u1_snp,
+                            &mut scratch.u2_snp,
+                        );
+
+                        let (u2_snp_snp, u2_snp_ty) = precompute_u2_snp(
+                            data.u2tx,
+                            data.u2ty,
+                            &scratch.u2_snp,
+                            n,
+                            data.p,
+                            &mut scratch.u2_xtsnp,
+                        );
+                        let snp_pre = SnpPrecomp {
+                            u1: &scratch.u1_snp,
+                            u2: &scratch.u2_snp,
+                            u2_xtsnp: &scratch.u2_xtsnp,
+                            u2_snp_snp,
+                            u2_snp_ty,
+                        };
+
+                        let (beta, se) = fast_reml_beta_se(
+                            log10_lbd,
+                            &data,
+                            &snp_pre,
+                            &mut scratch.core,
+                            n_minus_p_f,
+                        );
+                        out_row[0] = beta;
+                        out_row[1] = se;
+                        if se.is_finite() && se > 0.0 {
+                            let z = beta / se;
+                            out_row[2] = 2.0 * normal_sf(z.abs());
+                        } else {
+                            out_row[2] = f64::NAN;
+                        }
+                        if with_plrt {
+                            let ml = fast_ml_loglike(
+                                log10_lbd,
+                                &data,
+                                Some(&snp_pre),
+                                &mut scratch.core,
+                                n_f,
+                                c_ml,
+                            );
+                            if ml.is_finite() {
+                                let stat = 2.0 * (ml - nullml_val);
+                                out_row[3] = chi2_sf_df1(stat.max(0.0));
+                            } else {
+                                out_row[3] = f64::NAN;
+                            }
+                        }
+                    },
+                );
+        };
+        if let Some(tp) = &pool {
+            tp.install(compute_all);
+        } else {
+            compute_all();
+        }
+    });
+
+    Ok(out)
 }

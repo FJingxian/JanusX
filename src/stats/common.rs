@@ -111,8 +111,8 @@ impl AsyncTsvWriter {
         let path_for_writer = path_owned.clone();
         let flush_threshold = writer_capacity.clamp(MIN_FLUSH_BYTES, MAX_FLUSH_BYTES);
         let handle = std::thread::spawn(move || -> Result<(), String> {
-            let out_file =
-                File::create(&path_for_writer).map_err(|e| format!("create {path_for_writer}: {e}"))?;
+            let out_file = File::create(&path_for_writer)
+                .map_err(|e| format!("create {path_for_writer}: {e}"))?;
             let mut writer = BufWriter::with_capacity(writer_capacity.max(1), out_file);
             writer
                 .write_all(&header_owned)

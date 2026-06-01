@@ -284,11 +284,9 @@ impl GwasAssocTsvWriter {
             .writer
             .as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("writer is closed"))?;
-        let payload = std::mem::replace(
-            &mut self.text_buf,
-            String::with_capacity(self.buffer_bytes),
-        )
-        .into_bytes();
+        let payload =
+            std::mem::replace(&mut self.text_buf, String::with_capacity(self.buffer_bytes))
+                .into_bytes();
         writer.send(payload).map_err(PyIOError::new_err)?;
         Ok(())
     }

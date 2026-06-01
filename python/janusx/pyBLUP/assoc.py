@@ -150,6 +150,8 @@ except Exception:
 
 # Rust core kernels (PyO3 extension)
 from janusx.janusx import (
+    fastlmm_prepare_lowrank_f64,
+    fastlmm_assoc_from_snp_f32,
     glmf32,
     glmf32_full,
     lmm_reml_chunk_f32,
@@ -1021,6 +1023,44 @@ def fastlmm_assoc_chunk(
     return beta_se_p
 
 
+def fastlmm_assoc_from_snp(
+    S: np.ndarray,
+    u1tx: np.ndarray,
+    u2tx: np.ndarray,
+    u1ty: np.ndarray,
+    u2ty: np.ndarray,
+    log10_lbd: float,
+    snp_chunk: np.ndarray,
+    u1t: np.ndarray,
+    threads: int = 4,
+    nullml: Optional[float] = None,
+) -> np.ndarray:
+    """
+    Fixed-lambda FaST-LMM scan on SNP-major chunk with internal low-rank projection.
+    """
+    S = np.ascontiguousarray(S, dtype=np.float64).ravel()
+    u1tx = np.ascontiguousarray(u1tx, dtype=np.float64)
+    u2tx = np.ascontiguousarray(u2tx, dtype=np.float64)
+    u1ty = np.ascontiguousarray(u1ty, dtype=np.float64).ravel()
+    u2ty = np.ascontiguousarray(u2ty, dtype=np.float64).ravel()
+    snp_chunk = np.ascontiguousarray(snp_chunk, dtype=np.float32)
+    u1t = np.ascontiguousarray(u1t, dtype=np.float32)
+
+    beta_se_p = fastlmm_assoc_from_snp_f32(
+        S,
+        u1tx,
+        u2tx,
+        u1ty,
+        u2ty,
+        float(log10_lbd),
+        snp_chunk,
+        u1t,
+        int(threads),
+        None if nullml is None else float(nullml),
+    )
+    return beta_se_p
+
+
 def ml_loglike_null(
     S: np.ndarray,
     utx: np.ndarray,
@@ -1142,58 +1182,23 @@ def lmm_assoc_fixed_from_snp(
 
 class LMM:
     """
-    Fast LMM GWAS using eigen-decomposition of kinship + REML per SNP (Rust).
-
-    This class:
-      - performs eigen-decomposition of K once (np.linalg.eigh)
-      - precomputes rotated phenotype/covariates
-      - runs per-chunk REML via Rust kernel
-
-    Parameters
-    ----------
-    y : np.ndarray
-        Phenotype (n,) or (n,1). Internally used as (n,1).
-
-    X : np.ndarray or None
-        Covariates (n,p). If provided, an intercept column is added.
-
-    kinship : np.ndarray
-        Kinship matrix K of shape (n,n). A small ridge is added:
-            K + 1e-6 * I
-        to improve numerical stability.
-
-    Attributes
-    ----------
-    S : np.ndarray, shape (n,)
-        Eigenvalues of K (descending).
-
-    Dh : np.ndarray, shape (n,n), dtype=float32
-        U^T of eigenvectors (transposed), used to rotate.
-
-    Xcov : np.ndarray, shape (n,q)
-        Rotated covariates Dh @ X.
-
-    y : np.ndarray, shape (n,1)
-        Rotated phenotype Dh @ y.
-
-    bounds : tuple
-        log10(lambda) search bounds, centered around null estimate.
+    LMM GWAS with ridge-stabilized full-rank spectral GRM.
     """
+
+    _LOWRANK_REL_TOL = 1e-8
+    _GRM_EIGH_RIDGE = 1e-6
+    _ENABLE_LOWRANK_FAST = False
 
     def __init__(self, y: np.ndarray, X: Optional[np.ndarray], kinship: np.ndarray):
         global _WARNED_EIGH_NON_LAPACK, _WARNED_EIGH_SCIPY_FALLBACK
-        y = np.asarray(y).reshape(-1, 1)  # ensure (n,1)
+        y_arr = np.asarray(y).reshape(-1, 1)
 
-        # Add intercept automatically
-        X = (
-            np.concatenate([np.ones((y.shape[0], 1)), X], axis=1)
+        X_design = (
+            np.concatenate([np.ones((y_arr.shape[0], 1)), X], axis=1)
             if X is not None
-            else np.ones((y.shape[0], 1))
+            else np.ones((y_arr.shape[0], 1))
         )
 
-        # Eigen decomposition of kinship (stabilized, Rust-only).
-        # Prefer file-backed mmap GRM path to avoid materializing an extra
-        # dense float64 copy when the caller passed an identity-aligned .npy.
         kinship_file_hint = _resolve_matrix_file_hint(kinship)
         t_start = time.time()
         eig_thr = int(_infer_blas_threads_from_env() or 0)
@@ -1206,15 +1211,17 @@ class LMM:
                         driver="auto",
                         jobz="V",
                         require_lapack=False,
-                        diag_shift=1e-6,
+                        diag_shift=float(self._GRM_EIGH_RIDGE),
                     )
                 )
             except Exception:
                 kinship_file_hint = None
         if kinship_file_hint is None:
             kinship = np.array(kinship, dtype=np.float64, copy=True)
-            kinship.flat[::kinship.shape[0] + 1] += 1e-6
             kinship_eigh = np.ascontiguousarray(kinship, dtype=np.float64)
+            ridge = float(self._GRM_EIGH_RIDGE)
+            if ridge != 0.0:
+                kinship_eigh.flat[:: kinship_eigh.shape[0] + 1] += ridge
             if _rust_eigh_from_array_f64_inplace is not None:
                 try:
                     eval_raw, evec_raw, _blas_backend, _evd_backend, _n, _tb, _ti, _ta, _lapack, _sec = (
@@ -1269,8 +1276,6 @@ class LMM:
                 )
         if evec_raw is None:
             raise RuntimeError("rust_eigh_from_array_f64 returned no eigenvectors")
-        self.S = np.asarray(eval_raw, dtype=np.float64)
-        self.Dh = np.asarray(evec_raw, dtype=np.float64)
         if not str(_evd_backend).lower().startswith("lapack_"):
             _emit_runtime_warning_once(
                 "eigh_non_lapack",
@@ -1280,50 +1285,156 @@ class LMM:
                 ),
             )
         self.evd_secs = float(time.time() - t_start)
-        # Drop kinship to save memory
         if kinship_file_hint is None:
             del kinship
-        self.Dh = self.Dh.T.astype('float32')
-
-        # Pre-rotate covariates and phenotype once (Rust-only).
-        if _lmm_rotate_x_y_with_ut_f64 is None:
-            raise RuntimeError(
-                "Rust extension missing lmm_rotate_x_y_with_ut_f64. "
-                "Rebuild janusx extension for Rust-only GWAS mode."
-            )
-        xcov_rot, y_rot = _lmm_rotate_x_y_with_ut_f64(
-            np.ascontiguousarray(self.Dh, dtype=np.float32),
-            np.ascontiguousarray(X, dtype=np.float64),
-            np.ascontiguousarray(y.reshape(-1), dtype=np.float64),
-            int(_infer_blas_threads_from_env() or 0),
+        self._initialize_from_spectral(
+            y=y_arr,
+            X=X_design,
+            eigvals=np.asarray(eval_raw, dtype=np.float64),
+            eigvecs=np.asarray(evec_raw, dtype=np.float64),
+            evd_secs=float(self.evd_secs),
         )
-        self.Xcov = np.ascontiguousarray(np.asarray(xcov_rot, dtype=np.float64), dtype=np.float64)
-        self.y = np.ascontiguousarray(np.asarray(y_rot, dtype=np.float64), dtype=np.float64)
 
-        # ---- Estimate null lambda via scalar optimization (Python) ----
-        lbd_null, ml0, reml = lmm_reml_null(self.S, self.Xcov, self.y, (-5, 5), max_iter=50, tol=1e-3)
-        # print(lbd_null,reml)
-        # result = minimize_scalar(
-        #     lambda lbd: -self._NULLREML(10 ** (lbd)),
-        #     bounds=(-5, 5),
-        #     method="bounded",
-        #     options={"xatol": 1e-3},
-        # )
-        # print(10**result.x,-result.fun)
-        # lbd_null = 10 ** (result.x)
+    @classmethod
+    def from_spectral(
+        cls,
+        y: np.ndarray,
+        X: Optional[np.ndarray],
+        eigvals: np.ndarray,
+        eigvecs: np.ndarray,
+        evd_secs: float = 0.0,
+    ) -> "LMM":
+        y_arr = np.asarray(y).reshape(-1, 1)
+        X_design = (
+            np.concatenate([np.ones((y_arr.shape[0], 1)), X], axis=1)
+            if X is not None
+            else np.ones((y_arr.shape[0], 1))
+        )
+        obj = cls.__new__(cls)
+        obj._initialize_from_spectral(
+            y=y_arr,
+            X=X_design,
+            eigvals=np.asarray(eigvals, dtype=np.float64),
+            eigvecs=np.asarray(eigvecs, dtype=np.float64),
+            evd_secs=float(evd_secs),
+        )
+        return obj
 
-        vg_null = np.mean(self.S)
-        pve = vg_null / (vg_null + lbd_null)
+    def _initialize_from_spectral(
+        self,
+        *,
+        y: np.ndarray,
+        X: np.ndarray,
+        eigvals: np.ndarray,
+        eigvecs: np.ndarray,
+        evd_secs: float,
+    ) -> None:
+        s_full = np.ascontiguousarray(np.asarray(eigvals, dtype=np.float64).reshape(-1), dtype=np.float64)
+        u_full = np.ascontiguousarray(np.asarray(eigvecs, dtype=np.float64), dtype=np.float64)
+        y_vec = np.ascontiguousarray(np.asarray(y, dtype=np.float64).reshape(-1), dtype=np.float64)
+        X_design = np.ascontiguousarray(np.asarray(X, dtype=np.float64), dtype=np.float64)
 
-        self.lbd_null = lbd_null
-        self.pve = pve
-        self.LL0 = reml
-        self.ML0 = ml0
-        # Adaptive bounds around null (if PVE not degenerate)
-        if pve > 0.95 or pve < 0.05:
+        n = int(y_vec.shape[0])
+        if s_full.shape[0] != n:
+            raise ValueError(f"eigvals length mismatch: got {s_full.shape[0]}, expected {n}")
+        if u_full.shape != (n, n):
+            raise ValueError(f"eigvecs shape mismatch: got {u_full.shape}, expected ({n}, {n})")
+        if X_design.shape[0] != n:
+            raise ValueError(f"design row mismatch: got {X_design.shape[0]}, expected {n}")
+
+        lam_max = float(np.max(s_full)) if s_full.size > 0 else 0.0
+        rank_thr = float(self._LOWRANK_REL_TOL) * max(lam_max, 0.0)
+        keep_mask = np.isfinite(s_full) & (s_full > rank_thr)
+        rank = int(np.sum(keep_mask))
+        allow_lowrank = bool(self._ENABLE_LOWRANK_FAST)
+
+        self.n = int(n)
+        self.rank = int(n)
+        self.lowrank = bool(allow_lowrank and (0 < rank < n))
+        self.full_rank = True
+        self.rank_threshold = float(rank_thr)
+        self.evd_secs = float(evd_secs)
+        self.trace_mean = float(np.sum(np.clip(s_full, 0.0, None), dtype=np.float64) / float(max(1, n)))
+        self.Xcov = None
+        self.Dh = None
+        self.u1t = None
+        self.u1tx = None
+        self.u2tx = None
+        self.u1ty = None
+        self.u2ty = None
+
+        if self.lowrank:
+            (
+                rank_out,
+                trace_mean,
+                s_keep,
+                u1t,
+                u1tx,
+                u2tx,
+                u1ty,
+                u2ty,
+            ) = fastlmm_prepare_lowrank_f64(
+                s_full,
+                u_full,
+                X_design,
+                y_vec,
+                rel_tol=float(self._LOWRANK_REL_TOL),
+            )
+            self.rank = int(rank_out)
+            self.trace_mean = float(trace_mean)
+            self.S = np.ascontiguousarray(np.asarray(s_keep, dtype=np.float64).reshape(-1), dtype=np.float64)
+            self.u1t = np.ascontiguousarray(np.asarray(u1t, dtype=np.float32), dtype=np.float32)
+            self.u1tx = np.ascontiguousarray(np.asarray(u1tx, dtype=np.float64), dtype=np.float64)
+            self.u2tx = np.ascontiguousarray(np.asarray(u2tx, dtype=np.float64), dtype=np.float64)
+            self.u1ty = np.ascontiguousarray(np.asarray(u1ty, dtype=np.float64).reshape(-1), dtype=np.float64)
+            self.u2ty = np.ascontiguousarray(np.asarray(u2ty, dtype=np.float64).reshape(-1), dtype=np.float64)
+            self.y = y_vec.reshape(-1, 1)
+            lbd_null, ml0, reml = fastlmm_reml_null(
+                self.S,
+                self.u1tx,
+                self.u2tx,
+                self.u1ty,
+                self.u2ty,
+                (-5, 5),
+                max_iter=50,
+                tol=1e-3,
+                model="add",
+            )
+            vg_null = float(self.trace_mean)
+        else:
+            self.S = s_full
+            self.Dh = np.ascontiguousarray(u_full.T.astype(np.float32), dtype=np.float32)
+            if _lmm_rotate_x_y_with_ut_f64 is None:
+                raise RuntimeError(
+                    "Rust extension missing lmm_rotate_x_y_with_ut_f64. "
+                    "Rebuild janusx extension for Rust-only GWAS mode."
+                )
+            xcov_rot, y_rot = _lmm_rotate_x_y_with_ut_f64(
+                self.Dh,
+                X_design,
+                y_vec,
+                int(_infer_blas_threads_from_env() or 0),
+            )
+            self.Xcov = np.ascontiguousarray(np.asarray(xcov_rot, dtype=np.float64), dtype=np.float64)
+            self.y = np.ascontiguousarray(np.asarray(y_rot, dtype=np.float64), dtype=np.float64)
+            lbd_null, ml0, reml = lmm_reml_null(
+                self.S,
+                self.Xcov,
+                self.y,
+                (-5, 5),
+                max_iter=50,
+                tol=1e-3,
+            )
+            vg_null = float(np.mean(np.clip(self.S, 0.0, None)))
+
+        self.lbd_null = float(lbd_null)
+        self.pve = float(vg_null / (vg_null + self.lbd_null)) if (vg_null + self.lbd_null) > 0 else float("nan")
+        self.LL0 = float(reml)
+        self.ML0 = float(ml0)
+        if self.pve > 0.95 or self.pve < 0.05 or (not np.isfinite(self.lbd_null)) or self.lbd_null <= 0.0:
             self.bounds = (-5, 5)
         else:
-            self.bounds = (np.log10(lbd_null) - 2, np.log10(lbd_null) + 2)
+            self.bounds = (np.log10(self.lbd_null) - 2, np.log10(self.lbd_null) + 2)
 
     @classmethod
     def from_lmm(cls, other: "LMM") -> "LMM":
@@ -1331,16 +1442,30 @@ class LMM:
         Create a lightweight model clone that reuses precomputed EVD/rotations.
         """
         obj = cls.__new__(cls)
-        obj.S = other.S
-        obj.Dh = other.Dh
-        obj.Xcov = other.Xcov
-        obj.y = other.y
-        obj.lbd_null = other.lbd_null
-        obj.pve = other.pve
-        obj.LL0 = other.LL0
-        obj.ML0 = other.ML0
-        obj.bounds = other.bounds
-        obj.evd_secs = float(getattr(other, "evd_secs", 0.0))
+        for attr in (
+            "S",
+            "Dh",
+            "Xcov",
+            "y",
+            "lbd_null",
+            "pve",
+            "LL0",
+            "ML0",
+            "bounds",
+            "evd_secs",
+            "n",
+            "rank",
+            "lowrank",
+            "full_rank",
+            "rank_threshold",
+            "trace_mean",
+            "u1t",
+            "u1tx",
+            "u2tx",
+            "u1ty",
+            "u2ty",
+        ):
+            setattr(obj, attr, getattr(other, attr, None))
         return obj
 
     def _NULLREML(self, lbd: float) -> float:
@@ -1391,20 +1516,23 @@ class LMM:
     def gwas(self, snp: np.ndarray, threads: int = 1) -> np.ndarray:
         """
         Run LMM GWAS on a SNP-major genotype matrix/chunk.
-
-        Parameters
-        ----------
-        snp : np.ndarray, shape (m, n)
-            SNP-major genotype block. Rows SNPs, columns samples.
-
-        threads : int
-            Rust worker threads for per-SNP REML optimization.
-
-        Returns
-        -------
-        beta_se_p : np.ndarray, shape (m, 4)
-            Per-SNP beta, se, pwald, plrt.
         """
+        if bool(getattr(self, "lowrank", False)):
+            return fastlmm_reml(
+                self.S,
+                self.u1tx,
+                self.u2tx,
+                self.u1ty,
+                self.u2ty,
+                np.ascontiguousarray(np.asarray(snp, dtype=np.float32), dtype=np.float32),
+                self.u1t,
+                self.bounds,
+                max_iter=30,
+                tol=1e-2,
+                threads=threads,
+                nullml=self.ML0,
+                model="add",
+            )
         beta_se_p = lmm_reml_from_snp(
             self.S,
             self.Xcov,
@@ -1422,7 +1550,7 @@ class LMM:
 
 class FastLMM(LMM):
     """
-    Fast LMM GWAS using a fixed lambda for all SNPs (Rust kernel).
+    Fast LMM GWAS using a fixed lambda for all SNPs (Rust kernel, full-rank spectral path).
     """
 
     def gwas(self, snp: np.ndarray, threads: int = 1) -> np.ndarray:
@@ -1430,6 +1558,19 @@ class FastLMM(LMM):
             return super().gwas(snp, threads=threads)
 
         log10_lbd = float(np.log10(self.lbd_null))
+        if bool(getattr(self, "lowrank", False)):
+            return fastlmm_assoc_from_snp(
+                self.S,
+                self.u1tx,
+                self.u2tx,
+                self.u1ty,
+                self.u2ty,
+                log10_lbd,
+                np.ascontiguousarray(np.asarray(snp, dtype=np.float32), dtype=np.float32),
+                self.u1t,
+                threads=threads,
+                nullml=self.ML0,
+            )
         beta_se_p = lmm_assoc_fixed_from_snp(
             self.S,
             self.Xcov,

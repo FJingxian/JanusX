@@ -244,7 +244,10 @@ fn apply_diag_shift_row_major(a_row_major: &mut [f64], n: usize, diag_shift: f64
     }
 }
 
-fn load_square_matrix_from_npy_f64(path: &str, diag_shift: f64) -> Result<(Vec<f64>, usize), String> {
+fn load_square_matrix_from_npy_f64(
+    path: &str,
+    diag_shift: f64,
+) -> Result<(Vec<f64>, usize), String> {
     let file = File::open(path).map_err(|e| format!("open NPY failed: {e}"))?;
     let mmap = unsafe { MmapOptions::new().map(&file).map_err(|e| e.to_string())? };
     let (rows, cols, data_offset, dtype) = parse_npy_header_for_float_matrix(&mmap[..])?;
@@ -319,7 +322,10 @@ fn parse_text_matrix_row(line: &str) -> Vec<&str> {
     }
 }
 
-fn load_square_matrix_from_text_f64(path: &str, diag_shift: f64) -> Result<(Vec<f64>, usize), String> {
+fn load_square_matrix_from_text_f64(
+    path: &str,
+    diag_shift: f64,
+) -> Result<(Vec<f64>, usize), String> {
     let file = File::open(path).map_err(|e| format!("open text matrix failed: {e}"))?;
     let reader = BufReader::new(file);
 
@@ -383,7 +389,10 @@ fn load_square_matrix_from_text_f64(path: &str, diag_shift: f64) -> Result<(Vec<
     Ok((out, n))
 }
 
-fn load_square_matrix_f64_from_file(path: &str, diag_shift: f64) -> Result<(Vec<f64>, usize), String> {
+fn load_square_matrix_f64_from_file(
+    path: &str,
+    diag_shift: f64,
+) -> Result<(Vec<f64>, usize), String> {
     let p = Path::new(path);
     let ext = p
         .extension()

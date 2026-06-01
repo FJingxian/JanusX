@@ -1275,9 +1275,16 @@ where
     FX: FnMut(usize, usize, usize, f64) -> Result<(), String>,
 {
     if n_samples == 0 || n_covariates == 0 {
-        return Err("PCG SparseLMM null model requires n_samples > 0 and n_covariates > 0".to_string());
+        return Err(
+            "PCG SparseLMM null model requires n_samples > 0 and n_covariates > 0".to_string(),
+        );
     }
-    pcg_validate_matrix_shape("SparseLMM design matrix", x_row_major, n_samples, n_covariates)?;
+    pcg_validate_matrix_shape(
+        "SparseLMM design matrix",
+        x_row_major,
+        n_samples,
+        n_covariates,
+    )?;
     if y.len() != n_samples {
         return Err(format!(
             "PCG SparseLMM y length mismatch: got {}, expected {n_samples}",
@@ -1780,7 +1787,9 @@ where
         n_markers,
     )?;
     if n_markers == 0 {
-        return Err("PCG SparseLMM r-hat estimation requires at least one sampled marker".to_string());
+        return Err(
+            "PCG SparseLMM r-hat estimation requires at least one sampled marker".to_string(),
+        );
     }
     let inv_diag = jacobi_inv_diag.ok_or_else(|| {
         "PCG SparseLMM r-hat batched solver requires Jacobi inverse diagonal".to_string()

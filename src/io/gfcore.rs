@@ -121,10 +121,7 @@ pub(crate) struct DecodedSnpRowCounts {
 }
 
 #[inline]
-pub(crate) fn scan_snp_row_counts(
-    row: &[f32],
-    apply_het_filter: bool,
-) -> DecodedSnpRowCounts {
+pub(crate) fn scan_snp_row_counts(row: &[f32], apply_het_filter: bool) -> DecodedSnpRowCounts {
     let mut counts = DecodedSnpRowCounts::default();
     for &g in row.iter() {
         if g >= 0.0 {

@@ -17,11 +17,11 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
 
-use crate::blas::{rust_sgemm_prefers_rayon_rowmajor_f32_kernel, BlasThreadGuard};
 use crate::bedmath::{
     adaptive_grm_block_rows, decode_mean_imputed_additive_packed_block_rows_f32,
     decode_plink_bed_hardcall, is_identity_indices, packed_byte_lut,
 };
+use crate::blas::{rust_sgemm_prefers_rayon_rowmajor_f32_kernel, BlasThreadGuard};
 use crate::gfcore;
 use crate::gfcore::BedSnpIter;
 use crate::gfreader::{build_sample_selection, prepare_bed_logic_meta_owned_for_stats_samples};
@@ -806,10 +806,10 @@ pub fn lm_stream_bed_to_tsv(
             )
             .map_err(PyRuntimeError::new_err)?;
             let bed_path = format!("{norm_prefix}.bed");
-            let bed_file =
-                File::open(&bed_path).map_err(|e| PyRuntimeError::new_err(format!("open {bed_path}: {e}")))?;
-            let bed_mmap =
-                unsafe { Mmap::map(&bed_file) }.map_err(|e| PyRuntimeError::new_err(format!("mmap {bed_path}: {e}")))?;
+            let bed_file = File::open(&bed_path)
+                .map_err(|e| PyRuntimeError::new_err(format!("open {bed_path}: {e}")))?;
+            let bed_mmap = unsafe { Mmap::map(&bed_file) }
+                .map_err(|e| PyRuntimeError::new_err(format!("mmap {bed_path}: {e}")))?;
             if bed_mmap.len() < 3 {
                 return Err(PyRuntimeError::new_err("BED too small"));
             }
@@ -850,7 +850,10 @@ pub fn lm_stream_bed_to_tsv(
                     block_slice,
                     rows_here,
                     n,
-                    y_f32_add.as_ref().expect("additive y_f32 missing").as_slice(),
+                    y_f32_add
+                        .as_ref()
+                        .expect("additive y_f32 missing")
+                        .as_slice(),
                     1usize,
                     sy_slice,
                     pool.as_ref(),
@@ -893,7 +896,8 @@ pub fn lm_stream_bed_to_tsv(
                     let site = &prepared.sites[row_idx];
                     let r = &out_slice[local_idx * 5..(local_idx + 1) * 5];
                     let chisq_txt = format_chisq_value(r[2]);
-                    let miss_count = (prepared.missing_rate[row_idx] as f64 * n as f64).round() as i64;
+                    let miss_count =
+                        (prepared.missing_rate[row_idx] as f64 * n as f64).round() as i64;
                     let _ = write!(
                         text,
                         "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\t{:.4e}\n",
@@ -997,36 +1001,14 @@ pub fn lm_stream_bed_to_tsv(
                 }
                 scan_idx = scan_idx.saturating_add(batch_len);
 
-                let keep_meta: Vec<Option<(f32, f32)>> =
-                    if decoded_rows >= 64 {
-                        if let Some(p) = &pool {
-                            p.install(|| {
-                                window_rows[..decoded_rows * n]
-                                    .par_chunks_mut(n)
-                                    .zip(window_sites.par_iter_mut())
-                                    .zip(window_counts.par_iter().copied())
-                                    .map(|((row_sub, site), counts)| {
-                                        finalize_row(row_sub, site, Some(counts)).and_then(
-                                            |(maf_val, miss_val)| {
-                                                if snps_only
-                                                    && (!is_simple_snp_allele(&site.ref_allele)
-                                                        || !is_simple_snp_allele(&site.alt_allele))
-                                                {
-                                                    None
-                                                } else {
-                                                    Some((maf_val, miss_val))
-                                                }
-                                            },
-                                        )
-                                    })
-                                    .collect()
-                            })
-                        } else {
-                            (0..decoded_rows)
-                                .map(|idx| {
-                                    let row_sub = &mut window_rows[idx * n..(idx + 1) * n];
-                                    let site = &mut window_sites[idx];
-                                    let counts = window_counts[idx];
+                let keep_meta: Vec<Option<(f32, f32)>> = if decoded_rows >= 64 {
+                    if let Some(p) = &pool {
+                        p.install(|| {
+                            window_rows[..decoded_rows * n]
+                                .par_chunks_mut(n)
+                                .zip(window_sites.par_iter_mut())
+                                .zip(window_counts.par_iter().copied())
+                                .map(|((row_sub, site), counts)| {
                                     finalize_row(row_sub, site, Some(counts)).and_then(
                                         |(maf_val, miss_val)| {
                                             if snps_only
@@ -1041,7 +1023,7 @@ pub fn lm_stream_bed_to_tsv(
                                     )
                                 })
                                 .collect()
-                        }
+                        })
                     } else {
                         (0..decoded_rows)
                             .map(|idx| {
@@ -1062,7 +1044,28 @@ pub fn lm_stream_bed_to_tsv(
                                 )
                             })
                             .collect()
-                    };
+                    }
+                } else {
+                    (0..decoded_rows)
+                        .map(|idx| {
+                            let row_sub = &mut window_rows[idx * n..(idx + 1) * n];
+                            let site = &mut window_sites[idx];
+                            let counts = window_counts[idx];
+                            finalize_row(row_sub, site, Some(counts)).and_then(
+                                |(maf_val, miss_val)| {
+                                    if snps_only
+                                        && (!is_simple_snp_allele(&site.ref_allele)
+                                            || !is_simple_snp_allele(&site.alt_allele))
+                                    {
+                                        None
+                                    } else {
+                                        Some((maf_val, miss_val))
+                                    }
+                                },
+                            )
+                        })
+                        .collect()
+                };
 
                 chunk_sites.clear();
                 chunk_maf.clear();
@@ -1165,7 +1168,10 @@ pub fn lm_stream_bed_to_tsv(
                     block_rows,
                     m,
                     n,
-                    y_f32_add.as_ref().expect("additive y_f32 missing").as_slice(),
+                    y_f32_add
+                        .as_ref()
+                        .expect("additive y_f32 missing")
+                        .as_slice(),
                     1usize,
                     sy_slice,
                     pool.as_ref(),
@@ -1991,7 +1997,12 @@ pub fn glmf32_packed_assoc_to_tsv(
             row_missing.len()
         )));
     }
-    if chrom.len() != m || pos.len() != m || snp.len() != m || allele0.len() != m || allele1.len() != m {
+    if chrom.len() != m
+        || pos.len() != m
+        || snp.len() != m
+        || allele0.len() != m
+        || allele1.len() != m
+    {
         return Err(PyRuntimeError::new_err(format!(
             "TSV metadata length mismatch: rows={m}, chrom={}, pos={}, snp={}, allele0={}, allele1={}",
             chrom.len(),

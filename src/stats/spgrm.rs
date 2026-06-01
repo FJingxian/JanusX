@@ -20,8 +20,8 @@ use crate::bedmath::{
     is_identity_indices, packed_byte_lut, SubsetDecodePlan,
 };
 use crate::blas::{
-    cblas_sgemm_dispatch, BlasThreadGuard, CblasInt, CBLAS_COL_MAJOR, CBLAS_NO_TRANS, CBLAS_ROW_MAJOR,
-    CBLAS_TRANS,
+    cblas_sgemm_dispatch, BlasThreadGuard, CblasInt, CBLAS_COL_MAJOR, CBLAS_NO_TRANS,
+    CBLAS_ROW_MAJOR, CBLAS_TRANS,
 };
 use crate::gfcore::read_fam;
 use crate::gfreader::prepare_bed_logic_meta_owned_for_stats_samples;
@@ -2415,8 +2415,8 @@ fn spgrm_stream_bed_to_jxgrm_core(
     let packed_flat = &mmap[3..];
     let code4_lut = &packed_byte_lut().code4;
     let pool = get_cached_pool(threads).map_err(|e| e.to_string())?;
-    let stream_split_single_task = spgrm_single_diag_task_subtile_step(tasks.as_slice(), threads)
-        .is_some();
+    let stream_split_single_task =
+        spgrm_single_diag_task_subtile_step(tasks.as_slice(), threads).is_some();
     let blas_threads = if threads <= 1 {
         None
     } else if tasks.len() > 1 || stream_split_single_task {
@@ -3267,8 +3267,13 @@ mod tests {
             row_end: n,
         }];
         let sample_idx = (0..n).collect::<Vec<_>>();
-        let (stripe_scratch, task_accum) =
-            spgrm_build_stream_batch(task_batch.as_slice(), 4usize, sample_idx.as_slice(), n, 8usize);
+        let (stripe_scratch, task_accum) = spgrm_build_stream_batch(
+            task_batch.as_slice(),
+            4usize,
+            sample_idx.as_slice(),
+            n,
+            8usize,
+        );
         assert_eq!(stripe_scratch.len(), 1usize);
         assert_eq!(task_accum.len(), 1usize);
         assert!(!task_accum[0].accum_row_major);

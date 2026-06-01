@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import gc
 import hashlib
 import logging
 import os
@@ -814,6 +815,108 @@ def _prepare_packed_bed_once_for_gwas(
             f"active_rows={active_row_idx.shape[0]}"
         )
     return str(prefix), full_ids, packed_ctx, sites_all
+
+
+def _packed_lowrank_scan_to_tsv(
+    *,
+    mod: object,
+    packed: np.ndarray,
+    packed_n: int,
+    packed_row_idx: np.ndarray,
+    row_flip: np.ndarray,
+    maf: np.ndarray,
+    miss: np.ndarray,
+    sites_all: list[tuple[object, ...]],
+    sample_idx_trait: np.ndarray,
+    out_tsv: str,
+    chunk_size: int,
+    threads: int,
+    genetic_model: str,
+    progress_callback=None,
+) -> int:
+    if not hasattr(jxrs, "bed_packed_decode_rows_f32"):
+        raise RuntimeError(
+            "Rust extension missing bed_packed_decode_rows_f32 required by packed low-rank GWAS scan."
+        )
+    if not hasattr(jxrs, "GwasAssocTsvWriter") or not hasattr(jxrs, "SiteInfo"):
+        raise RuntimeError(
+            "Rust extension missing GwasAssocTsvWriter/SiteInfo required by packed low-rank GWAS scan."
+        )
+
+    total = int(len(sites_all))
+    if total != int(packed_row_idx.shape[0]):
+        raise ValueError(
+            f"packed low-rank scan metadata mismatch: sites={total}, active_rows={packed_row_idx.shape[0]}"
+        )
+    sample_idx_arr = np.ascontiguousarray(
+        np.asarray(sample_idx_trait, dtype=np.int64).reshape(-1),
+        dtype=np.int64,
+    )
+    writer = jxrs.GwasAssocTsvWriter(str(out_tsv), genetic_model=str(genetic_model))
+    step = int(max(1, chunk_size))
+    done = 0
+    try:
+        for start in range(0, total, step):
+            end = min(start + step, total)
+            src_rows = np.ascontiguousarray(
+                np.asarray(packed_row_idx[start:end], dtype=np.int64).reshape(-1),
+                dtype=np.int64,
+            )
+            packed_subset = np.ascontiguousarray(
+                np.asarray(packed[src_rows, :], dtype=np.uint8),
+                dtype=np.uint8,
+            )
+            maf_blk = np.ascontiguousarray(
+                np.asarray(maf[start:end], dtype=np.float32).reshape(-1),
+                dtype=np.float32,
+            )
+            miss_blk = np.ascontiguousarray(
+                np.asarray(miss[start:end], dtype=np.float32).reshape(-1),
+                dtype=np.float32,
+            )
+            flip_blk = np.ascontiguousarray(
+                np.asarray(row_flip[start:end], dtype=np.bool_).reshape(-1),
+                dtype=np.bool_,
+            )
+            local_rows = np.ascontiguousarray(
+                np.arange(int(end - start), dtype=np.int64),
+                dtype=np.int64,
+            )
+            geno_blk = np.ascontiguousarray(
+                np.asarray(
+                    jxrs.bed_packed_decode_rows_f32(
+                        packed_subset,
+                        int(packed_n),
+                        local_rows,
+                        flip_blk,
+                        maf_blk,
+                        sample_indices=sample_idx_arr,
+                    ),
+                    dtype=np.float32,
+                ),
+                dtype=np.float32,
+            )
+            res_blk = np.ascontiguousarray(
+                np.asarray(mod.gwas(geno_blk, threads=max(1, int(threads))), dtype=np.float64),
+                dtype=np.float64,
+            )
+            site_objs: list[object] = []
+            snp_blk: list[str] = []
+            for site in sites_all[start:end]:
+                c, p, a0, a1, sid = _site_tuple_parts(site)
+                site_objs.append(jxrs.SiteInfo(str(c), int(p), str(sid), str(a0), str(a1)))
+                snp_blk.append(str(sid))
+            writer.write_chunk(site_objs, snp_blk, maf_blk, miss_blk, res_blk)
+            done = int(end)
+            if progress_callback is not None:
+                progress_callback(done, total)
+        writer.flush()
+        return int(done)
+    finally:
+        try:
+            writer.close()
+        except Exception:
+            pass
 
 
 def _packed_preload_ready_state(
@@ -2184,8 +2287,6 @@ def run_fastlmm_packed_fullrank(
                 raise ValueError(
                     f"Trait GRM shape mismatch: got {grm_fit.shape}, expected ({n_idv}, {n_idv})."
                 )
-        grm_diag_raw = np.array(np.diag(grm_fit), dtype=np.float64, copy=True)
-
         evd_t0 = time.monotonic()
         with CliStatus(
             "Running FastLMM Eigen-Decomposition...",
@@ -2206,9 +2307,8 @@ def run_fastlmm_packed_fullrank(
                 raise
         # Keep explicit elapsed in case backend timing is unavailable/zero.
         evd_secs = max(float(evd_secs), max(time.monotonic() - evd_t0, 0.0))
-        # LAPACK eigh returns ascending eigenvalues. The packed Rust scan kernel
-        # consumes leading k components, so reorder to descending first and
-        # implicitly drop the smallest component when k = n-1.
+        # LAPACK eigh returns ascending eigenvalues. Reorder descending so the
+        # downstream full-rank spectral scan path sees a stable leading-to-trailing order.
         try:
             ord_desc = np.argsort(np.asarray(eigvals, dtype=np.float64))[::-1]
             eigvals = np.asarray(eigvals, dtype=np.float64)[ord_desc]
@@ -2216,112 +2316,40 @@ def run_fastlmm_packed_fullrank(
         except Exception:
             eigvals = np.asarray(eigvals, dtype=np.float64)
             eigvecs = np.asarray(eigvecs, dtype=np.float64)
-        s_trait = np.ascontiguousarray(np.maximum(eigvals, 0.0), dtype=np.float32)
-        u_sub = np.ascontiguousarray(eigvecs, dtype=np.float32)
-        if u_sub.shape != (n_idv, n_idv):
+        if eigvecs.shape != (n_idv, n_idv):
             raise ValueError(
-                f"Trait eigenvector shape mismatch: got {u_sub.shape}, expected ({n_idv}, {n_idv})."
+                f"Trait eigenvector shape mismatch: got {eigvecs.shape}, expected ({n_idv}, {n_idv})."
             )
-        # FastLMM fixed-lambda mode on packed path:
-        # estimate lambda once from null model, then scan with fixed_lbd.
+        with _gwas_evd_stage_ctx(max(1, int(threads))):
+            shared_lmm_mod = LMM.from_spectral(
+                y=y_vec,
+                X=x_arg,
+                eigvals=eigvals,
+                eigvecs=eigvecs,
+                evd_secs=float(evd_secs),
+            )
+            null_fast_mod = FastLMM.from_lmm(shared_lmm_mod)
+
         fixed_lbd: Optional[float] = None
         fixed_ml0: Optional[float] = None
-        if (
-            str(genetic_model).lower() == "add"
-            and hasattr(jxrs, "fastlmm_reml_null_f32")
-        ):
-            try:
-                k_trait = max(1, int(n_idv) - 1)
-                s_null = np.ascontiguousarray(
-                    np.maximum(np.asarray(eigvals[:k_trait], dtype=np.float64), 0.0),
-                    dtype=np.float64,
-                )
-                u_null = np.ascontiguousarray(
-                    np.asarray(eigvecs[:, :k_trait], dtype=np.float64),
-                    dtype=np.float64,
-                )
-                x_full = np.ascontiguousarray(
-                    np.concatenate(
-                        [np.ones((int(x_cov.shape[0]), 1), dtype=np.float64), x_cov],
-                        axis=1,
-                    ),
-                    dtype=np.float64,
-                )
-                with _gwas_evd_stage_ctx(max(1, int(threads))):
-                    u1tx = np.ascontiguousarray(u_null.T @ x_full, dtype=np.float64)
-                    u1ty = np.ascontiguousarray((u_null.T @ y_vec).reshape(-1), dtype=np.float64)
-                    u2tx = np.ascontiguousarray(x_full - (u_null @ u1tx), dtype=np.float64)
-                    u2ty = np.ascontiguousarray(y_vec - (u_null @ u1ty), dtype=np.float64)
-                lbd0, ml0_0, _reml0_0 = jxrs.fastlmm_reml_null_f32(
-                    s_null,
-                    u1tx,
-                    u2tx,
-                    u1ty,
-                    u2ty,
-                    -5.0,
-                    5.0,
-                    50,
-                    1e-2,
-                    "add",
-                )
-                if np.isfinite(float(lbd0)) and float(lbd0) > 0.0 and np.isfinite(float(ml0_0)):
-                    fixed_lbd = float(lbd0)
-                    fixed_ml0 = float(ml0_0)
-            except Exception as ex:
-                _emit_warning_line(
-                    logger,
-                    f"FastLMM fixed-lambda estimate unavailable; fallback to in-kernel search. reason={ex}",
-                    use_spinner=bool(use_spinner),
-                )
-                fixed_lbd = None
-                fixed_ml0 = None
-
-        null_pve: Optional[float] = None
-        null_ml0: Optional[float] = fixed_ml0
         try:
-            vg0 = float(np.mean(np.asarray(s_trait, dtype=np.float64)))
-            if (
-                fixed_lbd is not None
-                and np.isfinite(vg0)
-                and np.isfinite(float(fixed_lbd))
-                and (vg0 + float(fixed_lbd)) > 0.0
-            ):
-                null_pve = float(vg0 / (vg0 + float(fixed_lbd)))
+            lbd0_tmp = float(getattr(null_fast_mod, "lbd_null"))
+            if np.isfinite(lbd0_tmp) and lbd0_tmp > 0.0:
+                fixed_lbd = float(lbd0_tmp)
+        except Exception:
+            fixed_lbd = None
+        try:
+            ml0_tmp = float(getattr(null_fast_mod, "ML0"))
+            if np.isfinite(ml0_tmp):
+                fixed_ml0 = float(ml0_tmp)
+        except Exception:
+            fixed_ml0 = None
+        try:
+            pve_tmp = float(getattr(null_fast_mod, "pve"))
+            null_pve = pve_tmp if np.isfinite(pve_tmp) else None
         except Exception:
             null_pve = None
-
-        if (not bool(force_model)) and (null_pve is None or null_ml0 is None):
-            try:
-                py_fast_t0 = time.monotonic()
-                stage_threads = max(1, int(threads))
-                with _gwas_evd_stage_ctx(stage_threads):
-                    kinship_raw = np.array(grm_fit, dtype=np.float64, copy=True)
-                    np.fill_diagonal(kinship_raw, grm_diag_raw)
-                    null_fast_mod = FastLMM(
-                        y=y_vec,
-                        X=x_arg,
-                        # Use the raw trait GRM here; FastLMM/LMM adds its own ridge.
-                        kinship=kinship_raw,
-                    )
-                evd_secs += max(time.monotonic() - py_fast_t0, 0.0)
-                try:
-                    pve_tmp = float(getattr(null_fast_mod, "pve"))
-                    if np.isfinite(pve_tmp):
-                        null_pve = pve_tmp
-                except Exception:
-                    pass
-                try:
-                    ml0_tmp = float(getattr(null_fast_mod, "ML0"))
-                    if np.isfinite(ml0_tmp):
-                        null_ml0 = ml0_tmp
-                except Exception:
-                    pass
-            except Exception as ex:
-                _emit_warning_line(
-                    logger,
-                    f"FastLMM Python null fallback unavailable for switch decision; continuing without pre-scan switch. reason={ex}",
-                    use_spinner=bool(use_spinner),
-                )
+        null_ml0: Optional[float] = fixed_ml0
 
         if (not bool(force_model)) and _fastlmm_should_switch_to_lmm(null_pve):
             prev_pve = float(null_pve) if null_pve is not None else float("nan")
@@ -2420,6 +2448,12 @@ def run_fastlmm_packed_fullrank(
                     logger.info("")
                 continue
 
+        if bool(getattr(null_fast_mod, "lowrank", False)):
+            eigvals = None
+            eigvecs = None
+            grm_fit = None
+            gc.collect()
+
         # FastLMM packed currently exposes only scan-stage progress. Keep a
         # placeholder stage-1 handle so shared cleanup code remains safe.
         stage1_pbar: Optional[_ProgressAdapter] = None
@@ -2474,104 +2508,133 @@ def run_fastlmm_packed_fullrank(
         reml0 = float("nan")
         scan_secs = 0.0
         try:
-            u_trait = np.zeros((int(packed_n), int(n_idv)), dtype=np.float32)
-            u_trait[sample_idx_trait, :] = u_sub
             scan_t0 = time.monotonic()
             with _gwas_scan_stage_ctx(max(1, int(threads))):
-                progress_kwargs: dict[str, object] = {
-                    "progress_callback": None,
-                    "progress_every": 0,
-                }
-                if gwas_pbar is not None:
-                    progress_kwargs = {
-                        "progress_callback": _fastlmm_progress,
-                        "progress_every": int(max(1, min(gwas_total, int(max(1, chunk_size))))),
+                if bool(getattr(null_fast_mod, "lowrank", False)):
+                    _written_rows = _packed_lowrank_scan_to_tsv(
+                        mod=null_fast_mod,
+                        packed=packed,
+                        packed_n=int(packed_n),
+                        packed_row_idx=packed_row_idx,
+                        row_flip=row_flip,
+                        maf=maf,
+                        miss=miss,
+                        sites_all=sites_all,
+                        sample_idx_trait=sample_idx_trait,
+                        out_tsv=str(tmp_tsv),
+                        chunk_size=int(max(1, int(chunk_size))),
+                        threads=int(max(1, int(threads))),
+                        genetic_model=str(genetic_model),
+                        progress_callback=_fastlmm_progress if gwas_pbar is not None else None,
+                    )
+                    if int(_written_rows) != int(len(sites_all)):
+                        _emit_warning_line(
+                            logger,
+                            f"FastLMM low-rank writer row mismatch: expected={len(sites_all)} wrote={int(_written_rows)}",
+                            use_spinner=bool(use_spinner),
+                        )
+                    lbd = float(getattr(null_fast_mod, "lbd_null", np.nan))
+                    ml0 = float(getattr(null_fast_mod, "ML0", np.nan))
+                    reml0 = float(getattr(null_fast_mod, "LL0", np.nan))
+                else:
+                    u_sub = np.ascontiguousarray(np.asarray(eigvecs, dtype=np.float32), dtype=np.float32)
+                    s_trait = np.ascontiguousarray(np.maximum(eigvals, 0.0), dtype=np.float32)
+                    u_trait = np.zeros((int(packed_n), int(n_idv)), dtype=np.float32)
+                    u_trait[sample_idx_trait, :] = u_sub
+                    progress_kwargs: dict[str, object] = {
+                        "progress_callback": None,
+                        "progress_every": 0,
                     }
-                unified_done = False
-                if _gwas_use_rust_unified_v1():
-                    try:
-                        jobs = [
-                            {
-                                "model": "fastlmm",
-                                "trait": str(pname),
-                                "out_tsv": str(tmp_tsv),
-                                "y": y_vec,
-                                "x": x_arg,
-                                "u": u_trait,
-                                "s": s_trait,
-                                "sample_indices": sample_idx_trait,
-                                "low": -5.0,
-                                "high": 5.0,
-                                "max_iter": 50,
-                                "tol": 1e-2,
-                                "tau": 0.0,
-                                "genetic_model": str(genetic_model),
-                                "fixed_lbd": (float(fixed_lbd) if fixed_lbd is not None else None),
-                                "fixed_ml0": (float(fixed_ml0) if fixed_ml0 is not None else None),
-                                "scan_progress_callback": _fastlmm_progress,
-                                "progress_every": int(max(1, int(chunk_size))),
-                            }
-                        ]
-                        _res = jxrs.gwas_packed_unified_to_tsv(
-                            jobs,
+                    if gwas_pbar is not None:
+                        progress_kwargs = {
+                            "progress_callback": _fastlmm_progress,
+                            "progress_every": int(max(1, min(gwas_total, int(max(1, chunk_size))))),
+                        }
+                    unified_done = False
+                    if _gwas_use_rust_unified_v1():
+                        try:
+                            jobs = [
+                                {
+                                    "model": "fastlmm",
+                                    "trait": str(pname),
+                                    "out_tsv": str(tmp_tsv),
+                                    "y": y_vec,
+                                    "x": x_arg,
+                                    "u": u_trait,
+                                    "s": s_trait,
+                                    "sample_indices": sample_idx_trait,
+                                    "low": -5.0,
+                                    "high": 5.0,
+                                    "max_iter": 50,
+                                    "tol": 1e-2,
+                                    "tau": 0.0,
+                                    "genetic_model": str(genetic_model),
+                                    "fixed_lbd": (float(fixed_lbd) if fixed_lbd is not None else None),
+                                    "fixed_ml0": (float(fixed_ml0) if fixed_ml0 is not None else None),
+                                    "scan_progress_callback": _fastlmm_progress,
+                                    "progress_every": int(max(1, int(chunk_size))),
+                                }
+                            ]
+                            _res = jxrs.gwas_packed_unified_to_tsv(
+                                jobs,
+                                packed,
+                                int(packed_n),
+                                row_flip,
+                                maf,
+                                miss,
+                                chrom_all,
+                                pos_all,
+                                snp_all,
+                                allele0_all,
+                                allele1_all,
+                                int(max(1, int(chunk_size))),
+                                int(threads),
+                                None,
+                                int(max(1, int(chunk_size))),
+                                row_indices=packed_row_idx,
+                            )
+                            r0 = _res[0]
+                            lbd = float(r0.get("lbd", np.nan))
+                            ml0 = float(r0.get("ml0", np.nan))
+                            reml0 = float(r0.get("reml0", np.nan))
+                            unified_done = True
+                        except Exception as ex:
+                            _emit_warning_line(
+                                logger,
+                                f"FastLMM unified Rust dispatcher unavailable; fallback to legacy packed FastLMM. reason={ex}",
+                                use_spinner=bool(use_spinner),
+                            )
+                            unified_done = False
+                    if not unified_done:
+                        lbd, ml0, reml0 = jxrs.fastlmm_assoc_packed_f32_to_tsv(
                             packed,
                             int(packed_n),
                             row_flip,
                             maf,
                             miss,
+                            u_trait,
+                            s_trait,
+                            y_vec,
+                            x_arg,
+                            sample_idx_trait,
+                            -5.0,
+                            5.0,
+                            50,
+                            1e-2,
+                            0.0,
+                            int(threads),
+                            str(genetic_model),
                             chrom_all,
                             pos_all,
                             snp_all,
                             allele0_all,
                             allele1_all,
-                            int(max(1, int(chunk_size))),
-                            int(threads),
-                            None,
-                            int(max(1, int(chunk_size))),
+                            tmp_tsv,
                             row_indices=packed_row_idx,
+                            fixed_lbd=(float(fixed_lbd) if fixed_lbd is not None else None),
+                            fixed_ml0=(float(fixed_ml0) if fixed_ml0 is not None else None),
+                            **progress_kwargs,
                         )
-                        r0 = _res[0]
-                        lbd = float(r0.get("lbd", np.nan))
-                        ml0 = float(r0.get("ml0", np.nan))
-                        reml0 = float(r0.get("reml0", np.nan))
-                        unified_done = True
-                    except Exception as ex:
-                        _emit_warning_line(
-                            logger,
-                            f"FastLMM unified Rust dispatcher unavailable; fallback to legacy packed FastLMM. reason={ex}",
-                            use_spinner=bool(use_spinner),
-                        )
-                        unified_done = False
-                if not unified_done:
-                    lbd, ml0, reml0 = jxrs.fastlmm_assoc_packed_f32_to_tsv(
-                        packed,
-                        int(packed_n),
-                        row_flip,
-                        maf,
-                        miss,
-                        u_trait,
-                        s_trait,
-                        y_vec,
-                        x_arg,
-                        sample_idx_trait,
-                        -5.0,
-                        5.0,
-                        50,
-                        1e-2,
-                        0.0,
-                        int(threads),
-                        str(genetic_model),
-                        chrom_all,
-                        pos_all,
-                        snp_all,
-                        allele0_all,
-                        allele1_all,
-                        tmp_tsv,
-                        row_indices=packed_row_idx,
-                        fixed_lbd=(float(fixed_lbd) if fixed_lbd is not None else None),
-                        fixed_ml0=(float(fixed_ml0) if fixed_ml0 is not None else None),
-                        **progress_kwargs,
-                    )
             scan_secs = max(time.monotonic() - scan_t0, 0.0)
             gwas_ok = True
         finally:
@@ -2596,13 +2659,21 @@ def run_fastlmm_packed_fullrank(
                 _cleanup_gwas_result_tmp(tmp_tsv)
 
         pve = None
-        try:
-            vg = float(np.mean(np.asarray(s_trait, dtype=np.float64)))
-            lbd_v = float(lbd)
-            if np.isfinite(vg) and np.isfinite(lbd_v) and (vg + lbd_v) > 0:
-                pve = vg / (vg + lbd_v)
-        except Exception:
-            pve = None
+        if bool(getattr(null_fast_mod, "lowrank", False)):
+            try:
+                pve_tmp = float(getattr(null_fast_mod, "pve"))
+                if np.isfinite(pve_tmp):
+                    pve = pve_tmp
+            except Exception:
+                pve = None
+        else:
+            try:
+                vg = float(np.mean(np.asarray(s_trait, dtype=np.float64)))
+                lbd_v = float(lbd)
+                if np.isfinite(vg) and np.isfinite(lbd_v) and (vg + lbd_v) > 0:
+                    pve = vg / (vg + lbd_v)
+            except Exception:
+                pve = None
 
         _finalize_gwas_result_tsv(tmp_tsv, out_tsv, prefix, logger=logger)
         saved_paths.append(str(out_tsv))
@@ -3556,19 +3627,11 @@ def run_lmm_packed_fullrank(
             use_spinner=bool(use_spinner),
         )
 
+        if bool(getattr(mod, "lowrank", False)):
+            Ksub = None
+            gc.collect()
+
         sample_idx_trait = np.ascontiguousarray(sample_map[keep_idx], dtype=np.int64)
-        # Exact LMM route: per-SNP REML lambda re-estimation.
-        s_trait = np.ascontiguousarray(
-            np.maximum(np.asarray(mod.S, dtype=np.float64).reshape(-1), 0.0),
-            dtype=np.float64,
-        )
-        u_t = np.ascontiguousarray(np.asarray(mod.Dh, dtype=np.float32), dtype=np.float32)
-        if u_t.shape != (n_idv, n_idv):
-            raise ValueError(
-                f"Trait eigenvector shape mismatch: got {u_t.shape}, expected ({n_idv}, {n_idv})."
-            )
-        x_rot = np.ascontiguousarray(np.asarray(mod.Xcov, dtype=np.float64), dtype=np.float64)
-        y_rot = np.ascontiguousarray(np.asarray(mod.y, dtype=np.float64).reshape(-1), dtype=np.float64)
 
         gwas_t0 = time.monotonic()
         gwas_total = int(len(sites_all))
@@ -3619,56 +3682,85 @@ def run_lmm_packed_fullrank(
             out_tsv = f"{outprefix}.{pname_tag}.{gm_tag}.lmm.tsv"
         tmp_tsv = _gwas_result_tmp_path(out_tsv)
         try:
-            progress_kwargs: dict[str, object] = {}
-            if gwas_pbar is not None:
-                progress_kwargs = {
-                    "progress_callback": _lmm_progress,
-                    "progress_every": int(max(1, int(chunk_size))),
-                }
             with _gwas_scan_stage_ctx(max(1, int(threads))):
-                null_ml0: Optional[float] = None
-                init_log10_lbd: Optional[float] = None
-                try:
-                    ml0_tmp = float(getattr(mod, "ML0"))
-                    if np.isfinite(ml0_tmp):
-                        null_ml0 = ml0_tmp
-                except Exception:
-                    null_ml0 = None
-                try:
-                    lbd0_tmp = float(getattr(mod, "lbd_null"))
-                    if np.isfinite(lbd0_tmp) and lbd0_tmp > 0.0:
-                        init_log10_lbd = float(np.log10(lbd0_tmp))
-                except Exception:
-                    init_log10_lbd = None
+                if bool(getattr(mod, "lowrank", False)):
+                    _written_rows = _packed_lowrank_scan_to_tsv(
+                        mod=mod,
+                        packed=packed,
+                        packed_n=int(packed_n),
+                        packed_row_idx=packed_row_idx,
+                        row_flip=row_flip,
+                        maf=maf,
+                        miss=miss,
+                        sites_all=sites_all,
+                        sample_idx_trait=sample_idx_trait,
+                        out_tsv=str(tmp_tsv),
+                        chunk_size=int(max(1, int(chunk_size))),
+                        threads=int(max(1, int(threads))),
+                        genetic_model=str(genetic_model),
+                        progress_callback=_lmm_progress if gwas_pbar is not None else None,
+                    )
+                else:
+                    progress_kwargs: dict[str, object] = {}
+                    if gwas_pbar is not None:
+                        progress_kwargs = {
+                            "progress_callback": _lmm_progress,
+                            "progress_every": int(max(1, int(chunk_size))),
+                        }
+                    null_ml0: Optional[float] = None
+                    init_log10_lbd: Optional[float] = None
+                    try:
+                        ml0_tmp = float(getattr(mod, "ML0"))
+                        if np.isfinite(ml0_tmp):
+                            null_ml0 = ml0_tmp
+                    except Exception:
+                        null_ml0 = None
+                    try:
+                        lbd0_tmp = float(getattr(mod, "lbd_null"))
+                        if np.isfinite(lbd0_tmp) and lbd0_tmp > 0.0:
+                            init_log10_lbd = float(np.log10(lbd0_tmp))
+                    except Exception:
+                        init_log10_lbd = None
+                    s_trait = np.ascontiguousarray(
+                        np.maximum(np.asarray(mod.S, dtype=np.float64).reshape(-1), 0.0),
+                        dtype=np.float64,
+                    )
+                    u_t = np.ascontiguousarray(np.asarray(mod.Dh, dtype=np.float32), dtype=np.float32)
+                    if u_t.shape != (n_idv, n_idv):
+                        raise ValueError(
+                            f"Trait eigenvector shape mismatch: got {u_t.shape}, expected ({n_idv}, {n_idv})."
+                        )
+                    x_rot = np.ascontiguousarray(np.asarray(mod.Xcov, dtype=np.float64), dtype=np.float64)
+                    y_rot = np.ascontiguousarray(np.asarray(mod.y, dtype=np.float64).reshape(-1), dtype=np.float64)
 
-                _written_rows = jxrs.lmm_reml_assoc_packed_f32_to_tsv(
-                    packed,
-                    int(packed_n),
-                    row_flip,
-                    maf,
-                    miss,
-                    s_trait,
-                    x_rot,
-                    y_rot,
-                    u_t,
-                    chrom_all,
-                    pos_all,
-                    snp_all,
-                    allele0_all,
-                    allele1_all,
-                    tmp_tsv,
-                    sample_idx_trait,
-                    row_indices=packed_row_idx,
-                    low=-5.0,
-                    high=5.0,
-                    max_iter=50,
-                    tol=1e-2,
-                    threads=int(threads),
-                    model="add",
-                    nullml=null_ml0,
-                    init_log10_lbd=init_log10_lbd,
-                    **progress_kwargs,
-                )
+                    _written_rows = jxrs.lmm_reml_assoc_packed_f32_to_tsv(
+                        packed,
+                        int(packed_n),
+                        row_flip,
+                        maf,
+                        miss,
+                        s_trait,
+                        x_rot,
+                        y_rot,
+                        u_t,
+                        chrom_all,
+                        pos_all,
+                        snp_all,
+                        allele0_all,
+                        allele1_all,
+                        tmp_tsv,
+                        sample_idx_trait,
+                        row_indices=packed_row_idx,
+                        low=-5.0,
+                        high=5.0,
+                        max_iter=50,
+                        tol=1e-2,
+                        threads=int(threads),
+                        model="add",
+                        nullml=null_ml0,
+                        init_log10_lbd=init_log10_lbd,
+                        **progress_kwargs,
+                    )
                 if int(_written_rows) != int(len(sites_all)):
                     _emit_warning_line(
                         logger,

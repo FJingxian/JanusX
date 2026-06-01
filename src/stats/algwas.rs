@@ -6202,7 +6202,12 @@ pub fn algwas_packed_to_tsv(
     if row_flip.len() != m || row_maf.len() != m || row_missing.len() != m {
         return Err(PyRuntimeError::new_err("row metadata length mismatch"));
     }
-    if chrom.len() != m || pos.len() != m || snp.len() != m || allele0.len() != m || allele1.len() != m {
+    if chrom.len() != m
+        || pos.len() != m
+        || snp.len() != m
+        || allele0.len() != m
+        || allele1.len() != m
+    {
         return Err(PyRuntimeError::new_err("metadata length mismatch"));
     }
 

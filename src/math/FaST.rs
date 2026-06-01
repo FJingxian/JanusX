@@ -1,5 +1,180 @@
-use super::*;
+use numpy::ndarray::{Array1, Array2};
+use numpy::{PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
+use pyo3::exceptions::PyRuntimeError;
+use pyo3::prelude::*;
+use pyo3::Bound;
+use pyo3::BoundObject;
+use rayon::prelude::*;
+use std::borrow::Cow;
+use std::f64::consts::PI;
+use std::sync::Arc;
+use std::time::Instant;
+
 use crate::bedmath::decode_plink_bed_hardcall;
+use crate::blas::{
+    cblas_sgemm_dispatch, CblasInt, OpenBlasThreadGuard, CBLAS_COL_MAJOR, CBLAS_NO_TRANS,
+    CBLAS_TRANS,
+};
+use crate::brent::brent_minimize;
+use crate::eigh::symmetric_eigh_f64_row_major;
+use crate::stats_common::check_ctrlc;
+
+#[pyfunction]
+#[pyo3(signature = (eigvals, eigvecs, x, y, rel_tol=1e-8))]
+pub fn fastlmm_prepare_lowrank_f64<'py>(
+    py: Python<'py>,
+    eigvals: PyReadonlyArray1<'py, f64>,
+    eigvecs: PyReadonlyArray2<'py, f64>,
+    x: PyReadonlyArray2<'py, f64>,
+    y: PyReadonlyArray1<'py, f64>,
+    rel_tol: f64,
+) -> PyResult<(
+    usize,
+    f64,
+    Bound<'py, PyArray1<f64>>,
+    Bound<'py, PyArray2<f32>>,
+    Bound<'py, PyArray2<f64>>,
+    Bound<'py, PyArray2<f64>>,
+    Bound<'py, PyArray1<f64>>,
+    Bound<'py, PyArray1<f64>>,
+)> {
+    let evals = eigvals.as_slice()?;
+    let y_slice = y.as_slice()?;
+    let x_arr = x.as_array();
+    let u_arr = eigvecs.as_array();
+
+    if evals.is_empty() {
+        return Err(PyRuntimeError::new_err("eigvals must not be empty"));
+    }
+    let n = evals.len();
+    if y_slice.len() != n {
+        return Err(PyRuntimeError::new_err(format!(
+            "y length mismatch: got {}, expected {n}",
+            y_slice.len()
+        )));
+    }
+    if x_arr.ndim() != 2 || x_arr.shape()[0] != n {
+        return Err(PyRuntimeError::new_err(format!(
+            "x must have shape ({n}, p), got {:?}",
+            x_arr.shape()
+        )));
+    }
+    if u_arr.ndim() != 2 || u_arr.shape()[0] != n || u_arr.shape()[1] != n {
+        return Err(PyRuntimeError::new_err(format!(
+            "eigvecs must have shape ({n}, {n}), got {:?}",
+            u_arr.shape()
+        )));
+    }
+    if !(rel_tol.is_finite() && rel_tol >= 0.0) {
+        return Err(PyRuntimeError::new_err("rel_tol must be finite and >= 0"));
+    }
+
+    let p = x_arr.shape()[1];
+    let x_slice: Cow<[f64]> = match x.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(x_arr.iter().copied().collect()),
+    };
+    let u_slice: Cow<[f64]> = match eigvecs.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(u_arr.iter().copied().collect()),
+    };
+
+    let lambda_max = evals
+        .iter()
+        .copied()
+        .fold(0.0_f64, |acc, v| if v > acc { v } else { acc });
+    let threshold = if lambda_max > 0.0 {
+        rel_tol * lambda_max
+    } else {
+        f64::INFINITY
+    };
+    let keep: Vec<usize> = evals
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, &v)| {
+            if v.is_finite() && v > threshold {
+                Some(idx)
+            } else {
+                None
+            }
+        })
+        .collect();
+    let k = keep.len();
+
+    let trace_mean = evals
+        .iter()
+        .copied()
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .sum::<f64>()
+        / (n as f64);
+
+    let mut s_keep = vec![0.0_f64; k];
+    let mut u1t = vec![0.0_f32; k * n];
+    for (out_r, &col_idx) in keep.iter().enumerate() {
+        s_keep[out_r] = evals[col_idx];
+        for row in 0..n {
+            let v = u_slice[row * n + col_idx];
+            u1t[out_r * n + row] = v as f32;
+        }
+    }
+
+    let mut u1tx = vec![0.0_f64; k * p];
+    let mut u1ty = vec![0.0_f64; k];
+    let mut u2tx = x_slice.to_vec();
+    let mut u2ty = y_slice.to_vec();
+
+    for r in 0..k {
+        let u_row = &u1t[r * n..(r + 1) * n];
+        let mut proj_y = 0.0_f64;
+        for i in 0..n {
+            proj_y += (u_row[i] as f64) * y_slice[i];
+        }
+        u1ty[r] = proj_y;
+        for c in 0..p {
+            let mut proj_x = 0.0_f64;
+            for i in 0..n {
+                proj_x += (u_row[i] as f64) * x_slice[i * p + c];
+            }
+            u1tx[r * p + c] = proj_x;
+        }
+    }
+
+    for i in 0..n {
+        for r in 0..k {
+            let uir = u1t[r * n + i] as f64;
+            u2ty[i] -= uir * u1ty[r];
+        }
+        for c in 0..p {
+            let mut corr = 0.0_f64;
+            for r in 0..k {
+                corr += (u1t[r * n + i] as f64) * u1tx[r * p + c];
+            }
+            u2tx[i * p + c] -= corr;
+        }
+    }
+
+    let s_keep_arr = Array1::from_vec(s_keep);
+    let u1t_arr =
+        Array2::from_shape_vec((k, n), u1t).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let u1tx_arr =
+        Array2::from_shape_vec((k, p), u1tx).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let u2tx_arr =
+        Array2::from_shape_vec((n, p), u2tx).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let u1ty_arr = Array1::from_vec(u1ty);
+    let u2ty_arr = Array1::from_vec(u2ty);
+
+    #[allow(deprecated)]
+    Ok((
+        k,
+        trace_mean,
+        PyArray1::from_owned_array(py, s_keep_arr).into_bound(),
+        PyArray2::from_owned_array(py, u1t_arr).into_bound(),
+        PyArray2::from_owned_array(py, u1tx_arr).into_bound(),
+        PyArray2::from_owned_array(py, u2tx_arr).into_bound(),
+        PyArray1::from_owned_array(py, u1ty_arr).into_bound(),
+        PyArray1::from_owned_array(py, u2ty_arr).into_bound(),
+    ))
+}
 
 #[inline]
 fn marker_rankk_update_from_snp_major(

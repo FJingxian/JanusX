@@ -629,7 +629,9 @@ fn write_farmcpu_packed_main_scan(
     let mut stats_buf = vec![f64::NAN; row_block * 3];
     let mut text_buf = String::with_capacity(row_block * 128);
     let mut qtn_text_buf_opt = if qtn_writer.is_some() {
-        Some(String::with_capacity(row_block.min(qtn_lookup.len().max(1)) * 128))
+        Some(String::with_capacity(
+            row_block.min(qtn_lookup.len().max(1)) * 128,
+        ))
     } else {
         None
     };
@@ -646,8 +648,7 @@ fn write_farmcpu_packed_main_scan(
                     let idx = row_start + local_idx;
                     scr.reset_xs();
                     let src_row = row_indices.map(|v| v[idx]).unwrap_or(idx);
-                    let row =
-                        &packed_flat[src_row * bytes_per_snp..(src_row + 1) * bytes_per_snp];
+                    let row = &packed_flat[src_row * bytes_per_snp..(src_row + 1) * bytes_per_snp];
                     let flip = row_flip[idx];
                     let mean_g = (2.0_f64 * row_maf[idx] as f64).max(0.0);
                     let mut sy = 0.0_f64;
@@ -1285,7 +1286,12 @@ pub fn farmcpu_packed_to_tsv(
     if m == 0 {
         return Err(PyRuntimeError::new_err("empty packed marker matrix"));
     }
-    if chrom.len() != m || pos.len() != m || snp.len() != m || allele0.len() != m || allele1.len() != m {
+    if chrom.len() != m
+        || pos.len() != m
+        || snp.len() != m
+        || allele0.len() != m
+        || allele1.len() != m
+    {
         return Err(PyRuntimeError::new_err(format!(
             "metadata length mismatch: m={m}, chrom={}, pos={}, snp={}, allele0={}, allele1={}",
             chrom.len(),
@@ -1967,9 +1973,7 @@ pub fn farmcpu_write_assoc_tsv(
                     plrt
                 )
                 .map_err(|e| {
-                    PyRuntimeError::new_err(format!(
-                        "format qtn row {idx} for {pseudo_path}: {e}"
-                    ))
+                    PyRuntimeError::new_err(format!("format qtn row {idx} for {pseudo_path}: {e}"))
                 })?;
                 if q_text_buf.len() >= 512 * 1024 {
                     q_writer

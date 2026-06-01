@@ -570,8 +570,8 @@ fn prepare_splmm_assoc_inputs<'py>(
     }
 
     let use_external_packed = packed.is_some() || packed_n_samples > 0;
-    let use_external_mmap_meta =
-        !use_external_packed && (maf.is_some() || row_flip.is_some() || row_missing.is_some() || row_indices.is_some());
+    let use_external_mmap_meta = !use_external_packed
+        && (maf.is_some() || row_flip.is_some() || row_missing.is_some() || row_indices.is_some());
     let site_keep_full = if let Some(site_keep) = site_keep {
         Some(match site_keep.as_slice() {
             Ok(s) => s.to_vec(),
@@ -600,7 +600,14 @@ fn prepare_splmm_assoc_inputs<'py>(
     };
 
     let scan_prepared = if use_external_packed {
-        prepare_external_packed_input(packed, packed_n_samples, maf, row_flip, row_missing, row_indices)?
+        prepare_external_packed_input(
+            packed,
+            packed_n_samples,
+            maf,
+            row_flip,
+            row_missing,
+            row_indices,
+        )?
     } else if use_external_mmap_meta {
         prepare_prefix_input_from_external_meta(
             &bed_prefix,
@@ -1225,12 +1232,12 @@ Set `JX_SPARSE_CHOLESKY_MAX_L_NNZ` to override, or fall back to operator PCG.",
             }
             Err(err) => {
                 last_err = Some(err);
-        emit_progress_callback(
-            progress_callback,
-            5,
-            (attempt_idx + 1).min(rel_shifts.len().max(1)),
-            rel_shifts.len().max(1),
-        )?;
+                emit_progress_callback(
+                    progress_callback,
+                    5,
+                    (attempt_idx + 1).min(rel_shifts.len().max(1)),
+                    rel_shifts.len().max(1),
+                )?;
             }
         }
     }
@@ -2351,8 +2358,9 @@ fn estimate_rhat_and_scan(
 
     let stage1_cb = stage1_progress_callback.as_ref();
     if let Some(prefix) = operator_prepared.bed_prefix.as_deref() {
-        let sparse_factor_sample_idx_ref =
-            sparse_factor_sample_idx.as_deref().unwrap_or(operator_sample_idx.as_slice());
+        let sparse_factor_sample_idx_ref = sparse_factor_sample_idx
+            .as_deref()
+            .unwrap_or(operator_sample_idx.as_slice());
         let sparse_expected_n = if sparse_jxgrm_path.is_some() {
             sparse_factor_sample_idx_ref.len()
         } else {
@@ -2581,8 +2589,9 @@ fn estimate_rhat_and_scan_to_tsv(
 ) -> Result<(f64, usize, PcgJxlmmNullModelInfo, PcgJxlmmRHatResult), String> {
     let stage1_cb = stage1_progress_callback.as_ref();
     if let Some(prefix) = operator_prepared.bed_prefix.as_deref() {
-        let sparse_factor_sample_idx_ref =
-            sparse_factor_sample_idx.as_deref().unwrap_or(operator_sample_idx.as_slice());
+        let sparse_factor_sample_idx_ref = sparse_factor_sample_idx
+            .as_deref()
+            .unwrap_or(operator_sample_idx.as_slice());
         let sparse_expected_n = if sparse_jxgrm_path.is_some() {
             sparse_factor_sample_idx_ref.len()
         } else {
@@ -2621,7 +2630,10 @@ fn estimate_rhat_and_scan_to_tsv(
             );
         }
     }
-    Err("SparseLMM direct-to-TSV scan currently requires sparse SparseLMM factorization path.".to_string())
+    Err(
+        "SparseLMM direct-to-TSV scan currently requires sparse SparseLMM factorization path."
+            .to_string(),
+    )
 }
 
 #[pyfunction]

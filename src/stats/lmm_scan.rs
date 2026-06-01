@@ -25,7 +25,6 @@ use crate::linalg::{
 };
 use crate::stats_common::{env_truthy, get_cached_pool, parse_index_vec_i64, AsyncTsvWriter};
 
-/// Solve `A x = b` from the in-place Cholesky factor `L` stored in `a`.
 fn cholesky_solve(a: &[f64], dim: usize, b: &[f64]) -> Vec<f64> {
     let mut y = vec![0.0_f64; dim];
     for i in 0..dim {
@@ -217,7 +216,6 @@ fn reml_loglike(
     if cholesky_inplace(&mut xtv_inv_x, dim).is_none() {
         return -1e8;
     }
-    let log_det_xtv_inv_x = cholesky_logdet(&xtv_inv_x, dim);
     let beta = cholesky_solve(&xtv_inv_x, dim, &xtv_inv_y);
 
     let mut r_vec = vec![0.0_f64; n];
@@ -240,10 +238,10 @@ fn reml_loglike(
     }
 
     let log_det_v: f64 = v.iter().map(|vv| vv.ln()).sum();
+    let log_det_xtv = cholesky_logdet(&xtv_inv_x, dim);
     let n_f = n as f64;
-    let p_f = dim as f64;
-
-    let total_log = (n_f - p_f) * (rtv_invr.ln()) + log_det_v + log_det_xtv_inv_x;
+    let p_f = p as f64;
+    let total_log = (n_f - p_f) * (rtv_invr.ln()) + log_det_v + log_det_xtv;
     let c = (n_f - p_f) * ((n_f - p_f).ln() - 1.0 - (2.0 * PI).ln()) / 2.0;
     let reml = c - 0.5 * total_log;
 
@@ -1698,7 +1696,6 @@ pub fn lmm_assoc_chunk_f32<'py>(
         }
     }
 
-    // symmetrize + ridge
     let ridge = 1e-6;
     for r in 0..p {
         a[r * p + r] += ridge;
@@ -1708,12 +1705,10 @@ pub fn lmm_assoc_chunk_f32<'py>(
         }
     }
 
-    // Cholesky(A) in-place; now a stores L
     if cholesky_inplace(&mut a, p).is_none() {
         return Err(PyRuntimeError::new_err("X'WX not SPD"));
     }
 
-    // Solve A^{-1} b once (no-alloc version into tmp)
     let mut a_inv_b = vec![0.0_f64; p];
     cholesky_solve_into(&a, p, &b, &mut a_inv_b);
 
@@ -1758,13 +1753,11 @@ pub fn lmm_assoc_chunk_f32<'py>(
                             }
                         }
 
-                        // a_inv_c = A^{-1} c (no alloc)
                         cholesky_solve_into(&a, p, &scr.c, &mut scr.a_inv_c);
 
                         // ct_aic = c' A^{-1} c
                         let ct_aic = dot_loop(&scr.c, &scr.a_inv_c);
                         let schur = d - ct_aic;
-
                         if schur <= 1e-12 || !schur.is_finite() {
                             out_row[0] = f64::NAN;
                             out_row[1] = f64::NAN;
@@ -1933,7 +1926,6 @@ pub fn lmm_assoc_chunk_from_snp_f32<'py>(
         }
     }
 
-    // symmetrize + ridge
     let ridge = 1e-6;
     for r in 0..p {
         a[r * p + r] += ridge;
@@ -1943,12 +1935,10 @@ pub fn lmm_assoc_chunk_from_snp_f32<'py>(
         }
     }
 
-    // Cholesky(A) in-place; now a stores L
     if cholesky_inplace(&mut a, p).is_none() {
         return Err(PyRuntimeError::new_err("X'WX not SPD"));
     }
 
-    // Solve A^{-1} b once (no-alloc version into tmp)
     let mut a_inv_b = vec![0.0_f64; p];
     cholesky_solve_into(&a, p, &b, &mut a_inv_b);
 
@@ -1998,7 +1988,6 @@ pub fn lmm_assoc_chunk_from_snp_f32<'py>(
                         cholesky_solve_into(&a, p, &scr.c, &mut scr.a_inv_c);
                         let ct_aic = dot_loop(&scr.c, &scr.a_inv_c);
                         let schur = d - ct_aic;
-
                         if schur <= 1e-12 || !schur.is_finite() {
                             out_row[0] = f64::NAN;
                             out_row[1] = f64::NAN;
@@ -2945,7 +2934,12 @@ pub fn lmm_reml_assoc_packed_f32_to_tsv<'py>(
             "row_flip/row_maf/row_missing length mismatch with packed rows",
         ));
     }
-    if chrom.len() != m || pos.len() != m || snp.len() != m || allele0.len() != m || allele1.len() != m {
+    if chrom.len() != m
+        || pos.len() != m
+        || snp.len() != m
+        || allele0.len() != m
+        || allele1.len() != m
+    {
         return Err(PyRuntimeError::new_err(format!(
             "TSV metadata length mismatch: rows={m}, chrom={}, pos={}, snp={}, allele0={}, allele1={}",
             chrom.len(),
@@ -4336,7 +4330,12 @@ pub fn fastlmm_assoc_packed_f32_to_tsv<'py>(
             row_missing.len()
         )));
     }
-    if chrom.len() != m || pos.len() != m || snp.len() != m || allele0.len() != m || allele1.len() != m {
+    if chrom.len() != m
+        || pos.len() != m
+        || snp.len() != m
+        || allele0.len() != m
+        || allele1.len() != m
+    {
         return Err(PyRuntimeError::new_err(format!(
             "TSV metadata length mismatch: rows={m}, chrom={}, pos={}, snp={}, allele0={}, allele1={}",
             chrom.len(),

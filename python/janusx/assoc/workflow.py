@@ -3380,7 +3380,11 @@ def _gwas_scan_stage_ctx(threads: int):
 def _resolve_gwas_eigh_driver(n_samples: int) -> str:
     raw = str(os.environ.get("JX_GWAS_EIGH_DRIVER", "")).strip().lower()
     if raw in {"dsyevd", "dsyevr", "auto"}:
+        if raw == "auto" and int(n_samples) >= 32768:
+            return "dsyevr"
         return raw
+    if int(n_samples) >= 32768:
+        return "dsyevr"
     accel_try_dsyevr = str(os.environ.get("JX_GWAS_EIGH_ACCEL_DSYEVR", "")).strip().lower()
     if accel_try_dsyevr in {"1", "true", "yes", "on"}:
         backend = "unknown"

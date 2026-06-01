@@ -624,8 +624,8 @@ def eigendecompose_grm(grm: np.ndarray, logger=None) -> tuple[np.ndarray, np.nda
     threads = max(1, int(detect_effective_threads()))
 
     # Keep PCA aligned with GWAS default strategy:
-    # default to Rust "auto" (which resolves to dsyevd in current backend),
-    # while allowing explicit override via env.
+    # default to Rust "auto", but switch large full-vector problems to dsyevr
+    # before hitting dsyevd workspace limits.
     raw_driver = str(
         os.environ.get(
             "JX_PCA_EIGH_DRIVER",
@@ -633,6 +633,8 @@ def eigendecompose_grm(grm: np.ndarray, logger=None) -> tuple[np.ndarray, np.nda
         )
     ).strip().lower()
     driver = raw_driver if raw_driver in {"auto", "dsyevd", "dsyevr"} else "auto"
+    if driver == "auto" and n >= 32768:
+        driver = "dsyevr"
 
     def _run(driver_name: str, mat: np.ndarray):
         if hasattr(jxrs, "rust_eigh_from_array_f64_inplace") and bool(mat.flags.c_contiguous) and bool(mat.flags.writeable):

@@ -294,18 +294,18 @@
 #include <stdlib.h>
 #include <ctype.h>
 #ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#include <winsock2.h>
 #include <windows.h>
 #include <io.h>
 struct timezone {
   int tz_minuteswest;
   int tz_dsttime;
-};
-struct timeval {
-  long tv_sec;
-  long tv_usec;
 };
 static int gettimeofday(struct timeval *tv, struct timezone *tz)
 {

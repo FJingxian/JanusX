@@ -125,6 +125,23 @@ def _emit_runtime_warning_once(flag_name: str, message: str) -> None:
     except Exception:
         pass
 
+
+def _resolve_matrix_file_hint(matrix: object) -> Optional[str]:
+    try:
+        fn = getattr(matrix, "filename", None)
+        if fn is None:
+            return None
+        cand = os.fspath(fn)
+        if isinstance(cand, bytes):
+            cand = cand.decode("utf-8", errors="ignore")
+        cand = str(cand).strip()
+        low = cand.lower()
+        if cand and os.path.isfile(cand) and low.endswith((".npy", ".txt", ".tsv", ".csv")):
+            return cand
+    except Exception:
+        return None
+    return None
+
 from joblib import Parallel, delayed, cpu_count
 try:
     from threadpoolctl import threadpool_limits as _threadpool_limits
@@ -169,6 +186,10 @@ try:
     from janusx.janusx import rust_eigh_from_array_f64_inplace as _rust_eigh_from_array_f64_inplace
 except Exception:
     _rust_eigh_from_array_f64_inplace = None
+try:
+    from janusx.janusx import rust_eigh_from_matrix_file_f64 as _rust_eigh_from_matrix_file_f64
+except Exception:
+    _rust_eigh_from_matrix_file_f64 = None
 
 try:
     from janusx.janusx import (
@@ -1171,64 +1192,81 @@ class LMM:
         )
 
         # Eigen decomposition of kinship (stabilized, Rust-only).
-        # Copy first so shared callers do not observe in-place ridge mutation.
-        kinship = np.array(kinship, dtype=np.float64, copy=True)
-        kinship.flat[::kinship.shape[0] + 1] += 1e-6
+        # Prefer file-backed mmap GRM path to avoid materializing an extra
+        # dense float64 copy when the caller passed an identity-aligned .npy.
+        kinship_file_hint = _resolve_matrix_file_hint(kinship)
         t_start = time.time()
-        kinship_eigh = np.ascontiguousarray(kinship, dtype=np.float64)
         eig_thr = int(_infer_blas_threads_from_env() or 0)
-        if _rust_eigh_from_array_f64_inplace is not None:
+        if kinship_file_hint is not None and _rust_eigh_from_matrix_file_f64 is not None:
             try:
                 eval_raw, evec_raw, _blas_backend, _evd_backend, _n, _tb, _ti, _ta, _lapack, _sec = (
-                    _rust_eigh_from_array_f64_inplace(
-                        kinship_eigh,
+                    _rust_eigh_from_matrix_file_f64(
+                        str(kinship_file_hint),
                         threads=eig_thr,
                         driver="auto",
                         jobz="V",
                         require_lapack=False,
+                        diag_shift=1e-6,
                     )
                 )
-            except Exception as ex:
-                if _rust_eigh_from_array_f64 is None:
-                    raise RuntimeError(
-                        f"Rust eigh failed in LMM initialization (inplace): {ex}"
-                    ) from ex
-                kinship_retry = np.ascontiguousarray(kinship_eigh, dtype=np.float64)
+            except Exception:
+                kinship_file_hint = None
+        if kinship_file_hint is None:
+            kinship = np.array(kinship, dtype=np.float64, copy=True)
+            kinship.flat[::kinship.shape[0] + 1] += 1e-6
+            kinship_eigh = np.ascontiguousarray(kinship, dtype=np.float64)
+            if _rust_eigh_from_array_f64_inplace is not None:
                 try:
                     eval_raw, evec_raw, _blas_backend, _evd_backend, _n, _tb, _ti, _ta, _lapack, _sec = (
-                        _rust_eigh_from_array_f64(
-                            kinship_retry,
+                        _rust_eigh_from_array_f64_inplace(
+                            kinship_eigh,
                             threads=eig_thr,
                             driver="auto",
                             jobz="V",
                             require_lapack=False,
                         )
                     )
-                except Exception as ex_copy:
-                    raise RuntimeError(
-                        f"Rust eigh failed in LMM initialization after inplace retry "
-                        f"(inplace={ex}; copied={ex_copy})"
-                    ) from ex_copy
-        elif _rust_eigh_from_array_f64 is not None:
-            try:
-                eval_raw, evec_raw, _blas_backend, _evd_backend, _n, _tb, _ti, _ta, _lapack, _sec = (
-                    _rust_eigh_from_array_f64(
-                        kinship_eigh,
-                        threads=eig_thr,
-                        driver="auto",
-                        jobz="V",
-                        require_lapack=False,
+                except Exception as ex:
+                    if _rust_eigh_from_array_f64 is None:
+                        raise RuntimeError(
+                            f"Rust eigh failed in LMM initialization (inplace): {ex}"
+                        ) from ex
+                    kinship_retry = np.ascontiguousarray(kinship_eigh, dtype=np.float64)
+                    try:
+                        eval_raw, evec_raw, _blas_backend, _evd_backend, _n, _tb, _ti, _ta, _lapack, _sec = (
+                            _rust_eigh_from_array_f64(
+                                kinship_retry,
+                                threads=eig_thr,
+                                driver="auto",
+                                jobz="V",
+                                require_lapack=False,
+                            )
+                        )
+                    except Exception as ex_copy:
+                        raise RuntimeError(
+                            f"Rust eigh failed in LMM initialization after inplace retry "
+                            f"(inplace={ex}; copied={ex_copy})"
+                        ) from ex_copy
+            elif _rust_eigh_from_array_f64 is not None:
+                try:
+                    eval_raw, evec_raw, _blas_backend, _evd_backend, _n, _tb, _ti, _ta, _lapack, _sec = (
+                        _rust_eigh_from_array_f64(
+                            kinship_eigh,
+                            threads=eig_thr,
+                            driver="auto",
+                            jobz="V",
+                            require_lapack=False,
+                        )
                     )
-                )
-            except Exception as ex:
+                except Exception as ex:
+                    raise RuntimeError(
+                        f"Rust eigh failed in LMM initialization: {ex}"
+                    ) from ex
+            else:
                 raise RuntimeError(
-                    f"Rust eigh failed in LMM initialization: {ex}"
-                ) from ex
-        else:
-            raise RuntimeError(
-                "Rust extension missing rust_eigh_from_array_f64(_inplace). "
-                "Rebuild janusx extension for Rust-only GWAS mode."
-            )
+                    "Rust extension missing rust_eigh_from_array_f64(_inplace). "
+                    "Rebuild janusx extension for Rust-only GWAS mode."
+                )
         if evec_raw is None:
             raise RuntimeError("rust_eigh_from_array_f64 returned no eigenvectors")
         self.S = np.asarray(eval_raw, dtype=np.float64)
@@ -1243,7 +1281,8 @@ class LMM:
             )
         self.evd_secs = float(time.time() - t_start)
         # Drop kinship to save memory
-        del kinship
+        if kinship_file_hint is None:
+            del kinship
         self.Dh = self.Dh.T.astype('float32')
 
         # Pre-rotate covariates and phenotype once (Rust-only).

@@ -3005,7 +3005,7 @@ def prepare_streaming_context(
 
     if grm is not None:
         grm_idx = [grm_index[sid] for sid in ids]
-        grm = grm[np.ix_(grm_idx, grm_idx)]
+        grm = _subset_square_matrix_identity_aware(grm, grm_idx)
 
     q_idx = [q_index[sid] for sid in ids]
     qmatrix = qmatrix[q_idx]
@@ -3027,6 +3027,46 @@ def _as_plink_prefix(path_or_prefix: str) -> Union[str, None]:
     if all(os.path.isfile(f"{p}.{ext}") for ext in ("bed", "bim", "fam")):
         return p
     return None
+
+
+def _is_full_identity_index(idx: object, size: int) -> bool:
+    try:
+        n = int(size)
+    except Exception:
+        return False
+    if n < 0:
+        return False
+    try:
+        arr = np.asarray(idx)
+    except Exception:
+        arr = None
+    if arr is not None and arr.ndim == 1:
+        if int(arr.shape[0]) != n:
+            return False
+        try:
+            arr_i = np.asarray(arr, dtype=np.int64, order="C")
+        except Exception:
+            arr_i = None
+        if arr_i is not None:
+            return bool(np.array_equal(arr_i, np.arange(n, dtype=np.int64)))
+    try:
+        if len(idx) != n:
+            return False
+        for i, v in enumerate(idx):
+            if int(v) != i:
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def _subset_square_matrix_identity_aware(grm: np.ndarray, idx: object) -> np.ndarray:
+    g_shape = np.shape(grm)
+    n = int(g_shape[0]) if len(g_shape) >= 1 else 0
+    if _is_full_identity_index(idx, n):
+        return grm
+    idx_arr = np.asarray(idx, dtype=np.int64).reshape(-1)
+    return grm[np.ix_(idx_arr, idx_arr)]
 
 
 def _site_tuple_parts(
@@ -3386,6 +3426,7 @@ def _gwas_eigh_from_grm(
     logger: Union[logging.Logger, None] = None,
     stage_label: str = "GWAS",
     require_rust: bool = False,
+    diag_ridge: float = 0.0,
 ) -> tuple[np.ndarray, np.ndarray, str, float]:
     """
     Eigen-decomposition for symmetric GRM with Rust-first backend.
@@ -3400,6 +3441,7 @@ def _gwas_eigh_from_grm(
         )
     impl_req = _resolve_gwas_eigh_impl(require_rust=bool(require_rust))
     t = max(1, int(threads))
+    ridge = float(diag_ridge)
 
     matrix_file_hint: Optional[str] = None
     if impl_req == "rust" and hasattr(jxrs, "rust_eigh_from_matrix_file_f64"):
@@ -3429,6 +3471,8 @@ def _gwas_eigh_from_grm(
         if g0.ndim != 2 or g0.shape[0] != g0.shape[1] or g0.shape[0] == 0:
             raise RuntimeError(f"{stage_label} expects non-empty square GRM, got shape={g0.shape}")
         g = np.ascontiguousarray(g0)
+        if ridge != 0.0:
+            g.flat[:: g.shape[0] + 1] += ridge
 
     def _run_eigh_rust(driver_name: str, mat: Optional[np.ndarray], matrix_path: Optional[str] = None):
         with _gwas_evd_stage_ctx(t):
@@ -3439,6 +3483,7 @@ def _gwas_eigh_from_grm(
                     driver=str(driver_name),
                     jobz="V",
                     require_lapack=False,
+                    diag_shift=float(ridge),
                 )
             if mat is None:
                 raise RuntimeError("Rust eigh requires either matrix array or matrix file path.")

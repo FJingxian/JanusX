@@ -40,6 +40,7 @@ from .workflow import (
     _gwas_eigh_from_grm,
     _gwas_evd_stage_ctx,
     _gwas_scan_stage_ctx,
+    _is_full_identity_index,
     _log_file_only,
     _log_model_line,
     _mixed_model_switch_to_lm_decision,
@@ -53,6 +54,7 @@ from .workflow import (
     _safe_trait_file_label,
     _site_tuple_parts,
     _split_gwas_sites,
+    _subset_square_matrix_identity_aware,
     _trait_values_and_mask,
     auto_mmap_window_mb,
     detect_effective_threads,
@@ -2141,10 +2143,13 @@ def run_fastlmm_packed_fullrank(
         grm_secs = 0.0
         grm_fit: np.ndarray
         if grm is not None:
-            grm_fit = np.ascontiguousarray(
-                np.asarray(grm[np.ix_(keep_idx, keep_idx)], dtype=np.float64),
-                dtype=np.float64,
-            )
+            if _is_full_identity_index(keep_idx, int(np.shape(grm)[0])):
+                grm_fit = grm
+            else:
+                grm_fit = np.ascontiguousarray(
+                    np.asarray(_subset_square_matrix_identity_aware(grm, keep_idx), dtype=np.float64),
+                    dtype=np.float64,
+                )
             if grm_fit.ndim != 2 or grm_fit.shape[0] != grm_fit.shape[1] or grm_fit.shape[0] != n_idv:
                 raise ValueError(
                     f"Trait GRM shape mismatch: got {grm_fit.shape}, expected ({n_idv}, {n_idv})."
@@ -2179,8 +2184,7 @@ def run_fastlmm_packed_fullrank(
                 raise ValueError(
                     f"Trait GRM shape mismatch: got {grm_fit.shape}, expected ({n_idv}, {n_idv})."
                 )
-        grm_fit_raw = np.array(grm_fit, dtype=np.float64, copy=True)
-        np.fill_diagonal(grm_fit, np.diag(grm_fit) + 1e-6)
+        grm_diag_raw = np.array(np.diag(grm_fit), dtype=np.float64, copy=True)
 
         evd_t0 = time.monotonic()
         with CliStatus(
@@ -2195,6 +2199,7 @@ def run_fastlmm_packed_fullrank(
                     logger=logger,
                     stage_label=f"FastLMM-fullrank:{pname}",
                     require_rust=True,
+                    diag_ridge=1e-6,
                 )
             except Exception:
                 task.fail("FastLMM Eigen-Decomposition ...Failed")
@@ -2290,11 +2295,13 @@ def run_fastlmm_packed_fullrank(
                 py_fast_t0 = time.monotonic()
                 stage_threads = max(1, int(threads))
                 with _gwas_evd_stage_ctx(stage_threads):
+                    kinship_raw = np.array(grm_fit, dtype=np.float64, copy=True)
+                    np.fill_diagonal(kinship_raw, grm_diag_raw)
                     null_fast_mod = FastLMM(
                         y=y_vec,
                         X=x_arg,
                         # Use the raw trait GRM here; FastLMM/LMM adds its own ridge.
-                        kinship=np.array(grm_fit_raw, copy=True),
+                        kinship=kinship_raw,
                     )
                 evd_secs += max(time.monotonic() - py_fast_t0, 0.0)
                 try:
@@ -3470,7 +3477,7 @@ def run_lmm_packed_fullrank(
         if cov_all is not None:
             x_cov = np.concatenate([x_cov, cov_all[keep_idx]], axis=1)
 
-        Ksub = grm[np.ix_(keep_idx, keep_idx)]
+        Ksub = _subset_square_matrix_identity_aware(grm, keep_idx)
         evd_t0 = time.monotonic()
         with CliStatus(
             "Running LMM Eigen-Decomposition...",
@@ -4540,11 +4547,13 @@ def run_splmm_packed_fullrank(
             and np.isfinite(null_offdiag_density_k)
             and float(null_offdiag_density_k) < 1e-3
         ):
-            logger.warning(
-                f"Warning: SparseLMM sparse GRM for trait {pname} is nearly diagonal "
+            _log_file_only(
+                logger,
+                logging.WARNING,
+                f"SparseLMM sparse GRM for trait {pname} is nearly diagonal "
                 f"(nnz={null_nnz_k}, offdiag_density={float(null_offdiag_density_k):.4g}). "
-                "Under this sparse positive-kinship model, h2 can collapse toward 0 and LM switch is expected; "
-                "this is not comparable to dense FastLMM h2."
+                "Under this sparse positive-kinship model, h2 may be understated and, in more extreme cases, "
+                "LM switch can occur; this is not directly comparable to dense FastLMM h2."
             )
         pheno_trait_subset = pheno_aligned.iloc[keep_idx][[pname]].copy()
         ids_trait_subset = np.asarray(ids[keep_idx], dtype=str)

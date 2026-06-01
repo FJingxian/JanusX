@@ -42,6 +42,7 @@ from .workflow import (
     _run_fastplot_from_tsv_with_status,
     _run_result_write_with_status,
     _safe_trait_file_label,
+    _subset_square_matrix_identity_aware,
     _trait_values_and_mask,
     auto_mmap_window_mb,
     build_rich_progress,
@@ -618,7 +619,7 @@ def run_chunked_gwas_lmm_lm(
         if model_key in ("lmm", "fastlmm"):
             if grm is None:
                 raise ValueError("LMM/fastLMM requires GRM, but GRM was not prepared.")
-            Ksub = grm[np.ix_(keep_idx, keep_idx)]
+            Ksub = _subset_square_matrix_identity_aware(grm, keep_idx)
             evd_t0 = time.monotonic()
             evd_label = "LMM" if model_key == "lmm" else "FastLMM"
             evd_desc = f"{evd_label} Eigen-Decomposition"
@@ -1456,7 +1457,7 @@ def run_chunked_gwas_streaming_shared(
                 )
             else:
                 if shared_ksub is None:
-                    shared_ksub = grm[np.ix_(keep_idx, keep_idx)]
+                    shared_ksub = _subset_square_matrix_identity_aware(grm, keep_idx)
                 evd_desc = f"{model_label} Eigen-Decomposition"
                 with CliStatus(
                     f"Running {evd_desc}...",
@@ -1499,7 +1500,7 @@ def run_chunked_gwas_streaming_shared(
                 mod = shared_lmm_model
             else:
                 if shared_ksub is None:
-                    shared_ksub = grm[np.ix_(keep_idx, keep_idx)]
+                    shared_ksub = _subset_square_matrix_identity_aware(grm, keep_idx)
                 lmm_t0 = time.monotonic()
                 stage_threads = max(1, int(threads))
                 with _gwas_evd_stage_ctx(stage_threads):

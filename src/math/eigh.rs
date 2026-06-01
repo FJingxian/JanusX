@@ -234,7 +234,17 @@ fn parse_npy_header_for_float_matrix(
     Ok((rows, cols, header_end, dtype))
 }
 
-fn load_square_matrix_from_npy_f64(path: &str) -> Result<(Vec<f64>, usize), String> {
+#[inline]
+fn apply_diag_shift_row_major(a_row_major: &mut [f64], n: usize, diag_shift: f64) {
+    if diag_shift == 0.0 || n == 0 {
+        return;
+    }
+    for i in 0..n {
+        a_row_major[i * n + i] += diag_shift;
+    }
+}
+
+fn load_square_matrix_from_npy_f64(path: &str, diag_shift: f64) -> Result<(Vec<f64>, usize), String> {
     let file = File::open(path).map_err(|e| format!("open NPY failed: {e}"))?;
     let mmap = unsafe { MmapOptions::new().map(&file).map_err(|e| e.to_string())? };
     let (rows, cols, data_offset, dtype) = parse_npy_header_for_float_matrix(&mmap[..])?;
@@ -289,6 +299,7 @@ fn load_square_matrix_from_npy_f64(path: &str) -> Result<(Vec<f64>, usize), Stri
     if out.iter().any(|v| !v.is_finite()) {
         return Err("matrix contains non-finite values".to_string());
     }
+    apply_diag_shift_row_major(&mut out, n, diag_shift);
     Ok((out, n))
 }
 
@@ -308,7 +319,7 @@ fn parse_text_matrix_row(line: &str) -> Vec<&str> {
     }
 }
 
-fn load_square_matrix_from_text_f64(path: &str) -> Result<(Vec<f64>, usize), String> {
+fn load_square_matrix_from_text_f64(path: &str, diag_shift: f64) -> Result<(Vec<f64>, usize), String> {
     let file = File::open(path).map_err(|e| format!("open text matrix failed: {e}"))?;
     let reader = BufReader::new(file);
 
@@ -368,10 +379,11 @@ fn load_square_matrix_from_text_f64(path: &str) -> Result<(Vec<f64>, usize), Str
             expect
         ));
     }
+    apply_diag_shift_row_major(&mut out, n, diag_shift);
     Ok((out, n))
 }
 
-fn load_square_matrix_f64_from_file(path: &str) -> Result<(Vec<f64>, usize), String> {
+fn load_square_matrix_f64_from_file(path: &str, diag_shift: f64) -> Result<(Vec<f64>, usize), String> {
     let p = Path::new(path);
     let ext = p
         .extension()
@@ -379,9 +391,148 @@ fn load_square_matrix_f64_from_file(path: &str) -> Result<(Vec<f64>, usize), Str
         .unwrap_or("")
         .to_ascii_lowercase();
     match ext.as_str() {
-        "npy" => load_square_matrix_from_npy_f64(path),
-        "txt" | "tsv" | "csv" => load_square_matrix_from_text_f64(path),
-        _ => load_square_matrix_from_text_f64(path),
+        "npy" => load_square_matrix_from_npy_f64(path, diag_shift),
+        "txt" | "tsv" | "csv" => load_square_matrix_from_text_f64(path, diag_shift),
+        _ => load_square_matrix_from_text_f64(path, diag_shift),
+    }
+}
+
+#[inline]
+fn symmetric_eigh_f64_matrix_file_with_driver(
+    path: &str,
+    driver: EighDriver,
+    jobz: EighJobz,
+    diag_shift: f64,
+) -> Result<(Vec<f64>, Option<Vec<f64>>, &'static str, usize), String> {
+    let (mut a_primary, n) = load_square_matrix_f64_from_file(path, diag_shift)?;
+    if n == 0 {
+        let vecs = if matches!(jobz, EighJobz::ValuesAndVectors) {
+            Some(Vec::new())
+        } else {
+            None
+        };
+        return Ok((Vec::new(), vecs, "empty", 0));
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    {
+        let primary = driver;
+        let secondary = match driver {
+            EighDriver::Dsyevd => EighDriver::Dsyevr,
+            EighDriver::Dsyevr => EighDriver::Dsyevd,
+        };
+        let mut lapack_errors: Vec<String> = Vec::new();
+
+        match lapack_try_driver_row_major_inplace(&mut a_primary, n, jobz, primary) {
+            Ok(res) => return Ok((res.0, res.1, res.2, n)),
+            Err(err) => {
+                lapack_errors.push(format!(
+                    "{}: {err}",
+                    match primary {
+                        EighDriver::Dsyevd => "dsyevd",
+                        EighDriver::Dsyevr => "dsyevr",
+                    }
+                ));
+            }
+        }
+
+        let (mut a_retry, n_retry) = load_square_matrix_f64_from_file(path, diag_shift)?;
+        if n_retry != n {
+            return Err(format!(
+                "matrix shape changed across reload: first n={}, retry n={}",
+                n, n_retry
+            ));
+        }
+        match lapack_try_driver_row_major_inplace(&mut a_retry, n, jobz, secondary) {
+            Ok(res) => return Ok((res.0, res.1, res.2, n)),
+            Err(err) => {
+                lapack_errors.push(format!(
+                    "{}: {err}",
+                    match secondary {
+                        EighDriver::Dsyevd => "dsyevd",
+                        EighDriver::Dsyevr => "dsyevr",
+                    }
+                ));
+            }
+        }
+
+        let allow_nalgebra_fallback = if cfg!(target_os = "windows") {
+            match std::env::var("JX_EIGH_ALLOW_NALGEBRA_FALLBACK") {
+                Ok(v) => {
+                    let t = v.trim().to_ascii_lowercase();
+                    matches!(t.as_str(), "1" | "true" | "yes" | "y" | "on")
+                }
+                Err(_) => true,
+            }
+        } else {
+            env_truthy("JX_EIGH_ALLOW_NALGEBRA_FALLBACK")
+        };
+        if !allow_nalgebra_fallback {
+            return Err(format!(
+                "LAPACK eigh failed (driver={}, jobz={}): {}",
+                match driver {
+                    EighDriver::Dsyevd => "dsyevd",
+                    EighDriver::Dsyevr => "dsyevr",
+                },
+                eigh_jobz_label(jobz),
+                lapack_errors.join("; ")
+            ));
+        }
+
+        let dm = DMatrix::from_row_slice(n, n, &a_retry);
+        let se = nalgebra::linalg::SymmetricEigen::new(dm);
+        let eval_unsorted = se.eigenvalues.as_slice();
+        let evec_unsorted = se.eigenvectors;
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by(|&a, &b| {
+            eval_unsorted[a]
+                .partial_cmp(&eval_unsorted[b])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mut s = vec![0.0_f64; n];
+        let mut u = if matches!(jobz, EighJobz::ValuesAndVectors) {
+            Some(vec![0.0_f64; n * n])
+        } else {
+            None
+        };
+        for (col_new, &col_old) in order.iter().enumerate() {
+            s[col_new] = eval_unsorted[col_old];
+            if let Some(ref mut uu) = u {
+                for row in 0..n {
+                    uu[row * n + col_new] = evec_unsorted[(row, col_old)];
+                }
+            }
+        }
+        return Ok((s, u, "nalgebra", n));
+    }
+
+    #[allow(unreachable_code)]
+    {
+        let dm = DMatrix::from_row_slice(n, n, &a_primary);
+        let se = nalgebra::linalg::SymmetricEigen::new(dm);
+        let eval_unsorted = se.eigenvalues.as_slice();
+        let evec_unsorted = se.eigenvectors;
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by(|&a, &b| {
+            eval_unsorted[a]
+                .partial_cmp(&eval_unsorted[b])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mut s = vec![0.0_f64; n];
+        let mut u = if matches!(jobz, EighJobz::ValuesAndVectors) {
+            Some(vec![0.0_f64; n * n])
+        } else {
+            None
+        };
+        for (col_new, &col_old) in order.iter().enumerate() {
+            s[col_new] = eval_unsorted[col_old];
+            if let Some(ref mut uu) = u {
+                for row in 0..n {
+                    uu[row * n + col_new] = evec_unsorted[(row, col_old)];
+                }
+            }
+        }
+        Ok((s, u, "nalgebra", n))
     }
 }
 
@@ -934,7 +1085,7 @@ pub fn rust_eigh_from_array_f64<'py>(
 }
 
 #[pyfunction]
-#[pyo3(signature = (path, threads=0, driver=None, jobz="V", require_lapack=false))]
+#[pyo3(signature = (path, threads=0, driver=None, jobz="V", require_lapack=false, diag_shift=0.0))]
 pub fn rust_eigh_from_matrix_file_f64<'py>(
     py: Python<'py>,
     path: String,
@@ -942,6 +1093,7 @@ pub fn rust_eigh_from_matrix_file_f64<'py>(
     driver: Option<String>,
     jobz: &str,
     require_lapack: bool,
+    diag_shift: f64,
 ) -> PyResult<(
     Bound<'py, PyArray1<f64>>,
     Option<Bound<'py, PyArray2<f64>>>,
@@ -958,8 +1110,6 @@ pub fn rust_eigh_from_matrix_file_f64<'py>(
     if path_trimmed.is_empty() {
         return Err(PyRuntimeError::new_err("path must not be empty"));
     }
-    let (a_row_major, n) =
-        load_square_matrix_f64_from_file(path_trimmed).map_err(PyRuntimeError::new_err)?;
     let driver_sel = parse_eigh_driver_token(driver.unwrap_or_else(|| "auto".to_string()).as_str());
     let jobz_sel = parse_eigh_jobz_token(jobz);
 
@@ -967,14 +1117,18 @@ pub fn rust_eigh_from_matrix_file_f64<'py>(
     let (threads_before, threads_in_stage, run, threads_after) =
         crate::blas::with_eigh_thread_stage(threads, || {
             let t0 = Instant::now();
-            let run =
-                symmetric_eigh_f64_row_major_with_driver(&a_row_major, n, driver_sel, jobz_sel);
+            let run = symmetric_eigh_f64_matrix_file_with_driver(
+                path_trimmed,
+                driver_sel,
+                jobz_sel,
+                diag_shift,
+            );
             let elapsed = t0.elapsed().as_secs_f64();
             (run, elapsed)
         });
     let (run, elapsed) = run;
 
-    let (evals, evecs_opt, evd_backend) = run.map_err(PyRuntimeError::new_err)?;
+    let (evals, evecs_opt, evd_backend, n) = run.map_err(PyRuntimeError::new_err)?;
     let lapack_used = is_lapack_backend(evd_backend);
     if require_lapack && !lapack_used {
         return Err(PyRuntimeError::new_err(format!(

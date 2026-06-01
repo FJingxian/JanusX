@@ -192,9 +192,12 @@ use ld::{
 use lmm::{fastlmm_assoc_from_snp_f32, fastlmm_reml_chunk_f32, fastlmm_reml_null_f32};
 use lmm_scan::{
     ai_reml_multi_f64, ai_reml_null_f64, fastlmm_assoc_chunk_f32, fastlmm_assoc_packed_f32,
-    fastlmm_assoc_packed_f32_to_tsv, lmm_assoc_chunk_f32, lmm_assoc_chunk_from_snp_f32,
+    fastlmm_assoc_packed_f32_to_tsv, fvlmm_assoc_chunk_f32, fvlmm_assoc_chunk_from_snp_f32,
+    fvlmm_assoc_chunk_from_snp_with_cache_f32, fvlmm_assoc_chunk_with_cache_f32,
+    fvlmm_assoc_packed_f32_to_tsv,
+    fvlmm_assoc_prepare_cache_f32, lmm_assoc_chunk_f32, lmm_assoc_chunk_from_snp_f32,
     lmm_reml_assoc_packed_f32, lmm_reml_assoc_packed_f32_to_tsv, lmm_reml_chunk_f32,
-    lmm_reml_chunk_from_snp_f32, lmm_reml_null_f32, lmm_rotate_x_y_with_ut_f64,
+    lmm_reml_chunk_from_snp_f32, lmm_reml_null_f32, lmm_rotate_x_y_with_ut_f64, FvLmmAssocCache,
     ml_loglike_null_f32,
 };
 use logreg::fit_best_and_not_py;
@@ -274,6 +277,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_class::<SimEngine>()?;
     m.add_class::<SimTraitAccumulator>()?;
     m.add_class::<SiteInfo>()?;
+    m.add_class::<FvLmmAssocCache>()?;
     m.add_class::<PyMergeStats>()?;
     m.add_class::<PyConvertStats>()?;
     m.add_function(wrap_pyfunction!(popcount_py, m)?)?;
@@ -404,6 +408,11 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(lmm_reml_chunk_from_snp_f32, m)?)?;
     m.add_function(wrap_pyfunction!(lmm_assoc_chunk_f32, m)?)?;
     m.add_function(wrap_pyfunction!(lmm_assoc_chunk_from_snp_f32, m)?)?;
+    m.add_function(wrap_pyfunction!(fvlmm_assoc_chunk_f32, m)?)?;
+    m.add_function(wrap_pyfunction!(fvlmm_assoc_chunk_with_cache_f32, m)?)?;
+    m.add_function(wrap_pyfunction!(fvlmm_assoc_chunk_from_snp_f32, m)?)?;
+    m.add_function(wrap_pyfunction!(fvlmm_assoc_prepare_cache_f32, m)?)?;
+    m.add_function(wrap_pyfunction!(fvlmm_assoc_chunk_from_snp_with_cache_f32, m)?)?;
     m.add_function(wrap_pyfunction!(lmm_rotate_x_y_with_ut_f64, m)?)?;
     m.add_function(wrap_pyfunction!(lmm_reml_assoc_packed_f32, m)?)?;
     m.add_function(wrap_pyfunction!(lmm_reml_assoc_packed_f32_to_tsv, m)?)?;
@@ -411,6 +420,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(fastlmm_assoc_from_snp_f32, m)?)?;
     m.add_function(wrap_pyfunction!(fastlmm_assoc_packed_f32, m)?)?;
     m.add_function(wrap_pyfunction!(fastlmm_assoc_packed_f32_to_tsv, m)?)?;
+    m.add_function(wrap_pyfunction!(fvlmm_assoc_packed_f32_to_tsv, m)?)?;
     m.add_function(wrap_pyfunction!(fastlmm_reml_null_f32, m)?)?;
     m.add_function(wrap_pyfunction!(fastlmm_reml_chunk_f32, m)?)?;
     m.add_function(wrap_pyfunction!(bayesa, m)?)?;

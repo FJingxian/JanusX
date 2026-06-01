@@ -25,6 +25,7 @@ from janusx.script._common.packedctx import (
 from .workflow import (
     CliStatus,
     FastLMM,
+    FvLMM,
     LMM,
     _ProgressAdapter,
     _start_indeterminate_progress_bar,
@@ -2143,11 +2144,16 @@ def run_fastlmm_packed_fullrank(
     emit_trait_header: bool = True,
     preloaded_packed: Union[dict[str, object], None] = None,
     force_model: bool = False,
+    _route_model_key: str = "fastlmm",
+    _route_model_label: str = "FastLMM",
+    _route_model_cls: object = FastLMM,
+    _allow_pve_switch: bool = True,
 ) -> None:
     required_symbols = [
         "grm_packed_f64_with_stats",
         "rust_eigh_from_array_f64",
         "fastlmm_assoc_packed_f32_to_tsv",
+        "fvlmm_assoc_packed_f32_to_tsv",
     ]
     missing_symbols = [s for s in required_symbols if not hasattr(jxrs, s)]
     if len(missing_symbols) > 0:
@@ -2289,7 +2295,7 @@ def run_fastlmm_packed_fullrank(
                 )
         evd_t0 = time.monotonic()
         with CliStatus(
-            "Running FastLMM Eigen-Decomposition...",
+            f"Running {_route_model_label} Eigen-Decomposition...",
             enabled=bool(use_spinner),
             use_process=True,
         ) as task:
@@ -2298,12 +2304,12 @@ def run_fastlmm_packed_fullrank(
                     grm_fit,
                     threads=max(1, int(threads)),
                     logger=logger,
-                    stage_label=f"FastLMM-fullrank:{pname}",
+                    stage_label=f"{_route_model_key}-fullrank:{pname}",
                     require_rust=True,
                     diag_ridge=1e-6,
                 )
             except Exception:
-                task.fail("FastLMM Eigen-Decomposition ...Failed")
+                task.fail(f"{_route_model_label} Eigen-Decomposition ...Failed")
                 raise
         # Keep explicit elapsed in case backend timing is unavailable/zero.
         evd_secs = max(float(evd_secs), max(time.monotonic() - evd_t0, 0.0))
@@ -2328,7 +2334,7 @@ def run_fastlmm_packed_fullrank(
                 eigvecs=eigvecs,
                 evd_secs=float(evd_secs),
             )
-            null_fast_mod = FastLMM.from_lmm(shared_lmm_mod)
+            null_fast_mod = _route_model_cls.from_lmm(shared_lmm_mod)
 
         fixed_lbd: Optional[float] = None
         fixed_ml0: Optional[float] = None
@@ -2351,17 +2357,17 @@ def run_fastlmm_packed_fullrank(
             null_pve = None
         null_ml0: Optional[float] = fixed_ml0
 
-        if (not bool(force_model)) and _fastlmm_should_switch_to_lmm(null_pve):
+        if (not bool(force_model)) and bool(_allow_pve_switch) and _fastlmm_should_switch_to_lmm(null_pve):
             prev_pve = float(null_pve) if null_pve is not None else float("nan")
             logger.warning(
-                f"Warning: FastLMM switch to LMM for trait {pname}: "
+                f"Warning: {_route_model_label} switch to LMM for trait {pname}: "
                 f"null PVE={prev_pve:.4f} (>0.995)."
             )
             _log_model_line(
                 logger,
                 "LMM",
                 (
-                    f"switched from FastLMM null to LMM: "
+                    f"switched from {_route_model_label} null to LMM: "
                     f"PVE(null)={prev_pve:.4f} (>0.995) "
                     f"[{format_elapsed(evd_secs)}]"
                 ),
@@ -2406,14 +2412,14 @@ def run_fastlmm_packed_fullrank(
             )
             if switch_to_lm:
                 logger.warning(
-                    f"Warning: FastLMM switch to LM for trait {pname}: "
+                    f"Warning: {_route_model_label} switch to LM for trait {pname}: "
                     f"null LRT stat={float(lrt_stat):.4g}, p={float(lrt_p):.4g} (>=0.05)."
                 )
                 _log_model_line(
                     logger,
                     "LM",
                     (
-                        f"switched from FastLMM null to LM "
+                        f"switched from {_route_model_label} null to LM "
                         f"(LRT stat={float(lrt_stat):.4g}, p={float(lrt_p):.4g}) "
                         f"[{format_elapsed(evd_secs)}]"
                     ),
@@ -2454,7 +2460,7 @@ def run_fastlmm_packed_fullrank(
             grm_fit = None
             gc.collect()
 
-        # FastLMM packed currently exposes only scan-stage progress. Keep a
+        # Packed fixed-lambda routes currently expose only scan-stage progress. Keep a
         # placeholder stage-1 handle so shared cleanup code remains safe.
         stage1_pbar: Optional[_ProgressAdapter] = None
         gwas_total = int(len(sites_all))
@@ -2463,7 +2469,7 @@ def run_fastlmm_packed_fullrank(
         if bool(use_spinner):
             gwas_pbar = _ProgressAdapter(
                 total=max(1, gwas_total),
-                desc="FastLMM",
+                desc=_route_model_label,
                 force_animate=True,
             )
 
@@ -2484,7 +2490,7 @@ def run_fastlmm_packed_fullrank(
                 gwas_total = int(max(1, t))
                 gwas_pbar = _ProgressAdapter(
                     total=gwas_total,
-                    desc="FastLMM",
+                    desc=_route_model_label,
                     force_animate=True,
                 )
                 gwas_last_done = 0
@@ -2497,9 +2503,9 @@ def run_fastlmm_packed_fullrank(
         gm_tag = str(genetic_model).lower()
         pname_tag = _safe_trait_file_label(pname)
         if gm_tag == "add":
-            out_tsv = f"{outprefix}.{pname_tag}.fastlmm.tsv"
+            out_tsv = f"{outprefix}.{pname_tag}.{_route_model_key}.tsv"
         else:
-            out_tsv = f"{outprefix}.{pname_tag}.{gm_tag}.fastlmm.tsv"
+            out_tsv = f"{outprefix}.{pname_tag}.{gm_tag}.{_route_model_key}.tsv"
         tmp_tsv = _gwas_result_tmp_path(out_tsv)
 
         gwas_ok = False
@@ -2526,11 +2532,11 @@ def run_fastlmm_packed_fullrank(
                         threads=int(max(1, int(threads))),
                         genetic_model=str(genetic_model),
                         progress_callback=_fastlmm_progress if gwas_pbar is not None else None,
-                    )
+                        )
                     if int(_written_rows) != int(len(sites_all)):
                         _emit_warning_line(
                             logger,
-                            f"FastLMM low-rank writer row mismatch: expected={len(sites_all)} wrote={int(_written_rows)}",
+                            f"{_route_model_label} low-rank writer row mismatch: expected={len(sites_all)} wrote={int(_written_rows)}",
                             use_spinner=bool(use_spinner),
                         )
                     lbd = float(getattr(null_fast_mod, "lbd_null", np.nan))
@@ -2539,8 +2545,14 @@ def run_fastlmm_packed_fullrank(
                 else:
                     u_sub = np.ascontiguousarray(np.asarray(eigvecs, dtype=np.float32), dtype=np.float32)
                     s_trait = np.ascontiguousarray(np.maximum(eigvals, 0.0), dtype=np.float32)
-                    u_trait = np.zeros((int(packed_n), int(n_idv)), dtype=np.float32)
-                    u_trait[sample_idx_trait, :] = u_sub
+                    sample_idx_scan_arg: Optional[np.ndarray]
+                    if _is_full_identity_index(sample_idx_trait, int(packed_n)):
+                        u_trait = u_sub
+                        sample_idx_scan_arg = None
+                    else:
+                        u_trait = np.zeros((int(packed_n), int(n_idv)), dtype=np.float32)
+                        u_trait[sample_idx_trait, :] = u_sub
+                        sample_idx_scan_arg = sample_idx_trait
                     progress_kwargs: dict[str, object] = {
                         "progress_callback": None,
                         "progress_every": 0,
@@ -2555,14 +2567,14 @@ def run_fastlmm_packed_fullrank(
                         try:
                             jobs = [
                                 {
-                                    "model": "fastlmm",
+                                    "model": _route_model_key,
                                     "trait": str(pname),
                                     "out_tsv": str(tmp_tsv),
                                     "y": y_vec,
                                     "x": x_arg,
                                     "u": u_trait,
                                     "s": s_trait,
-                                    "sample_indices": sample_idx_trait,
+                                    "sample_indices": sample_idx_scan_arg,
                                     "low": -5.0,
                                     "high": 5.0,
                                     "max_iter": 50,
@@ -2601,12 +2613,17 @@ def run_fastlmm_packed_fullrank(
                         except Exception as ex:
                             _emit_warning_line(
                                 logger,
-                                f"FastLMM unified Rust dispatcher unavailable; fallback to legacy packed FastLMM. reason={ex}",
+                                f"{_route_model_label} unified Rust dispatcher unavailable; fallback to legacy packed scan. reason={ex}",
                                 use_spinner=bool(use_spinner),
                             )
                             unified_done = False
                     if not unified_done:
-                        lbd, ml0, reml0 = jxrs.fastlmm_assoc_packed_f32_to_tsv(
+                        packed_scan_fn = (
+                            jxrs.fvlmm_assoc_packed_f32_to_tsv
+                            if str(_route_model_key) == "fvlmm"
+                            else jxrs.fastlmm_assoc_packed_f32_to_tsv
+                        )
+                        lbd, ml0, reml0 = packed_scan_fn(
                             packed,
                             int(packed_n),
                             row_flip,
@@ -2616,7 +2633,7 @@ def run_fastlmm_packed_fullrank(
                             s_trait,
                             y_vec,
                             x_arg,
-                            sample_idx_trait,
+                            sample_idx_scan_arg,
                             -5.0,
                             5.0,
                             50,
@@ -2701,7 +2718,7 @@ def run_fastlmm_packed_fullrank(
         summary_rows.append(
             {
                 "phenotype": str(pname),
-                "model": "FastLMM",
+                "model": _route_model_label,
                 "nidv": int(n_idv),
                 "eff_snp": int(eff_snp),
                 "pve": (float(pve) if pve is not None else None),
@@ -2722,14 +2739,22 @@ def run_fastlmm_packed_fullrank(
         _rich_success(
             logger,
             (
-                f"FastLMM ...pve {float(pve):.3f} [{'/'.join(done_times)}]"
+                f"{_route_model_label} ...pve {float(pve):.3f} [{'/'.join(done_times)}]"
                 if (pve is not None and np.isfinite(float(pve)))
-                else f"FastLMM ...Finished [{'/'.join(done_times)}]"
+                else f"{_route_model_label} ...Finished [{'/'.join(done_times)}]"
             ),
             use_spinner=bool(use_spinner),
         )
         if multi_trait_mode:
             logger.info("")
+
+
+def run_fvlmm_packed_fullrank(*args, **kwargs) -> None:
+    kwargs.setdefault("_route_model_key", "fvlmm")
+    kwargs.setdefault("_route_model_label", "FvLMM")
+    kwargs.setdefault("_route_model_cls", FvLMM)
+    kwargs.setdefault("_allow_pve_switch", False)
+    run_fastlmm_packed_fullrank(*args, **kwargs)
 
 
 def run_lm_packed_fullrank(

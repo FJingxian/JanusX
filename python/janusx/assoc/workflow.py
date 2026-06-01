@@ -155,6 +155,7 @@ class _LazyPyBlupAssocSymbol:
 LM = _LazyPyBlupAssocSymbol("LM")
 LMM = _LazyPyBlupAssocSymbol("LMM")
 FastLMM = _LazyPyBlupAssocSymbol("FastLMM")
+FvLMM = _LazyPyBlupAssocSymbol("FvLMM")
 farmcpu = _LazyPyBlupAssocSymbol("farmcpu")
 from janusx.script._common.packedctx import (
     packed_preload_failure_state,
@@ -4257,6 +4258,10 @@ def run_fastlmm_packed_fullrank(*args, **kwargs):
     from janusx.assoc.workflow_model_packed import run_fastlmm_packed_fullrank as _impl
     return _impl(*args, **kwargs)
 
+def run_fvlmm_packed_fullrank(*args, **kwargs):
+    from janusx.assoc.workflow_model_packed import run_fvlmm_packed_fullrank as _impl
+    return _impl(*args, **kwargs)
+
 def run_lm_packed_fullrank(*args, **kwargs):
     from janusx.assoc.workflow_model_packed import run_lm_packed_fullrank as _impl
     return _impl(*args, **kwargs)
@@ -4440,7 +4445,7 @@ def _run_file_dense_fast_once(
     _log_file_only(
         logger,
         logging.INFO,
-        "FILE fast mode: preparing shared dense genotype cache once for LM/LMM/FastLMM/FarmCPU.",
+        "FILE fast mode: preparing shared dense genotype cache once for LM/LMM/FastLMM/FvLMM/FarmCPU.",
     )
     farmcpu_cache_runtime = run_farmcpu_fullmem(
         args=args,
@@ -4506,7 +4511,7 @@ def _run_file_dense_fast_once(
     chrom_all, pos_all, snp_all, allele0_all, allele1_all = _extract_ref_alt(ref_alt_obj, n_snps)
     _phase_split(logger)
 
-    model_sequence = [m for m in stream_models if m in {"lm", "lmm", "fastlmm"}]
+    model_sequence = [m for m in stream_models if m in {"lm", "lmm", "fastlmm", "fvlmm"}]
     gm_tag = str(args.model).lower()
     pheno_aligned, ids = _align_pheno_to_sample_order(pheno, ids)
     trait_iter = list(pheno_aligned.columns)
@@ -4568,7 +4573,12 @@ def _run_file_dense_fast_once(
 
         if not np.any(keep_site):
             for mkey in model_sequence:
-                model_label = "FastLMM" if mkey == "fastlmm" else str(mkey).upper()
+                if mkey == "fastlmm":
+                    model_label = "FastLMM"
+                elif mkey == "fvlmm":
+                    model_label = "FvLMM"
+                else:
+                    model_label = str(mkey).upper()
                 summary_rows.append(
                     {
                         "phenotype": str(pname),
@@ -4629,9 +4639,15 @@ def _run_file_dense_fast_once(
         kinship_sub: Union[np.ndarray, None] = None
         lmm_model_obj: Optional[Any] = None
         fastlmm_model_obj: Optional[Any] = None
+        fvlmm_model_obj: Optional[Any] = None
 
         for mkey in model_sequence:
-            model_label = "FastLMM" if mkey == "fastlmm" else str(mkey).upper()
+            if mkey == "fastlmm":
+                model_label = "FastLMM"
+            elif mkey == "fvlmm":
+                model_label = "FvLMM"
+            else:
+                model_label = str(mkey).upper()
             model_tag = str(mkey).lower()
             pname_tag = _safe_trait_file_label(pname)
             if gm_tag == "add":
@@ -4692,7 +4708,7 @@ def _run_file_dense_fast_once(
                         )
                         init_secs = max(time.monotonic() - init_t0, 0.0)
                     mod = lmm_model_obj
-                else:
+                elif mkey == "fastlmm":
                     if fastlmm_model_obj is None:
                         if lmm_model_obj is not None:
                             fastlmm_model_obj = FastLMM.from_lmm(lmm_model_obj)
@@ -4706,6 +4722,23 @@ def _run_file_dense_fast_once(
                             )
                             init_secs = max(time.monotonic() - init_t0, 0.0)
                     mod = fastlmm_model_obj
+                else:
+                    if fvlmm_model_obj is None:
+                        if lmm_model_obj is not None:
+                            fvlmm_model_obj = FvLMM.from_lmm(lmm_model_obj)
+                            init_secs = 0.0
+                        elif fastlmm_model_obj is not None:
+                            fvlmm_model_obj = FvLMM.from_lmm(fastlmm_model_obj)
+                            init_secs = 0.0
+                        else:
+                            init_t0 = time.monotonic()
+                            fvlmm_model_obj = FvLMM(
+                                y=y_vec,
+                                X=x_arg,
+                                kinship=np.array(kinship_sub, copy=True),
+                            )
+                            init_secs = max(time.monotonic() - init_t0, 0.0)
+                    mod = fvlmm_model_obj
 
                 scan_t0 = time.monotonic()
                 res_raw = mod.gwas(geno_model, threads=int(max(1, args.thread)))
@@ -4812,7 +4845,7 @@ def _run_file_dense_fast_once(
             if (
                 pve_now is not None
                 and np.isfinite(float(pve_now))
-                and str(model_label).lower() in {"lmm", "fastlmm"}
+                and str(model_label).lower() in {"lmm", "fastlmm", "fvlmm"}
             ):
                 done_msg = (
                     f"{model_label} ...pve {float(pve_now):.3f} "
@@ -4944,6 +4977,10 @@ def parse_args(argv: Optional[list[str]] = None):
         help="Run the linear mixed model with fixed lambda estimated in null model (memmap, low-memory; default: %(default)s).",
     )
     models_group.add_argument(
+        "-fvlmm", "--fvlmm", action="store_true", default=False,
+        help="Run the fixed-variance LMM spectral scan using the null-model lambda for the whole GWAS (default: %(default)s).",
+    )
+    models_group.add_argument(
         "-farmcpu", "--farmcpu", action="store_true", default=False,
         help="Run FarmCPU (full genotype in memory; default: %(default)s).",
     )
@@ -4976,7 +5013,7 @@ def parse_args(argv: Optional[list[str]] = None):
     )
     models_group.add_argument(
         "-model", "--model", type=str, choices=["add", "dom", "rec", "het"], default="add",
-        help="Genetic effect coding model for memmap LM/LMM/FastLMM (default: %(default)s).",
+        help="Genetic effect coding model for memmap LM/LMM/FastLMM/FvLMM (default: %(default)s).",
     )
 
     optional_group = parser.add_argument_group("Optional Arguments")
@@ -5085,7 +5122,7 @@ def parse_args(argv: Optional[list[str]] = None):
         "-fast", "--fast", action="store_true", default=False,
         help=(
             "Use packed full-rust paths when available (loads BED-packed genotype once "
-            "and reuses it across LM/LMM/FastLMM/SparseLMM/ALGWAS/FarmCPU)."
+            "and reuses it across LM/LMM/FastLMM/FvLMM/SparseLMM/ALGWAS/FarmCPU)."
         ),
     )
     optional_group.add_argument(
@@ -5230,6 +5267,8 @@ def _run_gwas_pipeline(
             model_tokens.append("LM")
         if args.fastlmm:
             model_tokens.append("fastLMM")
+        if args.fvlmm:
+            model_tokens.append("FvLMM")
         if args.lmm:
             model_tokens.append("LMM")
         if args.splmm:
@@ -5314,14 +5353,14 @@ def _run_gwas_pipeline(
     if not ensure_all_true(checks):
         raise SystemExit(1)
 
-    if not (args.lm or args.lmm or args.fastlmm or args.splmm or args.algwas or args.farmcpu):
+    if not (args.lm or args.lmm or args.fastlmm or args.fvlmm or args.splmm or args.algwas or args.farmcpu):
         logger.error(
-            "No model selected. Use -lm, -lmm, -fastlmm, -splmm, -algwas, and/or -farmcpu."
+            "No model selected. Use -lm, -lmm, -fastlmm, -fvlmm, -splmm, -algwas, and/or -farmcpu."
         )
         raise SystemExit(1)
     if args.farmcpu and args.model != "add":
         logger.warning(
-            "Warning: --model/--het currently apply to memmap LM/LMM/FastLMM; "
+            "Warning: --model/--het currently apply to memmap LM/LMM/FastLMM/FvLMM; "
             "FarmCPU keeps additive coding."
         )
     maf_threshold_scan = float(args.maf)
@@ -5370,10 +5409,10 @@ def _run_gwas_pipeline(
     # - packed full-load remains the fallback when memmap is unavailable
     allow_packed_grm_reuse = bool(
         fast_mode
-        and (args.lmm or args.fastlmm or qcov_needs_grm)
+        and (args.lmm or args.fastlmm or args.fvlmm or qcov_needs_grm)
     )
     force_bed_stream_scan = bool(
-        (args.lm or args.lmm or args.fastlmm)
+        (args.lm or args.lmm or args.fastlmm or args.fvlmm)
         and input_is_file_matrix
         and (not bool(fast_mode))
     )
@@ -5387,13 +5426,13 @@ def _run_gwas_pipeline(
             logging.INFO,
             "FILE matrix input for LM/LMM/FaSTLMM: materializing PLINK BED cache for Rust streaming scan.",
         )
-    if (not bool(fast_mode)) and bool(args.lmm or args.fastlmm or qcov_needs_grm):
+    if (not bool(fast_mode)) and bool(args.lmm or args.fastlmm or args.fvlmm or qcov_needs_grm):
         _log_file_only(
             logger,
             logging.INFO,
             "Non-fast GWAS: GRM uses memmap path by default (packed single-entry disabled).",
         )
-    elif bool(args.lmm or args.fastlmm or qcov_needs_grm):
+    elif bool(args.lmm or args.fastlmm or args.fvlmm or qcov_needs_grm):
         _log_file_only(
             logger,
             logging.INFO,
@@ -5433,6 +5472,8 @@ def _run_gwas_pipeline(
             stream_models.append("lmm")
         if args.fastlmm:
             stream_models.append("fastlmm")
+        if args.fvlmm:
+            stream_models.append("fvlmm")
         if args.splmm:
             stream_models.append("splmm")
         if args.algwas:
@@ -5531,7 +5572,7 @@ def _run_gwas_pipeline(
                     cov_inputs=args.cov,
                     threads=args.thread,
                     mmap_limit=mmap_limit_effective,
-                    require_kinship=(args.lmm or args.fastlmm),
+                    require_kinship=(args.lmm or args.fastlmm or args.fvlmm),
                     logger=logger,
                     use_spinner=use_spinner,
                     snps_only=bool(args.snps_only),
@@ -5814,6 +5855,36 @@ def _run_gwas_pipeline(
                             force_model=bool(args.force_model),
                         )
 
+                    def _run_route_fvlmm_packed(
+                        trait_one: list[str], emit_trait_header_model: bool
+                    ) -> None:
+                        run_fvlmm_packed_fullrank(
+                            genofile=genofile_stream,
+                            pheno=pheno,
+                            ids=ids,
+                            grm=grm,
+                            outprefix=outprefix,
+                            maf_threshold=maf_threshold_scan,
+                            max_missing_rate=max_missing_rate_scan,
+                            genetic_model=args.model,
+                            het_threshold=het_threshold_scan,
+                            chunk_size=args.chunksize,
+                            qmatrix=qmatrix,
+                            cov_all=cov_all,
+                            plot=args.plot,
+                            threads=args.thread,
+                            logger=logger,
+                            use_spinner=use_spinner,
+                            snps_only=bool(args.snps_only),
+                            eff_snp_by_trait=eff_snp_by_trait,
+                            summary_rows=gwas_summary_rows,
+                            saved_paths=saved_result_paths,
+                            trait_names=trait_one,
+                            emit_trait_header=bool(emit_trait_header_model),
+                            preloaded_packed=preloaded_packed,
+                            force_model=bool(args.force_model),
+                        )
+
                     def _run_route_algwas_packed(
                         trait_one: list[str], emit_trait_header_model: bool
                     ) -> None:
@@ -5878,6 +5949,43 @@ def _run_gwas_pipeline(
                     ) -> None:
                         run_chunked_gwas_lmm_lm(
                             model_name="fastlmm",
+                            genofile=genofile_stream,
+                            pheno=pheno,
+                            ids=ids,
+                            n_snps=n_snps,
+                            outprefix=outprefix,
+                            maf_threshold=maf_threshold_scan,
+                            max_missing_rate=max_missing_rate_scan,
+                            genetic_model=args.model,
+                            het_threshold=het_threshold_scan,
+                            chunk_size=args.chunksize,
+                            mmap_limit=mmap_limit_effective,
+                            grm=grm,
+                            qmatrix=qmatrix,
+                            cov_all=cov_all,
+                            eff_m=eff_m,
+                            plot=args.plot,
+                            threads=args.thread,
+                            logger=logger,
+                            use_spinner=use_spinner,
+                            snps_only=bool(args.snps_only),
+                            eff_snp_by_trait=eff_snp_by_trait,
+                            summary_rows=gwas_summary_rows,
+                            saved_paths=saved_result_paths,
+                            trait_names=trait_one,
+                            emit_trait_header=bool(emit_trait_header_model),
+                            chunk_size_user_set=bool(
+                                getattr(args, "_chunksize_user_set", True)
+                            ),
+                            prefer_packed_fullrust=bool(fast_mode),
+                            force_model=bool(args.force_model),
+                        )
+
+                    def _run_route_fvlmm_stream(
+                        trait_one: list[str], emit_trait_header_model: bool
+                    ) -> None:
+                        run_chunked_gwas_lmm_lm(
+                            model_name="fvlmm",
                             genofile=genofile_stream,
                             pheno=pheno,
                             ids=ids,
@@ -6013,11 +6121,13 @@ def _run_gwas_pipeline(
                         "lm_packed": _run_route_lm_packed,
                         "lmm_packed": _run_route_lmm_packed,
                         "fastlmm_packed": _run_route_fastlmm_packed,
+                        "fvlmm_packed": _run_route_fvlmm_packed,
                         "splmm": _run_route_splmm_packed,
                         "algwas": _run_route_algwas_packed,
                         "lm_stream": _run_route_lm_stream,
                         "lmm_stream": _run_route_lmm_stream,
                         "fastlmm_stream": _run_route_fastlmm_stream,
+                        "fvlmm_stream": _run_route_fvlmm_stream,
                         "farmcpu": _run_route_farmcpu,
                     }
                     route_aliases = {
@@ -6029,9 +6139,11 @@ def _run_gwas_pipeline(
                         "lmm_rust": "lmm_stream",
                         "fastlmm_memmap": "fastlmm_stream",
                         "fastlmm_rust": "fastlmm_stream",
+                        "fvlmm_memmap": "fvlmm_stream",
+                        "fvlmm_rust": "fvlmm_stream",
                         "farm": "farmcpu",
                     }
-                    stream_group_routes = {"lm_stream", "lmm_stream", "fastlmm_stream"}
+                    stream_group_routes = {"lm_stream", "lmm_stream", "fastlmm_stream", "fvlmm_stream"}
                     normalized_tasks: list[dict[str, object]] = []
                     for task_item in task_plan:
                         mk = str(task_item.get("model", "")).lower().strip()
@@ -6046,6 +6158,12 @@ def _run_gwas_pipeline(
                                     "fastlmm_packed"
                                     if bool(use_packed_fastlmm_scan)
                                     else "fastlmm_stream"
+                                )
+                            elif mk == "fvlmm":
+                                route = (
+                                    "fvlmm_packed"
+                                    if bool(use_packed_fastlmm_scan)
+                                    else "fvlmm_stream"
                                 )
                             elif mk == "splmm":
                                 route = "splmm"
@@ -6063,21 +6181,25 @@ def _run_gwas_pipeline(
                             "lm_packed",
                             "lmm_packed",
                             "fastlmm_packed",
+                            "fvlmm_packed",
                         }:
                             route = {
                                 "lm_packed": "lm_stream",
                                 "lmm_packed": "lmm_stream",
                                 "fastlmm_packed": "fastlmm_stream",
+                                "fvlmm_packed": "fvlmm_stream",
                             }[route]
                         if (not packed_preload_ready) and route in {
                             "lm_packed",
                             "lmm_packed",
                             "fastlmm_packed",
+                            "fvlmm_packed",
                         }:
                             route = {
                                 "lm_packed": "lm_stream",
                                 "lmm_packed": "lmm_stream",
                                 "fastlmm_packed": "fastlmm_stream",
+                                "fvlmm_packed": "fvlmm_stream",
                             }[route]
                         normalized_tasks.append(
                             {
@@ -6308,6 +6430,7 @@ def _run_gwas_pipeline(
                 "models": {
                     "lmm": bool(args.lmm),
                     "fastlmm": bool(args.fastlmm),
+                    "fvlmm": bool(args.fvlmm),
                     "lm": bool(args.lm),
                     "splmm": bool(args.splmm),
                     "algwas": bool(args.algwas),

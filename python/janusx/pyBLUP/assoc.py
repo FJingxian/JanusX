@@ -171,10 +171,20 @@ try:
     from janusx.janusx import (
         lmm_reml_chunk_from_snp_f32 as _lmm_reml_chunk_from_snp_f32,
         lmm_assoc_chunk_from_snp_f32 as _lmm_assoc_chunk_from_snp_f32,
+        fvlmm_assoc_chunk_f32 as _fvlmm_assoc_chunk_f32,
+        fvlmm_assoc_chunk_from_snp_f32 as _fvlmm_assoc_chunk_from_snp_f32,
+        fvlmm_assoc_prepare_cache_f32 as _fvlmm_assoc_prepare_cache_f32,
+        fvlmm_assoc_chunk_with_cache_f32 as _fvlmm_assoc_chunk_with_cache_f32,
+        fvlmm_assoc_chunk_from_snp_with_cache_f32 as _fvlmm_assoc_chunk_from_snp_with_cache_f32,
     )
 except Exception:
     _lmm_reml_chunk_from_snp_f32 = None
     _lmm_assoc_chunk_from_snp_f32 = None
+    _fvlmm_assoc_chunk_f32 = None
+    _fvlmm_assoc_chunk_from_snp_f32 = None
+    _fvlmm_assoc_prepare_cache_f32 = None
+    _fvlmm_assoc_chunk_with_cache_f32 = None
+    _fvlmm_assoc_chunk_from_snp_with_cache_f32 = None
 try:
     from janusx.janusx import lmm_rotate_x_y_with_ut_f64 as _lmm_rotate_x_y_with_ut_f64
 except Exception:
@@ -1126,6 +1136,78 @@ def lmm_assoc_fixed(
     return beta_se_p
 
 
+def fvlmm_assoc_fixed(
+    S: np.ndarray,
+    utx: np.ndarray,
+    uty: np.ndarray,
+    log10_lbd: float,
+    utsnp_chunk: np.ndarray,
+    threads: int = 4,
+    nullml: Optional[float] = None,
+) -> np.ndarray:
+    """
+    Fixed-variance LMM scan on an already-rotated SNP chunk.
+    """
+    if (
+        _fvlmm_assoc_prepare_cache_f32 is not None
+        and _fvlmm_assoc_chunk_with_cache_f32 is not None
+    ):
+        cache = fvlmm_assoc_prepare_cache(S, utx, uty, log10_lbd)
+        return fvlmm_assoc_fixed_with_cache(
+            cache,
+            utsnp_chunk,
+            threads=threads,
+            nullml=nullml,
+        )
+
+    if _fvlmm_assoc_chunk_f32 is None:
+        raise RuntimeError(
+            "Rust extension missing fvlmm_assoc_chunk_f32. "
+            "Rebuild janusx extension for rotated FvLMM GWAS mode."
+        )
+
+    S = np.ascontiguousarray(S, dtype=np.float64).ravel()
+    Xcov = np.ascontiguousarray(utx, dtype=np.float64)
+    y_rot = np.ascontiguousarray(uty, dtype=np.float64).ravel()
+    utsnp_chunk = np.ascontiguousarray(utsnp_chunk, dtype=np.float32)
+
+    beta_se_p = _fvlmm_assoc_chunk_f32(
+        S,
+        Xcov,
+        y_rot,
+        float(log10_lbd),
+        utsnp_chunk,
+        int(threads),
+        None if nullml is None else float(nullml),
+    )
+    return beta_se_p
+
+
+def fvlmm_assoc_fixed_with_cache(
+    cache: object,
+    utsnp_chunk: np.ndarray,
+    threads: int = 4,
+    nullml: Optional[float] = None,
+) -> np.ndarray:
+    """
+    Fixed-variance LMM scan on an already-rotated SNP chunk using a cached null model.
+    """
+    if _fvlmm_assoc_chunk_with_cache_f32 is None:
+        raise RuntimeError(
+            "Rust extension missing fvlmm_assoc_chunk_with_cache_f32. "
+            "Rebuild janusx extension for cached rotated FvLMM GWAS mode."
+        )
+
+    utsnp_chunk = np.ascontiguousarray(utsnp_chunk, dtype=np.float32)
+    beta_se_p = _fvlmm_assoc_chunk_with_cache_f32(
+        cache,
+        utsnp_chunk,
+        int(threads),
+        None if nullml is None else float(nullml),
+    )
+    return beta_se_p
+
+
 def lmm_assoc_fixed_from_snp(
     S: np.ndarray,
     utx: np.ndarray,
@@ -1178,6 +1260,101 @@ def lmm_assoc_fixed_from_snp(
         int(rotate_block_rows),
     )
     return beta_se_p
+
+
+def fvlmm_assoc_fixed_from_snp(
+    S: np.ndarray,
+    utx: np.ndarray,
+    uty: np.ndarray,
+    log10_lbd: float,
+    snp_chunk: np.ndarray,
+    u_t: np.ndarray,
+    threads: int = 4,
+    nullml: Optional[float] = None,
+    rotate_block_rows: int = 512,
+) -> np.ndarray:
+    """
+    Fixed-variance LMM scan on raw SNP chunk using the BLAS-blocked Rust kernel.
+    """
+    if _fvlmm_assoc_chunk_from_snp_f32 is None:
+        raise RuntimeError(
+            "Rust extension missing fvlmm_assoc_chunk_from_snp_f32. "
+            "Rebuild janusx extension for FvLMM GWAS mode."
+        )
+
+    S = np.ascontiguousarray(S, dtype=np.float64).ravel()
+    Xcov = np.ascontiguousarray(utx, dtype=np.float64)
+    y_rot = np.ascontiguousarray(uty, dtype=np.float64).ravel()
+    snp_chunk = np.ascontiguousarray(snp_chunk, dtype=np.float32)
+    u_t = np.ascontiguousarray(u_t, dtype=np.float32)
+    beta_se_p = _fvlmm_assoc_chunk_from_snp_f32(
+        S,
+        Xcov,
+        y_rot,
+        float(log10_lbd),
+        snp_chunk,
+        u_t,
+        int(threads),
+        None if nullml is None else float(nullml),
+        int(rotate_block_rows),
+    )
+    return beta_se_p
+
+
+def fvlmm_assoc_fixed_from_snp_with_cache(
+    cache: object,
+    snp_chunk: np.ndarray,
+    u_t: np.ndarray,
+    threads: int = 4,
+    nullml: Optional[float] = None,
+    rotate_block_rows: int = 512,
+) -> np.ndarray:
+    """
+    Fixed-variance LMM scan on raw SNP chunk using a trait-level cached null model.
+    """
+    if _fvlmm_assoc_chunk_from_snp_with_cache_f32 is None:
+        raise RuntimeError(
+            "Rust extension missing fvlmm_assoc_chunk_from_snp_with_cache_f32. "
+            "Rebuild janusx extension for cached FvLMM GWAS mode."
+        )
+
+    snp_chunk = np.ascontiguousarray(snp_chunk, dtype=np.float32)
+    u_t = np.ascontiguousarray(u_t, dtype=np.float32)
+    beta_se_p = _fvlmm_assoc_chunk_from_snp_with_cache_f32(
+        cache,
+        snp_chunk,
+        u_t,
+        int(threads),
+        None if nullml is None else float(nullml),
+        int(rotate_block_rows),
+    )
+    return beta_se_p
+
+
+def fvlmm_assoc_prepare_cache(
+    S: np.ndarray,
+    utx: np.ndarray,
+    uty: np.ndarray,
+    log10_lbd: float,
+) -> object:
+    """
+    Prepare the trait-level fixed-lambda null cache for FvLMM scans.
+    """
+    if _fvlmm_assoc_prepare_cache_f32 is None:
+        raise RuntimeError(
+            "Rust extension missing fvlmm_assoc_prepare_cache_f32. "
+            "Rebuild janusx extension for cached FvLMM GWAS mode."
+        )
+
+    S = np.ascontiguousarray(S, dtype=np.float64).ravel()
+    Xcov = np.ascontiguousarray(utx, dtype=np.float64)
+    y_rot = np.ascontiguousarray(uty, dtype=np.float64).ravel()
+    return _fvlmm_assoc_prepare_cache_f32(
+        S,
+        Xcov,
+        y_rot,
+        float(log10_lbd),
+    )
 
 
 class LMM:
@@ -1362,6 +1539,8 @@ class LMM:
         self.u2tx = None
         self.u1ty = None
         self.u2ty = None
+        self._fvlmm_assoc_cache = None
+        self._fvlmm_assoc_cache_log10_lbd = None
 
         if self.lowrank:
             (
@@ -1464,6 +1643,8 @@ class LMM:
             "u2tx",
             "u1ty",
             "u2ty",
+            "_fvlmm_assoc_cache",
+            "_fvlmm_assoc_cache_log10_lbd",
         ):
             setattr(obj, attr, getattr(other, attr, None))
         return obj
@@ -1582,6 +1763,119 @@ class FastLMM(LMM):
             nullml=self.ML0,
         )
         return beta_se_p
+
+
+class FvLMM(LMM):
+    """
+    Fixed-variance LMM GWAS using the null-model lambda for the whole scan.
+
+    Unlike FastLMM, this route does not switch back to per-SNP REML merely
+    because the null PVE is near the boundary. It is intended as the explicit
+    full-rank spectral fixed-variance scan path.
+    """
+
+    def _ensure_assoc_cache(self, log10_lbd: float) -> Optional[object]:
+        if bool(getattr(self, "lowrank", False)):
+            return None
+        if (
+            _fvlmm_assoc_prepare_cache_f32 is None
+            or (
+                _fvlmm_assoc_chunk_from_snp_with_cache_f32 is None
+                and _fvlmm_assoc_chunk_with_cache_f32 is None
+            )
+        ):
+            return None
+
+        cache = getattr(self, "_fvlmm_assoc_cache", None)
+        cache_log10_lbd = getattr(self, "_fvlmm_assoc_cache_log10_lbd", None)
+        need_rebuild = cache is None or cache_log10_lbd is None
+        if not need_rebuild:
+            try:
+                need_rebuild = (
+                    abs(float(cache_log10_lbd) - float(log10_lbd)) > 1e-12
+                    or int(getattr(cache, "n")) != int(self.n)
+                    or int(getattr(cache, "p")) != int(self.Xcov.shape[1])
+                )
+            except Exception:
+                need_rebuild = True
+        if need_rebuild:
+            cache = fvlmm_assoc_prepare_cache(
+                self.S,
+                self.Xcov,
+                self.y,
+                float(log10_lbd),
+            )
+            self._fvlmm_assoc_cache = cache
+            self._fvlmm_assoc_cache_log10_lbd = float(log10_lbd)
+        return cache
+
+    def gwas_rotated(self, utsnp_chunk: np.ndarray, threads: int = 1) -> np.ndarray:
+        lbd_null = float(getattr(self, "lbd_null", np.nan))
+        if not (np.isfinite(lbd_null) and lbd_null > 0.0):
+            raise RuntimeError("FvLMM.gwas_rotated requires a finite positive null lambda.")
+
+        log10_lbd = float(np.log10(lbd_null))
+        if bool(getattr(self, "lowrank", False)):
+            raise RuntimeError(
+                "FvLMM.gwas_rotated is only available for full-rank spectral path."
+            )
+
+        cache = self._ensure_assoc_cache(log10_lbd)
+        if cache is not None and _fvlmm_assoc_chunk_with_cache_f32 is not None:
+            return fvlmm_assoc_fixed_with_cache(
+                cache,
+                utsnp_chunk,
+                threads=threads,
+                nullml=self.ML0,
+            )
+        return fvlmm_assoc_fixed(
+            self.S,
+            self.Xcov,
+            self.y,
+            log10_lbd,
+            utsnp_chunk,
+            threads=threads,
+            nullml=self.ML0,
+        )
+
+    def gwas(self, snp: np.ndarray, threads: int = 1) -> np.ndarray:
+        lbd_null = float(getattr(self, "lbd_null", np.nan))
+        if not (np.isfinite(lbd_null) and lbd_null > 0.0):
+            return super().gwas(snp, threads=threads)
+
+        log10_lbd = float(np.log10(lbd_null))
+        if bool(getattr(self, "lowrank", False)):
+            return fastlmm_assoc_from_snp(
+                self.S,
+                self.u1tx,
+                self.u2tx,
+                self.u1ty,
+                self.u2ty,
+                log10_lbd,
+                np.ascontiguousarray(np.asarray(snp, dtype=np.float32), dtype=np.float32),
+                self.u1t,
+                threads=threads,
+                nullml=self.ML0,
+            )
+        cache = self._ensure_assoc_cache(log10_lbd)
+        if cache is not None and _fvlmm_assoc_chunk_from_snp_with_cache_f32 is not None:
+            return fvlmm_assoc_fixed_from_snp_with_cache(
+                cache,
+                snp,
+                self.Dh,
+                threads=threads,
+                nullml=self.ML0,
+            )
+        return fvlmm_assoc_fixed_from_snp(
+            self.S,
+            self.Xcov,
+            self.y,
+            log10_lbd,
+            snp,
+            self.Dh,
+            threads=threads,
+            nullml=self.ML0,
+        )
 
 
 class LM:

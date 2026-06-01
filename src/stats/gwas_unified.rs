@@ -7,7 +7,10 @@ use crate::algwas::algwas_packed_to_tsv;
 use crate::assoc::farmcpu_packed_to_tsv;
 use crate::glm::glmf32_packed_assoc_to_tsv;
 use crate::linalg::{chi2_sf_df1, cholesky_inplace, cholesky_solve_into};
-use crate::lmm_scan::{fastlmm_assoc_packed_f32_to_tsv, lmm_reml_assoc_packed_f32_to_tsv};
+use crate::lmm_scan::{
+    fastlmm_assoc_packed_f32_to_tsv, fvlmm_assoc_packed_f32_to_tsv,
+    lmm_reml_assoc_packed_f32_to_tsv,
+};
 
 fn req_item<'py>(d: &Bound<'py, PyDict>, key: &str) -> PyResult<Bound<'py, PyAny>> {
     d.get_item(key)?.ok_or_else(|| {
@@ -240,6 +243,7 @@ pub fn gwas_trait_model_dispatch_v2<'py>(
             "lm" => Some("lm"),
             "lmm" => Some("lmm"),
             "fastlmm" => Some("fastlmm"),
+            "fvlmm" => Some("fvlmm"),
             "algwas" => Some("algwas"),
             "splmm" => Some("splmm"),
             _ => None,
@@ -268,6 +272,13 @@ pub fn gwas_trait_model_dispatch_v2<'py>(
                         "fastlmm_packed"
                     } else {
                         "fastlmm_stream"
+                    }
+                }
+                "fvlmm" => {
+                    if use_packed_fastlmm {
+                        "fvlmm_packed"
+                    } else {
+                        "fvlmm_stream"
                     }
                 }
                 "farmcpu" => "farmcpu",
@@ -488,7 +499,7 @@ pub fn gwas_packed_unified_to_tsv<'py>(
                 )?;
                 result_obj.set_item("written_rows", n_written)?;
             }
-            "fastlmm" => {
+            "fastlmm" | "fvlmm" => {
                 let y: PyReadonlyArray1<'py, f64> = req_item(&job, "y")?.extract()?;
                 let u: PyReadonlyArray2<'py, f32> = req_item(&job, "u")?.extract()?;
                 let s: PyReadonlyArray1<'py, f32> = req_item(&job, "s")?.extract()?;
@@ -525,18 +536,23 @@ pub fn gwas_packed_unified_to_tsv<'py>(
                     .and_then(|v| v.extract().ok())
                     .unwrap_or_else(|| "add".to_string());
 
-                let fixed_lbd: Option<f64> = if model_lc == "fastlmm" {
+                let fixed_lbd: Option<f64> = if model_lc == "fastlmm" || model_lc == "fvlmm" {
                     opt_item(&job, "fixed_lbd")?.and_then(|v| v.extract().ok())
                 } else {
                     None
                 };
-                let fixed_ml0: Option<f64> = if model_lc == "fastlmm" {
+                let fixed_ml0: Option<f64> = if model_lc == "fastlmm" || model_lc == "fvlmm" {
                     opt_item(&job, "fixed_ml0")?.and_then(|v| v.extract().ok())
                 } else {
                     None
                 };
 
-                let (lbd, ml0, reml0) = fastlmm_assoc_packed_f32_to_tsv(
+                let scan_fn = if model_lc == "fvlmm" {
+                    fvlmm_assoc_packed_f32_to_tsv
+                } else {
+                    fastlmm_assoc_packed_f32_to_tsv
+                };
+                let (lbd, ml0, reml0) = scan_fn(
                     py,
                     packed.clone(),
                     n_samples,
@@ -701,7 +717,7 @@ pub fn gwas_packed_unified_to_tsv<'py>(
             }
             _ => {
                 return Err(PyValueError::new_err(format!(
-                    "jobs[{i}] has unsupported model '{}'; expected one of: lm, lmm, fastlmm, farmcpu, algwas",
+                    "jobs[{i}] has unsupported model '{}'; expected one of: lm, lmm, fastlmm, fvlmm, farmcpu, algwas",
                     model_lc
                 )));
             }

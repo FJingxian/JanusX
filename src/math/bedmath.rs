@@ -657,7 +657,7 @@ unsafe fn decode_subset_with_plan_neon(
 }
 
 #[inline]
-fn decode_subset_with_plan(
+pub(crate) fn decode_subset_with_plan(
     row: &[u8],
     plan: &SubsetDecodePlan,
     value_lut: &[f32; 4],

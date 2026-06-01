@@ -14,10 +14,17 @@ use rayon::prelude::*;
 use std::borrow::Cow;
 use std::f64::consts::PI;
 use std::fmt::Write as _;
+use std::sync::Arc;
 use std::time::Instant;
 
 use crate::aireml::ai_reml_null_from_spectral;
-use crate::bedmath::packed_row_missing_count_selected;
+use crate::bedmath::{
+    decode_row_centered_full_lut, decode_subset_with_plan, packed_byte_lut,
+    packed_row_missing_count_selected, SubsetDecodePlan,
+};
+use crate::blas::{
+    cblas_sgemm_dispatch, BlasThreadGuard, CblasInt, CBLAS_NO_TRANS, CBLAS_ROW_MAJOR, CBLAS_TRANS,
+};
 use crate::brent::{brent_minimize, brent_minimize_with_init};
 use crate::linalg::{
     chi2_sf_df1, chisq_from_beta_se_and_optional_plrt, cholesky_inplace, cholesky_logdet,
@@ -1116,6 +1123,93 @@ fn rotate_snp_block_with_ut(
 }
 
 #[inline]
+fn row_major_mat_mul_f32_blas(
+    a: &[f32],
+    rows: usize,
+    cols: usize,
+    rhs: &[f32],
+    n_rhs: usize,
+    out: &mut [f32],
+    threads: usize,
+) {
+    if rows == 0 || cols == 0 || n_rhs == 0 {
+        return;
+    }
+    debug_assert!(a.len() >= rows.saturating_mul(cols));
+    debug_assert!(rhs.len() >= cols.saturating_mul(n_rhs));
+    debug_assert!(out.len() >= rows.saturating_mul(n_rhs));
+
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    unsafe {
+        let _blas_guard = BlasThreadGuard::enter(threads.max(1));
+        cblas_sgemm_dispatch(
+            CBLAS_ROW_MAJOR,
+            CBLAS_NO_TRANS,
+            CBLAS_NO_TRANS,
+            rows as CblasInt,
+            n_rhs as CblasInt,
+            cols as CblasInt,
+            1.0_f32,
+            a.as_ptr(),
+            cols as CblasInt,
+            rhs.as_ptr(),
+            n_rhs as CblasInt,
+            0.0_f32,
+            out.as_mut_ptr(),
+            n_rhs as CblasInt,
+        );
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        matmul_rowmajor_f32(a, rows, cols, rhs, n_rhs, out);
+    }
+}
+
+#[inline]
+fn rotate_snp_block_with_ut_blas(
+    snp_block: &[f32],
+    rows: usize,
+    n: usize,
+    u_t: &[f32],
+    out_block: &mut [f32],
+    threads: usize,
+) {
+    if rows == 0 || n == 0 {
+        return;
+    }
+    debug_assert!(snp_block.len() >= rows.saturating_mul(n));
+    debug_assert!(u_t.len() >= n.saturating_mul(n));
+    debug_assert!(out_block.len() >= rows.saturating_mul(n));
+
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    unsafe {
+        let _blas_guard = BlasThreadGuard::enter(threads.max(1));
+        cblas_sgemm_dispatch(
+            CBLAS_ROW_MAJOR,
+            CBLAS_NO_TRANS,
+            CBLAS_TRANS,
+            rows as CblasInt,
+            n as CblasInt,
+            n as CblasInt,
+            1.0_f32,
+            snp_block.as_ptr(),
+            n as CblasInt,
+            u_t.as_ptr(),
+            n as CblasInt,
+            0.0_f32,
+            out_block.as_mut_ptr(),
+            n as CblasInt,
+        );
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        rotate_snp_block_with_ut(snp_block, rows, n, u_t, out_block);
+    }
+}
+
+#[inline]
 #[allow(dead_code)]
 fn matmul_rowmajor_f32(a: &[f32], m: usize, k: usize, b: &[f32], n: usize, out: &mut [f32]) {
     if m == 0 || k == 0 || n == 0 {
@@ -1606,6 +1700,356 @@ impl AssocScratch {
     }
 }
 
+struct FixedLambdaAssocCacheF32 {
+    w: Vec<f32>,
+    py_tilde: Vec<f32>,
+    wx_tilde: Vec<f32>, // row-major (n, p)
+    a_chol: Vec<f64>,
+    ypy: f64,
+    log_det_v: f64,
+    df: i32,
+}
+
+#[pyclass]
+pub struct FvLmmAssocCache {
+    cache: Arc<FixedLambdaAssocCacheF32>,
+    n: usize,
+    p: usize,
+    lbd: f64,
+}
+
+#[pymethods]
+impl FvLmmAssocCache {
+    #[getter]
+    fn n(&self) -> usize {
+        self.n
+    }
+
+    #[getter]
+    fn p(&self) -> usize {
+        self.p
+    }
+
+    #[getter]
+    fn lbd(&self) -> f64 {
+        self.lbd
+    }
+}
+
+#[inline]
+fn stage_assoc_threads_or(requested_threads: usize) -> usize {
+    std::env::var("JX_MLM_RUST_THREADS")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(requested_threads)
+}
+
+fn prepare_fixed_lambda_assoc_cache_f32(
+    s: &[f64],
+    xcov_slice: &[f64],
+    y: &[f64],
+    n: usize,
+    p: usize,
+    lbd: f64,
+) -> PyResult<FixedLambdaAssocCacheF32> {
+    let mut w = vec![0.0_f32; n];
+    let mut log_det_v = 0.0_f64;
+    for i in 0..n {
+        let vv = s[i] + lbd;
+        if !(vv.is_finite() && vv > 0.0) {
+            return Err(PyRuntimeError::new_err("non-positive s[i]+lbd"));
+        }
+        w[i] = (1.0 / vv) as f32;
+        log_det_v += vv.ln();
+    }
+
+    let mut a = vec![0.0_f64; p * p];
+    let mut b = vec![0.0_f64; p];
+    let mut ywy = 0.0_f64;
+    for i in 0..n {
+        let wi = w[i] as f64;
+        let yi = y[i];
+        ywy += wi * yi * yi;
+        let base = i * p;
+        for r in 0..p {
+            let xir = xcov_slice[base + r];
+            b[r] += wi * xir * yi;
+            for c in 0..=r {
+                a[r * p + c] += wi * xir * xcov_slice[base + c];
+            }
+        }
+    }
+
+    let ridge = 1e-6_f64;
+    for r in 0..p {
+        a[r * p + r] += ridge;
+        for c in 0..r {
+            a[c * p + r] = a[r * p + c];
+        }
+    }
+    if cholesky_inplace(&mut a, p).is_none() {
+        return Err(PyRuntimeError::new_err("X'WX not SPD"));
+    }
+
+    let mut a_inv_b = vec![0.0_f64; p];
+    cholesky_solve_into(&a, p, &b, &mut a_inv_b);
+    let ypy = (ywy - dot_loop(&b, &a_inv_b)).max(0.0);
+
+    let mut wx_tilde = vec![0.0_f32; n * p];
+    let mut py_tilde = vec![0.0_f32; n];
+    for i in 0..n {
+        let wi = w[i] as f64;
+        let base = i * p;
+        let mut x_aib = 0.0_f64;
+        for r in 0..p {
+            let xir = xcov_slice[base + r];
+            wx_tilde[base + r] = (wi * xir) as f32;
+            x_aib += xir * a_inv_b[r];
+        }
+        py_tilde[i] = (wi * (y[i] - x_aib)) as f32;
+    }
+
+    let df = (n as i32) - (p as i32) - 1;
+    if df <= 0 {
+        return Err(PyRuntimeError::new_err("df <= 0"));
+    }
+
+    Ok(FixedLambdaAssocCacheF32 {
+        w,
+        py_tilde,
+        wx_tilde,
+        a_chol: a,
+        ypy,
+        log_det_v,
+        df,
+    })
+}
+
+#[inline]
+fn missing_count_from_rate(v: f32, n_samples: usize) -> usize {
+    if !v.is_finite() || v <= 0.0 {
+        0usize
+    } else {
+        ((v as f64) * (n_samples as f64)).round().max(0.0) as usize
+    }
+}
+
+fn fill_packed_missing_block(
+    miss_sub: &mut [usize],
+    sample_identity: bool,
+    row_missing: &[f32],
+    row_idx: Option<&[usize]>,
+    start: usize,
+    packed_flat: &[u8],
+    bytes_per_snp: usize,
+    n_samples: usize,
+    sample_idx: &[usize],
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) {
+    if sample_identity {
+        if let Some(tp) = pool {
+            tp.install(|| {
+                miss_sub.par_iter_mut().enumerate().for_each(|(off, dst)| {
+                    let idx = start + off;
+                    let src_row = row_idx.map(|v| v[idx]).unwrap_or(idx);
+                    *dst = missing_count_from_rate(row_missing[src_row], n_samples);
+                });
+            });
+        } else {
+            miss_sub.iter_mut().enumerate().for_each(|(off, dst)| {
+                let idx = start + off;
+                let src_row = row_idx.map(|v| v[idx]).unwrap_or(idx);
+                *dst = missing_count_from_rate(row_missing[src_row], n_samples);
+            });
+        }
+        return;
+    }
+
+    if let Some(tp) = pool {
+        tp.install(|| {
+            miss_sub.par_iter_mut().enumerate().for_each(|(off, dst)| {
+                let idx = start + off;
+                let src_row = row_idx.map(|v| v[idx]).unwrap_or(idx);
+                let row =
+                    &packed_flat[src_row * bytes_per_snp..(src_row + 1) * bytes_per_snp];
+                *dst = packed_row_missing_count_selected(row, n_samples, sample_idx);
+            });
+        });
+    } else {
+        miss_sub.iter_mut().enumerate().for_each(|(off, dst)| {
+            let idx = start + off;
+            let src_row = row_idx.map(|v| v[idx]).unwrap_or(idx);
+            let row = &packed_flat[src_row * bytes_per_snp..(src_row + 1) * bytes_per_snp];
+            *dst = packed_row_missing_count_selected(row, n_samples, sample_idx);
+        });
+    }
+}
+
+#[inline]
+fn maybe_build_dense_subset_pos(sample_idx: &[usize], n_samples_full: usize) -> Option<Vec<isize>> {
+    if sample_idx.is_empty() || sample_idx.len() >= n_samples_full {
+        return None;
+    }
+    if sample_idx.len().saturating_mul(4) < n_samples_full.saturating_mul(3) {
+        return None;
+    }
+    let mut pos = vec![-1isize; n_samples_full];
+    for (j, &sid) in sample_idx.iter().enumerate() {
+        if pos[sid] >= 0 {
+            return None;
+        }
+        pos[sid] = j as isize;
+    }
+    Some(pos)
+}
+
+#[inline]
+fn packed_rotate_block_target_bytes() -> usize {
+    let default_mb = 64usize;
+    let mb = std::env::var("JX_GWAS_ROTATE_BLOCK_MB")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(default_mb);
+    mb.saturating_mul(1024 * 1024)
+}
+
+#[inline]
+fn packed_rotate_block_rows(max_rows: usize, n: usize, extra_row_bytes: usize) -> usize {
+    let bytes_per_row = n
+        .saturating_mul(2)
+        .saturating_mul(std::mem::size_of::<f32>())
+        .saturating_add(extra_row_bytes)
+        .max(1);
+    max_rows
+        .min((packed_rotate_block_target_bytes() / bytes_per_row).max(1))
+        .max(1)
+}
+
+#[inline]
+fn packed_progress_should_emit(
+    done: usize,
+    total: usize,
+    progress_block: usize,
+    next_emit: &mut usize,
+) -> bool {
+    if done >= total {
+        *next_emit = total.saturating_add(progress_block.max(1));
+        return true;
+    }
+    if done < *next_emit {
+        return false;
+    }
+    let step = progress_block.max(1);
+    while *next_emit <= done {
+        *next_emit = next_emit.saturating_add(step);
+    }
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
+fn assoc_fixed_lambda_rot_block_blas_f32(
+    g_rot: &[f32],
+    rows: usize,
+    n: usize,
+    p: usize,
+    cache: &FixedLambdaAssocCacheF32,
+    out: &mut [f64],
+    out_cols: usize,
+    threads: usize,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+    nullml: Option<f64>,
+) {
+    if rows == 0 {
+        return;
+    }
+    debug_assert!(g_rot.len() >= rows.saturating_mul(n));
+    debug_assert!(out.len() >= rows.saturating_mul(out_cols));
+
+    let mut num_buf = vec![0.0_f32; rows];
+    let mut c_buf = vec![0.0_f32; rows * p];
+    row_major_mat_mul_f32_blas(g_rot, rows, n, &cache.py_tilde, 1, &mut num_buf, threads);
+    row_major_mat_mul_f32_blas(g_rot, rows, n, &cache.wx_tilde, p, &mut c_buf, threads);
+
+    let with_plrt = nullml.is_some();
+    let nullml_val = nullml.unwrap_or(0.0);
+    let n_f = n as f64;
+    let c_ml = n_f * (n_f.ln() - 1.0 - (2.0 * PI).ln()) / 2.0;
+
+    let mut run = || {
+        out.par_chunks_mut(out_cols).enumerate().for_each_init(
+            || AssocScratch::new(p),
+            |scr, (idx, out_row)| {
+                scr.reset();
+                let row = &g_rot[idx * n..(idx + 1) * n];
+                let crow = &c_buf[idx * p..(idx + 1) * p];
+
+                let mut d = 0.0_f64;
+                for i in 0..n {
+                    let gi = row[i] as f64;
+                    d += (cache.w[i] as f64) * gi * gi;
+                }
+                for r in 0..p {
+                    scr.c[r] = crow[r] as f64;
+                }
+
+                cholesky_solve_into(&cache.a_chol, p, &scr.c, &mut scr.a_inv_c);
+                let ct_aic = dot_loop(&scr.c, &scr.a_inv_c);
+                let schur = d - ct_aic;
+                if schur <= 1e-12 || !schur.is_finite() {
+                    out_row[0] = f64::NAN;
+                    out_row[1] = f64::NAN;
+                    out_row[2] = f64::NAN;
+                    if with_plrt {
+                        out_row[3] = 1.0;
+                    }
+                    return;
+                }
+
+                let num = num_buf[idx] as f64;
+                let beta_g = num / schur;
+                let rwr = (cache.ypy - (num * num) / schur).max(0.0);
+                let sigma2 = rwr / (cache.df as f64);
+                let se_g = (sigma2 / schur).sqrt();
+                let pval = if se_g.is_finite() && se_g > 0.0 && beta_g.is_finite() {
+                    let z = (beta_g / se_g).abs();
+                    (2.0 * normal_sf(z)).clamp(f64::MIN_POSITIVE, 1.0)
+                } else {
+                    1.0
+                };
+
+                out_row[0] = beta_g;
+                out_row[1] = se_g;
+                out_row[2] = pval;
+                if with_plrt {
+                    let ml = if rwr > 0.0 && rwr.is_finite() {
+                        let total_log = n_f * rwr.ln() + cache.log_det_v;
+                        c_ml - 0.5 * total_log
+                    } else {
+                        f64::NAN
+                    };
+                    let mut stat = if ml.is_finite() {
+                        2.0 * (ml - nullml_val)
+                    } else {
+                        0.0
+                    };
+                    if !stat.is_finite() || stat < 0.0 {
+                        stat = 0.0;
+                    }
+                    out_row[3] = chi2_sf_df1(stat);
+                }
+            },
+        );
+    };
+
+    if let Some(tp) = pool {
+        tp.install(run);
+    } else {
+        run();
+    }
+}
+
 #[pyfunction]
 #[pyo3(signature = (s, xcov, y_rot, log10_lbd, g_rot_chunk, threads=0, nullml=None))]
 pub fn lmm_assoc_chunk_f32<'py>(
@@ -1819,6 +2263,160 @@ pub fn lmm_assoc_chunk_f32<'py>(
     });
 
     Ok(out)
+}
+
+#[pyfunction]
+#[pyo3(signature = (s, xcov, y_rot, log10_lbd))]
+pub fn fvlmm_assoc_prepare_cache_f32<'py>(
+    _py: Python<'py>,
+    s: PyReadonlyArray1<'py, f64>,
+    xcov: PyReadonlyArray2<'py, f64>,
+    y_rot: PyReadonlyArray1<'py, f64>,
+    log10_lbd: f64,
+) -> PyResult<FvLmmAssocCache> {
+    let s = s.as_slice()?;
+    let xcov_arr = xcov.as_array();
+    let y = y_rot.as_slice()?;
+
+    let n = y.len();
+    let (xc_n, p_cov) = (xcov_arr.shape()[0], xcov_arr.shape()[1]);
+    if xc_n != n {
+        return Err(PyRuntimeError::new_err("Xcov.n_rows must equal len(y_rot)"));
+    }
+    if s.len() != n {
+        return Err(PyRuntimeError::new_err("len(S) must equal len(y_rot)"));
+    }
+    if n <= p_cov + 1 {
+        return Err(PyRuntimeError::new_err("n must be > p_cov+1"));
+    }
+
+    let lbd = 10.0_f64.powf(log10_lbd);
+    if !lbd.is_finite() || lbd <= 0.0 {
+        return Err(PyRuntimeError::new_err("invalid log10_lbd"));
+    }
+
+    let xcov_slice: &[f64] = xcov
+        .as_slice()
+        .map_err(|_| PyRuntimeError::new_err("xcov must be contiguous (C-order)"))?;
+    let p = p_cov;
+    let cache = prepare_fixed_lambda_assoc_cache_f32(s, xcov_slice, y, n, p, lbd)?;
+    Ok(FvLmmAssocCache {
+        cache: Arc::new(cache),
+        n,
+        p,
+        lbd,
+    })
+}
+
+fn fvlmm_assoc_chunk_with_cache_impl<'py>(
+    py: Python<'py>,
+    cache: Arc<FixedLambdaAssocCacheF32>,
+    n: usize,
+    p: usize,
+    g_rot_chunk: PyReadonlyArray2<'py, f32>,
+    threads: usize,
+    nullml: Option<f64>,
+) -> PyResult<Bound<'py, PyArray2<f64>>> {
+    let g_arr = g_rot_chunk.as_array();
+    if g_arr.shape()[1] != n {
+        return Err(PyRuntimeError::new_err("g_rot_chunk must be (m, n)"));
+    }
+
+    let with_plrt = nullml.is_some();
+    let out_cols = if with_plrt { 4 } else { 3 };
+    let m = g_arr.shape()[0];
+    let out = PyArray2::<f64>::zeros(py, [m, out_cols], false).into_bound();
+    let out_slice: &mut [f64] = unsafe {
+        out.as_slice_mut()
+            .map_err(|_| PyRuntimeError::new_err("out not contiguous"))?
+    };
+
+    let g_flat: Cow<[f32]> = match g_rot_chunk.as_slice() {
+        Ok(slc) => Cow::Borrowed(slc),
+        Err(_) => Cow::Owned(g_arr.iter().copied().collect()),
+    };
+    let assoc_threads = stage_assoc_threads_or(threads);
+    let pool = get_cached_pool(assoc_threads)?;
+
+    py.detach(move || {
+        assoc_fixed_lambda_rot_block_blas_f32(
+            &g_flat,
+            m,
+            n,
+            p,
+            cache.as_ref(),
+            out_slice,
+            out_cols,
+            assoc_threads,
+            pool.as_ref(),
+            nullml,
+        );
+    });
+
+    Ok(out)
+}
+
+#[pyfunction]
+#[pyo3(signature = (cache, g_rot_chunk, threads=0, nullml=None))]
+pub fn fvlmm_assoc_chunk_with_cache_f32<'py>(
+    py: Python<'py>,
+    cache: PyRef<'py, FvLmmAssocCache>,
+    g_rot_chunk: PyReadonlyArray2<'py, f32>,
+    threads: usize,
+    nullml: Option<f64>,
+) -> PyResult<Bound<'py, PyArray2<f64>>> {
+    fvlmm_assoc_chunk_with_cache_impl(
+        py,
+        Arc::clone(&cache.cache),
+        cache.n,
+        cache.p,
+        g_rot_chunk,
+        threads,
+        nullml,
+    )
+}
+
+#[pyfunction]
+#[pyo3(signature = (s, xcov, y_rot, log10_lbd, g_rot_chunk, threads=0, nullml=None))]
+pub fn fvlmm_assoc_chunk_f32<'py>(
+    py: Python<'py>,
+    s: PyReadonlyArray1<'py, f64>,
+    xcov: PyReadonlyArray2<'py, f64>,
+    y_rot: PyReadonlyArray1<'py, f64>,
+    log10_lbd: f64,
+    g_rot_chunk: PyReadonlyArray2<'py, f32>,
+    threads: usize,
+    nullml: Option<f64>,
+) -> PyResult<Bound<'py, PyArray2<f64>>> {
+    let s = s.as_slice()?;
+    let xcov_arr = xcov.as_array();
+    let y = y_rot.as_slice()?;
+
+    let n = y.len();
+    let (xc_n, p_cov) = (xcov_arr.shape()[0], xcov_arr.shape()[1]);
+    if xc_n != n {
+        return Err(PyRuntimeError::new_err("Xcov.n_rows must equal len(y_rot)"));
+    }
+    if s.len() != n {
+        return Err(PyRuntimeError::new_err("len(S) must equal len(y_rot)"));
+    }
+    if n <= p_cov + 1 {
+        return Err(PyRuntimeError::new_err("n must be > p_cov+1"));
+    }
+
+    let lbd = 10.0_f64.powf(log10_lbd);
+    if !lbd.is_finite() || lbd <= 0.0 {
+        return Err(PyRuntimeError::new_err("invalid log10_lbd"));
+    }
+
+    let xcov_slice: &[f64] = xcov
+        .as_slice()
+        .map_err(|_| PyRuntimeError::new_err("xcov must be contiguous (C-order)"))?;
+    let p = p_cov;
+    let cache = Arc::new(prepare_fixed_lambda_assoc_cache_f32(
+        s, xcov_slice, y, n, p, lbd,
+    )?);
+    fvlmm_assoc_chunk_with_cache_impl(py, cache, n, p, g_rot_chunk, threads, nullml)
 }
 
 #[pyfunction]
@@ -2077,6 +2675,181 @@ pub fn lmm_assoc_chunk_from_snp_f32<'py>(
                 );
                 run_rows(rot_block, out_block);
             }
+            start += rows;
+        }
+    });
+
+    Ok(out)
+}
+
+#[pyfunction]
+#[pyo3(signature = (cache, snp_chunk, u_t, threads=0, nullml=None, rotate_block_rows=512))]
+pub fn fvlmm_assoc_chunk_from_snp_with_cache_f32<'py>(
+    py: Python<'py>,
+    cache: PyRef<'py, FvLmmAssocCache>,
+    snp_chunk: PyReadonlyArray2<'py, f32>,
+    u_t: PyReadonlyArray2<'py, f32>,
+    threads: usize,
+    nullml: Option<f64>,
+    rotate_block_rows: usize,
+) -> PyResult<Bound<'py, PyArray2<f64>>> {
+    let snp_arr = snp_chunk.as_array();
+    let ut_arr = u_t.as_array();
+
+    let n = cache.n;
+    let p = cache.p;
+    if snp_arr.shape()[1] != n {
+        return Err(PyRuntimeError::new_err("snp_chunk must be (m, n)"));
+    }
+    if ut_arr.shape()[0] != n || ut_arr.shape()[1] != n {
+        return Err(PyRuntimeError::new_err(
+            "u_t must be (n, n) and row-major U^T",
+        ));
+    }
+
+    let with_plrt = nullml.is_some();
+    let out_cols = if with_plrt { 4 } else { 3 };
+    let m = snp_arr.shape()[0];
+    let out = PyArray2::<f64>::zeros(py, [m, out_cols], false).into_bound();
+    let out_slice: &mut [f64] = unsafe {
+        out.as_slice_mut()
+            .map_err(|_| PyRuntimeError::new_err("out not contiguous"))?
+    };
+
+    let snp_flat: Cow<[f32]> = match snp_chunk.as_slice() {
+        Ok(slc) => Cow::Borrowed(slc),
+        Err(_) => Cow::Owned(snp_arr.iter().copied().collect()),
+    };
+    let ut_flat: Cow<[f32]> = match u_t.as_slice() {
+        Ok(slc) => Cow::Borrowed(slc),
+        Err(_) => Cow::Owned(ut_arr.iter().copied().collect()),
+    };
+
+    let assoc_threads = stage_assoc_threads_or(threads);
+    let pool = get_cached_pool(assoc_threads)?;
+    let block_rows = rotate_block_rows.max(1);
+    let cache_arc = Arc::clone(&cache.cache);
+
+    py.detach(|| {
+        let mut rot_buf = vec![0.0_f32; block_rows * n];
+        let mut start = 0usize;
+        while start < m {
+            let rows = (m - start).min(block_rows);
+            let snp_block = &snp_flat[start * n..(start + rows) * n];
+            let rot_block = &mut rot_buf[..rows * n];
+            rotate_snp_block_with_ut_blas(snp_block, rows, n, &ut_flat, rot_block, threads);
+            let out_block = &mut out_slice[start * out_cols..(start + rows) * out_cols];
+            assoc_fixed_lambda_rot_block_blas_f32(
+                rot_block,
+                rows,
+                n,
+                p,
+                cache_arc.as_ref(),
+                out_block,
+                out_cols,
+                assoc_threads,
+                pool.as_ref(),
+                nullml,
+            );
+            start += rows;
+        }
+    });
+
+    Ok(out)
+}
+
+#[pyfunction]
+#[pyo3(signature = (s, xcov, y_rot, log10_lbd, snp_chunk, u_t, threads=0, nullml=None, rotate_block_rows=512))]
+pub fn fvlmm_assoc_chunk_from_snp_f32<'py>(
+    py: Python<'py>,
+    s: PyReadonlyArray1<'py, f64>,
+    xcov: PyReadonlyArray2<'py, f64>,
+    y_rot: PyReadonlyArray1<'py, f64>,
+    log10_lbd: f64,
+    snp_chunk: PyReadonlyArray2<'py, f32>,
+    u_t: PyReadonlyArray2<'py, f32>,
+    threads: usize,
+    nullml: Option<f64>,
+    rotate_block_rows: usize,
+) -> PyResult<Bound<'py, PyArray2<f64>>> {
+    let s = s.as_slice()?;
+    let xcov_arr = xcov.as_array();
+    let y = y_rot.as_slice()?;
+    let snp_arr = snp_chunk.as_array();
+    let ut_arr = u_t.as_array();
+
+    let n = y.len();
+    let (xc_n, p_cov) = (xcov_arr.shape()[0], xcov_arr.shape()[1]);
+    if xc_n != n {
+        return Err(PyRuntimeError::new_err("Xcov.n_rows must equal len(y_rot)"));
+    }
+    if s.len() != n {
+        return Err(PyRuntimeError::new_err("len(S) must equal len(y_rot)"));
+    }
+    if snp_arr.shape()[1] != n {
+        return Err(PyRuntimeError::new_err("snp_chunk must be (m, n)"));
+    }
+    if ut_arr.shape()[0] != n || ut_arr.shape()[1] != n {
+        return Err(PyRuntimeError::new_err(
+            "u_t must be (n, n) and row-major U^T",
+        ));
+    }
+    if n <= p_cov + 1 {
+        return Err(PyRuntimeError::new_err("n must be > p_cov+1"));
+    }
+
+    let lbd = 10.0_f64.powf(log10_lbd);
+    if !lbd.is_finite() || lbd <= 0.0 {
+        return Err(PyRuntimeError::new_err("invalid log10_lbd"));
+    }
+
+    let with_plrt = nullml.is_some();
+    let out_cols = if with_plrt { 4 } else { 3 };
+    let m = snp_arr.shape()[0];
+    let out = PyArray2::<f64>::zeros(py, [m, out_cols], false).into_bound();
+    let out_slice: &mut [f64] = unsafe {
+        out.as_slice_mut()
+            .map_err(|_| PyRuntimeError::new_err("out not contiguous"))?
+    };
+
+    let xcov_slice: &[f64] = xcov
+        .as_slice()
+        .map_err(|_| PyRuntimeError::new_err("xcov must be contiguous (C-order)"))?;
+    let snp_flat: Cow<[f32]> = match snp_chunk.as_slice() {
+        Ok(slc) => Cow::Borrowed(slc),
+        Err(_) => Cow::Owned(snp_arr.iter().copied().collect()),
+    };
+    let ut_flat: Cow<[f32]> = match u_t.as_slice() {
+        Ok(slc) => Cow::Borrowed(slc),
+        Err(_) => Cow::Owned(ut_arr.iter().copied().collect()),
+    };
+    let p = p_cov;
+    let cache = prepare_fixed_lambda_assoc_cache_f32(s, xcov_slice, y, n, p, lbd)?;
+    let assoc_threads = stage_assoc_threads_or(threads);
+    let pool = get_cached_pool(assoc_threads)?;
+    let block_rows = rotate_block_rows.max(1);
+
+    py.detach(|| {
+        let mut rot_buf = vec![0.0_f32; block_rows * n];
+        let mut start = 0usize;
+        while start < m {
+            let rows = (m - start).min(block_rows);
+            let snp_block = &snp_flat[start * n..(start + rows) * n];
+            let rot_block = &mut rot_buf[..rows * n];
+            rotate_snp_block_with_ut_blas(snp_block, rows, n, &ut_flat, rot_block, threads);
+            let out_block = &mut out_slice[start * out_cols..(start + rows) * out_cols];
+            assoc_fixed_lambda_rot_block_blas_f32(
+                rot_block,
+                rows,
+                n,
+                p,
+                &cache,
+                out_block,
+                out_cols,
+                assoc_threads,
+                pool.as_ref(),
+                nullml,
+            );
             start += rows;
         }
     });
@@ -2576,20 +3349,15 @@ pub fn lmm_reml_assoc_packed_f32<'py>(
         (0..n_samples).collect()
     };
     let sample_identity = sample_idx.iter().enumerate().all(|(i, &sid)| sid == i);
-    let sample_byte_idx: Option<Vec<usize>> = if sample_identity {
+    let sample_subset_plan: Option<SubsetDecodePlan> = if sample_identity {
         None
     } else {
-        Some(sample_idx.iter().map(|&sid| sid >> 2).collect())
+        Some(SubsetDecodePlan::from_sample_idx(&sample_idx))
     };
-    let sample_bit_shift: Option<Vec<u8>> = if sample_identity {
+    let dense_subset_pos: Option<Vec<isize>> = if sample_identity {
         None
     } else {
-        Some(
-            sample_idx
-                .iter()
-                .map(|&sid| ((sid & 3) << 1) as u8)
-                .collect(),
-        )
+        maybe_build_dense_subset_pos(&sample_idx, n_samples)
     };
 
     let xcov_arr = xcov.as_array();
@@ -2735,8 +3503,8 @@ pub fn lmm_reml_assoc_packed_f32<'py>(
                     n,
                     gm,
                     sample_identity,
-                    sample_byte_idx.as_deref(),
-                    sample_bit_shift.as_deref(),
+                    sample_subset_plan.as_ref(),
+                    dense_subset_pos.as_deref(),
                     snp_block,
                 );
                 decode_secs += dt0.elapsed().as_secs_f64();
@@ -2979,20 +3747,15 @@ pub fn lmm_reml_assoc_packed_f32_to_tsv<'py>(
         (0..n_samples).collect()
     };
     let sample_identity = sample_idx.iter().enumerate().all(|(i, &sid)| sid == i);
-    let sample_byte_idx: Option<Vec<usize>> = if sample_identity {
+    let sample_subset_plan: Option<SubsetDecodePlan> = if sample_identity {
         None
     } else {
-        Some(sample_idx.iter().map(|&sid| sid >> 2).collect())
+        Some(SubsetDecodePlan::from_sample_idx(&sample_idx))
     };
-    let sample_bit_shift: Option<Vec<u8>> = if sample_identity {
+    let dense_subset_pos: Option<Vec<isize>> = if sample_identity {
         None
     } else {
-        Some(
-            sample_idx
-                .iter()
-                .map(|&sid| ((sid & 3) << 1) as u8)
-                .collect(),
-        )
+        maybe_build_dense_subset_pos(&sample_idx, n_samples)
     };
 
     let xcov_arr = xcov.as_array();
@@ -3152,32 +3915,25 @@ pub fn lmm_reml_assoc_packed_f32_to_tsv<'py>(
                     n,
                     gm,
                     sample_identity,
-                    sample_byte_idx.as_deref(),
-                    sample_bit_shift.as_deref(),
+                    sample_subset_plan.as_ref(),
+                    dense_subset_pos.as_deref(),
                     snp_block,
                 );
                 decode_secs += dt0.elapsed().as_secs_f64();
 
                 let miss_sub = &mut miss_block[..rows];
-                if let Some(tp) = &pool {
-                    tp.install(|| {
-                        miss_sub.par_iter_mut().enumerate().for_each(|(off, dst)| {
-                            let idx = start + off;
-                            let src_row = row_idx.as_ref().map(|v| v[idx]).unwrap_or(idx);
-                            let row = &packed_flat
-                                [src_row * bytes_per_snp..(src_row + 1) * bytes_per_snp];
-                            *dst = packed_row_missing_count_selected(row, n_samples, &sample_idx);
-                        });
-                    });
-                } else {
-                    miss_sub.iter_mut().enumerate().for_each(|(off, dst)| {
-                        let idx = start + off;
-                        let src_row = row_idx.as_ref().map(|v| v[idx]).unwrap_or(idx);
-                        let row =
-                            &packed_flat[src_row * bytes_per_snp..(src_row + 1) * bytes_per_snp];
-                        *dst = packed_row_missing_count_selected(row, n_samples, &sample_idx);
-                    });
-                }
+                fill_packed_missing_block(
+                    miss_sub,
+                    sample_identity,
+                    row_missing,
+                    row_idx.as_deref(),
+                    start,
+                    &packed_flat,
+                    bytes_per_snp,
+                    n_samples,
+                    &sample_idx,
+                    pool.as_ref(),
+                );
 
                 let rotate_tile_rows = choose_rotate_tile_rows(
                     rows,
@@ -3385,6 +4141,32 @@ impl PackedGeneticModel {
 }
 
 #[inline]
+fn packed_model_value_lut_f32(gm: PackedGeneticModel, flip: bool, mean_g: f32) -> [f32; 4] {
+    let raw = if flip {
+        [2.0_f32, mean_g, 1.0_f32, 0.0_f32]
+    } else {
+        [0.0_f32, mean_g, 1.0_f32, 2.0_f32]
+    };
+    [
+        gm.apply(raw[0] as f64) as f32,
+        gm.apply(raw[1] as f64) as f32,
+        gm.apply(raw[2] as f64) as f32,
+        gm.apply(raw[3] as f64) as f32,
+    ]
+}
+
+#[inline]
+fn center_decoded_row_inplace(row: &mut [f32]) {
+    if row.is_empty() {
+        return;
+    }
+    let mean = (row.iter().map(|&v| v as f64).sum::<f64>() / (row.len() as f64)) as f32;
+    for v in row.iter_mut() {
+        *v -= mean;
+    }
+}
+
+#[inline]
 fn decode_centered_block_packed_f32(
     packed_flat: &[u8],
     bytes_per_snp: usize,
@@ -3396,46 +4178,45 @@ fn decode_centered_block_packed_f32(
     n: usize,
     gm: PackedGeneticModel,
     sample_identity: bool,
-    sample_byte_idx: Option<&[usize]>,
-    sample_bit_shift: Option<&[u8]>,
+    subset_plan: Option<&SubsetDecodePlan>,
+    dense_subset_pos: Option<&[isize]>,
     out: &mut [f32],
 ) {
     if rows == 0 || n == 0 {
         return;
     }
     debug_assert_eq!(out.len(), rows * n);
+    let code4_lut = &packed_byte_lut().code4;
 
     if sample_identity {
         out.par_chunks_mut(n).enumerate().for_each(|(off, dst)| {
             let idx = row_start + off;
             let src_row = row_indices.map(|v| v[idx]).unwrap_or(idx);
             let row = &packed_flat[src_row * bytes_per_snp..(src_row + 1) * bytes_per_snp];
-            let flip = row_flip[idx];
             let mean_g = (2.0_f64 * (row_maf[idx] as f64)).max(0.0);
-            let mut sum_g = 0.0_f64;
+            let value_lut = packed_model_value_lut_f32(gm, row_flip[idx], mean_g as f32);
+            decode_row_centered_full_lut(row, n, code4_lut, &value_lut, dst);
+            center_decoded_row_inplace(dst);
+        });
+        return;
+    }
 
-            let mut j = 0usize;
-            for &b in row.iter() {
-                let mut lane = 0usize;
-                while lane < 4 && j < n {
-                    let code = (b >> (lane * 2)) & 0b11;
-                    let mut gv = match code {
-                        0b00 => 0.0_f64,
-                        0b10 => 1.0_f64,
-                        0b11 => 2.0_f64,
-                        _ => mean_g,
-                    };
-                    if flip && code != 0b01 {
-                        gv = 2.0_f64 - gv;
-                    }
-                    gv = gm.apply(gv);
-                    dst[j] = gv as f32;
-                    sum_g += gv;
-                    lane += 1;
-                    j += 1;
-                }
-                if j >= n {
-                    break;
+    if let Some(sample_pos) = dense_subset_pos {
+        out.par_chunks_mut(n)
+            .enumerate()
+            .for_each_init(|| vec![0.0_f32; sample_pos.len()], |full_row, (off, dst)| {
+            let idx = row_start + off;
+            let src_row = row_indices.map(|v| v[idx]).unwrap_or(idx);
+            let row = &packed_flat[src_row * bytes_per_snp..(src_row + 1) * bytes_per_snp];
+            let mean_g = (2.0_f64 * (row_maf[idx] as f64)).max(0.0);
+            let value_lut = packed_model_value_lut_f32(gm, row_flip[idx], mean_g as f32);
+            decode_row_centered_full_lut(row, sample_pos.len(), code4_lut, &value_lut, full_row);
+            let mut sum_g = 0.0_f64;
+            for (full_j, &out_j) in sample_pos.iter().enumerate() {
+                if out_j >= 0 {
+                    let gv = full_row[full_j];
+                    dst[out_j as usize] = gv;
+                    sum_g += gv as f64;
                 }
             }
             let g_mean = (sum_g / (n as f64)) as f32;
@@ -3446,35 +4227,15 @@ fn decode_centered_block_packed_f32(
         return;
     }
 
-    let byte_idx = sample_byte_idx.expect("sample_byte_idx must exist for non-identity mapping");
-    let bit_shift = sample_bit_shift.expect("sample_bit_shift must exist for non-identity mapping");
+    let plan = subset_plan.expect("subset_plan must exist for non-identity mapping");
     out.par_chunks_mut(n).enumerate().for_each(|(off, dst)| {
         let idx = row_start + off;
         let src_row = row_indices.map(|v| v[idx]).unwrap_or(idx);
         let row = &packed_flat[src_row * bytes_per_snp..(src_row + 1) * bytes_per_snp];
-        let flip = row_flip[idx];
         let mean_g = (2.0_f64 * (row_maf[idx] as f64)).max(0.0);
-        let mut sum_g = 0.0_f64;
-        for j in 0..n {
-            let b = row[byte_idx[j]];
-            let code = (b >> bit_shift[j]) & 0b11;
-            let mut gv = match code {
-                0b00 => 0.0_f64,
-                0b10 => 1.0_f64,
-                0b11 => 2.0_f64,
-                _ => mean_g,
-            };
-            if flip && code != 0b01 {
-                gv = 2.0_f64 - gv;
-            }
-            gv = gm.apply(gv);
-            dst[j] = gv as f32;
-            sum_g += gv;
-        }
-        let g_mean = (sum_g / (n as f64)) as f32;
-        for v in dst.iter_mut() {
-            *v -= g_mean;
-        }
+        let value_lut = packed_model_value_lut_f32(gm, row_flip[idx], mean_g as f32);
+        decode_subset_with_plan(row, plan, &value_lut, dst);
+        center_decoded_row_inplace(dst);
     });
 }
 
@@ -3777,20 +4538,15 @@ pub fn fastlmm_assoc_packed_f32<'py>(
         (0..n).collect()
     };
     let sample_identity = sample_idx.iter().enumerate().all(|(i, &sid)| sid == i);
-    let sample_byte_idx: Option<Vec<usize>> = if sample_identity {
+    let sample_subset_plan: Option<SubsetDecodePlan> = if sample_identity {
         None
     } else {
-        Some(sample_idx.iter().map(|&sid| sid >> 2).collect())
+        Some(SubsetDecodePlan::from_sample_idx(&sample_idx))
     };
-    let sample_bit_shift: Option<Vec<u8>> = if sample_identity {
+    let dense_subset_pos: Option<Vec<isize>> = if sample_identity {
         None
     } else {
-        Some(
-            sample_idx
-                .iter()
-                .map(|&sid| ((sid & 3) << 1) as u8)
-                .collect(),
-        )
+        maybe_build_dense_subset_pos(&sample_idx, n_samples)
     };
 
     let u_arr = u.as_array();
@@ -4048,22 +4804,16 @@ pub fn fastlmm_assoc_packed_f32<'py>(
             return Err(PyRuntimeError::new_err("invalid df <= 0 in packed fastlmm"));
         }
 
-        let target_bytes = 64usize * 1024 * 1024;
-        let bytes_per_row = n
-            .saturating_mul(2)
-            .saturating_mul(std::mem::size_of::<f32>())
-            .max(1);
-        let rotate_block_rows = progress_block
-            .min((target_bytes / bytes_per_row).max(1))
-            .max(1);
+        let rotate_block_rows = packed_rotate_block_rows(m, n, 0usize);
         let mut g_block = vec![0.0_f32; rotate_block_rows * n];
         let mut rot_block = vec![0.0_f32; rotate_block_rows * n];
+        let mut next_progress_emit = progress_block.min(m).max(1);
 
-        for row_start in (0..m).step_by(progress_block) {
-            let row_end = (row_start + progress_block).min(m);
+        for row_start in (0..m).step_by(rotate_block_rows) {
+            let row_end = (row_start + rotate_block_rows).min(m);
             let mut start = row_start;
             while start < row_end {
-                let rows = (row_end - start).min(rotate_block_rows);
+                let rows = row_end - start;
                 let snp_block = &mut g_block[..rows * n];
                 let g_rot = &mut rot_block[..rows * n];
 
@@ -4079,8 +4829,8 @@ pub fn fastlmm_assoc_packed_f32<'py>(
                     n,
                     gm,
                     sample_identity,
-                    sample_byte_idx.as_deref(),
-                    sample_bit_shift.as_deref(),
+                    sample_subset_plan.as_ref(),
+                    dense_subset_pos.as_deref(),
                     snp_block,
                 );
                 decode_secs += dt0.elapsed().as_secs_f64();
@@ -4194,6 +4944,9 @@ pub fn fastlmm_assoc_packed_f32<'py>(
 
             let done = row_end;
             if let Some(cb) = progress_callback.as_ref() {
+                if !packed_progress_should_emit(done, m, progress_block, &mut next_progress_emit) {
+                    continue;
+                }
                 Python::attach(|py2| -> PyResult<()> {
                     py2.check_signals()?;
                     cb.call1(py2, (done, m))?;
@@ -4371,20 +5124,15 @@ pub fn fastlmm_assoc_packed_f32_to_tsv<'py>(
         (0..n).collect()
     };
     let sample_identity = sample_idx.iter().enumerate().all(|(i, &sid)| sid == i);
-    let sample_byte_idx: Option<Vec<usize>> = if sample_identity {
+    let sample_subset_plan: Option<SubsetDecodePlan> = if sample_identity {
         None
     } else {
-        Some(sample_idx.iter().map(|&sid| sid >> 2).collect())
+        Some(SubsetDecodePlan::from_sample_idx(&sample_idx))
     };
-    let sample_bit_shift: Option<Vec<u8>> = if sample_identity {
+    let dense_subset_pos: Option<Vec<isize>> = if sample_identity {
         None
     } else {
-        Some(
-            sample_idx
-                .iter()
-                .map(|&sid| ((sid & 3) << 1) as u8)
-                .collect(),
-        )
+        maybe_build_dense_subset_pos(&sample_idx, n_samples)
     };
 
     let u_arr = u.as_array();
@@ -4645,26 +5393,26 @@ pub fn fastlmm_assoc_packed_f32_to_tsv<'py>(
             return Err(PyRuntimeError::new_err("invalid df <= 0 in packed fastlmm"));
         }
 
-        let target_bytes = 64usize * 1024 * 1024;
-        let bytes_per_row = n
-            .saturating_mul(2)
-            .saturating_mul(std::mem::size_of::<f32>())
-            .max(1);
-        let rotate_block_rows = progress_block
-            .min((target_bytes / bytes_per_row).max(1))
-            .max(1);
+        let rotate_block_rows = packed_rotate_block_rows(
+            m,
+            n,
+            out_cols
+                .saturating_mul(std::mem::size_of::<f64>())
+                .saturating_add(std::mem::size_of::<usize>()),
+        );
 
         let mut g_block = vec![0.0_f32; rotate_block_rows * n];
         let mut rot_block = vec![0.0_f32; rotate_block_rows * n];
         let mut out_block = vec![0.0_f64; rotate_block_rows * out_cols];
         let mut miss_block = vec![0usize; rotate_block_rows];
         let mut text_buf = String::with_capacity(rotate_block_rows * 128);
+        let mut next_progress_emit = progress_block.min(m).max(1);
 
-        for row_start in (0..m).step_by(progress_block) {
-            let row_end = (row_start + progress_block).min(m);
+        for row_start in (0..m).step_by(rotate_block_rows) {
+            let row_end = (row_start + rotate_block_rows).min(m);
             let mut start = row_start;
             while start < row_end {
-                let rows = (row_end - start).min(rotate_block_rows);
+                let rows = row_end - start;
                 let snp_block = &mut g_block[..rows * n];
                 let g_rot = &mut rot_block[..rows * n];
 
@@ -4680,8 +5428,8 @@ pub fn fastlmm_assoc_packed_f32_to_tsv<'py>(
                     n,
                     gm,
                     sample_identity,
-                    sample_byte_idx.as_deref(),
-                    sample_bit_shift.as_deref(),
+                    sample_subset_plan.as_ref(),
+                    dense_subset_pos.as_deref(),
                     snp_block,
                 );
                 decode_secs += dt0.elapsed().as_secs_f64();
@@ -4792,25 +5540,18 @@ pub fn fastlmm_assoc_packed_f32_to_tsv<'py>(
                 assoc_secs += at0.elapsed().as_secs_f64();
 
                 let miss_sub = &mut miss_block[..rows];
-                if let Some(tp) = &pool {
-                    tp.install(|| {
-                        miss_sub.par_iter_mut().enumerate().for_each(|(off, dst)| {
-                            let idx = start + off;
-                            let src_row = row_idx.as_ref().map(|v| v[idx]).unwrap_or(idx);
-                            let row = &packed_flat
-                                [src_row * bytes_per_snp..(src_row + 1) * bytes_per_snp];
-                            *dst = packed_row_missing_count_selected(row, n_samples, &sample_idx);
-                        });
-                    });
-                } else {
-                    miss_sub.iter_mut().enumerate().for_each(|(off, dst)| {
-                        let idx = start + off;
-                        let src_row = row_idx.as_ref().map(|v| v[idx]).unwrap_or(idx);
-                        let row =
-                            &packed_flat[src_row * bytes_per_snp..(src_row + 1) * bytes_per_snp];
-                        *dst = packed_row_missing_count_selected(row, n_samples, &sample_idx);
-                    });
-                }
+                fill_packed_missing_block(
+                    miss_sub,
+                    sample_identity,
+                    row_missing,
+                    row_idx.as_deref(),
+                    start,
+                    &packed_flat,
+                    bytes_per_snp,
+                    n_samples,
+                    &sample_idx,
+                    pool.as_ref(),
+                );
 
                 let tt0 = Instant::now();
                 text_buf.clear();
@@ -4850,6 +5591,9 @@ pub fn fastlmm_assoc_packed_f32_to_tsv<'py>(
 
             let done = row_end;
             if let Some(cb) = progress_callback.as_ref() {
+                if !packed_progress_should_emit(done, m, progress_block, &mut next_progress_emit) {
+                    continue;
+                }
                 Python::attach(|py2| -> PyResult<()> {
                     py2.check_signals()?;
                     cb.call1(py2, (done, m))?;
@@ -4878,6 +5622,528 @@ pub fn fastlmm_assoc_packed_f32_to_tsv<'py>(
             };
             eprintln!(
                 "FaST-LMM packed timing: decode={:.3}s ({:.1}%), proj={:.3}s ({:.1}%), assoc={:.3}s ({:.1}%), tsv={:.3}s ({:.1}%), other={:.3}s ({:.1}%), total={:.3}s, rows={}, n={}, threads={}",
+                decode_secs,
+                to_pct(decode_secs),
+                proj_secs,
+                to_pct(proj_secs),
+                assoc_secs,
+                to_pct(assoc_secs),
+                tsv_secs,
+                to_pct(tsv_secs),
+                other_secs,
+                to_pct(other_secs),
+                total_secs,
+                m,
+                n,
+                if threads > 0 { threads } else { rayon::current_num_threads() }
+            );
+        }
+        Ok(())
+    })?;
+
+    Ok((lbd, ml0, reml0))
+}
+
+#[pyfunction]
+pub fn fvlmm_assoc_packed_f32_to_tsv<'py>(
+    py: Python<'py>,
+    packed: PyReadonlyArray2<'py, u8>,
+    n_samples: usize,
+    row_flip: PyReadonlyArray1<'py, bool>,
+    row_maf: PyReadonlyArray1<'py, f32>,
+    row_missing: PyReadonlyArray1<'py, f32>,
+    u: PyReadonlyArray2<'py, f32>,
+    s: PyReadonlyArray1<'py, f32>,
+    y: PyReadonlyArray1<'py, f64>,
+    x: Option<PyReadonlyArray2<'py, f64>>,
+    sample_indices: Option<PyReadonlyArray1<'py, i64>>,
+    low: f64,
+    high: f64,
+    max_iter: usize,
+    tol: f64,
+    tau: f64,
+    threads: usize,
+    model: &str,
+    chrom: Vec<String>,
+    pos: Vec<i64>,
+    snp: Vec<String>,
+    allele0: Vec<String>,
+    allele1: Vec<String>,
+    out_tsv: &str,
+    progress_callback: Option<Py<PyAny>>,
+    progress_every: usize,
+    fixed_lbd: Option<f64>,
+    fixed_ml0: Option<f64>,
+    row_indices: Option<PyReadonlyArray1<'py, i64>>,
+) -> PyResult<(f64, f64, f64)> {
+    if fixed_lbd.is_none() && low >= high {
+        return Err(PyRuntimeError::new_err("low must be < high"));
+    }
+    if !(tol.is_finite() && tol > 0.0) {
+        return Err(PyRuntimeError::new_err("tol must be positive and finite"));
+    }
+    if !(tau.is_finite() && tau >= 0.0) {
+        return Err(PyRuntimeError::new_err("tau must be finite and >= 0"));
+    }
+    if n_samples == 0 {
+        return Err(PyRuntimeError::new_err("n_samples must be > 0"));
+    }
+    let gm = PackedGeneticModel::parse(model)?;
+
+    let packed_arr = packed.as_array();
+    if packed_arr.ndim() != 2 {
+        return Err(PyRuntimeError::new_err(
+            "packed must be 2D (m, bytes_per_snp)",
+        ));
+    }
+    let m_packed = packed_arr.shape()[0];
+    let bytes_per_snp = packed_arr.shape()[1];
+    let expected_bps = (n_samples + 3) / 4;
+    if bytes_per_snp != expected_bps {
+        return Err(PyRuntimeError::new_err(format!(
+            "packed second dimension mismatch: got {bytes_per_snp}, expected {expected_bps}"
+        )));
+    }
+
+    let row_flip = row_flip.as_slice()?;
+    let row_maf = row_maf.as_slice()?;
+    let row_missing = row_missing.as_slice()?;
+    let row_idx: Option<Vec<usize>> = if let Some(ridx) = row_indices {
+        Some(parse_index_vec_i64(
+            ridx.as_slice()?,
+            m_packed,
+            "row_indices",
+        )?)
+    } else {
+        None
+    };
+    let m = row_idx.as_ref().map(|v| v.len()).unwrap_or(m_packed);
+    if row_flip.len() != m {
+        return Err(PyRuntimeError::new_err(format!(
+            "row_flip length mismatch: got {}, expected {m}",
+            row_flip.len()
+        )));
+    }
+    if row_maf.len() != m {
+        return Err(PyRuntimeError::new_err(format!(
+            "row_maf length mismatch: got {}, expected {m}",
+            row_maf.len()
+        )));
+    }
+    if row_missing.len() != m {
+        return Err(PyRuntimeError::new_err(format!(
+            "row_missing length mismatch: got {}, expected {m}",
+            row_missing.len()
+        )));
+    }
+    if chrom.len() != m
+        || pos.len() != m
+        || snp.len() != m
+        || allele0.len() != m
+        || allele1.len() != m
+    {
+        return Err(PyRuntimeError::new_err(format!(
+            "TSV metadata length mismatch: rows={m}, chrom={}, pos={}, snp={}, allele0={}, allele1={}",
+            chrom.len(),
+            pos.len(),
+            snp.len(),
+            allele0.len(),
+            allele1.len()
+        )));
+    }
+
+    let y = y.as_slice()?;
+    let n = y.len();
+    if n == 0 {
+        return Err(PyRuntimeError::new_err("y must not be empty"));
+    }
+
+    let sample_idx: Vec<usize> = if let Some(sidx) = sample_indices {
+        let sidx_slice = sidx.as_slice()?;
+        if sidx_slice.len() != n {
+            return Err(PyRuntimeError::new_err(format!(
+                "sample_indices length mismatch: got {}, expected {n}",
+                sidx_slice.len()
+            )));
+        }
+        parse_index_vec_i64(sidx_slice, n_samples, "sample_indices")?
+    } else {
+        if n != n_samples {
+            return Err(PyRuntimeError::new_err(format!(
+                "len(y)={} must equal n_samples={} when sample_indices is not provided",
+                n, n_samples
+            )));
+        }
+        (0..n).collect()
+    };
+    let sample_identity = sample_idx.iter().enumerate().all(|(i, &sid)| sid == i);
+    let sample_subset_plan: Option<SubsetDecodePlan> = if sample_identity {
+        None
+    } else {
+        Some(SubsetDecodePlan::from_sample_idx(&sample_idx))
+    };
+    let dense_subset_pos: Option<Vec<isize>> = if sample_identity {
+        None
+    } else {
+        maybe_build_dense_subset_pos(&sample_idx, n_samples)
+    };
+
+    let u_arr = u.as_array();
+    if u_arr.ndim() != 2 {
+        return Err(PyRuntimeError::new_err("u must be 2D (n_samples, k)"));
+    }
+    let (u_n, k_full) = (u_arr.shape()[0], u_arr.shape()[1]);
+    if u_n != n_samples {
+        return Err(PyRuntimeError::new_err(format!(
+            "u row count mismatch: got {u_n}, expected {n_samples}"
+        )));
+    }
+    if k_full == 0 {
+        return Err(PyRuntimeError::new_err("u must have at least 1 component"));
+    }
+
+    let s_f32 = s.as_slice()?;
+    if s_f32.len() != k_full {
+        return Err(PyRuntimeError::new_err(format!(
+            "s length mismatch: got {}, expected {k_full}",
+            s_f32.len()
+        )));
+    }
+    if k_full < n {
+        return Err(PyRuntimeError::new_err(format!(
+            "u must provide full-rank eigenvectors for packed fixed-lambda scan: got k={}, expected >= n={}",
+            k_full, n
+        )));
+    }
+    let mut s_vec: Vec<f64> = s_f32[..n].iter().map(|&v| v as f64).collect();
+    if tau != 0.0 {
+        for v in s_vec.iter_mut() {
+            *v += tau;
+        }
+    }
+    if s_vec.iter().any(|v| !v.is_finite()) {
+        return Err(PyRuntimeError::new_err(
+            "invalid s/tau produced non-finite values",
+        ));
+    }
+
+    let p0 = match &x {
+        Some(xarr) => {
+            let xa = xarr.as_array();
+            if xa.ndim() != 2 {
+                return Err(PyRuntimeError::new_err("x must be 2D (n, p0)"));
+            }
+            let xr = xa.shape()[0];
+            let xc = xa.shape()[1];
+            if xr != n {
+                return Err(PyRuntimeError::new_err(format!(
+                    "x row count mismatch: got {xr}, expected {n}"
+                )));
+            }
+            xc
+        }
+        None => 0usize,
+    };
+    let p = p0 + 1;
+    if n <= p {
+        return Err(PyRuntimeError::new_err(format!(
+            "n must be > p for null model: n={n}, p={p}"
+        )));
+    }
+    if n <= p + 1 {
+        return Err(PyRuntimeError::new_err(format!(
+            "n must be > p+1 for SNP tests: n={n}, p={p}"
+        )));
+    }
+
+    let u_slice: &[f32] = u
+        .as_slice()
+        .map_err(|_| PyRuntimeError::new_err("u must be contiguous (C-order)"))?;
+    let packed_flat: Cow<[u8]> = match packed.as_slice() {
+        Ok(s0) => Cow::Borrowed(s0),
+        Err(_) => Cow::Owned(packed_arr.iter().copied().collect()),
+    };
+    let x_slice_opt: Option<&[f64]> = match &x {
+        Some(xarr) => Some(
+            xarr.as_slice()
+                .map_err(|_| PyRuntimeError::new_err("x must be contiguous (C-order)"))?,
+        ),
+        None => None,
+    };
+
+    let mut x_full = vec![0.0_f64; n * p];
+    for i in 0..n {
+        x_full[i * p] = 1.0;
+    }
+    if let Some(x_slice) = x_slice_opt {
+        for i in 0..n {
+            let src = &x_slice[i * p0..(i + 1) * p0];
+            let dst = &mut x_full[i * p + 1..(i + 1) * p];
+            dst.copy_from_slice(src);
+        }
+    }
+
+    let mut u_sub = vec![0.0_f32; n * n];
+    for (i, &sid) in sample_idx.iter().enumerate() {
+        let src = &u_slice[sid * k_full..sid * k_full + n];
+        let dst = &mut u_sub[i * n..(i + 1) * n];
+        dst.copy_from_slice(src);
+    }
+    let mut u_t_sub = vec![0.0_f32; n * n];
+    for i in 0..n {
+        for j in 0..n {
+            u_t_sub[j * n + i] = u_sub[i * n + j];
+        }
+    }
+
+    let pool = get_cached_pool(threads)?;
+    let mut y_rot = vec![0.0_f64; n];
+    let mut x_rot = vec![0.0_f64; n * p];
+    {
+        let mut run = || {
+            y_rot.par_iter_mut().enumerate().for_each(|(i, dst)| {
+                let ut_row = &u_t_sub[i * n..(i + 1) * n];
+                let mut acc = 0.0_f64;
+                for j in 0..n {
+                    acc += (ut_row[j] as f64) * y[j];
+                }
+                *dst = acc;
+            });
+            x_rot.par_chunks_mut(p).enumerate().for_each(|(i, row)| {
+                let ut_row = &u_t_sub[i * n..(i + 1) * n];
+                for c in 0..p {
+                    let mut acc = 0.0_f64;
+                    for j in 0..n {
+                        acc += (ut_row[j] as f64) * x_full[j * p + c];
+                    }
+                    row[c] = acc;
+                }
+            });
+        };
+        if let Some(tp) = &pool {
+            tp.install(run);
+        } else {
+            run();
+        }
+    }
+
+    let (lbd, ml0, reml0) = if let Some(lbd_fixed) = fixed_lbd {
+        if !(lbd_fixed.is_finite() && lbd_fixed > 0.0) {
+            return Err(PyRuntimeError::new_err(
+                "fixed_lbd must be finite and > 0 when provided",
+            ));
+        }
+        let log10_lbd = lbd_fixed.log10();
+        let ml = if let Some(v) = fixed_ml0 {
+            if !v.is_finite() {
+                return Err(PyRuntimeError::new_err(
+                    "fixed_ml0 must be finite when provided",
+                ));
+            }
+            v
+        } else {
+            ml_loglike(log10_lbd, &s_vec, &x_rot, &y_rot, None, n, p)
+        };
+        let reml = reml_loglike(log10_lbd, &s_vec, &x_rot, &y_rot, None, n, p);
+        (lbd_fixed, ml, reml)
+    } else {
+        let (best_log10_lbd, best_cost) = brent_minimize(
+            |x0| -reml_loglike(x0, &s_vec, &x_rot, &y_rot, None, n, p),
+            low,
+            high,
+            tol,
+            max_iter,
+        );
+        let lbd_tmp = 10.0_f64.powf(best_log10_lbd);
+        let ml = if let Some(v) = fixed_ml0 {
+            if !v.is_finite() {
+                return Err(PyRuntimeError::new_err(
+                    "fixed_ml0 must be finite when provided",
+                ));
+            }
+            v
+        } else {
+            ml_loglike(best_log10_lbd, &s_vec, &x_rot, &y_rot, None, n, p)
+        };
+        (lbd_tmp, ml, -best_cost)
+    };
+    if !lbd.is_finite() || lbd <= 0.0 {
+        return Err(PyRuntimeError::new_err(
+            "invalid fixed lambda in packed fvlmm",
+        ));
+    }
+
+    let out_tsv_path = out_tsv.to_string();
+    let progress_block = if progress_every == 0 {
+        m.max(1)
+    } else {
+        progress_every.max(1)
+    };
+    let out_cols = 4usize;
+    let stage_timing =
+        env_truthy("JX_FVLMM_PACKED_STAGE_TIMING") || env_truthy("JX_FASTLMM_PACKED_STAGE_TIMING");
+
+    let cache = prepare_fixed_lambda_assoc_cache_f32(&s_vec, &x_rot, &y_rot, n, p, lbd)?;
+
+    py.detach(move || -> PyResult<()> {
+        let total_t0 = Instant::now();
+        let mut decode_secs = 0.0_f64;
+        let mut proj_secs = 0.0_f64;
+        let mut assoc_secs = 0.0_f64;
+        let mut tsv_secs = 0.0_f64;
+
+        let writer = AsyncTsvWriter::with_config(
+            &out_tsv_path,
+            b"chrom\tpos\tsnp\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n",
+            64 * 1024 * 1024,
+            4,
+        )
+        .map_err(PyRuntimeError::new_err)?;
+
+        let rotate_block_rows = packed_rotate_block_rows(
+            m,
+            n,
+            out_cols
+                .saturating_mul(std::mem::size_of::<f64>())
+                .saturating_add(std::mem::size_of::<usize>()),
+        );
+
+        let mut g_block = vec![0.0_f32; rotate_block_rows * n];
+        let mut rot_block = vec![0.0_f32; rotate_block_rows * n];
+        let mut out_block = vec![0.0_f64; rotate_block_rows * out_cols];
+        let mut miss_block = vec![0usize; rotate_block_rows];
+        let mut text_buf = String::with_capacity(rotate_block_rows * 128);
+        let mut next_progress_emit = progress_block.min(m).max(1);
+
+        for row_start in (0..m).step_by(rotate_block_rows) {
+            let row_end = (row_start + rotate_block_rows).min(m);
+            let mut start = row_start;
+            while start < row_end {
+                let rows = row_end - start;
+                let snp_block = &mut g_block[..rows * n];
+                let g_rot = &mut rot_block[..rows * n];
+
+                let dt0 = Instant::now();
+                decode_centered_block_packed_f32(
+                    &packed_flat,
+                    bytes_per_snp,
+                    row_flip,
+                    row_maf,
+                    row_idx.as_deref(),
+                    start,
+                    rows,
+                    n,
+                    gm,
+                    sample_identity,
+                    sample_subset_plan.as_ref(),
+                    dense_subset_pos.as_deref(),
+                    snp_block,
+                );
+                decode_secs += dt0.elapsed().as_secs_f64();
+
+                let pt0 = Instant::now();
+                rotate_snp_block_with_ut_blas(snp_block, rows, n, &u_t_sub, g_rot, threads);
+                proj_secs += pt0.elapsed().as_secs_f64();
+
+                let out_sub = &mut out_block[..rows * out_cols];
+                let at0 = Instant::now();
+                assoc_fixed_lambda_rot_block_blas_f32(
+                    g_rot,
+                    rows,
+                    n,
+                    p,
+                    &cache,
+                    out_sub,
+                    out_cols,
+                    threads,
+                    pool.as_ref(),
+                    Some(ml0),
+                );
+                assoc_secs += at0.elapsed().as_secs_f64();
+
+                let miss_sub = &mut miss_block[..rows];
+                fill_packed_missing_block(
+                    miss_sub,
+                    sample_identity,
+                    row_missing,
+                    row_idx.as_deref(),
+                    start,
+                    &packed_flat,
+                    bytes_per_snp,
+                    n_samples,
+                    &sample_idx,
+                    pool.as_ref(),
+                );
+
+                let tt0 = Instant::now();
+                text_buf.clear();
+                if text_buf.capacity() < rows * 128 {
+                    text_buf.reserve(rows * 128 - text_buf.capacity());
+                }
+                for off in 0..rows {
+                    let idx = start + off;
+                    let base = off * out_cols;
+                    let beta = out_sub[base];
+                    let se = out_sub[base + 1];
+                    let chisq =
+                        chisq_from_beta_se_and_optional_plrt(beta, se, Some(out_sub[base + 3]));
+                    let chisq_txt = format_chisq_value(chisq);
+                    let _ = write!(
+                        text_buf,
+                        "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\t{:.4e}\n",
+                        chrom[idx],
+                        pos[idx],
+                        snp[idx],
+                        allele0[idx],
+                        allele1[idx],
+                        row_maf[idx],
+                        miss_sub[off],
+                        beta,
+                        se,
+                        chisq_txt,
+                        out_sub[base + 2],
+                        out_sub[base + 3]
+                    );
+                }
+                let payload = std::mem::take(&mut text_buf).into_bytes();
+                writer.send(payload).map_err(PyRuntimeError::new_err)?;
+                tsv_secs += tt0.elapsed().as_secs_f64();
+                start += rows;
+            }
+
+            let done = row_end;
+            if let Some(cb) = progress_callback.as_ref() {
+                if !packed_progress_should_emit(done, m, progress_block, &mut next_progress_emit) {
+                    continue;
+                }
+                Python::attach(|py2| -> PyResult<()> {
+                    py2.check_signals()?;
+                    cb.call1(py2, (done, m))?;
+                    Ok(())
+                })?;
+            } else {
+                Python::attach(|py2| py2.check_signals())?;
+            }
+        }
+
+        let wt0 = Instant::now();
+        let writer_result = writer.finish().map_err(PyRuntimeError::new_err);
+        tsv_secs += wt0.elapsed().as_secs_f64();
+        writer_result?;
+
+        if stage_timing {
+            let total_secs = total_t0.elapsed().as_secs_f64();
+            let other_secs = (total_secs - decode_secs - proj_secs - assoc_secs - tsv_secs)
+                .max(0.0_f64);
+            let to_pct = |x: f64| -> f64 {
+                if total_secs > 0.0 {
+                    x * 100.0 / total_secs
+                } else {
+                    0.0
+                }
+            };
+            eprintln!(
+                "FvLMM packed timing: decode={:.3}s ({:.1}%), proj={:.3}s ({:.1}%), assoc={:.3}s ({:.1}%), tsv={:.3}s ({:.1}%), other={:.3}s ({:.1}%), total={:.3}s, rows={}, n={}, threads={}",
                 decode_secs,
                 to_pct(decode_secs),
                 proj_secs,

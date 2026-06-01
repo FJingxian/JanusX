@@ -181,7 +181,13 @@ class LinearModel:
         write_files: bool,
     ) -> AssociationResult:
         from janusx.pyBLUP.QK2 import GRM as _calc_grm
-        from janusx.pyBLUP.assoc import LM as _LM, LMM as _LMM, FastLMM as _FastLMM, farmcpu as _farmcpu
+        from janusx.pyBLUP.assoc import (
+            LM as _LM,
+            LMM as _LMM,
+            FastLMM as _FastLMM,
+            FvLMM as _FvLMM,
+            farmcpu as _farmcpu,
+        )
 
         t0 = time.time()
         cfg = self.config
@@ -224,7 +230,7 @@ class LinearModel:
                 "(PLINK/BED-backed packed route)."
             )
 
-        if model_key in {"lmm", "fastlmm"}:
+        if model_key in {"lmm", "fastlmm", "fvlmm"}:
             kinship = cfg.extra.get("kinship") if isinstance(cfg.extra, dict) else None
             if kinship is None:
                 kinship = _calc_grm(m_snp, log=False, chunksize=max(1, int(cfg.chunksize)))
@@ -285,6 +291,22 @@ class LinearModel:
                     cols["plrt"] = arr[:, 3]
                 df = pd.DataFrame(cols)
                 pve = float(mod.pve) if np.isfinite(float(mod.pve)) else None
+            elif model_key == "fvlmm":
+                mod = _FvLMM(y=y_vec, X=x_cov, kinship=np.array(kinship, copy=True))
+                arr = np.asarray(mod.gwas(m_snp, threads=threads), dtype=np.float64)
+                cols = {
+                    "chrom": chrom,
+                    "pos": pos,
+                    "allele0": allele0,
+                    "allele1": allele1,
+                    "beta": arr[:, 0],
+                    "se": arr[:, 1],
+                    "pwald": arr[:, 2],
+                }
+                if arr.shape[1] > 3:
+                    cols["plrt"] = arr[:, 3]
+                df = pd.DataFrame(cols)
+                pve = float(mod.pve) if np.isfinite(float(mod.pve)) else None
             elif model_key == "farmcpu":
                 arr = np.asarray(
                     _farmcpu(
@@ -326,7 +348,11 @@ class LinearModel:
             summary_rows.append(
                 {
                     "phenotype": trait_name,
-                    "model": model_key.upper() if model_key != "fastlmm" else "FastLMM",
+                    "model": (
+                        "FastLMM"
+                        if model_key == "fastlmm"
+                        else ("FvLMM" if model_key == "fvlmm" else model_key.upper())
+                    ),
                     "nidv": int(n_samples),
                     "eff_snp": int(m),
                     "pve": pve,
@@ -415,6 +441,22 @@ class LinearModel:
     ) -> AssociationResult:
         return self._run(
             model_key="fastlmm",
+            out=out,
+            prefix=prefix,
+            log=log,
+            write_files=write_files,
+        )
+
+    def fvlmm(
+        self,
+        *,
+        out: Optional[str] = None,
+        prefix: Optional[str] = None,
+        log: bool = True,
+        write_files: bool = False,
+    ) -> AssociationResult:
+        return self._run(
+            model_key="fvlmm",
             out=out,
             prefix=prefix,
             log=log,

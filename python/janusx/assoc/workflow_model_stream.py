@@ -34,6 +34,7 @@ from .workflow import (
     _mixed_model_switch_to_lm_decision,
     _resolve_trait_iter,
     _gwas_result_tmp_path,
+    _gwas_eigh_from_grm,
     _gwas_evd_stage_ctx,
     _gwas_scan_stage_ctx,
     _log_file_only,
@@ -43,7 +44,6 @@ from .workflow import (
     _run_fastplot_from_tsv_with_status,
     _run_result_write_with_status,
     _safe_trait_file_label,
-    _subset_square_matrix_identity_aware,
     _trait_values_and_mask,
     auto_mmap_window_mb,
     build_rich_progress,
@@ -622,7 +622,6 @@ def run_chunked_gwas_lmm_lm(
         if model_key in ("lmm", "fastlmm", "fvlmm"):
             if grm is None:
                 raise ValueError("LMM/FastLMM/FvLMM requires GRM, but GRM was not prepared.")
-            Ksub = _subset_square_matrix_identity_aware(grm, keep_idx)
             evd_t0 = time.monotonic()
             evd_label = base_model_label
             evd_desc = f"{evd_label} Eigen-Decomposition"
@@ -634,7 +633,27 @@ def run_chunked_gwas_lmm_lm(
                 try:
                     stage_threads = max(1, int(threads))
                     with _gwas_evd_stage_ctx(stage_threads):
-                        mod = ModelCls(y=y_vec, X=X_cov, kinship=Ksub)
+                        eigvals, eigvecs, _evd_backend, _evd_elapsed = _gwas_eigh_from_grm(
+                            grm,
+                            threads=stage_threads,
+                            logger=logger,
+                            stage_label=f"{str(model_key).lower()}-stream:{pname}",
+                            require_rust=True,
+                            diag_ridge=1e-6,
+                            subset_idx=keep_idx,
+                        )
+                        base_lmm = LMM.from_spectral(
+                            y=y_vec,
+                            X=X_cov,
+                            eigvals=eigvals,
+                            eigvecs=eigvecs,
+                            evd_secs=float(_evd_elapsed),
+                        )
+                        mod = (
+                            LMM.from_lmm(base_lmm)
+                            if ModelCls is LMM
+                            else ModelCls.from_lmm(base_lmm)
+                        )
                 except Exception:
                     task.fail(f"{evd_desc} ...Failed")
                     raise
@@ -1399,7 +1418,6 @@ def run_chunked_gwas_streaming_shared(
     model_label_map = {"lmm": "LMM", "lm": "LM", "fastlmm": "FastLMM", "fvlmm": "FvLMM"}
     kinship_model_keys = {"lmm", "fastlmm", "fvlmm"}
     shared_lmm_model: Optional[LMM] = None
-    shared_ksub: Optional[np.ndarray] = None
     gm_tag = str(genetic_model).lower()
 
     def _stream_model_outbase(tag: str) -> str:
@@ -1461,8 +1479,6 @@ def run_chunked_gwas_streaming_shared(
                     f"PVE(null) ~ {mod.pve:.3f}; reusing shared eigen-decomposition"
                 )
             else:
-                if shared_ksub is None:
-                    shared_ksub = _subset_square_matrix_identity_aware(grm, keep_idx)
                 evd_desc = f"{model_label} Eigen-Decomposition"
                 with CliStatus(
                     f"Running {evd_desc}...",
@@ -1472,7 +1488,31 @@ def run_chunked_gwas_streaming_shared(
                     try:
                         stage_threads = max(1, int(threads))
                         with _gwas_evd_stage_ctx(stage_threads):
-                            mod = ModelCls(y=y_vec, X=X_cov, kinship=shared_ksub)
+                            eigvals, eigvecs, _evd_backend, _evd_elapsed = _gwas_eigh_from_grm(
+                                grm,
+                                threads=stage_threads,
+                                logger=logger,
+                                stage_label=f"{str(mkey).lower()}-stream-shared:{pname}",
+                                require_rust=True,
+                                diag_ridge=1e-6,
+                                subset_idx=keep_idx,
+                            )
+                            shared_lmm_model = LMM.from_spectral(
+                                y=y_vec,
+                                X=X_cov,
+                                eigvals=eigvals,
+                                eigvecs=eigvecs,
+                                evd_secs=float(_evd_elapsed),
+                            )
+                            mod = (
+                                LMM.from_lmm(shared_lmm_model)
+                                if mkey == "lmm"
+                                else (
+                                    FastLMM.from_lmm(shared_lmm_model)
+                                    if mkey == "fastlmm"
+                                    else FvLMM.from_lmm(shared_lmm_model)
+                                )
+                            )
                     except Exception:
                         task.fail(f"{evd_desc} ...Failed")
                         raise
@@ -1480,7 +1520,6 @@ def run_chunked_gwas_streaming_shared(
                 evd_elapsed = format_elapsed(evd_secs)
                 ctx["evd_secs"] = float(evd_secs)
                 ctx["init_log"] = f"PVE(null) ~ {mod.pve:.3f}; eigen-decomposition [{evd_elapsed}]"
-                shared_lmm_model = LMM.from_lmm(mod)
         else:
             mod = ModelCls(y=y_vec, X=X_cov)
             ctx["init_log"] = "streaming scan initialized"
@@ -1503,15 +1542,27 @@ def run_chunked_gwas_streaming_shared(
             if shared_lmm_model is not None:
                 mod = LMM.from_lmm(shared_lmm_model)
             else:
-                if shared_ksub is None:
-                    shared_ksub = _subset_square_matrix_identity_aware(grm, keep_idx)
                 lmm_t0 = time.monotonic()
                 stage_threads = max(1, int(threads))
                 with _gwas_evd_stage_ctx(stage_threads):
-                    mod = LMM(y=y_vec, X=X_cov, kinship=shared_ksub)
+                    eigvals, eigvecs, _evd_backend, _evd_elapsed = _gwas_eigh_from_grm(
+                        grm,
+                        threads=stage_threads,
+                        logger=logger,
+                        stage_label=f"lmm-stream-switch:{pname}",
+                        require_rust=True,
+                        diag_ridge=1e-6,
+                        subset_idx=keep_idx,
+                    )
+                    shared_lmm_model = LMM.from_spectral(
+                        y=y_vec,
+                        X=X_cov,
+                        eigvals=eigvals,
+                        eigvecs=eigvecs,
+                        evd_secs=float(_evd_elapsed),
+                    )
+                    mod = LMM.from_lmm(shared_lmm_model)
                 ctx["evd_secs"] = float(ctx["evd_secs"]) + max(time.monotonic() - lmm_t0, 0.0)
-                if shared_lmm_model is None:
-                    shared_lmm_model = LMM.from_lmm(mod)
             effective_model_key = "lmm"
             effective_model_label = "LMM"
             effective_model_tag = "lmm"

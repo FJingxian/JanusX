@@ -2250,20 +2250,8 @@ def run_fastlmm_packed_fullrank(
         sample_idx_trait = np.ascontiguousarray(sample_map[keep_idx], dtype=np.int64)
 
         grm_secs = 0.0
-        grm_fit: np.ndarray
-        if grm is not None:
-            if _is_full_identity_index(keep_idx, int(np.shape(grm)[0])):
-                grm_fit = grm
-            else:
-                grm_fit = np.ascontiguousarray(
-                    np.asarray(_subset_square_matrix_identity_aware(grm, keep_idx), dtype=np.float64),
-                    dtype=np.float64,
-                )
-            if grm_fit.ndim != 2 or grm_fit.shape[0] != grm_fit.shape[1] or grm_fit.shape[0] != n_idv:
-                raise ValueError(
-                    f"Trait GRM shape mismatch: got {grm_fit.shape}, expected ({n_idv}, {n_idv})."
-                )
-        else:
+        grm_fit: Optional[np.ndarray] = None
+        if grm is None:
             grm_t0 = time.monotonic()
             with CliStatus(
                 "Building packed GRM (Rust)...",
@@ -2301,12 +2289,13 @@ def run_fastlmm_packed_fullrank(
         ) as task:
             try:
                 eigvals, eigvecs, evd_backend, evd_secs = _gwas_eigh_from_grm(
-                    grm_fit,
+                    grm if grm is not None else grm_fit,
                     threads=max(1, int(threads)),
                     logger=logger,
                     stage_label=f"{_route_model_key}-fullrank:{pname}",
                     require_rust=True,
                     diag_ridge=1e-6,
+                    subset_idx=(keep_idx if grm is not None else None),
                 )
             except Exception:
                 task.fail(f"{_route_model_label} Eigen-Decomposition ...Failed")
@@ -3573,7 +3562,6 @@ def run_lmm_packed_fullrank(
         if cov_all is not None:
             x_cov = np.concatenate([x_cov, cov_all[keep_idx]], axis=1)
 
-        Ksub = _subset_square_matrix_identity_aware(grm, keep_idx)
         evd_t0 = time.monotonic()
         with CliStatus(
             "Running LMM Eigen-Decomposition...",
@@ -3583,7 +3571,22 @@ def run_lmm_packed_fullrank(
             try:
                 stage_threads = max(1, int(threads))
                 with _gwas_evd_stage_ctx(stage_threads):
-                    mod = LMM(y=y_vec, X=x_cov, kinship=Ksub)
+                    eigvals, eigvecs, _evd_backend, _evd_elapsed = _gwas_eigh_from_grm(
+                        grm,
+                        threads=stage_threads,
+                        logger=logger,
+                        stage_label=f"lmm-fullrank:{pname}",
+                        require_rust=True,
+                        diag_ridge=1e-6,
+                        subset_idx=keep_idx,
+                    )
+                    mod = LMM.from_spectral(
+                        y=y_vec,
+                        X=x_cov,
+                        eigvals=eigvals,
+                        eigvecs=eigvecs,
+                        evd_secs=float(_evd_elapsed),
+                    )
             except Exception:
                 task.fail("LMM Eigen-Decomposition ...Failed")
                 raise
@@ -3651,10 +3654,6 @@ def run_lmm_packed_fullrank(
             f"PVE(null) ~ {mod.pve:.3f}; eigen-decomposition [{format_elapsed(evd_secs)}]",
             use_spinner=bool(use_spinner),
         )
-
-        if bool(getattr(mod, "lowrank", False)):
-            Ksub = None
-            gc.collect()
 
         sample_idx_trait = np.ascontiguousarray(sample_map[keep_idx], dtype=np.int64)
 

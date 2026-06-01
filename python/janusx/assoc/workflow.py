@@ -3432,6 +3432,7 @@ def _gwas_eigh_from_grm(
     stage_label: str = "GWAS",
     require_rust: bool = False,
     diag_ridge: float = 0.0,
+    subset_idx: Optional[object] = None,
 ) -> tuple[np.ndarray, np.ndarray, str, float]:
     """
     Eigen-decomposition for symmetric GRM with Rust-first backend.
@@ -3448,40 +3449,99 @@ def _gwas_eigh_from_grm(
     t = max(1, int(threads))
     ridge = float(diag_ridge)
 
+    def _matrix_file_hint_from_obj(obj) -> Optional[str]:
+        cur = obj
+        seen: set[int] = set()
+        for _ in range(8):
+            if cur is None:
+                break
+            oid = id(cur)
+            if oid in seen:
+                break
+            seen.add(oid)
+            try:
+                _fn = getattr(cur, "filename", None)
+                if _fn is not None:
+                    cand = os.fspath(_fn)
+                    if isinstance(cand, bytes):
+                        cand = cand.decode("utf-8", errors="ignore")
+                    cand = str(cand).strip()
+                    low = cand.lower()
+                    if cand and os.path.isfile(cand) and low.endswith((".npy", ".txt", ".tsv", ".csv")):
+                        return cand
+            except Exception:
+                pass
+            try:
+                cur = getattr(cur, "base", None)
+            except Exception:
+                break
+        return None
+
     matrix_file_hint: Optional[str] = None
     if impl_req == "rust" and hasattr(jxrs, "rust_eigh_from_matrix_file_f64"):
-        try:
-            _fn = getattr(grm, "filename", None)
-            if _fn is not None:
-                cand = os.fspath(_fn)
-                if isinstance(cand, bytes):
-                    cand = cand.decode("utf-8", errors="ignore")
-                cand = str(cand).strip()
-                low = cand.lower()
-                if cand and os.path.isfile(cand) and low.endswith((".npy", ".txt", ".tsv", ".csv")):
-                    matrix_file_hint = cand
-        except Exception:
-            matrix_file_hint = None
+        matrix_file_hint = _matrix_file_hint_from_obj(grm)
 
     g_shape = np.shape(grm)
     if len(g_shape) != 2 or int(g_shape[0]) != int(g_shape[1]) or int(g_shape[0]) == 0:
         raise RuntimeError(f"{stage_label} expects non-empty square GRM, got shape={g_shape}")
-    n = int(g_shape[0])
-    driver_req = _resolve_gwas_eigh_driver(n)
+    n_full = int(g_shape[0])
+    subset_idx_arr: Optional[np.ndarray] = None
+    subset_identity = True
+    n_eigh = n_full
+    if subset_idx is not None:
+        subset_idx_arr = np.asarray(subset_idx, dtype=np.int64).reshape(-1)
+        if int(subset_idx_arr.shape[0]) == 0:
+            raise RuntimeError(f"{stage_label} received empty subset_idx.")
+        subset_identity = _is_full_identity_index(subset_idx_arr, n_full)
+        if not subset_identity:
+            n_eigh = int(subset_idx_arr.shape[0])
+    driver_req = _resolve_gwas_eigh_driver(n_eigh)
+
+    can_use_subset_file = bool(
+        impl_req == "rust"
+        and matrix_file_hint is not None
+        and (not subset_identity)
+        and hasattr(jxrs, "rust_eigh_from_matrix_file_subset_f64")
+    )
 
     g0: Optional[np.ndarray] = None
     g: Optional[np.ndarray] = None
-    if impl_req == "scipy" or matrix_file_hint is None:
-        g0 = np.asarray(grm, dtype=np.float64)
+    if impl_req == "scipy" or matrix_file_hint is None or ((not subset_identity) and (not can_use_subset_file)):
+        g_src = (
+            _subset_square_matrix_identity_aware(grm, subset_idx_arr)
+            if (subset_idx_arr is not None and not subset_identity)
+            else grm
+        )
+        g0 = np.asarray(g_src, dtype=np.float64)
         if g0.ndim != 2 or g0.shape[0] != g0.shape[1] or g0.shape[0] == 0:
             raise RuntimeError(f"{stage_label} expects non-empty square GRM, got shape={g0.shape}")
         g = np.ascontiguousarray(g0)
         if ridge != 0.0:
             g.flat[:: g.shape[0] + 1] += ridge
 
-    def _run_eigh_rust(driver_name: str, mat: Optional[np.ndarray], matrix_path: Optional[str] = None):
+    def _run_eigh_rust(
+        driver_name: str,
+        mat: Optional[np.ndarray],
+        matrix_path: Optional[str] = None,
+        subset_idx_local: Optional[np.ndarray] = None,
+    ):
         with _gwas_evd_stage_ctx(t):
             if matrix_path is not None and hasattr(jxrs, "rust_eigh_from_matrix_file_f64"):
+                if (
+                    subset_idx_local is not None
+                    and int(np.asarray(subset_idx_local).shape[0]) > 0
+                    and (not _is_full_identity_index(subset_idx_local, n_full))
+                    and hasattr(jxrs, "rust_eigh_from_matrix_file_subset_f64")
+                ):
+                    return jxrs.rust_eigh_from_matrix_file_subset_f64(
+                        str(matrix_path),
+                        np.ascontiguousarray(np.asarray(subset_idx_local, dtype=np.int64).reshape(-1), dtype=np.int64),
+                        threads=int(t),
+                        driver=str(driver_name),
+                        jobz="V",
+                        require_lapack=False,
+                        diag_shift=float(ridge),
+                    )
                 return jxrs.rust_eigh_from_matrix_file_f64(
                     str(matrix_path),
                     threads=int(t),
@@ -3553,7 +3613,12 @@ def _gwas_eigh_from_grm(
             float(elapsed),
         )
 
-    def _run_eigh(driver_name: str, mat: Optional[np.ndarray], matrix_path: Optional[str] = None):
+    def _run_eigh(
+        driver_name: str,
+        mat: Optional[np.ndarray],
+        matrix_path: Optional[str] = None,
+        subset_idx_local: Optional[np.ndarray] = None,
+    ):
         if impl_req == "scipy":
             if mat is None:
                 raise RuntimeError("SciPy eigh requires an in-memory GRM array.")
@@ -3569,7 +3634,12 @@ def _gwas_eigh_from_grm(
             _ta,
             _lapack_used,
             elapsed,
-        ) = _run_eigh_rust(driver_name, mat, matrix_path=matrix_path)
+        ) = _run_eigh_rust(
+            driver_name,
+            mat,
+            matrix_path=matrix_path,
+            subset_idx_local=subset_idx_local,
+        )
         return (
             np.asarray(eval_raw, dtype=np.float64),
             np.asarray(evec_raw, dtype=np.float64) if evec_raw is not None else None,
@@ -3583,6 +3653,7 @@ def _gwas_eigh_from_grm(
                 driver_req,
                 None,
                 matrix_path=matrix_file_hint,
+                subset_idx_local=(None if subset_identity else subset_idx_arr),
             )
         else:
             eval_raw, evec_raw, evd_backend, elapsed = _run_eigh(driver_req, g)
@@ -3594,6 +3665,7 @@ def _gwas_eigh_from_grm(
                         "dsyevd",
                         None,
                         matrix_path=matrix_file_hint,
+                        subset_idx_local=(None if subset_identity else subset_idx_arr),
                     )
                 else:
                     if g0 is None:

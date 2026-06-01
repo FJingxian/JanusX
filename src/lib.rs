@@ -146,7 +146,7 @@ use blas::{
 use bsa::preprocess_bsa;
 use eigh::{
     rust_eigh_debug_f64, rust_eigh_from_array_f64, rust_eigh_from_array_f64_inplace,
-    rust_eigh_from_matrix_file_f64,
+    rust_eigh_from_matrix_file_f64, rust_eigh_from_matrix_file_subset_f64,
 };
 use fast_math::fastlmm_prepare_lowrank_f64;
 use garfield::{
@@ -368,6 +368,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(rust_eigh_debug_f64, m)?)?;
     m.add_function(wrap_pyfunction!(rust_eigh_from_array_f64, m)?)?;
     m.add_function(wrap_pyfunction!(rust_eigh_from_matrix_file_f64, m)?)?;
+    m.add_function(wrap_pyfunction!(rust_eigh_from_matrix_file_subset_f64, m)?)?;
     m.add_function(wrap_pyfunction!(rust_eigh_from_array_f64_inplace, m)?)?;
     m.add_function(wrap_pyfunction!(fastlmm_prepare_lowrank_f64, m)?)?;
     m.add_function(wrap_pyfunction!(top_fit_model_py, m)?)?;

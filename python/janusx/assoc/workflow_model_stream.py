@@ -619,6 +619,7 @@ def run_chunked_gwas_lmm_lm(
         effective_model_key = str(model_key)
         effective_model_label = str(base_model_label)
         effective_model_tag = str(base_model_tag)
+        base_lmm: Optional[LMM] = None
         if model_key in ("lmm", "fastlmm", "fvlmm"):
             if grm is None:
                 raise ValueError("LMM/FastLMM/FvLMM requires GRM, but GRM was not prepared.")
@@ -673,9 +674,28 @@ def run_chunked_gwas_lmm_lm(
                     f"null PVE={prev_pve:.4f} (>0.995)."
                 )
                 lmm_t0 = time.monotonic()
-                stage_threads = max(1, int(threads))
-                with _gwas_evd_stage_ctx(stage_threads):
-                    mod = LMM(y=y_vec, X=X_cov, kinship=Ksub)
+                if base_lmm is not None:
+                    mod = LMM.from_lmm(base_lmm)
+                else:
+                    stage_threads = max(1, int(threads))
+                    with _gwas_evd_stage_ctx(stage_threads):
+                        eigvals, eigvecs, _evd_backend, _evd_elapsed = _gwas_eigh_from_grm(
+                            grm,
+                            threads=stage_threads,
+                            logger=logger,
+                            stage_label=f"lmm-stream-switch:{pname}",
+                            require_rust=True,
+                            diag_ridge=1e-6,
+                            subset_idx=keep_idx,
+                        )
+                        base_lmm = LMM.from_spectral(
+                            y=y_vec,
+                            X=X_cov,
+                            eigvals=eigvals,
+                            eigvecs=eigvecs,
+                            evd_secs=float(_evd_elapsed),
+                        )
+                        mod = LMM.from_lmm(base_lmm)
                 evd_secs += max(time.monotonic() - lmm_t0, 0.0)
                 evd_elapsed = format_elapsed(evd_secs)
                 effective_model_key = "lmm"

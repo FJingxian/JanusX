@@ -3005,8 +3005,9 @@ def prepare_streaming_context(
     pheno = pheno.loc[ids]
 
     if grm is not None:
-        grm_idx = [grm_index[sid] for sid in ids]
-        grm = _subset_square_matrix_identity_aware(grm, grm_idx)
+        grm_idx = np.ascontiguousarray([grm_index[sid] for sid in ids], dtype=np.int64)
+        if not _is_full_identity_index(grm_idx, int(np.shape(grm)[0])):
+            grm = _wrap_square_matrix_with_base_subset(grm, grm_idx)
 
     q_idx = [q_index[sid] for sid in ids]
     qmatrix = qmatrix[q_idx]
@@ -3059,6 +3060,65 @@ def _is_full_identity_index(idx: object, size: int) -> bool:
         return True
     except Exception:
         return False
+
+
+class _AlignedSquareMatrix(np.ndarray):
+    _jx_square_base_subset_idx: Optional[np.ndarray]
+
+    def __array_finalize__(self, obj) -> None:
+        self._jx_square_base_subset_idx = getattr(
+            obj, "_jx_square_base_subset_idx", None
+        )
+
+
+def _normalize_square_subset_index(
+    idx: object,
+    size: int,
+    label: str,
+) -> np.ndarray:
+    arr = np.asarray(idx, dtype=np.int64).reshape(-1)
+    if int(arr.shape[0]) == 0:
+        raise RuntimeError(f"{label} must not be empty.")
+    if np.any(arr < 0):
+        bad = int(arr[np.flatnonzero(arr < 0)[0]])
+        raise RuntimeError(f"{label} contains negative index: {bad}")
+    if np.any(arr >= int(size)):
+        bad = int(arr[np.flatnonzero(arr >= int(size))[0]])
+        raise RuntimeError(
+            f"{label} contains out-of-range index: {bad} for size={int(size)}"
+        )
+    return np.ascontiguousarray(arr, dtype=np.int64)
+
+
+def _wrap_square_matrix_with_base_subset(
+    grm: np.ndarray,
+    base_subset_idx: object,
+) -> np.ndarray:
+    g_shape = np.shape(grm)
+    n = int(g_shape[0]) if len(g_shape) >= 1 else 0
+    idx_arr = _normalize_square_subset_index(
+        base_subset_idx,
+        n,
+        "aligned GRM base subset index",
+    )
+    if _is_full_identity_index(idx_arr, n):
+        return grm
+    grm_view = np.asarray(grm).view(_AlignedSquareMatrix)
+    grm_view._jx_square_base_subset_idx = idx_arr
+    return grm_view
+
+
+def _square_matrix_base_subset_idx(grm: np.ndarray) -> Optional[np.ndarray]:
+    idx = getattr(grm, "_jx_square_base_subset_idx", None)
+    if idx is None:
+        return None
+    try:
+        arr = np.asarray(idx, dtype=np.int64).reshape(-1)
+    except Exception:
+        return None
+    if int(arr.shape[0]) == 0:
+        return None
+    return np.ascontiguousarray(arr, dtype=np.int64)
 
 
 def _subset_square_matrix_identity_aware(grm: np.ndarray, idx: object) -> np.ndarray:
@@ -3485,31 +3545,70 @@ def _gwas_eigh_from_grm(
     if len(g_shape) != 2 or int(g_shape[0]) != int(g_shape[1]) or int(g_shape[0]) == 0:
         raise RuntimeError(f"{stage_label} expects non-empty square GRM, got shape={g_shape}")
     n_full = int(g_shape[0])
+    aligned_base_idx_arr = _square_matrix_base_subset_idx(grm)
+    aligned_view_n = n_full
+    if aligned_base_idx_arr is not None:
+        aligned_base_idx_arr = _normalize_square_subset_index(
+            aligned_base_idx_arr,
+            n_full,
+            f"{stage_label} aligned GRM index",
+        )
+        if _is_full_identity_index(aligned_base_idx_arr, n_full):
+            aligned_base_idx_arr = None
+        else:
+            aligned_view_n = int(aligned_base_idx_arr.shape[0])
+
     subset_idx_arr: Optional[np.ndarray] = None
-    subset_identity = True
     n_eigh = n_full
     if subset_idx is not None:
-        subset_idx_arr = np.asarray(subset_idx, dtype=np.int64).reshape(-1)
-        if int(subset_idx_arr.shape[0]) == 0:
-            raise RuntimeError(f"{stage_label} received empty subset_idx.")
-        subset_identity = _is_full_identity_index(subset_idx_arr, n_full)
-        if not subset_identity:
-            n_eigh = int(subset_idx_arr.shape[0])
+        subset_idx_arr = _normalize_square_subset_index(
+            subset_idx,
+            aligned_view_n,
+            f"{stage_label} subset_idx",
+        )
+    effective_subset_idx_arr: Optional[np.ndarray] = None
+    if subset_idx_arr is not None:
+        if aligned_base_idx_arr is not None:
+            if _is_full_identity_index(subset_idx_arr, aligned_view_n):
+                effective_subset_idx_arr = aligned_base_idx_arr
+            else:
+                effective_subset_idx_arr = np.ascontiguousarray(
+                    aligned_base_idx_arr[subset_idx_arr],
+                    dtype=np.int64,
+                )
+        elif not _is_full_identity_index(subset_idx_arr, n_full):
+            effective_subset_idx_arr = subset_idx_arr
+    elif aligned_base_idx_arr is not None:
+        effective_subset_idx_arr = aligned_base_idx_arr
+    if effective_subset_idx_arr is not None:
+        effective_subset_idx_arr = _normalize_square_subset_index(
+            effective_subset_idx_arr,
+            n_full,
+            f"{stage_label} effective GRM subset",
+        )
+        if _is_full_identity_index(effective_subset_idx_arr, n_full):
+            effective_subset_idx_arr = None
+    if effective_subset_idx_arr is not None:
+        n_eigh = int(effective_subset_idx_arr.shape[0])
     driver_req = _resolve_gwas_eigh_driver(n_eigh)
 
     can_use_subset_file = bool(
         impl_req == "rust"
         and matrix_file_hint is not None
-        and (not subset_identity)
+        and (effective_subset_idx_arr is not None)
         and hasattr(jxrs, "rust_eigh_from_matrix_file_subset_f64")
     )
 
     g0: Optional[np.ndarray] = None
     g: Optional[np.ndarray] = None
-    if impl_req == "scipy" or matrix_file_hint is None or ((not subset_identity) and (not can_use_subset_file)):
+    if (
+        impl_req == "scipy"
+        or matrix_file_hint is None
+        or ((effective_subset_idx_arr is not None) and (not can_use_subset_file))
+    ):
         g_src = (
-            _subset_square_matrix_identity_aware(grm, subset_idx_arr)
-            if (subset_idx_arr is not None and not subset_identity)
+            _subset_square_matrix_identity_aware(grm, effective_subset_idx_arr)
+            if (effective_subset_idx_arr is not None)
             else grm
         )
         g0 = np.asarray(g_src, dtype=np.float64)
@@ -3530,7 +3629,6 @@ def _gwas_eigh_from_grm(
                 if (
                     subset_idx_local is not None
                     and int(np.asarray(subset_idx_local).shape[0]) > 0
-                    and (not _is_full_identity_index(subset_idx_local, n_full))
                     and hasattr(jxrs, "rust_eigh_from_matrix_file_subset_f64")
                 ):
                     return jxrs.rust_eigh_from_matrix_file_subset_f64(
@@ -3653,7 +3751,7 @@ def _gwas_eigh_from_grm(
                 driver_req,
                 None,
                 matrix_path=matrix_file_hint,
-                subset_idx_local=(None if subset_identity else subset_idx_arr),
+                subset_idx_local=effective_subset_idx_arr,
             )
         else:
             eval_raw, evec_raw, evd_backend, elapsed = _run_eigh(driver_req, g)
@@ -3665,7 +3763,7 @@ def _gwas_eigh_from_grm(
                         "dsyevd",
                         None,
                         matrix_path=matrix_file_hint,
-                        subset_idx_local=(None if subset_identity else subset_idx_arr),
+                        subset_idx_local=effective_subset_idx_arr,
                     )
                 else:
                     if g0 is None:

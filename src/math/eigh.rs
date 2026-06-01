@@ -45,6 +45,111 @@ fn copy_col_major_to_row_major(src_col_major: &[f64], n: usize) -> Vec<f64> {
 }
 
 #[inline]
+fn copy_row_major_to_col_major(src_row_major: &[f64], n: usize) -> Vec<f64> {
+    let mut out_col_major = vec![0.0_f64; n * n];
+    for row in 0..n {
+        for col in 0..n {
+            out_col_major[row + col * n] = src_row_major[row * n + col];
+        }
+    }
+    out_col_major
+}
+
+#[inline]
+fn array2_view_to_row_major(a_view: numpy::ndarray::ArrayView2<'_, f64>) -> Vec<f64> {
+    let nrows = a_view.shape().first().copied().unwrap_or(0usize);
+    let ncols = a_view.shape().get(1).copied().unwrap_or(0usize);
+    let mut out = vec![0.0_f64; nrows.saturating_mul(ncols)];
+    for row in 0..nrows {
+        for col in 0..ncols {
+            out[row * ncols + col] = a_view[(row, col)];
+        }
+    }
+    out
+}
+
+#[inline]
+fn validate_eigh_dims(n: usize, len: usize, label: &str) -> Result<(), String> {
+    let expect = n
+        .checked_mul(n)
+        .ok_or_else(|| format!("{label}: matrix element count overflow for n={n}"))?;
+    if len != expect {
+        return Err(format!(
+            "{label}: shape mismatch, len={} expected={expect}",
+            len
+        ));
+    }
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    {
+        let max_n = CblasInt::MAX as usize;
+        if n > max_n {
+            return Err(format!(
+                "{label}: n={} exceeds LAPACK integer limit {}",
+                n, max_n
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[inline]
+fn lapack_f64_workspace_len(query: f64, label: &str) -> Result<(CblasInt, usize), String> {
+    if !query.is_finite() {
+        return Err(format!("{label}: non-finite LAPACK workspace query result {query}"));
+    }
+    let need = query.ceil().max(1.0_f64);
+    let max_i32 = CblasInt::MAX as f64;
+    if need > max_i32 {
+        return Err(format!(
+            "{label}: workspace query {} exceeds LAPACK integer limit {}",
+            need, CblasInt::MAX
+        ));
+    }
+    let need_i = need as CblasInt;
+    Ok((need_i, need_i as usize))
+}
+
+#[inline]
+fn lapack_i32_workspace_len(query: CblasInt, label: &str) -> Result<(CblasInt, usize), String> {
+    if query < 1 {
+        return Err(format!(
+            "{label}: invalid integer workspace query result {query}"
+        ));
+    }
+    Ok((query, query as usize))
+}
+
+#[inline]
+fn symmetrize_row_major_f64(a_row_major: &[f64], n: usize, label: &str) -> Result<Vec<f64>, String> {
+    validate_eigh_dims(n, a_row_major.len(), label)?;
+    let mut out = vec![0.0_f64; n * n];
+    for row in 0..n {
+        for col in row..n {
+            let a_rc = a_row_major[row * n + col];
+            let a_cr = a_row_major[col * n + row];
+            if !a_rc.is_finite() {
+                return Err(format!(
+                    "{label}: non-finite value at ({row}, {col})"
+                ));
+            }
+            if !a_cr.is_finite() {
+                return Err(format!(
+                    "{label}: non-finite value at ({col}, {row})"
+                ));
+            }
+            let v = if row == col {
+                a_rc
+            } else {
+                0.5_f64 * (a_rc + a_cr)
+            };
+            out[row * n + col] = v;
+            out[col * n + row] = v;
+        }
+    }
+    Ok(out)
+}
+
+#[inline]
 fn parse_eigh_driver_token(token: &str) -> EighDriver {
     match token.trim().to_ascii_lowercase().as_str() {
         // Keep dsyevr as explicit opt-in; default/auto stay on dsyevd.
@@ -413,7 +518,7 @@ fn symmetric_eigh_f64_matrix_file_with_driver(
     jobz: EighJobz,
     diag_shift: f64,
 ) -> Result<(Vec<f64>, Option<Vec<f64>>, &'static str, usize), String> {
-    let (mut a_primary, n) = load_square_matrix_f64_from_file(path, diag_shift)?;
+    let (a_row_major, n) = load_square_matrix_f64_from_file(path, diag_shift)?;
     if n == 0 {
         let vecs = if matches!(jobz, EighJobz::ValuesAndVectors) {
             Some(Vec::new())
@@ -422,132 +527,14 @@ fn symmetric_eigh_f64_matrix_file_with_driver(
         };
         return Ok((Vec::new(), vecs, "empty", 0));
     }
-
-    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
-    {
-        let primary = driver;
-        let secondary = match driver {
-            EighDriver::Dsyevd => EighDriver::Dsyevr,
-            EighDriver::Dsyevr => EighDriver::Dsyevd,
-        };
-        let mut lapack_errors: Vec<String> = Vec::new();
-
-        match lapack_try_driver_row_major_inplace(&mut a_primary, n, jobz, primary) {
-            Ok(res) => return Ok((res.0, res.1, res.2, n)),
-            Err(err) => {
-                lapack_errors.push(format!(
-                    "{}: {err}",
-                    match primary {
-                        EighDriver::Dsyevd => "dsyevd",
-                        EighDriver::Dsyevr => "dsyevr",
-                    }
-                ));
-            }
-        }
-
-        let (mut a_retry, n_retry) = load_square_matrix_f64_from_file(path, diag_shift)?;
-        if n_retry != n {
-            return Err(format!(
-                "matrix shape changed across reload: first n={}, retry n={}",
-                n, n_retry
-            ));
-        }
-        match lapack_try_driver_row_major_inplace(&mut a_retry, n, jobz, secondary) {
-            Ok(res) => return Ok((res.0, res.1, res.2, n)),
-            Err(err) => {
-                lapack_errors.push(format!(
-                    "{}: {err}",
-                    match secondary {
-                        EighDriver::Dsyevd => "dsyevd",
-                        EighDriver::Dsyevr => "dsyevr",
-                    }
-                ));
-            }
-        }
-
-        let allow_nalgebra_fallback = if cfg!(target_os = "windows") {
-            match std::env::var("JX_EIGH_ALLOW_NALGEBRA_FALLBACK") {
-                Ok(v) => {
-                    let t = v.trim().to_ascii_lowercase();
-                    matches!(t.as_str(), "1" | "true" | "yes" | "y" | "on")
-                }
-                Err(_) => true,
-            }
-        } else {
-            env_truthy("JX_EIGH_ALLOW_NALGEBRA_FALLBACK")
-        };
-        if !allow_nalgebra_fallback {
-            return Err(format!(
-                "LAPACK eigh failed (driver={}, jobz={}): {}",
-                match driver {
-                    EighDriver::Dsyevd => "dsyevd",
-                    EighDriver::Dsyevr => "dsyevr",
-                },
-                eigh_jobz_label(jobz),
-                lapack_errors.join("; ")
-            ));
-        }
-
-        let dm = DMatrix::from_row_slice(n, n, &a_retry);
-        let se = nalgebra::linalg::SymmetricEigen::new(dm);
-        let eval_unsorted = se.eigenvalues.as_slice();
-        let evec_unsorted = se.eigenvectors;
-        let mut order: Vec<usize> = (0..n).collect();
-        order.sort_by(|&a, &b| {
-            eval_unsorted[a]
-                .partial_cmp(&eval_unsorted[b])
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        let mut s = vec![0.0_f64; n];
-        let mut u = if matches!(jobz, EighJobz::ValuesAndVectors) {
-            Some(vec![0.0_f64; n * n])
-        } else {
-            None
-        };
-        for (col_new, &col_old) in order.iter().enumerate() {
-            s[col_new] = eval_unsorted[col_old];
-            if let Some(ref mut uu) = u {
-                for row in 0..n {
-                    uu[row * n + col_new] = evec_unsorted[(row, col_old)];
-                }
-            }
-        }
-        return Ok((s, u, "nalgebra", n));
-    }
-
-    #[allow(unreachable_code)]
-    {
-        let dm = DMatrix::from_row_slice(n, n, &a_primary);
-        let se = nalgebra::linalg::SymmetricEigen::new(dm);
-        let eval_unsorted = se.eigenvalues.as_slice();
-        let evec_unsorted = se.eigenvectors;
-        let mut order: Vec<usize> = (0..n).collect();
-        order.sort_by(|&a, &b| {
-            eval_unsorted[a]
-                .partial_cmp(&eval_unsorted[b])
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        let mut s = vec![0.0_f64; n];
-        let mut u = if matches!(jobz, EighJobz::ValuesAndVectors) {
-            Some(vec![0.0_f64; n * n])
-        } else {
-            None
-        };
-        for (col_new, &col_old) in order.iter().enumerate() {
-            s[col_new] = eval_unsorted[col_old];
-            if let Some(ref mut uu) = u {
-                for row in 0..n {
-                    uu[row * n + col_new] = evec_unsorted[(row, col_old)];
-                }
-            }
-        }
-        Ok((s, u, "nalgebra", n))
-    }
+    let (evals, evecs, backend) =
+        symmetric_eigh_f64_row_major_with_driver(&a_row_major, n, driver, jobz)?;
+    Ok((evals, evecs, backend, n))
 }
 
 #[inline]
-fn lapack_dsyevr_row_major_inplace(
-    a_row_major: &mut [f64],
+fn lapack_dsyevr_col_major_inplace(
+    a_col_major: &mut [f64],
     n: usize,
     jobz: EighJobz,
 ) -> Result<(Vec<f64>, Option<Vec<f64>>, &'static str), String> {
@@ -587,7 +574,7 @@ fn lapack_dsyevr_row_major_inplace(
             range.as_ptr(),
             uplo.as_ptr(),
             &n_i,
-            a_row_major.as_mut_ptr(),
+            a_col_major.as_mut_ptr(),
             &lda,
             &vl,
             &vu,
@@ -613,10 +600,10 @@ fn lapack_dsyevr_row_major_inplace(
         return Err(format!("dsyevr workspace query failed: info={info}"));
     }
 
-    let lwork_use = (work_q[0] as CblasInt).max(1);
-    let liwork_use = iwork_q[0].max(1);
-    let mut work = vec![0.0_f64; lwork_use as usize];
-    let mut iwork = vec![0 as CblasInt; liwork_use as usize];
+    let (lwork_use, lwork_len) = lapack_f64_workspace_len(work_q[0], "dsyevr")?;
+    let (liwork_use, liwork_len) = lapack_i32_workspace_len(iwork_q[0], "dsyevr")?;
+    let mut work = vec![0.0_f64; lwork_len];
+    let mut iwork = vec![0 as CblasInt; liwork_len];
     info = 0;
     lwork = lwork_use;
     liwork = liwork_use;
@@ -627,7 +614,7 @@ fn lapack_dsyevr_row_major_inplace(
             range.as_ptr(),
             uplo.as_ptr(),
             &n_i,
-            a_row_major.as_mut_ptr(),
+            a_col_major.as_mut_ptr(),
             &lda,
             &vl,
             &vu,
@@ -666,8 +653,8 @@ fn lapack_dsyevr_row_major_inplace(
 
 #[inline]
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
-fn lapack_dsyevd_row_major_inplace(
-    a_row_major: &mut [f64],
+fn lapack_dsyevd_col_major_inplace(
+    a_col_major: &mut [f64],
     n: usize,
     jobz: EighJobz,
 ) -> Result<(Vec<f64>, Option<Vec<f64>>, &'static str), String> {
@@ -692,7 +679,7 @@ fn lapack_dsyevd_row_major_inplace(
             jobz_flag.as_ptr(),
             uplo.as_ptr(),
             &n_i,
-            a_row_major.as_mut_ptr(),
+            a_col_major.as_mut_ptr(),
             &lda,
             w.as_mut_ptr(),
             work_q.as_mut_ptr(),
@@ -709,10 +696,10 @@ fn lapack_dsyevd_row_major_inplace(
         return Err(format!("dsyevd workspace query failed: info={info}"));
     }
 
-    let lwork_use = (work_q[0] as CblasInt).max(1);
-    let liwork_use = iwork_q[0].max(1);
-    let mut work = vec![0.0_f64; lwork_use as usize];
-    let mut iwork = vec![0 as CblasInt; liwork_use as usize];
+    let (lwork_use, lwork_len) = lapack_f64_workspace_len(work_q[0], "dsyevd")?;
+    let (liwork_use, liwork_len) = lapack_i32_workspace_len(iwork_q[0], "dsyevd")?;
+    let mut work = vec![0.0_f64; lwork_len];
+    let mut iwork = vec![0 as CblasInt; liwork_len];
     info = 0;
     lwork = lwork_use;
     liwork = liwork_use;
@@ -721,7 +708,7 @@ fn lapack_dsyevd_row_major_inplace(
             jobz_flag.as_ptr(),
             uplo.as_ptr(),
             &n_i,
-            a_row_major.as_mut_ptr(),
+            a_col_major.as_mut_ptr(),
             &lda,
             w.as_mut_ptr(),
             work.as_mut_ptr(),
@@ -739,7 +726,7 @@ fn lapack_dsyevd_row_major_inplace(
     }
 
     if need_vec {
-        let u_row = copy_col_major_to_row_major(a_row_major, n);
+        let u_row = copy_col_major_to_row_major(a_col_major, n);
         Ok((w, Some(u_row), lapack_dsyevd_backend_label()))
     } else {
         Ok((w, None, lapack_dsyevd_backend_label()))
@@ -748,15 +735,15 @@ fn lapack_dsyevd_row_major_inplace(
 
 #[inline]
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
-fn lapack_try_driver_row_major_inplace(
-    a_row_major: &mut [f64],
+fn lapack_try_driver_col_major_inplace(
+    a_col_major: &mut [f64],
     n: usize,
     jobz: EighJobz,
     driver: EighDriver,
 ) -> Result<(Vec<f64>, Option<Vec<f64>>, &'static str), String> {
     match driver {
-        EighDriver::Dsyevd => lapack_dsyevd_row_major_inplace(a_row_major, n, jobz),
-        EighDriver::Dsyevr => lapack_dsyevr_row_major_inplace(a_row_major, n, jobz),
+        EighDriver::Dsyevd => lapack_dsyevd_col_major_inplace(a_col_major, n, jobz),
+        EighDriver::Dsyevr => lapack_dsyevr_col_major_inplace(a_col_major, n, jobz),
     }
 }
 
@@ -767,13 +754,7 @@ fn symmetric_eigh_f64_row_major_with_driver(
     driver: EighDriver,
     jobz: EighJobz,
 ) -> Result<(Vec<f64>, Option<Vec<f64>>, &'static str), String> {
-    if a_row_major.len() != n.saturating_mul(n) {
-        return Err(format!(
-            "symmetric_eigh_f64_row_major: shape mismatch, len={} expected={}",
-            a_row_major.len(),
-            n.saturating_mul(n)
-        ));
-    }
+    let a_sym_row_major = symmetrize_row_major_f64(a_row_major, n, "symmetric_eigh_f64_row_major")?;
     if n == 0 {
         let vecs = if matches!(jobz, EighJobz::ValuesAndVectors) {
             Some(Vec::new())
@@ -786,14 +767,14 @@ fn symmetric_eigh_f64_row_major_with_driver(
     #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     {
         let mut lapack_errors: Vec<String> = Vec::new();
-        let mut a_primary = a_row_major.to_vec();
+        let mut a_primary = copy_row_major_to_col_major(&a_sym_row_major, n);
         let primary = driver;
         let secondary = match driver {
             EighDriver::Dsyevd => EighDriver::Dsyevr,
             EighDriver::Dsyevr => EighDriver::Dsyevd,
         };
 
-        match lapack_try_driver_row_major_inplace(&mut a_primary, n, jobz, primary) {
+        match lapack_try_driver_col_major_inplace(&mut a_primary, n, jobz, primary) {
             Ok(res) => return Ok(res),
             Err(err) => {
                 lapack_errors.push(format!(
@@ -806,8 +787,8 @@ fn symmetric_eigh_f64_row_major_with_driver(
             }
         }
 
-        let mut a_retry = a_row_major.to_vec();
-        match lapack_try_driver_row_major_inplace(&mut a_retry, n, jobz, secondary) {
+        let mut a_retry = copy_row_major_to_col_major(&a_sym_row_major, n);
+        match lapack_try_driver_col_major_inplace(&mut a_retry, n, jobz, secondary) {
             Ok(res) => return Ok(res),
             Err(err) => {
                 lapack_errors.push(format!(
@@ -846,7 +827,7 @@ fn symmetric_eigh_f64_row_major_with_driver(
         }
     }
 
-    let dm = DMatrix::from_row_slice(n, n, a_row_major);
+    let dm = DMatrix::from_row_slice(n, n, &a_sym_row_major);
     let se = nalgebra::linalg::SymmetricEigen::new(dm);
     let eval_unsorted = se.eigenvalues.as_slice();
     let evec_unsorted = se.eigenvectors;
@@ -871,50 +852,6 @@ fn symmetric_eigh_f64_row_major_with_driver(
         }
     }
     Ok((s, u, "nalgebra"))
-}
-
-#[inline]
-fn symmetric_eigh_f64_row_major_inplace_single_driver(
-    a_row_major: &mut [f64],
-    n: usize,
-    driver: EighDriver,
-    jobz: EighJobz,
-) -> Result<(Vec<f64>, Option<Vec<f64>>, &'static str), String> {
-    if a_row_major.len() != n.saturating_mul(n) {
-        return Err(format!(
-            "symmetric_eigh_f64_row_major_inplace: shape mismatch, len={} expected={}",
-            a_row_major.len(),
-            n.saturating_mul(n)
-        ));
-    }
-    if n == 0 {
-        let vecs = if matches!(jobz, EighJobz::ValuesAndVectors) {
-            Some(Vec::new())
-        } else {
-            None
-        };
-        return Ok((Vec::new(), vecs, "empty"));
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
-    {
-        return lapack_try_driver_row_major_inplace(a_row_major, n, jobz, driver).map_err(|e| {
-            format!(
-                "inplace LAPACK eigh failed (driver={}, jobz={}): {e}",
-                match driver {
-                    EighDriver::Dsyevd => "dsyevd",
-                    EighDriver::Dsyevr => "dsyevr",
-                },
-                eigh_jobz_label(jobz),
-            )
-        });
-    }
-
-    #[allow(unreachable_code)]
-    Err(
-        "inplace eigh requires LAPACK backend on macOS/Linux/Windows; unsupported target"
-            .to_string(),
-    )
 }
 
 pub fn symmetric_eigh_f64_row_major(
@@ -1047,12 +984,8 @@ pub fn rust_eigh_from_array_f64<'py>(
     let (threads_before, threads_in_stage, run, threads_after) =
         crate::blas::with_eigh_thread_stage(threads, || {
             let t0 = Instant::now();
-            let run = if let Some(a_contig) = a_view.as_slice_memory_order() {
-                symmetric_eigh_f64_row_major_with_driver(a_contig, n, driver_sel, jobz_sel)
-            } else {
-                let a_tmp: Vec<f64> = a_view.iter().copied().collect();
-                symmetric_eigh_f64_row_major_with_driver(&a_tmp, n, driver_sel, jobz_sel)
-            };
+            let a_tmp = array2_view_to_row_major(a_view);
+            let run = symmetric_eigh_f64_row_major_with_driver(&a_tmp, n, driver_sel, jobz_sel);
             let elapsed = t0.elapsed().as_secs_f64();
             (run, elapsed)
         });
@@ -1203,13 +1136,8 @@ pub fn rust_eigh_from_array_f64_inplace<'py>(
         )));
     }
     let n = nrows;
-    let a_row_major: &mut [f64] = unsafe {
-        a.as_slice_mut().map_err(|_| {
-            PyRuntimeError::new_err(
-                "rust_eigh_from_array_f64_inplace expects writable contiguous float64 matrix",
-            )
-        })?
-    };
+    let a_ro = a.readonly();
+    let a_view = a_ro.as_array();
 
     let driver_sel = parse_eigh_driver_token(driver.unwrap_or_else(|| "auto".to_string()).as_str());
     let jobz_sel = parse_eigh_jobz_token(jobz);
@@ -1218,8 +1146,9 @@ pub fn rust_eigh_from_array_f64_inplace<'py>(
     let (threads_before, threads_in_stage, run, threads_after) =
         crate::blas::with_eigh_thread_stage(threads, || {
             let t0 = Instant::now();
-            let run = symmetric_eigh_f64_row_major_inplace_single_driver(
-                a_row_major,
+            let a_row_major = array2_view_to_row_major(a_view);
+            let run = symmetric_eigh_f64_row_major_with_driver(
+                &a_row_major,
                 n,
                 driver_sel,
                 jobz_sel,
@@ -1262,4 +1191,44 @@ pub fn rust_eigh_from_array_f64_inplace<'py>(
         lapack_used,
         elapsed,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_symmetrize_row_major_f64_averages_offdiag() {
+        let a = vec![
+            1.0_f64, 2.0_f64,
+            4.0_f64, 3.0_f64,
+        ];
+        let out = symmetrize_row_major_f64(&a, 2, "test").unwrap();
+        assert_eq!(out, vec![1.0_f64, 3.0_f64, 3.0_f64, 3.0_f64]);
+    }
+
+    #[test]
+    fn test_eigh_row_major_small_matrix() {
+        let a = vec![
+            2.0_f64, 1.0_f64,
+            1.0_f64, 2.0_f64,
+        ];
+        let (evals, evecs_opt, _backend) =
+            symmetric_eigh_f64_row_major_with_driver(&a, 2, EighDriver::Dsyevd, EighJobz::ValuesAndVectors)
+                .unwrap();
+        assert_eq!(evals.len(), 2);
+        assert!((evals[0] - 1.0_f64).abs() < 1e-9_f64);
+        assert!((evals[1] - 3.0_f64).abs() < 1e-9_f64);
+        let evecs = evecs_opt.unwrap();
+        assert_eq!(evecs.len(), 4);
+        let dot = evecs[0] * evecs[2] + evecs[1] * evecs[3];
+        assert!(dot.abs() < 1e-9_f64);
+    }
+
+    #[test]
+    fn test_lapack_workspace_len_rejects_i32_overflow() {
+        let overflow = (CblasInt::MAX as f64) + 1024.0_f64;
+        let err = lapack_f64_workspace_len(overflow, "test").unwrap_err();
+        assert!(err.contains("exceeds LAPACK integer limit"));
+    }
 }

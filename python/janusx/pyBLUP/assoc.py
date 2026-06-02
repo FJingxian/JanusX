@@ -126,6 +126,29 @@ def _emit_runtime_warning_once(flag_name: str, message: str) -> None:
         pass
 
 
+def _env_positive_int(name: str) -> Optional[int]:
+    raw = str(os.environ.get(str(name), "")).strip()
+    if raw == "":
+        return None
+    try:
+        val = int(raw)
+    except Exception:
+        return None
+    return val if val > 0 else None
+
+
+def _resolve_fvlmm_rotate_block_rows(rotate_block_rows: int) -> int:
+    """
+    Resolve the raw-SNP FvLMM projection block size.
+    An explicit environment override is useful for benchmarking the
+    projection kernel without changing the public GWAS CLI surface.
+    """
+    env_val = _env_positive_int("JX_FVLMM_ROTATE_BLOCK_ROWS")
+    if env_val is not None:
+        return int(env_val)
+    return max(1, int(rotate_block_rows))
+
+
 def _resolve_matrix_file_hint(matrix: object) -> Optional[str]:
     try:
         fn = getattr(matrix, "filename", None)
@@ -1276,6 +1299,7 @@ def fvlmm_assoc_fixed_from_snp(
     """
     Fixed-variance LMM scan on raw SNP chunk using the BLAS-blocked Rust kernel.
     """
+    rotate_block_rows = _resolve_fvlmm_rotate_block_rows(rotate_block_rows)
     if _fvlmm_assoc_chunk_from_snp_f32 is None:
         raise RuntimeError(
             "Rust extension missing fvlmm_assoc_chunk_from_snp_f32. "
@@ -1312,6 +1336,7 @@ def fvlmm_assoc_fixed_from_snp_with_cache(
     """
     Fixed-variance LMM scan on raw SNP chunk using a trait-level cached null model.
     """
+    rotate_block_rows = _resolve_fvlmm_rotate_block_rows(rotate_block_rows)
     if _fvlmm_assoc_chunk_from_snp_with_cache_f32 is None:
         raise RuntimeError(
             "Rust extension missing fvlmm_assoc_chunk_from_snp_with_cache_f32. "

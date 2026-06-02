@@ -1126,6 +1126,14 @@ fn rotate_snp_block_with_ut(
 }
 
 #[inline]
+fn env_positive_usize(name: &str) -> Option<usize> {
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&v| v > 0)
+}
+
+#[inline]
 fn row_major_mat_mul_f32_blas(
     a: &[f32],
     rows: usize,
@@ -1222,6 +1230,156 @@ fn row_major_mat_mul_f32_rhs_small(
 }
 
 #[inline]
+fn choose_rotate_row_tile_rows_fvlmm(rows: usize, n: usize, thread_hint: usize) -> usize {
+    if let Some(v) = env_positive_usize("JX_GWAS_ROTATE_ROW_TILE") {
+        return v.max(1).min(rows.max(1));
+    }
+    if n < 2048 {
+        return choose_rotate_tile_rows(rows, thread_hint);
+    }
+    let target_mb = env_positive_usize("JX_GWAS_ROTATE_ROW_TILE_MB").unwrap_or_else(|| {
+        if n >= 16384 {
+            8usize
+        } else if n >= 8192 {
+            6usize
+        } else {
+            4usize
+        }
+    });
+    let target_bytes = target_mb.saturating_mul(1024 * 1024);
+    let bytes_per_row = n
+        .saturating_mul(2)
+        .saturating_mul(std::mem::size_of::<f32>())
+        .max(1);
+    let mut tile_rows = (target_bytes / bytes_per_row).max(16).min(rows.max(1));
+    let max_tile = if n >= 16384 {
+        256usize
+    } else if n >= 8192 {
+        192usize
+    } else {
+        128usize
+    };
+    tile_rows = tile_rows.clamp(16, max_tile.min(rows.max(1)));
+    tile_rows.min(rows.max(1))
+}
+
+#[inline]
+fn choose_rotate_col_block_cols_fvlmm(n: usize) -> usize {
+    if let Some(v) = env_positive_usize("JX_GWAS_ROTATE_COL_BLOCK") {
+        return v.max(1).min(n.max(1));
+    }
+    if n < 2048 {
+        return n.max(1);
+    }
+    let target_mb = env_positive_usize("JX_GWAS_ROTATE_COL_BLOCK_MB").unwrap_or_else(|| {
+        if n >= 16384 {
+            12usize
+        } else if n >= 8192 {
+            16usize
+        } else {
+            8usize
+        }
+    });
+    let target_bytes = target_mb.saturating_mul(1024 * 1024);
+    let bytes_per_col = n.saturating_mul(std::mem::size_of::<f32>()).max(1);
+    let cols = (target_bytes / bytes_per_col).max(64);
+    cols.clamp(64, 1024).min(n.max(1))
+}
+
+#[inline]
+fn rotate_snp_block_with_ut_parallel_blocked(
+    snp_block: &[f32],
+    rows: usize,
+    n: usize,
+    u_t: &[f32],
+    out_block: &mut [f32],
+    row_tile_rows: usize,
+    col_block_cols: usize,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) {
+    if rows == 0 || n == 0 {
+        return;
+    }
+    debug_assert!(snp_block.len() >= rows.saturating_mul(n));
+    debug_assert!(u_t.len() >= n.saturating_mul(n));
+    debug_assert!(out_block.len() >= rows.saturating_mul(n));
+    let tile_rows = row_tile_rows.max(1).min(rows);
+    let col_block = col_block_cols.max(1).min(n);
+
+    let mut run_parallel = || {
+        out_block
+            .par_chunks_mut(tile_rows * n)
+            .enumerate()
+            .for_each_init(
+                || vec![0.0_f32; tile_rows.saturating_mul(col_block)],
+                |scratch, (chunk_idx, out_chunk)| {
+                    let row_start = chunk_idx * tile_rows;
+                    let rows_here = out_chunk.len() / n;
+                    let a_start = row_start * n;
+                    let a_end = a_start + rows_here * n;
+                    let a_block = &snp_block[a_start..a_end];
+                    if col_block >= n {
+                        rotate_snp_block_with_ut(a_block, rows_here, n, u_t, out_chunk);
+                        return;
+                    }
+                    for col_start in (0..n).step_by(col_block) {
+                        let cols_here = (n - col_start).min(col_block);
+                        let scratch_sub = &mut scratch[..rows_here * cols_here];
+                        matmul_rowmajor_rhs_transposed_from_rowmajor_f32(
+                            a_block,
+                            rows_here,
+                            n,
+                            &u_t[col_start * n..(col_start + cols_here) * n],
+                            cols_here,
+                            scratch_sub,
+                        );
+                        for r in 0..rows_here {
+                            let src =
+                                &scratch_sub[r * cols_here..(r + 1) * cols_here];
+                            let dst = &mut out_chunk
+                                [r * n + col_start..r * n + col_start + cols_here];
+                            dst.copy_from_slice(src);
+                        }
+                    }
+                },
+            );
+    };
+
+    if tile_rows >= rows {
+        if col_block >= n {
+            rotate_snp_block_with_ut(snp_block, rows, n, u_t, out_block);
+            return;
+        }
+        let mut scratch = vec![0.0_f32; rows.saturating_mul(col_block)];
+        for col_start in (0..n).step_by(col_block) {
+            let cols_here = (n - col_start).min(col_block);
+            let scratch_sub = &mut scratch[..rows * cols_here];
+            matmul_rowmajor_rhs_transposed_from_rowmajor_f32(
+                snp_block,
+                rows,
+                n,
+                &u_t[col_start * n..(col_start + cols_here) * n],
+                cols_here,
+                scratch_sub,
+            );
+            for r in 0..rows {
+                let src = &scratch_sub[r * cols_here..(r + 1) * cols_here];
+                let dst =
+                    &mut out_block[r * n + col_start..r * n + col_start + cols_here];
+                dst.copy_from_slice(src);
+            }
+        }
+        return;
+    }
+
+    if let Some(tp) = pool {
+        tp.install(run_parallel);
+    } else {
+        run_parallel();
+    }
+}
+
+#[inline]
 fn rotate_snp_block_with_ut_blas(
     snp_block: &[f32],
     rows: usize,
@@ -1229,6 +1387,7 @@ fn rotate_snp_block_with_ut_blas(
     u_t: &[f32],
     out_block: &mut [f32],
     threads: usize,
+    proj_pool: Option<&Arc<rayon::ThreadPool>>,
 ) {
     if rows == 0 || n == 0 {
         return;
@@ -1243,8 +1402,18 @@ fn rotate_snp_block_with_ut_blas(
         } else {
             rayon::current_num_threads()
         };
-        let tile_rows = choose_rotate_tile_rows(rows, thread_hint);
-        rotate_snp_block_with_ut_parallel(snp_block, rows, n, u_t, out_block, tile_rows);
+        let row_tile = choose_rotate_row_tile_rows_fvlmm(rows, n, thread_hint);
+        let col_block = choose_rotate_col_block_cols_fvlmm(n);
+        rotate_snp_block_with_ut_parallel_blocked(
+            snp_block,
+            rows,
+            n,
+            u_t,
+            out_block,
+            row_tile,
+            col_block,
+            proj_pool,
+        );
         return;
     }
 
@@ -2049,12 +2218,43 @@ impl FvLmmAssocCache {
 }
 
 #[inline]
-fn stage_assoc_threads_or(requested_threads: usize) -> usize {
-    std::env::var("JX_MLM_RUST_THREADS")
-        .ok()
-        .and_then(|s| s.trim().parse::<usize>().ok())
-        .filter(|&v| v > 0)
+fn stage_proj_threads_or(requested_threads: usize) -> usize {
+    env_positive_usize("JX_FVLMM_PROJ_THREADS")
+        .or_else(|| env_positive_usize("JX_MLM_RUST_THREADS"))
         .unwrap_or(requested_threads)
+}
+
+#[inline]
+fn stage_assoc_threads_or(requested_threads: usize) -> usize {
+    env_positive_usize("JX_FVLMM_ASSOC_THREADS")
+        .or_else(|| env_positive_usize("JX_MLM_RUST_THREADS"))
+        .unwrap_or(requested_threads)
+}
+
+fn build_u_t_sub_from_sample_idx(
+    u_slice: &[f32],
+    k_full: usize,
+    sample_idx: &[usize],
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) -> Vec<f32> {
+    let n = sample_idx.len();
+    let mut u_t_sub = vec![0.0_f32; n * n];
+    let mut run = || {
+        u_t_sub
+            .par_chunks_mut(n.max(1))
+            .enumerate()
+            .for_each(|(col_idx, dst_row)| {
+                for (out_col, &sid) in sample_idx.iter().enumerate() {
+                    dst_row[out_col] = u_slice[sid * k_full + col_idx];
+                }
+            });
+    };
+    if let Some(tp) = pool {
+        tp.install(run);
+    } else {
+        run();
+    }
+    u_t_sub
 }
 
 fn prepare_fixed_lambda_assoc_cache_f32(
@@ -3037,15 +3237,17 @@ pub fn fvlmm_assoc_chunk_from_snp_with_cache_f32<'py>(
         Err(_) => Cow::Owned(ut_arr.iter().copied().collect()),
     };
 
+    let proj_threads = stage_proj_threads_or(threads);
     let assoc_threads = stage_assoc_threads_or(threads);
-    let pool = get_cached_pool(assoc_threads)?;
+    let proj_pool = get_cached_pool(proj_threads)?;
+    let assoc_pool = get_cached_pool(assoc_threads)?;
     let block_rows = rotate_block_rows.max(1);
     let cache_arc = Arc::clone(&cache.cache);
     let use_pipeline = use_rotate_finalize_pipeline(
         !rust_sgemm_prefers_rayon_rowmajor_f32_kernel()
             && block_rows < m
             && assoc_threads > 1
-            && threads > 0,
+            && proj_threads > 1,
     );
 
     py.detach(|| {
@@ -3056,7 +3258,15 @@ pub fn fvlmm_assoc_chunk_from_snp_with_cache_f32<'py>(
             use_pipeline,
             |start, rows, rot_block| {
                 let snp_block = &snp_flat[start * n..(start + rows) * n];
-                rotate_snp_block_with_ut_blas(snp_block, rows, n, &ut_flat, rot_block, threads);
+                rotate_snp_block_with_ut_blas(
+                    snp_block,
+                    rows,
+                    n,
+                    &ut_flat,
+                    rot_block,
+                    proj_threads,
+                    proj_pool.as_ref(),
+                );
             },
             |start, rows, rot_block| {
                 let out_block = &mut out_slice[start * out_cols..(start + rows) * out_cols];
@@ -3069,7 +3279,7 @@ pub fn fvlmm_assoc_chunk_from_snp_with_cache_f32<'py>(
                     out_block,
                     out_cols,
                     assoc_threads,
-                    pool.as_ref(),
+                    assoc_pool.as_ref(),
                     nullml,
                 );
             },
@@ -3146,14 +3356,16 @@ pub fn fvlmm_assoc_chunk_from_snp_f32<'py>(
     };
     let p = p_cov;
     let cache = prepare_fixed_lambda_assoc_cache_f32(s, xcov_slice, y, n, p, lbd)?;
+    let proj_threads = stage_proj_threads_or(threads);
     let assoc_threads = stage_assoc_threads_or(threads);
-    let pool = get_cached_pool(assoc_threads)?;
+    let proj_pool = get_cached_pool(proj_threads)?;
+    let assoc_pool = get_cached_pool(assoc_threads)?;
     let block_rows = rotate_block_rows.max(1);
     let use_pipeline = use_rotate_finalize_pipeline(
         !rust_sgemm_prefers_rayon_rowmajor_f32_kernel()
             && block_rows < m
             && assoc_threads > 1
-            && threads > 0,
+            && proj_threads > 1,
     );
 
     py.detach(|| {
@@ -3164,7 +3376,15 @@ pub fn fvlmm_assoc_chunk_from_snp_f32<'py>(
             use_pipeline,
             |start, rows, rot_block| {
                 let snp_block = &snp_flat[start * n..(start + rows) * n];
-                rotate_snp_block_with_ut_blas(snp_block, rows, n, &ut_flat, rot_block, threads);
+                rotate_snp_block_with_ut_blas(
+                    snp_block,
+                    rows,
+                    n,
+                    &ut_flat,
+                    rot_block,
+                    proj_threads,
+                    proj_pool.as_ref(),
+                );
             },
             |start, rows, rot_block| {
                 let out_block = &mut out_slice[start * out_cols..(start + rows) * out_cols];
@@ -3177,7 +3397,7 @@ pub fn fvlmm_assoc_chunk_from_snp_f32<'py>(
                     out_block,
                     out_cols,
                     assoc_threads,
-                    pool.as_ref(),
+                    assoc_pool.as_ref(),
                     nullml,
                 );
             },
@@ -4974,20 +5194,8 @@ pub fn fastlmm_assoc_packed_f32<'py>(
         }
     }
 
-    let mut u_sub = vec![0.0_f32; n * n];
-    for (i, &sid) in sample_idx.iter().enumerate() {
-        let src = &u_slice[sid * k_full..sid * k_full + n];
-        let dst = &mut u_sub[i * n..(i + 1) * n];
-        dst.copy_from_slice(src);
-    }
-    let mut u_t_sub = vec![0.0_f32; n * n];
-    for i in 0..n {
-        for j in 0..n {
-            u_t_sub[j * n + i] = u_sub[i * n + j];
-        }
-    }
-
     let pool = get_cached_pool(threads)?;
+    let u_t_sub = build_u_t_sub_from_sample_idx(u_slice, k_full, &sample_idx, pool.as_ref());
     let mut y_rot = vec![0.0_f64; n];
     let mut x_rot = vec![0.0_f64; n * p];
     {
@@ -5560,20 +5768,8 @@ pub fn fastlmm_assoc_packed_f32_to_tsv<'py>(
         }
     }
 
-    let mut u_sub = vec![0.0_f32; n * n];
-    for (i, &sid) in sample_idx.iter().enumerate() {
-        let src = &u_slice[sid * k_full..sid * k_full + n];
-        let dst = &mut u_sub[i * n..(i + 1) * n];
-        dst.copy_from_slice(src);
-    }
-    let mut u_t_sub = vec![0.0_f32; n * n];
-    for i in 0..n {
-        for j in 0..n {
-            u_t_sub[j * n + i] = u_sub[i * n + j];
-        }
-    }
-
     let pool = get_cached_pool(threads)?;
+    let u_t_sub = build_u_t_sub_from_sample_idx(u_slice, k_full, &sample_idx, pool.as_ref());
     let mut y_rot = vec![0.0_f64; n];
     let mut x_rot = vec![0.0_f64; n * p];
     {
@@ -6213,20 +6409,8 @@ pub fn fvlmm_assoc_packed_f32_to_tsv<'py>(
         }
     }
 
-    let mut u_sub = vec![0.0_f32; n * n];
-    for (i, &sid) in sample_idx.iter().enumerate() {
-        let src = &u_slice[sid * k_full..sid * k_full + n];
-        let dst = &mut u_sub[i * n..(i + 1) * n];
-        dst.copy_from_slice(src);
-    }
-    let mut u_t_sub = vec![0.0_f32; n * n];
-    for i in 0..n {
-        for j in 0..n {
-            u_t_sub[j * n + i] = u_sub[i * n + j];
-        }
-    }
-
     let pool = get_cached_pool(threads)?;
+    let u_t_sub = build_u_t_sub_from_sample_idx(u_slice, k_full, &sample_idx, pool.as_ref());
     let mut y_rot = vec![0.0_f64; n];
     let mut x_rot = vec![0.0_f64; n * p];
     {
@@ -6340,19 +6524,19 @@ pub fn fvlmm_assoc_packed_f32_to_tsv<'py>(
 
         let mut text_buf = String::with_capacity(rotate_block_rows * 128);
         let mut next_progress_emit = progress_block.min(m).max(1);
-        let assoc_threads = if threads > 0 {
-            threads
-        } else {
-            rayon::current_num_threads()
-        };
+        let proj_threads = stage_proj_threads_or(threads);
+        let assoc_threads = stage_assoc_threads_or(threads);
+        let proj_pool = get_cached_pool(proj_threads)?;
+        let assoc_pool = get_cached_pool(assoc_threads)?;
         let packed_pipeline_default = !rust_sgemm_prefers_rayon_rowmajor_f32_kernel()
             && rotate_block_rows < m
+            && proj_threads > 1
             && assoc_threads > 1;
         let use_packed_pipeline = use_packed_three_stage_pipeline(packed_pipeline_default);
         let missing_pool = if use_packed_pipeline {
             None
         } else {
-            pool.as_ref()
+            assoc_pool.as_ref()
         };
 
         run_packed_decode_rotate_finalize_triple_buffer_f32(
@@ -6395,7 +6579,15 @@ pub fn fvlmm_assoc_packed_f32_to_tsv<'py>(
             |start, rows, snp_block, g_rot| {
                 let _ = start;
                 let pt0 = Instant::now();
-                rotate_snp_block_with_ut_blas(snp_block, rows, n, &u_t_sub, g_rot, threads);
+                rotate_snp_block_with_ut_blas(
+                    snp_block,
+                    rows,
+                    n,
+                    &u_t_sub,
+                    g_rot,
+                    proj_threads,
+                    proj_pool.as_ref(),
+                );
                 record_elapsed_nanos(&proj_nanos, pt0);
             },
             |start, rows, g_rot, out_sub, miss_sub| -> PyResult<()> {
@@ -6408,8 +6600,8 @@ pub fn fvlmm_assoc_packed_f32_to_tsv<'py>(
                     &cache,
                     out_sub,
                     out_cols,
-                    threads,
-                    pool.as_ref(),
+                    assoc_threads,
+                    assoc_pool.as_ref(),
                     Some(ml0),
                 );
                 record_elapsed_nanos(&assoc_nanos, at0);

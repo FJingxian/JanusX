@@ -71,15 +71,183 @@ def _detect_cgroup_cpu_quota() -> int | None:
     return None
 
 
+def _current_host_aliases() -> set[str]:
+    aliases: set[str] = set()
+    for raw in (platform.node(), getattr(os, "uname", lambda: None)() and os.uname().nodename):
+        text = str(raw or "").strip().lower()
+        if not text:
+            continue
+        aliases.add(text)
+        aliases.add(text.split(".", 1)[0])
+    return {x for x in aliases if x}
+
+
+def _host_matches_local(raw_host: str, aliases: set[str]) -> bool:
+    text = str(raw_host or "").strip().lower()
+    if not text:
+        return False
+    short = text.split(".", 1)[0]
+    return text in aliases or short in aliases
+
+
+def _detect_affinity_threads() -> int | None:
+    try:
+        if hasattr(os, "sched_getaffinity"):
+            aff = os.sched_getaffinity(0)  # type: ignore[attr-defined]
+            if aff is not None and len(aff) > 0:
+                return int(len(aff))
+    except Exception:
+        pass
+    return None
+
+
+def _detect_lsf_local_slots() -> int | None:
+    raw = str(os.environ.get("LSB_MCPU_HOSTS", "")).strip().split()
+    if len(raw) < 2:
+        return None
+    aliases = _current_host_aliases()
+    for i in range(0, len(raw) - 1, 2):
+        host = raw[i]
+        try:
+            slots = int(raw[i + 1])
+        except Exception:
+            continue
+        if slots > 0 and _host_matches_local(host, aliases):
+            return slots
+    return None
+
+
+def _detect_pbs_local_slots() -> int | None:
+    nodefile = str(os.environ.get("PBS_NODEFILE", "")).strip()
+    if not nodefile or not os.path.isfile(nodefile):
+        return None
+    aliases = _current_host_aliases()
+    count = 0
+    try:
+        with open(nodefile, "r", encoding="utf-8") as fh:
+            for line in fh:
+                if _host_matches_local(line.strip(), aliases):
+                    count += 1
+    except Exception:
+        return None
+    return count if count > 0 else None
+
+
+def _detect_sge_local_slots() -> int | None:
+    hostfile = str(os.environ.get("PE_HOSTFILE", "")).strip()
+    if not hostfile or not os.path.isfile(hostfile):
+        return None
+    aliases = _current_host_aliases()
+    try:
+        with open(hostfile, "r", encoding="utf-8") as fh:
+            for line in fh:
+                toks = line.strip().split()
+                if len(toks) < 2:
+                    continue
+                try:
+                    slots = int(toks[1])
+                except Exception:
+                    continue
+                if slots > 0 and _host_matches_local(toks[0], aliases):
+                    return slots
+    except Exception:
+        return None
+    return None
+
+
+def _first_positive_named(items: list[tuple[str, int | None]]) -> tuple[int | None, str | None]:
+    for name, value in items:
+        if value is not None and int(value) > 0:
+            return int(value), str(name)
+    return None, None
+
+
+def detect_thread_budget_info() -> dict[str, Any]:
+    scheduler_local_candidates = [
+        ("SLURM_CPUS_ON_NODE", _parse_positive_env_int("SLURM_CPUS_ON_NODE")),
+        ("LSB_MCPU_HOSTS", _detect_lsf_local_slots()),
+        ("PBS_NODEFILE", _detect_pbs_local_slots()),
+        ("PE_HOSTFILE", _detect_sge_local_slots()),
+    ]
+    scheduler_total_candidates = [
+        ("SLURM_CPUS_PER_TASK", _parse_positive_env_int("SLURM_CPUS_PER_TASK")),
+        ("PBS_NP", _parse_positive_env_int("PBS_NP")),
+        ("LSB_DJOB_NUMPROC", _parse_positive_env_int("LSB_DJOB_NUMPROC")),
+        ("NSLOTS", _parse_positive_env_int("NSLOTS")),
+        ("NCPUS", _parse_positive_env_int("NCPUS")),
+    ]
+
+    scheduler_local_threads, scheduler_local_source = _first_positive_named(
+        scheduler_local_candidates
+    )
+    scheduler_total_threads, scheduler_total_source = _first_positive_named(
+        scheduler_total_candidates
+    )
+    affinity_threads = _detect_affinity_threads()
+    cgroup_threads = _detect_cgroup_cpu_quota()
+    host_visible_threads = max(1, int(os.cpu_count() or 1))
+
+    effective_candidates: list[tuple[str, int]] = []
+    for source, value in (
+        ("scheduler_local", scheduler_local_threads),
+        ("scheduler_total", scheduler_total_threads),
+        ("affinity", affinity_threads),
+        ("cgroup", cgroup_threads),
+        ("host_visible", host_visible_threads),
+    ):
+        if value is not None and int(value) > 0:
+            effective_candidates.append((str(source), int(value)))
+    effective_threads = min(value for _, value in effective_candidates)
+    effective_sources = tuple(
+        source for source, value in effective_candidates if int(value) == int(effective_threads)
+    )
+
+    return {
+        "scheduler_local_threads": scheduler_local_threads,
+        "scheduler_local_source": scheduler_local_source,
+        "scheduler_total_threads": scheduler_total_threads,
+        "scheduler_total_source": scheduler_total_source,
+        "affinity_threads": affinity_threads,
+        "cgroup_threads": cgroup_threads,
+        "host_visible_threads": host_visible_threads,
+        "effective_threads": int(effective_threads),
+        "effective_sources": effective_sources,
+    }
+
+
+def format_thread_budget_summary(info: dict[str, Any]) -> str:
+    def _fmt(value: Any, source: Any = None) -> str:
+        if value is None:
+            return "NA"
+        if source is None or str(source).strip() == "":
+            return str(value)
+        return f"{value} [{source}]"
+
+    effective_sources = info.get("effective_sources") or ()
+    effective_src_text = ",".join(str(x) for x in effective_sources if str(x).strip())
+    return (
+        "scheduler total="
+        f"{_fmt(info.get('scheduler_total_threads'), info.get('scheduler_total_source'))}, "
+        "scheduler local="
+        f"{_fmt(info.get('scheduler_local_threads'), info.get('scheduler_local_source'))}, "
+        f"affinity={_fmt(info.get('affinity_threads'))}, "
+        f"cgroup={_fmt(info.get('cgroup_threads'))}, "
+        f"host_visible={_fmt(info.get('host_visible_threads'))}, "
+        "local effective="
+        f"{_fmt(info.get('effective_threads'), effective_src_text)}"
+    )
+
+
 def detect_effective_threads() -> int:
     """
     Detect usable CPU thread count in HPC/container environments.
 
-    Priority:
-      1) Scheduler allocation vars (SLURM/PBS/LSF/SGE)
-      2) CPU affinity mask
-      3) cgroup CPU quota
-      4) os.cpu_count()
+    Use the most restrictive positive local signal among:
+      1) Scheduler local-slot hints
+      2) Scheduler allocation vars
+      3) CPU affinity mask
+      4) cgroup CPU quota
+      5) os.cpu_count()
 
     Important:
       Pre-existing BLAS/OpenMP thread env vars are intentionally *not* used to
@@ -89,39 +257,7 @@ def detect_effective_threads() -> int:
       apply the chosen thread budget back to BLAS/Rayon explicitly after
       detection.
     """
-    scheduler_envs = [
-        "SLURM_CPUS_PER_TASK",
-        "PBS_NP",
-        "LSB_DJOB_NUMPROC",
-        "NSLOTS",
-        "NCPUS",
-    ]
-    detected: int | None = None
-    for name in scheduler_envs:
-        v = _parse_positive_env_int(name)
-        if v is not None:
-            detected = v
-            break
-
-    # Affinity-aware fallback
-    if detected is None:
-        try:
-            if hasattr(os, "sched_getaffinity"):
-                aff = os.sched_getaffinity(0)  # type: ignore[attr-defined]
-                if aff is not None and len(aff) > 0:
-                    detected = int(len(aff))
-        except Exception:
-            pass
-
-    # cgroup quota fallback (containers)
-    if detected is None:
-        detected = _detect_cgroup_cpu_quota()
-
-    # Last fallback: host-visible cores
-    if detected is None:
-        detected = int(os.cpu_count() or 1)
-
-    return max(1, int(detected))
+    return int(detect_thread_budget_info()["effective_threads"])
 
 
 def apply_blas_thread_env(

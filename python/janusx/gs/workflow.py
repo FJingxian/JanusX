@@ -155,7 +155,9 @@ from janusx.script._common.status import (
 from janusx.script._common.genocache import configure_genotype_cache_from_out
 from janusx.script._common.colspec import parse_zero_based_index_specs
 from janusx.script._common.threads import (
+    detect_thread_budget_info,
     detect_rust_blas_backend,
+    format_thread_budget_summary,
     get_rust_blas_threads,
     maybe_warn_non_openblas,
     require_openblas_by_default,
@@ -1989,15 +1991,100 @@ def _detect_cgroup_cpu_quota() -> int | None:
     return None
 
 
+def _current_host_aliases() -> set[str]:
+    aliases: set[str] = set()
+    for raw in (platform.node(), getattr(os, "uname", lambda: None)() and os.uname().nodename):
+        text = str(raw or "").strip().lower()
+        if not text:
+            continue
+        aliases.add(text)
+        aliases.add(text.split(".", 1)[0])
+    return {x for x in aliases if x}
+
+
+def _host_matches_local(raw_host: str, aliases: set[str]) -> bool:
+    text = str(raw_host or "").strip().lower()
+    if not text:
+        return False
+    short = text.split(".", 1)[0]
+    return text in aliases or short in aliases
+
+
+def _detect_affinity_threads() -> int | None:
+    try:
+        if hasattr(os, "sched_getaffinity"):
+            aff = os.sched_getaffinity(0)  # type: ignore[attr-defined]
+            if aff is not None and len(aff) > 0:
+                return int(len(aff))
+    except Exception:
+        pass
+    return None
+
+
+def _detect_lsf_local_slots() -> int | None:
+    raw = str(os.environ.get("LSB_MCPU_HOSTS", "")).strip().split()
+    if len(raw) < 2:
+        return None
+    aliases = _current_host_aliases()
+    for i in range(0, len(raw) - 1, 2):
+        host = raw[i]
+        try:
+            slots = int(raw[i + 1])
+        except Exception:
+            continue
+        if slots > 0 and _host_matches_local(host, aliases):
+            return slots
+    return None
+
+
+def _detect_pbs_local_slots() -> int | None:
+    nodefile = str(os.environ.get("PBS_NODEFILE", "")).strip()
+    if not nodefile or not os.path.isfile(nodefile):
+        return None
+    aliases = _current_host_aliases()
+    count = 0
+    try:
+        with open(nodefile, "r", encoding="utf-8") as fh:
+            for line in fh:
+                if _host_matches_local(line.strip(), aliases):
+                    count += 1
+    except Exception:
+        return None
+    return count if count > 0 else None
+
+
+def _detect_sge_local_slots() -> int | None:
+    hostfile = str(os.environ.get("PE_HOSTFILE", "")).strip()
+    if not hostfile or not os.path.isfile(hostfile):
+        return None
+    aliases = _current_host_aliases()
+    try:
+        with open(hostfile, "r", encoding="utf-8") as fh:
+            for line in fh:
+                toks = line.strip().split()
+                if len(toks) < 2:
+                    continue
+                try:
+                    slots = int(toks[1])
+                except Exception:
+                    continue
+                if slots > 0 and _host_matches_local(toks[0], aliases):
+                    return slots
+    except Exception:
+        return None
+    return None
+
+
 def detect_effective_threads() -> int:
     """
     Detect usable thread count in HPC/container environments.
 
-    Priority:
-      1) Scheduler allocation vars (SLURM/PBS/LSF/SGE)
-      2) CPU affinity mask
-      3) cgroup CPU quota
-      4) os.cpu_count()
+    Use the most restrictive positive local signal among:
+      1) Scheduler local-slot hints
+      2) Scheduler allocation vars
+      3) CPU affinity mask
+      4) cgroup CPU quota
+      5) os.cpu_count()
 
     Important:
       Do not let existing BLAS/OpenMP thread env vars shrink the detected job
@@ -2005,7 +2092,18 @@ def detect_effective_threads() -> int:
       by a previous shell/session default and should not override the current
       scheduler allocation for GS CLI default `-t`.
     """
-    # Scheduler-aware allocation hints (most reliable on HPC)
+    candidates: list[int] = []
+
+    scheduler_local_hints = [
+        _parse_positive_env_int("SLURM_CPUS_ON_NODE"),
+        _detect_lsf_local_slots(),
+        _detect_pbs_local_slots(),
+        _detect_sge_local_slots(),
+    ]
+    for v in scheduler_local_hints:
+        if v is not None and v > 0:
+            candidates.append(int(v))
+
     scheduler_envs = [
         "SLURM_CPUS_PER_TASK",
         "PBS_NP",
@@ -2015,32 +2113,21 @@ def detect_effective_threads() -> int:
     ]
     for name in scheduler_envs:
         v = _parse_positive_env_int(name)
-        if v is not None:
-            detected = v
-            break
-    else:
-        detected = None
+        if v is not None and v > 0:
+            candidates.append(int(v))
 
-    # Affinity-aware fallback
-    if detected is None:
-        try:
-            if hasattr(os, "sched_getaffinity"):
-                aff = os.sched_getaffinity(0)  # type: ignore[attr-defined]
-                if aff is not None and len(aff) > 0:
-                    detected = int(len(aff))
-        except Exception:
-            pass
+    aff = _detect_affinity_threads()
+    if aff is not None and aff > 0:
+        candidates.append(int(aff))
 
-    # cgroup quota fallback (containers)
-    if detected is None:
-        detected = _detect_cgroup_cpu_quota()
+    quota = _detect_cgroup_cpu_quota()
+    if quota is not None and quota > 0:
+        candidates.append(int(quota))
 
-    # Last fallback: host-visible cores
-    if detected is None:
-        detected = int(os.cpu_count() or 1)
+    host_visible = int(os.cpu_count() or 1)
+    candidates.append(max(1, host_visible))
 
-    # Optional software caps
-    return max(1, int(detected))
+    return max(1, min(int(v) for v in candidates if int(v) > 0))
 
 
 _THREAD_ENV_KEYS = (
@@ -14138,7 +14225,8 @@ def _run_gs_pipeline(
     args.out = os.path.normpath(args.out if args.out is not None else ".")
     outprefix = os.path.join(args.out, args.prefix)
     gs_model_dir = os.path.join(args.out, f"{args.prefix}.gs.model")
-    detected_threads = detect_effective_threads()
+    thread_budget = detect_thread_budget_info()
+    detected_threads = int(thread_budget["effective_threads"])
     requested_threads = int(args.thread)
     thread_capped = False
     if int(args.thread) <= 0:
@@ -14177,10 +14265,17 @@ def _run_gs_pipeline(
         if text != "":
             _file_only_logger.info(text)
 
+    logger.info(f"Thread detect: {format_thread_budget_summary(thread_budget)}")
+    logger.info(
+        "Thread plan: "
+        f"requested={requested_threads}, using={int(args.thread)}"
+    )
     if thread_capped:
         logger.warning(
-            f"Requested threads={requested_threads} exceeds detected available={detected_threads}; "
-            f"using {int(args.thread)}."
+            f"Requested threads={requested_threads} exceeds local effective={detected_threads}; "
+            f"using {int(args.thread)}. "
+            f"Scheduler total={thread_budget.get('scheduler_total_threads')} "
+            f"({thread_budget.get('scheduler_total_source') or 'NA'})."
         )
 
     manual_packed_preprocess_requested = bool(
@@ -14535,7 +14630,7 @@ def _run_gs_pipeline(
                 (
                     "Runtime",
                     [
-                        ("Threads", int(args.thread)),
+                        ("Threads", f"{int(args.thread)} (local effective {detected_threads})"),
                         ("CV", cv_cfg),
                         ("Model mode", ("on" if model_mode else "off")),
                         (

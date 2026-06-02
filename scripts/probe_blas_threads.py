@@ -31,6 +31,8 @@ from janusx.script._common.threads import (
     apply_blas_thread_env,
     detect_blas_backend,
     detect_effective_threads,
+    detect_thread_budget_info,
+    format_thread_budget_summary,
     get_rust_blas_threads,
     set_rust_blas_threads,
 )
@@ -180,6 +182,7 @@ def main(argv: list[str] | None = None) -> int:
         "scheduler_env": _env_snapshot(SCHED_ENV_KEYS),
         "initial_env": _env_snapshot(BLAS_ENV_KEYS),
         "initial_rust_blas_threads": get_rust_blas_threads(),
+        "thread_budget": detect_thread_budget_info(),
     }
     probes = [_probe_request(req) for req in requests]
 
@@ -198,6 +201,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"python_blas_backend={header['python_blas_backend']}")
     print(f"rust_sgemm_backend={header['rust_sgemm_backend']}")
     print(f"rust_eigh_lapack_backend={header['rust_eigh_lapack_backend']}")
+    print(f"thread_budget={format_thread_budget_summary(header['thread_budget'])}")
     if header["scheduler_env"]:
         print("scheduler_env:")
         for key, val in header["scheduler_env"].items():

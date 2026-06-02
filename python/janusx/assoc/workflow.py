@@ -113,6 +113,8 @@ from janusx.script._common.progress import build_rich_progress, rich_progress_av
 from janusx.script._common.threads import (
     apply_outer_thread_cap,
     detect_effective_threads,
+    detect_thread_budget_info,
+    format_thread_budget_summary,
     maybe_warn_non_openblas,
     runtime_thread_stage,
     require_openblas_by_default,
@@ -3417,8 +3419,6 @@ def _status_stage_thread_budget(threads: int) -> int:
 def _gwas_evd_stage_ctx(threads: int):
     """
     EVD / heavy dense linear algebra stage.
-
-    In outer-cap mode, keep both BLAS and Rayon at full `-t`.
     """
     t = max(1, int(threads))
     with runtime_thread_stage(blas_threads=t, rayon_threads=t):
@@ -3757,7 +3757,14 @@ def _gwas_eigh_from_grm(
         if impl_req == "scipy":
             if mat is None:
                 raise RuntimeError("SciPy eigh requires an in-memory GRM array.")
-            return _run_eigh_scipy(driver_name, mat)
+            eval_arr, evec_arr, backend_label, elapsed = _run_eigh_scipy(driver_name, mat)
+            meta = {
+                "stage_blas_threads": int(t),
+                "rust_blas_before": None,
+                "rust_blas_in_stage": None,
+                "rust_blas_after": None,
+            }
+            return eval_arr, evec_arr, backend_label, elapsed, meta
         (
             eval_raw,
             evec_raw,
@@ -3775,28 +3782,35 @@ def _gwas_eigh_from_grm(
             matrix_path=matrix_path,
             subset_idx_local=subset_idx_local,
         )
+        meta = {
+            "stage_blas_threads": int(t),
+            "rust_blas_before": None if int(_tb) <= 0 else int(_tb),
+            "rust_blas_in_stage": None if int(_ti) <= 0 else int(_ti),
+            "rust_blas_after": None if int(_ta) <= 0 else int(_ta),
+        }
         return (
             np.asarray(eval_raw, dtype=np.float64),
             np.asarray(evec_raw, dtype=np.float64) if evec_raw is not None else None,
             str(evd_backend),
             float(elapsed),
+            meta,
         )
 
     try:
         if impl_req == "rust" and matrix_file_hint is not None:
-            eval_raw, evec_raw, evd_backend, elapsed = _run_eigh(
+            eval_raw, evec_raw, evd_backend, elapsed, evd_meta = _run_eigh(
                 driver_req,
                 None,
                 matrix_path=matrix_file_hint,
                 subset_idx_local=effective_subset_idx_arr,
             )
         else:
-            eval_raw, evec_raw, evd_backend, elapsed = _run_eigh(driver_req, g)
+            eval_raw, evec_raw, evd_backend, elapsed, evd_meta = _run_eigh(driver_req, g)
     except Exception as ex:
         if str(driver_req).lower() == "dsyevr":
             try:
                 if impl_req == "rust" and matrix_file_hint is not None:
-                    eval_raw, evec_raw, evd_backend, elapsed = _run_eigh(
+                    eval_raw, evec_raw, evd_backend, elapsed, evd_meta = _run_eigh(
                         "dsyevd",
                         None,
                         matrix_path=matrix_file_hint,
@@ -3806,7 +3820,7 @@ def _gwas_eigh_from_grm(
                     if g0 is None:
                         raise RuntimeError("missing GRM array for dsyevd fallback")
                     g_retry = np.ascontiguousarray(np.asarray(g0, dtype=np.float64))
-                    eval_raw, evec_raw, evd_backend, elapsed = _run_eigh("dsyevd", g_retry)
+                    eval_raw, evec_raw, evd_backend, elapsed, evd_meta = _run_eigh("dsyevd", g_retry)
                 driver_req = "dsyevd(fallback)"
             except Exception as ex2:
                 raise RuntimeError(
@@ -3827,6 +3841,19 @@ def _gwas_eigh_from_grm(
         logger=logger,
     )
     if logger is not None:
+        subset_desc = (
+            f"{n_eigh}/{n_full}" if effective_subset_idx_arr is not None else f"full/{n_full}"
+        )
+        _log_file_only(
+            logger,
+            logging.INFO,
+            f"{stage_label} eigh thread cap: "
+            f"BLAS={int(evd_meta.get('stage_blas_threads') or t)} "
+            f"rust_blas(before={evd_meta.get('rust_blas_before')},"
+            f"in_stage={evd_meta.get('rust_blas_in_stage')},"
+            f"after={evd_meta.get('rust_blas_after')}) "
+            f"driver={driver_req} subset={subset_desc}",
+        )
         _log_file_only(
             logger,
             logging.INFO,
@@ -5424,7 +5451,8 @@ def _run_gwas_pipeline(
     # Plotting is always enabled for GWAS CLI.
     args.plot = True
     args.cov = _normalize_cov_inputs(args.cov)
-    detected_threads = detect_effective_threads()
+    thread_budget = detect_thread_budget_info()
+    detected_threads = int(thread_budget["effective_threads"])
     requested_threads = int(args.thread)
     thread_capped = False
 
@@ -5445,10 +5473,18 @@ def _run_gwas_pipeline(
     outprefix = os.path.join(args.out, prefix)
     log_path = f"{outprefix}.gwas.log"
     logger = setup_logging(log_path)
+    logger.info(f"Thread detect: {format_thread_budget_summary(thread_budget)}")
+    logger.info(
+        "Thread plan: "
+        f"requested={requested_threads}, using={int(args.thread)}, "
+        f"fvlmm_scan_stage={_resolve_fvlmm_scan_stage_mode()}"
+    )
     if thread_capped:
         logger.warning(
-            f"Warning: Requested threads={requested_threads} exceeds detected available={detected_threads}; "
-            f"using {int(args.thread)}."
+            f"Warning: Requested threads={requested_threads} exceeds local effective={detected_threads}; "
+            f"using {int(args.thread)}. "
+            f"Scheduler total={thread_budget.get('scheduler_total_threads')} "
+            f"({thread_budget.get('scheduler_total_source') or 'NA'})."
         )
     apply_outer_thread_cap(int(args.thread))
     # maybe_warn_non_openblas(
@@ -5536,7 +5572,7 @@ def _run_gwas_pipeline(
             host=socket.gethostname(),
             sections=[("General", cfg_rows)],
             footer_rows=[
-                ("Threads", f"{args.thread} ({detected_threads} available)"),
+                ("Threads", f"{args.thread} (local effective {detected_threads})"),
                 ("Output prefix", outprefix),
             ],
             line_max_chars=60,

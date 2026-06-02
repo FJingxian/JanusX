@@ -15,7 +15,7 @@ use std::borrow::Cow;
 use std::f64::consts::PI;
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, OnceLock};
 use std::thread;
 use std::time::Instant;
 
@@ -1656,6 +1656,131 @@ fn elapsed_nanos_to_secs(acc: &AtomicU64) -> f64 {
     (acc.load(Ordering::Relaxed) as f64) * 1e-9
 }
 
+#[inline]
+fn elapsed_nanos_since(t0: Instant) -> u64 {
+    t0.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
+}
+
+struct FvlmmChunkProfileStats {
+    calls: AtomicU64,
+    rows: AtomicU64,
+    wall_nanos: AtomicU64,
+    prep_nanos: AtomicU64,
+    proj_nanos: AtomicU64,
+    assoc_nanos: AtomicU64,
+}
+
+impl FvlmmChunkProfileStats {
+    const fn new() -> Self {
+        Self {
+            calls: AtomicU64::new(0),
+            rows: AtomicU64::new(0),
+            wall_nanos: AtomicU64::new(0),
+            prep_nanos: AtomicU64::new(0),
+            proj_nanos: AtomicU64::new(0),
+            assoc_nanos: AtomicU64::new(0),
+        }
+    }
+}
+
+static FVLMM_CHUNK_PROFILE_ROT_CACHE: FvlmmChunkProfileStats = FvlmmChunkProfileStats::new();
+static FVLMM_CHUNK_PROFILE_ROT_RAW: FvlmmChunkProfileStats = FvlmmChunkProfileStats::new();
+static FVLMM_CHUNK_PROFILE_FROM_SNP_CACHE: FvlmmChunkProfileStats = FvlmmChunkProfileStats::new();
+static FVLMM_CHUNK_PROFILE_FROM_SNP_RAW: FvlmmChunkProfileStats = FvlmmChunkProfileStats::new();
+static FVLMM_CHUNK_PROFILE_ENABLED: OnceLock<bool> = OnceLock::new();
+static FVLMM_CHUNK_PROFILE_EVERY: OnceLock<u64> = OnceLock::new();
+
+#[inline]
+fn fvlmm_chunk_profiling_enabled() -> bool {
+    *FVLMM_CHUNK_PROFILE_ENABLED.get_or_init(|| env_truthy("JX_FVLMM_CHUNK_PROFILING"))
+}
+
+#[inline]
+fn fvlmm_chunk_profile_every() -> u64 {
+    *FVLMM_CHUNK_PROFILE_EVERY
+        .get_or_init(|| env_positive_usize("JX_FVLMM_CHUNK_PROFILE_EVERY").unwrap_or(1) as u64)
+}
+
+#[inline]
+fn fvlmm_chunk_profile_state(route: &'static str) -> &'static FvlmmChunkProfileStats {
+    match route {
+        "rot_cache" => &FVLMM_CHUNK_PROFILE_ROT_CACHE,
+        "rot_raw" => &FVLMM_CHUNK_PROFILE_ROT_RAW,
+        "from_snp_cache" => &FVLMM_CHUNK_PROFILE_FROM_SNP_CACHE,
+        "from_snp_raw" => &FVLMM_CHUNK_PROFILE_FROM_SNP_RAW,
+        _ => &FVLMM_CHUNK_PROFILE_FROM_SNP_CACHE,
+    }
+}
+
+fn maybe_emit_fvlmm_chunk_profile(
+    route: &'static str,
+    rows: usize,
+    n: usize,
+    p: usize,
+    prep_nanos: u64,
+    proj_nanos: u64,
+    assoc_nanos: u64,
+    wall_nanos: u64,
+    threads: usize,
+    proj_threads: usize,
+    assoc_threads: usize,
+) {
+    if !fvlmm_chunk_profiling_enabled() {
+        return;
+    }
+
+    let stats = fvlmm_chunk_profile_state(route);
+    let call_idx = stats.calls.fetch_add(1, Ordering::Relaxed) + 1;
+    stats.rows.fetch_add(rows as u64, Ordering::Relaxed);
+    stats.wall_nanos.fetch_add(wall_nanos, Ordering::Relaxed);
+    stats.prep_nanos.fetch_add(prep_nanos, Ordering::Relaxed);
+    stats.proj_nanos.fetch_add(proj_nanos, Ordering::Relaxed);
+    stats.assoc_nanos.fetch_add(assoc_nanos, Ordering::Relaxed);
+
+    let every = fvlmm_chunk_profile_every().max(1);
+    if call_idx % every != 0 {
+        return;
+    }
+
+    let rows_total = stats.rows.load(Ordering::Relaxed);
+    let cum_wall = stats.wall_nanos.load(Ordering::Relaxed) as f64 * 1e-9;
+    let cum_prep = stats.prep_nanos.load(Ordering::Relaxed) as f64 * 1e-9;
+    let cum_proj = stats.proj_nanos.load(Ordering::Relaxed) as f64 * 1e-9;
+    let cum_assoc = stats.assoc_nanos.load(Ordering::Relaxed) as f64 * 1e-9;
+    let active_total = cum_prep + cum_proj + cum_assoc;
+    let pct = |secs: f64| -> f64 {
+        if active_total > 0.0 {
+            secs * 100.0 / active_total
+        } else {
+            0.0
+        }
+    };
+    let overlap = if cum_wall > 0.0 {
+        active_total / cum_wall
+    } else {
+        0.0
+    };
+
+    eprintln!(
+        "FvLMM chunk profiling[{route}]: calls={call_idx}, rows_total={rows_total}, last_rows={rows}, n={n}, p={p}, chunk_wall={:.3}s, chunk_prep={:.3}s, chunk_proj={:.3}s, chunk_assoc={:.3}s, cum_wall={:.3}s, cum_prep={:.3}s ({:.1}%), cum_proj={:.3}s ({:.1}%), cum_assoc={:.3}s ({:.1}%), active_over_wall={:.2}x, threads={}, proj_threads={}, assoc_threads={}",
+        (wall_nanos as f64) * 1e-9,
+        (prep_nanos as f64) * 1e-9,
+        (proj_nanos as f64) * 1e-9,
+        (assoc_nanos as f64) * 1e-9,
+        cum_wall,
+        cum_prep,
+        pct(cum_prep),
+        cum_proj,
+        pct(cum_proj),
+        cum_assoc,
+        pct(cum_assoc),
+        overlap,
+        threads,
+        proj_threads,
+        assoc_threads,
+    );
+}
+
 fn run_rotate_finalize_double_buffer_f32<FR, FF>(
     total_rows: usize,
     n: usize,
@@ -2820,6 +2945,8 @@ fn fvlmm_assoc_chunk_with_cache_impl<'py>(
     g_rot_chunk: PyReadonlyArray2<'py, f32>,
     threads: usize,
     nullml: Option<f64>,
+    profile_route: Option<&'static str>,
+    prep_nanos: u64,
 ) -> PyResult<Bound<'py, PyArray2<f64>>> {
     let g_arr = g_rot_chunk.as_array();
     if g_arr.shape()[1] != n {
@@ -2843,6 +2970,8 @@ fn fvlmm_assoc_chunk_with_cache_impl<'py>(
     let pool = get_cached_pool(assoc_threads)?;
 
     py.detach(move || {
+        let total_t0 = Instant::now();
+        let at0 = Instant::now();
         assoc_fixed_lambda_rot_block_blas_f32(
             &g_flat,
             m,
@@ -2855,6 +2984,23 @@ fn fvlmm_assoc_chunk_with_cache_impl<'py>(
             pool.as_ref(),
             nullml,
         );
+        if let Some(route) = profile_route {
+            let assoc_nanos = elapsed_nanos_since(at0);
+            let wall_nanos = elapsed_nanos_since(total_t0);
+            maybe_emit_fvlmm_chunk_profile(
+                route,
+                m,
+                n,
+                p,
+                prep_nanos,
+                0,
+                assoc_nanos,
+                wall_nanos,
+                threads,
+                0,
+                assoc_threads,
+            );
+        }
     });
 
     Ok(out)
@@ -2877,6 +3023,8 @@ pub fn fvlmm_assoc_chunk_with_cache_f32<'py>(
         g_rot_chunk,
         threads,
         nullml,
+        Some("rot_cache"),
+        0,
     )
 }
 
@@ -2917,10 +3065,22 @@ pub fn fvlmm_assoc_chunk_f32<'py>(
         .as_slice()
         .map_err(|_| PyRuntimeError::new_err("xcov must be contiguous (C-order)"))?;
     let p = p_cov;
+    let prep_t0 = Instant::now();
     let cache = Arc::new(prepare_fixed_lambda_assoc_cache_f32(
         s, xcov_slice, y, n, p, lbd,
     )?);
-    fvlmm_assoc_chunk_with_cache_impl(py, cache, n, p, g_rot_chunk, threads, nullml)
+    let prep_nanos = elapsed_nanos_since(prep_t0);
+    fvlmm_assoc_chunk_with_cache_impl(
+        py,
+        cache,
+        n,
+        p,
+        g_rot_chunk,
+        threads,
+        nullml,
+        Some("rot_raw"),
+        prep_nanos,
+    )
 }
 
 #[pyfunction]
@@ -3243,6 +3403,9 @@ pub fn fvlmm_assoc_chunk_from_snp_with_cache_f32<'py>(
     );
 
     py.detach(|| {
+        let total_t0 = Instant::now();
+        let proj_nanos = AtomicU64::new(0);
+        let assoc_nanos = AtomicU64::new(0);
         run_rotate_finalize_double_buffer_f32(
             m,
             n,
@@ -3250,6 +3413,7 @@ pub fn fvlmm_assoc_chunk_from_snp_with_cache_f32<'py>(
             use_pipeline,
             |start, rows, rot_block| {
                 let snp_block = &snp_flat[start * n..(start + rows) * n];
+                let pt0 = Instant::now();
                 rotate_snp_block_with_ut_blas(
                     snp_block,
                     rows,
@@ -3259,9 +3423,11 @@ pub fn fvlmm_assoc_chunk_from_snp_with_cache_f32<'py>(
                     proj_threads,
                     proj_pool.as_ref(),
                 );
+                record_elapsed_nanos(&proj_nanos, pt0);
             },
             |start, rows, rot_block| {
                 let out_block = &mut out_slice[start * out_cols..(start + rows) * out_cols];
+                let at0 = Instant::now();
                 assoc_fixed_lambda_rot_block_blas_f32(
                     rot_block,
                     rows,
@@ -3274,7 +3440,21 @@ pub fn fvlmm_assoc_chunk_from_snp_with_cache_f32<'py>(
                     assoc_pool.as_ref(),
                     nullml,
                 );
+                record_elapsed_nanos(&assoc_nanos, at0);
             },
+        );
+        maybe_emit_fvlmm_chunk_profile(
+            "from_snp_cache",
+            m,
+            n,
+            p,
+            0,
+            proj_nanos.load(Ordering::Relaxed),
+            assoc_nanos.load(Ordering::Relaxed),
+            elapsed_nanos_since(total_t0),
+            threads,
+            proj_threads,
+            assoc_threads,
         );
     });
 
@@ -3347,7 +3527,9 @@ pub fn fvlmm_assoc_chunk_from_snp_f32<'py>(
         Err(_) => Cow::Owned(ut_arr.iter().copied().collect()),
     };
     let p = p_cov;
+    let prep_t0 = Instant::now();
     let cache = prepare_fixed_lambda_assoc_cache_f32(s, xcov_slice, y, n, p, lbd)?;
+    let prep_nanos = elapsed_nanos_since(prep_t0);
     let proj_threads = stage_proj_threads_or(threads);
     let assoc_threads = stage_assoc_threads_or(threads);
     let proj_pool = get_cached_pool(proj_threads)?;
@@ -3361,6 +3543,9 @@ pub fn fvlmm_assoc_chunk_from_snp_f32<'py>(
     );
 
     py.detach(|| {
+        let total_t0 = Instant::now();
+        let proj_nanos = AtomicU64::new(0);
+        let assoc_nanos = AtomicU64::new(0);
         run_rotate_finalize_double_buffer_f32(
             m,
             n,
@@ -3368,6 +3553,7 @@ pub fn fvlmm_assoc_chunk_from_snp_f32<'py>(
             use_pipeline,
             |start, rows, rot_block| {
                 let snp_block = &snp_flat[start * n..(start + rows) * n];
+                let pt0 = Instant::now();
                 rotate_snp_block_with_ut_blas(
                     snp_block,
                     rows,
@@ -3377,9 +3563,11 @@ pub fn fvlmm_assoc_chunk_from_snp_f32<'py>(
                     proj_threads,
                     proj_pool.as_ref(),
                 );
+                record_elapsed_nanos(&proj_nanos, pt0);
             },
             |start, rows, rot_block| {
                 let out_block = &mut out_slice[start * out_cols..(start + rows) * out_cols];
+                let at0 = Instant::now();
                 assoc_fixed_lambda_rot_block_blas_f32(
                     rot_block,
                     rows,
@@ -3392,7 +3580,21 @@ pub fn fvlmm_assoc_chunk_from_snp_f32<'py>(
                     assoc_pool.as_ref(),
                     nullml,
                 );
+                record_elapsed_nanos(&assoc_nanos, at0);
             },
+        );
+        maybe_emit_fvlmm_chunk_profile(
+            "from_snp_raw",
+            m,
+            n,
+            p,
+            prep_nanos,
+            proj_nanos.load(Ordering::Relaxed),
+            assoc_nanos.load(Ordering::Relaxed),
+            elapsed_nanos_since(total_t0),
+            threads,
+            proj_threads,
+            assoc_threads,
         );
     });
 

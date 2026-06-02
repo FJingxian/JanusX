@@ -2044,7 +2044,8 @@ pub(crate) unsafe fn lapack_dsyevd_dispatch(
                     all(target_os = "windows", jx_openblas_lapack_available)
                 ),
                 feature = "blas-openblas",
-                jx_openblas_available
+                jx_openblas_available,
+                jx_openblas_lapack_available
             ))]
             {
                 lapack_dsyevd_openblas(jobz, uplo, n, a, lda, w, work, lwork, iwork, liwork, info);
@@ -2068,7 +2069,8 @@ pub(crate) unsafe fn lapack_dsyevd_dispatch(
             all(target_os = "windows", jx_openblas_lapack_available)
         ),
         feature = "blas-openblas",
-        jx_openblas_available
+        jx_openblas_available,
+        jx_openblas_lapack_available
     ))]
     {
         lapack_dsyevd_openblas(jobz, uplo, n, a, lda, w, work, lwork, iwork, liwork, info);
@@ -2149,7 +2151,8 @@ pub(crate) unsafe fn lapack_dsyevr_dispatch(
                     all(target_os = "windows", jx_openblas_lapack_available)
                 ),
                 feature = "blas-openblas",
-                jx_openblas_available
+                jx_openblas_available,
+                jx_openblas_lapack_available
             ))]
             {
                 lapack_dsyevr_openblas(
@@ -2179,7 +2182,8 @@ pub(crate) unsafe fn lapack_dsyevr_dispatch(
             all(target_os = "windows", jx_openblas_lapack_available)
         ),
         feature = "blas-openblas",
-        jx_openblas_available
+        jx_openblas_available,
+        jx_openblas_lapack_available
     ))]
     {
         lapack_dsyevr_openblas(

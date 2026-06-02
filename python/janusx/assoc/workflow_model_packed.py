@@ -41,6 +41,7 @@ from .workflow import (
     _gwas_result_tmp_path,
     _gwas_eigh_from_grm,
     _gwas_evd_stage_ctx,
+    _gwas_fvlmm_scan_stage_ctx,
     _gwas_scan_stage_ctx,
     _is_full_identity_index,
     _log_file_only,
@@ -2504,7 +2505,12 @@ def run_fastlmm_packed_fullrank(
         scan_secs = 0.0
         try:
             scan_t0 = time.monotonic()
-            with _gwas_scan_stage_ctx(max(1, int(threads))):
+            scan_stage_ctx = (
+                _gwas_fvlmm_scan_stage_ctx
+                if str(_route_model_key).lower() == "fvlmm"
+                else _gwas_scan_stage_ctx
+            )
+            with scan_stage_ctx(max(1, int(threads))):
                 if bool(getattr(null_fast_mod, "lowrank", False)):
                     _written_rows = _packed_lowrank_scan_to_tsv(
                         mod=null_fast_mod,

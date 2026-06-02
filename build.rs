@@ -885,10 +885,6 @@ fn compile_fasttree_executable() {
                 _ => {}
             }
         }
-        if target_os != "windows" {
-            cmd.arg("-lm");
-        }
-
         if use_openmp {
             cmd.arg("-DOPENMP");
             if let Some(inc) = explicit_omp_include.as_ref() {
@@ -932,6 +928,9 @@ fn compile_fasttree_executable() {
             }
         }
         cmd.arg(src_path.as_os_str());
+        if target_os != "windows" {
+            cmd.arg("-lm");
+        }
         Ok((cmd, runtimes))
     };
 
@@ -1298,6 +1297,20 @@ Enable default features or pass --features blas-openblas."
     {
         Ok(_) => {
             println!("cargo:rustc-cfg=jx_openblas_available");
+            let mut lapack_available = !cfg!(target_os = "windows");
+            if env_flag("JANUSX_FORCE_OPENBLAS_LAPACK") {
+                lapack_available = true;
+            }
+            if env_flag("JANUSX_DISABLE_OPENBLAS_LAPACK") {
+                lapack_available = false;
+            }
+            if lapack_available {
+                println!("cargo:rustc-cfg=jx_openblas_lapack_available");
+            } else {
+                emit_verbose_note(
+                    "OpenBLAS detected by pkg-config, but LAPACK symbols are treated as unavailable.",
+                );
+            }
             println!("cargo:warning=OpenBLAS detected by pkg-config.");
         }
         Err(err) => {

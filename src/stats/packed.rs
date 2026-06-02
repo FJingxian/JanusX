@@ -153,23 +153,20 @@ pub fn bed_packed_decode_rows_f32<'py>(
         )));
     }
 
-    let row_flip = row_flip.as_slice()?;
-    let row_maf = row_maf.as_slice()?;
-    if row_flip.len() != m {
-        return Err(PyRuntimeError::new_err(format!(
-            "row_flip length mismatch: got {}, expected {m}",
-            row_flip.len()
-        )));
-    }
-    if row_maf.len() != m {
-        return Err(PyRuntimeError::new_err(format!(
-            "row_maf length mismatch: got {}, expected {m}",
-            row_maf.len()
-        )));
-    }
-
     let row_idx_raw = row_indices.as_slice()?;
     let row_idx = parse_index_vec_i64(row_idx_raw, m, "row_indices")?;
+    let row_flip = row_flip.as_slice()?;
+    let row_maf = row_maf.as_slice()?;
+    let meta_is_packed_space = row_flip.len() == m && row_maf.len() == m;
+    let meta_is_compact_space = row_flip.len() == row_idx.len() && row_maf.len() == row_idx.len();
+    if !(meta_is_packed_space || meta_is_compact_space) {
+        return Err(PyRuntimeError::new_err(format!(
+            "row_flip/row_maf length mismatch: got row_flip={}, row_maf={}, expected either packed_rows={m} or selected_rows={}",
+            row_flip.len(),
+            row_maf.len(),
+            row_idx.len(),
+        )));
+    }
 
     let sample_idx: Vec<usize> = if let Some(sidx) = sample_indices {
         parse_index_vec_i64(sidx.as_slice()?, n_samples, "sample_indices")?
@@ -192,8 +189,9 @@ pub fn bed_packed_decode_rows_f32<'py>(
         .for_each(|(i_row, out_row)| {
             let src_row = row_idx[i_row];
             let row = &packed_flat[src_row * bytes_per_snp..(src_row + 1) * bytes_per_snp];
-            let flip = row_flip[src_row];
-            let mean_g = (2.0_f32 * row_maf[src_row]).max(0.0);
+            let meta_row = if meta_is_packed_space { src_row } else { i_row };
+            let flip = row_flip[meta_row];
+            let mean_g = (2.0_f32 * row_maf[meta_row]).max(0.0);
             for (j, &sidx) in sample_idx.iter().enumerate() {
                 let b = row[sidx >> 2];
                 let code = (b >> ((sidx & 3) * 2)) & 0b11;
@@ -2024,6 +2022,36 @@ mod tests {
 
             let out = decoded.readonly().as_array().to_owned();
             assert_eq!(out.shape(), &[2, 0]);
+        });
+    }
+
+    #[test]
+    fn bed_packed_decode_rows_f32_accepts_compact_metadata() {
+        Python::attach(|py| {
+            let packed = PyArray2::from_owned_array(
+                py,
+                Array2::from_shape_vec((3, 1), vec![0u8, 2u8, 3u8]).expect("packed shape"),
+            );
+            let row_indices = PyArray1::from_owned_array(py, Array1::from_vec(vec![2_i64, 1_i64]));
+            let row_flip = PyArray1::from_owned_array(py, Array1::from_vec(vec![false, false]));
+            let row_maf =
+                PyArray1::from_owned_array(py, Array1::from_vec(vec![0.25_f32, 0.5_f32]));
+
+            let decoded = bed_packed_decode_rows_f32(
+                py,
+                packed.readonly(),
+                4,
+                row_indices.readonly(),
+                row_flip.readonly(),
+                row_maf.readonly(),
+                None,
+            )
+            .expect("compact metadata should be accepted");
+
+            let out = decoded.readonly().as_array().to_owned();
+            assert_eq!(out.shape(), &[2, 4]);
+            assert_eq!(out[[0, 0]], 2.0_f32);
+            assert_eq!(out[[1, 0]], 1.0_f32);
         });
     }
 }

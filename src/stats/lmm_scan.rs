@@ -14,7 +14,9 @@ use rayon::prelude::*;
 use std::borrow::Cow;
 use std::f64::consts::PI;
 use std::fmt::Write as _;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{mpsc, Arc};
+use std::thread;
 use std::time::Instant;
 
 use crate::aireml::ai_reml_null_from_spectral;
@@ -23,7 +25,8 @@ use crate::bedmath::{
     packed_row_missing_count_selected, SubsetDecodePlan,
 };
 use crate::blas::{
-    cblas_sgemm_dispatch, BlasThreadGuard, CblasInt, CBLAS_NO_TRANS, CBLAS_ROW_MAJOR, CBLAS_TRANS,
+    cblas_sgemm_dispatch, rust_sgemm_prefers_rayon_rowmajor_f32_kernel, BlasThreadGuard,
+    CblasInt, CBLAS_NO_TRANS, CBLAS_ROW_MAJOR, CBLAS_TRANS,
 };
 use crate::brent::{brent_minimize, brent_minimize_with_init};
 use crate::linalg::{
@@ -1139,6 +1142,11 @@ fn row_major_mat_mul_f32_blas(
     debug_assert!(rhs.len() >= cols.saturating_mul(n_rhs));
     debug_assert!(out.len() >= rows.saturating_mul(n_rhs));
 
+    if n_rhs == 1 || (n_rhs <= 4 && rust_sgemm_prefers_rayon_rowmajor_f32_kernel()) {
+        row_major_mat_mul_f32_rhs_small(a, rows, cols, rhs, n_rhs, out);
+        return;
+    }
+
     #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     unsafe {
         let _blas_guard = BlasThreadGuard::enter(threads.max(1));
@@ -1167,6 +1175,53 @@ fn row_major_mat_mul_f32_blas(
 }
 
 #[inline]
+fn row_major_mat_mul_f32_rhs_small(
+    a: &[f32],
+    rows: usize,
+    cols: usize,
+    rhs: &[f32],
+    n_rhs: usize,
+    out: &mut [f32],
+) {
+    if rows == 0 || cols == 0 || n_rhs == 0 {
+        return;
+    }
+    debug_assert!(a.len() >= rows.saturating_mul(cols));
+    debug_assert!(rhs.len() >= cols.saturating_mul(n_rhs));
+    debug_assert!(out.len() >= rows.saturating_mul(n_rhs));
+
+    let run_row = |row_idx: usize, out_row: &mut [f32]| {
+        let a_row = &a[row_idx * cols..(row_idx + 1) * cols];
+        if n_rhs == 1 {
+            let mut acc = 0.0_f32;
+            for k in 0..cols {
+                acc += a_row[k] * rhs[k];
+            }
+            out_row[0] = acc;
+            return;
+        }
+        for rhs_col in 0..n_rhs {
+            let mut acc = 0.0_f32;
+            for k in 0..cols {
+                acc += a_row[k] * rhs[k * n_rhs + rhs_col];
+            }
+            out_row[rhs_col] = acc;
+        }
+    };
+
+    if rows >= 64 && rayon::current_num_threads() > 1 {
+        out.par_chunks_mut(n_rhs)
+            .enumerate()
+            .for_each(|(row_idx, out_row)| run_row(row_idx, out_row));
+        return;
+    }
+
+    for (row_idx, out_row) in out.chunks_mut(n_rhs).enumerate() {
+        run_row(row_idx, out_row);
+    }
+}
+
+#[inline]
 fn rotate_snp_block_with_ut_blas(
     snp_block: &[f32],
     rows: usize,
@@ -1181,6 +1236,17 @@ fn rotate_snp_block_with_ut_blas(
     debug_assert!(snp_block.len() >= rows.saturating_mul(n));
     debug_assert!(u_t.len() >= n.saturating_mul(n));
     debug_assert!(out_block.len() >= rows.saturating_mul(n));
+
+    if rust_sgemm_prefers_rayon_rowmajor_f32_kernel() {
+        let thread_hint = if threads > 0 {
+            threads
+        } else {
+            rayon::current_num_threads()
+        };
+        let tile_rows = choose_rotate_tile_rows(rows, thread_hint);
+        rotate_snp_block_with_ut_parallel(snp_block, rows, n, u_t, out_block, tile_rows);
+        return;
+    }
 
     #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     unsafe {
@@ -1393,6 +1459,252 @@ fn rotate_snp_block_with_ut_parallel(
             let a_end = a_start + rows_here * n;
             rotate_snp_block_with_ut(&snp_block[a_start..a_end], rows_here, n, u_t, out_chunk);
         });
+}
+
+#[inline]
+fn use_rotate_finalize_pipeline(default_on: bool) -> bool {
+    match std::env::var("JX_GWAS_ROT_PIPELINE") {
+        Ok(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" | "force" => true,
+            "0" | "false" | "no" | "off" => false,
+            _ => default_on,
+        },
+        Err(_) => default_on,
+    }
+}
+
+#[inline]
+fn use_packed_three_stage_pipeline(default_on: bool) -> bool {
+    match std::env::var("JX_GWAS_PACKED_PIPELINE") {
+        Ok(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" | "force" => true,
+            "0" | "false" | "no" | "off" => false,
+            _ => default_on,
+        },
+        Err(_) => default_on,
+    }
+}
+
+#[inline]
+fn record_elapsed_nanos(acc: &AtomicU64, t0: Instant) {
+    let nanos = t0.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+    acc.fetch_add(nanos, Ordering::Relaxed);
+}
+
+#[inline]
+fn elapsed_nanos_to_secs(acc: &AtomicU64) -> f64 {
+    (acc.load(Ordering::Relaxed) as f64) * 1e-9
+}
+
+fn run_rotate_finalize_double_buffer_f32<FR, FF>(
+    total_rows: usize,
+    n: usize,
+    block_rows: usize,
+    enable_pipeline: bool,
+    rotate_stage: FR,
+    mut finalize_stage: FF,
+) where
+    FR: Fn(usize, usize, &mut [f32]) + Sync + Send,
+    FF: FnMut(usize, usize, &[f32]),
+{
+    if total_rows == 0 || n == 0 || block_rows == 0 {
+        return;
+    }
+    if !enable_pipeline || total_rows <= block_rows {
+        let mut buf = vec![0.0_f32; block_rows * n];
+        let mut start = 0usize;
+        while start < total_rows {
+            let rows = (total_rows - start).min(block_rows);
+            rotate_stage(start, rows, &mut buf[..rows * n]);
+            finalize_stage(start, rows, &buf[..rows * n]);
+            start += rows;
+        }
+        return;
+    }
+
+    let buf_len = block_rows * n;
+    let (task_tx, task_rx) = mpsc::sync_channel::<(usize, usize, Vec<f32>)>(2);
+    let (done_tx, done_rx) = mpsc::sync_channel::<(usize, usize, Vec<f32>)>(2);
+
+    thread::scope(|scope| {
+        scope.spawn(move || {
+            while let Ok((start, rows, mut buf)) = task_rx.recv() {
+                rotate_stage(start, rows, &mut buf[..rows * n]);
+                if done_tx.send((start, rows, buf)).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let mut next_start = 0usize;
+        let mut inflight = 0usize;
+
+        for _ in 0..2usize {
+            if next_start >= total_rows {
+                break;
+            }
+            let rows = (total_rows - next_start).min(block_rows);
+            task_tx
+                .send((next_start, rows, vec![0.0_f32; buf_len]))
+                .expect("rotate pipeline task send");
+            next_start += rows;
+            inflight += 1;
+        }
+
+        while inflight > 0 {
+            let (start, rows, buf) = done_rx.recv().expect("rotate pipeline recv");
+            inflight -= 1;
+            finalize_stage(start, rows, &buf[..rows * n]);
+            if next_start < total_rows {
+                let next_rows = (total_rows - next_start).min(block_rows);
+                task_tx
+                    .send((next_start, next_rows, buf))
+                    .expect("rotate pipeline task resend");
+                next_start += next_rows;
+                inflight += 1;
+            }
+        }
+
+        drop(task_tx);
+    });
+}
+
+struct PackedStageBufferF32 {
+    start: usize,
+    rows: usize,
+    g_block: Vec<f32>,
+    rot_block: Vec<f32>,
+    out_block: Vec<f64>,
+    miss_block: Vec<usize>,
+}
+
+impl PackedStageBufferF32 {
+    fn new(block_rows: usize, n: usize, out_cols: usize) -> Self {
+        Self {
+            start: 0usize,
+            rows: 0usize,
+            g_block: vec![0.0_f32; block_rows.saturating_mul(n)],
+            rot_block: vec![0.0_f32; block_rows.saturating_mul(n)],
+            out_block: vec![0.0_f64; block_rows.saturating_mul(out_cols)],
+            miss_block: vec![0usize; block_rows],
+        }
+    }
+}
+
+fn run_packed_decode_rotate_finalize_triple_buffer_f32<FD, FR, FF, E>(
+    total_rows: usize,
+    n: usize,
+    block_rows: usize,
+    out_cols: usize,
+    enable_pipeline: bool,
+    decode_stage: FD,
+    rotate_stage: FR,
+    mut finalize_stage: FF,
+) -> Result<(), E>
+where
+    FD: Fn(usize, usize, &mut [f32], &mut [usize]) + Sync + Send,
+    FR: Fn(usize, usize, &[f32], &mut [f32]) + Sync + Send,
+    FF: FnMut(usize, usize, &[f32], &mut [f64], &[usize]) -> Result<(), E>,
+{
+    if total_rows == 0 || n == 0 || block_rows == 0 {
+        return Ok(());
+    }
+    if !enable_pipeline || total_rows <= block_rows {
+        let mut buf = PackedStageBufferF32::new(block_rows, n, out_cols);
+        let mut start = 0usize;
+        while start < total_rows {
+            let rows = (total_rows - start).min(block_rows);
+            decode_stage(
+                start,
+                rows,
+                &mut buf.g_block[..rows * n],
+                &mut buf.miss_block[..rows],
+            );
+            rotate_stage(
+                start,
+                rows,
+                &buf.g_block[..rows * n],
+                &mut buf.rot_block[..rows * n],
+            );
+            finalize_stage(
+                start,
+                rows,
+                &buf.rot_block[..rows * n],
+                &mut buf.out_block[..rows * out_cols],
+                &buf.miss_block[..rows],
+            )?;
+            start += rows;
+        }
+        return Ok(());
+    }
+
+    let pipeline_depth = 3usize;
+    let (free_tx, free_rx) = mpsc::sync_channel::<PackedStageBufferF32>(pipeline_depth);
+    let (decode_tx, decode_rx) = mpsc::sync_channel::<PackedStageBufferF32>(pipeline_depth);
+    let (rotate_tx, rotate_rx) = mpsc::sync_channel::<PackedStageBufferF32>(pipeline_depth);
+    for _ in 0..pipeline_depth {
+        free_tx
+            .send(PackedStageBufferF32::new(block_rows, n, out_cols))
+            .expect("packed pipeline free-buffer seed");
+    }
+
+    thread::scope(|scope| {
+        let decode_tx_worker = decode_tx.clone();
+        scope.spawn(move || {
+            let mut next_start = 0usize;
+            while next_start < total_rows {
+                let mut buf = free_rx.recv().expect("packed pipeline free-buffer recv");
+                let rows = (total_rows - next_start).min(block_rows);
+                buf.start = next_start;
+                buf.rows = rows;
+                decode_stage(
+                    next_start,
+                    rows,
+                    &mut buf.g_block[..rows * n],
+                    &mut buf.miss_block[..rows],
+                );
+                if decode_tx_worker.send(buf).is_err() {
+                    break;
+                }
+                next_start += rows;
+            }
+        });
+        drop(decode_tx);
+
+        let rotate_tx_worker = rotate_tx.clone();
+        scope.spawn(move || {
+            while let Ok(mut buf) = decode_rx.recv() {
+                let rows = buf.rows;
+                rotate_stage(
+                    buf.start,
+                    rows,
+                    &buf.g_block[..rows * n],
+                    &mut buf.rot_block[..rows * n],
+                );
+                if rotate_tx_worker.send(buf).is_err() {
+                    break;
+                }
+            }
+        });
+        drop(rotate_tx);
+
+        let mut done_rows = 0usize;
+        while done_rows < total_rows {
+            let mut buf = rotate_rx.recv().expect("packed pipeline rotate-buffer recv");
+            let rows = buf.rows;
+            finalize_stage(
+                buf.start,
+                rows,
+                &buf.rot_block[..rows * n],
+                &mut buf.out_block[..rows * out_cols],
+                &buf.miss_block[..rows],
+            )?;
+            done_rows += rows;
+            let _ = free_tx.send(buf);
+        }
+        Ok::<(), E>(())
+    })?;
+    Ok(())
 }
 
 #[pyfunction]
@@ -1852,15 +2164,15 @@ fn fill_packed_missing_block(
             tp.install(|| {
                 miss_sub.par_iter_mut().enumerate().for_each(|(off, dst)| {
                     let idx = start + off;
-                    let src_row = row_idx.map(|v| v[idx]).unwrap_or(idx);
-                    *dst = missing_count_from_rate(row_missing[src_row], n_samples);
+                    // row_missing is aligned to the active/output row order; only packed
+                    // row fetches should use row_idx indirection.
+                    *dst = missing_count_from_rate(row_missing[idx], n_samples);
                 });
             });
         } else {
             miss_sub.iter_mut().enumerate().for_each(|(off, dst)| {
                 let idx = start + off;
-                let src_row = row_idx.map(|v| v[idx]).unwrap_or(idx);
-                *dst = missing_count_from_rate(row_missing[src_row], n_samples);
+                *dst = missing_count_from_rate(row_missing[idx], n_samples);
             });
         }
         return;
@@ -2729,30 +3041,39 @@ pub fn fvlmm_assoc_chunk_from_snp_with_cache_f32<'py>(
     let pool = get_cached_pool(assoc_threads)?;
     let block_rows = rotate_block_rows.max(1);
     let cache_arc = Arc::clone(&cache.cache);
+    let use_pipeline = use_rotate_finalize_pipeline(
+        !rust_sgemm_prefers_rayon_rowmajor_f32_kernel()
+            && block_rows < m
+            && assoc_threads > 1
+            && threads > 0,
+    );
 
     py.detach(|| {
-        let mut rot_buf = vec![0.0_f32; block_rows * n];
-        let mut start = 0usize;
-        while start < m {
-            let rows = (m - start).min(block_rows);
-            let snp_block = &snp_flat[start * n..(start + rows) * n];
-            let rot_block = &mut rot_buf[..rows * n];
-            rotate_snp_block_with_ut_blas(snp_block, rows, n, &ut_flat, rot_block, threads);
-            let out_block = &mut out_slice[start * out_cols..(start + rows) * out_cols];
-            assoc_fixed_lambda_rot_block_blas_f32(
-                rot_block,
-                rows,
-                n,
-                p,
-                cache_arc.as_ref(),
-                out_block,
-                out_cols,
-                assoc_threads,
-                pool.as_ref(),
-                nullml,
-            );
-            start += rows;
-        }
+        run_rotate_finalize_double_buffer_f32(
+            m,
+            n,
+            block_rows,
+            use_pipeline,
+            |start, rows, rot_block| {
+                let snp_block = &snp_flat[start * n..(start + rows) * n];
+                rotate_snp_block_with_ut_blas(snp_block, rows, n, &ut_flat, rot_block, threads);
+            },
+            |start, rows, rot_block| {
+                let out_block = &mut out_slice[start * out_cols..(start + rows) * out_cols];
+                assoc_fixed_lambda_rot_block_blas_f32(
+                    rot_block,
+                    rows,
+                    n,
+                    p,
+                    cache_arc.as_ref(),
+                    out_block,
+                    out_cols,
+                    assoc_threads,
+                    pool.as_ref(),
+                    nullml,
+                );
+            },
+        );
     });
 
     Ok(out)
@@ -2828,30 +3149,39 @@ pub fn fvlmm_assoc_chunk_from_snp_f32<'py>(
     let assoc_threads = stage_assoc_threads_or(threads);
     let pool = get_cached_pool(assoc_threads)?;
     let block_rows = rotate_block_rows.max(1);
+    let use_pipeline = use_rotate_finalize_pipeline(
+        !rust_sgemm_prefers_rayon_rowmajor_f32_kernel()
+            && block_rows < m
+            && assoc_threads > 1
+            && threads > 0,
+    );
 
     py.detach(|| {
-        let mut rot_buf = vec![0.0_f32; block_rows * n];
-        let mut start = 0usize;
-        while start < m {
-            let rows = (m - start).min(block_rows);
-            let snp_block = &snp_flat[start * n..(start + rows) * n];
-            let rot_block = &mut rot_buf[..rows * n];
-            rotate_snp_block_with_ut_blas(snp_block, rows, n, &ut_flat, rot_block, threads);
-            let out_block = &mut out_slice[start * out_cols..(start + rows) * out_cols];
-            assoc_fixed_lambda_rot_block_blas_f32(
-                rot_block,
-                rows,
-                n,
-                p,
-                &cache,
-                out_block,
-                out_cols,
-                assoc_threads,
-                pool.as_ref(),
-                nullml,
-            );
-            start += rows;
-        }
+        run_rotate_finalize_double_buffer_f32(
+            m,
+            n,
+            block_rows,
+            use_pipeline,
+            |start, rows, rot_block| {
+                let snp_block = &snp_flat[start * n..(start + rows) * n];
+                rotate_snp_block_with_ut_blas(snp_block, rows, n, &ut_flat, rot_block, threads);
+            },
+            |start, rows, rot_block| {
+                let out_block = &mut out_slice[start * out_cols..(start + rows) * out_cols];
+                assoc_fixed_lambda_rot_block_blas_f32(
+                    rot_block,
+                    rows,
+                    n,
+                    p,
+                    &cache,
+                    out_block,
+                    out_cols,
+                    assoc_threads,
+                    pool.as_ref(),
+                    nullml,
+                );
+            },
+        );
     });
 
     Ok(out)
@@ -5987,10 +6317,10 @@ pub fn fvlmm_assoc_packed_f32_to_tsv<'py>(
 
     py.detach(move || -> PyResult<()> {
         let total_t0 = Instant::now();
-        let mut decode_secs = 0.0_f64;
-        let mut proj_secs = 0.0_f64;
-        let mut assoc_secs = 0.0_f64;
-        let mut tsv_secs = 0.0_f64;
+        let decode_nanos = AtomicU64::new(0);
+        let proj_nanos = AtomicU64::new(0);
+        let assoc_nanos = AtomicU64::new(0);
+        let tsv_nanos = AtomicU64::new(0);
 
         let writer = AsyncTsvWriter::with_config(
             &out_tsv_path,
@@ -6008,21 +6338,30 @@ pub fn fvlmm_assoc_packed_f32_to_tsv<'py>(
                 .saturating_add(std::mem::size_of::<usize>()),
         );
 
-        let mut g_block = vec![0.0_f32; rotate_block_rows * n];
-        let mut rot_block = vec![0.0_f32; rotate_block_rows * n];
-        let mut out_block = vec![0.0_f64; rotate_block_rows * out_cols];
-        let mut miss_block = vec![0usize; rotate_block_rows];
         let mut text_buf = String::with_capacity(rotate_block_rows * 128);
         let mut next_progress_emit = progress_block.min(m).max(1);
+        let assoc_threads = if threads > 0 {
+            threads
+        } else {
+            rayon::current_num_threads()
+        };
+        let packed_pipeline_default = !rust_sgemm_prefers_rayon_rowmajor_f32_kernel()
+            && rotate_block_rows < m
+            && assoc_threads > 1;
+        let use_packed_pipeline = use_packed_three_stage_pipeline(packed_pipeline_default);
+        let missing_pool = if use_packed_pipeline {
+            None
+        } else {
+            pool.as_ref()
+        };
 
-        for row_start in (0..m).step_by(rotate_block_rows) {
-            let row_end = (row_start + rotate_block_rows).min(m);
-            let mut start = row_start;
-            while start < row_end {
-                let rows = row_end - start;
-                let snp_block = &mut g_block[..rows * n];
-                let g_rot = &mut rot_block[..rows * n];
-
+        run_packed_decode_rotate_finalize_triple_buffer_f32(
+            m,
+            n,
+            rotate_block_rows,
+            out_cols,
+            use_packed_pipeline,
+            |start, rows, snp_block, miss_sub| {
                 let dt0 = Instant::now();
                 decode_centered_block_packed_f32(
                     &packed_flat,
@@ -6039,13 +6378,27 @@ pub fn fvlmm_assoc_packed_f32_to_tsv<'py>(
                     dense_subset_pos.as_deref(),
                     snp_block,
                 );
-                decode_secs += dt0.elapsed().as_secs_f64();
-
+                fill_packed_missing_block(
+                    miss_sub,
+                    sample_identity,
+                    row_missing,
+                    row_idx.as_deref(),
+                    start,
+                    &packed_flat,
+                    bytes_per_snp,
+                    n_samples,
+                    &sample_idx,
+                    missing_pool,
+                );
+                record_elapsed_nanos(&decode_nanos, dt0);
+            },
+            |start, rows, snp_block, g_rot| {
+                let _ = start;
                 let pt0 = Instant::now();
                 rotate_snp_block_with_ut_blas(snp_block, rows, n, &u_t_sub, g_rot, threads);
-                proj_secs += pt0.elapsed().as_secs_f64();
-
-                let out_sub = &mut out_block[..rows * out_cols];
+                record_elapsed_nanos(&proj_nanos, pt0);
+            },
+            |start, rows, g_rot, out_sub, miss_sub| -> PyResult<()> {
                 let at0 = Instant::now();
                 assoc_fixed_lambda_rot_block_blas_f32(
                     g_rot,
@@ -6059,21 +6412,7 @@ pub fn fvlmm_assoc_packed_f32_to_tsv<'py>(
                     pool.as_ref(),
                     Some(ml0),
                 );
-                assoc_secs += at0.elapsed().as_secs_f64();
-
-                let miss_sub = &mut miss_block[..rows];
-                fill_packed_missing_block(
-                    miss_sub,
-                    sample_identity,
-                    row_missing,
-                    row_idx.as_deref(),
-                    start,
-                    &packed_flat,
-                    bytes_per_snp,
-                    n_samples,
-                    &sample_idx,
-                    pool.as_ref(),
-                );
+                record_elapsed_nanos(&assoc_nanos, at0);
 
                 let tt0 = Instant::now();
                 text_buf.clear();
@@ -6107,29 +6446,33 @@ pub fn fvlmm_assoc_packed_f32_to_tsv<'py>(
                 }
                 let payload = std::mem::take(&mut text_buf).into_bytes();
                 writer.send(payload).map_err(PyRuntimeError::new_err)?;
-                tsv_secs += tt0.elapsed().as_secs_f64();
-                start += rows;
-            }
-
-            let done = row_end;
-            if let Some(cb) = progress_callback.as_ref() {
-                if !packed_progress_should_emit(done, m, progress_block, &mut next_progress_emit) {
-                    continue;
+                let done = start + rows;
+                if let Some(cb) = progress_callback.as_ref() {
+                    if packed_progress_should_emit(done, m, progress_block, &mut next_progress_emit)
+                    {
+                        Python::attach(|py2| -> PyResult<()> {
+                            py2.check_signals()?;
+                            cb.call1(py2, (done, m))?;
+                            Ok(())
+                        })?;
+                    }
+                } else {
+                    Python::attach(|py2| py2.check_signals())?;
                 }
-                Python::attach(|py2| -> PyResult<()> {
-                    py2.check_signals()?;
-                    cb.call1(py2, (done, m))?;
-                    Ok(())
-                })?;
-            } else {
-                Python::attach(|py2| py2.check_signals())?;
-            }
-        }
+                record_elapsed_nanos(&tsv_nanos, tt0);
+                Ok(())
+            },
+        )?;
 
         let wt0 = Instant::now();
         let writer_result = writer.finish().map_err(PyRuntimeError::new_err);
-        tsv_secs += wt0.elapsed().as_secs_f64();
+        record_elapsed_nanos(&tsv_nanos, wt0);
         writer_result?;
+
+        let decode_secs = elapsed_nanos_to_secs(&decode_nanos);
+        let proj_secs = elapsed_nanos_to_secs(&proj_nanos);
+        let assoc_secs = elapsed_nanos_to_secs(&assoc_nanos);
+        let tsv_secs = elapsed_nanos_to_secs(&tsv_nanos);
 
         if stage_timing {
             let total_secs = total_t0.elapsed().as_secs_f64();

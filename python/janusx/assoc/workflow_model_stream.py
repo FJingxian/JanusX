@@ -36,6 +36,7 @@ from .workflow import (
     _gwas_result_tmp_path,
     _gwas_eigh_from_grm,
     _gwas_evd_stage_ctx,
+    _gwas_fvlmm_scan_stage_ctx,
     _gwas_scan_stage_ctx,
     _log_file_only,
     _log_model_line,
@@ -972,7 +973,12 @@ def run_chunked_gwas_lmm_lm(
                     if pbar is not None:
                         pbar.set_postfix(memory=f"{mem_gb:.2f}GB")
 
-        with _gwas_scan_stage_ctx(scan_threads):
+        scan_stage_ctx = (
+            _gwas_fvlmm_scan_stage_ctx
+            if str(model_name).lower() == "fvlmm"
+            else _gwas_scan_stage_ctx
+        )
+        with scan_stage_ctx(scan_threads):
             ex = cf.ThreadPoolExecutor(max_workers=workers)
             try:
                 bed_prefix = _as_plink_prefix(genofile)
@@ -1841,7 +1847,12 @@ def run_chunked_gwas_streaming_shared(
             _advance_ctx(ctx, m_chunk, mem_text)
 
     interrupted = False
-    with _gwas_scan_stage_ctx(scan_threads):
+    scan_stage_ctx = (
+        _gwas_fvlmm_scan_stage_ctx
+        if len(model_order) == 1 and str(model_order[0]).lower() == "fvlmm"
+        else _gwas_scan_stage_ctx
+    )
+    with scan_stage_ctx(scan_threads):
         try:
             bed_prefix = _as_plink_prefix(genofile)
             if bed_prefix is None:

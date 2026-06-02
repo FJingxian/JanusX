@@ -3437,6 +3437,43 @@ def _gwas_scan_stage_ctx(threads: int):
         yield
 
 
+def _resolve_fvlmm_scan_stage_mode() -> str:
+    raw = str(os.environ.get("JX_FVLMM_SCAN_STAGE", "")).strip().lower()
+    if raw in {"blas-rayon", "blas_t_rayon_1", "dedicated", "blas_only"}:
+        return "blas_t_rayon_1"
+    if raw in {"full", "both", "legacy", "blas_t_rayon_t"}:
+        return "full"
+    if raw in {"generic", "scan", "blas_1_rayon_t"}:
+        return "generic"
+    # Keep legacy behavior as the initial default so we can benchmark apples-to-apples
+    # and only flip the default after validating on real workloads.
+    return "full"
+
+
+@contextmanager
+def _gwas_fvlmm_scan_stage_ctx(threads: int):
+    """
+    FvLMM scan stage.
+
+    Modes:
+    - `full` (legacy default): BLAS=t, Rayon=t
+    - `blas_t_rayon_1`: BLAS=t, Rayon=1
+    - `generic`: reuse the generic GWAS scan stage (BLAS=1, Rayon=t)
+    """
+    t = max(1, int(threads))
+    mode = _resolve_fvlmm_scan_stage_mode()
+    if mode == "blas_t_rayon_1":
+        with runtime_thread_stage(blas_threads=t, rayon_threads=1):
+            yield
+        return
+    if mode == "generic":
+        with _gwas_scan_stage_ctx(t):
+            yield
+        return
+    with runtime_thread_stage(blas_threads=t, rayon_threads=t):
+        yield
+
+
 def _resolve_gwas_eigh_driver(n_samples: int) -> str:
     raw = str(os.environ.get("JX_GWAS_EIGH_DRIVER", "")).strip().lower()
     if raw in {"dsyevd", "dsyevr", "auto"}:

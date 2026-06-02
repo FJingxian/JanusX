@@ -5,6 +5,7 @@ import csv
 import hashlib
 import importlib
 import os
+import shlex
 import shutil
 import sys
 import tempfile
@@ -110,6 +111,44 @@ def _build_wheel_via_python_module(
     filename = os.path.basename(wheel_path)
     shutil.copy2(wheel_path, os.path.join(wheel_directory, filename))
     return filename
+
+
+def _enable_macos_metal_gpu_default(
+    config_settings: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if sys.platform != "darwin":
+        return config_settings
+    if _env_flag_optional("JANUSX_PEP517_METAL_GPU") is False:
+        return config_settings
+
+    key = "maturin.build-args"
+    updated: dict[str, Any] = {} if config_settings is None else dict(config_settings)
+    if key not in updated and "build-args" in updated:
+        key = "build-args"
+
+    current = updated.get(key)
+    if current is None:
+        args: list[str] = []
+    elif isinstance(current, str):
+        args = shlex.split(current)
+    else:
+        args = [str(x) for x in current]
+
+    for idx, token in enumerate(args[:-1]):
+        if token != "--features":
+            continue
+        feats = {part.strip() for part in str(args[idx + 1]).split(",") if part.strip()}
+        if "metal-gpu" in feats:
+            return updated
+
+    args.extend(["--features", "metal-gpu"])
+    updated[key] = args
+    print(
+        "[build-backend] macOS build: enabling Cargo feature `metal-gpu` by default. "
+        "Set JANUSX_PEP517_METAL_GPU=0 to opt out.",
+        flush=True,
+    )
+    return updated
 
 
 def _env_flag(name: str) -> bool:
@@ -679,6 +718,7 @@ def build_editable(
     config_settings: dict[str, Any] | None = None,
     metadata_directory: str | None = None,
 ) -> str:
+    config_settings = _enable_macos_metal_gpu_default(config_settings)
     fn = getattr(_MATURIN, "build_editable", None)
     if fn is None:
         return build_wheel(wheel_directory, config_settings, metadata_directory)
@@ -690,6 +730,7 @@ def build_wheel(
     config_settings: dict[str, Any] | None = None,
     metadata_directory: str | None = None,
 ) -> str:
+    config_settings = _enable_macos_metal_gpu_default(config_settings)
     ext_path = _build_kmc_extension_for_wheel()
     win_dlls = _collect_windows_runtime_dlls()
     mac_dylibs = _collect_macos_openblas_dylibs()

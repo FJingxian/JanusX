@@ -2,8 +2,7 @@ use memmap2::MmapOptions;
 use nalgebra::DMatrix;
 use numpy::ndarray::{Array1, Array2};
 use numpy::{
-    PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2,
-    PyUntypedArrayMethods,
+    PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods,
 };
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
@@ -149,14 +148,17 @@ fn validate_subset_indices_usize(
 #[inline]
 fn lapack_f64_workspace_len(query: f64, label: &str) -> Result<(CblasInt, usize), String> {
     if !query.is_finite() {
-        return Err(format!("{label}: non-finite LAPACK workspace query result {query}"));
+        return Err(format!(
+            "{label}: non-finite LAPACK workspace query result {query}"
+        ));
     }
     let need = query.ceil().max(1.0_f64);
     let max_i32 = CblasInt::MAX as f64;
     if need > max_i32 {
         return Err(format!(
             "{label}: workspace query {} exceeds LAPACK integer limit {}",
-            need, CblasInt::MAX
+            need,
+            CblasInt::MAX
         ));
     }
     let need_i = need as CblasInt;
@@ -174,7 +176,11 @@ fn lapack_i32_workspace_len(query: CblasInt, label: &str) -> Result<(CblasInt, u
 }
 
 #[inline]
-fn symmetrize_row_major_f64(a_row_major: &[f64], n: usize, label: &str) -> Result<Vec<f64>, String> {
+fn symmetrize_row_major_f64(
+    a_row_major: &[f64],
+    n: usize,
+    label: &str,
+) -> Result<Vec<f64>, String> {
     validate_eigh_dims(n, a_row_major.len(), label)?;
     let mut out = vec![0.0_f64; n * n];
     for row in 0..n {
@@ -182,14 +188,10 @@ fn symmetrize_row_major_f64(a_row_major: &[f64], n: usize, label: &str) -> Resul
             let a_rc = a_row_major[row * n + col];
             let a_cr = a_row_major[col * n + row];
             if !a_rc.is_finite() {
-                return Err(format!(
-                    "{label}: non-finite value at ({row}, {col})"
-                ));
+                return Err(format!("{label}: non-finite value at ({row}, {col})"));
             }
             if !a_cr.is_finite() {
-                return Err(format!(
-                    "{label}: non-finite value at ({col}, {row})"
-                ));
+                return Err(format!("{label}: non-finite value at ({col}, {row})"));
             }
             let v = if row == col {
                 a_rc
@@ -286,16 +288,14 @@ fn dsyevd_vectors_workspace_overflows_i32(n: usize) -> bool {
 }
 
 #[inline]
-fn resolve_eigh_driver_for_problem(
-    requested: EighDriver,
-    n: usize,
-    jobz: EighJobz,
-) -> EighDriver {
+fn resolve_eigh_driver_for_problem(requested: EighDriver, n: usize, jobz: EighJobz) -> EighDriver {
     match requested {
         EighDriver::Dsyevd => EighDriver::Dsyevd,
         EighDriver::Dsyevr => EighDriver::Dsyevr,
         EighDriver::Auto => {
-            if matches!(jobz, EighJobz::ValuesAndVectors) && dsyevd_vectors_workspace_overflows_i32(n) {
+            if matches!(jobz, EighJobz::ValuesAndVectors)
+                && dsyevd_vectors_workspace_overflows_i32(n)
+            {
                 EighDriver::Dsyevr
             } else if env_truthy("JX_EIGH_ALLOW_DSYEVR") {
                 EighDriver::Dsyevr
@@ -567,10 +567,14 @@ fn load_square_matrix_from_npy_sym_col_major_f64(
             let a_rc = read_npy_float_elem_as_f64(payload, dtype, idx_rc)?;
             let a_cr = read_npy_float_elem_as_f64(payload, dtype, idx_cr)?;
             if !a_rc.is_finite() {
-                return Err(format!("matrix contains non-finite value at ({row}, {col})"));
+                return Err(format!(
+                    "matrix contains non-finite value at ({row}, {col})"
+                ));
             }
             if !a_cr.is_finite() {
-                return Err(format!("matrix contains non-finite value at ({col}, {row})"));
+                return Err(format!(
+                    "matrix contains non-finite value at ({col}, {row})"
+                ));
             }
             let mut v = if row == col {
                 a_rc
@@ -683,10 +687,14 @@ fn subset_square_row_major_to_sym_col_major_f64(
             let a_rc = src_row_major[src_row * n + src_col];
             let a_cr = src_row_major[src_col * n + src_row];
             if !a_rc.is_finite() {
-                return Err(format!("{label}: non-finite value at ({src_row}, {src_col})"));
+                return Err(format!(
+                    "{label}: non-finite value at ({src_row}, {src_col})"
+                ));
             }
             if !a_cr.is_finite() {
-                return Err(format!("{label}: non-finite value at ({src_col}, {src_row})"));
+                return Err(format!(
+                    "{label}: non-finite value at ({src_col}, {src_row})"
+                ));
             }
             let mut v = if local_row == local_col {
                 a_rc
@@ -873,7 +881,8 @@ fn symmetric_eigh_f64_matrix_file_with_driver(
             match lapack_run_driver_from_col_major_owned(a_col_major, n, jobz, primary) {
                 Ok((evals, evecs, backend)) => return Ok((evals, evecs, backend, n)),
                 Err(primary_err) => {
-                    let a_retry = load_square_matrix_from_npy_sym_col_major_f64(path, diag_shift)?.0;
+                    let a_retry =
+                        load_square_matrix_from_npy_sym_col_major_f64(path, diag_shift)?.0;
                     match lapack_run_driver_from_col_major_owned(a_retry, n, jobz, secondary) {
                         Ok((evals, evecs, backend)) => return Ok((evals, evecs, backend, n)),
                         Err(secondary_err) => {
@@ -977,7 +986,8 @@ fn symmetric_eigh_f64_matrix_file_subset_with_driver(
         match lapack_run_driver_from_col_major_owned(a_col_major, n, jobz, primary) {
             Ok((evals, evecs, backend)) => return Ok((evals, evecs, backend, n)),
             Err(primary_err) => {
-                let a_retry = load_square_matrix_subset_sym_col_major_f64(path, subset, diag_shift)?.0;
+                let a_retry =
+                    load_square_matrix_subset_sym_col_major_f64(path, subset, diag_shift)?.0;
                 match lapack_run_driver_from_col_major_owned(a_retry, n, jobz, secondary) {
                     Ok((evals, evecs, backend)) => return Ok((evals, evecs, backend, n)),
                     Err(secondary_err) => {
@@ -1341,8 +1351,7 @@ fn symmetric_eigh_f64_row_major_with_driver(
         }
     }
 
-    let a_sym_row_major =
-        symmetrize_row_major_f64(a_row_major, n, "symmetric_eigh_f64_row_major")?;
+    let a_sym_row_major = symmetrize_row_major_f64(a_row_major, n, "symmetric_eigh_f64_row_major")?;
     let dm = DMatrix::from_row_slice(n, n, &a_sym_row_major);
     let se = nalgebra::linalg::SymmetricEigen::new(dm);
     let eval_unsorted = se.eigenvalues.as_slice();
@@ -1816,23 +1825,21 @@ mod tests {
 
     #[test]
     fn test_symmetrize_row_major_f64_averages_offdiag() {
-        let a = vec![
-            1.0_f64, 2.0_f64,
-            4.0_f64, 3.0_f64,
-        ];
+        let a = vec![1.0_f64, 2.0_f64, 4.0_f64, 3.0_f64];
         let out = symmetrize_row_major_f64(&a, 2, "test").unwrap();
         assert_eq!(out, vec![1.0_f64, 3.0_f64, 3.0_f64, 3.0_f64]);
     }
 
     #[test]
     fn test_eigh_row_major_small_matrix() {
-        let a = vec![
-            2.0_f64, 1.0_f64,
-            1.0_f64, 2.0_f64,
-        ];
-        let (evals, evecs_opt, _backend) =
-            symmetric_eigh_f64_row_major_with_driver(&a, 2, EighDriver::Dsyevd, EighJobz::ValuesAndVectors)
-                .unwrap();
+        let a = vec![2.0_f64, 1.0_f64, 1.0_f64, 2.0_f64];
+        let (evals, evecs_opt, _backend) = symmetric_eigh_f64_row_major_with_driver(
+            &a,
+            2,
+            EighDriver::Dsyevd,
+            EighJobz::ValuesAndVectors,
+        )
+        .unwrap();
         assert_eq!(evals.len(), 2);
         assert!((evals[0] - 1.0_f64).abs() < 1e-9_f64);
         assert!((evals[1] - 3.0_f64).abs() < 1e-9_f64);

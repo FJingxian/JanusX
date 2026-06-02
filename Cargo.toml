@@ -9,7 +9,7 @@ name = "janusx"
 crate-type = ["cdylib", "rlib"]
 
 [features]
-default = ["blas-openblas", "python-extension"]
+default = ["blas-openblas"]
 # Compile-time BLAS selection:
 # - macOS default uses Accelerate.
 # - enable `blas-openblas` to link OpenBLAS and prefer it at runtime.

@@ -25,8 +25,8 @@ use crate::bedmath::{
     packed_row_missing_count_selected, SubsetDecodePlan,
 };
 use crate::blas::{
-    cblas_sgemm_dispatch, rust_sgemm_prefers_rayon_rowmajor_f32_kernel, BlasThreadGuard,
-    CblasInt, CBLAS_NO_TRANS, CBLAS_ROW_MAJOR, CBLAS_TRANS,
+    cblas_sgemm_dispatch, rust_sgemm_prefers_rayon_rowmajor_f32_kernel, BlasThreadGuard, CblasInt,
+    CBLAS_NO_TRANS, CBLAS_ROW_MAJOR, CBLAS_TRANS,
 };
 use crate::brent::{brent_minimize, brent_minimize_with_init};
 use crate::linalg::{
@@ -1334,10 +1334,9 @@ fn rotate_snp_block_with_ut_parallel_blocked(
                             scratch_sub,
                         );
                         for r in 0..rows_here {
-                            let src =
-                                &scratch_sub[r * cols_here..(r + 1) * cols_here];
-                            let dst = &mut out_chunk
-                                [r * n + col_start..r * n + col_start + cols_here];
+                            let src = &scratch_sub[r * cols_here..(r + 1) * cols_here];
+                            let dst =
+                                &mut out_chunk[r * n + col_start..r * n + col_start + cols_here];
                             dst.copy_from_slice(src);
                         }
                     }
@@ -1364,8 +1363,7 @@ fn rotate_snp_block_with_ut_parallel_blocked(
             );
             for r in 0..rows {
                 let src = &scratch_sub[r * cols_here..(r + 1) * cols_here];
-                let dst =
-                    &mut out_block[r * n + col_start..r * n + col_start + cols_here];
+                let dst = &mut out_block[r * n + col_start..r * n + col_start + cols_here];
                 dst.copy_from_slice(src);
             }
         }
@@ -1405,14 +1403,7 @@ fn rotate_snp_block_with_ut_blas(
         let row_tile = choose_rotate_row_tile_rows_fvlmm(rows, n, thread_hint);
         let col_block = choose_rotate_col_block_cols_fvlmm(n);
         rotate_snp_block_with_ut_parallel_blocked(
-            snp_block,
-            rows,
-            n,
-            u_t,
-            out_block,
-            row_tile,
-            col_block,
-            proj_pool,
+            snp_block, rows, n, u_t, out_block, row_tile, col_block, proj_pool,
         );
         return;
     }
@@ -1859,7 +1850,9 @@ where
 
         let mut done_rows = 0usize;
         while done_rows < total_rows {
-            let mut buf = rotate_rx.recv().expect("packed pipeline rotate-buffer recv");
+            let mut buf = rotate_rx
+                .recv()
+                .expect("packed pipeline rotate-buffer recv");
             let rows = buf.rows;
             finalize_stage(
                 buf.start,
@@ -2383,8 +2376,7 @@ fn fill_packed_missing_block(
             miss_sub.par_iter_mut().enumerate().for_each(|(off, dst)| {
                 let idx = start + off;
                 let src_row = row_idx.map(|v| v[idx]).unwrap_or(idx);
-                let row =
-                    &packed_flat[src_row * bytes_per_snp..(src_row + 1) * bytes_per_snp];
+                let row = &packed_flat[src_row * bytes_per_snp..(src_row + 1) * bytes_per_snp];
                 *dst = packed_row_missing_count_selected(row, n_samples, sample_idx);
             });
         });
@@ -4752,28 +4744,35 @@ fn decode_centered_block_packed_f32(
     }
 
     if let Some(sample_pos) = dense_subset_pos {
-        out.par_chunks_mut(n)
-            .enumerate()
-            .for_each_init(|| vec![0.0_f32; sample_pos.len()], |full_row, (off, dst)| {
-            let idx = row_start + off;
-            let src_row = row_indices.map(|v| v[idx]).unwrap_or(idx);
-            let row = &packed_flat[src_row * bytes_per_snp..(src_row + 1) * bytes_per_snp];
-            let mean_g = (2.0_f64 * (row_maf[idx] as f64)).max(0.0);
-            let value_lut = packed_model_value_lut_f32(gm, row_flip[idx], mean_g as f32);
-            decode_row_centered_full_lut(row, sample_pos.len(), code4_lut, &value_lut, full_row);
-            let mut sum_g = 0.0_f64;
-            for (full_j, &out_j) in sample_pos.iter().enumerate() {
-                if out_j >= 0 {
-                    let gv = full_row[full_j];
-                    dst[out_j as usize] = gv;
-                    sum_g += gv as f64;
+        out.par_chunks_mut(n).enumerate().for_each_init(
+            || vec![0.0_f32; sample_pos.len()],
+            |full_row, (off, dst)| {
+                let idx = row_start + off;
+                let src_row = row_indices.map(|v| v[idx]).unwrap_or(idx);
+                let row = &packed_flat[src_row * bytes_per_snp..(src_row + 1) * bytes_per_snp];
+                let mean_g = (2.0_f64 * (row_maf[idx] as f64)).max(0.0);
+                let value_lut = packed_model_value_lut_f32(gm, row_flip[idx], mean_g as f32);
+                decode_row_centered_full_lut(
+                    row,
+                    sample_pos.len(),
+                    code4_lut,
+                    &value_lut,
+                    full_row,
+                );
+                let mut sum_g = 0.0_f64;
+                for (full_j, &out_j) in sample_pos.iter().enumerate() {
+                    if out_j >= 0 {
+                        let gv = full_row[full_j];
+                        dst[out_j as usize] = gv;
+                        sum_g += gv as f64;
+                    }
                 }
-            }
-            let g_mean = (sum_g / (n as f64)) as f32;
-            for v in dst.iter_mut() {
-                *v -= g_mean;
-            }
-        });
+                let g_mean = (sum_g / (n as f64)) as f32;
+                for v in dst.iter_mut() {
+                    *v -= g_mean;
+                }
+            },
+        );
         return;
     }
 

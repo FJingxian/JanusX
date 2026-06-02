@@ -603,9 +603,9 @@ jobs:
             # Skip KMC prebuild on cross target; vendored pybind11 in KMC is not
             # Python 3.14 friendly and this path is not required for arm64 wheel sanity.
             export JANUSX_PREBUILD_KMC_BIND=0
-            maturin build --release --out dist --target ${{ matrix.target }} --features blas-openblas
+            maturin build --release --out dist --target ${{ matrix.target }} --features blas-openblas,python-extension
           else
-            maturin build --release --out dist --target ${{ matrix.target }} --interpreter python --features blas-openblas
+            maturin build --release --out dist --target ${{ matrix.target }} --interpreter python --features blas-openblas,python-extension
           fi
 
       - name: Probe SGEMM backend from built wheel

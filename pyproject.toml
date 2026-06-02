@@ -67,7 +67,7 @@ bindings = "pyo3"
 strip = false
 module-name = "janusx.janusx"
 python-source = "python"
-cargo-extra-args = "--locked"
+cargo-extra-args = "--locked --features python-extension"
 include = [
     { path = "scripts/build_backend.py", format = "sdist" },
     { path = "todo/FastTree.c", format = "sdist" },

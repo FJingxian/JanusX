@@ -3,6 +3,7 @@ mod permutation;
 mod residual;
 mod sampling;
 mod score;
+mod score_gpu;
 
 use self::permutation::{
     bucket_from_expr, bucket_from_rule, choose_representative_indices,
@@ -32,7 +33,6 @@ use crate::ml::common::{
 };
 use crate::ml::engine::{compute_feature_scores_grouped, parse_ml_engine, MlEngine};
 use crate::ml::extra_trees::ExtraTreesConfig;
-use crate::score::{score_binary_mcc_packed, score_cont_corr_packed};
 use memmap2::Mmap;
 use numpy::ndarray::{Array1, Array2};
 use numpy::{PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
@@ -65,8 +65,15 @@ use residual::{garfield_residualize_exact_from_grm_rust, GarfieldResidualResult}
 pub use sampling::stratified_test_mask;
 #[allow(unused_imports)]
 pub use score::{
-    score_cont_centered_gain_packed_with_sum, score_cont_weighted_mean_diff_packed,
-    ContinuousRuleScore,
+    score_binary_ba_mcc_batch_py, score_binary_ba_py, score_binary_mcc_packed, score_binary_mcc_py,
+    score_cont_centered_gain_packed_with_sum, score_cont_corr_packed, score_cont_corr_py,
+    score_cont_mean_diff_corr_batch_py, score_cont_mean_diff_py,
+    score_cont_weighted_mean_diff_packed, ContinuousRuleScore,
+};
+pub use score_gpu::{
+    garfield_compare_score_cont_centered_gain_batch_metal_vs_cpu_py,
+    garfield_score_cont_centered_gain_batch_packed_cpu_py,
+    garfield_score_cont_centered_gain_batch_packed_metal_py,
 };
 
 const BIN01_MAGIC: &[u8; 8] = b"JXBIN001";
@@ -8304,6 +8311,7 @@ mod tests {
                     site: SiteInfo {
                         chrom: "1".to_string(),
                         pos: 10,
+                        snp: "bin_row_10".to_string(),
                         ref_allele: "A".to_string(),
                         alt_allele: "T|BIN".to_string(),
                     },
@@ -8313,6 +8321,7 @@ mod tests {
                     site: SiteInfo {
                         chrom: "1".to_string(),
                         pos: 20,
+                        snp: "bin_row_20".to_string(),
                         ref_allele: "A".to_string(),
                         alt_allele: "C|BIN".to_string(),
                     },
@@ -8353,6 +8362,7 @@ mod tests {
                     site: SiteInfo {
                         chrom: "2".to_string(),
                         pos: 100,
+                        snp: "mbin_100_dom".to_string(),
                         ref_allele: "A".to_string(),
                         alt_allele: "G|DOM".to_string(),
                     },
@@ -8362,6 +8372,7 @@ mod tests {
                     site: SiteInfo {
                         chrom: "2".to_string(),
                         pos: 100,
+                        snp: "mbin_100_rec".to_string(),
                         ref_allele: "A".to_string(),
                         alt_allele: "G|REC".to_string(),
                     },
@@ -8371,6 +8382,7 @@ mod tests {
                     site: SiteInfo {
                         chrom: "2".to_string(),
                         pos: 100,
+                        snp: "mbin_100_het".to_string(),
                         ref_allele: "A".to_string(),
                         alt_allele: "G|HET".to_string(),
                     },
@@ -8380,6 +8392,7 @@ mod tests {
                     site: SiteInfo {
                         chrom: "2".to_string(),
                         pos: 150,
+                        snp: "mbin_150_dom".to_string(),
                         ref_allele: "C".to_string(),
                         alt_allele: "T|DOM".to_string(),
                     },
@@ -8389,6 +8402,7 @@ mod tests {
                     site: SiteInfo {
                         chrom: "2".to_string(),
                         pos: 150,
+                        snp: "mbin_150_rec".to_string(),
                         ref_allele: "C".to_string(),
                         alt_allele: "T|REC".to_string(),
                     },
@@ -8398,6 +8412,7 @@ mod tests {
                     site: SiteInfo {
                         chrom: "2".to_string(),
                         pos: 150,
+                        snp: "mbin_150_het".to_string(),
                         ref_allele: "C".to_string(),
                         alt_allele: "T|HET".to_string(),
                     },
@@ -8580,6 +8595,7 @@ mod tests {
         SiteInfo {
             chrom: chrom.to_string(),
             pos,
+            snp: format!("{chrom}:{pos}"),
             ref_allele: "A".to_string(),
             alt_allele: "G".to_string(),
         }
@@ -8723,6 +8739,7 @@ mod tests {
         let mut site_a = SiteInfo {
             chrom: "10".to_string(),
             pos: 111_023_852,
+            snp: "site_a".to_string(),
             ref_allele: "C".to_string(),
             alt_allele: "T".to_string(),
         };
@@ -8730,6 +8747,7 @@ mod tests {
         let mut site_b = SiteInfo {
             chrom: "10".to_string(),
             pos: 111_023_852,
+            snp: "site_b".to_string(),
             ref_allele: "T".to_string(),
             alt_allele: "C".to_string(),
         };
@@ -8782,6 +8800,7 @@ mod tests {
         let mut site = SiteInfo {
             chrom: "10".to_string(),
             pos: 111_023_852,
+            snp: "fill_flip_site".to_string(),
             ref_allele: "T".to_string(),
             alt_allele: "C".to_string(),
         };
@@ -8831,18 +8850,21 @@ mod tests {
             SiteInfo {
                 chrom: "1".to_string(),
                 pos: 150,
+                snp: "triad_1".to_string(),
                 ref_allele: "A".to_string(),
                 alt_allele: "G".to_string(),
             },
             SiteInfo {
                 chrom: "1".to_string(),
                 pos: 350,
+                snp: "triad_2".to_string(),
                 ref_allele: "A".to_string(),
                 alt_allele: "G".to_string(),
             },
             SiteInfo {
                 chrom: "2".to_string(),
                 pos: 580,
+                snp: "triad_3".to_string(),
                 ref_allele: "A".to_string(),
                 alt_allele: "G".to_string(),
             },
@@ -8873,6 +8895,7 @@ mod tests {
         let sites = vec![SiteInfo {
             chrom: "1".to_string(),
             pos: 260,
+            snp: "overlap_1".to_string(),
             ref_allele: "A".to_string(),
             alt_allele: "G".to_string(),
         }];

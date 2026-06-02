@@ -15,7 +15,7 @@ pub mod beam;
 #[path = "stats/bsa.rs"]
 mod bsa;
 #[path = "garfield/mod.rs"]
-mod garfield;
+pub(crate) mod garfield;
 #[path = "stats/glm.rs"]
 mod glm;
 #[path = "stats/grm.rs"]
@@ -43,8 +43,6 @@ mod logreg;
 mod packed;
 #[path = "stats/rsvd.rs"]
 mod rsvd;
-#[path = "stats/score.rs"]
-pub mod score;
 #[path = "stats/spgrm.rs"]
 mod spgrm;
 #[path = "stats/splmm.rs"]
@@ -143,6 +141,12 @@ use blas::{
     rust_blas_get_num_threads, rust_blas_set_num_threads, rust_eigh_lapack_backend,
     rust_sgemm_backend,
 };
+pub use blas::{
+    rust_blas_get_num_threads as janusx_rust_blas_get_num_threads,
+    rust_blas_set_num_threads as janusx_rust_blas_set_num_threads,
+    rust_eigh_lapack_backend as janusx_rust_eigh_lapack_backend,
+    rust_sgemm_backend as janusx_rust_sgemm_backend,
+};
 use bsa::preprocess_bsa;
 use eigh::{
     rust_eigh_debug_f64, rust_eigh_from_array_f64, rust_eigh_from_array_f64_inplace,
@@ -150,10 +154,14 @@ use eigh::{
 };
 use fast_math::fastlmm_prepare_lowrank_f64;
 use garfield::{
-    garfield_eval_rule_bin_py, garfield_logic_search_bed_py, garfield_prepare_input_bin_py,
-    garfield_residualize_bed_py, garfield_residualize_grm_py, garfield_scan_groups_bin_py,
-    garfield_scan_windows_bin_py, garfield_subset_bin_samples_py, load_bin01_packed_py,
-    load_mbin_packed_py,
+    garfield_compare_score_cont_centered_gain_batch_metal_vs_cpu_py, garfield_eval_rule_bin_py,
+    garfield_logic_search_bed_py, garfield_prepare_input_bin_py, garfield_residualize_bed_py,
+    garfield_residualize_grm_py, garfield_scan_groups_bin_py, garfield_scan_windows_bin_py,
+    garfield_score_cont_centered_gain_batch_packed_cpu_py,
+    garfield_score_cont_centered_gain_batch_packed_metal_py, garfield_subset_bin_samples_py,
+    load_bin01_packed_py, load_mbin_packed_py, score_binary_ba_mcc_batch_py, score_binary_ba_py,
+    score_binary_mcc_py, score_cont_corr_py, score_cont_mean_diff_corr_batch_py,
+    score_cont_mean_diff_py,
 };
 use gfreader::{
     bed_filter_stream_to_plink_rust, bed_filter_to_plink_rust, bed_mmap_filter_to_plink_rust,
@@ -194,11 +202,10 @@ use lmm_scan::{
     ai_reml_multi_f64, ai_reml_null_f64, fastlmm_assoc_chunk_f32, fastlmm_assoc_packed_f32,
     fastlmm_assoc_packed_f32_to_tsv, fvlmm_assoc_chunk_f32, fvlmm_assoc_chunk_from_snp_f32,
     fvlmm_assoc_chunk_from_snp_with_cache_f32, fvlmm_assoc_chunk_with_cache_f32,
-    fvlmm_assoc_packed_f32_to_tsv,
-    fvlmm_assoc_prepare_cache_f32, lmm_assoc_chunk_f32, lmm_assoc_chunk_from_snp_f32,
-    lmm_reml_assoc_packed_f32, lmm_reml_assoc_packed_f32_to_tsv, lmm_reml_chunk_f32,
-    lmm_reml_chunk_from_snp_f32, lmm_reml_null_f32, lmm_rotate_x_y_with_ut_f64, FvLmmAssocCache,
-    ml_loglike_null_f32,
+    fvlmm_assoc_packed_f32_to_tsv, fvlmm_assoc_prepare_cache_f32, lmm_assoc_chunk_f32,
+    lmm_assoc_chunk_from_snp_f32, lmm_reml_assoc_packed_f32, lmm_reml_assoc_packed_f32_to_tsv,
+    lmm_reml_chunk_f32, lmm_reml_chunk_from_snp_f32, lmm_reml_null_f32, lmm_rotate_x_y_with_ut_f64,
+    ml_loglike_null_f32, FvLmmAssocCache,
 };
 use logreg::fit_best_and_not_py;
 use ml::{garfield_ml_feature_scores_py, garfield_ml_select_topk_py};
@@ -209,10 +216,6 @@ use packed::{
     packed_malpha_mode_f64,
 };
 use rsvd::py_rsvd_packed_subset;
-use score::{
-    score_binary_ba_mcc_batch_py, score_binary_ba_py, score_binary_mcc_py, score_cont_corr_py,
-    score_cont_mean_diff_corr_batch_py, score_cont_mean_diff_py,
-};
 use sim::{sim_trait_accumulate_i8_f32, SimChunkGenerator, SimEngine, SimTraitAccumulator};
 use sim_g2p::g2p_simulate_py;
 use spgrm::{
@@ -317,6 +320,18 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(load_bed_2bit_packed, m)?)?;
     m.add_function(wrap_pyfunction!(load_bin01_packed_py, m)?)?;
     m.add_function(wrap_pyfunction!(load_mbin_packed_py, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        garfield_score_cont_centered_gain_batch_packed_cpu_py,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        garfield_score_cont_centered_gain_batch_packed_metal_py,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        garfield_compare_score_cont_centered_gain_batch_metal_vs_cpu_py,
+        m
+    )?)?;
     m.add_function(wrap_pyfunction!(scan_bed_2bit_packed_stats, m)?)?;
     m.add_function(wrap_pyfunction!(prepare_bed_2bit_packed, m)?)?;
     m.add_function(wrap_pyfunction!(prepare_bed_logic_meta_selected, m)?)?;
@@ -413,7 +428,10 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(fvlmm_assoc_chunk_with_cache_f32, m)?)?;
     m.add_function(wrap_pyfunction!(fvlmm_assoc_chunk_from_snp_f32, m)?)?;
     m.add_function(wrap_pyfunction!(fvlmm_assoc_prepare_cache_f32, m)?)?;
-    m.add_function(wrap_pyfunction!(fvlmm_assoc_chunk_from_snp_with_cache_f32, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        fvlmm_assoc_chunk_from_snp_with_cache_f32,
+        m
+    )?)?;
     m.add_function(wrap_pyfunction!(lmm_rotate_x_y_with_ut_f64, m)?)?;
     m.add_function(wrap_pyfunction!(lmm_reml_assoc_packed_f32, m)?)?;
     m.add_function(wrap_pyfunction!(lmm_reml_assoc_packed_f32_to_tsv, m)?)?;

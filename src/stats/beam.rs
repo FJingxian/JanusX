@@ -1,6 +1,6 @@
 use crate::bitwise::{and_popcount, bitand_assign, popcount};
+use crate::garfield::score_cont_corr_packed;
 use crate::gfcore::TxtSnpIter;
-use crate::score::score_cont_corr_packed;
 use memmap2::Mmap;
 use numpy::PyReadonlyArray1;
 use pyo3::exceptions::PyRuntimeError;

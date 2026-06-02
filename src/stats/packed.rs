@@ -2034,8 +2034,7 @@ mod tests {
             );
             let row_indices = PyArray1::from_owned_array(py, Array1::from_vec(vec![2_i64, 1_i64]));
             let row_flip = PyArray1::from_owned_array(py, Array1::from_vec(vec![false, false]));
-            let row_maf =
-                PyArray1::from_owned_array(py, Array1::from_vec(vec![0.25_f32, 0.5_f32]));
+            let row_maf = PyArray1::from_owned_array(py, Array1::from_vec(vec![0.25_f32, 0.5_f32]));
 
             let decoded = bed_packed_decode_rows_f32(
                 py,

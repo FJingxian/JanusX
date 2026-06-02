@@ -32,6 +32,10 @@ CPU_RSS_RE = re.compile(
     r"FvLMM:\s+avg CPU ~\s*(?P<cpu_pct>[-+0-9.eE]+)%\s+of\s+(?P<cpu_threads>\d+)\s+c,\s+peak RSS ~\s+(?P<peak_rss_gb>[-+0-9.eE]+)\s+G"
 )
 TOTAL_WALL_RE = re.compile(r"Finished\.\s+Total wall time:\s+(?P<wall_s>[-+0-9.eE]+)\s+seconds")
+
+
+def _print(msg: str) -> None:
+    print(msg, flush=True)
 NULL_PVE_RE = re.compile(r"FvLMM:\s+PVE\(null\)\s+~\s+(?P<null_pve>[-+0-9.eE]+)")
 
 
@@ -132,6 +136,19 @@ def _peak_rss_tree_bytes(proc: subprocess.Popen[str]) -> int:
     except Exception:
         pass
     return total
+
+
+def _tail_nonempty_lines(path: Path, max_lines: int) -> list[str]:
+    if max_lines <= 0 or not path.is_file():
+        return []
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return []
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return []
+    return lines[-max_lines:]
 
 
 def _build_cases(args: argparse.Namespace) -> list[Case]:
@@ -313,6 +330,8 @@ def _run_case(args: argparse.Namespace, case: Case, out_root: Path) -> dict[str,
     env = _build_env(os.environ.copy(), case, cache_root)
     t0 = time.perf_counter()
     peak_rss = 0
+    next_heartbeat_s = float(max(0, int(args.heartbeat_seconds)))
+    _print(f"[matrix] log={log_path}")
     with log_path.open("w", encoding="utf-8") as fh:
         proc = subprocess.Popen(
             cmd,
@@ -327,6 +346,17 @@ def _run_case(args: argparse.Namespace, case: Case, out_root: Path) -> dict[str,
             peak_rss = max(peak_rss, _peak_rss_tree_bytes(proc))
             if rc is not None:
                 break
+            elapsed_s = time.perf_counter() - t0
+            if next_heartbeat_s > 0.0 and elapsed_s >= next_heartbeat_s:
+                tail = _tail_nonempty_lines(log_path, int(args.heartbeat_tail_lines))
+                msg = (
+                    f"[matrix] {case.case_id} elapsed={elapsed_s:.1f}s "
+                    f"rss={peak_rss / (1024 ** 3):.2f}G"
+                )
+                if tail:
+                    msg += f" tail={tail[-1]}"
+                _print(msg)
+                next_heartbeat_s += float(max(1, int(args.heartbeat_seconds)))
             time.sleep(0.2)
     wall_s = time.perf_counter() - t0
     log_text = log_path.read_text(encoding="utf-8", errors="replace")
@@ -490,6 +520,18 @@ def main() -> int:
     ap.add_argument("--scan-stage-assoc-threads", type=str, default="auto")
     ap.add_argument("--dry-run", action="store_true", default=False, help="Only write commands.sh and matrix.json without executing.")
     ap.add_argument("--keep-going", action="store_true", default=False, help="Continue after failed cases.")
+    ap.add_argument(
+        "--heartbeat-seconds",
+        type=int,
+        default=30,
+        help="Print a progress heartbeat while a case is running. Set 0 to disable.",
+    )
+    ap.add_argument(
+        "--heartbeat-tail-lines",
+        type=int,
+        default=1,
+        help="How many non-empty log lines to inspect for heartbeat status.",
+    )
     args = ap.parse_args()
 
     out_root = Path(args.out).resolve()
@@ -504,29 +546,29 @@ def main() -> int:
     _write_commands(cases, args, out_root)
 
     if args.dry_run:
-        print(f"[matrix] wrote {len(cases)} cases to {matrix_path}")
-        print(f"[matrix] commands: {out_root / 'commands.sh'}")
+        _print(f"[matrix] wrote {len(cases)} cases to {matrix_path}")
+        _print(f"[matrix] commands: {out_root / 'commands.sh'}")
         return 0
 
     rows: list[dict[str, Any]] = []
     failures = 0
     for case in cases:
-        print(f"[matrix] {case.case_id} phase={case.phase} t={case.threads} proj={case.proj_threads} assoc={case.assoc_threads} row_mb={case.row_tile_mb} col_mb={case.col_block_mb} scan={case.scan_stage}")
+        _print(f"[matrix] {case.case_id} phase={case.phase} t={case.threads} proj={case.proj_threads} assoc={case.assoc_threads} row_mb={case.row_tile_mb} col_mb={case.col_block_mb} scan={case.scan_stage}")
         row = _run_case(args, case, out_root)
         rows.append(row)
         _write_summary(rows, out_root)
         if str(row.get("status")) != "ok":
             failures += 1
-            print(f"[matrix] failed: {case.case_id} -> {row['status']}", file=sys.stderr)
+            print(f"[matrix] failed: {case.case_id} -> {row['status']}", file=sys.stderr, flush=True)
             if not args.keep_going:
                 break
 
     _write_summary(rows, out_root)
     if failures > 0:
-        print(f"[matrix] completed with {failures} failed case(s)", file=sys.stderr)
+        print(f"[matrix] completed with {failures} failed case(s)", file=sys.stderr, flush=True)
         return 1
-    print(f"[matrix] completed {len(rows)} case(s)")
-    print(f"[matrix] summary: {out_root / 'summary.tsv'}")
+    _print(f"[matrix] completed {len(rows)} case(s)")
+    _print(f"[matrix] summary: {out_root / 'summary.tsv'}")
     return 0
 
 

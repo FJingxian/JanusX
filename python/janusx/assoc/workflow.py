@@ -3420,9 +3420,17 @@ def _gwas_evd_stage_ctx(threads: int):
     """
     EVD / heavy dense linear algebra stage.
     """
-    t = max(1, int(threads))
-    with runtime_thread_stage(blas_threads=t, rayon_threads=t):
+    spec = _gwas_evd_stage_thread_plan(threads)
+    with runtime_thread_stage(
+        blas_threads=int(spec["blas_threads"]),
+        rayon_threads=int(spec["rayon_threads"]),
+    ):
         yield
+
+
+def _gwas_evd_stage_thread_plan(threads: int) -> dict[str, int]:
+    t = max(1, int(threads))
+    return {"blas_threads": int(t), "rayon_threads": int(t)}
 
 
 @contextmanager
@@ -3432,9 +3440,17 @@ def _gwas_scan_stage_ctx(threads: int):
     - Rayon uses full `-t`
     - BLAS pinned to 1 to avoid oversubscription.
     """
-    t = max(1, int(threads))
-    with runtime_thread_stage(blas_threads=1, rayon_threads=t):
+    spec = _gwas_scan_stage_thread_plan(threads)
+    with runtime_thread_stage(
+        blas_threads=int(spec["blas_threads"]),
+        rayon_threads=int(spec["rayon_threads"]),
+    ):
         yield
+
+
+def _gwas_scan_stage_thread_plan(threads: int) -> dict[str, int]:
+    t = max(1, int(threads))
+    return {"blas_threads": 1, "rayon_threads": int(t)}
 
 
 def _resolve_fvlmm_scan_stage_mode() -> str:
@@ -3460,18 +3476,22 @@ def _gwas_fvlmm_scan_stage_ctx(threads: int):
     - `blas_t_rayon_1`: BLAS=t, Rayon=1
     - `generic`: reuse the generic GWAS scan stage (BLAS=1, Rayon=t)
     """
+    spec = _gwas_fvlmm_scan_stage_thread_plan(threads)
+    with runtime_thread_stage(
+        blas_threads=int(spec["blas_threads"]),
+        rayon_threads=int(spec["rayon_threads"]),
+    ):
+        yield
+
+
+def _gwas_fvlmm_scan_stage_thread_plan(threads: int) -> dict[str, int]:
     t = max(1, int(threads))
     mode = _resolve_fvlmm_scan_stage_mode()
     if mode == "blas_t_rayon_1":
-        with runtime_thread_stage(blas_threads=t, rayon_threads=1):
-            yield
-        return
+        return {"blas_threads": int(t), "rayon_threads": 1}
     if mode == "generic":
-        with _gwas_scan_stage_ctx(t):
-            yield
-        return
-    with runtime_thread_stage(blas_threads=t, rayon_threads=t):
-        yield
+        return _gwas_scan_stage_thread_plan(t)
+    return {"blas_threads": int(t), "rayon_threads": int(t)}
 
 
 def _resolve_gwas_eigh_driver(n_samples: int) -> str:
@@ -5473,12 +5493,23 @@ def _run_gwas_pipeline(
     outprefix = os.path.join(args.out, prefix)
     log_path = f"{outprefix}.gwas.log"
     logger = setup_logging(log_path)
+    fvlmm_scan_spec: dict[str, int] | None = None
+    if bool(getattr(args, "fvlmm", False)):
+        fvlmm_scan_spec = _gwas_fvlmm_scan_stage_thread_plan(int(args.thread))
     logger.info(f"Thread detect: {format_thread_budget_summary(thread_budget)}")
     logger.info(
         "Thread plan: "
         f"requested={requested_threads}, using={int(args.thread)}, "
         f"fvlmm_scan_stage={_resolve_fvlmm_scan_stage_mode()}"
     )
+    if fvlmm_scan_spec is not None:
+        _fb = int(fvlmm_scan_spec["blas_threads"])
+        _fr = int(fvlmm_scan_spec["rayon_threads"])
+        if _fb == _fr:
+            logger.info(f"FvLMM scan threads: BLAS={_fb}, Rayon={_fr}")
+        else:
+            logger.info(f"FvLMM scan BLAS threads: {_fb}")
+            logger.info(f"FvLMM scan Rayon threads: {_fr}")
     if thread_capped:
         logger.warning(
             f"Warning: Requested threads={requested_threads} exceeds local effective={detected_threads}; "
@@ -5565,16 +5596,23 @@ def _run_gwas_pipeline(
             cfg_rows.append(("Covariates", "; ".join(args.cov)))
         if args.splmm:
             cfg_rows.append(("SparseLMM sparse", True))
+        footer_rows: list[tuple[str, object]] = [
+            ("Threads", f"{args.thread} (local effective {detected_threads})"),
+        ]
+        if fvlmm_scan_spec is not None:
+            _fb = int(fvlmm_scan_spec["blas_threads"])
+            _fr = int(fvlmm_scan_spec["rayon_threads"])
+            if _fb != _fr:
+                footer_rows.append(("FvLMM scan BLAS", _fb))
+                footer_rows.append(("FvLMM scan Rayon", _fr))
+        footer_rows.append(("Output prefix", outprefix))
         emit_cli_configuration(
             logger,
             app_title="JanusX - GWAS",
             config_title="GWAS CONFIG",
             host=socket.gethostname(),
             sections=[("General", cfg_rows)],
-            footer_rows=[
-                ("Threads", f"{args.thread} (local effective {detected_threads})"),
-                ("Output prefix", outprefix),
-            ],
+            footer_rows=footer_rows,
             line_max_chars=60,
         )
 

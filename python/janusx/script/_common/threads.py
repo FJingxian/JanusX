@@ -49,7 +49,8 @@ def _detect_cgroup_cpu_quota() -> int | None:
     try:
         cpu_max = "/sys/fs/cgroup/cpu.max"
         if os.path.isfile(cpu_max):
-            txt = open(cpu_max, "r", encoding="utf-8").read().strip().split()
+            with open(cpu_max, "r", encoding="utf-8") as fh:
+                txt = fh.read().strip().split()
             if len(txt) >= 2 and txt[0] != "max":
                 quota = int(txt[0])
                 period = int(txt[1])
@@ -62,8 +63,10 @@ def _detect_cgroup_cpu_quota() -> int | None:
         q_path = "/sys/fs/cgroup/cpu/cpu.cfs_quota_us"
         p_path = "/sys/fs/cgroup/cpu/cpu.cfs_period_us"
         if os.path.isfile(q_path) and os.path.isfile(p_path):
-            quota = int(open(q_path, "r", encoding="utf-8").read().strip())
-            period = int(open(p_path, "r", encoding="utf-8").read().strip())
+            with open(q_path, "r", encoding="utf-8") as fh:
+                quota = int(fh.read().strip())
+            with open(p_path, "r", encoding="utf-8") as fh:
+                period = int(fh.read().strip())
             if quota > 0 and period > 0:
                 return max(1, int(math.ceil(float(quota) / float(period))))
     except Exception:

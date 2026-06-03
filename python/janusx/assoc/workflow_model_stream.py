@@ -1019,6 +1019,7 @@ def run_chunked_gwas_lmm_lm(
                     sample_ids=sample_ids,
                     threads=int(scan_threads),
                     nullml=mod.ML0,
+                    rotate_block_rows=int(model_chunk_size),
                 )
                 done_snps = int(rows_written)
                 has_results = done_snps > 0

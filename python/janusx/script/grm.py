@@ -126,7 +126,14 @@ def _grm_method_tag(method: int) -> str:
     return "cGRM" if int(method) == 1 else "sGRM"
 
 
-def _select_cli_grm_backend() -> tuple[str, str]:
+def _select_cli_grm_backend(*, fast: bool = False) -> tuple[str, str]:
+    if bool(fast):
+        if _grm_packed_bed_f32 is not None:
+            return ("packed-bed", "fast flag: force packed BED backend")
+        raise RuntimeError(
+            "Packed BED GRM kernel is unavailable. Rebuild JanusX extension to export "
+            "`grm_packed_bed_f32`."
+        )
     if _grm_stream_bed_f32 is not None:
         return ("memmap-bed", "full-sample GRM build")
     if _grm_packed_bed_f32 is not None:
@@ -208,7 +215,7 @@ def build_grm_streaming(
             mem = process.memory_info().rss / 1024**3
             pbar.set_postfix(memory=f"{mem:.2f} GB")
 
-    prev_block_target = os.environ.get("JX_GRM_STREAM_BLOCK_TARGET_MB")
+    prev_block_target = os.environ.get("JX_GRM_BLOCK_TARGET_MB")
     prev_stage_timing = os.environ.get("JX_GRM_STREAM_STAGE_TIMING")
     block_target_set = False
     stage_timing_set = False
@@ -221,7 +228,7 @@ def build_grm_streaming(
             )
         else:
             if np.isfinite(bt) and bt > 0:
-                os.environ["JX_GRM_STREAM_BLOCK_TARGET_MB"] = f"{bt:.6g}"
+                os.environ["JX_GRM_BLOCK_TARGET_MB"] = f"{bt:.6g}"
                 block_target_set = True
             else:
                 logger.warning(
@@ -247,9 +254,9 @@ def build_grm_streaming(
         finally:
             if block_target_set:
                 if prev_block_target is None:
-                    os.environ.pop("JX_GRM_STREAM_BLOCK_TARGET_MB", None)
+                    os.environ.pop("JX_GRM_BLOCK_TARGET_MB", None)
                 else:
-                    os.environ["JX_GRM_STREAM_BLOCK_TARGET_MB"] = prev_block_target
+                    os.environ["JX_GRM_BLOCK_TARGET_MB"] = prev_block_target
             if stage_timing_set:
                 if prev_stage_timing is None:
                     os.environ.pop("JX_GRM_STREAM_STAGE_TIMING", None)
@@ -314,7 +321,7 @@ def build_grm_packed_bed(
             mem = process.memory_info().rss / 1024**3
             pbar.set_postfix(memory=f"{mem:.2f} GB")
 
-    prev_block_target = os.environ.get("JX_GRM_PACKED_BLOCK_TARGET_MB")
+    prev_block_target = os.environ.get("JX_GRM_BLOCK_TARGET_MB")
     prev_stage_timing = os.environ.get("JX_GRM_PACKED_STAGE_TIMING")
     block_target_set = False
     stage_timing_set = False
@@ -327,7 +334,7 @@ def build_grm_packed_bed(
             )
         else:
             if np.isfinite(bt) and bt > 0:
-                os.environ["JX_GRM_PACKED_BLOCK_TARGET_MB"] = f"{bt:.6g}"
+                os.environ["JX_GRM_BLOCK_TARGET_MB"] = f"{bt:.6g}"
                 block_target_set = True
             else:
                 logger.warning(
@@ -358,9 +365,9 @@ def build_grm_packed_bed(
         finally:
             if block_target_set:
                 if prev_block_target is None:
-                    os.environ.pop("JX_GRM_PACKED_BLOCK_TARGET_MB", None)
+                    os.environ.pop("JX_GRM_BLOCK_TARGET_MB", None)
                 else:
-                    os.environ["JX_GRM_PACKED_BLOCK_TARGET_MB"] = prev_block_target
+                    os.environ["JX_GRM_BLOCK_TARGET_MB"] = prev_block_target
             if stage_timing_set:
                 if prev_stage_timing is None:
                     os.environ.pop("JX_GRM_PACKED_STAGE_TIMING", None)
@@ -571,6 +578,14 @@ def main(log: bool = True):
         "-npy", "--npy", action="store_true", default=False,
         help="Save GRM as binary NPY instead of plain text (default: %(default)s).",
     )
+    optional_group.add_argument(
+        "-fast", "--fast", action="store_true", default=False,
+        help=(
+            "Force packed BED backend (full in-memory load). "
+            "Faster for f64 GRM; for f32 the default streaming backend "
+            "with pipeline overlap is usually faster."
+        ),
+    )
 
     args = parser.parse_args()
     detected_threads = detect_effective_threads()
@@ -741,7 +756,7 @@ def main(log: bool = True):
             f"  {format_path_for_display(grm_path)}",
         )
     else:
-        selected_backend, backend_reason = _select_cli_grm_backend()
+        selected_backend, backend_reason = _select_cli_grm_backend(fast=bool(args.fast))
         logger.info(
             f"GRM auto route selected backend: {selected_backend} ({backend_reason})."
         )

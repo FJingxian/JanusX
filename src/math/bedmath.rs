@@ -920,10 +920,15 @@ pub(crate) fn adaptive_grm_block_rows(
     if exact_mode {
         return base;
     }
-    let target_mb = std::env::var("JX_GRM_PACKED_BLOCK_TARGET_MB")
+    let target_mb = std::env::var("JX_GRM_BLOCK_TARGET_MB")
         .ok()
         .and_then(|s| s.trim().parse::<f64>().ok())
-        .unwrap_or(64.0_f64);
+        .or_else(|| {
+            std::env::var("JX_GRM_PACKED_BLOCK_TARGET_MB")
+                .ok()
+                .and_then(|s| s.trim().parse::<f64>().ok())
+        })
+        .unwrap_or(1024.0_f64);
     if !(target_mb.is_finite() && target_mb > 0.0) {
         return base;
     }

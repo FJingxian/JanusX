@@ -194,54 +194,18 @@ fn grm_packed_cblas_flags() -> (bool, bool) {
 }
 
 #[inline]
-fn floor_power_of_two_usize(v: usize) -> usize {
-    if v <= 1 {
-        return 1usize;
-    }
-    1usize << ((usize::BITS - 1 - v.leading_zeros()) as usize)
-}
-
-#[inline]
-fn adaptive_packed_local_xxt_rows(n_samples: usize) -> usize {
+fn adaptive_packed_local_xxt_rows(_n_samples: usize) -> usize {
     if let Ok(raw) = std::env::var("JX_GRM_PACKED_LOCAL_XXT_ROWS") {
         if let Ok(v) = raw.trim().parse::<usize>() {
-            if v > 0 {
-                return v;
-            }
+            return v; // 0 = no tiling, >0 = tile size
         }
     }
 
-    // Keep the mixed-precision local XX^T update on a roughly bounded
-    // n_samples * local_rows footprint, then round down to a BLAS-friendly
-    // power-of-two row count. This keeps the packed f32 path numerically
-    // stable without forcing a one-size-fits-all fixed chunk.
-    let target_elems = std::env::var("JX_GRM_PACKED_LOCAL_XXT_TARGET_ELEMS")
-        .ok()
-        .and_then(|s| s.trim().parse::<usize>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(1_000_000usize);
-    let max_rows = std::env::var("JX_GRM_PACKED_LOCAL_XXT_MAX_ROWS")
-        .ok()
-        .and_then(|s| s.trim().parse::<usize>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(2048usize)
-        .max(1usize);
-    let min_rows = std::env::var("JX_GRM_PACKED_LOCAL_XXT_MIN_ROWS")
-        .ok()
-        .and_then(|s| s.trim().parse::<usize>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(128usize)
-        .max(1usize)
-        .min(max_rows);
-
-    if n_samples == 0 {
-        return min_rows;
-    }
-    let raw_rows = target_elems
-        .saturating_div(n_samples.max(1usize))
-        .max(1usize);
-    let pow2_rows = floor_power_of_two_usize(raw_rows).max(1usize);
-    pow2_rows.max(min_rows).min(max_rows)
+    // Default to 0 (no tiling): one SYRK call per block, matching the stream path.
+    // f64 accumulator already provides sufficient precision for the f32→f64 merge.
+    // Set JX_GRM_PACKED_LOCAL_XXT_ROWS to a power-of-two (e.g. 512) to enable
+    // tiling for additional numerical stability at the cost of more BLAS calls.
+    0
 }
 
 #[inline]
@@ -327,7 +291,40 @@ where
         sample_idx,
         method,
     )?;
-    let pool = get_cached_pool(threads).map_err(|e| e.to_string())?;
+
+    // Thread split for pipeline: decode_threads (producer, rayon) vs blas_threads (consumer)
+    let total_threads = effective_threads(threads);
+    let overlap_enabled = grm_overlap_enabled_default();
+    let decode_threads_hint = grm_decode_threads(total_threads, overlap_enabled);
+    // Pipeline overlap: on by default (matching stream path), can be disabled
+    // via JX_GRM_PACKED_PIPELINE=0 or JX_GRM_STREAM_OVERLAP=0.
+    // On macOS, BLAS uses AMX (independent of CPU), so decode (rayon) and
+    // SYRK (AMX) do not contend. On other platforms, disable if BLAS competes.
+    let packed_pipeline_env = std::env::var("JX_GRM_PACKED_PIPELINE")
+        .ok()
+        .map(|s| {
+            let t = s.trim().to_ascii_lowercase();
+            !matches!(t.as_str(), "0" | "false" | "no" | "off")
+        })
+        .unwrap_or(true);
+    let can_pipeline = packed_pipeline_env && overlap_enabled && total_threads > 1 && m > 1024;
+    let decode_threads = if can_pipeline {
+        decode_threads_hint.max(1)
+    } else {
+        1usize
+    };
+    let blas_threads = if decode_threads > 1 {
+        grm_blas_threads(total_threads, decode_threads, overlap_enabled)
+    } else {
+        total_threads.max(1)
+    };
+
+    let decode_pool = if decode_threads > 1 {
+        get_cached_pool(decode_threads).map_err(|e| e.to_string())?
+    } else {
+        get_cached_pool(threads).map_err(|e| e.to_string())?
+    };
+
     let row_step = adaptive_grm_block_rows(
         block_cols.max(1),
         m.max(1),
@@ -343,115 +340,296 @@ where
     };
     let (cblas_copy_rhs, cblas_force_tmp_accum) = grm_packed_cblas_flags();
     let local_xxt_rows = adaptive_packed_local_xxt_rows(n);
+    let eps = 1e-12_f32;
 
-    let _blas_guard = OpenBlasThreadGuard::enter(threads.max(1));
+    // --- shared immutable data ---
+    let byte_lut = packed_byte_lut();
+
+    // --- output buffers ---
+    let _blas_guard = OpenBlasThreadGuard::enter(blas_threads.max(1));
     let mut grm = Vec::<f64>::with_capacity(n * n);
     let grm_ptr = grm.as_mut_ptr();
-    let mut block = vec![0.0_f32; row_step * n];
     let mut grm_tmp = vec![0.0_f32; n * n];
     let mut varsum_acc = varsum_full;
-    let eps = 1e-12_f32;
-    let byte_lut = packed_byte_lut();
     let mut row_sum_all = vec![0.0_f64; m];
-    let mut last_notified = 0usize;
-    let mut is_first_block = true;
 
-    for row_start in (0..m).step_by(row_step) {
-        let row_end = (row_start + row_step).min(m);
-        let cur_rows = row_end - row_start;
-        let cur_block = &mut block[..cur_rows * n];
-        let mut block_varsum = vec![0.0_f64; cur_rows];
-        let mut block_rowsum = vec![0.0_f64; cur_rows];
+    if !can_pipeline {
+        // ---- serial fallback (original path) ----
+        let mut block = vec![0.0_f32; row_step * n];
+        let mut last_notified = 0usize;
+        let mut is_first_block = true;
 
-        let mut decode_run = || {
-            if full_sample_fast {
-                cur_block
-                    .par_chunks_mut(n)
-                    .zip(block_varsum.par_iter_mut())
-                    .zip(block_rowsum.par_iter_mut())
-                    .enumerate()
-                    .for_each(|(off, ((out_row, row_varsum_dst), row_sum_dst))| {
-                        let idx = row_start + off;
-                        let row = &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
-                        let p = row_maf_vec[idx].clamp(0.0_f32, 0.5_f32);
-                        let mean_g = 2.0_f32 * p;
-                        let var = 2.0_f32 * p * (1.0_f32 - p);
-                        let std_scale = if method == 2 {
-                            if var > eps {
-                                1.0_f32 / var.sqrt()
-                            } else {
-                                0.0_f32
-                            }
-                        } else {
-                            1.0_f32
-                        };
-                        let value_lut: [f32; 4] = if row_flip_vec[idx] {
-                            [
-                                (2.0_f32 - mean_g) * std_scale,
-                                0.0_f32,
-                                (1.0_f32 - mean_g) * std_scale,
-                                (0.0_f32 - mean_g) * std_scale,
-                            ]
-                        } else {
-                            [
-                                (0.0_f32 - mean_g) * std_scale,
-                                0.0_f32,
-                                (1.0_f32 - mean_g) * std_scale,
-                                (2.0_f32 - mean_g) * std_scale,
-                            ]
-                        };
-                        decode_row_centered_full_lut(
-                            row,
-                            n_samples,
-                            &byte_lut.code4,
-                            &value_lut,
-                            out_row,
-                        );
-                        if method == 1 {
-                            *row_varsum_dst = var as f64;
-                        }
-                        *row_sum_dst = (mean_g as f64) * (n as f64);
-                    });
-            } else {
-                cur_block
-                    .par_chunks_mut(n)
-                    .zip(block_varsum.par_iter_mut())
-                    .zip(block_rowsum.par_iter_mut())
-                    .enumerate()
-                    .for_each_init(
-                        || vec![0.0_f32; n_samples],
-                        |full_row, (off, ((out_row, row_varsum_dst), row_sum_dst))| {
+        for row_start in (0..m).step_by(row_step) {
+            let row_end = (row_start + row_step).min(m);
+            let cur_rows = row_end - row_start;
+            let cur_block = &mut block[..cur_rows * n];
+            let mut block_varsum = vec![0.0_f64; cur_rows];
+            let mut block_rowsum = vec![0.0_f64; cur_rows];
+
+            let mut decode_run = || {
+                if full_sample_fast {
+                    cur_block
+                        .par_chunks_mut(n)
+                        .zip(block_varsum.par_iter_mut())
+                        .zip(block_rowsum.par_iter_mut())
+                        .enumerate()
+                        .for_each(|(off, ((out_row, row_varsum_dst), row_sum_dst))| {
                             let idx = row_start + off;
                             let row = &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
                             let p = row_maf_vec[idx].clamp(0.0_f32, 0.5_f32);
-                            let default_mean_g = 2.0_f32 * p;
-                            let (var_centered, row_sum) = decode_subset_row_from_full_scratch(
+                            let mean_g = 2.0_f32 * p;
+                            let var = 2.0_f32 * p * (1.0_f32 - p);
+                            let std_scale = if method == 2 {
+                                if var > eps {
+                                    1.0_f32 / var.sqrt()
+                                } else {
+                                    0.0_f32
+                                }
+                            } else {
+                                1.0_f32
+                            };
+                            let value_lut: [f32; 4] = if row_flip_vec[idx] {
+                                [
+                                    (2.0_f32 - mean_g) * std_scale,
+                                    0.0_f32,
+                                    (1.0_f32 - mean_g) * std_scale,
+                                    (0.0_f32 - mean_g) * std_scale,
+                                ]
+                            } else {
+                                [
+                                    (0.0_f32 - mean_g) * std_scale,
+                                    0.0_f32,
+                                    (1.0_f32 - mean_g) * std_scale,
+                                    (2.0_f32 - mean_g) * std_scale,
+                                ]
+                            };
+                            decode_row_centered_full_lut(
                                 row,
                                 n_samples,
-                                sample_idx,
-                                row_flip_vec[idx],
-                                default_mean_g,
-                                method,
-                                eps,
                                 &byte_lut.code4,
-                                full_row.as_mut_slice(),
+                                &value_lut,
                                 out_row,
                             );
                             if method == 1 {
-                                *row_varsum_dst = var_centered;
+                                *row_varsum_dst = var as f64;
                             }
-                            *row_sum_dst = row_sum;
-                        },
-                    );
-            }
-        };
+                            *row_sum_dst = (mean_g as f64) * (n as f64);
+                        });
+                } else {
+                    cur_block
+                        .par_chunks_mut(n)
+                        .zip(block_varsum.par_iter_mut())
+                        .zip(block_rowsum.par_iter_mut())
+                        .enumerate()
+                        .for_each_init(
+                            || vec![0.0_f32; n_samples],
+                            |full_row, (off, ((out_row, row_varsum_dst), row_sum_dst))| {
+                                let idx = row_start + off;
+                                let row =
+                                    &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
+                                let p = row_maf_vec[idx].clamp(0.0_f32, 0.5_f32);
+                                let default_mean_g = 2.0_f32 * p;
+                                let (var_centered, row_sum) =
+                                    decode_subset_row_from_full_scratch(
+                                        row,
+                                        n_samples,
+                                        sample_idx,
+                                        row_flip_vec[idx],
+                                        default_mean_g,
+                                        method,
+                                        eps,
+                                        &byte_lut.code4,
+                                        full_row.as_mut_slice(),
+                                        out_row,
+                                    );
+                                if method == 1 {
+                                    *row_varsum_dst = var_centered;
+                                }
+                                *row_sum_dst = row_sum;
+                            },
+                        );
+                }
+            };
 
-        if let Some(tp) = &pool {
-            tp.install(&mut decode_run);
-        } else {
-            decode_run();
+            if let Some(tp) = &decode_pool {
+                tp.install(&mut decode_run);
+            } else {
+                decode_run();
+            }
+
+            grm_rankk_update_raw_mixed_f32_to_f64(
+                grm_ptr,
+                cur_block,
+                cur_rows,
+                n,
+                GrmAccumMode::Syrk,
+                cblas_copy_rhs,
+                is_first_block,
+                cblas_force_tmp_accum,
+                local_xxt_rows,
+                &mut grm_tmp,
+            )?;
+            is_first_block = false;
+            if method == 1 && !full_sample_fast {
+                varsum_acc += block_varsum.iter().sum::<f64>();
+            }
+            row_sum_all[row_start..row_end].copy_from_slice(&block_rowsum);
+
+            let done = row_end;
+            if (done >= last_notified.saturating_add(notify_step)) || (done == m) {
+                last_notified = done;
+                if let Some(cb) = progress.as_mut() {
+                    cb(done, m)?;
+                }
+            }
         }
 
+        let scale = if method == 1 {
+            if !(varsum_acc.is_finite() && varsum_acc > 0.0) {
+                return Err("invalid centered GRM denominator in subset path".to_string());
+            }
+            varsum_acc
+        } else {
+            m as f64
+        };
+        if !(scale.is_finite() && scale > 0.0) {
+            return Err("invalid GRM scale factor".to_string());
+        }
+        let inv_scale = 1.0_f64 / scale;
+        unsafe {
+            grm_scale_and_symmetrize_raw_f64(grm_ptr, n, inv_scale);
+            grm.set_len(n * n);
+        }
+        let varsum_ret = if method == 1 { varsum_acc } else { m as f64 };
+        let grm_f32: Vec<f32> = grm.into_iter().map(|v| v as f32).collect();
+        return Ok((grm_f32, row_sum_all, varsum_ret));
+    }
+
+    // ============================================================
+    // Pipeline path: double-buffer overlap of decode (producer)
+    // and GEMM accumulate (consumer).
+    // ============================================================
+
+    // Per-chunk buffer
+    struct Chunk {
+        data: Vec<f32>,    // row_step * n
+        varsum: Vec<f64>,  // row_step
+        rowsum: Vec<f64>,  // row_step
+        start: usize,
+        rows: usize,
+    }
+
+    let buf_depth = 2usize;
+    let make_chunk = || Chunk {
+        data: vec![0.0_f32; row_step * n],
+        varsum: vec![0.0_f64; row_step],
+        rowsum: vec![0.0_f64; row_step],
+        start: 0usize,
+        rows: 0usize,
+    };
+
+    // Producer: decodes blocks from packed BED
+    let mut next_start = 0usize;
+    let producer = |buf: &mut Chunk| -> bool {
+        if next_start >= m {
+            return false;
+        }
+        let row_end = (next_start + row_step).min(m);
+        let cur_rows = row_end - next_start;
+        buf.start = next_start;
+        buf.rows = cur_rows;
+        let cur_block = &mut buf.data[..cur_rows * n];
+        let cur_varsum = &mut buf.varsum[..cur_rows];
+        let cur_rowsum = &mut buf.rowsum[..cur_rows];
+
+        if full_sample_fast {
+            cur_block
+                .par_chunks_mut(n)
+                .zip(cur_varsum.par_iter_mut())
+                .zip(cur_rowsum.par_iter_mut())
+                .enumerate()
+                .for_each(|(off, ((out_row, row_varsum_dst), row_sum_dst))| {
+                    let idx = next_start + off;
+                    let row = &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
+                    let p = row_maf_vec[idx].clamp(0.0_f32, 0.5_f32);
+                    let mean_g = 2.0_f32 * p;
+                    let var = 2.0_f32 * p * (1.0_f32 - p);
+                    let std_scale = if method == 2 {
+                        if var > eps { 1.0_f32 / var.sqrt() } else { 0.0_f32 }
+                    } else {
+                        1.0_f32
+                    };
+                    let value_lut: [f32; 4] = if row_flip_vec[idx] {
+                        [
+                            (2.0_f32 - mean_g) * std_scale,
+                            0.0_f32,
+                            (1.0_f32 - mean_g) * std_scale,
+                            (0.0_f32 - mean_g) * std_scale,
+                        ]
+                    } else {
+                        [
+                            (0.0_f32 - mean_g) * std_scale,
+                            0.0_f32,
+                            (1.0_f32 - mean_g) * std_scale,
+                            (2.0_f32 - mean_g) * std_scale,
+                        ]
+                    };
+                    decode_row_centered_full_lut(
+                        row,
+                        n_samples,
+                        &byte_lut.code4,
+                        &value_lut,
+                        out_row,
+                    );
+                    if method == 1 {
+                        *row_varsum_dst = var as f64;
+                    }
+                    *row_sum_dst = (mean_g as f64) * (n as f64);
+                });
+        } else {
+            cur_block
+                .par_chunks_mut(n)
+                .zip(cur_varsum.par_iter_mut())
+                .zip(cur_rowsum.par_iter_mut())
+                .enumerate()
+                .for_each_init(
+                    || vec![0.0_f32; n_samples],
+                    |full_row, (off, ((out_row, row_varsum_dst), row_sum_dst))| {
+                        let idx = next_start + off;
+                        let row =
+                            &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
+                        let p = row_maf_vec[idx].clamp(0.0_f32, 0.5_f32);
+                        let default_mean_g = 2.0_f32 * p;
+                        let (var_centered, row_sum) = decode_subset_row_from_full_scratch(
+                            row,
+                            n_samples,
+                            sample_idx,
+                            row_flip_vec[idx],
+                            default_mean_g,
+                            method,
+                            eps,
+                            &byte_lut.code4,
+                            full_row.as_mut_slice(),
+                            out_row,
+                        );
+                        if method == 1 {
+                            *row_varsum_dst = var_centered;
+                        }
+                        *row_sum_dst = row_sum;
+                    },
+                );
+        }
+        next_start = row_end;
+        next_start < m
+    };
+
+    // Consumer: GEMM accumulate on decoded blocks
+    let mut is_first_block = true;
+    let mut last_notified = 0usize;
+    let mut done_rows = 0usize;
+    let consumer = |buf: &mut Chunk| {
+        let cur_rows = buf.rows;
+        let cur_block = &buf.data[..cur_rows * n];
         grm_rankk_update_raw_mixed_f32_to_f64(
             grm_ptr,
             cur_block,
@@ -466,22 +644,29 @@ where
         )?;
         is_first_block = false;
         if method == 1 && !full_sample_fast {
-            varsum_acc += block_varsum.iter().sum::<f64>();
+            varsum_acc += buf.varsum[..cur_rows].iter().sum::<f64>();
         }
-        row_sum_all[row_start..row_end].copy_from_slice(&block_rowsum);
+        let row_end = buf.start + cur_rows;
+        row_sum_all[buf.start..row_end].copy_from_slice(&buf.rowsum[..cur_rows]);
+        done_rows = row_end;
 
-        let done = row_end;
-        if (done >= last_notified.saturating_add(notify_step)) || (done == m) {
-            last_notified = done;
+        if (done_rows >= last_notified.saturating_add(notify_step)) || (done_rows >= m) {
+            last_notified = done_rows;
             if let Some(cb) = progress.as_mut() {
-                cb(done, m)?;
+                cb(done_rows, m)?;
             }
         }
-    }
+        Ok::<(), String>(())
+    };
+
+    // Producer uses rayon global pool for parallel decode;
+    // consumer uses BLAS with blas_threads (AMX on Apple Silicon).
+    // These are independent hardware resources, so overlap is effective.
+    crate::pipeline::run_double_buffer(buf_depth, make_chunk, producer, consumer)?;
 
     let scale = if method == 1 {
         if !(varsum_acc.is_finite() && varsum_acc > 0.0) {
-            return Err("invalid centered GRM denominator in subset path".to_string());
+            return Err("invalid centered GRM denominator in pipelined packed subset path".to_string());
         }
         varsum_acc
     } else {
@@ -2250,10 +2435,16 @@ fn grm_stream_block_rows(
         }
     }
     let base = requested_block_rows.max(1).min(m.max(1));
-    let target_mb = std::env::var("JX_GRM_STREAM_BLOCK_TARGET_MB")
+    let target_mb = std::env::var("JX_GRM_BLOCK_TARGET_MB")
         .ok()
         .and_then(|s| s.trim().parse::<f64>().ok())
         .filter(|v| v.is_finite() && *v > 0.0)
+        .or_else(|| {
+            std::env::var("JX_GRM_STREAM_BLOCK_TARGET_MB")
+                .ok()
+                .and_then(|s| s.trim().parse::<f64>().ok())
+                .filter(|v| v.is_finite() && *v > 0.0)
+        })
         .unwrap_or(1024.0_f64);
     let target_bytes = (target_mb * 1024.0_f64 * 1024.0_f64) as usize;
     if target_bytes == 0 {

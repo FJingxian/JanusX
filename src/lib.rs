@@ -70,6 +70,8 @@ mod gwasio;
 mod sim;
 #[path = "io/vcfout.rs"]
 mod vcfout;
+#[path = "io/pipeline.rs"]
+mod pipeline;
 
 // workflow (structural layer; currently type-only skeleton)
 #[path = "workflow/mod.rs"]

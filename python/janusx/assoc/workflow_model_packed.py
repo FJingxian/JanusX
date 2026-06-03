@@ -2780,9 +2780,11 @@ def run_lm_packed_fullrank(
     preloaded_packed: Union[dict[str, object], None] = None,
     force_model: bool = False,
 ) -> None:
-    if not hasattr(jxrs, "glmf32_packed_assoc_to_tsv"):
+    use_block_lm = hasattr(jxrs, "lm_block_assoc_packed_to_tsv")
+    if not hasattr(jxrs, "glmf32_packed_assoc_to_tsv") and not use_block_lm:
         raise RuntimeError(
-            "Rust extension missing glmf32_packed_assoc_to_tsv. Rebuild/install JanusX extension first."
+            "Rust extension missing both glmf32_packed_assoc_to_tsv and "
+            "lm_block_assoc_packed_to_tsv. Rebuild/install JanusX extension first."
         )
     if str(genetic_model).lower() != "add":
         raise ValueError(
@@ -2937,101 +2939,132 @@ def run_lm_packed_fullrank(
                         "progress_callback": _lm_progress,
                         "progress_every": int(max(1, int(chunk_size))),
                     }
-                unified_done = False
-                if _gwas_use_rust_unified_v1():
-                    try:
-                        jobs = [
-                            {
-                                "model": "lm",
-                                "trait": str(pname),
-                                "out_tsv": str(tmp_tsv),
-                                "y": y_vec,
-                                "x": x_design,
-                                "ixx": None,
-                                "sample_indices": sample_idx_trait,
-                                "step": int(max(1, int(chunk_size))),
-                                "scan_progress_callback": _lm_progress,
-                                "progress_every": int(max(1, int(chunk_size))),
-                            }
-                        ]
-                        _res = jxrs.gwas_packed_unified_to_tsv(
-                            jobs,
-                            packed,
-                            int(packed_n),
-                            row_flip,
-                            maf,
-                            miss,
-                            chrom_all,
-                            pos_all,
-                            snp_all,
-                            allele0_all,
-                            allele1_all,
-                            int(max(1, int(chunk_size))),
-                            int(threads),
-                            None,
-                            int(max(1, int(chunk_size))),
-                            row_indices=packed_row_idx,
-                        )
-                        try:
-                            _written_rows = int(_res[0].get("written_rows", len(chrom_all)))
-                        except Exception:
-                            _written_rows = int(len(chrom_all))
-                        unified_done = True
-                    except Exception as ex:
-                        _emit_warning_line(
-                            logger,
-                            f"LM unified Rust dispatcher unavailable; fallback to legacy packed LM. reason={ex}",
-                            use_spinner=bool(use_spinner),
-                        )
-                        unified_done = False
 
-                if not unified_done:
-                    try:
-                        _written_rows = jxrs.glmf32_packed_assoc_to_tsv(
-                            y_vec,
-                            x_design,
-                            None,
-                            packed,
-                            int(packed_n),
-                            row_flip,
-                            maf,
-                            miss,
-                            chrom_all,
-                            pos_all,
-                            snp_all,
-                            allele0_all,
-                            allele1_all,
-                            tmp_tsv,
-                            sample_idx_trait,
-                            row_indices=packed_row_idx,
-                            step=int(max(1, int(chunk_size))),
-                            threads=int(threads),
-                            **kwargs_assoc,
-                        )
-                    except TypeError:
-                        # Backward-compat fallback for older extensions that require ixx.
-                        ixx = _lm_precompute_ixx_qr(x_design)
-                        _written_rows = jxrs.glmf32_packed_assoc_to_tsv(
-                            y_vec,
-                            x_design,
-                            ixx,
-                            packed,
-                            int(packed_n),
-                            row_flip,
-                            maf,
-                            miss,
-                            chrom_all,
-                            pos_all,
-                            snp_all,
-                            allele0_all,
-                            allele1_all,
-                            tmp_tsv,
-                            sample_idx_trait,
-                            row_indices=packed_row_idx,
-                            step=int(max(1, int(chunk_size))),
-                            threads=int(threads),
-                            **kwargs_assoc,
-                        )
+                if use_block_lm:
+                    # New block formula with per-trait filtering
+                    ixx = _lm_precompute_ixx_qr(x_design)
+                    _kept, _scanned = jxrs.lm_block_assoc_packed_to_tsv(
+                        y_vec,
+                        x_design,
+                        ixx,
+                        packed,
+                        int(packed_n),
+                        row_flip,
+                        maf,
+                        miss,
+                        chrom_all,
+                        pos_all,
+                        snp_all,
+                        allele0_all,
+                        allele1_all,
+                        tmp_tsv,
+                        maf_threshold=float(maf_threshold),
+                        max_missing_rate=float(max_missing_rate),
+                        het_threshold=float(het_threshold),
+                        sample_indices=sample_idx_trait,
+                        row_indices=packed_row_idx,
+                        chunk_size=int(max(1, int(chunk_size))),
+                        threads=int(threads),
+                        **kwargs_assoc,
+                    )
+                    _written_rows = int(_kept)
+                else:
+                    # Legacy path: unified dispatcher or glmf32_packed_assoc_to_tsv
+                    unified_done = False
+                    if _gwas_use_rust_unified_v1():
+                        try:
+                            jobs = [
+                                {
+                                    "model": "lm",
+                                    "trait": str(pname),
+                                    "out_tsv": str(tmp_tsv),
+                                    "y": y_vec,
+                                    "x": x_design,
+                                    "ixx": None,
+                                    "sample_indices": sample_idx_trait,
+                                    "step": int(max(1, int(chunk_size))),
+                                    "scan_progress_callback": _lm_progress,
+                                    "progress_every": int(max(1, int(chunk_size))),
+                                }
+                            ]
+                            _res = jxrs.gwas_packed_unified_to_tsv(
+                                jobs,
+                                packed,
+                                int(packed_n),
+                                row_flip,
+                                maf,
+                                miss,
+                                chrom_all,
+                                pos_all,
+                                snp_all,
+                                allele0_all,
+                                allele1_all,
+                                int(max(1, int(chunk_size))),
+                                int(threads),
+                                None,
+                                int(max(1, int(chunk_size))),
+                                row_indices=packed_row_idx,
+                            )
+                            try:
+                                _written_rows = int(_res[0].get("written_rows", len(chrom_all)))
+                            except Exception:
+                                _written_rows = int(len(chrom_all))
+                            unified_done = True
+                        except Exception as ex:
+                            _emit_warning_line(
+                                logger,
+                                f"LM unified Rust dispatcher unavailable; fallback to legacy packed LM. reason={ex}",
+                                use_spinner=bool(use_spinner),
+                            )
+                            unified_done = False
+
+                    if not unified_done:
+                        try:
+                            _written_rows = jxrs.glmf32_packed_assoc_to_tsv(
+                                y_vec,
+                                x_design,
+                                None,
+                                packed,
+                                int(packed_n),
+                                row_flip,
+                                maf,
+                                miss,
+                                chrom_all,
+                                pos_all,
+                                snp_all,
+                                allele0_all,
+                                allele1_all,
+                                tmp_tsv,
+                                sample_idx_trait,
+                                row_indices=packed_row_idx,
+                                step=int(max(1, int(chunk_size))),
+                                threads=int(threads),
+                                **kwargs_assoc,
+                            )
+                        except TypeError:
+                            # Backward-compat fallback for older extensions that require ixx.
+                            ixx = _lm_precompute_ixx_qr(x_design)
+                            _written_rows = jxrs.glmf32_packed_assoc_to_tsv(
+                                y_vec,
+                                x_design,
+                                ixx,
+                                packed,
+                                int(packed_n),
+                                row_flip,
+                                maf,
+                                miss,
+                                chrom_all,
+                                pos_all,
+                                snp_all,
+                                allele0_all,
+                                allele1_all,
+                                tmp_tsv,
+                                sample_idx_trait,
+                                row_indices=packed_row_idx,
+                                step=int(max(1, int(chunk_size))),
+                                threads=int(threads),
+                                **kwargs_assoc,
+                            )
             gwas_ok = True
         finally:
             if gwas_pbar is not None:
@@ -3069,7 +3102,7 @@ def run_lm_packed_fullrank(
         avg_cpu = 100.0 * cpu_used / (wall * max(1, n_cores))
         peak_rss_gb = peak_rss / (1024 ** 3)
 
-        eff_snp = int(len(sites_all))
+        eff_snp = int(_written_rows) if use_block_lm else int(len(sites_all))
         eff_snp_by_trait[pname] = eff_snp
         summary_rows.append(
             {

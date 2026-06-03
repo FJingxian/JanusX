@@ -18,6 +18,7 @@ use super::score_gpu::{
 use crate::bitwise::{and_popcount, bitand_assign, bitnot_masked, bitor_into};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
+use std::env;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -27,6 +28,8 @@ const GARFIELD_BEAM_PAR_CHUNK_CANDS: usize = 128;
 const GARFIELD_INITIAL_SINGLETON_NEGATIONS: [bool; 1] = [false];
 const GARFIELD_AND_NOT_SHORTER_SUBRULE_GAIN_MAX: f64 = 0.08;
 const GARFIELD_AND_NOT_SHORTER_SUBRULE_HAMMING_FRAC_MAX: f64 = 0.05;
+const GARFIELD_LITERAL_BATCH_MAX_ROWS_DEFAULT: usize = 16_384;
+const GARFIELD_LITERAL_BATCH_MAX_WORK_WORDS_DEFAULT: usize = 1_048_576;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct GarfieldBeamProfileSnapshot {
@@ -58,6 +61,11 @@ pub(crate) fn snapshot_garfield_beam_profile() -> GarfieldBeamProfileSnapshot {
             as f64)
             * 1e-9,
     }
+}
+
+pub(crate) fn add_garfield_beam_profile_literal_precompute_ns(delta_ns: u64) {
+    GARFIELD_BEAM_PROFILE_LITERAL_PRECOMPUTE_NS.fetch_add(delta_ns, Ordering::Relaxed);
+    GARFIELD_BEAM_PROFILE_TOTAL_NS.fetch_add(delta_ns, Ordering::Relaxed);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -222,10 +230,18 @@ struct BeamState {
     max_singleton_test_raw: f64,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct LiteralSingletonScore {
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct LiteralSingletonScore {
     train: ContinuousRuleScore,
     test: ContinuousRuleScore,
+}
+
+pub(crate) struct LiteralScoreBatchRequest<'a> {
+    pub bits_train: &'a [u64],
+    pub row_words_train: usize,
+    pub bits_test: &'a [u64],
+    pub row_words_test: usize,
+    pub n_rows: usize,
 }
 
 type RuleLexKey = Vec<(usize, bool, u8)>;
@@ -1141,6 +1157,45 @@ fn validate_search_inputs(
 }
 
 #[inline]
+fn parse_env_usize(name: &str) -> Option<usize> {
+    env::var(name)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|&v| v > 0)
+}
+
+#[inline]
+fn literal_batch_max_rows() -> usize {
+    parse_env_usize("JX_GARFIELD_LITERAL_BATCH_MAX_ROWS")
+        .unwrap_or(GARFIELD_LITERAL_BATCH_MAX_ROWS_DEFAULT)
+}
+
+#[inline]
+fn literal_batch_max_work_words() -> usize {
+    parse_env_usize("JX_GARFIELD_LITERAL_BATCH_MAX_WORK_WORDS")
+        .unwrap_or(GARFIELD_LITERAL_BATCH_MAX_WORK_WORDS_DEFAULT)
+}
+
+#[inline]
+fn literal_inputs_are_shared(
+    y_train: &[f64],
+    n_train: usize,
+    y_test: &[f64],
+    n_test: usize,
+    bits_train: &[u64],
+    row_words_train: usize,
+    bits_test: &[u64],
+    row_words_test: usize,
+    n_rows: usize,
+) -> bool {
+    n_train == n_test
+        && row_words_train == row_words_test
+        && y_train[..n_train] == y_test[..n_test]
+        && bits_train[..n_rows.saturating_mul(row_words_train)]
+            == bits_test[..n_rows.saturating_mul(row_words_test)]
+}
+
+#[inline]
 fn apply_first_literal(
     row: &[u64],
     needed_words: usize,
@@ -1174,6 +1229,37 @@ fn precompute_literal_singleton_scores(
     let score_t0 = Instant::now();
     let out = (|| {
         let mode = parse_centered_gain_backend_mode_from_env()?;
+        let shared_inputs = needed_words_train == needed_words_test
+            && literal_inputs_are_shared(
+                y_train,
+                n_train,
+                y_test,
+                n_test,
+                bits_train,
+                row_words_train,
+                bits_test,
+                row_words_test,
+                n_rows,
+            );
+        if shared_inputs {
+            let shared_scores = precompute_literal_singleton_backend_scores(
+                mode,
+                y_train,
+                sum_y_train,
+                bits_train,
+                row_words_train,
+                needed_words_train,
+                n_train,
+                n_rows,
+            )?;
+            return Ok(shared_scores
+                .into_iter()
+                .map(|score| LiteralSingletonScore {
+                    train: score,
+                    test: score,
+                })
+                .collect());
+        }
         let train_scores = precompute_literal_singleton_backend_scores(
             mode,
             y_train,
@@ -1203,6 +1289,185 @@ fn precompute_literal_singleton_scores(
     })();
     GARFIELD_BEAM_PROFILE_LITERAL_PRECOMPUTE_NS
         .fetch_add(elapsed_ns_saturating(score_t0), Ordering::Relaxed);
+    out
+}
+
+pub(crate) fn precompute_literal_singleton_scores_batched(
+    y_train: &[f64],
+    n_train: usize,
+    y_test: &[f64],
+    n_test: usize,
+    requests: &[LiteralScoreBatchRequest<'_>],
+) -> Result<Vec<Vec<LiteralSingletonScore>>, String> {
+    if requests.is_empty() {
+        return Ok(Vec::new());
+    }
+    let score_t0 = Instant::now();
+    let out = (|| {
+        let ctx = "garfield::precompute_literal_singleton_scores_batched";
+        validate_continuous_y(y_train, n_train, ctx)?;
+        validate_continuous_y(y_test, n_test, ctx)?;
+        let mode = parse_centered_gain_backend_mode_from_env()?;
+        let sum_y_train = y_train.iter().take(n_train).copied().sum::<f64>();
+        let sum_y_test = y_test.iter().take(n_test).copied().sum::<f64>();
+        let max_rows = literal_batch_max_rows();
+        let max_work_words = literal_batch_max_work_words();
+        let mut out = vec![Vec::<LiteralSingletonScore>::new(); requests.len()];
+        let mut start = 0usize;
+
+        while start < requests.len() {
+            if requests[start].n_rows == 0 {
+                start += 1;
+                continue;
+            }
+            let row_words_train = requests[start].row_words_train;
+            let row_words_test = requests[start].row_words_test;
+            let needed_words_train = validate_bit_matrix(
+                requests[start].bits_train,
+                row_words_train,
+                requests[start].n_rows,
+                n_train,
+                ctx,
+            )?;
+            let needed_words_test = validate_bit_matrix(
+                requests[start].bits_test,
+                row_words_test,
+                requests[start].n_rows,
+                n_test,
+                ctx,
+            )?;
+            let mut end = start;
+            let mut batch_rows = 0usize;
+            let mut batch_train_words = 0usize;
+            let mut batch_test_words = 0usize;
+            while end < requests.len() {
+                let req = &requests[end];
+                if req.n_rows == 0 {
+                    end += 1;
+                    continue;
+                }
+                if req.row_words_train != row_words_train || req.row_words_test != row_words_test {
+                    break;
+                }
+                let req_train_words = req.n_rows.saturating_mul(req.row_words_train);
+                let req_test_words = req.n_rows.saturating_mul(req.row_words_test);
+                let next_rows = batch_rows.saturating_add(req.n_rows);
+                let next_work_words = batch_train_words
+                    .saturating_add(req_train_words)
+                    .max(batch_test_words.saturating_add(req_test_words));
+                if end > start && (next_rows > max_rows || next_work_words > max_work_words) {
+                    break;
+                }
+                validate_bit_matrix(
+                    req.bits_train,
+                    req.row_words_train,
+                    req.n_rows,
+                    n_train,
+                    ctx,
+                )?;
+                validate_bit_matrix(req.bits_test, req.row_words_test, req.n_rows, n_test, ctx)?;
+                batch_rows = next_rows;
+                batch_train_words = batch_train_words.saturating_add(req_train_words);
+                batch_test_words = batch_test_words.saturating_add(req_test_words);
+                end += 1;
+            }
+            let batch = &requests[start..end];
+            let batch_shared_inputs = needed_words_train == needed_words_test
+                && batch.iter().all(|req| {
+                    literal_inputs_are_shared(
+                        y_train,
+                        n_train,
+                        y_test,
+                        n_test,
+                        req.bits_train,
+                        req.row_words_train,
+                        req.bits_test,
+                        req.row_words_test,
+                        req.n_rows,
+                    )
+                });
+
+            let mut merged_train = Vec::<u64>::with_capacity(batch_train_words);
+            let mut merged_test = if batch_shared_inputs {
+                Vec::<u64>::new()
+            } else {
+                Vec::<u64>::with_capacity(batch_test_words)
+            };
+            for req in batch.iter() {
+                merged_train.extend_from_slice(
+                    &req.bits_train[..req.n_rows.saturating_mul(req.row_words_train)],
+                );
+                if !batch_shared_inputs {
+                    merged_test.extend_from_slice(
+                        &req.bits_test[..req.n_rows.saturating_mul(req.row_words_test)],
+                    );
+                }
+            }
+
+            if batch_shared_inputs {
+                let shared_scores = precompute_literal_singleton_backend_scores(
+                    mode,
+                    y_train,
+                    sum_y_train,
+                    merged_train.as_slice(),
+                    row_words_train,
+                    needed_words_train,
+                    n_train,
+                    batch_rows,
+                )?;
+                let mut row_offset = 0usize;
+                for (req_idx, req) in batch.iter().enumerate() {
+                    let score_start = row_offset.saturating_mul(2);
+                    let score_end = score_start.saturating_add(req.n_rows.saturating_mul(2));
+                    out[start + req_idx] = shared_scores[score_start..score_end]
+                        .iter()
+                        .copied()
+                        .map(|score| LiteralSingletonScore {
+                            train: score,
+                            test: score,
+                        })
+                        .collect();
+                    row_offset = row_offset.saturating_add(req.n_rows);
+                }
+            } else {
+                let train_scores = precompute_literal_singleton_backend_scores(
+                    mode,
+                    y_train,
+                    sum_y_train,
+                    merged_train.as_slice(),
+                    row_words_train,
+                    needed_words_train,
+                    n_train,
+                    batch_rows,
+                )?;
+                let test_scores = precompute_literal_singleton_backend_scores(
+                    mode,
+                    y_test,
+                    sum_y_test,
+                    merged_test.as_slice(),
+                    row_words_test,
+                    needed_words_test,
+                    n_test,
+                    batch_rows,
+                )?;
+                let mut row_offset = 0usize;
+                for (req_idx, req) in batch.iter().enumerate() {
+                    let score_start = row_offset.saturating_mul(2);
+                    let score_end = score_start.saturating_add(req.n_rows.saturating_mul(2));
+                    out[start + req_idx] = train_scores[score_start..score_end]
+                        .iter()
+                        .copied()
+                        .zip(test_scores[score_start..score_end].iter().copied())
+                        .map(|(train, test)| LiteralSingletonScore { train, test })
+                        .collect();
+                    row_offset = row_offset.saturating_add(req.n_rows);
+                }
+            }
+            start = end;
+        }
+        Ok(out)
+    })();
+    add_garfield_beam_profile_literal_precompute_ns(elapsed_ns_saturating(score_t0));
     out
 }
 
@@ -2692,7 +2957,7 @@ fn collapse_surrogate_candidate(
     })
 }
 
-pub fn beam_search_train_test_continuous(
+fn beam_search_train_test_continuous_impl(
     y_train: &[f64],
     bits_train: &[u64],
     row_words_train: usize,
@@ -2704,6 +2969,7 @@ pub fn beam_search_train_test_continuous(
     n_test: usize,
     group_ids: &[usize],
     params: BeamSearchParams,
+    literal_scores_override: Option<&[LiteralSingletonScore]>,
 ) -> Result<Vec<BeamRuleCandidate>, String> {
     let beam_t0 = Instant::now();
     let out = (|| {
@@ -2725,21 +2991,34 @@ pub fn beam_search_train_test_continuous(
 
         let max_depth = params.max_pick.min(n_rows);
         let exhaustive_depth = params.exhaustive_depth.max(1).min(max_depth);
-        let literal_scores = precompute_literal_singleton_scores(
-            y_train,
-            sum_y_train,
-            bits_train,
-            row_words_train,
-            needed_words_train,
-            n_train,
-            y_test,
-            sum_y_test,
-            bits_test,
-            row_words_test,
-            needed_words_test,
-            n_test,
-            n_rows,
-        )?;
+        let literal_scores_storage;
+        let literal_scores = if let Some(scores) = literal_scores_override {
+            if scores.len() != n_rows.saturating_mul(2) {
+                return Err(format!(
+                    "garfield::beam_search_train_test_continuous: literal score length mismatch: {} vs expected {}",
+                    scores.len(),
+                    n_rows.saturating_mul(2)
+                ));
+            }
+            scores
+        } else {
+            literal_scores_storage = precompute_literal_singleton_scores(
+                y_train,
+                sum_y_train,
+                bits_train,
+                row_words_train,
+                needed_words_train,
+                n_train,
+                y_test,
+                sum_y_test,
+                bits_test,
+                row_words_test,
+                needed_words_test,
+                n_test,
+                n_rows,
+            )?;
+            literal_scores_storage.as_slice()
+        };
 
         let mut kept_all = Vec::<BeamState>::new();
         let mut beam = if exhaustive_depth > 1 {
@@ -2751,7 +3030,7 @@ pub fn beam_search_train_test_continuous(
                 needed_words_train,
                 n_train,
                 group_ids,
-                literal_scores.as_slice(),
+                literal_scores,
                 &params,
             )?;
             kept_all.extend(exhaustive_initial.iter().cloned());
@@ -2767,7 +3046,7 @@ pub fn beam_search_train_test_continuous(
                     needed_words_train,
                     n_train,
                     group_ids,
-                    literal_scores.as_slice(),
+                    literal_scores,
                     &params,
                 )?;
                 if next.is_empty() {
@@ -2787,7 +3066,7 @@ pub fn beam_search_train_test_continuous(
                 needed_words_train,
                 n_train,
                 group_ids,
-                literal_scores.as_slice(),
+                literal_scores,
                 &params,
             )?;
             kept_all.extend(beam.iter().cloned());
@@ -2805,7 +3084,7 @@ pub fn beam_search_train_test_continuous(
                 needed_words_train,
                 n_train,
                 group_ids,
-                literal_scores.as_slice(),
+                literal_scores,
                 &params,
             )?;
             if next.is_empty() {
@@ -2831,7 +3110,7 @@ pub fn beam_search_train_test_continuous(
                 bits_test,
                 row_words_test,
                 n_test,
-                literal_scores.as_slice(),
+                literal_scores,
                 &params,
             )?;
             if !keep_rule_after_support_pruning(&cand.rule, &cand.test, n_test, &params) {
@@ -2856,6 +3135,65 @@ pub fn beam_search_train_test_continuous(
     GARFIELD_BEAM_PROFILE_CALLS.fetch_add(1, Ordering::Relaxed);
     GARFIELD_BEAM_PROFILE_TOTAL_NS.fetch_add(elapsed_ns_saturating(beam_t0), Ordering::Relaxed);
     out
+}
+
+pub fn beam_search_train_test_continuous(
+    y_train: &[f64],
+    bits_train: &[u64],
+    row_words_train: usize,
+    n_rows: usize,
+    n_train: usize,
+    y_test: &[f64],
+    bits_test: &[u64],
+    row_words_test: usize,
+    n_test: usize,
+    group_ids: &[usize],
+    params: BeamSearchParams,
+) -> Result<Vec<BeamRuleCandidate>, String> {
+    beam_search_train_test_continuous_impl(
+        y_train,
+        bits_train,
+        row_words_train,
+        n_rows,
+        n_train,
+        y_test,
+        bits_test,
+        row_words_test,
+        n_test,
+        group_ids,
+        params,
+        None,
+    )
+}
+
+pub(crate) fn beam_search_train_test_continuous_with_literal_scores(
+    y_train: &[f64],
+    bits_train: &[u64],
+    row_words_train: usize,
+    n_rows: usize,
+    n_train: usize,
+    y_test: &[f64],
+    bits_test: &[u64],
+    row_words_test: usize,
+    n_test: usize,
+    group_ids: &[usize],
+    params: BeamSearchParams,
+    literal_scores: &[LiteralSingletonScore],
+) -> Result<Vec<BeamRuleCandidate>, String> {
+    beam_search_train_test_continuous_impl(
+        y_train,
+        bits_train,
+        row_words_train,
+        n_rows,
+        n_train,
+        y_test,
+        bits_test,
+        row_words_test,
+        n_test,
+        group_ids,
+        params,
+        Some(literal_scores),
+    )
 }
 
 #[cfg(test)]
@@ -2922,6 +3260,43 @@ mod tests {
             max_singleton_train_raw: rule_max_singleton_raw(&rule, literal_scores, true),
             max_singleton_test_raw: rule_max_singleton_raw(&rule, literal_scores, false),
         }
+    }
+
+    #[test]
+    fn test_batched_literal_singleton_precompute_matches_per_unit() {
+        let y = vec![0.2, 1.1, -0.4, 0.8, 1.6, -0.3];
+        let rows_a = vec![vec![1, 0, 1, 0, 0, 1], vec![0, 1, 1, 0, 1, 0]];
+        let rows_b = vec![vec![1, 1, 0, 0, 1, 0], vec![0, 0, 1, 1, 0, 1]];
+        let (bits_a, row_words_a) = pack_rows(&rows_a, y.len());
+        let (bits_b, row_words_b) = pack_rows(&rows_b, y.len());
+        let expected_a = literal_scores_for_test(&y, bits_a.as_slice(), row_words_a, rows_a.len());
+        let expected_b = literal_scores_for_test(&y, bits_b.as_slice(), row_words_b, rows_b.len());
+        let actual = precompute_literal_singleton_scores_batched(
+            y.as_slice(),
+            y.len(),
+            y.as_slice(),
+            y.len(),
+            &[
+                LiteralScoreBatchRequest {
+                    bits_train: bits_a.as_slice(),
+                    row_words_train: row_words_a,
+                    bits_test: bits_a.as_slice(),
+                    row_words_test: row_words_a,
+                    n_rows: rows_a.len(),
+                },
+                LiteralScoreBatchRequest {
+                    bits_train: bits_b.as_slice(),
+                    row_words_train: row_words_b,
+                    bits_test: bits_b.as_slice(),
+                    row_words_test: row_words_b,
+                    n_rows: rows_b.len(),
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(actual.len(), 2);
+        assert_eq!(actual[0], expected_a);
+        assert_eq!(actual[1], expected_b);
     }
 
     #[test]

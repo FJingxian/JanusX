@@ -5,6 +5,10 @@ mod sampling;
 mod score;
 mod score_gpu;
 
+use self::bs::{
+    beam_search_train_test_continuous_with_literal_scores,
+    precompute_literal_singleton_scores_batched, LiteralScoreBatchRequest, LiteralSingletonScore,
+};
 use self::bs::{reset_garfield_beam_profile, snapshot_garfield_beam_profile};
 use self::permutation::{
     bucket_from_expr, bucket_from_rule, choose_representative_indices,
@@ -47,6 +51,7 @@ use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
 use std::collections::{HashMap, HashSet};
+use std::env;
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Seek, SeekFrom, Write};
@@ -89,6 +94,9 @@ const GARFIELD_SCAN_PAIR_PARENT_ABS_GAIN_MIN: f64 = 0.01;
 const GARFIELD_SCAN_SURROGATE_TEST_GAIN_MAX: f64 = 0.02;
 const GARFIELD_SCAN_SURROGATE_HAMMING_FRAC_MAX: f64 = 0.02;
 const GARFIELD_DISABLE_STRUCTURE_PRIOR: bool = true;
+const GARFIELD_SCAN_UNIT_COALESCE_MAX_UNITS_DEFAULT: usize = 64;
+const GARFIELD_NULL_TASK_COALESCE_MAX_TASKS_DEFAULT: usize = 64;
+const GARFIELD_STRUCTURE_TASK_COALESCE_MAX_UNITS_DEFAULT: usize = 32;
 
 #[inline]
 fn strict_maf_support_count(n_samples: usize, maf_threshold: f32) -> usize {
@@ -108,6 +116,35 @@ fn timing_share_pct(part_s: f64, whole_s: f64) -> f64 {
     } else {
         0.0
     }
+}
+
+#[inline]
+fn parse_env_usize(name: &str) -> Option<usize> {
+    env::var(name)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|&v| v > 0)
+}
+
+#[inline]
+fn garfield_scan_unit_coalesce_max_units() -> usize {
+    parse_env_usize("JX_GARFIELD_SCAN_UNIT_COALESCE_MAX_UNITS")
+        .unwrap_or(GARFIELD_SCAN_UNIT_COALESCE_MAX_UNITS_DEFAULT)
+        .max(1)
+}
+
+#[inline]
+fn garfield_null_task_coalesce_max_tasks() -> usize {
+    parse_env_usize("JX_GARFIELD_NULL_TASK_COALESCE_MAX_TASKS")
+        .unwrap_or(GARFIELD_NULL_TASK_COALESCE_MAX_TASKS_DEFAULT)
+        .max(1)
+}
+
+#[inline]
+fn garfield_structure_task_coalesce_max_units() -> usize {
+    parse_env_usize("JX_GARFIELD_STRUCTURE_TASK_COALESCE_MAX_UNITS")
+        .unwrap_or(GARFIELD_STRUCTURE_TASK_COALESCE_MAX_UNITS_DEFAULT)
+        .max(1)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -5415,18 +5452,11 @@ fn collect_rule_structure_posterior_for_unit_adaptive(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn evaluate_logic_unit_continuous(
+fn evaluate_logic_unit_prepared_continuous(
     ui: usize,
     unit: &GarfieldLogicUnit,
-    response: ResponseKind,
-    engine: Option<MlEngine>,
-    importance: ImportanceKind,
-    perm_cfg: PermutationConfig,
-    ml_top_k: usize,
-    ml_top_frac: f64,
-    tree_cfg: ExtraTreesConfig,
+    prepared: &GarfieldUnitPrepared,
     logic_bits: &GarfieldLogicBits,
-    train_idx_local: &[usize],
     test_idx_local: &[usize],
     y_train: &[f64],
     y_test: &[f64],
@@ -5435,39 +5465,38 @@ fn evaluate_logic_unit_continuous(
     beam_params: BeamSearchParams,
     top_rules_per_unit: usize,
     unit_kind_lc: &str,
+    literal_scores: Option<&[LiteralSingletonScore]>,
 ) -> Result<Vec<GarfieldLogicRuleRecord>, String> {
-    let Some(prepared) = prepare_logic_unit_continuous(
-        unit,
-        unit_kind_lc,
-        response,
-        engine,
-        importance,
-        perm_cfg,
-        ml_top_k,
-        ml_top_frac,
-        tree_cfg,
-        logic_bits,
-        train_idx_local,
-        test_idx_local,
-        y_train,
-        beam_params.clone(),
-    )?
-    else {
-        return Ok(Vec::new());
+    let beam_hits = if let Some(scores) = literal_scores {
+        beam_search_train_test_continuous_with_literal_scores(
+            y_train,
+            prepared.train_bits.as_slice(),
+            prepared.row_words_train,
+            prepared.selected_global_rows.len(),
+            y_train.len(),
+            y_test,
+            prepared.test_bits.as_slice(),
+            prepared.row_words_test,
+            test_idx_local.len(),
+            prepared.local_groups.as_slice(),
+            beam_params.clone(),
+            scores,
+        )?
+    } else {
+        beam_search_train_test_continuous(
+            y_train,
+            prepared.train_bits.as_slice(),
+            prepared.row_words_train,
+            prepared.selected_global_rows.len(),
+            y_train.len(),
+            y_test,
+            prepared.test_bits.as_slice(),
+            prepared.row_words_test,
+            test_idx_local.len(),
+            prepared.local_groups.as_slice(),
+            beam_params.clone(),
+        )?
     };
-    let beam_hits = beam_search_train_test_continuous(
-        y_train,
-        prepared.train_bits.as_slice(),
-        prepared.row_words_train,
-        prepared.selected_global_rows.len(),
-        train_idx_local.len(),
-        y_test,
-        prepared.test_bits.as_slice(),
-        prepared.row_words_test,
-        test_idx_local.len(),
-        prepared.local_groups.as_slice(),
-        beam_params.clone(),
-    )?;
     if beam_hits.is_empty() {
         return Ok(Vec::new());
     }
@@ -5553,6 +5582,310 @@ fn evaluate_logic_unit_continuous(
         });
     }
     Ok(out)
+}
+
+#[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
+fn evaluate_logic_unit_continuous(
+    ui: usize,
+    unit: &GarfieldLogicUnit,
+    response: ResponseKind,
+    engine: Option<MlEngine>,
+    importance: ImportanceKind,
+    perm_cfg: PermutationConfig,
+    ml_top_k: usize,
+    ml_top_frac: f64,
+    tree_cfg: ExtraTreesConfig,
+    logic_bits: &GarfieldLogicBits,
+    train_idx_local: &[usize],
+    test_idx_local: &[usize],
+    y_train: &[f64],
+    y_test: &[f64],
+    assoc_y: &[f64],
+    assoc_sample_indices: &[usize],
+    beam_params: BeamSearchParams,
+    top_rules_per_unit: usize,
+    unit_kind_lc: &str,
+) -> Result<Vec<GarfieldLogicRuleRecord>, String> {
+    let Some(prepared) = prepare_logic_unit_continuous(
+        unit,
+        unit_kind_lc,
+        response,
+        engine,
+        importance,
+        perm_cfg,
+        ml_top_k,
+        ml_top_frac,
+        tree_cfg,
+        logic_bits,
+        train_idx_local,
+        test_idx_local,
+        y_train,
+        beam_params.clone(),
+    )?
+    else {
+        return Ok(Vec::new());
+    };
+    evaluate_logic_unit_prepared_continuous(
+        ui,
+        unit,
+        &prepared,
+        logic_bits,
+        test_idx_local,
+        y_train,
+        y_test,
+        assoc_y,
+        assoc_sample_indices,
+        beam_params,
+        top_rules_per_unit,
+        unit_kind_lc,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process_scan_unit_chunk_continuous(
+    chunk_unit_indices: &[usize],
+    units: &[GarfieldLogicUnit],
+    response: ResponseKind,
+    engine: Option<MlEngine>,
+    importance: ImportanceKind,
+    perm_cfg: PermutationConfig,
+    ml_top_k: usize,
+    ml_top_frac: f64,
+    tree_cfg: ExtraTreesConfig,
+    logic_bits: &GarfieldLogicBits,
+    train_idx_local: &[usize],
+    test_idx_local: &[usize],
+    y_train: &[f64],
+    y_test: &[f64],
+    assoc_y: &[f64],
+    assoc_sample_indices: &[usize],
+    beam_params: BeamSearchParams,
+    top_rules_per_unit: usize,
+    unit_kind_lc: &str,
+    progress_callback: Option<&Py<PyAny>>,
+    scan_progress_done: &AtomicUsize,
+    scan_notify_step: usize,
+    scanned_units: usize,
+    skipped_messages: &Arc<Mutex<Vec<String>>>,
+) -> Result<Vec<Vec<GarfieldLogicRuleRecord>>, String> {
+    let mut out = vec![Vec::<GarfieldLogicRuleRecord>::new(); chunk_unit_indices.len()];
+    let mut prepared_units = Vec::<(usize, usize, GarfieldUnitPrepared)>::new();
+    for (slot_idx, &ui) in chunk_unit_indices.iter().enumerate() {
+        let unit = &units[ui];
+        if let Some(prepared) = prepare_logic_unit_continuous(
+            unit,
+            unit_kind_lc,
+            response,
+            engine,
+            importance,
+            perm_cfg,
+            ml_top_k,
+            ml_top_frac,
+            tree_cfg,
+            logic_bits,
+            train_idx_local,
+            test_idx_local,
+            y_train,
+            beam_params.clone(),
+        )? {
+            prepared_units.push((slot_idx, ui, prepared));
+        }
+    }
+
+    let literal_scores_batched = if prepared_units.is_empty() {
+        Vec::new()
+    } else {
+        let requests = prepared_units
+            .iter()
+            .map(|(_, _, prepared)| LiteralScoreBatchRequest {
+                bits_train: prepared.train_bits.as_slice(),
+                row_words_train: prepared.row_words_train,
+                bits_test: prepared.test_bits.as_slice(),
+                row_words_test: prepared.row_words_test,
+                n_rows: prepared.selected_global_rows.len(),
+            })
+            .collect::<Vec<_>>();
+        precompute_literal_singleton_scores_batched(
+            y_train,
+            y_train.len(),
+            y_test,
+            test_idx_local.len(),
+            requests.as_slice(),
+        )?
+    };
+    if literal_scores_batched.len() != prepared_units.len() {
+        return Err(format!(
+            "GARFIELD scan literal batch size mismatch: {} prepared units vs {} score bundles",
+            prepared_units.len(),
+            literal_scores_batched.len()
+        ));
+    }
+
+    let prepared_units = prepared_units;
+    let literal_scores_batched = literal_scores_batched;
+    let mut prepared_cursor = 0usize;
+    for (slot_idx, &ui) in chunk_unit_indices.iter().enumerate() {
+        let unit = &units[ui];
+        let maybe_prepared = prepared_units
+            .get(prepared_cursor)
+            .map(|(prepared_slot, prepared_ui, _)| (*prepared_slot, *prepared_ui));
+        if maybe_prepared == Some((slot_idx, ui)) {
+            let (_, _, prepared) = &prepared_units[prepared_cursor];
+            let literal_scores = literal_scores_batched
+                .get(prepared_cursor)
+                .ok_or_else(|| "GARFIELD scan literal score iterator underflow".to_string())?;
+            let unit_out = match evaluate_logic_unit_prepared_continuous(
+                ui,
+                unit,
+                prepared,
+                logic_bits,
+                test_idx_local,
+                y_train,
+                y_test,
+                assoc_y,
+                assoc_sample_indices,
+                beam_params.clone(),
+                top_rules_per_unit,
+                unit_kind_lc,
+                Some(literal_scores.as_slice()),
+            ) {
+                Ok(v) => v,
+                Err(err) if is_no_valid_initial_literals_error(&err) => {
+                    skipped_messages
+                        .lock()
+                        .map_err(|_| "GARFIELD skipped-messages mutex poisoned".to_string())?
+                        .push(format_skipped_unit_message("scan", &unit.label, &err));
+                    Vec::new()
+                }
+                Err(err) => return Err(err),
+            };
+            out[slot_idx] = unit_out;
+            prepared_cursor += 1;
+        }
+        let done = scan_progress_done.fetch_add(1, Ordering::Relaxed) + 1;
+        if done % scan_notify_step == 0 || done == scanned_units {
+            garfield_stage_progress_notify(
+                progress_callback,
+                "scan",
+                done,
+                scanned_units.max(1),
+                None,
+            )
+            .map_err(|e| e.to_string())?;
+        }
+    }
+    if prepared_cursor != prepared_units.len() || prepared_cursor != literal_scores_batched.len() {
+        return Err("GARFIELD scan prepared/literal iterator alignment mismatch".to_string());
+    }
+    Ok(out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process_rule_permutation_task_chunk(
+    slot_indices: &[usize],
+    rep_start: usize,
+    rep_end: usize,
+    null_chunk_prepared: &[(GarfieldNullChunk, GarfieldUnitPrepared)],
+    y_train: &[f64],
+    y_test: &[f64],
+    split_applied: bool,
+    perm_beam_params: BeamSearchParams,
+    seed: u64,
+    progress_callback: Option<&Py<PyAny>>,
+    null_progress_done: &AtomicUsize,
+    null_notify_step: usize,
+    permutation_task_total: usize,
+) -> Result<Vec<(usize, Vec<(RuleNullBucket, f64, f64)>)>, String> {
+    let mut out = Vec::<(usize, Vec<(RuleNullBucket, f64, f64)>)>::with_capacity(
+        slot_indices.len() * (rep_end - rep_start),
+    );
+    for &slot in slot_indices.iter() {
+        let (chunk, prepared) = &null_chunk_prepared[slot];
+        for rep in rep_start..rep_end {
+            let rep_seed = seed
+                ^ (chunk.window_id.wrapping_mul(0x94D0_49BB_1331_11EB))
+                ^ ((rep as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+                ^ ((slot as u64).wrapping_mul(0xA24B_AED4_963E_E407));
+            let vals = collect_rule_permutation_nulls_for_repeat(
+                prepared,
+                y_train,
+                y_test,
+                split_applied,
+                perm_beam_params.clone(),
+                rep_seed,
+            )?;
+            let done = null_progress_done.fetch_add(1, Ordering::Relaxed) + 1;
+            if done % null_notify_step == 0 || done == permutation_task_total {
+                garfield_stage_progress_notify(
+                    progress_callback,
+                    "null_penalty",
+                    done,
+                    permutation_task_total.max(1),
+                    None,
+                )
+                .map_err(|e| e.to_string())?;
+            }
+            out.push((rep, vals));
+        }
+    }
+    Ok(out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process_structure_prior_unit_chunk(
+    slot_start: usize,
+    chunk: &[(usize, GarfieldUnitPrepared)],
+    y_train: &[f64],
+    y_test: &[f64],
+    split_applied: bool,
+    posterior_beam_params: BeamSearchParams,
+    structure_prior_cfg: &RuleStructurePriorConfig,
+    seed: u64,
+    structure_scores: &Arc<Mutex<RuleStructurePriorCalibrator>>,
+    structure_repeats_used: &AtomicUsize,
+    structure_progress_done: &AtomicUsize,
+    structure_notify_step: usize,
+    structure_task_total: usize,
+    structure_prior_display_len: usize,
+    progress_callback: Option<&Py<PyAny>>,
+) -> Result<(), String> {
+    for (local_idx, (ui, prepared)) in chunk.iter().enumerate() {
+        let slot = slot_start + local_idx;
+        let unit_seed = seed
+            ^ ((*ui as u64).wrapping_mul(0xD134_2543_DE82_EF95))
+            ^ ((slot as u64).wrapping_mul(0xA24B_AED4_963E_E407));
+        let out = collect_rule_structure_posterior_for_unit_adaptive(
+            prepared,
+            y_train,
+            y_test,
+            split_applied,
+            posterior_beam_params.clone(),
+            structure_prior_cfg,
+            unit_seed,
+        )?;
+        structure_repeats_used.fetch_add(out.repeats_used, Ordering::Relaxed);
+        let alpha_meta = {
+            let mut guard = structure_scores
+                .lock()
+                .map_err(|_| "GARFIELD structure prior mutex poisoned".to_string())?;
+            guard.merge_from(&out.calibrator);
+            format_structure_alpha_meta(&guard, structure_prior_cfg, structure_prior_display_len)
+        };
+        let done = structure_progress_done.fetch_add(1, Ordering::Relaxed) + 1;
+        if done % structure_notify_step == 0 || done == structure_task_total {
+            garfield_stage_progress_notify(
+                progress_callback,
+                "structure_prior",
+                done,
+                structure_task_total.max(1),
+                Some(alpha_meta.as_str()),
+            )
+            .map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
 }
 
 #[inline]
@@ -6570,6 +6903,7 @@ fn garfield_logic_search_bed_owned(
                 .saturating_mul(perm_cfg.n_repeats.max(1))
                 .max(1),
         );
+        let null_task_coalesce_max_tasks = garfield_null_task_coalesce_max_tasks();
         let repeats_per_batch = if null_chunk_prepared.is_empty() {
             1usize
         } else {
@@ -6591,81 +6925,66 @@ fn garfield_logic_search_bed_owned(
         let mut rep_start = 0usize;
         'perm_batches: while rep_start < max_perm_repeats {
             let rep_end = (rep_start + repeats_per_batch).min(max_perm_repeats);
-            let mut batch_tasks = Vec::<(usize, usize, u64)>::with_capacity(
-                null_chunk_prepared.len() * (rep_end - rep_start),
-            );
-            for rep in rep_start..rep_end {
-                for (slot, (chunk, _prepared)) in null_chunk_prepared.iter().enumerate() {
-                    let rep_seed = seed
-                        ^ (chunk.window_id.wrapping_mul(0x94D0_49BB_1331_11EB))
-                        ^ ((rep as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
-                        ^ ((slot as u64).wrapping_mul(0xA24B_AED4_963E_E407));
-                    batch_tasks.push((slot, rep, rep_seed));
-                }
-            }
+            let rep_count = rep_end - rep_start;
+            let slot_chunk_width = if null_chunk_prepared.is_empty() {
+                1usize
+            } else {
+                null_task_coalesce_max_tasks
+                    .div_ceil(rep_count.max(1))
+                    .max(1)
+            };
+            let slot_indices = (0..null_chunk_prepared.len()).collect::<Vec<_>>();
             let batch_results = if let Some(pool) = perm_pool.as_ref() {
                 pool.install(|| {
-                    batch_tasks
-                        .par_iter()
-                        .map(|(slot, rep, rep_seed)| {
-                            let (_, prepared) = &null_chunk_prepared[*slot];
-                            let out = collect_rule_permutation_nulls_for_repeat(
-                                prepared,
+                    slot_indices
+                        .par_chunks(slot_chunk_width)
+                        .map(|slot_chunk| {
+                            process_rule_permutation_task_chunk(
+                                slot_chunk,
+                                rep_start,
+                                rep_end,
+                                null_chunk_prepared.as_slice(),
                                 train_fit.residualized_y.as_slice(),
                                 test_fit.residualized_y.as_slice(),
                                 split_applied,
                                 perm_beam_params.clone(),
-                                *rep_seed,
-                            )?;
-                            let done = null_progress_done.fetch_add(1, Ordering::Relaxed) + 1;
-                            if done % null_notify_step == 0 || done == permutation_task_total {
-                                garfield_stage_progress_notify(
-                                    progress_callback_parallel,
-                                    "null_penalty",
-                                    done,
-                                    permutation_task_total.max(1),
-                                    None,
-                                )
-                                .map_err(|e| e.to_string())?;
-                            }
-                            Ok((*rep, out))
+                                seed,
+                                progress_callback_parallel,
+                                &null_progress_done,
+                                null_notify_step,
+                                permutation_task_total,
+                            )
                         })
-                        .collect::<Vec<Result<(usize, Vec<(RuleNullBucket, f64, f64)>), String>>>()
+                        .collect::<Vec<Result<Vec<(usize, Vec<(RuleNullBucket, f64, f64)>)>, String>>>()
                 })
             } else {
-                let mut out =
-                    Vec::<Result<(usize, Vec<(RuleNullBucket, f64, f64)>), String>>::with_capacity(
-                        batch_tasks.len(),
-                    );
-                for (slot, rep, rep_seed) in batch_tasks.iter() {
-                    let (_, prepared) = &null_chunk_prepared[*slot];
-                    let unit_out = collect_rule_permutation_nulls_for_repeat(
-                        prepared,
+                let mut out = Vec::<Result<Vec<(usize, Vec<(RuleNullBucket, f64, f64)>)>, String>>::with_capacity(
+                    slot_indices.len().div_ceil(slot_chunk_width),
+                );
+                for slot_chunk in slot_indices.chunks(slot_chunk_width) {
+                    out.push(process_rule_permutation_task_chunk(
+                        slot_chunk,
+                        rep_start,
+                        rep_end,
+                        null_chunk_prepared.as_slice(),
                         train_fit.residualized_y.as_slice(),
                         test_fit.residualized_y.as_slice(),
                         split_applied,
                         perm_beam_params.clone(),
-                        *rep_seed,
-                    );
-                    let done = null_progress_done.fetch_add(1, Ordering::Relaxed) + 1;
-                    if done % null_notify_step == 0 || done == permutation_task_total {
-                        garfield_stage_progress_notify(
-                            progress_callback.as_ref(),
-                            "null_penalty",
-                            done,
-                            permutation_task_total.max(1),
-                            None,
-                        )
-                        .map_err(|e| e.to_string())?;
-                    }
-                    out.push(unit_out.map(|v| (*rep, v)));
+                        seed,
+                        progress_callback.as_ref(),
+                        &null_progress_done,
+                        null_notify_step,
+                        permutation_task_total,
+                    ));
                 }
                 out
             };
             let mut by_rep = vec![Vec::<(RuleNullBucket, f64, f64)>::new(); rep_end - rep_start];
-            for task_out in batch_results.into_iter() {
-                let (rep, vals) = task_out?;
-                by_rep[rep - rep_start].extend(vals);
+            for chunk_out in batch_results.into_iter() {
+                for (rep, vals) in chunk_out? {
+                    by_rep[rep - rep_start].extend(vals);
+                }
             }
             for (rep_offset, rep_vals) in by_rep.into_iter().enumerate() {
                 for (bucket, train_score, test_score) in rep_vals.into_iter() {
@@ -6737,6 +7056,7 @@ fn garfield_logic_search_bed_owned(
             ..beam_params.clone()
         };
         let bootstrap_threads = threads_eff.min(representative_prepared.len().max(1));
+        let structure_chunk_units = garfield_structure_task_coalesce_max_units();
         if bootstrap_threads > 1 {
             let pool = ThreadPoolBuilder::new()
                 .num_threads(bootstrap_threads)
@@ -6744,85 +7064,51 @@ fn garfield_logic_search_bed_owned(
                 .map_err(|e| format!("build GARFIELD bootstrap thread pool: {e}"))?;
             pool.install(|| {
                 representative_prepared
-                    .par_iter()
+                    .par_chunks(structure_chunk_units)
                     .enumerate()
-                    .map(|(slot, (ui, prepared))| {
-                        let unit_seed = seed
-                            ^ ((*ui as u64).wrapping_mul(0xD134_2543_DE82_EF95))
-                            ^ ((slot as u64).wrapping_mul(0xA24B_AED4_963E_E407));
-                        let out = collect_rule_structure_posterior_for_unit_adaptive(
-                            prepared,
+                    .map(|(chunk_idx, chunk)| {
+                        process_structure_prior_unit_chunk(
+                            chunk_idx.saturating_mul(structure_chunk_units),
+                            chunk,
                             train_fit.residualized_y.as_slice(),
                             test_fit.residualized_y.as_slice(),
                             split_applied,
                             posterior_beam_params.clone(),
                             &structure_prior_cfg,
-                            unit_seed,
-                        )?;
-                        structure_repeats_used.fetch_add(out.repeats_used, Ordering::Relaxed);
-                        let alpha_meta = {
-                            let mut guard = structure_scores.lock().map_err(|_| {
-                                "GARFIELD structure prior mutex poisoned".to_string()
-                            })?;
-                            guard.merge_from(&out.calibrator);
-                            format_structure_alpha_meta(
-                                &guard,
-                                &structure_prior_cfg,
-                                structure_prior_display_len,
-                            )
-                        };
-                        let done = structure_progress_done.fetch_add(1, Ordering::Relaxed) + 1;
-                        if done % structure_notify_step == 0 || done == structure_task_total {
-                            garfield_stage_progress_notify(
-                                progress_callback_parallel,
-                                "structure_prior",
-                                done,
-                                structure_task_total.max(1),
-                                Some(alpha_meta.as_str()),
-                            )
-                            .map_err(|e| e.to_string())?;
-                        }
-                        Ok(())
+                            seed,
+                            &structure_scores,
+                            &structure_repeats_used,
+                            &structure_progress_done,
+                            structure_notify_step,
+                            structure_task_total,
+                            structure_prior_display_len,
+                            progress_callback_parallel,
+                        )
                     })
                     .collect::<Vec<Result<(), String>>>()
             })
         } else {
-            for (slot, (ui, prepared)) in representative_prepared.iter().enumerate() {
-                let unit_seed = seed
-                    ^ ((*ui as u64).wrapping_mul(0xD134_2543_DE82_EF95))
-                    ^ ((slot as u64).wrapping_mul(0xA24B_AED4_963E_E407));
-                let unit_out = collect_rule_structure_posterior_for_unit_adaptive(
-                    prepared,
+            for (chunk_idx, chunk) in representative_prepared
+                .chunks(structure_chunk_units)
+                .enumerate()
+            {
+                process_structure_prior_unit_chunk(
+                    chunk_idx.saturating_mul(structure_chunk_units),
+                    chunk,
                     train_fit.residualized_y.as_slice(),
                     test_fit.residualized_y.as_slice(),
                     split_applied,
                     posterior_beam_params.clone(),
                     &structure_prior_cfg,
-                    unit_seed,
+                    seed,
+                    &structure_scores,
+                    &structure_repeats_used,
+                    &structure_progress_done,
+                    structure_notify_step,
+                    structure_task_total,
+                    structure_prior_display_len,
+                    progress_callback.as_ref(),
                 )?;
-                structure_repeats_used.fetch_add(unit_out.repeats_used, Ordering::Relaxed);
-                let alpha_meta = {
-                    let mut guard = structure_scores
-                        .lock()
-                        .map_err(|_| "GARFIELD structure prior mutex poisoned".to_string())?;
-                    guard.merge_from(&unit_out.calibrator);
-                    format_structure_alpha_meta(
-                        &guard,
-                        &structure_prior_cfg,
-                        structure_prior_display_len,
-                    )
-                };
-                let done = structure_progress_done.fetch_add(1, Ordering::Relaxed) + 1;
-                if done % structure_notify_step == 0 || done == structure_task_total {
-                    garfield_stage_progress_notify(
-                        progress_callback.as_ref(),
-                        "structure_prior",
-                        done,
-                        structure_task_total.max(1),
-                        Some(alpha_meta.as_str()),
-                    )
-                    .map_err(|e| e.to_string())?;
-                }
             }
             Vec::<Result<(), String>>::new()
         }
@@ -6899,6 +7185,7 @@ fn garfield_logic_search_bed_owned(
         allow_parallel: true,
         ..beam_params.clone()
     };
+    let scan_chunk_units = garfield_scan_unit_coalesce_max_units();
     let skipped_messages = Arc::new(Mutex::new(Vec::<String>::new()));
     let unit_results = if unit_parallel_threads > 1 {
         let pool = ThreadPoolBuilder::new()
@@ -6908,12 +7195,11 @@ fn garfield_logic_search_bed_owned(
         let skipped_messages_parallel = skipped_messages.clone();
         pool.install(|| {
             scan_unit_indices
-                .par_iter()
-                .map(|&ui| {
-                    let unit = &units[ui];
-                    let out = match evaluate_logic_unit_continuous(
-                        ui,
-                        unit,
+                .par_chunks(scan_chunk_units)
+                .map(|chunk_unit_indices| {
+                    process_scan_unit_chunk_continuous(
+                        chunk_unit_indices,
+                        units.as_slice(),
                         response,
                         engine,
                         importance,
@@ -6931,43 +7217,23 @@ fn garfield_logic_search_bed_owned(
                         scan_beam_params.clone(),
                         top_rules_per_unit,
                         &unit_kind_lc,
-                    ) {
-                        Ok(v) => v,
-                        Err(err) if is_no_valid_initial_literals_error(&err) => {
-                            let msg = format_skipped_unit_message("scan", &unit.label, &err);
-                            skipped_messages_parallel
-                                .lock()
-                                .map_err(|_| {
-                                    "GARFIELD skipped-messages mutex poisoned".to_string()
-                                })?
-                                .push(msg);
-                            Vec::new()
-                        }
-                        Err(err) => return Err(err),
-                    };
-                    let done = scan_progress_done.fetch_add(1, Ordering::Relaxed) + 1;
-                    if done % scan_notify_step == 0 || done == scanned_units {
-                        garfield_stage_progress_notify(
-                            progress_callback_parallel,
-                            "scan",
-                            done,
-                            scanned_units.max(1),
-                            None,
-                        )
-                        .map_err(|e| e.to_string())?;
-                    }
-                    Ok(out)
+                        progress_callback_parallel,
+                        &scan_progress_done,
+                        scan_notify_step,
+                        scanned_units,
+                        &skipped_messages_parallel,
+                    )
                 })
-                .collect::<Vec<Result<Vec<GarfieldLogicRuleRecord>, String>>>()
+                .collect::<Vec<Result<Vec<Vec<GarfieldLogicRuleRecord>>, String>>>()
         })
     } else {
-        let mut out =
-            Vec::<Result<Vec<GarfieldLogicRuleRecord>, String>>::with_capacity(scanned_units);
-        for &ui in scan_unit_indices.iter() {
-            let unit = &units[ui];
-            let unit_out = match evaluate_logic_unit_continuous(
-                ui,
-                unit,
+        let mut out = Vec::<Result<Vec<Vec<GarfieldLogicRuleRecord>>, String>>::with_capacity(
+            scan_unit_indices.len().div_ceil(scan_chunk_units),
+        );
+        for chunk_unit_indices in scan_unit_indices.chunks(scan_chunk_units) {
+            let chunk_out = process_scan_unit_chunk_continuous(
+                chunk_unit_indices,
+                units.as_slice(),
                 response,
                 engine,
                 importance,
@@ -6985,35 +7251,21 @@ fn garfield_logic_search_bed_owned(
                 scan_beam_params.clone(),
                 top_rules_per_unit,
                 &unit_kind_lc,
-            ) {
-                Ok(v) => Ok(v),
-                Err(err) if is_no_valid_initial_literals_error(&err) => {
-                    skipped_messages
-                        .lock()
-                        .map_err(|_| "GARFIELD skipped-messages mutex poisoned".to_string())?
-                        .push(format_skipped_unit_message("scan", &unit.label, &err));
-                    Ok(Vec::new())
-                }
-                Err(err) => Err(err),
-            };
-            let done = scan_progress_done.fetch_add(1, Ordering::Relaxed) + 1;
-            if done % scan_notify_step == 0 || done == scanned_units {
-                garfield_stage_progress_notify(
-                    progress_callback.as_ref(),
-                    "scan",
-                    done,
-                    scanned_units.max(1),
-                    None,
-                )
-                .map_err(|e| e.to_string())?;
-            }
-            out.push(unit_out);
+                progress_callback.as_ref(),
+                &scan_progress_done,
+                scan_notify_step,
+                scanned_units,
+                &skipped_messages,
+            );
+            out.push(chunk_out);
         }
         out
     };
     let mut records = Vec::<GarfieldLogicRuleRecord>::new();
-    for unit_out in unit_results.into_iter() {
-        records.extend(unit_out?);
+    for chunk_out in unit_results.into_iter() {
+        for unit_out in chunk_out? {
+            records.extend(unit_out);
+        }
     }
     let skipped_messages = Arc::try_unwrap(skipped_messages)
         .map_err(|_| "GARFIELD skipped-messages still shared".to_string())?

@@ -220,6 +220,9 @@ pub(crate) enum GarfieldCenteredGainBackendMode {
     Auto,
 }
 
+const DEFAULT_AUTO_GPU_MIN_ROWS: usize = 128;
+const DEFAULT_AUTO_GPU_MIN_WORK_WORDS: usize = 4_096;
+
 #[derive(Clone, Debug)]
 struct SingletonScoreDiffMetrics {
     max_abs_score_diff: f64,
@@ -394,6 +397,33 @@ fn centered_gain_backend_mode_name(mode: GarfieldCenteredGainBackendMode) -> &'s
     }
 }
 
+#[inline]
+fn parse_env_usize(name: &str) -> Option<usize> {
+    env::var(name)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+}
+
+#[inline]
+fn auto_gpu_min_rows() -> usize {
+    parse_env_usize("JX_GARFIELD_SCORE_AUTO_GPU_MIN_ROWS").unwrap_or(DEFAULT_AUTO_GPU_MIN_ROWS)
+}
+
+#[inline]
+fn auto_gpu_min_work_words() -> usize {
+    parse_env_usize("JX_GARFIELD_SCORE_AUTO_GPU_MIN_WORK_WORDS")
+        .unwrap_or(DEFAULT_AUTO_GPU_MIN_WORK_WORDS)
+}
+
+#[inline]
+fn auto_backend_should_try_gpu(n_rows: usize, row_words: usize) -> bool {
+    let min_rows = auto_gpu_min_rows();
+    let min_work_words = auto_gpu_min_work_words();
+    let rows_ok = min_rows == 0 || n_rows >= min_rows;
+    let work_ok = min_work_words == 0 || n_rows.saturating_mul(row_words) >= min_work_words;
+    rows_ok && work_ok
+}
+
 #[derive(Clone, Debug)]
 struct GarfieldMetalRuntimeStatus {
     compiled_with_metal_gpu_feature: bool,
@@ -511,16 +541,25 @@ pub(crate) fn score_cont_centered_gain_singletons_packed_with_backend(
         GarfieldCenteredGainBackendMode::Auto => {
             #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
             {
-                match score_cont_centered_gain_singletons_packed_gpu_impl(
-                    y, bits_flat, row_words, n_rows, n_samples,
-                ) {
-                    Ok(scores) => Ok((scores, "gpu")),
-                    Err(_) => Ok((
+                if auto_backend_should_try_gpu(n_rows, row_words) {
+                    match score_cont_centered_gain_singletons_packed_gpu_impl(
+                        y, bits_flat, row_words, n_rows, n_samples,
+                    ) {
+                        Ok(scores) => Ok((scores, "gpu")),
+                        Err(_) => Ok((
+                            score_cont_centered_gain_singletons_packed_cpu_impl(
+                                y, bits_flat, row_words, n_rows, n_samples,
+                            )?,
+                            "cpu",
+                        )),
+                    }
+                } else {
+                    Ok((
                         score_cont_centered_gain_singletons_packed_cpu_impl(
                             y, bits_flat, row_words, n_rows, n_samples,
                         )?,
                         "cpu",
-                    )),
+                    ))
                 }
             }
             #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
@@ -695,7 +734,7 @@ mod metal_impl {
     use std::mem::size_of;
     use std::ptr;
 
-    use super::{GpuRunMeta, GPU_Y_PRECISION_NOTE};
+    use super::{build_y_word_sums_f32, GpuRunMeta, GPU_Y_PRECISION_NOTE};
 
     #[repr(C)]
     #[derive(Clone, Copy, Debug)]
@@ -859,6 +898,13 @@ mod metal_impl {
         cached_bits_len: usize,
         cached_y_word_ptr: usize,
         cached_y_word_len: usize,
+        cached_y_src_ptr: usize,
+        cached_y_src_len: usize,
+        cached_y_src_row_words: usize,
+        cached_y_src_n_samples: usize,
+        cached_y_host: Vec<f32>,
+        cached_y_word_sum_host: Vec<f32>,
+        cached_y_total_sum: f64,
     }
 
     thread_local! {
@@ -917,6 +963,13 @@ mod metal_impl {
                 cached_bits_len: 0,
                 cached_y_word_ptr: 0,
                 cached_y_word_len: 0,
+                cached_y_src_ptr: 0,
+                cached_y_src_len: 0,
+                cached_y_src_row_words: 0,
+                cached_y_src_n_samples: 0,
+                cached_y_host: Vec::new(),
+                cached_y_word_sum_host: Vec::new(),
+                cached_y_total_sum: 0.0,
             })
         }
 
@@ -1069,6 +1122,128 @@ mod metal_impl {
             self.cached_y_word_len = y_word_sums.len();
         }
 
+        fn ensure_cached_y_host(&mut self, y: &[f64], row_words: usize, n_samples: usize) {
+            let src_ptr = y.as_ptr() as usize;
+            let cache_hit = self.cached_y_src_ptr == src_ptr
+                && self.cached_y_src_len == y.len()
+                && self.cached_y_src_row_words == row_words
+                && self.cached_y_src_n_samples == n_samples;
+            if !cache_hit {
+                self.cached_y_host.clear();
+                self.cached_y_host.reserve(n_samples);
+                let mut total_sum = 0.0f64;
+                for &value in y.iter().take(n_samples) {
+                    let value_f32 = value as f32;
+                    self.cached_y_host.push(value_f32);
+                    total_sum += value_f32 as f64;
+                }
+                self.cached_y_total_sum = total_sum;
+                self.cached_y_word_sum_host =
+                    build_y_word_sums_f32(self.cached_y_host.as_slice(), row_words, n_samples);
+                self.cached_y_src_ptr = src_ptr;
+                self.cached_y_src_len = y.len();
+                self.cached_y_src_row_words = row_words;
+                self.cached_y_src_n_samples = n_samples;
+            }
+        }
+
+        fn upload_cached_y_if_needed(&mut self) {
+            let ptr = self.cached_y_host.as_ptr();
+            let len = self.cached_y_host.len();
+            let y = unsafe { std::slice::from_raw_parts(ptr, len) };
+            self.upload_y_if_needed(y);
+        }
+
+        fn upload_cached_y_word_sums_if_needed(&mut self) {
+            let ptr = self.cached_y_word_sum_host.as_ptr();
+            let len = self.cached_y_word_sum_host.len();
+            let y_word_sums = unsafe { std::slice::from_raw_parts(ptr, len) };
+            self.upload_y_word_sums_if_needed(y_word_sums);
+        }
+
+        fn dispatch_sum_hit_n_hit_optimized(
+            &mut self,
+            row_words: usize,
+            n_rows: usize,
+            n_samples: usize,
+        ) -> Result<(Vec<f64>, Vec<u32>, GpuRunMeta), String> {
+            if n_rows == 0 {
+                let (_tg, width) = self.choose_opt_threadgroup(row_words);
+                return Ok((
+                    Vec::new(),
+                    Vec::new(),
+                    GpuRunMeta {
+                        variant: "optimized",
+                        y_precision: GPU_Y_PRECISION_NOTE,
+                        actual_threads_per_threadgroup: 1,
+                        thread_execution_width: width,
+                    },
+                ));
+            }
+
+            self.ensure_output_buffers(n_rows);
+
+            let prm = ScoreParams {
+                n_rows: n_rows as u32,
+                row_words: row_words as u32,
+                n_samples: n_samples as u32,
+                _pad: 0,
+            };
+
+            let (tg, width) = self.choose_opt_threadgroup(row_words);
+            let cmd = self.queue.new_command_buffer();
+            let enc = cmd.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&self.pipeline_opt);
+            enc.set_buffer(0, self.y_buf.as_ref().map(|v| &**v), 0);
+            enc.set_buffer(1, self.bits_buf.as_ref().map(|v| &**v), 0);
+            enc.set_buffer(2, self.y_word_sum_buf.as_ref().map(|v| &**v), 0);
+            enc.set_buffer(3, self.sum_buf.as_ref().map(|v| &**v), 0);
+            enc.set_buffer(4, self.n_hit_buf.as_ref().map(|v| &**v), 0);
+            enc.set_bytes(
+                5,
+                size_of::<ScoreParams>() as u64,
+                &prm as *const ScoreParams as *const c_void,
+            );
+            enc.dispatch_thread_groups(
+                MTLSize::new(n_rows as u64, 1, 1),
+                MTLSize::new(tg as u64, 1, 1),
+            );
+            enc.end_encoding();
+            cmd.commit();
+            cmd.wait_until_completed();
+
+            let mut sum_hit_f32 = vec![0.0f32; n_rows];
+            let mut n_hit = vec![0u32; n_rows];
+            let sum_buf = self.sum_buf.as_ref().expect("sum buffer allocated");
+            let n_hit_buf = self.n_hit_buf.as_ref().expect("n_hit buffer allocated");
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    sum_buf.contents() as *const f32,
+                    sum_hit_f32.as_mut_ptr(),
+                    n_rows,
+                );
+                ptr::copy_nonoverlapping(
+                    n_hit_buf.contents() as *const u32,
+                    n_hit.as_mut_ptr(),
+                    n_rows,
+                );
+            }
+            let sum_hit = sum_hit_f32
+                .into_iter()
+                .map(|v| v as f64)
+                .collect::<Vec<_>>();
+            Ok((
+                sum_hit,
+                n_hit,
+                GpuRunMeta {
+                    variant: "optimized",
+                    y_precision: GPU_Y_PRECISION_NOTE,
+                    actual_threads_per_threadgroup: tg,
+                    thread_execution_width: width,
+                },
+            ))
+        }
+
         pub(crate) fn run_sum_hit_n_hit_legacy(
             &self,
             y: &[f32],
@@ -1199,67 +1374,25 @@ mod metal_impl {
             self.upload_y_if_needed(y);
             self.upload_bits_if_needed(bits_flat);
             self.upload_y_word_sums_if_needed(y_word_sums);
-            self.ensure_output_buffers(n_rows);
+            self.dispatch_sum_hit_n_hit_optimized(row_words, n_rows, n_samples)
+        }
 
-            let prm = ScoreParams {
-                n_rows: n_rows as u32,
-                row_words: row_words as u32,
-                n_samples: n_samples as u32,
-                _pad: 0,
-            };
-
-            let (tg, width) = self.choose_opt_threadgroup(row_words);
-            let cmd = self.queue.new_command_buffer();
-            let enc = cmd.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(&self.pipeline_opt);
-            enc.set_buffer(0, self.y_buf.as_ref().map(|v| &**v), 0);
-            enc.set_buffer(1, self.bits_buf.as_ref().map(|v| &**v), 0);
-            enc.set_buffer(2, self.y_word_sum_buf.as_ref().map(|v| &**v), 0);
-            enc.set_buffer(3, self.sum_buf.as_ref().map(|v| &**v), 0);
-            enc.set_buffer(4, self.n_hit_buf.as_ref().map(|v| &**v), 0);
-            enc.set_bytes(
-                5,
-                size_of::<ScoreParams>() as u64,
-                &prm as *const ScoreParams as *const c_void,
-            );
-            enc.dispatch_thread_groups(
-                MTLSize::new(n_rows as u64, 1, 1),
-                MTLSize::new(tg as u64, 1, 1),
-            );
-            enc.end_encoding();
-            cmd.commit();
-            cmd.wait_until_completed();
-
-            let mut sum_hit_f32 = vec![0.0f32; n_rows];
-            let mut n_hit = vec![0u32; n_rows];
-            let sum_buf = self.sum_buf.as_ref().expect("sum buffer allocated");
-            let n_hit_buf = self.n_hit_buf.as_ref().expect("n_hit buffer allocated");
-            unsafe {
-                ptr::copy_nonoverlapping(
-                    sum_buf.contents() as *const f32,
-                    sum_hit_f32.as_mut_ptr(),
-                    n_rows,
-                );
-                ptr::copy_nonoverlapping(
-                    n_hit_buf.contents() as *const u32,
-                    n_hit.as_mut_ptr(),
-                    n_rows,
-                );
-            }
-            let sum_hit = sum_hit_f32
-                .into_iter()
-                .map(|v| v as f64)
-                .collect::<Vec<_>>();
-            Ok((
-                sum_hit,
-                n_hit,
-                GpuRunMeta {
-                    variant: "optimized",
-                    y_precision: GPU_Y_PRECISION_NOTE,
-                    actual_threads_per_threadgroup: tg,
-                    thread_execution_width: width,
-                },
-            ))
+        pub(crate) fn run_sum_hit_n_hit_optimized_from_f64(
+            &mut self,
+            y: &[f64],
+            bits_flat: &[u64],
+            row_words: usize,
+            n_rows: usize,
+            n_samples: usize,
+        ) -> Result<(Vec<f64>, Vec<u32>, f64, GpuRunMeta), String> {
+            self.ensure_cached_y_host(y, row_words, n_samples);
+            let total_sum = self.cached_y_total_sum;
+            self.upload_cached_y_if_needed();
+            self.upload_bits_if_needed(bits_flat);
+            self.upload_cached_y_word_sums_if_needed();
+            let (sum_hit, n_hit, meta) =
+                self.dispatch_sum_hit_n_hit_optimized(row_words, n_rows, n_samples)?;
+            Ok((sum_hit, n_hit, total_sum, meta))
         }
     }
 
@@ -1320,28 +1453,17 @@ fn score_cont_centered_gain_batch_packed_metal_impl(
             row_words
         ));
     }
-    let y_f32 = y
-        .iter()
-        .take(n_samples)
-        .map(|v| *v as f32)
-        .collect::<Vec<_>>();
-    let total_sum = y_f32.iter().map(|v| *v as f64).sum::<f64>();
     #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
     {
         return autoreleasepool(|| {
-            let y_word_sums = build_y_word_sums_f32(y_f32.as_slice(), row_words, n_samples);
-            let (sum_hit, n_hit, device_name, meta) =
+            let (sum_hit, n_hit, total_sum, device_name, meta) =
                 metal_impl::with_thread_local_batch(threads_per_threadgroup, |scanner| {
                     let device_name = scanner.device_name().to_string();
-                    let (sum_hit, n_hit, meta) = scanner.run_sum_hit_n_hit_optimized(
-                        y_f32.as_slice(),
-                        bits_flat,
-                        y_word_sums.as_slice(),
-                        row_words,
-                        n_rows,
-                        n_samples,
-                    )?;
-                    Ok((sum_hit, n_hit, device_name, meta))
+                    let (sum_hit, n_hit, total_sum, meta) = scanner
+                        .run_sum_hit_n_hit_optimized_from_f64(
+                            y, bits_flat, row_words, n_rows, n_samples,
+                        )?;
+                    Ok((sum_hit, n_hit, total_sum, device_name, meta))
                 })?;
             let parts =
                 build_score_parts_from_sum_hit(sum_hit, n_hit, n_samples, total_sum, row_words);
@@ -1442,8 +1564,6 @@ pub fn garfield_compare_score_cont_centered_gain_batch_metal_vs_cpu_py<'py>(
                 .collect::<Vec<_>>();
             #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
             let y_f32 = y_f32_as_f64.iter().map(|v| *v as f32).collect::<Vec<_>>();
-            #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-            let y_word_sums = build_y_word_sums_f32(y_f32.as_slice(), row_words, n_samples);
             let mut cpu_last: Option<BatchScoreParts> = None;
             let mut gpu_legacy_last: Option<BatchScoreParts> = None;
             let mut gpu_opt_last: Option<BatchScoreParts> = None;
@@ -1485,14 +1605,10 @@ pub fn garfield_compare_score_cont_centered_gain_batch_metal_vs_cpu_py<'py>(
                         total_sum,
                         row_words,
                     );
-                    let (sum_hit_opt, n_hit_opt, _opt_meta) = scanner.run_sum_hit_n_hit_optimized(
-                        y_f32.as_slice(),
-                        bits_flat,
-                        y_word_sums.as_slice(),
-                        row_words,
-                        n_rows,
-                        n_samples,
-                    )?;
+                    let (sum_hit_opt, n_hit_opt, _opt_total_sum, _opt_meta) = scanner
+                        .run_sum_hit_n_hit_optimized_from_f64(
+                            yv, bits_flat, row_words, n_rows, n_samples,
+                        )?;
                     let _ = build_score_parts_from_sum_hit(
                         sum_hit_opt,
                         n_hit_opt,
@@ -1548,14 +1664,10 @@ pub fn garfield_compare_score_cont_centered_gain_batch_metal_vs_cpu_py<'py>(
 
                 let t2 = Instant::now();
                 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-                let (sum_hit_opt, n_hit_opt, opt_meta) = scanner.run_sum_hit_n_hit_optimized(
-                    y_f32.as_slice(),
-                    bits_flat,
-                    y_word_sums.as_slice(),
-                    row_words,
-                    n_rows,
-                    n_samples,
-                )?;
+                let (sum_hit_opt, n_hit_opt, _opt_total_sum, opt_meta) = scanner
+                    .run_sum_hit_n_hit_optimized_from_f64(
+                        yv, bits_flat, row_words, n_rows, n_samples,
+                    )?;
                 #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
                 let (sum_hit_opt, n_hit_opt, opt_meta) = (
                     Vec::new(),

@@ -256,6 +256,55 @@ impl GwasAssocTsvWriter {
         Ok(sites.len())
     }
 
+    /// Append pre-formatted TSV text (e.g. from fvlmm_assoc_chunk_from_snp_to_tsv_f32).
+    /// The text must NOT contain a header line.
+    fn append_text(&mut self, text: String, has_plrt: bool, rows: usize) -> PyResult<()> {
+        if rows == 0 || text.is_empty() {
+            return Ok(());
+        }
+        match self.with_plrt {
+            None => {
+                self.with_plrt = Some(has_plrt);
+                let header: &[u8] = if has_plrt {
+                    b"chrom\tpos\tsnp\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n"
+                } else {
+                    b"chrom\tpos\tsnp\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\n"
+                };
+                self.writer = Some(
+                    AsyncTsvWriter::with_config(&self.path, header, 64 * 1024 * 1024, 16)
+                        .map_err(PyIOError::new_err)?,
+                );
+            }
+            Some(prev) => {
+                if prev != has_plrt {
+                    return Err(PyValueError::new_err(
+                        "inconsistent results columns across chunks",
+                    ));
+                }
+            }
+        }
+        self.rows_written = self.rows_written.saturating_add(rows);
+        if let Some(ref w) = self.writer {
+            w.send(text.into_bytes()).map_err(PyIOError::new_err)?;
+        }
+        Ok(())
+    }
+
+    /// Send a raw byte block to the writer. The writer must already be initialized
+    /// (via a prior `append_text` call).
+    fn send_block(&mut self, data: Vec<u8>) -> PyResult<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        match self.writer.as_ref() {
+            Some(w) => w.send(data).map_err(PyIOError::new_err)?,
+            None => return Err(PyRuntimeError::new_err(
+                "send_block called before writer is initialized (call append_text first)",
+            )),
+        }
+        Ok(())
+    }
+
     fn flush(&mut self) -> PyResult<()> {
         self.send_pending_block()?;
         Ok(())
@@ -794,7 +843,7 @@ impl SiteFilterExpr {
 }
 
 #[inline]
-fn sample_indices_are_identity(indices: &[usize]) -> bool {
+pub(crate) fn sample_indices_are_identity(indices: &[usize]) -> bool {
     indices.iter().enumerate().all(|(i, &idx)| idx == i)
 }
 
@@ -3159,8 +3208,8 @@ impl BedChunkReader {
                 return None;
             };
             if snps_only
-                && (!_is_simple_snp_allele(&site.ref_allele)
-                    || !_is_simple_snp_allele(&site.alt_allele))
+                && (!is_simple_snp_allele(&site.ref_allele)
+                    || !is_simple_snp_allele(&site.alt_allele))
             {
                 return None;
             }
@@ -4180,8 +4229,8 @@ pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples(
                 het_threshold,
             );
             let pass_snp = if snps_only {
-                _is_simple_snp_allele(&sites_all[i].ref_allele)
-                    && _is_simple_snp_allele(&sites_all[i].alt_allele)
+                is_simple_snp_allele(&sites_all[i].ref_allele)
+                    && is_simple_snp_allele(&sites_all[i].alt_allele)
             } else {
                 true
             };
@@ -4359,8 +4408,8 @@ pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples_pure_line(
                 max_missing_rate,
             );
             let pass_snp = if snps_only {
-                _is_simple_snp_allele(&sites_all[i].ref_allele)
-                    && _is_simple_snp_allele(&sites_all[i].alt_allele)
+                is_simple_snp_allele(&sites_all[i].ref_allele)
+                    && is_simple_snp_allele(&sites_all[i].alt_allele)
             } else {
                 true
             };
@@ -4984,7 +5033,7 @@ pub fn scan_bed_2bit_packed_stats<'py>(
 }
 
 #[inline]
-fn _is_simple_snp_allele(a: &str) -> bool {
+pub(crate) fn is_simple_snp_allele(a: &str) -> bool {
     let t = a.trim().to_ascii_uppercase();
     if t.len() != 1 {
         return false;

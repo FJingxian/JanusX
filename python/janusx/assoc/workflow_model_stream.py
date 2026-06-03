@@ -868,6 +868,20 @@ def run_chunked_gwas_lmm_lm(
             genetic_model=str(genetic_model),
         )
 
+        _use_fvlmm_tsv_fastpath = (
+            str(model_name).lower() == "fvlmm"
+            and hasattr(jxrs, "fvlmm_assoc_chunk_from_snp_to_tsv_f32")
+            and use_rust_assoc_writer
+            and hasattr(writer, "append_text")
+            and os.environ.get("JX_DISABLE_FVLMM_TSV_FASTPATH") != "1"
+        )
+
+        _use_fvlmm_unified = (
+            str(model_name).lower() == "fvlmm"
+            and hasattr(jxrs, "fvlmm_assoc_bed_to_tsv_f32")
+            and os.environ.get("JX_DISABLE_FVLMM_UNIFIED") != "1"
+        )
+
         def _format_chunk_tsv_text(
             results: np.ndarray,
             info_chunk: list[tuple[str, int, str, str]],
@@ -979,124 +993,203 @@ def run_chunked_gwas_lmm_lm(
             else _gwas_scan_stage_ctx
         )
         with scan_stage_ctx(scan_threads):
-            ex = cf.ThreadPoolExecutor(max_workers=workers)
-            try:
+            if _use_fvlmm_unified:
+                # Unified FvLMM path: single Rust call replaces entire chunk loop.
+                # The Rust function mmaps BED, filters SNPs, and runs the full
+                # triple-buffer pipeline (decode -> rotate -> assoc -> TSV write).
                 bed_prefix = _as_plink_prefix(genofile)
                 if bed_prefix is None:
                     raise RuntimeError(
                         "Rust-only GWAS scan requires PLINK BED input/prefix."
                     )
-                if not hasattr(jxrs, "BedChunkReader"):
-                    raise RuntimeError(
-                        "Rust-only GWAS scan requires rust symbol BedChunkReader."
-                    )
-                bed_reader = _new_bed_chunk_reader_for_stream(
+                sample_ids = [str(s) for s in sample_sub]
+                rows_written, _pve, _log_det_v = jxrs.fvlmm_assoc_bed_to_tsv_f32(
                     bed_prefix=str(bed_prefix),
-                    maf_threshold=float(maf_threshold),
-                    max_missing_rate=float(max_missing_rate),
-                    sample_ids=sample_sub.tolist(),
-                    model=str(genetic_model),
-                    het_threshold=float(het_threshold),
-                    mmap_window_mb=(int(mmap_window_mb) if mmap_window_mb is not None else None),
-                    logger=logger,
+                    out_tsv=str(tmp_tsv),
+                    s=np.ascontiguousarray(mod.S, dtype=np.float64),
+                    xcov=np.ascontiguousarray(mod.Xcov, dtype=np.float64),
+                    y_rot=np.ascontiguousarray(mod.y, dtype=np.float64).ravel(),
+                    log10_lbd=float(np.log10(float(mod.lbd_null))),
+                    u_t=np.ascontiguousarray(mod.Dh, dtype=np.float32),
+                    maf_thr=float(maf_threshold),
+                    miss_thr=float(max_missing_rate),
+                    het_thr=float(het_threshold),
+                    genetic_model=str(genetic_model),
+                    snps_only=bool(snps_only),
+                    sample_ids=sample_ids,
+                    threads=int(scan_threads),
+                    nullml=mod.ML0,
                 )
-                if not hasattr(bed_reader, "next_chunk_prepared"):
-                    raise RuntimeError(
-                        "Rust-only GWAS scan requires BedChunkReader.next_chunk_prepared."
-                    )
-                while True:
-                    out, legacy_snps_only = _bed_next_chunk_prepared_compat(
-                        bed_reader=bed_reader,
-                        chunk_size=int(model_chunk_size),
-                        coding=str(genetic_model),
-                        snps_only=bool(snps_only),
+                done_snps = int(rows_written)
+                has_results = done_snps > 0
+                mem_info = process.memory_info()
+                peak_rss = max(peak_rss, mem_info.rss)
+                if pbar is not None:
+                    pbar.update(int(done_snps))
+                    pbar.finish()
+            else:
+                ex = cf.ThreadPoolExecutor(max_workers=workers)
+                try:
+                    bed_prefix = _as_plink_prefix(genofile)
+                    if bed_prefix is None:
+                        raise RuntimeError(
+                            "Rust-only GWAS scan requires PLINK BED input/prefix."
+                        )
+                    if not hasattr(jxrs, "BedChunkReader"):
+                        raise RuntimeError(
+                            "Rust-only GWAS scan requires rust symbol BedChunkReader."
+                        )
+                    bed_reader = _new_bed_chunk_reader_for_stream(
+                        bed_prefix=str(bed_prefix),
+                        maf_threshold=float(maf_threshold),
+                        max_missing_rate=float(max_missing_rate),
+                        sample_ids=sample_sub.tolist(),
+                        model=str(genetic_model),
+                        het_threshold=float(het_threshold),
+                        mmap_window_mb=(int(mmap_window_mb) if mmap_window_mb is not None else None),
                         logger=logger,
                     )
-                    if out is None:
-                        break
-                    geno_center_raw, sites, maf_chunk_raw, miss_chunk_raw = out
-                    geno_center = np.ascontiguousarray(
-                        np.asarray(geno_center_raw, dtype=np.float32),
-                        dtype=np.float32,
-                    )
-                    maf_chunk = np.asarray(maf_chunk_raw, dtype=np.float32).reshape(-1)
-                    miss_chunk = np.asarray(miss_chunk_raw, dtype=np.float32).reshape(-1)
-                    if legacy_snps_only and bool(snps_only):
-                        geno_center, maf_chunk, sites = _filter_snps_only_chunk_python_fallback(
-                            geno_center=geno_center,
-                            maf_chunk=maf_chunk,
-                            sites=sites,
+                    if not hasattr(bed_reader, "next_chunk_prepared"):
+                        raise RuntimeError(
+                            "Rust-only GWAS scan requires BedChunkReader.next_chunk_prepared."
                         )
-                        miss_chunk = miss_chunk[: int(maf_chunk.shape[0])]
+                    while True:
+                        out, legacy_snps_only = _bed_next_chunk_prepared_compat(
+                            bed_reader=bed_reader,
+                            chunk_size=int(model_chunk_size),
+                            coding=str(genetic_model),
+                            snps_only=bool(snps_only),
+                            logger=logger,
+                        )
+                        if out is None:
+                            break
+                        geno_center_raw, sites, maf_chunk_raw, miss_chunk_raw = out
+                        geno_center = np.ascontiguousarray(
+                            np.asarray(geno_center_raw, dtype=np.float32),
+                            dtype=np.float32,
+                        )
+                        maf_chunk = np.asarray(maf_chunk_raw, dtype=np.float32).reshape(-1)
+                        miss_chunk = np.asarray(miss_chunk_raw, dtype=np.float32).reshape(-1)
+                        if legacy_snps_only and bool(snps_only):
+                            geno_center, maf_chunk, sites = _filter_snps_only_chunk_python_fallback(
+                                geno_center=geno_center,
+                                maf_chunk=maf_chunk,
+                                sites=sites,
+                            )
+                            miss_chunk = miss_chunk[: int(maf_chunk.shape[0])]
 
-                    m_chunk = int(geno_center.shape[0])
-                    if m_chunk == 0:
-                        continue
+                        m_chunk = int(geno_center.shape[0])
+                        if m_chunk == 0:
+                            continue
 
-                    if len(sites) == 0:
-                        continue
-                    snp_chunk = _resolve_stream_chunk_snp_names(list(sites))
-                    meta_chunk: object
+                        if len(sites) == 0:
+                            continue
+                        snp_chunk = _resolve_stream_chunk_snp_names(list(sites))
+                        meta_chunk: object
+                        if use_rust_assoc_writer:
+                            meta_chunk = sites
+                        else:
+                            raise RuntimeError("Rust-only GWAS mode requires Rust TSV writer path.")
+
+                        if _use_fvlmm_tsv_fastpath:
+                            # All-Rust pipeline: rotate + assoc + TSV formatting in one call.
+                            # No ThreadPoolExecutor — internal BLAS + Rayon threads provide parallelism.
+                            chroms = [s.chrom for s in sites]
+                            poss = [s.pos for s in sites]
+                            allele0s = [s.ref_allele for s in sites]
+                            allele1s = [s.alt_allele for s in sites]
+                            blocks, n_rows = jxrs.fvlmm_assoc_chunk_from_snp_to_tsv_f32(
+                                np.ascontiguousarray(mod.S, dtype=np.float64),
+                                np.ascontiguousarray(mod.Xcov, dtype=np.float64),
+                                np.ascontiguousarray(mod.y, dtype=np.float64).ravel(),
+                                float(np.log10(float(mod.lbd_null))),
+                                geno_center,
+                                np.ascontiguousarray(mod.Dh, dtype=np.float32),
+                                chroms,
+                                poss,
+                                snp_chunk,
+                                allele0s,
+                                allele1s,
+                                np.asarray(maf_chunk, dtype=np.float32).ravel().tolist(),
+                                np.asarray(miss_chunk, dtype=np.float32).ravel().tolist(),
+                                threads=scan_threads,
+                                nullml=mod.ML0,
+                            )
+                            if blocks is not None and len(blocks) > 0:
+                                block0 = blocks[0]
+                                if isinstance(block0, memoryview):
+                                    block0 = bytes(block0)
+                                writer.append_text(
+                                    block0.decode("utf-8") if isinstance(block0, bytes) else block0,
+                                    has_plrt=(mod.ML0 is not None),
+                                    rows=int(n_rows),
+                                )
+                                for blk in blocks[1:]:
+                                    if isinstance(blk, memoryview):
+                                        blk = bytes(blk)
+                                    writer.send_block(blk if isinstance(blk, bytes) else blk.encode("utf-8"))
+                            done_snps += int(m_chunk)
+                            mem_info = process.memory_info()
+                            peak_rss = max(peak_rss, mem_info.rss)
+                            if pbar is not None:
+                                pbar.update(int(m_chunk))
+                        else:
+                            fut = ex.submit(mod.gwas, geno_center, threads=threads_per_worker)
+                            inflight[chunk_seq] = (
+                                fut,
+                                int(m_chunk),
+                                meta_chunk,
+                                snp_chunk,
+                                maf_chunk,
+                                miss_chunk,
+                            )
+                            chunk_seq += 1
+
+                            if len(inflight) >= max_inflight:
+                                _drain_completed(wait_for_one=True)
+                            else:
+                                _drain_completed(wait_for_one=False)
+
+                    if not _use_fvlmm_tsv_fastpath:
+                        while len(inflight) > 0:
+                            _drain_completed(wait_for_one=True)
+                    writer.flush()
                     if use_rust_assoc_writer:
-                        meta_chunk = sites
+                        has_results = int(writer.rows_written) > 0
+                        wrote_header = bool(has_results)
                     else:
-                        raise RuntimeError("Rust-only GWAS mode requires Rust TSV writer path.")
-
-                    fut = ex.submit(mod.gwas, geno_center, threads=threads_per_worker)
-                    inflight[chunk_seq] = (
-                        fut,
-                        int(m_chunk),
-                        meta_chunk,
-                        snp_chunk,
-                        maf_chunk,
-                        miss_chunk,
-                    )
-                    chunk_seq += 1
-
-                    if len(inflight) >= max_inflight:
-                        _drain_completed(wait_for_one=True)
-                    else:
-                        _drain_completed(wait_for_one=False)
-
-                while len(inflight) > 0:
-                    _drain_completed(wait_for_one=True)
-                writer.flush()
-                if use_rust_assoc_writer:
-                    has_results = int(writer.rows_written) > 0
-                    wrote_header = bool(has_results)
-                else:
-                    wrote_header = bool(writer.wrote_header)
-                    has_results = int(writer.rows_written) > 0
-                if pbar is not None:
-                    pbar.finish()
-            except KeyboardInterrupt:
-                interrupted = True
-                for fut, _m, _meta, _maf, _miss in inflight.values():
+                        wrote_header = bool(writer.wrote_header)
+                        has_results = int(writer.rows_written) > 0
+                    if pbar is not None:
+                        pbar.finish()
+                except KeyboardInterrupt:
+                    interrupted = True
+                    for fut, _m, _meta, _maf, _miss in inflight.values():
+                        try:
+                            fut.cancel()
+                        except Exception:
+                            pass
+                    raise
+                finally:
+                    # Always stop renderer first, then tear down workers.
+                    if scan_warmup_active and scan_warmup_task is not None:
+                        try:
+                            scan_warmup_task.__exit__(None, None, None)
+                        except Exception:
+                            pass
+                        scan_warmup_active = False
+                    if pbar is not None:
+                        pbar.close(show_done=False)
+                    ex.shutdown(wait=False, cancel_futures=True)
                     try:
-                        fut.cancel()
+                        writer.close()
                     except Exception:
                         pass
-                raise
-            finally:
-                # Always stop renderer first, then tear down workers.
-                if scan_warmup_active and scan_warmup_task is not None:
-                    try:
-                        scan_warmup_task.__exit__(None, None, None)
-                    except Exception:
-                        pass
-                    scan_warmup_active = False
-                if pbar is not None:
-                    pbar.close(show_done=False)
-                ex.shutdown(wait=False, cancel_futures=True)
-                try:
-                    writer.close()
-                except Exception:
-                    pass
-                if interrupted and os.path.exists(tmp_tsv):
-                    try:
-                        os.remove(tmp_tsv)
-                    except Exception:
-                        pass
+                    if interrupted and os.path.exists(tmp_tsv):
+                        try:
+                            os.remove(tmp_tsv)
+                        except Exception:
+                            pass
 
         cpu_t1 = process.cpu_times()
         t1 = time.time()

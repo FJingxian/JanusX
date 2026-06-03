@@ -1098,6 +1098,7 @@ def smoke_flow(outdir: Path, logdir: Path, threads: int, cv_folds: int) -> None:
             "-lmm",
             "-lm",
             "-fastlmm",
+            "-fvlmm",
             "-algwas",
             "-splmm",
             "-k",

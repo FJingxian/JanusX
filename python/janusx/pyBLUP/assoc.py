@@ -234,6 +234,8 @@ try:
         lmm_assoc_chunk_from_snp_f32 as _lmm_assoc_chunk_from_snp_f32,
         fvlmm_assoc_chunk_f32 as _fvlmm_assoc_chunk_f32,
         fvlmm_assoc_chunk_from_snp_f32 as _fvlmm_assoc_chunk_from_snp_f32,
+        fvlmm_assoc_chunk_from_snp_to_tsv_f32 as _fvlmm_assoc_chunk_from_snp_to_tsv_f32,
+        fvlmm_assoc_bed_to_tsv_f32 as _fvlmm_assoc_bed_to_tsv_f32,
         fvlmm_assoc_prepare_cache_f32 as _fvlmm_assoc_prepare_cache_f32,
         fvlmm_assoc_chunk_with_cache_f32 as _fvlmm_assoc_chunk_with_cache_f32,
         fvlmm_assoc_chunk_from_snp_with_cache_f32 as _fvlmm_assoc_chunk_from_snp_with_cache_f32,
@@ -243,6 +245,8 @@ except Exception:
     _lmm_assoc_chunk_from_snp_f32 = None
     _fvlmm_assoc_chunk_f32 = None
     _fvlmm_assoc_chunk_from_snp_f32 = None
+    _fvlmm_assoc_chunk_from_snp_to_tsv_f32 = None
+    _fvlmm_assoc_bed_to_tsv_f32 = None
     _fvlmm_assoc_prepare_cache_f32 = None
     _fvlmm_assoc_chunk_with_cache_f32 = None
     _fvlmm_assoc_chunk_from_snp_with_cache_f32 = None

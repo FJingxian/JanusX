@@ -2534,13 +2534,26 @@ fn maybe_build_dense_subset_pos(sample_idx: &[usize], n_samples_full: usize) -> 
 }
 
 #[inline]
-fn packed_rotate_block_target_bytes() -> usize {
-    let default_mb = 64usize;
-    let mb = std::env::var("JX_GWAS_ROTATE_BLOCK_MB")
+fn packed_rotate_block_target_bytes(n: usize) -> usize {
+    let mb = std::env::var("JX_PACKED_ROTATE_BLOCK_MB")
         .ok()
         .and_then(|s| s.trim().parse::<usize>().ok())
         .filter(|&v| v > 0)
-        .unwrap_or(default_mb);
+        .or_else(|| {
+            std::env::var("JX_GWAS_ROTATE_BLOCK_MB")
+                .ok()
+                .and_then(|s| s.trim().parse::<usize>().ok())
+                .filter(|&v| v > 0)
+        })
+        .unwrap_or_else(|| {
+            if n >= 8_000 {
+                256usize
+            } else if n >= 4_000 {
+                128usize
+            } else {
+                64usize
+            }
+        });
     mb.saturating_mul(1024 * 1024)
 }
 
@@ -2552,7 +2565,7 @@ fn packed_rotate_block_rows(max_rows: usize, n: usize, extra_row_bytes: usize) -
         .saturating_add(extra_row_bytes)
         .max(1);
     max_rows
-        .min((packed_rotate_block_target_bytes() / bytes_per_row).max(1))
+        .min((packed_rotate_block_target_bytes(n) / bytes_per_row).max(1))
         .max(1)
 }
 
@@ -5761,6 +5774,7 @@ pub fn fastlmm_assoc_packed_f32_to_tsv<'py>(
     fixed_lbd: Option<f64>,
     fixed_ml0: Option<f64>,
     row_indices: Option<PyReadonlyArray1<'py, i64>>,
+    rotate_block_rows: usize,
 ) -> PyResult<(f64, f64, f64)> {
     if fixed_lbd.is_none() && low >= high {
         return Err(PyRuntimeError::new_err("low must be < high"));
@@ -6120,13 +6134,17 @@ pub fn fastlmm_assoc_packed_f32_to_tsv<'py>(
             return Err(PyRuntimeError::new_err("invalid df <= 0 in packed fastlmm"));
         }
 
-        let rotate_block_rows = packed_rotate_block_rows(
-            m,
-            n,
-            out_cols
-                .saturating_mul(std::mem::size_of::<f64>())
-                .saturating_add(std::mem::size_of::<usize>()),
-        );
+        let rotate_block_rows = if rotate_block_rows > 0 {
+            rotate_block_rows.min(m).max(1)
+        } else {
+            packed_rotate_block_rows(
+                m,
+                n,
+                out_cols
+                    .saturating_mul(std::mem::size_of::<f64>())
+                    .saturating_add(std::mem::size_of::<usize>()),
+            )
+        };
 
         let mut g_block = vec![0.0_f32; rotate_block_rows * n];
         let mut rot_block = vec![0.0_f32; rotate_block_rows * n];
@@ -6402,6 +6420,7 @@ pub fn fvlmm_assoc_packed_f32_to_tsv<'py>(
     fixed_lbd: Option<f64>,
     fixed_ml0: Option<f64>,
     row_indices: Option<PyReadonlyArray1<'py, i64>>,
+    rotate_block_rows: usize,
 ) -> PyResult<(f64, f64, f64)> {
     if fixed_lbd.is_none() && low >= high {
         return Err(PyRuntimeError::new_err("low must be < high"));
@@ -6715,13 +6734,17 @@ pub fn fvlmm_assoc_packed_f32_to_tsv<'py>(
         )
         .map_err(PyRuntimeError::new_err)?;
 
-        let rotate_block_rows = packed_rotate_block_rows(
-            m,
-            n,
-            out_cols
-                .saturating_mul(std::mem::size_of::<f64>())
-                .saturating_add(std::mem::size_of::<usize>()),
-        );
+        let rotate_block_rows = if rotate_block_rows > 0 {
+            rotate_block_rows.min(m).max(1)
+        } else {
+            packed_rotate_block_rows(
+                m,
+                n,
+                out_cols
+                    .saturating_mul(std::mem::size_of::<f64>())
+                    .saturating_add(std::mem::size_of::<usize>()),
+            )
+        };
 
         let mut text_buf = String::with_capacity(rotate_block_rows * 128);
         let mut next_progress_emit = progress_block.min(m).max(1);

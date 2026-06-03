@@ -137,16 +137,54 @@ def _env_positive_int(name: str) -> Optional[int]:
     return val if val > 0 else None
 
 
-def _resolve_fvlmm_rotate_block_rows(rotate_block_rows: int) -> int:
+def _resolve_raw_snp_rotate_block_rows(
+    rotate_block_rows: int,
+    *,
+    default_rows: int,
+    env_row_names: tuple[str, ...],
+    snp_chunk: Optional[np.ndarray] = None,
+) -> int:
     """
-    Resolve the raw-SNP FvLMM projection block size.
-    An explicit environment override is useful for benchmarking the
-    projection kernel without changing the public GWAS CLI surface.
+    Resolve the raw-SNP rotation/projection block size.
+
+    Priority:
+    1) explicit environment override
+    2) explicit function argument different from the public default
+    3) otherwise use the current SNP chunk size directly so CLI --chunksize
+       controls one-shot rotate/projection size
     """
-    env_val = _env_positive_int("JX_FVLMM_ROTATE_BLOCK_ROWS")
-    if env_val is not None:
-        return int(env_val)
-    return max(1, int(rotate_block_rows))
+    for env_name in env_row_names:
+        env_val = _env_positive_int(env_name)
+        if env_val is not None:
+            return int(env_val)
+
+    base_rows = max(1, int(rotate_block_rows))
+    default_rows = max(1, int(default_rows))
+    if base_rows != default_rows:
+        return base_rows
+    if snp_chunk is None:
+        return base_rows
+    try:
+        chunk_rows = int(np.asarray(snp_chunk).shape[0])
+    except Exception:
+        return base_rows
+    if chunk_rows <= 0:
+        return base_rows
+    return max(1, int(chunk_rows))
+
+
+def _resolve_fvlmm_rotate_block_rows(
+    rotate_block_rows: int,
+    *,
+    snp_chunk: Optional[np.ndarray] = None,
+    u_t: Optional[np.ndarray] = None,
+) -> int:
+    return _resolve_raw_snp_rotate_block_rows(
+        rotate_block_rows,
+        default_rows=512,
+        env_row_names=("JX_FVLMM_ROTATE_BLOCK_ROWS",),
+        snp_chunk=snp_chunk,
+    )
 
 
 def _resolve_matrix_file_hint(matrix: object) -> Optional[str]:
@@ -721,6 +759,13 @@ def lmm_reml_from_snp(
             "Please use JX_LMM_FROM_SNP_BACKEND=rust (or auto with Rust-preferred path)."
         )
 
+    rotate_block_rows = _resolve_raw_snp_rotate_block_rows(
+        rotate_block_rows,
+        default_rows=256,
+        env_row_names=("JX_LMM_ROTATE_BLOCK_ROWS",),
+        snp_chunk=snp_chunk,
+    )
+
     low, high = bounds
     S = np.ascontiguousarray(S, dtype=np.float64).ravel()
     utx = np.ascontiguousarray(utx, dtype=np.float64)
@@ -1266,6 +1311,13 @@ def lmm_assoc_fixed_from_snp(
             "Please use JX_LMM_FROM_SNP_BACKEND=rust (or auto with Rust-preferred path)."
         )
 
+    rotate_block_rows = _resolve_raw_snp_rotate_block_rows(
+        rotate_block_rows,
+        default_rows=512,
+        env_row_names=("JX_FASTLMM_ROTATE_BLOCK_ROWS", "JX_LMM_ROTATE_BLOCK_ROWS"),
+        snp_chunk=snp_chunk,
+    )
+
     S = np.ascontiguousarray(S, dtype=np.float64).ravel()
     Xcov = np.ascontiguousarray(utx, dtype=np.float64)
     y_rot = np.ascontiguousarray(uty, dtype=np.float64).ravel()
@@ -1299,7 +1351,10 @@ def fvlmm_assoc_fixed_from_snp(
     """
     Fixed-variance LMM scan on raw SNP chunk using the BLAS-blocked Rust kernel.
     """
-    rotate_block_rows = _resolve_fvlmm_rotate_block_rows(rotate_block_rows)
+    rotate_block_rows = _resolve_fvlmm_rotate_block_rows(
+        rotate_block_rows,
+        snp_chunk=snp_chunk,
+    )
     if _fvlmm_assoc_chunk_from_snp_f32 is None:
         raise RuntimeError(
             "Rust extension missing fvlmm_assoc_chunk_from_snp_f32. "
@@ -1336,7 +1391,10 @@ def fvlmm_assoc_fixed_from_snp_with_cache(
     """
     Fixed-variance LMM scan on raw SNP chunk using a trait-level cached null model.
     """
-    rotate_block_rows = _resolve_fvlmm_rotate_block_rows(rotate_block_rows)
+    rotate_block_rows = _resolve_fvlmm_rotate_block_rows(
+        rotate_block_rows,
+        snp_chunk=snp_chunk,
+    )
     if _fvlmm_assoc_chunk_from_snp_with_cache_f32 is None:
         raise RuntimeError(
             "Rust extension missing fvlmm_assoc_chunk_from_snp_with_cache_f32. "

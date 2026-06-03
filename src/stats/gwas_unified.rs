@@ -546,6 +546,9 @@ pub fn gwas_packed_unified_to_tsv<'py>(
                 } else {
                     None
                 };
+                let rotate_block_rows: usize = opt_item(&job, "rotate_block_rows")?
+                    .and_then(|v| v.extract().ok())
+                    .unwrap_or(0usize);
 
                 let scan_fn = if model_lc == "fvlmm" {
                     fvlmm_assoc_packed_f32_to_tsv
@@ -582,6 +585,7 @@ pub fn gwas_packed_unified_to_tsv<'py>(
                     fixed_lbd,
                     fixed_ml0,
                     row_indices.clone(),
+                    rotate_block_rows,
                 )?;
                 result_obj.set_item("lbd", lbd)?;
                 result_obj.set_item("ml0", ml0)?;

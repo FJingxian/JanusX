@@ -2578,6 +2578,7 @@ def run_fastlmm_packed_fullrank(
                                     "genetic_model": str(genetic_model),
                                     "fixed_lbd": (float(fixed_lbd) if fixed_lbd is not None else None),
                                     "fixed_ml0": (float(fixed_ml0) if fixed_ml0 is not None else None),
+                                    "rotate_block_rows": int(max(1, int(chunk_size))),
                                     "scan_progress_callback": _fastlmm_progress,
                                     "progress_every": int(max(1, int(chunk_size))),
                                 }
@@ -2645,6 +2646,7 @@ def run_fastlmm_packed_fullrank(
                             row_indices=packed_row_idx,
                             fixed_lbd=(float(fixed_lbd) if fixed_lbd is not None else None),
                             fixed_ml0=(float(fixed_ml0) if fixed_ml0 is not None else None),
+                            rotate_block_rows=int(max(1, int(chunk_size))),
                             **progress_kwargs,
                         )
             scan_secs = max(time.monotonic() - scan_t0, 0.0)
@@ -3789,6 +3791,7 @@ def run_lmm_packed_fullrank(
                         model="add",
                         nullml=null_ml0,
                         init_log10_lbd=init_log10_lbd,
+                        rotate_block_rows=int(max(1, int(chunk_size))),
                         **progress_kwargs,
                     )
                 if int(_written_rows) != int(len(sites_all)):

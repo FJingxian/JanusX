@@ -1378,6 +1378,24 @@ fn rotate_snp_block_with_ut_parallel_blocked(
 }
 
 #[inline]
+fn assoc_rotate_prefers_rayon_rowmajor_f32_kernel() -> bool {
+    for env_name in ["JX_LMM_ROTATE_F32_KERNEL", "JX_ROWMAJOR_F32_KERNEL"] {
+        if let Ok(raw) = std::env::var(env_name) {
+            let norm = raw.trim().to_ascii_lowercase();
+            match norm.as_str() {
+                "rayon" | "parallel" | "custom" => return true,
+                "blas" | "gemm" | "serial" => return false,
+                _ => {}
+            }
+        }
+    }
+    // For LMM/FvLMM association rotate-proj, default to BLAS-backed GEMM
+    // across platforms. This path is large dense projection, unlike some
+    // HE/PCG row-major kernels that still prefer custom Rayon tiling.
+    false
+}
+
+#[inline]
 fn rotate_snp_block_with_ut_blas(
     snp_block: &[f32],
     rows: usize,
@@ -1394,7 +1412,7 @@ fn rotate_snp_block_with_ut_blas(
     debug_assert!(u_t.len() >= n.saturating_mul(n));
     debug_assert!(out_block.len() >= rows.saturating_mul(n));
 
-    if rust_sgemm_prefers_rayon_rowmajor_f32_kernel() {
+    if assoc_rotate_prefers_rayon_rowmajor_f32_kernel() {
         let thread_hint = if threads > 0 {
             threads
         } else {
@@ -3409,7 +3427,7 @@ pub fn fvlmm_assoc_chunk_from_snp_with_cache_f32<'py>(
     let block_rows = rotate_block_rows.max(1);
     let cache_arc = Arc::clone(&cache.cache);
     let use_pipeline = use_rotate_finalize_pipeline(
-        !rust_sgemm_prefers_rayon_rowmajor_f32_kernel()
+        !assoc_rotate_prefers_rayon_rowmajor_f32_kernel()
             && block_rows < m
             && assoc_threads > 1
             && proj_threads > 1,
@@ -3549,7 +3567,7 @@ pub fn fvlmm_assoc_chunk_from_snp_f32<'py>(
     let assoc_pool = get_cached_pool(assoc_threads)?;
     let block_rows = rotate_block_rows.max(1);
     let use_pipeline = use_rotate_finalize_pipeline(
-        !rust_sgemm_prefers_rayon_rowmajor_f32_kernel()
+        !assoc_rotate_prefers_rayon_rowmajor_f32_kernel()
             && block_rows < m
             && assoc_threads > 1
             && proj_threads > 1,
@@ -6752,7 +6770,7 @@ pub fn fvlmm_assoc_packed_f32_to_tsv<'py>(
         let assoc_threads = stage_assoc_threads_or(threads);
         let proj_pool = get_cached_pool(proj_threads)?;
         let assoc_pool = get_cached_pool(assoc_threads)?;
-        let packed_pipeline_default = !rust_sgemm_prefers_rayon_rowmajor_f32_kernel()
+        let packed_pipeline_default = !assoc_rotate_prefers_rayon_rowmajor_f32_kernel()
             && rotate_block_rows < m
             && proj_threads > 1
             && assoc_threads > 1;

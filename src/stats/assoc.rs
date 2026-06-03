@@ -2100,7 +2100,7 @@ fn fit_dense_full_rows(
     y: &[f64],
     x_flat: &[f64],
     ixx_flat: &[f64],
-    g: &[f32],         // row-major (m, n)
+    g: &[f32], // row-major (m, n)
     m: usize,
     n: usize,
     selected_rows: &[usize],
@@ -2136,7 +2136,9 @@ fn fit_dense_full_rows(
     let mut scr = GlmScratch::new(q0);
     for (out_idx, &snp_idx) in selected_rows.iter().enumerate() {
         if snp_idx >= m {
-            return Err(format!("selected row index out of bounds: idx={snp_idx}, m={m}"));
+            return Err(format!(
+                "selected row index out of bounds: idx={snp_idx}, m={m}"
+            ));
         }
         scr.reset_xs();
         let g_row = &g[snp_idx * n..(snp_idx + 1) * n];
@@ -2262,9 +2264,9 @@ pub fn farmcpu_dense<'py>(
     Bound<'py, PyArray1<f64>>, // se
     Bound<'py, PyArray1<f64>>, // pwald
     Bound<'py, PyArray1<i64>>, // qtn_idx
-    usize,                      // n_pseudo_qtn
-    usize,                      // n_obs
-    usize,                      // df_lrt
+    usize,                     // n_pseudo_qtn
+    usize,                     // n_obs
+    usize,                     // df_lrt
 )> {
     let y_slice = y.as_slice()?;
     let n = y_slice.len();
@@ -2338,9 +2340,13 @@ pub fn farmcpu_dense<'py>(
     let max_iter_i = max_iter.max(1);
     let qb = qtn_bound.unwrap_or_else(|| {
         let nf = n as f64;
-        if nf <= 2.0 { 1 } else {
+        if nf <= 2.0 {
+            1
+        } else {
             let den = nf.log10();
-            if !den.is_finite() || den <= 0.0 { 1 } else {
+            if !den.is_finite() || den <= 0.0 {
+                1
+            } else {
                 ((nf / den).sqrt().floor() as usize).max(1)
             }
         }
@@ -2370,137 +2376,202 @@ pub fn farmcpu_dense<'py>(
     };
     let pool = get_cached_pool(threads)?;
 
-    py.detach(|| -> PyResult<(
-        Vec<f64>, Vec<f64>, Vec<f64>, Vec<usize>, usize,
-    )> {
-        let mut qtn_idx: Vec<usize> = Vec::new();
-        let mut final_model_cache: Option<(
-            Vec<f64>,     // x_qtn
-            usize,        // q_total
-            Vec<f64>,     // ixx
-            Vec<f64>,     // qtn_min_p
-            Vec<usize>,   // qtn_best_rows
-        )> = None;
+    py.detach(
+        || -> PyResult<(Vec<f64>, Vec<f64>, Vec<f64>, Vec<usize>, usize)> {
+            let mut qtn_idx: Vec<usize> = Vec::new();
+            let mut final_model_cache: Option<(
+                Vec<f64>,   // x_qtn
+                usize,      // q_total
+                Vec<f64>,   // ixx
+                Vec<f64>,   // qtn_min_p
+                Vec<usize>, // qtn_best_rows
+            )> = None;
 
-        for it_idx in 0..max_iter_i {
-            let (x_qtn, q_total) = build_x_with_qtn_dense(
-                &base_x, n, q_base, &qtn_idx, &g_flat, m, n,
-            ).map_err(PyRuntimeError::new_err)?;
+            for it_idx in 0..max_iter_i {
+                let (x_qtn, q_total) =
+                    build_x_with_qtn_dense(&base_x, n, q_base, &qtn_idx, &g_flat, m, n)
+                        .map_err(PyRuntimeError::new_err)?;
 
-            let mut xtx = vec![0.0_f64; q_total * q_total];
-            for i in 0..n {
-                let row = &x_qtn[i * q_total..(i + 1) * q_total];
-                for a in 0..q_total {
-                    let va = row[a];
-                    for b in 0..q_total {
-                        xtx[a * q_total + b] += va * row[b];
+                let mut xtx = vec![0.0_f64; q_total * q_total];
+                for i in 0..n {
+                    let row = &x_qtn[i * q_total..(i + 1) * q_total];
+                    for a in 0..q_total {
+                        let va = row[a];
+                        for b in 0..q_total {
+                            xtx[a * q_total + b] += va * row[b];
+                        }
                     }
                 }
-            }
-            let ixx = pinv_xtx(&xtx, q_total).map_err(PyRuntimeError::new_err)?;
-            let (mut fem, _m_scan, row_stride) = scan_dense_full_matrix(
-                y_slice, &x_qtn, &ixx, &g_flat, m, n, threads,
-            ).map_err(PyRuntimeError::new_err)?;
-            for i in 0..m {
-                let base = i * row_stride;
-                for c in 2..row_stride {
-                    let v = fem[base + c];
-                    if !v.is_finite() { fem[base + c] = 1.0; }
-                }
-            }
-
-            let k_qtn = qtn_idx.len();
-            let mut qtn_min_p = vec![1.0_f64; k_qtn];
-            if k_qtn > 0 {
+                let ixx = pinv_xtx(&xtx, q_total).map_err(PyRuntimeError::new_err)?;
+                let (mut fem, _m_scan, row_stride) =
+                    scan_dense_full_matrix(y_slice, &x_qtn, &ixx, &g_flat, m, n, threads)
+                        .map_err(PyRuntimeError::new_err)?;
                 for i in 0..m {
                     let base = i * row_stride;
-                    for j in 0..k_qtn {
-                        let col = 2 + q_base + j;
-                        let p = fem[base + col];
-                        if p.is_finite() && p < qtn_min_p[j] {
-                            qtn_min_p[j] = p;
+                    for c in 2..row_stride {
+                        let v = fem[base + c];
+                        if !v.is_finite() {
+                            fem[base + c] = 1.0;
                         }
                     }
                 }
-            }
 
-            let mut femp = vec![1.0_f64; m];
-            for i in 0..m {
-                femp[i] = fem[i * row_stride + row_stride - 1];
-            }
-            for (j, &idx) in qtn_idx.iter().enumerate() {
-                if idx < m && qtn_min_p[j].is_finite() {
-                    femp[idx] = qtn_min_p[j];
-                }
-            }
-
-            let has_signal = femp.iter().any(|&p| p.is_finite() && p <= qtn_threshold_eff);
-            if !has_signal {
-                let (final_qtn_min_p, final_qtn_best_rows) =
-                    summarize_qtn_from_fem(&fem, m, row_stride, q_base, &qtn_idx);
-                final_model_cache = Some((x_qtn, q_total, ixx, final_qtn_min_p, final_qtn_best_rows));
-                if let Some(cb) = progress_callback.as_ref() {
-                    Python::attach(|py2| -> PyResult<()> {
-                        py2.check_signals()?;
-                        cb.call1(py2, (it_idx + 1, max_iter_i))?;
-                        Ok(())
-                    })?;
-                }
-                break;
-            }
-
-            let mut combine: Vec<(i64, usize)> = Vec::new();
-            for &sz in szbin_i64.iter() {
-                for &nn in nbin_vals.iter() {
-                    combine.push((sz, nn));
-                }
-            }
-            if combine.is_empty() {
-                let (final_qtn_min_p, final_qtn_best_rows) =
-                    summarize_qtn_from_fem(&fem, m, row_stride, q_base, &qtn_idx);
-                final_model_cache = Some((x_qtn, q_total, ixx, final_qtn_min_p, final_qtn_best_rows));
-                if let Some(cb) = progress_callback.as_ref() {
-                    Python::attach(|py2| -> PyResult<()> {
-                        py2.check_signals()?;
-                        cb.call1(py2, (it_idx + 1, max_iter_i))?;
-                        Ok(())
-                    })?;
-                }
-                break;
-            }
-
-            let g_flat_rem = g_flat.as_ref();
-            let x_qtn_rem = x_qtn.as_slice();
-            let femp_rem = femp.as_slice();
-            let global_pos_rem = global_pos.as_slice();
-            let rem_task = || {
-                combine
-                    .par_iter()
-                    .map(|&(sz, nn)| {
-                        let leadidx = select_lead_indices(sz, nn, femp_rem, global_pos_rem);
-                        let k = leadidx.len();
-                        let mut sample_major = vec![0.0_f64; n * k];
-                        for (col, &row_idx) in leadidx.iter().enumerate() {
-                            let row = &g_flat_rem[row_idx * n..(row_idx + 1) * n];
-                            for i in 0..n {
-                                sample_major[i * k + col] = row[i] as f64;
+                let k_qtn = qtn_idx.len();
+                let mut qtn_min_p = vec![1.0_f64; k_qtn];
+                if k_qtn > 0 {
+                    for i in 0..m {
+                        let base = i * row_stride;
+                        for j in 0..k_qtn {
+                            let col = 2 + q_base + j;
+                            let p = fem[base + col];
+                            if p.is_finite() && p < qtn_min_p[j] {
+                                qtn_min_p[j] = p;
                             }
                         }
-                        let score = farmcpu_ll_score_from_sample_major(
-                            y_slice, x_qtn_rem, n, q_total,
-                            &sample_major, k,
-                            -5.0, 5.0, 0.1, 1e-8,
-                        ).unwrap_or(f64::INFINITY);
-                        (score, leadidx)
-                    })
-                    .collect::<Vec<(f64, Vec<usize>)>>()
-            };
-            let rem_res = if let Some(p) = &pool {
-                p.install(rem_task)
-            } else {
-                rem_task()
-            };
-            if rem_res.is_empty() {
+                    }
+                }
+
+                let mut femp = vec![1.0_f64; m];
+                for i in 0..m {
+                    femp[i] = fem[i * row_stride + row_stride - 1];
+                }
+                for (j, &idx) in qtn_idx.iter().enumerate() {
+                    if idx < m && qtn_min_p[j].is_finite() {
+                        femp[idx] = qtn_min_p[j];
+                    }
+                }
+
+                let has_signal = femp
+                    .iter()
+                    .any(|&p| p.is_finite() && p <= qtn_threshold_eff);
+                if !has_signal {
+                    let (final_qtn_min_p, final_qtn_best_rows) =
+                        summarize_qtn_from_fem(&fem, m, row_stride, q_base, &qtn_idx);
+                    final_model_cache =
+                        Some((x_qtn, q_total, ixx, final_qtn_min_p, final_qtn_best_rows));
+                    if let Some(cb) = progress_callback.as_ref() {
+                        Python::attach(|py2| -> PyResult<()> {
+                            py2.check_signals()?;
+                            cb.call1(py2, (it_idx + 1, max_iter_i))?;
+                            Ok(())
+                        })?;
+                    }
+                    break;
+                }
+
+                let mut combine: Vec<(i64, usize)> = Vec::new();
+                for &sz in szbin_i64.iter() {
+                    for &nn in nbin_vals.iter() {
+                        combine.push((sz, nn));
+                    }
+                }
+                if combine.is_empty() {
+                    let (final_qtn_min_p, final_qtn_best_rows) =
+                        summarize_qtn_from_fem(&fem, m, row_stride, q_base, &qtn_idx);
+                    final_model_cache =
+                        Some((x_qtn, q_total, ixx, final_qtn_min_p, final_qtn_best_rows));
+                    if let Some(cb) = progress_callback.as_ref() {
+                        Python::attach(|py2| -> PyResult<()> {
+                            py2.check_signals()?;
+                            cb.call1(py2, (it_idx + 1, max_iter_i))?;
+                            Ok(())
+                        })?;
+                    }
+                    break;
+                }
+
+                let g_flat_rem = g_flat.as_ref();
+                let x_qtn_rem = x_qtn.as_slice();
+                let femp_rem = femp.as_slice();
+                let global_pos_rem = global_pos.as_slice();
+                let rem_task = || {
+                    combine
+                        .par_iter()
+                        .map(|&(sz, nn)| {
+                            let leadidx = select_lead_indices(sz, nn, femp_rem, global_pos_rem);
+                            let k = leadidx.len();
+                            let mut sample_major = vec![0.0_f64; n * k];
+                            for (col, &row_idx) in leadidx.iter().enumerate() {
+                                let row = &g_flat_rem[row_idx * n..(row_idx + 1) * n];
+                                for i in 0..n {
+                                    sample_major[i * k + col] = row[i] as f64;
+                                }
+                            }
+                            let score = farmcpu_ll_score_from_sample_major(
+                                y_slice,
+                                x_qtn_rem,
+                                n,
+                                q_total,
+                                &sample_major,
+                                k,
+                                -5.0,
+                                5.0,
+                                0.1,
+                                1e-8,
+                            )
+                            .unwrap_or(f64::INFINITY);
+                            (score, leadidx)
+                        })
+                        .collect::<Vec<(f64, Vec<usize>)>>()
+                };
+                let rem_res = if let Some(p) = &pool {
+                    p.install(rem_task)
+                } else {
+                    rem_task()
+                };
+                if rem_res.is_empty() {
+                    if let Some(cb) = progress_callback.as_ref() {
+                        Python::attach(|py2| -> PyResult<()> {
+                            py2.check_signals()?;
+                            cb.call1(py2, (it_idx + 1, max_iter_i))?;
+                            Ok(())
+                        })?;
+                    }
+                    break;
+                }
+                let mut best_i = 0usize;
+                let mut best_score = rem_res[0].0;
+                for (i, (s, _)) in rem_res.iter().enumerate().skip(1) {
+                    if s.total_cmp(&best_score).is_lt() {
+                        best_score = *s;
+                        best_i = i;
+                    }
+                }
+                let opt_lead = &rem_res[best_i].1;
+                let mut qtn_union = qtn_idx.clone();
+                qtn_union.extend(opt_lead.iter().copied());
+                qtn_union.sort_unstable();
+                qtn_union.dedup();
+
+                if it_idx >= 1 && !qtn_union.is_empty() {
+                    let prev_set: HashSet<usize> = qtn_idx.iter().copied().collect();
+                    qtn_union.retain(|&idx| {
+                        let p = femp[idx];
+                        (p.is_finite() && p < qtn_threshold_eff) || prev_set.contains(&idx)
+                    });
+                }
+
+                let qtn_next: Vec<usize> = if qtn_union.is_empty() {
+                    Vec::new()
+                } else {
+                    let k_u = qtn_union.len();
+                    let mut sample_major = vec![0.0_f64; n * k_u];
+                    for (col, &row_idx) in qtn_union.iter().enumerate() {
+                        let row = &g_flat[row_idx * n..(row_idx + 1) * n];
+                        for i in 0..n {
+                            sample_major[i * k_u + col] = row[i] as f64;
+                        }
+                    }
+                    let pvals: Vec<f64> = qtn_union.iter().map(|&ix| femp[ix]).collect();
+                    let keep =
+                        farmcpu_super_keep_from_sample_major(&sample_major, n, k_u, &pvals, 0.7);
+                    qtn_union
+                        .iter()
+                        .zip(keep.iter())
+                        .filter_map(|(&ix, &k)| if k { Some(ix) } else { None })
+                        .collect()
+                };
+
                 if let Some(cb) = progress_callback.as_ref() {
                     Python::attach(|py2| -> PyResult<()> {
                         py2.check_signals()?;
@@ -2508,155 +2579,117 @@ pub fn farmcpu_dense<'py>(
                         Ok(())
                     })?;
                 }
-                break;
-            }
-            let mut best_i = 0usize;
-            let mut best_score = rem_res[0].0;
-            for (i, (s, _)) in rem_res.iter().enumerate().skip(1) {
-                if s.total_cmp(&best_score).is_lt() {
-                    best_score = *s;
-                    best_i = i;
+
+                if qtn_next == qtn_idx {
+                    let (final_qtn_min_p, final_qtn_best_rows) =
+                        summarize_qtn_from_fem(&fem, m, row_stride, q_base, &qtn_idx);
+                    final_model_cache =
+                        Some((x_qtn, q_total, ixx, final_qtn_min_p, final_qtn_best_rows));
+                    break;
                 }
-            }
-            let opt_lead = &rem_res[best_i].1;
-            let mut qtn_union = qtn_idx.clone();
-            qtn_union.extend(opt_lead.iter().copied());
-            qtn_union.sort_unstable();
-            qtn_union.dedup();
-
-            if it_idx >= 1 && !qtn_union.is_empty() {
-                let prev_set: HashSet<usize> = qtn_idx.iter().copied().collect();
-                qtn_union.retain(|&idx| {
-                    let p = femp[idx];
-                    (p.is_finite() && p < qtn_threshold_eff) || prev_set.contains(&idx)
-                });
+                qtn_idx = qtn_next;
             }
 
-            let qtn_next: Vec<usize> = if qtn_union.is_empty() {
-                Vec::new()
-            } else {
-                let k_u = qtn_union.len();
-                let mut sample_major = vec![0.0_f64; n * k_u];
-                for (col, &row_idx) in qtn_union.iter().enumerate() {
-                    let row = &g_flat[row_idx * n..(row_idx + 1) * n];
+            // Final scan
+            let (x_qtn, _q_total, ixx, qtn_min_p, qtn_best_rows) =
+                if let Some(cached) = final_model_cache.take() {
+                    cached
+                } else {
+                    let (x_qtn_f, q_total_f) =
+                        build_x_with_qtn_dense(&base_x, n, q_base, &qtn_idx, &g_flat, m, n)
+                            .map_err(PyRuntimeError::new_err)?;
+                    let mut xtx = vec![0.0_f64; q_total_f * q_total_f];
                     for i in 0..n {
-                        sample_major[i * k_u + col] = row[i] as f64;
-                    }
-                }
-                let pvals: Vec<f64> = qtn_union.iter().map(|&ix| femp[ix]).collect();
-                let keep = farmcpu_super_keep_from_sample_major(
-                    &sample_major, n, k_u, &pvals, 0.7,
-                );
-                qtn_union.iter().zip(keep.iter())
-                    .filter_map(|(&ix, &k)| if k { Some(ix) } else { None })
-                    .collect()
-            };
-
-            if let Some(cb) = progress_callback.as_ref() {
-                Python::attach(|py2| -> PyResult<()> {
-                    py2.check_signals()?;
-                    cb.call1(py2, (it_idx + 1, max_iter_i))?;
-                    Ok(())
-                })?;
-            }
-
-            if qtn_next == qtn_idx {
-                let (final_qtn_min_p, final_qtn_best_rows) =
-                    summarize_qtn_from_fem(&fem, m, row_stride, q_base, &qtn_idx);
-                final_model_cache = Some((x_qtn, q_total, ixx, final_qtn_min_p, final_qtn_best_rows));
-                break;
-            }
-            qtn_idx = qtn_next;
-        }
-
-        // Final scan
-        let (x_qtn, _q_total, ixx, qtn_min_p, qtn_best_rows) =
-            if let Some(cached) = final_model_cache.take() {
-                cached
-            } else {
-                let (x_qtn_f, q_total_f) = build_x_with_qtn_dense(
-                    &base_x, n, q_base, &qtn_idx, &g_flat, m, n,
-                ).map_err(PyRuntimeError::new_err)?;
-                let mut xtx = vec![0.0_f64; q_total_f * q_total_f];
-                for i in 0..n {
-                    let row = &x_qtn_f[i * q_total_f..(i + 1) * q_total_f];
-                    for a in 0..q_total_f {
-                        let va = row[a];
-                        for b in 0..q_total_f {
-                            xtx[a * q_total_f + b] += va * row[b];
+                        let row = &x_qtn_f[i * q_total_f..(i + 1) * q_total_f];
+                        for a in 0..q_total_f {
+                            let va = row[a];
+                            for b in 0..q_total_f {
+                                xtx[a * q_total_f + b] += va * row[b];
+                            }
                         }
                     }
-                }
-                let ixx_f = pinv_xtx(&xtx, q_total_f).map_err(PyRuntimeError::new_err)?;
-                let (mut fem_f, _m_scan_f, row_stride_f) = scan_dense_full_matrix(
-                    y_slice, &x_qtn_f, &ixx_f, &g_flat, m, n, threads,
-                ).map_err(PyRuntimeError::new_err)?;
-                for i in 0..m {
-                    let base = i * row_stride_f;
-                    for c in 2..row_stride_f {
-                        let v = fem_f[base + c];
-                        if !v.is_finite() { fem_f[base + c] = 1.0; }
+                    let ixx_f = pinv_xtx(&xtx, q_total_f).map_err(PyRuntimeError::new_err)?;
+                    let (mut fem_f, _m_scan_f, row_stride_f) =
+                        scan_dense_full_matrix(y_slice, &x_qtn_f, &ixx_f, &g_flat, m, n, threads)
+                            .map_err(PyRuntimeError::new_err)?;
+                    for i in 0..m {
+                        let base = i * row_stride_f;
+                        for c in 2..row_stride_f {
+                            let v = fem_f[base + c];
+                            if !v.is_finite() {
+                                fem_f[base + c] = 1.0;
+                            }
+                        }
+                    }
+                    let (qtn_min_p_f, qtn_best_rows_f) =
+                        summarize_qtn_from_fem(&fem_f, m, row_stride_f, q_base, &qtn_idx);
+                    (x_qtn_f, q_total_f, ixx_f, qtn_min_p_f, qtn_best_rows_f)
+                };
+
+            // Extract final beta/se/p from the last scan together with QTN beta/se overrides
+            let (mut fem_final, _mf, row_stride_final) =
+                scan_dense_full_matrix(y_slice, &x_qtn, &ixx, &g_flat, m, n, threads)
+                    .map_err(PyRuntimeError::new_err)?;
+            for i in 0..m {
+                let base = i * row_stride_final;
+                for c in 2..row_stride_final {
+                    let v = fem_final[base + c];
+                    if !v.is_finite() {
+                        fem_final[base + c] = 1.0;
                     }
                 }
-                let (qtn_min_p_f, qtn_best_rows_f) =
-                    summarize_qtn_from_fem(&fem_f, m, row_stride_f, q_base, &qtn_idx);
-                (x_qtn_f, q_total_f, ixx_f, qtn_min_p_f, qtn_best_rows_f)
-            };
-
-        // Extract final beta/se/p from the last scan together with QTN beta/se overrides
-        let (mut fem_final, _mf, row_stride_final) = scan_dense_full_matrix(
-            y_slice, &x_qtn, &ixx, &g_flat, m, n, threads,
-        ).map_err(PyRuntimeError::new_err)?;
-        for i in 0..m {
-            let base = i * row_stride_final;
-            for c in 2..row_stride_final {
-                let v = fem_final[base + c];
-                if !v.is_finite() { fem_final[base + c] = 1.0; }
             }
-        }
 
-        let k_qtn_final = qtn_idx.len();
-        let mut beta = vec![f64::NAN; m];
-        let mut se = vec![f64::NAN; m];
-        let mut pval = vec![f64::NAN; m];
+            let k_qtn_final = qtn_idx.len();
+            let mut beta = vec![f64::NAN; m];
+            let mut se = vec![f64::NAN; m];
+            let mut pval = vec![f64::NAN; m];
 
-        for i in 0..m {
-            let base = i * row_stride_final;
-            beta[i] = fem_final[base];
-            se[i] = fem_final[base + 1];
-            pval[i] = fem_final[base + row_stride_final - 1];
-        }
-        for (j, &idx) in qtn_idx.iter().enumerate() {
-            if idx < m {
-                pval[idx] = qtn_min_p[j];
+            for i in 0..m {
+                let base = i * row_stride_final;
+                beta[i] = fem_final[base];
+                se[i] = fem_final[base + 1];
+                pval[i] = fem_final[base + row_stride_final - 1];
             }
-        }
-
-        if k_qtn_final > 0 {
-            let (qtn_full, qtn_full_stride) = fit_dense_full_rows(
-                y_slice, &x_qtn, &ixx, &g_flat, m, n, &qtn_best_rows,
-            ).map_err(PyRuntimeError::new_err)?;
-            for j in 0..k_qtn_final {
-                let coef_idx = q_base + j;
-                let base = j * qtn_full_stride + 3 * coef_idx;
-                let qidx = qtn_idx[j];
-                if qidx < m {
-                    beta[qidx] = qtn_full[base];
-                    se[qidx] = qtn_full[base + 1];
+            for (j, &idx) in qtn_idx.iter().enumerate() {
+                if idx < m {
+                    pval[idx] = qtn_min_p[j];
                 }
             }
-        }
 
-        Ok((beta, se, pval, qtn_idx.clone(), k_qtn_final))
-    }).map(|(beta, se, pval, qtn_idx, n_pseudo_qtn)| {
+            if k_qtn_final > 0 {
+                let (qtn_full, qtn_full_stride) =
+                    fit_dense_full_rows(y_slice, &x_qtn, &ixx, &g_flat, m, n, &qtn_best_rows)
+                        .map_err(PyRuntimeError::new_err)?;
+                for j in 0..k_qtn_final {
+                    let coef_idx = q_base + j;
+                    let base = j * qtn_full_stride + 3 * coef_idx;
+                    let qidx = qtn_idx[j];
+                    if qidx < m {
+                        beta[qidx] = qtn_full[base];
+                        se[qidx] = qtn_full[base + 1];
+                    }
+                }
+            }
+
+            Ok((beta, se, pval, qtn_idx.clone(), k_qtn_final))
+        },
+    )
+    .map(|(beta, se, pval, qtn_idx, n_pseudo_qtn)| {
         let beta_arr = PyArray1::<f64>::from_vec(py, beta).into_bound();
         let se_arr = PyArray1::<f64>::from_vec(py, se).into_bound();
         let pval_arr = PyArray1::<f64>::from_vec(py, pval).into_bound();
-        let qtn_arr = PyArray1::<i64>::from_vec(
-            py,
-            qtn_idx.iter().map(|&x| x as i64).collect(),
-        ).into_bound();
-        (beta_arr, se_arr, pval_arr, qtn_arr, n_pseudo_qtn, n_obs, df_lrt)
+        let qtn_arr =
+            PyArray1::<i64>::from_vec(py, qtn_idx.iter().map(|&x| x as i64).collect()).into_bound();
+        (
+            beta_arr,
+            se_arr,
+            pval_arr,
+            qtn_arr,
+            n_pseudo_qtn,
+            n_obs,
+            df_lrt,
+        )
     })
 }
 

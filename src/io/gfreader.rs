@@ -1461,7 +1461,7 @@ fn collapse_bed_row_sorted_subset_with_plan(
 }
 
 #[inline]
-fn evaluate_packed_row_keep_and_flip(
+pub(crate) fn evaluate_packed_row_keep_and_flip(
     n_samples: usize,
     non_missing: usize,
     alt_sum: usize,

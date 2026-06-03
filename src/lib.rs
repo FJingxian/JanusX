@@ -154,10 +154,11 @@ use eigh::{
 };
 use fast_math::fastlmm_prepare_lowrank_f64;
 use garfield::{
-    garfield_compare_score_cont_centered_gain_batch_metal_vs_cpu_py, garfield_eval_rule_bin_py,
-    garfield_logic_search_bed_py, garfield_prepare_input_bin_py, garfield_residualize_bed_py,
-    garfield_residualize_grm_py, garfield_scan_groups_bin_py, garfield_scan_windows_bin_py,
-    garfield_score_cont_centered_gain_batch_packed_cpu_py,
+    garfield_compare_score_cont_centered_gain_batch_metal_vs_cpu_py,
+    garfield_compare_score_cont_centered_gain_singleton_backends_py, garfield_eval_rule_bin_py,
+    garfield_logic_search_bed_py, garfield_metal_runtime_status_py, garfield_prepare_input_bin_py,
+    garfield_residualize_bed_py, garfield_residualize_grm_py, garfield_scan_groups_bin_py,
+    garfield_scan_windows_bin_py, garfield_score_cont_centered_gain_batch_packed_cpu_py,
     garfield_score_cont_centered_gain_batch_packed_metal_py, garfield_subset_bin_samples_py,
     load_bin01_packed_py, load_mbin_packed_py, score_binary_ba_mcc_batch_py, score_binary_ba_py,
     score_binary_mcc_py, score_cont_corr_py, score_cont_mean_diff_corr_batch_py,
@@ -173,7 +174,8 @@ use gfreader::{
 };
 use glm::{
     glm_ixx_from_x_qr, glmf32, glmf32_full, glmf32_packed, glmf32_packed_assoc,
-    glmf32_packed_assoc_to_tsv, lm_block_assoc_packed, lm_stream_bed_to_tsv,
+    glmf32_packed_assoc_to_tsv, lm_block_assoc_packed, lm_block_assoc_packed_to_tsv,
+    lm_stream_bed_to_tsv,
 };
 use gmerge::{convert_genotypes, merge_genotypes, PyConvertStats, PyMergeStats};
 use grm::{
@@ -332,6 +334,11 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
         garfield_compare_score_cont_centered_gain_batch_metal_vs_cpu_py,
         m
     )?)?;
+    m.add_function(wrap_pyfunction!(
+        garfield_compare_score_cont_centered_gain_singleton_backends_py,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(garfield_metal_runtime_status_py, m)?)?;
     m.add_function(wrap_pyfunction!(scan_bed_2bit_packed_stats, m)?)?;
     m.add_function(wrap_pyfunction!(prepare_bed_2bit_packed, m)?)?;
     m.add_function(wrap_pyfunction!(prepare_bed_logic_meta_selected, m)?)?;
@@ -350,6 +357,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(algwas_packed_to_tsv, m)?)?;
     m.add_function(wrap_pyfunction!(lm_stream_bed_to_tsv, m)?)?;
     m.add_function(wrap_pyfunction!(lm_block_assoc_packed, m)?)?;
+    m.add_function(wrap_pyfunction!(lm_block_assoc_packed_to_tsv, m)?)?;
     m.add_function(wrap_pyfunction!(grm_sim_bench_f32, m)?)?;
     m.add_function(wrap_pyfunction!(bed_packed_row_flip_mask, m)?)?;
     m.add_function(wrap_pyfunction!(bed_packed_decode_rows_f32, m)?)?;

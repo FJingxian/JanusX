@@ -268,6 +268,7 @@ try:
     from janusx.janusx import (
         glmf32_packed as _glmf32_packed,
         lm_block_assoc_packed as _lm_block_assoc_packed,
+        lm_block_assoc_packed_to_tsv as _lm_block_assoc_packed_to_tsv,
         bed_packed_row_flip_mask as _bed_packed_row_flip_mask,
         bed_packed_decode_rows_f32 as _bed_packed_decode_rows_f32,
         farmcpu_rem_dense as _farmcpu_rem_dense,
@@ -279,6 +280,7 @@ try:
 except Exception:
     _glmf32_packed = None
     _lm_block_assoc_packed = None
+    _lm_block_assoc_packed_to_tsv = None
     _bed_packed_row_flip_mask = None
     _bed_packed_decode_rows_f32 = None
     _farmcpu_rem_dense = None

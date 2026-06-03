@@ -6,19 +6,59 @@ use super::permutation::{
 };
 use super::score::{
     score_cont_centered_gain_from_sum_and_n_hit, score_cont_centered_gain_packed_with_n_hit,
-    score_cont_weighted_mean_diff_packed, sum_y_where_both1, support_size_packed,
+    score_cont_centered_gain_packed_with_sum, sum_y_where_both1, support_size_packed,
     validate_continuous_y, ContinuousRuleScore,
+};
+use super::score_gpu::{
+    centered_gain_backend_mode_is_auto, parse_centered_gain_backend_mode_from_env,
+    score_cont_centered_gain_singletons_packed_cpu_impl,
+    score_cont_centered_gain_singletons_packed_legacy_impl,
+    score_cont_centered_gain_singletons_packed_with_backend,
 };
 use crate::bitwise::{and_popcount, bitand_assign, bitnot_masked, bitor_into};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 const GARFIELD_BEAM_PAR_MIN_TOTAL_CANDS: usize = 1_024;
 const GARFIELD_BEAM_PAR_CHUNK_CANDS: usize = 128;
 const GARFIELD_INITIAL_SINGLETON_NEGATIONS: [bool; 1] = [false];
 const GARFIELD_AND_NOT_SHORTER_SUBRULE_GAIN_MAX: f64 = 0.08;
 const GARFIELD_AND_NOT_SHORTER_SUBRULE_HAMMING_FRAC_MAX: f64 = 0.05;
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct GarfieldBeamProfileSnapshot {
+    pub calls: usize,
+    pub total_s: f64,
+    pub literal_precompute_s: f64,
+}
+
+static GARFIELD_BEAM_PROFILE_CALLS: AtomicUsize = AtomicUsize::new(0);
+static GARFIELD_BEAM_PROFILE_TOTAL_NS: AtomicU64 = AtomicU64::new(0);
+static GARFIELD_BEAM_PROFILE_LITERAL_PRECOMPUTE_NS: AtomicU64 = AtomicU64::new(0);
+
+#[inline]
+fn elapsed_ns_saturating(start: Instant) -> u64 {
+    start.elapsed().as_nanos().min(u64::MAX as u128) as u64
+}
+
+pub(crate) fn reset_garfield_beam_profile() {
+    GARFIELD_BEAM_PROFILE_CALLS.store(0, Ordering::Relaxed);
+    GARFIELD_BEAM_PROFILE_TOTAL_NS.store(0, Ordering::Relaxed);
+    GARFIELD_BEAM_PROFILE_LITERAL_PRECOMPUTE_NS.store(0, Ordering::Relaxed);
+}
+
+pub(crate) fn snapshot_garfield_beam_profile() -> GarfieldBeamProfileSnapshot {
+    GarfieldBeamProfileSnapshot {
+        calls: GARFIELD_BEAM_PROFILE_CALLS.load(Ordering::Relaxed),
+        total_s: (GARFIELD_BEAM_PROFILE_TOTAL_NS.load(Ordering::Relaxed) as f64) * 1e-9,
+        literal_precompute_s: (GARFIELD_BEAM_PROFILE_LITERAL_PRECOMPUTE_NS.load(Ordering::Relaxed)
+            as f64)
+            * 1e-9,
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum BeamBinaryOp {
@@ -1130,31 +1170,88 @@ fn precompute_literal_singleton_scores(
     needed_words_test: usize,
     n_test: usize,
     n_rows: usize,
-) -> Vec<LiteralSingletonScore> {
-    let mut out = Vec::<LiteralSingletonScore>::with_capacity(n_rows.saturating_mul(2));
-    for row_idx in 0..n_rows {
-        let row_train = row_prefix(bits_train, row_words_train, row_idx, needed_words_train);
-        let row_test = row_prefix(bits_test, row_words_test, row_idx, needed_words_test);
-        for &negated in &[false, true] {
-            let train_bits = apply_first_literal(row_train, needed_words_train, n_train, negated);
-            let test_bits = apply_first_literal(row_test, needed_words_test, n_test, negated);
-            let train_n_hit = support_size_packed(&train_bits, n_train);
-            let test_n_hit = support_size_packed(&test_bits, n_test);
-            out.push(LiteralSingletonScore {
-                train: score_cont_centered_gain_packed_with_n_hit(
-                    y_train,
-                    &train_bits,
-                    n_train,
-                    sum_y_train,
-                    train_n_hit,
-                ),
-                test: score_cont_centered_gain_packed_with_n_hit(
-                    y_test, &test_bits, n_test, sum_y_test, test_n_hit,
-                ),
-            });
-        }
-    }
+) -> Result<Vec<LiteralSingletonScore>, String> {
+    let score_t0 = Instant::now();
+    let out = (|| {
+        let mode = parse_centered_gain_backend_mode_from_env()?;
+        let train_scores = precompute_literal_singleton_backend_scores(
+            mode,
+            y_train,
+            sum_y_train,
+            bits_train,
+            row_words_train,
+            needed_words_train,
+            n_train,
+            n_rows,
+        )?;
+        let test_scores = precompute_literal_singleton_backend_scores(
+            mode,
+            y_test,
+            sum_y_test,
+            bits_test,
+            row_words_test,
+            needed_words_test,
+            n_test,
+            n_rows,
+        )?;
+
+        Ok(train_scores
+            .into_iter()
+            .zip(test_scores)
+            .map(|(train, test)| LiteralSingletonScore { train, test })
+            .collect())
+    })();
+    GARFIELD_BEAM_PROFILE_LITERAL_PRECOMPUTE_NS
+        .fetch_add(elapsed_ns_saturating(score_t0), Ordering::Relaxed);
     out
+}
+
+fn precompute_literal_singleton_backend_scores(
+    mode: super::score_gpu::GarfieldCenteredGainBackendMode,
+    y: &[f64],
+    sum_y: f64,
+    bits: &[u64],
+    row_words: usize,
+    needed_words: usize,
+    n_samples: usize,
+    n_rows: usize,
+) -> Result<Vec<ContinuousRuleScore>, String> {
+    let strict = score_cont_centered_gain_singletons_packed_with_backend(
+        y, bits, row_words, n_rows, n_samples,
+    )
+    .map(|v| v.0);
+    if !centered_gain_backend_mode_is_auto(mode) {
+        return strict;
+    }
+    strict
+        .or_else(|_| {
+            score_cont_centered_gain_singletons_packed_cpu_impl(
+                y, bits, row_words, n_rows, n_samples,
+            )
+        })
+        .or_else(|_| {
+            score_cont_centered_gain_singletons_packed_legacy_impl(
+                y, bits, row_words, n_rows, n_samples,
+            )
+        })
+        .or_else(|_| {
+            let mut fallback = Vec::with_capacity(n_rows.saturating_mul(2));
+            for row_idx in 0..n_rows {
+                let row = row_prefix(bits, row_words, row_idx, needed_words);
+                for &negated in &[false, true] {
+                    let literal_bits = apply_first_literal(row, needed_words, n_samples, negated);
+                    let n_hit = support_size_packed(&literal_bits, n_samples);
+                    fallback.push(score_cont_centered_gain_packed_with_n_hit(
+                        y,
+                        &literal_bits,
+                        n_samples,
+                        sum_y,
+                        n_hit,
+                    ));
+                }
+            }
+            Ok(fallback)
+        })
 }
 
 #[inline]
@@ -1268,7 +1365,12 @@ fn score_rule_continuous_from_bits(
     lambda_len: f64,
     lambda_not: f64,
 ) -> ContinuousRuleScore {
-    let mut sc = score_cont_weighted_mean_diff_packed(y, combined, n_samples);
+    let mut sc = score_cont_centered_gain_packed_with_sum(
+        y,
+        combined,
+        n_samples,
+        y.iter().take(n_samples).copied().sum::<f64>(),
+    );
     let penalty = if rule.len() > 1 {
         lambda_len * ((rule.len() - 1) as f64)
     } else {
@@ -2603,58 +2705,98 @@ pub fn beam_search_train_test_continuous(
     group_ids: &[usize],
     params: BeamSearchParams,
 ) -> Result<Vec<BeamRuleCandidate>, String> {
-    let (needed_words_train, needed_words_test) = validate_search_inputs(
-        y_train,
-        bits_train,
-        row_words_train,
-        n_rows,
-        n_train,
-        y_test,
-        bits_test,
-        row_words_test,
-        n_test,
-        group_ids,
-        &params,
-    )?;
-    let sum_y_train = y_train.iter().take(n_train).copied().sum::<f64>();
-    let sum_y_test = y_test.iter().take(n_test).copied().sum::<f64>();
-
-    let max_depth = params.max_pick.min(n_rows);
-    let exhaustive_depth = params.exhaustive_depth.max(1).min(max_depth);
-    let literal_scores = precompute_literal_singleton_scores(
-        y_train,
-        sum_y_train,
-        bits_train,
-        row_words_train,
-        needed_words_train,
-        n_train,
-        y_test,
-        sum_y_test,
-        bits_test,
-        row_words_test,
-        needed_words_test,
-        n_test,
-        n_rows,
-    );
-
-    let mut kept_all = Vec::<BeamState>::new();
-    let mut beam = if exhaustive_depth > 1 {
-        let exhaustive_initial = build_initial_states_exhaustive(
+    let beam_t0 = Instant::now();
+    let out = (|| {
+        let (needed_words_train, needed_words_test) = validate_search_inputs(
             y_train,
             bits_train,
             row_words_train,
             n_rows,
-            needed_words_train,
             n_train,
+            y_test,
+            bits_test,
+            row_words_test,
+            n_test,
             group_ids,
-            literal_scores.as_slice(),
             &params,
         )?;
-        kept_all.extend(exhaustive_initial.iter().cloned());
-        let mut frontier = exhaustive_initial;
-        for _depth in 2..=exhaustive_depth {
-            let next = expand_states_exhaustive(
-                frontier.as_slice(),
+        let sum_y_train = y_train.iter().take(n_train).copied().sum::<f64>();
+        let sum_y_test = y_test.iter().take(n_test).copied().sum::<f64>();
+
+        let max_depth = params.max_pick.min(n_rows);
+        let exhaustive_depth = params.exhaustive_depth.max(1).min(max_depth);
+        let literal_scores = precompute_literal_singleton_scores(
+            y_train,
+            sum_y_train,
+            bits_train,
+            row_words_train,
+            needed_words_train,
+            n_train,
+            y_test,
+            sum_y_test,
+            bits_test,
+            row_words_test,
+            needed_words_test,
+            n_test,
+            n_rows,
+        )?;
+
+        let mut kept_all = Vec::<BeamState>::new();
+        let mut beam = if exhaustive_depth > 1 {
+            let exhaustive_initial = build_initial_states_exhaustive(
+                y_train,
+                bits_train,
+                row_words_train,
+                n_rows,
+                needed_words_train,
+                n_train,
+                group_ids,
+                literal_scores.as_slice(),
+                &params,
+            )?;
+            kept_all.extend(exhaustive_initial.iter().cloned());
+            let mut frontier = exhaustive_initial;
+            for _depth in 2..=exhaustive_depth {
+                let next = expand_states_exhaustive(
+                    frontier.as_slice(),
+                    y_train,
+                    sum_y_train,
+                    bits_train,
+                    row_words_train,
+                    n_rows,
+                    needed_words_train,
+                    n_train,
+                    group_ids,
+                    literal_scores.as_slice(),
+                    &params,
+                )?;
+                if next.is_empty() {
+                    frontier = Vec::new();
+                    break;
+                }
+                kept_all.extend(next.iter().cloned());
+                frontier = next;
+            }
+            sort_truncate_states(frontier, params.beam_width.max(1))
+        } else {
+            let beam = build_initial_beam(
+                y_train,
+                bits_train,
+                row_words_train,
+                n_rows,
+                needed_words_train,
+                n_train,
+                group_ids,
+                literal_scores.as_slice(),
+                &params,
+            )?;
+            kept_all.extend(beam.iter().cloned());
+            beam
+        };
+
+        for _depth in (exhaustive_depth + 1)..=max_depth {
+            let next = expand_beam_once(
+                &beam,
                 y_train,
                 sum_y_train,
                 bits_train,
@@ -2667,87 +2809,53 @@ pub fn beam_search_train_test_continuous(
                 &params,
             )?;
             if next.is_empty() {
-                frontier = Vec::new();
                 break;
             }
             kept_all.extend(next.iter().cloned());
-            frontier = next;
+            beam = next;
         }
-        sort_truncate_states(frontier, params.beam_width.max(1))
-    } else {
-        let beam = build_initial_beam(
-            y_train,
-            bits_train,
-            row_words_train,
-            n_rows,
-            needed_words_train,
-            n_train,
-            group_ids,
-            literal_scores.as_slice(),
-            &params,
-        )?;
-        kept_all.extend(beam.iter().cloned());
-        beam
-    };
 
-    for _depth in (exhaustive_depth + 1)..=max_depth {
-        let next = expand_beam_once(
-            &beam,
-            y_train,
-            sum_y_train,
-            bits_train,
-            row_words_train,
-            n_rows,
-            needed_words_train,
-            n_train,
-            group_ids,
-            literal_scores.as_slice(),
-            &params,
-        )?;
-        if next.is_empty() {
-            break;
-        }
-        kept_all.extend(next.iter().cloned());
-        beam = next;
-    }
+        let retained = dedup_states_by_train_bits(kept_all);
 
-    let retained = dedup_states_by_train_bits(kept_all);
-
-    let mut best_by_rule =
-        HashMap::<Vec<(usize, bool, u8)>, BeamRuleCandidate>::with_capacity(retained.len());
-    for state in retained.into_iter() {
-        let cand = collapse_surrogate_candidate(
-            &state,
-            y_train,
-            bits_train,
-            row_words_train,
-            n_rows,
-            n_train,
-            y_test,
-            bits_test,
-            row_words_test,
-            n_test,
-            literal_scores.as_slice(),
-            &params,
-        )?;
-        if !keep_rule_after_support_pruning(&cand.rule, &cand.test, n_test, &params) {
-            continue;
-        }
-        let key = cand.rule.lexical_key();
-        match best_by_rule.entry(key) {
-            std::collections::hash_map::Entry::Vacant(slot) => {
-                slot.insert(cand);
+        let mut best_by_rule =
+            HashMap::<Vec<(usize, bool, u8)>, BeamRuleCandidate>::with_capacity(retained.len());
+        for state in retained.into_iter() {
+            let cand = collapse_surrogate_candidate(
+                &state,
+                y_train,
+                bits_train,
+                row_words_train,
+                n_rows,
+                n_train,
+                y_test,
+                bits_test,
+                row_words_test,
+                n_test,
+                literal_scores.as_slice(),
+                &params,
+            )?;
+            if !keep_rule_after_support_pruning(&cand.rule, &cand.test, n_test, &params) {
+                continue;
             }
-            std::collections::hash_map::Entry::Occupied(mut slot) => {
-                if cmp_candidate(&cand, slot.get()) == std::cmp::Ordering::Less {
+            let key = cand.rule.lexical_key();
+            match best_by_rule.entry(key) {
+                std::collections::hash_map::Entry::Vacant(slot) => {
                     slot.insert(cand);
+                }
+                std::collections::hash_map::Entry::Occupied(mut slot) => {
+                    if cmp_candidate(&cand, slot.get()) == std::cmp::Ordering::Less {
+                        slot.insert(cand);
+                    }
                 }
             }
         }
-    }
-    let mut out = best_by_rule.into_values().collect::<Vec<_>>();
-    out.sort_by(cmp_candidate);
-    Ok(out)
+        let mut out = best_by_rule.into_values().collect::<Vec<_>>();
+        out.sort_by(cmp_candidate);
+        Ok(out)
+    })();
+    GARFIELD_BEAM_PROFILE_CALLS.fetch_add(1, Ordering::Relaxed);
+    GARFIELD_BEAM_PROFILE_TOTAL_NS.fetch_add(elapsed_ns_saturating(beam_t0), Ordering::Relaxed);
+    out
 }
 
 #[cfg(test)]
@@ -2790,6 +2898,7 @@ mod tests {
             y.len(),
             n_rows,
         )
+        .unwrap()
     }
 
     fn beam_state_from_rule_for_test(
@@ -3904,7 +4013,8 @@ mod tests {
             words_for_samples(y.len()),
             y.len(),
             rows.len(),
-        );
+        )
+        .unwrap();
         let parent_rule = BeamRule {
             first: BeamLiteral {
                 row_index: 0,
@@ -4019,7 +4129,8 @@ mod tests {
             words_for_samples(y.len()),
             y.len(),
             rows.len(),
-        );
+        )
+        .unwrap();
         let parent_rule = BeamRule {
             first: BeamLiteral {
                 row_index: 0,
@@ -4133,7 +4244,8 @@ mod tests {
             words_for_samples(y.len()),
             y.len(),
             rows.len(),
-        );
+        )
+        .unwrap();
         let child_rule = BeamRule {
             first: BeamLiteral {
                 row_index: 0,
@@ -4237,7 +4349,8 @@ mod tests {
             words_for_samples(y.len()),
             y.len(),
             rows.len(),
-        );
+        )
+        .unwrap();
         let child_rule = BeamRule {
             first: BeamLiteral {
                 row_index: 0,
@@ -4368,7 +4481,8 @@ mod tests {
             words_for_samples(y.len()),
             y.len(),
             rows.len(),
-        );
+        )
+        .unwrap();
         let child_rule = BeamRule {
             first: BeamLiteral {
                 row_index: 0,

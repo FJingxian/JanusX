@@ -1,16 +1,24 @@
 #![allow(dead_code)]
 
-use super::score::{score_cont_centered_gain_from_sum_and_n_hit, validate_continuous_y};
+use super::score::{
+    score_cont_centered_gain_from_sum_and_n_hit, score_cont_centered_gain_packed_with_n_hit,
+    validate_continuous_y, ContinuousRuleScore,
+};
 use numpy::ndarray::Array1;
 use numpy::{PyArray1, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods};
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+use objc::rc::autoreleasepool;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use pyo3::BoundObject;
+use std::cmp::min;
+use std::env;
+use std::mem::size_of;
 use std::time::Instant;
 
 #[derive(Clone, Debug)]
-struct BatchScoreParts {
+pub(crate) struct BatchScoreParts {
     raw_score: Vec<f64>,
     mean_hit: Vec<f64>,
     mean_miss: Vec<f64>,
@@ -204,6 +212,394 @@ fn batch_score_parts_to_pydict<'py>(
     Ok(out)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GarfieldCenteredGainBackendMode {
+    Legacy,
+    Cpu,
+    Gpu,
+    Auto,
+}
+
+#[derive(Clone, Debug)]
+struct SingletonScoreDiffMetrics {
+    max_abs_score_diff: f64,
+    mean_abs_score_diff: f64,
+    max_abs_raw_score_diff: f64,
+    mean_abs_raw_score_diff: f64,
+    max_abs_support_frac_diff: f64,
+}
+
+#[inline]
+fn words_for_samples(n_samples: usize) -> usize {
+    n_samples.div_ceil(64).max(1)
+}
+
+#[inline]
+fn tail_mask(n_samples: usize) -> Option<u64> {
+    let rem = n_samples & 63;
+    if rem == 0 {
+        None
+    } else {
+        Some((1u64 << rem) - 1u64)
+    }
+}
+
+#[inline]
+fn apply_tail_mask(bits: &mut [u64], mask: Option<u64>) {
+    if let Some(m) = mask {
+        if let Some(last) = bits.last_mut() {
+            *last &= m;
+        }
+    }
+}
+
+#[inline]
+fn complement_first_literal(bits: &[u64], n_samples: usize) -> Vec<u64> {
+    let needed_words = words_for_samples(n_samples);
+    let mut out = bits[..needed_words].to_vec();
+    for word in out.iter_mut() {
+        *word = !*word;
+    }
+    apply_tail_mask(&mut out, tail_mask(n_samples));
+    out
+}
+
+#[inline]
+fn batch_parts_row_to_score(parts: &BatchScoreParts, row_idx: usize) -> ContinuousRuleScore {
+    ContinuousRuleScore {
+        score: parts.raw_score[row_idx],
+        raw_score: parts.raw_score[row_idx],
+        mean_hit: parts.mean_hit[row_idx],
+        mean_miss: parts.mean_miss[row_idx],
+        support_frac: parts.support_frac[row_idx],
+        n_hit: parts.n_hit[row_idx] as usize,
+        n_miss: parts.n_miss[row_idx] as usize,
+    }
+}
+
+#[inline]
+fn singleton_scores_from_positive_parts(parts: &BatchScoreParts) -> Vec<ContinuousRuleScore> {
+    let mut out = Vec::with_capacity(parts.n_rows.saturating_mul(2));
+    for row_idx in 0..parts.n_rows {
+        out.push(batch_parts_row_to_score(parts, row_idx));
+        out.push(score_cont_centered_gain_from_sum_and_n_hit(
+            parts.total_sum,
+            parts.total_sum - parts.sum_hit[row_idx],
+            parts.n_samples,
+            parts
+                .n_samples
+                .saturating_sub(parts.n_hit[row_idx] as usize),
+        ));
+    }
+    out
+}
+
+pub(crate) fn score_cont_centered_gain_singletons_packed_legacy_impl(
+    y: &[f64],
+    bits_flat: &[u64],
+    row_words: usize,
+    n_rows: usize,
+    n_samples: usize,
+) -> Result<Vec<ContinuousRuleScore>, String> {
+    const CTX: &str = "garfield_score_cont_centered_gain_singletons_packed_legacy";
+    validate_batch_shape(y, row_words, n_rows, n_samples, CTX)?;
+    if bits_flat.len() != row_words.saturating_mul(n_rows) {
+        return Err(format!(
+            "{CTX}: bits size mismatch: got {}, expected {} (n_rows={} row_words={})",
+            bits_flat.len(),
+            row_words.saturating_mul(n_rows),
+            n_rows,
+            row_words
+        ));
+    }
+    let total_sum = y.iter().take(n_samples).copied().sum::<f64>();
+    let needed_words = words_for_samples(n_samples);
+    let mut out = Vec::with_capacity(n_rows.saturating_mul(2));
+    for row_idx in 0..n_rows {
+        let start = row_idx * row_words;
+        let row = &bits_flat[start..start + needed_words];
+        let n_hit = count_sum_y_where_bit1_row(row, y, n_samples).0 as usize;
+        out.push(score_cont_centered_gain_packed_with_n_hit(
+            y, row, n_samples, total_sum, n_hit,
+        ));
+        let neg_bits = complement_first_literal(row, n_samples);
+        let n_hit_neg = n_samples.saturating_sub(n_hit);
+        out.push(score_cont_centered_gain_packed_with_n_hit(
+            y,
+            neg_bits.as_slice(),
+            n_samples,
+            total_sum,
+            n_hit_neg,
+        ));
+    }
+    Ok(out)
+}
+
+pub(crate) fn score_cont_centered_gain_singletons_packed_cpu_impl(
+    y: &[f64],
+    bits_flat: &[u64],
+    row_words: usize,
+    n_rows: usize,
+    n_samples: usize,
+) -> Result<Vec<ContinuousRuleScore>, String> {
+    Ok(singleton_scores_from_positive_parts(
+        &score_cont_centered_gain_batch_packed_cpu_impl(
+            y, bits_flat, row_words, n_rows, n_samples,
+        )?,
+    ))
+}
+
+fn score_cont_centered_gain_singletons_packed_gpu_impl(
+    y: &[f64],
+    bits_flat: &[u64],
+    row_words: usize,
+    n_rows: usize,
+    n_samples: usize,
+) -> Result<Vec<ContinuousRuleScore>, String> {
+    let (parts, _device_name, _meta) = score_cont_centered_gain_batch_packed_metal_impl(
+        y, bits_flat, row_words, n_rows, n_samples, None,
+    )?;
+    Ok(singleton_scores_from_positive_parts(&parts))
+}
+
+#[inline]
+pub(crate) fn parse_centered_gain_backend_mode_from_env(
+) -> Result<GarfieldCenteredGainBackendMode, String> {
+    let raw = env::var("JX_GARFIELD_SCORE_BACKEND").unwrap_or_default();
+    let mode = raw.trim().to_ascii_lowercase();
+    match mode.as_str() {
+        "" | "auto" => Ok(GarfieldCenteredGainBackendMode::Auto),
+        "legacy" | "old" | "scalar" => Ok(GarfieldCenteredGainBackendMode::Legacy),
+        "cpu" | "batch_cpu" | "new_cpu" => Ok(GarfieldCenteredGainBackendMode::Cpu),
+        "gpu" | "metal" | "new_gpu" => Ok(GarfieldCenteredGainBackendMode::Gpu),
+        _ => Err(format!(
+            "JX_GARFIELD_SCORE_BACKEND must be one of: auto, legacy, cpu, gpu; got '{}'",
+            raw
+        )),
+    }
+}
+
+#[inline]
+pub(crate) fn centered_gain_backend_mode_is_auto(mode: GarfieldCenteredGainBackendMode) -> bool {
+    matches!(mode, GarfieldCenteredGainBackendMode::Auto)
+}
+
+#[inline]
+fn centered_gain_backend_mode_name(mode: GarfieldCenteredGainBackendMode) -> &'static str {
+    match mode {
+        GarfieldCenteredGainBackendMode::Legacy => "legacy",
+        GarfieldCenteredGainBackendMode::Cpu => "cpu",
+        GarfieldCenteredGainBackendMode::Gpu => "gpu",
+        GarfieldCenteredGainBackendMode::Auto => "auto",
+    }
+}
+
+#[derive(Clone, Debug)]
+struct GarfieldMetalRuntimeStatus {
+    compiled_with_metal_gpu_feature: bool,
+    platform_is_macos: bool,
+    runtime_device_available: bool,
+    score_gpu_ready: bool,
+    device_name: Option<String>,
+    error: Option<String>,
+}
+
+fn garfield_metal_runtime_status_impl() -> GarfieldMetalRuntimeStatus {
+    let mut status = GarfieldMetalRuntimeStatus {
+        compiled_with_metal_gpu_feature: cfg!(feature = "metal-gpu"),
+        platform_is_macos: cfg!(target_os = "macos"),
+        runtime_device_available: false,
+        score_gpu_ready: false,
+        device_name: None,
+        error: None,
+    };
+
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    {
+        use metal::Device;
+
+        let device = Device::system_default().or_else(|| Device::all().into_iter().next());
+        status.device_name = device.as_ref().map(|dev| dev.name().to_string());
+        status.runtime_device_available = status.device_name.is_some();
+        if !status.runtime_device_available {
+            status.error = Some("Metal device unavailable on this macOS host".to_string());
+            return status;
+        }
+
+        match metal_impl::MetalGarfieldScoreBatch::new(None) {
+            Ok(scanner) => {
+                status.score_gpu_ready = true;
+                status.device_name = Some(scanner.device_name().to_string());
+            }
+            Err(err) => {
+                status.error = Some(err);
+            }
+        }
+        return status;
+    }
+
+    #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
+    {
+        status.error = Some(if !cfg!(target_os = "macos") {
+            "Metal backend is only supported on macOS".to_string()
+        } else {
+            "garfield Metal score batch is unavailable; this JanusX build does not include \
+metal-gpu."
+                .to_string()
+        });
+        status
+    }
+}
+
+#[pyfunction(name = "garfield_metal_runtime_status")]
+pub fn garfield_metal_runtime_status_py<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+    let backend_mode_env = env::var("JX_GARFIELD_SCORE_BACKEND").unwrap_or_default();
+    let backend_mode = parse_centered_gain_backend_mode_from_env();
+    let status = py.detach(garfield_metal_runtime_status_impl);
+
+    let out = PyDict::new(py).into_bound();
+    out.set_item("platform", env::consts::OS)?;
+    out.set_item(
+        "compiled_with_metal_gpu_feature",
+        status.compiled_with_metal_gpu_feature,
+    )?;
+    out.set_item("platform_is_macos", status.platform_is_macos)?;
+    out.set_item("runtime_device_available", status.runtime_device_available)?;
+    out.set_item("score_gpu_ready", status.score_gpu_ready)?;
+    out.set_item("device_name", status.device_name)?;
+    out.set_item("error", status.error)?;
+    out.set_item("backend_mode_env", backend_mode_env.clone())?;
+    match backend_mode {
+        Ok(mode) => {
+            out.set_item("backend_mode", centered_gain_backend_mode_name(mode))?;
+            out.set_item("backend_mode_parse_error", Option::<String>::None)?;
+        }
+        Err(err) => {
+            out.set_item("backend_mode", Option::<String>::None)?;
+            out.set_item("backend_mode_parse_error", err)?;
+        }
+    }
+    Ok(out)
+}
+
+pub(crate) fn score_cont_centered_gain_singletons_packed_with_backend(
+    y: &[f64],
+    bits_flat: &[u64],
+    row_words: usize,
+    n_rows: usize,
+    n_samples: usize,
+) -> Result<(Vec<ContinuousRuleScore>, &'static str), String> {
+    match parse_centered_gain_backend_mode_from_env()? {
+        GarfieldCenteredGainBackendMode::Legacy => Ok((
+            score_cont_centered_gain_singletons_packed_legacy_impl(
+                y, bits_flat, row_words, n_rows, n_samples,
+            )?,
+            "legacy",
+        )),
+        GarfieldCenteredGainBackendMode::Cpu => Ok((
+            score_cont_centered_gain_singletons_packed_cpu_impl(
+                y, bits_flat, row_words, n_rows, n_samples,
+            )?,
+            "cpu",
+        )),
+        GarfieldCenteredGainBackendMode::Gpu => Ok((
+            score_cont_centered_gain_singletons_packed_gpu_impl(
+                y, bits_flat, row_words, n_rows, n_samples,
+            )?,
+            "gpu",
+        )),
+        GarfieldCenteredGainBackendMode::Auto => {
+            #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+            {
+                match score_cont_centered_gain_singletons_packed_gpu_impl(
+                    y, bits_flat, row_words, n_rows, n_samples,
+                ) {
+                    Ok(scores) => Ok((scores, "gpu")),
+                    Err(_) => Ok((
+                        score_cont_centered_gain_singletons_packed_cpu_impl(
+                            y, bits_flat, row_words, n_rows, n_samples,
+                        )?,
+                        "cpu",
+                    )),
+                }
+            }
+            #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
+            {
+                Ok((
+                    score_cont_centered_gain_singletons_packed_cpu_impl(
+                        y, bits_flat, row_words, n_rows, n_samples,
+                    )?,
+                    "cpu",
+                ))
+            }
+        }
+    }
+}
+
+fn diff_singleton_scores(
+    lhs: &[ContinuousRuleScore],
+    rhs: &[ContinuousRuleScore],
+) -> SingletonScoreDiffMetrics {
+    let n = lhs.len().min(rhs.len());
+    let mut out = SingletonScoreDiffMetrics {
+        max_abs_score_diff: 0.0,
+        mean_abs_score_diff: 0.0,
+        max_abs_raw_score_diff: 0.0,
+        mean_abs_raw_score_diff: 0.0,
+        max_abs_support_frac_diff: 0.0,
+    };
+    for i in 0..n {
+        let d_score = (lhs[i].score - rhs[i].score).abs();
+        let d_raw = (lhs[i].raw_score - rhs[i].raw_score).abs();
+        let d_frac = (lhs[i].support_frac - rhs[i].support_frac).abs();
+        out.max_abs_score_diff = out.max_abs_score_diff.max(d_score);
+        out.mean_abs_score_diff += d_score;
+        out.max_abs_raw_score_diff = out.max_abs_raw_score_diff.max(d_raw);
+        out.mean_abs_raw_score_diff += d_raw;
+        out.max_abs_support_frac_diff = out.max_abs_support_frac_diff.max(d_frac);
+    }
+    if n > 0 {
+        out.mean_abs_score_diff /= n as f64;
+        out.mean_abs_raw_score_diff /= n as f64;
+    }
+    out
+}
+
+#[inline]
+fn estimate_singleton_backend_working_bytes(
+    backend: GarfieldCenteredGainBackendMode,
+    n_rows: usize,
+    row_words: usize,
+    n_samples: usize,
+) -> usize {
+    let score_bytes = n_rows
+        .saturating_mul(2)
+        .saturating_mul(size_of::<ContinuousRuleScore>());
+    let host_parts_bytes = n_rows
+        .saturating_mul(6)
+        .saturating_mul(size_of::<f64>())
+        .saturating_add(n_rows.saturating_mul(2).saturating_mul(size_of::<u32>()));
+    let needed_words = words_for_samples(n_samples);
+    let legacy_scratch = needed_words.saturating_mul(size_of::<u64>());
+    let gpu_buffers = n_samples
+        .saturating_mul(size_of::<f32>())
+        .saturating_add(row_words.saturating_mul(size_of::<f32>()))
+        .saturating_add(n_rows.saturating_mul(size_of::<f32>()))
+        .saturating_add(n_rows.saturating_mul(size_of::<u32>()))
+        .saturating_add(
+            n_rows
+                .saturating_mul(row_words)
+                .saturating_mul(size_of::<u64>()),
+        );
+    match backend {
+        GarfieldCenteredGainBackendMode::Legacy => score_bytes.saturating_add(legacy_scratch),
+        GarfieldCenteredGainBackendMode::Cpu => score_bytes.saturating_add(host_parts_bytes),
+        GarfieldCenteredGainBackendMode::Gpu | GarfieldCenteredGainBackendMode::Auto => score_bytes
+            .saturating_add(host_parts_bytes)
+            .saturating_add(gpu_buffers),
+    }
+}
+
 const GPU_Y_PRECISION_NOTE: &str =
     "gpu path uses f32 accumulation; CPU reference is run on y cast to f32 then lifted to f64";
 
@@ -293,6 +689,7 @@ mod metal_impl {
         Buffer, CommandQueue, CompileOptions, ComputePipelineState, Device, MTLResourceOptions,
         MTLSize,
     };
+    use std::cell::RefCell;
     use std::cmp::min;
     use std::ffi::c_void;
     use std::mem::size_of;
@@ -462,6 +859,14 @@ mod metal_impl {
         cached_bits_len: usize,
         cached_y_word_ptr: usize,
         cached_y_word_len: usize,
+    }
+
+    thread_local! {
+        // Keep one scanner per worker thread and intentionally leak it to avoid
+        // repeated Metal object teardown on Rayon threads, which has been seen
+        // to panic inside foreign-types/metal drop paths on macOS.
+        static THREAD_LOCAL_BATCH: RefCell<Option<(Option<usize>, *mut MetalGarfieldScoreBatch)>> =
+            const { RefCell::new(None) };
     }
 
     impl MetalGarfieldScoreBatch {
@@ -857,6 +1262,27 @@ mod metal_impl {
             ))
         }
     }
+
+    pub(crate) fn with_thread_local_batch<R>(
+        requested_threads_per_threadgroup: Option<usize>,
+        f: impl FnOnce(&mut MetalGarfieldScoreBatch) -> Result<R, String>,
+    ) -> Result<R, String> {
+        let normalized = requested_threads_per_threadgroup.map(|v| v.max(1));
+        THREAD_LOCAL_BATCH.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let ptr = match *slot {
+                Some((cached_req, ptr)) if cached_req == normalized => ptr,
+                _ => {
+                    let boxed = Box::new(MetalGarfieldScoreBatch::new(normalized)?);
+                    let ptr = Box::into_raw(boxed);
+                    *slot = Some((normalized, ptr));
+                    ptr
+                }
+            };
+            let batch = unsafe { &mut *ptr };
+            f(batch)
+        })
+    }
 }
 
 #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
@@ -899,41 +1325,34 @@ fn score_cont_centered_gain_batch_packed_metal_impl(
         .take(n_samples)
         .map(|v| *v as f32)
         .collect::<Vec<_>>();
-    let y_word_sums = build_y_word_sums_f32(y_f32.as_slice(), row_words, n_samples);
     let total_sum = y_f32.iter().map(|v| *v as f64).sum::<f64>();
     #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-    let scanner = metal_impl::MetalGarfieldScoreBatch::new(threads_per_threadgroup)?;
+    {
+        return autoreleasepool(|| {
+            let y_word_sums = build_y_word_sums_f32(y_f32.as_slice(), row_words, n_samples);
+            let (sum_hit, n_hit, device_name, meta) =
+                metal_impl::with_thread_local_batch(threads_per_threadgroup, |scanner| {
+                    let device_name = scanner.device_name().to_string();
+                    let (sum_hit, n_hit, meta) = scanner.run_sum_hit_n_hit_optimized(
+                        y_f32.as_slice(),
+                        bits_flat,
+                        y_word_sums.as_slice(),
+                        row_words,
+                        n_rows,
+                        n_samples,
+                    )?;
+                    Ok((sum_hit, n_hit, device_name, meta))
+                })?;
+            let parts =
+                build_score_parts_from_sum_hit(sum_hit, n_hit, n_samples, total_sum, row_words);
+            Ok((parts, device_name, meta))
+        });
+    }
     #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
-    let _scanner = metal_impl::MetalGarfieldScoreBatch::new(threads_per_threadgroup)?;
-    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-    let device_name = scanner.device_name().to_string();
-    #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
-    let device_name = "unavailable".to_string();
-    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-    let (sum_hit, n_hit, meta) = {
-        let mut scanner = scanner;
-        scanner.run_sum_hit_n_hit_optimized(
-            y_f32.as_slice(),
-            bits_flat,
-            y_word_sums.as_slice(),
-            row_words,
-            n_rows,
-            n_samples,
-        )?
-    };
-    #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
-    let (sum_hit, n_hit, meta) = (
-        Vec::new(),
-        Vec::new(),
-        GpuRunMeta {
-            variant: "optimized",
-            y_precision: GPU_Y_PRECISION_NOTE,
-            actual_threads_per_threadgroup: 0,
-            thread_execution_width: 0,
-        },
-    );
-    let parts = build_score_parts_from_sum_hit(sum_hit, n_hit, n_samples, total_sum, row_words);
-    Ok((parts, device_name, meta))
+    {
+        let _scanner = metal_impl::MetalGarfieldScoreBatch::new(threads_per_threadgroup)?;
+        unreachable!("non-macOS/non-metal path must return from MetalGarfieldScoreBatch::new");
+    }
 }
 
 #[pyfunction(name = "garfield_score_cont_centered_gain_batch_packed_metal")]
@@ -1021,7 +1440,9 @@ pub fn garfield_compare_score_cont_centered_gain_batch_metal_vs_cpu_py<'py>(
                 .take(n_samples)
                 .map(|v| (*v as f32) as f64)
                 .collect::<Vec<_>>();
+            #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
             let y_f32 = y_f32_as_f64.iter().map(|v| *v as f32).collect::<Vec<_>>();
+            #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
             let y_word_sums = build_y_word_sums_f32(y_f32.as_slice(), row_words, n_samples);
             let mut cpu_last: Option<BatchScoreParts> = None;
             let mut gpu_legacy_last: Option<BatchScoreParts> = None;
@@ -1030,6 +1451,7 @@ pub fn garfield_compare_score_cont_centered_gain_batch_metal_vs_cpu_py<'py>(
             let mut gpu_legacy_times = Vec::with_capacity(reps);
             let mut gpu_opt_times = Vec::with_capacity(reps);
             let total_sum = y_f32_as_f64.iter().copied().sum::<f64>();
+            #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
             let mut scanner = metal_impl::MetalGarfieldScoreBatch::new(threads_per_threadgroup)?;
             #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
             let device_name = scanner.device_name().to_string();
@@ -1296,6 +1718,270 @@ pub fn garfield_compare_score_cont_centered_gain_batch_metal_vs_cpu_py<'py>(
     out.set_item("gpu_legacy_elapsed_ms_repeats", gpu_legacy_ms)?;
     out.set_item("gpu_optimized_elapsed_ms_repeats", gpu_opt_ms)?;
     out.set_item("y_precision", opt_meta.y_precision)?;
+    Ok(out)
+}
+
+#[pyfunction(name = "garfield_compare_score_cont_centered_gain_singleton_backends")]
+pub fn garfield_compare_score_cont_centered_gain_singleton_backends_py<'py>(
+    py: Python<'py>,
+    y: PyReadonlyArray1<'py, f64>,
+    bits: PyReadonlyArray2<'py, u64>,
+    n_samples: usize,
+    repeats: Option<usize>,
+    warmup: Option<usize>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let yv = y.as_slice()?;
+    let shape = bits.shape();
+    if shape.len() != 2 {
+        return Err(PyValueError::new_err("bits must be a 2D uint64 array"));
+    }
+    let n_rows = shape[0];
+    let row_words = shape[1];
+    let bits_flat = bits
+        .as_slice()
+        .map_err(|_| PyValueError::new_err("bits must be contiguous (C-order)"))?;
+    let reps = repeats.unwrap_or(3).max(1);
+    let warm = warmup.unwrap_or(1);
+
+    let (legacy_last, cpu_last, gpu_last, legacy_ms, cpu_ms, gpu_ms, gpu_available, gpu_error) = py
+        .detach(|| {
+            let mut legacy_last: Option<Vec<ContinuousRuleScore>> = None;
+            let mut cpu_last: Option<Vec<ContinuousRuleScore>> = None;
+            let mut gpu_last: Option<Vec<ContinuousRuleScore>> = None;
+            let mut legacy_ms = Vec::with_capacity(reps);
+            let mut cpu_ms = Vec::with_capacity(reps);
+            let mut gpu_ms = Vec::with_capacity(reps);
+            let mut gpu_available = true;
+            let mut gpu_error: Option<String> = None;
+
+            for _ in 0..warm {
+                let _ = score_cont_centered_gain_singletons_packed_legacy_impl(
+                    yv, bits_flat, row_words, n_rows, n_samples,
+                )?;
+                let _ = score_cont_centered_gain_singletons_packed_cpu_impl(
+                    yv, bits_flat, row_words, n_rows, n_samples,
+                )?;
+                #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+                {
+                    if gpu_available {
+                        if let Err(err) = score_cont_centered_gain_singletons_packed_gpu_impl(
+                            yv, bits_flat, row_words, n_rows, n_samples,
+                        ) {
+                            gpu_available = false;
+                            gpu_error = Some(err);
+                        }
+                    }
+                }
+            }
+
+            for _ in 0..reps {
+                let t0 = Instant::now();
+                let legacy = score_cont_centered_gain_singletons_packed_legacy_impl(
+                    yv, bits_flat, row_words, n_rows, n_samples,
+                )?;
+                legacy_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
+                legacy_last = Some(legacy);
+
+                let t1 = Instant::now();
+                let cpu = score_cont_centered_gain_singletons_packed_cpu_impl(
+                    yv, bits_flat, row_words, n_rows, n_samples,
+                )?;
+                cpu_ms.push(t1.elapsed().as_secs_f64() * 1000.0);
+                cpu_last = Some(cpu);
+
+                #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+                {
+                    if gpu_available {
+                        let t2 = Instant::now();
+                        match score_cont_centered_gain_singletons_packed_gpu_impl(
+                            yv, bits_flat, row_words, n_rows, n_samples,
+                        ) {
+                            Ok(gpu) => {
+                                gpu_ms.push(t2.elapsed().as_secs_f64() * 1000.0);
+                                gpu_last = Some(gpu);
+                            }
+                            Err(err) => {
+                                gpu_available = false;
+                                gpu_error = Some(err);
+                                gpu_ms.push(f64::NAN);
+                            }
+                        }
+                    } else {
+                        gpu_ms.push(f64::NAN);
+                    }
+                }
+            }
+
+            #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
+            {
+                gpu_available = false;
+                gpu_error = Some("metal-gpu feature unavailable in this build".to_string());
+                gpu_ms.push(f64::NAN);
+                gpu_last = Some(cpu_last.clone().unwrap_or_default());
+            }
+            #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+            if !gpu_available {
+                gpu_last = Some(cpu_last.clone().unwrap_or_default());
+            }
+
+            Ok::<_, String>((
+                legacy_last
+                    .ok_or_else(|| "legacy singleton benchmark produced no result".to_string())?,
+                cpu_last.ok_or_else(|| "cpu singleton benchmark produced no result".to_string())?,
+                gpu_last.ok_or_else(|| "gpu singleton benchmark produced no result".to_string())?,
+                legacy_ms,
+                cpu_ms,
+                gpu_ms,
+                gpu_available,
+                gpu_error,
+            ))
+        })
+        .map_err(PyRuntimeError::new_err)?;
+
+    let legacy_cpu_diff = diff_singleton_scores(&legacy_last, &cpu_last);
+    let legacy_gpu_diff = if gpu_available {
+        diff_singleton_scores(&legacy_last, &gpu_last)
+    } else {
+        SingletonScoreDiffMetrics {
+            max_abs_score_diff: f64::NAN,
+            mean_abs_score_diff: f64::NAN,
+            max_abs_raw_score_diff: f64::NAN,
+            mean_abs_raw_score_diff: f64::NAN,
+            max_abs_support_frac_diff: f64::NAN,
+        }
+    };
+    let cpu_gpu_diff = if gpu_available {
+        diff_singleton_scores(&cpu_last, &gpu_last)
+    } else {
+        SingletonScoreDiffMetrics {
+            max_abs_score_diff: f64::NAN,
+            mean_abs_score_diff: f64::NAN,
+            max_abs_raw_score_diff: f64::NAN,
+            mean_abs_raw_score_diff: f64::NAN,
+            max_abs_support_frac_diff: f64::NAN,
+        }
+    };
+    let legacy_elapsed_ms = legacy_ms.iter().copied().sum::<f64>() / (legacy_ms.len() as f64);
+    let cpu_elapsed_ms = cpu_ms.iter().copied().sum::<f64>() / (cpu_ms.len() as f64);
+    let gpu_elapsed_ms = gpu_ms.iter().copied().sum::<f64>() / (gpu_ms.len() as f64);
+
+    let out = PyDict::new(py).into_bound();
+    out.set_item("n_rows", n_rows)?;
+    out.set_item("row_words", row_words)?;
+    out.set_item("n_samples", n_samples)?;
+    out.set_item(
+        "n_singleton_scores",
+        min(legacy_last.len(), min(cpu_last.len(), gpu_last.len())),
+    )?;
+    out.set_item("repeats", reps)?;
+    out.set_item("warmup", warm)?;
+    out.set_item("gpu_available", gpu_available)?;
+    out.set_item("gpu_error", gpu_error)?;
+    out.set_item("legacy_elapsed_ms", legacy_elapsed_ms)?;
+    out.set_item("cpu_elapsed_ms", cpu_elapsed_ms)?;
+    out.set_item("gpu_elapsed_ms", gpu_elapsed_ms)?;
+    out.set_item(
+        "cpu_speedup_vs_legacy",
+        legacy_elapsed_ms / cpu_elapsed_ms.max(1e-12),
+    )?;
+    out.set_item(
+        "gpu_speedup_vs_legacy",
+        legacy_elapsed_ms / gpu_elapsed_ms.max(1e-12),
+    )?;
+    out.set_item(
+        "gpu_speedup_vs_cpu",
+        cpu_elapsed_ms / gpu_elapsed_ms.max(1e-12),
+    )?;
+    out.set_item(
+        "legacy_estimated_working_bytes",
+        estimate_singleton_backend_working_bytes(
+            GarfieldCenteredGainBackendMode::Legacy,
+            n_rows,
+            row_words,
+            n_samples,
+        ),
+    )?;
+    out.set_item(
+        "cpu_estimated_working_bytes",
+        estimate_singleton_backend_working_bytes(
+            GarfieldCenteredGainBackendMode::Cpu,
+            n_rows,
+            row_words,
+            n_samples,
+        ),
+    )?;
+    out.set_item(
+        "gpu_estimated_working_bytes",
+        estimate_singleton_backend_working_bytes(
+            GarfieldCenteredGainBackendMode::Gpu,
+            n_rows,
+            row_words,
+            n_samples,
+        ),
+    )?;
+    out.set_item("legacy_elapsed_ms_repeats", legacy_ms)?;
+    out.set_item("cpu_elapsed_ms_repeats", cpu_ms)?;
+    out.set_item("gpu_elapsed_ms_repeats", gpu_ms)?;
+    out.set_item(
+        "legacy_cpu_max_abs_score_diff",
+        legacy_cpu_diff.max_abs_score_diff,
+    )?;
+    out.set_item(
+        "legacy_cpu_mean_abs_score_diff",
+        legacy_cpu_diff.mean_abs_score_diff,
+    )?;
+    out.set_item(
+        "legacy_cpu_max_abs_raw_score_diff",
+        legacy_cpu_diff.max_abs_raw_score_diff,
+    )?;
+    out.set_item(
+        "legacy_cpu_mean_abs_raw_score_diff",
+        legacy_cpu_diff.mean_abs_raw_score_diff,
+    )?;
+    out.set_item(
+        "legacy_cpu_max_abs_support_frac_diff",
+        legacy_cpu_diff.max_abs_support_frac_diff,
+    )?;
+    out.set_item(
+        "legacy_gpu_max_abs_score_diff",
+        legacy_gpu_diff.max_abs_score_diff,
+    )?;
+    out.set_item(
+        "legacy_gpu_mean_abs_score_diff",
+        legacy_gpu_diff.mean_abs_score_diff,
+    )?;
+    out.set_item(
+        "legacy_gpu_max_abs_raw_score_diff",
+        legacy_gpu_diff.max_abs_raw_score_diff,
+    )?;
+    out.set_item(
+        "legacy_gpu_mean_abs_raw_score_diff",
+        legacy_gpu_diff.mean_abs_raw_score_diff,
+    )?;
+    out.set_item(
+        "legacy_gpu_max_abs_support_frac_diff",
+        legacy_gpu_diff.max_abs_support_frac_diff,
+    )?;
+    out.set_item(
+        "cpu_gpu_max_abs_score_diff",
+        cpu_gpu_diff.max_abs_score_diff,
+    )?;
+    out.set_item(
+        "cpu_gpu_mean_abs_score_diff",
+        cpu_gpu_diff.mean_abs_score_diff,
+    )?;
+    out.set_item(
+        "cpu_gpu_max_abs_raw_score_diff",
+        cpu_gpu_diff.max_abs_raw_score_diff,
+    )?;
+    out.set_item(
+        "cpu_gpu_mean_abs_raw_score_diff",
+        cpu_gpu_diff.mean_abs_raw_score_diff,
+    )?;
+    out.set_item(
+        "cpu_gpu_max_abs_support_frac_diff",
+        cpu_gpu_diff.max_abs_support_frac_diff,
+    )?;
     Ok(out)
 }
 

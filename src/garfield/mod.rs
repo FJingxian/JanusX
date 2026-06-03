@@ -5,6 +5,7 @@ mod sampling;
 mod score;
 mod score_gpu;
 
+use self::bs::{reset_garfield_beam_profile, snapshot_garfield_beam_profile};
 use self::permutation::{
     bucket_from_expr, bucket_from_rule, choose_representative_indices,
     null_topk_per_repeat_for_bucket, shuffled_copy_f64, RuleNullBucket, RuleNullCalibrator,
@@ -52,6 +53,7 @@ use std::io::{BufRead, BufReader, BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 #[allow(unused_imports)]
 pub use bs::{
@@ -72,7 +74,8 @@ pub use score::{
 };
 pub use score_gpu::{
     garfield_compare_score_cont_centered_gain_batch_metal_vs_cpu_py,
-    garfield_score_cont_centered_gain_batch_packed_cpu_py,
+    garfield_compare_score_cont_centered_gain_singleton_backends_py,
+    garfield_metal_runtime_status_py, garfield_score_cont_centered_gain_batch_packed_cpu_py,
     garfield_score_cont_centered_gain_batch_packed_metal_py,
 };
 
@@ -96,6 +99,15 @@ fn strict_maf_support_count(n_samples: usize, maf_threshold: f32) -> usize {
         return 1;
     }
     ((f64::from(maf_threshold) * (n_samples as f64)).floor() as usize).saturating_add(1)
+}
+
+#[inline]
+fn timing_share_pct(part_s: f64, whole_s: f64) -> f64 {
+    if part_s.is_finite() && whole_s.is_finite() && whole_s > 0.0 {
+        (part_s / whole_s) * 100.0
+    } else {
+        0.0
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2323,6 +2335,16 @@ struct GarfieldLogicPipelineResult {
     n_samples: usize,
     units_total: usize,
     units_scanned: usize,
+    timing_total_wall_s: f64,
+    timing_scan_wall_s: f64,
+    timing_scan_beam_wall_s: f64,
+    timing_scan_literal_score_wall_s: f64,
+    timing_scan_beam_calls: usize,
+    timing_literal_score_share_of_total_pct: f64,
+    timing_literal_score_share_of_scan_pct: f64,
+    timing_literal_score_share_of_beam_pct: f64,
+    timing_beam_share_of_total_pct: f64,
+    timing_beam_share_of_scan_pct: f64,
     skipped_messages: Vec<String>,
     train_fit: GarfieldResidualResult,
     test_fit: GarfieldResidualResult,
@@ -5865,6 +5887,7 @@ fn garfield_logic_search_bed_owned(
     progress_callback: Option<Py<PyAny>>,
     progress_every: usize,
 ) -> Result<GarfieldLogicPipelineResult, String> {
+    let total_wall_t0 = Instant::now();
     validate_continuous_y(&y)?;
     let using_external_grm = grm.is_some();
     let fam_sample_ids = read_fam(normalize_plink_prefix(&prefix).as_str())?;
@@ -6845,6 +6868,8 @@ fn garfield_logic_search_bed_owned(
     } else {
         progress_every.max(1)
     };
+    reset_garfield_beam_profile();
+    let scan_stage_t0 = Instant::now();
     let scan_progress_done = AtomicUsize::new(0);
     garfield_stage_progress_notify(
         progress_callback.as_ref(),
@@ -6994,6 +7019,8 @@ fn garfield_logic_search_bed_owned(
         .map_err(|_| "GARFIELD skipped-messages still shared".to_string())?
         .into_inner()
         .map_err(|_| "GARFIELD skipped-messages mutex poisoned".to_string())?;
+    let scan_stage_wall_s = scan_stage_t0.elapsed().as_secs_f64();
+    let scan_beam_profile = snapshot_garfield_beam_profile();
 
     records = dedup_logic_rule_records(records);
     apply_logic_rule_output_limit(&mut records, max_output_rules, max_output_ratio)?;
@@ -7042,6 +7069,18 @@ fn garfield_logic_search_bed_owned(
     } else {
         0usize
     };
+    let total_wall_s = total_wall_t0.elapsed().as_secs_f64();
+    let timing_scan_beam_wall_s = scan_beam_profile.total_s;
+    let timing_scan_literal_score_wall_s = scan_beam_profile.literal_precompute_s;
+    let timing_literal_score_share_of_total_pct =
+        timing_share_pct(timing_scan_literal_score_wall_s, total_wall_s);
+    let timing_literal_score_share_of_scan_pct =
+        timing_share_pct(timing_scan_literal_score_wall_s, scan_stage_wall_s);
+    let timing_literal_score_share_of_beam_pct =
+        timing_share_pct(timing_scan_literal_score_wall_s, timing_scan_beam_wall_s);
+    let timing_beam_share_of_total_pct = timing_share_pct(timing_scan_beam_wall_s, total_wall_s);
+    let timing_beam_share_of_scan_pct =
+        timing_share_pct(timing_scan_beam_wall_s, scan_stage_wall_s);
 
     let structure_prior_for_output = rule_structure_prior.clone();
     let mut pseudo_prefix_out = None;
@@ -7094,6 +7133,16 @@ fn garfield_logic_search_bed_owned(
         n_samples: logic_bits.n_samples,
         units_total: total_units,
         units_scanned: scanned_units,
+        timing_total_wall_s: total_wall_s,
+        timing_scan_wall_s: scan_stage_wall_s,
+        timing_scan_beam_wall_s,
+        timing_scan_literal_score_wall_s,
+        timing_scan_beam_calls: scan_beam_profile.calls,
+        timing_literal_score_share_of_total_pct,
+        timing_literal_score_share_of_scan_pct,
+        timing_literal_score_share_of_beam_pct,
+        timing_beam_share_of_total_pct,
+        timing_beam_share_of_scan_pct,
         skipped_messages,
         train_fit,
         test_fit,
@@ -7344,6 +7393,34 @@ pub fn garfield_logic_search_bed_py<'py>(
     out.set_item("n_samples", result.n_samples)?;
     out.set_item("units_total", result.units_total)?;
     out.set_item("units_scanned", result.units_scanned)?;
+    out.set_item("timing_total_wall_s", result.timing_total_wall_s)?;
+    out.set_item("timing_scan_wall_s", result.timing_scan_wall_s)?;
+    out.set_item("timing_scan_beam_wall_s", result.timing_scan_beam_wall_s)?;
+    out.set_item(
+        "timing_scan_literal_score_wall_s",
+        result.timing_scan_literal_score_wall_s,
+    )?;
+    out.set_item("timing_scan_beam_calls", result.timing_scan_beam_calls)?;
+    out.set_item(
+        "timing_literal_score_share_of_total_pct",
+        result.timing_literal_score_share_of_total_pct,
+    )?;
+    out.set_item(
+        "timing_literal_score_share_of_scan_pct",
+        result.timing_literal_score_share_of_scan_pct,
+    )?;
+    out.set_item(
+        "timing_literal_score_share_of_beam_pct",
+        result.timing_literal_score_share_of_beam_pct,
+    )?;
+    out.set_item(
+        "timing_beam_share_of_total_pct",
+        result.timing_beam_share_of_total_pct,
+    )?;
+    out.set_item(
+        "timing_beam_share_of_scan_pct",
+        result.timing_beam_share_of_scan_pct,
+    )?;
     out.set_item("n_skipped_units", result.skipped_messages.len())?;
     out.set_item("skipped_messages", result.skipped_messages.clone())?;
     out.set_item("train_pve", result.train_fit.pve)?;

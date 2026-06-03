@@ -267,21 +267,25 @@ except Exception:
 try:
     from janusx.janusx import (
         glmf32_packed as _glmf32_packed,
+        lm_block_assoc_packed as _lm_block_assoc_packed,
         bed_packed_row_flip_mask as _bed_packed_row_flip_mask,
         bed_packed_decode_rows_f32 as _bed_packed_decode_rows_f32,
         farmcpu_rem_dense as _farmcpu_rem_dense,
         farmcpu_rem_packed as _farmcpu_rem_packed,
         farmcpu_super_dense as _farmcpu_super_dense,
         farmcpu_super_packed as _farmcpu_super_packed,
+        farmcpu_dense as _farmcpu_dense,
     )
 except Exception:
     _glmf32_packed = None
+    _lm_block_assoc_packed = None
     _bed_packed_row_flip_mask = None
     _bed_packed_decode_rows_f32 = None
     _farmcpu_rem_dense = None
     _farmcpu_rem_packed = None
     _farmcpu_super_dense = None
     _farmcpu_super_packed = None
+    _farmcpu_dense = None
 
 
 def _infer_blas_threads_from_env() -> Optional[int]:
@@ -562,10 +566,6 @@ def FEM(
 
     packed_ctx = _coerce_bed_packed_ctx(M)
     if packed_ctx is not None:
-        if _glmf32_packed is None:
-            raise RuntimeError(
-                "Rust extension missing glmf32_packed. Rebuild janusx extension."
-            )
         sidx = _normalize_sample_indices(
             sample_indices,
             int(packed_ctx["n_samples"]),
@@ -575,6 +575,25 @@ def FEM(
             raise ValueError(
                 f"Packed n_samples={packed_ctx['n_samples']} does not match len(y)={y.shape[0]}. "
                 "Provide sample_indices to align packed genotype samples."
+            )
+        if _lm_block_assoc_packed is not None:
+            return np.asarray(
+                _lm_block_assoc_packed(
+                    y,
+                    X,
+                    ixx,
+                    packed_ctx["packed"],
+                    int(packed_ctx["n_samples"]),
+                    packed_ctx["row_flip"],
+                    packed_ctx["maf"],
+                    sidx,
+                    int(chunksize),
+                    int(threads),
+                )
+            )
+        if _glmf32_packed is None:
+            raise RuntimeError(
+                "Rust extension missing glmf32_packed. Rebuild janusx extension."
             )
         return np.asarray(
             _glmf32_packed(
@@ -2439,6 +2458,58 @@ def farmcpu(
 
     # Add intercept
     X = np.concatenate([np.ones((y.shape[0], 1)), X], axis=1) if X is not None else np.ones((y.shape[0], 1))
+
+    # Fast path: Rust dense FarmCPU (full loop in Rust, no Python iteration)
+    if packed_ctx is None and _farmcpu_dense is not None:
+        # Parse return_info early for the fast path
+        if isinstance(return_info, str):
+            mode_fast = return_info.strip().lower()
+            if mode_fast in ("", "0", "false", "off", "no", "none"):
+                need_info_fast, collect_trace_fast = False, False
+            elif mode_fast in ("1", "true", "on", "yes", "summary"):
+                need_info_fast, collect_trace_fast = True, False
+            else:
+                need_info_fast, collect_trace_fast = True, True
+        else:
+            need_info_fast, collect_trace_fast = bool(return_info), False
+
+        y_contig = np.ascontiguousarray(y, dtype=np.float64)
+        # X has intercept in col 0; pass covariates only
+        if X.shape[1] > 1:
+            X_cov = np.ascontiguousarray(X[:, 1:], dtype=np.float64)
+        else:
+            X_cov = np.ascontiguousarray(np.zeros((y.shape[0], 0), dtype=np.float64))
+        g_contig = np.ascontiguousarray(M_work, dtype=np.float32)
+        chrom_list = [str(c) for c in np.asarray(chrlist).reshape(-1)]
+        pos_list = [int(p) for p in np.asarray(poslist, dtype=np.int64).reshape(-1)]
+        # nbin is now the grid array; nbin_den holds the original user value
+        beta, se, pval, qtn_idx_arr, n_pseudo_qtn, n_obs, df_lrt = _farmcpu_dense(
+            y_contig,
+            X_cov,
+            g_contig,
+            chrom_list,
+            pos_list,
+            threshold=float(threshold),
+            max_iter=int(iter),
+            qtn_bound=QTNbound,
+            nbin=nbin_den,
+            szbin=[float(sz) for sz in np.asarray(szbin).reshape(-1).tolist()],
+            threads=int(fem_threads),
+            progress_callback=progress_cb,
+        )
+        beta_se = np.column_stack([np.asarray(beta, dtype=np.float64).reshape(-1),
+                                    np.asarray(se, dtype=np.float64).reshape(-1)])
+        p_col = np.asarray(pval, dtype=np.float64).reshape(-1, 1)
+        out = np.concatenate([beta_se, p_col], axis=1)
+        if need_info_fast:
+            info: Dict[str, Any] = {
+                "n_pseudo_qtn": int(n_pseudo_qtn),
+                "qtn_idx": [int(x) for x in np.asarray(qtn_idx_arr, dtype=np.int64).reshape(-1).tolist()],
+            }
+            if collect_trace_fast:
+                info["trace"] = []
+            return out, info
+        return out
 
     if isinstance(return_info, str):
         mode = return_info.strip().lower()

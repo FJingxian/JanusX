@@ -124,8 +124,8 @@ use admixture::{
 };
 use algwas::algwas_packed_to_tsv;
 use assoc::{
-    farmcpu_packed_to_tsv, farmcpu_rem_dense, farmcpu_rem_packed, farmcpu_super_dense,
-    farmcpu_super_packed, farmcpu_write_assoc_tsv,
+    farmcpu_dense, farmcpu_packed_to_tsv, farmcpu_rem_dense, farmcpu_rem_packed,
+    farmcpu_super_dense, farmcpu_super_packed, farmcpu_write_assoc_tsv,
 };
 use bayes::{
     bayesa, bayesa_packed, bayesa_packed_trace, bayesb, bayesb_packed, bayesb_packed_trace,
@@ -173,7 +173,7 @@ use gfreader::{
 };
 use glm::{
     glm_ixx_from_x_qr, glmf32, glmf32_full, glmf32_packed, glmf32_packed_assoc,
-    glmf32_packed_assoc_to_tsv, lm_stream_bed_to_tsv,
+    glmf32_packed_assoc_to_tsv, lm_block_assoc_packed, lm_stream_bed_to_tsv,
 };
 use gmerge::{convert_genotypes, merge_genotypes, PyConvertStats, PyMergeStats};
 use grm::{
@@ -349,6 +349,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(glmf32_packed_assoc_to_tsv, m)?)?;
     m.add_function(wrap_pyfunction!(algwas_packed_to_tsv, m)?)?;
     m.add_function(wrap_pyfunction!(lm_stream_bed_to_tsv, m)?)?;
+    m.add_function(wrap_pyfunction!(lm_block_assoc_packed, m)?)?;
     m.add_function(wrap_pyfunction!(grm_sim_bench_f32, m)?)?;
     m.add_function(wrap_pyfunction!(bed_packed_row_flip_mask, m)?)?;
     m.add_function(wrap_pyfunction!(bed_packed_decode_rows_f32, m)?)?;
@@ -411,6 +412,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(farmcpu_super_dense, m)?)?;
     m.add_function(wrap_pyfunction!(farmcpu_super_packed, m)?)?;
     m.add_function(wrap_pyfunction!(farmcpu_packed_to_tsv, m)?)?;
+    m.add_function(wrap_pyfunction!(farmcpu_dense, m)?)?;
     m.add_function(wrap_pyfunction!(gwas_packed_unified_to_tsv, m)?)?;
     m.add_function(wrap_pyfunction!(gwas_trait_model_dispatch_v2, m)?)?;
     m.add_function(wrap_pyfunction!(gwas_trait_model_schedule, m)?)?;

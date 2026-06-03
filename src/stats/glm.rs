@@ -14,14 +14,19 @@ use std::fmt::Write as _;
 use std::fs;
 use std::fs::File;
 use std::hash::{Hash, Hasher};
+use std::sync::mpsc;
 use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
+use std::thread;
 
 use crate::bedmath::{
     adaptive_grm_block_rows, decode_mean_imputed_additive_packed_block_rows_f32,
     decode_plink_bed_hardcall, is_identity_indices, packed_byte_lut,
 };
-use crate::blas::{rust_sgemm_prefers_rayon_rowmajor_f32_kernel, BlasThreadGuard};
+use crate::blas::{
+    cblas_sgemm_dispatch, rust_sgemm_prefers_rayon_rowmajor_f32_kernel, BlasThreadGuard, CblasInt,
+    CBLAS_NO_TRANS, CBLAS_ROW_MAJOR, CBLAS_TRANS,
+};
 use crate::gfcore;
 use crate::gfcore::BedSnpIter;
 use crate::gfreader::{build_sample_selection, prepare_bed_logic_meta_owned_for_stats_samples};
@@ -1887,12 +1892,363 @@ pub fn glmf32_packed_assoc<'py>(
             Ok(())
         };
 
-        if let Some(p) = &pool {
-            p.install(runner)?;
-        } else {
-            runner()?;
+        runner()
+    })?;
+
+    Ok(out)
+}
+
+/// Unified LM block formula using centered/residualized approach with BLAS-3.
+///
+/// Precomputes r_y = M_X y = y - X @ C @ (X^T @ y) where C = (X^T X)^{-1}.
+/// Then decodes genotype in blocks and uses sgemm for X^T @ G_b,
+/// with double buffering to overlap decode and compute.
+///
+/// Formula per block:
+///   U = X^T @ G_b          (sgemm, f32)
+///   a = G_b @ r_y          (sgemm, f32)
+///   d = colsum(G_b^2)      (f64)
+///   V = C @ U              (f64)
+///   s = d - colsum(U ⊙ V)  (f64)
+///   beta = a / s
+///   se = sqrt(ve / s) where ve = (yy_r - a*beta) / (n - q0 - 1)
+#[pyfunction]
+#[pyo3(signature = (
+    y,
+    x,
+    ixx,
+    packed,
+    n_samples,
+    row_flip,
+    row_maf,
+    sample_indices=None,
+    chunk_size=10000,
+    threads=0
+))]
+pub fn lm_block_assoc_packed<'py>(
+    py: Python<'py>,
+    y: PyReadonlyArray1<'py, f64>,
+    x: PyReadonlyArray2<'py, f64>,
+    ixx: PyReadonlyArray2<'py, f64>,
+    packed: PyReadonlyArray2<'py, u8>,
+    n_samples: usize,
+    row_flip: PyReadonlyArray1<'py, bool>,
+    row_maf: PyReadonlyArray1<'py, f32>,
+    sample_indices: Option<PyReadonlyArray1<'py, i64>>,
+    chunk_size: usize,
+    threads: usize,
+) -> PyResult<Bound<'py, PyArray2<f64>>> {
+    if n_samples == 0 {
+        return Err(PyRuntimeError::new_err("n_samples must be > 0"));
+    }
+    if chunk_size == 0 {
+        return Err(PyRuntimeError::new_err("chunk_size must be > 0"));
+    }
+    let y_slice = y.as_slice()?;
+    let x_arr = x.as_array();
+    let ixx_arr = ixx.as_array();
+    let packed_arr = packed.as_array();
+
+    if packed_arr.ndim() != 2 {
+        return Err(PyRuntimeError::new_err(
+            "packed must be 2D (m, bytes_per_snp)",
+        ));
+    }
+    let m = packed_arr.shape()[0];
+    let bytes_per_snp = packed_arr.shape()[1];
+    let expected_bps = (n_samples + 3) / 4;
+    if bytes_per_snp != expected_bps {
+        return Err(PyRuntimeError::new_err(format!(
+            "packed second dimension mismatch: got {bytes_per_snp}, expected {expected_bps}"
+        )));
+    }
+
+    let row_flip = row_flip.as_slice()?;
+    let row_maf = row_maf.as_slice()?;
+    if row_flip.len() != m {
+        return Err(PyRuntimeError::new_err(format!(
+            "row_flip length mismatch: got {}, expected {m}",
+            row_flip.len()
+        )));
+    }
+    if row_maf.len() != m {
+        return Err(PyRuntimeError::new_err(format!(
+            "row_maf length mismatch: got {}, expected {m}",
+            row_maf.len()
+        )));
+    }
+
+    let sample_idx: Vec<usize> = if let Some(sidx) = sample_indices {
+        parse_index_vec_i64(sidx.as_slice()?, n_samples, "sample_indices")?
+    } else {
+        (0..n_samples).collect()
+    };
+    let n = y_slice.len();
+    if sample_idx.len() != n {
+        return Err(PyRuntimeError::new_err(format!(
+            "sample_indices length mismatch: got {}, expected len(y)={n}",
+            sample_idx.len()
+        )));
+    }
+
+    let (xn, q0) = (x_arr.shape()[0], x_arr.shape()[1]);
+    if xn != n {
+        return Err(PyRuntimeError::new_err("X.n_rows must equal len(y)"));
+    }
+    if ixx_arr.shape()[0] != q0 || ixx_arr.shape()[1] != q0 {
+        return Err(PyRuntimeError::new_err("ixx must be (q0,q0)"));
+    }
+    if n <= q0 + 1 {
+        return Err(PyRuntimeError::new_err(format!(
+            "n too small: require n > q0+1, got n={n}, q0={q0}"
+        )));
+    }
+    let df = (n as i32) - (q0 as i32) - 1;
+
+    let x_flat: Cow<[f64]> = match x.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(x_arr.iter().copied().collect()),
+    };
+    let ixx_flat: Cow<[f64]> = match ixx.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(ixx_arr.iter().copied().collect()),
+    };
+    let packed_flat: Cow<[u8]> = match packed.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(packed_arr.iter().copied().collect()),
+    };
+
+    // ---- Precompute r_y = M_X y = y - X @ C @ (X^T @ y) ----
+    let mut xy = vec![0.0_f64; q0];
+    for i in 0..n {
+        let yi = y_slice[i];
+        let row = &x_flat[i * q0..(i + 1) * q0];
+        for j in 0..q0 {
+            xy[j] += row[j] * yi;
         }
-        Ok(())
+    }
+    // C @ xy = ixx @ xy -> projection weights
+    let mut c_xy = vec![0.0_f64; q0];
+    for i in 0..q0 {
+        let mut acc = 0.0_f64;
+        let row = &ixx_flat[i * q0..(i + 1) * q0];
+        for j in 0..q0 {
+            acc += row[j] * xy[j];
+        }
+        c_xy[i] = acc;
+    }
+    // r_y = y - X @ (C @ xy)
+    let mut ry = vec![0.0_f64; n];
+    let mut yy_r = 0.0_f64;
+    for i in 0..n {
+        let xrow = &x_flat[i * q0..(i + 1) * q0];
+        let mut pred = 0.0_f64;
+        for j in 0..q0 {
+            pred += xrow[j] * c_xy[j];
+        }
+        let resid = y_slice[i] - pred;
+        ry[i] = resid;
+        yy_r += resid * resid;
+    }
+
+    // Convert r_y and X to f32 for sgemm
+    let ry_f32: Vec<f32> = ry.iter().map(|&v| v as f32).collect();
+    let x_f32: Vec<f32> = x_flat.iter().map(|&v| v as f32).collect();
+
+    // Output: beta(0), se(1), pwald(2), plrt(3)
+    let out = PyArray2::<f64>::zeros(py, [m, 4], false).into_bound();
+    let out_slice: &mut [f64] = unsafe {
+        out.as_slice_mut()
+            .map_err(|_| PyRuntimeError::new_err("output not contiguous"))?
+    };
+
+    let code4_lut = &packed_byte_lut().code4;
+    let full_sample_fast = sample_idx.iter().enumerate().all(|(i, &s)| i == s);
+
+    let _blas_guard = BlasThreadGuard::enter(threads.max(1));
+
+    let block_rows = chunk_size.min(m).max(1);
+
+    py.detach(|| -> PyResult<()> {
+        let runner = || -> PyResult<()> {
+            let g_buf_len = block_rows * n;
+            let (task_tx, task_rx) = mpsc::sync_channel::<(usize, usize, Vec<f32>)>(2);
+            let (done_tx, done_rx) = mpsc::sync_channel::<(usize, usize, Vec<f32>)>(2);
+
+            let decode_pool: Option<Arc<rayon::ThreadPool>> = None;
+
+            thread::scope(|scope| {
+                // Decode thread
+                scope.spawn(move || {
+                    while let Ok((start, rows, mut buf)) = task_rx.recv() {
+                        let buf_slice = &mut buf[..rows * n];
+                        let _ = decode_mean_imputed_additive_packed_block_rows_f32(
+                            &packed_flat,
+                            bytes_per_snp,
+                            n_samples,
+                            &row_flip,
+                            &row_maf,
+                            &sample_idx,
+                            full_sample_fast,
+                            None,
+                            start,
+                            buf_slice,
+                            code4_lut,
+                            decode_pool.as_ref(),
+                        );
+                        if done_tx.send((start, rows, buf)).is_err() {
+                            break;
+                        }
+                    }
+                });
+
+                // Seed pipeline with 2 buffers
+                let mut next_start = 0usize;
+                let mut inflight = 0usize;
+                for _ in 0..2 {
+                    if next_start >= m {
+                        break;
+                    }
+                    let rows = (m - next_start).min(block_rows);
+                    task_tx
+                        .send((next_start, rows, vec![0.0_f32; g_buf_len]))
+                        .expect("lm block pipeline task send");
+                    next_start += rows;
+                    inflight += 1;
+                }
+
+                // Process completed blocks
+                while inflight > 0 {
+                    let (start, rows, g_buf) = done_rx.recv().expect("lm block pipeline recv");
+                    inflight -= 1;
+
+                    let g_block = &g_buf[..rows * n];
+
+                    // ---- U = X^T @ G_b (q0 x rows, f32) ----
+                    let mut u_block = vec![0.0_f32; q0 * rows];
+                    if q0 > 0 {
+                        unsafe {
+                            cblas_sgemm_dispatch(
+                                CBLAS_ROW_MAJOR,
+                                CBLAS_TRANS,
+                                CBLAS_TRANS,
+                                q0 as CblasInt,
+                                rows as CblasInt,
+                                n as CblasInt,
+                                1.0_f32,
+                                x_f32.as_ptr(),
+                                q0 as CblasInt,
+                                g_block.as_ptr(),
+                                n as CblasInt,
+                                0.0_f32,
+                                u_block.as_mut_ptr(),
+                                rows as CblasInt,
+                            );
+                        }
+                    }
+
+                    // ---- a = G_b @ r_y (rows, f32) ----
+                    let mut a_block = vec![0.0_f32; rows];
+                    unsafe {
+                        cblas_sgemm_dispatch(
+                            CBLAS_ROW_MAJOR,
+                            CBLAS_NO_TRANS,
+                            CBLAS_NO_TRANS,
+                            rows as CblasInt,
+                            1 as CblasInt,
+                            n as CblasInt,
+                            1.0_f32,
+                            g_block.as_ptr(),
+                            n as CblasInt,
+                            ry_f32.as_ptr(),
+                            1 as CblasInt,
+                            0.0_f32,
+                            a_block.as_mut_ptr(),
+                            1 as CblasInt,
+                        );
+                    }
+
+                    // ---- d = colsum(G_b^2) (rows, f64) ----
+                    let mut d_block = vec![0.0_f64; rows];
+                    for j in 0..rows {
+                        let row_g = &g_block[j * n..(j + 1) * n];
+                        let mut ss = 0.0_f64;
+                        for &v in row_g {
+                            let vf = v as f64;
+                            ss += vf * vf;
+                        }
+                        d_block[j] = ss;
+                    }
+
+                    // ---- V = C @ U, s = d - colsum(U ⊙ V), per-SNP stats in f64 ----
+                    for j in 0..rows {
+                        // Extract U[:,j] as f64 column vector
+                        let mut uj = vec![0.0_f64; q0];
+                        for k in 0..q0 {
+                            uj[k] = u_block[k * rows + j] as f64;
+                        }
+                        // V_j = C @ U_j
+                        let mut vj = vec![0.0_f64; q0];
+                        for k in 0..q0 {
+                            let crow = &ixx_flat[k * q0..(k + 1) * q0];
+                            let mut acc = 0.0_f64;
+                            for t in 0..q0 {
+                                acc += crow[t] * uj[t];
+                            }
+                            vj[k] = acc;
+                        }
+                        // correction = sum_k U_j[k] * V_j[k]
+                        let mut correction = 0.0_f64;
+                        for k in 0..q0 {
+                            correction += uj[k] * vj[k];
+                        }
+                        let s_j = d_block[j] - correction;
+
+                        let a_j = a_block[j] as f64;
+
+                        let (beta_j, se_j, pwald, plrt) = if s_j < 1e-12 || !s_j.is_finite() {
+                            (f64::NAN, f64::NAN, f64::NAN, f64::NAN)
+                        } else {
+                            let b = a_j / s_j;
+                            let rss = (yy_r - b * a_j).max(0.0);
+                            let ve = rss / (df as f64);
+                            if ve <= 0.0 {
+                                (b, f64::NAN, f64::NAN, f64::NAN)
+                            } else {
+                                let se = (ve / s_j).sqrt();
+                                let t = b / se;
+                                let t2 = t * t;
+                                let p = student_t_p_two_sided(t, df);
+                                let plrt = lm_plrt_from_t2(t2, n, df);
+                                (b, se, p, plrt)
+                            }
+                        };
+
+                        let out_idx = start + j;
+                        out_slice[out_idx * 4] = beta_j;
+                        out_slice[out_idx * 4 + 1] = se_j;
+                        out_slice[out_idx * 4 + 2] = pwald;
+                        out_slice[out_idx * 4 + 3] = plrt;
+                    }
+
+                    // Recycle buffer for next decode
+                    if next_start < m {
+                        let next_rows = (m - next_start).min(block_rows);
+                        task_tx
+                            .send((next_start, next_rows, g_buf))
+                            .expect("lm block pipeline task resend");
+                        next_start += next_rows;
+                        inflight += 1;
+                    }
+                }
+
+                drop(task_tx);
+            });
+
+            Ok(())
+        };
+
+        runner()
     })?;
 
     Ok(out)

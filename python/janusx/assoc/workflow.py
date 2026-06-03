@@ -114,6 +114,7 @@ from janusx.script._common.threads import (
     apply_outer_thread_cap,
     detect_effective_threads,
     detect_thread_budget_info,
+    format_affinity_cpu_summary,
     format_thread_budget_summary,
     maybe_warn_non_openblas,
     runtime_thread_stage,
@@ -5493,11 +5494,25 @@ def _run_gwas_pipeline(
     outprefix = os.path.join(args.out, prefix)
     log_path = f"{outprefix}.gwas.log"
     logger = setup_logging(log_path)
+    _file_only_logger = logging.getLogger("janusx.gwas.file_only")
+    _file_only_logger.handlers.clear()
+    _file_only_logger.setLevel(logging.INFO)
+    _file_only_logger.propagate = False
+    for _h in list(logger.handlers):
+        if isinstance(_h, logging.FileHandler):
+            _file_only_logger.addHandler(_h)
+
+    def _log_thread_diag_file_only(msg: str) -> None:
+        text = str(msg).strip()
+        if text != "":
+            _file_only_logger.info(text)
+
     fvlmm_scan_spec: dict[str, int] | None = None
     if bool(getattr(args, "fvlmm", False)):
         fvlmm_scan_spec = _gwas_fvlmm_scan_stage_thread_plan(int(args.thread))
-    logger.info(f"Thread detect: {format_thread_budget_summary(thread_budget)}")
-    logger.info(
+    _log_thread_diag_file_only(f"Thread detect: {format_thread_budget_summary(thread_budget)}")
+    _log_thread_diag_file_only(format_affinity_cpu_summary(thread_budget))
+    _log_thread_diag_file_only(
         "Thread plan: "
         f"requested={requested_threads}, using={int(args.thread)}, "
         f"fvlmm_scan_stage={_resolve_fvlmm_scan_stage_mode()}"
@@ -5506,10 +5521,10 @@ def _run_gwas_pipeline(
         _fb = int(fvlmm_scan_spec["blas_threads"])
         _fr = int(fvlmm_scan_spec["rayon_threads"])
         if _fb == _fr:
-            logger.info(f"FvLMM scan threads: BLAS={_fb}, Rayon={_fr}")
+            _log_thread_diag_file_only(f"FvLMM scan threads: BLAS={_fb}, Rayon={_fr}")
         else:
-            logger.info(f"FvLMM scan BLAS threads: {_fb}")
-            logger.info(f"FvLMM scan Rayon threads: {_fr}")
+            _log_thread_diag_file_only(f"FvLMM scan BLAS threads: {_fb}")
+            _log_thread_diag_file_only(f"FvLMM scan Rayon threads: {_fr}")
     if thread_capped:
         logger.warning(
             f"Warning: Requested threads={requested_threads} exceeds local effective={detected_threads}; "
@@ -5598,14 +5613,8 @@ def _run_gwas_pipeline(
             cfg_rows.append(("SparseLMM sparse", True))
         footer_rows: list[tuple[str, object]] = [
             ("Threads", f"{args.thread} (local effective {detected_threads})"),
+            ("Output prefix", outprefix),
         ]
-        if fvlmm_scan_spec is not None:
-            _fb = int(fvlmm_scan_spec["blas_threads"])
-            _fr = int(fvlmm_scan_spec["rayon_threads"])
-            if _fb != _fr:
-                footer_rows.append(("FvLMM scan BLAS", _fb))
-                footer_rows.append(("FvLMM scan Rayon", _fr))
-        footer_rows.append(("Output prefix", outprefix))
         emit_cli_configuration(
             logger,
             app_title="JanusX - GWAS",

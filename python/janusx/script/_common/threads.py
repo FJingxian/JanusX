@@ -104,6 +104,17 @@ def _detect_affinity_threads() -> int | None:
     return None
 
 
+def _detect_affinity_cpus() -> list[int] | None:
+    try:
+        if hasattr(os, "sched_getaffinity"):
+            aff = os.sched_getaffinity(0)  # type: ignore[attr-defined]
+            if aff is not None and len(aff) > 0:
+                return sorted(int(x) for x in aff)
+    except Exception:
+        pass
+    return None
+
+
 def _detect_lsf_local_slots() -> int | None:
     raw = str(os.environ.get("LSB_MCPU_HOSTS", "")).strip().split()
     if len(raw) < 2:
@@ -186,6 +197,7 @@ def detect_thread_budget_info() -> dict[str, Any]:
     scheduler_total_threads, scheduler_total_source = _first_positive_named(
         scheduler_total_candidates
     )
+    affinity_cpus = _detect_affinity_cpus()
     affinity_threads = _detect_affinity_threads()
     cgroup_threads = _detect_cgroup_cpu_quota()
     host_visible_threads = max(1, int(os.cpu_count() or 1))
@@ -210,6 +222,7 @@ def detect_thread_budget_info() -> dict[str, Any]:
         "scheduler_local_source": scheduler_local_source,
         "scheduler_total_threads": scheduler_total_threads,
         "scheduler_total_source": scheduler_total_source,
+        "affinity_cpus": affinity_cpus,
         "affinity_threads": affinity_threads,
         "cgroup_threads": cgroup_threads,
         "host_visible_threads": host_visible_threads,
@@ -239,6 +252,18 @@ def format_thread_budget_summary(info: dict[str, Any]) -> str:
         "local effective="
         f"{_fmt(info.get('effective_threads'), effective_src_text)}"
     )
+
+
+def format_affinity_cpu_summary(info: dict[str, Any]) -> str:
+    cpus = info.get("affinity_cpus")
+    if not isinstance(cpus, (list, tuple)) or len(cpus) == 0:
+        return "Affinity cpus: NA"
+    vals = [int(x) for x in cpus]
+    if len(vals) <= 8:
+        body = ",".join(str(x) for x in vals)
+    else:
+        body = f"{vals[0]},{vals[1]},{vals[2]},...,{vals[-1]}"
+    return f"Affinity cpus: {len(vals)} -> [{body}]"
 
 
 def detect_effective_threads() -> int:

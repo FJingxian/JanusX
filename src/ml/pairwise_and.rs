@@ -17,10 +17,42 @@
 
 use crate::ml::common::{topk_indices, ResponseKind};
 use crate::ml::extra_trees::ExtraTreesConfig;
+use rayon::prelude::*;
 use std::env;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 const DEFAULT_MAX_CANDIDATES: usize = 100;
 const DEFAULT_ALPHA: f64 = 0.5;
+
+// ---------------------------------------------------------------------------
+// Fine-grained profile atomics for pairwise scoring stages
+// ---------------------------------------------------------------------------
+static PW_MARGINAL_NS: AtomicU64 = AtomicU64::new(0);
+static PW_PACK_NS: AtomicU64 = AtomicU64::new(0);
+static PW_KERNEL_NS: AtomicU64 = AtomicU64::new(0);
+static PW_COMBINE_NS: AtomicU64 = AtomicU64::new(0);
+
+#[inline]
+fn elapsed_ns_sat(start: Instant) -> u64 {
+    start.elapsed().as_nanos().min(u64::MAX as u128) as u64
+}
+
+pub fn reset_pairwise_profile() {
+    PW_MARGINAL_NS.store(0, Ordering::Relaxed);
+    PW_PACK_NS.store(0, Ordering::Relaxed);
+    PW_KERNEL_NS.store(0, Ordering::Relaxed);
+    PW_COMBINE_NS.store(0, Ordering::Relaxed);
+}
+
+pub fn snapshot_pairwise_profile() -> (f64, f64, f64, f64) {
+    (
+        (PW_MARGINAL_NS.load(Ordering::Relaxed) as f64) * 1e-9,
+        (PW_PACK_NS.load(Ordering::Relaxed) as f64) * 1e-9,
+        (PW_KERNEL_NS.load(Ordering::Relaxed) as f64) * 1e-9,
+        (PW_COMBINE_NS.load(Ordering::Relaxed) as f64) * 1e-9,
+    )
+}
 
 #[inline]
 fn parse_env_usize_fallback(name: &str, fallback: usize) -> usize {
@@ -252,36 +284,118 @@ fn pair_gains_packed(
     (gain_and, gain_nij, gain_ij, gain_ji)
 }
 
-// ---------------------------------------------------------------------------
-// Packed-native entry point (used from Garfield fast path — no dense allocs)
-// ---------------------------------------------------------------------------
+/// Fast variant: only computes AND via `count_sum_packed`.  The other three
+/// combinations (OR / AND_NOT_ij / AND_NOT_ji) are derived arithmetically
+/// from precomputed per-feature `(n_hit, sum_hit)` cached during Stage 1.
+///
+///   n_or  = n_i + n_j - n_and         s_or  = s_i + s_j - s_and
+///   n_ij  = n_i - n_and               s_ij  = s_i - s_and
+///   n_ji  = n_j - n_and               s_ji  = s_j - s_and
+#[inline]
+fn pair_gains_packed_fast(
+    pi: &[u64],
+    pj: &[u64],
+    scratch: &mut [u64],
+    y: &[f64],
+    y_word_sums: &[f64],
+    n_words: usize,
+    tail_mask: u64,
+    n_samples: usize,
+    total_sum: f64,
+    n_hit_i: usize,
+    sum_hit_i: f64,
+    n_hit_j: usize,
+    sum_hit_j: f64,
+) -> (f64, f64, f64, f64) {
+    for w in 0..n_words {
+        scratch[w] = pi[w] & pj[w];
+    }
+    let (n_and, s_and) =
+        count_sum_packed(scratch, y, y_word_sums, n_words, tail_mask);
 
-/// Feature scores directly from packed-u64 flat matrix.
-pub fn feature_scores_pairwise_and_packed(
+    let n_or = n_hit_i + n_hit_j - n_and;
+    let s_or = sum_hit_i + sum_hit_j - s_and;
+    let n_ij = n_hit_i - n_and;
+    let s_ij = sum_hit_i - s_and;
+    let n_ji = n_hit_j - n_and;
+    let s_ji = sum_hit_j - s_and;
+
+    let gain_and = centered_gain_from_counts(total_sum, s_and, n_samples, n_and);
+    let gain_nij = centered_gain_from_counts(total_sum, s_or, n_samples, n_or);
+    let gain_ij = centered_gain_from_counts(total_sum, s_ij, n_samples, n_ij);
+    let gain_ji = centered_gain_from_counts(total_sum, s_ji, n_samples, n_ji);
+
+    (gain_and, gain_nij, gain_ij, gain_ji)
+}
+
+fn feature_scores_pairwise_and_packed_core(
     bits_flat: &[u64],
     row_words: usize,
     n_features: usize,
     y: &[f64],
     n_samples: usize,
+    precomputed_stage1: Option<(&[usize], &[f64])>,
 ) -> Vec<f64> {
     if n_features == 0 {
         return Vec::new();
     }
     let total_sum: f64 = y.iter().sum();
-    let n_words = row_words; // caller already computed words_for_samples(n_samples)
+    let n_words = row_words;
     let rem = n_samples & 63;
     let tail_mask = if rem == 0 { u64::MAX } else { (1u64 << rem) - 1 };
     let y_word_sums = build_y_word_sums(y, n_samples, n_words);
 
-    // ---- Stage 1: marginal centred gain for every feature -----------------
+    // ---- Stage 1: marginal + cache (n_hit, sum_hit) per feature ----------
+    let t_marg = Instant::now();
     let mut marginal_gain = vec![0.0f64; n_features];
-    for i in 0..n_features {
-        let row = &bits_flat[i * row_words..(i + 1) * row_words];
-        let (n_hit, sum_hit) =
-            count_sum_packed(row, y, &y_word_sums, n_words, tail_mask);
-        marginal_gain[i] =
-            centered_gain_from_counts(total_sum, sum_hit, n_samples, n_hit);
-    }
+    let stage1_owned: Option<(Vec<usize>, Vec<f64>)>;
+    let (feat_n_hit, feat_sum_hit): (&[usize], &[f64]) =
+        if let Some((n_hit_pre, sum_hit_pre)) = precomputed_stage1 {
+            if n_hit_pre.len() >= n_features && sum_hit_pre.len() >= n_features {
+                stage1_owned = None;
+                for i in 0..n_features {
+                    marginal_gain[i] = centered_gain_from_counts(
+                        total_sum,
+                        sum_hit_pre[i],
+                        n_samples,
+                        n_hit_pre[i],
+                    );
+                }
+                (&n_hit_pre[..n_features], &sum_hit_pre[..n_features])
+            } else {
+                let mut feat_n_hit_owned = vec![0usize; n_features];
+                let mut feat_sum_hit_owned = vec![0.0f64; n_features];
+                for i in 0..n_features {
+                    let row = &bits_flat[i * row_words..(i + 1) * row_words];
+                    let (n_hit, sum_hit) =
+                        count_sum_packed(row, y, &y_word_sums, n_words, tail_mask);
+                    marginal_gain[i] =
+                        centered_gain_from_counts(total_sum, sum_hit, n_samples, n_hit);
+                    feat_n_hit_owned[i] = n_hit;
+                    feat_sum_hit_owned[i] = sum_hit;
+                }
+                stage1_owned = Some((feat_n_hit_owned, feat_sum_hit_owned));
+                let (feat_n_hit_owned, feat_sum_hit_owned) =
+                    stage1_owned.as_ref().expect("stage1 cache present");
+                (feat_n_hit_owned.as_slice(), feat_sum_hit_owned.as_slice())
+            }
+        } else {
+            let mut feat_n_hit_owned = vec![0usize; n_features];
+            let mut feat_sum_hit_owned = vec![0.0f64; n_features];
+            for i in 0..n_features {
+                let row = &bits_flat[i * row_words..(i + 1) * row_words];
+                let (n_hit, sum_hit) =
+                    count_sum_packed(row, y, &y_word_sums, n_words, tail_mask);
+                marginal_gain[i] =
+                    centered_gain_from_counts(total_sum, sum_hit, n_samples, n_hit);
+                feat_n_hit_owned[i] = n_hit;
+                feat_sum_hit_owned[i] = sum_hit;
+            }
+            stage1_owned = Some((feat_n_hit_owned, feat_sum_hit_owned));
+            let (feat_n_hit_owned, feat_sum_hit_owned) =
+                stage1_owned.as_ref().expect("stage1 cache present");
+            (feat_n_hit_owned.as_slice(), feat_sum_hit_owned.as_slice())
+        };
 
     let max_candidates = pairwise_and_max_candidates();
     let keep_n = max_candidates.min(n_features);
@@ -290,42 +404,74 @@ pub fn feature_scores_pairwise_and_packed(
         return marginal_gain;
     }
 
+    PW_MARGINAL_NS.fetch_add(elapsed_ns_sat(t_marg), Ordering::Relaxed);
+
+    let t_pack = Instant::now();
     let top = topk_indices(&marginal_gain, keep_n);
     let alpha = pairwise_and_alpha();
+    PW_PACK_NS.fetch_add(elapsed_ns_sat(t_pack), Ordering::Relaxed);
 
-    // ---- Stage 2: pairwise AND / OR / AND_NOT ----------------------------
-    let mut interaction_max = vec![0.0f64; n_features];
-    let mut scratch = vec![0u64; n_words];
+    // ---- Stage 2: pairwise via packed u64 (parallel, cached counts) --------
+    let t_kern = Instant::now();
+    let pairs: Vec<(usize, usize)> = (0..keep_n)
+        .flat_map(|a| ((a + 1)..keep_n).map(move |b| (a, b)))
+        .collect();
+    let grain = (pairs.len() / rayon::current_num_threads().max(1)).max(1);
 
-    for a in 0..keep_n {
-        let i = top[a];
-        let pi = &bits_flat[i * row_words..(i + 1) * row_words];
-        for b in (a + 1)..keep_n {
-            let j = top[b];
-            let pj = &bits_flat[j * row_words..(j + 1) * row_words];
-
-            let (gain_and, gain_nij, gain_ij, gain_ji) = pair_gains_packed(
-                pi, pj, &mut scratch, y, &y_word_sums,
-                n_words, tail_mask, n_samples, total_sum,
-            );
-
-            let baseline = marginal_gain[i].max(marginal_gain[j]);
-
-            let best = (gain_and - baseline)
-                .max(gain_nij - baseline)
-                .max(gain_ij - baseline)
-                .max(gain_ji - baseline);
-
-            if best > interaction_max[i] {
-                interaction_max[i] = best;
+    let interaction_max: Vec<f64> = pairs
+        .par_chunks(grain)
+        .map(|chunk| {
+            let mut local_max = vec![0.0f64; n_features];
+            let mut local_scratch = vec![0u64; n_words];
+            for &(a, b) in chunk {
+                let i = top[a];
+                let j = top[b];
+                let pi = &bits_flat[i * row_words..(i + 1) * row_words];
+                let pj = &bits_flat[j * row_words..(j + 1) * row_words];
+                let (gain_and, gain_nij, gain_ij, gain_ji) = pair_gains_packed_fast(
+                    pi,
+                    pj,
+                    &mut local_scratch,
+                    y,
+                    &y_word_sums,
+                    n_words,
+                    tail_mask,
+                    n_samples,
+                    total_sum,
+                    feat_n_hit[i],
+                    feat_sum_hit[i],
+                    feat_n_hit[j],
+                    feat_sum_hit[j],
+                );
+                let baseline = marginal_gain[i].max(marginal_gain[j]);
+                let best = (gain_and - baseline)
+                    .max(gain_nij - baseline)
+                    .max(gain_ij - baseline)
+                    .max(gain_ji - baseline);
+                if best > local_max[i] {
+                    local_max[i] = best;
+                }
+                if best > local_max[j] {
+                    local_max[j] = best;
+                }
             }
-            if best > interaction_max[j] {
-                interaction_max[j] = best;
-            }
-        }
-    }
+            local_max
+        })
+        .reduce(
+            || vec![0.0f64; n_features],
+            |mut a, b| {
+                for i in 0..n_features {
+                    if b[i] > a[i] {
+                        a[i] = b[i];
+                    }
+                }
+                a
+            },
+        );
 
-    // ---- Stage 3: combine -------------------------------------------------
+    // ---- Stage 3: combine --------------------------------------------------
+    PW_KERNEL_NS.fetch_add(elapsed_ns_sat(t_kern), Ordering::Relaxed);
+    let t_comb = Instant::now();
     let max_marginal = marginal_gain.iter().cloned().fold(0.0f64, f64::max);
     let max_interaction = interaction_max.iter().cloned().fold(0.0f64, f64::max);
 
@@ -338,11 +484,52 @@ pub fn feature_scores_pairwise_and_packed(
     let mut final_scores = vec![0.0f64; n_features];
     for i in 0..n_features {
         let interaction_scaled = interaction_max[i] * scale;
-        final_scores[i] =
-            (1.0 - alpha) * marginal_gain[i] + alpha * interaction_scaled;
+        final_scores[i] = (1.0 - alpha) * marginal_gain[i] + alpha * interaction_scaled;
     }
 
+    PW_COMBINE_NS.fetch_add(elapsed_ns_sat(t_comb), Ordering::Relaxed);
     final_scores
+}
+
+// ---------------------------------------------------------------------------
+// Packed-native entry point (used from Garfield fast path — no dense allocs)
+// ---------------------------------------------------------------------------
+
+/// Feature scores directly from packed-u64 flat matrix.
+pub fn feature_scores_pairwise_and_packed(
+    bits_flat: &[u64],
+    row_words: usize,
+    n_features: usize,
+    y: &[f64],
+    n_samples: usize,
+) -> Vec<f64> {
+    feature_scores_pairwise_and_packed_core(
+        bits_flat,
+        row_words,
+        n_features,
+        y,
+        n_samples,
+        None,
+    )
+}
+
+pub fn feature_scores_pairwise_and_packed_with_stage1(
+    bits_flat: &[u64],
+    row_words: usize,
+    n_features: usize,
+    y: &[f64],
+    n_samples: usize,
+    feat_n_hit: &[usize],
+    feat_sum_hit: &[f64],
+) -> Vec<f64> {
+    feature_scores_pairwise_and_packed_core(
+        bits_flat,
+        row_words,
+        n_features,
+        y,
+        n_samples,
+        Some((feat_n_hit, feat_sum_hit)),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -366,14 +553,20 @@ pub fn feature_scores_pairwise_and_flat(
     }
     let total_sum: f64 = y.iter().sum();
 
-    // ---- Stage 1: marginal from flat dense (zero alloc) --------------------
+    // ---- Stage 1: marginal from flat dense + cache counts -----------------
+    let t_marg = Instant::now();
     let mut marginal_gain = vec![0.0f64; n_features];
+    let mut feat_n_hit = vec![0usize; n_features];
+    let mut feat_sum_hit = vec![0.0f64; n_features];
     for i in 0..n_features {
         let row = &data[i * row_stride..][..n_samples];
         let (n_hit, sum_hit) = count_sum_y_dense(row, y);
         marginal_gain[i] =
             centered_gain_from_counts(total_sum, sum_hit, n_samples, n_hit);
+        feat_n_hit[i] = n_hit;
+        feat_sum_hit[i] = sum_hit;
     }
+    PW_MARGINAL_NS.fetch_add(elapsed_ns_sat(t_marg), Ordering::Relaxed);
 
     let max_candidates = pairwise_and_max_candidates();
     let keep_n = max_candidates.min(n_features);
@@ -382,6 +575,7 @@ pub fn feature_scores_pairwise_and_flat(
         return marginal_gain;
     }
 
+    let t_pack = Instant::now();
     let top = topk_indices(&marginal_gain, keep_n);
     let alpha = pairwise_and_alpha();
 
@@ -396,35 +590,55 @@ pub fn feature_scores_pairwise_and_flat(
         let row = &data[fi * row_stride..][..n_samples];
         packed_top.push(pack_dense(row, n_words));
     }
+    PW_PACK_NS.fetch_add(elapsed_ns_sat(t_pack), Ordering::Relaxed);
 
-    // ---- Stage 2: pairwise via packed u64 ----------------------------------
-    let mut interaction_max = vec![0.0f64; n_features];
-    let mut scratch = vec![0u64; n_words];
+    // ---- Stage 2: pairwise via packed u64 (parallel, cached counts) --------
+    let t_kern = Instant::now();
+    let pairs: Vec<(usize, usize)> = (0..keep_n)
+        .flat_map(|a| ((a + 1)..keep_n).map(move |b| (a, b)))
+        .collect();
+    let grain = (pairs.len() / rayon::current_num_threads().max(1)).max(1);
 
-    for a in 0..keep_n {
-        let i = top[a];
-        let pi = &packed_top[a];
-        for b in (a + 1)..keep_n {
-            let j = top[b];
-            let pj = &packed_top[b];
-
-            let (gain_and, gain_nij, gain_ij, gain_ji) = pair_gains_packed(
-                pi, pj, &mut scratch, y, &y_word_sums,
-                n_words, tail_mask, n_samples, total_sum,
-            );
-
-            let baseline = marginal_gain[i].max(marginal_gain[j]);
-            let best = (gain_and - baseline)
-                .max(gain_nij - baseline)
-                .max(gain_ij - baseline)
-                .max(gain_ji - baseline);
-
-            if best > interaction_max[i] { interaction_max[i] = best; }
-            if best > interaction_max[j] { interaction_max[j] = best; }
-        }
-    }
+    let interaction_max: Vec<f64> = pairs
+        .par_chunks(grain)
+        .map(|chunk| {
+            let mut local_max = vec![0.0f64; n_features];
+            let mut local_scratch = vec![0u64; n_words];
+            for &(a, b) in chunk {
+                let i = top[a];
+                let j = top[b];
+                let pi = &packed_top[a];
+                let pj = &packed_top[b];
+                let (gain_and, gain_nij, gain_ij, gain_ji) =
+                    pair_gains_packed_fast(
+                        pi, pj, &mut local_scratch, y, &y_word_sums,
+                        n_words, tail_mask, n_samples, total_sum,
+                        feat_n_hit[i], feat_sum_hit[i],
+                        feat_n_hit[j], feat_sum_hit[j],
+                    );
+                let baseline = marginal_gain[i].max(marginal_gain[j]);
+                let best = (gain_and - baseline)
+                    .max(gain_nij - baseline)
+                    .max(gain_ij - baseline)
+                    .max(gain_ji - baseline);
+                if best > local_max[i] { local_max[i] = best; }
+                if best > local_max[j] { local_max[j] = best; }
+            }
+            local_max
+        })
+        .reduce(
+            || vec![0.0f64; n_features],
+            |mut a, b| {
+                for i in 0..n_features {
+                    if b[i] > a[i] { a[i] = b[i]; }
+                }
+                a
+            },
+        );
 
     // ---- Stage 3: combine --------------------------------------------------
+    PW_KERNEL_NS.fetch_add(elapsed_ns_sat(t_kern), Ordering::Relaxed);
+    let t_comb = Instant::now();
     let max_marginal = marginal_gain.iter().cloned().fold(0.0f64, f64::max);
     let max_interaction = interaction_max.iter().cloned().fold(0.0f64, f64::max);
     let scale = if max_interaction > 0.0 && max_marginal > 0.0 {
@@ -439,6 +653,7 @@ pub fn feature_scores_pairwise_and_flat(
         final_scores[i] =
             (1.0 - alpha) * marginal_gain[i] + alpha * interaction_scaled;
     }
+    PW_COMBINE_NS.fetch_add(elapsed_ns_sat(t_comb), Ordering::Relaxed);
     final_scores
 }
 
@@ -475,12 +690,16 @@ pub fn feature_scores_pairwise_and_grouped(
     let n_samples = y.len();
     let total_sum: f64 = y.iter().sum();
 
-    // ---- Stage 1: marginal via dense scan (faster than pack+count) ---------
+    // ---- Stage 1: marginal via dense scan + cache counts ------------------
     let mut marginal_gain = vec![0.0f64; n_features];
+    let mut feat_n_hit = vec![0usize; n_features];
+    let mut feat_sum_hit = vec![0.0f64; n_features];
     for i in 0..n_features {
         let (n_hit, sum_hit) = count_sum_y_dense(&x_rows[i], y);
         marginal_gain[i] =
             centered_gain_from_counts(total_sum, sum_hit, n_samples, n_hit);
+        feat_n_hit[i] = n_hit;
+        feat_sum_hit[i] = sum_hit;
     }
 
     let max_candidates = pairwise_and_max_candidates();
@@ -504,37 +723,48 @@ pub fn feature_scores_pairwise_and_grouped(
         packed_top.push(pack_dense(&x_rows[fi], n_words));
     }
 
-    // ---- Stage 2: pairwise AND / OR / AND_NOT via packed u64 ---------------
-    let mut interaction_max = vec![0.0f64; n_features];
-    let mut scratch = vec![0u64; n_words];
+    // ---- Stage 2: pairwise AND / OR / AND_NOT via packed u64 (parallel) ---
+    let pairs: Vec<(usize, usize)> = (0..keep_n)
+        .flat_map(|a| ((a + 1)..keep_n).map(move |b| (a, b)))
+        .collect();
+    let grain = (pairs.len() / rayon::current_num_threads().max(1)).max(1);
 
-    for a in 0..keep_n {
-        let i = top[a];
-        let pi = &packed_top[a];
-        for b in (a + 1)..keep_n {
-            let j = top[b];
-            let pj = &packed_top[b];
-
-            let (gain_and, gain_nij, gain_ij, gain_ji) = pair_gains_packed(
-                pi, pj, &mut scratch, y, &y_word_sums,
-                n_words, tail_mask, n_samples, total_sum,
-            );
-
-            let baseline = marginal_gain[i].max(marginal_gain[j]);
-
-            let best = (gain_and - baseline)
-                .max(gain_nij - baseline)
-                .max(gain_ij - baseline)
-                .max(gain_ji - baseline);
-
-            if best > interaction_max[i] {
-                interaction_max[i] = best;
+    let interaction_max: Vec<f64> = pairs
+        .par_chunks(grain)
+        .map(|chunk| {
+            let mut local_max = vec![0.0f64; n_features];
+            let mut local_scratch = vec![0u64; n_words];
+            for &(a, b) in chunk {
+                let i = top[a];
+                let j = top[b];
+                let pi = &packed_top[a];
+                let pj = &packed_top[b];
+                let (gain_and, gain_nij, gain_ij, gain_ji) =
+                    pair_gains_packed_fast(
+                        pi, pj, &mut local_scratch, y, &y_word_sums,
+                        n_words, tail_mask, n_samples, total_sum,
+                        feat_n_hit[i], feat_sum_hit[i],
+                        feat_n_hit[j], feat_sum_hit[j],
+                    );
+                let baseline = marginal_gain[i].max(marginal_gain[j]);
+                let best = (gain_and - baseline)
+                    .max(gain_nij - baseline)
+                    .max(gain_ij - baseline)
+                    .max(gain_ji - baseline);
+                if best > local_max[i] { local_max[i] = best; }
+                if best > local_max[j] { local_max[j] = best; }
             }
-            if best > interaction_max[j] {
-                interaction_max[j] = best;
-            }
-        }
-    }
+            local_max
+        })
+        .reduce(
+            || vec![0.0f64; n_features],
+            |mut a, b| {
+                for i in 0..n_features {
+                    if b[i] > a[i] { a[i] = b[i]; }
+                }
+                a
+            },
+        );
 
     // ---- Stage 3: combine marginal + interaction scores --------------------
     let max_marginal = marginal_gain

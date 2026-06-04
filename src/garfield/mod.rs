@@ -38,7 +38,10 @@ use crate::ml::common::{
 };
 use crate::ml::engine::{compute_feature_scores_grouped, parse_ml_engine, MlEngine};
 use crate::ml::extra_trees::ExtraTreesConfig;
-use crate::ml::pairwise_and::feature_scores_pairwise_and_flat;
+use crate::ml::pairwise_and::{
+    feature_scores_pairwise_and_packed_with_stage1, reset_pairwise_profile,
+    snapshot_pairwise_profile,
+};
 
 use memmap2::Mmap;
 use numpy::ndarray::{Array1, Array2};
@@ -2371,6 +2374,14 @@ struct GarfieldLogicPipelineResult {
     timing_scan_literal_score_wall_s: f64,
     timing_scan_ml_select_wall_s: f64,
     timing_scan_beam_calls: usize,
+    timing_clone_bits_s: f64,
+    timing_sum_y_both1_s: f64,
+    timing_parent_baseline_s: f64,
+    timing_pw_marginal_s: f64,
+    timing_pw_pack_s: f64,
+    timing_pw_kernel_s: f64,
+    timing_pw_combine_s: f64,
+    timing_dense_extract_s: f64,
     timing_literal_score_share_of_total_pct: f64,
     timing_literal_score_share_of_scan_pct: f64,
     timing_literal_score_share_of_beam_pct: f64,
@@ -4452,6 +4463,23 @@ fn dense_binary_rows_from_full_bits_range_flat(
     n_rows_all: usize,
     n_samples_all: usize,
 ) -> Result<(Vec<u8>, usize), String> {
+    let _t = Instant::now();
+    let result = _dense_binary_rows_from_full_bits_range_flat_impl(
+        bits_flat, row_words, row_start, row_end, sample_indices, n_rows_all, n_samples_all,
+    );
+    DENSE_EXTRACT_FLAT_NS.fetch_add(elapsed_ns_saturating(_t), Ordering::Relaxed);
+    result
+}
+
+fn _dense_binary_rows_from_full_bits_range_flat_impl(
+    bits_flat: &[u64],
+    row_words: usize,
+    row_start: usize,
+    row_end: usize,
+    sample_indices: &[usize],
+    n_rows_all: usize,
+    n_samples_all: usize,
+) -> Result<(Vec<u8>, usize), String> {
     if row_end <= row_start {
         return Ok((Vec::new(), sample_indices.len()));
     }
@@ -4529,7 +4557,154 @@ fn dense_binary_rows_from_full_bits(
 /// Flat variant: returns `(data, row_stride)` where data is row-major
 /// `[row0_sample0, row0_sample1, ..., row1_sample0, ...]`.
 /// Single allocation, no per-row Vec overhead.
+static DENSE_EXTRACT_FLAT_NS: AtomicU64 = AtomicU64::new(0);
+static PACKED_EXTRACT_FLAT_NS: AtomicU64 = AtomicU64::new(0);
+
+#[inline]
+fn elapsed_ns_saturating(start: Instant) -> u64 {
+    start.elapsed().as_nanos().min(u64::MAX as u128) as u64
+}
+
 fn dense_binary_rows_from_full_bits_flat(
+    bits_flat: &[u64],
+    row_words: usize,
+    row_indices: &[usize],
+    sample_indices: &[usize],
+    n_rows_all: usize,
+    n_samples_all: usize,
+) -> Result<(Vec<u8>, usize), String> {
+    let _t = Instant::now();
+    let result = _dense_binary_rows_from_full_bits_flat_impl(
+        bits_flat, row_words, row_indices, sample_indices, n_rows_all, n_samples_all,
+    );
+    DENSE_EXTRACT_FLAT_NS.fetch_add(elapsed_ns_saturating(_t), Ordering::Relaxed);
+    result
+}
+
+fn packed_rows_subset_from_full_bits_with_stage1(
+    bits_flat: &[u64],
+    row_words_full: usize,
+    row_indices: &[usize],
+    sample_indices: &[usize],
+    y: &[f64],
+    n_rows_all: usize,
+    n_samples_all: usize,
+) -> Result<(Vec<u64>, usize, Vec<usize>, Vec<f64>), String> {
+    let _t = Instant::now();
+    if row_words_full != words_for_samples(n_samples_all) {
+        return Err(format!(
+            "row_words mismatch for full bit matrix: got {row_words_full}, expected {}",
+            words_for_samples(n_samples_all)
+        ));
+    }
+    if bits_flat.len() != n_rows_all.saturating_mul(row_words_full) {
+        return Err("full bit matrix length mismatch".to_string());
+    }
+    if sample_indices.len() != y.len() {
+        return Err(format!(
+            "sample_indices length ({}) != y length ({}) while subsetting packed rows",
+            sample_indices.len(),
+            y.len()
+        ));
+    }
+    let row_words_sub = words_for_samples(sample_indices.len());
+    let mut out = vec![0u64; row_indices.len().saturating_mul(row_words_sub)];
+    let mut feat_n_hit = vec![0usize; row_indices.len()];
+    let mut feat_sum_hit = vec![0.0f64; row_indices.len()];
+    for (dst_r, &src_r) in row_indices.iter().enumerate() {
+        if src_r >= n_rows_all {
+            return Err(format!("row index out of range while subsetting: {src_r}"));
+        }
+        let src = &bits_flat[src_r * row_words_full..(src_r + 1) * row_words_full];
+        let dst_base = dst_r * row_words_sub;
+        let mut n_hit = 0usize;
+        let mut sum_hit = 0.0f64;
+        for (dst_s, &src_s) in sample_indices.iter().enumerate() {
+            if src_s >= n_samples_all {
+                return Err(format!(
+                    "sample index out of range while subsetting: {src_s}"
+                ));
+            }
+            let bit = (src[src_s >> 6] >> (src_s & 63)) & 1u64;
+            if bit != 0 {
+                out[dst_base + (dst_s >> 6)] |= 1u64 << (dst_s & 63);
+                n_hit += 1;
+                sum_hit += y[dst_s];
+            }
+        }
+        feat_n_hit[dst_r] = n_hit;
+        feat_sum_hit[dst_r] = sum_hit;
+    }
+    PACKED_EXTRACT_FLAT_NS.fetch_add(elapsed_ns_saturating(_t), Ordering::Relaxed);
+    Ok((out, row_words_sub, feat_n_hit, feat_sum_hit))
+}
+
+fn packed_rows_subset_from_full_bits_range_with_stage1(
+    bits_flat: &[u64],
+    row_words_full: usize,
+    row_start: usize,
+    row_end: usize,
+    sample_indices: &[usize],
+    y: &[f64],
+    n_rows_all: usize,
+    n_samples_all: usize,
+) -> Result<(Vec<u64>, usize, Vec<usize>, Vec<f64>), String> {
+    let _t = Instant::now();
+    if row_end <= row_start {
+        return Ok((Vec::new(), words_for_samples(sample_indices.len()), Vec::new(), Vec::new()));
+    }
+    if row_end > n_rows_all {
+        return Err(format!(
+            "row range out of bounds while subsetting: [{row_start}, {row_end}) vs n_rows={n_rows_all}"
+        ));
+    }
+    if row_words_full != words_for_samples(n_samples_all) {
+        return Err(format!(
+            "row_words mismatch for full bit matrix: got {row_words_full}, expected {}",
+            words_for_samples(n_samples_all)
+        ));
+    }
+    if bits_flat.len() != n_rows_all.saturating_mul(row_words_full) {
+        return Err("full bit matrix length mismatch".to_string());
+    }
+    if sample_indices.len() != y.len() {
+        return Err(format!(
+            "sample_indices length ({}) != y length ({}) while subsetting packed range",
+            sample_indices.len(),
+            y.len()
+        ));
+    }
+    let row_words_sub = words_for_samples(sample_indices.len());
+    let n_rows_sub = row_end.saturating_sub(row_start);
+    let mut out = vec![0u64; n_rows_sub.saturating_mul(row_words_sub)];
+    let mut feat_n_hit = vec![0usize; n_rows_sub];
+    let mut feat_sum_hit = vec![0.0f64; n_rows_sub];
+    for (dst_r, src_r) in (row_start..row_end).enumerate() {
+        let src = &bits_flat[src_r * row_words_full..(src_r + 1) * row_words_full];
+        let dst_base = dst_r * row_words_sub;
+        let mut n_hit = 0usize;
+        let mut sum_hit = 0.0f64;
+        for (dst_s, &src_s) in sample_indices.iter().enumerate() {
+            if src_s >= n_samples_all {
+                return Err(format!(
+                    "sample index out of range while subsetting: {src_s}"
+                ));
+            }
+            let bit = (src[src_s >> 6] >> (src_s & 63)) & 1u64;
+            if bit != 0 {
+                out[dst_base + (dst_s >> 6)] |= 1u64 << (dst_s & 63);
+                n_hit += 1;
+                sum_hit += y[dst_s];
+            }
+        }
+        feat_n_hit[dst_r] = n_hit;
+        feat_sum_hit[dst_r] = sum_hit;
+    }
+    PACKED_EXTRACT_FLAT_NS.fetch_add(elapsed_ns_saturating(_t), Ordering::Relaxed);
+    Ok((out, row_words_sub, feat_n_hit, feat_sum_hit))
+}
+
+fn _dense_binary_rows_from_full_bits_flat_impl(
     bits_flat: &[u64],
     row_words: usize,
     row_indices: &[usize],
@@ -4887,23 +5062,27 @@ fn select_logic_unit_global_rows(
         let n_region = unit.indices.len();
         let keep_k = resolve_ml_keep_k(n_region, ml_top_k, ml_top_frac);
 
-        // ---- PairwiseAnd fast path: flat dense, single allocation ----------
+        // ---- PairwiseAnd fast path: packed subset + cached stage-1 stats ----
         if engine_one == MlEngine::PairwiseAnd {
             let t0 = Instant::now();
-            let (flat_data, row_stride) = dense_binary_rows_from_full_bits_flat(
+            let (packed_bits, row_words_sub, feat_n_hit, feat_sum_hit) =
+                packed_rows_subset_from_full_bits_with_stage1(
                 logic_bits.bits_flat.as_slice(),
                 logic_bits.row_words,
                 unit.indices.as_slice(),
                 train_idx_local,
+                y_train,
                 logic_bits.sites.len(),
                 logic_bits.n_samples,
             )?;
-            let scores = feature_scores_pairwise_and_flat(
-                flat_data.as_slice(),
-                row_stride,
+            let scores = feature_scores_pairwise_and_packed_with_stage1(
+                packed_bits.as_slice(),
+                row_words_sub,
                 n_region,
                 y_train,
                 train_idx_local.len(),
+                feat_n_hit.as_slice(),
+                feat_sum_hit.as_slice(),
             );
             let top_local = topk_indices(&scores, keep_k);
             GARFIELD_ML_SELECT_NS.fetch_add(
@@ -5092,23 +5271,27 @@ fn prepare_logic_chunk_continuous(
         perm_cfg.seed ^ chunk.window_id ^ 0x94D0_49BB_1331_11EB;
 
     let selected_global_rows = if let Some(engine_one) = engine {
-        // ---- PairwiseAnd fast path: flat dense, single allocation ----------
+        // ---- PairwiseAnd fast path: packed subset + cached stage-1 stats ----
         if engine_one == MlEngine::PairwiseAnd {
-            let (flat_data, row_stride) = dense_binary_rows_from_full_bits_range_flat(
+            let (packed_bits, row_words_sub, feat_n_hit, feat_sum_hit) =
+                packed_rows_subset_from_full_bits_range_with_stage1(
                 logic_bits.bits_flat.as_slice(),
                 logic_bits.row_words,
                 row_start,
                 row_end,
                 train_idx_local,
+                y_train,
                 logic_bits.sites.len(),
                 logic_bits.n_samples,
             )?;
-            let scores = feature_scores_pairwise_and_flat(
-                flat_data.as_slice(),
-                row_stride,
+            let scores = feature_scores_pairwise_and_packed_with_stage1(
+                packed_bits.as_slice(),
+                row_words_sub,
                 n_region,
                 y_train,
                 train_idx_local.len(),
+                feat_n_hit.as_slice(),
+                feat_sum_hit.as_slice(),
             );
             let (top_keep, rand_keep) =
                 resolve_ml_top_random_counts(keep_k, GARFIELD_NULL_ML_TOP_FRAC);
@@ -5299,52 +5482,65 @@ fn collect_rule_permutation_nulls_for_repeat(
         prepared.local_groups.as_slice(),
         beam_params,
     )?;
-    let mut idxs_by_bucket = HashMap::<RuleNullBucket, Vec<usize>>::new();
+    // Bucket train and test scores independently by their OWN support_frac,
+    // avoiding cross-boundary errors when train/test support differs.
+    let mut train_by_bucket = HashMap::<RuleNullBucket, Vec<usize>>::new();
+    let mut test_by_bucket = HashMap::<RuleNullBucket, Vec<usize>>::new();
     for (cand_idx, cand) in perm_hits.iter().enumerate() {
-        let bucket = bucket_from_rule(&cand.rule, cand.train.support_frac);
-        idxs_by_bucket.entry(bucket).or_default().push(cand_idx);
+        if cand.train_score.is_finite() {
+            let b = bucket_from_rule(&cand.rule, cand.train.support_frac);
+            train_by_bucket.entry(b).or_default().push(cand_idx);
+        }
+        if cand.test_score.is_finite() {
+            let b = bucket_from_rule(&cand.rule, cand.test.support_frac);
+            test_by_bucket.entry(b).or_default().push(cand_idx);
+        }
     }
     let mut out = Vec::<(RuleNullBucket, f64, f64)>::new();
-    for (bucket, idxs) in idxs_by_bucket.into_iter() {
+    // Collect all unique buckets
+    let all_buckets: HashSet<RuleNullBucket> = train_by_bucket
+        .keys()
+        .chain(test_by_bucket.keys())
+        .copied()
+        .collect();
+    for bucket in all_buckets {
         let keep_topk = null_topk_per_repeat_for_bucket(bucket).max(1);
-        let mut chosen = HashSet::<usize>::new();
+        let mut train_chosen = HashSet::<usize>::new();
+        let mut test_chosen = HashSet::<usize>::new();
 
-        let mut by_train = idxs.clone();
-        by_train.sort_by(|&a, &b| {
-            normalized_rank_score(perm_hits[b].train_score)
-                .partial_cmp(&normalized_rank_score(perm_hits[a].train_score))
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        for idx in by_train
-            .into_iter()
-            .filter(|&idx| perm_hits[idx].train_score.is_finite())
-            .take(keep_topk)
-        {
-            chosen.insert(idx);
+        if let Some(idxs) = train_by_bucket.get(&bucket) {
+            let mut sorted = idxs.clone();
+            sorted.sort_by(|&a, &b| {
+                normalized_rank_score(perm_hits[b].train_score)
+                    .partial_cmp(&normalized_rank_score(perm_hits[a].train_score))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            for &idx in sorted.iter().take(keep_topk) {
+                train_chosen.insert(idx);
+            }
+        }
+        if let Some(idxs) = test_by_bucket.get(&bucket) {
+            let mut sorted = idxs.clone();
+            sorted.sort_by(|&a, &b| {
+                normalized_rank_score(perm_hits[b].test_score)
+                    .partial_cmp(&normalized_rank_score(perm_hits[a].test_score))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            for &idx in sorted.iter().take(keep_topk) {
+                test_chosen.insert(idx);
+            }
         }
 
-        let mut by_test = idxs;
-        by_test.sort_by(|&a, &b| {
-            normalized_rank_score(perm_hits[b].test_score)
-                .partial_cmp(&normalized_rank_score(perm_hits[a].test_score))
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        for idx in by_test
-            .into_iter()
-            .filter(|&idx| perm_hits[idx].test_score.is_finite())
-            .take(keep_topk)
-        {
-            chosen.insert(idx);
-        }
-
-        if chosen.is_empty() {
-            continue;
-        }
-        let mut chosen_sorted = chosen.into_iter().collect::<Vec<_>>();
-        chosen_sorted.sort_unstable();
-        for idx in chosen_sorted.into_iter() {
+        // Push train scores and test scores to their OWN buckets independently.
+        // Use NaN for the "other" score so RuleNullScores::push silently
+        // drops it — each bucket only sees its own dimension.
+        for idx in train_chosen {
             let cand = &perm_hits[idx];
-            out.push((bucket, cand.train_score, cand.test_score));
+            out.push((bucket, cand.train_score, f64::NAN));
+        }
+        for idx in test_chosen {
+            let cand = &perm_hits[idx];
+            out.push((bucket, f64::NAN, cand.test_score));
         }
     }
     Ok(out)
@@ -5947,6 +6143,7 @@ fn process_scan_unit_chunk_continuous(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 fn process_rule_permutation_task_chunk(
     slot_indices: &[usize],
     rep_start: usize,
@@ -5993,6 +6190,55 @@ fn process_rule_permutation_task_chunk(
             }
             out.push((rep, vals));
         }
+    }
+    Ok(out)
+}
+
+/// Like `process_rule_permutation_task_chunk` but takes a flat `&[(slot, rep)]`
+/// list so callers can balance work across workers regardless of the
+/// slot/repeat ratio.
+fn process_rule_permutation_task_chunk_flat(
+    task_chunk: &[(usize, usize)],
+    null_chunk_prepared: &[(GarfieldNullChunk, GarfieldUnitPrepared)],
+    y_train: &[f64],
+    y_test: &[f64],
+    split_applied: bool,
+    perm_beam_params: BeamSearchParams,
+    seed: u64,
+    progress_callback: Option<&Py<PyAny>>,
+    null_progress_done: &AtomicUsize,
+    null_notify_step: usize,
+    permutation_task_total: usize,
+) -> Result<Vec<(usize, Vec<(RuleNullBucket, f64, f64)>)>, String> {
+    let mut out = Vec::<(usize, Vec<(RuleNullBucket, f64, f64)>)>::with_capacity(
+        task_chunk.len(),
+    );
+    for &(slot, rep) in task_chunk.iter() {
+        let (chunk, prepared) = &null_chunk_prepared[slot];
+        let rep_seed = seed
+            ^ (chunk.window_id.wrapping_mul(0x94D0_49BB_1331_11EB))
+            ^ ((rep as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+            ^ ((slot as u64).wrapping_mul(0xA24B_AED4_963E_E407));
+        let vals = collect_rule_permutation_nulls_for_repeat(
+            prepared,
+            y_train,
+            y_test,
+            split_applied,
+            perm_beam_params.clone(),
+            rep_seed,
+        )?;
+        let done = null_progress_done.fetch_add(1, Ordering::Relaxed) + 1;
+        if done % null_notify_step == 0 || done == permutation_task_total {
+            garfield_stage_progress_notify(
+                progress_callback,
+                "null_penalty",
+                done,
+                permutation_task_total.max(1),
+                None,
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        out.push((rep, vals));
     }
     Ok(out)
 }
@@ -7049,7 +7295,6 @@ fn garfield_logic_search_bed_owned(
         .map_err(|e| e.to_string())?;
         let perm_beam_params = BeamSearchParams {
             allow_parallel: false,
-            disable_parent_delta: true,
             ..beam_params.clone()
         };
         let mut bucket_scores =
@@ -7064,7 +7309,6 @@ fn garfield_logic_search_bed_owned(
                 .saturating_mul(perm_cfg.n_repeats.max(1))
                 .max(1),
         );
-        let null_task_coalesce_max_tasks = garfield_null_task_coalesce_max_tasks();
         let repeats_per_batch = if null_chunk_prepared.is_empty() {
             1usize
         } else {
@@ -7087,60 +7331,67 @@ fn garfield_logic_search_bed_owned(
         'perm_batches: while rep_start < max_perm_repeats {
             let rep_end = (rep_start + repeats_per_batch).min(max_perm_repeats);
             let rep_count = rep_end - rep_start;
-            let slot_chunk_width = if null_chunk_prepared.is_empty() {
-                1usize
-            } else {
-                null_task_coalesce_max_tasks
-                    .div_ceil(rep_count.max(1))
+            // Flatten (slot, rep) into a flat task list, then chunk by
+            // task_grain so every worker gets a balanced share regardless
+            // of the slot/repeat ratio.
+            let n_slots = null_chunk_prepared.len();
+            let total_tasks = n_slots.saturating_mul(rep_count);
+            let task_grain = if perm_threads > 1 {
+                total_tasks
+                    .div_ceil(perm_threads.saturating_mul(4))
                     .max(1)
+            } else {
+                total_tasks.max(1)
             };
-            let slot_indices = (0..null_chunk_prepared.len()).collect::<Vec<_>>();
-            let batch_results = if let Some(pool) = perm_pool.as_ref() {
-                pool.install(|| {
-                    slot_indices
-                        .par_chunks(slot_chunk_width)
-                        .map(|slot_chunk| {
-                            process_rule_permutation_task_chunk(
-                                slot_chunk,
-                                rep_start,
-                                rep_end,
+            let mut tasks: Vec<(usize, usize)> =
+                Vec::with_capacity(total_tasks);
+            for slot in 0..n_slots {
+                for rep in rep_start..rep_end {
+                    tasks.push((slot, rep));
+                }
+            }
+            let batch_results: Vec<Result<Vec<(usize, Vec<(RuleNullBucket, f64, f64)>)>, String>> =
+                if let Some(pool) = perm_pool.as_ref() {
+                    pool.install(|| {
+                        tasks
+                            .par_chunks(task_grain)
+                            .map(|task_chunk| {
+                                process_rule_permutation_task_chunk_flat(
+                                    task_chunk,
+                                    null_chunk_prepared.as_slice(),
+                                    train_fit.residualized_y.as_slice(),
+                                    test_fit.residualized_y.as_slice(),
+                                    split_applied,
+                                    perm_beam_params.clone(),
+                                    seed,
+                                    progress_callback_parallel,
+                                    &null_progress_done,
+                                    null_notify_step,
+                                    permutation_task_total,
+                                )
+                            })
+                            .collect()
+                    })
+                } else {
+                    tasks
+                        .chunks(task_grain)
+                        .map(|task_chunk| {
+                            process_rule_permutation_task_chunk_flat(
+                                task_chunk,
                                 null_chunk_prepared.as_slice(),
                                 train_fit.residualized_y.as_slice(),
                                 test_fit.residualized_y.as_slice(),
                                 split_applied,
                                 perm_beam_params.clone(),
                                 seed,
-                                progress_callback_parallel,
+                                progress_callback.as_ref(),
                                 &null_progress_done,
                                 null_notify_step,
                                 permutation_task_total,
                             )
                         })
-                        .collect::<Vec<Result<Vec<(usize, Vec<(RuleNullBucket, f64, f64)>)>, String>>>()
-                })
-            } else {
-                let mut out = Vec::<Result<Vec<(usize, Vec<(RuleNullBucket, f64, f64)>)>, String>>::with_capacity(
-                    slot_indices.len().div_ceil(slot_chunk_width),
-                );
-                for slot_chunk in slot_indices.chunks(slot_chunk_width) {
-                    out.push(process_rule_permutation_task_chunk(
-                        slot_chunk,
-                        rep_start,
-                        rep_end,
-                        null_chunk_prepared.as_slice(),
-                        train_fit.residualized_y.as_slice(),
-                        test_fit.residualized_y.as_slice(),
-                        split_applied,
-                        perm_beam_params.clone(),
-                        seed,
-                        progress_callback.as_ref(),
-                        &null_progress_done,
-                        null_notify_step,
-                        permutation_task_total,
-                    ));
-                }
-                out
-            };
+                        .collect()
+                };
             let mut by_rep = vec![Vec::<(RuleNullBucket, f64, f64)>::new(); rep_end - rep_start];
             for chunk_out in batch_results.into_iter() {
                 for (rep, vals) in chunk_out? {
@@ -7205,7 +7456,6 @@ fn garfield_logic_search_bed_owned(
         .map_err(|e| e.to_string())?;
         let posterior_beam_params = BeamSearchParams {
             allow_parallel: false,
-            disable_parent_delta: true,
             null_penalties: rule_null_lookup.clone(),
             structure_prior: None,
             min_gain: if no_clean {
@@ -7316,6 +7566,9 @@ fn garfield_logic_search_bed_owned(
         progress_every.max(1)
     };
     reset_garfield_beam_profile();
+    reset_pairwise_profile();
+    DENSE_EXTRACT_FLAT_NS.store(0, Ordering::Relaxed);
+    PACKED_EXTRACT_FLAT_NS.store(0, Ordering::Relaxed);
     GARFIELD_ML_SELECT_NS.store(0, Ordering::Relaxed);
     let scan_stage_t0 = Instant::now();
     let scan_progress_done = AtomicUsize::new(0);
@@ -7437,6 +7690,7 @@ fn garfield_logic_search_bed_owned(
     let timing_scan_ml_select_wall_s =
         (GARFIELD_ML_SELECT_NS.load(Ordering::Relaxed) as f64) * 1e-9;
     let scan_beam_profile = snapshot_garfield_beam_profile();
+    let (pw_marg, pw_pack, pw_kern, pw_comb) = snapshot_pairwise_profile();
 
     records = dedup_logic_rule_records(records);
     apply_logic_rule_output_limit(&mut records, max_output_rules, max_output_ratio)?;
@@ -7555,6 +7809,16 @@ fn garfield_logic_search_bed_owned(
         timing_scan_beam_wall_s,
         timing_scan_literal_score_wall_s,
         timing_scan_beam_calls: scan_beam_profile.calls,
+        timing_clone_bits_s: scan_beam_profile.clone_bits_s,
+        timing_sum_y_both1_s: scan_beam_profile.sum_y_both1_s,
+        timing_parent_baseline_s: scan_beam_profile.parent_baseline_s,
+        timing_pw_marginal_s: pw_marg,
+        timing_pw_pack_s: pw_pack,
+        timing_pw_kernel_s: pw_kern,
+        timing_pw_combine_s: pw_comb,
+        timing_dense_extract_s: ((DENSE_EXTRACT_FLAT_NS.load(Ordering::Relaxed)
+            + PACKED_EXTRACT_FLAT_NS.load(Ordering::Relaxed)) as f64)
+            * 1e-9,
         timing_literal_score_share_of_total_pct,
         timing_literal_score_share_of_scan_pct,
         timing_literal_score_share_of_beam_pct,
@@ -7819,6 +8083,14 @@ pub fn garfield_logic_search_bed_py<'py>(
         result.timing_scan_literal_score_wall_s,
     )?;
     out.set_item("timing_scan_beam_calls", result.timing_scan_beam_calls)?;
+    out.set_item("timing_clone_bits_s", result.timing_clone_bits_s)?;
+    out.set_item("timing_sum_y_both1_s", result.timing_sum_y_both1_s)?;
+    out.set_item("timing_parent_baseline_s", result.timing_parent_baseline_s)?;
+    out.set_item("timing_pw_marginal_s", result.timing_pw_marginal_s)?;
+    out.set_item("timing_pw_pack_s", result.timing_pw_pack_s)?;
+    out.set_item("timing_pw_kernel_s", result.timing_pw_kernel_s)?;
+    out.set_item("timing_pw_combine_s", result.timing_pw_combine_s)?;
+    out.set_item("timing_dense_extract_s", result.timing_dense_extract_s)?;
     out.set_item(
         "timing_literal_score_share_of_total_pct",
         result.timing_literal_score_share_of_total_pct,

@@ -99,7 +99,14 @@ def _normalize_result(result: dict[str, Any]) -> dict[str, Any]:
         "timing_scan_wall_s",
         "timing_scan_beam_wall_s",
         "timing_scan_literal_score_wall_s",
+        "timing_scan_ml_select_wall_s",
         "timing_scan_beam_calls",
+        "timing_clone_bits_s",
+        "timing_pw_marginal_s",
+        "timing_pw_pack_s",
+        "timing_pw_kernel_s",
+        "timing_pw_combine_s",
+        "timing_dense_extract_s",
         "timing_literal_score_share_of_total_pct",
         "timing_literal_score_share_of_scan_pct",
         "timing_literal_score_share_of_beam_pct",
@@ -363,7 +370,6 @@ def _run_child(args: argparse.Namespace, backend: str, root: Path) -> dict[str, 
         str(args.exhaustive_depth),
         "--beam-width",
         str(args.beam_width),
-        "--logic-gate",
         "--rank-score",
         str(args.rank_score),
         "--maf",
@@ -452,7 +458,7 @@ def main() -> int:
     ap.add_argument("--step", type=int, default=None)
     ap.add_argument("--scan-bimranges", default="")
     ap.add_argument("--bin-mode", default="bin")
-    ap.add_argument("--ml-method", default="rf")
+    ap.add_argument("--ml-method", default="")
     ap.add_argument("--topk", type=int, default=64)
     ap.add_argument("--permutation-repeats", type=int, default=0)
     ap.add_argument("--n-estimators", type=int, default=100)
@@ -461,7 +467,7 @@ def main() -> int:
     ap.add_argument("--layer", type=int, default=3)
     ap.add_argument("--exhaustive-depth", type=int, default=1)
     ap.add_argument("--beam-width", type=int, default=100)
-    ap.add_argument("--logic-gate", default="ao")
+
     ap.add_argument("--rank-score", default="interaction_gain")
     ap.add_argument("--maf", type=float, default=0.001)
     ap.add_argument("--geno", type=float, default=0.2)

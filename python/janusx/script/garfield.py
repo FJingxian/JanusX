@@ -711,10 +711,13 @@ def main() -> None:
     optional_group.add_argument(
         "-engine",
         "--engine",
-        type=str,
-        choices=["RF", "GBDT", "GBDT2"],
-        default=None,
-        help="Optional ML engine for candidate search. If omitted, skip ML and pass all unit variants directly to beam search.",
+        type=str.upper,
+        choices=["AUTO", "CORR", "RF", "GBDT", "GBDT2", "NONE", "SKIP", "DIRECT"],
+        default="CORR",
+        help=(
+            "ML engine for candidate search. Default: CORR. "
+            "Use NONE/SKIP/DIRECT to bypass ML and pass all unit variants directly to beam search."
+        ),
     )
     optional_group.add_argument(
         "-width",
@@ -840,7 +843,13 @@ def main() -> None:
         except Exception:
             parser.error("--prior-not must be finite when provided")
 
-    args.topk = int(args.width) if args.engine is not None else 0
+    if args.engine is not None:
+        args.engine = str(args.engine).upper()
+        if args.engine == "AUTO":
+            args.engine = "CORR"
+
+    ml_skip_tokens = {"NONE", "SKIP", "DIRECT"}
+    args.topk = int(args.width) if args.engine not in ml_skip_tokens else 0
     args.top_rules_runtime = 1
     args.max_output_rules_runtime = 0
     args.max_output_ratio_runtime = 0.0
@@ -856,8 +865,6 @@ def main() -> None:
     if args.feature_source == "mbin":
         args.feature_source = "bin"
 
-    if args.engine is not None:
-        args.engine = str(args.engine).upper()
     args.rank_score = "gain_from_layer:2"
     args.rank_schedule_source = "fixed-combination-gain"
     args.gain_start_layer_runtime = 2
@@ -890,7 +897,7 @@ def main() -> None:
             "(heterozygotes and NA are both treated as missing before binary decoding)."
         )
 
-    ml_skipped = args.engine is None
+    ml_skipped = args.engine in ml_skip_tokens
     engine_runtime = "none" if ml_skipped else str(args.engine)
     rank_score_runtime = str(args.rank_score)
     rank_schedule_source = str(args.rank_schedule_source)

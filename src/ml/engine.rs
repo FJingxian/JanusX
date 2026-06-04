@@ -80,7 +80,7 @@ pub fn compute_feature_scores_grouped(
     }
 
     let resolved = match engine {
-        MlEngine::Auto => MlEngine::PairwiseAnd,
+        MlEngine::Auto => MlEngine::Corr,
         other => other,
     };
 

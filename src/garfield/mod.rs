@@ -102,7 +102,6 @@ const GARFIELD_DISABLE_STRUCTURE_PRIOR: bool = true;
 static GARFIELD_ML_SELECT_NS: AtomicU64 = AtomicU64::new(0);
 
 const GARFIELD_SCAN_UNIT_COALESCE_MAX_UNITS_DEFAULT: usize = 64;
-const GARFIELD_NULL_TASK_COALESCE_MAX_TASKS_DEFAULT: usize = 64;
 const GARFIELD_STRUCTURE_TASK_COALESCE_MAX_UNITS_DEFAULT: usize = 32;
 
 #[inline]
@@ -137,13 +136,6 @@ fn parse_env_usize(name: &str) -> Option<usize> {
 fn garfield_scan_unit_coalesce_max_units() -> usize {
     parse_env_usize("JX_GARFIELD_SCAN_UNIT_COALESCE_MAX_UNITS")
         .unwrap_or(GARFIELD_SCAN_UNIT_COALESCE_MAX_UNITS_DEFAULT)
-        .max(1)
-}
-
-#[inline]
-fn garfield_null_task_coalesce_max_tasks() -> usize {
-    parse_env_usize("JX_GARFIELD_NULL_TASK_COALESCE_MAX_TASKS")
-        .unwrap_or(GARFIELD_NULL_TASK_COALESCE_MAX_TASKS_DEFAULT)
         .max(1)
 }
 
@@ -3854,7 +3846,7 @@ fn rule_expr(rule: &BeamRule, local_sites: &[SiteInfo]) -> Result<String, String
         .get(rule.first.row_index)
         .ok_or_else(|| format!("rule row index out of range: {}", rule.first.row_index))?;
     let mut out = literal_expr(first, rule.first.negated);
-    for (op, lit) in rule.rest.iter() {
+    for (_op, lit) in rule.rest.iter() {
         let site = local_sites
             .get(lit.row_index)
             .ok_or_else(|| format!("rule row index out of range: {}", lit.row_index))?;
@@ -3872,7 +3864,7 @@ fn rule_snp_name(rule: &BeamRule, local_sites: &[SiteInfo]) -> Result<String, St
         .get(rule.first.row_index)
         .ok_or_else(|| format!("rule row index out of range: {}", rule.first.row_index))?;
     let mut out = literal_name(first, rule.first.negated);
-    for (op, lit) in rule.rest.iter() {
+    for (_op, lit) in rule.rest.iter() {
         let site = local_sites
             .get(lit.row_index)
             .ok_or_else(|| format!("rule row index out of range: {}", lit.row_index))?;
@@ -3885,7 +3877,7 @@ fn rule_snp_name(rule: &BeamRule, local_sites: &[SiteInfo]) -> Result<String, St
 
 fn rule_ml_rank_name(rule: &BeamRule) -> String {
     let mut out = literal_ml_rank_name(rule.first.row_index, rule.first.negated);
-    for (op, lit) in rule.rest.iter() {
+    for (_op, lit) in rule.rest.iter() {
         let op_txt = " & "; // AND-only
         out.push_str(op_txt);
         out.push_str(&literal_ml_rank_name(lit.row_index, lit.negated));
@@ -4453,70 +4445,6 @@ fn dense_binary_rows_from_full_bits_range(
     Ok(out)
 }
 
-/// Flat range variant: single allocation, no per-row Vec.
-fn dense_binary_rows_from_full_bits_range_flat(
-    bits_flat: &[u64],
-    row_words: usize,
-    row_start: usize,
-    row_end: usize,
-    sample_indices: &[usize],
-    n_rows_all: usize,
-    n_samples_all: usize,
-) -> Result<(Vec<u8>, usize), String> {
-    let _t = Instant::now();
-    let result = _dense_binary_rows_from_full_bits_range_flat_impl(
-        bits_flat, row_words, row_start, row_end, sample_indices, n_rows_all, n_samples_all,
-    );
-    DENSE_EXTRACT_FLAT_NS.fetch_add(elapsed_ns_saturating(_t), Ordering::Relaxed);
-    result
-}
-
-fn _dense_binary_rows_from_full_bits_range_flat_impl(
-    bits_flat: &[u64],
-    row_words: usize,
-    row_start: usize,
-    row_end: usize,
-    sample_indices: &[usize],
-    n_rows_all: usize,
-    n_samples_all: usize,
-) -> Result<(Vec<u8>, usize), String> {
-    if row_end <= row_start {
-        return Ok((Vec::new(), sample_indices.len()));
-    }
-    if row_end > n_rows_all {
-        return Err(format!(
-            "row range out of bounds while densifying flat: [{row_start}, {row_end}) vs n_rows={n_rows_all}"
-        ));
-    }
-    if row_words != words_for_samples(n_samples_all) {
-        return Err(format!(
-            "row_words mismatch for full bit matrix: got {row_words}, expected {}",
-            words_for_samples(n_samples_all)
-        ));
-    }
-    if bits_flat.len() != n_rows_all.saturating_mul(row_words) {
-        return Err("full bit matrix length mismatch".to_string());
-    }
-    let row_stride = sample_indices.len();
-    let n_rows_sub = row_end.saturating_sub(row_start);
-    let mut data = vec![0u8; n_rows_sub.saturating_mul(row_stride)];
-
-    for (dst_r, src_r) in (row_start..row_end).enumerate() {
-        let src_row = &bits_flat[src_r * row_words..(src_r + 1) * row_words];
-        let dst_start = dst_r * row_stride;
-        for (j, &sid) in sample_indices.iter().enumerate() {
-            if sid >= n_samples_all {
-                return Err(format!(
-                    "sample index out of range while densifying flat: {sid}"
-                ));
-            }
-            data[dst_start + j] =
-                ((src_row[sid >> 6] >> (sid & 63)) & 1u64) as u8;
-        }
-    }
-    Ok((data, row_stride))
-}
-
 fn dense_binary_rows_from_full_bits(
     bits_flat: &[u64],
     row_words: usize,
@@ -4554,31 +4482,11 @@ fn dense_binary_rows_from_full_bits(
     Ok(out)
 }
 
-/// Flat variant: returns `(data, row_stride)` where data is row-major
-/// `[row0_sample0, row0_sample1, ..., row1_sample0, ...]`.
-/// Single allocation, no per-row Vec overhead.
-static DENSE_EXTRACT_FLAT_NS: AtomicU64 = AtomicU64::new(0);
 static PACKED_EXTRACT_FLAT_NS: AtomicU64 = AtomicU64::new(0);
 
 #[inline]
 fn elapsed_ns_saturating(start: Instant) -> u64 {
     start.elapsed().as_nanos().min(u64::MAX as u128) as u64
-}
-
-fn dense_binary_rows_from_full_bits_flat(
-    bits_flat: &[u64],
-    row_words: usize,
-    row_indices: &[usize],
-    sample_indices: &[usize],
-    n_rows_all: usize,
-    n_samples_all: usize,
-) -> Result<(Vec<u8>, usize), String> {
-    let _t = Instant::now();
-    let result = _dense_binary_rows_from_full_bits_flat_impl(
-        bits_flat, row_words, row_indices, sample_indices, n_rows_all, n_samples_all,
-    );
-    DENSE_EXTRACT_FLAT_NS.fetch_add(elapsed_ns_saturating(_t), Ordering::Relaxed);
-    result
 }
 
 fn packed_rows_subset_from_full_bits_with_stage1(
@@ -4702,48 +4610,6 @@ fn packed_rows_subset_from_full_bits_range_with_stage1(
     }
     PACKED_EXTRACT_FLAT_NS.fetch_add(elapsed_ns_saturating(_t), Ordering::Relaxed);
     Ok((out, row_words_sub, feat_n_hit, feat_sum_hit))
-}
-
-fn _dense_binary_rows_from_full_bits_flat_impl(
-    bits_flat: &[u64],
-    row_words: usize,
-    row_indices: &[usize],
-    sample_indices: &[usize],
-    n_rows_all: usize,
-    n_samples_all: usize,
-) -> Result<(Vec<u8>, usize), String> {
-    if row_words != words_for_samples(n_samples_all) {
-        return Err(format!(
-            "row_words mismatch for full bit matrix: got {row_words}, expected {}",
-            words_for_samples(n_samples_all)
-        ));
-    }
-    if bits_flat.len() != n_rows_all.saturating_mul(row_words) {
-        return Err("full bit matrix length mismatch".to_string());
-    }
-    let row_stride = sample_indices.len();
-    let n_rows = row_indices.len();
-    let mut data = vec![0u8; n_rows.saturating_mul(row_stride)];
-
-    for (dst_r, &src_r) in row_indices.iter().enumerate() {
-        if src_r >= n_rows_all {
-            return Err(format!(
-                "row index out of range while densifying flat: {src_r}"
-            ));
-        }
-        let src_row = &bits_flat[src_r * row_words..(src_r + 1) * row_words];
-        let dst_start = dst_r * row_stride;
-        for (j, &sid) in sample_indices.iter().enumerate() {
-            if sid >= n_samples_all {
-                return Err(format!(
-                    "sample index out of range while densifying flat: {sid}"
-                ));
-            }
-            data[dst_start + j] =
-                ((src_row[sid >> 6] >> (sid & 63)) & 1u64) as u8;
-        }
-    }
-    Ok((data, row_stride))
 }
 
 fn packed_rows_subset_from_full_bits_range(
@@ -6302,8 +6168,9 @@ fn process_structure_prior_unit_chunk(
 fn parse_optional_ml_engine(method: &str) -> Result<Option<MlEngine>, String> {
     let norm = method.trim().to_ascii_lowercase();
     match norm.as_str() {
-        // Default: pairwise interaction screening (fast + interaction-aware).
-        "" | "auto" => Ok(Some(MlEngine::PairwiseAnd)),
+        // Default: univariate correlation screening; robust when a scan unit
+        // contains many loci because cost stays linear in feature count.
+        "" | "auto" => Ok(Some(MlEngine::Corr)),
         "none" | "skip" | "direct" => Ok(None),
         _ => parse_ml_engine(norm.as_str()).map(Some),
     }
@@ -7567,7 +7434,6 @@ fn garfield_logic_search_bed_owned(
     };
     reset_garfield_beam_profile();
     reset_pairwise_profile();
-    DENSE_EXTRACT_FLAT_NS.store(0, Ordering::Relaxed);
     PACKED_EXTRACT_FLAT_NS.store(0, Ordering::Relaxed);
     GARFIELD_ML_SELECT_NS.store(0, Ordering::Relaxed);
     let scan_stage_t0 = Instant::now();
@@ -7816,9 +7682,7 @@ fn garfield_logic_search_bed_owned(
         timing_pw_pack_s: pw_pack,
         timing_pw_kernel_s: pw_kern,
         timing_pw_combine_s: pw_comb,
-        timing_dense_extract_s: ((DENSE_EXTRACT_FLAT_NS.load(Ordering::Relaxed)
-            + PACKED_EXTRACT_FLAT_NS.load(Ordering::Relaxed)) as f64)
-            * 1e-9,
+        timing_dense_extract_s: (PACKED_EXTRACT_FLAT_NS.load(Ordering::Relaxed) as f64) * 1e-9,
         timing_literal_score_share_of_total_pct,
         timing_literal_score_share_of_scan_pct,
         timing_literal_score_share_of_beam_pct,
@@ -7845,7 +7709,7 @@ fn garfield_logic_search_bed_owned(
     step=None,
     scan_bimranges=None,
     bin_mode="bin",
-    ml_method="",
+    ml_method="corr",
     ml_importance="imp",
     ml_top_k=64,
     ml_top_frac=0.0,

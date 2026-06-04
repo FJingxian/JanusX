@@ -267,7 +267,7 @@ impl MmapSparseGrmCsc {
         ) {
             if !padded_layout && values_offset != values_offset_padded {
                 return Err(format!(
-                    "Sparse GRM uses legacy unpadded values layout that cannot be mmap-aligned for zero-copy load: {path}. Rebuild this .jxgrm with the current JanusX writer. Detail: {err}"
+                    "Sparse GRM uses legacy unpadded values layout that cannot be mmap-aligned for zero-copy load: {path}. Rebuild this .spgrm with the current JanusX writer. Detail: {err}"
                 ));
             }
             return Err(err);
@@ -464,7 +464,7 @@ where
         }
         if !seen_diag {
             return Err(format!(
-                "Sparse GRM CSC missing diagonal entry at column {col}; .jxgrm from spgrm should keep all diagonals"
+                "Sparse GRM CSC missing diagonal entry at column {col}; .spgrm from spgrm should keep all diagonals"
             ));
         }
         let done = col + 1;
@@ -1368,7 +1368,7 @@ mod tests {
         };
         let mut out_path = std::env::temp_dir();
         out_path.push(format!(
-            "janusx_cholesky_pad_test_{}_{}.jxgrm",
+            "janusx_cholesky_pad_test_{}_{}.spgrm",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1394,7 +1394,7 @@ mod tests {
         };
         let mut out_path = std::env::temp_dir();
         out_path.push(format!(
-            "janusx_cholesky_validate_cache_test_{}_{}.jxgrm",
+            "janusx_cholesky_validate_cache_test_{}_{}.spgrm",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

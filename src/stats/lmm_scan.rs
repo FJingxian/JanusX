@@ -5644,7 +5644,7 @@ pub fn lmm_reml_assoc_packed_f32_to_tsv<'py>(
 }
 
 #[derive(Clone, Copy)]
-enum PackedGeneticModel {
+pub(crate) enum PackedGeneticModel {
     Add,
     Dom,
     Rec,
@@ -5720,7 +5720,7 @@ fn center_decoded_row_inplace(row: &mut [f32]) {
 }
 
 #[inline]
-fn decode_centered_block_packed_f32(
+pub(crate) fn decode_centered_block_packed_f32(
     packed_flat: &[u8],
     bytes_per_snp: usize,
     row_flip: &[bool],

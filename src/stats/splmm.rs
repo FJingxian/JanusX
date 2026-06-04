@@ -1101,7 +1101,7 @@ fn sparse_splmm_load_factor(
 ) -> Result<SparseJxgrmCholesky, String> {
     let path = sparse_jxgrm_path
         .map(|s| s.to_string())
-        .unwrap_or_else(|| format!("{prefix}.jxgrm"));
+        .unwrap_or_else(|| format!("{prefix}.spgrm"));
     if !Path::new(&path).exists() {
         return Err(format!(
             "SparseLMM requires a sparse kinship file, but none was found at: {path}"
@@ -1399,7 +1399,7 @@ fn sparse_solve_rhs_tiled(
 // Works with any GenotypeMatrix backend via UnifiedInput.
 fn exact_scan_blocks_core<G: GenotypeMatrix>(
     factor: &SparseJxgrmCholesky,
-    input: &UnifiedInput<G>,
+    input: &mut UnifiedInput<G>,
     x_design: &[f64],
     py_vec: &[f64],
     xt_v_inv_x_chol: &[f64],
@@ -1483,7 +1483,7 @@ fn exact_scan_blocks_core<G: GenotypeMatrix>(
         let spy_slice = &mut spy_block[..rows_here];
 
         // Step 1: decode genotype block via UnifiedInput
-        input.decode_additive_block(row_start, block_slice, scan_sample_idx, sample_identity, pool.as_ref())?;
+        input.matrix.decode_additive_block(&input.stats, row_start, block_slice, scan_sample_idx, sample_identity, pool.as_ref())?;
 
         // Step 2: numerator = G_block * Py
         row_major_block_mul_mat_f32(block_slice, rows_here, n, py_f32.as_slice(), 1, spy_slice, pool.as_ref());
@@ -1554,9 +1554,9 @@ fn scan_with_py_and_exact_pg_sparse(
     // Bridge through JxlmmMatrixAdapter (zero-copy) for backward compat.
     let adapter = JxlmmMatrixAdapter { inner: scan_prepared };
     let stats = unified_stats_from_jxlmm(scan_prepared);
-    let input = UnifiedInput { matrix: adapter, stats };
+    let mut input = UnifiedInput { matrix: adapter, stats };
     exact_scan_blocks_core(
-        factor, &input, x_design, py_vec, xt_v_inv_x_chol, scan_sample_idx,
+        factor, &mut input, x_design, py_vec, xt_v_inv_x_chol, scan_sample_idx,
         gm, threads, block_rows,
         scan_progress_callback, progress_every, progress_stage,
         solve_workspace, &mut memory_sink,
@@ -1566,7 +1566,7 @@ fn scan_with_py_and_exact_pg_sparse(
 
 #[allow(clippy::too_many_arguments)]
 fn grammar_scan_blocks_core<G: GenotypeMatrix>(
-    input: &UnifiedInput<G>,
+    input: &mut UnifiedInput<G>,
     x_design: &[f64],
     py_vec: &[f64],
     xtx_chol: &[f64],
@@ -1667,7 +1667,7 @@ fn grammar_scan_blocks_core<G: GenotypeMatrix>(
             let xts_slice = &mut xts_block[..rows_here * p];
             let ss_slice = &mut row_ss[..rows_here];
             // Decode via UnifiedInput
-            input.decode_additive_block(row_start, block_slice, scan_sample_idx, sample_identity, pool.as_ref())?;
+            input.matrix.decode_additive_block(&input.stats, row_start, block_slice, scan_sample_idx, sample_identity, pool.as_ref())?;
             row_major_block_mul_mat_f32(
                 block_slice,
                 rows_here,
@@ -1820,7 +1820,7 @@ fn scan_with_py_and_rhat(
 ) -> Result<Vec<f64>, String> {
     let adapter = JxlmmMatrixAdapter { inner: scan_prepared };
     let stats = unified_stats_from_jxlmm(scan_prepared);
-    let input = UnifiedInput { matrix: adapter, stats };
+    let mut input = UnifiedInput { matrix: adapter, stats };
     let m = input.n_markers();
     let mut out = vec![0.0_f64; m * 3];
     let mut memory_sink = |row_start: usize, rows_here: usize, block: &[f64]| {
@@ -1828,7 +1828,7 @@ fn scan_with_py_and_rhat(
         Ok(())
     };
     grammar_scan_blocks_core(
-        &input, x_design, py_vec, xtx_chol, scan_sample_idx,
+        &mut input, x_design, py_vec, xtx_chol, scan_sample_idx,
         gm, r_hat, threads, block_rows,
         scan_progress_callback, progress_every, progress_stage,
         &mut memory_sink,
@@ -1885,7 +1885,7 @@ fn scan_to_tsv_with_py_and_rhat(
 
     let adapter = JxlmmMatrixAdapter { inner: scan_prepared };
     let stats = unified_stats_from_jxlmm(scan_prepared);
-    let input = UnifiedInput { matrix: adapter, stats };
+    let mut input = UnifiedInput { matrix: adapter, stats };
     let row_maf = input.stats.maf.clone();
     let row_miss = input.stats.miss.clone();
     let m = input.n_markers();
@@ -1902,7 +1902,7 @@ fn scan_to_tsv_with_py_and_rhat(
         Ok(())
     };
     let run_res = grammar_scan_blocks_core(
-        &input, x_design, py_vec, xtx_chol, scan_sample_idx,
+        &mut input, x_design, py_vec, xtx_chol, scan_sample_idx,
         gm, r_hat, threads, block_rows,
         scan_progress_callback, progress_every, progress_stage,
         &mut tsv_sink,
@@ -1984,9 +1984,9 @@ fn scan_to_tsv_with_py_and_exact_pg_sparse(
     };
     let adapter = JxlmmMatrixAdapter { inner: scan_prepared };
     let stats = unified_stats_from_jxlmm(scan_prepared);
-    let input = UnifiedInput { matrix: adapter, stats };
+    let mut input = UnifiedInput { matrix: adapter, stats };
     let run_res = exact_scan_blocks_core(
-        factor, &input, x_design, py_vec, xt_v_inv_x_chol, scan_sample_idx,
+        factor, &mut input, x_design, py_vec, xt_v_inv_x_chol, scan_sample_idx,
         gm, threads, block_rows,
         scan_progress_callback, progress_every, progress_stage,
         solve_workspace, &mut tsv_sink,
@@ -2222,7 +2222,7 @@ fn estimate_rhat_and_scan_sparse(
             .ok_or_else(|| "SparseLMM exact scan requires a BED prefix".to_string())?;
         let matrix = crate::gload::BedMmapMatrix::open(bed_prefix)?;
         let stats = unified_stats_from_jxlmm(&scan_prepared);
-        let input = UnifiedInput { matrix, stats };
+        let mut input = UnifiedInput { matrix, stats };
 
         let m = input.n_markers();
         let mut out = vec![0.0_f64; m * 3];
@@ -2231,7 +2231,7 @@ fn estimate_rhat_and_scan_sparse(
             Ok(())
         };
         exact_scan_blocks_core(
-            &factor, &input, &x_design, &null_model.py,
+            &factor, &mut input, &x_design, &null_model.py,
             &null_model.xt_v_inv_x_chol, &scan_sample_idx,
             gm, threads, block_rows,
             scan_progress_callback.as_ref(), progress_every, 9,
@@ -2247,7 +2247,7 @@ fn estimate_rhat_and_scan_sparse(
             .ok_or_else(|| "SparseLMM grammar scan requires a BED prefix".to_string())?;
         let matrix = crate::gload::BedMmapMatrix::open(bed_prefix)?;
         let stats = unified_stats_from_jxlmm(&scan_prepared);
-        let input = UnifiedInput { matrix, stats };
+        let mut input = UnifiedInput { matrix, stats };
         let m = input.n_markers();
         let mut out = vec![0.0_f64; m * 3];
         let mut memory_sink = |row_start: usize, rows_here: usize, block: &[f64]| {
@@ -2255,7 +2255,7 @@ fn estimate_rhat_and_scan_sparse(
             Ok(())
         };
         grammar_scan_blocks_core(
-            &input, &x_design, &null_model.py, &null_model.xtx_chol,
+            &mut input, &x_design, &null_model.py, &null_model.xtx_chol,
             &scan_sample_idx, gm, r_hat, threads, block_rows,
             scan_progress_callback.as_ref(), progress_every, 9,
             &mut memory_sink,
@@ -3588,7 +3588,7 @@ mod tests {
 
         let adapter = JxlmmMatrixAdapter { inner: &prepared };
         let stats = unified_stats_from_jxlmm(&prepared);
-        let input = UnifiedInput { matrix: adapter, stats };
+        let mut input = UnifiedInput { matrix: adapter, stats };
         let mut core = vec![0.0_f64; prepared.n_rows() * 3];
         let mut sink = |row_start: usize, rows_here: usize, block: &[f64]| {
             core[row_start * 3..][..rows_here * 3].copy_from_slice(block);
@@ -3659,7 +3659,7 @@ mod tests {
         };
         let adapter = JxlmmMatrixAdapter { inner: &prepared };
         let stats = unified_stats_from_jxlmm(&prepared);
-        let input = UnifiedInput { matrix: adapter, stats };
+        let mut input = UnifiedInput { matrix: adapter, stats };
         exact_scan_blocks_core(
             &factor,
             &input,

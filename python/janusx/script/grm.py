@@ -536,7 +536,7 @@ def main(log: bool = True):
     optional_group.add_argument(
         "-sparse", "--sparse", nargs="?", const=0.05, default=None, type=float,
         help=(
-            "Build sparse GRM in CSC `.jxgrm` format and keep only off-diagonal "
+            "Build sparse GRM in CSC `.spgrm` format and keep only off-diagonal "
             "kinship entries >= cutoff (default cutoff when flag is present: %(const)s)."
         ),
     )
@@ -725,7 +725,7 @@ def main(log: bool = True):
                 f"Sparse GRM cutoff must be finite and >= 0, got {args.sparse}"
             )
         if args.npy:
-            logger.warning("`--npy` is ignored for sparse GRM output; writing `.jxgrm` CSC.")
+            logger.warning("`--npy` is ignored for sparse GRM output; writing `.spgrm` CSC.")
         logger.info(
             "GRM auto route selected backend: sparse-stream-bed "
             "(BED pre-scan + blockwise streaming sparse CSC writer)."

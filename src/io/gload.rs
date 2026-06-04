@@ -82,6 +82,146 @@ pub trait GenotypeMatrix: Send + Sync {
     /// Raw packed bytes at a specific source SNP index (original BIM row).
     /// This is the primitive accessor for mmap matrices.
     fn source_row_bytes(&self, source_idx: usize) -> &[u8];
+
+    /// Decode a block of kept markers via `decode_mean_imputed_additive_packed_block_rows_f32`.
+    /// Default impl uses `packed_flat()` with absolute source offsets.
+    /// Streaming backends override to pre-read file windows.
+    fn decode_additive_block(
+        &mut self,
+        stats: &GlobalStats,
+        row_start: usize,
+        out: &mut [f32],
+        sample_idx: &[usize],
+        sample_identity: bool,
+        pool: Option<&Arc<rayon::ThreadPool>>,
+    ) -> Result<(), String> {
+        let cols = if sample_identity { stats.n_samples_full } else { sample_idx.len() };
+        let rows_here = out.len().saturating_div(cols.max(1));
+        if rows_here == 0 { return Ok(()); }
+        let code4_lut = &packed_byte_lut().code4;
+        decode_mean_imputed_additive_packed_block_rows_f32(
+            self.packed_flat(), stats.bytes_per_snp, stats.n_samples_full,
+            stats.row_flip_slice(row_start, rows_here),
+            stats.row_maf_slice(row_start, rows_here),
+            sample_idx, sample_identity,
+            Some(stats.row_source_slice(row_start, rows_here)),
+            0, out, code4_lut, pool,
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// StreamingBedMatrix — chunked file I/O, no mmap
+// ---------------------------------------------------------------------------
+
+/// Reads BED rows on-demand via `pread` (or `seek`+`read`) instead of
+/// mmap-ing the whole file.  Dramatically reduces RSS for large BEDs
+/// when only sequential access is needed (e.g. GWAS scan).
+pub struct StreamingBedMatrix {
+    file: std::fs::File,
+    n_samples_full: usize,
+    bytes_per_snp: usize,
+    /// Reusable read buffer sized for one block's worth of packed rows.
+    buf: Vec<u8>,
+    /// Byte range currently held in `buf` (start, end) in source-index units.
+    buf_range: (usize, usize),
+}
+
+impl StreamingBedMatrix {
+    /// Open a BED prefix for streaming reads.
+    pub fn open(prefix: &str, block_rows: usize) -> Result<Self, String> {
+        let bed_prefix = normalize_plink_prefix(prefix);
+        let n_samples_full = crate::gfcore::read_fam(&bed_prefix)
+            .map_err(|e| e.to_string())?.len();
+        if n_samples_full == 0 {
+            return Err("no samples found in BED".to_string());
+        }
+        let bytes_per_snp = n_samples_full.div_ceil(4);
+        let bed_path = format!("{bed_prefix}.bed");
+        let file = std::fs::File::open(&bed_path)
+            .map_err(|e| format!("open {bed_path}: {e}"))?;
+        // 3-byte BED header is skipped via offset in read_rows.
+        let buf = vec![0u8; block_rows.saturating_mul(bytes_per_snp).max(1)];
+        Ok(Self { file, n_samples_full, bytes_per_snp, buf, buf_range: (usize::MAX, 0) })
+    }
+
+    /// Ensure `buf` contains the packed bytes for source rows `[start .. end)`.
+    /// Returns a slice covering the requested range.
+    pub fn read_source_range(&mut self, start: usize, end: usize) -> Result<&[u8], String> {
+        use std::os::unix::fs::FileExt;
+        let bps = self.bytes_per_snp;
+        let need = end.saturating_sub(start).saturating_mul(bps);
+        if need > self.buf.len() {
+            self.buf.resize(need, 0);
+        }
+        if start == self.buf_range.0 && end == self.buf_range.1 {
+            return Ok(&self.buf[..need]);
+        }
+        let offset = 3u64.saturating_add((start.saturating_mul(bps)) as u64);
+        self.file.read_exact_at(&mut self.buf[..need], offset)
+            .map_err(|e| format!("read BED rows [{start}..{end}) at offset {offset}: {e}"))?;
+        self.buf_range = (start, end);
+        Ok(&self.buf[..need])
+    }
+}
+
+impl StreamingBedMatrix {
+    /// Pre-fetch the byte range for a block of kept markers and return a
+    /// contiguous packed slice + relative row-source indices ready for
+    /// `decode_mean_imputed_additive_packed_block_rows_f32`.
+    pub fn prepare_block(
+        &mut self,
+        stats: &GlobalStats,
+        row_start: usize,
+        rows_here: usize,
+        rel_indices_out: &mut Vec<usize>,
+    ) -> Result<&[u8], String> {
+        let src_start = stats.row_source_indices[row_start];
+        let src_end = stats.row_source_indices[row_start + rows_here - 1] + 1;
+        let window = self.read_source_range(src_start, src_end)?;
+        rel_indices_out.clear();
+        rel_indices_out.extend(
+            (row_start..row_start + rows_here)
+                .map(|i| stats.row_source_indices[i].saturating_sub(src_start)),
+        );
+        if rel_indices_out.len() != rows_here {
+            return Err("prepare_block: rel_indices mismatch".to_string());
+        }
+        Ok(window)
+    }
+}
+
+impl GenotypeMatrix for StreamingBedMatrix {
+    fn n_samples_full(&self) -> usize { self.n_samples_full }
+    fn bytes_per_snp(&self) -> usize { self.bytes_per_snp }
+    fn packed_flat(&self) -> &[u8] {
+        &self.buf[..(self.buf_range.1.saturating_sub(self.buf_range.0).saturating_mul(self.bytes_per_snp))]
+    }
+    fn source_row_bytes(&self, _source_idx: usize) -> &[u8] { &[] }
+
+    fn decode_additive_block(
+        &mut self,
+        stats: &GlobalStats,
+        row_start: usize,
+        out: &mut [f32],
+        sample_idx: &[usize],
+        sample_identity: bool,
+        pool: Option<&Arc<rayon::ThreadPool>>,
+    ) -> Result<(), String> {
+        let cols = if sample_identity { stats.n_samples_full } else { sample_idx.len() };
+        let rows_here = out.len().saturating_div(cols.max(1));
+        if rows_here == 0 { return Ok(()); }
+        let mut rel_indices = Vec::with_capacity(rows_here);
+        let packed_slice = self.prepare_block(stats, row_start, rows_here, &mut rel_indices)?;
+        let code4_lut = &packed_byte_lut().code4;
+        decode_mean_imputed_additive_packed_block_rows_f32(
+            packed_slice, stats.bytes_per_snp, stats.n_samples_full,
+            stats.row_flip_slice(row_start, rows_here),
+            stats.row_maf_slice(row_start, rows_here),
+            sample_idx, sample_identity, Some(&rel_indices),
+            0, out, code4_lut, pool,
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -243,6 +383,38 @@ impl<G: GenotypeMatrix> UnifiedInput<G> {
             pool,
         )
     }
+
+    /// Decode from a pre-read packed slice (used by streaming backends).
+    /// `packed_slice` covers the source range for this block; `rel_indices`
+    /// are source-index offsets relative to the start of `packed_slice`.
+    #[inline]
+    pub fn decode_additive_block_from_slice(
+        &self,
+        packed_slice: &[u8],
+        rel_indices: &[usize],
+        row_start: usize,
+        rows_here: usize,
+        out: &mut [f32],
+        sample_idx: &[usize],
+        sample_identity: bool,
+        pool: Option<&Arc<rayon::ThreadPool>>,
+    ) -> Result<(), String> {
+        let code4_lut = &packed_byte_lut().code4;
+        decode_mean_imputed_additive_packed_block_rows_f32(
+            packed_slice,
+            self.stats.bytes_per_snp,
+            self.stats.n_samples_full,
+            self.stats.row_flip_slice(row_start, rows_here),
+            self.stats.row_maf_slice(row_start, rows_here),
+            sample_idx,
+            sample_identity,
+            Some(rel_indices),
+            0,
+            out,
+            code4_lut,
+            pool,
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -393,4 +565,54 @@ fn normalize_plink_prefix(prefix: &str) -> String {
 #[inline]
 fn is_simple_snp_allele(allele: &str) -> bool {
     matches!(allele, "A" | "C" | "G" | "T" | "a" | "c" | "g" | "t")
+}
+
+// ---------------------------------------------------------------------------
+// PackedGeneticModel — shared model enum for centered decode
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy)]
+pub enum PackedGeneticModel { Add, Dom, Rec, Het }
+
+// ---------------------------------------------------------------------------
+// Centered decode (zero-mean, used by LMM / FastLMM / FvLMM)
+// ---------------------------------------------------------------------------
+
+/// Centered block decode for any GenotypeMatrix backend.
+/// Uses `crate::lmm_scan::decode_centered_block_packed_f32` internally.
+pub fn decode_centered_block_unified<G: GenotypeMatrix>(
+    matrix: &G,
+    stats: &GlobalStats,
+    row_start: usize,
+    gm: PackedGeneticModel,
+    out: &mut [f32],
+    sample_idx: &[usize],
+    sample_identity: bool,
+) -> Result<(), String> {
+    use crate::lmm_scan::PackedGeneticModel as LmmModel;
+    let n = if sample_identity { stats.n_samples_full } else { sample_idx.len() };
+    let rows_here = out.len().saturating_div(n.max(1));
+    if rows_here == 0 { return Ok(()); }
+    let gm_lmm = match gm {
+        PackedGeneticModel::Add => LmmModel::Add,
+        PackedGeneticModel::Dom => LmmModel::Dom,
+        PackedGeneticModel::Rec => LmmModel::Rec,
+        PackedGeneticModel::Het => LmmModel::Het,
+    };
+    crate::lmm_scan::decode_centered_block_packed_f32(
+        matrix.packed_flat(),
+        stats.bytes_per_snp,
+        stats.row_flip_slice(row_start, rows_here),
+        stats.row_maf_slice(row_start, rows_here),
+        Some(stats.row_source_slice(row_start, rows_here)),
+        row_start,
+        rows_here,
+        n,
+        gm_lmm,
+        sample_identity,
+        None,
+        None,
+        out,
+    );
+    Ok(())
 }

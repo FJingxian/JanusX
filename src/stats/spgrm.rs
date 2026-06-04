@@ -20,8 +20,8 @@ use crate::bedmath::{
     is_identity_indices, packed_byte_lut, SubsetDecodePlan,
 };
 use crate::blas::{
-    cblas_sgemm_dispatch, BlasThreadGuard, CblasInt, CBLAS_COL_MAJOR, CBLAS_NO_TRANS,
-    CBLAS_ROW_MAJOR, CBLAS_TRANS,
+    cblas_sgemm_dispatch, cblas_ssyrk_dispatch, BlasThreadGuard, CblasInt, CBLAS_COL_MAJOR,
+    CBLAS_NO_TRANS, CBLAS_ROW_MAJOR, CBLAS_TRANS, CBLAS_UPPER,
 };
 use crate::gfcore::read_fam;
 use crate::gfreader::prepare_bed_logic_meta_owned_for_stats_samples;
@@ -261,15 +261,15 @@ fn normalize_plink_prefix_local(prefix: &str) -> String {
 }
 
 #[inline]
-fn normalize_jxgrm_path(prefix: &str) -> String {
+fn normalize_spgrm_path(prefix: &str) -> String {
     let trimmed = prefix.trim();
     if trimmed.is_empty() {
         return String::new();
     }
-    if trimmed.to_ascii_lowercase().ends_with(".jxgrm") {
+    if trimmed.to_ascii_lowercase().ends_with(".spgrm") {
         trimmed.to_string()
     } else {
-        format!("{trimmed}.jxgrm")
+        format!("{trimmed}.spgrm")
     }
 }
 
@@ -1737,6 +1737,99 @@ fn pair_block_accumulate_sgemm_rowmajor_strided(
     }
 }
 
+/// Runtime probe: benchmark ssyrk vs sgemm for self-block (C = A * A^T).
+/// Cache result per (rows, n_cols) pair.  Falls back to sgemm on non-BLAS platforms.
+fn spgrm_probe_self_accum_syrk_faster(n_cols: usize, rows: usize) -> bool {
+    if rows == 0 || n_cols == 0 {
+        return false;
+    }
+    // Small matrices: ssyrk overhead may dominate.
+    if n_cols < 64 || rows < 64 {
+        return false;
+    }
+
+    // Thread-safe probe cache.
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    static PROBE_CACHE: Mutex<Option<HashMap<(usize, usize), bool>>> = Mutex::new(None);
+    {
+        let cache = PROBE_CACHE.lock().unwrap();
+        if let Some(ref map) = *cache {
+            if let Some(&v) = map.get(&(n_cols, rows)) {
+                return v;
+            }
+        }
+    }
+
+    // Benchmark: run syrk and gemm each a few times, pick the faster.
+    let probe_rows = rows.min(256);  // small representative block
+    let probe_n = n_cols.min(256);
+    let mut a = vec![0.0_f32; probe_rows * probe_n];
+    let mut c = vec![0.0_f32; probe_n * probe_n];
+
+    let mut bench = |use_syrk: bool| -> f64 {
+        let mut best = f64::INFINITY;
+        for _ in 0..3 {
+            c.fill(0.0);
+            let t0 = std::time::Instant::now();
+            unsafe {
+                if use_syrk {
+                    cblas_ssyrk_dispatch(
+                        CBLAS_COL_MAJOR, CBLAS_UPPER, CBLAS_NO_TRANS,
+                        probe_n as CblasInt, probe_rows as CblasInt,
+                        1.0_f32, a.as_ptr(), probe_n as CblasInt,
+                        0.0_f32, c.as_mut_ptr(), probe_n as CblasInt,
+                    );
+                } else {
+                    cblas_sgemm_dispatch(
+                        CBLAS_COL_MAJOR, CBLAS_NO_TRANS, CBLAS_TRANS,
+                        probe_n as CblasInt, probe_n as CblasInt, probe_rows as CblasInt,
+                        1.0_f32, a.as_ptr(), probe_n as CblasInt,
+                        a.as_ptr(), probe_n as CblasInt,
+                        0.0_f32, c.as_mut_ptr(), probe_n as CblasInt,
+                    );
+                }
+            }
+            let dt = t0.elapsed().as_secs_f64();
+            if dt < best { best = dt; }
+        }
+        best
+    };
+
+    let syrk_s = bench(true);
+    let gemm_s = bench(false);
+    let faster = syrk_s < gemm_s;
+
+    let mut cache = PROBE_CACHE.lock().unwrap();
+    cache.get_or_insert_with(HashMap::new).insert((n_cols, rows), faster);
+    faster
+}
+
+#[inline]
+fn self_block_accumulate_ssyrk(
+    block_f32: &[f32],
+    rows: usize,
+    n_cols: usize,
+    accum: &mut [f32],
+    beta: f32,
+) {
+    unsafe {
+        cblas_ssyrk_dispatch(
+            CBLAS_COL_MAJOR,
+            CBLAS_UPPER,
+            CBLAS_NO_TRANS,
+            n_cols as CblasInt,
+            rows as CblasInt,
+            1.0_f32,
+            block_f32.as_ptr(),
+            n_cols as CblasInt,
+            beta,
+            accum.as_mut_ptr(),
+            n_cols as CblasInt,
+        );
+    }
+}
+
 #[inline]
 fn self_block_accumulate_sgemm(
     block_f32: &[f32],
@@ -1745,6 +1838,10 @@ fn self_block_accumulate_sgemm(
     accum: &mut [f32],
     beta: f32,
 ) {
+    // Probe once per (n_cols, rows) pair — use ssyrk when faster.
+    if spgrm_probe_self_accum_syrk_faster(n_cols, rows) {
+        return self_block_accumulate_ssyrk(block_f32, rows, n_cols, accum, beta);
+    }
     unsafe {
         cblas_sgemm_dispatch(
             CBLAS_COL_MAJOR,
@@ -2193,7 +2290,7 @@ pub fn spgrm_packed_to_jxgrm_core(
         sample_block,
         threads,
     )?;
-    let out_path = normalize_jxgrm_path(out_prefix);
+    let out_path = normalize_spgrm_path(out_prefix);
     if out_path.is_empty() {
         return Err("Sparse GRM output prefix must not be empty".to_string());
     }
@@ -2401,7 +2498,7 @@ fn spgrm_stream_bed_to_jxgrm_core(
     } else {
         None
     };
-    let out_path = normalize_jxgrm_path(out_prefix);
+    let out_path = normalize_spgrm_path(out_prefix);
     if out_path.is_empty() {
         return Err("Sparse GRM output prefix must not be empty".to_string());
     }
@@ -2667,7 +2764,7 @@ fn spgrm_dense_f32_to_jxgrm_core(
     if !threshold.is_finite() {
         return Err("Sparse GRM threshold must be finite".to_string());
     }
-    let out_path = normalize_jxgrm_path(out_prefix);
+    let out_path = normalize_spgrm_path(out_prefix);
     if out_path.is_empty() {
         return Err("Sparse GRM output prefix must not be empty".to_string());
     }
@@ -2729,7 +2826,7 @@ fn spgrm_dense_npy_to_jxgrm_core(
     if !threshold.is_finite() {
         return Err("Sparse GRM threshold must be finite".to_string());
     }
-    let out_path = normalize_jxgrm_path(out_prefix);
+    let out_path = normalize_spgrm_path(out_prefix);
     if out_path.is_empty() {
         return Err("Sparse GRM output prefix must not be empty".to_string());
     }
@@ -3148,7 +3245,7 @@ mod tests {
         };
         let mut out_path = std::env::temp_dir();
         out_path.push(format!(
-            "janusx_spgrm_test_{}_{}.jxgrm",
+            "janusx_spgrm_test_{}_{}.spgrm",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -3180,7 +3277,7 @@ mod tests {
         };
         let mut out_path = std::env::temp_dir();
         out_path.push(format!(
-            "janusx_spgrm_pad_test_{}_{}.jxgrm",
+            "janusx_spgrm_pad_test_{}_{}.spgrm",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

@@ -32,6 +32,7 @@ use crate::gfcore::BedSnpIter;
 use crate::gfreader::{
     build_sample_selection, prepare_bed_logic_meta_owned_for_stats_samples,
 };
+use crate::gload::{BedMmapMatrix, GenotypeMatrix, GlobalStats, PackedBedMatrix, UnifiedInput};
 use crate::he::row_major_block_mul_mat_f32;
 use crate::linalg::format_chisq_value;
 use crate::stats_common::{get_cached_pool, parse_index_vec_i64, AsyncTsvWriter};
@@ -3458,4 +3459,55 @@ pub fn glmf32_full<'py>(
     });
 
     Ok(out)
+}
+/// Unified additive LM scan — works with any GenotypeMatrix backend.
+/// Both mmap (BedMmapMatrix) and packed (PackedBedMatrix) call this function.
+#[allow(dead_code)]
+pub(crate) fn lm_unified_scan_to_tsv<G: GenotypeMatrix>(
+    input: &mut UnifiedInput<G>, y: &[f64], x_flat: &[f64], ixx_flat: &[f64],
+    out_tsv: &str, sample_idx: &[usize], sample_identity: bool,
+    chunk_size: usize, threads: usize,
+) -> Result<(usize, usize), String> {
+    let n = y.len(); let q0 = x_flat.len() / n; let m = input.n_markers();
+    if m == 0 { return Ok((0, 0)); }
+    let pool = crate::stats_common::get_cached_pool(threads).map_err(|e| e.to_string())?;
+    let y_f32: Vec<f32> = y.iter().map(|&v| v as f32).collect();
+    let x_f32: Vec<f32> = x_flat.iter().map(|&v| v as f32).collect();
+    let yy: f64 = y.iter().map(|v| v * v).sum();
+    let mut xy = vec![0.0_f64; q0];
+    for i in 0..n { let xr = &x_flat[i*q0..(i+1)*q0]; for j in 0..q0 { xy[j] += xr[j] * y[i]; } }
+    let mut xyc = vec![0.0_f64; q0]; xs_t_ixx_into(&xy, ixx_flat, q0, &mut xyc);
+    let xy_quad = dot(&xyc, &xy);
+    let blk = crate::bedmath::adaptive_grm_block_rows(chunk_size.max(512), m, n, 0, threads).max(1);
+    let mut buf = vec![0.0_f32; blk * n];
+    let mut sy_s = vec![0.0_f32; blk]; let mut xts_s = vec![0.0_f32; blk * q0];
+    let mut ss_s = vec![0.0_f64; blk]; let mut ob = vec![0.0_f64; blk * 5];
+    let mut xt = vec![0.0_f64; q0]; let mut b2 = vec![0.0_f64; q0];
+    let mut text = String::with_capacity(blk * 112);
+    let writer = AsyncTsvWriter::with_config(out_tsv,
+        b"chrom\tpos\tsnp\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n",
+        64*1024*1024, 4).map_err(|e| e.to_string())?;
+    let mut rs = 0usize; let mut kt = 0usize;
+    while rs < m {
+        let re = (rs + blk).min(m); let rh = re - rs; let bs = &mut buf[..rh * n];
+        input.matrix.decode_additive_block(&input.stats, rs, bs, sample_idx, sample_identity, pool.as_ref())?;
+        row_major_block_mul_mat_f32(bs, rh, n, &y_f32, 1, &mut sy_s[..rh], pool.as_ref());
+        row_major_block_mul_mat_f32(bs, rh, n, &x_f32, q0, &mut xts_s[..rh*q0], pool.as_ref());
+        row_major_block_sumsq_f64(bs, rh, n, &mut ss_s[..rh], pool.as_ref());
+        for li in 0..rh {
+            for j in 0..q0 { xt[j] = xts_s[li*q0 + j] as f64; }
+            let st = lm_assoc_from_centered_projection(&xt, sy_s[li] as f64, ss_s[li], ixx_flat, &xy, xy_quad, q0, n, yy, &mut b2);
+            ob[li*5..(li+1)*5].copy_from_slice(&st);
+        }
+        text.clear();
+        for li in 0..rh {
+            let s = &ob[li*5..(li+1)*5];
+            let _ = write!(text, "{}\t.\t.\t.\t.\t.\t.\t{:.4}\t{:.4}\t{}\t{:.4e}\t{:.4e}\n",
+                rs+li, s[0], s[1], format_chisq_value(s[4]), s[2], s[3]);
+        }
+        writer.send(std::mem::take(&mut text).into_bytes())?;
+        kt += rh; rs = re;
+    }
+    writer.finish()?;
+    Ok((kt, m))
 }

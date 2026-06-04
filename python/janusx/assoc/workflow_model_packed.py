@@ -175,7 +175,7 @@ def _jxlmm_normalize_jxgrm_path(path_or_prefix: str) -> str:
     raw = str(path_or_prefix).strip()
     if raw == "":
         return raw
-    return raw if raw.lower().endswith(".jxgrm") else f"{raw}.jxgrm"
+    return raw if raw.lower().endswith(".spgrm") else f"{raw}.spgrm"
 
 
 def _jxlmm_sparse_sample_hash(sample_indices: Union[np.ndarray, None]) -> str:

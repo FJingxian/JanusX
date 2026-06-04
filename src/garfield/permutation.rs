@@ -3,7 +3,9 @@ use rand::seq::SliceRandom;
 use rand::SeedableRng;
 use std::cmp::Ordering;
 
-use super::bs::{BeamBinaryOp, BeamRule};
+use super::bs::BeamRule;
+#[cfg(test)]
+use super::bs::BeamBinaryOp;
 
 pub const DEFAULT_RULE_PERMUTATION_REPRESENTATIVE_UNITS: usize = 32;
 pub const DEFAULT_RULE_NULL_PHYSICAL_CHUNKS: usize = 150;

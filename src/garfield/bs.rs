@@ -15,7 +15,7 @@ use super::score_gpu::{
     score_cont_centered_gain_singletons_packed_legacy_impl,
     score_cont_centered_gain_singletons_packed_with_backend,
 };
-use crate::bitwise::{and_popcount, bitand_assign, bitnot_masked, bitor_into};
+use crate::bitwise::{and_popcount, bitand_assign, bitnot_masked};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -220,7 +220,7 @@ pub(crate) struct LiteralScoreBatchRequest<'a> {
 
 type RuleLexKey = Vec<(usize, bool, u8)>;
 type RuleRawScoreCache = HashMap<RuleLexKey, f64>;
-type RuleBitsCache = Vec<(BeamRule, Vec<u64>)>;
+type RuleBitsCache = HashMap<RuleLexKey, Vec<u64>>;
 
 #[inline]
 fn words_for_samples(n_samples: usize) -> usize {
@@ -492,16 +492,16 @@ fn expansion_row_bounds(rule: &BeamRule, n_rows: usize) -> (usize, usize) {
 
 fn canonical_commutative_child_rule(
     parent: &BeamRule,
-    op: BeamBinaryOp,
+    _op: BeamBinaryOp,
     literal: BeamLiteral,
 ) -> Option<BeamRule> {
     let canonical_op = if let Some((first_op, _)) = parent.rest.first() {
-        if *first_op != op || !parent.rest.iter().all(|(rest_op, _)| *rest_op == *first_op) {
+        if *first_op != _op || !parent.rest.iter().all(|(rest_op, _)| *rest_op == *first_op) {
             return None;
         }
         *first_op
     } else {
-        op
+        _op
     };
 
     let mut lits = Vec::<BeamLiteral>::with_capacity(parent.len().saturating_add(1));
@@ -638,34 +638,26 @@ fn score_sum_hit(sc: &ContinuousRuleScore) -> f64 {
 #[inline]
 fn child_n_hit_from_intersection(
     parent_n_hit: usize,
-    row_n_hit: usize,
     inter_n_hit: usize,
-    n_samples: usize,
-    op: BeamBinaryOp,
     negated: bool,
 ) -> usize {
-    match (op, negated) {
-        (BeamBinaryOp::And, false) => inter_n_hit,
-        (BeamBinaryOp::And, true) => parent_n_hit.saturating_sub(inter_n_hit),
-        (BeamBinaryOp::And, false) => parent_n_hit + row_n_hit - inter_n_hit,
-        (BeamBinaryOp::And, true) => n_samples - row_n_hit + inter_n_hit,
+    if negated {
+        parent_n_hit.saturating_sub(inter_n_hit)
+    } else {
+        inter_n_hit
     }
 }
 
 #[inline]
 fn child_sum_hit_from_intersection(
     parent_sum_hit: f64,
-    row_sum_hit: f64,
     inter_sum_hit: f64,
-    total_sum: f64,
-    op: BeamBinaryOp,
     negated: bool,
 ) -> f64 {
-    match (op, negated) {
-        (BeamBinaryOp::And, false) => inter_sum_hit,
-        (BeamBinaryOp::And, true) => parent_sum_hit - inter_sum_hit,
-        (BeamBinaryOp::And, false) => parent_sum_hit + row_sum_hit - inter_sum_hit,
-        (BeamBinaryOp::And, true) => total_sum - row_sum_hit + inter_sum_hit,
+    if negated {
+        parent_sum_hit - inter_sum_hit
+    } else {
+        inter_sum_hit
     }
 }
 
@@ -674,24 +666,18 @@ fn evaluate_child_train_from_parent_virtual(
     parent_bits: &[u64],
     parent_train: &ContinuousRuleScore,
     row: &[u64],
-    row_train_pos: &ContinuousRuleScore,
+    _row_train_pos: &ContinuousRuleScore,
     y_train: &[f64],
     sum_y_train: f64,
     n_train: usize,
     child_rule_len: usize,
-    op: BeamBinaryOp,
+    _op: BeamBinaryOp,
     negated: bool,
     params: &BeamSearchParams,
 ) -> Option<ContinuousRuleScore> {
     let inter_n_hit = and_popcount(parent_bits, row) as usize;
-    let child_n_hit = child_n_hit_from_intersection(
-        parent_train.n_hit,
-        row_train_pos.n_hit,
-        inter_n_hit,
-        n_train,
-        op,
-        negated,
-    );
+    let child_n_hit =
+        child_n_hit_from_intersection(parent_train.n_hit, inter_n_hit, negated);
     let child_n_miss = n_train.saturating_sub(child_n_hit);
     if !keep_rule_after_support_counts(child_n_hit, child_n_miss, child_rule_len, n_train, params) {
         return None;
@@ -699,10 +685,7 @@ fn evaluate_child_train_from_parent_virtual(
     let inter_sum_hit = sum_y_where_both1(parent_bits, row, y_train, n_train);
     let child_sum_hit = child_sum_hit_from_intersection(
         score_sum_hit(parent_train),
-        score_sum_hit(row_train_pos),
         inter_sum_hit,
-        sum_y_train,
-        op,
         negated,
     );
     Some(score_cont_centered_gain_from_sum_and_n_hit(
@@ -847,23 +830,18 @@ fn ensure_rule_bits_cached(
     n_samples: usize,
     local_cache: &mut RuleBitsCache,
 ) -> Result<(), String> {
-    if local_cache
-        .iter()
-        .any(|(cached_rule, _)| cached_rule == rule)
-    {
+    let key = rule.lexical_key();
+    if local_cache.contains_key(&key) {
         return Ok(());
     }
     let combined = materialize_rule_bits(rule, bits_flat, row_words, n_rows, n_samples)?;
-    local_cache.push((rule.clone(), combined));
+    local_cache.insert(key, combined);
     Ok(())
 }
 
 #[inline]
 fn cached_rule_bits<'a>(rule: &BeamRule, local_cache: &'a RuleBitsCache) -> Option<&'a [u64]> {
-    local_cache
-        .iter()
-        .find(|(cached_rule, _)| cached_rule == rule)
-        .map(|(_, bits)| bits.as_slice())
+    local_cache.get(&rule.lexical_key()).map(|bits| bits.as_slice())
 }
 
 fn evaluate_rule_continuous_cached(
@@ -1002,11 +980,8 @@ fn diversity_parent_key(rule: &BeamRule) -> Option<Vec<(usize, bool, u8)>> {
     }
     let mut out = Vec::with_capacity(rule.len().saturating_sub(1));
     out.push((rule.first.row_index, rule.first.negated, 0u8));
-    for (op, lit) in rule.rest.iter().take(rule.rest.len().saturating_sub(1)) {
-        let op_code = match op {
-            BeamBinaryOp::And => 1u8,
-            BeamBinaryOp::And => 2u8,
-        };
+    for (_op, lit) in rule.rest.iter().take(rule.rest.len().saturating_sub(1)) {
+        let op_code = 1u8; // AND-only
         out.push((lit.row_index, lit.negated, op_code));
     }
     Some(out)
@@ -1542,21 +1517,16 @@ fn bitor_not_into_masked(dst: &mut [u64], rhs: &[u64], n_valid_bits: usize) {
 fn apply_literal_inplace(
     dst: &mut [u64],
     row: &[u64],
-    op: BeamBinaryOp,
+    _op: BeamBinaryOp,
     negated: bool,
     n_samples: usize,
 ) {
-    match (op, negated) {
+    match (_op, negated) {
         (BeamBinaryOp::And, false) => {
             bitand_assign(dst, row);
             apply_tail_mask(dst, tail_mask(n_samples));
         }
         (BeamBinaryOp::And, true) => bitand_not_assign_masked(dst, row, n_samples),
-        (BeamBinaryOp::And, false) => {
-            bitor_into(dst, row);
-            apply_tail_mask(dst, tail_mask(n_samples));
-        }
-        (BeamBinaryOp::And, true) => bitor_not_into_masked(dst, row, n_samples),
     }
 }
 
@@ -1581,7 +1551,7 @@ pub fn materialize_rule_bits(
         n_samples,
         rule.first.negated,
     );
-    for (op, lit) in rule.rest.iter() {
+    for (_op, lit) in rule.rest.iter() {
         if lit.row_index >= n_rows {
             return Err(format!(
                 "{ctx}: literal row index {} out of range for n_rows={}",
@@ -1589,7 +1559,7 @@ pub fn materialize_rule_bits(
             ));
         }
         let row = row_prefix(bits_flat, row_words, lit.row_index, needed_words);
-        apply_literal_inplace(&mut combined, row, *op, lit.negated, n_samples);
+        apply_literal_inplace(&mut combined, row, BeamBinaryOp::And, lit.negated, n_samples);
     }
     Ok(combined)
 }
@@ -1880,15 +1850,14 @@ fn expand_beam_once(
                     }
                     let row = row_prefix(bits_train, row_words_train, cand, needed_words_train);
                     let row_train_pos = literal_scores[literal_score_index(cand, false)].train;
-                    for &op in &[BeamBinaryOp::And] {
-                        for &negated in &[false, true] {
+                    for &negated in &[false, true] {
                             let literal = BeamLiteral {
                                 row_index: cand,
                                 group_id: gid,
                                 negated,
                             };
                             let canonical_rule =
-                                canonical_commutative_child_rule(&node.rule, op, literal);
+                                canonical_commutative_child_rule(&node.rule, BeamBinaryOp::And, literal);
                             let Some(train) = evaluate_child_train_from_parent_virtual(
                                 &node.combined_train,
                                 &node.train,
@@ -1898,7 +1867,7 @@ fn expand_beam_once(
                                 sum_y_train,
                                 n_train,
                                 node.rule.len() + 1,
-                                op,
+                                BeamBinaryOp::And,
                                 negated,
                                 params,
                             ) else {
@@ -1908,7 +1877,7 @@ fn expand_beam_once(
                                 rule
                             } else {
                                 let mut rule = node.rule.clone();
-                                rule.rest.push((op, literal));
+                                rule.rest.push((BeamBinaryOp::And, literal));
                                 rule
                             };
                             let single = literal_scores[literal_score_index(cand, negated)];
@@ -1955,7 +1924,7 @@ fn expand_beam_once(
                                 continue;
                             }
                             let mut combined = node.combined_train.clone();
-                            apply_literal_inplace(&mut combined, row, op, negated, n_train);
+                            apply_literal_inplace(&mut combined, row, BeamBinaryOp::And, negated, n_train);
                             push_top_k_states(
                                 &mut local,
                                 BeamState {
@@ -1970,7 +1939,6 @@ fn expand_beam_once(
                                 next_cap,
                             );
                         }
-                    }
                 }
                 Ok(local)
             })
@@ -2015,15 +1983,14 @@ fn expand_beam_once(
                 }
                 let row = row_prefix(bits_train, row_words_train, cand, needed_words_train);
                 let row_train_pos = literal_scores[literal_score_index(cand, false)].train;
-                for &op in &[BeamBinaryOp::And] {
-                    for &negated in &[false, true] {
+                for &negated in &[false, true] {
                         let literal = BeamLiteral {
                             row_index: cand,
                             group_id: gid,
                             negated,
                         };
                         let canonical_rule =
-                            canonical_commutative_child_rule(&node.rule, op, literal);
+                            canonical_commutative_child_rule(&node.rule, BeamBinaryOp::And, literal);
                         if blind_scan {
                             if let Some(rule) = canonical_rule.as_ref() {
                                 if !seen_commutative_children.insert(rule.lexical_key()) {
@@ -2040,7 +2007,7 @@ fn expand_beam_once(
                             sum_y_train,
                             n_train,
                             node.rule.len() + 1,
-                            op,
+                            BeamBinaryOp::And,
                             negated,
                             params,
                         ) else {
@@ -2050,7 +2017,7 @@ fn expand_beam_once(
                             rule
                         } else {
                             let mut rule = node.rule.clone();
-                            rule.rest.push((op, literal));
+                            rule.rest.push((BeamBinaryOp::And, literal));
                             rule
                         };
                         let single = literal_scores[literal_score_index(cand, negated)];
@@ -2097,7 +2064,7 @@ fn expand_beam_once(
                             continue;
                         }
                         let mut combined = node.combined_train.clone();
-                        apply_literal_inplace(&mut combined, row, op, negated, n_train);
+                        apply_literal_inplace(&mut combined, row, BeamBinaryOp::And, negated, n_train);
                         push_top_k_states(
                             &mut seq,
                             BeamState {
@@ -2111,7 +2078,6 @@ fn expand_beam_once(
                             },
                             next_cap,
                         );
-                    }
                 }
             }
         }
@@ -2168,8 +2134,7 @@ fn expand_states_exhaustive(
             }
             let row = row_prefix(bits_train, row_words_train, cand, needed_words_train);
             let row_train_pos = literal_scores[literal_score_index(cand, false)].train;
-            for &op in &[BeamBinaryOp::And] {
-                for &negated in &[false, true] {
+            for &negated in &[false, true] {
                     let Some(train) = evaluate_child_train_from_parent_virtual(
                         &node.combined_train,
                         &node.train,
@@ -2179,7 +2144,7 @@ fn expand_states_exhaustive(
                         sum_y_train,
                         n_train,
                         node.rule.len() + 1,
-                        op,
+                        BeamBinaryOp::And,
                         negated,
                         params,
                     ) else {
@@ -2191,7 +2156,7 @@ fn expand_states_exhaustive(
                         negated,
                     };
                     let mut rule = node.rule.clone();
-                    rule.rest.push((op, literal));
+                    rule.rest.push((BeamBinaryOp::And, literal));
                     let single = literal_scores[literal_score_index(cand, negated)];
                     let max_singleton_train_raw =
                         node.max_singleton_train_raw.max(single.train.raw_score);
@@ -2236,7 +2201,7 @@ fn expand_states_exhaustive(
                         continue;
                     }
                     let mut combined = node.combined_train.clone();
-                    apply_literal_inplace(&mut combined, row, op, negated, n_train);
+                    apply_literal_inplace(&mut combined, row, BeamBinaryOp::And, negated, n_train);
                     let state = BeamState {
                         rule,
                         combined_train: combined,
@@ -2255,7 +2220,6 @@ fn expand_states_exhaustive(
                                 slot.insert(state);
                             }
                         }
-                    }
                 }
             }
         }

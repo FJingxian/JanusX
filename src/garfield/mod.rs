@@ -3759,11 +3759,8 @@ fn literal_name(site: &SiteInfo, negated: bool) -> String {
 }
 
 #[inline]
-fn logic_symbol_compact(op: BeamBinaryOp) -> &'static str {
-    match op {
-        BeamBinaryOp::And => "&",
-        BeamBinaryOp::And => "&",
-    }
+fn logic_symbol_compact(_op: BeamBinaryOp) -> &'static str {
+    "&" // AND-only
 }
 
 #[inline]
@@ -3850,10 +3847,7 @@ fn rule_expr(rule: &BeamRule, local_sites: &[SiteInfo]) -> Result<String, String
         let site = local_sites
             .get(lit.row_index)
             .ok_or_else(|| format!("rule row index out of range: {}", lit.row_index))?;
-        let op_txt = match op {
-            BeamBinaryOp::And => "AND",
-            BeamBinaryOp::And => "AND",
-        };
+        let op_txt = "AND"; // AND-only
         out.push(' ');
         out.push_str(op_txt);
         out.push(' ');
@@ -3871,10 +3865,7 @@ fn rule_snp_name(rule: &BeamRule, local_sites: &[SiteInfo]) -> Result<String, St
         let site = local_sites
             .get(lit.row_index)
             .ok_or_else(|| format!("rule row index out of range: {}", lit.row_index))?;
-        let op_txt = match op {
-            BeamBinaryOp::And => " & ",
-            BeamBinaryOp::And => " & ",
-        };
+        let op_txt = " & "; // AND-only
         out.push_str(op_txt);
         out.push_str(&literal_name(site, lit.negated));
     }
@@ -3884,10 +3875,7 @@ fn rule_snp_name(rule: &BeamRule, local_sites: &[SiteInfo]) -> Result<String, St
 fn rule_ml_rank_name(rule: &BeamRule) -> String {
     let mut out = literal_ml_rank_name(rule.first.row_index, rule.first.negated);
     for (op, lit) in rule.rest.iter() {
-        let op_txt = match op {
-            BeamBinaryOp::And => " & ",
-            BeamBinaryOp::And => " & ",
-        };
+        let op_txt = " & "; // AND-only
         out.push_str(op_txt);
         out.push_str(&literal_ml_rank_name(lit.row_index, lit.negated));
     }

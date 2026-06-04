@@ -135,6 +135,7 @@ fn prepare_bed_logic_meta_owned_for_stats_samples_cached(
         het_threshold,
         snps_only,
         stats_sample_indices,
+        false,
     )?);
     let mut cache = lm_memmap_meta_cache()
         .lock()
@@ -1894,7 +1895,11 @@ pub fn glmf32_packed_assoc<'py>(
             Ok(())
         };
 
-        runner()
+        if let Some(p) = &pool {
+            p.install(runner)
+        } else {
+            runner()
+        }
     })?;
 
     Ok(out)

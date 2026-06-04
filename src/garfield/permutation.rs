@@ -133,17 +133,6 @@ pub struct RuleStructurePriorCalibrator {
     score_samples: Vec<f64>,
 }
 
-impl RuleNullScores {
-    fn push(&mut self, train_score: f64, test_score: f64) {
-        if train_score.is_finite() {
-            self.train.push(train_score);
-        }
-        if test_score.is_finite() {
-            self.test.push(test_score);
-        }
-    }
-}
-
 impl RuleNullBucket {
     #[inline]
     fn exact_index(self) -> usize {
@@ -317,17 +306,6 @@ fn null_quantile_for_bucket(bucket: RuleNullBucket) -> f64 {
     DEFAULT_RULE_NULL_QUANTILE
 }
 
-/// 3-component blended penalty (used internally for backward compat).
-#[inline]
-fn blended_penalty_3(
-    exact: Option<f64>,
-    collapsed: Option<f64>,
-    global: Option<f64>,
-    weights: (f64, f64, f64),
-) -> Option<f64> {
-    blended_penalty_4(exact, collapsed, None, global, (weights.0, weights.1, 0.0, weights.2))
-}
-
 /// 4-component blended penalty.
 #[inline]
 fn blended_penalty_4(
@@ -359,18 +337,22 @@ fn blended_penalty_4(
     }
 }
 
+#[allow(dead_code)]
 pub fn rule_null_bucket_count_exact() -> usize {
     NULL_BUCKET_EXACT
 }
+#[allow(dead_code)]
 pub fn rule_null_bucket_count_sign_len() -> usize {
     NULL_BUCKET_SIGN_LEN
 }
+#[allow(dead_code)]
 pub fn rule_null_bucket_count_maf_len() -> usize {
     NULL_BUCKET_MAF_LEN
 }
 
 /// Legacy wrapper — used by callers that still reference the old signature.
 #[inline]
+#[allow(dead_code)]
 pub fn rule_null_bucket_count(_max_rule_len: usize) -> usize {
     NULL_BUCKET_EXACT
 }
@@ -804,13 +786,6 @@ fn penalty_value_converged(prev: Option<f64>, curr: Option<f64>) -> bool {
         _ => false,
     }
 }
-
-
-
-fn has_not_expr(expr: &str) -> bool {
-    expr.to_ascii_uppercase().contains("NOT BIN(")
-}
-
 #[inline]
 fn support_minor_frac(support_frac: f64) -> f64 {
     if !support_frac.is_finite() {

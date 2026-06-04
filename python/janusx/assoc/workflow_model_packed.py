@@ -4409,12 +4409,8 @@ def run_splmm_packed_fullrank(
     trait_names: Union[list[str], None] = None,
     emit_trait_header: bool = True,
     preloaded_packed: Union[dict[str, object], None] = None,
-    force_sparse_splmm: bool = False,
+    exact_denom: bool = False,
 ) -> None:
-    jxlmm_source = splmm_source
-    jxlmm_sparse_cutoff = splmm_sparse_cutoff
-    jxlmm_sparse_jxgrm_path = splmm_sparse_jxgrm_path
-    force_sparse_jxlmm = force_sparse_splmm
     if str(genetic_model).lower() != "add":
         raise ValueError("SparseLMM full-rust packed route currently supports additive coding only (--model add).")
     if not hasattr(jxrs, "splmm_assoc_pcg_bed"):
@@ -4489,8 +4485,8 @@ def run_splmm_packed_fullrank(
             )
         use_preloaded_scan_meta = True
 
-    if jxlmm_sparse_cutoff is None:
-        jxlmm_sparse_cutoff, ignored_jxlmm_arg = _jxlmm_parse_sparse_cutoff(jxlmm_source)
+    if splmm_sparse_cutoff is None:
+        splmm_sparse_cutoff, ignored_jxlmm_arg = _jxlmm_parse_sparse_cutoff(splmm_source)
         if ignored_jxlmm_arg is not None:
             _emit_warning_line(
                 logger,
@@ -4501,10 +4497,10 @@ def run_splmm_packed_fullrank(
                 use_spinner=bool(use_spinner),
             )
     else:
-        jxlmm_sparse_cutoff = float(jxlmm_sparse_cutoff)
-        if (not np.isfinite(jxlmm_sparse_cutoff)) or float(jxlmm_sparse_cutoff) < 0.0:
+        splmm_sparse_cutoff = float(splmm_sparse_cutoff)
+        if (not np.isfinite(splmm_sparse_cutoff)) or float(splmm_sparse_cutoff) < 0.0:
             raise ValueError(
-                f"SparseLMM sparse cutoff must be a finite value >= 0, got {jxlmm_sparse_cutoff}"
+                f"SparseLMM sparse cutoff must be a finite value >= 0, got {splmm_sparse_cutoff}"
             )
 
     kinship_prefix = str(prefix)
@@ -4525,8 +4521,8 @@ def run_splmm_packed_fullrank(
     multi_trait_mode = len(trait_iter) > 1
     block_rows_use = int(max(4096, int(chunk_size)))
     shared_sparse_kinship_path: Optional[str] = None
-    if jxlmm_sparse_jxgrm_path is not None:
-        shared_sparse_kinship_path = _jxlmm_normalize_jxgrm_path(str(jxlmm_sparse_jxgrm_path))
+    if splmm_sparse_jxgrm_path is not None:
+        shared_sparse_kinship_path = _jxlmm_normalize_jxgrm_path(str(splmm_sparse_jxgrm_path))
         if not os.path.exists(shared_sparse_kinship_path):
             raise RuntimeError(
                 "Prebuilt SparseLMM sparse GRM path is missing: "
@@ -4593,7 +4589,7 @@ def run_splmm_packed_fullrank(
                 kinship_prefix,
                 sample_indices=None,
                 out_prefix=_jxlmm_sparse_out_prefix(kinship_prefix, None),
-                cutoff=float(jxlmm_sparse_cutoff),
+                cutoff=float(splmm_sparse_cutoff),
                 maf_threshold=float(maf_threshold),
                 max_missing_rate=float(max_missing_rate),
                 het_threshold=float(het_threshold),
@@ -4661,7 +4657,7 @@ def run_splmm_packed_fullrank(
             f"mean_diag(K)={null_mean_diag_k:.4g}, "
             f"nnz(K)={null_nnz_k}, "
             f"offdiag_density={null_offdiag_density_k:.4g}, "
-            f"sparse_cutoff={float(jxlmm_sparse_cutoff):g}, "
+            f"sparse_cutoff={float(splmm_sparse_cutoff):g}, "
             f"lambda={null_lbd:.4g}, sigma_g2={sigma_g2:.4g}, "
             f"sigma_e2={sigma_e2:.4g}, "
             f"lambda_boundary={null_lambda_boundary or 'interior'}, "
@@ -4922,23 +4918,14 @@ def run_splmm_packed_fullrank(
             trait_site_keep = np.ascontiguousarray(np.asarray(scan_meta["site_keep"], dtype=np.bool_).reshape(-1), dtype=np.bool_)
         n_trait_sites = int(trait_row_idx.shape[0])
         supports_direct_tsv = bool(hasattr(jxrs, "splmm_assoc_pcg_bed_to_tsv"))
-        trait_sites_all: Optional[list[tuple[object, ...]]] = None
-        if supports_direct_tsv:
-            chrom_all: list[str] = []
-            pos_all: list[int] = []
-            allele0_all: list[str] = []
-            allele1_all: list[str] = []
-            snp_all: list[str] = []
-            for idx in trait_row_idx:
-                c, p, a0, a1, sid = _site_tuple_parts(kinship_sites_all[int(idx)])
-                chrom_all.append(c)
-                pos_all.append(int(p))
-                allele0_all.append(a0)
-                allele1_all.append(a1)
-                snp_all.append(sid)
-        else:
-            trait_sites_all = [kinship_sites_all[int(idx)] for idx in trait_row_idx.tolist()]
-            chrom_all, pos_all, allele0_all, allele1_all, snp_all = _split_gwas_sites(trait_sites_all)
+        # BIM metadata (chrom/pos/snp/alleles) is now read inside the Rust
+        # splmm_assoc_pcg_bed_to_tsv function when the arrays are empty.
+        # Passing [] avoids building five large Python lists per trait.
+        chrom_all: list[str] = []
+        pos_all: list[int] = []
+        allele0_all: list[str] = []
+        allele1_all: list[str] = []
+        snp_all: list[str] = []
 
         scan_t0 = time.monotonic()
         scan_ok = False
@@ -5002,7 +4989,7 @@ def run_splmm_packed_fullrank(
                         scan_progress_callback=sparse_progress,
                         progress_every=int(max(512, min(int(block_rows_use), 4096))),
                         rhat_tol=1e-3,
-                        force_sparse_splmm=True,
+                        exact_denom=bool(exact_denom),
                     )
                 else:
                     jxlmm_out = jxrs.splmm_assoc_pcg_bed(
@@ -5034,7 +5021,7 @@ def run_splmm_packed_fullrank(
                         scan_progress_callback=sparse_progress,
                         progress_every=int(max(512, min(int(block_rows_use), 4096))),
                         rhat_tol=1e-3,
-                        force_sparse_splmm=True,
+                        exact_denom=bool(exact_denom),
                     )
             scan_ok = True
         finally:
@@ -5197,20 +5184,3 @@ def run_splmm_packed_fullrank(
         _stop_prepare_handle()
         if multi_trait_mode:
             logger.info("")
-
-
-def run_jxlmm_packed_fullrank(
-    *,
-    jxlmm_source: Optional[str] = None,
-    jxlmm_sparse_cutoff: Optional[float] = None,
-    jxlmm_sparse_jxgrm_path: Optional[str] = None,
-    force_sparse_jxlmm: bool = False,
-    **kwargs,
-) -> None:
-    return run_splmm_packed_fullrank(
-        splmm_source=jxlmm_source,
-        splmm_sparse_cutoff=jxlmm_sparse_cutoff,
-        splmm_sparse_jxgrm_path=jxlmm_sparse_jxgrm_path,
-        force_sparse_splmm=force_sparse_jxlmm,
-        **kwargs,
-    )

@@ -1859,11 +1859,15 @@ pub fn garfield_compare_score_cont_centered_gain_singleton_backends_py<'py>(
         .detach(|| {
             let mut legacy_last: Option<Vec<ContinuousRuleScore>> = None;
             let mut cpu_last: Option<Vec<ContinuousRuleScore>> = None;
-            let mut gpu_last: Option<Vec<ContinuousRuleScore>> = None;
             let mut legacy_ms = Vec::with_capacity(reps);
             let mut cpu_ms = Vec::with_capacity(reps);
+            #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+            let mut gpu_last: Option<Vec<ContinuousRuleScore>> = None;
+            #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
             let mut gpu_ms = Vec::with_capacity(reps);
+            #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
             let mut gpu_available = true;
+            #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
             let mut gpu_error: Option<String> = None;
 
             for _ in 0..warm {
@@ -1924,17 +1928,20 @@ pub fn garfield_compare_score_cont_centered_gain_singleton_backends_py<'py>(
                 }
             }
 
-            #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
-            {
-                gpu_available = false;
-                gpu_error = Some("metal-gpu feature unavailable in this build".to_string());
-                gpu_ms.push(f64::NAN);
-                gpu_last = Some(cpu_last.clone().unwrap_or_default());
-            }
             #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-            if !gpu_available {
-                gpu_last = Some(cpu_last.clone().unwrap_or_default());
-            }
+            let (gpu_last, gpu_ms, gpu_available, gpu_error) = {
+                if !gpu_available {
+                    gpu_last = Some(cpu_last.clone().unwrap_or_default());
+                }
+                (gpu_last, gpu_ms, gpu_available, gpu_error)
+            };
+            #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
+            let (gpu_last, gpu_ms, gpu_available, gpu_error) = (
+                cpu_last.clone(),
+                vec![f64::NAN; reps],
+                false,
+                Some("metal-gpu feature unavailable in this build".to_string()),
+            );
 
             Ok::<_, String>((
                 legacy_last

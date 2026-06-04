@@ -2620,6 +2620,7 @@ pub fn spgrm_bed_to_jxgrm_core(
         het_threshold,
         snps_only,
         sample_idx,
+        false,
     )?;
     let selected_idx: Cow<'_, [usize]> = match sample_idx {
         Some(idx) => Cow::Borrowed(idx),

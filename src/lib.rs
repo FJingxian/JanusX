@@ -62,6 +62,8 @@ mod tree;
 mod gfcore;
 #[path = "io/gfreader.rs"]
 mod gfreader;
+#[path = "io/gload.rs"]
+mod gload;
 #[path = "io/gmerge.rs"]
 mod gmerge;
 #[path = "io/gwasio.rs"]
@@ -227,7 +229,8 @@ use spgrm::{
     spgrm_bed_to_jxgrm, spgrm_dense_f32_to_jxgrm, spgrm_dense_npy_to_jxgrm, spgrm_packed_to_jxgrm,
 };
 use splmm::{
-    splmm_assoc_pcg_bed, splmm_assoc_pcg_bed_to_tsv, splmm_scan_exact_packed,
+    splmm_assoc_pcg_bed, splmm_assoc_pcg_bed_to_tsv, splmm_scan_grammar_packed,
+    splmm_scan_exact_packed,
     splmm_sparse_grm_diag_stats,
 };
 use spreml::{spreml_sparse_reml_brent_from_jxgrm, spreml_sparse_reml_grid_from_jxgrm};
@@ -381,6 +384,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(he_pcg_bed, m)?)?;
     m.add_function(wrap_pyfunction!(splmm_assoc_pcg_bed, m)?)?;
     m.add_function(wrap_pyfunction!(splmm_assoc_pcg_bed_to_tsv, m)?)?;
+    m.add_function(wrap_pyfunction!(splmm_scan_grammar_packed, m)?)?;
     m.add_function(wrap_pyfunction!(splmm_scan_exact_packed, m)?)?;
     m.add_function(wrap_pyfunction!(splmm_sparse_grm_diag_stats, m)?)?;
     m.add_function(wrap_pyfunction!(spreml_sparse_reml_grid_from_jxgrm, m)?)?;

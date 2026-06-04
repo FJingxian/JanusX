@@ -7,7 +7,6 @@ use rand::rngs::StdRng;
 use rand::seq::index::sample;
 use rand::SeedableRng;
 use rayon::prelude::*;
-use std::cell::Cell;
 use std::fmt::Write as FmtWrite;
 use std::fs::File;
 use std::path::Path;
@@ -16,7 +15,11 @@ use std::sync::Arc;
 use crate::bedmath::{
     adaptive_grm_block_rows, decode_mean_imputed_additive_packed_block_rows_f32, packed_byte_lut,
 };
-use crate::blas::{rust_sgemm_prefers_rayon_rowmajor_f32_kernel, BlasThreadGuard};
+use crate::blas::{
+    cblas_dgemm_dispatch, rust_sgemm_prefers_rayon_rowmajor_f32_kernel, BlasThreadGuard,
+    CBLAS_COL_MAJOR, CBLAS_NO_TRANS, CblasInt,
+};
+use crate::gload::{GenotypeMatrix, UnifiedInput};
 use crate::cholesky::{
     sparse_cholesky_analyze_subset_jxgrm_path_cached_with_progress, sparse_jxgrm_header_n_samples,
     subset_sparse_grm_csc, MmapSparseGrmCsc, SparseGrmCscView, SparseJxgrmAnalyzeProgressStage,
@@ -29,10 +32,7 @@ use crate::linalg::{
     chi2_sf_df1, chisq_from_beta_se_and_optional_plrt, cholesky_inplace, cholesky_solve_into,
     format_chisq_value,
 };
-use crate::pcg::{
-    pcg_build_jxlmm_null_model, pcg_estimate_jxlmm_r_hat, PcgGrmBedConfig, PcgGrmBedOperator,
-    PcgJxlmmNullModel, PcgJxlmmNullModelInfo, PcgJxlmmRHatResult,
-};
+use crate::pcg::{PcgJxlmmNullModel, PcgJxlmmNullModelInfo, PcgJxlmmRHatResult};
 use crate::stats_common::{get_cached_pool, parse_index_vec_i64, AsyncTsvWriter};
 
 const SPLMM_TINY: f64 = 1e-30_f64;
@@ -475,6 +475,7 @@ fn prepare_prefix_input(
         0.0_f32,
         false,
         sample_idx_probe,
+        false,
     )?;
     let meta = filter_meta_with_site_keep(meta, site_keep)?;
     let mmap = if let Some(mmap) = payload_mmap {
@@ -750,49 +751,6 @@ fn decode_packed_row_model_into_f64(
     }
 }
 
-fn make_bed_operator<'a, F>(
-    prepared: &'a JxlmmPreparedInput,
-    sample_idx: &[usize],
-    threads: usize,
-    block_rows: usize,
-    std_eps: f64,
-    use_train_maf: bool,
-    progress_callback: Option<&mut F>,
-    progress_every_rows: usize,
-) -> Result<PcgGrmBedOperator<'a>, String>
-where
-    F: FnMut(usize, usize) -> Result<(), String>,
-{
-    let cfg = PcgGrmBedConfig {
-        sample_idx: sample_idx.to_vec(),
-        row_flip: prepared.row_flip.clone(),
-        row_maf: prepared.row_maf.clone(),
-        row_indices: prepared.row_source_indices.clone(),
-        threads,
-        block_rows,
-        std_eps: std_eps as f32,
-        use_train_maf,
-    };
-    match &prepared.payload {
-        JxlmmPayload::Packed(bytes) => PcgGrmBedOperator::from_packed_rows_with_progress(
-            std::borrow::Cow::Borrowed(bytes.as_ref()),
-            prepared.n_samples_full,
-            cfg,
-            progress_callback,
-            progress_every_rows,
-        ),
-        JxlmmPayload::Mmap(_) => PcgGrmBedOperator::from_bed_mmap_prefix_with_progress(
-            prepared
-                .bed_prefix
-                .as_deref()
-                .ok_or_else(|| "SparseLMM mmap payload missing BED prefix".to_string())?,
-            cfg,
-            progress_callback,
-            progress_every_rows,
-        ),
-    }
-}
-
 fn choose_rhat_rows(m: usize, count: usize, seed: u64) -> Vec<usize> {
     let k = count.min(m);
     if k == m {
@@ -829,29 +787,6 @@ fn emit_progress_callback(
     Ok(())
 }
 
-#[inline]
-fn emit_progress_callback_throttled(
-    cb: Option<&Py<PyAny>>,
-    stage: usize,
-    done: usize,
-    total: usize,
-    every: usize,
-    last_sent: &Cell<usize>,
-) -> Result<(), String> {
-    if cb.is_none() {
-        return Ok(());
-    }
-    let total_use = total.max(1);
-    let done_use = done.min(total_use);
-    let step = every.max(1);
-    let last = last_sent.get();
-    if done_use == total_use || done_use >= last.saturating_add(step) {
-        emit_progress_callback(cb, stage, done_use, total_use)?;
-        last_sent.set(done_use);
-    }
-    Ok(())
-}
-
 fn xtx_chol_from_design(x_design: &[f64], n: usize, p: usize) -> Result<Vec<f64>, String> {
     if n == 0 || p == 0 {
         return Err("SparseLMM XtX chol requires n > 0 and p > 0".to_string());
@@ -863,16 +798,30 @@ fn xtx_chol_from_design(x_design: &[f64], n: usize, p: usize) -> Result<Vec<f64>
             n * p
         ));
     }
+    // XtX via dsyrk: X is n×p row-major ≡ p×n column-major with lda=p.
+    // dsyrk computes C(p×p) = A(p×n) * A^T(n×p)  [= X^T X].
     let mut xtx = vec![0.0_f64; p * p];
-    for i in 0..n {
-        let row = &x_design[i * p..(i + 1) * p];
-        for a in 0..p {
-            let xa = row[a];
-            for b in 0..=a {
-                xtx[a * p + b] += xa * row[b];
-            }
+    {
+        use crate::blas::{
+            cblas_dsyrk_dispatch, CBLAS_COL_MAJOR, CBLAS_NO_TRANS, CBLAS_UPPER, CblasInt,
+        };
+        unsafe {
+            cblas_dsyrk_dispatch(
+                CBLAS_COL_MAJOR,
+                CBLAS_UPPER,
+                CBLAS_NO_TRANS,
+                p as CblasInt,
+                n as CblasInt,
+                1.0_f64,
+                x_design.as_ptr(),
+                p as CblasInt,
+                0.0_f64,
+                xtx.as_mut_ptr(),
+                p as CblasInt,
+            );
         }
     }
+    // Mirror upper triangle to lower.
     for a in 0..p {
         for b in 0..a {
             xtx[b * p + a] = xtx[a * p + b];
@@ -1148,19 +1097,15 @@ fn sparse_splmm_load_factor(
     sample_idx: &[usize],
     sigma_g2: f64,
     sigma_e2: f64,
-    force_sparse: bool,
     progress_callback: Option<&Py<PyAny>>,
-) -> Result<Option<SparseJxgrmCholesky>, String> {
+) -> Result<SparseJxgrmCholesky, String> {
     let path = sparse_jxgrm_path
         .map(|s| s.to_string())
         .unwrap_or_else(|| format!("{prefix}.jxgrm"));
     if !Path::new(&path).exists() {
-        if force_sparse {
-            return Err(format!(
-                "SparseLMM requested but sparse kinship file not found: {path}"
-            ));
-        }
-        return Ok(None);
+        return Err(format!(
+            "SparseLMM requires a sparse kinship file, but none was found at: {path}"
+        ));
     }
     let sparse_n = sparse_jxgrm_header_n_samples(&path)?;
     let subset_request = normalize_sparse_subset_request(sample_idx, sparse_n)?;
@@ -1200,15 +1145,11 @@ fn sparse_splmm_load_factor(
     let max_l_nnz = sparse_cholesky_max_l_nnz();
     let estimated_l_nnz = analysis.factor_nnz_estimate();
     if estimated_l_nnz > max_l_nnz {
-        let msg = format!(
+        return Err(format!(
             "SparseLMM symbolic factor is too large for direct Cholesky: estimated L nnz={} exceeds limit {}. \
-Set `JX_SPARSE_CHOLESKY_MAX_L_NNZ` to override, or fall back to operator PCG.",
+Set `JX_SPARSE_CHOLESKY_MAX_L_NNZ` to override.",
             estimated_l_nnz, max_l_nnz
-        );
-        if force_sparse {
-            return Err(msg);
-        }
-        return Ok(None);
+        ));
     }
     let rel_shifts = [
         0.0_f64, 1e-12_f64, 1e-10_f64, 1e-8_f64, 1e-6_f64, 1e-5_f64, 1e-4_f64, 1e-3_f64, 1e-2_f64,
@@ -1228,7 +1169,7 @@ Set `JX_SPARSE_CHOLESKY_MAX_L_NNZ` to override, or fall back to operator PCG.",
                     rel_shifts.len().max(1),
                     rel_shifts.len().max(1),
                 )?;
-                return Ok(Some(factor));
+                return Ok(factor);
             }
             Err(err) => {
                 last_err = Some(err);
@@ -1253,11 +1194,7 @@ Set `JX_SPARSE_CHOLESKY_MAX_L_NNZ` to override, or fall back to operator PCG.",
 sigma_g2={sigma_g2:.6e}, sigma_e2={sigma_e2:.6e}, mean_diag={diag_mean_abs:.6e}, \
 min_diag={diag_min:.6e}, max_diag={diag_max:.6e}. Last error: {last_msg}. Hint: {hint}"
     );
-    if force_sparse {
-        Err(msg)
-    } else {
-        Ok(None)
-    }
+    Err(msg)
 }
 
 #[inline]
@@ -1313,9 +1250,323 @@ fn append_splmm_tsv_block(
     }
 }
 
+#[inline]
+fn row_major_snp_block_f32_to_col_major_f64(
+    block: &[f32],
+    rows: usize,
+    cols: usize,
+    out: &mut [f64],
+) {
+    debug_assert_eq!(block.len(), rows * cols);
+    debug_assert_eq!(out.len(), rows * cols);
+    // `block` is laid out as rows SNPs × cols samples, row-major:
+    //   block[snp * cols + sample]
+    // The sparse solver expects a column-major RHS matrix with cols samples as
+    // matrix rows and rows SNPs as RHS columns. In column-major storage, each
+    // RHS column is contiguous with length `cols`, so the required layout is:
+    //   out[snp * cols + sample]
+    // Therefore this conversion is a widening copy, not a mathematical transpose.
+    for snp in 0..rows {
+        let src = &block[snp * cols..(snp + 1) * cols];
+        let dst = &mut out[snp * cols..(snp + 1) * cols];
+        for sample in 0..cols {
+            dst[sample] = src[sample] as f64;
+        }
+    }
+}
+
+#[inline]
+fn adaptive_exact_block_rows(requested: usize, n: usize) -> usize {
+    // Exact block-scan peak memory model, per row (one SNP) of the block:
+    //   block          f32 [n]     = 4n
+    //   spy_block      f32 [1]     = 4
+    //   rhs_col_major  f64 [n]     = 8n
+    //   z_col_major    f64 [n]     = 8n
+    //   c_block        f64 [p]     ≈8p   (p is small, typically 1-4)
+    //   out_block      f64 [3]     = 24
+    //   --------------------------------------------------
+    //   total per row              = 20n + 8p + 28  bytes
+    //
+    // We approximate p=4 for safety and add 25% margin for the sparse-solve
+    // workspace and allocation overhead.
+    // Default cap: 128 MiB, overridable via JX_SPLMM_EXACT_MAX_BLOCK_BYTES.
+    const DEFAULT_MAX_BYTES: usize = 128 * 1024 * 1024; // 128 MiB
+    let max_bytes: usize = std::env::var("JX_SPLMM_EXACT_MAX_BLOCK_BYTES")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(DEFAULT_MAX_BYTES);
+    // nominal: 20n+60 bytes per row, then ×1.25 margin → 25n+75
+    let bytes_per_row = (25 * n.max(1)).saturating_add(75);
+    let max_rows = max_bytes / bytes_per_row;
+    requested.min(max_rows).max(1)
+}
+
+// C = X^T Z_block: X is n×p row-major, Z_col_major is n×rows_here column-major.
+// c_block is filled with rows_here × p output.
+//
+// Uses cblas_dgemm when BLAS is compiled in and the inner-product count
+// is large enough to amortise the X layout conversion (row→col major).
+// Falls back to a hand-written loop for small n or rows_here.
+#[inline]
+fn xt_mat_rhs_block(
+    x_design: &[f64],
+    z_col_major: &[f64],
+    n: usize,
+    p: usize,
+    rows_here: usize,
+    c_block: &mut [f64],
+) {
+    // Threshold: total inner-loop iterations at which BLAS overhead is worth it.
+    const BLAS_FLOPS_THRESHOLD: usize = 4096; // n * rows_here >= threshold
+
+    let use_dgemm = n.saturating_mul(rows_here) >= BLAS_FLOPS_THRESHOLD
+        && p > 0
+        && rows_here > 0
+        && n > 0;
+
+    if use_dgemm {
+        // 1) Convert X from row-major (n×p) to column-major (p×n).
+        let mut x_col = vec![0.0_f64; p.saturating_mul(n)];
+        for i in 0..n {
+            let src = &x_design[i * p..(i + 1) * p];
+            for k in 0..p {
+                x_col[k + (i as usize) * p] = src[k];
+            }
+        }
+
+        // 2) C_col(p×rows) = X_col(p×n) * Z_col(n×rows)   [all column-major]
+        let mut c_col = vec![0.0_f64; p.saturating_mul(rows_here)];
+        unsafe {
+            cblas_dgemm_dispatch(
+                CBLAS_COL_MAJOR,
+                CBLAS_NO_TRANS,
+                CBLAS_NO_TRANS,
+                p as CblasInt,
+                rows_here as CblasInt,
+                n as CblasInt,
+                1.0_f64,
+                x_col.as_ptr(),
+                p as CblasInt,
+                z_col_major.as_ptr(),
+                n as CblasInt,
+                0.0_f64,
+                c_col.as_mut_ptr(),
+                p as CblasInt,
+            );
+        }
+
+        // 3) Copy C_col (p×rows col-major) → c_block (rows×p row-major).
+        for j in 0..rows_here {
+            let dst = &mut c_block[j * p..(j + 1) * p];
+            for i in 0..p {
+                dst[i] = c_col[i + j * (p as usize)];
+            }
+        }
+        return;
+    }
+
+    // Fallback hand-written loop.
+    c_block.fill(0.0);
+    for i in 0..n {
+        let xi = &x_design[i * p..(i + 1) * p];
+        for j in 0..rows_here {
+            let z_ji = z_col_major[j * n + i];
+            if z_ji != 0.0 {
+                let c_j = &mut c_block[j * p..(j + 1) * p];
+                for k in 0..p {
+                    c_j[k] += xi[k] * z_ji;
+                }
+            }
+        }
+    }
+}
+
+/// Tiled sparse solve using JanusX's cached thread pool (when available).
+/// `workspaces` are pre-allocated once and reused across blocks.
+#[inline]
+fn sparse_solve_rhs_tiled(
+    factor: &SparseJxgrmCholesky,
+    rhs_col_major: &mut [f64],
+    n_rhs: usize,
+    workspaces: &mut [SparseJxgrmSolveWorkspace],
+    pool: Option<&rayon::ThreadPool>,
+) -> Result<(), String> {
+    factor.solve_in_place_tiled(rhs_col_major, n_rhs, workspaces, pool)
+}
+
+// Core block-scan loop for exact g'Pg denominator.
+// Works with any GenotypeMatrix backend via UnifiedInput.
+fn exact_scan_blocks_core<G: GenotypeMatrix>(
+    factor: &SparseJxgrmCholesky,
+    input: &UnifiedInput<G>,
+    x_design: &[f64],
+    py_vec: &[f64],
+    xt_v_inv_x_chol: &[f64],
+    scan_sample_idx: &[usize],
+    gm: PackedGeneticModel,
+    threads: usize,
+    block_rows: usize,
+    scan_progress_callback: Option<&Py<PyAny>>,
+    progress_every: usize,
+    progress_stage: usize,
+    _solve_workspace: &mut SparseJxgrmSolveWorkspace,
+    sink: &mut dyn FnMut(usize, usize, &[f64]) -> Result<(), String>,
+) -> Result<(), String> {
+    let n = py_vec.len();
+    if n == 0 {
+        return Err("SparseLMM exact scan requires non-empty Py vector".to_string());
+    }
+    if x_design.len() % n != 0 {
+        return Err(format!(
+            "SparseLMM exact scan design length mismatch: len(x_design)={} is not divisible by n={n}",
+            x_design.len()
+        ));
+    }
+    let p = x_design.len() / n;
+    if p == 0 {
+        return Err("SparseLMM exact scan requires at least one design column".to_string());
+    }
+    if xt_v_inv_x_chol.len() != p * p {
+        return Err(format!(
+            "SparseLMM exact scan XtVinvX chol length mismatch: got {}, expected {}",
+            xt_v_inv_x_chol.len(), p * p
+        ));
+    }
+    if scan_sample_idx.len() != n {
+        return Err(format!(
+            "SparseLMM exact scan sample length mismatch: sample_idx={}, expected {n}",
+            scan_sample_idx.len()
+        ));
+    }
+
+    let sample_identity = scan_sample_idx.iter().enumerate().all(|(i, &sid)| sid == i);
+    let pool = get_cached_pool(threads).map_err(|e| e.to_string())?;
+    let m = input.n_markers();
+    let progress_block = if progress_every == 0 { block_rows.max(512).max(1) } else { progress_every.max(1) };
+    if scan_progress_callback.is_some() {
+        emit_progress_callback(scan_progress_callback, progress_stage, 0, m.max(1))?;
+    }
+    if !matches!(gm, PackedGeneticModel::Add) {
+        return Err("SparseLMM exact denominator mode requires additive model".to_string());
+    }
+
+    let scan_block_rows = adaptive_exact_block_rows(
+        adaptive_grm_block_rows(progress_block, m, n, 0usize, threads).max(1), n,
+    );
+    let py_f32 = cast_f64_slice_to_f32(py_vec)?;
+    let blas_threads = if rust_sgemm_prefers_rayon_rowmajor_f32_kernel() { 1 } else { threads.max(1) };
+    let _blas_guard = BlasThreadGuard::enter(blas_threads);
+
+    let mut block = vec![0.0_f32; scan_block_rows * n];
+    let mut spy_block = vec![0.0_f32; scan_block_rows];
+    let mut rhs_col_major = vec![0.0_f64; scan_block_rows * n];
+    let mut z_col_major = vec![0.0_f64; scan_block_rows * n];
+    let mut c_block = vec![0.0_f64; scan_block_rows * p];
+    let mut alpha = vec![0.0_f64; p];
+    let mut out_block = vec![0.0_f64; scan_block_rows * 3];
+
+    const MIN_TILE_COLS: usize = 32;
+    let solve_tiles = if threads > 1 && scan_block_rows >= MIN_TILE_COLS {
+        threads.min(scan_block_rows.div_ceil(MIN_TILE_COLS).max(1))
+    } else { 1 };
+    let tile_cols_capacity = scan_block_rows.div_ceil(solve_tiles);
+    let mut tiled_workspaces: Vec<SparseJxgrmSolveWorkspace> = (0..solve_tiles)
+        .map(|_| factor.make_solve_workspace(tile_cols_capacity.max(1)))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut row_start = 0usize;
+    while row_start < m {
+        let row_end = (row_start + scan_block_rows).min(m);
+        let rows_here = row_end - row_start;
+        let block_slice = &mut block[..rows_here * n];
+        let spy_slice = &mut spy_block[..rows_here];
+
+        // Step 1: decode genotype block via UnifiedInput
+        input.decode_additive_block(row_start, block_slice, scan_sample_idx, sample_identity, pool.as_ref())?;
+
+        // Step 2: numerator = G_block * Py
+        row_major_block_mul_mat_f32(block_slice, rows_here, n, py_f32.as_slice(), 1, spy_slice, pool.as_ref());
+
+        // Step 3: convert to column-major f64 for sparse solve
+        let rhs_slice = &mut rhs_col_major[..rows_here * n];
+        row_major_snp_block_f32_to_col_major_f64(block_slice, rows_here, n, rhs_slice);
+
+        // Step 4: solve V * Z_block = G_block (tiled, in-place)
+        let z_slice = &mut z_col_major[..rows_here * n];
+        z_slice.copy_from_slice(rhs_slice);
+        sparse_solve_rhs_tiled(factor, z_slice, rows_here, &mut tiled_workspaces, pool.as_deref())?;
+
+        // Step 5: C_block = X^T Z_block
+        let c_slice = &mut c_block[..rows_here * p];
+        xt_mat_rhs_block(x_design, z_slice, n, p, rows_here, c_slice);
+
+        // Steps 6-8: per-SNP denominator and output
+        let out_slice = &mut out_block[..rows_here * 3];
+        for local_idx in 0..rows_here {
+            let g = &rhs_slice[local_idx * n..(local_idx + 1) * n];
+            let z = &z_slice[local_idx * n..(local_idx + 1) * n];
+            let s_v_s = g.iter().zip(z.iter()).map(|(a, b)| a * b).sum::<f64>();
+            let c_j = &c_slice[local_idx * p..(local_idx + 1) * p];
+            cholesky_solve_into(xt_v_inv_x_chol, p, c_j, &mut alpha);
+            let x_quad = c_j.iter().zip(alpha.iter()).map(|(a, b)| a * b).sum::<f64>();
+            let s_p_s = (s_v_s - x_quad).max(0.0);
+            let out_row = &mut out_slice[local_idx * 3..(local_idx + 1) * 3];
+            if s_p_s.is_finite() && s_p_s > SPLMM_TINY {
+                let spy = spy_slice[local_idx] as f64;
+                out_row[0] = spy / s_p_s;
+                out_row[1] = 1.0_f64 / s_p_s.sqrt();
+                out_row[2] = chi2_sf_df1((spy * spy) / s_p_s);
+            } else {
+                out_row[0] = f64::NAN; out_row[1] = f64::NAN; out_row[2] = 1.0_f64;
+            }
+        }
+        sink(row_start, rows_here, out_slice)?;
+        emit_progress_callback(scan_progress_callback, progress_stage, row_end, m.max(1))?;
+        row_start = row_end;
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
-fn scan_with_py_and_rhat(
+// Scan using exact denominator g'Pg — in-memory sink writes into pre-allocated Vec<f64>.
+fn scan_with_py_and_exact_pg_sparse(
+    factor: &SparseJxgrmCholesky,
     scan_prepared: &JxlmmPreparedInput,
+    x_design: &[f64],
+    py_vec: &[f64],
+    xt_v_inv_x_chol: &[f64],
+    scan_sample_idx: &[usize],
+    gm: PackedGeneticModel,
+    threads: usize,
+    block_rows: usize,
+    scan_progress_callback: Option<&Py<PyAny>>,
+    progress_every: usize,
+    progress_stage: usize,
+    solve_workspace: &mut SparseJxgrmSolveWorkspace,
+) -> Result<Vec<f64>, String> {
+    let m = scan_prepared.n_rows();
+    let mut out = vec![0.0_f64; m * 3];
+    let mut memory_sink = |row_start: usize, rows_here: usize, block: &[f64]| {
+        out[row_start * 3..][..rows_here * 3].copy_from_slice(block);
+        Ok(())
+    };
+    // Bridge through JxlmmMatrixAdapter (zero-copy) for backward compat.
+    let adapter = JxlmmMatrixAdapter { inner: scan_prepared };
+    let stats = unified_stats_from_jxlmm(scan_prepared);
+    let input = UnifiedInput { matrix: adapter, stats };
+    exact_scan_blocks_core(
+        factor, &input, x_design, py_vec, xt_v_inv_x_chol, scan_sample_idx,
+        gm, threads, block_rows,
+        scan_progress_callback, progress_every, progress_stage,
+        solve_workspace, &mut memory_sink,
+    )?;
+    Ok(out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn grammar_scan_blocks_core<G: GenotypeMatrix>(
+    input: &UnifiedInput<G>,
     x_design: &[f64],
     py_vec: &[f64],
     xtx_chol: &[f64],
@@ -1327,7 +1578,8 @@ fn scan_with_py_and_rhat(
     scan_progress_callback: Option<&Py<PyAny>>,
     progress_every: usize,
     progress_stage: usize,
-) -> Result<Vec<f64>, String> {
+    sink: &mut dyn FnMut(usize, usize, &[f64]) -> Result<(), String>,
+) -> Result<(), String> {
     if !(r_hat.is_finite() && r_hat > 0.0) {
         return Err(format!(
             "SparseLMM scan requires finite positive r_hat, got {r_hat}"
@@ -1379,8 +1631,7 @@ fn scan_with_py_and_rhat(
     };
 
     let pool = get_cached_pool(threads).map_err(|e| e.to_string())?;
-    let m = scan_prepared.n_rows();
-    let mut out = vec![0.0_f64; m * 3];
+    let m = input.n_markers();
     let progress_block = if progress_every == 0 {
         block_rows.max(512).max(1)
     } else {
@@ -1392,7 +1643,6 @@ fn scan_with_py_and_rhat(
 
     if matches!(gm, PackedGeneticModel::Add) {
         let scan_block_rows = adaptive_grm_block_rows(progress_block, m, n, 0usize, threads).max(1);
-        let code4_lut = &packed_byte_lut().code4;
         let py_f32 = cast_f64_slice_to_f32(py_vec)?;
         let x_design_f32 = cast_f64_slice_to_f32(x_design)?;
         let blas_threads = if rust_sgemm_prefers_rayon_rowmajor_f32_kernel() {
@@ -1407,6 +1657,7 @@ fn scan_with_py_and_rhat(
         let mut row_ss = vec![0.0_f64; scan_block_rows];
         let mut xts = vec![0.0_f64; p];
         let mut alpha = vec![0.0_f64; p];
+        let mut out_block = vec![0.0_f64; scan_block_rows * 3];
         let mut row_start = 0usize;
         while row_start < m {
             let row_end = (row_start + scan_block_rows).min(m);
@@ -1415,20 +1666,8 @@ fn scan_with_py_and_rhat(
             let spy_slice = &mut spy_block[..rows_here];
             let xts_slice = &mut xts_block[..rows_here * p];
             let ss_slice = &mut row_ss[..rows_here];
-            decode_mean_imputed_additive_packed_block_rows_f32(
-                scan_prepared.payload.as_bytes(),
-                scan_prepared.bytes_per_snp,
-                scan_prepared.n_samples_full,
-                &scan_prepared.row_flip,
-                &scan_prepared.row_maf,
-                scan_sample_idx,
-                sample_identity,
-                scan_prepared.row_source_indices.as_deref(),
-                row_start,
-                block_slice,
-                code4_lut,
-                pool.as_ref(),
-            )?;
+            // Decode via UnifiedInput
+            input.decode_additive_block(row_start, block_slice, scan_sample_idx, sample_identity, pool.as_ref())?;
             row_major_block_mul_mat_f32(
                 block_slice,
                 rows_here,
@@ -1448,7 +1687,7 @@ fn scan_with_py_and_rhat(
                 pool.as_ref(),
             );
             row_major_block_sumsq_f64(block_slice, rows_here, n, ss_slice, pool.as_ref());
-            let out_block = &mut out[row_start * 3..row_end * 3];
+            let out_slice = &mut out_block[..rows_here * 3];
             for local_idx in 0..rows_here {
                 let xts_row = &xts_slice[local_idx * p..(local_idx + 1) * p];
                 for j in 0..p {
@@ -1462,7 +1701,7 @@ fn scan_with_py_and_rhat(
                     .sum::<f64>();
                 let s_m_s = (ss_slice[local_idx] - x_quad).max(0.0_f64);
                 let denom = r_hat * s_m_s;
-                let out_row = &mut out_block[local_idx * 3..(local_idx + 1) * 3];
+                let out_row = &mut out_slice[local_idx * 3..(local_idx + 1) * 3];
                 if denom.is_finite() && denom > SPLMM_TINY {
                     let spy = spy_slice[local_idx] as f64;
                     let beta = spy / denom;
@@ -1477,18 +1716,21 @@ fn scan_with_py_and_rhat(
                     out_row[2] = 1.0_f64;
                 }
             }
+            sink(row_start, rows_here, out_slice)?;
             emit_progress_callback(scan_progress_callback, progress_stage, row_end, m.max(1))?;
             row_start = row_end;
         }
     } else {
         let thread_hint = threads.max(1);
         let row_tile = progress_block.div_ceil(thread_hint).clamp(32, 1024);
+        let mut out_block = vec![0.0_f64; progress_block * 3];
         let mut row_start = 0usize;
         while row_start < m {
             let row_end = (row_start + progress_block).min(m);
-            let out_block = &mut out[row_start * 3..row_end * 3];
+            let rows_here = row_end - row_start;
+            let out_slice = &mut out_block[..rows_here * 3];
             let mut run_block = || {
-                out_block
+                out_slice
                     .par_chunks_mut(row_tile * 3)
                     .enumerate()
                     .for_each_init(
@@ -1497,10 +1739,12 @@ fn scan_with_py_and_rhat(
                             let tile_row_start = row_start + tile_idx * row_tile;
                             for (local_idx, out_row) in out_tile.chunks_mut(3).enumerate() {
                                 let row_idx = tile_row_start + local_idx;
+                                let src_idx = input.stats.row_source_indices[row_idx];
+                                let row = input.matrix.source_row_bytes(src_idx);
                                 decode_packed_row_model_into_f64(
-                                    scan_prepared.row_bytes(row_idx),
-                                    scan_prepared.row_flip[row_idx],
-                                    scan_prepared.row_maf[row_idx],
+                                    row,
+                                    input.stats.row_flip[row_idx],
+                                    input.stats.maf[row_idx],
                                     n,
                                     gm,
                                     sample_identity,
@@ -1549,15 +1793,51 @@ fn scan_with_py_and_rhat(
             } else {
                 run_block();
             }
+            sink(row_start, rows_here, &out_block[..rows_here * 3])?;
             emit_progress_callback(scan_progress_callback, progress_stage, row_end, m.max(1))?;
             row_start = row_end;
         }
     }
 
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+// GRAMMAR-gamma scan — in-memory sink writes into pre-allocated Vec<f64>.
+fn scan_with_py_and_rhat(
+    scan_prepared: &JxlmmPreparedInput,
+    x_design: &[f64],
+    py_vec: &[f64],
+    xtx_chol: &[f64],
+    scan_sample_idx: &[usize],
+    gm: PackedGeneticModel,
+    r_hat: f64,
+    threads: usize,
+    block_rows: usize,
+    scan_progress_callback: Option<&Py<PyAny>>,
+    progress_every: usize,
+    progress_stage: usize,
+) -> Result<Vec<f64>, String> {
+    let adapter = JxlmmMatrixAdapter { inner: scan_prepared };
+    let stats = unified_stats_from_jxlmm(scan_prepared);
+    let input = UnifiedInput { matrix: adapter, stats };
+    let m = input.n_markers();
+    let mut out = vec![0.0_f64; m * 3];
+    let mut memory_sink = |row_start: usize, rows_here: usize, block: &[f64]| {
+        out[row_start * 3..][..rows_here * 3].copy_from_slice(block);
+        Ok(())
+    };
+    grammar_scan_blocks_core(
+        &input, x_design, py_vec, xtx_chol, scan_sample_idx,
+        gm, r_hat, threads, block_rows,
+        scan_progress_callback, progress_every, progress_stage,
+        &mut memory_sink,
+    )?;
     Ok(out)
 }
 
 #[allow(clippy::too_many_arguments)]
+// GRAMMAR-gamma scan — TSV sink formats+streams each block to a file.
 fn scan_to_tsv_with_py_and_rhat(
     scan_prepared: &JxlmmPreparedInput,
     x_design: &[f64],
@@ -1594,67 +1874,7 @@ fn scan_to_tsv_with_py_and_rhat(
             allele1.len()
         ));
     }
-    if !(r_hat.is_finite() && r_hat > 0.0) {
-        return Err(format!(
-            "SparseLMM scan requires finite positive r_hat, got {r_hat}"
-        ));
-    }
-    let n = py_vec.len();
-    if n == 0 {
-        return Err("SparseLMM scan requires non-empty Py vector".to_string());
-    }
-    if x_design.len() % n != 0 {
-        return Err(format!(
-            "SparseLMM scan design length mismatch: len(x_design)={} is not divisible by n={n}",
-            x_design.len()
-        ));
-    }
-    let p = x_design.len() / n;
-    if p == 0 {
-        return Err("SparseLMM scan requires at least one design column".to_string());
-    }
-    if xtx_chol.len() != p * p {
-        return Err(format!(
-            "SparseLMM scan XtX chol length mismatch: got {}, expected {}",
-            xtx_chol.len(),
-            p * p
-        ));
-    }
-    if scan_sample_idx.len() != n {
-        return Err(format!(
-            "SparseLMM scan sample length mismatch: sample_idx={}, expected {n}",
-            scan_sample_idx.len()
-        ));
-    }
-
-    let sample_identity = scan_sample_idx.iter().enumerate().all(|(i, &sid)| sid == i);
-    let sample_byte_idx: Option<Vec<usize>> = if sample_identity {
-        None
-    } else {
-        Some(scan_sample_idx.iter().map(|&sid| sid >> 2).collect())
-    };
-    let sample_bit_shift: Option<Vec<u8>> = if sample_identity {
-        None
-    } else {
-        Some(
-            scan_sample_idx
-                .iter()
-                .map(|&sid| ((sid & 3) << 1) as u8)
-                .collect(),
-        )
-    };
-
-    let pool = get_cached_pool(threads).map_err(|e| e.to_string())?;
     let m = scan_prepared.n_rows();
-    let progress_block = if progress_every == 0 {
-        block_rows.max(512).max(1)
-    } else {
-        progress_every.max(1)
-    };
-    if scan_progress_callback.is_some() {
-        emit_progress_callback(scan_progress_callback, progress_stage, 0, m.max(1))?;
-    }
-
     let writer = AsyncTsvWriter::with_config(
         out_tsv,
         b"chrom\tpos\tsnp\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\n",
@@ -1663,212 +1883,114 @@ fn scan_to_tsv_with_py_and_rhat(
     )
     .map_err(|e| e.to_string())?;
 
-    let mut text_buf = String::with_capacity(progress_block.max(1) * 112);
-    let code4_lut = &packed_byte_lut().code4;
-
-    let run_res: Result<(), String> = (|| {
-        if matches!(gm, PackedGeneticModel::Add) {
-            let scan_block_rows =
-                adaptive_grm_block_rows(progress_block, m, n, 0usize, threads).max(1);
-            let py_f32 = cast_f64_slice_to_f32(py_vec)?;
-            let x_design_f32 = cast_f64_slice_to_f32(x_design)?;
-            let blas_threads = if rust_sgemm_prefers_rayon_rowmajor_f32_kernel() {
-                1usize
-            } else {
-                threads.max(1)
-            };
-            let _blas_guard = BlasThreadGuard::enter(blas_threads);
-            let mut block = vec![0.0_f32; scan_block_rows * n];
-            let mut spy_block = vec![0.0_f32; scan_block_rows];
-            let mut xts_block = vec![0.0_f32; scan_block_rows * p];
-            let mut row_ss = vec![0.0_f64; scan_block_rows];
-            let mut out_block = vec![0.0_f64; scan_block_rows * 3];
-            let mut xts = vec![0.0_f64; p];
-            let mut alpha = vec![0.0_f64; p];
-            let mut row_start = 0usize;
-            while row_start < m {
-                let row_end = (row_start + scan_block_rows).min(m);
-                let rows_here = row_end - row_start;
-                let block_slice = &mut block[..rows_here * n];
-                let spy_slice = &mut spy_block[..rows_here];
-                let xts_slice = &mut xts_block[..rows_here * p];
-                let ss_slice = &mut row_ss[..rows_here];
-                let out_slice = &mut out_block[..rows_here * 3];
-                decode_mean_imputed_additive_packed_block_rows_f32(
-                    scan_prepared.payload.as_bytes(),
-                    scan_prepared.bytes_per_snp,
-                    scan_prepared.n_samples_full,
-                    &scan_prepared.row_flip,
-                    &scan_prepared.row_maf,
-                    scan_sample_idx,
-                    sample_identity,
-                    scan_prepared.row_source_indices.as_deref(),
-                    row_start,
-                    block_slice,
-                    code4_lut,
-                    pool.as_ref(),
-                )?;
-                row_major_block_mul_mat_f32(
-                    block_slice,
-                    rows_here,
-                    n,
-                    py_f32.as_slice(),
-                    1usize,
-                    spy_slice,
-                    pool.as_ref(),
-                );
-                row_major_block_mul_mat_f32(
-                    block_slice,
-                    rows_here,
-                    n,
-                    x_design_f32.as_slice(),
-                    p,
-                    xts_slice,
-                    pool.as_ref(),
-                );
-                row_major_block_sumsq_f64(block_slice, rows_here, n, ss_slice, pool.as_ref());
-                for local_idx in 0..rows_here {
-                    let xts_row = &xts_slice[local_idx * p..(local_idx + 1) * p];
-                    for j in 0..p {
-                        xts[j] = xts_row[j] as f64;
-                    }
-                    cholesky_solve_into(xtx_chol, p, &xts, &mut alpha);
-                    let x_quad = xts
-                        .iter()
-                        .zip(alpha.iter())
-                        .map(|(a, b)| a * b)
-                        .sum::<f64>();
-                    let s_m_s = (ss_slice[local_idx] - x_quad).max(0.0_f64);
-                    let denom = r_hat * s_m_s;
-                    let out_row = &mut out_slice[local_idx * 3..(local_idx + 1) * 3];
-                    if denom.is_finite() && denom > SPLMM_TINY {
-                        let spy = spy_slice[local_idx] as f64;
-                        let beta = spy / denom;
-                        let se = 1.0_f64 / denom.sqrt();
-                        let chisq = (spy * spy) / denom;
-                        out_row[0] = beta;
-                        out_row[1] = se;
-                        out_row[2] = chi2_sf_df1(chisq);
-                    } else {
-                        out_row[0] = f64::NAN;
-                        out_row[1] = f64::NAN;
-                        out_row[2] = 1.0_f64;
-                    }
-                }
-                text_buf.clear();
-                append_splmm_tsv_block(
-                    &mut text_buf,
-                    row_start,
-                    rows_here,
-                    out_slice,
-                    chrom,
-                    pos,
-                    snp,
-                    allele0,
-                    allele1,
-                    &scan_prepared.row_maf,
-                    &scan_prepared.row_missing,
-                    gm,
-                );
-                let payload = std::mem::take(&mut text_buf).into_bytes();
-                writer.send(payload)?;
-                emit_progress_callback(scan_progress_callback, progress_stage, row_end, m.max(1))?;
-                row_start = row_end;
-            }
-        } else {
-            let row_tile = progress_block.div_ceil(threads.max(1)).clamp(32, 1024);
-            let mut out_block = vec![0.0_f64; progress_block * 3];
-            let mut row_start = 0usize;
-            while row_start < m {
-                let row_end = (row_start + progress_block).min(m);
-                let rows_here = row_end - row_start;
-                let out_slice = &mut out_block[..rows_here * 3];
-                let mut run_block = || {
-                    out_slice
-                        .par_chunks_mut(row_tile * 3)
-                        .enumerate()
-                        .for_each_init(
-                            || (vec![0.0_f64; n], vec![0.0_f64; p], vec![0.0_f64; p]),
-                            |(snp, xts, alpha), (tile_idx, out_tile)| {
-                                let tile_row_start = row_start + tile_idx * row_tile;
-                                for (local_idx, out_row) in out_tile.chunks_mut(3).enumerate() {
-                                    let row_idx = tile_row_start + local_idx;
-                                    decode_packed_row_model_into_f64(
-                                        scan_prepared.row_bytes(row_idx),
-                                        scan_prepared.row_flip[row_idx],
-                                        scan_prepared.row_maf[row_idx],
-                                        n,
-                                        gm,
-                                        sample_identity,
-                                        sample_byte_idx.as_deref(),
-                                        sample_bit_shift.as_deref(),
-                                        snp,
-                                    );
-                                    xts.fill(0.0);
-                                    let mut spy = 0.0_f64;
-                                    let mut s_sq = 0.0_f64;
-                                    for i in 0..n {
-                                        let s_i = snp[i];
-                                        spy += s_i * py_vec[i];
-                                        s_sq += s_i * s_i;
-                                        let x_row = &x_design[i * p..(i + 1) * p];
-                                        for j in 0..p {
-                                            xts[j] += x_row[j] * s_i;
-                                        }
-                                    }
-                                    cholesky_solve_into(xtx_chol, p, xts, alpha);
-                                    let x_quad = xts
-                                        .iter()
-                                        .zip(alpha.iter())
-                                        .map(|(a, b)| a * b)
-                                        .sum::<f64>();
-                                    let s_m_s = (s_sq - x_quad).max(0.0);
-                                    let denom = r_hat * s_m_s;
-                                    if denom.is_finite() && denom > SPLMM_TINY {
-                                        let beta = spy / denom;
-                                        let se = 1.0 / denom.sqrt();
-                                        let chisq = (spy * spy) / denom;
-                                        out_row[0] = beta;
-                                        out_row[1] = se;
-                                        out_row[2] = chi2_sf_df1(chisq);
-                                    } else {
-                                        out_row[0] = f64::NAN;
-                                        out_row[1] = f64::NAN;
-                                        out_row[2] = 1.0;
-                                    }
-                                }
-                            },
-                        );
-                };
-                if let Some(tp) = &pool {
-                    tp.install(run_block);
-                } else {
-                    run_block();
-                }
-                text_buf.clear();
-                append_splmm_tsv_block(
-                    &mut text_buf,
-                    row_start,
-                    rows_here,
-                    out_slice,
-                    chrom,
-                    pos,
-                    snp,
-                    allele0,
-                    allele1,
-                    &scan_prepared.row_maf,
-                    &scan_prepared.row_missing,
-                    gm,
-                );
-                let payload = std::mem::take(&mut text_buf).into_bytes();
-                writer.send(payload)?;
-                emit_progress_callback(scan_progress_callback, progress_stage, row_end, m.max(1))?;
-                row_start = row_end;
-            }
-        }
+    let adapter = JxlmmMatrixAdapter { inner: scan_prepared };
+    let stats = unified_stats_from_jxlmm(scan_prepared);
+    let input = UnifiedInput { matrix: adapter, stats };
+    let row_maf = input.stats.maf.clone();
+    let row_miss = input.stats.miss.clone();
+    let m = input.n_markers();
+    let mut text_buf = String::with_capacity(block_rows.max(512).max(1) * 112);
+    let mut tsv_sink = |row_start: usize, rows_here: usize, block: &[f64]| {
+        text_buf.clear();
+        append_splmm_tsv_block(
+            &mut text_buf, row_start, rows_here, block,
+            chrom, pos, snp, allele0, allele1,
+            &row_maf, &row_miss, gm,
+        );
+        let payload = std::mem::take(&mut text_buf).into_bytes();
+        writer.send(payload)?;
         Ok(())
-    })();
+    };
+    let run_res = grammar_scan_blocks_core(
+        &input, x_design, py_vec, xtx_chol, scan_sample_idx,
+        gm, r_hat, threads, block_rows,
+        scan_progress_callback, progress_every, progress_stage,
+        &mut tsv_sink,
+    );
+    let writer_result = writer.finish();
+    run_res?;
+    writer_result?;
+    Ok(m)
+}
 
+#[allow(clippy::too_many_arguments)]
+// Scan using exact denominator g'Pg — TSV sink formats+streams each block to a file.
+fn scan_to_tsv_with_py_and_exact_pg_sparse(
+    factor: &SparseJxgrmCholesky,
+    scan_prepared: &JxlmmPreparedInput,
+    x_design: &[f64],
+    py_vec: &[f64],
+    xt_v_inv_x_chol: &[f64],
+    scan_sample_idx: &[usize],
+    gm: PackedGeneticModel,
+    threads: usize,
+    block_rows: usize,
+    chrom: &[String],
+    pos: &[i64],
+    snp: &[String],
+    allele0: &[String],
+    allele1: &[String],
+    out_tsv: &str,
+    scan_progress_callback: Option<&Py<PyAny>>,
+    progress_every: usize,
+    progress_stage: usize,
+    solve_workspace: &mut SparseJxgrmSolveWorkspace,
+) -> Result<usize, String> {
+    if chrom.len() != scan_prepared.n_rows()
+        || pos.len() != scan_prepared.n_rows()
+        || snp.len() != scan_prepared.n_rows()
+        || allele0.len() != scan_prepared.n_rows()
+        || allele1.len() != scan_prepared.n_rows()
+    {
+        return Err(format!(
+            "SparseLMM TSV metadata length mismatch: rows={}, chrom={}, pos={}, snp={}, allele0={}, allele1={}",
+            scan_prepared.n_rows(),
+            chrom.len(),
+            pos.len(),
+            snp.len(),
+            allele0.len(),
+            allele1.len()
+        ));
+    }
+    let m = scan_prepared.n_rows();
+    let writer = AsyncTsvWriter::with_config(
+        out_tsv,
+        b"chrom\tpos\tsnp\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\n",
+        64 * 1024 * 1024,
+        4,
+    )
+    .map_err(|e| e.to_string())?;
+
+    let mut text_buf = String::with_capacity(block_rows.max(512).max(1) * 112);
+    let mut tsv_sink = |row_start: usize, rows_here: usize, block: &[f64]| {
+        text_buf.clear();
+        append_splmm_tsv_block(
+            &mut text_buf,
+            row_start,
+            rows_here,
+            block,
+            chrom,
+            pos,
+            snp,
+            allele0,
+            allele1,
+            &scan_prepared.row_maf,
+            &scan_prepared.row_missing,
+            gm,
+        );
+        let payload = std::mem::take(&mut text_buf).into_bytes();
+        writer.send(payload)?;
+        Ok(())
+    };
+    let adapter = JxlmmMatrixAdapter { inner: scan_prepared };
+    let stats = unified_stats_from_jxlmm(scan_prepared);
+    let input = UnifiedInput { matrix: adapter, stats };
+    let run_res = exact_scan_blocks_core(
+        factor, &input, x_design, py_vec, xt_v_inv_x_chol, scan_sample_idx,
+        gm, threads, block_rows,
+        scan_progress_callback, progress_every, progress_stage,
+        solve_workspace, &mut tsv_sink,
+    );
     let writer_result = writer.finish();
     run_res?;
     writer_result?;
@@ -1890,13 +2012,30 @@ fn estimate_rhat_and_scan_sparse(
     stage1_progress_callback: Option<Py<PyAny>>,
     scan_progress_callback: Option<Py<PyAny>>,
     progress_every: usize,
+    exact_denom: bool,
 ) -> Result<(f64, Vec<f64>, PcgJxlmmNullModelInfo, PcgJxlmmRHatResult), String> {
     let n = y_vec.len();
     let p = x_design.len() / n;
     let stage1_cb = stage1_progress_callback.as_ref();
     let rhat_progress_total = n_rhat_progress_total(scan_prepared.n_rows(), rhat_markers);
     let n_rhat_cap = rhat_markers.min(scan_prepared.n_rows()).max(1);
-    let mut solve_workspace = factor.make_solve_workspace(p.max(n_rhat_cap).max(1))?;
+    // Exact mode needs workspace sized for the adaptive block size used during scan.
+    let solve_cap = if exact_denom {
+        let m = scan_prepared.n_rows();
+        let progress_block = if progress_every == 0 {
+            block_rows.max(512).max(1)
+        } else {
+            progress_every.max(1)
+        };
+        let est_block_rows = adaptive_exact_block_rows(
+            adaptive_grm_block_rows(progress_block, m, n, 0usize, threads).max(1),
+            n,
+        );
+        est_block_rows.max(p).max(n_rhat_cap).max(1)
+    } else {
+        p.max(n_rhat_cap).max(1)
+    };
+    let mut solve_workspace = factor.make_solve_workspace(solve_cap)?;
 
     if stage1_cb.is_some() {
         emit_progress_callback(stage1_cb, 6, 0, 1)?;
@@ -2055,8 +2194,6 @@ fn estimate_rhat_and_scan_sparse(
     drop(v_inv_s_col);
     drop(sampled_markers);
     drop(tmp_snp);
-    drop(solve_workspace);
-    drop(factor);
     let rhat_result = PcgJxlmmRHatResult {
         r_hat,
         n_markers_requested: n_rhat,
@@ -2077,22 +2214,54 @@ fn estimate_rhat_and_scan_sparse(
             ],
         },
     };
-    let out = scan_with_py_and_rhat(
-        &scan_prepared,
-        &x_design,
-        &null_model.py,
-        &null_model.xtx_chol,
-        &scan_sample_idx,
-        gm,
-        r_hat,
-        threads,
-        block_rows,
-        scan_progress_callback.as_ref(),
-        progress_every,
-        9,
-    )?;
+    if exact_denom {
+        // Build UnifiedInput<BedMmapMatrix> from the scan prefix.
+        // JxlmmPreparedInput metadata vectors are cloned once into
+        // GlobalStats; BedMmapMatrix opens the mmap for zero-copy access.
+        let bed_prefix = scan_prepared.bed_prefix.as_deref()
+            .ok_or_else(|| "SparseLMM exact scan requires a BED prefix".to_string())?;
+        let matrix = crate::gload::BedMmapMatrix::open(bed_prefix)?;
+        let stats = unified_stats_from_jxlmm(&scan_prepared);
+        let input = UnifiedInput { matrix, stats };
 
-    Ok((r_hat, out, null_info, rhat_result))
+        let m = input.n_markers();
+        let mut out = vec![0.0_f64; m * 3];
+        let mut memory_sink = |row_start: usize, rows_here: usize, block: &[f64]| {
+            out[row_start * 3..][..rows_here * 3].copy_from_slice(block);
+            Ok(())
+        };
+        exact_scan_blocks_core(
+            &factor, &input, &x_design, &null_model.py,
+            &null_model.xt_v_inv_x_chol, &scan_sample_idx,
+            gm, threads, block_rows,
+            scan_progress_callback.as_ref(), progress_every, 9,
+            &mut solve_workspace, &mut memory_sink,
+        )?;
+        drop(solve_workspace);
+        drop(factor);
+        Ok((r_hat, out, null_info, rhat_result))
+    } else {
+        drop(solve_workspace);
+        drop(factor);
+        let bed_prefix = scan_prepared.bed_prefix.as_deref()
+            .ok_or_else(|| "SparseLMM grammar scan requires a BED prefix".to_string())?;
+        let matrix = crate::gload::BedMmapMatrix::open(bed_prefix)?;
+        let stats = unified_stats_from_jxlmm(&scan_prepared);
+        let input = UnifiedInput { matrix, stats };
+        let m = input.n_markers();
+        let mut out = vec![0.0_f64; m * 3];
+        let mut memory_sink = |row_start: usize, rows_here: usize, block: &[f64]| {
+            out[row_start * 3..][..rows_here * 3].copy_from_slice(block);
+            Ok(())
+        };
+        grammar_scan_blocks_core(
+            &input, &x_design, &null_model.py, &null_model.xtx_chol,
+            &scan_sample_idx, gm, r_hat, threads, block_rows,
+            scan_progress_callback.as_ref(), progress_every, 9,
+            &mut memory_sink,
+        )?;
+        Ok((r_hat, out, null_info, rhat_result))
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2116,13 +2285,30 @@ fn estimate_rhat_and_scan_sparse_to_tsv(
     stage1_progress_callback: Option<Py<PyAny>>,
     scan_progress_callback: Option<Py<PyAny>>,
     progress_every: usize,
+    exact_denom: bool,
 ) -> Result<(f64, usize, PcgJxlmmNullModelInfo, PcgJxlmmRHatResult), String> {
     let n = y_vec.len();
     let p = x_design.len() / n;
     let stage1_cb = stage1_progress_callback.as_ref();
     let rhat_progress_total = n_rhat_progress_total(scan_prepared.n_rows(), rhat_markers);
     let n_rhat_cap = rhat_markers.min(scan_prepared.n_rows()).max(1);
-    let mut solve_workspace = factor.make_solve_workspace(p.max(n_rhat_cap).max(1))?;
+    // Exact mode needs workspace sized for the adaptive block size used during scan.
+    let solve_cap = if exact_denom {
+        let m = scan_prepared.n_rows();
+        let progress_block = if progress_every == 0 {
+            block_rows.max(512).max(1)
+        } else {
+            progress_every.max(1)
+        };
+        let est_block_rows = adaptive_exact_block_rows(
+            adaptive_grm_block_rows(progress_block, m, n, 0usize, threads).max(1),
+            n,
+        );
+        est_block_rows.max(p).max(n_rhat_cap).max(1)
+    } else {
+        p.max(n_rhat_cap).max(1)
+    };
+    let mut solve_workspace = factor.make_solve_workspace(solve_cap)?;
 
     if stage1_cb.is_some() {
         emit_progress_callback(stage1_cb, 6, 0, 1)?;
@@ -2281,8 +2467,6 @@ fn estimate_rhat_and_scan_sparse_to_tsv(
     drop(v_inv_s_col);
     drop(sampled_markers);
     drop(tmp_snp);
-    drop(solve_workspace);
-    drop(factor);
     let rhat_result = PcgJxlmmRHatResult {
         r_hat,
         n_markers_requested: n_rhat,
@@ -2303,28 +2487,56 @@ fn estimate_rhat_and_scan_sparse_to_tsv(
             ],
         },
     };
-    let written_rows = scan_to_tsv_with_py_and_rhat(
-        &scan_prepared,
-        &x_design,
-        &null_model.py,
-        &null_model.xtx_chol,
-        &scan_sample_idx,
-        gm,
-        r_hat,
-        threads,
-        block_rows,
-        chrom.as_slice(),
-        pos.as_slice(),
-        snp.as_slice(),
-        allele0.as_slice(),
-        allele1.as_slice(),
-        &out_tsv,
-        scan_progress_callback.as_ref(),
-        progress_every,
-        9,
-    )?;
-
-    Ok((r_hat, written_rows, null_info, rhat_result))
+    if exact_denom {
+        let written_rows = scan_to_tsv_with_py_and_exact_pg_sparse(
+            &factor,
+            &scan_prepared,
+            &x_design,
+            &null_model.py,
+            &null_model.xt_v_inv_x_chol,
+            &scan_sample_idx,
+            gm,
+            threads,
+            block_rows,
+            chrom.as_slice(),
+            pos.as_slice(),
+            snp.as_slice(),
+            allele0.as_slice(),
+            allele1.as_slice(),
+            &out_tsv,
+            scan_progress_callback.as_ref(),
+            progress_every,
+            9,
+            &mut solve_workspace,
+        )?;
+        drop(solve_workspace);
+        drop(factor);
+        Ok((r_hat, written_rows, null_info, rhat_result))
+    } else {
+        drop(solve_workspace);
+        drop(factor);
+        let written_rows = scan_to_tsv_with_py_and_rhat(
+            &scan_prepared,
+            &x_design,
+            &null_model.py,
+            &null_model.xtx_chol,
+            &scan_sample_idx,
+            gm,
+            r_hat,
+            threads,
+            block_rows,
+            chrom.as_slice(),
+            pos.as_slice(),
+            snp.as_slice(),
+            allele0.as_slice(),
+            allele1.as_slice(),
+            &out_tsv,
+            scan_progress_callback.as_ref(),
+            progress_every,
+            9,
+        )?;
+        Ok((r_hat, written_rows, null_info, rhat_result))
+    }
 }
 
 fn estimate_rhat_and_scan(
@@ -2338,225 +2550,54 @@ fn estimate_rhat_and_scan(
     gm: PackedGeneticModel,
     sigma_g2: f64,
     sigma_e2: f64,
-    tol: f64,
-    max_iter: usize,
     block_rows: usize,
-    std_eps: f64,
-    use_train_maf: bool,
     threads: usize,
     rhat_markers: usize,
     rhat_seed: u64,
     stage1_progress_callback: Option<Py<PyAny>>,
     scan_progress_callback: Option<Py<PyAny>>,
     progress_every: usize,
-    rhat_tol: f64,
-    force_sparse_splmm: bool,
     sparse_jxgrm_path: Option<String>,
+    exact_denom: bool,
 ) -> Result<(f64, Vec<f64>, PcgJxlmmNullModelInfo, PcgJxlmmRHatResult), String> {
-    let n = y_vec.len();
-    let p = x_design.len() / n;
-
     let stage1_cb = stage1_progress_callback.as_ref();
-    if let Some(prefix) = operator_prepared.bed_prefix.as_deref() {
-        let sparse_factor_sample_idx_ref = sparse_factor_sample_idx
-            .as_deref()
-            .unwrap_or(operator_sample_idx.as_slice());
-        let sparse_expected_n = if sparse_jxgrm_path.is_some() {
-            sparse_factor_sample_idx_ref.len()
-        } else {
-            operator_prepared.n_samples_full
-        };
-        if let Some(factor) = sparse_splmm_load_factor(
-            prefix,
-            sparse_jxgrm_path.as_deref(),
-            sparse_expected_n,
-            sparse_factor_sample_idx_ref,
-            sigma_g2,
-            sigma_e2,
-            force_sparse_splmm,
-            stage1_cb,
-        )? {
-            return estimate_rhat_and_scan_sparse(
-                factor,
-                scan_prepared,
-                x_design,
-                y_vec,
-                scan_sample_idx,
-                gm,
-                threads,
-                block_rows,
-                rhat_markers,
-                rhat_seed,
-                stage1_progress_callback,
-                scan_progress_callback,
-                progress_every,
-            );
-        }
-    } else if force_sparse_splmm {
-        return Err("SparseLMM requested but operator input has no BED prefix.".to_string());
-    }
-    let prepare_every_rows = if progress_every == 0 {
-        block_rows.max(256).max(1)
+    let prefix = operator_prepared
+        .bed_prefix
+        .as_deref()
+        .ok_or_else(|| "SparseLMM requires operator input with a PLINK BED prefix.".to_string())?;
+    let sparse_factor_sample_idx_ref = sparse_factor_sample_idx
+        .as_deref()
+        .unwrap_or(operator_sample_idx.as_slice());
+    let sparse_expected_n = if sparse_jxgrm_path.is_some() {
+        sparse_factor_sample_idx_ref.len()
     } else {
-        progress_every.max(1)
+        operator_prepared.n_samples_full
     };
-    let rhat_rows = choose_rhat_rows(scan_prepared.n_rows(), rhat_markers, rhat_seed);
-    let n_rhat = rhat_rows.len();
-    let build_total = operator_prepared.n_rows().max(1);
-    let jacobi_total = 1usize;
-    let v_inv_y_total = max_iter.max(1);
-    let v_inv_x_total = p.saturating_mul(max_iter.max(1)).max(1);
-    let rhat_decode_total = n_rhat.max(1);
-    let rhat_solve_total = n_rhat.saturating_mul(max_iter.max(1)).max(1);
-    let rhat_total = rhat_decode_total.saturating_add(rhat_solve_total);
-    let v_inv_x_last_sent = Cell::new(0usize);
-    let rhat_last_sent = Cell::new(rhat_decode_total);
-    let mut prepare_progress = |done: usize, total: usize| {
-        let done_use = done.min(total.max(1)).min(build_total);
-        emit_progress_callback(stage1_cb, 0, done_use, build_total)
-    };
-    if stage1_cb.is_some() {
-        emit_progress_callback(stage1_cb, 0, 0, build_total)?;
-    }
-    let mut k_grm = make_bed_operator(
-        &operator_prepared,
-        &operator_sample_idx,
-        threads,
-        block_rows,
-        std_eps,
-        use_train_maf,
-        if stage1_cb.is_some() {
-            Some(&mut prepare_progress)
-        } else {
-            None
-        },
-        prepare_every_rows,
-    )?;
-    emit_progress_callback(stage1_cb, 0, build_total, build_total)?;
-
-    emit_progress_callback(stage1_cb, 1, 0, jacobi_total)?;
-    let jacobi_inv_diag = k_grm.variance_jacobi_inv_diag(sigma_g2, sigma_e2)?;
-    emit_progress_callback(stage1_cb, 1, jacobi_total, jacobi_total)?;
-
-    emit_progress_callback(stage1_cb, 2, 0, v_inv_y_total)?;
-    let (null_model, null_info) = pcg_build_jxlmm_null_model(
-        &x_design,
-        &y_vec,
-        n,
-        p,
-        max_iter,
-        tol,
-        SPLMM_TINY,
-        &mut k_grm,
+    let factor = sparse_splmm_load_factor(
+        prefix,
+        sparse_jxgrm_path.as_deref(),
+        sparse_expected_n,
+        sparse_factor_sample_idx_ref,
         sigma_g2,
         sigma_e2,
-        Some(jacobi_inv_diag.as_slice()),
-        |iter, iter_max, _rel_res| {
-            emit_progress_callback(stage1_cb, 2, iter.min(iter_max.max(1)), v_inv_y_total)
-        },
-        |col, iter, iter_max, _rel_res| {
-            let cols_total = p.max(1);
-            let iter_use = iter.clamp(1, iter_max.max(1));
-            let done = iter_use
-                .saturating_sub(1)
-                .saturating_mul(cols_total)
-                .saturating_add((col + 1).min(cols_total));
-            emit_progress_callback_throttled(
-                stage1_cb,
-                3,
-                done,
-                v_inv_x_total,
-                cols_total,
-                &v_inv_x_last_sent,
-            )
-        },
+        stage1_cb,
     )?;
-
-    emit_progress_callback(stage1_cb, 4, 0, rhat_total)?;
-    let sample_identity = scan_sample_idx.iter().enumerate().all(|(i, &sid)| sid == i);
-    let sample_byte_idx: Option<Vec<usize>> = if sample_identity {
-        None
-    } else {
-        Some(scan_sample_idx.iter().map(|&sid| sid >> 2).collect())
-    };
-    let sample_bit_shift: Option<Vec<u8>> = if sample_identity {
-        None
-    } else {
-        Some(
-            scan_sample_idx
-                .iter()
-                .map(|&sid| ((sid & 3) << 1) as u8)
-                .collect(),
-        )
-    };
-    let mut sampled_markers = vec![0.0_f64; n * n_rhat];
-    let mut tmp_snp = vec![0.0_f64; n];
-    for (col, &row_idx) in rhat_rows.iter().enumerate() {
-        decode_packed_row_model_into_f64(
-            scan_prepared.row_bytes(row_idx),
-            scan_prepared.row_flip[row_idx],
-            scan_prepared.row_maf[row_idx],
-            n,
-            gm,
-            sample_identity,
-            sample_byte_idx.as_deref(),
-            sample_bit_shift.as_deref(),
-            &mut tmp_snp,
-        );
-        for i in 0..n {
-            sampled_markers[col * n + i] = tmp_snp[i];
-        }
-        emit_progress_callback(stage1_cb, 4, (col + 1).min(rhat_total), rhat_total)?;
-    }
-    let rhat_result = pcg_estimate_jxlmm_r_hat(
-        &null_model,
-        &x_design,
-        &sampled_markers,
-        n_rhat,
-        max_iter,
-        rhat_tol,
-        SPLMM_TINY,
-        &mut k_grm,
-        sigma_g2,
-        sigma_e2,
-        Some(jacobi_inv_diag.as_slice()),
-        |col, iter, iter_max, _rel_res| {
-            let cols_total = n_rhat.max(1);
-            let iter_use = iter.clamp(1, iter_max.max(1));
-            let done = rhat_decode_total.saturating_add(
-                iter_use
-                    .saturating_sub(1)
-                    .saturating_mul(cols_total)
-                    .saturating_add((col + 1).min(cols_total)),
-            );
-            emit_progress_callback_throttled(
-                stage1_cb,
-                4,
-                done,
-                rhat_total,
-                cols_total,
-                &rhat_last_sent,
-            )
-        },
-    )?;
-    emit_progress_callback(stage1_cb, 4, rhat_total, rhat_total)?;
-    let r_hat = rhat_result.r_hat;
-    let out = scan_with_py_and_rhat(
-        &scan_prepared,
-        &x_design,
-        &null_model.py,
-        &null_model.xtx_chol,
-        &scan_sample_idx,
+    estimate_rhat_and_scan_sparse(
+        factor,
+        scan_prepared,
+        x_design,
+        y_vec,
+        scan_sample_idx,
         gm,
-        r_hat,
         threads,
         block_rows,
-        scan_progress_callback.as_ref(),
+        rhat_markers,
+        rhat_seed,
+        stage1_progress_callback,
+        scan_progress_callback,
         progress_every,
-        5,
-    )?;
-
-    Ok((r_hat, out, null_info, rhat_result))
+        exact_denom,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2584,55 +2625,52 @@ fn estimate_rhat_and_scan_to_tsv(
     stage1_progress_callback: Option<Py<PyAny>>,
     scan_progress_callback: Option<Py<PyAny>>,
     progress_every: usize,
-    force_sparse_splmm: bool,
     sparse_jxgrm_path: Option<String>,
+    exact_denom: bool,
 ) -> Result<(f64, usize, PcgJxlmmNullModelInfo, PcgJxlmmRHatResult), String> {
     let stage1_cb = stage1_progress_callback.as_ref();
-    if let Some(prefix) = operator_prepared.bed_prefix.as_deref() {
-        let sparse_factor_sample_idx_ref = sparse_factor_sample_idx
-            .as_deref()
-            .unwrap_or(operator_sample_idx.as_slice());
-        let sparse_expected_n = if sparse_jxgrm_path.is_some() {
-            sparse_factor_sample_idx_ref.len()
-        } else {
-            operator_prepared.n_samples_full
-        };
-        if let Some(factor) = sparse_splmm_load_factor(
-            prefix,
-            sparse_jxgrm_path.as_deref(),
-            sparse_expected_n,
-            sparse_factor_sample_idx_ref,
-            sigma_g2,
-            sigma_e2,
-            force_sparse_splmm,
-            stage1_cb,
-        )? {
-            return estimate_rhat_and_scan_sparse_to_tsv(
-                factor,
-                scan_prepared,
-                x_design,
-                y_vec,
-                scan_sample_idx,
-                gm,
-                threads,
-                block_rows,
-                rhat_markers,
-                rhat_seed,
-                chrom,
-                pos,
-                snp,
-                allele0,
-                allele1,
-                out_tsv,
-                stage1_progress_callback,
-                scan_progress_callback,
-                progress_every,
-            );
-        }
-    }
-    Err(
-        "SparseLMM direct-to-TSV scan currently requires sparse SparseLMM factorization path."
-            .to_string(),
+    let prefix = operator_prepared
+        .bed_prefix
+        .as_deref()
+        .ok_or_else(|| "SparseLMM requires operator input with a PLINK BED prefix.".to_string())?;
+    let sparse_factor_sample_idx_ref = sparse_factor_sample_idx
+        .as_deref()
+        .unwrap_or(operator_sample_idx.as_slice());
+    let sparse_expected_n = if sparse_jxgrm_path.is_some() {
+        sparse_factor_sample_idx_ref.len()
+    } else {
+        operator_prepared.n_samples_full
+    };
+    let factor = sparse_splmm_load_factor(
+        prefix,
+        sparse_jxgrm_path.as_deref(),
+        sparse_expected_n,
+        sparse_factor_sample_idx_ref,
+        sigma_g2,
+        sigma_e2,
+        stage1_cb,
+    )?;
+    estimate_rhat_and_scan_sparse_to_tsv(
+        factor,
+        scan_prepared,
+        x_design,
+        y_vec,
+        scan_sample_idx,
+        gm,
+        threads,
+        block_rows,
+        rhat_markers,
+        rhat_seed,
+        chrom,
+        pos,
+        snp,
+        allele0,
+        allele1,
+        out_tsv,
+        stage1_progress_callback,
+        scan_progress_callback,
+        progress_every,
+        exact_denom,
     )
 }
 
@@ -2713,7 +2751,7 @@ pub fn splmm_sparse_grm_diag_stats<'py>(
     scan_progress_callback=None,
     progress_every=0,
     rhat_tol=1e-3,
-    force_sparse_splmm=false
+    exact_denom=false
 ))]
 pub fn splmm_assoc_pcg_bed<'py>(
     py: Python<'py>,
@@ -2746,7 +2784,7 @@ pub fn splmm_assoc_pcg_bed<'py>(
     scan_progress_callback: Option<Py<PyAny>>,
     progress_every: usize,
     rhat_tol: f64,
-    force_sparse_splmm: bool,
+    exact_denom: bool,
 ) -> PyResult<(
     f64,
     bool,
@@ -2771,6 +2809,7 @@ pub fn splmm_assoc_pcg_bed<'py>(
     if rhat_markers == 0 {
         return Err(PyRuntimeError::new_err("rhat_markers must be > 0"));
     }
+    let _ = (tol, max_iter, std_eps, use_train_maf, rhat_tol);
     emit_progress_callback(stage1_progress_callback.as_ref(), 0, 0, 1)
         .map_err(PyRuntimeError::new_err)?;
     let prepared = prepare_splmm_assoc_inputs(
@@ -2809,20 +2848,15 @@ pub fn splmm_assoc_pcg_bed<'py>(
                 prepared.gm,
                 sigma_g2,
                 sigma_e2,
-                tol,
-                max_iter,
                 block_rows,
-                std_eps,
-                use_train_maf,
                 threads,
                 rhat_markers,
                 rhat_seed,
                 stage1_progress_callback,
                 scan_progress_callback,
                 progress_every,
-                rhat_tol,
-                force_sparse_splmm,
                 sparse_jxgrm_path,
+                exact_denom,
             )
         })
         .map_err(PyRuntimeError::new_err)?;
@@ -2881,7 +2915,7 @@ pub fn splmm_assoc_pcg_bed<'py>(
     scan_progress_callback=None,
     progress_every=0,
     rhat_tol=1e-3,
-    force_sparse_splmm=false
+    exact_denom=false
 ))]
 pub fn splmm_assoc_pcg_bed_to_tsv<'py>(
     py: Python<'py>,
@@ -2920,7 +2954,7 @@ pub fn splmm_assoc_pcg_bed_to_tsv<'py>(
     scan_progress_callback: Option<Py<PyAny>>,
     progress_every: usize,
     rhat_tol: f64,
-    force_sparse_splmm: bool,
+    exact_denom: bool,
 ) -> PyResult<(f64, bool, usize, f64, bool, usize, f64, usize, usize, usize)> {
     if max_iter == 0 {
         return Err(PyRuntimeError::new_err("max_iter must be > 0"));
@@ -2960,6 +2994,34 @@ pub fn splmm_assoc_pcg_bed_to_tsv<'py>(
     )?;
     emit_progress_callback(stage1_progress_callback.as_ref(), 0, 1, 1)
         .map_err(PyRuntimeError::new_err)?;
+
+    // Auto-populate chrom/pos/snp/allele from BIM when the caller passes
+    // empty arrays (saves Python from building five large lists).
+    let (chrom, pos, snp, allele0, allele1): (Vec<String>, Vec<i64>, Vec<String>, Vec<String>, Vec<String>) =
+        if chrom.is_empty() && pos.is_empty() && snp.is_empty() && allele0.is_empty() && allele1.is_empty() {
+            let bed_prefix = normalize_plink_prefix_local(&prefix);
+            let sites = crate::gfcore::read_bim(&bed_prefix)
+                .map_err(|e| PyRuntimeError::new_err(format!("read BIM: {e}")))?;
+            let ri = prepared.scan_prepared.row_source_indices.as_ref()
+                .ok_or_else(|| PyRuntimeError::new_err("auto-populate requires row_source_indices"))?;
+            let m = prepared.scan_prepared.n_rows();
+            let mut c = Vec::with_capacity(m);
+            let mut p = Vec::with_capacity(m);
+            let mut s = Vec::with_capacity(m);
+            let mut a0 = Vec::with_capacity(m);
+            let mut a1 = Vec::with_capacity(m);
+            for &src in ri.iter() {
+                let site = &sites[src];
+                c.push(site.chrom.clone());
+                p.push(site.pos as i64);
+                s.push(site.snp.clone());
+                a0.push(site.ref_allele.clone());
+                a1.push(site.alt_allele.clone());
+            }
+            (c, p, s, a0, a1)
+        } else {
+            (chrom, pos, snp, allele0, allele1)
+        };
     if chrom.len() != prepared.scan_prepared.n_rows()
         || pos.len() != prepared.scan_prepared.n_rows()
         || snp.len() != prepared.scan_prepared.n_rows()
@@ -3003,8 +3065,8 @@ pub fn splmm_assoc_pcg_bed_to_tsv<'py>(
                 stage1_progress_callback,
                 scan_progress_callback,
                 progress_every,
-                force_sparse_splmm,
                 sparse_jxgrm_path,
+                exact_denom,
             )
         })
         .map_err(PyRuntimeError::new_err)?;
@@ -3040,7 +3102,7 @@ pub fn splmm_assoc_pcg_bed_to_tsv<'py>(
     progress_callback=None,
     progress_every=0
 ))]
-pub fn splmm_scan_exact_packed<'py>(
+pub fn splmm_scan_grammar_packed<'py>(
     py: Python<'py>,
     py_vec: PyReadonlyArray1<'py, f64>,
     r_hat: f64,
@@ -3087,7 +3149,7 @@ pub fn splmm_scan_exact_packed<'py>(
     let p = p_cov + 1;
     if n <= p {
         return Err(PyRuntimeError::new_err(format!(
-            "n must be > p for SparseLMM exact scan: n={n}, p={p}"
+            "n must be > p for SparseLMM grammar scan: n={n}, p={p}"
         )));
     }
     let xtx_chol = xtx_chol_from_design(&x_design, n, p).map_err(PyRuntimeError::new_err)?;
@@ -3145,4 +3207,522 @@ pub fn splmm_scan_exact_packed<'py>(
     let out_arr = numpy::ndarray::Array2::from_shape_vec((m, 3), out)
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     Ok(PyArray2::from_owned_array(py, out_arr))
+}
+
+/// Deprecated alias for `splmm_scan_grammar_packed`. The old name was misleading —
+/// this function has always used the GRAMMAR-gamma denominator (r_hat * g'Mg),
+/// not the exact g'Pg denominator.
+#[pyfunction]
+#[pyo3(signature = (
+    py_vec,
+    r_hat,
+    packed,
+    packed_n_samples,
+    maf,
+    row_flip,
+    x_cov=None,
+    sample_indices=None,
+    row_indices=None,
+    threads=0,
+    block_rows=0,
+    model="add",
+    progress_callback=None,
+    progress_every=0
+))]
+#[allow(non_snake_case)]
+pub fn splmm_scan_exact_packed<'py>(
+    py: Python<'py>,
+    py_vec: PyReadonlyArray1<'py, f64>,
+    r_hat: f64,
+    packed: PyReadonlyArray2<'py, u8>,
+    packed_n_samples: usize,
+    maf: PyReadonlyArray1<'py, f32>,
+    row_flip: PyReadonlyArray1<'py, bool>,
+    x_cov: Option<PyReadonlyArray2<'py, f64>>,
+    sample_indices: Option<PyReadonlyArray1<'py, i64>>,
+    row_indices: Option<PyReadonlyArray1<'py, i64>>,
+    threads: usize,
+    block_rows: usize,
+    model: &str,
+    progress_callback: Option<Py<PyAny>>,
+    progress_every: usize,
+) -> PyResult<Bound<'py, PyArray2<f64>>> {
+    use pyo3::intern;
+    let warnings = py.import(intern!(py, "warnings"))?;
+    warnings.call_method1(
+        intern!(py, "warn"),
+        ("splmm_scan_exact_packed is deprecated; use splmm_scan_grammar_packed instead",),
+    )?;
+    splmm_scan_grammar_packed(
+        py, py_vec, r_hat, packed, packed_n_samples, maf, row_flip,
+        x_cov, sample_indices, row_indices,
+        threads, block_rows, model, progress_callback, progress_every,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// gload::GenotypeMatrix adapter for JxlmmPreparedInput
+// ---------------------------------------------------------------------------
+// Zero-copy bridge: lets existing code paths call functions that expect a
+// UnifiedInput<G> without cloning the metadata vectors.  New modules should
+// construct a UnifiedInput<BedMmapMatrix> or UnifiedInput<PackedBedMatrix>
+// directly via gload::open_bed_mmap_unified() and pass that to
+// block-decode helpers.  Long-term JxlmmPreparedInput should be retired.
+
+/// Build a GlobalStats from a JxlmmPreparedInput (clones vectors once).
+fn unified_stats_from_jxlmm(p: &JxlmmPreparedInput) -> crate::gload::GlobalStats {
+    let row_source_indices = p.row_source_indices.clone().unwrap_or_else(|| {
+        (0..p.row_maf.len()).collect()
+    });
+    crate::gload::GlobalStats {
+        maf: p.row_maf.clone(),
+        miss: p.row_missing.clone(),
+        row_flip: p.row_flip.clone(),
+        row_source_indices,
+        site_keep: Vec::new(),
+        n_samples_full: p.n_samples_full,
+        n_markers_total: 0,
+        bytes_per_snp: p.bytes_per_snp,
+    }
+}
+
+/// Wraps a `&JxlmmPreparedInput` as a [`GenotypeMatrix`].
+struct JxlmmMatrixAdapter<'a> {
+    inner: &'a JxlmmPreparedInput,
+}
+
+impl GenotypeMatrix for JxlmmMatrixAdapter<'_> {
+    fn n_samples_full(&self) -> usize { self.inner.n_samples_full }
+    fn bytes_per_snp(&self) -> usize { self.inner.bytes_per_snp }
+    fn packed_flat(&self) -> &[u8] { self.inner.payload.as_bytes() }
+    fn source_row_bytes(&self, source_idx: usize) -> &[u8] {
+        let offset = source_idx.saturating_mul(self.inner.bytes_per_snp);
+        &self.inner.payload.as_bytes()[offset..][..self.inner.bytes_per_snp]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cholesky::sparse_cholesky_analyze_jxgrm_csc;
+    use crate::spgrm::SparseGrmCsc;
+
+    fn assert_close(lhs: &[f64], rhs: &[f64], tol: f64) {
+        assert_eq!(lhs.len(), rhs.len());
+        for (idx, (&a, &b)) in lhs.iter().zip(rhs.iter()).enumerate() {
+            if a.is_nan() || b.is_nan() {
+                assert!(
+                    a.is_nan() && b.is_nan(),
+                    "mismatch at {idx}: lhs={a:?}, rhs={b:?}"
+                );
+            } else {
+                assert!(
+                    (a - b).abs() <= tol,
+                    "mismatch at {idx}: lhs={a:.12e}, rhs={b:.12e}, diff={:.12e}, tol={tol:.12e}",
+                    (a - b).abs()
+                );
+            }
+        }
+    }
+
+    fn pack_plink_codes(codes: &[u8]) -> Vec<u8> {
+        let mut row = vec![0u8; codes.len().div_ceil(4)];
+        for (sample_idx, &code) in codes.iter().enumerate() {
+            row[sample_idx >> 2] |= (code & 0b11) << ((sample_idx & 3) * 2);
+        }
+        row
+    }
+
+    fn make_test_scan_prepared() -> (JxlmmPreparedInput, Vec<usize>) {
+        let source_rows = [
+            pack_plink_codes(&[0b00, 0b10, 0b11, 0b01]),
+            pack_plink_codes(&[0b10, 0b10, 0b00, 0b11]),
+            pack_plink_codes(&[0b11, 0b00, 0b10, 0b00]),
+        ];
+        let mut packed_flat = Vec::<u8>::new();
+        for row in source_rows.iter() {
+            packed_flat.extend_from_slice(row);
+        }
+        let prepared = JxlmmPreparedInput {
+            bed_prefix: None,
+            payload: JxlmmPayload::Packed(Arc::<[u8]>::from(packed_flat)),
+            n_samples_full: 4,
+            bytes_per_snp: 1,
+            row_flip: vec![false, false, false],
+            row_maf: vec![0.375, 0.5, 0.5],
+            row_missing: vec![0.0, 0.25, 0.0],
+            row_source_indices: Some(vec![2, 0, 1]),
+        };
+        let scan_sample_idx = vec![3usize, 1usize, 0usize];
+        (prepared, scan_sample_idx)
+    }
+
+    fn make_test_design() -> Vec<f64> {
+        let x_cov = vec![0.0_f64, 1.0_f64, 2.0_f64];
+        build_design_with_intercept(Some(&x_cov), 3, 1)
+    }
+
+    fn make_diag_factor(diag: &[f64]) -> SparseJxgrmCholesky {
+        let n = diag.len();
+        let csc = SparseGrmCsc {
+            n_samples: n,
+            nnz: n,
+            col_ptr: (0..=n).map(|v| v as u64).collect(),
+            row_indices: (0..n).map(|v| v as u32).collect(),
+            values: diag.to_vec(),
+        };
+        sparse_cholesky_analyze_jxgrm_csc(&csc)
+            .unwrap()
+            .factorize_diag_shifted(0.0)
+            .unwrap()
+    }
+
+    fn sample_mapping(scan_sample_idx: &[usize]) -> (bool, Option<Vec<usize>>, Option<Vec<u8>>) {
+        let sample_identity = scan_sample_idx
+            .iter()
+            .enumerate()
+            .all(|(i, &sid)| sid == i);
+        if sample_identity {
+            (true, None, None)
+        } else {
+            (
+                false,
+                Some(scan_sample_idx.iter().map(|&sid| sid >> 2).collect()),
+                Some(
+                    scan_sample_idx
+                        .iter()
+                        .map(|&sid| ((sid & 3) << 1) as u8)
+                        .collect(),
+                ),
+            )
+        }
+    }
+
+    fn decode_test_row(
+        prepared: &JxlmmPreparedInput,
+        row_idx: usize,
+        scan_sample_idx: &[usize],
+        gm: PackedGeneticModel,
+    ) -> Vec<f64> {
+        let n = scan_sample_idx.len();
+        let (sample_identity, sample_byte_idx, sample_bit_shift) = sample_mapping(scan_sample_idx);
+        let mut out = vec![0.0_f64; n];
+        decode_packed_row_model_into_f64(
+            prepared.row_bytes(row_idx),
+            prepared.row_flip[row_idx],
+            prepared.row_maf[row_idx],
+            n,
+            gm,
+            sample_identity,
+            sample_byte_idx.as_deref(),
+            sample_bit_shift.as_deref(),
+            &mut out,
+        );
+        out
+    }
+
+    fn manual_grammar_scan(
+        prepared: &JxlmmPreparedInput,
+        x_design: &[f64],
+        py_vec: &[f64],
+        xtx_chol: &[f64],
+        scan_sample_idx: &[usize],
+        gm: PackedGeneticModel,
+        r_hat: f64,
+    ) -> Vec<f64> {
+        let n = py_vec.len();
+        let p = x_design.len() / n;
+        let mut out = vec![0.0_f64; prepared.n_rows() * 3];
+        let mut xts = vec![0.0_f64; p];
+        let mut alpha = vec![0.0_f64; p];
+        for row_idx in 0..prepared.n_rows() {
+            let g = decode_test_row(prepared, row_idx, scan_sample_idx, gm);
+            xts.fill(0.0);
+            let mut spy = 0.0_f64;
+            let mut s_sq = 0.0_f64;
+            for i in 0..n {
+                let gi = g[i];
+                spy += gi * py_vec[i];
+                s_sq += gi * gi;
+                let x_row = &x_design[i * p..(i + 1) * p];
+                for j in 0..p {
+                    xts[j] += x_row[j] * gi;
+                }
+            }
+            cholesky_solve_into(xtx_chol, p, &xts, &mut alpha);
+            let x_quad = xts
+                .iter()
+                .zip(alpha.iter())
+                .map(|(a, b)| a * b)
+                .sum::<f64>();
+            let denom = r_hat * (s_sq - x_quad).max(0.0_f64);
+            let out_row = &mut out[row_idx * 3..(row_idx + 1) * 3];
+            if denom.is_finite() && denom > SPLMM_TINY {
+                out_row[0] = spy / denom;
+                out_row[1] = 1.0_f64 / denom.sqrt();
+                out_row[2] = chi2_sf_df1((spy * spy) / denom);
+            } else {
+                out_row[0] = f64::NAN;
+                out_row[1] = f64::NAN;
+                out_row[2] = 1.0_f64;
+            }
+        }
+        out
+    }
+
+    fn compute_xt_v_inv_x_chol(
+        factor: &SparseJxgrmCholesky,
+        x_design: &[f64],
+        n: usize,
+        p: usize,
+    ) -> Vec<f64> {
+        let x_col = row_major_to_col_major_f64(x_design, n, p).unwrap();
+        let mut workspace = factor.make_solve_workspace(p.max(1)).unwrap();
+        let x_v_inv_col =
+            sparse_solve_rhs_with_workspace(factor, &x_col, p, &mut workspace).unwrap();
+        let x_v_inv_row = col_major_to_row_major_f64(&x_v_inv_col, n, p).unwrap();
+        let mut xt_v_inv_x = vec![0.0_f64; p * p];
+        xt_mat_row_major(x_design, &x_v_inv_row, n, p, p, &mut xt_v_inv_x);
+        spd_cholesky_with_jitter(&xt_v_inv_x, p, "test XtVinvX").unwrap()
+    }
+
+    fn manual_exact_scan(
+        factor: &SparseJxgrmCholesky,
+        prepared: &JxlmmPreparedInput,
+        x_design: &[f64],
+        py_vec: &[f64],
+        xt_v_inv_x_chol: &[f64],
+        scan_sample_idx: &[usize],
+        gm: PackedGeneticModel,
+    ) -> Vec<f64> {
+        let n = py_vec.len();
+        let p = x_design.len() / n;
+        let mut out = vec![0.0_f64; prepared.n_rows() * 3];
+        let mut c_j = vec![0.0_f64; p];
+        let mut alpha = vec![0.0_f64; p];
+        for row_idx in 0..prepared.n_rows() {
+            let g = decode_test_row(prepared, row_idx, scan_sample_idx, gm);
+            let z = factor.solve_vec(&g).unwrap();
+            let spy = g
+                .iter()
+                .zip(py_vec.iter())
+                .map(|(a, b)| a * b)
+                .sum::<f64>();
+            let s_v_s = g.iter().zip(z.iter()).map(|(a, b)| a * b).sum::<f64>();
+            xt_vec_row_major(x_design, n, p, &z, &mut c_j);
+            cholesky_solve_into(xt_v_inv_x_chol, p, &c_j, &mut alpha);
+            let x_quad = c_j
+                .iter()
+                .zip(alpha.iter())
+                .map(|(a, b)| a * b)
+                .sum::<f64>();
+            let denom = (s_v_s - x_quad).max(0.0_f64);
+            let out_row = &mut out[row_idx * 3..(row_idx + 1) * 3];
+            if denom.is_finite() && denom > SPLMM_TINY {
+                out_row[0] = spy / denom;
+                out_row[1] = 1.0_f64 / denom.sqrt();
+                out_row[2] = chi2_sf_df1((spy * spy) / denom);
+            } else {
+                out_row[0] = f64::NAN;
+                out_row[1] = f64::NAN;
+                out_row[2] = 1.0_f64;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn row_major_snp_block_f32_to_col_major_f64_is_widening_copy() {
+        let block = vec![1.0_f32, 2.0_f32, 3.0_f32, 4.0_f32, 5.0_f32, 6.0_f32];
+        let mut out = vec![0.0_f64; block.len()];
+        row_major_snp_block_f32_to_col_major_f64(&block, 2, 3, &mut out);
+        assert_eq!(out, vec![1.0_f64, 2.0_f64, 3.0_f64, 4.0_f64, 5.0_f64, 6.0_f64]);
+    }
+
+    #[test]
+    fn xt_mat_rhs_block_matches_naive_reference() {
+        let n = 3usize;
+        let p = 2usize;
+        let rows_here = 2usize;
+        let x_design = vec![
+            1.0_f64, 2.0_f64, //
+            3.0_f64, 4.0_f64, //
+            5.0_f64, 6.0_f64,
+        ];
+        let z_col_major = vec![
+            10.0_f64, 11.0_f64, 12.0_f64, //
+            20.0_f64, 21.0_f64, 22.0_f64,
+        ];
+        let mut got = vec![0.0_f64; rows_here * p];
+        xt_mat_rhs_block(&x_design, &z_col_major, n, p, rows_here, &mut got);
+        let expected = vec![
+            103.0_f64, 136.0_f64, //
+            193.0_f64, 256.0_f64,
+        ];
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn grammar_scan_core_matches_wrapper_and_manual_reference() {
+        let (prepared, scan_sample_idx) = make_test_scan_prepared();
+        let x_design = make_test_design();
+        let py_vec = vec![0.4_f64, -1.0_f64, 0.8_f64];
+        let xtx_chol = xtx_chol_from_design(&x_design, py_vec.len(), 2).unwrap();
+        let r_hat = 1.7_f64;
+
+        let wrapper = scan_with_py_and_rhat(
+            &prepared,
+            &x_design,
+            &py_vec,
+            &xtx_chol,
+            &scan_sample_idx,
+            PackedGeneticModel::Add,
+            r_hat,
+            1,
+            0,
+            None,
+            2,
+            9,
+        )
+        .unwrap();
+
+        let adapter = JxlmmMatrixAdapter { inner: &prepared };
+        let stats = unified_stats_from_jxlmm(&prepared);
+        let input = UnifiedInput { matrix: adapter, stats };
+        let mut core = vec![0.0_f64; prepared.n_rows() * 3];
+        let mut sink = |row_start: usize, rows_here: usize, block: &[f64]| {
+            core[row_start * 3..][..rows_here * 3].copy_from_slice(block);
+            Ok(())
+        };
+        grammar_scan_blocks_core(
+            &input,
+            &x_design,
+            &py_vec,
+            &xtx_chol,
+            &scan_sample_idx,
+            PackedGeneticModel::Add,
+            r_hat,
+            1,
+            0,
+            None,
+            2,
+            9,
+            &mut sink,
+        )
+        .unwrap();
+
+        let manual = manual_grammar_scan(
+            &prepared,
+            &x_design,
+            &py_vec,
+            &xtx_chol,
+            &scan_sample_idx,
+            PackedGeneticModel::Add,
+            r_hat,
+        );
+
+        assert_close(&core, &wrapper, 1e-8_f64);
+        assert_close(&core, &manual, 1e-5_f64);
+    }
+
+    #[test]
+    fn exact_scan_core_matches_wrapper_and_manual_reference() {
+        let (prepared, scan_sample_idx) = make_test_scan_prepared();
+        let x_design = make_test_design();
+        let py_vec = vec![0.3_f64, -0.8_f64, 0.6_f64];
+        let factor = make_diag_factor(&[2.0_f64, 3.0_f64, 4.0_f64]);
+        let xt_v_inv_x_chol = compute_xt_v_inv_x_chol(&factor, &x_design, py_vec.len(), 2);
+
+        let mut workspace_wrapper = factor.make_solve_workspace(2).unwrap();
+        let wrapper = scan_with_py_and_exact_pg_sparse(
+            &factor,
+            &prepared,
+            &x_design,
+            &py_vec,
+            &xt_v_inv_x_chol,
+            &scan_sample_idx,
+            PackedGeneticModel::Add,
+            1,
+            0,
+            None,
+            2,
+            9,
+            &mut workspace_wrapper,
+        )
+        .unwrap();
+
+        let mut workspace_core = factor.make_solve_workspace(2).unwrap();
+        let mut core = vec![0.0_f64; prepared.n_rows() * 3];
+        let mut sink = |row_start: usize, rows_here: usize, block: &[f64]| {
+            core[row_start * 3..][..rows_here * 3].copy_from_slice(block);
+            Ok(())
+        };
+        let adapter = JxlmmMatrixAdapter { inner: &prepared };
+        let stats = unified_stats_from_jxlmm(&prepared);
+        let input = UnifiedInput { matrix: adapter, stats };
+        exact_scan_blocks_core(
+            &factor,
+            &input,
+            &x_design,
+            &py_vec,
+            &xt_v_inv_x_chol,
+            &scan_sample_idx,
+            PackedGeneticModel::Add,
+            1,
+            0,
+            None,
+            2,
+            9,
+            &mut workspace_core,
+            &mut sink,
+        )
+        .unwrap();
+
+        let manual = manual_exact_scan(
+            &factor,
+            &prepared,
+            &x_design,
+            &py_vec,
+            &xt_v_inv_x_chol,
+            &scan_sample_idx,
+            PackedGeneticModel::Add,
+        );
+
+        assert_close(&core, &wrapper, 1e-8_f64);
+        assert_close(&core, &manual, 1e-5_f64);
+    }
+
+    #[test]
+    fn estimate_rhat_and_scan_sparse_exact_denom_supports_block_rows_zero() {
+        let (prepared, scan_sample_idx) = make_test_scan_prepared();
+        let x_design = make_test_design();
+        let y_vec = vec![0.5_f64, -1.0_f64, 1.25_f64];
+        let factor = make_diag_factor(&[2.0_f64, 3.0_f64, 4.0_f64]);
+
+        let (r_hat, out, null_info, rhat_info) = estimate_rhat_and_scan_sparse(
+            factor,
+            prepared,
+            x_design,
+            y_vec,
+            scan_sample_idx,
+            PackedGeneticModel::Add,
+            1,
+            0,
+            2,
+            20260604_u64,
+            None,
+            None,
+            0,
+            true,
+        )
+        .unwrap();
+
+        assert!(r_hat.is_finite() && r_hat > 0.0);
+        assert_eq!(out.len(), 9);
+        assert!(out.iter().all(|v| v.is_finite() || v.is_nan()));
+        assert!(null_info.v_inv_y.converged);
+        assert!(null_info.v_inv_x.converged_all);
+        assert_eq!(rhat_info.n_markers_requested, 2);
+        assert!(rhat_info.n_markers_used > 0);
+    }
 }

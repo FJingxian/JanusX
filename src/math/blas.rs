@@ -2941,20 +2941,10 @@ pub(crate) fn prewarm_eigh_openblas_dyn_runtime() {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
-#[inline]
-pub(crate) fn prewarm_eigh_openblas_dyn_runtime() {}
-
 #[cfg(target_os = "macos")]
 #[inline]
 pub(crate) fn macos_eigh_uses_openblas_dyn() -> bool {
     should_try_openblas_lapack_on_macos() && openblas_lapack_dyn().is_some()
-}
-
-#[cfg(not(target_os = "macos"))]
-#[inline]
-pub(crate) fn macos_eigh_uses_openblas_dyn() -> bool {
-    false
 }
 
 #[cfg(target_os = "macos")]
@@ -2975,12 +2965,6 @@ fn macos_openblas_dyn_current_threads() -> isize {
             return v as isize;
         }
     }
-    -1
-}
-
-#[cfg(not(target_os = "macos"))]
-#[inline]
-fn macos_openblas_dyn_current_threads() -> isize {
     -1
 }
 

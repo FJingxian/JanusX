@@ -22,7 +22,7 @@ use self::permutation::{
     DEFAULT_RULE_STRUCTURE_BOOTSTRAP_STABLE_REPEATS, DEFAULT_RULE_STRUCTURE_DENSITY_TOPK,
 };
 use crate::beam::{beam_search_and_binary_mcc, beam_search_and_continuous_abs_corr, BeamAndResult};
-use crate::bitwise::bitand_assign;
+use crate::bitwise::{bitand_assign, bitnot_masked};
 use crate::gfcore::{
     process_snp_row, read_fam, BedSnpIter, HmpSnpIter, SiteInfo, TxtSnpIter, VcfSnpIter,
 };
@@ -81,6 +81,7 @@ pub use score::{
     score_cont_centered_gain_packed_with_sum, score_cont_corr_packed, score_cont_corr_py,
     score_cont_mean_diff_corr_batch_py, score_cont_mean_diff_py,
     score_cont_weighted_mean_diff_packed, ContinuousRuleScore,
+    support_size_packed,
 };
 pub use score_gpu::{
     garfield_compare_score_cont_centered_gain_batch_metal_vs_cpu_py,
@@ -2337,6 +2338,12 @@ struct GarfieldLogicRuleRecord {
     full_bits: Vec<u64>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GarfieldRuleDisplayPolarity {
+    OriginalAnd,
+    ComplementOr,
+}
+
 #[derive(Clone, Debug)]
 struct GarfieldLogicPipelineResult {
     pseudo_prefix: Option<String>,
@@ -2455,6 +2462,169 @@ fn literal_metric_token(value: f64, negated: bool) -> String {
     }
 }
 
+#[inline]
+fn logic_symbol_for_display(_op: BeamBinaryOp, polarity: GarfieldRuleDisplayPolarity) -> &'static str {
+    match polarity {
+        GarfieldRuleDisplayPolarity::OriginalAnd => "&",
+        GarfieldRuleDisplayPolarity::ComplementOr => "|",
+    }
+}
+
+#[inline]
+fn expr_symbol_for_display(_op: BeamBinaryOp, polarity: GarfieldRuleDisplayPolarity) -> &'static str {
+    match polarity {
+        GarfieldRuleDisplayPolarity::OriginalAnd => "AND",
+        GarfieldRuleDisplayPolarity::ComplementOr => "OR",
+    }
+}
+
+#[inline]
+fn display_literal_negated(
+    literal_negated: bool,
+    polarity: GarfieldRuleDisplayPolarity,
+) -> bool {
+    match polarity {
+        GarfieldRuleDisplayPolarity::OriginalAnd => literal_negated,
+        GarfieldRuleDisplayPolarity::ComplementOr => !literal_negated,
+    }
+}
+
+#[inline]
+fn complement_bits_in_place(bits: &mut [u64], n_samples: usize) {
+    bitnot_masked(bits, n_samples);
+}
+
+#[inline]
+fn preferred_display_polarity(
+    rule: &BeamRule,
+    full_bits: &[u64],
+    n_samples: usize,
+) -> GarfieldRuleDisplayPolarity {
+    let orig_not = rule.not_count();
+    let comp_not = rule.len().saturating_sub(orig_not);
+    if comp_not < orig_not {
+        return GarfieldRuleDisplayPolarity::ComplementOr;
+    }
+    if comp_not > orig_not {
+        return GarfieldRuleDisplayPolarity::OriginalAnd;
+    }
+    let n_hit = support_size_packed(full_bits, n_samples);
+    let n_miss = n_samples.saturating_sub(n_hit);
+    if n_miss < n_hit {
+        GarfieldRuleDisplayPolarity::ComplementOr
+    } else {
+        GarfieldRuleDisplayPolarity::OriginalAnd
+    }
+}
+
+fn rule_expr_with_polarity(
+    rule: &BeamRule,
+    local_sites: &[SiteInfo],
+    polarity: GarfieldRuleDisplayPolarity,
+) -> Result<String, String> {
+    let first = local_sites
+        .get(rule.first.row_index)
+        .ok_or_else(|| format!("rule row index out of range: {}", rule.first.row_index))?;
+    let mut out = literal_expr(
+        first,
+        display_literal_negated(rule.first.negated, polarity),
+    );
+    for (op, lit) in rule.rest.iter() {
+        let site = local_sites
+            .get(lit.row_index)
+            .ok_or_else(|| format!("rule row index out of range: {}", lit.row_index))?;
+        out.push(' ');
+        out.push_str(expr_symbol_for_display(*op, polarity));
+        out.push(' ');
+        out.push_str(&literal_expr(
+            site,
+            display_literal_negated(lit.negated, polarity),
+        ));
+    }
+    Ok(out)
+}
+
+fn rule_snp_name_with_polarity(
+    rule: &BeamRule,
+    local_sites: &[SiteInfo],
+    polarity: GarfieldRuleDisplayPolarity,
+) -> Result<String, String> {
+    let first = local_sites
+        .get(rule.first.row_index)
+        .ok_or_else(|| format!("rule row index out of range: {}", rule.first.row_index))?;
+    let mut out = literal_name(
+        first,
+        display_literal_negated(rule.first.negated, polarity),
+    );
+    for (op, lit) in rule.rest.iter() {
+        let site = local_sites
+            .get(lit.row_index)
+            .ok_or_else(|| format!("rule row index out of range: {}", lit.row_index))?;
+        out.push_str(logic_symbol_for_display(*op, polarity));
+        out.push_str(&literal_name(
+            site,
+            display_literal_negated(lit.negated, polarity),
+        ));
+    }
+    Ok(out)
+}
+
+fn rule_bim_name_with_polarity(
+    rule: &BeamRule,
+    local_sites: &[SiteInfo],
+    polarity: GarfieldRuleDisplayPolarity,
+) -> Result<String, String> {
+    rule_snp_name_with_polarity(rule, local_sites, polarity)
+}
+
+fn rule_bim_alleles_with_polarity(
+    rule: &BeamRule,
+    local_sites: &[SiteInfo],
+    polarity: GarfieldRuleDisplayPolarity,
+) -> Result<(String, String), String> {
+    let mut allele0 = Vec::<String>::with_capacity(rule.len());
+    let mut allele1 = Vec::<String>::with_capacity(rule.len());
+    let first = local_sites
+        .get(rule.first.row_index)
+        .ok_or_else(|| format!("rule row index out of range: {}", rule.first.row_index))?;
+    let (a0, a1) = literal_bim_alleles(
+        first,
+        display_literal_negated(rule.first.negated, polarity),
+    );
+    allele0.push(a0);
+    allele1.push(a1);
+    for (_, lit) in rule.rest.iter() {
+        let site = local_sites
+            .get(lit.row_index)
+            .ok_or_else(|| format!("rule row index out of range: {}", lit.row_index))?;
+        let (a0, a1) = literal_bim_alleles(
+            site,
+            display_literal_negated(lit.negated, polarity),
+        );
+        allele0.push(a0);
+        allele1.push(a1);
+    }
+    Ok((allele0.join(","), allele1.join(",")))
+}
+
+fn rule_ml_rank_name_with_polarity(
+    rule: &BeamRule,
+    polarity: GarfieldRuleDisplayPolarity,
+) -> String {
+    let mut out = literal_ml_rank_name(
+        rule.first.row_index,
+        display_literal_negated(rule.first.negated, polarity),
+    );
+    for (op, lit) in rule.rest.iter() {
+        out.push_str(logic_symbol_for_display(*op, polarity));
+        out.push_str(&literal_ml_rank_name(
+            lit.row_index,
+            display_literal_negated(lit.negated, polarity),
+        ));
+    }
+    out
+}
+
 fn build_rule_delta_annotations(
     rule: &BeamRule,
     child_score: f64,
@@ -2470,17 +2640,22 @@ fn build_rule_delta_annotations(
     n_full: usize,
     assoc_sample_indices: &[usize],
     params: &BeamSearchParams,
+    polarity: GarfieldRuleDisplayPolarity,
 ) -> Result<(String, String), String> {
     let mut score_txt = String::new();
     let mut pwald_txt = String::new();
 
     let mut append_literal = |op: Option<BeamBinaryOp>, lit: BeamLiteral| -> Result<(), String> {
         if let Some(op_use) = op {
-            let sym = logic_symbol_compact(op_use);
+            let sym = logic_symbol_for_display(op_use, polarity);
             score_txt.push_str(sym);
             pwald_txt.push_str(sym);
         }
-        let singleton = singleton_rule_from_literal(lit);
+        let display_lit = BeamLiteral {
+            negated: display_literal_negated(lit.negated, polarity),
+            ..lit
+        };
+        let singleton = singleton_rule_from_literal(display_lit);
         let test_sc = evaluate_rule_continuous(
             &singleton,
             y_test,
@@ -2508,8 +2683,8 @@ fn build_rule_delta_annotations(
             singleton_bits.as_slice(),
             assoc_sample_indices,
         );
-        score_txt.push_str(&literal_metric_token(single_score, lit.negated));
-        pwald_txt.push_str(&literal_metric_token(single_assoc.pwald, lit.negated));
+        score_txt.push_str(&literal_metric_token(single_score, display_lit.negated));
+        pwald_txt.push_str(&literal_metric_token(single_assoc.pwald, display_lit.negated));
         Ok(())
     };
 
@@ -3762,11 +3937,6 @@ fn literal_name(site: &SiteInfo, negated: bool) -> String {
 }
 
 #[inline]
-fn logic_symbol_compact(_op: BeamBinaryOp) -> &'static str {
-    "&" // AND-only
-}
-
-#[inline]
 fn simbench_logic_symbol_compact(logic: SimBenchLogic) -> &'static str {
     match logic {
         SimBenchLogic::Single => "",
@@ -3796,41 +3966,6 @@ fn literal_bim_alleles(site: &SiteInfo, negated: bool) -> (String, String) {
     }
 }
 
-fn rule_bim_name(rule: &BeamRule, local_sites: &[SiteInfo]) -> Result<String, String> {
-    let first = local_sites
-        .get(rule.first.row_index)
-        .ok_or_else(|| format!("rule row index out of range: {}", rule.first.row_index))?;
-    let mut out = literal_name(first, rule.first.negated);
-    for (op, lit) in rule.rest.iter() {
-        let site = local_sites
-            .get(lit.row_index)
-            .ok_or_else(|| format!("rule row index out of range: {}", lit.row_index))?;
-        out.push_str(logic_symbol_compact(*op));
-        out.push_str(&literal_name(site, lit.negated));
-    }
-    Ok(out)
-}
-
-fn rule_bim_alleles(rule: &BeamRule, local_sites: &[SiteInfo]) -> Result<(String, String), String> {
-    let mut allele0 = Vec::<String>::with_capacity(rule.len());
-    let mut allele1 = Vec::<String>::with_capacity(rule.len());
-    let first = local_sites
-        .get(rule.first.row_index)
-        .ok_or_else(|| format!("rule row index out of range: {}", rule.first.row_index))?;
-    let (a0, a1) = literal_bim_alleles(first, rule.first.negated);
-    allele0.push(a0);
-    allele1.push(a1);
-    for (_, lit) in rule.rest.iter() {
-        let site = local_sites
-            .get(lit.row_index)
-            .ok_or_else(|| format!("rule row index out of range: {}", lit.row_index))?;
-        let (a0, a1) = literal_bim_alleles(site, lit.negated);
-        allele0.push(a0);
-        allele1.push(a1);
-    }
-    Ok((allele0.join(","), allele1.join(",")))
-}
-
 #[inline]
 fn literal_ml_rank_name(row_index: usize, negated: bool) -> String {
     let rank = row_index.saturating_add(1);
@@ -3839,50 +3974,6 @@ fn literal_ml_rank_name(row_index: usize, negated: bool) -> String {
     } else {
         rank.to_string()
     }
-}
-
-fn rule_expr(rule: &BeamRule, local_sites: &[SiteInfo]) -> Result<String, String> {
-    let first = local_sites
-        .get(rule.first.row_index)
-        .ok_or_else(|| format!("rule row index out of range: {}", rule.first.row_index))?;
-    let mut out = literal_expr(first, rule.first.negated);
-    for (_op, lit) in rule.rest.iter() {
-        let site = local_sites
-            .get(lit.row_index)
-            .ok_or_else(|| format!("rule row index out of range: {}", lit.row_index))?;
-        let op_txt = "AND"; // AND-only
-        out.push(' ');
-        out.push_str(op_txt);
-        out.push(' ');
-        out.push_str(&literal_expr(site, lit.negated));
-    }
-    Ok(out)
-}
-
-fn rule_snp_name(rule: &BeamRule, local_sites: &[SiteInfo]) -> Result<String, String> {
-    let first = local_sites
-        .get(rule.first.row_index)
-        .ok_or_else(|| format!("rule row index out of range: {}", rule.first.row_index))?;
-    let mut out = literal_name(first, rule.first.negated);
-    for (_op, lit) in rule.rest.iter() {
-        let site = local_sites
-            .get(lit.row_index)
-            .ok_or_else(|| format!("rule row index out of range: {}", lit.row_index))?;
-        let op_txt = " & "; // AND-only
-        out.push_str(op_txt);
-        out.push_str(&literal_name(site, lit.negated));
-    }
-    Ok(out)
-}
-
-fn rule_ml_rank_name(rule: &BeamRule) -> String {
-    let mut out = literal_ml_rank_name(rule.first.row_index, rule.first.negated);
-    for (_op, lit) in rule.rest.iter() {
-        let op_txt = " & "; // AND-only
-        out.push_str(op_txt);
-        out.push_str(&literal_ml_rank_name(lit.row_index, lit.negated));
-    }
-    out
 }
 
 fn rule_selected_global_rows(
@@ -5746,21 +5837,31 @@ fn evaluate_logic_unit_prepared_continuous(
         if !keep {
             continue;
         }
-        let expr = rule_expr(&cand.rule, prepared.local_sites.as_slice())?;
-        let snp_name = rule_snp_name(&cand.rule, prepared.local_sites.as_slice())?;
-        let bim_snp_name = rule_bim_name(&cand.rule, prepared.local_sites.as_slice())?;
-        let (bim_allele0, bim_allele1) =
-            rule_bim_alleles(&cand.rule, prepared.local_sites.as_slice())?;
         let first_site = prepared
             .local_sites
             .get(cand.rule.first.row_index)
             .ok_or_else(|| "beam result first row index out of range".to_string())?;
-        let full_bits = materialize_rule_bits(
+        let mut full_bits = materialize_rule_bits(
             &cand.rule,
             prepared.selected_bits_full.as_slice(),
             logic_bits.row_words,
             prepared.selected_global_rows.len(),
             logic_bits.n_samples,
+        )?;
+        let polarity =
+            preferred_display_polarity(&cand.rule, full_bits.as_slice(), logic_bits.n_samples);
+        if matches!(polarity, GarfieldRuleDisplayPolarity::ComplementOr) {
+            complement_bits_in_place(full_bits.as_mut_slice(), logic_bits.n_samples);
+        }
+        let expr = rule_expr_with_polarity(&cand.rule, prepared.local_sites.as_slice(), polarity)?;
+        let snp_name =
+            rule_snp_name_with_polarity(&cand.rule, prepared.local_sites.as_slice(), polarity)?;
+        let bim_snp_name =
+            rule_bim_name_with_polarity(&cand.rule, prepared.local_sites.as_slice(), polarity)?;
+        let (bim_allele0, bim_allele1) = rule_bim_alleles_with_polarity(
+            &cand.rule,
+            prepared.local_sites.as_slice(),
+            polarity,
         )?;
         let assoc =
             fit_binary_rule_wald_from_bits(assoc_y, full_bits.as_slice(), assoc_sample_indices);
@@ -5779,6 +5880,7 @@ fn evaluate_logic_unit_prepared_continuous(
             logic_bits.n_samples,
             assoc_sample_indices,
             &beam_params,
+            polarity,
         )?;
         let selected_row_indices =
             rule_selected_global_rows(&cand.rule, prepared.selected_global_rows.as_slice())?;
@@ -5788,7 +5890,7 @@ fn evaluate_logic_unit_prepared_continuous(
             unit_index: ui + 1,
             region_size: unit.indices.len(),
             ml_feature_count: prepared.selected_global_rows.len(),
-            ml_rank: rule_ml_rank_name(&cand.rule),
+            ml_rank: rule_ml_rank_name_with_polarity(&cand.rule, polarity),
             selected_row_indices,
             snp_name,
             expr,
@@ -9204,6 +9306,120 @@ mod tests {
         apply_logic_rule_output_limit(&mut records, 2, 0.0).unwrap();
         assert_eq!(records.len(), 3);
         assert_eq!(records[1].score, records[2].score);
+    }
+
+    #[test]
+    fn test_preferred_display_polarity_prefers_complement_for_all_negated_rule() {
+        let rule = BeamRule {
+            first: BeamLiteral {
+                row_index: 0,
+                group_id: 0,
+                negated: true,
+            },
+            rest: vec![(
+                BeamBinaryOp::And,
+                BeamLiteral {
+                    row_index: 1,
+                    group_id: 1,
+                    negated: true,
+                },
+            )],
+        };
+        let full_bits = vec![0b0011u64];
+        let polarity = preferred_display_polarity(&rule, full_bits.as_slice(), 4);
+        assert_eq!(polarity, GarfieldRuleDisplayPolarity::ComplementOr);
+    }
+
+    #[test]
+    fn test_rule_display_polarity_rewrites_not_not_and_to_positive_or() {
+        let sites = vec![test_site("1", 100), test_site("1", 200)];
+        let rule = BeamRule {
+            first: BeamLiteral {
+                row_index: 0,
+                group_id: 0,
+                negated: true,
+            },
+            rest: vec![(
+                BeamBinaryOp::And,
+                BeamLiteral {
+                    row_index: 1,
+                    group_id: 1,
+                    negated: true,
+                },
+            )],
+        };
+        let polarity = GarfieldRuleDisplayPolarity::ComplementOr;
+        let expr = rule_expr_with_polarity(&rule, sites.as_slice(), polarity).unwrap();
+        let snp_name = rule_snp_name_with_polarity(&rule, sites.as_slice(), polarity).unwrap();
+        let bim_name = rule_bim_name_with_polarity(&rule, sites.as_slice(), polarity).unwrap();
+        let ml_rank = rule_ml_rank_name_with_polarity(&rule, polarity);
+        let (a0, a1) = rule_bim_alleles_with_polarity(&rule, sites.as_slice(), polarity).unwrap();
+
+        assert_eq!(expr, "BIN(1_100) OR BIN(1_200)");
+        assert_eq!(snp_name, "1_100|1_200");
+        assert_eq!(bim_name, "1_100|1_200");
+        assert_eq!(ml_rank, "1|2");
+        assert_eq!(a0, "A,A");
+        assert_eq!(a1, "G,G");
+    }
+
+    #[test]
+    fn test_dedup_logic_rule_records_prefers_canonical_fewer_not_same_support() {
+        let full_bits = vec![0b1010u64];
+        let records = vec![
+            GarfieldLogicRuleRecord {
+                unit_name: "u_not".to_string(),
+                unit_kind: "window".to_string(),
+                unit_index: 1,
+                region_size: 2,
+                ml_feature_count: 2,
+                ml_rank: "!1&!2".to_string(),
+                selected_row_indices: vec![0, 1],
+                snp_name: "!1_100&!1_200".to_string(),
+                expr: "NOT BIN(1_100) AND NOT BIN(1_200)".to_string(),
+                chrom_field: "1".to_string(),
+                bim_snp_name: "!1_100&!1_200".to_string(),
+                bim_allele0: "G,G".to_string(),
+                bim_allele1: "A,A".to_string(),
+                pos: 100,
+                beta: 0.1,
+                se: 0.1,
+                chisq: 1.0,
+                pwald: 1e-3,
+                score: 5.0,
+                delta_score: "0.1&0.2->5.0".to_string(),
+                delta_pwald: "0.1&0.2->1e-3".to_string(),
+                full_bits: full_bits.clone(),
+            },
+            GarfieldLogicRuleRecord {
+                unit_name: "u_pos".to_string(),
+                unit_kind: "window".to_string(),
+                unit_index: 1,
+                region_size: 2,
+                ml_feature_count: 2,
+                ml_rank: "1|2".to_string(),
+                selected_row_indices: vec![0, 1],
+                snp_name: "1_100|1_200".to_string(),
+                expr: "BIN(1_100) OR BIN(1_200)".to_string(),
+                chrom_field: "1".to_string(),
+                bim_snp_name: "1_100|1_200".to_string(),
+                bim_allele0: "A,A".to_string(),
+                bim_allele1: "G,G".to_string(),
+                pos: 100,
+                beta: 0.1,
+                se: 0.1,
+                chisq: 1.0,
+                pwald: 1e-3,
+                score: 5.0,
+                delta_score: "0.1|0.2->5.0".to_string(),
+                delta_pwald: "0.1|0.2->1e-3".to_string(),
+                full_bits,
+            },
+        ];
+        let deduped = dedup_logic_rule_records(records);
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0].snp_name, "1_100|1_200");
+        assert_eq!(deduped[0].expr, "BIN(1_100) OR BIN(1_200)");
     }
 
     fn test_site(chrom: &str, pos: i32) -> SiteInfo {

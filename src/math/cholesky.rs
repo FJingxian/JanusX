@@ -900,7 +900,7 @@ impl SparseJxgrmCholeskyAnalysis {
 
     fn factorize_from_perm_values(
         &self,
-        perm_values: Vec<f64>,
+        perm_values: &[f64],
     ) -> Result<SparseJxgrmCholesky, String> {
         let a_perm_lower = SparseColMatRef::<usize, f64>::new(
             unsafe {
@@ -912,7 +912,7 @@ impl SparseJxgrmCholeskyAnalysis {
                     &self.base_perm_row_indices,
                 )
             },
-            perm_values.as_slice(),
+            perm_values,
         );
         let mut l_values = vec![0.0_f64; self.symbolic.len_values()];
         let mut numeric_mem = GlobalPodBuffer::try_new(
@@ -955,11 +955,47 @@ impl SparseJxgrmCholeskyAnalysis {
                 perm_values[idx] += diag_shift;
             }
         }
-        self.factorize_from_perm_values(perm_values)
+        self.factorize_from_perm_values(&perm_values)
+    }
+
+    pub fn base_perm_values(&self) -> &[f64] {
+        &self.base_perm_values
     }
 
     pub fn factorize_k_plus_lambda_i(&self, lambda: f64) -> Result<SparseJxgrmCholesky, String> {
         self.factorize_diag_shifted(lambda)
+    }
+
+    /// Like factorize_k_plus_lambda_i but writes into `buf` instead of cloning
+    /// base_perm_values internally.  Caller must ensure `buf.len() ==
+    /// self.base_perm_values.len()`.
+    pub fn factorize_k_plus_lambda_i_buffered(
+        &self,
+        lambda: f64,
+        buf: &mut [f64],
+    ) -> Result<SparseJxgrmCholesky, String> {
+        if !lambda.is_finite() || lambda < 0.0 {
+            return Err(format!(
+                "Sparse Cholesky buffered factorization requires finite non-negative lambda, got {lambda}"
+            ));
+        }
+        if buf.len() != self.base_perm_values.len() {
+            return Err(format!(
+                "Sparse Cholesky buffered factorization buffer length mismatch: got {}, expected {}",
+                buf.len(),
+                self.base_perm_values.len()
+            ));
+        }
+        buf.copy_from_slice(&self.base_perm_values);
+        if lambda != 0.0 {
+            for &idx in self.diag_positions.iter() {
+                buf[idx] += lambda;
+            }
+        }
+        let result = self.factorize_from_perm_values(buf);
+        // buf now holds shifted values; restore original for next iteration.
+        buf.copy_from_slice(&self.base_perm_values);
+        result
     }
 
     pub fn factorize_sigma_g2_k_plus_sigma_e2_i(
@@ -995,7 +1031,7 @@ impl SparseJxgrmCholeskyAnalysis {
                 perm_values[idx] += sigma_e2 + diag_shift;
             }
         }
-        self.factorize_from_perm_values(perm_values)
+        self.factorize_from_perm_values(&perm_values)
     }
 }
 
@@ -1086,6 +1122,87 @@ impl SparseJxgrmCholesky {
         llt.solve_in_place_with_conj(Conj::No, rhs.rb_mut(), Parallelism::None, stack.rb_mut());
         faer::perm::permute_rows_in_place(rhs.rb_mut(), perm.inverse(), stack.rb_mut());
         Ok(())
+    }
+
+    /// Solve V·X = B for n_rhs right-hand sides, tiling columns across `workspaces`
+    /// (one per tile).  When `pool` is provided, tiles are dispatched on that
+    /// pool (via `pool.install` + `par_iter_mut`); otherwise the global rayon
+    /// pool is used.
+    ///
+    /// The L factor is shared read-only; all tiles traverse the same
+    /// elimination tree, so L1/L2/L3 cache is naturally shared.
+    ///
+    /// Each workspace element must have `n_rhs_capacity >= (cols in that tile)`;
+    /// work items are also validated for `workspace.n == self.n`.
+    pub fn solve_in_place_tiled(
+        &self,
+        rhs_col_major: &mut [f64],
+        n_rhs: usize,
+        workspaces: &mut [SparseJxgrmSolveWorkspace],
+        pool: Option<&rayon::ThreadPool>,
+    ) -> Result<(), String> {
+        const MIN_TILE_COLS: usize = 32;
+        let n = self.n;
+        if n_rhs == 0 {
+            return Err("n_rhs must be > 0".to_string());
+        }
+        if rhs_col_major.len() != n.saturating_mul(n_rhs) {
+            return Err(format!(
+                "tiled solve RHS length mismatch: got {}, expected {}",
+                rhs_col_major.len(),
+                n.saturating_mul(n_rhs)
+            ));
+        }
+        if workspaces.is_empty() || n_rhs < MIN_TILE_COLS {
+            // Pathological or tiny RHS – allocate one workspace and solve sequentially.
+            let mut ws = self.make_solve_workspace(n_rhs.max(1))?;
+            return self.solve_in_place_with_workspace(rhs_col_major, n_rhs, &mut ws);
+        }
+
+        let nt = workspaces.len();
+        let tile_cols = n_rhs.div_ceil(nt);
+        let n_rows = self.n;
+
+        // Partition the RHS slice into non-overlapping per-tile &mut slices,
+        // paired with their workspace by index (par_iter_mut provides distinct
+        // &mut access to each workspace element).
+        let mut run = || -> Result<(), String> {
+            use rayon::prelude::*;
+            // Pair each workspace with its column-range metadata.
+            workspaces
+                .par_iter_mut()
+                .enumerate()
+                .try_for_each(|(t, ws)| {
+                    let col_start = t.saturating_mul(tile_cols);
+                    let col_end = (col_start.saturating_add(tile_cols)).min(n_rhs);
+                    let cols_here = col_end.saturating_sub(col_start);
+                    if cols_here == 0 {
+                        return Ok(());
+                    }
+                    // RHS is column-major: tile `t` starts at byte offset
+                    // col_start * n_rows * sizeof(f64).
+                    let byte_offset = col_start
+                        .saturating_mul(n_rows)
+                        .saturating_mul(std::mem::size_of::<f64>());
+                    let len = cols_here.saturating_mul(n_rows);
+                    // SAFETY: Tiles partition `rhs_col_major` without overlap;
+                    // each rayon worker gets a unique `t` and therefore a
+                    // disjoint portion of the slice.  The raw pointer is
+                    // derived from `rhs_col_major` (valid, aligned, non-null)
+                    // and the region stays within bounds.
+                    let tile_slice = unsafe {
+                        let ptr = rhs_col_major.as_ptr().byte_add(byte_offset) as *mut f64;
+                        std::slice::from_raw_parts_mut(ptr, len)
+                    };
+                    self.solve_in_place_with_workspace(tile_slice, cols_here, ws)
+                })
+        };
+
+        if let Some(tp) = pool {
+            tp.install(move || run())
+        } else {
+            run()
+        }
     }
 
     pub fn solve_in_place(&self, rhs_col_major: &mut [f64], n_rhs: usize) -> Result<(), String> {

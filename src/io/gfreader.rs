@@ -1589,7 +1589,7 @@ fn evaluate_packed_row_keep_and_flip_pure_line(
 }
 
 #[inline]
-fn packed_row_stats_from_counts(
+pub(crate) fn packed_row_stats_from_counts(
     n_samples: usize,
     non_missing: usize,
     alt_sum: usize,
@@ -4116,6 +4116,7 @@ pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples(
     het_threshold: f32,
     snps_only: bool,
     stats_sample_indices: Option<&[usize]>,
+    stats_only: bool,
 ) -> Result<PreparedBedLogicMetaOwned, String> {
     if !(0.0..=0.5).contains(&maf_threshold) {
         return Err("maf_threshold must be within [0, 0.5]".to_string());
@@ -4264,7 +4265,11 @@ pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples(
         ),
     );
 
-    let mut sites_keep = Vec::<core::SiteInfo>::with_capacity(kept_n);
+    let mut sites_keep: Vec<core::SiteInfo> = if stats_only {
+        Vec::new()
+    } else {
+        Vec::with_capacity(kept_n)
+    };
     let mut row_flip_keep = Vec::<bool>::with_capacity(kept_n);
     let mut row_source_indices = Vec::<usize>::with_capacity(kept_n);
     let mut missing_rate_keep = Vec::<f32>::with_capacity(kept_n);
@@ -4275,7 +4280,9 @@ pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples(
             if flip {
                 std::mem::swap(&mut site.ref_allele, &mut site.alt_allele);
             }
-            sites_keep.push(site);
+            if !stats_only {
+                sites_keep.push(site);
+            }
             row_flip_keep.push(flip);
             row_source_indices.push(i);
             missing_rate_keep.push(missing_rate);
@@ -4310,6 +4317,7 @@ pub(crate) fn prepare_bed_logic_meta_owned(
         het_threshold,
         snps_only,
         None,
+        false,
     )
 }
 
@@ -4822,6 +4830,7 @@ pub(crate) fn prepare_bed_2bit_packed_owned_for_stats_samples(
         het_threshold,
         snps_only,
         stats_sample_indices,
+        false,
     )?;
     let subset = load_bed_2bit_packed_subset_owned_for_stats_samples(
         prefix,
@@ -5204,6 +5213,7 @@ pub fn prepare_bed_logic_meta_selected<'py>(
                 het_threshold,
                 snps_only,
                 sample_idx.as_deref(),
+                true, // stats_only: skip Vec<SiteInfo> allocation
             )
         })
         .map_err(PyRuntimeError::new_err)?;

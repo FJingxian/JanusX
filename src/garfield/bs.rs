@@ -1,8 +1,8 @@
 #![allow(dead_code)]
 
 use super::permutation::{
-    bucket_from_rule, structure_prior_penalty, CombMode, RuleNullBucket,
-    RuleNullPenaltyLookup, RuleStructurePrior,
+    bucket_from_rule, structure_prior_penalty, RuleNullBucket, RuleNullPenaltyLookup,
+    RuleStructurePrior,
 };
 use super::score::{
     score_cont_centered_gain_from_sum_and_n_hit, score_cont_centered_gain_packed_with_n_hit,
@@ -218,6 +218,12 @@ struct BeamState {
     max_singleton_test_raw: f64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct BeamSupportSignature {
+    train_bits: Vec<u64>,
+    test_bits: Option<Vec<u64>>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct LiteralSingletonScore {
     train: ContinuousRuleScore,
@@ -303,7 +309,7 @@ fn rank_mode_uses_gain(rule_len: usize, params: &BeamSearchParams) -> bool {
 
 #[inline]
 // AND-only stubs — kept for interface compatibility with old call sites.
-#[inline] fn rule_is_pure_or(_rule: &BeamRule) -> bool { false }
+fn rule_is_pure_or(_rule: &BeamRule) -> bool { false }
 #[inline] fn rule_is_pure_and(_rule: &BeamRule) -> bool { true }
 
 #[inline]
@@ -2128,6 +2134,71 @@ fn dedup_states_by_train_bits(states: Vec<BeamState>) -> Vec<BeamState> {
     out
 }
 
+fn dedup_states_by_support_signature(
+    states: Vec<BeamState>,
+    bits_test: &[u64],
+    row_words_test: usize,
+    n_rows: usize,
+    n_test: usize,
+    train_test_shared: bool,
+) -> Result<Vec<BeamState>, String> {
+    if train_test_shared {
+        return Ok(dedup_states_by_train_bits(states));
+    }
+
+    let mut groups = HashMap::<Vec<u64>, Vec<BeamState>>::with_capacity(states.len());
+    for state in states.into_iter() {
+        let t_clone = Instant::now();
+        let train_bits = state.combined_train.clone();
+        GARFIELD_PROFILE_CLONE_BITS_NS.fetch_add(elapsed_ns_saturating(t_clone), Ordering::Relaxed);
+        groups.entry(train_bits).or_default().push(state);
+    }
+
+    let mut best = HashMap::<BeamSupportSignature, BeamState>::with_capacity(groups.len());
+    for (train_bits, grouped_states) in groups.into_iter() {
+        if grouped_states.len() == 1 {
+            let state = grouped_states.into_iter().next().unwrap();
+            let key = BeamSupportSignature {
+                train_bits,
+                test_bits: None,
+            };
+            best.insert(key, state);
+            continue;
+        }
+        for state in grouped_states.into_iter() {
+            let t_clone = Instant::now();
+            let test_bits = materialize_rule_bits(
+                &state.rule,
+                bits_test,
+                row_words_test,
+                n_rows,
+                n_test,
+            )?;
+            let key = BeamSupportSignature {
+                train_bits: train_bits.clone(),
+                test_bits: Some(test_bits),
+            };
+            GARFIELD_PROFILE_CLONE_BITS_NS.fetch_add(
+                elapsed_ns_saturating(t_clone),
+                Ordering::Relaxed,
+            );
+            match best.entry(key) {
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(state);
+                }
+                std::collections::hash_map::Entry::Occupied(mut slot) => {
+                    if cmp_state(&state, slot.get()) == std::cmp::Ordering::Less {
+                        slot.insert(state);
+                    }
+                }
+            }
+        }
+    }
+    let mut out = best.into_values().collect::<Vec<_>>();
+    out.sort_by(cmp_state);
+    Ok(out)
+}
+
 #[inline]
 fn same_rule(a: &BeamRule, b: &BeamRule) -> bool {
     a == b
@@ -3025,7 +3096,24 @@ fn beam_search_train_test_continuous_impl(
             beam = next;
         }
 
-        let retained = dedup_states_by_train_bits(kept_all);
+        let retained = dedup_states_by_support_signature(
+            kept_all,
+            bits_test,
+            row_words_test,
+            n_rows,
+            n_test,
+            literal_inputs_are_shared(
+                y_train,
+                n_train,
+                y_test,
+                n_test,
+                bits_train,
+                row_words_train,
+                bits_test,
+                row_words_test,
+                n_rows,
+            ),
+        )?;
 
         let mut best_by_rule =
             HashMap::<Vec<(usize, bool, u8)>, BeamRuleCandidate>::with_capacity(retained.len());
@@ -3228,6 +3316,70 @@ mod tests {
         assert_eq!(actual.len(), 2);
         assert_eq!(actual[0], expected_a);
         assert_eq!(actual[1], expected_b);
+    }
+
+    #[test]
+    fn test_support_signature_dedup_keeps_distinct_test_support() {
+        let y = vec![0.2, 1.1, -0.4, 0.8];
+        let train_rows = vec![vec![1, 0, 0, 1], vec![1, 0, 0, 1]];
+        let test_rows = vec![vec![1, 0, 1, 0], vec![0, 1, 1, 0]];
+        let (train_bits, row_words_train) = pack_rows(&train_rows, y.len());
+        let (test_bits, row_words_test) = pack_rows(&test_rows, y.len());
+        let literal_scores =
+            literal_scores_for_test(&y, train_bits.as_slice(), row_words_train, train_rows.len());
+        let state_a = beam_state_from_rule_for_test(
+            BeamRule {
+                first: BeamLiteral {
+                    row_index: 0,
+                    group_id: 0,
+                    negated: false,
+                },
+                rest: Vec::new(),
+            },
+            &y,
+            train_bits.as_slice(),
+            row_words_train,
+            train_rows.len(),
+            literal_scores.as_slice(),
+        );
+        let state_b = beam_state_from_rule_for_test(
+            BeamRule {
+                first: BeamLiteral {
+                    row_index: 1,
+                    group_id: 1,
+                    negated: false,
+                },
+                rest: Vec::new(),
+            },
+            &y,
+            train_bits.as_slice(),
+            row_words_train,
+            train_rows.len(),
+            literal_scores.as_slice(),
+        );
+
+        let deduped = dedup_states_by_support_signature(
+            vec![state_a.clone(), state_b.clone()],
+            test_bits.as_slice(),
+            row_words_test,
+            train_rows.len(),
+            y.len(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(deduped.len(), 2);
+
+        let shared = dedup_states_by_support_signature(
+            vec![state_a, state_b],
+            train_bits.as_slice(),
+            row_words_train,
+            train_rows.len(),
+            y.len(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(shared.len(), 1);
+        assert_eq!(shared[0].rule.first.row_index, 0);
     }
 
     #[test]

@@ -5244,22 +5244,43 @@ def parse_args(argv: Optional[list[str]] = None):
         help="Run FarmCPU (full genotype in memory; default: %(default)s).",
     )
     models_group.add_argument(
-        "-splmm", "--splmm", "-jxlmm", "--jxlmm",
+        "-splmm", "--splmm",
         dest="splmm",
         nargs="?",
         const="__SELF__",
         default=None,
         metavar="CUTOFF",
         help=(
-            "Run SparseLMM (additive-only). SparseLMM builds or reuses sparse GRM from the main genotype "
-            "input, estimates variance components, then scans via sparse Cholesky. "
+            "Run SparseLMM (additive-only) with exact g'Pg denominator. "
+            "SparseLMM builds or reuses sparse GRM from the main genotype input, "
+            "estimates variance components, then scans via sparse Cholesky. "
             "Optional CUTOFF sets the sparse kinship cutoff (example: -splmm 0.001; default: 0.05)."
         ),
     )
     models_group.add_argument(
-        "-sparse", "--sparse", action="store_true", default=False,
+        "-splmm-approx", "--splmm-approx",
+        dest="splmm_approx",
+        nargs="?",
+        const="__SELF__",
+        default=None,
+        metavar="CUTOFF",
         help=(
-            "Force the sparse SparseLMM route. This is mainly useful for testing and validation."
+            "Run SparseLMM with GRAMMAR-gamma approximate denominator (faster, "
+            "but p-values may be slightly inflated). "
+            "Optional CUTOFF sets the sparse kinship cutoff."
+        ),
+    )
+    models_group.add_argument(
+        "-splmm-exact", "--splmm-exact",
+        dest="splmm_exact",
+        nargs="?",
+        const="__SELF__",
+        default=None,
+        metavar="CUTOFF",
+        help=(
+            "Run SparseLMM with exact g'Pg denominator for every SNP (most accurate, "
+            "but slower). "
+            "Optional CUTOFF sets the sparse kinship cutoff."
         ),
     )
     models_group.add_argument(
@@ -5439,10 +5460,23 @@ def parse_args(argv: Optional[list[str]] = None):
         parser.error("--farmcpu-qtn-bound must be >= 1.")
     if bool(args.algwas) and str(args.model).strip().lower() != "add":
         parser.error("--algwas currently supports additive coding only (--model add).")
+
+    # Normalise SPLMM mode flags: exactly one of -splmm / -splmm-approx / -splmm-exact.
+    _splmm_modes = [
+        (args.splmm,       "exact"),   # default -splmm → exact denominator
+        (args.splmm_approx, "approx"),
+        (args.splmm_exact, "exact"),
+    ]
+    _active_splmm_modes = [(val, mode) for val, mode in _splmm_modes if val is not None]
+    if len(_active_splmm_modes) > 1:
+        parser.error("Only one of -splmm / -splmm-approx / -splmm-exact may be specified.")
+    if _active_splmm_modes:
+        args.splmm, args._splmm_denom_mode = _active_splmm_modes[0]
+    else:
+        args._splmm_denom_mode = None
+
     if bool(args.splmm) and str(args.model).strip().lower() != "add":
         parser.error("--splmm currently supports additive coding only (--model add).")
-    if bool(args.sparse) and not bool(args.splmm):
-        parser.error("--sparse/--force-sparse only applies when --splmm is selected.")
     try:
         args.farmcpu_bin_size = _parse_float_csv(
             args.farmcpu_bin_size,
@@ -6210,6 +6244,7 @@ def _run_gwas_pipeline(
                     def _run_route_splmm_packed(
                         trait_one: list[str], emit_trait_header_model: bool
                     ) -> None:
+                        exact_denom = (args._splmm_denom_mode == "exact")
                         run_splmm_packed_fullrank(
                             genofile=genofile_stream,
                             splmm_source=args.splmm,
@@ -6236,6 +6271,7 @@ def _run_gwas_pipeline(
                             trait_names=trait_one,
                             emit_trait_header=bool(emit_trait_header_model),
                             preloaded_packed=preloaded_packed,
+                            exact_denom=exact_denom,
                         )
 
                     def _run_route_fastlmm_stream(

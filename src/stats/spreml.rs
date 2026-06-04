@@ -111,10 +111,14 @@ struct SparseRemlEvaluator {
     xt_vinv_x: Vec<f64>,
     beta_hat: Vec<f64>,
     solve_ws: Option<SparseJxgrmSolveWorkspace>,
+    // Reusable buffer for factorize_diag_shifted_buffered — avoids a
+    // per-iteration clone of base_perm_values during REML search.
+    perm_values_buf: Vec<f64>,
 }
 
 impl SparseRemlEvaluator {
-    fn new(n: usize, p: usize) -> Self {
+    fn new(n: usize, p: usize, analysis: &SparseJxgrmCholeskyAnalysis) -> Self {
+        let perm_values_buf = analysis.base_perm_values().to_vec();
         Self {
             n,
             p,
@@ -123,6 +127,7 @@ impl SparseRemlEvaluator {
             xt_vinv_x: vec![0.0_f64; p.saturating_mul(p)],
             beta_hat: vec![0.0_f64; p],
             solve_ws: None,
+            perm_values_buf,
         }
     }
 
@@ -290,7 +295,7 @@ fn evaluate_sparse_reml_at_lambda(
         ));
     }
 
-    let factor = analysis.factorize_k_plus_lambda_i(lambda)?;
+    let factor = analysis.factorize_k_plus_lambda_i_buffered(lambda, &mut evaluator.perm_values_buf)?;
     evaluator.fill_rhs(x_design, y);
     evaluator.solve_rhs_in_place(&factor)?;
 
@@ -369,7 +374,7 @@ fn sparse_reml_grid_search(
     let grid_n = grid_size.max(2);
     let n = y.len();
     let p = x_design.len() / n.max(1);
-    let mut evaluator = SparseRemlEvaluator::new(n, p);
+    let mut evaluator = SparseRemlEvaluator::new(n, p, analysis);
     let mut evals = Vec::<SparseRemlEval>::with_capacity(grid_n);
     let mut best = None::<SparseRemlEval>;
     let mut first_err = None::<String>;
@@ -429,7 +434,7 @@ fn sparse_reml_grid_search_with_progress(
     let grid_n = grid_size.max(2);
     let n = y.len();
     let p = x_design.len() / n.max(1);
-    let mut evaluator = SparseRemlEvaluator::new(n, p);
+    let mut evaluator = SparseRemlEvaluator::new(n, p, analysis);
     let mut evals = Vec::<SparseRemlEval>::with_capacity(grid_n);
     let mut best = None::<SparseRemlEval>;
     let mut first_err = None::<String>;
@@ -549,7 +554,7 @@ fn sparse_reml_brent_search_with_progress(
     let brent_eval_err = RefCell::new(None::<String>);
     let n = y.len();
     let p = x_design.len() / n.max(1);
-    let evaluator = RefCell::new(SparseRemlEvaluator::new(n, p));
+    let evaluator = RefCell::new(SparseRemlEvaluator::new(n, p, analysis));
     let mut brent_done = 0usize;
     let (best_log10, _cost) = brent_minimize_with_init(
         |x0| {

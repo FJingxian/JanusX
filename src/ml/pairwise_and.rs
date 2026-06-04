@@ -348,50 +348,35 @@ fn feature_scores_pairwise_and_packed_core(
     // ---- Stage 1: marginal + cache (n_hit, sum_hit) per feature ----------
     let t_marg = Instant::now();
     let mut marginal_gain = vec![0.0f64; n_features];
-    let stage1_owned: Option<(Vec<usize>, Vec<f64>)>;
+    let precomputed_stage1 = precomputed_stage1.and_then(|(n_hit_pre, sum_hit_pre)| {
+        if n_hit_pre.len() >= n_features && sum_hit_pre.len() >= n_features {
+            Some((n_hit_pre, sum_hit_pre))
+        } else {
+            None
+        }
+    });
+    let stage1_owned = if let Some((n_hit_pre, sum_hit_pre)) = precomputed_stage1 {
+        for i in 0..n_features {
+            marginal_gain[i] =
+                centered_gain_from_counts(total_sum, sum_hit_pre[i], n_samples, n_hit_pre[i]);
+        }
+        None
+    } else {
+        let mut feat_n_hit_owned = vec![0usize; n_features];
+        let mut feat_sum_hit_owned = vec![0.0f64; n_features];
+        for i in 0..n_features {
+            let row = &bits_flat[i * row_words..(i + 1) * row_words];
+            let (n_hit, sum_hit) = count_sum_packed(row, y, &y_word_sums, n_words, tail_mask);
+            marginal_gain[i] = centered_gain_from_counts(total_sum, sum_hit, n_samples, n_hit);
+            feat_n_hit_owned[i] = n_hit;
+            feat_sum_hit_owned[i] = sum_hit;
+        }
+        Some((feat_n_hit_owned, feat_sum_hit_owned))
+    };
     let (feat_n_hit, feat_sum_hit): (&[usize], &[f64]) =
         if let Some((n_hit_pre, sum_hit_pre)) = precomputed_stage1 {
-            if n_hit_pre.len() >= n_features && sum_hit_pre.len() >= n_features {
-                stage1_owned = None;
-                for i in 0..n_features {
-                    marginal_gain[i] = centered_gain_from_counts(
-                        total_sum,
-                        sum_hit_pre[i],
-                        n_samples,
-                        n_hit_pre[i],
-                    );
-                }
-                (&n_hit_pre[..n_features], &sum_hit_pre[..n_features])
-            } else {
-                let mut feat_n_hit_owned = vec![0usize; n_features];
-                let mut feat_sum_hit_owned = vec![0.0f64; n_features];
-                for i in 0..n_features {
-                    let row = &bits_flat[i * row_words..(i + 1) * row_words];
-                    let (n_hit, sum_hit) =
-                        count_sum_packed(row, y, &y_word_sums, n_words, tail_mask);
-                    marginal_gain[i] =
-                        centered_gain_from_counts(total_sum, sum_hit, n_samples, n_hit);
-                    feat_n_hit_owned[i] = n_hit;
-                    feat_sum_hit_owned[i] = sum_hit;
-                }
-                stage1_owned = Some((feat_n_hit_owned, feat_sum_hit_owned));
-                let (feat_n_hit_owned, feat_sum_hit_owned) =
-                    stage1_owned.as_ref().expect("stage1 cache present");
-                (feat_n_hit_owned.as_slice(), feat_sum_hit_owned.as_slice())
-            }
+            (&n_hit_pre[..n_features], &sum_hit_pre[..n_features])
         } else {
-            let mut feat_n_hit_owned = vec![0usize; n_features];
-            let mut feat_sum_hit_owned = vec![0.0f64; n_features];
-            for i in 0..n_features {
-                let row = &bits_flat[i * row_words..(i + 1) * row_words];
-                let (n_hit, sum_hit) =
-                    count_sum_packed(row, y, &y_word_sums, n_words, tail_mask);
-                marginal_gain[i] =
-                    centered_gain_from_counts(total_sum, sum_hit, n_samples, n_hit);
-                feat_n_hit_owned[i] = n_hit;
-                feat_sum_hit_owned[i] = sum_hit;
-            }
-            stage1_owned = Some((feat_n_hit_owned, feat_sum_hit_owned));
             let (feat_n_hit_owned, feat_sum_hit_owned) =
                 stage1_owned.as_ref().expect("stage1 cache present");
             (feat_n_hit_owned.as_slice(), feat_sum_hit_owned.as_slice())

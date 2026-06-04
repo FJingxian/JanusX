@@ -1101,7 +1101,15 @@ fn sparse_splmm_load_factor(
 ) -> Result<SparseJxgrmCholesky, String> {
     let path = sparse_jxgrm_path
         .map(|s| s.to_string())
-        .unwrap_or_else(|| format!("{prefix}.spgrm"));
+        .unwrap_or_else(|| {
+            let spgrm_path = format!("{prefix}.spgrm");
+            let jxgrm_path = format!("{prefix}.jxgrm");
+            if std::path::Path::new(&jxgrm_path).exists() && !std::path::Path::new(&spgrm_path).exists() {
+                jxgrm_path
+            } else {
+                spgrm_path
+            }
+        });
     if !Path::new(&path).exists() {
         return Err(format!(
             "SparseLMM requires a sparse kinship file, but none was found at: {path}"

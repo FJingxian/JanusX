@@ -267,10 +267,18 @@ fn normalize_spgrm_path(prefix: &str) -> String {
         return String::new();
     }
     if trimmed.to_ascii_lowercase().ends_with(".spgrm") {
-        trimmed.to_string()
-    } else {
-        format!("{trimmed}.spgrm")
+        return trimmed.to_string();
     }
+    // Backward compat: if an old .jxgrm file exists, use it.
+    if trimmed.to_ascii_lowercase().ends_with(".jxgrm") {
+        return trimmed.to_string();
+    }
+    let path_spgrm = format!("{trimmed}.spgrm");
+    let path_jxgrm = format!("{trimmed}.jxgrm");
+    if std::path::Path::new(&path_jxgrm).exists() && !std::path::Path::new(&path_spgrm).exists() {
+        return path_jxgrm;
+    }
+    path_spgrm
 }
 
 #[inline]

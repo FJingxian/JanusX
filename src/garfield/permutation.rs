@@ -1,8 +1,9 @@
-use super::bs::{BeamBinaryOp, BeamLogicGateMode, BeamRule};
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use rand::SeedableRng;
 use std::cmp::Ordering;
+
+use super::bs::{BeamBinaryOp, BeamRule};
 
 pub const DEFAULT_RULE_PERMUTATION_REPRESENTATIVE_UNITS: usize = 32;
 pub const DEFAULT_RULE_NULL_PHYSICAL_CHUNKS: usize = 150;
@@ -29,7 +30,7 @@ const STRUCTURE_PRIOR_LEN_TEMPER: f64 = 0.72;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum GateBucket {
     And,
-    Or,
+    // Or variant removed — beam search is AND-only.
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -54,7 +55,6 @@ struct RuleNullScores {
 
 #[derive(Clone, Debug)]
 pub struct RuleNullCalibrator {
-    use_gate_dim: bool,
     max_rule_len: usize,
     exact: Vec<RuleNullScores>,
     collapsed_gate: Vec<RuleNullScores>,
@@ -63,7 +63,6 @@ pub struct RuleNullCalibrator {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RuleNullPenaltyLookup {
-    use_gate_dim: bool,
     max_rule_len: usize,
     exact_train: Vec<Option<f64>>,
     exact_test: Vec<Option<f64>>,
@@ -75,7 +74,7 @@ pub struct RuleNullPenaltyLookup {
 
 impl Default for RuleNullPenaltyLookup {
     fn default() -> Self {
-        Self::new(false)
+        Self::new()
     }
 }
 
@@ -113,14 +112,6 @@ impl RuleNullScores {
 
 impl RuleNullBucket {
     #[inline]
-    fn gate_bin(self) -> usize {
-        match self.gate {
-            GateBucket::And => 0,
-            GateBucket::Or => 1,
-        }
-    }
-
-    #[inline]
     fn maf_bin(self) -> usize {
         match self.maf {
             MafBucket::Low => 0,
@@ -135,13 +126,8 @@ impl RuleNullBucket {
     }
 
     #[inline]
-    fn exact_index(self, max_rule_len: usize, use_gate_dim: bool) -> usize {
-        let base = self.collapsed_gate_index(max_rule_len);
-        if use_gate_dim {
-            (base * 2) + self.gate_bin()
-        } else {
-            base
-        }
+    fn exact_index(self, max_rule_len: usize) -> usize {
+        self.collapsed_gate_index(max_rule_len)
     }
 
     #[inline]
@@ -162,18 +148,8 @@ impl RuleNullBucket {
     }
 
     #[inline]
-    fn from_exact_index(idx: usize, max_rule_len: usize, use_gate_dim: bool) -> Self {
-        if !use_gate_dim {
-            return Self::from_collapsed_gate_index(idx, max_rule_len);
-        }
-        let gate = if (idx & 1) == 0 {
-            GateBucket::And
-        } else {
-            GateBucket::Or
-        };
-        let mut bucket = Self::from_collapsed_gate_index(idx >> 1, max_rule_len);
-        bucket.gate = gate;
-        bucket
+    fn from_exact_index(idx: usize, max_rule_len: usize) -> Self {
+        Self::from_collapsed_gate_index(idx, max_rule_len)
     }
 }
 
@@ -185,7 +161,7 @@ fn null_quantile_for_bucket(bucket: RuleNullBucket) -> f64 {
 
 #[inline]
 fn null_shrinkage_weights_for_bucket(bucket: RuleNullBucket) -> Option<(f64, f64, f64)> {
-    if !matches!(bucket.gate, GateBucket::And) || bucket.has_not || bucket.rule_len < 2 {
+    if bucket.has_not || bucket.rule_len < 2 {
         return None;
     }
     if bucket.rule_len == 2 {
@@ -225,7 +201,7 @@ fn blended_penalty(
 
 #[inline]
 pub fn null_topk_per_repeat_for_bucket(bucket: RuleNullBucket) -> usize {
-    if matches!(bucket.gate, GateBucket::And) && !bucket.has_not {
+    if !bucket.has_not {
         if bucket.rule_len == 2 {
             return DEFAULT_RULE_NULL_TOPK_AND_LEN2;
         }
@@ -237,35 +213,35 @@ pub fn null_topk_per_repeat_for_bucket(bucket: RuleNullBucket) -> usize {
 }
 
 #[inline]
-pub fn rule_null_bucket_count(max_rule_len: usize, use_gate_dim: bool) -> usize {
-    max_rule_len.max(1) * 2usize * 2usize * if use_gate_dim { 2usize } else { 1usize }
+pub fn rule_null_bucket_count(max_rule_len: usize) -> usize {
+    max_rule_len.max(1) * 2usize * 2usize
 }
 
 impl RuleNullCalibrator {
-    pub fn with_max_rule_len(max_rule_len: usize, use_gate_dim: bool) -> Self {
+    pub fn with_max_rule_len(max_rule_len: usize) -> Self {
+        let mrl = max_rule_len.max(1);
         Self {
-            use_gate_dim,
-            max_rule_len: max_rule_len.max(1),
+            max_rule_len: mrl,
             exact: vec![
                 RuleNullScores::default();
-                rule_null_bucket_count(max_rule_len.max(1), use_gate_dim)
+                rule_null_bucket_count(mrl)
             ],
             collapsed_gate: vec![
                 RuleNullScores::default();
-                rule_null_bucket_count(max_rule_len.max(1), false)
+                rule_null_bucket_count(mrl)
             ],
             global: RuleNullScores::default(),
         }
     }
 
-    pub fn new(use_gate_dim: bool) -> Self {
-        Self::with_max_rule_len(5, use_gate_dim)
+    pub fn new() -> Self {
+        Self::with_max_rule_len(5)
     }
 }
 
 impl Default for RuleNullCalibrator {
     fn default() -> Self {
-        Self::new(false)
+        Self::new()
     }
 }
 
@@ -505,41 +481,15 @@ fn penalty_value_converged(prev: Option<f64>, curr: Option<f64>) -> bool {
     }
 }
 
-fn gate_bucket_from_ops(has_or: bool) -> GateBucket {
-    if has_or {
-        GateBucket::Or
-    } else {
-        GateBucket::And
-    }
-}
-
-fn gate_bucket_for_mode(mode: BeamLogicGateMode, actual_gate: GateBucket) -> GateBucket {
-    match mode {
-        BeamLogicGateMode::AndOnly => GateBucket::And,
-        BeamLogicGateMode::OrOnly => GateBucket::Or,
-        BeamLogicGateMode::AndOr => actual_gate,
-    }
-}
-
-fn gate_bucket_from_rule(rule: &BeamRule, logic_gate_mode: BeamLogicGateMode) -> GateBucket {
-    let mut has_or = false;
-    for (op, _) in rule.rest.iter() {
-        match op {
-            BeamBinaryOp::Or => has_or = true,
-            BeamBinaryOp::And => {}
-        }
-    }
-    gate_bucket_for_mode(logic_gate_mode, gate_bucket_from_ops(has_or))
+fn gate_bucket_from_rule(_rule: &BeamRule) -> GateBucket {
+    GateBucket::And
 }
 
 fn gate_bucket_from_expr(
-    expr: &str,
+    _expr: &str,
     _rule_len: usize,
-    logic_gate_mode: BeamLogicGateMode,
 ) -> GateBucket {
-    let upper = expr.to_ascii_uppercase();
-    let has_or = upper.contains(" OR ");
-    gate_bucket_for_mode(logic_gate_mode, gate_bucket_from_ops(has_or))
+    GateBucket::And
 }
 
 fn has_not_expr(expr: &str) -> bool {
@@ -566,7 +516,7 @@ pub fn maf_bucket_from_frac(support_frac: f64) -> MafBucket {
 
 impl RuleNullCalibrator {
     pub fn insert(&mut self, bucket: RuleNullBucket, train_score: f64, test_score: f64) {
-        self.exact[bucket.exact_index(self.max_rule_len, self.use_gate_dim)]
+        self.exact[bucket.exact_index(self.max_rule_len)]
             .push(train_score, test_score);
         self.collapsed_gate[bucket.collapsed_gate_index(self.max_rule_len)]
             .push(train_score, test_score);
@@ -575,10 +525,10 @@ impl RuleNullCalibrator {
 
     pub fn finalize(&self) -> RuleNullPenaltyLookup {
         let mut out =
-            RuleNullPenaltyLookup::with_max_rule_len(self.max_rule_len, self.use_gate_dim);
+            RuleNullPenaltyLookup::with_max_rule_len(self.max_rule_len);
         for (idx, scores) in self.exact.iter().enumerate() {
             let bucket =
-                RuleNullBucket::from_exact_index(idx, self.max_rule_len, self.use_gate_dim);
+                RuleNullBucket::from_exact_index(idx, self.max_rule_len);
             let quantile = null_quantile_for_bucket(bucket);
             out.exact_train[idx] = quantile_nearest_rank(scores.train.as_slice(), quantile);
             out.exact_test[idx] = quantile_nearest_rank(scores.test.as_slice(), quantile);
@@ -599,25 +549,26 @@ impl RuleNullCalibrator {
 }
 
 impl RuleNullPenaltyLookup {
-    pub fn with_max_rule_len(max_rule_len: usize, use_gate_dim: bool) -> Self {
+    pub fn with_max_rule_len(max_rule_len: usize) -> Self {
+        let mrl = max_rule_len.max(1);
+        let n = rule_null_bucket_count(mrl);
         Self {
-            use_gate_dim,
-            max_rule_len: max_rule_len.max(1),
-            exact_train: vec![None; rule_null_bucket_count(max_rule_len.max(1), use_gate_dim)],
-            exact_test: vec![None; rule_null_bucket_count(max_rule_len.max(1), use_gate_dim)],
-            collapsed_gate_train: vec![None; rule_null_bucket_count(max_rule_len.max(1), false)],
-            collapsed_gate_test: vec![None; rule_null_bucket_count(max_rule_len.max(1), false)],
+            max_rule_len: mrl,
+            exact_train: vec![None; n],
+            exact_test: vec![None; n],
+            collapsed_gate_train: vec![None; n],
+            collapsed_gate_test: vec![None; n],
             global_train: None,
             global_test: None,
         }
     }
 
-    pub fn new(use_gate_dim: bool) -> Self {
-        Self::with_max_rule_len(5, use_gate_dim)
+    pub fn new() -> Self {
+        Self::with_max_rule_len(5)
     }
 
     fn penalty_with_fallback(&self, bucket: RuleNullBucket, is_train: bool) -> Option<f64> {
-        let exact_idx = bucket.exact_index(self.max_rule_len, self.use_gate_dim);
+        let exact_idx = bucket.exact_index(self.max_rule_len);
         let collapsed_idx = bucket.collapsed_gate_index(self.max_rule_len);
         let exact = if is_train {
             self.exact_train.get(exact_idx).copied().flatten()
@@ -651,11 +602,11 @@ impl RuleNullPenaltyLookup {
     }
 
     pub fn q99_converged_against(&self, prev: &Self) -> bool {
-        if self.max_rule_len != prev.max_rule_len || self.use_gate_dim != prev.use_gate_dim {
+        if self.max_rule_len != prev.max_rule_len {
             return false;
         }
         let mut saw_signal = false;
-        for idx in 0..rule_null_bucket_count(self.max_rule_len, false) {
+        for idx in 0..rule_null_bucket_count(self.max_rule_len) {
             let prev_train = prev.collapsed_gate_train.get(idx).copied().flatten();
             let curr_train = self.collapsed_gate_train.get(idx).copied().flatten();
             let prev_test = prev.collapsed_gate_test.get(idx).copied().flatten();
@@ -692,10 +643,9 @@ impl RuleNullPenaltyLookup {
 pub fn bucket_from_rule(
     rule: &BeamRule,
     support_frac: f64,
-    logic_gate_mode: BeamLogicGateMode,
 ) -> RuleNullBucket {
     RuleNullBucket {
-        gate: gate_bucket_from_rule(rule, logic_gate_mode),
+        gate: gate_bucket_from_rule(rule),
         rule_len: rule.len().max(1),
         has_not: rule.not_count() > 0,
         maf: maf_bucket_from_frac(support_frac),
@@ -706,10 +656,9 @@ pub fn bucket_from_expr(
     expr: &str,
     rule_len: usize,
     support_frac: f64,
-    logic_gate_mode: BeamLogicGateMode,
 ) -> RuleNullBucket {
     RuleNullBucket {
-        gate: gate_bucket_from_expr(expr, rule_len, logic_gate_mode),
+        gate: gate_bucket_from_expr(expr, rule_len),
         rule_len: rule_len.max(1),
         has_not: has_not_expr(expr),
         maf: maf_bucket_from_frac(support_frac),
@@ -770,7 +719,7 @@ mod tests {
                     },
                 ),
                 (
-                    BeamBinaryOp::Or,
+                    BeamBinaryOp::And,
                     super::super::bs::BeamLiteral {
                         row_index: 2,
                         group_id: 2,
@@ -779,8 +728,8 @@ mod tests {
                 ),
             ],
         };
-        let bucket = bucket_from_rule(&rule, 0.25, BeamLogicGateMode::AndOr);
-        assert_eq!(bucket.gate, GateBucket::Or);
+        let bucket = bucket_from_rule(&rule, 0.25);
+        assert_eq!(bucket.gate, GateBucket::And);
         assert_eq!(bucket.rule_len, 3);
         assert!(bucket.has_not);
         assert_eq!(bucket.maf, MafBucket::High);
@@ -792,7 +741,6 @@ mod tests {
             "BIN(1) AND NOT BIN(2) AND NOT BIN(3)",
             3,
             0.01,
-            BeamLogicGateMode::AndOr,
         );
         assert_eq!(bucket.gate, GateBucket::And);
         assert_eq!(bucket.rule_len, 3);
@@ -817,7 +765,7 @@ mod tests {
                 negated: false,
             },
             rest: vec![(
-                BeamBinaryOp::Or,
+                BeamBinaryOp::And,
                 super::super::bs::BeamLiteral {
                     row_index: 1,
                     group_id: 1,
@@ -825,10 +773,10 @@ mod tests {
                 },
             )],
         };
-        let singleton_bucket = bucket_from_rule(&singleton, 0.10, BeamLogicGateMode::OrOnly);
-        let pair_bucket = bucket_from_rule(&pair, 0.10, BeamLogicGateMode::OrOnly);
-        assert_eq!(singleton_bucket.gate, GateBucket::Or);
-        assert_eq!(pair_bucket.gate, GateBucket::Or);
+        let singleton_bucket = bucket_from_rule(&singleton, 0.10);
+        let pair_bucket = bucket_from_rule(&pair, 0.10);
+        assert_eq!(singleton_bucket.gate, GateBucket::And);
+        assert_eq!(pair_bucket.gate, GateBucket::And);
     }
 
     #[test]
@@ -919,7 +867,7 @@ mod tests {
             has_not: false,
             maf: MafBucket::High,
         };
-        let exact_idx = bucket.exact_index(lookup.max_rule_len, true);
+        let exact_idx = bucket.exact_index(lookup.max_rule_len);
         let collapsed_idx = bucket.collapsed_gate_index(lookup.max_rule_len);
         lookup.exact_train[exact_idx] = Some(100.0);
         lookup.collapsed_gate_train[collapsed_idx] = Some(60.0);
@@ -937,7 +885,7 @@ mod tests {
             has_not: true,
             maf: MafBucket::High,
         };
-        let exact_idx = bucket.exact_index(lookup.max_rule_len, true);
+        let exact_idx = bucket.exact_index(lookup.max_rule_len);
         let collapsed_idx = bucket.collapsed_gate_index(lookup.max_rule_len);
         lookup.exact_train[exact_idx] = Some(100.0);
         lookup.collapsed_gate_train[collapsed_idx] = Some(60.0);
@@ -949,12 +897,12 @@ mod tests {
     fn test_or_penalty_does_not_shrink() {
         let mut lookup = RuleNullPenaltyLookup::new(true);
         let bucket = RuleNullBucket {
-            gate: GateBucket::Or,
+            gate: GateBucket::And,
             rule_len: 2,
             has_not: false,
             maf: MafBucket::High,
         };
-        let exact_idx = bucket.exact_index(lookup.max_rule_len, true);
+        let exact_idx = bucket.exact_index(lookup.max_rule_len);
         let collapsed_idx = bucket.collapsed_gate_index(lookup.max_rule_len);
         lookup.exact_train[exact_idx] = Some(100.0);
         lookup.collapsed_gate_train[collapsed_idx] = Some(60.0);
@@ -972,7 +920,7 @@ mod tests {
             maf: MafBucket::Low,
         };
         let or_bucket = RuleNullBucket {
-            gate: GateBucket::Or,
+            gate: GateBucket::And,
             rule_len: 4,
             has_not: true,
             maf: MafBucket::Low,
@@ -984,10 +932,10 @@ mod tests {
 
     #[test]
     fn test_rule_null_bucket_count_matches_20_or_40_layout() {
-        assert_eq!(rule_null_bucket_count(5, false), 20);
-        assert_eq!(rule_null_bucket_count(5, true), 40);
-        assert_eq!(rule_null_bucket_count(4, false), 16);
-        assert_eq!(rule_null_bucket_count(4, true), 32);
+        assert_eq!(rule_null_bucket_count(5), 20);
+        assert_eq!(rule_null_bucket_count(5), 40);
+        assert_eq!(rule_null_bucket_count(4), 16);
+        assert_eq!(rule_null_bucket_count(4), 32);
     }
 
     #[test]

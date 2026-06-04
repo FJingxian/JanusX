@@ -14,7 +14,7 @@ from janusx.assoc.workflow import (
     _load_covariates_for_models,
     _load_phenotype_with_status,
     load_or_build_grm_with_cache,
-    run_fastlmm_packed_fullrank,
+    run_fvlmm_packed_fullrank,
 )
 from janusx.assoc.workflow_cache import _gwas_cache_prefix_with_params
 from janusx.gtools.reader import readanno
@@ -236,7 +236,7 @@ def _ensure_followup_grm(
         cache_dir=cache_dir,
         logger=logger,
     )
-    grm_all, _eff_m, grm_ids = load_or_build_grm_with_cache(
+    grm_all, _eff_m, grm_ids, _grm_cache_path = load_or_build_grm_with_cache(
         genofile=genofile,
         cache_prefix=cache_prefix,
         mgrm="1",
@@ -282,7 +282,7 @@ def _run_garfield_pseudo_fastlmm(
     qmatrix = np.zeros((len(sample_ids), 0), dtype=np.float64)
     summary_rows: list[dict[str, object]] = []
     saved_paths: list[str] = []
-    run_fastlmm_packed_fullrank(
+    run_fvlmm_packed_fullrank(
         genofile=str(pseudo_prefix),
         pheno=pheno_df,
         ids=np.asarray(sample_ids, dtype=str),
@@ -743,13 +743,6 @@ def main() -> None:
     optional_group.add_argument("--prior-not", type=float, default=None, help=argparse.SUPPRESS)
     optional_group.add_argument("-layer", "--layer", type=int, default=None, help="Maximum beam-search rule depth (default: 4).")
     optional_group.add_argument(
-        "-logic-gate",
-        "--logic-gate",
-        type=str,
-        default="and_or",
-        help="Allowed binary operators in beam search: and, or, or and_or.",
-    )
-    optional_group.add_argument(
         "-bimrange",
         "--bimrange",
         type=str,
@@ -865,20 +858,6 @@ def main() -> None:
 
     if args.engine is not None:
         args.engine = str(args.engine).upper()
-    logic_gate_map = {
-        "a": "and",
-        "and": "and",
-        "o": "or",
-        "or": "or",
-        "ao": "and_or",
-        "and_or": "and_or",
-        "andor": "and_or",
-        "and-or": "and_or",
-    }
-    logic_gate_key = str(args.logic_gate).strip().lower()
-    if logic_gate_key not in logic_gate_map:
-        parser.error("-logic-gate must be one of: and, or, and_or")
-    args.logic_gate = logic_gate_map[logic_gate_key]
     args.rank_score = "gain_from_layer:2"
     args.rank_schedule_source = "fixed-combination-gain"
     args.gain_start_layer_runtime = 2
@@ -913,7 +892,6 @@ def main() -> None:
 
     ml_skipped = args.engine is None
     engine_runtime = "none" if ml_skipped else str(args.engine)
-    logic_gate_runtime = args.logic_gate
     rank_score_runtime = str(args.rank_score)
     rank_schedule_source = str(args.rank_schedule_source)
     gain_start_layer_runtime = (
@@ -960,14 +938,13 @@ def main() -> None:
         ("Split", "none (full data)"),
         ("Engine", "none (skip ML)" if ml_skipped else args.engine),
         ("Permutation", bool(args.permutation)),
-        ("Pseudo GWAS", "FastLMM follow-up"),
+        ("Pseudo GWAS", "FvLMM follow-up"),
         ("Structured pruning", not bool(args.no_clean)),
         ("NOT control", "null penalty only"),
         ("Width", int(args.width)),
         ("Rules/unit", int(args.top_rules_runtime)),
         ("Layer", int(args.layer)),
         ("Pair seed depth", int(args.exhaustive_depth_runtime)),
-        ("Logic gate", args.logic_gate),
         ("Rule ranking", rank_schedule_runtime),
         ("Sim bench", args.simbench),
         ("Seed", int(args.seed)),
@@ -1116,11 +1093,8 @@ def main() -> None:
         y_raw = pheno_col.loc[common_ids].to_numpy(dtype=float)
         response_mode, y_common, response_note = _detect_response_mode(y_raw)
         logger.info(f"{trait_name} (n={len(common_ids)}, response={response_mode}{response_note})")
-        if response_mode != "continuous":
-            raise ValueError(
-                f"GARFIELD Rust pipeline currently supports continuous phenotypes only; "
-                f"trait '{trait_name}' is {response_mode}."
-            )
+        # Binary traits are accepted: LMM residualization produces continuous residuals,
+        # and centered-gain scoring is valid on any finite y (including 0/1).
         base_trait = _safe_trait_label(trait_name)
         count = used_trait_labels.get(base_trait, 0) + 1
         used_trait_labels[base_trait] = count
@@ -1186,7 +1160,6 @@ def main() -> None:
                 max_pick=int(args.layer),
                 exhaustive_depth=int(args.exhaustive_depth_runtime),
                 beam_width=int(args.beam_width),
-                logic_gate=str(args.logic_gate).lower(),
                 rank_score=str(args.rank_score),
                 maf_threshold=float(args.maf),
                 max_missing_rate=float(args.geno),
@@ -1265,7 +1238,7 @@ def main() -> None:
                 order="C",
             )
             logger.info(
-                f"Running pseudo FastLMM follow-up for '{trait_name}' on {int(n_rules)} GARFIELD rule(s)."
+                f"Running pseudo FvLMM follow-up for '{trait_name}' on {int(n_rules)} GARFIELD rule(s)."
             )
             pseudo_gwas_payload = _run_garfield_pseudo_fastlmm(
                 pseudo_prefix=str(pseudo_prefix),
@@ -1328,8 +1301,6 @@ def main() -> None:
             "extension": int(args.extension),
             "step": int(args.step),
             "bimrange": (list(args.bimrange) if args.bimrange else None),
-            "logic_gate_requested": args.logic_gate,
-            "logic_gate_runtime": logic_gate_runtime,
             "ranking_dataset": "full",
             "feature_source": feature_source,
             "grm_path": args.grm,
@@ -1419,7 +1390,6 @@ def main() -> None:
                 "grm_path": args.grm,
                 "grm_id_path": resolved_grm_id,
                 "scan_mode": args.scan_mode,
-                "logic_gate_runtime": logic_gate_runtime,
                 "rank_score_runtime": rank_score_runtime,
                 "rank_schedule_runtime": rank_schedule_runtime,
                 "rank_schedule_source": rank_schedule_source,

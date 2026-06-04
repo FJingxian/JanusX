@@ -38,6 +38,8 @@ use crate::ml::common::{
 };
 use crate::ml::engine::{compute_feature_scores_grouped, parse_ml_engine, MlEngine};
 use crate::ml::extra_trees::ExtraTreesConfig;
+use crate::ml::pairwise_and::feature_scores_pairwise_and_flat;
+
 use memmap2::Mmap;
 use numpy::ndarray::{Array1, Array2};
 use numpy::{PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
@@ -56,7 +58,7 @@ use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -64,7 +66,7 @@ use std::time::Instant;
 pub use bs::{
     beam_search_train_test_continuous, evaluate_rule_continuous, materialize_rule_bits,
     rank_rule_score_components, rank_rule_score_components_with_bucket, BeamBinaryOp, BeamLiteral,
-    BeamLogicGateMode, BeamRankMode, BeamRule, BeamRuleCandidate, BeamSearchParams,
+    BeamRankMode, BeamRule, BeamRuleCandidate, BeamSearchParams,
 };
 pub use residual::{garfield_residualize_bed_py, garfield_residualize_grm_py};
 use residual::{garfield_residualize_exact_from_grm_rust, GarfieldResidualResult};
@@ -94,6 +96,8 @@ const GARFIELD_SCAN_PAIR_PARENT_ABS_GAIN_MIN: f64 = 0.01;
 const GARFIELD_SCAN_SURROGATE_TEST_GAIN_MAX: f64 = 0.02;
 const GARFIELD_SCAN_SURROGATE_HAMMING_FRAC_MAX: f64 = 0.02;
 const GARFIELD_DISABLE_STRUCTURE_PRIOR: bool = true;
+static GARFIELD_ML_SELECT_NS: AtomicU64 = AtomicU64::new(0);
+
 const GARFIELD_SCAN_UNIT_COALESCE_MAX_UNITS_DEFAULT: usize = 64;
 const GARFIELD_NULL_TASK_COALESCE_MAX_TASKS_DEFAULT: usize = 64;
 const GARFIELD_STRUCTURE_TASK_COALESCE_MAX_UNITS_DEFAULT: usize = 32;
@@ -261,17 +265,6 @@ fn parse_bin_mode(mode: &str) -> Result<GarfieldBinMode, String> {
         "bin" | "bin02" => Ok(GarfieldBinMode::Bin),
         "mbin" => Ok(GarfieldBinMode::Mbin),
         _ => Err("mode must be one of: bin, mbin".to_string()),
-    }
-}
-
-#[inline]
-fn parse_beam_logic_gate_mode(mode: &str) -> Result<BeamLogicGateMode, String> {
-    let t = mode.trim().to_ascii_lowercase();
-    match t.as_str() {
-        "" | "ao" | "and_or" | "andor" | "and-or" => Ok(BeamLogicGateMode::AndOr),
-        "a" | "and" => Ok(BeamLogicGateMode::AndOnly),
-        "o" | "or" => Ok(BeamLogicGateMode::OrOnly),
-        _ => Err("logic_gate must be one of: A, O, AO".to_string()),
     }
 }
 
@@ -2376,6 +2369,7 @@ struct GarfieldLogicPipelineResult {
     timing_scan_wall_s: f64,
     timing_scan_beam_wall_s: f64,
     timing_scan_literal_score_wall_s: f64,
+    timing_scan_ml_select_wall_s: f64,
     timing_scan_beam_calls: usize,
     timing_literal_score_share_of_total_pct: f64,
     timing_literal_score_share_of_scan_pct: f64,
@@ -2494,7 +2488,7 @@ fn build_rule_delta_annotations(
             params.lambda_len,
             params.lambda_not,
         )?;
-        let bucket = bucket_from_rule(&singleton, test_sc.support_frac, params.logic_gate_mode);
+        let bucket = bucket_from_rule(&singleton, test_sc.support_frac);
         let single_score = rank_rule_score_components_with_bucket(
             bucket,
             singleton.len(),
@@ -3383,7 +3377,6 @@ fn evaluate_simbench_terms(
             sim_expr_txt.as_str(),
             term.sites.len(),
             train_sc.support_frac,
-            beam_params.logic_gate_mode,
         );
         let _train_score = rank_rule_score_components_with_bucket(
             sim_bucket,
@@ -3769,7 +3762,7 @@ fn literal_name(site: &SiteInfo, negated: bool) -> String {
 fn logic_symbol_compact(op: BeamBinaryOp) -> &'static str {
     match op {
         BeamBinaryOp::And => "&",
-        BeamBinaryOp::Or => "|",
+        BeamBinaryOp::And => "&",
     }
 }
 
@@ -3859,7 +3852,7 @@ fn rule_expr(rule: &BeamRule, local_sites: &[SiteInfo]) -> Result<String, String
             .ok_or_else(|| format!("rule row index out of range: {}", lit.row_index))?;
         let op_txt = match op {
             BeamBinaryOp::And => "AND",
-            BeamBinaryOp::Or => "OR",
+            BeamBinaryOp::And => "AND",
         };
         out.push(' ');
         out.push_str(op_txt);
@@ -3880,7 +3873,7 @@ fn rule_snp_name(rule: &BeamRule, local_sites: &[SiteInfo]) -> Result<String, St
             .ok_or_else(|| format!("rule row index out of range: {}", lit.row_index))?;
         let op_txt = match op {
             BeamBinaryOp::And => " & ",
-            BeamBinaryOp::Or => " | ",
+            BeamBinaryOp::And => " & ",
         };
         out.push_str(op_txt);
         out.push_str(&literal_name(site, lit.negated));
@@ -3893,7 +3886,7 @@ fn rule_ml_rank_name(rule: &BeamRule) -> String {
     for (op, lit) in rule.rest.iter() {
         let op_txt = match op {
             BeamBinaryOp::And => " & ",
-            BeamBinaryOp::Or => " | ",
+            BeamBinaryOp::And => " & ",
         };
         out.push_str(op_txt);
         out.push_str(&literal_ml_rank_name(lit.row_index, lit.negated));
@@ -4461,6 +4454,53 @@ fn dense_binary_rows_from_full_bits_range(
     Ok(out)
 }
 
+/// Flat range variant: single allocation, no per-row Vec.
+fn dense_binary_rows_from_full_bits_range_flat(
+    bits_flat: &[u64],
+    row_words: usize,
+    row_start: usize,
+    row_end: usize,
+    sample_indices: &[usize],
+    n_rows_all: usize,
+    n_samples_all: usize,
+) -> Result<(Vec<u8>, usize), String> {
+    if row_end <= row_start {
+        return Ok((Vec::new(), sample_indices.len()));
+    }
+    if row_end > n_rows_all {
+        return Err(format!(
+            "row range out of bounds while densifying flat: [{row_start}, {row_end}) vs n_rows={n_rows_all}"
+        ));
+    }
+    if row_words != words_for_samples(n_samples_all) {
+        return Err(format!(
+            "row_words mismatch for full bit matrix: got {row_words}, expected {}",
+            words_for_samples(n_samples_all)
+        ));
+    }
+    if bits_flat.len() != n_rows_all.saturating_mul(row_words) {
+        return Err("full bit matrix length mismatch".to_string());
+    }
+    let row_stride = sample_indices.len();
+    let n_rows_sub = row_end.saturating_sub(row_start);
+    let mut data = vec![0u8; n_rows_sub.saturating_mul(row_stride)];
+
+    for (dst_r, src_r) in (row_start..row_end).enumerate() {
+        let src_row = &bits_flat[src_r * row_words..(src_r + 1) * row_words];
+        let dst_start = dst_r * row_stride;
+        for (j, &sid) in sample_indices.iter().enumerate() {
+            if sid >= n_samples_all {
+                return Err(format!(
+                    "sample index out of range while densifying flat: {sid}"
+                ));
+            }
+            data[dst_start + j] =
+                ((src_row[sid >> 6] >> (sid & 63)) & 1u64) as u8;
+        }
+    }
+    Ok((data, row_stride))
+}
+
 fn dense_binary_rows_from_full_bits(
     bits_flat: &[u64],
     row_words: usize,
@@ -4496,6 +4536,51 @@ fn dense_binary_rows_from_full_bits(
         out.push(dense);
     }
     Ok(out)
+}
+
+/// Flat variant: returns `(data, row_stride)` where data is row-major
+/// `[row0_sample0, row0_sample1, ..., row1_sample0, ...]`.
+/// Single allocation, no per-row Vec overhead.
+fn dense_binary_rows_from_full_bits_flat(
+    bits_flat: &[u64],
+    row_words: usize,
+    row_indices: &[usize],
+    sample_indices: &[usize],
+    n_rows_all: usize,
+    n_samples_all: usize,
+) -> Result<(Vec<u8>, usize), String> {
+    if row_words != words_for_samples(n_samples_all) {
+        return Err(format!(
+            "row_words mismatch for full bit matrix: got {row_words}, expected {}",
+            words_for_samples(n_samples_all)
+        ));
+    }
+    if bits_flat.len() != n_rows_all.saturating_mul(row_words) {
+        return Err("full bit matrix length mismatch".to_string());
+    }
+    let row_stride = sample_indices.len();
+    let n_rows = row_indices.len();
+    let mut data = vec![0u8; n_rows.saturating_mul(row_stride)];
+
+    for (dst_r, &src_r) in row_indices.iter().enumerate() {
+        if src_r >= n_rows_all {
+            return Err(format!(
+                "row index out of range while densifying flat: {src_r}"
+            ));
+        }
+        let src_row = &bits_flat[src_r * row_words..(src_r + 1) * row_words];
+        let dst_start = dst_r * row_stride;
+        for (j, &sid) in sample_indices.iter().enumerate() {
+            if sid >= n_samples_all {
+                return Err(format!(
+                    "sample index out of range while densifying flat: {sid}"
+                ));
+            }
+            data[dst_start + j] =
+                ((src_row[sid >> 6] >> (sid & 63)) & 1u64) as u8;
+        }
+    }
+    Ok((data, row_stride))
 }
 
 fn packed_rows_subset_from_full_bits_range(
@@ -4805,11 +4890,50 @@ fn select_logic_unit_global_rows(
     train_idx_local: &[usize],
     y_train: &[f64],
     allow_parallel: bool,
+    
 ) -> Result<Option<Vec<usize>>, String> {
     if unit.indices.is_empty() {
         return Ok(None);
     }
     let selected_global_rows = if let Some(engine_one) = engine {
+        let n_region = unit.indices.len();
+        let keep_k = resolve_ml_keep_k(n_region, ml_top_k, ml_top_frac);
+
+        // ---- PairwiseAnd fast path: flat dense, single allocation ----------
+        if engine_one == MlEngine::PairwiseAnd {
+            let t0 = Instant::now();
+            let (flat_data, row_stride) = dense_binary_rows_from_full_bits_flat(
+                logic_bits.bits_flat.as_slice(),
+                logic_bits.row_words,
+                unit.indices.as_slice(),
+                train_idx_local,
+                logic_bits.sites.len(),
+                logic_bits.n_samples,
+            )?;
+            let scores = feature_scores_pairwise_and_flat(
+                flat_data.as_slice(),
+                row_stride,
+                n_region,
+                y_train,
+                train_idx_local.len(),
+            );
+            let top_local = topk_indices(&scores, keep_k);
+            GARFIELD_ML_SELECT_NS.fetch_add(
+                t0.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                Ordering::Relaxed,
+            );
+            if top_local.is_empty() {
+                return Ok(None);
+            }
+            return Ok(Some(
+                top_local
+                    .iter()
+                    .map(|&idx| unit.indices[idx])
+                    .collect::<Vec<_>>(),
+            ));
+        }
+
+        // ---- General ML path (Vec<Vec<u8>>) ----
         let dense_train = dense_binary_rows_from_full_bits(
             logic_bits.bits_flat.as_slice(),
             logic_bits.row_words,
@@ -4821,8 +4945,6 @@ fn select_logic_unit_global_rows(
         if dense_train.is_empty() {
             return Ok(None);
         }
-        let n_region = dense_train.len();
-        let keep_k = resolve_ml_keep_k(n_region, ml_top_k, ml_top_frac);
         let ml_group_ids = build_unit_window_group_ids(
             unit,
             unit.indices.as_slice(),
@@ -4973,46 +5095,101 @@ fn prepare_logic_chunk_continuous(
         return Ok(None);
     }
 
+    let n_region = row_end.saturating_sub(row_start);
+    let keep_k = resolve_ml_keep_k(n_region, ml_top_k, ml_top_frac);
+    let keep_policy = GarfieldMlKeepPolicy::TopKPlusRandom {
+        top_frac: GARFIELD_NULL_ML_TOP_FRAC,
+    };
+    let selection_seed =
+        perm_cfg.seed ^ chunk.window_id ^ 0x94D0_49BB_1331_11EB;
+
     let selected_global_rows = if let Some(engine_one) = engine {
-        let dense_train = dense_binary_rows_from_full_bits_range(
-            logic_bits.bits_flat.as_slice(),
-            logic_bits.row_words,
-            row_start,
-            row_end,
-            train_idx_local,
-            logic_bits.sites.len(),
-            logic_bits.n_samples,
-        )?;
-        if dense_train.is_empty() {
-            return Ok(None);
+        // ---- PairwiseAnd fast path: flat dense, single allocation ----------
+        if engine_one == MlEngine::PairwiseAnd {
+            let (flat_data, row_stride) = dense_binary_rows_from_full_bits_range_flat(
+                logic_bits.bits_flat.as_slice(),
+                logic_bits.row_words,
+                row_start,
+                row_end,
+                train_idx_local,
+                logic_bits.sites.len(),
+                logic_bits.n_samples,
+            )?;
+            let scores = feature_scores_pairwise_and_flat(
+                flat_data.as_slice(),
+                row_stride,
+                n_region,
+                y_train,
+                train_idx_local.len(),
+            );
+            let (top_keep, rand_keep) =
+                resolve_ml_top_random_counts(keep_k, GARFIELD_NULL_ML_TOP_FRAC);
+            let mut top_local = topk_indices(&scores, top_keep.max(1));
+            if rand_keep > 0 && top_local.len() < n_region {
+                let mut picked = vec![false; n_region];
+                for &idx in top_local.iter() {
+                    if idx < n_region { picked[idx] = true; }
+                }
+                let remaining: Vec<usize> =
+                    (0..n_region).filter(|&i| !picked[i]).collect();
+                if !remaining.is_empty() {
+                    let sample_n = rand_keep.min(remaining.len());
+                    let mut rng = StdRng::seed_from_u64(selection_seed);
+                    let sampled = sample_indices_without_replacement(
+                        &mut rng, remaining.len(), sample_n,
+                    );
+                    let mut extra: Vec<usize> =
+                        sampled.into_vec().into_iter().map(|i| remaining[i]).collect();
+                    extra.sort_unstable();
+                    top_local.extend(extra);
+                }
+            }
+            if top_local.is_empty() {
+                return Ok(None);
+            }
+            // Fall through to common path: convert local → global indices
+            top_local
+                .into_iter()
+                .map(|idx| row_start + idx)
+                .collect::<Vec<_>>()
+        } else {
+            // ---- General ML path ----
+            let dense_train = dense_binary_rows_from_full_bits_range(
+                logic_bits.bits_flat.as_slice(),
+                logic_bits.row_words,
+                row_start,
+                row_end,
+                train_idx_local,
+                logic_bits.sites.len(),
+                logic_bits.n_samples,
+            )?;
+            if dense_train.is_empty() {
+                return Ok(None);
+            }
+            let top_local = select_ml_top_local_indices(
+                dense_train.as_slice(),
+                y_train,
+                response,
+                engine_one,
+                ExtraTreesConfig {
+                    allow_parallel: beam_params.allow_parallel,
+                    ..tree_cfg
+                },
+                importance,
+                perm_cfg,
+                keep_k,
+                keep_policy,
+                selection_seed,
+                None,
+            )?;
+            if top_local.is_empty() {
+                return Ok(None);
+            }
+            top_local
+                .into_iter()
+                .map(|idx| row_start + idx)
+                .collect::<Vec<_>>()
         }
-        let n_region = dense_train.len();
-        let keep_k = resolve_ml_keep_k(n_region, ml_top_k, ml_top_frac);
-        let top_local = select_ml_top_local_indices(
-            dense_train.as_slice(),
-            y_train,
-            response,
-            engine_one,
-            ExtraTreesConfig {
-                allow_parallel: beam_params.allow_parallel,
-                ..tree_cfg
-            },
-            importance,
-            perm_cfg,
-            keep_k,
-            GarfieldMlKeepPolicy::TopKPlusRandom {
-                top_frac: GARFIELD_NULL_ML_TOP_FRAC,
-            },
-            perm_cfg.seed ^ chunk.window_id ^ 0x94D0_49BB_1331_11EB,
-            None,
-        )?;
-        if top_local.is_empty() {
-            return Ok(None);
-        }
-        top_local
-            .into_iter()
-            .map(|idx| row_start + idx)
-            .collect::<Vec<_>>()
     } else {
         (row_start..row_end).collect::<Vec<_>>()
     };
@@ -5115,7 +5292,6 @@ fn collect_rule_permutation_nulls_for_repeat(
         return Ok(Vec::new());
     }
 
-    let logic_gate_mode = beam_params.logic_gate_mode;
     let perm_train = shuffled_copy_f64(y_train, rep_seed);
     let perm_test = if split_applied {
         shuffled_copy_f64(y_test, rep_seed ^ 0xD1B5_4A32_D192_ED03)
@@ -5137,7 +5313,7 @@ fn collect_rule_permutation_nulls_for_repeat(
     )?;
     let mut idxs_by_bucket = HashMap::<RuleNullBucket, Vec<usize>>::new();
     for (cand_idx, cand) in perm_hits.iter().enumerate() {
-        let bucket = bucket_from_rule(&cand.rule, cand.train.support_frac, logic_gate_mode);
+        let bucket = bucket_from_rule(&cand.rule, cand.train.support_frac);
         idxs_by_bucket.entry(bucket).or_default().push(cand_idx);
     }
     let mut out = Vec::<(RuleNullBucket, f64, f64)>::new();
@@ -5892,7 +6068,9 @@ fn process_structure_prior_unit_chunk(
 fn parse_optional_ml_engine(method: &str) -> Result<Option<MlEngine>, String> {
     let norm = method.trim().to_ascii_lowercase();
     match norm.as_str() {
-        "" | "none" | "skip" | "direct" => Ok(None),
+        // Default: pairwise interaction screening (fast + interaction-aware).
+        "" | "auto" => Ok(Some(MlEngine::PairwiseAnd)),
+        "none" | "skip" | "direct" => Ok(None),
         _ => parse_ml_engine(norm.as_str()).map(Some),
     }
 }
@@ -6195,7 +6373,6 @@ fn garfield_logic_search_bed_owned(
     max_pick: usize,
     exhaustive_depth: usize,
     beam_width: usize,
-    logic_gate: String,
     rank_score: String,
     maf_threshold: f32,
     max_missing_rate: f32,
@@ -6545,7 +6722,6 @@ fn garfield_logic_search_bed_owned(
     let response = ResponseKind::Continuous;
     let engine = parse_optional_ml_engine(&ml_method)?;
     let importance = parse_importance(&ml_importance)?;
-    let logic_gate_mode = parse_beam_logic_gate_mode(&logic_gate)?;
     let rank_mode = parse_beam_rank_mode(&rank_score)?;
     let perm_cfg = PermutationConfig {
         n_repeats: permutation_repeats
@@ -6568,7 +6744,6 @@ fn garfield_logic_search_bed_owned(
         lambda_len: 0.0,
         lambda_not: 0.0,
         exhaustive_depth: exhaustive_depth.max(1),
-        logic_gate_mode,
         rank_mode,
         null_penalties: None,
         structure_prior: None,
@@ -6889,10 +7064,8 @@ fn garfield_logic_search_bed_owned(
             disable_parent_delta: true,
             ..beam_params.clone()
         };
-        let mut bucket_scores = RuleNullCalibrator::with_max_rule_len(
-            beam_params.max_pick.max(1),
-            matches!(logic_gate_mode, BeamLogicGateMode::AndOr),
-        );
+        let mut bucket_scores =
+            RuleNullCalibrator::with_max_rule_len(beam_params.max_pick.max(1));
         let min_perm_repeats =
             DEFAULT_RULE_NULL_ADAPTIVE_MIN_REPEATS.min(perm_cfg.n_repeats.max(1));
         let mut stable_rounds = 0usize;
@@ -7155,6 +7328,7 @@ fn garfield_logic_search_bed_owned(
         progress_every.max(1)
     };
     reset_garfield_beam_profile();
+    GARFIELD_ML_SELECT_NS.store(0, Ordering::Relaxed);
     let scan_stage_t0 = Instant::now();
     let scan_progress_done = AtomicUsize::new(0);
     garfield_stage_progress_notify(
@@ -7272,6 +7446,8 @@ fn garfield_logic_search_bed_owned(
         .into_inner()
         .map_err(|_| "GARFIELD skipped-messages mutex poisoned".to_string())?;
     let scan_stage_wall_s = scan_stage_t0.elapsed().as_secs_f64();
+    let timing_scan_ml_select_wall_s =
+        (GARFIELD_ML_SELECT_NS.load(Ordering::Relaxed) as f64) * 1e-9;
     let scan_beam_profile = snapshot_garfield_beam_profile();
 
     records = dedup_logic_rule_records(records);
@@ -7387,6 +7563,7 @@ fn garfield_logic_search_bed_owned(
         units_scanned: scanned_units,
         timing_total_wall_s: total_wall_s,
         timing_scan_wall_s: scan_stage_wall_s,
+        timing_scan_ml_select_wall_s,
         timing_scan_beam_wall_s,
         timing_scan_literal_score_wall_s,
         timing_scan_beam_calls: scan_beam_profile.calls,
@@ -7416,7 +7593,7 @@ fn garfield_logic_search_bed_owned(
     step=None,
     scan_bimranges=None,
     bin_mode="bin",
-    ml_method="rf",
+    ml_method="",
     ml_importance="imp",
     ml_top_k=64,
     ml_top_frac=0.0,
@@ -7433,7 +7610,6 @@ fn garfield_logic_search_bed_owned(
     max_pick=4,
     exhaustive_depth=1,
     beam_width=100,
-    logic_gate="ao",
     rank_score="interaction_gain",
     maf_threshold=0.02,
     max_missing_rate=0.05,
@@ -7490,7 +7666,6 @@ pub fn garfield_logic_search_bed_py<'py>(
     max_pick: usize,
     exhaustive_depth: usize,
     beam_width: usize,
-    logic_gate: &str,
     rank_score: &str,
     maf_threshold: f32,
     max_missing_rate: f32,
@@ -7585,7 +7760,6 @@ pub fn garfield_logic_search_bed_py<'py>(
                 max_pick,
                 exhaustive_depth,
                 beam_width,
-                logic_gate.to_string(),
                 rank_score.to_string(),
                 maf_threshold,
                 max_missing_rate,
@@ -7647,6 +7821,10 @@ pub fn garfield_logic_search_bed_py<'py>(
     out.set_item("units_scanned", result.units_scanned)?;
     out.set_item("timing_total_wall_s", result.timing_total_wall_s)?;
     out.set_item("timing_scan_wall_s", result.timing_scan_wall_s)?;
+    out.set_item(
+        "timing_scan_ml_select_wall_s",
+        result.timing_scan_ml_select_wall_s,
+    )?;
     out.set_item("timing_scan_beam_wall_s", result.timing_scan_beam_wall_s)?;
     out.set_item(
         "timing_scan_literal_score_wall_s",
@@ -8758,22 +8936,6 @@ mod tests {
         assert_eq!(row_bytes, row_bytes_for_samples(n_samples));
         assert_eq!(group_ids, vec![0u64, 0, 0, 1, 1, 1]);
         assert_eq!(packed.len(), n_rows * row_bytes);
-    }
-
-    #[test]
-    fn test_parse_beam_logic_gate_mode_aliases() {
-        assert_eq!(
-            parse_beam_logic_gate_mode("A").unwrap(),
-            BeamLogicGateMode::AndOnly
-        );
-        assert_eq!(
-            parse_beam_logic_gate_mode("or").unwrap(),
-            BeamLogicGateMode::OrOnly
-        );
-        assert_eq!(
-            parse_beam_logic_gate_mode("and_or").unwrap(),
-            BeamLogicGateMode::AndOr
-        );
     }
 
     #[test]

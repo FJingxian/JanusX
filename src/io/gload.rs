@@ -148,7 +148,6 @@ impl StreamingBedMatrix {
     /// Ensure `buf` contains the packed bytes for source rows `[start .. end)`.
     /// Returns a slice covering the requested range.
     pub fn read_source_range(&mut self, start: usize, end: usize) -> Result<&[u8], String> {
-        use std::os::unix::fs::FileExt;
         let bps = self.bytes_per_snp;
         let need = end.saturating_sub(start).saturating_mul(bps);
         if need > self.buf.len() {
@@ -158,8 +157,20 @@ impl StreamingBedMatrix {
             return Ok(&self.buf[..need]);
         }
         let offset = 3u64.saturating_add((start.saturating_mul(bps)) as u64);
-        self.file.read_exact_at(&mut self.buf[..need], offset)
-            .map_err(|e| format!("read BED rows [{start}..{end}) at offset {offset}: {e}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileExt;
+            self.file.read_exact_at(&mut self.buf[..need], offset)
+                .map_err(|e| format!("read BED rows [{start}..{end}): {e}"))?;
+        }
+        #[cfg(not(unix))]
+        {
+            use std::io::{Read, Seek, SeekFrom};
+            self.file.seek(SeekFrom::Start(offset))
+                .map_err(|e| format!("BED seek: {e}"))?;
+            self.file.read_exact(&mut self.buf[..need])
+                .map_err(|e| format!("BED read: {e}"))?;
+        }
         self.buf_range = (start, end);
         Ok(&self.buf[..need])
     }

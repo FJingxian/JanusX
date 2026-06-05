@@ -5251,14 +5251,16 @@ def parse_args(argv: Optional[list[str]] = None):
         default=None,
         metavar="CUTOFF",
         help=(
-            "Run SparseLMM (additive-only) with exact g'Pg denominator. "
+            "Run SparseLMM (additive-only) with two-stage scan: genome-wide "
+            "GRAMMAR-gamma approximation followed by exact g'Pg rescan for "
+            "SNPs passing p <= max(1e-4, 10/m). "
             "SparseLMM builds or reuses sparse GRM from the main genotype input, "
             "estimates variance components, then scans via sparse Cholesky. "
             "Optional CUTOFF sets the sparse kinship cutoff (example: -splmm 0.001; default: 0.05)."
         ),
     )
     models_group.add_argument(
-        "-splmm-approx", "--splmm-approx",
+        "-splmm-approx", "--splmm-approx", "-splmm-aprox", "--splmm-aprox",
         dest="splmm_approx",
         nargs="?",
         const="__SELF__",
@@ -5463,7 +5465,7 @@ def parse_args(argv: Optional[list[str]] = None):
 
     # Normalise SPLMM mode flags: exactly one of -splmm / -splmm-approx / -splmm-exact.
     _splmm_modes = [
-        (args.splmm,       "exact"),   # default -splmm → exact denominator
+        (args.splmm,       "two_stage"),   # default -splmm → two-stage scan
         (args.splmm_approx, "approx"),
         (args.splmm_exact, "exact"),
     ]
@@ -6244,7 +6246,6 @@ def _run_gwas_pipeline(
                     def _run_route_splmm_packed(
                         trait_one: list[str], emit_trait_header_model: bool
                     ) -> None:
-                        exact_denom = (args._splmm_denom_mode == "exact")
                         run_splmm_packed_fullrank(
                             genofile=genofile_stream,
                             splmm_source=args.splmm,
@@ -6271,7 +6272,7 @@ def _run_gwas_pipeline(
                             trait_names=trait_one,
                             emit_trait_header=bool(emit_trait_header_model),
                             preloaded_packed=preloaded_packed,
-                            exact_denom=exact_denom,
+                            scan_mode=str(args._splmm_denom_mode or "two_stage"),
                         )
 
                     def _run_route_fastlmm_stream(

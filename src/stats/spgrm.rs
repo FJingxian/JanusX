@@ -1772,7 +1772,7 @@ fn spgrm_probe_self_accum_syrk_faster(n_cols: usize, rows: usize) -> bool {
     // Benchmark: run syrk and gemm each a few times, pick the faster.
     let probe_rows = rows.min(256);  // small representative block
     let probe_n = n_cols.min(256);
-    let mut a = vec![0.0_f32; probe_rows * probe_n];
+    let a = vec![0.0_f32; probe_rows * probe_n];
     let mut c = vec![0.0_f32; probe_n * probe_n];
 
     let mut bench = |use_syrk: bool| -> f64 {

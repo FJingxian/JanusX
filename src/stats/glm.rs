@@ -32,7 +32,7 @@ use crate::gfcore::BedSnpIter;
 use crate::gfreader::{
     build_sample_selection, prepare_bed_logic_meta_owned_for_stats_samples,
 };
-use crate::gload::{BedMmapMatrix, GenotypeMatrix, GlobalStats, PackedBedMatrix, UnifiedInput};
+use crate::gload::{GenotypeMatrix, UnifiedInput};
 use crate::he::row_major_block_mul_mat_f32;
 use crate::linalg::format_chisq_value;
 use crate::stats_common::{get_cached_pool, parse_index_vec_i64, AsyncTsvWriter};

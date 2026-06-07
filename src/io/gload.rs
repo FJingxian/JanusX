@@ -23,12 +23,49 @@ use crate::gfreader::{
 };
 use crate::stats_common::get_cached_pool;
 
+#[cfg(unix)]
+fn read_file_exact_at(file: &File, buf: &mut [u8], offset: u64) -> Result<(), String> {
+    use std::os::unix::fs::FileExt;
+    file.read_exact_at(buf, offset)
+        .map_err(|e| format!("BED positioned read: {e}"))
+}
+
+#[cfg(windows)]
+fn read_file_exact_at(file: &File, buf: &mut [u8], offset: u64) -> Result<(), String> {
+    use std::os::windows::fs::FileExt;
+
+    let mut done = 0usize;
+    while done < buf.len() {
+        let n = file
+            .seek_read(&mut buf[done..], offset + done as u64)
+            .map_err(|e| format!("BED positioned read: {e}"))?;
+        if n == 0 {
+            return Err("BED positioned read: unexpected EOF".to_string());
+        }
+        done += n;
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn read_file_exact_at(file: &File, buf: &mut [u8], offset: u64) -> Result<(), String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = file
+        .try_clone()
+        .map_err(|e| format!("BED file clone for positioned read: {e}"))?;
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|e| format!("BED seek: {e}"))?;
+    file.read_exact(buf).map_err(|e| format!("BED read: {e}"))
+}
+
 /// Per-marker statistics computed once at load time.
 ///
 /// All vectors are in **kept-marker order** (i.e. after MAF/missing/het
 /// filtering).  `site_keep` is the only field indexed in the **original**
 /// SNP order.
 #[derive(Clone)]
+#[allow(dead_code)]
 pub struct GlobalStats {
     pub maf: Vec<f32>,
     pub miss: Vec<f32>,
@@ -70,6 +107,7 @@ impl GlobalStats {
 // GenotypeMatrix trait
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
 pub trait GenotypeMatrix: Send + Sync {
     fn n_samples_full(&self) -> usize;
     fn bytes_per_snp(&self) -> usize;
@@ -129,6 +167,7 @@ pub trait GenotypeMatrix: Send + Sync {
 /// Reads BED rows on-demand via `pread` (or `seek`+`read`) instead of
 /// mmap-ing the whole file.  Dramatically reduces RSS for large BEDs
 /// when only sequential access is needed (e.g. GWAS scan).
+#[allow(dead_code)]
 pub struct StreamingBedMatrix {
     file: std::fs::File,
     n_samples_full: usize,
@@ -139,6 +178,7 @@ pub struct StreamingBedMatrix {
     buf_range: (usize, usize),
 }
 
+#[allow(dead_code)]
 impl StreamingBedMatrix {
     /// Open a BED prefix for streaming reads.
     pub fn open(prefix: &str, block_rows: usize) -> Result<Self, String> {
@@ -175,28 +215,14 @@ impl StreamingBedMatrix {
             return Ok(&self.buf[..need]);
         }
         let offset = 3u64.saturating_add((start.saturating_mul(bps)) as u64);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::FileExt;
-            self.file
-                .read_exact_at(&mut self.buf[..need], offset)
-                .map_err(|e| format!("read BED rows [{start}..{end}): {e}"))?;
-        }
-        #[cfg(not(unix))]
-        {
-            use std::io::{Read, Seek, SeekFrom};
-            self.file
-                .seek(SeekFrom::Start(offset))
-                .map_err(|e| format!("BED seek: {e}"))?;
-            self.file
-                .read_exact(&mut self.buf[..need])
-                .map_err(|e| format!("BED read: {e}"))?;
-        }
+        read_file_exact_at(&self.file, &mut self.buf[..need], offset)
+            .map_err(|e| format!("read BED rows [{start}..{end}): {e}"))?;
         self.buf_range = (start, end);
         Ok(&self.buf[..need])
     }
 }
 
+#[allow(dead_code)]
 impl StreamingBedMatrix {
     /// Pre-fetch the byte range for a block of kept markers and return a
     /// contiguous packed slice + relative row-source indices ready for
@@ -283,6 +309,7 @@ impl GenotypeMatrix for StreamingBedMatrix {
 // BedMmapMatrix
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
 pub struct BedMmapMatrix {
     mmap: Arc<Mmap>,
     n_samples_full: usize,
@@ -290,6 +317,7 @@ pub struct BedMmapMatrix {
     bed_prefix: String,
 }
 
+#[allow(dead_code)]
 impl BedMmapMatrix {
     pub fn open(prefix: &str) -> Result<Self, String> {
         let bed_prefix = normalize_plink_prefix(prefix);
@@ -347,12 +375,14 @@ impl GenotypeMatrix for BedMmapMatrix {
 // PackedBedMatrix
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
 pub struct PackedBedMatrix {
     payload: Arc<[u8]>,
     n_samples_full: usize,
     bytes_per_snp: usize,
 }
 
+#[allow(dead_code)]
 impl PackedBedMatrix {
     pub fn from_packed(payload: Arc<[u8]>, n_samples_full: usize) -> Result<Self, String> {
         let bytes_per_snp = n_samples_full.div_ceil(4);
@@ -400,6 +430,7 @@ pub struct UnifiedInput<G: GenotypeMatrix> {
     pub stats: GlobalStats,
 }
 
+#[allow(dead_code)]
 impl<G: GenotypeMatrix> UnifiedInput<G> {
     #[inline]
     pub fn n_samples(&self) -> usize {
@@ -489,6 +520,7 @@ impl<G: GenotypeMatrix> UnifiedInput<G> {
 // Construction
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
 pub fn compute_global_stats_mmap(
     prefix: &str,
     maf_threshold: f32,
@@ -618,6 +650,7 @@ pub fn compute_global_stats_mmap(
     })
 }
 
+#[allow(dead_code)]
 pub fn open_bed_mmap_unified(
     prefix: &str,
     maf_threshold: f32,
@@ -645,6 +678,7 @@ pub fn open_bed_mmap_unified(
 // ---------------------------------------------------------------------------
 
 #[inline]
+#[allow(dead_code)]
 fn normalize_plink_prefix(prefix: &str) -> String {
     let mut out = prefix.trim().to_string();
     let lower = out.to_ascii_lowercase();
@@ -655,6 +689,7 @@ fn normalize_plink_prefix(prefix: &str) -> String {
 }
 
 #[inline]
+#[allow(dead_code)]
 fn is_simple_snp_allele(allele: &str) -> bool {
     matches!(allele, "A" | "C" | "G" | "T" | "a" | "c" | "g" | "t")
 }
@@ -664,6 +699,7 @@ fn is_simple_snp_allele(allele: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy)]
+#[allow(dead_code)]
 pub enum PackedGeneticModel {
     Add,
     Dom,
@@ -677,6 +713,7 @@ pub enum PackedGeneticModel {
 
 /// Centered block decode for any GenotypeMatrix backend.
 /// Uses `crate::lmm_scan::decode_centered_block_packed_f32` internally.
+#[allow(dead_code)]
 pub fn decode_centered_block_unified<G: GenotypeMatrix>(
     matrix: &G,
     stats: &GlobalStats,

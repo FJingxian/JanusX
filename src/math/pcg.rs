@@ -5,8 +5,7 @@ use std::fs::File;
 use std::sync::Arc;
 
 use crate::bedmath::{
-    adaptive_grm_block_rows, decode_standardized_packed_block_rows_f32, is_identity_indices,
-    packed_byte_lut,
+    adaptive_grm_block_rows, is_identity_indices, packed_byte_lut,
 };
 use crate::gfcore::{read_bim, read_fam};
 use crate::he::{
@@ -311,7 +310,6 @@ pub(crate) struct PcgGrmBedOperator<'a> {
     row_flip: Vec<bool>,
     row_mean: Vec<f32>,
     row_inv_sd: Vec<f32>,
-    diag_k: Vec<f32>,
     row_indices: Option<Vec<usize>>,
     block_rows: usize,
     m_scale: f32,
@@ -319,62 +317,6 @@ pub(crate) struct PcgGrmBedOperator<'a> {
     workspace: GrmApplyWorkspace,
     rhs_f32: Vec<f32>,
     out_f32: Vec<f32>,
-}
-
-#[allow(clippy::too_many_arguments)]
-fn pcg_compute_grm_diag_f32(
-    packed_flat: &[u8],
-    bytes_per_snp: usize,
-    n_samples_full: usize,
-    row_flip: &[bool],
-    row_mean: &[f32],
-    row_inv_sd: &[f32],
-    sample_idx: &[usize],
-    full_sample_fast: bool,
-    row_indices: Option<&[usize]>,
-    block_rows: usize,
-    m_scale: f32,
-    code4_lut: &[[u8; 4]; 256],
-    pool: Option<&Arc<rayon::ThreadPool>>,
-) -> Result<Vec<f32>, String> {
-    let m = row_flip.len();
-    let n_out = sample_idx.len();
-    let mut diag = vec![0.0_f32; n_out];
-    if m == 0 || n_out == 0 {
-        return Ok(diag);
-    }
-    let row_step = block_rows.max(1).min(m.max(1));
-    let mut block = vec![0.0_f32; row_step.saturating_mul(n_out)];
-    for st in (0..m).step_by(row_step) {
-        let ed = (st + row_step).min(m);
-        let cur_rows = ed - st;
-        let blk_slice = &mut block[..cur_rows * n_out];
-        decode_standardized_packed_block_rows_f32(
-            packed_flat,
-            bytes_per_snp,
-            n_samples_full,
-            row_flip,
-            row_mean,
-            row_inv_sd,
-            sample_idx,
-            full_sample_fast,
-            row_indices,
-            st,
-            blk_slice,
-            code4_lut,
-            pool,
-        )?;
-        for row in blk_slice.chunks(n_out) {
-            for (dst, &value) in diag.iter_mut().zip(row.iter()) {
-                *dst += value * value;
-            }
-        }
-    }
-    let scale = m_scale.max(1e-12_f32);
-    for value in diag.iter_mut() {
-        *value /= scale;
-    }
-    Ok(diag)
 }
 
 impl<'a> PcgGrmBedOperator<'a> {
@@ -389,29 +331,6 @@ impl<'a> PcgGrmBedOperator<'a> {
             Cow::Owned(bytes) => PcgBedPayload::Owned(bytes),
         };
         Self::from_payload(payload, n_samples_full, cfg)
-    }
-
-    pub(crate) fn from_packed_rows_with_progress<F>(
-        packed: Cow<'a, [u8]>,
-        n_samples_full: usize,
-        cfg: PcgGrmBedConfig,
-        progress_callback: Option<&mut F>,
-        progress_every_rows: usize,
-    ) -> Result<Self, String>
-    where
-        F: FnMut(usize, usize) -> Result<(), String>,
-    {
-        let payload = match packed {
-            Cow::Borrowed(bytes) => PcgBedPayload::Borrowed(bytes),
-            Cow::Owned(bytes) => PcgBedPayload::Owned(bytes),
-        };
-        Self::from_payload_with_progress(
-            payload,
-            n_samples_full,
-            cfg,
-            progress_callback,
-            progress_every_rows,
-        )
     }
 
     #[allow(dead_code)]
@@ -594,13 +513,6 @@ impl<'a> PcgGrmBedOperator<'a> {
         let block_rows =
             adaptive_grm_block_rows(base_rows, row_flip.len(), n_samples_used, 0usize, threads)
                 .max(1);
-        let mut diag_k = row_stats
-            .sample_diag_sum
-            .unwrap_or_else(|| vec![0.0_f32; n_samples_used]);
-        let scale = (row_stats.m_effective as f32).max(1e-12_f32);
-        for value in diag_k.iter_mut() {
-            *value /= scale;
-        }
         Ok(Self {
             payload,
             bytes_per_snp,
@@ -611,7 +523,6 @@ impl<'a> PcgGrmBedOperator<'a> {
             row_flip,
             row_mean: row_stats.row_mean,
             row_inv_sd: row_stats.row_inv_sd,
-            diag_k,
             row_indices,
             block_rows,
             m_scale: row_stats.m_effective as f32,
@@ -622,43 +533,6 @@ impl<'a> PcgGrmBedOperator<'a> {
         })
     }
 
-    pub(crate) fn variance_jacobi_inv_diag(
-        &self,
-        sigma_g2: f64,
-        sigma_e2: f64,
-    ) -> Result<Vec<f64>, String> {
-        pcg_validate_variance_components(sigma_g2, sigma_e2)?;
-        let diag_src: Cow<'_, [f32]> = if self.diag_k.len() == self.n_samples_used {
-            Cow::Borrowed(self.diag_k.as_slice())
-        } else {
-            Cow::Owned(pcg_compute_grm_diag_f32(
-                self.payload.as_packed_bytes(),
-                self.bytes_per_snp,
-                self.n_samples_full,
-                &self.row_flip,
-                &self.row_mean,
-                &self.row_inv_sd,
-                &self.sample_idx,
-                self.full_sample_fast,
-                self.row_indices.as_deref(),
-                self.block_rows,
-                self.m_scale,
-                &packed_byte_lut().code4,
-                self.pool.as_ref(),
-            )?)
-        };
-        let mut inv_diag = vec![0.0_f64; diag_src.len()];
-        for (dst, &kdiag) in inv_diag.iter_mut().zip(diag_src.iter()) {
-            let denom = sigma_g2 * (kdiag as f64) + sigma_e2;
-            if !denom.is_finite() || denom <= 0.0 {
-                return Err(format!(
-                    "PCG Jacobi preconditioner encountered non-positive V diagonal: sigma_g2={sigma_g2}, sigma_e2={sigma_e2}, Kdiag={kdiag}"
-                ));
-            }
-            *dst = 1.0_f64 / denom;
-        }
-        Ok(inv_diag)
-    }
 }
 
 impl PcgOperator<f64> for PcgGrmBedOperator<'_> {
@@ -690,61 +564,6 @@ impl PcgOperator<f64> for PcgGrmBedOperator<'_> {
             self.block_rows,
             &self.rhs_f32,
             1usize,
-            self.m_scale,
-            &packed_byte_lut().code4,
-            self.pool.as_ref(),
-            &mut self.workspace,
-            None,
-            &mut self.out_f32,
-        )?;
-        for (dst, &src) in output.iter_mut().zip(self.out_f32.iter()) {
-            *dst = src as f64;
-        }
-        Ok(())
-    }
-}
-
-impl PcgGrmBedOperator<'_> {
-    pub(crate) fn apply_mat_row_major_f64(
-        &mut self,
-        input: &[f64],
-        n_rhs: usize,
-        output: &mut [f64],
-    ) -> Result<(), String> {
-        let total = self.n_samples_used.saturating_mul(n_rhs);
-        if input.len() != total || output.len() != total {
-            return Err(format!(
-                "PCG GRM BED matrix apply length mismatch: input={}, out={}, expected={}",
-                input.len(),
-                output.len(),
-                total
-            ));
-        }
-        if self.rhs_f32.len() != total {
-            self.rhs_f32.resize(total, 0.0_f32);
-        }
-        if self.out_f32.len() != total {
-            self.out_f32.resize(total, 0.0_f32);
-        }
-        for (dst, &src) in self.rhs_f32.iter_mut().zip(input.iter()) {
-            if !src.is_finite() {
-                return Err("PCG GRM BED matrix apply received non-finite input".to_string());
-            }
-            *dst = src as f32;
-        }
-        apply_grm_to_mat_f32_with_workspace(
-            self.payload.as_packed_bytes(),
-            self.bytes_per_snp,
-            self.n_samples_full,
-            &self.row_flip,
-            &self.row_mean,
-            &self.row_inv_sd,
-            &self.sample_idx,
-            self.full_sample_fast,
-            self.row_indices.as_deref(),
-            self.block_rows,
-            &self.rhs_f32,
-            n_rhs,
             self.m_scale,
             &packed_byte_lut().code4,
             self.pool.as_ref(),

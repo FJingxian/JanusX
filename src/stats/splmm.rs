@@ -1746,69 +1746,6 @@ fn exact_scan_blocks_core<G: GenotypeMatrix>(
 }
 
 #[allow(clippy::too_many_arguments)]
-#[allow(dead_code)]
-// Scan using exact denominator g'Pg — in-memory sink writes into pre-allocated Vec<f64>.
-fn scan_with_py_and_exact_pg_sparse(
-    factor: &SparseJxgrmCholesky,
-    scan_prepared: &JxlmmPreparedInput,
-    x_design: &[f64],
-    x_design_col_major: &[f64],
-    x_design_xtx_chol: &[f64],
-    py_vec: &[f64],
-    xt_v_inv_x_chol: &[f64],
-    scan_sample_idx: &[usize],
-    gm: PackedGeneticModel,
-    threads: usize,
-    block_rows: usize,
-    scan_progress_callback: Option<&Py<PyAny>>,
-    progress_every: usize,
-    progress_stage: usize,
-    progress_done_offset: usize,
-    progress_total_override: usize,
-    solve_workspace: &mut SparseJxgrmSolveWorkspace,
-) -> Result<Vec<f64>, String> {
-    let m = scan_prepared.n_rows();
-    let mut out = vec![0.0_f64; m * 3];
-    let mut memory_sink = |row_start: usize, rows_here: usize, block: &[f64]| {
-        out[row_start * 3..][..rows_here * 3].copy_from_slice(block);
-        Ok(())
-    };
-    // Bridge through JxlmmMatrixAdapter (zero-copy) for backward compat.
-    let adapter = JxlmmMatrixAdapter {
-        inner: scan_prepared,
-    };
-    let stats = unified_stats_from_jxlmm(scan_prepared);
-    let mut input = UnifiedInput {
-        matrix: adapter,
-        stats,
-    };
-    exact_scan_blocks_core(
-        factor,
-        &mut input,
-        x_design,
-        x_design_col_major,
-        x_design_xtx_chol,
-        py_vec,
-        1.0_f64,
-        xt_v_inv_x_chol,
-        1.0_f64,
-        1.0_f64,
-        scan_sample_idx,
-        gm,
-        threads,
-        block_rows,
-        scan_progress_callback,
-        progress_every,
-        progress_stage,
-        progress_done_offset,
-        progress_total_override,
-        solve_workspace,
-        &mut memory_sink,
-    )?;
-    Ok(out)
-}
-
-#[allow(clippy::too_many_arguments)]
 fn scan_with_p0y_and_exact_p0_sparse(
     factor: &SparseJxgrmCholesky,
     scan_prepared: &JxlmmPreparedInput,
@@ -2262,110 +2199,6 @@ fn scan_with_p0y_and_gamma0(
     Ok(out)
 }
 
-#[allow(clippy::too_many_arguments)]
-#[allow(dead_code)]
-// GRAMMAR-gamma scan — TSV sink formats+streams each block to a file.
-fn scan_to_tsv_with_py_and_rhat(
-    scan_prepared: &JxlmmPreparedInput,
-    x_design: &[f64],
-    py_vec: &[f64],
-    xtx_chol: &[f64],
-    scan_sample_idx: &[usize],
-    gm: PackedGeneticModel,
-    r_hat: f64,
-    threads: usize,
-    block_rows: usize,
-    chrom: &[String],
-    pos: &[i64],
-    snp: &[String],
-    allele0: &[String],
-    allele1: &[String],
-    out_tsv: &str,
-    scan_progress_callback: Option<&Py<PyAny>>,
-    progress_every: usize,
-    progress_stage: usize,
-) -> Result<usize, String> {
-    if chrom.len() != scan_prepared.n_rows()
-        || pos.len() != scan_prepared.n_rows()
-        || snp.len() != scan_prepared.n_rows()
-        || allele0.len() != scan_prepared.n_rows()
-        || allele1.len() != scan_prepared.n_rows()
-    {
-        return Err(format!(
-            "SparseLMM TSV metadata length mismatch: rows={}, chrom={}, pos={}, snp={}, allele0={}, allele1={}",
-            scan_prepared.n_rows(),
-            chrom.len(),
-            pos.len(),
-            snp.len(),
-            allele0.len(),
-            allele1.len()
-        ));
-    }
-    let adapter = JxlmmMatrixAdapter {
-        inner: scan_prepared,
-    };
-    let stats = unified_stats_from_jxlmm(scan_prepared);
-    let mut input = UnifiedInput {
-        matrix: adapter,
-        stats,
-    };
-    let row_maf = input.stats.maf.clone();
-    let row_miss = input.stats.miss.clone();
-    let m = input.n_markers();
-    let writer = AsyncTsvWriter::with_config(
-        out_tsv,
-        b"chrom\tpos\tsnp\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\n",
-        64 * 1024 * 1024,
-        4,
-    )
-    .map_err(|e| e.to_string())?;
-    let mut text_buf = String::with_capacity(block_rows.max(512).max(1) * 112);
-    let mut tsv_sink = |row_start: usize, rows_here: usize, block: &[f64]| {
-        text_buf.clear();
-        append_splmm_tsv_block(
-            &mut text_buf,
-            row_start,
-            rows_here,
-            block,
-            chrom,
-            pos,
-            snp,
-            allele0,
-            allele1,
-            &row_maf,
-            &row_miss,
-            gm,
-        );
-        let payload = std::mem::take(&mut text_buf).into_bytes();
-        writer.send(payload)?;
-        Ok(())
-    };
-    let run_res = grammar_scan_blocks_core(
-        &mut input,
-        x_design,
-        py_vec,
-        1.0_f64,
-        xtx_chol,
-        scan_sample_idx,
-        gm,
-        r_hat,
-        1.0_f64,
-        threads,
-        block_rows,
-        scan_progress_callback,
-        progress_every,
-        progress_stage,
-        0,
-        0,
-        &mut tsv_sink,
-    );
-    let writer_result = writer.finish();
-    run_res?;
-    writer_result?;
-    Ok(m)
-}
-
-#[allow(clippy::too_many_arguments)]
 fn scan_to_tsv_with_p0y_and_gamma0(
     scan_prepared: &JxlmmPreparedInput,
     x_design: &[f64],
@@ -2472,116 +2305,6 @@ fn scan_to_tsv_with_p0y_and_gamma0(
     Ok(m)
 }
 
-#[allow(clippy::too_many_arguments)]
-#[allow(dead_code)]
-// Scan using exact denominator g'Pg — TSV sink formats+streams each block to a file.
-fn scan_to_tsv_with_py_and_exact_pg_sparse(
-    factor: &SparseJxgrmCholesky,
-    scan_prepared: &JxlmmPreparedInput,
-    x_design: &[f64],
-    x_design_col_major: &[f64],
-    x_design_xtx_chol: &[f64],
-    py_vec: &[f64],
-    xt_v_inv_x_chol: &[f64],
-    scan_sample_idx: &[usize],
-    gm: PackedGeneticModel,
-    threads: usize,
-    block_rows: usize,
-    chrom: &[String],
-    pos: &[i64],
-    snp: &[String],
-    allele0: &[String],
-    allele1: &[String],
-    out_tsv: &str,
-    scan_progress_callback: Option<&Py<PyAny>>,
-    progress_every: usize,
-    progress_stage: usize,
-    solve_workspace: &mut SparseJxgrmSolveWorkspace,
-) -> Result<usize, String> {
-    if chrom.len() != scan_prepared.n_rows()
-        || pos.len() != scan_prepared.n_rows()
-        || snp.len() != scan_prepared.n_rows()
-        || allele0.len() != scan_prepared.n_rows()
-        || allele1.len() != scan_prepared.n_rows()
-    {
-        return Err(format!(
-            "SparseLMM TSV metadata length mismatch: rows={}, chrom={}, pos={}, snp={}, allele0={}, allele1={}",
-            scan_prepared.n_rows(),
-            chrom.len(),
-            pos.len(),
-            snp.len(),
-            allele0.len(),
-            allele1.len()
-        ));
-    }
-    let m = scan_prepared.n_rows();
-    let writer = AsyncTsvWriter::with_config(
-        out_tsv,
-        b"chrom\tpos\tsnp\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\n",
-        64 * 1024 * 1024,
-        4,
-    )
-    .map_err(|e| e.to_string())?;
-
-    let mut text_buf = String::with_capacity(block_rows.max(512).max(1) * 112);
-    let mut tsv_sink = |row_start: usize, rows_here: usize, block: &[f64]| {
-        text_buf.clear();
-        append_splmm_tsv_block(
-            &mut text_buf,
-            row_start,
-            rows_here,
-            block,
-            chrom,
-            pos,
-            snp,
-            allele0,
-            allele1,
-            &scan_prepared.row_maf,
-            &scan_prepared.row_missing,
-            gm,
-        );
-        let payload = std::mem::take(&mut text_buf).into_bytes();
-        writer.send(payload)?;
-        Ok(())
-    };
-    let adapter = JxlmmMatrixAdapter {
-        inner: scan_prepared,
-    };
-    let stats = unified_stats_from_jxlmm(scan_prepared);
-    let mut input = UnifiedInput {
-        matrix: adapter,
-        stats,
-    };
-    let run_res = exact_scan_blocks_core(
-        factor,
-        &mut input,
-        x_design,
-        x_design_col_major,
-        x_design_xtx_chol,
-        py_vec,
-        1.0_f64,
-        xt_v_inv_x_chol,
-        1.0_f64,
-        1.0_f64,
-        scan_sample_idx,
-        gm,
-        threads,
-        block_rows,
-        scan_progress_callback,
-        progress_every,
-        progress_stage,
-        0,
-        0,
-        solve_workspace,
-        &mut tsv_sink,
-    );
-    let writer_result = writer.finish();
-    run_res?;
-    writer_result?;
-    Ok(m)
-}
-
-#[allow(clippy::too_many_arguments)]
 fn scan_to_tsv_with_p0y_and_exact_p0_sparse(
     factor: &SparseJxgrmCholesky,
     scan_prepared: &JxlmmPreparedInput,
@@ -2754,116 +2477,6 @@ fn merge_exact_results_into_scan(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-#[allow(dead_code)]
-fn scan_to_tsv_with_py_and_rhat_collect_candidates(
-    scan_prepared: &JxlmmPreparedInput,
-    x_design: &[f64],
-    py_vec: &[f64],
-    xtx_chol: &[f64],
-    scan_sample_idx: &[usize],
-    chrom: &[String],
-    pos: &[i64],
-    snp: &[String],
-    allele0: &[String],
-    allele1: &[String],
-    gm: PackedGeneticModel,
-    out_tsv: &str,
-    r_hat: f64,
-    threads: usize,
-    block_rows: usize,
-    scan_progress_callback: Option<&Py<PyAny>>,
-    progress_every: usize,
-    progress_stage: usize,
-    candidate_p_threshold: f64,
-) -> Result<Vec<usize>, String> {
-    let m = scan_prepared.n_rows();
-    if chrom.len() != m
-        || pos.len() != m
-        || snp.len() != m
-        || allele0.len() != m
-        || allele1.len() != m
-    {
-        return Err(format!(
-            "SparseLMM TSV metadata length mismatch: rows={m}, chrom={}, pos={}, snp={}, allele0={}, allele1={}",
-            chrom.len(),
-            pos.len(),
-            snp.len(),
-            allele0.len(),
-            allele1.len()
-        ));
-    }
-    let writer = AsyncTsvWriter::with_config(
-        out_tsv,
-        b"chrom\tpos\tsnp\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\n",
-        64 * 1024 * 1024,
-        4,
-    )
-    .map_err(|e| e.to_string())?;
-    let adapter = JxlmmMatrixAdapter {
-        inner: scan_prepared,
-    };
-    let stats = unified_stats_from_jxlmm(scan_prepared);
-    let mut input = UnifiedInput {
-        matrix: adapter,
-        stats,
-    };
-    let row_maf = input.stats.maf.clone();
-    let row_miss = input.stats.miss.clone();
-    let mut candidate_rows = Vec::<usize>::new();
-    candidate_rows.reserve(m.min(4096));
-    let mut text_buf = String::with_capacity(block_rows.max(512).max(1) * 112);
-    let mut tsv_sink = |row_start: usize, rows_here: usize, block: &[f64]| {
-        for local_idx in 0..rows_here {
-            let pwald = block[local_idx * 3 + 2];
-            if pwald.is_finite() && pwald <= candidate_p_threshold {
-                candidate_rows.push(row_start + local_idx);
-            }
-        }
-        text_buf.clear();
-        append_splmm_tsv_block(
-            &mut text_buf,
-            row_start,
-            rows_here,
-            block,
-            chrom,
-            pos,
-            snp,
-            allele0,
-            allele1,
-            &row_maf,
-            &row_miss,
-            gm,
-        );
-        writer.send(std::mem::take(&mut text_buf).into_bytes())?;
-        Ok(())
-    };
-    let run_res = grammar_scan_blocks_core(
-        &mut input,
-        x_design,
-        py_vec,
-        1.0_f64,
-        xtx_chol,
-        scan_sample_idx,
-        gm,
-        r_hat,
-        1.0_f64,
-        threads,
-        block_rows,
-        scan_progress_callback,
-        progress_every,
-        progress_stage,
-        0,
-        0,
-        &mut tsv_sink,
-    );
-    let writer_result = writer.finish();
-    run_res?;
-    writer_result?;
-    Ok(candidate_rows)
-}
-
-#[allow(clippy::too_many_arguments)]
 fn scan_to_tsv_with_p0y_and_gamma0_collect_candidates(
     scan_prepared: &JxlmmPreparedInput,
     x_design: &[f64],
@@ -4823,7 +4436,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_scan_core_matches_wrapper_and_manual_reference() {
+    fn exact_scan_core_matches_manual_reference() {
         let (prepared, scan_sample_idx) = make_test_scan_prepared();
         let x_design = make_test_design();
         let py_vec = vec![0.3_f64, -0.8_f64, 0.6_f64];
@@ -4831,28 +4444,6 @@ mod tests {
         let xt_v_inv_x_chol = compute_xt_v_inv_x_chol(&factor, &x_design, py_vec.len(), 2);
         let xtx_chol = xtx_chol_from_design(&x_design, py_vec.len(), 2).unwrap();
         let x_col = row_major_to_col_major_f64(&x_design, py_vec.len(), 2).unwrap();
-
-        let mut workspace_wrapper = factor.make_solve_workspace(2).unwrap();
-        let wrapper = scan_with_py_and_exact_pg_sparse(
-            &factor,
-            &prepared,
-            &x_design,
-            &x_col,
-            &xtx_chol,
-            &py_vec,
-            &xt_v_inv_x_chol,
-            &scan_sample_idx,
-            PackedGeneticModel::Add,
-            1,
-            0,
-            None,
-            2,
-            9,
-            0,
-            0,
-            &mut workspace_wrapper,
-        )
-        .unwrap();
 
         let mut workspace_core = factor.make_solve_workspace(2).unwrap();
         let mut core = vec![0.0_f64; prepared.n_rows() * 3];
@@ -4901,7 +4492,6 @@ mod tests {
             PackedGeneticModel::Add,
         );
 
-        assert_close(&core, &wrapper, 1e-8_f64);
         assert_close(&core, &manual, 1e-5_f64);
     }
 
@@ -4973,14 +4563,28 @@ mod tests {
         }
 
         let mut workspace_full = factor.make_solve_workspace(2).unwrap();
-        let full = scan_with_py_and_exact_pg_sparse(
+        let mut full = vec![0.0_f64; prepared.n_rows() * 3];
+        let mut full_sink = |row_start: usize, rows_here: usize, block: &[f64]| {
+            full[row_start * 3..][..rows_here * 3].copy_from_slice(block);
+            Ok(())
+        };
+        let adapter = JxlmmMatrixAdapter { inner: &prepared };
+        let stats = unified_stats_from_jxlmm(&prepared);
+        let mut input = UnifiedInput {
+            matrix: adapter,
+            stats,
+        };
+        exact_scan_blocks_core(
             &factor,
-            &prepared,
+            &mut input,
             &x_design,
             &x_col,
             &xtx_chol,
             &py_vec,
+            1.0_f64,
             &xt_v_inv_x_chol,
+            1.0_f64,
+            1.0_f64,
             &scan_sample_idx,
             PackedGeneticModel::Add,
             1,
@@ -4991,6 +4595,7 @@ mod tests {
             0,
             0,
             &mut workspace_full,
+            &mut full_sink,
         )
         .unwrap();
 

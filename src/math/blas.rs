@@ -2078,7 +2078,14 @@ pub(crate) unsafe fn lapack_dsyevd_dispatch(
         lapack_dsyevd_openblas(jobz, uplo, n, a, lda, w, work, lwork, iwork, liwork, info);
         return Ok(());
     }
-    #[cfg(target_os = "windows")]
+    #[cfg(all(
+        target_os = "windows",
+        not(all(
+            feature = "blas-openblas",
+            jx_openblas_available,
+            jx_openblas_lapack_available
+        ))
+    ))]
     {
         let _ = (jobz, uplo, n, a, lda, w, work, lwork, iwork, liwork, info);
         return Err("lapack_dsyevd unavailable on this Windows build");
@@ -2194,7 +2201,14 @@ pub(crate) unsafe fn lapack_dsyevr_dispatch(
         );
         return Ok(());
     }
-    #[cfg(target_os = "windows")]
+    #[cfg(all(
+        target_os = "windows",
+        not(all(
+            feature = "blas-openblas",
+            jx_openblas_available,
+            jx_openblas_lapack_available
+        ))
+    ))]
     {
         let _ = (
             jobz, range, uplo, n, a, lda, vl, vu, il, iu, abstol, m, w, z, ldz, isuppz, work,

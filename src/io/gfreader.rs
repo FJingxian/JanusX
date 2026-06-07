@@ -23,7 +23,9 @@ use std::sync::OnceLock;
 use crate::bitwise::and_popcount;
 use crate::gfcore as core;
 use crate::gfcore::{BedSnpIter, HmpSnpIter, TxtSnpIter, VcfSnpIter};
-use crate::linalg::{chisq_from_beta_se_and_optional_plrt, format_chisq_value};
+use crate::linalg::{
+    chisq_from_beta_se_and_optional_plrt, format_chisq_value, sanitize_assoc_pvalue,
+};
 use crate::stats_common::AsyncTsvWriter;
 use crate::vcfout::VcfOut;
 
@@ -208,6 +210,7 @@ impl GwasAssocTsvWriter {
                 transform_alleles_by_model_local(&s.ref_allele, &s.alt_allele, &self.model_key);
             let beta = res[[i, 0]];
             let se = res[[i, 1]];
+            let pwald = sanitize_assoc_pvalue(beta, se, res[[i, 2]]);
             let chisq = chisq_from_beta_se_and_optional_plrt(
                 beta,
                 se,
@@ -228,7 +231,7 @@ impl GwasAssocTsvWriter {
                     beta,
                     se,
                     chisq_txt,
-                    res[[i, 2]],
+                    pwald,
                     res[[i, 3]]
                 );
             } else {
@@ -245,7 +248,7 @@ impl GwasAssocTsvWriter {
                     beta,
                     se,
                     chisq_txt,
-                    res[[i, 2]],
+                    pwald,
                 );
             }
         }

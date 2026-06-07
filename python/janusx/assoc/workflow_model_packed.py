@@ -1482,6 +1482,60 @@ def _jxlmm_design_with_intercept(
     )
 
 
+def _jxlmm_component_scale_reml(
+    *,
+    y_vec: np.ndarray,
+    x_cov: Union[np.ndarray, None],
+    sigma_g2: float,
+    sigma_e2: float,
+) -> dict[str, float]:
+    y = np.ascontiguousarray(np.asarray(y_vec, dtype=np.float64).reshape(-1), dtype=np.float64)
+    n = int(y.shape[0])
+    x_design = _jxlmm_design_with_intercept(x_cov, n)
+    p = int(x_design.shape[1])
+    sigma_sum = float(sigma_g2) + float(sigma_e2)
+    if n <= p:
+        return {
+            "rss_reml": float("nan"),
+            "rss_mx_reml": float("nan"),
+            "df_reml": float("nan"),
+            "resid_var_reml": float("nan"),
+            "resid_var_mx_reml": float("nan"),
+            "ypy_reml": float("nan"),
+            "sigma_sum_profile": sigma_sum,
+            "sigma_scale_reml": float("nan"),
+        }
+    xtx = np.ascontiguousarray(x_design.T @ x_design, dtype=np.float64)
+    xty = np.ascontiguousarray(x_design.T @ y, dtype=np.float64)
+    beta = _jxlmm_solve_linear(xtx, xty)
+    resid = np.ascontiguousarray(y - (x_design @ beta), dtype=np.float64)
+    rss_mx = float(np.dot(resid, resid))
+    df = int(n - p)
+    # Trait-level scan rescaling anchor for GRAMMAR-gamma:
+    # use the residualized phenotype variance ||M_X y||^2 / (n - c) to bring
+    # sparse REML components back toward phenotype scale before scan. This is
+    # the empirical c_trait proxy that previously matched fastGWA calibration
+    # much better than the raw component sum.
+    ypy_reml = float(sigma_g2) * float(df) if np.isfinite(sigma_g2) and df > 0 else float("nan")
+    resid_var_reml = float(sigma_g2) if np.isfinite(sigma_g2) else float("nan")
+    resid_var_mx_reml = float(rss_mx / float(df)) if df > 0 else float("nan")
+    sigma_scale_reml = (
+        float(resid_var_mx_reml / sigma_sum)
+        if np.isfinite(resid_var_mx_reml) and np.isfinite(sigma_sum) and sigma_sum > 0.0
+        else float("nan")
+    )
+    return {
+        "rss_reml": ypy_reml,
+        "rss_mx_reml": rss_mx,
+        "df_reml": float(df),
+        "resid_var_reml": resid_var_reml,
+        "resid_var_mx_reml": resid_var_mx_reml,
+        "ypy_reml": ypy_reml,
+        "sigma_sum_profile": sigma_sum,
+        "sigma_scale_reml": sigma_scale_reml,
+    }
+
+
 def _jxlmm_solve_linear(lhs: np.ndarray, rhs: np.ndarray, *, ridge: float = 1e-10) -> np.ndarray:
     a = np.ascontiguousarray(np.asarray(lhs, dtype=np.float64), dtype=np.float64)
     b = np.ascontiguousarray(np.asarray(rhs, dtype=np.float64), dtype=np.float64)
@@ -1590,6 +1644,14 @@ def _jxlmm_sparse_null_fit(
         lbd = float(out.get("lambda", float("nan")))
         log10_lambda = float(np.log10(max(lbd, 1e-30))) if np.isfinite(lbd) and lbd > 0.0 else float("nan")
         out.update(
+            _jxlmm_component_scale_reml(
+                y_vec=y_arg,
+                x_cov=x_arg,
+                sigma_g2=float(out.get("sigma_g2", float("nan"))),
+                sigma_e2=float(out.get("sigma_e2", float("nan"))),
+            )
+        )
+        out.update(
             {
                 "fit_secs": float(fit_secs),
                 "mean_diag_k": mean_diag_k,
@@ -1654,7 +1716,7 @@ def _jxlmm_sparse_null_fit(
         else float("nan")
     )
     lambda_boundary = _jxlmm_sparse_lambda_boundary_flag(float(log10_lambda), low, high)
-    return {
+    out_dict = {
         "strategy": "sparse_reml_brent",
         "sigma_g2": sigma_g2,
         "sigma_e2": sigma_e2,
@@ -1681,6 +1743,15 @@ def _jxlmm_sparse_null_fit(
         "offdiag_density_k": float(offdiag_density),
         "lambda_boundary": lambda_boundary,
     }
+    out_dict.update(
+        _jxlmm_component_scale_reml(
+            y_vec=y_arg,
+            x_cov=x_arg,
+            sigma_g2=sigma_g2,
+            sigma_e2=sigma_e2,
+        )
+    )
+    return out_dict
 
 
 def prepare_memmap_filtered_bed_for_gwas(
@@ -3736,8 +3807,8 @@ def run_algwas_packed_fullrank(
         pname_tag = _safe_trait_file_label(pname)
         out_tsv = f"{outprefix}.{pname_tag}.algwas.tsv"
         tmp_tsv = _gwas_result_tmp_path(out_tsv)
-        pseudo_tsv_hint = f"{outprefix}.{pname_tag}.algwas.qtn.tsv"
-        stage1_tsv_hint = f"{os.path.splitext(out_tsv)[0]}.stage1.tsv"
+        pseudo_tsv_hint = f"{outprefix}.{pname_tag}.algwas.qtn"
+        stage1_tsv_hint = f"{os.path.splitext(out_tsv)[0]}.stage1"
         tmp_stage1_tsv_hint = f"{tmp_tsv}.stage1.tsv"
 
         stage1_total = 256
@@ -4289,12 +4360,34 @@ def run_splmm_packed_fullrank(
         null_nnz_k = int(null_fit.get("nnz_k", 0) or 0)
         null_offdiag_density_k = float(null_fit.get("offdiag_density_k", float("nan")))
         null_lambda_boundary = null_fit.get("lambda_boundary", None)
+        sigma_sum_profile = float(null_fit.get("sigma_sum_profile", sigma_g2 + sigma_e2))
+        rss_reml = float(null_fit.get("rss_reml", float("nan")))
+        df_reml = float(null_fit.get("df_reml", float("nan")))
+        resid_var_reml = float(null_fit.get("resid_var_reml", float("nan")))
+        resid_var_mx_reml = float(null_fit.get("resid_var_mx_reml", float("nan")))
+        ypy_reml = float(null_fit.get("ypy_reml", float("nan")))
+        sigma_scale_reml = float(null_fit.get("sigma_scale_reml", float("nan")))
         if not _jxlmm_null_components_valid(sigma_g2, sigma_e2):
             _stop_prepare_handle()
             raise RuntimeError(
                 f"SparseLMM null variance estimation returned invalid components for trait {pname}: "
                 f"sigma_g2={sigma_g2}, sigma_e2={sigma_e2}"
             )
+        sigma_g2_scan_preview = float("nan")
+        sigma_e2_scan_preview = float("nan")
+        scan_sigma_preview_valid = False
+        if (
+            np.isfinite(sigma_scale_reml)
+            and sigma_scale_reml > 0.0
+        ):
+            sigma_g2_scan_preview = float(sigma_g2 * sigma_scale_reml)
+            sigma_e2_scan_preview = float(sigma_e2 * sigma_scale_reml)
+            scan_sigma_preview_valid = _jxlmm_null_components_valid(
+                sigma_g2_scan_preview, sigma_e2_scan_preview
+            )
+        use_reml_scan_sigma = bool(scan_mode_norm in {"approx", "two_stage"} and scan_sigma_preview_valid)
+        sigma_g2_scan_use = float(sigma_g2_scan_preview) if use_reml_scan_sigma else float(sigma_g2)
+        sigma_e2_scan_use = float(sigma_e2_scan_preview) if use_reml_scan_sigma else float(sigma_e2)
         null_backend = str(null_fit.get("backend", "unknown"))
         null_strategy = str(null_fit.get("strategy", "unknown"))
         _null_fit_msg = (
@@ -4305,12 +4398,23 @@ def run_splmm_packed_fullrank(
             f"sparse_cutoff={float(splmm_sparse_cutoff):g}, "
             f"lambda={null_lbd:.4g}, sigma_g2={sigma_g2:.4g}, "
             f"sigma_e2={sigma_e2:.4g}, "
+            f"sigma_sum_profile={sigma_sum_profile:.4g}, "
+            f"ypy_reml={ypy_reml:.4g}, "
+            f"resid_var_reml={resid_var_reml:.4g}, "
+            f"resid_var_mx_reml={resid_var_mx_reml:.4g}, "
+            f"df_reml={df_reml:.0f}, "
+            f"scale_reml={sigma_scale_reml:.4g}, "
             f"lambda_boundary={null_lambda_boundary or 'interior'}, "
             f"backend={null_backend} [{format_elapsed(null_secs)}]"
             if np.isfinite(null_pve)
             else f"{null_strategy} null fit sigma_g2={sigma_g2:.4g}, sigma_e2={sigma_e2:.4g}, "
             f"backend={null_backend} [{format_elapsed(null_secs)}]"
         )
+        if scan_sigma_preview_valid:
+            _null_fit_msg = (
+                f"{_null_fit_msg}; "
+                f"scan_sigma_preview=(sigma_g2={sigma_g2_scan_preview:.4g}, sigma_e2={sigma_e2_scan_preview:.4g})"
+            )
         if bool(use_spinner):
             _log_file_only(logger, logging.INFO, f"SparseLMM: {_null_fit_msg}")
         else:
@@ -4602,8 +4706,8 @@ def run_splmm_packed_fullrank(
                     jxlmm_out = jxrs.splmm_assoc_pcg_bed_to_tsv(
                         str(kinship_prefix),
                         y_vec,
-                        float(sigma_g2),
-                        float(sigma_e2),
+                        float(sigma_g2_scan_use),
+                        float(sigma_e2_scan_use),
                         chrom_all,
                         pos_all,
                         snp_all,
@@ -4640,8 +4744,8 @@ def run_splmm_packed_fullrank(
                     jxlmm_out = jxrs.splmm_assoc_pcg_bed(
                         str(kinship_prefix),
                         y_vec,
-                        float(sigma_g2),
-                        float(sigma_e2),
+                        float(sigma_g2_scan_use),
+                        float(sigma_e2_scan_use),
                         x_cov=x_arg,
                         sample_indices=scan_sample_idx_trait,
                         operator_sample_indices=kinship_sample_idx_trait,
@@ -4758,8 +4862,20 @@ def run_splmm_packed_fullrank(
             if int(rhat_requested) > 0
             else ""
         )
+        _sigma_mode_info = (
+            f"sigma_mode=reml_p0_corrected(scale={sigma_scale_reml:.4g}, "
+            f"sigma_g2={sigma_g2_scan_use:.4g}, sigma_e2={sigma_e2_scan_use:.4g})"
+            if use_reml_scan_sigma
+            else (
+                f"sigma_mode=profile; scan_sigma_preview=reml_p0_corrected(scale={sigma_scale_reml:.4g}, "
+                f"sigma_g2={sigma_g2_scan_preview:.4g}, sigma_e2={sigma_e2_scan_preview:.4g})"
+                if scan_sigma_preview_valid
+                else "sigma_mode=profile"
+            )
+        )
         _scan_diag_msg = (
             f"{scan_route_desc}; mode={_scan_mode_desc}; {_rhat_info}"
+            f"{_sigma_mode_info}; "
             f"V^-1y converged={str(y_conv).lower()} ({y_iters} iters, relres={y_rel_res:.2e}), "
             f"V^-1X converged={str(x_conv_all).lower()} ({x_max_iters} iters, relres={x_max_rel_res:.2e})"
         )
@@ -4816,6 +4932,27 @@ def run_splmm_packed_fullrank(
                 "peak_rss_gb": float(peak_rss_gb),
                 "gwas_time_s": float(null_secs + scan_secs),
                 "viz_time_s": float(viz_secs),
+                "splmm_sigma_scale_reml": (
+                    float(sigma_scale_reml) if np.isfinite(sigma_scale_reml) else None
+                ),
+                "splmm_scan_sigma_mode": (
+                    "reml_p0_corrected" if use_reml_scan_sigma else "profile"
+                ),
+                "splmm_scan_sigma_g2": (
+                    float(sigma_g2_scan_use) if np.isfinite(sigma_g2_scan_use) else None
+                ),
+                "splmm_scan_sigma_e2": (
+                    float(sigma_e2_scan_use) if np.isfinite(sigma_e2_scan_use) else None
+                ),
+                "splmm_resid_var_reml": (
+                    float(resid_var_reml) if np.isfinite(resid_var_reml) else None
+                ),
+                "splmm_resid_var_mx_reml": (
+                    float(resid_var_mx_reml) if np.isfinite(resid_var_mx_reml) else None
+                ),
+                "splmm_ypy_reml": (
+                    float(ypy_reml) if np.isfinite(ypy_reml) else None
+                ),
                 "result_file": str(out_tsv),
             }
         )

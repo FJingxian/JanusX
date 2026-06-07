@@ -18,8 +18,8 @@ use memmap2::Mmap;
 use crate::bedmath::{decode_mean_imputed_additive_packed_block_rows_f32, packed_byte_lut};
 use crate::gfcore;
 use crate::gfreader::{
-    count_packed_row_counts, count_packed_row_counts_selected,
-    evaluate_packed_row_keep_and_flip, packed_row_stats_from_counts,
+    count_packed_row_counts, count_packed_row_counts_selected, evaluate_packed_row_keep_and_flip,
+    packed_row_stats_from_counts,
 };
 use crate::stats_common::get_cached_pool;
 
@@ -95,17 +95,29 @@ pub trait GenotypeMatrix: Send + Sync {
         sample_identity: bool,
         pool: Option<&Arc<rayon::ThreadPool>>,
     ) -> Result<(), String> {
-        let cols = if sample_identity { stats.n_samples_full } else { sample_idx.len() };
+        let cols = if sample_identity {
+            stats.n_samples_full
+        } else {
+            sample_idx.len()
+        };
         let rows_here = out.len().saturating_div(cols.max(1));
-        if rows_here == 0 { return Ok(()); }
+        if rows_here == 0 {
+            return Ok(());
+        }
         let code4_lut = &packed_byte_lut().code4;
         decode_mean_imputed_additive_packed_block_rows_f32(
-            self.packed_flat(), stats.bytes_per_snp, stats.n_samples_full,
+            self.packed_flat(),
+            stats.bytes_per_snp,
+            stats.n_samples_full,
             stats.row_flip_slice(row_start, rows_here),
             stats.row_maf_slice(row_start, rows_here),
-            sample_idx, sample_identity,
+            sample_idx,
+            sample_identity,
             Some(stats.row_source_slice(row_start, rows_here)),
-            0, out, code4_lut, pool,
+            0,
+            out,
+            code4_lut,
+            pool,
         )
     }
 }
@@ -132,17 +144,23 @@ impl StreamingBedMatrix {
     pub fn open(prefix: &str, block_rows: usize) -> Result<Self, String> {
         let bed_prefix = normalize_plink_prefix(prefix);
         let n_samples_full = crate::gfcore::read_fam(&bed_prefix)
-            .map_err(|e| e.to_string())?.len();
+            .map_err(|e| e.to_string())?
+            .len();
         if n_samples_full == 0 {
             return Err("no samples found in BED".to_string());
         }
         let bytes_per_snp = n_samples_full.div_ceil(4);
         let bed_path = format!("{bed_prefix}.bed");
-        let file = std::fs::File::open(&bed_path)
-            .map_err(|e| format!("open {bed_path}: {e}"))?;
+        let file = std::fs::File::open(&bed_path).map_err(|e| format!("open {bed_path}: {e}"))?;
         // 3-byte BED header is skipped via offset in read_rows.
         let buf = vec![0u8; block_rows.saturating_mul(bytes_per_snp).max(1)];
-        Ok(Self { file, n_samples_full, bytes_per_snp, buf, buf_range: (usize::MAX, 0) })
+        Ok(Self {
+            file,
+            n_samples_full,
+            bytes_per_snp,
+            buf,
+            buf_range: (usize::MAX, 0),
+        })
     }
 
     /// Ensure `buf` contains the packed bytes for source rows `[start .. end)`.
@@ -160,15 +178,18 @@ impl StreamingBedMatrix {
         #[cfg(unix)]
         {
             use std::os::unix::fs::FileExt;
-            self.file.read_exact_at(&mut self.buf[..need], offset)
+            self.file
+                .read_exact_at(&mut self.buf[..need], offset)
                 .map_err(|e| format!("read BED rows [{start}..{end}): {e}"))?;
         }
         #[cfg(not(unix))]
         {
             use std::io::{Read, Seek, SeekFrom};
-            self.file.seek(SeekFrom::Start(offset))
+            self.file
+                .seek(SeekFrom::Start(offset))
                 .map_err(|e| format!("BED seek: {e}"))?;
-            self.file.read_exact(&mut self.buf[..need])
+            self.file
+                .read_exact(&mut self.buf[..need])
                 .map_err(|e| format!("BED read: {e}"))?;
         }
         self.buf_range = (start, end);
@@ -203,12 +224,22 @@ impl StreamingBedMatrix {
 }
 
 impl GenotypeMatrix for StreamingBedMatrix {
-    fn n_samples_full(&self) -> usize { self.n_samples_full }
-    fn bytes_per_snp(&self) -> usize { self.bytes_per_snp }
-    fn packed_flat(&self) -> &[u8] {
-        &self.buf[..(self.buf_range.1.saturating_sub(self.buf_range.0).saturating_mul(self.bytes_per_snp))]
+    fn n_samples_full(&self) -> usize {
+        self.n_samples_full
     }
-    fn source_row_bytes(&self, _source_idx: usize) -> &[u8] { &[] }
+    fn bytes_per_snp(&self) -> usize {
+        self.bytes_per_snp
+    }
+    fn packed_flat(&self) -> &[u8] {
+        &self.buf[..(self
+            .buf_range
+            .1
+            .saturating_sub(self.buf_range.0)
+            .saturating_mul(self.bytes_per_snp))]
+    }
+    fn source_row_bytes(&self, _source_idx: usize) -> &[u8] {
+        &[]
+    }
 
     fn decode_additive_block(
         &mut self,
@@ -219,18 +250,31 @@ impl GenotypeMatrix for StreamingBedMatrix {
         sample_identity: bool,
         pool: Option<&Arc<rayon::ThreadPool>>,
     ) -> Result<(), String> {
-        let cols = if sample_identity { stats.n_samples_full } else { sample_idx.len() };
+        let cols = if sample_identity {
+            stats.n_samples_full
+        } else {
+            sample_idx.len()
+        };
         let rows_here = out.len().saturating_div(cols.max(1));
-        if rows_here == 0 { return Ok(()); }
+        if rows_here == 0 {
+            return Ok(());
+        }
         let mut rel_indices = Vec::with_capacity(rows_here);
         let packed_slice = self.prepare_block(stats, row_start, rows_here, &mut rel_indices)?;
         let code4_lut = &packed_byte_lut().code4;
         decode_mean_imputed_additive_packed_block_rows_f32(
-            packed_slice, stats.bytes_per_snp, stats.n_samples_full,
+            packed_slice,
+            stats.bytes_per_snp,
+            stats.n_samples_full,
             stats.row_flip_slice(row_start, rows_here),
             stats.row_maf_slice(row_start, rows_here),
-            sample_idx, sample_identity, Some(&rel_indices),
-            0, out, code4_lut, pool,
+            sample_idx,
+            sample_identity,
+            Some(&rel_indices),
+            0,
+            out,
+            code4_lut,
+            pool,
         )
     }
 }
@@ -249,21 +293,25 @@ pub struct BedMmapMatrix {
 impl BedMmapMatrix {
     pub fn open(prefix: &str) -> Result<Self, String> {
         let bed_prefix = normalize_plink_prefix(prefix);
-        let n_samples_full =
-            gfcore::read_fam(&bed_prefix).map_err(|e| e.to_string())?.len();
+        let n_samples_full = gfcore::read_fam(&bed_prefix)
+            .map_err(|e| e.to_string())?
+            .len();
         if n_samples_full == 0 {
             return Err("no samples found in BED".to_string());
         }
         let bytes_per_snp = n_samples_full.div_ceil(4);
         let bed_path = format!("{bed_prefix}.bed");
-        let bed_file =
-            File::open(&bed_path).map_err(|e| format!("open {bed_path}: {e}"))?;
-        let mmap = unsafe { Mmap::map(&bed_file) }
-            .map_err(|e| format!("mmap {bed_path}: {e}"))?;
+        let bed_file = File::open(&bed_path).map_err(|e| format!("open {bed_path}: {e}"))?;
+        let mmap = unsafe { Mmap::map(&bed_file) }.map_err(|e| format!("mmap {bed_path}: {e}"))?;
         if mmap.len() < 3 || mmap[0] != 0x6C || mmap[1] != 0x1B || mmap[2] != 0x01 {
             return Err("invalid or non-SNP-major BED".to_string());
         }
-        Ok(Self { mmap: Arc::new(mmap), n_samples_full, bytes_per_snp, bed_prefix })
+        Ok(Self {
+            mmap: Arc::new(mmap),
+            n_samples_full,
+            bytes_per_snp,
+            bed_prefix,
+        })
     }
 
     pub fn bed_prefix(&self) -> &str {
@@ -278,8 +326,12 @@ impl BedMmapMatrix {
 }
 
 impl GenotypeMatrix for BedMmapMatrix {
-    fn n_samples_full(&self) -> usize { self.n_samples_full }
-    fn bytes_per_snp(&self) -> usize { self.bytes_per_snp }
+    fn n_samples_full(&self) -> usize {
+        self.n_samples_full
+    }
+    fn bytes_per_snp(&self) -> usize {
+        self.bytes_per_snp
+    }
 
     fn packed_flat(&self) -> &[u8] {
         &self.mmap[3..]
@@ -302,15 +354,16 @@ pub struct PackedBedMatrix {
 }
 
 impl PackedBedMatrix {
-    pub fn from_packed(
-        payload: Arc<[u8]>,
-        n_samples_full: usize,
-    ) -> Result<Self, String> {
+    pub fn from_packed(payload: Arc<[u8]>, n_samples_full: usize) -> Result<Self, String> {
         let bytes_per_snp = n_samples_full.div_ceil(4);
         if payload.len() % bytes_per_snp != 0 {
             return Err("packed payload length is not a multiple of bytes_per_snp".to_string());
         }
-        Ok(Self { payload, n_samples_full, bytes_per_snp })
+        Ok(Self {
+            payload,
+            n_samples_full,
+            bytes_per_snp,
+        })
     }
 
     pub fn n_markers_contiguous(&self) -> usize {
@@ -319,8 +372,12 @@ impl PackedBedMatrix {
 }
 
 impl GenotypeMatrix for PackedBedMatrix {
-    fn n_samples_full(&self) -> usize { self.n_samples_full }
-    fn bytes_per_snp(&self) -> usize { self.bytes_per_snp }
+    fn n_samples_full(&self) -> usize {
+        self.n_samples_full
+    }
+    fn bytes_per_snp(&self) -> usize {
+        self.bytes_per_snp
+    }
 
     fn packed_flat(&self) -> &[u8] {
         &self.payload
@@ -442,13 +499,14 @@ pub fn compute_global_stats_mmap(
     threads: usize,
 ) -> Result<GlobalStats, String> {
     let bed_prefix = normalize_plink_prefix(prefix);
-    let n_samples_full = gfcore::read_fam(&bed_prefix).map_err(|e| e.to_string())?.len();
+    let n_samples_full = gfcore::read_fam(&bed_prefix)
+        .map_err(|e| e.to_string())?
+        .len();
     let bytes_per_snp = n_samples_full.div_ceil(4);
 
     let bed_path = format!("{bed_prefix}.bed");
     let bed_file = File::open(&bed_path).map_err(|e| format!("open {bed_path}: {e}"))?;
-    let mmap =
-        unsafe { Mmap::map(&bed_file) }.map_err(|e| format!("mmap {bed_path}: {e}"))?;
+    let mmap = unsafe { Mmap::map(&bed_file) }.map_err(|e| format!("mmap {bed_path}: {e}"))?;
     if mmap.len() < 3 || mmap[0] != 0x6C || mmap[1] != 0x1B || mmap[2] != 0x01 {
         return Err("invalid or non-SNP-major BED".to_string());
     }
@@ -465,9 +523,16 @@ pub fn compute_global_stats_mmap(
     };
 
     let stats_identity = sample_indices
-        .map(|s| s.is_empty() || (s.len() == n_samples_full && s.iter().enumerate().all(|(i, &sid)| sid == i)))
+        .map(|s| {
+            s.is_empty()
+                || (s.len() == n_samples_full && s.iter().enumerate().all(|(i, &sid)| sid == i))
+        })
         .unwrap_or(true);
-    let stats_n = if stats_identity { n_samples_full } else { sample_indices.unwrap().len() };
+    let stats_n = if stats_identity {
+        n_samples_full
+    } else {
+        sample_indices.unwrap().len()
+    };
     let apply_het = het_threshold > 0.0;
     let pool = get_cached_pool(threads).map_err(|e| e.to_string())?;
 
@@ -490,8 +555,14 @@ pub fn compute_global_stats_mmap(
                     let (miss, maf, _std) =
                         packed_row_stats_from_counts(stats_n, non_missing, alt_sum);
                     let (pass_num, flip) = evaluate_packed_row_keep_and_flip(
-                        stats_n, non_missing, alt_sum, het_count,
-                        maf_threshold, max_missing_rate, apply_het, het_threshold,
+                        stats_n,
+                        non_missing,
+                        alt_sum,
+                        het_count,
+                        maf_threshold,
+                        max_missing_rate,
+                        apply_het,
+                        het_threshold,
                     );
                     let pass_snp = if let Some(ref sites) = sites_all {
                         is_simple_snp_allele(&sites[i].ref_allele)
@@ -499,7 +570,12 @@ pub fn compute_global_stats_mmap(
                     } else {
                         true
                     };
-                    (pass_num && pass_snp, (pass_num && pass_snp) && flip, miss, maf)
+                    (
+                        pass_num && pass_snp,
+                        (pass_num && pass_snp) && flip,
+                        miss,
+                        maf,
+                    )
                 })
                 .collect()
         };
@@ -552,8 +628,13 @@ pub fn open_bed_mmap_unified(
     threads: usize,
 ) -> Result<UnifiedInput<BedMmapMatrix>, String> {
     let stats = compute_global_stats_mmap(
-        prefix, maf_threshold, max_missing_rate, het_threshold, snps_only,
-        sample_indices, threads,
+        prefix,
+        maf_threshold,
+        max_missing_rate,
+        het_threshold,
+        snps_only,
+        sample_indices,
+        threads,
     )?;
     let matrix = BedMmapMatrix::open(prefix)?;
     Ok(UnifiedInput { matrix, stats })
@@ -583,7 +664,12 @@ fn is_simple_snp_allele(allele: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy)]
-pub enum PackedGeneticModel { Add, Dom, Rec, Het }
+pub enum PackedGeneticModel {
+    Add,
+    Dom,
+    Rec,
+    Het,
+}
 
 // ---------------------------------------------------------------------------
 // Centered decode (zero-mean, used by LMM / FastLMM / FvLMM)
@@ -601,9 +687,15 @@ pub fn decode_centered_block_unified<G: GenotypeMatrix>(
     sample_identity: bool,
 ) -> Result<(), String> {
     use crate::lmm_scan::PackedGeneticModel as LmmModel;
-    let n = if sample_identity { stats.n_samples_full } else { sample_idx.len() };
+    let n = if sample_identity {
+        stats.n_samples_full
+    } else {
+        sample_idx.len()
+    };
     let rows_here = out.len().saturating_div(n.max(1));
-    if rows_here == 0 { return Ok(()); }
+    if rows_here == 0 {
+        return Ok(());
+    }
     let gm_lmm = match gm {
         PackedGeneticModel::Add => LmmModel::Add,
         PackedGeneticModel::Dom => LmmModel::Dom,

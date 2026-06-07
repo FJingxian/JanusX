@@ -1233,7 +1233,7 @@ def run_farmcpu_fullmem(
         phename_tag = _safe_trait_file_label(phename)
         out_tsv = os.path.join(outfolder, f"{prefix}.{phename_tag}.farmcpu.tsv")
         tmp_tsv = _gwas_result_tmp_path(out_tsv)
-        pseudo_tsv_hint = os.path.join(outfolder, f"{prefix}.{phename_tag}.farmcpu.qtn.tsv")
+        pseudo_tsv_hint = os.path.join(outfolder, f"{prefix}.{phename_tag}.farmcpu.qtn")
         n_pseudo_qtn = 0
         pseudo_tsv: Union[str, None] = None
 

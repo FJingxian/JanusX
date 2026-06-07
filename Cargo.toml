@@ -47,3 +47,9 @@ criterion = "0.5.1"
 [[bench]]
 name = "grm_dtype"
 harness = false
+
+[profile.dev]
+debug = 1
+
+[profile.dev.package.janusx]
+opt-level = 3

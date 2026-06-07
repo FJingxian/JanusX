@@ -295,7 +295,8 @@ fn evaluate_sparse_reml_at_lambda(
         ));
     }
 
-    let factor = analysis.factorize_k_plus_lambda_i_buffered(lambda, &mut evaluator.perm_values_buf)?;
+    let factor =
+        analysis.factorize_k_plus_lambda_i_buffered(lambda, &mut evaluator.perm_values_buf)?;
     evaluator.fill_rhs(x_design, y);
     evaluator.solve_rhs_in_place(&factor)?;
 

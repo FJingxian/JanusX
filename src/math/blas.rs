@@ -19,6 +19,8 @@ pub(crate) const CBLAS_NO_TRANS: CblasInt = 111;
 pub(crate) const CBLAS_TRANS: CblasInt = 112;
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 pub(crate) const CBLAS_UPPER: CblasInt = 121;
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+pub(crate) const CBLAS_LOWER: CblasInt = 122;
 
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]

@@ -68,12 +68,12 @@ mod gload;
 mod gmerge;
 #[path = "io/gwasio.rs"]
 mod gwasio;
+#[path = "io/pipeline.rs"]
+mod pipeline;
 #[path = "io/sim.rs"]
 mod sim;
 #[path = "io/vcfout.rs"]
 mod vcfout;
-#[path = "io/pipeline.rs"]
-mod pipeline;
 
 // workflow (structural layer; currently type-only skeleton)
 #[path = "workflow/mod.rs"]
@@ -229,9 +229,8 @@ use spgrm::{
     spgrm_bed_to_jxgrm, spgrm_dense_f32_to_jxgrm, spgrm_dense_npy_to_jxgrm, spgrm_packed_to_jxgrm,
 };
 use splmm::{
-    splmm_assoc_pcg_bed, splmm_assoc_pcg_bed_to_tsv, splmm_scan_grammar_packed,
-    splmm_scan_exact_packed,
-    splmm_sparse_grm_diag_stats,
+    splmm_assoc_pcg_bed, splmm_assoc_pcg_bed_to_tsv, splmm_scan_exact_packed,
+    splmm_scan_grammar_packed, splmm_sparse_grm_diag_stats,
 };
 use spreml::{spreml_sparse_reml_brent_from_jxgrm, spreml_sparse_reml_grid_from_jxgrm};
 use top::{top_fit_model_py, top_rank_to_target_sample_py, top_rank_to_target_values_py};

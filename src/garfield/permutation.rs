@@ -3,9 +3,9 @@ use rand::seq::SliceRandom;
 use rand::SeedableRng;
 use std::cmp::Ordering;
 
-use super::bs::BeamRule;
 #[cfg(test)]
 use super::bs::BeamBinaryOp;
+use super::bs::BeamRule;
 
 pub const DEFAULT_RULE_PERMUTATION_REPRESENTATIVE_UNITS: usize = 32;
 pub const DEFAULT_RULE_NULL_PHYSICAL_CHUNKS: usize = 150;
@@ -78,7 +78,6 @@ const NULL_BUCKET_MAF_LEN: usize = 6;
 const STRUCTURE_PRIOR_LEN_ALPHA: [f64; 5] = [16.0, 8.0, 4.0, 2.0, 1.0];
 const STRUCTURE_PRIOR_TARGET_ESS: f64 = 24.0;
 const STRUCTURE_PRIOR_LEN_TEMPER: f64 = 0.72;
-
 
 #[derive(Clone, Debug, Default)]
 struct RuleNullScores {
@@ -202,7 +201,11 @@ impl RuleNullBucket {
             1 => CombMode::Mixed,
             _ => CombMode::NegOnly,
         };
-        Self { comb, maf, len_bin: lb }
+        Self {
+            comb,
+            maf,
+            len_bin: lb,
+        }
     }
 
     #[inline]
@@ -427,8 +430,7 @@ impl RuleNullCalibrator {
         }
         out.global_train =
             sample_min_safe(self.global.train.as_slice(), DEFAULT_RULE_NULL_QUANTILE);
-        out.global_test =
-            sample_min_safe(self.global.test.as_slice(), DEFAULT_RULE_NULL_QUANTILE);
+        out.global_test = sample_min_safe(self.global.test.as_slice(), DEFAULT_RULE_NULL_QUANTILE);
         out
     }
 }
@@ -461,29 +463,49 @@ impl RuleNullPenaltyLookup {
         }
     }
 
-    pub fn new() -> Self { Self::with_max_rule_len(5) }
+    pub fn new() -> Self {
+        Self::with_max_rule_len(5)
+    }
 
     fn penalty_with_fallback(&self, bucket: RuleNullBucket, is_train: bool) -> Option<f64> {
         let exact = if is_train {
-            self.exact_train.get(bucket.exact_index()).copied().flatten()
+            self.exact_train
+                .get(bucket.exact_index())
+                .copied()
+                .flatten()
         } else {
             self.exact_test.get(bucket.exact_index()).copied().flatten()
         };
         let cs = if is_train {
-            self.cs_train.get(bucket.collapse_sign_len_index()).copied().flatten()
+            self.cs_train
+                .get(bucket.collapse_sign_len_index())
+                .copied()
+                .flatten()
         } else {
-            self.cs_test.get(bucket.collapse_sign_len_index()).copied().flatten()
+            self.cs_test
+                .get(bucket.collapse_sign_len_index())
+                .copied()
+                .flatten()
         };
         let cm = if is_train {
-            self.cm_train.get(bucket.collapse_maf_len_index()).copied().flatten()
+            self.cm_train
+                .get(bucket.collapse_maf_len_index())
+                .copied()
+                .flatten()
         } else {
-            self.cm_test.get(bucket.collapse_maf_len_index()).copied().flatten()
+            self.cm_test
+                .get(bucket.collapse_maf_len_index())
+                .copied()
+                .flatten()
         };
-        let global = if is_train { self.global_train } else { self.global_test };
+        let global = if is_train {
+            self.global_train
+        } else {
+            self.global_test
+        };
         if let Some(weights) = null_shrinkage_weights(bucket) {
             if let Some(ep) = exact {
-                let shrunk = blended_penalty_4(Some(ep), cs, cm, global, weights)
-                    .unwrap_or(ep);
+                let shrunk = blended_penalty_4(Some(ep), cs, cm, global, weights).unwrap_or(ep);
                 return Some(ep.min(shrunk));
             }
         }
@@ -497,11 +519,15 @@ impl RuleNullPenaltyLookup {
             let pt = prev.cs_train.get(idx).copied().flatten();
             let ct = self.cs_train.get(idx).copied().flatten();
             saw_signal |= pt.is_some() || ct.is_some();
-            if !penalty_value_converged(pt, ct) { return false; }
+            if !penalty_value_converged(pt, ct) {
+                return false;
+            }
             let pte = prev.cs_test.get(idx).copied().flatten();
             let cte = self.cs_test.get(idx).copied().flatten();
             saw_signal |= pte.is_some() || cte.is_some();
-            if !penalty_value_converged(pte, cte) { return false; }
+            if !penalty_value_converged(pte, cte) {
+                return false;
+            }
         }
         // collapse_maf_len (6 slots) — previously unchecked, causing
         // early-stop when maf×len was still fluctuating.
@@ -509,14 +535,20 @@ impl RuleNullPenaltyLookup {
             let pt = prev.cm_train.get(idx).copied().flatten();
             let ct = self.cm_train.get(idx).copied().flatten();
             saw_signal |= pt.is_some() || ct.is_some();
-            if !penalty_value_converged(pt, ct) { return false; }
+            if !penalty_value_converged(pt, ct) {
+                return false;
+            }
             let pte = prev.cm_test.get(idx).copied().flatten();
             let cte = self.cm_test.get(idx).copied().flatten();
             saw_signal |= pte.is_some() || cte.is_some();
-            if !penalty_value_converged(pte, cte) { return false; }
+            if !penalty_value_converged(pte, cte) {
+                return false;
+            }
         }
-        saw_signal |= prev.global_train.is_some() || self.global_train.is_some()
-            || prev.global_test.is_some() || self.global_test.is_some();
+        saw_signal |= prev.global_train.is_some()
+            || self.global_train.is_some()
+            || prev.global_test.is_some()
+            || self.global_test.is_some();
         saw_signal
             && penalty_value_converged(prev.global_train, self.global_train)
             && penalty_value_converged(prev.global_test, self.global_test)
@@ -836,22 +868,43 @@ pub fn shuffled_copy_f64(values: &[f64], seed: u64) -> Vec<f64> {
     out
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn b(comb: CombMode, lb: LenBin, maf: MafBucket) -> RuleNullBucket {
-        RuleNullBucket { comb, len_bin: lb, maf }
+        RuleNullBucket {
+            comb,
+            len_bin: lb,
+            maf,
+        }
     }
 
     #[test]
     fn test_bucket_from_rule_new() {
         let rule = BeamRule {
-            first: super::super::bs::BeamLiteral { row_index: 0, group_id: 0, negated: false },
+            first: super::super::bs::BeamLiteral {
+                row_index: 0,
+                group_id: 0,
+                negated: false,
+            },
             rest: vec![
-                (BeamBinaryOp::And, super::super::bs::BeamLiteral { row_index: 1, group_id: 1, negated: true }),
-                (BeamBinaryOp::And, super::super::bs::BeamLiteral { row_index: 2, group_id: 2, negated: false }),
+                (
+                    BeamBinaryOp::And,
+                    super::super::bs::BeamLiteral {
+                        row_index: 1,
+                        group_id: 1,
+                        negated: true,
+                    },
+                ),
+                (
+                    BeamBinaryOp::And,
+                    super::super::bs::BeamLiteral {
+                        row_index: 2,
+                        group_id: 2,
+                        negated: false,
+                    },
+                ),
             ],
         };
         let bk = bucket_from_rule(&rule, 0.25);
@@ -878,7 +931,11 @@ mod tests {
     #[test]
     fn test_bucket_singleton_and_pair() {
         let s = BeamRule {
-            first: super::super::bs::BeamLiteral { row_index: 0, group_id: 0, negated: false },
+            first: super::super::bs::BeamLiteral {
+                row_index: 0,
+                group_id: 0,
+                negated: false,
+            },
             rest: vec![],
         };
         let sb = bucket_from_rule(&s, 0.10);
@@ -891,7 +948,9 @@ mod tests {
         let mut cal = RuleNullCalibrator::new();
         let bk = b(CombMode::PosOnly, LenBin::L2, MafBucket::High);
         // Need >= NULL_EXACT_MIN_SAMPLES (10) for exact bucket to be used.
-        for v in 1..=20 { cal.insert(bk, v as f64, v as f64); }
+        for v in 1..=20 {
+            cal.insert(bk, v as f64, v as f64);
+        }
         cal.insert(bk, 1000.0, 1000.0);
         let lookup = cal.finalize();
         assert_eq!(lookup.train_penalty(bk).unwrap(), 1000.0);
@@ -913,11 +972,26 @@ mod tests {
 
     #[test]
     fn test_topk_values() {
-        assert_eq!(null_topk_per_repeat_for_bucket(b(CombMode::PosOnly, LenBin::L2, MafBucket::High)), 3);
-        assert_eq!(null_topk_per_repeat_for_bucket(b(CombMode::PosOnly, LenBin::L3p, MafBucket::High)), 2);
-        assert_eq!(null_topk_per_repeat_for_bucket(b(CombMode::Mixed, LenBin::L2, MafBucket::High)), 2);
-        assert_eq!(null_topk_per_repeat_for_bucket(b(CombMode::NegOnly, LenBin::L2, MafBucket::High)), 2);
-        assert_eq!(null_topk_per_repeat_for_bucket(b(CombMode::PosOnly, LenBin::L1, MafBucket::High)), 1);
+        assert_eq!(
+            null_topk_per_repeat_for_bucket(b(CombMode::PosOnly, LenBin::L2, MafBucket::High)),
+            3
+        );
+        assert_eq!(
+            null_topk_per_repeat_for_bucket(b(CombMode::PosOnly, LenBin::L3p, MafBucket::High)),
+            2
+        );
+        assert_eq!(
+            null_topk_per_repeat_for_bucket(b(CombMode::Mixed, LenBin::L2, MafBucket::High)),
+            2
+        );
+        assert_eq!(
+            null_topk_per_repeat_for_bucket(b(CombMode::NegOnly, LenBin::L2, MafBucket::High)),
+            2
+        );
+        assert_eq!(
+            null_topk_per_repeat_for_bucket(b(CombMode::PosOnly, LenBin::L1, MafBucket::High)),
+            1
+        );
     }
 
     #[test]

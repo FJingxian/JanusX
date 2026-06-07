@@ -59,7 +59,10 @@ fn main() {
     println!("host={host}");
     println!("available_parallelism={avail}");
     println!("rust_sgemm_backend={}", janusx_rust_sgemm_backend());
-    println!("rust_eigh_lapack_backend={}", janusx_rust_eigh_lapack_backend());
+    println!(
+        "rust_eigh_lapack_backend={}",
+        janusx_rust_eigh_lapack_backend()
+    );
     println!("scheduler_env:");
     for key in SCHED_ENV_KEYS {
         if let Ok(val) = env::var(key) {
@@ -72,7 +75,10 @@ fn main() {
             println!("  {key}={val}");
         }
     }
-    println!("initial_rust_blas_threads={}", janusx_rust_blas_get_num_threads());
+    println!(
+        "initial_rust_blas_threads={}",
+        janusx_rust_blas_get_num_threads()
+    );
     println!();
 
     for req in requests {

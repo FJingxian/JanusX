@@ -13,7 +13,7 @@ use crate::he::{
     apply_grm_to_mat_f32_with_workspace, build_row_standardization_stats_with_options,
     GrmApplyWorkspace,
 };
-use crate::linalg::{cholesky_inplace, cholesky_solve_into};
+use crate::linalg::cholesky_solve_into;
 use crate::stats_common::get_cached_pool;
 
 #[derive(Clone, Debug)]
@@ -213,75 +213,8 @@ impl<T: PcgScalar> PcgPreconditioner<T> for IdentityPreconditioner {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct ScaledIdentityPreconditioner {
-    inv_scale: f64,
-}
-
-impl ScaledIdentityPreconditioner {
-    #[inline]
-    pub(crate) fn new(scale: f64) -> Result<Self, String> {
-        if !scale.is_finite() || scale <= 0.0 {
-            return Err(format!(
-                "PCG scaled-identity preconditioner requires finite positive scale, got {scale}"
-            ));
-        }
-        Ok(Self {
-            inv_scale: 1.0 / scale,
-        })
-    }
-}
-
-impl<T: PcgScalar> PcgPreconditioner<T> for ScaledIdentityPreconditioner {
-    #[inline]
-    fn apply(&mut self, rhs: &[T], output: &mut [T]) -> Result<(), String> {
-        if rhs.len() != output.len() {
-            return Err(format!(
-                "PCG scaled-identity preconditioner length mismatch: rhs={}, out={}",
-                rhs.len(),
-                output.len()
-            ));
-        }
-        if rhs.len() >= PCG_PAR_THRESHOLD {
-            output
-                .par_iter_mut()
-                .zip(rhs.par_iter())
-                .for_each(|(outj, rhsj)| {
-                    let mut value = T::default();
-                    T::add_scaled_in_place(&mut value, self.inv_scale, *rhsj);
-                    *outj = value;
-                });
-        } else {
-            for j in 0..rhs.len() {
-                let mut value = T::default();
-                T::add_scaled_in_place(&mut value, self.inv_scale, rhs[j]);
-                output[j] = value;
-            }
-        }
-        Ok(())
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
 pub(crate) struct DiagonalPreconditioner<'a, T> {
     inv_diag: &'a [T],
-}
-
-#[derive(Clone, Debug)]
-enum PcgVariancePreconditionerF64 {
-    Scaled(ScaledIdentityPreconditioner),
-    Diagonal(Vec<f64>),
-}
-
-impl PcgPreconditioner<f64> for PcgVariancePreconditionerF64 {
-    #[inline]
-    fn apply(&mut self, rhs: &[f64], output: &mut [f64]) -> Result<(), String> {
-        match self {
-            Self::Scaled(inner) => inner.apply(rhs, output),
-            Self::Diagonal(inv_diag) => {
-                DiagonalPreconditioner::new(inv_diag.as_slice()).apply(rhs, output)
-            }
-        }
-    }
 }
 
 impl<'a, T> DiagonalPreconditioner<'a, T> {
@@ -1090,11 +1023,9 @@ fn pcg_normalize_sample_idx(
 pub(crate) struct PcgJxlmmNullModel {
     pub(crate) n_samples: usize,
     pub(crate) n_covariates: usize,
-    pub(crate) v_inv_x: Vec<f64>,
-    pub(crate) beta_hat: Vec<f64>,
-    pub(crate) py: Vec<f64>,
-    pub(crate) xt_v_inv_x_chol: Vec<f64>,
-    pub(crate) xtx_chol: Vec<f64>,
+    pub(crate) sigma2: f64,
+    pub(crate) p0y: Vec<f64>,
+    pub(crate) xt_p0_x_chol: Vec<f64>,
 }
 
 #[derive(Clone, Debug)]
@@ -1105,49 +1036,10 @@ pub(crate) struct PcgJxlmmNullModelInfo {
 
 #[derive(Clone, Debug)]
 pub(crate) struct PcgJxlmmRHatResult {
-    pub(crate) r_hat: f64,
     pub(crate) n_markers_requested: usize,
     pub(crate) n_markers_used: usize,
     #[allow(dead_code)]
     pub(crate) solve_info: PcgMatrixSolveInfo,
-}
-
-#[inline]
-fn pcg_variance_preconditioner_f64(
-    sigma_g2: f64,
-    sigma_e2: f64,
-) -> Result<PcgVariancePreconditionerF64, String> {
-    pcg_validate_variance_components(sigma_g2, sigma_e2)?;
-    let scale = (sigma_g2 + sigma_e2)
-        .max(sigma_e2)
-        .max(sigma_g2)
-        .max(1e-12_f64);
-    Ok(PcgVariancePreconditionerF64::Scaled(
-        ScaledIdentityPreconditioner::new(scale)?,
-    ))
-}
-
-#[inline]
-fn pcg_variance_preconditioner_jacobi_f64(
-    sigma_g2: f64,
-    sigma_e2: f64,
-    inv_diag: Option<&[f64]>,
-) -> Result<PcgVariancePreconditionerF64, String> {
-    if let Some(inv_diag) = inv_diag {
-        if inv_diag.is_empty() {
-            return Err(
-                "PCG Jacobi preconditioner requires non-empty inverse diagonal".to_string(),
-            );
-        }
-        if inv_diag.iter().any(|&v| !v.is_finite() || v <= 0.0) {
-            return Err(
-                "PCG Jacobi preconditioner requires finite positive inverse diagonal entries"
-                    .to_string(),
-            );
-        }
-        return Ok(PcgVariancePreconditionerF64::Diagonal(inv_diag.to_vec()));
-    }
-    pcg_variance_preconditioner_f64(sigma_g2, sigma_e2)
 }
 
 #[inline]
@@ -1169,56 +1061,6 @@ fn pcg_xt_vec(
 }
 
 #[inline]
-fn pcg_xt_mat(
-    x_row_major: &[f64],
-    y_row_major: &[f64],
-    n_samples: usize,
-    n_covariates: usize,
-    n_cols_y: usize,
-    out: &mut [f64],
-) {
-    out.fill(0.0);
-    for i in 0..n_samples {
-        let x_row = &x_row_major[i * n_covariates..(i + 1) * n_covariates];
-        let y_row = &y_row_major[i * n_cols_y..(i + 1) * n_cols_y];
-        for r in 0..n_covariates {
-            let xr = x_row[r];
-            for c in 0..n_cols_y {
-                out[r * n_cols_y + c] += xr * y_row[c];
-            }
-        }
-    }
-}
-
-#[inline]
-fn pcg_spd_cholesky_with_jitter(
-    matrix: &[f64],
-    dim: usize,
-    label: &str,
-) -> Result<Vec<f64>, String> {
-    pcg_validate_matrix_shape(label, matrix, dim, dim)?;
-    let mut chol = matrix.to_vec();
-    if cholesky_inplace(&mut chol, dim).is_some() {
-        return Ok(chol);
-    }
-    let trace = (0..dim).map(|i| matrix[i * dim + i].abs()).sum::<f64>();
-    let base_jitter = (trace / (dim.max(1) as f64)).max(1.0) * 1e-10_f64;
-    for attempt in 0..6 {
-        let jitter = base_jitter * 10.0_f64.powi(attempt);
-        chol.copy_from_slice(matrix);
-        for i in 0..dim {
-            chol[i * dim + i] += jitter;
-        }
-        if cholesky_inplace(&mut chol, dim).is_some() {
-            return Ok(chol);
-        }
-    }
-    Err(format!(
-        "PCG SparseLMM failed to factor {label} as SPD after diagonal jitter"
-    ))
-}
-
-#[inline]
 fn pcg_validate_jxlmm_state(
     null_model: &PcgJxlmmNullModel,
     x_row_major: &[f64],
@@ -1229,245 +1071,25 @@ fn pcg_validate_jxlmm_state(
         null_model.n_samples,
         null_model.n_covariates,
     )?;
-    pcg_validate_matrix_shape(
-        "SparseLMM V^{-1}X matrix",
-        &null_model.v_inv_x,
-        null_model.n_samples,
-        null_model.n_covariates,
-    )?;
-    if null_model.beta_hat.len() != null_model.n_covariates
-        || null_model.py.len() != null_model.n_samples
-    {
+    if !null_model.sigma2.is_finite() || null_model.sigma2 <= 0.0 {
+        return Err(format!(
+            "PCG SparseLMM null model requires finite positive sigma2, got {}",
+            null_model.sigma2
+        ));
+    }
+    if null_model.p0y.len() != null_model.n_samples {
         return Err("PCG SparseLMM null model state length mismatch".to_string());
     }
     pcg_validate_matrix_shape(
-        "SparseLMM XtVinvX chol",
-        &null_model.xt_v_inv_x_chol,
-        null_model.n_covariates,
-        null_model.n_covariates,
-    )?;
-    pcg_validate_matrix_shape(
-        "SparseLMM XtX chol",
-        &null_model.xtx_chol,
+        "SparseLMM XtP0X chol",
+        &null_model.xt_p0_x_chol,
         null_model.n_covariates,
         null_model.n_covariates,
     )?;
     Ok(())
 }
 
-pub(crate) fn pcg_build_jxlmm_null_model<FY, FX>(
-    x_row_major: &[f64],
-    y: &[f64],
-    n_samples: usize,
-    n_covariates: usize,
-    max_iter: usize,
-    tol: f64,
-    tiny: f64,
-    k_operator: &mut PcgGrmBedOperator<'_>,
-    sigma_g2: f64,
-    sigma_e2: f64,
-    jacobi_inv_diag: Option<&[f64]>,
-    mut on_v_inv_y_iteration: FY,
-    mut on_v_inv_x_column_iteration: FX,
-) -> Result<(PcgJxlmmNullModel, PcgJxlmmNullModelInfo), String>
-where
-    FY: FnMut(usize, usize, f64) -> Result<(), String>,
-    FX: FnMut(usize, usize, usize, f64) -> Result<(), String>,
-{
-    if n_samples == 0 || n_covariates == 0 {
-        return Err(
-            "PCG SparseLMM null model requires n_samples > 0 and n_covariates > 0".to_string(),
-        );
-    }
-    pcg_validate_matrix_shape(
-        "SparseLMM design matrix",
-        x_row_major,
-        n_samples,
-        n_covariates,
-    )?;
-    if y.len() != n_samples {
-        return Err(format!(
-            "PCG SparseLMM y length mismatch: got {}, expected {n_samples}",
-            y.len()
-        ));
-    }
-
-    let precond_y = pcg_variance_preconditioner_jacobi_f64(sigma_g2, sigma_e2, jacobi_inv_diag)?;
-    let v_inv_y = pcg_solve_v_inv_y(
-        y,
-        None,
-        max_iter,
-        tol,
-        tiny,
-        &mut *k_operator,
-        sigma_g2,
-        sigma_e2,
-        precond_y,
-        |iter, iter_max, rel_res| on_v_inv_y_iteration(iter, iter_max, rel_res),
-    )?;
-    if v_inv_y.iters < max_iter {
-        on_v_inv_y_iteration(max_iter, max_iter, v_inv_y.rel_res)?;
-    }
-    if !v_inv_y.converged {
-        return Err(format!(
-            "PCG SparseLMM V^-1 y did not converge: iters={}, rel_res={:.3e}",
-            v_inv_y.iters, v_inv_y.rel_res
-        ));
-    }
-
-    let v_inv_x = if let Some(inv_diag) = jacobi_inv_diag {
-        pcg_solve_variance_matrix_batched_f64(
-            x_row_major,
-            n_samples,
-            n_covariates,
-            max_iter,
-            tol,
-            tiny,
-            k_operator,
-            sigma_g2,
-            sigma_e2,
-            inv_diag,
-            |col, iter, iter_max, rel_res| {
-                on_v_inv_x_column_iteration(col, iter, iter_max, rel_res)
-            },
-        )?
-    } else {
-        let precond_x =
-            pcg_variance_preconditioner_jacobi_f64(sigma_g2, sigma_e2, jacobi_inv_diag)?;
-        pcg_solve_v_inv_x(
-            x_row_major,
-            n_samples,
-            n_covariates,
-            None,
-            max_iter,
-            tol,
-            tiny,
-            &mut *k_operator,
-            sigma_g2,
-            sigma_e2,
-            precond_x,
-            |col, iter, iter_max, rel_res| {
-                on_v_inv_x_column_iteration(col, iter, iter_max, rel_res)
-            },
-        )?
-    };
-    if v_inv_x
-        .column_info
-        .last()
-        .map(|info| info.iters < max_iter)
-        .unwrap_or(false)
-    {
-        on_v_inv_x_column_iteration(
-            n_covariates.saturating_sub(1),
-            max_iter,
-            max_iter,
-            v_inv_x.max_rel_res,
-        )?;
-    }
-    if !v_inv_x.converged_all {
-        return Err(format!(
-            "PCG SparseLMM V^-1 X did not converge for all columns: max_iters={}, max_rel_res={:.3e}",
-            v_inv_x.max_iters, v_inv_x.max_rel_res
-        ));
-    }
-
-    let mut xt_v_inv_y = vec![0.0_f64; n_covariates];
-    pcg_xt_vec(
-        x_row_major,
-        n_samples,
-        n_covariates,
-        &v_inv_y.x,
-        &mut xt_v_inv_y,
-    );
-
-    let mut xt_v_inv_x = vec![0.0_f64; n_covariates * n_covariates];
-    pcg_xt_mat(
-        x_row_major,
-        &v_inv_x.x,
-        n_samples,
-        n_covariates,
-        n_covariates,
-        &mut xt_v_inv_x,
-    );
-    let xt_v_inv_x_chol =
-        pcg_spd_cholesky_with_jitter(&xt_v_inv_x, n_covariates, "SparseLMM XtVinvX")?;
-    let mut beta_hat = vec![0.0_f64; n_covariates];
-    cholesky_solve_into(&xt_v_inv_x_chol, n_covariates, &xt_v_inv_y, &mut beta_hat);
-
-    let mut py = v_inv_y.x.clone();
-    for i in 0..n_samples {
-        let vinvx_row = &v_inv_x.x[i * n_covariates..(i + 1) * n_covariates];
-        let adjust = vinvx_row
-            .iter()
-            .zip(beta_hat.iter())
-            .map(|(a, b)| a * b)
-            .sum::<f64>();
-        py[i] -= adjust;
-    }
-
-    let mut xtx = vec![0.0_f64; n_covariates * n_covariates];
-    pcg_xt_mat(
-        x_row_major,
-        x_row_major,
-        n_samples,
-        n_covariates,
-        n_covariates,
-        &mut xtx,
-    );
-    let xtx_chol = pcg_spd_cholesky_with_jitter(&xtx, n_covariates, "SparseLMM XtX")?;
-
-    Ok((
-        PcgJxlmmNullModel {
-            n_samples,
-            n_covariates,
-            v_inv_x: v_inv_x.x,
-            beta_hat,
-            py,
-            xt_v_inv_x_chol,
-            xtx_chol,
-        },
-        PcgJxlmmNullModelInfo {
-            v_inv_y: pcg_solve_info(v_inv_y.converged, v_inv_y.iters, v_inv_y.rel_res),
-            v_inv_x: PcgMatrixSolveInfo {
-                n_rows: v_inv_x.n_rows,
-                n_cols: v_inv_x.n_cols,
-                converged_all: v_inv_x.converged_all,
-                max_iters: v_inv_x.max_iters,
-                max_rel_res: v_inv_x.max_rel_res,
-                column_info: v_inv_x.column_info,
-            },
-        },
-    ))
-}
-
-pub(crate) fn pcg_jxlmm_s_m_s(
-    null_model: &PcgJxlmmNullModel,
-    x_row_major: &[f64],
-    snp: &[f64],
-) -> Result<f64, String> {
-    pcg_validate_jxlmm_state(null_model, x_row_major)?;
-    if snp.len() != null_model.n_samples {
-        return Err(format!(
-            "PCG SparseLMM s^T M s SNP length mismatch: got {}, expected {}",
-            snp.len(),
-            null_model.n_samples
-        ));
-    }
-    let p = null_model.n_covariates;
-    let mut xts = vec![0.0_f64; p];
-    pcg_xt_vec(x_row_major, null_model.n_samples, p, snp, &mut xts);
-    let mut alpha = vec![0.0_f64; p];
-    cholesky_solve_into(&null_model.xtx_chol, p, &xts, &mut alpha);
-    let s_sq = snp.iter().map(|v| v * v).sum::<f64>();
-    let cross = xts
-        .iter()
-        .zip(alpha.iter())
-        .map(|(a, b)| a * b)
-        .sum::<f64>();
-    Ok((s_sq - cross).max(0.0_f64))
-}
-
-pub(crate) fn pcg_jxlmm_s_p_s_exact(
+pub(crate) fn pcg_jxlmm_s_p0_s_exact(
     null_model: &PcgJxlmmNullModel,
     x_row_major: &[f64],
     snp: &[f64],
@@ -1491,8 +1113,12 @@ pub(crate) fn pcg_jxlmm_s_p_s_exact(
         v_inv_snp,
         &mut xt_v_inv_s,
     );
+    let sigma2 = null_model.sigma2;
+    for value in xt_v_inv_s.iter_mut() {
+        *value *= sigma2;
+    }
     let mut gamma = vec![0.0_f64; p];
-    cholesky_solve_into(&null_model.xt_v_inv_x_chol, p, &xt_v_inv_s, &mut gamma);
+    cholesky_solve_into(&null_model.xt_p0_x_chol, p, &xt_v_inv_s, &mut gamma);
     let s_v_inv_s = snp
         .iter()
         .zip(v_inv_snp.iter())
@@ -1503,357 +1129,7 @@ pub(crate) fn pcg_jxlmm_s_p_s_exact(
         .zip(gamma.iter())
         .map(|(a, b)| a * b)
         .sum::<f64>();
-    Ok((s_v_inv_s - quad).max(0.0_f64))
-}
-
-#[inline]
-fn pcg_col_major_to_row_major_f64(
-    matrix_col_major: &[f64],
-    n_rows: usize,
-    n_cols: usize,
-) -> Result<Vec<f64>, String> {
-    pcg_validate_matrix_shape("column-major matrix", matrix_col_major, n_rows, n_cols)?;
-    let mut out = vec![0.0_f64; n_rows.saturating_mul(n_cols)];
-    for col in 0..n_cols {
-        let src = &matrix_col_major[col * n_rows..(col + 1) * n_rows];
-        for row in 0..n_rows {
-            out[row * n_cols + col] = src[row];
-        }
-    }
-    Ok(out)
-}
-
-#[inline]
-fn pcg_apply_diag_preconditioner_mat_f64(
-    inv_diag: &[f64],
-    rhs_row_major: &[f64],
-    n_rows: usize,
-    n_cols: usize,
-    out_row_major: &mut [f64],
-) -> Result<(), String> {
-    pcg_validate_matrix_shape("PCG diag-precond rhs", rhs_row_major, n_rows, n_cols)?;
-    pcg_validate_matrix_shape("PCG diag-precond out", out_row_major, n_rows, n_cols)?;
-    if inv_diag.len() != n_rows {
-        return Err(format!(
-            "PCG diag-precond length mismatch: diag={}, rows={n_rows}",
-            inv_diag.len()
-        ));
-    }
-    if n_rows.saturating_mul(n_cols) >= PCG_PAR_THRESHOLD {
-        out_row_major
-            .par_chunks_mut(n_cols)
-            .zip(rhs_row_major.par_chunks(n_cols))
-            .zip(inv_diag.par_iter())
-            .for_each(|((out_row, rhs_row), &scale)| {
-                for col in 0..n_cols {
-                    out_row[col] = rhs_row[col] * scale;
-                }
-            });
-    } else {
-        for row in 0..n_rows {
-            let scale = inv_diag[row];
-            let rhs_row = &rhs_row_major[row * n_cols..(row + 1) * n_cols];
-            let out_row = &mut out_row_major[row * n_cols..(row + 1) * n_cols];
-            for col in 0..n_cols {
-                out_row[col] = rhs_row[col] * scale;
-            }
-        }
-    }
-    Ok(())
-}
-
-#[inline]
-fn pcg_apply_variance_mat_f64(
-    k_operator: &mut PcgGrmBedOperator<'_>,
-    input_row_major: &[f64],
-    n_rows: usize,
-    n_cols: usize,
-    sigma_g2: f64,
-    sigma_e2: f64,
-    kx_row_major: &mut Vec<f64>,
-    output_row_major: &mut [f64],
-) -> Result<(), String> {
-    pcg_validate_matrix_shape("PCG variance-mat input", input_row_major, n_rows, n_cols)?;
-    pcg_validate_matrix_shape("PCG variance-mat out", output_row_major, n_rows, n_cols)?;
-    let total = n_rows.saturating_mul(n_cols);
-    if kx_row_major.len() != total {
-        kx_row_major.resize(total, 0.0_f64);
-    }
-    k_operator.apply_mat_row_major_f64(input_row_major, n_cols, kx_row_major)?;
-    for ((dst, &kg), &xv) in output_row_major
-        .iter_mut()
-        .zip(kx_row_major.iter())
-        .zip(input_row_major.iter())
-    {
-        *dst = sigma_g2.mul_add(kg, sigma_e2 * xv);
-    }
-    Ok(())
-}
-
-fn pcg_solve_variance_matrix_batched_f64<F>(
-    rhs_row_major: &[f64],
-    n_rows: usize,
-    n_cols: usize,
-    max_iter: usize,
-    tol: f64,
-    tiny: f64,
-    k_operator: &mut PcgGrmBedOperator<'_>,
-    sigma_g2: f64,
-    sigma_e2: f64,
-    inv_diag: &[f64],
-    mut on_column_iteration: F,
-) -> Result<PcgMatrixResult<f64>, String>
-where
-    F: FnMut(usize, usize, usize, f64) -> Result<(), String>,
-{
-    pcg_validate_variance_components(sigma_g2, sigma_e2)?;
-    pcg_validate_matrix_shape("PCG batched variance rhs", rhs_row_major, n_rows, n_cols)?;
-    if n_cols == 0 {
-        return Err("PCG batched variance solve requires at least one RHS column".to_string());
-    }
-    if inv_diag.len() != n_rows {
-        return Err(format!(
-            "PCG batched variance Jacobi diagonal mismatch: diag={}, rows={n_rows}",
-            inv_diag.len()
-        ));
-    }
-    if inv_diag.iter().any(|&v| !v.is_finite() || v <= 0.0) {
-        return Err(
-            "PCG batched variance solve requires finite positive Jacobi inverse diagonal entries"
-                .to_string(),
-        );
-    }
-
-    let total = n_rows.saturating_mul(n_cols);
-    let mut x = vec![0.0_f64; total];
-    let mut r = rhs_row_major.to_vec();
-    let mut z = vec![0.0_f64; total];
-    let mut p_mat = vec![0.0_f64; total];
-    let mut ap = vec![0.0_f64; total];
-    let mut kx = vec![0.0_f64; total];
-    let mut rhs_norm = vec![0.0_f64; n_cols];
-    let mut rz_old = vec![0.0_f64; n_cols];
-    let mut rz_new = vec![0.0_f64; n_cols];
-    let mut alpha = vec![0.0_f64; n_cols];
-    let mut p_ap = vec![0.0_f64; n_cols];
-    let mut rr = vec![0.0_f64; n_cols];
-    let mut rel_res = vec![f64::INFINITY; n_cols];
-    let mut converged = vec![false; n_cols];
-    let mut column_info = vec![pcg_solve_info(false, 0, f64::INFINITY); n_cols];
-
-    pcg_apply_diag_preconditioner_mat_f64(inv_diag, &r, n_rows, n_cols, &mut z)?;
-    p_mat.copy_from_slice(&z);
-    for row in 0..n_rows {
-        let row_off = row * n_cols;
-        let r_row = &r[row_off..row_off + n_cols];
-        let z_row = &z[row_off..row_off + n_cols];
-        for col in 0..n_cols {
-            rhs_norm[col] += r_row[col] * r_row[col];
-            rz_old[col] += r_row[col] * z_row[col];
-        }
-    }
-    for col in 0..n_cols {
-        let rr0 = rhs_norm[col];
-        rhs_norm[col] = rr0.sqrt().max(tiny);
-        rel_res[col] = rr0.sqrt() / rhs_norm[col];
-        if rel_res[col] <= tol || rz_old[col].abs() <= tiny {
-            converged[col] = true;
-            column_info[col] = pcg_solve_info(true, 0, rel_res[col]);
-        }
-    }
-
-    for iter in 1..=max_iter {
-        if converged.iter().all(|&v| v) {
-            break;
-        }
-        pcg_apply_variance_mat_f64(
-            k_operator, &p_mat, n_rows, n_cols, sigma_g2, sigma_e2, &mut kx, &mut ap,
-        )?;
-        rz_new.fill(0.0_f64);
-        alpha.fill(0.0_f64);
-        p_ap.fill(0.0_f64);
-        for row in 0..n_rows {
-            let row_off = row * n_cols;
-            let p_row = &p_mat[row_off..row_off + n_cols];
-            let ap_row = &ap[row_off..row_off + n_cols];
-            for col in 0..n_cols {
-                if converged[col] {
-                    continue;
-                }
-                p_ap[col] += p_row[col] * ap_row[col];
-            }
-        }
-        for col in 0..n_cols {
-            if converged[col] {
-                continue;
-            }
-            if !p_ap[col].is_finite() || p_ap[col].abs() <= tiny {
-                rel_res[col] = f64::INFINITY;
-                continue;
-            }
-            alpha[col] = rz_old[col] / p_ap[col];
-        }
-        for row in 0..n_rows {
-            let row_off = row * n_cols;
-            for col in 0..n_cols {
-                if converged[col] {
-                    continue;
-                }
-                let idx = row_off + col;
-                x[idx] += alpha[col] * p_mat[idx];
-                r[idx] -= alpha[col] * ap[idx];
-            }
-        }
-        pcg_apply_diag_preconditioner_mat_f64(inv_diag, &r, n_rows, n_cols, &mut z)?;
-        rr.fill(0.0_f64);
-        for row in 0..n_rows {
-            let row_off = row * n_cols;
-            let r_row = &r[row_off..row_off + n_cols];
-            let z_row = &z[row_off..row_off + n_cols];
-            for col in 0..n_cols {
-                if converged[col] {
-                    continue;
-                }
-                rr[col] += r_row[col] * r_row[col];
-                rz_new[col] += r_row[col] * z_row[col];
-            }
-        }
-        for col in 0..n_cols {
-            if converged[col] {
-                continue;
-            }
-            rel_res[col] = rr[col].sqrt() / rhs_norm[col];
-            on_column_iteration(col, iter, max_iter, rel_res[col])?;
-            if rel_res[col].is_finite() && rel_res[col] <= tol {
-                converged[col] = true;
-                column_info[col] = pcg_solve_info(true, iter, rel_res[col]);
-                continue;
-            }
-            if !rz_new[col].is_finite() || rz_old[col].abs() <= tiny {
-                column_info[col] = pcg_solve_info(false, iter, rel_res[col]);
-                continue;
-            }
-            let beta = rz_new[col] / rz_old[col];
-            for row in 0..n_rows {
-                let idx = row * n_cols + col;
-                p_mat[idx] = z[idx] + beta * p_mat[idx];
-            }
-            rz_old[col] = rz_new[col];
-            column_info[col] = pcg_solve_info(false, iter, rel_res[col]);
-        }
-    }
-
-    Ok(PcgMatrixResult {
-        x,
-        n_rows,
-        n_cols,
-        converged_all: converged.iter().all(|&v| v),
-        max_iters: column_info
-            .iter()
-            .map(|info| info.iters)
-            .max()
-            .unwrap_or(0usize),
-        max_rel_res: column_info
-            .iter()
-            .map(|info| info.rel_res)
-            .filter(|v| v.is_finite())
-            .fold(0.0_f64, f64::max),
-        column_info,
-    })
-}
-
-pub(crate) fn pcg_estimate_jxlmm_r_hat<F>(
-    null_model: &PcgJxlmmNullModel,
-    x_row_major: &[f64],
-    sampled_markers_col_major: &[f64],
-    n_markers: usize,
-    max_iter: usize,
-    tol: f64,
-    tiny: f64,
-    k_operator: &mut PcgGrmBedOperator<'_>,
-    sigma_g2: f64,
-    sigma_e2: f64,
-    jacobi_inv_diag: Option<&[f64]>,
-    mut on_v_inv_s_column_iteration: F,
-) -> Result<PcgJxlmmRHatResult, String>
-where
-    F: FnMut(usize, usize, usize, f64) -> Result<(), String>,
-{
-    pcg_validate_jxlmm_state(null_model, x_row_major)?;
-    pcg_validate_matrix_shape(
-        "SparseLMM sampled marker matrix",
-        sampled_markers_col_major,
-        null_model.n_samples,
-        n_markers,
-    )?;
-    if n_markers == 0 {
-        return Err(
-            "PCG SparseLMM r-hat estimation requires at least one sampled marker".to_string(),
-        );
-    }
-    let inv_diag = jacobi_inv_diag.ok_or_else(|| {
-        "PCG SparseLMM r-hat batched solver requires Jacobi inverse diagonal".to_string()
-    })?;
-    let rhs_row_major =
-        pcg_col_major_to_row_major_f64(sampled_markers_col_major, null_model.n_samples, n_markers)?;
-    let v_inv_s = pcg_solve_variance_matrix_batched_f64(
-        &rhs_row_major,
-        null_model.n_samples,
-        n_markers,
-        max_iter,
-        tol,
-        tiny,
-        k_operator,
-        sigma_g2,
-        sigma_e2,
-        inv_diag,
-        |col, iter, iter_max, rel_res| on_v_inv_s_column_iteration(col, iter, iter_max, rel_res),
-    )?;
-
-    let mut ratio_sum = 0.0_f64;
-    let mut n_used = 0usize;
-    let mut v_inv_col = vec![0.0_f64; null_model.n_samples];
-    for col in 0..n_markers {
-        let snp_col = &sampled_markers_col_major
-            [col * null_model.n_samples..(col + 1) * null_model.n_samples];
-        pcg_copy_matrix_column(
-            &v_inv_s.x,
-            null_model.n_samples,
-            n_markers,
-            col,
-            &mut v_inv_col,
-        );
-        let s_m_s = pcg_jxlmm_s_m_s(null_model, x_row_major, snp_col)?;
-        if !s_m_s.is_finite() || s_m_s <= tiny.max(1e-30_f64) {
-            continue;
-        }
-        let s_p_s = pcg_jxlmm_s_p_s_exact(null_model, x_row_major, snp_col, &v_inv_col)?;
-        if !s_p_s.is_finite() || s_p_s <= tiny.max(1e-30_f64) {
-            continue;
-        }
-        let ratio = s_p_s / s_m_s;
-        if ratio.is_finite() && ratio > 0.0 {
-            ratio_sum += ratio;
-            n_used += 1;
-        }
-    }
-    if n_used == 0 {
-        return Err("PCG SparseLMM r-hat estimation found no valid sampled markers".to_string());
-    }
-
-    Ok(PcgJxlmmRHatResult {
-        r_hat: ratio_sum / (n_used as f64),
-        n_markers_requested: n_markers,
-        n_markers_used: n_used,
-        solve_info: PcgMatrixSolveInfo {
-            n_rows: v_inv_s.n_rows,
-            n_cols: v_inv_s.n_cols,
-            converged_all: v_inv_s.converged_all,
-            max_iters: v_inv_s.max_iters,
-            max_rel_res: v_inv_s.max_rel_res,
-            column_info: v_inv_s.column_info,
-        },
-    })
+    Ok((sigma2 * s_v_inv_s - quad).max(0.0_f64))
 }
 
 #[inline]

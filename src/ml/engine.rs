@@ -87,9 +87,7 @@ pub fn compute_feature_scores_grouped(
     let scores = match (resolved, importance) {
         (MlEngine::PairwiseAnd, ImportanceKind::Imp)
         | (MlEngine::PairwiseAnd, ImportanceKind::Permutation) => {
-            feature_scores_pairwise_and_grouped(
-                x_rows, y, response, cfg, feature_group_ids,
-            )
+            feature_scores_pairwise_and_grouped(x_rows, y, response, cfg, feature_group_ids)
         }
         (MlEngine::ExtraTrees, ImportanceKind::Imp) => {
             feature_scores_extra_trees_grouped(x_rows, y, response, cfg, feature_group_ids)

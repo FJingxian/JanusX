@@ -219,12 +219,7 @@ fn count_sum_packed(
 // ---------------------------------------------------------------------------
 
 #[inline]
-fn centered_gain_from_counts(
-    total_sum: f64,
-    sum_hit: f64,
-    n_samples: usize,
-    n_hit: usize,
-) -> f64 {
+fn centered_gain_from_counts(total_sum: f64, sum_hit: f64, n_samples: usize, n_hit: usize) -> f64 {
     let n_miss = n_samples.saturating_sub(n_hit);
     if n_hit == 0 || n_miss == 0 {
         return 0.0;
@@ -310,8 +305,7 @@ fn pair_gains_packed_fast(
     for w in 0..n_words {
         scratch[w] = pi[w] & pj[w];
     }
-    let (n_and, s_and) =
-        count_sum_packed(scratch, y, y_word_sums, n_words, tail_mask);
+    let (n_and, s_and) = count_sum_packed(scratch, y, y_word_sums, n_words, tail_mask);
 
     let n_or = n_hit_i + n_hit_j - n_and;
     let s_or = sum_hit_i + sum_hit_j - s_and;
@@ -342,7 +336,11 @@ fn feature_scores_pairwise_and_packed_core(
     let total_sum: f64 = y.iter().sum();
     let n_words = row_words;
     let rem = n_samples & 63;
-    let tail_mask = if rem == 0 { u64::MAX } else { (1u64 << rem) - 1 };
+    let tail_mask = if rem == 0 {
+        u64::MAX
+    } else {
+        (1u64 << rem) - 1
+    };
     let y_word_sums = build_y_word_sums(y, n_samples, n_words);
 
     // ---- Stage 1: marginal + cache (n_hit, sum_hit) per feature ----------
@@ -488,14 +486,7 @@ pub fn feature_scores_pairwise_and_packed(
     y: &[f64],
     n_samples: usize,
 ) -> Vec<f64> {
-    feature_scores_pairwise_and_packed_core(
-        bits_flat,
-        row_words,
-        n_features,
-        y,
-        n_samples,
-        None,
-    )
+    feature_scores_pairwise_and_packed_core(bits_flat, row_words, n_features, y, n_samples, None)
 }
 
 pub fn feature_scores_pairwise_and_packed_with_stage1(
@@ -546,8 +537,7 @@ pub fn feature_scores_pairwise_and_flat(
     for i in 0..n_features {
         let row = &data[i * row_stride..][..n_samples];
         let (n_hit, sum_hit) = count_sum_y_dense(row, y);
-        marginal_gain[i] =
-            centered_gain_from_counts(total_sum, sum_hit, n_samples, n_hit);
+        marginal_gain[i] = centered_gain_from_counts(total_sum, sum_hit, n_samples, n_hit);
         feat_n_hit[i] = n_hit;
         feat_sum_hit[i] = sum_hit;
     }
@@ -567,7 +557,11 @@ pub fn feature_scores_pairwise_and_flat(
     // ---- Pack only top-M' for Stage 2 --------------------------------------
     let n_words = words_for_samples(n_samples);
     let rem = n_samples & 63;
-    let tail_mask = if rem == 0 { u64::MAX } else { (1u64 << rem) - 1 };
+    let tail_mask = if rem == 0 {
+        u64::MAX
+    } else {
+        (1u64 << rem) - 1
+    };
     let y_word_sums = build_y_word_sums(y, n_samples, n_words);
 
     let mut packed_top: Vec<Vec<u64>> = Vec::with_capacity(keep_n);
@@ -594,20 +588,32 @@ pub fn feature_scores_pairwise_and_flat(
                 let j = top[b];
                 let pi = &packed_top[a];
                 let pj = &packed_top[b];
-                let (gain_and, gain_nij, gain_ij, gain_ji) =
-                    pair_gains_packed_fast(
-                        pi, pj, &mut local_scratch, y, &y_word_sums,
-                        n_words, tail_mask, n_samples, total_sum,
-                        feat_n_hit[i], feat_sum_hit[i],
-                        feat_n_hit[j], feat_sum_hit[j],
-                    );
+                let (gain_and, gain_nij, gain_ij, gain_ji) = pair_gains_packed_fast(
+                    pi,
+                    pj,
+                    &mut local_scratch,
+                    y,
+                    &y_word_sums,
+                    n_words,
+                    tail_mask,
+                    n_samples,
+                    total_sum,
+                    feat_n_hit[i],
+                    feat_sum_hit[i],
+                    feat_n_hit[j],
+                    feat_sum_hit[j],
+                );
                 let baseline = marginal_gain[i].max(marginal_gain[j]);
                 let best = (gain_and - baseline)
                     .max(gain_nij - baseline)
                     .max(gain_ij - baseline)
                     .max(gain_ji - baseline);
-                if best > local_max[i] { local_max[i] = best; }
-                if best > local_max[j] { local_max[j] = best; }
+                if best > local_max[i] {
+                    local_max[i] = best;
+                }
+                if best > local_max[j] {
+                    local_max[j] = best;
+                }
             }
             local_max
         })
@@ -615,7 +621,9 @@ pub fn feature_scores_pairwise_and_flat(
             || vec![0.0f64; n_features],
             |mut a, b| {
                 for i in 0..n_features {
-                    if b[i] > a[i] { a[i] = b[i]; }
+                    if b[i] > a[i] {
+                        a[i] = b[i];
+                    }
                 }
                 a
             },
@@ -635,8 +643,7 @@ pub fn feature_scores_pairwise_and_flat(
     let mut final_scores = vec![0.0f64; n_features];
     for i in 0..n_features {
         let interaction_scaled = interaction_max[i] * scale;
-        final_scores[i] =
-            (1.0 - alpha) * marginal_gain[i] + alpha * interaction_scaled;
+        final_scores[i] = (1.0 - alpha) * marginal_gain[i] + alpha * interaction_scaled;
     }
     PW_COMBINE_NS.fetch_add(elapsed_ns_sat(t_comb), Ordering::Relaxed);
     final_scores
@@ -681,8 +688,7 @@ pub fn feature_scores_pairwise_and_grouped(
     let mut feat_sum_hit = vec![0.0f64; n_features];
     for i in 0..n_features {
         let (n_hit, sum_hit) = count_sum_y_dense(&x_rows[i], y);
-        marginal_gain[i] =
-            centered_gain_from_counts(total_sum, sum_hit, n_samples, n_hit);
+        marginal_gain[i] = centered_gain_from_counts(total_sum, sum_hit, n_samples, n_hit);
         feat_n_hit[i] = n_hit;
         feat_sum_hit[i] = sum_hit;
     }
@@ -700,7 +706,11 @@ pub fn feature_scores_pairwise_and_grouped(
     // ---- Pack only the top-M' features for Stage 2 -------------------------
     let n_words = words_for_samples(n_samples);
     let rem = n_samples & 63;
-    let tail_mask = if rem == 0 { u64::MAX } else { (1u64 << rem) - 1 };
+    let tail_mask = if rem == 0 {
+        u64::MAX
+    } else {
+        (1u64 << rem) - 1
+    };
     let y_word_sums = build_y_word_sums(y, n_samples, n_words);
 
     let mut packed_top: Vec<Vec<u64>> = Vec::with_capacity(keep_n);
@@ -724,20 +734,32 @@ pub fn feature_scores_pairwise_and_grouped(
                 let j = top[b];
                 let pi = &packed_top[a];
                 let pj = &packed_top[b];
-                let (gain_and, gain_nij, gain_ij, gain_ji) =
-                    pair_gains_packed_fast(
-                        pi, pj, &mut local_scratch, y, &y_word_sums,
-                        n_words, tail_mask, n_samples, total_sum,
-                        feat_n_hit[i], feat_sum_hit[i],
-                        feat_n_hit[j], feat_sum_hit[j],
-                    );
+                let (gain_and, gain_nij, gain_ij, gain_ji) = pair_gains_packed_fast(
+                    pi,
+                    pj,
+                    &mut local_scratch,
+                    y,
+                    &y_word_sums,
+                    n_words,
+                    tail_mask,
+                    n_samples,
+                    total_sum,
+                    feat_n_hit[i],
+                    feat_sum_hit[i],
+                    feat_n_hit[j],
+                    feat_sum_hit[j],
+                );
                 let baseline = marginal_gain[i].max(marginal_gain[j]);
                 let best = (gain_and - baseline)
                     .max(gain_nij - baseline)
                     .max(gain_ij - baseline)
                     .max(gain_ji - baseline);
-                if best > local_max[i] { local_max[i] = best; }
-                if best > local_max[j] { local_max[j] = best; }
+                if best > local_max[i] {
+                    local_max[i] = best;
+                }
+                if best > local_max[j] {
+                    local_max[j] = best;
+                }
             }
             local_max
         })
@@ -745,21 +767,17 @@ pub fn feature_scores_pairwise_and_grouped(
             || vec![0.0f64; n_features],
             |mut a, b| {
                 for i in 0..n_features {
-                    if b[i] > a[i] { a[i] = b[i]; }
+                    if b[i] > a[i] {
+                        a[i] = b[i];
+                    }
                 }
                 a
             },
         );
 
     // ---- Stage 3: combine marginal + interaction scores --------------------
-    let max_marginal = marginal_gain
-        .iter()
-        .cloned()
-        .fold(0.0f64, f64::max);
-    let max_interaction = interaction_max
-        .iter()
-        .cloned()
-        .fold(0.0f64, f64::max);
+    let max_marginal = marginal_gain.iter().cloned().fold(0.0f64, f64::max);
+    let max_interaction = interaction_max.iter().cloned().fold(0.0f64, f64::max);
 
     let scale = if max_interaction > 0.0 && max_marginal > 0.0 {
         max_marginal / max_interaction
@@ -770,8 +788,7 @@ pub fn feature_scores_pairwise_and_grouped(
     let mut final_scores = vec![0.0f64; n_features];
     for i in 0..n_features {
         let interaction_scaled = interaction_max[i] * scale;
-        final_scores[i] =
-            (1.0 - alpha) * marginal_gain[i] + alpha * interaction_scaled;
+        final_scores[i] = (1.0 - alpha) * marginal_gain[i] + alpha * interaction_scaled;
     }
 
     final_scores
@@ -815,7 +832,11 @@ mod tests {
         let n_words = words_for_samples(n_samples);
         let yws = build_y_word_sums(&y, n_samples, n_words);
         let rem = n_samples & 63;
-        let tail_mask = if rem == 0 { u64::MAX } else { (1u64 << rem) - 1 };
+        let tail_mask = if rem == 0 {
+            u64::MAX
+        } else {
+            (1u64 << rem) - 1
+        };
 
         let packed = pack_dense(&row, n_words);
         let (n, s) = count_sum_packed(&packed, &y, &yws, n_words, tail_mask);
@@ -841,9 +862,8 @@ mod tests {
         let feat_b = vec![1u8, 1, 0, 0, 0, 0, 1, 1];
         let x_rows = vec![feat_a, feat_b];
         let cfg = test_cfg();
-        let scores_packed = feature_scores_pairwise_and_grouped(
-            &x_rows, &y, ResponseKind::Continuous, cfg, None,
-        );
+        let scores_packed =
+            feature_scores_pairwise_and_grouped(&x_rows, &y, ResponseKind::Continuous, cfg, None);
 
         assert_eq!(scores_packed.len(), 2);
         assert!(scores_packed[0].is_finite());
@@ -863,9 +883,8 @@ mod tests {
         let x_rows = vec![a.clone(), b.clone()];
 
         let cfg = test_cfg();
-        let scores = feature_scores_pairwise_and_grouped(
-            &x_rows, &y, ResponseKind::Continuous, cfg, None,
-        );
+        let scores =
+            feature_scores_pairwise_and_grouped(&x_rows, &y, ResponseKind::Continuous, cfg, None);
 
         assert!(scores.len() == 2);
         assert!(scores[0].is_finite());
@@ -877,9 +896,8 @@ mod tests {
         let y = vec![1.0, 2.0, 3.0];
         let x_rows = vec![vec![1u8, 0, 1]];
         let cfg = test_cfg();
-        let scores = feature_scores_pairwise_and_grouped(
-            &x_rows, &y, ResponseKind::Continuous, cfg, None,
-        );
+        let scores =
+            feature_scores_pairwise_and_grouped(&x_rows, &y, ResponseKind::Continuous, cfg, None);
         assert_eq!(scores.len(), 1);
         assert!(scores[0].is_finite());
     }
@@ -888,9 +906,8 @@ mod tests {
     fn test_empty_input() {
         let y = vec![1.0, 2.0];
         let cfg = test_cfg();
-        let scores = feature_scores_pairwise_and_grouped(
-            &[], &y, ResponseKind::Continuous, cfg, None,
-        );
+        let scores =
+            feature_scores_pairwise_and_grouped(&[], &y, ResponseKind::Continuous, cfg, None);
         assert!(scores.is_empty());
     }
 
@@ -903,7 +920,11 @@ mod tests {
         let n_words = words_for_samples(n_samples);
         let yws = build_y_word_sums(&y, n_samples, n_words);
         let rem = n_samples & 63;
-        let tail_mask = if rem == 0 { u64::MAX } else { (1u64 << rem) - 1 };
+        let tail_mask = if rem == 0 {
+            u64::MAX
+        } else {
+            (1u64 << rem) - 1
+        };
 
         let packed = pack_dense(&row, n_words);
         let (n, s) = count_sum_packed(&packed, &y, &yws, n_words, tail_mask);

@@ -298,9 +298,11 @@ impl GwasAssocTsvWriter {
         }
         match self.writer.as_ref() {
             Some(w) => w.send(data).map_err(PyIOError::new_err)?,
-            None => return Err(PyRuntimeError::new_err(
-                "send_block called before writer is initialized (call append_text first)",
-            )),
+            None => {
+                return Err(PyRuntimeError::new_err(
+                    "send_block called before writer is initialized (call append_text first)",
+                ))
+            }
         }
         Ok(())
     }

@@ -80,8 +80,7 @@ pub use score::{
     score_binary_ba_mcc_batch_py, score_binary_ba_py, score_binary_mcc_packed, score_binary_mcc_py,
     score_cont_centered_gain_packed_with_sum, score_cont_corr_packed, score_cont_corr_py,
     score_cont_mean_diff_corr_batch_py, score_cont_mean_diff_py,
-    score_cont_weighted_mean_diff_packed, ContinuousRuleScore,
-    support_size_packed,
+    score_cont_weighted_mean_diff_packed, support_size_packed, ContinuousRuleScore,
 };
 pub use score_gpu::{
     garfield_compare_score_cont_centered_gain_batch_metal_vs_cpu_py,
@@ -2463,7 +2462,10 @@ fn literal_metric_token(value: f64, negated: bool) -> String {
 }
 
 #[inline]
-fn logic_symbol_for_display(_op: BeamBinaryOp, polarity: GarfieldRuleDisplayPolarity) -> &'static str {
+fn logic_symbol_for_display(
+    _op: BeamBinaryOp,
+    polarity: GarfieldRuleDisplayPolarity,
+) -> &'static str {
     match polarity {
         GarfieldRuleDisplayPolarity::OriginalAnd => "&",
         GarfieldRuleDisplayPolarity::ComplementOr => "|",
@@ -2471,7 +2473,10 @@ fn logic_symbol_for_display(_op: BeamBinaryOp, polarity: GarfieldRuleDisplayPola
 }
 
 #[inline]
-fn expr_symbol_for_display(_op: BeamBinaryOp, polarity: GarfieldRuleDisplayPolarity) -> &'static str {
+fn expr_symbol_for_display(
+    _op: BeamBinaryOp,
+    polarity: GarfieldRuleDisplayPolarity,
+) -> &'static str {
     match polarity {
         GarfieldRuleDisplayPolarity::OriginalAnd => "AND",
         GarfieldRuleDisplayPolarity::ComplementOr => "OR",
@@ -2479,10 +2484,7 @@ fn expr_symbol_for_display(_op: BeamBinaryOp, polarity: GarfieldRuleDisplayPolar
 }
 
 #[inline]
-fn display_literal_negated(
-    literal_negated: bool,
-    polarity: GarfieldRuleDisplayPolarity,
-) -> bool {
+fn display_literal_negated(literal_negated: bool, polarity: GarfieldRuleDisplayPolarity) -> bool {
     match polarity {
         GarfieldRuleDisplayPolarity::OriginalAnd => literal_negated,
         GarfieldRuleDisplayPolarity::ComplementOr => !literal_negated,
@@ -2525,10 +2527,7 @@ fn rule_expr_with_polarity(
     let first = local_sites
         .get(rule.first.row_index)
         .ok_or_else(|| format!("rule row index out of range: {}", rule.first.row_index))?;
-    let mut out = literal_expr(
-        first,
-        display_literal_negated(rule.first.negated, polarity),
-    );
+    let mut out = literal_expr(first, display_literal_negated(rule.first.negated, polarity));
     for (op, lit) in rule.rest.iter() {
         let site = local_sites
             .get(lit.row_index)
@@ -2552,10 +2551,7 @@ fn rule_snp_name_with_polarity(
     let first = local_sites
         .get(rule.first.row_index)
         .ok_or_else(|| format!("rule row index out of range: {}", rule.first.row_index))?;
-    let mut out = literal_name(
-        first,
-        display_literal_negated(rule.first.negated, polarity),
-    );
+    let mut out = literal_name(first, display_literal_negated(rule.first.negated, polarity));
     for (op, lit) in rule.rest.iter() {
         let site = local_sites
             .get(lit.row_index)
@@ -2587,20 +2583,15 @@ fn rule_bim_alleles_with_polarity(
     let first = local_sites
         .get(rule.first.row_index)
         .ok_or_else(|| format!("rule row index out of range: {}", rule.first.row_index))?;
-    let (a0, a1) = literal_bim_alleles(
-        first,
-        display_literal_negated(rule.first.negated, polarity),
-    );
+    let (a0, a1) =
+        literal_bim_alleles(first, display_literal_negated(rule.first.negated, polarity));
     allele0.push(a0);
     allele1.push(a1);
     for (_, lit) in rule.rest.iter() {
         let site = local_sites
             .get(lit.row_index)
             .ok_or_else(|| format!("rule row index out of range: {}", lit.row_index))?;
-        let (a0, a1) = literal_bim_alleles(
-            site,
-            display_literal_negated(lit.negated, polarity),
-        );
+        let (a0, a1) = literal_bim_alleles(site, display_literal_negated(lit.negated, polarity));
         allele0.push(a0);
         allele1.push(a1);
     }
@@ -2684,7 +2675,10 @@ fn build_rule_delta_annotations(
             assoc_sample_indices,
         );
         score_txt.push_str(&literal_metric_token(single_score, display_lit.negated));
-        pwald_txt.push_str(&literal_metric_token(single_assoc.pwald, display_lit.negated));
+        pwald_txt.push_str(&literal_metric_token(
+            single_assoc.pwald,
+            display_lit.negated,
+        ));
         Ok(())
     };
 
@@ -4650,7 +4644,12 @@ fn packed_rows_subset_from_full_bits_range_with_stage1(
 ) -> Result<(Vec<u64>, usize, Vec<usize>, Vec<f64>), String> {
     let _t = Instant::now();
     if row_end <= row_start {
-        return Ok((Vec::new(), words_for_samples(sample_indices.len()), Vec::new(), Vec::new()));
+        return Ok((
+            Vec::new(),
+            words_for_samples(sample_indices.len()),
+            Vec::new(),
+            Vec::new(),
+        ));
     }
     if row_end > n_rows_all {
         return Err(format!(
@@ -5010,7 +5009,6 @@ fn select_logic_unit_global_rows(
     train_idx_local: &[usize],
     y_train: &[f64],
     allow_parallel: bool,
-    
 ) -> Result<Option<Vec<usize>>, String> {
     if unit.indices.is_empty() {
         return Ok(None);
@@ -5024,14 +5022,14 @@ fn select_logic_unit_global_rows(
             let t0 = Instant::now();
             let (packed_bits, row_words_sub, feat_n_hit, feat_sum_hit) =
                 packed_rows_subset_from_full_bits_with_stage1(
-                logic_bits.bits_flat.as_slice(),
-                logic_bits.row_words,
-                unit.indices.as_slice(),
-                train_idx_local,
-                y_train,
-                logic_bits.sites.len(),
-                logic_bits.n_samples,
-            )?;
+                    logic_bits.bits_flat.as_slice(),
+                    logic_bits.row_words,
+                    unit.indices.as_slice(),
+                    train_idx_local,
+                    y_train,
+                    logic_bits.sites.len(),
+                    logic_bits.n_samples,
+                )?;
             let scores = feature_scores_pairwise_and_packed_with_stage1(
                 packed_bits.as_slice(),
                 row_words_sub,
@@ -5224,23 +5222,22 @@ fn prepare_logic_chunk_continuous(
     let keep_policy = GarfieldMlKeepPolicy::TopKPlusRandom {
         top_frac: GARFIELD_NULL_ML_TOP_FRAC,
     };
-    let selection_seed =
-        perm_cfg.seed ^ chunk.window_id ^ 0x94D0_49BB_1331_11EB;
+    let selection_seed = perm_cfg.seed ^ chunk.window_id ^ 0x94D0_49BB_1331_11EB;
 
     let selected_global_rows = if let Some(engine_one) = engine {
         // ---- PairwiseAnd fast path: packed subset + cached stage-1 stats ----
         if engine_one == MlEngine::PairwiseAnd {
             let (packed_bits, row_words_sub, feat_n_hit, feat_sum_hit) =
                 packed_rows_subset_from_full_bits_range_with_stage1(
-                logic_bits.bits_flat.as_slice(),
-                logic_bits.row_words,
-                row_start,
-                row_end,
-                train_idx_local,
-                y_train,
-                logic_bits.sites.len(),
-                logic_bits.n_samples,
-            )?;
+                    logic_bits.bits_flat.as_slice(),
+                    logic_bits.row_words,
+                    row_start,
+                    row_end,
+                    train_idx_local,
+                    y_train,
+                    logic_bits.sites.len(),
+                    logic_bits.n_samples,
+                )?;
             let scores = feature_scores_pairwise_and_packed_with_stage1(
                 packed_bits.as_slice(),
                 row_words_sub,
@@ -5256,18 +5253,21 @@ fn prepare_logic_chunk_continuous(
             if rand_keep > 0 && top_local.len() < n_region {
                 let mut picked = vec![false; n_region];
                 for &idx in top_local.iter() {
-                    if idx < n_region { picked[idx] = true; }
+                    if idx < n_region {
+                        picked[idx] = true;
+                    }
                 }
-                let remaining: Vec<usize> =
-                    (0..n_region).filter(|&i| !picked[i]).collect();
+                let remaining: Vec<usize> = (0..n_region).filter(|&i| !picked[i]).collect();
                 if !remaining.is_empty() {
                     let sample_n = rand_keep.min(remaining.len());
                     let mut rng = StdRng::seed_from_u64(selection_seed);
-                    let sampled = sample_indices_without_replacement(
-                        &mut rng, remaining.len(), sample_n,
-                    );
-                    let mut extra: Vec<usize> =
-                        sampled.into_vec().into_iter().map(|i| remaining[i]).collect();
+                    let sampled =
+                        sample_indices_without_replacement(&mut rng, remaining.len(), sample_n);
+                    let mut extra: Vec<usize> = sampled
+                        .into_vec()
+                        .into_iter()
+                        .map(|i| remaining[i])
+                        .collect();
                     extra.sort_unstable();
                     top_local.extend(extra);
                 }
@@ -5858,11 +5858,8 @@ fn evaluate_logic_unit_prepared_continuous(
             rule_snp_name_with_polarity(&cand.rule, prepared.local_sites.as_slice(), polarity)?;
         let bim_snp_name =
             rule_bim_name_with_polarity(&cand.rule, prepared.local_sites.as_slice(), polarity)?;
-        let (bim_allele0, bim_allele1) = rule_bim_alleles_with_polarity(
-            &cand.rule,
-            prepared.local_sites.as_slice(),
-            polarity,
-        )?;
+        let (bim_allele0, bim_allele1) =
+            rule_bim_alleles_with_polarity(&cand.rule, prepared.local_sites.as_slice(), polarity)?;
         let assoc =
             fit_binary_rule_wald_from_bits(assoc_y, full_bits.as_slice(), assoc_sample_indices);
         let (delta_score, delta_pwald) = build_rule_delta_annotations(
@@ -6178,9 +6175,7 @@ fn process_rule_permutation_task_chunk_flat(
     null_notify_step: usize,
     permutation_task_total: usize,
 ) -> Result<Vec<(usize, Vec<(RuleNullBucket, f64, f64)>)>, String> {
-    let mut out = Vec::<(usize, Vec<(RuleNullBucket, f64, f64)>)>::with_capacity(
-        task_chunk.len(),
-    );
+    let mut out = Vec::<(usize, Vec<(RuleNullBucket, f64, f64)>)>::with_capacity(task_chunk.len());
     for &(slot, rep) in task_chunk.iter() {
         let (chunk, prepared) = &null_chunk_prepared[slot];
         let rep_seed = seed
@@ -7266,8 +7261,7 @@ fn garfield_logic_search_bed_owned(
             allow_parallel: false,
             ..beam_params.clone()
         };
-        let mut bucket_scores =
-            RuleNullCalibrator::with_max_rule_len(beam_params.max_pick.max(1));
+        let mut bucket_scores = RuleNullCalibrator::with_max_rule_len(beam_params.max_pick.max(1));
         let min_perm_repeats =
             DEFAULT_RULE_NULL_ADAPTIVE_MIN_REPEATS.min(perm_cfg.n_repeats.max(1));
         let mut stable_rounds = 0usize;
@@ -7306,14 +7300,11 @@ fn garfield_logic_search_bed_owned(
             let n_slots = null_chunk_prepared.len();
             let total_tasks = n_slots.saturating_mul(rep_count);
             let task_grain = if perm_threads > 1 {
-                total_tasks
-                    .div_ceil(perm_threads.saturating_mul(4))
-                    .max(1)
+                total_tasks.div_ceil(perm_threads.saturating_mul(4)).max(1)
             } else {
                 total_tasks.max(1)
             };
-            let mut tasks: Vec<(usize, usize)> =
-                Vec::with_capacity(total_tasks);
+            let mut tasks: Vec<(usize, usize)> = Vec::with_capacity(total_tasks);
             for slot in 0..n_slots {
                 for rep in rep_start..rep_end {
                     tasks.push((slot, rep));

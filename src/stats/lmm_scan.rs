@@ -29,13 +29,16 @@ use crate::blas::{
     CBLAS_NO_TRANS, CBLAS_ROW_MAJOR, CBLAS_TRANS,
 };
 use crate::brent::{brent_minimize, brent_minimize_with_init};
+use crate::gfcore;
+use crate::gfreader::{
+    count_packed_row_counts, count_packed_row_counts_selected, is_simple_snp_allele,
+    sample_indices_are_identity,
+};
 use crate::linalg::{
     chi2_sf_df1, chisq_from_beta_se_and_optional_plrt, cholesky_inplace, cholesky_logdet,
     cholesky_solve_into, format_chisq_value, normal_sf,
 };
 use crate::stats_common::{env_truthy, get_cached_pool, parse_index_vec_i64, AsyncTsvWriter};
-use crate::gfcore;
-use crate::gfreader::{count_packed_row_counts, count_packed_row_counts_selected, is_simple_snp_allele, sample_indices_are_identity};
 use memmap2::Mmap;
 use std::fs::File;
 
@@ -3746,11 +3749,17 @@ pub fn fvlmm_assoc_chunk_from_snp_to_tsv_f32<'py>(
     if m == 0 {
         return Ok((Vec::new(), 0));
     }
-    if chrom.len() != m || pos.len() != m || snp.len() != m
-        || allele0.len() != m || allele1.len() != m
-        || maf.len() != m || miss.len() != m
+    if chrom.len() != m
+        || pos.len() != m
+        || snp.len() != m
+        || allele0.len() != m
+        || allele1.len() != m
+        || maf.len() != m
+        || miss.len() != m
     {
-        return Err(PyRuntimeError::new_err("TSV metadata length mismatch with snp_chunk rows"));
+        return Err(PyRuntimeError::new_err(
+            "TSV metadata length mismatch with snp_chunk rows",
+        ));
     }
 
     let with_plrt = nullml.is_some();
@@ -3842,8 +3851,13 @@ pub fn fvlmm_assoc_chunk_from_snp_to_tsv_f32<'py>(
                     let beta = out_sub[base];
                     let se = out_sub[base + 1];
                     let chisq_val = chisq_from_beta_se_and_optional_plrt(
-                        beta, se,
-                        if with_plrt { Some(out_sub[base + 3]) } else { None },
+                        beta,
+                        se,
+                        if with_plrt {
+                            Some(out_sub[base + 3])
+                        } else {
+                            None
+                        },
                     );
                     let chisq_txt = format_chisq_value(chisq_val);
                     if with_plrt {
@@ -3995,408 +4009,392 @@ pub fn fvlmm_assoc_bed_to_tsv_f32<'py>(
     let bed_prefix_owned = bed_prefix.to_string();
     let out_tsv_owned = out_tsv.to_string();
 
-    let (rows_written, pve, log_det_v) = py.detach(move || -> Result<(usize, f64, f64), String> {
-        // ============================================================
-        // Setup: mmap BED, parse FAM/BIM, build sample index mapping
-        // ============================================================
-        let full_samples = gfcore::read_fam(&bed_prefix_owned)?;
-        let n_samples_full = full_samples.len();
-        if n_samples_full == 0 {
-            return Err("no samples in PLINK FAM".to_string());
-        }
+    let (rows_written, pve, log_det_v) = py
+        .detach(move || -> Result<(usize, f64, f64), String> {
+            // ============================================================
+            // Setup: mmap BED, parse FAM/BIM, build sample index mapping
+            // ============================================================
+            let full_samples = gfcore::read_fam(&bed_prefix_owned)?;
+            let n_samples_full = full_samples.len();
+            if n_samples_full == 0 {
+                return Err("no samples in PLINK FAM".to_string());
+            }
 
-        let all_sites = gfcore::read_bim(&bed_prefix_owned)?;
+            let all_sites = gfcore::read_bim(&bed_prefix_owned)?;
 
-        let sample_idx: Vec<usize> = match &sample_ids {
-            Some(ids) => {
-                let id_to_idx: std::collections::HashMap<&str, usize> = full_samples
-                    .iter()
-                    .enumerate()
-                    .map(|(i, name)| (name.as_str(), i))
-                    .collect();
-                ids.iter()
-                    .map(|sid| {
-                        id_to_idx.get(sid.as_str()).copied().ok_or_else(|| {
-                            format!("sample '{sid}' not found in PLINK FAM")
+            let sample_idx: Vec<usize> = match &sample_ids {
+                Some(ids) => {
+                    let id_to_idx: std::collections::HashMap<&str, usize> = full_samples
+                        .iter()
+                        .enumerate()
+                        .map(|(i, name)| (name.as_str(), i))
+                        .collect();
+                    ids.iter()
+                        .map(|sid| {
+                            id_to_idx
+                                .get(sid.as_str())
+                                .copied()
+                                .ok_or_else(|| format!("sample '{sid}' not found in PLINK FAM"))
                         })
-                    })
-                    .collect::<Result<Vec<usize>, String>>()?
+                        .collect::<Result<Vec<usize>, String>>()?
+                }
+                None => (0..n_samples_full).collect(),
+            };
+            if sample_idx.len() != n {
+                return Err(format!(
+                    "sample_ids length {} != len(y_rot) {}",
+                    sample_idx.len(),
+                    n
+                ));
             }
-            None => (0..n_samples_full).collect(),
-        };
-        if sample_idx.len() != n {
-            return Err(format!(
-                "sample_ids length {} != len(y_rot) {}",
-                sample_idx.len(),
-                n
-            ));
-        }
 
-        // mmap BED
-        let bed_path = format!("{bed_prefix_owned}.bed");
-        let bed_file =
-            File::open(&bed_path).map_err(|e| format!("open {bed_path}: {e}"))?;
-        let mmap = unsafe { Mmap::map(&bed_file) }
-            .map_err(|e| format!("mmap {bed_path}: {e}"))?;
-        if mmap.len() < 3 || mmap[0] != 0x6C || mmap[1] != 0x1B || mmap[2] != 0x01 {
-            return Err("only SNP-major BED supported".to_string());
-        }
-
-        let bytes_per_snp = (n_samples_full + 3) / 4;
-        if bytes_per_snp == 0 {
-            return Err("bytes_per_snp is zero".to_string());
-        }
-        let data_len = mmap.len() - 3;
-        if data_len % bytes_per_snp != 0 {
-            return Err(format!(
-                "BED payload length {data_len} not a multiple of {bytes_per_snp}"
-            ));
-        }
-        let n_snps = data_len / bytes_per_snp;
-        let packed_src = &mmap[3..];
-
-        if all_sites.len() != n_snps {
-            return Err(format!(
-                "BIM site count {} != BED SNP count {n_snps}",
-                all_sites.len()
-            ));
-        }
-
-        let use_selected =
-            !sample_indices_are_identity(&sample_idx) || sample_idx.len() != n_samples_full;
-        let sample_identity =
-            !use_selected && sample_idx.len() == n_samples_full;
-
-        // ============================================================
-        // Build assoc cache and thread pools (once, upfront)
-        // ============================================================
-        let cache = prepare_fixed_lambda_assoc_cache_f32(s_slice, xcov_slice, y, n, p, lbd)
-            .map_err(|e| format!("{e}"))?;
-        let y_sq = y.iter().map(|&yi| yi * yi).sum::<f64>();
-        let pve_out = if y_sq > 0.0 {
-            (1.0 - cache.ypy / y_sq).clamp(0.0, 1.0)
-        } else {
-            f64::NAN
-        };
-        let log_det_v_out = cache.log_det_v;
-
-        let proj_threads = stage_proj_threads_or(threads);
-        let assoc_threads = stage_assoc_threads_or(threads);
-        let proj_pool = get_cached_pool(proj_threads).map_err(|e| format!("{e}"))?;
-        let assoc_pool = get_cached_pool(assoc_threads).map_err(|e| format!("{e}"))?;
-        let sample_subset_plan: Option<SubsetDecodePlan> = if sample_identity {
-            None
-        } else {
-            Some(SubsetDecodePlan::from_sample_idx(&sample_idx))
-        };
-        let dense_subset_pos: Option<Vec<isize>> = if sample_identity {
-            None
-        } else {
-            maybe_build_dense_subset_pos(&sample_idx, n_samples_full)
-        };
-
-        // ============================================================
-        // TSV writer
-        // ============================================================
-        let header: &[u8] = if with_plrt {
-            b"chrom\tpos\tsnp\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n"
-        } else {
-            b"chrom\tpos\tsnp\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\n"
-        };
-        let writer =
-            AsyncTsvWriter::with_config(&out_tsv_owned, header, 64 * 1024 * 1024, 16)?;
-
-        // ============================================================
-        // Double-buffer pipeline: count+decode (bg) || rotate+assoc+write (main)
-        // Uses generic pipeline from src/io/pipeline.rs.
-        // ============================================================
-        let scan_chunk_snps = rotate_block_rows.max(1024).min(65536);
-
-        let mut text_buf = String::with_capacity(scan_chunk_snps * 128);
-        let mut total_rows = 0usize;
-
-        let progress_block = if progress_every == 0 {
-            0usize
-        } else {
-            progress_every.max(1)
-        };
-        let mut next_progress_emit = if progress_block > 0 {
-            progress_block.min(n_snps).max(1)
-        } else {
-            0
-        };
-
-        // --- Producer: count (rayon) + filter + metadata + decode ---
-        let mut chunk_start = 0usize;
-        let producer = |chunk: &mut StreamingChunk| -> bool {
-            if chunk_start >= n_snps {
-                return false;
+            // mmap BED
+            let bed_path = format!("{bed_prefix_owned}.bed");
+            let bed_file = File::open(&bed_path).map_err(|e| format!("open {bed_path}: {e}"))?;
+            let mmap =
+                unsafe { Mmap::map(&bed_file) }.map_err(|e| format!("mmap {bed_path}: {e}"))?;
+            if mmap.len() < 3 || mmap[0] != 0x6C || mmap[1] != 0x1B || mmap[2] != 0x01 {
+                return Err("only SNP-major BED supported".to_string());
             }
-            chunk.clear();
-            let chunk_end = (chunk_start + scan_chunk_snps).min(n_snps);
 
-            // ---- rayon parallel: per-SNP counting + numeric filter ----
-            let counts: Vec<Option<SnpCounts>> = (chunk_start..chunk_end)
-                .into_par_iter()
-                .map(|snp_idx| {
-                    let row = &packed_src
-                        [snp_idx * bytes_per_snp..(snp_idx + 1) * bytes_per_snp];
-                    let (missing, het, hom_alt) = if use_selected {
-                        count_packed_row_counts_selected(
-                            row,
-                            n_samples_full,
-                            &sample_idx,
-                        )
-                    } else {
-                        count_packed_row_counts(row, n_samples_full)
-                    };
-                    let non_missing = n.saturating_sub(missing);
+            let bytes_per_snp = (n_samples_full + 3) / 4;
+            if bytes_per_snp == 0 {
+                return Err("bytes_per_snp is zero".to_string());
+            }
+            let data_len = mmap.len() - 3;
+            if data_len % bytes_per_snp != 0 {
+                return Err(format!(
+                    "BED payload length {data_len} not a multiple of {bytes_per_snp}"
+                ));
+            }
+            let n_snps = data_len / bytes_per_snp;
+            let packed_src = &mmap[3..];
 
-                    let miss_rate = if n > 0 {
-                        missing as f32 / n as f32
-                    } else {
-                        1.0_f32
-                    };
-                    if miss_rate > miss_thr {
-                        return None;
-                    }
+            if all_sites.len() != n_snps {
+                return Err(format!(
+                    "BIM site count {} != BED SNP count {n_snps}",
+                    all_sites.len()
+                ));
+            }
 
-                    if non_missing == 0 {
-                        return if maf_thr > 0.0 {
-                            None
+            let use_selected =
+                !sample_indices_are_identity(&sample_idx) || sample_idx.len() != n_samples_full;
+            let sample_identity = !use_selected && sample_idx.len() == n_samples_full;
+
+            // ============================================================
+            // Build assoc cache and thread pools (once, upfront)
+            // ============================================================
+            let cache = prepare_fixed_lambda_assoc_cache_f32(s_slice, xcov_slice, y, n, p, lbd)
+                .map_err(|e| format!("{e}"))?;
+            let y_sq = y.iter().map(|&yi| yi * yi).sum::<f64>();
+            let pve_out = if y_sq > 0.0 {
+                (1.0 - cache.ypy / y_sq).clamp(0.0, 1.0)
+            } else {
+                f64::NAN
+            };
+            let log_det_v_out = cache.log_det_v;
+
+            let proj_threads = stage_proj_threads_or(threads);
+            let assoc_threads = stage_assoc_threads_or(threads);
+            let proj_pool = get_cached_pool(proj_threads).map_err(|e| format!("{e}"))?;
+            let assoc_pool = get_cached_pool(assoc_threads).map_err(|e| format!("{e}"))?;
+            let sample_subset_plan: Option<SubsetDecodePlan> = if sample_identity {
+                None
+            } else {
+                Some(SubsetDecodePlan::from_sample_idx(&sample_idx))
+            };
+            let dense_subset_pos: Option<Vec<isize>> = if sample_identity {
+                None
+            } else {
+                maybe_build_dense_subset_pos(&sample_idx, n_samples_full)
+            };
+
+            // ============================================================
+            // TSV writer
+            // ============================================================
+            let header: &[u8] = if with_plrt {
+                b"chrom\tpos\tsnp\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n"
+            } else {
+                b"chrom\tpos\tsnp\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\n"
+            };
+            let writer = AsyncTsvWriter::with_config(&out_tsv_owned, header, 64 * 1024 * 1024, 16)?;
+
+            // ============================================================
+            // Double-buffer pipeline: count+decode (bg) || rotate+assoc+write (main)
+            // Uses generic pipeline from src/io/pipeline.rs.
+            // ============================================================
+            let scan_chunk_snps = rotate_block_rows.max(1024).min(65536);
+
+            let mut text_buf = String::with_capacity(scan_chunk_snps * 128);
+            let mut total_rows = 0usize;
+
+            let progress_block = if progress_every == 0 {
+                0usize
+            } else {
+                progress_every.max(1)
+            };
+            let mut next_progress_emit = if progress_block > 0 {
+                progress_block.min(n_snps).max(1)
+            } else {
+                0
+            };
+
+            // --- Producer: count (rayon) + filter + metadata + decode ---
+            let mut chunk_start = 0usize;
+            let producer = |chunk: &mut StreamingChunk| -> bool {
+                if chunk_start >= n_snps {
+                    return false;
+                }
+                chunk.clear();
+                let chunk_end = (chunk_start + scan_chunk_snps).min(n_snps);
+
+                // ---- rayon parallel: per-SNP counting + numeric filter ----
+                let counts: Vec<Option<SnpCounts>> = (chunk_start..chunk_end)
+                    .into_par_iter()
+                    .map(|snp_idx| {
+                        let row =
+                            &packed_src[snp_idx * bytes_per_snp..(snp_idx + 1) * bytes_per_snp];
+                        let (missing, het, hom_alt) = if use_selected {
+                            count_packed_row_counts_selected(row, n_samples_full, &sample_idx)
                         } else {
-                            Some(SnpCounts {
-                                flip: false,
-                                maf: 0.0_f32,
-                                miss_rate,
-                                missing_count: missing,
-                            })
+                            count_packed_row_counts(row, n_samples_full)
                         };
-                    }
+                        let non_missing = n.saturating_sub(missing);
 
-                    if het_thr > 0.0 {
-                        let het_rate =
-                            het as f32 / non_missing as f32;
-                        if het_rate > het_thr {
+                        let miss_rate = if n > 0 {
+                            missing as f32 / n as f32
+                        } else {
+                            1.0_f32
+                        };
+                        if miss_rate > miss_thr {
                             return None;
                         }
-                    }
 
-                    let alt_sum =
-                        het.saturating_add(hom_alt.saturating_mul(2));
-                    let alt_freq =
-                        alt_sum as f32 / (2.0_f32 * non_missing as f32);
-                    let (maf_v, flip) = if alt_freq > 0.5_f32 {
-                        (1.0_f32 - alt_freq, true)
-                    } else {
-                        (alt_freq, false)
-                    };
+                        if non_missing == 0 {
+                            return if maf_thr > 0.0 {
+                                None
+                            } else {
+                                Some(SnpCounts {
+                                    flip: false,
+                                    maf: 0.0_f32,
+                                    miss_rate,
+                                    missing_count: missing,
+                                })
+                            };
+                        }
 
-                    if maf_v < maf_thr {
-                        return None;
-                    }
+                        if het_thr > 0.0 {
+                            let het_rate = het as f32 / non_missing as f32;
+                            if het_rate > het_thr {
+                                return None;
+                            }
+                        }
 
-                    Some(SnpCounts {
-                        flip,
-                        maf: maf_v,
-                        miss_rate,
-                        missing_count: missing,
-                    })
-                })
-                .collect();
-
-            // ---- Sequential: snps_only filter + metadata collection ----
-            for (offset, snp_idx) in (chunk_start..chunk_end).enumerate() {
-                let cnts = match &counts[offset] {
-                    Some(c) => c,
-                    None => continue,
-                };
-                if snps_only {
-                    let site = &all_sites[snp_idx];
-                    if !is_simple_snp_allele(&site.ref_allele)
-                        || !is_simple_snp_allele(&site.alt_allele)
-                    {
-                        continue;
-                    }
-                }
-                let site = &all_sites[snp_idx];
-                chunk.indices.push(snp_idx);
-                chunk.flip.push(cnts.flip);
-                chunk.maf.push(cnts.maf);
-                chunk.miss_rate.push(cnts.miss_rate);
-                chunk.miss_block[chunk.rows] = cnts.missing_count;
-                chunk.chrom.push(site.chrom.clone());
-                chunk.pos.push(site.pos as i64);
-                chunk.snp.push(resolve_snp_name(
-                    &site.snp,
-                    &site.chrom,
-                    site.pos,
-                ));
-                if cnts.flip {
-                    chunk.a0.push(site.alt_allele.clone());
-                    chunk.a1.push(site.ref_allele.clone());
-                } else {
-                    chunk.a0.push(site.ref_allele.clone());
-                    chunk.a1.push(site.alt_allele.clone());
-                }
-                chunk.rows += 1;
-            }
-
-            // ---- Decode ----
-            if chunk.rows > 0 {
-                decode_centered_block_packed_f32(
-                    packed_src,
-                    bytes_per_snp,
-                    &chunk.flip,
-                    &chunk.maf,
-                    Some(&chunk.indices),
-                    0,
-                    chunk.rows,
-                    if sample_identity { n_samples_full } else { n },
-                    gm,
-                    sample_identity,
-                    sample_subset_plan.as_ref(),
-                    dense_subset_pos.as_deref(),
-                    &mut chunk.g_block[..chunk.rows * n],
-                );
-            }
-
-            chunk.scanned_to = chunk_end;
-            chunk_start = chunk_end;
-            chunk_start < n_snps
-        };
-
-        // --- Consumer: Rotate + assoc + format TSV + write ---
-        let consumer = |chunk: &mut StreamingChunk| {
-            let rows = chunk.rows;
-            if rows > 0 {
-                // Rotate – large SGEMM
-                rotate_snp_block_with_ut_blas(
-                    &chunk.g_block[..rows * n],
-                    rows,
-                    n,
-                    &ut_flat,
-                    &mut chunk.rot_block[..rows * n],
-                    proj_threads,
-                    proj_pool.as_ref(),
-                );
-
-                // Assoc – large SGEMM
-                assoc_fixed_lambda_rot_block_blas_f32(
-                    &chunk.rot_block[..rows * n],
-                    rows,
-                    n,
-                    p,
-                    &cache,
-                    &mut chunk.out_block[..rows * out_cols],
-                    out_cols,
-                    assoc_threads,
-                    assoc_pool.as_ref(),
-                    nullml,
-                );
-
-                // Format TSV and write
-                text_buf.clear();
-                if text_buf.capacity() < rows * 128 {
-                    text_buf
-                        .reserve(rows * 128 - text_buf.capacity());
-                }
-                for off in 0..rows {
-                    let base = off * out_cols;
-                    let beta = chunk.out_block[base];
-                    let se = chunk.out_block[base + 1];
-                    let chisq_val = chisq_from_beta_se_and_optional_plrt(
-                        beta,
-                        se,
-                        if with_plrt {
-                            Some(chunk.out_block[base + 3])
+                        let alt_sum = het.saturating_add(hom_alt.saturating_mul(2));
+                        let alt_freq = alt_sum as f32 / (2.0_f32 * non_missing as f32);
+                        let (maf_v, flip) = if alt_freq > 0.5_f32 {
+                            (1.0_f32 - alt_freq, true)
                         } else {
-                            None
-                        },
-                    );
-                    let chisq_txt = format_chisq_value(chisq_val);
-                    if with_plrt {
-                        let _ = write!(
-                            text_buf,
-                            "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\t{:.4e}\n",
-                            chunk.chrom[off],
-                            chunk.pos[off],
-                            chunk.snp[off],
-                            chunk.a0[off],
-                            chunk.a1[off],
-                            chunk.maf[off],
-                            chunk.miss_block[off],
-                            beta,
-                            se,
-                            chisq_txt,
-                            chunk.out_block[base + 2],
-                            chunk.out_block[base + 3],
-                        );
-                    } else {
-                        let _ = write!(
-                            text_buf,
-                            "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\n",
-                            chunk.chrom[off],
-                            chunk.pos[off],
-                            chunk.snp[off],
-                            chunk.a0[off],
-                            chunk.a1[off],
-                            chunk.maf[off],
-                            chunk.miss_block[off],
-                            beta,
-                            se,
-                            chisq_txt,
-                            chunk.out_block[base + 2],
-                        );
+                            (alt_freq, false)
+                        };
+
+                        if maf_v < maf_thr {
+                            return None;
+                        }
+
+                        Some(SnpCounts {
+                            flip,
+                            maf: maf_v,
+                            miss_rate,
+                            missing_count: missing,
+                        })
+                    })
+                    .collect();
+
+                // ---- Sequential: snps_only filter + metadata collection ----
+                for (offset, snp_idx) in (chunk_start..chunk_end).enumerate() {
+                    let cnts = match &counts[offset] {
+                        Some(c) => c,
+                        None => continue,
+                    };
+                    if snps_only {
+                        let site = &all_sites[snp_idx];
+                        if !is_simple_snp_allele(&site.ref_allele)
+                            || !is_simple_snp_allele(&site.alt_allele)
+                        {
+                            continue;
+                        }
                     }
+                    let site = &all_sites[snp_idx];
+                    chunk.indices.push(snp_idx);
+                    chunk.flip.push(cnts.flip);
+                    chunk.maf.push(cnts.maf);
+                    chunk.miss_rate.push(cnts.miss_rate);
+                    chunk.miss_block[chunk.rows] = cnts.missing_count;
+                    chunk.chrom.push(site.chrom.clone());
+                    chunk.pos.push(site.pos as i64);
+                    chunk
+                        .snp
+                        .push(resolve_snp_name(&site.snp, &site.chrom, site.pos));
+                    if cnts.flip {
+                        chunk.a0.push(site.alt_allele.clone());
+                        chunk.a1.push(site.ref_allele.clone());
+                    } else {
+                        chunk.a0.push(site.ref_allele.clone());
+                        chunk.a1.push(site.alt_allele.clone());
+                    }
+                    chunk.rows += 1;
                 }
-                let payload = std::mem::take(&mut text_buf).into_bytes();
-                writer.send(payload)?;
+
+                // ---- Decode ----
+                if chunk.rows > 0 {
+                    decode_centered_block_packed_f32(
+                        packed_src,
+                        bytes_per_snp,
+                        &chunk.flip,
+                        &chunk.maf,
+                        Some(&chunk.indices),
+                        0,
+                        chunk.rows,
+                        if sample_identity { n_samples_full } else { n },
+                        gm,
+                        sample_identity,
+                        sample_subset_plan.as_ref(),
+                        dense_subset_pos.as_deref(),
+                        &mut chunk.g_block[..chunk.rows * n],
+                    );
+                }
+
+                chunk.scanned_to = chunk_end;
+                chunk_start = chunk_end;
+                chunk_start < n_snps
+            };
+
+            // --- Consumer: Rotate + assoc + format TSV + write ---
+            let consumer = |chunk: &mut StreamingChunk| {
+                let rows = chunk.rows;
+                if rows > 0 {
+                    // Rotate – large SGEMM
+                    rotate_snp_block_with_ut_blas(
+                        &chunk.g_block[..rows * n],
+                        rows,
+                        n,
+                        &ut_flat,
+                        &mut chunk.rot_block[..rows * n],
+                        proj_threads,
+                        proj_pool.as_ref(),
+                    );
+
+                    // Assoc – large SGEMM
+                    assoc_fixed_lambda_rot_block_blas_f32(
+                        &chunk.rot_block[..rows * n],
+                        rows,
+                        n,
+                        p,
+                        &cache,
+                        &mut chunk.out_block[..rows * out_cols],
+                        out_cols,
+                        assoc_threads,
+                        assoc_pool.as_ref(),
+                        nullml,
+                    );
+
+                    // Format TSV and write
+                    text_buf.clear();
+                    if text_buf.capacity() < rows * 128 {
+                        text_buf.reserve(rows * 128 - text_buf.capacity());
+                    }
+                    for off in 0..rows {
+                        let base = off * out_cols;
+                        let beta = chunk.out_block[base];
+                        let se = chunk.out_block[base + 1];
+                        let chisq_val = chisq_from_beta_se_and_optional_plrt(
+                            beta,
+                            se,
+                            if with_plrt {
+                                Some(chunk.out_block[base + 3])
+                            } else {
+                                None
+                            },
+                        );
+                        let chisq_txt = format_chisq_value(chisq_val);
+                        if with_plrt {
+                            let _ = write!(
+                                text_buf,
+                                "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\t{:.4e}\n",
+                                chunk.chrom[off],
+                                chunk.pos[off],
+                                chunk.snp[off],
+                                chunk.a0[off],
+                                chunk.a1[off],
+                                chunk.maf[off],
+                                chunk.miss_block[off],
+                                beta,
+                                se,
+                                chisq_txt,
+                                chunk.out_block[base + 2],
+                                chunk.out_block[base + 3],
+                            );
+                        } else {
+                            let _ = write!(
+                                text_buf,
+                                "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\n",
+                                chunk.chrom[off],
+                                chunk.pos[off],
+                                chunk.snp[off],
+                                chunk.a0[off],
+                                chunk.a1[off],
+                                chunk.maf[off],
+                                chunk.miss_block[off],
+                                beta,
+                                se,
+                                chisq_txt,
+                                chunk.out_block[base + 2],
+                            );
+                        }
+                    }
+                    let payload = std::mem::take(&mut text_buf).into_bytes();
+                    writer.send(payload)?;
+                }
+
+                total_rows += rows;
+
+                // Progress callback
+                if progress_block > 0 && chunk.scanned_to >= next_progress_emit {
+                    if let Some(ref cb) = progress_callback {
+                        let _ = Python::attach(|py2| -> PyResult<()> {
+                            py2.check_signals()?;
+                            cb.call1(py2, (chunk.scanned_to.min(n_snps), n_snps))?;
+                            Ok(())
+                        });
+                    }
+                    next_progress_emit = (chunk.scanned_to / progress_block + 1)
+                        .saturating_mul(progress_block)
+                        .min(n_snps);
+                }
+
+                Ok::<(), String>(())
+            };
+
+            crate::pipeline::run_double_buffer(
+                2,
+                || StreamingChunk::new(scan_chunk_snps, n, out_cols),
+                producer,
+                consumer,
+            )?;
+
+            if let Some(ref cb) = progress_callback {
+                let _ = Python::attach(|py2| -> PyResult<()> {
+                    py2.check_signals()?;
+                    cb.call1(py2, (n_snps, n_snps))?;
+                    Ok(())
+                });
             }
 
-            total_rows += rows;
-
-            // Progress callback
-            if progress_block > 0
-                && chunk.scanned_to >= next_progress_emit
-            {
-                if let Some(ref cb) = progress_callback {
-                    let _ = Python::attach(|py2| -> PyResult<()> {
-                        py2.check_signals()?;
-                        cb.call1(
-                            py2,
-                            (chunk.scanned_to.min(n_snps), n_snps),
-                        )?;
-                        Ok(())
-                    });
-                }
-                next_progress_emit = (chunk.scanned_to / progress_block + 1)
-                    .saturating_mul(progress_block)
-                    .min(n_snps);
-            }
-
-            Ok::<(), String>(())
-        };
-
-        crate::pipeline::run_double_buffer(
-            2,
-            || StreamingChunk::new(scan_chunk_snps, n, out_cols),
-            producer,
-            consumer,
-        )?;
-
-        if let Some(ref cb) = progress_callback {
-            let _ = Python::attach(|py2| -> PyResult<()> {
-                py2.check_signals()?;
-                cb.call1(py2, (n_snps, n_snps))?;
-                Ok(())
-            });
-        }
-
-        writer.finish()?;
-        Ok((total_rows, pve_out, log_det_v_out))
-    })
-    .map_err(PyRuntimeError::new_err)?;
+            writer.finish()?;
+            Ok((total_rows, pve_out, log_det_v_out))
+        })
+        .map_err(PyRuntimeError::new_err)?;
 
     Ok((rows_written, pve, log_det_v))
 }

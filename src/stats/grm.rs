@@ -429,19 +429,18 @@ where
                                     &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
                                 let p = row_maf_vec[idx].clamp(0.0_f32, 0.5_f32);
                                 let default_mean_g = 2.0_f32 * p;
-                                let (var_centered, row_sum) =
-                                    decode_subset_row_from_full_scratch(
-                                        row,
-                                        n_samples,
-                                        sample_idx,
-                                        row_flip_vec[idx],
-                                        default_mean_g,
-                                        method,
-                                        eps,
-                                        &byte_lut.code4,
-                                        full_row.as_mut_slice(),
-                                        out_row,
-                                    );
+                                let (var_centered, row_sum) = decode_subset_row_from_full_scratch(
+                                    row,
+                                    n_samples,
+                                    sample_idx,
+                                    row_flip_vec[idx],
+                                    default_mean_g,
+                                    method,
+                                    eps,
+                                    &byte_lut.code4,
+                                    full_row.as_mut_slice(),
+                                    out_row,
+                                );
                                 if method == 1 {
                                     *row_varsum_dst = var_centered;
                                 }
@@ -512,9 +511,9 @@ where
 
     // Per-chunk buffer
     struct Chunk {
-        data: Vec<f32>,    // row_step * n
-        varsum: Vec<f64>,  // row_step
-        rowsum: Vec<f64>,  // row_step
+        data: Vec<f32>,   // row_step * n
+        varsum: Vec<f64>, // row_step
+        rowsum: Vec<f64>, // row_step
         start: usize,
         rows: usize,
     }
@@ -555,7 +554,11 @@ where
                     let mean_g = 2.0_f32 * p;
                     let var = 2.0_f32 * p * (1.0_f32 - p);
                     let std_scale = if method == 2 {
-                        if var > eps { 1.0_f32 / var.sqrt() } else { 0.0_f32 }
+                        if var > eps {
+                            1.0_f32 / var.sqrt()
+                        } else {
+                            0.0_f32
+                        }
                     } else {
                         1.0_f32
                     };
@@ -596,8 +599,7 @@ where
                     || vec![0.0_f32; n_samples],
                     |full_row, (off, ((out_row, row_varsum_dst), row_sum_dst))| {
                         let idx = next_start + off;
-                        let row =
-                            &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
+                        let row = &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
                         let p = row_maf_vec[idx].clamp(0.0_f32, 0.5_f32);
                         let default_mean_g = 2.0_f32 * p;
                         let (var_centered, row_sum) = decode_subset_row_from_full_scratch(
@@ -666,7 +668,9 @@ where
 
     let scale = if method == 1 {
         if !(varsum_acc.is_finite() && varsum_acc > 0.0) {
-            return Err("invalid centered GRM denominator in pipelined packed subset path".to_string());
+            return Err(
+                "invalid centered GRM denominator in pipelined packed subset path".to_string(),
+            );
         }
         varsum_acc
     } else {

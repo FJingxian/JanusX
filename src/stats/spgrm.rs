@@ -21,7 +21,7 @@ use crate::bedmath::{
 };
 use crate::blas::{
     cblas_sgemm_dispatch, cblas_ssyrk_dispatch, BlasThreadGuard, CblasInt, CBLAS_COL_MAJOR,
-    CBLAS_NO_TRANS, CBLAS_ROW_MAJOR, CBLAS_TRANS, CBLAS_UPPER,
+    CBLAS_LOWER, CBLAS_NO_TRANS, CBLAS_ROW_MAJOR, CBLAS_TRANS, CBLAS_UPPER,
 };
 use crate::gfcore::read_fam;
 use crate::gfreader::prepare_bed_logic_meta_owned_for_stats_samples;
@@ -1770,7 +1770,7 @@ fn spgrm_probe_self_accum_syrk_faster(n_cols: usize, rows: usize) -> bool {
     }
 
     // Benchmark: run syrk and gemm each a few times, pick the faster.
-    let probe_rows = rows.min(256);  // small representative block
+    let probe_rows = rows.min(256); // small representative block
     let probe_n = n_cols.min(256);
     let a = vec![0.0_f32; probe_rows * probe_n];
     let mut c = vec![0.0_f32; probe_n * probe_n];
@@ -1783,23 +1783,41 @@ fn spgrm_probe_self_accum_syrk_faster(n_cols: usize, rows: usize) -> bool {
             unsafe {
                 if use_syrk {
                     cblas_ssyrk_dispatch(
-                        CBLAS_COL_MAJOR, CBLAS_UPPER, CBLAS_NO_TRANS,
-                        probe_n as CblasInt, probe_rows as CblasInt,
-                        1.0_f32, a.as_ptr(), probe_n as CblasInt,
-                        0.0_f32, c.as_mut_ptr(), probe_n as CblasInt,
+                        CBLAS_COL_MAJOR,
+                        CBLAS_UPPER,
+                        CBLAS_NO_TRANS,
+                        probe_n as CblasInt,
+                        probe_rows as CblasInt,
+                        1.0_f32,
+                        a.as_ptr(),
+                        probe_n as CblasInt,
+                        0.0_f32,
+                        c.as_mut_ptr(),
+                        probe_n as CblasInt,
                     );
                 } else {
                     cblas_sgemm_dispatch(
-                        CBLAS_COL_MAJOR, CBLAS_NO_TRANS, CBLAS_TRANS,
-                        probe_n as CblasInt, probe_n as CblasInt, probe_rows as CblasInt,
-                        1.0_f32, a.as_ptr(), probe_n as CblasInt,
-                        a.as_ptr(), probe_n as CblasInt,
-                        0.0_f32, c.as_mut_ptr(), probe_n as CblasInt,
+                        CBLAS_COL_MAJOR,
+                        CBLAS_NO_TRANS,
+                        CBLAS_TRANS,
+                        probe_n as CblasInt,
+                        probe_n as CblasInt,
+                        probe_rows as CblasInt,
+                        1.0_f32,
+                        a.as_ptr(),
+                        probe_n as CblasInt,
+                        a.as_ptr(),
+                        probe_n as CblasInt,
+                        0.0_f32,
+                        c.as_mut_ptr(),
+                        probe_n as CblasInt,
                     );
                 }
             }
             let dt = t0.elapsed().as_secs_f64();
-            if dt < best { best = dt; }
+            if dt < best {
+                best = dt;
+            }
         }
         best
     };
@@ -1809,7 +1827,9 @@ fn spgrm_probe_self_accum_syrk_faster(n_cols: usize, rows: usize) -> bool {
     let faster = syrk_s < gemm_s;
 
     let mut cache = PROBE_CACHE.lock().unwrap();
-    cache.get_or_insert_with(HashMap::new).insert((n_cols, rows), faster);
+    cache
+        .get_or_insert_with(HashMap::new)
+        .insert((n_cols, rows), faster);
     faster
 }
 
@@ -1824,7 +1844,7 @@ fn self_block_accumulate_ssyrk(
     unsafe {
         cblas_ssyrk_dispatch(
             CBLAS_COL_MAJOR,
-            CBLAS_UPPER,
+            CBLAS_LOWER,
             CBLAS_NO_TRANS,
             n_cols as CblasInt,
             rows as CblasInt,
@@ -3383,5 +3403,42 @@ mod tests {
         assert_eq!(stripe_scratch.len(), 1usize);
         assert_eq!(task_accum.len(), 1usize);
         assert!(!task_accum[0].accum_row_major);
+    }
+
+    #[test]
+    fn self_block_accumulate_ssyrk_matches_sgemm_on_lower_triangle() {
+        let rows = 3usize;
+        let n_cols = 4usize;
+        let block_col_major = vec![
+            1.0_f32, 2.0_f32, 3.0_f32, 4.0_f32, 5.0_f32, 6.0_f32, 7.0_f32, 8.0_f32, 9.0_f32,
+            10.0_f32, 11.0_f32, 12.0_f32,
+        ];
+        let mut accum_syrk = vec![0.0_f32; n_cols * n_cols];
+        let mut accum_gemm = vec![0.0_f32; n_cols * n_cols];
+        self_block_accumulate_ssyrk(
+            block_col_major.as_slice(),
+            rows,
+            n_cols,
+            accum_syrk.as_mut_slice(),
+            0.0_f32,
+        );
+        self_block_accumulate_sgemm(
+            block_col_major.as_slice(),
+            rows,
+            n_cols,
+            accum_gemm.as_mut_slice(),
+            0.0_f32,
+        );
+        for col in 0..n_cols {
+            for row in col..n_cols {
+                let idx = row + col * n_cols;
+                assert!(
+                    (accum_syrk[idx] - accum_gemm[idx]).abs() < 1e-4_f32,
+                    "lower-triangle mismatch at ({row},{col}): syrk={} gemm={}",
+                    accum_syrk[idx],
+                    accum_gemm[idx],
+                );
+            }
+        }
     }
 }

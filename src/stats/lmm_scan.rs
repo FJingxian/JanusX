@@ -36,7 +36,7 @@ use crate::gfreader::{
 };
 use crate::linalg::{
     chi2_sf_df1, chisq_from_beta_se_and_optional_plrt, cholesky_inplace, cholesky_logdet,
-    cholesky_solve_into, format_chisq_value, normal_sf,
+    cholesky_solve_into, format_chisq_value, normal_sf, sanitize_assoc_pvalue,
 };
 use crate::stats_common::{env_truthy, get_cached_pool, parse_index_vec_i64, AsyncTsvWriter};
 use memmap2::Mmap;
@@ -3850,6 +3850,7 @@ pub fn fvlmm_assoc_chunk_from_snp_to_tsv_f32<'py>(
                     let base = off * out_cols;
                     let beta = out_sub[base];
                     let se = out_sub[base + 1];
+                    let pwald = sanitize_assoc_pvalue(beta, se, out_sub[base + 2]);
                     let chisq_val = chisq_from_beta_se_and_optional_plrt(
                         beta,
                         se,
@@ -3874,7 +3875,7 @@ pub fn fvlmm_assoc_chunk_from_snp_to_tsv_f32<'py>(
                             beta,
                             se,
                             chisq_txt,
-                            out_sub[base + 2],
+                            pwald,
                             out_sub[base + 3],
                         );
                     } else {
@@ -3891,7 +3892,7 @@ pub fn fvlmm_assoc_chunk_from_snp_to_tsv_f32<'py>(
                             beta,
                             se,
                             chisq_txt,
-                            out_sub[base + 2],
+                            pwald,
                         );
                     }
                 }
@@ -4308,6 +4309,7 @@ pub fn fvlmm_assoc_bed_to_tsv_f32<'py>(
                         let base = off * out_cols;
                         let beta = chunk.out_block[base];
                         let se = chunk.out_block[base + 1];
+                        let pwald = sanitize_assoc_pvalue(beta, se, chunk.out_block[base + 2]);
                         let chisq_val = chisq_from_beta_se_and_optional_plrt(
                             beta,
                             se,
@@ -4332,7 +4334,7 @@ pub fn fvlmm_assoc_bed_to_tsv_f32<'py>(
                                 beta,
                                 se,
                                 chisq_txt,
-                                chunk.out_block[base + 2],
+                                pwald,
                                 chunk.out_block[base + 3],
                             );
                         } else {
@@ -4349,7 +4351,7 @@ pub fn fvlmm_assoc_bed_to_tsv_f32<'py>(
                                 beta,
                                 se,
                                 chisq_txt,
-                                chunk.out_block[base + 2],
+                                pwald,
                             );
                         }
                     }
@@ -5537,6 +5539,7 @@ pub fn lmm_reml_assoc_packed_f32_to_tsv<'py>(
                     let base = off * out_cols;
                     let beta = out_sub[base];
                     let se = out_sub[base + 1];
+                    let pwald = sanitize_assoc_pvalue(beta, se, out_sub[base + 2]);
                     let chisq = chisq_from_beta_se_and_optional_plrt(
                         beta,
                         se,
@@ -5557,7 +5560,7 @@ pub fn lmm_reml_assoc_packed_f32_to_tsv<'py>(
                             beta,
                             se,
                             chisq_txt,
-                            out_sub[base + 2],
+                            pwald,
                             out_sub[base + 3]
                         );
                     } else {
@@ -7102,6 +7105,7 @@ pub fn fastlmm_assoc_packed_f32_to_tsv<'py>(
                     let base = off * out_cols;
                     let beta = out_sub[base];
                     let se = out_sub[base + 1];
+                    let pwald = sanitize_assoc_pvalue(beta, se, out_sub[base + 2]);
                     let chisq =
                         chisq_from_beta_se_and_optional_plrt(beta, se, Some(out_sub[base + 3]));
                     let chisq_txt = format_chisq_value(chisq);
@@ -7118,7 +7122,7 @@ pub fn fastlmm_assoc_packed_f32_to_tsv<'py>(
                         beta,
                         se,
                         chisq_txt,
-                        out_sub[base + 2],
+                        pwald,
                         out_sub[base + 3]
                     );
                 }
@@ -7634,6 +7638,7 @@ pub fn fvlmm_assoc_packed_f32_to_tsv<'py>(
                     let base = off * out_cols;
                     let beta = out_sub[base];
                     let se = out_sub[base + 1];
+                    let pwald = sanitize_assoc_pvalue(beta, se, out_sub[base + 2]);
                     let chisq =
                         chisq_from_beta_se_and_optional_plrt(beta, se, Some(out_sub[base + 3]));
                     let chisq_txt = format_chisq_value(chisq);
@@ -7650,7 +7655,7 @@ pub fn fvlmm_assoc_packed_f32_to_tsv<'py>(
                         beta,
                         se,
                         chisq_txt,
-                        out_sub[base + 2],
+                        pwald,
                         out_sub[base + 3]
                     );
                 }

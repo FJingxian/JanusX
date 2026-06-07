@@ -10,6 +10,7 @@ use std::f64::consts::PI;
 use crate::brent::brent_minimize;
 use crate::linalg::{
     chi2_sf_df1, cholesky_inplace, cholesky_logdet, cholesky_solve_into, normal_sf,
+    sanitize_assoc_pvalue,
 };
 
 #[derive(Clone, Copy)]
@@ -1008,9 +1009,9 @@ pub fn fastlmm_assoc_from_snp_f32<'py>(
                         out_row[1] = se;
                         if se.is_finite() && se > 0.0 {
                             let z = beta / se;
-                            out_row[2] = 2.0 * normal_sf(z.abs());
+                            out_row[2] = sanitize_assoc_pvalue(beta, se, 2.0 * normal_sf(z.abs()));
                         } else {
-                            out_row[2] = f64::NAN;
+                            out_row[2] = 1.0;
                         }
                         if with_plrt {
                             let ml = fast_ml_loglike(

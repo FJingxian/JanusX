@@ -28,7 +28,7 @@ use crate::blas::{
     CBLAS_NO_TRANS, CBLAS_TRANS,
 };
 use crate::he::build_row_standardization_stats;
-use crate::linalg::{chi2_sf_df1, chi2_stat_df1_from_sf, format_chisq_value};
+use crate::linalg::{chi2_sf_df1, chi2_stat_df1_from_sf, format_chisq_value, sanitize_assoc_pvalue};
 use crate::math_farmcpu::decode_packed_rows_to_sample_major;
 use crate::pcg::{pcg_solve, IdentityPreconditioner, PcgOperator};
 use crate::stats_common::{get_cached_pool, parse_index_vec_i64, AsyncTsvWriter};
@@ -5770,12 +5770,12 @@ fn write_stage2_tsv(
             let mut beta = out_block[base];
             let mut se = out_block[base + 1];
             let mut chisq = out_block[base + 2];
-            let mut pwald = out_block[base + 3];
+            let mut pwald = sanitize_assoc_pvalue(beta, se, out_block[base + 3]);
             let mut plrt = out_block[base + 4];
             if let Some(&j) = qtn_lookup.get(&idx) {
                 beta = qtn_beta[j];
                 se = qtn_se[j];
-                pwald = qtn_pwald[j];
+                pwald = sanitize_assoc_pvalue(beta, se, qtn_pwald[j]);
                 plrt = qtn_plrt[j];
                 chisq = qtn_chisq[j];
                 qtn_written += 1;

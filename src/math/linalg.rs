@@ -17,6 +17,18 @@ pub(crate) fn chi2_sf_df1(stat: f64) -> f64 {
 }
 
 #[inline]
+pub(crate) fn sanitize_assoc_pvalue(beta: f64, se: f64, p: f64) -> f64 {
+    if !(beta.is_finite() && se.is_finite() && se > 0.0) {
+        return 1.0;
+    }
+    if p.is_finite() {
+        p.clamp(f64::MIN_POSITIVE, 1.0)
+    } else {
+        1.0
+    }
+}
+
+#[inline]
 fn betacf(a: f64, b: f64, x: f64) -> f64 {
     let qab = a + b;
     let qap = a + 1.0;
@@ -281,7 +293,7 @@ pub(crate) fn cholesky_logdet(l: &[f64], dim: usize) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::chi2_stat_df1_from_sf;
+    use super::{chi2_stat_df1_from_sf, sanitize_assoc_pvalue};
 
     #[test]
     fn chi2_df1_inverse_surv_handles_tiny_p_values() {
@@ -295,5 +307,14 @@ mod tests {
         assert!(chi2_stat_df1_from_sf(f64::NAN).is_nan());
         assert_eq!(chi2_stat_df1_from_sf(0.0), f64::INFINITY);
         assert_eq!(chi2_stat_df1_from_sf(1.0), 0.0);
+    }
+
+    #[test]
+    fn sanitize_assoc_pvalue_marks_invalid_effects_nonsignificant() {
+        assert_eq!(sanitize_assoc_pvalue(f64::NAN, 1.0, 1.0e-12), 1.0);
+        assert_eq!(sanitize_assoc_pvalue(1.0, f64::NAN, 1.0e-12), 1.0);
+        assert_eq!(sanitize_assoc_pvalue(1.0, 0.0, 1.0e-12), 1.0);
+        assert_eq!(sanitize_assoc_pvalue(1.0, 1.0, f64::NAN), 1.0);
+        assert!(sanitize_assoc_pvalue(1.0, 1.0, 1.0e-12) < 1.0);
     }
 }

@@ -29,7 +29,7 @@ use crate::gload::{GenotypeMatrix, UnifiedInput};
 use crate::he::row_major_block_mul_mat_f32;
 use crate::linalg::{
     chi2_sf_df1, chisq_from_beta_se_and_optional_plrt, cholesky_inplace, cholesky_solve_into,
-    format_chisq_value,
+    format_chisq_value, sanitize_assoc_pvalue,
 };
 use crate::pcg::{PcgJxlmmNullModel, PcgJxlmmNullModelInfo, PcgJxlmmRHatResult};
 use crate::stats_common::{get_cached_pool, parse_index_vec_i64, AsyncTsvWriter};
@@ -1262,7 +1262,7 @@ fn append_splmm_tsv_block(
         let base = local_idx * 3;
         let beta = results[base];
         let se = results[base + 1];
-        let pwald = results[base + 2];
+        let pwald = sanitize_assoc_pvalue(beta, se, results[base + 2]);
         let chisq_txt = format_chisq_value(chisq_from_beta_se_and_optional_plrt(beta, se, None));
         let (a0, a1) = transform_alleles_by_model_local(&allele0[row_idx], &allele1[row_idx], gm);
         let _ = writeln!(

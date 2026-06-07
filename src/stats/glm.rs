@@ -32,7 +32,7 @@ use crate::gfcore::BedSnpIter;
 use crate::gfreader::{build_sample_selection, prepare_bed_logic_meta_owned_for_stats_samples};
 use crate::gload::{GenotypeMatrix, UnifiedInput};
 use crate::he::row_major_block_mul_mat_f32;
-use crate::linalg::format_chisq_value;
+use crate::linalg::{format_chisq_value, sanitize_assoc_pvalue};
 use crate::stats_common::{get_cached_pool, parse_index_vec_i64, AsyncTsvWriter};
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
@@ -903,6 +903,7 @@ pub fn lm_stream_bed_to_tsv(
                     let site = &prepared.sites[row_idx];
                     let r = &out_slice[local_idx * 5..(local_idx + 1) * 5];
                     let chisq_txt = format_chisq_value(r[2]);
+                    let pwald = sanitize_assoc_pvalue(r[0], r[1], r[3]);
                     let miss_count =
                         (prepared.missing_rate[row_idx] as f64 * n as f64).round() as i64;
                     let _ = write!(
@@ -918,7 +919,7 @@ pub fn lm_stream_bed_to_tsv(
                         r[0],
                         r[1],
                         chisq_txt,
-                        r[3],
+                        pwald,
                         r[4]
                     );
                 }
@@ -1359,6 +1360,7 @@ pub fn lm_stream_bed_to_tsv(
                     transform_alleles_by_model(&site.ref_allele, &site.alt_allele, model.as_str());
                 let r = &out[i * 5..(i + 1) * 5];
                 let chisq_txt = format_chisq_value(r[2]);
+                let pwald = sanitize_assoc_pvalue(r[0], r[1], r[3]);
                 let _ = write!(
                     text,
                     "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\t{:.4e}\n",
@@ -1372,7 +1374,7 @@ pub fn lm_stream_bed_to_tsv(
                     r[0],
                     r[1],
                     chisq_txt,
-                    r[3],
+                    pwald,
                     r[4]
                 );
             }
@@ -2664,6 +2666,7 @@ pub fn lm_block_assoc_packed_to_tsv<'py>(
                         f64::NAN
                     };
                     let chisq_txt = format_chisq_value(chisq);
+                    let pwald = sanitize_assoc_pvalue(beta_j, se_j, pwald);
 
                     let _ = write!(
                         text_buf,
@@ -3066,6 +3069,7 @@ pub fn glmf32_packed_assoc_to_tsv(
                     let idx = i_marker + l;
                     let base = l * 5;
                     let chisq_txt = format_chisq_value(block[base + 2]);
+                    let pwald = sanitize_assoc_pvalue(block[base], block[base + 1], block[base + 3]);
                     let _ = write!(
                         text_buf,
                         "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\t{:.4e}\n",
@@ -3079,7 +3083,7 @@ pub fn glmf32_packed_assoc_to_tsv(
                         block[base],
                         block[base + 1],
                         chisq_txt,
-                        block[base + 3],
+                        pwald,
                         block[base + 4],
                     );
                 }
@@ -3546,6 +3550,7 @@ pub(crate) fn lm_unified_scan_to_tsv<G: GenotypeMatrix>(
         text.clear();
         for li in 0..rh {
             let s = &ob[li * 5..(li + 1) * 5];
+            let pwald = sanitize_assoc_pvalue(s[0], s[1], s[2]);
             let _ = write!(
                 text,
                 "{}\t.\t.\t.\t.\t.\t.\t{:.4}\t{:.4}\t{}\t{:.4e}\t{:.4e}\n",
@@ -3553,7 +3558,7 @@ pub(crate) fn lm_unified_scan_to_tsv<G: GenotypeMatrix>(
                 s[0],
                 s[1],
                 format_chisq_value(s[4]),
-                s[2],
+                pwald,
                 s[3]
             );
         }

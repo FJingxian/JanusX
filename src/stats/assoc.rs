@@ -1,5 +1,7 @@
 use crate::bedmath::{decode_plink_bed_hardcall, packed_row_missing_count_selected};
-use crate::linalg::{chi2_sf_df1, chi2_stat_df1_from_sf, format_chisq_value};
+use crate::linalg::{
+    chi2_sf_df1, chi2_stat_df1_from_sf, format_chisq_value, sanitize_assoc_pvalue,
+};
 use crate::math_farmcpu::{
     decode_dense_rows_to_sample_major, decode_packed_rows_to_sample_major,
     farmcpu_ll_score_from_sample_major, farmcpu_super_keep_from_sample_major, select_lead_indices,
@@ -1880,6 +1882,7 @@ pub fn farmcpu_write_assoc_tsv(
             f64::NAN
         };
         let chisq_txt = format_chisq_value(chisq);
+        let pwald_txt = sanitize_assoc_pvalue(b, s, pwald[i]);
         writeln!(
             text_buf,
             "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\t{:.4e}",
@@ -1893,7 +1896,7 @@ pub fn farmcpu_write_assoc_tsv(
             b,
             s,
             chisq_txt,
-            pwald[i],
+            pwald_txt,
             plrt
         )
         .map_err(|e| PyRuntimeError::new_err(format!("format row {i} for {out_tsv}: {e}")))?;
@@ -1956,6 +1959,7 @@ pub fn farmcpu_write_assoc_tsv(
                     f64::NAN
                 };
                 let chisq_txt = format_chisq_value(chisq);
+                let pwald_txt = sanitize_assoc_pvalue(b, s, pwald[idx]);
                 writeln!(
                     q_text_buf,
                     "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\t{:.4e}",
@@ -1969,7 +1973,7 @@ pub fn farmcpu_write_assoc_tsv(
                     b,
                     s,
                     chisq_txt,
-                    pwald[idx],
+                    pwald_txt,
                     plrt
                 )
                 .map_err(|e| {

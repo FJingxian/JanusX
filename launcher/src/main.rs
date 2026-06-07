@@ -38,7 +38,6 @@ const WARMUP_MARKER: &str = ".runtime_warmed";
 const LAUNCHER_VERSION_MARKER: &str = ".launcher_version";
 const RUNTIME_OWNER_MARKER: &str = ".launcher_runtime_owner";
 const UNINSTALL_HELPER_NAME: &str = "jx_uninstall_cleanup.cmd";
-const GWAS_HISTORY_DB_FILE: &str = "janusx_tasks.db";
 const KNOWN_MODULES: [&str; 29] = [
     "grm",
     "pca",
@@ -4076,63 +4075,13 @@ fn run_downloaded_installer(installer: &Path, verbose: bool) -> Result<(), Strin
 
 fn run_clean(args: &[String]) -> Result<i32, String> {
     if args.len() == 1 && matches!(args[0].as_str(), "-h" | "--help" | "help") {
-        println!("Clean usage:\n  jx -clean\n  jx -clean <history_id>");
+        println!("Clean usage:\n  jx -clean");
         return Ok(0);
     }
-    if args.len() > 1 {
-        return Err("Clean usage:\n  jx -clean\n  jx -clean <history_id>".to_string());
+    if !args.is_empty() {
+        return Err("Clean usage:\n  jx -clean".to_string());
     }
-    if args.len() == 1 {
-        let python = ensure_runtime(false)?;
-        let mut cmd = Command::new(&python);
-        cmd.arg("-m")
-            .arg("janusx.script.loadanno")
-            .arg("--clean-id")
-            .arg(&args[0]);
-        let status = cmd
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .status()
-            .map_err(|e| format!("Failed to run load cleaner: {e}"))?;
-        return Ok(exit_code(status));
-    }
-
-    let clean_home = runtime_home().or_else(|_| default_runtime_home())?;
-    let uniq: Vec<PathBuf> = vec![clean_home.join(GWAS_HISTORY_DB_FILE)];
-    let mut removed: Vec<PathBuf> = Vec::new();
-    let mut failed_primary: Vec<String> = Vec::new();
-    for p in uniq {
-        if !p.exists() {
-            continue;
-        }
-        let res = if p.is_dir() {
-            std::fs::remove_dir_all(&p)
-        } else {
-            std::fs::remove_file(&p)
-        };
-        match res {
-            Ok(_) => removed.push(p),
-            Err(e) => failed_primary.push(format!("{} ({e})", p.display())),
-        }
-    }
-
-    if !failed_primary.is_empty() {
-        return Err(format!(
-            "Failed to clean GWAS history DB:\n{}",
-            failed_primary.join("\n")
-        ));
-    }
-
-    if removed.is_empty() {
-        print_success_line("GWAS history DB already clean.");
-    } else {
-        print_success_line("GWAS history DB cleaned.");
-        for p in removed {
-            println!("  removed {}", p.display());
-        }
-    }
-    println!("A new history DB will be created automatically on next `jx gwas`.");
+    print_success_line("GWAS history DB support has been removed; nothing to clean.");
     Ok(0)
 }
 
@@ -5577,7 +5526,7 @@ fn print_cli_help() {
     print_help_entry(
         2,
         "-clean",
-        "Clear GWAS history DB, or `jx -clean <history_id>` to remove one history record",
+        "Deprecated; GWAS history DB support has been removed",
         flag_key_width,
         width,
     );
@@ -6881,3 +6830,6 @@ mod tests {
         assert_ne!(frame_60_900, frame_61_000);
     }
 }
+// Shared launcher/runtime metadata DB used by DLC/runtime bookkeeping.
+// GWAS history recording has been disabled on the Python side.
+const GWAS_HISTORY_DB_FILE: &str = "janusx_tasks.db";

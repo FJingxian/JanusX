@@ -1503,6 +1503,9 @@ def _jxlmm_component_scale_reml(
             "resid_var_mx_reml": float("nan"),
             "ypy_reml": float("nan"),
             "sigma_sum_profile": sigma_sum,
+            "sigma2_profile_reml": float("nan"),
+            "sigma2_mx_reml": float("nan"),
+            "sigma_scale_p0_to_mx": float("nan"),
             "sigma_scale_reml": float("nan"),
         }
     xtx = np.ascontiguousarray(x_design.T @ x_design, dtype=np.float64)
@@ -1511,17 +1514,28 @@ def _jxlmm_component_scale_reml(
     resid = np.ascontiguousarray(y - (x_design @ beta), dtype=np.float64)
     rss_mx = float(np.dot(resid, resid))
     df = int(n - p)
-    # Trait-level scan rescaling anchor for GRAMMAR-gamma:
-    # use the residualized phenotype variance ||M_X y||^2 / (n - c) to bring
-    # sparse REML components back toward phenotype scale before scan. This is
-    # the empirical c_trait proxy that previously matched fastGWA calibration
-    # much better than the raw component sum.
+    # Under the explicit P0 + sigma^2 parameterization:
+    #   sigma2_profile = y'P0y / (n - p)
+    #   sigma2_mx      = y'M_Xy / (n - p)
+    # For standardized K, V = sigma^2 (K + lambda I), so the approximate scan
+    # should use sigma2_scan = sigma2_mx / (1 + lambda)
+    #                           = sigma2_mx / ((sigma_g2 + sigma_e2) / sigma_g2).
+    # Because Rust still receives (sigma_g2, sigma_e2), the effective factor we
+    # apply to both components is:
+    #   scan_scale = sigma2_scan / sigma2_profile = sigma2_mx / (sigma_g2 + sigma_e2).
     ypy_reml = float(sigma_g2) * float(df) if np.isfinite(sigma_g2) and df > 0 else float("nan")
     resid_var_reml = float(sigma_g2) if np.isfinite(sigma_g2) else float("nan")
     resid_var_mx_reml = float(rss_mx / float(df)) if df > 0 else float("nan")
+    sigma2_profile_reml = resid_var_reml
+    sigma2_mx_reml = resid_var_mx_reml
+    sigma_scale_p0_to_mx = (
+        float(rss_mx / ypy_reml)
+        if np.isfinite(rss_mx) and np.isfinite(ypy_reml) and ypy_reml > 0.0
+        else float("nan")
+    )
     sigma_scale_reml = (
-        float(resid_var_mx_reml / sigma_sum)
-        if np.isfinite(resid_var_mx_reml) and np.isfinite(sigma_sum) and sigma_sum > 0.0
+        float(sigma2_mx_reml / sigma_sum)
+        if np.isfinite(sigma2_mx_reml) and np.isfinite(sigma_sum) and sigma_sum > 0.0
         else float("nan")
     )
     return {
@@ -1532,6 +1546,9 @@ def _jxlmm_component_scale_reml(
         "resid_var_mx_reml": resid_var_mx_reml,
         "ypy_reml": ypy_reml,
         "sigma_sum_profile": sigma_sum,
+        "sigma2_profile_reml": sigma2_profile_reml,
+        "sigma2_mx_reml": sigma2_mx_reml,
+        "sigma_scale_p0_to_mx": sigma_scale_p0_to_mx,
         "sigma_scale_reml": sigma_scale_reml,
     }
 
@@ -4366,6 +4383,9 @@ def run_splmm_packed_fullrank(
         resid_var_reml = float(null_fit.get("resid_var_reml", float("nan")))
         resid_var_mx_reml = float(null_fit.get("resid_var_mx_reml", float("nan")))
         ypy_reml = float(null_fit.get("ypy_reml", float("nan")))
+        sigma2_profile_reml = float(null_fit.get("sigma2_profile_reml", resid_var_reml))
+        sigma2_mx_reml = float(null_fit.get("sigma2_mx_reml", resid_var_mx_reml))
+        sigma_scale_p0_to_mx = float(null_fit.get("sigma_scale_p0_to_mx", float("nan")))
         sigma_scale_reml = float(null_fit.get("sigma_scale_reml", float("nan")))
         if not _jxlmm_null_components_valid(sigma_g2, sigma_e2):
             _stop_prepare_handle()
@@ -4400,10 +4420,11 @@ def run_splmm_packed_fullrank(
             f"sigma_e2={sigma_e2:.4g}, "
             f"sigma_sum_profile={sigma_sum_profile:.4g}, "
             f"ypy_reml={ypy_reml:.4g}, "
-            f"resid_var_reml={resid_var_reml:.4g}, "
-            f"resid_var_mx_reml={resid_var_mx_reml:.4g}, "
+            f"sigma2_profile={sigma2_profile_reml:.4g}, "
+            f"sigma2_mx={sigma2_mx_reml:.4g}, "
             f"df_reml={df_reml:.0f}, "
-            f"scale_reml={sigma_scale_reml:.4g}, "
+            f"c_p0_to_mx={sigma_scale_p0_to_mx:.4g}, "
+            f"scan_scale={sigma_scale_reml:.4g}, "
             f"lambda_boundary={null_lambda_boundary or 'interior'}, "
             f"backend={null_backend} [{format_elapsed(null_secs)}]"
             if np.isfinite(null_pve)
@@ -4413,7 +4434,8 @@ def run_splmm_packed_fullrank(
         if scan_sigma_preview_valid:
             _null_fit_msg = (
                 f"{_null_fit_msg}; "
-                f"scan_sigma_preview=(sigma_g2={sigma_g2_scan_preview:.4g}, sigma_e2={sigma_e2_scan_preview:.4g})"
+                f"scan_sigma_preview=(sigma2={sigma_g2_scan_preview:.4g}, "
+                f"sigma_g2={sigma_g2_scan_preview:.4g}, sigma_e2={sigma_e2_scan_preview:.4g})"
             )
         if bool(use_spinner):
             _log_file_only(logger, logging.INFO, f"SparseLMM: {_null_fit_msg}")
@@ -4862,13 +4884,16 @@ def run_splmm_packed_fullrank(
             if int(rhat_requested) > 0
             else ""
         )
+        sigma2_scan_use = float(sigma_g2_scan_use)
         _sigma_mode_info = (
-            f"sigma_mode=reml_p0_corrected(scale={sigma_scale_reml:.4g}, "
-            f"sigma_g2={sigma_g2_scan_use:.4g}, sigma_e2={sigma_e2_scan_use:.4g})"
+            f"sigma_mode=mx_sigma2_over_1plambda(c_p0_to_mx={sigma_scale_p0_to_mx:.4g}, "
+            f"scan_scale={sigma_scale_reml:.4g}, "
+            f"sigma2={sigma2_scan_use:.4g}, sigma_g2={sigma_g2_scan_use:.4g}, sigma_e2={sigma_e2_scan_use:.4g})"
             if use_reml_scan_sigma
             else (
-                f"sigma_mode=profile; scan_sigma_preview=reml_p0_corrected(scale={sigma_scale_reml:.4g}, "
-                f"sigma_g2={sigma_g2_scan_preview:.4g}, sigma_e2={sigma_e2_scan_preview:.4g})"
+                f"sigma_mode=profile; scan_sigma_preview=mx_sigma2_over_1plambda(c_p0_to_mx={sigma_scale_p0_to_mx:.4g}, "
+                f"scan_scale={sigma_scale_reml:.4g}, "
+                f"sigma2={sigma_g2_scan_preview:.4g}, sigma_g2={sigma_g2_scan_preview:.4g}, sigma_e2={sigma_e2_scan_preview:.4g})"
                 if scan_sigma_preview_valid
                 else "sigma_mode=profile"
             )
@@ -4935,8 +4960,20 @@ def run_splmm_packed_fullrank(
                 "splmm_sigma_scale_reml": (
                     float(sigma_scale_reml) if np.isfinite(sigma_scale_reml) else None
                 ),
+                "splmm_sigma2_profile_reml": (
+                    float(sigma2_profile_reml) if np.isfinite(sigma2_profile_reml) else None
+                ),
+                "splmm_sigma2_mx_reml": (
+                    float(sigma2_mx_reml) if np.isfinite(sigma2_mx_reml) else None
+                ),
+                "splmm_sigma_scale_p0_to_mx": (
+                    float(sigma_scale_p0_to_mx) if np.isfinite(sigma_scale_p0_to_mx) else None
+                ),
                 "splmm_scan_sigma_mode": (
-                    "reml_p0_corrected" if use_reml_scan_sigma else "profile"
+                    "mx_sigma2_over_1plambda" if use_reml_scan_sigma else "profile"
+                ),
+                "splmm_scan_sigma2": (
+                    float(sigma2_scan_use) if np.isfinite(sigma2_scan_use) else None
                 ),
                 "splmm_scan_sigma_g2": (
                     float(sigma_g2_scan_use) if np.isfinite(sigma_g2_scan_use) else None

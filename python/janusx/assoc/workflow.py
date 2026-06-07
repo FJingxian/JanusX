@@ -120,7 +120,6 @@ from janusx.script._common.threads import (
     runtime_thread_stage,
     require_openblas_by_default,
 )
-from janusx.script._common.gwas_history import record_gwas_run
 from janusx.script._common.genocache import configure_genotype_cache_from_out
 from janusx.script._common.genoio import (
     basename_only as _basename_only,
@@ -6749,59 +6748,6 @@ def _run_gwas_pipeline(
         run_status = "failed"
         run_error = str(e)
         logger.exception(f"Error in JanusX GWAS pipeline: {e}")
-
-    if run_status == "done":
-        try:
-            genofile_kind = (
-                "bfile" if bool(args.bfile)
-                else ("vcf" if bool(args.vcf)
-                      else ("hmp" if bool(args.hmp) else "tsv"))
-            )
-            args_data = {
-                "models": {
-                    "lmm": bool(args.lmm),
-                    "fastlmm": bool(args.fastlmm),
-                    "fvlmm": bool(args.fvlmm),
-                    "lm": bool(args.lm),
-                    "splmm": bool(args.splmm),
-                    "algwas": bool(args.algwas),
-                    "farmcpu": bool(args.farmcpu),
-                },
-                "model": str(args.model),
-                "bed_backend": ("packed" if bool(fast_mode) else "memmap"),
-                "bed_loader": ("packed" if bool(fast_mode) else "memmap"),
-                "snps_only": bool(args.snps_only),
-                "maf": float(args.maf),
-                "geno": float(args.geno),
-                "het": float(args.het),
-                "chunksize": int(args.chunksize),
-                "thread": int(args.thread),
-                "ncol": (list(args.ncol) if args.ncol is not None else None),
-                "cov": (list(args.cov) if args.cov is not None else []),
-                "grm": str(args.grm),
-                "qcov": str(args.qcov),
-                "grm_display": _format_grm_display(args.grm),
-                "qcov_display": _format_qcov_display(args.qcov),
-                "cov_display": _format_cov_display(args.cov),
-                "traits": [str(x) for x in trait_order],
-                "trait_col_map": {str(k): int(v) for k, v in trait_col_map.items()},
-            }
-            record_gwas_run(
-                run_id=run_id,
-                status=run_status,
-                genofile=str(gfile),
-                genofile_kind=genofile_kind,
-                phenofile=str(args.pheno),
-                outprefix=str(outprefix),
-                log_file=str(log_path),
-                result_files=[str(x) for x in ordered_result_paths],
-                summary_rows=[dict(x) for x in _ordered_gwas_summary_rows(gwas_summary_rows)],
-                args_data=args_data,
-                error_text="",
-                created_at=run_created_at,
-            )
-        except Exception as e:
-            logger.warning(f"Failed to write GWAS history DB: {e}")
 
     lt = time.localtime()
     endinfo = (

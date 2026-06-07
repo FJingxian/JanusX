@@ -40,7 +40,6 @@ from ..script._common.gwas_history import (
     get_gwas_run,
     list_annotation_registry,
     list_gwas_history_rows,
-    record_gwas_run,
     resolve_db_path,
     resolve_jx_home,
     upsert_postgwas_run,
@@ -984,35 +983,9 @@ class WebUIState:
                 "eff_snp": int(det.get("n_rows", 0) or 0),
             }
         ]
-        args_data = {
-            "model": "upload",
-            "source": "webui-upload",
-            "detected_columns": {
-                "chr": str(det.get("chr", "")),
-                "pos": str(det.get("pos", "")),
-                "pvalue": str(det.get("pvalue", "")),
-            },
-        }
-        try:
-            record_gwas_run(
-                run_id=run_id,
-                status="completed",
-                genofile=str(gpath),
-                genofile_kind=str(gkind),
-                phenofile=str(p),
-                outprefix=outprefix,
-                log_file=log_file,
-                result_files=[str(p)],
-                summary_rows=summary_rows,
-                args_data=args_data,
-                error_text="",
-                created_at=_now_str(),
-            )
-        except Exception as exc:
-            raise RuntimeError(f"record-db failed: {exc}") from exc
         return {
             "run_id": run_id,
-            "history_id": f"{run_id}|0",
+            "history_id": "",
             "path": str(p),
             "file_name": str(p.name),
             "detected": {

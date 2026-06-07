@@ -401,10 +401,13 @@ unsafe fn decode_row_centered_full_lut_neon(
         }
 
         for cst in (0..CHUNK_CODES).step_by(4) {
-            let p = code_buf.as_ptr().add(cst);
-            let idx_u8 = vld1_u8(p);
-            let idx_u16 = vmovl_u8(idx_u8);
-            let idx_u32 = vmovl_u16(vget_low_u16(idx_u16));
+            let idx_buf = [
+                code_buf[cst] as u32,
+                code_buf[cst + 1] as u32,
+                code_buf[cst + 2] as u32,
+                code_buf[cst + 3] as u32,
+            ];
+            let idx_u32 = vld1q_u32(idx_buf.as_ptr());
             let mut outv = v3;
             let m2 = vceqq_u32(idx_u32, idx2);
             outv = vbslq_f32(m2, v2, outv);
@@ -431,10 +434,13 @@ unsafe fn decode_row_centered_full_lut_neon(
         }
         let simd_codes = tail_codes - (tail_codes % 4);
         for cst in (0..simd_codes).step_by(4) {
-            let p = code_buf.as_ptr().add(cst);
-            let idx_u8 = vld1_u8(p);
-            let idx_u16 = vmovl_u8(idx_u8);
-            let idx_u32 = vmovl_u16(vget_low_u16(idx_u16));
+            let idx_buf = [
+                code_buf[cst] as u32,
+                code_buf[cst + 1] as u32,
+                code_buf[cst + 2] as u32,
+                code_buf[cst + 3] as u32,
+            ];
+            let idx_u32 = vld1q_u32(idx_buf.as_ptr());
             let mut outv = v3;
             let m2 = vceqq_u32(idx_u32, idx2);
             outv = vbslq_f32(m2, v2, outv);

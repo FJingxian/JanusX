@@ -230,7 +230,7 @@ use spgrm::{
 };
 use splmm::{
     splmm_assoc_pcg_bed, splmm_assoc_pcg_bed_to_tsv, splmm_scan_exact_packed,
-    splmm_scan_grammar_packed, splmm_sparse_grm_diag_stats,
+    splmm_scan_grammar_packed, splmm_sparse_grm_diag_stats, splmm_sparse_null_model_debug,
 };
 use spreml::{spreml_sparse_reml_brent_from_jxgrm, spreml_sparse_reml_grid_from_jxgrm};
 use top::{top_fit_model_py, top_rank_to_target_sample_py, top_rank_to_target_values_py};
@@ -386,6 +386,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(splmm_scan_grammar_packed, m)?)?;
     m.add_function(wrap_pyfunction!(splmm_scan_exact_packed, m)?)?;
     m.add_function(wrap_pyfunction!(splmm_sparse_grm_diag_stats, m)?)?;
+    m.add_function(wrap_pyfunction!(splmm_sparse_null_model_debug, m)?)?;
     m.add_function(wrap_pyfunction!(spreml_sparse_reml_grid_from_jxgrm, m)?)?;
     m.add_function(wrap_pyfunction!(spreml_sparse_reml_brent_from_jxgrm, m)?)?;
     m.add_function(wrap_pyfunction!(king::king_unrelated_set_from_bed_py, m)?)?;

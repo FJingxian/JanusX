@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import logging
 import os
+import hashlib
+import re
 import time
 import warnings
 from contextlib import contextmanager
@@ -234,7 +236,33 @@ def _grm_method_cache_tag(mgrm: str, *, legacy: bool = False) -> str:
         return "grm1" if legacy else "cGRM"
     if s == "2":
         return "grm2" if legacy else "sGRM"
-    return s
+    raw = str(s).replace("\\", "/").rstrip("/")
+    base = os.path.basename(raw)
+    low = base.lower()
+    if ".cgrm" in low:
+        return "grm1" if legacy else "cGRM"
+    if ".sgrm" in low:
+        return "grm2" if legacy else "sGRM"
+    stem = base
+    while True:
+        stem_low = stem.lower()
+        matched = False
+        for ext in (".spgrm", ".jxgrm", ".npy", ".txt", ".tsv", ".csv", ".bin", ".gz"):
+            if stem_low.endswith(ext):
+                stem = stem[: -len(ext)]
+                matched = True
+                break
+        if not matched:
+            break
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._-")
+    if stem == "":
+        stem = "grm"
+    try:
+        resolved = str(safe_resolve(raw))
+    except Exception:
+        resolved = raw
+    digest = hashlib.sha1(resolved.encode("utf-8")).hexdigest()[:10]
+    return f"{stem}.{digest}"
 
 
 @contextmanager

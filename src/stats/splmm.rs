@@ -1,5 +1,5 @@
 use memmap2::Mmap;
-use numpy::{PyArray2, PyReadonlyArray1, PyReadonlyArray2};
+use numpy::{PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::Bound;
@@ -2717,6 +2717,151 @@ impl SplmmPreparedScanState {
     }
 }
 
+struct SplmmBuiltNullState {
+    x_design_col_major: Vec<f64>,
+    py: Vec<f64>,
+    beta_hat: Vec<f64>,
+    null_model: PcgJxlmmNullModel,
+    null_info: PcgJxlmmNullModelInfo,
+}
+
+fn build_sparse_jxlmm_null_state(
+    factor: &SparseJxgrmCholesky,
+    x_design: &[f64],
+    y_vec: &[f64],
+    sigma2: f64,
+    solve_workspace: &mut SparseJxgrmSolveWorkspace,
+    stage1_cb: Option<&Py<PyAny>>,
+) -> Result<SplmmBuiltNullState, String> {
+    let n = y_vec.len();
+    if n == 0 {
+        return Err("SparseLMM null-state build requires non-empty y".to_string());
+    }
+    if x_design.len() % n != 0 {
+        return Err(format!(
+            "SparseLMM null-state design length mismatch: len(x_design)={} is not divisible by n={n}",
+            x_design.len()
+        ));
+    }
+    let p = x_design.len() / n;
+    if p == 0 {
+        return Err("SparseLMM null-state build requires at least one design column".to_string());
+    }
+    if !(sigma2.is_finite() && sigma2 > 0.0_f64) {
+        return Err(format!(
+            "SparseLMM null-state build requires finite positive sigma2, got {sigma2}"
+        ));
+    }
+
+    if stage1_cb.is_some() {
+        emit_progress_callback(stage1_cb, 6, 0, 1)?;
+    }
+    let y_vinv_col = sparse_solve_rhs_with_workspace(factor, y_vec, 1, solve_workspace)?;
+    if stage1_cb.is_some() {
+        emit_progress_callback(stage1_cb, 6, 1, 1)?;
+    }
+
+    let x_design_col_major = row_major_to_col_major_f64(&x_design, n, p)?;
+    if stage1_cb.is_some() {
+        emit_progress_callback(stage1_cb, 7, 0, p.max(1))?;
+    }
+    let x_vinv_col =
+        sparse_solve_rhs_with_workspace(factor, &x_design_col_major, p, solve_workspace)?;
+    if stage1_cb.is_some() {
+        emit_progress_callback(stage1_cb, 7, p.max(1), p.max(1))?;
+    }
+
+    let mut xt_v_inv_y = vec![0.0_f64; p];
+    xt_vec_row_major(&x_design, n, p, &y_vinv_col, &mut xt_v_inv_y);
+
+    let mut xt_v_inv_x = vec![0.0_f64; p * p];
+    unsafe {
+        cblas_dgemm_dispatch(
+            CBLAS_COL_MAJOR,
+            CBLAS_TRANS,
+            CBLAS_NO_TRANS,
+            p as CblasInt,
+            p as CblasInt,
+            n as CblasInt,
+            1.0_f64,
+            x_design_col_major.as_ptr(),
+            n as CblasInt,
+            x_vinv_col.as_ptr(),
+            n as CblasInt,
+            0.0_f64,
+            xt_v_inv_x.as_mut_ptr(),
+            p as CblasInt,
+        );
+    }
+    let xt_v_inv_x_chol = spd_cholesky_with_jitter(&xt_v_inv_x, p, "SparseLMM XtVinvX")?;
+    drop(xt_v_inv_x);
+
+    let mut beta_hat = vec![0.0_f64; p];
+    cholesky_solve_into(&xt_v_inv_x_chol, p, &xt_v_inv_y, &mut beta_hat);
+    drop(xt_v_inv_y);
+
+    let mut py = y_vinv_col;
+    for (cov_idx, beta) in beta_hat.iter().copied().enumerate() {
+        if beta == 0.0_f64 {
+            continue;
+        }
+        let vinvx_col = &x_vinv_col[cov_idx * n..(cov_idx + 1) * n];
+        for i in 0..n {
+            py[i] -= vinvx_col[i] * beta;
+        }
+    }
+    drop(x_vinv_col);
+
+    let mut p0y = py.clone();
+    for value in p0y.iter_mut() {
+        *value *= sigma2;
+    }
+    let mut xt_p0_x_chol = xt_v_inv_x_chol.clone();
+    let sqrt_sigma2 = sigma2.sqrt();
+    if sqrt_sigma2 != 1.0_f64 {
+        for value in xt_p0_x_chol.iter_mut() {
+            *value *= sqrt_sigma2;
+        }
+    }
+
+    let null_model = PcgJxlmmNullModel {
+        n_samples: n,
+        n_covariates: p,
+        sigma2,
+        p0y,
+        xt_p0_x_chol,
+    };
+    let null_info = PcgJxlmmNullModelInfo {
+        v_inv_y: crate::pcg::PcgSolveInfo {
+            converged: true,
+            iters: 1,
+            rel_res: 0.0,
+        },
+        v_inv_x: crate::pcg::PcgMatrixSolveInfo {
+            n_rows: n,
+            n_cols: p,
+            converged_all: true,
+            max_iters: 1,
+            max_rel_res: 0.0,
+            column_info: vec![
+                crate::pcg::PcgSolveInfo {
+                    converged: true,
+                    iters: 1,
+                    rel_res: 0.0,
+                };
+                p
+            ],
+        },
+    };
+    Ok(SplmmBuiltNullState {
+        x_design_col_major,
+        py,
+        beta_hat,
+        null_model,
+        null_info,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn prepare_splmm_scan_state(
     factor: SparseJxgrmCholesky,
@@ -2768,110 +2913,22 @@ fn prepare_splmm_scan_state(
     };
     let mut solve_workspace = factor.make_solve_workspace(solve_cap)?;
 
-    if stage1_cb.is_some() {
-        emit_progress_callback(stage1_cb, 6, 0, 1)?;
-    }
-    let y_vinv_col = sparse_solve_rhs_with_workspace(&factor, &y_vec, 1, &mut solve_workspace)?;
-    if stage1_cb.is_some() {
-        emit_progress_callback(stage1_cb, 6, 1, 1)?;
-    }
-
-    let x_design_col_major = row_major_to_col_major_f64(&x_design, n, p)?;
     let x_design_xtx_chol = if scan_mode.needs_rhat() || scan_mode.needs_exact_workspace() {
         Some(xtx_chol_from_design(x_design, n, p)?)
     } else {
         None
     };
-    if stage1_cb.is_some() {
-        emit_progress_callback(stage1_cb, 7, 0, p.max(1))?;
-    }
-    let x_vinv_col =
-        sparse_solve_rhs_with_workspace(&factor, &x_design_col_major, p, &mut solve_workspace)?;
-    if stage1_cb.is_some() {
-        emit_progress_callback(stage1_cb, 7, p.max(1), p.max(1))?;
-    }
-
-    let mut xt_v_inv_y = vec![0.0_f64; p];
-    xt_vec_row_major(&x_design, n, p, &y_vinv_col, &mut xt_v_inv_y);
-
-    let mut xt_v_inv_x = vec![0.0_f64; p * p];
-    unsafe {
-        cblas_dgemm_dispatch(
-            CBLAS_COL_MAJOR,
-            CBLAS_TRANS,
-            CBLAS_NO_TRANS,
-            p as CblasInt,
-            p as CblasInt,
-            n as CblasInt,
-            1.0_f64,
-            x_design_col_major.as_ptr(),
-            n as CblasInt,
-            x_vinv_col.as_ptr(),
-            n as CblasInt,
-            0.0_f64,
-            xt_v_inv_x.as_mut_ptr(),
-            p as CblasInt,
-        );
-    }
-    let xt_v_inv_x_chol = spd_cholesky_with_jitter(&xt_v_inv_x, p, "SparseLMM XtVinvX")?;
-    drop(xt_v_inv_x);
-    let mut beta_hat = vec![0.0_f64; p];
-    cholesky_solve_into(&xt_v_inv_x_chol, p, &xt_v_inv_y, &mut beta_hat);
-    drop(xt_v_inv_y);
-
-    let mut py = y_vinv_col.clone();
-    drop(y_vinv_col);
-    for (cov_idx, beta) in beta_hat.iter().copied().enumerate() {
-        if beta == 0.0_f64 {
-            continue;
-        }
-        let vinvx_col = &x_vinv_col[cov_idx * n..(cov_idx + 1) * n];
-        for i in 0..n {
-            py[i] -= vinvx_col[i] * beta;
-        }
-    }
-    drop(x_vinv_col);
-    let mut p0y = py;
-    for value in p0y.iter_mut() {
-        *value *= sigma2;
-    }
-    let mut xt_p0_x_chol = xt_v_inv_x_chol.clone();
-    let sqrt_sigma2 = sigma2.sqrt();
-    if sqrt_sigma2 != 1.0_f64 {
-        for value in xt_p0_x_chol.iter_mut() {
-            *value *= sqrt_sigma2;
-        }
-    }
-
-    let null_model = PcgJxlmmNullModel {
-        n_samples: n,
-        n_covariates: p,
+    let null_state = build_sparse_jxlmm_null_state(
+        &factor,
+        x_design,
+        y_vec,
         sigma2,
-        p0y,
-        xt_p0_x_chol,
-    };
-    let null_info = PcgJxlmmNullModelInfo {
-        v_inv_y: crate::pcg::PcgSolveInfo {
-            converged: true,
-            iters: 1,
-            rel_res: 0.0,
-        },
-        v_inv_x: crate::pcg::PcgMatrixSolveInfo {
-            n_rows: n,
-            n_cols: p,
-            converged_all: true,
-            max_iters: 1,
-            max_rel_res: 0.0,
-            column_info: vec![
-                crate::pcg::PcgSolveInfo {
-                    converged: true,
-                    iters: 1,
-                    rel_res: 0.0,
-                };
-                p
-            ],
-        },
-    };
+        &mut solve_workspace,
+        stage1_cb,
+    )?;
+    let x_design_col_major = null_state.x_design_col_major;
+    let null_model = null_state.null_model;
+    let null_info = null_state.null_info;
 
     let (gamma0, r_hat, rhat_result) = if !scan_mode.needs_rhat() {
         (
@@ -3453,6 +3510,115 @@ pub fn splmm_sparse_grm_diag_stats<'py>(
         }
     })
     .map_err(|e: String| PyRuntimeError::new_err(e))
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    jxgrm_path,
+    y,
+    sigma_g2,
+    sigma_e2,
+    x_cov=None,
+    sample_indices=None
+))]
+pub fn splmm_sparse_null_model_debug<'py>(
+    py: Python<'py>,
+    jxgrm_path: String,
+    y: PyReadonlyArray1<'py, f64>,
+    sigma_g2: f64,
+    sigma_e2: f64,
+    x_cov: Option<PyReadonlyArray2<'py, f64>>,
+    sample_indices: Option<PyReadonlyArray1<'py, i64>>,
+) -> PyResult<(
+    f64,
+    Bound<'py, PyArray1<f64>>,
+    Bound<'py, PyArray1<f64>>,
+    Bound<'py, PyArray1<f64>>,
+)> {
+    let y_vec = y.as_slice()?.to_vec();
+    let n = y_vec.len();
+    if n == 0 {
+        return Err(PyRuntimeError::new_err("y must not be empty"));
+    }
+    let sparse_n = sparse_jxgrm_header_n_samples(&jxgrm_path).map_err(PyRuntimeError::new_err)?;
+    let sample_idx = if let Some(raw) = sample_indices.as_ref() {
+        parse_index_vec_i64(raw.as_slice()?, sparse_n, "sample_indices")
+            .map_err(PyRuntimeError::new_err)?
+    } else {
+        if n != sparse_n {
+            return Err(PyRuntimeError::new_err(format!(
+                "SparseLMM null debug requires y length to match sparse n when sample_indices is omitted: y={n}, sparse_n={sparse_n}"
+            )));
+        }
+        (0..sparse_n).collect::<Vec<_>>()
+    };
+    if sample_idx.len() != n {
+        return Err(PyRuntimeError::new_err(format!(
+            "SparseLMM null debug sample/y mismatch: sample_indices={}, y={n}",
+            sample_idx.len()
+        )));
+    }
+
+    let (x_cov_owned, p_cov) = if let Some(x_cov) = &x_cov {
+        let x_arr = x_cov.as_array();
+        if x_arr.ndim() != 2 {
+            return Err(PyRuntimeError::new_err("x_cov must be 2D (n, p_cov)"));
+        }
+        let (xn, xp) = (x_arr.shape()[0], x_arr.shape()[1]);
+        if xn != n {
+            return Err(PyRuntimeError::new_err(format!(
+                "x_cov row count mismatch: got {xn}, expected {n}"
+            )));
+        }
+        let owned = match x_cov.as_slice() {
+            Ok(s) => s.to_vec(),
+            Err(_) => x_arr.iter().copied().collect(),
+        };
+        (Some(owned), xp)
+    } else {
+        (None, 0usize)
+    };
+    let x_design = build_design_with_intercept(x_cov_owned.as_deref(), n, p_cov);
+    let p = p_cov + 1;
+    if n <= p {
+        return Err(PyRuntimeError::new_err(format!(
+            "n must be > p for SparseLMM null debug: n={n}, p={p}"
+        )));
+    }
+
+    let sigma2 = splmm_effective_sigma2(sigma_g2, sigma_e2).map_err(PyRuntimeError::new_err)?;
+    let sample_idx_for_factor = sample_idx.clone();
+    let x_design_for_factor = x_design.clone();
+    let y_vec_for_factor = y_vec.clone();
+    let built = py
+        .detach(move || {
+            let factor = sparse_splmm_load_factor(
+                "",
+                Some(&jxgrm_path),
+                n,
+                sample_idx_for_factor.as_slice(),
+                sigma_g2,
+                sigma_e2,
+                None,
+            )?;
+            let mut solve_workspace = factor.make_solve_workspace(p.max(1))?;
+            build_sparse_jxlmm_null_state(
+                &factor,
+                x_design_for_factor.as_slice(),
+                y_vec_for_factor.as_slice(),
+                sigma2,
+                &mut solve_workspace,
+                None,
+            )
+        })
+        .map_err(PyRuntimeError::new_err)?;
+
+    Ok((
+        built.null_model.sigma2,
+        PyArray1::from_owned_array(py, numpy::ndarray::Array1::from_vec(built.py)),
+        PyArray1::from_owned_array(py, numpy::ndarray::Array1::from_vec(built.null_model.p0y)),
+        PyArray1::from_owned_array(py, numpy::ndarray::Array1::from_vec(built.beta_hat)),
+    ))
 }
 
 #[pyfunction]
@@ -4623,6 +4789,57 @@ mod tests {
         .unwrap();
 
         assert_close(&full, &p0, 1e-10_f64);
+    }
+
+    #[test]
+    fn build_sparse_jxlmm_null_state_matches_manual_reference() {
+        let x_design = make_test_design();
+        let y_vec = vec![0.5_f64, -1.0_f64, 1.25_f64];
+        let factor = make_diag_factor(&[2.0_f64, 3.0_f64, 4.0_f64]);
+        let sigma2 = 2.75_f64;
+        let n = y_vec.len();
+        let p = x_design.len() / n;
+
+        let mut workspace = factor.make_solve_workspace(p.max(1)).unwrap();
+        let built = build_sparse_jxlmm_null_state(
+            &factor,
+            &x_design,
+            &y_vec,
+            sigma2,
+            &mut workspace,
+            None,
+        )
+        .unwrap();
+
+        let x_col = row_major_to_col_major_f64(&x_design, n, p).unwrap();
+        let mut workspace_manual = factor.make_solve_workspace(p.max(1)).unwrap();
+        let y_vinv = sparse_solve_rhs_with_workspace(&factor, &y_vec, 1, &mut workspace_manual).unwrap();
+        let x_vinv =
+            sparse_solve_rhs_with_workspace(&factor, &x_col, p, &mut workspace_manual).unwrap();
+        let mut xt_v_inv_y = vec![0.0_f64; p];
+        xt_vec_row_major(&x_design, n, p, &y_vinv, &mut xt_v_inv_y);
+        let xt_v_inv_x_chol = compute_xt_v_inv_x_chol(&factor, &x_design, n, p);
+        let mut beta_hat = vec![0.0_f64; p];
+        cholesky_solve_into(&xt_v_inv_x_chol, p, &xt_v_inv_y, &mut beta_hat);
+        let mut py_manual = y_vinv.clone();
+        for (cov_idx, beta) in beta_hat.iter().copied().enumerate() {
+            if beta == 0.0_f64 {
+                continue;
+            }
+            let vinvx_col = &x_vinv[cov_idx * n..(cov_idx + 1) * n];
+            for i in 0..n {
+                py_manual[i] -= vinvx_col[i] * beta;
+            }
+        }
+        let p0y_manual: Vec<f64> = py_manual.iter().map(|v| v * sigma2).collect();
+
+        assert_close(&built.x_design_col_major, &x_col, 1e-12_f64);
+        assert_close(&built.beta_hat, &beta_hat, 1e-12_f64);
+        assert_close(&built.py, &py_manual, 1e-12_f64);
+        assert_close(&built.null_model.p0y, &p0y_manual, 1e-12_f64);
+        assert_eq!(built.null_model.n_samples, n);
+        assert_eq!(built.null_model.n_covariates, p);
+        assert!((built.null_model.sigma2 - sigma2).abs() <= 1e-12_f64);
     }
 
     #[test]

@@ -1383,6 +1383,24 @@ fn residualized_sumsq_from_xtx_chol(
 }
 
 #[inline]
+fn scalar_xtx_inv_from_chol(xtx_chol: &[f64], p: usize) -> Option<f64> {
+    if p != 1 || xtx_chol.len() != 1 {
+        return None;
+    }
+    let xtx00 = xtx_chol[0] * xtx_chol[0];
+    if xtx00.is_finite() && xtx00 > SPLMM_TINY {
+        Some(1.0_f64 / xtx00)
+    } else {
+        None
+    }
+}
+
+#[inline]
+fn residualized_sumsq_scalar(xtx00_inv: f64, xts0: f64, s_sq: f64) -> f64 {
+    (s_sq - xts0 * xts0 * xtx00_inv).max(0.0_f64)
+}
+
+#[inline]
 fn cast_f64_slice_to_f32(input: &[f64]) -> Result<Vec<f32>, String> {
     let mut out = Vec::with_capacity(input.len());
     for &value in input {
@@ -2564,6 +2582,7 @@ fn grammar_scan_blocks_core<G: GenotypeMatrix>(
         let mut out_block = vec![0.0_f64; scan_block_rows * 3];
         let thread_hint = threads.max(1);
         let row_tile = scan_block_rows.div_ceil(thread_hint).clamp(32, 1024);
+        let scalar_xtx00_inv = scalar_xtx_inv_from_chol(xtx_chol, p);
         let mut row_start = 0usize;
         while row_start < m {
             let row_end = (row_start + scan_block_rows).min(m);
@@ -2603,52 +2622,31 @@ fn grammar_scan_blocks_core<G: GenotypeMatrix>(
             let out_slice = &mut out_block[..rows_here * 3];
             let t0 = stage_timing.then(Instant::now);
             let mut run_assoc = || {
-                out_slice
-                    .par_chunks_mut(row_tile * 3)
-                    .enumerate()
-                    .for_each_init(
-                        || (vec![0.0_f64; p], vec![0.0_f64; p]),
-                        |(xts, alpha), (tile_idx, out_tile)| {
+                if let Some(xtx00_inv) = scalar_xtx00_inv {
+                    let x0 = x_design;
+                    out_slice.par_chunks_mut(row_tile * 3).enumerate().for_each(
+                        |(tile_idx, out_tile)| {
                             let tile_row_start = tile_idx * row_tile;
                             for (local_off, out_row) in out_tile.chunks_mut(3).enumerate() {
                                 let local_idx = tile_row_start + local_off;
                                 let row = &block_slice[local_idx * n..(local_idx + 1) * n];
-                                xts.fill(0.0_f64);
                                 let mut score = 0.0_f64;
+                                let mut xts0 = 0.0_f64;
                                 let mut row_ss_fallback = 0.0_f64;
-                                if p == 1 {
-                                    for i in 0..n {
-                                        let s_i = row[i] as f64;
-                                        score += s_i * score_vec[i];
-                                        if !packed_ss_ok {
-                                            row_ss_fallback += s_i * s_i;
-                                        }
-                                        xts[0] += x_design[i] * s_i;
-                                    }
-                                } else {
-                                    for i in 0..n {
-                                        let s_i = row[i] as f64;
-                                        score += s_i * score_vec[i];
-                                        if !packed_ss_ok {
-                                            row_ss_fallback += s_i * s_i;
-                                        }
-                                        let x_row = &x_design[i * p..(i + 1) * p];
-                                        for j in 0..p {
-                                            xts[j] += x_row[j] * s_i;
-                                        }
+                                for i in 0..n {
+                                    let s_i = row[i] as f64;
+                                    score += s_i * score_vec[i];
+                                    xts0 += x0[i] * s_i;
+                                    if !packed_ss_ok {
+                                        row_ss_fallback += s_i * s_i;
                                     }
                                 }
-                                let s_m_s = residualized_sumsq_from_xtx_chol(
-                                    xtx_chol,
-                                    p,
-                                    xts,
-                                    alpha,
-                                    if packed_ss_ok {
-                                        ss_slice[local_idx]
-                                    } else {
-                                        row_ss_fallback
-                                    },
-                                );
+                                let s_sq = if packed_ss_ok {
+                                    ss_slice[local_idx]
+                                } else {
+                                    row_ss_fallback
+                                };
+                                let s_m_s = residualized_sumsq_scalar(xtx00_inv, xts0, s_sq);
                                 let score = score_scale * score;
                                 let denom_scaled = denom_scale * s_m_s;
                                 if let Some((beta, se, pwald)) =
@@ -2665,6 +2663,61 @@ fn grammar_scan_blocks_core<G: GenotypeMatrix>(
                             }
                         },
                     );
+                } else {
+                    out_slice
+                        .par_chunks_mut(row_tile * 3)
+                        .enumerate()
+                        .for_each_init(
+                            || (vec![0.0_f64; p], vec![0.0_f64; p]),
+                            |(xts, alpha), (tile_idx, out_tile)| {
+                                let tile_row_start = tile_idx * row_tile;
+                                for (local_off, out_row) in out_tile.chunks_mut(3).enumerate() {
+                                    let local_idx = tile_row_start + local_off;
+                                    let row = &block_slice[local_idx * n..(local_idx + 1) * n];
+                                    xts.fill(0.0_f64);
+                                    let mut score = 0.0_f64;
+                                    let mut row_ss_fallback = 0.0_f64;
+                                    for i in 0..n {
+                                        let s_i = row[i] as f64;
+                                        score += s_i * score_vec[i];
+                                        if !packed_ss_ok {
+                                            row_ss_fallback += s_i * s_i;
+                                        }
+                                        let x_row = &x_design[i * p..(i + 1) * p];
+                                        for j in 0..p {
+                                            xts[j] += x_row[j] * s_i;
+                                        }
+                                    }
+                                    let s_m_s = residualized_sumsq_from_xtx_chol(
+                                        xtx_chol,
+                                        p,
+                                        xts,
+                                        alpha,
+                                        if packed_ss_ok {
+                                            ss_slice[local_idx]
+                                        } else {
+                                            row_ss_fallback
+                                        },
+                                    );
+                                    let score = score_scale * score;
+                                    let denom_scaled = denom_scale * s_m_s;
+                                    if let Some((beta, se, pwald)) = splmm_wald_from_scaled_denom(
+                                        score,
+                                        denom_scaled,
+                                        wald_sigma2,
+                                    ) {
+                                        out_row[0] = beta;
+                                        out_row[1] = se;
+                                        out_row[2] = pwald;
+                                    } else {
+                                        out_row[0] = f64::NAN;
+                                        out_row[1] = f64::NAN;
+                                        out_row[2] = 1.0_f64;
+                                    }
+                                }
+                            },
+                        );
+                }
             };
             if let Some(tp) = &pool {
                 tp.install(run_assoc);
@@ -5260,6 +5313,78 @@ mod tests {
         let x_design = make_test_design();
         let py_vec = vec![0.4_f64, -1.0_f64, 0.8_f64];
         let xtx_chol = xtx_chol_from_design(&x_design, py_vec.len(), 2).unwrap();
+        let r_hat = 1.7_f64;
+
+        let wrapper = scan_with_py_and_rhat(
+            &prepared,
+            &x_design,
+            &py_vec,
+            &xtx_chol,
+            &scan_sample_idx,
+            PackedGeneticModel::Add,
+            r_hat,
+            1,
+            0,
+            None,
+            2,
+            9,
+            0,
+            0,
+        )
+        .unwrap();
+
+        let adapter = JxlmmMatrixAdapter { inner: &prepared };
+        let stats = unified_stats_from_jxlmm(&prepared);
+        let mut input = UnifiedInput {
+            matrix: adapter,
+            stats,
+        };
+        let mut core = vec![0.0_f64; prepared.n_rows() * 3];
+        let mut sink = |row_start: usize, rows_here: usize, block: &[f64]| {
+            core[row_start * 3..][..rows_here * 3].copy_from_slice(block);
+            Ok(())
+        };
+        grammar_scan_blocks_core(
+            &mut input,
+            &x_design,
+            &py_vec,
+            1.0_f64,
+            &xtx_chol,
+            &scan_sample_idx,
+            PackedGeneticModel::Add,
+            r_hat,
+            1.0_f64,
+            1,
+            0,
+            None,
+            2,
+            9,
+            0,
+            0,
+            &mut sink,
+        )
+        .unwrap();
+
+        let manual = manual_grammar_scan(
+            &prepared,
+            &x_design,
+            &py_vec,
+            &xtx_chol,
+            &scan_sample_idx,
+            PackedGeneticModel::Add,
+            r_hat,
+        );
+
+        assert_close(&core, &wrapper, 1e-8_f64);
+        assert_close(&core, &manual, 1e-5_f64);
+    }
+
+    #[test]
+    fn grammar_scan_core_p1_matches_manual_reference() {
+        let (prepared, scan_sample_idx) = make_test_scan_prepared();
+        let x_design = vec![1.0_f64, 1.0_f64, 1.0_f64];
+        let py_vec = vec![0.4_f64, -1.0_f64, 0.8_f64];
+        let xtx_chol = xtx_chol_from_design(&x_design, py_vec.len(), 1).unwrap();
         let r_hat = 1.7_f64;
 
         let wrapper = scan_with_py_and_rhat(

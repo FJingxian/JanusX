@@ -7,7 +7,6 @@ use rand::rngs::StdRng;
 use rand::seq::index::sample;
 use rand::SeedableRng;
 use rayon::prelude::*;
-use std::fmt::Write as FmtWrite;
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
@@ -69,6 +68,7 @@ struct SplmmTsvTiming {
     finish_secs: f64,
     blocks: usize,
     bytes: usize,
+    format_threads: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -266,7 +266,7 @@ fn emit_splmm_tsv_timing(mode: &str, timing: &SplmmTsvTiming, rows: usize) {
         }
     };
     eprintln!(
-        "SparseLMM TSV timing mode={mode}: format={:.3}s ({:.1}%), write={:.3}s ({:.1}%), send={:.3}s ({:.1}%), finish_wait={:.3}s ({:.1}%), worker_total={:.3}s, accounted={:.3}s, rows={}, blocks={}, bytes={}",
+        "SparseLMM TSV timing mode={mode}: format={:.3}s ({:.1}%), write={:.3}s ({:.1}%), send={:.3}s ({:.1}%), finish_wait={:.3}s ({:.1}%), worker_total={:.3}s, accounted={:.3}s, rows={}, blocks={}, bytes={}, format_threads={}",
         timing.format_secs,
         to_pct(timing.format_secs),
         timing.write_secs,
@@ -280,13 +280,31 @@ fn emit_splmm_tsv_timing(mode: &str, timing: &SplmmTsvTiming, rows: usize) {
         rows,
         timing.blocks,
         timing.bytes,
+        timing.format_threads,
     );
+}
+
+#[inline]
+fn splmm_tsv_format_threads(scan_threads: usize) -> usize {
+    if let Ok(raw) = std::env::var("JX_SPLMM_TSV_THREADS") {
+        if let Ok(val) = raw.trim().parse::<usize>() {
+            if val > 0 {
+                return val;
+            }
+        }
+    }
+    if scan_threads <= 2 {
+        1
+    } else {
+        scan_threads.min(4)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
 fn run_splmm_async_tsv_writer<R, F>(
     out_tsv: &str,
-    row_capacity_hint: usize,
+    _row_capacity_hint: usize,
+    scan_threads: usize,
     chrom: &[String],
     pos: &[i64],
     snp: &[String],
@@ -313,8 +331,8 @@ where
     let queue_depth_eff = QUEUE_DEPTH_HINT
         .max((WRITER_CAPACITY / (4 * 1024 * 1024)).max(1))
         .clamp(MIN_QUEUE_DEPTH, MAX_QUEUE_DEPTH);
-    let row_cap = row_capacity_hint.max(512).max(1);
     let rows_total = chrom.len();
+    let format_threads = splmm_tsv_format_threads(scan_threads.max(1));
 
     let (scan_out, tsv_timing) =
         std::thread::scope(|scope| -> Result<(R, SplmmTsvTiming), String> {
@@ -324,6 +342,7 @@ where
                     File::create(out_tsv).map_err(|e| format!("create {out_tsv}: {e}"))?;
                 let mut writer = BufWriter::with_capacity(WRITER_CAPACITY.max(1), out_file);
                 let mut timing = SplmmTsvTiming::default();
+                timing.format_threads = format_threads;
                 let t0 = stage_timing.then(Instant::now);
                 writer
                     .write_all(HEADER)
@@ -336,34 +355,89 @@ where
                 }
                 let flush_threshold = WRITER_CAPACITY.clamp(MIN_FLUSH_BYTES, MAX_FLUSH_BYTES);
                 let mut pending_bytes = 0usize;
-                let mut text_buf = String::with_capacity(row_cap * 112);
+                let format_pool = if format_threads > 1 {
+                    Some(
+                        rayon::ThreadPoolBuilder::new()
+                            .num_threads(format_threads)
+                            .build()
+                            .map_err(|e| format!("SparseLMM TSV format pool: {e}"))?,
+                    )
+                } else {
+                    None
+                };
                 for payload in rx {
-                    text_buf.clear();
                     let t0 = stage_timing.then(Instant::now);
-                    append_splmm_tsv_block(
-                        &mut text_buf,
-                        payload.row_start,
-                        payload.rows_here,
-                        payload.results.as_slice(),
-                        chrom,
-                        pos,
-                        snp,
-                        allele0,
-                        allele1,
-                        row_maf,
-                        row_missing,
-                        gm,
-                    );
+                    let formatted_blocks: Vec<Vec<u8>> = if payload.rows_here >= 1024
+                        && format_threads > 1
+                    {
+                        let rows_per_chunk = payload
+                            .rows_here
+                            .div_ceil(format_threads.saturating_mul(2))
+                            .clamp(256, 4096);
+                        let n_chunks = payload.rows_here.div_ceil(rows_per_chunk);
+                        format_pool
+                            .as_ref()
+                            .expect("format pool must exist when format_threads > 1")
+                            .install(|| {
+                                (0..n_chunks)
+                                    .into_par_iter()
+                                    .map(|chunk_idx| {
+                                        let local_row_start = chunk_idx * rows_per_chunk;
+                                        let rows_here = (payload.rows_here - local_row_start)
+                                            .min(rows_per_chunk);
+                                        let mut out =
+                                            Vec::<u8>::with_capacity(rows_here.saturating_mul(96));
+                                        append_splmm_tsv_block(
+                                            &mut out,
+                                            payload.row_start + local_row_start,
+                                            rows_here,
+                                            &payload.results[local_row_start * 3
+                                                ..(local_row_start + rows_here) * 3],
+                                            chrom,
+                                            pos,
+                                            snp,
+                                            allele0,
+                                            allele1,
+                                            row_maf,
+                                            row_missing,
+                                            gm,
+                                        );
+                                        out
+                                    })
+                                    .collect()
+                            })
+                    } else {
+                        let mut out =
+                            Vec::<u8>::with_capacity(payload.rows_here.saturating_mul(96));
+                        append_splmm_tsv_block(
+                            &mut out,
+                            payload.row_start,
+                            payload.rows_here,
+                            payload.results.as_slice(),
+                            chrom,
+                            pos,
+                            snp,
+                            allele0,
+                            allele1,
+                            row_maf,
+                            row_missing,
+                            gm,
+                        );
+                        vec![out]
+                    };
                     if let Some(t0) = t0 {
                         timing.format_secs += t0.elapsed().as_secs_f64();
                     }
-                    let bytes_now = text_buf.len();
-                    let t0 = stage_timing.then(Instant::now);
-                    writer
-                        .write_all(text_buf.as_bytes())
-                        .map_err(|e| format!("write {out_tsv}: {e}"))?;
-                    if let Some(t0) = t0 {
-                        timing.write_secs += t0.elapsed().as_secs_f64();
+                    let mut bytes_now = 0usize;
+                    for block in formatted_blocks {
+                        bytes_now = bytes_now.saturating_add(block.len());
+                        let t0 = stage_timing.then(Instant::now);
+                        writer
+                            .write_all(block.as_slice())
+                            .map_err(|e| format!("write {out_tsv}: {e}"))?;
+                        if let Some(t0) = t0 {
+                            timing.write_secs += t0.elapsed().as_secs_f64();
+                        }
                     }
                     pending_bytes = pending_bytes.saturating_add(bytes_now);
                     if pending_bytes >= flush_threshold {
@@ -1740,7 +1814,7 @@ fn sparse_solve_rhs_with_workspace(
 
 #[allow(clippy::too_many_arguments)]
 fn append_splmm_tsv_block(
-    text_buf: &mut String,
+    text_buf: &mut Vec<u8>,
     row_start: usize,
     rows_here: usize,
     results: &[f64],
@@ -1753,6 +1827,7 @@ fn append_splmm_tsv_block(
     row_missing: &[f32],
     gm: PackedGeneticModel,
 ) {
+    debug_assert_eq!(results.len(), rows_here.saturating_mul(3));
     for local_idx in 0..rows_here {
         let row_idx = row_start + local_idx;
         let base = local_idx * 3;
@@ -1764,11 +1839,11 @@ fn append_splmm_tsv_block(
         let _ = writeln!(
             text_buf,
             "{}\t{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{}\t{:.4e}",
-            chrom[row_idx],
+            chrom[row_idx].as_str(),
             pos[row_idx],
-            snp[row_idx],
-            a0,
-            a1,
+            snp[row_idx].as_str(),
+            a0.as_ref(),
+            a1.as_ref(),
             row_maf[row_idx],
             row_missing[row_idx],
             beta,
@@ -2876,6 +2951,7 @@ fn scan_to_tsv_with_p0y_and_gamma0(
     run_splmm_async_tsv_writer(
         out_tsv,
         block_rows,
+        threads,
         chrom,
         pos,
         snp,
@@ -2969,6 +3045,7 @@ fn scan_to_tsv_with_p0y_and_exact_p0_sparse(
     run_splmm_async_tsv_writer(
         out_tsv,
         block_rows,
+        threads,
         chrom,
         pos,
         snp,
@@ -3127,6 +3204,7 @@ fn scan_to_tsv_with_p0y_and_gamma0_collect_candidates(
     run_splmm_async_tsv_writer(
         out_tsv,
         block_rows,
+        threads,
         chrom,
         pos,
         snp,
@@ -3215,7 +3293,7 @@ fn merge_two_stage_tsv_with_exact_rows(
 
     let mut row_idx = 0usize;
     let mut candidate_ptr = 0usize;
-    let mut exact_buf = String::with_capacity(256);
+    let mut exact_buf = Vec::<u8>::with_capacity(256);
     loop {
         let n_read = reader
             .read_line(&mut line)
@@ -3242,7 +3320,7 @@ fn merge_two_stage_tsv_with_exact_rows(
                     gm,
                 );
                 writer
-                    .write_all(exact_buf.as_bytes())
+                    .write_all(exact_buf.as_slice())
                     .map_err(|e| format!("write exact merged row {row_idx} to {out_tsv}: {e}"))?;
             } else {
                 writer

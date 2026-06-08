@@ -235,6 +235,9 @@ def prepare_packed_ctx_from_plink(
                 "missing_rate": np.ascontiguousarray(
                     np.asarray(miss_raw, dtype=np.float32).reshape(-1), dtype=np.float32
                 ),
+                "af": np.ascontiguousarray(
+                    np.asarray(maf_raw, dtype=np.float32).reshape(-1), dtype=np.float32
+                ),
                 "maf": np.ascontiguousarray(
                     np.asarray(maf_raw, dtype=np.float32).reshape(-1), dtype=np.float32
                 ),
@@ -277,10 +280,15 @@ def prepare_packed_ctx_from_plink(
             miss_arr = np.ascontiguousarray(np.asarray(miss_raw, dtype=np.float32).reshape(-1))
             maf_arr = np.ascontiguousarray(np.asarray(maf_raw, dtype=np.float32).reshape(-1))
             std_arr = np.ascontiguousarray(np.asarray(std_raw, dtype=np.float32).reshape(-1))
-            row_flip_full = np.ascontiguousarray(
+            row_flip_input = np.ascontiguousarray(
                 np.asarray(row_flip_raw, dtype=np.bool_).reshape(-1),
                 dtype=np.bool_,
             )
+            af_arr = np.ascontiguousarray(
+                np.where(row_flip_input, 1.0 - maf_arr, maf_arr).astype(np.float32, copy=False),
+                dtype=np.float32,
+            )
+            row_flip_full = np.zeros_like(row_flip_input, dtype=np.bool_)
             het_arr = np.ascontiguousarray(np.asarray(het_raw, dtype=np.float32).reshape(-1))
             n_total_sites = int(maf_arr.shape[0])
 
@@ -340,7 +348,8 @@ def prepare_packed_ctx_from_plink(
                 packed_ctx = {
                     "packed": packed_memmap,
                     "missing_rate": miss_arr,
-                    "maf": maf_arr,
+                    "af": af_arr,
+                    "maf": af_arr,
                     "std_denom": std_arr,
                     "row_flip": row_flip_full,
                     "site_keep": site_keep,
@@ -365,19 +374,20 @@ def prepare_packed_ctx_from_plink(
                     dtype=np.uint8,
                 )
                 miss_keep = np.ascontiguousarray(miss_arr[keep], dtype=np.float32)
-                maf_keep = np.ascontiguousarray(maf_arr[keep], dtype=np.float32)
+                maf_keep = np.ascontiguousarray(af_arr[keep], dtype=np.float32)
                 std_keep = np.ascontiguousarray(std_arr[keep], dtype=np.float32)
                 row_flip = np.ascontiguousarray(row_flip_full[keep], dtype=np.bool_)
             else:
                 packed = np.ascontiguousarray(np.asarray(packed_memmap, dtype=np.uint8), dtype=np.uint8)
                 miss_keep = miss_arr
-                maf_keep = maf_arr
+                maf_keep = af_arr
                 std_keep = std_arr
                 row_flip = row_flip_full
 
             packed_ctx = {
                 "packed": packed,
                 "missing_rate": miss_keep,
+                "af": maf_keep,
                 "maf": maf_keep,
                 "std_denom": std_keep,
                 "row_flip": row_flip,
@@ -433,13 +443,7 @@ def prepare_packed_ctx_from_plink(
         )
     site_keep = np.ascontiguousarray(np.asarray(keep, dtype=np.bool_).reshape(-1), dtype=np.bool_)
 
-    if _jxrs is not None and hasattr(_jxrs, "bed_packed_row_flip_mask"):
-        row_flip_full = np.ascontiguousarray(
-            np.asarray(_jxrs.bed_packed_row_flip_mask(packed, int(packed_n)), dtype=np.bool_).reshape(-1),
-            dtype=np.bool_,
-        )
-    else:
-        row_flip_full = np.zeros((int(packed.shape[0]),), dtype=np.bool_)
+    row_flip_full = np.zeros((int(packed.shape[0]),), dtype=np.bool_)
 
     keep_idx = np.ascontiguousarray(
         np.flatnonzero(site_keep).astype(np.int64, copy=False),
@@ -466,6 +470,7 @@ def prepare_packed_ctx_from_plink(
         packed_ctx = {
             "packed": packed,
             "missing_rate": miss_arr,
+            "af": maf_arr,
             "maf": maf_arr,
             "std_denom": std_arr,
             "row_flip": row_flip_full,
@@ -492,6 +497,7 @@ def prepare_packed_ctx_from_plink(
     packed_ctx = {
         "packed": packed,
         "missing_rate": miss_arr,
+        "af": maf_arr,
         "maf": maf_arr,
         "std_denom": std_arr,
         "row_flip": row_flip,

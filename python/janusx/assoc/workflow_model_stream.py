@@ -845,7 +845,7 @@ def run_chunked_gwas_lmm_lm(
                 mode = "a" if self._wrote_header else "w"
                 with open(self.path, mode, encoding="utf-8", newline="") as fh:
                     if not self._wrote_header:
-                        header = "chrom\tpos\tsnp\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald"
+                        header = "chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald"
                         if bool(self._has_plrt):
                             header += "\tplrt"
                         fh.write(header + "\n")
@@ -1476,7 +1476,7 @@ def run_chunked_gwas_streaming_shared(
             mode = "a" if self._wrote_header else "w"
             with open(self.path, mode, encoding="utf-8", newline="") as fh:
                 if not self._wrote_header:
-                    header = "chrom\tpos\tsnp\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald"
+                    header = "chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald"
                     if bool(self._has_plrt):
                         header += "\tplrt"
                     fh.write(header + "\n")

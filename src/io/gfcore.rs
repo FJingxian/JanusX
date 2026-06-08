@@ -110,7 +110,6 @@ pub fn open_text_maybe_gz(path: &Path) -> Result<Box<dyn BufRead + Send + Sync>,
 #[derive(Clone, Copy, Debug)]
 pub struct ProcessedSnpRowStats {
     pub missing_count: u32,
-    pub maf: f32,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -135,7 +134,7 @@ pub(crate) fn scan_snp_row_counts(row: &[f32], apply_het_filter: bool) -> Decode
     counts
 }
 
-pub(crate) fn process_snp_row_with_precomputed_counts(
+fn process_snp_row_with_precomputed_counts_impl(
     row: &mut [f32],
     ref_allele: &mut String,
     alt_allele: &mut String,
@@ -145,9 +144,11 @@ pub(crate) fn process_snp_row_with_precomputed_counts(
     fill_missing: bool,
     apply_het_filter: bool,
     het_threshold: f32,
+    preserve_alt_orientation: bool,
 ) -> Option<ProcessedSnpRowStats> {
     let non_missing = counts.non_missing;
-    let mut alt_sum = counts.alt_sum;
+    let raw_alt_sum = counts.alt_sum;
+    let mut alt_sum = raw_alt_sum;
     let het_count = counts.het_count;
     let n_samples = row.len() as f64;
     if n_samples == 0.0 {
@@ -169,7 +170,6 @@ pub(crate) fn process_snp_row_with_precomputed_counts(
         }
         return Some(ProcessedSnpRowStats {
             missing_count,
-            maf: 0.0,
         });
     }
 
@@ -181,16 +181,15 @@ pub(crate) fn process_snp_row_with_precomputed_counts(
         }
     }
 
-    let mut alt_freq = alt_sum / (2.0 * non_missing as f64);
-    if alt_freq > 0.5 {
+    let alt_freq = raw_alt_sum / (2.0 * non_missing as f64);
+    if !preserve_alt_orientation && alt_freq > 0.5 {
         for g in row.iter_mut() {
             if *g >= 0.0 {
                 *g = 2.0 - *g;
             }
         }
         std::mem::swap(ref_allele, alt_allele);
-        alt_sum = 2.0 * non_missing as f64 - alt_sum;
-        alt_freq = alt_sum / (2.0 * non_missing as f64);
+        alt_sum = 2.0 * non_missing as f64 - raw_alt_sum;
     }
 
     let maf = alt_freq.min(1.0 - alt_freq) as f32;
@@ -208,7 +207,57 @@ pub(crate) fn process_snp_row_with_precomputed_counts(
         }
     }
 
-    Some(ProcessedSnpRowStats { missing_count, maf })
+    Some(ProcessedSnpRowStats { missing_count })
+}
+
+pub(crate) fn process_snp_row_with_precomputed_counts(
+    row: &mut [f32],
+    ref_allele: &mut String,
+    alt_allele: &mut String,
+    counts: DecodedSnpRowCounts,
+    maf_threshold: f32,
+    max_missing_rate: f32,
+    fill_missing: bool,
+    apply_het_filter: bool,
+    het_threshold: f32,
+) -> Option<ProcessedSnpRowStats> {
+    process_snp_row_with_precomputed_counts_impl(
+        row,
+        ref_allele,
+        alt_allele,
+        counts,
+        maf_threshold,
+        max_missing_rate,
+        fill_missing,
+        apply_het_filter,
+        het_threshold,
+        false,
+    )
+}
+
+pub(crate) fn process_snp_row_with_precomputed_counts_preserve_alt(
+    row: &mut [f32],
+    ref_allele: &mut String,
+    alt_allele: &mut String,
+    counts: DecodedSnpRowCounts,
+    maf_threshold: f32,
+    max_missing_rate: f32,
+    fill_missing: bool,
+    apply_het_filter: bool,
+    het_threshold: f32,
+) -> Option<ProcessedSnpRowStats> {
+    process_snp_row_with_precomputed_counts_impl(
+        row,
+        ref_allele,
+        alt_allele,
+        counts,
+        maf_threshold,
+        max_missing_rate,
+        fill_missing,
+        apply_het_filter,
+        het_threshold,
+        true,
+    )
 }
 
 pub fn process_snp_row_with_stats(
@@ -223,6 +272,30 @@ pub fn process_snp_row_with_stats(
 ) -> Option<ProcessedSnpRowStats> {
     let counts = scan_snp_row_counts(row, apply_het_filter);
     process_snp_row_with_precomputed_counts(
+        row,
+        ref_allele,
+        alt_allele,
+        counts,
+        maf_threshold,
+        max_missing_rate,
+        fill_missing,
+        apply_het_filter,
+        het_threshold,
+    )
+}
+
+pub fn process_snp_row_with_stats_preserve_alt(
+    row: &mut [f32],
+    ref_allele: &mut String,
+    alt_allele: &mut String,
+    maf_threshold: f32,
+    max_missing_rate: f32,
+    fill_missing: bool,
+    apply_het_filter: bool,
+    het_threshold: f32,
+) -> Option<ProcessedSnpRowStats> {
+    let counts = scan_snp_row_counts(row, apply_het_filter);
+    process_snp_row_with_precomputed_counts_preserve_alt(
         row,
         ref_allele,
         alt_allele,
@@ -257,6 +330,7 @@ pub fn process_snp_row(
     )
     .is_some()
 }
+
 
 fn parse_delimiter_char(delimiter: Option<&str>) -> Result<Option<char>, String> {
     match delimiter {

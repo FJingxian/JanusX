@@ -695,7 +695,7 @@ pub fn lm_stream_bed_to_tsv(
     py.detach(move || -> PyResult<(usize, usize)> {
         let writer = AsyncTsvWriter::with_config(
             &out_tsv_path,
-            b"chrom\tpos\tsnp\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n",
+            b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n",
             64 * 1024 * 1024,
             4,
         )
@@ -738,7 +738,7 @@ pub fn lm_stream_bed_to_tsv(
                             pre_counts: Option<gfcore::DecodedSnpRowCounts>|
          -> Option<(f32, f32)> {
             let stats = if let Some(counts) = pre_counts {
-                gfcore::process_snp_row_with_precomputed_counts(
+                gfcore::process_snp_row_with_precomputed_counts_preserve_alt(
                     row_sub,
                     &mut site.ref_allele,
                     &mut site.alt_allele,
@@ -750,7 +750,7 @@ pub fn lm_stream_bed_to_tsv(
                     het_threshold,
                 )
             } else {
-                gfcore::process_snp_row_with_stats(
+                gfcore::process_snp_row_with_stats_preserve_alt(
                     row_sub,
                     &mut site.ref_allele,
                     &mut site.alt_allele,
@@ -778,7 +778,7 @@ pub fn lm_stream_bed_to_tsv(
                 *v -= mean_model;
             }
             let maf_val = if model.as_str() == "add" {
-                stats.maf
+                ((maf_sum / n as f64) * 0.5_f64) as f32
             } else {
                 (maf_sum / n as f64) as f32
             };
@@ -2494,7 +2494,7 @@ pub fn lm_block_assoc_packed_to_tsv<'py>(
         let row_missing = row_missing_owned;
         let writer = AsyncTsvWriter::with_config(
             &out_path,
-            b"chrom\tpos\tsnp\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n",
+            b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n",
             64 * 1024 * 1024,
             4,
         )
@@ -2924,7 +2924,7 @@ pub fn glmf32_packed_assoc_to_tsv(
     py.detach(move || -> PyResult<usize> {
         let writer = AsyncTsvWriter::with_config(
             &out_path,
-            b"chrom\tpos\tsnp\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n",
+            b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n",
             64 * 1024 * 1024,
             4,
         )
@@ -3508,7 +3508,7 @@ pub(crate) fn lm_unified_scan_to_tsv<G: GenotypeMatrix>(
     let mut text = String::with_capacity(blk * 112);
     let writer = AsyncTsvWriter::with_config(
         out_tsv,
-        b"chrom\tpos\tsnp\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n",
+        b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n",
         64 * 1024 * 1024,
         4,
     )

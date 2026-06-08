@@ -1450,7 +1450,7 @@ fn spgrm_row_mean_and_inv_sd(row_maf: &[f32], method: usize) -> (Vec<f32>, Vec<f
         row_maf
             .iter()
             .map(|&maf| {
-                let p = maf.clamp(0.0_f32, 0.5_f32);
+                let p = maf.clamp(0.0_f32, 1.0_f32);
                 let var = 2.0_f32 * p * (1.0_f32 - p);
                 if var > 1e-12_f32 {
                     1.0_f32 / var.sqrt()

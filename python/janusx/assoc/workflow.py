@@ -4566,7 +4566,7 @@ def run_lrlmm_packed(
                 "snp": snp,
                 "allele0": a0,
                 "allele1": a1,
-                "maf": np.asarray(maf_trait, dtype=np.float32),
+                "af": np.asarray(maf_trait, dtype=np.float32),
                 "beta": np.asarray(res[:, 0], dtype=np.float64),
                 "se": np.asarray(res[:, 1], dtype=np.float64),
                 "pwald": np.asarray(res[:, 2], dtype=np.float64),
@@ -4746,6 +4746,20 @@ def _run_file_dense_fast_once(
         ref_alt_obj: object,
         n_markers: int,
     ) -> tuple[np.ndarray, np.ndarray, list[str], list[str], list[str]]:
+        try:
+            sites_bim = _read_bim_sites(str(prefix))
+            if len(sites_bim) == int(n_markers):
+                chrom_bim, pos_bim, allele0_bim, allele1_bim, snp_bim = _split_gwas_sites(sites_bim)
+                return (
+                    np.asarray(chrom_bim, dtype=object),
+                    np.asarray(pos_bim, dtype=np.int64),
+                    snp_bim,
+                    allele0_bim,
+                    allele1_bim,
+                )
+        except Exception:
+            pass
+
         if isinstance(ref_alt_obj, pd.DataFrame):
             ref_alt_df = ref_alt_obj.reset_index(drop=True)
             cols_need = {"chrom", "pos", "snp", "allele0", "allele1"}
@@ -5048,7 +5062,7 @@ def _run_file_dense_fast_once(
         )
         p = np.asarray(np.mean(geno_add_use, axis=1, dtype=np.float64) / 2.0, dtype=np.float64)
         p = np.clip(p, 0.0, 1.0)
-        maf = np.ascontiguousarray(np.minimum(p, 1.0 - p), dtype=np.float32)
+        af = np.ascontiguousarray(p, dtype=np.float32)
 
         chrom_keep = np.asarray(chrom_all[keep_site], dtype=object)
         pos_keep = np.asarray(pos_all[keep_site], dtype=np.int64)
@@ -5193,7 +5207,7 @@ def _run_file_dense_fast_once(
                     "snp": snp_keep,
                     "allele0": allele0_use,
                     "allele1": allele1_use,
-                    "maf": np.asarray(maf, dtype=np.float32),
+                    "af": np.asarray(af, dtype=np.float32),
                     "beta": np.asarray(res[:, 0], dtype=np.float64),
                     "se": np.asarray(res[:, 1], dtype=np.float64),
                     "pwald": np.asarray(res[:, 2], dtype=np.float64),

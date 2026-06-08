@@ -1720,7 +1720,7 @@ pub fn farmcpu_packed_to_tsv(
         let out_path = out_tsv.to_string();
         let writer = AsyncTsvWriter::with_config(
             &out_path,
-            b"chrom\tpos\tsnp\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n",
+            b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n",
             64 * 1024 * 1024,
             4,
         )
@@ -1734,7 +1734,7 @@ pub fn farmcpu_packed_to_tsv(
                 qtn_writer_opt = Some(
                     AsyncTsvWriter::with_config(
                         &qtn_path_for_err,
-                        b"chrom\tpos\tsnp\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n",
+                        b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n",
                         16 * 1024 * 1024,
                         4,
                     )
@@ -1856,7 +1856,7 @@ pub fn farmcpu_write_assoc_tsv(
 
     let writer = AsyncTsvWriter::with_config(
         out_tsv,
-        b"chrom\tpos\tsnp\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n",
+        b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n",
         4 * 1024 * 1024,
         4,
     )
@@ -1934,7 +1934,7 @@ pub fn farmcpu_write_assoc_tsv(
         if !uniq.is_empty() {
             let q_writer = AsyncTsvWriter::with_config(
                 pseudo_path,
-                b"chrom\tpos\tsnp\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n",
+                b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n",
                 512 * 1024,
                 4,
             )

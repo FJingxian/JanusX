@@ -576,7 +576,7 @@ def _jxlmm_bed_logic_meta_selected(
         raise RuntimeError(
             "Rust extension missing prepare_bed_logic_meta_selected required by SparseLMM memmap path."
         )
-    row_idx, miss, maf, row_flip, site_keep, n_samples_full, n_snps_total = jxrs.prepare_bed_logic_meta_selected(
+    row_idx, miss, af, row_flip, site_keep, n_samples_full, n_snps_total = jxrs.prepare_bed_logic_meta_selected(
         str(prefix),
         sample_indices=np.ascontiguousarray(np.asarray(sample_indices, dtype=np.int64), dtype=np.int64),
         maf_threshold=float(maf_threshold),
@@ -587,7 +587,8 @@ def _jxlmm_bed_logic_meta_selected(
     return {
         "row_indices": np.ascontiguousarray(np.asarray(row_idx, dtype=np.int64), dtype=np.int64),
         "missing_rate": np.ascontiguousarray(np.asarray(miss, dtype=np.float32), dtype=np.float32),
-        "maf": np.ascontiguousarray(np.asarray(maf, dtype=np.float32), dtype=np.float32),
+        "af": np.ascontiguousarray(np.asarray(af, dtype=np.float32), dtype=np.float32),
+        "maf": np.ascontiguousarray(np.asarray(af, dtype=np.float32), dtype=np.float32),
         "row_flip": np.ascontiguousarray(np.asarray(row_flip, dtype=np.bool_), dtype=np.bool_),
         "site_keep": np.ascontiguousarray(np.asarray(site_keep, dtype=np.bool_), dtype=np.bool_),
         "n_samples_full": int(n_samples_full),
@@ -635,20 +636,16 @@ def _packed_ctx_active_view_for_gwas(
     )
     if int(miss_full.shape[0]) != int(packed.shape[0]):
         raise ValueError("Packed GWAS context mismatch: missing_rate length != packed rows.")
-    maf_full = np.ascontiguousarray(
-        np.asarray(packed_ctx["maf"], dtype=np.float32).reshape(-1),
+    af_full = np.ascontiguousarray(
+        np.asarray(packed_ctx.get("af", packed_ctx["maf"]), dtype=np.float32).reshape(-1),
         dtype=np.float32,
     )
-    if int(maf_full.shape[0]) != int(packed.shape[0]):
-        raise ValueError("Packed GWAS context mismatch: maf length != packed rows.")
+    if int(af_full.shape[0]) != int(packed.shape[0]):
+        raise ValueError("Packed GWAS context mismatch: af length != packed rows.")
     row_flip_raw = packed_ctx.get("row_flip", None)
     if row_flip_raw is None:
-        if not hasattr(jxrs, "bed_packed_row_flip_mask"):
-            raise RuntimeError(
-                "Rust packed row-flip kernel is unavailable. Rebuild/install JanusX extension."
-            )
         row_flip_full = np.ascontiguousarray(
-            np.asarray(jxrs.bed_packed_row_flip_mask(packed, int(packed_n)), dtype=np.bool_).reshape(-1),
+            np.zeros((int(packed.shape[0]),), dtype=np.bool_),
             dtype=np.bool_,
         )
         packed_ctx["row_flip"] = row_flip_full
@@ -680,7 +677,7 @@ def _packed_ctx_active_view_for_gwas(
         )
         if int(site_keep.shape[0]) < int(active_row_idx.shape[0]):
             raise ValueError("Packed GWAS context mismatch: active_row_idx exceeds site_keep length.")
-    maf_active = np.ascontiguousarray(maf_full[active_row_idx], dtype=np.float32)
+    maf_active = np.ascontiguousarray(af_full[active_row_idx], dtype=np.float32)
     miss_active = np.ascontiguousarray(miss_full[active_row_idx], dtype=np.float32)
     row_flip_active = np.ascontiguousarray(row_flip_full[active_row_idx], dtype=np.bool_)
     return packed, packed_n, active_row_idx, maf_active, miss_active, row_flip_active
@@ -729,8 +726,12 @@ def _prepare_packed_bed_once_for_gwas(
                 np.asarray(packed_ctx_obj["missing_rate"], dtype=np.float32).reshape(-1),
                 dtype=np.float32,
             ),
+            "af": np.ascontiguousarray(
+                np.asarray(packed_ctx_obj.get("af", packed_ctx_obj["maf"]), dtype=np.float32).reshape(-1),
+                dtype=np.float32,
+            ),
             "maf": np.ascontiguousarray(
-                np.asarray(packed_ctx_obj["maf"], dtype=np.float32).reshape(-1),
+                np.asarray(packed_ctx_obj.get("af", packed_ctx_obj["maf"]), dtype=np.float32).reshape(-1),
                 dtype=np.float32,
             ),
             "row_flip": np.ascontiguousarray(
@@ -784,8 +785,12 @@ def _prepare_packed_bed_once_for_gwas(
                 np.asarray(packed_ctx["missing_rate"], dtype=np.float32).reshape(-1),
                 dtype=np.float32,
             ),
+            "af": np.ascontiguousarray(
+                np.asarray(packed_ctx.get("af", packed_ctx["maf"]), dtype=np.float32).reshape(-1),
+                dtype=np.float32,
+            ),
             "maf": np.ascontiguousarray(
-                np.asarray(packed_ctx["maf"], dtype=np.float32).reshape(-1),
+                np.asarray(packed_ctx.get("af", packed_ctx["maf"]), dtype=np.float32).reshape(-1),
                 dtype=np.float32,
             ),
             "row_flip": np.ascontiguousarray(
@@ -1342,7 +1347,7 @@ def _write_jxlmm_assoc_tsv(
     res_arr = np.ascontiguousarray(np.asarray(results, dtype=np.float64), dtype=np.float64)
     if maf_arr.shape[0] != n_rows or miss_arr.shape[0] != n_rows:
         raise ValueError(
-            f"SparseLMM TSV writer metadata mismatch: sites={n_rows}, maf={maf_arr.shape[0]}, miss={miss_arr.shape[0]}"
+            f"SparseLMM TSV writer metadata mismatch: sites={n_rows}, af={maf_arr.shape[0]}, miss={miss_arr.shape[0]}"
         )
     if res_arr.shape != (n_rows, 3):
         raise ValueError(
@@ -1362,7 +1367,7 @@ def _write_jxlmm_assoc_tsv(
     step = int(max(1, chunk_rows))
     written = 0
     with open(out_tsv, "w", encoding="utf-8", newline="") as fh:
-        fh.write("chrom\tpos\tsnp\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\n")
+        fh.write("chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\n")
         for start in range(0, n_rows, step):
             end = min(start + step, n_rows)
             chunk_text: list[str] = []
@@ -3724,15 +3729,16 @@ def run_algwas_packed_fullrank(
     packed_mode = str(packed_ctx.get("packed_filter_mode", "compact")).strip().lower()
     packed_raw = np.ascontiguousarray(np.asarray(packed_ctx["packed"], dtype=np.uint8))
     packed_n = int(packed_ctx["n_samples"])
-    maf_raw = np.ascontiguousarray(np.asarray(packed_ctx["maf"], dtype=np.float32).reshape(-1), dtype=np.float32)
+    maf_raw = np.ascontiguousarray(
+        np.asarray(packed_ctx.get("af", packed_ctx["maf"]), dtype=np.float32).reshape(-1),
+        dtype=np.float32,
+    )
     miss_raw = np.ascontiguousarray(np.asarray(packed_ctx["missing_rate"], dtype=np.float32).reshape(-1), dtype=np.float32)
     row_flip_raw = np.ascontiguousarray(
         np.asarray(
             packed_ctx.get(
                 "row_flip",
-                jxrs.bed_packed_row_flip_mask(packed_raw, int(packed_n))
-                if hasattr(jxrs, "bed_packed_row_flip_mask")
-                else np.zeros((int(packed_raw.shape[0]),), dtype=np.bool_),
+                np.zeros((int(packed_raw.shape[0]),), dtype=np.bool_),
             ),
             dtype=np.bool_,
         ).reshape(-1),

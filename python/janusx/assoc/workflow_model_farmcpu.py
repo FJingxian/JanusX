@@ -92,14 +92,14 @@ def _normalize_packed_ctx_for_farmcpu_cache(
         )
 
     miss_raw = _raw_vec("missing_rate", np.float32)
-    maf_raw = _raw_vec("maf", np.float32)
+    maf_raw = np.ascontiguousarray(
+        np.asarray(packed_obj.get("af", packed_obj["maf"]), dtype=np.float32).reshape(-1),
+        dtype=np.float32,
+    )
 
     row_flip_obj = packed_obj.get("row_flip")
     if row_flip_obj is None:
-        if hasattr(jxrs, "bed_packed_row_flip_mask"):
-            row_flip_obj = jxrs.bed_packed_row_flip_mask(packed_num, packed_n)
-        else:
-            row_flip_obj = np.zeros(packed_rows, dtype=np.bool_)
+        row_flip_obj = np.zeros(packed_rows, dtype=np.bool_)
     row_flip_raw = np.ascontiguousarray(
         np.asarray(row_flip_obj, dtype=np.bool_).reshape(-1),
         dtype=np.bool_,
@@ -256,7 +256,7 @@ def build_qmatrix_farmcpu(
             dtype=np.uint8,
         )
         maf = np.ascontiguousarray(
-            np.asarray(packed_ctx_obj["maf"], dtype=np.float32).reshape(-1),
+            np.asarray(packed_ctx_obj.get("af", packed_ctx_obj["maf"]), dtype=np.float32).reshape(-1),
             dtype=np.float32,
         )
         packed_n = int(packed_ctx_obj["n_samples"])
@@ -267,10 +267,7 @@ def build_qmatrix_farmcpu(
 
         row_flip_obj = packed_ctx_obj.get("row_flip", None)
         if row_flip_obj is None:
-            if hasattr(jxrs, "bed_packed_row_flip_mask"):
-                row_flip_obj = jxrs.bed_packed_row_flip_mask(packed, int(packed_n))
-            else:
-                row_flip_obj = np.zeros((int(packed.shape[0]),), dtype=np.bool_)
+            row_flip_obj = np.zeros((int(packed.shape[0]),), dtype=np.bool_)
         row_flip = np.ascontiguousarray(
             np.asarray(row_flip_obj, dtype=np.bool_).reshape(-1),
             dtype=np.bool_,
@@ -868,7 +865,7 @@ def run_farmcpu_fullmem(
                 dtype=np.float32,
             )
             maf_num = np.ascontiguousarray(
-                np.asarray(packed_ctx_raw["maf"], dtype=np.float32).reshape(-1),
+                np.asarray(packed_ctx_raw.get("af", packed_ctx_raw["maf"]), dtype=np.float32).reshape(-1),
                 dtype=np.float32,
             )
             active_row_idx = np.ascontiguousarray(
@@ -881,13 +878,7 @@ def run_farmcpu_fullmem(
 
             row_flip_raw = packed_ctx_raw.get("row_flip")
             if row_flip_raw is None:
-                if hasattr(jxrs, "bed_packed_row_flip_mask"):
-                    row_flip_raw = jxrs.bed_packed_row_flip_mask(
-                        packed_num,
-                        int(packed_ctx_raw["n_samples"]),
-                    )
-                else:
-                    row_flip_raw = np.zeros(int(packed_num.shape[0]), dtype=np.bool_)
+                row_flip_raw = np.zeros(int(packed_num.shape[0]), dtype=np.bool_)
             row_flip_full = np.ascontiguousarray(
                 np.asarray(row_flip_raw, dtype=np.bool_).reshape(-1),
                 dtype=np.bool_,
@@ -902,6 +893,7 @@ def run_farmcpu_fullmem(
             packed_ctx = {
                 "packed": packed,
                 "missing_rate": miss_arr,
+                "af": maf_arr,
                 "maf": maf_arr,
                 "row_flip": row_flip_arr,
                 "row_indices": active_row_idx,

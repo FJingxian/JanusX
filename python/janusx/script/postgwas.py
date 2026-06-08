@@ -86,7 +86,7 @@ from joblib import Parallel, delayed
 import warnings
 from ._common.cjk import contains_cjk as _contains_cjk, ensure_cjk_font as _ensure_cjk_font
 
-_LEAD_SNP_INFO_COLS = ["allele0", "allele1", "maf", "beta", "se"]
+_LEAD_SNP_INFO_COLS = ["allele0", "allele1", "af", "maf", "beta", "se"]
 _QQ_FIXED_RATIO = 5.0 / 4.0
 _QQ_FAST_MAX_POINTS = 120_000
 _CONFIG_LINE_MAX_CHARS = 60

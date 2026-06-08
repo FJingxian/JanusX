@@ -5652,7 +5652,7 @@ fn write_stage2_tsv(
     };
     let writer = AsyncTsvWriter::with_config(
         out_tsv,
-        b"chrom\tpos\tsnp\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n",
+        b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n",
         64 * 1024 * 1024,
         4,
     )?;
@@ -5661,7 +5661,7 @@ fn write_stage2_tsv(
         if k > 0 {
             Some(AsyncTsvWriter::with_config(
                 path,
-                b"chrom\tpos\tsnp\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n",
+                b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n",
                 16 * 1024 * 1024,
                 4,
             )?)

@@ -186,9 +186,9 @@ impl GwasAssocTsvWriter {
             None => {
                 self.with_plrt = Some(has_plrt);
                 let header: &[u8] = if has_plrt {
-                    b"chrom\tpos\tsnp\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n"
+                    b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n"
                 } else {
-                    b"chrom\tpos\tsnp\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\n"
+                    b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\n"
                 };
                 self.writer = Some(
                     AsyncTsvWriter::with_config(&self.path, header, 64 * 1024 * 1024, 16)
@@ -269,9 +269,9 @@ impl GwasAssocTsvWriter {
             None => {
                 self.with_plrt = Some(has_plrt);
                 let header: &[u8] = if has_plrt {
-                    b"chrom\tpos\tsnp\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n"
+                    b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n"
                 } else {
-                    b"chrom\tpos\tsnp\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\n"
+                    b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\n"
                 };
                 self.writer = Some(
                     AsyncTsvWriter::with_config(&self.path, header, 64 * 1024 * 1024, 16)
@@ -1559,6 +1559,7 @@ pub(crate) fn evaluate_packed_row_keep_and_flip(
     (true, flip)
 }
 
+#[allow(dead_code)]
 #[inline]
 fn evaluate_packed_row_keep_and_flip_pure_line(
     n_samples: usize,
@@ -3136,9 +3137,9 @@ impl BedChunkReader {
     /// Return chunk with model-coding + row-centering prepared in Rust.
     ///
     /// Output tuple:
-    ///   (geno_centered, sites, maf, miss)
-    /// where `maf` is:
-    ///   - additive: mean(additive dosage)/2
+    ///   (geno_centered, sites, af, miss)
+    /// where `af` is:
+    ///   - additive: mean(additive dosage)/2 with ALT kept as dosage 1
     ///   - dom/rec/het: mean(coded value)
     /// and `miss` is the per-site missing genotype count on the selected samples.
     #[pyo3(signature = (chunk_size, coding=None, snps_only=false))]
@@ -3189,7 +3190,7 @@ impl BedChunkReader {
 
         let mut out: Vec<f32> = Vec::with_capacity(chunk_size * n);
         let mut sites: Vec<SiteInfo> = Vec::with_capacity(chunk_size);
-        let mut maf: Vec<f32> = Vec::with_capacity(chunk_size);
+        let mut af: Vec<f32> = Vec::with_capacity(chunk_size);
         let mut miss: Vec<f32> = Vec::with_capacity(chunk_size);
         let mut m = 0usize;
         let maf_thr = self.maf;
@@ -3199,7 +3200,7 @@ impl BedChunkReader {
         let het_thr = self.het_threshold;
 
         let prepare_one = |mut row_sub: Vec<f32>, mut site: core::SiteInfo| {
-            let stats = core::process_snp_row_with_stats(
+            let stats = core::process_snp_row_with_stats_preserve_alt(
                 &mut row_sub,
                 &mut site.ref_allele,
                 &mut site.alt_allele,
@@ -3225,13 +3226,17 @@ impl BedChunkReader {
                 *v = mv;
                 sum += mv as f64;
             }
-            let mean = (sum / n as f64) as f32;
+            let coded_mean = (sum / n as f64) as f32;
+            let mean = coded_mean;
             for v in row_sub.iter_mut() {
                 *v -= mean;
             }
-            let coded_mean = (sum / n as f64) as f32;
-            let maf_v = if additive_mode { stats.maf } else { coded_mean };
-            Some((row_sub, site.into(), maf_v, stats.missing_count as f32))
+            let af_v = if additive_mode {
+                coded_mean * 0.5_f32
+            } else {
+                coded_mean
+            };
+            Some((row_sub, site.into(), af_v, stats.missing_count as f32))
         };
 
         if let Some(ref snp_indices) = self.snp_indices {
@@ -3276,10 +3281,10 @@ impl BedChunkReader {
                 };
 
                 for item in decoded.into_iter().flatten() {
-                    let (row_sub, site, maf_v, miss_v) = item;
+                    let (row_sub, site, af_v, miss_v) = item;
                     out.extend_from_slice(&row_sub);
                     sites.push(site);
-                    maf.push(maf_v);
+                    af.push(af_v);
                     miss.push(miss_v);
                     m += 1;
                 }
@@ -3304,10 +3309,10 @@ impl BedChunkReader {
                     })
                     .collect();
                 for item in decoded.into_iter().flatten() {
-                    let (row_sub, site, maf_v, miss_v) = item;
+                    let (row_sub, site, af_v, miss_v) = item;
                     out.extend_from_slice(&row_sub);
                     sites.push(site);
-                    maf.push(maf_v);
+                    af.push(af_v);
                     miss.push(miss_v);
                     m += 1;
                 }
@@ -3343,10 +3348,10 @@ impl BedChunkReader {
                         .collect()
                 };
                 for item in decoded.into_iter().flatten() {
-                    let (row_sub, site, maf_v, miss_v) = item;
+                    let (row_sub, site, af_v, miss_v) = item;
                     out.extend_from_slice(&row_sub);
                     sites.push(site);
-                    maf.push(maf_v);
+                    af.push(af_v);
                     miss.push(miss_v);
                     m += 1;
                 }
@@ -3359,10 +3364,10 @@ impl BedChunkReader {
                     self.it.next_snp_selected_raw(&self.sample_indices)
                 };
                 if let Some((row_sub, site)) = maybe {
-                    if let Some((row_sub2, site2, maf_v, miss_v)) = prepare_one(row_sub, site) {
+                    if let Some((row_sub2, site2, af_v, miss_v)) = prepare_one(row_sub, site) {
                         out.extend_from_slice(&row_sub2);
                         sites.push(site2);
-                        maf.push(maf_v);
+                        af.push(af_v);
                         miss.push(miss_v);
                         m += 1;
                     }
@@ -3381,7 +3386,7 @@ impl BedChunkReader {
         #[allow(deprecated)]
         let py_mat = PyArray2::from_owned_array(py, mat).into_bound();
         #[allow(deprecated)]
-        let maf_arr = PyArray1::from_owned_array(py, Array1::from_vec(maf)).into_bound();
+        let maf_arr = PyArray1::from_owned_array(py, Array1::from_vec(af)).into_bound();
         #[allow(deprecated)]
         let miss_arr = PyArray1::from_owned_array(py, Array1::from_vec(miss)).into_bound();
         Ok(Some((py_mat, sites, maf_arr, miss_arr)))
@@ -4210,7 +4215,7 @@ pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples(
     );
 
     let apply_het_filter = het_threshold > 0.0_f32;
-    let keep_flip_stats: Vec<(bool, bool, f32, f32)> = packed_full
+    let keep_flip_stats: Vec<(bool, f32, f32)> = packed_full
         .par_chunks(bytes_per_snp)
         .enumerate()
         .map(|(i, row)| {
@@ -4222,18 +4227,24 @@ pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples(
             let non_missing = stats_n_samples.saturating_sub(missing);
             let alt_sum = het.saturating_add(hom_alt.saturating_mul(2));
             let het_count = if apply_het_filter { het } else { 0usize };
-            let (missing_rate, maf, _std) =
+            let (missing_rate, _maf, _std) =
                 packed_row_stats_from_counts(stats_n_samples, non_missing, alt_sum);
-            let (pass_num, flip) = evaluate_packed_row_keep_and_flip(
-                stats_n_samples,
-                non_missing,
-                alt_sum,
-                het_count,
-                maf_threshold,
-                max_missing_rate,
-                apply_het_filter,
-                het_threshold,
-            );
+            let alt_freq = if non_missing > 0 {
+                (alt_sum as f32) / (2.0_f32 * non_missing as f32)
+            } else {
+                0.0_f32
+            };
+            let pass_num = if missing_rate > max_missing_rate {
+                false
+            } else if non_missing == 0 {
+                maf_threshold <= 0.0_f32
+            } else if apply_het_filter
+                && ((het_count as f64) / (non_missing as f64)) > (het_threshold as f64)
+            {
+                false
+            } else {
+                alt_freq.min(1.0_f32 - alt_freq) >= maf_threshold
+            };
             let pass_snp = if snps_only {
                 is_simple_snp_allele(&sites_all[i].ref_allele)
                     && is_simple_snp_allele(&sites_all[i].alt_allele)
@@ -4241,12 +4252,12 @@ pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples(
                 true
             };
             let keep = pass_num && pass_snp;
-            (keep, keep && flip, missing_rate, maf)
+            (keep, missing_rate, alt_freq)
         })
         .collect();
     let site_keep: Vec<bool> = keep_flip_stats
         .iter()
-        .map(|(keep, _, _, _)| *keep)
+        .map(|(keep, _, _)| *keep)
         .collect();
     if site_keep.len() != n_snps {
         return Err(format!(
@@ -4279,19 +4290,16 @@ pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples(
     let mut row_source_indices = Vec::<usize>::with_capacity(kept_n);
     let mut missing_rate_keep = Vec::<f32>::with_capacity(kept_n);
     let mut maf_keep = Vec::<f32>::with_capacity(kept_n);
-    for (i, mut site) in sites_all.into_iter().enumerate() {
+    for (i, site) in sites_all.into_iter().enumerate() {
         if site_keep[i] {
-            let (_keep, flip, missing_rate, maf) = keep_flip_stats[i];
-            if flip {
-                std::mem::swap(&mut site.ref_allele, &mut site.alt_allele);
-            }
+            let (_keep, missing_rate, alt_freq) = keep_flip_stats[i];
             if !stats_only {
                 sites_keep.push(site);
             }
-            row_flip_keep.push(flip);
+            row_flip_keep.push(false);
             row_source_indices.push(i);
             missing_rate_keep.push(missing_rate);
-            maf_keep.push(maf);
+            maf_keep.push(alt_freq);
         }
     }
 
@@ -4402,7 +4410,7 @@ pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples_pure_line(
     }
 
     let packed_full = &mmap[3..];
-    let keep_flip_stats: Vec<(bool, bool, f32, f32)> = packed_full
+    let keep_flip_stats: Vec<(bool, f32, f32)> = packed_full
         .par_chunks(bytes_per_snp)
         .enumerate()
         .map(|(i, row)| {
@@ -4411,15 +4419,21 @@ pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples_pure_line(
             } else {
                 count_packed_row_pure_line_counts_selected(row, n_samples, stats_sample_indices)
             };
-            let (missing_rate, maf, _std) =
+            let (missing_rate, _maf, _std) =
                 packed_row_stats_from_counts_pure_line(stats_n_samples, logic_missing, hom_alt);
-            let (pass_num, flip) = evaluate_packed_row_keep_and_flip_pure_line(
-                stats_n_samples,
-                logic_missing,
-                hom_alt,
-                maf_threshold,
-                max_missing_rate,
-            );
+            let usable_homo = stats_n_samples.saturating_sub(logic_missing.min(stats_n_samples));
+            let alt_freq = if usable_homo > 0 {
+                (hom_alt as f32) / (usable_homo as f32)
+            } else {
+                0.0_f32
+            };
+            let pass_num = if missing_rate > max_missing_rate {
+                false
+            } else if usable_homo == 0 {
+                false
+            } else {
+                alt_freq.min(1.0_f32 - alt_freq) >= maf_threshold
+            };
             let pass_snp = if snps_only {
                 is_simple_snp_allele(&sites_all[i].ref_allele)
                     && is_simple_snp_allele(&sites_all[i].alt_allele)
@@ -4427,12 +4441,12 @@ pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples_pure_line(
                 true
             };
             let keep = pass_num && pass_snp;
-            (keep, keep && flip, missing_rate, maf)
+            (keep, missing_rate, alt_freq)
         })
         .collect();
     let site_keep: Vec<bool> = keep_flip_stats
         .iter()
-        .map(|(keep, _, _, _)| *keep)
+        .map(|(keep, _, _)| *keep)
         .collect();
     if site_keep.len() != n_snps {
         return Err(format!(
@@ -4453,17 +4467,14 @@ pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples_pure_line(
     let mut row_source_indices = Vec::<usize>::with_capacity(kept_n);
     let mut missing_rate_keep = Vec::<f32>::with_capacity(kept_n);
     let mut maf_keep = Vec::<f32>::with_capacity(kept_n);
-    for (i, mut site) in sites_all.into_iter().enumerate() {
+    for (i, site) in sites_all.into_iter().enumerate() {
         if site_keep[i] {
-            let (_keep, flip, missing_rate, maf) = keep_flip_stats[i];
-            if flip {
-                std::mem::swap(&mut site.ref_allele, &mut site.alt_allele);
-            }
+            let (_keep, missing_rate, alt_freq) = keep_flip_stats[i];
             sites_keep.push(site);
-            row_flip_keep.push(flip);
+            row_flip_keep.push(false);
             row_source_indices.push(i);
             missing_rate_keep.push(missing_rate);
-            maf_keep.push(maf);
+            maf_keep.push(alt_freq);
         }
     }
 
@@ -4605,12 +4616,17 @@ pub(crate) fn load_bed_2bit_packed_subset_owned_for_stats_samples(
                 };
                 let non_missing = stats_n_samples.saturating_sub(missing);
                 let alt_sum = het.saturating_add(hom_alt.saturating_mul(2));
-                let (miss, maf, std) =
+                let (miss, _maf, std) =
                     packed_row_stats_from_counts(stats_n_samples, non_missing, alt_sum);
+                let af = if non_missing > 0 {
+                    (alt_sum as f32) / (2.0_f32 * non_missing as f32)
+                } else {
+                    0.0_f32
+                };
                 *miss_v = miss;
-                *maf_v = maf.clamp(0.0, 0.5);
+                *maf_v = af.clamp(0.0, 1.0);
                 *std_v = std;
-                *row_flip_v = non_missing > 0 && alt_sum > non_missing;
+                *row_flip_v = false;
             },
         );
 
@@ -4736,14 +4752,19 @@ pub(crate) fn load_bed_2bit_packed_subset_owned_for_stats_samples_pure_line(
                 } else {
                     count_packed_row_pure_line_counts_selected(row, n_samples, stats_sample_indices)
                 };
-                let (miss, maf, std) =
+                let (miss, _maf, std) =
                     packed_row_stats_from_counts_pure_line(stats_n_samples, logic_missing, hom_alt);
-                *miss_v = miss;
-                *maf_v = maf.clamp(0.0, 0.5);
-                *std_v = std;
                 let usable_homo =
                     stats_n_samples.saturating_sub(logic_missing.min(stats_n_samples));
-                *row_flip_v = usable_homo > 0 && hom_alt > (usable_homo / 2);
+                let af = if usable_homo > 0 {
+                    (hom_alt as f32) / (usable_homo as f32)
+                } else {
+                    0.0_f32
+                };
+                *miss_v = miss;
+                *maf_v = af.clamp(0.0, 1.0);
+                *std_v = std;
+                *row_flip_v = false;
             },
         );
 

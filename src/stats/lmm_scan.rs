@@ -4114,9 +4114,9 @@ pub fn fvlmm_assoc_bed_to_tsv_f32<'py>(
             // TSV writer
             // ============================================================
             let header: &[u8] = if with_plrt {
-                b"chrom\tpos\tsnp\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n"
+                b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n"
             } else {
-                b"chrom\tpos\tsnp\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\n"
+                b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\n"
             };
             let writer = AsyncTsvWriter::with_config(&out_tsv_owned, header, 64 * 1024 * 1024, 16)?;
 
@@ -4193,19 +4193,15 @@ pub fn fvlmm_assoc_bed_to_tsv_f32<'py>(
 
                         let alt_sum = het.saturating_add(hom_alt.saturating_mul(2));
                         let alt_freq = alt_sum as f32 / (2.0_f32 * non_missing as f32);
-                        let (maf_v, flip) = if alt_freq > 0.5_f32 {
-                            (1.0_f32 - alt_freq, true)
-                        } else {
-                            (alt_freq, false)
-                        };
+                        let maf_v = alt_freq.min(1.0_f32 - alt_freq);
 
                         if maf_v < maf_thr {
                             return None;
                         }
 
                         Some(SnpCounts {
-                            flip,
-                            maf: maf_v,
+                            flip: false,
+                            maf: alt_freq,
                             miss_rate,
                             missing_count: missing,
                         })
@@ -4237,13 +4233,8 @@ pub fn fvlmm_assoc_bed_to_tsv_f32<'py>(
                     chunk
                         .snp
                         .push(resolve_snp_name(&site.snp, &site.chrom, site.pos));
-                    if cnts.flip {
-                        chunk.a0.push(site.alt_allele.clone());
-                        chunk.a1.push(site.ref_allele.clone());
-                    } else {
-                        chunk.a0.push(site.ref_allele.clone());
-                        chunk.a1.push(site.alt_allele.clone());
-                    }
+                    chunk.a0.push(site.ref_allele.clone());
+                    chunk.a1.push(site.alt_allele.clone());
                     chunk.rows += 1;
                 }
 
@@ -5370,10 +5361,10 @@ pub fn lmm_reml_assoc_packed_f32_to_tsv<'py>(
         let writer = AsyncTsvWriter::with_config(
             &out_tsv_path,
             if with_plrt {
-                b"chrom\tpos\tsnp\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n"
+                b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n"
                     .as_slice()
             } else {
-                b"chrom\tpos\tsnp\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\n"
+                b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\n"
                     .as_slice()
             },
             64 * 1024 * 1024,
@@ -6876,7 +6867,7 @@ pub fn fastlmm_assoc_packed_f32_to_tsv<'py>(
 
         let writer = AsyncTsvWriter::with_config(
             &out_tsv_path,
-            b"chrom\tpos\tsnp\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n",
+            b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n",
             64 * 1024 * 1024,
             4,
         )
@@ -7526,7 +7517,7 @@ pub fn fvlmm_assoc_packed_f32_to_tsv<'py>(
 
         let writer = AsyncTsvWriter::with_config(
             &out_tsv_path,
-            b"chrom\tpos\tsnp\tallele0\tallele1\tmaf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n",
+            b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n",
             64 * 1024 * 1024,
             4,
         )

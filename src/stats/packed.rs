@@ -411,7 +411,7 @@ pub fn bed_packed_signed_hash_f32<'py>(
                                 let row = &packed_flat
                                     [row_idx * bytes_per_snp..(row_idx + 1) * bytes_per_snp];
                                 let flip = row_flip_vec[row_idx];
-                                let maf = row_maf_vec[row_idx].clamp(0.0_f32, 0.5_f32);
+                                let maf = row_maf_vec[row_idx].clamp(0.0_f32, 1.0_f32);
                                 let mean_g = 2.0_f32 * maf;
                                 let denom = if standardize {
                                     (2.0_f32 * maf * (1.0_f32 - maf)).max(1e-12_f32).sqrt()
@@ -717,7 +717,7 @@ pub fn bed_packed_signed_hash_ztz_stats_f64<'py>(
                                     let row = &packed_flat
                                         [row_idx * bytes_per_snp..(row_idx + 1) * bytes_per_snp];
                                     let flip = row_flip_vec[row_idx];
-                                    let maf = row_maf_vec[row_idx].clamp(0.0_f32, 0.5_f32);
+                                    let maf = row_maf_vec[row_idx].clamp(0.0_f32, 1.0_f32);
                                     let mean_g = 2.0_f32 * maf;
                                     let denom = if standardize {
                                         (2.0_f32 * maf * (1.0_f32 - maf)).max(1e-12_f32).sqrt()
@@ -1111,7 +1111,7 @@ pub fn bed_packed_signed_hash_kernels_f64<'py>(
                                     let row = &packed_flat
                                         [row_idx * bytes_per_snp..(row_idx + 1) * bytes_per_snp];
                                     let flip = row_flip_vec[row_idx];
-                                    let maf = row_maf_vec[row_idx].clamp(0.0_f32, 0.5_f32);
+                                    let maf = row_maf_vec[row_idx].clamp(0.0_f32, 1.0_f32);
                                     let mean_g = 2.0_f32 * maf;
                                     let denom = if standardize {
                                         (2.0_f32 * maf * (1.0_f32 - maf)).max(1e-12_f32).sqrt()
@@ -1227,7 +1227,7 @@ pub fn bed_packed_signed_hash_kernels_f64<'py>(
                                     let row = &packed_flat
                                         [row_idx * bytes_per_snp..(row_idx + 1) * bytes_per_snp];
                                     let flip = row_flip_vec[row_idx];
-                                    let maf = row_maf_vec[row_idx].clamp(0.0_f32, 0.5_f32);
+                                    let maf = row_maf_vec[row_idx].clamp(0.0_f32, 1.0_f32);
                                     let mean_g = 2.0_f32 * maf;
                                     let denom = if standardize {
                                         (2.0_f32 * maf * (1.0_f32 - maf)).max(1e-12_f32).sqrt()

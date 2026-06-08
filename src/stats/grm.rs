@@ -81,7 +81,7 @@ pub(crate) fn decode_grm_block(
                     let idx = row_start + off;
                     let row = &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
                     let flip = row_flip_vec[idx];
-                    let p = row_maf_vec[idx].clamp(0.0, 0.5);
+                    let p = row_maf_vec[idx].clamp(0.0, 1.0);
                     let mean_g = 2.0_f32 * p;
                     let var = 2.0_f32 * p * (1.0_f32 - p);
                     let std_scale = if method == 2 {
@@ -124,7 +124,7 @@ pub(crate) fn decode_grm_block(
                         let idx = row_start + off;
                         let row = &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
                         let flip = row_flip_vec[idx];
-                        let p = row_maf_vec[idx].clamp(0.0, 0.5);
+                        let p = row_maf_vec[idx].clamp(0.0, 1.0);
                         let default_mean_g = 2.0_f32 * p;
                         let (var_centered, _row_sum) = decode_subset_row_from_full_scratch(
                             row,
@@ -376,7 +376,7 @@ where
                         .for_each(|(off, ((out_row, row_varsum_dst), row_sum_dst))| {
                             let idx = row_start + off;
                             let row = &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
-                            let p = row_maf_vec[idx].clamp(0.0_f32, 0.5_f32);
+                            let p = row_maf_vec[idx].clamp(0.0_f32, 1.0_f32);
                             let mean_g = 2.0_f32 * p;
                             let var = 2.0_f32 * p * (1.0_f32 - p);
                             let std_scale = if method == 2 {
@@ -427,7 +427,7 @@ where
                                 let idx = row_start + off;
                                 let row =
                                     &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
-                                let p = row_maf_vec[idx].clamp(0.0_f32, 0.5_f32);
+                                let p = row_maf_vec[idx].clamp(0.0_f32, 1.0_f32);
                                 let default_mean_g = 2.0_f32 * p;
                                 let (var_centered, row_sum) = decode_subset_row_from_full_scratch(
                                     row,
@@ -550,7 +550,7 @@ where
                 .for_each(|(off, ((out_row, row_varsum_dst), row_sum_dst))| {
                     let idx = next_start + off;
                     let row = &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
-                    let p = row_maf_vec[idx].clamp(0.0_f32, 0.5_f32);
+                    let p = row_maf_vec[idx].clamp(0.0_f32, 1.0_f32);
                     let mean_g = 2.0_f32 * p;
                     let var = 2.0_f32 * p * (1.0_f32 - p);
                     let std_scale = if method == 2 {
@@ -600,7 +600,7 @@ where
                     |full_row, (off, ((out_row, row_varsum_dst), row_sum_dst))| {
                         let idx = next_start + off;
                         let row = &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
-                        let p = row_maf_vec[idx].clamp(0.0_f32, 0.5_f32);
+                        let p = row_maf_vec[idx].clamp(0.0_f32, 1.0_f32);
                         let default_mean_g = 2.0_f32 * p;
                         let (var_centered, row_sum) = decode_subset_row_from_full_scratch(
                             row,
@@ -756,7 +756,7 @@ where
                     .for_each(|(off, ((out_row, row_varsum_dst), row_sum_dst))| {
                         let idx = row_start + off;
                         let row = &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
-                        let p = row_maf_vec[idx].clamp(0.0_f32, 0.5_f32) as f64;
+                        let p = row_maf_vec[idx].clamp(0.0_f32, 1.0_f32) as f64;
                         let mean_g = 2.0_f64 * p;
                         let var = 2.0_f64 * p * (1.0_f64 - p);
                         let std_scale = if method == 2 {
@@ -806,7 +806,7 @@ where
                         |full_row, (off, ((out_row, row_varsum_dst), row_sum_dst))| {
                             let idx = row_start + off;
                             let row = &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
-                            let p = row_maf_vec[idx].clamp(0.0_f32, 0.5_f32) as f64;
+                            let p = row_maf_vec[idx].clamp(0.0_f32, 1.0_f32) as f64;
                             let default_mean_g = 2.0_f64 * p;
                             let (var_centered, row_sum) = decode_subset_row_from_full_scratch_f64(
                                 row,

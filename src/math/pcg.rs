@@ -4,9 +4,7 @@ use std::borrow::Cow;
 use std::fs::File;
 use std::sync::Arc;
 
-use crate::bedmath::{
-    adaptive_grm_block_rows, is_identity_indices, packed_byte_lut,
-};
+use crate::bedmath::{adaptive_grm_block_rows, is_identity_indices, packed_byte_lut};
 use crate::gfcore::{read_bim, read_fam};
 use crate::he::{
     apply_grm_to_mat_f32_with_workspace, build_row_standardization_stats_with_options,
@@ -532,7 +530,6 @@ impl<'a> PcgGrmBedOperator<'a> {
             out_f32: vec![0.0_f32; n_samples_used],
         })
     }
-
 }
 
 impl PcgOperator<f64> for PcgGrmBedOperator<'_> {

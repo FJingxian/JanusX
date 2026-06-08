@@ -2050,11 +2050,9 @@ fn grammar_scan_blocks_core<G: GenotypeMatrix>(
                                     residualized_sumsq_from_xtx_chol(xtx_chol, p, xts, alpha, s_sq);
                                 let denom_scaled = denom_scale * s_m_s;
                                 let score = score_scale * score;
-                                if let Some((beta, se, pwald)) = splmm_wald_from_scaled_denom(
-                                    score,
-                                    denom_scaled,
-                                    wald_sigma2,
-                                ) {
+                                if let Some((beta, se, pwald)) =
+                                    splmm_wald_from_scaled_denom(score, denom_scaled, wald_sigma2)
+                                {
                                     out_row[0] = beta;
                                     out_row[1] = se;
                                     out_row[2] = pwald;
@@ -4801,19 +4799,14 @@ mod tests {
         let p = x_design.len() / n;
 
         let mut workspace = factor.make_solve_workspace(p.max(1)).unwrap();
-        let built = build_sparse_jxlmm_null_state(
-            &factor,
-            &x_design,
-            &y_vec,
-            sigma2,
-            &mut workspace,
-            None,
-        )
-        .unwrap();
+        let built =
+            build_sparse_jxlmm_null_state(&factor, &x_design, &y_vec, sigma2, &mut workspace, None)
+                .unwrap();
 
         let x_col = row_major_to_col_major_f64(&x_design, n, p).unwrap();
         let mut workspace_manual = factor.make_solve_workspace(p.max(1)).unwrap();
-        let y_vinv = sparse_solve_rhs_with_workspace(&factor, &y_vec, 1, &mut workspace_manual).unwrap();
+        let y_vinv =
+            sparse_solve_rhs_with_workspace(&factor, &y_vec, 1, &mut workspace_manual).unwrap();
         let x_vinv =
             sparse_solve_rhs_with_workspace(&factor, &x_col, p, &mut workspace_manual).unwrap();
         let mut xt_v_inv_y = vec![0.0_f64; p];

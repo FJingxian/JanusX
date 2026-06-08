@@ -2427,6 +2427,133 @@ def build_pcs_from_grm(
     return pcs
 
 
+def build_pcs_from_genotype_rsvd(
+    genofile: str,
+    dim: int,
+    logger: logging.Logger,
+    *,
+    maf_threshold: float,
+    max_missing_rate: float,
+    chunk_size: int,
+    snps_only: bool,
+    threads: int = 1,
+    use_spinner: bool = False,
+    preloaded_packed: Union[dict[str, object], None] = None,
+) -> tuple[np.ndarray, np.ndarray, str]:
+    """
+    Compute leading PCs directly from genotype input via Rust RSVD.
+
+    Preferred route:
+      1) reuse packed preload when GWAS is already in packed mode
+      2) otherwise use memmap/stream RSVD on the resolved genotype source
+    """
+    dim_use = max(1, int(dim))
+    threads_use = max(1, int(threads))
+    if hasattr(jxrs, "admx_set_threads"):
+        try:
+            jxrs.admx_set_threads(int(threads_use))
+        except Exception:
+            pass
+
+    if bool(packed_preload_is_ready(preloaded_packed)) and hasattr(jxrs, "rsvd_packed_subset"):
+        packed_ctx = preloaded_packed.get("packed_ctx") if isinstance(preloaded_packed, dict) else None
+        full_ids_obj = preloaded_packed.get("full_ids") if isinstance(preloaded_packed, dict) else None
+        if isinstance(packed_ctx, dict) and full_ids_obj is not None:
+            full_ids = np.asarray(full_ids_obj, dtype=str)
+            packed = np.ascontiguousarray(np.asarray(packed_ctx["packed"], dtype=np.uint8))
+            packed_n = int(packed_ctx["n_samples"])
+            if packed_n != int(full_ids.shape[0]):
+                raise ValueError(
+                    f"Packed preload sample size mismatch for RSVD PCA: packed={packed_n}, ids={full_ids.shape[0]}"
+                )
+            sample_idx = np.arange(packed_n, dtype=np.int64)
+            with runtime_thread_stage(rayon_threads=int(threads_use)):
+                with CliStatus(
+                    f"Calculating PCs via RSVD packed preload (n={packed_n}, nPC={dim_use})...",
+                    enabled=bool(use_spinner),
+                    use_process=True,
+                ) as task:
+                    try:
+                        _eval_raw, evec_raw, _maf_raw, _flip_raw = jxrs.rsvd_packed_subset(
+                            packed,
+                            int(packed_n),
+                            int(dim_use),
+                            sample_idx,
+                            42,
+                            3,
+                            1e-1,
+                        )
+                    except Exception:
+                        task.fail("Calculating PCs via RSVD packed preload ...Failed")
+                        raise
+                    qmatrix = np.ascontiguousarray(np.asarray(evec_raw, dtype="float32"), dtype="float32")
+                    if qmatrix.ndim == 1:
+                        qmatrix = qmatrix.reshape(-1, 1)
+                    task.complete(
+                        f"Calculating PCs via RSVD packed preload (n={qmatrix.shape[0]}, nPC={qmatrix.shape[1]})"
+                    )
+            return qmatrix, full_ids, "rsvd_packed_preload"
+
+    if not hasattr(jxrs, "admx_rsvd_stream_sample"):
+        raise RuntimeError(
+            "GWAS Q/PC build requires Rust RSVD backend admx_rsvd_stream_sample, but the symbol is unavailable."
+        )
+
+    rsvd_input = str(genofile).strip()
+    if _as_plink_prefix(rsvd_input) is None:
+        delim = "," if rsvd_input.lower().endswith(".csv") else None
+        rsvd_input = str(
+            prepare_cli_input_cache(
+                rsvd_input,
+                snps_only=bool(snps_only),
+                delimiter=delim,
+                prefer_plink_for_txt=True,
+            )
+        )
+    sample_ids, algo_snp = inspect_genotype_file(
+        rsvd_input,
+        snps_only=bool(snps_only),
+        maf=float(maf_threshold),
+        missing_rate=float(max_missing_rate),
+    )
+    samples = np.asarray(sample_ids, dtype=str)
+    mmap_window_mb = auto_mmap_window_mb(
+        rsvd_input,
+        int(samples.shape[0]),
+        int(algo_snp),
+        int(chunk_size),
+    )
+    with runtime_thread_stage(rayon_threads=int(threads_use)):
+        with CliStatus(
+            f"Calculating PCs via RSVD stream (n={samples.shape[0]}, nPC={dim_use})...",
+            enabled=bool(use_spinner),
+            use_process=True,
+        ) as task:
+            try:
+                _eval_raw, evec_raw = jxrs.admx_rsvd_stream_sample(
+                    str(rsvd_input),
+                    int(dim_use),
+                    42,
+                    3,
+                    1e-1,
+                    bool(snps_only),
+                    float(maf_threshold),
+                    float(max_missing_rate),
+                    None,
+                    int(mmap_window_mb),
+                )
+            except Exception:
+                task.fail("Calculating PCs via RSVD stream ...Failed")
+                raise
+            qmatrix = np.ascontiguousarray(np.asarray(evec_raw, dtype="float32"), dtype="float32")
+            if qmatrix.ndim == 1:
+                qmatrix = qmatrix.reshape(-1, 1)
+            task.complete(
+                f"Calculating PCs via RSVD stream (n={qmatrix.shape[0]}, nPC={qmatrix.shape[1]})"
+            )
+    return qmatrix, samples, "rsvd_stream"
+
+
 def load_or_build_q_with_cache(
     genofile: str,
     grm: Union[np.ndarray, None],
@@ -2438,17 +2565,20 @@ def load_or_build_q_with_cache(
     maf_threshold: float,
     max_missing_rate: float,
     het_threshold: float,
+    chunk_size: int,
     snps_only: bool,
     threads: int,
     logger,
     use_spinner: bool = False,
+    preloaded_packed: Union[dict[str, object], None] = None,
 ) -> tuple[np.ndarray, Union[np.ndarray, None]]:
     """
     Load or build Q matrix (PCs) with caching for streaming LMM/LM.
     Note: external Q file via -q is no longer supported; pass external
     covariate matrices via -c.
 
-    GWAS policy: when PCA needs to be computed from GRM, enforce Rust eigh.
+    GWAS policy: default to Rust RSVD on genotype input; fallback to GRM eigh
+    only when RSVD is unavailable or fails.
     """
     n = int(n_samples)
     qdim = _parse_qcov_dim(pcdim)
@@ -2499,21 +2629,45 @@ def load_or_build_q_with_cache(
                         f"Loading Q matrix from {src} (n={qmatrix.shape[0]}, nPC={qmatrix.shape[1]}) ...Finished"
                     )
             else:
-                if grm is None:
-                    raise ValueError(
-                        "Q cache not found and GRM is unavailable; cannot generate PCA covariates."
-                    )
                 pc_calc_t0 = time.monotonic()
-                eigval, eigvec, _evd_backend, _evd_secs = _gwas_eigh_from_grm(
-                    grm,
-                    threads=int(threads),
-                    logger=logger,
-                    stage_label="GWAS-Q-build",
-                    require_rust=True,
-                )
-                qmatrix = np.asarray(eigvec[:, -dim:], dtype="float32")
+                pc_backend = "unknown"
+                try:
+                    qmatrix, q_ids, pc_backend = build_pcs_from_genotype_rsvd(
+                        genofile=str(genofile),
+                        dim=int(dim),
+                        logger=logger,
+                        maf_threshold=float(maf_threshold),
+                        max_missing_rate=float(max_missing_rate),
+                        chunk_size=int(chunk_size),
+                        snps_only=bool(snps_only),
+                        threads=int(threads),
+                        use_spinner=bool(use_spinner),
+                        preloaded_packed=preloaded_packed,
+                    )
+                except Exception as rsvd_ex:
+                    if grm is None:
+                        raise
+                    _emit_warning_line(
+                        logger,
+                        f"RSVD PCA build failed; falling back to GRM eigh. reason={rsvd_ex}",
+                        use_spinner=bool(use_spinner),
+                    )
+                    _eigval, eigvec, _evd_backend, _evd_secs = _gwas_eigh_from_grm(
+                        grm,
+                        threads=int(threads),
+                        logger=logger,
+                        stage_label="GWAS-Q-build",
+                        require_rust=True,
+                    )
+                    qmatrix = np.asarray(eigvec[:, -dim:], dtype="float32")
+                    q_ids = ids
+                    pc_backend = "grm_eigh_fallback"
+                if qmatrix.shape != (n, int(dim)):
+                    raise ValueError(
+                        f"PCA build shape mismatch: expected ({n},{dim}), got {qmatrix.shape}"
+                    )
                 pc_msg = (
-                    f"Calculating PCs from GRM (n={qmatrix.shape[0]}, nPC={qmatrix.shape[1]}) "
+                    f"Calculating PCs via {pc_backend} (n={qmatrix.shape[0]}, nPC={qmatrix.shape[1]}) "
                     f"...Finished [{format_elapsed(time.monotonic() - pc_calc_t0)}]"
                 )
                 _log_file_only(logger, logging.INFO, pc_msg)
@@ -2814,7 +2968,7 @@ def prepare_streaming_context(
 
         # PCA stream...
         qmatrix, q_ids = load_or_build_q_with_cache(
-            genofile=genofile,
+            genofile=stream_genofile,
             grm=grm,
             n_samples=n_samples,
             cache_prefix=cache_prefix,
@@ -2824,10 +2978,12 @@ def prepare_streaming_context(
             maf_threshold=maf_threshold,
             max_missing_rate=max_missing_rate,
             het_threshold=het_threshold,
+            chunk_size=chunk_size,
             snps_only=bool(snps_only),
             threads=int(threads),
             logger=logger,
             use_spinner=use_spinner,
+            preloaded_packed=preloaded_packed,
         )
 
         cov_all, cov_ids = _load_covariate_for_streaming(

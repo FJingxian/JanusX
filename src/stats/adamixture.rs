@@ -14,12 +14,22 @@ use rand_distr::StandardNormal;
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
 use std::convert::TryFrom;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Instant, UNIX_EPOCH};
 
+use crate::bedmath::packed_byte_lut;
+use crate::blas::{
+    cblas_sgemm_dispatch, BlasThreadGuard, CblasInt, CBLAS_NO_TRANS, CBLAS_ROW_MAJOR, CBLAS_TRANS,
+};
 use crate::gfcore::{
     process_snp_row, read_bim, read_fam, BedSnpIter, HmpSnpIter, TxtSnpIter, VcfSnpIter,
+};
+use crate::rsvd::{
+    rsvd_block_rows_env, rsvd_packed_compute_a_omega, rsvd_packed_compute_at_random_omega,
+    rsvd_packed_compute_ata_omega, rsvd_packed_compute_gram_aq, rsvd_right_singular_from_gram,
+    PackedRsvdView, RsvdKernelTiming,
 };
 
 const EPS64: f64 = 1e-5;
@@ -140,13 +150,198 @@ struct PackedBedRsvd {
     row_flip: Vec<bool>,
 }
 
-impl PackedBedRsvd {
-    #[inline]
-    fn row_bytes(&self, snp_idx: usize) -> &[u8] {
-        let src_row = self.active_row_idx[snp_idx];
-        let start = self.payload_offset + src_row * self.bytes_per_snp;
-        &self.mmap[start..start + self.bytes_per_snp]
+const PACKED_BED_CACHE_MAGIC: &[u8; 8] = b"JXRSVDC1";
+const PACKED_BED_CACHE_VERSION: u32 = 1;
+
+#[inline]
+fn packed_bed_cache_enabled() -> bool {
+    match std::env::var("JANUSX_RSVD_BED_CACHE") {
+        Ok(v) => {
+            let s = v.trim().to_ascii_lowercase();
+            !(s == "0" || s == "false" || s == "off" || s == "no")
+        }
+        Err(_) => true,
     }
+}
+
+fn packed_bed_cache_path(prefix: &str, cfg: &StreamRsvdConfig) -> PathBuf {
+    PathBuf::from(format!(
+        "{prefix}.rsvd_bedcache.maf{:08x}.miss{:08x}.snps{}.bin",
+        cfg.maf.to_bits(),
+        cfg.missing_rate.to_bits(),
+        if cfg.snps_only { 1 } else { 0 }
+    ))
+}
+
+#[inline]
+fn file_signature(path: &Path) -> Option<(u64, u64)> {
+    let meta = path.metadata().ok()?;
+    let size = meta.len();
+    let mtime = meta
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_nanos()
+        .min(u64::MAX as u128) as u64;
+    Some((size, mtime))
+}
+
+#[inline]
+fn push_u32_le(buf: &mut Vec<u8>, v: u32) {
+    buf.extend_from_slice(&v.to_le_bytes());
+}
+
+#[inline]
+fn push_u64_le(buf: &mut Vec<u8>, v: u64) {
+    buf.extend_from_slice(&v.to_le_bytes());
+}
+
+#[inline]
+fn push_f32_le(buf: &mut Vec<u8>, v: f32) {
+    buf.extend_from_slice(&v.to_le_bytes());
+}
+
+#[inline]
+fn read_u32_le(bytes: &[u8], pos: &mut usize) -> Option<u32> {
+    let end = pos.checked_add(4)?;
+    let arr: [u8; 4] = bytes.get(*pos..end)?.try_into().ok()?;
+    *pos = end;
+    Some(u32::from_le_bytes(arr))
+}
+
+#[inline]
+fn read_u64_le(bytes: &[u8], pos: &mut usize) -> Option<u64> {
+    let end = pos.checked_add(8)?;
+    let arr: [u8; 8] = bytes.get(*pos..end)?.try_into().ok()?;
+    *pos = end;
+    Some(u64::from_le_bytes(arr))
+}
+
+#[inline]
+fn read_f32_le(bytes: &[u8], pos: &mut usize) -> Option<f32> {
+    let end = pos.checked_add(4)?;
+    let arr: [u8; 4] = bytes.get(*pos..end)?.try_into().ok()?;
+    *pos = end;
+    Some(f32::from_le_bytes(arr))
+}
+
+fn try_load_packed_bed_cache(
+    cache_path: &Path,
+    bed_path: &Path,
+    bim_path: &Path,
+    fam_path: &Path,
+    n_samples: usize,
+    n_total_sites: usize,
+    bytes_per_snp: usize,
+) -> Option<(Vec<usize>, Vec<f32>, Vec<bool>)> {
+    if !packed_bed_cache_enabled() || !cache_path.exists() {
+        return None;
+    }
+    let (bed_size, bed_mtime) = file_signature(bed_path)?;
+    let (bim_size, bim_mtime) = file_signature(bim_path)?;
+    let (fam_size, fam_mtime) = file_signature(fam_path)?;
+    let bytes = fs::read(cache_path).ok()?;
+    let mut pos = 0usize;
+    if bytes.get(0..8)? != PACKED_BED_CACHE_MAGIC {
+        return None;
+    }
+    pos += 8;
+    if read_u32_le(&bytes, &mut pos)? != PACKED_BED_CACHE_VERSION {
+        return None;
+    }
+    if read_u64_le(&bytes, &mut pos)? != bed_size
+        || read_u64_le(&bytes, &mut pos)? != bed_mtime
+        || read_u64_le(&bytes, &mut pos)? != bim_size
+        || read_u64_le(&bytes, &mut pos)? != bim_mtime
+        || read_u64_le(&bytes, &mut pos)? != fam_size
+        || read_u64_le(&bytes, &mut pos)? != fam_mtime
+        || read_u64_le(&bytes, &mut pos)? != n_samples as u64
+        || read_u64_le(&bytes, &mut pos)? != n_total_sites as u64
+        || read_u64_le(&bytes, &mut pos)? != bytes_per_snp as u64
+    {
+        return None;
+    }
+    let n_active = usize::try_from(read_u64_le(&bytes, &mut pos)?).ok()?;
+    if n_active > n_total_sites {
+        return None;
+    }
+
+    let mut row_freq = vec![0.0_f32; n_active];
+    for value in row_freq.iter_mut() {
+        *value = read_f32_le(&bytes, &mut pos)?;
+    }
+    let flip_end = pos.checked_add(n_active)?;
+    let flip_slice = bytes.get(pos..flip_end)?;
+    let row_flip: Vec<bool> = flip_slice.iter().map(|&v| v != 0).collect();
+    pos = flip_end;
+
+    let mut active_row_idx = Vec::with_capacity(n_active);
+    for _ in 0..n_active {
+        let idx = usize::try_from(read_u32_le(&bytes, &mut pos)?).ok()?;
+        if idx >= n_total_sites {
+            return None;
+        }
+        active_row_idx.push(idx);
+    }
+    if pos != bytes.len() {
+        return None;
+    }
+    Some((active_row_idx, row_freq, row_flip))
+}
+
+fn try_store_packed_bed_cache(
+    cache_path: &Path,
+    bed_path: &Path,
+    bim_path: &Path,
+    fam_path: &Path,
+    bytes_per_snp: usize,
+    n_total_sites: usize,
+    data: &PackedBedRsvd,
+) -> Result<(), String> {
+    if !packed_bed_cache_enabled() {
+        return Ok(());
+    }
+    let (bed_size, bed_mtime) =
+        file_signature(bed_path).ok_or_else(|| "missing BED signature".to_string())?;
+    let (bim_size, bim_mtime) =
+        file_signature(bim_path).ok_or_else(|| "missing BIM signature".to_string())?;
+    let (fam_size, fam_mtime) =
+        file_signature(fam_path).ok_or_else(|| "missing FAM signature".to_string())?;
+    if data
+        .active_row_idx
+        .iter()
+        .any(|&idx| idx > u32::MAX as usize)
+    {
+        return Err("active_row_idx exceeds u32 range for RSVD cache".to_string());
+    }
+    let n_active = data.active_row_idx.len();
+    let mut buf = Vec::with_capacity(8 + 4 + 9 * 8 + n_active * (4 + 1 + 4));
+    buf.extend_from_slice(PACKED_BED_CACHE_MAGIC);
+    push_u32_le(&mut buf, PACKED_BED_CACHE_VERSION);
+    push_u64_le(&mut buf, bed_size);
+    push_u64_le(&mut buf, bed_mtime);
+    push_u64_le(&mut buf, bim_size);
+    push_u64_le(&mut buf, bim_mtime);
+    push_u64_le(&mut buf, fam_size);
+    push_u64_le(&mut buf, fam_mtime);
+    push_u64_le(&mut buf, data.n_samples as u64);
+    push_u64_le(&mut buf, n_total_sites as u64);
+    push_u64_le(&mut buf, bytes_per_snp as u64);
+    push_u64_le(&mut buf, n_active as u64);
+    for &freq in data.row_freq.iter() {
+        push_f32_le(&mut buf, freq);
+    }
+    for &flip in data.row_flip.iter() {
+        buf.push(if flip { 1 } else { 0 });
+    }
+    for &idx in data.active_row_idx.iter() {
+        push_u32_le(&mut buf, idx as u32);
+    }
+    let tmp_path = cache_path.with_extension("tmp");
+    fs::write(&tmp_path, &buf).map_err(|e| e.to_string())?;
+    fs::rename(&tmp_path, cache_path).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 #[inline]
@@ -163,6 +358,13 @@ fn env_truthy_local(name: &str) -> bool {
 #[inline]
 fn rsvd_rss_debug_enabled() -> bool {
     env_truthy_local("JX_RSVD_RSS_DEBUG") || env_truthy_local("JX_PCA_RSS_DEBUG")
+}
+
+#[inline]
+fn rsvd_time_debug_enabled() -> bool {
+    env_truthy_local("JX_RSVD_TIME_STAGE")
+        || env_truthy_local("JX_RSVD_TIME_DEBUG")
+        || env_truthy_local("JX_PCA_TIME_STAGE")
 }
 
 #[inline]
@@ -245,29 +447,64 @@ fn emit_rsvd_rss_debug(stage: &str, detail: &str) {
     let _ = std::io::stdout().flush();
 }
 
+fn emit_rsvd_time_debug(stage: &str, detail: &str) {
+    if !rsvd_time_debug_enabled() {
+        return;
+    }
+    println!("[RSVD-TIME] {stage} {detail}");
+    let _ = std::io::stdout().flush();
+}
+
+#[inline]
+fn fmt_stage_secs(v: f64) -> String {
+    format!("{v:.3}s")
+}
+
 #[inline]
 fn format_f32_vec_bytes(len: usize) -> String {
     format_debug_bytes_local((len.saturating_mul(std::mem::size_of::<f32>())) as u64)
 }
 
 #[inline]
-fn decode_plink_2bit(row: &[u8], sample_idx: usize) -> u8 {
-    let b = row[sample_idx / 4];
-    (b >> ((sample_idx % 4) * 2)) & 0b11
+fn packed_row_nonmissing_alt_sum_full(row: &[u8], n_samples: usize) -> (usize, f64) {
+    let byte_lut = packed_byte_lut();
+    let full_bytes = n_samples / 4;
+    let rem = n_samples % 4;
+    let mut non_missing = 0usize;
+    let mut alt_sum = 0.0_f64;
+    for &b in row.iter().take(full_bytes) {
+        let idx = b as usize;
+        non_missing += byte_lut.nonmiss[idx] as usize;
+        alt_sum += byte_lut.alt_sum[idx] as f64;
+    }
+    if rem > 0 {
+        let codes = &byte_lut.code4[row[full_bytes] as usize];
+        for &code in codes.iter().take(rem) {
+            match code {
+                0b00 => {
+                    non_missing += 1;
+                }
+                0b10 => {
+                    non_missing += 1;
+                    alt_sum += 1.0;
+                }
+                0b11 => {
+                    non_missing += 1;
+                    alt_sum += 2.0;
+                }
+                _ => {}
+            }
+        }
+    }
+    (non_missing, alt_sum)
 }
 
 #[inline]
-fn centered_from_plink_code(code: u8, f2: f32, flip: bool) -> Option<f32> {
-    let mut g = match code {
-        0b00 => 0.0_f32,
-        0b10 => 1.0_f32,
-        0b11 => 2.0_f32,
-        _ => return None, // 0b01 missing
-    };
-    if flip {
-        g = 2.0_f32 - g;
-    }
-    Some(g - f2)
+fn packed_backend_stats_chunk_rows(n_rows: usize, n_samples: usize) -> usize {
+    let rows = rsvd_block_rows_env(n_samples, n_rows)
+        .saturating_mul(16)
+        .clamp(1024, 16384);
+    rows.min(n_rows.max(1))
 }
 
 fn packed_bed_fast_enabled() -> bool {
@@ -280,13 +517,6 @@ fn packed_bed_fast_enabled() -> bool {
     }
 }
 
-fn rsvd_tile_cols_env() -> usize {
-    match std::env::var("JANUSX_ADMX_RSVD_TILE") {
-        Ok(v) => v.trim().parse::<usize>().ok().unwrap_or(1024).max(1),
-        Err(_) => 1024,
-    }
-}
-
 fn try_build_packed_bed_backend(cfg: &StreamRsvdConfig) -> Result<Option<PackedBedRsvd>, String> {
     if !packed_bed_fast_enabled() {
         return Ok(None);
@@ -294,6 +524,10 @@ fn try_build_packed_bed_backend(cfg: &StreamRsvdConfig) -> Result<Option<PackedB
     let Some(prefix) = detect_bed_prefix(&cfg.genotype_path) else {
         return Ok(None);
     };
+    let bed_path = PathBuf::from(format!("{prefix}.bed"));
+    let bim_path = PathBuf::from(format!("{prefix}.bim"));
+    let fam_path = PathBuf::from(format!("{prefix}.fam"));
+    let cache_path = packed_bed_cache_path(&prefix, cfg);
 
     let samples = read_fam(&prefix)?;
     let n_samples = samples.len();
@@ -303,7 +537,6 @@ fn try_build_packed_bed_backend(cfg: &StreamRsvdConfig) -> Result<Option<PackedB
     let sites = read_bim(&prefix)?;
     let n_snps_total = sites.len();
 
-    let bed_path = format!("{prefix}.bed");
     let mut file = File::open(&bed_path).map_err(|e| e.to_string())?;
     let mut header = [0u8; 3];
     file.read_exact(&mut header).map_err(|e| e.to_string())?;
@@ -337,62 +570,80 @@ fn try_build_packed_bed_backend(cfg: &StreamRsvdConfig) -> Result<Option<PackedB
         ),
     );
 
+    if let Some((active_row_idx, row_freq, row_flip)) = try_load_packed_bed_cache(
+        &cache_path,
+        &bed_path,
+        &bim_path,
+        &fam_path,
+        n_samples,
+        n_snps_total,
+        bytes_per_snp,
+    ) {
+        emit_rsvd_rss_debug(
+            "packed_backend/cache_hit",
+            &format!(
+                "prefix={} cache={} active_rows={}",
+                prefix,
+                cache_path.display(),
+                row_freq.len(),
+            ),
+        );
+        return Ok(Some(PackedBedRsvd {
+            mmap,
+            payload_offset: 3,
+            bytes_per_snp,
+            n_samples,
+            n_snps: row_freq.len(),
+            n_total_sites: n_snps_total,
+            active_row_idx,
+            row_freq,
+            row_flip,
+        }));
+    }
+
     let mut active_row_idx: Vec<usize> = Vec::with_capacity(n_snps_total);
     let mut row_freq: Vec<f32> = Vec::with_capacity(n_snps_total);
     let mut row_flip: Vec<bool> = Vec::with_capacity(n_snps_total);
     let n_samples_f64 = n_samples as f64;
-
-    for snp_idx in 0..n_snps_total {
-        let site = &sites[snp_idx];
-        if cfg.snps_only && !is_simple_snp_alleles(&site.ref_allele, &site.alt_allele) {
-            continue;
-        }
-        let row_start = 3 + snp_idx * bytes_per_snp;
-        let row = &mmap[row_start..row_start + bytes_per_snp];
-
-        let mut non_missing: usize = 0;
-        let mut alt_sum: f64 = 0.0;
-        for l in 0..n_samples {
-            let code = decode_plink_2bit(row, l);
-            match code {
-                0b00 => {
-                    non_missing += 1;
+    let chunk_rows = packed_backend_stats_chunk_rows(n_snps_total, n_samples);
+    for chunk_start in (0..n_snps_total).step_by(chunk_rows) {
+        let chunk_end = (chunk_start + chunk_rows).min(n_snps_total);
+        let keep_rows: Vec<Option<(usize, f32, bool)>> = (chunk_start..chunk_end)
+            .into_par_iter()
+            .map(|snp_idx| {
+                let site = &sites[snp_idx];
+                if cfg.snps_only && !is_simple_snp_alleles(&site.ref_allele, &site.alt_allele) {
+                    return None;
                 }
-                0b10 => {
-                    non_missing += 1;
-                    alt_sum += 1.0;
-                }
-                0b11 => {
-                    non_missing += 1;
-                    alt_sum += 2.0;
-                }
-                _ => {}
-            }
-        }
+                let row_start = 3 + snp_idx * bytes_per_snp;
+                let row = &mmap[row_start..row_start + bytes_per_snp];
+                let (non_missing, alt_sum) = packed_row_nonmissing_alt_sum_full(row, n_samples);
 
-        let miss_rate = 1.0_f64 - (non_missing as f64 / n_samples_f64);
-        if miss_rate > cfg.missing_rate as f64 {
-            continue;
-        }
-        if non_missing == 0 {
-            if cfg.maf > 0.0 {
-                continue;
-            }
-            active_row_idx.push(snp_idx);
-            row_freq.push(0.0);
-            row_flip.push(false);
-            continue;
-        }
+                let miss_rate = 1.0_f64 - (non_missing as f64 / n_samples_f64);
+                if miss_rate > cfg.missing_rate as f64 {
+                    return None;
+                }
+                if non_missing == 0 {
+                    if cfg.maf > 0.0 {
+                        return None;
+                    }
+                    return Some((snp_idx, 0.0_f32, false));
+                }
 
-        let p = alt_sum / (2.0 * non_missing as f64);
-        let flip = p > 0.5;
-        let p_minor = if flip { 1.0 - p } else { p };
-        if p_minor < cfg.maf as f64 {
-            continue;
+                let p = alt_sum / (2.0 * non_missing as f64);
+                let flip = p > 0.5;
+                let p_minor = if flip { 1.0 - p } else { p };
+                if p_minor < cfg.maf as f64 {
+                    return None;
+                }
+                Some((snp_idx, p_minor as f32, flip))
+            })
+            .collect();
+        for item in keep_rows.into_iter().flatten() {
+            active_row_idx.push(item.0);
+            row_freq.push(item.1);
+            row_flip.push(item.2);
         }
-        active_row_idx.push(snp_idx);
-        row_freq.push(p_minor as f32);
-        row_flip.push(flip);
     }
 
     let n_snps = row_freq.len();
@@ -407,7 +658,7 @@ fn try_build_packed_bed_backend(cfg: &StreamRsvdConfig) -> Result<Option<PackedB
             format_debug_bytes_local((row_flip.len() * std::mem::size_of::<bool>()) as u64),
         ),
     );
-    Ok(Some(PackedBedRsvd {
+    let backend = PackedBedRsvd {
         mmap,
         payload_offset: 3,
         bytes_per_snp,
@@ -417,7 +668,17 @@ fn try_build_packed_bed_backend(cfg: &StreamRsvdConfig) -> Result<Option<PackedB
         active_row_idx,
         row_freq,
         row_flip,
-    }))
+    };
+    let _ = try_store_packed_bed_cache(
+        &cache_path,
+        &bed_path,
+        &bim_path,
+        &fam_path,
+        bytes_per_snp,
+        n_snps_total,
+        &backend,
+    );
+    Ok(Some(backend))
 }
 
 fn compute_a_omega_packed(
@@ -425,78 +686,72 @@ fn compute_a_omega_packed(
     omega: &[f32], // (n, kp)
     kp: usize,
 ) -> Result<Vec<f32>, String> {
-    let m = backend.n_snps;
-    let n = backend.n_samples;
-    if omega.len() != n * kp {
-        return Err("omega shape mismatch in packed A*Omega".to_string());
-    }
-    let mut out = vec![0.0_f32; m * kp];
-    out.par_chunks_mut(kp).enumerate().for_each(|(i, out_row)| {
-        let row = backend.row_bytes(i);
-        let f2 = 2.0_f32 * backend.row_freq[i];
-        let flip = backend.row_flip[i];
-        for l in 0..n {
-            let code = decode_plink_2bit(row, l);
-            if let Some(centered) = centered_from_plink_code(code, f2, flip) {
-                let omega_row = &omega[l * kp..(l + 1) * kp];
-                for j in 0..kp {
-                    out_row[j] += centered * omega_row[j];
-                }
-            }
-        }
-    });
-    Ok(out)
+    let sample_idx: Vec<usize> = (0..backend.n_samples).collect();
+    let packed_view = PackedRsvdView {
+        packed_flat: &backend.mmap[backend.payload_offset..],
+        bytes_per_snp: backend.bytes_per_snp,
+        n_samples: backend.n_samples,
+        row_freq: &backend.row_freq,
+        row_flip: &backend.row_flip,
+        sample_idx: &sample_idx,
+        packed_row_indices: Some(&backend.active_row_idx),
+    };
+    rsvd_packed_compute_a_omega(packed_view, omega, kp)
 }
 
-fn compute_at_omega_packed(
+fn compute_at_random_omega_packed(
     backend: &PackedBedRsvd,
-    omega: &[f32], // (m, kp)
     kp: usize,
-    tile_cols: usize,
+    seed: u64,
 ) -> Result<Vec<f32>, String> {
-    let m = backend.n_snps;
-    let n = backend.n_samples;
-    if omega.len() != m * kp {
-        return Err("omega shape mismatch in packed A^T*Omega".to_string());
-    }
-    let mut out = vec![0.0_f32; n * kp];
-    let tile = tile_cols.max(1).min(n);
-    for block_start in (0..n).step_by(tile) {
-        let block_len = (n - block_start).min(tile);
-        let blk = (0..m)
-            .into_par_iter()
-            .fold(
-                || vec![0.0_f32; block_len * kp],
-                |mut local, i| {
-                    let row = backend.row_bytes(i);
-                    let f2 = 2.0_f32 * backend.row_freq[i];
-                    let flip = backend.row_flip[i];
-                    let omega_row = &omega[i * kp..(i + 1) * kp];
-                    for off in 0..block_len {
-                        let l = block_start + off;
-                        let code = decode_plink_2bit(row, l);
-                        if let Some(centered) = centered_from_plink_code(code, f2, flip) {
-                            let dst = &mut local[off * kp..(off + 1) * kp];
-                            for j in 0..kp {
-                                dst[j] += centered * omega_row[j];
-                            }
-                        }
-                    }
-                    local
-                },
-            )
-            .reduce(
-                || vec![0.0_f32; block_len * kp],
-                |mut a, b| {
-                    for idx in 0..(block_len * kp) {
-                        a[idx] += b[idx];
-                    }
-                    a
-                },
-            );
-        out[block_start * kp..(block_start + block_len) * kp].copy_from_slice(&blk);
-    }
-    Ok(out)
+    let sample_idx: Vec<usize> = (0..backend.n_samples).collect();
+    let packed_view = PackedRsvdView {
+        packed_flat: &backend.mmap[backend.payload_offset..],
+        bytes_per_snp: backend.bytes_per_snp,
+        n_samples: backend.n_samples,
+        row_freq: &backend.row_freq,
+        row_flip: &backend.row_flip,
+        sample_idx: &sample_idx,
+        packed_row_indices: Some(&backend.active_row_idx),
+    };
+    rsvd_packed_compute_at_random_omega(packed_view, kp, seed)
+}
+
+fn compute_ata_omega_packed(
+    backend: &PackedBedRsvd,
+    omega: &[f32], // (n, kp)
+    kp: usize,
+    timing: Option<&mut RsvdKernelTiming>,
+) -> Result<Vec<f32>, String> {
+    let sample_idx: Vec<usize> = (0..backend.n_samples).collect();
+    let packed_view = PackedRsvdView {
+        packed_flat: &backend.mmap[backend.payload_offset..],
+        bytes_per_snp: backend.bytes_per_snp,
+        n_samples: backend.n_samples,
+        row_freq: &backend.row_freq,
+        row_flip: &backend.row_flip,
+        sample_idx: &sample_idx,
+        packed_row_indices: Some(&backend.active_row_idx),
+    };
+    rsvd_packed_compute_ata_omega(packed_view, omega, kp, timing)
+}
+
+fn compute_gram_aq_packed(
+    backend: &PackedBedRsvd,
+    q: &[f32],
+    kp: usize,
+) -> Result<Vec<f64>, String> {
+    let sample_idx: Vec<usize> = (0..backend.n_samples).collect();
+    let packed_view = PackedRsvdView {
+        packed_flat: &backend.mmap[backend.payload_offset..],
+        bytes_per_snp: backend.bytes_per_snp,
+        n_samples: backend.n_samples,
+        row_freq: &backend.row_freq,
+        row_flip: &backend.row_flip,
+        sample_idx: &sample_idx,
+        packed_row_indices: Some(&backend.active_row_idx),
+    };
+    rsvd_packed_compute_gram_aq(packed_view, q, kp)
 }
 
 fn open_stream_iter(cfg: &StreamRsvdConfig) -> Result<StreamSnpIter, String> {
@@ -581,13 +836,161 @@ where
     Ok((row_idx, n))
 }
 
-fn random_omega(m: usize, kp: usize, seed: u64) -> Vec<f32> {
-    let mut rng = StdRng::seed_from_u64(seed);
-    let mut omega = vec![0.0_f32; m * kp];
-    for v in omega.iter_mut() {
+#[inline]
+fn checked_cblas_dim_local(v: usize, label: &str) -> Result<CblasInt, String> {
+    if v > CblasInt::MAX as usize {
+        return Err(format!("dimension overflow for {label}: {v}"));
+    }
+    Ok(v as CblasInt)
+}
+
+fn for_each_processed_centered_block<F>(
+    cfg: &StreamRsvdConfig,
+    row_freq: &[f32],
+    block_rows: usize,
+    timing: Option<&mut RsvdKernelTiming>,
+    mut on_block: F,
+) -> Result<(usize, usize), String>
+where
+    F: FnMut(usize, usize, &[f32]) -> Result<(), String>,
+{
+    let mut it = open_stream_iter(cfg)?;
+    let n = it.n_samples();
+    if n == 0 {
+        return Err("no samples found in genotype input".to_string());
+    }
+    let block_rows_use = block_rows.max(1);
+    let mut block = vec![0.0_f32; block_rows_use * n];
+    let mut row_idx: usize = 0;
+    let mut filled: usize = 0;
+    let measure_timing = timing.is_some();
+    let mut decode_s = 0.0_f64;
+    let mut gemm_s = 0.0_f64;
+
+    while let Some((mut row, mut ref_allele, mut alt_allele)) = it.next_row_raw() {
+        let t_decode = if measure_timing {
+            Some(Instant::now())
+        } else {
+            None
+        };
+        if row.len() != n {
+            return Err(format!(
+                "inconsistent sample count while streaming: expected {n}, got {}",
+                row.len()
+            ));
+        }
+        normalize_numeric_row(&mut row);
+
+        if cfg.snps_only && !is_simple_snp_alleles(&ref_allele, &alt_allele) {
+            continue;
+        }
+
+        let keep = process_snp_row(
+            &mut row,
+            &mut ref_allele,
+            &mut alt_allele,
+            cfg.maf,
+            cfg.missing_rate,
+            true,
+            false,
+            0.02,
+        );
+        if !keep {
+            continue;
+        }
+        if row_idx >= row_freq.len() {
+            return Err("streamed row count exceeded expected row_freq length".to_string());
+        }
+
+        let mean_g = 2.0_f32 * row_freq[row_idx];
+        let dst = &mut block[filled * n..(filled + 1) * n];
+        for col in 0..n {
+            dst[col] = row[col] - mean_g;
+        }
+        if let Some(t0) = t_decode {
+            decode_s += t0.elapsed().as_secs_f64();
+        }
+        filled += 1;
+        row_idx += 1;
+
+        if filled == block_rows_use {
+            let t_gemm = if measure_timing {
+                Some(Instant::now())
+            } else {
+                None
+            };
+            on_block(row_idx - filled, filled, &block[..filled * n])?;
+            if let Some(t0) = t_gemm {
+                gemm_s += t0.elapsed().as_secs_f64();
+            }
+            filled = 0;
+        }
+    }
+
+    if filled > 0 {
+        let t_gemm = if measure_timing {
+            Some(Instant::now())
+        } else {
+            None
+        };
+        on_block(row_idx - filled, filled, &block[..filled * n])?;
+        if let Some(t0) = t_gemm {
+            gemm_s += t0.elapsed().as_secs_f64();
+        }
+    }
+    if let Some(t) = timing {
+        t.decode_s += decode_s;
+        t.gemm_s += gemm_s;
+    }
+    Ok((row_idx, n))
+}
+
+#[inline]
+fn accum_gram_lower_f64_local(
+    block: &[f32],
+    rows: usize,
+    cols: usize,
+    gram: &mut [f64],
+    gram_block: &mut [f32],
+) -> Result<(), String> {
+    debug_assert_eq!(block.len(), rows * cols);
+    debug_assert_eq!(gram.len(), cols * cols);
+    debug_assert_eq!(gram_block.len(), cols * cols);
+    if rows == 0 || cols == 0 {
+        return Ok(());
+    }
+    gram_block.fill(0.0);
+    let rows_i = checked_cblas_dim_local(rows, "rows")?;
+    let cols_i = checked_cblas_dim_local(cols, "cols")?;
+    unsafe {
+        cblas_sgemm_dispatch(
+            CBLAS_ROW_MAJOR,
+            CBLAS_TRANS,
+            CBLAS_NO_TRANS,
+            cols_i,
+            cols_i,
+            rows_i,
+            1.0_f32,
+            block.as_ptr(),
+            cols_i,
+            block.as_ptr(),
+            cols_i,
+            0.0_f32,
+            gram_block.as_mut_ptr(),
+            cols_i,
+        );
+    }
+    for i in 0..(cols * cols) {
+        gram[i] += gram_block[i] as f64;
+    }
+    Ok(())
+}
+
+#[inline]
+fn fill_random_omega_block(rng: &mut StdRng, omega_block: &mut [f32]) {
+    for v in omega_block.iter_mut() {
         *v = rng.sample::<f64, _>(StandardNormal) as f32;
     }
-    omega
 }
 
 fn thin_svd_from_tall(
@@ -606,21 +1009,29 @@ fn thin_svd_from_tall(
         ));
     }
 
-    let mut gram = vec![0.0_f64; cols * cols];
-    for r in 0..rows {
-        let row = &x[r * cols..(r + 1) * cols];
-        for i in 0..cols {
-            let xi = row[i] as f64;
-            for j in 0..=i {
-                gram[i * cols + j] += xi * (row[j] as f64);
-            }
-        }
+    let rows_i = checked_cblas_dim_local(rows, "rows")?;
+    let cols_i = checked_cblas_dim_local(cols, "cols")?;
+    let _blas_guard = BlasThreadGuard::enter(rayon::current_num_threads().max(1));
+    let mut gram_f32 = vec![0.0_f32; cols * cols];
+    unsafe {
+        cblas_sgemm_dispatch(
+            CBLAS_ROW_MAJOR,
+            CBLAS_TRANS,
+            CBLAS_NO_TRANS,
+            cols_i,
+            cols_i,
+            rows_i,
+            1.0_f32,
+            x.as_ptr(),
+            cols_i,
+            x.as_ptr(),
+            cols_i,
+            0.0_f32,
+            gram_f32.as_mut_ptr(),
+            cols_i,
+        );
     }
-    for i in 0..cols {
-        for j in 0..i {
-            gram[j * cols + i] = gram[i * cols + j];
-        }
-    }
+    let gram: Vec<f64> = gram_f32.into_iter().map(|v| v as f64).collect();
 
     let eig = SymmetricEigen::new(DMatrix::from_row_slice(cols, cols, &gram));
     let mut order: Vec<usize> = (0..cols).collect();
@@ -636,64 +1047,91 @@ fn thin_svd_from_tall(
         }
     }
 
-    let mut u = vec![0.0_f32; rows * cols]; // row-major
-    for r in 0..rows {
-        let x_row = &x[r * cols..(r + 1) * cols];
-        let u_row = &mut u[r * cols..(r + 1) * cols];
-        for c in 0..cols {
-            let mut acc = 0.0_f64;
-            for t in 0..cols {
-                acc += (x_row[t] as f64) * (v[t * cols + c] as f64);
-            }
-            let inv = if s[c] > 1e-12 {
-                1.0_f64 / (s[c] as f64)
-            } else {
-                0.0_f64
-            };
-            u_row[c] = (acc * inv) as f32;
+    let mut v_scaled = v.clone();
+    for c in 0..cols {
+        let inv = if s[c] > 1e-12 {
+            1.0_f32 / s[c]
+        } else {
+            0.0_f32
+        };
+        for r in 0..cols {
+            v_scaled[r * cols + c] *= inv;
         }
+    }
+    let mut u = vec![0.0_f32; rows * cols]; // row-major
+    unsafe {
+        cblas_sgemm_dispatch(
+            CBLAS_ROW_MAJOR,
+            CBLAS_NO_TRANS,
+            CBLAS_NO_TRANS,
+            rows_i,
+            cols_i,
+            cols_i,
+            1.0_f32,
+            x.as_ptr(),
+            cols_i,
+            v_scaled.as_ptr(),
+            cols_i,
+            0.0_f32,
+            u.as_mut_ptr(),
+            cols_i,
+        );
     }
     Ok((u, s, v))
 }
 
-fn compute_at_omega_stream(
+fn compute_at_random_omega_stream(
     cfg: &StreamRsvdConfig,
-    omega: &[f32],    // (m, kp)
     row_freq: &[f32], // (m,)
     m: usize,
     n: usize,
     kp: usize,
+    seed: u64,
 ) -> Result<Vec<f32>, String> {
-    if omega.len() != m * kp {
-        return Err("omega shape mismatch in streaming A^T*Omega".to_string());
-    }
     if row_freq.len() != m {
-        return Err("row_freq length mismatch in streaming A^T*Omega".to_string());
+        return Err("row_freq length mismatch in streaming A^T*Omega_random".to_string());
     }
 
     let mut y = vec![0.0_f32; n * kp]; // (n, kp)
-    let (seen, seen_n) = for_each_processed_row(cfg, |idx, row| {
-        if idx >= m {
-            return Err("streamed row count exceeded expected m in A^T*Omega".to_string());
-        }
-        let omega_row = &omega[idx * kp..(idx + 1) * kp];
-        let f2 = 2.0_f32 * row_freq[idx];
-        for l in 0..n {
-            let gv = row[l];
-            if gv < 0.0 || !gv.is_finite() {
-                continue;
+    let block_rows = rsvd_block_rows_env(n, m);
+    let n_i = checked_cblas_dim_local(n, "n")?;
+    let kp_i = checked_cblas_dim_local(kp, "kp")?;
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut omega_block = vec![0.0_f32; block_rows * kp];
+    let _blas_guard = BlasThreadGuard::enter(rayon::current_num_threads().max(1));
+    let (seen, seen_n) = for_each_processed_centered_block(
+        cfg,
+        row_freq,
+        block_rows,
+        None,
+        |_row_start, rows_here, block| {
+            let rows_i = checked_cblas_dim_local(rows_here, "rows_here")?;
+            let omega_cur = &mut omega_block[..rows_here * kp];
+            fill_random_omega_block(&mut rng, omega_cur);
+            unsafe {
+                cblas_sgemm_dispatch(
+                    CBLAS_ROW_MAJOR,
+                    CBLAS_TRANS,
+                    CBLAS_NO_TRANS,
+                    n_i,
+                    kp_i,
+                    rows_i,
+                    1.0_f32,
+                    block.as_ptr(),
+                    n_i,
+                    omega_cur.as_ptr(),
+                    kp_i,
+                    1.0_f32,
+                    y.as_mut_ptr(),
+                    kp_i,
+                );
             }
-            let centered = gv - f2;
-            let y_row = &mut y[l * kp..(l + 1) * kp];
-            for j in 0..kp {
-                y_row[j] += centered * omega_row[j];
-            }
-        }
-        Ok(())
-    })?;
+            Ok(())
+        },
+    )?;
     if seen_n != n || seen != m {
         return Err(format!(
-            "A^T*Omega pass row mismatch: seen={seen}, expected={m}, n_seen={seen_n}, n_expected={n}"
+            "A^T*Omega_random pass row mismatch: seen={seen}, expected={m}, n_seen={seen_n}, n_expected={n}"
         ));
     }
     Ok(y)
@@ -715,31 +1153,185 @@ fn compute_a_omega_stream(
     }
 
     let mut out = vec![0.0_f32; m * kp]; // (m, kp)
-    let (seen, seen_n) = for_each_processed_row(cfg, |idx, row| {
-        if idx >= m {
-            return Err("streamed row count exceeded expected m in A*Omega".to_string());
-        }
-        let f2 = 2.0_f32 * row_freq[idx];
-        let out_row = &mut out[idx * kp..(idx + 1) * kp];
-        for j in 0..kp {
-            let mut acc = 0.0_f32;
-            for l in 0..n {
-                let gv = row[l];
-                if gv < 0.0 || !gv.is_finite() {
-                    continue;
-                }
-                acc += (gv - f2) * omega[l * kp + j];
+    let block_rows = rsvd_block_rows_env(n, m);
+    let n_i = checked_cblas_dim_local(n, "n")?;
+    let kp_i = checked_cblas_dim_local(kp, "kp")?;
+    let _blas_guard = BlasThreadGuard::enter(rayon::current_num_threads().max(1));
+    let (seen, seen_n) = for_each_processed_centered_block(
+        cfg,
+        row_freq,
+        block_rows,
+        None,
+        |row_start, rows_here, block| {
+            let rows_i = checked_cblas_dim_local(rows_here, "rows_here")?;
+            let out_block = &mut out[row_start * kp..(row_start + rows_here) * kp];
+            unsafe {
+                cblas_sgemm_dispatch(
+                    CBLAS_ROW_MAJOR,
+                    CBLAS_NO_TRANS,
+                    CBLAS_NO_TRANS,
+                    rows_i,
+                    kp_i,
+                    n_i,
+                    1.0_f32,
+                    block.as_ptr(),
+                    n_i,
+                    omega.as_ptr(),
+                    kp_i,
+                    0.0_f32,
+                    out_block.as_mut_ptr(),
+                    kp_i,
+                );
             }
-            out_row[j] = acc;
-        }
-        Ok(())
-    })?;
+            Ok(())
+        },
+    )?;
     if seen_n != n || seen != m {
         return Err(format!(
             "A*Omega pass row mismatch: seen={seen}, expected={m}, n_seen={seen_n}, n_expected={n}"
         ));
     }
     Ok(out)
+}
+
+fn compute_ata_omega_stream(
+    cfg: &StreamRsvdConfig,
+    omega: &[f32],    // (n, kp)
+    row_freq: &[f32], // (m,)
+    m: usize,
+    n: usize,
+    kp: usize,
+    timing: Option<&mut RsvdKernelTiming>,
+) -> Result<Vec<f32>, String> {
+    if omega.len() != n * kp {
+        return Err("omega shape mismatch in streaming A^T*(A*Omega)".to_string());
+    }
+    if row_freq.len() != m {
+        return Err("row_freq length mismatch in streaming A^T*(A*Omega)".to_string());
+    }
+
+    let mut out = vec![0.0_f32; n * kp];
+    let block_rows = rsvd_block_rows_env(n, m);
+    let n_i = checked_cblas_dim_local(n, "n")?;
+    let kp_i = checked_cblas_dim_local(kp, "kp")?;
+    let mut g_block = vec![0.0_f32; block_rows * kp];
+    let _blas_guard = BlasThreadGuard::enter(rayon::current_num_threads().max(1));
+    let (seen, seen_n) = for_each_processed_centered_block(
+        cfg,
+        row_freq,
+        block_rows,
+        timing,
+        |_row_start, rows_here, block| {
+            let rows_i = checked_cblas_dim_local(rows_here, "rows_here")?;
+            let cur_g = &mut g_block[..rows_here * kp];
+            unsafe {
+                cblas_sgemm_dispatch(
+                    CBLAS_ROW_MAJOR,
+                    CBLAS_NO_TRANS,
+                    CBLAS_NO_TRANS,
+                    rows_i,
+                    kp_i,
+                    n_i,
+                    1.0_f32,
+                    block.as_ptr(),
+                    n_i,
+                    omega.as_ptr(),
+                    kp_i,
+                    0.0_f32,
+                    cur_g.as_mut_ptr(),
+                    kp_i,
+                );
+                cblas_sgemm_dispatch(
+                    CBLAS_ROW_MAJOR,
+                    CBLAS_TRANS,
+                    CBLAS_NO_TRANS,
+                    n_i,
+                    kp_i,
+                    rows_i,
+                    1.0_f32,
+                    block.as_ptr(),
+                    n_i,
+                    cur_g.as_ptr(),
+                    kp_i,
+                    1.0_f32,
+                    out.as_mut_ptr(),
+                    kp_i,
+                );
+            }
+            Ok(())
+        },
+    )?;
+    if seen_n != n || seen != m {
+        return Err(format!(
+            "A^T*(A*Omega) pass row mismatch: seen={seen}, expected={m}, n_seen={seen_n}, n_expected={n}"
+        ));
+    }
+    Ok(out)
+}
+
+fn compute_gram_aq_stream(
+    cfg: &StreamRsvdConfig,
+    q: &[f32],        // (n, kp)
+    row_freq: &[f32], // (m,)
+    m: usize,
+    n: usize,
+    kp: usize,
+) -> Result<Vec<f64>, String> {
+    if q.len() != n * kp {
+        return Err("q shape mismatch in streaming gram(AQ)".to_string());
+    }
+    if row_freq.len() != m {
+        return Err("row_freq length mismatch in streaming gram(AQ)".to_string());
+    }
+
+    let block_rows = rsvd_block_rows_env(n, m);
+    let n_i = checked_cblas_dim_local(n, "n")?;
+    let kp_i = checked_cblas_dim_local(kp, "kp")?;
+    let mut gram = vec![0.0_f64; kp * kp];
+    let mut gram_block = vec![0.0_f32; kp * kp];
+    let mut g_block = vec![0.0_f32; block_rows * kp];
+    let _blas_guard = BlasThreadGuard::enter(rayon::current_num_threads().max(1));
+    let (seen, seen_n) = for_each_processed_centered_block(
+        cfg,
+        row_freq,
+        block_rows,
+        None,
+        |_row_start, rows_here, block| {
+            let rows_i = checked_cblas_dim_local(rows_here, "rows_here")?;
+            let cur_g = &mut g_block[..rows_here * kp];
+            unsafe {
+                cblas_sgemm_dispatch(
+                    CBLAS_ROW_MAJOR,
+                    CBLAS_NO_TRANS,
+                    CBLAS_NO_TRANS,
+                    rows_i,
+                    kp_i,
+                    n_i,
+                    1.0_f32,
+                    block.as_ptr(),
+                    n_i,
+                    q.as_ptr(),
+                    kp_i,
+                    0.0_f32,
+                    cur_g.as_mut_ptr(),
+                    kp_i,
+                );
+            }
+            accum_gram_lower_f64_local(cur_g, rows_here, kp, &mut gram, &mut gram_block)?;
+            Ok(())
+        },
+    )?;
+    if seen_n != n || seen != m {
+        return Err(format!(
+            "gram(AQ) pass row mismatch: seen={seen}, expected={m}, n_seen={seen_n}, n_expected={n}"
+        ));
+    }
+    for i in 0..kp {
+        for j in 0..i {
+            gram[j * kp + i] = gram[i * kp + j];
+        }
+    }
+    Ok(gram)
 }
 
 #[pyfunction]
@@ -791,9 +1383,10 @@ pub fn admx_rsvd_stream<'py>(
         delimiter,
         mmap_window_mb,
     };
+    let t_total = Instant::now();
+    let mut t_stage = Instant::now();
 
     let packed_backend = try_build_packed_bed_backend(&cfg).map_err(PyRuntimeError::new_err)?;
-    let tile_cols = rsvd_tile_cols_env();
 
     let mut row_freq: Vec<f32> = Vec::new();
     let (m, n) = if let Some(backend) = packed_backend.as_ref() {
@@ -819,6 +1412,7 @@ pub fn admx_rsvd_stream<'py>(
         })
         .map_err(PyRuntimeError::new_err)?
     };
+    let backend_s = t_stage.elapsed().as_secs_f64();
 
     if m == 0 {
         return Err(PyRuntimeError::new_err(
@@ -833,6 +1427,7 @@ pub fn admx_rsvd_stream<'py>(
 
     let k_eff = k.min(m);
     let kp = (k_eff + 10).max(20).min(m.max(1));
+    let block_rows = rsvd_block_rows_env(n, m);
     let backend_extra = if let Some(backend) = packed_backend.as_ref() {
         format!(
             " total_sites={} active_row_idx={}",
@@ -860,23 +1455,28 @@ pub fn admx_rsvd_stream<'py>(
             backend_extra,
         ),
     );
+    emit_rsvd_time_debug(
+        "stream/backend_ready",
+        &format!("elapsed={}", fmt_stage_secs(backend_s)),
+    );
 
-    let omega = random_omega(m, kp, seed);
     emit_rsvd_rss_debug(
         "stream/omega_ready",
         &format!(
-            "omega_shape=({}, {}) omega={}",
-            m,
+            "omega_mode=random_block rows={} kp={} omega_scratch={}",
+            block_rows,
             kp,
-            format_f32_vec_bytes(omega.len())
+            format_f32_vec_bytes(block_rows * kp)
         ),
     );
+    t_stage = Instant::now();
     let mut y = if let Some(backend) = packed_backend.as_ref() {
-        compute_at_omega_packed(backend, &omega, kp, tile_cols)
+        compute_at_random_omega_packed(backend, kp, seed)
     } else {
-        compute_at_omega_stream(&cfg, &omega, &row_freq, m, n, kp)
+        compute_at_random_omega_stream(&cfg, &row_freq, m, n, kp, seed)
     }
     .map_err(PyRuntimeError::new_err)?;
+    let init_proj_s = t_stage.elapsed().as_secs_f64();
     emit_rsvd_rss_debug(
         "stream/y_ready",
         &format!(
@@ -886,7 +1486,13 @@ pub fn admx_rsvd_stream<'py>(
             format_f32_vec_bytes(y.len())
         ),
     );
+    emit_rsvd_time_debug(
+        "stream/init_proj",
+        &format!("elapsed={}", fmt_stage_secs(init_proj_s)),
+    );
+    t_stage = Instant::now();
     let (mut q, _, _) = thin_svd_from_tall(&y, n, kp).map_err(PyRuntimeError::new_err)?;
+    let init_q_s = t_stage.elapsed().as_secs_f64();
     emit_rsvd_rss_debug(
         "stream/q_ready",
         &format!(
@@ -896,27 +1502,60 @@ pub fn admx_rsvd_stream<'py>(
             format_f32_vec_bytes(q.len())
         ),
     );
+    emit_rsvd_time_debug(
+        "stream/init_q",
+        &format!("elapsed={}", fmt_stage_secs(init_q_s)),
+    );
 
     let mut sk = vec![0.0_f32; kp];
     let mut alpha = 0.0_f32;
+    let mut power_mul_s = 0.0_f64;
+    let mut power_mul_decode_s = 0.0_f64;
+    let mut power_mul_gemm_s = 0.0_f64;
+    let mut power_qr_s = 0.0_f64;
+    let mut power_iters_done = 0usize;
+    let measure_kernel_timing = rsvd_time_debug_enabled();
     for it in 0..power {
-        let g_small = if let Some(backend) = packed_backend.as_ref() {
-            compute_a_omega_packed(backend, &q, kp)
-        } else {
-            compute_a_omega_stream(&cfg, &q, &row_freq, m, n, kp)
-        }
-        .map_err(PyRuntimeError::new_err)?;
+        let t_power_mul = Instant::now();
+        let mut kernel_timing = RsvdKernelTiming::default();
         y = if let Some(backend) = packed_backend.as_ref() {
-            compute_at_omega_packed(backend, &g_small, kp, tile_cols)
+            compute_ata_omega_packed(
+                backend,
+                &q,
+                kp,
+                if measure_kernel_timing {
+                    Some(&mut kernel_timing)
+                } else {
+                    None
+                },
+            )
         } else {
-            compute_at_omega_stream(&cfg, &g_small, &row_freq, m, n, kp)
+            compute_ata_omega_stream(
+                &cfg,
+                &q,
+                &row_freq,
+                m,
+                n,
+                kp,
+                if measure_kernel_timing {
+                    Some(&mut kernel_timing)
+                } else {
+                    None
+                },
+            )
         }
         .map_err(PyRuntimeError::new_err)?;
+        power_mul_s += t_power_mul.elapsed().as_secs_f64();
+        power_mul_decode_s += kernel_timing.decode_s;
+        power_mul_gemm_s += kernel_timing.gemm_s;
         for idx in 0..(n * kp) {
             y[idx] -= alpha * q[idx];
         }
+        let t_power_qr = Instant::now();
         let (q_new, s_y, _) = thin_svd_from_tall(&y, n, kp).map_err(PyRuntimeError::new_err)?;
+        power_qr_s += t_power_qr.elapsed().as_secs_f64();
         q = q_new;
+        power_iters_done = it + 1;
 
         if it > 0 {
             let mut max_rel = 0.0_f32;
@@ -944,25 +1583,31 @@ pub fn admx_rsvd_stream<'py>(
         }
     }
 
+    t_stage = Instant::now();
     let g_small = if let Some(backend) = packed_backend.as_ref() {
         compute_a_omega_packed(backend, &q, kp)
     } else {
         compute_a_omega_stream(&cfg, &q, &row_freq, m, n, kp)
     }
     .map_err(PyRuntimeError::new_err)?;
+    let final_proj_s = t_stage.elapsed().as_secs_f64();
+    t_stage = Instant::now();
     let (u_small, s_all, _) =
         thin_svd_from_tall(&g_small, m, kp).map_err(PyRuntimeError::new_err)?;
+    let final_svd_s = t_stage.elapsed().as_secs_f64();
 
     let mut eigvals = vec![0.0_f32; k_eff];
     for i in 0..k_eff {
         eigvals[i] = s_all[i] * s_all[i];
     }
     let mut eigvecs = vec![0.0_f32; m * k_eff];
+    t_stage = Instant::now();
     for r in 0..m {
         let src = &u_small[r * kp..(r + 1) * kp];
         let dst = &mut eigvecs[r * k_eff..(r + 1) * k_eff];
         dst.copy_from_slice(&src[..k_eff]);
     }
+    let final_vec_s = t_stage.elapsed().as_secs_f64();
 
     let eval_arr = PyArray1::<f32>::zeros(py, [k_eff], false).into_bound();
     let evec_arr = PyArray2::<f32>::zeros(py, [m, k_eff], false).into_bound();
@@ -984,6 +1629,26 @@ pub fn admx_rsvd_stream<'py>(
             m,
             k_eff,
             format_f32_vec_bytes(eigvecs.len()),
+        ),
+    );
+    let total_s = t_total.elapsed().as_secs_f64();
+    emit_rsvd_time_debug(
+        "stream/summary",
+        &format!(
+            "total={} backend={} init_proj={} init_q={} power_mul={} power_mul_decode={} power_mul_gemm={} power_qr={} final_proj={} final_svd={} final_vec={} power_iters={} block_rows={}",
+            fmt_stage_secs(total_s),
+            fmt_stage_secs(backend_s),
+            fmt_stage_secs(init_proj_s),
+            fmt_stage_secs(init_q_s),
+            fmt_stage_secs(power_mul_s),
+            fmt_stage_secs(power_mul_decode_s),
+            fmt_stage_secs(power_mul_gemm_s),
+            fmt_stage_secs(power_qr_s),
+            fmt_stage_secs(final_proj_s),
+            fmt_stage_secs(final_svd_s),
+            fmt_stage_secs(final_vec_s),
+            power_iters_done,
+            block_rows,
         ),
     );
     eval_slice.copy_from_slice(&eigvals);
@@ -1040,9 +1705,10 @@ pub fn admx_rsvd_stream_sample<'py>(
         delimiter,
         mmap_window_mb,
     };
+    let t_total = Instant::now();
+    let mut t_stage = Instant::now();
 
     let packed_backend = try_build_packed_bed_backend(&cfg).map_err(PyRuntimeError::new_err)?;
-    let tile_cols = rsvd_tile_cols_env();
 
     let mut row_freq: Vec<f32> = Vec::new();
     let mut varsum: f64 = 0.0;
@@ -1073,6 +1739,7 @@ pub fn admx_rsvd_stream_sample<'py>(
         })
         .map_err(PyRuntimeError::new_err)?
     };
+    let backend_s = t_stage.elapsed().as_secs_f64();
 
     if m == 0 {
         return Err(PyRuntimeError::new_err(
@@ -1092,6 +1759,7 @@ pub fn admx_rsvd_stream_sample<'py>(
 
     let k_eff = k.min(n);
     let kp = (k_eff + 10).max(20).min(m.max(1));
+    let block_rows = rsvd_block_rows_env(n, m);
     let backend_extra = if let Some(backend) = packed_backend.as_ref() {
         format!(
             " total_sites={} active_row_idx={}",
@@ -1120,23 +1788,28 @@ pub fn admx_rsvd_stream_sample<'py>(
             backend_extra,
         ),
     );
+    emit_rsvd_time_debug(
+        "stream_sample/backend_ready",
+        &format!("elapsed={}", fmt_stage_secs(backend_s)),
+    );
 
-    let omega = random_omega(m, kp, seed);
     emit_rsvd_rss_debug(
         "stream_sample/omega_ready",
         &format!(
-            "omega_shape=({}, {}) omega={}",
-            m,
+            "omega_mode=random_block rows={} kp={} omega_scratch={}",
+            block_rows,
             kp,
-            format_f32_vec_bytes(omega.len())
+            format_f32_vec_bytes(block_rows * kp)
         ),
     );
+    t_stage = Instant::now();
     let mut y = if let Some(backend) = packed_backend.as_ref() {
-        compute_at_omega_packed(backend, &omega, kp, tile_cols)
+        compute_at_random_omega_packed(backend, kp, seed)
     } else {
-        compute_at_omega_stream(&cfg, &omega, &row_freq, m, n, kp)
+        compute_at_random_omega_stream(&cfg, &row_freq, m, n, kp, seed)
     }
     .map_err(PyRuntimeError::new_err)?;
+    let init_proj_s = t_stage.elapsed().as_secs_f64();
     emit_rsvd_rss_debug(
         "stream_sample/y_ready",
         &format!(
@@ -1146,7 +1819,13 @@ pub fn admx_rsvd_stream_sample<'py>(
             format_f32_vec_bytes(y.len())
         ),
     );
+    emit_rsvd_time_debug(
+        "stream_sample/init_proj",
+        &format!("elapsed={}", fmt_stage_secs(init_proj_s)),
+    );
+    t_stage = Instant::now();
     let (mut q, _, _) = thin_svd_from_tall(&y, n, kp).map_err(PyRuntimeError::new_err)?;
+    let init_q_s = t_stage.elapsed().as_secs_f64();
     emit_rsvd_rss_debug(
         "stream_sample/q_ready",
         &format!(
@@ -1156,27 +1835,60 @@ pub fn admx_rsvd_stream_sample<'py>(
             format_f32_vec_bytes(q.len())
         ),
     );
+    emit_rsvd_time_debug(
+        "stream_sample/init_q",
+        &format!("elapsed={}", fmt_stage_secs(init_q_s)),
+    );
 
     let mut sk = vec![0.0_f32; kp];
     let mut alpha = 0.0_f32;
+    let mut power_mul_s = 0.0_f64;
+    let mut power_mul_decode_s = 0.0_f64;
+    let mut power_mul_gemm_s = 0.0_f64;
+    let mut power_qr_s = 0.0_f64;
+    let mut power_iters_done = 0usize;
+    let measure_kernel_timing = rsvd_time_debug_enabled();
     for it in 0..power {
-        let g_small = if let Some(backend) = packed_backend.as_ref() {
-            compute_a_omega_packed(backend, &q, kp)
-        } else {
-            compute_a_omega_stream(&cfg, &q, &row_freq, m, n, kp)
-        }
-        .map_err(PyRuntimeError::new_err)?;
+        let t_power_mul = Instant::now();
+        let mut kernel_timing = RsvdKernelTiming::default();
         y = if let Some(backend) = packed_backend.as_ref() {
-            compute_at_omega_packed(backend, &g_small, kp, tile_cols)
+            compute_ata_omega_packed(
+                backend,
+                &q,
+                kp,
+                if measure_kernel_timing {
+                    Some(&mut kernel_timing)
+                } else {
+                    None
+                },
+            )
         } else {
-            compute_at_omega_stream(&cfg, &g_small, &row_freq, m, n, kp)
+            compute_ata_omega_stream(
+                &cfg,
+                &q,
+                &row_freq,
+                m,
+                n,
+                kp,
+                if measure_kernel_timing {
+                    Some(&mut kernel_timing)
+                } else {
+                    None
+                },
+            )
         }
         .map_err(PyRuntimeError::new_err)?;
+        power_mul_s += t_power_mul.elapsed().as_secs_f64();
+        power_mul_decode_s += kernel_timing.decode_s;
+        power_mul_gemm_s += kernel_timing.gemm_s;
         for idx in 0..(n * kp) {
             y[idx] -= alpha * q[idx];
         }
+        let t_power_qr = Instant::now();
         let (q_new, s_y, _) = thin_svd_from_tall(&y, n, kp).map_err(PyRuntimeError::new_err)?;
+        power_qr_s += t_power_qr.elapsed().as_secs_f64();
         q = q_new;
+        power_iters_done = it + 1;
 
         if it > 0 {
             let mut max_rel = 0.0_f32;
@@ -1204,24 +1916,32 @@ pub fn admx_rsvd_stream_sample<'py>(
         }
     }
 
-    let g_small = if let Some(backend) = packed_backend.as_ref() {
-        compute_a_omega_packed(backend, &q, kp)
+    t_stage = Instant::now();
+    let gram = if let Some(backend) = packed_backend.as_ref() {
+        compute_gram_aq_packed(backend, &q, kp).map_err(PyRuntimeError::new_err)?
     } else {
-        compute_a_omega_stream(&cfg, &q, &row_freq, m, n, kp)
-    }
-    .map_err(PyRuntimeError::new_err)?;
+        compute_gram_aq_stream(&cfg, &q, &row_freq, m, n, kp).map_err(PyRuntimeError::new_err)?
+    };
+    let gram_s = t_stage.elapsed().as_secs_f64();
     emit_rsvd_rss_debug(
-        "stream_sample/g_small_ready",
+        "stream_sample/gram_ready",
         &format!(
-            "g_small_shape=({}, {}) g_small={}",
-            m,
+            "gram_shape=({}, {}) gram={}",
             kp,
-            format_f32_vec_bytes(g_small.len()),
+            kp,
+            format_debug_bytes_local(
+                (gram.len().saturating_mul(std::mem::size_of::<f64>())) as u64
+            ),
         ),
     );
-    let (_, s_all, v_small) =
-        thin_svd_from_tall(&g_small, m, kp).map_err(PyRuntimeError::new_err)?;
-
+    emit_rsvd_time_debug(
+        "stream_sample/gram",
+        &format!("elapsed={}", fmt_stage_secs(gram_s)),
+    );
+    t_stage = Instant::now();
+    let (s_all, v_small) =
+        rsvd_right_singular_from_gram(&gram, kp).map_err(PyRuntimeError::new_err)?;
+    let eig_s = t_stage.elapsed().as_secs_f64();
     let mut eigvals = vec![0.0_f32; k_eff];
     // Align PCA eigenvalue scaling with the GRM pathway in python/janusx/script/pca.py.
     // For sample-side PCA: lambda = sigma^2 / varsum, where
@@ -1233,6 +1953,7 @@ pub fn admx_rsvd_stream_sample<'py>(
 
     // Sample-side eigenvectors/right singular vectors: q @ v_small[:, :k_eff]
     let mut eigvecs_sample = vec![0.0_f32; n * k_eff];
+    t_stage = Instant::now();
     for r in 0..n {
         let q_row = &q[r * kp..(r + 1) * kp];
         let out_row = &mut eigvecs_sample[r * k_eff..(r + 1) * k_eff];
@@ -1244,6 +1965,7 @@ pub fn admx_rsvd_stream_sample<'py>(
             out_row[c] = acc as f32;
         }
     }
+    let final_vec_s = t_stage.elapsed().as_secs_f64();
 
     let eval_arr = PyArray1::<f32>::zeros(py, [k_eff], false).into_bound();
     let evec_arr = PyArray2::<f32>::zeros(py, [n, k_eff], false).into_bound();
@@ -1265,6 +1987,26 @@ pub fn admx_rsvd_stream_sample<'py>(
             n,
             k_eff,
             format_f32_vec_bytes(eigvecs_sample.len()),
+        ),
+    );
+    let total_s = t_total.elapsed().as_secs_f64();
+    emit_rsvd_time_debug(
+        "stream_sample/summary",
+        &format!(
+            "total={} backend={} init_proj={} init_q={} power_mul={} power_mul_decode={} power_mul_gemm={} power_qr={} gram={} eig={} final_vec={} power_iters={} block_rows={}",
+            fmt_stage_secs(total_s),
+            fmt_stage_secs(backend_s),
+            fmt_stage_secs(init_proj_s),
+            fmt_stage_secs(init_q_s),
+            fmt_stage_secs(power_mul_s),
+            fmt_stage_secs(power_mul_decode_s),
+            fmt_stage_secs(power_mul_gemm_s),
+            fmt_stage_secs(power_qr_s),
+            fmt_stage_secs(gram_s),
+            fmt_stage_secs(eig_s),
+            fmt_stage_secs(final_vec_s),
+            power_iters_done,
+            block_rows,
         ),
     );
     eval_slice.copy_from_slice(&eigvals);

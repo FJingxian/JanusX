@@ -4348,8 +4348,10 @@ def run_splmm_packed_fullrank(
                 prepare_handle = None
 
         scan_meta = None
-        null_t0 = time.monotonic()
+        scan_meta_secs = 0.0
+        null_fit_secs = 0.0
         if not bool(use_preloaded_scan_meta):
+            scan_meta_t0 = time.monotonic()
             scan_meta = _jxlmm_bed_logic_meta_selected(
                 str(kinship_prefix),
                 sample_indices=kinship_sample_idx_trait,
@@ -4358,6 +4360,8 @@ def run_splmm_packed_fullrank(
                 het_threshold=float(het_threshold),
                 snps_only=bool(snps_only),
             )
+            scan_meta_secs = max(time.monotonic() - scan_meta_t0, 0.0)
+        null_fit_t0 = time.monotonic()
         null_fit = _jxlmm_sparse_null_fit(
             jxgrm_path=str(trait_sparse_kinship_path),
             sample_idx=kinship_sample_idx_trait,
@@ -4365,7 +4369,8 @@ def run_splmm_packed_fullrank(
             x_cov=x_arg,
             progress_callback=None,
         )
-        null_secs = max(time.monotonic() - null_t0, 0.0)
+        null_fit_secs = max(time.monotonic() - null_fit_t0, 0.0)
+        null_secs = float(scan_meta_secs + null_fit_secs)
         peak_rss = max(peak_rss, process.memory_info().rss)
 
         sigma_g2 = float(null_fit["sigma_g2"])
@@ -4426,10 +4431,10 @@ def run_splmm_packed_fullrank(
             f"c_p0_to_mx={sigma_scale_p0_to_mx:.4g}, "
             f"scan_scale={sigma_scale_reml:.4g}, "
             f"lambda_boundary={null_lambda_boundary or 'interior'}, "
-            f"backend={null_backend} [{format_elapsed(null_secs)}]"
+            f"backend={null_backend} [null_fit={format_elapsed(null_fit_secs)}]"
             if np.isfinite(null_pve)
             else f"{null_strategy} null fit sigma_g2={sigma_g2:.4g}, sigma_e2={sigma_e2:.4g}, "
-            f"backend={null_backend} [{format_elapsed(null_secs)}]"
+            f"backend={null_backend} [null_fit={format_elapsed(null_fit_secs)}]"
         )
         if scan_sigma_preview_valid:
             _null_fit_msg = (
@@ -4904,14 +4909,26 @@ def run_splmm_packed_fullrank(
             f"V^-1y converged={str(y_conv).lower()} ({y_iters} iters, relres={y_rel_res:.2e}), "
             f"V^-1X converged={str(x_conv_all).lower()} ({x_max_iters} iters, relres={x_max_rel_res:.2e})"
         )
+        _timing_diag_msg = (
+            f"trait timing: scan_meta={format_elapsed(scan_meta_secs)}, "
+            f"null_fit={format_elapsed(null_fit_secs)}, "
+            f"scan={format_elapsed(scan_secs)}"
+        )
         _assoc_test_msg = (
             "association test uses Wald chi^2(1): chisq=(beta/se)^2, "
             "pwald=Pr[Chi^2_1>=chisq]; SparseLMM does not currently emit a PLRT/LRT column."
         )
         if bool(use_spinner):
+            _log_file_only(logger, logging.INFO, f"SparseLMM: {_timing_diag_msg}")
             _log_file_only(logger, logging.INFO, f"SparseLMM: {_scan_diag_msg}")
             _log_file_only(logger, logging.INFO, f"SparseLMM: {_assoc_test_msg}")
         else:
+            _log_model_line(
+                logger,
+                "SparseLMM",
+                _timing_diag_msg,
+                use_spinner=False,
+            )
             _log_model_line(
                 logger,
                 "SparseLMM",
@@ -4955,7 +4972,10 @@ def run_splmm_packed_fullrank(
                 "pve": (float(null_pve) if np.isfinite(null_pve) else None),
                 "avg_cpu": float(avg_cpu),
                 "peak_rss_gb": float(peak_rss_gb),
-                "gwas_time_s": float(null_secs + scan_secs),
+                "gwas_time_s": float(scan_meta_secs + null_fit_secs + scan_secs),
+                "splmm_scan_meta_s": float(scan_meta_secs),
+                "splmm_null_fit_s": float(null_fit_secs),
+                "splmm_scan_s": float(scan_secs),
                 "viz_time_s": float(viz_secs),
                 "splmm_sigma_scale_reml": (
                     float(sigma_scale_reml) if np.isfinite(sigma_scale_reml) else None
@@ -4994,7 +5014,11 @@ def run_splmm_packed_fullrank(
             }
         )
 
-        done_times = [format_elapsed(null_secs), format_elapsed(scan_secs)]
+        done_times = [
+            format_elapsed(scan_meta_secs),
+            format_elapsed(null_fit_secs),
+            format_elapsed(scan_secs),
+        ]
         if plot:
             done_times.append(format_elapsed(viz_secs))
         _rich_success(

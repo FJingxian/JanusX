@@ -3069,7 +3069,8 @@ pub fn glmf32_packed_assoc_to_tsv(
                     let idx = i_marker + l;
                     let base = l * 5;
                     let chisq_txt = format_chisq_value(block[base + 2]);
-                    let pwald = sanitize_assoc_pvalue(block[base], block[base + 1], block[base + 3]);
+                    let pwald =
+                        sanitize_assoc_pvalue(block[base], block[base + 1], block[base + 3]);
                     let _ = write!(
                         text_buf,
                         "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\t{:.4e}\n",

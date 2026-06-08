@@ -204,6 +204,14 @@ _GWAS_COL_RANGE_RE = re.compile(r"^\s*(\d+)\s*([:-])\s*(\d+)\s*$")
 # Basic utilities
 # ======================================================================
 
+def _env_truthy(name: str, default: str = "0") -> bool:
+    raw = str(os.environ.get(name, default)).strip().lower()
+    return raw in {"1", "true", "yes", "y", "on"}
+
+
+def _gwas_plot_enabled() -> bool:
+    return _env_truthy("JX_GWAS_PLOT", "1")
+
 def _section(logger:logging.Logger, title: str) -> None:
     """Emit a formatted log section header with a leading blank line."""
     logger.info("")
@@ -5650,8 +5658,9 @@ def _run_gwas_pipeline(
     run_error = ""
     if args is None:
         args = parse_args(argv)
-    # Plotting is always enabled for GWAS CLI.
-    args.plot = True
+    # Plotting is enabled by default for GWAS CLI, but benchmarks can disable
+    # it to keep visualization out of end-to-end runtime comparisons.
+    args.plot = _gwas_plot_enabled()
     args.cov = _normalize_cov_inputs(args.cov)
     thread_budget = detect_thread_budget_info()
     detected_threads = int(thread_budget["effective_threads"])

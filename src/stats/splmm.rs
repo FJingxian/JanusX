@@ -12,6 +12,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::bedmath::adaptive_grm_block_rows;
 use crate::blas::{
@@ -32,7 +33,7 @@ use crate::linalg::{
     format_chisq_value, sanitize_assoc_pvalue,
 };
 use crate::pcg::{PcgJxlmmNullModel, PcgJxlmmNullModelInfo, PcgJxlmmRHatResult};
-use crate::stats_common::{get_cached_pool, parse_index_vec_i64, AsyncTsvWriter};
+use crate::stats_common::{env_truthy, get_cached_pool, parse_index_vec_i64, AsyncTsvWriter};
 
 const SPLMM_TINY: f64 = 1e-30_f64;
 const SPLMM_EXACT_PG_MIN_REL_SM: f64 = 1e-4_f64;
@@ -41,6 +42,80 @@ const SPLMM_DEFAULT_RHAT_SEED: u64 = 20260527;
 const SPLMM_DEFAULT_SPARSE_CHOLESKY_MAX_L_NNZ: usize = 100_000_000;
 const SPLMM_TWO_STAGE_P_THRESHOLD_FLOOR: f64 = 1e-4_f64;
 const SPLMM_TWO_STAGE_P_THRESHOLD_NUM: f64 = 10.0_f64;
+
+#[derive(Clone, Copy, Debug, Default)]
+struct SplmmPackedScanTiming {
+    decode_secs: f64,
+    gpy_secs: f64,
+    gx_secs: f64,
+    row_sumsq_secs: f64,
+    repack_secs: f64,
+    solve_secs: f64,
+    xtz_secs: f64,
+    denom_secs: f64,
+    sink_secs: f64,
+}
+
+#[inline]
+fn splmm_packed_stage_timing_enabled() -> bool {
+    env_truthy("JX_SPLMM_PACKED_STAGE_TIMING")
+}
+
+fn emit_splmm_packed_scan_timing(
+    mode: &str,
+    timing: &SplmmPackedScanTiming,
+    total_secs: f64,
+    rows: usize,
+    n: usize,
+    p: usize,
+    threads: usize,
+) {
+    let accounted_secs = timing.decode_secs
+        + timing.gpy_secs
+        + timing.gx_secs
+        + timing.row_sumsq_secs
+        + timing.repack_secs
+        + timing.solve_secs
+        + timing.xtz_secs
+        + timing.denom_secs
+        + timing.sink_secs;
+    let other_secs = (total_secs - accounted_secs).max(0.0_f64);
+    let to_pct = |x: f64| -> f64 {
+        if total_secs > 0.0 {
+            x * 100.0 / total_secs
+        } else {
+            0.0
+        }
+    };
+    eprintln!(
+        "SparseLMM packed timing mode={mode}: decode={:.3}s ({:.1}%), gpy={:.3}s ({:.1}%), gx={:.3}s ({:.1}%), row_sumsq={:.3}s ({:.1}%), repack={:.3}s ({:.1}%), solve={:.3}s ({:.1}%), xtz={:.3}s ({:.1}%), denom={:.3}s ({:.1}%), sink={:.3}s ({:.1}%), other={:.3}s ({:.1}%), total={:.3}s, rows={}, n={}, p={}, threads={}",
+        timing.decode_secs,
+        to_pct(timing.decode_secs),
+        timing.gpy_secs,
+        to_pct(timing.gpy_secs),
+        timing.gx_secs,
+        to_pct(timing.gx_secs),
+        timing.row_sumsq_secs,
+        to_pct(timing.row_sumsq_secs),
+        timing.repack_secs,
+        to_pct(timing.repack_secs),
+        timing.solve_secs,
+        to_pct(timing.solve_secs),
+        timing.xtz_secs,
+        to_pct(timing.xtz_secs),
+        timing.denom_secs,
+        to_pct(timing.denom_secs),
+        timing.sink_secs,
+        to_pct(timing.sink_secs),
+        other_secs,
+        to_pct(other_secs),
+        total_secs,
+        rows,
+        n,
+        p,
+        if threads > 0 { threads } else { rayon::current_num_threads() },
+    );
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SplmmScanMode {
@@ -1499,6 +1574,9 @@ fn exact_scan_blocks_core<G: GenotypeMatrix>(
     _solve_workspace: &mut SparseJxgrmSolveWorkspace,
     sink: &mut dyn FnMut(usize, usize, &[f64]) -> Result<(), String>,
 ) -> Result<(), String> {
+    let stage_timing = splmm_packed_stage_timing_enabled();
+    let total_t0 = stage_timing.then(Instant::now);
+    let mut timing = SplmmPackedScanTiming::default();
     if !(score_scale.is_finite() && score_scale > 0.0) {
         return Err(format!(
             "SparseLMM exact scan requires finite positive score scale, got {score_scale}"
@@ -1628,6 +1706,7 @@ fn exact_scan_blocks_core<G: GenotypeMatrix>(
         let ss_slice = &mut row_ss[..rows_here];
 
         // Step 1: decode genotype block via UnifiedInput
+        let t0 = stage_timing.then(Instant::now);
         input.matrix.decode_additive_block(
             &input.stats,
             row_start,
@@ -1636,8 +1715,12 @@ fn exact_scan_blocks_core<G: GenotypeMatrix>(
             sample_identity,
             pool.as_ref(),
         )?;
+        if let Some(t0) = t0 {
+            timing.decode_secs += t0.elapsed().as_secs_f64();
+        }
 
         // Step 2: numerator = G_block * Py
+        let t0 = stage_timing.then(Instant::now);
         row_major_block_mul_mat_f32(
             block_slice,
             rows_here,
@@ -1647,6 +1730,10 @@ fn exact_scan_blocks_core<G: GenotypeMatrix>(
             spy_slice,
             pool.as_ref(),
         );
+        if let Some(t0) = t0 {
+            timing.gpy_secs += t0.elapsed().as_secs_f64();
+        }
+        let t0 = stage_timing.then(Instant::now);
         row_major_block_mul_mat_f32(
             block_slice,
             rows_here,
@@ -1656,15 +1743,27 @@ fn exact_scan_blocks_core<G: GenotypeMatrix>(
             xts_slice,
             pool.as_ref(),
         );
+        if let Some(t0) = t0 {
+            timing.gx_secs += t0.elapsed().as_secs_f64();
+        }
+        let t0 = stage_timing.then(Instant::now);
         row_major_block_sumsq_f64(block_slice, rows_here, n, ss_slice, pool.as_ref());
+        if let Some(t0) = t0 {
+            timing.row_sumsq_secs += t0.elapsed().as_secs_f64();
+        }
 
         // Step 3: convert to column-major f64 for sparse solve
         let rhs_slice = &mut rhs_col_major[..rows_here * n];
+        let t0 = stage_timing.then(Instant::now);
         row_major_snp_block_f32_to_col_major_f64(block_slice, rows_here, n, rhs_slice);
+        if let Some(t0) = t0 {
+            timing.repack_secs += t0.elapsed().as_secs_f64();
+        }
 
         // Step 4: solve V * Z_block = G_block (tiled, in-place)
         let z_slice = &mut z_col_major[..rows_here * n];
         z_slice.copy_from_slice(rhs_slice);
+        let t0 = stage_timing.then(Instant::now);
         sparse_solve_rhs_tiled(
             factor,
             z_slice,
@@ -1672,9 +1771,13 @@ fn exact_scan_blocks_core<G: GenotypeMatrix>(
             &mut tiled_workspaces,
             pool.as_deref(),
         )?;
+        if let Some(t0) = t0 {
+            timing.solve_secs += t0.elapsed().as_secs_f64();
+        }
 
         // Step 5: C_block = X^T Z_block
         let c_slice = &mut c_block[..rows_here * p];
+        let t0 = stage_timing.then(Instant::now);
         xt_mat_rhs_block(
             x_design,
             Some(x_design_col_major),
@@ -1684,9 +1787,13 @@ fn exact_scan_blocks_core<G: GenotypeMatrix>(
             rows_here,
             c_slice,
         );
+        if let Some(t0) = t0 {
+            timing.xtz_secs += t0.elapsed().as_secs_f64();
+        }
 
         // Steps 6-8: per-SNP denominator and output
         let out_slice = &mut out_block[..rows_here * 3];
+        let t0 = stage_timing.then(Instant::now);
         for local_idx in 0..rows_here {
             let g = &rhs_slice[local_idx * n..(local_idx + 1) * n];
             let z = &z_slice[local_idx * n..(local_idx + 1) * n];
@@ -1733,7 +1840,14 @@ fn exact_scan_blocks_core<G: GenotypeMatrix>(
                 out_row[2] = 1.0_f64;
             }
         }
+        if let Some(t0) = t0 {
+            timing.denom_secs += t0.elapsed().as_secs_f64();
+        }
+        let t0 = stage_timing.then(Instant::now);
         sink(row_start, rows_here, out_slice)?;
+        if let Some(t0) = t0 {
+            timing.sink_secs += t0.elapsed().as_secs_f64();
+        }
         emit_progress_callback(
             scan_progress_callback,
             progress_stage,
@@ -1741,6 +1855,17 @@ fn exact_scan_blocks_core<G: GenotypeMatrix>(
             progress_total,
         )?;
         row_start = row_end;
+    }
+    if let Some(total_t0) = total_t0 {
+        emit_splmm_packed_scan_timing(
+            "exact",
+            &timing,
+            total_t0.elapsed().as_secs_f64(),
+            m,
+            n,
+            p,
+            threads,
+        );
     }
     Ok(())
 }
@@ -1831,6 +1956,9 @@ fn grammar_scan_blocks_core<G: GenotypeMatrix>(
     progress_total_override: usize,
     sink: &mut dyn FnMut(usize, usize, &[f64]) -> Result<(), String>,
 ) -> Result<(), String> {
+    let stage_timing = splmm_packed_stage_timing_enabled();
+    let total_t0 = stage_timing.then(Instant::now);
+    let mut timing = SplmmPackedScanTiming::default();
     if !(score_scale.is_finite() && score_scale > 0.0) {
         return Err(format!(
             "SparseLMM scan requires finite positive score scale, got {score_scale}"
@@ -1938,6 +2066,7 @@ fn grammar_scan_blocks_core<G: GenotypeMatrix>(
             let xts_slice = &mut xts_block[..rows_here * p];
             let ss_slice = &mut row_ss[..rows_here];
             // Decode via UnifiedInput
+            let t0 = stage_timing.then(Instant::now);
             input.matrix.decode_additive_block(
                 &input.stats,
                 row_start,
@@ -1946,6 +2075,10 @@ fn grammar_scan_blocks_core<G: GenotypeMatrix>(
                 sample_identity,
                 pool.as_ref(),
             )?;
+            if let Some(t0) = t0 {
+                timing.decode_secs += t0.elapsed().as_secs_f64();
+            }
+            let t0 = stage_timing.then(Instant::now);
             row_major_block_mul_mat_f32(
                 block_slice,
                 rows_here,
@@ -1955,6 +2088,10 @@ fn grammar_scan_blocks_core<G: GenotypeMatrix>(
                 spy_slice,
                 pool.as_ref(),
             );
+            if let Some(t0) = t0 {
+                timing.gpy_secs += t0.elapsed().as_secs_f64();
+            }
+            let t0 = stage_timing.then(Instant::now);
             row_major_block_mul_mat_f32(
                 block_slice,
                 rows_here,
@@ -1964,8 +2101,16 @@ fn grammar_scan_blocks_core<G: GenotypeMatrix>(
                 xts_slice,
                 pool.as_ref(),
             );
+            if let Some(t0) = t0 {
+                timing.gx_secs += t0.elapsed().as_secs_f64();
+            }
+            let t0 = stage_timing.then(Instant::now);
             row_major_block_sumsq_f64(block_slice, rows_here, n, ss_slice, pool.as_ref());
+            if let Some(t0) = t0 {
+                timing.row_sumsq_secs += t0.elapsed().as_secs_f64();
+            }
             let out_slice = &mut out_block[..rows_here * 3];
+            let t0 = stage_timing.then(Instant::now);
             for local_idx in 0..rows_here {
                 let xts_row = &xts_slice[local_idx * p..(local_idx + 1) * p];
                 for j in 0..p {
@@ -1993,7 +2138,14 @@ fn grammar_scan_blocks_core<G: GenotypeMatrix>(
                     out_row[2] = 1.0_f64;
                 }
             }
+            if let Some(t0) = t0 {
+                timing.denom_secs += t0.elapsed().as_secs_f64();
+            }
+            let t0 = stage_timing.then(Instant::now);
             sink(row_start, rows_here, out_slice)?;
+            if let Some(t0) = t0 {
+                timing.sink_secs += t0.elapsed().as_secs_f64();
+            }
             emit_progress_callback(
                 scan_progress_callback,
                 progress_stage,
@@ -2079,6 +2231,18 @@ fn grammar_scan_blocks_core<G: GenotypeMatrix>(
             )?;
             row_start = row_end;
         }
+    }
+
+    if let Some(total_t0) = total_t0 {
+        emit_splmm_packed_scan_timing(
+            "approx",
+            &timing,
+            total_t0.elapsed().as_secs_f64(),
+            m,
+            n,
+            p,
+            threads,
+        );
     }
 
     Ok(())

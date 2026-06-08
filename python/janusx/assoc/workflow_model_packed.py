@@ -247,6 +247,7 @@ def _jxlmm_sparse_spec(
     max_missing_rate: float,
     het_threshold: float,
     snps_only: bool,
+    method: int = 1,
 ) -> dict[str, object]:
     return {
         "cutoff": float(cutoff),
@@ -255,7 +256,7 @@ def _jxlmm_sparse_spec(
         "max_missing_rate": float(max_missing_rate),
         "het_threshold": float(het_threshold),
         "snps_only": bool(snps_only),
-        "method": int(_JXLMM_SPARSE_GRM_METHOD),
+        "method": int(method),
     }
 
 
@@ -292,6 +293,7 @@ def _ensure_jxlmm_sparse_grm(
     threads: int,
     logger: logging.Logger,
     use_spinner: bool,
+    method: int = 1,
 ) -> str:
     threads_use = int(max(1, int(threads) if int(threads) > 0 else detect_effective_threads()))
     sample_idx_arg = None
@@ -314,6 +316,7 @@ def _ensure_jxlmm_sparse_grm(
         max_missing_rate=float(max_missing_rate),
         het_threshold=float(het_threshold),
         snps_only=bool(snps_only),
+        method=method,
     )
     spec["sample_hash"] = _jxlmm_sparse_sample_hash(sample_idx_arg)
     spec["sample_n"] = int(sample_idx_arg.shape[0]) if sample_idx_arg is not None else None
@@ -334,10 +337,10 @@ def _ensure_jxlmm_sparse_grm(
         if existing_spec == spec and layout_reason is None:
             src = os.path.basename(str(sparse_path))
             with CliStatus(
-                f"Loading sparse GRM for SparseLMM from {src}...",
+                f"Loading sparse GRM from {src}...",
                 enabled=bool(use_spinner),
             ) as task:
-                task.complete(f"Loading sparse GRM for SparseLMM from {src} ...Finished")
+                task.complete(f"Loading sparse GRM from {src} ...Finished")
             _log_file_only(
                 logger,
                 logging.INFO,
@@ -374,9 +377,9 @@ def _ensure_jxlmm_sparse_grm(
         and have_dense_npy_sparse
     )
     progress_desc = (
-        "Extracting sparse GRM for SparseLMM from dense GRM"
+        "Calculating sparse GRM from dense GRM"
         if use_dense_extract
-        else "Building sparse GRM for SparseLMM"
+        else f"Calculating sparse GRM from {os.path.basename(str(prefix))}..."
     )
     pbar: Optional[_ProgressAdapter] = None
     spin_handle = _start_indeterminate_progress_bar(progress_desc) if bool(use_spinner) else None
@@ -435,7 +438,7 @@ def _ensure_jxlmm_sparse_grm(
                 str(prefix),
                 out_prefix=str(out_prefix_use),
                 sample_indices=sample_idx_arg,
-                method=int(_JXLMM_SPARSE_GRM_METHOD),
+                method=int(method),
                 threshold=float(cutoff),
                 abs_threshold=False,
                 maf_threshold=float(maf_threshold),
@@ -510,16 +513,18 @@ def _ensure_jxlmm_sparse_grm(
             f"SparseLMM sparse GRM ready: {_display_path(sparse_path)} "
             f"({', '.join(built_shape)}, "
             f"source={'dense_grm_npy' if use_dense_extract else 'bed'}, "
-            f"method={'standardized' if int(_JXLMM_SPARSE_GRM_METHOD) == 2 else 'centered'}, "
+            f"method={'standardized' if int(method) == 2 else 'centered'}, "
             f"BLAS=1, Rayon={int(threads_use)}, "
             f"sample_block=auto, "
             f"time={format_elapsed(build_secs)})"
         ),
     )
     if bool(use_spinner):
+        prefix_name = os.path.basename(str(prefix))
         _rich_success(
             logger,
-            f"{progress_desc} ...Finished [{format_elapsed(build_secs)}]",
+            f"Calculating sparse GRM from {prefix_name} (n={built_n_samples or 'all'}) "
+            f"...Finished [{format_elapsed(build_secs)}]",
             use_spinner=True,
         )
     return sparse_path
@@ -539,6 +544,7 @@ def _ensure_splmm_sparse_grm(
     threads: int,
     logger: logging.Logger,
     use_spinner: bool,
+    method: int = 1,
 ) -> str:
     return _ensure_jxlmm_sparse_grm(
         prefix,
@@ -553,6 +559,7 @@ def _ensure_splmm_sparse_grm(
         threads=threads,
         logger=logger,
         use_spinner=use_spinner,
+        method=method,
     )
 
 
@@ -4118,6 +4125,7 @@ def run_splmm_packed_fullrank(
     splmm_source: Optional[str] = None,
     splmm_sparse_cutoff: Optional[float] = None,
     splmm_sparse_jxgrm_path: Optional[str] = None,
+    splmm_sparse_method: int = 1,
     pheno: pd.DataFrame,
     ids: np.ndarray,
     outprefix: str,
@@ -4139,7 +4147,7 @@ def run_splmm_packed_fullrank(
     trait_names: Union[list[str], None] = None,
     emit_trait_header: bool = True,
     preloaded_packed: Union[dict[str, object], None] = None,
-    scan_mode: str = "two_stage",
+    scan_mode: str = "exact",
 ) -> None:
     if str(genetic_model).lower() != "add":
         raise ValueError("SparseLMM full-rust packed route currently supports additive coding only (--model add).")
@@ -4330,6 +4338,7 @@ def run_splmm_packed_fullrank(
                 threads=int(threads),
                 logger=logger,
                 use_spinner=bool(use_spinner),
+                method=int(splmm_sparse_method),
             )
             sparse_kinship_cache[sparse_cache_key] = str(trait_sparse_kinship_path)
         prepare_handle = (

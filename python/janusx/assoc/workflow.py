@@ -5406,16 +5406,14 @@ def parse_args(argv: Optional[list[str]] = None):
         default=None,
         metavar="CUTOFF",
         help=(
-            "Run SparseLMM (additive-only) with two-stage scan: genome-wide "
-            "GRAMMAR-gamma approximation followed by exact g'Pg rescan for "
-            "SNPs passing p <= max(1e-4, 10/m). "
+            "Run SparseLMM (additive-only) with exact g'Pg denominator for every SNP. "
             "SparseLMM builds or reuses sparse GRM from the main genotype input, "
             "estimates variance components, then scans via sparse Cholesky. "
             "Optional CUTOFF sets the sparse kinship cutoff (example: -splmm 0.001; default: 0.05)."
         ),
     )
     models_group.add_argument(
-        "-splmm-approx", "--splmm-approx", "-splmm-aprox", "--splmm-aprox",
+        "-splmm-approx", "--splmm-approx",
         dest="splmm_approx",
         nargs="?",
         const="__SELF__",
@@ -5424,19 +5422,6 @@ def parse_args(argv: Optional[list[str]] = None):
         help=(
             "Run SparseLMM with GRAMMAR-gamma approximate denominator (faster, "
             "but p-values may be slightly inflated). "
-            "Optional CUTOFF sets the sparse kinship cutoff."
-        ),
-    )
-    models_group.add_argument(
-        "-splmm-exact", "--splmm-exact",
-        dest="splmm_exact",
-        nargs="?",
-        const="__SELF__",
-        default=None,
-        metavar="CUTOFF",
-        help=(
-            "Run SparseLMM with exact g'Pg denominator for every SNP (most accurate, "
-            "but slower). "
             "Optional CUTOFF sets the sparse kinship cutoff."
         ),
     )
@@ -5472,6 +5457,12 @@ def parse_args(argv: Optional[list[str]] = None):
         "-k", "--grm", type=str, default="1",
         help="GRM option: 1 (centering), 2 (standardization), "
              "or a path to a precomputed GRM file (default: %(default)s).",
+    )
+    optional_group.add_argument(
+        "-spk", "--grm-sparse", type=str, default="1", dest="grm_sparse",
+        help="Sparse GRM option for SparseLMM (-splmm / -splmm-approx): "
+             "1 (centering), 2 (standardization), "
+             "or a path to a precomputed Sparse GRM file (default: %(default)s).",
     )
     optional_group.add_argument(
         "-q", "--qcov", type=str, default="0",
@@ -5618,15 +5609,14 @@ def parse_args(argv: Optional[list[str]] = None):
     if bool(args.algwas) and str(args.model).strip().lower() != "add":
         parser.error("--algwas currently supports additive coding only (--model add).")
 
-    # Normalise SPLMM mode flags: exactly one of -splmm / -splmm-approx / -splmm-exact.
+    # Normalise SPLMM mode flags: exactly one of -splmm / -splmm-approx.
     _splmm_modes = [
-        (args.splmm,       "two_stage"),   # default -splmm → two-stage scan
-        (args.splmm_approx, "approx"),
-        (args.splmm_exact, "exact"),
+        (args.splmm,        "exact"),   # -splmm → exact g'Pg denominator
+        (args.splmm_approx,  "approx"),
     ]
     _active_splmm_modes = [(val, mode) for val, mode in _splmm_modes if val is not None]
     if len(_active_splmm_modes) > 1:
-        parser.error("Only one of -splmm / -splmm-approx / -splmm-exact may be specified.")
+        parser.error("Only one of -splmm / -splmm-approx may be specified.")
     if _active_splmm_modes:
         args.splmm, args._splmm_denom_mode = _active_splmm_modes[0]
     else:
@@ -6004,38 +5994,74 @@ def _run_gwas_pipeline(
                         use_spinner=bool(use_spinner),
                     )
 
-                def _prepare_splmm_sparse_after_grm(
-                    stream_genofile_ready: str,
-                    loaded_dense_grm_path: Optional[str],
-                ) -> None:
-                    nonlocal prepared_splmm_sparse_jxgrm_path
-                    splmm_sparse_prefix = _as_plink_prefix(stream_genofile_ready)
-                    if splmm_sparse_prefix is None:
-                        return
-                    dense_grm_path = None
-                    sparse_out_prefix = str(splmm_sparse_prefix)
-                    if loaded_dense_grm_path is not None and str(loaded_dense_grm_path).strip() != "":
-                        dense_grm_path = str(loaded_dense_grm_path)
-                    elif str(getattr(args, "grm", "1")).strip() not in {"", "1", "2"}:
-                        dense_grm_path = str(getattr(args, "grm"))
-                    if dense_grm_path is not None and dense_grm_path.lower().endswith(".npy"):
-                        sparse_out_prefix = dense_grm_path[: -len(".npy")]
-                    prepared_splmm_sparse_jxgrm_path = _ensure_splmm_sparse_grm(
-                        str(splmm_sparse_prefix),
-                        sample_indices=None,
-                        out_prefix=str(sparse_out_prefix),
-                        dense_grm_path=dense_grm_path,
-                        cutoff=float(prepared_splmm_sparse_cutoff),
-                        maf_threshold=float(maf_threshold_scan),
-                        max_missing_rate=float(max_missing_rate_scan),
-                        het_threshold=float(het_threshold_scan),
-                        snps_only=bool(args.snps_only),
-                        threads=int(args.thread),
-                        logger=logger,
-                        use_spinner=bool(use_spinner),
-                    )
+                # Determine sparse GRM: method (1=centering, 2=standardization) or
+                # precomputed path.
+                spk_val = str(getattr(args, "grm_sparse", "1")).strip()
+                prepared_splmm_sparse_method: int = 1
+                spk_is_path = False
+                if spk_val in ("1", "2"):
+                    prepared_splmm_sparse_method = int(spk_val)
+                else:
+                    from janusx.assoc.workflow_model_packed import _jxlmm_normalize_jxgrm_path
 
-                splmm_post_grm_hook = _prepare_splmm_sparse_after_grm
+                    spk_path = _jxlmm_normalize_jxgrm_path(spk_val)
+                    if os.path.exists(spk_path):
+                        prepared_splmm_sparse_jxgrm_path = spk_path
+                        spk_is_path = True
+                    else:
+                        parser.error(
+                            f"--grm-sparse path does not exist: {spk_val}"
+                        )
+
+                # Always use the post-GRM hook so the loading message appears
+                # at the right time (after genotype/GRM, before trait scanning).
+                if spk_is_path:
+                    def _prepare_splmm_sparse_after_grm(
+                        _stream_genofile_ready: str,
+                        _loaded_dense_grm_path: Optional[str],
+                    ) -> None:
+                        src = os.path.basename(str(prepared_splmm_sparse_jxgrm_path))
+                        with CliStatus(
+                            f"Loading sparse GRM from {src}...",
+                            enabled=bool(use_spinner),
+                        ) as task:
+                            task.complete(f"Loading sparse GRM from {src} ...Finished")
+
+                    splmm_post_grm_hook = _prepare_splmm_sparse_after_grm
+                else:
+                    def _prepare_splmm_sparse_after_grm(
+                        stream_genofile_ready: str,
+                        loaded_dense_grm_path: Optional[str],
+                    ) -> None:
+                        nonlocal prepared_splmm_sparse_jxgrm_path
+                        splmm_sparse_prefix = _as_plink_prefix(stream_genofile_ready)
+                        if splmm_sparse_prefix is None:
+                            return
+                        dense_grm_path = None
+                        sparse_out_prefix = str(splmm_sparse_prefix)
+                        if loaded_dense_grm_path is not None and str(loaded_dense_grm_path).strip() != "":
+                            dense_grm_path = str(loaded_dense_grm_path)
+                        elif str(getattr(args, "grm", "1")).strip() not in {"", "1", "2"}:
+                            dense_grm_path = str(getattr(args, "grm"))
+                        if dense_grm_path is not None and dense_grm_path.lower().endswith(".npy"):
+                            sparse_out_prefix = dense_grm_path[: -len(".npy")]
+                        prepared_splmm_sparse_jxgrm_path = _ensure_splmm_sparse_grm(
+                            str(splmm_sparse_prefix),
+                            sample_indices=None,
+                            out_prefix=str(sparse_out_prefix),
+                            dense_grm_path=dense_grm_path,
+                            cutoff=float(prepared_splmm_sparse_cutoff),
+                            maf_threshold=float(maf_threshold_scan),
+                            max_missing_rate=float(max_missing_rate_scan),
+                            het_threshold=float(het_threshold_scan),
+                            snps_only=bool(args.snps_only),
+                            threads=int(args.thread),
+                            logger=logger,
+                            use_spinner=bool(use_spinner),
+                            method=prepared_splmm_sparse_method,
+                        )
+
+                    splmm_post_grm_hook = _prepare_splmm_sparse_after_grm
             if shared_context_needed:
                 _section(logger, "GWAS task")
                 _log_file_only(
@@ -6406,6 +6432,7 @@ def _run_gwas_pipeline(
                             splmm_source=args.splmm,
                             splmm_sparse_cutoff=prepared_splmm_sparse_cutoff,
                             splmm_sparse_jxgrm_path=prepared_splmm_sparse_jxgrm_path,
+                            splmm_sparse_method=prepared_splmm_sparse_method,
                             pheno=pheno,
                             ids=ids,
                             outprefix=outprefix,
@@ -6427,7 +6454,7 @@ def _run_gwas_pipeline(
                             trait_names=trait_one,
                             emit_trait_header=bool(emit_trait_header_model),
                             preloaded_packed=preloaded_packed,
-                            scan_mode=str(args._splmm_denom_mode or "two_stage"),
+                            scan_mode=str(args._splmm_denom_mode or "exact"),
                         )
 
                     def _run_route_fastlmm_stream(

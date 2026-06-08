@@ -56,6 +56,15 @@ struct SplmmPackedScanTiming {
     sink_secs: f64,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct SplmmTsvTiming {
+    format_secs: f64,
+    send_secs: f64,
+    finish_secs: f64,
+    blocks: usize,
+    bytes: usize,
+}
+
 #[inline]
 fn splmm_packed_stage_timing_enabled() -> bool {
     env_truthy("JX_SPLMM_PACKED_STAGE_TIMING")
@@ -114,6 +123,30 @@ fn emit_splmm_packed_scan_timing(
         n,
         p,
         if threads > 0 { threads } else { rayon::current_num_threads() },
+    );
+}
+
+fn emit_splmm_tsv_timing(mode: &str, timing: &SplmmTsvTiming, rows: usize) {
+    let total_secs = timing.format_secs + timing.send_secs + timing.finish_secs;
+    let to_pct = |x: f64| -> f64 {
+        if total_secs > 0.0 {
+            x * 100.0 / total_secs
+        } else {
+            0.0
+        }
+    };
+    eprintln!(
+        "SparseLMM TSV timing mode={mode}: format={:.3}s ({:.1}%), send={:.3}s ({:.1}%), finish={:.3}s ({:.1}%), total={:.3}s, rows={}, blocks={}, bytes={}",
+        timing.format_secs,
+        to_pct(timing.format_secs),
+        timing.send_secs,
+        to_pct(timing.send_secs),
+        timing.finish_secs,
+        to_pct(timing.finish_secs),
+        total_secs,
+        rows,
+        timing.blocks,
+        timing.bytes,
     );
 }
 
@@ -2382,6 +2415,8 @@ fn scan_to_tsv_with_p0y_and_gamma0(
     progress_every: usize,
     progress_stage: usize,
 ) -> Result<usize, String> {
+    let stage_timing = splmm_packed_stage_timing_enabled();
+    let mut tsv_timing = SplmmTsvTiming::default();
     let score_vec = if sigma2 == 1.0_f64 {
         p0y_vec.to_vec()
     } else {
@@ -2424,6 +2459,7 @@ fn scan_to_tsv_with_p0y_and_gamma0(
     let mut text_buf = String::with_capacity(block_rows.max(512).max(1) * 112);
     let mut tsv_sink = |row_start: usize, rows_here: usize, block: &[f64]| {
         text_buf.clear();
+        let t0 = stage_timing.then(Instant::now);
         append_splmm_tsv_block(
             &mut text_buf,
             row_start,
@@ -2438,8 +2474,18 @@ fn scan_to_tsv_with_p0y_and_gamma0(
             &row_miss,
             gm,
         );
+        if let Some(t0) = t0 {
+            tsv_timing.format_secs += t0.elapsed().as_secs_f64();
+        }
         let payload = std::mem::take(&mut text_buf).into_bytes();
+        let payload_len = payload.len();
+        let t0 = stage_timing.then(Instant::now);
         writer.send(payload)?;
+        if let Some(t0) = t0 {
+            tsv_timing.send_secs += t0.elapsed().as_secs_f64();
+        }
+        tsv_timing.blocks = tsv_timing.blocks.saturating_add(1);
+        tsv_timing.bytes = tsv_timing.bytes.saturating_add(payload_len);
         Ok(())
     };
     let run_res = grammar_scan_blocks_core(
@@ -2461,7 +2507,14 @@ fn scan_to_tsv_with_p0y_and_gamma0(
         0,
         &mut tsv_sink,
     );
+    let t0 = stage_timing.then(Instant::now);
     let writer_result = writer.finish();
+    if let Some(t0) = t0 {
+        tsv_timing.finish_secs += t0.elapsed().as_secs_f64();
+    }
+    if stage_timing {
+        emit_splmm_tsv_timing("approx", &tsv_timing, m);
+    }
     run_res?;
     writer_result?;
     Ok(m)
@@ -2491,6 +2544,8 @@ fn scan_to_tsv_with_p0y_and_exact_p0_sparse(
     progress_stage: usize,
     solve_workspace: &mut SparseJxgrmSolveWorkspace,
 ) -> Result<usize, String> {
+    let stage_timing = splmm_packed_stage_timing_enabled();
+    let mut tsv_timing = SplmmTsvTiming::default();
     let score_vec = if sigma2 == 1.0_f64 {
         p0y_vec.to_vec()
     } else {
@@ -2524,6 +2579,7 @@ fn scan_to_tsv_with_p0y_and_exact_p0_sparse(
     let mut text_buf = String::with_capacity(block_rows.max(512).max(1) * 112);
     let mut tsv_sink = |row_start: usize, rows_here: usize, block: &[f64]| {
         text_buf.clear();
+        let t0 = stage_timing.then(Instant::now);
         append_splmm_tsv_block(
             &mut text_buf,
             row_start,
@@ -2538,8 +2594,18 @@ fn scan_to_tsv_with_p0y_and_exact_p0_sparse(
             &scan_prepared.row_missing,
             gm,
         );
+        if let Some(t0) = t0 {
+            tsv_timing.format_secs += t0.elapsed().as_secs_f64();
+        }
         let payload = std::mem::take(&mut text_buf).into_bytes();
+        let payload_len = payload.len();
+        let t0 = stage_timing.then(Instant::now);
         writer.send(payload)?;
+        if let Some(t0) = t0 {
+            tsv_timing.send_secs += t0.elapsed().as_secs_f64();
+        }
+        tsv_timing.blocks = tsv_timing.blocks.saturating_add(1);
+        tsv_timing.bytes = tsv_timing.bytes.saturating_add(payload_len);
         Ok(())
     };
     let adapter = JxlmmMatrixAdapter {
@@ -2573,7 +2639,14 @@ fn scan_to_tsv_with_p0y_and_exact_p0_sparse(
         solve_workspace,
         &mut tsv_sink,
     );
+    let t0 = stage_timing.then(Instant::now);
     let writer_result = writer.finish();
+    if let Some(t0) = t0 {
+        tsv_timing.finish_secs += t0.elapsed().as_secs_f64();
+    }
+    if stage_timing {
+        emit_splmm_tsv_timing("exact", &tsv_timing, m);
+    }
     run_res?;
     writer_result?;
     Ok(m)
@@ -2661,6 +2734,8 @@ fn scan_to_tsv_with_p0y_and_gamma0_collect_candidates(
     progress_stage: usize,
     candidate_p_threshold: f64,
 ) -> Result<Vec<usize>, String> {
+    let stage_timing = splmm_packed_stage_timing_enabled();
+    let mut tsv_timing = SplmmTsvTiming::default();
     let score_vec = if sigma2 == 1.0_f64 {
         p0y_vec.to_vec()
     } else {
@@ -2710,6 +2785,7 @@ fn scan_to_tsv_with_p0y_and_gamma0_collect_candidates(
             }
         }
         text_buf.clear();
+        let t0 = stage_timing.then(Instant::now);
         append_splmm_tsv_block(
             &mut text_buf,
             row_start,
@@ -2724,7 +2800,18 @@ fn scan_to_tsv_with_p0y_and_gamma0_collect_candidates(
             &row_miss,
             gm,
         );
-        writer.send(std::mem::take(&mut text_buf).into_bytes())?;
+        if let Some(t0) = t0 {
+            tsv_timing.format_secs += t0.elapsed().as_secs_f64();
+        }
+        let payload = std::mem::take(&mut text_buf).into_bytes();
+        let payload_len = payload.len();
+        let t0 = stage_timing.then(Instant::now);
+        writer.send(payload)?;
+        if let Some(t0) = t0 {
+            tsv_timing.send_secs += t0.elapsed().as_secs_f64();
+        }
+        tsv_timing.blocks = tsv_timing.blocks.saturating_add(1);
+        tsv_timing.bytes = tsv_timing.bytes.saturating_add(payload_len);
         Ok(())
     };
     let run_res = grammar_scan_blocks_core(
@@ -2746,7 +2833,14 @@ fn scan_to_tsv_with_p0y_and_gamma0_collect_candidates(
         0,
         &mut tsv_sink,
     );
+    let t0 = stage_timing.then(Instant::now);
     let writer_result = writer.finish();
+    if let Some(t0) = t0 {
+        tsv_timing.finish_secs += t0.elapsed().as_secs_f64();
+    }
+    if stage_timing {
+        emit_splmm_tsv_timing("two_stage_collect", &tsv_timing, m);
+    }
     run_res?;
     writer_result?;
     Ok(candidate_rows)

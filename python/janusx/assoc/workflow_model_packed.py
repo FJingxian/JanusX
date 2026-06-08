@@ -35,6 +35,7 @@ from .workflow import (
     _cleanup_gwas_result_tmp,
     _display_path,
     _emit_trait_header,
+    _emit_plain_info_line,
     _emit_warning_line,
     _fastlmm_should_switch_to_lmm,
     _finalize_gwas_result_tsv,
@@ -4729,6 +4730,10 @@ def run_splmm_packed_fullrank(
         x_max_rel_res = 0.0
         rhat_requested = 30
         rhat_used = 30
+        rust_prepare_inputs_secs = 0.0
+        rust_bim_meta_secs = 0.0
+        rust_null_scan_core_secs = 0.0
+        rust_writer_wait_secs = 0.0
         arr = None
         wrote_direct_tsv = False
         scan_route_desc = (
@@ -4833,6 +4838,11 @@ def run_splmm_packed_fullrank(
         written_rows = 0
         if wrote_direct_tsv:
             written_rows = int(jxlmm_t[9])
+            if len(jxlmm_t) >= 11 and isinstance(jxlmm_t[10], (tuple, list)) and len(jxlmm_t[10]) >= 4:
+                rust_prepare_inputs_secs = float(jxlmm_t[10][0])
+                rust_bim_meta_secs = float(jxlmm_t[10][1])
+                rust_null_scan_core_secs = float(jxlmm_t[10][2])
+                rust_writer_wait_secs = float(jxlmm_t[10][3])
         else:
             arr = np.ascontiguousarray(np.asarray(jxlmm_t[9], dtype=np.float64), dtype=np.float64)
 
@@ -4929,10 +4939,32 @@ def run_splmm_packed_fullrank(
             f"null_fit={format_elapsed(null_fit_secs)}, "
             f"scan={format_elapsed(scan_secs)}"
         )
+        rust_top_level_total_secs = float(
+            rust_prepare_inputs_secs
+            + rust_bim_meta_secs
+            + rust_null_scan_core_secs
+            + rust_writer_wait_secs
+        )
+        _rust_top_level_timing_msg = None
+        if np.isfinite(rust_top_level_total_secs) and rust_top_level_total_secs > 0.0:
+            _rust_top_level_timing_msg = (
+                "Rust top-level timing: "
+                f"prepare_inputs={format_elapsed(rust_prepare_inputs_secs)}, "
+                f"bim_meta={format_elapsed(rust_bim_meta_secs)}, "
+                f"null_scan_core={format_elapsed(rust_null_scan_core_secs)}, "
+                f"writer_wait={format_elapsed(rust_writer_wait_secs)}, "
+                f"total={format_elapsed(rust_top_level_total_secs)}"
+            )
         _assoc_test_msg = (
             "association test uses Wald chi^2(1): chisq=(beta/se)^2, "
             "pwald=Pr[Chi^2_1>=chisq]; SparseLMM does not currently emit a PLRT/LRT column."
         )
+        if _rust_top_level_timing_msg is not None:
+            _emit_plain_info_line(
+                logger,
+                f"SparseLMM: {_rust_top_level_timing_msg}",
+                use_spinner=bool(use_spinner),
+            )
         if bool(use_spinner):
             _log_file_only(logger, logging.INFO, f"SparseLMM: {_timing_diag_msg}")
             _log_file_only(logger, logging.INFO, f"SparseLMM: {_scan_diag_msg}")

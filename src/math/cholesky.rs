@@ -100,6 +100,15 @@ fn sparse_analysis_cache_key(
     })
 }
 
+#[inline]
+fn sparse_numeric_parallelism(threads: usize) -> Parallelism {
+    if threads <= 1 {
+        Parallelism::None
+    } else {
+        Parallelism::Rayon(threads)
+    }
+}
+
 pub(crate) trait SparseGrmCscView {
     fn n_samples(&self) -> usize;
     fn nnz(&self) -> usize;
@@ -898,9 +907,10 @@ impl SparseJxgrmCholeskyAnalysis {
         ))
     }
 
-    fn factorize_from_perm_values(
+    fn factorize_from_perm_values_with_parallelism(
         &self,
         perm_values: &[f64],
+        parallelism: Parallelism,
     ) -> Result<SparseJxgrmCholesky, String> {
         let a_perm_lower = SparseColMatRef::<usize, f64>::new(
             unsafe {
@@ -918,7 +928,7 @@ impl SparseJxgrmCholeskyAnalysis {
         let mut numeric_mem = GlobalPodBuffer::try_new(
             supernodal::factorize_supernodal_numeric_llt_req::<usize, f64>(
                 &self.symbolic,
-                Parallelism::None,
+                parallelism,
             )
             .map_err(|e| format!("build sparse numeric LLT StackReq failed: {e}"))?,
         )
@@ -928,7 +938,7 @@ impl SparseJxgrmCholeskyAnalysis {
             a_perm_lower,
             LltRegularization::default(),
             &self.symbolic,
-            Parallelism::None,
+            parallelism,
             PodStack::new(&mut numeric_mem),
         )
         .map_err(|e| format!("sparse numeric LLT factorization failed: {e}"))?;
@@ -955,7 +965,7 @@ impl SparseJxgrmCholeskyAnalysis {
                 perm_values[idx] += diag_shift;
             }
         }
-        self.factorize_from_perm_values(&perm_values)
+        self.factorize_from_perm_values_with_parallelism(&perm_values, Parallelism::None)
     }
 
     pub fn base_perm_values(&self) -> &[f64] {
@@ -992,7 +1002,7 @@ impl SparseJxgrmCholeskyAnalysis {
                 buf[idx] += lambda;
             }
         }
-        let result = self.factorize_from_perm_values(buf);
+        let result = self.factorize_from_perm_values_with_parallelism(buf, Parallelism::None);
         // buf now holds shifted values; restore original for next iteration.
         buf.copy_from_slice(&self.base_perm_values);
         result
@@ -1031,7 +1041,39 @@ impl SparseJxgrmCholeskyAnalysis {
                 perm_values[idx] += sigma_e2 + diag_shift;
             }
         }
-        self.factorize_from_perm_values(&perm_values)
+        self.factorize_from_perm_values_with_parallelism(&perm_values, Parallelism::None)
+    }
+
+    pub fn factorize_sigma_g2_k_plus_sigma_e2_i_with_diag_shift_parallel(
+        &self,
+        sigma_g2: f64,
+        sigma_e2: f64,
+        diag_shift: f64,
+        threads: usize,
+    ) -> Result<SparseJxgrmCholesky, String> {
+        if !sigma_g2.is_finite() || sigma_g2 < 0.0 || !sigma_e2.is_finite() || sigma_e2 < 0.0 {
+            return Err(format!(
+                "Sparse Cholesky requires finite non-negative variance components, got sigma_g2={sigma_g2}, sigma_e2={sigma_e2}"
+            ));
+        }
+        if !diag_shift.is_finite() || diag_shift < 0.0 {
+            return Err(format!(
+                "Sparse Cholesky diagonal shift must be finite and >= 0, got {diag_shift}"
+            ));
+        }
+        let mut perm_values = self.base_perm_values.clone();
+        for value in perm_values.iter_mut() {
+            *value *= sigma_g2;
+        }
+        if sigma_e2 != 0.0 || diag_shift != 0.0 {
+            for &idx in self.diag_positions.iter() {
+                perm_values[idx] += sigma_e2 + diag_shift;
+            }
+        }
+        self.factorize_from_perm_values_with_parallelism(
+            &perm_values,
+            sparse_numeric_parallelism(threads),
+        )
     }
 }
 

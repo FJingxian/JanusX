@@ -72,6 +72,15 @@ struct SplmmTsvTiming {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
+struct SplmmAssocTopLevelTiming {
+    prepare_inputs_secs: f64,
+    bim_meta_secs: f64,
+    null_scan_core_secs: f64,
+    writer_wait_secs: f64,
+    total_secs: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
 struct SplmmNullStateTiming {
     solve_y_secs: f64,
     solve_x_secs: f64,
@@ -105,9 +114,27 @@ struct SplmmTsvBlockPayload {
     results: Vec<f64>,
 }
 
+struct SplmmScanToTsvResult {
+    r_hat: f64,
+    written_rows: usize,
+    null_info: PcgJxlmmNullModelInfo,
+    rhat_info: PcgJxlmmRHatResult,
+    factor_load_secs: f64,
+    scan_prepare_secs: f64,
+    scan_exec_secs: f64,
+    writer_wait_secs: f64,
+}
+
 #[inline]
 fn splmm_packed_stage_timing_enabled() -> bool {
     env_truthy("JX_SPLMM_PACKED_STAGE_TIMING")
+}
+
+#[inline]
+fn splmm_top_level_timing_enabled() -> bool {
+    env_truthy("JX_SPLMM_TOP_LEVEL_TIMING")
+        || env_truthy("JX_SPLMM_TOPLEVEL_TIMING")
+        || splmm_packed_stage_timing_enabled()
 }
 
 #[inline]
@@ -284,6 +311,76 @@ fn emit_splmm_tsv_timing(mode: &str, timing: &SplmmTsvTiming, rows: usize) {
     );
 }
 
+fn emit_splmm_assoc_top_level_timing(
+    mode: &str,
+    timing: &SplmmAssocTopLevelTiming,
+    rows: usize,
+    n: usize,
+    p: usize,
+    threads: usize,
+) {
+    let to_pct = |x: f64| -> f64 {
+        if timing.total_secs > 0.0 {
+            x * 100.0 / timing.total_secs
+        } else {
+            0.0
+        }
+    };
+    eprintln!(
+        "SparseLMM top-level timing mode={mode}: prepare_inputs={:.3}s ({:.1}%), bim_meta={:.3}s ({:.1}%), null_scan_core={:.3}s ({:.1}%), writer_wait={:.3}s ({:.1}%), total={:.3}s, rows={}, n={}, p={}, threads={}",
+        timing.prepare_inputs_secs,
+        to_pct(timing.prepare_inputs_secs),
+        timing.bim_meta_secs,
+        to_pct(timing.bim_meta_secs),
+        timing.null_scan_core_secs,
+        to_pct(timing.null_scan_core_secs),
+        timing.writer_wait_secs,
+        to_pct(timing.writer_wait_secs),
+        timing.total_secs,
+        rows,
+        n,
+        p,
+        threads,
+    );
+}
+
+fn emit_splmm_null_scan_core_timing(
+    mode: &str,
+    factor_load_secs: f64,
+    scan_prepare_secs: f64,
+    scan_exec_secs: f64,
+    writer_wait_secs: f64,
+    rows: usize,
+    n: usize,
+    p: usize,
+    threads: usize,
+) {
+    let total_secs = factor_load_secs + scan_prepare_secs + scan_exec_secs + writer_wait_secs;
+    let to_pct = |x: f64| -> f64 {
+        if total_secs > 0.0 {
+            x * 100.0 / total_secs
+        } else {
+            0.0
+        }
+    };
+    eprintln!(
+        "SparseLMM null-scan-core timing mode={mode}: factor_load={:.3}s ({:.1}%), scan_prepare={:.3}s ({:.1}%), scan_exec={:.3}s ({:.1}%), writer_wait={:.3}s ({:.1}%), total={:.3}s, rows={}, n={}, p={}, threads={}",
+        factor_load_secs,
+        to_pct(factor_load_secs),
+        scan_prepare_secs,
+        to_pct(scan_prepare_secs),
+        scan_exec_secs,
+        to_pct(scan_exec_secs),
+        writer_wait_secs,
+        to_pct(writer_wait_secs),
+        total_secs,
+        rows,
+        n,
+        p,
+        threads,
+    );
+}
+
 #[inline]
 fn splmm_tsv_format_threads(scan_threads: usize) -> usize {
     if let Ok(raw) = std::env::var("JX_SPLMM_TSV_THREADS") {
@@ -316,7 +413,7 @@ fn run_splmm_async_tsv_writer<R, F>(
     mode: &str,
     stage_timing: bool,
     run_scan: F,
-) -> Result<R, String>
+) -> Result<(R, SplmmTsvTiming), String>
 where
     F: FnOnce(&mut dyn FnMut(usize, usize, &[f64]) -> Result<(), String>) -> Result<R, String>,
 {
@@ -495,7 +592,7 @@ where
     if stage_timing {
         emit_splmm_tsv_timing(mode, &tsv_timing, rows_total);
     }
-    Ok(scan_out)
+    Ok((scan_out, tsv_timing))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1412,6 +1509,98 @@ fn cast_f64_slice_to_f32(input: &[f64]) -> Result<Vec<f32>, String> {
     Ok(out)
 }
 
+fn read_bim_selected_columns(
+    prefix: &str,
+    row_source_indices: &[usize],
+) -> Result<(Vec<String>, Vec<i64>, Vec<String>, Vec<String>, Vec<String>), String> {
+    if row_source_indices.is_empty() {
+        return Ok((Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()));
+    }
+    let is_nondecreasing = row_source_indices.windows(2).all(|w| w[0] <= w[1]);
+    if !is_nondecreasing {
+        let sites = crate::gfcore::read_bim(prefix)?;
+        let mut chrom = Vec::with_capacity(row_source_indices.len());
+        let mut pos = Vec::with_capacity(row_source_indices.len());
+        let mut snp = Vec::with_capacity(row_source_indices.len());
+        let mut allele0 = Vec::with_capacity(row_source_indices.len());
+        let mut allele1 = Vec::with_capacity(row_source_indices.len());
+        for &src in row_source_indices {
+            let site = sites
+                .get(src)
+                .ok_or_else(|| format!("BIM row index out of range: {src} >= {}", sites.len()))?;
+            chrom.push(site.chrom.clone());
+            pos.push(site.pos as i64);
+            snp.push(site.snp.clone());
+            allele0.push(site.ref_allele.clone());
+            allele1.push(site.alt_allele.clone());
+        }
+        return Ok((chrom, pos, snp, allele0, allele1));
+    }
+
+    let bim_path = format!("{prefix}.bim");
+    let file = File::open(&bim_path).map_err(|e| format!("open {bim_path}: {e}"))?;
+    let mut reader = BufReader::new(file);
+    let mut line = String::new();
+
+    let mut chrom = Vec::with_capacity(row_source_indices.len());
+    let mut pos = Vec::with_capacity(row_source_indices.len());
+    let mut snp = Vec::with_capacity(row_source_indices.len());
+    let mut allele0 = Vec::with_capacity(row_source_indices.len());
+    let mut allele1 = Vec::with_capacity(row_source_indices.len());
+
+    let mut want_ptr = 0usize;
+    let mut row_idx = 0usize;
+    while want_ptr < row_source_indices.len() {
+        line.clear();
+        let n_read = reader
+            .read_line(&mut line)
+            .map_err(|e| format!("read {bim_path} line {}: {e}", row_idx + 1))?;
+        if n_read == 0 {
+            return Err(format!(
+                "BIM ended early: needed row {} but file has only {} rows",
+                row_source_indices[want_ptr], row_idx
+            ));
+        }
+        if row_idx != row_source_indices[want_ptr] {
+            row_idx += 1;
+            continue;
+        }
+
+        let mut it = line.split_whitespace();
+        let chrom_tok = it
+            .next()
+            .ok_or_else(|| format!("Malformed BIM line at {bim_path}:{}", row_idx + 1))?;
+        let snp_tok = it
+            .next()
+            .ok_or_else(|| format!("Malformed BIM line at {bim_path}:{}", row_idx + 1))?;
+        let _cm_tok = it
+            .next()
+            .ok_or_else(|| format!("Malformed BIM line at {bim_path}:{}", row_idx + 1))?;
+        let pos_tok = it
+            .next()
+            .ok_or_else(|| format!("Malformed BIM line at {bim_path}:{}", row_idx + 1))?;
+        let a0_tok = it
+            .next()
+            .ok_or_else(|| format!("Malformed BIM line at {bim_path}:{}", row_idx + 1))?;
+        let a1_tok = it
+            .next()
+            .ok_or_else(|| format!("Malformed BIM line at {bim_path}:{}", row_idx + 1))?;
+        let pos_i64 = pos_tok.parse::<i64>().unwrap_or(0_i64);
+
+        while want_ptr < row_source_indices.len() && row_source_indices[want_ptr] == row_idx {
+            chrom.push(chrom_tok.to_string());
+            pos.push(pos_i64);
+            snp.push(snp_tok.to_string());
+            allele0.push(a0_tok.to_string());
+            allele1.push(a1_tok.to_string());
+            want_ptr += 1;
+        }
+        row_idx += 1;
+    }
+
+    Ok((chrom, pos, snp, allele0, allele1))
+}
+
 fn row_major_block_sumsq_f64(
     block: &[f32],
     rows: usize,
@@ -1711,6 +1900,7 @@ fn sparse_splmm_load_factor(
     sample_idx: &[usize],
     sigma_g2: f64,
     sigma_e2: f64,
+    threads: usize,
     progress_callback: Option<&Py<PyAny>>,
 ) -> Result<SparseJxgrmCholesky, String> {
     let path = sparse_jxgrm_path.map(|s| s.to_string()).unwrap_or_else(|| {
@@ -1780,9 +1970,12 @@ Set `JX_SPARSE_CHOLESKY_MAX_L_NNZ` to override.",
     let mut last_err = None::<String>;
     for (attempt_idx, &rel) in rel_shifts.iter().enumerate() {
         let diag_shift = diag_mean_abs * rel;
-        match analysis
-            .factorize_sigma_g2_k_plus_sigma_e2_i_with_diag_shift(sigma_g2, sigma_e2, diag_shift)
-        {
+        match analysis.factorize_sigma_g2_k_plus_sigma_e2_i_with_diag_shift_parallel(
+            sigma_g2,
+            sigma_e2,
+            diag_shift,
+            threads.max(1),
+        ) {
             Ok(factor) => {
                 emit_progress_callback(
                     progress_callback,
@@ -2967,7 +3160,7 @@ fn scan_to_tsv_with_p0y_and_gamma0(
     scan_progress_callback: Option<&Py<PyAny>>,
     progress_every: usize,
     progress_stage: usize,
-) -> Result<usize, String> {
+) -> Result<(usize, SplmmTsvTiming), String> {
     let stage_timing = splmm_packed_stage_timing_enabled();
     let score_vec = if sigma2 == 1.0_f64 {
         p0y_vec.to_vec()
@@ -3040,6 +3233,7 @@ fn scan_to_tsv_with_p0y_and_gamma0(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn scan_to_tsv_with_p0y_and_exact_p0_sparse(
     factor: &SparseJxgrmCholesky,
     scan_prepared: &JxlmmPreparedInput,
@@ -3063,7 +3257,7 @@ fn scan_to_tsv_with_p0y_and_exact_p0_sparse(
     progress_every: usize,
     progress_stage: usize,
     solve_workspace: &mut SparseJxgrmSolveWorkspace,
-) -> Result<usize, String> {
+) -> Result<(usize, SplmmTsvTiming), String> {
     let stage_timing = splmm_packed_stage_timing_enabled();
     let score_vec = if sigma2 == 1.0_f64 {
         p0y_vec.to_vec()
@@ -3219,7 +3413,7 @@ fn scan_to_tsv_with_p0y_and_gamma0_collect_candidates(
     progress_every: usize,
     progress_stage: usize,
     candidate_p_threshold: f64,
-) -> Result<Vec<usize>, String> {
+) -> Result<(Vec<usize>, SplmmTsvTiming), String> {
     let stage_timing = splmm_packed_stage_timing_enabled();
     let score_vec = if sigma2 == 1.0_f64 {
         p0y_vec.to_vec()
@@ -4016,6 +4210,7 @@ fn estimate_rhat_and_scan(
         sparse_factor_sample_idx_ref,
         sigma_g2,
         sigma_e2,
+        threads,
         stage1_cb,
     )?;
     estimate_rhat_and_scan_sparse(
@@ -4065,7 +4260,7 @@ fn estimate_rhat_and_scan_to_tsv(
     progress_every: usize,
     sparse_jxgrm_path: Option<String>,
     scan_mode: SplmmScanMode,
-) -> Result<(f64, usize, PcgJxlmmNullModelInfo, PcgJxlmmRHatResult), String> {
+) -> Result<SplmmScanToTsvResult, String> {
     let stage1_cb = stage1_progress_callback.as_ref();
     let prefix = operator_prepared
         .bed_prefix
@@ -4079,6 +4274,7 @@ fn estimate_rhat_and_scan_to_tsv(
     } else {
         operator_prepared.n_samples_full
     };
+    let factor_load_t0 = Instant::now();
     let factor = sparse_splmm_load_factor(
         prefix,
         sparse_jxgrm_path.as_deref(),
@@ -4086,8 +4282,11 @@ fn estimate_rhat_and_scan_to_tsv(
         sparse_factor_sample_idx_ref,
         sigma_g2,
         sigma_e2,
+        threads,
         stage1_cb,
     )?;
+    let factor_load_secs = factor_load_t0.elapsed().as_secs_f64();
+    let prepare_t0 = Instant::now();
     let mut state = prepare_splmm_scan_state(
         factor,
         &scan_prepared,
@@ -4105,6 +4304,7 @@ fn estimate_rhat_and_scan_to_tsv(
         progress_every,
         scan_mode,
     )?;
+    let scan_prepare_secs = prepare_t0.elapsed().as_secs_f64();
     if splmm_prepare_stage_timing_enabled() {
         emit_splmm_prepare_timing(
             scan_mode.as_str(),
@@ -4116,7 +4316,8 @@ fn estimate_rhat_and_scan_to_tsv(
     }
     let total_rows = scan_prepared.n_rows();
     let x_design_xtx_chol = state.require_x_design_xtx_chol()?.to_vec();
-    let written_rows = match scan_mode {
+    let scan_exec_t0 = Instant::now();
+    let (written_rows, tsv_timing) = match scan_mode {
         SplmmScanMode::Approx => scan_to_tsv_with_p0y_and_gamma0(
             &scan_prepared,
             &x_design,
@@ -4164,37 +4365,38 @@ fn estimate_rhat_and_scan_to_tsv(
         )?,
         SplmmScanMode::TwoStage => {
             let approx_tmp_tsv = format!("{out_tsv}.approx.twostage.tmp");
-            let run_res = (|| -> Result<usize, String> {
+            let run_res = (|| -> Result<(usize, SplmmTsvTiming), String> {
                 let p_threshold = splmm_two_stage_p_threshold(total_rows);
-                let candidate_rows = scan_to_tsv_with_p0y_and_gamma0_collect_candidates(
-                    &scan_prepared,
-                    &x_design,
-                    &state.null_model.p0y,
-                    x_design_xtx_chol.as_slice(),
-                    &scan_sample_idx,
-                    chrom.as_slice(),
-                    pos.as_slice(),
-                    snp.as_slice(),
-                    allele0.as_slice(),
-                    allele1.as_slice(),
-                    gm,
-                    &approx_tmp_tsv,
-                    state.gamma0,
-                    state.null_model.sigma2,
-                    threads,
-                    block_rows,
-                    scan_progress_callback.as_ref(),
-                    progress_every,
-                    9,
-                    p_threshold,
-                )?;
+                let (candidate_rows, tsv_timing) =
+                    scan_to_tsv_with_p0y_and_gamma0_collect_candidates(
+                        &scan_prepared,
+                        &x_design,
+                        &state.null_model.p0y,
+                        x_design_xtx_chol.as_slice(),
+                        &scan_sample_idx,
+                        chrom.as_slice(),
+                        pos.as_slice(),
+                        snp.as_slice(),
+                        allele0.as_slice(),
+                        allele1.as_slice(),
+                        gm,
+                        &approx_tmp_tsv,
+                        state.gamma0,
+                        state.null_model.sigma2,
+                        threads,
+                        block_rows,
+                        scan_progress_callback.as_ref(),
+                        progress_every,
+                        9,
+                        p_threshold,
+                    )?;
                 if candidate_rows.is_empty() {
                     std::fs::rename(&approx_tmp_tsv, &out_tsv).map_err(|e| {
                         format!(
                             "rename SparseLMM two-stage approx TSV {approx_tmp_tsv} -> {out_tsv}: {e}"
                         )
                     })?;
-                    return Ok(total_rows);
+                    return Ok((total_rows, tsv_timing));
                 }
                 let subset = scan_prepared.subset_rows(&candidate_rows)?;
                 let exact_out = scan_with_p0y_and_exact_p0_sparse(
@@ -4233,7 +4435,7 @@ fn estimate_rhat_and_scan_to_tsv(
                 std::fs::remove_file(&approx_tmp_tsv).map_err(|e| {
                     format!("remove SparseLMM two-stage temp TSV {approx_tmp_tsv}: {e}")
                 })?;
-                Ok(merged_rows)
+                Ok((merged_rows, tsv_timing))
             })();
             if run_res.is_err() {
                 let _ = std::fs::remove_file(&approx_tmp_tsv);
@@ -4241,7 +4443,30 @@ fn estimate_rhat_and_scan_to_tsv(
             run_res?
         }
     };
-    Ok((state.r_hat, written_rows, state.null_info, state.rhat_info))
+    let scan_exec_secs = (scan_exec_t0.elapsed().as_secs_f64() - tsv_timing.finish_secs).max(0.0);
+    if splmm_top_level_timing_enabled() {
+        emit_splmm_null_scan_core_timing(
+            scan_mode.as_str(),
+            factor_load_secs,
+            scan_prepare_secs,
+            scan_exec_secs,
+            tsv_timing.finish_secs,
+            total_rows,
+            y_vec.len(),
+            x_design.len() / y_vec.len(),
+            threads.max(1),
+        );
+    }
+    Ok(SplmmScanToTsvResult {
+        r_hat: state.r_hat,
+        written_rows,
+        null_info: state.null_info,
+        rhat_info: state.rhat_info,
+        factor_load_secs,
+        scan_prepare_secs,
+        scan_exec_secs,
+        writer_wait_secs: tsv_timing.finish_secs,
+    })
 }
 
 #[pyfunction]
@@ -4377,6 +4602,7 @@ pub fn splmm_sparse_null_model_debug<'py>(
                 sample_idx_for_factor.as_slice(),
                 sigma_g2,
                 sigma_e2,
+                1,
                 None,
             )?;
             let mut solve_workspace = factor.make_solve_workspace(p.max(1))?;
@@ -4635,7 +4861,22 @@ pub fn splmm_assoc_pcg_bed_to_tsv<'py>(
     progress_every: usize,
     rhat_tol: f64,
     scan_mode: &str,
-) -> PyResult<(f64, bool, usize, f64, bool, usize, f64, usize, usize, usize)> {
+) -> PyResult<(
+    f64,
+    bool,
+    usize,
+    f64,
+    bool,
+    usize,
+    f64,
+    usize,
+    usize,
+    usize,
+    (f64, f64, f64, f64),
+)> {
+    let top_level_timing = splmm_top_level_timing_enabled();
+    let total_t0 = top_level_timing.then(Instant::now);
+    let mut top_timing = SplmmAssocTopLevelTiming::default();
     if max_iter == 0 {
         return Err(PyRuntimeError::new_err("max_iter must be > 0"));
     }
@@ -4653,6 +4894,7 @@ pub fn splmm_assoc_pcg_bed_to_tsv<'py>(
 
     emit_progress_callback(stage1_progress_callback.as_ref(), 0, 0, 1)
         .map_err(PyRuntimeError::new_err)?;
+    let t0 = top_level_timing.then(Instant::now);
     let prepared = prepare_splmm_assoc_inputs(
         &prefix,
         y,
@@ -4673,11 +4915,18 @@ pub fn splmm_assoc_pcg_bed_to_tsv<'py>(
         prepared.operator_prepared.n_samples_full,
         "sparse_sample_indices",
     )?;
+    if let Some(t0) = t0 {
+        top_timing.prepare_inputs_secs += t0.elapsed().as_secs_f64();
+    }
     emit_progress_callback(stage1_progress_callback.as_ref(), 0, 1, 1)
         .map_err(PyRuntimeError::new_err)?;
+    let scan_rows = prepared.scan_prepared.n_rows();
+    let n = prepared.y_vec.len();
+    let p = prepared.x_design.len() / n;
 
     // Auto-populate chrom/pos/snp/allele from BIM when the caller passes
     // empty arrays (saves Python from building five large lists).
+    let t0 = top_level_timing.then(Instant::now);
     let (chrom, pos, snp, allele0, allele1): (
         Vec<String>,
         Vec<i64>,
@@ -4691,31 +4940,19 @@ pub fn splmm_assoc_pcg_bed_to_tsv<'py>(
         && allele1.is_empty()
     {
         let bed_prefix = normalize_plink_prefix_local(&prefix);
-        let sites = crate::gfcore::read_bim(&bed_prefix)
-            .map_err(|e| PyRuntimeError::new_err(format!("read BIM: {e}")))?;
         let ri = prepared
             .scan_prepared
             .row_source_indices
             .as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("auto-populate requires row_source_indices"))?;
-        let m = prepared.scan_prepared.n_rows();
-        let mut c = Vec::with_capacity(m);
-        let mut p = Vec::with_capacity(m);
-        let mut s = Vec::with_capacity(m);
-        let mut a0 = Vec::with_capacity(m);
-        let mut a1 = Vec::with_capacity(m);
-        for &src in ri.iter() {
-            let site = &sites[src];
-            c.push(site.chrom.clone());
-            p.push(site.pos as i64);
-            s.push(site.snp.clone());
-            a0.push(site.ref_allele.clone());
-            a1.push(site.alt_allele.clone());
-        }
-        (c, p, s, a0, a1)
+        read_bim_selected_columns(&bed_prefix, ri.as_slice())
+            .map_err(|e| PyRuntimeError::new_err(format!("read BIM selected columns: {e}")))?
     } else {
         (chrom, pos, snp, allele0, allele1)
     };
+    if let Some(t0) = t0 {
+        top_timing.bim_meta_secs += t0.elapsed().as_secs_f64();
+    }
     if chrom.len() != prepared.scan_prepared.n_rows()
         || pos.len() != prepared.scan_prepared.n_rows()
         || snp.len() != prepared.scan_prepared.n_rows()
@@ -4733,7 +4970,8 @@ pub fn splmm_assoc_pcg_bed_to_tsv<'py>(
         )));
     }
 
-    let (r_hat, written_rows, null_info, rhat_info) = py
+    let t0 = top_level_timing.then(Instant::now);
+    let scan_out = py
         .detach(move || {
             estimate_rhat_and_scan_to_tsv(
                 prepared.operator_prepared,
@@ -4764,6 +5002,35 @@ pub fn splmm_assoc_pcg_bed_to_tsv<'py>(
             )
         })
         .map_err(PyRuntimeError::new_err)?;
+    let _detach_secs = t0.map(|t0| t0.elapsed().as_secs_f64()).unwrap_or(0.0_f64);
+    top_timing.writer_wait_secs = scan_out.writer_wait_secs;
+    top_timing.null_scan_core_secs =
+        scan_out.factor_load_secs + scan_out.scan_prepare_secs + scan_out.scan_exec_secs;
+    top_timing.total_secs = total_t0
+        .map(|t0| t0.elapsed().as_secs_f64())
+        .unwrap_or_else(|| {
+            top_timing.prepare_inputs_secs
+                + top_timing.bim_meta_secs
+                + top_timing.null_scan_core_secs
+                + top_timing.writer_wait_secs
+        });
+    if top_level_timing {
+        emit_splmm_assoc_top_level_timing(
+            scan_mode.as_str(),
+            &top_timing,
+            scan_rows,
+            n,
+            p,
+            threads.max(1),
+        );
+    }
+    let SplmmScanToTsvResult {
+        r_hat,
+        written_rows,
+        null_info,
+        rhat_info,
+        ..
+    } = scan_out;
 
     Ok((
         r_hat,
@@ -4776,6 +5043,12 @@ pub fn splmm_assoc_pcg_bed_to_tsv<'py>(
         rhat_info.n_markers_requested,
         rhat_info.n_markers_used,
         written_rows,
+        (
+            top_timing.prepare_inputs_secs,
+            top_timing.bim_meta_secs,
+            top_timing.null_scan_core_secs,
+            top_timing.writer_wait_secs,
+        ),
     ))
 }
 

@@ -18,8 +18,9 @@ use memmap2::Mmap;
 use crate::bedmath::{decode_mean_imputed_additive_packed_block_rows_f32, packed_byte_lut};
 use crate::gfcore;
 use crate::gfreader::{
-    count_packed_row_counts, count_packed_row_counts_selected, evaluate_packed_row_keep_and_flip,
-    packed_row_stats_from_counts,
+    count_packed_row_counts, count_packed_row_counts_selected_with_excluded,
+    evaluate_packed_row_keep_and_flip, packed_row_stats_from_counts,
+    precompute_excluded_sample_indices,
 };
 use crate::stats_common::get_cached_pool;
 
@@ -565,6 +566,11 @@ pub fn compute_global_stats_mmap(
     } else {
         sample_indices.unwrap().len()
     };
+    let stats_excluded_sample_indices = if stats_identity {
+        None
+    } else {
+        precompute_excluded_sample_indices(n_samples_full, sample_indices.unwrap())
+    };
     let apply_het = het_threshold > 0.0;
     let pool = get_cached_pool(threads).map_err(|e| e.to_string())?;
 
@@ -579,7 +585,12 @@ pub fn compute_global_stats_mmap(
                     let (missing, het, hom_alt) = if stats_identity {
                         count_packed_row_counts(row, n_samples_full)
                     } else {
-                        count_packed_row_counts_selected(row, n_samples_full, si_ref.unwrap())
+                        count_packed_row_counts_selected_with_excluded(
+                            row,
+                            n_samples_full,
+                            si_ref.unwrap(),
+                            stats_excluded_sample_indices.as_deref(),
+                        )
                     };
                     let non_missing = stats_n.saturating_sub(missing);
                     let alt_sum = het.saturating_add(hom_alt.saturating_mul(2));

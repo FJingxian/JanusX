@@ -19,6 +19,7 @@ use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 #[cfg(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64"))]
 use std::sync::OnceLock;
+use std::time::Instant;
 
 use crate::bitwise::and_popcount;
 use crate::gfcore as core;
@@ -523,6 +524,100 @@ fn gfreader_rss_debug_enabled() -> bool {
     env_truthy_local("JX_GFREADER_RSS_DEBUG")
         || env_truthy_local("JX_PACKED_IO_DEBUG")
         || env_truthy_local("JX_GS_DEBUG_STAGE")
+}
+
+#[inline]
+fn bed_logic_meta_stage_timing_enabled() -> bool {
+    env_truthy_local("JX_BED_LOGIC_META_TIMING")
+        || env_truthy_local("JX_SPLMM_PREPARE_STAGE_TIMING")
+        || env_truthy_local("JX_SPLMM_PACKED_STAGE_TIMING")
+}
+
+#[inline]
+fn timing_pct_local(part_secs: f64, total_secs: f64) -> f64 {
+    if total_secs > 0.0_f64 {
+        (part_secs / total_secs) * 100.0_f64
+    } else {
+        0.0_f64
+    }
+}
+
+fn emit_bed_logic_meta_timing(
+    stage: &str,
+    read_fam_secs: f64,
+    read_bim_secs: f64,
+    mmap_secs: f64,
+    row_stats_secs: f64,
+    site_keep_secs: f64,
+    pack_kept_secs: f64,
+    total_secs: f64,
+    n_samples: usize,
+    stats_n_samples: usize,
+    n_snps: usize,
+    kept_n: usize,
+    stats_only: bool,
+) {
+    if !bed_logic_meta_stage_timing_enabled() {
+        return;
+    }
+    let accounted = read_fam_secs
+        + read_bim_secs
+        + mmap_secs
+        + row_stats_secs
+        + site_keep_secs
+        + pack_kept_secs;
+    let other_secs = (total_secs - accounted).max(0.0_f64);
+    eprintln!(
+        "BED logic meta timing stage={stage}: read_fam={:.3}s ({:.1}%), read_bim={:.3}s ({:.1}%), mmap={:.3}s ({:.1}%), row_stats={:.3}s ({:.1}%), site_keep={:.3}s ({:.1}%), pack_kept={:.3}s ({:.1}%), other={:.3}s ({:.1}%), total={:.3}s, n_samples={}, stats_n_samples={}, n_snps={}, kept_n={}, stats_only={}",
+        read_fam_secs,
+        timing_pct_local(read_fam_secs, total_secs),
+        read_bim_secs,
+        timing_pct_local(read_bim_secs, total_secs),
+        mmap_secs,
+        timing_pct_local(mmap_secs, total_secs),
+        row_stats_secs,
+        timing_pct_local(row_stats_secs, total_secs),
+        site_keep_secs,
+        timing_pct_local(site_keep_secs, total_secs),
+        pack_kept_secs,
+        timing_pct_local(pack_kept_secs, total_secs),
+        other_secs,
+        timing_pct_local(other_secs, total_secs),
+        total_secs,
+        n_samples,
+        stats_n_samples,
+        n_snps,
+        kept_n,
+        stats_only,
+    );
+}
+
+fn emit_bed_logic_meta_py_timing(
+    stage: &str,
+    rust_core_secs: f64,
+    py_arrays_secs: f64,
+    total_secs: f64,
+    n_samples_full: usize,
+    n_snps_total: usize,
+    kept_n: usize,
+) {
+    if !bed_logic_meta_stage_timing_enabled() {
+        return;
+    }
+    let other_secs = (total_secs - rust_core_secs - py_arrays_secs).max(0.0_f64);
+    eprintln!(
+        "BED logic meta timing stage={stage}: rust_core={:.3}s ({:.1}%), py_arrays={:.3}s ({:.1}%), other={:.3}s ({:.1}%), total={:.3}s, n_samples_full={}, n_snps_total={}, kept_n={}",
+        rust_core_secs,
+        timing_pct_local(rust_core_secs, total_secs),
+        py_arrays_secs,
+        timing_pct_local(py_arrays_secs, total_secs),
+        other_secs,
+        timing_pct_local(other_secs, total_secs),
+        total_secs,
+        n_samples_full,
+        n_snps_total,
+        kept_n,
+    );
 }
 
 #[inline]
@@ -1276,14 +1371,10 @@ pub(crate) fn count_packed_row_counts(row: &[u8], n_samples: usize) -> (usize, u
 }
 
 #[inline]
-pub(crate) fn count_packed_row_counts_selected(
+fn count_packed_row_counts_scalar_indices(
     row: &[u8],
-    n_samples: usize,
     sample_indices: &[usize],
 ) -> (usize, usize, usize) {
-    if sample_indices_are_identity(sample_indices) && sample_indices.len() == n_samples {
-        return count_packed_row_counts(row, n_samples);
-    }
     let mut missing = 0usize;
     let mut het = 0usize;
     let mut hom_alt = 0usize;
@@ -1297,6 +1388,74 @@ pub(crate) fn count_packed_row_counts_selected(
         }
     }
     (missing, het, hom_alt)
+}
+
+#[inline]
+pub(crate) fn precompute_excluded_sample_indices(
+    n_samples: usize,
+    sample_indices: &[usize],
+) -> Option<Vec<usize>> {
+    if sample_indices.is_empty() || sample_indices.len() >= n_samples {
+        return None;
+    }
+    let mut selected_mask = vec![false; n_samples];
+    let mut unique_selected = 0usize;
+    for &sid in sample_indices {
+        if sid >= n_samples {
+            return None;
+        }
+        if !selected_mask[sid] {
+            selected_mask[sid] = true;
+            unique_selected += 1;
+        }
+    }
+    if unique_selected != sample_indices.len() {
+        return None;
+    }
+    let excluded_n = n_samples.saturating_sub(unique_selected);
+    if excluded_n == 0 || excluded_n.saturating_mul(4) > unique_selected {
+        return None;
+    }
+    let mut excluded = Vec::with_capacity(excluded_n);
+    for (sid, &selected) in selected_mask.iter().enumerate() {
+        if !selected {
+            excluded.push(sid);
+        }
+    }
+    Some(excluded)
+}
+
+#[inline]
+pub(crate) fn count_packed_row_counts_selected_with_excluded(
+    row: &[u8],
+    n_samples: usize,
+    sample_indices: &[usize],
+    excluded_sample_indices: Option<&[usize]>,
+) -> (usize, usize, usize) {
+    if sample_indices_are_identity(sample_indices) && sample_indices.len() == n_samples {
+        return count_packed_row_counts(row, n_samples);
+    }
+    if let Some(excluded_sample_indices) = excluded_sample_indices {
+        let (missing, het, hom_alt) = count_packed_row_counts(row, n_samples);
+        let (missing_ex, het_ex, hom_alt_ex) =
+            count_packed_row_counts_scalar_indices(row, excluded_sample_indices);
+        return (
+            missing.saturating_sub(missing_ex),
+            het.saturating_sub(het_ex),
+            hom_alt.saturating_sub(hom_alt_ex),
+        );
+    }
+    count_packed_row_counts_scalar_indices(row, sample_indices)
+}
+
+#[inline]
+#[allow(dead_code)]
+pub(crate) fn count_packed_row_counts_selected(
+    row: &[u8],
+    n_samples: usize,
+    sample_indices: &[usize],
+) -> (usize, usize, usize) {
+    count_packed_row_counts_selected_with_excluded(row, n_samples, sample_indices, None)
 }
 
 #[inline]
@@ -1327,14 +1486,10 @@ pub(crate) fn count_packed_row_pure_line_counts(row: &[u8], n_samples: usize) ->
 }
 
 #[inline]
-pub(crate) fn count_packed_row_pure_line_counts_selected(
+fn count_packed_row_pure_line_counts_scalar_indices(
     row: &[u8],
-    n_samples: usize,
     sample_indices: &[usize],
 ) -> (usize, usize) {
-    if sample_indices_are_identity(sample_indices) && sample_indices.len() == n_samples {
-        return count_packed_row_pure_line_counts(row, n_samples);
-    }
     let mut logic_missing = 0usize;
     let mut hom_alt = 0usize;
     for &sid in sample_indices.iter() {
@@ -1346,6 +1501,43 @@ pub(crate) fn count_packed_row_pure_line_counts_selected(
         }
     }
     (logic_missing, hom_alt)
+}
+
+#[inline]
+pub(crate) fn count_packed_row_pure_line_counts_selected_with_excluded(
+    row: &[u8],
+    n_samples: usize,
+    sample_indices: &[usize],
+    excluded_sample_indices: Option<&[usize]>,
+) -> (usize, usize) {
+    if sample_indices_are_identity(sample_indices) && sample_indices.len() == n_samples {
+        return count_packed_row_pure_line_counts(row, n_samples);
+    }
+    if let Some(excluded_sample_indices) = excluded_sample_indices {
+        let (logic_missing, hom_alt) = count_packed_row_pure_line_counts(row, n_samples);
+        let (logic_missing_ex, hom_alt_ex) =
+            count_packed_row_pure_line_counts_scalar_indices(row, excluded_sample_indices);
+        return (
+            logic_missing.saturating_sub(logic_missing_ex),
+            hom_alt.saturating_sub(hom_alt_ex),
+        );
+    }
+    count_packed_row_pure_line_counts_scalar_indices(row, sample_indices)
+}
+
+#[inline]
+#[allow(dead_code)]
+pub(crate) fn count_packed_row_pure_line_counts_selected(
+    row: &[u8],
+    n_samples: usize,
+    sample_indices: &[usize],
+) -> (usize, usize) {
+    count_packed_row_pure_line_counts_selected_with_excluded(
+        row,
+        n_samples,
+        sample_indices,
+        None,
+    )
 }
 
 #[inline]
@@ -4128,6 +4320,8 @@ pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples(
     stats_sample_indices: Option<&[usize]>,
     stats_only: bool,
 ) -> Result<PreparedBedLogicMetaOwned, String> {
+    let total_t0 = Instant::now();
+    let mut read_bim_secs = 0.0_f64;
     if !(0.0..=0.5).contains(&maf_threshold) {
         return Err("maf_threshold must be within [0, 0.5]".to_string());
     }
@@ -4144,7 +4338,9 @@ pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples(
         bed_prefix.truncate(bed_prefix.len() - 4);
     }
 
+    let read_fam_t0 = Instant::now();
     let samples = core::read_fam(&bed_prefix).map_err(|e| e.to_string())?;
+    let read_fam_secs = read_fam_t0.elapsed().as_secs_f64();
     let n_samples = samples.len();
     if n_samples == 0 {
         return Err("no samples found in PLINK input".to_string());
@@ -4162,6 +4358,11 @@ pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples(
     } else {
         stats_sample_indices.len()
     };
+    let stats_excluded_sample_indices = if stats_identity {
+        None
+    } else {
+        precompute_excluded_sample_indices(n_samples, stats_sample_indices)
+    };
     if stats_n_samples == 0 {
         return Err("selected sample set for BED logic preparation is empty".to_string());
     }
@@ -4170,20 +4371,12 @@ pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples(
         &format!("prefix={bed_prefix} n_samples={n_samples} stats_n_samples={stats_n_samples}"),
     );
 
-    let sites_all = core::read_bim(&bed_prefix).map_err(|e| e.to_string())?;
-    let n_snps = sites_all.len();
-    if n_snps == 0 {
-        return Err("no SNP sites found in PLINK BIM input".to_string());
-    }
-    emit_gfreader_rss_debug(
-        "prepare_bed_logic_meta/read_bim",
-        &format!("prefix={bed_prefix} n_snps={n_snps}"),
-    );
-
+    let mmap_t0 = Instant::now();
     let bed_path = format!("{bed_prefix}.bed");
     let bed_file = File::open(&bed_path).map_err(|e| format!("failed to open {bed_path}: {e}"))?;
     let mmap =
         unsafe { Mmap::map(&bed_file) }.map_err(|e| format!("failed to mmap {bed_path}: {e}"))?;
+    let mmap_secs = mmap_t0.elapsed().as_secs_f64();
     if mmap.len() < 3 {
         return Err("BED too small".to_string());
     }
@@ -4199,11 +4392,33 @@ pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples(
         ));
     }
     let n_snps_bed = data_len / bytes_per_snp;
-    if n_snps_bed != n_snps {
-        return Err(format!(
-            "BED/BIM SNP count mismatch: bed={n_snps_bed}, bim={n_snps}"
-        ));
+    if n_snps_bed == 0 {
+        return Err("no SNP sites found in PLINK BED input".to_string());
     }
+
+    let load_sites_all = snps_only || !stats_only;
+    let sites_all = if load_sites_all {
+        let read_bim_t0 = Instant::now();
+        let sites_all = core::read_bim(&bed_prefix).map_err(|e| e.to_string())?;
+        read_bim_secs = read_bim_t0.elapsed().as_secs_f64();
+        let n_snps_bim = sites_all.len();
+        if n_snps_bim == 0 {
+            return Err("no SNP sites found in PLINK BIM input".to_string());
+        }
+        if n_snps_bed != n_snps_bim {
+            return Err(format!(
+                "BED/BIM SNP count mismatch: bed={n_snps_bed}, bim={n_snps_bim}"
+            ));
+        }
+        emit_gfreader_rss_debug(
+            "prepare_bed_logic_meta/read_bim",
+            &format!("prefix={bed_prefix} n_snps={n_snps_bim}"),
+        );
+        Some(sites_all)
+    } else {
+        None
+    };
+    let n_snps = n_snps_bed;
 
     let packed_full = &mmap[3..];
     emit_gfreader_rss_debug(
@@ -4215,6 +4430,7 @@ pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples(
     );
 
     let apply_het_filter = het_threshold > 0.0_f32;
+    let row_stats_t0 = Instant::now();
     let keep_flip_stats: Vec<(bool, f32, f32)> = packed_full
         .par_chunks(bytes_per_snp)
         .enumerate()
@@ -4222,7 +4438,12 @@ pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples(
             let (missing, het, hom_alt) = if stats_identity {
                 count_packed_row_counts(row, n_samples)
             } else {
-                count_packed_row_counts_selected(row, n_samples, stats_sample_indices)
+                count_packed_row_counts_selected_with_excluded(
+                    row,
+                    n_samples,
+                    stats_sample_indices,
+                    stats_excluded_sample_indices.as_deref(),
+                )
             };
             let non_missing = stats_n_samples.saturating_sub(missing);
             let alt_sum = het.saturating_add(hom_alt.saturating_mul(2));
@@ -4246,8 +4467,10 @@ pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples(
                 alt_freq.min(1.0_f32 - alt_freq) >= maf_threshold
             };
             let pass_snp = if snps_only {
-                is_simple_snp_allele(&sites_all[i].ref_allele)
-                    && is_simple_snp_allele(&sites_all[i].alt_allele)
+                let site = &sites_all
+                    .as_ref()
+                    .expect("snps_only requires BIM metadata for allele filtering")[i];
+                is_simple_snp_allele(&site.ref_allele) && is_simple_snp_allele(&site.alt_allele)
             } else {
                 true
             };
@@ -4255,6 +4478,8 @@ pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples(
             (keep, missing_rate, alt_freq)
         })
         .collect();
+    let row_stats_secs = row_stats_t0.elapsed().as_secs_f64();
+    let site_keep_t0 = Instant::now();
     let site_keep: Vec<bool> = keep_flip_stats
         .iter()
         .map(|(keep, _, _)| *keep)
@@ -4267,6 +4492,7 @@ pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples(
     }
 
     let kept_n = site_keep.iter().filter(|&&x| x).count();
+    let site_keep_secs = site_keep_t0.elapsed().as_secs_f64();
     if kept_n == 0 {
         return Err(
             "No SNPs left after packed BED filtering. Please relax thresholds.".to_string(),
@@ -4281,6 +4507,7 @@ pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples(
         ),
     );
 
+    let pack_kept_t0 = Instant::now();
     let mut sites_keep: Vec<core::SiteInfo> = if stats_only {
         Vec::new()
     } else {
@@ -4290,18 +4517,45 @@ pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples(
     let mut row_source_indices = Vec::<usize>::with_capacity(kept_n);
     let mut missing_rate_keep = Vec::<f32>::with_capacity(kept_n);
     let mut maf_keep = Vec::<f32>::with_capacity(kept_n);
-    for (i, site) in sites_all.into_iter().enumerate() {
-        if site_keep[i] {
-            let (_keep, missing_rate, alt_freq) = keep_flip_stats[i];
-            if !stats_only {
-                sites_keep.push(site);
+    if let Some(sites_all) = sites_all {
+        for (i, site) in sites_all.into_iter().enumerate() {
+            if site_keep[i] {
+                let (_keep, missing_rate, alt_freq) = keep_flip_stats[i];
+                if !stats_only {
+                    sites_keep.push(site);
+                }
+                row_flip_keep.push(false);
+                row_source_indices.push(i);
+                missing_rate_keep.push(missing_rate);
+                maf_keep.push(alt_freq);
             }
-            row_flip_keep.push(false);
-            row_source_indices.push(i);
-            missing_rate_keep.push(missing_rate);
-            maf_keep.push(alt_freq);
+        }
+    } else {
+        for (i, (keep, missing_rate, alt_freq)) in keep_flip_stats.iter().copied().enumerate() {
+            if keep {
+                row_flip_keep.push(false);
+                row_source_indices.push(i);
+                missing_rate_keep.push(missing_rate);
+                maf_keep.push(alt_freq);
+            }
         }
     }
+    let pack_kept_secs = pack_kept_t0.elapsed().as_secs_f64();
+    emit_bed_logic_meta_timing(
+        "prepare_bed_logic_meta_owned_for_stats_samples",
+        read_fam_secs,
+        read_bim_secs,
+        mmap_secs,
+        row_stats_secs,
+        site_keep_secs,
+        pack_kept_secs,
+        total_t0.elapsed().as_secs_f64(),
+        n_samples,
+        stats_n_samples,
+        n_snps,
+        kept_n,
+        stats_only,
+    );
 
     Ok(PreparedBedLogicMetaOwned {
         site_keep,
@@ -4374,6 +4628,11 @@ pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples_pure_line(
     } else {
         stats_sample_indices.len()
     };
+    let stats_excluded_sample_indices = if stats_identity {
+        None
+    } else {
+        precompute_excluded_sample_indices(n_samples, stats_sample_indices)
+    };
     if stats_n_samples == 0 {
         return Err("selected sample set for BED pure-line logic preparation is empty".to_string());
     }
@@ -4417,7 +4676,12 @@ pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples_pure_line(
             let (logic_missing, hom_alt) = if stats_identity {
                 count_packed_row_pure_line_counts(row, n_samples)
             } else {
-                count_packed_row_pure_line_counts_selected(row, n_samples, stats_sample_indices)
+                count_packed_row_pure_line_counts_selected_with_excluded(
+                    row,
+                    n_samples,
+                    stats_sample_indices,
+                    stats_excluded_sample_indices.as_deref(),
+                )
             };
             let (missing_rate, _maf, _std) =
                 packed_row_stats_from_counts_pure_line(stats_n_samples, logic_missing, hom_alt);
@@ -4536,6 +4800,11 @@ pub(crate) fn load_bed_2bit_packed_subset_owned_for_stats_samples(
     } else {
         stats_sample_indices.len()
     };
+    let stats_excluded_sample_indices = if stats_identity {
+        None
+    } else {
+        precompute_excluded_sample_indices(n_samples, stats_sample_indices)
+    };
     if stats_n_samples == 0 {
         return Err("selected sample set for packed BED subset stats is empty".to_string());
     }
@@ -4612,7 +4881,12 @@ pub(crate) fn load_bed_2bit_packed_subset_owned_for_stats_samples(
                 let (missing, het, hom_alt) = if stats_identity {
                     count_packed_row_counts(row, n_samples)
                 } else {
-                    count_packed_row_counts_selected(row, n_samples, stats_sample_indices)
+                    count_packed_row_counts_selected_with_excluded(
+                        row,
+                        n_samples,
+                        stats_sample_indices,
+                        stats_excluded_sample_indices.as_deref(),
+                    )
                 };
                 let non_missing = stats_n_samples.saturating_sub(missing);
                 let alt_sum = het.saturating_add(hom_alt.saturating_mul(2));
@@ -4687,6 +4961,11 @@ pub(crate) fn load_bed_2bit_packed_subset_owned_for_stats_samples_pure_line(
     } else {
         stats_sample_indices.len()
     };
+    let stats_excluded_sample_indices = if stats_identity {
+        None
+    } else {
+        precompute_excluded_sample_indices(n_samples, stats_sample_indices)
+    };
     if stats_n_samples == 0 {
         return Err("selected sample set for packed BED subset stats is empty".to_string());
     }
@@ -4750,7 +5029,12 @@ pub(crate) fn load_bed_2bit_packed_subset_owned_for_stats_samples_pure_line(
                 let (logic_missing, hom_alt) = if stats_identity {
                     count_packed_row_pure_line_counts(row, n_samples)
                 } else {
-                    count_packed_row_pure_line_counts_selected(row, n_samples, stats_sample_indices)
+                    count_packed_row_pure_line_counts_selected_with_excluded(
+                        row,
+                        n_samples,
+                        stats_sample_indices,
+                        stats_excluded_sample_indices.as_deref(),
+                    )
                 };
                 let (miss, _maf, std) =
                     packed_row_stats_from_counts_pure_line(stats_n_samples, logic_missing, hom_alt);
@@ -5204,6 +5488,7 @@ pub fn prepare_bed_logic_meta_selected<'py>(
             "het_threshold must be within [0, 1.0]",
         ));
     }
+    let total_t0 = Instant::now();
 
     let bed_prefix = normalize_plink_prefix_local(&prefix);
     let n_samples_full = core::read_fam(&bed_prefix)
@@ -5230,6 +5515,7 @@ pub fn prepare_bed_logic_meta_selected<'py>(
         None
     };
 
+    let rust_core_t0 = Instant::now();
     let prepared = py
         .detach(move || {
             prepare_bed_logic_meta_owned_for_stats_samples(
@@ -5243,7 +5529,9 @@ pub fn prepare_bed_logic_meta_selected<'py>(
             )
         })
         .map_err(PyRuntimeError::new_err)?;
+    let rust_core_secs = rust_core_t0.elapsed().as_secs_f64();
 
+    let py_arrays_t0 = Instant::now();
     let row_idx: Vec<i64> = prepared
         .row_source_indices
         .iter()
@@ -5262,6 +5550,16 @@ pub fn prepare_bed_logic_meta_selected<'py>(
     #[allow(deprecated)]
     let site_keep_arr =
         PyArray1::from_owned_array(py, Array1::from_vec(prepared.site_keep)).into_bound();
+    let py_arrays_secs = py_arrays_t0.elapsed().as_secs_f64();
+    emit_bed_logic_meta_py_timing(
+        "prepare_bed_logic_meta_selected_py",
+        rust_core_secs,
+        py_arrays_secs,
+        total_t0.elapsed().as_secs_f64(),
+        n_samples_full,
+        prepared.n_snps_total,
+        prepared.row_source_indices.len(),
+    );
     Ok((
         row_idx_arr,
         miss_arr,
@@ -6624,7 +6922,9 @@ impl PlinkStreamWriter {
 mod tests {
     use super::{
         count_packed_row_counts, count_packed_row_counts_selected,
-        evaluate_packed_row_keep_and_flip,
+        count_packed_row_counts_selected_with_excluded, count_packed_row_pure_line_counts,
+        count_packed_row_pure_line_counts_selected_with_excluded, evaluate_packed_row_keep_and_flip,
+        precompute_excluded_sample_indices,
     };
 
     fn pack_plink_codes(codes: &[u8]) -> Vec<u8> {
@@ -6646,6 +6946,44 @@ mod tests {
 
         let identity = count_packed_row_counts_selected(&row, 6, &[0, 1, 2, 3, 4, 5]);
         assert_eq!(identity, full);
+    }
+
+    #[test]
+    fn selected_counts_with_excluded_match_direct_subset_counts() {
+        let row = pack_plink_codes(&[0b00, 0b11, 0b10, 0b01, 0b11, 0b00]);
+        let sample_indices = [0usize, 1, 2, 4, 5];
+        let excluded = precompute_excluded_sample_indices(6, &sample_indices)
+            .expect("near-full subset should precompute excluded sample indices");
+        let direct = count_packed_row_counts_selected(&row, 6, &sample_indices);
+        let with_excluded = count_packed_row_counts_selected_with_excluded(
+            &row,
+            6,
+            &sample_indices,
+            Some(excluded.as_slice()),
+        );
+        assert_eq!(with_excluded, direct);
+    }
+
+    #[test]
+    fn pure_line_selected_counts_with_excluded_match_direct_subset_counts() {
+        let row = pack_plink_codes(&[0b00, 0b11, 0b10, 0b01, 0b11, 0b00]);
+        let sample_indices = [0usize, 1, 2, 4, 5];
+        let excluded = precompute_excluded_sample_indices(6, &sample_indices)
+            .expect("near-full subset should precompute excluded sample indices");
+        let direct = count_packed_row_pure_line_counts_selected_with_excluded(
+            &row,
+            6,
+            &sample_indices,
+            None,
+        );
+        let with_excluded = count_packed_row_pure_line_counts_selected_with_excluded(
+            &row,
+            6,
+            &sample_indices,
+            Some(excluded.as_slice()),
+        );
+        assert_eq!(with_excluded, direct);
+        assert_eq!(count_packed_row_pure_line_counts(&row, 6), (2, 2));
     }
 
     #[test]

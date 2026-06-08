@@ -67,6 +67,34 @@ struct SplmmTsvTiming {
     bytes: usize,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct SplmmNullStateTiming {
+    solve_y_secs: f64,
+    solve_x_secs: f64,
+    xt_v_inv_y_secs: f64,
+    xt_v_inv_x_secs: f64,
+    chol_secs: f64,
+    beta_py_secs: f64,
+    scale_secs: f64,
+    total_secs: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct SplmmPrepareTiming {
+    workspace_secs: f64,
+    xtx_chol_secs: f64,
+    null_state_secs: f64,
+    rhat_decode_secs: f64,
+    rhat_solve_secs: f64,
+    rhat_mx_secs: f64,
+    rhat_p0_secs: f64,
+    rhat_reduce_secs: f64,
+    total_secs: f64,
+    n_rhat_requested: usize,
+    n_rhat_used: usize,
+    null_state: SplmmNullStateTiming,
+}
+
 struct SplmmTsvBlockPayload {
     row_start: usize,
     rows_here: usize,
@@ -76,6 +104,11 @@ struct SplmmTsvBlockPayload {
 #[inline]
 fn splmm_packed_stage_timing_enabled() -> bool {
     env_truthy("JX_SPLMM_PACKED_STAGE_TIMING")
+}
+
+#[inline]
+fn splmm_prepare_stage_timing_enabled() -> bool {
+    env_truthy("JX_SPLMM_PREPARE_STAGE_TIMING") || splmm_packed_stage_timing_enabled()
 }
 
 fn emit_splmm_packed_scan_timing(
@@ -131,6 +164,87 @@ fn emit_splmm_packed_scan_timing(
         n,
         p,
         if threads > 0 { threads } else { rayon::current_num_threads() },
+    );
+}
+
+fn emit_splmm_prepare_timing(
+    mode: &str,
+    timing: &SplmmPrepareTiming,
+    rows: usize,
+    n: usize,
+    p: usize,
+) {
+    let accounted_secs = timing.workspace_secs
+        + timing.xtx_chol_secs
+        + timing.null_state_secs
+        + timing.rhat_decode_secs
+        + timing.rhat_solve_secs
+        + timing.rhat_mx_secs
+        + timing.rhat_p0_secs
+        + timing.rhat_reduce_secs;
+    let other_secs = (timing.total_secs - accounted_secs).max(0.0_f64);
+    let to_pct = |x: f64| -> f64 {
+        if timing.total_secs > 0.0 {
+            x * 100.0 / timing.total_secs
+        } else {
+            0.0
+        }
+    };
+    eprintln!(
+        "SparseLMM prepare timing mode={mode}: workspace={:.3}s ({:.1}%), xtx_chol={:.3}s ({:.1}%), null_state={:.3}s ({:.1}%), rhat_decode={:.3}s ({:.1}%), rhat_solve={:.3}s ({:.1}%), rhat_mx={:.3}s ({:.1}%), rhat_p0={:.3}s ({:.1}%), rhat_reduce={:.3}s ({:.1}%), other={:.3}s ({:.1}%), total={:.3}s, rows={}, n={}, p={}, rhat_requested={}, rhat_used={}",
+        timing.workspace_secs,
+        to_pct(timing.workspace_secs),
+        timing.xtx_chol_secs,
+        to_pct(timing.xtx_chol_secs),
+        timing.null_state_secs,
+        to_pct(timing.null_state_secs),
+        timing.rhat_decode_secs,
+        to_pct(timing.rhat_decode_secs),
+        timing.rhat_solve_secs,
+        to_pct(timing.rhat_solve_secs),
+        timing.rhat_mx_secs,
+        to_pct(timing.rhat_mx_secs),
+        timing.rhat_p0_secs,
+        to_pct(timing.rhat_p0_secs),
+        timing.rhat_reduce_secs,
+        to_pct(timing.rhat_reduce_secs),
+        other_secs,
+        to_pct(other_secs),
+        timing.total_secs,
+        rows,
+        n,
+        p,
+        timing.n_rhat_requested,
+        timing.n_rhat_used,
+    );
+
+    let null_total = timing.null_state.total_secs;
+    let null_to_pct = |x: f64| -> f64 {
+        if null_total > 0.0 {
+            x * 100.0 / null_total
+        } else {
+            0.0
+        }
+    };
+    eprintln!(
+        "SparseLMM null-state timing: solve_y={:.3}s ({:.1}%), solve_x={:.3}s ({:.1}%), xt_v_inv_y={:.3}s ({:.1}%), xt_v_inv_x={:.3}s ({:.1}%), chol={:.3}s ({:.1}%), beta_py={:.3}s ({:.1}%), scale={:.3}s ({:.1}%), total={:.3}s, n={}, p={}",
+        timing.null_state.solve_y_secs,
+        null_to_pct(timing.null_state.solve_y_secs),
+        timing.null_state.solve_x_secs,
+        null_to_pct(timing.null_state.solve_x_secs),
+        timing.null_state.xt_v_inv_y_secs,
+        null_to_pct(timing.null_state.xt_v_inv_y_secs),
+        timing.null_state.xt_v_inv_x_secs,
+        null_to_pct(timing.null_state.xt_v_inv_x_secs),
+        timing.null_state.chol_secs,
+        null_to_pct(timing.null_state.chol_secs),
+        timing.null_state.beta_py_secs,
+        null_to_pct(timing.null_state.beta_py_secs),
+        timing.null_state.scale_secs,
+        null_to_pct(timing.null_state.scale_secs),
+        null_total,
+        n,
+        p,
     );
 }
 
@@ -328,6 +442,15 @@ impl SplmmScanMode {
     #[inline]
     fn needs_exact_workspace(self) -> bool {
         matches!(self, Self::Exact | Self::TwoStage)
+    }
+
+    #[inline]
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Approx => "approx",
+            Self::Exact => "exact",
+            Self::TwoStage => "two_stage",
+        }
     }
 }
 
@@ -3013,6 +3136,7 @@ struct SplmmPreparedScanState {
     gamma0: f64,
     r_hat: f64,
     rhat_info: PcgJxlmmRHatResult,
+    prepare_timing: SplmmPrepareTiming,
 }
 
 impl SplmmPreparedScanState {
@@ -3030,6 +3154,7 @@ struct SplmmBuiltNullState {
     beta_hat: Vec<f64>,
     null_model: PcgJxlmmNullModel,
     null_info: PcgJxlmmNullModelInfo,
+    timing: SplmmNullStateTiming,
 }
 
 fn build_sparse_jxlmm_null_state(
@@ -3040,6 +3165,8 @@ fn build_sparse_jxlmm_null_state(
     solve_workspace: &mut SparseJxgrmSolveWorkspace,
     stage1_cb: Option<&Py<PyAny>>,
 ) -> Result<SplmmBuiltNullState, String> {
+    let total_t0 = Instant::now();
+    let mut timing = SplmmNullStateTiming::default();
     let n = y_vec.len();
     if n == 0 {
         return Err("SparseLMM null-state build requires non-empty y".to_string());
@@ -3063,7 +3190,9 @@ fn build_sparse_jxlmm_null_state(
     if stage1_cb.is_some() {
         emit_progress_callback(stage1_cb, 6, 0, 1)?;
     }
+    let solve_y_t0 = Instant::now();
     let y_vinv_col = sparse_solve_rhs_with_workspace(factor, y_vec, 1, solve_workspace)?;
+    timing.solve_y_secs = solve_y_t0.elapsed().as_secs_f64();
     if stage1_cb.is_some() {
         emit_progress_callback(stage1_cb, 6, 1, 1)?;
     }
@@ -3072,16 +3201,21 @@ fn build_sparse_jxlmm_null_state(
     if stage1_cb.is_some() {
         emit_progress_callback(stage1_cb, 7, 0, p.max(1))?;
     }
+    let solve_x_t0 = Instant::now();
     let x_vinv_col =
         sparse_solve_rhs_with_workspace(factor, &x_design_col_major, p, solve_workspace)?;
+    timing.solve_x_secs = solve_x_t0.elapsed().as_secs_f64();
     if stage1_cb.is_some() {
         emit_progress_callback(stage1_cb, 7, p.max(1), p.max(1))?;
     }
 
     let mut xt_v_inv_y = vec![0.0_f64; p];
+    let xt_v_inv_y_t0 = Instant::now();
     xt_vec_row_major(&x_design, n, p, &y_vinv_col, &mut xt_v_inv_y);
+    timing.xt_v_inv_y_secs = xt_v_inv_y_t0.elapsed().as_secs_f64();
 
     let mut xt_v_inv_x = vec![0.0_f64; p * p];
+    let xt_v_inv_x_t0 = Instant::now();
     unsafe {
         cblas_dgemm_dispatch(
             CBLAS_COL_MAJOR,
@@ -3100,10 +3234,14 @@ fn build_sparse_jxlmm_null_state(
             p as CblasInt,
         );
     }
+    timing.xt_v_inv_x_secs = xt_v_inv_x_t0.elapsed().as_secs_f64();
+    let chol_t0 = Instant::now();
     let xt_v_inv_x_chol = spd_cholesky_with_jitter(&xt_v_inv_x, p, "SparseLMM XtVinvX")?;
+    timing.chol_secs = chol_t0.elapsed().as_secs_f64();
     drop(xt_v_inv_x);
 
     let mut beta_hat = vec![0.0_f64; p];
+    let beta_py_t0 = Instant::now();
     cholesky_solve_into(&xt_v_inv_x_chol, p, &xt_v_inv_y, &mut beta_hat);
     drop(xt_v_inv_y);
 
@@ -3118,7 +3256,9 @@ fn build_sparse_jxlmm_null_state(
         }
     }
     drop(x_vinv_col);
+    timing.beta_py_secs = beta_py_t0.elapsed().as_secs_f64();
 
+    let scale_t0 = Instant::now();
     let mut p0y = py.clone();
     for value in p0y.iter_mut() {
         *value *= sigma2;
@@ -3130,6 +3270,8 @@ fn build_sparse_jxlmm_null_state(
             *value *= sqrt_sigma2;
         }
     }
+    timing.scale_secs = scale_t0.elapsed().as_secs_f64();
+    timing.total_secs = total_t0.elapsed().as_secs_f64();
 
     let null_model = PcgJxlmmNullModel {
         n_samples: n,
@@ -3166,6 +3308,7 @@ fn build_sparse_jxlmm_null_state(
         beta_hat,
         null_model,
         null_info,
+        timing,
     })
 }
 
@@ -3187,6 +3330,8 @@ fn prepare_splmm_scan_state(
     progress_every: usize,
     scan_mode: SplmmScanMode,
 ) -> Result<SplmmPreparedScanState, String> {
+    let total_t0 = Instant::now();
+    let mut prepare_timing = SplmmPrepareTiming::default();
     let n = y_vec.len();
     let p = x_design.len() / n;
     let sigma2 = splmm_effective_sigma2(sigma_g2, sigma_e2)?;
@@ -3218,13 +3363,17 @@ fn prepare_splmm_scan_state(
     } else {
         p.max(n_rhat_cap).max(1)
     };
+    let workspace_t0 = Instant::now();
     let mut solve_workspace = factor.make_solve_workspace(solve_cap)?;
+    prepare_timing.workspace_secs = workspace_t0.elapsed().as_secs_f64();
 
+    let xtx_chol_t0 = Instant::now();
     let x_design_xtx_chol = if scan_mode.needs_rhat() || scan_mode.needs_exact_workspace() {
         Some(xtx_chol_from_design(x_design, n, p)?)
     } else {
         None
     };
+    prepare_timing.xtx_chol_secs = xtx_chol_t0.elapsed().as_secs_f64();
     let null_state = build_sparse_jxlmm_null_state(
         &factor,
         x_design,
@@ -3233,9 +3382,11 @@ fn prepare_splmm_scan_state(
         &mut solve_workspace,
         stage1_cb,
     )?;
+    prepare_timing.null_state_secs = null_state.timing.total_secs;
     let x_design_col_major = null_state.x_design_col_major;
     let null_model = null_state.null_model;
     let null_info = null_state.null_info;
+    prepare_timing.null_state = null_state.timing;
 
     let (gamma0, r_hat, rhat_result) = if !scan_mode.needs_rhat() {
         (
@@ -3257,6 +3408,7 @@ fn prepare_splmm_scan_state(
     } else {
         let rhat_rows = choose_rhat_rows(scan_prepared.n_rows(), rhat_markers, rhat_seed);
         let n_rhat = rhat_rows.len();
+        prepare_timing.n_rhat_requested = n_rhat;
         if stage1_cb.is_some() {
             emit_progress_callback(stage1_cb, 8, 0, rhat_progress_total)?;
         }
@@ -3283,6 +3435,7 @@ fn prepare_splmm_scan_state(
         let mut tmp_snp = vec![0.0_f64; n];
         let mut xts = vec![0.0_f64; p];
         let mut alpha = vec![0.0_f64; p];
+        let rhat_decode_t0 = Instant::now();
         for (col, &row_idx) in rhat_rows.iter().enumerate() {
             decode_packed_row_model_into_f64(
                 scan_prepared.row_bytes(row_idx),
@@ -3302,32 +3455,43 @@ fn prepare_splmm_scan_state(
                 emit_progress_callback(stage1_cb, 8, col + 1, rhat_progress_total)?;
             }
         }
+        prepare_timing.rhat_decode_secs = rhat_decode_t0.elapsed().as_secs_f64();
+        let rhat_solve_t0 = Instant::now();
         let v_inv_s_col = sparse_solve_rhs_with_workspace(
             &factor,
             &sampled_markers,
             n_rhat,
             &mut solve_workspace,
         )?;
+        prepare_timing.rhat_solve_secs = rhat_solve_t0.elapsed().as_secs_f64();
         let mut ratio_sum = 0.0_f64;
         let mut n_used = 0usize;
         let mut v_inv_col = vec![0.0_f64; n];
+        let rhat_reduce_t0 = Instant::now();
+        let mut rhat_mx_secs = 0.0_f64;
+        let mut rhat_p0_secs = 0.0_f64;
         for col in 0..n_rhat {
             let snp_col = &sampled_markers[col * n..(col + 1) * n];
             for row in 0..n {
                 v_inv_col[row] = v_inv_s_col[col * n + row];
             }
+            let mx_t0 = Instant::now();
             xt_vec_row_major(x_design, n, p, snp_col, &mut xts);
             let s_sq = snp_col.iter().map(|v| v * v).sum::<f64>();
             if !s_sq.is_finite() || s_sq <= SPLMM_TINY {
+                rhat_mx_secs += mx_t0.elapsed().as_secs_f64();
                 continue;
             }
             let s_m_s =
                 residualized_sumsq_from_xtx_chol(x_design_xtx_chol, p, &xts, &mut alpha, s_sq);
+            rhat_mx_secs += mx_t0.elapsed().as_secs_f64();
             if !s_m_s.is_finite() || s_m_s <= SPLMM_TINY {
                 continue;
             }
+            let p0_t0 = Instant::now();
             let s_p0_s =
                 crate::pcg::pcg_jxlmm_s_p0_s_exact(&null_model, &x_design, snp_col, &v_inv_col)?;
+            rhat_p0_secs += p0_t0.elapsed().as_secs_f64();
             if !s_p0_s.is_finite() || s_p0_s <= SPLMM_TINY {
                 continue;
             }
@@ -3343,6 +3507,13 @@ fn prepare_splmm_scan_state(
         if stage1_cb.is_some() {
             emit_progress_callback(stage1_cb, 8, rhat_progress_total, rhat_progress_total)?;
         }
+        prepare_timing.rhat_mx_secs = rhat_mx_secs;
+        prepare_timing.rhat_p0_secs = rhat_p0_secs;
+        prepare_timing.n_rhat_used = n_used;
+        prepare_timing.rhat_reduce_secs = (rhat_reduce_t0.elapsed().as_secs_f64()
+            - rhat_mx_secs
+            - rhat_p0_secs)
+            .max(0.0_f64);
         let gamma0_val = ratio_sum / (n_used as f64);
         let r_hat_val = gamma0_val / sigma2;
         drop(v_inv_col);
@@ -3373,6 +3544,7 @@ fn prepare_splmm_scan_state(
             },
         )
     };
+    prepare_timing.total_secs = total_t0.elapsed().as_secs_f64();
     Ok(SplmmPreparedScanState {
         factor,
         solve_workspace,
@@ -3383,6 +3555,7 @@ fn prepare_splmm_scan_state(
         gamma0,
         r_hat,
         rhat_info: rhat_result,
+        prepare_timing,
     })
 }
 
@@ -3423,6 +3596,15 @@ fn estimate_rhat_and_scan_sparse(
         progress_every,
         scan_mode,
     )?;
+    if splmm_prepare_stage_timing_enabled() {
+        emit_splmm_prepare_timing(
+            scan_mode.as_str(),
+            &state.prepare_timing,
+            scan_prepared.n_rows(),
+            y_vec.len(),
+            x_design.len() / y_vec.len(),
+        );
+    }
     let total_rows = scan_prepared.n_rows();
     let x_design_xtx_chol = state.require_x_design_xtx_chol()?.to_vec();
     let out = match scan_mode {
@@ -3643,6 +3825,15 @@ fn estimate_rhat_and_scan_to_tsv(
         progress_every,
         scan_mode,
     )?;
+    if splmm_prepare_stage_timing_enabled() {
+        emit_splmm_prepare_timing(
+            scan_mode.as_str(),
+            &state.prepare_timing,
+            scan_prepared.n_rows(),
+            y_vec.len(),
+            x_design.len() / y_vec.len(),
+        );
+    }
     let total_rows = scan_prepared.n_rows();
     let x_design_xtx_chol = state.require_x_design_xtx_chol()?.to_vec();
     let written_rows = match scan_mode {

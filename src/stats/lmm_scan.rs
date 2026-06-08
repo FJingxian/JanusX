@@ -31,8 +31,8 @@ use crate::blas::{
 use crate::brent::{brent_minimize, brent_minimize_with_init};
 use crate::gfcore;
 use crate::gfreader::{
-    count_packed_row_counts, count_packed_row_counts_selected, is_simple_snp_allele,
-    sample_indices_are_identity,
+    count_packed_row_counts, count_packed_row_counts_selected_with_excluded,
+    is_simple_snp_allele, precompute_excluded_sample_indices, sample_indices_are_identity,
 };
 use crate::linalg::{
     chi2_sf_df1, chisq_from_beta_se_and_optional_plrt, cholesky_inplace, cholesky_logdet,
@@ -4081,6 +4081,11 @@ pub fn fvlmm_assoc_bed_to_tsv_f32<'py>(
             let use_selected =
                 !sample_indices_are_identity(&sample_idx) || sample_idx.len() != n_samples_full;
             let sample_identity = !use_selected && sample_idx.len() == n_samples_full;
+            let selected_excluded_sample_indices = if use_selected {
+                precompute_excluded_sample_indices(n_samples_full, &sample_idx)
+            } else {
+                None
+            };
 
             // ============================================================
             // Build assoc cache and thread pools (once, upfront)
@@ -4156,7 +4161,12 @@ pub fn fvlmm_assoc_bed_to_tsv_f32<'py>(
                         let row =
                             &packed_src[snp_idx * bytes_per_snp..(snp_idx + 1) * bytes_per_snp];
                         let (missing, het, hom_alt) = if use_selected {
-                            count_packed_row_counts_selected(row, n_samples_full, &sample_idx)
+                            count_packed_row_counts_selected_with_excluded(
+                                row,
+                                n_samples_full,
+                                &sample_idx,
+                                selected_excluded_sample_indices.as_deref(),
+                            )
                         } else {
                             count_packed_row_counts(row, n_samples_full)
                         };

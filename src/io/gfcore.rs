@@ -2929,7 +2929,10 @@ impl TxtSnpIter {
 
 #[cfg(test)]
 mod tests {
-    use super::{read_bim, TxtSnpIter, BIN01_MAGIC, BIN_SITE_MAGIC, BSITE_MAGIC, BSITE_VERSION};
+    use super::{
+        process_snp_row_with_stats, process_snp_row_with_stats_preserve_alt, read_bim, TxtSnpIter,
+        BIN01_MAGIC, BIN_SITE_MAGIC, BSITE_MAGIC, BSITE_VERSION,
+    };
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -2941,6 +2944,49 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("janusx_{prefix}_{stamp}"));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn process_snp_row_preserve_alt_keeps_original_allele_order() {
+        let mut row_preserve = vec![2.0_f32, 2.0, 1.0, 0.0, -9.0];
+        let mut ref_preserve = "C".to_string();
+        let mut alt_preserve = "G".to_string();
+        let stats_preserve = process_snp_row_with_stats_preserve_alt(
+            &mut row_preserve,
+            &mut ref_preserve,
+            &mut alt_preserve,
+            0.02,
+            0.5,
+            true,
+            false,
+            0.0,
+        )
+        .expect("preserve-alt row should pass filters");
+        assert_eq!(stats_preserve.missing_count, 1);
+        assert_eq!(ref_preserve, "C");
+        assert_eq!(alt_preserve, "G");
+        assert_eq!(&row_preserve[..4], &[2.0, 2.0, 1.0, 0.0]);
+        assert!((row_preserve[4] - 1.25).abs() < 1e-6);
+
+        let mut row_legacy = vec![2.0_f32, 2.0, 1.0, 0.0, -9.0];
+        let mut ref_legacy = "C".to_string();
+        let mut alt_legacy = "G".to_string();
+        let stats_legacy = process_snp_row_with_stats(
+            &mut row_legacy,
+            &mut ref_legacy,
+            &mut alt_legacy,
+            0.02,
+            0.5,
+            true,
+            false,
+            0.0,
+        )
+        .expect("legacy row should pass filters");
+        assert_eq!(stats_legacy.missing_count, 1);
+        assert_eq!(ref_legacy, "G");
+        assert_eq!(alt_legacy, "C");
+        assert_eq!(&row_legacy[..4], &[0.0, 0.0, 1.0, 2.0]);
+        assert!((row_legacy[4] - 0.75).abs() < 1e-6);
     }
 
     #[test]

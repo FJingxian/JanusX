@@ -6032,8 +6032,9 @@ def _run_gwas_pipeline(
                         prepared_splmm_sparse_jxgrm_path = spk_path
                         spk_is_path = True
                     else:
-                        parser.error(
-                            f"--grm-sparse path does not exist: {spk_val}"
+                        raise ValueError(
+                            f"--grm-sparse path does not exist: {spk_val} "
+                            f"(normalized candidate: {spk_path})"
                         )
 
                 # Always use the post-GRM hook so the loading message appears

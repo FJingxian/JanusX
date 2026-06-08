@@ -1532,12 +1532,7 @@ pub(crate) fn count_packed_row_pure_line_counts_selected(
     n_samples: usize,
     sample_indices: &[usize],
 ) -> (usize, usize) {
-    count_packed_row_pure_line_counts_selected_with_excluded(
-        row,
-        n_samples,
-        sample_indices,
-        None,
-    )
+    count_packed_row_pure_line_counts_selected_with_excluded(row, n_samples, sample_indices, None)
 }
 
 #[inline]
@@ -4480,10 +4475,7 @@ pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples(
         .collect();
     let row_stats_secs = row_stats_t0.elapsed().as_secs_f64();
     let site_keep_t0 = Instant::now();
-    let site_keep: Vec<bool> = keep_flip_stats
-        .iter()
-        .map(|(keep, _, _)| *keep)
-        .collect();
+    let site_keep: Vec<bool> = keep_flip_stats.iter().map(|(keep, _, _)| *keep).collect();
     if site_keep.len() != n_snps {
         return Err(format!(
             "internal error: site_keep rows {} != n_snps {n_snps}",
@@ -4708,10 +4700,7 @@ pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples_pure_line(
             (keep, missing_rate, alt_freq)
         })
         .collect();
-    let site_keep: Vec<bool> = keep_flip_stats
-        .iter()
-        .map(|(keep, _, _)| *keep)
-        .collect();
+    let site_keep: Vec<bool> = keep_flip_stats.iter().map(|(keep, _, _)| *keep).collect();
     if site_keep.len() != n_snps {
         return Err(format!(
             "internal error: site_keep rows {} != n_snps {n_snps}",
@@ -6923,8 +6912,8 @@ mod tests {
     use super::{
         count_packed_row_counts, count_packed_row_counts_selected,
         count_packed_row_counts_selected_with_excluded, count_packed_row_pure_line_counts,
-        count_packed_row_pure_line_counts_selected_with_excluded, evaluate_packed_row_keep_and_flip,
-        precompute_excluded_sample_indices,
+        count_packed_row_pure_line_counts_selected_with_excluded,
+        evaluate_packed_row_keep_and_flip, precompute_excluded_sample_indices,
     };
 
     fn pack_plink_codes(codes: &[u8]) -> Vec<u8> {

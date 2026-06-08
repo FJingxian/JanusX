@@ -168,9 +168,7 @@ fn process_snp_row_with_precomputed_counts_impl(
         if fill_missing {
             row.fill(0.0);
         }
-        return Some(ProcessedSnpRowStats {
-            missing_count,
-        });
+        return Some(ProcessedSnpRowStats { missing_count });
     }
 
     if apply_het_filter {
@@ -330,7 +328,6 @@ pub fn process_snp_row(
     )
     .is_some()
 }
-
 
 fn parse_delimiter_char(delimiter: Option<&str>) -> Result<Option<char>, String> {
     match delimiter {

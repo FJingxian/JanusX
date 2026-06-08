@@ -528,9 +528,49 @@ pub(crate) fn decode_row_centered_full_lut_f64(
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct SubsetDecodePlan {
-    byte_idx: Vec<usize>,
-    shift_bits: Vec<u8>,
+pub(crate) enum SubsetDecodePlan {
+    Gather {
+        byte_idx: Vec<usize>,
+        shift_bits: Vec<u8>,
+    },
+    NearFull {
+        n_samples_full: usize,
+        kept_ranges: Vec<(usize, usize)>,
+    },
+}
+
+#[inline]
+fn maybe_build_near_full_kept_ranges(
+    sample_idx: &[usize],
+    n_samples: usize,
+) -> Option<Vec<(usize, usize)>> {
+    if sample_idx.is_empty() || sample_idx.len() >= n_samples {
+        return None;
+    }
+    let excluded_n = n_samples.saturating_sub(sample_idx.len());
+    if excluded_n == 0 || excluded_n.saturating_mul(4) > sample_idx.len() {
+        return None;
+    }
+    let mut kept_ranges = Vec::<(usize, usize)>::with_capacity(excluded_n.saturating_add(1));
+    let mut start = sample_idx[0];
+    if start >= n_samples {
+        return None;
+    }
+    let mut prev = start;
+    for &sid in sample_idx.iter().skip(1) {
+        if sid >= n_samples || sid <= prev {
+            return None;
+        }
+        if sid == prev + 1 {
+            prev = sid;
+            continue;
+        }
+        kept_ranges.push((start, prev + 1));
+        start = sid;
+        prev = sid;
+    }
+    kept_ranges.push((start, prev + 1));
+    Some(kept_ranges)
 }
 
 impl SubsetDecodePlan {
@@ -542,9 +582,68 @@ impl SubsetDecodePlan {
             byte_idx.push(sid >> 2);
             shift_bits.push(((sid & 3) * 2) as u8);
         }
-        Self {
+        Self::Gather {
             byte_idx,
             shift_bits,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn from_sample_idx_with_n_samples(sample_idx: &[usize], n_samples: usize) -> Self {
+        if let Some(kept_ranges) = maybe_build_near_full_kept_ranges(sample_idx, n_samples) {
+            return Self::NearFull {
+                n_samples_full: n_samples,
+                kept_ranges,
+            };
+        }
+        Self::from_sample_idx(sample_idx)
+    }
+}
+
+#[inline]
+fn compact_full_decode_by_kept_ranges(
+    full_row: &[f32],
+    kept_ranges: &[(usize, usize)],
+    out_row: &mut [f32],
+) {
+    let mut dst = 0usize;
+    for &(start, end) in kept_ranges {
+        let len = end.saturating_sub(start);
+        out_row[dst..dst + len].copy_from_slice(&full_row[start..end]);
+        dst += len;
+    }
+    debug_assert_eq!(dst, out_row.len());
+}
+
+#[inline]
+fn subset_plan_full_scratch_len(plan: Option<&SubsetDecodePlan>) -> usize {
+    match plan {
+        Some(SubsetDecodePlan::NearFull { n_samples_full, .. }) => *n_samples_full,
+        _ => 0usize,
+    }
+}
+
+#[inline]
+fn decode_subset_plan_row_f32(
+    row: &[u8],
+    plan: &SubsetDecodePlan,
+    code4_lut: &[[u8; 4]; 256],
+    value_lut: &[f32; 4],
+    full_row_scratch: &mut [f32],
+    out_row: &mut [f32],
+) {
+    match plan {
+        SubsetDecodePlan::Gather { .. } => {
+            decode_subset_with_plan(row, plan, value_lut, out_row);
+        }
+        SubsetDecodePlan::NearFull {
+            n_samples_full,
+            kept_ranges,
+        } => {
+            debug_assert!(full_row_scratch.len() >= *n_samples_full);
+            let full_row = &mut full_row_scratch[..*n_samples_full];
+            decode_row_centered_full_lut(row, *n_samples_full, code4_lut, value_lut, full_row);
+            compact_full_decode_by_kept_ranges(full_row, kept_ranges, out_row);
         }
     }
 }
@@ -578,7 +677,14 @@ unsafe fn decode_subset_with_plan_avx2(
     out_row: &mut [f32],
 ) {
     use x86_simd::*;
-    let n = plan.byte_idx.len();
+    let SubsetDecodePlan::Gather {
+        byte_idx,
+        shift_bits,
+    } = plan
+    else {
+        unreachable!("AVX2 subset gather decode requires Gather plan");
+    };
+    let n = byte_idx.len();
     let idx0 = _mm256_set1_epi32(0);
     let idx1 = _mm256_set1_epi32(1);
     let idx2 = _mm256_set1_epi32(2);
@@ -588,14 +694,14 @@ unsafe fn decode_subset_with_plan_avx2(
     let v3 = _mm256_set1_ps(value_lut[3]);
     let mut j = 0usize;
     while j + 8 <= n {
-        let c0 = ((row[plan.byte_idx[j]] >> plan.shift_bits[j]) & 0b11) as i32;
-        let c1 = ((row[plan.byte_idx[j + 1]] >> plan.shift_bits[j + 1]) & 0b11) as i32;
-        let c2 = ((row[plan.byte_idx[j + 2]] >> plan.shift_bits[j + 2]) & 0b11) as i32;
-        let c3 = ((row[plan.byte_idx[j + 3]] >> plan.shift_bits[j + 3]) & 0b11) as i32;
-        let c4 = ((row[plan.byte_idx[j + 4]] >> plan.shift_bits[j + 4]) & 0b11) as i32;
-        let c5 = ((row[plan.byte_idx[j + 5]] >> plan.shift_bits[j + 5]) & 0b11) as i32;
-        let c6 = ((row[plan.byte_idx[j + 6]] >> plan.shift_bits[j + 6]) & 0b11) as i32;
-        let c7 = ((row[plan.byte_idx[j + 7]] >> plan.shift_bits[j + 7]) & 0b11) as i32;
+        let c0 = ((row[byte_idx[j]] >> shift_bits[j]) & 0b11) as i32;
+        let c1 = ((row[byte_idx[j + 1]] >> shift_bits[j + 1]) & 0b11) as i32;
+        let c2 = ((row[byte_idx[j + 2]] >> shift_bits[j + 2]) & 0b11) as i32;
+        let c3 = ((row[byte_idx[j + 3]] >> shift_bits[j + 3]) & 0b11) as i32;
+        let c4 = ((row[byte_idx[j + 4]] >> shift_bits[j + 4]) & 0b11) as i32;
+        let c5 = ((row[byte_idx[j + 5]] >> shift_bits[j + 5]) & 0b11) as i32;
+        let c6 = ((row[byte_idx[j + 6]] >> shift_bits[j + 6]) & 0b11) as i32;
+        let c7 = ((row[byte_idx[j + 7]] >> shift_bits[j + 7]) & 0b11) as i32;
         let idx = _mm256_setr_epi32(c0, c1, c2, c3, c4, c5, c6, c7);
         let mut outv = v3;
         let m2 = _mm256_castsi256_ps(_mm256_cmpeq_epi32(idx, idx2));
@@ -608,7 +714,7 @@ unsafe fn decode_subset_with_plan_avx2(
         j += 8;
     }
     for t in j..n {
-        let code = (row[plan.byte_idx[t]] >> plan.shift_bits[t]) & 0b11;
+        let code = (row[byte_idx[t]] >> shift_bits[t]) & 0b11;
         out_row[t] = value_lut[code as usize];
     }
 }
@@ -629,7 +735,14 @@ unsafe fn decode_subset_with_plan_neon(
     out_row: &mut [f32],
 ) {
     use std::arch::aarch64::*;
-    let n = plan.byte_idx.len();
+    let SubsetDecodePlan::Gather {
+        byte_idx,
+        shift_bits,
+    } = plan
+    else {
+        unreachable!("NEON subset gather decode requires Gather plan");
+    };
+    let n = byte_idx.len();
     let idx0 = vdupq_n_u32(0);
     let idx1 = vdupq_n_u32(1);
     let idx2 = vdupq_n_u32(2);
@@ -640,10 +753,10 @@ unsafe fn decode_subset_with_plan_neon(
     let mut j = 0usize;
     while j + 4 <= n {
         let codes = [
-            ((row[plan.byte_idx[j]] >> plan.shift_bits[j]) & 0b11) as u32,
-            ((row[plan.byte_idx[j + 1]] >> plan.shift_bits[j + 1]) & 0b11) as u32,
-            ((row[plan.byte_idx[j + 2]] >> plan.shift_bits[j + 2]) & 0b11) as u32,
-            ((row[plan.byte_idx[j + 3]] >> plan.shift_bits[j + 3]) & 0b11) as u32,
+            ((row[byte_idx[j]] >> shift_bits[j]) & 0b11) as u32,
+            ((row[byte_idx[j + 1]] >> shift_bits[j + 1]) & 0b11) as u32,
+            ((row[byte_idx[j + 2]] >> shift_bits[j + 2]) & 0b11) as u32,
+            ((row[byte_idx[j + 3]] >> shift_bits[j + 3]) & 0b11) as u32,
         ];
         let idx = vld1q_u32(codes.as_ptr());
         let mut outv = v3;
@@ -657,7 +770,7 @@ unsafe fn decode_subset_with_plan_neon(
         j += 4;
     }
     for t in j..n {
-        let code = (row[plan.byte_idx[t]] >> plan.shift_bits[t]) & 0b11;
+        let code = (row[byte_idx[t]] >> shift_bits[t]) & 0b11;
         out_row[t] = value_lut[code as usize];
     }
 }
@@ -669,7 +782,14 @@ pub(crate) fn decode_subset_with_plan(
     value_lut: &[f32; 4],
     out_row: &mut [f32],
 ) {
-    let n = plan.byte_idx.len();
+    let SubsetDecodePlan::Gather {
+        byte_idx,
+        shift_bits,
+    } = plan
+    else {
+        unreachable!("subset gather decode requires Gather plan");
+    };
+    let n = byte_idx.len();
     if n >= BED_SUBSET_SIMD_MIN_LEN && bed_subset_decode_simd_enabled() {
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         if bed_subset_decode_avx2_runtime_available() {
@@ -683,7 +803,7 @@ pub(crate) fn decode_subset_with_plan(
         }
     }
     for t in 0..n {
-        let code = (row[plan.byte_idx[t]] >> plan.shift_bits[t]) & 0b11;
+        let code = (row[byte_idx[t]] >> shift_bits[t]) & 0b11;
         out_row[t] = value_lut[code as usize];
     }
 }
@@ -720,10 +840,13 @@ pub(crate) fn decode_mean_imputed_additive_packed_block_rows_f32(
     let subset_plan = if full_sample_fast {
         None
     } else {
-        Some(SubsetDecodePlan::from_sample_idx(sample_idx))
+        Some(SubsetDecodePlan::from_sample_idx_with_n_samples(
+            sample_idx, n_samples,
+        ))
     };
+    let full_scratch_len = subset_plan_full_scratch_len(subset_plan.as_ref());
 
-    let decode_one = |local_row: usize, out_row: &mut [f32]| {
+    let decode_one = |local_row: usize, out_row: &mut [f32], full_row_scratch: &mut [f32]| {
         let row_idx_local = row_start + local_row;
         let row_idx_packed = packed_row_indices
             .map(|idx| idx[row_idx_local])
@@ -741,19 +864,23 @@ pub(crate) fn decode_mean_imputed_additive_packed_block_rows_f32(
             return;
         }
         if let Some(plan) = subset_plan.as_ref() {
-            decode_subset_with_plan(row, plan, &value_lut, out_row);
+            decode_subset_plan_row_f32(row, plan, code4_lut, &value_lut, full_row_scratch, out_row);
         }
     };
 
     if let Some(tp) = pool {
         tp.install(|| {
-            out.par_chunks_mut(n_out)
-                .enumerate()
-                .for_each(|(local_row, out_row)| decode_one(local_row, out_row));
+            out.par_chunks_mut(n_out).enumerate().for_each_init(
+                || vec![0.0_f32; full_scratch_len],
+                |full_row_scratch, (local_row, out_row)| {
+                    decode_one(local_row, out_row, full_row_scratch.as_mut_slice())
+                },
+            );
         });
     } else {
+        let mut full_row_scratch = vec![0.0_f32; full_scratch_len];
         for (local_row, out_row) in out.chunks_mut(n_out).enumerate() {
-            decode_one(local_row, out_row);
+            decode_one(local_row, out_row, full_row_scratch.as_mut_slice());
         }
     }
     Ok(())
@@ -790,12 +917,15 @@ pub(crate) fn decode_standardized_packed_block_rows_f32_with_plan(
     let local_subset_plan = if full_sample_fast {
         None
     } else {
-        subset_plan
-            .cloned()
-            .or_else(|| Some(SubsetDecodePlan::from_sample_idx(sample_idx)))
+        subset_plan.cloned().or_else(|| {
+            Some(SubsetDecodePlan::from_sample_idx_with_n_samples(
+                sample_idx, n_samples,
+            ))
+        })
     };
+    let full_scratch_len = subset_plan_full_scratch_len(local_subset_plan.as_ref());
 
-    let decode_one = |local_row: usize, out_row: &mut [f32]| {
+    let decode_one = |local_row: usize, out_row: &mut [f32], full_row_scratch: &mut [f32]| {
         let row_idx_local = row_start + local_row;
         let row_idx_packed = packed_row_indices
             .map(|idx| idx[row_idx_local])
@@ -824,19 +954,23 @@ pub(crate) fn decode_standardized_packed_block_rows_f32_with_plan(
             return;
         }
         if let Some(plan) = local_subset_plan.as_ref() {
-            decode_subset_with_plan(row, plan, &value_lut, out_row);
+            decode_subset_plan_row_f32(row, plan, code4_lut, &value_lut, full_row_scratch, out_row);
         }
     };
 
     if let Some(tp) = pool {
         tp.install(|| {
-            out.par_chunks_mut(n_out)
-                .enumerate()
-                .for_each(|(local_row, out_row)| decode_one(local_row, out_row));
+            out.par_chunks_mut(n_out).enumerate().for_each_init(
+                || vec![0.0_f32; full_scratch_len],
+                |full_row_scratch, (local_row, out_row)| {
+                    decode_one(local_row, out_row, full_row_scratch.as_mut_slice())
+                },
+            );
         });
     } else {
+        let mut full_row_scratch = vec![0.0_f32; full_scratch_len];
         for (local_row, out_row) in out.chunks_mut(n_out).enumerate() {
-            decode_one(local_row, out_row);
+            decode_one(local_row, out_row, full_row_scratch.as_mut_slice());
         }
     }
     Ok(())
@@ -1105,4 +1239,110 @@ pub(crate) fn decode_subset_row_from_full_scratch_f64(
 
     let row_sum = mean_g * (n as f64);
     (var_centered, row_sum)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pack_codes(codes: &[u8]) -> Vec<u8> {
+        let mut out = vec![0u8; codes.len().div_ceil(4)];
+        for (i, &code) in codes.iter().enumerate() {
+            out[i >> 2] |= (code & 0b11) << ((i & 3) * 2);
+        }
+        out
+    }
+
+    #[test]
+    fn near_full_additive_decode_matches_gather_decode() {
+        let codes = [0u8, 2, 3, 1, 0, 3, 2, 0];
+        let packed = pack_codes(&codes);
+        let sample_idx = vec![0usize, 1, 2, 3, 5, 6, 7];
+        let code4_lut = &packed_byte_lut().code4;
+        let row_flip = [false];
+        let row_maf = [0.25_f32];
+        let mut out_near_full = vec![0.0_f32; sample_idx.len()];
+        decode_mean_imputed_additive_packed_block_rows_f32(
+            packed.as_slice(),
+            packed.len(),
+            codes.len(),
+            &row_flip,
+            &row_maf,
+            sample_idx.as_slice(),
+            false,
+            None,
+            0,
+            out_near_full.as_mut_slice(),
+            code4_lut,
+            None,
+        )
+        .expect("near-full additive decode should succeed");
+
+        let mean_g = 2.0_f32 * row_maf[0];
+        let value_lut = [0.0_f32, mean_g, 1.0_f32, 2.0_f32];
+        let gather_plan = SubsetDecodePlan::from_sample_idx(sample_idx.as_slice());
+        let mut out_gather = vec![0.0_f32; sample_idx.len()];
+        decode_subset_with_plan(
+            packed.as_slice(),
+            &gather_plan,
+            &value_lut,
+            out_gather.as_mut_slice(),
+        );
+
+        assert_eq!(out_near_full, out_gather);
+    }
+
+    #[test]
+    fn near_full_standardized_decode_matches_gather_decode() {
+        let codes = [3u8, 2, 0, 1, 3, 2, 0, 2];
+        let packed = pack_codes(&codes);
+        let sample_idx = vec![0usize, 1, 2, 4, 5, 6, 7];
+        let code4_lut = &packed_byte_lut().code4;
+        let row_flip = [true];
+        let row_mean = [0.6_f32];
+        let row_inv_sd = [1.25_f32];
+        let near_full_plan =
+            SubsetDecodePlan::from_sample_idx_with_n_samples(sample_idx.as_slice(), codes.len());
+        let gather_plan = SubsetDecodePlan::from_sample_idx(sample_idx.as_slice());
+        let mut out_near_full = vec![0.0_f32; sample_idx.len()];
+        let mut out_gather = vec![0.0_f32; sample_idx.len()];
+        decode_standardized_packed_block_rows_f32_with_plan(
+            packed.as_slice(),
+            packed.len(),
+            codes.len(),
+            &row_flip,
+            &row_mean,
+            &row_inv_sd,
+            sample_idx.as_slice(),
+            false,
+            Some(&near_full_plan),
+            None,
+            0,
+            out_near_full.as_mut_slice(),
+            code4_lut,
+            None,
+        )
+        .expect("near-full standardized decode should succeed");
+        decode_standardized_packed_block_rows_f32_with_plan(
+            packed.as_slice(),
+            packed.len(),
+            codes.len(),
+            &row_flip,
+            &row_mean,
+            &row_inv_sd,
+            sample_idx.as_slice(),
+            false,
+            Some(&gather_plan),
+            None,
+            0,
+            out_gather.as_mut_slice(),
+            code4_lut,
+            None,
+        )
+        .expect("gather standardized decode should succeed");
+
+        for (lhs, rhs) in out_near_full.iter().zip(out_gather.iter()) {
+            assert!((lhs - rhs).abs() <= 1e-6_f32);
+        }
+    }
 }

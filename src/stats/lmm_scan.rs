@@ -31,8 +31,8 @@ use crate::blas::{
 use crate::brent::{brent_minimize, brent_minimize_with_init};
 use crate::gfcore;
 use crate::gfreader::{
-    count_packed_row_counts, count_packed_row_counts_selected_with_excluded,
-    is_simple_snp_allele, precompute_excluded_sample_indices, sample_indices_are_identity,
+    count_packed_row_counts, count_packed_row_counts_selected_with_excluded, is_simple_snp_allele,
+    precompute_excluded_sample_indices, sample_indices_are_identity,
 };
 use crate::linalg::{
     chi2_sf_df1, chisq_from_beta_se_and_optional_plrt, cholesky_inplace, cholesky_logdet,
@@ -4107,7 +4107,10 @@ pub fn fvlmm_assoc_bed_to_tsv_f32<'py>(
             let sample_subset_plan: Option<SubsetDecodePlan> = if sample_identity {
                 None
             } else {
-                Some(SubsetDecodePlan::from_sample_idx(&sample_idx))
+                Some(SubsetDecodePlan::from_sample_idx_with_n_samples(
+                    &sample_idx,
+                    n_samples_full,
+                ))
             };
             let dense_subset_pos: Option<Vec<isize>> = if sample_identity {
                 None
@@ -4906,7 +4909,10 @@ pub fn lmm_reml_assoc_packed_f32<'py>(
     let sample_subset_plan: Option<SubsetDecodePlan> = if sample_identity {
         None
     } else {
-        Some(SubsetDecodePlan::from_sample_idx(&sample_idx))
+        Some(SubsetDecodePlan::from_sample_idx_with_n_samples(
+            &sample_idx,
+            n_samples,
+        ))
     };
     let dense_subset_pos: Option<Vec<isize>> = if sample_identity {
         None
@@ -5304,7 +5310,10 @@ pub fn lmm_reml_assoc_packed_f32_to_tsv<'py>(
     let sample_subset_plan: Option<SubsetDecodePlan> = if sample_identity {
         None
     } else {
-        Some(SubsetDecodePlan::from_sample_idx(&sample_idx))
+        Some(SubsetDecodePlan::from_sample_idx_with_n_samples(
+            &sample_idx,
+            n_samples,
+        ))
     };
     let dense_subset_pos: Option<Vec<isize>> = if sample_identity {
         None
@@ -6103,7 +6112,10 @@ pub fn fastlmm_assoc_packed_f32<'py>(
     let sample_subset_plan: Option<SubsetDecodePlan> = if sample_identity {
         None
     } else {
-        Some(SubsetDecodePlan::from_sample_idx(&sample_idx))
+        Some(SubsetDecodePlan::from_sample_idx_with_n_samples(
+            &sample_idx,
+            n_samples,
+        ))
     };
     let dense_subset_pos: Option<Vec<isize>> = if sample_identity {
         None
@@ -6678,7 +6690,10 @@ pub fn fastlmm_assoc_packed_f32_to_tsv<'py>(
     let sample_subset_plan: Option<SubsetDecodePlan> = if sample_identity {
         None
     } else {
-        Some(SubsetDecodePlan::from_sample_idx(&sample_idx))
+        Some(SubsetDecodePlan::from_sample_idx_with_n_samples(
+            &sample_idx,
+            n_samples,
+        ))
     };
     let dense_subset_pos: Option<Vec<isize>> = if sample_identity {
         None
@@ -7325,7 +7340,10 @@ pub fn fvlmm_assoc_packed_f32_to_tsv<'py>(
     let sample_subset_plan: Option<SubsetDecodePlan> = if sample_identity {
         None
     } else {
-        Some(SubsetDecodePlan::from_sample_idx(&sample_idx))
+        Some(SubsetDecodePlan::from_sample_idx_with_n_samples(
+            &sample_idx,
+            n_samples,
+        ))
     };
     let dense_subset_pos: Option<Vec<isize>> = if sample_identity {
         None

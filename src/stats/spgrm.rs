@@ -172,7 +172,10 @@ impl SpgrmStreamStripeScratch {
         let subset_plan = if full_sample_fast {
             None
         } else {
-            Some(SubsetDecodePlan::from_sample_idx(stripe_idx))
+            Some(SubsetDecodePlan::from_sample_idx_with_n_samples(
+                stripe_idx,
+                n_samples_full,
+            ))
         };
         Self {
             stripe,

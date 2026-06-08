@@ -299,7 +299,10 @@ impl<'a> PackedRsvdView<'a> {
         let subset_plan = if full_sample_fast {
             None
         } else {
-            Some(SubsetDecodePlan::from_sample_idx(self.sample_idx))
+            Some(SubsetDecodePlan::from_sample_idx_with_n_samples(
+                self.sample_idx,
+                self.n_samples,
+            ))
         };
         Ok((full_sample_fast, subset_plan))
     }

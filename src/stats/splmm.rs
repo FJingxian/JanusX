@@ -11,8 +11,8 @@ use std::fmt::Write as FmtWrite;
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::mpsc::sync_channel;
+use std::sync::Arc;
 use std::time::Instant;
 
 use crate::bedmath::adaptive_grm_block_rows;
@@ -26,7 +26,10 @@ use crate::cholesky::{
     SparseJxgrmCholesky, SparseJxgrmSolveWorkspace,
 };
 use crate::gfcore::read_fam;
-use crate::gfreader::prepare_bed_logic_meta_owned_for_stats_samples;
+use crate::gfreader::{
+    count_packed_row_counts, count_packed_row_counts_selected_with_excluded,
+    precompute_excluded_sample_indices, prepare_bed_logic_meta_owned_for_stats_samples,
+};
 use crate::gload::{GenotypeMatrix, UnifiedInput};
 use crate::he::row_major_block_mul_mat_f32;
 use crate::linalg::{
@@ -49,6 +52,7 @@ struct SplmmPackedScanTiming {
     decode_secs: f64,
     gpy_secs: f64,
     gx_secs: f64,
+    assoc_secs: f64,
     row_sumsq_secs: f64,
     repack_secs: f64,
     solve_secs: f64,
@@ -123,6 +127,7 @@ fn emit_splmm_packed_scan_timing(
     let accounted_secs = timing.decode_secs
         + timing.gpy_secs
         + timing.gx_secs
+        + timing.assoc_secs
         + timing.row_sumsq_secs
         + timing.repack_secs
         + timing.solve_secs
@@ -138,13 +143,15 @@ fn emit_splmm_packed_scan_timing(
         }
     };
     eprintln!(
-        "SparseLMM packed timing mode={mode}: decode={:.3}s ({:.1}%), gpy={:.3}s ({:.1}%), gx={:.3}s ({:.1}%), row_sumsq={:.3}s ({:.1}%), repack={:.3}s ({:.1}%), solve={:.3}s ({:.1}%), xtz={:.3}s ({:.1}%), denom={:.3}s ({:.1}%), sink={:.3}s ({:.1}%), other={:.3}s ({:.1}%), total={:.3}s, rows={}, n={}, p={}, threads={}",
+        "SparseLMM packed timing mode={mode}: decode={:.3}s ({:.1}%), gpy={:.3}s ({:.1}%), gx={:.3}s ({:.1}%), assoc={:.3}s ({:.1}%), row_sumsq={:.3}s ({:.1}%), repack={:.3}s ({:.1}%), solve={:.3}s ({:.1}%), xtz={:.3}s ({:.1}%), denom={:.3}s ({:.1}%), sink={:.3}s ({:.1}%), other={:.3}s ({:.1}%), total={:.3}s, rows={}, n={}, p={}, threads={}",
         timing.decode_secs,
         to_pct(timing.decode_secs),
         timing.gpy_secs,
         to_pct(timing.gpy_secs),
         timing.gx_secs,
         to_pct(timing.gx_secs),
+        timing.assoc_secs,
+        to_pct(timing.assoc_secs),
         timing.row_sumsq_secs,
         to_pct(timing.row_sumsq_secs),
         timing.repack_secs,
@@ -309,105 +316,107 @@ where
     let row_cap = row_capacity_hint.max(512).max(1);
     let rows_total = chrom.len();
 
-    let (scan_out, tsv_timing) = std::thread::scope(|scope| -> Result<(R, SplmmTsvTiming), String> {
-        let (tx, rx) = sync_channel::<SplmmTsvBlockPayload>(queue_depth_eff);
-        let handle = scope.spawn(move || -> Result<SplmmTsvTiming, String> {
-            let out_file = File::create(out_tsv).map_err(|e| format!("create {out_tsv}: {e}"))?;
-            let mut writer = BufWriter::with_capacity(WRITER_CAPACITY.max(1), out_file);
-            let mut timing = SplmmTsvTiming::default();
-            let t0 = stage_timing.then(Instant::now);
-            writer
-                .write_all(HEADER)
-                .map_err(|e| format!("write header {out_tsv}: {e}"))?;
-            writer
-                .flush()
-                .map_err(|e| format!("flush header {out_tsv}: {e}"))?;
-            if let Some(t0) = t0 {
-                timing.write_secs += t0.elapsed().as_secs_f64();
-            }
-            let flush_threshold = WRITER_CAPACITY.clamp(MIN_FLUSH_BYTES, MAX_FLUSH_BYTES);
-            let mut pending_bytes = 0usize;
-            let mut text_buf = String::with_capacity(row_cap * 112);
-            for payload in rx {
-                text_buf.clear();
-                let t0 = stage_timing.then(Instant::now);
-                append_splmm_tsv_block(
-                    &mut text_buf,
-                    payload.row_start,
-                    payload.rows_here,
-                    payload.results.as_slice(),
-                    chrom,
-                    pos,
-                    snp,
-                    allele0,
-                    allele1,
-                    row_maf,
-                    row_missing,
-                    gm,
-                );
-                if let Some(t0) = t0 {
-                    timing.format_secs += t0.elapsed().as_secs_f64();
-                }
-                let bytes_now = text_buf.len();
+    let (scan_out, tsv_timing) =
+        std::thread::scope(|scope| -> Result<(R, SplmmTsvTiming), String> {
+            let (tx, rx) = sync_channel::<SplmmTsvBlockPayload>(queue_depth_eff);
+            let handle = scope.spawn(move || -> Result<SplmmTsvTiming, String> {
+                let out_file =
+                    File::create(out_tsv).map_err(|e| format!("create {out_tsv}: {e}"))?;
+                let mut writer = BufWriter::with_capacity(WRITER_CAPACITY.max(1), out_file);
+                let mut timing = SplmmTsvTiming::default();
                 let t0 = stage_timing.then(Instant::now);
                 writer
-                    .write_all(text_buf.as_bytes())
-                    .map_err(|e| format!("write {out_tsv}: {e}"))?;
+                    .write_all(HEADER)
+                    .map_err(|e| format!("write header {out_tsv}: {e}"))?;
+                writer
+                    .flush()
+                    .map_err(|e| format!("flush header {out_tsv}: {e}"))?;
                 if let Some(t0) = t0 {
                     timing.write_secs += t0.elapsed().as_secs_f64();
                 }
-                pending_bytes = pending_bytes.saturating_add(bytes_now);
-                if pending_bytes >= flush_threshold {
+                let flush_threshold = WRITER_CAPACITY.clamp(MIN_FLUSH_BYTES, MAX_FLUSH_BYTES);
+                let mut pending_bytes = 0usize;
+                let mut text_buf = String::with_capacity(row_cap * 112);
+                for payload in rx {
+                    text_buf.clear();
+                    let t0 = stage_timing.then(Instant::now);
+                    append_splmm_tsv_block(
+                        &mut text_buf,
+                        payload.row_start,
+                        payload.rows_here,
+                        payload.results.as_slice(),
+                        chrom,
+                        pos,
+                        snp,
+                        allele0,
+                        allele1,
+                        row_maf,
+                        row_missing,
+                        gm,
+                    );
+                    if let Some(t0) = t0 {
+                        timing.format_secs += t0.elapsed().as_secs_f64();
+                    }
+                    let bytes_now = text_buf.len();
                     let t0 = stage_timing.then(Instant::now);
                     writer
-                        .flush()
-                        .map_err(|e| format!("flush {out_tsv}: {e}"))?;
+                        .write_all(text_buf.as_bytes())
+                        .map_err(|e| format!("write {out_tsv}: {e}"))?;
                     if let Some(t0) = t0 {
                         timing.write_secs += t0.elapsed().as_secs_f64();
                     }
-                    pending_bytes = 0usize;
+                    pending_bytes = pending_bytes.saturating_add(bytes_now);
+                    if pending_bytes >= flush_threshold {
+                        let t0 = stage_timing.then(Instant::now);
+                        writer
+                            .flush()
+                            .map_err(|e| format!("flush {out_tsv}: {e}"))?;
+                        if let Some(t0) = t0 {
+                            timing.write_secs += t0.elapsed().as_secs_f64();
+                        }
+                        pending_bytes = 0usize;
+                    }
+                    timing.blocks = timing.blocks.saturating_add(1);
+                    timing.bytes = timing.bytes.saturating_add(bytes_now);
                 }
-                timing.blocks = timing.blocks.saturating_add(1);
-                timing.bytes = timing.bytes.saturating_add(bytes_now);
-            }
-            let t0 = stage_timing.then(Instant::now);
-            writer
-                .flush()
-                .map_err(|e| format!("flush {out_tsv}: {e}"))?;
-            if let Some(t0) = t0 {
-                timing.write_secs += t0.elapsed().as_secs_f64();
-            }
-            Ok(timing)
-        });
+                let t0 = stage_timing.then(Instant::now);
+                writer
+                    .flush()
+                    .map_err(|e| format!("flush {out_tsv}: {e}"))?;
+                if let Some(t0) = t0 {
+                    timing.write_secs += t0.elapsed().as_secs_f64();
+                }
+                Ok(timing)
+            });
 
-        let mut send_secs = 0.0_f64;
-        let mut sink = |row_start: usize, rows_here: usize, block: &[f64]| {
-            let t0 = stage_timing.then(Instant::now);
-            tx.send(SplmmTsvBlockPayload {
-                row_start,
-                rows_here,
-                results: block.to_vec(),
-            })
-            .map_err(|e| format!("send {out_tsv}: {e}"))?;
-            if let Some(t0) = t0 {
-                send_secs += t0.elapsed().as_secs_f64();
-            }
-            Ok(())
-        };
+            let mut send_secs = 0.0_f64;
+            let mut sink = |row_start: usize, rows_here: usize, block: &[f64]| {
+                let t0 = stage_timing.then(Instant::now);
+                tx.send(SplmmTsvBlockPayload {
+                    row_start,
+                    rows_here,
+                    results: block.to_vec(),
+                })
+                .map_err(|e| format!("send {out_tsv}: {e}"))?;
+                if let Some(t0) = t0 {
+                    send_secs += t0.elapsed().as_secs_f64();
+                }
+                Ok(())
+            };
 
-        let run_res = run_scan(&mut sink);
-        drop(tx);
-        let t0 = stage_timing.then(Instant::now);
-        let mut timing = handle
-            .join()
-            .map_err(|_| format!("writer thread panicked for {out_tsv}"))??;
-        if let Some(t0) = t0 {
-            timing.finish_secs += t0.elapsed().as_secs_f64();
-        }
-        timing.send_secs = send_secs;
-        let out = run_res?;
-        Ok((out, timing))
-    })?;
+            let run_res = run_scan(&mut sink);
+            drop(tx);
+            let t0 = stage_timing.then(Instant::now);
+            let mut timing = handle
+                .join()
+                .map_err(|_| format!("writer thread panicked for {out_tsv}"))??;
+            if let Some(t0) = t0 {
+                timing.finish_secs += t0.elapsed().as_secs_f64();
+            }
+            timing.send_secs = send_secs;
+            let out = run_res?;
+            Ok((out, timing))
+        })?;
 
     if stage_timing {
         emit_splmm_tsv_timing(mode, &tsv_timing, rows_total);
@@ -1353,6 +1362,111 @@ fn row_major_block_sumsq_f64(
 }
 
 #[inline]
+fn additive_row_sumsq_from_counts(
+    missing: usize,
+    het: usize,
+    hom_alt: usize,
+    n_selected: usize,
+    row_flip: bool,
+    row_maf: f32,
+) -> f64 {
+    let non_missing = n_selected.saturating_sub(missing);
+    let hom_two = if row_flip {
+        non_missing.saturating_sub(het).saturating_sub(hom_alt)
+    } else {
+        hom_alt
+    };
+    let mean_g = (2.0_f64 * row_maf as f64).clamp(0.0_f64, 2.0_f64);
+    4.0_f64.mul_add(
+        hom_two as f64,
+        (het as f64) + (missing as f64) * mean_g * mean_g,
+    )
+}
+
+fn packed_block_additive_sumsq_from_counts<G: GenotypeMatrix>(
+    input: &UnifiedInput<G>,
+    row_start: usize,
+    rows_here: usize,
+    scan_sample_idx: &[usize],
+    sample_identity: bool,
+    selected_excluded_sample_idx: Option<&[usize]>,
+    out: &mut [f64],
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) -> bool {
+    if rows_here == 0 || out.len() != rows_here {
+        return rows_here == 0;
+    }
+    if !sample_identity && selected_excluded_sample_idx.is_none() {
+        return false;
+    }
+    let first_src_idx = input.stats.row_source_indices[row_start];
+    if input.matrix.source_row_bytes(first_src_idx).len() != input.stats.bytes_per_snp {
+        return false;
+    }
+    let n_selected = scan_sample_idx.len();
+    let n_samples_full = input.stats.n_samples_full;
+    let use_parallel = pool.map(|tp| tp.current_num_threads() > 1).unwrap_or(false)
+        && rows_here.saturating_mul(input.stats.bytes_per_snp) >= 16_384usize;
+    let mut run = || {
+        out.par_iter_mut().enumerate().for_each(|(local_idx, dst)| {
+            let row_idx = row_start + local_idx;
+            let src_idx = input.stats.row_source_indices[row_idx];
+            let row = input.matrix.source_row_bytes(src_idx);
+            let (missing, het, hom_alt) = if sample_identity {
+                count_packed_row_counts(row, n_selected)
+            } else {
+                count_packed_row_counts_selected_with_excluded(
+                    row,
+                    n_samples_full,
+                    scan_sample_idx,
+                    selected_excluded_sample_idx,
+                )
+            };
+            *dst = additive_row_sumsq_from_counts(
+                missing,
+                het,
+                hom_alt,
+                n_selected,
+                input.stats.row_flip[row_idx],
+                input.stats.maf[row_idx],
+            );
+        });
+    };
+    if use_parallel {
+        if let Some(tp) = pool {
+            tp.install(run);
+        } else {
+            run();
+        }
+    } else {
+        for (local_idx, dst) in out.iter_mut().enumerate() {
+            let row_idx = row_start + local_idx;
+            let src_idx = input.stats.row_source_indices[row_idx];
+            let row = input.matrix.source_row_bytes(src_idx);
+            let (missing, het, hom_alt) = if sample_identity {
+                count_packed_row_counts(row, n_selected)
+            } else {
+                count_packed_row_counts_selected_with_excluded(
+                    row,
+                    n_samples_full,
+                    scan_sample_idx,
+                    selected_excluded_sample_idx,
+                )
+            };
+            *dst = additive_row_sumsq_from_counts(
+                missing,
+                het,
+                hom_alt,
+                n_selected,
+                input.stats.row_flip[row_idx],
+                input.stats.maf[row_idx],
+            );
+        }
+    }
+    true
+}
+
+#[inline]
 fn row_major_to_col_major_f64(
     input: &[f64],
     n_rows: usize,
@@ -1942,6 +2056,11 @@ fn exact_scan_blocks_core<G: GenotypeMatrix>(
     }
 
     let sample_identity = scan_sample_idx.iter().enumerate().all(|(i, &sid)| sid == i);
+    let selected_excluded_sample_idx = if sample_identity {
+        None
+    } else {
+        precompute_excluded_sample_indices(input.stats.n_samples_full, scan_sample_idx)
+    };
     let pool = get_cached_pool(threads).map_err(|e| e.to_string())?;
     let m = input.n_markers();
     let progress_total = if progress_total_override == 0 {
@@ -2054,7 +2173,18 @@ fn exact_scan_blocks_core<G: GenotypeMatrix>(
             timing.gx_secs += t0.elapsed().as_secs_f64();
         }
         let t0 = stage_timing.then(Instant::now);
-        row_major_block_sumsq_f64(block_slice, rows_here, n, ss_slice, pool.as_ref());
+        if !packed_block_additive_sumsq_from_counts(
+            input,
+            row_start,
+            rows_here,
+            scan_sample_idx,
+            sample_identity,
+            selected_excluded_sample_idx.as_deref(),
+            ss_slice,
+            pool.as_ref(),
+        ) {
+            row_major_block_sumsq_f64(block_slice, rows_here, n, ss_slice, pool.as_ref());
+        }
         if let Some(t0) = t0 {
             timing.row_sumsq_secs += t0.elapsed().as_secs_f64();
         }
@@ -2325,6 +2455,11 @@ fn grammar_scan_blocks_core<G: GenotypeMatrix>(
                 .collect(),
         )
     };
+    let selected_excluded_sample_idx = if sample_identity {
+        None
+    } else {
+        precompute_excluded_sample_indices(input.stats.n_samples_full, scan_sample_idx)
+    };
 
     let pool = get_cached_pool(threads).map_err(|e| e.to_string())?;
     let m = input.n_markers();
@@ -2349,28 +2484,16 @@ fn grammar_scan_blocks_core<G: GenotypeMatrix>(
 
     if matches!(gm, PackedGeneticModel::Add) {
         let scan_block_rows = adaptive_grm_block_rows(progress_block, m, n, 0usize, threads).max(1);
-        let score_f32 = cast_f64_slice_to_f32(score_vec)?;
-        let x_design_f32 = cast_f64_slice_to_f32(x_design)?;
-        let blas_threads = if rust_sgemm_prefers_rayon_rowmajor_f32_kernel() {
-            1usize
-        } else {
-            threads.max(1)
-        };
-        let _blas_guard = BlasThreadGuard::enter(blas_threads);
         let mut block = vec![0.0_f32; scan_block_rows * n];
-        let mut spy_block = vec![0.0_f32; scan_block_rows];
-        let mut xts_block = vec![0.0_f32; scan_block_rows * p];
         let mut row_ss = vec![0.0_f64; scan_block_rows];
-        let mut xts = vec![0.0_f64; p];
-        let mut alpha = vec![0.0_f64; p];
         let mut out_block = vec![0.0_f64; scan_block_rows * 3];
+        let thread_hint = threads.max(1);
+        let row_tile = scan_block_rows.div_ceil(thread_hint).clamp(32, 1024);
         let mut row_start = 0usize;
         while row_start < m {
             let row_end = (row_start + scan_block_rows).min(m);
             let rows_here = row_end - row_start;
             let block_slice = &mut block[..rows_here * n];
-            let spy_slice = &mut spy_block[..rows_here];
-            let xts_slice = &mut xts_block[..rows_here * p];
             let ss_slice = &mut row_ss[..rows_here];
             // Decode via UnifiedInput
             let t0 = stage_timing.then(Instant::now);
@@ -2386,67 +2509,95 @@ fn grammar_scan_blocks_core<G: GenotypeMatrix>(
                 timing.decode_secs += t0.elapsed().as_secs_f64();
             }
             let t0 = stage_timing.then(Instant::now);
-            row_major_block_mul_mat_f32(
-                block_slice,
+            let packed_ss_ok = packed_block_additive_sumsq_from_counts(
+                input,
+                row_start,
                 rows_here,
-                n,
-                score_f32.as_slice(),
-                1usize,
-                spy_slice,
+                scan_sample_idx,
+                sample_identity,
+                selected_excluded_sample_idx.as_deref(),
+                ss_slice,
                 pool.as_ref(),
             );
-            if let Some(t0) = t0 {
-                timing.gpy_secs += t0.elapsed().as_secs_f64();
+            if !packed_ss_ok {
+                row_major_block_sumsq_f64(block_slice, rows_here, n, ss_slice, pool.as_ref());
             }
-            let t0 = stage_timing.then(Instant::now);
-            row_major_block_mul_mat_f32(
-                block_slice,
-                rows_here,
-                n,
-                x_design_f32.as_slice(),
-                p,
-                xts_slice,
-                pool.as_ref(),
-            );
-            if let Some(t0) = t0 {
-                timing.gx_secs += t0.elapsed().as_secs_f64();
-            }
-            let t0 = stage_timing.then(Instant::now);
-            row_major_block_sumsq_f64(block_slice, rows_here, n, ss_slice, pool.as_ref());
             if let Some(t0) = t0 {
                 timing.row_sumsq_secs += t0.elapsed().as_secs_f64();
             }
             let out_slice = &mut out_block[..rows_here * 3];
             let t0 = stage_timing.then(Instant::now);
-            for local_idx in 0..rows_here {
-                let xts_row = &xts_slice[local_idx * p..(local_idx + 1) * p];
-                for j in 0..p {
-                    xts[j] = xts_row[j] as f64;
-                }
-                let s_m_s = residualized_sumsq_from_xtx_chol(
-                    xtx_chol,
-                    p,
-                    &xts,
-                    &mut alpha,
-                    ss_slice[local_idx],
-                );
-                let out_row = &mut out_slice[local_idx * 3..(local_idx + 1) * 3];
-                let score = score_scale * (spy_slice[local_idx] as f64);
-                let denom_scaled = denom_scale * s_m_s;
-                if let Some((beta, se, pwald)) =
-                    splmm_wald_from_scaled_denom(score, denom_scaled, wald_sigma2)
-                {
-                    out_row[0] = beta;
-                    out_row[1] = se;
-                    out_row[2] = pwald;
-                } else {
-                    out_row[0] = f64::NAN;
-                    out_row[1] = f64::NAN;
-                    out_row[2] = 1.0_f64;
-                }
+            let mut run_assoc = || {
+                out_slice
+                    .par_chunks_mut(row_tile * 3)
+                    .enumerate()
+                    .for_each_init(
+                        || (vec![0.0_f64; p], vec![0.0_f64; p]),
+                        |(xts, alpha), (tile_idx, out_tile)| {
+                            let tile_row_start = tile_idx * row_tile;
+                            for (local_off, out_row) in out_tile.chunks_mut(3).enumerate() {
+                                let local_idx = tile_row_start + local_off;
+                                let row = &block_slice[local_idx * n..(local_idx + 1) * n];
+                                xts.fill(0.0_f64);
+                                let mut score = 0.0_f64;
+                                let mut row_ss_fallback = 0.0_f64;
+                                if p == 1 {
+                                    for i in 0..n {
+                                        let s_i = row[i] as f64;
+                                        score += s_i * score_vec[i];
+                                        if !packed_ss_ok {
+                                            row_ss_fallback += s_i * s_i;
+                                        }
+                                        xts[0] += x_design[i] * s_i;
+                                    }
+                                } else {
+                                    for i in 0..n {
+                                        let s_i = row[i] as f64;
+                                        score += s_i * score_vec[i];
+                                        if !packed_ss_ok {
+                                            row_ss_fallback += s_i * s_i;
+                                        }
+                                        let x_row = &x_design[i * p..(i + 1) * p];
+                                        for j in 0..p {
+                                            xts[j] += x_row[j] * s_i;
+                                        }
+                                    }
+                                }
+                                let s_m_s = residualized_sumsq_from_xtx_chol(
+                                    xtx_chol,
+                                    p,
+                                    xts,
+                                    alpha,
+                                    if packed_ss_ok {
+                                        ss_slice[local_idx]
+                                    } else {
+                                        row_ss_fallback
+                                    },
+                                );
+                                let score = score_scale * score;
+                                let denom_scaled = denom_scale * s_m_s;
+                                if let Some((beta, se, pwald)) =
+                                    splmm_wald_from_scaled_denom(score, denom_scaled, wald_sigma2)
+                                {
+                                    out_row[0] = beta;
+                                    out_row[1] = se;
+                                    out_row[2] = pwald;
+                                } else {
+                                    out_row[0] = f64::NAN;
+                                    out_row[1] = f64::NAN;
+                                    out_row[2] = 1.0_f64;
+                                }
+                            }
+                        },
+                    );
+            };
+            if let Some(tp) = &pool {
+                tp.install(run_assoc);
+            } else {
+                run_assoc();
             }
             if let Some(t0) = t0 {
-                timing.denom_secs += t0.elapsed().as_secs_f64();
+                timing.assoc_secs += t0.elapsed().as_secs_f64();
             }
             let t0 = stage_timing.then(Instant::now);
             sink(row_start, rows_here, out_slice)?;
@@ -3510,10 +3661,8 @@ fn prepare_splmm_scan_state(
         prepare_timing.rhat_mx_secs = rhat_mx_secs;
         prepare_timing.rhat_p0_secs = rhat_p0_secs;
         prepare_timing.n_rhat_used = n_used;
-        prepare_timing.rhat_reduce_secs = (rhat_reduce_t0.elapsed().as_secs_f64()
-            - rhat_mx_secs
-            - rhat_p0_secs)
-            .max(0.0_f64);
+        prepare_timing.rhat_reduce_secs =
+            (rhat_reduce_t0.elapsed().as_secs_f64() - rhat_mx_secs - rhat_p0_secs).max(0.0_f64);
         let gamma0_val = ratio_sum / (n_used as f64);
         let r_hat_val = gamma0_val / sigma2;
         drop(v_inv_col);

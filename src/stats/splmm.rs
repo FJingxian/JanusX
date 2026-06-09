@@ -1985,9 +1985,28 @@ fn row_major_snp_block_f32_to_col_major_f64(
     rows: usize,
     cols: usize,
     out: &mut [f64],
+    pool: Option<&Arc<rayon::ThreadPool>>,
 ) {
     debug_assert_eq!(block.len(), rows * cols);
     debug_assert_eq!(out.len(), rows * cols);
+    let use_parallel = pool.map(|tp| tp.current_num_threads() > 1).unwrap_or(false)
+        && rows.saturating_mul(cols) >= 16_384usize;
+    if use_parallel {
+        let mut run = || {
+            out.par_chunks_mut(cols).enumerate().for_each(|(snp, dst)| {
+                let src = &block[snp * cols..(snp + 1) * cols];
+                for sample in 0..cols {
+                    dst[sample] = src[sample] as f64;
+                }
+            });
+        };
+        if let Some(tp) = pool {
+            tp.install(run);
+        } else {
+            run();
+        }
+        return;
+    }
     // `block` is laid out as rows SNPs × cols samples, row-major:
     //   block[snp * cols + sample]
     // The sparse solver expects a column-major RHS matrix with cols samples as
@@ -2005,18 +2024,79 @@ fn row_major_snp_block_f32_to_col_major_f64(
 }
 
 #[inline]
+fn pairwise_block_dot_f32_f64(
+    lhs_block: &[f32],
+    rhs_block: &[f64],
+    rows: usize,
+    cols: usize,
+    out: &mut [f64],
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) {
+    debug_assert_eq!(lhs_block.len(), rows.saturating_mul(cols));
+    debug_assert_eq!(rhs_block.len(), rows.saturating_mul(cols));
+    debug_assert_eq!(out.len(), rows);
+
+    #[inline]
+    fn dot_row(lhs: &[f32], rhs: &[f64]) -> f64 {
+        let mut i = 0usize;
+        let mut acc0 = 0.0_f64;
+        let mut acc1 = 0.0_f64;
+        let mut acc2 = 0.0_f64;
+        let mut acc3 = 0.0_f64;
+        while i + 4 <= lhs.len() {
+            acc0 += (lhs[i] as f64) * rhs[i];
+            acc1 += (lhs[i + 1] as f64) * rhs[i + 1];
+            acc2 += (lhs[i + 2] as f64) * rhs[i + 2];
+            acc3 += (lhs[i + 3] as f64) * rhs[i + 3];
+            i += 4;
+        }
+        let mut dot = (acc0 + acc1) + (acc2 + acc3);
+        while i < lhs.len() {
+            dot += (lhs[i] as f64) * rhs[i];
+            i += 1;
+        }
+        dot
+    }
+
+    let use_parallel = pool.map(|tp| tp.current_num_threads() > 1).unwrap_or(false)
+        && rows.saturating_mul(cols) >= 16_384usize;
+    if use_parallel {
+        let mut run = || {
+            out.par_iter_mut().enumerate().for_each(|(row_idx, dst)| {
+                let lhs = &lhs_block[row_idx * cols..(row_idx + 1) * cols];
+                let rhs = &rhs_block[row_idx * cols..(row_idx + 1) * cols];
+                *dst = dot_row(lhs, rhs);
+            });
+        };
+        if let Some(tp) = pool {
+            tp.install(run);
+        } else {
+            run();
+        }
+        return;
+    }
+    for row_idx in 0..rows {
+        let lhs = &lhs_block[row_idx * cols..(row_idx + 1) * cols];
+        let rhs = &rhs_block[row_idx * cols..(row_idx + 1) * cols];
+        out[row_idx] = dot_row(lhs, rhs);
+    }
+}
+
+#[inline]
 fn adaptive_exact_block_rows(requested: usize, n: usize) -> usize {
     // Exact block-scan peak memory model, per row (one SNP) of the block:
     //   block          f32 [n]     = 4n
     //   spy_block      f32 [1]     = 4
-    //   rhs_col_major  f64 [n]     = 8n
     //   z_col_major    f64 [n]     = 8n
-    //   c_block        f64 [p]     ≈8p   (p is small, typically 1-4)
+    //   xts_block      f32 [p]     ≈4p
+    //   c_block        f64 [p]     ≈8p
+    //   row_ss         f64 [1]     = 8
+    //   sv_block       f64 [1]     = 8
     //   out_block      f64 [3]     = 24
     //   --------------------------------------------------
-    //   total per row              = 20n + 8p + 28  bytes
+    //   total per row              ≈12n + 12p + 52 bytes
     //
-    // We approximate p=4 for safety and add 25% margin for the sparse-solve
+    // We approximate p=4 for safety and add slack for the sparse-solve
     // workspace and allocation overhead.
     // Default cap: 128 MiB, overridable via JX_SPLMM_EXACT_MAX_BLOCK_BYTES.
     const DEFAULT_MAX_BYTES: usize = 128 * 1024 * 1024; // 128 MiB
@@ -2025,8 +2105,9 @@ fn adaptive_exact_block_rows(requested: usize, n: usize) -> usize {
         .and_then(|s| s.trim().parse::<usize>().ok())
         .filter(|&v| v > 0)
         .unwrap_or(DEFAULT_MAX_BYTES);
-    // nominal: 20n+60 bytes per row, then ×1.25 margin → 25n+75
-    let bytes_per_row = (25 * n.max(1)).saturating_add(75);
+    // Conservative cap after removing the extra RHS buffer:
+    //   16n + 160 bytes per row
+    let bytes_per_row = (16 * n.max(1)).saturating_add(160);
     let max_rows = max_bytes / bytes_per_row;
     requested.min(max_rows).max(1)
 }
@@ -2302,15 +2383,11 @@ fn exact_scan_blocks_core<G: GenotypeMatrix>(
     let mut spy_block = vec![0.0_f32; scan_block_rows];
     let mut xts_block = vec![0.0_f32; scan_block_rows * p];
     let mut row_ss = vec![0.0_f64; scan_block_rows];
-    let mut rhs_col_major = vec![0.0_f64; scan_block_rows * n];
     let mut z_col_major = vec![0.0_f64; scan_block_rows * n];
+    let mut sv_block = vec![0.0_f64; scan_block_rows];
     let exact_scalar_p1 = scalar_spd_inv_from_chol(x_design_xtx_chol, p)
         .zip(scalar_spd_inv_from_chol(xt_den_x_chol, p));
-    let mut c_block = if exact_scalar_p1.is_some() {
-        Vec::new()
-    } else {
-        vec![0.0_f64; scan_block_rows * p]
-    };
+    let mut c_block = vec![0.0_f64; scan_block_rows * p];
     let mut xts = if exact_scalar_p1.is_some() {
         Vec::new()
     } else {
@@ -2352,6 +2429,7 @@ fn exact_scan_blocks_core<G: GenotypeMatrix>(
         let spy_slice = &mut spy_block[..rows_here];
         let xts_slice = &mut xts_block[..rows_here * p];
         let ss_slice = &mut row_ss[..rows_here];
+        let sv_slice = &mut sv_block[..rows_here];
 
         // Step 1: decode genotype block via UnifiedInput
         let t0 = stage_timing.then(Instant::now);
@@ -2411,17 +2489,15 @@ fn exact_scan_blocks_core<G: GenotypeMatrix>(
             timing.row_sumsq_secs += t0.elapsed().as_secs_f64();
         }
 
-        // Step 3: convert to column-major f64 for sparse solve
-        let rhs_slice = &mut rhs_col_major[..rows_here * n];
+        // Step 3: widen decode block directly into the sparse-solve buffer
+        let z_slice = &mut z_col_major[..rows_here * n];
         let t0 = stage_timing.then(Instant::now);
-        row_major_snp_block_f32_to_col_major_f64(block_slice, rows_here, n, rhs_slice);
+        row_major_snp_block_f32_to_col_major_f64(block_slice, rows_here, n, z_slice, pool.as_ref());
         if let Some(t0) = t0 {
             timing.repack_secs += t0.elapsed().as_secs_f64();
         }
 
         // Step 4: solve V * Z_block = G_block (tiled, in-place)
-        let z_slice = &mut z_col_major[..rows_here * n];
-        z_slice.copy_from_slice(rhs_slice);
         let t0 = stage_timing.then(Instant::now);
         sparse_solve_rhs_tiled(
             factor,
@@ -2435,41 +2511,37 @@ fn exact_scan_blocks_core<G: GenotypeMatrix>(
         }
 
         // Step 5: C_block = X^T Z_block
-        if exact_scalar_p1.is_none() {
-            let c_slice = &mut c_block[..rows_here * p];
-            let t0 = stage_timing.then(Instant::now);
-            xt_mat_rhs_block(
-                x_design,
-                Some(x_design_col_major),
-                z_slice,
-                n,
-                p,
-                rows_here,
-                c_slice,
-            );
-            if let Some(t0) = t0 {
-                timing.xtz_secs += t0.elapsed().as_secs_f64();
-            }
+        let c_slice = &mut c_block[..rows_here * p];
+        let t0 = stage_timing.then(Instant::now);
+        xt_mat_rhs_block(
+            x_design,
+            Some(x_design_col_major),
+            z_slice,
+            n,
+            p,
+            rows_here,
+            c_slice,
+        );
+        if let Some(t0) = t0 {
+            timing.xtz_secs += t0.elapsed().as_secs_f64();
         }
 
-        // Steps 6-8: per-SNP denominator and output
+        // Step 6: batch g'Z for the whole block
+        let t0 = stage_timing.then(Instant::now);
+        pairwise_block_dot_f32_f64(block_slice, z_slice, rows_here, n, sv_slice, pool.as_ref());
+        if let Some(t0) = t0 {
+            timing.denom_secs += t0.elapsed().as_secs_f64();
+        }
+
+        // Steps 7-8: per-SNP denominator and output
         let out_slice = &mut out_block[..rows_here * 3];
         let t0 = stage_timing.then(Instant::now);
         if let Some((xtx00_inv, xtden00_inv)) = exact_scalar_p1 {
-            let x0 = x_design;
             for local_idx in 0..rows_here {
-                let g = &rhs_slice[local_idx * n..(local_idx + 1) * n];
-                let z = &z_slice[local_idx * n..(local_idx + 1) * n];
                 let xts0 = xts_slice[local_idx] as f64;
                 let s_m_s = residualized_sumsq_scalar(xtx00_inv, xts0, ss_slice[local_idx]);
-                let mut s_v_s = 0.0_f64;
-                let mut xtz0 = 0.0_f64;
-                for i in 0..n {
-                    let g_i = g[i];
-                    let z_i = z[i];
-                    s_v_s += g_i * z_i;
-                    xtz0 += x0[i] * z_i;
-                }
+                let s_v_s = sv_slice[local_idx];
+                let xtz0 = c_slice[local_idx];
                 let c0_scaled = xtz0 * denom_scale;
                 let x_quad = c0_scaled * c0_scaled * xtden00_inv;
                 let denom_scaled = (denom_scale * s_v_s - x_quad).max(0.0);
@@ -2494,11 +2566,8 @@ fn exact_scan_blocks_core<G: GenotypeMatrix>(
                 }
             }
         } else {
-            let c_slice = &c_block[..rows_here * p];
             for local_idx in 0..rows_here {
-                let g = &rhs_slice[local_idx * n..(local_idx + 1) * n];
-                let z = &z_slice[local_idx * n..(local_idx + 1) * n];
-                let s_v_s = g.iter().zip(z.iter()).map(|(a, b)| a * b).sum::<f64>();
+                let s_v_s = sv_slice[local_idx];
                 let c_j = &c_slice[local_idx * p..(local_idx + 1) * p];
                 let xts_row = &xts_slice[local_idx * p..(local_idx + 1) * p];
                 for j in 0..p {
@@ -5537,11 +5606,26 @@ mod tests {
     fn row_major_snp_block_f32_to_col_major_f64_is_widening_copy() {
         let block = vec![1.0_f32, 2.0_f32, 3.0_f32, 4.0_f32, 5.0_f32, 6.0_f32];
         let mut out = vec![0.0_f64; block.len()];
-        row_major_snp_block_f32_to_col_major_f64(&block, 2, 3, &mut out);
+        row_major_snp_block_f32_to_col_major_f64(&block, 2, 3, &mut out, None);
         assert_eq!(
             out,
             vec![1.0_f64, 2.0_f64, 3.0_f64, 4.0_f64, 5.0_f64, 6.0_f64]
         );
+    }
+
+    #[test]
+    fn pairwise_block_dot_f32_f64_matches_reference() {
+        let lhs = vec![
+            1.0_f32, 2.0_f32, 3.0_f32, //
+            4.0_f32, 5.0_f32, 6.0_f32,
+        ];
+        let rhs = vec![
+            0.5_f64, 1.0_f64, 1.5_f64, //
+            2.0_f64, 2.5_f64, 3.0_f64,
+        ];
+        let mut out = vec![0.0_f64; 2];
+        pairwise_block_dot_f32_f64(&lhs, &rhs, 2, 3, &mut out, None);
+        assert_eq!(out, vec![7.0_f64, 39.5_f64]);
     }
 
     #[test]

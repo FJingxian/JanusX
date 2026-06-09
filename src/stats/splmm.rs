@@ -2436,8 +2436,9 @@ fn exact_scan_blocks_core<G: GenotypeMatrix>(
     } else {
         progress_total_override.max(1)
     };
-    let progress_block = if progress_every == 0 {
-        block_rows.max(512).max(1)
+    let scan_block_hint = block_rows.max(512).max(1);
+    let progress_step = if progress_every == 0 {
+        scan_block_hint
     } else {
         progress_every.max(1)
     };
@@ -2454,7 +2455,7 @@ fn exact_scan_blocks_core<G: GenotypeMatrix>(
     }
 
     let scan_block_rows = adaptive_exact_block_rows(
-        adaptive_grm_block_rows(progress_block, m, n, 0usize, threads).max(1),
+        adaptive_grm_block_rows(scan_block_hint, m, n, 0usize, threads).max(1),
         n,
     );
     let score_f32 = cast_f64_slice_to_f32(score_vec)?;
@@ -2509,6 +2510,7 @@ fn exact_scan_blocks_core<G: GenotypeMatrix>(
         .collect::<Result<Vec<_>, _>>()?;
 
     let mut row_start = 0usize;
+    let mut next_progress_done = progress_done_offset.saturating_add(progress_step);
     while row_start < m {
         let row_end = (row_start + scan_block_rows).min(m);
         let rows_here = row_end - row_start;
@@ -2722,12 +2724,22 @@ fn exact_scan_blocks_core<G: GenotypeMatrix>(
         if let Some(t0) = t0 {
             timing.sink_secs += t0.elapsed().as_secs_f64();
         }
-        emit_progress_callback(
-            scan_progress_callback,
-            progress_stage,
-            (progress_done_offset + row_end).min(progress_total),
-            progress_total,
-        )?;
+        let done_abs = progress_done_offset.saturating_add(row_end);
+        if scan_progress_callback.is_some() && (row_end == m || done_abs >= next_progress_done) {
+            emit_progress_callback(
+                scan_progress_callback,
+                progress_stage,
+                done_abs.min(progress_total),
+                progress_total,
+            )?;
+            while next_progress_done <= done_abs {
+                let advanced = next_progress_done.saturating_add(progress_step);
+                if advanced == next_progress_done {
+                    break;
+                }
+                next_progress_done = advanced;
+            }
+        }
         row_start = row_end;
     }
     if let Some(total_t0) = total_t0 {

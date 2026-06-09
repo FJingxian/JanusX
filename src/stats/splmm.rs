@@ -2083,6 +2083,93 @@ fn pairwise_block_dot_f32_f64(
 }
 
 #[inline]
+fn fused_block_sv_xtz_scalar_p1(
+    g_block: &[f32],
+    z_block: &[f64],
+    x0: &[f64],
+    rows: usize,
+    cols: usize,
+    sv_out: &mut [f64],
+    xtz_out: &mut [f64],
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) {
+    debug_assert_eq!(g_block.len(), rows.saturating_mul(cols));
+    debug_assert_eq!(z_block.len(), rows.saturating_mul(cols));
+    debug_assert_eq!(x0.len(), cols);
+    debug_assert_eq!(sv_out.len(), rows);
+    debug_assert_eq!(xtz_out.len(), rows);
+
+    #[inline]
+    fn fused_row(g: &[f32], z: &[f64], x0: &[f64]) -> (f64, f64) {
+        let mut i = 0usize;
+        let mut sv0 = 0.0_f64;
+        let mut sv1 = 0.0_f64;
+        let mut sv2 = 0.0_f64;
+        let mut sv3 = 0.0_f64;
+        let mut xtz0 = 0.0_f64;
+        let mut xtz1 = 0.0_f64;
+        let mut xtz2 = 0.0_f64;
+        let mut xtz3 = 0.0_f64;
+        while i + 4 <= g.len() {
+            let z0 = z[i];
+            let z1 = z[i + 1];
+            let z2 = z[i + 2];
+            let z3 = z[i + 3];
+            sv0 += (g[i] as f64) * z0;
+            sv1 += (g[i + 1] as f64) * z1;
+            sv2 += (g[i + 2] as f64) * z2;
+            sv3 += (g[i + 3] as f64) * z3;
+            xtz0 += x0[i] * z0;
+            xtz1 += x0[i + 1] * z1;
+            xtz2 += x0[i + 2] * z2;
+            xtz3 += x0[i + 3] * z3;
+            i += 4;
+        }
+        let mut sv = (sv0 + sv1) + (sv2 + sv3);
+        let mut xtz = (xtz0 + xtz1) + (xtz2 + xtz3);
+        while i < g.len() {
+            let z_i = z[i];
+            sv += (g[i] as f64) * z_i;
+            xtz += x0[i] * z_i;
+            i += 1;
+        }
+        (sv, xtz)
+    }
+
+    let use_parallel = pool.map(|tp| tp.current_num_threads() > 1).unwrap_or(false)
+        && rows.saturating_mul(cols) >= 16_384usize;
+    if use_parallel {
+        let mut run = || {
+            sv_out
+                .par_iter_mut()
+                .zip(xtz_out.par_iter_mut())
+                .enumerate()
+                .for_each(|(row_idx, (sv_dst, xtz_dst))| {
+                    let g = &g_block[row_idx * cols..(row_idx + 1) * cols];
+                    let z = &z_block[row_idx * cols..(row_idx + 1) * cols];
+                    let (sv, xtz) = fused_row(g, z, x0);
+                    *sv_dst = sv;
+                    *xtz_dst = xtz;
+                });
+        };
+        if let Some(tp) = pool {
+            tp.install(run);
+        } else {
+            run();
+        }
+        return;
+    }
+
+    for row_idx in 0..rows {
+        let g = &g_block[row_idx * cols..(row_idx + 1) * cols];
+        let z = &z_block[row_idx * cols..(row_idx + 1) * cols];
+        let (sv, xtz) = fused_row(g, z, x0);
+        sv_out[row_idx] = sv;
+        xtz_out[row_idx] = xtz;
+    }
+}
+
+#[inline]
 fn adaptive_exact_block_rows(requested: usize, n: usize) -> usize {
     // Exact block-scan peak memory model, per row (one SNP) of the block:
     //   block          f32 [n]     = 4n
@@ -2510,27 +2597,43 @@ fn exact_scan_blocks_core<G: GenotypeMatrix>(
             timing.solve_secs += t0.elapsed().as_secs_f64();
         }
 
-        // Step 5: C_block = X^T Z_block
+        // Step 5: C_block = X^T Z_block; for p=1 also fuse g'Z here.
         let c_slice = &mut c_block[..rows_here * p];
         let t0 = stage_timing.then(Instant::now);
-        xt_mat_rhs_block(
-            x_design,
-            Some(x_design_col_major),
-            z_slice,
-            n,
-            p,
-            rows_here,
-            c_slice,
-        );
+        if exact_scalar_p1.is_some() {
+            let x0 = &x_design[..n];
+            fused_block_sv_xtz_scalar_p1(
+                block_slice,
+                z_slice,
+                x0,
+                rows_here,
+                n,
+                sv_slice,
+                &mut c_slice[..rows_here],
+                pool.as_ref(),
+            );
+        } else {
+            xt_mat_rhs_block(
+                x_design,
+                Some(x_design_col_major),
+                z_slice,
+                n,
+                p,
+                rows_here,
+                c_slice,
+            );
+        }
         if let Some(t0) = t0 {
             timing.xtz_secs += t0.elapsed().as_secs_f64();
         }
 
-        // Step 6: batch g'Z for the whole block
-        let t0 = stage_timing.then(Instant::now);
-        pairwise_block_dot_f32_f64(block_slice, z_slice, rows_here, n, sv_slice, pool.as_ref());
-        if let Some(t0) = t0 {
-            timing.denom_secs += t0.elapsed().as_secs_f64();
+        // Step 6: batch g'Z for the generic p>1 path.
+        if exact_scalar_p1.is_none() {
+            let t0 = stage_timing.then(Instant::now);
+            pairwise_block_dot_f32_f64(block_slice, z_slice, rows_here, n, sv_slice, pool.as_ref());
+            if let Some(t0) = t0 {
+                timing.denom_secs += t0.elapsed().as_secs_f64();
+            }
         }
 
         // Steps 7-8: per-SNP denominator and output
@@ -5626,6 +5729,24 @@ mod tests {
         let mut out = vec![0.0_f64; 2];
         pairwise_block_dot_f32_f64(&lhs, &rhs, 2, 3, &mut out, None);
         assert_eq!(out, vec![7.0_f64, 39.5_f64]);
+    }
+
+    #[test]
+    fn fused_block_sv_xtz_scalar_p1_matches_reference() {
+        let g = vec![
+            1.0_f32, 2.0_f32, 3.0_f32, //
+            4.0_f32, 5.0_f32, 6.0_f32,
+        ];
+        let z = vec![
+            0.5_f64, 1.0_f64, 1.5_f64, //
+            2.0_f64, 2.5_f64, 3.0_f64,
+        ];
+        let x0 = vec![10.0_f64, 20.0_f64, 30.0_f64];
+        let mut sv = vec![0.0_f64; 2];
+        let mut xtz = vec![0.0_f64; 2];
+        fused_block_sv_xtz_scalar_p1(&g, &z, &x0, 2, 3, &mut sv, &mut xtz, None);
+        assert_eq!(sv, vec![7.0_f64, 39.5_f64]);
+        assert_eq!(xtz, vec![70.0_f64, 160.0_f64]);
     }
 
     #[test]

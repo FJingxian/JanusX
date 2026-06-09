@@ -512,14 +512,28 @@ def run_chunked_gwas_lmm_lm(
     trait_iter = _resolve_trait_iter(pheno_aligned, trait_names)
     multi_trait_mode = len(trait_iter) > 1
 
-    # For single-model kinship models on PLINK BED input, reuse the shared
-    # prepared-chunk scan bus (same Rust read-block path as multi-model mode)
-    # to reduce Python per-chunk orchestration overhead.
-    if (
-        model_key in {"lmm", "fastlmm", "fvlmm"}
-        and _as_plink_prefix(genofile) is not None
+    bed_prefix = _as_plink_prefix(genofile)
+    has_prepared_bed_bus = (
+        bed_prefix is not None
         and hasattr(jxrs, "BedChunkReader")
         and hasattr(getattr(jxrs, "BedChunkReader"), "next_chunk_prepared")
+    )
+    fvlmm_has_dedicated_bed_fastpath = bool(
+        bed_prefix is not None
+        and (
+            hasattr(jxrs, "fvlmm_assoc_bed_to_tsv_f32")
+            or hasattr(jxrs, "fvlmm_assoc_chunk_from_snp_to_tsv_f32")
+        )
+    )
+
+    # For single-model kinship models on PLINK BED input, reuse the shared
+    # prepared-chunk scan bus (same Rust read-block path as multi-model mode)
+    # to reduce Python per-chunk orchestration overhead. Keep single-model
+    # FvLMM on the dedicated runner when its Rust fastpaths are available.
+    if (
+        model_key in {"lmm", "fastlmm", "fvlmm"}
+        and has_prepared_bed_bus
+        and not (model_key == "fvlmm" and fvlmm_has_dedicated_bed_fastpath)
     ):
         _log_file_only(
             logger,
@@ -559,6 +573,13 @@ def run_chunked_gwas_lmm_lm(
             if multi_trait_mode and trait_idx < len(trait_iter) - 1:
                 logger.info("")
         return
+    if model_key == "fvlmm" and fvlmm_has_dedicated_bed_fastpath:
+        _log_file_only(
+            logger,
+            logging.INFO,
+            "FvLMM route: using dedicated single-model Rust BED fastpath "
+            "(skip shared prepared-chunk bus).",
+        )
 
     for trait_idx, pname in enumerate(trait_iter):
         cpu_t0 = process.cpu_times()
@@ -791,6 +812,7 @@ def run_chunked_gwas_lmm_lm(
         pbar_total = int(eff_snp_by_trait.get(pname, n_snps))
         pbar_desc = f"{effective_model_label}"
         pbar: Optional[_ProgressAdapter] = None
+        pbar_last_done = 0
         scan_warmup_task: Optional[CliStatus] = None
         scan_warmup_active = False
         if bool(use_spinner):
@@ -987,6 +1009,48 @@ def run_chunked_gwas_lmm_lm(
                     if pbar is not None:
                         pbar.set_postfix(memory=f"{mem_gb:.2f}GB")
 
+        def _fvlmm_unified_progress(done: int, total: int) -> None:
+            nonlocal pbar, pbar_total, pbar_last_done, scan_warmup_active, scan_warmup_task
+            if not bool(use_spinner):
+                return
+            try:
+                d = int(done)
+                t = int(total)
+            except Exception:
+                return
+            total_use = int(max(1, t if t > 0 else pbar_total))
+            if pbar is None:
+                if scan_warmup_active and scan_warmup_task is not None:
+                    try:
+                        scan_warmup_task.__exit__(None, None, None)
+                    except Exception:
+                        pass
+                    scan_warmup_active = False
+                pbar_total = total_use
+                pbar = _ProgressAdapter(
+                    total=pbar_total,
+                    desc=pbar_desc,
+                    force_animate=True,
+                )
+                pbar_last_done = 0
+            elif total_use != pbar_total and pbar_last_done == 0:
+                try:
+                    pbar.close(show_done=False)
+                except Exception:
+                    pass
+                pbar_total = total_use
+                pbar = _ProgressAdapter(
+                    total=pbar_total,
+                    desc=pbar_desc,
+                    force_animate=True,
+                )
+                pbar_last_done = 0
+            d = int(max(0, min(d, pbar_total)))
+            step = int(max(0, d - pbar_last_done))
+            if step > 0 and pbar is not None:
+                pbar.update(step)
+                pbar_last_done = d
+
         scan_stage_ctx = (
             _gwas_fvlmm_scan_stage_ctx
             if str(model_name).lower() == "fvlmm"
@@ -1020,13 +1084,16 @@ def run_chunked_gwas_lmm_lm(
                     threads=int(scan_threads),
                     nullml=mod.ML0,
                     rotate_block_rows=int(model_chunk_size),
+                    progress_callback=(_fvlmm_unified_progress if bool(use_spinner) else None),
+                    progress_every=int(max(1, int(model_chunk_size))),
                 )
                 done_snps = int(rows_written)
                 has_results = done_snps > 0
                 mem_info = process.memory_info()
                 peak_rss = max(peak_rss, mem_info.rss)
                 if pbar is not None:
-                    pbar.update(int(done_snps))
+                    if done_snps > pbar_last_done:
+                        pbar.update(int(done_snps - pbar_last_done))
                     pbar.finish()
             else:
                 ex = cf.ThreadPoolExecutor(max_workers=workers)

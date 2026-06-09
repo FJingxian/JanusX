@@ -5,6 +5,8 @@ use std::arch::x86 as x86_simd;
 use std::arch::x86_64 as x86_simd;
 use std::sync::{Arc, OnceLock};
 
+use crate::gfcore::{block_rows_from_memory_target_mb, parse_positive_env_f64};
+
 const BED_DECODE_SIMD_DEFAULT: &str = match option_env!("JANUSX_BED_DECODE_SIMD_DEFAULT") {
     Some(v) => v,
     None => "0",
@@ -1060,22 +1062,13 @@ pub(crate) fn adaptive_grm_block_rows(
     if exact_mode {
         return base;
     }
-    let target_mb = std::env::var("JX_GRM_BLOCK_TARGET_MB")
-        .ok()
-        .and_then(|s| s.trim().parse::<f64>().ok())
-        .or_else(|| {
-            std::env::var("JX_GRM_PACKED_BLOCK_TARGET_MB")
-                .ok()
-                .and_then(|s| s.trim().parse::<f64>().ok())
-        })
-        .unwrap_or(1024.0_f64);
-    if !(target_mb.is_finite() && target_mb > 0.0) {
-        return base;
-    }
-    let target_bytes = (target_mb * 1024.0_f64 * 1024.0_f64) as usize;
-    if target_bytes == 0 {
-        return base;
-    }
+    let target_mb = parse_positive_env_f64(&[
+        "JX_GRM_PACKED_BLOCK_TARGET_MB",
+        "JX_GRM_BLOCK_TARGET_MB",
+        "JX_BED_BLOCK_TARGET_MB",
+        "JANUSX_BED_BLOCK_TARGET_MB",
+    ])
+    .unwrap_or(1024.0_f64);
     let workers = if threads > 0 {
         threads
     } else {
@@ -1087,10 +1080,8 @@ pub(crate) fn adaptive_grm_block_rows(
         .saturating_mul(4)
         .saturating_mul(workers.max(1));
     let row_bytes = n_out.saturating_mul(4).max(1);
-    if reserve_bytes >= target_bytes {
-        return 1;
-    }
-    let cap_rows = ((target_bytes - reserve_bytes) / row_bytes).max(1);
+    let cap_rows =
+        block_rows_from_memory_target_mb(target_mb, row_bytes, m.max(1), 1, 1, reserve_bytes);
     base.min(cap_rows)
 }
 

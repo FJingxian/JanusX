@@ -50,6 +50,7 @@ import multiprocessing as mp
 import tempfile
 import shutil
 import sys
+from contextlib import contextmanager
 
 import numpy as np
 import pandas as pd
@@ -67,6 +68,7 @@ mpl.rcParams["ps.fonttype"] = 42
 from janusx.bioplotkit.sci_set import color_set
 from janusx.bioplotkit.pcshow import PCSHOW
 from janusx.gfreader import (
+    calc_decode_block_rows_from_memory_mb,
     load_genotype_chunks,
     inspect_genotype_file,
     auto_mmap_window_mb,
@@ -96,6 +98,31 @@ from ._common.threads import detect_effective_threads
 # ======================================================================
 # Helpers: GRM-based PCA (aligned with GWAS module)
 # ======================================================================
+
+DEFAULT_BED_MEMORY_MB = 512.0
+
+
+def _normalize_memory_mb(memory_mb: Union[int, float, None]) -> float:
+    if memory_mb is None:
+        return float(DEFAULT_BED_MEMORY_MB)
+    mb = float(memory_mb)
+    if (not np.isfinite(mb)) or mb <= 0.0:
+        raise ValueError(f"--memory must be a finite value > 0, got {memory_mb}")
+    return float(mb)
+
+
+@contextmanager
+def _bed_block_target_env(memory_mb: Union[int, float, None]) -> None:
+    prev = os.environ.get("JX_BED_BLOCK_TARGET_MB")
+    if memory_mb is not None:
+        os.environ["JX_BED_BLOCK_TARGET_MB"] = f"{float(memory_mb):.6g}"
+    try:
+        yield
+    finally:
+        if prev is None:
+            os.environ.pop("JX_BED_BLOCK_TARGET_MB", None)
+        else:
+            os.environ["JX_BED_BLOCK_TARGET_MB"] = prev
 
 def load_group_table(group_path: str) -> tuple[pd.DataFrame, Union[str , None], Union[str , None]]:
     group_df = pd.read_csv(group_path, sep="\t", header=None, index_col=0)
@@ -508,8 +535,7 @@ def build_grm_streaming_for_pca(
     genofile: str,
     maf_threshold: float = 0.02,
     max_missing_rate: float = 0.05,
-    chunk_size: int = 100_000,
-    mmap_limit: bool = True,
+    memory_mb: float = DEFAULT_BED_MEMORY_MB,
     inspected_meta: Optional[tuple[list[str], int]] = None,
     logger=None,
     emit_progress_done: bool = True,
@@ -542,6 +568,13 @@ def build_grm_streaming_for_pca(
         sample_ids_raw, n_snps = inspected_meta
     sample_ids = np.array(sample_ids_raw, dtype=str)
     n_samples = len(sample_ids)
+    block_rows = calc_decode_block_rows_from_memory_mb(
+        n_samples,
+        float(memory_mb),
+        buffers=2,
+        max_rows=max(1, int(n_snps)),
+    )
+    block_rows = max(1, int(block_rows if block_rows is not None else 1))
     pbar = ProgressAdapter(
         total=n_snps,
         desc="GRM (rust-memmap)",
@@ -550,7 +583,7 @@ def build_grm_streaming_for_pca(
     )
     process = psutil.Process()
 
-    mem_tick_span = max(1, 10 * int(chunk_size))
+    mem_tick_span = max(1, 10 * int(block_rows))
     last_done = 0
 
     def _progress_cb(done: int, _total: int) -> None:
@@ -563,22 +596,20 @@ def build_grm_streaming_for_pca(
             mem = process.memory_info().rss / 1024**3
             pbar.set_postfix(memory=f"{mem:.2f} GB")
 
-    mmap_window_mb = (
-        auto_mmap_window_mb(rust_input, n_samples, n_snps, chunk_size)
-        if mmap_limit else None
-    )
+    mmap_window_mb = auto_mmap_window_mb(rust_input, n_samples, n_snps, float(memory_mb))
     try:
-        grm_raw, eff_m_raw, stream_n_raw = jxrs.grm_stream_bed_f32(
-            str(rust_input),
-            method=1,
-            maf_threshold=float(maf_threshold),
-            max_missing_rate=float(max_missing_rate),
-            block_cols=max(1, int(chunk_size)),
-            threads=0,
-            progress_callback=_progress_cb,
-            progress_every=max(1, int(chunk_size)),
-            mmap_window_mb=(int(mmap_window_mb) if mmap_window_mb is not None else None),
-        )
+        with _bed_block_target_env(memory_mb):
+            grm_raw, eff_m_raw, stream_n_raw = jxrs.grm_stream_bed_f32(
+                str(rust_input),
+                method=1,
+                maf_threshold=float(maf_threshold),
+                max_missing_rate=float(max_missing_rate),
+                block_cols=max(1, int(block_rows)),
+                threads=0,
+                progress_callback=_progress_cb,
+                progress_every=max(1, int(block_rows)),
+                mmap_window_mb=(int(mmap_window_mb) if mmap_window_mb is not None else None),
+            )
     finally:
         pbar.finish()
         pbar.close()
@@ -828,10 +859,6 @@ def main(log: bool = True):
         help="Number of leading principal components to output (default: %(default)s).",
     )
     optional_group.add_argument(
-        "-mmap-limit", "--mmap-limit", action="store_true", default=False,
-        help="Enable windowed mmap for BED inputs (default backend; auto: 2x chunk size).",
-    )
-    optional_group.add_argument(
         "-maf", "--maf", type=float, default=0.02,
         help="Exclude variants with minor allele frequency lower than a threshold "
              "(default: %(default)s).",
@@ -842,9 +869,11 @@ def main(log: bool = True):
              "(default: %(default)s).",
     )
     optional_group.add_argument(
-        "-chunksize", "--chunksize", type=int, default=100_000,
-        help="Number of SNPs per chunk for memmap GRM "
-             "(default: %(default)s).",
+        "-memory", "--memory", type=float, default=DEFAULT_BED_MEMORY_MB,
+        help=(
+            "Target decode working-set size in MB for BED memmap/packed kernels "
+            "(default: %(default)s)."
+        ),
     )
     optional_group.add_argument(
         "-plot", "--plot", action="store_true", default=False,
@@ -963,7 +992,7 @@ def main(log: bool = True):
     args.out = os.path.normpath(args.out if args.out is not None else ".")
     outprefix = os.path.join(args.out, args.prefix)
     genotype_input_mode = bool(args.vcf or args.hmp or args.file or args.bfile)
-    mmap_limit_effective = bool(args.mmap_limit or genotype_input_mode)
+    args.memory = _normalize_memory_mb(args.memory)
 
     # Keep index for logging and validate after logger is ready
     palette_idx = int(args.color)
@@ -1006,9 +1035,8 @@ def main(log: bool = True):
                     ("Output PCs", f"top {args.dim}"),
                     ("MAF threshold", args.maf),
                     ("Missing rate", args.geno),
-                    ("Chunk size", args.chunksize),
+                    ("Memory MB", args.memory),
                     ("BED backend", "memmap (default)"),
-                    ("Mmap limit flag", args.mmap_limit),
                     ("RSVD mode", args.rsvd),
                 ]
             )
@@ -1138,7 +1166,7 @@ def main(log: bool = True):
                 )
                 with CliStatus(
                     f"Loading genotype from {load_src_disp}...",
-                    enabled=(use_spinner and (not mmap_limit_effective)),
+                    enabled=use_spinner,
                     use_process=True,
                 ) as task:
                     try:
@@ -1146,8 +1174,7 @@ def main(log: bool = True):
                             genofile=rsvd_input,
                             maf_threshold=args.maf,
                             max_missing_rate=args.geno,
-                            chunk_size=int(args.chunksize),
-                            mmap_limit=mmap_limit_effective,
+                            memory_mb=float(args.memory),
                             inspected_meta=(meta_sample_ids, meta_n_snps),
                             logger=None,
                             emit_progress_done=False,
@@ -1204,25 +1231,28 @@ def main(log: bool = True):
                         f"Loading genotype from {load_src_disp} (n={algo_n}, nSNP={int(algo_snp)})"
                     )
 
-                mmap_window_mb = (
-                    auto_mmap_window_mb(rsvd_input, len(samples), int(algo_snp), int(args.chunksize))
-                    if mmap_limit_effective else None
+                mmap_window_mb = auto_mmap_window_mb(
+                    rsvd_input,
+                    len(samples),
+                    int(algo_snp),
+                    float(args.memory),
                 )
 
                 def _run_rsvd_only():
-                    return _run_rsvd_subprocess(
-                        genotype_path=str(rsvd_input),
-                        dim=int(args.dim),
-                        seed=int(args.rsvd_seed),
-                        power=int(args.rsvd_power),
-                        tol=float(args.rsvd_tol),
-                        snps_only=bool(rsvd_snps_only),
-                        maf=float(args.maf),
-                        missing_rate=float(args.geno),
-                        mmap_window_mb=int(mmap_window_mb) if mmap_window_mb is not None else 0,
-                        force_packed_bed=bool(_is_plink_prefix_path(rsvd_input)),
-                        progress_callback=None,
-                    )
+                    with _bed_block_target_env(float(args.memory)):
+                        return _run_rsvd_subprocess(
+                            genotype_path=str(rsvd_input),
+                            dim=int(args.dim),
+                            seed=int(args.rsvd_seed),
+                            power=int(args.rsvd_power),
+                            tol=float(args.rsvd_tol),
+                            snps_only=bool(rsvd_snps_only),
+                            maf=float(args.maf),
+                            missing_rate=float(args.geno),
+                            mmap_window_mb=int(mmap_window_mb) if mmap_window_mb is not None else 0,
+                            force_packed_bed=bool(_is_plink_prefix_path(rsvd_input)),
+                            progress_callback=None,
+                        )
 
                 (eigenval, eigenvec), algo_elapsed_s = _run_with_algo_progress(
                     algo_name,
@@ -1242,7 +1272,7 @@ def main(log: bool = True):
         else:
             with CliStatus(
                 f"Loading genotype from {load_src_disp}...",
-                enabled=(use_spinner and (not mmap_limit_effective)),
+                enabled=use_spinner,
                 use_process=True,
             ) as task:
                 try:
@@ -1250,8 +1280,7 @@ def main(log: bool = True):
                         genofile=gfile,
                         maf_threshold=args.maf,
                         max_missing_rate=args.geno,
-                        chunk_size=int(args.chunksize),
-                        mmap_limit=mmap_limit_effective,
+                        memory_mb=float(args.memory),
                         inspected_meta=None,
                         logger=None,
                         emit_progress_done=False,

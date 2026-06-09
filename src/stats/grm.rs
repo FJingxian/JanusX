@@ -24,7 +24,10 @@ use crate::blas::{
     cblas_dgemm_dispatch, cblas_dsyrk_dispatch, cblas_sgemm_dispatch, cblas_ssyrk_dispatch,
     CblasInt, OpenBlasThreadGuard, CBLAS_COL_MAJOR, CBLAS_NO_TRANS, CBLAS_TRANS, CBLAS_UPPER,
 };
-use crate::gfcore::{read_fam, BedSnpIter};
+use crate::gfcore::{
+    block_rows_from_memory_target_mb, parse_positive_env_f64, parse_positive_env_usize, read_fam,
+    BedSnpIter,
+};
 use crate::stats_common::{
     check_ctrlc, env_truthy, get_cached_pool, map_err_string_to_py, parse_index_vec_i64,
 };
@@ -2431,38 +2434,21 @@ fn grm_stream_block_rows(
     if exact_mode {
         return requested_block_rows.max(1).min(m.max(1));
     }
-    if let Ok(raw) = std::env::var("JX_GRM_STREAM_BLOCK_ROWS") {
-        if let Ok(v) = raw.trim().parse::<usize>() {
-            if v > 0 {
-                return v.min(m.max(1));
-            }
-        }
+    if let Some(v) = parse_positive_env_usize(&["JX_GRM_STREAM_BLOCK_ROWS"]) {
+        return v.min(m.max(1));
     }
     let base = requested_block_rows.max(1).min(m.max(1));
-    let target_mb = std::env::var("JX_GRM_BLOCK_TARGET_MB")
-        .ok()
-        .and_then(|s| s.trim().parse::<f64>().ok())
-        .filter(|v| v.is_finite() && *v > 0.0)
-        .or_else(|| {
-            std::env::var("JX_GRM_STREAM_BLOCK_TARGET_MB")
-                .ok()
-                .and_then(|s| s.trim().parse::<f64>().ok())
-                .filter(|v| v.is_finite() && *v > 0.0)
-        })
-        .unwrap_or(1024.0_f64);
-    let target_bytes = (target_mb * 1024.0_f64 * 1024.0_f64) as usize;
-    if target_bytes == 0 {
-        return base;
-    }
+    let target_mb = parse_positive_env_f64(&[
+        "JX_GRM_STREAM_BLOCK_TARGET_MB",
+        "JX_GRM_BLOCK_TARGET_MB",
+        "JX_BED_BLOCK_TARGET_MB",
+        "JANUSX_BED_BLOCK_TARGET_MB",
+    ])
+    .unwrap_or(1024.0_f64);
     let row_bytes = n_samples.saturating_mul(elem_bytes.max(1)).max(1);
-    let cap_rows = target_bytes
-        .saturating_div(row_bytes.saturating_mul(2).max(1))
-        .max(1);
-    let max_rows = std::env::var("JX_GRM_STREAM_BLOCK_MAX_ROWS")
-        .ok()
-        .and_then(|s| s.trim().parse::<usize>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(65_536usize);
+    let max_rows =
+        parse_positive_env_usize(&["JX_GRM_STREAM_BLOCK_MAX_ROWS"]).unwrap_or(65_536usize);
+    let cap_rows = block_rows_from_memory_target_mb(target_mb, row_bytes, m.max(1), 1, 2, 0);
     base.min(cap_rows).min(max_rows).max(1).min(m.max(1))
 }
 

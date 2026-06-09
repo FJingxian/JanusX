@@ -29,11 +29,13 @@ import socket
 import argparse
 import logging
 import json
+from contextlib import contextmanager
 from typing import Union
 
 import numpy as np
 import psutil
 from janusx.gfreader import (
+    calc_decode_block_rows_from_memory_mb,
     inspect_genotype_file,
     auto_mmap_window_mb,
     prepare_cli_input_cache,
@@ -89,6 +91,9 @@ except Exception:
     _spgrm_dense_npy_to_jxgrm = None
 
 
+DEFAULT_BED_MEMORY_MB = 512.0
+
+
 def _is_plink_prefix_path(path_or_prefix: str) -> bool:
     p = str(path_or_prefix).strip()
     if p == "":
@@ -97,6 +102,45 @@ def _is_plink_prefix_path(path_or_prefix: str) -> bool:
     if low.endswith(".bed") or low.endswith(".bim") or low.endswith(".fam"):
         p = p[:-4]
     return all(os.path.isfile(f"{p}.{ext}") for ext in ("bed", "bim", "fam"))
+
+
+def _normalize_memory_mb(memory_mb: Union[int, float, None]) -> float:
+    if memory_mb is None:
+        return float(DEFAULT_BED_MEMORY_MB)
+    mb = float(memory_mb)
+    if (not np.isfinite(mb)) or mb <= 0.0:
+        raise ValueError(f"--memory must be a finite value > 0, got {memory_mb}")
+    return float(mb)
+
+
+def _decode_block_rows_from_memory_mb(
+    n_samples: int,
+    n_snps: int,
+    memory_mb: Union[int, float],
+    *,
+    streaming: bool,
+) -> int:
+    rows = calc_decode_block_rows_from_memory_mb(
+        int(n_samples),
+        float(memory_mb),
+        buffers=(2 if streaming else 1),
+        max_rows=max(1, int(n_snps)),
+    )
+    return max(1, int(rows if rows is not None else 1))
+
+
+@contextmanager
+def _bed_block_target_env(memory_mb: Union[int, float, None]) -> None:
+    prev = os.environ.get("JX_BED_BLOCK_TARGET_MB")
+    if memory_mb is not None:
+        os.environ["JX_BED_BLOCK_TARGET_MB"] = f"{float(memory_mb):.6g}"
+    try:
+        yield
+    finally:
+        if prev is None:
+            os.environ.pop("JX_BED_BLOCK_TARGET_MB", None)
+        else:
+            os.environ["JX_BED_BLOCK_TARGET_MB"] = prev
 
 
 def _resolve_rust_grm_input(
@@ -218,10 +262,10 @@ def build_grm_streaming(
     method: int,
     maf_threshold: float,
     max_missing_rate: float,
-    chunk_size: int,
+    block_rows: int,
     mmap_window_mb: Union[int , None],
     threads: int,
-    block_target_mb: Union[float, None],
+    memory_mb: Union[float, None],
     stage_timing: bool,
     logger,
 ) -> tuple[np.ndarray, int]:
@@ -244,8 +288,8 @@ def build_grm_streaming(
         MAF filter threshold passed to the Rust reader.
     max_missing_rate : float
         Missing-rate filter threshold passed to the Rust reader.
-    chunk_size : int
-        Number of SNPs per chunk.
+    block_rows : int
+        Number of SNP rows per decode block.
     logger : logging.Logger
         Logger for progress messages.
 
@@ -269,7 +313,7 @@ def build_grm_streaming(
     )
     stream_t0 = time.monotonic()
     process = psutil.Process()
-    mem_tick_span = max(1, 10 * int(chunk_size))
+    mem_tick_span = max(1, 10 * int(block_rows))
     last_done = 0
 
     def _progress_cb(done: int, _total: int) -> None:
@@ -282,48 +326,27 @@ def build_grm_streaming(
             mem = process.memory_info().rss / 1024**3
             pbar.set_postfix(memory=f"{mem:.2f} GB")
 
-    prev_block_target = os.environ.get("JX_GRM_BLOCK_TARGET_MB")
     prev_stage_timing = os.environ.get("JX_GRM_STREAM_STAGE_TIMING")
-    block_target_set = False
     stage_timing_set = False
-    if block_target_mb is not None:
-        try:
-            bt = float(block_target_mb)
-        except Exception:
-            logger.warning(
-                f"Invalid --block-target-mb={block_target_mb}; fallback to runtime default."
-            )
-        else:
-            if np.isfinite(bt) and bt > 0:
-                os.environ["JX_GRM_BLOCK_TARGET_MB"] = f"{bt:.6g}"
-                block_target_set = True
-            else:
-                logger.warning(
-                    f"Non-positive --block-target-mb={block_target_mb}; fallback to runtime default."
-                )
     if bool(stage_timing):
         os.environ["JX_GRM_STREAM_STAGE_TIMING"] = "1"
         stage_timing_set = True
 
     try:
         try:
-            grm_raw, eff_m, stream_n = _grm_stream_bed_f32(
-                str(genofile),
-                method=int(method),
-                maf_threshold=float(maf_threshold),
-                max_missing_rate=float(max_missing_rate),
-                block_cols=max(1, int(chunk_size)),
-                threads=max(1, int(threads)),
-                progress_callback=_progress_cb,
-                progress_every=max(1, int(chunk_size)),
-                mmap_window_mb=(int(mmap_window_mb) if mmap_window_mb is not None else None),
-            )
+            with _bed_block_target_env(memory_mb):
+                grm_raw, eff_m, stream_n = _grm_stream_bed_f32(
+                    str(genofile),
+                    method=int(method),
+                    maf_threshold=float(maf_threshold),
+                    max_missing_rate=float(max_missing_rate),
+                    block_cols=max(1, int(block_rows)),
+                    threads=max(1, int(threads)),
+                    progress_callback=_progress_cb,
+                    progress_every=max(1, int(block_rows)),
+                    mmap_window_mb=(int(mmap_window_mb) if mmap_window_mb is not None else None),
+                )
         finally:
-            if block_target_set:
-                if prev_block_target is None:
-                    os.environ.pop("JX_GRM_BLOCK_TARGET_MB", None)
-                else:
-                    os.environ["JX_GRM_BLOCK_TARGET_MB"] = prev_block_target
             if stage_timing_set:
                 if prev_stage_timing is None:
                     os.environ.pop("JX_GRM_STREAM_STAGE_TIMING", None)
@@ -356,10 +379,10 @@ def build_grm_streaming_to_npy(
     method: int,
     maf_threshold: float,
     max_missing_rate: float,
-    chunk_size: int,
+    block_rows: int,
     mmap_window_mb: Union[int, None],
     threads: int,
-    block_target_mb: Union[float, None],
+    memory_mb: Union[float, None],
     stage_timing: bool,
     logger,
 ) -> int:
@@ -382,7 +405,7 @@ def build_grm_streaming_to_npy(
     )
     stream_t0 = time.monotonic()
     process = psutil.Process()
-    mem_tick_span = max(1, 10 * int(chunk_size))
+    mem_tick_span = max(1, 10 * int(block_rows))
     last_done = 0
 
     def _progress_cb(done: int, _total: int) -> None:
@@ -395,49 +418,28 @@ def build_grm_streaming_to_npy(
             mem = process.memory_info().rss / 1024**3
             pbar.set_postfix(memory=f"{mem:.2f} GB")
 
-    prev_block_target = os.environ.get("JX_GRM_BLOCK_TARGET_MB")
     prev_stage_timing = os.environ.get("JX_GRM_STREAM_STAGE_TIMING")
-    block_target_set = False
     stage_timing_set = False
-    if block_target_mb is not None:
-        try:
-            bt = float(block_target_mb)
-        except Exception:
-            logger.warning(
-                f"Invalid --block-target-mb={block_target_mb}; fallback to runtime default."
-            )
-        else:
-            if np.isfinite(bt) and bt > 0:
-                os.environ["JX_GRM_BLOCK_TARGET_MB"] = f"{bt:.6g}"
-                block_target_set = True
-            else:
-                logger.warning(
-                    f"Non-positive --block-target-mb={block_target_mb}; fallback to runtime default."
-                )
     if bool(stage_timing):
         os.environ["JX_GRM_STREAM_STAGE_TIMING"] = "1"
         stage_timing_set = True
 
     try:
         try:
-            eff_m, stream_n = _grm_stream_bed_f32_to_npy(
-                str(genofile),
-                str(out_npy_path),
-                method=int(method),
-                maf_threshold=float(maf_threshold),
-                max_missing_rate=float(max_missing_rate),
-                block_cols=max(1, int(chunk_size)),
-                threads=max(1, int(threads)),
-                progress_callback=_progress_cb,
-                progress_every=max(1, int(chunk_size)),
-                mmap_window_mb=(int(mmap_window_mb) if mmap_window_mb is not None else None),
-            )
+            with _bed_block_target_env(memory_mb):
+                eff_m, stream_n = _grm_stream_bed_f32_to_npy(
+                    str(genofile),
+                    str(out_npy_path),
+                    method=int(method),
+                    maf_threshold=float(maf_threshold),
+                    max_missing_rate=float(max_missing_rate),
+                    block_cols=max(1, int(block_rows)),
+                    threads=max(1, int(threads)),
+                    progress_callback=_progress_cb,
+                    progress_every=max(1, int(block_rows)),
+                    mmap_window_mb=(int(mmap_window_mb) if mmap_window_mb is not None else None),
+                )
         finally:
-            if block_target_set:
-                if prev_block_target is None:
-                    os.environ.pop("JX_GRM_BLOCK_TARGET_MB", None)
-                else:
-                    os.environ["JX_GRM_BLOCK_TARGET_MB"] = prev_block_target
             if stage_timing_set:
                 if prev_stage_timing is None:
                     os.environ.pop("JX_GRM_STREAM_STAGE_TIMING", None)
@@ -468,9 +470,9 @@ def build_grm_packed_bed(
     method: int,
     maf_threshold: float,
     max_missing_rate: float,
-    chunk_size: int,
+    block_rows: int,
     threads: int,
-    block_target_mb: Union[float, None],
+    memory_mb: Union[float, None],
     stage_timing: bool,
     logger,
 ) -> tuple[np.ndarray, int]:
@@ -488,7 +490,7 @@ def build_grm_packed_bed(
     )
     stream_t0 = time.monotonic()
     process = psutil.Process()
-    mem_tick_span = max(1, 10 * int(chunk_size))
+    mem_tick_span = max(1, 10 * int(block_rows))
     last_done = 0
 
     def _progress_cb(done: int, _total: int) -> None:
@@ -501,41 +503,25 @@ def build_grm_packed_bed(
             mem = process.memory_info().rss / 1024**3
             pbar.set_postfix(memory=f"{mem:.2f} GB")
 
-    prev_block_target = os.environ.get("JX_GRM_BLOCK_TARGET_MB")
     prev_stage_timing = os.environ.get("JX_GRM_PACKED_STAGE_TIMING")
-    block_target_set = False
     stage_timing_set = False
-    if block_target_mb is not None:
-        try:
-            bt = float(block_target_mb)
-        except Exception:
-            logger.warning(
-                f"Invalid --block-target-mb={block_target_mb}; fallback to runtime default."
-            )
-        else:
-            if np.isfinite(bt) and bt > 0:
-                os.environ["JX_GRM_BLOCK_TARGET_MB"] = f"{bt:.6g}"
-                block_target_set = True
-            else:
-                logger.warning(
-                    f"Non-positive --block-target-mb={block_target_mb}; fallback to runtime default."
-                )
     if bool(stage_timing):
         os.environ["JX_GRM_PACKED_STAGE_TIMING"] = "1"
         stage_timing_set = True
 
     try:
         try:
-            grm_raw, eff_m, packed_n = _grm_packed_bed_f32(
-                str(genofile),
-                method=int(method),
-                maf_threshold=float(maf_threshold),
-                max_missing_rate=float(max_missing_rate),
-                block_cols=max(1, int(chunk_size)),
-                threads=max(1, int(threads)),
-                progress_callback=_progress_cb,
-                progress_every=max(1, int(chunk_size)),
-            )
+            with _bed_block_target_env(memory_mb):
+                grm_raw, eff_m, packed_n = _grm_packed_bed_f32(
+                    str(genofile),
+                    method=int(method),
+                    maf_threshold=float(maf_threshold),
+                    max_missing_rate=float(max_missing_rate),
+                    block_cols=max(1, int(block_rows)),
+                    threads=max(1, int(threads)),
+                    progress_callback=_progress_cb,
+                    progress_every=max(1, int(block_rows)),
+                )
             if int(packed_n) != int(n_samples):
                 raise RuntimeError(
                     f"Packed sample count mismatch: packed={int(packed_n)}, expected={int(n_samples)}"
@@ -543,11 +529,6 @@ def build_grm_packed_bed(
             grm = np.ascontiguousarray(np.asarray(grm_raw, dtype=np.float32))
             eff_m = int(eff_m)
         finally:
-            if block_target_set:
-                if prev_block_target is None:
-                    os.environ.pop("JX_GRM_BLOCK_TARGET_MB", None)
-                else:
-                    os.environ["JX_GRM_BLOCK_TARGET_MB"] = prev_block_target
             if stage_timing_set:
                 if prev_stage_timing is None:
                     os.environ.pop("JX_GRM_PACKED_STAGE_TIMING", None)
@@ -806,16 +787,10 @@ def main(log: bool = True):
              "(default: %(default)s).",
     )
     optional_group.add_argument(
-        "-chunksize", "--chunksize", type=int, default=100_000,
-        help="Number of SNPs per chunk for memmap GRM "
-             "(default: %(default)s).",
-    )
-    optional_group.add_argument(
-        "--block-target-mb", type=float, default=None,
+        "-memory", "--memory", type=float, default=DEFAULT_BED_MEMORY_MB,
         help=(
-            "Target temporary working-set size (MB) for the selected BED GRM backend "
-            "auto block tuning. Larger values may improve compute utilization at the "
-            "cost of memory."
+            "Target decode working-set size in MB for BED memmap/packed kernels "
+            "(default: %(default)s)."
         ),
     )
     optional_group.add_argument(
@@ -824,10 +799,6 @@ def main(log: bool = True):
             "Print stage timing breakdown (decode/GEMM/other) from the selected "
             "Rust BED GRM backend."
         ),
-    )
-    optional_group.add_argument(
-        "-mmap-limit", "--mmap-limit", action="store_true", default=False,
-        help="Enable windowed mmap for BED inputs (default backend; auto: 2x chunk size).",
     )
     optional_group.add_argument(
         "-npy", "--npy", action="store_true", default=False,
@@ -927,12 +898,10 @@ def main(log: bool = True):
                 ("Sparse GRM cutoff", "disabled" if args.sparse is None else args.sparse),
                 ("MAF threshold", args.maf),
                 ("Missing rate", args.geno),
-                ("Chunk size", args.chunksize),
-                ("Block target MB", "backend-default" if args.block_target_mb is None else args.block_target_mb),
+                ("Memory MB", args.memory),
                 ("Stage timing", bool(args.stage_timing or spgrm_timing_enabled)),
                 ("Threads", f"{args.thread} ({detected_threads} available)"),
                 ("BED backend", bed_backend_policy),
-                ("Mmap limit flag", args.mmap_limit),
                 ("Save as NPY", args.npy),
             ]
         )
@@ -1064,15 +1033,20 @@ def main(log: bool = True):
     # Defaults match GWAS; can be overridden via CLI.
     maf_threshold = args.maf
     max_missing_rate = args.geno
-    chunk_size = int(args.chunksize)
-    mmap_limit_effective = bool(args.mmap_limit or _is_plink_prefix_path(str(grm_input)))
-    if mmap_limit_effective and (not bool(args.mmap_limit)):
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug("GRM backend policy: memmap (default).")
-    mmap_window_mb = (
-        auto_mmap_window_mb(grm_input, n_samples, n_snps, chunk_size)
-        if mmap_limit_effective else None
+    memory_mb = _normalize_memory_mb(args.memory)
+    stream_block_rows = _decode_block_rows_from_memory_mb(
+        n_samples,
+        n_snps,
+        memory_mb,
+        streaming=True,
     )
+    packed_block_rows = _decode_block_rows_from_memory_mb(
+        n_samples,
+        n_snps,
+        memory_mb,
+        streaming=False,
+    )
+    mmap_window_mb = auto_mmap_window_mb(grm_input, n_samples, n_snps, memory_mb)
 
     if args.sparse is not None:
         sparse_cutoff = float(args.sparse)
@@ -1096,10 +1070,10 @@ def main(log: bool = True):
             kinship_cutoff=sparse_cutoff,
             maf_threshold=maf_threshold,
             max_missing_rate=max_missing_rate,
-            chunk_size=chunk_size,
+            chunk_size=stream_block_rows,
             mmap_window_mb=mmap_window_mb,
             threads=int(args.thread),
-            block_target_mb=args.block_target_mb,
+            block_target_mb=memory_mb,
             stage_timing=bool(args.stage_timing),
             logger=logger,
         )
@@ -1139,10 +1113,7 @@ def main(log: bool = True):
         dense_saved_direct = False
 
         if selected_backend == "memmap-bed":
-            if args.block_target_mb is not None:
-                logger.info(
-                    f"Memmap GRM block target override: {float(args.block_target_mb):.6g} MB."
-                )
+            logger.info(f"GRM decode memory target: {float(memory_mb):.6g} MB.")
             if bool(args.stage_timing):
                 logger.info("Memmap GRM stage timing is enabled (decode/GEMM/other).")
             try:
@@ -1155,10 +1126,10 @@ def main(log: bool = True):
                         method=args.method,
                         maf_threshold=maf_threshold,
                         max_missing_rate=max_missing_rate,
-                        chunk_size=chunk_size,
+                        block_rows=stream_block_rows,
                         mmap_window_mb=mmap_window_mb,
                         threads=int(args.thread),
-                        block_target_mb=args.block_target_mb,
+                        memory_mb=memory_mb,
                         stage_timing=bool(args.stage_timing),
                         logger=logger,
                     )
@@ -1172,10 +1143,10 @@ def main(log: bool = True):
                         method=args.method,
                         maf_threshold=maf_threshold,
                         max_missing_rate=max_missing_rate,
-                        chunk_size=chunk_size,
+                        block_rows=stream_block_rows,
                         mmap_window_mb=mmap_window_mb,
                         threads=int(args.thread),
-                        block_target_mb=args.block_target_mb,
+                        memory_mb=memory_mb,
                         stage_timing=bool(args.stage_timing),
                         logger=logger,
                     )
@@ -1191,9 +1162,9 @@ def main(log: bool = True):
                     method=args.method,
                     maf_threshold=maf_threshold,
                     max_missing_rate=max_missing_rate,
-                    chunk_size=chunk_size,
+                    block_rows=packed_block_rows,
                     threads=int(args.thread),
-                    block_target_mb=args.block_target_mb,
+                    memory_mb=memory_mb,
                     stage_timing=bool(args.stage_timing),
                     logger=logger,
                 )
@@ -1206,9 +1177,9 @@ def main(log: bool = True):
                 method=args.method,
                 maf_threshold=maf_threshold,
                 max_missing_rate=max_missing_rate,
-                chunk_size=chunk_size,
+                block_rows=packed_block_rows,
                 threads=int(args.thread),
-                block_target_mb=args.block_target_mb,
+                memory_mb=memory_mb,
                 stage_timing=bool(args.stage_timing),
                 logger=logger,
             )

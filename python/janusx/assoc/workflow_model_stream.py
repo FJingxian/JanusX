@@ -62,6 +62,14 @@ _WARNED_BED_MMAP_LIMIT_LEGACY = False
 _WARNED_BED_PREPARED_SNPS_ONLY_LEGACY = False
 
 
+def _current_bed_memory_mb() -> float:
+    try:
+        mb = float(os.environ.get("JX_BED_BLOCK_TARGET_MB", "512"))
+    except Exception:
+        return 512.0
+    return mb if np.isfinite(mb) and mb > 0.0 else 512.0
+
+
 def _stream_site_parts(site: object) -> tuple[str, int, str, str]:
     chrom = str(getattr(site, "chrom", "."))
     try:
@@ -304,7 +312,7 @@ def run_chunked_gwas_lmm_lm(
                 logger,
                 logging.INFO,
                 "LM route: using rust single-entry BED streaming pipeline "
-                "(mmap window supported by default memmap backend; --mmap-limit keeps this explicit).",
+                "(mmap window handled automatically by the default memmap backend).",
             )
             run_lm_stream_bed_single_entry(
                 genofile=genofile,
@@ -783,7 +791,7 @@ def run_chunked_gwas_lmm_lm(
         tmp_tsv = _gwas_result_tmp_path(out_tsv)
         wrote_header = False
         mmap_window_mb = (
-            auto_mmap_window_mb(genofile, len(ids), n_snps, model_chunk_size)
+            auto_mmap_window_mb(genofile, len(ids), n_snps, _current_bed_memory_mb())
             if mmap_limit else None
         )
 
@@ -1095,6 +1103,8 @@ def run_chunked_gwas_lmm_lm(
                     if done_snps > pbar_last_done:
                         pbar.update(int(done_snps - pbar_last_done))
                     pbar.finish()
+                    pbar.close(show_done=False)
+                    pbar = None
             else:
                 ex = cf.ThreadPoolExecutor(max_workers=workers)
                 try:
@@ -1302,7 +1312,7 @@ def run_chunked_gwas_lmm_lm(
 
         _run_result_write_with_status(
             lambda: _finalize_gwas_result_tsv(tmp_tsv, out_tsv, genofile, logger=logger),
-            use_spinner=bool(use_spinner),
+            use_spinner=False,
             emit_done_line=False,
         )
         saved_paths.append(str(out_tsv))
@@ -1935,7 +1945,7 @@ def run_chunked_gwas_streaming_shared(
             f"(n={int(n_idv)}).",
         )
     mmap_window_mb = (
-        auto_mmap_window_mb(genofile, len(ids), n_snps, model_chunk_size)
+        auto_mmap_window_mb(genofile, len(ids), n_snps, _current_bed_memory_mb())
         if mmap_limit else None
     )
     sample_sub = trait_ids
@@ -2200,7 +2210,7 @@ def run_chunked_gwas_streaming_shared(
         if has_results:
             _run_result_write_with_status(
                 lambda: _finalize_gwas_result_tsv(tmp_tsv, out_tsv, genofile, logger=logger),
-                use_spinner=bool(use_spinner),
+                use_spinner=False,
                 emit_done_line=False,
             )
             saved_paths.append(str(out_tsv))

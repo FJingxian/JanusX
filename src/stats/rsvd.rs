@@ -20,6 +20,9 @@ use crate::bedmath::{
 use crate::blas::{
     cblas_sgemm_dispatch, BlasThreadGuard, CblasInt, CBLAS_NO_TRANS, CBLAS_ROW_MAJOR, CBLAS_TRANS,
 };
+use crate::gfcore::{
+    block_rows_from_memory_target_mb, parse_positive_env_f64, parse_positive_env_usize,
+};
 use crate::pipeline::run_double_buffer;
 use crate::stats_common::get_cached_pool;
 
@@ -123,20 +126,6 @@ fn align_rsvd_rows(rows: usize, max_rows: usize) -> usize {
 }
 
 #[inline]
-fn parse_positive_env_usize(keys: &[&str]) -> Option<usize> {
-    for &key in keys {
-        if let Ok(v) = std::env::var(key) {
-            if let Ok(parsed) = v.trim().parse::<usize>() {
-                if parsed > 0 {
-                    return Some(parsed);
-                }
-            }
-        }
-    }
-    None
-}
-
-#[inline]
 fn env_truthy_local(name: &str) -> bool {
     std::env::var(name)
         .ok()
@@ -180,9 +169,14 @@ fn rsvd_blas_threads(total_threads: usize, decode_threads: usize, overlap_enable
 
 #[inline]
 fn rows_from_target_mb(target_mb: usize, n_cols: usize, max_rows: usize) -> usize {
-    let bytes_per_row = n_cols.max(1).saturating_mul(std::mem::size_of::<f32>());
-    let target_bytes = target_mb.saturating_mul(1024 * 1024);
-    let raw_rows = (target_bytes / bytes_per_row).max(1);
+    let raw_rows = block_rows_from_memory_target_mb(
+        target_mb as f64,
+        n_cols.max(1).saturating_mul(std::mem::size_of::<f32>()),
+        max_rows.max(1),
+        1,
+        1,
+        0,
+    );
     align_rsvd_rows(raw_rows, max_rows)
 }
 
@@ -314,9 +308,13 @@ pub(crate) fn rsvd_block_rows_env(n_cols: usize, max_rows: usize) -> usize {
     {
         return align_rsvd_rows(rows, max_rows);
     }
-    if let Some(target_mb) = parse_positive_env_usize(&["JANUSX_RSVD_BLOCK_MB", "JX_RSVD_BLOCK_MB"])
-    {
-        return rows_from_target_mb(target_mb, n_cols, max_rows);
+    if let Some(target_mb) = parse_positive_env_f64(&[
+        "JANUSX_RSVD_BLOCK_MB",
+        "JX_RSVD_BLOCK_MB",
+        "JX_BED_BLOCK_TARGET_MB",
+        "JANUSX_BED_BLOCK_TARGET_MB",
+    ]) {
+        return rows_from_target_mb(target_mb as usize, n_cols, max_rows);
     }
     let cap_rows = max_rows.min(4096).max(1);
     let mut heuristic = rows_from_target_mb(64, n_cols, max_rows).min(cap_rows);

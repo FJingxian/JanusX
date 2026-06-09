@@ -481,7 +481,7 @@ def _run_fastplot_with_status(
     xlabel: str,
     outpdf: str,
     use_spinner: bool = False,
-    emit_done_line: bool = True,
+    emit_done_line: bool = False,
 ) -> float:
     viz_t0 = time.time()
     if bool(use_spinner):
@@ -505,7 +505,7 @@ def _run_fastplot_from_tsv_with_status(
     xlabel: str,
     outpdf: str,
     use_spinner: bool = False,
-    emit_done_line: bool = True,
+    emit_done_line: bool = False,
 ) -> float:
     viz_t0 = time.time()
     if bool(use_spinner):

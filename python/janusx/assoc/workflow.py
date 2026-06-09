@@ -82,6 +82,7 @@ except Exception:
 import psutil
 import janusx as jx_pkg
 from janusx.gfreader import (
+    calc_decode_block_rows_from_memory_mb,
     load_genotype_chunks,
     inspect_genotype_file,
     auto_mmap_window_mb,
@@ -120,6 +121,8 @@ from janusx.script._common.threads import (
     runtime_thread_stage,
     require_openblas_by_default,
 )
+
+DEFAULT_BED_MEMORY_MB = 512.0
 from janusx.script._common.genocache import configure_genotype_cache_from_out
 from janusx.script._common.genoio import (
     basename_only as _basename_only,
@@ -1952,6 +1955,7 @@ def build_grm_streaming(
     chunk_size: int,
     method: int,
     mmap_window_mb: Union[int , None],
+    memory_mb: float,
     threads: int,
     logger,
     use_spinner: bool = False,
@@ -2014,88 +2018,62 @@ def build_grm_streaming(
         grm: Union[np.ndarray, None] = None
         eff_m = 0
         cache_target = str(cache_write_path).strip() if cache_write_path is not None else ""
-        if backend_kind == "packed-preloaded":
-            pre = preloaded_packed if packed_preload_is_ready(preloaded_packed) else None
-            if not isinstance(pre, dict) or str(pre.get("prefix", "")) != str(packed_prefix):
-                raise RuntimeError(
-                    "Packed preload route selected, but compatible preloaded payload is unavailable."
+        with _bed_block_target_env(memory_mb):
+            if backend_kind == "packed-preloaded":
+                pre = preloaded_packed if packed_preload_is_ready(preloaded_packed) else None
+                if not isinstance(pre, dict) or str(pre.get("prefix", "")) != str(packed_prefix):
+                    raise RuntimeError(
+                        "Packed preload route selected, but compatible preloaded payload is unavailable."
+                    )
+                packed_ctx_obj = pre.get("packed_ctx")
+                if not isinstance(packed_ctx_obj, dict):
+                    raise RuntimeError("Packed preload route selected without a valid packed_ctx.")
+                packed_pre = np.ascontiguousarray(
+                    np.asarray(packed_ctx_obj["packed"], dtype=np.uint8),
+                    dtype=np.uint8,
                 )
-            packed_ctx_obj = pre.get("packed_ctx")
-            if not isinstance(packed_ctx_obj, dict):
-                raise RuntimeError("Packed preload route selected without a valid packed_ctx.")
-            packed_pre = np.ascontiguousarray(
-                np.asarray(packed_ctx_obj["packed"], dtype=np.uint8),
-                dtype=np.uint8,
-            )
-            maf_pre = np.ascontiguousarray(
-                np.asarray(packed_ctx_obj["maf"], dtype=np.float32).reshape(-1),
-                dtype=np.float32,
-            )
-            row_flip_pre = np.ascontiguousarray(
-                np.asarray(packed_ctx_obj["row_flip"], dtype=np.bool_).reshape(-1),
-                dtype=np.bool_,
-            )
-            packed_n_pre = int(packed_ctx_obj["n_samples"])
-            if packed_n_pre != int(n_samples):
-                raise RuntimeError(
-                    "Preloaded packed sample count mismatch: "
-                    f"packed={packed_n_pre}, expected={int(n_samples)}"
+                maf_pre = np.ascontiguousarray(
+                    np.asarray(packed_ctx_obj["maf"], dtype=np.float32).reshape(-1),
+                    dtype=np.float32,
                 )
-            if int(packed_pre.shape[0]) != int(maf_pre.shape[0]) or int(
-                packed_pre.shape[0]
-            ) != int(row_flip_pre.shape[0]):
-                raise RuntimeError(
-                    "Preloaded packed metadata mismatch: "
-                    f"packed_rows={packed_pre.shape[0]}, maf={maf_pre.shape[0]}, row_flip={row_flip_pre.shape[0]}"
+                row_flip_pre = np.ascontiguousarray(
+                    np.asarray(packed_ctx_obj["row_flip"], dtype=np.bool_).reshape(-1),
+                    dtype=np.bool_,
                 )
-            _log_file_only(
-                logger,
-                logging.INFO,
-                "Packed GRM: reusing preloaded packed payload (skip BED repack).",
-            )
-            grm_raw = jxrs.grm_packed_f32(
-                packed_pre,
-                int(packed_n_pre),
-                row_flip_pre,
-                maf_pre,
-                sample_indices=None,
-                method=int(method),
-                block_cols=max(1, int(chunk_size)),
-                threads=max(1, int(threads)),
-                progress_callback=_on_packed_progress,
-                progress_every=max(1, int(chunk_size)),
-            )
-            eff_m = int(packed_pre.shape[0])
-        elif backend_kind == "packed-bed":
-            grm_raw, eff_m_raw, packed_n_raw = jxrs.grm_packed_bed_f32(
-                str(packed_prefix),
-                method=int(method),
-                maf_threshold=float(maf_threshold),
-                max_missing_rate=float(max_missing_rate),
-                block_cols=max(1, int(chunk_size)),
-                threads=max(1, int(threads)),
-                progress_callback=_on_packed_progress,
-                progress_every=max(1, int(chunk_size)),
-            )
-            packed_n = int(packed_n_raw)
-            if packed_n != int(n_samples):
-                raise RuntimeError(
-                    f"Packed sample count mismatch: packed={packed_n}, expected={int(n_samples)}"
-                )
-            eff_m = int(eff_m_raw)
-        else:
-            two_stage_raw = str(os.environ.get("JX_GRM_STREAM_TWO_STAGE", "")).strip().lower()
-            if two_stage_raw in {"1", "true", "yes", "on"}:
+                packed_n_pre = int(packed_ctx_obj["n_samples"])
+                if packed_n_pre != int(n_samples):
+                    raise RuntimeError(
+                        "Preloaded packed sample count mismatch: "
+                        f"packed={packed_n_pre}, expected={int(n_samples)}"
+                    )
+                if int(packed_pre.shape[0]) != int(maf_pre.shape[0]) or int(
+                    packed_pre.shape[0]
+                ) != int(row_flip_pre.shape[0]):
+                    raise RuntimeError(
+                        "Preloaded packed metadata mismatch: "
+                        f"packed_rows={packed_pre.shape[0]}, maf={maf_pre.shape[0]}, row_flip={row_flip_pre.shape[0]}"
+                    )
                 _log_file_only(
                     logger,
                     logging.INFO,
-                    "GRM memmap-bed note: JX_GRM_STREAM_TWO_STAGE=1 is enabled; "
-                    "memmap entry may internally switch to packed prebuild mode.",
+                    "Packed GRM: reusing preloaded packed payload (skip BED repack).",
                 )
-            if stream_direct_cache:
-                eff_m_raw, stream_n_raw = jxrs.grm_stream_bed_f32_to_npy(
+                grm_raw = jxrs.grm_packed_f32(
+                    packed_pre,
+                    int(packed_n_pre),
+                    row_flip_pre,
+                    maf_pre,
+                    sample_indices=None,
+                    method=int(method),
+                    block_cols=max(1, int(chunk_size)),
+                    threads=max(1, int(threads)),
+                    progress_callback=_on_packed_progress,
+                    progress_every=max(1, int(chunk_size)),
+                )
+                eff_m = int(packed_pre.shape[0])
+            elif backend_kind == "packed-bed":
+                grm_raw, eff_m_raw, packed_n_raw = jxrs.grm_packed_bed_f32(
                     str(packed_prefix),
-                    str(cache_target),
                     method=int(method),
                     maf_threshold=float(maf_threshold),
                     max_missing_rate=float(max_missing_rate),
@@ -2103,37 +2081,64 @@ def build_grm_streaming(
                     threads=max(1, int(threads)),
                     progress_callback=_on_packed_progress,
                     progress_every=max(1, int(chunk_size)),
-                    mmap_window_mb=(int(mmap_window_mb) if mmap_window_mb is not None else None),
                 )
-                stream_n = int(stream_n_raw)
-                if stream_n != int(n_samples):
+                packed_n = int(packed_n_raw)
+                if packed_n != int(n_samples):
                     raise RuntimeError(
-                        f"Memmap sample count mismatch: memmap={stream_n}, expected={int(n_samples)}"
+                        f"Packed sample count mismatch: packed={packed_n}, expected={int(n_samples)}"
                     )
                 eff_m = int(eff_m_raw)
-                # Keep cache writer output on disk only; caller will atomically
-                # move tmp -> final path and then reopen the final cache.
-                # This avoids holding a memmap handle on tmp cache files, which
-                # can block os.replace on Windows (WinError 32).
-                grm = np.empty((0, 0), dtype=np.float32)
             else:
-                grm_raw, eff_m_raw, stream_n_raw = jxrs.grm_stream_bed_f32(
-                    str(packed_prefix),
-                    method=int(method),
-                    maf_threshold=float(maf_threshold),
-                    max_missing_rate=float(max_missing_rate),
-                    block_cols=max(1, int(chunk_size)),
-                    threads=max(1, int(threads)),
-                    progress_callback=_on_packed_progress,
-                    progress_every=max(1, int(chunk_size)),
-                    mmap_window_mb=(int(mmap_window_mb) if mmap_window_mb is not None else None),
-                )
-                stream_n = int(stream_n_raw)
-                if stream_n != int(n_samples):
-                    raise RuntimeError(
-                        f"Memmap sample count mismatch: memmap={stream_n}, expected={int(n_samples)}"
+                two_stage_raw = str(os.environ.get("JX_GRM_STREAM_TWO_STAGE", "")).strip().lower()
+                if two_stage_raw in {"1", "true", "yes", "on"}:
+                    _log_file_only(
+                        logger,
+                        logging.INFO,
+                        "GRM memmap-bed note: JX_GRM_STREAM_TWO_STAGE=1 is enabled; "
+                        "memmap entry may internally switch to packed prebuild mode.",
                     )
-                eff_m = int(eff_m_raw)
+                if stream_direct_cache:
+                    eff_m_raw, stream_n_raw = jxrs.grm_stream_bed_f32_to_npy(
+                        str(packed_prefix),
+                        str(cache_target),
+                        method=int(method),
+                        maf_threshold=float(maf_threshold),
+                        max_missing_rate=float(max_missing_rate),
+                        block_cols=max(1, int(chunk_size)),
+                        threads=max(1, int(threads)),
+                        progress_callback=_on_packed_progress,
+                        progress_every=max(1, int(chunk_size)),
+                        mmap_window_mb=(int(mmap_window_mb) if mmap_window_mb is not None else None),
+                    )
+                    stream_n = int(stream_n_raw)
+                    if stream_n != int(n_samples):
+                        raise RuntimeError(
+                            f"Memmap sample count mismatch: memmap={stream_n}, expected={int(n_samples)}"
+                        )
+                    eff_m = int(eff_m_raw)
+                    # Keep cache writer output on disk only; caller will atomically
+                    # move tmp -> final path and then reopen the final cache.
+                    # This avoids holding a memmap handle on tmp cache files, which
+                    # can block os.replace on Windows (WinError 32).
+                    grm = np.empty((0, 0), dtype=np.float32)
+                else:
+                    grm_raw, eff_m_raw, stream_n_raw = jxrs.grm_stream_bed_f32(
+                        str(packed_prefix),
+                        method=int(method),
+                        maf_threshold=float(maf_threshold),
+                        max_missing_rate=float(max_missing_rate),
+                        block_cols=max(1, int(chunk_size)),
+                        threads=max(1, int(threads)),
+                        progress_callback=_on_packed_progress,
+                        progress_every=max(1, int(chunk_size)),
+                        mmap_window_mb=(int(mmap_window_mb) if mmap_window_mb is not None else None),
+                    )
+                    stream_n = int(stream_n_raw)
+                    if stream_n != int(n_samples):
+                        raise RuntimeError(
+                            f"Memmap sample count mismatch: memmap={stream_n}, expected={int(n_samples)}"
+                        )
+                    eff_m = int(eff_m_raw)
 
         if grm is None:
             grm = np.ascontiguousarray(np.asarray(grm_raw, dtype=np.float32))
@@ -2154,8 +2159,8 @@ def load_or_build_grm_with_cache(
     max_missing_rate: float,
     het_threshold: float,
     chunk_size: int,
+    memory_mb: float,
     threads: int,
-    mmap_limit: bool,
     logger:logging.Logger,
     use_spinner: bool = False,
     ids_preloaded: Union[np.ndarray, None] = None,
@@ -2306,8 +2311,9 @@ def load_or_build_grm_with_cache(
                     chunk_size=chunk_size,
                     method=method_int,
                     mmap_window_mb=auto_mmap_window_mb(
-                        genofile_for_grm, n_samples, n_snps, chunk_size
-                    ) if mmap_limit else None,
+                        genofile_for_grm, n_samples, n_snps, float(memory_mb)
+                    ),
+                    memory_mb=float(memory_mb),
                     threads=threads,
                     logger=logger,
                     use_spinner=use_spinner,
@@ -2443,6 +2449,7 @@ def build_pcs_from_genotype_rsvd(
     maf_threshold: float,
     max_missing_rate: float,
     chunk_size: int,
+    memory_mb: float,
     snps_only: bool,
     threads: int = 1,
     use_spinner: bool = False,
@@ -2529,7 +2536,7 @@ def build_pcs_from_genotype_rsvd(
         rsvd_input,
         int(samples.shape[0]),
         int(algo_snp),
-        int(chunk_size),
+        float(memory_mb),
     )
     with runtime_thread_stage(rayon_threads=int(threads_use)):
         with CliStatus(
@@ -2538,18 +2545,19 @@ def build_pcs_from_genotype_rsvd(
             use_process=True,
         ) as task:
             try:
-                _eval_raw, evec_raw = jxrs.admx_rsvd_stream_sample(
-                    str(rsvd_input),
-                    int(dim_use),
-                    42,
-                    3,
-                    1e-1,
-                    bool(snps_only),
-                    float(maf_threshold),
-                    float(max_missing_rate),
-                    None,
-                    int(mmap_window_mb),
-                )
+                with _bed_block_target_env(float(memory_mb)):
+                    _eval_raw, evec_raw = jxrs.admx_rsvd_stream_sample(
+                        str(rsvd_input),
+                        int(dim_use),
+                        42,
+                        3,
+                        1e-1,
+                        bool(snps_only),
+                        float(maf_threshold),
+                        float(max_missing_rate),
+                        None,
+                        int(mmap_window_mb),
+                    )
             except Exception:
                 task.fail("Calculating PCs via RSVD stream ...Failed")
                 raise
@@ -2574,6 +2582,7 @@ def load_or_build_q_with_cache(
     max_missing_rate: float,
     het_threshold: float,
     chunk_size: int,
+    memory_mb: float,
     snps_only: bool,
     threads: int,
     logger,
@@ -2647,6 +2656,7 @@ def load_or_build_q_with_cache(
                         maf_threshold=float(maf_threshold),
                         max_missing_rate=float(max_missing_rate),
                         chunk_size=int(chunk_size),
+                        memory_mb=float(memory_mb),
                         snps_only=bool(snps_only),
                         threads=int(threads),
                         use_spinner=bool(use_spinner),
@@ -2740,12 +2750,11 @@ def prepare_streaming_context(
     max_missing_rate: float,
     genetic_model: str,
     het_threshold: float,
-    chunk_size: int,
+    memory_mb: float,
     mgrm: str,
     pcdim: str,
     cov_inputs: Union[str, list[str], None],
     threads: int,
-    mmap_limit: bool,
     require_kinship: bool,
     logger,
     use_spinner: bool = False,
@@ -2791,6 +2800,12 @@ def prepare_streaming_context(
             if _is_cache_warning_message(msg):
                 deferred_cache_warnings.append(msg)
     n_samples = len(ids)
+    chunk_size = _resolve_bed_block_rows_from_memory(
+        float(memory_mb),
+        int(n_samples),
+        int(n_snps),
+        streaming=True,
+    )
     _log_info(
         logger,
         f"Genotype meta: {n_samples} samples, {n_snps} SNPs.",
@@ -2953,8 +2968,8 @@ def prepare_streaming_context(
                 max_missing_rate=max_missing_rate,
                 het_threshold=het_threshold,
                 chunk_size=chunk_size,
+                memory_mb=float(memory_mb),
                 threads=threads,
-                mmap_limit=mmap_limit,
                 logger=logger,
                 use_spinner=use_spinner,
                 ids_preloaded=ids,
@@ -2987,6 +3002,7 @@ def prepare_streaming_context(
             max_missing_rate=max_missing_rate,
             het_threshold=het_threshold,
             chunk_size=chunk_size,
+            memory_mb=float(memory_mb),
             snps_only=bool(snps_only),
             threads=int(threads),
             logger=logger,
@@ -3520,6 +3536,45 @@ def _resolve_lrlmm_rank(rank_opt: Union[int, None], n_samples: int) -> int:
     return max(1, min(int(rank_opt), n))
 
 
+def _normalize_bed_memory_mb(memory_mb: Union[int, float, None]) -> float:
+    if memory_mb is None:
+        return float(DEFAULT_BED_MEMORY_MB)
+    mb = float(memory_mb)
+    if (not np.isfinite(mb)) or mb <= 0.0:
+        raise ValueError(f"--memory must be a finite value > 0, got {memory_mb}")
+    return float(mb)
+
+
+def _resolve_bed_block_rows_from_memory(
+    memory_mb: Union[int, float],
+    n_samples: int,
+    n_snps_hint: int,
+    *,
+    streaming: bool,
+) -> int:
+    rows = calc_decode_block_rows_from_memory_mb(
+        int(n_samples),
+        float(memory_mb),
+        buffers=(2 if streaming else 1),
+        max_rows=max(1, int(n_snps_hint)),
+    )
+    return max(1, int(rows if rows is not None else 1))
+
+
+@contextmanager
+def _bed_block_target_env(memory_mb: Union[int, float, None]):
+    prev = os.environ.get("JX_BED_BLOCK_TARGET_MB")
+    if memory_mb is not None:
+        os.environ["JX_BED_BLOCK_TARGET_MB"] = f"{float(memory_mb):.6g}"
+    try:
+        yield
+    finally:
+        if prev is None:
+            os.environ.pop("JX_BED_BLOCK_TARGET_MB", None)
+        else:
+            os.environ["JX_BED_BLOCK_TARGET_MB"] = prev
+
+
 def _resolve_stream_scan_chunk_size(
     chunk_size: int,
     n_snps_hint: int,
@@ -3536,7 +3591,7 @@ def _resolve_stream_scan_chunk_size(
     ------
     - Respect user-provided chunk size strictly.
     - For LM streaming with small sample size, auto-grow chunk size when
-      user did not pass --chunksize, so per-chunk compute is large enough to
+      user did not pass --memory, so per-chunk compute is large enough to
       amortize Python orchestration and file-write overhead.
     """
     _ = bool(use_spinner)
@@ -4526,7 +4581,6 @@ def run_lrlmm_packed(
                         if int(gwas_last_done) < int(max(1, gwas_total)):
                             gwas_pbar.update(int(max(1, gwas_total)) - int(gwas_last_done))
                         gwas_pbar.finish()
-                        time.sleep(0.05)
                 except Exception:
                     pass
                 gwas_pbar.close(show_done=False)
@@ -4591,6 +4645,7 @@ def run_lrlmm_packed(
                 xlabel=str(pname),
                 outpdf=out_svg,
                 use_spinner=bool(use_spinner),
+                emit_done_line=False,
             )
 
         cast_map: dict[str, object] = {"pwald": "object", "pos": int}
@@ -4605,7 +4660,7 @@ def run_lrlmm_packed(
             res_df.to_csv(out_tsv, sep="\t", float_format="%.4f", index=None)
         _run_result_write_with_status(
             _write_lrlmm,
-            use_spinner=bool(use_spinner),
+            use_spinner=False,
             emit_done_line=False,
         )
         saved_paths.append(str(out_tsv))
@@ -5230,7 +5285,7 @@ def _run_file_dense_fast_once(
 
             _run_result_write_with_status(
                 _write_dense_result,
-                use_spinner=bool(use_spinner),
+                use_spinner=False,
                 emit_done_line=False,
             )
             saved_paths.append(str(out_tsv))
@@ -5560,13 +5615,11 @@ def parse_args(argv: Optional[list[str]] = None):
         ),
     )
     optional_group.add_argument(
-        "-chunksize", "--chunksize", type=int, default=10_000,
-        help="Number of SNPs per chunk for memmap LMM/LM and RSVD mmap sizing "
-             "(affects GRM and GWAS; default: %(default)s).",
-    )
-    optional_group.add_argument(
-        "-mmap-limit", "--mmap-limit", action="store_true", default=False,
-        help="Enable windowed mmap for BED inputs (auto: 2x chunk size).",
+        "-memory", "--memory", type=float, default=DEFAULT_BED_MEMORY_MB,
+        help=(
+            "Target decode working-set size in MB for BED memmap/packed kernels "
+            "(affects GRM, GWAS scan blocks, and RSVD; default: %(default)s)."
+        ),
     )
     optional_group.add_argument(
         "-fast", "--fast", action="store_true", default=False,
@@ -5653,7 +5706,11 @@ def parse_args(argv: Optional[list[str]] = None):
         )
     except ValueError as e:
         parser.error(str(e))
-    args._chunksize_user_set = bool(_option_present(argv, "-chunksize", "--chunksize"))
+    args.memory = _normalize_bed_memory_mb(getattr(args, "memory", DEFAULT_BED_MEMORY_MB))
+    args._memory_user_set = bool(_option_present(argv, "-memory", "--memory"))
+    args._chunksize_user_set = bool(args._memory_user_set)
+    args.mmap_limit = False
+    args.chunksize = 10_000
     return args
 
 
@@ -5787,7 +5844,6 @@ def _run_gwas_pipeline(
             ("Genotype file", gfile),
             ("Phenotype file", args.pheno),
             ("Phenotype cols", args.ncol if args.ncol is not None else "All"),
-            ("Mmap limit", args.mmap_limit),
             ("BED backend", bed_backend_policy),
             ("Fast mode", cli_fast_mode),
             ("Models", " ".join(model_tokens) if len(model_tokens) > 0 else "None"),
@@ -5797,7 +5853,7 @@ def _run_gwas_pipeline(
             ("Q option", args.qcov),
             ("MAF threshold", args.maf),
             ("Miss threshold", args.geno),
-            ("Chunk size", args.chunksize),
+            ("Memory MB", args.memory),
         ]
         if args.model != "add":
             cfg_rows.append(("Het filter", f"{args.het} (keep [{args.het}, {1.0 - args.het}])"))
@@ -5867,7 +5923,7 @@ def _run_gwas_pipeline(
 
     input_is_bed = _as_plink_prefix(gfile) is not None
     memmap_mode = not bool(fast_mode)
-    mmap_limit_effective = bool(args.mmap_limit or memmap_mode)
+    mmap_limit_effective = bool(memmap_mode)
     _log_file_only(
         logger,
         logging.INFO,
@@ -5881,7 +5937,7 @@ def _run_gwas_pipeline(
             )
         ),
     )
-    if memmap_mode and (not bool(args.mmap_limit)):
+    if memmap_mode:
         _log_file_only(
             logger,
             logging.INFO,
@@ -5950,6 +6006,7 @@ def _run_gwas_pipeline(
                 logging.INFO,
                 "FarmCPU selected on FILE matrix input: packed fast mode disabled; using dense float32 path.",
             )
+    os.environ["JX_BED_BLOCK_TARGET_MB"] = f"{float(args.memory):.6g}"
     try:
 
         # --- prepare streaming context once if needed ---
@@ -6119,12 +6176,11 @@ def _run_gwas_pipeline(
                     max_missing_rate=max_missing_rate_scan,
                     genetic_model=args.model,
                     het_threshold=het_threshold_scan,
-                    chunk_size=args.chunksize,
+                    memory_mb=float(args.memory),
                     mgrm=args.grm,
                     pcdim=args.qcov,
                     cov_inputs=args.cov,
                     threads=args.thread,
-                    mmap_limit=mmap_limit_effective,
                     require_kinship=(args.lmm or args.fastlmm or args.fvlmm),
                     logger=logger,
                     use_spinner=use_spinner,
@@ -6133,6 +6189,12 @@ def _run_gwas_pipeline(
                     preload_packed_context=bool(fast_mode),
                     require_bed_stream=bool(stream_selected),
                     post_grm_hook=splmm_post_grm_hook,
+                )
+                args.chunksize = _resolve_bed_block_rows_from_memory(
+                    float(args.memory),
+                    int(len(ids)),
+                    int(n_snps),
+                    streaming=True,
                 )
                 if (
                     bool(fast_mode)

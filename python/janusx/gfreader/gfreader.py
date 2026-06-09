@@ -1008,20 +1008,61 @@ def _prepare_txtlike_input_for_cache(kind: str, prefix: str, src_path: Union[str
     return staged
 
 
+def calc_decode_block_rows_from_memory_mb(
+    n_samples: int,
+    memory_mb: Union[int, float],
+    *,
+    elem_bytes: int = 4,
+    buffers: int = 1,
+    reserve_bytes: int = 0,
+    min_rows: int = 1,
+    max_rows: Union[int, None] = None,
+) -> Union[int, None]:
+    """
+    Convert a memory target (MB) into SNP rows per decode block.
+
+    Mirrors the Rust-side `block_rows_from_memory_target_mb(...)` policy.
+    """
+    if n_samples <= 0 or elem_bytes <= 0 or buffers <= 0:
+        return None
+    try:
+        target_mb = float(memory_mb)
+    except Exception:
+        return None
+    if not np.isfinite(target_mb) or target_mb <= 0.0:
+        return None
+    target_bytes = int(target_mb * 1024.0 * 1024.0)
+    floor_rows = max(1, int(min_rows))
+    max_rows_eff = None if max_rows is None else max(1, int(max_rows))
+    if max_rows_eff is not None:
+        floor_rows = min(floor_rows, max_rows_eff)
+    if target_bytes <= 0:
+        return int(floor_rows)
+    if int(reserve_bytes) >= target_bytes:
+        return int(floor_rows)
+    bytes_per_row = max(1, int(n_samples)) * max(1, int(elem_bytes)) * max(1, int(buffers))
+    usable_bytes = max(0, target_bytes - max(0, int(reserve_bytes)))
+    rows = max(1, usable_bytes // max(1, bytes_per_row))
+    rows = max(int(floor_rows), int(rows))
+    if max_rows_eff is not None:
+        rows = min(rows, max_rows_eff)
+    return int(rows)
+
+
 def calc_mmap_window_mb(
     n_samples: int,
     n_snps: int,
-    chunk_size: int,
+    block_rows: int,
     min_chunks: int = 2,
 ) -> Union[int,None]:
     """
-    Compute a BED mmap window size (MB) to cover at least `min_chunks` chunks.
+    Compute a BED mmap window size (MB) to cover at least `min_chunks` decode blocks.
 
     Returns None when inputs are invalid.
     """
-    if n_samples <= 0 or n_snps <= 0 or chunk_size <= 0:
+    if n_samples <= 0 or n_snps <= 0 or block_rows <= 0:
         return None
-    target_snps = min(n_snps, max(1, min_chunks) * chunk_size)
+    target_snps = min(n_snps, max(1, min_chunks) * block_rows)
     bytes_per_snp = (n_samples + 3) // 4
     required_bytes = max(1, target_snps * bytes_per_snp)
     mb = (required_bytes + (1024 * 1024 - 1)) // (1024 * 1024)
@@ -1032,7 +1073,13 @@ def auto_mmap_window_mb(
     path_or_prefix: str,
     n_samples: int,
     n_snps: int,
-    chunk_size: int,
+    memory_mb: Union[int, float],
+    *,
+    elem_bytes: int = 4,
+    buffers: int = 2,
+    reserve_bytes: int = 0,
+    min_rows: int = 1,
+    max_rows: Union[int, None] = None,
     min_chunks: int = 2,
 ) -> Union[int,None]:
     """
@@ -1041,7 +1088,18 @@ def auto_mmap_window_mb(
     kind, _, _ = _resolve_input(path_or_prefix)
     if kind != "plink":
         return None
-    return calc_mmap_window_mb(n_samples, n_snps, chunk_size, min_chunks=min_chunks)
+    block_rows = calc_decode_block_rows_from_memory_mb(
+        n_samples,
+        memory_mb,
+        elem_bytes=elem_bytes,
+        buffers=buffers,
+        reserve_bytes=reserve_bytes,
+        min_rows=min_rows,
+        max_rows=max_rows,
+    )
+    if block_rows is None:
+        return None
+    return calc_mmap_window_mb(n_samples, n_snps, block_rows, min_chunks=min_chunks)
 
 def bed_chunk_reader(
     prefix: str,

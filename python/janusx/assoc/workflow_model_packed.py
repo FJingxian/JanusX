@@ -78,6 +78,14 @@ _SPLMM_SPARSE_REML_MAX_ITER = 20
 _SPLMM_SPGRM_SINGLE_BLOCK_N_MAX = 2048
 _JXLMM_EXACT_N_MAX = _SPLMM_EXACT_N_MAX
 _JXLMM_SPARSE_NULL_CLIP_EIG_EXACT_N_MAX = _SPLMM_SPARSE_NULL_CLIP_EIG_EXACT_N_MAX
+
+
+def _current_bed_memory_mb() -> float:
+    try:
+        mb = float(os.environ.get("JX_BED_BLOCK_TARGET_MB", "512"))
+    except Exception:
+        return 512.0
+    return mb if np.isfinite(mb) and mb > 0.0 else 512.0
 _JXLMM_KING_THRESHOLD = _SPLMM_KING_THRESHOLD
 _JXLMM_SPARSE_GRM_CUTOFF = _SPLMM_SPARSE_GRM_CUTOFF
 _JXLMM_SPARSE_GRM_METHOD = _SPLMM_SPARSE_GRM_METHOD
@@ -2398,7 +2406,6 @@ def run_fastlmm_packed_fullrank(
             if stage1_pbar is not None:
                 try:
                     stage1_pbar.finish()
-                    time.sleep(0.02)
                 except Exception:
                     pass
                 stage1_pbar.close(show_done=False)
@@ -2408,7 +2415,6 @@ def run_fastlmm_packed_fullrank(
                         if int(gwas_last_done) < int(max(1, gwas_total)):
                             gwas_pbar.update(int(max(1, gwas_total)) - int(gwas_last_done))
                         gwas_pbar.finish()
-                        time.sleep(0.05)
                 except Exception:
                     pass
                 gwas_pbar.close(show_done=False)
@@ -2816,7 +2822,6 @@ def run_lm_packed_fullrank(
                         if int(gwas_last_done) < int(max(1, gwas_total)):
                             gwas_pbar.update(int(max(1, gwas_total)) - int(gwas_last_done))
                         gwas_pbar.finish()
-                        time.sleep(0.05)
                 except Exception:
                     pass
                 gwas_pbar.close(show_done=False)
@@ -2974,7 +2979,7 @@ def run_lm_stream_bed_single_entry(
             user_specified=bool(chunk_size_user_set),
         )
         mmap_window_mb = (
-            auto_mmap_window_mb(genofile, len(ids), n_snps, int(model_chunk_size))
+            auto_mmap_window_mb(genofile, len(ids), n_snps, _current_bed_memory_mb())
             if bool(mmap_limit)
             else None
         )
@@ -3119,7 +3124,6 @@ def run_lm_stream_bed_single_entry(
                         if int(pbar_done) < int(max(1, pbar.total)):
                             pbar.update(int(max(1, pbar.total)) - int(pbar_done))
                         pbar.finish()
-                        time.sleep(0.05)
                 except Exception:
                     pass
                 pbar.close(show_done=False)
@@ -3588,7 +3592,6 @@ def run_lmm_packed_fullrank(
                         if int(gwas_last_done) < int(max(1, gwas_total)):
                             gwas_pbar.update(int(max(1, gwas_total)) - int(gwas_last_done))
                         gwas_pbar.finish()
-                        time.sleep(0.05)
                 except Exception:
                     pass
                 gwas_pbar.close(show_done=False)
@@ -4046,7 +4049,6 @@ def run_algwas_packed_fullrank(
                         if int(gwas_last_done) < int(max(1, gwas_total)):
                             gwas_pbar.update(int(max(1, gwas_total)) - int(gwas_last_done))
                         gwas_pbar.finish()
-                        time.sleep(0.05)
                 except Exception:
                     pass
                 gwas_pbar.close(show_done=False)
@@ -4884,7 +4886,7 @@ def run_splmm_packed_fullrank(
 
             _run_result_write_with_status(
                 _write_jxlmm,
-                use_spinner=bool(use_spinner),
+                use_spinner=False,
                 emit_done_line=False,
             )
         if int(written_rows) != int(n_trait_sites):
@@ -4973,11 +4975,18 @@ def run_splmm_packed_fullrank(
             "pwald=Pr[Chi^2_1>=chisq]; SparseLMM does not currently emit a PLRT/LRT column."
         )
         if _rust_top_level_timing_msg is not None:
-            _emit_plain_info_line(
-                logger,
-                f"SparseLMM: {_rust_top_level_timing_msg}",
-                use_spinner=bool(use_spinner),
-            )
+            if bool(use_spinner):
+                _log_file_only(
+                    logger,
+                    logging.INFO,
+                    f"SparseLMM: {_rust_top_level_timing_msg}",
+                )
+            else:
+                _emit_plain_info_line(
+                    logger,
+                    f"SparseLMM: {_rust_top_level_timing_msg}",
+                    use_spinner=False,
+                )
         if bool(use_spinner):
             _log_file_only(logger, logging.INFO, f"SparseLMM: {_timing_diag_msg}")
             _log_file_only(logger, logging.INFO, f"SparseLMM: {_scan_diag_msg}")
@@ -5075,8 +5084,7 @@ def run_splmm_packed_fullrank(
         )
 
         done_times = [
-            format_elapsed(scan_meta_secs),
-            format_elapsed(null_fit_secs),
+            format_elapsed(null_secs),
             format_elapsed(scan_secs),
         ]
         if plot:

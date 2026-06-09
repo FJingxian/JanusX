@@ -34,6 +34,67 @@ fn system_page_size() -> usize {
     }
 }
 
+#[inline]
+pub(crate) fn parse_positive_env_usize(keys: &[&str]) -> Option<usize> {
+    for &key in keys {
+        if let Ok(v) = std::env::var(key) {
+            if let Ok(parsed) = v.trim().parse::<usize>() {
+                if parsed > 0 {
+                    return Some(parsed);
+                }
+            }
+        }
+    }
+    None
+}
+
+#[inline]
+pub(crate) fn parse_positive_env_f64(keys: &[&str]) -> Option<f64> {
+    for &key in keys {
+        if let Ok(v) = std::env::var(key) {
+            if let Ok(parsed) = v.trim().parse::<f64>() {
+                if parsed.is_finite() && parsed > 0.0 {
+                    return Some(parsed);
+                }
+            }
+        }
+    }
+    None
+}
+
+#[inline]
+pub(crate) fn block_rows_from_memory_target_mb(
+    target_mb: f64,
+    row_bytes: usize,
+    max_rows: usize,
+    min_rows: usize,
+    buffers: usize,
+    reserve_bytes: usize,
+) -> usize {
+    if max_rows == 0 {
+        return 1;
+    }
+    let floor_rows = min_rows.max(1).min(max_rows);
+    if !(target_mb.is_finite() && target_mb > 0.0) {
+        return floor_rows;
+    }
+    let target_bytes_f = target_mb * 1024.0_f64 * 1024.0_f64;
+    if !(target_bytes_f.is_finite() && target_bytes_f > 0.0) {
+        return floor_rows;
+    }
+    let target_bytes = target_bytes_f.min(usize::MAX as f64) as usize;
+    if target_bytes == 0 {
+        return floor_rows;
+    }
+    if reserve_bytes >= target_bytes {
+        return floor_rows;
+    }
+    let bytes_per_row = row_bytes.max(1).saturating_mul(buffers.max(1)).max(1);
+    let usable_bytes = target_bytes.saturating_sub(reserve_bytes);
+    let rows = usable_bytes.saturating_div(bytes_per_row).max(1);
+    rows.max(floor_rows).min(max_rows)
+}
+
 // ---------------------------
 // Variant metadata
 // ---------------------------

@@ -59,6 +59,7 @@ class AssociationConfig:
     threads: int = 0
     chunksize: int = 10000
     mmap_limit: bool = False
+    memory: float = 512.0
     grm: str = "1"
     qcov: int = 0
     model: str = "add"
@@ -94,8 +95,8 @@ class AssociationConfig:
             raise ValueError("geno must be within [0, 1].")
         if not (0.0 <= float(self.het) <= 0.5):
             raise ValueError("het must be within [0, 0.5].")
-        if int(self.chunksize) < 1:
-            raise ValueError("chunksize must be >= 1.")
+        if (not np.isfinite(float(self.memory))) or float(self.memory) <= 0.0:
+            raise ValueError("memory must be a finite value > 0.")
 
     @property
     def is_file_mode(self) -> bool:
@@ -156,13 +157,11 @@ class AssociationConfig:
         argv.extend(["-maf", str(float(self.maf))])
         argv.extend(["-geno", str(float(self.geno))])
         argv.extend(["-het", str(float(self.het))])
-        argv.extend(["-chunksize", str(int(self.chunksize))])
+        argv.extend(["-memory", str(float(self.memory))])
         argv.extend(["-k", str(self.grm)])
         argv.extend(["-q", str(int(self.qcov))])
         if bool(self.snps_only):
             argv.append("-snps-only")
-        if bool(self.mmap_limit):
-            argv.append("-mmap-limit")
 
         out_use = self.out if out_dir is None else out_dir
         argv.extend(["-o", _normalize_path_text(str(out_use))])

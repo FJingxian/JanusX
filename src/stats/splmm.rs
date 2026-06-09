@@ -2327,13 +2327,20 @@ fn splmm_wald_from_scaled_denom(
 
 /// Tiled sparse solve using JanusX's cached thread pool (when available).
 /// `workspaces` are pre-allocated once and reused across blocks.
+///
+/// We intentionally do not use faer's internal Rayon parallelism here.
+/// On SparseLMM exact benchmarks this caused severe regressions
+/// (solve time jumping from tens of seconds to several minutes), so the
+/// stable default remains outer tiled parallelism only.
 #[inline]
 fn sparse_solve_rhs_tiled(
     factor: &SparseJxgrmCholesky,
     rhs_col_major: &mut [f64],
     n_rhs: usize,
+    _full_workspace: &mut SparseJxgrmSolveWorkspace,
     workspaces: &mut [SparseJxgrmSolveWorkspace],
     pool: Option<&rayon::ThreadPool>,
+    _threads: usize,
 ) -> Result<(), String> {
     factor.solve_in_place_tiled(rhs_col_major, n_rhs, workspaces, pool)
 }
@@ -2505,9 +2512,16 @@ fn exact_scan_blocks_core<G: GenotypeMatrix>(
         1
     };
     let tile_cols_capacity = scan_block_rows.div_ceil(solve_tiles);
-    let mut tiled_workspaces: Vec<SparseJxgrmSolveWorkspace> = (0..solve_tiles)
-        .map(|_| factor.make_solve_workspace(tile_cols_capacity.max(1)))
-        .collect::<Result<Vec<_>, _>>()?;
+    let use_full_parallel_solve = threads > 1
+        && _solve_workspace.n_rhs_capacity() >= scan_block_rows
+        && scan_block_rows >= 512;
+    let mut tiled_workspaces: Vec<SparseJxgrmSolveWorkspace> = if use_full_parallel_solve {
+        Vec::new()
+    } else {
+        (0..solve_tiles)
+            .map(|_| factor.make_solve_workspace(tile_cols_capacity.max(1)))
+            .collect::<Result<Vec<_>, _>>()?
+    };
 
     let mut row_start = 0usize;
     let mut next_progress_done = progress_done_offset.saturating_add(progress_step);
@@ -2592,8 +2606,10 @@ fn exact_scan_blocks_core<G: GenotypeMatrix>(
             factor,
             z_slice,
             rows_here,
+            _solve_workspace,
             &mut tiled_workspaces,
             pool.as_deref(),
+            threads.max(1),
         )?;
         if let Some(t0) = t0 {
             timing.solve_secs += t0.elapsed().as_secs_f64();
@@ -3966,7 +3982,7 @@ fn prepare_splmm_scan_state(
     rhat_markers: usize,
     rhat_seed: u64,
     stage1_cb: Option<&Py<PyAny>>,
-    progress_every: usize,
+    _progress_every: usize,
     scan_mode: SplmmScanMode,
 ) -> Result<SplmmPreparedScanState, String> {
     let total_t0 = Instant::now();
@@ -3989,13 +4005,9 @@ fn prepare_splmm_scan_state(
     };
     let solve_cap = if scan_mode.needs_exact_workspace() {
         let m = scan_prepared.n_rows();
-        let progress_block = if progress_every == 0 {
-            block_rows.max(512).max(1)
-        } else {
-            progress_every.max(1)
-        };
+        let scan_block_hint = block_rows.max(512).max(1);
         let est_block_rows = adaptive_exact_block_rows(
-            adaptive_grm_block_rows(progress_block, m, n, 0usize, threads).max(1),
+            adaptive_grm_block_rows(scan_block_hint, m, n, 0usize, threads).max(1),
             n,
         );
         est_block_rows.max(p).max(n_rhat_cap).max(1)

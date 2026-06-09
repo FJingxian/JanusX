@@ -54,9 +54,12 @@ from ._common.genocache import configure_genotype_cache_from_out
 from ._common.genoio import determine_genotype_source as _determine_genotype_source
 from ._common.threads import (
     apply_blas_thread_env,
+    detect_rust_blas_backend,
     detect_effective_threads,
+    get_rust_blas_threads,
     maybe_warn_non_openblas,
     require_openblas_by_default,
+    set_rust_blas_threads,
 )
 from ._common.grmstable import (
     save_grm_npy_blocked,
@@ -67,10 +70,12 @@ try:
     from janusx.janusx import (
         grm_packed_bed_f32 as _grm_packed_bed_f32,
         grm_stream_bed_f32 as _grm_stream_bed_f32,
+        grm_stream_bed_f32_to_npy as _grm_stream_bed_f32_to_npy,
     )
 except Exception:
     _grm_packed_bed_f32 = None
     _grm_stream_bed_f32 = None
+    _grm_stream_bed_f32_to_npy = None
 
 try:
     from janusx.janusx import (
@@ -341,6 +346,119 @@ def build_grm_streaming(
         force_color=True,
     )
     return grm, eff_m
+
+
+def build_grm_streaming_to_npy(
+    genofile: str,
+    out_npy_path: str,
+    n_samples: int,
+    n_snps: int,
+    method: int,
+    maf_threshold: float,
+    max_missing_rate: float,
+    chunk_size: int,
+    mmap_window_mb: Union[int, None],
+    threads: int,
+    block_target_mb: Union[float, None],
+    stage_timing: bool,
+    logger,
+) -> int:
+    """
+    Build the GRM in memmap mode and stream the final dense matrix directly to NPY.
+
+    This avoids materializing the full GRM again in Python just to write the file.
+    """
+    if _grm_stream_bed_f32_to_npy is None:
+        raise RuntimeError(
+            "Rust memmap GRM->NPY kernel is unavailable. Rebuild JanusX extension to export "
+            "`grm_stream_bed_f32_to_npy`."
+        )
+
+    pbar = ProgressAdapter(
+        total=n_snps,
+        desc="GRM (rust-memmap)",
+        emit_done=False,
+        force_animate=True,
+    )
+    stream_t0 = time.monotonic()
+    process = psutil.Process()
+    mem_tick_span = max(1, 10 * int(chunk_size))
+    last_done = 0
+
+    def _progress_cb(done: int, _total: int) -> None:
+        nonlocal last_done
+        d = int(done)
+        if d > last_done:
+            pbar.update(d - last_done)
+            last_done = d
+        if d % mem_tick_span == 0:
+            mem = process.memory_info().rss / 1024**3
+            pbar.set_postfix(memory=f"{mem:.2f} GB")
+
+    prev_block_target = os.environ.get("JX_GRM_BLOCK_TARGET_MB")
+    prev_stage_timing = os.environ.get("JX_GRM_STREAM_STAGE_TIMING")
+    block_target_set = False
+    stage_timing_set = False
+    if block_target_mb is not None:
+        try:
+            bt = float(block_target_mb)
+        except Exception:
+            logger.warning(
+                f"Invalid --block-target-mb={block_target_mb}; fallback to runtime default."
+            )
+        else:
+            if np.isfinite(bt) and bt > 0:
+                os.environ["JX_GRM_BLOCK_TARGET_MB"] = f"{bt:.6g}"
+                block_target_set = True
+            else:
+                logger.warning(
+                    f"Non-positive --block-target-mb={block_target_mb}; fallback to runtime default."
+                )
+    if bool(stage_timing):
+        os.environ["JX_GRM_STREAM_STAGE_TIMING"] = "1"
+        stage_timing_set = True
+
+    try:
+        try:
+            eff_m, stream_n = _grm_stream_bed_f32_to_npy(
+                str(genofile),
+                str(out_npy_path),
+                method=int(method),
+                maf_threshold=float(maf_threshold),
+                max_missing_rate=float(max_missing_rate),
+                block_cols=max(1, int(chunk_size)),
+                threads=max(1, int(threads)),
+                progress_callback=_progress_cb,
+                progress_every=max(1, int(chunk_size)),
+                mmap_window_mb=(int(mmap_window_mb) if mmap_window_mb is not None else None),
+            )
+        finally:
+            if block_target_set:
+                if prev_block_target is None:
+                    os.environ.pop("JX_GRM_BLOCK_TARGET_MB", None)
+                else:
+                    os.environ["JX_GRM_BLOCK_TARGET_MB"] = prev_block_target
+            if stage_timing_set:
+                if prev_stage_timing is None:
+                    os.environ.pop("JX_GRM_STREAM_STAGE_TIMING", None)
+                else:
+                    os.environ["JX_GRM_STREAM_STAGE_TIMING"] = prev_stage_timing
+    finally:
+        pbar.finish()
+        pbar.close()
+    stream_elapsed = max(0.0, time.monotonic() - stream_t0)
+    if int(stream_n) != int(n_samples):
+        raise RuntimeError(
+            f"Memmap sample count mismatch: memmap={int(stream_n)}, expected={int(n_samples)}"
+        )
+    eff_m = int(eff_m)
+
+    log_success(
+        logger,
+        f"GRM (Effective SNPs: {eff_m}, rust-memmap kernel -> npy) ...Finished [{format_elapsed(stream_elapsed)}]",
+        force_color=True,
+    )
+    return eff_m
 
 
 def build_grm_packed_bed(
@@ -766,6 +884,24 @@ def main(log: bool = True):
             f"using {int(args.thread)}."
         )
     apply_blas_thread_env(int(args.thread))
+    rust_blas_set_ok = set_rust_blas_threads(int(args.thread))
+    rust_blas_backend = str(detect_rust_blas_backend()).strip().lower() or "unknown"
+    rust_blas_threads = get_rust_blas_threads()
+    rust_blas_threads_text = (
+        "NA" if rust_blas_threads is None else str(int(rust_blas_threads))
+    )
+    logger.info(
+        "Rust SGEMM backend: %s; requested_threads=%s; rust_blas_threads=%s; direct_set=%s.",
+        rust_blas_backend,
+        int(args.thread),
+        rust_blas_threads_text,
+        "ok" if rust_blas_set_ok else "no",
+    )
+    if require_openblas_by_default() and rust_blas_backend not in {"openblas"}:
+        logger.warning(
+            "Rust SGEMM backend is '%s', not openblas. Dense GRM build may underutilize threads.",
+            rust_blas_backend,
+        )
     # maybe_warn_non_openblas(
     #     logger=logger,
     #     strict=require_openblas_by_default(),
@@ -992,6 +1128,15 @@ def main(log: bool = True):
         logger.info(
             f"GRM auto route selected backend: {selected_backend} ({backend_reason})."
         )
+        method_tag = _grm_method_tag(args.method)
+        direct_npy_path = (
+            f"{outprefix}.{method_tag}.npy"
+            if (args.npy and selected_backend == "memmap-bed")
+            else None
+        )
+        grm = None
+        grm_path = None
+        dense_saved_direct = False
 
         if selected_backend == "memmap-bed":
             if args.block_target_mb is not None:
@@ -1001,20 +1146,39 @@ def main(log: bool = True):
             if bool(args.stage_timing):
                 logger.info("Memmap GRM stage timing is enabled (decode/GEMM/other).")
             try:
-                grm, eff_m = build_grm_streaming(
-                    genofile=grm_input,
-                    n_samples=n_samples,
-                    n_snps=n_snps,
-                    method=args.method,
-                    maf_threshold=maf_threshold,
-                    max_missing_rate=max_missing_rate,
-                    chunk_size=chunk_size,
-                    mmap_window_mb=mmap_window_mb,
-                    threads=int(args.thread),
-                    block_target_mb=args.block_target_mb,
-                    stage_timing=bool(args.stage_timing),
-                    logger=logger,
-                )
+                if direct_npy_path is not None:
+                    eff_m = build_grm_streaming_to_npy(
+                        genofile=grm_input,
+                        out_npy_path=direct_npy_path,
+                        n_samples=n_samples,
+                        n_snps=n_snps,
+                        method=args.method,
+                        maf_threshold=maf_threshold,
+                        max_missing_rate=max_missing_rate,
+                        chunk_size=chunk_size,
+                        mmap_window_mb=mmap_window_mb,
+                        threads=int(args.thread),
+                        block_target_mb=args.block_target_mb,
+                        stage_timing=bool(args.stage_timing),
+                        logger=logger,
+                    )
+                    grm_path = direct_npy_path
+                    dense_saved_direct = True
+                else:
+                    grm, eff_m = build_grm_streaming(
+                        genofile=grm_input,
+                        n_samples=n_samples,
+                        n_snps=n_snps,
+                        method=args.method,
+                        maf_threshold=maf_threshold,
+                        max_missing_rate=max_missing_rate,
+                        chunk_size=chunk_size,
+                        mmap_window_mb=mmap_window_mb,
+                        threads=int(args.thread),
+                        block_target_mb=args.block_target_mb,
+                        stage_timing=bool(args.stage_timing),
+                        logger=logger,
+                    )
             except Exception as ex:
                 logger.warning(
                     "Memmap GRM kernel failed; fallback to Packed backend. "
@@ -1055,12 +1219,16 @@ def main(log: bool = True):
     if args.sparse is None:
         method_tag = _grm_method_tag(args.method)
         if args.npy:
-            grm_path = f"{outprefix}.{method_tag}.npy"
-            save_grm_npy_blocked(
-                grm_path,
-                grm,
-                dtype=np.float32,
-            )
+            if grm_path is None:
+                grm_path = f"{outprefix}.{method_tag}.npy"
+            if not dense_saved_direct:
+                if grm is None:
+                    raise RuntimeError("Dense GRM is missing before NPY save.")
+                save_grm_npy_blocked(
+                    grm_path,
+                    grm,
+                    dtype=np.float32,
+                )
             id_path = f"{grm_path}.id"
             np.savetxt(id_path, sample_ids, fmt="%s")
             log_success(
@@ -1071,6 +1239,8 @@ def main(log: bool = True):
             )
         else:
             grm_path = f"{outprefix}.{method_tag}.txt"
+            if grm is None:
+                raise RuntimeError("Dense GRM is missing before text save.")
             np.savetxt(grm_path, grm, fmt="%.6f")
             id_path = f"{grm_path}.id"
             np.savetxt(id_path, sample_ids, fmt="%s")

@@ -2512,16 +2512,9 @@ fn exact_scan_blocks_core<G: GenotypeMatrix>(
         1
     };
     let tile_cols_capacity = scan_block_rows.div_ceil(solve_tiles);
-    let use_full_parallel_solve = threads > 1
-        && _solve_workspace.n_rhs_capacity() >= scan_block_rows
-        && scan_block_rows >= 512;
-    let mut tiled_workspaces: Vec<SparseJxgrmSolveWorkspace> = if use_full_parallel_solve {
-        Vec::new()
-    } else {
-        (0..solve_tiles)
-            .map(|_| factor.make_solve_workspace(tile_cols_capacity.max(1)))
-            .collect::<Result<Vec<_>, _>>()?
-    };
+    let mut tiled_workspaces: Vec<SparseJxgrmSolveWorkspace> = (0..solve_tiles)
+        .map(|_| factor.make_solve_workspace(tile_cols_capacity.max(1)))
+        .collect::<Result<Vec<_>, _>>()?;
 
     let mut row_start = 0usize;
     let mut next_progress_done = progress_done_offset.saturating_add(progress_step);

@@ -4233,23 +4233,26 @@ def run_splmm_packed_fullrank(
             )
         use_preloaded_scan_meta = True
 
-    if splmm_sparse_cutoff is None:
-        splmm_sparse_cutoff, ignored_jxlmm_arg = _jxlmm_parse_sparse_cutoff(splmm_source)
-        if ignored_jxlmm_arg is not None:
-            _emit_warning_line(
-                logger,
-                (
-                    "SparseLMM only accepts an optional numeric sparse cutoff via -splmm; "
-                    f"ignoring non-numeric argument: {ignored_jxlmm_arg}"
-                ),
-                use_spinner=bool(use_spinner),
-            )
-    else:
-        splmm_sparse_cutoff = float(splmm_sparse_cutoff)
-        if (not np.isfinite(splmm_sparse_cutoff)) or float(splmm_sparse_cutoff) < 0.0:
-            raise ValueError(
-                f"SparseLMM sparse cutoff must be a finite value >= 0, got {splmm_sparse_cutoff}"
-            )
+    sparse_cutoff_log = "precomputed" if splmm_sparse_jxgrm_path is not None else None
+    if splmm_sparse_jxgrm_path is None:
+        if splmm_sparse_cutoff is None:
+            splmm_sparse_cutoff, ignored_jxlmm_arg = _jxlmm_parse_sparse_cutoff(splmm_source)
+            if ignored_jxlmm_arg is not None:
+                _emit_warning_line(
+                    logger,
+                    (
+                        "SparseLMM only accepts an optional numeric sparse cutoff via -splmm; "
+                        f"ignoring non-numeric argument: {ignored_jxlmm_arg}"
+                    ),
+                    use_spinner=bool(use_spinner),
+                )
+        else:
+            splmm_sparse_cutoff = float(splmm_sparse_cutoff)
+            if (not np.isfinite(splmm_sparse_cutoff)) or float(splmm_sparse_cutoff) < 0.0:
+                raise ValueError(
+                    f"SparseLMM sparse cutoff must be a finite value >= 0, got {splmm_sparse_cutoff}"
+                )
+        sparse_cutoff_log = f"{float(splmm_sparse_cutoff):g}"
 
     kinship_prefix = str(prefix)
     kinship_sites_all = list(sites_all_full)
@@ -4436,7 +4439,7 @@ def run_splmm_packed_fullrank(
             f"mean_diag(K)={null_mean_diag_k:.4g}, "
             f"nnz(K)={null_nnz_k}, "
             f"offdiag_density={null_offdiag_density_k:.4g}, "
-            f"sparse_cutoff={float(splmm_sparse_cutoff):g}, "
+            f"sparse_cutoff={sparse_cutoff_log}, "
             f"lambda={null_lbd:.4g}, sigma_g2={sigma_g2:.4g}, "
             f"sigma_e2={sigma_e2:.4g}, "
             f"sigma_sum_profile={sigma_sum_profile:.4g}, "

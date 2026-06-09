@@ -6007,6 +6007,15 @@ def _run_gwas_pipeline(
                 prepared_splmm_sparse_cutoff, ignored_splmm_arg = _splmm_parse_sparse_cutoff(
                     args.splmm
                 )
+                splmm_cutoff_explicit = False
+                splmm_raw = str(args.splmm).strip() if args.splmm is not None else ""
+                if splmm_raw not in {"", "__SELF__"}:
+                    try:
+                        float(splmm_raw)
+                    except Exception:
+                        splmm_cutoff_explicit = False
+                    else:
+                        splmm_cutoff_explicit = True
                 if ignored_splmm_arg is not None:
                     _emit_warning_line(
                         logger,
@@ -6040,6 +6049,15 @@ def _run_gwas_pipeline(
                 # Always use the post-GRM hook so the loading message appears
                 # at the right time (after genotype/GRM, before trait scanning).
                 if spk_is_path:
+                    if splmm_cutoff_explicit:
+                        _emit_warning_line(
+                            logger,
+                            (
+                                "SparseLMM received both `-spk <path>` and `-splmm <cutoff>`; "
+                                "the cutoff is ignored when a precomputed sparse GRM path is supplied."
+                            ),
+                            use_spinner=bool(use_spinner),
+                        )
                     def _prepare_splmm_sparse_after_grm(
                         _stream_genofile_ready: str,
                         _loaded_dense_grm_path: Optional[str],

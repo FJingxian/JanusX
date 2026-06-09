@@ -28,6 +28,7 @@ import time
 import socket
 import argparse
 import logging
+import json
 from typing import Union
 
 import numpy as np
@@ -60,6 +61,7 @@ from ._common.threads import (
 from ._common.grmstable import (
     save_grm_npy_blocked,
 )
+from ._common.grmio import read_id_file, resolve_grm_id_path
 
 try:
     from janusx.janusx import (
@@ -74,10 +76,12 @@ try:
     from janusx.janusx import (
         spgrm_bed_to_jxgrm as _spgrm_bed_to_jxgrm,
         spgrm_dense_f32_to_jxgrm as _spgrm_dense_f32_to_jxgrm,
+        spgrm_dense_npy_to_jxgrm as _spgrm_dense_npy_to_jxgrm,
     )
 except Exception:
     _spgrm_bed_to_jxgrm = None
     _spgrm_dense_f32_to_jxgrm = None
+    _spgrm_dense_npy_to_jxgrm = None
 
 
 def _is_plink_prefix_path(path_or_prefix: str) -> bool:
@@ -124,6 +128,64 @@ def _resolve_rust_grm_input(
 
 def _grm_method_tag(method: int) -> str:
     return "cGRM" if int(method) == 1 else "sGRM"
+
+
+def _dense_grm_auto_prefix(path: str) -> str:
+    base = os.path.basename(str(path).rstrip("/\\"))
+    low = base.lower()
+    if low.endswith(".npy"):
+        base = base[:-4]
+    if base.startswith("~"):
+        base = base[1:]
+    return base
+
+
+def _infer_dense_grm_method_tag(path: str, fallback_method: int) -> str:
+    base = os.path.basename(str(path))
+    if ".cGRM" in base or base.endswith("cGRM.npy"):
+        return "cGRM"
+    if ".sGRM" in base or base.endswith("sGRM.npy"):
+        return "sGRM"
+    return _grm_method_tag(fallback_method)
+
+
+def _write_sparse_grm_meta(
+    sparse_path: str,
+    *,
+    cutoff: float,
+    source: str,
+    method: Union[int, None],
+    maf_threshold: Union[float, None],
+    max_missing_rate: Union[float, None],
+    het_threshold: Union[float, None],
+    snps_only: bool,
+    dense_grm_path: Union[str, None] = None,
+) -> None:
+    meta = {
+        "abs_threshold": False,
+        "cutoff": float(cutoff),
+        "dense_grm_path": (
+            os.path.normpath(str(dense_grm_path))
+            if dense_grm_path is not None and str(dense_grm_path).strip() != ""
+            else None
+        ),
+        "het_threshold": (
+            None if het_threshold is None else float(het_threshold)
+        ),
+        "maf_threshold": (
+            None if maf_threshold is None else float(maf_threshold)
+        ),
+        "max_missing_rate": (
+            None if max_missing_rate is None else float(max_missing_rate)
+        ),
+        "method": None if method is None else int(method),
+        "sample_hash": "all",
+        "sample_n": None,
+        "snps_only": bool(snps_only),
+        "source": str(source),
+    }
+    with open(f"{sparse_path}.meta.json", "w", encoding="utf-8") as fh:
+        json.dump(meta, fh, ensure_ascii=True, sort_keys=True)
 
 
 def _select_cli_grm_backend(*, fast: bool = False) -> tuple[str, str]:
@@ -471,6 +533,74 @@ def build_sparse_grm_packed_bed(
     return str(sparse_path), int(sparse_n), int(sparse_nnz)
 
 
+def build_sparse_grm_dense_npy(
+    dense_grm_path: str,
+    out_prefix: str,
+    n_samples: int,
+    kinship_cutoff: float,
+    logger,
+) -> tuple[str, int, int]:
+    if _spgrm_dense_npy_to_jxgrm is None:
+        raise RuntimeError(
+            "Sparse GRM dense-NPY kernel is unavailable. Rebuild JanusX extension to export "
+            "`spgrm_dense_npy_to_jxgrm`."
+        )
+    logger.info(
+        "Sparse GRM route selected dense-grm-npy: "
+        f"n={n_samples}, threshold-only extraction from precomputed dense GRM."
+    )
+    pbar = ProgressAdapter(
+        total=1,
+        desc="Sparse GRM (dense-grm-npy)",
+        emit_done=False,
+        force_animate=True,
+    )
+    build_t0 = time.monotonic()
+    process = psutil.Process()
+    last_done = 0
+    last_total = 1
+
+    def _progress_cb(done: int, total: int) -> None:
+        nonlocal last_done, last_total
+        d = max(0, int(done))
+        t = max(1, int(total))
+        if t != last_total:
+            pbar.set_total(t)
+            last_total = t
+        d = min(d, t)
+        if d > last_done:
+            pbar.update(d - last_done)
+            last_done = d
+        mem = process.memory_info().rss / 1024**3
+        pbar.set_postfix(memory=f"{mem:.2f} GB")
+
+    try:
+        sparse_path, sparse_n, sparse_nnz = _spgrm_dense_npy_to_jxgrm(
+            str(dense_grm_path),
+            out_prefix=str(out_prefix),
+            threshold=float(kinship_cutoff),
+            abs_threshold=False,
+            progress_callback=_progress_cb,
+            progress_every=1,
+        )
+    finally:
+        pbar.finish()
+        pbar.close()
+
+    build_elapsed = max(0.0, time.monotonic() - build_t0)
+    if int(sparse_n) != int(n_samples):
+        raise RuntimeError(
+            f"Sparse GRM sample count mismatch: sparse={int(sparse_n)}, expected={int(n_samples)}"
+        )
+    log_success(
+        logger,
+        f"Sparse GRM (NNZ: {int(sparse_nnz)}) ...Finished "
+        f"[{format_elapsed(build_elapsed)}]",
+        force_color=True,
+    )
+    return str(sparse_path), int(sparse_n), int(sparse_nnz)
+
+
 def main(log: bool = True):
     t_start = time.time()
 
@@ -507,6 +637,13 @@ def main(log: bool = True):
         help=(
             "Input genotype numeric matrix (.txt/.tsv/.csv/.npy) or prefix. "
             "Requires sibling prefix.id. Optional site metadata: prefix.site or prefix.bim."
+        ),
+    )
+    geno_group.add_argument(
+        "-k", "--dense-grm", type=str, dest="dense_grm",
+        help=(
+            "Input precomputed dense GRM in `.npy` format. "
+            "Requires sibling `<grm>.id` and must be used with `-sparse` to emit `.spgrm`."
         ),
     )
 
@@ -600,13 +737,17 @@ def main(log: bool = True):
     # ------------------------------------------------------------------
     # Determine genotype file and output prefix
     # ------------------------------------------------------------------
-    gfile, auto_prefix = _determine_genotype_source(
-        vcf=getattr(args, "vcf", None),
-        hmp=getattr(args, "hmp", None),
-        file=getattr(args, "file", None),
-        bfile=getattr(args, "bfile", None),
-        prefix=None,
-    )
+    if getattr(args, "dense_grm", None):
+        gfile = str(args.dense_grm)
+        auto_prefix = _dense_grm_auto_prefix(gfile)
+    else:
+        gfile, auto_prefix = _determine_genotype_source(
+            vcf=getattr(args, "vcf", None),
+            hmp=getattr(args, "hmp", None),
+            file=getattr(args, "file", None),
+            bfile=getattr(args, "bfile", None),
+            prefix=None,
+        )
     args.prefix = auto_prefix if args.prefix is None else args.prefix
 
     args.out = os.path.normpath(args.out if args.out is not None else ".")
@@ -636,6 +777,29 @@ def main(log: bool = True):
             spgrm_timing_env and spgrm_timing_env not in {"0", "false", "no", "off"}
         )
         bed_backend_policy = "auto: memmap primary, packed fallback"
+        general_rows = (
+            [
+                ("Dense GRM file", gfile),
+                ("Sparse GRM cutoff", "disabled" if args.sparse is None else args.sparse),
+                ("Threads", f"{args.thread} ({detected_threads} available)"),
+                ("Save as NPY", args.npy),
+            ]
+            if getattr(args, "dense_grm", None)
+            else [
+                ("Genotype file", gfile),
+                ("GRM method", "Centered" if args.method == 1 else "Standardized/weighted"),
+                ("Sparse GRM cutoff", "disabled" if args.sparse is None else args.sparse),
+                ("MAF threshold", args.maf),
+                ("Missing rate", args.geno),
+                ("Chunk size", args.chunksize),
+                ("Block target MB", "backend-default" if args.block_target_mb is None else args.block_target_mb),
+                ("Stage timing", bool(args.stage_timing or spgrm_timing_enabled)),
+                ("Threads", f"{args.thread} ({detected_threads} available)"),
+                ("BED backend", bed_backend_policy),
+                ("Mmap limit flag", args.mmap_limit),
+                ("Save as NPY", args.npy),
+            ]
+        )
         emit_cli_configuration(
             logger,
             app_title="JanusX - GRM",
@@ -644,20 +808,7 @@ def main(log: bool = True):
             sections=[
                 (
                     "General",
-                    [
-                        ("Genotype file", gfile),
-                        ("GRM method", "Centered" if args.method == 1 else "Standardized/weighted"),
-                        ("Sparse GRM cutoff", "disabled" if args.sparse is None else args.sparse),
-                        ("MAF threshold", args.maf),
-                        ("Missing rate", args.geno),
-                        ("Chunk size", args.chunksize),
-                        ("Block target MB", "backend-default" if args.block_target_mb is None else args.block_target_mb),
-                        ("Stage timing", bool(args.stage_timing or spgrm_timing_enabled)),
-                        ("Threads", f"{args.thread} ({detected_threads} available)"),
-                        ("BED backend", bed_backend_policy),
-                        ("Mmap limit flag", args.mmap_limit),
-                        ("Save as NPY", args.npy),
-                    ],
+                    general_rows,
                 )
             ],
             footer_rows=[("Output prefix", outprefix)],
@@ -665,7 +816,9 @@ def main(log: bool = True):
         )
 
     checks: list[bool] = []
-    if args.bfile:
+    if getattr(args, "dense_grm", None):
+        checks.append(ensure_file_exists(logger, gfile, "Dense GRM file"))
+    elif args.bfile:
         checks.append(ensure_plink_prefix_exists(logger, gfile, "Genotype PLINK prefix"))
     elif args.file:
         checks.append(ensure_file_input_exists(logger, gfile, "Genotype FILE input"))
@@ -673,6 +826,73 @@ def main(log: bool = True):
         checks.append(ensure_file_exists(logger, gfile, "Genotype file"))
     if not ensure_all_true(checks):
         raise SystemExit(1)
+
+    if getattr(args, "dense_grm", None):
+        if args.sparse is None:
+            raise RuntimeError("Dense GRM input requires `-sparse <cutoff>` to emit `.spgrm`.")
+        sparse_cutoff = float(args.sparse)
+        if not np.isfinite(sparse_cutoff) or sparse_cutoff < 0.0:
+            raise RuntimeError(
+                f"Sparse GRM cutoff must be finite and >= 0, got {args.sparse}"
+            )
+        if args.npy:
+            logger.warning("`--npy` is ignored for sparse GRM output; writing `.spgrm` CSC.")
+        dense_id_path = resolve_grm_id_path(gfile)
+        if dense_id_path is None:
+            raise RuntimeError(
+                "Dense GRM input requires sibling sample IDs in `<grm>.id`."
+            )
+        sample_ids = np.asarray(read_id_file(dense_id_path), dtype=str)
+        if int(sample_ids.shape[0]) <= 0:
+            raise RuntimeError("Dense GRM ID file is empty.")
+        dense_arr = np.load(gfile, mmap_mode="r")
+        if np.asarray(dense_arr).ndim != 2 or int(dense_arr.shape[0]) != int(dense_arr.shape[1]):
+            raise RuntimeError(
+                f"Dense GRM must be a square `.npy` matrix, got shape={np.asarray(dense_arr).shape}"
+            )
+        n_samples = int(dense_arr.shape[0])
+        if n_samples != int(sample_ids.shape[0]):
+            raise RuntimeError(
+                f"Dense GRM ID count mismatch: matrix n={n_samples}, id={int(sample_ids.shape[0])}"
+            )
+        method_tag = _infer_dense_grm_method_tag(gfile, args.method)
+        sparse_prefix = f"{outprefix}.{method_tag}"
+        grm_path, sparse_n, sparse_nnz = build_sparse_grm_dense_npy(
+            dense_grm_path=gfile,
+            out_prefix=sparse_prefix,
+            n_samples=n_samples,
+            kinship_cutoff=sparse_cutoff,
+            logger=logger,
+        )
+        _write_sparse_grm_meta(
+            grm_path,
+            cutoff=sparse_cutoff,
+            source="dense_grm_npy",
+            method=None,
+            maf_threshold=None,
+            max_missing_rate=None,
+            het_threshold=None,
+            snps_only=False,
+            dense_grm_path=gfile,
+        )
+        id_path = f"{grm_path}.id"
+        np.savetxt(id_path, sample_ids, fmt="%s")
+        log_success(
+            logger,
+            f"Saved sparse GRM in CSC format (NNZ={int(sparse_nnz)}):\n"
+            f"  {format_path_for_display(id_path)}\n"
+            f"  {format_path_for_display(grm_path)}\n"
+            f"  {format_path_for_display(f'{grm_path}.meta.json')}",
+        )
+        lt = time.localtime()
+        endinfo = (
+            f"\nFinished GRM calculation. Total wall time: "
+            f"{round(time.time() - t_start, 2)} seconds\n"
+            f"{lt.tm_year}-{lt.tm_mon}-{lt.tm_mday} "
+            f"{lt.tm_hour}:{lt.tm_min}:{lt.tm_sec}"
+        )
+        log_success(logger, endinfo)
+        return
 
     # ------------------------------------------------------------------
     # Resolve Rust GRM input (PLINK BED or cache-converted BED)
@@ -747,13 +967,25 @@ def main(log: bool = True):
             stage_timing=bool(args.stage_timing),
             logger=logger,
         )
+        _write_sparse_grm_meta(
+            grm_path,
+            cutoff=sparse_cutoff,
+            source="bed",
+            method=int(args.method),
+            maf_threshold=maf_threshold,
+            max_missing_rate=max_missing_rate,
+            het_threshold=0.0,
+            snps_only=False,
+            dense_grm_path=None,
+        )
         id_path = f"{grm_path}.id"
         np.savetxt(id_path, sample_ids, fmt="%s")
         log_success(
             logger,
             f"Saved sparse GRM in CSC format (NNZ={int(sparse_nnz)}):\n"
             f"  {format_path_for_display(id_path)}\n"
-            f"  {format_path_for_display(grm_path)}",
+            f"  {format_path_for_display(grm_path)}\n"
+            f"  {format_path_for_display(f'{grm_path}.meta.json')}",
         )
     else:
         selected_backend, backend_reason = _select_cli_grm_backend(fast=bool(args.fast))

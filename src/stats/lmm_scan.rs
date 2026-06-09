@@ -30,6 +30,7 @@ use crate::blas::{
 };
 use crate::brent::{brent_minimize, brent_minimize_with_init};
 use crate::gfcore;
+use crate::gfcore::read_bim_columns;
 use crate::gfreader::{
     count_packed_row_counts, count_packed_row_counts_selected_with_excluded, is_simple_snp_allele,
     precompute_excluded_sample_indices, sample_indices_are_identity,
@@ -4021,7 +4022,8 @@ pub fn fvlmm_assoc_bed_to_tsv_f32<'py>(
                 return Err("no samples in PLINK FAM".to_string());
             }
 
-            let all_sites = gfcore::read_bim(&bed_prefix_owned)?;
+            let (all_chrom, all_pos, all_snp, all_allele0, all_allele1) =
+                read_bim_columns(&bed_prefix_owned, None)?;
 
             let sample_idx: Vec<usize> = match &sample_ids {
                 Some(ids) => {
@@ -4071,10 +4073,10 @@ pub fn fvlmm_assoc_bed_to_tsv_f32<'py>(
             let n_snps = data_len / bytes_per_snp;
             let packed_src = &mmap[3..];
 
-            if all_sites.len() != n_snps {
+            if all_chrom.len() != n_snps {
                 return Err(format!(
                     "BIM site count {} != BED SNP count {n_snps}",
-                    all_sites.len()
+                    all_chrom.len()
                 ));
             }
 
@@ -4228,26 +4230,26 @@ pub fn fvlmm_assoc_bed_to_tsv_f32<'py>(
                         None => continue,
                     };
                     if snps_only {
-                        let site = &all_sites[snp_idx];
-                        if !is_simple_snp_allele(&site.ref_allele)
-                            || !is_simple_snp_allele(&site.alt_allele)
+                        if !is_simple_snp_allele(&all_allele0[snp_idx])
+                            || !is_simple_snp_allele(&all_allele1[snp_idx])
                         {
                             continue;
                         }
                     }
-                    let site = &all_sites[snp_idx];
                     chunk.indices.push(snp_idx);
                     chunk.flip.push(cnts.flip);
                     chunk.maf.push(cnts.maf);
                     chunk.miss_rate.push(cnts.miss_rate);
                     chunk.miss_block[chunk.rows] = cnts.missing_count;
-                    chunk.chrom.push(site.chrom.clone());
-                    chunk.pos.push(site.pos as i64);
-                    chunk
-                        .snp
-                        .push(resolve_snp_name(&site.snp, &site.chrom, site.pos));
-                    chunk.a0.push(site.ref_allele.clone());
-                    chunk.a1.push(site.alt_allele.clone());
+                    chunk.chrom.push(all_chrom[snp_idx].clone());
+                    chunk.pos.push(all_pos[snp_idx] as i64);
+                    chunk.snp.push(resolve_snp_name(
+                        &all_snp[snp_idx],
+                        &all_chrom[snp_idx],
+                        all_pos[snp_idx],
+                    ));
+                    chunk.a0.push(all_allele0[snp_idx].clone());
+                    chunk.a1.push(all_allele1[snp_idx].clone());
                     chunk.rows += 1;
                 }
 

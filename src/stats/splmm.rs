@@ -24,7 +24,7 @@ use crate::cholesky::{
     subset_sparse_grm_csc, MmapSparseGrmCsc, SparseGrmCscView, SparseJxgrmAnalyzeProgressStage,
     SparseJxgrmCholesky, SparseJxgrmSolveWorkspace,
 };
-use crate::gfcore::read_fam;
+use crate::gfcore::{read_bim_columns, read_fam};
 use crate::gfreader::{
     count_packed_row_counts, count_packed_row_counts_selected_with_excluded,
     precompute_excluded_sample_indices, prepare_bed_logic_meta_owned_for_stats_samples,
@@ -77,6 +77,8 @@ struct SplmmAssocTopLevelTiming {
     bim_meta_secs: f64,
     null_scan_core_secs: f64,
     writer_wait_secs: f64,
+    detach_wall_secs: f64,
+    other_secs: f64,
     total_secs: f64,
 }
 
@@ -327,7 +329,7 @@ fn emit_splmm_assoc_top_level_timing(
         }
     };
     eprintln!(
-        "SparseLMM top-level timing mode={mode}: prepare_inputs={:.3}s ({:.1}%), bim_meta={:.3}s ({:.1}%), null_scan_core={:.3}s ({:.1}%), writer_wait={:.3}s ({:.1}%), total={:.3}s, rows={}, n={}, p={}, threads={}",
+        "SparseLMM top-level timing mode={mode}: prepare_inputs={:.3}s ({:.1}%), bim_meta={:.3}s ({:.1}%), null_scan_core={:.3}s ({:.1}%), writer_wait={:.3}s ({:.1}%), detach_wall={:.3}s ({:.1}%), other={:.3}s ({:.1}%), total={:.3}s, rows={}, n={}, p={}, threads={}",
         timing.prepare_inputs_secs,
         to_pct(timing.prepare_inputs_secs),
         timing.bim_meta_secs,
@@ -336,6 +338,10 @@ fn emit_splmm_assoc_top_level_timing(
         to_pct(timing.null_scan_core_secs),
         timing.writer_wait_secs,
         to_pct(timing.writer_wait_secs),
+        timing.detach_wall_secs,
+        to_pct(timing.detach_wall_secs),
+        timing.other_secs,
+        to_pct(timing.other_secs),
         timing.total_secs,
         rows,
         n,
@@ -1480,13 +1486,13 @@ fn residualized_sumsq_from_xtx_chol(
 }
 
 #[inline]
-fn scalar_xtx_inv_from_chol(xtx_chol: &[f64], p: usize) -> Option<f64> {
-    if p != 1 || xtx_chol.len() != 1 {
+fn scalar_spd_inv_from_chol(chol: &[f64], p: usize) -> Option<f64> {
+    if p != 1 || chol.len() != 1 {
         return None;
     }
-    let xtx00 = xtx_chol[0] * xtx_chol[0];
-    if xtx00.is_finite() && xtx00 > SPLMM_TINY {
-        Some(1.0_f64 / xtx00)
+    let x00 = chol[0] * chol[0];
+    if x00.is_finite() && x00 > SPLMM_TINY {
+        Some(1.0_f64 / x00)
     } else {
         None
     }
@@ -1507,98 +1513,6 @@ fn cast_f64_slice_to_f32(input: &[f64]) -> Result<Vec<f32>, String> {
         out.push(value as f32);
     }
     Ok(out)
-}
-
-fn read_bim_selected_columns(
-    prefix: &str,
-    row_source_indices: &[usize],
-) -> Result<(Vec<String>, Vec<i64>, Vec<String>, Vec<String>, Vec<String>), String> {
-    if row_source_indices.is_empty() {
-        return Ok((Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()));
-    }
-    let is_nondecreasing = row_source_indices.windows(2).all(|w| w[0] <= w[1]);
-    if !is_nondecreasing {
-        let sites = crate::gfcore::read_bim(prefix)?;
-        let mut chrom = Vec::with_capacity(row_source_indices.len());
-        let mut pos = Vec::with_capacity(row_source_indices.len());
-        let mut snp = Vec::with_capacity(row_source_indices.len());
-        let mut allele0 = Vec::with_capacity(row_source_indices.len());
-        let mut allele1 = Vec::with_capacity(row_source_indices.len());
-        for &src in row_source_indices {
-            let site = sites
-                .get(src)
-                .ok_or_else(|| format!("BIM row index out of range: {src} >= {}", sites.len()))?;
-            chrom.push(site.chrom.clone());
-            pos.push(site.pos as i64);
-            snp.push(site.snp.clone());
-            allele0.push(site.ref_allele.clone());
-            allele1.push(site.alt_allele.clone());
-        }
-        return Ok((chrom, pos, snp, allele0, allele1));
-    }
-
-    let bim_path = format!("{prefix}.bim");
-    let file = File::open(&bim_path).map_err(|e| format!("open {bim_path}: {e}"))?;
-    let mut reader = BufReader::new(file);
-    let mut line = String::new();
-
-    let mut chrom = Vec::with_capacity(row_source_indices.len());
-    let mut pos = Vec::with_capacity(row_source_indices.len());
-    let mut snp = Vec::with_capacity(row_source_indices.len());
-    let mut allele0 = Vec::with_capacity(row_source_indices.len());
-    let mut allele1 = Vec::with_capacity(row_source_indices.len());
-
-    let mut want_ptr = 0usize;
-    let mut row_idx = 0usize;
-    while want_ptr < row_source_indices.len() {
-        line.clear();
-        let n_read = reader
-            .read_line(&mut line)
-            .map_err(|e| format!("read {bim_path} line {}: {e}", row_idx + 1))?;
-        if n_read == 0 {
-            return Err(format!(
-                "BIM ended early: needed row {} but file has only {} rows",
-                row_source_indices[want_ptr], row_idx
-            ));
-        }
-        if row_idx != row_source_indices[want_ptr] {
-            row_idx += 1;
-            continue;
-        }
-
-        let mut it = line.split_whitespace();
-        let chrom_tok = it
-            .next()
-            .ok_or_else(|| format!("Malformed BIM line at {bim_path}:{}", row_idx + 1))?;
-        let snp_tok = it
-            .next()
-            .ok_or_else(|| format!("Malformed BIM line at {bim_path}:{}", row_idx + 1))?;
-        let _cm_tok = it
-            .next()
-            .ok_or_else(|| format!("Malformed BIM line at {bim_path}:{}", row_idx + 1))?;
-        let pos_tok = it
-            .next()
-            .ok_or_else(|| format!("Malformed BIM line at {bim_path}:{}", row_idx + 1))?;
-        let a0_tok = it
-            .next()
-            .ok_or_else(|| format!("Malformed BIM line at {bim_path}:{}", row_idx + 1))?;
-        let a1_tok = it
-            .next()
-            .ok_or_else(|| format!("Malformed BIM line at {bim_path}:{}", row_idx + 1))?;
-        let pos_i64 = pos_tok.parse::<i64>().unwrap_or(0_i64);
-
-        while want_ptr < row_source_indices.len() && row_source_indices[want_ptr] == row_idx {
-            chrom.push(chrom_tok.to_string());
-            pos.push(pos_i64);
-            snp.push(snp_tok.to_string());
-            allele0.push(a0_tok.to_string());
-            allele1.push(a1_tok.to_string());
-            want_ptr += 1;
-        }
-        row_idx += 1;
-    }
-
-    Ok((chrom, pos, snp, allele0, allele1))
 }
 
 fn row_major_block_sumsq_f64(
@@ -2390,11 +2304,33 @@ fn exact_scan_blocks_core<G: GenotypeMatrix>(
     let mut row_ss = vec![0.0_f64; scan_block_rows];
     let mut rhs_col_major = vec![0.0_f64; scan_block_rows * n];
     let mut z_col_major = vec![0.0_f64; scan_block_rows * n];
-    let mut c_block = vec![0.0_f64; scan_block_rows * p];
-    let mut xts = vec![0.0_f64; p];
-    let mut alpha = vec![0.0_f64; p];
-    let mut c_scaled = vec![0.0_f64; p];
-    let mut alpha_xtx = vec![0.0_f64; p];
+    let exact_scalar_p1 = scalar_spd_inv_from_chol(x_design_xtx_chol, p)
+        .zip(scalar_spd_inv_from_chol(xt_den_x_chol, p));
+    let mut c_block = if exact_scalar_p1.is_some() {
+        Vec::new()
+    } else {
+        vec![0.0_f64; scan_block_rows * p]
+    };
+    let mut xts = if exact_scalar_p1.is_some() {
+        Vec::new()
+    } else {
+        vec![0.0_f64; p]
+    };
+    let mut alpha = if exact_scalar_p1.is_some() {
+        Vec::new()
+    } else {
+        vec![0.0_f64; p]
+    };
+    let mut c_scaled = if exact_scalar_p1.is_some() {
+        Vec::new()
+    } else {
+        vec![0.0_f64; p]
+    };
+    let mut alpha_xtx = if exact_scalar_p1.is_some() {
+        Vec::new()
+    } else {
+        vec![0.0_f64; p]
+    };
     let mut out_block = vec![0.0_f64; scan_block_rows * 3];
 
     const MIN_TILE_COLS: usize = 32;
@@ -2499,68 +2435,111 @@ fn exact_scan_blocks_core<G: GenotypeMatrix>(
         }
 
         // Step 5: C_block = X^T Z_block
-        let c_slice = &mut c_block[..rows_here * p];
-        let t0 = stage_timing.then(Instant::now);
-        xt_mat_rhs_block(
-            x_design,
-            Some(x_design_col_major),
-            z_slice,
-            n,
-            p,
-            rows_here,
-            c_slice,
-        );
-        if let Some(t0) = t0 {
-            timing.xtz_secs += t0.elapsed().as_secs_f64();
+        if exact_scalar_p1.is_none() {
+            let c_slice = &mut c_block[..rows_here * p];
+            let t0 = stage_timing.then(Instant::now);
+            xt_mat_rhs_block(
+                x_design,
+                Some(x_design_col_major),
+                z_slice,
+                n,
+                p,
+                rows_here,
+                c_slice,
+            );
+            if let Some(t0) = t0 {
+                timing.xtz_secs += t0.elapsed().as_secs_f64();
+            }
         }
 
         // Steps 6-8: per-SNP denominator and output
         let out_slice = &mut out_block[..rows_here * 3];
         let t0 = stage_timing.then(Instant::now);
-        for local_idx in 0..rows_here {
-            let g = &rhs_slice[local_idx * n..(local_idx + 1) * n];
-            let z = &z_slice[local_idx * n..(local_idx + 1) * n];
-            let s_v_s = g.iter().zip(z.iter()).map(|(a, b)| a * b).sum::<f64>();
-            let c_j = &c_slice[local_idx * p..(local_idx + 1) * p];
-            let xts_row = &xts_slice[local_idx * p..(local_idx + 1) * p];
-            for j in 0..p {
-                xts[j] = xts_row[j] as f64;
+        if let Some((xtx00_inv, xtden00_inv)) = exact_scalar_p1 {
+            let x0 = x_design;
+            for local_idx in 0..rows_here {
+                let g = &rhs_slice[local_idx * n..(local_idx + 1) * n];
+                let z = &z_slice[local_idx * n..(local_idx + 1) * n];
+                let xts0 = xts_slice[local_idx] as f64;
+                let s_m_s = residualized_sumsq_scalar(xtx00_inv, xts0, ss_slice[local_idx]);
+                let mut s_v_s = 0.0_f64;
+                let mut xtz0 = 0.0_f64;
+                for i in 0..n {
+                    let g_i = g[i];
+                    let z_i = z[i];
+                    s_v_s += g_i * z_i;
+                    xtz0 += x0[i] * z_i;
+                }
+                let c0_scaled = xtz0 * denom_scale;
+                let x_quad = c0_scaled * c0_scaled * xtden00_inv;
+                let denom_scaled = (denom_scale * s_v_s - x_quad).max(0.0);
+                let out_row = &mut out_slice[local_idx * 3..(local_idx + 1) * 3];
+                let denom_full = denom_scaled / wald_sigma2;
+                if exact_pg_is_numerically_singular(denom_full, s_m_s) {
+                    out_row[0] = f64::NAN;
+                    out_row[1] = f64::NAN;
+                    out_row[2] = 1.0_f64;
+                } else if let Some((beta, se, pwald)) = splmm_wald_from_scaled_denom(
+                    score_scale * (spy_slice[local_idx] as f64),
+                    denom_scaled,
+                    wald_sigma2,
+                ) {
+                    out_row[0] = beta;
+                    out_row[1] = se;
+                    out_row[2] = pwald;
+                } else {
+                    out_row[0] = f64::NAN;
+                    out_row[1] = f64::NAN;
+                    out_row[2] = 1.0_f64;
+                }
             }
-            let s_m_s = residualized_sumsq_from_xtx_chol(
-                x_design_xtx_chol,
-                p,
-                &xts,
-                &mut alpha_xtx,
-                ss_slice[local_idx],
-            );
-            for j in 0..p {
-                c_scaled[j] = c_j[j] * denom_scale;
-            }
-            cholesky_solve_into(xt_den_x_chol, p, &c_scaled, &mut alpha);
-            let x_quad = c_scaled
-                .iter()
-                .zip(alpha.iter())
-                .map(|(a, b)| a * b)
-                .sum::<f64>();
-            let denom_scaled = (denom_scale * s_v_s - x_quad).max(0.0);
-            let out_row = &mut out_slice[local_idx * 3..(local_idx + 1) * 3];
-            let denom_full = denom_scaled / wald_sigma2;
-            if exact_pg_is_numerically_singular(denom_full, s_m_s) {
-                out_row[0] = f64::NAN;
-                out_row[1] = f64::NAN;
-                out_row[2] = 1.0_f64;
-            } else if let Some((beta, se, pwald)) = splmm_wald_from_scaled_denom(
-                score_scale * (spy_slice[local_idx] as f64),
-                denom_scaled,
-                wald_sigma2,
-            ) {
-                out_row[0] = beta;
-                out_row[1] = se;
-                out_row[2] = pwald;
-            } else {
-                out_row[0] = f64::NAN;
-                out_row[1] = f64::NAN;
-                out_row[2] = 1.0_f64;
+        } else {
+            let c_slice = &c_block[..rows_here * p];
+            for local_idx in 0..rows_here {
+                let g = &rhs_slice[local_idx * n..(local_idx + 1) * n];
+                let z = &z_slice[local_idx * n..(local_idx + 1) * n];
+                let s_v_s = g.iter().zip(z.iter()).map(|(a, b)| a * b).sum::<f64>();
+                let c_j = &c_slice[local_idx * p..(local_idx + 1) * p];
+                let xts_row = &xts_slice[local_idx * p..(local_idx + 1) * p];
+                for j in 0..p {
+                    xts[j] = xts_row[j] as f64;
+                }
+                let s_m_s = residualized_sumsq_from_xtx_chol(
+                    x_design_xtx_chol,
+                    p,
+                    &xts,
+                    &mut alpha_xtx,
+                    ss_slice[local_idx],
+                );
+                for j in 0..p {
+                    c_scaled[j] = c_j[j] * denom_scale;
+                }
+                cholesky_solve_into(xt_den_x_chol, p, &c_scaled, &mut alpha);
+                let x_quad = c_scaled
+                    .iter()
+                    .zip(alpha.iter())
+                    .map(|(a, b)| a * b)
+                    .sum::<f64>();
+                let denom_scaled = (denom_scale * s_v_s - x_quad).max(0.0);
+                let out_row = &mut out_slice[local_idx * 3..(local_idx + 1) * 3];
+                let denom_full = denom_scaled / wald_sigma2;
+                if exact_pg_is_numerically_singular(denom_full, s_m_s) {
+                    out_row[0] = f64::NAN;
+                    out_row[1] = f64::NAN;
+                    out_row[2] = 1.0_f64;
+                } else if let Some((beta, se, pwald)) = splmm_wald_from_scaled_denom(
+                    score_scale * (spy_slice[local_idx] as f64),
+                    denom_scaled,
+                    wald_sigma2,
+                ) {
+                    out_row[0] = beta;
+                    out_row[1] = se;
+                    out_row[2] = pwald;
+                } else {
+                    out_row[0] = f64::NAN;
+                    out_row[1] = f64::NAN;
+                    out_row[2] = 1.0_f64;
+                }
             }
         }
         if let Some(t0) = t0 {
@@ -2775,7 +2754,7 @@ fn grammar_scan_blocks_core<G: GenotypeMatrix>(
         let mut out_block = vec![0.0_f64; scan_block_rows * 3];
         let thread_hint = threads.max(1);
         let row_tile = scan_block_rows.div_ceil(thread_hint).clamp(32, 1024);
-        let scalar_xtx00_inv = scalar_xtx_inv_from_chol(xtx_chol, p);
+        let scalar_xtx00_inv = scalar_spd_inv_from_chol(xtx_chol, p);
         let mut row_start = 0usize;
         while row_start < m {
             let row_end = (row_start + scan_block_rows).min(m);
@@ -4872,7 +4851,7 @@ pub fn splmm_assoc_pcg_bed_to_tsv<'py>(
     usize,
     usize,
     usize,
-    (f64, f64, f64, f64),
+    (f64, f64, f64, f64, f64, f64, f64),
 )> {
     let top_level_timing = splmm_top_level_timing_enabled();
     let total_t0 = top_level_timing.then(Instant::now);
@@ -4945,8 +4924,16 @@ pub fn splmm_assoc_pcg_bed_to_tsv<'py>(
             .row_source_indices
             .as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("auto-populate requires row_source_indices"))?;
-        read_bim_selected_columns(&bed_prefix, ri.as_slice())
-            .map_err(|e| PyRuntimeError::new_err(format!("read BIM selected columns: {e}")))?
+        let (chrom, pos, snp, allele0, allele1) =
+            read_bim_columns(&bed_prefix, Some(ri.as_slice()))
+                .map_err(|e| PyRuntimeError::new_err(format!("read BIM selected columns: {e}")))?;
+        (
+            chrom,
+            pos.into_iter().map(|v| v as i64).collect(),
+            snp,
+            allele0,
+            allele1,
+        )
     } else {
         (chrom, pos, snp, allele0, allele1)
     };
@@ -5002,10 +4989,11 @@ pub fn splmm_assoc_pcg_bed_to_tsv<'py>(
             )
         })
         .map_err(PyRuntimeError::new_err)?;
-    let _detach_secs = t0.map(|t0| t0.elapsed().as_secs_f64()).unwrap_or(0.0_f64);
+    let detach_secs = t0.map(|t0| t0.elapsed().as_secs_f64()).unwrap_or(0.0_f64);
     top_timing.writer_wait_secs = scan_out.writer_wait_secs;
     top_timing.null_scan_core_secs =
         scan_out.factor_load_secs + scan_out.scan_prepare_secs + scan_out.scan_exec_secs;
+    top_timing.detach_wall_secs = detach_secs;
     top_timing.total_secs = total_t0
         .map(|t0| t0.elapsed().as_secs_f64())
         .unwrap_or_else(|| {
@@ -5014,6 +5002,11 @@ pub fn splmm_assoc_pcg_bed_to_tsv<'py>(
                 + top_timing.null_scan_core_secs
                 + top_timing.writer_wait_secs
         });
+    let accounted_secs = top_timing.prepare_inputs_secs
+        + top_timing.bim_meta_secs
+        + top_timing.null_scan_core_secs
+        + top_timing.writer_wait_secs;
+    top_timing.other_secs = (top_timing.total_secs - accounted_secs).max(0.0_f64);
     if top_level_timing {
         emit_splmm_assoc_top_level_timing(
             scan_mode.as_str(),
@@ -5048,6 +5041,9 @@ pub fn splmm_assoc_pcg_bed_to_tsv<'py>(
             top_timing.bim_meta_secs,
             top_timing.null_scan_core_secs,
             top_timing.writer_wait_secs,
+            top_timing.detach_wall_secs,
+            top_timing.other_secs,
+            top_timing.total_secs,
         ),
     ))
 }

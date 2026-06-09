@@ -92,6 +92,14 @@ pub fn read_bim(prefix: &str) -> Result<Vec<SiteInfo>, String> {
     read_bim_file(&bim_path)
 }
 
+pub fn read_bim_columns(
+    prefix: &str,
+    row_indices: Option<&[usize]>,
+) -> Result<(Vec<String>, Vec<i32>, Vec<String>, Vec<String>, Vec<String>), String> {
+    let bim_path = PathBuf::from(format!("{prefix}.bim"));
+    read_bim_columns_file(&bim_path, row_indices)
+}
+
 // ---------------------------
 // VCF open helper
 // ---------------------------
@@ -1169,6 +1177,128 @@ fn read_bim_file(path: &Path) -> Result<Vec<SiteInfo>, String> {
         });
     }
     Ok(sites)
+}
+
+fn read_bim_columns_file(
+    path: &Path,
+    row_indices: Option<&[usize]>,
+) -> Result<(Vec<String>, Vec<i32>, Vec<String>, Vec<String>, Vec<String>), String> {
+    let select = match row_indices {
+        Some(idx) if idx.is_empty() => {
+            return Ok((Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()));
+        }
+        Some(idx) => Some(idx),
+        None => None,
+    };
+    if let Some(idx) = select {
+        let is_nondecreasing = idx.windows(2).all(|w| w[0] <= w[1]);
+        if !is_nondecreasing {
+            let sites = read_bim_file(path)?;
+            let mut chrom = Vec::with_capacity(idx.len());
+            let mut pos = Vec::with_capacity(idx.len());
+            let mut snp = Vec::with_capacity(idx.len());
+            let mut allele0 = Vec::with_capacity(idx.len());
+            let mut allele1 = Vec::with_capacity(idx.len());
+            for &src in idx {
+                let site = sites.get(src).ok_or_else(|| {
+                    format!("BIM row index out of range: {src} >= {}", sites.len())
+                })?;
+                chrom.push(site.chrom.clone());
+                pos.push(site.pos);
+                snp.push(site.snp.clone());
+                allele0.push(site.ref_allele.clone());
+                allele1.push(site.alt_allele.clone());
+            }
+            return Ok((chrom, pos, snp, allele0, allele1));
+        }
+    }
+
+    let file = File::open(path).map_err(|e| e.to_string())?;
+    let reader = BufReader::new(file);
+    let want_len = select.map(|idx| idx.len()).unwrap_or(0);
+    let mut chrom = Vec::with_capacity(want_len);
+    let mut pos = Vec::with_capacity(want_len);
+    let mut snp = Vec::with_capacity(want_len);
+    let mut allele0 = Vec::with_capacity(want_len);
+    let mut allele1 = Vec::with_capacity(want_len);
+    let mut want_ptr = 0usize;
+
+    for (line_no, line) in reader.lines().enumerate() {
+        let l = line.map_err(|e| format!("{}:{}: {}", path.display(), line_no + 1, e))?;
+        if let Some(idx) = select {
+            if want_ptr >= idx.len() {
+                break;
+            }
+            if line_no != idx[want_ptr] {
+                continue;
+            }
+        }
+
+        let mut cols = l.split_whitespace();
+        let chrom_tok = cols.next().ok_or_else(|| {
+            format!(
+                "Malformed BIM line at {}:{}: {l}",
+                path.display(),
+                line_no + 1
+            )
+        })?;
+        let snp_tok = cols.next().ok_or_else(|| {
+            format!(
+                "Malformed BIM line at {}:{}: {l}",
+                path.display(),
+                line_no + 1
+            )
+        })?;
+        let _cm_tok = cols.next().ok_or_else(|| {
+            format!(
+                "Malformed BIM line at {}:{}: {l}",
+                path.display(),
+                line_no + 1
+            )
+        })?;
+        let pos_tok = cols.next().ok_or_else(|| {
+            format!(
+                "Malformed BIM line at {}:{}: {l}",
+                path.display(),
+                line_no + 1
+            )
+        })?;
+        let a1_tok = cols.next().ok_or_else(|| {
+            format!(
+                "Malformed BIM line at {}:{}: {l}",
+                path.display(),
+                line_no + 1
+            )
+        })?;
+        let a2_tok = cols.next().ok_or_else(|| {
+            format!(
+                "Malformed BIM line at {}:{}: {l}",
+                path.display(),
+                line_no + 1
+            )
+        })?;
+
+        chrom.push(chrom_tok.to_string());
+        pos.push(pos_tok.parse::<i32>().unwrap_or(0));
+        snp.push(snp_tok.to_string());
+        allele0.push(a1_tok.to_string());
+        allele1.push(a2_tok.to_string());
+        if select.is_some() {
+            want_ptr += 1;
+        }
+    }
+
+    if let Some(idx) = select {
+        if want_ptr != idx.len() {
+            return Err(format!(
+                "BIM ended early: needed row {} but only resolved {} selected rows from {}",
+                idx[want_ptr],
+                want_ptr,
+                path.display()
+            ));
+        }
+    }
+    Ok((chrom, pos, snp, allele0, allele1))
 }
 
 fn write_bim_file(path: &Path, sites: &[SiteInfo]) -> Result<(), String> {

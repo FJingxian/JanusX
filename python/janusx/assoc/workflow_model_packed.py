@@ -4734,6 +4734,9 @@ def run_splmm_packed_fullrank(
         rust_bim_meta_secs = 0.0
         rust_null_scan_core_secs = 0.0
         rust_writer_wait_secs = 0.0
+        rust_detach_wall_secs = 0.0
+        rust_other_secs = 0.0
+        rust_total_secs = 0.0
         arr = None
         wrote_direct_tsv = False
         scan_route_desc = (
@@ -4843,6 +4846,10 @@ def run_splmm_packed_fullrank(
                 rust_bim_meta_secs = float(jxlmm_t[10][1])
                 rust_null_scan_core_secs = float(jxlmm_t[10][2])
                 rust_writer_wait_secs = float(jxlmm_t[10][3])
+                if len(jxlmm_t[10]) >= 7:
+                    rust_detach_wall_secs = float(jxlmm_t[10][4])
+                    rust_other_secs = float(jxlmm_t[10][5])
+                    rust_total_secs = float(jxlmm_t[10][6])
         else:
             arr = np.ascontiguousarray(np.asarray(jxlmm_t[9], dtype=np.float64), dtype=np.float64)
 
@@ -4939,21 +4946,24 @@ def run_splmm_packed_fullrank(
             f"null_fit={format_elapsed(null_fit_secs)}, "
             f"scan={format_elapsed(scan_secs)}"
         )
-        rust_top_level_total_secs = float(
-            rust_prepare_inputs_secs
-            + rust_bim_meta_secs
-            + rust_null_scan_core_secs
-            + rust_writer_wait_secs
-        )
+        if not (np.isfinite(rust_total_secs) and rust_total_secs > 0.0):
+            rust_total_secs = float(
+                rust_prepare_inputs_secs
+                + rust_bim_meta_secs
+                + rust_null_scan_core_secs
+                + rust_writer_wait_secs
+            )
         _rust_top_level_timing_msg = None
-        if np.isfinite(rust_top_level_total_secs) and rust_top_level_total_secs > 0.0:
+        if np.isfinite(rust_total_secs) and rust_total_secs > 0.0:
             _rust_top_level_timing_msg = (
                 "Rust top-level timing: "
                 f"prepare_inputs={format_elapsed(rust_prepare_inputs_secs)}, "
                 f"bim_meta={format_elapsed(rust_bim_meta_secs)}, "
                 f"null_scan_core={format_elapsed(rust_null_scan_core_secs)}, "
                 f"writer_wait={format_elapsed(rust_writer_wait_secs)}, "
-                f"total={format_elapsed(rust_top_level_total_secs)}"
+                f"detach_wall={format_elapsed(rust_detach_wall_secs)}, "
+                f"other={format_elapsed(rust_other_secs)}, "
+                f"total={format_elapsed(rust_total_secs)}"
             )
         _assoc_test_msg = (
             "association test uses Wald chi^2(1): chisq=(beta/se)^2, "

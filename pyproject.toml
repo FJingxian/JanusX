@@ -4,7 +4,7 @@ version = "1.0.25"
 description = "A Suite of Genotyping Tools for Genome-Wide Association Study and Genomic Selection"
 requires-python = ">=3.10"
 dependencies = [
-    "numpy!=2.4.3", "scipy",
+    "numpy", "scipy",
     "pandas>=1.5",
     "matplotlib",
     "psutil",

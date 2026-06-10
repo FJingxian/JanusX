@@ -1111,6 +1111,60 @@ impl SparseJxgrmCholeskyAnalysis {
         Ok(result)
     }
 
+    pub fn factorize_k_plus_lambda_i_buffered_parallel(
+        &self,
+        lambda: f64,
+        buf: &mut [f64],
+        threads: usize,
+    ) -> Result<SparseJxgrmCholesky, String> {
+        if !lambda.is_finite() || lambda < 0.0 {
+            return Err(format!(
+                "Sparse Cholesky buffered parallel factorization requires finite non-negative lambda, got {lambda}"
+            ));
+        }
+        if buf.len() != self.base_perm_values.len() {
+            return Err(format!(
+                "Sparse Cholesky buffered parallel factorization buffer length mismatch: got {}, expected {}",
+                buf.len(),
+                self.base_perm_values.len()
+            ));
+        }
+        let prep_t0 = Instant::now();
+        buf.copy_from_slice(&self.base_perm_values);
+        if lambda != 0.0 {
+            for &idx in self.diag_positions.iter() {
+                buf[idx] += lambda;
+            }
+        }
+        let prep_secs = prep_t0.elapsed().as_secs_f64();
+        let parallelism = sparse_numeric_parallelism(threads);
+        let parallelism_desc = match &parallelism {
+            Parallelism::None => "none".to_string(),
+            Parallelism::Rayon(n_threads) => format!("rayon({n_threads})"),
+        };
+        let (result, timing) =
+            self.factorize_from_perm_values_with_parallelism_timed(buf, parallelism)?;
+        let cleanup_t0 = Instant::now();
+        buf.copy_from_slice(&self.base_perm_values);
+        let cleanup_secs = cleanup_t0.elapsed().as_secs_f64();
+        if sparse_factor_timing_enabled() {
+            emit_sparse_factor_timing(
+                "buffered_lambda_parallel",
+                prep_secs,
+                timing.numeric_secs,
+                timing.logdet_secs,
+                cleanup_secs,
+                prep_secs + timing.total_secs + cleanup_secs,
+                self.n,
+                self.base_perm_values.len(),
+                result.factor_nnz(),
+                self.diag_positions.len(),
+                &parallelism_desc,
+            );
+        }
+        Ok(result)
+    }
+
     pub fn factorize_sigma_g2_k_plus_sigma_e2_i(
         &self,
         sigma_g2: f64,

@@ -109,6 +109,14 @@ def _gwas_use_rust_unified_v1() -> bool:
     return bool(enabled and hasattr(jxrs, "gwas_packed_unified_to_tsv"))
 
 
+def _splmm_approx_legacy_backend() -> bool:
+    legacy_flag = str(os.environ.get("JX_SPLMM_APPROX_LEGACY", "")).strip().lower()
+    if legacy_flag in {"1", "true", "yes", "on"}:
+        return True
+    raw = str(os.environ.get("JX_SPLMM_APPROX_BACKEND", "")).strip().lower()
+    return raw in {"legacy", "old", "p0", "gamma0"}
+
+
 def _algwas_stage1_ebic_gamma() -> float:
     raw = str(os.environ.get("JX_ALGWAS_STAGE1_EBIC_GAMMA", "")).strip()
     try:
@@ -4513,6 +4521,10 @@ def run_splmm_packed_fullrank(
         sigma2_mx_reml = float(null_fit.get("sigma2_mx_reml", resid_var_mx_reml))
         sigma_scale_p0_to_mx = float(null_fit.get("sigma_scale_p0_to_mx", float("nan")))
         sigma_scale_reml = float(null_fit.get("sigma_scale_reml", float("nan")))
+        approx_legacy_backend = bool(
+            scan_mode_norm == "approx" and _splmm_approx_legacy_backend()
+        )
+        scan_scale_active = bool(scan_mode_norm in {"two_stage", "approx"})
         if not _jxlmm_null_components_valid(sigma_g2, sigma_e2):
             _stop_prepare_handle()
             raise RuntimeError(
@@ -4522,7 +4534,7 @@ def run_splmm_packed_fullrank(
         sigma_g2_scan_preview = float("nan")
         sigma_e2_scan_preview = float("nan")
         scan_sigma_preview_valid = False
-        if (
+        if scan_scale_active and (
             np.isfinite(sigma_scale_reml)
             and sigma_scale_reml > 0.0
         ):
@@ -4531,7 +4543,7 @@ def run_splmm_packed_fullrank(
             scan_sigma_preview_valid = _jxlmm_null_components_valid(
                 sigma_g2_scan_preview, sigma_e2_scan_preview
             )
-        use_reml_scan_sigma = bool(scan_mode_norm in {"approx", "two_stage"} and scan_sigma_preview_valid)
+        use_reml_scan_sigma = bool(scan_scale_active and scan_sigma_preview_valid)
         sigma_g2_scan_use = float(sigma_g2_scan_preview) if use_reml_scan_sigma else float(sigma_g2)
         sigma_e2_scan_use = float(sigma_e2_scan_preview) if use_reml_scan_sigma else float(sigma_e2)
         null_backend = str(null_fit.get("backend", "unknown"))
@@ -4549,15 +4561,18 @@ def run_splmm_packed_fullrank(
             f"sigma2_profile={sigma2_profile_reml:.4g}, "
             f"sigma2_mx={sigma2_mx_reml:.4g}, "
             f"df_reml={df_reml:.0f}, "
-            f"c_p0_to_mx={sigma_scale_p0_to_mx:.4g}, "
-            f"scan_scale={sigma_scale_reml:.4g}, "
             f"lambda_boundary={null_lambda_boundary or 'interior'}, "
             f"backend={null_backend} [null_fit={format_elapsed(null_fit_secs)}]"
             if np.isfinite(null_pve)
             else f"{null_strategy} null fit sigma_g2={sigma_g2:.4g}, sigma_e2={sigma_e2:.4g}, "
             f"backend={null_backend} [null_fit={format_elapsed(null_fit_secs)}]"
         )
-        if scan_sigma_preview_valid:
+        if scan_scale_active:
+            _null_fit_msg = (
+                f"{_null_fit_msg}; "
+                f"c_p0_to_mx={sigma_scale_p0_to_mx:.4g}, scan_scale={sigma_scale_reml:.4g}"
+            )
+        if scan_sigma_preview_valid and scan_scale_active:
             _null_fit_msg = (
                 f"{_null_fit_msg}; "
                 f"scan_sigma_preview=(sigma2={sigma_g2_scan_preview:.4g}, "
@@ -5027,20 +5042,42 @@ def run_splmm_packed_fullrank(
             if int(rhat_requested) > 0
             else ""
         )
-        sigma2_scan_use = float(sigma_g2_scan_use)
-        _sigma_mode_info = (
-            f"sigma_mode=mx_sigma2_over_1plambda(c_p0_to_mx={sigma_scale_p0_to_mx:.4g}, "
-            f"scan_scale={sigma_scale_reml:.4g}, "
-            f"sigma2={sigma2_scan_use:.4g}, sigma_g2={sigma_g2_scan_use:.4g}, sigma_e2={sigma_e2_scan_use:.4g})"
-            if use_reml_scan_sigma
-            else (
+        sigma2_scan_use = float("nan")
+        scan_sigma_mode = "profile"
+        if scan_mode_norm == "approx" and (not approx_legacy_backend) and use_reml_scan_sigma:
+            sigma2_scan_use = float(sigma_g2_scan_use)
+            scan_sigma_mode = "mx_sigma2_over_1plambda_residualized_scan"
+            _sigma_mode_info = (
+                "sigma_mode=mx_sigma2_over_1plambda+residualized_scan("
+                f"c_p0_to_mx={sigma_scale_p0_to_mx:.4g}, "
+                f"scan_scale={sigma_scale_reml:.4g}, "
+                f"sigma2={sigma2_scan_use:.4g}, sigma_g2={sigma_g2_scan_use:.4g}, "
+                f"sigma_e2={sigma_e2_scan_use:.4g}, "
+                f"sampled={rhat_used}/{rhat_requested})"
+            )
+        elif scan_mode_norm == "approx" and (not approx_legacy_backend):
+            scan_sigma_mode = "profile_residualized_scan"
+            _sigma_mode_info = (
+                "sigma_mode=profile+residualized_scan; "
+                f"Rust approx residualizes scan vectors with supplied profile null components, "
+                f"sampled markers={rhat_used}/{rhat_requested}"
+            )
+        elif use_reml_scan_sigma:
+            sigma2_scan_use = float(sigma_g2_scan_use)
+            scan_sigma_mode = "mx_sigma2_over_1plambda"
+            _sigma_mode_info = (
+                f"sigma_mode=mx_sigma2_over_1plambda(c_p0_to_mx={sigma_scale_p0_to_mx:.4g}, "
+                f"scan_scale={sigma_scale_reml:.4g}, "
+                f"sigma2={sigma2_scan_use:.4g}, sigma_g2={sigma_g2_scan_use:.4g}, sigma_e2={sigma_e2_scan_use:.4g})"
+            )
+        elif scan_sigma_preview_valid and scan_scale_active:
+            _sigma_mode_info = (
                 f"sigma_mode=profile; scan_sigma_preview=mx_sigma2_over_1plambda(c_p0_to_mx={sigma_scale_p0_to_mx:.4g}, "
                 f"scan_scale={sigma_scale_reml:.4g}, "
                 f"sigma2={sigma_g2_scan_preview:.4g}, sigma_g2={sigma_g2_scan_preview:.4g}, sigma_e2={sigma_e2_scan_preview:.4g})"
-                if scan_sigma_preview_valid
-                else "sigma_mode=profile"
             )
-        )
+        else:
+            _sigma_mode_info = "sigma_mode=profile"
         _scan_diag_msg = (
             f"{scan_route_desc}; mode={_scan_mode_desc}; {_rhat_info}"
             f"{_sigma_mode_info}; "
@@ -5161,9 +5198,7 @@ def run_splmm_packed_fullrank(
                 "splmm_sigma_scale_p0_to_mx": (
                     float(sigma_scale_p0_to_mx) if np.isfinite(sigma_scale_p0_to_mx) else None
                 ),
-                "splmm_scan_sigma_mode": (
-                    "mx_sigma2_over_1plambda" if use_reml_scan_sigma else "profile"
-                ),
+                "splmm_scan_sigma_mode": str(scan_sigma_mode),
                 "splmm_scan_sigma2": (
                     float(sigma2_scan_use) if np.isfinite(sigma2_scan_use) else None
                 ),

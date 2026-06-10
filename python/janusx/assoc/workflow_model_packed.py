@@ -1608,6 +1608,8 @@ def _jxlmm_sparse_null_fit(
     y_vec: np.ndarray,
     x_cov: Union[np.ndarray, None],
     progress_callback=None,
+    residualized_approx: bool = False,
+    threads: Union[int, None] = None,
 ) -> dict[str, object]:
     y_arg = np.ascontiguousarray(np.asarray(y_vec, dtype=np.float64).reshape(-1), dtype=np.float64)
     sample_idx_arg = None
@@ -1633,6 +1635,74 @@ def _jxlmm_sparse_null_fit(
     offdiag_nnz = max(0, int(nnz_k) - max(0, int(n_samples_k)))
     offdiag_total = max(1, int(n_samples_k) * max(0, int(n_samples_k) - 1) // 2)
     offdiag_density = float(offdiag_nnz / offdiag_total) if int(n_samples_k) > 1 else float("nan")
+    threads_use = int(max(1, int(threads) if threads is not None and int(threads) > 0 else detect_effective_threads()))
+
+    if residualized_approx:
+        if not hasattr(jxrs, "splmm_residualized_approx_null_fit_from_jxgrm"):
+            raise RuntimeError(
+                "Rust extension missing splmm_residualized_approx_null_fit_from_jxgrm required by SparseLMM approx residualized null fit."
+            )
+        fit_t0 = time.monotonic()
+        out = jxrs.splmm_residualized_approx_null_fit_from_jxgrm(
+            str(jxgrm_path),
+            y_arg,
+            x_cov=x_arg,
+            sample_indices=sample_idx_arg,
+            low=-5.0,
+            high=5.0,
+            grid_size=int(_JXLMM_SPARSE_REML_GRID_SIZE),
+            tol=1e-3,
+            max_iter=int(_JXLMM_SPARSE_REML_MAX_ITER),
+            threads=int(threads_use),
+        )
+        fit_secs = max(time.monotonic() - fit_t0, 0.0)
+        lbd, sigma_g2, sigma_e2, ml, reml, log10_lambda, df_reml = tuple(out)
+        sigma_g2 = float(sigma_g2)
+        sigma_e2 = float(sigma_e2)
+        sigma_sum = float(sigma_g2 + sigma_e2)
+        pve = _jxlmm_component_ratio(sigma_g2, sigma_e2)
+        ypy_reml = float(sigma_g2) * float(df_reml) if np.isfinite(sigma_g2) and np.isfinite(df_reml) and df_reml > 0 else float("nan")
+        out_dict = {
+            "strategy": "residualized_sparse_reml_brent",
+            "sigma_g2": sigma_g2,
+            "sigma_e2": sigma_e2,
+            "pve": pve,
+            "lambda": float(lbd),
+            "log10_lambda": float(log10_lambda),
+            "ml": float(ml),
+            "reml": float(reml),
+            "converged": True,
+            "used_iter": 0,
+            "backend": "sparse_cholesky_residualized",
+            "fit_secs": float(fit_secs),
+            "grid_log10": [],
+            "grid_reml": [],
+            "grid_sigma_g2": [],
+            "grid_sigma_e2": [],
+            "mean_diag_k": mean_diag_k,
+            "pve_diag_scaled": float("nan"),
+            "min_diag_k": float(sparse_diag.get("min_diag", float("nan"))),
+            "max_diag_k": float(sparse_diag.get("max_diag", float("nan"))),
+            "n_samples_k": float(n_samples_k),
+            "nnz_k": float(nnz_k),
+            "offdiag_nnz_k": float(offdiag_nnz),
+            "offdiag_density_k": float(offdiag_density),
+            "lambda_boundary": _jxlmm_sparse_lambda_boundary_flag(float(log10_lambda), -5.0, 5.0),
+            "rss_reml": ypy_reml,
+            "rss_mx_reml": float("nan"),
+            "df_reml": float(df_reml),
+            "resid_var_reml": float(sigma_g2) if np.isfinite(sigma_g2) else float("nan"),
+            "resid_var_mx_reml": float("nan"),
+            "ypy_reml": ypy_reml,
+            "sigma_sum_profile": sigma_sum,
+            "sigma2_profile_reml": float(sigma_g2) if np.isfinite(sigma_g2) else float("nan"),
+            "sigma2_mx_reml": float("nan"),
+            "sigma_scale_p0_to_mx": float("nan"),
+            "sigma_scale_reml": float("nan"),
+        }
+        if progress_callback is not None:
+            progress_callback(1, 1)
+        return out_dict
 
     if (
         int(_JXLMM_SPARSE_NULL_CLIP_EIG_EXACT_N_MAX) > 0
@@ -4246,14 +4316,23 @@ def run_splmm_packed_fullrank(
         raise RuntimeError(
             "Rust extension missing splmm_assoc_pcg_bed. Rebuild/install JanusX extension first."
         )
-    if not hasattr(jxrs, "spreml_sparse_reml_brent_from_jxgrm"):
+    scan_mode_norm = str(scan_mode).strip().lower()
+    if scan_mode_norm not in {"two_stage", "approx", "exact"}:
+        raise ValueError(f"Unsupported SparseLMM scan mode: {scan_mode}")
+    approx_legacy_backend = bool(
+        scan_mode_norm == "approx" and _splmm_approx_legacy_backend()
+    )
+    if scan_mode_norm == "approx" and (not approx_legacy_backend):
+        if not hasattr(jxrs, "splmm_residualized_approx_null_fit_from_jxgrm"):
+            raise RuntimeError(
+                "Rust extension missing splmm_residualized_approx_null_fit_from_jxgrm required by SparseLMM approx residualized null fit. "
+                "Rebuild/install JanusX extension first."
+            )
+    elif not hasattr(jxrs, "spreml_sparse_reml_brent_from_jxgrm"):
         raise RuntimeError(
             "Rust extension missing spreml_sparse_reml_brent_from_jxgrm required by SparseLMM sparse null fit. "
             "Rebuild/install JanusX extension first."
         )
-    scan_mode_norm = str(scan_mode).strip().lower()
-    if scan_mode_norm not in {"two_stage", "approx", "exact"}:
-        raise ValueError(f"Unsupported SparseLMM scan mode: {scan_mode}")
 
     pheno_aligned, ids = _align_pheno_to_sample_order(pheno, ids)
     prefix = _as_plink_prefix(genofile)
@@ -4476,6 +4555,8 @@ def run_splmm_packed_fullrank(
                 y_vec=y_vec,
                 x_cov=x_arg,
                 progress_callback=None,
+                residualized_approx=bool(scan_mode_norm == "approx" and (not approx_legacy_backend)),
+                threads=int(threads),
             )
             return out, max(time.monotonic() - task_t0, 0.0)
 
@@ -4521,10 +4602,19 @@ def run_splmm_packed_fullrank(
         sigma2_mx_reml = float(null_fit.get("sigma2_mx_reml", resid_var_mx_reml))
         sigma_scale_p0_to_mx = float(null_fit.get("sigma_scale_p0_to_mx", float("nan")))
         sigma_scale_reml = float(null_fit.get("sigma_scale_reml", float("nan")))
-        approx_legacy_backend = bool(
-            scan_mode_norm == "approx" and _splmm_approx_legacy_backend()
+        residualized_approx_null = bool(
+            scan_mode_norm == "approx"
+            and (not approx_legacy_backend)
+            and str(null_fit.get("strategy", "")).strip().lower() == "residualized_sparse_reml_brent"
         )
-        scan_scale_active = bool(scan_mode_norm in {"two_stage", "approx"})
+        scan_scale_active = bool(
+            scan_mode_norm == "two_stage"
+            or (
+                scan_mode_norm == "approx"
+                and (not approx_legacy_backend)
+                and (not residualized_approx_null)
+            )
+        )
         if not _jxlmm_null_components_valid(sigma_g2, sigma_e2):
             _stop_prepare_handle()
             raise RuntimeError(
@@ -4544,8 +4634,18 @@ def run_splmm_packed_fullrank(
                 sigma_g2_scan_preview, sigma_e2_scan_preview
             )
         use_reml_scan_sigma = bool(scan_scale_active and scan_sigma_preview_valid)
-        sigma_g2_scan_use = float(sigma_g2_scan_preview) if use_reml_scan_sigma else float(sigma_g2)
-        sigma_e2_scan_use = float(sigma_e2_scan_preview) if use_reml_scan_sigma else float(sigma_e2)
+        if use_reml_scan_sigma:
+            sigma_g2_scan_arg = float(sigma_g2_scan_preview)
+            sigma_e2_scan_arg = float(sigma_e2_scan_preview)
+        else:
+            sigma_g2_scan_arg = float(sigma_g2)
+            sigma_e2_scan_arg = float(sigma_e2)
+        if residualized_approx_null:
+            sigma_g2_scan_use = float("nan")
+            sigma_e2_scan_use = float("nan")
+        else:
+            sigma_g2_scan_use = float(sigma_g2_scan_arg)
+            sigma_e2_scan_use = float(sigma_e2_scan_arg)
         null_backend = str(null_fit.get("backend", "unknown"))
         null_strategy = str(null_fit.get("strategy", "unknown"))
         _null_fit_msg = (
@@ -4877,8 +4977,8 @@ def run_splmm_packed_fullrank(
                     jxlmm_out = jxrs.splmm_assoc_pcg_bed_to_tsv(
                         str(kinship_prefix),
                         y_vec,
-                        float(sigma_g2_scan_use),
-                        float(sigma_e2_scan_use),
+                        float(sigma_g2_scan_arg),
+                        float(sigma_e2_scan_arg),
                         chrom_all,
                         pos_all,
                         snp_all,
@@ -4915,8 +5015,8 @@ def run_splmm_packed_fullrank(
                     jxlmm_out = jxrs.splmm_assoc_pcg_bed(
                         str(kinship_prefix),
                         y_vec,
-                        float(sigma_g2_scan_use),
-                        float(sigma_e2_scan_use),
+                        float(sigma_g2_scan_arg),
+                        float(sigma_e2_scan_arg),
                         x_cov=x_arg,
                         sample_indices=scan_sample_idx_trait,
                         operator_sample_indices=kinship_sample_idx_trait,
@@ -5044,7 +5144,14 @@ def run_splmm_packed_fullrank(
         )
         sigma2_scan_use = float("nan")
         scan_sigma_mode = "profile"
-        if scan_mode_norm == "approx" and (not approx_legacy_backend) and use_reml_scan_sigma:
+        if scan_mode_norm == "approx" and (not approx_legacy_backend) and residualized_approx_null:
+            scan_sigma_mode = "residualized_reml_residualized_scan_rust_internal"
+            _sigma_mode_info = (
+                "sigma_mode=residualized_reml+residualized_scan("
+                f"Rust internal scaling; profile sigma_g2={sigma_g2:.4g}, sigma_e2={sigma_e2:.4g}, "
+                f"sampled={rhat_used}/{rhat_requested})"
+            )
+        elif scan_mode_norm == "approx" and (not approx_legacy_backend) and use_reml_scan_sigma:
             sigma2_scan_use = float(sigma_g2_scan_use)
             scan_sigma_mode = "mx_sigma2_over_1plambda_residualized_scan"
             _sigma_mode_info = (
@@ -5187,7 +5294,9 @@ def run_splmm_packed_fullrank(
                 "splmm_scan_s": float(scan_secs),
                 "viz_time_s": float(viz_secs),
                 "splmm_sigma_scale_reml": (
-                    float(sigma_scale_reml) if np.isfinite(sigma_scale_reml) else None
+                    None if residualized_approx_null else (
+                        float(sigma_scale_reml) if np.isfinite(sigma_scale_reml) else None
+                    )
                 ),
                 "splmm_sigma2_profile_reml": (
                     float(sigma2_profile_reml) if np.isfinite(sigma2_profile_reml) else None
@@ -5200,13 +5309,19 @@ def run_splmm_packed_fullrank(
                 ),
                 "splmm_scan_sigma_mode": str(scan_sigma_mode),
                 "splmm_scan_sigma2": (
-                    float(sigma2_scan_use) if np.isfinite(sigma2_scan_use) else None
+                    None if residualized_approx_null else (
+                        float(sigma2_scan_use) if np.isfinite(sigma2_scan_use) else None
+                    )
                 ),
                 "splmm_scan_sigma_g2": (
-                    float(sigma_g2_scan_use) if np.isfinite(sigma_g2_scan_use) else None
+                    None if residualized_approx_null else (
+                        float(sigma_g2_scan_use) if np.isfinite(sigma_g2_scan_use) else None
+                    )
                 ),
                 "splmm_scan_sigma_e2": (
-                    float(sigma_e2_scan_use) if np.isfinite(sigma_e2_scan_use) else None
+                    None if residualized_approx_null else (
+                        float(sigma_e2_scan_use) if np.isfinite(sigma_e2_scan_use) else None
+                    )
                 ),
                 "splmm_resid_var_reml": (
                     float(resid_var_reml) if np.isfinite(resid_var_reml) else None

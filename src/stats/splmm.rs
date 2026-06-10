@@ -38,7 +38,10 @@ use crate::linalg::{
 use crate::pcg::{
     PcgJxlmmNullModel, PcgJxlmmNullModelInfo, PcgJxlmmRHatResult, PcgMatrixSolveInfo, PcgSolveInfo,
 };
-use crate::splmm_approx::build_residualized_approx_null_from_components;
+use crate::splmm_approx::{
+    build_residualized_approx_scan_null_from_profile_components,
+    fit_sparse_reml_on_residualized_response,
+};
 use crate::stats_common::{env_truthy, get_cached_pool, parse_index_vec_i64};
 
 const SPLMM_TINY: f64 = 1e-30_f64;
@@ -4409,7 +4412,7 @@ fn estimate_residualized_approx_scan_sparse(
     if stage1_cb.is_some() {
         emit_progress_callback(stage1_cb, 5, 0, 1)?;
     }
-    let fit = build_residualized_approx_null_from_components(
+    let fit = build_residualized_approx_scan_null_from_profile_components(
         analysis.as_ref(),
         x_design.as_slice(),
         y_vec.as_slice(),
@@ -4499,7 +4502,7 @@ fn estimate_residualized_approx_scan_to_tsv_sparse(
     if stage1_cb.is_some() {
         emit_progress_callback(stage1_cb, 5, 0, 1)?;
     }
-    let fit = build_residualized_approx_null_from_components(
+    let fit = build_residualized_approx_scan_null_from_profile_components(
         analysis.as_ref(),
         x_design.as_slice(),
         y_vec.as_slice(),
@@ -5237,6 +5240,120 @@ pub fn splmm_sparse_null_model_debug<'py>(
         PyArray1::from_owned_array(py, numpy::ndarray::Array1::from_vec(built.null_model.p0y)),
         PyArray1::from_owned_array(py, numpy::ndarray::Array1::from_vec(built.beta_hat)),
     ))
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    jxgrm_path,
+    y,
+    x_cov=None,
+    sample_indices=None,
+    low=-5.0,
+    high=5.0,
+    grid_size=7,
+    tol=1e-3,
+    max_iter=200,
+    threads=1
+))]
+pub fn splmm_residualized_approx_null_fit_from_jxgrm<'py>(
+    py: Python<'py>,
+    jxgrm_path: String,
+    y: PyReadonlyArray1<'py, f64>,
+    x_cov: Option<PyReadonlyArray2<'py, f64>>,
+    sample_indices: Option<PyReadonlyArray1<'py, i64>>,
+    low: f64,
+    high: f64,
+    grid_size: usize,
+    tol: f64,
+    max_iter: usize,
+    threads: usize,
+) -> PyResult<(f64, f64, f64, f64, f64, f64, f64)> {
+    let y_vec = y.as_slice()?.to_vec();
+    let n = y_vec.len();
+    if n == 0 {
+        return Err(PyRuntimeError::new_err("y must not be empty"));
+    }
+    let sparse_n = sparse_jxgrm_header_n_samples(&jxgrm_path).map_err(PyRuntimeError::new_err)?;
+    let sample_idx = if let Some(raw) = sample_indices.as_ref() {
+        parse_index_vec_i64(raw.as_slice()?, sparse_n, "sample_indices")
+            .map_err(PyRuntimeError::new_err)?
+    } else {
+        if n != sparse_n {
+            return Err(PyRuntimeError::new_err(format!(
+                "SparseLMM residualized approx null fit requires y length to match sparse n when sample_indices is omitted: y={n}, sparse_n={sparse_n}"
+            )));
+        }
+        (0..sparse_n).collect::<Vec<_>>()
+    };
+    if sample_idx.len() != n {
+        return Err(PyRuntimeError::new_err(format!(
+            "SparseLMM residualized approx null fit sample/y mismatch: sample_indices={}, y={n}",
+            sample_idx.len()
+        )));
+    }
+
+    let (x_cov_owned, p_cov) = if let Some(x_cov) = &x_cov {
+        let x_arr = x_cov.as_array();
+        if x_arr.ndim() != 2 {
+            return Err(PyRuntimeError::new_err("x_cov must be 2D (n, p_cov)"));
+        }
+        let (xn, xp) = (x_arr.shape()[0], x_arr.shape()[1]);
+        if xn != n {
+            return Err(PyRuntimeError::new_err(format!(
+                "x_cov row count mismatch: got {xn}, expected {n}"
+            )));
+        }
+        let owned = match x_cov.as_slice() {
+            Ok(s) => s.to_vec(),
+            Err(_) => x_arr.iter().copied().collect(),
+        };
+        (Some(owned), xp)
+    } else {
+        (None, 0usize)
+    };
+    let x_design = build_design_with_intercept(x_cov_owned.as_deref(), n, p_cov);
+    let p = p_cov + 1;
+    if n <= p {
+        return Err(PyRuntimeError::new_err(format!(
+            "n must be > p for SparseLMM residualized approx null fit: n={n}, p={p}"
+        )));
+    }
+    let df_reml = (n - p) as f64;
+
+    let sample_idx_for_fit = sample_idx.clone();
+    let x_design_for_fit = x_design.clone();
+    let y_vec_for_fit = y_vec.clone();
+    let jxgrm_path_for_fit = jxgrm_path.clone();
+    py.detach(move || {
+        let analysis = sparse_splmm_load_analysis(
+            &jxgrm_path_for_fit,
+            n,
+            sample_idx_for_fit.as_slice(),
+            None,
+        )?;
+        let fit = fit_sparse_reml_on_residualized_response(
+            analysis.as_ref(),
+            x_design_for_fit.as_slice(),
+            y_vec_for_fit.as_slice(),
+            low,
+            high,
+            grid_size,
+            tol,
+            max_iter,
+            threads.max(1),
+        )?;
+        let log10_lambda = fit.lambda.log10();
+        Ok((
+            fit.lambda,
+            fit.sigma_g2,
+            fit.sigma_e2,
+            fit.ml,
+            fit.reml,
+            log10_lambda,
+            df_reml,
+        ))
+    })
+    .map_err(|e: String| PyRuntimeError::new_err(e))
 }
 
 #[pyfunction]

@@ -49,12 +49,14 @@ import socket
 import argparse
 import logging
 import re
+import shlex
 import sys
 import threading
 import warnings
 import multiprocessing as mp
 import concurrent.futures as cf
 import textwrap
+from shutil import get_terminal_size
 from datetime import datetime
 from typing import Any, Iterator, Union, Optional, Callable
 import uuid
@@ -91,6 +93,7 @@ from janusx.gfreader import (
 from janusx.pyBLUP.QK2 import QK
 from janusx import janusx as jxrs
 from janusx.script._common.log import setup_logging
+from janusx.script._common.config_render import emit_cli_configuration
 from janusx.script._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 from janusx.script._common.pathcheck import (
     ensure_all_true,
@@ -223,6 +226,79 @@ def _gwas_logger_verbose(logger: Optional[logging.Logger]) -> bool:
         return bool(getattr(logger, "_janusx_gwas_verbose"))
     except Exception:
         return False
+
+
+def _gwas_terminal_rich(logger: Optional[logging.Logger]) -> bool:
+    try:
+        return bool(getattr(logger, "_janusx_gwas_terminal_rich"))
+    except Exception:
+        return False
+
+
+def _gwas_report_logger(logger: logging.Logger) -> logging.Logger:
+    try:
+        rep = getattr(logger, "_janusx_gwas_report_logger")
+        if isinstance(rep, logging.Logger):
+            return rep
+    except Exception:
+        pass
+    return logger
+
+
+def _gwas_stream_logger(logger: logging.Logger) -> Optional[logging.Logger]:
+    try:
+        stream_logger = getattr(logger, "_janusx_gwas_stream_logger")
+        if isinstance(stream_logger, logging.Logger):
+            return stream_logger
+    except Exception:
+        pass
+    return None
+
+
+def _gwas_terminal_rule_width(
+    default: int = 60,
+    *,
+    logger: Optional[logging.Logger] = None,
+) -> int:
+    if logger is not None:
+        try:
+            w = int(getattr(logger, "_janusx_cli_config_panel_width"))
+            if w > 0:
+                return w
+        except Exception:
+            pass
+    if not stdout_is_tty():
+        return int(max(20, default))
+    try:
+        cols = int(get_terminal_size((int(default), 20)).columns)
+    except Exception:
+        cols = int(default)
+    return int(max(40, min(120, cols)))
+
+
+def _gwas_terminal_config_line_max_chars(default: int = 60) -> int:
+    if not stdout_is_tty():
+        return int(max(20, default))
+    try:
+        cols = int(get_terminal_size((int(default) + 12, 20)).columns)
+    except Exception:
+        cols = int(default)
+    # Leave room for panel borders/padding while still expanding on wider terminals.
+    return int(max(40, min(120, cols - 10)))
+
+
+def _gwas_invocation_command(argv: Optional[list[str]] = None) -> str:
+    tokens = [str(x) for x in (sys.argv[1:] if argv is None else argv)]
+    prog_raw = str(sys.argv[0]).strip() if len(sys.argv) > 0 else ""
+    if prog_raw == "":
+        prog_raw = "jx gwas"
+    try:
+        prog_parts = shlex.split(prog_raw)
+    except Exception:
+        prog_parts = [prog_raw]
+    if len(prog_parts) == 0:
+        prog_parts = ["jx", "gwas"]
+    return shlex.join([str(x) for x in (prog_parts + tokens)])
 
 
 def _emit_report_banner(logger: logging.Logger, title: str) -> None:
@@ -376,15 +452,16 @@ def _format_gwas_thread_plan(
 
 def _section(logger:logging.Logger, title: str) -> None:
     """Emit a formatted log section header with a leading blank line."""
+    rule = "=" * _gwas_terminal_rule_width(_SECTION_WIDTH, logger=logger)
     logger.info("")
-    logger.info(_REPORT_RULE)
+    logger.info(rule)
     logger.info(title)
-    logger.info(_REPORT_RULE)
+    logger.info(rule)
 
 
 def _phase_split(logger: logging.Logger) -> None:
     """Visual separator between loading stage and compute stage."""
-    logger.info(_REPORT_SUBRULE)
+    logger.info("-" * _gwas_terminal_rule_width(_SECTION_WIDTH, logger=logger))
 
 
 def _replace_file_with_retry(
@@ -651,17 +728,102 @@ def _emit_trait_header(
                 pve_val = pve_tmp
         except Exception:
             pve_val = None
-    _emit_report_major_section(logger, f"Task Execution: {trait}")
+    report_logger = _gwas_report_logger(logger)
+    _emit_report_major_section(report_logger, f"Task Execution: {trait}")
     sample_text = f"{int(n_idv)}"
     if pve_val is not None:
         sample_text = f"{sample_text} | Null PVE={pve_val:.3f}"
-    _emit_report_kv(logger, "Trait Samples", sample_text)
+    _emit_report_kv(report_logger, "Trait Samples", sample_text)
     context_rows = getattr(logger, "_janusx_gwas_task_context_rows", None)
     if isinstance(context_rows, list):
         for item in context_rows:
             if not (isinstance(item, tuple) and len(item) == 2):
                 continue
-            _emit_report_kv(logger, str(item[0]), item[1])
+            _emit_report_kv(report_logger, str(item[0]), item[1])
+
+    if _gwas_terminal_rich(logger):
+        stream_logger = _gwas_stream_logger(logger)
+        if stream_logger is not None:
+            if pve_val is None:
+                n_line = f"(n={int(n_idv)})"
+            else:
+                n_line = f"(n={int(n_idv)}; pve={pve_val:.3f})"
+            prefix = "* "
+            full = f"{prefix}{trait} {n_line}"
+            if len(full) <= int(width):
+                lines = [full]
+            else:
+                if (len(prefix) + len(trait)) <= int(width):
+                    lines = [f"{prefix}{trait}", n_line]
+                else:
+                    trait_lines = textwrap.wrap(
+                        trait,
+                        width=max(10, int(width) - len(prefix)),
+                        break_long_words=True,
+                        break_on_hyphens=False,
+                    )
+                    if len(trait_lines) > 0:
+                        trait_lines[0] = f"{prefix}{trait_lines[0]}"
+                    else:
+                        trait_lines = [prefix.strip()]
+                    lines = trait_lines + [n_line]
+            for ln in lines:
+                stream_logger.info(ln)
+
+
+def _emit_gwas_summary_legacy(
+    logger: logging.Logger,
+    rows: list[dict[str, object]],
+) -> None:
+    if len(rows) == 0:
+        return
+
+    _section(logger, "Summary")
+    headers = [
+        "pheno",
+        "model",
+        "nidv",
+        "nsnp",
+        "pve",
+        "mem(G)",
+        "Ctime(s)",
+        "Vtime(s)",
+    ]
+
+    out_rows: list[list[str]] = []
+    for r in _ordered_gwas_summary_rows(rows):
+        model_text = _normalize_gwas_model_name(r.get("model", ""))
+        pve_raw = r.get("pve", None)
+        pve_text = "NA"
+        try:
+            if pve_raw is not None:
+                pve_val = float(pve_raw)
+                if np.isfinite(pve_val):
+                    pve_text = f"{pve_val:.3f}"
+        except Exception:
+            pve_text = "NA"
+        out_rows.append(
+            [
+                str(r.get("phenotype", "")),
+                model_text,
+                f"{int(r.get('nidv', 0))}",
+                f"{int(r.get('eff_snp', 0))}",
+                pve_text,
+                f"{float(r.get('peak_rss_gb', 0.0)):.2f}",
+                f"{float(r.get('gwas_time_s', 0.0)):.1f}",
+                f"{float(r.get('viz_time_s', 0.0)):.1f}",
+            ]
+        )
+
+    widths = [len(h) for h in headers]
+    for row in out_rows:
+        for i, v in enumerate(row):
+            widths[i] = max(widths[i], len(v))
+
+    header_line = "  ".join(headers[i].ljust(widths[i]) for i in range(len(headers)))
+    logger.info(header_line)
+    for row in out_rows:
+        logger.info("  ".join(row[i].ljust(widths[i]) for i in range(len(row))))
 
 
 def _emit_gwas_summary(
@@ -671,7 +833,8 @@ def _emit_gwas_summary(
     if len(rows) == 0:
         return
 
-    _emit_report_major_section(logger, "Summary Report")
+    report_logger = _gwas_report_logger(logger)
+    _emit_report_major_section(report_logger, "Summary Report")
     headers = [
         "Trait",
         "Model",
@@ -714,10 +877,15 @@ def _emit_gwas_summary(
             widths[i] = max(widths[i], len(v))
 
     header_line = "  ".join(headers[i].ljust(widths[i]) for i in range(len(headers)))
-    logger.info(header_line)
+    report_logger.info(header_line)
     for row in out_rows:
-        logger.info("  ".join(row[i].ljust(widths[i]) for i in range(len(row))))
-    logger.info(_REPORT_SUBRULE)
+        report_logger.info("  ".join(row[i].ljust(widths[i]) for i in range(len(row))))
+    report_logger.info(_REPORT_SUBRULE)
+
+    if _gwas_terminal_rich(logger):
+        stream_logger = _gwas_stream_logger(logger)
+        if stream_logger is not None:
+            _emit_gwas_summary_legacy(stream_logger, rows)
 
 
 def _align_pheno_to_sample_order(
@@ -906,6 +1074,23 @@ def _ordered_saved_result_paths(
         seen.add(p)
         ordered.append(p)
     return ordered
+
+
+def _terminal_saved_result_paths(paths: list[str]) -> list[str]:
+    hidden_suffixes = (
+        ".algwas.stage1",
+        ".algwas.qtn",
+        ".farmcpu.qtn",
+    )
+    out: list[str] = []
+    for path in paths:
+        p = str(path).strip()
+        if p == "":
+            continue
+        if any(p.endswith(suf) for suf in hidden_suffixes):
+            continue
+        out.append(p)
+    return out
 
 
 def _display_path(path: str) -> str:
@@ -5889,7 +6074,7 @@ def _run_gwas_pipeline(
     return_result: bool = False,
 ):
     t_start = time.time()
-    use_spinner = False
+    use_spinner = bool(stdout_is_tty())
     run_id = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
     run_created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     run_status = "done"
@@ -5931,6 +6116,25 @@ def _run_gwas_pipeline(
     for _h in list(logger.handlers):
         if isinstance(_h, logging.FileHandler):
             _file_only_logger.addHandler(_h)
+    _stream_only_logger = logging.getLogger("janusx.gwas.stream_only")
+    _stream_only_logger.handlers.clear()
+    _stream_only_logger.setLevel(logging.INFO)
+    _stream_only_logger.propagate = False
+    for _h in list(logger.handlers):
+        if not isinstance(_h, logging.FileHandler):
+            _stream_only_logger.addHandler(_h)
+    terminal_rich = bool(use_spinner)
+    report_logger = _file_only_logger if terminal_rich else logger
+    terminal_logger = _stream_only_logger if terminal_rich else logger
+    for _lg in {logger, _file_only_logger, _stream_only_logger, report_logger, terminal_logger}:
+        try:
+            setattr(_lg, "_janusx_gwas_verbose", bool(getattr(args, "verbose", False)))
+            setattr(_lg, "_janusx_gwas_progress_enabled", False)
+            setattr(_lg, "_janusx_gwas_terminal_rich", terminal_rich)
+            setattr(_lg, "_janusx_gwas_report_logger", report_logger)
+            setattr(_lg, "_janusx_gwas_stream_logger", terminal_logger if terminal_rich else None)
+        except Exception:
+            continue
 
     advanced_notes: list[str] = []
 
@@ -5997,37 +6201,83 @@ def _run_gwas_pipeline(
                 if cli_fast_mode
                 else "memmap (default)"
             )
-        _emit_report_banner(logger, "JanusX - GWAS Pipeline Analysis")
-        _emit_report_block(logger, "System Context")
-        _emit_report_kv(logger, "Host", socket.gethostname())
+        cfg_rows: list[tuple[str, object]] = [
+            ("Genotype file", gfile),
+            ("Phenotype file", args.pheno),
+            ("Phenotype cols", args.ncol if args.ncol is not None else "All"),
+            ("BED backend", bed_backend_policy),
+            ("Fast mode", cli_fast_mode),
+            ("Models", _format_gwas_models_executed(args)),
+            ("Genetic model", args.model),
+            ("SNPs only", args.snps_only),
+            ("GRM option", args.grm),
+            ("Q option", args.qcov),
+            ("MAF threshold", args.maf),
+            ("Miss threshold", args.geno),
+            ("Memory MB", args.memory),
+        ]
+        if float(args.het) > 0.0:
+            cfg_rows.append(("Het filter", f"{float(args.het):g} (keep [{float(args.het):g}, {1.0 - float(args.het):g}])"))
+        if args.farmcpu:
+            cfg_rows.extend(
+                [
+                    ("FarmCPU iter", int(args.farmcpu_iter)),
+                    ("FarmCPU threshold", float(args.farmcpu_threshold)),
+                    ("FarmCPU nbin", int(args.farmcpu_nbin)),
+                    ("FarmCPU QTNbound", "auto" if args.farmcpu_qtn_bound is None else int(args.farmcpu_qtn_bound)),
+                    ("FarmCPU szbin", ",".join(f"{float(x):g}" for x in args.farmcpu_bin_size)),
+                ]
+            )
+        if args.cov:
+            cfg_rows.append(("Covariates", "; ".join(str(x) for x in args.cov)))
+        if args.splmm:
+            cfg_rows.append(("SparseLMM sparse", True))
+        footer_rows: list[tuple[str, object]] = [
+            ("Threads", f"{args.thread} (local effective {detected_threads})"),
+            ("Output prefix", outprefix),
+        ]
+        if terminal_rich:
+            emit_cli_configuration(
+                terminal_logger,
+                app_title="JanusX - GWAS",
+                config_title="GWAS CONFIG",
+                host=socket.gethostname(),
+                sections=[("General", cfg_rows)],
+                footer_rows=footer_rows,
+                line_max_chars=_gwas_terminal_config_line_max_chars(60),
+            )
+
+        _emit_report_banner(report_logger, "JanusX - GWAS Pipeline Analysis")
+        _emit_report_block(report_logger, "System Context")
+        _emit_report_kv(report_logger, "Host", socket.gethostname())
         _emit_report_kv(
-            logger,
+            report_logger,
             "Threads",
             f"Requested={requested_threads} | Using={int(args.thread)} (Local Effective: {detected_threads})",
         )
         _emit_report_kv(
-            logger,
+            report_logger,
             "Thread Plan",
             _format_gwas_thread_plan(args, fvlmm_scan_spec),
         )
-        logger.info("")
-        _emit_report_block(logger, "Configuration")
-        _emit_report_kv(logger, "Genotype File", _display_path(str(gfile)))
-        _emit_report_kv(logger, "Phenotype File", _display_path(str(args.pheno)))
+        report_logger.info("")
+        _emit_report_block(report_logger, "Configuration")
+        _emit_report_kv(report_logger, "Genotype File", _display_path(str(gfile)))
+        _emit_report_kv(report_logger, "Phenotype File", _display_path(str(args.pheno)))
         _emit_report_kv(
-            logger,
+            report_logger,
             "Phenotype Cols",
             args.ncol if args.ncol is not None else "All",
         )
-        _emit_report_kv(logger, "Models Executed", _format_gwas_models_executed(args))
+        _emit_report_kv(report_logger, "Models Executed", _format_gwas_models_executed(args))
         _emit_report_kv(
-            logger,
+            report_logger,
             "Thresholds",
             f"MAF={float(args.maf):g} | Miss={float(args.geno):g}",
         )
-        _emit_report_kv(logger, "Output Prefix", _display_path(str(outprefix)))
+        _emit_report_kv(report_logger, "Output Prefix", _display_path(str(outprefix)))
         _emit_report_kv(
-            logger,
+            report_logger,
             "Fast Mode",
             _format_gwas_fast_mode_status(
                 explicit_fast_mode=bool(explicit_fast_mode),
@@ -6035,6 +6285,10 @@ def _run_gwas_pipeline(
                 algwas_auto_fast=bool(algwas_auto_fast),
             ),
         )
+        report_logger.info("")
+        _emit_report_block(report_logger, "Command")
+        cmd_text = _gwas_invocation_command(argv)
+        report_logger.info(f"  {cmd_text}")
         advanced_config_rows: list[tuple[str, object]] = [
             ("BED Backend", bed_backend_policy),
             ("Genetic Model", args.model),
@@ -6321,6 +6575,8 @@ def _run_gwas_pipeline(
 
                     splmm_post_grm_hook = _prepare_splmm_sparse_after_grm
             if shared_context_needed:
+                if terminal_rich:
+                    _section(terminal_logger, "GWAS task")
                 _append_advanced_note("Prepare shared context (phenotype/genotype meta/GRM/Q/cov)")
                 pheno, ids, n_snps, grm, qmatrix, cov_all, eff_m, genofile_stream, preloaded_packed = prepare_streaming_context(
                     genofile=genofile_stream,
@@ -6376,6 +6632,8 @@ def _run_gwas_pipeline(
                             f"Fast mode packed preload unavailable; falling back to on-demand packed load. reason={ex}"
                         )
                         preloaded_packed = packed_preload_failure_state(genofile_stream, ex)
+                if terminal_rich:
+                    _phase_split(terminal_logger)
                 logger_task_rows: list[tuple[str, object]] = [
                     ("Data Loaded", f"{int(len(ids))} Samples | {int(n_snps)} SNPs"),
                     ("Genotype Cache", _display_path(str(genofile_stream))),
@@ -7189,17 +7447,22 @@ def _run_gwas_pipeline(
             saved_result_paths,
         )
         if len(ordered_result_paths) > 0:
-            logger.info("")
-            _emit_report_block(logger, "Outputs Generated")
+            report_logger.info("")
+            _emit_report_block(report_logger, "Outputs Generated")
             for p in ordered_result_paths:
-                logger.info(f"  * {_display_path(p)}")
+                report_logger.info(f"  * {_display_path(p)}")
+            if terminal_rich:
+                terminal_result_paths = _terminal_saved_result_paths(ordered_result_paths)
+                if len(terminal_result_paths) > 0:
+                    saved_body = "\n".join([f"  {_display_path(p)}" for p in terminal_result_paths])
+                    _rich_success(terminal_logger, f"Results saved:\n{saved_body}")
         if bool(getattr(args, "verbose", False)):
-            logger.info("")
-            _emit_report_block(logger, "Advanced Parameters")
+            report_logger.info("")
+            _emit_report_block(report_logger, "Advanced Parameters")
             for key, value in advanced_config_rows:
-                _emit_report_kv(logger, str(key), value)
+                _emit_report_kv(report_logger, str(key), value)
             for note in advanced_notes:
-                logger.info(f"  Note             : {note}")
+                report_logger.info(f"  Note             : {note}")
 
     except KeyboardInterrupt:
         run_status = "failed"
@@ -7221,10 +7484,19 @@ def _run_gwas_pipeline(
         run_error = str(e)
         logger.exception(f"Error in JanusX GWAS pipeline: {e}")
 
-    logger.info("")
-    _emit_report_kv(logger, "Total Wall Time", f"{max(time.time() - t_start, 0.0):.2f}s")
-    _emit_report_kv(logger, "Finished At", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-    logger.info(_REPORT_RULE)
+    if terminal_rich:
+        lt = time.localtime()
+        endinfo = (
+            f"\nFinished. Total wall time: {round(time.time() - t_start, 2)} seconds\n"
+            f"{lt.tm_year}-{lt.tm_mon}-{lt.tm_mday} "
+            f"{lt.tm_hour}:{lt.tm_min}:{lt.tm_sec}"
+        )
+        _rich_success(terminal_logger, endinfo)
+
+    report_logger.info("")
+    _emit_report_kv(report_logger, "Total Wall Time", f"{max(time.time() - t_start, 0.0):.2f}s")
+    _emit_report_kv(report_logger, "Finished At", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    report_logger.info(_REPORT_RULE)
 
     if bool(return_result):
         return {

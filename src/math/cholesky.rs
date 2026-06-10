@@ -4,6 +4,7 @@ use std::hash::{Hash, Hasher};
 use std::io::Read;
 use std::mem::{align_of, size_of};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 
 use faer::dyn_stack::{GlobalPodBuffer, PodStack, StackReq};
 use faer::reborrow::*;
@@ -107,6 +108,48 @@ fn sparse_numeric_parallelism(threads: usize) -> Parallelism {
     } else {
         Parallelism::Rayon(threads)
     }
+}
+
+fn env_truthy_local(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|v| {
+            let s = v.trim().to_ascii_lowercase();
+            !(s.is_empty() || s == "0" || s == "false" || s == "no" || s == "off")
+        })
+        .unwrap_or(false)
+}
+
+fn sparse_factor_timing_enabled() -> bool {
+    env_truthy_local("JX_SPARSE_FACTOR_TIMING")
+        || env_truthy_local("JX_SPARSE_REML_TIMING")
+        || env_truthy_local("JX_SPLMM_PREPARE_STAGE_TIMING")
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct SparseFactorizeCoreTiming {
+    numeric_secs: f64,
+    logdet_secs: f64,
+    total_secs: f64,
+}
+
+fn emit_sparse_factor_timing(
+    stage: &str,
+    prep_secs: f64,
+    numeric_secs: f64,
+    logdet_secs: f64,
+    cleanup_secs: f64,
+    total_secs: f64,
+    n: usize,
+    a_nnz: usize,
+    factor_nnz: usize,
+    diag_n: usize,
+    parallelism: &str,
+) {
+    let other_secs = (total_secs - prep_secs - numeric_secs - logdet_secs - cleanup_secs).max(0.0);
+    eprintln!(
+        "Sparse factor timing: stage={stage}, prep={prep_secs:.3}s, numeric={numeric_secs:.3}s, logdet={logdet_secs:.3}s, cleanup={cleanup_secs:.3}s, other={other_secs:.3}s, total={total_secs:.3}s, n={n}, a_nnz={a_nnz}, factor_nnz={factor_nnz}, diag_n={diag_n}, parallelism={parallelism}",
+    );
 }
 
 pub(crate) trait SparseGrmCscView {
@@ -907,11 +950,12 @@ impl SparseJxgrmCholeskyAnalysis {
         ))
     }
 
-    fn factorize_from_perm_values_with_parallelism(
+    fn factorize_from_perm_values_with_parallelism_timed(
         &self,
         perm_values: &[f64],
         parallelism: Parallelism,
-    ) -> Result<SparseJxgrmCholesky, String> {
+    ) -> Result<(SparseJxgrmCholesky, SparseFactorizeCoreTiming), String> {
+        let total_t0 = Instant::now();
         let a_perm_lower = SparseColMatRef::<usize, f64>::new(
             unsafe {
                 SymbolicSparseColMatRef::new_unchecked(
@@ -925,6 +969,7 @@ impl SparseJxgrmCholeskyAnalysis {
             perm_values,
         );
         let mut l_values = vec![0.0_f64; self.symbolic.len_values()];
+        let numeric_t0 = Instant::now();
         let mut numeric_mem = GlobalPodBuffer::try_new(
             supernodal::factorize_supernodal_numeric_llt_req::<usize, f64>(
                 &self.symbolic,
@@ -942,15 +987,25 @@ impl SparseJxgrmCholeskyAnalysis {
             PodStack::new(&mut numeric_mem),
         )
         .map_err(|e| format!("sparse numeric LLT factorization failed: {e}"))?;
+        let numeric_secs = numeric_t0.elapsed().as_secs_f64();
+        let logdet_t0 = Instant::now();
         let logdet = supernodal_llt_logdet(&self.symbolic, &l_values)?;
-        Ok(SparseJxgrmCholesky {
-            n: self.n,
-            perm: self.perm.clone(),
-            perm_inv: self.perm_inv.clone(),
-            symbolic: Arc::clone(&self.symbolic),
-            l_values,
-            logdet,
-        })
+        let logdet_secs = logdet_t0.elapsed().as_secs_f64();
+        Ok((
+            SparseJxgrmCholesky {
+                n: self.n,
+                perm: self.perm.clone(),
+                perm_inv: self.perm_inv.clone(),
+                symbolic: Arc::clone(&self.symbolic),
+                l_values,
+                logdet,
+            },
+            SparseFactorizeCoreTiming {
+                numeric_secs,
+                logdet_secs,
+                total_secs: total_t0.elapsed().as_secs_f64(),
+            },
+        ))
     }
 
     pub fn factorize_diag_shifted(&self, diag_shift: f64) -> Result<SparseJxgrmCholesky, String> {
@@ -959,13 +1014,37 @@ impl SparseJxgrmCholeskyAnalysis {
                 "Sparse Cholesky diagonal shift must be finite and >= 0, got {diag_shift}"
             ));
         }
+        let prep_t0 = Instant::now();
         let mut perm_values = self.base_perm_values.clone();
         if diag_shift != 0.0 {
             for &idx in self.diag_positions.iter() {
                 perm_values[idx] += diag_shift;
             }
         }
-        self.factorize_from_perm_values_with_parallelism(&perm_values, Parallelism::None)
+        let prep_secs = prep_t0.elapsed().as_secs_f64();
+        let parallelism = Parallelism::None;
+        let parallelism_desc = match &parallelism {
+            Parallelism::None => "none".to_string(),
+            Parallelism::Rayon(n_threads) => format!("rayon({n_threads})"),
+        };
+        let (factor, timing) =
+            self.factorize_from_perm_values_with_parallelism_timed(&perm_values, parallelism)?;
+        if sparse_factor_timing_enabled() {
+            emit_sparse_factor_timing(
+                "diag_shifted",
+                prep_secs,
+                timing.numeric_secs,
+                timing.logdet_secs,
+                0.0,
+                prep_secs + timing.total_secs,
+                self.n,
+                self.base_perm_values.len(),
+                factor.factor_nnz(),
+                self.diag_positions.len(),
+                &parallelism_desc,
+            );
+        }
+        Ok(factor)
     }
 
     pub fn base_perm_values(&self) -> &[f64] {
@@ -996,16 +1075,40 @@ impl SparseJxgrmCholeskyAnalysis {
                 self.base_perm_values.len()
             ));
         }
+        let prep_t0 = Instant::now();
         buf.copy_from_slice(&self.base_perm_values);
         if lambda != 0.0 {
             for &idx in self.diag_positions.iter() {
                 buf[idx] += lambda;
             }
         }
-        let result = self.factorize_from_perm_values_with_parallelism(buf, Parallelism::None);
-        // buf now holds shifted values; restore original for next iteration.
+        let prep_secs = prep_t0.elapsed().as_secs_f64();
+        let parallelism = Parallelism::None;
+        let parallelism_desc = match &parallelism {
+            Parallelism::None => "none".to_string(),
+            Parallelism::Rayon(n_threads) => format!("rayon({n_threads})"),
+        };
+        let (result, timing) =
+            self.factorize_from_perm_values_with_parallelism_timed(buf, parallelism)?;
+        let cleanup_t0 = Instant::now();
         buf.copy_from_slice(&self.base_perm_values);
-        result
+        let cleanup_secs = cleanup_t0.elapsed().as_secs_f64();
+        if sparse_factor_timing_enabled() {
+            emit_sparse_factor_timing(
+                "buffered_lambda",
+                prep_secs,
+                timing.numeric_secs,
+                timing.logdet_secs,
+                cleanup_secs,
+                prep_secs + timing.total_secs + cleanup_secs,
+                self.n,
+                self.base_perm_values.len(),
+                result.factor_nnz(),
+                self.diag_positions.len(),
+                &parallelism_desc,
+            );
+        }
+        Ok(result)
     }
 
     pub fn factorize_sigma_g2_k_plus_sigma_e2_i(
@@ -1032,6 +1135,7 @@ impl SparseJxgrmCholeskyAnalysis {
                 "Sparse Cholesky diagonal shift must be finite and >= 0, got {diag_shift}"
             ));
         }
+        let prep_t0 = Instant::now();
         let mut perm_values = self.base_perm_values.clone();
         for value in perm_values.iter_mut() {
             *value *= sigma_g2;
@@ -1041,7 +1145,30 @@ impl SparseJxgrmCholeskyAnalysis {
                 perm_values[idx] += sigma_e2 + diag_shift;
             }
         }
-        self.factorize_from_perm_values_with_parallelism(&perm_values, Parallelism::None)
+        let prep_secs = prep_t0.elapsed().as_secs_f64();
+        let parallelism = Parallelism::None;
+        let parallelism_desc = match &parallelism {
+            Parallelism::None => "none".to_string(),
+            Parallelism::Rayon(n_threads) => format!("rayon({n_threads})"),
+        };
+        let (factor, timing) =
+            self.factorize_from_perm_values_with_parallelism_timed(&perm_values, parallelism)?;
+        if sparse_factor_timing_enabled() {
+            emit_sparse_factor_timing(
+                "sigma_shifted",
+                prep_secs,
+                timing.numeric_secs,
+                timing.logdet_secs,
+                0.0,
+                prep_secs + timing.total_secs,
+                self.n,
+                self.base_perm_values.len(),
+                factor.factor_nnz(),
+                self.diag_positions.len(),
+                &parallelism_desc,
+            );
+        }
+        Ok(factor)
     }
 
     pub fn factorize_sigma_g2_k_plus_sigma_e2_i_with_diag_shift_parallel(
@@ -1061,6 +1188,7 @@ impl SparseJxgrmCholeskyAnalysis {
                 "Sparse Cholesky diagonal shift must be finite and >= 0, got {diag_shift}"
             ));
         }
+        let prep_t0 = Instant::now();
         let mut perm_values = self.base_perm_values.clone();
         for value in perm_values.iter_mut() {
             *value *= sigma_g2;
@@ -1070,10 +1198,30 @@ impl SparseJxgrmCholeskyAnalysis {
                 perm_values[idx] += sigma_e2 + diag_shift;
             }
         }
-        self.factorize_from_perm_values_with_parallelism(
-            &perm_values,
-            sparse_numeric_parallelism(threads),
-        )
+        let prep_secs = prep_t0.elapsed().as_secs_f64();
+        let parallelism = sparse_numeric_parallelism(threads);
+        let parallelism_desc = match &parallelism {
+            Parallelism::None => "none".to_string(),
+            Parallelism::Rayon(n_threads) => format!("rayon({n_threads})"),
+        };
+        let (factor, timing) =
+            self.factorize_from_perm_values_with_parallelism_timed(&perm_values, parallelism)?;
+        if sparse_factor_timing_enabled() {
+            emit_sparse_factor_timing(
+                "sigma_shifted_parallel",
+                prep_secs,
+                timing.numeric_secs,
+                timing.logdet_secs,
+                0.0,
+                prep_secs + timing.total_secs,
+                self.n,
+                self.base_perm_values.len(),
+                factor.factor_nnz(),
+                self.diag_positions.len(),
+                &parallelism_desc,
+            );
+        }
+        Ok(factor)
     }
 }
 

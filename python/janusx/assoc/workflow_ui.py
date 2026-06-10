@@ -204,7 +204,7 @@ def _log_model_line(
     *,
     use_spinner: bool = False,
 ) -> None:
-    if not _gwas_verbose_enabled(logger):
+    if (not _gwas_verbose_enabled(logger)) and (not use_spinner) and (not stdout_is_tty()):
         return
     _log_info(logger, f"{str(model_label)}: {str(message)}", use_spinner=use_spinner)
 
@@ -219,12 +219,8 @@ def _rich_success(
     msg = str(message)
     file_msg = str(msg if log_message is None else log_message)
     model_line = _format_gwas_model_completion_line(msg)
-    if model_line is not None:
-        if use_spinner or stdout_is_tty():
-            _log_file_only(logger, logging.INFO, model_line)
-            print(model_line, flush=True)
-        else:
-            logger.info(model_line)
+    if model_line is not None and (not use_spinner) and (not stdout_is_tty()):
+        logger.info(model_line)
         return
     force_color = bool(use_spinner)
     if is_skip_status_text(msg):
@@ -257,10 +253,8 @@ class _ProgressAdapter:
     ) -> None:
         self.total = int(max(0, total))
         self.desc = str(desc)
-        self._progress_enabled = _gwas_progress_enabled(logger)
-        self._animate = bool(
-            self._progress_enabled and (force_animate or should_animate_status(self.desc))
-        )
+        self._log_progress_enabled = _gwas_progress_enabled(logger)
+        self._animate = bool((force_animate or should_animate_status(self.desc)) and stdout_is_tty())
         self._logger = logger
         self._log_unit = str(log_unit).strip() or "item"
         self._backend = "none"
@@ -334,7 +328,7 @@ class _ProgressAdapter:
             self._logger.info(str(line))
 
     def _emit_log_progress(self, *, force: bool = False) -> None:
-        if (not self._progress_enabled) or self._logger is None:
+        if (not self._log_progress_enabled) or self._logger is None:
             return
         total = int(max(1, self.total))
         done = int(max(0, min(self._done, total)))

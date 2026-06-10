@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import concurrent.futures as cf
 import gc
 import hashlib
 import logging
@@ -4442,11 +4443,14 @@ def run_splmm_packed_fullrank(
                 prepare_handle = None
 
         scan_meta = None
+        null_fit = None
         scan_meta_secs = 0.0
         null_fit_secs = 0.0
-        if not bool(use_preloaded_scan_meta):
-            scan_meta_t0 = time.monotonic()
-            scan_meta = _jxlmm_bed_logic_meta_selected(
+        null_prepare_t0 = time.monotonic()
+
+        def _run_sparse_scan_meta_task() -> tuple[object, float]:
+            task_t0 = time.monotonic()
+            out = _jxlmm_bed_logic_meta_selected(
                 str(kinship_prefix),
                 sample_indices=kinship_sample_idx_trait,
                 maf_threshold=float(maf_threshold),
@@ -4454,17 +4458,40 @@ def run_splmm_packed_fullrank(
                 het_threshold=float(het_threshold),
                 snps_only=bool(snps_only),
             )
-            scan_meta_secs = max(time.monotonic() - scan_meta_t0, 0.0)
-        null_fit_t0 = time.monotonic()
-        null_fit = _jxlmm_sparse_null_fit(
-            jxgrm_path=str(trait_sparse_kinship_path),
-            sample_idx=kinship_sample_idx_trait,
-            y_vec=y_vec,
-            x_cov=x_arg,
-            progress_callback=None,
-        )
-        null_fit_secs = max(time.monotonic() - null_fit_t0, 0.0)
-        null_secs = float(scan_meta_secs + null_fit_secs)
+            return out, max(time.monotonic() - task_t0, 0.0)
+
+        def _run_sparse_null_fit_task() -> tuple[dict[str, object], float]:
+            task_t0 = time.monotonic()
+            out = _jxlmm_sparse_null_fit(
+                jxgrm_path=str(trait_sparse_kinship_path),
+                sample_idx=kinship_sample_idx_trait,
+                y_vec=y_vec,
+                x_cov=x_arg,
+                progress_callback=None,
+            )
+            return out, max(time.monotonic() - task_t0, 0.0)
+
+        if not bool(use_preloaded_scan_meta):
+            with cf.ThreadPoolExecutor(max_workers=2, thread_name_prefix="jx-splmm-prepare") as ex:
+                future_map: dict[cf.Future, str] = {
+                    ex.submit(_run_sparse_scan_meta_task): "scan_meta",
+                    ex.submit(_run_sparse_null_fit_task): "null_fit",
+                }
+                future_results: dict[str, tuple[object, float]] = {}
+                try:
+                    for fut in cf.as_completed(future_map):
+                        future_results[future_map[fut]] = fut.result()
+                except Exception:
+                    for fut in future_map:
+                        fut.cancel()
+                    raise
+            scan_meta, scan_meta_secs = future_results["scan_meta"]
+            null_fit_obj, null_fit_secs = future_results["null_fit"]
+            null_fit = dict(null_fit_obj)
+        else:
+            null_fit_obj, null_fit_secs = _run_sparse_null_fit_task()
+            null_fit = dict(null_fit_obj)
+        null_secs = max(time.monotonic() - null_prepare_t0, 0.0)
         peak_rss = max(peak_rss, process.memory_info().rss)
 
         sigma_g2 = float(null_fit["sigma_g2"])
@@ -5021,7 +5048,8 @@ def run_splmm_packed_fullrank(
             f"V^-1X converged={str(x_conv_all).lower()} ({x_max_iters} iters, relres={x_max_rel_res:.2e})"
         )
         _timing_diag_msg = (
-            f"trait timing: scan_meta={format_elapsed(scan_meta_secs)}, "
+            f"trait timing: prepare_wall={format_elapsed(null_secs)}, "
+            f"scan_meta={format_elapsed(scan_meta_secs)}, "
             f"null_fit={format_elapsed(null_fit_secs)}, "
             f"scan={format_elapsed(scan_secs)}"
         )
@@ -5115,7 +5143,8 @@ def run_splmm_packed_fullrank(
                 "pve": (float(null_pve) if np.isfinite(null_pve) else None),
                 "avg_cpu": float(avg_cpu),
                 "peak_rss_gb": float(peak_rss_gb),
-                "gwas_time_s": float(scan_meta_secs + null_fit_secs + scan_secs),
+                "gwas_time_s": float(null_secs + scan_secs),
+                "splmm_prepare_wall_s": float(null_secs),
                 "splmm_scan_meta_s": float(scan_meta_secs),
                 "splmm_null_fit_s": float(null_fit_secs),
                 "splmm_scan_s": float(scan_secs),

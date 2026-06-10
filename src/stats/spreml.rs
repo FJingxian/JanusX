@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::f64::consts::PI;
 use std::sync::Arc;
+use std::time::Instant;
 
 use numpy::{PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::exceptions::PyRuntimeError;
@@ -30,6 +31,116 @@ struct SparseRemlEval {
 struct SparseRemlSearchResult {
     best: SparseRemlEval,
     grid: Vec<SparseRemlEval>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SparseRemlEvalTiming {
+    factorize_secs: f64,
+    fill_rhs_secs: f64,
+    solve_secs: f64,
+    dense_secs: f64,
+    total_secs: f64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SparseRemlPhaseTiming {
+    n_evals: usize,
+    factorize_secs: f64,
+    fill_rhs_secs: f64,
+    solve_secs: f64,
+    dense_secs: f64,
+    total_secs: f64,
+}
+
+impl SparseRemlPhaseTiming {
+    fn add_eval(&mut self, timing: &SparseRemlEvalTiming) {
+        self.n_evals = self.n_evals.saturating_add(1);
+        self.factorize_secs += timing.factorize_secs;
+        self.fill_rhs_secs += timing.fill_rhs_secs;
+        self.solve_secs += timing.solve_secs;
+        self.dense_secs += timing.dense_secs;
+        self.total_secs += timing.total_secs;
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct SparseRemlTimingSummary {
+    analysis_load_secs: f64,
+    design_secs: f64,
+    grid_secs: f64,
+    brent_secs: f64,
+    final_eval_secs: f64,
+    total_secs: f64,
+    grid_eval: SparseRemlPhaseTiming,
+    brent_eval: SparseRemlPhaseTiming,
+    final_eval: SparseRemlPhaseTiming,
+}
+
+fn env_truthy_local(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|v| {
+            let s = v.trim().to_ascii_lowercase();
+            !(s.is_empty() || s == "0" || s == "false" || s == "no" || s == "off")
+        })
+        .unwrap_or(false)
+}
+
+fn sparse_reml_timing_enabled() -> bool {
+    env_truthy_local("JX_SPARSE_REML_TIMING")
+        || env_truthy_local("JX_SPLMM_PREPARE_STAGE_TIMING")
+        || env_truthy_local("JX_SPLMM_PACKED_STAGE_TIMING")
+}
+
+fn emit_sparse_reml_timing(
+    timing: &SparseRemlTimingSummary,
+    n: usize,
+    p: usize,
+    grid_size: usize,
+    max_iter: usize,
+) {
+    let phase_other = |phase_total: f64, phase_eval: &SparseRemlPhaseTiming| -> f64 {
+        (phase_total - phase_eval.total_secs).max(0.0_f64)
+    };
+    let final_other = phase_other(timing.final_eval_secs, &timing.final_eval);
+    let total_other = (timing.total_secs
+        - timing.analysis_load_secs
+        - timing.design_secs
+        - timing.grid_secs
+        - timing.brent_secs
+        - timing.final_eval_secs)
+        .max(0.0_f64);
+    eprintln!(
+        "SPREML timing: analysis_load={:.3}s, design={:.3}s, grid={:.3}s (evals={}, factorize={:.3}s, fill_rhs={:.3}s, solve={:.3}s, dense={:.3}s, other={:.3}s), brent={:.3}s (evals={}, factorize={:.3}s, fill_rhs={:.3}s, solve={:.3}s, dense={:.3}s, other={:.3}s), final_eval={:.3}s (factorize={:.3}s, fill_rhs={:.3}s, solve={:.3}s, dense={:.3}s, other={:.3}s), total={:.3}s, other={:.3}s, n={}, p={}, grid_size={}, max_iter={}",
+        timing.analysis_load_secs,
+        timing.design_secs,
+        timing.grid_secs,
+        timing.grid_eval.n_evals,
+        timing.grid_eval.factorize_secs,
+        timing.grid_eval.fill_rhs_secs,
+        timing.grid_eval.solve_secs,
+        timing.grid_eval.dense_secs,
+        phase_other(timing.grid_secs, &timing.grid_eval),
+        timing.brent_secs,
+        timing.brent_eval.n_evals,
+        timing.brent_eval.factorize_secs,
+        timing.brent_eval.fill_rhs_secs,
+        timing.brent_eval.solve_secs,
+        timing.brent_eval.dense_secs,
+        phase_other(timing.brent_secs, &timing.brent_eval),
+        timing.final_eval_secs,
+        timing.final_eval.factorize_secs,
+        timing.final_eval.fill_rhs_secs,
+        timing.final_eval.solve_secs,
+        timing.final_eval.dense_secs,
+        final_other,
+        timing.total_secs,
+        total_other,
+        n,
+        p,
+        grid_size,
+        max_iter,
+    );
 }
 
 fn refine_monotone_valid_lower_bound<F>(
@@ -94,13 +205,7 @@ fn sparse_reml_refine_lower_feasible_log10(
 }
 
 fn sparse_reml_debug_enabled() -> bool {
-    std::env::var("JX_SPARSE_REML_DEBUG")
-        .ok()
-        .map(|v| {
-            let s = v.trim().to_ascii_lowercase();
-            !(s.is_empty() || s == "0" || s == "false" || s == "no" || s == "off")
-        })
-        .unwrap_or(false)
+    env_truthy_local("JX_SPARSE_REML_DEBUG")
 }
 
 struct SparseRemlEvaluator {
@@ -276,7 +381,9 @@ fn evaluate_sparse_reml_at_lambda(
     y: &[f64],
     log10_lambda: f64,
     evaluator: &mut SparseRemlEvaluator,
-) -> Result<SparseRemlEval, String> {
+) -> Result<(SparseRemlEval, SparseRemlEvalTiming), String> {
+    let total_t0 = Instant::now();
+    let mut timing = SparseRemlEvalTiming::default();
     let lambda = 10.0_f64.powf(log10_lambda);
     if !lambda.is_finite() || lambda <= 0.0 {
         return Err(format!(
@@ -295,11 +402,18 @@ fn evaluate_sparse_reml_at_lambda(
         ));
     }
 
+    let factorize_t0 = Instant::now();
     let factor =
         analysis.factorize_k_plus_lambda_i_buffered(lambda, &mut evaluator.perm_values_buf)?;
+    timing.factorize_secs = factorize_t0.elapsed().as_secs_f64();
+    let fill_rhs_t0 = Instant::now();
     evaluator.fill_rhs(x_design, y);
+    timing.fill_rhs_secs = fill_rhs_t0.elapsed().as_secs_f64();
+    let solve_t0 = Instant::now();
     evaluator.solve_rhs_in_place(&factor)?;
+    timing.solve_secs = solve_t0.elapsed().as_secs_f64();
 
+    let dense_t0 = Instant::now();
     let y_vinv = &evaluator.rhs[..n];
     let x_vinv_col = &evaluator.rhs[n..];
     let y_vinv_y = y.iter().zip(y_vinv.iter()).map(|(a, b)| a * b).sum::<f64>();
@@ -348,75 +462,23 @@ fn evaluate_sparse_reml_at_lambda(
             "SPREML likelihood is invalid at lambda={lambda}: ml={ml}, reml={reml}"
         ));
     }
+    timing.dense_secs = dense_t0.elapsed().as_secs_f64();
+    timing.total_secs = total_t0.elapsed().as_secs_f64();
 
-    Ok(SparseRemlEval {
-        log10_lambda,
-        lambda,
-        sigma_g2,
-        sigma_e2,
-        ml,
-        reml,
-    })
+    Ok((
+        SparseRemlEval {
+            log10_lambda,
+            lambda,
+            sigma_g2,
+            sigma_e2,
+            ml,
+            reml,
+        },
+        timing,
+    ))
 }
 
-fn sparse_reml_grid_search(
-    analysis: &SparseJxgrmCholeskyAnalysis,
-    x_design: &[f64],
-    y: &[f64],
-    low: f64,
-    high: f64,
-    grid_size: usize,
-) -> Result<SparseRemlSearchResult, String> {
-    if !low.is_finite() || !high.is_finite() || low >= high {
-        return Err(format!(
-            "SPREML grid search requires finite low < high, got low={low}, high={high}"
-        ));
-    }
-    let grid_n = grid_size.max(2);
-    let n = y.len();
-    let p = x_design.len() / n.max(1);
-    let mut evaluator = SparseRemlEvaluator::new(n, p, analysis);
-    let mut evals = Vec::<SparseRemlEval>::with_capacity(grid_n);
-    let mut best = None::<SparseRemlEval>;
-    let mut first_err = None::<String>;
-    for idx in 0..grid_n {
-        let t = if grid_n <= 1 {
-            0.0_f64
-        } else {
-            idx as f64 / (grid_n - 1) as f64
-        };
-        let log10_lambda = low + (high - low) * t;
-        match evaluate_sparse_reml_at_lambda(analysis, x_design, y, log10_lambda, &mut evaluator) {
-            Ok(eval) => {
-                if best
-                    .as_ref()
-                    .map(|cur| eval.reml > cur.reml)
-                    .unwrap_or(true)
-                {
-                    best = Some(eval.clone());
-                }
-                evals.push(eval);
-            }
-            Err(err) => {
-                if sparse_reml_debug_enabled() {
-                    eprintln!("SPREML grid eval failed at log10(lambda)={log10_lambda:.6e}: {err}");
-                }
-                if first_err.is_none() {
-                    first_err = Some(err);
-                }
-            }
-        }
-    }
-    let best = best.ok_or_else(|| match first_err {
-        Some(err) => format!(
-            "SPREML sparse grid search found no valid lambda in [{low}, {high}]; first failure: {err}"
-        ),
-        None => format!("SPREML sparse grid search found no valid lambda in [{low}, {high}]"),
-    })?;
-    Ok(SparseRemlSearchResult { best, grid: evals })
-}
-
-fn sparse_reml_grid_search_with_progress(
+fn sparse_reml_grid_search_core(
     analysis: &SparseJxgrmCholeskyAnalysis,
     x_design: &[f64],
     y: &[f64],
@@ -426,7 +488,7 @@ fn sparse_reml_grid_search_with_progress(
     progress_callback: Option<&Py<PyAny>>,
     progress_offset: usize,
     progress_total: usize,
-) -> Result<SparseRemlSearchResult, String> {
+) -> Result<(SparseRemlSearchResult, SparseRemlPhaseTiming), String> {
     if !low.is_finite() || !high.is_finite() || low >= high {
         return Err(format!(
             "SPREML grid search requires finite low < high, got low={low}, high={high}"
@@ -439,6 +501,7 @@ fn sparse_reml_grid_search_with_progress(
     let mut evals = Vec::<SparseRemlEval>::with_capacity(grid_n);
     let mut best = None::<SparseRemlEval>;
     let mut first_err = None::<String>;
+    let mut phase_timing = SparseRemlPhaseTiming::default();
     for idx in 0..grid_n {
         let t = if grid_n <= 1 {
             0.0_f64
@@ -447,7 +510,8 @@ fn sparse_reml_grid_search_with_progress(
         };
         let log10_lambda = low + (high - low) * t;
         match evaluate_sparse_reml_at_lambda(analysis, x_design, y, log10_lambda, &mut evaluator) {
-            Ok(eval) => {
+            Ok((eval, eval_timing)) => {
+                phase_timing.add_eval(&eval_timing);
                 if best
                     .as_ref()
                     .map(|cur| eval.reml > cur.reml)
@@ -478,7 +542,19 @@ fn sparse_reml_grid_search_with_progress(
         ),
         None => format!("SPREML sparse grid search found no valid lambda in [{low}, {high}]"),
     })?;
-    Ok(SparseRemlSearchResult { best, grid: evals })
+    Ok((SparseRemlSearchResult { best, grid: evals }, phase_timing))
+}
+
+fn sparse_reml_grid_search(
+    analysis: &SparseJxgrmCholeskyAnalysis,
+    x_design: &[f64],
+    y: &[f64],
+    low: f64,
+    high: f64,
+    grid_size: usize,
+) -> Result<SparseRemlSearchResult, String> {
+    sparse_reml_grid_search_core(analysis, x_design, y, low, high, grid_size, None, 0, 1)
+        .map(|(result, _timing)| result)
 }
 
 fn sparse_reml_brent_search_with_progress(
@@ -493,7 +569,7 @@ fn sparse_reml_brent_search_with_progress(
     progress_callback: Option<&Py<PyAny>>,
     progress_offset: usize,
     progress_total: usize,
-) -> Result<SparseRemlSearchResult, String> {
+) -> Result<(SparseRemlSearchResult, SparseRemlTimingSummary), String> {
     if !(tol.is_finite() && tol > 0.0) {
         return Err(format!(
             "SPREML Brent tol must be finite and > 0, got {tol}"
@@ -503,7 +579,10 @@ fn sparse_reml_brent_search_with_progress(
         return Err("SPREML Brent max_iter must be > 0".to_string());
     }
     let grid_n = grid_size.max(2);
-    let grid = sparse_reml_grid_search_with_progress(
+    let total_t0 = Instant::now();
+    let mut timing = SparseRemlTimingSummary::default();
+    let grid_t0 = Instant::now();
+    let (grid, grid_phase_timing) = sparse_reml_grid_search_core(
         analysis,
         x_design,
         y,
@@ -514,6 +593,8 @@ fn sparse_reml_brent_search_with_progress(
         progress_offset,
         progress_total,
     )?;
+    timing.grid_secs = grid_t0.elapsed().as_secs_f64();
+    timing.grid_eval = grid_phase_timing;
     let init = Some(grid.best.log10_lambda);
     let best_idx = grid
         .grid
@@ -556,7 +637,9 @@ fn sparse_reml_brent_search_with_progress(
     let n = y.len();
     let p = x_design.len() / n.max(1);
     let evaluator = RefCell::new(SparseRemlEvaluator::new(n, p, analysis));
+    let brent_phase_timing = RefCell::new(SparseRemlPhaseTiming::default());
     let mut brent_done = 0usize;
+    let brent_t0 = Instant::now();
     let (best_log10, _cost) = brent_minimize_with_init(
         |x0| {
             if brent_progress_err.borrow().is_some() {
@@ -569,7 +652,10 @@ fn sparse_reml_brent_search_with_progress(
                 x0,
                 &mut evaluator.borrow_mut(),
             ) {
-                Ok(eval) => -eval.reml,
+                Ok((eval, eval_timing)) => {
+                    brent_phase_timing.borrow_mut().add_eval(&eval_timing);
+                    -eval.reml
+                }
                 Err(err) => {
                     if sparse_reml_debug_enabled() {
                         eprintln!("SPREML Brent eval failed at log10(lambda)={x0:.6e}: {err}");
@@ -599,10 +685,13 @@ fn sparse_reml_brent_search_with_progress(
         max_iter,
         init,
     );
+    timing.brent_secs = brent_t0.elapsed().as_secs_f64();
+    timing.brent_eval = brent_phase_timing.into_inner();
     if let Some(err) = brent_progress_err.into_inner() {
         return Err(err);
     }
-    let best_eval = evaluate_sparse_reml_at_lambda(
+    let final_eval_t0 = Instant::now();
+    let (best_eval, final_eval_timing) = evaluate_sparse_reml_at_lambda(
         analysis,
         x_design,
         y,
@@ -615,10 +704,16 @@ fn sparse_reml_brent_search_with_progress(
         ),
         None => err,
     })?;
-    Ok(SparseRemlSearchResult {
-        best: best_eval,
-        grid: grid.grid,
-    })
+    timing.final_eval_secs = final_eval_t0.elapsed().as_secs_f64();
+    timing.final_eval.add_eval(&final_eval_timing);
+    timing.total_secs = total_t0.elapsed().as_secs_f64();
+    Ok((
+        SparseRemlSearchResult {
+            best: best_eval,
+            grid: grid.grid,
+        },
+        timing,
+    ))
 }
 
 #[inline]
@@ -836,11 +931,15 @@ pub fn spreml_sparse_reml_brent_from_jxgrm<'py>(
     };
 
     py.detach(move || {
+        let total_t0 = Instant::now();
+        let timing_enabled = sparse_reml_timing_enabled();
         let total_progress = 1usize
             .saturating_add(grid_size.max(2))
             .saturating_add(max_iter.max(1));
         emit_sparse_reml_progress(progress_callback.as_ref(), 0, total_progress)?;
+        let analysis_t0 = Instant::now();
         let analysis = load_subset_analysis_from_path(&jxgrm_path, sample_idx_raw.as_deref())?;
+        let analysis_load_secs = analysis_t0.elapsed().as_secs_f64();
         emit_sparse_reml_progress(progress_callback.as_ref(), 1, total_progress)?;
         if analysis.dim() != y_vec.len() {
             return Err(format!(
@@ -853,8 +952,11 @@ pub fn spreml_sparse_reml_brent_from_jxgrm<'py>(
             Some((buf, p)) => (Some(buf.as_slice()), *p),
             None => (None, 0usize),
         };
+        let design_t0 = Instant::now();
         let x_design = build_design_matrix(x_cov_slice, y_vec.len(), p0)?;
-        let result = sparse_reml_brent_search_with_progress(
+        let design_secs = design_t0.elapsed().as_secs_f64();
+        let p = x_design.len() / y_vec.len().max(1);
+        let (result, mut timing) = sparse_reml_brent_search_with_progress(
             &analysis,
             &x_design,
             &y_vec,
@@ -867,6 +969,12 @@ pub fn spreml_sparse_reml_brent_from_jxgrm<'py>(
             1,
             total_progress,
         )?;
+        timing.analysis_load_secs = analysis_load_secs;
+        timing.design_secs = design_secs;
+        timing.total_secs = total_t0.elapsed().as_secs_f64();
+        if timing_enabled {
+            emit_sparse_reml_timing(&timing, y_vec.len(), p, grid_size.max(2), max_iter.max(1));
+        }
         emit_sparse_reml_progress(progress_callback.as_ref(), total_progress, total_progress)?;
         Ok(result_to_tuple(result))
     })

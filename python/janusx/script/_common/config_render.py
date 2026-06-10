@@ -8,6 +8,7 @@ from .status import stdout_is_tty
 
 try:
     from rich.console import Console, Group
+    from rich.measure import Measurement
     from rich.panel import Panel
     from rich.table import Table
     from rich.text import Text
@@ -17,6 +18,7 @@ try:
 except Exception:
     Console = None  # type: ignore[assignment]
     Group = None  # type: ignore[assignment]
+    Measurement = None  # type: ignore[assignment]
     Panel = None  # type: ignore[assignment]
     Table = None  # type: ignore[assignment]
     Text = None  # type: ignore[assignment]
@@ -163,13 +165,14 @@ def _render_rich_panel(
     key_width: int,
     line_max_chars: int,
     overflow_mark: str,
-) -> bool:
+) -> int:
     if not (_HAS_RICH and stdout_is_tty()):
-        return False
+        return 0
 
     try:
         assert Console is not None
         assert Group is not None
+        assert Measurement is not None
         assert Panel is not None
         assert Table is not None
         assert Text is not None
@@ -211,16 +214,18 @@ def _render_rich_panel(
             parts.append(Text("Output", style=styles["section"]))
             parts.append(_kv_table(footer_rows))
 
+        console = Console()
         panel = Panel(
             Group(*parts),
             title=panel_title_txt,
             border_style=styles["border"],
             expand=False,
         )
-        Console().print(panel)
-        return True
+        panel_width = int(max(1, Measurement.get(console, console.options, panel).maximum))
+        console.print(panel)
+        return panel_width
     except Exception:
-        return False
+        return 0
 
 
 def emit_cli_configuration(
@@ -295,7 +300,7 @@ def emit_cli_configuration(
     terminal_lines.append(divider_terminal + "\n")
 
     if bool(emit_to_stdout):
-        rich_rendered = _render_rich_panel(
+        rich_panel_width = _render_rich_panel(
             app_title=str(app_title),
             config_title=str(config_title),
             host=str(host),
@@ -305,8 +310,17 @@ def emit_cli_configuration(
             line_max_chars=line_max_chars,
             overflow_mark=overflow_mark,
         )
+        if int(rich_panel_width) > 0:
+            try:
+                setattr(logger, "_janusx_cli_config_panel_width", int(rich_panel_width))
+            except Exception:
+                pass
 
-        if not rich_rendered:
+        if int(rich_panel_width) <= 0:
+            try:
+                setattr(logger, "_janusx_cli_config_panel_width", int(len(divider_terminal)))
+            except Exception:
+                pass
             _emit_info_to_stream_handlers(logger, str(app_title))
             _emit_info_to_stream_handlers(logger, f"Host: {host}\n")
             for line in terminal_lines:

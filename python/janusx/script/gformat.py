@@ -750,9 +750,12 @@ def _read_plink_bim_sites(prefix: str) -> list[SiteInfo]:
                 )
             chrom = str(tok[0])
             pos = int(float(tok[3]))
+            snp = str(tok[1]).strip()
+            if snp == "" or snp == ".":
+                snp = f"{chrom}_{pos}"
             ref = str(tok[4])
             alt = str(tok[5])
-            out.append(SiteInfo(chrom, int(pos), ref, alt))
+            out.append(SiteInfo(chrom, int(pos), snp, ref, alt))
     if len(out) == 0:
         raise ValueError(f"No variants found in BIM: {bim_path}")
     return out

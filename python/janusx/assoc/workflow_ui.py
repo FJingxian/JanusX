@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import re
 import threading
 import time
 from typing import Optional
@@ -17,6 +19,7 @@ from janusx.script._common.cjk import contains_cjk as _contains_cjk, ensure_cjk_
 from janusx.script._common.progress import build_rich_progress, rich_progress_available
 from janusx.script._common.status import (
     CliStatus,
+    format_elapsed,
     is_skip_status_text,
     print_success,
     print_warning,
@@ -34,6 +37,72 @@ except Exception:
 
 
 _GWAS_PROGRESS_BAR_WIDTH = 30
+_GWAS_LOG_PROGRESS_MIN_INTERVAL_SEC = 2.0
+_GWAS_MODEL_LINE_WIDTH = 80
+_GWAS_MODEL_DONE_RE = re.compile(
+    r"^(?P<label>[A-Za-z][A-Za-z0-9]*(?:\([^)]*\))?)\s+\.\.\.(?P<body>.*?)(?:\s+\[(?P<times>[^\]]+)\])?$"
+)
+_GWAS_MODEL_LABELS = {
+    "LM",
+    "LMM",
+    "FastLMM",
+    "FvLMM",
+    "SparseLMM",
+    "ALGWAS",
+    "FarmCPU",
+    "LowRankLMM",
+    "LrLMM",
+}
+
+
+def _logger_flag(logger: Optional[logging.Logger], name: str, default: bool = False) -> bool:
+    if logger is None:
+        return bool(default)
+    try:
+        return bool(getattr(logger, name))
+    except Exception:
+        return bool(default)
+
+
+def _gwas_progress_enabled(logger: Optional[logging.Logger]) -> bool:
+    env_raw = str(os.environ.get("JX_GWAS_PROGRESS", "0")).strip().lower()
+    env_enabled = env_raw in {"1", "true", "yes", "y", "on"}
+    return bool(_logger_flag(logger, "_janusx_gwas_progress_enabled", env_enabled))
+
+
+def _gwas_verbose_enabled(logger: Optional[logging.Logger]) -> bool:
+    return bool(_logger_flag(logger, "_janusx_gwas_verbose", False))
+
+
+def _format_gwas_model_completion_line(message: object) -> Optional[str]:
+    msg = str(message).strip()
+    if msg == "":
+        return None
+    m = _GWAS_MODEL_DONE_RE.match(msg)
+    if m is None:
+        return None
+    label_raw = str(m.group("label") or "").strip()
+    label = re.sub(r"\([^)]*\)$", "", label_raw).strip()
+    if label not in _GWAS_MODEL_LABELS:
+        return None
+    body = str(m.group("body") or "").strip()
+    if body == "":
+        body = "Finished"
+    if body.lower().startswith("pve "):
+        body = f"PVE={body[4:].strip()}"
+    times = str(m.group("times") or "").strip()
+    prefix = f"  > {label:<14}: "
+    suffix = f"[ {times} ]" if times != "" else ""
+    if suffix != "":
+        dots = max(2, _GWAS_MODEL_LINE_WIDTH - len(prefix) - len(body) - len(suffix) - 1)
+        return f"{prefix}{body} {'.' * dots} {suffix}"
+    return f"{prefix}{body}"
+
+
+def _progress_callback_step(total: int, *, updates: int = _GWAS_PROGRESS_BAR_WIDTH) -> int:
+    tot = int(max(1, total))
+    n_updates = int(max(8, updates))
+    return int(max(1, (tot + n_updates - 1) // n_updates))
 
 
 def _format_progress_metric(
@@ -135,6 +204,8 @@ def _log_model_line(
     *,
     use_spinner: bool = False,
 ) -> None:
+    if not _gwas_verbose_enabled(logger):
+        return
     _log_info(logger, f"{str(model_label)}: {str(message)}", use_spinner=use_spinner)
 
 
@@ -147,6 +218,14 @@ def _rich_success(
 ) -> None:
     msg = str(message)
     file_msg = str(msg if log_message is None else log_message)
+    model_line = _format_gwas_model_completion_line(msg)
+    if model_line is not None:
+        if use_spinner or stdout_is_tty():
+            _log_file_only(logger, logging.INFO, model_line)
+            print(model_line, flush=True)
+        else:
+            logger.info(model_line)
+        return
     force_color = bool(use_spinner)
     if is_skip_status_text(msg):
         if use_spinner or stdout_is_tty():
@@ -167,10 +246,23 @@ class _ProgressAdapter:
     Progress bar adapter with rich-first rendering and tqdm fallback.
     """
 
-    def __init__(self, total: int, desc: str, *, force_animate: bool = False) -> None:
+    def __init__(
+        self,
+        total: int,
+        desc: str,
+        *,
+        force_animate: bool = False,
+        logger: Optional[logging.Logger] = None,
+        log_unit: str = "SNP",
+    ) -> None:
         self.total = int(max(0, total))
         self.desc = str(desc)
-        self._animate = bool(force_animate or should_animate_status(self.desc))
+        self._progress_enabled = _gwas_progress_enabled(logger)
+        self._animate = bool(
+            self._progress_enabled and (force_animate or should_animate_status(self.desc))
+        )
+        self._logger = logger
+        self._log_unit = str(log_unit).strip() or "item"
         self._backend = "none"
         self._progress = None
         self._task_id = None
@@ -183,6 +275,11 @@ class _ProgressAdapter:
         self._memory_until_tick = 0
         self._hb_stop = threading.Event()
         self._hb_thread: Optional[threading.Thread] = None
+        self._log_last_cells = -1
+        self._log_last_desc = self.desc
+        self._log_last_memory = ""
+        self._log_last_emit_ts = 0.0
+        self._log_finished = False
 
         if self._animate and rich_progress_available():
             try:
@@ -221,11 +318,65 @@ class _ProgressAdapter:
         if self._animate and self._backend in {"rich", "tqdm"}:
             self._hb_thread = threading.Thread(target=self._heartbeat, daemon=True)
             self._hb_thread.start()
+        self._emit_log_progress(force=True)
+
+    def _active_memory_text(self) -> str:
+        if self._memory_text and self._tick <= self._memory_until_tick:
+            return str(self._memory_text).strip()
+        return ""
+
+    def _emit_progress_log_line(self, line: str) -> None:
+        if self._logger is None:
+            return
+        if stdout_is_tty():
+            _log_file_only(self._logger, logging.INFO, str(line))
+        else:
+            self._logger.info(str(line))
+
+    def _emit_log_progress(self, *, force: bool = False) -> None:
+        if (not self._progress_enabled) or self._logger is None:
+            return
+        total = int(max(1, self.total))
+        done = int(max(0, min(self._done, total)))
+        frac = float(done) / float(total) if total > 0 else 0.0
+        width = int(max(8, _GWAS_PROGRESS_BAR_WIDTH))
+        filled = width if done >= total else int(frac * float(width))
+        filled = max(0, min(width, filled))
+        mem_text = self._active_memory_text()
+        now = time.monotonic()
+        if not force:
+            if (
+                filled == self._log_last_cells
+                and self.desc == self._log_last_desc
+                and mem_text == self._log_last_memory
+                and (now - self._log_last_emit_ts) < _GWAS_LOG_PROGRESS_MIN_INTERVAL_SEC
+            ):
+                return
+        elif (
+            done == total
+            and self._log_finished
+            and filled == self._log_last_cells
+            and self.desc == self._log_last_desc
+            and mem_text == self._log_last_memory
+        ):
+            return
+        bar = "*" * filled
+        unit = str(self._log_unit).strip() or "item"
+        if done == total and total > 0:
+            self._log_finished = True
+        elapsed = format_elapsed(now - self._start_ts)
+        details = [f"{done:,}/{total:,} {unit}", elapsed]
+        if mem_text != "":
+            details.append(f"RSS={mem_text}")
+        line = f"{self.desc} progress [{bar}] [{', '.join(details)}]"
+        self._emit_progress_log_line(line)
+        self._log_last_cells = filled
+        self._log_last_desc = self.desc
+        self._log_last_memory = mem_text
+        self._log_last_emit_ts = now
 
     def _metric_text(self) -> str:
-        mem = ""
-        if self._memory_text and self._tick <= self._memory_until_tick:
-            mem = self._memory_text
+        mem = self._active_memory_text()
         return _format_progress_metric(self._done, self.total, mem if mem else None)
 
     def _refresh_metric(self) -> None:
@@ -257,12 +408,14 @@ class _ProgressAdapter:
         elif self._backend == "tqdm" and self._tqdm is not None:
             self._tqdm.update(step)
             self._tqdm.set_postfix_str(self._metric_text())
+        self._emit_log_progress(force=False)
 
     def set_postfix(self, *, memory: Optional[str] = None) -> None:
         if memory is not None:
             self._memory_text = str(memory).replace(" ", "")
             self._memory_until_tick = self._tick + 5
         self._refresh_metric()
+        self._emit_log_progress(force=False)
 
     def set_description(self, desc: str) -> None:
         self.desc = str(desc)
@@ -270,6 +423,7 @@ class _ProgressAdapter:
             self._progress.update(self._task_id, description=self.desc, metric=self._metric_text())
         elif self._backend == "tqdm" and self._tqdm is not None:
             self._tqdm.set_description_str(self.desc)
+        self._emit_log_progress(force=True)
 
     def set_total(self, total: int) -> None:
         self.total = int(max(0, total))
@@ -279,6 +433,7 @@ class _ProgressAdapter:
         elif self._backend == "tqdm" and self._tqdm is not None:
             self._tqdm.total = self.total
             self._tqdm.refresh()
+        self._emit_log_progress(force=True)
 
     def finish(self) -> None:
         if self._finished:
@@ -291,6 +446,7 @@ class _ProgressAdapter:
             self._tqdm.set_postfix_str(self._metric_text())
             self._tqdm.refresh()
         self._finished = True
+        self._emit_log_progress(force=True)
 
     def close(self, *, show_done: bool = True) -> None:
         if self._hb_thread is not None:
@@ -311,6 +467,8 @@ class _ProgressAdapter:
         elif self._backend == "tqdm" and self._tqdm is not None:
             self._tqdm.close()
             self._tqdm = None
+        if show_done and self._finished and (not self._log_finished):
+            self._emit_log_progress(force=True)
         self._backend = "none"
         self._finished = True
 

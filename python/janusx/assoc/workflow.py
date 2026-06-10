@@ -91,7 +91,6 @@ from janusx.gfreader import (
 from janusx.pyBLUP.QK2 import QK
 from janusx import janusx as jxrs
 from janusx.script._common.log import setup_logging
-from janusx.script._common.config_render import emit_cli_configuration
 from janusx.script._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 from janusx.script._common.pathcheck import (
     ensure_all_true,
@@ -178,6 +177,7 @@ from janusx.assoc.workflow_ui import (
     _log_model_line,
     _rich_success,
     _ProgressAdapter,
+    _progress_callback_step,
     _start_indeterminate_progress_bar,
     _stop_indeterminate_progress_bar,
     fastplot,
@@ -199,7 +199,9 @@ from janusx.assoc.workflow_cache import (
 
 _FASTLMM_PVE_LOW = 0.05
 _FASTLMM_PVE_HIGH = 0.995
-_SECTION_WIDTH = 60
+_SECTION_WIDTH = 80
+_REPORT_RULE = "=" * _SECTION_WIDTH
+_REPORT_SUBRULE = "-" * _SECTION_WIDTH
 _GWAS_PROGRESS_BAR_WIDTH = 30
 _GWAS_COL_RANGE_RE = re.compile(r"^\s*(\d+)\s*([:-])\s*(\d+)\s*$")
 
@@ -215,17 +217,174 @@ def _env_truthy(name: str, default: str = "0") -> bool:
 def _gwas_plot_enabled() -> bool:
     return _env_truthy("JX_GWAS_PLOT", "1")
 
+
+def _gwas_logger_verbose(logger: Optional[logging.Logger]) -> bool:
+    try:
+        return bool(getattr(logger, "_janusx_gwas_verbose"))
+    except Exception:
+        return False
+
+
+def _emit_report_banner(logger: logging.Logger, title: str) -> None:
+    logger.info(_REPORT_RULE)
+    logger.info(str(title))
+    logger.info(_REPORT_RULE)
+    logger.info("")
+
+
+def _emit_report_block(logger: logging.Logger, title: str) -> None:
+    logger.info(f"[ {str(title)} ]")
+
+
+def _emit_report_major_section(logger: logging.Logger, title: str) -> None:
+    logger.info("")
+    logger.info(_REPORT_RULE)
+    logger.info(f"[ {str(title)} ]")
+    logger.info(_REPORT_SUBRULE)
+
+
+def _emit_report_kv(logger: logging.Logger, key: str, value: object, *, key_width: int = 16) -> None:
+    logger.info(f"  {str(key):<{int(key_width)}} : {str(value)}")
+
+
+def _normalize_gwas_model_name(model_name: object) -> str:
+    model_text = str(model_name or "").strip()
+    if model_text.lower() in {"lowranklmm", "lrlmm"}:
+        return "LrLMM"
+    return model_text
+
+
+def _format_gwas_models_executed(args) -> str:
+    models: list[str] = []
+    if bool(args.lm):
+        models.append("LM")
+    if bool(args.lmm):
+        models.append("LMM")
+    if bool(args.fastlmm):
+        models.append("FastLMM")
+    if bool(args.fvlmm):
+        models.append("FvLMM")
+    if bool(args.splmm):
+        models.append("SparseLMM")
+    if bool(args.algwas):
+        models.append("ALGWAS")
+    if bool(args.farmcpu):
+        models.append("FarmCPU")
+    return ", ".join(models) if len(models) > 0 else "None"
+
+
+def _format_gwas_fast_mode_status(
+    *,
+    explicit_fast_mode: bool,
+    farmcpu_auto_fast: bool,
+    algwas_auto_fast: bool,
+) -> str:
+    if bool(explicit_fast_mode):
+        return "Enabled (CLI)"
+    auto_tags: list[str] = []
+    if bool(farmcpu_auto_fast):
+        auto_tags.append("FarmCPU Auto-selected")
+    if bool(algwas_auto_fast):
+        auto_tags.append("ALGWAS Auto-selected")
+    if len(auto_tags) > 0:
+        return f"Enabled ({'; '.join(auto_tags)})"
+    return "Disabled"
+
+
+def _format_gwas_grm_status(grm, grm_arg: object) -> str:
+    if grm is None:
+        return "Not loaded"
+    try:
+        arr = np.asarray(grm)
+        if arr.ndim == 2:
+            shape_text = f"{int(arr.shape[0])}x{int(arr.shape[1])}"
+        else:
+            shape_text = str(tuple(int(x) for x in arr.shape))
+    except Exception:
+        shape_text = "Loaded"
+    grm_opt = str(grm_arg).strip()
+    if grm_opt == "1":
+        src = "Centered GRM"
+    elif grm_opt == "2":
+        src = "Standardized GRM"
+    else:
+        src = "Reused"
+    return f"{shape_text} ({src})"
+
+
+def _format_gwas_q_status(qmatrix) -> str:
+    if qmatrix is None:
+        return "Not loaded"
+    try:
+        q_arr = np.asarray(qmatrix)
+        if q_arr.ndim != 2:
+            return "Invalid"
+        qdim = int(q_arr.shape[1])
+        if qdim <= 0:
+            return "Dimension 0 (Empty)"
+        return f"Dimension {qdim}"
+    except Exception:
+        return "Unknown"
+
+
+def _format_gwas_cov_status(cov_all) -> str:
+    if cov_all is None:
+        return "None"
+    try:
+        arr = np.asarray(cov_all)
+        if arr.ndim != 2 or int(arr.shape[1]) <= 0:
+            return "None"
+        return f"{int(arr.shape[1])} columns"
+    except Exception:
+        return "Loaded"
+
+
+def _format_gwas_sparse_status(
+    sparse_grm_path: Optional[str],
+    *,
+    sparse_requested: bool,
+    sparse_cutoff: Optional[float],
+    sparse_source: object,
+) -> str:
+    if not bool(sparse_requested):
+        return "Not requested"
+    if sparse_grm_path is None or str(sparse_grm_path).strip() == "":
+        cutoff_text = "NA" if sparse_cutoff is None else f"{float(sparse_cutoff):g}"
+        return f"Requested (cutoff={cutoff_text})"
+    source = str(sparse_source).strip()
+    src_label = "Reused" if source not in {"", "1", "2"} else "Prepared"
+    cutoff_text = "" if sparse_cutoff is None else f" | cutoff={float(sparse_cutoff):g}"
+    return f"{src_label} ({_display_path(str(sparse_grm_path))}{cutoff_text})"
+
+
+def _format_gwas_thread_plan(
+    args,
+    fvlmm_scan_spec: Optional[dict[str, int]],
+) -> str:
+    scan_stage = _resolve_fvlmm_scan_stage_mode()
+    if fvlmm_scan_spec is None:
+        blas_threads = int(args.thread)
+        rayon_threads = int(args.thread)
+    else:
+        blas_threads = int(fvlmm_scan_spec.get("blas_threads", args.thread))
+        rayon_threads = int(fvlmm_scan_spec.get("rayon_threads", args.thread))
+    return (
+        f"FvLMM_scan_stage={scan_stage} | "
+        f"BLAS={blas_threads} | Rayon={rayon_threads}"
+    )
+
+
 def _section(logger:logging.Logger, title: str) -> None:
     """Emit a formatted log section header with a leading blank line."""
     logger.info("")
-    logger.info("=" * _SECTION_WIDTH)
+    logger.info(_REPORT_RULE)
     logger.info(title)
-    logger.info("=" * _SECTION_WIDTH)
+    logger.info(_REPORT_RULE)
 
 
 def _phase_split(logger: logging.Logger) -> None:
     """Visual separator between loading stage and compute stage."""
-    logger.info("-" * _SECTION_WIDTH)
+    logger.info(_REPORT_SUBRULE)
 
 
 def _replace_file_with_retry(
@@ -483,10 +642,6 @@ def _emit_trait_header(
     use_spinner: bool = False,
     width: int = 60,
 ) -> None:
-    """
-    Emit trait header as one line: "<trait> (n=<idv>)".
-    If it exceeds section width, wrap at trait/name boundary.
-    """
     trait = str(trait_name)
     pve_val: Optional[float] = None
     if pve is not None:
@@ -496,35 +651,17 @@ def _emit_trait_header(
                 pve_val = pve_tmp
         except Exception:
             pve_val = None
-    if pve_val is None:
-        n_line = f"(n={int(n_idv)})"
-    else:
-        n_line = f"(n={int(n_idv)}; pve={pve_val:.3f})"
-    prefix = "* "
-    full = f"{prefix}{trait} {n_line}"
-    if len(full) <= int(width):
-        lines = [full]
-    else:
-        if (len(prefix) + len(trait)) <= int(width):
-            lines = [f"{prefix}{trait}", n_line]
-        else:
-            trait_lines = textwrap.wrap(
-                trait,
-                width=max(10, int(width) - len(prefix)),
-                break_long_words=True,
-                break_on_hyphens=False,
-            )
-            if len(trait_lines) > 0:
-                trait_lines[0] = f"{prefix}{trait_lines[0]}"
-            else:
-                trait_lines = [prefix.strip()]
-            lines = trait_lines + [n_line]
-    for ln in lines:
-        if use_spinner:
-            _log_file_only(logger, logging.INFO, ln)
-            print(ln, flush=True)
-        else:
-            logger.info(ln)
+    _emit_report_major_section(logger, f"Task Execution: {trait}")
+    sample_text = f"{int(n_idv)}"
+    if pve_val is not None:
+        sample_text = f"{sample_text} | Null PVE={pve_val:.3f}"
+    _emit_report_kv(logger, "Trait Samples", sample_text)
+    context_rows = getattr(logger, "_janusx_gwas_task_context_rows", None)
+    if isinstance(context_rows, list):
+        for item in context_rows:
+            if not (isinstance(item, tuple) and len(item) == 2):
+                continue
+            _emit_report_kv(logger, str(item[0]), item[1])
 
 
 def _emit_gwas_summary(
@@ -534,23 +671,21 @@ def _emit_gwas_summary(
     if len(rows) == 0:
         return
 
-    _section(logger, "Summary")
+    _emit_report_major_section(logger, "Summary Report")
     headers = [
-        "pheno",
-        "model",
-        "nidv",
-        "nsnp",
-        "pve",
-        "mem(G)",
-        "Ctime(s)",
-        "Vtime(s)",
+        "Trait",
+        "Model",
+        "N_Indv",
+        "N_SNP",
+        "PVE",
+        "Mem(GB)",
+        "C-Time(s)",
+        "V-Time(s)",
     ]
 
     out_rows: list[list[str]] = []
     for r in _ordered_gwas_summary_rows(rows):
-        model_text = str(r.get("model", "")).strip()
-        if model_text.lower() in {"lowranklmm", "lrlmm"}:
-            model_text = "LrLMM"
+        model_text = _normalize_gwas_model_name(r.get("model", ""))
         pve_raw = r.get("pve", None)
         pve_text = "NA"
         try:
@@ -582,6 +717,7 @@ def _emit_gwas_summary(
     logger.info(header_line)
     for row in out_rows:
         logger.info("  ".join(row[i].ljust(widths[i]) for i in range(len(row))))
+    logger.info(_REPORT_SUBRULE)
 
 
 def _align_pheno_to_sample_order(
@@ -1889,7 +2025,8 @@ def _inspect_genotype_with_status(
                 logger.warning(wmsg)
         task.desc = f"Loading genotype from {src}... SNP={n_snps}"
         task.complete(f"Loading genotype from {src} (n={len(ids)}, nSNP={n_snps})")
-        _log_info(logger, f"Cached genotype sites: {n_snps}", use_spinner=use_spinner)
+        if _gwas_logger_verbose(logger):
+            _log_info(logger, f"Genotype sites cached: {n_snps}", use_spinner=use_spinner)
         return ids, n_snps
 
 
@@ -1980,18 +2117,20 @@ def build_grm_streaming(
         cache_write_path=cache_write_path,
     )
 
-    _log_info(
-        logger,
-        (
-            f"Building GRM (Rust {backend_kind} single-entry), method={method}. "
-            f"route={backend_reason}"
-        ),
-        use_spinner=use_spinner,
-    )
+    if _gwas_logger_verbose(logger):
+        _log_info(
+            logger,
+            (
+                f"Building GRM (Rust {backend_kind} single-entry), method={method}. "
+                f"route={backend_reason}"
+            ),
+            use_spinner=use_spinner,
+        )
     pbar = _ProgressAdapter(
         total=n_snps,
         desc=("GRM (rust-memmap)" if backend_kind == "memmap-bed" else "GRM (rust-bed)"),
         force_animate=True,
+        logger=logger,
     )
     process = psutil.Process()
     mem_tick_span = max(1, 10 * int(chunk_size))
@@ -2148,7 +2287,8 @@ def build_grm_streaming(
     finally:
         pbar.close(show_done=False)
 
-    _log_info(logger, "GRM construction finished.", use_spinner=use_spinner)
+    if _gwas_logger_verbose(logger):
+        _log_info(logger, "GRM construction finished.", use_spinner=use_spinner)
     return grm, int(eff_m)
 
 def load_or_build_grm_with_cache(
@@ -2390,7 +2530,8 @@ def load_or_build_grm_with_cache(
                 raise
             task.complete(f"Loading GRM from {src} (n={grm.shape[0]})")
 
-    _log_info(logger, f"GRM shape: {grm.shape}", use_spinner=use_spinner)
+    if _gwas_logger_verbose(logger):
+        _log_info(logger, f"GRM shape: {grm.shape}", use_spinner=use_spinner)
     return grm, eff_m, grm_ids, grm_cache_path
 
 
@@ -2714,7 +2855,8 @@ def load_or_build_q_with_cache(
             "Use -q <int> and provide external covariates via -c."
         )
 
-    _log_info(logger, f"Q matrix shape: {qmatrix.shape}", use_spinner=use_spinner)
+    if _gwas_logger_verbose(logger):
+        _log_info(logger, f"Q matrix shape: {qmatrix.shape}", use_spinner=use_spinner)
     return qmatrix, q_ids
 
 
@@ -2806,11 +2948,12 @@ def prepare_streaming_context(
         int(n_snps),
         streaming=True,
     )
-    _log_info(
-        logger,
-        f"Genotype meta: {n_samples} samples, {n_snps} SNPs.",
-        use_spinner=use_spinner,
-    )
+    if _gwas_logger_verbose(logger):
+        _log_info(
+            logger,
+            f"Genotype meta: {n_samples} samples, {n_snps} SNPs.",
+            use_spinner=use_spinner,
+        )
 
     cache_prefix = _gwas_cache_prefix_with_params(
         genofile,
@@ -2820,11 +2963,12 @@ def prepare_streaming_context(
         logger=logger,
         warning_collector=deferred_cache_warnings,
     )
-    _log_info(
-        logger,
-        f"Cache prefix: {cache_prefix}",
-        use_spinner=use_spinner,
-    )
+    if _gwas_logger_verbose(logger):
+        _log_info(
+            logger,
+            f"Cache prefix: {cache_prefix}",
+            use_spinner=use_spinner,
+        )
     stream_genofile = str(genofile)
     preloaded_packed: Union[dict[str, object], None] = None
     genofile_low = str(genofile).lower()
@@ -3158,14 +3302,15 @@ def prepare_streaming_context(
     q_has_pc = bool(np.asarray(qmatrix).ndim == 2 and int(qmatrix.shape[1]) > 0)
     q_n: Union[int, str] = "NA" if (q_ids is None or (not q_has_pc)) else int(len(q_ids))
     cov_n: Union[int, str] = "NA" if cov_ids is None else int(len(cov_ids))
-    _emit_plain_info_line(
-        logger,
-        (
-            f"geno={len(geno_ids)}, pheno={len(pheno_ids)}, "
-            f"grm={grm_n}, q={q_n}, cov={cov_n} -> {len(common_ids)}"
-        ),
-        use_spinner=use_spinner,
-    )
+    if _gwas_logger_verbose(logger):
+        _emit_plain_info_line(
+            logger,
+            (
+                f"Sample overlap: geno={len(geno_ids)}, pheno={len(pheno_ids)}, "
+                f"grm={grm_n}, q={q_n}, cov={cov_n}, common={len(common_ids)}"
+            ),
+            use_spinner=use_spinner,
+        )
 
     # index maps
     geno_index = {sid: i for i, sid in enumerate(geno_ids)}
@@ -4079,7 +4224,7 @@ def _gwas_eigh_from_grm(
         evd_backend=backend,
         logger=logger,
     )
-    if logger is not None:
+    if logger is not None and _gwas_logger_verbose(logger):
         subset_desc = (
             f"{n_eigh}/{n_full}" if effective_subset_idx_arr is not None else f"full/{n_full}"
         )
@@ -4465,12 +4610,12 @@ def run_lrlmm_packed(
         gwas_total = int(len(sites_all))
         gwas_last_done = 0
         gwas_pbar: Optional[_ProgressAdapter] = None
-        if show_internal_status:
-            gwas_pbar = _ProgressAdapter(
-                total=max(1, gwas_total),
-                desc="LrLMM",
-                force_animate=True,
-            )
+        gwas_pbar = _ProgressAdapter(
+            total=max(1, gwas_total),
+            desc="LrLMM",
+            force_animate=True,
+            logger=logger,
+        )
 
         def _lrlmm_progress(done: int, total: int) -> None:
             nonlocal gwas_last_done, gwas_total, gwas_pbar
@@ -4491,6 +4636,7 @@ def run_lrlmm_packed(
                     total=gwas_total,
                     desc="LrLMM",
                     force_animate=True,
+                    logger=logger,
                 )
                 gwas_last_done = 0
             d = int(max(0, min(d, max(1, gwas_total))))
@@ -4505,7 +4651,15 @@ def run_lrlmm_packed(
             if gwas_pbar is not None:
                 progress_kwargs = {
                     "progress_callback": _lrlmm_progress,
-                    "progress_every": int(max(1, int(chunk_size))),
+                    "progress_every": int(
+                        max(
+                            1,
+                            min(
+                                int(max(1, int(chunk_size))),
+                                _progress_callback_step(int(max(1, gwas_total))),
+                            ),
+                        )
+                    ),
                 }
             try:
                 lbd, _ml0, _reml0, res_raw = jxrs.fastlmm_assoc_packed_f32(
@@ -4932,12 +5086,12 @@ def _run_file_dense_fast_once(
     process = psutil.Process()
     n_cores = detect_effective_threads()
 
-    _section(logger, "GWAS task")
-    _log_file_only(
-        logger,
-        logging.INFO,
-        "FILE fast mode: preparing shared dense genotype cache once for LM/LMM/FastLMM/FvLMM/FarmCPU.",
-    )
+    if _gwas_logger_verbose(logger):
+        _log_file_only(
+            logger,
+            logging.INFO,
+            "FILE fast mode: preparing shared dense genotype cache once for LM/LMM/FastLMM/FvLMM/FarmCPU.",
+        )
     farmcpu_cache_runtime = run_farmcpu_fullmem(
         args=args,
         gfile=str(gfile),
@@ -5000,7 +5154,16 @@ def _run_file_dense_fast_once(
 
     ref_alt_obj = farmcpu_cache_runtime.get("ref_alt")
     chrom_all, pos_all, snp_all, allele0_all, allele1_all = _extract_ref_alt(ref_alt_obj, n_snps)
-    _phase_split(logger)
+    setattr(
+        logger,
+        "_janusx_gwas_task_context_rows",
+        [
+            ("Data Loaded", f"{int(ids.shape[0])} Samples | {int(n_snps)} SNPs"),
+            ("Genotype Cache", _display_path(str(gfile))),
+            ("Q Matrix", _format_gwas_q_status(qmatrix)),
+            ("Covariates", "None"),
+        ],
+    )
 
     model_sequence = [m for m in stream_models if m in {"lm", "lmm", "fastlmm", "fvlmm"}]
     gm_tag = str(args.model).lower()
@@ -5647,6 +5810,10 @@ def parse_args(argv: Optional[list[str]] = None):
         "-prefix", "--prefix", type=str, default=None,
         help="Prefix for output files (default: %(default)s).",
     )
+    optional_group.add_argument(
+        "-v", "--verbose", action="store_true", default=False,
+        help="Show advanced diagnostics and configuration details at the end of the report.",
+    )
 
     args, extras = parser.parse_known_args(argv)
     has_genotype = bool(args.vcf or args.hmp or args.file or args.bfile)
@@ -5722,7 +5889,7 @@ def _run_gwas_pipeline(
     return_result: bool = False,
 ):
     t_start = time.time()
-    use_spinner = bool(getattr(sys.stdout, "isatty", lambda: False)())
+    use_spinner = False
     run_id = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
     run_created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     run_status = "done"
@@ -5755,6 +5922,8 @@ def _run_gwas_pipeline(
     outprefix = os.path.join(args.out, prefix)
     log_path = f"{outprefix}.gwas.log"
     logger = setup_logging(log_path)
+    setattr(logger, "_janusx_gwas_verbose", bool(getattr(args, "verbose", False)))
+    setattr(logger, "_janusx_gwas_progress_enabled", False)
     _file_only_logger = logging.getLogger("janusx.gwas.file_only")
     _file_only_logger.handlers.clear()
     _file_only_logger.setLevel(logging.INFO)
@@ -5763,17 +5932,19 @@ def _run_gwas_pipeline(
         if isinstance(_h, logging.FileHandler):
             _file_only_logger.addHandler(_h)
 
-    def _log_thread_diag_file_only(msg: str) -> None:
+    advanced_notes: list[str] = []
+
+    def _append_advanced_note(msg: str) -> None:
         text = str(msg).strip()
         if text != "":
-            _file_only_logger.info(text)
+            advanced_notes.append(text)
 
     fvlmm_scan_spec: dict[str, int] | None = None
     if bool(getattr(args, "fvlmm", False)):
         fvlmm_scan_spec = _gwas_fvlmm_scan_stage_thread_plan(int(args.thread))
-    _log_thread_diag_file_only(f"Thread detect: {format_thread_budget_summary(thread_budget)}")
-    _log_thread_diag_file_only(format_affinity_cpu_summary(thread_budget))
-    _log_thread_diag_file_only(
+    _append_advanced_note(f"Thread detect: {format_thread_budget_summary(thread_budget)}")
+    _append_advanced_note(format_affinity_cpu_summary(thread_budget))
+    _append_advanced_note(
         "Thread plan: "
         f"requested={requested_threads}, using={int(args.thread)}, "
         f"fvlmm_scan_stage={_resolve_fvlmm_scan_stage_mode()}"
@@ -5782,10 +5953,10 @@ def _run_gwas_pipeline(
         _fb = int(fvlmm_scan_spec["blas_threads"])
         _fr = int(fvlmm_scan_spec["rayon_threads"])
         if _fb == _fr:
-            _log_thread_diag_file_only(f"FvLMM scan threads: BLAS={_fb}, Rayon={_fr}")
+            _append_advanced_note(f"FvLMM scan threads: BLAS={_fb}, Rayon={_fr}")
         else:
-            _log_thread_diag_file_only(f"FvLMM scan BLAS threads: {_fb}")
-            _log_thread_diag_file_only(f"FvLMM scan Rayon threads: {_fr}")
+            _append_advanced_note(f"FvLMM scan BLAS threads: {_fb}")
+            _append_advanced_note(f"FvLMM scan Rayon threads: {_fr}")
     if thread_capped:
         logger.warning(
             f"Warning: Requested threads={requested_threads} exceeds local effective={detected_threads}; "
@@ -5802,6 +5973,7 @@ def _run_gwas_pipeline(
     saved_result_paths: list[str] = []
     ordered_result_paths: list[str] = []
     trait_order: list[str] = []
+    advanced_config_rows: list[tuple[str, object]] = []
     _, _file_matrix_path_cli = _resolve_file_input_matrix(gfile)
     input_is_file_matrix = bool(_file_matrix_path_cli is not None)
     explicit_fast_mode = bool(getattr(args, "fast", False))
@@ -5816,21 +5988,6 @@ def _run_gwas_pipeline(
     file_fast_dense_mode = False
 
     if log:
-        model_tokens: list[str] = []
-        if args.lm:
-            model_tokens.append("LM")
-        if args.fastlmm:
-            model_tokens.append("fastLMM")
-        if args.fvlmm:
-            model_tokens.append("FvLMM")
-        if args.lmm:
-            model_tokens.append("LMM")
-        if args.splmm:
-            model_tokens.append("SparseLMM")
-        if args.algwas:
-            model_tokens.append("ALGWAS")
-        if args.farmcpu:
-            model_tokens.append("FarmCPU")
         cli_fast_mode = bool(fast_mode)
         if file_fast_rust_mode:
             bed_backend_policy = "packed (-fast/-farmcpu/-algwas; FILE->BED cache)"
@@ -5840,50 +5997,74 @@ def _run_gwas_pipeline(
                 if cli_fast_mode
                 else "memmap (default)"
             )
-        cfg_rows: list[tuple[str, object]] = [
-            ("Genotype file", gfile),
-            ("Phenotype file", args.pheno),
-            ("Phenotype cols", args.ncol if args.ncol is not None else "All"),
-            ("BED backend", bed_backend_policy),
-            ("Fast mode", cli_fast_mode),
-            ("Models", " ".join(model_tokens) if len(model_tokens) > 0 else "None"),
-            ("Genetic model", args.model),
-            ("SNPs only", args.snps_only),
-            ("GRM option", args.grm),
-            ("Q option", args.qcov),
-            ("MAF threshold", args.maf),
-            ("Miss threshold", args.geno),
-            ("Memory MB", args.memory),
+        _emit_report_banner(logger, "JanusX - GWAS Pipeline Analysis")
+        _emit_report_block(logger, "System Context")
+        _emit_report_kv(logger, "Host", socket.gethostname())
+        _emit_report_kv(
+            logger,
+            "Threads",
+            f"Requested={requested_threads} | Using={int(args.thread)} (Local Effective: {detected_threads})",
+        )
+        _emit_report_kv(
+            logger,
+            "Thread Plan",
+            _format_gwas_thread_plan(args, fvlmm_scan_spec),
+        )
+        logger.info("")
+        _emit_report_block(logger, "Configuration")
+        _emit_report_kv(logger, "Genotype File", _display_path(str(gfile)))
+        _emit_report_kv(logger, "Phenotype File", _display_path(str(args.pheno)))
+        _emit_report_kv(
+            logger,
+            "Phenotype Cols",
+            args.ncol if args.ncol is not None else "All",
+        )
+        _emit_report_kv(logger, "Models Executed", _format_gwas_models_executed(args))
+        _emit_report_kv(
+            logger,
+            "Thresholds",
+            f"MAF={float(args.maf):g} | Miss={float(args.geno):g}",
+        )
+        _emit_report_kv(logger, "Output Prefix", _display_path(str(outprefix)))
+        _emit_report_kv(
+            logger,
+            "Fast Mode",
+            _format_gwas_fast_mode_status(
+                explicit_fast_mode=bool(explicit_fast_mode),
+                farmcpu_auto_fast=bool(farmcpu_auto_fast),
+                algwas_auto_fast=bool(algwas_auto_fast),
+            ),
+        )
+        advanced_config_rows: list[tuple[str, object]] = [
+            ("BED Backend", bed_backend_policy),
+            ("Genetic Model", args.model),
+            ("GRM Option", args.grm),
+            ("Q Option", args.qcov),
+            ("Memory MB", float(args.memory)),
+            ("SNPs Only", bool(args.snps_only)),
+            ("Force Model", bool(args.force_model)),
         ]
-        if args.model != "add":
-            cfg_rows.append(("Het filter", f"{args.het} (keep [{args.het}, {1.0 - args.het}])"))
-        if args.farmcpu:
-            cfg_rows.extend(
-                [
-                    ("FarmCPU iter", int(args.farmcpu_iter)),
-                    ("FarmCPU threshold", float(args.farmcpu_threshold)),
-                    ("FarmCPU nbin", int(args.farmcpu_nbin)),
-                    ("FarmCPU QTNbound", "auto" if args.farmcpu_qtn_bound is None else int(args.farmcpu_qtn_bound)),
-                    ("FarmCPU szbin", ",".join(f"{float(x):g}" for x in args.farmcpu_bin_size)),
-                ]
+        if float(args.het) > 0.0:
+            advanced_config_rows.append(
+                ("Het Filter", f"{float(args.het):g} (keep [{float(args.het):g}, {1.0 - float(args.het):g}])")
             )
         if args.cov:
-            cfg_rows.append(("Covariates", "; ".join(args.cov)))
+            advanced_config_rows.append(("Covariates", "; ".join(str(x) for x in args.cov)))
         if args.splmm:
-            cfg_rows.append(("SparseLMM sparse", True))
-        footer_rows: list[tuple[str, object]] = [
-            ("Threads", f"{args.thread} (local effective {detected_threads})"),
-            ("Output prefix", outprefix),
-        ]
-        emit_cli_configuration(
-            logger,
-            app_title="JanusX - GWAS",
-            config_title="GWAS CONFIG",
-            host=socket.gethostname(),
-            sections=[("General", cfg_rows)],
-            footer_rows=footer_rows,
-            line_max_chars=60,
-        )
+            advanced_config_rows.append(
+                ("SparseLMM Mode", str(getattr(args, "_splmm_denom_mode", "exact") or "exact"))
+            )
+            advanced_config_rows.append(("Sparse GRM Input", str(getattr(args, "grm_sparse", "1"))))
+        if args.farmcpu:
+            advanced_config_rows.extend(
+                [
+                    ("FarmCPU Iter", int(args.farmcpu_iter)),
+                    ("FarmCPU Threshold", float(args.farmcpu_threshold)),
+                    ("FarmCPU NBin", int(args.farmcpu_nbin)),
+                    ("FarmCPU QTNbound", "auto" if args.farmcpu_qtn_bound is None else int(args.farmcpu_qtn_bound)),
+                    ("FarmCPU SzBin", ",".join(f"{float(x):g}" for x in args.farmcpu_bin_size)),
+                ]
+            )
 
     checks: list[bool] = []
     if args.bfile:
@@ -5924,37 +6105,27 @@ def _run_gwas_pipeline(
     input_is_bed = _as_plink_prefix(gfile) is not None
     memmap_mode = not bool(fast_mode)
     mmap_limit_effective = bool(memmap_mode)
-    _log_file_only(
-        logger,
-        logging.INFO,
-        (
-            "FILE fast backend policy: Rust packed/stream via PLINK cache."
-            if file_fast_rust_mode
-            else (
-                "BED backend policy: packed (-fast/-farmcpu/-algwas)."
-                if fast_mode
-                else "BED backend policy: memmap (default)."
-            )
-        ),
+    _append_advanced_note(
+        "FILE fast backend policy: Rust packed/stream via PLINK cache."
+        if file_fast_rust_mode
+        else (
+            "BED backend policy: packed (-fast/-farmcpu/-algwas)."
+            if fast_mode
+            else "BED backend policy: memmap (default)."
+        )
     )
     if memmap_mode:
-        _log_file_only(
-            logger,
-            logging.INFO,
+        _append_advanced_note(
             "Default memmap route enabled: stream-aligned windowed mmap will be used on BED/cache input "
-            "(no temporary mmapbed.* PLINK cache will be created).",
+            "(no temporary mmapbed.* PLINK cache will be created)."
         )
     if (not input_is_bed) and memmap_mode:
-        _log_file_only(
-            logger,
-            logging.INFO,
-            "Input is not direct PLINK BED; memmap route will apply after source conversion/cache to BED.",
+        _append_advanced_note(
+            "Input is not direct PLINK BED; memmap route will apply after source conversion/cache to BED."
         )
     if bool(args.splmm) and (not bool(fast_mode)):
-        _log_file_only(
-            logger,
-            logging.INFO,
-            "SparseLMM default backend: BED memmap/streaming metadata; packed preload is used only with -fast.",
+        _append_advanced_note(
+            "SparseLMM default backend: BED memmap/streaming metadata; packed preload is used only with -fast."
         )
     qcov_needs_grm = str(getattr(args, "qcov", "0")).strip() not in {"", "0"}
     # GRM route policy:
@@ -5974,37 +6145,25 @@ def _run_gwas_pipeline(
         (not bool(file_fast_dense_mode))
         and (allow_packed_grm_reuse or force_bed_stream_scan)
     )
-    if force_bed_stream_scan and (not bool(fast_mode)):
-        _log_file_only(
-            logger,
-            logging.INFO,
-            "FILE matrix input for LM/LMM/FaSTLMM: materializing PLINK BED cache for Rust streaming scan.",
+    if force_bed_stream_scan and bool(args.file) and (not bool(fast_mode)):
+        _append_advanced_note(
+            "FILE matrix input for LM/LMM/FaSTLMM: materializing PLINK BED cache for Rust streaming scan."
         )
     if (not bool(fast_mode)) and bool(args.lmm or args.fastlmm or args.fvlmm or qcov_needs_grm):
-        _log_file_only(
-            logger,
-            logging.INFO,
-            "Non-fast GWAS: GRM uses memmap path by default (packed single-entry disabled).",
+        _append_advanced_note(
+            "Non-fast GWAS: GRM uses memmap path by default (packed single-entry disabled)."
         )
     elif bool(args.lmm or args.fastlmm or args.fvlmm or qcov_needs_grm):
-        _log_file_only(
-            logger,
-            logging.INFO,
+        _append_advanced_note(
             "GWAS GRM auto route: memmap stays primary for full-sample builds; packed is "
-            "reused only when a compatible preloaded packed payload is already available.",
+            "reused only when a compatible preloaded packed payload is already available."
         )
     if bool(args.farmcpu) and (not bool(explicit_fast_mode)):
         if bool(farmcpu_auto_fast):
-            _log_file_only(
-                logger,
-                logging.INFO,
-                "FarmCPU selected: enabling fast mode automatically.",
-            )
+            _append_advanced_note("FarmCPU selected: enabling fast mode automatically.")
         else:
-            _log_file_only(
-                logger,
-                logging.INFO,
-                "FarmCPU selected on FILE matrix input: packed fast mode disabled; using dense float32 path.",
+            _append_advanced_note(
+                "FarmCPU selected on FILE matrix input: packed fast mode disabled; using dense float32 path."
             )
     os.environ["JX_BED_BLOCK_TARGET_MB"] = f"{float(args.memory):.6g}"
     try:
@@ -6162,12 +6321,7 @@ def _run_gwas_pipeline(
 
                     splmm_post_grm_hook = _prepare_splmm_sparse_after_grm
             if shared_context_needed:
-                _section(logger, "GWAS task")
-                _log_file_only(
-                    logger,
-                    logging.INFO,
-                    "Prepare shared context (phenotype/genotype meta/GRM/Q/cov)",
-                )
+                _append_advanced_note("Prepare shared context (phenotype/genotype meta/GRM/Q/cov)")
                 pheno, ids, n_snps, grm, qmatrix, cov_all, eff_m, genofile_stream, preloaded_packed = prepare_streaming_context(
                     genofile=genofile_stream,
                     phenofile=args.pheno,
@@ -6222,7 +6376,26 @@ def _run_gwas_pipeline(
                             f"Fast mode packed preload unavailable; falling back to on-demand packed load. reason={ex}"
                         )
                         preloaded_packed = packed_preload_failure_state(genofile_stream, ex)
-                _phase_split(logger)
+                logger_task_rows: list[tuple[str, object]] = [
+                    ("Data Loaded", f"{int(len(ids))} Samples | {int(n_snps)} SNPs"),
+                    ("Genotype Cache", _display_path(str(genofile_stream))),
+                    ("GRM Status", _format_gwas_grm_status(grm, args.grm)),
+                    ("Q Matrix", _format_gwas_q_status(qmatrix)),
+                    ("Covariates", _format_gwas_cov_status(cov_all)),
+                ]
+                if bool(args.splmm) or bool(args.splmm_approx):
+                    logger_task_rows.append(
+                        (
+                            "Sparse GRM",
+                            _format_gwas_sparse_status(
+                                prepared_splmm_sparse_jxgrm_path,
+                                sparse_requested=bool(args.splmm),
+                                sparse_cutoff=prepared_splmm_sparse_cutoff,
+                                sparse_source=getattr(args, "grm_sparse", "1"),
+                            ),
+                        )
+                    )
+                setattr(logger, "_janusx_gwas_task_context_rows", logger_task_rows)
             else:
                 if args.farmcpu:
                     pheno = _load_phenotype_with_status(
@@ -6231,6 +6404,11 @@ def _run_gwas_pipeline(
                         logger,
                         id_col=0,
                         use_spinner=use_spinner,
+                    )
+                    setattr(
+                        logger,
+                        "_janusx_gwas_task_context_rows",
+                        [("Phenotype Rows", int(pheno.shape[0]))],
                     )
 
         trait_order = list(pheno.columns) if pheno is not None else []
@@ -7012,9 +7190,16 @@ def _run_gwas_pipeline(
         )
         if len(ordered_result_paths) > 0:
             logger.info("")
-            saved_body = "\n".join([f"  {_display_path(p)}" for p in ordered_result_paths])
-            _rich_success(logger, f"Results saved:\n{saved_body}")
-        # _rich_success(logger, f"  {str(log_path).replace('//', '/')}")
+            _emit_report_block(logger, "Outputs Generated")
+            for p in ordered_result_paths:
+                logger.info(f"  * {_display_path(p)}")
+        if bool(getattr(args, "verbose", False)):
+            logger.info("")
+            _emit_report_block(logger, "Advanced Parameters")
+            for key, value in advanced_config_rows:
+                _emit_report_kv(logger, str(key), value)
+            for note in advanced_notes:
+                logger.info(f"  Note             : {note}")
 
     except KeyboardInterrupt:
         run_status = "failed"
@@ -7036,13 +7221,10 @@ def _run_gwas_pipeline(
         run_error = str(e)
         logger.exception(f"Error in JanusX GWAS pipeline: {e}")
 
-    lt = time.localtime()
-    endinfo = (
-        f"\nFinished. Total wall time: {round(time.time() - t_start, 2)} seconds\n"
-        f"{lt.tm_year}-{lt.tm_mon}-{lt.tm_mday} "
-        f"{lt.tm_hour}:{lt.tm_min}:{lt.tm_sec}"
-    )
-    _rich_success(logger, endinfo)
+    logger.info("")
+    _emit_report_kv(logger, "Total Wall Time", f"{max(time.time() - t_start, 0.0):.2f}s")
+    _emit_report_kv(logger, "Finished At", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    logger.info(_REPORT_RULE)
 
     if bool(return_result):
         return {

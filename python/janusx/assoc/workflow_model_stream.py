@@ -31,6 +31,7 @@ from .workflow import (
     _finalize_gwas_result_tsv,
     _format_progress_metric,
     _cleanup_gwas_result_tmp,
+    _progress_callback_step,
     _mixed_model_switch_to_lm_decision,
     _resolve_trait_iter,
     _gwas_result_tmp_path,
@@ -637,12 +638,13 @@ def run_chunked_gwas_lmm_lm(
             and (not bool(chunk_size_user_set))
             and int(model_chunk_size) != int(chunk_size)
         ):
-            _log_file_only(
-                logger,
-                logging.INFO,
-                f"LM auto chunk-size: {int(chunk_size)} -> {int(model_chunk_size)} "
-                f"(n={int(n_idv)}).",
-            )
+            if bool(getattr(logger, "_janusx_gwas_verbose", False)):
+                _log_file_only(
+                    logger,
+                    logging.INFO,
+                    f"LM auto chunk-size: {int(chunk_size)} -> {int(model_chunk_size)} "
+                    f"(n={int(n_idv)}).",
+                )
 
         header_pve: Optional[float] = None
         init_log_message: Optional[str] = None
@@ -820,6 +822,13 @@ def run_chunked_gwas_lmm_lm(
         pbar_total = int(eff_snp_by_trait.get(pname, n_snps))
         pbar_desc = f"{effective_model_label}"
         pbar: Optional[_ProgressAdapter] = None
+        if not bool(use_spinner):
+            pbar = _ProgressAdapter(
+                total=int(max(1, pbar_total)),
+                desc=pbar_desc,
+                force_animate=True,
+                logger=logger,
+            )
         pbar_last_done = 0
         scan_warmup_task: Optional[CliStatus] = None
         scan_warmup_active = False
@@ -1007,6 +1016,7 @@ def run_chunked_gwas_lmm_lm(
                         total=pbar_total,
                         desc=pbar_desc,
                         force_animate=True,
+                        logger=logger,
                     )
                 pbar.update(int(m_chunk))
 
@@ -1019,8 +1029,6 @@ def run_chunked_gwas_lmm_lm(
 
         def _fvlmm_unified_progress(done: int, total: int) -> None:
             nonlocal pbar, pbar_total, pbar_last_done, scan_warmup_active, scan_warmup_task
-            if not bool(use_spinner):
-                return
             try:
                 d = int(done)
                 t = int(total)
@@ -1039,6 +1047,7 @@ def run_chunked_gwas_lmm_lm(
                     total=pbar_total,
                     desc=pbar_desc,
                     force_animate=True,
+                    logger=logger,
                 )
                 pbar_last_done = 0
             elif total_use != pbar_total and pbar_last_done == 0:
@@ -1051,6 +1060,7 @@ def run_chunked_gwas_lmm_lm(
                     total=pbar_total,
                     desc=pbar_desc,
                     force_animate=True,
+                    logger=logger,
                 )
                 pbar_last_done = 0
             d = int(max(0, min(d, pbar_total)))
@@ -1092,8 +1102,16 @@ def run_chunked_gwas_lmm_lm(
                     threads=int(scan_threads),
                     nullml=mod.ML0,
                     rotate_block_rows=int(model_chunk_size),
-                    progress_callback=(_fvlmm_unified_progress if bool(use_spinner) else None),
-                    progress_every=int(max(1, int(model_chunk_size))),
+                    progress_callback=_fvlmm_unified_progress,
+                    progress_every=int(
+                        max(
+                            1,
+                            min(
+                                int(max(1, int(model_chunk_size))),
+                                _progress_callback_step(int(max(1, pbar_total))),
+                            ),
+                        )
+                    ),
                 )
                 done_snps = int(rows_written)
                 has_results = done_snps > 0
@@ -1412,11 +1430,12 @@ def run_chunked_gwas_streaming_shared(
             ("FastLMM" if m == "fastlmm" else ("FvLMM" if m == "fvlmm" else str(m).upper()))
             for m in model_order
         )
-        _log_file_only(
-            logger,
-            logging.INFO,
-            f"Shared GWAS stream: grouped {grouped_labels} on one BED scan.",
-        )
+        if bool(getattr(logger, "_janusx_gwas_verbose", False)):
+            _log_file_only(
+                logger,
+                logging.INFO,
+                f"Shared GWAS stream: grouped {grouped_labels} on one BED scan.",
+            )
 
     process = psutil.Process()
     n_cores = detect_effective_threads()
@@ -1886,6 +1905,7 @@ def run_chunked_gwas_streaming_shared(
                         total=pbar_total,
                         desc=str(ctx["model_label"]),
                         force_animate=True,
+                        logger=logger,
                     )
         progress_started = True
 
@@ -1938,12 +1958,13 @@ def run_chunked_gwas_streaming_shared(
         and (not bool(chunk_size_user_set))
         and int(model_chunk_size) != int(chunk_size)
     ):
-        _log_file_only(
-            logger,
-            logging.INFO,
-            f"LM auto chunk-size: {int(chunk_size)} -> {int(model_chunk_size)} "
-            f"(n={int(n_idv)}).",
-        )
+        if bool(getattr(logger, "_janusx_gwas_verbose", False)):
+            _log_file_only(
+                logger,
+                logging.INFO,
+                f"LM auto chunk-size: {int(chunk_size)} -> {int(model_chunk_size)} "
+                f"(n={int(n_idv)}).",
+            )
     mmap_window_mb = (
         auto_mmap_window_mb(genofile, len(ids), n_snps, _current_bed_memory_mb())
         if mmap_limit else None
@@ -2053,11 +2074,12 @@ def run_chunked_gwas_streaming_shared(
                 raise RuntimeError(
                     "Rust-only GWAS scan requires BedChunkReader.next_chunk_prepared."
                 )
-            _log_file_only(
-                logger,
-                logging.INFO,
-                "Shared GWAS scan: using Rust BED prepared-chunk stream.",
-            )
+            if bool(getattr(logger, "_janusx_gwas_verbose", False)):
+                _log_file_only(
+                    logger,
+                    logging.INFO,
+                    "Shared GWAS scan: using Rust BED prepared-chunk stream.",
+                )
             while True:
                 out, legacy_snps_only = _bed_next_chunk_prepared_compat(
                     bed_reader=bed_reader,

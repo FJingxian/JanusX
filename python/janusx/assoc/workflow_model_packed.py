@@ -48,6 +48,7 @@ from .workflow import (
     _log_file_only,
     _log_model_line,
     _mixed_model_switch_to_lm_decision,
+    _progress_callback_step,
     _read_bim_sites,
     _replace_file_with_retry,
     _resolve_trait_iter,
@@ -410,6 +411,7 @@ def _ensure_jxlmm_sparse_grm(
                 total=t,
                 desc=progress_desc,
                 force_animate=True,
+                logger=logger,
             )
             last_total = t
         if t != last_total:
@@ -2207,12 +2209,12 @@ def run_fastlmm_packed_fullrank(
         gwas_total = int(len(sites_all))
         gwas_last_done = 0
         gwas_pbar: Optional[_ProgressAdapter] = None
-        if bool(use_spinner):
-            gwas_pbar = _ProgressAdapter(
-                total=max(1, gwas_total),
-                desc=_route_model_label,
-                force_animate=True,
-            )
+        gwas_pbar = _ProgressAdapter(
+            total=max(1, gwas_total),
+            desc=_route_model_label,
+            force_animate=True,
+            logger=logger,
+        )
 
         def _fastlmm_progress(done: int, total: int) -> None:
             nonlocal gwas_last_done, gwas_total, gwas_pbar
@@ -2233,6 +2235,7 @@ def run_fastlmm_packed_fullrank(
                     total=gwas_total,
                     desc=_route_model_label,
                     force_animate=True,
+                    logger=logger,
                 )
                 gwas_last_done = 0
             d = int(max(0, min(d, max(1, gwas_total))))
@@ -2306,7 +2309,15 @@ def run_fastlmm_packed_fullrank(
                     if gwas_pbar is not None:
                         progress_kwargs = {
                             "progress_callback": _fastlmm_progress,
-                            "progress_every": int(max(1, min(gwas_total, int(max(1, chunk_size))))),
+                            "progress_every": int(
+                                max(
+                                    1,
+                                    min(
+                                        int(max(1, min(gwas_total, int(max(1, chunk_size))))),
+                                        _progress_callback_step(int(max(1, gwas_total))),
+                                    ),
+                                )
+                            ),
                         }
                     unified_done = False
                     if _gwas_use_rust_unified_v1():
@@ -2331,7 +2342,15 @@ def run_fastlmm_packed_fullrank(
                                     "fixed_ml0": (float(fixed_ml0) if fixed_ml0 is not None else None),
                                     "rotate_block_rows": int(max(1, int(chunk_size))),
                                     "scan_progress_callback": _fastlmm_progress,
-                                    "progress_every": int(max(1, int(chunk_size))),
+                                    "progress_every": int(
+                                        max(
+                                            1,
+                                            min(
+                                                int(max(1, int(chunk_size))),
+                                                _progress_callback_step(int(max(1, gwas_total))),
+                                            ),
+                                        )
+                                    ),
                                 }
                             ]
                             _res = jxrs.gwas_packed_unified_to_tsv(
@@ -2645,12 +2664,12 @@ def run_lm_packed_fullrank(
         gwas_total = int(len(sites_all))
         gwas_last_done = 0
         gwas_pbar: Optional[_ProgressAdapter] = None
-        if bool(use_spinner):
-            gwas_pbar = _ProgressAdapter(
-                total=max(1, gwas_total),
-                desc="LM",
-                force_animate=True,
-            )
+        gwas_pbar = _ProgressAdapter(
+            total=max(1, gwas_total),
+            desc="LM",
+            force_animate=True,
+            logger=logger,
+        )
 
         def _lm_progress(done: int, total: int) -> None:
             nonlocal gwas_last_done, gwas_total, gwas_pbar
@@ -2671,6 +2690,7 @@ def run_lm_packed_fullrank(
                     total=gwas_total,
                     desc="LM",
                     force_animate=True,
+                    logger=logger,
                 )
                 gwas_last_done = 0
             d = int(max(0, min(d, max(1, gwas_total))))
@@ -2686,7 +2706,15 @@ def run_lm_packed_fullrank(
                 if gwas_pbar is not None:
                     kwargs_assoc = {
                         "progress_callback": _lm_progress,
-                        "progress_every": int(max(1, int(chunk_size))),
+                        "progress_every": int(
+                            max(
+                                1,
+                                min(
+                                    int(max(1, int(chunk_size))),
+                                    _progress_callback_step(int(max(1, gwas_total))),
+                                ),
+                            )
+                        ),
                     }
 
                 if use_block_lm:
@@ -2733,7 +2761,15 @@ def run_lm_packed_fullrank(
                                     "sample_indices": sample_idx_trait,
                                     "step": int(max(1, int(chunk_size))),
                                     "scan_progress_callback": _lm_progress,
-                                    "progress_every": int(max(1, int(chunk_size))),
+                                    "progress_every": int(
+                                        max(
+                                            1,
+                                            min(
+                                                int(max(1, int(chunk_size))),
+                                                _progress_callback_step(int(max(1, gwas_total))),
+                                            ),
+                                        )
+                                    ),
                                 }
                             ]
                             _res = jxrs.gwas_packed_unified_to_tsv(
@@ -3005,6 +3041,13 @@ def run_lm_stream_bed_single_entry(
         scan_t0 = time.monotonic()
         pbar_total_hint = int(eff_snp_by_trait.get(str(pname), n_snps))
         pbar: Optional[_ProgressAdapter] = None
+        if not bool(use_spinner):
+            pbar = _ProgressAdapter(
+                total=int(max(1, pbar_total_hint)),
+                desc="LM",
+                force_animate=True,
+                logger=logger,
+            )
         pbar_done = 0
         warm_task: Optional[CliStatus] = None
         warm_active = False
@@ -3032,7 +3075,12 @@ def run_lm_stream_bed_single_entry(
                         pass
                     warm_active = False
                 total_use = int(max(1, t if t > 0 else pbar_total_hint))
-                pbar = _ProgressAdapter(total=total_use, desc="LM", force_animate=True)
+                pbar = _ProgressAdapter(
+                    total=total_use,
+                    desc="LM",
+                    force_animate=True,
+                    logger=logger,
+                )
             total_cap = int(max(1, pbar.total))
             d = int(max(0, min(d, total_cap)))
             stepv = int(max(0, d - int(pbar_done)))
@@ -3045,12 +3093,18 @@ def run_lm_stream_bed_single_entry(
         scan_ok = False
         try:
             with _gwas_scan_stage_ctx(int(max(1, scan_threads))):
-                kwargs_stream: dict[str, object] = {}
-                if bool(use_spinner):
-                    kwargs_stream = {
-                        "progress_callback": _lm_progress,
-                        "progress_every": int(max(1, int(model_chunk_size))),
-                    }
+                kwargs_stream: dict[str, object] = {
+                    "progress_callback": _lm_progress,
+                    "progress_every": int(
+                        max(
+                            1,
+                            min(
+                                int(max(1, int(model_chunk_size))),
+                                _progress_callback_step(int(max(1, pbar_total_hint))),
+                            ),
+                        )
+                    ),
+                }
                 lm_base_kwargs = {
                     "sample_ids": trait_ids.tolist(),
                     "maf_threshold": float(maf_threshold),
@@ -3449,12 +3503,12 @@ def run_lmm_packed_fullrank(
         gwas_total = int(len(sites_all))
         gwas_last_done = 0
         gwas_pbar: Optional[_ProgressAdapter] = None
-        if bool(use_spinner):
-            gwas_pbar = _ProgressAdapter(
-                total=max(1, gwas_total),
-                desc="LMM",
-                force_animate=True,
-            )
+        gwas_pbar = _ProgressAdapter(
+            total=max(1, gwas_total),
+            desc="LMM",
+            force_animate=True,
+            logger=logger,
+        )
 
         def _lmm_progress(done: int, total: int) -> None:
             nonlocal gwas_last_done, gwas_total, gwas_pbar
@@ -3475,6 +3529,7 @@ def run_lmm_packed_fullrank(
                     total=gwas_total,
                     desc="LMM",
                     force_animate=True,
+                    logger=logger,
                 )
                 gwas_last_done = 0
             d = int(max(0, min(d, max(1, gwas_total))))
@@ -3517,7 +3572,15 @@ def run_lmm_packed_fullrank(
                     if gwas_pbar is not None:
                         progress_kwargs = {
                             "progress_callback": _lmm_progress,
-                            "progress_every": int(max(1, int(chunk_size))),
+                            "progress_every": int(
+                                max(
+                                    1,
+                                    min(
+                                        int(max(1, int(chunk_size))),
+                                        _progress_callback_step(int(max(1, gwas_total))),
+                                    ),
+                                )
+                            ),
                         }
                     null_ml0: Optional[float] = None
                     init_log10_lbd: Optional[float] = None
@@ -3883,6 +3946,7 @@ def run_algwas_packed_fullrank(
                     total=total_use,
                     desc="ALGWAS stage1",
                     force_animate=True,
+                    logger=logger,
                 )
             total_use = int(max(1, stage1_pbar.total if stage1_pbar is not None else stage1_total))
             if t > 0:
@@ -3935,6 +3999,7 @@ def run_algwas_packed_fullrank(
                     total=total_use,
                     desc="ALGWAS scan",
                     force_animate=True,
+                    logger=logger,
                 )
             total_use = int(max(1, gwas_pbar.total if gwas_pbar is not None else gwas_total))
             d = int(max(0, min(d, total_use)))
@@ -3970,7 +4035,15 @@ def run_algwas_packed_fullrank(
                                 "scan_step": int(max(1, int(chunk_size))),
                                 "stage1_progress_callback": _algwas_stage1_progress,
                                 "scan_progress_callback": _algwas_progress,
-                                "progress_every": int(max(1, int(chunk_size))),
+                                "progress_every": int(
+                                    max(
+                                        1,
+                                        min(
+                                            int(max(1, int(chunk_size))),
+                                            _progress_callback_step(int(max(1, gwas_total))),
+                                        ),
+                                    )
+                                ),
                                 "pseudo_tsv": str(pseudo_tsv_hint),
                             }
                         ]
@@ -4662,6 +4735,7 @@ def run_splmm_packed_fullrank(
                         total=total_use,
                         desc="SparseLMM",
                         force_animate=True,
+                        logger=logger,
                     )
                 elif total_use != int(max(1, current_total)):
                     current_total = total_use

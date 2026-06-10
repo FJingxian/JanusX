@@ -283,6 +283,7 @@ def build_qmatrix_farmcpu(
             total=int(max(1, int(packed.shape[0]))),
             desc="GRM (packed-bed)",
             force_animate=True,
+            logger=logger,
         )
         process = psutil.Process()
         mem_tick_span = max(1, 10 * int(max(1, int(chunk_size))))
@@ -369,6 +370,7 @@ def build_qmatrix_farmcpu(
             total=int(max(1, m_rows)),
             desc="GRM (dense)",
             force_animate=True,
+            logger=logger,
         )
         process = psutil.Process()
         mem_tick_span = max(1, 10 * int(block_rows))
@@ -678,7 +680,12 @@ def run_farmcpu_fullmem(
         allele0 = np.empty(n_pre_keep, dtype=object)
         allele1 = np.empty(n_pre_keep, dtype=object)
 
-        pbar = _ProgressAdapter(total=n_total, desc=f"Loading site metadata ({src})")
+        pbar = _ProgressAdapter(
+            total=n_total,
+            desc=f"Loading site metadata ({src})",
+            logger=logger,
+            log_unit="row",
+        )
         lines = 0
         done = 0
         out = 0
@@ -1056,7 +1063,10 @@ def run_farmcpu_fullmem(
         )
         _emit_plain_info_line(
             logger,
-            f"geno={geno_n}, pheno={pheno.shape[0]}, q={q_n}, cov={cov_n} -> {common_n}",
+            (
+                f"Sample overlap: geno={geno_n}, pheno={pheno.shape[0]}, "
+                f"q={q_n}, cov={cov_n}, common={common_n}"
+            ),
             use_spinner=bool(use_spinner),
         )
         # For packed+Rust path, keep lightweight metadata lists in cache to avoid
@@ -1195,6 +1205,8 @@ def run_farmcpu_fullmem(
             total=farm_iter,
             desc=farm_label,
             force_animate=bool(use_spinner),
+            logger=logger,
+            log_unit="iter",
         )
         farm_state = {"done": 0}
 

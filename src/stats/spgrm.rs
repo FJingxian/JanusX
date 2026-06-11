@@ -24,7 +24,7 @@ use crate::blas::{
     CBLAS_LOWER, CBLAS_NO_TRANS, CBLAS_ROW_MAJOR, CBLAS_TRANS, CBLAS_UPPER,
 };
 use crate::gfcore::read_fam;
-use crate::gfreader::prepare_bed_logic_meta_owned_for_stats_samples;
+use crate::gfreader::prepare_bed_logic_meta_owned_for_stats_samples_with_mmap_window;
 use crate::gload::WindowedBedMatrix;
 use crate::grm::decode_grm_block;
 use crate::stats_common::{
@@ -3081,14 +3081,15 @@ pub fn spgrm_bed_to_jxgrm_core(
     if bed_prefix.is_empty() {
         return Err("Sparse GRM BED prefix must not be empty".to_string());
     }
-    let prepared = prepare_bed_logic_meta_owned_for_stats_samples(
+    let prepared = prepare_bed_logic_meta_owned_for_stats_samples_with_mmap_window(
         &bed_prefix,
         maf_threshold,
         max_missing_rate,
         het_threshold,
         snps_only,
         sample_idx,
-        false,
+        true,
+        mmap_window_mb,
     )?;
     let selected_idx: Cow<'_, [usize]> = match sample_idx {
         Some(idx) => Cow::Borrowed(idx),

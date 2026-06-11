@@ -4306,6 +4306,154 @@ pub(crate) struct PreparedBedPackedOwned {
     pub bytes_per_snp: usize,
 }
 
+fn prepare_bed_logic_meta_owned_for_stats_samples_sparse_windowed(
+    prefix: &str,
+    maf_threshold: f32,
+    max_missing_rate: f32,
+    het_threshold: f32,
+    stats_sample_indices: Option<&[usize]>,
+    mmap_window_mb: usize,
+) -> Result<PreparedBedLogicMetaOwned, String> {
+    if mmap_window_mb == 0 {
+        return Err("mmap_window_mb must be > 0".to_string());
+    }
+
+    let total_t0 = Instant::now();
+    let mut bed_prefix = prefix.to_string();
+    let lower = bed_prefix.to_ascii_lowercase();
+    if lower.ends_with(".bed") || lower.ends_with(".bim") || lower.ends_with(".fam") {
+        bed_prefix.truncate(bed_prefix.len() - 4);
+    }
+
+    let open_iter_t0 = Instant::now();
+    let mut it = BedSnpIter::new_for_grm_window(&bed_prefix, mmap_window_mb)?;
+    let open_iter_secs = open_iter_t0.elapsed().as_secs_f64();
+    let n_samples = it.n_samples();
+    if n_samples == 0 {
+        return Err("no samples found in PLINK input".to_string());
+    }
+
+    let stats_sample_indices = stats_sample_indices.unwrap_or(&[]);
+    if !stats_sample_indices.is_empty() && stats_sample_indices.iter().any(|&idx| idx >= n_samples)
+    {
+        return Err("selected sample index out of range for BED logic preparation".to_string());
+    }
+    let stats_identity = stats_sample_indices.is_empty()
+        || (stats_sample_indices.len() == n_samples
+            && sample_indices_are_identity(stats_sample_indices));
+    let stats_n_samples = if stats_identity {
+        n_samples
+    } else {
+        stats_sample_indices.len()
+    };
+    if stats_n_samples == 0 {
+        return Err("selected sample set for BED logic preparation is empty".to_string());
+    }
+
+    let n_snps = it.n_snps();
+    let bytes_per_snp = n_samples.div_ceil(4);
+    emit_gfreader_rss_debug(
+        "prepare_bed_logic_meta/windowed_init",
+        &format!(
+            "prefix={bed_prefix} n_samples={n_samples} stats_n_samples={stats_n_samples} n_snps={n_snps} bytes_per_snp={bytes_per_snp} mmap_window_mb={mmap_window_mb}"
+        ),
+    );
+
+    let apply_het_filter = het_threshold > 0.0_f32;
+    let row_stats_t0 = Instant::now();
+    let mut site_keep = Vec::<bool>::with_capacity(n_snps);
+    let mut row_flip_keep = Vec::<bool>::new();
+    let mut row_source_indices = Vec::<usize>::new();
+    let mut missing_rate_keep = Vec::<f32>::new();
+    let mut maf_keep = Vec::<f32>::new();
+
+    while let Some((snp_idx, counts)) = if stats_identity {
+        it.next_snp_counts_only()
+    } else {
+        it.next_snp_selected_counts_only(stats_sample_indices)
+    } {
+        let non_missing = counts.non_missing;
+        let alt_sum = counts.alt_sum as usize;
+        let het_count = counts.het_count;
+        let (missing_rate, _maf, _std) =
+            packed_row_stats_from_counts(stats_n_samples, non_missing, alt_sum);
+        let alt_freq = if non_missing > 0 {
+            (counts.alt_sum as f32) / (2.0_f32 * non_missing as f32)
+        } else {
+            0.0_f32
+        };
+        let keep = if missing_rate > max_missing_rate {
+            false
+        } else if non_missing == 0 {
+            maf_threshold <= 0.0_f32
+        } else if apply_het_filter
+            && ((het_count as f64) / (non_missing as f64)) > (het_threshold as f64)
+        {
+            false
+        } else {
+            alt_freq.min(1.0_f32 - alt_freq) >= maf_threshold
+        };
+        site_keep.push(keep);
+        if keep {
+            row_flip_keep.push(false);
+            row_source_indices.push(snp_idx);
+            missing_rate_keep.push(missing_rate);
+            maf_keep.push(alt_freq);
+        }
+    }
+    let row_stats_secs = row_stats_t0.elapsed().as_secs_f64();
+
+    if site_keep.len() != n_snps {
+        return Err(format!(
+            "internal error: site_keep rows {} != n_snps {n_snps}",
+            site_keep.len()
+        ));
+    }
+
+    let kept_n = row_source_indices.len();
+    if kept_n == 0 {
+        return Err(
+            "No SNPs left after windowed BED filtering. Please relax thresholds.".to_string(),
+        );
+    }
+    emit_gfreader_rss_debug(
+        "prepare_bed_logic_meta/windowed_done",
+        &format!(
+            "n_snps={n_snps} kept_n={kept_n} dropped={} keep_ratio={:.6}",
+            n_snps.saturating_sub(kept_n),
+            (kept_n as f64) / (n_snps as f64),
+        ),
+    );
+
+    emit_bed_logic_meta_timing(
+        "prepare_bed_logic_meta_owned_for_stats_samples_windowed",
+        open_iter_secs,
+        0.0,
+        0.0,
+        row_stats_secs,
+        0.0,
+        0.0,
+        total_t0.elapsed().as_secs_f64(),
+        n_samples,
+        stats_n_samples,
+        n_snps,
+        kept_n,
+        true,
+    );
+
+    Ok(PreparedBedLogicMetaOwned {
+        site_keep,
+        row_flip: row_flip_keep,
+        row_source_indices,
+        missing_rate: missing_rate_keep,
+        maf: maf_keep,
+        sites: Vec::new(),
+        n_samples,
+        n_snps_total: n_snps,
+        bytes_per_snp,
+    })
+}
+
 pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples(
     prefix: &str,
     maf_threshold: f32,
@@ -4314,6 +4462,28 @@ pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples(
     snps_only: bool,
     stats_sample_indices: Option<&[usize]>,
     stats_only: bool,
+) -> Result<PreparedBedLogicMetaOwned, String> {
+    prepare_bed_logic_meta_owned_for_stats_samples_with_mmap_window(
+        prefix,
+        maf_threshold,
+        max_missing_rate,
+        het_threshold,
+        snps_only,
+        stats_sample_indices,
+        stats_only,
+        None,
+    )
+}
+
+pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples_with_mmap_window(
+    prefix: &str,
+    maf_threshold: f32,
+    max_missing_rate: f32,
+    het_threshold: f32,
+    snps_only: bool,
+    stats_sample_indices: Option<&[usize]>,
+    stats_only: bool,
+    mmap_window_mb: Option<usize>,
 ) -> Result<PreparedBedLogicMetaOwned, String> {
     let total_t0 = Instant::now();
     let mut read_bim_secs = 0.0_f64;
@@ -4331,6 +4501,19 @@ pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples(
     let lower = bed_prefix.to_ascii_lowercase();
     if lower.ends_with(".bed") || lower.ends_with(".bim") || lower.ends_with(".fam") {
         bed_prefix.truncate(bed_prefix.len() - 4);
+    }
+
+    if let Some(window_mb) = mmap_window_mb {
+        if stats_only && !snps_only {
+            return prepare_bed_logic_meta_owned_for_stats_samples_sparse_windowed(
+                &bed_prefix,
+                maf_threshold,
+                max_missing_rate,
+                het_threshold,
+                stats_sample_indices,
+                window_mb,
+            );
+        }
     }
 
     let read_fam_t0 = Instant::now();

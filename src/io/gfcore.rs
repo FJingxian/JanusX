@@ -2093,6 +2093,43 @@ impl BedSnpIter {
     }
 
     #[inline]
+    fn decode_snp_bytes_counts_only(&self, snp_bytes: &[u8]) -> DecodedSnpRowCounts {
+        let byte_lut = packed_byte_lut();
+        let mut counts = DecodedSnpRowCounts::default();
+        let full_bytes = self.n_samples / 4;
+        let rem = self.n_samples % 4;
+        for &b in snp_bytes.iter().take(full_bytes) {
+            let idx = b as usize;
+            counts.non_missing += byte_lut.nonmiss[idx] as usize;
+            counts.alt_sum += byte_lut.alt_sum[idx] as f64;
+            counts.het_count += byte_lut.het_sum[idx] as usize;
+        }
+        if rem > 0 {
+            let b = snp_bytes[full_bytes];
+            let idx = b as usize;
+            let codes = &byte_lut.code4[idx];
+            for lane in 0..rem {
+                match codes[lane] {
+                    0b00 => {
+                        counts.non_missing += 1;
+                    }
+                    0b10 => {
+                        counts.non_missing += 1;
+                        counts.alt_sum += 1.0;
+                        counts.het_count += 1;
+                    }
+                    0b11 => {
+                        counts.non_missing += 1;
+                        counts.alt_sum += 2.0;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        counts
+    }
+
+    #[inline]
     fn decode_snp_bytes_selected_into_with_counts(
         &self,
         snp_bytes: &[u8],
@@ -2125,35 +2162,38 @@ impl BedSnpIter {
     }
 
     #[inline]
-    fn decode_snp_bytes_stats_only(&self, snp_bytes: &[u8]) -> (f64, usize) {
-        let byte_lut = packed_byte_lut();
-        let mut alt_sum = 0.0_f64;
-        let mut non_missing = 0usize;
-        let full_bytes = self.n_samples / 4;
-        let rem = self.n_samples % 4;
-        for &b in snp_bytes.iter().take(full_bytes) {
-            let idx = b as usize;
-            non_missing += byte_lut.nonmiss[idx] as usize;
-            alt_sum += byte_lut.alt_sum[idx] as f64;
-        }
-        if rem > 0 {
-            let b = snp_bytes[full_bytes];
-            let idx = b as usize;
-            let codes = &byte_lut.code4[idx];
-            for lane in 0..rem {
-                let code = codes[lane];
-                if code != 0b01 {
-                    non_missing += 1;
-                    alt_sum += match code {
-                        0b00 => 0.0_f64,
-                        0b10 => 1.0_f64,
-                        0b11 => 2.0_f64,
-                        _ => 0.0_f64,
-                    };
+    fn decode_snp_bytes_selected_counts_only(
+        &self,
+        snp_bytes: &[u8],
+        sample_indices: &[usize],
+    ) -> DecodedSnpRowCounts {
+        let mut counts = DecodedSnpRowCounts::default();
+        for &samp_idx in sample_indices.iter() {
+            let byte = snp_bytes[samp_idx >> 2];
+            let code = (byte >> ((samp_idx & 3) * 2)) & 0b11;
+            match code {
+                0b00 => {
+                    counts.non_missing += 1;
                 }
+                0b10 => {
+                    counts.non_missing += 1;
+                    counts.alt_sum += 1.0;
+                    counts.het_count += 1;
+                }
+                0b11 => {
+                    counts.non_missing += 1;
+                    counts.alt_sum += 2.0;
+                }
+                _ => {}
             }
         }
-        (alt_sum, non_missing)
+        counts
+    }
+
+    #[inline]
+    fn decode_snp_bytes_stats_only(&self, snp_bytes: &[u8]) -> (f64, usize) {
+        let counts = self.decode_snp_bytes_counts_only(snp_bytes);
+        (counts.alt_sum, counts.non_missing)
     }
 
     /// Random-access decode for one SNP row into caller-provided buffer.
@@ -2400,6 +2440,59 @@ impl BedSnpIter {
 
             let (alt_sum, non_missing) = self.decode_snp_bytes_stats_only(snp_bytes);
             return Some((snp_idx, alt_sum, non_missing));
+        }
+        None
+    }
+
+    pub(crate) fn next_snp_counts_only(&mut self) -> Option<(usize, DecodedSnpRowCounts)> {
+        while self.cur < self.n_snps {
+            let snp_idx = self.cur;
+            self.cur += 1;
+
+            if self.window_snps.is_some() {
+                let window_end = self.window_start_snp + self.window_len_snps;
+                if snp_idx < self.window_start_snp || snp_idx >= window_end {
+                    if let Err(e) = self.remap_window(snp_idx) {
+                        panic!("failed to remap BED window: {e}");
+                    }
+                }
+            }
+
+            let snp_bytes = match self.snp_bytes(snp_idx) {
+                Some(bytes) => bytes,
+                None => return None,
+            };
+
+            let counts = self.decode_snp_bytes_counts_only(snp_bytes);
+            return Some((snp_idx, counts));
+        }
+        None
+    }
+
+    pub(crate) fn next_snp_selected_counts_only(
+        &mut self,
+        sample_indices: &[usize],
+    ) -> Option<(usize, DecodedSnpRowCounts)> {
+        while self.cur < self.n_snps {
+            let snp_idx = self.cur;
+            self.cur += 1;
+
+            if self.window_snps.is_some() {
+                let window_end = self.window_start_snp + self.window_len_snps;
+                if snp_idx < self.window_start_snp || snp_idx >= window_end {
+                    if let Err(e) = self.remap_window(snp_idx) {
+                        panic!("failed to remap BED window: {e}");
+                    }
+                }
+            }
+
+            let snp_bytes = match self.snp_bytes(snp_idx) {
+                Some(bytes) => bytes,
+                None => return None,
+            };
+
+            let counts = self.decode_snp_bytes_selected_counts_only(snp_bytes, sample_indices);
+            return Some((snp_idx, counts));
         }
         None
     }

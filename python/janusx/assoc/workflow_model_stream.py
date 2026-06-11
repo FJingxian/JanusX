@@ -1172,6 +1172,14 @@ def run_chunked_gwas_lmm_lm(
                         init_log10_lbd = float(np.log10(lbd0_tmp))
                 except Exception:
                     init_log10_lbd = None
+                try:
+                    bounds_tmp = tuple(getattr(mod, "bounds"))
+                    lmm_low = float(bounds_tmp[0])
+                    lmm_high = float(bounds_tmp[1])
+                    if not (np.isfinite(lmm_low) and np.isfinite(lmm_high) and lmm_low < lmm_high):
+                        raise ValueError
+                except Exception:
+                    lmm_low, lmm_high = -5.0, 5.0
                 rows_written = jxrs.lmm_reml_assoc_bed_to_tsv_f32(
                     bed_prefix=str(bed_prefix),
                     out_tsv=str(tmp_tsv),
@@ -1185,9 +1193,12 @@ def run_chunked_gwas_lmm_lm(
                     genetic_model=str(genetic_model),
                     snps_only=bool(snps_only),
                     sample_ids=sample_ids,
-                    low=-5.0,
-                    high=5.0,
-                    max_iter=50,
+                    low=float(lmm_low),
+                    high=float(lmm_high),
+                    # Match LMM.gwas()/lmm_reml_from_snp legacy scan defaults.
+                    # The unified BED path should only change IO/RSS behavior,
+                    # not make every per-SNP REML optimizer run longer.
+                    max_iter=30,
                     tol=1e-2,
                     threads=int(scan_threads),
                     nullml=null_ml0,

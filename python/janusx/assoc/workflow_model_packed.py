@@ -24,6 +24,7 @@ from janusx.script._common.packedctx import (
 )
 
 from .workflow import (
+    _BimSiteColumns,
     CliStatus,
     FastLMM,
     FvLMM,
@@ -50,7 +51,8 @@ from .workflow import (
     _log_model_line,
     _mixed_model_switch_to_lm_decision,
     _progress_callback_step,
-    _read_bim_sites,
+    _coerce_bim_site_columns,
+    _read_bim_site_columns,
     _replace_file_with_retry,
     _resolve_trait_iter,
     _resolve_stream_scan_chunk_size,
@@ -59,7 +61,6 @@ from .workflow import (
     _run_result_write_with_status,
     _safe_trait_file_label,
     _site_tuple_parts,
-    _split_gwas_sites,
     _subset_square_matrix_identity_aware,
     _trait_values_and_mask,
     auto_mmap_window_mb,
@@ -712,13 +713,13 @@ def _prepare_packed_bed_once_for_gwas(
     snps_only: bool,
     use_spinner: bool,
     preloaded_packed: Union[dict[str, object], None] = None,
-) -> tuple[str, np.ndarray, dict[str, object], list[tuple[str, int, str, str, str]]]:
+) -> tuple[str, np.ndarray, dict[str, object], _BimSiteColumns]:
     """
     Resolve packed BED context for GWAS full-rust routes.
 
     Returns
     -------
-    prefix, full_ids, packed_ctx, sites_all
+    prefix, full_ids, packed_ctx, site_meta
     """
     prefix = _as_plink_prefix(genofile)
     if prefix is None:
@@ -776,13 +777,10 @@ def _prepare_packed_bed_once_for_gwas(
             "n_samples": int(packed_ctx_obj["n_samples"]),
             "source_prefix": str(prefix),
         }
-        sites_pre = pre.get("sites_all")
-        if isinstance(sites_pre, list) and len(sites_pre) > 0:
-            sites_all = [
-                _site_tuple_parts(site)
-                for site in sites_pre
-            ]
-            return str(prefix), full_ids, packed_ctx, sites_all
+        sites_pre = pre.get("site_meta", pre.get("sites_all"))
+        site_meta = _coerce_bim_site_columns(sites_pre)
+        if site_meta is not None and len(site_meta) > 0:
+            return str(prefix), full_ids, packed_ctx, site_meta
     else:
         with CliStatus("Loading packed BED genotype...", enabled=bool(use_spinner)) as task:
             try:
@@ -833,28 +831,23 @@ def _prepare_packed_bed_once_for_gwas(
             "source_prefix": str(prefix),
         }
 
-    sites_all_full = _read_bim_sites(str(prefix))
-    site_keep_obj = packed_ctx.get("site_keep", None)
-    if site_keep_obj is None:
-        site_keep = np.ones((len(sites_all_full),), dtype=np.bool_)
-    else:
-        site_keep = np.asarray(site_keep_obj, dtype=np.bool_).reshape(-1)
-    if int(site_keep.shape[0]) != int(len(sites_all_full)):
-        raise ValueError("Packed site_keep length mismatch with BIM rows.")
-    sites_all = [s for s, keep in zip(sites_all_full, site_keep) if bool(keep)]
     active_row_idx = np.ascontiguousarray(
         np.asarray(
-            packed_ctx.get("active_row_idx", np.flatnonzero(site_keep).astype(np.int64, copy=False)),
+            packed_ctx.get(
+                "active_row_idx",
+                np.arange(int(np.asarray(packed_ctx["packed"]).shape[0]), dtype=np.int64),
+            ),
             dtype=np.int64,
         ).reshape(-1),
         dtype=np.int64,
     )
-    if int(len(sites_all)) != int(active_row_idx.shape[0]):
+    site_meta = _read_bim_site_columns(str(prefix), active_row_idx)
+    if int(len(site_meta)) != int(active_row_idx.shape[0]):
         raise ValueError(
-            f"Packed/BIM mismatch after filtering: sites={len(sites_all)} "
+            f"Packed/BIM mismatch after filtering: sites={len(site_meta)} "
             f"active_rows={active_row_idx.shape[0]}"
         )
-    return str(prefix), full_ids, packed_ctx, sites_all
+    return str(prefix), full_ids, packed_ctx, site_meta
 
 
 def _packed_lowrank_scan_to_tsv(
@@ -866,7 +859,7 @@ def _packed_lowrank_scan_to_tsv(
     row_flip: np.ndarray,
     maf: np.ndarray,
     miss: np.ndarray,
-    sites_all: list[tuple[object, ...]],
+    sites_all: _BimSiteColumns,
     sample_idx_trait: np.ndarray,
     out_tsv: str,
     chunk_size: int,
@@ -964,13 +957,14 @@ def _packed_preload_ready_state(
     prefix: str,
     full_ids: np.ndarray,
     packed_ctx: dict[str, object],
-    sites_all: list[tuple[str, int, str, str, str]],
+    sites_all: _BimSiteColumns,
 ) -> dict[str, object]:
     return {
         "prefix": str(prefix),
         "full_ids": np.asarray(full_ids, dtype=str),
         "packed_ctx": packed_ctx,
-        "sites_all": list(sites_all),
+        "site_meta": sites_all,
+        "sites_all": sites_all,
     }
 
 
@@ -1350,7 +1344,7 @@ def _jxlmm_null_progress_desc(route_desc: str, done: int, total: int) -> str:
 def _write_jxlmm_assoc_tsv(
     *,
     out_tsv: str,
-    sites_all: list[tuple[str, int, str, str, str]],
+    sites_all: _BimSiteColumns,
     maf: np.ndarray,
     miss: np.ndarray,
     results: np.ndarray,
@@ -2031,7 +2025,7 @@ def run_fastlmm_packed_fullrank(
         raise ValueError(
             f"Packed/BIM mismatch after filtering: sites={len(sites_all)} active_rows={packed_row_idx.shape[0]}"
         )
-    chrom_all, pos_all, allele0_all, allele1_all, snp_all = _split_gwas_sites(sites_all)
+    chrom_all, pos_all, allele0_all, allele1_all, snp_all = sites_all.columns()
 
     process = psutil.Process()
     n_cores = detect_effective_threads()
@@ -2675,7 +2669,7 @@ def run_lm_packed_fullrank(
         raise ValueError(
             f"Packed/BIM mismatch after filtering: sites={len(sites_all)} active_rows={packed_row_idx.shape[0]}"
         )
-    chrom_all, pos_all, allele0_all, allele1_all, snp_all = _split_gwas_sites(sites_all)
+    chrom_all, pos_all, allele0_all, allele1_all, snp_all = sites_all.columns()
 
     process = psutil.Process()
     n_cores = detect_effective_threads()
@@ -3619,7 +3613,7 @@ def run_lmm_packed_fullrank(
 
         gwas_ok = False
         null_lbd = float("nan")
-        chrom_all, pos_all, allele0_all, allele1_all, snp_all = _split_gwas_sites(sites_all)
+        chrom_all, pos_all, allele0_all, allele1_all, snp_all = sites_all.columns()
         gm_tag = str(genetic_model).lower()
         pname_tag = _safe_trait_file_label(pname)
         if gm_tag == "add":
@@ -3926,7 +3920,7 @@ def run_algwas_packed_fullrank(
             f"Packed/BIM mismatch after filtering: sites={len(sites_all)} active_rows={packed_row_idx.shape[0]}"
         )
 
-    chrom_all, pos_all, allele0_all, allele1_all, snp_all = _split_gwas_sites(sites_all)
+    chrom_all, pos_all, allele0_all, allele1_all, snp_all = sites_all.columns()
 
     process = psutil.Process()
     n_cores = detect_effective_threads()
@@ -4308,6 +4302,7 @@ def run_splmm_packed_fullrank(
     trait_names: Union[list[str], None] = None,
     emit_trait_header: bool = True,
     preloaded_packed: Union[dict[str, object], None] = None,
+    force_model: bool = False,
     scan_mode: str = "exact",
 ) -> None:
     if str(genetic_model).lower() != "add":
@@ -4348,7 +4343,6 @@ def run_splmm_packed_fullrank(
         )
     except KeyError as e:
         raise ValueError("Some aligned sample IDs are not present in PLINK FAM sample order.") from e
-    sites_all_full = _read_bim_sites(str(prefix))
     scan_sample_map = np.ascontiguousarray(scan_sample_map, dtype=np.int64)
     packed_preload_ready = None
     use_preloaded_scan_meta = False
@@ -4418,7 +4412,6 @@ def run_splmm_packed_fullrank(
         sparse_cutoff_log = f"{float(splmm_sparse_cutoff):g}"
 
     kinship_prefix = str(prefix)
-    kinship_sites_all = list(sites_all_full)
     kinship_sample_map = np.asarray(scan_sample_map, dtype=np.int64)
     kinship_present_mask = kinship_sample_map >= 0
 
@@ -4582,6 +4575,14 @@ def run_splmm_packed_fullrank(
             null_fit = dict(null_fit_obj)
         null_secs = max(time.monotonic() - null_prepare_t0, 0.0)
         peak_rss = max(peak_rss, process.memory_info().rss)
+        if bool(use_preloaded_scan_meta):
+            n_scan_sites_hint = int(np.asarray(scan_row_idx, dtype=np.int64).reshape(-1).shape[0])
+        else:
+            if scan_meta is None:
+                raise RuntimeError("SparseLMM memmap scan metadata is missing.")
+            n_scan_sites_hint = int(
+                np.asarray(scan_meta["row_indices"], dtype=np.int64).reshape(-1).shape[0]
+            )
 
         sigma_g2 = float(null_fit["sigma_g2"])
         sigma_e2 = float(null_fit["sigma_e2"])
@@ -4724,6 +4725,8 @@ def run_splmm_packed_fullrank(
         pheno_trait_subset = pheno_aligned.iloc[keep_idx][[pname]].copy()
         ids_trait_subset = np.asarray(ids[keep_idx], dtype=str)
         if (
+            (not bool(force_model))
+            and
             null_strategy == "fastlmm_exact_spectral"
             and _fastlmm_should_switch_to_lmm(null_pve)
         ):
@@ -4767,7 +4770,7 @@ def run_splmm_packed_fullrank(
                 trait_names=[str(pname)],
                 emit_trait_header=False,
                 preloaded_packed=packed_preload_ready,
-                force_model=False,
+                force_model=bool(force_model),
             )
             if multi_trait_mode:
                 logger.info("")
@@ -4775,7 +4778,7 @@ def run_splmm_packed_fullrank(
             continue
 
         null_ml0 = null_fit.get("ml", None)
-        if null_ml0 is not None and np.isfinite(float(null_ml0)):
+        if (not bool(force_model)) and null_ml0 is not None and np.isfinite(float(null_ml0)):
             switch_to_lm, lrt_stat, lrt_p = _mixed_model_switch_to_lm_decision(
                 y_vec=y_vec,
                 x_cov=x_cov,
@@ -4822,14 +4825,14 @@ def run_splmm_packed_fullrank(
                         trait_names=[str(pname)],
                         emit_trait_header=False,
                         preloaded_packed=packed_preload_ready,
-                        force_model=False,
+                        force_model=bool(force_model),
                     )
                 else:
                     run_lm_stream_bed_single_entry(
                         genofile=genofile,
                         pheno=pheno_trait_subset,
                         ids=ids_trait_subset,
-                        n_snps=int(len(kinship_sites_all)),
+                        n_snps=int(n_scan_sites_hint),
                         outprefix=outprefix,
                         maf_threshold=maf_threshold,
                         max_missing_rate=max_missing_rate,
@@ -4930,6 +4933,12 @@ def run_splmm_packed_fullrank(
             trait_scan_row_flip = np.ascontiguousarray(np.asarray(scan_meta["row_flip"], dtype=np.bool_).reshape(-1), dtype=np.bool_)
             trait_site_keep = np.ascontiguousarray(np.asarray(scan_meta["site_keep"], dtype=np.bool_).reshape(-1), dtype=np.bool_)
         n_trait_sites = int(trait_row_idx.shape[0])
+        mmap_window_mb = auto_mmap_window_mb(
+            genofile,
+            len(ids),
+            n_trait_sites,
+            _current_bed_memory_mb(),
+        )
         supports_direct_tsv = bool(hasattr(jxrs, "splmm_assoc_pcg_bed_to_tsv"))
         # BIM metadata (chrom/pos/snp/alleles) is now read inside the Rust
         # splmm_assoc_pcg_bed_to_tsv function when the arrays are empty.
@@ -5010,6 +5019,7 @@ def run_splmm_packed_fullrank(
                         progress_every=int(max(512, min(int(block_rows_use), 4096))),
                         rhat_tol=1e-3,
                         scan_mode=scan_mode_norm,
+                        mmap_window_mb=(int(mmap_window_mb) if mmap_window_mb is not None else None),
                     )
                 else:
                     jxlmm_out = jxrs.splmm_assoc_pcg_bed(
@@ -5042,6 +5052,7 @@ def run_splmm_packed_fullrank(
                         progress_every=int(max(512, min(int(block_rows_use), 4096))),
                         rhat_tol=1e-3,
                         scan_mode=scan_mode_norm,
+                        mmap_window_mb=(int(mmap_window_mb) if mmap_window_mb is not None else None),
                     )
             scan_ok = True
         finally:
@@ -5087,7 +5098,7 @@ def run_splmm_packed_fullrank(
 
             def _write_jxlmm() -> None:
                 nonlocal written_rows, arr
-                sites_use = [kinship_sites_all[int(idx)] for idx in trait_row_idx.tolist()]
+                sites_use = _read_bim_site_columns(str(kinship_prefix), trait_row_idx)
                 written_rows = int(
                     _write_jxlmm_assoc_tsv(
                         out_tsv=tmp_tsv,

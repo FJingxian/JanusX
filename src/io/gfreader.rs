@@ -6640,6 +6640,57 @@ pub fn load_site_info(
     Ok(it.sites.into_iter().map(Into::into).collect())
 }
 
+#[pyfunction]
+#[pyo3(signature = (path_or_prefix, row_indices=None))]
+pub fn load_bim_columns<'py>(
+    path_or_prefix: String,
+    row_indices: Option<PyReadonlyArray1<'py, i64>>,
+) -> PyResult<(Vec<String>, Vec<i64>, Vec<String>, Vec<String>, Vec<String>)> {
+    let p = path_or_prefix.trim().to_string();
+    if p.is_empty() {
+        return Err(PyValueError::new_err("path_or_prefix must not be empty"));
+    }
+
+    let lower = p.to_ascii_lowercase();
+    let is_plink_explicit =
+        lower.ends_with(".bed") || lower.ends_with(".bim") || lower.ends_with(".fam");
+    let is_plink_prefix = Path::new(&(p.clone() + ".bed")).exists()
+        && Path::new(&(p.clone() + ".bim")).exists()
+        && Path::new(&(p.clone() + ".fam")).exists();
+    if !(is_plink_explicit || is_plink_prefix) {
+        return Err(PyValueError::new_err(
+            "load_bim_columns requires a PLINK BED/BIM/FAM prefix or explicit PLINK file path",
+        ));
+    }
+
+    let prefix = normalize_plink_prefix_local(&p);
+    let selected_rows: Option<Vec<usize>> = if let Some(row_indices) = row_indices {
+        let slice = row_indices.as_slice()?;
+        let mut out = Vec::with_capacity(slice.len());
+        for &raw in slice {
+            let idx = usize::try_from(raw).map_err(|_| {
+                PyValueError::new_err(format!(
+                    "row_indices must be non-negative, got {raw}"
+                ))
+            })?;
+            out.push(idx);
+        }
+        Some(out)
+    } else {
+        None
+    };
+
+    let (chrom, pos, snp, allele0, allele1) =
+        core::read_bim_columns(&prefix, selected_rows.as_deref()).map_err(PyRuntimeError::new_err)?;
+    Ok((
+        chrom,
+        pos.into_iter().map(|v| v as i64).collect(),
+        snp,
+        allele0,
+        allele1,
+    ))
+}
+
 // -------- count_vcf_snps (Py function) --------
 #[pyfunction]
 pub fn count_vcf_snps(path: String) -> PyResult<usize> {

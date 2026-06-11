@@ -41,6 +41,7 @@ const SPGRM_DEFAULT_BATCH_DECODED_STRIPE_FLOOR: usize = 8;
 const SPGRM_DEFAULT_BATCH_DECODED_STRIPE_THREADS_FACTOR: usize = 2;
 const SPGRM_DEFAULT_BATCH_MIN_ACCUM_BYTES: usize = 8 * 1024 * 1024;
 const SPGRM_JXGRM_VALUE_ALIGN_BYTES: usize = std::mem::size_of::<f64>();
+const SPGRM_DEFAULT_STREAMING_MERGE_MIN_BYTES: usize = 2 * 1024 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SpgrmNpyFloatDtype {
@@ -577,6 +578,23 @@ fn spgrm_spill_nnz_limit() -> usize {
 }
 
 #[inline]
+fn spgrm_streaming_merge_min_bytes() -> usize {
+    if let Some(bytes) = std::env::var("JANUSX_SPGRM_STREAMING_MERGE_MIN_BYTES")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&v| v > 0)
+    {
+        return bytes;
+    }
+    std::env::var("JANUSX_SPGRM_STREAMING_MERGE_MIN_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .map(|mb| mb.saturating_mul(1024).saturating_mul(1024))
+        .unwrap_or(SPGRM_DEFAULT_STREAMING_MERGE_MIN_BYTES)
+}
+
+#[inline]
 fn spgrm_batch_max_accum_bytes(sample_step: usize, threads: usize) -> usize {
     if let Some(mb) = std::env::var("JANUSX_SPGRM_BATCH_MAX_ACCUM_MB")
         .ok()
@@ -891,6 +909,277 @@ impl SpgrmCscStreamWriter {
             .map_err(|e| format!("sync sparse GRM file failed: {e}"))?;
         Ok(())
     }
+}
+
+struct SpgrmCscTempPayloadWriter {
+    out_path: String,
+    row_path: PathBuf,
+    value_path: PathBuf,
+    n_samples: usize,
+    written: usize,
+    current_col: usize,
+    col_ptr: Vec<u64>,
+    prev_entry: Option<SpgrmEntry>,
+    row_writer: BufWriter<File>,
+    value_writer: BufWriter<File>,
+}
+
+impl SpgrmCscTempPayloadWriter {
+    fn new(out_path: &str, n_samples: usize) -> Result<Self, String> {
+        let suffix = format!(
+            "merge{}.{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let row_path = spgrm_temp_merge_path(out_path, &suffix, "rows");
+        let value_path = spgrm_temp_merge_path(out_path, &suffix, "vals");
+        let row_file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&row_path)
+            .map_err(|e| {
+                format!(
+                    "create sparse GRM merge temp row file {} failed: {e}",
+                    row_path.display()
+                )
+            })?;
+        let value_file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&value_path)
+            .map_err(|e| {
+                format!(
+                    "create sparse GRM merge temp value file {} failed: {e}",
+                    value_path.display()
+                )
+            })?;
+        Ok(Self {
+            out_path: out_path.to_string(),
+            row_path,
+            value_path,
+            n_samples,
+            written: 0usize,
+            current_col: 0usize,
+            col_ptr: vec![0u64; n_samples + 1],
+            prev_entry: None,
+            row_writer: BufWriter::with_capacity(SPGRM_DEFAULT_WRITE_BUF_BYTES, row_file),
+            value_writer: BufWriter::with_capacity(SPGRM_DEFAULT_WRITE_BUF_BYTES, value_file),
+        })
+    }
+
+    fn push(&mut self, entry: SpgrmEntry) -> Result<(), String> {
+        let col = entry.col as usize;
+        let row = entry.row as usize;
+        if col >= self.n_samples {
+            return Err(format!(
+                "Sparse GRM temp writer column index out of range: {col} >= {}",
+                self.n_samples
+            ));
+        }
+        if row >= self.n_samples {
+            return Err(format!(
+                "Sparse GRM temp writer row index out of range: {row} >= {}",
+                self.n_samples
+            ));
+        }
+        if row < col {
+            return Err(format!(
+                "Sparse GRM temp writer expects lower triangle; got row={row} < col={col}"
+            ));
+        }
+        if !entry.value.is_finite() {
+            return Err(format!(
+                "Sparse GRM temp writer received non-finite value at pair ({row}, {col})"
+            ));
+        }
+        if let Some(prev) = self.prev_entry {
+            match spgrm_entry_cmp(&prev, &entry) {
+                Ordering::Less => {}
+                Ordering::Equal => {
+                    return Err(format!(
+                        "Sparse GRM duplicate temp merge entry detected at pair ({row}, {col})"
+                    ));
+                }
+                Ordering::Greater => {
+                    return Err(format!(
+                        "Sparse GRM temp merge order is not sorted at pair ({row}, {col})"
+                    ));
+                }
+            }
+        }
+        while self.current_col < col {
+            self.col_ptr[self.current_col + 1] = self.written as u64;
+            self.current_col += 1;
+        }
+        self.row_writer
+            .write_all(&entry.row.to_le_bytes())
+            .map_err(|e| format!("write sparse GRM temp row payload failed: {e}"))?;
+        self.value_writer
+            .write_all(&entry.value.to_le_bytes())
+            .map_err(|e| format!("write sparse GRM temp value payload failed: {e}"))?;
+        self.written = self.written.saturating_add(1);
+        self.prev_entry = Some(entry);
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<(usize, usize), String> {
+        while self.current_col < self.n_samples {
+            self.col_ptr[self.current_col + 1] = self.written as u64;
+            self.current_col += 1;
+        }
+        let row_path = self.row_path.clone();
+        let value_path = self.value_path.clone();
+        let result = (|| -> Result<(usize, usize), String> {
+            self.row_writer
+                .flush()
+                .map_err(|e| format!("flush sparse GRM temp row payload failed: {e}"))?;
+            self.value_writer
+                .flush()
+                .map_err(|e| format!("flush sparse GRM temp value payload failed: {e}"))?;
+            let row_file = self
+                .row_writer
+                .into_inner()
+                .map_err(|e| format!("close sparse GRM temp row payload failed: {}", e.error()))?;
+            row_file
+                .sync_data()
+                .map_err(|e| format!("sync sparse GRM temp row payload failed: {e}"))?;
+            drop(row_file);
+            let value_file = self.value_writer.into_inner().map_err(|e| {
+                format!("close sparse GRM temp value payload failed: {}", e.error())
+            })?;
+            value_file
+                .sync_data()
+                .map_err(|e| format!("sync sparse GRM temp value payload failed: {e}"))?;
+            drop(value_file);
+
+            let mut out_file = OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .read(true)
+                .write(true)
+                .open(self.out_path.as_str())
+                .map_err(|e| format!("create sparse GRM file {} failed: {e}", self.out_path))?;
+            {
+                let mut header_writer =
+                    BufWriter::with_capacity(SPGRM_DEFAULT_WRITE_BUF_BYTES, &mut out_file);
+                header_writer
+                    .write_all(&(self.n_samples as u64).to_le_bytes())
+                    .map_err(|e| format!("write sparse GRM header(n) failed: {e}"))?;
+                header_writer
+                    .write_all(&(self.written as u64).to_le_bytes())
+                    .map_err(|e| format!("write sparse GRM header(nnz) failed: {e}"))?;
+                write_u64_slice(&mut header_writer, self.col_ptr.as_slice())?;
+                header_writer
+                    .flush()
+                    .map_err(|e| format!("flush sparse GRM header failed: {e}"))?;
+            }
+
+            out_file
+                .seek(SeekFrom::End(0))
+                .map_err(|e| format!("seek sparse GRM row payload append failed: {e}"))?;
+            let mut row_reader = File::open(&row_path).map_err(|e| {
+                format!(
+                    "open sparse GRM merge temp row file {} failed: {e}",
+                    row_path.display()
+                )
+            })?;
+            std::io::copy(&mut row_reader, &mut out_file)
+                .map_err(|e| format!("append sparse GRM row payload failed: {e}"))?;
+
+            let pad_bytes = spgrm_jxgrm_values_padding_bytes(self.written)?;
+            if pad_bytes > 0 {
+                out_file
+                    .write_all(&[0u8; 8][..pad_bytes])
+                    .map_err(|e| format!("write sparse GRM alignment padding failed: {e}"))?;
+            }
+
+            let mut value_reader = File::open(&value_path).map_err(|e| {
+                format!(
+                    "open sparse GRM merge temp value file {} failed: {e}",
+                    value_path.display()
+                )
+            })?;
+            std::io::copy(&mut value_reader, &mut out_file)
+                .map_err(|e| format!("append sparse GRM value payload failed: {e}"))?;
+            out_file
+                .sync_data()
+                .map_err(|e| format!("sync sparse GRM file failed: {e}"))?;
+            Ok((self.n_samples, self.written))
+        })();
+        let _ = std::fs::remove_file(&row_path);
+        let _ = std::fs::remove_file(&value_path);
+        result
+    }
+}
+
+#[inline]
+fn spgrm_temp_merge_path(out_path: &str, suffix: &str, kind: &str) -> PathBuf {
+    let mut path = PathBuf::from(out_path);
+    let new_ext = match path.extension().and_then(|s| s.to_str()) {
+        Some(ext) if !ext.is_empty() => format!("{ext}.{suffix}.{kind}.tmp"),
+        _ => format!("{suffix}.{kind}.tmp"),
+    };
+    path.set_extension(new_ext);
+    path
+}
+
+fn for_each_merged_chunk_entry<F>(chunk_paths: &[PathBuf], mut callback: F) -> Result<(), String>
+where
+    F: FnMut(SpgrmEntry) -> Result<(), String>,
+{
+    let mut readers = Vec::<SpgrmChunkReader>::with_capacity(chunk_paths.len());
+    let mut heap = BinaryHeap::<SpgrmChunkHead>::new();
+    for (chunk_idx, chunk_path) in chunk_paths.iter().enumerate() {
+        let mut reader = open_spgrm_chunk_reader(chunk_path)?;
+        if let Some(head) = read_chunk_entry(&mut reader, chunk_idx)? {
+            heap.push(head);
+        }
+        readers.push(reader);
+    }
+
+    let mut pending: Option<SpgrmEntry> = None;
+    while let Some(head) = heap.pop() {
+        let entry = SpgrmEntry {
+            col: head.col,
+            row: head.row,
+            value: head.value,
+        };
+        if let Some(prev) = pending.as_mut() {
+            if prev.col == entry.col && prev.row == entry.row {
+                prev.value += entry.value;
+            } else {
+                callback(*prev)?;
+                *prev = entry;
+            }
+        } else {
+            pending = Some(entry);
+        }
+        if let Some(next) = read_chunk_entry(&mut readers[head.chunk_idx], head.chunk_idx)? {
+            heap.push(next);
+        }
+    }
+    if let Some(entry) = pending {
+        callback(entry)?;
+    }
+    Ok(())
+}
+
+#[inline]
+fn spgrm_chunk_merge_estimated_bytes(nnz: usize) -> usize {
+    nnz.saturating_mul(spgrm_record_bytes())
+}
+
+#[inline]
+fn spgrm_should_use_streaming_merge(chunk_paths: &[PathBuf], nnz: usize) -> bool {
+    chunk_paths.len() > 1
+        && spgrm_chunk_merge_estimated_bytes(nnz) >= spgrm_streaming_merge_min_bytes()
 }
 
 struct SpgrmPreparedBuild {
@@ -1525,40 +1814,47 @@ fn write_sorted_entries_to_jxgrm(
     Ok((n_samples, nnz))
 }
 
-fn merge_chunked_entries_to_jxgrm(
+fn merge_chunked_entries_to_jxgrm_in_memory(
     out_path: &str,
     n_samples: usize,
     chunk_paths: &[PathBuf],
     nnz: usize,
 ) -> Result<(usize, usize), String> {
-    let mut readers = Vec::<SpgrmChunkReader>::with_capacity(chunk_paths.len());
-    let mut heap = BinaryHeap::<SpgrmChunkHead>::new();
-    for (chunk_idx, chunk_path) in chunk_paths.iter().enumerate() {
-        let mut reader = open_spgrm_chunk_reader(chunk_path)?;
-        if let Some(head) = read_chunk_entry(&mut reader, chunk_idx)? {
-            heap.push(head);
-        }
-        readers.push(reader);
-    }
     let mut merged = Vec::<SpgrmEntry>::with_capacity(nnz);
-    while let Some(head) = heap.pop() {
-        merged.push(SpgrmEntry {
-            col: head.col,
-            row: head.row,
-            value: head.value,
-        });
-        if let Some(next) = read_chunk_entry(&mut readers[head.chunk_idx], head.chunk_idx)? {
-            heap.push(next);
-        }
-    }
-    merged.sort_unstable_by(spgrm_entry_cmp);
-    let merged_nnz = spgrm_compress_sorted_entries(&mut merged);
+    for_each_merged_chunk_entry(chunk_paths, |entry| {
+        merged.push(entry);
+        Ok(())
+    })?;
+    let merged_nnz = merged.len();
     let mut writer = SpgrmCscStreamWriter::new(out_path, n_samples, merged_nnz)?;
     for entry in merged {
         writer.push(entry)?;
     }
     writer.finish()?;
     Ok((n_samples, merged_nnz))
+}
+
+fn merge_chunked_entries_to_jxgrm_streaming(
+    out_path: &str,
+    n_samples: usize,
+    chunk_paths: &[PathBuf],
+) -> Result<(usize, usize), String> {
+    let mut writer = SpgrmCscTempPayloadWriter::new(out_path, n_samples)?;
+    for_each_merged_chunk_entry(chunk_paths, |entry| writer.push(entry))?;
+    writer.finish()
+}
+
+fn merge_chunked_entries_to_jxgrm(
+    out_path: &str,
+    n_samples: usize,
+    chunk_paths: &[PathBuf],
+    nnz: usize,
+) -> Result<(usize, usize), String> {
+    if spgrm_should_use_streaming_merge(chunk_paths, nnz) {
+        merge_chunked_entries_to_jxgrm_streaming(out_path, n_samples, chunk_paths)
+    } else {
+        merge_chunked_entries_to_jxgrm_in_memory(out_path, n_samples, chunk_paths, nnz)
+    }
 }
 
 #[inline]
@@ -3324,6 +3620,113 @@ mod tests {
         assert_eq!(row_end % 8, 4);
         assert_eq!(&bytes[row_end..row_end + 4], &[0u8; 4]);
         let _ = std::fs::remove_file(out_str);
+    }
+
+    #[test]
+    fn sparse_grm_chunked_merge_streaming_matches_in_memory() {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "janusx_spgrm_merge_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let chunk_paths = (0..3usize)
+            .map(|idx| dir.join(format!("chunk{idx:03}.coo")))
+            .collect::<Vec<_>>();
+        let mut chunk0 = vec![
+            SpgrmEntry {
+                col: 1,
+                row: 2,
+                value: 0.2_f64,
+            },
+            SpgrmEntry {
+                col: 0,
+                row: 0,
+                value: 1.0_f64,
+            },
+            SpgrmEntry {
+                col: 1,
+                row: 1,
+                value: 1.1_f64,
+            },
+        ];
+        let mut chunk1 = vec![
+            SpgrmEntry {
+                col: 1,
+                row: 2,
+                value: 0.3_f64,
+            },
+            SpgrmEntry {
+                col: 2,
+                row: 2,
+                value: 0.9_f64,
+            },
+            SpgrmEntry {
+                col: 0,
+                row: 3,
+                value: 0.4_f64,
+            },
+        ];
+        let mut chunk2 = vec![
+            SpgrmEntry {
+                col: 2,
+                row: 3,
+                value: 0.5_f64,
+            },
+            SpgrmEntry {
+                col: 3,
+                row: 3,
+                value: 1.2_f64,
+            },
+            SpgrmEntry {
+                col: 0,
+                row: 3,
+                value: 0.1_f64,
+            },
+        ];
+        spill_sorted_entries_to_chunk(&chunk_paths[0], &mut chunk0).unwrap();
+        spill_sorted_entries_to_chunk(&chunk_paths[1], &mut chunk1).unwrap();
+        spill_sorted_entries_to_chunk(&chunk_paths[2], &mut chunk2).unwrap();
+
+        let out_mem = dir.join("merge_in_memory.spgrm");
+        let out_stream = dir.join("merge_streaming.spgrm");
+        merge_chunked_entries_to_jxgrm_in_memory(
+            out_mem.to_str().unwrap(),
+            4usize,
+            chunk_paths.as_slice(),
+            9usize,
+        )
+        .unwrap();
+        merge_chunked_entries_to_jxgrm_streaming(
+            out_stream.to_str().unwrap(),
+            4usize,
+            chunk_paths.as_slice(),
+        )
+        .unwrap();
+
+        let mem = crate::cholesky::read_sparse_grm_csc(out_mem.to_str().unwrap()).unwrap();
+        let stream = crate::cholesky::read_sparse_grm_csc(out_stream.to_str().unwrap()).unwrap();
+        assert_eq!(mem.n_samples, stream.n_samples);
+        assert_eq!(mem.nnz, stream.nnz);
+        assert_eq!(mem.col_ptr, stream.col_ptr);
+        assert_eq!(mem.row_indices, stream.row_indices);
+        assert_eq!(mem.values.len(), stream.values.len());
+        for (lhs, rhs) in mem.values.iter().zip(stream.values.iter()) {
+            assert!((lhs - rhs).abs() < 1e-12);
+        }
+        assert_eq!(mem.nnz, 6usize);
+
+        let _ = std::fs::remove_file(out_mem);
+        let _ = std::fs::remove_file(out_stream);
+        for chunk_path in chunk_paths {
+            let _ = std::fs::remove_file(chunk_path);
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

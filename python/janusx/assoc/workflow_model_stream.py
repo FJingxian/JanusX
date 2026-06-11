@@ -908,7 +908,7 @@ def run_chunked_gwas_lmm_lm(
         )
 
         _use_fvlmm_tsv_fastpath = (
-            str(model_name).lower() == "fvlmm"
+            str(effective_model_key).lower() == "fvlmm"
             and hasattr(jxrs, "fvlmm_assoc_chunk_from_snp_to_tsv_f32")
             and use_rust_assoc_writer
             and hasattr(writer, "append_text")
@@ -916,7 +916,7 @@ def run_chunked_gwas_lmm_lm(
         )
 
         _use_fvlmm_unified = (
-            str(model_name).lower() == "fvlmm"
+            str(effective_model_key).lower() == "fvlmm"
             and hasattr(jxrs, "fvlmm_assoc_bed_to_tsv_f32")
             and os.environ.get("JX_DISABLE_FVLMM_UNIFIED") != "1"
         )
@@ -1071,7 +1071,7 @@ def run_chunked_gwas_lmm_lm(
 
         scan_stage_ctx = (
             _gwas_fvlmm_scan_stage_ctx
-            if str(model_name).lower() == "fvlmm"
+            if str(effective_model_key).lower() == "fvlmm"
             else _gwas_scan_stage_ctx
         )
         with scan_stage_ctx(scan_threads):
@@ -1112,6 +1112,7 @@ def run_chunked_gwas_lmm_lm(
                             ),
                         )
                     ),
+                    mmap_window_mb=(int(mmap_window_mb) if mmap_window_mb is not None else None),
                 )
                 done_snps = int(rows_written)
                 has_results = done_snps > 0

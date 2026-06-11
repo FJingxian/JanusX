@@ -19,6 +19,7 @@ use crate::blas::{
     cblas_dgemm_dispatch, rust_sgemm_prefers_rayon_rowmajor_f32_kernel, BlasThreadGuard, CblasInt,
     CBLAS_COL_MAJOR, CBLAS_NO_TRANS, CBLAS_TRANS,
 };
+use crate::bedmath::{decode_mean_imputed_additive_packed_block_rows_f32, packed_byte_lut};
 use crate::cholesky::{
     sparse_cholesky_analyze_subset_jxgrm_path_cached_with_progress, sparse_jxgrm_header_n_samples,
     subset_sparse_grm_csc, MmapSparseGrmCsc, SparseGrmCscView, SparseJxgrmAnalyzeProgressStage,
@@ -29,7 +30,7 @@ use crate::gfreader::{
     count_packed_row_counts, count_packed_row_counts_selected_with_excluded,
     precompute_excluded_sample_indices, prepare_bed_logic_meta_owned_for_stats_samples,
 };
-use crate::gload::{GenotypeMatrix, UnifiedInput};
+use crate::gload::{GenotypeMatrix, UnifiedInput, WindowedBedMatrix};
 use crate::he::row_major_block_mul_mat_f32;
 use crate::linalg::{
     chi2_sf_df1, chisq_from_beta_se_and_optional_plrt, cholesky_inplace, cholesky_solve_into,
@@ -2929,6 +2930,7 @@ fn scan_with_p0y_and_exact_p0_sparse(
     progress_stage: usize,
     progress_done_offset: usize,
     progress_total_override: usize,
+    mmap_window_mb: Option<usize>,
     solve_workspace: &mut SparseJxgrmSolveWorkspace,
 ) -> Result<Vec<f64>, String> {
     let score_vec = if sigma2 == 1.0_f64 {
@@ -2942,7 +2944,7 @@ fn scan_with_p0y_and_exact_p0_sparse(
         out[row_start * 3..][..rows_here * 3].copy_from_slice(block);
         Ok(())
     };
-    let mut input = unified_input_from_jxlmm(scan_prepared);
+    let mut input = unified_input_from_jxlmm(scan_prepared, mmap_window_mb)?;
     exact_scan_blocks_core(
         factor,
         &mut input,
@@ -3354,8 +3356,9 @@ fn scan_with_py_and_rhat(
     progress_stage: usize,
     progress_done_offset: usize,
     progress_total_override: usize,
+    mmap_window_mb: Option<usize>,
 ) -> Result<Vec<f64>, String> {
-    let mut input = unified_input_from_jxlmm(scan_prepared);
+    let mut input = unified_input_from_jxlmm(scan_prepared, mmap_window_mb)?;
     let m = input.n_markers();
     let mut out = vec![0.0_f64; m * 3];
     let mut memory_sink = |row_start: usize, rows_here: usize, block: &[f64]| {
@@ -3404,6 +3407,7 @@ fn scan_to_tsv_with_py_and_rhat(
     scan_progress_callback: Option<&Py<PyAny>>,
     progress_every: usize,
     progress_stage: usize,
+    mmap_window_mb: Option<usize>,
 ) -> Result<(usize, SplmmTsvTiming), String> {
     let stage_timing = splmm_packed_stage_timing_enabled();
     if chrom.len() != scan_prepared.n_rows()
@@ -3422,7 +3426,7 @@ fn scan_to_tsv_with_py_and_rhat(
             allele1.len()
         ));
     }
-    let mut input = unified_input_from_jxlmm(scan_prepared);
+    let mut input = unified_input_from_jxlmm(scan_prepared, mmap_window_mb)?;
     let row_maf = input.stats.maf.clone();
     let row_miss = input.stats.miss.clone();
     let m = input.n_markers();
@@ -3482,13 +3486,14 @@ fn scan_with_p0y_and_gamma0(
     progress_stage: usize,
     progress_done_offset: usize,
     progress_total_override: usize,
+    mmap_window_mb: Option<usize>,
 ) -> Result<Vec<f64>, String> {
     let score_vec = if sigma2 == 1.0_f64 {
         p0y_vec.to_vec()
     } else {
         p0y_vec.iter().map(|v| *v / sigma2).collect::<Vec<_>>()
     };
-    let mut input = unified_input_from_jxlmm(scan_prepared);
+    let mut input = unified_input_from_jxlmm(scan_prepared, mmap_window_mb)?;
     let m = input.n_markers();
     let mut out = vec![0.0_f64; m * 3];
     let mut memory_sink = |row_start: usize, rows_here: usize, block: &[f64]| {
@@ -3537,6 +3542,7 @@ fn scan_to_tsv_with_p0y_and_gamma0(
     scan_progress_callback: Option<&Py<PyAny>>,
     progress_every: usize,
     progress_stage: usize,
+    mmap_window_mb: Option<usize>,
 ) -> Result<(usize, SplmmTsvTiming), String> {
     let stage_timing = splmm_packed_stage_timing_enabled();
     let score_vec = if sigma2 == 1.0_f64 {
@@ -3560,7 +3566,7 @@ fn scan_to_tsv_with_p0y_and_gamma0(
             allele1.len()
         ));
     }
-    let mut input = unified_input_from_jxlmm(scan_prepared);
+    let mut input = unified_input_from_jxlmm(scan_prepared, mmap_window_mb)?;
     let row_maf = input.stats.maf.clone();
     let row_miss = input.stats.miss.clone();
     let m = input.n_markers();
@@ -3626,6 +3632,7 @@ fn scan_to_tsv_with_p0y_and_exact_p0_sparse(
     scan_progress_callback: Option<&Py<PyAny>>,
     progress_every: usize,
     progress_stage: usize,
+    mmap_window_mb: Option<usize>,
     solve_workspace: &mut SparseJxgrmSolveWorkspace,
 ) -> Result<(usize, SplmmTsvTiming), String> {
     let stage_timing = splmm_packed_stage_timing_enabled();
@@ -3651,7 +3658,7 @@ fn scan_to_tsv_with_p0y_and_exact_p0_sparse(
         ));
     }
     let m = scan_prepared.n_rows();
-    let mut input = unified_input_from_jxlmm(scan_prepared);
+    let mut input = unified_input_from_jxlmm(scan_prepared, mmap_window_mb)?;
     run_splmm_async_tsv_writer(
         out_tsv,
         block_rows,
@@ -3776,6 +3783,7 @@ fn scan_to_tsv_with_p0y_and_gamma0_collect_candidates(
     progress_every: usize,
     progress_stage: usize,
     candidate_p_threshold: f64,
+    mmap_window_mb: Option<usize>,
 ) -> Result<(Vec<usize>, SplmmTsvTiming), String> {
     let stage_timing = splmm_packed_stage_timing_enabled();
     let score_vec = if sigma2 == 1.0_f64 {
@@ -3799,7 +3807,7 @@ fn scan_to_tsv_with_p0y_and_gamma0_collect_candidates(
             allele1.len()
         ));
     }
-    let mut input = unified_input_from_jxlmm(scan_prepared);
+    let mut input = unified_input_from_jxlmm(scan_prepared, mmap_window_mb)?;
     let row_maf = input.stats.maf.clone();
     let row_miss = input.stats.miss.clone();
     let mut candidate_rows = Vec::<usize>::new();
@@ -4404,6 +4412,7 @@ fn estimate_residualized_approx_scan_sparse(
     progress_every: usize,
     approx_fit_tol: f64,
     approx_fit_max_iter: usize,
+    mmap_window_mb: Option<usize>,
 ) -> Result<(f64, Vec<f64>, PcgJxlmmNullModelInfo, PcgJxlmmRHatResult), String> {
     let _ = (approx_fit_tol, approx_fit_max_iter);
     let stage1_cb = stage1_progress_callback.as_ref();
@@ -4458,6 +4467,7 @@ fn estimate_residualized_approx_scan_sparse(
         9,
         0,
         0,
+        mmap_window_mb,
     )?;
     Ok((
         gamma,
@@ -4493,6 +4503,7 @@ fn estimate_residualized_approx_scan_to_tsv_sparse(
     approx_fit_tol: f64,
     approx_fit_max_iter: usize,
     factor_load_secs: f64,
+    mmap_window_mb: Option<usize>,
 ) -> Result<SplmmScanToTsvResult, String> {
     let _ = (approx_fit_tol, approx_fit_max_iter);
     let stage1_cb = stage1_progress_callback.as_ref();
@@ -4554,6 +4565,7 @@ fn estimate_residualized_approx_scan_to_tsv_sparse(
         scan_progress_callback.as_ref(),
         progress_every,
         9,
+        mmap_window_mb,
     )?;
     let scan_exec_secs = (scan_exec_t0.elapsed().as_secs_f64() - tsv_timing.finish_secs).max(0.0);
     if splmm_top_level_timing_enabled() {
@@ -4599,6 +4611,7 @@ fn estimate_rhat_and_scan_sparse(
     scan_progress_callback: Option<Py<PyAny>>,
     progress_every: usize,
     scan_mode: SplmmScanMode,
+    mmap_window_mb: Option<usize>,
 ) -> Result<(f64, Vec<f64>, PcgJxlmmNullModelInfo, PcgJxlmmRHatResult), String> {
     let stage1_cb = stage1_progress_callback.as_ref();
     let mut state = prepare_splmm_scan_state(
@@ -4646,6 +4659,7 @@ fn estimate_rhat_and_scan_sparse(
             9,
             0,
             0,
+            mmap_window_mb,
         )?,
         SplmmScanMode::Exact => scan_with_p0y_and_exact_p0_sparse(
             &state.factor,
@@ -4665,6 +4679,7 @@ fn estimate_rhat_and_scan_sparse(
             9,
             0,
             0,
+            mmap_window_mb,
             &mut state.solve_workspace,
         )?,
         SplmmScanMode::TwoStage => {
@@ -4684,6 +4699,7 @@ fn estimate_rhat_and_scan_sparse(
                 9,
                 0,
                 total_rows,
+                mmap_window_mb,
             )?;
             let p_threshold = splmm_two_stage_p_threshold(total_rows);
             let candidate_rows = select_two_stage_candidates(&approx_out, p_threshold);
@@ -4707,6 +4723,7 @@ fn estimate_rhat_and_scan_sparse(
                     9,
                     total_rows,
                     total_rows + candidate_rows.len(),
+                    mmap_window_mb,
                     &mut state.solve_workspace,
                 )?;
                 merge_exact_results_into_scan(&mut approx_out, &exact_out, &candidate_rows)?;
@@ -4739,6 +4756,7 @@ fn estimate_rhat_and_scan(
     scan_mode: SplmmScanMode,
     approx_fit_tol: f64,
     approx_fit_max_iter: usize,
+    mmap_window_mb: Option<usize>,
 ) -> Result<(f64, Vec<f64>, PcgJxlmmNullModelInfo, PcgJxlmmRHatResult), String> {
     let stage1_cb = stage1_progress_callback.as_ref();
     let prefix = operator_prepared
@@ -4779,6 +4797,7 @@ fn estimate_rhat_and_scan(
             progress_every,
             approx_fit_tol,
             approx_fit_max_iter,
+            mmap_window_mb,
         );
     }
     let factor = sparse_splmm_load_factor(
@@ -4808,6 +4827,7 @@ fn estimate_rhat_and_scan(
         scan_progress_callback,
         progress_every,
         scan_mode,
+        mmap_window_mb,
     )
 }
 
@@ -4840,6 +4860,7 @@ fn estimate_rhat_and_scan_to_tsv(
     scan_mode: SplmmScanMode,
     approx_fit_tol: f64,
     approx_fit_max_iter: usize,
+    mmap_window_mb: Option<usize>,
 ) -> Result<SplmmScanToTsvResult, String> {
     let stage1_cb = stage1_progress_callback.as_ref();
     let prefix = operator_prepared
@@ -4889,6 +4910,7 @@ fn estimate_rhat_and_scan_to_tsv(
             approx_fit_tol,
             approx_fit_max_iter,
             factor_load_secs,
+            mmap_window_mb,
         );
     }
     let factor_load_t0 = Instant::now();
@@ -4955,6 +4977,7 @@ fn estimate_rhat_and_scan_to_tsv(
             scan_progress_callback.as_ref(),
             progress_every,
             9,
+            mmap_window_mb,
         )?,
         SplmmScanMode::Exact => scan_to_tsv_with_p0y_and_exact_p0_sparse(
             &state.factor,
@@ -4978,6 +5001,7 @@ fn estimate_rhat_and_scan_to_tsv(
             scan_progress_callback.as_ref(),
             progress_every,
             9,
+            mmap_window_mb,
             &mut state.solve_workspace,
         )?,
         SplmmScanMode::TwoStage => {
@@ -5006,6 +5030,7 @@ fn estimate_rhat_and_scan_to_tsv(
                         progress_every,
                         9,
                         p_threshold,
+                        mmap_window_mb,
                     )?;
                 if candidate_rows.is_empty() {
                     std::fs::rename(&approx_tmp_tsv, &out_tsv).map_err(|e| {
@@ -5034,6 +5059,7 @@ fn estimate_rhat_and_scan_to_tsv(
                     9,
                     total_rows,
                     total_rows + candidate_rows.len(),
+                    mmap_window_mb,
                     &mut state.solve_workspace,
                 )?;
                 let merged_rows = merge_two_stage_tsv_with_exact_rows(
@@ -5387,7 +5413,8 @@ pub fn splmm_residualized_approx_null_fit_from_jxgrm<'py>(
     scan_progress_callback=None,
     progress_every=0,
     rhat_tol=1e-3,
-    scan_mode="two_stage"
+    scan_mode="two_stage",
+    mmap_window_mb=None
 ))]
 pub fn splmm_assoc_pcg_bed<'py>(
     py: Python<'py>,
@@ -5421,6 +5448,7 @@ pub fn splmm_assoc_pcg_bed<'py>(
     progress_every: usize,
     rhat_tol: f64,
     scan_mode: &str,
+    mmap_window_mb: Option<usize>,
 ) -> PyResult<(
     f64,
     bool,
@@ -5496,6 +5524,7 @@ pub fn splmm_assoc_pcg_bed<'py>(
                 scan_mode,
                 tol,
                 max_iter,
+                mmap_window_mb,
             )
         })
         .map_err(PyRuntimeError::new_err)?;
@@ -5554,7 +5583,8 @@ pub fn splmm_assoc_pcg_bed<'py>(
     scan_progress_callback=None,
     progress_every=0,
     rhat_tol=1e-3,
-    scan_mode="two_stage"
+    scan_mode="two_stage",
+    mmap_window_mb=None
 ))]
 pub fn splmm_assoc_pcg_bed_to_tsv<'py>(
     py: Python<'py>,
@@ -5594,6 +5624,7 @@ pub fn splmm_assoc_pcg_bed_to_tsv<'py>(
     progress_every: usize,
     rhat_tol: f64,
     scan_mode: &str,
+    mmap_window_mb: Option<usize>,
 ) -> PyResult<(
     f64,
     bool,
@@ -5742,6 +5773,7 @@ pub fn splmm_assoc_pcg_bed_to_tsv<'py>(
                 scan_mode,
                 tol,
                 max_iter,
+                mmap_window_mb,
             )
         })
         .map_err(PyRuntimeError::new_err)?;
@@ -5920,6 +5952,7 @@ pub fn splmm_scan_grammar_packed<'py>(
                 2,
                 0,
                 0,
+                None,
             )
         })
         .map_err(PyRuntimeError::new_err)?;
@@ -6021,31 +6054,107 @@ fn unified_stats_from_jxlmm(p: &JxlmmPreparedInput) -> crate::gload::GlobalStats
 }
 
 #[inline]
-fn unified_input_from_jxlmm(prepared: &JxlmmPreparedInput) -> UnifiedInput<JxlmmMatrixAdapter<'_>> {
-    UnifiedInput {
-        matrix: JxlmmMatrixAdapter { inner: prepared },
+fn unified_input_from_jxlmm(
+    prepared: &JxlmmPreparedInput,
+    mmap_window_mb: Option<usize>,
+) -> Result<UnifiedInput<JxlmmMatrixAdapter<'_>>, String> {
+    let matrix = if let Some(window_mb) = mmap_window_mb.filter(|&v| v > 0) {
+        if let Some(prefix) = prepared.bed_prefix.as_deref() {
+            JxlmmMatrixAdapter::Windowed {
+                matrix: WindowedBedMatrix::open(prefix, window_mb)?,
+            }
+        } else {
+            JxlmmMatrixAdapter::Direct { inner: prepared }
+        }
+    } else {
+        JxlmmMatrixAdapter::Direct { inner: prepared }
+    };
+    Ok(UnifiedInput {
+        matrix,
         stats: unified_stats_from_jxlmm(prepared),
-    }
+    })
 }
 
-/// Wraps a `&JxlmmPreparedInput` as a [`GenotypeMatrix`].
-struct JxlmmMatrixAdapter<'a> {
-    inner: &'a JxlmmPreparedInput,
+/// Wraps a SparseLMM prepared input as a [`GenotypeMatrix`].
+enum JxlmmMatrixAdapter<'a> {
+    Direct { inner: &'a JxlmmPreparedInput },
+    Windowed { matrix: WindowedBedMatrix },
 }
 
 impl GenotypeMatrix for JxlmmMatrixAdapter<'_> {
     fn n_samples_full(&self) -> usize {
-        self.inner.n_samples_full
+        match self {
+            Self::Direct { inner } => inner.n_samples_full,
+            Self::Windowed { matrix } => matrix.n_samples_full(),
+        }
     }
     fn bytes_per_snp(&self) -> usize {
-        self.inner.bytes_per_snp
+        match self {
+            Self::Direct { inner } => inner.bytes_per_snp,
+            Self::Windowed { matrix } => matrix.bytes_per_snp(),
+        }
     }
     fn packed_flat(&self) -> &[u8] {
-        self.inner.payload.as_bytes()
+        match self {
+            Self::Direct { inner } => inner.payload.as_bytes(),
+            Self::Windowed { matrix } => matrix.packed_flat(),
+        }
     }
     fn source_row_bytes(&self, source_idx: usize) -> &[u8] {
-        let offset = source_idx.saturating_mul(self.inner.bytes_per_snp);
-        &self.inner.payload.as_bytes()[offset..][..self.inner.bytes_per_snp]
+        match self {
+            Self::Direct { inner } => {
+                let offset = source_idx.saturating_mul(inner.bytes_per_snp);
+                &inner.payload.as_bytes()[offset..][..inner.bytes_per_snp]
+            }
+            Self::Windowed { matrix } => matrix.source_row_bytes(source_idx),
+        }
+    }
+
+    fn decode_additive_block(
+        &mut self,
+        stats: &crate::gload::GlobalStats,
+        row_start: usize,
+        out: &mut [f32],
+        sample_idx: &[usize],
+        sample_identity: bool,
+        pool: Option<&Arc<rayon::ThreadPool>>,
+    ) -> Result<(), String> {
+        match self {
+            Self::Direct { inner } => {
+                let cols = if sample_identity {
+                    stats.n_samples_full
+                } else {
+                    sample_idx.len()
+                };
+                let rows_here = out.len().saturating_div(cols.max(1));
+                if rows_here == 0 {
+                    return Ok(());
+                }
+                let code4_lut = &packed_byte_lut().code4;
+                decode_mean_imputed_additive_packed_block_rows_f32(
+                    inner.payload.as_bytes(),
+                    stats.bytes_per_snp,
+                    stats.n_samples_full,
+                    stats.row_flip_slice(row_start, rows_here),
+                    stats.row_maf_slice(row_start, rows_here),
+                    sample_idx,
+                    sample_identity,
+                    Some(stats.row_source_slice(row_start, rows_here)),
+                    0,
+                    out,
+                    code4_lut,
+                    pool,
+                )
+            }
+            Self::Windowed { matrix } => matrix.decode_additive_block(
+                stats,
+                    row_start,
+                    out,
+                    sample_idx,
+                    sample_identity,
+                    pool,
+                ),
+        }
     }
 }
 
@@ -6397,10 +6506,11 @@ mod tests {
             9,
             0,
             0,
+            None,
         )
         .unwrap();
 
-        let mut input = unified_input_from_jxlmm(&prepared);
+        let mut input = unified_input_from_jxlmm(&prepared, None).unwrap();
         let mut core = vec![0.0_f64; prepared.n_rows() * 3];
         let mut sink = |row_start: usize, rows_here: usize, block: &[f64]| {
             core[row_start * 3..][..rows_here * 3].copy_from_slice(block);
@@ -6464,10 +6574,11 @@ mod tests {
             9,
             0,
             0,
+            None,
         )
         .unwrap();
 
-        let mut input = unified_input_from_jxlmm(&prepared);
+        let mut input = unified_input_from_jxlmm(&prepared, None).unwrap();
         let mut core = vec![0.0_f64; prepared.n_rows() * 3];
         let mut sink = |row_start: usize, rows_here: usize, block: &[f64]| {
             core[row_start * 3..][..rows_here * 3].copy_from_slice(block);
@@ -6524,7 +6635,7 @@ mod tests {
             core[row_start * 3..][..rows_here * 3].copy_from_slice(block);
             Ok(())
         };
-        let mut input = unified_input_from_jxlmm(&prepared);
+        let mut input = unified_input_from_jxlmm(&prepared, None).unwrap();
         exact_scan_blocks_core(
             &factor,
             &mut input,
@@ -6589,6 +6700,7 @@ mod tests {
             9,
             0,
             0,
+            None,
         )
         .unwrap();
         let p0 = scan_with_p0y_and_gamma0(
@@ -6607,6 +6719,7 @@ mod tests {
             9,
             0,
             0,
+            None,
         )
         .unwrap();
 
@@ -6638,6 +6751,7 @@ mod tests {
             9,
             0,
             0,
+            None,
         )
         .unwrap();
 
@@ -6682,7 +6796,7 @@ mod tests {
             full[row_start * 3..][..rows_here * 3].copy_from_slice(block);
             Ok(())
         };
-        let mut input = unified_input_from_jxlmm(&prepared);
+        let mut input = unified_input_from_jxlmm(&prepared, None).unwrap();
         exact_scan_blocks_core(
             &factor,
             &mut input,
@@ -6727,6 +6841,7 @@ mod tests {
             9,
             0,
             0,
+            None,
             &mut workspace_p0,
         )
         .unwrap();
@@ -6804,6 +6919,7 @@ mod tests {
             None,
             0,
             SplmmScanMode::Exact,
+            None,
         )
         .unwrap();
 

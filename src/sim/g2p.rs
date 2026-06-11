@@ -69,6 +69,7 @@ struct G2pSimConfig {
     delimiter: Option<String>,
     maf_threshold: f32,
     max_missing_rate: f32,
+    het_threshold: Option<f32>,
     seed: u64,
     residual_var: f64,
     bg_pve: f64,
@@ -642,6 +643,7 @@ fn iterate_filtered_rows<F>(
     delimiter: Option<&str>,
     maf_threshold: f32,
     max_missing_rate: f32,
+    het_threshold: Option<f32>,
     snps_only: bool,
     mut callback: F,
 ) -> Result<Vec<String>, String>
@@ -659,8 +661,8 @@ where
             maf_threshold,
             max_missing_rate,
             true,
-            false,
-            0.02,
+            het_threshold.is_some(),
+            het_threshold.unwrap_or(1.0_f32),
         );
         if !keep {
             continue;
@@ -1319,6 +1321,11 @@ fn g2p_simulate_core(config: G2pSimConfig) -> Result<G2pSimResult, String> {
     if !(0.0..=1.0).contains(&config.logic_het_max) {
         return Err("logic_het_max must be within [0, 1].".to_string());
     }
+    if let Some(het_threshold) = config.het_threshold {
+        if !(0.0..=1.0).contains(&het_threshold) {
+            return Err("het_threshold must be within [0, 1].".to_string());
+        }
+    }
     if !(0.0..=1.0).contains(&config.logic_af_min) || !(0.0..=1.0).contains(&config.logic_af_max) {
         return Err("logic_af_min/logic_af_max must be within [0, 1].".to_string());
     }
@@ -1397,6 +1404,7 @@ fn g2p_simulate_core(config: G2pSimConfig) -> Result<G2pSimResult, String> {
         config.delimiter.as_deref(),
         config.maf_threshold,
         config.max_missing_rate,
+        config.het_threshold,
         config.snps_only,
         |_, row, site| {
             bg_progress_seen = bg_progress_seen.saturating_add(1);
@@ -1537,6 +1545,7 @@ fn g2p_simulate_core(config: G2pSimConfig) -> Result<G2pSimResult, String> {
                 config.delimiter.as_deref(),
                 config.maf_threshold,
                 config.max_missing_rate,
+                config.het_threshold,
                 config.snps_only,
                 |kept_idx, row, _site| {
                     causal_progress_seen = causal_progress_seen.saturating_add(1);
@@ -1598,6 +1607,7 @@ fn g2p_simulate_core(config: G2pSimConfig) -> Result<G2pSimResult, String> {
                 config.delimiter.as_deref(),
                 config.maf_threshold,
                 config.max_missing_rate,
+                config.het_threshold,
                 config.snps_only,
                 |kept_idx, row, _site| {
                     causal_progress_seen = causal_progress_seen.saturating_add(1);
@@ -1777,6 +1787,7 @@ fn g2p_simulate_core(config: G2pSimConfig) -> Result<G2pSimResult, String> {
     chunk_size=100_000,
     maf_threshold=0.02_f32,
     max_missing_rate=0.05_f32,
+    het_threshold=None,
     seed=1_u64,
     residual_var=1.0_f64,
     bg_pve=0.5_f64,
@@ -1799,7 +1810,7 @@ fn g2p_simulate_core(config: G2pSimConfig) -> Result<G2pSimResult, String> {
     logic_window_bp=None,
     logic_effect_model="gate",
     delimiter=None,
-    snps_only=true,
+    snps_only=false,
     pheno_prefix=None,
     fixed_effects_path=None,
     random_effects_path=None,
@@ -1817,6 +1828,7 @@ pub fn g2p_simulate_py<'py>(
     chunk_size: usize,
     maf_threshold: f32,
     max_missing_rate: f32,
+    het_threshold: Option<f32>,
     seed: u64,
     residual_var: f64,
     bg_pve: f64,
@@ -1861,6 +1873,13 @@ pub fn g2p_simulate_py<'py>(
         return Err(PyValueError::new_err(
             "residual_var must be finite and >= 0.",
         ));
+    }
+    if let Some(het_threshold) = het_threshold {
+        if !(0.0..=1.0).contains(&het_threshold) {
+            return Err(PyValueError::new_err(
+                "het_threshold must be within [0, 1].",
+            ));
+        }
     }
     if logic_k_min == 0 {
         return Err(PyValueError::new_err("logic_k_min must be > 0."));
@@ -1913,6 +1932,7 @@ pub fn g2p_simulate_py<'py>(
         delimiter,
         maf_threshold,
         max_missing_rate,
+        het_threshold,
         seed,
         residual_var,
         bg_pve,
@@ -1988,6 +2008,19 @@ pub fn g2p_simulate_py<'py>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::{self, File};
+    use std::io::Write;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn make_temp_dir(prefix: &str) -> std::path::PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("janusx_{prefix}_{stamp}"));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
 
     #[test]
     fn test_centered_interaction_is_orthogonal_to_main_effects() {
@@ -2011,5 +2044,121 @@ mod tests {
         assert!(dot_a.abs() < 1e-8);
         assert!(dot_b.abs() < 1e-8);
         assert!(variance_f64(&z) > 1e-12);
+    }
+
+    #[test]
+    fn iterate_filtered_rows_keeps_non_acgt_sites_when_snps_only_disabled() {
+        let dir = make_temp_dir("g2p_iter_txt");
+        let prefix = dir.join("geno");
+        let txt_path = dir.join("geno.txt");
+        let id_path = dir.join("geno.id");
+
+        {
+            let mut f = File::create(&txt_path).unwrap();
+            writeln!(f, "0\t1\t2").unwrap();
+        }
+        {
+            let mut f = File::create(&id_path).unwrap();
+            writeln!(f, "s1").unwrap();
+            writeln!(f, "s2").unwrap();
+            writeln!(f, "s3").unwrap();
+        }
+
+        let mut kept_false = 0usize;
+        let sample_ids = iterate_filtered_rows(
+            prefix.to_str().unwrap(),
+            None,
+            0.0,
+            1.0,
+            None,
+            false,
+            |_, row, site| {
+                assert_eq!(row, &[0.0_f32, 1.0_f32, 2.0_f32]);
+                assert_eq!(site.ref_allele, "N");
+                assert_eq!(site.alt_allele, "N");
+                kept_false += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(sample_ids, vec!["s1", "s2", "s3"]);
+        assert_eq!(kept_false, 1);
+
+        let mut kept_true = 0usize;
+        let sample_ids_true = iterate_filtered_rows(
+            prefix.to_str().unwrap(),
+            None,
+            0.0,
+            1.0,
+            None,
+            true,
+            |_, _, _| {
+                kept_true += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(sample_ids_true, vec!["s1", "s2", "s3"]);
+        assert_eq!(kept_true, 0);
+
+        let _ = fs::remove_file(txt_path);
+        let _ = fs::remove_file(id_path);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn iterate_filtered_rows_respects_optional_het_threshold() {
+        let dir = make_temp_dir("g2p_iter_het");
+        let prefix = dir.join("geno");
+        let txt_path = dir.join("geno.txt");
+        let id_path = dir.join("geno.id");
+
+        {
+            let mut f = File::create(&txt_path).unwrap();
+            writeln!(f, "0\t1\t2\t1").unwrap();
+        }
+        {
+            let mut f = File::create(&id_path).unwrap();
+            writeln!(f, "s1").unwrap();
+            writeln!(f, "s2").unwrap();
+            writeln!(f, "s3").unwrap();
+            writeln!(f, "s4").unwrap();
+        }
+
+        let mut kept_disabled = 0usize;
+        iterate_filtered_rows(
+            prefix.to_str().unwrap(),
+            None,
+            0.0,
+            1.0,
+            None,
+            false,
+            |_, _, _| {
+                kept_disabled += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(kept_disabled, 1);
+
+        let mut kept_enabled = 0usize;
+        iterate_filtered_rows(
+            prefix.to_str().unwrap(),
+            None,
+            0.0,
+            1.0,
+            Some(0.25_f32),
+            false,
+            |_, _, _| {
+                kept_enabled += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(kept_enabled, 0);
+
+        let _ = fs::remove_file(txt_path);
+        let _ = fs::remove_file(id_path);
+        let _ = fs::remove_dir_all(dir);
     }
 }

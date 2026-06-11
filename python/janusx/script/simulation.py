@@ -120,6 +120,7 @@ def _run_rust_simulation(
     seed: int,
     maf: float,
     missing_rate: float,
+    het_threshold: float | None,
     bg_pve: float,
     residual_var: float,
     causal: int,
@@ -144,6 +145,7 @@ def _run_rust_simulation(
     trait_name: Optional[str] = None,
     write_effect_tables: bool = False,
     grm: np.ndarray | None = None,
+    snps_only: bool = False,
     progress_callback: Any | None = None,
     progress_total_hint: Optional[int] = None,
     progress_every: int = 10_000,
@@ -161,6 +163,7 @@ def _run_rust_simulation(
             chunk_size=100_000,
             maf_threshold=float(maf),
             max_missing_rate=float(missing_rate),
+            het_threshold=None if het_threshold is None else float(het_threshold),
             seed=int(seed),
             residual_var=float(residual_var),
             bg_pve=float(bg_pve),
@@ -183,7 +186,7 @@ def _run_rust_simulation(
             logic_window_bp=logic_window_bp,
             logic_effect_model=str(logic_effect_model),
             delimiter=None,
-            snps_only=True,
+            snps_only=bool(snps_only),
             pheno_prefix=outprefix,
             fixed_effects_path=fixed_path,
             random_effects_path=random_path,
@@ -207,6 +210,7 @@ def simulate_phenotype_from_genofile(
     seed: int = 1,
     maf: float = 0.02,
     missing_rate: float = 0.05,
+    het: float | None = None,
     pve: float = 0.5,
     ve: float = 1.0,
     windows: int = 50_000,
@@ -227,6 +231,7 @@ def simulate_phenotype_from_genofile(
         seed=int(seed),
         maf=float(maf),
         missing_rate=float(missing_rate),
+        het_threshold=None if het is None else float(het),
         bg_pve=float(pve),
         residual_var=float(ve),
         causal=1,
@@ -251,6 +256,7 @@ def simulate_phenotype_from_genofile(
         trait_name=None,
         write_effect_tables=False,
         grm=None,
+        snps_only=False,
     )
     y = np.asarray(res["phenotype"], dtype=np.float64).reshape(-1, 1)
     outsites = [(str(c), int(s), int(e)) for c, s, e in list(res.get("causal_sites", []))]
@@ -516,6 +522,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     filter_group.add_argument("-maf", "--maf", type=float, default=0.02, help="Exclude variants with minor allele frequency lower than a threshold (default: 0.02).")
     filter_group.add_argument("-geno", "--geno", type=float, default=0.05, help="Exclude variants with missing call frequencies greater than a threshold (default: 0.05).")
+    filter_group.add_argument(
+        "-het",
+        "--het",
+        type=float,
+        default=None,
+        help="Optional maximum heterozygosity rate per variant in [0,1]. Disabled by default.",
+    )
 
     pve_group.add_argument(
         "-bg-pve",
@@ -666,6 +679,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                     ("Genotype file", gfile),
                     ("MAF threshold", args.maf),
                     ("Missing threshold", args.geno),
+                    ("Het threshold", "None" if args.het is None else args.het),
                     ("Background PVE", args.bg_pve),
                     ("Residual input (deprecated)", args.ve),
                     ("Background GRM", args.grm),
@@ -676,6 +690,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                     ("Logic window bp", logic_window_bp),
                     ("Logic effect model", logic_effect_model if logic_mode is not None else "None"),
                     ("Background dist", bg_dist),
+                    ("SNPs only", False),
                     ("Gamma shape", gamma_shape if bg_dist == "gamma" else "None"),
                     # ("Laplace scale", laplace_scale if bg_dist == "laplace" else "None"),
                     ("BIM ranges", len(bimranges)),
@@ -704,6 +719,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     if not (0.0 <= float(args.bg_pve) <= 1.0):
         logger.error("--bg-pve/--pve must be in [0, 1].")
         raise SystemExit(1)
+    if args.het is not None and not (0.0 <= float(args.het) <= 1.0):
+        logger.error("--het must be in [0, 1].")
+        raise SystemExit(1)
     if cs_pve is not None and not (0.0 <= float(cs_pve) <= 1.0):
         logger.error("--cs-pve must be in [0, 1].")
         raise SystemExit(1)
@@ -721,9 +739,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     with CliStatus("Inspecting genotype input...", enabled=True) as task:
         sample_ids, n_sites = inspect_genotype_file(
             gfile,
-            snps_only=True,
+            snps_only=False,
             maf=float(args.maf),
             missing_rate=float(args.geno),
+            het=1.0 if args.het is None else float(args.het),
         )
         task.complete("Inspecting genotype input ...Finished")
     sample_ids = np.asarray(sample_ids, dtype=str)
@@ -827,6 +846,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             seed=seed,
             maf=float(args.maf),
             missing_rate=float(args.geno),
+            het_threshold=None if args.het is None else float(args.het),
             bg_pve=float(args.bg_pve),
             residual_var=float(args.ve),
             causal=int(args.causal),
@@ -851,6 +871,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             trait_name=None,
             write_effect_tables=True,
             grm=aligned_grm,
+            snps_only=False,
             progress_callback=_simulation_progress,
             progress_total_hint=progress_total_hint,
             progress_every=max(1, min(10_000, progress_total_hint // 200 if progress_total_hint > 0 else 10_000)),

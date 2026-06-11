@@ -3235,6 +3235,7 @@ def prepare_streaming_context(
                 "prefix": str(prefix0),
                 "full_ids": np.asarray(full_ids0, dtype=str),
                 "packed_ctx": packed_ctx0,
+                "site_meta": sites0,
                 "sites_all": sites0,
             }
             # When packed preload is ready, switch streaming source to the packed prefix.
@@ -3388,6 +3389,7 @@ def prepare_streaming_context(
                 "prefix": str(prefix1),
                 "full_ids": np.asarray(full_ids1, dtype=str),
                 "packed_ctx": packed_ctx1,
+                "site_meta": sites1,
                 "sites_all": sites1,
             }
             stream_genofile = str(prefix1)
@@ -3701,6 +3703,164 @@ def _read_bim_sites(prefix: str) -> list[tuple[str, int, str, str, str]]:
             a1 = str(toks[5])
             out.append((chrom, pos, a0, a1, snp))
     return out
+
+
+class _BimSiteColumns:
+    __slots__ = ("chrom", "pos", "allele0", "allele1", "snp")
+
+    def __init__(
+        self,
+        *,
+        chrom: list[str],
+        pos: list[int],
+        allele0: list[str],
+        allele1: list[str],
+        snp: list[str],
+    ) -> None:
+        n = int(len(chrom))
+        if (
+            int(len(pos)) != n
+            or int(len(allele0)) != n
+            or int(len(allele1)) != n
+            or int(len(snp)) != n
+        ):
+            raise ValueError("BIM metadata column length mismatch.")
+        self.chrom = chrom
+        self.pos = pos
+        self.allele0 = allele0
+        self.allele1 = allele1
+        self.snp = snp
+
+    @classmethod
+    def from_sites(cls, sites: list[tuple[object, ...]]) -> "_BimSiteColumns":
+        chrom, pos, allele0, allele1, snp = _split_gwas_sites(list(sites))
+        return cls(
+            chrom=[str(v) for v in chrom],
+            pos=[int(v) for v in pos],
+            allele0=[str(v) for v in allele0],
+            allele1=[str(v) for v in allele1],
+            snp=[str(v) for v in snp],
+        )
+
+    def __len__(self) -> int:
+        return int(len(self.snp))
+
+    def __iter__(self) -> Iterator[tuple[str, int, str, str, str]]:
+        for idx in range(len(self)):
+            yield self[idx]
+
+    def __getitem__(self, key: object) -> object:
+        if isinstance(key, slice):
+            return [self[i] for i in range(*key.indices(len(self)))]
+        idx = int(key)
+        n = len(self)
+        if idx < 0:
+            idx += n
+        if idx < 0 or idx >= n:
+            raise IndexError("BIM metadata index out of range")
+        return (
+            str(self.chrom[idx]),
+            int(self.pos[idx]),
+            str(self.allele0[idx]),
+            str(self.allele1[idx]),
+            str(self.snp[idx]),
+        )
+
+    def columns(self) -> tuple[list[str], list[int], list[str], list[str], list[str]]:
+        return self.chrom, self.pos, self.allele0, self.allele1, self.snp
+
+    def take(self, idx: object) -> "_BimSiteColumns":
+        idx_arr = np.asarray(idx, dtype=np.int64).reshape(-1)
+        return _BimSiteColumns(
+            chrom=[self.chrom[int(i)] for i in idx_arr],
+            pos=[int(self.pos[int(i)]) for i in idx_arr],
+            allele0=[self.allele0[int(i)] for i in idx_arr],
+            allele1=[self.allele1[int(i)] for i in idx_arr],
+            snp=[self.snp[int(i)] for i in idx_arr],
+        )
+
+    def bool_mask(self, mask: object) -> "_BimSiteColumns":
+        mask_arr = np.asarray(mask, dtype=np.bool_).reshape(-1)
+        if int(mask_arr.shape[0]) != len(self):
+            raise ValueError(
+                f"BIM metadata mask length mismatch: got {mask_arr.shape[0]}, expected {len(self)}"
+            )
+        keep_idx = np.flatnonzero(mask_arr).astype(np.int64, copy=False)
+        return self.take(keep_idx)
+
+    def simple_snp_mask(self) -> np.ndarray:
+        return np.asarray(
+            [
+                (len(str(a0)) == 1 and len(str(a1)) == 1)
+                for a0, a1 in zip(self.allele0, self.allele1)
+            ],
+            dtype=np.bool_,
+        )
+
+    def to_ref_alt_dict(self) -> dict[str, object]:
+        return {
+            "chrom": list(self.chrom),
+            "pos": list(self.pos),
+            "snp": list(self.snp),
+            "allele0": list(self.allele0),
+            "allele1": list(self.allele1),
+        }
+
+
+def _coerce_bim_site_columns(obj: object) -> Optional[_BimSiteColumns]:
+    if isinstance(obj, _BimSiteColumns):
+        return obj
+    if isinstance(obj, list):
+        return _BimSiteColumns.from_sites(obj)
+    if isinstance(obj, dict):
+        chrom_obj = obj.get("chrom")
+        pos_obj = obj.get("pos")
+        snp_obj = obj.get("snp")
+        allele0_obj = obj.get("allele0")
+        allele1_obj = obj.get("allele1")
+        if chrom_obj is None or pos_obj is None or snp_obj is None or allele0_obj is None or allele1_obj is None:
+            return None
+        chrom = [str(v) for v in list(chrom_obj)]
+        pos = [int(v) for v in list(pos_obj)]
+        snp = [str(v) for v in list(snp_obj)]
+        allele0 = [str(v) for v in list(allele0_obj)]
+        allele1 = [str(v) for v in list(allele1_obj)]
+        return _BimSiteColumns(
+            chrom=chrom,
+            pos=pos,
+            allele0=allele0,
+            allele1=allele1,
+            snp=snp,
+        )
+    return None
+
+
+def _read_bim_site_columns(
+    prefix: str,
+    row_indices: Union[np.ndarray, list[int], None] = None,
+) -> _BimSiteColumns:
+    row_idx_arr = None
+    if row_indices is not None:
+        row_idx_arr = np.ascontiguousarray(
+            np.asarray(row_indices, dtype=np.int64).reshape(-1),
+            dtype=np.int64,
+        )
+    if hasattr(jxrs, "load_bim_columns"):
+        chrom, pos, snp, allele0, allele1 = jxrs.load_bim_columns(
+            str(prefix),
+            row_idx_arr,
+        )
+        return _BimSiteColumns(
+            chrom=[str(v) for v in list(chrom)],
+            pos=[int(v) for v in list(pos)],
+            allele0=[str(v) for v in list(allele0)],
+            allele1=[str(v) for v in list(allele1)],
+            snp=[str(v) for v in list(snp)],
+        )
+    sites_all = _read_bim_sites(str(prefix))
+    if row_idx_arr is not None:
+        sites_all = [sites_all[int(i)] for i in row_idx_arr.tolist()]
+    return _BimSiteColumns.from_sites(sites_all)
 
 
 def _coerce_site_pos(value: object) -> int:
@@ -4590,16 +4750,33 @@ def run_lrlmm_packed(
                 raise ValueError(
                     "prepared ref_alt row count does not match packed SNP count."
                 )
-            sites_all = list(
-                zip(
-                    ref_alt_df["chrom"].astype(str).tolist(),
-                    pd.to_numeric(ref_alt_df["pos"], errors="coerce").fillna(0).astype(int).tolist(),
-                    ref_alt_df["allele0"].astype(str).tolist(),
-                    ref_alt_df["allele1"].astype(str).tolist(),
-                )
+            sites_all = _BimSiteColumns(
+                chrom=ref_alt_df["chrom"].astype(str).tolist(),
+                pos=(
+                    pd.to_numeric(ref_alt_df["pos"], errors="coerce")
+                    .fillna(0)
+                    .astype(int)
+                    .tolist()
+                ),
+                allele0=ref_alt_df["allele0"].astype(str).tolist(),
+                allele1=ref_alt_df["allele1"].astype(str).tolist(),
+                snp=[
+                    _normalize_snp_name(
+                        raw_name,
+                        chrom,
+                        pos,
+                    )
+                    for raw_name, chrom, pos in zip(
+                        ref_alt_df.get("snp", pd.Series(dtype=object)).astype(str).tolist()
+                        if "snp" in ref_alt_df.columns
+                        else [""] * int(ref_alt_df.shape[0]),
+                        ref_alt_df["chrom"].astype(str).tolist(),
+                        pd.to_numeric(ref_alt_df["pos"], errors="coerce").fillna(0).astype(int).tolist(),
+                    )
+                ],
             )
         else:
-            sites_all = _read_bim_sites(prefix)
+            sites_all = _read_bim_site_columns(prefix)
             if len(sites_all) != int(packed.shape[0]):
                 raise ValueError(
                     f"BIM row count mismatch with packed BED: bim={len(sites_all)}, packed={packed.shape[0]}"
@@ -4649,34 +4826,28 @@ def run_lrlmm_packed(
         if packed.shape[0] != maf.shape[0] or packed.shape[0] != miss.shape[0]:
             raise ValueError("Packed BED arrays have inconsistent SNP dimensions.")
 
-        sites_all_full = _read_bim_sites(prefix)
         keep_numeric = np.ascontiguousarray(
             np.asarray(packed_ctx_raw["site_keep"], dtype=np.bool_).reshape(-1), dtype=np.bool_
         )
-        if len(sites_all_full) != int(keep_numeric.shape[0]):
+        kept_numeric_idx = np.flatnonzero(keep_numeric).astype(np.int64, copy=False)
+        sites_all_numeric = _read_bim_site_columns(prefix, kept_numeric_idx)
+        if len(sites_all_numeric) != int(kept_numeric_idx.shape[0]):
             raise ValueError(
                 "BIM row count mismatch with packed BED filtering mask: "
-                f"bim={len(sites_all_full)}, mask={keep_numeric.shape[0]}"
+                f"bim={len(sites_all_numeric)}, kept_numeric={kept_numeric_idx.shape[0]}"
             )
-        keep_final = np.ascontiguousarray(keep_numeric, dtype=np.bool_)
+        keep_local = np.ones((len(sites_all_numeric),), dtype=np.bool_)
         if bool(snps_only):
-            snp_mask = np.asarray(
-                [
-                    (len(str(_site_tuple_parts(site)[2])) == 1 and len(str(_site_tuple_parts(site)[3])) == 1)
-                    for site in sites_all_full
-                ],
-                dtype=bool,
-            )
-            keep_final &= snp_mask
-        if not np.any(keep_final):
+            keep_local &= sites_all_numeric.simple_snp_mask()
+        if not np.any(keep_local):
             raise ValueError("No SNP remains after LRLMM packed-bed filtering.")
-        if not np.array_equal(keep_final, keep_numeric):
-            kept_numeric_idx = np.flatnonzero(keep_numeric).astype(np.int64, copy=False)
-            keep_local = np.ascontiguousarray(keep_final[kept_numeric_idx], dtype=np.bool_)
+        if not np.all(keep_local):
             packed = np.ascontiguousarray(packed[keep_local], dtype=np.uint8)
             miss = np.ascontiguousarray(miss[keep_local], dtype=np.float32)
             maf = np.ascontiguousarray(maf[keep_local], dtype=np.float32)
-        sites_all = [s for s, k in zip(sites_all_full, keep_final) if bool(k)]
+            sites_all = sites_all_numeric.bool_mask(keep_local)
+        else:
+            sites_all = sites_all_numeric
 
     process = psutil.Process()
     n_cores = detect_effective_threads()
@@ -4950,7 +5121,7 @@ def run_lrlmm_packed(
             use_spinner=bool(use_spinner),
         )
 
-        chrom, pos, a0, a1, snp = _split_gwas_sites(sites_all)
+        chrom, pos, a0, a1, snp = sites_all.columns()
 
         res_df = pd.DataFrame(
             {
@@ -5141,9 +5312,9 @@ def _run_file_dense_fast_once(
         n_markers: int,
     ) -> tuple[np.ndarray, np.ndarray, list[str], list[str], list[str]]:
         try:
-            sites_bim = _read_bim_sites(str(prefix))
+            sites_bim = _read_bim_site_columns(str(prefix))
             if len(sites_bim) == int(n_markers):
-                chrom_bim, pos_bim, allele0_bim, allele1_bim, snp_bim = _split_gwas_sites(sites_bim)
+                chrom_bim, pos_bim, allele0_bim, allele1_bim, snp_bim = sites_bim.columns()
                 return (
                     np.asarray(chrom_bim, dtype=object),
                     np.asarray(pos_bim, dtype=np.int64),
@@ -6625,6 +6796,7 @@ def _run_gwas_pipeline(
                             "prefix": str(prefix0),
                             "full_ids": np.asarray(full_ids0, dtype=str),
                             "packed_ctx": packed_ctx0,
+                            "site_meta": sites0,
                             "sites_all": sites0,
                         }
                     except Exception as ex:
@@ -6704,27 +6876,11 @@ def _run_gwas_pipeline(
                             and qmatrix is not None
                         ):
                             try:
-                                sites_prefill = preloaded_packed.get("sites_all")
-                                if isinstance(sites_prefill, list):
-                                    chrom_prefill: list[str] = []
-                                    pos_prefill: list[int] = []
-                                    snp_prefill: list[str] = []
-                                    allele0_prefill: list[str] = []
-                                    allele1_prefill: list[str] = []
-                                    for site in sites_prefill:
-                                        c, p, a0, a1, sid = _site_tuple_parts(site)
-                                        chrom_prefill.append(str(c))
-                                        pos_prefill.append(int(p))
-                                        snp_prefill.append(str(sid))
-                                        allele0_prefill.append(str(a0))
-                                        allele1_prefill.append(str(a1))
-                                    ref_alt_prefill = {
-                                        "chrom": chrom_prefill,
-                                        "pos": pos_prefill,
-                                        "snp": snp_prefill,
-                                        "allele0": allele0_prefill,
-                                        "allele1": allele1_prefill,
-                                    }
+                                sites_prefill = _coerce_bim_site_columns(
+                                    preloaded_packed.get("site_meta", preloaded_packed.get("sites_all"))
+                                )
+                                if sites_prefill is not None:
+                                    ref_alt_prefill = sites_prefill.to_ref_alt_dict()
                                     full_ids_prefill = np.asarray(
                                         preloaded_packed.get("full_ids", ids),
                                         dtype=str,
@@ -6994,6 +7150,7 @@ def _run_gwas_pipeline(
                             trait_names=trait_one,
                             emit_trait_header=bool(emit_trait_header_model),
                             preloaded_packed=preloaded_packed,
+                            force_model=bool(args.force_model),
                             scan_mode=str(args._splmm_denom_mode or "exact"),
                         )
 
@@ -7367,27 +7524,11 @@ def _run_gwas_pipeline(
                 and qmatrix is not None
             ):
                 try:
-                    sites_prefill = preloaded_packed.get("sites_all")
-                    if isinstance(sites_prefill, list):
-                        chrom_prefill: list[str] = []
-                        pos_prefill: list[int] = []
-                        snp_prefill: list[str] = []
-                        allele0_prefill: list[str] = []
-                        allele1_prefill: list[str] = []
-                        for site in sites_prefill:
-                            c, p, a0, a1, sid = _site_tuple_parts(site)
-                            chrom_prefill.append(str(c))
-                            pos_prefill.append(int(p))
-                            snp_prefill.append(str(sid))
-                            allele0_prefill.append(str(a0))
-                            allele1_prefill.append(str(a1))
-                        ref_alt_prefill = {
-                            "chrom": chrom_prefill,
-                            "pos": pos_prefill,
-                            "snp": snp_prefill,
-                            "allele0": allele0_prefill,
-                            "allele1": allele1_prefill,
-                        }
+                    sites_prefill = _coerce_bim_site_columns(
+                        preloaded_packed.get("site_meta", preloaded_packed.get("sites_all"))
+                    )
+                    if sites_prefill is not None:
+                        ref_alt_prefill = sites_prefill.to_ref_alt_dict()
                         full_ids_prefill = np.asarray(
                             preloaded_packed.get("full_ids", ids),
                             dtype=str,

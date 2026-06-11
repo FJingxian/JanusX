@@ -174,10 +174,10 @@ use garfield::{
 use gfreader::{
     bed_filter_stream_to_plink_rust, bed_filter_to_plink_rust, bed_mmap_filter_to_plink_rust,
     count_hmp_snps, count_vcf_snps, gfd_packbits_from_dosage_block, load_bed_2bit_packed,
-    load_bed_u8_matrix, load_site_info, prepare_bed_2bit_packed, prepare_bed_logic_meta_selected,
-    scan_bed_2bit_packed_stats, BedChunkReader, BedMmapReader, GwasAssocTsvWriter, HmpChunkReader,
-    HmpStreamWriter, NpyMmapReader, PlinkStreamWriter, SiteInfo, TxtChunkReader, VcfChunkReader,
-    VcfStreamWriter,
+    load_bed_u8_matrix, load_bim_columns, load_site_info, prepare_bed_2bit_packed,
+    prepare_bed_logic_meta_selected, scan_bed_2bit_packed_stats, BedChunkReader, BedMmapReader,
+    GwasAssocTsvWriter, HmpChunkReader, HmpStreamWriter, NpyMmapReader, PlinkStreamWriter,
+    SiteInfo, TxtChunkReader, VcfChunkReader, VcfStreamWriter,
 };
 use glm::{
     glm_ixx_from_x_qr, glmf32, glmf32_full, glmf32_packed, glmf32_packed_assoc,
@@ -353,6 +353,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(prepare_bed_logic_meta_selected, m)?)?;
     m.add_function(wrap_pyfunction!(load_bed_u8_matrix, m)?)?;
     m.add_function(wrap_pyfunction!(load_site_info, m)?)?;
+    m.add_function(wrap_pyfunction!(load_bim_columns, m)?)?;
     m.add_function(wrap_pyfunction!(gfd_packbits_from_dosage_block, m)?)?;
     m.add_function(wrap_pyfunction!(sim_trait_accumulate_i8_f32, m)?)?;
     m.add_function(wrap_pyfunction!(g2p_simulate_py, m)?)?;

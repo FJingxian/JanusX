@@ -35,6 +35,7 @@ use crate::gfreader::{
     count_packed_row_counts, count_packed_row_counts_selected_with_excluded, is_simple_snp_allele,
     precompute_excluded_sample_indices, sample_indices_are_identity,
 };
+use crate::gload::WindowedBedMatrix;
 use crate::linalg::{
     chi2_sf_df1, chisq_from_beta_se_and_optional_plrt, cholesky_inplace, cholesky_logdet,
     cholesky_solve_into, format_chisq_value, normal_sf, sanitize_assoc_pvalue,
@@ -3949,6 +3950,7 @@ pub fn fvlmm_assoc_chunk_from_snp_to_tsv_f32<'py>(
     rotate_block_rows = 512,
     progress_callback = None,
     progress_every = 0,
+    mmap_window_mb = None,
 ))]
 pub fn fvlmm_assoc_bed_to_tsv_f32<'py>(
     py: Python<'py>,
@@ -3970,6 +3972,7 @@ pub fn fvlmm_assoc_bed_to_tsv_f32<'py>(
     rotate_block_rows: usize,
     progress_callback: Option<Py<PyAny>>,
     progress_every: usize,
+    mmap_window_mb: Option<usize>,
 ) -> PyResult<(usize, f64, f64)> {
     let s_slice = s.as_slice()?;
     let xcov_arr = xcov.as_array();
@@ -4051,27 +4054,41 @@ pub fn fvlmm_assoc_bed_to_tsv_f32<'py>(
                 ));
             }
 
-            // mmap BED
-            let bed_path = format!("{bed_prefix_owned}.bed");
-            let bed_file = File::open(&bed_path).map_err(|e| format!("open {bed_path}: {e}"))?;
-            let mmap =
-                unsafe { Mmap::map(&bed_file) }.map_err(|e| format!("mmap {bed_path}: {e}"))?;
-            if mmap.len() < 3 || mmap[0] != 0x6C || mmap[1] != 0x1B || mmap[2] != 0x01 {
-                return Err("only SNP-major BED supported".to_string());
-            }
-
             let bytes_per_snp = (n_samples_full + 3) / 4;
             if bytes_per_snp == 0 {
                 return Err("bytes_per_snp is zero".to_string());
             }
-            let data_len = mmap.len() - 3;
-            if data_len % bytes_per_snp != 0 {
-                return Err(format!(
-                    "BED payload length {data_len} not a multiple of {bytes_per_snp}"
-                ));
-            }
-            let n_snps = data_len / bytes_per_snp;
-            let packed_src = &mmap[3..];
+            let bed_path = format!("{bed_prefix_owned}.bed");
+            let mut bed_window = if let Some(window_mb) = mmap_window_mb.filter(|&v| v > 0) {
+                Some(WindowedBedMatrix::open(&bed_prefix_owned, window_mb)?)
+            } else {
+                None
+            };
+            let full_mmap = if bed_window.is_none() {
+                let bed_file = File::open(&bed_path).map_err(|e| format!("open {bed_path}: {e}"))?;
+                let mmap =
+                    unsafe { Mmap::map(&bed_file) }.map_err(|e| format!("mmap {bed_path}: {e}"))?;
+                if mmap.len() < 3 || mmap[0] != 0x6C || mmap[1] != 0x1B || mmap[2] != 0x01 {
+                    return Err("only SNP-major BED supported".to_string());
+                }
+                let data_len = mmap.len() - 3;
+                if data_len % bytes_per_snp != 0 {
+                    return Err(format!(
+                        "BED payload length {data_len} not a multiple of {bytes_per_snp}"
+                    ));
+                }
+                Some(mmap)
+            } else {
+                None
+            };
+            let n_snps = if let Some(window) = bed_window.as_ref() {
+                window.n_source_snps()
+            } else {
+                let mmap = full_mmap
+                    .as_ref()
+                    .ok_or_else(|| "internal error: missing BED source".to_string())?;
+                (mmap.len() - 3) / bytes_per_snp
+            };
 
             if all_chrom.len() != n_snps {
                 return Err(format!(
@@ -4152,19 +4169,45 @@ pub fn fvlmm_assoc_bed_to_tsv_f32<'py>(
 
             // --- Producer: count (rayon) + filter + metadata + decode ---
             let mut chunk_start = 0usize;
+            let producer_err = Arc::new(OnceLock::<String>::new());
+            let producer_err_bg = Arc::clone(&producer_err);
             let producer = |chunk: &mut StreamingChunk| -> bool {
                 if chunk_start >= n_snps {
                     return false;
                 }
                 chunk.clear();
                 let chunk_end = (chunk_start + scan_chunk_snps).min(n_snps);
+                let chunk_packed = match bed_window.as_mut() {
+                    Some(window) => match window.read_source_range(chunk_start, chunk_end) {
+                        Ok(slice) => slice,
+                        Err(e) => {
+                            let _ = producer_err_bg.set(e);
+                            return false;
+                        }
+                    },
+                    None => {
+                        let mmap = match full_mmap.as_ref() {
+                            Some(mmap) => mmap,
+                            None => {
+                                let _ = producer_err_bg
+                                    .set("internal error: missing full BED mmap".to_string());
+                                return false;
+                            }
+                        };
+                        let packed = &mmap[3..];
+                        let start_byte = chunk_start * bytes_per_snp;
+                        let end_byte = chunk_end * bytes_per_snp;
+                        &packed[start_byte..end_byte]
+                    }
+                };
 
                 // ---- rayon parallel: per-SNP counting + numeric filter ----
                 let counts: Vec<Option<SnpCounts>> = (chunk_start..chunk_end)
                     .into_par_iter()
                     .map(|snp_idx| {
-                        let row =
-                            &packed_src[snp_idx * bytes_per_snp..(snp_idx + 1) * bytes_per_snp];
+                        let local_idx = snp_idx - chunk_start;
+                        let row = &chunk_packed
+                            [local_idx * bytes_per_snp..(local_idx + 1) * bytes_per_snp];
                         let (missing, het, hom_alt) = if use_selected {
                             count_packed_row_counts_selected_with_excluded(
                                 row,
@@ -4236,7 +4279,7 @@ pub fn fvlmm_assoc_bed_to_tsv_f32<'py>(
                             continue;
                         }
                     }
-                    chunk.indices.push(snp_idx);
+                    chunk.indices.push(offset);
                     chunk.flip.push(cnts.flip);
                     chunk.maf.push(cnts.maf);
                     chunk.miss_rate.push(cnts.miss_rate);
@@ -4256,7 +4299,7 @@ pub fn fvlmm_assoc_bed_to_tsv_f32<'py>(
                 // ---- Decode ----
                 if chunk.rows > 0 {
                     decode_centered_block_packed_f32(
-                        packed_src,
+                        chunk_packed,
                         bytes_per_snp,
                         &chunk.flip,
                         &chunk.maf,
@@ -4390,6 +4433,9 @@ pub fn fvlmm_assoc_bed_to_tsv_f32<'py>(
                 producer,
                 consumer,
             )?;
+            if let Some(err) = producer_err.get() {
+                return Err(err.clone());
+            }
 
             if let Some(ref cb) = progress_callback {
                 let _ = Python::attach(|py2| -> PyResult<()> {

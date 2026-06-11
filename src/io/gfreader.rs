@@ -6669,9 +6669,7 @@ pub fn load_bim_columns<'py>(
         let mut out = Vec::with_capacity(slice.len());
         for &raw in slice {
             let idx = usize::try_from(raw).map_err(|_| {
-                PyValueError::new_err(format!(
-                    "row_indices must be non-negative, got {raw}"
-                ))
+                PyValueError::new_err(format!("row_indices must be non-negative, got {raw}"))
             })?;
             out.push(idx);
         }
@@ -6681,7 +6679,8 @@ pub fn load_bim_columns<'py>(
     };
 
     let (chrom, pos, snp, allele0, allele1) =
-        core::read_bim_columns(&prefix, selected_rows.as_deref()).map_err(PyRuntimeError::new_err)?;
+        core::read_bim_columns(&prefix, selected_rows.as_deref())
+            .map_err(PyRuntimeError::new_err)?;
     Ok((
         chrom,
         pos.into_iter().map(|v| v as i64).collect(),

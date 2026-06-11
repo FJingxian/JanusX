@@ -4727,7 +4727,8 @@ pub fn fvlmm_assoc_bed_to_tsv_f32<'py>(
                 None
             };
             let full_mmap = if bed_window.is_none() {
-                let bed_file = File::open(&bed_path).map_err(|e| format!("open {bed_path}: {e}"))?;
+                let bed_file =
+                    File::open(&bed_path).map_err(|e| format!("open {bed_path}: {e}"))?;
                 let mmap =
                     unsafe { Mmap::map(&bed_file) }.map_err(|e| format!("mmap {bed_path}: {e}"))?;
                 if mmap.len() < 3 || mmap[0] != 0x6C || mmap[1] != 0x1B || mmap[2] != 0x01 {

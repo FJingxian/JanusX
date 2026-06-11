@@ -25,6 +25,7 @@ use crate::blas::{
 };
 use crate::gfcore::read_fam;
 use crate::gfreader::prepare_bed_logic_meta_owned_for_stats_samples;
+use crate::gload::WindowedBedMatrix;
 use crate::grm::decode_grm_block;
 use crate::stats_common::{
     check_ctrlc, get_cached_pool, map_err_string_to_py, parse_index_vec_i64,
@@ -2740,6 +2741,7 @@ fn spgrm_stream_bed_to_jxgrm_core(
     block_rows: usize,
     sample_block: usize,
     threads: usize,
+    mmap_window_mb: Option<usize>,
     progress_callback: Option<&Py<PyAny>>,
     progress_every: usize,
 ) -> Result<(String, usize, usize), String> {
@@ -2830,13 +2832,24 @@ fn spgrm_stream_bed_to_jxgrm_core(
         return Err("Sparse GRM output prefix must not be empty".to_string());
     }
     let (row_mean, row_inv_sd) = spgrm_row_mean_and_inv_sd(meta.maf.as_slice(), method);
-    let mmap = spgrm_open_bed_payload_mmap(
-        bed_prefix,
-        meta.n_samples,
-        meta.n_snps_total,
-        meta.bytes_per_snp,
-    )?;
-    let packed_flat = &mmap[3..];
+    let mut bed_window = if let Some(window_mb) = mmap_window_mb {
+        if window_mb == 0 {
+            return Err("Sparse GRM mmap_window_mb must be > 0".to_string());
+        }
+        Some(WindowedBedMatrix::open(bed_prefix, window_mb)?)
+    } else {
+        None
+    };
+    let full_mmap = if bed_window.is_none() {
+        Some(spgrm_open_bed_payload_mmap(
+            bed_prefix,
+            meta.n_samples,
+            meta.n_snps_total,
+            meta.bytes_per_snp,
+        )?)
+    } else {
+        None
+    };
     let code4_lut = &packed_byte_lut().code4;
     let pool = get_cached_pool(threads).map_err(|e| e.to_string())?;
     let stream_split_single_task =
@@ -2850,6 +2863,7 @@ fn spgrm_stream_bed_to_jxgrm_core(
     };
     let _blas_guard = blas_threads.map(BlasThreadGuard::enter);
     let mut chunk_paths = Vec::<PathBuf>::new();
+    let mut rel_row_indices = Vec::<usize>::new();
     let write_result = (|| -> Result<(usize, usize), String> {
         let mut done_steps = 0usize;
         let mut last_notified = 0usize;
@@ -2865,23 +2879,52 @@ fn spgrm_stream_bed_to_jxgrm_core(
             for row_start in (0..m).step_by(row_step) {
                 let cur_rows = (row_start + row_step).min(m) - row_start;
                 let beta = if row_start == 0 { 0.0_f32 } else { 1.0_f32 };
+                let packed_block: &[u8];
+                let packed_row_indices: Option<&[usize]>;
+                let decode_row_start: usize;
+                let row_flip_use: &[bool];
+                let row_mean_use: &[f32];
+                let row_inv_sd_use: &[f32];
+
+                if let Some(window) = bed_window.as_mut() {
+                    let row_end = row_start + cur_rows;
+                    packed_block = window.prepare_source_rows(
+                        &meta.row_source_indices[row_start..row_end],
+                        &mut rel_row_indices,
+                    )?;
+                    packed_row_indices = Some(rel_row_indices.as_slice());
+                    decode_row_start = 0usize;
+                    row_flip_use = &meta.row_flip[row_start..row_end];
+                    row_mean_use = &row_mean[row_start..row_end];
+                    row_inv_sd_use = &row_inv_sd[row_start..row_end];
+                } else {
+                    let mmap = full_mmap
+                        .as_ref()
+                        .ok_or_else(|| "internal error: missing full BED mmap".to_string())?;
+                    packed_block = &mmap[3..];
+                    packed_row_indices = Some(meta.row_source_indices.as_slice());
+                    decode_row_start = row_start;
+                    row_flip_use = meta.row_flip.as_slice();
+                    row_mean_use = row_mean.as_slice();
+                    row_inv_sd_use = row_inv_sd.as_slice();
+                }
 
                 for stripe in stripe_scratch.iter_mut() {
                     let stripe_idx = &sample_idx[stripe.stripe.start..stripe.stripe.end];
                     let stripe_width = stripe.width();
                     let t_decode = Instant::now();
                     decode_standardized_packed_block_rows_f32_with_plan(
-                        packed_flat,
+                        packed_block,
                         meta.bytes_per_snp,
                         n_samples_full,
-                        meta.row_flip.as_slice(),
-                        row_mean.as_slice(),
-                        row_inv_sd.as_slice(),
+                        row_flip_use,
+                        row_mean_use,
+                        row_inv_sd_use,
                         stripe_idx,
                         stripe.full_sample_fast,
                         stripe.subset_plan.as_ref(),
-                        Some(meta.row_source_indices.as_slice()),
-                        row_start,
+                        packed_row_indices,
+                        decode_row_start,
                         &mut stripe.decoded[..cur_rows * stripe_width],
                         code4_lut,
                         pool.as_ref(),
@@ -3030,6 +3073,7 @@ pub fn spgrm_bed_to_jxgrm_core(
     block_rows: usize,
     sample_block: usize,
     threads: usize,
+    mmap_window_mb: Option<usize>,
     progress_callback: Option<&Py<PyAny>>,
     progress_every: usize,
 ) -> Result<(String, usize, usize), String> {
@@ -3061,6 +3105,7 @@ pub fn spgrm_bed_to_jxgrm_core(
         block_rows,
         sample_block,
         threads,
+        mmap_window_mb,
         progress_callback,
         progress_every,
     )
@@ -3331,6 +3376,7 @@ pub fn spgrm_packed_to_jxgrm<'py>(
     block_rows=0,
     sample_block=0,
     threads=0,
+    mmap_window_mb=None,
     progress_callback=None,
     progress_every=0
 ))]
@@ -3348,6 +3394,7 @@ pub fn spgrm_bed_to_jxgrm<'py>(
     block_rows: usize,
     sample_block: usize,
     threads: usize,
+    mmap_window_mb: Option<usize>,
     progress_callback: Option<Py<PyAny>>,
     progress_every: usize,
 ) -> PyResult<(String, usize, usize)> {
@@ -3382,6 +3429,7 @@ pub fn spgrm_bed_to_jxgrm<'py>(
         block_rows,
         sample_block,
         threads,
+        mmap_window_mb,
         progress_callback.as_ref(),
         progress_every,
     )
@@ -3485,6 +3533,26 @@ mod tests {
             }
         }
         packed
+    }
+
+    fn write_toy_plink(prefix: &str, sample_major: &[Vec<Option<u8>>]) {
+        let packed = pack_site_major_dosages(sample_major);
+        let n_samples = sample_major.len();
+        let n_sites = sample_major.first().map(|v| v.len()).unwrap_or(0);
+
+        let mut bed_bytes = vec![0x6C_u8, 0x1B_u8, 0x01_u8];
+        bed_bytes.extend_from_slice(packed.as_slice());
+        std::fs::write(format!("{prefix}.bed"), bed_bytes).unwrap();
+
+        let fam = (0..n_samples)
+            .map(|i| format!("F{i}\tI{i}\t0\t0\t0\t-9\n"))
+            .collect::<String>();
+        std::fs::write(format!("{prefix}.fam"), fam).unwrap();
+
+        let bim = (0..n_sites)
+            .map(|i| format!("1\tsnp{}\t0\t{}\tA\tC\n", i + 1, i + 1))
+            .collect::<String>();
+        std::fs::write(format!("{prefix}.bim"), bim).unwrap();
     }
 
     fn dense_from_csc_lower(csc: &SparseGrmCsc) -> Vec<f64> {
@@ -3726,6 +3794,96 @@ mod tests {
         for chunk_path in chunk_paths {
             let _ = std::fs::remove_file(chunk_path);
         }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn spgrm_bed_windowed_matches_full_mmap() {
+        let geno = vec![
+            vec![Some(0), Some(0), Some(1), Some(2)],
+            vec![Some(0), Some(1), Some(1), Some(2)],
+            vec![Some(2), Some(1), Some(2), Some(1)],
+            vec![Some(2), Some(2), Some(2), Some(0)],
+        ];
+
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "janusx_spgrm_bed_window_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let prefix = dir.join("toy");
+        let prefix_str = prefix.to_string_lossy().to_string();
+        write_toy_plink(&prefix_str, &geno);
+
+        let out_full = dir.join("full");
+        let out_window = dir.join("window");
+        let out_full_str = out_full.to_string_lossy().to_string();
+        let out_window_str = out_window.to_string_lossy().to_string();
+
+        let (path_full, n_full, nnz_full) = spgrm_bed_to_jxgrm_core(
+            &prefix_str,
+            None,
+            &out_full_str,
+            1usize,
+            0.0_f64,
+            true,
+            0.0_f32,
+            1.0_f32,
+            0.0_f32,
+            false,
+            0usize,
+            0usize,
+            1usize,
+            None,
+            None,
+            0usize,
+        )
+        .unwrap();
+        let (path_window, n_window, nnz_window) = spgrm_bed_to_jxgrm_core(
+            &prefix_str,
+            None,
+            &out_window_str,
+            1usize,
+            0.0_f64,
+            true,
+            0.0_f32,
+            1.0_f32,
+            0.0_f32,
+            false,
+            0usize,
+            0usize,
+            1usize,
+            Some(1usize),
+            None,
+            0usize,
+        )
+        .unwrap();
+
+        let full = crate::cholesky::read_sparse_grm_csc(&path_full).unwrap();
+        let window = crate::cholesky::read_sparse_grm_csc(&path_window).unwrap();
+        assert_eq!(n_full, geno.len());
+        assert_eq!(n_window, geno.len());
+        assert_eq!(nnz_full, nnz_window);
+        assert_eq!(full.n_samples, window.n_samples);
+        assert_eq!(full.nnz, window.nnz);
+        assert_eq!(full.col_ptr, window.col_ptr);
+        assert_eq!(full.row_indices, window.row_indices);
+        assert_eq!(full.values.len(), window.values.len());
+        for (lhs, rhs) in full.values.iter().zip(window.values.iter()) {
+            assert!((lhs - rhs).abs() < 1e-12);
+        }
+
+        let _ = std::fs::remove_file(format!("{prefix_str}.bed"));
+        let _ = std::fs::remove_file(format!("{prefix_str}.bim"));
+        let _ = std::fs::remove_file(format!("{prefix_str}.fam"));
+        let _ = std::fs::remove_file(path_full);
+        let _ = std::fs::remove_file(path_window);
         let _ = std::fs::remove_dir_all(dir);
     }
 

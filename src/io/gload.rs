@@ -510,6 +510,28 @@ impl WindowedBedMatrix {
         Ok(&self.scratch[..need])
     }
 
+    pub fn prepare_source_rows(
+        &mut self,
+        source_indices: &[usize],
+        rel_indices_out: &mut Vec<usize>,
+    ) -> Result<&[u8], String> {
+        if source_indices.is_empty() {
+            rel_indices_out.clear();
+            return Ok(&[]);
+        }
+        let src_start = source_indices[0];
+        let src_end = source_indices[source_indices.len() - 1] + 1;
+        let source_span = src_end - src_start;
+        let zero_copy_ok = source_span <= source_indices.len().saturating_mul(8).max(1);
+        if zero_copy_ok {
+            rel_indices_out.clear();
+            rel_indices_out.extend(source_indices.iter().map(|&src_idx| src_idx - src_start));
+            self.read_source_range(src_start, src_end)
+        } else {
+            self.decode_sparse_rows_to_scratch(source_indices, rel_indices_out)
+        }
+    }
+
     pub fn prepare_block(
         &mut self,
         stats: &GlobalStats,
@@ -518,17 +540,7 @@ impl WindowedBedMatrix {
         rel_indices_out: &mut Vec<usize>,
     ) -> Result<&[u8], String> {
         let source_indices = stats.row_source_slice(row_start, rows_here);
-        let src_start = source_indices[0];
-        let src_end = source_indices[rows_here - 1] + 1;
-        let source_span = src_end - src_start;
-        let zero_copy_ok = source_span <= rows_here.saturating_mul(8).max(1);
-        if zero_copy_ok {
-            rel_indices_out.clear();
-            rel_indices_out.extend(source_indices.iter().map(|&src_idx| src_idx - src_start));
-            self.read_source_range(src_start, src_end)
-        } else {
-            self.decode_sparse_rows_to_scratch(source_indices, rel_indices_out)
-        }
+        self.prepare_source_rows(source_indices, rel_indices_out)
     }
 }
 

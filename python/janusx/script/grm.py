@@ -611,6 +611,7 @@ def build_sparse_grm_packed_bed(
             block_rows=0,
             sample_block=0,
             threads=max(1, int(threads)),
+            mmap_window_mb=(int(mmap_window_mb) if mmap_window_mb is not None else None),
             progress_callback=_progress_cb,
             progress_every=1,
         )

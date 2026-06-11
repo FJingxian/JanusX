@@ -15,11 +15,11 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::bedmath::adaptive_grm_block_rows;
+use crate::bedmath::{decode_mean_imputed_additive_packed_block_rows_f32, packed_byte_lut};
 use crate::blas::{
     cblas_dgemm_dispatch, rust_sgemm_prefers_rayon_rowmajor_f32_kernel, BlasThreadGuard, CblasInt,
     CBLAS_COL_MAJOR, CBLAS_NO_TRANS, CBLAS_TRANS,
 };
-use crate::bedmath::{decode_mean_imputed_additive_packed_block_rows_f32, packed_byte_lut};
 use crate::cholesky::{
     sparse_cholesky_analyze_subset_jxgrm_path_cached_with_progress, sparse_jxgrm_header_n_samples,
     subset_sparse_grm_csc, MmapSparseGrmCsc, SparseGrmCscView, SparseJxgrmAnalyzeProgressStage,
@@ -6148,12 +6148,12 @@ impl GenotypeMatrix for JxlmmMatrixAdapter<'_> {
             }
             Self::Windowed { matrix } => matrix.decode_additive_block(
                 stats,
-                    row_start,
-                    out,
-                    sample_idx,
-                    sample_identity,
-                    pool,
-                ),
+                row_start,
+                out,
+                sample_idx,
+                sample_identity,
+                pool,
+            ),
         }
     }
 }

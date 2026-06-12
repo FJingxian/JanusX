@@ -71,6 +71,8 @@ mod gload;
 mod gmerge;
 #[path = "io/gwasio.rs"]
 mod gwasio;
+#[path = "kmer/mod.rs"]
+pub mod kmer;
 #[path = "io/pipeline.rs"]
 mod pipeline;
 #[path = "io/sim.rs"]
@@ -202,6 +204,7 @@ use gwas_unified::{
 };
 use gwasio::load_gwas_triplet_fast;
 use he::he_pcg_bed;
+use kmer::kmerge_run_py;
 use ld::{
     bed_ldblock_r2_rust, bed_packed_ld_prune_maf_priority, bed_prune_to_plink_rust,
     packed_prune_kernel_stats,
@@ -215,8 +218,8 @@ use lmm_scan::{
     fvlmm_assoc_packed_f32_to_tsv, fvlmm_assoc_prepare_cache_f32, lmm_assoc_chunk_f32,
     lmm_assoc_chunk_from_snp_f32, lmm_reml_assoc_bed_to_tsv_f32, lmm_reml_assoc_packed_f32,
     lmm_reml_assoc_packed_f32_to_tsv, lmm_reml_chunk_f32, lmm_reml_chunk_from_snp_f32,
-    lmm_reml_lmm2_assoc_bed_to_tsv_f32, lmm_reml_lmm2_chunk_from_snp_f32,
-    lmm_reml_null_f32, lmm_rotate_x_y_with_ut_f64, ml_loglike_null_f32, FvLmmAssocCache,
+    lmm_reml_lmm2_assoc_bed_to_tsv_f32, lmm_reml_lmm2_chunk_from_snp_f32, lmm_reml_null_f32,
+    lmm_rotate_x_y_with_ut_f64, ml_loglike_null_f32, FvLmmAssocCache,
 };
 use logreg::fit_best_and_not_py;
 use ml::{garfield_ml_feature_scores_py, garfield_ml_select_topk_py};
@@ -325,6 +328,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
         beam_scan_windows_continuous_corr_bin_py,
         m
     )?)?;
+    m.add_function(wrap_pyfunction!(kmerge_run_py, m)?)?;
     m.add_function(wrap_pyfunction!(merge_genotypes, m)?)?;
     m.add_function(wrap_pyfunction!(convert_genotypes, m)?)?;
     m.add_function(wrap_pyfunction!(count_vcf_snps, m)?)?;

@@ -2352,8 +2352,15 @@ pub fn lmm_reml_lmm2_chunk_from_snp_f32<'py>(
                             tol,
                             max_iter,
                         );
-                        let (beta, se, lambda_reml) =
-                            final_beta_se(best_log10_lbd_reml, s, &xcov_flat, y, &snp_vec, n, p_cov);
+                        let (beta, se, lambda_reml) = final_beta_se(
+                            best_log10_lbd_reml,
+                            s,
+                            &xcov_flat,
+                            y,
+                            &snp_vec,
+                            n,
+                            p_cov,
+                        );
                         let pwald = if beta.is_finite() && se.is_finite() && se > 0.0 {
                             let z = beta / se;
                             (2.0 * normal_sf(z.abs())).clamp(f64::MIN_POSITIVE, 1.0)
@@ -4895,8 +4902,8 @@ pub fn lmm_reml_lmm2_assoc_bed_to_tsv_f32<'py>(
     let out_tsv_owned = out_tsv.to_string();
     let stage_timing =
         env_truthy("JX_LMM2_UNIFIED_STAGE_TIMING") || env_truthy("JX_LMM_UNIFIED_STAGE_TIMING");
-    let use_warm_start =
-        !(env_truthy("JX_LMM2_UNIFIED_NO_WARM_START") || env_truthy("JX_LMM_UNIFIED_NO_WARM_START"));
+    let use_warm_start = !(env_truthy("JX_LMM2_UNIFIED_NO_WARM_START")
+        || env_truthy("JX_LMM_UNIFIED_NO_WARM_START"));
 
     py.detach(move || -> Result<usize, String> {
         let total_t0 = Instant::now();

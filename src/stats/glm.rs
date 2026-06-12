@@ -1360,7 +1360,8 @@ pub fn lm_stream_bed_to_tsv(
                 let (a0, a1) =
                     transform_alleles_by_model(&site.ref_allele, &site.alt_allele, model.as_str());
                 let r = &out[i * 5..(i + 1) * 5];
-                let chisq_txt = format_chisq_value(chisq_from_beta_se_and_optional_plrt(r[0], r[1], None));
+                let chisq_txt =
+                    format_chisq_value(chisq_from_beta_se_and_optional_plrt(r[0], r[1], None));
                 let pwald = sanitize_assoc_pvalue(r[0], r[1], r[3]);
                 let _ = write!(
                     text,
@@ -3068,8 +3069,11 @@ pub fn glmf32_packed_assoc_to_tsv(
                 for l in 0..cnt {
                     let idx = i_marker + l;
                     let base = l * 5;
-                    let chisq_txt =
-                        format_chisq_value(chisq_from_beta_se_and_optional_plrt(block[base], block[base + 1], None));
+                    let chisq_txt = format_chisq_value(chisq_from_beta_se_and_optional_plrt(
+                        block[base],
+                        block[base + 1],
+                        None,
+                    ));
                     let pwald =
                         sanitize_assoc_pvalue(block[base], block[base + 1], block[base + 3]);
                     let _ = write!(

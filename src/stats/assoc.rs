@@ -1359,8 +1359,7 @@ pub fn farmcpu_packed_to_tsv(
     let pool = get_cached_pool(threads)?;
 
     py.detach(|| -> PyResult<()> {
-        let mut final_model_cache: Option<(Vec<f64>, usize, Vec<f64>, Vec<f64>, Vec<usize>)> =
-            None;
+        let mut final_model_cache: Option<(Vec<f64>, usize, Vec<f64>, Vec<f64>, Vec<usize>)> = None;
         for it_idx in 0..max_iter_i {
             let (x_qtn, q_total) = build_x_with_qtn_packed(
                 &base_x,
@@ -1706,13 +1705,13 @@ pub fn farmcpu_packed_to_tsv(
         if let Some(pseudo_path) = pseudo_tsv {
             if !qtn_idx.is_empty() {
                 qtn_path_for_err = pseudo_path.to_string();
-                    qtn_writer_opt = Some(
-                        AsyncTsvWriter::with_config(
-                            &qtn_path_for_err,
-                            b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\n",
-                            16 * 1024 * 1024,
-                            4,
-                        )
+                qtn_writer_opt = Some(
+                    AsyncTsvWriter::with_config(
+                        &qtn_path_for_err,
+                        b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\n",
+                        16 * 1024 * 1024,
+                        4,
+                    )
                     .map_err(PyRuntimeError::new_err)?,
                 );
             }
@@ -1747,9 +1746,9 @@ pub fn farmcpu_packed_to_tsv(
         .map_err(PyRuntimeError::new_err)?;
         writer.finish().map_err(PyRuntimeError::new_err)?;
         if let Some(q_writer) = qtn_writer_opt.take() {
-            q_writer.finish().map_err(|e| {
-                PyRuntimeError::new_err(format!("{qtn_path_for_err}: {e}"))
-            })?;
+            q_writer
+                .finish()
+                .map_err(|e| PyRuntimeError::new_err(format!("{qtn_path_for_err}: {e}")))?;
         }
         let _ = qtn_rows_written;
         Ok(())

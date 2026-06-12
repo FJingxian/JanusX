@@ -349,6 +349,172 @@ fn maybe_prebuild_kmc_bind() {
     }
 }
 
+fn resolve_kmc_source_dir() -> PathBuf {
+    let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
+    if let Some(raw) = env_value("JANUSX_KMC_SRC") {
+        let cand = PathBuf::from(raw);
+        if cand.join("kmc_core").join("kmc_runner.h").is_file()
+            && cand.join("kmc_api").join("kmc_file.h").is_file()
+        {
+            return cand;
+        }
+        panic!(
+            "JANUSX_KMC_SRC does not look like a valid KMC source tree: {}",
+            cand.to_string_lossy()
+        );
+    }
+
+    let vendored = Path::new(&manifest_dir)
+        .join("python")
+        .join("janusx")
+        .join("native")
+        .join("vendor")
+        .join("kmc");
+    if vendored.join("kmc_core").join("kmc_runner.h").is_file()
+        && vendored.join("kmc_api").join("kmc_file.h").is_file()
+    {
+        return vendored;
+    }
+
+    panic!(
+        "KMC source not found. Set JANUSX_KMC_SRC or ensure vendored source exists under python/janusx/native/vendor/kmc."
+    );
+}
+
+fn ensure_kmc_compat_include(kmc_src_dir: &Path) -> PathBuf {
+    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR missing"));
+    let compat_root = out_dir.join("jx_kmc_compat");
+    let ext_dir = compat_root.join("ext");
+    fs::create_dir_all(&ext_dir).expect("failed to create KMC compat include dir");
+    let algo_hdr = ext_dir.join("algorithm");
+    if !algo_hdr.is_file() {
+        fs::write(
+            &algo_hdr,
+            "#pragma once\n#include <algorithm>\nnamespace __gnu_cxx { using std::copy_n; }\n",
+        )
+        .expect("failed to write KMC compat ext/algorithm header");
+    }
+
+    let zlib_hdr = kmc_src_dir
+        .join("3rd_party")
+        .join("cloudflare")
+        .join("zlib.h");
+    if !zlib_hdr.is_file() {
+        if let Some(parent) = zlib_hdr.parent() {
+            fs::create_dir_all(parent).expect("failed to create KMC cloudflare zlib dir");
+        }
+        fs::write(
+            &zlib_hdr,
+            "/* JANUSX_KMC_ZLIB_SHIM */\n#pragma once\n#if defined(__has_include_next)\n#  if __has_include_next(<zlib.h>)\n#    include_next <zlib.h>\n#  else\n#    include <zlib.h>\n#  endif\n#else\n#  include <zlib.h>\n#endif\n",
+        )
+        .expect("failed to write KMC zlib shim");
+    }
+
+    compat_root
+}
+
+fn kmc_source_files(kmc_src_dir: &Path) -> Vec<PathBuf> {
+    let rel = [
+        "kmc_core/mem_disk_file.cpp",
+        "kmc_core/rev_byte.cpp",
+        "kmc_core/bkb_writer.cpp",
+        "kmc_core/cpu_info.cpp",
+        "kmc_core/bkb_reader.cpp",
+        "kmc_core/fastq_reader.cpp",
+        "kmc_core/timer.cpp",
+        "kmc_core/develop.cpp",
+        "kmc_core/kb_completer.cpp",
+        "kmc_core/kb_storer.cpp",
+        "kmc_core/kmer.cpp",
+        "kmc_core/splitter.cpp",
+        "kmc_core/kb_collector.cpp",
+        "kmc_core/kmc_runner.cpp",
+        "kmc_core/kff_writer.cpp",
+        "kmc_api/mmer.cpp",
+        "kmc_api/kmc_file.cpp",
+        "kmc_api/kmer_api.cpp",
+    ];
+    let mut out = rel
+        .iter()
+        .map(|path| kmc_src_dir.join(path))
+        .collect::<Vec<_>>();
+
+    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    if target_arch == "aarch64" {
+        out.push(kmc_src_dir.join("kmc_core").join("raduls_neon.cpp"));
+    } else {
+        out.push(kmc_src_dir.join("kmc_core").join("raduls_sse2.cpp"));
+        out.push(kmc_src_dir.join("kmc_core").join("raduls_sse41.cpp"));
+        out.push(kmc_src_dir.join("kmc_core").join("raduls_avx.cpp"));
+        out.push(kmc_src_dir.join("kmc_core").join("raduls_avx2.cpp"));
+    }
+    out
+}
+
+fn compile_kmc_wrapper() {
+    println!("cargo:rerun-if-env-changed=JANUSX_KMC_SRC");
+    println!("cargo:rerun-if-changed=src/kmer/ffi/kmc_wrapper.cpp");
+    println!("cargo:rerun-if-changed=src/kmer/ffi/kmc_wrapper.h");
+
+    let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
+    let kmc_src_dir = resolve_kmc_source_dir();
+    let compat_include = ensure_kmc_compat_include(&kmc_src_dir);
+    let wrapper_cpp = Path::new(&manifest_dir)
+        .join("src")
+        .join("kmer")
+        .join("ffi")
+        .join("kmc_wrapper.cpp");
+    let sources = kmc_source_files(&kmc_src_dir);
+    for src in sources.iter() {
+        println!("cargo:rerun-if-changed={}", src.to_string_lossy());
+    }
+
+    let mut build = cc::Build::new();
+    build.cpp(true).warnings(false);
+    build.file(&wrapper_cpp);
+    for src in sources.iter() {
+        build.file(src);
+    }
+    build.include(&compat_include);
+    build.include(&kmc_src_dir);
+    build.include(kmc_src_dir.join("kmc_core"));
+    build.include(kmc_src_dir.join("kmc_api"));
+    build.flag_if_supported("-std=c++14");
+    build.flag_if_supported("/std:c++14");
+    build.flag_if_supported("-Wno-unused-parameter");
+    build.flag_if_supported("-Wno-sign-compare");
+    if cfg!(not(target_os = "windows")) {
+        build.flag_if_supported("-pthread");
+    }
+    build.compile("jx_kmc_wrapper");
+
+    if cfg!(target_os = "windows") {
+        let zlib_static = kmc_src_dir
+            .join("kmc_core")
+            .join("libs")
+            .join("zlibstat.lib");
+        if zlib_static.is_file() {
+            if let Some(parent) = zlib_static.parent() {
+                println!(
+                    "cargo:rustc-link-search=native={}",
+                    parent.to_string_lossy()
+                );
+            }
+            println!("cargo:rustc-link-lib=static=zlibstat");
+        } else {
+            println!("cargo:rustc-link-lib=zlib");
+        }
+    } else {
+        println!("cargo:rustc-link-lib=z");
+        println!("cargo:rustc-link-lib=m");
+        println!("cargo:rustc-link-lib=pthread");
+    }
+    emit_verbose_note(format!(
+        "KMC wrapper enabled with source tree {}",
+        kmc_src_dir.to_string_lossy()
+    ));
+}
+
 fn find_command_on_path(name: &str) -> Option<PathBuf> {
     let candidate = PathBuf::from(name);
     if candidate.components().count() > 1 {
@@ -1165,6 +1331,7 @@ fn configure_openblas_from_dir(lib_dir_s: &str, source_label: &str) -> bool {
 
 fn main() {
     maybe_prebuild_kmc_bind();
+    compile_kmc_wrapper();
     emit_bed_decode_simd_defaults();
     compile_fasttree_executable();
 

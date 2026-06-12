@@ -317,7 +317,7 @@ fn ensure_kmc_compat_include(kmc_src_dir: &Path) -> PathBuf {
     compat_root
 }
 
-fn kmc_source_files(kmc_src_dir: &Path) -> Vec<PathBuf> {
+fn kmc_common_source_files(kmc_src_dir: &Path) -> Vec<PathBuf> {
     let rel = [
         "kmc_core/mem_disk_file.cpp",
         "kmc_core/rev_byte.cpp",
@@ -338,21 +338,94 @@ fn kmc_source_files(kmc_src_dir: &Path) -> Vec<PathBuf> {
         "kmc_api/kmc_file.cpp",
         "kmc_api/kmer_api.cpp",
     ];
-    let mut out = rel
+    rel
         .iter()
         .map(|path| kmc_src_dir.join(path))
-        .collect::<Vec<_>>();
+        .collect::<Vec<_>>()
+}
 
+fn kmc_arch_source_files(kmc_src_dir: &Path) -> Vec<PathBuf> {
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     if target_arch == "aarch64" {
-        out.push(kmc_src_dir.join("kmc_core").join("raduls_neon.cpp"));
-    } else {
-        out.push(kmc_src_dir.join("kmc_core").join("raduls_sse2.cpp"));
-        out.push(kmc_src_dir.join("kmc_core").join("raduls_sse41.cpp"));
-        out.push(kmc_src_dir.join("kmc_core").join("raduls_avx.cpp"));
-        out.push(kmc_src_dir.join("kmc_core").join("raduls_avx2.cpp"));
+        return vec![kmc_src_dir.join("kmc_core").join("raduls_neon.cpp")];
     }
-    out
+    if target_arch == "x86_64" || target_arch == "x86" {
+        return vec![
+            kmc_src_dir.join("kmc_core").join("raduls_sse2.cpp"),
+            kmc_src_dir.join("kmc_core").join("raduls_sse41.cpp"),
+            kmc_src_dir.join("kmc_core").join("raduls_avx.cpp"),
+            kmc_src_dir.join("kmc_core").join("raduls_avx2.cpp"),
+        ];
+    }
+    Vec::new()
+}
+
+fn configure_kmc_build(build: &mut cc::Build, compat_include: &Path, kmc_src_dir: &Path) {
+    build.cpp(true).warnings(false);
+    build.include(compat_include);
+    build.include(kmc_src_dir);
+    build.include(kmc_src_dir.join("kmc_core"));
+    build.include(kmc_src_dir.join("kmc_api"));
+    build.flag_if_supported("-std=c++14");
+    build.flag_if_supported("/std:c++14");
+    build.flag_if_supported("-Wno-unused-parameter");
+    build.flag_if_supported("-Wno-sign-compare");
+    if cfg!(not(target_os = "windows")) {
+        build.flag_if_supported("-pthread");
+    }
+}
+
+fn compile_kmc_arch_sources(
+    compat_include: &Path,
+    kmc_src_dir: &Path,
+    arch_sources: &[PathBuf],
+) {
+    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    if target_arch == "aarch64" {
+        if let Some(src) = arch_sources.first() {
+            let mut build = cc::Build::new();
+            configure_kmc_build(&mut build, compat_include, kmc_src_dir);
+            build.file(src);
+            build.compile("jx_kmc_wrapper_raduls_neon");
+        }
+        return;
+    }
+    if target_arch != "x86_64" && target_arch != "x86" {
+        return;
+    }
+
+    for src in arch_sources {
+        let Some(stem) = src.file_stem().and_then(|x| x.to_str()) else {
+            continue;
+        };
+        let mut build = cc::Build::new();
+        configure_kmc_build(&mut build, compat_include, kmc_src_dir);
+        build.file(src);
+        match stem {
+            "raduls_sse2" => {
+                build.flag_if_supported("-msse2");
+                build.flag_if_supported("/arch:SSE2");
+                build.define("__SSE2__", None);
+            }
+            "raduls_sse41" => {
+                build.flag_if_supported("-msse4.1");
+                build.flag_if_supported("/arch:SSE2");
+                build.define("__SSE4_1__", None);
+            }
+            "raduls_avx" => {
+                build.flag_if_supported("-mavx");
+                build.flag_if_supported("/arch:AVX");
+                build.define("__AVX__", None);
+            }
+            "raduls_avx2" => {
+                build.flag_if_supported("-mavx2");
+                build.flag_if_supported("/arch:AVX2");
+                build.define("__AVX2__", None);
+            }
+            _ => continue,
+        }
+        build.compile(&format!("jx_kmc_wrapper_{stem}"));
+    }
 }
 
 fn compile_kmc_wrapper() {
@@ -368,29 +441,20 @@ fn compile_kmc_wrapper() {
         .join("kmer")
         .join("ffi")
         .join("kmc_wrapper.cpp");
-    let sources = kmc_source_files(&kmc_src_dir);
-    for src in sources.iter() {
+    let common_sources = kmc_common_source_files(&kmc_src_dir);
+    let arch_sources = kmc_arch_source_files(&kmc_src_dir);
+    for src in common_sources.iter().chain(arch_sources.iter()) {
         println!("cargo:rerun-if-changed={}", src.to_string_lossy());
     }
 
     let mut build = cc::Build::new();
-    build.cpp(true).warnings(false);
+    configure_kmc_build(&mut build, &compat_include, &kmc_src_dir);
     build.file(&wrapper_cpp);
-    for src in sources.iter() {
+    for src in common_sources.iter() {
         build.file(src);
     }
-    build.include(&compat_include);
-    build.include(&kmc_src_dir);
-    build.include(kmc_src_dir.join("kmc_core"));
-    build.include(kmc_src_dir.join("kmc_api"));
-    build.flag_if_supported("-std=c++14");
-    build.flag_if_supported("/std:c++14");
-    build.flag_if_supported("-Wno-unused-parameter");
-    build.flag_if_supported("-Wno-sign-compare");
-    if cfg!(not(target_os = "windows")) {
-        build.flag_if_supported("-pthread");
-    }
     build.compile("jx_kmc_wrapper");
+    compile_kmc_arch_sources(&compat_include, &kmc_src_dir, &arch_sources);
 
     if cfg!(target_os = "windows") {
         let zlib_static = kmc_src_dir

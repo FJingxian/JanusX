@@ -28,9 +28,7 @@ use crate::blas::{
     CBLAS_NO_TRANS, CBLAS_TRANS,
 };
 use crate::he::build_row_standardization_stats;
-use crate::linalg::{
-    chi2_sf_df1, chi2_stat_df1_from_sf, format_chisq_value, sanitize_assoc_pvalue,
-};
+use crate::linalg::{chi2_stat_df1_from_sf, format_chisq_value, sanitize_assoc_pvalue};
 use crate::math_farmcpu::decode_packed_rows_to_sample_major;
 use crate::pcg::{pcg_solve, IdentityPreconditioner, PcgOperator};
 use crate::stats_common::{get_cached_pool, parse_index_vec_i64, AsyncTsvWriter};
@@ -5620,7 +5618,6 @@ fn write_stage2_tsv(
     let mut qtn_beta = vec![f64::NAN; k];
     let mut qtn_se = vec![f64::NAN; k];
     let mut qtn_pwald = vec![f64::NAN; k];
-    let mut qtn_plrt = vec![f64::NAN; k];
     let mut qtn_chisq = vec![f64::NAN; k];
     for j in 0..k {
         let coef_idx = q_base + j;
@@ -5631,8 +5628,12 @@ fn write_stage2_tsv(
             qtn_beta[j] = beta;
             qtn_se[j] = se;
             qtn_pwald[j] = student_t_p_two_sided(t, bg_df);
-            qtn_plrt[j] = lm_plrt_from_t2(t * t, n, bg_df);
-            qtn_chisq[j] = chi2_stat_df1_from_sf(qtn_plrt[j]);
+            qtn_chisq[j] = if beta.is_finite() && se.is_finite() && se > 0.0 {
+                let z = beta / se;
+                z * z
+            } else {
+                f64::NAN
+            };
         }
     }
 
@@ -5652,7 +5653,7 @@ fn write_stage2_tsv(
     };
     let writer = AsyncTsvWriter::with_config(
         out_tsv,
-        b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n",
+        b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\n",
         64 * 1024 * 1024,
         4,
     )?;
@@ -5661,7 +5662,7 @@ fn write_stage2_tsv(
         if k > 0 {
             Some(AsyncTsvWriter::with_config(
                 path,
-                b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n",
+                b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\n",
                 16 * 1024 * 1024,
                 4,
             )?)
@@ -5748,13 +5749,12 @@ fn write_stage2_tsv(
                         }
                         let t = beta_snp / se_snp;
                         let pwald = student_t_p_two_sided(t, df);
-                        let plrt = lm_plrt_from_t2(t * t, n, df);
                         let stat = chi2_stat_df1_from_sf(pwald);
                         row_out[0] = beta_snp;
                         row_out[1] = se_snp;
                         row_out[2] = stat;
                         row_out[3] = pwald;
-                        row_out[4] = plrt;
+                        row_out[4] = f64::NAN;
                     },
                 );
         };
@@ -5769,23 +5769,30 @@ fn write_stage2_tsv(
         for l in 0..cnt {
             let idx = i + l;
             let base = l * row_stride;
-            let mut beta = out_block[base];
-            let mut se = out_block[base + 1];
-            let mut chisq = out_block[base + 2];
-            let mut pwald = sanitize_assoc_pvalue(beta, se, out_block[base + 3]);
-            let mut plrt = out_block[base + 4];
-            if let Some(&j) = qtn_lookup.get(&idx) {
-                beta = qtn_beta[j];
-                se = qtn_se[j];
-                pwald = sanitize_assoc_pvalue(beta, se, qtn_pwald[j]);
-                plrt = qtn_plrt[j];
-                chisq = qtn_chisq[j];
+            let (beta, se, pwald, chisq) = if let Some(&j) = qtn_lookup.get(&idx) {
                 qtn_written += 1;
-            }
+                (
+                    qtn_beta[j],
+                    qtn_se[j],
+                    sanitize_assoc_pvalue(qtn_beta[j], qtn_se[j], qtn_pwald[j]),
+                    qtn_chisq[j],
+                )
+            } else {
+                let beta = out_block[base];
+                let se = out_block[base + 1];
+                let pwald = sanitize_assoc_pvalue(beta, se, out_block[base + 3]);
+                let chisq = if beta.is_finite() && se.is_finite() && se > 0.0 {
+                    let z = beta / se;
+                    z * z
+                } else {
+                    f64::NAN
+                };
+                (beta, se, pwald, chisq)
+            };
             let miss = row_missing_count_from_float(row_missing[idx]);
             let _ = write!(
                 text_buf,
-                "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\t{:.4e}\n",
+                "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\n",
                 chrom[idx],
                 pos[idx],
                 snp[idx],
@@ -5796,13 +5803,12 @@ fn write_stage2_tsv(
                 beta,
                 se,
                 format_chisq_value(chisq),
-                pwald,
-                plrt
+                pwald
             );
             if qtn_lookup.contains_key(&idx) {
                 let _ = write!(
                     pseudo_text_buf,
-                    "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\t{:.4e}\n",
+                    "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\n",
                     chrom[idx],
                     pos[idx],
                     snp[idx],
@@ -5813,8 +5819,7 @@ fn write_stage2_tsv(
                     beta,
                     se,
                     format_chisq_value(chisq),
-                    pwald,
-                    plrt
+                    pwald
                 );
             }
         }
@@ -5924,15 +5929,6 @@ fn student_t_p_two_sided(t: f64, df: i32) -> f64 {
         p = 1.0_f64;
     }
     p.clamp(f64::MIN_POSITIVE, 1.0_f64)
-}
-
-#[inline]
-fn lm_plrt_from_t2(t2: f64, n_obs: usize, df: i32) -> f64 {
-    if df <= 0 || !t2.is_finite() || t2 < 0.0_f64 {
-        return f64::NAN;
-    }
-    let stat = (n_obs as f64) * (1.0_f64 + t2 / (df as f64)).ln();
-    chi2_sf_df1(stat)
 }
 
 fn betacf(a: f64, b: f64, x: f64) -> f64 {

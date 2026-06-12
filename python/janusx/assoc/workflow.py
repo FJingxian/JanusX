@@ -6,6 +6,7 @@ Design overview
 ---------------
 Models:
   - LMM     : streaming, low-memory implementation (slim.LMM)
+  - LMM2    : exact LMM scan with Wald + per-SNP ML/PLRT output
   - LM      : streaming, low-memory implementation (slim.LM)
   - SparseLMM: sparse-GRM + sparse-Cholesky mixed-model route
   - ALGWAS  : packed/full-rust adaptive-lasso GWAS route
@@ -161,6 +162,7 @@ class _LazyPyBlupAssocSymbol:
 
 LM = _LazyPyBlupAssocSymbol("LM")
 LMM = _LazyPyBlupAssocSymbol("LMM")
+LMM2 = _LazyPyBlupAssocSymbol("LMM2")
 FastLMM = _LazyPyBlupAssocSymbol("FastLMM")
 FvLMM = _LazyPyBlupAssocSymbol("FvLMM")
 farmcpu = _LazyPyBlupAssocSymbol("farmcpu")
@@ -336,6 +338,8 @@ def _format_gwas_models_executed(args) -> str:
         models.append("LM")
     if bool(args.lmm):
         models.append("LMM")
+    if bool(getattr(args, "lmm2", False)):
+        models.append("LMM2")
     if bool(args.fastlmm):
         models.append("FastLMM")
     if bool(args.fvlmm):
@@ -641,33 +645,6 @@ def _chi2_sf_df1_vec(stat: np.ndarray) -> np.ndarray:
         p = np.fromiter((math.erfc(float(v)) for v in np.asarray(z, dtype=np.float64)), dtype=np.float64)
     out[ok] = np.clip(p, np.finfo(np.float64).tiny, 1.0)
     return out
-
-
-def _plrt_from_beta_se(
-    beta: np.ndarray,
-    se: np.ndarray,
-    *,
-    n_obs: int,
-    df: int,
-) -> np.ndarray:
-    """
-    Compute 1-df LM LRT p-values from beta/se without re-scanning genotype.
-    """
-    b = np.asarray(beta, dtype=np.float64).reshape(-1)
-    s = np.asarray(se, dtype=np.float64).reshape(-1)
-    out = np.full(b.shape, np.nan, dtype=np.float64)
-    n = int(n_obs)
-    d = int(df)
-    if n <= 0 or d <= 0:
-        return out
-    ok = np.isfinite(b) & np.isfinite(s) & (s > 0.0)
-    if not np.any(ok):
-        return out
-    t2 = np.square(b[ok] / s[ok])
-    stat = float(n) * np.log1p(t2 / float(d))
-    out[ok] = _chi2_sf_df1_vec(stat)
-    return out
-
 
 def _gwas_use_packed_fullrust_routes() -> bool:
     """
@@ -5136,8 +5113,10 @@ def run_lrlmm_packed(
                 "pwald": np.asarray(res[:, 2], dtype=np.float64),
             }
         )
-        if res.shape[1] > 3:
-            res_df["plrt"] = np.asarray(res[:, 3], dtype=np.float64)
+        if res.shape[1] == 6:
+            res_df["lambda"] = np.asarray(res[:, 3], dtype=np.float64)
+            res_df["ml"] = np.asarray(res[:, 4], dtype=np.float64)
+            res_df["plrt"] = np.asarray(res[:, 5], dtype=np.float64)
 
         gm_tag = str(genetic_model).lower()
         pname_tag = _safe_trait_file_label(pname)
@@ -5159,12 +5138,16 @@ def run_lrlmm_packed(
             )
 
         cast_map: dict[str, object] = {"pwald": "object", "pos": int}
+        if "ml" in res_df.columns:
+            cast_map["ml"] = "object"
         if "plrt" in res_df.columns:
             cast_map["plrt"] = "object"
         def _write_lrlmm() -> None:
             nonlocal res_df
             res_df = res_df.astype(cast_map)
             res_df.loc[:, "pwald"] = res_df["pwald"].map(lambda x: f"{x:.4e}")
+            if "ml" in res_df.columns:
+                res_df.loc[:, "ml"] = res_df["ml"].map(lambda x: f"{x:.6e}")
             if "plrt" in res_df.columns:
                 res_df.loc[:, "plrt"] = res_df["plrt"].map(lambda x: f"{x:.4e}")
             res_df.to_csv(out_tsv, sep="\t", float_format="%.4f", index=None)
@@ -5235,6 +5218,14 @@ def _splmm_parse_sparse_cutoff(*args, **kwargs):
 
 def _ensure_splmm_sparse_grm(*args, **kwargs):
     from janusx.assoc.workflow_model_packed import _ensure_splmm_sparse_grm as _impl
+    return _impl(*args, **kwargs)
+
+def _jxlmm_normalize_jxgrm_path(*args, **kwargs):
+    from janusx.assoc.workflow_model_packed import _jxlmm_normalize_jxgrm_path as _impl
+    return _impl(*args, **kwargs)
+
+def _jxlmm_sparse_out_prefix_for_gwas(*args, **kwargs):
+    from janusx.assoc.workflow_model_packed import _jxlmm_sparse_out_prefix_for_gwas as _impl
     return _impl(*args, **kwargs)
 
 def prepare_memmap_filtered_bed_for_gwas(*args, **kwargs):
@@ -5521,7 +5512,7 @@ def _run_file_dense_fast_once(
         ],
     )
 
-    model_sequence = [m for m in stream_models if m in {"lm", "lmm", "fastlmm", "fvlmm"}]
+    model_sequence = [m for m in stream_models if m in {"lm", "lmm", "lmm2", "fastlmm", "fvlmm"}]
     gm_tag = str(args.model).lower()
     pheno_aligned, ids = _align_pheno_to_sample_order(pheno, ids)
     trait_iter = list(pheno_aligned.columns)
@@ -5587,6 +5578,8 @@ def _run_file_dense_fast_once(
                     model_label = "FastLMM"
                 elif mkey == "fvlmm":
                     model_label = "FvLMM"
+                elif mkey == "lmm2":
+                    model_label = "LMM2"
                 else:
                     model_label = str(mkey).upper()
                 summary_rows.append(
@@ -5648,6 +5641,7 @@ def _run_file_dense_fast_once(
 
         kinship_sub: Union[np.ndarray, None] = None
         lmm_model_obj: Optional[Any] = None
+        lmm2_model_obj: Optional[Any] = None
         fastlmm_model_obj: Optional[Any] = None
         fvlmm_model_obj: Optional[Any] = None
 
@@ -5656,6 +5650,8 @@ def _run_file_dense_fast_once(
                 model_label = "FastLMM"
             elif mkey == "fvlmm":
                 model_label = "FvLMM"
+            elif mkey == "lmm2":
+                model_label = "LMM2"
             else:
                 model_label = str(mkey).upper()
             model_tag = str(mkey).lower()
@@ -5718,6 +5714,20 @@ def _run_file_dense_fast_once(
                         )
                         init_secs = max(time.monotonic() - init_t0, 0.0)
                     mod = lmm_model_obj
+                elif mkey == "lmm2":
+                    if lmm2_model_obj is None:
+                        if lmm_model_obj is not None:
+                            lmm2_model_obj = LMM2.from_lmm(lmm_model_obj)
+                            init_secs = 0.0
+                        else:
+                            init_t0 = time.monotonic()
+                            lmm2_model_obj = LMM2(
+                                y=y_vec,
+                                X=x_arg,
+                                kinship=np.array(kinship_sub, copy=True),
+                            )
+                            init_secs = max(time.monotonic() - init_t0, 0.0)
+                    mod = lmm2_model_obj
                 elif mkey == "fastlmm":
                     if fastlmm_model_obj is None:
                         if lmm_model_obj is not None:
@@ -5736,6 +5746,9 @@ def _run_file_dense_fast_once(
                     if fvlmm_model_obj is None:
                         if lmm_model_obj is not None:
                             fvlmm_model_obj = FvLMM.from_lmm(lmm_model_obj)
+                            init_secs = 0.0
+                        elif lmm2_model_obj is not None:
+                            fvlmm_model_obj = FvLMM.from_lmm(lmm2_model_obj)
                             init_secs = 0.0
                         elif fastlmm_model_obj is not None:
                             fvlmm_model_obj = FvLMM.from_lmm(fastlmm_model_obj)
@@ -5787,17 +5800,23 @@ def _run_file_dense_fast_once(
                     "pwald": np.asarray(res[:, 2], dtype=np.float64),
                 }
             )
-            if res.shape[1] > 3:
-                res_df["plrt"] = np.asarray(res[:, 3], dtype=np.float64)
+            if res.shape[1] == 6:
+                res_df["lambda"] = np.asarray(res[:, 3], dtype=np.float64)
+                res_df["ml"] = np.asarray(res[:, 4], dtype=np.float64)
+                res_df["plrt"] = np.asarray(res[:, 5], dtype=np.float64)
 
             viz_secs = 0.0
 
             def _write_dense_result() -> None:
                 cast_map: dict[str, object] = {"pos": int, "pwald": "object"}
+                if "ml" in res_df.columns:
+                    cast_map["ml"] = "object"
                 if "plrt" in res_df.columns:
                     cast_map["plrt"] = "object"
                 out_df = res_df.astype(cast_map)
                 out_df.loc[:, "pwald"] = out_df["pwald"].map(lambda x: f"{x:.4e}")
+                if "ml" in out_df.columns:
+                    out_df.loc[:, "ml"] = out_df["ml"].map(lambda x: f"{x:.6e}")
                 if "plrt" in out_df.columns:
                     out_df.loc[:, "plrt"] = out_df["plrt"].map(lambda x: f"{x:.4e}")
                 out_df.to_csv(out_tsv, sep="\t", float_format="%.4f", index=False)
@@ -5849,13 +5868,13 @@ def _run_file_dense_fast_once(
             done_times: list[str] = []
             if init_secs > 0.0:
                 done_times.append(format_elapsed(init_secs))
-            done_times.append(format_elapsed(scan_secs))
+                done_times.append(format_elapsed(scan_secs))
             if bool(args.plot):
                 done_times.append(format_elapsed(viz_secs))
             if (
                 pve_now is not None
                 and np.isfinite(float(pve_now))
-                and str(model_label).lower() in {"lmm", "fastlmm", "fvlmm"}
+                and str(model_label).lower() in {"lmm", "lmm2", "fastlmm", "fvlmm"}
             ):
                 done_msg = (
                     f"{model_label} ...pve {float(pve_now):.3f} "
@@ -5983,6 +6002,13 @@ def parse_args(argv: Optional[list[str]] = None):
         help="Run the linear mixed model (memmap, low-memory; default: %(default)s).",
     )
     models_group.add_argument(
+        "-lmm2", "--lmm2", action="store_true", default=False,
+        help=(
+            "Run exact LMM with Wald beta/se/pwald plus per-SNP ML/plrt output "
+            "(roughly ~2x scan cost versus -lmm; default: %(default)s)."
+        ),
+    )
+    models_group.add_argument(
         "-fastlmm", "--fastlmm", action="store_true", default=False,
         help="Run the linear mixed model with fixed lambda estimated in null model (memmap, low-memory; default: %(default)s).",
     )
@@ -6031,7 +6057,7 @@ def parse_args(argv: Optional[list[str]] = None):
     )
     models_group.add_argument(
         "-model", "--model", type=str, choices=["add", "dom", "rec", "het"], default="add",
-        help="Genetic effect coding model for memmap LM/LMM/FastLMM/FvLMM (default: %(default)s).",
+        help="Genetic effect coding model for memmap LM/LMM/LMM2/FastLMM/FvLMM (default: %(default)s).",
     )
 
     optional_group = parser.add_argument_group("Optional Arguments")
@@ -6513,14 +6539,23 @@ def _run_gwas_pipeline(
     if not ensure_all_true(checks):
         raise SystemExit(1)
 
-    if not (args.lm or args.lmm or args.fastlmm or args.fvlmm or args.splmm or args.algwas or args.farmcpu):
+    if not (
+        args.lm
+        or args.lmm
+        or getattr(args, "lmm2", False)
+        or args.fastlmm
+        or args.fvlmm
+        or args.splmm
+        or args.algwas
+        or args.farmcpu
+    ):
         logger.error(
-            "No model selected. Use -lm, -lmm, -fastlmm, -fvlmm, -splmm, -algwas, and/or -farmcpu."
+            "No model selected. Use -lm, -lmm, -lmm2, -fastlmm, -fvlmm, -splmm, -algwas, and/or -farmcpu."
         )
         raise SystemExit(1)
     if args.farmcpu and args.model != "add":
         logger.warning(
-            "Warning: --model/--het currently apply to memmap LM/LMM/FastLMM/FvLMM; "
+            "Warning: --model/--het currently apply to memmap LM/LMM/LMM2/FastLMM/FvLMM; "
             "FarmCPU keeps additive coding."
         )
     maf_threshold_scan = float(args.maf)
@@ -6559,10 +6594,10 @@ def _run_gwas_pipeline(
     # - packed full-load remains the fallback when memmap is unavailable
     allow_packed_grm_reuse = bool(
         fast_mode
-        and (args.lmm or args.fastlmm or args.fvlmm or qcov_needs_grm)
+        and (args.lmm or getattr(args, "lmm2", False) or args.fastlmm or args.fvlmm or qcov_needs_grm)
     )
     force_bed_stream_scan = bool(
-        (args.lm or args.lmm or args.fastlmm or args.fvlmm)
+        (args.lm or args.lmm or getattr(args, "lmm2", False) or args.fastlmm or args.fvlmm)
         and input_is_file_matrix
         and (not bool(fast_mode))
     )
@@ -6574,11 +6609,11 @@ def _run_gwas_pipeline(
         _append_advanced_note(
             "FILE matrix input for LM/LMM/FaSTLMM: materializing PLINK BED cache for Rust streaming scan."
         )
-    if (not bool(fast_mode)) and bool(args.lmm or args.fastlmm or args.fvlmm or qcov_needs_grm):
+    if (not bool(fast_mode)) and bool(args.lmm or getattr(args, "lmm2", False) or args.fastlmm or args.fvlmm or qcov_needs_grm):
         _append_advanced_note(
             "Non-fast GWAS: GRM uses memmap path by default (packed single-entry disabled)."
         )
-    elif bool(args.lmm or args.fastlmm or args.fvlmm or qcov_needs_grm):
+    elif bool(args.lmm or getattr(args, "lmm2", False) or args.fastlmm or args.fvlmm or qcov_needs_grm):
         _append_advanced_note(
             "GWAS GRM auto route: memmap stays primary for full-sample builds; packed is "
             "reused only when a compatible preloaded packed payload is already available."
@@ -6609,6 +6644,8 @@ def _run_gwas_pipeline(
             stream_models.append("lm")
         if args.lmm:
             stream_models.append("lmm")
+        if getattr(args, "lmm2", False):
+            stream_models.append("lmm2")
         if args.fastlmm:
             stream_models.append("fastlmm")
         if args.fvlmm:
@@ -6675,9 +6712,6 @@ def _run_gwas_pipeline(
                 if spk_val in ("1", "2"):
                     prepared_splmm_sparse_method = int(spk_val)
                 else:
-                    from janusx.assoc.workflow_model_packed import _jxlmm_normalize_jxgrm_path
-                    from janusx.assoc.workflow_model_packed import _jxlmm_sparse_out_prefix_for_gwas
-
                     spk_path = _jxlmm_normalize_jxgrm_path(spk_val)
                     if os.path.exists(spk_path):
                         prepared_splmm_sparse_jxgrm_path = spk_path
@@ -6768,7 +6802,7 @@ def _run_gwas_pipeline(
                     pcdim=args.qcov,
                     cov_inputs=args.cov,
                     threads=args.thread,
-                    require_kinship=(args.lmm or args.fastlmm or args.fvlmm),
+                    require_kinship=(args.lmm or getattr(args, "lmm2", False) or args.fastlmm or args.fvlmm),
                     logger=logger,
                     use_spinner=use_spinner,
                     snps_only=bool(args.snps_only),
@@ -7308,6 +7342,43 @@ def _run_gwas_pipeline(
                             force_model=bool(args.force_model),
                         )
 
+                    def _run_route_lmm2_stream(
+                        trait_one: list[str], emit_trait_header_model: bool
+                    ) -> None:
+                        run_chunked_gwas_lmm_lm(
+                            model_name="lmm2",
+                            genofile=genofile_stream,
+                            pheno=pheno,
+                            ids=ids,
+                            n_snps=n_snps,
+                            outprefix=outprefix,
+                            maf_threshold=maf_threshold_scan,
+                            max_missing_rate=max_missing_rate_scan,
+                            genetic_model=args.model,
+                            het_threshold=het_threshold_scan,
+                            chunk_size=args.chunksize,
+                            mmap_limit=mmap_limit_effective,
+                            grm=grm,
+                            qmatrix=qmatrix,
+                            cov_all=cov_all,
+                            eff_m=eff_m,
+                            plot=args.plot,
+                            threads=args.thread,
+                            logger=logger,
+                            use_spinner=use_spinner,
+                            snps_only=bool(args.snps_only),
+                            eff_snp_by_trait=eff_snp_by_trait,
+                            summary_rows=gwas_summary_rows,
+                            saved_paths=saved_result_paths,
+                            trait_names=trait_one,
+                            emit_trait_header=bool(emit_trait_header_model),
+                            chunk_size_user_set=bool(
+                                getattr(args, "_chunksize_user_set", True)
+                            ),
+                            prefer_packed_fullrust=False,
+                            force_model=bool(args.force_model),
+                        )
+
                     def _run_route_farmcpu(
                         trait_one: list[str], emit_trait_header_model: bool
                     ) -> None:
@@ -7342,6 +7413,7 @@ def _run_gwas_pipeline(
                         "algwas": _run_route_algwas_packed,
                         "lm_stream": _run_route_lm_stream,
                         "lmm_stream": _run_route_lmm_stream,
+                        "lmm2_stream": _run_route_lmm2_stream,
                         "fastlmm_stream": _run_route_fastlmm_stream,
                         "fvlmm_stream": _run_route_fvlmm_stream,
                         "farmcpu": _run_route_farmcpu,
@@ -7353,13 +7425,16 @@ def _run_gwas_pipeline(
                         "lmm_stream": "lmm_stream",
                         "lmm_memmap": "lmm_stream",
                         "lmm_rust": "lmm_stream",
+                        "lmm2_stream": "lmm2_stream",
+                        "lmm2_memmap": "lmm2_stream",
+                        "lmm2_rust": "lmm2_stream",
                         "fastlmm_memmap": "fastlmm_stream",
                         "fastlmm_rust": "fastlmm_stream",
                         "fvlmm_memmap": "fvlmm_stream",
                         "fvlmm_rust": "fvlmm_stream",
                         "farm": "farmcpu",
                     }
-                    stream_group_routes = {"lm_stream", "lmm_stream", "fastlmm_stream", "fvlmm_stream"}
+                    stream_group_routes = {"lm_stream", "lmm_stream", "lmm2_stream", "fastlmm_stream", "fvlmm_stream"}
                     normalized_tasks: list[dict[str, object]] = []
                     for task_item in task_plan:
                         mk = str(task_item.get("model", "")).lower().strip()
@@ -7369,6 +7444,8 @@ def _run_gwas_pipeline(
                                 route = "lm_packed" if packed_preload_ready else "lm_stream"
                             elif mk == "lmm":
                                 route = "lmm_packed" if packed_preload_ready else "lmm_stream"
+                            elif mk == "lmm2":
+                                route = "lmm2_stream"
                             elif mk == "fastlmm":
                                 route = (
                                     "fastlmm_packed"

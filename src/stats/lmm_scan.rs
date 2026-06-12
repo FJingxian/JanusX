@@ -2250,6 +2250,201 @@ pub fn lmm_reml_chunk_from_snp_f32<'py>(
     Ok(beta_se_p)
 }
 
+#[pyfunction]
+#[pyo3(signature = (s, xcov, y_rot, low, high, snp_chunk, u_t, nullml, max_iter=50, tol=1e-2, threads=0, rotate_block_rows=256))]
+pub fn lmm_reml_lmm2_chunk_from_snp_f32<'py>(
+    py: Python<'py>,
+    s: PyReadonlyArray1<'py, f64>,
+    xcov: PyReadonlyArray2<'py, f64>,
+    y_rot: PyReadonlyArray1<'py, f64>,
+    low: f64,
+    high: f64,
+    snp_chunk: PyReadonlyArray2<'py, f32>,
+    u_t: PyReadonlyArray2<'py, f32>,
+    nullml: f64,
+    max_iter: usize,
+    tol: f64,
+    threads: usize,
+    rotate_block_rows: usize,
+) -> PyResult<Bound<'py, PyArray2<f64>>> {
+    let s = s.as_slice()?;
+    let xcov_arr = xcov.as_array();
+    let y = y_rot.as_slice()?;
+    let snp_arr = snp_chunk.as_array();
+    let ut_arr = u_t.as_array();
+
+    let n = y.len();
+    let (xc_n, p_cov) = (xcov_arr.shape()[0], xcov_arr.shape()[1]);
+    if xc_n != n {
+        return Err(PyRuntimeError::new_err("Xcov.n_rows must equal len(y_rot)"));
+    }
+    if s.len() != n {
+        return Err(PyRuntimeError::new_err("len(S) must equal len(y_rot)"));
+    }
+    if snp_arr.shape()[1] != n {
+        return Err(PyRuntimeError::new_err("snp_chunk must be (m_chunk, n)"));
+    }
+    if ut_arr.shape()[0] != n || ut_arr.shape()[1] != n {
+        return Err(PyRuntimeError::new_err(
+            "u_t must be (n, n) and row-major U^T",
+        ));
+    }
+    if low >= high {
+        return Err(PyRuntimeError::new_err("low must be < high"));
+    }
+    if !nullml.is_finite() {
+        return Err(PyRuntimeError::new_err("nullml must be finite"));
+    }
+
+    let m_chunk = snp_arr.shape()[0];
+    let xcov_flat: Cow<[f64]> = match xcov.as_slice() {
+        Ok(s0) => Cow::Borrowed(s0),
+        Err(_) => Cow::Owned(xcov_arr.iter().copied().collect()),
+    };
+    let snp_flat: Cow<[f32]> = match snp_chunk.as_slice() {
+        Ok(s0) => Cow::Borrowed(s0),
+        Err(_) => Cow::Owned(snp_arr.iter().copied().collect()),
+    };
+    let ut_flat: Cow<[f32]> = match u_t.as_slice() {
+        Ok(s0) => Cow::Borrowed(s0),
+        Err(_) => Cow::Owned(ut_arr.iter().copied().collect()),
+    };
+
+    let out_cols = 6usize;
+    let out = PyArray2::<f64>::zeros(py, [m_chunk, out_cols], false).into_bound();
+    let out_slice: &mut [f64] = unsafe {
+        out.as_slice_mut()
+            .map_err(|_| PyRuntimeError::new_err("lmm2 output not contiguous"))?
+    };
+
+    let pool = if threads > 0 {
+        Some(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .map_err(|e| PyRuntimeError::new_err(format!("rayon pool: {e}")))?,
+        )
+    } else {
+        None
+    };
+
+    let block_rows = rotate_block_rows.max(1);
+
+    py.detach(|| {
+        let mut rot_buf = vec![0.0_f32; block_rows * n];
+
+        let run_rows = |g_block: &[f32], out_block: &mut [f64]| {
+            out_block
+                .par_chunks_mut(out_cols)
+                .enumerate()
+                .for_each_init(
+                    || vec![0.0_f64; n],
+                    |snp_vec, (idx, out_row)| {
+                        let row = &g_block[idx * n..(idx + 1) * n];
+                        for i in 0..n {
+                            snp_vec[i] = row[i] as f64;
+                        }
+
+                        let (best_log10_lbd_reml, _best_reml_cost) = brent_minimize(
+                            |x| -reml_loglike(x, s, &xcov_flat, y, Some(&snp_vec[..]), n, p_cov),
+                            low,
+                            high,
+                            tol,
+                            max_iter,
+                        );
+                        let (beta, se, lambda_reml) =
+                            final_beta_se(best_log10_lbd_reml, s, &xcov_flat, y, &snp_vec, n, p_cov);
+                        let pwald = if beta.is_finite() && se.is_finite() && se > 0.0 {
+                            let z = beta / se;
+                            (2.0 * normal_sf(z.abs())).clamp(f64::MIN_POSITIVE, 1.0)
+                        } else {
+                            1.0
+                        };
+
+                        let (best_log10_lbd_ml, best_ml_cost) = brent_minimize_with_init(
+                            |x| -ml_loglike(x, s, &xcov_flat, y, Some(&snp_vec[..]), n, p_cov),
+                            low,
+                            high,
+                            tol,
+                            max_iter,
+                            Some(best_log10_lbd_reml),
+                        );
+                        let mut ml_alt = -best_ml_cost;
+                        if !ml_alt.is_finite() {
+                            ml_alt = ml_loglike(
+                                best_log10_lbd_ml,
+                                s,
+                                &xcov_flat,
+                                y,
+                                Some(&snp_vec[..]),
+                                n,
+                                p_cov,
+                            );
+                        }
+                        let mut stat = if ml_alt.is_finite() {
+                            2.0 * (ml_alt - nullml)
+                        } else {
+                            0.0
+                        };
+                        if !stat.is_finite() || stat < 0.0 {
+                            stat = 0.0;
+                        }
+                        let plrt = chi2_sf_df1(stat);
+
+                        out_row[0] = beta;
+                        out_row[1] = se;
+                        out_row[2] = if pwald.is_finite() { pwald } else { 1.0 };
+                        out_row[3] = lambda_reml;
+                        out_row[4] = ml_alt;
+                        out_row[5] = plrt;
+                    },
+                );
+        };
+
+        let mut start = 0usize;
+        while start < m_chunk {
+            let rows = (m_chunk - start).min(block_rows);
+            let snp_block = &snp_flat[start * n..(start + rows) * n];
+            let rot_block = &mut rot_buf[..rows * n];
+            let rotate_tile_rows = choose_rotate_tile_rows(
+                rows,
+                if threads > 0 {
+                    threads
+                } else {
+                    rayon::current_num_threads()
+                },
+            );
+            let out_block = &mut out_slice[start * out_cols..(start + rows) * out_cols];
+            if let Some(tp) = &pool {
+                tp.install(|| {
+                    rotate_snp_block_with_ut_parallel(
+                        snp_block,
+                        rows,
+                        n,
+                        &ut_flat,
+                        rot_block,
+                        rotate_tile_rows,
+                    );
+                    run_rows(rot_block, out_block);
+                });
+            } else {
+                rotate_snp_block_with_ut_parallel(
+                    snp_block,
+                    rows,
+                    n,
+                    &ut_flat,
+                    rot_block,
+                    rotate_tile_rows,
+                );
+                run_rows(rot_block, out_block);
+            }
+            start += rows;
+        }
+    });
+
+    Ok(out)
+}
+
 // ------------------------------------------------------------
 // Helpers: dot loops
 // ------------------------------------------------------------
@@ -7007,7 +7202,8 @@ pub fn fastlmm_assoc_packed_f32<'py>(
         ));
     }
 
-    let out_cols = 4usize;
+    let with_plrt = fixed_ml0.is_some();
+    let out_cols = if with_plrt { 4usize } else { 3usize };
     let out = PyArray2::<f64>::zeros(py, [m, out_cols], false).into_bound();
     let out_slice: &mut [f64] = unsafe {
         out.as_slice_mut()
@@ -7591,7 +7787,8 @@ pub fn fastlmm_assoc_packed_f32_to_tsv<'py>(
     } else {
         progress_every.max(1)
     };
-    let out_cols = 4usize;
+    let with_plrt = fixed_ml0.is_some();
+    let out_cols = if with_plrt { 4usize } else { 3usize };
     let stage_timing = env_truthy("JX_FASTLMM_PACKED_STAGE_TIMING");
 
     py.detach(move || -> PyResult<()> {
@@ -7601,12 +7798,12 @@ pub fn fastlmm_assoc_packed_f32_to_tsv<'py>(
         let mut assoc_secs = 0.0_f64;
         let mut tsv_secs = 0.0_f64;
 
-        let writer = AsyncTsvWriter::with_config(
-            &out_tsv_path,
-            b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n",
-            64 * 1024 * 1024,
-            4,
-        )
+        let header: &[u8] = if with_plrt {
+            b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n"
+        } else {
+            b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\n"
+        };
+        let writer = AsyncTsvWriter::with_config(&out_tsv_path, header, 64 * 1024 * 1024, 4)
         .map_err(PyRuntimeError::new_err)?;
 
         let n_f = n as f64;
@@ -7756,7 +7953,9 @@ pub fn fastlmm_assoc_packed_f32_to_tsv<'py>(
                                     out_row[0] = f64::NAN;
                                     out_row[1] = f64::NAN;
                                     out_row[2] = f64::NAN;
-                                    out_row[3] = 1.0;
+                                    if with_plrt {
+                                        out_row[3] = 1.0;
+                                    }
                                     return;
                                 }
 
@@ -7778,26 +7977,26 @@ pub fn fastlmm_assoc_packed_f32_to_tsv<'py>(
                                 } else {
                                     1.0
                                 };
-                                let ml = if rwr > 0.0 && rwr.is_finite() {
-                                    let total_log = n_f * rwr.ln() + log_det_v;
-                                    c_ml - 0.5 * total_log
-                                } else {
-                                    f64::NAN
-                                };
-                                let mut stat = if ml.is_finite() {
-                                    2.0 * (ml - ml0)
-                                } else {
-                                    0.0
-                                };
-                                if !stat.is_finite() || stat < 0.0 {
-                                    stat = 0.0;
-                                }
-                                let plrt = chi2_sf_df1(stat);
-
                                 out_row[0] = beta_g;
                                 out_row[1] = se_g;
                                 out_row[2] = pval;
-                                out_row[3] = plrt;
+                                if with_plrt {
+                                    let ml = if rwr > 0.0 && rwr.is_finite() {
+                                        let total_log = n_f * rwr.ln() + log_det_v;
+                                        c_ml - 0.5 * total_log
+                                    } else {
+                                        f64::NAN
+                                    };
+                                    let mut stat = if ml.is_finite() {
+                                        2.0 * (ml - ml0)
+                                    } else {
+                                        0.0
+                                    };
+                                    if !stat.is_finite() || stat < 0.0 {
+                                        stat = 0.0;
+                                    }
+                                    out_row[3] = chi2_sf_df1(stat);
+                                }
                             },
                         );
                 };
@@ -7833,25 +8032,42 @@ pub fn fastlmm_assoc_packed_f32_to_tsv<'py>(
                     let beta = out_sub[base];
                     let se = out_sub[base + 1];
                     let pwald = sanitize_assoc_pvalue(beta, se, out_sub[base + 2]);
-                    let chisq =
-                        chisq_from_beta_se_and_optional_plrt(beta, se, Some(out_sub[base + 3]));
+                    let chisq = chisq_from_beta_se_and_optional_plrt(beta, se, None);
                     let chisq_txt = format_chisq_value(chisq);
-                    let _ = write!(
-                        text_buf,
-                        "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\t{:.4e}\n",
-                        chrom[idx],
-                        pos[idx],
-                        snp[idx],
-                        allele0[idx],
-                        allele1[idx],
-                        row_maf[idx],
-                        miss_sub[off],
-                        beta,
-                        se,
-                        chisq_txt,
-                        pwald,
-                        out_sub[base + 3]
-                    );
+                    if with_plrt {
+                        let _ = write!(
+                            text_buf,
+                            "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\t{:.4e}\n",
+                            chrom[idx],
+                            pos[idx],
+                            snp[idx],
+                            allele0[idx],
+                            allele1[idx],
+                            row_maf[idx],
+                            miss_sub[off],
+                            beta,
+                            se,
+                            chisq_txt,
+                            pwald,
+                            out_sub[base + 3]
+                        );
+                    } else {
+                        let _ = write!(
+                            text_buf,
+                            "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\n",
+                            chrom[idx],
+                            pos[idx],
+                            snp[idx],
+                            allele0[idx],
+                            allele1[idx],
+                            row_maf[idx],
+                            miss_sub[off],
+                            beta,
+                            se,
+                            chisq_txt,
+                            pwald
+                        );
+                    }
                 }
                 let payload = std::mem::take(&mut text_buf).into_bytes();
                 writer.send(payload).map_err(PyRuntimeError::new_err)?;
@@ -8241,7 +8457,8 @@ pub fn fvlmm_assoc_packed_f32_to_tsv<'py>(
     } else {
         progress_every.max(1)
     };
-    let out_cols = 4usize;
+    let with_plrt = fixed_ml0.is_some();
+    let out_cols = if with_plrt { 4usize } else { 3usize };
     let stage_timing =
         env_truthy("JX_FVLMM_PACKED_STAGE_TIMING") || env_truthy("JX_FASTLMM_PACKED_STAGE_TIMING");
 
@@ -8254,12 +8471,12 @@ pub fn fvlmm_assoc_packed_f32_to_tsv<'py>(
         let assoc_nanos = AtomicU64::new(0);
         let tsv_nanos = AtomicU64::new(0);
 
-        let writer = AsyncTsvWriter::with_config(
-            &out_tsv_path,
-            b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n",
-            64 * 1024 * 1024,
-            4,
-        )
+        let header: &[u8] = if with_plrt {
+            b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n"
+        } else {
+            b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\n"
+        };
+        let writer = AsyncTsvWriter::with_config(&out_tsv_path, header, 64 * 1024 * 1024, 4)
         .map_err(PyRuntimeError::new_err)?;
 
         let rotate_block_rows = if rotate_block_rows > 0 {
@@ -8354,7 +8571,7 @@ pub fn fvlmm_assoc_packed_f32_to_tsv<'py>(
                     out_cols,
                     assoc_threads,
                     assoc_pool.as_ref(),
-                    Some(ml0),
+                    if with_plrt { Some(ml0) } else { None },
                 );
                 record_elapsed_nanos(&assoc_nanos, at0);
 
@@ -8369,25 +8586,42 @@ pub fn fvlmm_assoc_packed_f32_to_tsv<'py>(
                     let beta = out_sub[base];
                     let se = out_sub[base + 1];
                     let pwald = sanitize_assoc_pvalue(beta, se, out_sub[base + 2]);
-                    let chisq =
-                        chisq_from_beta_se_and_optional_plrt(beta, se, Some(out_sub[base + 3]));
+                    let chisq = chisq_from_beta_se_and_optional_plrt(beta, se, None);
                     let chisq_txt = format_chisq_value(chisq);
-                    let _ = write!(
-                        text_buf,
-                        "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\t{:.4e}\n",
-                        chrom[idx],
-                        pos[idx],
-                        snp[idx],
-                        allele0[idx],
-                        allele1[idx],
-                        row_maf[idx],
-                        miss_sub[off],
-                        beta,
-                        se,
-                        chisq_txt,
-                        pwald,
-                        out_sub[base + 3]
-                    );
+                    if with_plrt {
+                        let _ = write!(
+                            text_buf,
+                            "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\t{:.4e}\n",
+                            chrom[idx],
+                            pos[idx],
+                            snp[idx],
+                            allele0[idx],
+                            allele1[idx],
+                            row_maf[idx],
+                            miss_sub[off],
+                            beta,
+                            se,
+                            chisq_txt,
+                            pwald,
+                            out_sub[base + 3]
+                        );
+                    } else {
+                        let _ = write!(
+                            text_buf,
+                            "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\n",
+                            chrom[idx],
+                            pos[idx],
+                            snp[idx],
+                            allele0[idx],
+                            allele1[idx],
+                            row_maf[idx],
+                            miss_sub[off],
+                            beta,
+                            se,
+                            chisq_txt,
+                            pwald
+                        );
+                    }
                 }
                 let payload = std::mem::take(&mut text_buf).into_bytes();
                 writer.send(payload).map_err(PyRuntimeError::new_err)?;

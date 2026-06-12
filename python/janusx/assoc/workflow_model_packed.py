@@ -2203,7 +2203,7 @@ def run_fastlmm_packed_fullrank(
             null_pve = pve_tmp if np.isfinite(pve_tmp) else None
         except Exception:
             null_pve = None
-        null_ml0: Optional[float] = fixed_ml0
+        null_ml0: Optional[float] = None
 
         if (not bool(force_model)) and bool(_allow_pve_switch) and _fastlmm_should_switch_to_lmm(null_pve):
             prev_pve = float(null_pve) if null_pve is not None else float("nan")
@@ -2444,7 +2444,7 @@ def run_fastlmm_packed_fullrank(
                                     "tau": 0.0,
                                     "genetic_model": str(genetic_model),
                                     "fixed_lbd": (float(fixed_lbd) if fixed_lbd is not None else None),
-                                    "fixed_ml0": (float(fixed_ml0) if fixed_ml0 is not None else None),
+                                    "fixed_ml0": None,
                                     "rotate_block_rows": int(max(1, int(chunk_size))),
                                     "scan_progress_callback": _fastlmm_progress,
                                     "progress_every": int(
@@ -2520,7 +2520,7 @@ def run_fastlmm_packed_fullrank(
                             tmp_tsv,
                             row_indices=packed_row_idx,
                             fixed_lbd=(float(fixed_lbd) if fixed_lbd is not None else None),
-                            fixed_ml0=(float(fixed_ml0) if fixed_ml0 is not None else None),
+                            fixed_ml0=None,
                             rotate_block_rows=int(max(1, int(chunk_size))),
                             **progress_kwargs,
                         )
@@ -3737,7 +3737,7 @@ def run_lmm_packed_fullrank(
                         tol=1e-2,
                         threads=int(threads),
                         model="add",
-                        nullml=null_ml0,
+                        nullml=None,
                         init_log10_lbd=init_log10_lbd,
                         rotate_block_rows=int(max(1, int(chunk_size))),
                         **progress_kwargs,

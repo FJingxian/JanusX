@@ -184,6 +184,7 @@ class LinearModel:
         from janusx.pyBLUP.assoc import (
             LM as _LM,
             LMM as _LMM,
+            LMM2 as _LMM2,
             FastLMM as _FastLMM,
             FvLMM as _FvLMM,
             farmcpu as _farmcpu,
@@ -230,7 +231,7 @@ class LinearModel:
                 "(PLINK/BED-backed packed route)."
             )
 
-        if model_key in {"lmm", "fastlmm", "fvlmm"}:
+        if model_key in {"lmm", "lmm2", "fastlmm", "fvlmm"}:
             kinship = cfg.extra.get("kinship") if isinstance(cfg.extra, dict) else None
             if kinship is None:
                 kinship = _calc_grm(m_snp, log=False, chunksize=max(1, int(cfg.chunksize)))
@@ -271,8 +272,23 @@ class LinearModel:
                     "se": arr[:, 1],
                     "pwald": arr[:, 2],
                 }
-                if arr.shape[1] > 3:
-                    cols["plrt"] = arr[:, 3]
+                df = pd.DataFrame(cols)
+                pve = float(mod.pve) if np.isfinite(float(mod.pve)) else None
+            elif model_key == "lmm2":
+                mod = _LMM2(y=y_vec, X=x_cov, kinship=np.array(kinship, copy=True))
+                arr = np.asarray(mod.gwas(m_snp, threads=threads), dtype=np.float64)
+                cols = {
+                    "chrom": chrom,
+                    "pos": pos,
+                    "allele0": allele0,
+                    "allele1": allele1,
+                    "beta": arr[:, 0],
+                    "se": arr[:, 1],
+                    "pwald": arr[:, 2],
+                    "lambda": arr[:, 3],
+                    "ml": arr[:, 4],
+                    "plrt": arr[:, 5],
+                }
                 df = pd.DataFrame(cols)
                 pve = float(mod.pve) if np.isfinite(float(mod.pve)) else None
             elif model_key == "fastlmm":
@@ -287,8 +303,6 @@ class LinearModel:
                     "se": arr[:, 1],
                     "pwald": arr[:, 2],
                 }
-                if arr.shape[1] > 3:
-                    cols["plrt"] = arr[:, 3]
                 df = pd.DataFrame(cols)
                 pve = float(mod.pve) if np.isfinite(float(mod.pve)) else None
             elif model_key == "fvlmm":
@@ -303,8 +317,6 @@ class LinearModel:
                     "se": arr[:, 1],
                     "pwald": arr[:, 2],
                 }
-                if arr.shape[1] > 3:
-                    cols["plrt"] = arr[:, 3]
                 df = pd.DataFrame(cols)
                 pve = float(mod.pve) if np.isfinite(float(mod.pve)) else None
             elif model_key == "farmcpu":
@@ -340,6 +352,8 @@ class LinearModel:
                 out_file = os.path.join(out_dir, f"{out_prefix}.{trait_name}.{model_key}.tsv")
                 w = df.copy()
                 w["pwald"] = pd.to_numeric(w["pwald"], errors="coerce").map(lambda x: f"{x:.4e}")
+                if "ml" in w.columns:
+                    w["ml"] = pd.to_numeric(w["ml"], errors="coerce").map(lambda x: f"{x:.6e}")
                 if "plrt" in w.columns:
                     w["plrt"] = pd.to_numeric(w["plrt"], errors="coerce").map(lambda x: f"{x:.4e}")
                 w.to_csv(out_file, sep="\t", index=False)
@@ -351,7 +365,7 @@ class LinearModel:
                     "model": (
                         "FastLMM"
                         if model_key == "fastlmm"
-                        else ("FvLMM" if model_key == "fvlmm" else model_key.upper())
+                        else ("FvLMM" if model_key == "fvlmm" else ("LMM2" if model_key == "lmm2" else model_key.upper()))
                     ),
                     "nidv": int(n_samples),
                     "eff_snp": int(m),
@@ -425,6 +439,22 @@ class LinearModel:
     ) -> AssociationResult:
         return self._run(
             model_key="lmm",
+            out=out,
+            prefix=prefix,
+            log=log,
+            write_files=write_files,
+        )
+
+    def lmm2(
+        self,
+        *,
+        out: Optional[str] = None,
+        prefix: Optional[str] = None,
+        log: bool = True,
+        write_files: bool = False,
+    ) -> AssociationResult:
+        return self._run(
+            model_key="lmm2",
             out=out,
             prefix=prefix,
             log=log,

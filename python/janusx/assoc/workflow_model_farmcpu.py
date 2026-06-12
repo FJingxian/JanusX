@@ -1495,7 +1495,6 @@ def run_farmcpu_fullmem(
                         "se": se_arr,
                         "chisq": _format_chisq_output(np.square(beta_arr / se_arr)),
                         "pwald": pwald_arr,
-                        "plrt": np.full((eff_snp,), np.nan, dtype=np.float64),
                     }
                 )
                 out_df.to_csv(str(tmp_tsv), sep="\t", index=False)

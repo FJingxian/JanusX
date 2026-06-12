@@ -208,11 +208,7 @@ pub(crate) fn chi2_stat_df1_from_sf(p: f64) -> f64 {
 
 #[inline]
 pub(crate) fn chisq_from_beta_se_and_optional_plrt(beta: f64, se: f64, plrt: Option<f64>) -> f64 {
-    if let Some(p) = plrt {
-        if p.is_finite() {
-            return chi2_stat_df1_from_sf(p);
-        }
-    }
+    let _ = plrt;
     if beta.is_finite() && se.is_finite() && se > 0.0 {
         let z = beta / se;
         z * z

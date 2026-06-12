@@ -32,7 +32,9 @@ use crate::gfcore::BedSnpIter;
 use crate::gfreader::{build_sample_selection, prepare_bed_logic_meta_owned_for_stats_samples};
 use crate::gload::{GenotypeMatrix, UnifiedInput};
 use crate::he::row_major_block_mul_mat_f32;
-use crate::linalg::{format_chisq_value, sanitize_assoc_pvalue};
+use crate::linalg::{
+    chisq_from_beta_se_and_optional_plrt, format_chisq_value, sanitize_assoc_pvalue,
+};
 use crate::stats_common::{get_cached_pool, parse_index_vec_i64, AsyncTsvWriter};
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
@@ -695,7 +697,7 @@ pub fn lm_stream_bed_to_tsv(
     py.detach(move || -> PyResult<(usize, usize)> {
         let writer = AsyncTsvWriter::with_config(
             &out_tsv_path,
-            b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n",
+            b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\n",
             64 * 1024 * 1024,
             4,
         )
@@ -908,7 +910,7 @@ pub fn lm_stream_bed_to_tsv(
                         (prepared.missing_rate[row_idx] as f64 * n as f64).round() as i64;
                     let _ = write!(
                         text,
-                        "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\t{:.4e}\n",
+                        "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\n",
                         site.chrom,
                         site.pos,
                         site.snp,
@@ -919,8 +921,7 @@ pub fn lm_stream_bed_to_tsv(
                         r[0],
                         r[1],
                         chisq_txt,
-                        pwald,
-                        r[4]
+                        pwald
                     );
                 }
                 let payload = std::mem::take(&mut text).into_bytes();
@@ -1359,11 +1360,11 @@ pub fn lm_stream_bed_to_tsv(
                 let (a0, a1) =
                     transform_alleles_by_model(&site.ref_allele, &site.alt_allele, model.as_str());
                 let r = &out[i * 5..(i + 1) * 5];
-                let chisq_txt = format_chisq_value(r[2]);
+                let chisq_txt = format_chisq_value(chisq_from_beta_se_and_optional_plrt(r[0], r[1], None));
                 let pwald = sanitize_assoc_pvalue(r[0], r[1], r[3]);
                 let _ = write!(
                     text,
-                    "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\t{:.4e}\n",
+                    "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\n",
                     site.chrom,
                     site.pos,
                     site.snp,
@@ -1374,8 +1375,7 @@ pub fn lm_stream_bed_to_tsv(
                     r[0],
                     r[1],
                     chisq_txt,
-                    pwald,
-                    r[4]
+                    pwald
                 );
             }
             let payload = std::mem::take(&mut text).into_bytes();
@@ -2494,7 +2494,7 @@ pub fn lm_block_assoc_packed_to_tsv<'py>(
         let row_missing = row_missing_owned;
         let writer = AsyncTsvWriter::with_config(
             &out_path,
-            b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n",
+            b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\n",
             64 * 1024 * 1024,
             4,
         )
@@ -2668,9 +2668,10 @@ pub fn lm_block_assoc_packed_to_tsv<'py>(
                     let chisq_txt = format_chisq_value(chisq);
                     let pwald = sanitize_assoc_pvalue(beta_j, se_j, pwald);
 
+                    let _ = plrt;
                     let _ = write!(
                         text_buf,
-                        "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\t{:.4e}\n",
+                        "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\n",
                         chrom[fi],
                         pos[fi],
                         snp[fi],
@@ -2682,7 +2683,6 @@ pub fn lm_block_assoc_packed_to_tsv<'py>(
                         se_j,
                         chisq_txt,
                         pwald,
-                        plrt,
                     );
                 }
 
@@ -2924,7 +2924,7 @@ pub fn glmf32_packed_assoc_to_tsv(
     py.detach(move || -> PyResult<usize> {
         let writer = AsyncTsvWriter::with_config(
             &out_path,
-            b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n",
+            b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\n",
             64 * 1024 * 1024,
             4,
         )
@@ -3068,12 +3068,13 @@ pub fn glmf32_packed_assoc_to_tsv(
                 for l in 0..cnt {
                     let idx = i_marker + l;
                     let base = l * 5;
-                    let chisq_txt = format_chisq_value(block[base + 2]);
+                    let chisq_txt =
+                        format_chisq_value(chisq_from_beta_se_and_optional_plrt(block[base], block[base + 1], None));
                     let pwald =
                         sanitize_assoc_pvalue(block[base], block[base + 1], block[base + 3]);
                     let _ = write!(
                         text_buf,
-                        "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\t{:.4e}\n",
+                        "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\n",
                         chrom[idx],
                         pos[idx],
                         snp[idx],
@@ -3085,7 +3086,6 @@ pub fn glmf32_packed_assoc_to_tsv(
                         block[base + 1],
                         chisq_txt,
                         pwald,
-                        block[base + 4],
                     );
                 }
                 let payload = std::mem::take(&mut text_buf).into_bytes();
@@ -3508,7 +3508,7 @@ pub(crate) fn lm_unified_scan_to_tsv<G: GenotypeMatrix>(
     let mut text = String::with_capacity(blk * 112);
     let writer = AsyncTsvWriter::with_config(
         out_tsv,
-        b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n",
+        b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\n",
         64 * 1024 * 1024,
         4,
     )
@@ -3554,13 +3554,12 @@ pub(crate) fn lm_unified_scan_to_tsv<G: GenotypeMatrix>(
             let pwald = sanitize_assoc_pvalue(s[0], s[1], s[2]);
             let _ = write!(
                 text,
-                "{}\t.\t.\t.\t.\t.\t.\t{:.4}\t{:.4}\t{}\t{:.4e}\t{:.4e}\n",
+                "{}\t.\t.\t.\t.\t.\t.\t{:.4}\t{:.4}\t{}\t{:.4e}\n",
                 rs + li,
                 s[0],
                 s[1],
-                format_chisq_value(s[4]),
-                pwald,
-                s[3]
+                format_chisq_value(chisq_from_beta_se_and_optional_plrt(s[0], s[1], None)),
+                pwald
             );
         }
         writer.send(std::mem::take(&mut text).into_bytes())?;

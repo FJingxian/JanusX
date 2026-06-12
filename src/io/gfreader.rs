@@ -99,11 +99,25 @@ fn transform_alleles_by_model_local(
 pub struct GwasAssocTsvWriter {
     path: String,
     model_key: String,
-    with_plrt: Option<bool>,
+    result_cols: Option<usize>,
     rows_written: usize,
     buffer_bytes: usize,
     text_buf: String,
     writer: Option<AsyncTsvWriter>,
+}
+
+#[inline]
+fn gwas_assoc_header_for_result_cols(result_cols: usize) -> PyResult<&'static [u8]> {
+    match result_cols {
+        3 => Ok(b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\n"),
+        4 => Ok(b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n"),
+        6 => Ok(
+            b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\tlambda\tml\tplrt\n",
+        ),
+        other => Err(PyValueError::new_err(format!(
+            "unsupported GWAS result column count: {other} (expected 3, 4, or 6)"
+        ))),
+    }
 }
 
 #[pymethods]
@@ -120,7 +134,7 @@ impl GwasAssocTsvWriter {
         Ok(Self {
             path,
             model_key,
-            with_plrt: None,
+            result_cols: None,
             rows_written: 0,
             buffer_bytes: 8 * 1024 * 1024,
             text_buf: String::with_capacity(8 * 1024 * 1024),
@@ -182,22 +196,18 @@ impl GwasAssocTsvWriter {
                 shape[1]
             )));
         }
-        let has_plrt = shape[1] > 3;
-        match self.with_plrt {
+        let result_cols = shape[1];
+        let header = gwas_assoc_header_for_result_cols(result_cols)?;
+        match self.result_cols {
             None => {
-                self.with_plrt = Some(has_plrt);
-                let header: &[u8] = if has_plrt {
-                    b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n"
-                } else {
-                    b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\n"
-                };
+                self.result_cols = Some(result_cols);
                 self.writer = Some(
                     AsyncTsvWriter::with_config(&self.path, header, 64 * 1024 * 1024, 16)
                         .map_err(PyIOError::new_err)?,
                 );
             }
             Some(prev) => {
-                if prev != has_plrt {
+                if prev != result_cols {
                     return Err(PyValueError::new_err(
                         "inconsistent results columns across chunks",
                     ));
@@ -212,13 +222,28 @@ impl GwasAssocTsvWriter {
             let beta = res[[i, 0]];
             let se = res[[i, 1]];
             let pwald = sanitize_assoc_pvalue(beta, se, res[[i, 2]]);
-            let chisq = chisq_from_beta_se_and_optional_plrt(
-                beta,
-                se,
-                if has_plrt { Some(res[[i, 3]]) } else { None },
-            );
+            let chisq = chisq_from_beta_se_and_optional_plrt(beta, se, None);
             let chisq_txt = format_chisq_value(chisq);
-            if has_plrt {
+            if result_cols == 6 {
+                let _ = writeln!(
+                    self.text_buf,
+                    "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\t{:.6e}\t{:.6e}\t{:.4e}",
+                    s.chrom,
+                    s.pos,
+                    snp[i],
+                    a0,
+                    a1,
+                    maf_arr[i],
+                    miss_arr[i].round() as i64,
+                    beta,
+                    se,
+                    chisq_txt,
+                    pwald,
+                    res[[i, 3]],
+                    res[[i, 4]],
+                    res[[i, 5]]
+                );
+            } else if result_cols == 4 {
                 let _ = writeln!(
                     self.text_buf,
                     "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\t{:.4e}",
@@ -266,21 +291,18 @@ impl GwasAssocTsvWriter {
         if rows == 0 || text.is_empty() {
             return Ok(());
         }
-        match self.with_plrt {
+        let result_cols = if has_plrt { 4usize } else { 3usize };
+        let header = gwas_assoc_header_for_result_cols(result_cols)?;
+        match self.result_cols {
             None => {
-                self.with_plrt = Some(has_plrt);
-                let header: &[u8] = if has_plrt {
-                    b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n"
-                } else {
-                    b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\n"
-                };
+                self.result_cols = Some(result_cols);
                 self.writer = Some(
                     AsyncTsvWriter::with_config(&self.path, header, 64 * 1024 * 1024, 16)
                         .map_err(PyIOError::new_err)?,
                 );
             }
             Some(prev) => {
-                if prev != has_plrt {
+                if prev != result_cols {
                     return Err(PyValueError::new_err(
                         "inconsistent results columns across chunks",
                     ));

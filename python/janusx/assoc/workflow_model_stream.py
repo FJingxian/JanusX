@@ -13,7 +13,6 @@ from typing import Optional, Union
 import numpy as np
 import pandas as pd
 import psutil
-from scipy.stats import chi2
 
 from .workflow import (
     CliStatus,
@@ -21,6 +20,7 @@ from .workflow import (
     FvLMM,
     LM,
     LMM,
+    LMM2,
     _GWAS_PROGRESS_BAR_WIDTH,
     _ProgressAdapter,
     _align_pheno_to_sample_order,
@@ -109,28 +109,31 @@ def _chisq_from_gwas_results(results: np.ndarray) -> np.ndarray:
     if np.any(valid_wald):
         z = beta[valid_wald] / se[valid_wald]
         chisq[valid_wald] = np.square(z)
-
-    if res.shape[1] <= 3:
-        return chisq
-
-    plrt = np.asarray(res[:, 3], dtype=np.float64)
-    valid_plrt = np.isfinite(plrt) & (plrt >= 0.0) & (plrt <= 1.0)
-    if not np.any(valid_plrt):
-        return chisq
-
-    one_mask = valid_plrt & (plrt >= 1.0)
-    if np.any(one_mask):
-        chisq[one_mask] = 0.0
-
-    zero_mask = valid_plrt & (plrt <= 0.0)
-    if np.any(zero_mask):
-        chisq[zero_mask] = np.inf
-
-    mid_mask = valid_plrt & (plrt > 0.0) & (plrt < 1.0)
-    if np.any(mid_mask):
-        chisq[mid_mask] = chi2.isf(plrt[mid_mask], 1)
-
     return chisq
+
+
+def _gwas_result_header_and_extra_cols(res: np.ndarray) -> tuple[str, list[np.ndarray], int]:
+    arr = np.asarray(res, dtype=np.float64)
+    if arr.ndim != 2 or arr.shape[1] < 3:
+        raise ValueError(f"Unexpected GWAS result shape: {arr.shape}")
+    result_cols = int(arr.shape[1])
+    header = "chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald"
+    extras: list[np.ndarray] = []
+    if result_cols == 6:
+        header += "\tlambda\tml\tplrt"
+        extras = [
+            np.char.mod("%.6g", arr[:, 3]),
+            np.char.mod("%.6e", arr[:, 4]),
+            np.char.mod("%.4e", arr[:, 5]),
+        ]
+    elif result_cols == 4:
+        header += "\tplrt"
+        extras = [np.char.mod("%.4e", arr[:, 3])]
+    elif result_cols != 3:
+        raise ValueError(
+            f"Unsupported GWAS result column count: {result_cols} (expected 3, 4, or 6)."
+        )
+    return header, extras, result_cols
 
 
 def _format_chisq_scalar(value: float) -> str:
@@ -280,6 +283,7 @@ def run_chunked_gwas_lmm_lm(
     """
     model_map = {
         "lmm": LMM,
+        "lmm2": LMM2,
         "lm": LM,
         "fastlmm": FastLMM,
         "fvlmm": FvLMM,
@@ -288,6 +292,7 @@ def run_chunked_gwas_lmm_lm(
     ModelCls = model_map[model_key]
     base_model_label = {
         "lmm": "LMM",
+        "lmm2": "LMM2",
         "lm": "LM",
         "fastlmm": "FastLMM",
         "fvlmm": "FvLMM",
@@ -545,7 +550,7 @@ def run_chunked_gwas_lmm_lm(
     # to reduce Python per-chunk orchestration overhead. Keep single-model
     # FvLMM on the dedicated runner when its Rust fastpaths are available.
     if (
-        model_key in {"lmm", "fastlmm", "fvlmm"}
+        model_key in {"lmm", "lmm2", "fastlmm", "fvlmm"}
         and has_prepared_bed_bus
         and not (model_key == "fvlmm" and fvlmm_has_dedicated_bed_fastpath)
         and not (model_key == "lmm" and lmm_has_dedicated_bed_fastpath)
@@ -880,18 +885,18 @@ def run_chunked_gwas_lmm_lm(
                 self.path = str(path)
                 self.batch_chunks = max(1, int(batch_chunks))
                 self._parts: list[str] = []
-                self._has_plrt: Optional[bool] = None
+                self._result_cols: Optional[int] = None
                 self._wrote_header = False
                 self.rows_written = 0
 
-            def append(self, text: str, *, has_plrt: bool, rows: int) -> None:
+            def append(self, text: str, *, result_cols: int, rows: int) -> None:
                 n_rows = int(rows)
                 if n_rows <= 0:
                     return
-                hp = bool(has_plrt)
-                if self._has_plrt is None:
-                    self._has_plrt = hp
-                elif self._has_plrt != hp:
+                rc = int(result_cols)
+                if self._result_cols is None:
+                    self._result_cols = rc
+                elif self._result_cols != rc:
                     raise ValueError(
                         "Inconsistent result columns across chunks while writing GWAS TSV."
                     )
@@ -906,9 +911,9 @@ def run_chunked_gwas_lmm_lm(
                 mode = "a" if self._wrote_header else "w"
                 with open(self.path, mode, encoding="utf-8", newline="") as fh:
                     if not self._wrote_header:
-                        header = "chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald"
-                        if bool(self._has_plrt):
-                            header += "\tplrt"
+                        header, _extras, _result_cols = _gwas_result_header_and_extra_cols(
+                            np.zeros((1, int(self._result_cols or 3)), dtype=np.float64)
+                        )
                         fh.write(header + "\n")
                         self._wrote_header = True
                     fh.write("".join(self._parts))
@@ -954,9 +959,9 @@ def run_chunked_gwas_lmm_lm(
             snp_chunk: list[str],
             maf_chunk: np.ndarray,
             miss_chunk: np.ndarray,
-        ) -> tuple[str, bool, int]:
+        ) -> tuple[str, int, int]:
             if len(info_chunk) == 0:
-                return "", bool(np.asarray(results).shape[1] > 3), 0
+                return "", int(np.asarray(results).shape[1]), 0
             if len(snp_chunk) != len(info_chunk):
                 raise ValueError(
                     "SNP metadata length mismatch while formatting GWAS chunk."
@@ -971,6 +976,7 @@ def run_chunked_gwas_lmm_lm(
                 )
             res = np.asarray(results, dtype=np.float64)
             chisq = _chisq_from_gwas_results(res)
+            _header, extra_cols, result_cols = _gwas_result_header_and_extra_cols(res)
             cols = [
                 np.asarray(chroms, dtype=object),
                 np.asarray(poss, dtype=np.int64).astype(str),
@@ -987,14 +993,12 @@ def run_chunked_gwas_lmm_lm(
                 _format_chisq_output(chisq),
                 np.char.mod("%.4e", res[:, 2]),
             ]
-            has_plrt = bool(res.shape[1] > 3)
-            if has_plrt:
-                cols.append(np.char.mod("%.4e", res[:, 3]))
+            cols.extend(extra_cols)
             rows = np.column_stack(cols)
             text = "\n".join("\t".join(map(str, row)) for row in rows)
             if text:
                 text += "\n"
-            return text, has_plrt, int(rows.shape[0])
+            return text, result_cols, int(rows.shape[0])
 
         def _drain_completed(*, wait_for_one: bool) -> None:
             nonlocal done_snps, peak_rss, pbar, scan_warmup_active, scan_warmup_task
@@ -1023,14 +1027,14 @@ def run_chunked_gwas_lmm_lm(
                         np.asarray(results, dtype=np.float64),
                     )
                 else:
-                    chunk_text, has_plrt, n_rows = _format_chunk_tsv_text(
+                    chunk_text, result_cols, n_rows = _format_chunk_tsv_text(
                         results,
                         meta_chunk,
                         snp_chunk,
                         maf_chunk,
                         miss_chunk,
                     )
-                    writer.append(chunk_text, has_plrt=has_plrt, rows=n_rows)
+                    writer.append(chunk_text, result_cols=result_cols, rows=n_rows)
                 done_snps += int(m_chunk)
                 if pbar is None:
                     if scan_warmup_active and scan_warmup_task is not None:
@@ -1201,7 +1205,7 @@ def run_chunked_gwas_lmm_lm(
                     max_iter=30,
                     tol=1e-2,
                     threads=int(scan_threads),
-                    nullml=null_ml0,
+                    nullml=None,
                     init_log10_lbd=init_log10_lbd,
                     rotate_block_rows=int(model_chunk_size),
                     progress_callback=_fvlmm_unified_progress,
@@ -1312,7 +1316,7 @@ def run_chunked_gwas_lmm_lm(
                                 np.asarray(maf_chunk, dtype=np.float32).ravel().tolist(),
                                 np.asarray(miss_chunk, dtype=np.float32).ravel().tolist(),
                                 threads=scan_threads,
-                                nullml=mod.ML0,
+                                nullml=None,
                             )
                             if blocks is not None and len(blocks) > 0:
                                 block0 = blocks[0]
@@ -1320,7 +1324,7 @@ def run_chunked_gwas_lmm_lm(
                                     block0 = bytes(block0)
                                 writer.append_text(
                                     block0.decode("utf-8") if isinstance(block0, bytes) else block0,
-                                    has_plrt=(mod.ML0 is not None),
+                                    has_plrt=False,
                                     rows=int(n_rows),
                                 )
                                 for blk in blocks[1:]:
@@ -1478,7 +1482,7 @@ def run_chunked_gwas_lmm_lm(
         if (
             header_pve is not None
             and np.isfinite(float(header_pve))
-            and str(effective_model_label).lower() in {"lmm", "fastlmm", "fvlmm"}
+            and str(effective_model_label).lower() in {"lmm", "lmm2", "fastlmm", "fvlmm"}
         ):
             done_msg = f"{effective_model_label} ...pve {float(header_pve):.3f} [{'/'.join(time_parts)}]"
         else:
@@ -1524,7 +1528,7 @@ def run_chunked_gwas_streaming_shared(
     same chunk before moving to the next chunk.
     """
     model_order = [str(m).lower() for m in model_names]
-    model_map = {"lmm": LMM, "lm": LM, "fastlmm": FastLMM, "fvlmm": FvLMM}
+    model_map = {"lmm": LMM, "lmm2": LMM2, "lm": LM, "fastlmm": FastLMM, "fvlmm": FvLMM}
     model_order = [m for m in model_order if m in model_map]
     if len(model_order) == 0:
         return
@@ -1649,18 +1653,18 @@ def run_chunked_gwas_streaming_shared(
             self.path = str(path)
             self.batch_chunks = max(1, int(batch_chunks))
             self._parts: list[str] = []
-            self._has_plrt: Optional[bool] = None
+            self._result_cols: Optional[int] = None
             self._wrote_header = False
             self.rows_written = 0
 
-        def append(self, text: str, *, has_plrt: bool, rows: int) -> None:
+        def append(self, text: str, *, result_cols: int, rows: int) -> None:
             n_rows = int(rows)
             if n_rows <= 0:
                 return
-            hp = bool(has_plrt)
-            if self._has_plrt is None:
-                self._has_plrt = hp
-            elif self._has_plrt != hp:
+            rc = int(result_cols)
+            if self._result_cols is None:
+                self._result_cols = rc
+            elif self._result_cols != rc:
                 raise ValueError(
                     "Inconsistent result columns across chunks while writing GWAS TSV."
                 )
@@ -1675,9 +1679,9 @@ def run_chunked_gwas_streaming_shared(
             mode = "a" if self._wrote_header else "w"
             with open(self.path, mode, encoding="utf-8", newline="") as fh:
                 if not self._wrote_header:
-                    header = "chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald"
-                    if bool(self._has_plrt):
-                        header += "\tplrt"
+                    header, _extras, _result_cols = _gwas_result_header_and_extra_cols(
+                        np.zeros((1, int(self._result_cols or 3)), dtype=np.float64)
+                    )
                     fh.write(header + "\n")
                     self._wrote_header = True
                 fh.write("".join(self._parts))
@@ -1693,9 +1697,9 @@ def run_chunked_gwas_streaming_shared(
         snp_chunk: list[str],
         maf_chunk: np.ndarray,
         miss_chunk: np.ndarray,
-    ) -> tuple[str, bool]:
+    ) -> tuple[str, int]:
         if len(info_chunk) == 0:
-            return "", bool(np.asarray(results).shape[1] > 3)
+            return "", int(np.asarray(results).shape[1])
         if len(snp_chunk) != len(info_chunk):
             raise ValueError("SNP metadata length mismatch while formatting GWAS chunk.")
 
@@ -1709,6 +1713,7 @@ def run_chunked_gwas_streaming_shared(
 
         res = np.asarray(results, dtype=np.float64)
         chisq = _chisq_from_gwas_results(res)
+        _header, extra_cols, result_cols = _gwas_result_header_and_extra_cols(res)
         cols = [
             np.asarray(chroms, dtype=object),
             np.asarray(poss, dtype=np.int64).astype(str),
@@ -1725,17 +1730,15 @@ def run_chunked_gwas_streaming_shared(
             _format_chisq_output(chisq),
             np.char.mod("%.4e", res[:, 2]),
         ]
-        has_plrt = bool(res.shape[1] > 3)
-        if has_plrt:
-            cols.append(np.char.mod("%.4e", res[:, 3]))
+        cols.extend(extra_cols)
 
         out = np.column_stack(cols)
         buf = io.StringIO()
         np.savetxt(buf, out, fmt="%s", delimiter="\t")
-        return buf.getvalue(), has_plrt
+        return buf.getvalue(), result_cols
 
-    model_label_map = {"lmm": "LMM", "lm": "LM", "fastlmm": "FastLMM", "fvlmm": "FvLMM"}
-    kinship_model_keys = {"lmm", "fastlmm", "fvlmm"}
+    model_label_map = {"lmm": "LMM", "lmm2": "LMM2", "lm": "LM", "fastlmm": "FastLMM", "fvlmm": "FvLMM"}
+    kinship_model_keys = {"lmm", "lmm2", "fastlmm", "fvlmm"}
     shared_lmm_model: Optional[LMM] = None
     gm_tag = str(genetic_model).lower()
 
@@ -1785,10 +1788,12 @@ def run_chunked_gwas_streaming_shared(
         init_t0 = time.monotonic()
         if mkey in kinship_model_keys:
             if grm is None:
-                raise ValueError("LMM/FastLMM/FvLMM requires GRM, but GRM was not prepared.")
+                raise ValueError("LMM/LMM2/FastLMM/FvLMM requires GRM, but GRM was not prepared.")
             if shared_lmm_model is not None:
                 if mkey == "lmm":
                     mod = LMM.from_lmm(shared_lmm_model)
+                elif mkey == "lmm2":
+                    mod = LMM2.from_lmm(shared_lmm_model)
                 elif mkey == "fastlmm":
                     mod = FastLMM.from_lmm(shared_lmm_model)
                 else:
@@ -1823,15 +1828,14 @@ def run_chunked_gwas_streaming_shared(
                                 eigvecs=eigvecs,
                                 evd_secs=float(_evd_elapsed),
                             )
-                            mod = (
-                                LMM.from_lmm(shared_lmm_model)
-                                if mkey == "lmm"
-                                else (
-                                    FastLMM.from_lmm(shared_lmm_model)
-                                    if mkey == "fastlmm"
-                                    else FvLMM.from_lmm(shared_lmm_model)
-                                )
-                            )
+                            if mkey == "lmm":
+                                mod = LMM.from_lmm(shared_lmm_model)
+                            elif mkey == "lmm2":
+                                mod = LMM2.from_lmm(shared_lmm_model)
+                            elif mkey == "fastlmm":
+                                mod = FastLMM.from_lmm(shared_lmm_model)
+                            else:
+                                mod = FvLMM.from_lmm(shared_lmm_model)
                     except Exception:
                         task.fail(f"{evd_desc} ...Failed")
                         raise
@@ -1859,7 +1863,7 @@ def run_chunked_gwas_streaming_shared(
                 f"null PVE={prev_pve:.4f} (>0.995)."
             )
             if shared_lmm_model is not None:
-                mod = LMM.from_lmm(shared_lmm_model)
+                mod = LMM2.from_lmm(shared_lmm_model) if mkey == "lmm2" else LMM.from_lmm(shared_lmm_model)
             else:
                 lmm_t0 = time.monotonic()
                 stage_threads = max(1, int(threads))
@@ -1880,7 +1884,7 @@ def run_chunked_gwas_streaming_shared(
                         eigvecs=eigvecs,
                         evd_secs=float(_evd_elapsed),
                     )
-                    mod = LMM.from_lmm(shared_lmm_model)
+                    mod = LMM2.from_lmm(shared_lmm_model) if mkey == "lmm2" else LMM.from_lmm(shared_lmm_model)
                 ctx["evd_secs"] = float(ctx["evd_secs"]) + max(time.monotonic() - lmm_t0, 0.0)
             effective_model_key = "lmm"
             effective_model_label = "LMM"
@@ -2123,14 +2127,14 @@ def run_chunked_gwas_streaming_shared(
                 ]
                 if len(info_chunk) == 0:
                     continue
-                chunk_text, has_plrt = _format_chunk_tsv_text(
+                chunk_text, result_cols = _format_chunk_tsv_text(
                     results,
                     info_chunk,
                     snp_chunk,
                     maf_chunk,
                     miss_chunk,
                 )
-                writer.append(chunk_text, has_plrt=bool(has_plrt), rows=m_chunk)
+                writer.append(chunk_text, result_cols=result_cols, rows=m_chunk)
             ctx["has_results"] = True
 
             mem_info = process.memory_info()
@@ -2305,7 +2309,7 @@ def run_chunked_gwas_streaming_shared(
         out_tsv = str(ctx["out_tsv"])
         viz_secs = 0.0
         ctx_pve: Optional[float] = None
-        if str(ctx.get("model_key", "")) in {"lmm", "fastlmm", "fvlmm"}:
+        if str(ctx.get("model_key", "")) in {"lmm", "lmm2", "fastlmm", "fvlmm"}:
             mod_obj = ctx.get("mod")
             if mod_obj is not None and hasattr(mod_obj, "pve"):
                 try:
@@ -2379,7 +2383,7 @@ def run_chunked_gwas_streaming_shared(
         if (
             ctx_pve is not None
             and np.isfinite(float(ctx_pve))
-            and str(model_label).lower() in {"lmm", "fastlmm", "fvlmm"}
+            and str(model_label).lower() in {"lmm", "lmm2", "fastlmm", "fvlmm"}
         ):
             done_msg = f"{model_label} ...pve {float(ctx_pve):.3f} [{'/'.join(time_parts)}]"
         else:

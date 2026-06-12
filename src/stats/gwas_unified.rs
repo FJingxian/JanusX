@@ -242,6 +242,7 @@ pub fn gwas_trait_model_dispatch_v2<'py>(
         let norm = match mk.as_str() {
             "lm" => Some("lm"),
             "lmm" => Some("lmm"),
+            "lmm2" => Some("lmm2"),
             "fastlmm" => Some("fastlmm"),
             "fvlmm" => Some("fvlmm"),
             "algwas" => Some("algwas"),
@@ -267,6 +268,7 @@ pub fn gwas_trait_model_dispatch_v2<'py>(
             let route = match model_name.as_str() {
                 "lm" => "lm_packed",
                 "lmm" => "lmm_packed",
+                "lmm2" => "lmm2_stream",
                 "fastlmm" => {
                     if use_packed_fastlmm {
                         "fastlmm_packed"

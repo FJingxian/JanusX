@@ -36,6 +36,7 @@ from typing import Any, Callable, Dict, Optional, Tuple, Union
 
 import numpy as np
 from scipy.linalg import eigh, cho_factor, cho_solve
+from scipy.optimize import minimize_scalar
 try:
     from scipy.special import erfc as _sp_erfc
 except Exception:
@@ -231,6 +232,7 @@ except Exception:
 try:
     from janusx.janusx import (
         lmm_reml_chunk_from_snp_f32 as _lmm_reml_chunk_from_snp_f32,
+        lmm_reml_lmm2_chunk_from_snp_f32 as _lmm_reml_lmm2_chunk_from_snp_f32,
         lmm_assoc_chunk_from_snp_f32 as _lmm_assoc_chunk_from_snp_f32,
         fvlmm_assoc_chunk_f32 as _fvlmm_assoc_chunk_f32,
         fvlmm_assoc_chunk_from_snp_f32 as _fvlmm_assoc_chunk_from_snp_f32,
@@ -242,6 +244,7 @@ try:
     )
 except Exception:
     _lmm_reml_chunk_from_snp_f32 = None
+    _lmm_reml_lmm2_chunk_from_snp_f32 = None
     _lmm_assoc_chunk_from_snp_f32 = None
     _fvlmm_assoc_chunk_f32 = None
     _fvlmm_assoc_chunk_from_snp_f32 = None
@@ -814,6 +817,60 @@ def lmm_reml_from_snp(
     return beta_se_p
 
 
+def lmm_reml_lmm2_from_snp(
+    S: np.ndarray,
+    utx: np.ndarray,
+    uty: np.ndarray,
+    snp_chunk: np.ndarray,
+    u_t: np.ndarray,
+    bounds: tuple,
+    *,
+    nullml: float,
+    max_iter: int = 30,
+    tol: float = 1e-2,
+    threads: int = 4,
+    rotate_block_rows: int = 256,
+) -> np.ndarray:
+    """
+    LMM2 scan on raw SNP chunk with per-SNP REML + ML optimization.
+
+    Output columns:
+      beta, se, pwald, lambda_reml, ml_alt, plrt
+    """
+    if _lmm_reml_lmm2_chunk_from_snp_f32 is None:
+        raise RuntimeError(
+            "Rust extension missing lmm_reml_lmm2_chunk_from_snp_f32. "
+            "Rebuild janusx extension for Rust-only GWAS mode."
+        )
+
+    rotate_block_rows = _resolve_raw_snp_rotate_block_rows(
+        rotate_block_rows,
+        default_rows=256,
+        env_row_names=("JX_LMM_ROTATE_BLOCK_ROWS",),
+        snp_chunk=snp_chunk,
+    )
+    low, high = bounds
+    S = np.ascontiguousarray(S, dtype=np.float64).ravel()
+    utx = np.ascontiguousarray(utx, dtype=np.float64)
+    uty = np.ascontiguousarray(uty, dtype=np.float64).ravel()
+    snp_chunk = np.ascontiguousarray(snp_chunk, dtype=np.float32)
+    u_t = np.ascontiguousarray(u_t, dtype=np.float32)
+    return _lmm_reml_lmm2_chunk_from_snp_f32(
+        S,
+        utx,
+        uty,
+        float(low),
+        float(high),
+        snp_chunk,
+        u_t,
+        float(nullml),
+        int(max_iter),
+        float(tol),
+        int(threads),
+        int(rotate_block_rows),
+    )
+
+
 def lmm_reml_null(
     S: np.ndarray,
     utx: np.ndarray,
@@ -871,6 +928,46 @@ def lmm_reml_null(
         float(tol),
     )
     return lbd, ml, reml
+
+
+def lmm_ml_null(
+    S: np.ndarray,
+    utx: np.ndarray,
+    uty: np.ndarray,
+    bounds: tuple,
+    max_iter: int = 30,
+    tol: float = 1e-2,
+) -> tuple[float, float]:
+    """
+    Null-model ML optimization on the same spectralized residualized path.
+
+    Returns
+    -------
+    lbd_ml : float
+        Null-model ML-optimal lambda.
+    ml0 : float
+        Null-model ML log-likelihood at that optimum.
+    """
+    S = np.ascontiguousarray(S, dtype=np.float64).ravel()
+    utx = np.ascontiguousarray(utx, dtype=np.float64)
+    uty = np.ascontiguousarray(uty, dtype=np.float64).ravel()
+    low, high = (float(bounds[0]), float(bounds[1]))
+    if not (np.isfinite(low) and np.isfinite(high) and low < high):
+        raise ValueError(f"Invalid bounds for null ML optimization: {bounds}")
+
+    def _objective(log10_lbd: float) -> float:
+        ml = float(ml_loglike_null_f32(S, utx, uty, float(log10_lbd)))
+        return -ml if np.isfinite(ml) else 1e300
+
+    opt = minimize_scalar(
+        _objective,
+        bounds=(low, high),
+        method="bounded",
+        options={"maxiter": int(max_iter), "xatol": float(tol)},
+    )
+    best_log10 = float(opt.x)
+    ml0 = float(ml_loglike_null_f32(S, utx, uty, best_log10))
+    return float(10.0 ** best_log10), ml0
 
 
 def fastlmm_reml_null(
@@ -1819,7 +1916,7 @@ class LMM:
                 max_iter=30,
                 tol=1e-2,
                 threads=threads,
-                nullml=self.ML0,
+                nullml=None,
                 model="add",
             )
         beta_se_p = lmm_reml_from_snp(
@@ -1832,9 +1929,48 @@ class LMM:
             max_iter=30,
             tol=1e-2,
             threads=threads,
-            nullml=self.ML0,
+            nullml=None,
         )
         return beta_se_p
+
+
+class LMM2(LMM):
+    """
+    Exact LMM scan with Wald beta/se plus per-SNP ML likelihood for PLRT.
+
+    Output columns:
+      beta, se, pwald, lambda_reml, ml_alt, plrt
+    """
+
+    def gwas(self, snp: np.ndarray, threads: int = 1) -> np.ndarray:
+        if bool(getattr(self, "lowrank", False)):
+            raise RuntimeError(
+                "LMM2 currently requires the full-rank spectral LMM path."
+            )
+        ml0_exact = getattr(self, "_lmm2_ml0_exact", None)
+        if ml0_exact is None or (not np.isfinite(float(ml0_exact))):
+            lbd_ml, ml0_exact = lmm_ml_null(
+                self.S,
+                self.Xcov,
+                self.y,
+                self.bounds,
+                max_iter=30,
+                tol=1e-2,
+            )
+            self._lmm2_lbd_null_ml = float(lbd_ml)
+            self._lmm2_ml0_exact = float(ml0_exact)
+        return lmm_reml_lmm2_from_snp(
+            self.S,
+            self.Xcov,
+            self.y,
+            snp,
+            self.Dh,
+            self.bounds,
+            max_iter=30,
+            tol=1e-2,
+            threads=threads,
+            nullml=float(ml0_exact),
+        )
 
 
 class FastLMM(LMM):
@@ -1858,7 +1994,7 @@ class FastLMM(LMM):
                 np.ascontiguousarray(np.asarray(snp, dtype=np.float32), dtype=np.float32),
                 self.u1t,
                 threads=threads,
-                nullml=self.ML0,
+                nullml=None,
             )
         beta_se_p = lmm_assoc_fixed_from_snp(
             self.S,
@@ -1868,7 +2004,7 @@ class FastLMM(LMM):
             snp,
             self.Dh,
             threads=threads,
-            nullml=self.ML0,
+            nullml=None,
         )
         return beta_se_p
 
@@ -1934,7 +2070,7 @@ class FvLMM(LMM):
                 cache,
                 utsnp_chunk,
                 threads=threads,
-                nullml=self.ML0,
+                nullml=None,
             )
         return fvlmm_assoc_fixed(
             self.S,
@@ -1943,7 +2079,7 @@ class FvLMM(LMM):
             log10_lbd,
             utsnp_chunk,
             threads=threads,
-            nullml=self.ML0,
+            nullml=None,
         )
 
     def gwas(self, snp: np.ndarray, threads: int = 1) -> np.ndarray:
@@ -1963,7 +2099,7 @@ class FvLMM(LMM):
                 np.ascontiguousarray(np.asarray(snp, dtype=np.float32), dtype=np.float32),
                 self.u1t,
                 threads=threads,
-                nullml=self.ML0,
+                nullml=None,
             )
         cache = self._ensure_assoc_cache(log10_lbd)
         if cache is not None and _fvlmm_assoc_chunk_from_snp_with_cache_f32 is not None:
@@ -1972,7 +2108,7 @@ class FvLMM(LMM):
                 snp,
                 self.Dh,
                 threads=threads,
-                nullml=self.ML0,
+                nullml=None,
             )
         return fvlmm_assoc_fixed_from_snp(
             self.S,
@@ -1982,7 +2118,7 @@ class FvLMM(LMM):
             snp,
             self.Dh,
             threads=threads,
-            nullml=self.ML0,
+            nullml=None,
         )
 
 
@@ -2026,24 +2162,19 @@ class LM:
 
         Returns
         -------
-        beta_se_p_plrt : np.ndarray, shape (m, 4)
-            Columns: beta, se, pwald, plrt.
+        beta_se_p : np.ndarray, shape (m, 3)
+            Columns: beta, se, pwald.
         """
-        beta_se_p = FEM(
-            self.y,
-            self.X,
-            snp,
-            snp.shape[0],
-            threads,
-            ixx=self.ixx,
-        )[:, [0, 1, -1]]
-        n = int(self.y.shape[0])
-        q0 = int(self.X.shape[1])
-        df = int(n - q0 - 1)
-        plrt = _lm_plrt_from_beta_se(beta_se_p[:, 0], beta_se_p[:, 1], n_obs=n, df=df)
-        return np.concatenate(
-            [np.asarray(beta_se_p, dtype=np.float64), plrt.reshape(-1, 1)],
-            axis=1,
+        return np.asarray(
+            FEM(
+                self.y,
+                self.X,
+                snp,
+                snp.shape[0],
+                threads,
+                ixx=self.ixx,
+            )[:, [0, 1, 2]],
+            dtype=np.float64,
         )
 
 

@@ -1,6 +1,6 @@
 use crate::bedmath::{decode_plink_bed_hardcall, packed_row_missing_count_selected};
 use crate::linalg::{
-    chi2_sf_df1, chi2_stat_df1_from_sf, format_chisq_value, sanitize_assoc_pvalue,
+    chisq_from_beta_se_and_optional_plrt, format_chisq_value, sanitize_assoc_pvalue,
 };
 use crate::math_farmcpu::{
     decode_dense_rows_to_sample_major, decode_packed_rows_to_sample_major,
@@ -118,15 +118,6 @@ fn student_t_p_two_sided(t: f64, df: i32) -> f64 {
         p = 1.0;
     }
     p.clamp(f64::MIN_POSITIVE, 1.0)
-}
-
-#[inline]
-fn lm_plrt_from_t2(t2: f64, n_obs: usize, df: i32) -> f64 {
-    if df <= 0 || !t2.is_finite() || t2 < 0.0 {
-        return f64::NAN;
-    }
-    let stat = (n_obs as f64) * (1.0 + t2 / (df as f64)).ln();
-    chi2_sf_df1(stat)
 }
 
 #[inline]
@@ -624,8 +615,7 @@ fn write_farmcpu_packed_main_scan(
         }
     }
     let yy: f64 = y.iter().map(|v| v * v).sum();
-    let df = (n as i32) - (q0 as i32) - 1;
-    let can_plrt = df > 0;
+    let _df = (n as i32) - (q0 as i32) - 1;
     let pool = get_cached_pool(threads).map_err(|e| e.to_string())?;
     let row_block = 8192usize;
     let mut stats_buf = vec![f64::NAN; row_block * 3];
@@ -727,24 +717,11 @@ fn write_farmcpu_packed_main_scan(
                     pwald = qtn_min_p[j];
                 }
             }
-            let plrt = if can_plrt && beta.is_finite() && se.is_finite() && se > 0.0 {
-                let t2 = (beta / se) * (beta / se);
-                lm_plrt_from_t2(t2, n, df)
-            } else {
-                f64::NAN
-            };
-            let chisq = if plrt.is_finite() {
-                chi2_stat_df1_from_sf(plrt)
-            } else if beta.is_finite() && se.is_finite() && se > 0.0 {
-                let z = beta / se;
-                z * z
-            } else {
-                f64::NAN
-            };
+            let chisq = chisq_from_beta_se_and_optional_plrt(beta, se, None);
             let chisq_txt = format_chisq_value(chisq);
             let _ = write!(
                 text_buf,
-                "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\t{:.4e}\n",
+                "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\n",
                 chrom[i],
                 pos[i],
                 snp[i],
@@ -755,15 +732,14 @@ fn write_farmcpu_packed_main_scan(
                 beta,
                 se,
                 chisq_txt,
-                pwald,
-                plrt
+                pwald
             );
             if let Some(ref mut qtn_text_buf) = qtn_text_buf_opt {
                 if qtn_lookup.contains_key(&i) {
                     qtn_rows_written += 1;
                     let _ = write!(
                         qtn_text_buf,
-                        "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\t{:.4e}\n",
+                        "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\n",
                         chrom[i],
                         pos[i],
                         snp[i],
@@ -774,8 +750,7 @@ fn write_farmcpu_packed_main_scan(
                         beta,
                         se,
                         chisq_txt,
-                        pwald,
-                        plrt
+                        pwald
                     );
                 }
             }
@@ -1720,7 +1695,7 @@ pub fn farmcpu_packed_to_tsv(
         let out_path = out_tsv.to_string();
         let writer = AsyncTsvWriter::with_config(
             &out_path,
-            b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n",
+            b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\n",
             64 * 1024 * 1024,
             4,
         )
@@ -1731,13 +1706,13 @@ pub fn farmcpu_packed_to_tsv(
         if let Some(pseudo_path) = pseudo_tsv {
             if !qtn_idx.is_empty() {
                 qtn_path_for_err = pseudo_path.to_string();
-                qtn_writer_opt = Some(
-                    AsyncTsvWriter::with_config(
-                        &qtn_path_for_err,
-                        b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n",
-                        16 * 1024 * 1024,
-                        4,
-                    )
+                    qtn_writer_opt = Some(
+                        AsyncTsvWriter::with_config(
+                            &qtn_path_for_err,
+                            b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\n",
+                            16 * 1024 * 1024,
+                            4,
+                        )
                     .map_err(PyRuntimeError::new_err)?,
                 );
             }
@@ -1850,13 +1825,11 @@ pub fn farmcpu_write_assoc_tsv(
         )));
     }
 
-    let n_f = n_obs as f64;
-    let df_f = df as f64;
-    let can_plrt = n_obs > 0 && df > 0;
+    let _ = (n_obs, df);
 
     let writer = AsyncTsvWriter::with_config(
         out_tsv,
-        b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n",
+        b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\n",
         4 * 1024 * 1024,
         4,
     )
@@ -1866,26 +1839,12 @@ pub fn farmcpu_write_assoc_tsv(
     for i in 0..m {
         let b = beta[i];
         let s = se[i];
-        let plrt = if can_plrt && b.is_finite() && s.is_finite() && s > 0.0 {
-            let t2 = (b / s) * (b / s);
-            let stat = n_f * (1.0 + t2 / df_f).ln();
-            chi2_sf_df1(stat)
-        } else {
-            f64::NAN
-        };
-        let chisq = if plrt.is_finite() {
-            chi2_stat_df1_from_sf(plrt)
-        } else if b.is_finite() && s.is_finite() && s > 0.0 {
-            let z = b / s;
-            z * z
-        } else {
-            f64::NAN
-        };
+        let chisq = chisq_from_beta_se_and_optional_plrt(b, s, None);
         let chisq_txt = format_chisq_value(chisq);
         let pwald_txt = sanitize_assoc_pvalue(b, s, pwald[i]);
         writeln!(
             text_buf,
-            "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\t{:.4e}",
+            "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}",
             chrom[i],
             pos[i],
             snp[i],
@@ -1896,8 +1855,7 @@ pub fn farmcpu_write_assoc_tsv(
             b,
             s,
             chisq_txt,
-            pwald_txt,
-            plrt
+            pwald_txt
         )
         .map_err(|e| PyRuntimeError::new_err(format!("format row {i} for {out_tsv}: {e}")))?;
         if (i + 1) % 8192 == 0 {
@@ -1934,7 +1892,7 @@ pub fn farmcpu_write_assoc_tsv(
         if !uniq.is_empty() {
             let q_writer = AsyncTsvWriter::with_config(
                 pseudo_path,
-                b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n",
+                b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\n",
                 512 * 1024,
                 4,
             )
@@ -1943,26 +1901,12 @@ pub fn farmcpu_write_assoc_tsv(
             for &idx in uniq.iter() {
                 let b = beta[idx];
                 let s = se[idx];
-                let plrt = if can_plrt && b.is_finite() && s.is_finite() && s > 0.0 {
-                    let t2 = (b / s) * (b / s);
-                    let stat = n_f * (1.0 + t2 / df_f).ln();
-                    chi2_sf_df1(stat)
-                } else {
-                    f64::NAN
-                };
-                let chisq = if plrt.is_finite() {
-                    chi2_stat_df1_from_sf(plrt)
-                } else if b.is_finite() && s.is_finite() && s > 0.0 {
-                    let z = b / s;
-                    z * z
-                } else {
-                    f64::NAN
-                };
+                let chisq = chisq_from_beta_se_and_optional_plrt(b, s, None);
                 let chisq_txt = format_chisq_value(chisq);
                 let pwald_txt = sanitize_assoc_pvalue(b, s, pwald[idx]);
                 writeln!(
                     q_text_buf,
-                    "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\t{:.4e}",
+                    "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}",
                     chrom[idx],
                     pos[idx],
                     snp[idx],
@@ -1973,8 +1917,7 @@ pub fn farmcpu_write_assoc_tsv(
                     b,
                     s,
                     chisq_txt,
-                    pwald_txt,
-                    plrt
+                    pwald_txt
                 )
                 .map_err(|e| {
                     PyRuntimeError::new_err(format!("format qtn row {idx} for {pseudo_path}: {e}"))

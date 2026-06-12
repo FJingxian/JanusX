@@ -157,6 +157,7 @@ from janusx.script._common.colspec import parse_zero_based_index_specs
 from janusx.script._common.threads import (
     detect_thread_budget_info,
     detect_rust_blas_backend,
+    format_requested_thread_usage,
     format_thread_budget_summary,
     get_rust_blas_threads,
     maybe_warn_non_openblas,
@@ -14630,7 +14631,14 @@ def _run_gs_pipeline(
                 (
                     "Runtime",
                     [
-                        ("Threads", f"{int(args.thread)} (local effective {detected_threads})"),
+                        (
+                            "Threads",
+                            format_requested_thread_usage(
+                                requested_threads=int(requested_threads),
+                                using_threads=int(args.thread),
+                                detected_threads=int(detected_threads),
+                            ),
+                        ),
                         ("CV", cv_cfg),
                         ("Model mode", ("on" if model_mode else "off")),
                         (

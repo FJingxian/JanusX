@@ -58,6 +58,7 @@ from ._common.threads import (
     apply_blas_thread_env,
     detect_rust_blas_backend,
     detect_effective_threads,
+    format_requested_thread_usage,
     get_rust_blas_threads,
     maybe_warn_non_openblas,
     require_openblas_by_default,
@@ -889,7 +890,14 @@ def main(log: bool = True):
             [
                 ("Dense GRM file", gfile),
                 ("Sparse GRM cutoff", "disabled" if args.sparse is None else args.sparse),
-                ("Threads", f"{args.thread} ({detected_threads} available)"),
+                (
+                    "Threads",
+                    format_requested_thread_usage(
+                        requested_threads=int(requested_threads),
+                        using_threads=int(args.thread),
+                        detected_threads=int(detected_threads),
+                    ),
+                ),
                 ("Save as NPY", args.npy),
             ]
             if getattr(args, "dense_grm", None)
@@ -901,7 +909,14 @@ def main(log: bool = True):
                 ("Missing rate", args.geno),
                 ("Memory MB", args.memory),
                 ("Stage timing", bool(args.stage_timing or spgrm_timing_enabled)),
-                ("Threads", f"{args.thread} ({detected_threads} available)"),
+                (
+                    "Threads",
+                    format_requested_thread_usage(
+                        requested_threads=int(requested_threads),
+                        using_threads=int(args.thread),
+                        detected_threads=int(detected_threads),
+                    ),
+                ),
                 ("BED backend", bed_backend_policy),
                 ("Save as NPY", args.npy),
             ]

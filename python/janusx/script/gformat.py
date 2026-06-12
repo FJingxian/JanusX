@@ -101,7 +101,11 @@ from ._common.pathcheck import (
 from ._common.progress import ProgressAdapter
 from ._common.status import CliStatus, log_success, stdout_is_tty
 from ._common.genocache import configure_genotype_cache_from_out
-from ._common.threads import apply_blas_thread_env, detect_effective_threads
+from ._common.threads import (
+    apply_blas_thread_env,
+    detect_effective_threads,
+    format_requested_thread_usage,
+)
 
 
 def _normalize_chr_key(chrom: str) -> str:
@@ -1736,7 +1740,14 @@ def main() -> None:
                             else "Rust (default)"
                         ),
                     ),
-                    ("Threads", int(args.thread)),
+                    (
+                        "Threads",
+                        format_requested_thread_usage(
+                            requested_threads=int(requested_threads),
+                            using_threads=int(args.thread),
+                            detected_threads=int(detected_threads),
+                        ),
+                    ),
                     ("Chr filter", ",".join(sorted(chr_keys)) if chr_keys else "None"),
                     ("BP range", f"{args.from_bp if args.from_bp is not None else '-'}..{args.to_bp if args.to_bp is not None else '-'}"),
                     ("MAF threshold", float(args.maf)),

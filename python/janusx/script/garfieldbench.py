@@ -42,7 +42,7 @@ from janusx.script._common.pathcheck import (
     format_path_for_display,
 )
 from janusx.script._common.status import CliStatus, log_success
-from janusx.script._common.threads import detect_effective_threads
+from janusx.script._common.threads import detect_effective_threads, format_requested_thread_usage
 from janusx.script.simulation import simulate_phenotype_from_genofile, write_phenotypes, write_sites
 
 
@@ -692,8 +692,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     if float(args.region_flank_mb) <= 0:
         logger.error("--region-flank-mb must be > 0")
         return 1
+    detected_threads = int(detect_effective_threads())
+    requested_threads = int(args.thread)
     if int(args.thread) <= 0:
-        args.thread = int(detect_effective_threads())
+        args.thread = int(detected_threads)
     if args.step is not None and int(args.step) <= 0:
         logger.error("-step/--step must be > 0")
         return 1
@@ -732,7 +734,14 @@ def main(argv: Optional[list[str]] = None) -> int:
                     ("Hit top-K", int(args.top_k_hit)),
                     ("Hit mode", str(args.hit_mode)),
                     ("Hit LD r2", float(args.hit_ld_r2)),
-                    ("Threads", int(args.thread)),
+                    (
+                        "Threads",
+                        format_requested_thread_usage(
+                            requested_threads=int(requested_threads),
+                            using_threads=int(args.thread),
+                            detected_threads=int(detected_threads),
+                        ),
+                    ),
                 ],
             )
         ],

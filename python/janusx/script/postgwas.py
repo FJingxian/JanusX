@@ -50,6 +50,7 @@ from ._common.config_render import get_config_color_styles
 from ._common.threads import (
     apply_blas_thread_env,
     detect_effective_threads,
+    format_requested_thread_usage,
     maybe_warn_non_openblas,
     require_openblas_by_default,
 )
@@ -5156,7 +5157,11 @@ def main():
     bimrange_text = _format_bimrange_summary(args.bimrange_tuples)
     merge_map_rows = [(str(i), str(file)) for i, file in enumerate(args.merge_files)] if args.merge_mode else []
     output_prefix_text = outprefix_base
-    threads_text = f"{args.thread} ({detected_threads} available)"
+    threads_text = format_requested_thread_usage(
+        requested_threads=int(requested_threads),
+        using_threads=int(args.thread),
+        detected_threads=int(detected_threads),
+    )
 
     base_rows: list[tuple[str, str]] = [
         ("Input files", input_files_text),

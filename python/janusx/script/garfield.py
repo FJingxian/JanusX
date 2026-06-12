@@ -33,7 +33,11 @@ from janusx.script._common.pathcheck import (
 )
 from janusx.script._common.progress import ProgressAdapter, build_rich_progress, rich_progress_available
 from janusx.script._common.status import CliStatus, log_success, print_failure, stdout_is_tty, success_symbol
-from janusx.script._common.threads import apply_outer_thread_cap, detect_effective_threads
+from janusx.script._common.threads import (
+    apply_outer_thread_cap,
+    detect_effective_threads,
+    format_requested_thread_usage,
+)
 from janusx.assoc.workflow_ui import _emit_plain_info_line
 
 
@@ -875,6 +879,7 @@ def main() -> None:
         parser.error(str(e))
 
     detected_threads = detect_effective_threads()
+    requested_threads = int(args.thread)
     if int(args.thread) <= 0:
         args.thread = int(detected_threads)
     if int(args.thread) > int(detected_threads):
@@ -963,7 +968,17 @@ def main() -> None:
         config_title="GARFIELD CONFIG",
         host=socket.gethostname(),
         sections=[("General", general_rows)],
-        footer_rows=[("Threads", f"{int(args.thread)} ({int(detected_threads)} available)"), ("Output prefix", outprefix)],
+        footer_rows=[
+            (
+                "Threads",
+                format_requested_thread_usage(
+                    requested_threads=int(requested_threads),
+                    using_threads=int(args.thread),
+                    detected_threads=int(detected_threads),
+                ),
+            ),
+            ("Output prefix", outprefix),
+        ],
         line_max_chars=60,
     )
     # logger.info(

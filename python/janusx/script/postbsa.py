@@ -52,6 +52,7 @@ from ._common.progress import build_rich_progress, rich_progress_available
 from ._common.threads import (
     apply_blas_thread_env,
     detect_effective_threads,
+    format_requested_thread_usage,
     maybe_warn_non_openblas,
     require_openblas_by_default,
 )
@@ -1890,7 +1891,14 @@ def main() -> None:
             )
         ],
         footer_rows=[
-            ("Threads", f"{args.thread} ({detected_threads} available)"),
+            (
+                "Threads",
+                format_requested_thread_usage(
+                    requested_threads=int(requested_threads),
+                    using_threads=int(args.thread),
+                    detected_threads=int(detected_threads),
+                ),
+            ),
             ("Parallel jobs", worker_count if len(input_files) > 1 else 1),
             ("Output stem", output_stem),
         ],

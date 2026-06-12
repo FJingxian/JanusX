@@ -119,6 +119,7 @@ from janusx.script._common.threads import (
     detect_effective_threads,
     detect_thread_budget_info,
     format_affinity_cpu_summary,
+    format_requested_thread_usage,
     format_thread_budget_summary,
     maybe_warn_non_openblas,
     runtime_thread_stage,
@@ -6430,7 +6431,14 @@ def _run_gwas_pipeline(
         if args.splmm:
             cfg_rows.append(("SparseLMM sparse", True))
         footer_rows: list[tuple[str, object]] = [
-            ("Threads", f"{args.thread} (local effective {detected_threads})"),
+            (
+                "Threads",
+                format_requested_thread_usage(
+                    requested_threads=int(requested_threads),
+                    using_threads=int(args.thread),
+                    detected_threads=int(detected_threads),
+                ),
+            ),
             ("Output prefix", outprefix),
         ]
         if terminal_rich:

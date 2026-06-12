@@ -25,7 +25,7 @@ from ._common.pathcheck import (
     format_path_for_display,
 )
 from ._common.status import CliStatus, format_elapsed, log_success
-from ._common.threads import detect_effective_threads
+from ._common.threads import detect_effective_threads, format_requested_thread_usage
 
 try:
     from janusx import janusx as jxrs
@@ -542,6 +542,8 @@ def main() -> None:
         parser.error("select at least one statistic: -freq / -miss / -het / -ldsc")
     if int(args.threads) <= 0:
         parser.error("--threads must be > 0")
+    detected_threads = int(detect_effective_threads())
+    requested_threads = int(args.threads)
 
     gfile, auto_prefix = determine_genotype_source(
         vcf=getattr(args, "vcf", None),
@@ -602,7 +604,14 @@ def main() -> None:
             (
                 "Runtime",
                 [
-                    ("Threads", int(args.threads)),
+                    (
+                        "Threads",
+                        format_requested_thread_usage(
+                            requested_threads=int(requested_threads),
+                            using_threads=int(args.threads),
+                            detected_threads=int(detected_threads),
+                        ),
+                    ),
                     ("BED-cache for non-bfile", True),
                     ("Log file", log_path),
                 ],

@@ -41,6 +41,7 @@ from ._common.status import CliStatus, log_success, print_failure, print_success
 from ._common.threads import (
     apply_blas_thread_env,
     detect_effective_threads,
+    format_requested_thread_usage,
     maybe_warn_non_openblas,
     require_openblas_by_default,
 )
@@ -766,6 +767,7 @@ def _run_single_k(
     total_k: int,
     args: argparse.Namespace,
     detected_threads: int,
+    requested_threads: int,
     resolved_threads: int,
     enable_spinner: bool,
     emit_config_to_stdout: bool,
@@ -834,7 +836,14 @@ def _run_single_k(
                 (
                     "Runtime",
                     [
-                        ("Threads", f"{int(resolved_threads)} ({detected_threads} available)"),
+                        (
+                            "Threads",
+                            format_requested_thread_usage(
+                                requested_threads=int(requested_threads),
+                                using_threads=int(resolved_threads),
+                                detected_threads=int(detected_threads),
+                            ),
+                        ),
                         ("Seed", int(args.seed)),
                     ],
                 ),
@@ -1297,6 +1306,7 @@ def main() -> None:
                 total_k=int(len(k_values)),
                 args=args,
                 detected_threads=int(detected_threads),
+                requested_threads=int(requested_threads),
                 resolved_threads=int(resolved_threads),
                 enable_spinner=bool(enable_spinner),
                 emit_config_to_stdout=bool(not multi_k),

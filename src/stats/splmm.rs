@@ -46,7 +46,6 @@ use crate::splmm_approx::{
 use crate::stats_common::{env_truthy, get_cached_pool, parse_index_vec_i64};
 
 const SPLMM_TINY: f64 = 1e-30_f64;
-const SPLMM_EXACT_PG_MIN_REL_SM: f64 = 1e-4_f64;
 const SPLMM_DEFAULT_RHAT_MARKERS: usize = 30;
 const SPLMM_DEFAULT_RHAT_SEED: u64 = 20260527;
 const SPLMM_DEFAULT_SPARSE_CHOLESKY_MAX_L_NNZ: usize = 100_000_000;
@@ -2384,18 +2383,21 @@ fn xt_mat_rhs_block(
         // 2) Treat c_block as C_col(p×rows) in column-major. This is byte-identical
         // to rows_here×p row-major, so we can feed it straight into GEMM and then
         // reuse the same buffer as per-SNP contiguous row slices without copying.
+        //
+        // X has already been converted to an n×p column-major matrix, so
+        // X^T Z must use TRANS on X with lda=n.
         debug_assert_eq!(c_block.len(), rows_here.saturating_mul(p));
         unsafe {
             cblas_dgemm_dispatch(
                 CBLAS_COL_MAJOR,
-                CBLAS_NO_TRANS,
+                CBLAS_TRANS,
                 CBLAS_NO_TRANS,
                 p as CblasInt,
                 rows_here as CblasInt,
                 n as CblasInt,
                 1.0_f64,
                 x_col.as_ptr(),
-                p as CblasInt,
+                n as CblasInt,
                 z_col_major.as_ptr(),
                 n as CblasInt,
                 0.0_f64,
@@ -2420,15 +2422,6 @@ fn xt_mat_rhs_block(
             }
         }
     }
-}
-
-#[inline]
-fn exact_pg_is_numerically_singular(s_p_s: f64, s_m_s: f64) -> bool {
-    s_p_s.is_finite()
-        && s_m_s.is_finite()
-        && s_p_s > 0.0
-        && s_m_s > SPLMM_TINY
-        && s_p_s <= SPLMM_EXACT_PG_MIN_REL_SM * s_m_s.max(1.0)
 }
 
 #[inline]
@@ -2577,11 +2570,6 @@ fn exact_scan_blocks_core<G: GenotypeMatrix>(
     }
 
     let sample_identity = scan_sample_idx.iter().enumerate().all(|(i, &sid)| sid == i);
-    let selected_excluded_sample_idx = if sample_identity {
-        None
-    } else {
-        precompute_excluded_sample_indices(input.stats.n_samples_full, scan_sample_idx)
-    };
     let pool = get_cached_pool(threads).map_err(|e| e.to_string())?;
     let m = input.n_markers();
     let progress_total = if progress_total_override == 0 {
@@ -2612,7 +2600,6 @@ fn exact_scan_blocks_core<G: GenotypeMatrix>(
         n,
     );
     let score_f32 = cast_f64_slice_to_f32(score_vec)?;
-    let x_design_f32 = cast_f64_slice_to_f32(x_design)?;
     let blas_threads = if rust_sgemm_prefers_rayon_rowmajor_f32_kernel() {
         1
     } else {
@@ -2622,29 +2609,16 @@ fn exact_scan_blocks_core<G: GenotypeMatrix>(
 
     let mut block = vec![0.0_f32; scan_block_rows * n];
     let mut spy_block = vec![0.0_f32; scan_block_rows];
-    let mut xts_block = vec![0.0_f32; scan_block_rows * p];
-    let mut row_ss = vec![0.0_f64; scan_block_rows];
     let mut z_col_major = vec![0.0_f64; scan_block_rows * n];
     let mut sv_block = vec![0.0_f64; scan_block_rows];
-    let exact_scalar_p1 = scalar_spd_inv_from_chol(x_design_xtx_chol, p)
-        .zip(scalar_spd_inv_from_chol(xt_den_x_chol, p));
+    let exact_scalar_p1 = scalar_spd_inv_from_chol(xt_den_x_chol, p);
     let mut c_block = vec![0.0_f64; scan_block_rows * p];
-    let mut xts = if exact_scalar_p1.is_some() {
-        Vec::new()
-    } else {
-        vec![0.0_f64; p]
-    };
     let mut alpha = if exact_scalar_p1.is_some() {
         Vec::new()
     } else {
         vec![0.0_f64; p]
     };
     let mut c_scaled = if exact_scalar_p1.is_some() {
-        Vec::new()
-    } else {
-        vec![0.0_f64; p]
-    };
-    let mut alpha_xtx = if exact_scalar_p1.is_some() {
         Vec::new()
     } else {
         vec![0.0_f64; p]
@@ -2669,8 +2643,6 @@ fn exact_scan_blocks_core<G: GenotypeMatrix>(
         let rows_here = row_end - row_start;
         let block_slice = &mut block[..rows_here * n];
         let spy_slice = &mut spy_block[..rows_here];
-        let xts_slice = &mut xts_block[..rows_here * p];
-        let ss_slice = &mut row_ss[..rows_here];
         let sv_slice = &mut sv_block[..rows_here];
 
         // Step 1: decode genotype block via UnifiedInput
@@ -2701,36 +2673,6 @@ fn exact_scan_blocks_core<G: GenotypeMatrix>(
         if let Some(t0) = t0 {
             timing.gpy_secs += t0.elapsed().as_secs_f64();
         }
-        let t0 = stage_timing.then(Instant::now);
-        row_major_block_mul_mat_f32(
-            block_slice,
-            rows_here,
-            n,
-            x_design_f32.as_slice(),
-            p,
-            xts_slice,
-            pool.as_ref(),
-        );
-        if let Some(t0) = t0 {
-            timing.gx_secs += t0.elapsed().as_secs_f64();
-        }
-        let t0 = stage_timing.then(Instant::now);
-        if !packed_block_additive_sumsq_from_counts(
-            input,
-            row_start,
-            rows_here,
-            scan_sample_idx,
-            sample_identity,
-            selected_excluded_sample_idx.as_deref(),
-            ss_slice,
-            pool.as_ref(),
-        ) {
-            row_major_block_sumsq_f64(block_slice, rows_here, n, ss_slice, pool.as_ref());
-        }
-        if let Some(t0) = t0 {
-            timing.row_sumsq_secs += t0.elapsed().as_secs_f64();
-        }
-
         // Step 3: widen decode block directly into the sparse-solve buffer
         let z_slice = &mut z_col_major[..rows_here * n];
         let t0 = stage_timing.then(Instant::now);
@@ -2796,22 +2738,17 @@ fn exact_scan_blocks_core<G: GenotypeMatrix>(
         // Steps 7-8: per-SNP denominator and output
         let out_slice = &mut out_block[..rows_here * 3];
         let t0 = stage_timing.then(Instant::now);
-        if let Some((xtx00_inv, xtden00_inv)) = exact_scalar_p1 {
+        // Exact mode should follow the direct g'Pg formula and only drop rows
+        // whose denominator is actually non-positive or non-finite.
+        if let Some(xtden00_inv) = exact_scalar_p1 {
             for local_idx in 0..rows_here {
-                let xts0 = xts_slice[local_idx] as f64;
-                let s_m_s = residualized_sumsq_scalar(xtx00_inv, xts0, ss_slice[local_idx]);
                 let s_v_s = sv_slice[local_idx];
                 let xtz0 = c_slice[local_idx];
                 let c0_scaled = xtz0 * denom_scale;
                 let x_quad = c0_scaled * c0_scaled * xtden00_inv;
                 let denom_scaled = (denom_scale * s_v_s - x_quad).max(0.0);
                 let out_row = &mut out_slice[local_idx * 3..(local_idx + 1) * 3];
-                let denom_full = denom_scaled / wald_sigma2;
-                if exact_pg_is_numerically_singular(denom_full, s_m_s) {
-                    out_row[0] = f64::NAN;
-                    out_row[1] = f64::NAN;
-                    out_row[2] = 1.0_f64;
-                } else if let Some((beta, se, pwald)) = splmm_wald_from_scaled_denom(
+                if let Some((beta, se, pwald)) = splmm_wald_from_scaled_denom(
                     score_scale * (spy_slice[local_idx] as f64),
                     denom_scaled,
                     wald_sigma2,
@@ -2829,17 +2766,6 @@ fn exact_scan_blocks_core<G: GenotypeMatrix>(
             for local_idx in 0..rows_here {
                 let s_v_s = sv_slice[local_idx];
                 let c_j = &c_slice[local_idx * p..(local_idx + 1) * p];
-                let xts_row = &xts_slice[local_idx * p..(local_idx + 1) * p];
-                for j in 0..p {
-                    xts[j] = xts_row[j] as f64;
-                }
-                let s_m_s = residualized_sumsq_from_xtx_chol(
-                    x_design_xtx_chol,
-                    p,
-                    &xts,
-                    &mut alpha_xtx,
-                    ss_slice[local_idx],
-                );
                 for j in 0..p {
                     c_scaled[j] = c_j[j] * denom_scale;
                 }
@@ -2851,12 +2777,7 @@ fn exact_scan_blocks_core<G: GenotypeMatrix>(
                     .sum::<f64>();
                 let denom_scaled = (denom_scale * s_v_s - x_quad).max(0.0);
                 let out_row = &mut out_slice[local_idx * 3..(local_idx + 1) * 3];
-                let denom_full = denom_scaled / wald_sigma2;
-                if exact_pg_is_numerically_singular(denom_full, s_m_s) {
-                    out_row[0] = f64::NAN;
-                    out_row[1] = f64::NAN;
-                    out_row[2] = 1.0_f64;
-                } else if let Some((beta, se, pwald)) = splmm_wald_from_scaled_denom(
+                if let Some((beta, se, pwald)) = splmm_wald_from_scaled_denom(
                     score_scale * (spy_slice[local_idx] as f64),
                     denom_scaled,
                     wald_sigma2,
@@ -6484,6 +6405,50 @@ mod tests {
     }
 
     #[test]
+    fn xt_mat_rhs_block_blas_matches_naive_reference() {
+        let n = 128usize;
+        let p = 3usize;
+        let rows_here = 40usize;
+        let mut x_design = vec![0.0_f64; n * p];
+        for i in 0..n {
+            for j in 0..p {
+                x_design[i * p + j] = ((i + 1 + 3 * j) as f64) / ((j + 2) as f64);
+            }
+        }
+        let mut z_col_major = vec![0.0_f64; n * rows_here];
+        for col in 0..rows_here {
+            for row in 0..n {
+                z_col_major[col * n + row] = ((row + 2 * col + 1) as f64) / 17.0_f64;
+            }
+        }
+        let mut expected = vec![0.0_f64; rows_here * p];
+        for j in 0..rows_here {
+            let c_j = &mut expected[j * p..(j + 1) * p];
+            for i in 0..n {
+                let xi = &x_design[i * p..(i + 1) * p];
+                let z_ji = z_col_major[j * n + i];
+                for k in 0..p {
+                    c_j[k] += xi[k] * z_ji;
+                }
+            }
+        }
+        let x_col = row_major_to_col_major_f64(&x_design, n, p).unwrap();
+        let mut got = vec![0.0_f64; rows_here * p];
+        xt_mat_rhs_block(
+            &x_design,
+            Some(&x_col),
+            &z_col_major,
+            n,
+            p,
+            rows_here,
+            &mut got,
+        );
+        for (lhs, rhs) in got.iter().zip(expected.iter()) {
+            assert!((lhs - rhs).abs() <= 1.0e-10_f64);
+        }
+    }
+
+    #[test]
     fn grammar_scan_core_matches_wrapper_and_manual_reference() {
         let (prepared, scan_sample_idx) = make_test_scan_prepared();
         let x_design = make_test_design();
@@ -6930,17 +6895,6 @@ mod tests {
         assert!(null_info.v_inv_x.converged_all);
         assert_eq!(rhat_info.n_markers_requested, 0);
         assert_eq!(rhat_info.n_markers_used, 0);
-    }
-
-    #[test]
-    fn exact_pg_relative_guard_flags_near_singular_rows() {
-        let s_m_s = 10.0_f64;
-        let s_p_s = SPLMM_EXACT_PG_MIN_REL_SM * s_m_s * 0.5;
-        assert!(exact_pg_is_numerically_singular(s_p_s, s_m_s));
-        assert!(!exact_pg_is_numerically_singular(
-            SPLMM_EXACT_PG_MIN_REL_SM * s_m_s * 2.0,
-            s_m_s,
-        ));
     }
 
     #[test]

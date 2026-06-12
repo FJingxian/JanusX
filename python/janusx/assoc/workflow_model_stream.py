@@ -544,6 +544,11 @@ def run_chunked_gwas_lmm_lm(
         and hasattr(jxrs, "lmm_reml_assoc_bed_to_tsv_f32")
         and os.environ.get("JX_DISABLE_LMM_UNIFIED") != "1"
     )
+    lmm2_has_dedicated_bed_fastpath = bool(
+        bed_prefix is not None
+        and hasattr(jxrs, "lmm_reml_lmm2_assoc_bed_to_tsv_f32")
+        and os.environ.get("JX_DISABLE_LMM2_UNIFIED") != "1"
+    )
 
     # For single-model kinship models on PLINK BED input, reuse the shared
     # prepared-chunk scan bus (same Rust read-block path as multi-model mode)
@@ -554,6 +559,7 @@ def run_chunked_gwas_lmm_lm(
         and has_prepared_bed_bus
         and not (model_key == "fvlmm" and fvlmm_has_dedicated_bed_fastpath)
         and not (model_key == "lmm" and lmm_has_dedicated_bed_fastpath)
+        and not (model_key == "lmm2" and lmm2_has_dedicated_bed_fastpath)
     ):
         _log_file_only(
             logger,
@@ -605,6 +611,13 @@ def run_chunked_gwas_lmm_lm(
             logger,
             logging.INFO,
             "LMM route: using dedicated single-model Rust BED fastpath "
+            "(skip shared prepared-chunk bus).",
+        )
+    if model_key == "lmm2" and lmm2_has_dedicated_bed_fastpath:
+        _log_file_only(
+            logger,
+            logging.INFO,
+            "LMM2 route: using dedicated single-model Rust BED fastpath "
             "(skip shared prepared-chunk bus).",
         )
 
@@ -670,9 +683,9 @@ def run_chunked_gwas_lmm_lm(
         effective_model_label = str(base_model_label)
         effective_model_tag = str(base_model_tag)
         base_lmm: Optional[LMM] = None
-        if model_key in ("lmm", "fastlmm", "fvlmm"):
+        if model_key in ("lmm", "lmm2", "fastlmm", "fvlmm"):
             if grm is None:
-                raise ValueError("LMM/FastLMM/FvLMM requires GRM, but GRM was not prepared.")
+                raise ValueError("LMM/LMM2/FastLMM/FvLMM requires GRM, but GRM was not prepared.")
             evd_t0 = time.monotonic()
             evd_label = base_model_label
             evd_desc = f"{evd_label} Eigen-Decomposition"
@@ -839,14 +852,23 @@ def run_chunked_gwas_lmm_lm(
         scan_t0 = time.time()
         pbar_total = int(eff_snp_by_trait.get(pname, n_snps))
         pbar_desc = f"{effective_model_label}"
-        # Unified LMM may spend noticeable time in the first large Rust block
-        # before the first progress callback arrives; show 0% immediately
-        # instead of a "Waiting ..." warmup spinner.
+        # Unified LMM/LMM2 may spend noticeable time in the first large Rust
+        # block before the first progress callback arrives; show 0%
+        # immediately instead of a "Waiting ..." warmup spinner.
         prestart_unified_lmm_pbar = bool(
             use_spinner
-            and str(effective_model_key).lower() == "lmm"
-            and hasattr(jxrs, "lmm_reml_assoc_bed_to_tsv_f32")
-            and os.environ.get("JX_DISABLE_LMM_UNIFIED") != "1"
+            and (
+                (
+                    str(effective_model_key).lower() == "lmm"
+                    and hasattr(jxrs, "lmm_reml_assoc_bed_to_tsv_f32")
+                    and os.environ.get("JX_DISABLE_LMM_UNIFIED") != "1"
+                )
+                or (
+                    str(effective_model_key).lower() == "lmm2"
+                    and hasattr(jxrs, "lmm_reml_lmm2_assoc_bed_to_tsv_f32")
+                    and os.environ.get("JX_DISABLE_LMM2_UNIFIED") != "1"
+                )
+            )
         )
         pbar: Optional[_ProgressAdapter] = None
         if (not bool(use_spinner)) or prestart_unified_lmm_pbar:
@@ -951,6 +973,11 @@ def run_chunked_gwas_lmm_lm(
             str(effective_model_key).lower() == "lmm"
             and hasattr(jxrs, "lmm_reml_assoc_bed_to_tsv_f32")
             and os.environ.get("JX_DISABLE_LMM_UNIFIED") != "1"
+        )
+        _use_lmm2_unified = (
+            str(effective_model_key).lower() == "lmm2"
+            and hasattr(jxrs, "lmm_reml_lmm2_assoc_bed_to_tsv_f32")
+            and os.environ.get("JX_DISABLE_LMM2_UNIFIED") != "1"
         )
 
         def _format_chunk_tsv_text(
@@ -1207,6 +1234,86 @@ def run_chunked_gwas_lmm_lm(
                     threads=int(scan_threads),
                     nullml=None,
                     init_log10_lbd=init_log10_lbd,
+                    rotate_block_rows=int(model_chunk_size),
+                    progress_callback=_fvlmm_unified_progress,
+                    progress_every=int(
+                        max(
+                            1,
+                            min(
+                                int(max(1, int(model_chunk_size))),
+                                _progress_callback_step(int(max(1, pbar_total))),
+                            ),
+                        )
+                    ),
+                    mmap_window_mb=(int(mmap_window_mb) if mmap_window_mb is not None else None),
+                )
+                done_snps = int(rows_written)
+                has_results = done_snps > 0
+                mem_info = process.memory_info()
+                peak_rss = max(peak_rss, mem_info.rss)
+                if pbar is not None:
+                    if done_snps > pbar_last_done:
+                        pbar.update(int(done_snps - pbar_last_done))
+                    pbar.finish()
+                    pbar.close(show_done=False)
+                    pbar = None
+            elif _use_lmm2_unified:
+                bed_prefix = _as_plink_prefix(genofile)
+                if bed_prefix is None:
+                    raise RuntimeError(
+                        "Rust-only GWAS scan requires PLINK BED input/prefix."
+                    )
+                sample_ids = [str(s) for s in sample_sub]
+                null_ml0: Optional[float] = None
+                init_log10_lbd_reml: Optional[float] = None
+                init_log10_lbd_ml: Optional[float] = None
+                try:
+                    ml0_tmp = float(getattr(mod, "_lmm2_ml0_exact"))
+                    if np.isfinite(ml0_tmp):
+                        null_ml0 = ml0_tmp
+                except Exception:
+                    null_ml0 = None
+                try:
+                    lbd0_tmp = float(getattr(mod, "lbd_null"))
+                    if np.isfinite(lbd0_tmp) and lbd0_tmp > 0.0:
+                        init_log10_lbd_reml = float(np.log10(lbd0_tmp))
+                except Exception:
+                    init_log10_lbd_reml = None
+                try:
+                    lbd_ml_tmp = float(getattr(mod, "_lmm2_lbd_null_ml"))
+                    if np.isfinite(lbd_ml_tmp) and lbd_ml_tmp > 0.0:
+                        init_log10_lbd_ml = float(np.log10(lbd_ml_tmp))
+                except Exception:
+                    init_log10_lbd_ml = None
+                try:
+                    bounds_tmp = tuple(getattr(mod, "bounds"))
+                    lmm_low = float(bounds_tmp[0])
+                    lmm_high = float(bounds_tmp[1])
+                    if not (np.isfinite(lmm_low) and np.isfinite(lmm_high) and lmm_low < lmm_high):
+                        raise ValueError
+                except Exception:
+                    lmm_low, lmm_high = -5.0, 5.0
+                rows_written = jxrs.lmm_reml_lmm2_assoc_bed_to_tsv_f32(
+                    bed_prefix=str(bed_prefix),
+                    out_tsv=str(tmp_tsv),
+                    s=np.ascontiguousarray(mod.S, dtype=np.float64),
+                    xcov=np.ascontiguousarray(mod.Xcov, dtype=np.float64),
+                    y_rot=np.ascontiguousarray(mod.y, dtype=np.float64).ravel(),
+                    u_t=np.ascontiguousarray(mod.Dh, dtype=np.float32),
+                    maf_thr=float(maf_threshold),
+                    miss_thr=float(max_missing_rate),
+                    het_thr=float(het_threshold),
+                    genetic_model=str(genetic_model),
+                    snps_only=bool(snps_only),
+                    sample_ids=sample_ids,
+                    low=float(lmm_low),
+                    high=float(lmm_high),
+                    max_iter=30,
+                    tol=1e-2,
+                    threads=int(scan_threads),
+                    nullml=null_ml0,
+                    init_log10_lbd_reml=init_log10_lbd_reml,
+                    init_log10_lbd_ml=init_log10_lbd_ml,
                     rotate_block_rows=int(model_chunk_size),
                     progress_callback=_fvlmm_unified_progress,
                     progress_every=int(

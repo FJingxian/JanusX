@@ -215,8 +215,8 @@ use lmm_scan::{
     fvlmm_assoc_packed_f32_to_tsv, fvlmm_assoc_prepare_cache_f32, lmm_assoc_chunk_f32,
     lmm_assoc_chunk_from_snp_f32, lmm_reml_assoc_bed_to_tsv_f32, lmm_reml_assoc_packed_f32,
     lmm_reml_assoc_packed_f32_to_tsv, lmm_reml_chunk_f32, lmm_reml_chunk_from_snp_f32,
-    lmm_reml_lmm2_chunk_from_snp_f32, lmm_reml_null_f32, lmm_rotate_x_y_with_ut_f64,
-    ml_loglike_null_f32, FvLmmAssocCache,
+    lmm_reml_lmm2_assoc_bed_to_tsv_f32, lmm_reml_lmm2_chunk_from_snp_f32,
+    lmm_reml_null_f32, lmm_rotate_x_y_with_ut_f64, ml_loglike_null_f32, FvLmmAssocCache,
 };
 use logreg::fit_best_and_not_py;
 use ml::{garfield_ml_feature_scores_py, garfield_ml_select_topk_py};
@@ -464,6 +464,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     )?)?;
     m.add_function(wrap_pyfunction!(lmm_rotate_x_y_with_ut_f64, m)?)?;
     m.add_function(wrap_pyfunction!(lmm_reml_assoc_bed_to_tsv_f32, m)?)?;
+    m.add_function(wrap_pyfunction!(lmm_reml_lmm2_assoc_bed_to_tsv_f32, m)?)?;
     m.add_function(wrap_pyfunction!(lmm_reml_assoc_packed_f32, m)?)?;
     m.add_function(wrap_pyfunction!(lmm_reml_assoc_packed_f32_to_tsv, m)?)?;
     m.add_function(wrap_pyfunction!(fastlmm_assoc_chunk_f32, m)?)?;

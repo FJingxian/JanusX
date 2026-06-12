@@ -6010,7 +6010,7 @@ def parse_args(argv: Optional[list[str]] = None):
     )
     models_group.add_argument(
         "-fastlmm", "--fastlmm", action="store_true", default=False,
-        help="Run the linear mixed model with fixed lambda estimated in null model (memmap, low-memory; default: %(default)s).",
+        help=argparse.SUPPRESS,
     )
     models_group.add_argument(
         "-fvlmm", "--fvlmm", action="store_true", default=False,
@@ -6057,7 +6057,7 @@ def parse_args(argv: Optional[list[str]] = None):
     )
     models_group.add_argument(
         "-model", "--model", type=str, choices=["add", "dom", "rec", "het"], default="add",
-        help="Genetic effect coding model for memmap LM/LMM/LMM2/FastLMM/FvLMM (default: %(default)s).",
+        help="Genetic effect coding model for memmap LM/LMM/LMM2/FvLMM (default: %(default)s).",
     )
 
     optional_group = parser.add_argument_group("Optional Arguments")
@@ -6170,14 +6170,14 @@ def parse_args(argv: Optional[list[str]] = None):
         "-fast", "--fast", action="store_true", default=False,
         help=(
             "Use packed full-rust paths when available (loads BED-packed genotype once "
-            "and reuses it across LM/LMM/FastLMM/FvLMM/SparseLMM/ALGWAS/FarmCPU)."
+            "and reuses it across LM/LMM/LMM2/FvLMM/SparseLMM/ALGWAS/FarmCPU)."
         ),
     )
     optional_group.add_argument(
         "-force-model", "--force-model", action="store_true", default=False,
         help=(
             "Force the requested GWAS model(s) and disable automatic "
-            "FastLMM->LMM / mixed-model->LM switching."
+            "fixed-variance/mixed-model fallback switching."
         ),
     )
     optional_group.add_argument(
@@ -6550,9 +6550,18 @@ def _run_gwas_pipeline(
         or args.farmcpu
     ):
         logger.error(
-            "No model selected. Use -lm, -lmm, -lmm2, -fastlmm, -fvlmm, -splmm, -algwas, and/or -farmcpu."
+            "No model selected. Use -lm, -lmm, -lmm2, -fvlmm, -splmm, -algwas, and/or -farmcpu."
         )
         raise SystemExit(1)
+    if args.fastlmm:
+        _emit_warning_line(
+            logger,
+            (
+                "FaSTLMM is deprecated and will be removed in JanusX 1.0.26. "
+                "Use `-fvlmm` for fixed-lambda scans or `-lmm`/`-lmm2` for exact LMM."
+            ),
+            use_spinner=bool(use_spinner),
+        )
     if args.farmcpu and args.model != "add":
         logger.warning(
             "Warning: --model/--het currently apply to memmap LM/LMM/LMM2/FastLMM/FvLMM; "

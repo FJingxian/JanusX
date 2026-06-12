@@ -4792,6 +4792,700 @@ pub fn lmm_reml_assoc_bed_to_tsv_f32<'py>(
     .map_err(PyRuntimeError::new_err)
 }
 
+/// Single-entry Rust BED -> TSV path for exact LMM2 association.
+///
+/// This mirrors the unified LMM BED scan, but computes per-SNP REML
+/// beta/se/pwald together with a second per-SNP ML optimization for
+/// `lambda/ml/plrt`.
+#[pyfunction]
+#[pyo3(signature = (
+    bed_prefix,
+    out_tsv,
+    s, xcov, y_rot, u_t,
+    maf_thr, miss_thr, het_thr,
+    genetic_model = "add",
+    snps_only = false,
+    sample_ids = None,
+    low = -5.0,
+    high = 5.0,
+    max_iter = 30,
+    tol = 1e-2,
+    threads = 0,
+    nullml = None,
+    init_log10_lbd_reml = None,
+    init_log10_lbd_ml = None,
+    rotate_block_rows = 512,
+    progress_callback = None,
+    progress_every = 0,
+    mmap_window_mb = None,
+))]
+pub fn lmm_reml_lmm2_assoc_bed_to_tsv_f32<'py>(
+    py: Python<'py>,
+    bed_prefix: &str,
+    out_tsv: &str,
+    s: PyReadonlyArray1<'py, f64>,
+    xcov: PyReadonlyArray2<'py, f64>,
+    y_rot: PyReadonlyArray1<'py, f64>,
+    u_t: PyReadonlyArray2<'py, f32>,
+    maf_thr: f32,
+    miss_thr: f32,
+    het_thr: f32,
+    genetic_model: &str,
+    snps_only: bool,
+    sample_ids: Option<Vec<String>>,
+    low: f64,
+    high: f64,
+    max_iter: usize,
+    tol: f64,
+    threads: usize,
+    nullml: Option<f64>,
+    init_log10_lbd_reml: Option<f64>,
+    init_log10_lbd_ml: Option<f64>,
+    rotate_block_rows: usize,
+    progress_callback: Option<Py<PyAny>>,
+    progress_every: usize,
+    mmap_window_mb: Option<usize>,
+) -> PyResult<usize> {
+    if low >= high {
+        return Err(PyRuntimeError::new_err("low must be < high"));
+    }
+    if !(tol.is_finite() && tol > 0.0) {
+        return Err(PyRuntimeError::new_err("tol must be positive and finite"));
+    }
+
+    let s_slice = s.as_slice()?;
+    let xcov_arr = xcov.as_array();
+    let y = y_rot.as_slice()?;
+    let ut_arr = u_t.as_array();
+
+    let n = y.len();
+    let p = xcov_arr.shape()[1];
+    if xcov_arr.shape()[0] != n {
+        return Err(PyRuntimeError::new_err("Xcov.n_rows must equal len(y_rot)"));
+    }
+    if s_slice.len() != n {
+        return Err(PyRuntimeError::new_err("len(S) must equal len(y_rot)"));
+    }
+    if ut_arr.shape()[0] != n || ut_arr.shape()[1] != n {
+        return Err(PyRuntimeError::new_err("u_t must be (n, n) row-major U^T"));
+    }
+    if n <= p + 1 {
+        return Err(PyRuntimeError::new_err("n must be > p+1"));
+    }
+
+    let gm = PackedGeneticModel::parse(genetic_model)?;
+    let out_cols = 6usize;
+    let init_log10_lbd_reml = init_log10_lbd_reml
+        .filter(|v| v.is_finite())
+        .map(|v| v.clamp(low, high));
+    let init_log10_lbd_ml = init_log10_lbd_ml
+        .filter(|v| v.is_finite())
+        .map(|v| v.clamp(low, high));
+
+    let xcov_flat: Cow<[f64]> = match xcov.as_slice() {
+        Ok(slc) => Cow::Borrowed(slc),
+        Err(_) => Cow::Owned(xcov_arr.iter().copied().collect()),
+    };
+    let ut_flat: Cow<[f32]> = match u_t.as_slice() {
+        Ok(slc) => Cow::Borrowed(slc),
+        Err(_) => Cow::Owned(ut_arr.iter().copied().collect()),
+    };
+
+    let bed_prefix_owned = bed_prefix.to_string();
+    let out_tsv_owned = out_tsv.to_string();
+    let stage_timing =
+        env_truthy("JX_LMM2_UNIFIED_STAGE_TIMING") || env_truthy("JX_LMM_UNIFIED_STAGE_TIMING");
+    let use_warm_start =
+        !(env_truthy("JX_LMM2_UNIFIED_NO_WARM_START") || env_truthy("JX_LMM_UNIFIED_NO_WARM_START"));
+
+    py.detach(move || -> Result<usize, String> {
+        let total_t0 = Instant::now();
+        let count_nanos = AtomicU64::new(0);
+        let meta_nanos = AtomicU64::new(0);
+        let decode_nanos = AtomicU64::new(0);
+        let proj_nanos = AtomicU64::new(0);
+        let assoc_nanos = AtomicU64::new(0);
+        let tsv_nanos = AtomicU64::new(0);
+
+        let null_opt_t0 = Instant::now();
+        let nullml_val = if let Some(v) = nullml {
+            if !v.is_finite() {
+                return Err("nullml must be finite when provided".to_string());
+            }
+            v
+        } else {
+            let init_guess = init_log10_lbd_ml.or(init_log10_lbd_reml);
+            let (best_log10_lbd_ml, best_ml_cost) = brent_minimize_with_init(
+                |x0| -ml_loglike(x0, s_slice, &xcov_flat, y, None, n, p),
+                low,
+                high,
+                tol,
+                max_iter,
+                init_guess,
+            );
+            let mut ml0 = -best_ml_cost;
+            if !ml0.is_finite() {
+                ml0 = ml_loglike(best_log10_lbd_ml, s_slice, &xcov_flat, y, None, n, p);
+            }
+            if !ml0.is_finite() {
+                return Err("failed to optimize null ML for LMM2 unified scan".to_string());
+            }
+            ml0
+        };
+        let null_opt_secs = null_opt_t0.elapsed().as_secs_f64();
+
+        let full_samples = gfcore::read_fam(&bed_prefix_owned)?;
+        let n_samples_full = full_samples.len();
+        if n_samples_full == 0 {
+            return Err("no samples in PLINK FAM".to_string());
+        }
+
+        let (all_chrom, all_pos, all_snp, all_allele0, all_allele1) =
+            read_bim_columns(&bed_prefix_owned, None)?;
+
+        let sample_idx: Vec<usize> = match &sample_ids {
+            Some(ids) => {
+                let id_to_idx: std::collections::HashMap<&str, usize> = full_samples
+                    .iter()
+                    .enumerate()
+                    .map(|(i, name)| (name.as_str(), i))
+                    .collect();
+                ids.iter()
+                    .map(|sid| {
+                        id_to_idx
+                            .get(sid.as_str())
+                            .copied()
+                            .ok_or_else(|| format!("sample '{sid}' not found in PLINK FAM"))
+                    })
+                    .collect::<Result<Vec<usize>, String>>()?
+            }
+            None => (0..n_samples_full).collect(),
+        };
+        if sample_idx.len() != n {
+            return Err(format!(
+                "sample_ids length {} != len(y_rot) {}",
+                sample_idx.len(),
+                n
+            ));
+        }
+
+        let bytes_per_snp = (n_samples_full + 3) / 4;
+        if bytes_per_snp == 0 {
+            return Err("bytes_per_snp is zero".to_string());
+        }
+        let bed_path = format!("{bed_prefix_owned}.bed");
+        let mut bed_window = if let Some(window_mb) = mmap_window_mb.filter(|&v| v > 0) {
+            Some(WindowedBedMatrix::open(&bed_prefix_owned, window_mb)?)
+        } else {
+            None
+        };
+        let full_mmap = if bed_window.is_none() {
+            let bed_file = File::open(&bed_path).map_err(|e| format!("open {bed_path}: {e}"))?;
+            let mmap =
+                unsafe { Mmap::map(&bed_file) }.map_err(|e| format!("mmap {bed_path}: {e}"))?;
+            if mmap.len() < 3 || mmap[0] != 0x6C || mmap[1] != 0x1B || mmap[2] != 0x01 {
+                return Err("only SNP-major BED supported".to_string());
+            }
+            let data_len = mmap.len() - 3;
+            if data_len % bytes_per_snp != 0 {
+                return Err(format!(
+                    "BED payload length {data_len} not a multiple of {bytes_per_snp}"
+                ));
+            }
+            Some(mmap)
+        } else {
+            None
+        };
+        let n_snps = if let Some(window) = bed_window.as_ref() {
+            window.n_source_snps()
+        } else {
+            let mmap = full_mmap
+                .as_ref()
+                .ok_or_else(|| "internal error: missing BED source".to_string())?;
+            (mmap.len() - 3) / bytes_per_snp
+        };
+
+        if all_chrom.len() != n_snps {
+            return Err(format!(
+                "BIM site count {} != BED SNP count {n_snps}",
+                all_chrom.len()
+            ));
+        }
+
+        let use_selected =
+            !sample_indices_are_identity(&sample_idx) || sample_idx.len() != n_samples_full;
+        let sample_identity = !use_selected && sample_idx.len() == n_samples_full;
+        let selected_excluded_sample_indices = if use_selected {
+            precompute_excluded_sample_indices(n_samples_full, &sample_idx)
+        } else {
+            None
+        };
+        let sample_subset_plan: Option<SubsetDecodePlan> = if sample_identity {
+            None
+        } else {
+            Some(SubsetDecodePlan::from_sample_idx_with_n_samples(
+                &sample_idx,
+                n_samples_full,
+            ))
+        };
+        let dense_subset_pos: Option<Vec<isize>> = if sample_identity {
+            None
+        } else {
+            maybe_build_dense_subset_pos(&sample_idx, n_samples_full)
+        };
+
+        let proj_threads = stage_proj_threads_or(threads);
+        let assoc_threads = stage_assoc_threads_or(threads);
+        let proj_pool = get_cached_pool(proj_threads).map_err(|e| format!("{e}"))?;
+        let assoc_pool = get_cached_pool(assoc_threads).map_err(|e| format!("{e}"))?;
+
+        let header: &[u8] =
+            b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\tlambda\tml\tplrt\n";
+        let writer = AsyncTsvWriter::with_config(&out_tsv_owned, header, 64 * 1024 * 1024, 16)?;
+
+        let scan_chunk_snps = rotate_block_rows.max(1024).min(65536);
+        let mut text_buf = String::with_capacity(scan_chunk_snps * 160);
+        let mut total_rows = 0usize;
+
+        let progress_block = if progress_every == 0 {
+            0usize
+        } else {
+            progress_every.max(1)
+        };
+        let mut next_progress_emit = if progress_block > 0 {
+            progress_block.min(n_snps).max(1)
+        } else {
+            0
+        };
+
+        let run_rows = |g_block: &[f32], rows: usize, out_block: &mut [f64]| {
+            let mut run = || {
+                out_block[..rows * out_cols]
+                    .par_chunks_mut(out_cols)
+                    .enumerate()
+                    .for_each_init(
+                        || (vec![0.0_f64; n], init_log10_lbd_reml, init_log10_lbd_ml),
+                        |state, (idx, out_row)| {
+                            let (snp_vec, last_log10_lbd_reml, last_log10_lbd_ml) = state;
+                            let row = &g_block[idx * n..(idx + 1) * n];
+                            for i in 0..n {
+                                snp_vec[i] = row[i] as f64;
+                            }
+
+                            let reml_init_guess = if use_warm_start {
+                                (*last_log10_lbd_reml)
+                                    .or(init_log10_lbd_reml)
+                                    .or(init_log10_lbd_ml)
+                            } else {
+                                init_log10_lbd_reml.or(init_log10_lbd_ml)
+                            };
+                            let (best_log10_lbd_reml, _best_reml_cost) = brent_minimize_with_init(
+                                |x0| {
+                                    -reml_loglike(
+                                        x0,
+                                        s_slice,
+                                        &xcov_flat,
+                                        y,
+                                        Some(&snp_vec[..]),
+                                        n,
+                                        p,
+                                    )
+                                },
+                                low,
+                                high,
+                                tol,
+                                max_iter,
+                                reml_init_guess,
+                            );
+                            if use_warm_start {
+                                *last_log10_lbd_reml = Some(best_log10_lbd_reml);
+                            }
+
+                            let (beta, se, lambda_reml) = final_beta_se(
+                                best_log10_lbd_reml,
+                                s_slice,
+                                &xcov_flat,
+                                y,
+                                &snp_vec[..],
+                                n,
+                                p,
+                            );
+                            let pwald = if beta.is_finite() && se.is_finite() && se > 0.0 {
+                                let z = beta / se;
+                                (2.0 * normal_sf(z.abs())).clamp(f64::MIN_POSITIVE, 1.0)
+                            } else {
+                                1.0
+                            };
+
+                            let ml_init_guess = if use_warm_start {
+                                (*last_log10_lbd_ml)
+                                    .or(Some(best_log10_lbd_reml))
+                                    .or(init_log10_lbd_ml)
+                                    .or(init_log10_lbd_reml)
+                            } else {
+                                Some(best_log10_lbd_reml)
+                                    .or(init_log10_lbd_ml)
+                                    .or(init_log10_lbd_reml)
+                            };
+                            let (best_log10_lbd_ml, best_ml_cost) = brent_minimize_with_init(
+                                |x0| {
+                                    -ml_loglike(
+                                        x0,
+                                        s_slice,
+                                        &xcov_flat,
+                                        y,
+                                        Some(&snp_vec[..]),
+                                        n,
+                                        p,
+                                    )
+                                },
+                                low,
+                                high,
+                                tol,
+                                max_iter,
+                                ml_init_guess,
+                            );
+                            if use_warm_start {
+                                *last_log10_lbd_ml = Some(best_log10_lbd_ml);
+                            }
+
+                            let mut ml_alt = -best_ml_cost;
+                            if !ml_alt.is_finite() {
+                                ml_alt = ml_loglike(
+                                    best_log10_lbd_ml,
+                                    s_slice,
+                                    &xcov_flat,
+                                    y,
+                                    Some(&snp_vec[..]),
+                                    n,
+                                    p,
+                                );
+                            }
+                            let mut stat = if ml_alt.is_finite() {
+                                2.0 * (ml_alt - nullml_val)
+                            } else {
+                                0.0
+                            };
+                            if !stat.is_finite() || stat < 0.0 {
+                                stat = 0.0;
+                            }
+                            let plrt = chi2_sf_df1(stat);
+
+                            out_row[0] = beta;
+                            out_row[1] = se;
+                            out_row[2] = if pwald.is_finite() { pwald } else { 1.0 };
+                            out_row[3] = lambda_reml;
+                            out_row[4] = ml_alt;
+                            out_row[5] = if plrt.is_finite() { plrt } else { 1.0 };
+                        },
+                    );
+            };
+
+            if let Some(tp) = assoc_pool.as_ref() {
+                tp.install(run);
+            } else {
+                run();
+            }
+        };
+
+        let mut chunk_start = 0usize;
+        let producer_err = Arc::new(OnceLock::<String>::new());
+        let producer_err_bg = Arc::clone(&producer_err);
+        let producer = |chunk: &mut StreamingChunk| -> bool {
+            if chunk_start >= n_snps {
+                return false;
+            }
+            chunk.clear();
+            let chunk_end = (chunk_start + scan_chunk_snps).min(n_snps);
+            let chunk_packed = match bed_window.as_mut() {
+                Some(window) => match window.read_source_range(chunk_start, chunk_end) {
+                    Ok(slice) => slice,
+                    Err(e) => {
+                        let _ = producer_err_bg.set(e);
+                        return false;
+                    }
+                },
+                None => {
+                    let mmap = match full_mmap.as_ref() {
+                        Some(mmap) => mmap,
+                        None => {
+                            let _ = producer_err_bg
+                                .set("internal error: missing BED source".to_string());
+                            return false;
+                        }
+                    };
+                    let packed = &mmap[3..];
+                    let start_byte = chunk_start * bytes_per_snp;
+                    let end_byte = chunk_end * bytes_per_snp;
+                    &packed[start_byte..end_byte]
+                }
+            };
+
+            let count_t0 = Instant::now();
+            let counts: Vec<Option<SnpCounts>> = (chunk_start..chunk_end)
+                .into_par_iter()
+                .map(|snp_idx| {
+                    let local_idx = snp_idx - chunk_start;
+                    let row =
+                        &chunk_packed[local_idx * bytes_per_snp..(local_idx + 1) * bytes_per_snp];
+                    let (missing, het, hom_alt) = if use_selected {
+                        count_packed_row_counts_selected_with_excluded(
+                            row,
+                            n_samples_full,
+                            &sample_idx,
+                            selected_excluded_sample_indices.as_deref(),
+                        )
+                    } else {
+                        count_packed_row_counts(row, n_samples_full)
+                    };
+                    let non_missing = n.saturating_sub(missing);
+
+                    let miss_rate = if n > 0 {
+                        missing as f32 / n as f32
+                    } else {
+                        1.0_f32
+                    };
+                    if miss_rate > miss_thr {
+                        return None;
+                    }
+
+                    if non_missing == 0 {
+                        return if maf_thr > 0.0 {
+                            None
+                        } else {
+                            Some(SnpCounts {
+                                flip: false,
+                                maf: 0.0_f32,
+                                miss_rate,
+                                missing_count: missing,
+                            })
+                        };
+                    }
+
+                    if het_thr > 0.0 {
+                        let het_rate = het as f32 / non_missing as f32;
+                        if het_rate > het_thr {
+                            return None;
+                        }
+                    }
+
+                    let alt_sum = het.saturating_add(hom_alt.saturating_mul(2));
+                    let alt_freq = alt_sum as f32 / (2.0_f32 * non_missing as f32);
+                    let maf_v = alt_freq.min(1.0_f32 - alt_freq);
+                    if maf_v < maf_thr {
+                        return None;
+                    }
+
+                    Some(SnpCounts {
+                        flip: false,
+                        maf: alt_freq,
+                        miss_rate,
+                        missing_count: missing,
+                    })
+                })
+                .collect();
+            record_elapsed_nanos(&count_nanos, count_t0);
+
+            let meta_t0 = Instant::now();
+            for (offset, snp_idx) in (chunk_start..chunk_end).enumerate() {
+                let cnts = match &counts[offset] {
+                    Some(c) => c,
+                    None => continue,
+                };
+                if snps_only
+                    && (!is_simple_snp_allele(&all_allele0[snp_idx])
+                        || !is_simple_snp_allele(&all_allele1[snp_idx]))
+                {
+                    continue;
+                }
+                chunk.indices.push(offset);
+                chunk.flip.push(cnts.flip);
+                chunk.maf.push(cnts.maf);
+                chunk.miss_rate.push(cnts.miss_rate);
+                chunk.miss_block[chunk.rows] = cnts.missing_count;
+                chunk.chrom.push(all_chrom[snp_idx].clone());
+                chunk.pos.push(all_pos[snp_idx] as i64);
+                chunk.snp.push(resolve_snp_name(
+                    &all_snp[snp_idx],
+                    &all_chrom[snp_idx],
+                    all_pos[snp_idx],
+                ));
+                chunk.a0.push(all_allele0[snp_idx].clone());
+                chunk.a1.push(all_allele1[snp_idx].clone());
+                chunk.rows += 1;
+            }
+            record_elapsed_nanos(&meta_nanos, meta_t0);
+
+            if chunk.rows > 0 {
+                let decode_t0 = Instant::now();
+                decode_centered_block_packed_f32(
+                    chunk_packed,
+                    bytes_per_snp,
+                    &chunk.flip,
+                    &chunk.maf,
+                    Some(&chunk.indices),
+                    0,
+                    chunk.rows,
+                    if sample_identity { n_samples_full } else { n },
+                    gm,
+                    sample_identity,
+                    sample_subset_plan.as_ref(),
+                    dense_subset_pos.as_deref(),
+                    &mut chunk.g_block[..chunk.rows * n],
+                );
+                record_elapsed_nanos(&decode_nanos, decode_t0);
+            }
+
+            chunk.scanned_to = chunk_end;
+            chunk_start = chunk_end;
+            chunk_start < n_snps
+        };
+
+        let consumer = |chunk: &mut StreamingChunk| {
+            let rows = chunk.rows;
+            if rows > 0 {
+                let proj_t0 = Instant::now();
+                rotate_snp_block_with_ut_blas(
+                    &chunk.g_block[..rows * n],
+                    rows,
+                    n,
+                    &ut_flat,
+                    &mut chunk.rot_block[..rows * n],
+                    proj_threads,
+                    proj_pool.as_ref(),
+                );
+                record_elapsed_nanos(&proj_nanos, proj_t0);
+                let assoc_t0 = Instant::now();
+                run_rows(
+                    &chunk.rot_block[..rows * n],
+                    rows,
+                    &mut chunk.out_block[..rows * out_cols],
+                );
+                record_elapsed_nanos(&assoc_nanos, assoc_t0);
+
+                let tsv_t0 = Instant::now();
+                text_buf.clear();
+                if text_buf.capacity() < rows * 160 {
+                    text_buf.reserve(rows * 160 - text_buf.capacity());
+                }
+                for off in 0..rows {
+                    let base = off * out_cols;
+                    let beta = chunk.out_block[base];
+                    let se = chunk.out_block[base + 1];
+                    let pwald = sanitize_assoc_pvalue(beta, se, chunk.out_block[base + 2]);
+                    let chisq = chisq_from_beta_se_and_optional_plrt(beta, se, None);
+                    let chisq_txt = format_chisq_value(chisq);
+                    let _ = write!(
+                        text_buf,
+                        "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\t{:.6e}\t{:.6e}\t{:.4e}\n",
+                        chunk.chrom[off],
+                        chunk.pos[off],
+                        chunk.snp[off],
+                        chunk.a0[off],
+                        chunk.a1[off],
+                        chunk.maf[off],
+                        chunk.miss_block[off],
+                        beta,
+                        se,
+                        chisq_txt,
+                        pwald,
+                        chunk.out_block[base + 3],
+                        chunk.out_block[base + 4],
+                        chunk.out_block[base + 5],
+                    );
+                }
+                let payload = std::mem::take(&mut text_buf).into_bytes();
+                writer.send(payload)?;
+                record_elapsed_nanos(&tsv_nanos, tsv_t0);
+            }
+
+            total_rows += rows;
+            if progress_block > 0 && chunk.scanned_to >= next_progress_emit {
+                if let Some(ref cb) = progress_callback {
+                    let _ = Python::attach(|py2| -> PyResult<()> {
+                        py2.check_signals()?;
+                        cb.call1(py2, (chunk.scanned_to.min(n_snps), n_snps))?;
+                        Ok(())
+                    });
+                }
+                next_progress_emit = (chunk.scanned_to / progress_block + 1)
+                    .saturating_mul(progress_block)
+                    .min(n_snps);
+            }
+
+            Ok::<(), String>(())
+        };
+
+        let pipeline_t0 = Instant::now();
+        crate::pipeline::run_double_buffer(
+            2,
+            || StreamingChunk::new(scan_chunk_snps, n, out_cols),
+            producer,
+            consumer,
+        )?;
+        let pipeline_secs = pipeline_t0.elapsed().as_secs_f64();
+        if let Some(err) = producer_err.get() {
+            return Err(err.clone());
+        }
+
+        if let Some(ref cb) = progress_callback {
+            let _ = Python::attach(|py2| -> PyResult<()> {
+                py2.check_signals()?;
+                cb.call1(py2, (n_snps, n_snps))?;
+                Ok(())
+            });
+        }
+
+        let writer_t0 = Instant::now();
+        writer.finish()?;
+        record_elapsed_nanos(&tsv_nanos, writer_t0);
+
+        if stage_timing {
+            let total_secs = total_t0.elapsed().as_secs_f64();
+            let count_secs = elapsed_nanos_to_secs(&count_nanos);
+            let meta_secs = elapsed_nanos_to_secs(&meta_nanos);
+            let decode_secs = elapsed_nanos_to_secs(&decode_nanos);
+            let proj_secs = elapsed_nanos_to_secs(&proj_nanos);
+            let assoc_secs = elapsed_nanos_to_secs(&assoc_nanos);
+            let tsv_secs = elapsed_nanos_to_secs(&tsv_nanos);
+            let to_pct = |x: f64| -> f64 {
+                if total_secs > 0.0 {
+                    x * 100.0 / total_secs
+                } else {
+                    0.0
+                }
+            };
+            eprintln!(
+                "LMM2 unified timing: null_ml_opt={:.3}s ({:.1}%), count_qc={:.3}s ({:.1}%), metadata={:.3}s ({:.1}%), decode={:.3}s ({:.1}%), project={:.3}s ({:.1}%), assoc={:.3}s ({:.1}%), tsv={:.3}s ({:.1}%), pipeline_wall={:.3}s, total={:.3}s, rows={}, snps={}, n={}, chunk={}, proj_threads={}, assoc_threads={}",
+                null_opt_secs,
+                to_pct(null_opt_secs),
+                count_secs,
+                to_pct(count_secs),
+                meta_secs,
+                to_pct(meta_secs),
+                decode_secs,
+                to_pct(decode_secs),
+                proj_secs,
+                to_pct(proj_secs),
+                assoc_secs,
+                to_pct(assoc_secs),
+                tsv_secs,
+                to_pct(tsv_secs),
+                pipeline_secs,
+                total_secs,
+                total_rows,
+                n_snps,
+                n,
+                scan_chunk_snps,
+                proj_threads,
+                assoc_threads,
+            );
+        }
+        Ok(total_rows)
+    })
+    .map_err(PyRuntimeError::new_err)
+}
+
 /// This eliminates the Python chunk loop and ThreadPoolExecutor overhead for FvLMM.
 #[pyfunction]
 #[pyo3(signature = (

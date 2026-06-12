@@ -38,7 +38,7 @@ Modules:
     fastq2count   RNA-seq counting pipeline from FASTQ to count matrix
     kmer          K-mer workflow: count(KMC) or tree(WASTER)
     kmerge        Merge multi-sample KMC databases into genotype matrix
-    view          View .bin/.bin.site as plain text for pipes
+    view          View .bkmer/.bsite as plain text for pipes
     tree          Tree workflow entry (`-nj` Neighbor-Joining / `-ml` FastTree ML)
     treeplot      Visualize Newick/GRM trees with toytree
     adamixture    ADAMIXTURE ancestry inference
@@ -338,7 +338,7 @@ def _print_cli_help() -> None:
     _print_help_entry(4, "fastq2count", "RNA-seq counting pipeline from FASTQ to count matrix", 12, width)
     _print_help_entry(4, "kmer", "K-mer workflow: count(KMC) or tree(WASTER)", 12, width)
     _print_help_entry(4, "kmerge", "Merge multi-sample KMC databases into genotype matrix", 12, width)
-    _print_help_entry(4, "view", "View .bin/.bin.site as plain text for shell pipes", 12, width)
+    _print_help_entry(4, "view", "View .bkmer/.bsite as plain text for shell pipes", 12, width)
     _print_help_entry(4, "tree", "Tree workflow entry (`-nj` Neighbor-Joining / `-ml` FastTree ML)", 12, width)
     _print_help_entry(4, "treeplot", "Visualize Newick/GRM trees with toytree", 12, width)
     _print_help_entry(4, "adamixture", "ADAMIXTURE ancestry inference", 12, width)

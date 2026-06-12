@@ -33,6 +33,7 @@ def build_parser():
         "-db",
         "--db",
         nargs="+",
+        action="append",
         required=True,
         help=(
             "Input KMC databases. Supports KMC prefix, .kmc_pre/.kmc_suf path, "
@@ -142,6 +143,10 @@ def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
 
+    db_inputs = [str(item) for group in args.db for item in group]
+    if len(db_inputs) == 0:
+        parser.error("-db/--db cannot be empty.")
+
     if args.thread <= 0:
         parser.error("-t/--thread must be > 0.")
     if args.memory <= 0:
@@ -158,6 +163,11 @@ def main() -> int:
         parser.error("-freq/--freq must be within [0, 0.5].")
     if not (1 <= int(args.bucket_bits) <= 20):
         parser.error("--bucket-bits must be within [1, 20].")
+    if len(db_inputs) == 1 and float(args.freq) > 0.0:
+        parser.error(
+            "single-sample kmerge with -freq > 0 filters out all present k-mers; "
+            "use -freq 0.0 or provide multiple samples in one -db group or repeated -db flags."
+        )
 
     detected_threads = int(detect_effective_threads())
     threads = int(args.thread)
@@ -176,7 +186,7 @@ def main() -> int:
         parser.error("-prefix/--prefix cannot be empty.")
 
     summary = jxrs.kmerge_run(
-        db_inputs=[str(x) for x in args.db],
+        db_inputs=db_inputs,
         sample_ids=None if args.sample_id is None else [str(x).strip() for x in args.sample_id],
         out=out_dir,
         prefix=prefix,

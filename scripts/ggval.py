@@ -1069,8 +1069,16 @@ def smoke_flow(outdir: Path, logdir: Path, threads: int, cv_folds: int) -> None:
         stderr_to_stdout=True,
     )
 
-    require_log_match(log_snp0, r"Cache prefix: .*\.snp0", "default VCF GWAS did not use snp0 cache prefix")
-    require_log_match(log_snp1, r"Cache prefix: .*\.snp1", "-snps-only VCF GWAS did not use snp1 cache prefix")
+    require_log_match(
+        log_snp0,
+        r"(Cache prefix:|Genotype Cache\s*:).*\.snp0",
+        "default VCF GWAS did not use snp0 cache prefix",
+    )
+    require_log_match(
+        log_snp1,
+        r"(Cache prefix:|Genotype Cache\s*:).*\.snp1",
+        "-snps-only VCF GWAS did not use snp1 cache prefix",
+    )
 
     for suffix in [".snp0.bed", ".snp0.bim", ".snp0.fam", ".snp1.bed", ".snp1.bim", ".snp1.fam"]:
         require_file(Path(f"{vcf_cache_base}{suffix}"), f"missing VCF cache file {suffix}")

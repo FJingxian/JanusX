@@ -91,8 +91,8 @@ if [[ "${MODE}" == "smoke" ]]; then
         "${VCF_CACHE_BASE}.snp1.bed" "${VCF_CACHE_BASE}.snp1.bim" "${VCF_CACHE_BASE}.snp1.fam"
   run jx gwas -vcf "${VCF_SRC}" -p "${VCF_PHENO}" -lm -n 0 -t "${THREADS}" -o "${OUTDIR}" >"${LOG_SNP0}" 2>&1
   run jx gwas -vcf "${VCF_SRC}" -p "${VCF_PHENO}" -lm -n 0 -snps-only -t "${THREADS}" -o "${OUTDIR}" >"${LOG_SNP1}" 2>&1
-  grep -Eq "Cache prefix: .*\\.snp0" "${LOG_SNP0}" || { cat "${LOG_SNP0}"; fail "default VCF GWAS did not use snp0 cache prefix."; }
-  grep -Eq "Cache prefix: .*\\.snp1" "${LOG_SNP1}" || { cat "${LOG_SNP1}"; fail "-snps-only VCF GWAS did not use snp1 cache prefix."; }
+  grep -Eq "(Cache prefix:|Genotype Cache[[:space:]]*:).*\\.snp0" "${LOG_SNP0}" || { cat "${LOG_SNP0}"; fail "default VCF GWAS did not use snp0 cache prefix."; }
+  grep -Eq "(Cache prefix:|Genotype Cache[[:space:]]*:).*\\.snp1" "${LOG_SNP1}" || { cat "${LOG_SNP1}"; fail "-snps-only VCF GWAS did not use snp1 cache prefix."; }
   [[ -f "${VCF_CACHE_BASE}.snp0.bed" && -f "${VCF_CACHE_BASE}.snp0.bim" && -f "${VCF_CACHE_BASE}.snp0.fam" ]] \
     || { ls -l "${VCF_CACHE_BASE}".snp* 2>/dev/null || true; fail "missing VCF cache files for snp0 mode."; }
   [[ -f "${VCF_CACHE_BASE}.snp1.bed" && -f "${VCF_CACHE_BASE}.snp1.bim" && -f "${VCF_CACHE_BASE}.snp1.fam" ]] \

@@ -50,8 +50,6 @@ _GWAS_MODEL_LABELS = {
     "SparseLMM",
     "ALGWAS",
     "FarmCPU",
-    "LowRankLMM",
-    "LrLMM",
 }
 
 

@@ -16,6 +16,7 @@ from typing import Optional, Union
 import numpy as np
 import pandas as pd
 import psutil
+from janusx.assoc.workflow_cache import _is_writable_dir, _resolve_gwas_cache_dir
 from janusx.script._common.packedctx import (
     prepare_packed_ctx_from_plink,
     packed_preload_is_disabled,
@@ -219,6 +220,37 @@ def _jxlmm_sparse_out_prefix(prefix: str, sample_indices: Union[np.ndarray, None
         return str(prefix)
     arr = np.ascontiguousarray(np.asarray(sample_indices, dtype=np.int64).reshape(-1), dtype=np.int64)
     return f"{prefix}.splmm.n{int(arr.shape[0])}.{_jxlmm_sparse_sample_hash(arr)}"
+
+
+def _jxlmm_sparse_out_prefix_for_gwas(
+    prefix: str,
+    sample_indices: Union[np.ndarray, None],
+    *,
+    outprefix: Optional[str] = None,
+    dense_grm_path: Optional[str] = None,
+    logger: Optional[logging.Logger] = None,
+) -> str:
+    dense_path = str(dense_grm_path).strip() if dense_grm_path is not None else ""
+    if dense_path != "" and dense_path.lower().endswith(".npy"):
+        desired = dense_path[: -len(".npy")]
+    else:
+        desired = _jxlmm_sparse_out_prefix(str(prefix), sample_indices)
+    desired_dir = os.path.abspath(os.path.dirname(str(desired)) or ".")
+    if _is_writable_dir(desired_dir):
+        return str(desired)
+
+    cache_dir = None
+    if outprefix is not None and str(outprefix).strip() != "":
+        cache_dir = os.path.abspath(os.path.dirname(str(outprefix)))
+    fallback_root = _resolve_gwas_cache_dir(
+        str(prefix),
+        cache_dir=cache_dir,
+        logger=logger,
+    )
+    desired_base = os.path.basename(str(desired).rstrip("/\\"))
+    if desired_base == "":
+        desired_base = os.path.basename(str(prefix).rstrip("/\\")) or "sparse_grm"
+    return os.path.join(fallback_root, desired_base).replace("\\", "/")
 
 
 def _jxlmm_sparse_layout_rebuild_reason(sparse_path: str) -> Optional[str]:
@@ -4495,7 +4527,12 @@ def run_splmm_packed_fullrank(
             trait_sparse_kinship_path = _ensure_jxlmm_sparse_grm(
                 kinship_prefix,
                 sample_indices=None,
-                out_prefix=_jxlmm_sparse_out_prefix(kinship_prefix, None),
+                out_prefix=_jxlmm_sparse_out_prefix_for_gwas(
+                    kinship_prefix,
+                    None,
+                    outprefix=str(outprefix),
+                    logger=logger,
+                ),
                 cutoff=float(splmm_sparse_cutoff),
                 maf_threshold=float(maf_threshold),
                 max_missing_rate=float(max_missing_rate),

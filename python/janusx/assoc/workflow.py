@@ -6676,6 +6676,7 @@ def _run_gwas_pipeline(
                     prepared_splmm_sparse_method = int(spk_val)
                 else:
                     from janusx.assoc.workflow_model_packed import _jxlmm_normalize_jxgrm_path
+                    from janusx.assoc.workflow_model_packed import _jxlmm_sparse_out_prefix_for_gwas
 
                     spk_path = _jxlmm_normalize_jxgrm_path(spk_val)
                     if os.path.exists(spk_path):
@@ -6726,8 +6727,13 @@ def _run_gwas_pipeline(
                             dense_grm_path = str(loaded_dense_grm_path)
                         elif str(getattr(args, "grm", "1")).strip() not in {"", "1", "2"}:
                             dense_grm_path = str(getattr(args, "grm"))
-                        if dense_grm_path is not None and dense_grm_path.lower().endswith(".npy"):
-                            sparse_out_prefix = dense_grm_path[: -len(".npy")]
+                        sparse_out_prefix = _jxlmm_sparse_out_prefix_for_gwas(
+                            str(splmm_sparse_prefix),
+                            None,
+                            outprefix=str(outprefix),
+                            dense_grm_path=dense_grm_path,
+                            logger=logger,
+                        )
                         prepared_splmm_sparse_jxgrm_path = _ensure_splmm_sparse_grm(
                             str(splmm_sparse_prefix),
                             sample_indices=None,

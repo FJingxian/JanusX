@@ -7,14 +7,21 @@ import os
 import zipfile
 
 
-def _is_kmc_entry(name: str) -> bool:
+def _is_legacy_kmc_entry(name: str) -> bool:
     if not name.startswith("janusx/_kmc_count"):
+        return False
+    return name.endswith(".so") or name.endswith(".pyd") or ".so." in name
+
+def _is_main_native_entry(name: str) -> bool:
+    if not name.startswith("janusx/janusx"):
         return False
     return name.endswith(".so") or name.endswith(".pyd") or ".so." in name
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Verify wheel contains prebuilt janusx/_kmc_count extension.")
+    parser = argparse.ArgumentParser(
+        description="Verify wheel uses the unified Rust/KMC native extension and does not bundle legacy _kmc_count."
+    )
     parser.add_argument(
         "patterns",
         nargs="*",
@@ -41,12 +48,18 @@ def main() -> int:
 
     for wheel in wheels:
         with zipfile.ZipFile(wheel, "r") as zf:
-            entries = [n for n in zf.namelist() if _is_kmc_entry(n)]
+            legacy_entries = [n for n in zf.namelist() if _is_legacy_kmc_entry(n)]
+            main_entries = [n for n in zf.namelist() if _is_main_native_entry(n)]
         print(f"[check_wheel_kmc] wheel={wheel}")
-        print(f"[check_wheel_kmc] kmc_entries={entries}")
-        if not entries:
+        print(f"[check_wheel_kmc] main_native_entries={main_entries}")
+        print(f"[check_wheel_kmc] legacy_kmc_entries={legacy_entries}")
+        if not main_entries:
             raise SystemExit(
-                f"Strict mode failed: wheel lacks prebuilt janusx/_kmc_count extension: {wheel}"
+                f"Strict mode failed: wheel lacks janusx/janusx native extension: {wheel}"
+            )
+        if legacy_entries:
+            raise SystemExit(
+                f"Strict mode failed: wheel still bundles legacy janusx/_kmc_count extension: {wheel}"
             )
 
     return 0

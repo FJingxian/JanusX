@@ -323,7 +323,6 @@ echo "[build.sh] project cargo config prepared"
 # Build/install using the conda-provided maturin + Rust toolchain.
 export JANUSX_REQUIRE_OPENBLAS=1
 export JANUSX_BUILD_VERBOSE="${JANUSX_BUILD_VERBOSE:-1}"
-export JANUSX_PREBUILD_KMC_BIND=0
 if [[ -n "${PREFIX:-}" ]]; then
   export OPENBLAS_LIB_DIR="${PREFIX}/lib"
   export OPENBLAS_INCLUDE_DIR="${PREFIX}/include"

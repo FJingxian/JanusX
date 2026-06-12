@@ -29,7 +29,6 @@ requirements:
     - pip
     - maturin >=1.9.4,<2
     - numpy >=1.23,!=2.4.3
-    - pybind11 >=2.13.0
     - zlib
     - openblas
   run:

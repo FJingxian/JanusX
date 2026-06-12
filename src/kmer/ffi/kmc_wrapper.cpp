@@ -1,6 +1,7 @@
 #include "kmc_wrapper.h"
 
 #include <cstdint>
+#include <cctype>
 #include <exception>
 #include <memory>
 #include <stdexcept>
@@ -8,6 +9,7 @@
 #include <vector>
 
 #include "kmc_file.h"
+#include "kmc_runner.h"
 
 namespace {
 
@@ -37,6 +39,25 @@ uint64_t encode_kmer_direct_u64(const CKmerAPI& kmer, std::vector<uint64_t>& wor
         throw std::runtime_error("current wrapper only supports k <= 31");
     }
     return words_buf[0];
+}
+
+KMC::InputFileType parse_input_type(const std::string& input_type_raw) {
+    std::string s;
+    s.reserve(input_type_raw.size());
+    for (char c : input_type_raw) {
+        s.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    }
+
+    if (s == "fastq") {
+        return KMC::InputFileType::FASTQ;
+    }
+    if (s == "fasta") {
+        return KMC::InputFileType::FASTA;
+    }
+    if (s == "multiline-fasta" || s == "multiline_fasta" || s == "mlfasta") {
+        return KMC::InputFileType::MULTILINE_FASTA;
+    }
+    throw std::runtime_error("Unsupported input_type: " + input_type_raw);
 }
 
 }  // namespace
@@ -106,6 +127,114 @@ int jx_kmc_info(JxKmcHandle handle, JxKmcDbInfo* out_info) {
         return 0;
     } catch (...) {
         set_error("unknown C++ exception in jx_kmc_info");
+        return 0;
+    }
+}
+
+int jx_kmc_count_run(
+    const char* const* input_files,
+    size_t input_files_len,
+    const char* output_prefix,
+    const char* tmp_dir,
+    uint32_t kmer_len,
+    uint32_t threads,
+    uint32_t max_ram_gb,
+    uint64_t cutoff_min,
+    uint64_t cutoff_max,
+    uint64_t counter_max,
+    int canonical,
+    const char* input_type,
+    JxKmcCountStats* out_stats
+) {
+    clear_error();
+    if (input_files == nullptr || input_files_len == 0U) {
+        set_error("input_files cannot be empty");
+        return 0;
+    }
+    if (output_prefix == nullptr || output_prefix[0] == '\0') {
+        set_error("output_prefix cannot be empty");
+        return 0;
+    }
+    if (tmp_dir == nullptr || tmp_dir[0] == '\0') {
+        set_error("tmp_dir cannot be empty");
+        return 0;
+    }
+    if (input_type == nullptr || input_type[0] == '\0') {
+        set_error("input_type cannot be empty");
+        return 0;
+    }
+    if (out_stats == nullptr) {
+        set_error("out_stats cannot be null");
+        return 0;
+    }
+    if (kmer_len == 0U) {
+        set_error("kmer_len must be > 0");
+        return 0;
+    }
+    if (max_ram_gb == 0U) {
+        set_error("max_ram_gb must be > 0");
+        return 0;
+    }
+
+    try {
+        std::vector<std::string> files;
+        files.reserve(input_files_len);
+        for (size_t idx = 0; idx < input_files_len; ++idx) {
+            const char* raw = input_files[idx];
+            if (raw == nullptr || raw[0] == '\0') {
+                throw std::runtime_error("input_files contains an empty path");
+            }
+            files.emplace_back(raw);
+        }
+
+        KMC::Stage1Params stage1;
+        KMC::NullLogger quiet_logger;
+        KMC::NullPercentProgressObserver quiet_percent;
+        KMC::NullProgressObserver quiet_progress;
+        stage1.SetInputFiles(files)
+            .SetTmpPath(std::string(tmp_dir))
+            .SetKmerLen(kmer_len)
+            .SetMaxRamGB(max_ram_gb)
+            .SetInputFileType(parse_input_type(std::string(input_type)))
+            .SetCanonicalKmers(canonical != 0)
+            .SetVerboseLogger(&quiet_logger)
+            .SetWarningsLogger(&quiet_logger)
+            .SetPercentProgressObserver(&quiet_percent)
+            .SetProgressObserver(&quiet_progress);
+        if (threads > 0U) {
+            stage1.SetNThreads(threads);
+        }
+
+        KMC::Stage2Params stage2;
+        stage2.SetMaxRamGB(max_ram_gb)
+            .SetOutputFileName(std::string(output_prefix))
+            .SetOutputFileType(KMC::OutputFileType::KMC)
+            .SetCutoffMin(cutoff_min)
+            .SetCutoffMax(cutoff_max)
+            .SetCounterMax(counter_max);
+        if (threads > 0U) {
+            stage2.SetNThreads(threads);
+        }
+
+        KMC::Runner runner;
+        auto stage1_results = runner.RunStage1(stage1);
+        auto stage2_results = runner.RunStage2(stage2);
+
+        out_stats->stage1_time_s = static_cast<double>(stage1_results.time);
+        out_stats->stage2_time_s = static_cast<double>(stage2_results.time);
+        out_stats->n_sequences = static_cast<uint64_t>(stage1_results.nSeqences);
+        out_stats->tmp_size_stage1 = static_cast<uint64_t>(stage1_results.tmpSize);
+        out_stats->n_total_kmers = static_cast<uint64_t>(stage2_results.nTotalKmers);
+        out_stats->n_unique_kmers = static_cast<uint64_t>(stage2_results.nUniqueKmers);
+        out_stats->n_below_cutoff_min = static_cast<uint64_t>(stage2_results.nBelowCutoffMin);
+        out_stats->n_above_cutoff_max = static_cast<uint64_t>(stage2_results.nAboveCutoffMax);
+        out_stats->max_disk_usage = static_cast<uint64_t>(stage2_results.maxDiskUsage);
+        return 1;
+    } catch (const std::exception& err) {
+        set_error(err.what());
+        return 0;
+    } catch (...) {
+        set_error("unknown C++ exception in jx_kmc_count_run");
         return 0;
     }
 }

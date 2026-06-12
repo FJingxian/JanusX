@@ -58,7 +58,7 @@ index-url = "https://pypi.tuna.tsinghua.edu.cn/simple"
 python-install-mirror = "https://registry.npmmirror.com/-/binary/python-build-standalone/"
 
 [build-system]
-requires = ["maturin>=1.7,<2", "numpy>=1.23,!=2.4.3", "pybind11>=2.13.0"]
+requires = ["maturin>=1.7,<2", "numpy>=1.23,!=2.4.3"]
 build-backend = "build_backend"
 backend-path = ["scripts"]
 
@@ -71,20 +71,16 @@ cargo-extra-args = "--locked --features python-extension"
 include = [
     { path = "scripts/build_backend.py", format = "sdist" },
     { path = "todo/FastTree.c", format = "sdist" },
-    { path = "python/janusx/native/build_kmc_bind.py", format = "sdist" },
-    { path = "python/janusx/native/kmc_count_bind.cpp", format = "sdist" },
     { path = "python/janusx/native/vendor/kmc/3rd_party/cloudflare/zlib.h", format = "sdist" },
     { path = "python/janusx/native/vendor/kmc/kmc_core/*.h", format = "sdist" },
     { path = "python/janusx/native/vendor/kmc/kmc_core/*.cpp", format = "sdist" },
     { path = "python/janusx/native/vendor/kmc/kmc_api/*.h", format = "sdist" },
     { path = "python/janusx/native/vendor/kmc/kmc_api/*.cpp", format = "sdist" },
-    { path = "python/janusx/native/vendor/kmc/py_kmc_api/libs/pybind11/include/**", format = "sdist" },
     { path = "python/janusx/native/vendor/kmc/3rd_party/cloudflare/zlib.h", format = "wheel" },
     { path = "python/janusx/native/vendor/kmc/kmc_core/*.h", format = "wheel" },
     { path = "python/janusx/native/vendor/kmc/kmc_core/*.cpp", format = "wheel" },
     { path = "python/janusx/native/vendor/kmc/kmc_api/*.h", format = "wheel" },
     { path = "python/janusx/native/vendor/kmc/kmc_api/*.cpp", format = "wheel" },
-    { path = "python/janusx/native/vendor/kmc/py_kmc_api/libs/pybind11/include/**", format = "wheel" },
 ]
 exclude = [
     "python/janusx/native/vendor/kmc/**/*.o",

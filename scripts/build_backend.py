@@ -161,14 +161,6 @@ def _env_flag_optional(name: str) -> bool | None:
         return None
     return raw in {"1", "true", "yes", "on"}
 
-def _strict_kmc_bind_mode() -> bool:
-    explicit = _env_flag_optional("JANUSX_STRICT_KMC_BIND")
-    if explicit is not None:
-        return bool(explicit)
-    # Default strict on Linux/macOS wheel builds to avoid publishing wheels
-    # that require runtime C++ compilation for `jx kmer`.
-    return sys.platform.startswith("linux") or (sys.platform == "darwin")
-
 
 def _project_root() -> Path:
     here = Path(__file__).resolve()
@@ -176,35 +168,6 @@ def _project_root() -> Path:
         if (parent / "pyproject.toml").is_file():
             return parent
     return here.parent
-
-
-def _build_kmc_extension_for_wheel() -> Path | None:
-    if str(os.environ.get("JANUSX_PREBUILD_KMC_BIND", "")).strip() == "0":
-        return None
-    py_src = _project_root() / "python"
-    if not py_src.is_dir():
-        return None
-    if str(py_src) not in sys.path:
-        sys.path.insert(0, str(py_src))
-    try:
-        from janusx.kmc_bind import build_kmc_bind_module  # type: ignore
-
-        kmc_src_raw = str(os.environ.get("JANUSX_KMC_SRC", "")).strip()
-        ext_path = build_kmc_bind_module(
-            kmc_src=kmc_src_raw or None,
-            rebuild=_env_flag("JANUSX_KMC_REBUILD"),
-            verbose=_env_flag("JANUSX_BUILD_VERBOSE"),
-        )
-        return Path(ext_path)
-    except Exception as exc:
-        if _strict_kmc_bind_mode():
-            raise
-        print(
-            f"[build-backend] warning: prebuild _kmc_count failed ({exc}); "
-            "wheel will fallback to runtime compilation path.",
-            flush=True,
-        )
-        return None
 
 
 def _sha256_record(path: Path) -> tuple[str, int]:
@@ -731,7 +694,6 @@ def build_wheel(
     metadata_directory: str | None = None,
 ) -> str:
     config_settings = _enable_macos_metal_gpu_default(config_settings)
-    ext_path = _build_kmc_extension_for_wheel()
     win_dlls = _collect_windows_runtime_dlls()
     mac_dylibs = _collect_macos_openblas_dylibs()
     if sys.platform.startswith("win") and _env_flag("JANUSX_REQUIRE_OPENBLAS"):
@@ -741,35 +703,26 @@ def build_wheel(
                 "JANUSX_REQUIRE_OPENBLAS=1 but no OpenBLAS runtime DLL was found for wheel bundling. "
                 "Set OPENBLAS_BIN_DIR/OPENBLAS_LIB_DIR or use a conda env with OpenBLAS in Library/bin."
             )
-
-    prev = os.environ.get("JANUSX_PREBUILD_KMC_BIND")
-    os.environ["JANUSX_PREBUILD_KMC_BIND"] = "0"
+    _ensure_maturin_on_path()
     try:
-        _ensure_maturin_on_path()
-        try:
-            wheel_name = _MATURIN.build_wheel(
-                wheel_directory,
-                config_settings,
-                metadata_directory,
-            )
-        except FileNotFoundError as exc:
-            missing = str(getattr(exc, "filename", "")).strip().lower()
-            if missing != "maturin":
-                raise
-            print(
-                "[build-backend] warning: `maturin` executable not found on PATH; "
-                "falling back to `python -m maturin`.",
-                flush=True,
-            )
-            wheel_name = _build_wheel_via_python_module(
-                wheel_directory,
-                config_settings,
-            )
-    finally:
-        if prev is None:
-            os.environ.pop("JANUSX_PREBUILD_KMC_BIND", None)
-        else:
-            os.environ["JANUSX_PREBUILD_KMC_BIND"] = prev
+        wheel_name = _MATURIN.build_wheel(
+            wheel_directory,
+            config_settings,
+            metadata_directory,
+        )
+    except FileNotFoundError as exc:
+        missing = str(getattr(exc, "filename", "")).strip().lower()
+        if missing != "maturin":
+            raise
+        print(
+            "[build-backend] warning: `maturin` executable not found on PATH; "
+            "falling back to `python -m maturin`.",
+            flush=True,
+        )
+        wheel_name = _build_wheel_via_python_module(
+            wheel_directory,
+            config_settings,
+        )
 
     fasttree_files = _collect_fasttree_artifacts()
     if len(fasttree_files) == 0:
@@ -779,8 +732,6 @@ def build_wheel(
         )
 
     artifacts: list[tuple[Path, Path]] = []
-    if ext_path is not None:
-        artifacts.append((ext_path, Path("janusx") / ext_path.name))
     for fasttree_file in fasttree_files:
         artifacts.append((fasttree_file, Path("janusx") / "bin" / fasttree_file.name))
     for dll in win_dlls:
@@ -791,8 +742,6 @@ def build_wheel(
     if len(artifacts) > 0:
         wheel_path = Path(wheel_directory).resolve() / wheel_name
         _inject_artifacts_into_wheel(wheel_path, artifacts)
-        if ext_path is not None:
-            print(f"[build-backend] injected extension: janusx/{ext_path.name}", flush=True)
         joined_fasttree = ", ".join(f"janusx/bin/{p.name}" for p in fasttree_files)
         print(f"[build-backend] injected FastTree artifacts: {joined_fasttree}", flush=True)
         if win_dlls:

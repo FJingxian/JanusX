@@ -13,7 +13,10 @@ import subprocess
 import time
 from pathlib import Path
 
-from janusx.kmc_bind import run_kmc_count
+try:
+    from janusx import janusx as jxrs
+except Exception:
+    jxrs = None
 
 from ._common.config_render import emit_cli_configuration
 from ._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog
@@ -21,6 +24,14 @@ from ._common.log import setup_logging
 from ._common.pathcheck import format_path_for_display
 from ._common.status import CliStatus, format_elapsed, log_success, stdout_is_tty
 from ._common.threads import detect_effective_threads, format_requested_thread_usage
+
+
+def _require_rust_backend() -> None:
+    if jxrs is None or not hasattr(jxrs, "kmer_count_run"):
+        raise RuntimeError(
+            "JanusX Rust extension is unavailable or missing `kmer_count_run`. "
+            "Please rebuild/install the extension first."
+        )
 
 
 def _infer_input_type(paths: list[str]) -> str:
@@ -657,6 +668,7 @@ def main() -> int:
         parser.error("-limit-mem/--limit-mem must be >= 2.")
     if int(args.kmer_len) <= 0:
         parser.error("-k/--kmer-len must be > 0.")
+    _require_rust_backend()
 
     input_files = [str(Path(x).expanduser()) for x in args.fa]
     out_dir = Path(args.out).expanduser().resolve()
@@ -687,9 +699,6 @@ def main() -> int:
 
     use_spinner = bool(stdout_is_tty())
     canonical = _env_flag("JANUSX_KMER_CANONICAL", default=True)
-    kmc_src = str(os.environ.get("JANUSX_KMC_SRC", "")).strip() or None
-    rebuild_bind = _env_flag("JANUSX_KMC_REBUILD", default=False)
-    verbose_build = _env_flag("JANUSX_BUILD_VERBOSE", default=False)
 
     try:
         for p in input_files:
@@ -756,41 +765,39 @@ def main() -> int:
         if use_spinner:
             with CliStatus("Running KMC count...", enabled=True, use_process=True) as task:
                 try:
-                    stats = run_kmc_count(
-                        input_files=input_files,
-                        output_prefix=output_prefix,
-                        tmp_dir=tmp_dir,
-                        kmer_len=int(args.kmer_len),
-                        threads=threads,
-                        max_ram_gb=int(args.limit_mem_gb),
-                        cutoff_min=int(args.cutoff_min),
-                        cutoff_max=int(args.cutoff_max),
-                        counter_max=int(args.counter_max),
-                        canonical=canonical,
-                        input_type=input_type,
-                        kmc_src=kmc_src,
-                        rebuild_bind=bool(rebuild_bind),
-                        verbose_build=bool(verbose_build),
+                    stats = dict(
+                        jxrs.kmer_count_run(
+                            input_files=input_files,
+                            output_prefix=output_prefix,
+                            tmp_dir=tmp_dir,
+                            kmer_len=int(args.kmer_len),
+                            threads=threads,
+                            max_ram_gb=int(args.limit_mem_gb),
+                            cutoff_min=int(args.cutoff_min),
+                            cutoff_max=int(args.cutoff_max),
+                            counter_max=int(args.counter_max),
+                            canonical=canonical,
+                            input_type=input_type,
+                        )
                     )
                 except Exception:
                     task.fail("Running KMC count ...Failed")
                     raise
         else:
-            stats = run_kmc_count(
-                input_files=input_files,
-                output_prefix=output_prefix,
-                tmp_dir=tmp_dir,
-                kmer_len=int(args.kmer_len),
-                threads=threads,
-                max_ram_gb=int(args.limit_mem_gb),
-                cutoff_min=int(args.cutoff_min),
-                cutoff_max=int(args.cutoff_max),
-                counter_max=int(args.counter_max),
-                canonical=canonical,
-                input_type=input_type,
-                kmc_src=kmc_src,
-                rebuild_bind=bool(rebuild_bind),
-                verbose_build=bool(verbose_build),
+            stats = dict(
+                jxrs.kmer_count_run(
+                    input_files=input_files,
+                    output_prefix=output_prefix,
+                    tmp_dir=tmp_dir,
+                    kmer_len=int(args.kmer_len),
+                    threads=threads,
+                    max_ram_gb=int(args.limit_mem_gb),
+                    cutoff_min=int(args.cutoff_min),
+                    cutoff_max=int(args.cutoff_max),
+                    counter_max=int(args.counter_max),
+                    canonical=canonical,
+                    input_type=input_type,
+                )
             )
 
         logger.info(

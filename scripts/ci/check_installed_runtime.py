@@ -140,7 +140,7 @@ def _check_macos_bundled_openblas_signature_and_probe_load() -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Verify installed janusx runtime backend and KMC availability.")
+    parser = argparse.ArgumentParser(description="Verify installed janusx runtime backend and Rust KMC entrypoints.")
     parser.add_argument(
         "--require-openblas",
         action="store_true",
@@ -155,9 +155,10 @@ def main() -> int:
     )
     parser.add_argument(
         "--check-kmc-load",
+        "--check-kmer-count-run",
         action="store_true",
         default=False,
-        help="Try loading janusx.kmc_bind prebuilt module with CXX disabled.",
+        help="Require janusx.janusx to export kmer_count_run().",
     )
     parser.add_argument(
         "--check-macos-bundled-openblas",
@@ -208,12 +209,10 @@ def main() -> int:
             )
 
     if args.check_kmc_load:
-        os.environ.setdefault("JANUSX_KMC_BIND_NO_BUILD", "1")
-        os.environ.setdefault("CXX", "__janusx_disabled_cxx__")
-        from janusx.kmc_bind import load_kmc_bind_module
-
-        mod = load_kmc_bind_module(verbose=False)
-        print(f"[check_installed_runtime] kmc_bind_loaded={mod.__name__}")
+        has_symbol = hasattr(jx, "kmer_count_run")
+        print(f"[check_installed_runtime] kmer_count_run={has_symbol}")
+        if not has_symbol:
+            raise SystemExit("Strict mode failed: janusx.janusx lacks kmer_count_run()")
 
     if args.check_macos_bundled_openblas:
         _check_macos_bundled_openblas_signature_and_probe_load()

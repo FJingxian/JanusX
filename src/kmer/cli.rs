@@ -7,8 +7,8 @@ use anyhow::{bail, Context, Result};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
-use std::fs::{self, File};
-use std::io::{BufRead, BufReader};
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug)]
@@ -29,6 +29,7 @@ pub struct KmergeArgs {
     pub resume: bool,
     pub keep_tmp: bool,
     pub force: bool,
+    pub log_path: Option<PathBuf>,
 }
 
 #[pyfunction(
@@ -49,7 +50,8 @@ pub struct KmergeArgs {
         min_count = 1,
         resume = false,
         keep_tmp = false,
-        force = false
+        force = false,
+        log_path = None
     )
 )]
 pub fn kmerge_run_py(
@@ -70,6 +72,7 @@ pub fn kmerge_run_py(
     resume: bool,
     keep_tmp: bool,
     force: bool,
+    log_path: Option<String>,
 ) -> PyResult<Py<PyDict>> {
     let args = KmergeArgs {
         db_inputs,
@@ -88,6 +91,7 @@ pub fn kmerge_run_py(
         resume,
         keep_tmp,
         force,
+        log_path: log_path.map(PathBuf::from),
     };
 
     let summary = py
@@ -135,6 +139,7 @@ pub fn run_kmerge(args: KmergeArgs) -> Result<Stage3Summary> {
         );
     }
     let k = inspect_common_k(&samples)?;
+    let log_path = args.log_path.as_deref();
 
     prepare_output_space(&out_dir, &tmp_dir, &args, &samples)?;
 
@@ -142,24 +147,31 @@ pub fn run_kmerge(args: KmergeArgs) -> Result<Stage3Summary> {
         && is_stage_done(&tmp_dir.join("stage3.done"))
         && out_dir.join(format!("{}.meta.json", args.prefix)).is_file()
     {
+        emit_run_line(
+            log_path,
+            "Stage 3/3: resume hit, reusing existing final outputs",
+        )?;
         return load_existing_summary(&out_dir, &args.prefix);
     }
 
     let max_records_per_flush =
         max_records_per_flush(args.memory_mb, args.threads, args.max_run_size_mb)?;
 
-    println!(
-        "Rust kmerge: samples={}, k={}, threads={}, memory={}MB, bucket_bits={}, batch_size={}",
-        samples.len(),
-        k,
-        args.threads,
-        args.memory_mb,
-        args.bucket_bits,
-        args.batch_size
-    );
+    emit_run_line(
+        log_path,
+        &format!(
+            "Rust kmerge: samples={}, k={}, threads={}, memory={}MB, bucket_bits={}, batch_size={}",
+            samples.len(),
+            k,
+            args.threads,
+            args.memory_mb,
+            args.bucket_bits,
+            args.batch_size
+        ),
+    )?;
 
     if !(args.resume && is_stage_done(&tmp_dir.join("stage1.done"))) {
-        println!("Stage 1/3: KMC stream -> bucketed sorted runs");
+        emit_run_line(log_path, "Stage 1/3: KMC stream -> bucketed sorted runs")?;
         run_stage1(&Stage1Config {
             tmp_dir: &tmp_dir,
             samples: &samples,
@@ -171,14 +183,14 @@ pub fn run_kmerge(args: KmergeArgs) -> Result<Stage3Summary> {
             threads: args.threads,
         })?;
     } else {
-        println!("Stage 1/3: resume hit, reusing existing sorted runs");
+        emit_run_line(log_path, "Stage 1/3: resume hit, reusing existing sorted runs")?;
     }
 
     let parts = if args.resume && is_stage_done(&tmp_dir.join("stage2.done")) {
-        println!("Stage 2/3: resume hit, reusing existing bucket parts");
+        emit_run_line(log_path, "Stage 2/3: resume hit, reusing existing bucket parts")?;
         load_stage2_manifest(&tmp_dir)?
     } else {
-        println!("Stage 2/3: bucket merge -> .bkmer.part / .bsite.part");
+        emit_run_line(log_path, "Stage 2/3: bucket merge -> .bkmer.part / .bsite.part")?;
         run_stage2(&Stage2Config {
             tmp_dir: &tmp_dir,
             n_samples: samples.len(),
@@ -193,7 +205,7 @@ pub fn run_kmerge(args: KmergeArgs) -> Result<Stage3Summary> {
         bail!("no k-mers survived filters across all buckets");
     }
 
-    println!("Stage 3/3: concat parts -> final matrix");
+    emit_run_line(log_path, "Stage 3/3: concat parts -> final matrix")?;
     let summary = run_stage3(&Stage3Config {
         out_dir: &out_dir,
         prefix: &args.prefix,
@@ -213,6 +225,20 @@ pub fn run_kmerge(args: KmergeArgs) -> Result<Stage3Summary> {
     }
 
     Ok(summary)
+}
+
+fn emit_run_line(log_path: Option<&Path>, line: &str) -> Result<()> {
+    println!("{line}");
+    if let Some(path) = log_path {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .with_context(|| format!("failed to open kmerge log file: {}", path.display()))?;
+        writeln!(file, "{line}")
+            .with_context(|| format!("failed to write kmerge log file: {}", path.display()))?;
+    }
+    Ok(())
 }
 
 fn resolve_samples(

@@ -288,6 +288,18 @@ def detect_effective_threads() -> int:
     return int(detect_thread_budget_info()["effective_threads"])
 
 
+def format_requested_thread_usage(
+    requested_threads: int,
+    using_threads: int,
+    detected_threads: int,
+) -> str:
+    return (
+        f"Requested={int(requested_threads)} | "
+        f"Using={int(using_threads)} "
+        f"(Local Effective: {int(detected_threads)})"
+    )
+
+
 def apply_blas_thread_env(
     threads: int,
     *,

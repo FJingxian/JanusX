@@ -36,7 +36,7 @@ Modules:
     Pipeline and utility:
     fastq2vcf     Variant-calling pipeline from FASTQ to VCF
     fastq2count   RNA-seq counting pipeline from FASTQ to count matrix
-    kmer          K-mer workflow: count(KMC) or tree(WASTER)
+    kmer          K-mer counting workflow via KMC
     kmerge        Merge multi-sample KMC databases into genotype matrix
     view          View .bkmer/.bsite as plain text for pipes
     tree          Tree workflow entry (`-nj` Neighbor-Joining / `-ml` FastTree ML)
@@ -336,7 +336,7 @@ def _print_cli_help() -> None:
     print(f"  {_style_blue('Pipeline and utility:')}")
     _print_help_entry(4, "fastq2vcf", "Variant-calling pipeline from FASTQ to VCF", 12, width)
     _print_help_entry(4, "fastq2count", "RNA-seq counting pipeline from FASTQ to count matrix", 12, width)
-    _print_help_entry(4, "kmer", "K-mer workflow: count(KMC) or tree(WASTER)", 12, width)
+    _print_help_entry(4, "kmer", "K-mer counting workflow via KMC", 12, width)
     _print_help_entry(4, "kmerge", "Merge multi-sample KMC databases into genotype matrix", 12, width)
     _print_help_entry(4, "view", "View .bkmer/.bsite as plain text for shell pipes", 12, width)
     _print_help_entry(4, "tree", "Tree workflow entry (`-nj` Neighbor-Joining / `-ml` FastTree ML)", 12, width)

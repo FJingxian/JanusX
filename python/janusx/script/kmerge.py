@@ -1,11 +1,39 @@
 from __future__ import annotations
 
+import logging
+import socket
 from pathlib import Path
 
 from janusx import janusx as jxrs
 
+from ._common.config_render import emit_cli_configuration
 from ._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog
-from ._common.threads import detect_effective_threads
+from ._common.log import setup_logging
+from ._common.pathcheck import format_path_for_display
+from ._common.status import log_success
+from ._common.threads import detect_effective_threads, format_requested_thread_usage
+
+
+def _reopen_file_handlers_append(logger: logging.Logger) -> None:
+    file_specs: list[tuple[str, int, logging.Formatter | None]] = []
+    for handler in list(logger.handlers):
+        if isinstance(handler, logging.FileHandler):
+            try:
+                handler.flush()
+            except Exception:
+                pass
+            file_specs.append((str(handler.baseFilename), int(handler.level), handler.formatter))
+            logger.removeHandler(handler)
+            try:
+                handler.close()
+            except Exception:
+                pass
+    for filename, level, formatter in file_specs:
+        handler = logging.FileHandler(filename, mode="a", encoding="utf-8")
+        handler.setLevel(level)
+        if formatter is not None:
+            handler.setFormatter(formatter)
+        logger.addHandler(handler)
 
 
 def build_parser():
@@ -21,7 +49,7 @@ def build_parser():
         ),
         description=(
             "Merge multi-sample KMC databases into JanusX k-mer bitmatrix output "
-            "(.idv + .bkmer + .bsite + .meta.json)."
+            "(.idv + .bkmer + .bsite + .meta.json) and write <prefix>.kmerge.log."
         ),
     )
 
@@ -146,6 +174,7 @@ def main() -> int:
     db_inputs = [str(item) for group in args.db for item in group]
     if len(db_inputs) == 0:
         parser.error("-db/--db cannot be empty.")
+    db_inputs_log = [str(Path(item).expanduser().resolve()) for item in db_inputs]
 
     if args.thread <= 0:
         parser.error("-t/--thread must be > 0.")
@@ -171,51 +200,104 @@ def main() -> int:
 
     detected_threads = int(detect_effective_threads())
     threads = int(args.thread)
-    if threads > detected_threads:
-        print(
-            f"Warning: Requested threads={threads} exceeds detected available={detected_threads}; "
-            f"using {detected_threads}.",
-            flush=True,
-        )
-        threads = detected_threads
-
     out_dir = str(Path(args.out).expanduser().resolve())
     Path(out_dir).mkdir(parents=True, exist_ok=True)
     prefix = str(args.prefix).strip()
     if prefix == "":
         parser.error("-prefix/--prefix cannot be empty.")
+    log_path = str(Path(out_dir) / f"{prefix}.kmerge.log")
+    logger = setup_logging(log_path)
 
-    summary = jxrs.kmerge_run(
-        db_inputs=db_inputs,
-        sample_ids=None if args.sample_id is None else [str(x).strip() for x in args.sample_id],
-        out=out_dir,
-        prefix=prefix,
-        thread=threads,
-        memory=int(args.memory),
-        min_presence=int(args.min_presence),
-        freq=float(args.freq),
-        tmp_dir=None if args.tmp_dir is None else str(Path(args.tmp_dir).expanduser().resolve()),
-        max_run_size=int(args.max_run_size),
-        bucket_bits=int(args.bucket_bits),
-        batch_size=int(args.batch_size),
-        min_count=int(args.min_count),
-        resume=bool(args.resume),
-        keep_tmp=bool(args.keep_tmp),
-        force=bool(args.force),
+    if threads > detected_threads:
+        logger.warning(
+            f"Requested threads={threads} exceeds detected available={detected_threads}; "
+            f"using {detected_threads}."
+        )
+        threads = detected_threads
+
+    emit_cli_configuration(
+        logger,
+        app_title="JanusX kmerge",
+        config_title="Multi-sample KMC merge",
+        host=socket.gethostname(),
+        sections=[
+            (
+                "Input",
+                [
+                    ("DB inputs", len(db_inputs)),
+                    ("Sample IDs", len(args.sample_id) if args.sample_id is not None else "auto"),
+                ],
+            ),
+            (
+                "Filter",
+                [
+                    ("Min count", int(args.min_count)),
+                    ("Min presence", int(args.min_presence)),
+                    ("Freq", float(args.freq)),
+                ],
+            ),
+                (
+                    "Runtime",
+                    [
+                        (
+                            "Threads",
+                            format_requested_thread_usage(
+                                requested_threads=args.thread,
+                                using_threads=threads,
+                                detected_threads=detected_threads,
+                            ),
+                        ),
+                        ("Memory MB", int(args.memory)),
+                        ("Bucket bits", int(args.bucket_bits)),
+                        ("Batch size", int(args.batch_size)),
+                    ("Keep tmp", bool(args.keep_tmp)),
+                    ("Resume", bool(args.resume)),
+                    ("Force", bool(args.force)),
+                    ("Log file", log_path),
+                ],
+            ),
+        ],
+        footer_rows=[("Output dir", out_dir), ("Prefix", prefix)],
     )
+    logger.info("Input KMC DB arguments:")
+    for idx, path in enumerate(db_inputs_log, start=1):
+        logger.info(f"  [{idx}] {path}")
+    _reopen_file_handlers_append(logger)
 
-    print(
+    try:
+        summary = jxrs.kmerge_run(
+            db_inputs=db_inputs,
+            sample_ids=None if args.sample_id is None else [str(x).strip() for x in args.sample_id],
+            out=out_dir,
+            prefix=prefix,
+            thread=threads,
+            memory=int(args.memory),
+            min_presence=int(args.min_presence),
+            freq=float(args.freq),
+            tmp_dir=None if args.tmp_dir is None else str(Path(args.tmp_dir).expanduser().resolve()),
+            max_run_size=int(args.max_run_size),
+            bucket_bits=int(args.bucket_bits),
+            batch_size=int(args.batch_size),
+            min_count=int(args.min_count),
+            resume=bool(args.resume),
+            keep_tmp=bool(args.keep_tmp),
+            force=bool(args.force),
+            log_path=log_path,
+        )
+    except Exception as exc:
+        logger.error(str(exc))
+        return 1
+
+    log_success(
+        logger,
         f"Merged {int(summary['n_kmers'])} k-mers across {int(summary['n_samples'])} samples (k={int(summary['k'])}).",
-        flush=True,
     )
-    print(
-        "Output files:\n"
-        f"  {summary['idv']}\n"
-        f"  {summary['bkmer']}\n"
-        f"  {summary['bsite']}\n"
-        f"  {summary['meta']}",
-        flush=True,
-    )
+    logger.info("Output files:")
+    logger.info(f"  {format_path_for_display(summary['idv'])}")
+    logger.info(f"  {format_path_for_display(summary['bkmer'])}")
+    logger.info(f"  {format_path_for_display(summary['bsite'])}")
+    logger.info(f"  {format_path_for_display(summary['meta'])}")
+    logger.info(f"Log file: {format_path_for_display(log_path)}")
     return 0
 
 

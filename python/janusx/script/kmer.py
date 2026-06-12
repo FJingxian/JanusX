@@ -8,15 +8,19 @@ import re
 import shlex
 import shutil
 import signal
+import socket
 import subprocess
 import time
 from pathlib import Path
 
 from janusx.kmc_bind import run_kmc_count
 
+from ._common.config_render import emit_cli_configuration
 from ._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog
-from ._common.status import CliStatus, stdout_is_tty
-from ._common.threads import detect_effective_threads
+from ._common.log import setup_logging
+from ._common.pathcheck import format_path_for_display
+from ._common.status import CliStatus, format_elapsed, log_success, stdout_is_tty
+from ._common.threads import detect_effective_threads, format_requested_thread_usage
 
 
 def _infer_input_type(paths: list[str]) -> str:
@@ -479,44 +483,26 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=cli_help_formatter(),
         epilog=minimal_help_epilog(
             [
-                "jx kmer -fa sample.fastq.gz --count -o out -prefix sample_k19 -k 19 -t 8",
-                "jx kmer -fa species1.fa species2.fa --tree -o out -prefix species_tree -t 8 --waster-mode 4",
-                "JANUSX_WASTER_BIN=/path/waster jx kmer -fa *.fa --tree -o out",
+                "jx kmer -fa sample.fastq.gz -o out -prefix sample_k19 -k 19 -t 8",
+                "jx kmer -fa read_1.fq.gz read_2.fq.gz -o out -prefix sample_pe -k 31 -ci 1",
                 "Common params: -fa/-t/-o/-prefix/-k/-limit-mem",
-                "Count-only params (--count): -ci/-cx/--counter-max/--tmp-dir",
-                "Tree-only params (--tree): --waster-mode/--waster-sampled/--waster-qcs/--waster-qcn/--waster-pattern/--waster-consensus/--waster-continue-file",
+                "Count params: -ci/-cx/--counter-max/--tmp-dir",
             ]
         ),
         description=(
-            "K-mer workflow entry with FASTA/FASTQ input. "
-            "Use --count for KMC databases (<prefix>.kmc_pre/.kmc_suf), "
-            "or --tree for WASTER reference-free Newick."
+            "K-mer counting workflow with FASTA/FASTQ input. "
+            "Generates KMC databases (<prefix>.kmc_pre/.kmc_suf) and <prefix>.kmer.log."
         ),
     )
-    common_group = parser.add_argument_group("Common arguments (all workflows)")
-    workflow = parser.add_argument_group("Workflow selector")
+    common_group = parser.add_argument_group("Common arguments")
     count_group = parser.add_argument_group("Kmer count optional arguments")
-    tree_group = parser.add_argument_group("WASTER optional arguments")
 
     common_group.add_argument(
         "-fa",
         "--fa",
         nargs="+",
         required=True,
-        help="Input FASTQ/FASTA files (one or more). Each file is treated as one sample/species.",
-    )
-
-    workflow.add_argument(
-        "-count",
-        "--count",
-        action="store_true",
-        help="Use KMC counting workflow (default when neither --count nor --tree is set).",
-    )
-    workflow.add_argument(
-        "-tree",
-        "--tree",
-        action="store_true",
-        help="Use WASTER workflow to infer reference-free phylogeny files.",
+        help="Input FASTQ/FASTA files (one or more). Multiple files are counted into one KMC database.",
     )
 
     common_group.add_argument(
@@ -556,8 +542,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=8,
         help=(
             "Memory limit in GB (default: 8). "
-            "For --count: passed to KMC memory cap. "
-            "For --tree: subprocess memory watchdog kills task on limit exceed."
+            "Passed to KMC as the memory cap."
         ),
     )
     common_group.add_argument(
@@ -595,51 +580,60 @@ def build_parser() -> argparse.ArgumentParser:
         help="Temporary directory for KMC intermediate files (default: <out>.kmc_tmp).",
     )
 
-    tree_group.add_argument(
+    parser.add_argument(
+        "-count",
+        "--count",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "-tree",
+        "--tree",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
         "--waster-mode",
         type=int,
         choices=[1, 2, 3, 4],
         default=4,
-        help=(
-            "WASTER mode (default: 4). "
-            "1=whole inference, 2=patterns only, 3=SNPs only, 4=start from SNPs to Newick."
-        ),
+        help=argparse.SUPPRESS,
     )
-    tree_group.add_argument(
+    parser.add_argument(
         "--waster-sampled",
         type=int,
         default=16,
-        help="Maximum sampled species used by WASTER (default: 16).",
+        help=argparse.SUPPRESS,
     )
-    tree_group.add_argument(
+    parser.add_argument(
         "--waster-qcs",
         type=int,
         default=30,
-        help="WASTER SNP-base quality threshold for FASTQ inputs (default: 30).",
+        help=argparse.SUPPRESS,
     )
-    tree_group.add_argument(
+    parser.add_argument(
         "--waster-qcn",
         type=int,
         default=20,
-        help="WASTER non-SNP quality threshold for FASTQ inputs (default: 20).",
+        help=argparse.SUPPRESS,
     )
-    tree_group.add_argument(
+    parser.add_argument(
         "--waster-pattern",
         type=int,
         default=500_000_000,
-        help="WASTER number of frequent patterns (default: 500000000).",
+        help=argparse.SUPPRESS,
     )
-    tree_group.add_argument(
+    parser.add_argument(
         "--waster-consensus",
         type=int,
         default=25_000_000,
-        help="WASTER number of consensus profiles (default: 25000000).",
+        help=argparse.SUPPRESS,
     )
-    tree_group.add_argument(
+    parser.add_argument(
         "--waster-continue-file",
         type=str,
         default=None,
-        help="Optional WASTER --continue file path for reusing frequent patterns.",
+        help=argparse.SUPPRESS,
     )
 
     return parser
@@ -649,12 +643,15 @@ def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
 
-    mode_count = bool(args.count)
-    mode_tree = bool(args.tree)
-    if mode_count and mode_tree:
-        parser.error("--count and --tree are mutually exclusive.")
-    if not mode_count and not mode_tree:
-        mode_count = True
+    waster_requested = bool(args.tree) or args.waster_continue_file is not None
+    waster_requested = waster_requested or int(args.waster_mode) != 4
+    waster_requested = waster_requested or int(args.waster_sampled) != 16
+    waster_requested = waster_requested or int(args.waster_qcs) != 30
+    waster_requested = waster_requested or int(args.waster_qcn) != 20
+    waster_requested = waster_requested or int(args.waster_pattern) != 500_000_000
+    waster_requested = waster_requested or int(args.waster_consensus) != 25_000_000
+    if waster_requested:
+        parser.error("WASTER workflow in `jx kmer` is hidden and no longer supported.")
 
     if int(args.limit_mem_gb) < 2:
         parser.error("-limit-mem/--limit-mem must be >= 2.")
@@ -662,10 +659,6 @@ def main() -> int:
         parser.error("-k/--kmer-len must be > 0.")
 
     input_files = [str(Path(x).expanduser()) for x in args.fa]
-    for p in input_files:
-        if not Path(p).is_file():
-            raise FileNotFoundError(f"Input file not found: {p}")
-
     out_dir = Path(args.out).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -679,34 +672,85 @@ def main() -> int:
     out_parent = Path(output_prefix).parent
     if str(out_parent) not in {"", "."}:
         out_parent.mkdir(parents=True, exist_ok=True)
+    log_path = str(out_dir / f"{prefix}.kmer.log")
+    logger = setup_logging(log_path)
 
     detected_threads = int(detect_effective_threads())
     requested_threads = int(args.thread)
     threads = max(1, int(requested_threads))
     if threads > detected_threads:
-        print(
-            f"Warning: Requested threads={threads} exceeds detected available={detected_threads}; "
-            f"using {detected_threads}.",
-            flush=True,
+        logger.warning(
+            f"Requested threads={threads} exceeds detected available={detected_threads}; "
+            f"using {detected_threads}."
         )
         threads = int(detected_threads)
 
     use_spinner = bool(stdout_is_tty())
+    canonical = _env_flag("JANUSX_KMER_CANONICAL", default=True)
+    kmc_src = str(os.environ.get("JANUSX_KMC_SRC", "")).strip() or None
+    rebuild_bind = _env_flag("JANUSX_KMC_REBUILD", default=False)
+    verbose_build = _env_flag("JANUSX_BUILD_VERBOSE", default=False)
 
-    if mode_count:
-        canonical = _env_flag("JANUSX_KMER_CANONICAL", default=True)
-        kmc_src = str(os.environ.get("JANUSX_KMC_SRC", "")).strip() or None
-        rebuild_bind = _env_flag("JANUSX_KMC_REBUILD", default=False)
-        verbose_build = _env_flag("JANUSX_BUILD_VERBOSE", default=False)
+    try:
+        for p in input_files:
+            if not Path(p).is_file():
+                raise FileNotFoundError(f"Input file not found: {p}")
+        input_files = [str(Path(p).resolve()) for p in input_files]
 
         tmp_dir = str(Path(args.tmp_dir).expanduser()) if args.tmp_dir else f"{output_prefix}.kmc_tmp"
         Path(tmp_dir).mkdir(parents=True, exist_ok=True)
         input_type = _infer_input_type(input_files)
 
-        print(
+        emit_cli_configuration(
+            logger,
+            app_title="JanusX kmer",
+            config_title="KMC k-mer counting",
+            host=socket.gethostname(),
+            sections=[
+                (
+                    "Input",
+                    [
+                        ("Files", len(input_files)),
+                        ("Input type", input_type),
+                        ("Canonical", bool(canonical)),
+                    ],
+                ),
+                (
+                    "KMC",
+                    [
+                        ("K", int(args.kmer_len)),
+                        ("Cutoff min", int(args.cutoff_min)),
+                        ("Cutoff max", int(args.cutoff_max)),
+                        ("Counter max", int(args.counter_max)),
+                    ],
+                ),
+                (
+                    "Runtime",
+                    [
+                        (
+                            "Threads",
+                            format_requested_thread_usage(
+                                requested_threads=requested_threads,
+                                using_threads=threads,
+                                detected_threads=detected_threads,
+                            ),
+                        ),
+                        ("Memory GB", int(args.limit_mem_gb)),
+                        ("Tmp dir", tmp_dir),
+                        ("Log file", log_path),
+                    ],
+                ),
+            ],
+            footer_rows=[("Output prefix", output_prefix)],
+        )
+        logger.info("Input FASTA/FASTQ files:")
+        for idx, path in enumerate(input_files, start=1):
+            logger.info(f"  [{idx}] {path}")
+
+        t0 = time.monotonic()
+        logger.info(
             f"Running KMC count: inputs={len(input_files)}, k={int(args.kmer_len)}, "
-            f"threads={threads}, limit_mem_gb={int(args.limit_mem_gb)}, input_type={input_type}",
-            flush=True,
+            f"threads={threads}, limit_mem_gb={int(args.limit_mem_gb)}, input_type={input_type}"
         )
 
         if use_spinner:
@@ -749,71 +793,26 @@ def main() -> int:
                 verbose_build=bool(verbose_build),
             )
 
-        print(
+        logger.info(
             f"KMC finished: stage1={float(stats.get('stage1_time_s', 0.0)):.3f}s, "
             f"stage2={float(stats.get('stage2_time_s', 0.0)):.3f}s, "
             f"unique={int(stats.get('n_unique_kmers', 0))}, total={int(stats.get('n_total_kmers', 0))}"
         )
         if int(stats.get("n_total_kmers", 0)) == 0:
-            print(
-                "! Warning: KMC output is empty (total_kmers=0). "
-                "Try smaller -k and/or lower -ci (e.g. -ci 1), or provide longer input sequences.",
-                flush=True,
+            logger.warning(
+                "KMC output is empty (total_kmers=0). Try smaller -k and/or lower -ci "
+                "(e.g. -ci 1), or provide longer input sequences."
             )
-        print(f"Output files:\n  {output_prefix}.kmc_pre\n  {output_prefix}.kmc_suf")
+
+        log_success(logger, f"kmer finished [{format_elapsed(time.monotonic() - t0)}]")
+        logger.info("Output files:")
+        logger.info(f"  {format_path_for_display(f'{output_prefix}.kmc_pre')}")
+        logger.info(f"  {format_path_for_display(f'{output_prefix}.kmc_suf')}")
+        logger.info(f"Log file: {format_path_for_display(log_path)}")
         return 0
-
-    if int(args.waster_sampled) <= 0:
-        parser.error("--waster-sampled must be > 0.")
-    if int(args.waster_pattern) <= 0:
-        parser.error("--waster-pattern must be > 0.")
-    if int(args.waster_consensus) <= 0:
-        parser.error("--waster-consensus must be > 0.")
-    if not (0 <= int(args.waster_qcs) <= 93):
-        parser.error("--waster-qcs must be in [0, 93].")
-    if not (0 <= int(args.waster_qcn) <= 93):
-        parser.error("--waster-qcn must be in [0, 93].")
-
-    waster_bin = _resolve_tool_binary(
-        explicit=None,
-        env_vars=("JANUSX_WASTER_BIN",),
-        path_names=("waster", "WASTER"),
-        label="WASTER",
-    )
-
-    tree_outputs = _run_waster_tree_pipeline(
-        input_files=input_files,
-        out_dir=out_dir,
-        prefix=str(prefix),
-        threads=int(threads),
-        limit_mem_gb=int(args.limit_mem_gb),
-        waster_mode=int(args.waster_mode),
-        waster_sampled=int(args.waster_sampled),
-        waster_qcs=int(args.waster_qcs),
-        waster_qcn=int(args.waster_qcn),
-        waster_pattern=int(args.waster_pattern),
-        waster_consensus=int(args.waster_consensus),
-        waster_continue_file=(
-            str(Path(args.waster_continue_file).expanduser())
-            if args.waster_continue_file is not None
-            else None
-        ),
-        waster_bin=str(waster_bin),
-        use_spinner=use_spinner,
-    )
-    out_lines = [f"  {tree_outputs['waster_input_tsv']}"]
-    if "waster_snp_fa" in tree_outputs:
-        out_lines.append(f"  {tree_outputs['waster_snp_fa']}")
-    if "waster_patterns" in tree_outputs:
-        out_lines.append(f"  {tree_outputs['waster_patterns']}")
-    if "waster_newick" in tree_outputs:
-        out_lines.append(f"  {tree_outputs['waster_newick']}")
-    print(
-        f"WASTER tree workflow finished (mode={int(args.waster_mode)}).\n"
-        "Output files:\n" + "\n".join(out_lines),
-        flush=True,
-    )
-    return 0
+    except Exception as exc:
+        logger.error(str(exc))
+        return 1
 
 
 if __name__ == "__main__":

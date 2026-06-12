@@ -24,7 +24,10 @@ use crate::blas::{
     CBLAS_LOWER, CBLAS_NO_TRANS, CBLAS_ROW_MAJOR, CBLAS_TRANS, CBLAS_UPPER,
 };
 use crate::gfcore::read_fam;
-use crate::gfreader::prepare_bed_logic_meta_owned_for_stats_samples_with_mmap_window;
+use crate::gfreader::{
+    prepare_bed_logic_meta_owned_for_stats_samples_sparse_windowed,
+    prepare_bed_logic_meta_owned_for_stats_samples_with_mmap_window,
+};
 use crate::gload::WindowedBedMatrix;
 use crate::grm::decode_grm_block;
 use crate::stats_common::{
@@ -2744,6 +2747,7 @@ fn spgrm_stream_bed_to_jxgrm_core(
     mmap_window_mb: Option<usize>,
     progress_callback: Option<&Py<PyAny>>,
     progress_every: usize,
+    progress_done_offset: usize,
 ) -> Result<(String, usize, usize), String> {
     let n_samples_full = meta.n_samples;
     if n_samples_full == 0 {
@@ -2812,12 +2816,11 @@ fn spgrm_stream_bed_to_jxgrm_core(
         spgrm_batch_limits(row_step, sample_step, threads),
     );
     let total_batches = task_batches.len().max(1);
-    let total_blocks = m.div_ceil(row_step).max(1);
-    let total_steps = total_batches
-        .saturating_mul(total_blocks.saturating_add(1))
-        .saturating_add(1);
+    let total_progress = progress_done_offset
+        .saturating_add(total_batches.saturating_mul(m))
+        .max(1);
     let notify_step = if progress_every == 0 {
-        1usize
+        row_step.max(1)
     } else {
         progress_every.max(1)
     };
@@ -2865,13 +2868,21 @@ fn spgrm_stream_bed_to_jxgrm_core(
     let mut chunk_paths = Vec::<PathBuf>::new();
     let mut rel_row_indices = Vec::<usize>::new();
     let write_result = (|| -> Result<(usize, usize), String> {
-        let mut done_steps = 0usize;
         let mut last_notified = 0usize;
         let mut chunk_idx = 0usize;
         let mut nnz_total = 0usize;
         let mut buffer = Vec::<SpgrmEntry>::new();
 
-        for batch in task_batches.iter() {
+        spgrm_progress_notify(
+            progress_callback,
+            progress_done_offset,
+            total_progress,
+            notify_step,
+            &mut last_notified,
+            true,
+        )?;
+
+        for (batch_idx, batch) in task_batches.iter().enumerate() {
             let task_batch = &tasks[batch.start..batch.end];
             let (mut stripe_scratch, mut task_accum) =
                 spgrm_build_stream_batch(task_batch, row_step, sample_idx, n_samples_full, threads);
@@ -2964,11 +2975,12 @@ fn spgrm_stream_bed_to_jxgrm_core(
                     }
                 }
 
-                done_steps = done_steps.saturating_add(1);
+                let batch_progress_offset = batch_idx.saturating_mul(m);
+                let done_rows = batch_progress_offset.saturating_add(row_start + cur_rows);
                 spgrm_progress_notify(
                     progress_callback,
-                    done_steps,
-                    total_steps,
+                    progress_done_offset.saturating_add(done_rows),
+                    total_progress,
                     notify_step,
                     &mut last_notified,
                     false,
@@ -2997,16 +3009,6 @@ fn spgrm_stream_bed_to_jxgrm_core(
                 chunk_paths.push(chunk_path);
                 chunk_idx = chunk_idx.saturating_add(1);
             }
-
-            done_steps = done_steps.saturating_add(1);
-            spgrm_progress_notify(
-                progress_callback,
-                done_steps,
-                total_steps,
-                notify_step,
-                &mut last_notified,
-                false,
-            )?;
         }
 
         let write_result = if chunk_paths.is_empty() {
@@ -3035,11 +3037,10 @@ fn spgrm_stream_bed_to_jxgrm_core(
             out
         }?;
 
-        done_steps = done_steps.saturating_add(1);
         spgrm_progress_notify(
             progress_callback,
-            done_steps,
-            total_steps,
+            total_progress,
+            total_progress,
             notify_step,
             &mut last_notified,
             true,
@@ -3081,20 +3082,49 @@ pub fn spgrm_bed_to_jxgrm_core(
     if bed_prefix.is_empty() {
         return Err("Sparse GRM BED prefix must not be empty".to_string());
     }
-    let prepared = prepare_bed_logic_meta_owned_for_stats_samples_with_mmap_window(
-        &bed_prefix,
-        maf_threshold,
-        max_missing_rate,
-        het_threshold,
-        snps_only,
-        sample_idx,
-        true,
-        mmap_window_mb,
-    )?;
+    let prepared = if let Some(window_mb) = mmap_window_mb {
+        if !snps_only {
+            prepare_bed_logic_meta_owned_for_stats_samples_sparse_windowed(
+                &bed_prefix,
+                maf_threshold,
+                max_missing_rate,
+                het_threshold,
+                sample_idx,
+                window_mb,
+                threads,
+                progress_callback,
+                0usize,
+                progress_every,
+            )?
+        } else {
+            prepare_bed_logic_meta_owned_for_stats_samples_with_mmap_window(
+                &bed_prefix,
+                maf_threshold,
+                max_missing_rate,
+                het_threshold,
+                snps_only,
+                sample_idx,
+                true,
+                mmap_window_mb,
+            )?
+        }
+    } else {
+        prepare_bed_logic_meta_owned_for_stats_samples_with_mmap_window(
+            &bed_prefix,
+            maf_threshold,
+            max_missing_rate,
+            het_threshold,
+            snps_only,
+            sample_idx,
+            true,
+            mmap_window_mb,
+        )?
+    };
     let selected_idx: Cow<'_, [usize]> = match sample_idx {
         Some(idx) => Cow::Borrowed(idx),
         None => Cow::Owned((0..prepared.n_samples).collect()),
     };
+    let progress_done_offset = prepared.n_snps_total;
     spgrm_stream_bed_to_jxgrm_core(
         &bed_prefix,
         selected_idx.as_ref(),
@@ -3109,6 +3139,7 @@ pub fn spgrm_bed_to_jxgrm_core(
         mmap_window_mb,
         progress_callback,
         progress_every,
+        progress_done_offset,
     )
 }
 

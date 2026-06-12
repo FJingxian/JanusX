@@ -1274,8 +1274,16 @@ fn decode_grm_stream_block_parallel_into_f64(
             reached_eof = true;
             break;
         }
+        if it.ensure_window_for_snp(base).is_err() {
+            reached_eof = true;
+            break;
+        }
         let need_rows = row_step - cur_rows;
-        let scan_rows = (n_total - base).min(batch_cap).min(need_rows);
+        let mapped_rows = it.mapped_contiguous_snps_from(base);
+        let scan_rows = (n_total - base)
+            .min(batch_cap)
+            .min(need_rows)
+            .min(mapped_rows.max(1));
         if scan_rows == 0 {
             reached_eof = true;
             break;
@@ -1466,8 +1474,16 @@ fn decode_grm_stream_block_parallel_into_f32(
             reached_eof = true;
             break;
         }
+        if it.ensure_window_for_snp(base).is_err() {
+            reached_eof = true;
+            break;
+        }
         let need_rows = row_step - cur_rows;
-        let scan_rows = (n_total - base).min(batch_cap).min(need_rows);
+        let mapped_rows = it.mapped_contiguous_snps_from(base);
+        let scan_rows = (n_total - base)
+            .min(batch_cap)
+            .min(need_rows)
+            .min(mapped_rows.max(1));
         if scan_rows == 0 {
             reached_eof = true;
             break;
@@ -4225,7 +4241,7 @@ pub fn grm_stream_bed_f64<'py>(
 
     let total_threads = effective_threads(threads);
     let overlap_enabled = grm_overlap_enabled_default();
-    let can_parallel_decode = !it.is_windowed();
+    let can_parallel_decode = true;
     let decode_threads_hint = if can_parallel_decode {
         grm_decode_threads(total_threads, overlap_enabled)
     } else {
@@ -4981,7 +4997,7 @@ pub fn grm_stream_bed_f32<'py>(
 
     let total_threads = effective_threads(threads);
     let overlap_enabled = grm_overlap_enabled_default();
-    let can_parallel_decode = !it.is_windowed();
+    let can_parallel_decode = true;
     let decode_threads_hint = if can_parallel_decode {
         grm_decode_threads(total_threads, overlap_enabled)
     } else {

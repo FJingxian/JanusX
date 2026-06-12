@@ -4306,13 +4306,17 @@ pub(crate) struct PreparedBedPackedOwned {
     pub bytes_per_snp: usize,
 }
 
-fn prepare_bed_logic_meta_owned_for_stats_samples_sparse_windowed(
+pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples_sparse_windowed(
     prefix: &str,
     maf_threshold: f32,
     max_missing_rate: f32,
     het_threshold: f32,
     stats_sample_indices: Option<&[usize]>,
     mmap_window_mb: usize,
+    threads: usize,
+    progress_callback: Option<&Py<PyAny>>,
+    progress_done_offset: usize,
+    progress_every: usize,
 ) -> Result<PreparedBedLogicMetaOwned, String> {
     if mmap_window_mb == 0 {
         return Err("mmap_window_mb must be > 0".to_string());
@@ -4366,39 +4370,120 @@ fn prepare_bed_logic_meta_owned_for_stats_samples_sparse_windowed(
     let mut row_source_indices = Vec::<usize>::new();
     let mut missing_rate_keep = Vec::<f32>::new();
     let mut maf_keep = Vec::<f32>::new();
-
-    while let Some((snp_idx, counts)) = if stats_identity {
-        it.next_snp_counts_only()
+    let prep_threads = threads.max(1);
+    let pool = if prep_threads > 1 {
+        crate::stats_common::get_cached_pool(prep_threads).map_err(|e| e.to_string())?
     } else {
-        it.next_snp_selected_counts_only(stats_sample_indices)
-    } {
-        let non_missing = counts.non_missing;
-        let alt_sum = counts.alt_sum as usize;
-        let het_count = counts.het_count;
-        let (missing_rate, _maf, _std) =
-            packed_row_stats_from_counts(stats_n_samples, non_missing, alt_sum);
-        let alt_freq = if non_missing > 0 {
-            (counts.alt_sum as f32) / (2.0_f32 * non_missing as f32)
-        } else {
-            0.0_f32
+        None
+    };
+    let notify_step = if progress_every == 0 {
+        (n_snps / 200).max(1)
+    } else {
+        progress_every.max(1)
+    };
+    let mut last_notified = progress_done_offset.min(progress_done_offset.saturating_add(n_snps));
+    let progress_total_hint = progress_done_offset
+        .saturating_add(n_snps.saturating_mul(2))
+        .max(1);
+    if let Some(cb) = progress_callback {
+        Python::attach(|py2| -> PyResult<()> {
+            py2.check_signals()?;
+            cb.call1(py2, (progress_done_offset, progress_total_hint))?;
+            Ok(())
+        })
+        .map_err(|e| e.to_string())?;
+    }
+
+    let mut keep_flags = Vec::<u8>::new();
+    let mut missing_batch = Vec::<f32>::new();
+    let mut maf_batch = Vec::<f32>::new();
+    while it.cursor() < n_snps {
+        let base = it.cursor();
+        it.ensure_window_for_snp(base)?;
+        let scan_rows = it.mapped_contiguous_snps_from(base);
+        if scan_rows == 0 {
+            return Err("windowed BED pre-stat scan reached empty window".to_string());
+        }
+
+        keep_flags.resize(scan_rows, 0u8);
+        keep_flags[..scan_rows].fill(0u8);
+        missing_batch.resize(scan_rows, 0.0_f32);
+        maf_batch.resize(scan_rows, 0.0_f32);
+
+        let mut run = || {
+            let it_ref: &BedSnpIter = &it;
+            keep_flags[..scan_rows]
+                .par_iter_mut()
+                .zip(missing_batch[..scan_rows].par_iter_mut())
+                .zip(maf_batch[..scan_rows].par_iter_mut())
+                .enumerate()
+                .for_each(|(off, ((keep_dst, missing_dst), maf_dst))| {
+                    let snp_idx = base + off;
+                    let counts = if stats_identity {
+                        it_ref
+                            .decode_snp_counts_only_at(snp_idx)
+                            .expect("windowed pre-stat SNP index out of range")
+                    } else {
+                        it_ref
+                            .decode_snp_selected_counts_only_at(snp_idx, stats_sample_indices)
+                            .expect("windowed pre-stat selected SNP index out of range")
+                    };
+                    let non_missing = counts.non_missing;
+                    let alt_sum = counts.alt_sum as usize;
+                    let het_count = counts.het_count;
+                    let (missing_rate, _maf, _std) =
+                        packed_row_stats_from_counts(stats_n_samples, non_missing, alt_sum);
+                    let alt_freq = if non_missing > 0 {
+                        (counts.alt_sum as f32) / (2.0_f32 * non_missing as f32)
+                    } else {
+                        0.0_f32
+                    };
+                    let keep = if missing_rate > max_missing_rate {
+                        false
+                    } else if non_missing == 0 {
+                        maf_threshold <= 0.0_f32
+                    } else if apply_het_filter
+                        && ((het_count as f64) / (non_missing as f64)) > (het_threshold as f64)
+                    {
+                        false
+                    } else {
+                        alt_freq.min(1.0_f32 - alt_freq) >= maf_threshold
+                    };
+                    *keep_dst = if keep { 1 } else { 0 };
+                    *missing_dst = missing_rate;
+                    *maf_dst = alt_freq;
+                });
         };
-        let keep = if missing_rate > max_missing_rate {
-            false
-        } else if non_missing == 0 {
-            maf_threshold <= 0.0_f32
-        } else if apply_het_filter
-            && ((het_count as f64) / (non_missing as f64)) > (het_threshold as f64)
-        {
-            false
+        if let Some(tp) = pool.as_ref() {
+            tp.install(&mut run);
         } else {
-            alt_freq.min(1.0_f32 - alt_freq) >= maf_threshold
-        };
-        site_keep.push(keep);
-        if keep {
-            row_flip_keep.push(false);
-            row_source_indices.push(snp_idx);
-            missing_rate_keep.push(missing_rate);
-            maf_keep.push(alt_freq);
+            run();
+        }
+
+        for off in 0..scan_rows {
+            let keep = keep_flags[off] != 0;
+            site_keep.push(keep);
+            if keep {
+                row_flip_keep.push(false);
+                row_source_indices.push(base + off);
+                missing_rate_keep.push(missing_batch[off]);
+                maf_keep.push(maf_batch[off]);
+            }
+        }
+        it.set_cursor(base + scan_rows);
+
+        let done = progress_done_offset.saturating_add((base + scan_rows).min(n_snps));
+        let total = progress_total_hint;
+        if done >= last_notified.saturating_add(notify_step) || base + scan_rows >= n_snps {
+            last_notified = done;
+            Python::attach(|py2| -> PyResult<()> {
+                py2.check_signals()?;
+                if let Some(cb) = progress_callback {
+                    cb.call1(py2, (done.min(total), total))?;
+                }
+                Ok(())
+            })
+            .map_err(|e| e.to_string())?;
         }
     }
     let row_stats_secs = row_stats_t0.elapsed().as_secs_f64();
@@ -4512,6 +4597,10 @@ pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples_with_mmap_window(
                 het_threshold,
                 stats_sample_indices,
                 window_mb,
+                1usize,
+                None,
+                0usize,
+                0usize,
             );
         }
     }

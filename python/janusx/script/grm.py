@@ -51,7 +51,7 @@ from ._common.pathcheck import (
     ensure_plink_prefix_exists,
 )
 from ._common.progress import ProgressAdapter
-from ._common.status import format_elapsed, log_success
+from ._common.status import CliStatus, format_elapsed, log_success
 from ._common.genocache import configure_genotype_cache_from_out
 from ._common.genoio import determine_genotype_source as _determine_genotype_source
 from ._common.threads import (
@@ -1026,10 +1026,22 @@ def main(log: bool = True):
     # ------------------------------------------------------------------
     # Inspect genotype and build GRM
     # ------------------------------------------------------------------
-    sample_ids, n_snps = inspect_genotype_file(grm_input)
-    sample_ids = np.array(sample_ids, dtype=str)
-    n_samples = len(sample_ids)
-    logger.info(f"Genotype meta: {n_samples} samples, {n_snps} SNPs.")
+    genotype_src = format_path_for_display(str(gfile))
+    with CliStatus(
+        f"Loading genotype from {genotype_src}...",
+        enabled=True,
+        use_process=True,
+    ) as task:
+        try:
+            sample_ids, n_snps = inspect_genotype_file(grm_input)
+        except Exception:
+            task.fail(f"Loading genotype from {genotype_src} ...Failed")
+            raise
+        sample_ids = np.array(sample_ids, dtype=str)
+        n_samples = len(sample_ids)
+        task.complete(
+            f"Loading genotype from {genotype_src} (n={n_samples}, nSNP={n_snps})"
+        )
 
     # Defaults match GWAS; can be overridden via CLI.
     maf_threshold = args.maf

@@ -2196,14 +2196,35 @@ impl BedSnpIter {
         (counts.alt_sum, counts.non_missing)
     }
 
+    pub fn decode_snp_counts_only_at(&self, snp_idx: usize) -> Option<DecodedSnpRowCounts> {
+        if snp_idx >= self.n_snps {
+            return None;
+        }
+        let snp_bytes = self.snp_bytes(snp_idx)?;
+        Some(self.decode_snp_bytes_counts_only(snp_bytes))
+    }
+
+    pub fn decode_snp_selected_counts_only_at(
+        &self,
+        snp_idx: usize,
+        sample_indices: &[usize],
+    ) -> Option<DecodedSnpRowCounts> {
+        if snp_idx >= self.n_snps {
+            return None;
+        }
+        let snp_bytes = self.snp_bytes(snp_idx)?;
+        Some(self.decode_snp_bytes_selected_counts_only(snp_bytes, sample_indices))
+    }
+
     /// Random-access decode for one SNP row into caller-provided buffer.
-    /// Returns (alt_sum, non_missing_count). Unsupported for windowed mmap mode.
+    /// Returns (alt_sum, non_missing_count). In windowed mode the SNP must
+    /// already lie inside the currently mapped window.
     pub fn decode_snp_raw_into_with_stats_at(
         &self,
         snp_idx: usize,
         out: &mut [f32],
     ) -> Option<(f64, usize)> {
-        if self.window_snps.is_some() || snp_idx >= self.n_snps || out.len() < self.n_samples {
+        if snp_idx >= self.n_snps || out.len() < self.n_samples {
             return None;
         }
         let snp_bytes = self.snp_bytes(snp_idx)?;
@@ -2310,6 +2331,35 @@ impl BedSnpIter {
 
     pub fn is_windowed(&self) -> bool {
         self.window_snps.is_some()
+    }
+
+    pub fn ensure_window_for_snp(&mut self, snp_idx: usize) -> Result<(), String> {
+        if snp_idx >= self.n_snps {
+            return Err("SNP index out of range".to_string());
+        }
+        if self.window_snps.is_some() {
+            let window_end = self.window_start_snp + self.window_len_snps;
+            if snp_idx < self.window_start_snp || snp_idx >= window_end {
+                self.remap_window(snp_idx)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn mapped_contiguous_snps_from(&self, snp_idx: usize) -> usize {
+        if snp_idx >= self.n_snps {
+            return 0;
+        }
+        if self.window_snps.is_some() {
+            let window_end = self.window_start_snp + self.window_len_snps;
+            if snp_idx < self.window_start_snp || snp_idx >= window_end {
+                0
+            } else {
+                window_end.saturating_sub(snp_idx)
+            }
+        } else {
+            self.n_snps.saturating_sub(snp_idx)
+        }
     }
 
     /// Decode next SNP row into caller-provided buffer (len >= n_samples)
@@ -2440,59 +2490,6 @@ impl BedSnpIter {
 
             let (alt_sum, non_missing) = self.decode_snp_bytes_stats_only(snp_bytes);
             return Some((snp_idx, alt_sum, non_missing));
-        }
-        None
-    }
-
-    pub(crate) fn next_snp_counts_only(&mut self) -> Option<(usize, DecodedSnpRowCounts)> {
-        while self.cur < self.n_snps {
-            let snp_idx = self.cur;
-            self.cur += 1;
-
-            if self.window_snps.is_some() {
-                let window_end = self.window_start_snp + self.window_len_snps;
-                if snp_idx < self.window_start_snp || snp_idx >= window_end {
-                    if let Err(e) = self.remap_window(snp_idx) {
-                        panic!("failed to remap BED window: {e}");
-                    }
-                }
-            }
-
-            let snp_bytes = match self.snp_bytes(snp_idx) {
-                Some(bytes) => bytes,
-                None => return None,
-            };
-
-            let counts = self.decode_snp_bytes_counts_only(snp_bytes);
-            return Some((snp_idx, counts));
-        }
-        None
-    }
-
-    pub(crate) fn next_snp_selected_counts_only(
-        &mut self,
-        sample_indices: &[usize],
-    ) -> Option<(usize, DecodedSnpRowCounts)> {
-        while self.cur < self.n_snps {
-            let snp_idx = self.cur;
-            self.cur += 1;
-
-            if self.window_snps.is_some() {
-                let window_end = self.window_start_snp + self.window_len_snps;
-                if snp_idx < self.window_start_snp || snp_idx >= window_end {
-                    if let Err(e) = self.remap_window(snp_idx) {
-                        panic!("failed to remap BED window: {e}");
-                    }
-                }
-            }
-
-            let snp_bytes = match self.snp_bytes(snp_idx) {
-                Some(bytes) => bytes,
-                None => return None,
-            };
-
-            let counts = self.decode_snp_bytes_selected_counts_only(snp_bytes, sample_indices);
-            return Some((snp_idx, counts));
         }
         None
     }

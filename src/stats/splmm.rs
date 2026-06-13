@@ -8,7 +8,7 @@ use rand::seq::index::sample;
 use rand::SeedableRng;
 use rayon::prelude::*;
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::Path;
 use std::sync::mpsc::sync_channel;
 use std::sync::Arc;
@@ -726,7 +726,7 @@ impl JxlmmPayload {
 
 struct JxlmmPreparedInput {
     bed_prefix: Option<String>,
-    payload: JxlmmPayload,
+    payload: Option<JxlmmPayload>,
     n_samples_full: usize,
     bytes_per_snp: usize,
     row_flip: Vec<bool>,
@@ -743,14 +743,26 @@ impl JxlmmPreparedInput {
     }
 
     #[inline]
-    fn row_bytes(&self, row_idx: usize) -> &[u8] {
+    fn payload_bytes(&self) -> Result<&[u8], String> {
+        self.payload
+            .as_ref()
+            .map(JxlmmPayload::as_bytes)
+            .ok_or_else(|| {
+                "SparseLMM prepared input has no resident BED payload; windowed access is required."
+                    .to_string()
+            })
+    }
+
+    #[cfg(test)]
+    #[inline]
+    fn row_bytes(&self, row_idx: usize) -> Result<&[u8], String> {
         let src = self
             .row_source_indices
             .as_ref()
             .map(|v| v[row_idx])
             .unwrap_or(row_idx);
-        let packed = self.payload.as_bytes();
-        &packed[src * self.bytes_per_snp..(src + 1) * self.bytes_per_snp]
+        let packed = self.payload_bytes()?;
+        Ok(&packed[src * self.bytes_per_snp..(src + 1) * self.bytes_per_snp])
     }
 
     fn subset_rows(&self, keep_rows: &[usize]) -> Result<Self, String> {
@@ -780,10 +792,10 @@ impl JxlmmPreparedInput {
         }
         Ok(Self {
             bed_prefix: self.bed_prefix.clone(),
-            payload: match &self.payload {
+            payload: self.payload.as_ref().map(|payload| match payload {
                 JxlmmPayload::Packed(bytes) => JxlmmPayload::Packed(Arc::clone(bytes)),
                 JxlmmPayload::Mmap(mmap) => JxlmmPayload::Mmap(Arc::clone(mmap)),
-            },
+            }),
             n_samples_full: self.n_samples_full,
             bytes_per_snp: self.bytes_per_snp,
             row_flip,
@@ -798,10 +810,10 @@ impl Clone for JxlmmPreparedInput {
     fn clone(&self) -> Self {
         Self {
             bed_prefix: self.bed_prefix.clone(),
-            payload: match &self.payload {
+            payload: self.payload.as_ref().map(|payload| match payload {
                 JxlmmPayload::Packed(bytes) => JxlmmPayload::Packed(Arc::clone(bytes)),
                 JxlmmPayload::Mmap(mmap) => JxlmmPayload::Mmap(Arc::clone(mmap)),
-            },
+            }),
             n_samples_full: self.n_samples_full,
             bytes_per_snp: self.bytes_per_snp,
             row_flip: self.row_flip.clone(),
@@ -830,6 +842,39 @@ fn normalize_plink_prefix_local(prefix: &str) -> String {
         out.truncate(out.len().saturating_sub(4));
     }
     out
+}
+
+fn inspect_plink_bed_shape_local(
+    bed_prefix: &str,
+    n_samples_full: usize,
+) -> Result<(usize, usize), String> {
+    if n_samples_full == 0 {
+        return Err("No samples found in BED input.".to_string());
+    }
+    let bytes_per_snp = n_samples_full.div_ceil(4);
+    let bed_path = format!("{bed_prefix}.bed");
+    let mut bed_file = File::open(&bed_path).map_err(|e| format!("open {bed_path}: {e}"))?;
+    let mut header = [0u8; 3];
+    bed_file
+        .read_exact(&mut header)
+        .map_err(|e| format!("read {bed_path} header: {e}"))?;
+    if header != [0x6C, 0x1B, 0x01] {
+        return Err("Only SNP-major BED supported".to_string());
+    }
+    let bed_len = bed_file
+        .metadata()
+        .map_err(|e| format!("metadata {bed_path}: {e}"))?
+        .len() as usize;
+    if bed_len < 3 {
+        return Err("BED too small".to_string());
+    }
+    let payload_len = bed_len - 3;
+    if bytes_per_snp == 0 || payload_len % bytes_per_snp != 0 {
+        return Err(format!(
+            "invalid BED payload length: data_len={payload_len}, bytes_per_snp={bytes_per_snp}"
+        ));
+    }
+    Ok((bytes_per_snp, payload_len / bytes_per_snp))
 }
 
 #[inline]
@@ -1008,7 +1053,7 @@ fn prepare_external_packed_input<'py>(
     };
     Ok(JxlmmPreparedInput {
         bed_prefix: None,
-        payload: JxlmmPayload::Packed(packed_arc),
+        payload: Some(JxlmmPayload::Packed(packed_arc)),
         n_samples_full: packed_n_samples,
         bytes_per_snp,
         row_flip,
@@ -1026,6 +1071,7 @@ fn prepare_prefix_input_from_external_meta<'py>(
     row_missing: Option<PyReadonlyArray1<'py, f32>>,
     row_indices: Option<PyReadonlyArray1<'py, i64>>,
     payload_mmap: Option<Arc<Mmap>>,
+    retain_payload: bool,
 ) -> PyResult<JxlmmPreparedInput> {
     let bed_prefix = normalize_plink_prefix_local(prefix);
     if bed_prefix.is_empty() {
@@ -1049,31 +1095,24 @@ fn prepare_prefix_input_from_external_meta<'py>(
             "splmm_assoc_pcg_bed: mmap metadata path requires `row_indices` argument.",
         )
     })?;
-    let mmap = if let Some(mmap) = payload_mmap {
-        mmap
+    let (bytes_per_snp, n_snps_bed) =
+        inspect_plink_bed_shape_local(&bed_prefix, n_samples_full).map_err(PyRuntimeError::new_err)?;
+    let payload = if retain_payload {
+        let mmap = if let Some(mmap) = payload_mmap {
+            mmap
+        } else {
+            let bed_path = format!("{bed_prefix}.bed");
+            let bed_file = File::open(&bed_path)
+                .map_err(|e| PyRuntimeError::new_err(format!("open {bed_path}: {e}")))?;
+            Arc::new(
+                unsafe { Mmap::map(&bed_file) }
+                    .map_err(|e| PyRuntimeError::new_err(format!("mmap {bed_path}: {e}")))?,
+            )
+        };
+        Some(JxlmmPayload::Mmap(mmap))
     } else {
-        let bed_path = format!("{bed_prefix}.bed");
-        let bed_file = File::open(&bed_path)
-            .map_err(|e| PyRuntimeError::new_err(format!("open {bed_path}: {e}")))?;
-        Arc::new(
-            unsafe { Mmap::map(&bed_file) }
-                .map_err(|e| PyRuntimeError::new_err(format!("mmap {bed_path}: {e}")))?,
-        )
+        None
     };
-    if mmap.len() < 3 {
-        return Err(PyRuntimeError::new_err("BED too small"));
-    }
-    if mmap[0] != 0x6C || mmap[1] != 0x1B || mmap[2] != 0x01 {
-        return Err(PyRuntimeError::new_err("Only SNP-major BED supported"));
-    }
-    let bytes_per_snp = n_samples_full.div_ceil(4);
-    let payload_len = mmap.len().saturating_sub(3);
-    if bytes_per_snp == 0 || payload_len % bytes_per_snp != 0 {
-        return Err(PyRuntimeError::new_err(format!(
-            "invalid BED payload length: data_len={payload_len}, bytes_per_snp={bytes_per_snp}"
-        )));
-    }
-    let n_snps_bed = payload_len / bytes_per_snp;
     let row_source_indices =
         parse_index_vec_i64(row_indices_ro.as_slice()?, n_snps_bed, "row_indices")?;
     let m = row_source_indices.len();
@@ -1103,7 +1142,7 @@ fn prepare_prefix_input_from_external_meta<'py>(
     }
     Ok(JxlmmPreparedInput {
         bed_prefix: Some(bed_prefix),
-        payload: JxlmmPayload::Mmap(mmap),
+        payload,
         n_samples_full,
         bytes_per_snp,
         row_flip,
@@ -1146,7 +1185,7 @@ fn prepare_prefix_input(
     };
     Ok(JxlmmPreparedInput {
         bed_prefix: Some(bed_prefix),
-        payload: JxlmmPayload::Mmap(mmap),
+        payload: Some(JxlmmPayload::Mmap(mmap)),
         n_samples_full,
         bytes_per_snp: meta.bytes_per_snp,
         row_flip: meta.row_flip,
@@ -1181,6 +1220,7 @@ fn prepare_splmm_assoc_inputs<'py>(
     row_missing: Option<PyReadonlyArray1<'py, f32>>,
     row_indices: Option<PyReadonlyArray1<'py, i64>>,
     model: &str,
+    mmap_window_mb: Option<usize>,
 ) -> PyResult<PreparedJxlmmAssoc> {
     let gm = PackedGeneticModel::parse(model)?;
     let bed_prefix = normalize_plink_prefix_local(prefix);
@@ -1248,7 +1288,11 @@ fn prepare_splmm_assoc_inputs<'py>(
         "operator_sample_indices",
     )?
     .or_else(|| scan_sample_probe.clone());
+    let windowed_requested = mmap_window_mb.filter(|&v| v > 0).is_some();
+    let skip_resident_bed_payload = use_external_mmap_meta && windowed_requested;
     let shared_bed_mmap = if use_external_packed {
+        None
+    } else if skip_resident_bed_payload {
         None
     } else {
         let bed_path = format!("{bed_prefix}.bed");
@@ -1277,6 +1321,7 @@ fn prepare_splmm_assoc_inputs<'py>(
             row_missing,
             row_indices,
             shared_bed_mmap.as_ref().map(Arc::clone),
+            !skip_resident_bed_payload,
         )?
     } else {
         prepare_prefix_input(
@@ -1410,6 +1455,85 @@ fn decode_packed_row_model_into_f64(
     }
 }
 
+#[inline]
+fn build_selected_sample_decode_plan(
+    scan_sample_idx: &[usize],
+) -> (bool, Option<Vec<usize>>, Option<Vec<u8>>) {
+    let sample_identity = scan_sample_idx.iter().enumerate().all(|(i, &sid)| sid == i);
+    let sample_byte_idx: Option<Vec<usize>> = if sample_identity {
+        None
+    } else {
+        Some(scan_sample_idx.iter().map(|&sid| sid >> 2).collect())
+    };
+    let sample_bit_shift: Option<Vec<u8>> = if sample_identity {
+        None
+    } else {
+        Some(
+            scan_sample_idx
+                .iter()
+                .map(|&sid| ((sid & 3) << 1) as u8)
+                .collect(),
+        )
+    };
+    (sample_identity, sample_byte_idx, sample_bit_shift)
+}
+
+fn decode_prepared_row_model_into_f64(
+    scan_prepared: &JxlmmPreparedInput,
+    row_idx: usize,
+    n: usize,
+    gm: PackedGeneticModel,
+    sample_identity: bool,
+    sample_byte_idx: Option<&[usize]>,
+    sample_bit_shift: Option<&[u8]>,
+    out: &mut [f64],
+    windowed: &mut Option<WindowedBedMatrix>,
+) -> Result<(), String> {
+    if let Some(payload) = scan_prepared.payload.as_ref() {
+        let src = scan_prepared
+            .row_source_indices
+            .as_ref()
+            .map(|v| v[row_idx])
+            .unwrap_or(row_idx);
+        let packed = payload.as_bytes();
+        let row = &packed[src * scan_prepared.bytes_per_snp..(src + 1) * scan_prepared.bytes_per_snp];
+        decode_packed_row_model_into_f64(
+            row,
+            scan_prepared.row_flip[row_idx],
+            scan_prepared.row_maf[row_idx],
+            n,
+            gm,
+            sample_identity,
+            sample_byte_idx,
+            sample_bit_shift,
+            out,
+        );
+        return Ok(());
+    }
+    let src = scan_prepared
+        .row_source_indices
+        .as_ref()
+        .map(|v| v[row_idx])
+        .unwrap_or(row_idx);
+    let matrix = windowed.as_mut().ok_or_else(|| {
+        "SparseLMM prepared input has no resident BED payload and no windowed row reader."
+            .to_string()
+    })?;
+    let row = matrix.read_source_range(src, src + 1)?;
+    decode_packed_row_model_into_f64(
+        row,
+        scan_prepared.row_flip[row_idx],
+        scan_prepared.row_maf[row_idx],
+        n,
+        gm,
+        sample_identity,
+        sample_byte_idx,
+        sample_bit_shift,
+        out,
+    );
+    Ok(())
+}
+
 fn choose_rhat_rows(m: usize, count: usize, seed: u64) -> Vec<usize> {
     let k = count.min(m);
     if k == m {
@@ -1434,39 +1558,41 @@ fn decode_rhat_markers_col_major(
     progress_callback: Option<&Py<PyAny>>,
     progress_stage: usize,
     progress_total: usize,
+    mmap_window_mb: Option<usize>,
 ) -> Result<Vec<f64>, String> {
     let n = scan_sample_idx.len();
     let n_rhat = rhat_rows.len();
-    let sample_identity = scan_sample_idx.iter().enumerate().all(|(i, &sid)| sid == i);
-    let sample_byte_idx: Option<Vec<usize>> = if sample_identity {
-        None
+    let (sample_identity, sample_byte_idx, sample_bit_shift) =
+        build_selected_sample_decode_plan(scan_sample_idx);
+    let mut windowed = if scan_prepared.payload.is_none() {
+        let prefix = scan_prepared
+            .bed_prefix
+            .as_deref()
+            .ok_or_else(|| "SparseLMM requires a PLINK BED prefix for windowed row decode.".to_string())?;
+        let window_mb = mmap_window_mb
+            .filter(|&v| v > 0)
+            .ok_or_else(|| {
+                "SparseLMM windowed row decode requires mmap_window_mb when no resident BED payload is retained."
+                    .to_string()
+            })?;
+        Some(WindowedBedMatrix::open(prefix, window_mb)?)
     } else {
-        Some(scan_sample_idx.iter().map(|&sid| sid >> 2).collect())
-    };
-    let sample_bit_shift: Option<Vec<u8>> = if sample_identity {
         None
-    } else {
-        Some(
-            scan_sample_idx
-                .iter()
-                .map(|&sid| ((sid & 3) << 1) as u8)
-                .collect(),
-        )
     };
     let mut sampled_markers = vec![0.0_f64; n * n_rhat];
     let mut tmp_snp = vec![0.0_f64; n];
     for (col, &row_idx) in rhat_rows.iter().enumerate() {
-        decode_packed_row_model_into_f64(
-            scan_prepared.row_bytes(row_idx),
-            scan_prepared.row_flip[row_idx],
-            scan_prepared.row_maf[row_idx],
+        decode_prepared_row_model_into_f64(
+            scan_prepared,
+            row_idx,
             n,
             gm,
             sample_identity,
             sample_byte_idx.as_deref(),
             sample_bit_shift.as_deref(),
             &mut tmp_snp,
-        );
+            &mut windowed,
+        )?;
         for i in 0..n {
             sampled_markers[col * n + i] = tmp_snp[i];
         }
@@ -4090,6 +4216,7 @@ fn prepare_splmm_scan_state(
     stage1_cb: Option<&Py<PyAny>>,
     _progress_every: usize,
     scan_mode: SplmmScanMode,
+    mmap_window_mb: Option<usize>,
 ) -> Result<SplmmPreparedScanState, String> {
     let total_t0 = Instant::now();
     let mut prepare_timing = SplmmPrepareTiming::default();
@@ -4166,52 +4293,22 @@ fn prepare_splmm_scan_state(
         let rhat_rows = choose_rhat_rows(scan_prepared.n_rows(), rhat_markers, rhat_seed);
         let n_rhat = rhat_rows.len();
         prepare_timing.n_rhat_requested = n_rhat;
-        if stage1_cb.is_some() {
-            emit_progress_callback(stage1_cb, 8, 0, rhat_progress_total)?;
-        }
-        let sample_identity = scan_sample_idx.iter().enumerate().all(|(i, &sid)| sid == i);
-        let sample_byte_idx: Option<Vec<usize>> = if sample_identity {
-            None
-        } else {
-            Some(scan_sample_idx.iter().map(|&sid| sid >> 2).collect())
-        };
-        let sample_bit_shift: Option<Vec<u8>> = if sample_identity {
-            None
-        } else {
-            Some(
-                scan_sample_idx
-                    .iter()
-                    .map(|&sid| ((sid & 3) << 1) as u8)
-                    .collect(),
-            )
-        };
         let x_design_xtx_chol = x_design_xtx_chol
             .as_deref()
             .ok_or_else(|| "SparseLMM approximate scan modes require XtX chol".to_string())?;
-        let mut sampled_markers = vec![0.0_f64; n * n_rhat];
-        let mut tmp_snp = vec![0.0_f64; n];
         let mut xts = vec![0.0_f64; p];
         let mut alpha = vec![0.0_f64; p];
         let rhat_decode_t0 = Instant::now();
-        for (col, &row_idx) in rhat_rows.iter().enumerate() {
-            decode_packed_row_model_into_f64(
-                scan_prepared.row_bytes(row_idx),
-                scan_prepared.row_flip[row_idx],
-                scan_prepared.row_maf[row_idx],
-                n,
-                gm,
-                sample_identity,
-                sample_byte_idx.as_deref(),
-                sample_bit_shift.as_deref(),
-                &mut tmp_snp,
-            );
-            for i in 0..n {
-                sampled_markers[col * n + i] = tmp_snp[i];
-            }
-            if stage1_cb.is_some() {
-                emit_progress_callback(stage1_cb, 8, col + 1, rhat_progress_total)?;
-            }
-        }
+        let sampled_markers = decode_rhat_markers_col_major(
+            scan_prepared,
+            scan_sample_idx,
+            gm,
+            rhat_rows.as_slice(),
+            stage1_cb,
+            8,
+            rhat_progress_total,
+            mmap_window_mb,
+        )?;
         prepare_timing.rhat_decode_secs = rhat_decode_t0.elapsed().as_secs_f64();
         let rhat_solve_t0 = Instant::now();
         let v_inv_s_col = sparse_solve_rhs_with_workspace(
@@ -4274,7 +4371,6 @@ fn prepare_splmm_scan_state(
         drop(v_inv_col);
         drop(v_inv_s_col);
         drop(sampled_markers);
-        drop(tmp_snp);
         (
             gamma0_val,
             r_hat_val,
@@ -4366,6 +4462,7 @@ fn estimate_residualized_approx_scan_sparse(
         stage1_cb,
         8,
         rhat_progress_total,
+        mmap_window_mb,
     )?;
     let (gamma, n_used) =
         fit.estimate_gamma_from_markers(x_design.as_slice(), sampled_markers.as_slice(), n_rhat)?;
@@ -4458,6 +4555,7 @@ fn estimate_residualized_approx_scan_to_tsv_sparse(
         stage1_cb,
         8,
         rhat_progress_total,
+        mmap_window_mb,
     )?;
     let (gamma, n_used) =
         fit.estimate_gamma_from_markers(x_design.as_slice(), sampled_markers.as_slice(), n_rhat)?;
@@ -4551,6 +4649,7 @@ fn estimate_rhat_and_scan_sparse(
         stage1_cb,
         progress_every,
         scan_mode,
+        mmap_window_mb,
     )?;
     if splmm_prepare_stage_timing_enabled() {
         emit_splmm_prepare_timing(
@@ -4863,6 +4962,7 @@ fn estimate_rhat_and_scan_to_tsv(
         stage1_cb,
         progress_every,
         scan_mode,
+        mmap_window_mb,
     )?;
     let scan_prepare_secs = prepare_t0.elapsed().as_secs_f64();
     if splmm_prepare_stage_timing_enabled() {
@@ -5412,6 +5512,7 @@ pub fn splmm_assoc_pcg_bed<'py>(
         row_missing,
         row_indices,
         model,
+        mmap_window_mb,
     )?;
     let sparse_factor_sample_idx = parse_optional_index_array(
         sparse_sample_indices.as_ref(),
@@ -5594,6 +5695,7 @@ pub fn splmm_assoc_pcg_bed_to_tsv<'py>(
         row_missing,
         row_indices,
         model,
+        mmap_window_mb,
     )?;
     let sparse_factor_sample_idx = parse_optional_index_array(
         sparse_sample_indices.as_ref(),
@@ -5988,6 +6090,12 @@ fn unified_input_from_jxlmm(
             JxlmmMatrixAdapter::Direct { inner: prepared }
         }
     } else {
+        if prepared.payload.is_none() {
+            return Err(
+                "SparseLMM direct BED scan requires a resident BED payload; provide mmap_window_mb to use windowed scanning."
+                    .to_string(),
+            );
+        }
         JxlmmMatrixAdapter::Direct { inner: prepared }
     };
     Ok(UnifiedInput {
@@ -6017,7 +6125,9 @@ impl GenotypeMatrix for JxlmmMatrixAdapter<'_> {
     }
     fn packed_flat(&self) -> &[u8] {
         match self {
-            Self::Direct { inner } => inner.payload.as_bytes(),
+            Self::Direct { inner } => inner
+                .payload_bytes()
+                .expect("direct SparseLMM matrix adapter requires resident BED payload"),
             Self::Windowed { matrix } => matrix.packed_flat(),
         }
     }
@@ -6025,7 +6135,10 @@ impl GenotypeMatrix for JxlmmMatrixAdapter<'_> {
         match self {
             Self::Direct { inner } => {
                 let offset = source_idx.saturating_mul(inner.bytes_per_snp);
-                &inner.payload.as_bytes()[offset..][..inner.bytes_per_snp]
+                &inner
+                    .payload_bytes()
+                    .expect("direct SparseLMM matrix adapter requires resident BED payload")
+                    [offset..][..inner.bytes_per_snp]
             }
             Self::Windowed { matrix } => matrix.source_row_bytes(source_idx),
         }
@@ -6042,6 +6155,9 @@ impl GenotypeMatrix for JxlmmMatrixAdapter<'_> {
     ) -> Result<(), String> {
         match self {
             Self::Direct { inner } => {
+                let payload = inner
+                    .payload_bytes()
+                    .expect("direct SparseLMM matrix adapter requires resident BED payload");
                 let cols = if sample_identity {
                     stats.n_samples_full
                 } else {
@@ -6053,7 +6169,7 @@ impl GenotypeMatrix for JxlmmMatrixAdapter<'_> {
                 }
                 let code4_lut = &packed_byte_lut().code4;
                 decode_mean_imputed_additive_packed_block_rows_f32(
-                    inner.payload.as_bytes(),
+                    payload,
                     stats.bytes_per_snp,
                     stats.n_samples_full,
                     stats.row_flip_slice(row_start, rows_here),
@@ -6186,7 +6302,9 @@ mod tests {
         let (sample_identity, sample_byte_idx, sample_bit_shift) = sample_mapping(scan_sample_idx);
         let mut out = vec![0.0_f64; n];
         decode_packed_row_model_into_f64(
-            prepared.row_bytes(row_idx),
+            prepared
+                .row_bytes(row_idx)
+                .expect("test prepared input should retain resident payload"),
             prepared.row_flip[row_idx],
             prepared.row_maf[row_idx],
             n,

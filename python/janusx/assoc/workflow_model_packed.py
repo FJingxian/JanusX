@@ -599,6 +599,7 @@ def _splmm_bed_logic_meta_selected(
     max_missing_rate: float,
     het_threshold: float,
     snps_only: bool,
+    mmap_window_mb: Optional[int] = None,
 ) -> dict[str, object]:
     if not hasattr(jxrs, "prepare_bed_logic_meta_selected"):
         raise RuntimeError(
@@ -611,6 +612,7 @@ def _splmm_bed_logic_meta_selected(
         max_missing_rate=float(max_missing_rate),
         het_threshold=float(het_threshold),
         snps_only=bool(snps_only),
+        mmap_window_mb=(None if mmap_window_mb is None else int(max(1, int(mmap_window_mb)))),
     )
     return {
         "row_indices": np.ascontiguousarray(np.asarray(row_idx, dtype=np.int64), dtype=np.int64),
@@ -4546,6 +4548,7 @@ def run_splmm_packed_fullrank(
         scan_meta_secs = 0.0
         null_fit_secs = 0.0
         null_prepare_t0 = time.monotonic()
+        scan_meta_mmap_window_mb = int(max(1, _current_bed_memory_mb()))
 
         def _run_sparse_scan_meta_task() -> tuple[object, float]:
             task_t0 = time.monotonic()
@@ -4556,6 +4559,7 @@ def run_splmm_packed_fullrank(
                 max_missing_rate=float(max_missing_rate),
                 het_threshold=float(het_threshold),
                 snps_only=bool(snps_only),
+                mmap_window_mb=scan_meta_mmap_window_mb,
             )
             return out, max(time.monotonic() - task_t0, 0.0)
 

@@ -5738,6 +5738,7 @@ pub fn prepare_bed_2bit_packed<'py>(
     max_missing_rate=1.0,
     het_threshold=0.0,
     snps_only=false,
+    mmap_window_mb=None,
 ))]
 pub fn prepare_bed_logic_meta_selected<'py>(
     py: Python<'py>,
@@ -5747,6 +5748,7 @@ pub fn prepare_bed_logic_meta_selected<'py>(
     max_missing_rate: f32,
     het_threshold: f32,
     snps_only: bool,
+    mmap_window_mb: Option<usize>,
 ) -> PyResult<(
     Bound<'py, PyArray1<i64>>,
     Bound<'py, PyArray1<f32>>,
@@ -5801,7 +5803,7 @@ pub fn prepare_bed_logic_meta_selected<'py>(
     let rust_core_t0 = Instant::now();
     let prepared = py
         .detach(move || {
-            prepare_bed_logic_meta_owned_for_stats_samples(
+            prepare_bed_logic_meta_owned_for_stats_samples_with_mmap_window(
                 &bed_prefix,
                 maf_threshold,
                 max_missing_rate,
@@ -5809,6 +5811,7 @@ pub fn prepare_bed_logic_meta_selected<'py>(
                 snps_only,
                 sample_idx.as_deref(),
                 true, // stats_only: skip Vec<SiteInfo> allocation
+                mmap_window_mb.filter(|&v| v > 0),
             )
         })
         .map_err(PyRuntimeError::new_err)?;

@@ -11,10 +11,13 @@ Examples
 from __future__ import annotations
 
 import argparse
+import ctypes
 import logging
+import math
 import os
 import socket
 import sys
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -22,9 +25,11 @@ from typing import Any, Optional
 
 import numpy as np
 
+from janusx import janusx as jxrs
 from janusx.adamixture import ADAMixtureConfig, evaluate_adamixture_cverror, train_adamixture
-from janusx.adamixture.core import load_genotype_u8_matrix
+from janusx.adamixture.core import _admx_py_mem_debug, load_genotype_u8_matrix
 from janusx.gfreader import inspect_genotype_file
+from ._common.interrupt import force_exit
 from ._common.config_render import emit_cli_configuration
 from ._common.genoio import determine_genotype_source_from_args, strip_default_prefix_suffix
 from ._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog
@@ -84,6 +89,198 @@ def _bool_env(name: str, default: bool = True) -> bool:
     if raw == "":
         return bool(default)
     return raw not in {"0", "false", "no", "off"}
+
+
+def _default_max_rss_gb() -> float:
+    raw = str(os.environ.get("JANUSX_ADMX_MAX_RSS_GB", "")).strip()
+    if raw == "":
+        return 10.0
+    try:
+        value = float(raw)
+    except Exception:
+        return 10.0
+    if not math.isfinite(value):
+        return 10.0
+    return float(value)
+
+
+class _AdmixtureMemoryWatchdog:
+    def __init__(self, *, limit_gb: float, logger: logging.Logger, interval_s: float = 0.2) -> None:
+        self.limit_gb = float(limit_gb)
+        self.logger = logger
+        self.interval_s = float(max(0.05, interval_s))
+        self.limit_bytes = int(self.limit_gb * (1024.0**3))
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._started = False
+        self._psutil = None
+        self._mac_proc_pid_rusage = None
+        self._mac_rusage_info_v4 = None
+
+    def start(self) -> None:
+        if not (math.isfinite(self.limit_gb) and self.limit_gb > 0.0):
+            return
+        try:
+            import psutil  # type: ignore
+        except Exception as ex:
+            self.logger.warning(
+                f"RSS watchdog unavailable: failed to import psutil ({ex})."
+            )
+            return
+        self._psutil = psutil
+        self._thread = threading.Thread(
+            target=self._run,
+            name="janusx-admixture-rss-watchdog",
+            daemon=True,
+        )
+        self._thread.start()
+        self._started = True
+        limit_label = f"{self.limit_gb:.3f}" if self.limit_gb < 0.01 else f"{self.limit_gb:.2f}"
+        self.logger.info(
+            f"{'Memory limit':<22}: {limit_label} GB "
+            "(0 disables; macOS uses current phys_footprint, other platforms use RSS)"
+        )
+
+    def stop(self) -> None:
+        if not self._started:
+            return
+        self._stop.set()
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=0.5)
+
+    def _mac_current_footprint_bytes(self) -> Optional[int]:
+        if sys.platform != "darwin":
+            return None
+        try:
+            if self._mac_proc_pid_rusage is None or self._mac_rusage_info_v4 is None:
+                class RUsageInfoV4(ctypes.Structure):
+                    _fields_ = [
+                        ("ri_uuid", ctypes.c_uint8 * 16),
+                        ("ri_user_time", ctypes.c_uint64),
+                        ("ri_system_time", ctypes.c_uint64),
+                        ("ri_pkg_idle_wkups", ctypes.c_uint64),
+                        ("ri_interrupt_wkups", ctypes.c_uint64),
+                        ("ri_pageins", ctypes.c_uint64),
+                        ("ri_wired_size", ctypes.c_uint64),
+                        ("ri_resident_size", ctypes.c_uint64),
+                        ("ri_phys_footprint", ctypes.c_uint64),
+                        ("ri_proc_start_abstime", ctypes.c_uint64),
+                        ("ri_proc_exit_abstime", ctypes.c_uint64),
+                        ("ri_child_user_time", ctypes.c_uint64),
+                        ("ri_child_system_time", ctypes.c_uint64),
+                        ("ri_child_pkg_idle_wkups", ctypes.c_uint64),
+                        ("ri_child_interrupt_wkups", ctypes.c_uint64),
+                        ("ri_child_pageins", ctypes.c_uint64),
+                        ("ri_child_elapsed_abstime", ctypes.c_uint64),
+                        ("ri_diskio_bytesread", ctypes.c_uint64),
+                        ("ri_diskio_byteswritten", ctypes.c_uint64),
+                        ("ri_cpu_time_qos_default", ctypes.c_uint64),
+                        ("ri_cpu_time_qos_maintenance", ctypes.c_uint64),
+                        ("ri_cpu_time_qos_background", ctypes.c_uint64),
+                        ("ri_cpu_time_qos_utility", ctypes.c_uint64),
+                        ("ri_cpu_time_qos_legacy", ctypes.c_uint64),
+                        ("ri_cpu_time_qos_user_initiated", ctypes.c_uint64),
+                        ("ri_cpu_time_qos_user_interactive", ctypes.c_uint64),
+                        ("ri_billed_system_time", ctypes.c_uint64),
+                        ("ri_serviced_system_time", ctypes.c_uint64),
+                        ("ri_logical_writes", ctypes.c_uint64),
+                        ("ri_lifetime_max_phys_footprint", ctypes.c_uint64),
+                        ("ri_instructions", ctypes.c_uint64),
+                        ("ri_cycles", ctypes.c_uint64),
+                        ("ri_billed_energy", ctypes.c_uint64),
+                        ("ri_serviced_energy", ctypes.c_uint64),
+                        ("ri_interval_max_phys_footprint", ctypes.c_uint64),
+                        ("ri_runnable_time", ctypes.c_uint64),
+                    ]
+
+                lib = ctypes.CDLL(None)
+                fn = lib.proc_pid_rusage
+                fn.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
+                fn.restype = ctypes.c_int
+                self._mac_proc_pid_rusage = fn
+                self._mac_rusage_info_v4 = RUsageInfoV4
+            info = self._mac_rusage_info_v4()
+            rc = int(self._mac_proc_pid_rusage(int(os.getpid()), 4, ctypes.byref(info)))
+            if rc != 0:
+                return None
+            return int(info.ri_phys_footprint)
+        except Exception:
+            return None
+
+    def _proc_tree_memory_bytes(self) -> Optional[tuple[int, str]]:
+        if self._psutil is None:
+            return None
+        try:
+            proc = self._psutil.Process(os.getpid())
+            rss_total = int(proc.memory_info().rss)
+        except Exception:
+            return None
+        try:
+            for child in proc.children(recursive=True):
+                try:
+                    rss_total += int(child.memory_info().rss)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        footprint = self._mac_current_footprint_bytes()
+        if footprint is not None and int(footprint) >= int(rss_total):
+            return int(footprint), "phys_footprint"
+        return int(rss_total), "rss"
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval_s):
+            mem = self._proc_tree_memory_bytes()
+            if mem is None:
+                continue
+            mem_bytes, metric = mem
+            if mem_bytes <= self.limit_bytes:
+                continue
+            mem_gb = float(mem_bytes) / (1024.0**3)
+            limit_label = (
+                f"{self.limit_gb:.3f}" if self.limit_gb < 0.01 else f"{self.limit_gb:.2f}"
+            )
+            msg = (
+                "ADAMIXTURE task aborted: memory limit exceeded "
+                f"(limit={limit_label} GB, {metric}={mem_gb:.2f} GB)."
+            )
+            try:
+                self.logger.error(msg)
+            except Exception:
+                pass
+            force_exit(137, msg)
+
+
+def _bed_stream_session_available(source_label: str) -> bool:
+    return str(source_label).upper() == "BFILE" and (
+        hasattr(jxrs, "AdmxBedTrainingSession") or hasattr(jxrs, "AdmxBedBackend")
+    )
+
+
+def _plink_prefix_from_pathlike(genotype_path: str) -> Optional[str]:
+    raw = str(Path(str(genotype_path)).expanduser())
+    prefix = raw[:-4] if raw.lower().endswith(".bed") else raw
+    if Path(f"{prefix}.bed").exists() and Path(f"{prefix}.fam").exists():
+        return prefix
+    return None
+
+
+def _try_read_plink_sample_ids(genotype_path: str) -> Optional[list[str]]:
+    prefix = _plink_prefix_from_pathlike(genotype_path)
+    if prefix is None:
+        return None
+    fam_path = Path(f"{prefix}.fam")
+    sample_ids: list[str] = []
+    with open(fam_path, "r", encoding="utf-8") as fr:
+        for line in fr:
+            toks = str(line).strip().split()
+            if len(toks) >= 2:
+                sample_ids.append(str(toks[1]))
+            elif len(toks) == 1:
+                sample_ids.append(str(toks[0]))
+            else:
+                sample_ids.append("")
+    return sample_ids
 
 
 def _build_k_warm_start(
@@ -398,25 +595,32 @@ def _safe_sample_ids_and_site_lines(
     expected_n: int,
     expected_m: int,
     logger: logging.Logger,
-) -> tuple[list[str], list[str]]:
+) -> tuple[list[str], Optional[list[str]]]:
     sample_ids: list[str] = []
-    site_lines: list[str] = []
-    try:
-        sample_ids_raw, site_rows_raw = inspect_genotype_file(
-            genotype_path,
-            snps_only=bool(snps_only),
-            maf=float(maf),
-            missing_rate=float(missing_rate),
-        )
-        sample_ids = [str(x) for x in sample_ids_raw]
-        if isinstance(site_rows_raw, (list, tuple, np.ndarray)):
-            site_lines = [_site_line_from_obj(x) for x in site_rows_raw]
-        else:
-            site_lines = []
-    except Exception as ex:
-        logger.warning(f"Failed to inspect sample/site IDs for Q/P output: {ex}")
-        sample_ids = []
-        site_lines = []
+    site_lines: Optional[list[str]] = None
+    if _plink_prefix_from_pathlike(genotype_path) is not None:
+        try:
+            sample_ids = list(_try_read_plink_sample_ids(genotype_path) or [])
+            site_lines = None
+        except Exception as ex:
+            logger.warning(f"Failed to read PLINK sample IDs for Q/P output: {ex}")
+            sample_ids = []
+            site_lines = None
+    else:
+        try:
+            sample_ids_raw, site_rows_raw = inspect_genotype_file(
+                genotype_path,
+                snps_only=bool(snps_only),
+                maf=float(maf),
+                missing_rate=float(missing_rate),
+            )
+            sample_ids = [str(x) for x in sample_ids_raw]
+            if isinstance(site_rows_raw, (list, tuple, np.ndarray)):
+                site_lines = [_site_line_from_obj(x) for x in site_rows_raw]
+        except Exception as ex:
+            logger.warning(f"Failed to inspect sample/site IDs for Q/P output: {ex}")
+            sample_ids = []
+            site_lines = None
 
     if len(sample_ids) != int(expected_n):
         if len(sample_ids) > 0:
@@ -427,14 +631,14 @@ def _safe_sample_ids_and_site_lines(
             )
         sample_ids = [f"S{i+1}" for i in range(int(expected_n))]
 
-    if len(site_lines) != int(expected_m):
+    if site_lines is not None and len(site_lines) != int(expected_m):
         if len(site_lines) > 0:
             logger.warning(
                 "Site row count mismatch for P.site output "
                 f"(sites={len(site_lines)}, expected={int(expected_m)}). "
-                "Fallback to generated site rows."
+                "Fallback to streamed generated site rows."
             )
-        site_lines = [f"0\t{i+1}\tN\tN" for i in range(int(expected_m))]
+        site_lines = None
 
     return sample_ids, site_lines
 
@@ -546,24 +750,32 @@ def _render_structure_plot(
         return None, {}
 
 
-def _write_p_npy_and_site(
-    out_npy_path: str,
+def _write_p_site_lines(
     out_site_path: str,
-    site_lines: list[str],
+    site_lines: Optional[list[str]],
+    n_rows: int,
+) -> None:
+    with open(out_site_path, "w", encoding="utf-8") as fw:
+        if site_lines is None:
+            for i in range(int(n_rows)):
+                fw.write(f"0\t{i+1}\tN\tN\n")
+            return
+        if len(site_lines) != int(n_rows):
+            raise ValueError(
+                f"P.site row count mismatch: sites={len(site_lines)}, rows={int(n_rows)}"
+            )
+        for line in site_lines:
+            text = str(line).rstrip("\n")
+            fw.write(f"{text}\n")
+
+
+def _write_p_npy(
+    out_npy_path: str,
     mat: np.ndarray,
 ) -> None:
     arr = np.asarray(mat)
     if arr.ndim != 2:
         raise ValueError(f"P matrix must be 2D, got shape={arr.shape}")
-    if len(site_lines) != int(arr.shape[0]):
-        raise ValueError(
-            f"P.site row count mismatch: sites={len(site_lines)}, rows={int(arr.shape[0])}"
-        )
-
-    with open(out_site_path, "w", encoding="utf-8") as fw:
-        for line in site_lines:
-            text = str(line).rstrip("\n")
-            fw.write(f"{text}\n")
 
     dtype = _resolve_p_npy_dtype()
     chunk_rows_raw = str(os.environ.get("JANUSX_ADMX_P_MEMMAP_CHUNK", "4096")).strip()
@@ -584,6 +796,35 @@ def _write_p_npy_and_site(
             mm[start:end, :] = np.asarray(arr[start:end, :], dtype=dtype)
     finally:
         del mm
+
+
+def _try_write_bed_p_site_file(
+    genotype_path: str,
+    *,
+    snps_only: bool,
+    maf: float,
+    missing_rate: float,
+    out_site_path: str,
+    logger: logging.Logger,
+) -> bool:
+    if not hasattr(jxrs, "AdmxBedBackend"):
+        return False
+    try:
+        backend = jxrs.AdmxBedBackend(
+            str(genotype_path),
+            bool(snps_only),
+            float(maf),
+            float(missing_rate),
+        )
+        if not hasattr(backend, "write_site_file"):
+            return False
+        backend.write_site_file(str(out_site_path))
+        return True
+    except Exception as ex:
+        logger.warning(
+            f"Failed to stream BED P.site from backend ({ex}); fallback to generated site rows."
+        )
+        return False
 
 
 def _parse_k_spec(k_spec: str) -> list[int]:
@@ -797,14 +1038,17 @@ def _run_single_k(
     p_site_out = os.path.join(outdir, f"{prefix}.{int(k)}.P.site")
     structure_fmt = "svg"
     structure_out = os.path.join(outdir, f"{prefix}.{int(k)}.admix.{structure_fmt}")
+    plot_enabled = not bool(getattr(args, "no_plot", False))
 
     model_rows = [
         ("K", int(k)),
         ("Solver", str(args.solver)),
         ("max_iter", int(args.max_iter)),
+        ("check", int(args.check)),
         ("tol", float(args.tol)),
         ("CVerror", (str(cv_label) if cv_enabled else "off")),
         ("Tag labels", ("off" if len(tag_samples) == 0 else f"{len(tag_samples)} sample(s)")),
+        ("Structure plot", ("on" if plot_enabled else "off")),
     ]
     if int(total_k) > 1:
         model_rows.append(("K spec", str(k_spec)))
@@ -814,6 +1058,10 @@ def _run_single_k(
     if not emit_config_to_stdout:
         cfg_mute = _mute_stdout_info_logs(logger)
     try:
+        _admx_py_mem_debug(
+            "cli/run_single_k/before_config",
+            f"k={int(k)} source={source_label} bed_stream={bool(_bed_stream_session_available(source_label))}",
+        )
         emit_cli_configuration(
             logger,
             app_title="JanusX - ADAMIXTURE",
@@ -854,11 +1102,12 @@ def _run_single_k(
                 ("Q output", q_out),
                 ("P output (.npy)", p_npy_out),
                 ("P site (.site)", p_site_out),
-                ("Structure plot", structure_out),
+                ("Structure plot", (structure_out if plot_enabled else "disabled")),
                 ("Log file", log_path),
             ],
             emit_to_stdout=bool(emit_config_to_stdout),
         )
+        _admx_py_mem_debug("cli/run_single_k/after_config", f"k={int(k)}")
     finally:
         _restore_handler_levels(cfg_mute)
 
@@ -875,6 +1124,7 @@ def _run_single_k(
         geno=float(args.geno),
         solver=str(args.solver),
         max_iter=max(1, int(args.max_iter)),
+        check=max(1, int(args.check)),
         tol=float(args.tol),
         cv=int(cv_value if cv_enabled else 0),
     )
@@ -884,21 +1134,34 @@ def _run_single_k(
     muted: list[tuple[logging.Handler, int]] = []
     cverror_result: Optional[dict[str, float]] = None
     structure_plot_path: Optional[str] = None
+    bed_stream_session = _bed_stream_session_available(source_label)
     t_one = time.time()
     try:
+        _admx_py_mem_debug(
+            "cli/run_single_k/before_progress_setup",
+            f"k={int(k)} use_batch_progress={bool(use_batch_progress)} enable_spinner={bool(enable_spinner)}",
+        )
         if use_batch_progress:
             muted = _mute_stdout_info_logs(logger)
         elif enable_spinner:
             progress_ui = _AdmixtureCliProgress(logger, enabled=True)
             callback = progress_ui.on_event
             muted = _mute_stdout_info_logs(logger)
+        _admx_py_mem_debug(
+            "cli/run_single_k/before_train",
+            f"k={int(k)} bed_stream={bool(bed_stream_session)} shared_g={shared_g is not None}",
+        )
         try:
             p_mat, q_mat, m, n = train_adamixture(
                 cfg,
                 logger,
                 callback=callback,
-                g_matrix=shared_g,
+                g_matrix=(None if bed_stream_session else shared_g),
                 warm_start=warm_start,
+            )
+            _admx_py_mem_debug(
+                "cli/run_single_k/after_train",
+                f"k={int(k)} m={int(m)} n={int(n)}",
             )
         finally:
             if progress_ui is not None:
@@ -915,19 +1178,39 @@ def _run_single_k(
             logger=logger,
         )
         _write_q_txt_with_row_ids(q_out, q_ids, np.asarray(q_mat, dtype=np.float64))
-        _write_p_npy_and_site(
+        p_arr = np.asarray(p_mat, dtype=np.float32)
+        site_written = False
+        if bed_stream_session:
+            site_written = _try_write_bed_p_site_file(
+                genotype_path,
+                snps_only=bool(args.snps_only),
+                maf=float(args.maf),
+                missing_rate=float(args.geno),
+                out_site_path=p_site_out,
+                logger=logger,
+            )
+            if site_written:
+                logger.info("P.site metadata      : BED backend stream")
+        if not site_written:
+            _write_p_site_lines(
+                p_site_out,
+                p_site_lines,
+                int(p_arr.shape[0]),
+            )
+        _write_p_npy(
             p_npy_out,
-            p_site_out,
-            p_site_lines,
-            np.asarray(p_mat, dtype=np.float32),
+            p_arr,
         )
-        structure_plot_path, _plot_meta = _render_structure_plot(
-            q_mat=np.asarray(q_mat, dtype=np.float64),
-            q_ids=list(q_ids),
-            out_path=str(structure_out),
-            tag_samples=list(tag_samples),
-            logger=logger,
-        )
+        if plot_enabled:
+            structure_plot_path, _plot_meta = _render_structure_plot(
+                q_mat=np.asarray(q_mat, dtype=np.float64),
+                q_ids=list(q_ids),
+                out_path=str(structure_out),
+                tag_samples=list(tag_samples),
+                logger=logger,
+            )
+        else:
+            logger.info("Structure plot      : skipped (--no-plot)")
         if cv_enabled:
             cv_progress_callback = None
             if use_batch_progress:
@@ -978,6 +1261,11 @@ def _run_single_k(
                 progress_ui.fail("ADAMIXTURE ...Failed")
             except Exception:
                 pass
+        if "ADAMIXTURE memory limit exceeded" in str(e):
+            msg = str(e)
+            logger.error(msg)
+            print_failure("ADAMIXTURE memory limit exceeded", force_color=True)
+            force_exit(137, msg)
         logger.exception(f"ADAMIXTURE failed: {e}")
         print_failure("ADAMIXTURE ...Failed", force_color=True)
         raise
@@ -1091,6 +1379,12 @@ def _build_parser() -> CliArgumentParser:
         ),
     )
     input_output.add_argument(
+        "--no-plot",
+        action="store_true",
+        default=False,
+        help="Skip structure plot rendering and only write Q/P/site/log outputs.",
+    )
+    input_output.add_argument(
         "-chunksize",
         "--chunksize",
         type=int,
@@ -1136,6 +1430,15 @@ def _build_parser() -> CliArgumentParser:
         help=argparse.SUPPRESS,
     )
     runtime.add_argument("-seed", "--seed", type=int, default=42, help="Random seed (default: 42).")
+    runtime.add_argument(
+        "--max-rss-gb",
+        type=float,
+        default=_default_max_rss_gb(),
+        help=(
+            "Abort the task if current RSS exceeds this memory cap in GB "
+            f"(default: {_default_max_rss_gb():g}; use 0 to disable)."
+        ),
+    )
 
     model = parser.add_argument_group("Model/Optimization Arguments")
     model.add_argument(
@@ -1153,6 +1456,16 @@ def _build_parser() -> CliArgumentParser:
         type=int,
         default=500,
         help="Maximum optimization iterations (default: 500).",
+    )
+    model.add_argument(
+        "-check",
+        "--check",
+        type=int,
+        default=5,
+        help=(
+            "Log-likelihood check interval during Adam-EM (default: 5). "
+            "Larger values reduce full-data scans and can speed up large BED runs."
+        ),
     )
     model.add_argument(
         "-tol",
@@ -1196,8 +1509,13 @@ def main() -> None:
         parser.error("-tol/--tol must be > 0.")
     if int(args.max_iter) <= 0:
         parser.error("-max-iter/--max-iter must be a positive integer.")
+    if int(args.check) <= 0:
+        parser.error("-check/--check must be a positive integer.")
     if int(args.thread) <= 0:
         parser.error("-t/--thread must be a positive integer.")
+    if (not math.isfinite(float(args.max_rss_gb))) or float(args.max_rss_gb) < 0.0:
+        parser.error("--max-rss-gb must be >= 0.")
+    os.environ["JANUSX_ADMX_MAX_RSS_GB"] = str(float(args.max_rss_gb))
     try:
         k_values = _parse_k_spec(str(args.k))
     except Exception as ex:
@@ -1225,7 +1543,12 @@ def main() -> None:
         tmp_logger.addHandler(h)
     tmp_logger.setLevel(logging.INFO)
     tmp_logger.propagate = False
+    rss_watchdog = _AdmixtureMemoryWatchdog(
+        limit_gb=float(args.max_rss_gb),
+        logger=tmp_logger,
+    )
     try:
+        rss_watchdog.start()
         genotype_path, source_label, auto_prefix = _resolve_input(args, tmp_logger)
     except Exception as e:
         print_failure(str(e), force_color=True)
@@ -1236,7 +1559,9 @@ def main() -> None:
     multi_k = len(k_values) > 1
     enable_spinner = bool(stdout_is_tty())
     k_warmstart_enabled = bool(multi_k and bool(args.k_warmstart))
+    bed_stream_session = _bed_stream_session_available(source_label)
     use_geno_cache = _bool_env("JANUSX_ADMX_CACHE_GENO", True)
+    effective_geno_cache = bool(use_geno_cache and (not bed_stream_session))
     if multi_k:
         if cv_enabled:
             cv_msg = str(cv_label)
@@ -1248,9 +1573,11 @@ def main() -> None:
         )
         print(
             f"CVerror={cv_msg}, solver={args.solver}, "
-            f"max_iter={int(args.max_iter)}, threads={int(resolved_threads)}, "
+            f"max_iter={int(args.max_iter)}, check={int(args.check)}, "
+            f"threads={int(resolved_threads)}, "
             f"k_warmstart={'on' if k_warmstart_enabled else 'off'}, "
-            f"geno_cache={'on' if use_geno_cache else 'off'}, "
+            f"geno_cache={'on' if effective_geno_cache else 'off'}, "
+            f"bed_stream={'on' if bed_stream_session else 'off'}, "
             f"tag={'on' if len(tag_samples) > 0 else 'off'}",
             flush=True,
         )
@@ -1258,6 +1585,26 @@ def main() -> None:
             tmp_logger.warning(
                 "Warning: --k-warmstart is experimental and may alter convergence; "
                 "for strict reproducibility use default (warm-start off)."
+            )
+    if bed_stream_session:
+        if hasattr(jxrs, "AdmxBedTrainingSession"):
+            tmp_logger.info(
+                "BED Rust training session detected: model training will call fit_k() "
+                "on the persistent packed BED backend instead of dense shared_g cache."
+            )
+        else:
+            tmp_logger.info(
+                "BED stream session detected: model training will use low-memory BED backend "
+                "instead of dense shared_g cache."
+            )
+        if use_geno_cache:
+            tmp_logger.info(
+                "Skipping dense genotype preload because BED stream session is available."
+            )
+        if cv_enabled:
+            tmp_logger.info(
+                "CVerror will use the BED foldmask stream backend when available, "
+                "avoiding dense g_full and per-fold g_train copies."
             )
     if thread_capped:
         tmp_logger.warning(
@@ -1270,7 +1617,7 @@ def main() -> None:
     #     strict=require_openblas_by_default(),
     # )
     shared_g: Optional[np.ndarray] = None
-    if use_geno_cache:
+    if effective_geno_cache:
         shared_g = load_genotype_u8_matrix(
             genotype_path,
             chunk_size=max(1000, int(args.chunksize)),
@@ -1280,49 +1627,52 @@ def main() -> None:
         )
     prev_model_state: Optional[dict[str, Any]] = None
     summary_rows: list[dict[str, Any]] = []
-    with _AdmixtureBatchProgress(
-        enabled=bool(multi_k),
-        total_k=int(len(k_values)),
-        cv_enabled=bool(cv_enabled),
-        cv_label=str(cv_label),
-    ) as batch_progress:
-        for idx, k in enumerate(k_values, start=1):
-            batch_progress.start_k(k=int(k))
-            warm_start = None
-            if k_warmstart_enabled:
-                warm_start = _build_k_warm_start(
-                    prev_model_state,
-                    target_k=int(k),
-                    seed=int(args.seed),
+    try:
+        with _AdmixtureBatchProgress(
+            enabled=bool(multi_k),
+            total_k=int(len(k_values)),
+            cv_enabled=bool(cv_enabled),
+            cv_label=str(cv_label),
+        ) as batch_progress:
+            for idx, k in enumerate(k_values, start=1):
+                batch_progress.start_k(k=int(k))
+                warm_start = None
+                if k_warmstart_enabled:
+                    warm_start = _build_k_warm_start(
+                        prev_model_state,
+                        target_k=int(k),
+                        seed=int(args.seed),
+                    )
+                row, model_state = _run_single_k(
+                    genotype_path=genotype_path,
+                    source_label=source_label,
+                    prefix=prefix,
+                    outdir=outdir,
+                    k=int(k),
+                    k_spec=str(args.k),
+                    k_index=int(idx),
+                    total_k=int(len(k_values)),
+                    args=args,
+                    detected_threads=int(detected_threads),
+                    requested_threads=int(requested_threads),
+                    resolved_threads=int(resolved_threads),
+                    enable_spinner=bool(enable_spinner),
+                    emit_config_to_stdout=bool(not multi_k),
+                    batch_progress=batch_progress,
+                    cv_enabled=bool(cv_enabled),
+                    cv_value=int(cv_value),
+                    cv_label=str(cv_label),
+                    tag_samples=list(tag_samples),
+                    shared_g=shared_g,
+                    warm_start=warm_start,
+                    keep_model_for_warmstart=bool(k_warmstart_enabled),
                 )
-            row, model_state = _run_single_k(
-                genotype_path=genotype_path,
-                source_label=source_label,
-                prefix=prefix,
-                outdir=outdir,
-                k=int(k),
-                k_spec=str(args.k),
-                k_index=int(idx),
-                total_k=int(len(k_values)),
-                args=args,
-                detected_threads=int(detected_threads),
-                requested_threads=int(requested_threads),
-                resolved_threads=int(resolved_threads),
-                enable_spinner=bool(enable_spinner),
-                emit_config_to_stdout=bool(not multi_k),
-                batch_progress=batch_progress,
-                cv_enabled=bool(cv_enabled),
-                cv_value=int(cv_value),
-                cv_label=str(cv_label),
-                tag_samples=list(tag_samples),
-                shared_g=shared_g,
-                warm_start=warm_start,
-                keep_model_for_warmstart=bool(k_warmstart_enabled),
-            )
-            summary_rows.append(row)
-            if k_warmstart_enabled:
-                prev_model_state = model_state
-            batch_progress.advance_k(steps=1)
+                summary_rows.append(row)
+                if k_warmstart_enabled:
+                    prev_model_state = model_state
+                batch_progress.advance_k(steps=1)
+    finally:
+        rss_watchdog.stop()
 
     summary_log = os.path.join(outdir, f"{prefix}.adamixture.summary.log")
     logger = setup_logging(summary_log)

@@ -183,14 +183,23 @@ pub fn run_kmerge(args: KmergeArgs) -> Result<Stage3Summary> {
             threads: args.threads,
         })?;
     } else {
-        emit_run_line(log_path, "Stage 1/3: resume hit, reusing existing sorted runs")?;
+        emit_run_line(
+            log_path,
+            "Stage 1/3: resume hit, reusing existing sorted runs",
+        )?;
     }
 
     let parts = if args.resume && is_stage_done(&tmp_dir.join("stage2.done")) {
-        emit_run_line(log_path, "Stage 2/3: resume hit, reusing existing bucket parts")?;
+        emit_run_line(
+            log_path,
+            "Stage 2/3: resume hit, reusing existing bucket parts",
+        )?;
         load_stage2_manifest(&tmp_dir)?
     } else {
-        emit_run_line(log_path, "Stage 2/3: bucket merge -> .bkmer.part / .bsite.part")?;
+        emit_run_line(
+            log_path,
+            "Stage 2/3: bucket merge -> .bkmer.part / .bsite.part",
+        )?;
         run_stage2(&Stage2Config {
             tmp_dir: &tmp_dir,
             n_samples: samples.len(),

@@ -40,7 +40,9 @@ use crate::linalg::{
     chi2_sf_df1, chisq_from_beta_se_and_optional_plrt, cholesky_inplace, cholesky_logdet,
     cholesky_solve_into, format_chisq_value, normal_sf, sanitize_assoc_pvalue,
 };
-use crate::stats_common::{env_truthy, get_cached_pool, parse_index_vec_i64, AsyncTsvWriter};
+use crate::stats_common::{
+    env_truthy, get_cached_pool, parse_index_vec_i64, resolve_assoc_tsv_metadata, AsyncTsvWriter,
+};
 use memmap2::Mmap;
 use std::fs::File;
 
@@ -6790,7 +6792,8 @@ pub fn lmm_reml_assoc_packed_f32<'py>(
     progress_every=0,
     nullml=None,
     init_log10_lbd=None,
-    rotate_block_rows=256
+    rotate_block_rows=256,
+    bed_prefix=None
 ))]
 pub fn lmm_reml_assoc_packed_f32_to_tsv<'py>(
     py: Python<'py>,
@@ -6822,6 +6825,7 @@ pub fn lmm_reml_assoc_packed_f32_to_tsv<'py>(
     nullml: Option<f64>,
     init_log10_lbd: Option<f64>,
     rotate_block_rows: usize,
+    bed_prefix: Option<&str>,
 ) -> PyResult<usize> {
     if n_samples == 0 {
         return Err(PyRuntimeError::new_err("n_samples must be > 0"));
@@ -6869,21 +6873,17 @@ pub fn lmm_reml_assoc_packed_f32_to_tsv<'py>(
             "row_flip/row_maf/row_missing length mismatch with packed rows",
         ));
     }
-    if chrom.len() != m
-        || pos.len() != m
-        || snp.len() != m
-        || allele0.len() != m
-        || allele1.len() != m
-    {
-        return Err(PyRuntimeError::new_err(format!(
-            "TSV metadata length mismatch: rows={m}, chrom={}, pos={}, snp={}, allele0={}, allele1={}",
-            chrom.len(),
-            pos.len(),
-            snp.len(),
-            allele0.len(),
-            allele1.len()
-        )));
-    }
+    let (chrom, pos, snp, allele0, allele1) = resolve_assoc_tsv_metadata(
+        bed_prefix,
+        chrom,
+        pos,
+        snp,
+        allele0,
+        allele1,
+        row_idx.as_deref(),
+        m,
+    )
+    .map_err(PyRuntimeError::new_err)?;
 
     let y = y_rot.as_slice()?;
     let n = y.len();
@@ -8193,6 +8193,7 @@ pub fn fastlmm_assoc_packed_f32_to_tsv<'py>(
     fixed_ml0: Option<f64>,
     row_indices: Option<PyReadonlyArray1<'py, i64>>,
     rotate_block_rows: usize,
+    bed_prefix: Option<&str>,
 ) -> PyResult<(f64, f64, f64)> {
     if fixed_lbd.is_none() && low >= high {
         return Err(PyRuntimeError::new_err("low must be < high"));
@@ -8254,21 +8255,17 @@ pub fn fastlmm_assoc_packed_f32_to_tsv<'py>(
             row_missing.len()
         )));
     }
-    if chrom.len() != m
-        || pos.len() != m
-        || snp.len() != m
-        || allele0.len() != m
-        || allele1.len() != m
-    {
-        return Err(PyRuntimeError::new_err(format!(
-            "TSV metadata length mismatch: rows={m}, chrom={}, pos={}, snp={}, allele0={}, allele1={}",
-            chrom.len(),
-            pos.len(),
-            snp.len(),
-            allele0.len(),
-            allele1.len()
-        )));
-    }
+    let (chrom, pos, snp, allele0, allele1) = resolve_assoc_tsv_metadata(
+        bed_prefix,
+        chrom,
+        pos,
+        snp,
+        allele0,
+        allele1,
+        row_idx.as_deref(),
+        m,
+    )
+    .map_err(PyRuntimeError::new_err)?;
 
     let y = y.as_slice()?;
     let n = y.len();
@@ -8863,6 +8860,7 @@ pub fn fvlmm_assoc_packed_f32_to_tsv<'py>(
     fixed_ml0: Option<f64>,
     row_indices: Option<PyReadonlyArray1<'py, i64>>,
     rotate_block_rows: usize,
+    bed_prefix: Option<&str>,
 ) -> PyResult<(f64, f64, f64)> {
     if fixed_lbd.is_none() && low >= high {
         return Err(PyRuntimeError::new_err("low must be < high"));
@@ -8924,21 +8922,17 @@ pub fn fvlmm_assoc_packed_f32_to_tsv<'py>(
             row_missing.len()
         )));
     }
-    if chrom.len() != m
-        || pos.len() != m
-        || snp.len() != m
-        || allele0.len() != m
-        || allele1.len() != m
-    {
-        return Err(PyRuntimeError::new_err(format!(
-            "TSV metadata length mismatch: rows={m}, chrom={}, pos={}, snp={}, allele0={}, allele1={}",
-            chrom.len(),
-            pos.len(),
-            snp.len(),
-            allele0.len(),
-            allele1.len()
-        )));
-    }
+    let (chrom, pos, snp, allele0, allele1) = resolve_assoc_tsv_metadata(
+        bed_prefix,
+        chrom,
+        pos,
+        snp,
+        allele0,
+        allele1,
+        row_idx.as_deref(),
+        m,
+    )
+    .map_err(PyRuntimeError::new_err)?;
 
     let y = y.as_slice()?;
     let n = y.len();

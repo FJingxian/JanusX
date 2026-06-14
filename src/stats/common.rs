@@ -11,6 +11,72 @@ use std::thread::JoinHandle;
 
 pub(crate) const INTERRUPTED_MSG: &str = "Interrupted by user (Ctrl+C).";
 
+pub(crate) type AssocTsvMetadata = (
+    Vec<String>,
+    Vec<i64>,
+    Vec<String>,
+    Vec<String>,
+    Vec<String>,
+);
+
+pub(crate) fn resolve_assoc_tsv_metadata(
+    bed_prefix: Option<&str>,
+    chrom: Vec<String>,
+    pos: Vec<i64>,
+    snp: Vec<String>,
+    allele0: Vec<String>,
+    allele1: Vec<String>,
+    row_indices: Option<&[usize]>,
+    expected_len: usize,
+) -> Result<AssocTsvMetadata, String> {
+    let all_empty = chrom.is_empty()
+        && pos.is_empty()
+        && snp.is_empty()
+        && allele0.is_empty()
+        && allele1.is_empty();
+    if all_empty {
+        let prefix = bed_prefix
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| "empty TSV metadata requires non-empty bed_prefix".to_string())?;
+        let (chrom2, pos2, snp2, allele02, allele12) =
+            crate::gfcore::read_bim_columns(prefix, row_indices)?;
+        if chrom2.len() != expected_len
+            || pos2.len() != expected_len
+            || snp2.len() != expected_len
+            || allele02.len() != expected_len
+            || allele12.len() != expected_len
+        {
+            return Err(format!(
+                "BIM metadata length mismatch: expected={expected_len}, chrom={}, pos={}, snp={}, allele0={}, allele1={}",
+                chrom2.len(),
+                pos2.len(),
+                snp2.len(),
+                allele02.len(),
+                allele12.len(),
+            ));
+        }
+        let pos64 = pos2.into_iter().map(|v| v as i64).collect::<Vec<i64>>();
+        return Ok((chrom2, pos64, snp2, allele02, allele12));
+    }
+    if chrom.len() != expected_len
+        || pos.len() != expected_len
+        || snp.len() != expected_len
+        || allele0.len() != expected_len
+        || allele1.len() != expected_len
+    {
+        return Err(format!(
+            "TSV metadata length mismatch: rows={expected_len}, chrom={}, pos={}, snp={}, allele0={}, allele1={}",
+            chrom.len(),
+            pos.len(),
+            snp.len(),
+            allele0.len(),
+            allele1.len()
+        ));
+    }
+    Ok((chrom, pos, snp, allele0, allele1))
+}
+
 #[inline]
 pub(crate) fn check_ctrlc() -> Result<(), String> {
     Python::attach(|py| py.check_signals()).map_err(|_| INTERRUPTED_MSG.to_string())
@@ -34,6 +100,213 @@ pub(crate) fn env_truthy(name: &str) -> bool {
             matches!(t.as_str(), "1" | "true" | "yes" | "y" | "on")
         })
         .unwrap_or(false)
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ProcessMemoryUsage {
+    pub(crate) current_bytes: u64,
+    pub(crate) metric: &'static str,
+    pub(crate) rss_bytes: Option<u64>,
+    pub(crate) footprint_bytes: Option<u64>,
+}
+
+#[inline]
+pub(crate) fn format_bytes(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    let b = bytes as f64;
+    if b >= GIB {
+        format!("{:.2} GiB", b / GIB)
+    } else if b >= MIB {
+        format!("{:.1} MiB", b / MIB)
+    } else if b >= KIB {
+        format!("{:.1} KiB", b / KIB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+#[inline]
+fn env_disabled(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|v| {
+            let t = v.trim().to_ascii_lowercase();
+            matches!(t.as_str(), "0" | "false" | "no" | "off")
+        })
+        .unwrap_or(false)
+}
+
+#[inline]
+pub(crate) fn admx_madvise_dontneed_bytes(ptr: *const u8, len: usize) {
+    if ptr.is_null() || len == 0 {
+        return;
+    }
+    if env_disabled("JANUSX_ADMX_MADVISE_DONTNEED") || env_disabled("JX_ADMX_MADVISE_DONTNEED") {
+        return;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if page_size <= 0 {
+            return;
+        }
+        let page = page_size as usize;
+        let start = ptr as usize;
+        let end = start.saturating_add(len);
+        if end <= start {
+            return;
+        }
+        let aligned_start = start & !(page - 1);
+        let aligned_end = end.saturating_add(page - 1) & !(page - 1);
+        let advise_len = aligned_end.saturating_sub(aligned_start);
+        if advise_len == 0 {
+            return;
+        }
+        unsafe {
+            let _ = libc::madvise(
+                aligned_start as *mut libc::c_void,
+                advise_len,
+                libc::MADV_DONTNEED,
+            );
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (ptr, len);
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn process_memory_usage() -> Option<ProcessMemoryUsage> {
+    let text = std::fs::read_to_string("/proc/self/statm").ok()?;
+    let mut fields = text.split_whitespace();
+    let _size_pages = fields.next()?;
+    let rss_pages: u64 = fields.next()?.parse().ok()?;
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page_size <= 0 {
+        return None;
+    }
+    let rss = rss_pages.saturating_mul(page_size as u64);
+    Some(ProcessMemoryUsage {
+        current_bytes: rss,
+        metric: "rss",
+        rss_bytes: Some(rss),
+        footprint_bytes: None,
+    })
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn process_memory_usage() -> Option<ProcessMemoryUsage> {
+    unsafe extern "C" {
+        fn proc_pid_rusage(
+            pid: libc::c_int,
+            flavor: libc::c_int,
+            buffer: *mut libc::c_void,
+        ) -> libc::c_int;
+    }
+
+    let mut info = std::mem::MaybeUninit::<libc::rusage_info_v4>::zeroed();
+    let rc = unsafe {
+        proc_pid_rusage(
+            libc::getpid(),
+            libc::RUSAGE_INFO_V4,
+            info.as_mut_ptr() as *mut libc::c_void,
+        )
+    };
+    if rc == 0 {
+        let info = unsafe { info.assume_init() };
+        return Some(ProcessMemoryUsage {
+            current_bytes: info.ri_phys_footprint,
+            metric: "phys_footprint",
+            rss_bytes: Some(info.ri_resident_size),
+            footprint_bytes: Some(info.ri_phys_footprint),
+        });
+    }
+
+    let mut ru = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+    let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, ru.as_mut_ptr()) };
+    if rc != 0 {
+        return None;
+    }
+    let ru = unsafe { ru.assume_init() };
+    let rss_peak = ru.ru_maxrss as u64;
+    Some(ProcessMemoryUsage {
+        current_bytes: rss_peak,
+        metric: "rss_peak",
+        rss_bytes: Some(rss_peak),
+        footprint_bytes: None,
+    })
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+pub(crate) fn process_memory_usage() -> Option<ProcessMemoryUsage> {
+    let mut ru = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+    let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, ru.as_mut_ptr()) };
+    if rc != 0 {
+        return None;
+    }
+    let ru = unsafe { ru.assume_init() };
+    let rss_peak = (ru.ru_maxrss as u64).saturating_mul(1024);
+    Some(ProcessMemoryUsage {
+        current_bytes: rss_peak,
+        metric: "rss_peak",
+        rss_bytes: Some(rss_peak),
+        footprint_bytes: None,
+    })
+}
+
+#[cfg(not(unix))]
+pub(crate) fn process_memory_usage() -> Option<ProcessMemoryUsage> {
+    None
+}
+
+pub(crate) fn admx_memory_limit_bytes_from_env() -> Option<u64> {
+    for name in ["JANUSX_ADMX_MAX_FOOTPRINT_GB", "JANUSX_ADMX_MAX_RSS_GB"] {
+        let Ok(raw) = std::env::var(name) else {
+            continue;
+        };
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let value = trimmed.parse::<f64>().ok()?;
+        if !value.is_finite() || value <= 0.0 {
+            return None;
+        }
+        return Some((value * 1024.0_f64 * 1024.0_f64 * 1024.0_f64) as u64);
+    }
+    None
+}
+
+#[inline]
+pub(crate) fn check_admx_memory_limit(stage: &str) -> Result<(), String> {
+    let Some(limit) = admx_memory_limit_bytes_from_env() else {
+        return Ok(());
+    };
+    let Some(usage) = process_memory_usage() else {
+        return Ok(());
+    };
+    if usage.current_bytes <= limit {
+        return Ok(());
+    }
+    let rss = usage
+        .rss_bytes
+        .map(format_bytes)
+        .unwrap_or_else(|| "NA".to_string());
+    let footprint = usage
+        .footprint_bytes
+        .map(format_bytes)
+        .unwrap_or_else(|| "NA".to_string());
+    Err(format!(
+        "ADAMIXTURE memory limit exceeded at {stage}: {}={} (rss={}, footprint={}, limit={}).",
+        usage.metric,
+        format_bytes(usage.current_bytes),
+        rss,
+        footprint,
+        format_bytes(limit),
+    ))
 }
 
 thread_local! {

@@ -31,7 +31,9 @@ use crate::he::build_row_standardization_stats;
 use crate::linalg::{chi2_stat_df1_from_sf, format_chisq_value, sanitize_assoc_pvalue};
 use crate::math_farmcpu::decode_packed_rows_to_sample_major;
 use crate::pcg::{pcg_solve, IdentityPreconditioner, PcgOperator};
-use crate::stats_common::{get_cached_pool, parse_index_vec_i64, AsyncTsvWriter};
+use crate::stats_common::{
+    get_cached_pool, parse_index_vec_i64, resolve_assoc_tsv_metadata, AsyncTsvWriter,
+};
 
 const DEFAULT_STANDARDIZE_EPS32: f32 = 1e-12_f32;
 const DEFAULT_STAGE1_PATH_STEPS: usize = 64;
@@ -6126,7 +6128,8 @@ fn write_algwas_stage1_summary_tsv(
     stage1_progress_callback=None,
     threads=0,
     progress_callback=None,
-    pseudo_tsv=None
+    pseudo_tsv=None,
+    bed_prefix=None
 ))]
 pub fn algwas_packed_to_tsv(
     _py: Python<'_>,
@@ -6153,6 +6156,7 @@ pub fn algwas_packed_to_tsv(
     threads: usize,
     progress_callback: Option<Py<PyAny>>,
     pseudo_tsv: Option<&str>,
+    bed_prefix: Option<&str>,
 ) -> PyResult<(usize, usize, usize)> {
     if n_samples == 0 {
         return Err(PyRuntimeError::new_err("n_samples must be > 0"));
@@ -6187,28 +6191,6 @@ pub fn algwas_packed_to_tsv(
     let row_flip = row_flip.as_slice()?;
     let row_maf = row_maf.as_slice()?;
     let row_missing = row_missing.as_slice()?;
-    let row_idx: Option<Vec<usize>> = if let Some(ridx) = row_indices {
-        Some(parse_index_vec_i64(
-            ridx.as_slice()?,
-            row_flip.len(),
-            "row_indices",
-        )?)
-    } else {
-        None
-    };
-    let m = row_idx.as_ref().map(|v| v.len()).unwrap_or(row_flip.len());
-    if row_flip.len() != m || row_maf.len() != m || row_missing.len() != m {
-        return Err(PyRuntimeError::new_err("row metadata length mismatch"));
-    }
-    if chrom.len() != m
-        || pos.len() != m
-        || snp.len() != m
-        || allele0.len() != m
-        || allele1.len() != m
-    {
-        return Err(PyRuntimeError::new_err("metadata length mismatch"));
-    }
-
     let packed_arr = packed.as_array();
     if packed_arr.ndim() != 2 {
         return Err(PyRuntimeError::new_err("packed must be 2D"));
@@ -6221,6 +6203,30 @@ pub fn algwas_packed_to_tsv(
             "packed second dimension mismatch: got {bytes_per_snp}, expected {expected_bps}"
         )));
     }
+    let row_idx: Option<Vec<usize>> = if let Some(ridx) = row_indices {
+        Some(parse_index_vec_i64(
+            ridx.as_slice()?,
+            m_packed,
+            "row_indices",
+        )?)
+    } else {
+        None
+    };
+    let m = row_idx.as_ref().map(|v| v.len()).unwrap_or(m_packed);
+    if row_flip.len() != m || row_maf.len() != m || row_missing.len() != m {
+        return Err(PyRuntimeError::new_err("row metadata length mismatch"));
+    }
+    let (chrom, pos, snp, allele0, allele1) = resolve_assoc_tsv_metadata(
+        bed_prefix,
+        chrom,
+        pos,
+        snp,
+        allele0,
+        allele1,
+        row_idx.as_deref(),
+        m,
+    )
+    .map_err(PyRuntimeError::new_err)?;
     let packed_flat: Cow<[u8]> = match packed.as_slice() {
         Ok(s) => Cow::Borrowed(s),
         Err(_) => Cow::Owned(packed_arr.iter().copied().collect()),

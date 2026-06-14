@@ -338,8 +338,7 @@ fn kmc_common_source_files(kmc_src_dir: &Path) -> Vec<PathBuf> {
         "kmc_api/kmc_file.cpp",
         "kmc_api/kmer_api.cpp",
     ];
-    rel
-        .iter()
+    rel.iter()
         .map(|path| kmc_src_dir.join(path))
         .collect::<Vec<_>>()
 }
@@ -375,11 +374,7 @@ fn configure_kmc_build(build: &mut cc::Build, compat_include: &Path, kmc_src_dir
     }
 }
 
-fn compile_kmc_arch_sources(
-    compat_include: &Path,
-    kmc_src_dir: &Path,
-    arch_sources: &[PathBuf],
-) {
+fn compile_kmc_arch_sources(compat_include: &Path, kmc_src_dir: &Path, arch_sources: &[PathBuf]) {
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     if target_arch == "aarch64" {
         if let Some(src) = arch_sources.first() {

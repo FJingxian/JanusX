@@ -17,9 +17,9 @@ Execution mode (automatic)
 --------------------------
   - No explicit "low-memory" flag is required.
   - Default: LM/LMM/FastLMM run in memmap BED mode.
-  - With `-fast` (or when `-farmcpu` / `-algwas` is selected), packed BED is
-    loaded once and reused for full-rust packed routes when available.
-  - SparseLMM defaults to BED memmap / streaming metadata unless `-fast` reuses a packed preload.
+  - Packed BED preload is reserved for FarmCPU and ALGWAS.
+  - LM/LMM/FastLMM/FvLMM/SparseLMM stay on memmap / streaming BED routes even
+    when `-fast` is present.
   - FarmCPU always runs on the full in-memory genotype matrix.
 
 Caching
@@ -674,8 +674,9 @@ def _gwas_use_packed_grm_build() -> bool:
     """
     Whether GRM construction should prefer packed BED + Rust CBLAS route.
 
-    Default is True. In current GWAS policy, this toggle is mainly applied
-    in fast/farmcpu mode; non-fast mode prefers streaming GRM.
+    Default is True. In current GWAS policy, packed GRM reuse is reserved for
+    packed-only model routes; standard LM/LMM/FaSTLMM/FvLMM/SparseLMM scans
+    stay on memmap/streaming backends.
     """
     raw = str(os.environ.get("JX_GWAS_USE_PACKED_GRM", "")).strip().lower()
     if raw == "":
@@ -3188,10 +3189,8 @@ def prepare_streaming_context(
                 "materialization from the source genotype file."
             )
 
-    # In fast/farmcpu mode, preload packed BED once right after genotype meta
-    # is known, then reuse for downstream GWAS/FarmCPU stages. This keeps the
-    # packed-BED loading step adjacent to genotype inspection even for LM-only
-    # fast runs that do not need a packed GRM.
+    # Preload packed BED once right after genotype meta is known when a
+    # packed-only model route (currently FarmCPU / ALGWAS) needs it.
     if bool(preload_packed_context):
         try:
             prefix0, full_ids0, packed_ctx0, sites0 = _prepare_packed_bed_once_for_gwas(
@@ -3202,20 +3201,19 @@ def prepare_streaming_context(
                 snps_only=bool(snps_only),
                 use_spinner=bool(use_spinner),
                 preloaded_packed=None,
+                load_site_meta=False,
             )
             preloaded_packed = {
                 "prefix": str(prefix0),
                 "full_ids": np.asarray(full_ids0, dtype=str),
                 "packed_ctx": packed_ctx0,
-                "site_meta": sites0,
-                "sites_all": sites0,
             }
             # When packed preload is ready, switch streaming source to the packed prefix.
             stream_genofile = str(prefix0)
         except Exception as ex:
             _emit_warning_line(
                 logger,
-                f"Fast mode packed preload unavailable; fallback to on-demand packed load. reason={ex}",
+                f"Packed preload unavailable; fallback to on-demand packed load. reason={ex}",
                 use_spinner=bool(use_spinner),
             )
             preloaded_packed = packed_preload_failure_state(stream_genofile, ex)
@@ -3356,13 +3354,12 @@ def prepare_streaming_context(
                 snps_only=bool(snps_only),
                 use_spinner=bool(use_spinner),
                 preloaded_packed=None,
+                load_site_meta=False,
             )
             preloaded_packed = {
                 "prefix": str(prefix1),
                 "full_ids": np.asarray(full_ids1, dtype=str),
                 "packed_ctx": packed_ctx1,
-                "site_meta": sites1,
-                "sites_all": sites1,
             }
             stream_genofile = str(prefix1)
         except Exception as ex:
@@ -3854,6 +3851,124 @@ def _normalize_snp_name(raw_name: object, chrom: object, pos: object) -> str:
     if name == "" or name == "." or name.lower() == "nan":
         return _fallback_snp_name(chrom, pos)
     return name
+
+
+def _make_deferred_bim_metadata(
+    prefix: str,
+    row_indices: Union[np.ndarray, list[int], None] = None,
+    *,
+    n_markers: Union[int, None] = None,
+) -> dict[str, object]:
+    row_idx_arr = None
+    if row_indices is not None:
+        row_idx_arr = np.ascontiguousarray(
+            np.asarray(row_indices, dtype=np.int64).reshape(-1),
+            dtype=np.int64,
+        )
+    if n_markers is None:
+        n_markers_use = int(row_idx_arr.shape[0]) if row_idx_arr is not None else 0
+    else:
+        n_markers_use = int(max(0, int(n_markers)))
+    return {
+        "_kind": "deferred_bim",
+        "bed_prefix": str(prefix),
+        "row_indices": row_idx_arr,
+        "n_markers": n_markers_use,
+    }
+
+
+def _bim_metadata_len(meta_obj: object) -> int:
+    if isinstance(meta_obj, _BimSiteColumns):
+        return int(len(meta_obj))
+    if isinstance(meta_obj, pd.DataFrame):
+        return int(meta_obj.shape[0])
+    if isinstance(meta_obj, dict):
+        if str(meta_obj.get("_kind", "")) == "deferred_bim":
+            return int(max(0, int(meta_obj.get("n_markers", 0))))
+        for key in ("snp", "chrom", "pos", "allele0", "allele1"):
+            if key in meta_obj:
+                try:
+                    return int(len(meta_obj[key]))  # type: ignore[index]
+                except Exception:
+                    continue
+    if isinstance(meta_obj, list):
+        return int(len(meta_obj))
+    return 0
+
+
+def _resolve_bim_site_columns_meta(
+    meta_obj: object,
+    *,
+    prefix: Union[str, None] = None,
+    row_indices: Union[np.ndarray, list[int], None] = None,
+    expected_rows: Union[int, None] = None,
+) -> _BimSiteColumns:
+    sites = _coerce_bim_site_columns(meta_obj)
+    if sites is None and isinstance(meta_obj, dict) and str(meta_obj.get("_kind", "")) == "deferred_bim":
+        prefix = str(meta_obj.get("bed_prefix", prefix or "") or "").strip()
+        row_idx_obj = meta_obj.get("row_indices", row_indices)
+        row_indices = row_idx_obj
+    if sites is None:
+        prefix_use = str(prefix or "").strip()
+        if prefix_use == "":
+            raise ValueError("BIM metadata resolution requires a prefix or concrete metadata columns.")
+        sites = _read_bim_site_columns(prefix_use, row_indices)
+    if expected_rows is not None and int(len(sites)) != int(expected_rows):
+        raise ValueError(
+            f"BIM metadata length mismatch: loaded={len(sites)}, expected={int(expected_rows)}"
+        )
+    return sites
+
+
+def _resolve_ref_alt_columns(
+    ref_alt_obj: object,
+    *,
+    expected_rows: int,
+    prefix: Union[str, None] = None,
+    row_indices: Union[np.ndarray, list[int], None] = None,
+) -> tuple[list[str], list[int], list[str], list[str], list[str]]:
+    if isinstance(ref_alt_obj, pd.DataFrame):
+        ref_alt_df = ref_alt_obj.reset_index(drop=True)
+        cols_need = {"chrom", "pos", "snp", "allele0", "allele1"}
+        if not cols_need.issubset(set(ref_alt_df.columns)):
+            raise ValueError(
+                "ref_alt dataframe missing required columns: chrom/pos/snp/allele0/allele1."
+            )
+        if int(ref_alt_df.shape[0]) != int(expected_rows):
+            raise ValueError(
+                f"ref_alt dataframe rows={ref_alt_df.shape[0]} != expected markers={int(expected_rows)}."
+            )
+        return (
+            ref_alt_df["chrom"].astype(str).tolist(),
+            (
+                pd.to_numeric(ref_alt_df["pos"], errors="coerce")
+                .fillna(0)
+                .astype(np.int64)
+                .tolist()
+            ),
+            ref_alt_df["snp"].astype(str).tolist(),
+            ref_alt_df["allele0"].astype(str).tolist(),
+            ref_alt_df["allele1"].astype(str).tolist(),
+        )
+
+    sites = _resolve_bim_site_columns_meta(
+        ref_alt_obj,
+        prefix=prefix,
+        row_indices=row_indices,
+        expected_rows=int(expected_rows),
+    )
+    chrom_col, pos_col, allele0_col, allele1_col, snp_raw = sites.columns()
+    snp_col = [
+        _normalize_snp_name(raw_name, chrom_name, pos_name)
+        for raw_name, chrom_name, pos_name in zip(snp_raw, chrom_col, pos_col)
+    ]
+    return (
+        [str(x) for x in chrom_col],
+        [int(x) for x in pos_col],
+        snp_col,
+        [str(x) for x in allele0_col],
+        [str(x) for x in allele1_col],
+    )
 
 
 def _resolve_gwas_snp_bim_path(genofile: str) -> Union[str, None]:
@@ -4651,74 +4766,18 @@ def _run_file_dense_fast_once(
         ref_alt_obj: object,
         n_markers: int,
     ) -> tuple[np.ndarray, np.ndarray, list[str], list[str], list[str]]:
-        try:
-            sites_bim = _read_bim_site_columns(str(prefix))
-            if len(sites_bim) == int(n_markers):
-                chrom_bim, pos_bim, allele0_bim, allele1_bim, snp_bim = sites_bim.columns()
-                return (
-                    np.asarray(chrom_bim, dtype=object),
-                    np.asarray(pos_bim, dtype=np.int64),
-                    snp_bim,
-                    allele0_bim,
-                    allele1_bim,
-                )
-        except Exception:
-            pass
-
-        if isinstance(ref_alt_obj, pd.DataFrame):
-            ref_alt_df = ref_alt_obj.reset_index(drop=True)
-            cols_need = {"chrom", "pos", "snp", "allele0", "allele1"}
-            if not cols_need.issubset(set(ref_alt_df.columns)):
-                raise ValueError(
-                    "FarmCPU dense cache ref_alt missing required columns: "
-                    "chrom/pos/snp/allele0/allele1."
-                )
-            if int(ref_alt_df.shape[0]) != int(n_markers):
-                raise ValueError(
-                    f"FarmCPU dense cache ref_alt rows={ref_alt_df.shape[0]} "
-                    f"!= genotype markers={n_markers}."
-                )
-            chrom = ref_alt_df["chrom"].astype(str).to_numpy(dtype=object)
-            pos = (
-                pd.to_numeric(ref_alt_df["pos"], errors="coerce")
-                .fillna(0)
-                .astype(np.int64)
-                .to_numpy()
-            )
-            snp = ref_alt_df["snp"].astype(str).tolist()
-            allele0 = ref_alt_df["allele0"].astype(str).tolist()
-            allele1 = ref_alt_df["allele1"].astype(str).tolist()
-            return chrom, pos, snp, allele0, allele1
-
-        if isinstance(ref_alt_obj, dict):
-            chrom_obj = ref_alt_obj.get("chrom")
-            pos_obj = ref_alt_obj.get("pos")
-            snp_obj = ref_alt_obj.get("snp")
-            a0_obj = ref_alt_obj.get("allele0")
-            a1_obj = ref_alt_obj.get("allele1")
-            if chrom_obj is None or pos_obj is None or snp_obj is None or a0_obj is None or a1_obj is None:
-                raise ValueError(
-                    "FarmCPU dense cache ref_alt dict must contain "
-                    "chrom/pos/snp/allele0/allele1."
-                )
-            chrom = np.asarray(chrom_obj, dtype=object).reshape(-1)
-            pos = np.asarray(pos_obj, dtype=np.int64).reshape(-1)
-            snp = [str(x) for x in np.asarray(snp_obj, dtype=object).reshape(-1)]
-            allele0 = [str(x) for x in np.asarray(a0_obj, dtype=object).reshape(-1)]
-            allele1 = [str(x) for x in np.asarray(a1_obj, dtype=object).reshape(-1)]
-            if (
-                int(chrom.shape[0]) != int(n_markers)
-                or int(pos.shape[0]) != int(n_markers)
-                or len(snp) != int(n_markers)
-                or len(allele0) != int(n_markers)
-                or len(allele1) != int(n_markers)
-            ):
-                raise ValueError(
-                    "FarmCPU dense cache ref_alt length mismatch with genotype markers."
-                )
-            return chrom, pos, snp, allele0, allele1
-
-        raise ValueError("Unsupported FarmCPU dense cache ref_alt payload type.")
+        chrom_col, pos_col, snp_col, allele0_col, allele1_col = _resolve_ref_alt_columns(
+            ref_alt_obj,
+            expected_rows=int(n_markers),
+            prefix=str(prefix),
+        )
+        return (
+            np.asarray(chrom_col, dtype=object),
+            np.asarray(pos_col, dtype=np.int64),
+            snp_col,
+            allele0_col,
+            allele1_col,
+        )
 
     def _heter_keep_mask(geno_add: np.ndarray, het_threshold: float) -> np.ndarray:
         geno = np.asarray(geno_add, dtype=np.float32)
@@ -5729,6 +5788,7 @@ def _run_gwas_pipeline(
     explicit_fast_mode = bool(getattr(args, "fast", False))
     farmcpu_auto_fast = bool(args.farmcpu)
     algwas_auto_fast = bool(args.algwas)
+    packed_model_routes_enabled = bool(args.farmcpu or args.algwas)
     fast_mode = bool(
         explicit_fast_mode or farmcpu_auto_fast or algwas_auto_fast
     )
@@ -5740,10 +5800,12 @@ def _run_gwas_pipeline(
     if log:
         cli_fast_mode = bool(fast_mode)
         if file_fast_rust_mode:
-            bed_backend_policy = "packed (-fast/-farmcpu/-algwas; FILE->BED cache)"
+            bed_backend_policy = (
+                "mixed (memmap default; packed only for FarmCPU/ALGWAS; FILE->BED cache)"
+            )
         else:
             bed_backend_policy = (
-                "packed (-fast/-farmcpu/-algwas)"
+                "mixed (memmap default; packed only for FarmCPU/ALGWAS)"
                 if cli_fast_mode
                 else "memmap (default)"
             )
@@ -5934,7 +5996,7 @@ def _run_gwas_pipeline(
         "FILE fast backend policy: Rust packed/stream via PLINK cache."
         if file_fast_rust_mode
         else (
-            "BED backend policy: packed (-fast/-farmcpu/-algwas)."
+            "BED backend policy: mixed; memmap default, packed reserved for FarmCPU/ALGWAS."
             if fast_mode
             else "BED backend policy: memmap (default)."
         )
@@ -5950,17 +6012,14 @@ def _run_gwas_pipeline(
         )
     if bool(args.splmm) and (not bool(fast_mode)):
         _append_advanced_note(
-            "SparseLMM default backend: BED memmap/streaming metadata; packed preload is used only with -fast."
+            "SparseLMM default backend: BED memmap/streaming metadata."
         )
     qcov_needs_grm = str(getattr(args, "qcov", "0")).strip() not in {"", "0"}
     # GRM route policy:
     # - default full-sample GRM builds prefer memmap BED
-    # - fast/qcov contexts may reuse an already-preloaded packed payload
+    # - packed reuse is disabled for standard GWAS model routes
     # - packed full-load remains the fallback when memmap is unavailable
-    allow_packed_grm_reuse = bool(
-        fast_mode
-        and (args.lmm or getattr(args, "lmm2", False) or args.fastlmm or args.fvlmm or qcov_needs_grm)
-    )
+    allow_packed_grm_reuse = False
     force_bed_stream_scan = bool(
         (args.lm or args.lmm or getattr(args, "lmm2", False) or args.fastlmm or args.fvlmm)
         and input_is_file_matrix
@@ -6172,7 +6231,7 @@ def _run_gwas_pipeline(
                     use_spinner=use_spinner,
                     snps_only=bool(args.snps_only),
                     allow_packed_grm=bool(allow_packed_grm_effective),
-                    preload_packed_context=bool(fast_mode),
+                    preload_packed_context=bool(packed_model_routes_enabled),
                     require_bed_stream=bool(stream_selected),
                     post_grm_hook=splmm_post_grm_hook,
                 )
@@ -6183,7 +6242,7 @@ def _run_gwas_pipeline(
                     streaming=True,
                 )
                 if (
-                    bool(fast_mode)
+                    bool(packed_model_routes_enabled)
                     and (not packed_preload_is_ready(preloaded_packed))
                     and (not packed_preload_is_disabled(preloaded_packed))
                 ):
@@ -6196,17 +6255,16 @@ def _run_gwas_pipeline(
                             snps_only=bool(args.snps_only),
                             use_spinner=bool(use_spinner),
                             preloaded_packed=None,
+                            load_site_meta=False,
                         )
                         preloaded_packed = {
                             "prefix": str(prefix0),
                             "full_ids": np.asarray(full_ids0, dtype=str),
                             "packed_ctx": packed_ctx0,
-                            "site_meta": sites0,
-                            "sites_all": sites0,
                         }
                     except Exception as ex:
                         logger.warning(
-                            f"Fast mode packed preload unavailable; falling back to on-demand packed load. reason={ex}"
+                            f"Packed preload unavailable; falling back to on-demand packed load. reason={ex}"
                         )
                         preloaded_packed = packed_preload_failure_state(genofile_stream, ex)
                 if terminal_rich:
@@ -6281,11 +6339,19 @@ def _run_gwas_pipeline(
                             and qmatrix is not None
                         ):
                             try:
-                                sites_prefill = _coerce_bim_site_columns(
-                                    preloaded_packed.get("site_meta", preloaded_packed.get("sites_all"))
-                                )
-                                if sites_prefill is not None:
-                                    ref_alt_prefill = sites_prefill.to_ref_alt_dict()
+                                packed_ctx_prefill = preloaded_packed.get("packed_ctx")
+                                if isinstance(packed_ctx_prefill, dict):
+                                    row_idx_prefill = packed_ctx_prefill.get("row_indices")
+                                    if row_idx_prefill is None:
+                                        row_idx_prefill = packed_ctx_prefill.get("active_row_idx")
+                                    if row_idx_prefill is None:
+                                        site_keep_prefill = packed_ctx_prefill.get("site_keep")
+                                        if site_keep_prefill is not None:
+                                            site_keep_arr = np.asarray(site_keep_prefill, dtype=np.bool_).reshape(-1)
+                                            row_idx_prefill = np.flatnonzero(site_keep_arr).astype(np.int64, copy=False)
+                                    row_idx_prefill_arr = None
+                                    if row_idx_prefill is not None:
+                                        row_idx_prefill_arr = np.asarray(row_idx_prefill, dtype=np.int64).reshape(-1)
                                     full_ids_prefill = np.asarray(
                                         preloaded_packed.get("full_ids", ids),
                                         dtype=str,
@@ -6308,8 +6374,16 @@ def _run_gwas_pipeline(
                                         "pheno": pheno,
                                         "famid": np.asarray(ids, dtype=str),
                                         "geno": None,
-                                        "packed_ctx": preloaded_packed.get("packed_ctx"),
-                                        "ref_alt": ref_alt_prefill,
+                                        "packed_ctx": packed_ctx_prefill,
+                                        "ref_alt": _make_deferred_bim_metadata(
+                                            str(preloaded_packed.get("prefix", farmcpu_genofile)),
+                                            row_idx_prefill_arr,
+                                            n_markers=(
+                                                int(row_idx_prefill_arr.shape[0])
+                                                if row_idx_prefill_arr is not None
+                                                else 0
+                                            ),
+                                        ),
                                         "qmatrix": q_prefill,
                                         "packed_sample_idx": packed_idx_map,
                                     }
@@ -6335,11 +6409,7 @@ def _run_gwas_pipeline(
                             emit_trait_header=False,
                             preloaded_packed=preloaded_packed,
                         )
-                    use_packed_fastlmm_scan = bool(
-                        fast_mode
-                        and packed_preload_ready
-                        and _gwas_use_packed_fastlmm_scan()
-                    )
+                    use_packed_fastlmm_scan = False
                     require_dispatch_v2 = bool(args.algwas)
                     task_plan = None
                     rust_plan_errors: list[str] = []
@@ -6554,7 +6624,7 @@ def _run_gwas_pipeline(
                             saved_paths=saved_result_paths,
                             trait_names=trait_one,
                             emit_trait_header=bool(emit_trait_header_model),
-                            preloaded_packed=preloaded_packed,
+                            preloaded_packed=None,
                             force_model=bool(args.force_model),
                             scan_mode=str(args._splmm_denom_mode or "exact"),
                         )
@@ -6592,7 +6662,7 @@ def _run_gwas_pipeline(
                             chunk_size_user_set=bool(
                                 getattr(args, "_chunksize_user_set", True)
                             ),
-                            prefer_packed_fullrust=bool(fast_mode),
+                            prefer_packed_fullrust=False,
                             force_model=bool(args.force_model),
                         )
 
@@ -6629,7 +6699,7 @@ def _run_gwas_pipeline(
                             chunk_size_user_set=bool(
                                 getattr(args, "_chunksize_user_set", True)
                             ),
-                            prefer_packed_fullrust=bool(fast_mode),
+                            prefer_packed_fullrust=False,
                             force_model=bool(args.force_model),
                         )
 
@@ -6666,7 +6736,7 @@ def _run_gwas_pipeline(
                             chunk_size_user_set=bool(
                                 getattr(args, "_chunksize_user_set", True)
                             ),
-                            prefer_packed_fullrust=bool(fast_mode),
+                            prefer_packed_fullrust=False,
                             force_model=bool(args.force_model),
                         )
 
@@ -6703,7 +6773,7 @@ def _run_gwas_pipeline(
                             chunk_size_user_set=bool(
                                 getattr(args, "_chunksize_user_set", True)
                             ),
-                            prefer_packed_fullrust=bool(fast_mode),
+                            prefer_packed_fullrust=False,
                             force_model=bool(args.force_model),
                         )
 
@@ -6806,23 +6876,15 @@ def _run_gwas_pipeline(
                         route = str(task_item.get("route", "")).lower().strip()
                         if not route:
                             if mk == "lm":
-                                route = "lm_packed" if packed_preload_ready else "lm_stream"
+                                route = "lm_stream"
                             elif mk == "lmm":
-                                route = "lmm_packed" if packed_preload_ready else "lmm_stream"
+                                route = "lmm_stream"
                             elif mk == "lmm2":
                                 route = "lmm2_stream"
                             elif mk == "fastlmm":
-                                route = (
-                                    "fastlmm_packed"
-                                    if bool(use_packed_fastlmm_scan)
-                                    else "fastlmm_stream"
-                                )
+                                route = "fastlmm_stream"
                             elif mk == "fvlmm":
-                                route = (
-                                    "fvlmm_packed"
-                                    if bool(use_packed_fastlmm_scan)
-                                    else "fvlmm_stream"
-                                )
+                                route = "fvlmm_stream"
                             elif mk == "splmm":
                                 route = "splmm"
                             elif mk == "algwas":
@@ -6833,9 +6895,8 @@ def _run_gwas_pipeline(
                                 route = "unknown"
                         route = route_aliases.get(route, route)
                         # Policy guardrail:
-                        # only -fast/-farmcpu runs may use packed single-entry routes.
-                        # Non-fast LM/LMM/FastLMM must stay on memmap/stream path.
-                        if (not bool(fast_mode)) and route in {
+                        # packed single-entry GWAS routes are reserved for FarmCPU/ALGWAS.
+                        if route in {
                             "lm_packed",
                             "lmm_packed",
                             "fastlmm_packed",
@@ -6972,11 +7033,19 @@ def _run_gwas_pipeline(
                 and qmatrix is not None
             ):
                 try:
-                    sites_prefill = _coerce_bim_site_columns(
-                        preloaded_packed.get("site_meta", preloaded_packed.get("sites_all"))
-                    )
-                    if sites_prefill is not None:
-                        ref_alt_prefill = sites_prefill.to_ref_alt_dict()
+                    packed_ctx_prefill = preloaded_packed.get("packed_ctx")
+                    if isinstance(packed_ctx_prefill, dict):
+                        row_idx_prefill = packed_ctx_prefill.get("row_indices")
+                        if row_idx_prefill is None:
+                            row_idx_prefill = packed_ctx_prefill.get("active_row_idx")
+                        if row_idx_prefill is None:
+                            site_keep_prefill = packed_ctx_prefill.get("site_keep")
+                            if site_keep_prefill is not None:
+                                site_keep_arr = np.asarray(site_keep_prefill, dtype=np.bool_).reshape(-1)
+                                row_idx_prefill = np.flatnonzero(site_keep_arr).astype(np.int64, copy=False)
+                        row_idx_prefill_arr = None
+                        if row_idx_prefill is not None:
+                            row_idx_prefill_arr = np.asarray(row_idx_prefill, dtype=np.int64).reshape(-1)
                         full_ids_prefill = np.asarray(
                             preloaded_packed.get("full_ids", ids),
                             dtype=str,
@@ -6999,8 +7068,16 @@ def _run_gwas_pipeline(
                             "pheno": pheno,
                             "famid": np.asarray(ids, dtype=str),
                             "geno": None,
-                            "packed_ctx": preloaded_packed.get("packed_ctx"),
-                            "ref_alt": ref_alt_prefill,
+                            "packed_ctx": packed_ctx_prefill,
+                            "ref_alt": _make_deferred_bim_metadata(
+                                str(preloaded_packed.get("prefix", farmcpu_genofile)),
+                                row_idx_prefill_arr,
+                                n_markers=(
+                                    int(row_idx_prefill_arr.shape[0])
+                                    if row_idx_prefill_arr is not None
+                                    else 0
+                                ),
+                            ),
                             "qmatrix": q_prefill,
                             "packed_sample_idx": packed_idx_map,
                         }

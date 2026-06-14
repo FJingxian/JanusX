@@ -131,6 +131,8 @@ def _normalize_filter_mode(mode: str) -> str:
     key = str(mode or "compact").strip().lower()
     if key in {"", "compact", "filtered", "subset"}:
         return "compact"
+    if key in {"lazy_owned", "owned_full", "full_owned"}:
+        return "lazy_owned"
     if key in {"lazy", "lazy_full", "full", "mask"}:
         return "lazy"
     if key == "auto":
@@ -328,7 +330,7 @@ def prepare_packed_ctx_from_plink(
                 else 0.0
             )
             use_lazy = False
-            if filter_mode_key == "lazy":
+            if filter_mode_key in {"lazy", "lazy_owned"}:
                 use_lazy = True
             elif filter_mode_key == "auto":
                 lazy_keep_ratio = float(
@@ -345,8 +347,19 @@ def prepare_packed_ctx_from_plink(
                     n_samples=int(packed_n),
                     n_snps=n_total_sites,
                 )
+                if filter_mode_key == "lazy_owned":
+                    packed_payload: np.ndarray = np.array(
+                        packed_memmap,
+                        dtype=np.uint8,
+                        order="C",
+                        copy=True,
+                    )
+                    packed_storage = "owned"
+                else:
+                    packed_payload = packed_memmap
+                    packed_storage = "memmap"
                 packed_ctx = {
-                    "packed": packed_memmap,
+                    "packed": packed_payload,
                     "missing_rate": miss_arr,
                     "af": af_arr,
                     "maf": af_arr,
@@ -358,7 +371,7 @@ def prepare_packed_ctx_from_plink(
                     "n_total_sites": int(site_keep.shape[0]),
                     "n_active_sites": int(keep_idx.shape[0]),
                     "packed_filter_mode": "lazy_full",
-                    "packed_storage": "memmap",
+                    "packed_storage": packed_storage,
                     "source_prefix": str(plink_prefix),
                 }
                 return sample_ids_arr, packed_ctx
@@ -455,7 +468,7 @@ def prepare_packed_ctx_from_plink(
         else 0.0
     )
     use_lazy = False
-    if filter_mode_key == "lazy":
+    if filter_mode_key in {"lazy", "lazy_owned"}:
         use_lazy = True
     elif filter_mode_key == "auto":
         lazy_keep_ratio = float(

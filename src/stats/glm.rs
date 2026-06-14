@@ -35,7 +35,9 @@ use crate::he::row_major_block_mul_mat_f32;
 use crate::linalg::{
     chisq_from_beta_se_and_optional_plrt, format_chisq_value, sanitize_assoc_pvalue,
 };
-use crate::stats_common::{get_cached_pool, parse_index_vec_i64, AsyncTsvWriter};
+use crate::stats_common::{
+    get_cached_pool, parse_index_vec_i64, resolve_assoc_tsv_metadata, AsyncTsvWriter,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 struct LmMemmapMetaCacheKey {
@@ -2293,7 +2295,8 @@ pub fn lm_block_assoc_packed<'py>(
     chunk_size=10000,
     threads=0,
     progress_callback=None,
-    progress_every=0
+    progress_every=0,
+    bed_prefix=None
 ))]
 pub fn lm_block_assoc_packed_to_tsv<'py>(
     py: Python<'py>,
@@ -2320,6 +2323,7 @@ pub fn lm_block_assoc_packed_to_tsv<'py>(
     threads: usize,
     progress_callback: Option<Py<PyAny>>,
     progress_every: usize,
+    bed_prefix: Option<&str>,
 ) -> PyResult<(usize, usize)> {
     if n_samples == 0 {
         return Err(PyRuntimeError::new_err("n_samples must be > 0"));
@@ -2388,16 +2392,17 @@ pub fn lm_block_assoc_packed_to_tsv<'py>(
             "row_missing length mismatch"
         )));
     }
-    if chrom.len() != m
-        || pos.len() != m
-        || snp.len() != m
-        || allele0.len() != m
-        || allele1.len() != m
-    {
-        return Err(PyRuntimeError::new_err(format!(
-            "TSV metadata length mismatch"
-        )));
-    }
+    let (chrom, pos, snp, allele0, allele1) = resolve_assoc_tsv_metadata(
+        bed_prefix,
+        chrom,
+        pos,
+        snp,
+        allele0,
+        allele1,
+        row_idx.as_deref(),
+        m,
+    )
+    .map_err(PyRuntimeError::new_err)?;
 
     let sample_idx: Vec<usize> = if let Some(sidx) = sample_indices {
         parse_index_vec_i64(sidx.as_slice()?, n_samples, "sample_indices")?
@@ -2751,7 +2756,8 @@ pub fn lm_block_assoc_packed_to_tsv<'py>(
     step=10000,
     threads=0,
     progress_callback=None,
-    progress_every=0
+    progress_every=0,
+    bed_prefix=None
 ))]
 pub fn glmf32_packed_assoc_to_tsv(
     py: Python<'_>,
@@ -2775,6 +2781,7 @@ pub fn glmf32_packed_assoc_to_tsv(
     threads: usize,
     progress_callback: Option<Py<PyAny>>,
     progress_every: usize,
+    bed_prefix: Option<&str>,
 ) -> PyResult<usize> {
     if n_samples == 0 {
         return Err(PyRuntimeError::new_err("n_samples must be > 0"));
@@ -2829,21 +2836,17 @@ pub fn glmf32_packed_assoc_to_tsv(
             row_missing.len()
         )));
     }
-    if chrom.len() != m
-        || pos.len() != m
-        || snp.len() != m
-        || allele0.len() != m
-        || allele1.len() != m
-    {
-        return Err(PyRuntimeError::new_err(format!(
-            "TSV metadata length mismatch: rows={m}, chrom={}, pos={}, snp={}, allele0={}, allele1={}",
-            chrom.len(),
-            pos.len(),
-            snp.len(),
-            allele0.len(),
-            allele1.len()
-        )));
-    }
+    let (chrom, pos, snp, allele0, allele1) = resolve_assoc_tsv_metadata(
+        bed_prefix,
+        chrom,
+        pos,
+        snp,
+        allele0,
+        allele1,
+        row_idx.as_deref(),
+        m,
+    )
+    .map_err(PyRuntimeError::new_err)?;
 
     let sample_idx: Vec<usize> = if let Some(sidx) = sample_indices {
         parse_index_vec_i64(sidx.as_slice()?, n_samples, "sample_indices")?

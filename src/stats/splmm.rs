@@ -1095,8 +1095,8 @@ fn prepare_prefix_input_from_external_meta<'py>(
             "splmm_assoc_pcg_bed: mmap metadata path requires `row_indices` argument.",
         )
     })?;
-    let (bytes_per_snp, n_snps_bed) =
-        inspect_plink_bed_shape_local(&bed_prefix, n_samples_full).map_err(PyRuntimeError::new_err)?;
+    let (bytes_per_snp, n_snps_bed) = inspect_plink_bed_shape_local(&bed_prefix, n_samples_full)
+        .map_err(PyRuntimeError::new_err)?;
     let payload = if retain_payload {
         let mmap = if let Some(mmap) = payload_mmap {
             mmap
@@ -1496,7 +1496,8 @@ fn decode_prepared_row_model_into_f64(
             .map(|v| v[row_idx])
             .unwrap_or(row_idx);
         let packed = payload.as_bytes();
-        let row = &packed[src * scan_prepared.bytes_per_snp..(src + 1) * scan_prepared.bytes_per_snp];
+        let row =
+            &packed[src * scan_prepared.bytes_per_snp..(src + 1) * scan_prepared.bytes_per_snp];
         decode_packed_row_model_into_f64(
             row,
             scan_prepared.row_flip[row_idx],
@@ -1565,10 +1566,9 @@ fn decode_rhat_markers_col_major(
     let (sample_identity, sample_byte_idx, sample_bit_shift) =
         build_selected_sample_decode_plan(scan_sample_idx);
     let mut windowed = if scan_prepared.payload.is_none() {
-        let prefix = scan_prepared
-            .bed_prefix
-            .as_deref()
-            .ok_or_else(|| "SparseLMM requires a PLINK BED prefix for windowed row decode.".to_string())?;
+        let prefix = scan_prepared.bed_prefix.as_deref().ok_or_else(|| {
+            "SparseLMM requires a PLINK BED prefix for windowed row decode.".to_string()
+        })?;
         let window_mb = mmap_window_mb
             .filter(|&v| v > 0)
             .ok_or_else(|| {

@@ -24,7 +24,7 @@ use crate::gfcore::{
     block_rows_from_memory_target_mb, parse_positive_env_f64, parse_positive_env_usize,
 };
 use crate::pipeline::run_double_buffer;
-use crate::stats_common::get_cached_pool;
+use crate::stats_common::{admx_madvise_dontneed_bytes, check_admx_memory_limit, get_cached_pool};
 
 const _INTERRUPTED_MSG: &str = "Interrupted by user (Ctrl+C).";
 
@@ -379,6 +379,47 @@ fn decode_block_rows_f32(
 }
 
 #[inline]
+fn madvise_packed_rows_after_decode(view: PackedRsvdView<'_>, row_start: usize, rows: usize) {
+    if rows == 0 || view.bytes_per_snp == 0 {
+        return;
+    }
+    let Some(row_end) = row_start.checked_add(rows) else {
+        return;
+    };
+    let (first_row, last_row) = if let Some(indices) = view.packed_row_indices {
+        let Some(slice) = indices.get(row_start..row_end) else {
+            return;
+        };
+        let Some((&first, rest)) = slice.split_first() else {
+            return;
+        };
+        let mut min_row = first;
+        let mut max_row = first;
+        for &idx in rest {
+            min_row = min_row.min(idx);
+            max_row = max_row.max(idx);
+        }
+        (min_row, max_row)
+    } else {
+        (row_start, row_end - 1)
+    };
+    let Some(start) = first_row.checked_mul(view.bytes_per_snp) else {
+        return;
+    };
+    let Some(end) = last_row
+        .checked_add(1)
+        .and_then(|r| r.checked_mul(view.bytes_per_snp))
+    else {
+        return;
+    };
+    if end <= start || end > view.packed_flat.len() {
+        return;
+    }
+    let ptr = unsafe { view.packed_flat.as_ptr().add(start) };
+    admx_madvise_dontneed_bytes(ptr, end - start);
+}
+
+#[inline]
 fn accum_gram_lower_f64(
     block: &[f32],
     rows: usize,
@@ -472,6 +513,7 @@ pub(crate) fn rsvd_packed_compute_a_omega(
 
     for row_start in (0..m).step_by(block_rows) {
         _check_ctrlc()?;
+        check_admx_memory_limit("rsvd_packed/a_omega")?;
         let row_end = (row_start + block_rows).min(m);
         let cur_rows = row_end - row_start;
         let cur_block = &mut block[..cur_rows * n];
@@ -488,6 +530,7 @@ pub(crate) fn rsvd_packed_compute_a_omega(
             cur_block,
             decode_pool.as_ref(),
         )?;
+        madvise_packed_rows_after_decode(view, row_start, cur_rows);
         let out_block = &mut out[row_start * kp..row_end * kp];
         let cur_rows_block_i = if cur_rows == block_rows {
             cur_rows_i
@@ -541,6 +584,7 @@ pub(crate) fn rsvd_packed_compute_at_random_omega(
 
     for row_start in (0..m).step_by(block_rows) {
         _check_ctrlc()?;
+        check_admx_memory_limit("rsvd_packed/at_random_omega")?;
         let row_end = (row_start + block_rows).min(m);
         let cur_rows = row_end - row_start;
         let cur_block = &mut block[..cur_rows * n];
@@ -557,6 +601,7 @@ pub(crate) fn rsvd_packed_compute_at_random_omega(
             cur_block,
             decode_pool.as_ref(),
         )?;
+        madvise_packed_rows_after_decode(view, row_start, cur_rows);
         let cur_omega = &mut omega_block[..cur_rows * kp];
         fill_random_omega_block(&mut rng, cur_omega);
         let cur_rows_i = checked_cblas_dim(cur_rows, "cur_rows")?;
@@ -631,6 +676,7 @@ pub(crate) fn rsvd_packed_compute_ata_omega(
         let mut row_inv_sd = vec![1.0_f32; block_rows];
         for row_start in (0..m).step_by(block_rows) {
             _check_ctrlc()?;
+            check_admx_memory_limit("rsvd_packed/ata_omega")?;
             let row_end = (row_start + block_rows).min(m);
             let cur_rows = row_end - row_start;
             let cur_block = &mut block[..cur_rows * n];
@@ -652,6 +698,7 @@ pub(crate) fn rsvd_packed_compute_ata_omega(
                 cur_block,
                 decode_pool.as_ref(),
             )?;
+            madvise_packed_rows_after_decode(view, row_start, cur_rows);
             if let Some(t0) = t_decode {
                 decode_s += t0.elapsed().as_secs_f64();
             }
@@ -724,6 +771,13 @@ pub(crate) fn rsvd_packed_compute_ata_omega(
                     buf.rows = 0;
                     return false;
                 }
+                if let Err(e) = check_admx_memory_limit("rsvd_packed/ata_omega_decode") {
+                    if let Ok(mut slot) = producer_error_bg.lock() {
+                        *slot = Some(e);
+                    }
+                    buf.rows = 0;
+                    return false;
+                }
                 let row_start = next_row_start;
                 let row_end = (row_start + block_rows).min(m);
                 let cur_rows = row_end - row_start;
@@ -747,6 +801,7 @@ pub(crate) fn rsvd_packed_compute_ata_omega(
                     decode_pool.as_ref(),
                 ) {
                     Ok(()) => {
+                        madvise_packed_rows_after_decode(view, row_start, cur_rows);
                         if let Some(t0) = t_decode {
                             if let Ok(mut acc) = decode_acc_bg.lock() {
                                 *acc += t0.elapsed().as_secs_f64();
@@ -771,6 +826,7 @@ pub(crate) fn rsvd_packed_compute_ata_omega(
                     return Ok::<(), String>(());
                 }
                 _check_ctrlc()?;
+                check_admx_memory_limit("rsvd_packed/ata_omega_gemm")?;
                 let cur_rows = buf.rows;
                 let cur_rows_i = checked_cblas_dim(cur_rows, "cur_rows")?;
                 let cur_block = &buf.block[..cur_rows * n];
@@ -867,6 +923,7 @@ pub(crate) fn rsvd_packed_compute_gram_aq(
 
     for row_start in (0..m).step_by(block_rows) {
         _check_ctrlc()?;
+        check_admx_memory_limit("rsvd_packed/gram_aq")?;
         let row_end = (row_start + block_rows).min(m);
         let cur_rows = row_end - row_start;
         let cur_block = &mut block[..cur_rows * n];
@@ -883,6 +940,7 @@ pub(crate) fn rsvd_packed_compute_gram_aq(
             cur_block,
             decode_pool.as_ref(),
         )?;
+        madvise_packed_rows_after_decode(view, row_start, cur_rows);
         let cur_rows_i = checked_cblas_dim(cur_rows, "cur_rows")?;
         let cur_g = &mut g_block[..cur_rows * kp];
         unsafe {

@@ -50,10 +50,11 @@ from .workflow import (
     _is_full_identity_index,
     _log_file_only,
     _log_model_line,
+    _make_deferred_bim_metadata,
     _mixed_model_switch_to_lm_decision,
     _progress_callback_step,
     _coerce_bim_site_columns,
-    _read_bim_site_columns,
+    _resolve_bim_site_columns_meta,
     _replace_file_with_retry,
     _resolve_trait_iter,
     _resolve_stream_scan_chunk_size,
@@ -656,22 +657,20 @@ def _lm_precompute_ixx_qr(x_design: np.ndarray) -> np.ndarray:
 def _packed_ctx_active_view_for_gwas(
     packed_ctx: dict[str, object],
 ) -> tuple[np.ndarray, int, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    packed = np.ascontiguousarray(np.asarray(packed_ctx["packed"], dtype=np.uint8))
-    packed_n = int(packed_ctx["n_samples"])
+    packed = np.asarray(packed_ctx["packed"], dtype=np.uint8)
     if packed.ndim != 2:
         raise ValueError("Packed GWAS context requires packed ndim=2.")
+    if not packed.flags.c_contiguous:
+        packed = np.ascontiguousarray(packed, dtype=np.uint8)
+    packed_n = int(packed_ctx["n_samples"])
     miss_full = np.ascontiguousarray(
         np.asarray(packed_ctx["missing_rate"], dtype=np.float32).reshape(-1),
         dtype=np.float32,
     )
-    if int(miss_full.shape[0]) != int(packed.shape[0]):
-        raise ValueError("Packed GWAS context mismatch: missing_rate length != packed rows.")
     af_full = np.ascontiguousarray(
         np.asarray(packed_ctx.get("af", packed_ctx["maf"]), dtype=np.float32).reshape(-1),
         dtype=np.float32,
     )
-    if int(af_full.shape[0]) != int(packed.shape[0]):
-        raise ValueError("Packed GWAS context mismatch: af length != packed rows.")
     row_flip_raw = packed_ctx.get("row_flip", None)
     if row_flip_raw is None:
         row_flip_full = np.ascontiguousarray(
@@ -684,33 +683,76 @@ def _packed_ctx_active_view_for_gwas(
             np.asarray(row_flip_raw, dtype=np.bool_).reshape(-1),
             dtype=np.bool_,
         )
-    if int(row_flip_full.shape[0]) != int(packed.shape[0]):
-        raise ValueError("Packed GWAS context mismatch: row_flip length != packed rows.")
-
-    site_keep_raw = packed_ctx.get("site_keep", None)
-    if site_keep_raw is None:
-        active_row_idx = np.ascontiguousarray(np.arange(int(packed.shape[0]), dtype=np.int64), dtype=np.int64)
-    else:
-        site_keep = np.ascontiguousarray(
-            np.asarray(site_keep_raw, dtype=np.bool_).reshape(-1),
-            dtype=np.bool_,
-        )
-        active_row_idx = np.ascontiguousarray(
-            np.asarray(
-                packed_ctx.get(
-                    "active_row_idx",
-                    np.flatnonzero(site_keep).astype(np.int64, copy=False),
-                ),
+    packed_mode = str(packed_ctx.get("packed_filter_mode", "compact")).strip().lower()
+    if packed_mode == "lazy_full":
+        if int(miss_full.shape[0]) != int(packed.shape[0]):
+            raise ValueError("Packed GWAS lazy-full context mismatch: missing_rate length != packed rows.")
+        if int(af_full.shape[0]) != int(packed.shape[0]):
+            raise ValueError("Packed GWAS lazy-full context mismatch: af length != packed rows.")
+        if int(row_flip_full.shape[0]) != int(packed.shape[0]):
+            raise ValueError("Packed GWAS lazy-full context mismatch: row_flip length != packed rows.")
+        site_keep_raw = packed_ctx.get("site_keep", None)
+        if site_keep_raw is None:
+            active_row_idx = np.ascontiguousarray(
+                np.arange(int(packed.shape[0]), dtype=np.int64),
                 dtype=np.int64,
-            ).reshape(-1),
-            dtype=np.int64,
+            )
+        else:
+            site_keep = np.ascontiguousarray(
+                np.asarray(site_keep_raw, dtype=np.bool_).reshape(-1),
+                dtype=np.bool_,
+            )
+            active_row_idx = np.ascontiguousarray(
+                np.asarray(
+                    packed_ctx.get(
+                        "active_row_idx",
+                        np.flatnonzero(site_keep).astype(np.int64, copy=False),
+                    ),
+                    dtype=np.int64,
+                ).reshape(-1),
+                dtype=np.int64,
+            )
+            if int(site_keep.shape[0]) < int(active_row_idx.shape[0]):
+                raise ValueError("Packed GWAS context mismatch: active_row_idx exceeds site_keep length.")
+        if int(active_row_idx.shape[0]) > 0:
+            if int(active_row_idx.min()) < 0 or int(active_row_idx.max()) >= int(packed.shape[0]):
+                raise ValueError("Packed GWAS lazy-full context mismatch: active_row_idx out of packed bounds.")
+        maf_active = np.ascontiguousarray(af_full[active_row_idx], dtype=np.float32)
+        miss_active = np.ascontiguousarray(miss_full[active_row_idx], dtype=np.float32)
+        row_flip_active = np.ascontiguousarray(row_flip_full[active_row_idx], dtype=np.bool_)
+        return packed, packed_n, active_row_idx, maf_active, miss_active, row_flip_active
+
+    if int(miss_full.shape[0]) != int(packed.shape[0]):
+        raise ValueError("Packed GWAS compact context mismatch: missing_rate length != packed rows.")
+    if int(af_full.shape[0]) != int(packed.shape[0]):
+        raise ValueError("Packed GWAS compact context mismatch: af length != packed rows.")
+    if int(row_flip_full.shape[0]) != int(packed.shape[0]):
+        raise ValueError("Packed GWAS compact context mismatch: row_flip length != packed rows.")
+    local_row_idx = np.ascontiguousarray(
+        np.arange(int(packed.shape[0]), dtype=np.int64),
+        dtype=np.int64,
+    )
+    return packed, packed_n, local_row_idx, af_full, miss_full, row_flip_full
+
+
+def _resolve_packed_sites_all(
+    prefix: str,
+    packed_row_idx: np.ndarray,
+    sites_all: Union[_BimSiteColumns, dict[str, object], None],
+) -> _BimSiteColumns:
+    meta_obj = sites_all
+    if meta_obj is None:
+        meta_obj = _make_deferred_bim_metadata(
+            str(prefix),
+            packed_row_idx,
+            n_markers=int(packed_row_idx.shape[0]),
         )
-        if int(site_keep.shape[0]) < int(active_row_idx.shape[0]):
-            raise ValueError("Packed GWAS context mismatch: active_row_idx exceeds site_keep length.")
-    maf_active = np.ascontiguousarray(af_full[active_row_idx], dtype=np.float32)
-    miss_active = np.ascontiguousarray(miss_full[active_row_idx], dtype=np.float32)
-    row_flip_active = np.ascontiguousarray(row_flip_full[active_row_idx], dtype=np.bool_)
-    return packed, packed_n, active_row_idx, maf_active, miss_active, row_flip_active
+    return _resolve_bim_site_columns_meta(
+        meta_obj,
+        prefix=str(prefix),
+        row_indices=packed_row_idx,
+        expected_rows=int(packed_row_idx.shape[0]),
+    )
 
 
 def _prepare_packed_bed_once_for_gwas(
@@ -722,13 +764,14 @@ def _prepare_packed_bed_once_for_gwas(
     snps_only: bool,
     use_spinner: bool,
     preloaded_packed: Union[dict[str, object], None] = None,
-) -> tuple[str, np.ndarray, dict[str, object], _BimSiteColumns]:
+    load_site_meta: bool = False,
+) -> tuple[str, np.ndarray, dict[str, object], Union[_BimSiteColumns, None]]:
     """
     Resolve packed BED context for GWAS full-rust routes.
 
     Returns
     -------
-    prefix, full_ids, packed_ctx, site_meta
+    prefix, full_ids, packed_ctx, site_meta_or_none
     """
     prefix = _as_plink_prefix(genofile)
     if prefix is None:
@@ -788,8 +831,10 @@ def _prepare_packed_bed_once_for_gwas(
         }
         sites_pre = pre.get("site_meta", pre.get("sites_all"))
         site_meta = _coerce_bim_site_columns(sites_pre)
-        if site_meta is not None and len(site_meta) > 0:
+        if load_site_meta and site_meta is not None and len(site_meta) > 0:
             return str(prefix), full_ids, packed_ctx, site_meta
+        if not load_site_meta:
+            return str(prefix), full_ids, packed_ctx, None
     else:
         with CliStatus("Loading packed BED genotype...", enabled=bool(use_spinner)) as task:
             try:
@@ -799,7 +844,7 @@ def _prepare_packed_bed_once_for_gwas(
                     missing_rate=float(max_missing_rate),
                     het_threshold=float(het_threshold),
                     snps_only=bool(snps_only),
-                    filter_mode="lazy",
+                    filter_mode="lazy_owned",
                 )
             except Exception:
                 task.fail("Loading packed BED genotype ...Failed")
@@ -850,12 +895,18 @@ def _prepare_packed_bed_once_for_gwas(
         ).reshape(-1),
         dtype=np.int64,
     )
-    site_meta = _read_bim_site_columns(str(prefix), active_row_idx)
-    if int(len(site_meta)) != int(active_row_idx.shape[0]):
-        raise ValueError(
-            f"Packed/BIM mismatch after filtering: sites={len(site_meta)} "
-            f"active_rows={active_row_idx.shape[0]}"
-        )
+    if not load_site_meta:
+        return str(prefix), full_ids, packed_ctx, None
+    site_meta = _resolve_bim_site_columns_meta(
+        _make_deferred_bim_metadata(
+            str(prefix),
+            active_row_idx,
+            n_markers=int(active_row_idx.shape[0]),
+        ),
+        prefix=str(prefix),
+        row_indices=active_row_idx,
+        expected_rows=int(active_row_idx.shape[0]),
+    )
     return str(prefix), full_ids, packed_ctx, site_meta
 
 
@@ -966,15 +1017,17 @@ def _packed_preload_ready_state(
     prefix: str,
     full_ids: np.ndarray,
     packed_ctx: dict[str, object],
-    sites_all: _BimSiteColumns,
+    sites_all: Union[_BimSiteColumns, None],
 ) -> dict[str, object]:
-    return {
+    out = {
         "prefix": str(prefix),
         "full_ids": np.asarray(full_ids, dtype=str),
         "packed_ctx": packed_ctx,
-        "site_meta": sites_all,
-        "sites_all": sites_all,
     }
+    if sites_all is not None:
+        out["site_meta"] = sites_all
+        out["sites_all"] = sites_all
+    return out
 
 
 def _splmm_null_components_valid(sigma_g2: float, sigma_e2: float) -> bool:
@@ -2012,6 +2065,7 @@ def run_fastlmm_packed_fullrank(
         snps_only=bool(snps_only),
         use_spinner=bool(use_spinner),
         preloaded_packed=preloaded_packed,
+        load_site_meta=False,
     )
     packed_preload_ready = _packed_preload_ready_state(
         prefix=prefix,
@@ -2036,12 +2090,7 @@ def run_fastlmm_packed_fullrank(
         or int(packed_row_idx.shape[0]) != int(row_flip.shape[0])
     ):
         raise ValueError("Packed BED arrays have inconsistent SNP dimensions.")
-
-    if int(len(sites_all)) != int(packed_row_idx.shape[0]):
-        raise ValueError(
-            f"Packed/BIM mismatch after filtering: sites={len(sites_all)} active_rows={packed_row_idx.shape[0]}"
-        )
-    chrom_all, pos_all, allele0_all, allele1_all, snp_all = sites_all.columns()
+    n_sites_active = int(packed_row_idx.shape[0])
 
     process = psutil.Process()
     n_cores = detect_effective_threads()
@@ -2295,7 +2344,7 @@ def run_fastlmm_packed_fullrank(
         # Packed fixed-lambda routes currently expose only scan-stage progress. Keep a
         # placeholder stage-1 handle so shared cleanup code remains safe.
         stage1_pbar: Optional[_ProgressAdapter] = None
-        gwas_total = int(len(sites_all))
+        gwas_total = int(n_sites_active)
         gwas_last_done = 0
         gwas_pbar: Optional[_ProgressAdapter] = None
         gwas_pbar = _ProgressAdapter(
@@ -2355,6 +2404,7 @@ def run_fastlmm_packed_fullrank(
             )
             with scan_stage_ctx(max(1, int(threads))):
                 if bool(getattr(null_fast_mod, "lowrank", False)):
+                    sites_lowrank = _resolve_packed_sites_all(prefix, packed_row_idx, sites_all)
                     _written_rows = _packed_lowrank_scan_to_tsv(
                         mod=null_fast_mod,
                         packed=packed,
@@ -2363,7 +2413,7 @@ def run_fastlmm_packed_fullrank(
                         row_flip=row_flip,
                         maf=maf,
                         miss=miss,
-                        sites_all=sites_all,
+                        sites_all=sites_lowrank,
                         sample_idx_trait=sample_idx_trait,
                         out_tsv=str(tmp_tsv),
                         chunk_size=int(max(1, int(chunk_size))),
@@ -2371,10 +2421,10 @@ def run_fastlmm_packed_fullrank(
                         genetic_model=str(genetic_model),
                         progress_callback=_fastlmm_progress if gwas_pbar is not None else None,
                         )
-                    if int(_written_rows) != int(len(sites_all)):
+                    if int(_written_rows) != int(n_sites_active):
                         _emit_warning_line(
                             logger,
-                            f"{_route_model_label} low-rank writer row mismatch: expected={len(sites_all)} wrote={int(_written_rows)}",
+                            f"{_route_model_label} low-rank writer row mismatch: expected={n_sites_active} wrote={int(_written_rows)}",
                             use_spinner=bool(use_spinner),
                         )
                     lbd = float(getattr(null_fast_mod, "lbd_null", np.nan))
@@ -2449,16 +2499,17 @@ def run_fastlmm_packed_fullrank(
                                 row_flip,
                                 maf,
                                 miss,
-                                chrom_all,
-                                pos_all,
-                                snp_all,
-                                allele0_all,
-                                allele1_all,
+                                [],
+                                [],
+                                [],
+                                [],
+                                [],
                                 int(max(1, int(chunk_size))),
                                 int(threads),
                                 None,
                                 int(max(1, int(chunk_size))),
                                 row_indices=packed_row_idx,
+                                bed_prefix=str(prefix),
                             )
                             r0 = _res[0]
                             lbd = float(r0.get("lbd", np.nan))
@@ -2496,16 +2547,17 @@ def run_fastlmm_packed_fullrank(
                             0.0,
                             int(threads),
                             str(genetic_model),
-                            chrom_all,
-                            pos_all,
-                            snp_all,
-                            allele0_all,
-                            allele1_all,
+                            [],
+                            [],
+                            [],
+                            [],
+                            [],
                             tmp_tsv,
                             row_indices=packed_row_idx,
                             fixed_lbd=(float(fixed_lbd) if fixed_lbd is not None else None),
                             fixed_ml0=None,
                             rotate_block_rows=int(max(1, int(chunk_size))),
+                            bed_prefix=str(prefix),
                             **progress_kwargs,
                         )
             scan_secs = max(time.monotonic() - scan_t0, 0.0)
@@ -2567,7 +2619,7 @@ def run_fastlmm_packed_fullrank(
         avg_cpu = 100.0 * cpu_used / (wall * max(1, n_cores))
         peak_rss_gb = peak_rss / (1024 ** 3)
 
-        eff_snp = int(len(sites_all))
+        eff_snp = int(n_sites_active)
         eff_snp_by_trait[pname] = eff_snp
         summary_rows.append(
             {
@@ -2656,6 +2708,7 @@ def run_lm_packed_fullrank(
         snps_only=bool(snps_only),
         use_spinner=bool(use_spinner),
         preloaded_packed=preloaded_packed,
+        load_site_meta=False,
     )
     packed_preload_ready = _packed_preload_ready_state(
         prefix=prefix,
@@ -2680,12 +2733,7 @@ def run_lm_packed_fullrank(
         or int(packed_row_idx.shape[0]) != int(row_flip.shape[0])
     ):
         raise ValueError("Packed BED arrays have inconsistent SNP dimensions.")
-
-    if int(len(sites_all)) != int(packed_row_idx.shape[0]):
-        raise ValueError(
-            f"Packed/BIM mismatch after filtering: sites={len(sites_all)} active_rows={packed_row_idx.shape[0]}"
-        )
-    chrom_all, pos_all, allele0_all, allele1_all, snp_all = sites_all.columns()
+    n_sites_active = int(packed_row_idx.shape[0])
 
     process = psutil.Process()
     n_cores = detect_effective_threads()
@@ -2750,7 +2798,7 @@ def run_lm_packed_fullrank(
         tmp_tsv = _gwas_result_tmp_path(out_tsv)
 
         gwas_t0 = time.monotonic()
-        gwas_total = int(len(sites_all))
+        gwas_total = int(n_sites_active)
         gwas_last_done = 0
         gwas_pbar: Optional[_ProgressAdapter] = None
         gwas_pbar = _ProgressAdapter(
@@ -2818,11 +2866,11 @@ def run_lm_packed_fullrank(
                         row_flip,
                         maf,
                         miss,
-                        chrom_all,
-                        pos_all,
-                        snp_all,
-                        allele0_all,
-                        allele1_all,
+                        [],
+                        [],
+                        [],
+                        [],
+                        [],
                         tmp_tsv,
                         maf_threshold=float(maf_threshold),
                         max_missing_rate=float(max_missing_rate),
@@ -2831,6 +2879,7 @@ def run_lm_packed_fullrank(
                         row_indices=packed_row_idx,
                         chunk_size=int(max(1, int(chunk_size))),
                         threads=int(threads),
+                        bed_prefix=str(prefix),
                         **kwargs_assoc,
                     )
                     _written_rows = int(_kept)
@@ -2868,21 +2917,22 @@ def run_lm_packed_fullrank(
                                 row_flip,
                                 maf,
                                 miss,
-                                chrom_all,
-                                pos_all,
-                                snp_all,
-                                allele0_all,
-                                allele1_all,
+                                [],
+                                [],
+                                [],
+                                [],
+                                [],
                                 int(max(1, int(chunk_size))),
                                 int(threads),
                                 None,
                                 int(max(1, int(chunk_size))),
                                 row_indices=packed_row_idx,
+                                bed_prefix=str(prefix),
                             )
                             try:
-                                _written_rows = int(_res[0].get("written_rows", len(chrom_all)))
+                                _written_rows = int(_res[0].get("written_rows", n_sites_active))
                             except Exception:
-                                _written_rows = int(len(chrom_all))
+                                _written_rows = int(n_sites_active)
                             unified_done = True
                         except Exception as ex:
                             _emit_warning_line(
@@ -2903,16 +2953,17 @@ def run_lm_packed_fullrank(
                                 row_flip,
                                 maf,
                                 miss,
-                                chrom_all,
-                                pos_all,
-                                snp_all,
-                                allele0_all,
-                                allele1_all,
+                                [],
+                                [],
+                                [],
+                                [],
+                                [],
                                 tmp_tsv,
                                 sample_idx_trait,
                                 row_indices=packed_row_idx,
                                 step=int(max(1, int(chunk_size))),
                                 threads=int(threads),
+                                bed_prefix=str(prefix),
                                 **kwargs_assoc,
                             )
                         except TypeError:
@@ -2927,16 +2978,17 @@ def run_lm_packed_fullrank(
                                 row_flip,
                                 maf,
                                 miss,
-                                chrom_all,
-                                pos_all,
-                                snp_all,
-                                allele0_all,
-                                allele1_all,
+                                [],
+                                [],
+                                [],
+                                [],
+                                [],
                                 tmp_tsv,
                                 sample_idx_trait,
                                 row_indices=packed_row_idx,
                                 step=int(max(1, int(chunk_size))),
                                 threads=int(threads),
+                                bed_prefix=str(prefix),
                                 **kwargs_assoc,
                             )
             gwas_ok = True
@@ -2975,7 +3027,7 @@ def run_lm_packed_fullrank(
         avg_cpu = 100.0 * cpu_used / (wall * max(1, n_cores))
         peak_rss_gb = peak_rss / (1024 ** 3)
 
-        eff_snp = int(_written_rows) if use_block_lm else int(len(sites_all))
+        eff_snp = int(_written_rows) if use_block_lm else int(n_sites_active)
         eff_snp_by_trait[pname] = eff_snp
         summary_rows.append(
             {
@@ -3417,6 +3469,7 @@ def run_lmm_packed_fullrank(
         snps_only=bool(snps_only),
         use_spinner=bool(use_spinner),
         preloaded_packed=preloaded_packed,
+        load_site_meta=False,
     )
     packed_preload_ready = _packed_preload_ready_state(
         prefix=prefix,
@@ -3441,11 +3494,7 @@ def run_lmm_packed_fullrank(
         or int(packed_row_idx.shape[0]) != int(row_flip.shape[0])
     ):
         raise ValueError("Packed BED arrays have inconsistent SNP dimensions.")
-
-    if int(len(sites_all)) != int(packed_row_idx.shape[0]):
-        raise ValueError(
-            f"Packed/BIM mismatch after filtering: sites={len(sites_all)} active_rows={packed_row_idx.shape[0]}"
-        )
+    n_sites_active = int(packed_row_idx.shape[0])
 
     process = psutil.Process()
     n_cores = detect_effective_threads()
@@ -3589,7 +3638,7 @@ def run_lmm_packed_fullrank(
         sample_idx_trait = np.ascontiguousarray(sample_map[keep_idx], dtype=np.int64)
 
         gwas_t0 = time.monotonic()
-        gwas_total = int(len(sites_all))
+        gwas_total = int(n_sites_active)
         gwas_last_done = 0
         gwas_pbar: Optional[_ProgressAdapter] = None
         gwas_pbar = _ProgressAdapter(
@@ -3629,7 +3678,6 @@ def run_lmm_packed_fullrank(
 
         gwas_ok = False
         null_lbd = float("nan")
-        chrom_all, pos_all, allele0_all, allele1_all, snp_all = sites_all.columns()
         gm_tag = str(genetic_model).lower()
         pname_tag = _safe_trait_file_label(pname)
         if gm_tag == "add":
@@ -3640,6 +3688,7 @@ def run_lmm_packed_fullrank(
         try:
             with _gwas_scan_stage_ctx(max(1, int(threads))):
                 if bool(getattr(mod, "lowrank", False)):
+                    sites_lowrank = _resolve_packed_sites_all(prefix, packed_row_idx, sites_all)
                     _written_rows = _packed_lowrank_scan_to_tsv(
                         mod=mod,
                         packed=packed,
@@ -3648,7 +3697,7 @@ def run_lmm_packed_fullrank(
                         row_flip=row_flip,
                         maf=maf,
                         miss=miss,
-                        sites_all=sites_all,
+                        sites_all=sites_lowrank,
                         sample_idx_trait=sample_idx_trait,
                         out_tsv=str(tmp_tsv),
                         chunk_size=int(max(1, int(chunk_size))),
@@ -3707,11 +3756,11 @@ def run_lmm_packed_fullrank(
                         x_rot,
                         y_rot,
                         u_t,
-                        chrom_all,
-                        pos_all,
-                        snp_all,
-                        allele0_all,
-                        allele1_all,
+                        [],
+                        [],
+                        [],
+                        [],
+                        [],
                         tmp_tsv,
                         sample_idx_trait,
                         row_indices=packed_row_idx,
@@ -3724,12 +3773,13 @@ def run_lmm_packed_fullrank(
                         nullml=None,
                         init_log10_lbd=init_log10_lbd,
                         rotate_block_rows=int(max(1, int(chunk_size))),
+                        bed_prefix=str(prefix),
                         **progress_kwargs,
                     )
-                if int(_written_rows) != int(len(sites_all)):
+                if int(_written_rows) != int(n_sites_active):
                     _emit_warning_line(
                         logger,
-                        f"LMM Rust writer row mismatch: expected={len(sites_all)} wrote={int(_written_rows)}",
+                        f"LMM Rust writer row mismatch: expected={n_sites_active} wrote={int(_written_rows)}",
                         use_spinner=bool(use_spinner),
                     )
                 try:
@@ -3794,7 +3844,7 @@ def run_lmm_packed_fullrank(
             use_spinner=bool(use_spinner),
         )
 
-        eff_snp = int(len(sites_all))
+        eff_snp = int(n_sites_active)
         eff_snp_by_trait[pname] = eff_snp
         summary_rows.append(
             {
@@ -3872,6 +3922,7 @@ def run_algwas_packed_fullrank(
         snps_only=bool(snps_only),
         use_spinner=bool(use_spinner),
         preloaded_packed=preloaded_packed,
+        load_site_meta=False,
     )
     id_to_idx = {sid: i for i, sid in enumerate(full_ids)}
     try:
@@ -3882,47 +3933,9 @@ def run_algwas_packed_fullrank(
     except KeyError as e:
         raise ValueError("Some aligned sample IDs are not present in packed BED sample order.") from e
 
-    packed_mode = str(packed_ctx.get("packed_filter_mode", "compact")).strip().lower()
-    packed_raw = np.ascontiguousarray(np.asarray(packed_ctx["packed"], dtype=np.uint8))
-    packed_n = int(packed_ctx["n_samples"])
-    maf_raw = np.ascontiguousarray(
-        np.asarray(packed_ctx.get("af", packed_ctx["maf"]), dtype=np.float32).reshape(-1),
-        dtype=np.float32,
+    packed, packed_n, packed_row_idx, maf, miss, row_flip = _packed_ctx_active_view_for_gwas(
+        packed_ctx
     )
-    miss_raw = np.ascontiguousarray(np.asarray(packed_ctx["missing_rate"], dtype=np.float32).reshape(-1), dtype=np.float32)
-    row_flip_raw = np.ascontiguousarray(
-        np.asarray(
-            packed_ctx.get(
-                "row_flip",
-                np.zeros((int(packed_raw.shape[0]),), dtype=np.bool_),
-            ),
-            dtype=np.bool_,
-        ).reshape(-1),
-        dtype=np.bool_,
-    )
-    active_row_idx_raw = np.ascontiguousarray(
-        np.asarray(
-            packed_ctx.get(
-                "active_row_idx",
-                np.arange(int(packed_raw.shape[0]), dtype=np.int64),
-            ),
-            dtype=np.int64,
-        ).reshape(-1),
-        dtype=np.int64,
-    )
-    if packed_mode == "lazy_full":
-        packed = np.ascontiguousarray(packed_raw[active_row_idx_raw], dtype=np.uint8)
-        maf = np.ascontiguousarray(maf_raw[active_row_idx_raw], dtype=np.float32)
-        miss = np.ascontiguousarray(miss_raw[active_row_idx_raw], dtype=np.float32)
-        row_flip = np.ascontiguousarray(row_flip_raw[active_row_idx_raw], dtype=np.bool_)
-    else:
-        packed = packed_raw
-        maf = maf_raw
-        miss = miss_raw
-        row_flip = row_flip_raw
-        active_row_idx_raw = np.arange(int(packed.shape[0]), dtype=np.int64)
-
-    packed_row_idx = active_row_idx_raw
     if packed_n <= 0:
         raise ValueError("Packed BED reported invalid sample count.")
     if (
@@ -3931,12 +3944,7 @@ def run_algwas_packed_fullrank(
         or int(packed_row_idx.shape[0]) != int(row_flip.shape[0])
     ):
         raise ValueError("Packed BED arrays have inconsistent SNP dimensions.")
-    if int(len(sites_all)) != int(packed_row_idx.shape[0]):
-        raise ValueError(
-            f"Packed/BIM mismatch after filtering: sites={len(sites_all)} active_rows={packed_row_idx.shape[0]}"
-        )
-
-    chrom_all, pos_all, allele0_all, allele1_all, snp_all = sites_all.columns()
+    n_sites_active = int(packed_row_idx.shape[0])
 
     process = psutil.Process()
     n_cores = detect_effective_threads()
@@ -4001,7 +4009,7 @@ def run_algwas_packed_fullrank(
         stage1_last_done = 0
         stage1_pbar: Optional[_ProgressAdapter] = None
         stage1_spin_handle = _start_indeterminate_progress_bar("ALGWAS stage1")
-        gwas_total = int(len(sites_all))
+        gwas_total = int(n_sites_active)
         gwas_last_done = 0
         gwas_pbar: Optional[_ProgressAdapter] = None
 
@@ -4143,16 +4151,17 @@ def run_algwas_packed_fullrank(
                             row_flip,
                             maf,
                             miss,
-                            chrom_all,
-                            pos_all,
-                            snp_all,
-                            allele0_all,
-                            allele1_all,
+                            [],
+                            [],
+                            [],
+                            [],
+                            [],
                             int(max(1, int(chunk_size))),
                             int(threads),
                             None,
                             int(max(1, int(chunk_size))),
-                            row_indices=None,
+                            row_indices=packed_row_idx,
+                            bed_prefix=str(prefix),
                         )
                         r0 = _res[0]
                         qtn_count = int(r0.get("qtn_count", 0))
@@ -4170,11 +4179,11 @@ def run_algwas_packed_fullrank(
                     qtn_count, pseudo_rows, _written_rows = jxrs.algwas_packed_to_tsv(
                         y_vec,
                         x_cov,
-                        chrom_all,
-                        pos_all,
-                        snp_all,
-                        allele0_all,
-                        allele1_all,
+                        [],
+                        [],
+                        [],
+                        [],
+                        [],
                         packed,
                         int(packed_n),
                         row_flip,
@@ -4190,7 +4199,8 @@ def run_algwas_packed_fullrank(
                         threads=int(threads),
                         progress_callback=_algwas_progress,
                         pseudo_tsv=str(pseudo_tsv_hint),
-                        row_indices=None,
+                        row_indices=packed_row_idx,
+                        bed_prefix=str(prefix),
                     )
             gwas_ok = True
         finally:
@@ -4261,7 +4271,7 @@ def run_algwas_packed_fullrank(
             use_spinner=bool(use_spinner),
         )
 
-        eff_snp = int(len(sites_all))
+        eff_snp = int(n_sites_active)
         eff_snp_by_trait[str(pname)] = eff_snp
         summary_rows.append(
             {
@@ -4376,6 +4386,7 @@ def run_splmm_packed_fullrank(
             snps_only=bool(snps_only),
             use_spinner=bool(use_spinner),
             preloaded_packed=preloaded_packed,
+            load_site_meta=False,
         )
         packed_preload_ready = _packed_preload_ready_state(
             prefix=prefix_packed,
@@ -4400,10 +4411,6 @@ def run_splmm_packed_fullrank(
             or int(scan_row_idx.shape[0]) != int(scan_row_flip.shape[0])
         ):
             raise ValueError("Packed BED arrays have inconsistent SNP dimensions.")
-        if int(len(sites_all_packed)) != int(scan_row_idx.shape[0]):
-            raise ValueError(
-                f"Packed/BIM mismatch after filtering: sites={len(sites_all_packed)} active_rows={scan_row_idx.shape[0]}"
-            )
         use_preloaded_scan_meta = True
 
     sparse_cutoff_log = "precomputed" if splmm_sparse_jxgrm_path is not None else None
@@ -5121,7 +5128,16 @@ def run_splmm_packed_fullrank(
 
             def _write_splmm() -> None:
                 nonlocal written_rows, arr
-                sites_use = _read_bim_site_columns(str(kinship_prefix), trait_row_idx)
+                sites_use = _resolve_bim_site_columns_meta(
+                    _make_deferred_bim_metadata(
+                        str(kinship_prefix),
+                        trait_row_idx,
+                        n_markers=int(n_trait_sites),
+                    ),
+                    prefix=str(kinship_prefix),
+                    row_indices=trait_row_idx,
+                    expected_rows=int(n_trait_sites),
+                )
                 written_rows = int(
                     _write_splmm_assoc_tsv(
                         out_tsv=tmp_tsv,

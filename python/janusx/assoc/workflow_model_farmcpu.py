@@ -43,8 +43,11 @@ from .workflow import (
     _parse_qcov_dim,
     _pca_cache_path,
     _pca_cache_path_legacy,
+    _bim_metadata_len,
+    _make_deferred_bim_metadata,
     _read_id_file,
     _resolve_trait_iter,
+    _resolve_ref_alt_columns,
     _replace_file_with_retry,
     _resolve_file_input_matrix,
     _rich_success,
@@ -179,7 +182,6 @@ def _normalize_packed_ctx_for_farmcpu_cache(
         "n_samples": packed_n,
         "source_prefix": packed_obj.get("source_prefix"),
     }
-
 
 def prepare_qk_and_filter(
     geno: np.ndarray,
@@ -654,31 +656,43 @@ def run_farmcpu_fullmem(
         keep_mask: np.ndarray,
         *,
         snps_only_mode: bool,
-    ) -> tuple[pd.DataFrame, np.ndarray]:
+        return_metadata: bool = True,
+    ) -> tuple[Union[pd.DataFrame, None], np.ndarray]:
         bim_path = f"{prefix}.bim"
         src = _basename_only(bim_path)
         keep = np.ascontiguousarray(np.asarray(keep_mask, dtype=np.bool_).reshape(-1))
         n_total = int(keep.shape[0])
         if n_total == 0:
             return (
-                pd.DataFrame(columns=["chrom", "pos", "snp", "allele0", "allele1"]),
+                (
+                    pd.DataFrame(columns=["chrom", "pos", "snp", "allele0", "allele1"])
+                    if bool(return_metadata)
+                    else None
+                ),
                 keep,
             )
 
         n_pre_keep = int(np.sum(keep))
         if n_pre_keep == 0:
             return (
-                pd.DataFrame(columns=["chrom", "pos", "snp", "allele0", "allele1"]),
+                (
+                    pd.DataFrame(columns=["chrom", "pos", "snp", "allele0", "allele1"])
+                    if bool(return_metadata)
+                    else None
+                ),
                 keep,
             )
 
         # Stream BIM and keep only SNPs that survive numeric filters, optionally
         # applying SNP-only filtering in the same pass.
-        chrom = np.empty(n_pre_keep, dtype=object)
-        pos = np.empty(n_pre_keep, dtype=np.int64)
-        snp = np.empty(n_pre_keep, dtype=object)
-        allele0 = np.empty(n_pre_keep, dtype=object)
-        allele1 = np.empty(n_pre_keep, dtype=object)
+        if bool(return_metadata):
+            chrom = np.empty(n_pre_keep, dtype=object)
+            pos = np.empty(n_pre_keep, dtype=np.int64)
+            snp = np.empty(n_pre_keep, dtype=object)
+            allele0 = np.empty(n_pre_keep, dtype=object)
+            allele1 = np.empty(n_pre_keep, dtype=object)
+        else:
+            chrom = pos = snp = allele0 = allele1 = None
 
         pbar = _ProgressAdapter(
             total=n_total,
@@ -709,7 +723,7 @@ def run_farmcpu_fullmem(
                         a1 = str(parts[5])
                         if snps_only_mode and (len(a0) != 1 or len(a1) != 1):
                             keep[idx] = False
-                        else:
+                        elif bool(return_metadata):
                             chrom[out] = str(parts[0])
                             raw_snp = str(parts[1]) if len(parts) > 1 else "."
                             try:
@@ -739,6 +753,9 @@ def run_farmcpu_fullmem(
             pbar.finish()
         finally:
             pbar.close()
+
+        if not bool(return_metadata):
+            return None, keep
 
         ref_alt_df = pd.DataFrame(
             {
@@ -837,7 +854,7 @@ def run_farmcpu_fullmem(
                             missing_rate=float(args.geno),
                             snps_only=False,
                             expected_n_samples=int(famid.shape[0]),
-                            filter_mode="lazy",
+                            filter_mode="lazy_owned",
                         )
                     except Exception:
                         task.fail("Loading genotype (Full) ...Failed")
@@ -858,10 +875,11 @@ def run_farmcpu_fullmem(
                 np.asarray(packed_ctx_raw["site_keep"], dtype=np.bool_).reshape(-1), dtype=np.bool_
             )
 
-            ref_alt, keep_final = _load_bim_ref_alt_filtered(
+            _ref_alt_df, keep_final = _load_bim_ref_alt_filtered(
                 str(packed_prefix),
                 keep_numeric,
                 snps_only_mode=bool(snps_only),
+                return_metadata=False,
             )
             if not np.any(keep_final):
                 raise ValueError("After filtering, number of SNPs is zero for FarmCPU.")
@@ -896,7 +914,12 @@ def run_farmcpu_fullmem(
                 )
             row_flip_arr = np.ascontiguousarray(row_flip_full[active_row_idx], dtype=np.bool_)
 
-            loaded_snps = int(ref_alt.shape[0])
+            loaded_snps = int(active_row_idx.shape[0])
+            ref_alt = _make_deferred_bim_metadata(
+                str(packed_prefix),
+                active_row_idx,
+                n_markers=loaded_snps,
+            )
             packed_ctx = {
                 "packed": packed,
                 "missing_rate": miss_arr,
@@ -1003,7 +1026,7 @@ def run_farmcpu_fullmem(
 
         t_loaded = time.time() - t_loading
         if (not bool(context_prepared)) and (not bool(prepare_only)):
-            ns_loaded = int(ref_alt.shape[0])
+            ns_loaded = _bim_metadata_len(ref_alt)
             _rich_success(
                 logger,
                 f"FarmCPU input ready (n={len(famid)}, nSNP={ns_loaded}) [{format_elapsed(t_loaded)}]",
@@ -1016,7 +1039,7 @@ def run_farmcpu_fullmem(
                 logging.INFO,
                 f"Genotype and phenotype loaded in {t_loaded:.2f} seconds",
             )
-        if int(ref_alt.shape[0]) == 0:
+        if int(_bim_metadata_len(ref_alt)) == 0:
             msg = "After filtering, number of SNPs is zero for FarmCPU."
             logger.error(msg)
             raise ValueError(msg)
@@ -1045,7 +1068,7 @@ def run_farmcpu_fullmem(
             use_spinner=use_spinner,
             quiet_terminal=bool(context_prepared or prepare_only),
             snps_only=bool(snps_only),
-            n_snps_hint=int(ref_alt.shape[0]),
+            n_snps_hint=int(_bim_metadata_len(ref_alt)),
             threads=int(args.thread),
             mmap_limit=bool(args.mmap_limit),
             preloaded_packed=preloaded_packed,
@@ -1069,28 +1092,12 @@ def run_farmcpu_fullmem(
             ),
             use_spinner=bool(use_spinner),
         )
-        # For packed+Rust path, keep lightweight metadata lists in cache to avoid
-        # repeated large temporary string-array conversions in each trait loop.
-        ref_alt_cache_obj: object = ref_alt
-        if (
-            packed_ctx is not None
-            and bool(hasattr(jxrs, "farmcpu_packed_to_tsv"))
-            and isinstance(ref_alt, pd.DataFrame)
-        ):
-            ref_alt_cache_obj = {
-                "chrom": ref_alt["chrom"].tolist(),
-                "pos": pd.to_numeric(ref_alt["pos"], errors="coerce").fillna(0).astype(np.int64).tolist(),
-                "snp": ref_alt["snp"].tolist(),
-                "allele0": ref_alt["allele0"].tolist(),
-                "allele1": ref_alt["allele1"].tolist(),
-            }
-
         farmcpu_cache = {
             "pheno": pheno,
             "famid": famid,
             "geno": geno,
             "packed_ctx": packed_ctx,
-            "ref_alt": ref_alt_cache_obj,
+            "ref_alt": ref_alt,
             "qmatrix": qmatrix,
         }
     else:
@@ -1222,18 +1229,6 @@ def run_farmcpu_fullmem(
             except Exception:
                 pass
 
-        if isinstance(ref_alt, dict):
-            chrom_col = [str(x) for x in ref_alt.get("chrom", [])]
-            pos_col = [int(x) for x in ref_alt.get("pos", [])]
-            snp_col = [str(x) for x in ref_alt.get("snp", [])]
-            allele0_col = [str(x) for x in ref_alt.get("allele0", [])]
-            allele1_col = [str(x) for x in ref_alt.get("allele1", [])]
-        else:
-            chrom_col = ref_alt["chrom"].tolist()
-            pos_col = ref_alt["pos"].astype(np.int64, copy=False).tolist()
-            snp_col = ref_alt["snp"].tolist()
-            allele0_col = ref_alt["allele0"].tolist()
-            allele1_col = ref_alt["allele1"].tolist()
         phename_tag = _safe_trait_file_label(phename)
         out_tsv = os.path.join(outfolder, f"{prefix}.{phename_tag}.farmcpu.tsv")
         tmp_tsv = _gwas_result_tmp_path(out_tsv)
@@ -1245,6 +1240,20 @@ def run_farmcpu_fullmem(
             packed_ctx is not None
             and bool(hasattr(jxrs, "farmcpu_packed_to_tsv"))
         )
+        bed_prefix_meta: Union[str, None] = None
+        expected_meta_rows = int(eff_snp)
+        if use_rust_controller and isinstance(ref_alt, dict) and str(ref_alt.get("_kind", "")) == "deferred_bim":
+            bed_prefix_meta = str(ref_alt.get("bed_prefix", "") or "").strip() or None
+            chrom_col = []
+            pos_col = []
+            snp_col = []
+            allele0_col = []
+            allele1_col = []
+        else:
+            chrom_col, pos_col, snp_col, allele0_col, allele1_col = _resolve_ref_alt_columns(
+                ref_alt,
+                expected_rows=expected_meta_rows,
+            )
         if use_rust_controller:
             packed_payload = m_input
             if not isinstance(packed_payload, dict):
@@ -1344,6 +1353,7 @@ def run_farmcpu_fullmem(
                             None,
                             int(max(1, int(getattr(args, "chunksize", 10000)))),
                             row_indices=row_idx_arr,
+                            bed_prefix=bed_prefix_meta,
                         )
                     except Exception as ex:
                         msg = str(ex)
@@ -1372,6 +1382,7 @@ def run_farmcpu_fullmem(
                             None,
                             int(max(1, int(getattr(args, "chunksize", 10000)))),
                             row_indices=None,
+                            bed_prefix=None,
                         )
                     r0 = _res[0]
                     n_pseudo_qtn = int(r0.get("pseudo_rows", 0))
@@ -1402,6 +1413,7 @@ def run_farmcpu_fullmem(
                         threads=int(args.thread),
                         progress_callback=_farmcpu_progress,
                         pseudo_tsv=pseudo_tsv_hint,
+                        bed_prefix=bed_prefix_meta,
                     )
                 farm_pbar.finish()
             finally:

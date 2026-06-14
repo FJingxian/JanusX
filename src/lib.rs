@@ -123,13 +123,16 @@ mod phylo;
 mod sim_g2p;
 
 use admixture::{
-    admx_adam_optimize_f32, admx_adam_update_p, admx_adam_update_p_inplace,
-    admx_adam_update_p_inplace_f32, admx_adam_update_q, admx_adam_update_q_inplace,
-    admx_adam_update_q_inplace_f32, admx_allele_frequency, admx_em_step, admx_em_step_inplace,
-    admx_em_step_inplace_f32, admx_kl_divergence, admx_loglikelihood, admx_loglikelihood_f32,
-    admx_map_p_f32, admx_map_q_f32, admx_multiply_a_omega, admx_multiply_a_omega_inplace,
-    admx_multiply_at_omega, admx_multiply_at_omega_inplace, admx_rmse_f32, admx_rmse_f64,
-    admx_rsvd_power_step_inplace, admx_rsvd_stream, admx_rsvd_stream_sample, admx_set_threads,
+    admx_adam_optimize_bed_f32, admx_adam_optimize_f32, admx_adam_update_p,
+    admx_adam_update_p_inplace, admx_adam_update_p_inplace_f32, admx_adam_update_q,
+    admx_adam_update_q_inplace, admx_adam_update_q_inplace_f32, admx_allele_frequency,
+    admx_bed_training_meta, admx_em_step, admx_em_step_inplace, admx_em_step_inplace_f32,
+    admx_kl_divergence, admx_loglikelihood, admx_loglikelihood_bed_f32, admx_loglikelihood_f32,
+    admx_map_p_f32, admx_map_q_f32, admx_multiply_a_omega, admx_multiply_a_omega_bed,
+    admx_multiply_a_omega_inplace, admx_multiply_at_omega, admx_multiply_at_omega_inplace,
+    admx_rmse_f32, admx_rmse_f64, admx_rsvd_power_step_inplace, admx_rsvd_stream,
+    admx_rsvd_stream_sample, admx_set_threads, AdmxBedBackend, AdmxBedFoldBackend,
+    AdmxBedTrainingSession,
 };
 use algwas::algwas_packed_to_tsv;
 use assoc::{
@@ -204,7 +207,7 @@ use gwas_unified::{
 };
 use gwasio::load_gwas_triplet_fast;
 use he::he_pcg_bed;
-use kmer::{kmerge_run_py, kmer_count_run_py};
+use kmer::{kmer_count_run_py, kmerge_run_py};
 use ld::{
     bed_ldblock_r2_rust, bed_packed_ld_prune_maf_priority, bed_prune_to_plink_rust,
     packed_prune_kernel_stats,
@@ -281,6 +284,9 @@ pub use lasso::{
 
 #[pymodule]
 fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
+    m.add_class::<AdmxBedBackend>()?;
+    m.add_class::<AdmxBedFoldBackend>()?;
+    m.add_class::<AdmxBedTrainingSession>()?;
     m.add_class::<BedChunkReader>()?;
     m.add_class::<BedMmapReader>()?;
     m.add_class::<NpyMmapReader>()?;
@@ -490,6 +496,8 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(bayescpi_packed_trace, m)?)?;
     m.add_function(wrap_pyfunction!(admx_multiply_at_omega, m)?)?;
     m.add_function(wrap_pyfunction!(admx_multiply_a_omega, m)?)?;
+    m.add_function(wrap_pyfunction!(admx_multiply_a_omega_bed, m)?)?;
+    m.add_function(wrap_pyfunction!(admx_bed_training_meta, m)?)?;
     m.add_function(wrap_pyfunction!(admx_multiply_at_omega_inplace, m)?)?;
     m.add_function(wrap_pyfunction!(admx_multiply_a_omega_inplace, m)?)?;
     m.add_function(wrap_pyfunction!(admx_rsvd_power_step_inplace, m)?)?;
@@ -498,6 +506,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_rsvd_packed_subset, m)?)?;
     m.add_function(wrap_pyfunction!(admx_allele_frequency, m)?)?;
     m.add_function(wrap_pyfunction!(admx_loglikelihood, m)?)?;
+    m.add_function(wrap_pyfunction!(admx_loglikelihood_bed_f32, m)?)?;
     m.add_function(wrap_pyfunction!(admx_loglikelihood_f32, m)?)?;
     m.add_function(wrap_pyfunction!(admx_rmse_f32, m)?)?;
     m.add_function(wrap_pyfunction!(admx_rmse_f64, m)?)?;
@@ -514,6 +523,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(admx_adam_update_p_inplace_f32, m)?)?;
     m.add_function(wrap_pyfunction!(admx_adam_update_q_inplace_f32, m)?)?;
     m.add_function(wrap_pyfunction!(admx_adam_optimize_f32, m)?)?;
+    m.add_function(wrap_pyfunction!(admx_adam_optimize_bed_f32, m)?)?;
     m.add_function(wrap_pyfunction!(admx_set_threads, m)?)?;
     m.add_function(wrap_pyfunction!(fit_best_and_not_py, m)?)?;
     m.add_function(wrap_pyfunction!(garfield_ml_feature_scores_py, m)?)?;

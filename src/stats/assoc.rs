@@ -6,7 +6,9 @@ use crate::math_farmcpu::{
     decode_dense_rows_to_sample_major, decode_packed_rows_to_sample_major,
     farmcpu_ll_score_from_sample_major, farmcpu_super_keep_from_sample_major, select_lead_indices,
 };
-use crate::stats_common::{get_cached_pool, parse_index_vec_i64, AsyncTsvWriter};
+use crate::stats_common::{
+    get_cached_pool, parse_index_vec_i64, resolve_assoc_tsv_metadata, AsyncTsvWriter,
+};
 use nalgebra::DMatrix;
 use numpy::PyArray1;
 use numpy::PyArrayMethods;
@@ -1171,7 +1173,8 @@ pub fn farmcpu_super_dense<'py>(
     szbin=vec![5e5, 5e6, 5e7],
     threads=0,
     progress_callback=None,
-    pseudo_tsv=None
+    pseudo_tsv=None,
+    bed_prefix=None
 ))]
 pub fn farmcpu_packed_to_tsv(
     py: Python<'_>,
@@ -1198,6 +1201,7 @@ pub fn farmcpu_packed_to_tsv(
     threads: usize,
     progress_callback: Option<Py<PyAny>>,
     pseudo_tsv: Option<&str>,
+    bed_prefix: Option<&str>,
 ) -> PyResult<(usize, usize, usize)> {
     if n_samples == 0 {
         return Err(PyRuntimeError::new_err("n_samples must be > 0"));
@@ -1263,21 +1267,17 @@ pub fn farmcpu_packed_to_tsv(
     if m == 0 {
         return Err(PyRuntimeError::new_err("empty packed marker matrix"));
     }
-    if chrom.len() != m
-        || pos.len() != m
-        || snp.len() != m
-        || allele0.len() != m
-        || allele1.len() != m
-    {
-        return Err(PyRuntimeError::new_err(format!(
-            "metadata length mismatch: m={m}, chrom={}, pos={}, snp={}, allele0={}, allele1={}",
-            chrom.len(),
-            pos.len(),
-            snp.len(),
-            allele0.len(),
-            allele1.len()
-        )));
-    }
+    let (chrom, pos, snp, allele0, allele1) = resolve_assoc_tsv_metadata(
+        bed_prefix,
+        chrom,
+        pos,
+        snp,
+        allele0,
+        allele1,
+        row_idx.as_deref(),
+        m,
+    )
+    .map_err(PyRuntimeError::new_err)?;
     let row_flip = row_flip.as_slice()?;
     let row_maf = row_maf.as_slice()?;
     let row_missing = row_missing.as_slice()?;

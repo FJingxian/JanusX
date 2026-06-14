@@ -1,8 +1,9 @@
 use memmap2::Mmap;
 use nalgebra::{DMatrix, SymmetricEigen};
-use numpy::ndarray::ArrayView2;
+use numpy::ndarray::{Array1, Array2, ArrayView2};
 use numpy::{
-    PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods,
+    PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2, PyReadwriteArray2,
+    PyUntypedArrayMethods,
 };
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
@@ -15,8 +16,9 @@ use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
 use std::convert::TryFrom;
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Instant, UNIX_EPOCH};
 
 use crate::bedmath::packed_byte_lut;
@@ -24,12 +26,16 @@ use crate::blas::{
     cblas_sgemm_dispatch, BlasThreadGuard, CblasInt, CBLAS_NO_TRANS, CBLAS_ROW_MAJOR, CBLAS_TRANS,
 };
 use crate::gfcore::{
-    process_snp_row, read_bim, read_fam, BedSnpIter, HmpSnpIter, TxtSnpIter, VcfSnpIter,
+    parse_positive_env_usize, process_snp_row, read_fam, BedSnpIter, HmpSnpIter, TxtSnpIter,
+    VcfSnpIter,
 };
 use crate::rsvd::{
     rsvd_block_rows_env, rsvd_packed_compute_a_omega, rsvd_packed_compute_at_random_omega,
     rsvd_packed_compute_ata_omega, rsvd_packed_compute_gram_aq, rsvd_right_singular_from_gram,
     PackedRsvdView, RsvdKernelTiming,
+};
+use crate::stats_common::{
+    admx_madvise_dontneed_bytes, check_admx_memory_limit, process_memory_usage,
 };
 
 const EPS64: f64 = 1e-5;
@@ -138,9 +144,38 @@ fn detect_bed_prefix(path_or_prefix: &str) -> Option<String> {
     }
 }
 
+enum PackedBedStorage {
+    Mmap(Mmap),
+    Owned(Vec<u8>),
+}
+
+impl PackedBedStorage {
+    #[inline]
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            PackedBedStorage::Mmap(mmap) => mmap,
+            PackedBedStorage::Owned(buf) => buf,
+        }
+    }
+
+    #[inline]
+    fn is_mmap(&self) -> bool {
+        matches!(self, PackedBedStorage::Mmap(_))
+    }
+
+    #[inline]
+    fn label(&self) -> &'static str {
+        match self {
+            PackedBedStorage::Mmap(_) => "mmap",
+            PackedBedStorage::Owned(_) => "owned",
+        }
+    }
+}
+
 struct PackedBedRsvd {
-    mmap: Mmap,
+    storage: PackedBedStorage,
     payload_offset: usize,
+    compact_rows: bool,
     bytes_per_snp: usize,
     n_samples: usize,
     n_snps: usize,
@@ -173,6 +208,37 @@ fn packed_bed_cache_path(prefix: &str, cfg: &StreamRsvdConfig) -> PathBuf {
     ))
 }
 
+fn packed_bed_compact_cache_path(prefix: &str, cfg: &StreamRsvdConfig) -> PathBuf {
+    PathBuf::from(format!(
+        "{prefix}.rsvd_bedpack.maf{:08x}.miss{:08x}.snps{}.bin",
+        cfg.maf.to_bits(),
+        cfg.missing_rate.to_bits(),
+        if cfg.snps_only { 1 } else { 0 }
+    ))
+}
+
+#[inline]
+fn packed_bed_compact_cache_enabled() -> bool {
+    match std::env::var("JANUSX_ADMX_BED_COMPACT_CACHE") {
+        Ok(v) => {
+            let s = v.trim().to_ascii_lowercase();
+            !(s == "0" || s == "false" || s == "off" || s == "no")
+        }
+        Err(_) => true,
+    }
+}
+
+#[inline]
+fn packed_bed_owned_storage_enabled() -> bool {
+    match std::env::var("JANUSX_ADMX_BED_OWNED_PACKED") {
+        Ok(v) => {
+            let s = v.trim().to_ascii_lowercase();
+            !(s == "0" || s == "false" || s == "off" || s == "no")
+        }
+        Err(_) => true,
+    }
+}
+
 #[inline]
 fn file_signature(path: &Path) -> Option<(u64, u64)> {
     let meta = path.metadata().ok()?;
@@ -185,6 +251,33 @@ fn file_signature(path: &Path) -> Option<(u64, u64)> {
         .as_nanos()
         .min(u64::MAX as u128) as u64;
     Some((size, mtime))
+}
+
+fn scan_bim_site_count_and_simple_mask(
+    prefix: &str,
+    snps_only: bool,
+) -> Result<(usize, Option<Vec<bool>>), String> {
+    let bim_path = format!("{prefix}.bim");
+    let file = File::open(&bim_path).map_err(|e| format!("{bim_path}: {e}"))?;
+    let reader = BufReader::new(file);
+    let mut n_sites = 0usize;
+    let mut simple_mask = if snps_only { Some(Vec::new()) } else { None };
+
+    for (line_no, line) in reader.lines().enumerate() {
+        let l = line.map_err(|e| format!("{bim_path}:{}: {e}", line_no + 1))?;
+        let cols: Vec<&str> = l.split_whitespace().collect();
+        if cols.len() < 6 {
+            return Err(format!(
+                "Malformed BIM line at {bim_path}:{}: {l}",
+                line_no + 1
+            ));
+        }
+        if let Some(mask) = simple_mask.as_mut() {
+            mask.push(is_simple_snp_alleles(cols[4], cols[5]));
+        }
+        n_sites += 1;
+    }
+    Ok((n_sites, simple_mask))
 }
 
 #[inline]
@@ -202,30 +295,6 @@ fn push_f32_le(buf: &mut Vec<u8>, v: f32) {
     buf.extend_from_slice(&v.to_le_bytes());
 }
 
-#[inline]
-fn read_u32_le(bytes: &[u8], pos: &mut usize) -> Option<u32> {
-    let end = pos.checked_add(4)?;
-    let arr: [u8; 4] = bytes.get(*pos..end)?.try_into().ok()?;
-    *pos = end;
-    Some(u32::from_le_bytes(arr))
-}
-
-#[inline]
-fn read_u64_le(bytes: &[u8], pos: &mut usize) -> Option<u64> {
-    let end = pos.checked_add(8)?;
-    let arr: [u8; 8] = bytes.get(*pos..end)?.try_into().ok()?;
-    *pos = end;
-    Some(u64::from_le_bytes(arr))
-}
-
-#[inline]
-fn read_f32_le(bytes: &[u8], pos: &mut usize) -> Option<f32> {
-    let end = pos.checked_add(4)?;
-    let arr: [u8; 4] = bytes.get(*pos..end)?.try_into().ok()?;
-    *pos = end;
-    Some(f32::from_le_bytes(arr))
-}
-
 fn try_load_packed_bed_cache(
     cache_path: &Path,
     bed_path: &Path,
@@ -241,50 +310,69 @@ fn try_load_packed_bed_cache(
     let (bed_size, bed_mtime) = file_signature(bed_path)?;
     let (bim_size, bim_mtime) = file_signature(bim_path)?;
     let (fam_size, fam_mtime) = file_signature(fam_path)?;
-    let bytes = fs::read(cache_path).ok()?;
-    let mut pos = 0usize;
-    if bytes.get(0..8)? != PACKED_BED_CACHE_MAGIC {
+    let mut file = File::open(cache_path).ok()?;
+    let mut magic = [0u8; 8];
+    file.read_exact(&mut magic).ok()?;
+    if &magic != PACKED_BED_CACHE_MAGIC {
         return None;
     }
-    pos += 8;
-    if read_u32_le(&bytes, &mut pos)? != PACKED_BED_CACHE_VERSION {
+
+    let mut u32_buf = [0u8; 4];
+    file.read_exact(&mut u32_buf).ok()?;
+    if u32::from_le_bytes(u32_buf) != PACKED_BED_CACHE_VERSION {
         return None;
     }
-    if read_u64_le(&bytes, &mut pos)? != bed_size
-        || read_u64_le(&bytes, &mut pos)? != bed_mtime
-        || read_u64_le(&bytes, &mut pos)? != bim_size
-        || read_u64_le(&bytes, &mut pos)? != bim_mtime
-        || read_u64_le(&bytes, &mut pos)? != fam_size
-        || read_u64_le(&bytes, &mut pos)? != fam_mtime
-        || read_u64_le(&bytes, &mut pos)? != n_samples as u64
-        || read_u64_le(&bytes, &mut pos)? != n_total_sites as u64
-        || read_u64_le(&bytes, &mut pos)? != bytes_per_snp as u64
+
+    let read_u64_from_file = |f: &mut File| -> Option<u64> {
+        let mut buf = [0u8; 8];
+        f.read_exact(&mut buf).ok()?;
+        Some(u64::from_le_bytes(buf))
+    };
+    if read_u64_from_file(&mut file)? != bed_size
+        || read_u64_from_file(&mut file)? != bed_mtime
+        || read_u64_from_file(&mut file)? != bim_size
+        || read_u64_from_file(&mut file)? != bim_mtime
+        || read_u64_from_file(&mut file)? != fam_size
+        || read_u64_from_file(&mut file)? != fam_mtime
+        || read_u64_from_file(&mut file)? != n_samples as u64
+        || read_u64_from_file(&mut file)? != n_total_sites as u64
+        || read_u64_from_file(&mut file)? != bytes_per_snp as u64
     {
         return None;
     }
-    let n_active = usize::try_from(read_u64_le(&bytes, &mut pos)?).ok()?;
+    let n_active = usize::try_from(read_u64_from_file(&mut file)?).ok()?;
     if n_active > n_total_sites {
         return None;
     }
 
     let mut row_freq = vec![0.0_f32; n_active];
     for value in row_freq.iter_mut() {
-        *value = read_f32_le(&bytes, &mut pos)?;
+        let mut buf = [0u8; 4];
+        file.read_exact(&mut buf).ok()?;
+        *value = f32::from_le_bytes(buf);
     }
-    let flip_end = pos.checked_add(n_active)?;
-    let flip_slice = bytes.get(pos..flip_end)?;
-    let row_flip: Vec<bool> = flip_slice.iter().map(|&v| v != 0).collect();
-    pos = flip_end;
+    let mut flip_buf = vec![0u8; n_active];
+    file.read_exact(&mut flip_buf).ok()?;
+    let row_flip: Vec<bool> = flip_buf.iter().map(|&v| v != 0).collect();
 
     let mut active_row_idx = Vec::with_capacity(n_active);
     for _ in 0..n_active {
-        let idx = usize::try_from(read_u32_le(&bytes, &mut pos)?).ok()?;
+        let mut buf = [0u8; 4];
+        file.read_exact(&mut buf).ok()?;
+        let idx = usize::try_from(u32::from_le_bytes(buf)).ok()?;
         if idx >= n_total_sites {
             return None;
         }
         active_row_idx.push(idx);
     }
-    if pos != bytes.len() {
+    let file_len = usize::try_from(file.metadata().ok()?.len()).ok()?;
+    let pos = 8usize
+        .checked_add(4)?
+        .checked_add(10usize.checked_mul(8)?)?
+        .checked_add(n_active.checked_mul(4)?)?
+        .checked_add(n_active)?
+        .checked_add(n_active.checked_mul(4)?)?;
+    if pos != file_len {
         return None;
     }
     Some((active_row_idx, row_freq, row_flip))
@@ -344,6 +432,105 @@ fn try_store_packed_bed_cache(
     Ok(())
 }
 
+fn try_open_packed_bed_compact_cache_storage(
+    compact_path: &Path,
+    n_active: usize,
+    bytes_per_snp: usize,
+) -> Option<PackedBedStorage> {
+    if !packed_bed_compact_cache_enabled() || !compact_path.exists() {
+        return None;
+    }
+    let expected_size = n_active.checked_mul(bytes_per_snp)?;
+    if expected_size == 0 {
+        return None;
+    }
+    let mut file = File::open(compact_path).ok()?;
+    let file_size = usize::try_from(file.metadata().ok()?.len()).ok()?;
+    if file_size != expected_size {
+        return None;
+    }
+    if packed_bed_owned_storage_enabled() {
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(expected_size).ok()?;
+        file.read_to_end(&mut buf).ok()?;
+        if buf.len() == expected_size {
+            return Some(PackedBedStorage::Owned(buf));
+        }
+        return None;
+    }
+    unsafe { Mmap::map(&file).ok().map(PackedBedStorage::Mmap) }
+}
+
+fn build_compact_cache_from_active_rows(
+    compact_path: &Path,
+    bed_path: &Path,
+    n_total_sites: usize,
+    n_samples: usize,
+    bytes_per_snp: usize,
+    active_row_idx: &[usize],
+) -> Result<(), String> {
+    if !packed_bed_compact_cache_enabled() {
+        return Err("compact BED row cache is disabled".to_string());
+    }
+    let mut bed_reader = BufReader::new(File::open(bed_path).map_err(|e| e.to_string())?);
+    let mut header = [0u8; 3];
+    bed_reader.read_exact(&mut header).map_err(|e| e.to_string())?;
+    if header != [0x6C, 0x1B, 0x01] {
+        return Err("Only SNP-major BED supported".to_string());
+    }
+
+    let tmp_path = compact_path.with_extension("tmp");
+    let mut writer = BufWriter::new(File::create(&tmp_path).map_err(|e| e.to_string())?);
+    let chunk_rows = packed_backend_stats_chunk_rows(n_total_sites, n_samples);
+    let mut chunk_buf = Vec::<u8>::new();
+    let mut active_ptr = 0usize;
+    for chunk_start in (0..n_total_sites).step_by(chunk_rows) {
+        check_admx_memory_limit("bed_backend/compact_cache_build")?;
+        let chunk_end = (chunk_start + chunk_rows).min(n_total_sites);
+        let row_count = chunk_end - chunk_start;
+        chunk_buf.resize(row_count * bytes_per_snp, 0);
+        bed_reader
+            .read_exact(&mut chunk_buf)
+            .map_err(|e| e.to_string())?;
+        while active_ptr < active_row_idx.len() {
+            let snp_idx = active_row_idx[active_ptr];
+            if snp_idx < chunk_start {
+                return Err("active_row_idx is not sorted".to_string());
+            }
+            if snp_idx >= chunk_end {
+                break;
+            }
+            let local = snp_idx - chunk_start;
+            let row_start = local * bytes_per_snp;
+            writer
+                .write_all(&chunk_buf[row_start..row_start + bytes_per_snp])
+                .map_err(|e| e.to_string())?;
+            active_ptr += 1;
+        }
+        emit_rsvd_rss_debug(
+            "packed_backend/compact_cache_build",
+            &format!(
+                "rows={}/{} active_written={}/{}",
+                chunk_end,
+                n_total_sites,
+                active_ptr,
+                active_row_idx.len()
+            ),
+        );
+    }
+    if active_ptr != active_row_idx.len() {
+        return Err(format!(
+            "compact cache build wrote {} active rows, expected {}",
+            active_ptr,
+            active_row_idx.len()
+        ));
+    }
+    writer.flush().map_err(|e| e.to_string())?;
+    drop(writer);
+    fs::rename(&tmp_path, compact_path).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 #[inline]
 fn env_truthy_local(name: &str) -> bool {
     match std::env::var(name) {
@@ -353,6 +540,23 @@ fn env_truthy_local(name: &str) -> bool {
         }
         Err(_) => false,
     }
+}
+
+#[inline]
+fn admx_rsvd_kp(k_eff: usize, max_cols: usize) -> usize {
+    let oversample =
+        parse_positive_env_usize(&["JANUSX_ADMX_RSVD_OVERSAMPLE", "JX_ADMX_RSVD_OVERSAMPLE"])
+            .unwrap_or(6);
+    let kp_min =
+        parse_positive_env_usize(&["JANUSX_ADMX_RSVD_KP_MIN", "JX_ADMX_RSVD_KP_MIN"]).unwrap_or(12);
+    let kp_cap = parse_positive_env_usize(&["JANUSX_ADMX_RSVD_KP_MAX", "JX_ADMX_RSVD_KP_MAX"]);
+
+    let limit = max_cols.max(1);
+    let mut kp = k_eff.max(1).saturating_add(oversample).max(kp_min);
+    if let Some(cap) = kp_cap {
+        kp = kp.min(cap.max(k_eff.max(1)));
+    }
+    kp.min(limit)
 }
 
 #[inline]
@@ -384,67 +588,35 @@ fn format_debug_bytes_local(bytes: u64) -> String {
     }
 }
 
-#[cfg(target_os = "linux")]
-#[inline]
-fn process_rss_bytes_local() -> Option<(u64, &'static str)> {
-    let text = std::fs::read_to_string("/proc/self/statm").ok()?;
-    let mut fields = text.split_whitespace();
-    let _size_pages = fields.next()?;
-    let rss_pages: u64 = fields.next()?.parse().ok()?;
-    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    if page_size <= 0 {
-        return None;
-    }
-    Some((rss_pages.saturating_mul(page_size as u64), "current"))
-}
-
-#[cfg(target_os = "macos")]
-#[inline]
-fn process_rss_bytes_local() -> Option<(u64, &'static str)> {
-    let mut ru = std::mem::MaybeUninit::<libc::rusage>::zeroed();
-    let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, ru.as_mut_ptr()) };
-    if rc != 0 {
-        return None;
-    }
-    let ru = unsafe { ru.assume_init() };
-    Some((ru.ru_maxrss as u64, "peak"))
-}
-
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-#[inline]
-fn process_rss_bytes_local() -> Option<(u64, &'static str)> {
-    let mut ru = std::mem::MaybeUninit::<libc::rusage>::zeroed();
-    let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, ru.as_mut_ptr()) };
-    if rc != 0 {
-        return None;
-    }
-    let ru = unsafe { ru.assume_init() };
-    Some(((ru.ru_maxrss as u64).saturating_mul(1024), "peak"))
-}
-
-#[cfg(not(unix))]
-#[inline]
-fn process_rss_bytes_local() -> Option<(u64, &'static str)> {
-    None
-}
-
 fn emit_rsvd_rss_debug(stage: &str, detail: &str) {
     if !rsvd_rss_debug_enabled() {
         return;
     }
-    match process_rss_bytes_local() {
-        Some((rss_bytes, rss_kind)) => {
-            println!(
-                "[RSVD-DEBUG] {stage} rss={} rss_kind={} {detail}",
-                format_debug_bytes_local(rss_bytes),
-                rss_kind,
+    match process_memory_usage() {
+        Some(usage) => {
+            let rss = usage
+                .rss_bytes
+                .map(format_debug_bytes_local)
+                .unwrap_or_else(|| "NA".to_string());
+            let footprint = usage
+                .footprint_bytes
+                .map(format_debug_bytes_local)
+                .unwrap_or_else(|| "NA".to_string());
+            eprintln!(
+                "[RSVD-DEBUG] {stage} mem={} metric={} rss={} footprint={} {detail}",
+                format_debug_bytes_local(usage.current_bytes),
+                usage.metric,
+                rss,
+                footprint,
             );
         }
         None => {
-            println!("[RSVD-DEBUG] {stage} rss=NA rss_kind=unavailable {detail}");
+            eprintln!(
+                "[RSVD-DEBUG] {stage} mem=NA metric=unavailable rss=NA footprint=NA {detail}"
+            );
         }
     }
-    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
 }
 
 fn emit_rsvd_time_debug(stage: &str, detail: &str) {
@@ -507,6 +679,85 @@ fn packed_backend_stats_chunk_rows(n_rows: usize, n_samples: usize) -> usize {
     rows.min(n_rows.max(1))
 }
 
+#[inline]
+fn madvise_mmap_bed_rows(
+    bytes: &[u8],
+    payload_offset: usize,
+    bytes_per_snp: usize,
+    first_row: usize,
+    rows: usize,
+) {
+    if rows == 0 || bytes_per_snp == 0 {
+        return;
+    }
+    let Some(start) = first_row
+        .checked_mul(bytes_per_snp)
+        .and_then(|v| payload_offset.checked_add(v))
+    else {
+        return;
+    };
+    let Some(end) = first_row
+        .checked_add(rows)
+        .and_then(|r| r.checked_mul(bytes_per_snp))
+        .and_then(|v| payload_offset.checked_add(v))
+    else {
+        return;
+    };
+    if end <= start || end > bytes.len() {
+        return;
+    }
+    let ptr = unsafe { bytes.as_ptr().add(start) };
+    admx_madvise_dontneed_bytes(ptr, end - start);
+}
+
+#[inline]
+fn madvise_backend_active_rows(backend: &PackedBedRsvd, active_start: usize, rows: usize) {
+    if rows == 0 || backend.bytes_per_snp == 0 || !backend.storage.is_mmap() {
+        return;
+    }
+    if backend.compact_rows {
+        madvise_mmap_bed_rows(
+            backend.storage.as_slice(),
+            backend.payload_offset,
+            backend.bytes_per_snp,
+            active_start,
+            rows,
+        );
+        return;
+    }
+    let Some(active_end) = active_start.checked_add(rows) else {
+        return;
+    };
+    let Some(slice) = backend.active_row_idx.get(active_start..active_end) else {
+        return;
+    };
+    let Some((&first, rest)) = slice.split_first() else {
+        return;
+    };
+    let mut min_row = first;
+    let mut max_row = first;
+    for &idx in rest {
+        min_row = min_row.min(idx);
+        max_row = max_row.max(idx);
+    }
+    madvise_mmap_bed_rows(
+        backend.storage.as_slice(),
+        backend.payload_offset,
+        backend.bytes_per_snp,
+        min_row,
+        max_row.saturating_sub(min_row).saturating_add(1),
+    );
+}
+
+#[inline]
+fn packed_backend_row_indices(backend: &PackedBedRsvd) -> Option<&[usize]> {
+    if backend.compact_rows {
+        None
+    } else {
+        Some(&backend.active_row_idx)
+    }
+}
+
 fn packed_bed_fast_enabled() -> bool {
     match std::env::var("JANUSX_RSVD_BED_PACKED") {
         Ok(v) => {
@@ -524,18 +775,23 @@ fn try_build_packed_bed_backend(cfg: &StreamRsvdConfig) -> Result<Option<PackedB
     let Some(prefix) = detect_bed_prefix(&cfg.genotype_path) else {
         return Ok(None);
     };
+    emit_rsvd_rss_debug("packed_backend/open_start", &format!("prefix={prefix}"));
     let bed_path = PathBuf::from(format!("{prefix}.bed"));
     let bim_path = PathBuf::from(format!("{prefix}.bim"));
     let fam_path = PathBuf::from(format!("{prefix}.fam"));
     let cache_path = packed_bed_cache_path(&prefix, cfg);
+    let compact_path = packed_bed_compact_cache_path(&prefix, cfg);
 
     let samples = read_fam(&prefix)?;
     let n_samples = samples.len();
     if n_samples == 0 {
         return Err("no samples found in PLINK input".to_string());
     }
-    let sites = read_bim(&prefix)?;
-    let n_snps_total = sites.len();
+    check_admx_memory_limit("bed_backend/after_fam")?;
+    emit_rsvd_rss_debug(
+        "packed_backend/fam_ready",
+        &format!("prefix={} n_samples={}", prefix, n_samples),
+    );
 
     let mut file = File::open(&bed_path).map_err(|e| e.to_string())?;
     let mut header = [0u8; 3];
@@ -544,22 +800,23 @@ fn try_build_packed_bed_backend(cfg: &StreamRsvdConfig) -> Result<Option<PackedB
         return Err("Only SNP-major BED supported".to_string());
     }
     let bytes_per_snp = (n_samples + 3) / 4;
-    let expected_payload = n_snps_total
-        .checked_mul(bytes_per_snp)
-        .ok_or_else(|| "BED payload size overflow".to_string())?;
     let file_size = usize::try_from(file.metadata().map_err(|e| e.to_string())?.len())
         .map_err(|_| "BED file size overflow".to_string())?;
-    let expected_size = 3usize
-        .checked_add(expected_payload)
-        .ok_or_else(|| "BED file size overflow".to_string())?;
-    if file_size != expected_size {
+    if file_size < 3 {
+        return Err("BED file is too small".to_string());
+    }
+    let payload_size = file_size - 3;
+    if bytes_per_snp == 0 || payload_size % bytes_per_snp != 0 {
         return Err(format!(
-            "BED payload size mismatch: file={file_size}, expected={expected_size}"
+            "BED payload size mismatch: payload={payload_size}, bytes_per_snp={bytes_per_snp}"
         ));
     }
-    let mmap = unsafe { Mmap::map(&file) }.map_err(|e| e.to_string())?;
+    let n_snps_total = payload_size / bytes_per_snp;
+    let expected_payload = payload_size;
+    drop(file);
+    check_admx_memory_limit("bed_backend/after_bed_header")?;
     emit_rsvd_rss_debug(
-        "packed_backend/mmap_ready",
+        "packed_backend/bed_header",
         &format!(
             "prefix={} n_samples={} n_total_sites={} bytes_per_snp={} mapped_payload={}",
             prefix,
@@ -588,9 +845,100 @@ fn try_build_packed_bed_backend(cfg: &StreamRsvdConfig) -> Result<Option<PackedB
                 row_freq.len(),
             ),
         );
+        if row_freq.is_empty() {
+            return Err("no SNPs remain after BED filters".to_string());
+        }
+        if let Some(storage) =
+            try_open_packed_bed_compact_cache_storage(&compact_path, row_freq.len(), bytes_per_snp)
+        {
+            emit_rsvd_rss_debug(
+                "packed_backend/compact_cache_hit",
+                &format!(
+                    "prefix={} cache={} active_rows={} packed_payload={} storage={}",
+                    prefix,
+                    compact_path.display(),
+                    row_freq.len(),
+                    format_debug_bytes_local(
+                        (row_freq.len().saturating_mul(bytes_per_snp)) as u64
+                    ),
+                    storage.label(),
+                ),
+            );
+            return Ok(Some(PackedBedRsvd {
+                storage,
+                payload_offset: 0,
+                compact_rows: true,
+                bytes_per_snp,
+                n_samples,
+                n_snps: row_freq.len(),
+                n_total_sites: n_snps_total,
+                active_row_idx,
+                row_freq,
+                row_flip,
+            }));
+        }
+        emit_rsvd_rss_debug(
+            "packed_backend/compact_cache_miss",
+            &format!("prefix={} cache={}", prefix, compact_path.display()),
+        );
+        match build_compact_cache_from_active_rows(
+            &compact_path,
+            &bed_path,
+            n_snps_total,
+            n_samples,
+            bytes_per_snp,
+            &active_row_idx,
+        ) {
+            Ok(()) => {
+                if let Some(storage) =
+                    try_open_packed_bed_compact_cache_storage(&compact_path, row_freq.len(), bytes_per_snp)
+                {
+                    emit_rsvd_rss_debug(
+                        "packed_backend/compact_cache_built",
+                        &format!(
+                            "prefix={} cache={} active_rows={} storage={}",
+                            prefix,
+                            compact_path.display(),
+                            row_freq.len(),
+                            storage.label(),
+                        ),
+                    );
+                    return Ok(Some(PackedBedRsvd {
+                        storage,
+                        payload_offset: 0,
+                        compact_rows: true,
+                        bytes_per_snp,
+                        n_samples,
+                        n_snps: row_freq.len(),
+                        n_total_sites: n_snps_total,
+                        active_row_idx,
+                        row_freq,
+                        row_flip,
+                    }));
+                }
+            }
+            Err(e) => {
+                emit_rsvd_rss_debug(
+                    "packed_backend/compact_cache_build_failed",
+                    &format!("prefix={} error={}", prefix, e),
+                );
+            }
+        }
+        let file = File::open(&bed_path).map_err(|e| e.to_string())?;
+        let mmap = unsafe { Mmap::map(&file) }.map_err(|e| e.to_string())?;
+        emit_rsvd_rss_debug(
+            "packed_backend/original_mmap_fallback",
+            &format!(
+                "prefix={} active_rows={} mapped_payload={}",
+                prefix,
+                row_freq.len(),
+                format_debug_bytes_local(expected_payload as u64),
+            ),
+        );
         return Ok(Some(PackedBedRsvd {
-            mmap,
+            storage: PackedBedStorage::Mmap(mmap),
             payload_offset: 3,
+            compact_rows: false,
             bytes_per_snp,
             n_samples,
             n_snps: row_freq.len(),
@@ -601,22 +949,71 @@ fn try_build_packed_bed_backend(cfg: &StreamRsvdConfig) -> Result<Option<PackedB
         }));
     }
 
+    let (bim_sites, simple_snp_mask) = scan_bim_site_count_and_simple_mask(&prefix, cfg.snps_only)?;
+    if bim_sites != n_snps_total {
+        return Err(format!(
+            "BED/BIM site count mismatch: bed={n_snps_total}, bim={bim_sites}"
+        ));
+    }
+    check_admx_memory_limit("bed_backend/after_bim_scan")?;
+    emit_rsvd_rss_debug(
+        "packed_backend/cache_miss_bim_ready",
+        &format!(
+            "prefix={} n_total_sites={} snps_only={}",
+            prefix, n_snps_total, cfg.snps_only
+        ),
+    );
+
     let mut active_row_idx: Vec<usize> = Vec::with_capacity(n_snps_total);
     let mut row_freq: Vec<f32> = Vec::with_capacity(n_snps_total);
     let mut row_flip: Vec<bool> = Vec::with_capacity(n_snps_total);
     let n_samples_f64 = n_samples as f64;
     let chunk_rows = packed_backend_stats_chunk_rows(n_snps_total, n_samples);
+    let mut bed_reader = BufReader::new(File::open(&bed_path).map_err(|e| e.to_string())?);
+    let mut header = [0u8; 3];
+    bed_reader.read_exact(&mut header).map_err(|e| e.to_string())?;
+    if header != [0x6C, 0x1B, 0x01] {
+        return Err("Only SNP-major BED supported".to_string());
+    }
+    let compact_tmp_path = compact_path.with_extension("tmp");
+    let mut compact_writer = if packed_bed_compact_cache_enabled() {
+        match File::create(&compact_tmp_path) {
+            Ok(file) => Some(BufWriter::new(file)),
+            Err(e) => {
+                emit_rsvd_rss_debug(
+                    "packed_backend/compact_cache_create_failed",
+                    &format!("prefix={} cache={} error={}", prefix, compact_path.display(), e),
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let mut chunk_buf = Vec::<u8>::new();
     for chunk_start in (0..n_snps_total).step_by(chunk_rows) {
+        check_admx_memory_limit("bed_backend/filter_scan")?;
         let chunk_end = (chunk_start + chunk_rows).min(n_snps_total);
-        let keep_rows: Vec<Option<(usize, f32, bool)>> = (chunk_start..chunk_end)
+        let row_count = chunk_end - chunk_start;
+        chunk_buf.resize(row_count * bytes_per_snp, 0);
+        bed_reader
+            .read_exact(&mut chunk_buf)
+            .map_err(|e| e.to_string())?;
+        let keep_rows: Vec<Option<(usize, usize, f32, bool)>> = (0..row_count)
             .into_par_iter()
-            .map(|snp_idx| {
-                let site = &sites[snp_idx];
-                if cfg.snps_only && !is_simple_snp_alleles(&site.ref_allele, &site.alt_allele) {
+            .map(|local_idx| {
+                let snp_idx = chunk_start + local_idx;
+                if cfg.snps_only
+                    && !simple_snp_mask
+                        .as_ref()
+                        .and_then(|mask| mask.get(snp_idx))
+                        .copied()
+                        .unwrap_or(false)
+                {
                     return None;
                 }
-                let row_start = 3 + snp_idx * bytes_per_snp;
-                let row = &mmap[row_start..row_start + bytes_per_snp];
+                let row_start = local_idx * bytes_per_snp;
+                let row = &chunk_buf[row_start..row_start + bytes_per_snp];
                 let (non_missing, alt_sum) = packed_row_nonmissing_alt_sum_full(row, n_samples);
 
                 let miss_rate = 1.0_f64 - (non_missing as f64 / n_samples_f64);
@@ -627,7 +1024,7 @@ fn try_build_packed_bed_backend(cfg: &StreamRsvdConfig) -> Result<Option<PackedB
                     if cfg.maf > 0.0 {
                         return None;
                     }
-                    return Some((snp_idx, 0.0_f32, false));
+                    return Some((local_idx, snp_idx, 0.0_f32, false));
                 }
 
                 let p = alt_sum / (2.0 * non_missing as f64);
@@ -636,17 +1033,40 @@ fn try_build_packed_bed_backend(cfg: &StreamRsvdConfig) -> Result<Option<PackedB
                 if p_minor < cfg.maf as f64 {
                     return None;
                 }
-                Some((snp_idx, p_minor as f32, flip))
+                Some((local_idx, snp_idx, p_minor as f32, flip))
             })
             .collect();
         for item in keep_rows.into_iter().flatten() {
-            active_row_idx.push(item.0);
-            row_freq.push(item.1);
-            row_flip.push(item.2);
+            let (local_idx, snp_idx, freq, flip) = item;
+            active_row_idx.push(snp_idx);
+            row_freq.push(freq);
+            row_flip.push(flip);
+            if let Some(writer) = compact_writer.as_mut() {
+                let row_start = local_idx * bytes_per_snp;
+                writer
+                    .write_all(&chunk_buf[row_start..row_start + bytes_per_snp])
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        if rsvd_rss_debug_enabled()
+            && (((chunk_start / chunk_rows) % 64 == 0) || chunk_end == n_snps_total)
+        {
+            emit_rsvd_rss_debug(
+                "packed_backend/filter_scan",
+                &format!(
+                    "rows={}/{} active_rows={}",
+                    chunk_end,
+                    n_snps_total,
+                    row_freq.len()
+                ),
+            );
         }
     }
 
     let n_snps = row_freq.len();
+    if n_snps == 0 {
+        return Err("no SNPs remain after BED filters".to_string());
+    }
     emit_rsvd_rss_debug(
         "packed_backend/filter_done",
         &format!(
@@ -658,9 +1078,54 @@ fn try_build_packed_bed_backend(cfg: &StreamRsvdConfig) -> Result<Option<PackedB
             format_debug_bytes_local((row_flip.len() * std::mem::size_of::<bool>()) as u64),
         ),
     );
+    let compact_ready = if let Some(mut writer) = compact_writer {
+        writer.flush().map_err(|e| e.to_string())?;
+        drop(writer);
+        fs::rename(&compact_tmp_path, &compact_path).map_err(|e| e.to_string())?;
+        true
+    } else {
+        false
+    };
+    let storage;
+    let payload_offset;
+    let compact_rows;
+    let expected_compact_payload = n_snps
+        .checked_mul(bytes_per_snp)
+        .ok_or_else(|| "compact BED payload size overflow".to_string())?;
+    if compact_ready {
+        storage = try_open_packed_bed_compact_cache_storage(&compact_path, n_snps, bytes_per_snp)
+            .ok_or_else(|| "failed to open compact BED row cache after build".to_string())?;
+        payload_offset = 0;
+        compact_rows = true;
+        emit_rsvd_rss_debug(
+            "packed_backend/compact_cache_ready",
+            &format!(
+                "prefix={} cache={} packed_payload={} storage={}",
+                prefix,
+                compact_path.display(),
+                format_debug_bytes_local(expected_compact_payload as u64),
+                storage.label(),
+            ),
+        );
+    } else {
+        let file = File::open(&bed_path).map_err(|e| e.to_string())?;
+        let mmap = unsafe { Mmap::map(&file) }.map_err(|e| e.to_string())?;
+        storage = PackedBedStorage::Mmap(mmap);
+        payload_offset = 3;
+        compact_rows = false;
+        emit_rsvd_rss_debug(
+            "packed_backend/original_mmap_ready",
+            &format!(
+                "prefix={} mapped_payload={}",
+                prefix,
+                format_debug_bytes_local(expected_payload as u64),
+            ),
+        );
+    }
     let backend = PackedBedRsvd {
-        mmap,
-        payload_offset: 3,
+        storage,
+        payload_offset,
+        compact_rows,
         bytes_per_snp,
         n_samples,
         n_snps,
@@ -681,6 +1146,76 @@ fn try_build_packed_bed_backend(cfg: &StreamRsvdConfig) -> Result<Option<PackedB
     Ok(Some(backend))
 }
 
+fn open_packed_bed_backend_for_training(
+    genotype_path: &str,
+    snps_only: bool,
+    maf: f32,
+    missing_rate: f32,
+) -> Result<(PackedBedRsvd, String), String> {
+    if !(0.0..=0.5).contains(&maf) {
+        return Err("maf must be within [0, 0.5]".to_string());
+    }
+    if !(0.0..=1.0).contains(&missing_rate) {
+        return Err("missing_rate must be within [0, 1]".to_string());
+    }
+    let prefix = detect_bed_prefix(genotype_path)
+        .ok_or_else(|| format!("BED prefix not found for genotype input: {genotype_path}"))?;
+    let cfg = StreamRsvdConfig {
+        genotype_path: prefix.clone(),
+        snps_only,
+        maf,
+        missing_rate,
+        delimiter: None,
+        mmap_window_mb: 0,
+    };
+    let Some(backend) = try_build_packed_bed_backend(&cfg)? else {
+        return Err("BED backend is unavailable or disabled for this input".to_string());
+    };
+    Ok((backend, prefix))
+}
+
+#[pyclass]
+pub struct AdmxBedBackend {
+    backend: Arc<PackedBedRsvd>,
+    prefix: String,
+    snps_only: bool,
+    maf: f32,
+    missing_rate: f32,
+}
+
+#[pyclass]
+pub struct AdmxBedFoldBackend {
+    backend: Arc<PackedBedRsvd>,
+    prefix: String,
+    snps_only: bool,
+    maf: f32,
+    missing_rate: f32,
+    fold_id: usize,
+    folds: usize,
+    cv_seed: u64,
+    row_freq_train: Vec<f32>,
+    train_observed: usize,
+    holdout_observed: usize,
+}
+
+#[pyclass]
+pub struct AdmxBedTrainingSession {
+    backend: Arc<PackedBedRsvd>,
+    prefix: String,
+    snps_only: bool,
+    maf: f32,
+    missing_rate: f32,
+}
+
+struct AdmxBedFitResult {
+    p: Vec<f32>,
+    q: Vec<f32>,
+    ll_final: f64,
+    adam_iter: usize,
+    init_ll: f64,
+    als_iter: usize,
+}
+
 fn compute_a_omega_packed(
     backend: &PackedBedRsvd,
     omega: &[f32], // (n, kp)
@@ -688,13 +1223,13 @@ fn compute_a_omega_packed(
 ) -> Result<Vec<f32>, String> {
     let sample_idx: Vec<usize> = (0..backend.n_samples).collect();
     let packed_view = PackedRsvdView {
-        packed_flat: &backend.mmap[backend.payload_offset..],
+        packed_flat: &backend.storage.as_slice()[backend.payload_offset..],
         bytes_per_snp: backend.bytes_per_snp,
         n_samples: backend.n_samples,
         row_freq: &backend.row_freq,
         row_flip: &backend.row_flip,
         sample_idx: &sample_idx,
-        packed_row_indices: Some(&backend.active_row_idx),
+        packed_row_indices: packed_backend_row_indices(backend),
     };
     rsvd_packed_compute_a_omega(packed_view, omega, kp)
 }
@@ -706,13 +1241,13 @@ fn compute_at_random_omega_packed(
 ) -> Result<Vec<f32>, String> {
     let sample_idx: Vec<usize> = (0..backend.n_samples).collect();
     let packed_view = PackedRsvdView {
-        packed_flat: &backend.mmap[backend.payload_offset..],
+        packed_flat: &backend.storage.as_slice()[backend.payload_offset..],
         bytes_per_snp: backend.bytes_per_snp,
         n_samples: backend.n_samples,
         row_freq: &backend.row_freq,
         row_flip: &backend.row_flip,
         sample_idx: &sample_idx,
-        packed_row_indices: Some(&backend.active_row_idx),
+        packed_row_indices: packed_backend_row_indices(backend),
     };
     rsvd_packed_compute_at_random_omega(packed_view, kp, seed)
 }
@@ -725,13 +1260,13 @@ fn compute_ata_omega_packed(
 ) -> Result<Vec<f32>, String> {
     let sample_idx: Vec<usize> = (0..backend.n_samples).collect();
     let packed_view = PackedRsvdView {
-        packed_flat: &backend.mmap[backend.payload_offset..],
+        packed_flat: &backend.storage.as_slice()[backend.payload_offset..],
         bytes_per_snp: backend.bytes_per_snp,
         n_samples: backend.n_samples,
         row_freq: &backend.row_freq,
         row_flip: &backend.row_flip,
         sample_idx: &sample_idx,
-        packed_row_indices: Some(&backend.active_row_idx),
+        packed_row_indices: packed_backend_row_indices(backend),
     };
     rsvd_packed_compute_ata_omega(packed_view, omega, kp, timing)
 }
@@ -743,15 +1278,58 @@ fn compute_gram_aq_packed(
 ) -> Result<Vec<f64>, String> {
     let sample_idx: Vec<usize> = (0..backend.n_samples).collect();
     let packed_view = PackedRsvdView {
-        packed_flat: &backend.mmap[backend.payload_offset..],
+        packed_flat: &backend.storage.as_slice()[backend.payload_offset..],
         bytes_per_snp: backend.bytes_per_snp,
         n_samples: backend.n_samples,
         row_freq: &backend.row_freq,
         row_flip: &backend.row_flip,
         sample_idx: &sample_idx,
-        packed_row_indices: Some(&backend.active_row_idx),
+        packed_row_indices: packed_backend_row_indices(backend),
     };
     rsvd_packed_compute_gram_aq(packed_view, q, kp)
+}
+
+#[inline]
+fn packed_backend_row_slice(backend: &PackedBedRsvd, active_row: usize) -> &[u8] {
+    let snp_idx = if backend.compact_rows {
+        active_row
+    } else {
+        backend.active_row_idx[active_row]
+    };
+    let start = backend.payload_offset + snp_idx * backend.bytes_per_snp;
+    &backend.storage.as_slice()[start..start + backend.bytes_per_snp]
+}
+
+#[inline]
+fn packed_code_minor_allele_g(code: u8, flip: bool) -> Option<f32> {
+    match code {
+        0b00 => Some(if flip { 2.0_f32 } else { 0.0_f32 }),
+        0b10 => Some(1.0_f32),
+        0b11 => Some(if flip { 0.0_f32 } else { 2.0_f32 }),
+        _ => None,
+    }
+}
+
+#[inline]
+fn cv_fold_hash64(flat_idx: u64, seed: u64) -> u64 {
+    let mix = seed ^ 0x9E3779B97F4A7C15_u64;
+    let mut x = flat_idx ^ mix;
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9_u64);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB_u64);
+    x ^ (x >> 31)
+}
+
+#[inline]
+fn cv_fold_id(flat_idx: u64, folds: usize, seed: u64) -> usize {
+    (cv_fold_hash64(flat_idx, seed) % (folds.max(1) as u64)) as usize
+}
+
+#[inline]
+fn validate_cv_folds(folds: usize) -> Result<(), String> {
+    if folds < 2 {
+        return Err(format!("CVerror requires folds >= 2, got {folds}."));
+    }
+    Ok(())
 }
 
 fn open_stream_iter(cfg: &StreamRsvdConfig) -> Result<StreamSnpIter, String> {
@@ -787,6 +1365,69 @@ fn open_stream_iter(cfg: &StreamRsvdConfig) -> Result<StreamSnpIter, String> {
         path,
         cfg.delimiter.as_deref(),
     )?))
+}
+
+fn write_p_site_from_backend_impl(
+    prefix: &str,
+    active_row_idx: &[usize],
+    row_flip: &[bool],
+    out_path: &str,
+) -> Result<(), String> {
+    if active_row_idx.len() != row_flip.len() {
+        return Err(format!(
+            "active_row_idx / row_flip length mismatch: {} vs {}",
+            active_row_idx.len(),
+            row_flip.len()
+        ));
+    }
+    let bim_path = format!("{prefix}.bim");
+    let file = File::open(&bim_path).map_err(|e| format!("{bim_path}: {e}"))?;
+    let reader = BufReader::new(file);
+    let mut writer = BufWriter::with_capacity(
+        8 * 1024 * 1024,
+        File::create(out_path).map_err(|e| format!("{out_path}: {e}"))?,
+    );
+    let mut want_ptr = 0usize;
+
+    for (line_no, line) in reader.lines().enumerate() {
+        if want_ptr >= active_row_idx.len() {
+            break;
+        }
+        if line_no != active_row_idx[want_ptr] {
+            continue;
+        }
+        let l = line.map_err(|e| format!("{bim_path}:{}: {e}", line_no + 1))?;
+        let cols: Vec<&str> = l.split_whitespace().collect();
+        if cols.len() < 6 {
+            return Err(format!(
+                "Malformed BIM line at {bim_path}:{}: {l}",
+                line_no + 1
+            ));
+        }
+        let (ref_allele, alt_allele) = if row_flip[want_ptr] {
+            (cols[5], cols[4])
+        } else {
+            (cols[4], cols[5])
+        };
+        writeln!(
+            writer,
+            "{}\t{}\t{}\t{}",
+            cols[0], cols[3], ref_allele, alt_allele
+        )
+        .map_err(|e| format!("{out_path}: {e}"))?;
+        want_ptr += 1;
+    }
+
+    if want_ptr != active_row_idx.len() {
+        return Err(format!(
+            "BIM row count mismatch while writing P.site: wrote {}, expected {} from {}",
+            want_ptr,
+            active_row_idx.len(),
+            bim_path
+        ));
+    }
+    writer.flush().map_err(|e| format!("{out_path}: {e}"))?;
+    Ok(())
 }
 
 fn for_each_processed_row<F>(
@@ -1426,7 +2067,7 @@ pub fn admx_rsvd_stream<'py>(
     }
 
     let k_eff = k.min(m);
-    let kp = (k_eff + 10).max(20).min(m.max(1));
+    let kp = admx_rsvd_kp(k_eff, m.max(1).min(n.max(1)));
     let block_rows = rsvd_block_rows_env(n, m);
     let backend_extra = if let Some(backend) = packed_backend.as_ref() {
         format!(
@@ -1709,36 +2350,37 @@ pub fn admx_rsvd_stream_sample<'py>(
     let mut t_stage = Instant::now();
 
     let packed_backend = try_build_packed_bed_backend(&cfg).map_err(PyRuntimeError::new_err)?;
+    if let Some(backend) = packed_backend.as_ref() {
+        let (eigvals, eigvecs_sample) =
+            rsvd_stream_sample_packed_impl(backend, k, seed, power, tol)
+                .map_err(PyRuntimeError::new_err)?;
+        let k_eff = eigvals.len();
+        let eval_arr = row_freq_to_pyarray(py, &eigvals);
+        let evec_arr = vec_to_pyarray2_f32(py, backend.n_samples, k_eff, &eigvecs_sample)?;
+        return Ok((eval_arr, evec_arr));
+    }
 
     let mut row_freq: Vec<f32> = Vec::new();
     let mut varsum: f64 = 0.0;
-    let (m, n) = if let Some(backend) = packed_backend.as_ref() {
-        row_freq = backend.row_freq.clone();
-        for &freq in row_freq.iter() {
-            varsum += 2.0_f64 * (freq as f64) * (1.0_f64 - freq as f64);
-        }
-        (backend.n_snps, backend.n_samples)
-    } else {
-        for_each_processed_row(&cfg, |_idx, row| {
-            let mut alt_sum = 0.0_f64;
-            let mut non_missing = 0usize;
-            for &g in row.iter() {
-                if g >= 0.0 && g.is_finite() {
-                    alt_sum += g as f64;
-                    non_missing += 1;
-                }
+    let (m, n) = for_each_processed_row(&cfg, |_idx, row| {
+        let mut alt_sum = 0.0_f64;
+        let mut non_missing = 0usize;
+        for &g in row.iter() {
+            if g >= 0.0 && g.is_finite() {
+                alt_sum += g as f64;
+                non_missing += 1;
             }
-            let freq = if non_missing > 0 {
-                (alt_sum / (2.0 * non_missing as f64)) as f32
-            } else {
-                0.0_f32
-            };
-            varsum += 2.0_f64 * (freq as f64) * (1.0_f64 - freq as f64);
-            row_freq.push(freq);
-            Ok(())
-        })
-        .map_err(PyRuntimeError::new_err)?
-    };
+        }
+        let freq = if non_missing > 0 {
+            (alt_sum / (2.0 * non_missing as f64)) as f32
+        } else {
+            0.0_f32
+        };
+        varsum += 2.0_f64 * (freq as f64) * (1.0_f64 - freq as f64);
+        row_freq.push(freq);
+        Ok(())
+    })
+    .map_err(PyRuntimeError::new_err)?;
     let backend_s = t_stage.elapsed().as_secs_f64();
 
     if m == 0 {
@@ -1758,7 +2400,7 @@ pub fn admx_rsvd_stream_sample<'py>(
     }
 
     let k_eff = k.min(n);
-    let kp = (k_eff + 10).max(20).min(m.max(1));
+    let kp = admx_rsvd_kp(k_eff, m.max(1).min(n.max(1)));
     let block_rows = rsvd_block_rows_env(n, m);
     let backend_extra = if let Some(backend) = packed_backend.as_ref() {
         format!(
@@ -2040,6 +2682,2346 @@ fn loglikelihood_f32_impl(g: &ArrayView2<'_, u8>, p: &[f32], q: &[f32], n: usize
         .sum()
 }
 
+fn loglikelihood_packed_f32_impl(backend: &PackedBedRsvd, p: &[f32], q: &[f32], k: usize) -> f64 {
+    let n = backend.n_samples;
+    let full_bytes = n / 4;
+    let rem = n % 4;
+    let byte_lut = packed_byte_lut();
+    (0..backend.n_snps)
+        .into_par_iter()
+        .map(|i| {
+            let row = packed_backend_row_slice(backend, i);
+            let p_row = &p[i * k..(i + 1) * k];
+            let flip = backend.row_flip[i];
+            let mut part = 0.0_f64;
+            let mut col = 0usize;
+            for &b in row.iter().take(full_bytes) {
+                let codes = &byte_lut.code4[b as usize];
+                for &code in codes.iter() {
+                    if let Some(gv_f32) = packed_code_minor_allele_g(code, flip) {
+                        let q_row = &q[col * k..(col + 1) * k];
+                        let mut rec = 0.0_f32;
+                        for kk in 0..k {
+                            rec += p_row[kk] * q_row[kk];
+                        }
+                        let rec = rec.clamp(1e-6, 1.0 - 1e-6) as f64;
+                        let gv = gv_f32 as f64;
+                        part += gv * rec.ln() + (2.0 - gv) * (1.0 - rec).ln();
+                    }
+                    col += 1;
+                }
+            }
+            if rem > 0 {
+                let codes = &byte_lut.code4[row[full_bytes] as usize];
+                for &code in codes.iter().take(rem) {
+                    if let Some(gv_f32) = packed_code_minor_allele_g(code, flip) {
+                        let q_row = &q[col * k..(col + 1) * k];
+                        let mut rec = 0.0_f32;
+                        for kk in 0..k {
+                            rec += p_row[kk] * q_row[kk];
+                        }
+                        let rec = rec.clamp(1e-6, 1.0 - 1e-6) as f64;
+                        let gv = gv_f32 as f64;
+                        part += gv * rec.ln() + (2.0 - gv) * (1.0 - rec).ln();
+                    }
+                    col += 1;
+                }
+            }
+            part
+        })
+        .sum()
+}
+
+fn row_freq_to_pyarray<'py>(py: Python<'py>, row_freq: &[f32]) -> Bound<'py, PyArray1<f32>> {
+    #[allow(deprecated)]
+    PyArray1::from_owned_array(py, Array1::from_vec(row_freq.to_vec())).into_bound()
+}
+
+fn vec_to_pyarray2_f32<'py>(
+    py: Python<'py>,
+    rows: usize,
+    cols: usize,
+    data: &[f32],
+) -> PyResult<Bound<'py, PyArray2<f32>>> {
+    let out = PyArray2::<f32>::zeros(py, [rows, cols], false).into_bound();
+    let out_s = unsafe {
+        out.as_slice_mut()
+            .map_err(|_| PyRuntimeError::new_err("output not contiguous"))?
+    };
+    out_s.copy_from_slice(data);
+    Ok(out)
+}
+
+fn vec_into_pyarray2_f32<'py>(
+    py: Python<'py>,
+    rows: usize,
+    cols: usize,
+    data: Vec<f32>,
+) -> PyResult<Bound<'py, PyArray2<f32>>> {
+    if data.len() != rows.saturating_mul(cols) {
+        return Err(PyRuntimeError::new_err(format!(
+            "output buffer size mismatch: got {}, expected {}",
+            data.len(),
+            rows.saturating_mul(cols)
+        )));
+    }
+    let arr = Array2::from_shape_vec((rows, cols), data)
+        .map_err(|e| PyRuntimeError::new_err(format!("failed to build output array: {e}")))?;
+    #[allow(deprecated)]
+    Ok(PyArray2::from_owned_array(py, arr).into_bound())
+}
+
+fn vec_to_pyarray1_i64<'py>(py: Python<'py>, data: &[i64]) -> PyResult<Bound<'py, PyArray1<i64>>> {
+    let out = PyArray1::<i64>::zeros(py, [data.len()], false).into_bound();
+    let out_s = unsafe {
+        out.as_slice_mut()
+            .map_err(|_| PyRuntimeError::new_err("output not contiguous"))?
+    };
+    out_s.copy_from_slice(data);
+    Ok(out)
+}
+
+fn cv_observed_fold_counts_packed_impl(
+    backend: &PackedBedRsvd,
+    folds: usize,
+    seed: u64,
+) -> Result<(usize, Vec<i64>), String> {
+    validate_cv_folds(folds)?;
+    let n = backend.n_samples;
+    let m = backend.n_snps;
+    if n == 0 || m == 0 {
+        return Ok((0, vec![0_i64; folds]));
+    }
+    let full_bytes = n / 4;
+    let rem = n % 4;
+    let byte_lut = packed_byte_lut();
+    let chunk_rows = rsvd_block_rows_env(n, m)
+        .saturating_mul(16)
+        .clamp(1024, 16384)
+        .min(m.max(1));
+    let mut observed_total = 0usize;
+    let mut fold_counts = vec![0_i64; folds];
+
+    for chunk_start in (0..m).step_by(chunk_rows) {
+        let chunk_end = (chunk_start + chunk_rows).min(m);
+        let (obs_chunk, fold_chunk) = (chunk_start..chunk_end)
+            .into_par_iter()
+            .fold(
+                || (0usize, vec![0_i64; folds]),
+                |(mut obs_local, mut fold_local), i| {
+                    let row = packed_backend_row_slice(backend, i);
+                    let row_offset = (i as u64) * (n as u64);
+                    let mut col = 0usize;
+                    for &packed in row.iter().take(full_bytes) {
+                        let codes = &byte_lut.code4[packed as usize];
+                        for &code in codes.iter() {
+                            if code != 0b01 {
+                                let fid = cv_fold_id(row_offset + (col as u64), folds, seed);
+                                fold_local[fid] += 1;
+                                obs_local += 1;
+                            }
+                            col += 1;
+                        }
+                    }
+                    if rem > 0 {
+                        let codes = &byte_lut.code4[row[full_bytes] as usize];
+                        for &code in codes.iter().take(rem) {
+                            if code != 0b01 {
+                                let fid = cv_fold_id(row_offset + (col as u64), folds, seed);
+                                fold_local[fid] += 1;
+                                obs_local += 1;
+                            }
+                            col += 1;
+                        }
+                    }
+                    (obs_local, fold_local)
+                },
+            )
+            .reduce(
+                || (0usize, vec![0_i64; folds]),
+                |(obs_a, mut fold_a), (obs_b, fold_b)| {
+                    for f in 0..folds {
+                        fold_a[f] += fold_b[f];
+                    }
+                    (obs_a + obs_b, fold_a)
+                },
+            );
+        observed_total += obs_chunk;
+        for f in 0..folds {
+            fold_counts[f] += fold_chunk[f];
+        }
+    }
+
+    Ok((observed_total, fold_counts))
+}
+
+fn cv_training_row_freq_packed_impl(
+    backend: &PackedBedRsvd,
+    fold_id_keepout: usize,
+    folds: usize,
+    seed: u64,
+) -> Result<(Vec<f32>, usize, usize), String> {
+    validate_cv_folds(folds)?;
+    if fold_id_keepout >= folds {
+        return Err(format!(
+            "fold_id must be within [0, {}), got {fold_id_keepout}",
+            folds
+        ));
+    }
+    let n = backend.n_samples;
+    let m = backend.n_snps;
+    let full_bytes = n / 4;
+    let rem = n % 4;
+    let byte_lut = packed_byte_lut();
+    let chunk_rows = rsvd_block_rows_env(n, m)
+        .saturating_mul(16)
+        .clamp(1024, 16384)
+        .min(m.max(1));
+    let mut row_freq = vec![0.0_f32; m];
+    let mut train_observed_total = 0usize;
+    let mut holdout_observed_total = 0usize;
+
+    for chunk_start in (0..m).step_by(chunk_rows) {
+        let chunk_end = (chunk_start + chunk_rows).min(m);
+        let chunk_stats: Vec<(f32, usize, usize)> = (chunk_start..chunk_end)
+            .into_par_iter()
+            .map(|i| {
+                let row = packed_backend_row_slice(backend, i);
+                let flip = backend.row_flip[i];
+                let row_offset = (i as u64) * (n as u64);
+                let mut train_non_missing = 0usize;
+                let mut holdout_non_missing = 0usize;
+                let mut alt_sum = 0.0_f64;
+                let mut col = 0usize;
+                for &packed in row.iter().take(full_bytes) {
+                    let codes = &byte_lut.code4[packed as usize];
+                    for &code in codes.iter() {
+                        if let Some(gv) = packed_code_minor_allele_g(code, flip) {
+                            if cv_fold_id(row_offset + (col as u64), folds, seed) == fold_id_keepout
+                            {
+                                holdout_non_missing += 1;
+                            } else {
+                                train_non_missing += 1;
+                                alt_sum += gv as f64;
+                            }
+                        }
+                        col += 1;
+                    }
+                }
+                if rem > 0 {
+                    let codes = &byte_lut.code4[row[full_bytes] as usize];
+                    for &code in codes.iter().take(rem) {
+                        if let Some(gv) = packed_code_minor_allele_g(code, flip) {
+                            if cv_fold_id(row_offset + (col as u64), folds, seed) == fold_id_keepout
+                            {
+                                holdout_non_missing += 1;
+                            } else {
+                                train_non_missing += 1;
+                                alt_sum += gv as f64;
+                            }
+                        }
+                        col += 1;
+                    }
+                }
+                let freq = if train_non_missing > 0 {
+                    (alt_sum / (2.0_f64 * train_non_missing as f64)) as f32
+                } else {
+                    0.0_f32
+                };
+                (freq, train_non_missing, holdout_non_missing)
+            })
+            .collect();
+        for (off, (freq, train_ct, holdout_ct)) in chunk_stats.into_iter().enumerate() {
+            row_freq[chunk_start + off] = freq;
+            train_observed_total += train_ct;
+            holdout_observed_total += holdout_ct;
+        }
+    }
+
+    Ok((row_freq, train_observed_total, holdout_observed_total))
+}
+
+fn decode_train_masked_block_rows_f32(
+    backend: &PackedBedRsvd,
+    row_freq_train: &[f32],
+    row_start: usize,
+    rows: usize,
+    fold_id_keepout: usize,
+    folds: usize,
+    cv_seed: u64,
+    out: &mut [f32],
+) -> Result<(), String> {
+    let n = backend.n_samples;
+    if row_freq_train.len() != backend.n_snps {
+        return Err(format!(
+            "row_freq_train length mismatch: got {}, expected {}",
+            row_freq_train.len(),
+            backend.n_snps
+        ));
+    }
+    if out.len() != rows * n {
+        return Err(format!(
+            "masked decode output length mismatch: got {}, expected {}",
+            out.len(),
+            rows * n
+        ));
+    }
+    let full_bytes = n / 4;
+    let rem = n % 4;
+    let code4 = &packed_byte_lut().code4;
+    out.par_chunks_mut(n)
+        .enumerate()
+        .for_each(|(local_row, out_row)| {
+            let i = row_start + local_row;
+            let row = packed_backend_row_slice(backend, i);
+            let mean_g = 2.0_f32 * row_freq_train[i];
+            let value_lut: [f32; 4] = if backend.row_flip[i] {
+                [
+                    2.0_f32 - mean_g,
+                    0.0_f32,
+                    1.0_f32 - mean_g,
+                    0.0_f32 - mean_g,
+                ]
+            } else {
+                [
+                    0.0_f32 - mean_g,
+                    0.0_f32,
+                    1.0_f32 - mean_g,
+                    2.0_f32 - mean_g,
+                ]
+            };
+            let row_offset = (i as u64) * (n as u64);
+            let mut col = 0usize;
+            for &packed in row.iter().take(full_bytes) {
+                let codes = &code4[packed as usize];
+                for &code in codes.iter() {
+                    let flat_idx = row_offset + (col as u64);
+                    out_row[col] = if code == 0b01
+                        || cv_fold_id(flat_idx, folds, cv_seed) == fold_id_keepout
+                    {
+                        0.0_f32
+                    } else {
+                        value_lut[code as usize]
+                    };
+                    col += 1;
+                }
+            }
+            if rem > 0 {
+                let codes = &code4[row[full_bytes] as usize];
+                for &code in codes.iter().take(rem) {
+                    let flat_idx = row_offset + (col as u64);
+                    out_row[col] = if code == 0b01
+                        || cv_fold_id(flat_idx, folds, cv_seed) == fold_id_keepout
+                    {
+                        0.0_f32
+                    } else {
+                        value_lut[code as usize]
+                    };
+                    col += 1;
+                }
+            }
+        });
+    Ok(())
+}
+
+fn compute_a_omega_packed_fold_impl(
+    backend: &PackedBedRsvd,
+    row_freq_train: &[f32],
+    omega: &[f32],
+    kp: usize,
+    fold_id_keepout: usize,
+    folds: usize,
+    cv_seed: u64,
+) -> Result<Vec<f32>, String> {
+    validate_cv_folds(folds)?;
+    let m = backend.n_snps;
+    let n = backend.n_samples;
+    if row_freq_train.len() != m {
+        return Err(format!(
+            "row_freq_train length mismatch: got {}, expected {m}",
+            row_freq_train.len()
+        ));
+    }
+    if omega.len() != n * kp {
+        return Err("omega shape mismatch in masked packed RSVD A*Omega".to_string());
+    }
+    let block_rows = rsvd_block_rows_env(n, m);
+    let mut out = vec![0.0_f32; m * kp];
+    let mut block = vec![0.0_f32; block_rows * n];
+    let n_i = checked_cblas_dim_local(n, "n")?;
+    let kp_i = checked_cblas_dim_local(kp, "kp")?;
+    let _blas_guard = BlasThreadGuard::enter(rayon::current_num_threads().max(1));
+
+    for row_start in (0..m).step_by(block_rows) {
+        let row_end = (row_start + block_rows).min(m);
+        let cur_rows = row_end - row_start;
+        let cur_block = &mut block[..cur_rows * n];
+        decode_train_masked_block_rows_f32(
+            backend,
+            row_freq_train,
+            row_start,
+            cur_rows,
+            fold_id_keepout,
+            folds,
+            cv_seed,
+            cur_block,
+        )?;
+        let out_block = &mut out[row_start * kp..row_end * kp];
+        let cur_rows_i = checked_cblas_dim_local(cur_rows, "cur_rows")?;
+        unsafe {
+            cblas_sgemm_dispatch(
+                CBLAS_ROW_MAJOR,
+                CBLAS_NO_TRANS,
+                CBLAS_NO_TRANS,
+                cur_rows_i,
+                kp_i,
+                n_i,
+                1.0_f32,
+                cur_block.as_ptr(),
+                n_i,
+                omega.as_ptr(),
+                kp_i,
+                0.0_f32,
+                out_block.as_mut_ptr(),
+                kp_i,
+            );
+        }
+    }
+    Ok(out)
+}
+
+fn compute_at_random_omega_packed_fold_impl(
+    backend: &PackedBedRsvd,
+    row_freq_train: &[f32],
+    kp: usize,
+    seed: u64,
+    fold_id_keepout: usize,
+    folds: usize,
+    cv_seed: u64,
+) -> Result<Vec<f32>, String> {
+    validate_cv_folds(folds)?;
+    let m = backend.n_snps;
+    let n = backend.n_samples;
+    if row_freq_train.len() != m {
+        return Err(format!(
+            "row_freq_train length mismatch: got {}, expected {m}",
+            row_freq_train.len()
+        ));
+    }
+    let block_rows = rsvd_block_rows_env(n, m);
+    let mut out = vec![0.0_f32; n * kp];
+    let mut block = vec![0.0_f32; block_rows * n];
+    let mut omega_block = vec![0.0_f32; block_rows * kp];
+    let mut rng = StdRng::seed_from_u64(seed);
+    let n_i = checked_cblas_dim_local(n, "n")?;
+    let kp_i = checked_cblas_dim_local(kp, "kp")?;
+    let _blas_guard = BlasThreadGuard::enter(rayon::current_num_threads().max(1));
+
+    for row_start in (0..m).step_by(block_rows) {
+        let row_end = (row_start + block_rows).min(m);
+        let cur_rows = row_end - row_start;
+        let cur_block = &mut block[..cur_rows * n];
+        decode_train_masked_block_rows_f32(
+            backend,
+            row_freq_train,
+            row_start,
+            cur_rows,
+            fold_id_keepout,
+            folds,
+            cv_seed,
+            cur_block,
+        )?;
+        let cur_omega = &mut omega_block[..cur_rows * kp];
+        fill_random_omega_block(&mut rng, cur_omega);
+        let cur_rows_i = checked_cblas_dim_local(cur_rows, "cur_rows")?;
+        unsafe {
+            cblas_sgemm_dispatch(
+                CBLAS_ROW_MAJOR,
+                CBLAS_TRANS,
+                CBLAS_NO_TRANS,
+                n_i,
+                kp_i,
+                cur_rows_i,
+                1.0_f32,
+                cur_block.as_ptr(),
+                n_i,
+                cur_omega.as_ptr(),
+                kp_i,
+                1.0_f32,
+                out.as_mut_ptr(),
+                kp_i,
+            );
+        }
+    }
+    Ok(out)
+}
+
+fn compute_ata_omega_packed_fold_impl(
+    backend: &PackedBedRsvd,
+    row_freq_train: &[f32],
+    omega: &[f32],
+    kp: usize,
+    fold_id_keepout: usize,
+    folds: usize,
+    cv_seed: u64,
+    timing: Option<&mut RsvdKernelTiming>,
+) -> Result<Vec<f32>, String> {
+    validate_cv_folds(folds)?;
+    let m = backend.n_snps;
+    let n = backend.n_samples;
+    if row_freq_train.len() != m {
+        return Err(format!(
+            "row_freq_train length mismatch: got {}, expected {m}",
+            row_freq_train.len()
+        ));
+    }
+    if omega.len() != n * kp {
+        return Err("omega shape mismatch in masked packed RSVD A^T*(A*Omega)".to_string());
+    }
+    let block_rows = rsvd_block_rows_env(n, m);
+    let mut out = vec![0.0_f32; n * kp];
+    let mut block = vec![0.0_f32; block_rows * n];
+    let mut g_block = vec![0.0_f32; block_rows * kp];
+    let n_i = checked_cblas_dim_local(n, "n")?;
+    let kp_i = checked_cblas_dim_local(kp, "kp")?;
+    let _blas_guard = BlasThreadGuard::enter(rayon::current_num_threads().max(1));
+    let measure_timing = timing.is_some();
+    let mut decode_s = 0.0_f64;
+    let mut gemm_s = 0.0_f64;
+
+    for row_start in (0..m).step_by(block_rows) {
+        let row_end = (row_start + block_rows).min(m);
+        let cur_rows = row_end - row_start;
+        let cur_rows_i = checked_cblas_dim_local(cur_rows, "cur_rows")?;
+        let cur_block = &mut block[..cur_rows * n];
+        let t_decode = if measure_timing {
+            Some(Instant::now())
+        } else {
+            None
+        };
+        decode_train_masked_block_rows_f32(
+            backend,
+            row_freq_train,
+            row_start,
+            cur_rows,
+            fold_id_keepout,
+            folds,
+            cv_seed,
+            cur_block,
+        )?;
+        if let Some(t0) = t_decode {
+            decode_s += t0.elapsed().as_secs_f64();
+        }
+        let cur_g = &mut g_block[..cur_rows * kp];
+        let t_gemm = if measure_timing {
+            Some(Instant::now())
+        } else {
+            None
+        };
+        unsafe {
+            cblas_sgemm_dispatch(
+                CBLAS_ROW_MAJOR,
+                CBLAS_NO_TRANS,
+                CBLAS_NO_TRANS,
+                cur_rows_i,
+                kp_i,
+                n_i,
+                1.0_f32,
+                cur_block.as_ptr(),
+                n_i,
+                omega.as_ptr(),
+                kp_i,
+                0.0_f32,
+                cur_g.as_mut_ptr(),
+                kp_i,
+            );
+            cblas_sgemm_dispatch(
+                CBLAS_ROW_MAJOR,
+                CBLAS_TRANS,
+                CBLAS_NO_TRANS,
+                n_i,
+                kp_i,
+                cur_rows_i,
+                1.0_f32,
+                cur_block.as_ptr(),
+                n_i,
+                cur_g.as_ptr(),
+                kp_i,
+                1.0_f32,
+                out.as_mut_ptr(),
+                kp_i,
+            );
+        }
+        if let Some(t0) = t_gemm {
+            gemm_s += t0.elapsed().as_secs_f64();
+        }
+    }
+
+    if let Some(t) = timing {
+        t.decode_s += decode_s;
+        t.gemm_s += gemm_s;
+    }
+    Ok(out)
+}
+
+fn compute_gram_aq_packed_fold_impl(
+    backend: &PackedBedRsvd,
+    row_freq_train: &[f32],
+    q: &[f32],
+    kp: usize,
+    fold_id_keepout: usize,
+    folds: usize,
+    cv_seed: u64,
+) -> Result<Vec<f64>, String> {
+    validate_cv_folds(folds)?;
+    let m = backend.n_snps;
+    let n = backend.n_samples;
+    if row_freq_train.len() != m {
+        return Err(format!(
+            "row_freq_train length mismatch: got {}, expected {m}",
+            row_freq_train.len()
+        ));
+    }
+    if q.len() != n * kp {
+        return Err("Q shape mismatch in masked packed RSVD gram(AQ)".to_string());
+    }
+    let block_rows = rsvd_block_rows_env(n, m);
+    let mut block = vec![0.0_f32; block_rows * n];
+    let mut aq_block = vec![0.0_f32; block_rows * kp];
+    let mut gram = vec![0.0_f64; kp * kp];
+    let mut gram_block = vec![0.0_f32; kp * kp];
+    let n_i = checked_cblas_dim_local(n, "n")?;
+    let kp_i = checked_cblas_dim_local(kp, "kp")?;
+    let _blas_guard = BlasThreadGuard::enter(rayon::current_num_threads().max(1));
+
+    for row_start in (0..m).step_by(block_rows) {
+        let row_end = (row_start + block_rows).min(m);
+        let cur_rows = row_end - row_start;
+        let cur_rows_i = checked_cblas_dim_local(cur_rows, "cur_rows")?;
+        let cur_block = &mut block[..cur_rows * n];
+        decode_train_masked_block_rows_f32(
+            backend,
+            row_freq_train,
+            row_start,
+            cur_rows,
+            fold_id_keepout,
+            folds,
+            cv_seed,
+            cur_block,
+        )?;
+        let cur_aq = &mut aq_block[..cur_rows * kp];
+        unsafe {
+            cblas_sgemm_dispatch(
+                CBLAS_ROW_MAJOR,
+                CBLAS_NO_TRANS,
+                CBLAS_NO_TRANS,
+                cur_rows_i,
+                kp_i,
+                n_i,
+                1.0_f32,
+                cur_block.as_ptr(),
+                n_i,
+                q.as_ptr(),
+                kp_i,
+                0.0_f32,
+                cur_aq.as_mut_ptr(),
+                kp_i,
+            );
+        }
+        accum_gram_lower_f64_local(cur_aq, cur_rows, kp, &mut gram, &mut gram_block)?;
+    }
+    Ok(gram)
+}
+
+fn rsvd_stream_sample_packed_impl(
+    backend: &PackedBedRsvd,
+    k: usize,
+    seed: u64,
+    power: usize,
+    tol: f32,
+) -> Result<(Vec<f32>, Vec<f32>), String> {
+    if k == 0 {
+        return Err("k must be > 0".to_string());
+    }
+    if !(tol.is_finite() && tol > 0.0) {
+        return Err("tol must be positive and finite".to_string());
+    }
+
+    let t_total = Instant::now();
+    let n = backend.n_samples;
+    let m = backend.n_snps;
+    let row_freq = &backend.row_freq;
+    let mut varsum: f64 = 0.0;
+    for &freq in row_freq.iter() {
+        varsum += 2.0_f64 * (freq as f64) * (1.0_f64 - freq as f64);
+    }
+
+    if m == 0 {
+        return Err("no SNPs passed filtering in streaming RSVD".to_string());
+    }
+    if n == 0 {
+        return Err("no samples available for streaming RSVD".to_string());
+    }
+    if !(varsum.is_finite() && varsum > 0.0) {
+        return Err("invalid scaling denominator in streaming RSVD (varsum <= 0)".to_string());
+    }
+    check_admx_memory_limit("rsvd_stream_sample/start")?;
+
+    let k_eff = k.min(n);
+    let kp = admx_rsvd_kp(k_eff, m.max(1).min(n.max(1)));
+    let block_rows = rsvd_block_rows_env(n, m);
+    emit_rsvd_rss_debug(
+        "stream_sample/backend_ready",
+        &format!(
+            "mode=packed_session n_samples={} n_snps={} kp={} row_freq={} varsum={:.6e} total_sites={} active_row_idx={}",
+            n,
+            m,
+            kp,
+            format_f32_vec_bytes(row_freq.len()),
+            varsum,
+            backend.n_total_sites,
+            format_debug_bytes_local(
+                (backend.active_row_idx.len() * std::mem::size_of::<usize>()) as u64
+            ),
+        ),
+    );
+    emit_rsvd_rss_debug(
+        "stream_sample/omega_ready",
+        &format!(
+            "omega_mode=random_block rows={} kp={} omega_scratch={}",
+            block_rows,
+            kp,
+            format_f32_vec_bytes(block_rows * kp)
+        ),
+    );
+
+    let t_stage = Instant::now();
+    let mut y = compute_at_random_omega_packed(backend, kp, seed)?;
+    check_admx_memory_limit("rsvd_stream_sample/init_proj")?;
+    let init_proj_s = t_stage.elapsed().as_secs_f64();
+    emit_rsvd_rss_debug(
+        "stream_sample/y_ready",
+        &format!(
+            "y_shape=({}, {}) y={}",
+            n,
+            kp,
+            format_f32_vec_bytes(y.len())
+        ),
+    );
+    emit_rsvd_time_debug(
+        "stream_sample/init_proj",
+        &format!("elapsed={}", fmt_stage_secs(init_proj_s)),
+    );
+
+    let t_stage = Instant::now();
+    let (mut q, _, _) = thin_svd_from_tall(&y, n, kp)?;
+    check_admx_memory_limit("rsvd_stream_sample/init_q")?;
+    let init_q_s = t_stage.elapsed().as_secs_f64();
+    emit_rsvd_rss_debug(
+        "stream_sample/q_ready",
+        &format!(
+            "q_shape=({}, {}) q={}",
+            n,
+            kp,
+            format_f32_vec_bytes(q.len())
+        ),
+    );
+    emit_rsvd_time_debug(
+        "stream_sample/init_q",
+        &format!("elapsed={}", fmt_stage_secs(init_q_s)),
+    );
+
+    let mut sk = vec![0.0_f32; kp];
+    let mut alpha = 0.0_f32;
+    let mut power_mul_s = 0.0_f64;
+    let mut power_mul_decode_s = 0.0_f64;
+    let mut power_mul_gemm_s = 0.0_f64;
+    let mut power_qr_s = 0.0_f64;
+    let mut power_iters_done = 0usize;
+    let measure_kernel_timing = rsvd_time_debug_enabled();
+    for it in 0..power {
+        check_admx_memory_limit("rsvd_stream_sample/power_start")?;
+        let t_power_mul = Instant::now();
+        let mut kernel_timing = RsvdKernelTiming::default();
+        y = compute_ata_omega_packed(
+            backend,
+            &q,
+            kp,
+            if measure_kernel_timing {
+                Some(&mut kernel_timing)
+            } else {
+                None
+            },
+        )?;
+        power_mul_s += t_power_mul.elapsed().as_secs_f64();
+        power_mul_decode_s += kernel_timing.decode_s;
+        power_mul_gemm_s += kernel_timing.gemm_s;
+        for idx in 0..(n * kp) {
+            y[idx] -= alpha * q[idx];
+        }
+        let t_power_qr = Instant::now();
+        let (q_new, s_y, _) = thin_svd_from_tall(&y, n, kp)?;
+        check_admx_memory_limit("rsvd_stream_sample/power_qr")?;
+        power_qr_s += t_power_qr.elapsed().as_secs_f64();
+        q = q_new;
+        power_iters_done = it + 1;
+
+        if it > 0 {
+            let mut max_rel = 0.0_f32;
+            for i in 0..k_eff {
+                let sk_now = s_y[i] + alpha;
+                let denom = sk_now.max(1e-12);
+                let rel = ((sk_now - sk[i]).abs()) / denom;
+                if rel > max_rel {
+                    max_rel = rel;
+                }
+                sk[i] = sk_now;
+            }
+            if max_rel < tol {
+                break;
+            }
+        } else {
+            for i in 0..kp {
+                sk[i] = s_y[i] + alpha;
+            }
+        }
+
+        let tail = s_y[kp - 1];
+        if alpha < tail {
+            alpha = 0.5 * (alpha + tail);
+        }
+    }
+
+    let t_stage = Instant::now();
+    let gram = compute_gram_aq_packed(backend, &q, kp)?;
+    check_admx_memory_limit("rsvd_stream_sample/gram")?;
+    let gram_s = t_stage.elapsed().as_secs_f64();
+    emit_rsvd_rss_debug(
+        "stream_sample/gram_ready",
+        &format!(
+            "gram_shape=({}, {}) gram={}",
+            kp,
+            kp,
+            format_debug_bytes_local(
+                (gram.len().saturating_mul(std::mem::size_of::<f64>())) as u64
+            ),
+        ),
+    );
+    emit_rsvd_time_debug(
+        "stream_sample/gram",
+        &format!("elapsed={}", fmt_stage_secs(gram_s)),
+    );
+
+    let t_stage = Instant::now();
+    let (s_all, v_small) = rsvd_right_singular_from_gram(&gram, kp)?;
+    let eig_s = t_stage.elapsed().as_secs_f64();
+    let mut eigvals = vec![0.0_f32; k_eff];
+    let scale = varsum as f32;
+    for i in 0..k_eff {
+        eigvals[i] = (s_all[i] * s_all[i]) / scale;
+    }
+
+    let t_stage = Instant::now();
+    let mut eigvecs_sample = vec![0.0_f32; n * k_eff];
+    for r in 0..n {
+        let q_row = &q[r * kp..(r + 1) * kp];
+        let out_row = &mut eigvecs_sample[r * k_eff..(r + 1) * k_eff];
+        for c in 0..k_eff {
+            let mut acc = 0.0_f64;
+            for t in 0..kp {
+                acc += (q_row[t] as f64) * (v_small[t * kp + c] as f64);
+            }
+            out_row[c] = acc as f32;
+        }
+    }
+    let final_vec_s = t_stage.elapsed().as_secs_f64();
+    emit_rsvd_rss_debug(
+        "stream_sample/final_ready",
+        &format!(
+            "eigvals={} eigvecs_shape=({}, {}) eigvecs={}",
+            format_f32_vec_bytes(eigvals.len()),
+            n,
+            k_eff,
+            format_f32_vec_bytes(eigvecs_sample.len()),
+        ),
+    );
+    let total_s = t_total.elapsed().as_secs_f64();
+    emit_rsvd_time_debug(
+        "stream_sample/summary",
+        &format!(
+            "total={} backend={} init_proj={} init_q={} power_mul={} power_mul_decode={} power_mul_gemm={} power_qr={} gram={} eig={} final_vec={} power_iters={} block_rows={}",
+            fmt_stage_secs(total_s),
+            fmt_stage_secs(0.0),
+            fmt_stage_secs(init_proj_s),
+            fmt_stage_secs(init_q_s),
+            fmt_stage_secs(power_mul_s),
+            fmt_stage_secs(power_mul_decode_s),
+            fmt_stage_secs(power_mul_gemm_s),
+            fmt_stage_secs(power_qr_s),
+            fmt_stage_secs(gram_s),
+            fmt_stage_secs(eig_s),
+            fmt_stage_secs(final_vec_s),
+            power_iters_done,
+            block_rows,
+        ),
+    );
+    Ok((eigvals, eigvecs_sample))
+}
+
+fn rsvd_stream_sample_packed_fold_impl(
+    backend: &PackedBedRsvd,
+    row_freq_train: &[f32],
+    k: usize,
+    seed: u64,
+    power: usize,
+    tol: f32,
+    fold_id_keepout: usize,
+    folds: usize,
+    cv_seed: u64,
+) -> Result<(Vec<f32>, Vec<f32>), String> {
+    validate_cv_folds(folds)?;
+    if fold_id_keepout >= folds {
+        return Err(format!(
+            "fold_id must be within [0, {}), got {fold_id_keepout}",
+            folds
+        ));
+    }
+    if k == 0 {
+        return Err("k must be > 0".to_string());
+    }
+    if !(tol.is_finite() && tol > 0.0) {
+        return Err("tol must be positive and finite".to_string());
+    }
+
+    let t_total = Instant::now();
+    let n = backend.n_samples;
+    let m = backend.n_snps;
+    if row_freq_train.len() != m {
+        return Err(format!(
+            "row_freq_train length mismatch: got {}, expected {m}",
+            row_freq_train.len()
+        ));
+    }
+
+    let mut varsum = 0.0_f64;
+    for &freq in row_freq_train.iter() {
+        varsum += 2.0_f64 * (freq as f64) * (1.0_f64 - freq as f64);
+    }
+    if m == 0 {
+        return Err("no SNPs passed filtering in streaming RSVD".to_string());
+    }
+    if n == 0 {
+        return Err("no samples available for streaming RSVD".to_string());
+    }
+    if !(varsum.is_finite() && varsum > 0.0) {
+        return Err(
+            "invalid scaling denominator in masked streaming RSVD (varsum <= 0)".to_string(),
+        );
+    }
+    check_admx_memory_limit("rsvd_stream_sample_fold/start")?;
+
+    let k_eff = k.min(n);
+    let kp = admx_rsvd_kp(k_eff, m.max(1).min(n.max(1)));
+    let block_rows = rsvd_block_rows_env(n, m);
+    let mut y = compute_at_random_omega_packed_fold_impl(
+        backend,
+        row_freq_train,
+        kp,
+        seed,
+        fold_id_keepout,
+        folds,
+        cv_seed,
+    )?;
+    check_admx_memory_limit("rsvd_stream_sample_fold/init_proj")?;
+    let init_proj_s = t_total.elapsed().as_secs_f64();
+    let (mut q, _, _) = thin_svd_from_tall(&y, n, kp)?;
+    check_admx_memory_limit("rsvd_stream_sample_fold/init_q")?;
+    let init_q_s = t_total.elapsed().as_secs_f64() - init_proj_s;
+
+    let mut sk = vec![0.0_f32; kp];
+    let mut alpha = 0.0_f32;
+    let mut power_mul_s = 0.0_f64;
+    let mut power_mul_decode_s = 0.0_f64;
+    let mut power_mul_gemm_s = 0.0_f64;
+    let mut power_qr_s = 0.0_f64;
+    let mut power_iters_done = 0usize;
+    let measure_kernel_timing = rsvd_time_debug_enabled();
+    for it in 0..power {
+        check_admx_memory_limit("rsvd_stream_sample_fold/power_start")?;
+        let t_power_mul = Instant::now();
+        let mut kernel_timing = RsvdKernelTiming::default();
+        y = compute_ata_omega_packed_fold_impl(
+            backend,
+            row_freq_train,
+            &q,
+            kp,
+            fold_id_keepout,
+            folds,
+            cv_seed,
+            if measure_kernel_timing {
+                Some(&mut kernel_timing)
+            } else {
+                None
+            },
+        )?;
+        power_mul_s += t_power_mul.elapsed().as_secs_f64();
+        power_mul_decode_s += kernel_timing.decode_s;
+        power_mul_gemm_s += kernel_timing.gemm_s;
+        for idx in 0..(n * kp) {
+            y[idx] -= alpha * q[idx];
+        }
+        let t_power_qr = Instant::now();
+        let (q_new, s_y, _) = thin_svd_from_tall(&y, n, kp)?;
+        check_admx_memory_limit("rsvd_stream_sample_fold/power_qr")?;
+        power_qr_s += t_power_qr.elapsed().as_secs_f64();
+        q = q_new;
+        power_iters_done = it + 1;
+
+        if it > 0 {
+            let mut max_rel = 0.0_f32;
+            for i in 0..k_eff {
+                let sk_now = s_y[i] + alpha;
+                let denom = sk_now.max(1e-12);
+                let rel = ((sk_now - sk[i]).abs()) / denom;
+                if rel > max_rel {
+                    max_rel = rel;
+                }
+                sk[i] = sk_now;
+            }
+            if max_rel < tol {
+                break;
+            }
+        } else {
+            for i in 0..kp {
+                sk[i] = s_y[i] + alpha;
+            }
+        }
+
+        let tail = s_y[kp - 1];
+        if alpha < tail {
+            alpha = 0.5 * (alpha + tail);
+        }
+    }
+
+    let gram = compute_gram_aq_packed_fold_impl(
+        backend,
+        row_freq_train,
+        &q,
+        kp,
+        fold_id_keepout,
+        folds,
+        cv_seed,
+    )?;
+    check_admx_memory_limit("rsvd_stream_sample_fold/gram")?;
+    let gram_s =
+        t_total.elapsed().as_secs_f64() - init_proj_s - init_q_s - power_mul_s - power_qr_s;
+    let (s_all, v_small) = rsvd_right_singular_from_gram(&gram, kp)?;
+    let mut eigvals = vec![0.0_f32; k_eff];
+    let scale = varsum as f32;
+    for i in 0..k_eff {
+        eigvals[i] = (s_all[i] * s_all[i]) / scale;
+    }
+
+    let mut eigvecs_sample = vec![0.0_f32; n * k_eff];
+    for r in 0..n {
+        let q_row = &q[r * kp..(r + 1) * kp];
+        let out_row = &mut eigvecs_sample[r * k_eff..(r + 1) * k_eff];
+        for c in 0..k_eff {
+            let mut acc = 0.0_f64;
+            for t in 0..kp {
+                acc += (q_row[t] as f64) * (v_small[t * kp + c] as f64);
+            }
+            out_row[c] = acc as f32;
+        }
+    }
+
+    let total_s = t_total.elapsed().as_secs_f64();
+    emit_rsvd_time_debug(
+        "stream_sample_fold/summary",
+        &format!(
+            "total={} init_proj={} init_q={} power_mul={} power_mul_decode={} power_mul_gemm={} power_qr={} gram={} power_iters={} block_rows={} fold={}/{}",
+            fmt_stage_secs(total_s),
+            fmt_stage_secs(init_proj_s),
+            fmt_stage_secs(init_q_s),
+            fmt_stage_secs(power_mul_s),
+            fmt_stage_secs(power_mul_decode_s),
+            fmt_stage_secs(power_mul_gemm_s),
+            fmt_stage_secs(power_qr_s),
+            fmt_stage_secs(gram_s.max(0.0)),
+            power_iters_done,
+            block_rows,
+            fold_id_keepout + 1,
+            folds,
+        ),
+    );
+    Ok((eigvals, eigvecs_sample))
+}
+
+fn multiply_a_omega_packed_checked_impl(
+    backend: &PackedBedRsvd,
+    omega: &[f32],
+    n: usize,
+    kp: usize,
+    row_freq_len: usize,
+) -> Result<Vec<f32>, String> {
+    if n == 0 || kp == 0 {
+        return Err("omega must be a non-empty 2D matrix with shape (n_samples, k)".to_string());
+    }
+    if backend.n_samples != n {
+        return Err(format!(
+            "omega sample dimension mismatch: got {n}, expected {}",
+            backend.n_samples
+        ));
+    }
+    if backend.n_snps != row_freq_len {
+        return Err(format!(
+            "row_freq length mismatch: got {}, expected {}",
+            row_freq_len, backend.n_snps
+        ));
+    }
+    compute_a_omega_packed(backend, omega, kp)
+}
+
+fn loglikelihood_packed_checked_impl(
+    backend: &PackedBedRsvd,
+    p: &ArrayView2<'_, f32>,
+    q: &ArrayView2<'_, f32>,
+) -> Result<f64, String> {
+    let (m, k) = p.dim();
+    let (n, k2) = q.dim();
+    if k != k2 {
+        return Err(format!(
+            "P/Q K mismatch: p=({}, {}), q=({}, {})",
+            m, k, n, k2
+        ));
+    }
+    if backend.n_snps != m || backend.n_samples != n {
+        return Err(format!(
+            "shape mismatch: expected P=({}, {}), Q=({}, {}), got P=({}, {}), Q=({}, {})",
+            backend.n_snps, k, backend.n_samples, k, m, k, n, k2
+        ));
+    }
+    let p_s = p
+        .as_slice()
+        .ok_or_else(|| "P is not contiguous".to_string())?;
+    let q_s = q
+        .as_slice()
+        .ok_or_else(|| "Q is not contiguous".to_string())?;
+    Ok(loglikelihood_packed_f32_impl(backend, p_s, q_s, k))
+}
+
+fn symmetric_pinv_f32(mat: &[f32], k: usize) -> Result<Vec<f32>, String> {
+    if k == 0 || mat.len() != k * k {
+        return Err(format!(
+            "invalid square matrix for pseudo-inverse: len={}, k={k}",
+            mat.len()
+        ));
+    }
+    let mat64: Vec<f64> = mat.iter().map(|&v| v as f64).collect();
+    let eig = SymmetricEigen::new(DMatrix::from_row_slice(k, k, &mat64));
+    let max_eval = eig
+        .eigenvalues
+        .iter()
+        .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+    let cutoff = (max_eval * 1e-12_f64).max(1e-12_f64);
+    let mut inv = vec![0.0_f32; k * k];
+    for ev_idx in 0..k {
+        let eval = eig.eigenvalues[ev_idx];
+        if !eval.is_finite() || eval.abs() <= cutoff {
+            continue;
+        }
+        let inv_eval = 1.0_f64 / eval;
+        for r in 0..k {
+            let vr = eig.eigenvectors[(r, ev_idx)];
+            for c in 0..k {
+                inv[r * k + c] += (vr * eig.eigenvectors[(c, ev_idx)] * inv_eval) as f32;
+            }
+        }
+    }
+    Ok(inv)
+}
+
+fn gram_xtx_f32(x: &[f32], rows: usize, k: usize) -> Result<Vec<f32>, String> {
+    if rows == 0 || k == 0 || x.len() != rows * k {
+        return Err(format!(
+            "invalid matrix for X^T X: len={}, expected={}",
+            x.len(),
+            rows.saturating_mul(k)
+        ));
+    }
+    let rows_i = checked_cblas_dim_local(rows, "rows")?;
+    let k_i = checked_cblas_dim_local(k, "k")?;
+    let mut out = vec![0.0_f32; k * k];
+    let _blas_guard = BlasThreadGuard::enter(rayon::current_num_threads().max(1));
+    unsafe {
+        cblas_sgemm_dispatch(
+            CBLAS_ROW_MAJOR,
+            CBLAS_TRANS,
+            CBLAS_NO_TRANS,
+            k_i,
+            k_i,
+            rows_i,
+            1.0_f32,
+            x.as_ptr(),
+            k_i,
+            x.as_ptr(),
+            k_i,
+            0.0_f32,
+            out.as_mut_ptr(),
+            k_i,
+        );
+    }
+    Ok(out)
+}
+
+fn matmul_rowmajor_f32(
+    a: &[f32],
+    rows_a: usize,
+    cols_a: usize,
+    b: &[f32],
+    cols_b: usize,
+) -> Result<Vec<f32>, String> {
+    if rows_a == 0 || cols_a == 0 || cols_b == 0 {
+        return Err("invalid empty matrix for matmul".to_string());
+    }
+    if a.len() != rows_a * cols_a || b.len() != cols_a * cols_b {
+        return Err(format!(
+            "matmul shape mismatch: A len={} expected={}, B len={} expected={}",
+            a.len(),
+            rows_a.saturating_mul(cols_a),
+            b.len(),
+            cols_a.saturating_mul(cols_b)
+        ));
+    }
+    let rows_i = checked_cblas_dim_local(rows_a, "rows_a")?;
+    let cols_a_i = checked_cblas_dim_local(cols_a, "cols_a")?;
+    let cols_b_i = checked_cblas_dim_local(cols_b, "cols_b")?;
+    let mut out = vec![0.0_f32; rows_a * cols_b];
+    let _blas_guard = BlasThreadGuard::enter(rayon::current_num_threads().max(1));
+    unsafe {
+        cblas_sgemm_dispatch(
+            CBLAS_ROW_MAJOR,
+            CBLAS_NO_TRANS,
+            CBLAS_NO_TRANS,
+            rows_i,
+            cols_b_i,
+            cols_a_i,
+            1.0_f32,
+            a.as_ptr(),
+            cols_a_i,
+            b.as_ptr(),
+            cols_b_i,
+            0.0_f32,
+            out.as_mut_ptr(),
+            cols_b_i,
+        );
+    }
+    Ok(out)
+}
+
+fn matmul_at_b_f32(a: &[f32], b: &[f32], rows: usize, k: usize) -> Result<Vec<f32>, String> {
+    if rows == 0 || k == 0 || a.len() != rows * k || b.len() != rows * k {
+        return Err(format!(
+            "invalid matrices for A^T B: A len={}, B len={}, expected={}",
+            a.len(),
+            b.len(),
+            rows.saturating_mul(k)
+        ));
+    }
+    let rows_i = checked_cblas_dim_local(rows, "rows")?;
+    let k_i = checked_cblas_dim_local(k, "k")?;
+    let mut out = vec![0.0_f32; k * k];
+    let _blas_guard = BlasThreadGuard::enter(rayon::current_num_threads().max(1));
+    unsafe {
+        cblas_sgemm_dispatch(
+            CBLAS_ROW_MAJOR,
+            CBLAS_TRANS,
+            CBLAS_NO_TRANS,
+            k_i,
+            k_i,
+            rows_i,
+            1.0_f32,
+            a.as_ptr(),
+            k_i,
+            b.as_ptr(),
+            k_i,
+            0.0_f32,
+            out.as_mut_ptr(),
+            k_i,
+        );
+    }
+    Ok(out)
+}
+
+fn right_multiply_pinv_f32(x: &[f32], rows: usize, k: usize, reg: f32) -> Result<Vec<f32>, String> {
+    let mut gram = gram_xtx_f32(x, rows, k)?;
+    for d in 0..k {
+        gram[d * k + d] += reg;
+    }
+    let pinv = symmetric_pinv_f32(&gram, k)?;
+    matmul_rowmajor_f32(x, rows, k, &pinv, k)
+}
+
+fn map_q_rows_inplace_f32(q: &mut [f32], n: usize, k: usize) {
+    q.par_chunks_mut(k).take(n).for_each(|row| {
+        let mut sum = 0.0_f32;
+        for v in row.iter_mut() {
+            *v = clip32(*v);
+            sum += *v;
+        }
+        if sum <= 0.0_f32 || !sum.is_finite() {
+            let v = 1.0_f32 / (k as f32).max(1.0_f32);
+            row.fill(v);
+        } else {
+            for v in row.iter_mut() {
+                *v /= sum;
+            }
+        }
+    });
+}
+
+fn map_p_rows_inplace_f32(p: &mut [f32]) {
+    p.par_iter_mut().for_each(|v| {
+        *v = clip32(*v);
+    });
+}
+
+fn weighted_colsums_f32(x: &[f32], weights: &[f32], rows: usize, k: usize) -> Vec<f32> {
+    (0..rows)
+        .into_par_iter()
+        .fold(
+            || vec![0.0_f32; k],
+            |mut acc, r| {
+                let w = weights[r];
+                let row = &x[r * k..(r + 1) * k];
+                for j in 0..k {
+                    acc[j] += row[j] * w;
+                }
+                acc
+            },
+        )
+        .reduce(
+            || vec![0.0_f32; k],
+            |mut a, b| {
+                for j in 0..k {
+                    a[j] += b[j];
+                }
+                a
+            },
+        )
+}
+
+fn colsums_f32(x: &[f32], rows: usize, k: usize) -> Vec<f32> {
+    (0..rows)
+        .into_par_iter()
+        .fold(
+            || vec![0.0_f32; k],
+            |mut acc, r| {
+                let row = &x[r * k..(r + 1) * k];
+                for j in 0..k {
+                    acc[j] += row[j];
+                }
+                acc
+            },
+        )
+        .reduce(
+            || vec![0.0_f32; k],
+            |mut a, b| {
+                for j in 0..k {
+                    a[j] += b[j];
+                }
+                a
+            },
+        )
+}
+
+fn rmse_slices_f32(a: &[f32], b: &[f32]) -> Result<f32, String> {
+    if a.len() != b.len() {
+        return Err(format!(
+            "RMSE shape mismatch: len(a)={}, len(b)={}",
+            a.len(),
+            b.len()
+        ));
+    }
+    if a.is_empty() {
+        return Ok(0.0_f32);
+    }
+    let acc: f64 = a
+        .par_iter()
+        .zip(b.par_iter())
+        .map(|(&x, &y)| {
+            let d = (x - y) as f64;
+            d * d
+        })
+        .sum();
+    Ok(((acc / a.len() as f64) as f32).sqrt())
+}
+
+fn compute_q_from_p_projection_f32(
+    z: &[f32],
+    v: &[f32],
+    row_freq: &[f32],
+    i_mat: &[f32],
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Result<Vec<f32>, String> {
+    let zt_i = matmul_at_b_f32(z, i_mat, m, k)?;
+    let mut q = matmul_rowmajor_f32(v, n, k, &zt_i, k)?;
+    let fsum = weighted_colsums_f32(i_mat, row_freq, m, k);
+    q.par_chunks_mut(k).for_each(|row| {
+        for j in 0..k {
+            row[j] = 0.5_f32 * row[j] + fsum[j];
+        }
+    });
+    map_q_rows_inplace_f32(&mut q, n, k);
+    Ok(q)
+}
+
+fn compute_p_from_q_projection_f32(
+    z: &[f32],
+    v: &[f32],
+    row_freq: &[f32],
+    i_mat: &[f32],
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Result<Vec<f32>, String> {
+    let vt_i = matmul_at_b_f32(v, i_mat, n, k)?;
+    let mut p = matmul_rowmajor_f32(z, m, k, &vt_i, k)?;
+    let isum = colsums_f32(i_mat, n, k);
+    p.par_chunks_mut(k).enumerate().for_each(|(i, row)| {
+        let f = row_freq[i];
+        for j in 0..k {
+            row[j] = clip32(0.5_f32 * row[j] + f * isum[j]);
+        }
+    });
+    Ok(p)
+}
+
+fn adam_seed_init_rust(m: usize, n: usize, k: usize, seed: u64) -> (Vec<f32>, Vec<f32>) {
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut p = vec![0.0_f32; m * k];
+    for v in p.iter_mut() {
+        *v = clip32(rng.random::<f32>());
+    }
+    let mut q = vec![0.0_f32; n * k];
+    for v in q.iter_mut() {
+        *v = clip32(rng.random::<f32>());
+    }
+    map_q_rows_inplace_f32(&mut q, n, k);
+    (p, q)
+}
+
+fn als_init_packed_session_impl(
+    backend: &PackedBedRsvd,
+    z: &[f32],
+    v: &[f32],
+    seed: u64,
+    k: usize,
+    max_iter: usize,
+    tol: f32,
+    reg: f32,
+) -> Result<(Vec<f32>, Vec<f32>, f64, usize), String> {
+    let m = backend.n_snps;
+    let n = backend.n_samples;
+    if m == 0 || n == 0 || k == 0 {
+        return Err("invalid empty matrix for BED training session ALS".to_string());
+    }
+    if z.len() != m * k || v.len() != n * k || backend.row_freq.len() != m {
+        return Err(format!(
+            "ALS shape mismatch: z={}, expected {}; v={}, expected {}; row_freq={}, expected {m}",
+            z.len(),
+            m.saturating_mul(k),
+            v.len(),
+            n.saturating_mul(k),
+            backend.row_freq.len()
+        ));
+    }
+    let (mut p, _) = adam_seed_init_rust(m, n, k, seed);
+    let mut i_mat = right_multiply_pinv_f32(&p, m, k, reg)?;
+    let mut q = compute_q_from_p_projection_f32(z, v, &backend.row_freq, &i_mat, m, n, k)?;
+    let mut q_prev = q.clone();
+    let mut rmse_best = f32::INFINITY;
+    let mut stall_counter = 0usize;
+    let mut high_corr = false;
+    let mut p_best: Option<Vec<f32>> = None;
+    let mut q_best: Option<Vec<f32>> = None;
+    let mut last_iter = 0usize;
+    check_admx_memory_limit("als_init/start")?;
+
+    for it in 0..max_iter {
+        check_admx_memory_limit("als_init/iter_start")?;
+        last_iter = it + 1;
+        let i_q = right_multiply_pinv_f32(&q, n, k, reg)?;
+        p = compute_p_from_q_projection_f32(z, v, &backend.row_freq, &i_q, m, n, k)?;
+        map_p_rows_inplace_f32(&mut p);
+
+        let g_p = gram_xtx_f32(&p, m, k)?;
+        i_mat = {
+            let mut g_reg = g_p.clone();
+            for d in 0..k {
+                g_reg[d * k + d] += reg;
+            }
+            let pinv = symmetric_pinv_f32(&g_reg, k)?;
+            matmul_rowmajor_f32(&p, m, k, &pinv, k)?
+        };
+        q = compute_q_from_p_projection_f32(z, v, &backend.row_freq, &i_mat, m, n, k)?;
+
+        let rmse_err = rmse_slices_f32(&q, &q_prev)?;
+        if !high_corr {
+            let mut max_corr = 0.0_f32;
+            for a in 0..k {
+                let va = g_p[a * k + a].max(1e-12_f32).sqrt();
+                for b in 0..k {
+                    if a == b {
+                        continue;
+                    }
+                    let vb = g_p[b * k + b].max(1e-12_f32).sqrt();
+                    let denom = (va * vb).max(1e-10_f32);
+                    max_corr = max_corr.max((g_p[a * k + b] / denom).abs());
+                }
+            }
+            if max_corr > 0.95_f32 {
+                high_corr = true;
+            }
+        }
+
+        if high_corr {
+            if rmse_err < rmse_best {
+                rmse_best = rmse_err;
+                p_best = Some(p.clone());
+                q_best = Some(q.clone());
+                stall_counter = 0;
+            } else {
+                stall_counter += 1;
+            }
+            if stall_counter >= 20 {
+                if let (Some(pb), Some(qb)) = (p_best.take(), q_best.take()) {
+                    p = pb;
+                    q = qb;
+                }
+                break;
+            }
+        }
+
+        if rmse_err < tol {
+            break;
+        }
+        q_prev.copy_from_slice(&q);
+    }
+
+    let init_ll = loglikelihood_packed_f32_impl(backend, &p, &q, k);
+    check_admx_memory_limit("als_init/done")?;
+    Ok((p, q, init_ll, last_iter))
+}
+
+fn fit_admx_bed_training_session_impl(
+    backend: &PackedBedRsvd,
+    k: usize,
+    seed: u64,
+    solver: &str,
+    power: usize,
+    tol: f32,
+    max_als: usize,
+    reg_als: f32,
+    lr: f32,
+    beta1: f32,
+    beta2: f32,
+    epsilon: f32,
+    max_iter: usize,
+    check_every: usize,
+    lr_decay: f32,
+    min_lr: f32,
+) -> Result<AdmxBedFitResult, String> {
+    let m = backend.n_snps;
+    let n = backend.n_samples;
+    if m == 0 || n == 0 || k == 0 {
+        return Err("invalid empty input for BED training session".to_string());
+    }
+    let solver_norm = solver.trim().to_ascii_lowercase();
+    let solver_mode = if solver_norm == "adam" {
+        "adam"
+    } else {
+        "adam-em"
+    };
+    emit_rsvd_rss_debug(
+        "train_session/start",
+        &format!(
+            "n_snps={} n_samples={} k={} solver={}",
+            m, n, k, solver_mode
+        ),
+    );
+
+    let (mut p, mut q, init_ll, als_iter) = if solver_mode == "adam" {
+        let (p0, q0) = adam_seed_init_rust(m, n, k, seed);
+        (p0, q0, f64::NAN, 0usize)
+    } else {
+        let (_eigvals, v) = rsvd_stream_sample_packed_impl(backend, k, seed, power, tol)?;
+        check_admx_memory_limit("train_session/after_rsvd")?;
+        let k_eff = if n == 0 { 0 } else { k.min(n) };
+        if k_eff != k {
+            return Err(format!(
+                "K={k} exceeds sample-side RSVD rank {k_eff}; reduce K or use dense fallback"
+            ));
+        }
+        let z = multiply_a_omega_packed_checked_impl(backend, &v, n, k, m)?;
+        check_admx_memory_limit("train_session/after_z")?;
+        als_init_packed_session_impl(backend, &z, &v, seed, k, max_als, tol, reg_als)?
+    };
+
+    emit_rsvd_rss_debug(
+        "train_session/adam_start",
+        &format!(
+            "p={} q={} max_iter={} check_every={}",
+            format_f32_vec_bytes(p.len()),
+            format_f32_vec_bytes(q.len()),
+            max_iter,
+            check_every.max(1)
+        ),
+    );
+    let (ll_final, adam_iter) = adam_optimize_packed_inplace_impl(
+        backend,
+        &mut p,
+        &mut q,
+        m,
+        n,
+        k,
+        lr,
+        beta1,
+        beta2,
+        epsilon,
+        max_iter,
+        check_every,
+        lr_decay,
+        min_lr,
+    )?;
+    emit_rsvd_rss_debug(
+        "train_session/done",
+        &format!("ll={:.3} adam_iter={}", ll_final, adam_iter),
+    );
+    Ok(AdmxBedFitResult {
+        p,
+        q,
+        ll_final,
+        adam_iter,
+        init_ll,
+        als_iter,
+    })
+}
+
+fn loglikelihood_packed_train_fold_f32_impl(
+    backend: &PackedBedRsvd,
+    p: &[f32],
+    q: &[f32],
+    k: usize,
+    fold_id_keepout: usize,
+    folds: usize,
+    cv_seed: u64,
+) -> f64 {
+    let n = backend.n_samples;
+    let full_bytes = n / 4;
+    let rem = n % 4;
+    let byte_lut = packed_byte_lut();
+    (0..backend.n_snps)
+        .into_par_iter()
+        .map(|i| {
+            let row = packed_backend_row_slice(backend, i);
+            let p_row = &p[i * k..(i + 1) * k];
+            let flip = backend.row_flip[i];
+            let row_offset = (i as u64) * (n as u64);
+            let mut part = 0.0_f64;
+            let mut col = 0usize;
+            for &packed in row.iter().take(full_bytes) {
+                let codes = &byte_lut.code4[packed as usize];
+                for &code in codes.iter() {
+                    if let Some(gv_f32) = packed_code_minor_allele_g(code, flip) {
+                        if cv_fold_id(row_offset + (col as u64), folds, cv_seed) != fold_id_keepout
+                        {
+                            let q_row = &q[col * k..(col + 1) * k];
+                            let mut rec = 0.0_f32;
+                            for kk in 0..k {
+                                rec += p_row[kk] * q_row[kk];
+                            }
+                            let rec = rec.clamp(1e-6, 1.0 - 1e-6) as f64;
+                            let gv = gv_f32 as f64;
+                            part += gv * rec.ln() + (2.0 - gv) * (1.0 - rec).ln();
+                        }
+                    }
+                    col += 1;
+                }
+            }
+            if rem > 0 {
+                let codes = &byte_lut.code4[row[full_bytes] as usize];
+                for &code in codes.iter().take(rem) {
+                    if let Some(gv_f32) = packed_code_minor_allele_g(code, flip) {
+                        if cv_fold_id(row_offset + (col as u64), folds, cv_seed) != fold_id_keepout
+                        {
+                            let q_row = &q[col * k..(col + 1) * k];
+                            let mut rec = 0.0_f32;
+                            for kk in 0..k {
+                                rec += p_row[kk] * q_row[kk];
+                            }
+                            let rec = rec.clamp(1e-6, 1.0 - 1e-6) as f64;
+                            let gv = gv_f32 as f64;
+                            part += gv * rec.ln() + (2.0 - gv) * (1.0 - rec).ln();
+                        }
+                    }
+                    col += 1;
+                }
+            }
+            part
+        })
+        .sum()
+}
+
+fn holdout_nll_packed_fold_f32_impl(
+    backend: &PackedBedRsvd,
+    p: &[f32],
+    q: &[f32],
+    k: usize,
+    fold_id_keepout: usize,
+    folds: usize,
+    cv_seed: u64,
+) -> (f64, usize) {
+    let n = backend.n_samples;
+    let full_bytes = n / 4;
+    let rem = n % 4;
+    let byte_lut = packed_byte_lut();
+    let ln2 = 2.0_f64.ln();
+    (0..backend.n_snps)
+        .into_par_iter()
+        .map(|i| {
+            let row = packed_backend_row_slice(backend, i);
+            let p_row = &p[i * k..(i + 1) * k];
+            let flip = backend.row_flip[i];
+            let row_offset = (i as u64) * (n as u64);
+            let mut ll_sum = 0.0_f64;
+            let mut n_sum = 0usize;
+            let mut col = 0usize;
+            for &packed in row.iter().take(full_bytes) {
+                let codes = &byte_lut.code4[packed as usize];
+                for &code in codes.iter() {
+                    if let Some(gv_f32) = packed_code_minor_allele_g(code, flip) {
+                        if cv_fold_id(row_offset + (col as u64), folds, cv_seed) == fold_id_keepout
+                        {
+                            let q_row = &q[col * k..(col + 1) * k];
+                            let mut rec = 0.0_f32;
+                            for kk in 0..k {
+                                rec += p_row[kk] * q_row[kk];
+                            }
+                            let rec = rec.clamp(1e-8, 1.0 - 1e-8) as f64;
+                            let gv = gv_f32 as f64;
+                            let log_comb = if (gv - 1.0_f64).abs() < f64::EPSILON {
+                                ln2
+                            } else {
+                                0.0_f64
+                            };
+                            ll_sum += log_comb + gv * rec.ln() + (2.0 - gv) * (1.0 - rec).ln();
+                            n_sum += 1;
+                        }
+                    }
+                    col += 1;
+                }
+            }
+            if rem > 0 {
+                let codes = &byte_lut.code4[row[full_bytes] as usize];
+                for &code in codes.iter().take(rem) {
+                    if let Some(gv_f32) = packed_code_minor_allele_g(code, flip) {
+                        if cv_fold_id(row_offset + (col as u64), folds, cv_seed) == fold_id_keepout
+                        {
+                            let q_row = &q[col * k..(col + 1) * k];
+                            let mut rec = 0.0_f32;
+                            for kk in 0..k {
+                                rec += p_row[kk] * q_row[kk];
+                            }
+                            let rec = rec.clamp(1e-8, 1.0 - 1e-8) as f64;
+                            let gv = gv_f32 as f64;
+                            let log_comb = if (gv - 1.0_f64).abs() < f64::EPSILON {
+                                ln2
+                            } else {
+                                0.0_f64
+                            };
+                            ll_sum += log_comb + gv * rec.ln() + (2.0 - gv) * (1.0 - rec).ln();
+                            n_sum += 1;
+                        }
+                    }
+                    col += 1;
+                }
+            }
+            (ll_sum, n_sum)
+        })
+        .reduce(
+            || (0.0_f64, 0usize),
+            |(ll_a, n_a), (ll_b, n_b)| (ll_a + ll_b, n_a + n_b),
+        )
+}
+
+#[allow(dead_code)]
+fn em_step_packed_fold_f32_impl(
+    backend: &PackedBedRsvd,
+    p_src: &[f32],
+    q_src: &[f32],
+    p_em_slice: &mut [f32],
+    q_em_slice: &mut [f32],
+    q_bat: &mut [f32],
+    t_acc: &mut [f32],
+    fold_id_keepout: usize,
+    folds: usize,
+    cv_seed: u64,
+) -> Result<(), String> {
+    let m = backend.n_snps;
+    let n = backend.n_samples;
+    if m == 0 || n == 0 {
+        return Ok(());
+    }
+    if p_src.len() % m != 0 {
+        return Err("invalid P shape in masked packed EM helper".to_string());
+    }
+    let k = p_src.len() / m;
+    if q_src.len() != n * k {
+        return Err("invalid Q shape in masked packed EM helper".to_string());
+    }
+    if p_em_slice.len() != m * k || q_em_slice.len() != n * k {
+        return Err("invalid masked packed EM output buffer size".to_string());
+    }
+    if q_bat.len() != n || t_acc.len() != n * k {
+        return Err("invalid masked packed EM scratch buffer size".to_string());
+    }
+
+    let full_bytes = n / 4;
+    let rem = n % 4;
+    let byte_lut = packed_byte_lut();
+    let blocks = rayon::current_num_threads().max(1);
+    let rows_per_block = (m + blocks - 1) / blocks;
+    let chunk_elems = (rows_per_block * k).max(k);
+    let (qb_sum, ta_sum, _, _) = p_em_slice
+        .par_chunks_mut(chunk_elems)
+        .enumerate()
+        .fold(
+            || {
+                (
+                    vec![0.0_f32; n],
+                    vec![0.0_f32; n * k],
+                    vec![0.0_f32; k],
+                    vec![0.0_f32; k],
+                )
+            },
+            |(mut qb, mut ta, mut a, mut b), (chunk_idx, em_chunk)| {
+                let row_start = chunk_idx * rows_per_block;
+                let row_count = em_chunk.len() / k;
+                for r in 0..row_count {
+                    let i = row_start + r;
+                    if i >= m {
+                        break;
+                    }
+                    let row = packed_backend_row_slice(backend, i);
+                    let flip = backend.row_flip[i];
+                    let row_offset = (i as u64) * (n as u64);
+                    let p_row = &p_src[i * k..(i + 1) * k];
+                    let out_row = &mut em_chunk[r * k..(r + 1) * k];
+                    a.fill(0.0_f32);
+                    b.fill(0.0_f32);
+                    let mut col = 0usize;
+                    for &packed in row.iter().take(full_bytes) {
+                        let codes = &byte_lut.code4[packed as usize];
+                        for &code in codes.iter() {
+                            if let Some(g_f) = packed_code_minor_allele_g(code, flip) {
+                                if cv_fold_id(row_offset + (col as u64), folds, cv_seed)
+                                    != fold_id_keepout
+                                {
+                                    qb[col] += 2.0_f32;
+                                    let q_row = &q_src[col * k..(col + 1) * k];
+                                    let mut rec = 0.0_f32;
+                                    for kk in 0..k {
+                                        rec += p_row[kk] * q_row[kk];
+                                    }
+                                    rec = rec.clamp(1e-6, 1.0 - 1e-6);
+                                    let aa = g_f / rec;
+                                    let bb = (2.0_f32 - g_f) / (1.0_f32 - rec);
+                                    let t_row = &mut ta[col * k..(col + 1) * k];
+                                    for kk in 0..k {
+                                        let qv = q_row[kk];
+                                        a[kk] += qv * aa;
+                                        b[kk] += qv * bb;
+                                        t_row[kk] += p_row[kk] * (aa - bb) + bb;
+                                    }
+                                }
+                            }
+                            col += 1;
+                        }
+                    }
+                    if rem > 0 {
+                        let codes = &byte_lut.code4[row[full_bytes] as usize];
+                        for &code in codes.iter().take(rem) {
+                            if let Some(g_f) = packed_code_minor_allele_g(code, flip) {
+                                if cv_fold_id(row_offset + (col as u64), folds, cv_seed)
+                                    != fold_id_keepout
+                                {
+                                    qb[col] += 2.0_f32;
+                                    let q_row = &q_src[col * k..(col + 1) * k];
+                                    let mut rec = 0.0_f32;
+                                    for kk in 0..k {
+                                        rec += p_row[kk] * q_row[kk];
+                                    }
+                                    rec = rec.clamp(1e-6, 1.0 - 1e-6);
+                                    let aa = g_f / rec;
+                                    let bb = (2.0_f32 - g_f) / (1.0_f32 - rec);
+                                    let t_row = &mut ta[col * k..(col + 1) * k];
+                                    for kk in 0..k {
+                                        let qv = q_row[kk];
+                                        a[kk] += qv * aa;
+                                        b[kk] += qv * bb;
+                                        t_row[kk] += p_row[kk] * (aa - bb) + bb;
+                                    }
+                                }
+                            }
+                            col += 1;
+                        }
+                    }
+                    for kk in 0..k {
+                        let denom = p_row[kk] * (a[kk] - b[kk]) + b[kk];
+                        let v = if denom.abs() < 1e-8 {
+                            p_row[kk]
+                        } else {
+                            (a[kk] * p_row[kk]) / denom
+                        };
+                        out_row[kk] = clip32(v);
+                    }
+                }
+                madvise_backend_active_rows(backend, row_start, row_count);
+                (qb, ta, a, b)
+            },
+        )
+        .reduce(
+            || {
+                (
+                    vec![0.0_f32; n],
+                    vec![0.0_f32; n * k],
+                    vec![0.0_f32; k],
+                    vec![0.0_f32; k],
+                )
+            },
+            |(mut qb1, mut ta1, a1, b1), (qb2, ta2, _, _)| {
+                for col in 0..n {
+                    qb1[col] += qb2[col];
+                }
+                for idx in 0..(n * k) {
+                    ta1[idx] += ta2[idx];
+                }
+                (qb1, ta1, a1, b1)
+            },
+        );
+    q_bat.copy_from_slice(&qb_sum);
+    t_acc.copy_from_slice(&ta_sum);
+
+    q_em_slice
+        .par_chunks_mut(k)
+        .enumerate()
+        .for_each(|(col, out_row)| {
+            let q_row = &q_src[col * k..(col + 1) * k];
+            if q_bat[col] <= 0.0_f32 {
+                for kk in 0..k {
+                    out_row[kk] = clip32(q_row[kk]);
+                }
+            } else {
+                let inv = 1.0_f32 / q_bat[col];
+                let t_row = &t_acc[col * k..(col + 1) * k];
+                for kk in 0..k {
+                    out_row[kk] = clip32(q_row[kk] * t_row[kk] * inv);
+                }
+            }
+            let sum = out_row.iter().sum::<f32>();
+            if sum <= 0.0_f32 || !sum.is_finite() {
+                let v = 1.0_f32 / (k as f32).max(1.0_f32);
+                out_row.fill(v);
+            } else {
+                for kk in 0..k {
+                    out_row[kk] /= sum;
+                }
+            }
+        });
+    Ok(())
+}
+
+fn adam_optimize_packed_fold_inplace_impl(
+    backend: &PackedBedRsvd,
+    p: &mut [f32],
+    q: &mut [f32],
+    m: usize,
+    n: usize,
+    k: usize,
+    lr: f32,
+    beta1: f32,
+    beta2: f32,
+    epsilon: f32,
+    max_iter: usize,
+    check_every: usize,
+    lr_decay: f32,
+    min_lr: f32,
+    fold_id_keepout: usize,
+    folds: usize,
+    cv_seed: u64,
+) -> Result<(f64, usize), String> {
+    validate_cv_folds(folds)?;
+    if m != backend.n_snps || n != backend.n_samples {
+        return Err(format!(
+            "shape mismatch: expected P/Q rows=({}, {}), got ({}, {})",
+            backend.n_snps, backend.n_samples, m, n
+        ));
+    }
+    if m == 0 || n == 0 || k == 0 {
+        return Err("invalid empty input matrix for fold-masked BED ADAM optimization".to_string());
+    }
+    if p.len() != m * k || q.len() != n * k {
+        return Err(
+            "invalid contiguous slice length for fold-masked BED ADAM optimization".to_string(),
+        );
+    }
+
+    let mut p_best = vec![0.0_f32; m * k];
+    let mut q_best = vec![0.0_f32; n * k];
+    let mut ll_best = f64::NEG_INFINITY;
+    let mut no_improve = 0usize;
+    let mut lr_cur = lr;
+    let mut last_iter = 0usize;
+    let mut beta1_pow = 1.0_f32;
+    let mut beta2_pow = 1.0_f32;
+    let mut have_best = false;
+
+    let mut m_p = vec![0.0_f32; m * k];
+    let mut v_p = vec![0.0_f32; m * k];
+    let mut m_q = vec![0.0_f32; n * k];
+    let mut v_q = vec![0.0_f32; n * k];
+    let mut q_em = vec![0.0_f32; n * k];
+    let check_every = check_every.max(1);
+    let full_bytes = n / 4;
+    let rem = n % 4;
+    let byte_lut = packed_byte_lut();
+    let blocks = rayon::current_num_threads().max(1);
+    let rows_per_block = (m + blocks - 1) / blocks;
+    let chunk_elems = (rows_per_block * k).max(k);
+    check_admx_memory_limit("adam_fold/scratch_ready")?;
+
+    for it in 0..max_iter {
+        check_admx_memory_limit("adam_fold/iter_start")?;
+        last_iter = it + 1;
+        let one_b1 = 1.0_f32 - beta1;
+        let one_b2 = 1.0_f32 - beta2;
+        beta1_pow *= beta1;
+        beta2_pow *= beta2;
+        let m_scale = if (1.0_f32 - beta1_pow).abs() < 1e-8 {
+            1.0_f32
+        } else {
+            1.0_f32 / (1.0_f32 - beta1_pow)
+        };
+        let v_scale = if (1.0_f32 - beta2_pow).abs() < 1e-8 {
+            1.0_f32
+        } else {
+            1.0_f32 / (1.0_f32 - beta2_pow)
+        };
+
+        let (qb_sum, ta_sum, _, _) = p
+            .par_chunks_mut(chunk_elems)
+            .zip(m_p.par_chunks_mut(chunk_elems))
+            .zip(v_p.par_chunks_mut(chunk_elems))
+            .enumerate()
+            .fold(
+                || {
+                    (
+                        vec![0.0_f32; n],
+                        vec![0.0_f32; n * k],
+                        vec![0.0_f32; k],
+                        vec![0.0_f32; k],
+                    )
+                },
+                |(mut qb, mut ta, mut a, mut b), (chunk_idx, ((p_chunk, m_chunk), v_chunk))| {
+                    let row_start = chunk_idx * rows_per_block;
+                    let row_count = p_chunk.len() / k;
+                    for r in 0..row_count {
+                        let i = row_start + r;
+                        if i >= m {
+                            break;
+                        }
+                        let row = packed_backend_row_slice(backend, i);
+                        let flip = backend.row_flip[i];
+                        let row_offset = (i as u64) * (n as u64);
+                        let p_row = &mut p_chunk[r * k..(r + 1) * k];
+                        let m_row = &mut m_chunk[r * k..(r + 1) * k];
+                        let v_row = &mut v_chunk[r * k..(r + 1) * k];
+                        a.fill(0.0_f32);
+                        b.fill(0.0_f32);
+                        let mut col = 0usize;
+                        let geno_lut = if flip {
+                            [2.0_f32, -1.0_f32, 1.0_f32, 0.0_f32]
+                        } else {
+                            [0.0_f32, -1.0_f32, 1.0_f32, 2.0_f32]
+                        };
+                        for &packed in row.iter().take(full_bytes) {
+                            let codes = &byte_lut.code4[packed as usize];
+                            for &code in codes.iter() {
+                                let g_f = geno_lut[code as usize];
+                                if g_f >= 0.0_f32 {
+                                    if cv_fold_id(row_offset + (col as u64), folds, cv_seed)
+                                        != fold_id_keepout
+                                    {
+                                        qb[col] += 2.0_f32;
+                                        let q_row = &q[col * k..(col + 1) * k];
+                                        let mut rec = 0.0_f32;
+                                        for kk in 0..k {
+                                            rec += p_row[kk] * q_row[kk];
+                                        }
+                                        rec = rec.clamp(1e-6, 1.0 - 1e-6);
+                                        let aa = g_f / rec;
+                                        let bb = (2.0_f32 - g_f) / (1.0_f32 - rec);
+                                        let t_row = &mut ta[col * k..(col + 1) * k];
+                                        for kk in 0..k {
+                                            let qv = q_row[kk];
+                                            a[kk] += qv * aa;
+                                            b[kk] += qv * bb;
+                                            t_row[kk] += p_row[kk] * (aa - bb) + bb;
+                                        }
+                                    }
+                                }
+                                col += 1;
+                            }
+                        }
+                        if rem > 0 {
+                            let codes = &byte_lut.code4[row[full_bytes] as usize];
+                            for &code in codes.iter().take(rem) {
+                                let g_f = geno_lut[code as usize];
+                                if g_f >= 0.0_f32 {
+                                    if cv_fold_id(row_offset + (col as u64), folds, cv_seed)
+                                        != fold_id_keepout
+                                    {
+                                        qb[col] += 2.0_f32;
+                                        let q_row = &q[col * k..(col + 1) * k];
+                                        let mut rec = 0.0_f32;
+                                        for kk in 0..k {
+                                            rec += p_row[kk] * q_row[kk];
+                                        }
+                                        rec = rec.clamp(1e-6, 1.0 - 1e-6);
+                                        let aa = g_f / rec;
+                                        let bb = (2.0_f32 - g_f) / (1.0_f32 - rec);
+                                        let t_row = &mut ta[col * k..(col + 1) * k];
+                                        for kk in 0..k {
+                                            let qv = q_row[kk];
+                                            a[kk] += qv * aa;
+                                            b[kk] += qv * bb;
+                                            t_row[kk] += p_row[kk] * (aa - bb) + bb;
+                                        }
+                                    }
+                                }
+                                col += 1;
+                            }
+                        }
+                        for kk in 0..k {
+                            let denom = p_row[kk] * (a[kk] - b[kk]) + b[kk];
+                            let p_em = if denom.abs() < 1e-8_f32 {
+                                p_row[kk]
+                            } else {
+                                (a[kk] * p_row[kk]) / denom
+                            };
+                            let delta = p_em - p_row[kk];
+                            let mcur = beta1 * m_row[kk] + one_b1 * delta;
+                            let vcur = beta2 * v_row[kk] + one_b2 * delta * delta;
+                            let m_hat = mcur * m_scale;
+                            let v_hat = vcur * v_scale;
+                            let step = lr_cur * m_hat / (v_hat.sqrt() + epsilon);
+                            p_row[kk] = clip32(p_row[kk] + step);
+                            m_row[kk] = mcur;
+                            v_row[kk] = vcur;
+                        }
+                    }
+                    madvise_backend_active_rows(backend, row_start, row_count);
+                    (qb, ta, a, b)
+                },
+            )
+            .reduce(
+                || {
+                    (
+                        vec![0.0_f32; n],
+                        vec![0.0_f32; n * k],
+                        vec![0.0_f32; k],
+                        vec![0.0_f32; k],
+                    )
+                },
+                |(mut qb1, mut ta1, a1, b1), (qb2, ta2, _, _)| {
+                    for (dst, src) in qb1.iter_mut().zip(qb2.iter()) {
+                        *dst += *src;
+                    }
+                    for (dst, src) in ta1.iter_mut().zip(ta2.iter()) {
+                        *dst += *src;
+                    }
+                    (qb1, ta1, a1, b1)
+                },
+            );
+        q_em.par_chunks_mut(k)
+            .enumerate()
+            .for_each(|(col, out_row)| {
+                let q_row = &q[col * k..(col + 1) * k];
+                if qb_sum[col] <= 0.0_f32 {
+                    for kk in 0..k {
+                        out_row[kk] = clip32(q_row[kk]);
+                    }
+                } else {
+                    let inv = 1.0_f32 / qb_sum[col];
+                    let t_row = &ta_sum[col * k..(col + 1) * k];
+                    for kk in 0..k {
+                        out_row[kk] = clip32(q_row[kk] * t_row[kk] * inv);
+                    }
+                }
+                let sum = out_row.iter().sum::<f32>();
+                if sum <= 0.0_f32 || !sum.is_finite() {
+                    let v = 1.0_f32 / (k as f32).max(1.0_f32);
+                    out_row.fill(v);
+                } else {
+                    for kk in 0..k {
+                        out_row[kk] /= sum;
+                    }
+                }
+            });
+
+        q.par_chunks_mut(k)
+            .zip(m_q.par_chunks_mut(k))
+            .zip(v_q.par_chunks_mut(k))
+            .enumerate()
+            .for_each(|(i, ((q_row, m_row), v_row))| {
+                let base = i * k;
+                let mut sum = 0.0_f32;
+                for j in 0..k {
+                    let idx = base + j;
+                    let delta = q_em[idx] - q_row[j];
+                    let mcur = beta1 * m_row[j] + one_b1 * delta;
+                    let vcur = beta2 * v_row[j] + one_b2 * delta * delta;
+                    let m_hat = mcur * m_scale;
+                    let v_hat = vcur * v_scale;
+                    let step = lr_cur * m_hat / (v_hat.sqrt() + epsilon);
+                    let qv = clip32(q_row[j] + step);
+                    q_row[j] = qv;
+                    m_row[j] = mcur;
+                    v_row[j] = vcur;
+                    sum += qv;
+                }
+                if sum <= 0.0_f32 || !sum.is_finite() {
+                    let v = 1.0_f32 / (k as f32).max(1.0_f32);
+                    q_row.fill(v);
+                } else {
+                    for j in 0..k {
+                        q_row[j] /= sum;
+                    }
+                }
+            });
+
+        if last_iter % check_every != 0 {
+            continue;
+        }
+
+        let ll_cur = loglikelihood_packed_train_fold_f32_impl(
+            backend,
+            &p,
+            &q,
+            k,
+            fold_id_keepout,
+            folds,
+            cv_seed,
+        );
+        check_admx_memory_limit("adam_fold/loglik")?;
+        if (ll_cur - ll_best).abs() < 0.1_f64 {
+            break;
+        }
+
+        if ll_cur > ll_best {
+            ll_best = ll_cur;
+            p_best.copy_from_slice(&p);
+            q_best.copy_from_slice(&q);
+            have_best = true;
+            no_improve = 0;
+        } else {
+            no_improve += 1;
+            lr_cur = (lr_cur * lr_decay).max(min_lr);
+            if no_improve >= 2 {
+                break;
+            }
+        }
+    }
+
+    if !ll_best.is_finite() {
+        ll_best = loglikelihood_packed_train_fold_f32_impl(
+            backend,
+            &p,
+            &q,
+            k,
+            fold_id_keepout,
+            folds,
+            cv_seed,
+        );
+        p_best.copy_from_slice(&p);
+        q_best.copy_from_slice(&q);
+        have_best = true;
+    }
+    if have_best {
+        p.copy_from_slice(&p_best);
+        q.copy_from_slice(&q_best);
+    }
+    Ok((ll_best, last_iter))
+}
+
+fn adam_optimize_packed_fold_impl(
+    backend: &PackedBedRsvd,
+    p0: &ArrayView2<'_, f32>,
+    q0: &ArrayView2<'_, f32>,
+    lr: f32,
+    beta1: f32,
+    beta2: f32,
+    epsilon: f32,
+    max_iter: usize,
+    check_every: usize,
+    lr_decay: f32,
+    min_lr: f32,
+    fold_id_keepout: usize,
+    folds: usize,
+    cv_seed: u64,
+) -> Result<(Vec<f32>, Vec<f32>, f64, usize), String> {
+    let (m, k) = p0.dim();
+    let (n, k2) = q0.dim();
+    if k != k2 {
+        return Err(format!(
+            "shape mismatch: expected shared K, got P0=({}, {}), Q0=({}, {})",
+            m, k, n, k2
+        ));
+    }
+    let p0s = p0
+        .as_slice()
+        .ok_or_else(|| "P0 not contiguous".to_string())?;
+    let q0s = q0
+        .as_slice()
+        .ok_or_else(|| "Q0 not contiguous".to_string())?;
+
+    let mut p = p0s.to_vec();
+    let mut q = q0s.to_vec();
+    let (ll_best, last_iter) = adam_optimize_packed_fold_inplace_impl(
+        backend,
+        &mut p,
+        &mut q,
+        m,
+        n,
+        k,
+        lr,
+        beta1,
+        beta2,
+        epsilon,
+        max_iter,
+        check_every,
+        lr_decay,
+        min_lr,
+        fold_id_keepout,
+        folds,
+        cv_seed,
+    )?;
+    Ok((p, q, ll_best, last_iter))
+}
+
 fn em_step_inplace_f32_tiled_impl(
     g: &ArrayView2<'_, u8>,
     p_src: &[f32],
@@ -2273,6 +5255,1359 @@ fn em_step_inplace_f32_tiled_impl(
             }
         });
     Ok(())
+}
+
+#[allow(dead_code)]
+fn em_step_packed_f32_impl(
+    backend: &PackedBedRsvd,
+    p_src: &[f32],
+    q_src: &[f32],
+    p_em_slice: &mut [f32],
+    q_em_slice: &mut [f32],
+    q_bat: &mut [f32],
+    t_acc: &mut [f32],
+) -> Result<(), String> {
+    let m = backend.n_snps;
+    let n = backend.n_samples;
+    if m == 0 || n == 0 {
+        return Ok(());
+    }
+    if p_src.len() % m != 0 {
+        return Err("invalid P shape in packed EM helper".to_string());
+    }
+    let k = p_src.len() / m;
+    if q_src.len() != n * k {
+        return Err("invalid Q shape in packed EM helper".to_string());
+    }
+    if p_em_slice.len() != m * k || q_em_slice.len() != n * k {
+        return Err("invalid packed EM output buffer size".to_string());
+    }
+    if q_bat.len() != n || t_acc.len() != n * k {
+        return Err("invalid packed EM scratch buffer size".to_string());
+    }
+
+    let full_bytes = n / 4;
+    let rem = n % 4;
+    let byte_lut = packed_byte_lut();
+    let blocks = rayon::current_num_threads().max(1);
+    let rows_per_block = (m + blocks - 1) / blocks;
+    let chunk_elems = (rows_per_block * k).max(k);
+    let (qb_sum, ta_sum, _, _) = p_em_slice
+        .par_chunks_mut(chunk_elems)
+        .enumerate()
+        .fold(
+            || {
+                (
+                    vec![0.0_f32; n],
+                    vec![0.0_f32; n * k],
+                    vec![0.0_f32; k],
+                    vec![0.0_f32; k],
+                )
+            },
+            |(mut qb, mut ta, mut a, mut b), (chunk_idx, em_chunk)| {
+                let row_start = chunk_idx * rows_per_block;
+                let row_count = em_chunk.len() / k;
+                for r in 0..row_count {
+                    let i = row_start + r;
+                    if i >= m {
+                        break;
+                    }
+                    let row = packed_backend_row_slice(backend, i);
+                    let flip = backend.row_flip[i];
+                    let p_row = &p_src[i * k..(i + 1) * k];
+                    let out_row = &mut em_chunk[r * k..(r + 1) * k];
+                    a.fill(0.0);
+                    b.fill(0.0);
+                    let mut col = 0usize;
+                    for &packed in row.iter().take(full_bytes) {
+                        let codes = &byte_lut.code4[packed as usize];
+                        for &code in codes.iter() {
+                            if let Some(g_f) = packed_code_minor_allele_g(code, flip) {
+                                qb[col] += 2.0;
+                                let q_row = &q_src[col * k..(col + 1) * k];
+                                let mut rec = 0.0_f32;
+                                for kk in 0..k {
+                                    rec += p_row[kk] * q_row[kk];
+                                }
+                                rec = rec.clamp(1e-6, 1.0 - 1e-6);
+                                let aa = g_f / rec;
+                                let bb = (2.0 - g_f) / (1.0 - rec);
+                                let t_row = &mut ta[col * k..(col + 1) * k];
+                                for kk in 0..k {
+                                    let qv = q_row[kk];
+                                    a[kk] += qv * aa;
+                                    b[kk] += qv * bb;
+                                    t_row[kk] += p_row[kk] * (aa - bb) + bb;
+                                }
+                            }
+                            col += 1;
+                        }
+                    }
+                    if rem > 0 {
+                        let codes = &byte_lut.code4[row[full_bytes] as usize];
+                        for &code in codes.iter().take(rem) {
+                            if let Some(g_f) = packed_code_minor_allele_g(code, flip) {
+                                qb[col] += 2.0;
+                                let q_row = &q_src[col * k..(col + 1) * k];
+                                let mut rec = 0.0_f32;
+                                for kk in 0..k {
+                                    rec += p_row[kk] * q_row[kk];
+                                }
+                                rec = rec.clamp(1e-6, 1.0 - 1e-6);
+                                let aa = g_f / rec;
+                                let bb = (2.0 - g_f) / (1.0 - rec);
+                                let t_row = &mut ta[col * k..(col + 1) * k];
+                                for kk in 0..k {
+                                    let qv = q_row[kk];
+                                    a[kk] += qv * aa;
+                                    b[kk] += qv * bb;
+                                    t_row[kk] += p_row[kk] * (aa - bb) + bb;
+                                }
+                            }
+                            col += 1;
+                        }
+                    }
+                    for kk in 0..k {
+                        let denom = p_row[kk] * (a[kk] - b[kk]) + b[kk];
+                        let v = if denom.abs() < 1e-8 {
+                            p_row[kk]
+                        } else {
+                            (a[kk] * p_row[kk]) / denom
+                        };
+                        out_row[kk] = clip32(v);
+                    }
+                }
+                madvise_backend_active_rows(backend, row_start, row_count);
+                (qb, ta, a, b)
+            },
+        )
+        .reduce(
+            || {
+                (
+                    vec![0.0_f32; n],
+                    vec![0.0_f32; n * k],
+                    vec![0.0_f32; k],
+                    vec![0.0_f32; k],
+                )
+            },
+            |(mut qb1, mut ta1, a1, b1), (qb2, ta2, _, _)| {
+                for col in 0..n {
+                    qb1[col] += qb2[col];
+                }
+                for idx in 0..(n * k) {
+                    ta1[idx] += ta2[idx];
+                }
+                (qb1, ta1, a1, b1)
+            },
+        );
+    q_bat.copy_from_slice(&qb_sum);
+    t_acc.copy_from_slice(&ta_sum);
+
+    q_em_slice
+        .par_chunks_mut(k)
+        .enumerate()
+        .for_each(|(col, out_row)| {
+            let q_row = &q_src[col * k..(col + 1) * k];
+            if q_bat[col] <= 0.0 {
+                for kk in 0..k {
+                    out_row[kk] = clip32(q_row[kk]);
+                }
+            } else {
+                let inv = 1.0 / q_bat[col];
+                let t_row = &t_acc[col * k..(col + 1) * k];
+                for kk in 0..k {
+                    out_row[kk] = clip32(q_row[kk] * t_row[kk] * inv);
+                }
+            }
+            let sum = out_row.iter().sum::<f32>();
+            if sum <= 0.0 || !sum.is_finite() {
+                let v = 1.0 / (k as f32).max(1.0);
+                out_row.fill(v);
+            } else {
+                for kk in 0..k {
+                    out_row[kk] /= sum;
+                }
+            }
+        });
+    Ok(())
+}
+
+fn adam_optimize_packed_inplace_impl(
+    backend: &PackedBedRsvd,
+    p: &mut [f32],
+    q: &mut [f32],
+    m: usize,
+    n: usize,
+    k: usize,
+    lr: f32,
+    beta1: f32,
+    beta2: f32,
+    epsilon: f32,
+    max_iter: usize,
+    check_every: usize,
+    lr_decay: f32,
+    min_lr: f32,
+) -> Result<(f64, usize), String> {
+    if m != backend.n_snps || n != backend.n_samples {
+        return Err(format!(
+            "shape mismatch: expected P/Q rows=({}, {}), got ({}, {})",
+            backend.n_snps, backend.n_samples, m, n
+        ));
+    }
+    if m == 0 || n == 0 || k == 0 {
+        return Err("invalid empty input matrix for BED-backed ADAM optimization".to_string());
+    }
+    if p.len() != m * k || q.len() != n * k {
+        return Err("invalid contiguous slice length for BED-backed ADAM optimization".to_string());
+    }
+
+    let mut p_best = vec![0.0_f32; m * k];
+    let mut q_best = vec![0.0_f32; n * k];
+    let mut ll_best = f64::NEG_INFINITY;
+    let mut no_improve: usize = 0;
+    let mut lr_cur = lr;
+    let mut last_iter = 0usize;
+    let mut beta1_pow = 1.0_f32;
+    let mut beta2_pow = 1.0_f32;
+    let mut have_best = false;
+
+    let mut m_p = vec![0.0_f32; m * k];
+    let mut v_p = vec![0.0_f32; m * k];
+    let mut m_q = vec![0.0_f32; n * k];
+    let mut v_q = vec![0.0_f32; n * k];
+    let mut q_em = vec![0.0_f32; n * k];
+    let check_every = check_every.max(1);
+    let full_bytes = n / 4;
+    let rem = n % 4;
+    let byte_lut = packed_byte_lut();
+    let blocks = rayon::current_num_threads().max(1);
+    let rows_per_block = (m + blocks - 1) / blocks;
+    let chunk_elems = (rows_per_block * k).max(k);
+    check_admx_memory_limit("adam/scratch_ready")?;
+
+    for it in 0..max_iter {
+        check_admx_memory_limit("adam/iter_start")?;
+        last_iter = it + 1;
+        let one_b1 = 1.0_f32 - beta1;
+        let one_b2 = 1.0_f32 - beta2;
+        beta1_pow *= beta1;
+        beta2_pow *= beta2;
+        let m_scale = if (1.0_f32 - beta1_pow).abs() < 1e-8 {
+            1.0_f32
+        } else {
+            1.0_f32 / (1.0_f32 - beta1_pow)
+        };
+        let v_scale = if (1.0_f32 - beta2_pow).abs() < 1e-8 {
+            1.0_f32
+        } else {
+            1.0_f32 / (1.0_f32 - beta2_pow)
+        };
+
+        let (qb_sum, ta_sum, _, _) = p
+            .par_chunks_mut(chunk_elems)
+            .zip(m_p.par_chunks_mut(chunk_elems))
+            .zip(v_p.par_chunks_mut(chunk_elems))
+            .enumerate()
+            .fold(
+                || {
+                    (
+                        vec![0.0_f32; n],
+                        vec![0.0_f32; n * k],
+                        vec![0.0_f32; k],
+                        vec![0.0_f32; k],
+                    )
+                },
+                |(mut qb, mut ta, mut a, mut b), (chunk_idx, ((p_chunk, m_chunk), v_chunk))| {
+                    let row_start = chunk_idx * rows_per_block;
+                    let row_count = p_chunk.len() / k;
+                    for r in 0..row_count {
+                        let i = row_start + r;
+                        if i >= m {
+                            break;
+                        }
+                        let row = packed_backend_row_slice(backend, i);
+                        let flip = backend.row_flip[i];
+                        let p_row = &mut p_chunk[r * k..(r + 1) * k];
+                        let m_row = &mut m_chunk[r * k..(r + 1) * k];
+                        let v_row = &mut v_chunk[r * k..(r + 1) * k];
+                        a.fill(0.0_f32);
+                        b.fill(0.0_f32);
+                        let mut col = 0usize;
+                        let geno_lut = if flip {
+                            [2.0_f32, -1.0_f32, 1.0_f32, 0.0_f32]
+                        } else {
+                            [0.0_f32, -1.0_f32, 1.0_f32, 2.0_f32]
+                        };
+                        for &packed in row.iter().take(full_bytes) {
+                            let codes = &byte_lut.code4[packed as usize];
+                            for &code in codes.iter() {
+                                let g_f = geno_lut[code as usize];
+                                if g_f >= 0.0_f32 {
+                                    qb[col] += 2.0_f32;
+                                    let q_row = &q[col * k..(col + 1) * k];
+                                    let mut rec = 0.0_f32;
+                                    for kk in 0..k {
+                                        rec += p_row[kk] * q_row[kk];
+                                    }
+                                    rec = rec.clamp(1e-6, 1.0 - 1e-6);
+                                    let aa = g_f / rec;
+                                    let bb = (2.0_f32 - g_f) / (1.0_f32 - rec);
+                                    let t_row = &mut ta[col * k..(col + 1) * k];
+                                    for kk in 0..k {
+                                        let qv = q_row[kk];
+                                        a[kk] += qv * aa;
+                                        b[kk] += qv * bb;
+                                        t_row[kk] += p_row[kk] * (aa - bb) + bb;
+                                    }
+                                }
+                                col += 1;
+                            }
+                        }
+                        if rem > 0 {
+                            let codes = &byte_lut.code4[row[full_bytes] as usize];
+                            for &code in codes.iter().take(rem) {
+                                let g_f = geno_lut[code as usize];
+                                if g_f >= 0.0_f32 {
+                                    qb[col] += 2.0_f32;
+                                    let q_row = &q[col * k..(col + 1) * k];
+                                    let mut rec = 0.0_f32;
+                                    for kk in 0..k {
+                                        rec += p_row[kk] * q_row[kk];
+                                    }
+                                    rec = rec.clamp(1e-6, 1.0 - 1e-6);
+                                    let aa = g_f / rec;
+                                    let bb = (2.0_f32 - g_f) / (1.0_f32 - rec);
+                                    let t_row = &mut ta[col * k..(col + 1) * k];
+                                    for kk in 0..k {
+                                        let qv = q_row[kk];
+                                        a[kk] += qv * aa;
+                                        b[kk] += qv * bb;
+                                        t_row[kk] += p_row[kk] * (aa - bb) + bb;
+                                    }
+                                }
+                                col += 1;
+                            }
+                        }
+                        for kk in 0..k {
+                            let denom = p_row[kk] * (a[kk] - b[kk]) + b[kk];
+                            let p_em = if denom.abs() < 1e-8_f32 {
+                                p_row[kk]
+                            } else {
+                                (a[kk] * p_row[kk]) / denom
+                            };
+                            let delta = p_em - p_row[kk];
+                            let mcur = beta1 * m_row[kk] + one_b1 * delta;
+                            let vcur = beta2 * v_row[kk] + one_b2 * delta * delta;
+                            let m_hat = mcur * m_scale;
+                            let v_hat = vcur * v_scale;
+                            let step = lr_cur * m_hat / (v_hat.sqrt() + epsilon);
+                            p_row[kk] = clip32(p_row[kk] + step);
+                            m_row[kk] = mcur;
+                            v_row[kk] = vcur;
+                        }
+                    }
+                    madvise_backend_active_rows(backend, row_start, row_count);
+                    (qb, ta, a, b)
+                },
+            )
+            .reduce(
+                || {
+                    (
+                        vec![0.0_f32; n],
+                        vec![0.0_f32; n * k],
+                        vec![0.0_f32; k],
+                        vec![0.0_f32; k],
+                    )
+                },
+                |(mut qb1, mut ta1, a1, b1), (qb2, ta2, _, _)| {
+                    for (dst, src) in qb1.iter_mut().zip(qb2.iter()) {
+                        *dst += *src;
+                    }
+                    for (dst, src) in ta1.iter_mut().zip(ta2.iter()) {
+                        *dst += *src;
+                    }
+                    (qb1, ta1, a1, b1)
+                },
+            );
+        q_em.par_chunks_mut(k)
+            .enumerate()
+            .for_each(|(col, out_row)| {
+                let q_row = &q[col * k..(col + 1) * k];
+                if qb_sum[col] <= 0.0_f32 {
+                    for kk in 0..k {
+                        out_row[kk] = clip32(q_row[kk]);
+                    }
+                } else {
+                    let inv = 1.0_f32 / qb_sum[col];
+                    let t_row = &ta_sum[col * k..(col + 1) * k];
+                    for kk in 0..k {
+                        out_row[kk] = clip32(q_row[kk] * t_row[kk] * inv);
+                    }
+                }
+                let sum = out_row.iter().sum::<f32>();
+                if sum <= 0.0_f32 || !sum.is_finite() {
+                    let v = 1.0_f32 / (k as f32).max(1.0_f32);
+                    out_row.fill(v);
+                } else {
+                    for kk in 0..k {
+                        out_row[kk] /= sum;
+                    }
+                }
+            });
+
+        q.par_chunks_mut(k)
+            .zip(m_q.par_chunks_mut(k))
+            .zip(v_q.par_chunks_mut(k))
+            .enumerate()
+            .for_each(|(i, ((q_row, m_row), v_row))| {
+                let base = i * k;
+                let mut sum = 0.0_f32;
+                for j in 0..k {
+                    let idx = base + j;
+                    let delta = q_em[idx] - q_row[j];
+                    let mcur = beta1 * m_row[j] + one_b1 * delta;
+                    let vcur = beta2 * v_row[j] + one_b2 * delta * delta;
+                    let m_hat = mcur * m_scale;
+                    let v_hat = vcur * v_scale;
+                    let step = lr_cur * m_hat / (v_hat.sqrt() + epsilon);
+                    let qv = clip32(q_row[j] + step);
+                    q_row[j] = qv;
+                    m_row[j] = mcur;
+                    v_row[j] = vcur;
+                    sum += qv;
+                }
+                if sum <= 0.0 || !sum.is_finite() {
+                    let v = 1.0 / (k as f32).max(1.0);
+                    q_row.fill(v);
+                } else {
+                    for j in 0..k {
+                        q_row[j] /= sum;
+                    }
+                }
+            });
+
+        if last_iter % check_every != 0 {
+            continue;
+        }
+
+        let ll_cur = loglikelihood_packed_f32_impl(backend, &p, &q, k);
+        check_admx_memory_limit("adam/loglik")?;
+        if (ll_cur - ll_best).abs() < 0.1 {
+            break;
+        }
+
+        if ll_cur > ll_best {
+            ll_best = ll_cur;
+            p_best.copy_from_slice(&p);
+            q_best.copy_from_slice(&q);
+            have_best = true;
+            no_improve = 0;
+        } else {
+            no_improve += 1;
+            lr_cur = (lr_cur * lr_decay).max(min_lr);
+            if no_improve >= 2 {
+                break;
+            }
+        }
+    }
+
+    if !ll_best.is_finite() {
+        ll_best = loglikelihood_packed_f32_impl(backend, &p, &q, k);
+        p_best.copy_from_slice(&p);
+        q_best.copy_from_slice(&q);
+        have_best = true;
+    }
+    if have_best {
+        p.copy_from_slice(&p_best);
+        q.copy_from_slice(&q_best);
+    }
+    Ok((ll_best, last_iter))
+}
+
+fn adam_optimize_packed_impl(
+    backend: &PackedBedRsvd,
+    p0: &ArrayView2<'_, f32>,
+    q0: &ArrayView2<'_, f32>,
+    lr: f32,
+    beta1: f32,
+    beta2: f32,
+    epsilon: f32,
+    max_iter: usize,
+    check_every: usize,
+    lr_decay: f32,
+    min_lr: f32,
+) -> Result<(Vec<f32>, Vec<f32>, f64, usize), String> {
+    let (m, k) = p0.dim();
+    let (n, k2) = q0.dim();
+    if k != k2 {
+        return Err(format!(
+            "shape mismatch: expected shared K, got P0=({}, {}), Q0=({}, {})",
+            m, k, n, k2
+        ));
+    }
+    let p0s = p0
+        .as_slice()
+        .ok_or_else(|| "P0 not contiguous".to_string())?;
+    let q0s = q0
+        .as_slice()
+        .ok_or_else(|| "Q0 not contiguous".to_string())?;
+
+    let mut p = p0s.to_vec();
+    let mut q = q0s.to_vec();
+    let (ll_best, last_iter) = adam_optimize_packed_inplace_impl(
+        backend,
+        &mut p,
+        &mut q,
+        m,
+        n,
+        k,
+        lr,
+        beta1,
+        beta2,
+        epsilon,
+        max_iter,
+        check_every,
+        lr_decay,
+        min_lr,
+    )?;
+    Ok((p, q, ll_best, last_iter))
+}
+
+#[pymethods]
+impl AdmxBedTrainingSession {
+    #[new]
+    #[pyo3(signature = (
+        genotype_path,
+        snps_only=true,
+        maf=0.02,
+        missing_rate=0.05
+    ))]
+    fn new(genotype_path: String, snps_only: bool, maf: f32, missing_rate: f32) -> PyResult<Self> {
+        let (backend, prefix) =
+            open_packed_bed_backend_for_training(&genotype_path, snps_only, maf, missing_rate)
+                .map_err(PyRuntimeError::new_err)?;
+        Ok(Self {
+            backend: Arc::new(backend),
+            prefix,
+            snps_only,
+            maf,
+            missing_rate,
+        })
+    }
+
+    #[staticmethod]
+    #[pyo3(signature = (
+        genotype_path,
+        snps_only=true,
+        maf=0.02,
+        missing_rate=0.05
+    ))]
+    fn open(
+        py: Python<'_>,
+        genotype_path: String,
+        snps_only: bool,
+        maf: f32,
+        missing_rate: f32,
+    ) -> PyResult<Self> {
+        let (backend, prefix) = py
+            .detach(move || {
+                open_packed_bed_backend_for_training(
+                    &genotype_path,
+                    snps_only,
+                    maf,
+                    missing_rate,
+                )
+            })
+            .map_err(PyRuntimeError::new_err)?;
+        Ok(Self {
+            backend: Arc::new(backend),
+            prefix,
+            snps_only,
+            maf,
+            missing_rate,
+        })
+    }
+
+    #[getter]
+    fn n_samples(&self) -> usize {
+        self.backend.n_samples
+    }
+
+    #[getter]
+    fn n_snps(&self) -> usize {
+        self.backend.n_snps
+    }
+
+    #[getter]
+    fn prefix(&self) -> String {
+        self.prefix.clone()
+    }
+
+    fn row_freq<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f32>> {
+        row_freq_to_pyarray(py, &self.backend.row_freq)
+    }
+
+    fn write_site_file(&self, out_path: String) -> PyResult<()> {
+        write_p_site_from_backend_impl(
+            &self.prefix,
+            &self.backend.active_row_idx,
+            &self.backend.row_flip,
+            &out_path,
+        )
+        .map_err(PyRuntimeError::new_err)
+    }
+
+    #[pyo3(signature = (
+        k,
+        seed,
+        solver,
+        power,
+        tol,
+        max_als,
+        reg_als,
+        lr,
+        beta1,
+        beta2,
+        epsilon,
+        max_iter,
+        check_every,
+        lr_decay,
+        min_lr
+    ))]
+    fn fit_k<'py>(
+        &self,
+        py: Python<'py>,
+        k: usize,
+        seed: u64,
+        solver: String,
+        power: usize,
+        tol: f32,
+        max_als: usize,
+        reg_als: f32,
+        lr: f32,
+        beta1: f32,
+        beta2: f32,
+        epsilon: f32,
+        max_iter: usize,
+        check_every: usize,
+        lr_decay: f32,
+        min_lr: f32,
+    ) -> PyResult<(
+        Bound<'py, PyArray2<f32>>,
+        Bound<'py, PyArray2<f32>>,
+        f64,
+        usize,
+        f64,
+        usize,
+    )> {
+        let backend = Arc::clone(&self.backend);
+        let result = py
+            .detach(move || {
+                fit_admx_bed_training_session_impl(
+                    backend.as_ref(),
+                    k,
+                    seed,
+                    &solver,
+                    power,
+                    tol,
+                    max_als,
+                    reg_als,
+                    lr,
+                    beta1,
+                    beta2,
+                    epsilon,
+                    max_iter,
+                    check_every,
+                    lr_decay,
+                    min_lr,
+                )
+            })
+            .map_err(PyRuntimeError::new_err)?;
+        let AdmxBedFitResult {
+            p,
+            q,
+            ll_final,
+            adam_iter,
+            init_ll,
+            als_iter,
+        } = result;
+        let p_out = vec_into_pyarray2_f32(py, self.backend.n_snps, k, p)?;
+        let q_out = vec_into_pyarray2_f32(py, self.backend.n_samples, k, q)?;
+        Ok((p_out, q_out, ll_final, adam_iter, init_ll, als_iter))
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "AdmxBedTrainingSession(prefix='{}', n_snps={}, n_samples={}, snps_only={}, maf={}, missing_rate={})",
+            self.prefix,
+            self.backend.n_snps,
+            self.backend.n_samples,
+            self.snps_only,
+            self.maf,
+            self.missing_rate,
+        )
+    }
+}
+
+#[pymethods]
+impl AdmxBedBackend {
+    #[new]
+    #[pyo3(signature = (
+        genotype_path,
+        snps_only=true,
+        maf=0.02,
+        missing_rate=0.05
+    ))]
+    fn new(genotype_path: String, snps_only: bool, maf: f32, missing_rate: f32) -> PyResult<Self> {
+        let (backend, prefix) =
+            open_packed_bed_backend_for_training(&genotype_path, snps_only, maf, missing_rate)
+                .map_err(PyRuntimeError::new_err)?;
+        Ok(Self {
+            backend: Arc::new(backend),
+            prefix,
+            snps_only,
+            maf,
+            missing_rate,
+        })
+    }
+
+    fn row_freq<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f32>> {
+        row_freq_to_pyarray(py, &self.backend.row_freq)
+    }
+
+    #[getter]
+    fn n_samples(&self) -> usize {
+        self.backend.n_samples
+    }
+
+    #[getter]
+    fn n_snps(&self) -> usize {
+        self.backend.n_snps
+    }
+
+    #[getter]
+    fn prefix(&self) -> String {
+        self.prefix.clone()
+    }
+
+    fn rsvd_stream_sample<'py>(
+        &self,
+        py: Python<'py>,
+        k: usize,
+        seed: u64,
+        power: usize,
+        tol: f32,
+    ) -> PyResult<(Bound<'py, PyArray1<f32>>, Bound<'py, PyArray2<f32>>)> {
+        let (eigvals, eigvecs_sample) =
+            rsvd_stream_sample_packed_impl(self.backend.as_ref(), k, seed, power, tol)
+                .map_err(PyRuntimeError::new_err)?;
+        let k_eff = eigvals.len();
+        let eval_arr = row_freq_to_pyarray(py, &eigvals);
+        let evec_arr = vec_to_pyarray2_f32(py, self.backend.n_samples, k_eff, &eigvecs_sample)?;
+        Ok((eval_arr, evec_arr))
+    }
+
+    fn multiply_a_omega<'py>(
+        &self,
+        py: Python<'py>,
+        omega: PyReadonlyArray2<'py, f32>,
+    ) -> PyResult<Bound<'py, PyArray2<f32>>> {
+        let omega = omega.as_array();
+        let (n, kp) = omega.dim();
+        let omega_s = omega
+            .as_slice()
+            .ok_or_else(|| PyRuntimeError::new_err("omega is not contiguous"))?;
+        let out_vec = multiply_a_omega_packed_checked_impl(
+            self.backend.as_ref(),
+            omega_s,
+            n,
+            kp,
+            self.backend.n_snps,
+        )
+        .map_err(PyRuntimeError::new_err)?;
+        vec_to_pyarray2_f32(py, self.backend.n_snps, kp, &out_vec)
+    }
+
+    fn loglikelihood_f32(
+        &self,
+        p: PyReadonlyArray2<'_, f32>,
+        q: PyReadonlyArray2<'_, f32>,
+    ) -> PyResult<f64> {
+        loglikelihood_packed_checked_impl(self.backend.as_ref(), &p.as_array(), &q.as_array())
+            .map_err(PyRuntimeError::new_err)
+    }
+
+    fn write_site_file(&self, out_path: String) -> PyResult<()> {
+        write_p_site_from_backend_impl(
+            &self.prefix,
+            &self.backend.active_row_idx,
+            &self.backend.row_flip,
+            &out_path,
+        )
+        .map_err(PyRuntimeError::new_err)
+    }
+
+    fn cv_observed_fold_counts<'py>(
+        &self,
+        py: Python<'py>,
+        folds: usize,
+        seed: u64,
+    ) -> PyResult<(usize, Bound<'py, PyArray1<i64>>)> {
+        let (observed, fold_counts) =
+            cv_observed_fold_counts_packed_impl(self.backend.as_ref(), folds, seed)
+                .map_err(PyRuntimeError::new_err)?;
+        Ok((observed, vec_to_pyarray1_i64(py, &fold_counts)?))
+    }
+
+    fn make_cv_fold_backend(
+        &self,
+        fold_id: usize,
+        folds: usize,
+        seed: u64,
+    ) -> PyResult<AdmxBedFoldBackend> {
+        let (row_freq_train, train_observed, holdout_observed) =
+            cv_training_row_freq_packed_impl(self.backend.as_ref(), fold_id, folds, seed)
+                .map_err(PyRuntimeError::new_err)?;
+        Ok(AdmxBedFoldBackend {
+            backend: Arc::clone(&self.backend),
+            prefix: self.prefix.clone(),
+            snps_only: self.snps_only,
+            maf: self.maf,
+            missing_rate: self.missing_rate,
+            fold_id,
+            folds,
+            cv_seed: seed,
+            row_freq_train,
+            train_observed,
+            holdout_observed,
+        })
+    }
+
+    #[pyo3(signature = (
+        p0,
+        q0,
+        lr=0.005,
+        beta1=0.80,
+        beta2=0.88,
+        epsilon=1e-8,
+        max_iter=1500,
+        check_every=5,
+        lr_decay=0.5,
+        min_lr=1e-6
+    ))]
+    fn adam_optimize_f32<'py>(
+        &self,
+        py: Python<'py>,
+        p0: PyReadonlyArray2<'py, f32>,
+        q0: PyReadonlyArray2<'py, f32>,
+        lr: f32,
+        beta1: f32,
+        beta2: f32,
+        epsilon: f32,
+        max_iter: usize,
+        check_every: usize,
+        lr_decay: f32,
+        min_lr: f32,
+    ) -> PyResult<(
+        Bound<'py, PyArray2<f32>>,
+        Bound<'py, PyArray2<f32>>,
+        f64,
+        usize,
+    )> {
+        let (p_best, q_best, ll_best, last_iter) = adam_optimize_packed_impl(
+            self.backend.as_ref(),
+            &p0.as_array(),
+            &q0.as_array(),
+            lr,
+            beta1,
+            beta2,
+            epsilon,
+            max_iter,
+            check_every,
+            lr_decay,
+            min_lr,
+        )
+        .map_err(PyRuntimeError::new_err)?;
+        let p_out = vec_to_pyarray2_f32(py, self.backend.n_snps, p0.shape()[1], &p_best)?;
+        let q_out = vec_to_pyarray2_f32(py, self.backend.n_samples, q0.shape()[1], &q_best)?;
+        Ok((p_out, q_out, ll_best, last_iter))
+    }
+
+    #[pyo3(signature = (
+        p,
+        q,
+        lr=0.005,
+        beta1=0.80,
+        beta2=0.88,
+        epsilon=1e-8,
+        max_iter=1500,
+        check_every=5,
+        lr_decay=0.5,
+        min_lr=1e-6
+    ))]
+    fn adam_optimize_inplace_f32<'py>(
+        &self,
+        mut p: PyReadwriteArray2<'py, f32>,
+        mut q: PyReadwriteArray2<'py, f32>,
+        lr: f32,
+        beta1: f32,
+        beta2: f32,
+        epsilon: f32,
+        max_iter: usize,
+        check_every: usize,
+        lr_decay: f32,
+        min_lr: f32,
+    ) -> PyResult<(f64, usize)> {
+        let mut p_arr = p.as_array_mut();
+        let mut q_arr = q.as_array_mut();
+        let (m, k) = p_arr.dim();
+        let (n, k2) = q_arr.dim();
+        if k != k2 {
+            return Err(PyRuntimeError::new_err(format!(
+                "shape mismatch: expected shared K, got P=({}, {}), Q=({}, {})",
+                m, k, n, k2
+            )));
+        }
+        let p_s = p_arr
+            .as_slice_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("P is not contiguous"))?;
+        let q_s = q_arr
+            .as_slice_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("Q is not contiguous"))?;
+        adam_optimize_packed_inplace_impl(
+            self.backend.as_ref(),
+            p_s,
+            q_s,
+            m,
+            n,
+            k,
+            lr,
+            beta1,
+            beta2,
+            epsilon,
+            max_iter,
+            check_every,
+            lr_decay,
+            min_lr,
+        )
+        .map_err(PyRuntimeError::new_err)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "AdmxBedBackend(prefix='{}', n_snps={}, n_samples={}, snps_only={}, maf={}, missing_rate={})",
+            self.prefix,
+            self.backend.n_snps,
+            self.backend.n_samples,
+            self.snps_only,
+            self.maf,
+            self.missing_rate,
+        )
+    }
+}
+
+#[pymethods]
+impl AdmxBedFoldBackend {
+    fn row_freq<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f32>> {
+        row_freq_to_pyarray(py, &self.row_freq_train)
+    }
+
+    #[getter]
+    fn n_samples(&self) -> usize {
+        self.backend.n_samples
+    }
+
+    #[getter]
+    fn n_snps(&self) -> usize {
+        self.backend.n_snps
+    }
+
+    #[getter]
+    fn prefix(&self) -> String {
+        self.prefix.clone()
+    }
+
+    #[getter]
+    fn train_observed(&self) -> usize {
+        self.train_observed
+    }
+
+    #[getter]
+    fn holdout_observed(&self) -> usize {
+        self.holdout_observed
+    }
+
+    fn rsvd_stream_sample<'py>(
+        &self,
+        py: Python<'py>,
+        k: usize,
+        seed: u64,
+        power: usize,
+        tol: f32,
+    ) -> PyResult<(Bound<'py, PyArray1<f32>>, Bound<'py, PyArray2<f32>>)> {
+        let (eigvals, eigvecs_sample) = rsvd_stream_sample_packed_fold_impl(
+            self.backend.as_ref(),
+            &self.row_freq_train,
+            k,
+            seed,
+            power,
+            tol,
+            self.fold_id,
+            self.folds,
+            self.cv_seed,
+        )
+        .map_err(PyRuntimeError::new_err)?;
+        let k_eff = eigvals.len();
+        let eval_arr = row_freq_to_pyarray(py, &eigvals);
+        let evec_arr = vec_to_pyarray2_f32(py, self.backend.n_samples, k_eff, &eigvecs_sample)?;
+        Ok((eval_arr, evec_arr))
+    }
+
+    fn multiply_a_omega<'py>(
+        &self,
+        py: Python<'py>,
+        omega: PyReadonlyArray2<'py, f32>,
+    ) -> PyResult<Bound<'py, PyArray2<f32>>> {
+        let omega = omega.as_array();
+        let (n, kp) = omega.dim();
+        let omega_s = omega
+            .as_slice()
+            .ok_or_else(|| PyRuntimeError::new_err("omega is not contiguous"))?;
+        let out_vec = compute_a_omega_packed_fold_impl(
+            self.backend.as_ref(),
+            &self.row_freq_train,
+            omega_s,
+            kp,
+            self.fold_id,
+            self.folds,
+            self.cv_seed,
+        )
+        .map_err(PyRuntimeError::new_err)?;
+        if n != self.backend.n_samples {
+            return Err(PyRuntimeError::new_err(format!(
+                "omega sample dimension mismatch: got {n}, expected {}",
+                self.backend.n_samples
+            )));
+        }
+        vec_to_pyarray2_f32(py, self.backend.n_snps, kp, &out_vec)
+    }
+
+    fn loglikelihood_f32(
+        &self,
+        p: PyReadonlyArray2<'_, f32>,
+        q: PyReadonlyArray2<'_, f32>,
+    ) -> PyResult<f64> {
+        let p = p.as_array();
+        let q = q.as_array();
+        let (m, k) = p.dim();
+        let (n, k2) = q.dim();
+        if m != self.backend.n_snps || n != self.backend.n_samples || k != k2 {
+            return Err(PyRuntimeError::new_err(format!(
+                "shape mismatch: expected P=({}, {}), Q=({}, {}), got P=({}, {}), Q=({}, {})",
+                self.backend.n_snps, k, self.backend.n_samples, k, m, k, n, k2
+            )));
+        }
+        let p_s = p
+            .as_slice()
+            .ok_or_else(|| PyRuntimeError::new_err("P is not contiguous"))?;
+        let q_s = q
+            .as_slice()
+            .ok_or_else(|| PyRuntimeError::new_err("Q is not contiguous"))?;
+        Ok(loglikelihood_packed_train_fold_f32_impl(
+            self.backend.as_ref(),
+            p_s,
+            q_s,
+            k,
+            self.fold_id,
+            self.folds,
+            self.cv_seed,
+        ))
+    }
+
+    fn holdout_nll_f32(
+        &self,
+        p: PyReadonlyArray2<'_, f32>,
+        q: PyReadonlyArray2<'_, f32>,
+    ) -> PyResult<(f64, f64, usize)> {
+        let p = p.as_array();
+        let q = q.as_array();
+        let (m, k) = p.dim();
+        let (n, k2) = q.dim();
+        if m != self.backend.n_snps || n != self.backend.n_samples || k != k2 {
+            return Err(PyRuntimeError::new_err(format!(
+                "shape mismatch: expected P=({}, {}), Q=({}, {}), got P=({}, {}), Q=({}, {})",
+                self.backend.n_snps, k, self.backend.n_samples, k, m, k, n, k2
+            )));
+        }
+        let p_s = p
+            .as_slice()
+            .ok_or_else(|| PyRuntimeError::new_err("P is not contiguous"))?;
+        let q_s = q
+            .as_slice()
+            .ok_or_else(|| PyRuntimeError::new_err("Q is not contiguous"))?;
+        let (ll_sum, n_holdout) = holdout_nll_packed_fold_f32_impl(
+            self.backend.as_ref(),
+            p_s,
+            q_s,
+            k,
+            self.fold_id,
+            self.folds,
+            self.cv_seed,
+        );
+        if n_holdout == 0 {
+            return Ok((f64::NAN, f64::NAN, 0));
+        }
+        let mean_nll = -ll_sum / (n_holdout as f64);
+        let deviance = -2.0_f64 * ll_sum;
+        Ok((mean_nll, deviance, n_holdout))
+    }
+
+    fn write_site_file(&self, out_path: String) -> PyResult<()> {
+        write_p_site_from_backend_impl(
+            &self.prefix,
+            &self.backend.active_row_idx,
+            &self.backend.row_flip,
+            &out_path,
+        )
+        .map_err(PyRuntimeError::new_err)
+    }
+
+    #[pyo3(signature = (
+        p0,
+        q0,
+        lr=0.005,
+        beta1=0.80,
+        beta2=0.88,
+        epsilon=1e-8,
+        max_iter=1500,
+        check_every=5,
+        lr_decay=0.5,
+        min_lr=1e-6
+    ))]
+    fn adam_optimize_f32<'py>(
+        &self,
+        py: Python<'py>,
+        p0: PyReadonlyArray2<'py, f32>,
+        q0: PyReadonlyArray2<'py, f32>,
+        lr: f32,
+        beta1: f32,
+        beta2: f32,
+        epsilon: f32,
+        max_iter: usize,
+        check_every: usize,
+        lr_decay: f32,
+        min_lr: f32,
+    ) -> PyResult<(
+        Bound<'py, PyArray2<f32>>,
+        Bound<'py, PyArray2<f32>>,
+        f64,
+        usize,
+    )> {
+        let (p_best, q_best, ll_best, last_iter) = adam_optimize_packed_fold_impl(
+            self.backend.as_ref(),
+            &p0.as_array(),
+            &q0.as_array(),
+            lr,
+            beta1,
+            beta2,
+            epsilon,
+            max_iter,
+            check_every,
+            lr_decay,
+            min_lr,
+            self.fold_id,
+            self.folds,
+            self.cv_seed,
+        )
+        .map_err(PyRuntimeError::new_err)?;
+        let p_out = vec_to_pyarray2_f32(py, self.backend.n_snps, p0.shape()[1], &p_best)?;
+        let q_out = vec_to_pyarray2_f32(py, self.backend.n_samples, q0.shape()[1], &q_best)?;
+        Ok((p_out, q_out, ll_best, last_iter))
+    }
+
+    #[pyo3(signature = (
+        p,
+        q,
+        lr=0.005,
+        beta1=0.80,
+        beta2=0.88,
+        epsilon=1e-8,
+        max_iter=1500,
+        check_every=5,
+        lr_decay=0.5,
+        min_lr=1e-6
+    ))]
+    fn adam_optimize_inplace_f32<'py>(
+        &self,
+        mut p: PyReadwriteArray2<'py, f32>,
+        mut q: PyReadwriteArray2<'py, f32>,
+        lr: f32,
+        beta1: f32,
+        beta2: f32,
+        epsilon: f32,
+        max_iter: usize,
+        check_every: usize,
+        lr_decay: f32,
+        min_lr: f32,
+    ) -> PyResult<(f64, usize)> {
+        let mut p_arr = p.as_array_mut();
+        let mut q_arr = q.as_array_mut();
+        let (m, k) = p_arr.dim();
+        let (n, k2) = q_arr.dim();
+        if k != k2 {
+            return Err(PyRuntimeError::new_err(format!(
+                "shape mismatch: expected shared K, got P=({}, {}), Q=({}, {})",
+                m, k, n, k2
+            )));
+        }
+        let p_s = p_arr
+            .as_slice_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("P is not contiguous"))?;
+        let q_s = q_arr
+            .as_slice_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("Q is not contiguous"))?;
+        adam_optimize_packed_fold_inplace_impl(
+            self.backend.as_ref(),
+            p_s,
+            q_s,
+            m,
+            n,
+            k,
+            lr,
+            beta1,
+            beta2,
+            epsilon,
+            max_iter,
+            check_every,
+            lr_decay,
+            min_lr,
+            self.fold_id,
+            self.folds,
+            self.cv_seed,
+        )
+        .map_err(PyRuntimeError::new_err)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "AdmxBedFoldBackend(prefix='{}', fold={}/{}, n_snps={}, n_samples={}, snps_only={}, maf={}, missing_rate={}, train_observed={}, holdout_observed={})",
+            self.prefix,
+            self.fold_id + 1,
+            self.folds,
+            self.backend.n_snps,
+            self.backend.n_samples,
+            self.snps_only,
+            self.maf,
+            self.missing_rate,
+            self.train_observed,
+            self.holdout_observed,
+        )
+    }
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    genotype_path,
+    omega,
+    row_freq,
+    snps_only=true,
+    maf=0.02,
+    missing_rate=0.05,
+    delimiter=None,
+    mmap_window_mb=0
+))]
+pub fn admx_multiply_a_omega_bed<'py>(
+    py: Python<'py>,
+    genotype_path: String,
+    omega: PyReadonlyArray2<'py, f32>,
+    row_freq: PyReadonlyArray1<'py, f32>,
+    snps_only: bool,
+    maf: f32,
+    missing_rate: f32,
+    delimiter: Option<String>,
+    mmap_window_mb: usize,
+) -> PyResult<Bound<'py, PyArray2<f32>>> {
+    let omega = omega.as_array();
+    let (n, kp) = omega.dim();
+    let omega_s = omega
+        .as_slice()
+        .ok_or_else(|| PyRuntimeError::new_err("omega is not contiguous"))?;
+    let row_freq_s = row_freq
+        .as_slice()
+        .map_err(|_| PyRuntimeError::new_err("row_freq is not contiguous"))?;
+    let cfg = StreamRsvdConfig {
+        genotype_path,
+        snps_only,
+        maf,
+        missing_rate,
+        delimiter,
+        mmap_window_mb,
+    };
+    let packed_backend = try_build_packed_bed_backend(&cfg).map_err(PyRuntimeError::new_err)?;
+    let out_vec = if let Some(backend) = packed_backend.as_ref() {
+        multiply_a_omega_packed_checked_impl(backend, omega_s, n, kp, row_freq_s.len())
+            .map_err(PyRuntimeError::new_err)?
+    } else {
+        compute_a_omega_stream(&cfg, omega_s, row_freq_s, row_freq_s.len(), n, kp)
+            .map_err(PyRuntimeError::new_err)?
+    };
+    vec_to_pyarray2_f32(py, row_freq_s.len(), kp, &out_vec)
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    genotype_path,
+    snps_only=true,
+    maf=0.02,
+    missing_rate=0.05
+))]
+pub fn admx_bed_training_meta<'py>(
+    py: Python<'py>,
+    genotype_path: String,
+    snps_only: bool,
+    maf: f32,
+    missing_rate: f32,
+) -> PyResult<(Bound<'py, PyArray1<f32>>, usize)> {
+    if !(0.0..=0.5).contains(&maf) {
+        return Err(PyRuntimeError::new_err("maf must be within [0, 0.5]"));
+    }
+    if !(0.0..=1.0).contains(&missing_rate) {
+        return Err(PyRuntimeError::new_err(
+            "missing_rate must be within [0, 1]",
+        ));
+    }
+    let (backend, _prefix) = py
+        .detach(move || {
+            open_packed_bed_backend_for_training(&genotype_path, snps_only, maf, missing_rate)
+        })
+        .map_err(PyRuntimeError::new_err)?;
+    let row_freq_arr = row_freq_to_pyarray(py, &backend.row_freq);
+    let n_samples = backend.n_samples;
+    Ok((row_freq_arr, n_samples))
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    genotype_path,
+    p,
+    q,
+    snps_only=true,
+    maf=0.02,
+    missing_rate=0.05
+))]
+pub fn admx_loglikelihood_bed_f32(
+    genotype_path: String,
+    p: PyReadonlyArray2<'_, f32>,
+    q: PyReadonlyArray2<'_, f32>,
+    snps_only: bool,
+    maf: f32,
+    missing_rate: f32,
+) -> PyResult<f64> {
+    let (backend, _prefix) =
+        open_packed_bed_backend_for_training(&genotype_path, snps_only, maf, missing_rate)
+            .map_err(PyRuntimeError::new_err)?;
+    loglikelihood_packed_checked_impl(&backend, &p.as_array(), &q.as_array())
+        .map_err(PyRuntimeError::new_err)
 }
 
 #[pyfunction]
@@ -4003,5 +8338,68 @@ pub fn admx_adam_optimize_f32<'py>(
     };
     p_out_s.copy_from_slice(&p_best);
     q_out_s.copy_from_slice(&q_best);
+    Ok((p_out, q_out, ll_best, last_iter))
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    genotype_path,
+    p0,
+    q0,
+    lr=0.005,
+    beta1=0.80,
+    beta2=0.88,
+    epsilon=1e-8,
+    max_iter=1500,
+    check_every=5,
+    lr_decay=0.5,
+    min_lr=1e-6,
+    snps_only=true,
+    maf=0.02,
+    missing_rate=0.05
+))]
+pub fn admx_adam_optimize_bed_f32<'py>(
+    py: Python<'py>,
+    genotype_path: String,
+    p0: PyReadonlyArray2<'py, f32>,
+    q0: PyReadonlyArray2<'py, f32>,
+    lr: f32,
+    beta1: f32,
+    beta2: f32,
+    epsilon: f32,
+    max_iter: usize,
+    check_every: usize,
+    lr_decay: f32,
+    min_lr: f32,
+    snps_only: bool,
+    maf: f32,
+    missing_rate: f32,
+) -> PyResult<(
+    Bound<'py, PyArray2<f32>>,
+    Bound<'py, PyArray2<f32>>,
+    f64,
+    usize,
+)> {
+    let (backend, _prefix) =
+        open_packed_bed_backend_for_training(&genotype_path, snps_only, maf, missing_rate)
+            .map_err(PyRuntimeError::new_err)?;
+    let p0v = p0.as_array();
+    let q0v = q0.as_array();
+    let (p_best, q_best, ll_best, last_iter) = adam_optimize_packed_impl(
+        &backend,
+        &p0v,
+        &q0v,
+        lr,
+        beta1,
+        beta2,
+        epsilon,
+        max_iter,
+        check_every,
+        lr_decay,
+        min_lr,
+    )
+    .map_err(PyRuntimeError::new_err)?;
+    let p_out = vec_to_pyarray2_f32(py, backend.n_snps, p0v.shape()[1], &p_best)?;
+    let q_out = vec_to_pyarray2_f32(py, backend.n_samples, q0v.shape()[1], &q_best)?;
     Ok((p_out, q_out, ll_best, last_iter))
 }

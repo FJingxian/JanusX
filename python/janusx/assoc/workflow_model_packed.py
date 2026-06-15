@@ -1201,8 +1201,9 @@ def run_qtn_segmented_lm_stage2(
     progress_callback,
     args_obj: object,
 ) -> tuple[int, int, int]:
-    if not hasattr(jxrs, "lm_stream_bed_segments_to_tsv"):
-        raise RuntimeError("Rust extension missing lm_stream_bed_segments_to_tsv; rebuild JanusX.")
+    has_compact = hasattr(jxrs, "lm_stream_bed_segments_compact_to_tsv")
+    if not has_compact and not hasattr(jxrs, "lm_stream_bed_segments_to_tsv"):
+        raise RuntimeError("Rust extension missing stage2 LM streaming functions; rebuild JanusX.")
     qtn_rows = _read_qtn_rows(qtn_tsv)
     _qtn_packed, _qtn_n, qtn_active_row_idx, _qtn_maf, _qtn_miss, _qtn_flip = _packed_ctx_active_view_for_gwas(
         qtn_preloaded_packed["packed_ctx"]  # type: ignore[arg-type]
@@ -1227,15 +1228,11 @@ def run_qtn_segmented_lm_stage2(
         ),
         dtype=np.float64,
     )
-    x_contexts: list[np.ndarray] = [
-        np.ascontiguousarray(np.concatenate([base_design, qtn_cov], axis=1), dtype=np.float64)
-    ]
     windows = _qtn_windows_from_meta(qtn_meta, qtn_cov, _farmcpu_final_window_bp_from_args(args_obj))
+    context_exclude_qtn: list[list[int]] = [[]]
     for w in windows:
-        qpos = set(int(x) for x in list(w.get("qtn_positions", [])))
-        keep_cols = [j for j in range(int(qtn_cov.shape[1])) if j not in qpos]
-        qtn_local = qtn_cov[:, keep_cols] if keep_cols else np.zeros((int(y_vec.shape[0]), 0), dtype=np.float64)
-        x_contexts.append(np.ascontiguousarray(np.concatenate([base_design, qtn_local], axis=1), dtype=np.float64))
+        qpos = sorted(set(int(x) for x in list(w.get("qtn_positions", []))))
+        context_exclude_qtn.append(qpos)
     main_ids = _read_bed_fam_iids(main_prefix)
     id_map = {str(sid): i for i, sid in enumerate(main_ids)}
     try:
@@ -1264,23 +1261,56 @@ def run_qtn_segmented_lm_stage2(
         active_row_idx=active_row_idx,
         windows=windows,
     )
-    kept_rows, scan_rows = jxrs.lm_stream_bed_segments_to_tsv(
-        str(main_prefix),
-        np.ascontiguousarray(np.asarray(y_vec, dtype=np.float64).reshape(-1), dtype=np.float64),
-        x_contexts,
-        segments,
-        str(tmp_tsv),
-        sample_ids=[str(x) for x in np.asarray(trait_ids, dtype=str)],
-        maf_threshold=float(maf_threshold),
-        max_missing_rate=float(max_missing_rate),
-        het_threshold=float(het_threshold),
-        snps_only=bool(snps_only),
-        chunk_size=int(max(1, int(chunk_size))),
-        threads=int(max(1, int(threads))),
-        progress_callback=progress_callback,
-        progress_every=int(max(1, min(int(max(1, int(chunk_size))), _progress_callback_step(int(max(1, active_row_idx.shape[0])))))),
-        mmap_window_mb=(None if stage2_mmap_window_mb is None else int(max(1, int(stage2_mmap_window_mb)))),
-    )
+    y_stage2 = np.ascontiguousarray(np.asarray(y_vec, dtype=np.float64).reshape(-1), dtype=np.float64)
+    sample_ids_stage2 = [str(x) for x in np.asarray(trait_ids, dtype=str)]
+    progress_every = int(max(1, min(int(max(1, int(chunk_size))), _progress_callback_step(int(max(1, active_row_idx.shape[0]))))))
+    mmap_window_arg = None if stage2_mmap_window_mb is None else int(max(1, int(stage2_mmap_window_mb)))
+    if has_compact:
+        kept_rows, scan_rows = jxrs.lm_stream_bed_segments_compact_to_tsv(
+            str(main_prefix),
+            y_stage2,
+            base_design,
+            np.ascontiguousarray(np.asarray(qtn_cov, dtype=np.float64), dtype=np.float64),
+            context_exclude_qtn,
+            segments,
+            str(tmp_tsv),
+            sample_ids=sample_ids_stage2,
+            maf_threshold=float(maf_threshold),
+            max_missing_rate=float(max_missing_rate),
+            het_threshold=float(het_threshold),
+            snps_only=bool(snps_only),
+            chunk_size=int(max(1, int(chunk_size))),
+            threads=int(max(1, int(threads))),
+            progress_callback=progress_callback,
+            progress_every=progress_every,
+            mmap_window_mb=mmap_window_arg,
+        )
+    else:
+        x_contexts: list[np.ndarray] = [
+            np.ascontiguousarray(np.concatenate([base_design, qtn_cov], axis=1), dtype=np.float64)
+        ]
+        for exclude in context_exclude_qtn[1:]:
+            qpos = set(int(x) for x in exclude)
+            keep_cols = [j for j in range(int(qtn_cov.shape[1])) if j not in qpos]
+            qtn_local = qtn_cov[:, keep_cols] if keep_cols else np.zeros((int(y_vec.shape[0]), 0), dtype=np.float64)
+            x_contexts.append(np.ascontiguousarray(np.concatenate([base_design, qtn_local], axis=1), dtype=np.float64))
+        kept_rows, scan_rows = jxrs.lm_stream_bed_segments_to_tsv(
+            str(main_prefix),
+            y_stage2,
+            x_contexts,
+            segments,
+            str(tmp_tsv),
+            sample_ids=sample_ids_stage2,
+            maf_threshold=float(maf_threshold),
+            max_missing_rate=float(max_missing_rate),
+            het_threshold=float(het_threshold),
+            snps_only=bool(snps_only),
+            chunk_size=int(max(1, int(chunk_size))),
+            threads=int(max(1, int(threads))),
+            progress_callback=progress_callback,
+            progress_every=progress_every,
+            mmap_window_mb=mmap_window_arg,
+        )
     return int(kept_rows), int(scan_rows), int(qtn_cov.shape[1])
 
 

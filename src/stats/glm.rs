@@ -851,16 +851,28 @@ fn lm_assoc_from_qr_projection(
     ss: f64,
     ctx: &LmQrProjection,
 ) -> [f64; 5] {
-    debug_assert_eq!(qg.len(), ctx.rank);
+    lm_assoc_from_projection_residual(qg, gy_resid, ss, ctx.rss0, ctx.n, ctx.rank)
+}
+
+#[inline]
+fn lm_assoc_from_projection_residual(
+    qg: &[f64],
+    gy_resid: f64,
+    ss: f64,
+    rss0: f64,
+    n: usize,
+    rank: usize,
+) -> [f64; 5] {
+    debug_assert_eq!(qg.len(), rank);
     let q_quad = qg.iter().map(|v| v * v).sum::<f64>();
     let gg_resid = ss - q_quad;
-    let df = ctx.df_snp();
+    let df = (n as i32) - (rank as i32) - 1;
     if !(gg_resid.is_finite() && gg_resid > 1e-8) || df <= 0 {
         return [f64::NAN, f64::NAN, f64::NAN, f64::NAN, f64::NAN];
     }
 
     let beta_snp = gy_resid / gg_resid;
-    let rss1 = (ctx.rss0 - gy_resid * beta_snp).max(0.0);
+    let rss1 = (rss0 - gy_resid * beta_snp).max(0.0);
     let ve = rss1 / (df as f64);
     if !(ve.is_finite() && ve > 0.0) {
         return [f64::NAN, f64::NAN, f64::NAN, f64::NAN, f64::NAN];
@@ -871,9 +883,9 @@ fn lm_assoc_from_qr_projection(
         return [f64::NAN, f64::NAN, f64::NAN, f64::NAN, f64::NAN];
     }
     let t = beta_snp / se_snp;
-    let stat = (ctx.n as f64) * (1.0 + (t * t) / (df as f64)).ln();
+    let stat = (n as f64) * (1.0 + (t * t) / (df as f64)).ln();
     let pwald = student_t_p_two_sided(t, df);
-    let plrt = lm_plrt_from_t2(t * t, ctx.n, df);
+    let plrt = lm_plrt_from_t2(t * t, n, df);
     [beta_snp, se_snp, stat, pwald, plrt]
 }
 
@@ -887,6 +899,22 @@ fn lm_assoc_from_qr_projection_raw(
     debug_assert_eq!(qg.len(), ctx.rank);
     let gy_resid = gy_raw - dot(qg, &ctx.qty);
     lm_assoc_from_qr_projection(qg, gy_resid, ss, ctx)
+}
+
+#[inline]
+fn lm_assoc_from_projection_raw_values(
+    qg: &[f64],
+    qty: &[f64],
+    gy_raw: f64,
+    ss: f64,
+    rss0: f64,
+    n: usize,
+    rank: usize,
+) -> [f64; 5] {
+    debug_assert_eq!(qg.len(), rank);
+    debug_assert_eq!(qty.len(), rank);
+    let gy_resid = gy_raw - dot(qg, qty);
+    lm_assoc_from_projection_residual(qg, gy_resid, ss, rss0, n, rank)
 }
 
 #[derive(Clone, Copy)]
@@ -951,6 +979,323 @@ impl LmUnifiedStreamingChunk {
         self.rows = 0usize;
         self.scanned_to = 0usize;
     }
+}
+
+#[derive(Clone, Debug)]
+struct LmStage2CompactContext {
+    col_indices: Vec<usize>,
+    chol_l: Vec<f64>,
+    qty: Vec<f64>,
+    rss0: f64,
+    rank: usize,
+    n: usize,
+}
+
+#[inline]
+fn lm_forward_solve_lower_inplace(l: &[f64], dim: usize, rhs: &mut [f64]) {
+    debug_assert_eq!(l.len(), dim.saturating_mul(dim));
+    debug_assert_eq!(rhs.len(), dim);
+    for i in 0..dim {
+        let mut sum = rhs[i];
+        for k in 0..i {
+            sum -= l[i * dim + k] * rhs[k];
+        }
+        rhs[i] = sum / l[i * dim + i];
+    }
+}
+
+fn lm_stage2_build_x_all_f32(
+    x_base: &[f64],
+    qtn_cov: &[f64],
+    n: usize,
+    base_cols: usize,
+    qtn_cols: usize,
+) -> Result<Vec<f32>, String> {
+    if x_base.len() != n.saturating_mul(base_cols) {
+        return Err("x_base shape mismatch".to_string());
+    }
+    if qtn_cov.len() != n.saturating_mul(qtn_cols) {
+        return Err("qtn_cov shape mismatch".to_string());
+    }
+    let q_all = base_cols.saturating_add(qtn_cols);
+    if q_all == 0 {
+        return Err("stage2 design has zero columns".to_string());
+    }
+    let mut out = vec![0.0_f32; n.saturating_mul(q_all)];
+    for i in 0..n {
+        let dst = &mut out[i * q_all..(i + 1) * q_all];
+        for c in 0..base_cols {
+            let value = x_base[i * base_cols + c];
+            if !value.is_finite() {
+                return Err("x_base contains non-finite values".to_string());
+            }
+            dst[c] = value as f32;
+        }
+        for c in 0..qtn_cols {
+            let value = qtn_cov[i * qtn_cols + c];
+            if !value.is_finite() {
+                return Err("qtn_cov contains non-finite values".to_string());
+            }
+            dst[base_cols + c] = value as f32;
+        }
+    }
+    Ok(out)
+}
+
+fn lm_stage2_xtx_from_x_all_f32(
+    x_all_f32: &[f32],
+    n: usize,
+    q_all: usize,
+) -> Result<Vec<f64>, String> {
+    if x_all_f32.len() != n.saturating_mul(q_all) {
+        return Err("x_all_f32 shape mismatch".to_string());
+    }
+    let mut xtx_f32 = vec![0.0_f32; q_all.saturating_mul(q_all)];
+    if q_all > 0 && n > 0 {
+        unsafe {
+            cblas_sgemm_dispatch(
+                CBLAS_ROW_MAJOR,
+                CBLAS_TRANS,
+                CBLAS_NO_TRANS,
+                q_all as CblasInt,
+                q_all as CblasInt,
+                n as CblasInt,
+                1.0,
+                x_all_f32.as_ptr(),
+                q_all as CblasInt,
+                x_all_f32.as_ptr(),
+                q_all as CblasInt,
+                0.0,
+                xtx_f32.as_mut_ptr(),
+                q_all as CblasInt,
+            );
+        }
+    }
+    Ok(xtx_f32.into_iter().map(|v| v as f64).collect())
+}
+
+fn lm_stage2_xty_from_design(
+    x_base: &[f64],
+    qtn_cov: &[f64],
+    y: &[f64],
+    n: usize,
+    base_cols: usize,
+    qtn_cols: usize,
+) -> Result<Vec<f64>, String> {
+    let q_all = base_cols.saturating_add(qtn_cols);
+    if y.len() != n {
+        return Err("y length mismatch".to_string());
+    }
+    if x_base.len() != n.saturating_mul(base_cols) {
+        return Err("x_base shape mismatch".to_string());
+    }
+    if qtn_cov.len() != n.saturating_mul(qtn_cols) {
+        return Err("qtn_cov shape mismatch".to_string());
+    }
+    let xty: Vec<f64> = (0..q_all)
+        .into_par_iter()
+        .map(|col| {
+            let mut acc = 0.0_f64;
+            if col < base_cols {
+                for i in 0..n {
+                    acc += x_base[i * base_cols + col] * y[i];
+                }
+            } else {
+                let qcol = col - base_cols;
+                for i in 0..n {
+                    acc += qtn_cov[i * qtn_cols + qcol] * y[i];
+                }
+            }
+            acc
+        })
+        .collect();
+    Ok(xty)
+}
+
+fn lm_stage2_context_from_subset_xtx(
+    xtx_all: &[f64],
+    xty_all: &[f64],
+    yy: f64,
+    n: usize,
+    q_all: usize,
+    col_indices: Vec<usize>,
+) -> Result<LmStage2CompactContext, String> {
+    if col_indices.is_empty() {
+        return Err("stage2 context has zero columns".to_string());
+    }
+
+    // Rank-revealing compact QR via Cholesky on X'X.  We never materialize Q:
+    // for each SNP, Q'g is obtained as solve(L, X'g), where X'X = L L'.
+    let requested_rank = col_indices.len();
+    let mut active_cols = Vec::<usize>::with_capacity(requested_rank);
+    let mut rows_l: Vec<Vec<f64>> = Vec::with_capacity(requested_rank);
+    for &src_col in col_indices.iter() {
+        if src_col >= q_all {
+            return Err(format!(
+                "stage2 context column {src_col} out of range {q_all}"
+            ));
+        }
+        let diag = xtx_all[src_col * q_all + src_col];
+        if !diag.is_finite() || diag <= 0.0 {
+            continue;
+        }
+        let cur_rank = active_cols.len();
+        let mut row = vec![0.0_f64; cur_rank + 1];
+        for j in 0..cur_rank {
+            let active_col = active_cols[j];
+            let mut sum = xtx_all[src_col * q_all + active_col];
+            if !sum.is_finite() {
+                return Err("stage2 compact QR received non-finite X'X".to_string());
+            }
+            for k in 0..j {
+                sum -= row[k] * rows_l[j][k];
+            }
+            let pivot = rows_l[j][j];
+            if pivot <= 0.0 || !pivot.is_finite() {
+                return Err("stage2 compact QR produced invalid Cholesky pivot".to_string());
+            }
+            row[j] = sum / pivot;
+        }
+        let projected = row[..cur_rank].iter().map(|v| v * v).sum::<f64>();
+        let residual_diag = diag - projected;
+        let tol = 1e-12_f64 * diag.abs().max(1.0);
+        if residual_diag <= tol || !residual_diag.is_finite() {
+            continue;
+        }
+        row[cur_rank] = residual_diag.sqrt();
+        active_cols.push(src_col);
+        rows_l.push(row);
+    }
+
+    let rank = active_cols.len();
+    if rank == 0 {
+        return Err("stage2 compact QR failed: all design columns are rank deficient".to_string());
+    }
+    if n <= rank + 1 {
+        return Err(format!(
+            "n too small: require n > rank+1, got n={n}, rank={rank}"
+        ));
+    }
+    let mut chol_l = vec![0.0_f64; rank.saturating_mul(rank)];
+    for i in 0..rank {
+        for j in 0..=i {
+            chol_l[i * rank + j] = rows_l[i][j];
+        }
+    }
+    let mut qty = vec![0.0_f64; rank];
+    for (i, &src) in active_cols.iter().enumerate() {
+        qty[i] = xty_all[src];
+    }
+    lm_forward_solve_lower_inplace(&chol_l, rank, &mut qty);
+    let y_fit_ss = qty.iter().map(|v| v * v).sum::<f64>();
+    let rss0 = (yy - y_fit_ss).max(0.0);
+    if !rss0.is_finite() {
+        return Err("stage2 compact QR produced non-finite residual RSS".to_string());
+    }
+    Ok(LmStage2CompactContext {
+        col_indices: active_cols,
+        chol_l,
+        qty,
+        rss0,
+        rank,
+        n,
+    })
+}
+
+fn parse_lm_context_exclude_qtn<'py>(
+    context_exclude_qtn: Bound<'py, PyAny>,
+    qtn_cols: usize,
+) -> PyResult<Vec<Vec<usize>>> {
+    let outer = context_exclude_qtn.cast::<PyList>().map_err(|_| {
+        PyValueError::new_err("context_exclude_qtn must be a list of qtn-index lists")
+    })?;
+    let mut out = Vec::<Vec<usize>>::with_capacity(outer.len());
+    for (idx, item) in outer.iter().enumerate() {
+        let inner = item.cast::<PyList>().map_err(|_| {
+            PyValueError::new_err(format!("context_exclude_qtn[{idx}] must be a list"))
+        })?;
+        let mut vals = Vec::<usize>::with_capacity(inner.len());
+        let mut seen = std::collections::HashSet::<usize>::with_capacity(inner.len());
+        for value in inner.iter() {
+            let qidx: usize = value.extract().map_err(|_| {
+                PyValueError::new_err(format!(
+                    "context_exclude_qtn[{idx}] contains a non-integer value"
+                ))
+            })?;
+            if qidx >= qtn_cols {
+                return Err(PyValueError::new_err(format!(
+                    "context_exclude_qtn[{idx}] index {qidx} out of range {qtn_cols}"
+                )));
+            }
+            if seen.insert(qidx) {
+                vals.push(qidx);
+            }
+        }
+        vals.sort_unstable();
+        out.push(vals);
+    }
+    Ok(out)
+}
+
+fn lm_stage2_build_compact_contexts(
+    xtx_all: &[f64],
+    xty_all: &[f64],
+    yy: f64,
+    n: usize,
+    base_cols: usize,
+    qtn_cols: usize,
+    context_exclude_qtn: &[Vec<usize>],
+    threads: usize,
+) -> Result<Vec<LmStage2CompactContext>, String> {
+    let q_all = base_cols.saturating_add(qtn_cols);
+    let build_one = |exclude: &Vec<usize>| -> Result<LmStage2CompactContext, String> {
+        let mut excluded = vec![false; qtn_cols];
+        for &idx in exclude {
+            excluded[idx] = true;
+        }
+        let mut cols = Vec::<usize>::with_capacity(q_all.saturating_sub(exclude.len()));
+        cols.extend(0..base_cols);
+        for qidx in 0..qtn_cols {
+            if !excluded[qidx] {
+                cols.push(base_cols + qidx);
+            }
+        }
+        lm_stage2_context_from_subset_xtx(xtx_all, xty_all, yy, n, q_all, cols)
+    };
+    if context_exclude_qtn.len() <= 1 {
+        return context_exclude_qtn.iter().map(build_one).collect();
+    }
+    let ctx_threads = threads.max(1).min(context_exclude_qtn.len()).min(8);
+    let pool = get_cached_pool(ctx_threads).map_err(|e| e.to_string())?;
+    if let Some(tp) = pool.as_ref() {
+        tp.install(|| context_exclude_qtn.par_iter().map(build_one).collect())
+    } else {
+        context_exclude_qtn.iter().map(build_one).collect()
+    }
+}
+
+#[inline]
+fn lm_stage2_compact_assoc_from_gx(
+    ctx: &LmStage2CompactContext,
+    gx_all_row: &[f32],
+    gy_raw: f64,
+    ss: f64,
+    qg_tmp: &mut [f64],
+) -> [f64; 5] {
+    debug_assert!(qg_tmp.len() >= ctx.rank);
+    for (dst, &src_col) in ctx.col_indices.iter().enumerate() {
+        qg_tmp[dst] = gx_all_row[src_col] as f64;
+    }
+    lm_forward_solve_lower_inplace(&ctx.chol_l, ctx.rank, &mut qg_tmp[..ctx.rank]);
+    lm_assoc_from_projection_raw_values(
+        &qg_tmp[..ctx.rank],
+        &ctx.qty,
+        gy_raw,
+        ss,
+        ctx.rss0,
+        ctx.n,
+        ctx.rank,
+    )
 }
 
 #[inline]
@@ -1700,6 +2045,378 @@ fn lm_stream_bed_segments_windowed_unified(
     crate::pipeline::run_double_buffer(
         2,
         || LmUnifiedStreamingChunk::new(scan_chunk_snps, n, max_rank),
+        producer,
+        consumer,
+    )?;
+    if let Some(err) = producer_err.get() {
+        return Err(err.clone());
+    }
+    if !segment_plan.is_empty() {
+        let expected = segment_plan.last().map(|s| s.end).unwrap_or(0usize);
+        if active_idx != expected {
+            return Err(format!(
+                "segment active marker count mismatch: streamed={active_idx}, segments_end={expected}"
+            ));
+        }
+    }
+    if let Some(cb) = progress_callback {
+        let _ = Python::attach(|py2| -> PyResult<()> {
+            py2.check_signals()?;
+            cb.call1(py2, (n_snps, n_snps))?;
+            Ok(())
+        });
+    }
+    writer.finish()?;
+    Ok((kept_total, n_snps))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lm_stream_bed_segments_compact_windowed_unified(
+    norm_prefix: &str,
+    y_raw: &[f64],
+    x_all_f32: &[f32],
+    q_all: usize,
+    compact_contexts: &[LmStage2CompactContext],
+    segment_plan: &[LmStreamSegment],
+    out_tsv_path: &str,
+    sample_indices: &[usize],
+    maf_threshold: f32,
+    max_missing_rate: f32,
+    het_threshold: f32,
+    snps_only: bool,
+    chunk_size: usize,
+    threads: usize,
+    progress_callback: Option<&Py<PyAny>>,
+    progress_every: usize,
+    mmap_window_mb: usize,
+) -> Result<(usize, usize), String> {
+    let n = y_raw.len();
+    if compact_contexts.is_empty() {
+        return Err("compact stage2 contexts must not be empty".to_string());
+    }
+    if q_all == 0 || x_all_f32.len() != n.saturating_mul(q_all) {
+        return Err("compact stage2 design shape mismatch".to_string());
+    }
+    if sample_indices.len() != n {
+        return Err(format!(
+            "sample_ids length mismatch: selected n={} but len(y)={n}",
+            sample_indices.len()
+        ));
+    }
+    let full_samples = gfcore::read_fam(norm_prefix)?;
+    let n_samples_full = full_samples.len();
+    if n_samples_full == 0 {
+        return Err("no samples in PLINK FAM".to_string());
+    }
+    if let Some(max_sid) = sample_indices.iter().copied().max() {
+        if max_sid >= n_samples_full {
+            return Err(format!(
+                "sample index {max_sid} out of bounds for {n_samples_full} BED samples"
+            ));
+        }
+    }
+
+    let (all_chrom, all_pos, all_snp, all_allele0, all_allele1) =
+        read_bim_columns(norm_prefix, None)?;
+    let mut bed_window = WindowedBedMatrix::open(norm_prefix, mmap_window_mb)?;
+    let bytes_per_snp = bed_window.bytes_per_snp();
+    let n_snps = bed_window.n_source_snps();
+    if all_chrom.len() != n_snps {
+        return Err(format!(
+            "BIM site count {} != BED SNP count {n_snps}",
+            all_chrom.len()
+        ));
+    }
+
+    let use_selected =
+        !sample_indices_are_identity(sample_indices) || sample_indices.len() != n_samples_full;
+    let sample_identity = !use_selected;
+    let selected_excluded_sample_indices = if use_selected {
+        precompute_excluded_sample_indices(n_samples_full, sample_indices)
+    } else {
+        None
+    };
+    let sample_subset_plan: Option<SubsetDecodePlan> = if sample_identity {
+        None
+    } else {
+        Some(SubsetDecodePlan::from_sample_idx_with_n_samples(
+            sample_indices,
+            n_samples_full,
+        ))
+    };
+    let dense_subset_pos = if sample_identity {
+        None
+    } else {
+        lm_maybe_build_dense_subset_pos(sample_indices, n_samples_full)
+    };
+
+    let pool = get_cached_pool(threads).map_err(|e| e.to_string())?;
+    let max_rank = compact_contexts
+        .iter()
+        .map(|ctx| ctx.rank)
+        .max()
+        .unwrap_or(0usize);
+    let scan_chunk_snps = chunk_size.max(1024).min(65536).min(n_snps.max(1));
+    let progress_block = if progress_every == 0 {
+        scan_chunk_snps.max(1)
+    } else {
+        progress_every.max(1)
+    };
+    let mut next_progress_emit = progress_block.min(n_snps).max(1);
+    let output_row_limit = lm_max_output_rows_env();
+    let mut written_total = 0usize;
+    let mut kept_total = 0usize;
+    let mut text = String::with_capacity(scan_chunk_snps * 112);
+    let mut qg_tmp = vec![0.0_f64; max_rank.max(1)];
+
+    let lm_parallel_rhs =
+        lm_prefer_parallel_small_rhs(scan_chunk_snps.max(1), n, q_all, pool.as_ref());
+    let blas_threads = if lm_parallel_rhs || rust_sgemm_prefers_rayon_rowmajor_f32_kernel() {
+        1usize
+    } else {
+        threads.max(1)
+    };
+    let _blas_guard = BlasThreadGuard::enter(blas_threads);
+
+    let writer = AsyncTsvWriter::with_config(
+        out_tsv_path,
+        b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\n",
+        64 * 1024 * 1024,
+        16,
+    )?;
+
+    let mut chunk_start = 0usize;
+    let mut active_idx = 0usize;
+    let mut segment_cursor = 0usize;
+    let producer_err = Arc::new(OnceLock::<String>::new());
+    let producer_err_bg = Arc::clone(&producer_err);
+    let producer = |chunk: &mut LmUnifiedStreamingChunk| -> bool {
+        if chunk_start >= n_snps {
+            return false;
+        }
+        chunk.clear();
+        let chunk_end = (chunk_start + scan_chunk_snps).min(n_snps);
+        let chunk_packed = match bed_window.read_source_range(chunk_start, chunk_end) {
+            Ok(slice) => slice,
+            Err(e) => {
+                let _ = producer_err_bg.set(e);
+                return false;
+            }
+        };
+
+        let counts: Vec<Option<LmUnifiedSnpCounts>> = (chunk_start..chunk_end)
+            .into_par_iter()
+            .map(|snp_idx| {
+                let local_idx = snp_idx - chunk_start;
+                let row = &chunk_packed[local_idx * bytes_per_snp..(local_idx + 1) * bytes_per_snp];
+                let (missing, het, hom_alt) = if use_selected {
+                    count_packed_row_counts_selected_with_excluded(
+                        row,
+                        n_samples_full,
+                        sample_indices,
+                        selected_excluded_sample_indices.as_deref(),
+                    )
+                } else {
+                    count_packed_row_counts(row, n_samples_full)
+                };
+                let non_missing = n.saturating_sub(missing);
+                let miss_rate = if n > 0 {
+                    missing as f32 / n as f32
+                } else {
+                    1.0_f32
+                };
+                if miss_rate > max_missing_rate {
+                    return None;
+                }
+                if non_missing == 0 {
+                    return if maf_threshold > 0.0 {
+                        None
+                    } else {
+                        Some(LmUnifiedSnpCounts {
+                            maf: 0.0_f32,
+                            missing_count: missing,
+                        })
+                    };
+                }
+                if het_threshold > 0.0 {
+                    let het_rate = het as f32 / non_missing as f32;
+                    if het_rate > het_threshold {
+                        return None;
+                    }
+                }
+                let alt_sum = het.saturating_add(hom_alt.saturating_mul(2));
+                let alt_freq = alt_sum as f32 / (2.0_f32 * non_missing as f32);
+                let maf = alt_freq.min(1.0_f32 - alt_freq);
+                if maf < maf_threshold {
+                    return None;
+                }
+
+                Some(LmUnifiedSnpCounts {
+                    maf: alt_freq,
+                    missing_count: missing,
+                })
+            })
+            .collect();
+
+        for (offset, snp_idx) in (chunk_start..chunk_end).enumerate() {
+            let cnts = match counts[offset] {
+                Some(c) => c,
+                None => continue,
+            };
+            if snps_only
+                && (!is_simple_snp_allele(&all_allele0[snp_idx])
+                    || !is_simple_snp_allele(&all_allele1[snp_idx]))
+            {
+                continue;
+            }
+            let ctx_id = match lm_segment_context_for_active_idx(
+                segment_plan,
+                &mut segment_cursor,
+                active_idx,
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = producer_err_bg.set(e);
+                    return false;
+                }
+            };
+            if ctx_id >= compact_contexts.len() {
+                let _ = producer_err_bg.set(format!(
+                    "segment context index {ctx_id} exceeds compact context length {}",
+                    compact_contexts.len()
+                ));
+                return false;
+            }
+            chunk.indices.push(offset);
+            chunk.flip.push(false);
+            chunk.maf.push(cnts.maf);
+            chunk.miss_block[chunk.rows] = cnts.missing_count;
+            chunk.chrom.push(all_chrom[snp_idx].clone());
+            chunk.pos.push(all_pos[snp_idx] as i64);
+            chunk.snp.push(lm_resolve_snp_name(
+                &all_snp[snp_idx],
+                &all_chrom[snp_idx],
+                all_pos[snp_idx],
+            ));
+            chunk.a0.push(all_allele0[snp_idx].clone());
+            chunk.a1.push(all_allele1[snp_idx].clone());
+            chunk.ctx_ids.push(ctx_id);
+            chunk.rows += 1;
+            active_idx = active_idx.saturating_add(1);
+        }
+
+        if chunk.rows > 0 {
+            decode_centered_block_packed_f32(
+                chunk_packed,
+                bytes_per_snp,
+                &chunk.flip,
+                &chunk.maf,
+                Some(&chunk.indices),
+                0,
+                chunk.rows,
+                if sample_identity { n_samples_full } else { n },
+                PackedDecodeGeneticModel::Add,
+                sample_identity,
+                sample_subset_plan.as_ref(),
+                dense_subset_pos.as_deref(),
+                &mut chunk.g_block[..chunk.rows * n],
+            );
+        }
+
+        chunk.scanned_to = chunk_end;
+        chunk_start = chunk_end;
+        chunk_start < n_snps
+    };
+
+    let consumer = |chunk: &mut LmUnifiedStreamingChunk| {
+        let rows = chunk.rows;
+        if rows > 0 {
+            let g_slice = &chunk.g_block[..rows * n];
+            row_major_block_dot_and_sumsq_f64(
+                g_slice,
+                rows,
+                n,
+                y_raw,
+                &mut chunk.gy_block[..rows],
+                &mut chunk.ss_block[..rows],
+                pool.as_ref(),
+            );
+            row_major_block_mul_mat_f32_lm(
+                g_slice,
+                rows,
+                n,
+                x_all_f32,
+                q_all,
+                &mut chunk.qg_block[..rows * q_all],
+                pool.as_ref(),
+            );
+
+            for row_idx in 0..rows {
+                let ctx = &compact_contexts[chunk.ctx_ids[row_idx]];
+                let gx_row = &chunk.qg_block[row_idx * q_all..(row_idx + 1) * q_all];
+                let stats = lm_stage2_compact_assoc_from_gx(
+                    ctx,
+                    gx_row,
+                    chunk.gy_block[row_idx],
+                    chunk.ss_block[row_idx],
+                    &mut qg_tmp,
+                );
+                chunk.out_block[row_idx * 5..(row_idx + 1) * 5].copy_from_slice(&stats);
+            }
+
+            let write_rows = output_row_limit
+                .map(|limit| limit.saturating_sub(written_total).min(rows))
+                .unwrap_or(rows);
+            if write_rows > 0 {
+                text.clear();
+                if text.capacity() < write_rows * 112 {
+                    text.reserve(write_rows * 112 - text.capacity());
+                }
+                for row_idx in 0..write_rows {
+                    let r = &chunk.out_block[row_idx * 5..(row_idx + 1) * 5];
+                    let chisq_txt = format_chisq_value(r[2]);
+                    let pwald = sanitize_assoc_pvalue(r[0], r[1], r[3]);
+                    let _ = write!(
+                        text,
+                        "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\n",
+                        chunk.chrom[row_idx],
+                        chunk.pos[row_idx],
+                        chunk.snp[row_idx],
+                        chunk.a0[row_idx],
+                        chunk.a1[row_idx],
+                        chunk.maf[row_idx],
+                        chunk.miss_block[row_idx],
+                        r[0],
+                        r[1],
+                        chisq_txt,
+                        pwald
+                    );
+                }
+                writer.send(std::mem::take(&mut text).into_bytes())?;
+                written_total = written_total.saturating_add(write_rows);
+            }
+        }
+
+        kept_total = kept_total.saturating_add(rows);
+        if chunk.scanned_to >= next_progress_emit {
+            if let Some(cb) = progress_callback {
+                let _ = Python::attach(|py2| -> PyResult<()> {
+                    py2.check_signals()?;
+                    cb.call1(py2, (chunk.scanned_to.min(n_snps), n_snps))?;
+                    Ok(())
+                });
+            }
+            next_progress_emit = (chunk.scanned_to / progress_block + 1)
+                .saturating_mul(progress_block)
+                .min(n_snps);
+        }
+
+        Ok::<(), String>(())
+    };
+
+    crate::pipeline::run_double_buffer(
+        2,
+        || LmUnifiedStreamingChunk::new(scan_chunk_snps, n, q_all),
         producer,
         consumer,
     )?;
@@ -2661,6 +3378,195 @@ fn parse_lm_segments_unbounded<'py>(
         prev_end = end;
     }
     Ok(out)
+}
+
+/// Compact QR-projected LM streaming scan over ordered active marker segments.
+///
+/// This is the stage2-optimized variant.  Python passes one base design matrix,
+/// one QTN covariate matrix, and per-context QTN columns to exclude; Rust keeps
+/// only compact Cholesky/QR factors for each context instead of materializing Q.
+#[pyfunction]
+#[pyo3(signature = (
+    prefix,
+    y,
+    x_base,
+    qtn_cov,
+    context_exclude_qtn,
+    segments,
+    out_tsv,
+    sample_ids=None,
+    maf_threshold=0.0,
+    max_missing_rate=1.0,
+    het_threshold=0.02,
+    snps_only=false,
+    chunk_size=10000,
+    threads=0,
+    progress_callback=None,
+    progress_every=0,
+    mmap_window_mb=None,
+))]
+pub fn lm_stream_bed_segments_compact_to_tsv<'py>(
+    py: Python<'py>,
+    prefix: String,
+    y: PyReadonlyArray1<'py, f64>,
+    x_base: PyReadonlyArray2<'py, f64>,
+    qtn_cov: PyReadonlyArray2<'py, f64>,
+    context_exclude_qtn: Bound<'py, PyAny>,
+    segments: Bound<'py, PyAny>,
+    out_tsv: String,
+    sample_ids: Option<Vec<String>>,
+    maf_threshold: f32,
+    max_missing_rate: f32,
+    het_threshold: f32,
+    snps_only: bool,
+    chunk_size: usize,
+    threads: usize,
+    progress_callback: Option<Py<PyAny>>,
+    progress_every: usize,
+    mmap_window_mb: Option<usize>,
+) -> PyResult<(usize, usize)> {
+    if chunk_size == 0 {
+        return Err(PyValueError::new_err("chunk_size must be > 0"));
+    }
+    if !(0.0..=0.5).contains(&maf_threshold) {
+        return Err(PyValueError::new_err(
+            "maf_threshold must be within [0, 0.5]",
+        ));
+    }
+    if !(0.0..=1.0).contains(&max_missing_rate) {
+        return Err(PyValueError::new_err(
+            "max_missing_rate must be within [0, 1.0]",
+        ));
+    }
+    if !(0.0..=1.0).contains(&het_threshold) {
+        return Err(PyValueError::new_err(
+            "het_threshold must be within [0, 1.0]",
+        ));
+    }
+    let window_mb = mmap_window_mb
+        .filter(|v| *v > 0)
+        .ok_or_else(|| PyValueError::new_err("mmap_window_mb must be provided and > 0"))?;
+
+    let y_slice = y.as_slice()?;
+    let n = y_slice.len();
+    if n == 0 {
+        return Err(PyValueError::new_err("y must not be empty"));
+    }
+    let x_base_arr = x_base.as_array();
+    let qtn_arr = qtn_cov.as_array();
+    if x_base_arr.ndim() != 2 || qtn_arr.ndim() != 2 {
+        return Err(PyValueError::new_err("x_base and qtn_cov must be 2D"));
+    }
+    let base_rows = x_base_arr.shape()[0];
+    let base_cols = x_base_arr.shape()[1];
+    let qtn_rows = qtn_arr.shape()[0];
+    let qtn_cols = qtn_arr.shape()[1];
+    if base_rows != n {
+        return Err(PyValueError::new_err(format!(
+            "x_base rows must equal len(y): rows={base_rows}, len(y)={n}"
+        )));
+    }
+    if qtn_rows != n {
+        return Err(PyValueError::new_err(format!(
+            "qtn_cov rows must equal len(y): rows={qtn_rows}, len(y)={n}"
+        )));
+    }
+    if base_cols == 0 {
+        return Err(PyValueError::new_err(
+            "x_base must have at least one column",
+        ));
+    }
+
+    let x_base_flat: Cow<[f64]> = match x_base.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(x_base_arr.iter().copied().collect()),
+    };
+    let qtn_flat: Cow<[f64]> = match qtn_cov.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(qtn_arr.iter().copied().collect()),
+    };
+    let context_exclude = parse_lm_context_exclude_qtn(context_exclude_qtn, qtn_cols)?;
+    if context_exclude.is_empty() {
+        return Err(PyValueError::new_err(
+            "context_exclude_qtn must contain at least one context",
+        ));
+    }
+
+    let norm_prefix = normalize_plink_prefix_local(&prefix);
+    let samples = gfcore::read_fam(&norm_prefix).map_err(PyRuntimeError::new_err)?;
+    let (sample_indices, _sample_ids_ordered) =
+        build_sample_selection(&samples, sample_ids, None).map_err(PyRuntimeError::new_err)?;
+    if sample_indices.len() != n {
+        return Err(PyRuntimeError::new_err(format!(
+            "sample_ids length mismatch: selected n={} but len(y)={n}",
+            sample_indices.len()
+        )));
+    }
+
+    let y_raw = y_slice.to_vec();
+    let yy = y_raw.iter().map(|v| v * v).sum::<f64>();
+    let q_all = base_cols.saturating_add(qtn_cols);
+    let x_all_f32 = lm_stage2_build_x_all_f32(
+        x_base_flat.as_ref(),
+        qtn_flat.as_ref(),
+        n,
+        base_cols,
+        qtn_cols,
+    )
+    .map_err(PyValueError::new_err)?;
+    let xtx_all = {
+        let _blas_guard = BlasThreadGuard::enter(threads.max(1));
+        lm_stage2_xtx_from_x_all_f32(x_all_f32.as_slice(), n, q_all)
+            .map_err(PyRuntimeError::new_err)?
+    };
+    let xty_all = lm_stage2_xty_from_design(
+        x_base_flat.as_ref(),
+        qtn_flat.as_ref(),
+        y_raw.as_slice(),
+        n,
+        base_cols,
+        qtn_cols,
+    )
+    .map_err(PyRuntimeError::new_err)?;
+    let compact_contexts = {
+        let _blas_guard = BlasThreadGuard::enter(1);
+        lm_stage2_build_compact_contexts(
+            xtx_all.as_slice(),
+            xty_all.as_slice(),
+            yy,
+            n,
+            base_cols,
+            qtn_cols,
+            context_exclude.as_slice(),
+            threads,
+        )
+        .map_err(PyRuntimeError::new_err)?
+    };
+    let segment_plan = parse_lm_segments_unbounded(segments, compact_contexts.len())?;
+    let out_tsv_path = out_tsv.clone();
+
+    py.detach(move || -> PyResult<(usize, usize)> {
+        lm_stream_bed_segments_compact_windowed_unified(
+            norm_prefix.as_str(),
+            y_raw.as_slice(),
+            x_all_f32.as_slice(),
+            q_all,
+            compact_contexts.as_slice(),
+            segment_plan.as_slice(),
+            out_tsv_path.as_str(),
+            sample_indices.as_slice(),
+            maf_threshold,
+            max_missing_rate,
+            het_threshold,
+            snps_only,
+            chunk_size,
+            threads,
+            progress_callback.as_ref(),
+            progress_every,
+            window_mb,
+        )
+        .map_err(PyRuntimeError::new_err)
+    })
 }
 
 /// QR-projected LM streaming scan over ordered active marker segments.

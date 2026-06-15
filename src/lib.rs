@@ -187,7 +187,7 @@ use gfreader::{
 use glm::{
     glm_ixx_from_x_qr, glmf32, glmf32_full, glmf32_packed, glmf32_packed_assoc,
     glmf32_packed_assoc_to_tsv, lm_block_assoc_packed, lm_block_assoc_packed_to_tsv,
-    lm_stream_bed_segments_to_tsv, lm_stream_bed_to_tsv,
+    lm_stream_bed_segments_compact_to_tsv, lm_stream_bed_segments_to_tsv, lm_stream_bed_to_tsv,
 };
 use gmerge::{convert_genotypes, merge_genotypes, PyConvertStats, PyMergeStats};
 use grm::{
@@ -378,6 +378,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(glmf32_packed_assoc_to_tsv, m)?)?;
     m.add_function(wrap_pyfunction!(algwas_packed_to_tsv, m)?)?;
     m.add_function(wrap_pyfunction!(lm_stream_bed_to_tsv, m)?)?;
+    m.add_function(wrap_pyfunction!(lm_stream_bed_segments_compact_to_tsv, m)?)?;
     m.add_function(wrap_pyfunction!(lm_stream_bed_segments_to_tsv, m)?)?;
     m.add_function(wrap_pyfunction!(lm_block_assoc_packed, m)?)?;
     m.add_function(wrap_pyfunction!(lm_block_assoc_packed_to_tsv, m)?)?;

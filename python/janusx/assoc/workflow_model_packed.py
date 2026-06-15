@@ -1200,92 +1200,166 @@ def run_qtn_segmented_lm_stage2(
     threads: int,
     progress_callback,
     args_obj: object,
+    logger: Optional[logging.Logger] = None,
+    use_spinner: bool = False,
+    status_prefix: Optional[str] = None,
 ) -> tuple[int, int, int]:
     has_compact = hasattr(jxrs, "lm_stream_bed_segments_compact_to_tsv")
     if not has_compact and not hasattr(jxrs, "lm_stream_bed_segments_to_tsv"):
         raise RuntimeError("Rust extension missing stage2 LM streaming functions; rebuild JanusX.")
-    qtn_rows = _read_qtn_rows(qtn_tsv)
-    _qtn_packed, _qtn_n, qtn_active_row_idx, _qtn_maf, _qtn_miss, _qtn_flip = _packed_ctx_active_view_for_gwas(
-        qtn_preloaded_packed["packed_ctx"]  # type: ignore[arg-type]
-    )
-    qtn_active_sel, qtn_meta = _selected_qtn_active_indices(
-        qtn_prefix=str(qtn_preloaded_packed["prefix"]),
-        qtn_active_row_idx=qtn_active_row_idx,
-        qtn_rows=qtn_rows,
-    )
-    qtn_cov = _decode_qtn_covariates(
-        qtn_preloaded_packed=qtn_preloaded_packed,
-        qtn_active_indices=qtn_active_sel,
-        trait_ids=np.asarray(trait_ids, dtype=str),
-    )
-    base_design = np.ascontiguousarray(
-        np.concatenate(
-            [
-                np.ones((int(y_vec.shape[0]), 1), dtype=np.float64),
-                np.asarray(base_cov, dtype=np.float64),
-            ],
-            axis=1,
-        ),
-        dtype=np.float64,
-    )
-    windows = _qtn_windows_from_meta(qtn_meta, qtn_cov, _farmcpu_final_window_bp_from_args(args_obj))
-    context_exclude_qtn: list[list[int]] = [[]]
-    for w in windows:
-        qpos = sorted(set(int(x) for x in list(w.get("qtn_positions", []))))
-        context_exclude_qtn.append(qpos)
-    main_ids = _read_bed_fam_iids(main_prefix)
-    id_map = {str(sid): i for i, sid in enumerate(main_ids)}
+    stage_status_enabled = status_prefix is not None
+    status_tasks: dict[str, CliStatus] = {}
+
+    def _status_begin(desc: str) -> Optional[CliStatus]:
+        if not stage_status_enabled:
+            return None
+        task = CliStatus(f"{desc} ...", enabled=bool(use_spinner))
+        task.__enter__()
+        return task
+
+    def _status_complete(task: Optional[CliStatus], message: str) -> None:
+        if task is not None:
+            task.complete(message)
+        if logger is not None:
+            _log_file_only(logger, logging.INFO, message)
+
+    def _status_fail(task: Optional[CliStatus], message: str) -> None:
+        if task is not None:
+            task.fail(message)
+        if logger is not None:
+            _log_file_only(logger, logging.ERROR, message)
+
+    qtn_desc = f"Preparing {status_prefix} QTN covariates" if status_prefix else ""
+    qtn_task = _status_begin(qtn_desc)
     try:
-        sample_idx = np.asarray([id_map[str(sid)] for sid in np.asarray(trait_ids, dtype=str)], dtype=np.int64)
-    except KeyError as e:
-        raise ValueError("Some trait sample IDs are not present in main BED sample order.") from e
-    scan_meta_mmap_window_mb = int(max(1, _current_bed_memory_mb()))
-    meta = _splmm_bed_logic_meta_selected(
-        str(main_prefix),
-        sample_indices=sample_idx,
-        maf_threshold=float(maf_threshold),
-        max_missing_rate=float(max_missing_rate),
-        het_threshold=float(het_threshold),
-        snps_only=bool(snps_only),
-        mmap_window_mb=scan_meta_mmap_window_mb,
-    )
-    active_row_idx = np.asarray(meta["row_indices"], dtype=np.int64).reshape(-1)
-    stage2_mmap_window_mb = auto_mmap_window_mb(
-        str(main_prefix),
-        int(len(main_ids)),
-        int(meta.get("n_snps_total", max(1, int(active_row_idx.shape[0])))),
-        _current_bed_memory_mb(),
-    )
-    segments = _active_segments_for_windows(
-        main_prefix=str(main_prefix),
-        active_row_idx=active_row_idx,
-        windows=windows,
-    )
-    y_stage2 = np.ascontiguousarray(np.asarray(y_vec, dtype=np.float64).reshape(-1), dtype=np.float64)
-    sample_ids_stage2 = [str(x) for x in np.asarray(trait_ids, dtype=str)]
-    progress_every = int(max(1, min(int(max(1, int(chunk_size))), _progress_callback_step(int(max(1, active_row_idx.shape[0]))))))
-    mmap_window_arg = None if stage2_mmap_window_mb is None else int(max(1, int(stage2_mmap_window_mb)))
-    if has_compact:
-        kept_rows, scan_rows = jxrs.lm_stream_bed_segments_compact_to_tsv(
+        qtn_rows = _read_qtn_rows(qtn_tsv)
+        _qtn_packed, _qtn_n, qtn_active_row_idx, _qtn_maf, _qtn_miss, _qtn_flip = _packed_ctx_active_view_for_gwas(
+            qtn_preloaded_packed["packed_ctx"]  # type: ignore[arg-type]
+        )
+        qtn_active_sel, qtn_meta = _selected_qtn_active_indices(
+            qtn_prefix=str(qtn_preloaded_packed["prefix"]),
+            qtn_active_row_idx=qtn_active_row_idx,
+            qtn_rows=qtn_rows,
+        )
+        qtn_cov = _decode_qtn_covariates(
+            qtn_preloaded_packed=qtn_preloaded_packed,
+            qtn_active_indices=qtn_active_sel,
+            trait_ids=np.asarray(trait_ids, dtype=str),
+        )
+        base_design = np.ascontiguousarray(
+            np.concatenate(
+                [
+                    np.ones((int(y_vec.shape[0]), 1), dtype=np.float64),
+                    np.asarray(base_cov, dtype=np.float64),
+                ],
+                axis=1,
+            ),
+            dtype=np.float64,
+        )
+        windows = _qtn_windows_from_meta(qtn_meta, qtn_cov, _farmcpu_final_window_bp_from_args(args_obj))
+        context_exclude_qtn: list[list[int]] = [[]]
+        for w in windows:
+            qpos = sorted(set(int(x) for x in list(w.get("qtn_positions", []))))
+            context_exclude_qtn.append(qpos)
+        _status_complete(
+            qtn_task,
+            f"{qtn_desc} ...Finished (n={int(qtn_cov.shape[0])}, nQTN={int(qtn_cov.shape[1])}, windows={len(windows)})",
+        )
+    except Exception:
+        _status_fail(qtn_task, f"{qtn_desc} ...Failed")
+        raise
+
+    index_desc = f"Indexing {status_prefix} scan markers" if status_prefix else ""
+    index_task = _status_begin(index_desc)
+    try:
+        main_ids = _read_bed_fam_iids(main_prefix)
+        id_map = {str(sid): i for i, sid in enumerate(main_ids)}
+        try:
+            sample_idx = np.asarray([id_map[str(sid)] for sid in np.asarray(trait_ids, dtype=str)], dtype=np.int64)
+        except KeyError as e:
+            raise ValueError("Some trait sample IDs are not present in main BED sample order.") from e
+        scan_meta_mmap_window_mb = int(max(1, _current_bed_memory_mb()))
+        meta = _splmm_bed_logic_meta_selected(
             str(main_prefix),
-            y_stage2,
-            base_design,
-            np.ascontiguousarray(np.asarray(qtn_cov, dtype=np.float64), dtype=np.float64),
-            context_exclude_qtn,
-            segments,
-            str(tmp_tsv),
-            sample_ids=sample_ids_stage2,
+            sample_indices=sample_idx,
             maf_threshold=float(maf_threshold),
             max_missing_rate=float(max_missing_rate),
             het_threshold=float(het_threshold),
             snps_only=bool(snps_only),
-            chunk_size=int(max(1, int(chunk_size))),
-            threads=int(max(1, int(threads))),
-            progress_callback=progress_callback,
-            progress_every=progress_every,
-            mmap_window_mb=mmap_window_arg,
+            mmap_window_mb=scan_meta_mmap_window_mb,
         )
+        active_row_idx = np.asarray(meta["row_indices"], dtype=np.int64).reshape(-1)
+        stage2_mmap_window_mb = auto_mmap_window_mb(
+            str(main_prefix),
+            int(len(main_ids)),
+            int(meta.get("n_snps_total", max(1, int(active_row_idx.shape[0])))),
+            _current_bed_memory_mb(),
+        )
+        segments = _active_segments_for_windows(
+            main_prefix=str(main_prefix),
+            active_row_idx=active_row_idx,
+            windows=windows,
+        )
+        _status_complete(
+            index_task,
+            f"{index_desc} ...Finished (active={int(active_row_idx.shape[0])}, total={int(meta.get('n_snps_total', 0))}, segments={len(segments)})",
+        )
+    except Exception:
+        _status_fail(index_task, f"{index_desc} ...Failed")
+        raise
+    y_stage2 = np.ascontiguousarray(np.asarray(y_vec, dtype=np.float64).reshape(-1), dtype=np.float64)
+    sample_ids_stage2 = [str(x) for x in np.asarray(trait_ids, dtype=str)]
+    progress_every = int(max(1, min(int(max(1, int(chunk_size))), _progress_callback_step(int(max(1, active_row_idx.shape[0]))))))
+    mmap_window_arg = None if stage2_mmap_window_mb is None else int(max(1, int(stage2_mmap_window_mb)))
+
+    def _compact_setup_status(phase: str, state: str, value_a: int, value_b: int) -> None:
+        if not stage_status_enabled:
+            return
+        phase_s = str(phase)
+        state_s = str(state)
+        if state_s == "start":
+            status_tasks[phase_s] = _status_begin(phase_s)  # type: ignore[assignment]
+            return
+        task = status_tasks.pop(phase_s, None)
+        if state_s == "finish":
+            _status_complete(
+                task,
+                f"{phase_s} ...Finished (contexts={int(value_a)}, q={int(value_b)})",
+            )
+        elif state_s == "fail":
+            _status_fail(task, f"{phase_s} ...Failed")
+
+    if has_compact:
+        try:
+            kept_rows, scan_rows = jxrs.lm_stream_bed_segments_compact_to_tsv(
+                str(main_prefix),
+                y_stage2,
+                base_design,
+                np.ascontiguousarray(np.asarray(qtn_cov, dtype=np.float64), dtype=np.float64),
+                context_exclude_qtn,
+                segments,
+                str(tmp_tsv),
+                sample_ids=sample_ids_stage2,
+                maf_threshold=float(maf_threshold),
+                max_missing_rate=float(max_missing_rate),
+                het_threshold=float(het_threshold),
+                snps_only=bool(snps_only),
+                chunk_size=int(max(1, int(chunk_size))),
+                threads=int(max(1, int(threads))),
+                progress_callback=progress_callback,
+                progress_every=progress_every,
+                mmap_window_mb=mmap_window_arg,
+                setup_callback=_compact_setup_status,
+            )
+        except Exception:
+            task = status_tasks.pop("Building compact QR contexts", None)
+            if task is not None:
+                _status_fail(task, "Building compact QR contexts ...Failed")
+            raise
     else:
+        legacy_task = _status_begin("Building compact QR contexts")
+        if legacy_task is not None:
+            _status_complete(legacy_task, "Building compact QR contexts ...Skipped (legacy explicit-Q path)")
         x_contexts: list[np.ndarray] = [
             np.ascontiguousarray(np.concatenate([base_design, qtn_cov], axis=1), dtype=np.float64)
         ]
@@ -4639,6 +4713,9 @@ def run_algwas_packed_fullrank(
                         threads=int(threads),
                         progress_callback=_algwas_progress,
                         args_obj=type("_AlgwasQtnArgs", (), {"farmcpu_bin_size": [5e5, 5e6, 5e7]})(),
+                        logger=logger,
+                        use_spinner=bool(use_spinner),
+                        status_prefix="ALGWAS stage2",
                     )
                     pseudo_rows = int(max(pseudo_rows, qtn_used))
                     gwas_total = int(max(1, scan_rows2))

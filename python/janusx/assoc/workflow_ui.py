@@ -202,9 +202,11 @@ def _log_model_line(
     *,
     use_spinner: bool = False,
 ) -> None:
+    msg = f"{str(model_label)}: {str(message)}"
     if (not _gwas_verbose_enabled(logger)) and (not use_spinner) and (not stdout_is_tty()):
+        _log_file_only(logger, logging.INFO, msg)
         return
-    _log_info(logger, f"{str(model_label)}: {str(message)}", use_spinner=use_spinner)
+    _log_info(logger, msg, use_spinner=use_spinner)
 
 
 def _rich_success(

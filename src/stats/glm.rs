@@ -24,8 +24,8 @@ use crate::bedmath::{
     decode_plink_bed_hardcall, is_identity_indices, packed_byte_lut, SubsetDecodePlan,
 };
 use crate::blas::{
-    cblas_sgemm_dispatch, rust_sgemm_prefers_rayon_rowmajor_f32_kernel, BlasThreadGuard, CblasInt,
-    CBLAS_NO_TRANS, CBLAS_ROW_MAJOR, CBLAS_TRANS,
+    cblas_dgemm_dispatch, cblas_sgemm_dispatch, rust_sgemm_prefers_rayon_rowmajor_f32_kernel,
+    BlasThreadGuard, CblasInt, CBLAS_NO_TRANS, CBLAS_ROW_MAJOR, CBLAS_TRANS,
 };
 use crate::gfcore;
 use crate::gfcore::read_bim_columns;
@@ -1042,36 +1042,86 @@ fn lm_stage2_build_x_all_f32(
     Ok(out)
 }
 
-fn lm_stage2_xtx_from_x_all_f32(
-    x_all_f32: &[f32],
+fn lm_stage2_xtx_from_design_f64(
+    x_base: &[f64],
+    qtn_cov: &[f64],
     n: usize,
-    q_all: usize,
+    base_cols: usize,
+    qtn_cols: usize,
 ) -> Result<Vec<f64>, String> {
-    if x_all_f32.len() != n.saturating_mul(q_all) {
-        return Err("x_all_f32 shape mismatch".to_string());
+    if x_base.len() != n.saturating_mul(base_cols) {
+        return Err("x_base shape mismatch".to_string());
     }
-    let mut xtx_f32 = vec![0.0_f32; q_all.saturating_mul(q_all)];
-    if q_all > 0 && n > 0 {
+    if qtn_cov.len() != n.saturating_mul(qtn_cols) {
+        return Err("qtn_cov shape mismatch".to_string());
+    }
+    let q_all = base_cols.saturating_add(qtn_cols);
+    if q_all == 0 {
+        return Err("stage2 design has zero columns".to_string());
+    }
+    let mut xtx = vec![0.0_f64; q_all.saturating_mul(q_all)];
+    if base_cols > 0 && n > 0 {
         unsafe {
-            cblas_sgemm_dispatch(
+            cblas_dgemm_dispatch(
                 CBLAS_ROW_MAJOR,
                 CBLAS_TRANS,
                 CBLAS_NO_TRANS,
-                q_all as CblasInt,
-                q_all as CblasInt,
+                base_cols as CblasInt,
+                base_cols as CblasInt,
                 n as CblasInt,
                 1.0,
-                x_all_f32.as_ptr(),
-                q_all as CblasInt,
-                x_all_f32.as_ptr(),
-                q_all as CblasInt,
+                x_base.as_ptr(),
+                base_cols as CblasInt,
+                x_base.as_ptr(),
+                base_cols as CblasInt,
                 0.0,
-                xtx_f32.as_mut_ptr(),
+                xtx.as_mut_ptr(),
                 q_all as CblasInt,
             );
         }
     }
-    Ok(xtx_f32.into_iter().map(|v| v as f64).collect())
+    if qtn_cols > 0 && n > 0 {
+        unsafe {
+            cblas_dgemm_dispatch(
+                CBLAS_ROW_MAJOR,
+                CBLAS_TRANS,
+                CBLAS_NO_TRANS,
+                base_cols as CblasInt,
+                qtn_cols as CblasInt,
+                n as CblasInt,
+                1.0,
+                x_base.as_ptr(),
+                base_cols as CblasInt,
+                qtn_cov.as_ptr(),
+                qtn_cols as CblasInt,
+                0.0,
+                xtx.as_mut_ptr().add(base_cols),
+                q_all as CblasInt,
+            );
+            cblas_dgemm_dispatch(
+                CBLAS_ROW_MAJOR,
+                CBLAS_TRANS,
+                CBLAS_NO_TRANS,
+                qtn_cols as CblasInt,
+                qtn_cols as CblasInt,
+                n as CblasInt,
+                1.0,
+                qtn_cov.as_ptr(),
+                qtn_cols as CblasInt,
+                qtn_cov.as_ptr(),
+                qtn_cols as CblasInt,
+                0.0,
+                xtx.as_mut_ptr().add(base_cols * q_all + base_cols),
+                q_all as CblasInt,
+            );
+        }
+        for r in 0..base_cols {
+            for c in 0..qtn_cols {
+                xtx[(base_cols + c) * q_all + r] = xtx[r * q_all + base_cols + c];
+            }
+        }
+    }
+    Ok(xtx)
 }
 
 fn lm_stage2_xty_from_design(
@@ -3404,6 +3454,7 @@ fn parse_lm_segments_unbounded<'py>(
     progress_callback=None,
     progress_every=0,
     mmap_window_mb=None,
+    setup_callback=None,
 ))]
 pub fn lm_stream_bed_segments_compact_to_tsv<'py>(
     py: Python<'py>,
@@ -3424,6 +3475,7 @@ pub fn lm_stream_bed_segments_compact_to_tsv<'py>(
     progress_callback: Option<Py<PyAny>>,
     progress_every: usize,
     mmap_window_mb: Option<usize>,
+    setup_callback: Option<Py<PyAny>>,
 ) -> PyResult<(usize, usize)> {
     if chunk_size == 0 {
         return Err(PyValueError::new_err("chunk_size must be > 0"));
@@ -3506,6 +3558,12 @@ pub fn lm_stream_bed_segments_compact_to_tsv<'py>(
     let y_raw = y_slice.to_vec();
     let yy = y_raw.iter().map(|v| v * v).sum::<f64>();
     let q_all = base_cols.saturating_add(qtn_cols);
+    if let Some(cb) = setup_callback.as_ref() {
+        cb.call1(
+            py,
+            ("Building compact QR contexts", "start", 0usize, 0usize),
+        )?;
+    }
     let x_all_f32 = lm_stage2_build_x_all_f32(
         x_base_flat.as_ref(),
         qtn_flat.as_ref(),
@@ -3516,8 +3574,14 @@ pub fn lm_stream_bed_segments_compact_to_tsv<'py>(
     .map_err(PyValueError::new_err)?;
     let xtx_all = {
         let _blas_guard = BlasThreadGuard::enter(threads.max(1));
-        lm_stage2_xtx_from_x_all_f32(x_all_f32.as_slice(), n, q_all)
-            .map_err(PyRuntimeError::new_err)?
+        lm_stage2_xtx_from_design_f64(
+            x_base_flat.as_ref(),
+            qtn_flat.as_ref(),
+            n,
+            base_cols,
+            qtn_cols,
+        )
+        .map_err(PyRuntimeError::new_err)?
     };
     let xty_all = lm_stage2_xty_from_design(
         x_base_flat.as_ref(),
@@ -3542,6 +3606,17 @@ pub fn lm_stream_bed_segments_compact_to_tsv<'py>(
         )
         .map_err(PyRuntimeError::new_err)?
     };
+    if let Some(cb) = setup_callback.as_ref() {
+        cb.call1(
+            py,
+            (
+                "Building compact QR contexts",
+                "finish",
+                compact_contexts.len(),
+                q_all,
+            ),
+        )?;
+    }
     let segment_plan = parse_lm_segments_unbounded(segments, compact_contexts.len())?;
     let out_tsv_path = out_tsv.clone();
 

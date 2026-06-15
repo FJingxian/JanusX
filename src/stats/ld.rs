@@ -12,8 +12,9 @@ use rayon::prelude::*;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use crate::bedmath::{decode_row_centered_full_lut, packed_byte_lut, packed_pair_lut};
 use crate::blas::{
@@ -22,11 +23,16 @@ use crate::blas::{
 use crate::math_ld::{
     build_bitplanes_u64, build_row_bitplanes_u64_with_aux, classify_ld_pair_by_maf,
     compute_packed_row_stats, dot_nomiss_pair_bitplanes, dot_nomiss_pair_from_packed,
-    dot_nomiss_row_bitplanes, packed_prune_kernel_stats as packed_prune_kernel_stats_core,
-    r2_pairwise_complete_bitplanes, r2_pairwise_complete_bitplanes_cached_masks,
-    r2_pairwise_complete_from_packed, PackedRowStats,
+    dot_nomiss_row_bitplanes, fill_row_bitplanes_hlav_u64,
+    packed_prune_kernel_stats as packed_prune_kernel_stats_core, r2_pairwise_complete_bitplanes,
+    r2_pairwise_complete_bitplanes_cached_masks, r2_pairwise_complete_from_packed, PackedRowStats,
 };
 use crate::stats_common::{get_cached_pool, map_err_string_to_py};
+
+#[inline]
+fn should_write_output_site(max_output_sites: Option<usize>, written: usize) -> bool {
+    max_output_sites.map(|lim| written < lim).unwrap_or(true)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LdPruneMode {
@@ -672,7 +678,7 @@ fn select_bim_indices_for_ld(
 ) -> Result<(usize, Vec<usize>, Vec<String>, Vec<i64>), String> {
     let bim_path = format!("{prefix}.bim");
     let file = File::open(&bim_path).map_err(|e| format!("{bim_path}: {e}"))?;
-    let reader = BufReader::new(file);
+    let reader = BufReader::with_capacity(8 * 1024 * 1024, file);
 
     let mut total_snps = 0usize;
     let mut selected_idx: Vec<usize> = Vec::new();
@@ -1017,7 +1023,7 @@ fn ld_r2_matrix_from_packed_rows(
 fn read_bim_lines_chrom_pos(prefix: &str) -> Result<(Vec<String>, Vec<i32>, Vec<i64>), String> {
     let bim_path = format!("{prefix}.bim");
     let file = File::open(&bim_path).map_err(|e| format!("{bim_path}: {e}"))?;
-    let reader = BufReader::new(file);
+    let reader = BufReader::with_capacity(8 * 1024 * 1024, file);
     let mut lines: Vec<String> = Vec::new();
     let mut chrom_codes: Vec<i32> = Vec::new();
     let mut positions: Vec<i64> = Vec::new();
@@ -1029,19 +1035,24 @@ fn read_bim_lines_chrom_pos(prefix: &str) -> Result<(Vec<String>, Vec<i32>, Vec<
         if t.is_empty() {
             continue;
         }
-        let toks: Vec<&str> = t.split_whitespace().collect();
-        if toks.len() < 4 {
+        let mut toks = t.split_whitespace();
+        let Some(chr_tok) = toks.next() else {
+            continue;
+        };
+        let _id = toks.next();
+        let _cm = toks.next();
+        let Some(pos_tok) = toks.next() else {
             return Err(format!(
                 "{bim_path}:{}: malformed BIM row (need >=4 columns)",
                 line_no + 1
             ));
-        }
-        let chr_raw = toks[0].to_string();
-        let pos = toks[3].parse::<i64>().map_err(|_| {
+        };
+        let chr_raw = chr_tok.to_string();
+        let pos = pos_tok.parse::<i64>().map_err(|_| {
             format!(
                 "{bim_path}:{}: invalid POS column '{}'",
                 line_no + 1,
-                toks[3]
+                pos_tok
             )
         })?;
         let code = if let Some(&c) = chr_map.get(&chr_raw) {
@@ -1094,6 +1105,7 @@ fn write_pruned_plink(
     bed_payload: &[u8],
     bytes_per_snp: usize,
     bim_lines: &[String],
+    max_output_sites: Option<usize>,
 ) -> Result<(usize, usize), String> {
     if keep.len() != bim_lines.len() {
         return Err(format!(
@@ -1119,14 +1131,26 @@ fn write_pruned_plink(
         }
     }
 
-    let mut wbed = BufWriter::new(File::create(&out_bed).map_err(|e| format!("{out_bed}: {e}"))?);
+    let mut wbed = BufWriter::with_capacity(
+        8 * 1024 * 1024,
+        File::create(&out_bed).map_err(|e| format!("{out_bed}: {e}"))?,
+    );
     wbed.write_all(&[0x6C, 0x1B, 0x01])
         .map_err(|e| format!("{out_bed}: {e}"))?;
-    let mut wbim = BufWriter::new(File::create(&out_bim).map_err(|e| format!("{out_bim}: {e}"))?);
+    let mut wbim = BufWriter::with_capacity(
+        4 * 1024 * 1024,
+        File::create(&out_bim).map_err(|e| format!("{out_bim}: {e}"))?,
+    );
 
     let mut kept = 0usize;
+    let mut written = 0usize;
     for i in 0..keep.len() {
         if !keep[i] {
+            continue;
+        }
+        kept = kept.saturating_add(1);
+        let write_this = should_write_output_site(max_output_sites, written);
+        if !write_this {
             continue;
         }
         let s = i.saturating_mul(bytes_per_snp);
@@ -1136,7 +1160,7 @@ fn write_pruned_plink(
         wbim.write_all(bim_lines[i].as_bytes())
             .and_then(|_| wbim.write_all(b"\n"))
             .map_err(|e| format!("{out_bim}: {e}"))?;
-        kept = kept.saturating_add(1);
+        written = written.saturating_add(1);
     }
     wbed.flush().map_err(|e| format!("{out_bed}: {e}"))?;
     wbim.flush().map_err(|e| format!("{out_bim}: {e}"))?;
@@ -1183,47 +1207,134 @@ fn parse_bim_line_chrom_pos(
     if t.is_empty() {
         return Err(format!("{bim_path}:{}: empty BIM row", line_no));
     }
-    let toks: Vec<&str> = t.split_whitespace().collect();
-    if toks.len() < 4 {
+    let mut toks = t.split_whitespace();
+    let Some(chrom) = toks.next() else {
+        return Err(format!("{bim_path}:{}: empty BIM row", line_no));
+    };
+    let _id = toks.next();
+    let _cm = toks.next();
+    let Some(pos_tok) = toks.next() else {
         return Err(format!(
             "{bim_path}:{}: malformed BIM row (need >=4 columns)",
             line_no
         ));
-    }
-    let pos = toks[3]
+    };
+    let pos = pos_tok
         .parse::<i64>()
-        .map_err(|_| format!("{bim_path}:{}: invalid POS column '{}'", line_no, toks[3]))?;
-    Ok((toks[0].to_string(), pos))
+        .map_err(|_| format!("{bim_path}:{}: invalid POS column '{}'", line_no, pos_tok))?;
+    Ok((chrom.to_string(), pos))
 }
 
-fn scan_bim_last_index_and_order(
-    prefix: &str,
-) -> Result<(usize, HashMap<String, usize>, bool), String> {
+#[derive(Clone)]
+struct BimChromBlock {
+    chrom: String,
+    start_idx: usize,
+    len: usize,
+    bim_start: u64,
+    bim_end: u64,
+    pos_sorted: bool,
+}
+
+struct BimStreamScan {
+    total_snps: usize,
+    chrom_last_index: HashMap<String, usize>,
+    chrom_pos_sorted: bool,
+    chrom_contiguous: bool,
+    blocks: Vec<BimChromBlock>,
+}
+
+fn scan_bim_stream_blocks(prefix: &str) -> Result<BimStreamScan, String> {
     let bim_path = format!("{prefix}.bim");
     let file = File::open(&bim_path).map_err(|e| format!("{bim_path}: {e}"))?;
-    let reader = BufReader::new(file);
-    let mut last_index: HashMap<String, usize> = HashMap::new();
+    let mut reader = BufReader::with_capacity(8 * 1024 * 1024, file);
+    let mut chrom_last_index: HashMap<String, usize> = HashMap::new();
     let mut last_pos_by_chrom: HashMap<String, i64> = HashMap::new();
-    let mut nondecreasing_within_chrom = true;
+    let mut closed_chroms: HashSet<String> = HashSet::new();
+    let mut blocks: Vec<BimChromBlock> = Vec::new();
+    let mut chrom_pos_sorted = true;
+    let mut chrom_contiguous = true;
     let mut total = 0usize;
+    let mut byte_pos = 0u64;
+    let mut line = String::new();
+    let mut current_chrom: Option<String> = None;
+    let mut block_start_idx = 0usize;
+    let mut block_start_byte = 0u64;
+    let mut block_len = 0usize;
+    let mut block_pos_sorted = true;
+    let mut block_last_pos: Option<i64> = None;
 
-    for (line_no0, line) in reader.lines().enumerate() {
-        let line_no = line_no0 + 1;
-        let l = line.map_err(|e| format!("{bim_path}:{}: {}", line_no, e))?;
-        let (chrom, pos) = parse_bim_line_chrom_pos(&l, line_no, &bim_path)?;
+    loop {
+        line.clear();
+        let line_start = byte_pos;
+        let n = reader
+            .read_line(&mut line)
+            .map_err(|e| format!("{bim_path}:{}: {}", total + 1, e))?;
+        if n == 0 {
+            break;
+        }
+        byte_pos = byte_pos.saturating_add(n as u64);
+        let (chrom, pos) = parse_bim_line_chrom_pos(&line, total + 1, &bim_path)?;
+
+        let starts_new_block = current_chrom.as_ref().map(|c| c != &chrom).unwrap_or(true);
+        if starts_new_block {
+            if let Some(prev_chrom) = current_chrom.take() {
+                closed_chroms.insert(prev_chrom.clone());
+                blocks.push(BimChromBlock {
+                    chrom: prev_chrom,
+                    start_idx: block_start_idx,
+                    len: block_len,
+                    bim_start: block_start_byte,
+                    bim_end: line_start,
+                    pos_sorted: block_pos_sorted,
+                });
+            }
+            if closed_chroms.contains(&chrom) {
+                chrom_contiguous = false;
+            }
+            current_chrom = Some(chrom.clone());
+            block_start_idx = total;
+            block_start_byte = line_start;
+            block_len = 0usize;
+            block_pos_sorted = true;
+            block_last_pos = None;
+        }
+
         if let Some(prev) = last_pos_by_chrom.insert(chrom.clone(), pos) {
             if pos < prev {
-                nondecreasing_within_chrom = false;
+                chrom_pos_sorted = false;
             }
         }
-        last_index.insert(chrom, total);
+        if let Some(prev) = block_last_pos.replace(pos) {
+            if pos < prev {
+                block_pos_sorted = false;
+            }
+        }
+        chrom_last_index.insert(chrom, total);
+        block_len = block_len.saturating_add(1);
         total = total.saturating_add(1);
+    }
+
+    if let Some(prev_chrom) = current_chrom.take() {
+        blocks.push(BimChromBlock {
+            chrom: prev_chrom,
+            start_idx: block_start_idx,
+            len: block_len,
+            bim_start: block_start_byte,
+            bim_end: byte_pos,
+            pos_sorted: block_pos_sorted,
+        });
     }
 
     if total == 0 {
         return Err(format!("no variant rows in {bim_path}"));
     }
-    Ok((total, last_index, nondecreasing_within_chrom))
+    Ok(BimStreamScan {
+        total_snps: total,
+        chrom_last_index,
+        chrom_pos_sorted,
+        chrom_contiguous,
+        blocks,
+    })
 }
 
 struct StreamingPruneBufferedRow {
@@ -1449,6 +1560,8 @@ fn drain_finalized_streaming_rows(
     wbed: &mut BufWriter<File>,
     wbim: &mut BufWriter<File>,
     kept: &mut usize,
+    written: &mut usize,
+    max_output_sites: Option<usize>,
     out_bed: &str,
     out_bim: &str,
 ) -> Result<(), String> {
@@ -1462,17 +1575,788 @@ fn drain_finalized_streaming_rows(
         }
         if let Some(row) = rows[*next_write].take() {
             if !row.dropped {
-                wbed.write_all(&row.packed)
-                    .map_err(|e| format!("{out_bed}: {e}"))?;
-                wbim.write_all(row.bim_line.as_bytes())
-                    .and_then(|_| wbim.write_all(b"\n"))
-                    .map_err(|e| format!("{out_bim}: {e}"))?;
                 *kept = kept.saturating_add(1);
+                let write_this = should_write_output_site(max_output_sites, *written);
+                if write_this {
+                    wbed.write_all(&row.packed)
+                        .map_err(|e| format!("{out_bed}: {e}"))?;
+                    wbim.write_all(row.bim_line.as_bytes())
+                        .and_then(|_| wbim.write_all(b"\n"))
+                        .map_err(|e| format!("{out_bim}: {e}"))?;
+                    *written = written.saturating_add(1);
+                }
             }
         }
         *next_write = (*next_write).saturating_add(1);
     }
     Ok(())
+}
+
+struct StreamChromRow {
+    first_unchecked_seq: usize,
+    pos: i64,
+    packed: Vec<u8>,
+    bim_line: String,
+    stats: PackedRowStats,
+    bits: Vec<u64>,
+    dropped: bool,
+}
+
+struct ChromPruneTempResult {
+    block_idx: usize,
+    kept: usize,
+    temp_bed: Option<String>,
+    temp_bim: Option<String>,
+}
+
+#[inline]
+fn stream_row_alive(rows: &[StreamChromRow], base_seq: usize, seq: usize) -> bool {
+    if seq < base_seq {
+        return false;
+    }
+    let idx = seq - base_seq;
+    rows.get(idx).map(|r| !r.dropped).unwrap_or(false)
+}
+
+#[inline]
+fn stream_chrom_bit_slices(bits: &[u64]) -> Option<(&[u64], &[u64], &[u64], &[u64])> {
+    let words = bits.len() / 4;
+    if words == 0 || words.saturating_mul(4) != bits.len() {
+        return None;
+    }
+    Some((
+        &bits[..words],
+        &bits[words..words.saturating_mul(2)],
+        &bits[words.saturating_mul(2)..words.saturating_mul(3)],
+        &bits[words.saturating_mul(3)..],
+    ))
+}
+
+#[inline]
+fn drop_stream_chrom_row(row: &mut StreamChromRow, bit_pool: &mut Vec<Vec<u64>>) {
+    row.dropped = true;
+    row.packed.clear();
+    row.bim_line.clear();
+    let mut bits = std::mem::take(&mut row.bits);
+    bits.clear();
+    if bits.capacity() > 0 {
+        bit_pool.push(bits);
+    }
+}
+
+fn classify_stream_chrom_pair_by_maf(
+    row_i: &StreamChromRow,
+    row_j: &StreamChromRow,
+    n_samples_f: f64,
+    denom: f64,
+    prune_r2_thresh: f64,
+    eps: f64,
+    word_masks: &[u64],
+) -> Option<u8> {
+    let (ih, il, ia, iv) = stream_chrom_bit_slices(&row_i.bits)?;
+    let (jh, jl, ja, jv) = stream_chrom_bit_slices(&row_j.bits)?;
+    let r2 = if !row_i.stats.has_missing && !row_j.stats.has_missing {
+        let dot_imp = dot_nomiss_row_bitplanes(ih, il, jh, jl, word_masks);
+        let cov = dot_imp - n_samples_f * row_i.stats.mean * row_j.stats.mean;
+        let denom_corr = denom * row_i.stats.std * row_j.stats.std;
+        let corr = if denom_corr > 0.0_f64 {
+            cov / denom_corr
+        } else {
+            0.0_f64
+        };
+        corr * corr
+    } else {
+        if row_i.stats.non_missing <= 1 || row_j.stats.non_missing <= 1 {
+            return None;
+        }
+        r2_pairwise_complete_bitplanes_cached_masks(ih, ia, iv, jh, ja, jv).unwrap_or(f64::NAN)
+    };
+    if !(r2.is_finite() && r2 > prune_r2_thresh) {
+        return None;
+    }
+    Some(classify_ld_pair_by_maf(
+        row_i.stats.maf,
+        row_j.stats.maf,
+        eps,
+    ))
+}
+
+fn flush_stream_chrom_rows(
+    rows: &mut Vec<StreamChromRow>,
+    base_seq: &mut usize,
+    flush_before: usize,
+    kept: &mut usize,
+    bit_pool: &mut Vec<Vec<u64>>,
+    wbed: Option<&mut BufWriter<File>>,
+    wbim: Option<&mut BufWriter<File>>,
+    out_bed: &str,
+    out_bim: &str,
+) -> Result<(), String> {
+    if flush_before <= *base_seq {
+        return Ok(());
+    }
+    let drain_n = flush_before.saturating_sub(*base_seq).min(rows.len());
+    if drain_n == 0 {
+        return Ok(());
+    }
+    let mut wbed_opt = wbed;
+    let mut wbim_opt = wbim;
+    for mut row in rows.drain(0..drain_n) {
+        if row.dropped {
+            let mut bits = std::mem::take(&mut row.bits);
+            bits.clear();
+            if bits.capacity() > 0 {
+                bit_pool.push(bits);
+            }
+            continue;
+        }
+        *kept = kept.saturating_add(1);
+        if let (Some(wbed_ref), Some(wbim_ref)) = (wbed_opt.as_deref_mut(), wbim_opt.as_deref_mut())
+        {
+            wbed_ref
+                .write_all(&row.packed)
+                .map_err(|e| format!("{out_bed}: {e}"))?;
+            wbim_ref
+                .write_all(row.bim_line.as_bytes())
+                .and_then(|_| wbim_ref.write_all(b"\n"))
+                .map_err(|e| format!("{out_bim}: {e}"))?;
+        }
+        let mut bits = std::mem::take(&mut row.bits);
+        bits.clear();
+        if bits.capacity() > 0 {
+            bit_pool.push(bits);
+        }
+    }
+    *base_seq = base_seq.saturating_add(drain_n);
+    Ok(())
+}
+
+fn process_stream_chrom_ready_windows(
+    rows: &mut Vec<StreamChromRow>,
+    base_seq: &mut usize,
+    seen_count: usize,
+    chrom_done: bool,
+    next_start: &mut usize,
+    bp_scan: &mut usize,
+    window_bp: Option<i64>,
+    window_variants: Option<usize>,
+    step: usize,
+    r2_threshold: f64,
+    n_samples_f: f64,
+    denom: f64,
+    word_masks: &[u64],
+    kept: &mut usize,
+    bit_pool: &mut Vec<Vec<u64>>,
+    mut wbed: Option<&mut BufWriter<File>>,
+    mut wbim: Option<&mut BufWriter<File>>,
+    out_bed: &str,
+    out_bim: &str,
+) -> Result<(), String> {
+    let eps = 1e-12_f64;
+    let prune_r2_thresh = r2_threshold * (1.0_f64 + eps);
+    loop {
+        if *next_start >= seen_count {
+            break;
+        }
+        if *next_start < *base_seq {
+            *next_start = *base_seq;
+        }
+        let (window_end_seq, ready) = if let Some(bp) = window_bp {
+            let start_idx = next_start.saturating_sub(*base_seq);
+            let Some(start_row) = rows.get(start_idx) else {
+                break;
+            };
+            let target = start_row.pos.saturating_add(bp);
+            if *bp_scan < next_start.saturating_add(1) {
+                *bp_scan = next_start.saturating_add(1);
+            }
+            while *bp_scan < seen_count {
+                let idx = bp_scan.saturating_sub(*base_seq);
+                let Some(row) = rows.get(idx) else {
+                    break;
+                };
+                if row.pos > target {
+                    break;
+                }
+                *bp_scan = bp_scan.saturating_add(1);
+            }
+            let ready_now = chrom_done || (*bp_scan < seen_count);
+            let end_seq = if ready_now { *bp_scan } else { seen_count };
+            (end_seq, ready_now)
+        } else {
+            let want_end = next_start.saturating_add(window_variants.unwrap_or(1));
+            let end_seq = want_end.min(seen_count);
+            let ready_now = chrom_done || (seen_count >= want_end);
+            (end_seq, ready_now)
+        };
+        if !ready {
+            break;
+        }
+
+        if window_end_seq > next_start.saturating_add(1) {
+            let mut window_seqs: Vec<usize> = ((*next_start)..window_end_seq)
+                .filter(|seq| stream_row_alive(rows, *base_seq, *seq))
+                .collect();
+            loop {
+                let mut keep_n = 0usize;
+                for read_idx in 0..window_seqs.len() {
+                    let seq = window_seqs[read_idx];
+                    if stream_row_alive(rows, *base_seq, seq) {
+                        if keep_n != read_idx {
+                            window_seqs[keep_n] = seq;
+                        }
+                        keep_n = keep_n.saturating_add(1);
+                    }
+                }
+                window_seqs.truncate(keep_n);
+                if window_seqs.len() <= 1 {
+                    break;
+                }
+
+                let mut at_least_one_prune = false;
+                for wi in 0..window_seqs.len().saturating_sub(1) {
+                    let seq_i = window_seqs[wi];
+                    if !stream_row_alive(rows, *base_seq, seq_i) {
+                        continue;
+                    }
+                    let i_idx = seq_i.saturating_sub(*base_seq);
+                    let scan_min_seq = rows[i_idx]
+                        .first_unchecked_seq
+                        .max(next_start.saturating_add(1));
+                    if scan_min_seq >= window_end_seq {
+                        rows[i_idx].first_unchecked_seq =
+                            rows[i_idx].first_unchecked_seq.max(window_end_seq);
+                        continue;
+                    }
+
+                    let wj_start = window_seqs.partition_point(|seq| *seq < scan_min_seq);
+                    let mut prune_hit: Option<(u8, usize, usize)> = None;
+                    for wj in wj_start..window_seqs.len() {
+                        let seq_j = window_seqs[wj];
+                        if seq_j >= window_end_seq {
+                            break;
+                        }
+                        if !stream_row_alive(rows, *base_seq, seq_j) {
+                            continue;
+                        }
+                        let j_idx = seq_j.saturating_sub(*base_seq);
+                        if let Some(tag) = classify_stream_chrom_pair_by_maf(
+                            &rows[i_idx],
+                            &rows[j_idx],
+                            n_samples_f,
+                            denom,
+                            prune_r2_thresh,
+                            eps,
+                            word_masks,
+                        ) {
+                            prune_hit = Some((tag, wj, seq_j));
+                            break;
+                        }
+                    }
+
+                    if let Some((tag, wj, seq_j)) = prune_hit {
+                        at_least_one_prune = true;
+                        if tag == 1u8 {
+                            drop_stream_chrom_row(&mut rows[i_idx], bit_pool);
+                        } else {
+                            let j_idx = seq_j.saturating_sub(*base_seq);
+                            drop_stream_chrom_row(&mut rows[j_idx], bit_pool);
+                            let mut next_seq = window_end_seq;
+                            for &candidate_seq in window_seqs.iter().skip(wj + 1) {
+                                if candidate_seq >= window_end_seq {
+                                    break;
+                                }
+                                if stream_row_alive(rows, *base_seq, candidate_seq) {
+                                    next_seq = candidate_seq;
+                                    break;
+                                }
+                            }
+                            if stream_row_alive(rows, *base_seq, seq_i) {
+                                rows[i_idx].first_unchecked_seq =
+                                    rows[i_idx].first_unchecked_seq.max(next_seq);
+                            }
+                        }
+                    } else if stream_row_alive(rows, *base_seq, seq_i) {
+                        rows[i_idx].first_unchecked_seq =
+                            rows[i_idx].first_unchecked_seq.max(window_end_seq);
+                    }
+                }
+                if !at_least_one_prune {
+                    break;
+                }
+            }
+        }
+
+        *next_start = next_start.saturating_add(step);
+        let flush_before = (*next_start).min(seen_count);
+        flush_stream_chrom_rows(
+            rows,
+            base_seq,
+            flush_before,
+            kept,
+            bit_pool,
+            wbed.as_deref_mut(),
+            wbim.as_deref_mut(),
+            out_bed,
+            out_bim,
+        )?;
+    }
+    Ok(())
+}
+
+fn notify_chrom_prune_progress(
+    callback: Option<&Arc<Mutex<Py<PyAny>>>>,
+    block_idx: usize,
+    chrom: &str,
+    done: usize,
+    total: usize,
+    finished: bool,
+) -> Result<(), String> {
+    let Some(cb_arc) = callback else {
+        return Ok(());
+    };
+    let cb_guard = cb_arc
+        .lock()
+        .map_err(|_| "chromosome progress callback lock poisoned".to_string())?;
+    Python::attach(|py2| -> PyResult<()> {
+        py2.check_signals()?;
+        cb_guard.call1(py2, (block_idx, chrom, done, total, finished))?;
+        Ok(())
+    })
+    .map_err(|e| e.to_string())
+}
+
+fn process_stream_chrom_block(
+    src_prefix: &str,
+    out_prefix: &str,
+    block: &BimChromBlock,
+    block_idx: usize,
+    n_samples: usize,
+    bytes_per_snp: usize,
+    window_bp: Option<i64>,
+    window_variants: Option<usize>,
+    step_variants: usize,
+    r2_threshold: f64,
+    word_masks: &[u64],
+    write_temp: bool,
+    chrom_progress_callback: Option<&Arc<Mutex<Py<PyAny>>>>,
+    progress_every: usize,
+) -> Result<ChromPruneTempResult, String> {
+    let src_bed = format!("{src_prefix}.bed");
+    let src_bim = format!("{src_prefix}.bim");
+    let pid = std::process::id();
+    let temp_bed = if write_temp {
+        Some(format!("{out_prefix}.jxprune_chr_{pid}_{block_idx}.bedtmp"))
+    } else {
+        None
+    };
+    let temp_bim = if write_temp {
+        Some(format!("{out_prefix}.jxprune_chr_{pid}_{block_idx}.bimtmp"))
+    } else {
+        None
+    };
+
+    let mut bed_file = File::open(&src_bed).map_err(|e| format!("{src_bed}: {e}"))?;
+    let bed_offset = 3u64
+        .checked_add(
+            (block.start_idx as u64)
+                .checked_mul(bytes_per_snp as u64)
+                .ok_or_else(|| "BED row offset overflow".to_string())?,
+        )
+        .ok_or_else(|| "BED row offset overflow".to_string())?;
+    bed_file
+        .seek(SeekFrom::Start(bed_offset))
+        .map_err(|e| format!("{src_bed}: {e}"))?;
+    let mut bed_reader = BufReader::with_capacity(8 * 1024 * 1024, bed_file);
+
+    let mut bim_file = File::open(&src_bim).map_err(|e| format!("{src_bim}: {e}"))?;
+    bim_file
+        .seek(SeekFrom::Start(block.bim_start))
+        .map_err(|e| format!("{src_bim}: {e}"))?;
+    let mut bim_reader = BufReader::with_capacity(4 * 1024 * 1024, bim_file);
+
+    if let Some(parent) = Path::new(out_prefix).parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+    }
+    let mut wbed = match temp_bed.as_ref() {
+        Some(path) => Some(BufWriter::with_capacity(
+            8 * 1024 * 1024,
+            File::create(path).map_err(|e| format!("{path}: {e}"))?,
+        )),
+        None => None,
+    };
+    let mut wbim = match temp_bim.as_ref() {
+        Some(path) => Some(BufWriter::with_capacity(
+            4 * 1024 * 1024,
+            File::create(path).map_err(|e| format!("{path}: {e}"))?,
+        )),
+        None => None,
+    };
+
+    let byte_lut = packed_byte_lut();
+    let denom = (n_samples.saturating_sub(1)).max(1) as f64;
+    let n_samples_f = n_samples as f64;
+    let step = step_variants.max(1);
+    let mut rows: Vec<StreamChromRow> = Vec::new();
+    let mut bit_pool: Vec<Vec<u64>> = Vec::new();
+    let mut base_seq = 0usize;
+    let mut seen_count = 0usize;
+    let mut next_start = 0usize;
+    let mut bp_scan = 0usize;
+    let mut kept = 0usize;
+    let mut row_buf = vec![0u8; bytes_per_snp];
+    let mut line_buf = String::new();
+    let mut consumed_bim = block.bim_start;
+    let notify_step = if progress_every == 0 {
+        (block.len / 100).max(1)
+    } else {
+        progress_every.max(1)
+    };
+    let mut last_notified = 0usize;
+
+    notify_chrom_prune_progress(
+        chrom_progress_callback,
+        block_idx,
+        &block.chrom,
+        0usize,
+        block.len,
+        false,
+    )?;
+
+    for local_seq in 0..block.len {
+        line_buf.clear();
+        let n_line = bim_reader
+            .read_line(&mut line_buf)
+            .map_err(|e| format!("{src_bim}:{}: {}", block.start_idx + local_seq + 1, e))?;
+        if n_line == 0 {
+            return Err(format!(
+                "{src_bim}: unexpected EOF at variant row {}",
+                block.start_idx + local_seq + 1
+            ));
+        }
+        consumed_bim = consumed_bim.saturating_add(n_line as u64);
+        if consumed_bim > block.bim_end {
+            return Err(format!(
+                "{src_bim}: chromosome block {} exceeded BIM byte range",
+                block.chrom
+            ));
+        }
+        let bim_line_trimmed = line_buf.trim_end_matches(&['\r', '\n'][..]);
+        let (_chrom, pos) =
+            parse_bim_line_chrom_pos(bim_line_trimmed, block.start_idx + local_seq + 1, &src_bim)?;
+        bed_reader
+            .read_exact(&mut row_buf)
+            .map_err(|e| format!("{src_bed}: row {}: {}", block.start_idx + local_seq + 1, e))?;
+
+        let stats = compute_packed_row_stats(&row_buf, n_samples, byte_lut);
+        let mut bits = bit_pool.pop().unwrap_or_default();
+        fill_row_bitplanes_hlav_u64(&row_buf, n_samples, &mut bits);
+        rows.push(StreamChromRow {
+            first_unchecked_seq: seen_count.saturating_add(1),
+            pos,
+            packed: if write_temp {
+                row_buf.to_vec()
+            } else {
+                Vec::new()
+            },
+            bim_line: if write_temp {
+                bim_line_trimmed.to_string()
+            } else {
+                String::new()
+            },
+            stats,
+            bits,
+            dropped: false,
+        });
+        seen_count = seen_count.saturating_add(1);
+        process_stream_chrom_ready_windows(
+            &mut rows,
+            &mut base_seq,
+            seen_count,
+            false,
+            &mut next_start,
+            &mut bp_scan,
+            window_bp,
+            window_variants,
+            step,
+            r2_threshold,
+            n_samples_f,
+            denom,
+            word_masks,
+            &mut kept,
+            &mut bit_pool,
+            wbed.as_mut(),
+            wbim.as_mut(),
+            temp_bed.as_deref().unwrap_or(""),
+            temp_bim.as_deref().unwrap_or(""),
+        )?;
+        let done = local_seq.saturating_add(1);
+        if done >= last_notified.saturating_add(notify_step) || done == block.len {
+            last_notified = done;
+            notify_chrom_prune_progress(
+                chrom_progress_callback,
+                block_idx,
+                &block.chrom,
+                done,
+                block.len,
+                done == block.len,
+            )?;
+        }
+    }
+
+    process_stream_chrom_ready_windows(
+        &mut rows,
+        &mut base_seq,
+        seen_count,
+        true,
+        &mut next_start,
+        &mut bp_scan,
+        window_bp,
+        window_variants,
+        step,
+        r2_threshold,
+        n_samples_f,
+        denom,
+        word_masks,
+        &mut kept,
+        &mut bit_pool,
+        wbed.as_mut(),
+        wbim.as_mut(),
+        temp_bed.as_deref().unwrap_or(""),
+        temp_bim.as_deref().unwrap_or(""),
+    )?;
+    flush_stream_chrom_rows(
+        &mut rows,
+        &mut base_seq,
+        seen_count,
+        &mut kept,
+        &mut bit_pool,
+        wbed.as_mut(),
+        wbim.as_mut(),
+        temp_bed.as_deref().unwrap_or(""),
+        temp_bim.as_deref().unwrap_or(""),
+    )?;
+    if !rows.is_empty() {
+        return Err(format!(
+            "streaming chromosome block {} finished with unflushed rows",
+            block.chrom
+        ));
+    }
+    if let Some(w) = wbed.as_mut() {
+        w.flush()
+            .map_err(|e| format!("{}: {e}", temp_bed.as_deref().unwrap_or("")))?;
+    }
+    if let Some(w) = wbim.as_mut() {
+        w.flush()
+            .map_err(|e| format!("{}: {e}", temp_bim.as_deref().unwrap_or("")))?;
+    }
+
+    Ok(ChromPruneTempResult {
+        block_idx,
+        kept,
+        temp_bed,
+        temp_bim,
+    })
+}
+
+fn copy_exact_bytes_limited(
+    src_path: &str,
+    dst: &mut BufWriter<File>,
+    n_bytes: usize,
+) -> Result<(), String> {
+    let mut src = BufReader::with_capacity(
+        8 * 1024 * 1024,
+        File::open(src_path).map_err(|e| format!("{src_path}: {e}"))?,
+    );
+    let mut remaining = n_bytes;
+    let mut buf = vec![0u8; 8 * 1024 * 1024];
+    while remaining > 0 {
+        let take = remaining.min(buf.len());
+        src.read_exact(&mut buf[..take])
+            .map_err(|e| format!("{src_path}: {e}"))?;
+        dst.write_all(&buf[..take])
+            .map_err(|e| format!("{src_path}: {e}"))?;
+        remaining -= take;
+    }
+    Ok(())
+}
+
+fn copy_bim_lines_limited(
+    src_path: &str,
+    dst: &mut BufWriter<File>,
+    n_lines: usize,
+) -> Result<(), String> {
+    let mut src = BufReader::with_capacity(
+        4 * 1024 * 1024,
+        File::open(src_path).map_err(|e| format!("{src_path}: {e}"))?,
+    );
+    let mut line = String::new();
+    for _ in 0..n_lines {
+        line.clear();
+        let n = src
+            .read_line(&mut line)
+            .map_err(|e| format!("{src_path}: {e}"))?;
+        if n == 0 {
+            return Err(format!("{src_path}: unexpected EOF while copying BIM rows"));
+        }
+        dst.write_all(line.as_bytes())
+            .map_err(|e| format!("{src_path}: {e}"))?;
+    }
+    Ok(())
+}
+
+fn concat_stream_chrom_results_to_plink(
+    src_prefix: &str,
+    out_prefix: &str,
+    results: &[ChromPruneTempResult],
+    bytes_per_snp: usize,
+    max_output_sites: Option<usize>,
+) -> Result<(), String> {
+    let out_bed = format!("{out_prefix}.bed");
+    let out_bim = format!("{out_prefix}.bim");
+    let out_fam = format!("{out_prefix}.fam");
+    let src_fam = format!("{src_prefix}.fam");
+    if let Some(parent) = Path::new(&out_bed).parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+    }
+    let mut wbed = BufWriter::with_capacity(
+        8 * 1024 * 1024,
+        File::create(&out_bed).map_err(|e| format!("{out_bed}: {e}"))?,
+    );
+    let mut wbim = BufWriter::with_capacity(
+        4 * 1024 * 1024,
+        File::create(&out_bim).map_err(|e| format!("{out_bim}: {e}"))?,
+    );
+    wbed.write_all(&[0x6C, 0x1B, 0x01])
+        .map_err(|e| format!("{out_bed}: {e}"))?;
+
+    let mut written = 0usize;
+    let max_rows = max_output_sites.unwrap_or(usize::MAX);
+    for result in results {
+        if written >= max_rows {
+            break;
+        }
+        let rows_to_copy = result.kept.min(max_rows - written);
+        if rows_to_copy == 0 {
+            continue;
+        }
+        let bed_path = result
+            .temp_bed
+            .as_deref()
+            .ok_or_else(|| "missing chromosome temporary BED output".to_string())?;
+        let bim_path = result
+            .temp_bim
+            .as_deref()
+            .ok_or_else(|| "missing chromosome temporary BIM output".to_string())?;
+        copy_exact_bytes_limited(
+            bed_path,
+            &mut wbed,
+            rows_to_copy
+                .checked_mul(bytes_per_snp)
+                .ok_or_else(|| "BED output byte count overflow".to_string())?,
+        )?;
+        copy_bim_lines_limited(bim_path, &mut wbim, rows_to_copy)?;
+        written = written.saturating_add(rows_to_copy);
+    }
+    wbed.flush().map_err(|e| format!("{out_bed}: {e}"))?;
+    wbim.flush().map_err(|e| format!("{out_bim}: {e}"))?;
+    fs::copy(&src_fam, &out_fam).map_err(|e| format!("{src_fam} -> {out_fam}: {e}"))?;
+
+    for result in results {
+        if let Some(path) = result.temp_bed.as_ref() {
+            let _ = fs::remove_file(path);
+        }
+        if let Some(path) = result.temp_bim.as_ref() {
+            let _ = fs::remove_file(path);
+        }
+    }
+    Ok(())
+}
+
+fn stream_prune_chrom_blocks_to_plink(
+    src_prefix: &str,
+    out_prefix: &str,
+    scan: BimStreamScan,
+    n_samples: usize,
+    window_bp: Option<i64>,
+    window_variants: Option<usize>,
+    step_variants: usize,
+    r2_threshold: f64,
+    threads: usize,
+    progress_callback: Option<Py<PyAny>>,
+    chrom_progress_callback: Option<Py<PyAny>>,
+    progress_every: usize,
+    max_output_sites: Option<usize>,
+) -> Result<(usize, usize), String> {
+    if scan.blocks.is_empty() {
+        return Err("no chromosome blocks found in BIM".to_string());
+    }
+    let bytes_per_snp = (n_samples + 3) / 4;
+    let words = (n_samples + 63) / 64;
+    let mut word_masks = vec![u64::MAX; words];
+    if words > 0 {
+        let rem = n_samples % 64;
+        if rem != 0 {
+            word_masks[words - 1] = (1u64 << rem) - 1u64;
+        }
+    }
+    let write_temp = max_output_sites != Some(0usize);
+    let pool = get_cached_pool(threads).map_err(|e| e.to_string())?;
+    let blocks = scan.blocks;
+    let chrom_progress = chrom_progress_callback.map(|cb| Arc::new(Mutex::new(cb)));
+    let run = || -> Result<Vec<ChromPruneTempResult>, String> {
+        blocks
+            .par_iter()
+            .enumerate()
+            .map(|(block_idx, block)| {
+                process_stream_chrom_block(
+                    src_prefix,
+                    out_prefix,
+                    block,
+                    block_idx,
+                    n_samples,
+                    bytes_per_snp,
+                    window_bp,
+                    window_variants,
+                    step_variants,
+                    r2_threshold,
+                    &word_masks,
+                    write_temp,
+                    chrom_progress.as_ref(),
+                    progress_every,
+                )
+            })
+            .collect()
+    };
+    let mut results = if let Some(tp) = pool.as_ref() {
+        tp.install(run)?
+    } else {
+        run()?
+    };
+    results.sort_by_key(|r| r.block_idx);
+    let kept = results
+        .iter()
+        .fold(0usize, |acc, r| acc.saturating_add(r.kept));
+    concat_stream_chrom_results_to_plink(
+        src_prefix,
+        out_prefix,
+        &results,
+        bytes_per_snp,
+        max_output_sites,
+    )?;
+    if let Some(cb) = progress_callback.as_ref() {
+        Python::attach(|py2| -> PyResult<()> {
+            py2.check_signals()?;
+            cb.call1(py2, (scan.total_snps, scan.total_snps))?;
+            Ok(())
+        })
+        .map_err(|e| e.to_string())?;
+    }
+    Ok((kept, scan.total_snps))
 }
 
 fn stream_prune_plink_to_plink(
@@ -1484,13 +2368,45 @@ fn stream_prune_plink_to_plink(
     r2_threshold: f64,
     threads: usize,
     progress_callback: Option<Py<PyAny>>,
+    chrom_progress_callback: Option<Py<PyAny>>,
     progress_every: usize,
+    max_output_sites: Option<usize>,
+    pre_scan: Option<BimStreamScan>,
 ) -> Result<(usize, usize), String> {
     validate_ld_prune_args(window_bp, window_variants, step_variants, r2_threshold)?;
     let mode = resolve_ld_prune_mode();
 
-    let (total_snps, chrom_last_index, chrom_pos_sorted) =
-        scan_bim_last_index_and_order(src_prefix)?;
+    let scan = match pre_scan {
+        Some(scan) => scan,
+        None => scan_bim_stream_blocks(src_prefix)?,
+    };
+    let total_snps = scan.total_snps;
+    let chrom_pos_sorted = scan.chrom_pos_sorted;
+    if mode == LdPruneMode::Strict
+        && scan.chrom_contiguous
+        && (window_bp.is_none() || scan.blocks.iter().all(|b| b.pos_sorted))
+    {
+        let n_samples = crate::gfcore::read_fam(src_prefix)?.len();
+        if n_samples == 0 || total_snps == 0 {
+            return Err("empty PLINK input (no samples or no SNPs)".to_string());
+        }
+        return stream_prune_chrom_blocks_to_plink(
+            src_prefix,
+            out_prefix,
+            scan,
+            n_samples,
+            window_bp,
+            window_variants,
+            step_variants,
+            r2_threshold,
+            threads,
+            progress_callback,
+            chrom_progress_callback,
+            progress_every,
+            max_output_sites,
+        );
+    }
+    let chrom_last_index = scan.chrom_last_index;
     if window_bp.is_some() && !chrom_pos_sorted {
         return Err(
             "streaming packed prune requires BIM positions to be nondecreasing within each chromosome"
@@ -1530,9 +2446,15 @@ fn stream_prune_plink_to_plink(
     }
 
     let bim_file = File::open(&src_bim).map_err(|e| format!("{src_bim}: {e}"))?;
-    let mut bim_reader = BufReader::new(bim_file);
-    let mut wbed = BufWriter::new(File::create(&out_bed).map_err(|e| format!("{out_bed}: {e}"))?);
-    let mut wbim = BufWriter::new(File::create(&out_bim).map_err(|e| format!("{out_bim}: {e}"))?);
+    let mut bim_reader = BufReader::with_capacity(8 * 1024 * 1024, bim_file);
+    let mut wbed = BufWriter::with_capacity(
+        8 * 1024 * 1024,
+        File::create(&out_bed).map_err(|e| format!("{out_bed}: {e}"))?,
+    );
+    let mut wbim = BufWriter::with_capacity(
+        4 * 1024 * 1024,
+        File::create(&out_bim).map_err(|e| format!("{out_bim}: {e}"))?,
+    );
     wbed.write_all(&header)
         .map_err(|e| format!("{out_bed}: {e}"))?;
 
@@ -1570,6 +2492,7 @@ fn stream_prune_plink_to_plink(
     let mut rows: Vec<Option<StreamingPruneBufferedRow>> = Vec::new();
     let mut next_write = 0usize;
     let mut kept = 0usize;
+    let mut written = 0usize;
     let mut active_by_chrom: HashMap<String, VecDeque<usize>> = HashMap::new();
     let mut seen_by_chrom: HashMap<String, usize> = HashMap::new();
     let mut chrom_pos_by_seq: HashMap<String, Vec<i64>> = HashMap::new();
@@ -1592,8 +2515,8 @@ fn stream_prune_plink_to_plink(
                     row_idx + 1
                 ));
             }
-            let bim_line = line_buf.trim_end_matches(&['\r', '\n'][..]).to_string();
-            let (chrom, pos) = parse_bim_line_chrom_pos(&bim_line, row_idx + 1, &src_bim)?;
+            let bim_line_trimmed = line_buf.trim_end_matches(&['\r', '\n'][..]);
+            let (chrom, pos) = parse_bim_line_chrom_pos(bim_line_trimmed, row_idx + 1, &src_bim)?;
 
             let current_chrom_seq = {
                 let entry = seen_by_chrom.entry(chrom.clone()).or_insert(0usize);
@@ -1840,6 +2763,7 @@ fn stream_prune_plink_to_plink(
                 }
             }
 
+            let keep_output_payload = should_write_output_site(max_output_sites, written);
             let stored_row = if current_dropped {
                 StreamingPruneBufferedRow {
                     pos,
@@ -1861,8 +2785,16 @@ fn stream_prune_plink_to_plink(
                     pos,
                     chrom_seq: current_chrom_seq,
                     first_unchecked_seq: current_chrom_seq.saturating_add(1),
-                    packed: row_buf.to_vec(),
-                    bim_line,
+                    packed: if keep_output_payload {
+                        row_buf.to_vec()
+                    } else {
+                        Vec::new()
+                    },
+                    bim_line: if keep_output_payload {
+                        bim_line_trimmed.to_string()
+                    } else {
+                        String::new()
+                    },
                     stats: current_stats,
                     bit_h: current_bit_h,
                     bit_l: current_bit_l,
@@ -1901,6 +2833,8 @@ fn stream_prune_plink_to_plink(
                 &mut wbed,
                 &mut wbim,
                 &mut kept,
+                &mut written,
+                max_output_sites,
                 &out_bed,
                 &out_bim,
             )?;
@@ -1931,8 +2865,8 @@ fn stream_prune_plink_to_plink(
                     row_idx + 1
                 ));
             }
-            let bim_line = line_buf.trim_end_matches(&['\r', '\n'][..]).to_string();
-            let (chrom, pos) = parse_bim_line_chrom_pos(&bim_line, row_idx + 1, &src_bim)?;
+            let bim_line_trimmed = line_buf.trim_end_matches(&['\r', '\n'][..]);
+            let (chrom, pos) = parse_bim_line_chrom_pos(bim_line_trimmed, row_idx + 1, &src_bim)?;
 
             let current_chrom_seq = {
                 let entry = seen_by_chrom.entry(chrom.clone()).or_insert(0usize);
@@ -1955,12 +2889,21 @@ fn stream_prune_plink_to_plink(
             let current_bit_a = Some(a_now);
             let current_bit_v = Some(v_now);
 
+            let keep_output_payload = should_write_output_site(max_output_sites, written);
             let stored_row = StreamingPruneBufferedRow {
                 pos,
                 chrom_seq: current_chrom_seq,
                 first_unchecked_seq: current_chrom_seq.saturating_add(1),
-                packed: row_buf.to_vec(),
-                bim_line,
+                packed: if keep_output_payload {
+                    row_buf.to_vec()
+                } else {
+                    Vec::new()
+                },
+                bim_line: if keep_output_payload {
+                    bim_line_trimmed.to_string()
+                } else {
+                    String::new()
+                },
                 stats: current_stats,
                 bit_h: current_bit_h,
                 bit_l: current_bit_l,
@@ -2221,6 +3164,8 @@ fn stream_prune_plink_to_plink(
                 &mut wbed,
                 &mut wbim,
                 &mut kept,
+                &mut written,
+                max_output_sites,
                 &out_bed,
                 &out_bim,
             )?;
@@ -2270,6 +3215,8 @@ fn stream_prune_plink_to_plink(
         &mut wbed,
         &mut wbim,
         &mut kept,
+        &mut written,
+        max_output_sites,
         &out_bed,
         &out_bim,
     )?;
@@ -2411,7 +3358,9 @@ pub fn bed_packed_ld_prune_maf_priority<'py>(
     r2_threshold=0.2,
     threads=0,
     progress_callback=None,
-    progress_every=0
+    chrom_progress_callback=None,
+    progress_every=0,
+    max_output_sites=None
 ))]
 pub fn bed_prune_to_plink_rust(
     py: Python<'_>,
@@ -2423,7 +3372,9 @@ pub fn bed_prune_to_plink_rust(
     r2_threshold: f64,
     threads: usize,
     progress_callback: Option<Py<PyAny>>,
+    chrom_progress_callback: Option<Py<PyAny>>,
     progress_every: usize,
+    max_output_sites: Option<usize>,
 ) -> PyResult<(usize, usize)> {
     let src = normalize_plink_prefix(&src_prefix);
     let out = normalize_plink_prefix(&out_prefix);
@@ -2436,10 +3387,11 @@ pub fn bed_prune_to_plink_rust(
     validate_ld_prune_args(window_bp, window_variants, step_variants, r2_threshold)
         .map_err(map_err_string_to_py)?;
 
-    let use_streaming = match scan_bim_last_index_and_order(&src) {
-        Ok((_n_snps, _last_idx, chrom_pos_sorted)) => {
+    let bim_scan = scan_bim_stream_blocks(&src);
+    let use_streaming = match &bim_scan {
+        Ok(scan) => {
             if window_bp.is_some() {
-                chrom_pos_sorted
+                scan.chrom_pos_sorted
             } else {
                 true
             }
@@ -2459,7 +3411,10 @@ pub fn bed_prune_to_plink_rust(
                     r2_threshold,
                     threads,
                     progress_callback,
+                    chrom_progress_callback,
                     progress_every,
+                    max_output_sites,
+                    bim_scan.ok(),
                 )
             })
             .map_err(map_err_string_to_py);
@@ -2498,9 +3453,16 @@ pub fn bed_prune_to_plink_rust(
         })
         .map_err(map_err_string_to_py)?;
 
-    let (kept, total) =
-        write_pruned_plink(&src, &out, &keep, &bed_payload, bytes_per_snp, &bim_lines)
-            .map_err(map_err_string_to_py)?;
+    let (kept, total) = write_pruned_plink(
+        &src,
+        &out,
+        &keep,
+        &bed_payload,
+        bytes_per_snp,
+        &bim_lines,
+        max_output_sites,
+    )
+    .map_err(map_err_string_to_py)?;
     if let Some(cb) = progress_callback.as_ref() {
         Python::attach(|py2| -> PyResult<()> {
             py2.check_signals()?;

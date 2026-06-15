@@ -46,6 +46,22 @@ use crate::stats_common::{
 use memmap2::Mmap;
 use std::fs::File;
 
+#[inline]
+fn gwas_max_output_rows_env() -> Option<usize> {
+    for key in ["JX_FVLMM_MAX_OUTPUT_ROWS", "JX_GWAS_MAX_OUTPUT_ROWS"] {
+        if let Ok(raw) = std::env::var(key) {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Ok(value) = trimmed.parse::<usize>() {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
 fn cholesky_solve(a: &[f64], dim: usize, b: &[f64]) -> Vec<f64> {
     let mut y = vec![0.0_f64; dim];
     for i in 0..dim {
@@ -5716,6 +5732,8 @@ pub fn fvlmm_assoc_bed_to_tsv_f32<'py>(
 
             let mut text_buf = String::with_capacity(scan_chunk_snps * 128);
             let mut total_rows = 0usize;
+            let output_row_limit = gwas_max_output_rows_env();
+            let mut written_total = 0usize;
 
             let progress_block = if progress_every == 0 {
                 0usize
@@ -5911,11 +5929,16 @@ pub fn fvlmm_assoc_bed_to_tsv_f32<'py>(
                     );
 
                     // Format TSV and write
-                    text_buf.clear();
-                    if text_buf.capacity() < rows * 128 {
-                        text_buf.reserve(rows * 128 - text_buf.capacity());
+                    let write_rows = output_row_limit
+                        .map(|limit| limit.saturating_sub(written_total).min(rows))
+                        .unwrap_or(rows);
+                    if write_rows > 0 {
+                        text_buf.clear();
+                        if text_buf.capacity() < write_rows * 128 {
+                            text_buf.reserve(write_rows * 128 - text_buf.capacity());
+                        }
                     }
-                    for off in 0..rows {
+                    for off in 0..write_rows {
                         let base = off * out_cols;
                         let beta = chunk.out_block[base];
                         let se = chunk.out_block[base + 1];
@@ -5965,8 +5988,11 @@ pub fn fvlmm_assoc_bed_to_tsv_f32<'py>(
                             );
                         }
                     }
-                    let payload = std::mem::take(&mut text_buf).into_bytes();
-                    writer.send(payload)?;
+                    if write_rows > 0 {
+                        let payload = std::mem::take(&mut text_buf).into_bytes();
+                        writer.send(payload)?;
+                        written_total = written_total.saturating_add(write_rows);
+                    }
                 }
 
                 total_rows += rows;

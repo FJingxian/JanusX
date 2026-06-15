@@ -124,6 +124,7 @@ struct SplmmTsvBlockPayload {
 struct SplmmScanToTsvResult {
     r_hat: f64,
     written_rows: usize,
+    factor_nnz: usize,
     null_info: PcgJxlmmNullModelInfo,
     rhat_info: PcgJxlmmRHatResult,
     factor_load_secs: f64,
@@ -131,6 +132,14 @@ struct SplmmScanToTsvResult {
     scan_exec_secs: f64,
     writer_wait_secs: f64,
 }
+
+type SplmmScanResult = (
+    f64,
+    Vec<f64>,
+    PcgJxlmmNullModelInfo,
+    PcgJxlmmRHatResult,
+    usize,
+);
 
 #[inline]
 fn splmm_packed_stage_timing_enabled() -> bool {
@@ -4430,7 +4439,7 @@ fn estimate_residualized_approx_scan_sparse(
     approx_fit_tol: f64,
     approx_fit_max_iter: usize,
     mmap_window_mb: Option<usize>,
-) -> Result<(f64, Vec<f64>, PcgJxlmmNullModelInfo, PcgJxlmmRHatResult), String> {
+) -> Result<SplmmScanResult, String> {
     let _ = (approx_fit_tol, approx_fit_max_iter);
     let stage1_cb = stage1_progress_callback.as_ref();
     let n = y_vec.len();
@@ -4445,6 +4454,7 @@ fn estimate_residualized_approx_scan_sparse(
         sigma_g2,
         sigma_e2,
     )?;
+    let factor_nnz = fit.factor_nnz();
     if stage1_cb.is_some() {
         emit_progress_callback(stage1_cb, 5, 1, 1)?;
     }
@@ -4492,6 +4502,7 @@ fn estimate_residualized_approx_scan_sparse(
         out,
         trivial_pcg_null_info(n, p),
         trivial_pcg_rhat_info(n, n_rhat, n_used),
+        factor_nnz,
     ))
 }
 
@@ -4603,6 +4614,7 @@ fn estimate_residualized_approx_scan_to_tsv_sparse(
     Ok(SplmmScanToTsvResult {
         r_hat: gamma,
         written_rows,
+        factor_nnz: fit.factor_nnz(),
         null_info: trivial_pcg_null_info(n, p),
         rhat_info: trivial_pcg_rhat_info(n, n_rhat, n_used),
         factor_load_secs,
@@ -4631,8 +4643,9 @@ fn estimate_rhat_and_scan_sparse(
     progress_every: usize,
     scan_mode: SplmmScanMode,
     mmap_window_mb: Option<usize>,
-) -> Result<(f64, Vec<f64>, PcgJxlmmNullModelInfo, PcgJxlmmRHatResult), String> {
+) -> Result<SplmmScanResult, String> {
     let stage1_cb = stage1_progress_callback.as_ref();
+    let factor_nnz = factor.factor_nnz();
     let mut state = prepare_splmm_scan_state(
         factor,
         &scan_prepared,
@@ -4751,7 +4764,13 @@ fn estimate_rhat_and_scan_sparse(
             approx_out
         }
     };
-    Ok((state.r_hat, out, state.null_info, state.rhat_info))
+    Ok((
+        state.r_hat,
+        out,
+        state.null_info,
+        state.rhat_info,
+        factor_nnz,
+    ))
 }
 
 fn estimate_rhat_and_scan(
@@ -4777,7 +4796,7 @@ fn estimate_rhat_and_scan(
     approx_fit_tol: f64,
     approx_fit_max_iter: usize,
     mmap_window_mb: Option<usize>,
-) -> Result<(f64, Vec<f64>, PcgJxlmmNullModelInfo, PcgJxlmmRHatResult), String> {
+) -> Result<SplmmScanResult, String> {
     let stage1_cb = stage1_progress_callback.as_ref();
     let prefix = operator_prepared
         .bed_prefix
@@ -5124,6 +5143,7 @@ fn estimate_rhat_and_scan_to_tsv(
     Ok(SplmmScanToTsvResult {
         r_hat: state.r_hat,
         written_rows,
+        factor_nnz: state.factor.factor_nnz(),
         null_info: state.null_info,
         rhat_info: state.rhat_info,
         factor_load_secs,
@@ -5481,6 +5501,7 @@ pub fn splmm_assoc_pcg_bed<'py>(
     usize,
     usize,
     Bound<'py, PyArray2<f64>>,
+    usize,
 )> {
     if max_iter == 0 {
         return Err(PyRuntimeError::new_err("max_iter must be > 0"));
@@ -5522,7 +5543,7 @@ pub fn splmm_assoc_pcg_bed<'py>(
     emit_progress_callback(stage1_progress_callback.as_ref(), 0, 1, 1)
         .map_err(PyRuntimeError::new_err)?;
 
-    let (r_hat, out, null_info, rhat_info) = py
+    let (r_hat, out, null_info, rhat_info, factor_nnz) = py
         .detach(move || {
             estimate_rhat_and_scan(
                 prepared.operator_prepared,
@@ -5565,6 +5586,7 @@ pub fn splmm_assoc_pcg_bed<'py>(
         rhat_info.n_markers_requested,
         rhat_info.n_markers_used,
         PyArray2::from_owned_array(py, out_arr),
+        factor_nnz,
     ))
 }
 
@@ -5659,6 +5681,7 @@ pub fn splmm_assoc_pcg_bed_to_tsv<'py>(
     usize,
     usize,
     (f64, f64, f64, f64, f64, f64, f64),
+    usize,
 )> {
     let top_level_timing = splmm_top_level_timing_enabled();
     let total_t0 = top_level_timing.then(Instant::now);
@@ -5831,6 +5854,7 @@ pub fn splmm_assoc_pcg_bed_to_tsv<'py>(
     let SplmmScanToTsvResult {
         r_hat,
         written_rows,
+        factor_nnz,
         null_info,
         rhat_info,
         ..
@@ -5856,6 +5880,7 @@ pub fn splmm_assoc_pcg_bed_to_tsv<'py>(
             top_timing.other_secs,
             top_timing.total_secs,
         ),
+        factor_nnz,
     ))
 }
 
@@ -6242,7 +6267,7 @@ mod tests {
         }
         let prepared = JxlmmPreparedInput {
             bed_prefix: None,
-            payload: JxlmmPayload::Packed(Arc::<[u8]>::from(packed_flat)),
+            payload: Some(JxlmmPayload::Packed(Arc::<[u8]>::from(packed_flat))),
             n_samples_full: 4,
             bytes_per_snp: 1,
             row_flip: vec![false, false, false],
@@ -6985,7 +7010,7 @@ mod tests {
         let y_vec = vec![0.5_f64, -1.0_f64, 1.25_f64];
         let factor = make_diag_factor(&[2.0_f64, 3.0_f64, 4.0_f64]);
 
-        let (r_hat, out, null_info, rhat_info) = estimate_rhat_and_scan_sparse(
+        let (r_hat, out, null_info, rhat_info, factor_nnz) = estimate_rhat_and_scan_sparse(
             factor,
             prepared,
             x_design,
@@ -7005,6 +7030,7 @@ mod tests {
             None,
         )
         .unwrap();
+        assert!(factor_nnz > 0);
 
         assert!(r_hat.is_nan());
         assert_eq!(out.len(), 9);

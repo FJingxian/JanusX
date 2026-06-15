@@ -636,6 +636,7 @@ def run_farmcpu_fullmem(
     prepare_only: bool = False,
     emit_trait_header: bool = True,
     preloaded_packed: Union[dict[str, object], None] = None,
+    qtn_preloaded_packed: Union[dict[str, object], None] = None,
     emit_file_dense_warning: bool = True,
 ) -> dict[str, object]:
     """
@@ -650,6 +651,39 @@ def run_farmcpu_fullmem(
     qdim = args.qcov
     cov = args.cov
     snps_only = bool(getattr(args, "snps_only", False))
+
+    if (
+        farmcpu_cache is None
+        and isinstance(qtn_preloaded_packed, dict)
+        and pheno_preloaded is not None
+        and ids_preloaded is not None
+        and qmatrix_preloaded is not None
+    ):
+        qtn_ctx_obj = qtn_preloaded_packed.get("packed_ctx")
+        if not isinstance(qtn_ctx_obj, dict):
+            raise ValueError("Invalid QTN packed payload for FarmCPU: missing packed_ctx.")
+        qtn_ctx = _normalize_packed_ctx_for_farmcpu_cache(qtn_ctx_obj)
+        qtn_row_idx = np.asarray(qtn_ctx.get("row_indices", []), dtype=np.int64).reshape(-1)
+        qtn_ids = np.asarray(qtn_preloaded_packed.get("full_ids", []), dtype=str)
+        id_to_qtn = {str(sid): i for i, sid in enumerate(qtn_ids)}
+        try:
+            qtn_sample_idx = np.asarray([id_to_qtn[str(sid)] for sid in np.asarray(ids_preloaded, dtype=str)], dtype=np.int64)
+        except KeyError as e:
+            raise ValueError("Some GWAS sample IDs are not present in QTN genotype sample order.") from e
+        farmcpu_cache = {
+            "pheno": pheno_preloaded,
+            "famid": np.asarray(ids_preloaded, dtype=str),
+            "geno": None,
+            "packed_ctx": qtn_ctx,
+            "ref_alt": _make_deferred_bim_metadata(
+                str(qtn_preloaded_packed.get("prefix", "")),
+                qtn_row_idx,
+                n_markers=int(qtn_row_idx.shape[0]),
+            ),
+            "qmatrix": np.asarray(qmatrix_preloaded, dtype="float32"),
+            "packed_sample_idx": qtn_sample_idx,
+            "_qtn_stage_mode": True,
+        }
 
     def _load_bim_ref_alt_filtered(
         prefix: str,
@@ -799,6 +833,7 @@ def run_farmcpu_fullmem(
             maf_threshold=float(args.maf),
             max_missing_rate=float(args.geno),
             het_threshold=float(args.het),
+            force_kind=("hmp" if bool(getattr(args, "hmp", None)) else None),
         )
         famid = np.asarray(famid, dtype=str)
         geno = None
@@ -1155,6 +1190,7 @@ def run_farmcpu_fullmem(
 
         p_sub = np.ascontiguousarray(y_full[keep_idx], dtype=np.float64).reshape(-1, 1)
         q_sub = qmatrix[keep_idx]
+        trait_ids = np.asarray(famid[keep_idx], dtype=str)
         n_idv = int(keep_idx.shape[0])
         if packed_ctx is None:
             if geno is None:
@@ -1207,6 +1243,7 @@ def run_farmcpu_fullmem(
         farm_qtn_bound = None if farm_qtn_bound_raw is None else int(farm_qtn_bound_raw)
         farm_nbin = max(1, int(getattr(args, "farmcpu_nbin", 5)))
         farm_szbin = [float(x) for x in getattr(args, "farmcpu_bin_size", [5e5, 5e6, 5e7])]
+        farm_raw = bool(getattr(args, "farmcpu_raw", False))
         farm_label = "FarmCPU"
         farm_pbar = _ProgressAdapter(
             total=farm_iter,
@@ -1331,6 +1368,7 @@ def run_farmcpu_fullmem(
                             "qtn_bound": farm_qtn_bound,
                             "nbin": int(farm_nbin),
                             "szbin": [float(x) for x in farm_szbin],
+                            "raw": bool(farm_raw),
                             "pseudo_tsv": str(pseudo_tsv_hint),
                             "scan_progress_callback": _farmcpu_progress,
                         }
@@ -1414,6 +1452,7 @@ def run_farmcpu_fullmem(
                         progress_callback=_farmcpu_progress,
                         pseudo_tsv=pseudo_tsv_hint,
                         bed_prefix=bed_prefix_meta,
+                        raw=bool(farm_raw),
                     )
                 farm_pbar.finish()
             finally:
@@ -1421,6 +1460,70 @@ def run_farmcpu_fullmem(
             n_pseudo_qtn = int(max(0, n_pseudo_qtn))
             if int(rust_qtn_written) > 0 and os.path.exists(pseudo_tsv_hint):
                 pseudo_tsv = pseudo_tsv_hint
+            if bool(farmcpu_cache.get("_qtn_stage_mode", False)):
+                main_prefix = _as_plink_prefix(gfile)
+                if main_prefix is None:
+                    raise ValueError("FarmCPU QTN stage2 requires main genotype PLINK BED prefix.")
+                from janusx.assoc.workflow_model_packed import run_qtn_segmented_lm_stage2
+
+                stage2_done = {"value": 0}
+                stage2_pbar = None
+
+                def _farmcpu_stage2_progress(done: int, total: int) -> None:
+                    nonlocal peak_rss, stage2_pbar
+                    try:
+                        d = int(done)
+                        t = int(total)
+                    except Exception:
+                        return
+                    if stage2_pbar is None:
+                        stage2_pbar = _ProgressAdapter(
+                            total=max(1, int(t if t > 0 else (n_snps_preloaded or eff_snp))),
+                            desc="FarmCPU stage2",
+                            force_animate=bool(use_spinner),
+                            logger=logger,
+                        )
+                    if t > 0 and int(stage2_pbar.total) != t and int(stage2_done["value"]) == 0:
+                        stage2_pbar.set_total(int(max(1, t)))
+                    target = int(max(0, min(int(stage2_pbar.total), d)))
+                    delta = target - int(stage2_done["value"])
+                    if delta > 0:
+                        stage2_pbar.update(delta)
+                        stage2_done["value"] = target
+                    try:
+                        peak_rss = max(peak_rss, process.memory_info().rss)
+                    except Exception:
+                        pass
+
+                try:
+                    kept_rows2, scan_rows2, qtn_used = run_qtn_segmented_lm_stage2(
+                        main_prefix=str(main_prefix),
+                        y_vec=np.ascontiguousarray(p_sub, dtype=np.float64).reshape(-1),
+                        trait_ids=trait_ids,
+                        base_cov=np.ascontiguousarray(q_sub, dtype=np.float64),
+                        qtn_preloaded_packed=qtn_preloaded_packed,  # type: ignore[arg-type]
+                        qtn_tsv=str(pseudo_tsv_hint),
+                        tmp_tsv=str(tmp_tsv),
+                        maf_threshold=float(args.maf),
+                        max_missing_rate=float(args.geno),
+                        het_threshold=float(args.het),
+                        snps_only=bool(snps_only),
+                        chunk_size=int(max(1, int(getattr(args, "chunksize", 10000)))),
+                        threads=int(args.thread),
+                        progress_callback=_farmcpu_stage2_progress,
+                        args_obj=args,
+                    )
+                    eff_snp = int(kept_rows2)
+                    n_pseudo_qtn = int(max(n_pseudo_qtn, qtn_used))
+                finally:
+                    if stage2_pbar is not None:
+                        try:
+                            if int(stage2_done["value"]) < int(stage2_pbar.total):
+                                stage2_pbar.update(int(stage2_pbar.total) - int(stage2_done["value"]))
+                            stage2_pbar.finish()
+                        except Exception:
+                            pass
+                        stage2_pbar.close(show_done=False)
         else:
             farm_ret: object
             try:

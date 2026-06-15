@@ -11,6 +11,7 @@ import os
 import time
 import uuid
 import json
+from bisect import bisect_right
 from typing import Optional, Union
 
 import numpy as np
@@ -908,6 +909,379 @@ def _prepare_packed_bed_once_for_gwas(
         expected_rows=int(active_row_idx.shape[0]),
     )
     return str(prefix), full_ids, packed_ctx, site_meta
+
+
+def _read_bed_fam_iids(prefix: str) -> np.ndarray:
+    fam_path = f"{prefix}.fam"
+    ids: list[str] = []
+    with open(fam_path, "r", encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            parts = line.rstrip("\n").split()
+            if len(parts) >= 2:
+                ids.append(str(parts[1]))
+    return np.asarray(ids, dtype=str)
+
+
+def _iter_bim_active_rows(prefix: str, active_row_idx: np.ndarray):
+    row_idx = np.asarray(active_row_idx, dtype=np.int64).reshape(-1)
+    if int(row_idx.shape[0]) == 0:
+        return
+    ptr = 0
+    target = int(row_idx[ptr])
+    with open(f"{prefix}.bim", "r", encoding="utf-8", errors="replace") as fh:
+        for source_idx, line in enumerate(fh):
+            if source_idx < target:
+                continue
+            while source_idx == target:
+                parts = line.rstrip("\n").split()
+                if len(parts) < 6:
+                    raise ValueError(f"{prefix}.bim line {source_idx + 1} is malformed.")
+                yield (
+                    ptr,
+                    source_idx,
+                    str(parts[0]),
+                    int(float(parts[3])),
+                    str(parts[1]),
+                    str(parts[4]),
+                    str(parts[5]),
+                )
+                ptr += 1
+                if ptr >= int(row_idx.shape[0]):
+                    return
+                target = int(row_idx[ptr])
+                if source_idx != target:
+                    break
+
+
+def _read_qtn_rows(qtn_tsv: str) -> pd.DataFrame:
+    if not qtn_tsv or not os.path.exists(qtn_tsv):
+        return pd.DataFrame(columns=["chrom", "pos", "snp"])
+    df = pd.read_csv(qtn_tsv, sep="\t")
+    need = {"chrom", "pos", "snp"}
+    if not need.issubset(set(df.columns)):
+        raise ValueError(f"QTN TSV lacks required columns {sorted(need)}: {qtn_tsv}")
+    out = df.loc[:, ["chrom", "pos", "snp"]].copy()
+    out["chrom"] = out["chrom"].astype(str)
+    out["pos"] = out["pos"].astype(np.int64)
+    out["snp"] = out["snp"].astype(str)
+    return out
+
+
+def _selected_qtn_active_indices(
+    *,
+    qtn_prefix: str,
+    qtn_active_row_idx: np.ndarray,
+    qtn_rows: pd.DataFrame,
+) -> tuple[np.ndarray, list[dict[str, object]]]:
+    if qtn_rows.empty:
+        return np.zeros((0,), dtype=np.int64), []
+    snp_to_order: dict[str, list[int]] = {}
+    pos_to_order: dict[tuple[str, int], list[int]] = {}
+    for i, row in qtn_rows.iterrows():
+        snp_to_order.setdefault(str(row["snp"]), []).append(int(i))
+        pos_to_order.setdefault((str(row["chrom"]), int(row["pos"])), []).append(int(i))
+    selected: dict[int, tuple[int, dict[str, object]]] = {}
+    for active_i, _source_i, chrom, pos, snp, a0, a1 in _iter_bim_active_rows(qtn_prefix, qtn_active_row_idx):
+        orders = snp_to_order.get(str(snp), [])
+        if len(orders) == 0:
+            orders = pos_to_order.get((str(chrom), int(pos)), [])
+        for order in orders:
+            selected.setdefault(
+                int(order),
+                (
+                    int(active_i),
+                    {
+                        "chrom": str(chrom),
+                        "pos": int(pos),
+                        "snp": str(snp),
+                        "allele0": str(a0),
+                        "allele1": str(a1),
+                    },
+                ),
+            )
+    active: list[int] = []
+    meta: list[dict[str, object]] = []
+    for order in range(int(qtn_rows.shape[0])):
+        hit = selected.get(order)
+        if hit is None:
+            continue
+        active.append(int(hit[0]))
+        meta.append(hit[1])
+    return np.asarray(active, dtype=np.int64), meta
+
+
+def _decode_qtn_covariates(
+    *,
+    qtn_preloaded_packed: dict[str, object],
+    qtn_active_indices: np.ndarray,
+    trait_ids: np.ndarray,
+) -> np.ndarray:
+    active_sel = np.asarray(qtn_active_indices, dtype=np.int64).reshape(-1)
+    if int(active_sel.shape[0]) == 0:
+        return np.zeros((int(np.asarray(trait_ids).shape[0]), 0), dtype=np.float64)
+    if not hasattr(jxrs, "bed_packed_decode_rows_f32"):
+        raise RuntimeError("Rust extension missing bed_packed_decode_rows_f32 for QTN covariate decode.")
+    qtn_full_ids = np.asarray(qtn_preloaded_packed["full_ids"], dtype=str).reshape(-1)
+    qtn_id_map = {str(sid): i for i, sid in enumerate(qtn_full_ids)}
+    try:
+        sample_idx = np.asarray([qtn_id_map[str(sid)] for sid in np.asarray(trait_ids, dtype=str)], dtype=np.int64)
+    except KeyError as e:
+        raise ValueError("Some trait sample IDs are not present in QTN genotype sample order.") from e
+    packed, packed_n, active_row_idx, maf, _miss, row_flip = _packed_ctx_active_view_for_gwas(
+        qtn_preloaded_packed["packed_ctx"]  # type: ignore[arg-type]
+    )
+    if int(active_sel.min()) < 0 or int(active_sel.max()) >= int(active_row_idx.shape[0]):
+        raise ValueError("Selected QTN active index out of bounds.")
+    source_rows = np.ascontiguousarray(active_row_idx[active_sel], dtype=np.int64)
+    flip_sel = np.ascontiguousarray(row_flip[active_sel], dtype=np.bool_)
+    maf_sel = np.ascontiguousarray(maf[active_sel], dtype=np.float32)
+    geno = np.asarray(
+        jxrs.bed_packed_decode_rows_f32(
+            packed,
+            int(packed_n),
+            source_rows,
+            flip_sel,
+            maf_sel,
+            sample_indices=np.ascontiguousarray(sample_idx, dtype=np.int64),
+        ),
+        dtype=np.float32,
+    )
+    return np.ascontiguousarray(geno.T, dtype=np.float64)
+
+
+def _farmcpu_final_window_bp_from_args(args_obj: object) -> int:
+    raw_env = str(os.environ.get("JX_FARMCPU_FINAL_WINDOW_BP", "")).strip()
+    if raw_env:
+        try:
+            val = int(float(raw_env))
+        except Exception:
+            val = -1
+        if val >= 0:
+            return int(val)
+    vals: list[int] = []
+    for x in getattr(args_obj, "farmcpu_bin_size", [5e5, 5e6, 5e7]):
+        try:
+            v = int(float(x))
+        except Exception:
+            continue
+        if v > 0:
+            vals.append(v)
+    return int(min(vals) if vals else 500_000)
+
+
+def _qtn_windows_from_meta(qtn_meta: list[dict[str, object]], qtn_cov: np.ndarray, window_bp: int) -> list[dict[str, object]]:
+    k = len(qtn_meta)
+    if k == 0 or int(window_bp) < 0:
+        return []
+    parent = list(range(k))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    starts = [int(m["pos"]) - int(window_bp) for m in qtn_meta]
+    ends = [int(m["pos"]) + int(window_bp) for m in qtn_meta]
+    for i in range(k):
+        for j in range(i + 1, k):
+            if str(qtn_meta[i]["chrom"]) == str(qtn_meta[j]["chrom"]) and starts[i] <= ends[j] and starts[j] <= ends[i]:
+                union(i, j)
+    try:
+        ld_thr = float(os.environ.get("JX_FARMCPU_FINAL_LD_MERGE_R2", "0.7"))
+    except Exception:
+        ld_thr = 0.7
+    if k > 1 and np.isfinite(ld_thr) and ld_thr > 0.0 and int(qtn_cov.shape[1]) == k:
+        corr = np.corrcoef(np.asarray(qtn_cov, dtype=np.float64), rowvar=False)
+        for i in range(k):
+            for j in range(i + 1, k):
+                if str(qtn_meta[i]["chrom"]) == str(qtn_meta[j]["chrom"]):
+                    r = corr[i, j]
+                    if np.isfinite(r) and float(r * r) >= float(ld_thr):
+                        union(i, j)
+    grouped: dict[int, dict[str, object]] = {}
+    for i in range(k):
+        root = find(i)
+        item = grouped.setdefault(
+            root,
+            {"chrom": str(qtn_meta[i]["chrom"]), "start": starts[i], "end": ends[i], "qtn_positions": []},
+        )
+        item["start"] = min(int(item["start"]), starts[i])
+        item["end"] = max(int(item["end"]), ends[i])
+        cast_list = item["qtn_positions"]
+        assert isinstance(cast_list, list)
+        cast_list.append(i)
+    windows = sorted(grouped.values(), key=lambda w: (str(w["chrom"]), int(w["start"]), int(w["end"])))
+    merged: list[dict[str, object]] = []
+    for w in windows:
+        if merged and str(merged[-1]["chrom"]) == str(w["chrom"]) and int(w["start"]) <= int(merged[-1]["end"]):
+            merged[-1]["end"] = max(int(merged[-1]["end"]), int(w["end"]))
+            merged[-1]["qtn_positions"] = sorted(set(int(x) for x in list(merged[-1]["qtn_positions"]) + list(w["qtn_positions"])))
+        else:
+            w["qtn_positions"] = sorted(set(int(x) for x in list(w["qtn_positions"])))
+            merged.append(w)
+    return merged
+
+
+def _active_segments_for_windows(
+    *,
+    main_prefix: str,
+    active_row_idx: np.ndarray,
+    windows: list[dict[str, object]],
+) -> list[tuple[int, int, int]]:
+    if len(windows) == 0:
+        return []
+    by_chrom: dict[str, dict[str, list[int]]] = {}
+    for win_idx, w in enumerate(windows):
+        chrom_w = str(w["chrom"])
+        by_chrom.setdefault(chrom_w, {"starts": [], "ends": [], "ctx": []})
+        by_chrom[chrom_w]["starts"].append(int(w["start"]))
+        by_chrom[chrom_w]["ends"].append(int(w["end"]))
+        by_chrom[chrom_w]["ctx"].append(int(win_idx) + 1)
+    for chrom_w, rec in by_chrom.items():
+        order = sorted(range(len(rec["starts"])), key=lambda i: (rec["starts"][i], rec["ends"][i]))
+        by_chrom[chrom_w] = {
+            "starts": [rec["starts"][i] for i in order],
+            "ends": [rec["ends"][i] for i in order],
+            "ctx": [rec["ctx"][i] for i in order],
+        }
+
+    bounds: dict[int, list[int]] = {}
+    for active_i, _source_i, chrom, pos, _snp, _a0, _a1 in _iter_bim_active_rows(main_prefix, active_row_idx):
+        rec = by_chrom.get(str(chrom))
+        if rec is None:
+            continue
+        p = bisect_right(rec["starts"], int(pos)) - 1
+        if p < 0 or int(pos) > int(rec["ends"][p]):
+            continue
+        ctx_id = int(rec["ctx"][p])
+        cur = bounds.get(ctx_id)
+        if cur is None:
+            bounds[ctx_id] = [int(active_i), int(active_i) + 1]
+        else:
+            cur[1] = int(active_i) + 1
+
+    window_ranges = [(start, end, ctx_id) for ctx_id, (start, end) in bounds.items() if start < end]
+    window_ranges.sort(key=lambda x: (x[0], x[1]))
+    segments: list[tuple[int, int, int]] = []
+    cursor = 0
+    for start, end, ctx_id in window_ranges:
+        if start > cursor:
+            segments.append((cursor, start, 0))
+        start_use = max(start, cursor)
+        if end > start_use:
+            segments.append((start_use, end, ctx_id))
+        cursor = max(cursor, end)
+    n_active = int(np.asarray(active_row_idx).shape[0])
+    if cursor < n_active:
+        segments.append((cursor, n_active, 0))
+    return segments
+
+
+def run_qtn_segmented_lm_stage2(
+    *,
+    main_prefix: str,
+    y_vec: np.ndarray,
+    trait_ids: np.ndarray,
+    base_cov: np.ndarray,
+    qtn_preloaded_packed: dict[str, object],
+    qtn_tsv: str,
+    tmp_tsv: str,
+    maf_threshold: float,
+    max_missing_rate: float,
+    het_threshold: float,
+    snps_only: bool,
+    chunk_size: int,
+    threads: int,
+    progress_callback,
+    args_obj: object,
+) -> tuple[int, int, int]:
+    if not hasattr(jxrs, "lm_stream_bed_segments_to_tsv"):
+        raise RuntimeError("Rust extension missing lm_stream_bed_segments_to_tsv; rebuild JanusX.")
+    qtn_rows = _read_qtn_rows(qtn_tsv)
+    _qtn_packed, _qtn_n, qtn_active_row_idx, _qtn_maf, _qtn_miss, _qtn_flip = _packed_ctx_active_view_for_gwas(
+        qtn_preloaded_packed["packed_ctx"]  # type: ignore[arg-type]
+    )
+    qtn_active_sel, qtn_meta = _selected_qtn_active_indices(
+        qtn_prefix=str(qtn_preloaded_packed["prefix"]),
+        qtn_active_row_idx=qtn_active_row_idx,
+        qtn_rows=qtn_rows,
+    )
+    qtn_cov = _decode_qtn_covariates(
+        qtn_preloaded_packed=qtn_preloaded_packed,
+        qtn_active_indices=qtn_active_sel,
+        trait_ids=np.asarray(trait_ids, dtype=str),
+    )
+    base_design = np.ascontiguousarray(
+        np.concatenate(
+            [
+                np.ones((int(y_vec.shape[0]), 1), dtype=np.float64),
+                np.asarray(base_cov, dtype=np.float64),
+            ],
+            axis=1,
+        ),
+        dtype=np.float64,
+    )
+    x_contexts: list[np.ndarray] = [
+        np.ascontiguousarray(np.concatenate([base_design, qtn_cov], axis=1), dtype=np.float64)
+    ]
+    windows = _qtn_windows_from_meta(qtn_meta, qtn_cov, _farmcpu_final_window_bp_from_args(args_obj))
+    for w in windows:
+        qpos = set(int(x) for x in list(w.get("qtn_positions", [])))
+        keep_cols = [j for j in range(int(qtn_cov.shape[1])) if j not in qpos]
+        qtn_local = qtn_cov[:, keep_cols] if keep_cols else np.zeros((int(y_vec.shape[0]), 0), dtype=np.float64)
+        x_contexts.append(np.ascontiguousarray(np.concatenate([base_design, qtn_local], axis=1), dtype=np.float64))
+    main_ids = _read_bed_fam_iids(main_prefix)
+    id_map = {str(sid): i for i, sid in enumerate(main_ids)}
+    try:
+        sample_idx = np.asarray([id_map[str(sid)] for sid in np.asarray(trait_ids, dtype=str)], dtype=np.int64)
+    except KeyError as e:
+        raise ValueError("Some trait sample IDs are not present in main BED sample order.") from e
+    scan_meta_mmap_window_mb = int(max(1, _current_bed_memory_mb()))
+    meta = _splmm_bed_logic_meta_selected(
+        str(main_prefix),
+        sample_indices=sample_idx,
+        maf_threshold=float(maf_threshold),
+        max_missing_rate=float(max_missing_rate),
+        het_threshold=float(het_threshold),
+        snps_only=bool(snps_only),
+        mmap_window_mb=scan_meta_mmap_window_mb,
+    )
+    active_row_idx = np.asarray(meta["row_indices"], dtype=np.int64).reshape(-1)
+    stage2_mmap_window_mb = auto_mmap_window_mb(
+        str(main_prefix),
+        int(len(main_ids)),
+        int(meta.get("n_snps_total", max(1, int(active_row_idx.shape[0])))),
+        _current_bed_memory_mb(),
+    )
+    segments = _active_segments_for_windows(
+        main_prefix=str(main_prefix),
+        active_row_idx=active_row_idx,
+        windows=windows,
+    )
+    kept_rows, scan_rows = jxrs.lm_stream_bed_segments_to_tsv(
+        str(main_prefix),
+        np.ascontiguousarray(np.asarray(y_vec, dtype=np.float64).reshape(-1), dtype=np.float64),
+        x_contexts,
+        segments,
+        str(tmp_tsv),
+        sample_ids=[str(x) for x in np.asarray(trait_ids, dtype=str)],
+        maf_threshold=float(maf_threshold),
+        max_missing_rate=float(max_missing_rate),
+        het_threshold=float(het_threshold),
+        snps_only=bool(snps_only),
+        chunk_size=int(max(1, int(chunk_size))),
+        threads=int(max(1, int(threads))),
+        progress_callback=progress_callback,
+        progress_every=int(max(1, min(int(max(1, int(chunk_size))), _progress_callback_step(int(max(1, active_row_idx.shape[0])))))),
+        mmap_window_mb=(None if stage2_mmap_window_mb is None else int(max(1, int(stage2_mmap_window_mb)))),
+    )
+    return int(kept_rows), int(scan_rows), int(qtn_cov.shape[1])
 
 
 def _packed_lowrank_scan_to_tsv(
@@ -3905,6 +4279,7 @@ def run_algwas_packed_fullrank(
     trait_names: Union[list[str], None] = None,
     emit_trait_header: bool = True,
     preloaded_packed: Union[dict[str, object], None] = None,
+    qtn_preloaded_packed: Union[dict[str, object], None] = None,
 ) -> None:
     if str(genetic_model).lower() != "add":
         raise ValueError("ALGWAS full-rust packed route currently supports additive coding only (--model add).")
@@ -3914,16 +4289,29 @@ def run_algwas_packed_fullrank(
             "Rebuild/install JanusX extension first."
         )
 
-    prefix, full_ids, packed_ctx, sites_all = _prepare_packed_bed_once_for_gwas(
-        genofile=genofile,
-        maf_threshold=float(maf_threshold),
-        max_missing_rate=float(max_missing_rate),
-        het_threshold=float(het_threshold),
-        snps_only=bool(snps_only),
-        use_spinner=bool(use_spinner),
-        preloaded_packed=preloaded_packed,
-        load_site_meta=False,
-    )
+    qtn_stage_mode = isinstance(qtn_preloaded_packed, dict)
+    main_prefix = _as_plink_prefix(genofile)
+    if main_prefix is None:
+        raise ValueError("ALGWAS route requires PLINK BED input or BED cache prefix.")
+    if qtn_stage_mode:
+        prefix = str(main_prefix)
+        full_ids = np.asarray(qtn_preloaded_packed.get("full_ids", []), dtype=str)
+        packed_ctx_obj = qtn_preloaded_packed.get("packed_ctx")
+        if not isinstance(packed_ctx_obj, dict):
+            raise ValueError("Invalid QTN packed payload: missing packed_ctx.")
+        packed_ctx = packed_ctx_obj
+        sites_all = None
+    else:
+        prefix, full_ids, packed_ctx, sites_all = _prepare_packed_bed_once_for_gwas(
+            genofile=genofile,
+            maf_threshold=float(maf_threshold),
+            max_missing_rate=float(max_missing_rate),
+            het_threshold=float(het_threshold),
+            snps_only=bool(snps_only),
+            use_spinner=bool(use_spinner),
+            preloaded_packed=preloaded_packed,
+            load_site_meta=False,
+        )
     id_to_idx = {sid: i for i, sid in enumerate(full_ids)}
     try:
         sample_map = np.asarray(
@@ -3990,6 +4378,7 @@ def run_algwas_packed_fullrank(
         # Keep ALGWAS trait filtering consistent with other GWAS models:
         # non-missing phenotypes are retained, missing values are dropped.
         y_vec = np.array(y_full[keep_idx], dtype=np.float64, order="C", copy=True)
+        trait_ids = np.asarray(ids[keep_idx], dtype=str)
         x_cov = np.ascontiguousarray(qmatrix[keep_idx], dtype=np.float64)
         if cov_all is not None:
             x_cov = np.ascontiguousarray(
@@ -4111,6 +4500,7 @@ def run_algwas_packed_fullrank(
 
         qtn_count = 0
         pseudo_rows = 0
+        stage2_eff_snp: Optional[int] = None
         gwas_ok = False
         gwas_t0 = time.monotonic()
         try:
@@ -4131,7 +4521,7 @@ def run_algwas_packed_fullrank(
                                 "lambda_min_ratio": 0.001,
                                 "scan_step": int(max(1, int(chunk_size))),
                                 "stage1_progress_callback": _algwas_stage1_progress,
-                                "scan_progress_callback": _algwas_progress,
+                                "scan_progress_callback": (None if qtn_stage_mode else _algwas_progress),
                                 "progress_every": int(
                                     max(
                                         1,
@@ -4197,11 +4587,32 @@ def run_algwas_packed_fullrank(
                         scan_step=int(max(1, int(chunk_size))),
                         stage1_progress_callback=_algwas_stage1_progress,
                         threads=int(threads),
-                        progress_callback=_algwas_progress,
+                        progress_callback=(None if qtn_stage_mode else _algwas_progress),
                         pseudo_tsv=str(pseudo_tsv_hint),
                         row_indices=packed_row_idx,
                         bed_prefix=str(prefix),
                     )
+                if qtn_stage_mode:
+                    kept_rows2, scan_rows2, qtn_used = run_qtn_segmented_lm_stage2(
+                        main_prefix=str(main_prefix),
+                        y_vec=y_vec,
+                        trait_ids=trait_ids,
+                        base_cov=x_cov,
+                        qtn_preloaded_packed=qtn_preloaded_packed,  # type: ignore[arg-type]
+                        qtn_tsv=str(pseudo_tsv_hint),
+                        tmp_tsv=str(tmp_tsv),
+                        maf_threshold=float(maf_threshold),
+                        max_missing_rate=float(max_missing_rate),
+                        het_threshold=float(het_threshold),
+                        snps_only=bool(snps_only),
+                        chunk_size=int(max(1, int(chunk_size))),
+                        threads=int(threads),
+                        progress_callback=_algwas_progress,
+                        args_obj=type("_AlgwasQtnArgs", (), {"farmcpu_bin_size": [5e5, 5e6, 5e7]})(),
+                    )
+                    pseudo_rows = int(max(pseudo_rows, qtn_used))
+                    gwas_total = int(max(1, scan_rows2))
+                    stage2_eff_snp = int(kept_rows2)
             gwas_ok = True
         finally:
             if stage1_spin_handle is not None:
@@ -4271,7 +4682,7 @@ def run_algwas_packed_fullrank(
             use_spinner=bool(use_spinner),
         )
 
-        eff_snp = int(n_sites_active)
+        eff_snp = int(stage2_eff_snp if stage2_eff_snp is not None else n_sites_active)
         eff_snp_by_trait[str(pname)] = eff_snp
         summary_rows.append(
             {
@@ -4997,6 +5408,7 @@ def run_splmm_packed_fullrank(
         rust_detach_wall_secs = 0.0
         rust_other_secs = 0.0
         rust_total_secs = 0.0
+        factor_nnz = None
         arr = None
         wrote_direct_tsv = False
         scan_route_desc = (
@@ -5112,8 +5524,12 @@ def run_splmm_packed_fullrank(
                     rust_detach_wall_secs = float(splmm_t[10][4])
                     rust_other_secs = float(splmm_t[10][5])
                     rust_total_secs = float(splmm_t[10][6])
+            if len(splmm_t) >= 12:
+                factor_nnz = int(splmm_t[11])
         else:
             arr = np.ascontiguousarray(np.asarray(splmm_t[9], dtype=np.float64), dtype=np.float64)
+            if len(splmm_t) >= 11:
+                factor_nnz = int(splmm_t[10])
 
         scan_secs = max(time.monotonic() - scan_t0, 0.0)
         peak_rss = max(peak_rss, process.memory_info().rss)
@@ -5266,6 +5682,9 @@ def run_splmm_packed_fullrank(
                 f"other={format_elapsed(rust_other_secs)}, "
                 f"total={format_elapsed(rust_total_secs)}"
             )
+        _factor_nnz_msg = None
+        if factor_nnz is not None:
+            _factor_nnz_msg = f"sparse Cholesky factor: nnz(L)={int(factor_nnz):,}"
         _assoc_test_msg = (
             "association test uses Wald chi^2(1): chisq=(beta/se)^2, "
             "pwald=Pr[Chi^2_1>=chisq]; SparseLMM does not currently emit a PLRT/LRT column."
@@ -5281,6 +5700,20 @@ def run_splmm_packed_fullrank(
                 _emit_plain_info_line(
                     logger,
                     f"SparseLMM: {_rust_top_level_timing_msg}",
+                    use_spinner=False,
+                )
+        if _factor_nnz_msg is not None:
+            if bool(use_spinner):
+                _log_file_only(
+                    logger,
+                    logging.INFO,
+                    f"SparseLMM: {_factor_nnz_msg}",
+                )
+            else:
+                _log_model_line(
+                    logger,
+                    "SparseLMM",
+                    _factor_nnz_msg,
                     use_spinner=False,
                 )
         if bool(use_spinner):

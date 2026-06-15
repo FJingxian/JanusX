@@ -135,7 +135,6 @@ Useful notes:
 - `-k 1` and `-k 2` ask JanusX to build GRM internally; `-k <path>` reuses an external GRM
 - `-q` adds leading PCs as Q covariates
 - `-c` accepts either a covariate file or a single-site token such as `1:1000`
-- `-fast` enables packed full-Rust paths when available and is especially useful with PLINK BED input
 
 ### 3.3 Run GS and REML
 
@@ -175,8 +174,8 @@ Accepted `-k` forms:
 ### 3.5 Convert and merge genotype data
 
 ```bash
-jx gformat -vcf example/mouse_hs1940.vcf.gz -fmt plink -o demo -prefix mouse_hs1940
-jx gformat -bfile example/~mouse_hs1940 -fmt npy --prune 500kb 10 0.2 -o demo -prefix mouse_hs1940
+jx gformat -vcf example/mouse_hs1940.vcf.gz -o demo -prefix mouse_hs1940
+jx gformat -bfile example/~mouse_hs1940 --prune 500kb 10 0.2 -o demo -prefix mouse_hs1940
 
 jx gmerge -bfile cohort_a cohort_b -fmt plink -o demo -prefix merged
 ```
@@ -187,6 +186,18 @@ Use these modules when you need:
 - sample filtering or site extraction: `gformat`
 - LD pruning for downstream GWAS or GS: `gformat --prune`
 - multi-panel merging: `gmerge`
+
+`gformat` defaults to PLINK BED output when `-fmt` is omitted. Set
+`JX_GFORMAT_MAX_OUTPUT_SITES=0` to benchmark filtering/extraction/prune stages
+without writing variant rows, or set it to a positive integer to cap BED output.
+`gformat --prune` follows PLINK-style window syntax: a bare number is a variant
+count window (e.g. `500 50 0.2`), while `kb`/`bp` suffixes request physical
+position windows.
+For PLINK input/output LD pruning, the default Rust path uses the lower-memory
+streaming writer. Set `JX_GFORMAT_PRUNE_STREAMING_IO=0` to force the packed
+speed path when memory is not a concern. SIMD prune kernel stats are written to
+the `.gformat.log` file by default; set `JX_GFORMAT_PRINT_PRUNE_KERNEL_STATS=1`
+to also print them to the terminal.
 
 ### 3.6 Post-processing and visualization
 
@@ -269,6 +280,5 @@ Use launcher `jx` when you want the full external workflow to run.
 - Use `jx <module> -h` as the source of truth for flags. The dispatcher help is intentionally broad; module help is precise.
 - Prefer PLINK BED input when you expect to rerun the same cohort many times. Packed BED paths are reused more efficiently than repeated VCF parsing.
 - Use `-prefix` deliberately. It makes downstream files easier to chain into `postgwas`, `postgs`, and `webui`.
-- For large BED-based GWAS, `-fast` is the easiest switch to test first.
 - For large GS runs, use `-debug` when you need thread policy, BLAS backend, or packed-path diagnostics.
 - There is also a repository script `python -m janusx.script.beam`, but it is not part of the main `jx -h` module surface.

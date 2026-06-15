@@ -370,13 +370,37 @@ def _strip_known_suffix(path_or_prefix: str) -> str:
     return p
 
 
-def _resolve_input(path_or_prefix: str):
+def _resolve_input(path_or_prefix: str, force_kind: Union[str, None] = None):
     """
     Resolve input kind and prefix.
     Returns (kind, prefix, src_path_or_none).
     kind: "plink" | "vcf" | "hmp" | "txt" | "npy" | "bin" | "unknown"
     """
     p = str(path_or_prefix)
+    fk = str(force_kind or "").strip().lower()
+    if fk in {"vcf", "hmp", "txt", "file", "npy", "bin", "plink"}:
+        if fk == "file":
+            fk = "txt"
+        if fk == "plink":
+            prefix = p[:-4] if p.lower().endswith((".bed", ".bim", ".fam")) else p
+            if _is_plink_prefix(prefix):
+                return "plink", prefix, None
+            return "plink", prefix, None
+        if os.path.exists(p):
+            return fk, _strip_known_suffix(p), p
+        prefix = _strip_known_suffix(p)
+        if fk == "hmp":
+            for cand in (p, f"{prefix}.hmp.gz", f"{prefix}.hmp"):
+                if os.path.exists(cand):
+                    return "hmp", _strip_known_suffix(cand), cand
+            return "hmp", prefix, p
+        if fk == "vcf":
+            for cand in (p, f"{prefix}.vcf.gz", f"{prefix}.vcf"):
+                if os.path.exists(cand):
+                    return "vcf", _strip_known_suffix(cand), cand
+            return "vcf", prefix, p
+        if fk in {"txt", "npy", "bin"}:
+            return fk, prefix, p
     low = p.lower()
 
     if _is_plink_prefix(p):
@@ -496,7 +520,7 @@ def _ensure_plink_cache_from_source_at(
             # In that case convert_genotypes misinterprets '*.hmp' as a PLINK prefix.
             ex_msg = str(ex).lower()
             source_low = str(source_path).lower()
-            hmp_src = source_low.endswith((".hmp", ".hmp.gz"))
+            hmp_src = (str(source_label).upper() == "HMP") or source_low.endswith((".hmp", ".hmp.gz"))
             txt_src = source_low.endswith((".txt", ".tsv", ".csv", ".npy", ".bin"))
             looks_like_old_hmp_bug = (
                 "plink prefix not found or missing .bed/.bim/.fam" in ex_msg
@@ -848,6 +872,7 @@ def prepare_cli_input_cache(
     snps_only: bool = False,
     delimiter: Union[str, None] = None,
     prefer_plink_for_txt: bool = False,
+    force_kind: Union[str, None] = None,
 ) -> str:
     """
     Normalize CLI genotype input to cache-backed paths:
@@ -855,7 +880,7 @@ def prepare_cli_input_cache(
       - TXT     -> NPY cache path (default) or PLINK BED prefix cache
       - others  -> unchanged
     """
-    kind, prefix, src_path = _resolve_input(path_or_prefix)
+    kind, prefix, src_path = _resolve_input(path_or_prefix, force_kind=force_kind)
     if kind == "vcf":
         if src_path is None:
             raise ValueError("VCF source path not found.")
@@ -1382,6 +1407,7 @@ def load_genotype_chunks(
     sample_indices: Union[list[int] , None] = None,
     mmap_window_mb: Union[int , None] = None,
     delimiter: Union[str , None] = None,
+    force_kind: Union[str, None] = None,
 ):
     """
     High-level Python interface for reading genotype data in chunks
@@ -1476,7 +1502,7 @@ def load_genotype_chunks(
     ...     print(sites[0].chrom, sites[0].pos)
     """
     chunk_size = int(chunk_size)
-    kind, prefix, src_path = _resolve_input(path_or_prefix)
+    kind, prefix, src_path = _resolve_input(path_or_prefix, force_kind=force_kind)
     # 1) Resolve caches and dispatch
     if kind == "vcf":
         if src_path is None:
@@ -1765,6 +1791,7 @@ def inspect_genotype_file(
     missing_rate: float = 0.05,
     het: float = 0.01,
     delimiter: Union[str , None] = None,
+    force_kind: Union[str, None] = None,
 ):
     """
     Inspect the genotype input and return sample IDs and the SNP count.
@@ -1794,7 +1821,7 @@ def inspect_genotype_file(
         * FILE sidecar IDs from prefix.id or prefix.fam
     - sample_ids do NOT contain SNP / site information.
     """
-    kind, prefix, src_path = _resolve_input(path_or_prefix)
+    kind, prefix, src_path = _resolve_input(path_or_prefix, force_kind=force_kind)
 
     if kind == "vcf":
         if src_path is None:

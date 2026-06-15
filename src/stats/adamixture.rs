@@ -474,7 +474,9 @@ fn build_compact_cache_from_active_rows(
     }
     let mut bed_reader = BufReader::new(File::open(bed_path).map_err(|e| e.to_string())?);
     let mut header = [0u8; 3];
-    bed_reader.read_exact(&mut header).map_err(|e| e.to_string())?;
+    bed_reader
+        .read_exact(&mut header)
+        .map_err(|e| e.to_string())?;
     if header != [0x6C, 0x1B, 0x01] {
         return Err("Only SNP-major BED supported".to_string());
     }
@@ -858,9 +860,7 @@ fn try_build_packed_bed_backend(cfg: &StreamRsvdConfig) -> Result<Option<PackedB
                     prefix,
                     compact_path.display(),
                     row_freq.len(),
-                    format_debug_bytes_local(
-                        (row_freq.len().saturating_mul(bytes_per_snp)) as u64
-                    ),
+                    format_debug_bytes_local((row_freq.len().saturating_mul(bytes_per_snp)) as u64),
                     storage.label(),
                 ),
             );
@@ -890,9 +890,11 @@ fn try_build_packed_bed_backend(cfg: &StreamRsvdConfig) -> Result<Option<PackedB
             &active_row_idx,
         ) {
             Ok(()) => {
-                if let Some(storage) =
-                    try_open_packed_bed_compact_cache_storage(&compact_path, row_freq.len(), bytes_per_snp)
-                {
+                if let Some(storage) = try_open_packed_bed_compact_cache_storage(
+                    &compact_path,
+                    row_freq.len(),
+                    bytes_per_snp,
+                ) {
                     emit_rsvd_rss_debug(
                         "packed_backend/compact_cache_built",
                         &format!(
@@ -971,7 +973,9 @@ fn try_build_packed_bed_backend(cfg: &StreamRsvdConfig) -> Result<Option<PackedB
     let chunk_rows = packed_backend_stats_chunk_rows(n_snps_total, n_samples);
     let mut bed_reader = BufReader::new(File::open(&bed_path).map_err(|e| e.to_string())?);
     let mut header = [0u8; 3];
-    bed_reader.read_exact(&mut header).map_err(|e| e.to_string())?;
+    bed_reader
+        .read_exact(&mut header)
+        .map_err(|e| e.to_string())?;
     if header != [0x6C, 0x1B, 0x01] {
         return Err("Only SNP-major BED supported".to_string());
     }
@@ -982,7 +986,12 @@ fn try_build_packed_bed_backend(cfg: &StreamRsvdConfig) -> Result<Option<PackedB
             Err(e) => {
                 emit_rsvd_rss_debug(
                     "packed_backend/compact_cache_create_failed",
-                    &format!("prefix={} cache={} error={}", prefix, compact_path.display(), e),
+                    &format!(
+                        "prefix={} cache={} error={}",
+                        prefix,
+                        compact_path.display(),
+                        e
+                    ),
                 );
                 None
             }
@@ -5811,12 +5820,7 @@ impl AdmxBedTrainingSession {
     ) -> PyResult<Self> {
         let (backend, prefix) = py
             .detach(move || {
-                open_packed_bed_backend_for_training(
-                    &genotype_path,
-                    snps_only,
-                    maf,
-                    missing_rate,
-                )
+                open_packed_bed_backend_for_training(&genotype_path, snps_only, maf, missing_rate)
             })
             .map_err(PyRuntimeError::new_err)?;
         Ok(Self {

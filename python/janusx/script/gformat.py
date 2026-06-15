@@ -17,6 +17,8 @@ Supported outputs
 - `-fmt txt`   : `prefix.txt` + `prefix.id` + `prefix.site`
 - `-fmt npy`   : `prefix.npy` + `prefix.id` + `prefix.site`
 
+Default output format is PLINK (`-fmt plink`) when `-fmt` is omitted.
+
 Notes
 -----
 - `-file` inputs must carry sibling `prefix.id`.
@@ -35,6 +37,7 @@ import gzip
 import shutil
 import subprocess
 import itertools
+from threading import Lock
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, Sequence
@@ -98,8 +101,8 @@ from ._common.pathcheck import (
     format_path_for_display,
     ensure_plink_prefix_exists,
 )
-from ._common.progress import ProgressAdapter
-from ._common.status import CliStatus, log_success, stdout_is_tty
+from ._common.progress import ProgressAdapter, build_rich_progress
+from ._common.status import CliStatus, log_success, stdout_is_tty, _emit_to_file_handlers
 from ._common.genocache import configure_genotype_cache_from_out
 from ._common.threads import (
     apply_blas_thread_env,
@@ -120,6 +123,117 @@ def _normalize_chr_key(chrom: str) -> str:
 
 def _split_tokens(line: str) -> list[str]:
     return [x for x in re.split(r"[,\s]+", line.strip()) if x]
+
+
+def _log_status_file_only(logger, message: str) -> None:
+    if not _emit_to_file_handlers(logger, 20, str(message)):
+        logger.info(str(message))
+
+
+class _ChromPruneProgress:
+    def __init__(self, max_visible: int) -> None:
+        self.max_visible = int(max(1, min(5, int(max_visible))))
+        self._lock = Lock()
+        self._progress = None
+        self._states: dict[int, tuple[str, int, int, bool]] = {}
+        self._visible: dict[int, object] = {}
+        self._pending: list[int] = []
+        if stdout_is_tty():
+            self._progress = build_rich_progress(
+                description_template="[green]{task.description}",
+                show_spinner=False,
+                show_bar=True,
+                show_percentage=True,
+                show_elapsed=True,
+                show_remaining=True,
+                field_templates=["{task.fields[postfix]}"],
+                transient=True,
+            )
+            if self._progress is not None:
+                self._progress.start()
+
+    @staticmethod
+    def _label(chrom: str) -> str:
+        c = str(chrom)
+        if c.lower().startswith("chr"):
+            return f"LD prune {c}"
+        return f"LD prune chr{c}"
+
+    def _remember_pending(self, block_idx: int) -> None:
+        if block_idx not in self._pending:
+            self._pending.append(block_idx)
+
+    def _show_locked(self, block_idx: int) -> None:
+        if self._progress is None or block_idx in self._visible:
+            return
+        chrom, done, total, finished = self._states.get(block_idx, ("?", 0, 1, False))
+        if finished:
+            return
+        task_id = self._progress.add_task(
+            self._label(chrom),
+            total=max(1, int(total)),
+            completed=max(0, min(int(done), max(1, int(total)))),
+            postfix=f"{int(done)}/{int(total)}",
+        )
+        self._visible[block_idx] = task_id
+
+    def _promote_locked(self) -> None:
+        while len(self._visible) < self.max_visible and self._pending:
+            idx = self._pending.pop(0)
+            state = self._states.get(idx)
+            if state is None or state[3] or idx in self._visible:
+                continue
+            self._show_locked(idx)
+
+    def update(self, block_idx: int, chrom: str, done: int, total: int, finished: bool) -> None:
+        if self._progress is None:
+            return
+        idx = int(block_idx)
+        total_i = int(max(1, int(total)))
+        done_i = int(max(0, min(int(done), total_i)))
+        finished_b = bool(finished)
+        with self._lock:
+            self._states[idx] = (str(chrom), done_i, total_i, finished_b)
+            if idx not in self._visible and not finished_b:
+                self._remember_pending(idx)
+            if idx in self._visible:
+                task_id = self._visible[idx]
+                self._progress.update(
+                    task_id,
+                    total=total_i,
+                    completed=done_i,
+                    postfix=f"{done_i}/{total_i}",
+                )
+            elif not finished_b and len(self._visible) < self.max_visible:
+                if idx in self._pending:
+                    self._pending.remove(idx)
+                self._show_locked(idx)
+
+            if finished_b:
+                if idx in self._pending:
+                    self._pending.remove(idx)
+                task_id = self._visible.pop(idx, None)
+                if task_id is not None:
+                    try:
+                        self._progress.update(
+                            task_id,
+                            total=total_i,
+                            completed=total_i,
+                            postfix=f"{total_i}/{total_i}",
+                        )
+                        self._progress.remove_task(task_id)
+                    except Exception:
+                        pass
+                self._promote_locked()
+
+    def close(self) -> None:
+        with self._lock:
+            progress = self._progress
+            self._progress = None
+            self._visible.clear()
+            self._pending.clear()
+        if progress is not None:
+            progress.stop()
 
 
 def _parse_int_token(token: str, name: str) -> int:
@@ -315,9 +429,8 @@ def _parse_prune_window(token: str) -> tuple[int | None, int | None]:
     t = str(token).strip().lower()
     if t == "":
         raise ValueError("Empty prune window token.")
-    # Default unit is kb:
-    #   1   -> 1kb  -> 1000bp
-    #   0.1 -> 0.1kb -> 100bp
+    # PLINK-compatible syntax: a bare number is a variant-count window.
+    # Use explicit kb/bp suffixes for physical-position windows.
     if t.endswith("kb"):
         v = float(t[:-2].strip())
         if not np.isfinite(v) or v <= 0:
@@ -331,7 +444,12 @@ def _parse_prune_window(token: str) -> tuple[int | None, int | None]:
     v = float(t)
     if not np.isfinite(v) or v <= 0:
         raise ValueError(f"Invalid prune window: {token}")
-    return None, int(max(1, round(v * 1000.0)))
+    if abs(v - round(v)) > 1e-9:
+        raise ValueError(
+            f"Invalid prune window: {token}. Use an integer variant count, "
+            "or add kb/bp suffix for a physical window."
+        )
+    return int(max(1, round(v))), None
 
 
 def _parse_prune_args(values: list[str] | None) -> PruneSpec | None:
@@ -360,6 +478,25 @@ def _parse_prune_args(values: list[str] | None) -> PruneSpec | None:
 def _env_truthy(name: str, default: str = "0") -> bool:
     v = str(os.getenv(name, default)).strip().lower()
     return v in {"1", "true", "yes", "y", "on"}
+
+
+def _resolve_max_output_sites_env() -> int | None:
+    raw = os.getenv("JX_GFORMAT_MAX_OUTPUT_SITES")
+    if raw is None:
+        return None
+    text = str(raw).strip().lower()
+    if text in {"", "none", "off", "false", "disable", "disabled"}:
+        return None
+    try:
+        value = int(text)
+    except Exception as e:
+        raise ValueError(
+            "JX_GFORMAT_MAX_OUTPUT_SITES must be a non-negative integer "
+            "(0 disables variant-row output)."
+        ) from e
+    if value < 0:
+        raise ValueError("JX_GFORMAT_MAX_OUTPUT_SITES must be >= 0.")
+    return int(value)
 
 
 def _resolve_ld_prune_backend() -> str:
@@ -391,6 +528,42 @@ def _count_nonempty_text_lines(path: str) -> int:
             if s and (not s.startswith("#")):
                 n += 1
     return int(n)
+
+
+def _inspect_plink_prefix_light(prefix: str) -> tuple[list[str], int]:
+    p = str(prefix)
+    if p.lower().endswith((".bed", ".bim", ".fam")):
+        p = str(Path(p).with_suffix(""))
+    fam_path = f"{p}.fam"
+    bim_path = f"{p}.bim"
+
+    sample_ids: list[str] = []
+    with open(fam_path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            s = line.strip()
+            if not s:
+                continue
+            tok = _split_tokens(s)
+            if not tok:
+                continue
+            sample_ids.append(str(tok[1] if len(tok) >= 2 else tok[0]))
+    if not sample_ids:
+        raise ValueError(f"No samples found in FAM: {fam_path}")
+
+    n_sites = 0
+    last = b""
+    with open(bim_path, "rb") as f:
+        while True:
+            chunk = f.read(8 * 1024 * 1024)
+            if not chunk:
+                break
+            n_sites += chunk.count(b"\n")
+            last = chunk[-1:]
+    if last and last != b"\n":
+        n_sites += 1
+    if n_sites <= 0:
+        raise ValueError(f"No variants found in BIM: {bim_path}")
+    return sample_ids, int(n_sites)
 
 
 def _run_external_command(
@@ -833,6 +1006,7 @@ def _write_plink_subset_from_packed(
     out_prefix: str,
     packed: np.ndarray,
     keep_mask: np.ndarray,
+    max_output_sites: int | None = None,
 ) -> None:
     src = str(src_prefix)
     out = str(out_prefix)
@@ -861,6 +1035,8 @@ def _write_plink_subset_from_packed(
     with open(out_bed, "wb") as fw:
         fw.write(bytes([0x6C, 0x1B, 0x01]))
         keep_idx = np.flatnonzero(keep)
+        if max_output_sites is not None:
+            keep_idx = keep_idx[: max(0, int(max_output_sites))]
         for i in keep_idx.tolist():
             fw.write(memoryview(x[int(i)]))
 
@@ -868,9 +1044,14 @@ def _write_plink_subset_from_packed(
     with open(src_bim, "r", encoding="utf-8", errors="replace") as fr, open(
         out_bim, "w", encoding="utf-8"
     ) as fw:
+        written = 0
+        max_rows = None if max_output_sites is None else max(0, int(max_output_sites))
         for i, line in enumerate(fr):
             if i < int(keep.size) and bool(keep[i]):
+                if max_rows is not None and written >= max_rows:
+                    break
                 fw.write(line)
+                written += 1
 
     # FAM is unchanged when sample filtering is absent.
     shutil.copyfile(src_fam, out_fam)
@@ -987,6 +1168,7 @@ def _ld_prune_with_rust_filtered_pipeline(
     filter_progress_every: int = 0,
     prune_progress_callback=None,
     prune_progress_every: int = 0,
+    max_output_sites: int | None = None,
 ) -> tuple[int, int, int, float, int]:
     if _bed_filter_to_plink_rust is None or _bed_prune_to_plink_rust is None:
         raise RuntimeError(
@@ -1058,6 +1240,9 @@ def _ld_prune_with_rust_filtered_pipeline(
             step_variants=int(spec.step_variants),
             r2_threshold=float(spec.r2_threshold),
             threads=int(threads),
+            max_output_sites=(
+                int(max_output_sites) if max_output_sites is not None else None
+            ),
         )
         if prune_progress_callback is not None:
             try:
@@ -1070,9 +1255,19 @@ def _ld_prune_with_rust_filtered_pipeline(
                 emsg = str(ex).lower()
                 if ("keyword" not in emsg) and ("argument" not in emsg) and ("positional" not in emsg):
                     raise
-                keep_n, total_n = _bed_prune_to_plink_rust(**prune_args)
+                legacy_prune_args = dict(prune_args)
+                legacy_prune_args.pop("max_output_sites", None)
+                keep_n, total_n = _bed_prune_to_plink_rust(**legacy_prune_args)
         else:
-            keep_n, total_n = _bed_prune_to_plink_rust(**prune_args)
+            try:
+                keep_n, total_n = _bed_prune_to_plink_rust(**prune_args)
+            except TypeError as ex:
+                emsg = str(ex).lower()
+                if ("keyword" not in emsg) and ("argument" not in emsg) and ("positional" not in emsg):
+                    raise
+                legacy_prune_args = dict(prune_args)
+                legacy_prune_args.pop("max_output_sites", None)
+                keep_n, total_n = _bed_prune_to_plink_rust(**legacy_prune_args)
         keep_n = int(keep_n)
         total_n = int(total_n)
         if total_n != filt_keep:
@@ -1522,12 +1717,12 @@ def build_parser() -> CliArgumentParser:
         formatter_class=cli_help_formatter(),
         epilog=minimal_help_epilog(
             [
-                "jx gformat -vcf geno.vcf.gz -fmt npy",
+                "jx gformat -vcf geno.vcf.gz",
                 "jx gformat -hmp geno.hmp.gz -fmt plink",
                 "jx gformat -bfile geno_prefix -fmt txt -o outdir -prefix panel",
                 "jx gformat -file geno_prefix -fmt vcf",
-                "jx gformat -bfile geno_prefix -fmt npy --prune 1 5 0.2",
-                "jx gformat -bfile geno_prefix -fmt npy --prune 500kb 10 0.2",
+                "jx gformat -bfile geno_prefix --prune 500 50 0.2",
+                "jx gformat -bfile geno_prefix --prune 500kb 10 0.2",
             ]
         ),
     )
@@ -1562,8 +1757,8 @@ def build_parser() -> CliArgumentParser:
         "--fmt",
         dest="format",
         choices=["plink", "vcf", "hmp", "txt", "npy", "gfd"],
-        default="npy",
-        help="Output genotype format: plink, vcf, hmp, txt, npy, gfd (default: npy).",
+        default="plink",
+        help="Output genotype format: plink, vcf, hmp, txt, npy, gfd (default: plink).",
     )
     opt.add_argument(
         "-o",
@@ -1638,8 +1833,8 @@ def build_parser() -> CliArgumentParser:
             "Built-in backend uses strict sliding-window + greedy semantics. "
             "Set env JX_LD_PRUNE_BACKEND=plink to run external PLINK backend "
             "(PLINK input/output prune-only path). "
-            "Numeric window defaults to kb (1=1kb, 0.1=100bp). "
-            "Examples: --prune 1 5 0.2, --prune 1kb 5 0.2, --prune 100bp 5 0.2."
+            "Bare numeric windows are variant counts; use kb/bp suffixes for physical windows. "
+            "Examples: --prune 500 50 0.2, --prune 500kb 50 0.2, --prune 100bp 5 0.2."
         ),
     )
     opt.add_argument(
@@ -1688,6 +1883,12 @@ def main() -> None:
         parser.error(str(e))
     prune_backend_raw = str(os.getenv("JX_LD_PRUNE_BACKEND", "")).strip().lower()
     prune_backend = _resolve_ld_prune_backend()
+    try:
+        output_site_limit = _resolve_max_output_sites_env()
+    except ValueError as e:
+        parser.error(str(e))
+    prune_streaming_io = _env_truthy("JX_GFORMAT_PRUNE_STREAMING_IO", "1")
+    print_prune_kernel_stats = _env_truthy("JX_GFORMAT_PRINT_PRUNE_KERNEL_STATS", "0")
 
     gfile, default_prefix = determine_genotype_source(args)
     if args.prefix is None:
@@ -1733,11 +1934,27 @@ def main() -> None:
                     ("Extract", f"{extract_mode or 'None'}:{extract_file or 'None'}"),
                     ("Prune", (prune_spec.label() if prune_spec is not None else "None")),
                     (
+                        "Output site limit",
+                        (
+                            str(output_site_limit)
+                            if output_site_limit is not None
+                            else "None"
+                        ),
+                    ),
+                    (
                         "Prune backend",
                         (
                             ("PLINK external (env)")
                             if (prune_spec is not None and prune_backend == "plink")
                             else "Rust (default)"
+                        ),
+                    ),
+                    (
+                        "Prune PLINK I/O",
+                        (
+                            "streaming-low-memory"
+                            if prune_streaming_io
+                            else "packed-speed"
                         ),
                     ),
                     (
@@ -1850,7 +2067,7 @@ def main() -> None:
 
         filter_desc = "Applying filters/slices..."
         if not status_enabled:
-            logger.info(filter_desc)
+            _log_status_file_only(logger, filter_desc)
         call_args = dict(
             src_prefix=str(gfile),
             out_prefix=str(out_prefix),
@@ -1870,13 +2087,14 @@ def main() -> None:
             bp_min=(int(post_filter.bp_min) if post_filter.bp_min is not None else None),
             bp_max=(int(post_filter.bp_max) if post_filter.bp_max is not None else None),
             ranges=post_filter.ranges,
+            max_output_sites=output_site_limit,
         )
         if status_enabled:
             pbar = ProgressAdapter(
                 total=1,
                 desc="Applying filters/slices",
                 force_animate=True,
-                keep_display=True,
+                keep_display=False,
                 show_remaining=True,
                 emit_done=False,
             )
@@ -1911,7 +2129,9 @@ def main() -> None:
                     emsg = str(ex).lower()
                     if ("keyword" not in emsg) and ("argument" not in emsg) and ("positional" not in emsg):
                         raise
-                    keep_n, scanned_n, out_n = _bed_filter_to_plink_rust(**call_args)
+                    legacy_call_args = dict(call_args)
+                    legacy_call_args.pop("max_output_sites", None)
+                    keep_n, scanned_n, out_n = _bed_filter_to_plink_rust(**legacy_call_args)
                 scanned_n = int(scanned_n)
                 if scanned_n > 0 and direct_done < scanned_n:
                     pbar.set_total(scanned_n)
@@ -1923,14 +2143,23 @@ def main() -> None:
                 pbar.close()
         else:
             t_direct = time.time()
-            keep_n, scanned_n, out_n = _bed_filter_to_plink_rust(**call_args)
+            try:
+                keep_n, scanned_n, out_n = _bed_filter_to_plink_rust(**call_args)
+            except TypeError as ex:
+                emsg = str(ex).lower()
+                if ("keyword" not in emsg) and ("argument" not in emsg) and ("positional" not in emsg):
+                    raise
+                legacy_call_args = dict(call_args)
+                legacy_call_args.pop("max_output_sites", None)
+                keep_n, scanned_n, out_n = _bed_filter_to_plink_rust(**legacy_call_args)
         rust_filter_direct_wall = float(time.time() - t_direct)
         selected_n_sites = int(keep_n)
         dropped_n = int(max(0, int(scanned_n) - int(keep_n)))
         if not status_enabled:
-            logger.info(
+            _log_status_file_only(
+                logger,
                 "Applying filters/slices ...Finished "
-                f"(backend=rust-packed-io, kept={int(keep_n)}, dropped={dropped_n})"
+                f"(backend=rust-packed-io, kept={int(keep_n)}, dropped={dropped_n})",
             )
         if selected_n_sites <= 0:
             raise ValueError(
@@ -1944,7 +2173,7 @@ def main() -> None:
 
     inspect_desc = "Inspecting genotype metadata..."
     if not status_enabled:
-        logger.info(inspect_desc)
+        _log_status_file_only(logger, inspect_desc)
     with CliStatus(
         inspect_desc,
         enabled=status_enabled,
@@ -1988,6 +2217,8 @@ def main() -> None:
                 # count divergence on non-dosage numeric matrices.
                 _ = (txt_matrix_path, txt_id_path, txt_site_path)
                 sample_ids, n_sites = inspect_genotype_file(gfile)
+            elif source_kind == "plink":
+                sample_ids, n_sites = _inspect_plink_prefix_light(str(gfile))
             else:
                 sample_ids, n_sites = inspect_genotype_file(gfile)
         except Exception:
@@ -1997,8 +2228,9 @@ def main() -> None:
             f"Inspecting genotype metadata ...Finished (n={len(sample_ids)}, nSNP={int(n_sites)})"
         )
     if not status_enabled:
-        logger.info(
-            f"Inspecting genotype metadata ...Finished (n={len(sample_ids)}, nSNP={int(n_sites)})"
+        _log_status_file_only(
+            logger,
+            f"Inspecting genotype metadata ...Finished (n={len(sample_ids)}, nSNP={int(n_sites)})",
         )
     keep_sample_ids: list[str] | None = None
     if args.keep:
@@ -2162,6 +2394,7 @@ def main() -> None:
             and out_fmt == "plink"
             and keep_sample_ids is None
             and _bed_prune_to_plink_rust is not None
+            and prune_streaming_io
         )
         use_rust_prune_filtered_direct = bool(
             source_kind == "plink"
@@ -2176,7 +2409,7 @@ def main() -> None:
                 "extra filters; falling back to built-in backend."
             )
         if not status_enabled:
-            logger.info(prune_desc)
+            _log_status_file_only(logger, prune_desc)
         if use_external_plink_prune:
             with CliStatus(prune_desc, enabled=status_enabled) as task:
                 try:
@@ -2205,31 +2438,23 @@ def main() -> None:
                     task.fail("Applying LD prune ...Failed")
                     raise
             if not status_enabled:
-                logger.info(
+                _log_status_file_only(
+                    logger,
                     "Applying LD prune ...Finished "
-                    f"(backend={prune_direct_backend}, kept={selected_n_sites}, dropped={int(prune_pre_sites - selected_n_sites)})"
+                    f"(backend={prune_direct_backend}, kept={selected_n_sites}, dropped={int(prune_pre_sites - selected_n_sites)})",
                 )
         elif use_rust_prune_direct and status_enabled:
-            pbar_total = int(max(1, int(n_sites)))
-            pbar = ProgressAdapter(
-                total=pbar_total,
-                desc="Applying LD prune",
-                force_animate=True,
-                keep_display=True,
-                show_remaining=True,
-                emit_done=False,
-            )
-            prune_done = 0
+            chrom_progress = _ChromPruneProgress(max_visible=min(5, int(args.thread)))
+            prune_success_msg: str | None = None
 
-            def _on_prune_progress(done: int, total: int) -> None:
-                nonlocal prune_done
-                d = int(max(0, int(done)))
-                t = int(max(1, int(total)))
-                if d > t:
-                    d = t
-                if d > prune_done:
-                    pbar.update(d - prune_done)
-                    prune_done = d
+            def _on_chrom_prune_progress(
+                block_idx: int,
+                chrom: str,
+                done: int,
+                total: int,
+                finished: bool,
+            ) -> None:
+                chrom_progress.update(block_idx, chrom, done, total, finished)
 
             try:
                 t_direct = time.time()
@@ -2249,44 +2474,48 @@ def main() -> None:
                     step_variants=int(prune_spec.step_variants),
                     r2_threshold=float(prune_spec.r2_threshold),
                     threads=int(args.thread),
+                    max_output_sites=output_site_limit,
                 )
                 try:
                     keep_n, total_n = _bed_prune_to_plink_rust(
                         **call_args,
-                        progress_callback=_on_prune_progress,
-                        progress_every=max(1000, int(max(1, int(n_sites) // 200))),
+                        chrom_progress_callback=_on_chrom_prune_progress,
+                        progress_every=0,
                     )
-                except TypeError:
-                    # Backward-compatible fallback for older extension without callback args.
-                    keep_n, total_n = _bed_prune_to_plink_rust(**call_args)
+                except TypeError as ex:
+                    emsg = str(ex).lower()
+                    if ("keyword" not in emsg) and ("argument" not in emsg) and ("positional" not in emsg):
+                        raise
+                    # Backward-compatible fallback for older extension without chromosome callback args.
+                    legacy_call_args = dict(call_args)
+                    legacy_call_args.pop("max_output_sites", None)
+                    keep_n, total_n = _bed_prune_to_plink_rust(**legacy_call_args)
                 total_n = int(total_n)
                 keep_n = int(keep_n)
-                if prune_done < total_n:
-                    pbar.update(total_n - prune_done)
-                pbar.finish()
                 rust_prune_direct_wall = float(time.time() - t_direct)
                 prune_pre_sites = int(total_n)
                 selected_n_sites = int(keep_n)
                 rust_prune_direct_done = True
-                prune_direct_backend = "rust-packed-io"
+                prune_direct_backend = "rust-stream-io"
                 if keep_n <= 0:
                     raise ValueError(
                         "All variants were filtered out by LD prune; "
                         "try a looser --prune r^2 threshold or larger window."
                     )
-                log_success(
-                    logger,
+                prune_success_msg = (
                     "Applying LD prune ...Finished "
-                    f"(backend={prune_direct_backend}, kept={keep_n}, dropped={int(prune_pre_sites - keep_n)})",
+                    f"(backend={prune_direct_backend}, kept={keep_n}, dropped={int(prune_pre_sites - keep_n)})"
                 )
             finally:
-                pbar.close()
+                chrom_progress.close()
+            if prune_success_msg is not None:
+                log_success(logger, prune_success_msg)
         elif use_rust_prune_filtered_direct and status_enabled:
             pbar = ProgressAdapter(
                 total=max(1, int(n_sites)),
                 desc="Applying LD prune",
                 force_animate=True,
-                keep_display=True,
+                keep_display=False,
                 show_remaining=True,
                 emit_done=False,
             )
@@ -2295,6 +2524,7 @@ def main() -> None:
             prune_done = 0
             prune_total = 0
             phase_offset = 0
+            prune_success_msg: str | None = None
 
             def _on_filter_progress(done: int, total: int) -> None:
                 nonlocal filter_done, filter_total
@@ -2359,12 +2589,13 @@ def main() -> None:
                     filter_progress_every=0,
                     prune_progress_callback=_on_prune_progress,
                     prune_progress_every=max(1000, int(max(1, int(n_sites) // 200))),
+                    max_output_sites=output_site_limit,
                 )
                 rust_prune_direct_wall = float(wall)
                 prune_pre_sites = int(pre_n)
                 selected_n_sites = int(keep_n)
                 rust_prune_direct_done = True
-                prune_direct_backend = "rust-filter+prune-packed-io"
+                prune_direct_backend = "rust-filter+stream-io"
                 if keep_sample_ids is not None and int(out_n) != int(len(keep_sample_ids)):
                     logger.warning(
                         "Rust filtered-prune sample count mismatch: "
@@ -2387,13 +2618,14 @@ def main() -> None:
                         "All variants were filtered out by LD prune; "
                         "try a looser --prune r^2 threshold or larger window."
                     )
-                log_success(
-                    logger,
+                prune_success_msg = (
                     "Applying LD prune ...Finished "
-                    f"(backend={prune_direct_backend}, kept={keep_n}, dropped={int(prune_pre_sites - keep_n)})",
+                    f"(backend={prune_direct_backend}, kept={keep_n}, dropped={int(prune_pre_sites - keep_n)})"
                 )
             finally:
                 pbar.close()
+            if prune_success_msg is not None:
+                log_success(logger, prune_success_msg)
         else:
             with CliStatus(prune_desc, enabled=status_enabled) as task:
                 try:
@@ -2419,6 +2651,7 @@ def main() -> None:
                             bp_max=(int(post_filter.bp_max) if post_filter.bp_max is not None else None),
                             ranges=post_filter.ranges,
                             logger=logger,
+                            max_output_sites=output_site_limit,
                         )
                         rust_prune_direct_wall = float(wall)
                         prune_pre_sites = int(pre_n)
@@ -2432,7 +2665,7 @@ def main() -> None:
                             )
                     elif use_rust_prune_direct:
                         t_direct = time.time()
-                        keep_n, total_n = _bed_prune_to_plink_rust(
+                        call_args = dict(
                             src_prefix=str(gfile),
                             out_prefix=str(out_prefix),
                             window_bp=(
@@ -2448,12 +2681,22 @@ def main() -> None:
                             step_variants=int(prune_spec.step_variants),
                             r2_threshold=float(prune_spec.r2_threshold),
                             threads=int(args.thread),
+                            max_output_sites=output_site_limit,
                         )
+                        try:
+                            keep_n, total_n = _bed_prune_to_plink_rust(**call_args)
+                        except TypeError as ex:
+                            emsg = str(ex).lower()
+                            if ("keyword" not in emsg) and ("argument" not in emsg) and ("positional" not in emsg):
+                                raise
+                            legacy_call_args = dict(call_args)
+                            legacy_call_args.pop("max_output_sites", None)
+                            keep_n, total_n = _bed_prune_to_plink_rust(**legacy_call_args)
                         rust_prune_direct_wall = float(time.time() - t_direct)
                         prune_pre_sites = int(total_n)
                         selected_n_sites = int(keep_n)
                         rust_prune_direct_done = True
-                        prune_direct_backend = "rust-packed-io"
+                        prune_direct_backend = "rust-stream-io"
                     elif use_packed_prune_fastpath:
                         keep_mask, sites_all, packed_raw, _packed_n = _ld_prune_with_maf_priority_packed_plink(
                             gfile,
@@ -2499,7 +2742,7 @@ def main() -> None:
                         pruned_sites = [sites_all[i] for i in np.flatnonzero(keep_mask)]
                     selected_n_sites = int(keep_n)
                     if rust_prune_direct_done:
-                        backend = str(prune_direct_backend or "rust-packed-io")
+                        backend = str(prune_direct_backend or "rust-stream-io")
                     else:
                         backend = "rust-packed" if use_packed_prune_fastpath else "python-dense"
                     task.complete(
@@ -2511,12 +2754,13 @@ def main() -> None:
                     raise
             if not status_enabled:
                 if rust_prune_direct_done:
-                    backend = str(prune_direct_backend or "rust-packed-io")
+                    backend = str(prune_direct_backend or "rust-stream-io")
                 else:
                     backend = "rust-packed" if use_packed_prune_fastpath else "python-dense"
-                logger.info(
+                _log_status_file_only(
+                    logger,
                     "Applying LD prune ...Finished "
-                    f"(backend={backend}, kept={selected_n_sites}, dropped={int(prune_pre_sites - selected_n_sites)})"
+                    f"(backend={backend}, kept={selected_n_sites}, dropped={int(prune_pre_sites - selected_n_sites)})",
                 )
         if (
             use_packed_prune_fastpath
@@ -2535,7 +2779,7 @@ def main() -> None:
                     scalar_calls,
                     avx2_hit_rate,
                 ) = _packed_prune_kernel_stats(reset=False)
-                logger.info(
+                stats_msg = (
                     "Prune kernel stats: "
                     f"backend={k_backend}, "
                     f"avx2_available={int(bool(avx2_available))}, "
@@ -2547,6 +2791,10 @@ def main() -> None:
                     f"scalar_calls={int(scalar_calls)}, "
                     f"avx2_hit_rate={float(avx2_hit_rate):.4f}"
                 )
+                if print_prune_kernel_stats:
+                    logger.info(stats_msg)
+                else:
+                    _log_status_file_only(logger, stats_msg)
             except Exception:
                 pass
     elif need_selected_count and out_fmt == "npy":
@@ -2590,6 +2838,7 @@ def main() -> None:
             out_prefix=str(out_prefix),
             packed=np.asarray(packed_prune_packed, dtype=np.uint8),
             keep_mask=np.asarray(packed_prune_keep_mask, dtype=bool),
+            max_output_sites=output_site_limit,
         )
         log_success(logger, f"Format conversion completed in {time.time() - t0:.2f} s")
         log_success(logger, f"Output written: {output_display}")

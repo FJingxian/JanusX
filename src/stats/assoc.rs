@@ -1,4 +1,5 @@
 use crate::bedmath::{decode_plink_bed_hardcall, packed_row_missing_count_selected};
+use crate::blas::{cblas_dgemm_dispatch, CblasInt, CBLAS_NO_TRANS, CBLAS_ROW_MAJOR};
 use crate::linalg::{
     chisq_from_beta_se_and_optional_plrt, format_chisq_value, sanitize_assoc_pvalue,
 };
@@ -209,6 +210,306 @@ fn pinv_xtx(xtx: &[f64], q: usize) -> Result<Vec<f64>, String> {
     Ok(ixx.as_slice().to_vec())
 }
 
+#[inline]
+fn farmcpu_final_window_bp(szbin: &[i64]) -> i64 {
+    if let Ok(raw) = std::env::var("JX_FARMCPU_FINAL_WINDOW_BP") {
+        if let Ok(v) = raw.trim().parse::<i64>() {
+            if v >= 0 {
+                return v;
+            }
+        }
+    }
+    szbin
+        .iter()
+        .copied()
+        .filter(|&v| v > 0)
+        .min()
+        .unwrap_or(500_000_i64)
+}
+
+fn pinv_for_row_major_x(x_flat: &[f64], n: usize, q: usize) -> Result<Vec<f64>, String> {
+    if x_flat.len() != n.saturating_mul(q) {
+        return Err("X shape mismatch for X'X pseudo-inverse".to_string());
+    }
+    let mut xtx = vec![0.0_f64; q * q];
+    for i in 0..n {
+        let row = &x_flat[i * q..(i + 1) * q];
+        for a in 0..q {
+            let va = row[a];
+            for b in 0..q {
+                xtx[a * q + b] += va * row[b];
+            }
+        }
+    }
+    pinv_xtx(&xtx, q)
+}
+
+fn farmcpu_window_representatives(
+    sorted_candidates: Vec<(f64, usize)>,
+    chrom: &[String],
+    pos: &[i64],
+    window_bp: i64,
+    max_keep: usize,
+) -> Vec<usize> {
+    let mut out: Vec<usize> = Vec::with_capacity(max_keep.min(sorted_candidates.len()));
+    let bp = window_bp.max(0) as u64;
+    'candidate: for (_p, idx) in sorted_candidates {
+        if idx >= chrom.len() || idx >= pos.len() {
+            continue;
+        }
+        for &kept in out.iter() {
+            if kept < chrom.len() && kept < pos.len() && chrom[kept] == chrom[idx] {
+                if pos[kept].abs_diff(pos[idx]) <= bp {
+                    continue 'candidate;
+                }
+            }
+        }
+        out.push(idx);
+        if out.len() >= max_keep {
+            break;
+        }
+    }
+    out.sort_unstable();
+    out
+}
+
+#[derive(Clone, Debug)]
+struct FarmcpuFinalWindow {
+    chrom: String,
+    start: i64,
+    end: i64,
+    qtn_model_positions: Vec<usize>,
+}
+
+#[inline]
+fn farmcpu_final_ld_merge_r2_threshold() -> f64 {
+    if let Ok(raw) = std::env::var("JX_FARMCPU_FINAL_LD_MERGE_R2") {
+        if let Ok(v) = raw.trim().parse::<f64>() {
+            if v.is_finite() {
+                return v;
+            }
+        }
+    }
+    0.7
+}
+
+fn find_parent(parent: &mut [usize], x: usize) -> usize {
+    let mut r = x;
+    while parent[r] != r {
+        r = parent[r];
+    }
+    let mut y = x;
+    while parent[y] != y {
+        let next = parent[y];
+        parent[y] = r;
+        y = next;
+    }
+    r
+}
+
+fn union_parent(parent: &mut [usize], a: usize, b: usize) {
+    let ra = find_parent(parent, a);
+    let rb = find_parent(parent, b);
+    if ra != rb {
+        parent[rb] = ra;
+    }
+}
+
+fn sample_major_r2(sample_major: &[f64], n: usize, k: usize, a: usize, b: usize) -> f64 {
+    if n == 0 || a >= k || b >= k {
+        return 0.0;
+    }
+    let mut ma = 0.0_f64;
+    let mut mb = 0.0_f64;
+    for i in 0..n {
+        ma += sample_major[i * k + a];
+        mb += sample_major[i * k + b];
+    }
+    ma /= n as f64;
+    mb /= n as f64;
+    let mut va = 0.0_f64;
+    let mut vb = 0.0_f64;
+    let mut cov = 0.0_f64;
+    for i in 0..n {
+        let da = sample_major[i * k + a] - ma;
+        let db = sample_major[i * k + b] - mb;
+        va += da * da;
+        vb += db * db;
+        cov += da * db;
+    }
+    let den = va * vb;
+    if den <= 0.0 || !den.is_finite() {
+        0.0
+    } else {
+        ((cov * cov) / den).clamp(0.0, 1.0)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_farmcpu_final_windows(
+    qtn_idx: &[usize],
+    chrom: &[String],
+    pos: &[i64],
+    final_window_bp: i64,
+    packed_flat: &[u8],
+    bytes_per_snp: usize,
+    row_indices: Option<&[usize]>,
+    sample_idx: &[usize],
+    row_flip: &[bool],
+    row_maf: &[f32],
+) -> Result<Vec<FarmcpuFinalWindow>, String> {
+    let k = qtn_idx.len();
+    if k == 0 || final_window_bp < 0 {
+        return Ok(Vec::new());
+    }
+    let bp = final_window_bp.max(0);
+    let mut parent: Vec<usize> = (0..k).collect();
+    let mut starts = vec![0_i64; k];
+    let mut ends = vec![0_i64; k];
+    for (j, &idx) in qtn_idx.iter().enumerate() {
+        if idx >= chrom.len() || idx >= pos.len() {
+            return Err("QTN index out of metadata bounds during window merge".to_string());
+        }
+        starts[j] = pos[idx].saturating_sub(bp);
+        ends[j] = pos[idx].saturating_add(bp);
+    }
+
+    for a in 0..k {
+        for b in (a + 1)..k {
+            let ia = qtn_idx[a];
+            let ib = qtn_idx[b];
+            if chrom[ia] == chrom[ib] && starts[a] <= ends[b] && starts[b] <= ends[a] {
+                union_parent(&mut parent, a, b);
+            }
+        }
+    }
+
+    let ld_thr = farmcpu_final_ld_merge_r2_threshold();
+    if k > 1 && ld_thr.is_finite() && ld_thr > 0.0 {
+        let sample_major = decode_packed_rows_to_sample_major(
+            packed_flat,
+            bytes_per_snp,
+            qtn_idx,
+            row_indices,
+            sample_idx,
+            row_flip,
+            row_maf,
+        )?;
+        for a in 0..k {
+            for b in (a + 1)..k {
+                let ia = qtn_idx[a];
+                let ib = qtn_idx[b];
+                if chrom[ia] != chrom[ib] {
+                    continue;
+                }
+                let r2 = sample_major_r2(&sample_major, sample_idx.len(), k, a, b);
+                if r2 >= ld_thr {
+                    union_parent(&mut parent, a, b);
+                }
+            }
+        }
+    }
+
+    let mut grouped: HashMap<usize, FarmcpuFinalWindow> = HashMap::new();
+    for j in 0..k {
+        let root = find_parent(&mut parent, j);
+        let idx = qtn_idx[j];
+        grouped
+            .entry(root)
+            .and_modify(|w| {
+                w.start = w.start.min(starts[j]);
+                w.end = w.end.max(ends[j]);
+                w.qtn_model_positions.push(j);
+            })
+            .or_insert_with(|| FarmcpuFinalWindow {
+                chrom: chrom[idx].clone(),
+                start: starts[j],
+                end: ends[j],
+                qtn_model_positions: vec![j],
+            });
+    }
+    let mut windows: Vec<FarmcpuFinalWindow> = grouped.into_values().collect();
+    windows.sort_by(|a, b| {
+        a.chrom
+            .cmp(&b.chrom)
+            .then_with(|| a.start.cmp(&b.start))
+            .then_with(|| a.end.cmp(&b.end))
+    });
+
+    let mut merged: Vec<FarmcpuFinalWindow> = Vec::with_capacity(windows.len());
+    for mut w in windows {
+        w.qtn_model_positions.sort_unstable();
+        w.qtn_model_positions.dedup();
+        if let Some(last) = merged.last_mut() {
+            if last.chrom == w.chrom && w.start <= last.end {
+                last.end = last.end.max(w.end);
+                last.qtn_model_positions.extend(w.qtn_model_positions);
+                last.qtn_model_positions.sort_unstable();
+                last.qtn_model_positions.dedup();
+                continue;
+            }
+        }
+        merged.push(w);
+    }
+    Ok(merged)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn farmcpu_prune_qtn_by_merged_windows(
+    qtn_idx: Vec<usize>,
+    marker_pvalues: &[f64],
+    chrom: &[String],
+    pos: &[i64],
+    final_window_bp: i64,
+    packed_flat: &[u8],
+    bytes_per_snp: usize,
+    row_indices: Option<&[usize]>,
+    sample_idx: &[usize],
+    row_flip: &[bool],
+    row_maf: &[f32],
+    max_keep: usize,
+) -> Result<Vec<usize>, String> {
+    if qtn_idx.is_empty() || max_keep == 0 {
+        return Ok(Vec::new());
+    }
+    let windows = build_farmcpu_final_windows(
+        &qtn_idx,
+        chrom,
+        pos,
+        final_window_bp,
+        packed_flat,
+        bytes_per_snp,
+        row_indices,
+        sample_idx,
+        row_flip,
+        row_maf,
+    )?;
+    let mut reps: Vec<(f64, usize)> = Vec::with_capacity(windows.len());
+    for window in windows.iter() {
+        let mut best: Option<(f64, usize)> = None;
+        for &model_pos in window.qtn_model_positions.iter() {
+            let idx = qtn_idx[model_pos];
+            let p = marker_pvalues.get(idx).copied().unwrap_or(1.0);
+            if !p.is_finite() {
+                continue;
+            }
+            match best {
+                Some((bp, bi)) if p.total_cmp(&bp).is_ge() || (p == bp && idx >= bi) => {}
+                _ => best = Some((p, idx)),
+            }
+        }
+        if let Some(v) = best {
+            reps.push(v);
+        }
+    }
+    reps.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    reps.truncate(max_keep);
+    let mut out: Vec<usize> = reps.into_iter().map(|(_, idx)| idx).collect();
+    out.sort_unstable();
+    out.dedup();
+    Ok(out)
+}
+
 fn build_x_with_qtn_packed(
     base_x: &[f64],
     n: usize,
@@ -379,21 +680,23 @@ fn scan_packed_full_matrix(
     Ok((out, m, row_stride))
 }
 
-fn fit_packed_full_rows(
+#[allow(clippy::too_many_arguments)]
+fn farmcpu_conditional_subset_stats(
     y: &[f64],
-    x_flat: &[f64],   // row-major (n, q0)
-    ixx_flat: &[f64], // row-major (q0, q0)
+    x_bg: &[f64],
+    ixx_flat: &[f64],
     packed_flat: &[u8],
     n_samples: usize,
     row_flip: &[bool],
     row_maf: &[f32],
     row_indices: Option<&[usize]>,
     sample_idx: &[usize],
-    selected_rows: &[usize],
-) -> Result<(Vec<f64>, usize), String> {
+    target_rows: &[usize],
+    threads: usize,
+) -> Result<Vec<[f64; 3]>, String> {
     let n = y.len();
     if n == 0 {
-        return Err("empty y".to_string());
+        return Err("empty phenotype vector".to_string());
     }
     if sample_idx.len() != n {
         return Err("sample_idx length mismatch".to_string());
@@ -401,112 +704,321 @@ fn fit_packed_full_rows(
     if n_samples == 0 {
         return Err("n_samples must be > 0".to_string());
     }
-    let bytes_per_snp = (n_samples + 3) / 4;
-    if bytes_per_snp == 0 {
-        return Err("invalid packed shape".to_string());
+    let q0 = x_bg.len() / n;
+    if x_bg.len() != n * q0 {
+        return Err("background X shape mismatch".to_string());
     }
-    if packed_flat.len() % bytes_per_snp != 0 {
-        return Err("packed length is not divisible by bytes_per_snp".to_string());
+    if ixx_flat.len() != q0 * q0 {
+        return Err("background inverse X'X shape mismatch".to_string());
+    }
+    if n <= q0 + 1 {
+        return Err(format!("n too small for conditional scan: n={n}, q={q0}"));
+    }
+    let bytes_per_snp = n_samples.div_ceil(4);
+    if bytes_per_snp == 0 || packed_flat.len() % bytes_per_snp != 0 {
+        return Err("invalid packed shape for conditional scan".to_string());
     }
     let m_packed = packed_flat.len() / bytes_per_snp;
     let m = row_indices.map(|v| v.len()).unwrap_or(m_packed);
     if row_flip.len() != m || row_maf.len() != m {
         return Err("row_flip/row_maf length mismatch".to_string());
     }
-    let q0 = if n == 0 { 0 } else { x_flat.len() / n };
-    if x_flat.len() != n * q0 {
-        return Err("X shape mismatch".to_string());
-    }
-    if ixx_flat.len() != q0 * q0 {
-        return Err("ixx shape mismatch".to_string());
-    }
-    if n <= q0 + 1 {
-        return Err(format!("n too small for LM core: n={n}, q={q0}"));
+    if target_rows.iter().any(|&idx| idx >= m) {
+        return Err("conditional scan target row out of range".to_string());
     }
 
-    let dim = q0 + 1;
-    let row_stride = dim * 3;
     let mut xy = vec![0.0_f64; q0];
     for i in 0..n {
         let yi = y[i];
-        let row = &x_flat[i * q0..(i + 1) * q0];
+        let row = &x_bg[i * q0..(i + 1) * q0];
         for j in 0..q0 {
             xy[j] += row[j] * yi;
         }
     }
     let yy: f64 = y.iter().map(|v| v * v).sum();
-    let mut out = vec![f64::NAN; selected_rows.len() * row_stride];
-    let mut scr = GlmScratch::new(q0);
-    for (row_idx, &idx) in selected_rows.iter().enumerate() {
-        if idx >= m {
-            return Err(format!(
-                "selected row index out of bounds: idx={idx}, m={m}"
-            ));
-        }
-        scr.reset_xs();
-        let src_row = row_indices.map(|v| v[idx]).unwrap_or(idx);
-        if src_row >= m_packed {
-            return Err(format!(
-                "packed row index out of bounds: idx={src_row}, packed_rows={m_packed}"
-            ));
-        }
-        let row = &packed_flat[src_row * bytes_per_snp..(src_row + 1) * bytes_per_snp];
-        let flip = row_flip[idx];
-        let mean_g = (2.0_f64 * row_maf[idx] as f64).max(0.0);
-        let mut sy = 0.0_f64;
-        let mut ss = 0.0_f64;
-        for (k, &sidx) in sample_idx.iter().enumerate() {
-            let b = row[sidx >> 2];
-            let code = (b >> ((sidx & 3) * 2)) & 0b11;
-            let mut gv = match decode_plink_bed_hardcall(code) {
-                Some(v) => v,
-                None => mean_g,
-            };
-            if flip && code != 0b01 {
-                gv = 2.0 - gv;
-            }
-            sy += gv * y[k];
-            ss += gv * gv;
-            let xrow = &x_flat[k * q0..(k + 1) * q0];
-            for j in 0..q0 {
-                scr.xs[j] += xrow[j] * gv;
-            }
-        }
-        xs_t_ixx_into(&scr.xs, ixx_flat, q0, &mut scr.b21);
-        let t2 = dot(&scr.b21, &scr.xs);
-        let b22 = ss - t2;
-        let (invb22, df) = if b22 < 1e-8 {
-            (0.0, (n as i32) - (q0 as i32))
-        } else {
-            (1.0 / b22, (n as i32) - (q0 as i32) - 1)
-        };
-        let row_out = &mut out[row_idx * row_stride..(row_idx + 1) * row_stride];
-        if df <= 0 {
-            row_out.fill(f64::NAN);
-            continue;
-        }
-        build_ixxs_into(ixx_flat, &scr.b21, invb22, q0, &mut scr.ixxs);
-        scr.rhs[..q0].copy_from_slice(&xy);
-        scr.rhs[q0] = sy;
-        matvec_into(&scr.ixxs, dim, &scr.rhs, &mut scr.beta);
-        let beta_rhs = dot(&scr.beta, &scr.rhs);
-        let ve = (yy - beta_rhs) / (df as f64);
-        for ff in 0..dim {
-            let se = (scr.ixxs[ff * dim + ff] * ve).sqrt();
-            let t = scr.beta[ff] / se;
-            let base = 3 * ff;
-            row_out[base] = scr.beta[ff];
-            row_out[base + 1] = se;
-            row_out[base + 2] = student_t_p_two_sided(t, df);
-        }
-        if invb22 == 0.0 {
-            let base = 3 * q0;
-            row_out[base] = f64::NAN;
-            row_out[base + 1] = f64::NAN;
-            row_out[base + 2] = f64::NAN;
+    let bg_df = (n as i32) - (q0 as i32);
+    if bg_df <= 0 {
+        return Err(format!(
+            "n too small for conditional background: n={n}, q={q0}"
+        ));
+    }
+    let mut bg_beta = vec![0.0_f64; q0];
+    matvec_into(ixx_flat, q0, &xy, &mut bg_beta);
+    let bg_rss = (yy - dot(&bg_beta, &xy)).max(0.0);
+    let mut y_resid = vec![0.0_f64; n];
+    for i in 0..n {
+        let row = &x_bg[i * q0..(i + 1) * q0];
+        y_resid[i] = y[i] - dot(row, &bg_beta);
+    }
+
+    let mut out = vec![[f64::NAN; 3]; target_rows.len()];
+    let pool = get_cached_pool(threads).map_err(|e| e.to_string())?;
+    let mut runner = || {
+        out.par_iter_mut()
+            .zip(target_rows.par_iter())
+            .for_each_init(
+                || GlmScratch::new(q0),
+                |scr, (stat_out, &idx)| {
+                    scr.reset_xs();
+                    let src_row = row_indices.map(|v| v[idx]).unwrap_or(idx);
+                    if src_row >= m_packed {
+                        return;
+                    }
+                    let row = &packed_flat[src_row * bytes_per_snp..(src_row + 1) * bytes_per_snp];
+                    let flip = row_flip[idx];
+                    let mean_g = (2.0_f64 * row_maf[idx] as f64).max(0.0);
+                    let mut sy_resid = 0.0_f64;
+                    let mut ss = 0.0_f64;
+                    for (k, &sidx) in sample_idx.iter().enumerate() {
+                        let b = row[sidx >> 2];
+                        let code = (b >> ((sidx & 3) * 2)) & 0b11;
+                        let mut gv = match decode_plink_bed_hardcall(code) {
+                            Some(v) => v,
+                            None => mean_g,
+                        };
+                        if flip && code != 0b01 {
+                            gv = 2.0 - gv;
+                        }
+                        sy_resid += gv * y_resid[k];
+                        ss += gv * gv;
+                        let xrow = &x_bg[k * q0..(k + 1) * q0];
+                        for j in 0..q0 {
+                            scr.xs[j] += xrow[j] * gv;
+                        }
+                    }
+                    xs_t_ixx_into(&scr.xs, ixx_flat, q0, &mut scr.b21);
+                    let b22 = ss - dot(&scr.b21, &scr.xs);
+                    let df = bg_df - 1;
+                    if df <= 0 || b22 <= 1e-8 || !b22.is_finite() {
+                        return;
+                    }
+                    let beta = sy_resid / b22;
+                    let rss_full = (bg_rss - (sy_resid * sy_resid / b22)).max(0.0);
+                    let ve = rss_full / (df as f64);
+                    let se = (ve / b22).sqrt();
+                    if !beta.is_finite() || !se.is_finite() || se <= 0.0 {
+                        return;
+                    }
+                    let pwald = student_t_p_two_sided(beta / se, df);
+                    *stat_out = [beta, se, pwald];
+                },
+            );
+    };
+    if let Some(tp) = &pool {
+        tp.install(&mut runner);
+    } else {
+        runner();
+    }
+    Ok(out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn farmcpu_scan_packed_marker_pvalues(
+    y: &[f64],
+    x_bg: &[f64],
+    ixx_flat: &[f64],
+    packed_flat: &[u8],
+    n_samples: usize,
+    row_flip: &[bool],
+    row_maf: &[f32],
+    row_indices: Option<&[usize]>,
+    sample_idx: &[usize],
+    threads: usize,
+) -> Result<(Vec<f64>, Vec<f64>), String> {
+    let n = y.len();
+    if n == 0 {
+        return Err("empty phenotype vector".to_string());
+    }
+    if sample_idx.len() != n {
+        return Err("sample_idx length mismatch".to_string());
+    }
+    if n_samples == 0 {
+        return Err("n_samples must be > 0".to_string());
+    }
+    let q0 = x_bg.len() / n;
+    if x_bg.len() != n * q0 {
+        return Err("background X shape mismatch".to_string());
+    }
+    if ixx_flat.len() != q0 * q0 {
+        return Err("background inverse X'X shape mismatch".to_string());
+    }
+    if n <= q0 + 1 {
+        return Err(format!(
+            "n too small for FarmCPU stage1 scan: n={n}, q={q0}"
+        ));
+    }
+    let bytes_per_snp = n_samples.div_ceil(4);
+    if bytes_per_snp == 0 || packed_flat.len() % bytes_per_snp != 0 {
+        return Err("invalid packed shape for FarmCPU stage1 scan".to_string());
+    }
+    let m_packed = packed_flat.len() / bytes_per_snp;
+    let m = row_indices.map(|v| v.len()).unwrap_or(m_packed);
+    if row_flip.len() != m || row_maf.len() != m {
+        return Err("row_flip/row_maf length mismatch".to_string());
+    }
+    if row_indices
+        .map(|v| v.iter().any(|&idx| idx >= m_packed))
+        .unwrap_or(false)
+    {
+        return Err("row_indices out of bounds for packed rows".to_string());
+    }
+
+    let mut xy = vec![0.0_f64; q0];
+    for i in 0..n {
+        let yi = y[i];
+        let row = &x_bg[i * q0..(i + 1) * q0];
+        for j in 0..q0 {
+            xy[j] += row[j] * yi;
         }
     }
-    Ok((out, row_stride))
+    let yy: f64 = y.iter().map(|v| v * v).sum();
+    let bg_df = (n as i32) - (q0 as i32);
+    if bg_df <= 0 {
+        return Err(format!(
+            "n too small for FarmCPU stage1 background: n={n}, q={q0}"
+        ));
+    }
+    let mut bg_beta = vec![0.0_f64; q0];
+    matvec_into(ixx_flat, q0, &xy, &mut bg_beta);
+    let bg_rss = (yy - dot(&bg_beta, &xy)).max(0.0);
+    let bg_ve = bg_rss / (bg_df as f64);
+    let mut bg_pwald = vec![1.0_f64; q0];
+    for j in 0..q0 {
+        let se = (ixx_flat[j * q0 + j] * bg_ve).sqrt();
+        if se.is_finite() && se > 0.0 && bg_beta[j].is_finite() {
+            bg_pwald[j] = student_t_p_two_sided(bg_beta[j] / se, bg_df);
+        }
+    }
+    let mut y_resid = vec![0.0_f64; n];
+    for i in 0..n {
+        let row = &x_bg[i * q0..(i + 1) * q0];
+        y_resid[i] = y[i] - dot(row, &bg_beta);
+    }
+
+    let pool = get_cached_pool(threads).map_err(|e| e.to_string())?;
+    let row_block = 8192usize;
+    let mut geno_buf = vec![0.0_f64; row_block * n];
+    let mut xs_buf = vec![0.0_f64; row_block * q0];
+    let mut b21_buf = vec![0.0_f64; row_block * q0];
+    let mut sy_resid_buf = vec![0.0_f64; row_block];
+    let mut ss_buf = vec![0.0_f64; row_block];
+    let mut pvals = vec![1.0_f64; m];
+
+    for row_start in (0..m).step_by(row_block) {
+        let row_end = (row_start + row_block).min(m);
+        let n_block = row_end - row_start;
+        let geno_slice = &mut geno_buf[..n_block * n];
+        let sy_slice = &mut sy_resid_buf[..n_block];
+        let ss_slice = &mut ss_buf[..n_block];
+        let mut decode_runner = || {
+            geno_slice
+                .par_chunks_mut(n)
+                .zip(sy_slice.par_iter_mut())
+                .zip(ss_slice.par_iter_mut())
+                .enumerate()
+                .for_each(|(local_idx, ((geno_row, sy_out), ss_out))| {
+                    let idx = row_start + local_idx;
+                    let src_row = row_indices.map(|v| v[idx]).unwrap_or(idx);
+                    let row = &packed_flat[src_row * bytes_per_snp..(src_row + 1) * bytes_per_snp];
+                    let flip = row_flip[idx];
+                    let mean_g = (2.0_f64 * row_maf[idx] as f64).max(0.0);
+                    let mut sy_resid = 0.0_f64;
+                    let mut ss = 0.0_f64;
+                    for (k, &sidx) in sample_idx.iter().enumerate() {
+                        let b = row[sidx >> 2];
+                        let code = (b >> ((sidx & 3) * 2)) & 0b11;
+                        let mut gv = match decode_plink_bed_hardcall(code) {
+                            Some(v) => v,
+                            None => mean_g,
+                        };
+                        if flip && code != 0b01 {
+                            gv = 2.0 - gv;
+                        }
+                        geno_row[k] = gv;
+                        sy_resid += gv * y_resid[k];
+                        ss += gv * gv;
+                    }
+                    *sy_out = sy_resid;
+                    *ss_out = ss;
+                });
+        };
+        if let Some(p) = &pool {
+            p.install(&mut decode_runner);
+        } else {
+            decode_runner();
+        }
+
+        let xs_slice = &mut xs_buf[..n_block * q0];
+        let b21_slice = &mut b21_buf[..n_block * q0];
+        unsafe {
+            cblas_dgemm_dispatch(
+                CBLAS_ROW_MAJOR,
+                CBLAS_NO_TRANS,
+                CBLAS_NO_TRANS,
+                n_block as CblasInt,
+                q0 as CblasInt,
+                n as CblasInt,
+                1.0_f64,
+                geno_slice.as_ptr(),
+                n as CblasInt,
+                x_bg.as_ptr(),
+                q0 as CblasInt,
+                0.0_f64,
+                xs_slice.as_mut_ptr(),
+                q0 as CblasInt,
+            );
+            cblas_dgemm_dispatch(
+                CBLAS_ROW_MAJOR,
+                CBLAS_NO_TRANS,
+                CBLAS_NO_TRANS,
+                n_block as CblasInt,
+                q0 as CblasInt,
+                q0 as CblasInt,
+                1.0_f64,
+                xs_slice.as_ptr(),
+                q0 as CblasInt,
+                ixx_flat.as_ptr(),
+                q0 as CblasInt,
+                0.0_f64,
+                b21_slice.as_mut_ptr(),
+                q0 as CblasInt,
+            );
+        }
+
+        let p_slice = &mut pvals[row_start..row_end];
+        let mut stat_runner = || {
+            p_slice
+                .par_iter_mut()
+                .enumerate()
+                .for_each(|(local_idx, p_out)| {
+                    let xs = &xs_slice[local_idx * q0..(local_idx + 1) * q0];
+                    let b21 = &b21_slice[local_idx * q0..(local_idx + 1) * q0];
+                    let b22 = ss_slice[local_idx] - dot(b21, xs);
+                    let df_row = bg_df - 1;
+                    if df_row <= 0 || b22 <= 1e-8 || !b22.is_finite() {
+                        *p_out = 1.0;
+                        return;
+                    }
+                    let sy_resid = sy_slice[local_idx];
+                    let beta = sy_resid / b22;
+                    let rss_full = (bg_rss - (sy_resid * sy_resid / b22)).max(0.0);
+                    let ve = rss_full / (df_row as f64);
+                    let se = (ve / b22).sqrt();
+                    if !beta.is_finite() || !se.is_finite() || se <= 0.0 {
+                        *p_out = 1.0;
+                        return;
+                    }
+                    *p_out = student_t_p_two_sided(beta / se, df_row);
+                });
+        };
+        if let Some(p) = &pool {
+            p.install(&mut stat_runner);
+        } else {
+            stat_runner();
+        }
+    }
+
+    Ok((pvals, bg_pwald))
 }
 
 fn summarize_qtn_from_fem(
@@ -554,11 +1066,10 @@ fn write_farmcpu_packed_main_scan(
     allele0: &[String],
     allele1: &[String],
     miss_counts: &[usize],
-    _q_base: usize,
+    q_base: usize,
     qtn_lookup: &HashMap<usize, usize>,
-    qtn_min_p: &[f64],
-    qtn_beta: &[f64],
-    qtn_se: &[f64],
+    qtn_idx: &[usize],
+    final_window_bp: i64,
 ) -> Result<(usize, usize), String> {
     let n = y.len();
     if n == 0 {
@@ -607,7 +1118,6 @@ fn write_farmcpu_packed_main_scan(
         return Err(format!("n too small for LM core: n={n}, q={q0}"));
     }
 
-    let dim = q0 + 1;
     let mut xy = vec![0.0_f64; q0];
     for i in 0..n {
         let yi = y[i];
@@ -617,9 +1127,117 @@ fn write_farmcpu_packed_main_scan(
         }
     }
     let yy: f64 = y.iter().map(|v| v * v).sum();
-    let _df = (n as i32) - (q0 as i32) - 1;
+    let bg_df = (n as i32) - (q0 as i32);
+    if bg_df <= 0 {
+        return Err(format!(
+            "n too small for FarmCPU background model: n={n}, q={q0}"
+        ));
+    }
+    let mut bg_beta = vec![0.0_f64; q0];
+    matvec_into(ixx_flat, q0, &xy, &mut bg_beta);
+    let bg_rss = (yy - dot(&bg_beta, &xy)).max(0.0);
+    let bg_ve = bg_rss / (bg_df as f64);
+    let mut bg_se = vec![f64::NAN; q0];
+    let mut bg_pwald = vec![f64::NAN; q0];
+    for j in 0..q0 {
+        let se = (ixx_flat[j * q0 + j] * bg_ve).sqrt();
+        bg_se[j] = se;
+        if se.is_finite() && se > 0.0 && bg_beta[j].is_finite() {
+            bg_pwald[j] = student_t_p_two_sided(bg_beta[j] / se, bg_df);
+        }
+    }
+    let mut y_resid = vec![0.0_f64; n];
+    for i in 0..n {
+        let row = &x_qtn[i * q0..(i + 1) * q0];
+        y_resid[i] = y[i] - dot(row, &bg_beta);
+    }
+
+    let mut local_overrides: HashMap<usize, [f64; 3]> = HashMap::new();
+    if final_window_bp >= 0 && !qtn_idx.is_empty() {
+        let mut base_x = vec![0.0_f64; n * q_base];
+        for i in 0..n {
+            let src = &x_qtn[i * q0..i * q0 + q_base];
+            let dst = &mut base_x[i * q_base..(i + 1) * q_base];
+            dst.copy_from_slice(src);
+        }
+        let windows = build_farmcpu_final_windows(
+            qtn_idx,
+            chrom,
+            pos,
+            final_window_bp,
+            packed_flat,
+            bytes_per_snp,
+            row_indices,
+            sample_idx,
+            row_flip,
+            row_maf,
+        )?;
+        let mut chr_to_rows: HashMap<&str, Vec<usize>> = HashMap::new();
+        for i in 0..m {
+            chr_to_rows.entry(chrom[i].as_str()).or_default().push(i);
+        }
+        for window in windows.iter() {
+            let mut window_rows = Vec::<usize>::new();
+            if let Some(rows) = chr_to_rows.get(window.chrom.as_str()) {
+                for &i in rows {
+                    if pos[i] >= window.start && pos[i] <= window.end {
+                        window_rows.push(i);
+                    }
+                }
+            }
+            if window_rows.is_empty() {
+                continue;
+            }
+            let mut local_qtn = Vec::<usize>::with_capacity(
+                qtn_idx
+                    .len()
+                    .saturating_sub(window.qtn_model_positions.len()),
+            );
+            for (j, &idx) in qtn_idx.iter().enumerate() {
+                if window.qtn_model_positions.binary_search(&j).is_err() {
+                    local_qtn.push(idx);
+                }
+            }
+            let (x_local, q_local) = build_x_with_qtn_packed(
+                &base_x,
+                n,
+                q_base,
+                &local_qtn,
+                packed_flat,
+                bytes_per_snp,
+                row_indices,
+                sample_idx,
+                row_flip,
+                row_maf,
+            )?;
+            let ixx_local = pinv_for_row_major_x(&x_local, n, q_local)?;
+            let local_stats = farmcpu_conditional_subset_stats(
+                y,
+                &x_local,
+                &ixx_local,
+                packed_flat,
+                n_samples,
+                row_flip,
+                row_maf,
+                row_indices,
+                sample_idx,
+                &window_rows,
+                threads,
+            )?;
+            for (&idx, stat) in window_rows.iter().zip(local_stats.into_iter()) {
+                local_overrides.insert(idx, stat);
+            }
+        }
+    }
+
     let pool = get_cached_pool(threads).map_err(|e| e.to_string())?;
     let row_block = 8192usize;
+    let row_stride = 3usize;
+    let mut geno_buf = vec![0.0_f64; row_block * n];
+    let mut xs_buf = vec![0.0_f64; row_block * q0];
+    let mut b21_buf = vec![0.0_f64; row_block * q0];
+    let mut sy_resid_buf = vec![0.0_f64; row_block];
+    let mut ss_buf = vec![0.0_f64; row_block];
     let mut stats_buf = vec![f64::NAN; row_block * 3];
     let mut text_buf = String::with_capacity(row_block * 128);
     let mut qtn_text_buf_opt = if qtn_writer.is_some() {
@@ -634,18 +1252,23 @@ fn write_farmcpu_packed_main_scan(
     for row_start in (0..m).step_by(row_block) {
         let row_end = (row_start + row_block).min(m);
         let n_block = row_end - row_start;
-        let stats_slice = &mut stats_buf[..n_block * 3];
-        let mut runner = || {
-            stats_slice.par_chunks_mut(3).enumerate().for_each_init(
-                || GlmScratch::new(q0),
-                |scr, (local_idx, stat_out)| {
+        let stats_slice = &mut stats_buf[..n_block * row_stride];
+        let geno_slice = &mut geno_buf[..n_block * n];
+        let sy_slice = &mut sy_resid_buf[..n_block];
+        let ss_slice = &mut ss_buf[..n_block];
+        let mut decode_runner = || {
+            geno_slice
+                .par_chunks_mut(n)
+                .zip(sy_slice.par_iter_mut())
+                .zip(ss_slice.par_iter_mut())
+                .enumerate()
+                .for_each(|(local_idx, ((geno_row, sy_out), ss_out))| {
                     let idx = row_start + local_idx;
-                    scr.reset_xs();
                     let src_row = row_indices.map(|v| v[idx]).unwrap_or(idx);
                     let row = &packed_flat[src_row * bytes_per_snp..(src_row + 1) * bytes_per_snp];
                     let flip = row_flip[idx];
                     let mean_g = (2.0_f64 * row_maf[idx] as f64).max(0.0);
-                    let mut sy = 0.0_f64;
+                    let mut sy_resid = 0.0_f64;
                     let mut ss = 0.0_f64;
                     for (k, &sidx) in sample_idx.iter().enumerate() {
                         let b = row[sidx >> 2];
@@ -657,46 +1280,100 @@ fn write_farmcpu_packed_main_scan(
                         if flip && code != 0b01 {
                             gv = 2.0 - gv;
                         }
-                        sy += gv * y[k];
+                        geno_row[k] = gv;
+                        sy_resid += gv * y_resid[k];
                         ss += gv * gv;
-                        let xrow = &x_qtn[k * q0..(k + 1) * q0];
-                        for j in 0..q0 {
-                            scr.xs[j] += xrow[j] * gv;
-                        }
                     }
-                    xs_t_ixx_into(&scr.xs, ixx_flat, q0, &mut scr.b21);
-                    let t2 = dot(&scr.b21, &scr.xs);
-                    let b22 = ss - t2;
-                    let (invb22, df_row) = if b22 < 1e-8 {
-                        (0.0, (n as i32) - (q0 as i32))
-                    } else {
-                        (1.0 / b22, (n as i32) - (q0 as i32) - 1)
-                    };
-                    if df_row <= 0 || invb22 == 0.0 {
+                    *sy_out = sy_resid;
+                    *ss_out = ss;
+                });
+        };
+        if let Some(p) = &pool {
+            p.install(&mut decode_runner);
+        } else {
+            decode_runner();
+        }
+
+        let xs_slice = &mut xs_buf[..n_block * q0];
+        let b21_slice = &mut b21_buf[..n_block * q0];
+        unsafe {
+            cblas_dgemm_dispatch(
+                CBLAS_ROW_MAJOR,
+                CBLAS_NO_TRANS,
+                CBLAS_NO_TRANS,
+                n_block as CblasInt,
+                q0 as CblasInt,
+                n as CblasInt,
+                1.0_f64,
+                geno_slice.as_ptr(),
+                n as CblasInt,
+                x_qtn.as_ptr(),
+                q0 as CblasInt,
+                0.0_f64,
+                xs_slice.as_mut_ptr(),
+                q0 as CblasInt,
+            );
+            cblas_dgemm_dispatch(
+                CBLAS_ROW_MAJOR,
+                CBLAS_NO_TRANS,
+                CBLAS_NO_TRANS,
+                n_block as CblasInt,
+                q0 as CblasInt,
+                q0 as CblasInt,
+                1.0_f64,
+                xs_slice.as_ptr(),
+                q0 as CblasInt,
+                ixx_flat.as_ptr(),
+                q0 as CblasInt,
+                0.0_f64,
+                b21_slice.as_mut_ptr(),
+                q0 as CblasInt,
+            );
+        }
+
+        let mut stat_runner = || {
+            stats_slice
+                .par_chunks_mut(row_stride)
+                .enumerate()
+                .for_each(|(local_idx, stat_out)| {
+                    let idx = row_start + local_idx;
+                    if qtn_lookup.contains_key(&idx) || local_overrides.contains_key(&idx) {
                         stat_out[0] = f64::NAN;
                         stat_out[1] = f64::NAN;
                         stat_out[2] = f64::NAN;
                         return;
                     }
-                    build_ixxs_into(ixx_flat, &scr.b21, invb22, q0, &mut scr.ixxs);
-                    scr.rhs[..q0].copy_from_slice(&xy);
-                    scr.rhs[q0] = sy;
-                    matvec_into(&scr.ixxs, dim, &scr.rhs, &mut scr.beta);
-                    let beta_rhs = dot(&scr.beta, &scr.rhs);
-                    let ve = (yy - beta_rhs) / (df_row as f64);
-                    let beta = scr.beta[q0];
-                    let se = (scr.ixxs[q0 * dim + q0] * ve).sqrt();
+                    let xs = &xs_slice[local_idx * q0..(local_idx + 1) * q0];
+                    let b21 = &b21_slice[local_idx * q0..(local_idx + 1) * q0];
+                    let b22 = ss_slice[local_idx] - dot(b21, xs);
+                    let df_row = bg_df - 1;
+                    if df_row <= 0 || b22 <= 1e-8 || !b22.is_finite() {
+                        stat_out[0] = f64::NAN;
+                        stat_out[1] = f64::NAN;
+                        stat_out[2] = f64::NAN;
+                        return;
+                    }
+                    let sy_resid = sy_slice[local_idx];
+                    let beta = sy_resid / b22;
+                    let rss_full = (bg_rss - (sy_resid * sy_resid / b22)).max(0.0);
+                    let ve = rss_full / (df_row as f64);
+                    let se = (ve / b22).sqrt();
+                    if !beta.is_finite() || !se.is_finite() || se <= 0.0 {
+                        stat_out[0] = f64::NAN;
+                        stat_out[1] = f64::NAN;
+                        stat_out[2] = f64::NAN;
+                        return;
+                    }
                     let t = beta / se;
                     stat_out[0] = beta;
                     stat_out[1] = se;
                     stat_out[2] = student_t_p_two_sided(t, df_row);
-                },
-            );
+                });
         };
         if let Some(p) = &pool {
-            p.install(&mut runner);
+            p.install(&mut stat_runner);
         } else {
-            runner();
+            stat_runner();
         }
 
         text_buf.clear();
@@ -712,11 +1389,20 @@ fn write_farmcpu_packed_main_scan(
             if !pwald.is_finite() {
                 pwald = 1.0;
             }
-            if let Some(&j) = qtn_lookup.get(&i) {
-                beta = qtn_beta[j];
-                se = qtn_se[j];
-                if qtn_min_p[j].is_finite() {
-                    pwald = qtn_min_p[j];
+            if let Some(stat) = local_overrides.get(&i) {
+                beta = stat[0];
+                se = stat[1];
+                pwald = sanitize_assoc_pvalue(beta, se, stat[2]);
+            } else if let Some(&j) = qtn_lookup.get(&i) {
+                let coef_idx = q_base + j;
+                if coef_idx < q0 {
+                    beta = bg_beta[coef_idx];
+                    se = bg_se[coef_idx];
+                    pwald = sanitize_assoc_pvalue(beta, se, bg_pwald[coef_idx]);
+                } else {
+                    beta = f64::NAN;
+                    se = f64::NAN;
+                    pwald = 1.0;
                 }
             }
             let chisq = chisq_from_beta_se_and_optional_plrt(beta, se, None);
@@ -1174,7 +1860,8 @@ pub fn farmcpu_super_dense<'py>(
     threads=0,
     progress_callback=None,
     pseudo_tsv=None,
-    bed_prefix=None
+    bed_prefix=None,
+    raw=false
 ))]
 pub fn farmcpu_packed_to_tsv(
     py: Python<'_>,
@@ -1202,6 +1889,7 @@ pub fn farmcpu_packed_to_tsv(
     progress_callback: Option<Py<PyAny>>,
     pseudo_tsv: Option<&str>,
     bed_prefix: Option<&str>,
+    raw: bool,
 ) -> PyResult<(usize, usize, usize)> {
     if n_samples == 0 {
         return Err(PyRuntimeError::new_err("n_samples must be > 0"));
@@ -1356,245 +2044,16 @@ pub fn farmcpu_packed_to_tsv(
     if szbin_i64.is_empty() {
         szbin_i64 = vec![500_000_i64, 5_000_000_i64, 50_000_000_i64];
     }
+    let final_window_bp = farmcpu_final_window_bp(&szbin_i64);
+    let qtn_stage_cap = qtn_bound
+        .map(|v| v.max(1))
+        .unwrap_or_else(|| qb_eff.saturating_mul(nbin_den).max(qb_eff));
     let pool = get_cached_pool(threads)?;
 
     py.detach(|| -> PyResult<()> {
-        let mut final_model_cache: Option<(Vec<f64>, usize, Vec<f64>, Vec<f64>, Vec<usize>)> = None;
-        for it_idx in 0..max_iter_i {
-            let (x_qtn, q_total) = build_x_with_qtn_packed(
-                &base_x,
-                n,
-                q_base,
-                &qtn_idx,
-                &packed_flat,
-                bytes_per_snp,
-                row_idx.as_deref(),
-                &sample_idx,
-                row_flip,
-                row_maf,
-            )
-            .map_err(PyRuntimeError::new_err)?;
-
-            let mut xtx = vec![0.0_f64; q_total * q_total];
-            for i in 0..n {
-                let row = &x_qtn[i * q_total..(i + 1) * q_total];
-                for a in 0..q_total {
-                    let va = row[a];
-                    for b in 0..q_total {
-                        xtx[a * q_total + b] += va * row[b];
-                    }
-                }
-            }
-            let ixx = pinv_xtx(&xtx, q_total).map_err(PyRuntimeError::new_err)?;
-            let (mut fem, _m_scan, row_stride) = scan_packed_full_matrix(
-                y,
-                &x_qtn,
-                &ixx,
-                &packed_flat,
-                n_samples,
-                row_flip,
-                row_maf,
-                row_idx.as_deref(),
-                &sample_idx,
-                threads,
-            )
-            .map_err(PyRuntimeError::new_err)?;
-            for i in 0..m {
-                let base = i * row_stride;
-                for c in 2..row_stride {
-                    let v = fem[base + c];
-                    if !v.is_finite() {
-                        fem[base + c] = 1.0;
-                    }
-                }
-            }
-
-            let k_qtn = qtn_idx.len();
-            let mut qtn_min_p = vec![1.0_f64; k_qtn];
-            if k_qtn > 0 {
-                for i in 0..m {
-                    let base = i * row_stride;
-                    for j in 0..k_qtn {
-                        let col = 2 + q_base + j;
-                        let p = fem[base + col];
-                        if p.is_finite() && p < qtn_min_p[j] {
-                            qtn_min_p[j] = p;
-                        }
-                    }
-                }
-            }
-
-            let mut femp = vec![1.0_f64; m];
-            for i in 0..m {
-                femp[i] = fem[i * row_stride + row_stride - 1];
-            }
-            for (j, &idx) in qtn_idx.iter().enumerate() {
-                if idx < m && qtn_min_p[j].is_finite() {
-                    femp[idx] = qtn_min_p[j];
-                }
-            }
-
-            let has_signal = femp
-                .iter()
-                .any(|&p| p.is_finite() && p <= qtn_threshold_eff);
-            if !has_signal {
-                let (final_qtn_min_p, final_qtn_best_rows) =
-                    summarize_qtn_from_fem(&fem, m, row_stride, q_base, &qtn_idx);
-                final_model_cache =
-                    Some((x_qtn, q_total, ixx, final_qtn_min_p, final_qtn_best_rows));
-                if let Some(cb) = progress_callback.as_ref() {
-                    Python::attach(|py2| -> PyResult<()> {
-                        py2.check_signals()?;
-                        cb.call1(py2, (it_idx + 1, max_iter_i))?;
-                        Ok(())
-                    })?;
-                }
-                break;
-            }
-
-            let mut combine: Vec<(i64, usize)> = Vec::new();
-            for &sz in szbin_i64.iter() {
-                for &nn in nbin_vals.iter() {
-                    combine.push((sz, nn));
-                }
-            }
-            if combine.is_empty() {
-                let (final_qtn_min_p, final_qtn_best_rows) =
-                    summarize_qtn_from_fem(&fem, m, row_stride, q_base, &qtn_idx);
-                final_model_cache =
-                    Some((x_qtn, q_total, ixx, final_qtn_min_p, final_qtn_best_rows));
-                if let Some(cb) = progress_callback.as_ref() {
-                    Python::attach(|py2| -> PyResult<()> {
-                        py2.check_signals()?;
-                        cb.call1(py2, (it_idx + 1, max_iter_i))?;
-                        Ok(())
-                    })?;
-                }
-                break;
-            }
-
-            let rem_task = || {
-                combine
-                    .par_iter()
-                    .map(|&(sz, nn)| {
-                        let leadidx = select_lead_indices(sz, nn, &femp, &global_pos);
-                        let sample_major = decode_packed_rows_to_sample_major(
-                            &packed_flat,
-                            bytes_per_snp,
-                            &leadidx,
-                            row_idx.as_deref(),
-                            &sample_idx,
-                            row_flip,
-                            row_maf,
-                        );
-                        let sample_major = match sample_major {
-                            Ok(v) => v,
-                            Err(_) => return (f64::INFINITY, leadidx),
-                        };
-                        let score = farmcpu_ll_score_from_sample_major(
-                            y,
-                            &x_qtn,
-                            n,
-                            q_total,
-                            &sample_major,
-                            leadidx.len(),
-                            -5.0,
-                            5.0,
-                            0.1,
-                            1e-8,
-                        )
-                        .unwrap_or(f64::INFINITY);
-                        (score, leadidx)
-                    })
-                    .collect::<Vec<(f64, Vec<usize>)>>()
-            };
-            let rem_res = if let Some(p) = &pool {
-                p.install(rem_task)
-            } else {
-                rem_task()
-            };
-            if rem_res.is_empty() {
-                if let Some(cb) = progress_callback.as_ref() {
-                    Python::attach(|py2| -> PyResult<()> {
-                        py2.check_signals()?;
-                        cb.call1(py2, (it_idx + 1, max_iter_i))?;
-                        Ok(())
-                    })?;
-                }
-                break;
-            }
-            let mut best_i = 0usize;
-            let mut best_score = rem_res[0].0;
-            for (i, (s, _)) in rem_res.iter().enumerate().skip(1) {
-                if s.total_cmp(&best_score).is_lt() {
-                    best_score = *s;
-                    best_i = i;
-                }
-            }
-            let opt_lead = &rem_res[best_i].1;
-            let mut qtn_union = qtn_idx.clone();
-            qtn_union.extend(opt_lead.iter().copied());
-            qtn_union.sort_unstable();
-            qtn_union.dedup();
-
-            if it_idx >= 1 && !qtn_union.is_empty() {
-                let prev_set: HashSet<usize> = qtn_idx.iter().copied().collect();
-                qtn_union.retain(|&idx| {
-                    let p = femp[idx];
-                    (p.is_finite() && p < qtn_threshold_eff) || prev_set.contains(&idx)
-                });
-            }
-
-            let qtn_next: Vec<usize> = if qtn_union.is_empty() {
-                Vec::new()
-            } else {
-                let sample_major = decode_packed_rows_to_sample_major(
-                    &packed_flat,
-                    bytes_per_snp,
-                    &qtn_union,
-                    row_idx.as_deref(),
-                    &sample_idx,
-                    row_flip,
-                    row_maf,
-                )
-                .map_err(PyRuntimeError::new_err)?;
-                let pvals: Vec<f64> = qtn_union.iter().map(|&ix| femp[ix]).collect();
-                let keep = farmcpu_super_keep_from_sample_major(
-                    &sample_major,
-                    n,
-                    qtn_union.len(),
-                    &pvals,
-                    0.7,
-                );
-                qtn_union
-                    .iter()
-                    .zip(keep.iter())
-                    .filter_map(|(&ix, &k)| if k { Some(ix) } else { None })
-                    .collect()
-            };
-
-            if let Some(cb) = progress_callback.as_ref() {
-                Python::attach(|py2| -> PyResult<()> {
-                    py2.check_signals()?;
-                    cb.call1(py2, (it_idx + 1, max_iter_i))?;
-                    Ok(())
-                })?;
-            }
-
-            if qtn_next == qtn_idx {
-                let (final_qtn_min_p, final_qtn_best_rows) =
-                    summarize_qtn_from_fem(&fem, m, row_stride, q_base, &qtn_idx);
-                final_model_cache =
-                    Some((x_qtn, q_total, ixx, final_qtn_min_p, final_qtn_best_rows));
-                break;
-            }
-            qtn_idx = qtn_next;
-        }
-
-        let (x_qtn, _q_total, ixx, qtn_min_p, qtn_best_rows) =
-            if let Some(cached) = final_model_cache.take() {
-                cached
-            } else {
+        let mut final_model_cache: Option<(Vec<f64>, usize, Vec<f64>)> = None;
+        if !raw {
+            for it_idx in 0..max_iter_i {
                 let (x_qtn, q_total) = build_x_with_qtn_packed(
                     &base_x,
                     n,
@@ -1608,6 +2067,108 @@ pub fn farmcpu_packed_to_tsv(
                     row_maf,
                 )
                 .map_err(PyRuntimeError::new_err)?;
+                let ixx =
+                    pinv_for_row_major_x(&x_qtn, n, q_total).map_err(PyRuntimeError::new_err)?;
+                let (mut femp, bg_pwald) = farmcpu_scan_packed_marker_pvalues(
+                    y,
+                    &x_qtn,
+                    &ixx,
+                    &packed_flat,
+                    n_samples,
+                    row_flip,
+                    row_maf,
+                    row_idx.as_deref(),
+                    &sample_idx,
+                    threads,
+                )
+                .map_err(PyRuntimeError::new_err)?;
+                for (j, &idx) in qtn_idx.iter().enumerate() {
+                    let coef_idx = q_base + j;
+                    if idx < femp.len() && coef_idx < bg_pwald.len() {
+                        femp[idx] = bg_pwald[coef_idx];
+                    }
+                }
+
+                let mut candidates: Vec<(f64, usize)> = femp
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .filter_map(|(idx, p)| {
+                        if p.is_finite() && p <= qtn_threshold_eff {
+                            Some((p, idx))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                candidates.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+                if candidates.is_empty() {
+                    final_model_cache = Some((x_qtn, q_total, ixx));
+                    if let Some(cb) = progress_callback.as_ref() {
+                        Python::attach(|py2| -> PyResult<()> {
+                            py2.check_signals()?;
+                            cb.call1(py2, (it_idx + 1, max_iter_i))?;
+                            Ok(())
+                        })?;
+                    }
+                    break;
+                }
+                let mut qtn_union = qtn_idx.clone();
+                qtn_union.extend(farmcpu_window_representatives(
+                    candidates,
+                    &chrom,
+                    &pos,
+                    final_window_bp,
+                    qtn_stage_cap,
+                ));
+                qtn_union.sort_unstable();
+                qtn_union.dedup();
+                let qtn_next = farmcpu_prune_qtn_by_merged_windows(
+                    qtn_union,
+                    &femp,
+                    &chrom,
+                    &pos,
+                    final_window_bp,
+                    &packed_flat,
+                    bytes_per_snp,
+                    row_idx.as_deref(),
+                    &sample_idx,
+                    row_flip,
+                    row_maf,
+                    qtn_stage_cap,
+                )
+                .map_err(PyRuntimeError::new_err)?;
+
+                if let Some(cb) = progress_callback.as_ref() {
+                    Python::attach(|py2| -> PyResult<()> {
+                        py2.check_signals()?;
+                        cb.call1(py2, (it_idx + 1, max_iter_i))?;
+                        Ok(())
+                    })?;
+                }
+
+                if qtn_next == qtn_idx {
+                    final_model_cache = Some((x_qtn, q_total, ixx));
+                    break;
+                }
+                qtn_idx = qtn_next;
+            }
+        } else {
+            for it_idx in 0..max_iter_i {
+                let (x_qtn, q_total) = build_x_with_qtn_packed(
+                    &base_x,
+                    n,
+                    q_base,
+                    &qtn_idx,
+                    &packed_flat,
+                    bytes_per_snp,
+                    row_idx.as_deref(),
+                    &sample_idx,
+                    row_flip,
+                    row_maf,
+                )
+                .map_err(PyRuntimeError::new_err)?;
+
                 let mut xtx = vec![0.0_f64; q_total * q_total];
                 for i in 0..n {
                     let row = &x_qtn[i * q_total..(i + 1) * q_total];
@@ -1641,34 +2202,211 @@ pub fn farmcpu_packed_to_tsv(
                         }
                     }
                 }
-                let (qtn_min_p, qtn_best_rows) =
-                    summarize_qtn_from_fem(&fem, m, row_stride, q_base, &qtn_idx);
-                (x_qtn, q_total, ixx, qtn_min_p, qtn_best_rows)
-            };
-        let k_qtn = qtn_idx.len();
-        let mut qtn_beta = vec![f64::NAN; k_qtn];
-        let mut qtn_se = vec![f64::NAN; k_qtn];
-        if k_qtn > 0 {
-            let (qtn_full, qtn_full_stride) = fit_packed_full_rows(
-                y,
-                &x_qtn,
-                &ixx,
-                &packed_flat,
-                n_samples,
-                row_flip,
-                row_maf,
-                row_idx.as_deref(),
-                &sample_idx,
-                &qtn_best_rows,
-            )
-            .map_err(PyRuntimeError::new_err)?;
-            for j in 0..k_qtn {
-                let coef_idx = q_base + j;
-                let base = j * qtn_full_stride + 3 * coef_idx;
-                qtn_beta[j] = qtn_full[base];
-                qtn_se[j] = qtn_full[base + 1];
+
+                let k_qtn = qtn_idx.len();
+                let mut qtn_min_p = vec![1.0_f64; k_qtn];
+                if k_qtn > 0 {
+                    for i in 0..m {
+                        let base = i * row_stride;
+                        for j in 0..k_qtn {
+                            let col = 2 + q_base + j;
+                            let p = fem[base + col];
+                            if p.is_finite() && p < qtn_min_p[j] {
+                                qtn_min_p[j] = p;
+                            }
+                        }
+                    }
+                }
+
+                let mut femp = vec![1.0_f64; m];
+                for i in 0..m {
+                    femp[i] = fem[i * row_stride + row_stride - 1];
+                }
+                for (j, &idx) in qtn_idx.iter().enumerate() {
+                    if idx < m && qtn_min_p[j].is_finite() {
+                        femp[idx] = qtn_min_p[j];
+                    }
+                }
+
+                let has_signal = femp
+                    .iter()
+                    .any(|&p| p.is_finite() && p <= qtn_threshold_eff);
+                if !has_signal {
+                    final_model_cache = Some((x_qtn, q_total, ixx));
+                    if let Some(cb) = progress_callback.as_ref() {
+                        Python::attach(|py2| -> PyResult<()> {
+                            py2.check_signals()?;
+                            cb.call1(py2, (it_idx + 1, max_iter_i))?;
+                            Ok(())
+                        })?;
+                    }
+                    break;
+                }
+
+                let mut combine: Vec<(i64, usize)> = Vec::new();
+                for &sz in szbin_i64.iter() {
+                    for &nn in nbin_vals.iter() {
+                        combine.push((sz, nn));
+                    }
+                }
+                if combine.is_empty() {
+                    final_model_cache = Some((x_qtn, q_total, ixx));
+                    if let Some(cb) = progress_callback.as_ref() {
+                        Python::attach(|py2| -> PyResult<()> {
+                            py2.check_signals()?;
+                            cb.call1(py2, (it_idx + 1, max_iter_i))?;
+                            Ok(())
+                        })?;
+                    }
+                    break;
+                }
+
+                let rem_task = || {
+                    combine
+                        .par_iter()
+                        .map(|&(sz, nn)| {
+                            let leadidx = select_lead_indices(sz, nn, &femp, &global_pos);
+                            let sample_major = decode_packed_rows_to_sample_major(
+                                &packed_flat,
+                                bytes_per_snp,
+                                &leadidx,
+                                row_idx.as_deref(),
+                                &sample_idx,
+                                row_flip,
+                                row_maf,
+                            );
+                            let sample_major = match sample_major {
+                                Ok(v) => v,
+                                Err(_) => return (f64::INFINITY, leadidx),
+                            };
+                            let score = farmcpu_ll_score_from_sample_major(
+                                y,
+                                &x_qtn,
+                                n,
+                                q_total,
+                                &sample_major,
+                                leadidx.len(),
+                                -5.0,
+                                5.0,
+                                0.1,
+                                1e-8,
+                            )
+                            .unwrap_or(f64::INFINITY);
+                            (score, leadidx)
+                        })
+                        .collect::<Vec<(f64, Vec<usize>)>>()
+                };
+                let rem_res = if let Some(p) = &pool {
+                    p.install(rem_task)
+                } else {
+                    rem_task()
+                };
+                if rem_res.is_empty() {
+                    if let Some(cb) = progress_callback.as_ref() {
+                        Python::attach(|py2| -> PyResult<()> {
+                            py2.check_signals()?;
+                            cb.call1(py2, (it_idx + 1, max_iter_i))?;
+                            Ok(())
+                        })?;
+                    }
+                    break;
+                }
+                let mut best_i = 0usize;
+                let mut best_score = rem_res[0].0;
+                for (i, (s, _)) in rem_res.iter().enumerate().skip(1) {
+                    if s.total_cmp(&best_score).is_lt() {
+                        best_score = *s;
+                        best_i = i;
+                    }
+                }
+                let opt_lead = &rem_res[best_i].1;
+                let mut qtn_union = qtn_idx.clone();
+                qtn_union.extend(opt_lead.iter().copied());
+                qtn_union.sort_unstable();
+                qtn_union.dedup();
+
+                if it_idx >= 1 && !qtn_union.is_empty() {
+                    let prev_set: HashSet<usize> = qtn_idx.iter().copied().collect();
+                    qtn_union.retain(|&idx| {
+                        let p = femp[idx];
+                        (p.is_finite() && p < qtn_threshold_eff) || prev_set.contains(&idx)
+                    });
+                }
+
+                let qtn_next: Vec<usize> = if qtn_union.is_empty() {
+                    Vec::new()
+                } else {
+                    let sample_major = decode_packed_rows_to_sample_major(
+                        &packed_flat,
+                        bytes_per_snp,
+                        &qtn_union,
+                        row_idx.as_deref(),
+                        &sample_idx,
+                        row_flip,
+                        row_maf,
+                    )
+                    .map_err(PyRuntimeError::new_err)?;
+                    let pvals: Vec<f64> = qtn_union.iter().map(|&ix| femp[ix]).collect();
+                    let keep = farmcpu_super_keep_from_sample_major(
+                        &sample_major,
+                        n,
+                        qtn_union.len(),
+                        &pvals,
+                        0.7,
+                    );
+                    qtn_union
+                        .iter()
+                        .zip(keep.iter())
+                        .filter_map(|(&ix, &k)| if k { Some(ix) } else { None })
+                        .collect()
+                };
+
+                if let Some(cb) = progress_callback.as_ref() {
+                    Python::attach(|py2| -> PyResult<()> {
+                        py2.check_signals()?;
+                        cb.call1(py2, (it_idx + 1, max_iter_i))?;
+                        Ok(())
+                    })?;
+                }
+
+                if qtn_next == qtn_idx {
+                    final_model_cache = Some((x_qtn, q_total, ixx));
+                    break;
+                }
+                qtn_idx = qtn_next;
             }
         }
+
+        let (x_qtn, _q_total, ixx) = if let Some(cached) = final_model_cache.take() {
+            cached
+        } else {
+            let (x_qtn, q_total) = build_x_with_qtn_packed(
+                &base_x,
+                n,
+                q_base,
+                &qtn_idx,
+                &packed_flat,
+                bytes_per_snp,
+                row_idx.as_deref(),
+                &sample_idx,
+                row_flip,
+                row_maf,
+            )
+            .map_err(PyRuntimeError::new_err)?;
+            let mut xtx = vec![0.0_f64; q_total * q_total];
+            for i in 0..n {
+                let row = &x_qtn[i * q_total..(i + 1) * q_total];
+                for a in 0..q_total {
+                    let va = row[a];
+                    for b in 0..q_total {
+                        xtx[a * q_total + b] += va * row[b];
+                    }
+                }
+            }
+            let ixx = pinv_xtx(&xtx, q_total).map_err(PyRuntimeError::new_err)?;
+            (x_qtn, q_total, ixx)
+        };
+        let k_qtn = qtn_idx.len();
         let mut qtn_lookup: HashMap<usize, usize> = HashMap::with_capacity(k_qtn);
         for (j, &idx) in qtn_idx.iter().enumerate() {
             qtn_lookup.insert(idx, j);
@@ -1739,9 +2477,8 @@ pub fn farmcpu_packed_to_tsv(
             &miss_counts,
             q_base,
             &qtn_lookup,
-            &qtn_min_p,
-            &qtn_beta,
-            &qtn_se,
+            &qtn_idx,
+            final_window_bp,
         )
         .map_err(PyRuntimeError::new_err)?;
         writer.finish().map_err(PyRuntimeError::new_err)?;

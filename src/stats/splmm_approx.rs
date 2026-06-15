@@ -505,6 +505,11 @@ pub(crate) fn build_residualized_approx_scan_null_from_profile_components(
 }
 
 impl ResidualizedApproxNullFit {
+    #[inline]
+    pub(crate) fn factor_nnz(&self) -> usize {
+        self.factor.factor_nnz()
+    }
+
     pub(crate) fn estimate_gamma_from_markers(
         &self,
         x_design: &[f64],

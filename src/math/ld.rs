@@ -641,6 +641,73 @@ pub(crate) fn build_row_bitplanes_u64_with_aux(
 }
 
 #[inline]
+pub(crate) fn fill_row_bitplanes_hlav_u64(row: &[u8], n_samples: usize, out: &mut Vec<u64>) {
+    let words = n_samples.div_ceil(64);
+    if words == 0 {
+        out.clear();
+        return;
+    }
+
+    static ROW_LUT: OnceLock<([u8; 256], [u8; 256], [u8; 256], [u8; 256])> = OnceLock::new();
+    let (lut_h, lut_l, lut_a, lut_v) = ROW_LUT.get_or_init(|| {
+        let mut lh = [0u8; 256];
+        let mut ll = [0u8; 256];
+        let mut la = [0u8; 256];
+        let mut lv = [0u8; 256];
+        for b in 0u16..=255 {
+            let byte = b as u8;
+            let mut hb = 0u8;
+            let mut lb = 0u8;
+            let mut ab = 0u8;
+            let mut vb = 0u8;
+            for lane in 0..4usize {
+                let code = (byte >> (lane * 2)) & 0b11;
+                let bit = 1u8 << lane;
+                if ((code >> 1) & 1) != 0 {
+                    hb |= bit;
+                }
+                if (code & 1) != 0 {
+                    lb |= bit;
+                }
+                if code == 0b11 {
+                    ab |= bit;
+                }
+                if code != 0b01 {
+                    vb |= bit;
+                }
+            }
+            lh[byte as usize] = hb;
+            ll[byte as usize] = lb;
+            la[byte as usize] = ab;
+            lv[byte as usize] = vb;
+        }
+        (lh, ll, la, lv)
+    });
+
+    out.clear();
+    out.resize(words.saturating_mul(4), 0u64);
+    let lo_off = words;
+    let ai_off = words.saturating_mul(2);
+    let vi_off = words.saturating_mul(3);
+    for (bi, &b) in row.iter().enumerate() {
+        let w = bi >> 4;
+        let sh = ((bi & 15) << 2) as u32;
+        out[w] |= (lut_h[b as usize] as u64) << sh;
+        out[lo_off + w] |= (lut_l[b as usize] as u64) << sh;
+        out[ai_off + w] |= (lut_a[b as usize] as u64) << sh;
+        out[vi_off + w] |= (lut_v[b as usize] as u64) << sh;
+    }
+    let rem = n_samples % 64;
+    if rem != 0 {
+        let tail_mask = (1u64 << rem) - 1u64;
+        out[words - 1] &= tail_mask;
+        out[lo_off + words - 1] &= tail_mask;
+        out[ai_off + words - 1] &= tail_mask;
+        out[vi_off + words - 1] &= tail_mask;
+    }
+}
+
+#[inline]
 pub(crate) fn r2_pairwise_complete_bitplanes(
     hi: &[u64],
     li: &[u64],

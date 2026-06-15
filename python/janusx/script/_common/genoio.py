@@ -109,10 +109,12 @@ def determine_genotype_source(
 
     gfile_norm = gfile.replace("\\", "/")
     if apply_cache:
+        force_kind = "hmp" if hmp else None
         gfile_norm = prepare_cli_input_cache(
             gfile_norm,
             snps_only=bool(snps_only),
             delimiter=delimiter,
+            force_kind=force_kind,
         )
         gfile_norm = str(gfile_norm).replace("\\", "/")
 

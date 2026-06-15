@@ -356,7 +356,7 @@ def run_chunked_gwas_lmm_lm(
                 _log_file_only(
                     logger,
                     logging.INFO,
-                    "LM route: using streaming orchestrator (fast mode disabled).",
+                    "LM route: using streaming orchestrator (packed route disabled).",
                 )
             else:
                 _log_file_only(
@@ -390,7 +390,7 @@ def run_chunked_gwas_lmm_lm(
                 return
         reasons: list[str] = []
         if not packed_fullrust_enabled:
-            reasons.append("fast mode disabled")
+            reasons.append("packed route disabled")
         if not can_packed:
             reasons.append("input is not PLINK BED prefix")
         if not has_symbols:
@@ -443,7 +443,7 @@ def run_chunked_gwas_lmm_lm(
             return
         reasons: list[str] = []
         if not packed_fullrust_enabled:
-            reasons.append("fast mode disabled")
+            reasons.append("packed route disabled")
         if not can_packed:
             reasons.append("input is not PLINK BED prefix")
         if not has_symbols:

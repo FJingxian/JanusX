@@ -25,7 +25,7 @@ use crate::bedmath::{
 };
 use crate::blas::{
     cblas_daxpy_dispatch, cblas_dgemm_dispatch, CblasInt, OpenBlasThreadGuard, CBLAS_COL_MAJOR,
-    CBLAS_NO_TRANS, CBLAS_TRANS,
+    CBLAS_NO_TRANS, CBLAS_ROW_MAJOR, CBLAS_TRANS,
 };
 use crate::he::build_row_standardization_stats;
 use crate::linalg::{chi2_stat_df1_from_sf, format_chisq_value, sanitize_assoc_pvalue};
@@ -57,6 +57,9 @@ const DEFAULT_STAGE1_MSGPS_STEP_MAX: usize = 200_000usize;
 const DEFAULT_STAGE1_MSGPS_PMAX: usize = 300usize;
 const DEFAULT_STAGE1_MSGPS_XTX_CACHE_MB: usize = 512usize;
 const DEFAULT_STAGE1_MSGPS_XTX_LOG_EVERY: usize = 32usize;
+const DEFAULT_STAGE1_MSGPS_XTX_BATCH: usize = 16usize;
+const DEFAULT_STAGE1_MSGPS_EARLY_STOP_CHECK_EVERY: usize = 512usize;
+const DEFAULT_STAGE1_MSGPS_EARLY_STOP_PATIENCE: usize = 6usize;
 const DEFAULT_STAGE1_AUTO_EXACT_MAX_FEATURES: usize = 32_768usize;
 const DEFAULT_STAGE1_AUTO_EXACT_MAX_CELLS: usize = 64_000_000usize;
 const DEFAULT_STAGE1_EXACT_PCG_MIN_N: usize = 4096usize;
@@ -81,12 +84,12 @@ fn algwas_stage1_mode() -> AlgwasStage1Mode {
 fn algwas_stage1_mode_from_raw(raw: Option<&str>) -> AlgwasStage1Mode {
     let raw = raw.unwrap_or("").trim().to_ascii_lowercase();
     match raw.as_str() {
-        "" => AlgwasStage1Mode::StreamActive,
+        "" => AlgwasStage1Mode::Auto,
         "auto" => AlgwasStage1Mode::Auto,
         "dense" | "msgps" => AlgwasStage1Mode::DenseMsgps,
         "stream" | "approx" | "active" => AlgwasStage1Mode::StreamActive,
         "packed" | "exact" | "packed_exact" | "exact_packed" => AlgwasStage1Mode::PackedExactMsgps,
-        _ => AlgwasStage1Mode::PackedExactMsgps,
+        _ => AlgwasStage1Mode::Auto,
     }
 }
 
@@ -153,6 +156,11 @@ fn algwas_stage1_timing_enabled() -> bool {
 }
 
 #[inline]
+fn algwas_stage2_timing_enabled() -> bool {
+    env_var_truthy("JX_ALGWAS_STAGE2_TIMING")
+}
+
+#[inline]
 fn algwas_stage1_ebic_gamma() -> f64 {
     std::env::var("JX_ALGWAS_STAGE1_EBIC_GAMMA")
         .ok()
@@ -169,6 +177,50 @@ fn algwas_stage1_site_cap(n: usize) -> usize {
         .and_then(|s| s.trim().parse::<usize>().ok())
         .filter(|&v| v > 0)
         .unwrap_or(default_cap)
+}
+
+#[inline]
+fn algwas_stage1_exact_site_cap(pmax: usize) -> usize {
+    std::env::var("JX_ALGWAS_STAGE1_SITE_CAP")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .map(|v| v.min(pmax.max(1)))
+        .unwrap_or(pmax.max(1))
+}
+
+#[inline]
+fn env_var_enabled_default(name: &str, default: bool) -> bool {
+    match std::env::var(name) {
+        Ok(v) => {
+            let raw = v.trim().to_ascii_lowercase();
+            !matches!(raw.as_str(), "" | "0" | "false" | "no" | "off")
+        }
+        Err(_) => default,
+    }
+}
+
+#[inline]
+fn algwas_stage1_exact_early_stop_enabled() -> bool {
+    env_var_enabled_default("JX_ALGWAS_STAGE1_EXACT_EARLY_STOP", true)
+}
+
+#[inline]
+fn algwas_stage1_exact_bic_check_every() -> usize {
+    std::env::var("JX_ALGWAS_STAGE1_EXACT_BIC_CHECK_EVERY")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(DEFAULT_STAGE1_MSGPS_EARLY_STOP_CHECK_EVERY)
+}
+
+#[inline]
+fn algwas_stage1_exact_bic_patience_checks() -> usize {
+    std::env::var("JX_ALGWAS_STAGE1_EXACT_BIC_PATIENCE")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(DEFAULT_STAGE1_MSGPS_EARLY_STOP_PATIENCE)
 }
 
 #[inline]
@@ -225,6 +277,60 @@ fn algwas_xtx_cache_log_every() -> usize {
         .and_then(|s| s.trim().parse::<usize>().ok())
         .filter(|&v| v > 0)
         .unwrap_or(DEFAULT_STAGE1_MSGPS_XTX_LOG_EVERY)
+}
+
+#[inline]
+fn algwas_xtx_batch_size() -> usize {
+    std::env::var("JX_ALGWAS_XTX_BATCH")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(DEFAULT_STAGE1_MSGPS_XTX_BATCH)
+        .clamp(1usize, 32usize)
+}
+
+#[inline]
+fn algwas_xtx_prefetch_max_rows(default_cap: usize) -> usize {
+    std::env::var("JX_ALGWAS_XTX_PREFETCH_MAX_ROWS")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(default_cap)
+}
+
+#[inline]
+fn algwas_stage2_block_rows(
+    max_rows: usize,
+    n_samples: usize,
+    q_total: usize,
+    row_stride: usize,
+) -> usize {
+    if max_rows <= 1 {
+        return max_rows.max(1);
+    }
+    if let Some(rows) = std::env::var("JX_ALGWAS_STAGE2_BLOCK_ROWS")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&v| v > 0)
+    {
+        return rows.min(max_rows).max(1);
+    }
+    let target_mb = std::env::var("JX_ALGWAS_STAGE2_BLOCK_MB")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(128usize);
+    let row_bytes = n_samples
+        .saturating_mul(size_of::<f64>())
+        .saturating_add(
+            q_total
+                .saturating_mul(2usize)
+                .saturating_mul(size_of::<f64>()),
+        )
+        .saturating_add(row_stride.saturating_mul(size_of::<f64>()))
+        .saturating_add(2usize.saturating_mul(size_of::<f64>()))
+        .max(1usize);
+    let target_bytes = target_mb.saturating_mul(1024usize * 1024usize);
+    (target_bytes / row_bytes).clamp(1usize, max_rows)
 }
 
 #[inline]
@@ -294,8 +400,38 @@ fn log_choose_ln(n: usize, k: usize) -> f64 {
 }
 
 #[inline]
-fn algwas_bic_from_rss_df(n: usize, rss: f64, df: f64) -> f64 {
-    (n as f64) * (rss.max(1e-12_f64) / n as f64).ln() + df * (n as f64).ln()
+fn algwas_stage1_tau2_from_residuals_f32(y: &[f32]) -> f64 {
+    let n = y.len();
+    if n <= 1 {
+        return 1e-12_f64;
+    }
+    let mean = y.iter().map(|&v| v as f64).sum::<f64>() / n as f64;
+    let ss = y
+        .iter()
+        .map(|&v| {
+            let d = v as f64 - mean;
+            d * d
+        })
+        .sum::<f64>();
+    (ss / (n as f64 - 1.0_f64)).max(1e-12_f64)
+}
+
+#[inline]
+fn algwas_stage1_tau2_from_centered_f64(y_centered: &[f64]) -> f64 {
+    let n = y_centered.len();
+    if n <= 1 {
+        return 1e-12_f64;
+    }
+    let ss = y_centered.iter().map(|v| v * v).sum::<f64>();
+    (ss / (n as f64 - 1.0_f64)).max(1e-12_f64)
+}
+
+#[inline]
+fn algwas_bic_from_rss_df_tau2(n: usize, rss: f64, df: f64, tau2: f64) -> f64 {
+    let tau2_use = tau2.max(1e-12_f64);
+    (n as f64) * (2.0_f64 * std::f64::consts::PI * tau2_use).ln()
+        + (rss.max(0.0_f64) / tau2_use)
+        + df * (n as f64).ln()
 }
 
 #[inline]
@@ -311,6 +447,20 @@ fn algwas_stage1_path_score(
     match criterion {
         AlgwasStage1SelectCriterion::Ebic => point.ebic,
         AlgwasStage1SelectCriterion::Bic => point.bic,
+    }
+}
+
+#[inline]
+fn algwas_stage1_score_from_bic(
+    bic: f64,
+    n_features: usize,
+    nnz: usize,
+    ebic_gamma: f64,
+    criterion: AlgwasStage1SelectCriterion,
+) -> f64 {
+    match criterion {
+        AlgwasStage1SelectCriterion::Bic => bic,
+        AlgwasStage1SelectCriterion::Ebic => algwas_ebic_from_bic(bic, n_features, nnz, ebic_gamma),
     }
 }
 
@@ -745,6 +895,62 @@ fn row_major_block_mul_vec_f64(
             acc += row[c] * vec[c];
         }
         out[r] = acc;
+    }
+}
+
+#[inline]
+fn row_major_block_mul_pivots_t_f64(
+    block: &[f64],
+    rows: usize,
+    cols: usize,
+    pivots: &[f64],
+    batch: usize,
+    out: &mut [f64],
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) {
+    debug_assert_eq!(block.len(), rows.saturating_mul(cols));
+    debug_assert_eq!(pivots.len(), batch.saturating_mul(cols));
+    debug_assert_eq!(out.len(), rows.saturating_mul(batch));
+    if rows == 0 || cols == 0 || batch == 0 {
+        return;
+    }
+    if batch == 1 {
+        row_major_block_mul_vec_f64(block, rows, cols, pivots, out, pool);
+        return;
+    }
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    unsafe {
+        cblas_dgemm_dispatch(
+            CBLAS_ROW_MAJOR,
+            CBLAS_NO_TRANS,
+            CBLAS_TRANS,
+            rows as CblasInt,
+            batch as CblasInt,
+            cols as CblasInt,
+            1.0_f64,
+            block.as_ptr(),
+            cols as CblasInt,
+            pivots.as_ptr(),
+            cols as CblasInt,
+            0.0_f64,
+            out.as_mut_ptr(),
+            batch as CblasInt,
+        );
+        return;
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        for r in 0..rows {
+            let row = &block[r * cols..(r + 1) * cols];
+            for b in 0..batch {
+                let pivot = &pivots[b * cols..(b + 1) * cols];
+                let mut acc = 0.0_f64;
+                for c in 0..cols {
+                    acc += row[c] * pivot[c];
+                }
+                out[r * batch + b] = acc;
+            }
+        }
     }
 }
 
@@ -1353,6 +1559,8 @@ struct MsgpsXtxScratch {
     row_ids: Vec<usize>,
     block: Vec<f64>,
     tmp: Vec<f64>,
+    pivots: Vec<f64>,
+    tmp_batch: Vec<f64>,
 }
 
 impl MsgpsXtxScratch {
@@ -1366,6 +1574,18 @@ impl MsgpsXtxScratch {
         }
         self.row_ids.clear();
         self.row_ids.reserve(block_rows);
+    }
+
+    fn prepare_batch(&mut self, block_rows: usize, n_samples: usize, batch: usize) {
+        self.prepare(block_rows, n_samples);
+        let pivot_len = batch.saturating_mul(n_samples);
+        if self.pivots.len() < pivot_len {
+            self.pivots.resize(pivot_len, 0.0_f64);
+        }
+        let tmp_len = block_rows.saturating_mul(batch);
+        if self.tmp_batch.len() < tmp_len {
+            self.tmp_batch.resize(tmp_len, 0.0_f64);
+        }
     }
 }
 
@@ -3188,19 +3408,48 @@ fn ensure_msgps_xtx_cached(
     xtx_cache: &mut MsgpsXtxCache,
     scratch: &mut MsgpsXtxScratch,
 ) -> Result<(), String> {
-    if xtx_cache.contains_key(row_idx) {
+    ensure_msgps_xtx_cached_batch(design, proj, &[row_idx], std_cache, xtx_cache, scratch)
+}
+
+fn ensure_msgps_xtx_cached_batch(
+    design: &AlgwasPackedDesign<'_>,
+    proj: &CovariateProjection,
+    row_indices: &[usize],
+    std_cache: &mut HashMap<usize, CachedMsgpsStdRow>,
+    xtx_cache: &mut MsgpsXtxCache,
+    scratch: &mut MsgpsXtxScratch,
+) -> Result<(), String> {
+    let mut rows_to_cache = Vec::<usize>::with_capacity(row_indices.len());
+    for &row_idx in row_indices {
+        if row_idx >= design.n_features() || xtx_cache.contains_key(row_idx) {
+            continue;
+        }
+        if !rows_to_cache.contains(&row_idx) {
+            rows_to_cache.push(row_idx);
+        }
+    }
+    if rows_to_cache.is_empty() {
         return Ok(());
     }
-    ensure_msgps_std_row_cached(design, proj, row_idx, std_cache)?;
-    let pivot = &std_cache
-        .get(&row_idx)
-        .ok_or_else(|| "missing cached standardized row".to_string())?
-        .values;
+    for &row_idx in &rows_to_cache {
+        ensure_msgps_std_row_cached(design, proj, row_idx, std_cache)?;
+    }
     let n = design.n_samples();
     let p = design.n_features();
     let block_rows = design.block_rows.max(1);
-    let spill_slot = xtx_cache.reserve_slot();
-    scratch.prepare(block_rows, n);
+    let batch = rows_to_cache.len();
+    scratch.prepare_batch(block_rows, n, batch);
+    for (b, &row_idx) in rows_to_cache.iter().enumerate() {
+        let pivot = &std_cache
+            .get(&row_idx)
+            .ok_or_else(|| "missing cached standardized row".to_string())?
+            .values;
+        scratch.pivots[b * n..(b + 1) * n].copy_from_slice(pivot);
+    }
+    let spill_slots: Vec<usize> = rows_to_cache
+        .iter()
+        .map(|_| xtx_cache.reserve_slot())
+        .collect();
     let n_blocks = p.div_ceil(block_rows);
     for block_idx in (0..n_blocks).rev() {
         let row_start = block_idx * block_rows;
@@ -3213,22 +3462,58 @@ fn ensure_msgps_xtx_cached(
             &mut scratch.block[..rows * n],
             None,
         )?;
-        row_major_block_mul_vec_f64(
+        row_major_block_mul_pivots_t_f64(
             &scratch.block[..rows * n],
             rows,
             n,
-            pivot,
-            &mut scratch.tmp[..rows],
+            &scratch.pivots[..batch * n],
+            batch,
+            &mut scratch.tmp_batch[..rows * batch],
             design.pool.as_ref(),
         );
-        xtx_cache.write_block(spill_slot, block_idx, &scratch.tmp[..rows])?;
-        xtx_cache.insert_hot_block(
-            MsgpsXtxBlockKey { row_idx, block_idx },
-            scratch.tmp[..rows].to_vec(),
-        )?;
+        for (b, &row_idx) in rows_to_cache.iter().enumerate() {
+            for local in 0..rows {
+                scratch.tmp[local] = scratch.tmp_batch[local * batch + b];
+            }
+            xtx_cache.write_block(spill_slots[b], block_idx, &scratch.tmp[..rows])?;
+            xtx_cache.insert_hot_block(
+                MsgpsXtxBlockKey { row_idx, block_idx },
+                scratch.tmp[..rows].to_vec(),
+            )?;
+        }
     }
-    xtx_cache.commit_spilled_row(row_idx, spill_slot);
+    for (&row_idx, &spill_slot) in rows_to_cache.iter().zip(spill_slots.iter()) {
+        xtx_cache.commit_spilled_row(row_idx, spill_slot);
+    }
     Ok(())
+}
+
+#[inline]
+fn insert_top_xtx_prefetch_candidate(
+    candidates: &mut Vec<(usize, f64)>,
+    cap: usize,
+    row_idx: usize,
+    score: f64,
+) {
+    if cap == 0 || !score.is_finite() || score <= 0.0_f64 {
+        return;
+    }
+    if candidates.iter().any(|(idx, _)| *idx == row_idx) {
+        return;
+    }
+    if candidates.len() < cap {
+        candidates.push((row_idx, score));
+        candidates.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+        return;
+    }
+    if let Some((_, last_score)) = candidates.last() {
+        if score <= *last_score {
+            return;
+        }
+    }
+    candidates.pop();
+    candidates.push((row_idx, score));
+    candidates.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
 }
 
 #[inline]
@@ -3904,6 +4189,7 @@ fn fit_stage1_path_streaming(
 
     let y_t0 = stage1_timing.then(Instant::now);
     let y_resid = proj.residualize_y(y)?;
+    let tau2 = algwas_stage1_tau2_from_residuals_f32(&y_resid);
     let y_secs = y_t0.map(|t0| t0.elapsed().as_secs_f64()).unwrap_or(0.0_f64);
     let diag_t0 = stage1_timing.then(Instant::now);
     let diag_xtx = design.diag_xtx_residualized(proj)?;
@@ -3986,10 +4272,11 @@ fn fit_stage1_path_streaming(
             .map_err(|e| e.to_string())?;
         }
         let rss0 = dot_f32_f64(&y_resid, &y_resid, design.pool.as_ref());
+        let bic0 = algwas_bic_from_rss_df_tau2(n, rss0, 0.0_f64, tau2);
         let path = vec![AlgwasStage1PathPoint {
             lambda: 0.0_f32,
-            bic: (n as f64) * (rss0.max(1e-12_f64) / n as f64).ln(),
-            ebic: (n as f64) * (rss0.max(1e-12_f64) / n as f64).ln(),
+            bic: bic0,
+            ebic: bic0,
             rss: rss0,
             nnz: 0,
             df: 0.0_f64,
@@ -4016,7 +4303,7 @@ fn fit_stage1_path_streaming(
 
     let mut path = Vec::<AlgwasStage1PathPoint>::with_capacity(lambda_steps + 1);
     let rss0 = dot_f32_f64(&y_resid, &y_resid, design.pool.as_ref());
-    let bic0 = algwas_bic_from_rss_df(n, rss0, 0.0_f64);
+    let bic0 = algwas_bic_from_rss_df_tau2(n, rss0, 0.0_f64, tau2);
     let ebic0 = algwas_ebic_from_bic(bic0, p, 0usize, ebic_gamma);
     path.push(AlgwasStage1PathPoint {
         lambda: 0.0_f32,
@@ -4074,7 +4361,7 @@ fn fit_stage1_path_streaming(
         }
         let nnz = beta_std.iter().filter(|&&v| v != 0.0_f32).count();
         let df = nnz as f64;
-        let bic = algwas_bic_from_rss_df(n, rss, df);
+        let bic = algwas_bic_from_rss_df_tau2(n, rss, df, tau2);
         let ebic = algwas_ebic_from_bic(bic, p, nnz, ebic_gamma);
         path.push(AlgwasStage1PathPoint {
             lambda,
@@ -4704,6 +4991,8 @@ fn fit_stage1_path_exact_packed(
     cfg: &AlgwasConfig,
     progress_callback: Option<&Py<PyAny>>,
 ) -> Result<AlgwasStage1Result, String> {
+    let stage1_timing = algwas_stage1_timing_enabled();
+    let stage1_total_t0 = stage1_timing.then(Instant::now);
     let ebic_gamma = algwas_stage1_ebic_gamma();
     let n = design.n_samples();
     let p = design.n_features();
@@ -4784,11 +5073,16 @@ fn fit_stage1_path_exact_packed(
         .qtn_bound
         .unwrap_or(DEFAULT_STAGE1_MSGPS_PMAX)
         .min(p.max(1));
-    let early_stop_cap = algwas_stage1_site_cap(n);
+    let hard_site_cap = algwas_stage1_exact_site_cap(pmax);
+    let selection_criterion = algwas_stage1_select_criterion();
+    let exact_early_stop = algwas_stage1_exact_early_stop_enabled();
+    let exact_bic_check_every = algwas_stage1_exact_bic_check_every();
+    let exact_bic_patience = algwas_stage1_exact_bic_patience_checks();
 
     let mut g: Vec<f64> = xty0.iter().map(|v| alpha_n2 * *v).collect();
     let mut residual = DVector::<f64>::from_column_slice(&y_centered);
     let mut beta_std = vec![0.0_f64; p];
+    let mut current_nnz = 0usize;
     let mut beta_sign_state = vec![0i8; p];
     let mut selected_order = vec![0usize; p];
     let mut selected_cols = Vec::<usize>::new();
@@ -4797,9 +5091,15 @@ fn fit_stage1_path_exact_packed(
     let mut tuning = vec![0.0_f64; step_max + 1];
     let mut tuning_stand = vec![0.0_f64; step_max + 1];
     let mut rss = vec![0.0_f64; step_max + 1];
+    let mut nnz_by_step = vec![0usize; step_max + 1];
     let mut increment_vec = vec![0.0_f64; step_max + 1];
     let mut sum_lambda = vec![0.0_f64; step_max + 1];
     rss[0] = residual.dot(&residual);
+    let tau2 = algwas_stage1_tau2_from_centered_f64(&y_centered);
+    let bic0 = algwas_bic_from_rss_df_tau2(n, rss[0], 0.0_f64, tau2);
+    let mut checkpoint_best_score =
+        algwas_stage1_score_from_bic(bic0, p, 0usize, ebic_gamma, selection_criterion);
+    let mut checkpoint_no_improve = 0usize;
 
     let mut last_jstar: Option<usize> = None;
     let mut last_sign = 1.0_f64;
@@ -4811,12 +5111,16 @@ fn fit_stage1_path_exact_packed(
     let mut std_cache = HashMap::<usize, CachedMsgpsStdRow>::with_capacity(cache_cap);
     let mut xtx_cache = MsgpsXtxCache::new(p, cache_cap, block_rows)?;
     let mut xtx_scratch = MsgpsXtxScratch::default();
+    let xtx_batch_size = algwas_xtx_batch_size();
+    let xtx_prefetch_enabled = xtx_batch_size > 1;
+    let xtx_prefetch_max_rows = algwas_xtx_prefetch_max_rows(pmax);
+    let mut xtx_spec_prefetch_count = 0usize;
     let beta_zero_tol = msgps_near_zero_tol(delta_t);
 
     if let Some(cb) = progress_callback {
         Python::attach(|py| -> PyResult<()> {
             py.check_signals()?;
-            cb.call1(py, (0usize, 0usize))?;
+            cb.call1(py, (0usize, step_max))?;
             Ok(())
         })
         .map_err(|e| e.to_string())?;
@@ -4844,6 +5148,11 @@ fn fit_stage1_path_exact_packed(
         let mut max_val = 0.0_f64;
         let mut below_thr = 0usize;
         let mut sum_abs_lambda = 0.0_f64;
+        let mut xtx_prefetch_candidates = if xtx_prefetch_enabled {
+            Vec::<(usize, f64)>::with_capacity(xtx_batch_size)
+        } else {
+            Vec::<(usize, f64)>::new()
+        };
         for j in 0..p {
             let absg = g[j].abs();
             let lambda_raw = g[j] / weights[j];
@@ -4866,6 +5175,14 @@ fn fit_stage1_path_exact_packed(
                 max_val = score;
                 max_idx = j;
             }
+            if xtx_prefetch_enabled && score > 0.0_f64 && !xtx_cache.contains_key(j) {
+                insert_top_xtx_prefetch_candidate(
+                    &mut xtx_prefetch_candidates,
+                    xtx_batch_size,
+                    j,
+                    score,
+                );
+            }
         }
 
         let lambda_j = g[max_idx] / weights[max_idx];
@@ -4881,7 +5198,14 @@ fn fit_stage1_path_exact_packed(
         betahat_index_adj[step] = selected_order[max_idx];
 
         let beta_prev = beta_std[max_idx];
+        let beta_prev_nonzero = beta_prev != 0.0_f64;
         beta_std[max_idx] += delta_t * sign;
+        let beta_now_nonzero = beta_std[max_idx] != 0.0_f64;
+        if !beta_prev_nonzero && beta_now_nonzero {
+            current_nnz = current_nnz.saturating_add(1);
+        } else if beta_prev_nonzero && !beta_now_nonzero {
+            current_nnz = current_nnz.saturating_sub(1);
+        }
         if beta_std[max_idx] > beta_zero_tol {
             beta_sign_state[max_idx] = 1;
         } else if beta_std[max_idx] < -beta_zero_tol {
@@ -4898,6 +5222,7 @@ fn fit_stage1_path_exact_packed(
         let col = &std_cache.get(&max_idx).unwrap().values;
         daxpy_inplace_f64(-delta_t * sign, col, residual.as_mut_slice());
         rss[step] = residual.dot(&residual);
+        nnz_by_step[step] = current_nnz;
         let delta_pen = weights[max_idx] * (beta_std[max_idx].abs() - beta_prev.abs());
         tuning[step] = tuning[step - 1] + delta_pen;
         tuning_stand[step] =
@@ -4906,17 +5231,12 @@ fn fit_stage1_path_exact_packed(
 
         last_jstar = Some(max_idx);
         last_sign = sign;
-        if selected_cols.len() > early_stop_cap {
-            step_adj_raw = step.saturating_add(1);
-            include_last_step = true;
+        if selected_cols.len() > hard_site_cap {
+            step_adj_raw = step;
             break;
         }
         if below_thr == p || max_val <= 0.0_f64 {
             converged = true;
-            step_adj_raw = step;
-            break;
-        }
-        if selected_cols.len() == pmax + 1 {
             step_adj_raw = step;
             break;
         }
@@ -4928,11 +5248,79 @@ fn fit_stage1_path_exact_packed(
                 break;
             }
         }
+        if exact_early_stop && step % exact_bic_check_every == 0 {
+            let q_n = selected_cols.len();
+            let df_step = if q_n > 0 {
+                let mut x_sel = Vec::<f64>::with_capacity(n * q_n);
+                for &col_idx in selected_cols.iter().take(q_n) {
+                    ensure_msgps_std_row_cached(design, proj, col_idx, &mut std_cache)?;
+                    x_sel.extend_from_slice(&std_cache.get(&col_idx).unwrap().values);
+                }
+                let x_sel = DMatrix::<f64>::from_vec(n, q_n, x_sel);
+                let r = x_sel.qr().r();
+                compute_msgps_df_modified(&r, &betahat_index_adj, &increment_vec, step)
+                    .get(step)
+                    .copied()
+                    .unwrap_or(q_n as f64)
+            } else {
+                0.0_f64
+            };
+            let bic = algwas_bic_from_rss_df_tau2(n, rss[step], df_step, tau2);
+            let score =
+                algwas_stage1_score_from_bic(bic, p, current_nnz, ebic_gamma, selection_criterion);
+            let improve_tol = 1e-9_f64 * checkpoint_best_score.abs().max(1.0_f64);
+            if score + improve_tol < checkpoint_best_score {
+                checkpoint_best_score = score;
+                checkpoint_no_improve = 0;
+            } else {
+                checkpoint_no_improve = checkpoint_no_improve.saturating_add(1);
+                if checkpoint_no_improve >= exact_bic_patience {
+                    step_adj_raw = step;
+                    include_last_step = true;
+                    break;
+                }
+            }
+        }
+        if xtx_prefetch_enabled {
+            let mut batch_rows = Vec::<usize>::with_capacity(xtx_batch_size);
+            if !xtx_cache.contains_key(max_idx) {
+                batch_rows.push(max_idx);
+            }
+            for (idx, _) in xtx_prefetch_candidates {
+                if batch_rows.len() >= xtx_batch_size {
+                    break;
+                }
+                if idx != max_idx && !xtx_cache.contains_key(idx) {
+                    batch_rows.push(idx);
+                }
+            }
+            if !batch_rows.is_empty() {
+                let required_rows = usize::from(batch_rows.first().copied() == Some(max_idx));
+                if xtx_spec_prefetch_count >= xtx_prefetch_max_rows {
+                    batch_rows.truncate(required_rows);
+                } else {
+                    let spec_room = xtx_prefetch_max_rows - xtx_spec_prefetch_count;
+                    batch_rows.truncate(required_rows.saturating_add(spec_room));
+                }
+            }
+            if !batch_rows.is_empty() {
+                let spec_added = batch_rows.iter().filter(|&&idx| idx != max_idx).count();
+                ensure_msgps_xtx_cached_batch(
+                    design,
+                    proj,
+                    &batch_rows,
+                    &mut std_cache,
+                    &mut xtx_cache,
+                    &mut xtx_scratch,
+                )?;
+                xtx_spec_prefetch_count = xtx_spec_prefetch_count.saturating_add(spec_added);
+            }
+        }
         if let Some(cb) = progress_callback {
             if step <= 1024 || step % 64 == 0 || step == step_max {
                 Python::attach(|py| -> PyResult<()> {
                     py.check_signals()?;
-                    cb.call1(py, (step, 0usize))?;
+                    cb.call1(py, (step, step_max))?;
                     Ok(())
                 })
                 .map_err(|e| e.to_string())?;
@@ -4959,33 +5347,9 @@ fn fit_stage1_path_exact_packed(
         vec![0.0_f64; step_adj + 1]
     };
 
-    let tau2 = if n <= p {
-        let mean = y_centered.iter().sum::<f64>() / n as f64;
-        let mut ss = 0.0_f64;
-        for &v in &y_centered {
-            let d = v - mean;
-            ss += d * d;
-        }
-        ss / (n as f64 - 1.0_f64).max(1.0_f64)
-    } else {
-        let resid_ols = DVector::<f64>::from_column_slice(&y_centered)
-            - (DMatrix::<f64>::from_vec(n, p, {
-                let mut x_std = Vec::<f64>::with_capacity(n * p);
-                for j in 0..p {
-                    ensure_msgps_std_row_cached(design, proj, j, &mut std_cache)?;
-                    x_std.extend_from_slice(&std_cache.get(&j).unwrap().values);
-                }
-                x_std
-            }) * DVector::<f64>::from_column_slice(&beta_std));
-        resid_ols.dot(&resid_ols) / ((n - p).max(1) as f64)
-    }
-    .max(1e-12_f64);
-
-    let selection_criterion = algwas_stage1_select_criterion();
     let mut path = Vec::<AlgwasStage1PathPoint>::with_capacity(step_adj + 1);
     for step in 0..=step_adj {
-        let beta_step = reconstruct_msgps_beta(p, &betahat_index, step, delta_t);
-        let nnz = beta_step.iter().filter(|&&v| v != 0.0_f64).count();
+        let nnz = nnz_by_step.get(step).copied().unwrap_or(0usize);
         let bic = (n as f64) * (2.0_f64 * std::f64::consts::PI * tau2).ln()
             + (rss[step] / tau2)
             + (n as f64).ln() * df.get(step).copied().unwrap_or(0.0_f64);
@@ -5034,6 +5398,17 @@ fn fit_stage1_path_exact_packed(
             Ok(())
         })
         .map_err(|e| e.to_string())?;
+    }
+    if let Some(t0) = stage1_total_t0 {
+        eprintln!(
+            "ALGWAS exact packed stage1 timing: total={:.3}s steps={} selected_rows={} xtx_rows={} xtx_batch={} xtx_spec_prefetch={}",
+            t0.elapsed().as_secs_f64(),
+            step_adj,
+            selected_cols.len(),
+            xtx_cache.entries.len(),
+            xtx_batch_size,
+            xtx_spec_prefetch_count
+        );
     }
     xtx_cache.maybe_log_final_summary();
 
@@ -5159,12 +5534,17 @@ fn fit_stage1_path_dense_msgps(
         .qtn_bound
         .unwrap_or(DEFAULT_STAGE1_MSGPS_PMAX)
         .min(p.max(1));
-    let early_stop_cap = algwas_stage1_site_cap(n);
+    let hard_site_cap = algwas_stage1_exact_site_cap(pmax);
+    let selection_criterion = algwas_stage1_select_criterion();
+    let exact_early_stop = algwas_stage1_exact_early_stop_enabled();
+    let exact_bic_check_every = algwas_stage1_exact_bic_check_every();
+    let exact_bic_patience = algwas_stage1_exact_bic_patience_checks();
 
     let xty0 = x_std.transpose() * DVector::<f64>::from_column_slice(&y_centered);
     let mut g: Vec<f64> = xty0.iter().map(|v| alpha_n2 * *v).collect();
     let mut residual = DVector::<f64>::from_column_slice(&y_centered);
     let mut beta_std = vec![0.0_f64; p];
+    let mut current_nnz = 0usize;
     let mut beta_sign_state = vec![0i8; p];
     let mut selected_order = vec![0usize; p];
     let mut selected_cols = Vec::<usize>::new();
@@ -5174,9 +5554,21 @@ fn fit_stage1_path_dense_msgps(
     let mut tuning = vec![0.0_f64; step_max + 1];
     let mut tuning_stand = vec![0.0_f64; step_max + 1];
     let mut rss = vec![0.0_f64; step_max + 1];
+    let mut nnz_by_step = vec![0usize; step_max + 1];
     let mut increment_vec = vec![0.0_f64; step_max + 1];
     let mut sum_lambda = vec![0.0_f64; step_max + 1];
     rss[0] = residual.dot(&residual);
+    let tau2 = if n <= p {
+        algwas_stage1_tau2_from_centered_f64(&y_centered)
+    } else {
+        let resid_ols = DVector::<f64>::from_column_slice(&y_centered)
+            - (&x_std * DVector::<f64>::from_column_slice(&beta_ols));
+        (resid_ols.dot(&resid_ols) / ((n - p).max(1) as f64)).max(1e-12_f64)
+    };
+    let bic0 = algwas_bic_from_rss_df_tau2(n, rss[0], 0.0_f64, tau2);
+    let mut checkpoint_best_score =
+        algwas_stage1_score_from_bic(bic0, p, 0usize, ebic_gamma, selection_criterion);
+    let mut checkpoint_no_improve = 0usize;
 
     let mut last_jstar: Option<usize> = None;
     let mut last_sign = 1.0_f64;
@@ -5187,7 +5579,7 @@ fn fit_stage1_path_dense_msgps(
     if let Some(cb) = progress_callback {
         Python::attach(|py| -> PyResult<()> {
             py.check_signals()?;
-            cb.call1(py, (0usize, 0usize))?;
+            cb.call1(py, (0usize, step_max))?;
             Ok(())
         })
         .map_err(|e| e.to_string())?;
@@ -5245,7 +5637,14 @@ fn fit_stage1_path_dense_msgps(
         betahat_index_adj[step] = selected_order[max_idx];
 
         let beta_prev = beta_std[max_idx];
+        let beta_prev_nonzero = beta_prev != 0.0_f64;
         beta_std[max_idx] += delta_t * sign;
+        let beta_now_nonzero = beta_std[max_idx] != 0.0_f64;
+        if !beta_prev_nonzero && beta_now_nonzero {
+            current_nnz = current_nnz.saturating_add(1);
+        } else if beta_prev_nonzero && !beta_now_nonzero {
+            current_nnz = current_nnz.saturating_sub(1);
+        }
         if beta_std[max_idx] > beta_zero_tol {
             beta_sign_state[max_idx] = 1;
         } else if beta_std[max_idx] < -beta_zero_tol {
@@ -5261,6 +5660,7 @@ fn fit_stage1_path_dense_msgps(
         let col = x_std.column(max_idx);
         daxpy_inplace_f64(-delta_t * sign, col.as_slice(), residual.as_mut_slice());
         rss[step] = residual.dot(&residual);
+        nnz_by_step[step] = current_nnz;
         let delta_pen = weights[max_idx] * (beta_std[max_idx].abs() - beta_prev.abs());
         tuning[step] = tuning[step - 1] + delta_pen;
         tuning_stand[step] = tuning_stand[step - 1] + standardize_vec[max_idx] * delta_pen;
@@ -5268,17 +5668,12 @@ fn fit_stage1_path_dense_msgps(
 
         last_jstar = Some(max_idx);
         last_sign = sign;
-        if selected_cols.len() > early_stop_cap {
-            step_adj_raw = step.saturating_add(1);
-            include_last_step = true;
+        if selected_cols.len() > hard_site_cap {
+            step_adj_raw = step;
             break;
         }
         if below_thr == p || max_val <= 0.0_f64 {
             converged = true;
-            step_adj_raw = step;
-            break;
-        }
-        if selected_cols.len() == pmax + 1 {
             step_adj_raw = step;
             break;
         }
@@ -5290,11 +5685,43 @@ fn fit_stage1_path_dense_msgps(
                 break;
             }
         }
+        if exact_early_stop && step % exact_bic_check_every == 0 {
+            let q_n = selected_cols.len();
+            let df_step = if q_n > 0 {
+                let mut x_sel = Vec::<f64>::with_capacity(n * q_n);
+                for &col_idx in selected_cols.iter().take(q_n) {
+                    x_sel.extend_from_slice(x_std.column(col_idx).as_slice());
+                }
+                let x_sel = DMatrix::<f64>::from_vec(n, q_n, x_sel);
+                let r = x_sel.qr().r();
+                compute_msgps_df_modified(&r, &betahat_index_adj, &increment_vec, step)
+                    .get(step)
+                    .copied()
+                    .unwrap_or(q_n as f64)
+            } else {
+                0.0_f64
+            };
+            let bic = algwas_bic_from_rss_df_tau2(n, rss[step], df_step, tau2);
+            let score =
+                algwas_stage1_score_from_bic(bic, p, current_nnz, ebic_gamma, selection_criterion);
+            let improve_tol = 1e-9_f64 * checkpoint_best_score.abs().max(1.0_f64);
+            if score + improve_tol < checkpoint_best_score {
+                checkpoint_best_score = score;
+                checkpoint_no_improve = 0;
+            } else {
+                checkpoint_no_improve = checkpoint_no_improve.saturating_add(1);
+                if checkpoint_no_improve >= exact_bic_patience {
+                    step_adj_raw = step;
+                    include_last_step = true;
+                    break;
+                }
+            }
+        }
         if let Some(cb) = progress_callback {
             if step <= 1024 || step % 64 == 0 || step == step_max {
                 Python::attach(|py| -> PyResult<()> {
                     py.check_signals()?;
-                    cb.call1(py, (step, 0usize))?;
+                    cb.call1(py, (step, step_max))?;
                     Ok(())
                 })
                 .map_err(|e| e.to_string())?;
@@ -5320,26 +5747,9 @@ fn fit_stage1_path_dense_msgps(
         vec![0.0_f64; step_adj + 1]
     };
 
-    let tau2 = if n <= p {
-        let mean = y_centered.iter().sum::<f64>() / n as f64;
-        let mut ss = 0.0_f64;
-        for &v in &y_centered {
-            let d = v - mean;
-            ss += d * d;
-        }
-        ss / (n as f64 - 1.0_f64).max(1.0_f64)
-    } else {
-        let resid_ols = DVector::<f64>::from_column_slice(&y_centered)
-            - (&x_std * DVector::<f64>::from_column_slice(&beta_ols));
-        resid_ols.dot(&resid_ols) / ((n - p).max(1) as f64)
-    }
-    .max(1e-12_f64);
-
-    let selection_criterion = algwas_stage1_select_criterion();
     let mut path = Vec::<AlgwasStage1PathPoint>::with_capacity(step_adj + 1);
     for step in 0..=step_adj {
-        let beta_step = reconstruct_msgps_beta(p, &betahat_index, step, delta_t);
-        let nnz = beta_step.iter().filter(|&&v| v != 0.0_f64).count();
+        let nnz = nnz_by_step.get(step).copied().unwrap_or(0usize);
         let bic = (n as f64) * (2.0_f64 * std::f64::consts::PI * tau2).ln()
             + (rss[step] / tau2)
             + (n as f64).ln() * df.get(step).copied().unwrap_or(0.0_f64);
@@ -5493,21 +5903,39 @@ fn compute_background_model(
     }
     let mut xtx = vec![0.0_f64; q * q];
     let mut xty = vec![0.0_f64; q];
-    for i in 0..n {
-        let row = &x_bg[i * q..(i + 1) * q];
-        let yi = y[i];
-        for a in 0..q {
-            let va = row[a];
-            xty[a] += va * yi;
-            for b in 0..=a {
-                xtx[a * q + b] += va * row[b];
-            }
-        }
-    }
-    for a in 0..q {
-        for b in 0..a {
-            xtx[b * q + a] = xtx[a * q + b];
-        }
+    unsafe {
+        cblas_dgemm_dispatch(
+            CBLAS_ROW_MAJOR,
+            CBLAS_TRANS,
+            CBLAS_NO_TRANS,
+            q as CblasInt,
+            q as CblasInt,
+            n as CblasInt,
+            1.0_f64,
+            x_bg.as_ptr(),
+            q as CblasInt,
+            x_bg.as_ptr(),
+            q as CblasInt,
+            0.0_f64,
+            xtx.as_mut_ptr(),
+            q as CblasInt,
+        );
+        cblas_dgemm_dispatch(
+            CBLAS_ROW_MAJOR,
+            CBLAS_TRANS,
+            CBLAS_NO_TRANS,
+            q as CblasInt,
+            1 as CblasInt,
+            n as CblasInt,
+            1.0_f64,
+            x_bg.as_ptr(),
+            q as CblasInt,
+            y.as_ptr(),
+            1 as CblasInt,
+            0.0_f64,
+            xty.as_mut_ptr(),
+            1 as CblasInt,
+        );
     }
     let ixx = pinv_xtx(&xtx, q)?;
     let mut beta = vec![0.0_f64; q];
@@ -5554,6 +5982,8 @@ fn write_stage2_tsv(
     progress_every: usize,
     pseudo_tsv: Option<&str>,
 ) -> Result<(usize, usize, usize), String> {
+    let stage2_timing = algwas_stage2_timing_enabled();
+    let stage2_t0 = stage2_timing.then(Instant::now);
     let n = y.len();
     let p_cov = if n == 0 { 0 } else { x_cov.len() / n };
     if x_cov.len() != n.saturating_mul(p_cov) {
@@ -5574,6 +6004,15 @@ fn write_stage2_tsv(
     }
     if sample_indices.len() != n {
         return Err("sample index length mismatch".to_string());
+    }
+    let m = row_indices.map(|v| v.len()).unwrap_or(row_flip.len());
+    if let Some(cb) = progress_callback.as_ref() {
+        Python::attach(|py| -> PyResult<()> {
+            py.check_signals()?;
+            cb.call1(py, (0usize, m))?;
+            Ok(())
+        })
+        .map_err(|e| e.to_string())?;
     }
     let mut x_bg = vec![0.0_f64; n * q_total];
     for i in 0..n {
@@ -5601,15 +6040,17 @@ fn write_stage2_tsv(
         }
     }
 
-    let mut bg_xty = vec![0.0_f64; q_total];
-    for i in 0..n {
-        let yi = y[i];
-        let row = &x_bg[i * q_total..(i + 1) * q_total];
-        for j in 0..q_total {
-            bg_xty[j] += row[j] * yi;
-        }
-    }
     let (bg_beta, bg_ixx, bg_rss, bg_df) = compute_background_model(y, &x_bg, n, q_total)?;
+    let mut y_resid = vec![0.0_f64; n];
+    for i in 0..n {
+        let row = &x_bg[i * q_total..(i + 1) * q_total];
+        y_resid[i] = y[i]
+            - row
+                .iter()
+                .zip(bg_beta.iter())
+                .map(|(x, b)| x * b)
+                .sum::<f64>();
+    }
     let mut bg_se = vec![f64::NAN; q_total];
     if bg_df > 0 && bg_rss.is_finite() {
         let ve = bg_rss / (bg_df as f64);
@@ -5653,6 +6094,7 @@ fn write_stage2_tsv(
     } else {
         progress_every.max(1)
     };
+    let stage2_rows = algwas_stage2_block_rows(step, n, q_total, 5usize);
     let writer = AsyncTsvWriter::with_config(
         out_tsv,
         b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\n",
@@ -5676,94 +6118,146 @@ fn write_stage2_tsv(
     };
 
     let row_stride = 5usize;
-    let mut out_block = vec![0.0_f64; step * row_stride];
-    let mut text_buf = String::with_capacity(step * 128);
-    let mut pseudo_text_buf = String::with_capacity(k.min(step).max(1) * 128);
+    let mut geno_block = vec![0.0_f64; stage2_rows * n];
+    let mut xs_block = vec![0.0_f64; stage2_rows * q_total];
+    let mut b21_block = vec![0.0_f64; stage2_rows * q_total];
+    let mut sy_block = vec![0.0_f64; stage2_rows];
+    let mut ss_block = vec![0.0_f64; stage2_rows];
+    let mut out_block = vec![0.0_f64; stage2_rows * row_stride];
+    let mut text_buf = String::with_capacity(stage2_rows * 128);
+    let mut pseudo_text_buf = String::with_capacity(k.min(stage2_rows).max(1) * 128);
     let mut written_rows = 0usize;
     let mut pseudo_rows = 0usize;
     let mut qtn_written = 0usize;
 
     let mut i = 0usize;
-    while i < row_indices.map(|v| v.len()).unwrap_or(row_flip.len()) {
-        let m = row_indices.map(|v| v.len()).unwrap_or(row_flip.len());
-        let cnt = std::cmp::min(step, m - i);
+    while i < m {
+        let cnt = std::cmp::min(stage2_rows, m - i);
         let block_slice = &mut out_block[..cnt * row_stride];
-        let mut runner = || {
+        let geno_slice = &mut geno_block[..cnt * n];
+        let sy_slice = &mut sy_block[..cnt];
+        let ss_slice = &mut ss_block[..cnt];
+        let mut decode_runner = || {
+            geno_slice
+                .par_chunks_mut(n)
+                .zip(sy_slice.par_iter_mut())
+                .zip(ss_slice.par_iter_mut())
+                .enumerate()
+                .for_each(|(l, ((geno_row, sy_out), ss_out))| {
+                    let idx = i + l;
+                    let src_row = row_indices.map(|v| v[idx]).unwrap_or(idx);
+                    let row = &packed_flat[src_row * bytes_per_snp..(src_row + 1) * bytes_per_snp];
+                    let flip = row_flip[idx];
+                    let mean_g = (2.0_f64 * row_maf[idx] as f64).max(0.0_f64);
+                    let mut sy_resid = 0.0_f64;
+                    let mut ss = 0.0_f64;
+                    for (sample_local, &sidx) in sample_indices.iter().enumerate() {
+                        let b = row[sidx >> 2];
+                        let code = (b >> ((sidx & 3) * 2)) & 0b11;
+                        let mut gv = match decode_plink_bed_hardcall(code) {
+                            Some(v) => v,
+                            None => mean_g,
+                        };
+                        if flip && code != 0b01 {
+                            gv = 2.0_f64 - gv;
+                        }
+                        geno_row[sample_local] = gv;
+                        sy_resid += gv * y_resid[sample_local];
+                        ss += gv * gv;
+                    }
+                    *sy_out = sy_resid;
+                    *ss_out = ss;
+                });
+        };
+        if let Some(p) = &pool {
+            p.install(decode_runner);
+        } else {
+            decode_runner();
+        }
+
+        let xs_slice = &mut xs_block[..cnt * q_total];
+        let b21_slice = &mut b21_block[..cnt * q_total];
+        unsafe {
+            cblas_dgemm_dispatch(
+                CBLAS_ROW_MAJOR,
+                CBLAS_NO_TRANS,
+                CBLAS_NO_TRANS,
+                cnt as CblasInt,
+                q_total as CblasInt,
+                n as CblasInt,
+                1.0_f64,
+                geno_slice.as_ptr(),
+                n as CblasInt,
+                x_bg.as_ptr(),
+                q_total as CblasInt,
+                0.0_f64,
+                xs_slice.as_mut_ptr(),
+                q_total as CblasInt,
+            );
+            cblas_dgemm_dispatch(
+                CBLAS_ROW_MAJOR,
+                CBLAS_NO_TRANS,
+                CBLAS_NO_TRANS,
+                cnt as CblasInt,
+                q_total as CblasInt,
+                q_total as CblasInt,
+                1.0_f64,
+                xs_slice.as_ptr(),
+                q_total as CblasInt,
+                bg_ixx.as_ptr(),
+                q_total as CblasInt,
+                0.0_f64,
+                b21_slice.as_mut_ptr(),
+                q_total as CblasInt,
+            );
+        }
+
+        let mut stat_runner = || {
             block_slice
                 .par_chunks_mut(row_stride)
                 .enumerate()
-                .for_each_init(
-                    || GlmScratch::new(q_total),
-                    |scr, (l, row_out)| {
-                        let idx = i + l;
-                        let src_row = row_indices.map(|v| v[idx]).unwrap_or(idx);
-                        let row =
-                            &packed_flat[src_row * bytes_per_snp..(src_row + 1) * bytes_per_snp];
-                        let flip = row_flip[idx];
-                        let mean_g = (2.0_f64 * row_maf[idx] as f64).max(0.0_f64);
-                        scr.reset_xs();
-                        let mut sy = 0.0_f64;
-                        let mut ss = 0.0_f64;
-                        for (k, &sidx) in sample_indices.iter().enumerate() {
-                            let b = row[sidx >> 2];
-                            let code = (b >> ((sidx & 3) * 2)) & 0b11;
-                            let mut gv = match decode_plink_bed_hardcall(code) {
-                                Some(v) => v,
-                                None => mean_g,
-                            };
-                            if flip && code != 0b01 {
-                                gv = 2.0_f64 - gv;
-                            }
-                            sy += gv * y[k];
-                            ss += gv * gv;
-                            let xrow = &x_bg[k * q_total..(k + 1) * q_total];
-                            for j in 0..q_total {
-                                scr.xs[j] += xrow[j] * gv;
-                            }
-                        }
-                        xs_t_ixx_into(&scr.xs, &bg_ixx, q_total, &mut scr.b21);
-                        let t2 = dot_f64(&scr.b21, &scr.xs);
-                        let b22 = ss - t2;
-                        let (invb22, df) = if b22 < 1e-8_f64 {
-                            (0.0_f64, bg_df)
-                        } else {
-                            (1.0_f64 / b22, bg_df - 1)
-                        };
-                        if df <= 0 {
-                            row_out.fill(f64::NAN);
-                            return;
-                        }
-                        build_ixxs_into(&bg_ixx, &scr.b21, invb22, q_total, &mut scr.ixxs);
-                        scr.rhs[..q_total].copy_from_slice(&bg_xty);
-                        scr.rhs[q_total] = sy;
-                        matvec_row_major(&scr.ixxs, q_total + 1, &scr.rhs, &mut scr.beta);
-                        let beta_rhs = dot_f64(&scr.beta, &scr.rhs);
-                        let ve = (y.iter().map(|v| v * v).sum::<f64>() - beta_rhs) / (df as f64);
-                        let beta_snp = scr.beta[q_total];
-                        let se_snp = (scr.ixxs[q_total * (q_total + 1) + q_total] * ve).sqrt();
-                        if invb22 == 0.0
-                            || !beta_snp.is_finite()
-                            || !se_snp.is_finite()
-                            || se_snp <= 0.0
-                        {
-                            row_out.fill(f64::NAN);
-                            return;
-                        }
-                        let t = beta_snp / se_snp;
-                        let pwald = student_t_p_two_sided(t, df);
-                        let stat = chi2_stat_df1_from_sf(pwald);
-                        row_out[0] = beta_snp;
-                        row_out[1] = se_snp;
-                        row_out[2] = stat;
-                        row_out[3] = pwald;
-                        row_out[4] = f64::NAN;
-                    },
-                );
+                .for_each(|(l, row_out)| {
+                    let idx = i + l;
+                    if qtn_lookup.contains_key(&idx) {
+                        row_out.fill(f64::NAN);
+                        return;
+                    }
+                    let xs = &xs_slice[l * q_total..(l + 1) * q_total];
+                    let b21 = &b21_slice[l * q_total..(l + 1) * q_total];
+                    let t2 = dot_f64(b21, xs);
+                    let b22 = ss_slice[l] - t2;
+                    let df = bg_df - 1;
+                    if b22 <= 1e-8_f64 || df <= 0 {
+                        row_out.fill(f64::NAN);
+                        return;
+                    }
+                    let sy_resid = sy_slice[l];
+                    let beta_snp = sy_resid / b22;
+                    let rss_full = (bg_rss - (sy_resid * sy_resid / b22)).max(0.0_f64);
+                    let ve = rss_full / (df as f64);
+                    let se_snp = (ve / b22).sqrt();
+                    if !ve.is_finite()
+                        || !beta_snp.is_finite()
+                        || !se_snp.is_finite()
+                        || se_snp <= 0.0
+                    {
+                        row_out.fill(f64::NAN);
+                        return;
+                    }
+                    let t = beta_snp / se_snp;
+                    let pwald = student_t_p_two_sided(t, df);
+                    let stat = chi2_stat_df1_from_sf(pwald);
+                    row_out[0] = beta_snp;
+                    row_out[1] = se_snp;
+                    row_out[2] = stat;
+                    row_out[3] = pwald;
+                    row_out[4] = f64::NAN;
+                });
         };
         if let Some(p) = &pool {
-            p.install(runner);
+            p.install(stat_runner);
         } else {
-            runner();
+            stat_runner();
         }
 
         text_buf.clear();
@@ -5837,7 +6331,7 @@ fn write_stage2_tsv(
         written_rows += cnt;
         if let Some(cb) = progress_callback.as_ref() {
             let done = written_rows;
-            if done % progress_block == 0 || done == m {
+            if done % progress_block == 0 || done == m || cnt < step {
                 Python::attach(|py| -> PyResult<()> {
                     py.check_signals()?;
                     cb.call1(py, (done, m))?;
@@ -5853,61 +6347,18 @@ fn write_stage2_tsv(
         pw.finish()?;
         pseudo_rows = qtn_written;
     }
+    if let Some(t0) = stage2_t0 {
+        eprintln!(
+            "ALGWAS stage2 timing: total={:.3}s rows={} q_bg={} selected_qtn={} block_rows={} block_mb={}",
+            t0.elapsed().as_secs_f64(),
+            m,
+            q_total,
+            k,
+            stage2_rows,
+            std::env::var("JX_ALGWAS_STAGE2_BLOCK_MB").unwrap_or_else(|_| "128".to_string())
+        );
+    }
     Ok((k, pseudo_rows, written_rows))
-}
-
-#[derive(Clone, Debug)]
-struct GlmScratch {
-    xs: Vec<f64>,
-    b21: Vec<f64>,
-    rhs: Vec<f64>,
-    beta: Vec<f64>,
-    ixxs: Vec<f64>,
-}
-
-impl GlmScratch {
-    fn new(q0: usize) -> Self {
-        let dim = q0 + 1;
-        Self {
-            xs: vec![0.0_f64; q0],
-            b21: vec![0.0_f64; q0],
-            rhs: vec![0.0_f64; dim],
-            beta: vec![0.0_f64; dim],
-            ixxs: vec![0.0_f64; dim * dim],
-        }
-    }
-
-    #[inline]
-    fn reset_xs(&mut self) {
-        self.xs.fill(0.0_f64);
-    }
-}
-
-#[inline]
-fn xs_t_ixx_into(xs: &[f64], ixx: &[f64], q0: usize, out_b21: &mut [f64]) {
-    for j in 0..q0 {
-        let mut acc = 0.0_f64;
-        for k in 0..q0 {
-            acc += xs[k] * ixx[k * q0 + j];
-        }
-        out_b21[j] = acc;
-    }
-}
-
-#[inline]
-fn build_ixxs_into(ixx: &[f64], b21: &[f64], invb22: f64, q0: usize, out_ixxs: &mut [f64]) {
-    let dim = q0 + 1;
-    for r in 0..q0 {
-        for c in 0..q0 {
-            out_ixxs[r * dim + c] = ixx[r * q0 + c] + invb22 * (b21[r] * b21[c]);
-        }
-    }
-    out_ixxs[q0 * dim + q0] = invb22;
-    for j in 0..q0 {
-        let v = -invb22 * b21[j];
-        out_ixxs[q0 * dim + j] = v;
-        out_ixxs[j * dim + q0] = v;
-    }
 }
 
 #[inline]
@@ -6490,7 +6941,7 @@ mod tests {
     fn algwas_stage1_auto_mode_switches_by_scale() {
         assert_eq!(
             algwas_stage1_mode_from_raw(None),
-            AlgwasStage1Mode::StreamActive
+            AlgwasStage1Mode::PackedExactMsgps
         );
         assert_eq!(
             algwas_stage1_mode_from_raw(Some("auto")),

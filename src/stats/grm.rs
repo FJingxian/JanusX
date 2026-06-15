@@ -503,6 +503,8 @@ where
             grm.set_len(n * n);
         }
         let varsum_ret = if method == 1 { varsum_acc } else { m as f64 };
+        drop(grm_tmp);
+        drop(block);
         let grm_f32: Vec<f32> = grm.into_iter().map(|v| v as f32).collect();
         return Ok((grm_f32, row_sum_all, varsum_ret));
     }
@@ -688,6 +690,7 @@ where
         grm.set_len(n * n);
     }
     let varsum_ret = if method == 1 { varsum_acc } else { m as f64 };
+    drop(grm_tmp);
     let grm_f32: Vec<f32> = grm.into_iter().map(|v| v as f32).collect();
     Ok((grm_f32, row_sum_all, varsum_ret))
 }
@@ -3770,6 +3773,11 @@ blas_threads={}, overlap={}, accum={}",
                     grm_accum_mode_name(accum_mode_runtime),
                 );
             }
+            drop(grm_tmp);
+            drop(block_a);
+            drop(block_b);
+            drop(varsum_a);
+            drop(varsum_b);
             let grm_f32: Vec<f32> = grm.into_iter().map(|v| v as f32).collect();
             Ok(grm_f32)
         })
@@ -5637,6 +5645,10 @@ threads_total={}, decode_threads={}, blas_threads={}, overlap={}, par_decode={},
                 &mut last_notified,
                 true,
             )?;
+            drop(grm_tmp);
+            drop(block_a);
+            drop(block_b);
+            drop(prestats);
             let grm_f32: Vec<f32> = grm.into_iter().map(|v| v as f32).collect();
             Ok((grm_f32, eff_m))
         })

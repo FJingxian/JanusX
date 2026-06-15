@@ -1859,6 +1859,7 @@ fn write_plink_subset_filtered_packed(
     max_missing_rate: f32,
     apply_het_filter: bool,
     het_threshold: f32,
+    max_output_sites: Option<usize>,
     progress_callback: Option<&Py<PyAny>>,
     progress_every: usize,
 ) -> Result<usize, String> {
@@ -1955,6 +1956,7 @@ fn write_plink_subset_filtered_packed(
     };
 
     let mut kept = 0usize;
+    let mut written = 0usize;
     let mut out_row = vec![0u8; out_bytes_per_snp];
     let total_selected = selected_snp_indices.len();
     let notify_step = if progress_every == 0 {
@@ -2072,39 +2074,46 @@ fn write_plink_subset_filtered_packed(
                 if !keep {
                     continue;
                 }
+                kept = kept.saturating_add(1);
                 let site = &sites[snp_idx];
-                write_bim_site_line_with_flip(&mut wbim, site, flip)?;
+                let write_this = max_output_sites.map(|lim| written < lim).unwrap_or(true);
+                if write_this {
+                    write_bim_site_line_with_flip(&mut wbim, site, flip)?;
 
-                if !flip {
-                    if tail_pairs == 0 {
-                        if full_identity {
-                            wbed.write_all(row).map_err(|e| format!("{out_bed}: {e}"))?;
+                    if !flip {
+                        if tail_pairs == 0 {
+                            if full_identity {
+                                wbed.write_all(row).map_err(|e| format!("{out_bed}: {e}"))?;
+                            } else {
+                                wbed.write_all(&row[..out_bytes_per_snp])
+                                    .map_err(|e| format!("{out_bed}: {e}"))?;
+                            }
                         } else {
-                            wbed.write_all(&row[..out_bytes_per_snp])
+                            if full_bytes_out > 0 {
+                                wbed.write_all(&row[..full_bytes_out])
+                                    .map_err(|e| format!("{out_bed}: {e}"))?;
+                            }
+                            let last = row[full_bytes_out] & tail_mask;
+                            wbed.write_all(&[last])
                                 .map_err(|e| format!("{out_bed}: {e}"))?;
                         }
                     } else {
                         if full_bytes_out > 0 {
-                            wbed.write_all(&row[..full_bytes_out])
+                            flip_bed_bytes_into(
+                                &row[..full_bytes_out],
+                                &mut out_row[..full_bytes_out],
+                            );
+                            wbed.write_all(&out_row[..full_bytes_out])
                                 .map_err(|e| format!("{out_bed}: {e}"))?;
                         }
-                        let last = row[full_bytes_out] & tail_mask;
-                        wbed.write_all(&[last])
-                            .map_err(|e| format!("{out_bed}: {e}"))?;
+                        if tail_pairs > 0 {
+                            let last = flip_bed_byte_fast(row[full_bytes_out]) & tail_mask;
+                            wbed.write_all(&[last])
+                                .map_err(|e| format!("{out_bed}: {e}"))?;
+                        }
                     }
-                } else {
-                    if full_bytes_out > 0 {
-                        flip_bed_bytes_into(&row[..full_bytes_out], &mut out_row[..full_bytes_out]);
-                        wbed.write_all(&out_row[..full_bytes_out])
-                            .map_err(|e| format!("{out_bed}: {e}"))?;
-                    }
-                    if tail_pairs > 0 {
-                        let last = flip_bed_byte_fast(row[full_bytes_out]) & tail_mask;
-                        wbed.write_all(&[last])
-                            .map_err(|e| format!("{out_bed}: {e}"))?;
-                    }
+                    written = written.saturating_add(1);
                 }
-                kept = kept.saturating_add(1);
             }
             processed = processed.saturating_add(rows_n);
             notify_progress(processed)?;
@@ -2228,6 +2237,11 @@ fn write_plink_subset_filtered_packed(
                     if !keep {
                         continue;
                     }
+                    kept = kept.saturating_add(1);
+                    let write_this = max_output_sites.map(|lim| written < lim).unwrap_or(true);
+                    if !write_this {
+                        continue;
+                    }
                     let site = &sites[snp_idx];
                     write_bim_site_line_with_flip(&mut wbim, site, flip)?;
 
@@ -2245,7 +2259,7 @@ fn write_plink_subset_filtered_packed(
                     }
                     wbed.write_all(&collapsed)
                         .map_err(|e| format!("{out_bed}: {e}"))?;
-                    kept = kept.saturating_add(1);
+                    written = written.saturating_add(1);
                 }
                 processed = processed.saturating_add(rows_n);
                 notify_progress(processed)?;
@@ -2361,6 +2375,13 @@ fn write_plink_subset_filtered_packed(
                 continue;
             }
 
+            kept = kept.saturating_add(1);
+            let write_this = max_output_sites.map(|lim| written < lim).unwrap_or(true);
+            if !write_this {
+                notify_progress(processed)?;
+                continue;
+            }
+
             let site = &sites[snp_idx];
             write_bim_site_line_with_flip(&mut wbim, site, flip)?;
 
@@ -2388,7 +2409,7 @@ fn write_plink_subset_filtered_packed(
             }
             wbed.write_all(&out_row)
                 .map_err(|e| format!("{out_bed}: {e}"))?;
-            kept = kept.saturating_add(1);
+            written = written.saturating_add(1);
             notify_progress(processed)?;
         }
     }
@@ -2799,6 +2820,7 @@ pub fn bed_mmap_filter_to_plink_rust(
     ranges=None,
     progress_callback=None,
     progress_every=0,
+    max_output_sites=None,
 ))]
 pub fn bed_filter_to_plink_rust(
     py: Python<'_>,
@@ -2818,6 +2840,7 @@ pub fn bed_filter_to_plink_rust(
     ranges: Option<Vec<(String, i32, i32)>>,
     progress_callback: Option<Py<PyAny>>,
     progress_every: usize,
+    max_output_sites: Option<usize>,
 ) -> PyResult<(usize, usize, usize)> {
     let src = normalize_plink_prefix_local(&src_prefix);
     let out = normalize_plink_prefix_local(&out_prefix);
@@ -2892,6 +2915,7 @@ pub fn bed_filter_to_plink_rust(
                 max_missing_rate,
                 apply_het_filter,
                 het,
+                max_output_sites,
                 progress_callback.as_ref(),
                 progress_every,
             )?;

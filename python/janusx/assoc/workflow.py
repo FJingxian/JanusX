@@ -18,8 +18,7 @@ Execution mode (automatic)
   - No explicit "low-memory" flag is required.
   - Default: LM/LMM/FastLMM run in memmap BED mode.
   - Packed BED preload is reserved for FarmCPU and ALGWAS.
-  - LM/LMM/FastLMM/FvLMM/SparseLMM stay on memmap / streaming BED routes even
-    when `-fast` is present.
+  - LM/LMM/FastLMM/FvLMM/SparseLMM stay on memmap / streaming BED routes.
   - FarmCPU always runs on the full in-memory genotype matrix.
 
 Caching
@@ -351,14 +350,11 @@ def _format_gwas_models_executed(args) -> str:
     return ", ".join(models) if len(models) > 0 else "None"
 
 
-def _format_gwas_fast_mode_status(
+def _format_gwas_packed_route_status(
     *,
-    explicit_fast_mode: bool,
     farmcpu_auto_fast: bool,
     algwas_auto_fast: bool,
 ) -> str:
-    if bool(explicit_fast_mode):
-        return "Enabled (CLI)"
     auto_tags: list[str] = []
     if bool(farmcpu_auto_fast):
         auto_tags.append("FarmCPU Auto-selected")
@@ -431,7 +427,10 @@ def _format_gwas_sparse_status(
         return f"Requested (cutoff={cutoff_text})"
     source = str(sparse_source).strip()
     src_label = "Reused" if source not in {"", "1", "2"} else "Prepared"
-    cutoff_text = "" if sparse_cutoff is None else f" | cutoff={float(sparse_cutoff):g}"
+    if src_label == "Reused":
+        cutoff_text = " | cutoff=precomputed"
+    else:
+        cutoff_text = "" if sparse_cutoff is None else f" | cutoff={float(sparse_cutoff):g}"
     return f"{src_label} ({_display_path(str(sparse_grm_path))}{cutoff_text})"
 
 
@@ -643,32 +642,6 @@ def _chi2_sf_df1_vec(stat: np.ndarray) -> np.ndarray:
         p = np.fromiter((math.erfc(float(v)) for v in np.asarray(z, dtype=np.float64)), dtype=np.float64)
     out[ok] = np.clip(p, np.finfo(np.float64).tiny, 1.0)
     return out
-
-def _gwas_use_packed_fullrust_routes() -> bool:
-    """
-    Whether optional packed single-entry full-rust routes are enabled.
-
-    Currently used for LMM/FastLMM packed route gating. LM packed route is
-    enabled automatically for PLINK BED additive scans when available.
-    """
-    raw = str(os.environ.get("JX_GWAS_USE_PACKED_FULLRUST", "")).strip().lower()
-    return raw in {"1", "true", "yes", "y", "on"}
-
-
-def _gwas_use_packed_fastlmm_scan() -> bool:
-    """
-    Whether to use packed full-rust FastLMM scan in `-fast` mode.
-
-    Default is True so `-fast` follows the packed path. Set
-    `JX_GWAS_USE_PACKED_FASTLMM_SCAN=0` to force streaming prepared-chunk scan.
-    """
-    raw = str(os.environ.get("JX_GWAS_USE_PACKED_FASTLMM_SCAN", "")).strip().lower()
-    if raw == "":
-        return True
-    if raw in {"0", "false", "no", "n", "off"}:
-        return False
-    return raw in {"1", "true", "yes", "y", "on"}
-
 
 def _gwas_use_packed_grm_build() -> bool:
     """
@@ -1809,12 +1782,14 @@ def _detect_cache_need(
     maf: float = 0.02,
     max_missing_rate: float = 0.05,
     het_threshold: float = 0.01,
+    force_kind: Optional[str] = None,
 ) -> tuple[bool, str, list[str]]:
     """
     Detect whether genotype cache build is expected before inspect/load.
     """
     low = str(genofile).lower()
-    if low.endswith(".vcf.gz") or low.endswith(".vcf"):
+    kind_forced = str(force_kind or "").strip().lower()
+    if kind_forced == "vcf" or low.endswith(".vcf.gz") or low.endswith(".vcf"):
         cprefix = _cache_prefix_tilde(
             genofile,
             snps_only=snps_only,
@@ -1831,7 +1806,7 @@ def _detect_cache_need(
             stale = cache_mtime < src_mtime
         return (not all_exist) or stale, "vcf", targets
 
-    if low.endswith(".hmp.gz") or low.endswith(".hmp"):
+    if kind_forced == "hmp" or low.endswith(".hmp.gz") or low.endswith(".hmp"):
         # HMP caching currently uses the non-parameterized PLINK cache prefix (~base)
         # from gfreader's source-cache path.
         cprefix = f"{genotype_cache_prefix(genofile, snps_only=bool(snps_only))}.snp{1 if bool(snps_only) else 0}"
@@ -1908,6 +1883,7 @@ def _inspect_genotype_file_with_warnings(
     maf_threshold: float = 0.02,
     max_missing_rate: float = 0.05,
     het_threshold: float = 0.01,
+    force_kind: Optional[str] = None,
 ) -> tuple[np.ndarray, int, list[str]]:
     """
     Run inspect_genotype_file and capture warning messages.
@@ -1921,6 +1897,7 @@ def _inspect_genotype_file_with_warnings(
             maf=float(maf_threshold),
             missing_rate=float(max_missing_rate),
             het=float(het_threshold),
+            force_kind=force_kind,
         )
     warn_msgs: list[str] = []
     for w in caught:
@@ -1943,6 +1920,7 @@ def _inspect_genotype_with_status(
     max_missing_rate: float = 0.05,
     het_threshold: float = 0.01,
     warning_collector: Union[list[str], None] = None,
+    force_kind: Optional[str] = None,
 ) -> tuple[np.ndarray, int]:
     """
     Inspect genotype metadata with optional cache-status spinner.
@@ -1954,6 +1932,7 @@ def _inspect_genotype_with_status(
         maf=float(maf_threshold),
         max_missing_rate=float(max_missing_rate),
         het_threshold=float(het_threshold),
+        force_kind=force_kind,
     )
     status_enabled = bool(use_spinner)
     plain_progress = (not status_enabled) and (cache_kind in {"vcf", "hmp", "txt"})
@@ -1977,6 +1956,7 @@ def _inspect_genotype_with_status(
                     maf=float(maf_threshold),
                     missing_rate=float(max_missing_rate),
                     het=float(het_threshold),
+                    force_kind=force_kind,
                 )
             except Exception:
                 task.fail(f"Loading genotype from {src} ...Failed")
@@ -2031,6 +2011,7 @@ def _inspect_genotype_with_status(
                     float(maf_threshold),
                     float(max_missing_rate),
                     float(het_threshold),
+                    force_kind,
                 )
             except Exception:
                 use_subproc = False
@@ -2046,6 +2027,7 @@ def _inspect_genotype_with_status(
                         float(maf_threshold),
                         float(max_missing_rate),
                         float(het_threshold),
+                        force_kind,
                     )
                     out["value"] = (np.asarray(ids0, dtype=str), int(ns0))
                     warn_msgs.extend(warns0)
@@ -3063,6 +3045,7 @@ def prepare_streaming_context(
     preload_packed_context: bool = False,
     require_bed_stream: bool = False,
     post_grm_hook: Optional[Callable[[str, Optional[str]], None]] = None,
+    force_kind: Optional[str] = None,
 ):
     """
     Prepare all shared resources for streaming LMM/LM once:
@@ -3091,6 +3074,7 @@ def prepare_streaming_context(
             max_missing_rate=float(max_missing_rate),
             het_threshold=float(het_threshold),
             warning_collector=deferred_cache_warnings,
+            force_kind=force_kind,
         )
         for w in caught:
             try:
@@ -3134,7 +3118,7 @@ def prepare_streaming_context(
     if genofile_low.endswith(".vcf") or genofile_low.endswith(".vcf.gz"):
         # VCF caches are parameterized by maf/missing/snps_only in gfreader.
         cache_candidates.append(str(cache_prefix))
-    elif genofile_low.endswith(".hmp") or genofile_low.endswith(".hmp.gz"):
+    elif str(force_kind or "").strip().lower() == "hmp" or genofile_low.endswith(".hmp") or genofile_low.endswith(".hmp.gz"):
         # HMP source-cache path currently uses non-parameterized '~base' prefix.
         cache_candidates.append(
             genotype_cache_prefix(
@@ -3166,6 +3150,7 @@ def prepare_streaming_context(
                     snps_only=bool(snps_only),
                     delimiter=delim,
                     prefer_plink_for_txt=True,
+                    force_kind=force_kind,
                 )
             )
             cached_prefix = _as_plink_prefix(cached_cli)
@@ -4835,7 +4820,7 @@ def _run_file_dense_fast_once(
                 out0.append(f"{hom0}/{hom1}")
                 out1.append(het)
             else:
-                raise ValueError(f"Unsupported genetic model for dense FILE fast route: {model}")
+                raise ValueError(f"Unsupported genetic model for dense FILE packed route: {model}")
         return out0, out1
 
     process = psutil.Process()
@@ -4845,7 +4830,7 @@ def _run_file_dense_fast_once(
         _log_file_only(
             logger,
             logging.INFO,
-            "FILE fast mode: preparing shared dense genotype cache once for LM/LMM/FastLMM/FvLMM/FarmCPU.",
+            "FILE packed route: preparing shared dense genotype cache once for LM/LMM/FastLMM/FvLMM/FarmCPU.",
         )
     farmcpu_cache_runtime = run_farmcpu_fullmem(
         args=args,
@@ -4873,21 +4858,21 @@ def _run_file_dense_fast_once(
 
     pheno_obj = farmcpu_cache_runtime.get("pheno")
     if not isinstance(pheno_obj, pd.DataFrame):
-        raise RuntimeError("FarmCPU cache missing phenotype dataframe in FILE fast mode.")
+        raise RuntimeError("FarmCPU cache missing phenotype dataframe in FILE packed route.")
     pheno = pheno_obj
     ids = np.asarray(farmcpu_cache_runtime.get("famid"), dtype=str).reshape(-1)
     if int(ids.shape[0]) == 0:
-        raise RuntimeError("FarmCPU cache has zero genotype samples in FILE fast mode.")
+        raise RuntimeError("FarmCPU cache has zero genotype samples in FILE packed route.")
 
     geno_obj = farmcpu_cache_runtime.get("geno")
     if geno_obj is None:
         raise RuntimeError(
-            "FILE fast mode expects dense genotype matrix in FarmCPU cache, got None."
+            "FILE packed route expects dense genotype matrix in FarmCPU cache, got None."
         )
     geno = np.ascontiguousarray(np.asarray(geno_obj, dtype=np.float32))
     if geno.ndim != 2:
         raise RuntimeError(
-            f"Dense FILE fast genotype must be 2D, got ndim={geno.ndim}."
+            f"Dense FILE packed genotype must be 2D, got ndim={geno.ndim}."
         )
     if int(geno.shape[1]) != int(ids.shape[0]):
         raise RuntimeError(
@@ -5512,6 +5497,35 @@ def parse_args(argv: Optional[list[str]] = None):
             "Examples: -c cov.tsv -c 1:1000 -c 1:1000:1000."
         ),
     )
+    qtn_group = optional_group.add_mutually_exclusive_group(required=False)
+    qtn_group.add_argument(
+        "-qvcf", "--qtn-vcf", type=str, default=None,
+        help=(
+            "Optional QTN-search genotype VCF for FarmCPU/ALGWAS stage1. "
+            "Ignored by other models."
+        ),
+    )
+    qtn_group.add_argument(
+        "-qhmp", "--qtn-hmp", type=str, default=None,
+        help=(
+            "Optional QTN-search genotype HMP for FarmCPU/ALGWAS stage1. "
+            "Ignored by other models; parsed as HMP regardless of suffix."
+        ),
+    )
+    qtn_group.add_argument(
+        "-qbfile", "--qtn-bfile", type=str, default=None,
+        help=(
+            "Optional QTN-search PLINK BED prefix for FarmCPU/ALGWAS stage1. "
+            "Ignored by other models."
+        ),
+    )
+    qtn_group.add_argument(
+        "-qfile", "--qtn-file", type=str, default=None,
+        help=(
+            "Optional QTN-search numeric FILE matrix for FarmCPU/ALGWAS stage1. "
+            "Ignored by other models."
+        ),
+    )
     optional_group.add_argument(
         "-snps-only", "--snps-only", "-only-snps", "--only-snps", action="store_true", default=False,
         help="Exclude non-SNP variants.",
@@ -5568,17 +5582,17 @@ def parse_args(argv: Optional[list[str]] = None):
         ),
     )
     optional_group.add_argument(
+        "-farmcpu-raw", "--farmcpu-raw", action="store_true", default=False,
+        help=(
+            "Use the legacy FarmCPU REM/SUPER stage-1 selector instead of the default unified FEM selector."
+            if show_dev_help else argparse.SUPPRESS
+        ),
+    )
+    optional_group.add_argument(
         "-memory", "--memory", type=float, default=DEFAULT_BED_MEMORY_MB,
         help=(
             "Target decode working-set size in MB for BED memmap/packed kernels "
             "(affects GRM, GWAS scan blocks, and RSVD; default: %(default)s)."
-        ),
-    )
-    optional_group.add_argument(
-        "-fast", "--fast", action="store_true", default=False,
-        help=(
-            "Use packed full-rust paths when available (loads BED-packed genotype once "
-            "and reuses it across LM/LMM/LMM2/FvLMM/SparseLMM/ALGWAS/FarmCPU)."
         ),
     )
     optional_group.add_argument(
@@ -5605,6 +5619,10 @@ def parse_args(argv: Optional[list[str]] = None):
         help="Show advanced diagnostics and configuration details at the end of the report.",
     )
 
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    if any(str(tok) in {"-fast", "--fast"} for tok in raw_argv):
+        parser.error("unrecognized arguments: -fast/--fast (removed; use model-specific routes)")
+
     args, extras = parser.parse_known_args(argv)
     has_genotype = bool(args.vcf or args.hmp or args.file or args.bfile)
     has_pheno = bool(args.pheno)
@@ -5630,6 +5648,8 @@ def parse_args(argv: Optional[list[str]] = None):
         args.qcov = str(_parse_qcov_dim(args.qcov))
     except ValueError as e:
         parser.error(str(e))
+    if bool(getattr(args, "farmcpu_raw", False)):
+        args.farmcpu = True
     if int(args.farmcpu_iter) < 1:
         parser.error("--farmcpu-iter must be >= 1.")
     if not np.isfinite(float(args.farmcpu_threshold)) or float(args.farmcpu_threshold) <= 0:
@@ -5669,6 +5689,85 @@ def parse_args(argv: Optional[list[str]] = None):
     args.mmap_limit = False
     args.chunksize = 10_000
     return args
+
+
+def _qtn_source_from_args(args) -> Optional[tuple[str, str, Optional[str]]]:
+    if getattr(args, "qtn_vcf", None):
+        return "vcf", str(args.qtn_vcf), "vcf"
+    if getattr(args, "qtn_hmp", None):
+        return "hmp", str(args.qtn_hmp), "hmp"
+    if getattr(args, "qtn_bfile", None):
+        return "bfile", str(args.qtn_bfile), None
+    if getattr(args, "qtn_file", None):
+        return "file", str(args.qtn_file), None
+    return None
+
+
+def _prepare_qtn_packed_preload(
+    args,
+    *,
+    logger: logging.Logger,
+    use_spinner: bool,
+) -> Optional[dict[str, object]]:
+    src = _qtn_source_from_args(args)
+    if src is None:
+        return None
+    if not (bool(getattr(args, "farmcpu", False)) or bool(getattr(args, "algwas", False))):
+        return None
+    kind, path, force_kind = src
+    if kind == "bfile":
+        prefix = _as_plink_prefix(path)
+        if prefix is None:
+            raise ValueError(f"QTN PLINK prefix is invalid or incomplete: {path}")
+    else:
+        prefix = _as_plink_prefix(
+            prepare_cli_input_cache(
+                path,
+                snps_only=bool(getattr(args, "snps_only", False)),
+                delimiter=("," if str(path).lower().endswith(".csv") else None),
+                prefer_plink_for_txt=True,
+                force_kind=force_kind,
+            )
+        )
+        if prefix is None:
+            raise ValueError(f"Unable to materialize QTN input as PLINK BED: {path}")
+    with CliStatus(
+        "Loading QTN genotype (Full packed)...",
+        enabled=bool(use_spinner),
+        use_process=True,
+    ) as task:
+        try:
+            full_ids, packed_ctx = prepare_packed_ctx_from_plink(
+                str(prefix),
+                maf=float(getattr(args, "maf", 0.02)),
+                missing_rate=float(getattr(args, "geno", 0.05)),
+                snps_only=bool(getattr(args, "snps_only", False)),
+                expected_n_samples=None,
+                filter_mode="lazy_owned",
+            )
+        except Exception:
+            task.fail("Loading QTN genotype (Full packed) ...Failed")
+            raise
+        row_idx = packed_ctx.get("row_indices", packed_ctx.get("active_row_idx"))
+        if row_idx is None:
+            site_keep = packed_ctx.get("site_keep")
+            row_idx = np.flatnonzero(np.asarray(site_keep, dtype=np.bool_).reshape(-1)) if site_keep is not None else []
+        n_active = int(np.asarray(row_idx, dtype=np.int64).reshape(-1).shape[0])
+        task.complete(
+            f"Loading QTN genotype (Full packed) ...Finished (n={len(full_ids)}, nSNP={n_active})"
+        )
+    _log_file_only(
+        logger,
+        logging.INFO,
+        f"QTN stage1 genotype source: {path} -> {prefix}",
+    )
+    return {
+        "kind": kind,
+        "source": path,
+        "prefix": str(prefix),
+        "full_ids": np.asarray(full_ids, dtype=str),
+        "packed_ctx": packed_ctx,
+    }
 
 
 def _run_gwas_pipeline(
@@ -5785,12 +5884,20 @@ def _run_gwas_pipeline(
     advanced_config_rows: list[tuple[str, object]] = []
     _, _file_matrix_path_cli = _resolve_file_input_matrix(gfile)
     input_is_file_matrix = bool(_file_matrix_path_cli is not None)
-    explicit_fast_mode = bool(getattr(args, "fast", False))
+    qtn_input_requested = _qtn_source_from_args(args) is not None
+    standard_stream_models_requested = bool(
+        args.lm
+        or args.lmm
+        or getattr(args, "lmm2", False)
+        or args.fastlmm
+        or args.fvlmm
+        or args.splmm
+    )
     farmcpu_auto_fast = bool(args.farmcpu)
     algwas_auto_fast = bool(args.algwas)
-    packed_model_routes_enabled = bool(args.farmcpu or args.algwas)
+    packed_model_routes_enabled = bool((args.farmcpu or args.algwas) and not qtn_input_requested)
     fast_mode = bool(
-        explicit_fast_mode or farmcpu_auto_fast or algwas_auto_fast
+        farmcpu_auto_fast or algwas_auto_fast
     )
     # FILE-input fast policy (2026-05): prefer Rust routes by materializing
     # PLINK cache then using packed/stream scans, instead of dense Python path.
@@ -5798,7 +5905,7 @@ def _run_gwas_pipeline(
     file_fast_dense_mode = False
 
     if log:
-        cli_fast_mode = bool(fast_mode)
+        packed_auto_mode = bool(fast_mode)
         if file_fast_rust_mode:
             bed_backend_policy = (
                 "mixed (memmap default; packed only for FarmCPU/ALGWAS; FILE->BED cache)"
@@ -5806,7 +5913,7 @@ def _run_gwas_pipeline(
         else:
             bed_backend_policy = (
                 "mixed (memmap default; packed only for FarmCPU/ALGWAS)"
-                if cli_fast_mode
+                if packed_auto_mode
                 else "memmap (default)"
             )
         cfg_rows: list[tuple[str, object]] = [
@@ -5814,7 +5921,7 @@ def _run_gwas_pipeline(
             ("Phenotype file", args.pheno),
             ("Phenotype cols", args.ncol if args.ncol is not None else "All"),
             ("BED backend", bed_backend_policy),
-            ("Fast mode", cli_fast_mode),
+            ("Packed auto route", packed_auto_mode),
             ("Models", _format_gwas_models_executed(args)),
             ("Genetic model", args.model),
             ("SNPs only", args.snps_only),
@@ -5824,6 +5931,9 @@ def _run_gwas_pipeline(
             ("Miss threshold", args.geno),
             ("Memory MB", args.memory),
         ]
+        if qtn_input_requested and (args.farmcpu or args.algwas):
+            _qtn_kind, _qtn_path, _ = _qtn_source_from_args(args) or ("", "", None)
+            cfg_rows.append(("QTN stage1 input", f"{_qtn_kind}:{_qtn_path}"))
         if float(args.het) > 0.0:
             cfg_rows.append(("Het filter", f"{float(args.het):g} (keep [{float(args.het):g}, {1.0 - float(args.het):g}])"))
         if args.farmcpu:
@@ -5834,6 +5944,7 @@ def _run_gwas_pipeline(
                     ("FarmCPU nbin", int(args.farmcpu_nbin)),
                     ("FarmCPU QTNbound", "auto" if args.farmcpu_qtn_bound is None else int(args.farmcpu_qtn_bound)),
                     ("FarmCPU szbin", ",".join(f"{float(x):g}" for x in args.farmcpu_bin_size)),
+                    ("FarmCPU stage1", "raw REM/SUPER" if bool(args.farmcpu_raw) else "unified FEM"),
                 ]
             )
         if args.cov:
@@ -5893,9 +6004,8 @@ def _run_gwas_pipeline(
         _emit_report_kv(report_logger, "Output Prefix", _display_path(str(outprefix)))
         _emit_report_kv(
             report_logger,
-            "Fast Mode",
-            _format_gwas_fast_mode_status(
-                explicit_fast_mode=bool(explicit_fast_mode),
+            "Packed Route",
+            _format_gwas_packed_route_status(
                 farmcpu_auto_fast=bool(farmcpu_auto_fast),
                 algwas_auto_fast=bool(algwas_auto_fast),
             ),
@@ -5932,6 +6042,7 @@ def _run_gwas_pipeline(
                     ("FarmCPU NBin", int(args.farmcpu_nbin)),
                     ("FarmCPU QTNbound", "auto" if args.farmcpu_qtn_bound is None else int(args.farmcpu_qtn_bound)),
                     ("FarmCPU SzBin", ",".join(f"{float(x):g}" for x in args.farmcpu_bin_size)),
+                    ("FarmCPU Stage1", "raw REM/SUPER" if bool(args.farmcpu_raw) else "unified FEM"),
                 ]
             )
 
@@ -5990,10 +6101,10 @@ def _run_gwas_pipeline(
     het_threshold_scan = float(args.het)
 
     input_is_bed = _as_plink_prefix(gfile) is not None
-    memmap_mode = not bool(fast_mode)
+    memmap_mode = bool(standard_stream_models_requested or (not bool(fast_mode)))
     mmap_limit_effective = bool(memmap_mode)
     _append_advanced_note(
-        "FILE fast backend policy: Rust packed/stream via PLINK cache."
+        "FILE packed backend policy: Rust packed/stream via PLINK cache."
         if file_fast_rust_mode
         else (
             "BED backend policy: mixed; memmap default, packed reserved for FarmCPU/ALGWAS."
@@ -6035,20 +6146,15 @@ def _run_gwas_pipeline(
         )
     if (not bool(fast_mode)) and bool(args.lmm or getattr(args, "lmm2", False) or args.fastlmm or args.fvlmm or qcov_needs_grm):
         _append_advanced_note(
-            "Non-fast GWAS: GRM uses memmap path by default (packed single-entry disabled)."
+            "Streaming GWAS: GRM uses memmap path by default (packed single-entry disabled)."
         )
     elif bool(args.lmm or getattr(args, "lmm2", False) or args.fastlmm or args.fvlmm or qcov_needs_grm):
         _append_advanced_note(
             "GWAS GRM auto route: memmap stays primary for full-sample builds; packed is "
             "reused only when a compatible preloaded packed payload is already available."
         )
-    if bool(args.farmcpu) and (not bool(explicit_fast_mode)):
-        if bool(farmcpu_auto_fast):
-            _append_advanced_note("FarmCPU selected: enabling fast mode automatically.")
-        else:
-            _append_advanced_note(
-                "FarmCPU selected on FILE matrix input: packed fast mode disabled; using dense float32 path."
-            )
+    if bool(args.farmcpu):
+        _append_advanced_note("FarmCPU selected: enabling packed auto route.")
     os.environ["JX_BED_BLOCK_TARGET_MB"] = f"{float(args.memory):.6g}"
     try:
 
@@ -6062,6 +6168,7 @@ def _run_gwas_pipeline(
         eff_m = None
         genofile_stream = gfile
         eff_snp_by_trait: dict[str, int] = {}
+        qtn_preloaded_packed: Optional[dict[str, object]] = None
 
         stream_models: list[str] = []
         if args.lm:
@@ -6098,7 +6205,7 @@ def _run_gwas_pipeline(
                 summary_rows=gwas_summary_rows,
                 saved_paths=saved_result_paths,
             )
-            # Dense FILE-fast route has already run requested models.
+            # Dense FILE packed route has already run requested models.
             stream_models = []
             has_farmcpu = False
             farmcpu_handled_in_trait_loop = True
@@ -6209,6 +6316,34 @@ def _run_gwas_pipeline(
                         )
 
                     splmm_post_grm_hook = _prepare_splmm_sparse_after_grm
+            post_grm_hook: Optional[Callable[[str, Optional[str]], None]] = splmm_post_grm_hook
+            qtn_post_grm_requested = bool(qtn_input_requested and (args.farmcpu or args.algwas))
+            if qtn_post_grm_requested:
+                base_post_grm_hook = post_grm_hook
+
+                def _prepare_qtn_after_grm(
+                    _stream_genofile_ready: str,
+                    _loaded_dense_grm_path: Optional[str],
+                ) -> None:
+                    nonlocal qtn_preloaded_packed
+                    if qtn_preloaded_packed is None:
+                        qtn_preloaded_packed = _prepare_qtn_packed_preload(
+                            args,
+                            logger=logger,
+                            use_spinner=use_spinner,
+                        )
+
+                if base_post_grm_hook is None:
+                    post_grm_hook = _prepare_qtn_after_grm
+                else:
+                    def _prepare_splmm_then_qtn_after_grm(
+                        stream_genofile_ready: str,
+                        loaded_dense_grm_path: Optional[str],
+                    ) -> None:
+                        base_post_grm_hook(stream_genofile_ready, loaded_dense_grm_path)
+                        _prepare_qtn_after_grm(stream_genofile_ready, loaded_dense_grm_path)
+
+                    post_grm_hook = _prepare_splmm_then_qtn_after_grm
             if shared_context_needed:
                 if terminal_rich:
                     _section(terminal_logger, "GWAS task")
@@ -6232,9 +6367,11 @@ def _run_gwas_pipeline(
                     snps_only=bool(args.snps_only),
                     allow_packed_grm=bool(allow_packed_grm_effective),
                     preload_packed_context=bool(packed_model_routes_enabled),
-                    require_bed_stream=bool(stream_selected),
-                    post_grm_hook=splmm_post_grm_hook,
+                    require_bed_stream=bool(stream_selected or qtn_input_requested),
+                    post_grm_hook=post_grm_hook,
+                    force_kind=("hmp" if bool(getattr(args, "hmp", None)) else None),
                 )
+                farmcpu_genofile = str(genofile_stream)
                 args.chunksize = _resolve_bed_block_rows_from_memory(
                     float(args.memory),
                     int(len(ids)),
@@ -6315,7 +6452,7 @@ def _run_gwas_pipeline(
         else:
             for idx0, trait_name in enumerate(trait_order):
                 trait_col_map[str(trait_name)] = int(idx0)
-        farmcpu_genofile = str(gfile)
+        farmcpu_genofile = str(genofile_stream)
 
         # -------------------------------
         # 1) Rust-only model routes
@@ -6323,7 +6460,7 @@ def _run_gwas_pipeline(
         if len(stream_models) > 0:
             rust_only_model_routes = True
             if rust_only_model_routes:
-                # v3: fast mode always executes via trait/model task plan (Rust route planner
+                # v3: packed/stream routes execute via trait/model task plan (Rust route planner
                 # + thin Python executor) so single-model paths no longer bypass the unified route.
                 use_trait_grouped_fast = True
                 if use_trait_grouped_fast:
@@ -6408,6 +6545,7 @@ def _run_gwas_pipeline(
                             prepare_only=True,
                             emit_trait_header=False,
                             preloaded_packed=preloaded_packed,
+                            qtn_preloaded_packed=qtn_preloaded_packed,
                         )
                     use_packed_fastlmm_scan = False
                     require_dispatch_v2 = bool(args.algwas)
@@ -6593,6 +6731,7 @@ def _run_gwas_pipeline(
                             trait_names=trait_one,
                             emit_trait_header=bool(emit_trait_header_model),
                             preloaded_packed=preloaded_packed,
+                            qtn_preloaded_packed=qtn_preloaded_packed,
                         )
 
                     def _run_route_splmm_packed(
@@ -6836,6 +6975,7 @@ def _run_gwas_pipeline(
                             farmcpu_cache=farmcpu_cache_runtime,
                             emit_trait_header=False,
                             preloaded_packed=preloaded_packed,
+                            qtn_preloaded_packed=qtn_preloaded_packed,
                         )
                         farmcpu_handled_in_trait_loop = True
 
@@ -7101,6 +7241,7 @@ def _run_gwas_pipeline(
                 farmcpu_cache=farmcpu_cache_prefill,
                 emit_trait_header=bool(emit_farmcpu_trait_header),
                 preloaded_packed=preloaded_packed,
+                qtn_preloaded_packed=qtn_preloaded_packed,
             )
 
         if len(gwas_summary_rows) > 0:

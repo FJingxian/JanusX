@@ -11,13 +11,7 @@ use std::thread::JoinHandle;
 
 pub(crate) const INTERRUPTED_MSG: &str = "Interrupted by user (Ctrl+C).";
 
-pub(crate) type AssocTsvMetadata = (
-    Vec<String>,
-    Vec<i64>,
-    Vec<String>,
-    Vec<String>,
-    Vec<String>,
-);
+pub(crate) type AssocTsvMetadata = (Vec<String>, Vec<i64>, Vec<String>, Vec<String>, Vec<String>);
 
 pub(crate) fn resolve_assoc_tsv_metadata(
     bed_prefix: Option<&str>,

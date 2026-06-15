@@ -627,6 +627,9 @@ pub fn gwas_packed_unified_to_tsv<'py>(
                     .unwrap_or_else(|| vec![5e5, 5e6, 5e7]);
                 let pseudo_tsv: Option<String> =
                     opt_item(&job, "pseudo_tsv")?.and_then(|v| v.extract().ok());
+                let raw: bool = opt_item(&job, "raw")?
+                    .and_then(|v| v.extract().ok())
+                    .unwrap_or(false);
 
                 let (qtn_n, pseudo_n, rows_n) = farmcpu_packed_to_tsv(
                     py,
@@ -654,6 +657,7 @@ pub fn gwas_packed_unified_to_tsv<'py>(
                     scan_progress_callback,
                     pseudo_tsv.as_deref(),
                     bed_prefix,
+                    raw,
                 )?;
                 result_obj.set_item("qtn_count", qtn_n)?;
                 result_obj.set_item("pseudo_rows", pseudo_n)?;

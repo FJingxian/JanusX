@@ -1,6 +1,8 @@
 use crate::kmer::ffi::kmc_reader::KmcReader;
 use crate::kmer::format::SampleEntry;
 use anyhow::{bail, Context, Result};
+use std::collections::HashSet;
+use std::fs;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -20,13 +22,7 @@ pub fn resolve_samples(
     let mut raw_pairs = if db_inputs.len() == 1 && looks_like_db_list_file(&db_inputs[0]) {
         parse_db_list_file(&db_inputs[0])?
     } else {
-        db_inputs
-            .iter()
-            .map(|raw| {
-                let prefix = normalize_prefix(raw)?;
-                Ok((default_sample_id(&prefix), prefix))
-            })
-            .collect::<Result<Vec<_>>>()?
+        expand_db_inputs(db_inputs)?
     };
 
     if let Some(overrides) = sample_ids_override {
@@ -104,6 +100,7 @@ fn parse_db_list_file(path: &str) -> Result<Vec<(String, String)>> {
         File::open(path).with_context(|| format!("failed to open KMC db list file: {path}"))?;
     let reader = BufReader::new(file);
     let mut out = Vec::new();
+    let mut seen = HashSet::<String>::new();
     for line in reader.lines() {
         let line = line?;
         let text = line.trim();
@@ -111,18 +108,227 @@ fn parse_db_list_file(path: &str) -> Result<Vec<(String, String)>> {
             continue;
         }
         let fields = text.split_whitespace().collect::<Vec<_>>();
-        let (sample_id, prefix_raw) = if fields.len() == 1 {
-            let prefix = normalize_prefix(fields[0])?;
-            (default_sample_id(&prefix), prefix)
+        let expanded = if fields.len() == 1 {
+            expand_raw_input(fields[0])?
         } else {
-            (fields[0].to_string(), normalize_prefix(fields[1])?)
+            expand_named_input(fields[0], fields[1])?
         };
-        out.push((sample_id, prefix_raw));
+        for (sample_id, prefix_raw) in expanded {
+            if seen.insert(prefix_raw.clone()) {
+                out.push((sample_id, prefix_raw));
+            }
+        }
     }
     if out.is_empty() {
         bail!("KMC db list file is empty: {path}");
     }
     Ok(out)
+}
+
+fn expand_db_inputs(db_inputs: &[String]) -> Result<Vec<(String, String)>> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::<String>::new();
+    for raw in db_inputs {
+        for (sample_id, prefix) in expand_cli_input(raw)? {
+            if seen.insert(prefix.clone()) {
+                out.push((sample_id, prefix));
+            }
+        }
+    }
+    if out.is_empty() {
+        bail!("no valid KMC databases were resolved from input arguments");
+    }
+    Ok(out)
+}
+
+fn expand_cli_input(raw: &str) -> Result<Vec<(String, String)>> {
+    let text = raw.trim();
+    if text.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let prefix = normalize_prefix(text)?;
+    if contains_glob_meta(&prefix) {
+        return expand_raw_input(text);
+    }
+
+    let path = Path::new(text);
+    if path.is_dir() {
+        return expand_directory_input(path);
+    }
+
+    if has_complete_kmc_db(&prefix) {
+        return Ok(vec![(default_sample_id(&prefix), prefix)]);
+    }
+
+    if path.exists() {
+        return Ok(Vec::new());
+    }
+
+    bail!(
+        "KMC database not complete for prefix `{prefix}`. Expected {prefix}.kmc_pre and {prefix}.kmc_suf"
+    )
+}
+
+fn expand_directory_input(path: &Path) -> Result<Vec<(String, String)>> {
+    let mut prefixes = Vec::new();
+    let mut seen = HashSet::<String>::new();
+    for entry in fs::read_dir(path)
+        .with_context(|| format!("failed to read KMC input directory: {}", path.display()))?
+    {
+        let entry = entry?;
+        let entry_path = entry.path();
+        let entry_text = entry_path.to_string_lossy().into_owned();
+        let prefix = normalize_prefix(&entry_text)?;
+        if has_complete_kmc_db(&prefix) && seen.insert(prefix.clone()) {
+            prefixes.push((default_sample_id(&prefix), prefix));
+        }
+    }
+    prefixes.sort_by(|a, b| a.1.cmp(&b.1));
+    Ok(prefixes)
+}
+
+fn expand_raw_input(raw: &str) -> Result<Vec<(String, String)>> {
+    let prefixes = expand_prefix_candidates(raw)?;
+    Ok(prefixes
+        .into_iter()
+        .map(|prefix| (default_sample_id(&prefix), prefix))
+        .collect::<Vec<_>>())
+}
+
+fn expand_named_input(sample_id: &str, raw: &str) -> Result<Vec<(String, String)>> {
+    let sid = sample_id.trim();
+    if sid.is_empty() {
+        bail!("sample-id cannot be empty in KMC db list file");
+    }
+    let prefixes = expand_prefix_candidates(raw)?;
+    if prefixes.len() > 1 {
+        bail!(
+            "sample-id `{sid}` maps to multiple KMC databases via pattern `{raw}`; please expand them explicitly"
+        );
+    }
+    Ok(prefixes
+        .into_iter()
+        .map(|prefix| (sid.to_string(), prefix))
+        .collect::<Vec<_>>())
+}
+
+fn expand_prefix_candidates(raw: &str) -> Result<Vec<String>> {
+    let prefix = normalize_prefix(raw)?;
+    if !contains_glob_meta(&prefix) {
+        return Ok(vec![prefix]);
+    }
+
+    let matched_paths = expand_glob_paths(&prefix)?;
+    let mut seen = HashSet::<String>::new();
+    let mut prefixes = Vec::new();
+    for path in matched_paths {
+        let path_text = path.to_string_lossy().into_owned();
+        let candidate = normalize_prefix(&path_text)?;
+        if has_complete_kmc_db(&candidate) && seen.insert(candidate.clone()) {
+            prefixes.push(candidate);
+        }
+    }
+    prefixes.sort();
+    if prefixes.is_empty() {
+        bail!("glob input `{raw}` did not match any complete KMC database");
+    }
+    Ok(prefixes)
+}
+
+fn contains_glob_meta(text: &str) -> bool {
+    text.chars().any(|ch| matches!(ch, '*' | '?'))
+}
+
+fn expand_glob_paths(pattern: &str) -> Result<Vec<PathBuf>> {
+    let root = if pattern.starts_with('/') {
+        PathBuf::from("/")
+    } else {
+        PathBuf::from(".")
+    };
+    let mut current = vec![root];
+    for component in pattern.split('/') {
+        if component.is_empty() {
+            continue;
+        }
+        if component == "." {
+            continue;
+        }
+        if component == ".." {
+            current = current
+                .into_iter()
+                .map(|path| path.parent().unwrap_or(Path::new("/")).to_path_buf())
+                .collect::<Vec<_>>();
+            continue;
+        }
+
+        if contains_glob_meta(component) {
+            let mut next = Vec::new();
+            for base in &current {
+                let dir = if base.as_os_str().is_empty() {
+                    Path::new(".")
+                } else {
+                    base.as_path()
+                };
+                if !dir.is_dir() {
+                    continue;
+                }
+                for entry in fs::read_dir(dir)
+                    .with_context(|| format!("failed to read directory for glob expansion: {}", dir.display()))?
+                {
+                    let entry = entry?;
+                    let file_name = entry.file_name();
+                    let Some(name) = file_name.to_str() else {
+                        continue;
+                    };
+                    if glob_component_matches(component, name) {
+                        next.push(dir.join(name));
+                    }
+                }
+            }
+            current = next;
+        } else {
+            current = current
+                .into_iter()
+                .map(|path| path.join(component))
+                .collect::<Vec<_>>();
+        }
+    }
+    current.sort();
+    current.dedup();
+    Ok(current)
+}
+
+fn glob_component_matches(pattern: &str, text: &str) -> bool {
+    let p = pattern.as_bytes();
+    let t = text.as_bytes();
+    let mut dp = vec![vec![false; t.len() + 1]; p.len() + 1];
+    dp[0][0] = true;
+    for i in 0..p.len() {
+        match p[i] {
+            b'*' => {
+                dp[i + 1][0] = dp[i][0];
+                for j in 0..t.len() {
+                    dp[i + 1][j + 1] = dp[i][j + 1] || dp[i + 1][j];
+                }
+            }
+            b'?' => {
+                for j in 0..t.len() {
+                    if dp[i][j] {
+                        dp[i + 1][j + 1] = true;
+                    }
+                }
+            }
+            byte => {
+                for j in 0..t.len() {
+                    if dp[i][j] && byte == t[j] {
+                        dp[i + 1][j + 1] = true;
+                    }
+                }
+            }
+        }
+    }
+    dp[p.len()][t.len()]
 }
 
 fn looks_like_db_list_file(raw: &str) -> bool {
@@ -163,6 +369,12 @@ fn validate_prefix(prefix: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn has_complete_kmc_db(prefix: &str) -> bool {
+    let pre = PathBuf::from(format!("{prefix}.kmc_pre"));
+    let suf = PathBuf::from(format!("{prefix}.kmc_suf"));
+    pre.is_file() && suf.is_file()
 }
 
 fn default_sample_id(prefix: &str) -> String {

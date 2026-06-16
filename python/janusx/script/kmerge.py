@@ -124,6 +124,7 @@ def build_parser():
         epilog=minimal_help_epilog(
             [
                 "jx kmerge -db /data/kmc/S001 /data/kmc/S002 -o out -prefix maize_k31",
+                "jx kmerge -db '/data/kmc/*' -o out -prefix maize_k31",
                 "jx kmerge -db samples.kmc.tsv -o out -prefix maize_k31 -t 32 -memory 128000",
                 "jx kmerge -db sampleA.kmc_pre sampleB.kmc_pre -o out -prefix panel --resume",
             ]
@@ -146,7 +147,7 @@ def build_parser():
         required=True,
         help=(
             "Input KMC databases. Supports KMC prefix, .kmc_pre/.kmc_suf path, "
-            "or a one/two-column text file."
+            "directory/glob auto-discovery, or a one/two-column text file."
         ),
     )
 
@@ -264,12 +265,6 @@ def main() -> int:
         parser.error("-freq/--freq must be within [0, 0.5].")
     if not (1 <= int(args.bucket_bits) <= 20):
         parser.error("--bucket-bits must be within [1, 20].")
-    if len(db_inputs) == 1 and float(args.freq) > 0.0:
-        parser.error(
-            "single-sample kmerge with -freq > 0 filters out all present k-mers; "
-            "use -freq 0.0 or provide multiple samples in one -db group or repeated -db flags."
-        )
-
     detected_threads = int(detect_effective_threads())
     threads = int(args.thread)
     out_dir = str(Path(args.out).expanduser().resolve())

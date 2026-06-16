@@ -1,7 +1,7 @@
 use crate::kmer::format::SampleEntry;
 use crate::kmer::inputs::{inspect_kmc_inputs, resolve_samples};
 use crate::kmer::stage1_bucket::{run_stage1, Stage1Config};
-use crate::kmer::stage2_stats::{run_stage2_stats, Stage2StatsConfig};
+use crate::kmer::stage2_stats::{run_stage2_stats, Stage2StatsConfig, VennPatternCount};
 use anyhow::{bail, Context, Result};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
@@ -179,9 +179,6 @@ fn run_kstats(args: KstatsArgs) -> Result<KstatsSummary> {
     if samples.len() < 2 {
         bail!("kstats requires at least 2 KMC databases");
     }
-    if matches!(args.mode, StatsMode::Venn) && samples.len() != 2 {
-        bail!("`-venn` requires exactly 2 KMC databases");
-    }
 
     let inspect = inspect_kmc_inputs(&samples)?;
     let out_dir = args.out_dir.clone();
@@ -243,11 +240,12 @@ fn run_kstats(args: KstatsArgs) -> Result<KstatsSummary> {
     emit_run_line(log_path, "Stage 2/3: bucket merge -> pairwise counts")?;
     let stage2_total = 1u64 << args.bucket_bits;
     emit_progress_callback(progress_callback, 2, 0, stage2_total.max(1) as usize)?;
-    let pair_counts = run_stage2_stats(&Stage2StatsConfig {
+    let stage2 = run_stage2_stats(&Stage2StatsConfig {
         tmp_dir: &tmp_dir,
         n_samples: samples.len(),
         bucket_bits: args.bucket_bits,
         threads: args.threads,
+        collect_patterns: matches!(args.mode, StatsMode::Venn) && samples.len() > 2,
         progress_callback: stage2_progress.clone(),
         progress_total: stage2_total.max(1),
     })?;
@@ -259,7 +257,7 @@ fn run_kstats(args: KstatsArgs) -> Result<KstatsSummary> {
     )?;
 
     emit_run_line(log_path, "Stage 3/3: write statistics tables")?;
-    let stage3_total = output_row_total(args.mode, samples.len());
+    let stage3_total = output_row_total(args.mode, samples.len(), stage2.venn_patterns.as_ref());
     emit_progress_callback(progress_callback, 3, 0, stage3_total.max(1) as usize)?;
     let mut stage3_done = 0u64;
     let summary = write_outputs(
@@ -268,7 +266,8 @@ fn run_kstats(args: KstatsArgs) -> Result<KstatsSummary> {
         args.mode,
         inspect.k,
         &samples,
-        &pair_counts,
+        &stage2.pair_counts,
+        stage2.venn_patterns.as_deref(),
         stage3_progress.as_ref(),
         &mut stage3_done,
         stage3_total.max(1),
@@ -342,13 +341,25 @@ fn planned_outputs(out_dir: &Path, prefix: &str, mode: StatsMode) -> Vec<PathBuf
     }
 }
 
-fn output_row_total(mode: StatsMode, n_samples: usize) -> u64 {
+fn output_row_total(
+    mode: StatsMode,
+    n_samples: usize,
+    venn_patterns: Option<&Vec<VennPatternCount>>,
+) -> u64 {
     match mode {
         StatsMode::Pair(PairMode::Union) | StatsMode::Pair(PairMode::Intersection) => {
             n_samples as u64
         }
         StatsMode::Pair(PairMode::Both) => (n_samples as u64).saturating_mul(2),
-        StatsMode::Venn => 1,
+        StatsMode::Venn => {
+            if n_samples <= 2 {
+                1
+            } else {
+                venn_patterns
+                    .map(|rows| rows.len().max(1) as u64)
+                    .unwrap_or(1)
+            }
+        }
     }
 }
 
@@ -359,6 +370,7 @@ fn write_outputs(
     k: u32,
     samples: &[SampleEntry],
     pair_counts: &[u64],
+    venn_patterns: Option<&[VennPatternCount]>,
     progress_callback: Option<&ProgressFnStage>,
     progress_done: &mut u64,
     progress_total: u64,
@@ -423,14 +435,25 @@ fn write_outputs(
         }
         StatsMode::Venn => {
             let path = out_dir.join(format!("{prefix}.venn.tsv"));
-            write_venn_table(
-                &path,
-                samples,
-                pair_counts,
-                progress_callback,
-                progress_done,
-                progress_total,
-            )?;
+            if samples.len() <= 2 {
+                write_venn_table_pair(
+                    &path,
+                    samples,
+                    pair_counts,
+                    progress_callback,
+                    progress_done,
+                    progress_total,
+                )?;
+            } else {
+                write_venn_table_multi(
+                    &path,
+                    samples,
+                    venn_patterns.unwrap_or(&[]),
+                    progress_callback,
+                    progress_done,
+                    progress_total,
+                )?;
+            }
             venn_path = Some(path);
         }
     }
@@ -492,7 +515,7 @@ fn write_pair_matrix(
     Ok(())
 }
 
-fn write_venn_table(
+fn write_venn_table_pair(
     path: &Path,
     samples: &[SampleEntry],
     pair_counts: &[u64],
@@ -536,6 +559,48 @@ fn write_venn_table(
     Ok(())
 }
 
+fn write_venn_table_multi(
+    path: &Path,
+    samples: &[SampleEntry],
+    venn_patterns: &[VennPatternCount],
+    progress_callback: Option<&ProgressFnStage>,
+    progress_done: &mut u64,
+    progress_total: u64,
+) -> Result<()> {
+    let file = File::create(path)
+        .with_context(|| format!("failed to create venn stats file: {}", path.display()))?;
+    let mut writer = BufWriter::new(file);
+    writer.write_all(b"pattern_id\tcount\tn_present\tpattern_bits\tsample_ids")?;
+    for sample in samples {
+        writer.write_all(b"\t")?;
+        writer.write_all(sample.sample_id.as_bytes())?;
+    }
+    writer.write_all(b"\n")?;
+
+    for (idx, row) in venn_patterns.iter().enumerate() {
+        let pattern_bits = render_pattern_bits(&row.bit_words, samples.len());
+        let sample_ids = render_pattern_sample_ids(&row.bit_words, samples);
+        let n_present = bit_count(&row.bit_words);
+        write!(
+            writer,
+            "{}\t{}\t{}\t{}\t{}",
+            idx + 1,
+            row.count,
+            n_present,
+            pattern_bits,
+            sample_ids
+        )?;
+        for sample_idx in 0..samples.len() {
+            let present = if bit_is_set(&row.bit_words, sample_idx) { 1 } else { 0 };
+            write!(writer, "\t{present}")?;
+        }
+        writer.write_all(b"\n")?;
+        emit_stage2_tick(progress_callback, progress_done, progress_total, 1)?;
+    }
+    writer.flush()?;
+    Ok(())
+}
+
 type ProgressFnStage = Arc<dyn Fn(u64, u64) -> Result<()> + Send + Sync + 'static>;
 
 fn lower_tri_len(n: usize) -> Result<usize> {
@@ -547,6 +612,37 @@ fn lower_tri_len(n: usize) -> Result<usize> {
 fn tri_index(i: usize, j: usize) -> usize {
     let (hi, lo) = if i >= j { (i, j) } else { (j, i) };
     hi * (hi + 1) / 2 + lo
+}
+
+fn bit_count(words: &[u64]) -> u32 {
+    words.iter().map(|word| word.count_ones()).sum::<u32>()
+}
+
+fn bit_is_set(words: &[u64], idx: usize) -> bool {
+    let word_idx = idx / 64;
+    let bit_idx = idx % 64;
+    words
+        .get(word_idx)
+        .map(|word| ((word >> bit_idx) & 1) == 1)
+        .unwrap_or(false)
+}
+
+fn render_pattern_bits(words: &[u64], n_samples: usize) -> String {
+    let mut out = String::with_capacity(n_samples);
+    for idx in 0..n_samples {
+        out.push(if bit_is_set(words, idx) { '1' } else { '0' });
+    }
+    out
+}
+
+fn render_pattern_sample_ids(words: &[u64], samples: &[SampleEntry]) -> String {
+    let mut out = Vec::new();
+    for (idx, sample) in samples.iter().enumerate() {
+        if bit_is_set(words, idx) {
+            out.push(sample.sample_id.as_str());
+        }
+    }
+    out.join(",")
 }
 
 fn max_records_per_flush(

@@ -125,6 +125,7 @@ def build_parser():
             [
                 "jx kstats -db sample_A sample_B -pair both -o out",
                 "jx kstats -db sample_A -db sample_B -venn -o out -prefix pairAB",
+                "jx kstats -db './panel/*.jx*' -venn -o out -prefix panel_venn",
                 "jx kstats -db panel.kmc.tsv -pair intersection -sid A B C -o out -t 8 -memory 4096",
             ]
         ),
@@ -146,7 +147,7 @@ def build_parser():
         required=True,
         help=(
             "Input KMC databases. Supports KMC prefix, .kmc_pre/.kmc_suf path, "
-            "or a one/two-column text file."
+            "directory/glob auto-discovery, or a one/two-column text file."
         ),
     )
 
@@ -162,7 +163,10 @@ def build_parser():
         "-venn",
         "--venn",
         action="store_true",
-        help="Write a 2-sample venn summary table.",
+        help=(
+            "Write venn-style presence statistics. For 2 samples, outputs the classic "
+            "summary row; for >2 samples, outputs one row per observed presence pattern."
+        ),
     )
 
     basic.add_argument(
@@ -265,9 +269,6 @@ def main() -> int:
         parser.error("--batch-size must be > 0.")
     if args.min_count <= 0:
         parser.error("--min-count must be > 0.")
-    if args.venn and len(db_inputs) != 2:
-        parser.error("-venn requires exactly 2 KMC databases.")
-
     detected_threads = int(detect_effective_threads())
     requested_threads = int(args.thread)
     using_threads = min(requested_threads, detected_threads)

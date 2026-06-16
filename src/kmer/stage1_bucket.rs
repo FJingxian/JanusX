@@ -1,7 +1,7 @@
 use crate::kmer::encode::{bucket_id_from_code, canonical_code};
 use crate::kmer::ffi::kmc_reader::KmcReader;
 use crate::kmer::format::SampleEntry;
-use crate::kmer::progress::KmergeProgressBar;
+use crate::kmer::progress::ProgressFn;
 use crate::kmer::record::{write_rec, KmerPresenceRec};
 use anyhow::{Context, Result};
 use rayon::prelude::*;
@@ -9,7 +9,7 @@ use rayon::ThreadPoolBuilder;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 pub struct Stage1Config<'a> {
@@ -21,7 +21,8 @@ pub struct Stage1Config<'a> {
     pub bucket_bits: u8,
     pub max_records_per_flush: usize,
     pub threads: usize,
-    pub progress_bar: KmergeProgressBar,
+    pub progress_callback: Option<ProgressFn>,
+    pub progress_total: u64,
 }
 
 pub fn run_stage1(config: &Stage1Config<'_>) -> Result<()> {
@@ -36,12 +37,13 @@ pub fn run_stage1(config: &Stage1Config<'_>) -> Result<()> {
         .num_threads(config.threads.max(1))
         .build()
         .context("failed to build stage1 thread pool")?;
+    let progress_done = Arc::new(AtomicU64::new(0));
 
     pool.install(|| {
         config
             .samples
             .par_iter()
-            .try_for_each(|sample| process_sample(sample, config, &run_counters))
+            .try_for_each(|sample| process_sample(sample, config, &run_counters, &progress_done))
     })?;
 
     write_marker(&config.tmp_dir.join("stage1.done"))?;
@@ -52,6 +54,7 @@ fn process_sample(
     sample: &SampleEntry,
     config: &Stage1Config<'_>,
     run_counters: &Arc<Vec<AtomicUsize>>,
+    progress_done: &Arc<AtomicU64>,
 ) -> Result<()> {
     let mut reader = KmcReader::open(&sample.kmc_prefix, config.k)
         .with_context(|| format!("failed to open sample {}", sample.sample_id))?;
@@ -71,7 +74,10 @@ fn process_sample(
         if n == 0 {
             break;
         }
-        config.progress_bar.inc(n as u64);
+        if let Some(cb) = &config.progress_callback {
+            let done = progress_done.fetch_add(n as u64, Ordering::Relaxed) + n as u64;
+            cb(done.min(config.progress_total), config.progress_total)?;
+        }
 
         if db_is_canonical {
             for idx in 0..n {

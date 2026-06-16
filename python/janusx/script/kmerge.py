@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import socket
+import threading
 from pathlib import Path
 
 from janusx import janusx as jxrs
@@ -10,6 +11,7 @@ from ._common.config_render import emit_cli_configuration
 from ._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 from ._common.log import setup_logging
 from ._common.pathcheck import format_path_for_display
+from ._common.progress import ProgressAdapter
 from ._common.status import log_success
 from ._common.threads import detect_effective_threads, format_requested_thread_usage
 
@@ -34,6 +36,85 @@ def _reopen_file_handlers_append(logger: logging.Logger) -> None:
         if formatter is not None:
             handler.setFormatter(formatter)
         logger.addHandler(handler)
+
+
+class _KmergeCliProgress:
+    _STAGE_LABELS = {
+        1: "kmerge Stage 1/3",
+        2: "kmerge Stage 2/3",
+        3: "kmerge Stage 3/3",
+    }
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._stage = None
+        self._done = 0
+        self._total = 0
+        self._bar = None
+
+    def callback(self, stage: int, done: int, total: int) -> None:
+        stage_i = int(stage)
+        done_i = max(0, int(done))
+        total_i = max(1, int(total))
+        with self._lock:
+            if self._stage != stage_i or self._bar is None:
+                self._close_locked()
+                self._stage = stage_i
+                self._done = 0
+                self._total = total_i
+                self._bar = ProgressAdapter(
+                    total=total_i,
+                    desc=self._stage_desc(stage_i),
+                    show_postfix=False,
+                    keep_display=False,
+                    emit_done=False,
+                    force_animate=True,
+                )
+            elif self._total != total_i:
+                self._total = total_i
+                self._bar.set_total(total_i)
+
+            if done_i < self._done:
+                self._close_locked()
+                self._stage = stage_i
+                self._done = 0
+                self._total = total_i
+                self._bar = ProgressAdapter(
+                    total=total_i,
+                    desc=self._stage_desc(stage_i),
+                    show_postfix=False,
+                    keep_display=False,
+                    emit_done=False,
+                    force_animate=True,
+                )
+
+            if self._bar is not None and done_i > self._done:
+                self._bar.update(done_i - self._done)
+            self._done = done_i
+
+            if self._bar is not None and done_i >= total_i:
+                self._bar.finish()
+                self._bar.close()
+                self._bar = None
+                self._stage = None
+                self._done = 0
+                self._total = 0
+
+    def close(self) -> None:
+        with self._lock:
+            self._close_locked()
+
+    def _close_locked(self) -> None:
+        if self._bar is not None:
+            self._bar.close()
+            self._bar = None
+        self._stage = None
+        self._done = 0
+        self._total = 0
+
+    @classmethod
+    def _stage_desc(cls, stage: int) -> str:
+        return cls._STAGE_LABELS.get(int(stage), f"kmerge Stage {int(stage)}")
 
 
 def build_parser():
@@ -226,20 +307,20 @@ def main() -> int:
                     ("Freq", float(args.freq)),
                 ],
             ),
-                (
-                    "Runtime",
-                    [
-                        (
-                            "Threads",
-                            format_requested_thread_usage(
-                                requested_threads=args.thread,
-                                using_threads=threads,
-                                detected_threads=detected_threads,
-                            ),
+            (
+                "Runtime",
+                [
+                    (
+                        "Threads",
+                        format_requested_thread_usage(
+                            requested_threads=args.thread,
+                            using_threads=threads,
+                            detected_threads=detected_threads,
                         ),
-                        ("Memory MB", int(args.memory)),
-                        ("Bucket bits", int(args.bucket_bits)),
-                        ("Batch size", int(args.batch_size)),
+                    ),
+                    ("Memory MB", int(args.memory)),
+                    ("Bucket bits", int(args.bucket_bits)),
+                    ("Batch size", int(args.batch_size)),
                     ("Keep tmp", bool(args.keep_tmp)),
                     ("Resume", bool(args.resume)),
                     ("Force", bool(args.force)),
@@ -253,6 +334,7 @@ def main() -> int:
     for idx, path in enumerate(db_inputs_log, start=1):
         logger.info(f"  [{idx}] {path}")
     _reopen_file_handlers_append(logger)
+    progress_ui = _KmergeCliProgress()
 
     try:
         summary = jxrs.kmerge_run(
@@ -272,10 +354,14 @@ def main() -> int:
             keep_tmp=bool(args.keep_tmp),
             force=bool(args.force),
             log_path=log_path,
+            progress_callback=progress_ui.callback,
         )
     except Exception as exc:
+        progress_ui.close()
         logger.error(str(exc))
         return 1
+    finally:
+        progress_ui.close()
 
     log_success(
         logger,

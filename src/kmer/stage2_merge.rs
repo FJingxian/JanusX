@@ -1,5 +1,5 @@
 use crate::kmer::format::BucketPartSummary;
-use crate::kmer::progress::KmergeProgressBar;
+use crate::kmer::progress::ProgressFn;
 use crate::kmer::record::{read_rec_opt, KmerPresenceRec};
 use crate::kmer::writer::{bitset_column, bytes_per_col};
 use anyhow::{bail, Context, Result};
@@ -10,6 +10,8 @@ use std::collections::BinaryHeap;
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::Arc;
 
 pub struct Stage2Config<'a> {
     pub tmp_dir: &'a Path,
@@ -17,7 +19,8 @@ pub struct Stage2Config<'a> {
     pub freq: f64,
     pub bucket_bits: u8,
     pub threads: usize,
-    pub progress_bar: KmergeProgressBar,
+    pub progress_callback: Option<ProgressFn>,
+    pub progress_total: u64,
 }
 
 pub fn run_stage2(config: &Stage2Config<'_>) -> Result<Vec<BucketPartSummary>> {
@@ -35,13 +38,17 @@ pub fn run_stage2(config: &Stage2Config<'_>) -> Result<Vec<BucketPartSummary>> {
         .num_threads(config.threads.max(1))
         .build()
         .context("failed to build stage2 thread pool")?;
+    let progress_done = Arc::new(AtomicU64::new(0));
 
     let mut parts = pool.install(|| {
         bucket_ids
             .into_par_iter()
             .map(|bucket_id| {
                 let part = merge_bucket(bucket_id, &parts_dir, config)?;
-                config.progress_bar.inc(1);
+                if let Some(cb) = &config.progress_callback {
+                    let done = progress_done.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+                    cb(done.min(config.progress_total), config.progress_total)?;
+                }
                 Ok(part)
             })
             .collect::<Result<Vec<_>>>()

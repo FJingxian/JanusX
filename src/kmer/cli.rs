@@ -1,6 +1,6 @@
 use crate::kmer::ffi::kmc_reader::KmcReader;
 use crate::kmer::format::{KmergeMeta, SampleEntry};
-use crate::kmer::progress::KmergeProgressBar;
+use crate::kmer::progress::ProgressFn;
 use crate::kmer::stage1_bucket::{run_stage1, Stage1Config};
 use crate::kmer::stage2_merge::{load_stage2_manifest, run_stage2, Stage2Config};
 use crate::kmer::stage3_concat::{run_stage3, Stage3Config, Stage3Summary};
@@ -11,8 +11,9 @@ use pyo3::types::PyDict;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct KmergeArgs {
     pub db_inputs: Vec<String>,
     pub sample_ids: Option<Vec<String>>,
@@ -30,6 +31,7 @@ pub struct KmergeArgs {
     pub keep_tmp: bool,
     pub force: bool,
     pub log_path: Option<PathBuf>,
+    pub progress_callback: Option<Arc<Py<PyAny>>>,
 }
 
 #[pyfunction(
@@ -50,7 +52,8 @@ pub struct KmergeArgs {
         resume = false,
         keep_tmp = false,
         force = false,
-        log_path = None
+        log_path = None,
+        progress_callback = None
     )
 )]
 pub fn kmerge_run_py(
@@ -71,6 +74,7 @@ pub fn kmerge_run_py(
     keep_tmp: bool,
     force: bool,
     log_path: Option<String>,
+    progress_callback: Option<Py<PyAny>>,
 ) -> PyResult<Py<PyDict>> {
     let args = KmergeArgs {
         db_inputs,
@@ -89,6 +93,7 @@ pub fn kmerge_run_py(
         keep_tmp,
         force,
         log_path: log_path.map(PathBuf::from),
+        progress_callback: progress_callback.map(Arc::new),
     };
 
     let summary = py
@@ -138,6 +143,10 @@ pub fn run_kmerge(args: KmergeArgs) -> Result<Stage3Summary> {
     let inspect = inspect_kmerge_inputs(&samples)?;
     let k = inspect.k;
     let log_path = args.log_path.as_deref();
+    let progress_callback = args.progress_callback.as_deref();
+    let stage1_progress = build_progress_callback(args.progress_callback.as_ref(), 1);
+    let stage2_progress = build_progress_callback(args.progress_callback.as_ref(), 2);
+    let stage3_progress = build_progress_callback(args.progress_callback.as_ref(), 3);
 
     prepare_output_space(&out_dir, &tmp_dir, &args, &samples)?;
 
@@ -170,7 +179,12 @@ pub fn run_kmerge(args: KmergeArgs) -> Result<Stage3Summary> {
 
     if !(args.resume && is_stage_done(&tmp_dir.join("stage1.done"))) {
         emit_run_line(log_path, "Stage 1/3: KMC stream -> bucketed sorted runs")?;
-        let stage1_pb = build_stage_progress_bar("Stage 1/3 records", inspect.total_stage1_records);
+        emit_progress_callback(
+            progress_callback,
+            1,
+            0,
+            inspect.total_stage1_records as usize,
+        )?;
         run_stage1(&Stage1Config {
             tmp_dir: &tmp_dir,
             samples: &samples,
@@ -180,9 +194,15 @@ pub fn run_kmerge(args: KmergeArgs) -> Result<Stage3Summary> {
             bucket_bits: args.bucket_bits,
             max_records_per_flush,
             threads: args.threads,
-            progress_bar: stage1_pb.clone(),
+            progress_callback: stage1_progress.clone(),
+            progress_total: inspect.total_stage1_records.max(1),
         })?;
-        finish_stage_progress_bar(&stage1_pb);
+        emit_progress_callback(
+            progress_callback,
+            1,
+            inspect.total_stage1_records as usize,
+            inspect.total_stage1_records as usize,
+        )?;
     } else {
         emit_run_line(
             log_path,
@@ -201,16 +221,23 @@ pub fn run_kmerge(args: KmergeArgs) -> Result<Stage3Summary> {
             log_path,
             "Stage 2/3: bucket merge -> .bkmer.part / .bsite.part",
         )?;
-        let stage2_pb = build_stage_progress_bar("Stage 2/3 buckets", 1u64 << args.bucket_bits);
+        let stage2_total = 1u64 << args.bucket_bits;
+        emit_progress_callback(progress_callback, 2, 0, stage2_total as usize)?;
         let parts = run_stage2(&Stage2Config {
             tmp_dir: &tmp_dir,
             n_samples: samples.len(),
             freq: args.freq,
             bucket_bits: args.bucket_bits,
             threads: args.threads,
-            progress_bar: stage2_pb.clone(),
+            progress_callback: stage2_progress.clone(),
+            progress_total: stage2_total.max(1),
         })?;
-        finish_stage_progress_bar(&stage2_pb);
+        emit_progress_callback(
+            progress_callback,
+            2,
+            stage2_total as usize,
+            stage2_total as usize,
+        )?;
         parts
     };
 
@@ -219,10 +246,8 @@ pub fn run_kmerge(args: KmergeArgs) -> Result<Stage3Summary> {
     }
 
     emit_run_line(log_path, "Stage 3/3: concat parts -> final matrix")?;
-    let stage3_pb = build_stage_progress_bar(
-        "Stage 3/3 concat",
-        (parts.len() as u64).saturating_mul(2).saturating_add(2),
-    );
+    let stage3_total = (parts.len() as u64).saturating_mul(2).saturating_add(2);
+    emit_progress_callback(progress_callback, 3, 0, stage3_total as usize)?;
     let summary = run_stage3(&Stage3Config {
         out_dir: &out_dir,
         prefix: &args.prefix,
@@ -233,9 +258,15 @@ pub fn run_kmerge(args: KmergeArgs) -> Result<Stage3Summary> {
         min_count: args.min_count,
         freq: args.freq,
         bucket_bits: args.bucket_bits,
-        progress_bar: stage3_pb.clone(),
+        progress_callback: stage3_progress.clone(),
+        progress_total: stage3_total.max(1),
     })?;
-    finish_stage_progress_bar(&stage3_pb);
+    emit_progress_callback(
+        progress_callback,
+        3,
+        stage3_total as usize,
+        stage3_total as usize,
+    )?;
 
     if !args.keep_tmp {
         fs::remove_dir_all(&tmp_dir)
@@ -368,12 +399,30 @@ fn inspect_kmerge_inputs(samples: &[SampleEntry]) -> Result<KmergeInputInspect> 
     })
 }
 
-fn build_stage_progress_bar(desc: &str, total: u64) -> KmergeProgressBar {
-    KmergeProgressBar::new(desc, total)
+fn build_progress_callback(cb: Option<&Arc<Py<PyAny>>>, stage: usize) -> Option<ProgressFn> {
+    let cb = Arc::clone(cb?);
+    Some(Arc::new(move |done: u64, total: u64| -> Result<()> {
+        emit_progress_callback(Some(cb.as_ref()), stage, done as usize, total as usize)
+    }))
 }
 
-fn finish_stage_progress_bar(progress_bar: &KmergeProgressBar) {
-    progress_bar.finish();
+fn emit_progress_callback(
+    cb: Option<&Py<PyAny>>,
+    stage: usize,
+    done: usize,
+    total: usize,
+) -> Result<()> {
+    let total_use = total.max(1);
+    let done_use = done.min(total_use);
+    if let Some(cb) = cb {
+        Python::attach(|py| -> PyResult<()> {
+            py.check_signals()?;
+            cb.call1(py, (stage, done_use, total_use))?;
+            Ok(())
+        })
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    }
+    Ok(())
 }
 
 fn prepare_output_space(

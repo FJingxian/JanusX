@@ -342,10 +342,6 @@ impl LmQrProjection {
         })
     }
 
-    #[inline]
-    fn df_snp(&self) -> i32 {
-        (self.n as i32) - (self.rank as i32) - 1
-    }
 }
 
 #[pyfunction]

@@ -1,6 +1,8 @@
 use crate::kmer::format::{KmergeMeta, SampleEntry, BSITE_HEADER_SIZE};
 use crate::kmer::progress::ProgressFn;
 use anyhow::{bail, Context, Result};
+#[cfg(unix)]
+use memmap2::Advice;
 use memmap2::MmapOptions;
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
@@ -156,6 +158,8 @@ pub(crate) fn scan_kbin_compare(
             .map(&file)
             .with_context(|| format!("failed to mmap bsite file: {}", plan.bsite_path.display()))?
     };
+    #[cfg(unix)]
+    let _ = mmap.advise(Advice::Sequential);
     if mmap.len() < BSITE_HEADER_SIZE {
         bail!("truncated bsite file: {}", plan.bsite_path.display());
     }

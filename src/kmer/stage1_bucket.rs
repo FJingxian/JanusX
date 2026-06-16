@@ -1,6 +1,7 @@
 use crate::kmer::encode::{bucket_id_from_code, canonical_code};
 use crate::kmer::ffi::kmc_reader::KmcReader;
 use crate::kmer::format::SampleEntry;
+use crate::kmer::progress::KmergeProgressBar;
 use crate::kmer::record::{write_rec, KmerPresenceRec};
 use anyhow::{Context, Result};
 use rayon::prelude::*;
@@ -20,6 +21,7 @@ pub struct Stage1Config<'a> {
     pub bucket_bits: u8,
     pub max_records_per_flush: usize,
     pub threads: usize,
+    pub progress_bar: KmergeProgressBar,
 }
 
 pub fn run_stage1(config: &Stage1Config<'_>) -> Result<()> {
@@ -69,6 +71,7 @@ fn process_sample(
         if n == 0 {
             break;
         }
+        config.progress_bar.inc(n as u64);
 
         if db_is_canonical {
             for idx in 0..n {

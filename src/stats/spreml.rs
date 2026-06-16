@@ -986,6 +986,14 @@ mod tests {
     use super::*;
     use crate::cholesky::sparse_cholesky_analyze_jxgrm_csc;
     use crate::spgrm::SparseGrmCsc;
+    use nalgebra::{DMatrix, DVector};
+
+    fn assert_close(lhs: f64, rhs: f64, tol: f64, label: &str) {
+        assert!(
+            (lhs - rhs).abs() <= tol,
+            "{label} mismatch: lhs={lhs}, rhs={rhs}, tol={tol}"
+        );
+    }
 
     #[test]
     fn sparse_reml_grid_runs_on_small_csc() {
@@ -1015,5 +1023,58 @@ mod tests {
             64,
         );
         assert!((refined + 0.137_f64).abs() <= 1e-4_f64);
+    }
+
+    #[test]
+    fn sparse_reml_fixed_lambda_matches_dense_profile_on_indefinite_k() {
+        // K has eigenvalues 3 and -1, so it is indefinite, but K + lambda I
+        // is SPD for lambda > 1. This is the regime SparseLMM exact null-fit
+        // uses on thresholded sparse GRMs.
+        let csc = SparseGrmCsc {
+            n_samples: 2,
+            nnz: 3,
+            col_ptr: vec![0, 2, 3],
+            row_indices: vec![0, 1, 1],
+            values: vec![1.0, 2.0, 1.0],
+        };
+        let analysis = sparse_cholesky_analyze_jxgrm_csc(&csc).unwrap();
+        let y = vec![0.5_f64, -1.25_f64];
+        let x = build_design_matrix(None, 2, 0).unwrap();
+        let mut evaluator = SparseRemlEvaluator::new(y.len(), 1, &analysis);
+        let lambda = 1.5_f64;
+        let log10_lambda = lambda.log10();
+
+        let (eval, _timing) =
+            evaluate_sparse_reml_at_lambda(&analysis, &x, &y, log10_lambda, &mut evaluator)
+                .unwrap();
+
+        let k = DMatrix::<f64>::from_row_slice(2, 2, &[1.0, 2.0, 2.0, 1.0]);
+        let v = k + DMatrix::<f64>::identity(2, 2) * lambda;
+        let chol_v = v.clone().cholesky().unwrap();
+        let y_vec = DVector::<f64>::from_row_slice(&y);
+        let x_mat = DMatrix::<f64>::from_row_slice(2, 1, &[1.0, 1.0]);
+        let vinv_y = chol_v.solve(&y_vec);
+        let vinv_x = chol_v.solve(&x_mat);
+        let xt_vinv_x = x_mat.transpose() * &vinv_x;
+        let chol_x = xt_vinv_x.clone().cholesky().unwrap();
+        let xt_vinv_y = x_mat.transpose() * &vinv_y;
+        let beta = chol_x.solve(&xt_vinv_y);
+        let py = vinv_y - vinv_x * beta;
+        let ypy = y_vec.dot(&py);
+        let df = 1.0_f64;
+        let sigma_g2 = ypy / df;
+        let log_det_v = 2.0_f64 * chol_v.l().diagonal().iter().map(|d| d.ln()).sum::<f64>();
+        let log_det_xt = 2.0_f64 * chol_x.l().diagonal().iter().map(|d| d.ln()).sum::<f64>();
+        let c_reml = df * (df.ln() - 1.0_f64 - (2.0_f64 * PI).ln()) * 0.5_f64;
+        let reml = c_reml - 0.5_f64 * (df * ypy.ln() + log_det_v + log_det_xt);
+        let n_f = 2.0_f64;
+        let c_ml = n_f * (n_f.ln() - 1.0_f64 - (2.0_f64 * PI).ln()) * 0.5_f64;
+        let ml = c_ml - 0.5_f64 * (n_f * ypy.ln() + log_det_v);
+
+        assert_close(eval.lambda, lambda, 1e-12_f64, "lambda");
+        assert_close(eval.sigma_g2, sigma_g2, 1e-12_f64, "sigma_g2");
+        assert_close(eval.sigma_e2, lambda * sigma_g2, 1e-12_f64, "sigma_e2");
+        assert_close(eval.reml, reml, 1e-12_f64, "reml");
+        assert_close(eval.ml, ml, 1e-12_f64, "ml");
     }
 }

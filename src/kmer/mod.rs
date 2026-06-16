@@ -3,6 +3,7 @@ pub mod count;
 pub mod encode;
 pub mod ffi;
 pub mod format;
+pub mod progress;
 pub mod reader;
 pub mod record;
 pub mod stage1_bucket;

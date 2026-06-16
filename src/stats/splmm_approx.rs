@@ -23,6 +23,8 @@ pub(crate) struct ResidualizedApproxNullFit {
     pub(crate) sigma_e2: f64,
     pub(crate) ml: f64,
     pub(crate) reml: f64,
+    // Keeps gamma on the same V^-1 scale as a_vec when the factor is K + lambda I only.
+    gamma_scale_correction: f64,
     factor: SparseJxgrmCholesky,
 }
 
@@ -398,6 +400,7 @@ pub(crate) fn fit_sparse_reml_on_residualized_response(
         sigma_e2: best_eval.sigma_e2,
         ml: best_eval.ml,
         reml: best_eval.reml,
+        gamma_scale_correction: 1.0_f64,
         factor,
     })
 }
@@ -479,6 +482,7 @@ fn build_residualized_approx_null_from_residualized_response(
         sigma_e2,
         ml: f64::NAN,
         reml: f64::NAN,
+        gamma_scale_correction: 1.0_f64,
         factor,
     })
 }
@@ -505,6 +509,7 @@ pub(crate) fn build_residualized_approx_scan_null_from_lambda_and_factor(
         sigma_e2: lambda * sigma2_scan,
         ml: f64::NAN,
         reml: f64::NAN,
+        gamma_scale_correction: 1.0_f64 / sigma2_scan,
         factor,
     })
 }
@@ -566,7 +571,10 @@ impl ResidualizedApproxNullFit {
                     .to_string(),
             );
         }
-        Ok((ratio_sum / (n_used as f64), n_used))
+        Ok((
+            (ratio_sum / (n_used as f64)) * self.gamma_scale_correction,
+            n_used,
+        ))
     }
 
     pub(crate) fn build_scan_model(
@@ -762,5 +770,66 @@ mod tests {
         assert!((fit.lambda - 0.5_f64).abs() <= 1e-12_f64);
         let expected_a = fit.factor.solve_vec(fit.y_resid.as_slice()).unwrap();
         assert_close(&fit.a_vec, &expected_a, 1e-12_f64);
+    }
+
+    #[test]
+    fn lambda_only_scan_null_matches_component_scaled_gamma_and_assoc() {
+        let analysis = make_diag_analysis(&[1.0_f64, 1.5_f64, 2.0_f64, 3.0_f64]);
+        let x_design = vec![1.0_f64, 1.0_f64, 1.0_f64, 1.0_f64];
+        let y = vec![1.0_f64, -0.25_f64, 0.75_f64, 1.5_f64];
+        let lambda = 0.8_f64;
+        let (_y_resid, sigma2_scan) =
+            residualized_scan_sigma2_from_lambda(&x_design, &y, lambda).unwrap();
+
+        let component_fit = build_residualized_approx_null_from_components(
+            &analysis,
+            &x_design,
+            &y,
+            sigma2_scan,
+            lambda * sigma2_scan,
+        )
+        .unwrap();
+
+        let lambda_fit = build_residualized_approx_scan_null_from_lambda_and_factor(
+            analysis.factorize_k_plus_lambda_i(lambda).unwrap(),
+            &x_design,
+            &y,
+            lambda,
+        )
+        .unwrap();
+
+        assert_close(
+            component_fit.a_vec.as_slice(),
+            lambda_fit.a_vec.as_slice(),
+            1e-12_f64,
+        );
+
+        let sampled_markers = vec![
+            0.0_f64, 1.0_f64, 2.0_f64, 1.0_f64, //
+            2.0_f64, 0.0_f64, 1.0_f64, 1.0_f64,
+        ];
+        let (gamma_component, used_component) = component_fit
+            .estimate_gamma_from_markers(&x_design, sampled_markers.as_slice(), 2)
+            .unwrap();
+        let (gamma_lambda, used_lambda) = lambda_fit
+            .estimate_gamma_from_markers(&x_design, sampled_markers.as_slice(), 2)
+            .unwrap();
+        assert_eq!(used_component, used_lambda);
+        assert!((gamma_component - gamma_lambda).abs() <= 1e-12_f64);
+
+        let test_marker = vec![1.0_f64, 2.0_f64, 0.0_f64, 1.0_f64];
+        let assoc_component = component_fit
+            .build_scan_model(&x_design, gamma_component)
+            .unwrap()
+            .assoc_from_marker(test_marker.as_slice())
+            .unwrap();
+        let assoc_lambda = lambda_fit
+            .build_scan_model(&x_design, gamma_lambda)
+            .unwrap()
+            .assoc_from_marker(test_marker.as_slice())
+            .unwrap();
+        assert!((assoc_component.0 - assoc_lambda.0).abs() <= 1e-12_f64);
+        assert!((assoc_component.1 - assoc_lambda.1).abs() <= 1e-12_f64);
+        assert!((assoc_component.2 - assoc_lambda.2).abs() <= 1e-12_f64);
     }
 }

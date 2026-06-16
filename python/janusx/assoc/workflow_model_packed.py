@@ -2105,15 +2105,16 @@ def _jxlmm_component_scale_reml(
     resid = np.ascontiguousarray(y - (x_design @ beta), dtype=np.float64)
     rss_mx = float(np.dot(resid, resid))
     df = int(n - p)
+    # These are diagnostic scale summaries only. The Rust sparse scan paths now
+    # consume lambda directly and reconstruct any scan-scale sigma^2 internally
+    # on the same K + lambda I chain, so these values are no longer used to
+    # rescale scan inputs.
+    #
     # Under the explicit P0 + sigma^2 parameterization:
     #   sigma2_profile = y'P0y / (n - p)
     #   sigma2_mx      = y'M_Xy / (n - p)
-    # For standardized K, V = sigma^2 (K + lambda I), so the approximate scan
-    # should use sigma2_scan = sigma2_mx / (1 + lambda)
-    #                           = sigma2_mx / ((sigma_g2 + sigma_e2) / sigma_g2).
-    # Because Rust still receives (sigma_g2, sigma_e2), the effective factor we
-    # apply to both components is:
-    #   scan_scale = sigma2_scan / sigma2_profile = sigma2_mx / (sigma_g2 + sigma_e2).
+    # For standardized K, V = sigma^2 (K + lambda I), the residualized approx
+    # scan-scale variance is sigma2_scan = sigma2_mx / (1 + lambda).
     ypy_reml = float(sigma_g2) * float(df) if np.isfinite(sigma_g2) and df > 0 else float("nan")
     resid_var_reml = float(sigma_g2) if np.isfinite(sigma_g2) else float("nan")
     resid_var_mx_reml = float(rss_mx / float(df)) if df > 0 else float("nan")

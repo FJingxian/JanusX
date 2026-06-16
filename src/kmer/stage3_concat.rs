@@ -1,5 +1,6 @@
 use crate::kmer::encode::ENCODING_NAME;
 use crate::kmer::format::{BkmerHeader, BsiteHeader, BucketPartSummary, KmergeMeta, SampleEntry};
+use crate::kmer::progress::KmergeProgressBar;
 use crate::kmer::writer::{append_path_to_writer, bytes_per_col, write_idv_file, write_meta_json};
 use anyhow::{bail, Context, Result};
 use std::fs::{self, File};
@@ -16,6 +17,7 @@ pub struct Stage3Config<'a> {
     pub min_count: u32,
     pub freq: f64,
     pub bucket_bits: u8,
+    pub progress_bar: KmergeProgressBar,
 }
 
 #[derive(Clone, Debug)]
@@ -45,6 +47,7 @@ pub fn run_stage3(config: &Stage3Config<'_>) -> Result<Stage3Summary> {
     let meta_path = config.out_dir.join(format!("{}.meta.json", config.prefix));
 
     write_idv_file(&idv_path, config.samples)?;
+    config.progress_bar.inc(1);
 
     let n_samples = config.samples.len() as u64;
     let bytes_per_col_u64 = bytes_per_col(config.samples.len()) as u64;
@@ -60,6 +63,7 @@ pub fn run_stage3(config: &Stage3Config<'_>) -> Result<Stage3Summary> {
     .write_to(&mut bkmer_writer)?;
     for part in config.parts.iter() {
         append_path_to_writer(&mut bkmer_writer, Path::new(&part.bkmer_part))?;
+        config.progress_bar.inc(1);
     }
     bkmer_writer.flush()?;
 
@@ -74,6 +78,7 @@ pub fn run_stage3(config: &Stage3Config<'_>) -> Result<Stage3Summary> {
     .write_to(&mut bsite_writer)?;
     for part in config.parts.iter() {
         append_path_to_writer(&mut bsite_writer, Path::new(&part.bsite_part))?;
+        config.progress_bar.inc(1);
     }
     bsite_writer.flush()?;
 
@@ -110,6 +115,7 @@ pub fn run_stage3(config: &Stage3Config<'_>) -> Result<Stage3Summary> {
         compression: "none".to_string(),
     };
     write_meta_json(&meta_path, &meta)?;
+    config.progress_bar.inc(1);
     fs::write(config.tmp_dir.join("stage3.done"), b"done\n")
         .context("failed to write stage3 marker")?;
 

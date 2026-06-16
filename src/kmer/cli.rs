@@ -1,5 +1,6 @@
 use crate::kmer::ffi::kmc_reader::KmcReader;
 use crate::kmer::format::{KmergeMeta, SampleEntry};
+use crate::kmer::progress::KmergeProgressBar;
 use crate::kmer::stage1_bucket::{run_stage1, Stage1Config};
 use crate::kmer::stage2_merge::{load_stage2_manifest, run_stage2, Stage2Config};
 use crate::kmer::stage3_concat::{run_stage3, Stage3Config, Stage3Summary};
@@ -134,7 +135,8 @@ pub fn run_kmerge(args: KmergeArgs) -> Result<Stage3Summary> {
             "single-sample kmerge with freq > 0 filters out all present k-mers; use freq=0.0 or provide multiple samples"
         );
     }
-    let k = inspect_common_k(&samples)?;
+    let inspect = inspect_kmerge_inputs(&samples)?;
+    let k = inspect.k;
     let log_path = args.log_path.as_deref();
 
     prepare_output_space(&out_dir, &tmp_dir, &args, &samples)?;
@@ -168,6 +170,7 @@ pub fn run_kmerge(args: KmergeArgs) -> Result<Stage3Summary> {
 
     if !(args.resume && is_stage_done(&tmp_dir.join("stage1.done"))) {
         emit_run_line(log_path, "Stage 1/3: KMC stream -> bucketed sorted runs")?;
+        let stage1_pb = build_stage_progress_bar("Stage 1/3 records", inspect.total_stage1_records);
         run_stage1(&Stage1Config {
             tmp_dir: &tmp_dir,
             samples: &samples,
@@ -177,7 +180,9 @@ pub fn run_kmerge(args: KmergeArgs) -> Result<Stage3Summary> {
             bucket_bits: args.bucket_bits,
             max_records_per_flush,
             threads: args.threads,
+            progress_bar: stage1_pb.clone(),
         })?;
+        finish_stage_progress_bar(&stage1_pb);
     } else {
         emit_run_line(
             log_path,
@@ -196,13 +201,17 @@ pub fn run_kmerge(args: KmergeArgs) -> Result<Stage3Summary> {
             log_path,
             "Stage 2/3: bucket merge -> .bkmer.part / .bsite.part",
         )?;
-        run_stage2(&Stage2Config {
+        let stage2_pb = build_stage_progress_bar("Stage 2/3 buckets", 1u64 << args.bucket_bits);
+        let parts = run_stage2(&Stage2Config {
             tmp_dir: &tmp_dir,
             n_samples: samples.len(),
             freq: args.freq,
             bucket_bits: args.bucket_bits,
             threads: args.threads,
-        })?
+            progress_bar: stage2_pb.clone(),
+        })?;
+        finish_stage_progress_bar(&stage2_pb);
+        parts
     };
 
     if parts.iter().map(|part| part.n_kmers).sum::<u64>() == 0 {
@@ -210,6 +219,10 @@ pub fn run_kmerge(args: KmergeArgs) -> Result<Stage3Summary> {
     }
 
     emit_run_line(log_path, "Stage 3/3: concat parts -> final matrix")?;
+    let stage3_pb = build_stage_progress_bar(
+        "Stage 3/3 concat",
+        (parts.len() as u64).saturating_mul(2).saturating_add(2),
+    );
     let summary = run_stage3(&Stage3Config {
         out_dir: &out_dir,
         prefix: &args.prefix,
@@ -220,7 +233,9 @@ pub fn run_kmerge(args: KmergeArgs) -> Result<Stage3Summary> {
         min_count: args.min_count,
         freq: args.freq,
         bucket_bits: args.bucket_bits,
+        progress_bar: stage3_pb.clone(),
     })?;
+    finish_stage_progress_bar(&stage3_pb);
 
     if !args.keep_tmp {
         fs::remove_dir_all(&tmp_dir)
@@ -315,11 +330,18 @@ fn parse_db_list_file(path: &str) -> Result<Vec<(String, String)>> {
     Ok(out)
 }
 
-fn inspect_common_k(samples: &[SampleEntry]) -> Result<u32> {
+struct KmergeInputInspect {
+    k: u32,
+    total_stage1_records: u64,
+}
+
+fn inspect_kmerge_inputs(samples: &[SampleEntry]) -> Result<KmergeInputInspect> {
     let mut common_k = None::<u32>;
+    let mut total_stage1_records = 0u64;
     for sample in samples {
         let reader = KmcReader::open(&sample.kmc_prefix, 0)
             .with_context(|| format!("failed to inspect KMC db: {}", sample.kmc_prefix))?;
+        total_stage1_records = total_stage1_records.saturating_add(reader.info().total_kmers);
         let k = reader.info().kmer_length;
         if k == 0 {
             bail!("invalid KMC k-mer length for {}", sample.kmc_prefix);
@@ -339,7 +361,19 @@ fn inspect_common_k(samples: &[SampleEntry]) -> Result<u32> {
             common_k = Some(k);
         }
     }
-    common_k.ok_or_else(|| anyhow::anyhow!("no samples available after resolving KMC inputs"))
+    Ok(KmergeInputInspect {
+        k: common_k
+            .ok_or_else(|| anyhow::anyhow!("no samples available after resolving KMC inputs"))?,
+        total_stage1_records,
+    })
+}
+
+fn build_stage_progress_bar(desc: &str, total: u64) -> KmergeProgressBar {
+    KmergeProgressBar::new(desc, total)
+}
+
+fn finish_stage_progress_bar(progress_bar: &KmergeProgressBar) {
+    progress_bar.finish();
 }
 
 fn prepare_output_space(

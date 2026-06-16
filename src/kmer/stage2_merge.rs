@@ -1,4 +1,5 @@
 use crate::kmer::format::BucketPartSummary;
+use crate::kmer::progress::KmergeProgressBar;
 use crate::kmer::record::{read_rec_opt, KmerPresenceRec};
 use crate::kmer::writer::{bitset_column, bytes_per_col};
 use anyhow::{bail, Context, Result};
@@ -16,6 +17,7 @@ pub struct Stage2Config<'a> {
     pub freq: f64,
     pub bucket_bits: u8,
     pub threads: usize,
+    pub progress_bar: KmergeProgressBar,
 }
 
 pub fn run_stage2(config: &Stage2Config<'_>) -> Result<Vec<BucketPartSummary>> {
@@ -37,7 +39,11 @@ pub fn run_stage2(config: &Stage2Config<'_>) -> Result<Vec<BucketPartSummary>> {
     let mut parts = pool.install(|| {
         bucket_ids
             .into_par_iter()
-            .map(|bucket_id| merge_bucket(bucket_id, &parts_dir, config))
+            .map(|bucket_id| {
+                let part = merge_bucket(bucket_id, &parts_dir, config)?;
+                config.progress_bar.inc(1);
+                Ok(part)
+            })
             .collect::<Result<Vec<_>>>()
     })?;
     parts.retain(|part| part.n_kmers > 0);

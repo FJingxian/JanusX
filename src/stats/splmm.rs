@@ -6056,7 +6056,7 @@ mod tests {
         build_design_with_intercept(Some(&x_cov), 3, 1)
     }
 
-    fn make_diag_factor(diag: &[f64]) -> SparseJxgrmCholesky {
+    fn make_diag_analysis(diag: &[f64]) -> SparseJxgrmCholeskyAnalysis {
         let n = diag.len();
         let csc = SparseGrmCsc {
             n_samples: n,
@@ -6065,10 +6065,11 @@ mod tests {
             row_indices: (0..n).map(|v| v as u32).collect(),
             values: diag.to_vec(),
         };
-        sparse_cholesky_analyze_jxgrm_csc(&csc)
-            .unwrap()
-            .factorize_diag_shifted(0.0)
-            .unwrap()
+        sparse_cholesky_analyze_jxgrm_csc(&csc).unwrap()
+    }
+
+    fn make_diag_factor(diag: &[f64]) -> SparseJxgrmCholesky {
+        make_diag_analysis(diag).factorize_diag_shifted(0.0).unwrap()
     }
 
     fn sample_mapping(scan_sample_idx: &[usize]) -> (bool, Option<Vec<usize>>, Option<Vec<u8>>) {
@@ -6722,6 +6723,91 @@ mod tests {
         assert_eq!(built.null_model.n_covariates, p);
         assert!((built.null_model.ypy - ypy_manual).abs() <= 1e-12_f64);
         assert!((built.null_model.sigma2 - sigma2_manual).abs() <= 1e-12_f64);
+    }
+
+    #[test]
+    fn exact_scan_is_invariant_to_global_v_scale_when_lambda_matches() {
+        let (prepared, scan_sample_idx) = make_test_scan_prepared();
+        let x_design = make_test_design();
+        let y_vec = vec![0.5_f64, -1.0_f64, 1.25_f64];
+        let analysis = make_diag_analysis(&[1.0_f64, 2.0_f64, 4.0_f64]);
+        let lambda = 0.75_f64;
+        let sigma2_scale = 1.8_f64;
+        let factor_lambda = analysis.factorize_k_plus_lambda_i(lambda).unwrap();
+        let factor_scaled = analysis
+            .factorize_sigma_g2_k_plus_sigma_e2_i(sigma2_scale, lambda * sigma2_scale)
+            .unwrap();
+        let n = y_vec.len();
+        let p = x_design.len() / n;
+
+        let mut workspace_lambda = factor_lambda.make_solve_workspace(p.max(1)).unwrap();
+        let built_lambda = build_sparse_jxlmm_null_state(
+            &factor_lambda,
+            &x_design,
+            &y_vec,
+            &mut workspace_lambda,
+            None,
+        )
+        .unwrap();
+        let mut workspace_scaled = factor_scaled.make_solve_workspace(p.max(1)).unwrap();
+        let built_scaled = build_sparse_jxlmm_null_state(
+            &factor_scaled,
+            &x_design,
+            &y_vec,
+            &mut workspace_scaled,
+            None,
+        )
+        .unwrap();
+
+        let mut scan_workspace_lambda = factor_lambda.make_solve_workspace(2).unwrap();
+        let out_lambda = scan_with_py_and_exact_p_sparse(
+            &factor_lambda,
+            &prepared,
+            &x_design,
+            &built_lambda.x_design_col_major,
+            &built_lambda.null_model.py,
+            built_lambda.null_model.ypy,
+            built_lambda.null_model.df,
+            &built_lambda.null_model.xt_w_x_chol,
+            &scan_sample_idx,
+            PackedGeneticModel::Add,
+            1,
+            0,
+            None,
+            2,
+            9,
+            0,
+            0,
+            None,
+            &mut scan_workspace_lambda,
+        )
+        .unwrap();
+
+        let mut scan_workspace_scaled = factor_scaled.make_solve_workspace(2).unwrap();
+        let out_scaled = scan_with_py_and_exact_p_sparse(
+            &factor_scaled,
+            &prepared,
+            &x_design,
+            &built_scaled.x_design_col_major,
+            &built_scaled.null_model.py,
+            built_scaled.null_model.ypy,
+            built_scaled.null_model.df,
+            &built_scaled.null_model.xt_w_x_chol,
+            &scan_sample_idx,
+            PackedGeneticModel::Add,
+            1,
+            0,
+            None,
+            2,
+            9,
+            0,
+            0,
+            None,
+            &mut scan_workspace_scaled,
+        )
+        .unwrap();
+
+        assert_close(&out_lambda, &out_scaled, 1e-10_f64);
     }
 
     #[test]

@@ -423,6 +423,39 @@ pub(crate) fn build_residualized_approx_null_from_components(
     build_residualized_approx_null_from_residualized_response(analysis, y_resid, sigma_g2, sigma_e2)
 }
 
+fn residualized_scan_sigma2_from_lambda(
+    x_design: &[f64],
+    y: &[f64],
+    lambda: f64,
+) -> Result<(Vec<f64>, f64), String> {
+    if !(lambda.is_finite() && lambda >= 0.0) {
+        return Err(format!(
+            "SparseLMM residualized approx requires finite lambda >= 0, got {lambda}"
+        ));
+    }
+    let (n, p) = validate_design_and_response(x_design, y)?;
+    if n <= p {
+        return Err(format!(
+            "SparseLMM residualized approx requires n > p, got n={n}, p={p}"
+        ));
+    }
+    let df = (n - p) as f64;
+    let (y_resid, _) = residualize_response(x_design, y)?;
+    let rss_mx = dot_f64(y_resid.as_slice(), y_resid.as_slice());
+    if !(rss_mx.is_finite() && rss_mx > SPLMM_APPROX_TINY) {
+        return Err(format!(
+            "SparseLMM residualized approx produced invalid residualized RSS: {rss_mx}"
+        ));
+    }
+    let sigma2_scan = rss_mx / (df * (1.0_f64 + lambda));
+    if !(sigma2_scan.is_finite() && sigma2_scan > 0.0) {
+        return Err(format!(
+            "SparseLMM residualized approx produced invalid scan sigma2 at lambda={lambda}: {sigma2_scan}"
+        ));
+    }
+    Ok((y_resid, sigma2_scan))
+}
+
 fn build_residualized_approx_null_from_residualized_response(
     analysis: &SparseJxgrmCholeskyAnalysis,
     y_resid: Vec<f64>,
@@ -450,58 +483,30 @@ fn build_residualized_approx_null_from_residualized_response(
     })
 }
 
-pub(crate) fn build_residualized_approx_scan_null_from_profile_components(
-    analysis: &SparseJxgrmCholeskyAnalysis,
+pub(crate) fn build_residualized_approx_scan_null_from_lambda_and_factor(
+    factor: SparseJxgrmCholesky,
     x_design: &[f64],
     y: &[f64],
-    sigma_g2: f64,
-    sigma_e2: f64,
+    lambda: f64,
 ) -> Result<ResidualizedApproxNullFit, String> {
-    if !(sigma_g2.is_finite() && sigma_g2 > 0.0) {
-        return Err(format!(
-            "SparseLMM residualized approx requires finite sigma_g2 > 0, got {sigma_g2}"
-        ));
+    let (y_resid, sigma2_scan) = residualized_scan_sigma2_from_lambda(x_design, y, lambda)?;
+    let mut a_vec = factor.solve_vec(y_resid.as_slice())?;
+    if sigma2_scan != 1.0_f64 {
+        let inv_sigma2 = 1.0_f64 / sigma2_scan;
+        for value in a_vec.iter_mut() {
+            *value *= inv_sigma2;
+        }
     }
-    if !(sigma_e2.is_finite() && sigma_e2 >= 0.0) {
-        return Err(format!(
-            "SparseLMM residualized approx requires finite sigma_e2 >= 0, got {sigma_e2}"
-        ));
-    }
-    let (n, p) = validate_design_and_response(x_design, y)?;
-    if n <= p {
-        return Err(format!(
-            "SparseLMM residualized approx requires n > p, got n={n}, p={p}"
-        ));
-    }
-    let df = (n - p) as f64;
-    let (y_resid, _) = residualize_response(x_design, y)?;
-    let rss_mx = dot_f64(y_resid.as_slice(), y_resid.as_slice());
-    if !(rss_mx.is_finite() && rss_mx > SPLMM_APPROX_TINY) {
-        return Err(format!(
-            "SparseLMM residualized approx produced invalid residualized RSS: {rss_mx}"
-        ));
-    }
-    let resid_var_mx = rss_mx / df;
-    let sigma_sum_profile = sigma_g2 + sigma_e2;
-    if !(sigma_sum_profile.is_finite() && sigma_sum_profile > SPLMM_APPROX_TINY) {
-        return Err(format!(
-            "SparseLMM residualized approx requires finite sigma_g2 + sigma_e2 > 0, got {sigma_sum_profile}"
-        ));
-    }
-    let scan_scale = resid_var_mx / sigma_sum_profile;
-    if !(scan_scale.is_finite() && scan_scale > 0.0) {
-        return Err(format!(
-            "SparseLMM residualized approx produced invalid scan scale: resid_var_mx={resid_var_mx}, sigma_sum_profile={sigma_sum_profile}, scan_scale={scan_scale}"
-        ));
-    }
-    let sigma_g2_scan = sigma_g2 * scan_scale;
-    let sigma_e2_scan = sigma_e2 * scan_scale;
-    build_residualized_approx_null_from_residualized_response(
-        analysis,
+    Ok(ResidualizedApproxNullFit {
         y_resid,
-        sigma_g2_scan,
-        sigma_e2_scan,
-    )
+        a_vec,
+        lambda,
+        sigma_g2: sigma2_scan,
+        sigma_e2: lambda * sigma2_scan,
+        ml: f64::NAN,
+        reml: f64::NAN,
+        factor,
+    })
 }
 
 impl ResidualizedApproxNullFit {

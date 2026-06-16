@@ -43,7 +43,6 @@ pub struct KmergeMeta {
     pub bsite_file: String,
     pub idv_file: String,
     pub min_count: u32,
-    pub min_presence: u32,
     pub min_presence_rate: f64,
     pub max_presence_rate: f64,
     pub bucket_bits: u8,

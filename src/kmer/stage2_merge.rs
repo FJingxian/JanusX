@@ -13,7 +13,6 @@ use std::path::{Path, PathBuf};
 pub struct Stage2Config<'a> {
     pub tmp_dir: &'a Path,
     pub n_samples: usize,
-    pub min_presence: u32,
     pub freq: f64,
     pub bucket_bits: u8,
     pub threads: usize,
@@ -173,10 +172,7 @@ fn merge_bucket(
         }
 
         let presence = present_samples.len() as u32;
-        if presence < config.min_presence {
-            continue;
-        }
-        let rate = present_samples.len() as f64 / config.n_samples as f64;
+        let rate = presence as f64 / config.n_samples as f64;
         if rate < config.freq || rate > 1.0 - config.freq {
             continue;
         }

@@ -207,12 +207,16 @@ def compute_jx_rhat(
     flip_sub = np.ascontiguousarray(np.asarray(meta["row_flip"], dtype=np.bool_)[mask], dtype=np.bool_)
     if row_idx_sub.size == 0:
         raise RuntimeError("no SNPs remained after intersecting trait QC rows with extract set")
+    if (not np.isfinite(float(sigma_g2))) or float(sigma_g2) <= 0.0:
+        raise RuntimeError(f"invalid sigma_g2 for SparseLMM lambda conversion: {sigma_g2}")
+    if (not np.isfinite(float(sigma_e2))) or float(sigma_e2) < 0.0:
+        raise RuntimeError(f"invalid sigma_e2 for SparseLMM lambda conversion: {sigma_e2}")
+    lbd = float(float(sigma_e2) / float(sigma_g2))
 
     out = w.jxrs.splmm_assoc_pcg_bed(
         str(bfile),
         y_vec,
-        float(sigma_g2),
-        float(sigma_e2),
+        float(lbd),
         x_cov=None,
         sample_indices=sample_idx,
         operator_sample_indices=sample_idx,

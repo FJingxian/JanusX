@@ -14,7 +14,6 @@ pub struct Stage3Config<'a> {
     pub parts: &'a [BucketPartSummary],
     pub k: u32,
     pub min_count: u32,
-    pub min_presence: u32,
     pub freq: f64,
     pub bucket_bits: u8,
 }
@@ -105,7 +104,6 @@ pub fn run_stage3(config: &Stage3Config<'_>) -> Result<Stage3Summary> {
             .unwrap_or_default()
             .to_string(),
         min_count: config.min_count,
-        min_presence: config.min_presence,
         min_presence_rate: config.freq,
         max_presence_rate: 1.0 - config.freq,
         bucket_bits: config.bucket_bits,

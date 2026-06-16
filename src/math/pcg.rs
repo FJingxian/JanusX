@@ -839,9 +839,11 @@ fn pcg_normalize_sample_idx(
 pub(crate) struct PcgJxlmmNullModel {
     pub(crate) n_samples: usize,
     pub(crate) n_covariates: usize,
+    pub(crate) df: f64,
+    pub(crate) ypy: f64,
     pub(crate) sigma2: f64,
-    pub(crate) p0y: Vec<f64>,
-    pub(crate) xt_p0_x_chol: Vec<f64>,
+    pub(crate) py: Vec<f64>,
+    pub(crate) xt_w_x_chol: Vec<f64>,
 }
 
 #[derive(Clone, Debug)]
@@ -893,12 +895,24 @@ fn pcg_validate_jxlmm_state(
             null_model.sigma2
         ));
     }
-    if null_model.p0y.len() != null_model.n_samples {
+    if !null_model.df.is_finite() || null_model.df <= 0.0 {
+        return Err(format!(
+            "PCG SparseLMM null model requires finite positive df, got {}",
+            null_model.df
+        ));
+    }
+    if !null_model.ypy.is_finite() || null_model.ypy <= 0.0 {
+        return Err(format!(
+            "PCG SparseLMM null model requires finite positive yPy, got {}",
+            null_model.ypy
+        ));
+    }
+    if null_model.py.len() != null_model.n_samples {
         return Err("PCG SparseLMM null model state length mismatch".to_string());
     }
     pcg_validate_matrix_shape(
-        "SparseLMM XtP0X chol",
-        &null_model.xt_p0_x_chol,
+        "SparseLMM XtWX chol",
+        &null_model.xt_w_x_chol,
         null_model.n_covariates,
         null_model.n_covariates,
     )?;
@@ -929,12 +943,8 @@ pub(crate) fn pcg_jxlmm_s_p0_s_exact(
         v_inv_snp,
         &mut xt_v_inv_s,
     );
-    let sigma2 = null_model.sigma2;
-    for value in xt_v_inv_s.iter_mut() {
-        *value *= sigma2;
-    }
     let mut gamma = vec![0.0_f64; p];
-    cholesky_solve_into(&null_model.xt_p0_x_chol, p, &xt_v_inv_s, &mut gamma);
+    cholesky_solve_into(&null_model.xt_w_x_chol, p, &xt_v_inv_s, &mut gamma);
     let s_v_inv_s = snp
         .iter()
         .zip(v_inv_snp.iter())
@@ -945,7 +955,7 @@ pub(crate) fn pcg_jxlmm_s_p0_s_exact(
         .zip(gamma.iter())
         .map(|(a, b)| a * b)
         .sum::<f64>();
-    Ok((sigma2 * s_v_inv_s - quad).max(0.0_f64))
+    Ok((s_v_inv_s - quad).max(0.0_f64))
 }
 
 #[inline]

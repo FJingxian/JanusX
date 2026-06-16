@@ -341,7 +341,6 @@ impl LmQrProjection {
             n,
         })
     }
-
 }
 
 #[pyfunction]

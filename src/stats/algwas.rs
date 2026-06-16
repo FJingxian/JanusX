@@ -4165,7 +4165,11 @@ fn fit_stage1_greedy_screen_fallback(
         let q = selected_local.len();
         let mut x_cols = Vec::<f64>::with_capacity(n * q);
         for &sel_local in &selected_local {
-            x_cols.extend(dense[sel_local * n..(sel_local + 1) * n].iter().map(|&v| v as f64));
+            x_cols.extend(
+                dense[sel_local * n..(sel_local + 1) * n]
+                    .iter()
+                    .map(|&v| v as f64),
+            );
         }
         let x = DMatrix::<f64>::from_vec(n, q, x_cols);
         let xtx = x.transpose() * &x;

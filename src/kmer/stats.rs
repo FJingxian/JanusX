@@ -1,5 +1,8 @@
 use crate::kmer::format::SampleEntry;
 use crate::kmer::inputs::{inspect_kmc_inputs, resolve_samples};
+use crate::kmer::kbin_stats::{
+    inspect_kbin_compare, planned_kbin_outputs, scan_kbin_compare, write_kbin_compare_outputs,
+};
 use crate::kmer::stage1_bucket::{run_stage1, Stage1Config};
 use crate::kmer::stage2_stats::{run_stage2_stats, Stage2StatsConfig, VennPatternCount};
 use anyhow::{bail, Context, Result};
@@ -35,13 +38,21 @@ enum StatsMode {
     Venn,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum KstatsMode {
+    Kmc(StatsMode),
+    KbinCompare,
+}
+
 #[derive(Debug)]
 struct KstatsArgs {
     pub db_inputs: Vec<String>,
     pub sample_ids: Option<Vec<String>>,
+    pub kbin_prefix: Option<PathBuf>,
+    pub compare_groups: Option<Vec<String>>,
     pub out_dir: PathBuf,
     pub prefix: String,
-    pub mode: StatsMode,
+    pub mode: KstatsMode,
     pub threads: usize,
     pub memory_mb: usize,
     pub tmp_dir: Option<PathBuf>,
@@ -60,10 +71,16 @@ struct KstatsSummary {
     pub pair_intersection_path: Option<PathBuf>,
     pub pair_union_path: Option<PathBuf>,
     pub venn_path: Option<PathBuf>,
+    pub compare_groups_path: Option<PathBuf>,
+    pub compare_patterns_path: Option<PathBuf>,
+    pub compare_pairs_path: Option<PathBuf>,
     pub n_samples: u64,
     pub k: u32,
     pub matrix_bytes: u64,
     pub using_threads: usize,
+    pub n_groups: Option<u64>,
+    pub backend: String,
+    pub scan_mode: Option<String>,
 }
 
 #[pyfunction(
@@ -71,6 +88,8 @@ struct KstatsSummary {
     signature = (
         db_inputs,
         sample_ids = None,
+        kbin = None,
+        compare_groups = None,
         out = ".",
         prefix = "kstats",
         pair = None,
@@ -92,6 +111,8 @@ pub fn kstats_run_py(
     py: Python<'_>,
     db_inputs: Vec<String>,
     sample_ids: Option<Vec<String>>,
+    kbin: Option<String>,
+    compare_groups: Option<Vec<String>>,
     out: &str,
     prefix: &str,
     pair: Option<&str>,
@@ -108,10 +129,13 @@ pub fn kstats_run_py(
     log_path: Option<String>,
     progress_callback: Option<Py<PyAny>>,
 ) -> PyResult<Py<PyDict>> {
-    let mode = parse_mode(pair, venn).map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+    let mode = parse_cli_mode(kbin.as_deref(), compare_groups.as_ref(), pair, venn)
+        .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
     let args = KstatsArgs {
         db_inputs,
         sample_ids,
+        kbin_prefix: kbin.map(PathBuf::from),
+        compare_groups,
         out_dir: PathBuf::from(out),
         prefix: prefix.to_string(),
         mode,
@@ -154,19 +178,78 @@ pub fn kstats_run_py(
             .as_ref()
             .map(|x| x.to_string_lossy().into_owned()),
     )?;
+    out.set_item(
+        "compare_groups",
+        summary
+            .compare_groups_path
+            .as_ref()
+            .map(|x| x.to_string_lossy().into_owned()),
+    )?;
+    out.set_item(
+        "compare_patterns",
+        summary
+            .compare_patterns_path
+            .as_ref()
+            .map(|x| x.to_string_lossy().into_owned()),
+    )?;
+    out.set_item(
+        "compare_pairs",
+        summary
+            .compare_pairs_path
+            .as_ref()
+            .map(|x| x.to_string_lossy().into_owned()),
+    )?;
     out.set_item("n_samples", summary.n_samples)?;
     out.set_item("k", summary.k)?;
     out.set_item("matrix_bytes", summary.matrix_bytes)?;
     out.set_item("using_threads", summary.using_threads)?;
+    out.set_item("n_groups", summary.n_groups)?;
+    out.set_item("backend", summary.backend)?;
+    out.set_item("scan_mode", summary.scan_mode)?;
     Ok(out.unbind())
 }
 
 fn run_kstats(args: KstatsArgs) -> Result<KstatsSummary> {
-    if args.db_inputs.is_empty() {
-        bail!("no input KMC database provided");
-    }
     if args.prefix.trim().is_empty() {
         bail!("prefix cannot be empty");
+    }
+    match args.mode {
+        KstatsMode::Kmc(mode) => run_kstats_kmc(args, mode),
+        KstatsMode::KbinCompare => run_kstats_kbin(args),
+    }
+}
+
+fn parse_mode(pair: Option<&str>, venn: bool) -> Result<StatsMode> {
+    match (pair, venn) {
+        (Some(_), true) => bail!("`-pair` and `-venn` are mutually exclusive"),
+        (None, false) => bail!("one of `-pair` or `-venn` is required"),
+        (Some(raw), false) => Ok(StatsMode::Pair(PairMode::parse(raw)?)),
+        (None, true) => Ok(StatsMode::Venn),
+    }
+}
+
+fn parse_cli_mode(
+    kbin: Option<&str>,
+    compare_groups: Option<&Vec<String>>,
+    pair: Option<&str>,
+    venn: bool,
+) -> Result<KstatsMode> {
+    if kbin.is_some() {
+        if pair.is_some() || venn {
+            bail!("`-pair`/`-venn` are not used with `-kbin`; use `-compare`");
+        }
+        let compare_len = compare_groups.map(|x| x.len()).unwrap_or(0);
+        if compare_len < 2 {
+            bail!("`-kbin` mode requires at least 2 `-compare` groups");
+        }
+        return Ok(KstatsMode::KbinCompare);
+    }
+    Ok(KstatsMode::Kmc(parse_mode(pair, venn)?))
+}
+
+fn run_kstats_kmc(args: KstatsArgs, mode: StatsMode) -> Result<KstatsSummary> {
+    if args.db_inputs.is_empty() {
+        bail!("no input KMC database provided");
     }
     if args.batch_size == 0 {
         bail!("batch_size must be > 0");
@@ -193,7 +276,7 @@ fn run_kstats(args: KstatsArgs) -> Result<KstatsSummary> {
         .ok_or_else(|| anyhow::anyhow!("pairwise matrix byte size overflow"))?;
 
     let log_path = args.log_path.as_deref();
-    prepare_output_space(&out_dir, &tmp_dir, &args.prefix, args.mode, args.force)?;
+    prepare_output_space(&out_dir, &tmp_dir, &args.prefix, mode, args.force)?;
     let max_records_per_flush =
         max_records_per_flush(args.memory_mb, args.threads, args.max_run_size_mb)?;
 
@@ -217,7 +300,12 @@ fn run_kstats(args: KstatsArgs) -> Result<KstatsSummary> {
     let stage3_progress = build_progress_callback(args.progress_callback.as_ref(), 3);
 
     emit_run_line(log_path, "Stage 1/3: KMC stream -> bucketed sorted runs")?;
-    emit_progress_callback(progress_callback, 1, 0, inspect.total_records.max(1) as usize)?;
+    emit_progress_callback(
+        progress_callback,
+        1,
+        0,
+        inspect.total_records.max(1) as usize,
+    )?;
     run_stage1(&Stage1Config {
         tmp_dir: &tmp_dir,
         samples: &samples,
@@ -239,19 +327,19 @@ fn run_kstats(args: KstatsArgs) -> Result<KstatsSummary> {
         n_samples: samples.len(),
         bucket_bits: args.bucket_bits,
         threads: args.threads,
-        collect_patterns: matches!(args.mode, StatsMode::Venn) && samples.len() > 2,
+        collect_patterns: matches!(mode, StatsMode::Venn) && samples.len() > 2,
         progress_callback: stage2_progress.clone(),
         progress_total: stage2_total.max(1),
     })?;
 
     emit_run_line(log_path, "Stage 3/3: write statistics tables")?;
-    let stage3_total = output_row_total(args.mode, samples.len(), stage2.venn_patterns.as_ref());
+    let stage3_total = output_row_total(mode, samples.len(), stage2.venn_patterns.as_ref());
     emit_progress_callback(progress_callback, 3, 0, stage3_total.max(1) as usize)?;
     let mut stage3_done = 0u64;
     let summary = write_outputs(
         &out_dir,
         &args.prefix,
-        args.mode,
+        mode,
         inspect.k,
         &samples,
         &stage2.pair_counts,
@@ -270,13 +358,85 @@ fn run_kstats(args: KstatsArgs) -> Result<KstatsSummary> {
     Ok(summary)
 }
 
-fn parse_mode(pair: Option<&str>, venn: bool) -> Result<StatsMode> {
-    match (pair, venn) {
-        (Some(_), true) => bail!("`-pair` and `-venn` are mutually exclusive"),
-        (None, false) => bail!("one of `-pair` or `-venn` is required"),
-        (Some(raw), false) => Ok(StatsMode::Pair(PairMode::parse(raw)?)),
-        (None, true) => Ok(StatsMode::Venn),
-    }
+fn run_kstats_kbin(args: KstatsArgs) -> Result<KstatsSummary> {
+    let kbin_prefix = args
+        .kbin_prefix
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("missing `-kbin` prefix"))?;
+    let compare_groups = args
+        .compare_groups
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("missing `-compare` groups"))?;
+    let out_dir = args.out_dir.clone();
+    let log_path = args.log_path.as_deref();
+
+    emit_run_line(log_path, "Stage 1/3: load kmerge bitmatrix metadata")?;
+    emit_progress_callback(args.progress_callback.as_deref(), 1, 0, 1)?;
+    let plan = inspect_kbin_compare(kbin_prefix, compare_groups)?;
+    emit_progress_callback(args.progress_callback.as_deref(), 1, 1, 1)?;
+
+    prepare_kbin_output_space(&out_dir, &args.prefix, args.force)?;
+    emit_run_line(
+        log_path,
+        &format!(
+            "Bitmatrix files: meta={} | idv={} | bsite={}",
+            plan.meta_path.display(),
+            plan.idv_path.display(),
+            plan.bsite_path.display()
+        ),
+    )?;
+    emit_run_line(
+        log_path,
+        &format!(
+            "Rust kstats: samples={}, groups={}, k={}, backend=bitmatrix-parallel, threads={}, bytes_per_col={}, scan_mode_hint={}, matrix_bytes={}",
+            plan.n_samples,
+            plan.groups.len(),
+            plan.k,
+            args.threads,
+            plan.bytes_per_col,
+            plan.scan_mode,
+            plan.n_kmers.saturating_mul(plan.bytes_per_col as u64)
+        ),
+    )?;
+
+    let progress_stage2 = build_progress_callback(args.progress_callback.as_ref(), 2);
+    let progress_stage3 = build_progress_callback(args.progress_callback.as_ref(), 3);
+    emit_run_line(
+        log_path,
+        "Stage 2/3: parallel .bsite scan -> group patterns",
+    )?;
+    emit_progress_callback(
+        args.progress_callback.as_deref(),
+        2,
+        0,
+        usize::try_from(plan.n_kmers).unwrap_or(usize::MAX),
+    )?;
+    let scan = scan_kbin_compare(&plan, args.threads, progress_stage2.clone())?;
+
+    emit_run_line(log_path, "Stage 3/3: write comparison tables")?;
+    let compare_outputs = write_kbin_compare_outputs(
+        &out_dir,
+        &args.prefix,
+        &plan,
+        &scan,
+        progress_stage3.clone(),
+    )?;
+
+    Ok(KstatsSummary {
+        pair_intersection_path: None,
+        pair_union_path: None,
+        venn_path: None,
+        compare_groups_path: Some(compare_outputs.groups_path),
+        compare_patterns_path: Some(compare_outputs.patterns_path),
+        compare_pairs_path: Some(compare_outputs.pairs_path),
+        n_samples: plan.n_samples as u64,
+        k: plan.k,
+        matrix_bytes: scan.scan_bytes,
+        using_threads: args.threads,
+        n_groups: Some(plan.groups.len() as u64),
+        backend: "bitmatrix-parallel".to_string(),
+        scan_mode: Some(scan.scan_mode),
+    })
 }
 
 fn prepare_output_space(
@@ -298,8 +458,12 @@ fn prepare_output_space(
     }
     if tmp_dir.exists() {
         if force {
-            fs::remove_dir_all(tmp_dir)
-                .with_context(|| format!("failed to clear tmp dir before rerun: {}", tmp_dir.display()))?;
+            fs::remove_dir_all(tmp_dir).with_context(|| {
+                format!(
+                    "failed to clear tmp dir before rerun: {}",
+                    tmp_dir.display()
+                )
+            })?;
         } else if tmp_dir.read_dir()?.next().is_some() {
             bail!(
                 "tmp dir already exists and is not empty: {} (use --force to overwrite)",
@@ -309,6 +473,20 @@ fn prepare_output_space(
     }
     fs::create_dir_all(tmp_dir)
         .with_context(|| format!("failed to create tmp dir: {}", tmp_dir.display()))?;
+    Ok(())
+}
+
+fn prepare_kbin_output_space(out_dir: &Path, prefix: &str, force: bool) -> Result<()> {
+    fs::create_dir_all(out_dir)
+        .with_context(|| format!("failed to create output dir: {}", out_dir.display()))?;
+    for path in planned_kbin_outputs(out_dir, prefix) {
+        if path.exists() && !force {
+            bail!(
+                "output file already exists: {} (use --force to overwrite)",
+                path.display()
+            );
+        }
+    }
     Ok(())
 }
 
@@ -449,10 +627,16 @@ fn write_outputs(
         pair_intersection_path,
         pair_union_path,
         venn_path,
+        compare_groups_path: None,
+        compare_patterns_path: None,
+        compare_pairs_path: None,
         n_samples: samples.len() as u64,
         k,
         matrix_bytes,
         using_threads,
+        n_groups: None,
+        backend: "bucket-parallel".to_string(),
+        scan_mode: None,
     })
 }
 
@@ -578,7 +762,11 @@ fn write_venn_table_multi(
             sample_ids
         )?;
         for sample_idx in 0..samples.len() {
-            let present = if bit_is_set(&row.bit_words, sample_idx) { 1 } else { 0 };
+            let present = if bit_is_set(&row.bit_words, sample_idx) {
+                1
+            } else {
+                0
+            };
             write!(writer, "\t{present}")?;
         }
         writer.write_all(b"\n")?;

@@ -136,11 +136,12 @@ def build_parser():
                 "jx kstats -db sample_A -db sample_B -venn -o out -prefix pairAB",
                 "jx kstats -db './panel/*.jx*' -venn -o out -prefix panel_venn",
                 "jx kstats -db panel.kmc.tsv -pair intersection -sid A B C -o out -t 8 -memory 4096",
+                "jx kstats -kbin test.kmer/kmerge -compare WY25=WY2_11.jx,WY2_21.jx WY35P=YY3P_11.jx,YY5P_11.jx -o out",
             ]
         ),
         description=(
-            "Compute pairwise KMC k-mer statistics from KMC databases using a "
-            "bucket-parallel Rust backend without producing merged .bkmer/.bsite outputs."
+            "Compute k-mer statistics either from KMC databases or directly from an existing "
+            "JanusX kmerge bitmatrix using Rust backends."
         ),
     )
 
@@ -153,14 +154,23 @@ def build_parser():
         "--db",
         nargs="+",
         action="append",
-        required=True,
         help=(
             "Input KMC databases. Supports KMC prefix, .kmc_pre/.kmc_suf path, "
             "directory/glob auto-discovery, or a one/two-column text file."
         ),
     )
+    required.add_argument(
+        "-kbin",
+        "--kbin",
+        type=str,
+        default=None,
+        help=(
+            "Input JanusX kmerge bitmatrix prefix or .meta.json path. "
+            "Example: /path/to/kmerge or /path/to/kmerge.meta.json."
+        ),
+    )
 
-    mode = required.add_mutually_exclusive_group(required=True)
+    mode = required.add_mutually_exclusive_group(required=False)
     mode.add_argument(
         "-pair",
         "--pair",
@@ -177,13 +187,23 @@ def build_parser():
             "summary row; for >2 samples, outputs one row per observed presence pattern."
         ),
     )
+    required.add_argument(
+        "-compare",
+        "--compare",
+        nargs="+",
+        default=None,
+        help=(
+            "Bitmatrix compare groups for -kbin mode. Each item is either NAME=sample1,sample2 "
+            "or sample1,sample2. At least 2 groups are required."
+        ),
+    )
 
     basic.add_argument(
         "-sid",
         "--sample-id",
         nargs="+",
         default=None,
-        help="Optional sample IDs in the same order as -db.",
+        help="Optional sample IDs in the same order as -db. Only used in -db mode.",
     )
     basic.add_argument(
         "-o",
@@ -261,9 +281,23 @@ def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
 
-    db_inputs = [str(item) for group in args.db for item in group]
-    if len(db_inputs) == 0:
-        parser.error("-db/--db cannot be empty.")
+    db_inputs = [str(item) for group in (args.db or []) for item in group]
+    has_db = len(db_inputs) > 0
+    has_kbin = args.kbin is not None and str(args.kbin).strip() != ""
+    if has_db == has_kbin:
+        parser.error("Exactly one of -db/--db or -kbin/--kbin is required.")
+    if has_db:
+        if args.pair is None and not bool(args.venn):
+            parser.error("One of -pair/--pair or -venn/--venn is required in -db mode.")
+        if args.compare is not None:
+            parser.error("-compare/--compare is only valid in -kbin mode.")
+    else:
+        if args.sample_id is not None:
+            parser.error("-sid/--sample-id is only valid in -db mode.")
+        if args.pair is not None or bool(args.venn):
+            parser.error("-pair/--pair and -venn/--venn are not used with -kbin; use -compare.")
+        if args.compare is None or len(args.compare) < 2:
+            parser.error("-kbin mode requires at least 2 -compare group definitions.")
     if args.thread <= 0:
         parser.error("-t/--thread must be > 0.")
     if args.memory <= 0:
@@ -287,73 +321,124 @@ def main() -> int:
     log_path = str(out_dir / f"{output_prefix}.kstats.log")
     logger = setup_logging(log_path)
 
-    try:
-        resolved = jxrs.kmer_resolve_inputs(
-            db_inputs=db_inputs,
-            sample_ids=None if args.sample_id is None else [str(x).strip() for x in args.sample_id],
-        )
-    except Exception as exc:
-        logger.error(str(exc))
-        return 1
-    resolved_n_samples = int(resolved["n_samples"])
-    resolved_sample_ids = [str(x) for x in resolved["sample_ids"]]
-    resolved_prefixes = [str(x) for x in resolved["prefixes"]]
-
     if requested_threads > detected_threads:
         logger.warning(
             f"Requested threads={requested_threads} exceeds detected available={detected_threads}; using {using_threads}."
         )
 
-    emit_cli_configuration(
-        logger,
-        app_title="JanusX kstats",
-        config_title="KMC pairwise k-mer statistics",
-        host=socket.gethostname(),
-        sections=[
-            (
-                "Input",
-                [
-                    ("Resolved DBs", resolved_n_samples),
-                    ("Sample IDs", len(args.sample_id) if args.sample_id is not None else "auto"),
-                ],
-            ),
-            (
-                "Mode",
-                [
-                    ("Operation", f"pair:{args.pair}" if args.pair is not None else "venn"),
-                    ("Backend", "bucket-parallel"),
-                ],
-            ),
-            (
-                "Runtime",
-                [
-                    (
-                        "Threads",
-                        format_requested_thread_usage(
-                            requested_threads=requested_threads,
-                            using_threads=using_threads,
-                            detected_threads=detected_threads,
+    resolved = None
+    resolved_n_samples = None
+    resolved_sample_ids: list[str] = []
+    resolved_prefixes: list[str] = []
+    kbin_prefix = None
+    compare_specs = None
+    if has_db:
+        try:
+            resolved = jxrs.kmer_resolve_inputs(
+                db_inputs=db_inputs,
+                sample_ids=None if args.sample_id is None else [str(x).strip() for x in args.sample_id],
+            )
+        except Exception as exc:
+            logger.error(str(exc))
+            return 1
+        resolved_n_samples = int(resolved["n_samples"])
+        resolved_sample_ids = [str(x) for x in resolved["sample_ids"]]
+        resolved_prefixes = [str(x) for x in resolved["prefixes"]]
+        emit_cli_configuration(
+            logger,
+            app_title="JanusX kstats",
+            config_title="KMC pairwise k-mer statistics",
+            host=socket.gethostname(),
+            sections=[
+                (
+                    "Input",
+                    [
+                        ("Resolved DBs", resolved_n_samples),
+                        ("Sample IDs", len(args.sample_id) if args.sample_id is not None else "auto"),
+                    ],
+                ),
+                (
+                    "Mode",
+                    [
+                        ("Operation", f"pair:{args.pair}" if args.pair is not None else "venn"),
+                        ("Backend", "bucket-parallel"),
+                    ],
+                ),
+                (
+                    "Runtime",
+                    [
+                        (
+                            "Threads",
+                            format_requested_thread_usage(
+                                requested_threads=requested_threads,
+                                using_threads=using_threads,
+                                detected_threads=detected_threads,
+                            ),
                         ),
-                    ),
-                    ("Memory MB", int(args.memory)),
-                    ("Bucket bits", int(args.bucket_bits)),
-                    ("Max run MB", int(args.max_run_size)),
-                    ("Batch size", int(args.batch_size)),
-                    ("Min count", int(args.min_count)),
-                    ("Keep tmp", bool(args.keep_tmp)),
-                    ("Force", bool(args.force)),
-                    ("Log file", log_path),
-                ],
-            ),
-        ],
-        footer_rows=[("Output dir", str(out_dir)), ("Prefix", output_prefix)],
-    )
-    logger.info("Resolved KMC DB pairs:")
-    for idx, (sample_id, resolved_prefix) in enumerate(
-        zip(resolved_sample_ids, resolved_prefixes), start=1
-    ):
-        kmc_pre, kmc_suf = format_kmc_db_pair_for_display(resolved_prefix)
-        logger.info(f"  [{idx}] {sample_id}\t{kmc_pre} | {kmc_suf}")
+                        ("Memory MB", int(args.memory)),
+                        ("Bucket bits", int(args.bucket_bits)),
+                        ("Max run MB", int(args.max_run_size)),
+                        ("Batch size", int(args.batch_size)),
+                        ("Min count", int(args.min_count)),
+                        ("Keep tmp", bool(args.keep_tmp)),
+                        ("Force", bool(args.force)),
+                        ("Log file", log_path),
+                    ],
+                ),
+            ],
+            footer_rows=[("Output dir", str(out_dir)), ("Prefix", output_prefix)],
+        )
+        logger.info("Resolved KMC DB pairs:")
+        for idx, (sample_id, resolved_prefix) in enumerate(
+            zip(resolved_sample_ids, resolved_prefixes), start=1
+        ):
+            kmc_pre, kmc_suf = format_kmc_db_pair_for_display(resolved_prefix)
+            logger.info(f"  [{idx}] {sample_id}\t{kmc_pre} | {kmc_suf}")
+    else:
+        kbin_prefix = str(Path(args.kbin).expanduser().resolve())
+        compare_specs = [str(x).strip() for x in args.compare]
+        emit_cli_configuration(
+            logger,
+            app_title="JanusX kstats",
+            config_title="Bitmatrix group comparison",
+            host=socket.gethostname(),
+            sections=[
+                (
+                    "Input",
+                    [
+                        ("Kbin prefix", kbin_prefix),
+                        ("Compare groups", len(compare_specs)),
+                    ],
+                ),
+                (
+                    "Mode",
+                    [
+                        ("Operation", "compare"),
+                        ("Backend", "bitmatrix-parallel"),
+                    ],
+                ),
+                (
+                    "Runtime",
+                    [
+                        (
+                            "Threads",
+                            format_requested_thread_usage(
+                                requested_threads=requested_threads,
+                                using_threads=using_threads,
+                                detected_threads=detected_threads,
+                            ),
+                        ),
+                        ("Force", bool(args.force)),
+                        ("Log file", log_path),
+                    ],
+                ),
+            ],
+            footer_rows=[("Output dir", str(out_dir)), ("Prefix", output_prefix)],
+        )
+        logger.info(f"Input kmerge prefix: {format_path_for_display(kbin_prefix)}")
+        logger.info("Compare groups:")
+        for idx, spec in enumerate(compare_specs, start=1):
+            logger.info(f"  [{idx}] {spec}")
     _reopen_file_handlers_append(logger)
 
     progress_ui = _KstatsCliProgress()
@@ -361,6 +446,8 @@ def main() -> int:
         summary = jxrs.kstats_run(
             db_inputs=db_inputs,
             sample_ids=None if args.sample_id is None else [str(x).strip() for x in args.sample_id],
+            kbin=kbin_prefix,
+            compare_groups=compare_specs,
             out=str(out_dir),
             prefix=output_prefix,
             pair=(None if args.pair is None else str(args.pair)),
@@ -384,10 +471,21 @@ def main() -> int:
     finally:
         progress_ui.close()
 
-    log_success(
-        logger,
-        f"kstats finished: samples={int(summary['n_samples'])}, k={int(summary['k'])}, matrix_bytes={int(summary['matrix_bytes'])}",
-    )
+    backend = str(summary.get("backend", "bucket-parallel"))
+    if backend == "bitmatrix-parallel":
+        log_success(
+            logger,
+            (
+                f"kstats finished: samples={int(summary['n_samples'])}, groups={int(summary['n_groups'])}, "
+                f"k={int(summary['k'])}, scan_mode={summary.get('scan_mode')}, "
+                f"matrix_bytes={int(summary['matrix_bytes'])}"
+            ),
+        )
+    else:
+        log_success(
+            logger,
+            f"kstats finished: samples={int(summary['n_samples'])}, k={int(summary['k'])}, matrix_bytes={int(summary['matrix_bytes'])}",
+        )
     logger.info("Output files:")
     if summary["pair_intersection"] is not None:
         logger.info(f"  {format_path_for_display(summary['pair_intersection'])}")
@@ -395,6 +493,12 @@ def main() -> int:
         logger.info(f"  {format_path_for_display(summary['pair_union'])}")
     if summary["venn"] is not None:
         logger.info(f"  {format_path_for_display(summary['venn'])}")
+    if summary["compare_groups"] is not None:
+        logger.info(f"  {format_path_for_display(summary['compare_groups'])}")
+    if summary["compare_patterns"] is not None:
+        logger.info(f"  {format_path_for_display(summary['compare_patterns'])}")
+    if summary["compare_pairs"] is not None:
+        logger.info(f"  {format_path_for_display(summary['compare_pairs'])}")
     logger.info(f"Log file: {format_path_for_display(log_path)}")
     return 0
 

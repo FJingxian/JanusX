@@ -207,7 +207,7 @@ use gwas_unified::{
 };
 use gwasio::load_gwas_triplet_fast;
 use he::he_pcg_bed;
-use kmer::{kmer_count_run_py, kmerge_run_py, kmer_resolve_inputs_py, kstats_run_py};
+use kmer::{kmer_count_run_py, kmer_resolve_inputs_py, kmerge_run_py, kstats_run_py};
 use ld::{
     bed_ldblock_r2_rust, bed_packed_ld_prune_maf_priority, bed_prune_to_plink_rust,
     packed_prune_kernel_stats,

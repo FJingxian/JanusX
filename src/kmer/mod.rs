@@ -4,6 +4,7 @@ pub mod encode;
 pub mod ffi;
 pub mod format;
 pub mod inputs;
+pub mod kbin_stats;
 pub mod progress;
 pub mod reader;
 pub mod record;

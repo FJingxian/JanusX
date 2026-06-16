@@ -624,7 +624,9 @@ impl SplmmScanMode {
         match text.trim().to_ascii_lowercase().as_str() {
             "approx" => Ok(Self::Approx),
             "exact" => Ok(Self::Exact),
-            _ => Err(PyRuntimeError::new_err("scan_mode must be one of: approx, exact")),
+            _ => Err(PyRuntimeError::new_err(
+                "scan_mode must be one of: approx, exact",
+            )),
         }
     }
 
@@ -747,7 +749,6 @@ impl JxlmmPreparedInput {
         let packed = self.payload_bytes()?;
         Ok(&packed[src * self.bytes_per_snp..(src + 1) * self.bytes_per_snp])
     }
-
 }
 
 impl Clone for JxlmmPreparedInput {
@@ -2493,11 +2494,7 @@ fn xt_mat_rhs_block(
 }
 
 #[inline]
-fn splmm_wald_from_score_denom(
-    score: f64,
-    denom: f64,
-    sigma2: f64,
-) -> Option<(f64, f64, f64)> {
+fn splmm_wald_from_score_denom(score: f64, denom: f64, sigma2: f64) -> Option<(f64, f64, f64)> {
     if !(score.is_finite()
         && denom.is_finite()
         && denom > SPLMM_TINY
@@ -2794,9 +2791,7 @@ fn exact_scan_blocks_core<G: GenotypeMatrix>(
                 let schur = (s_v_s - x_quad).max(0.0);
                 let score = spy_slice[local_idx] as f64;
                 let out_row = &mut out_slice[local_idx * 3..(local_idx + 1) * 3];
-                if let Some((beta, se, pwald)) =
-                    splmm_wald_from_score_denom(score, schur, sigma2)
-                {
+                if let Some((beta, se, pwald)) = splmm_wald_from_score_denom(score, schur, sigma2) {
                     out_row[0] = beta;
                     out_row[1] = se;
                     out_row[2] = pwald;
@@ -2819,9 +2814,7 @@ fn exact_scan_blocks_core<G: GenotypeMatrix>(
                 let schur = (s_v_s - x_quad).max(0.0);
                 let score = spy_slice[local_idx] as f64;
                 let out_row = &mut out_slice[local_idx * 3..(local_idx + 1) * 3];
-                if let Some((beta, se, pwald)) =
-                    splmm_wald_from_score_denom(score, schur, sigma2)
-                {
+                if let Some((beta, se, pwald)) = splmm_wald_from_score_denom(score, schur, sigma2) {
                     out_row[0] = beta;
                     out_row[1] = se;
                     out_row[2] = pwald;
@@ -3719,13 +3712,8 @@ fn prepare_splmm_scan_state(
     let workspace_t0 = Instant::now();
     let mut solve_workspace = factor.make_solve_workspace(solve_cap)?;
     prepare_timing.workspace_secs = workspace_t0.elapsed().as_secs_f64();
-    let null_state = build_sparse_jxlmm_null_state(
-        &factor,
-        x_design,
-        y_vec,
-        &mut solve_workspace,
-        stage1_cb,
-    )?;
+    let null_state =
+        build_sparse_jxlmm_null_state(&factor, x_design, y_vec, &mut solve_workspace, stage1_cb)?;
     prepare_timing.null_state_secs = null_state.timing.total_secs;
     let x_design_col_major = null_state.x_design_col_major;
     let null_model = null_state.null_model;
@@ -5218,7 +5206,9 @@ mod tests {
     }
 
     fn make_diag_factor(diag: &[f64]) -> SparseJxgrmCholesky {
-        make_diag_analysis(diag).factorize_diag_shifted(0.0).unwrap()
+        make_diag_analysis(diag)
+            .factorize_diag_shifted(0.0)
+            .unwrap()
     }
 
     fn sample_mapping(scan_sample_idx: &[usize]) -> (bool, Option<Vec<usize>>, Option<Vec<u8>>) {
@@ -6038,5 +6028,4 @@ mod tests {
         assert_eq!(rhat_info.n_markers_requested, 0);
         assert_eq!(rhat_info.n_markers_used, 0);
     }
-
 }

@@ -306,9 +306,12 @@ fn expand_glob_paths(pattern: &str) -> Result<Vec<PathBuf>> {
                 if !dir.is_dir() {
                     continue;
                 }
-                for entry in fs::read_dir(dir)
-                    .with_context(|| format!("failed to read directory for glob expansion: {}", dir.display()))?
-                {
+                for entry in fs::read_dir(dir).with_context(|| {
+                    format!(
+                        "failed to read directory for glob expansion: {}",
+                        dir.display()
+                    )
+                })? {
                     let entry = entry?;
                     let file_name = entry.file_name();
                     let Some(name) = file_name.to_str() else {

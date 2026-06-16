@@ -14,6 +14,15 @@ def format_path_for_display(path: str | Path) -> str:
     return s.replace("\\", "/")
 
 
+def format_kmc_db_pair_for_display(prefix: str | Path) -> tuple[str, str]:
+    prefix_path = safe_resolve(prefix)
+    prefix_text = str(prefix_path)
+    return (
+        format_path_for_display(f"{prefix_text}.kmc_pre"),
+        format_path_for_display(f"{prefix_text}.kmc_suf"),
+    )
+
+
 def format_output_display(
     out_fmt: str,
     out_prefix: str | Path,

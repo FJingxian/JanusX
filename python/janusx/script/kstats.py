@@ -10,7 +10,7 @@ from janusx import janusx as jxrs
 from ._common.config_render import emit_cli_configuration
 from ._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 from ._common.log import setup_logging
-from ._common.pathcheck import format_path_for_display
+from ._common.pathcheck import format_kmc_db_pair_for_display, format_path_for_display
 from ._common.progress import ProgressAdapter
 from ._common.status import log_success
 from ._common.threads import detect_effective_threads, format_requested_thread_usage
@@ -51,12 +51,20 @@ class _KstatsCliProgress:
         self._done = 0
         self._total = 0
         self._bar = None
+        self._completed_stage = None
 
     def callback(self, stage: int, done: int, total: int) -> None:
         stage_i = int(stage)
         done_i = max(0, int(done))
         total_i = max(1, int(total))
         with self._lock:
+            if (
+                self._bar is None
+                and self._stage is None
+                and self._completed_stage == stage_i
+                and done_i >= total_i
+            ):
+                return
             if self._stage != stage_i or self._bar is None:
                 self._close_locked()
                 self._stage = stage_i
@@ -96,6 +104,7 @@ class _KstatsCliProgress:
                 self._bar.finish()
                 self._bar.close()
                 self._bar = None
+                self._completed_stage = stage_i
                 self._stage = None
                 self._done = 0
                 self._total = 0
@@ -255,8 +264,6 @@ def main() -> int:
     db_inputs = [str(item) for group in args.db for item in group]
     if len(db_inputs) == 0:
         parser.error("-db/--db cannot be empty.")
-    db_inputs_log = [str(Path(item).expanduser().resolve()) for item in db_inputs]
-
     if args.thread <= 0:
         parser.error("-t/--thread must be > 0.")
     if args.memory <= 0:
@@ -274,11 +281,23 @@ def main() -> int:
     using_threads = min(requested_threads, detected_threads)
     out_dir = Path(args.out).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
-    prefix = str(args.prefix).strip()
-    if prefix == "":
+    output_prefix = str(args.prefix).strip()
+    if output_prefix == "":
         parser.error("-prefix/--prefix cannot be empty.")
-    log_path = str(out_dir / f"{prefix}.kstats.log")
+    log_path = str(out_dir / f"{output_prefix}.kstats.log")
     logger = setup_logging(log_path)
+
+    try:
+        resolved = jxrs.kmer_resolve_inputs(
+            db_inputs=db_inputs,
+            sample_ids=None if args.sample_id is None else [str(x).strip() for x in args.sample_id],
+        )
+    except Exception as exc:
+        logger.error(str(exc))
+        return 1
+    resolved_n_samples = int(resolved["n_samples"])
+    resolved_sample_ids = [str(x) for x in resolved["sample_ids"]]
+    resolved_prefixes = [str(x) for x in resolved["prefixes"]]
 
     if requested_threads > detected_threads:
         logger.warning(
@@ -294,7 +313,7 @@ def main() -> int:
             (
                 "Input",
                 [
-                    ("DB inputs", len(db_inputs)),
+                    ("Resolved DBs", resolved_n_samples),
                     ("Sample IDs", len(args.sample_id) if args.sample_id is not None else "auto"),
                 ],
             ),
@@ -327,11 +346,14 @@ def main() -> int:
                 ],
             ),
         ],
-        footer_rows=[("Output dir", str(out_dir)), ("Prefix", prefix)],
+        footer_rows=[("Output dir", str(out_dir)), ("Prefix", output_prefix)],
     )
-    logger.info("Input KMC DB arguments:")
-    for idx, path in enumerate(db_inputs_log, start=1):
-        logger.info(f"  [{idx}] {path}")
+    logger.info("Resolved KMC DB pairs:")
+    for idx, (sample_id, resolved_prefix) in enumerate(
+        zip(resolved_sample_ids, resolved_prefixes), start=1
+    ):
+        kmc_pre, kmc_suf = format_kmc_db_pair_for_display(resolved_prefix)
+        logger.info(f"  [{idx}] {sample_id}\t{kmc_pre} | {kmc_suf}")
     _reopen_file_handlers_append(logger)
 
     progress_ui = _KstatsCliProgress()
@@ -340,7 +362,7 @@ def main() -> int:
             db_inputs=db_inputs,
             sample_ids=None if args.sample_id is None else [str(x).strip() for x in args.sample_id],
             out=str(out_dir),
-            prefix=prefix,
+            prefix=output_prefix,
             pair=(None if args.pair is None else str(args.pair)),
             venn=bool(args.venn),
             thread=using_threads,

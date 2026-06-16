@@ -197,12 +197,6 @@ pub fn run_kmerge(args: KmergeArgs) -> Result<Stage3Summary> {
             progress_callback: stage1_progress.clone(),
             progress_total: inspect.total_records.max(1),
         })?;
-        emit_progress_callback(
-            progress_callback,
-            1,
-            inspect.total_records.max(1) as usize,
-            inspect.total_records.max(1) as usize,
-        )?;
     } else {
         emit_run_line(
             log_path,
@@ -232,12 +226,6 @@ pub fn run_kmerge(args: KmergeArgs) -> Result<Stage3Summary> {
             progress_callback: stage2_progress.clone(),
             progress_total: stage2_total.max(1),
         })?;
-        emit_progress_callback(
-            progress_callback,
-            2,
-            stage2_total as usize,
-            stage2_total as usize,
-        )?;
         parts
     };
 
@@ -261,12 +249,6 @@ pub fn run_kmerge(args: KmergeArgs) -> Result<Stage3Summary> {
         progress_callback: stage3_progress.clone(),
         progress_total: stage3_total.max(1),
     })?;
-    emit_progress_callback(
-        progress_callback,
-        3,
-        stage3_total as usize,
-        stage3_total as usize,
-    )?;
 
     if !args.keep_tmp {
         fs::remove_dir_all(&tmp_dir)

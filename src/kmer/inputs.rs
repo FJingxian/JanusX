@@ -1,6 +1,9 @@
 use crate::kmer::ffi::kmc_reader::KmcReader;
 use crate::kmer::format::SampleEntry;
 use anyhow::{bail, Context, Result};
+use pyo3::exceptions::PyRuntimeError;
+use pyo3::prelude::*;
+use pyo3::types::PyDict;
 use std::collections::HashSet;
 use std::fs;
 use std::fs::File;
@@ -93,6 +96,36 @@ pub fn inspect_kmc_inputs(samples: &[SampleEntry]) -> Result<KmcInputInspect> {
         sample_total_kmers,
         all_canonical,
     })
+}
+
+#[pyfunction(
+    name = "kmer_resolve_inputs",
+    signature = (db_inputs, sample_ids = None)
+)]
+pub fn kmer_resolve_inputs_py(
+    py: Python<'_>,
+    db_inputs: Vec<String>,
+    sample_ids: Option<Vec<String>>,
+) -> PyResult<Py<PyDict>> {
+    let samples = resolve_samples(&db_inputs, sample_ids.as_ref())
+        .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+    let out = PyDict::new(py);
+    out.set_item("n_samples", samples.len())?;
+    out.set_item(
+        "sample_ids",
+        samples
+            .iter()
+            .map(|sample| sample.sample_id.clone())
+            .collect::<Vec<_>>(),
+    )?;
+    out.set_item(
+        "prefixes",
+        samples
+            .iter()
+            .map(|sample| sample.kmc_prefix.clone())
+            .collect::<Vec<_>>(),
+    )?;
+    Ok(out.unbind())
 }
 
 fn parse_db_list_file(path: &str) -> Result<Vec<(String, String)>> {

@@ -230,12 +230,6 @@ fn run_kstats(args: KstatsArgs) -> Result<KstatsSummary> {
         progress_callback: stage1_progress.clone(),
         progress_total: inspect.total_records.max(1),
     })?;
-    emit_progress_callback(
-        progress_callback,
-        1,
-        inspect.total_records.max(1) as usize,
-        inspect.total_records.max(1) as usize,
-    )?;
 
     emit_run_line(log_path, "Stage 2/3: bucket merge -> pairwise counts")?;
     let stage2_total = 1u64 << args.bucket_bits;
@@ -249,12 +243,6 @@ fn run_kstats(args: KstatsArgs) -> Result<KstatsSummary> {
         progress_callback: stage2_progress.clone(),
         progress_total: stage2_total.max(1),
     })?;
-    emit_progress_callback(
-        progress_callback,
-        2,
-        stage2_total.max(1) as usize,
-        stage2_total.max(1) as usize,
-    )?;
 
     emit_run_line(log_path, "Stage 3/3: write statistics tables")?;
     let stage3_total = output_row_total(args.mode, samples.len(), stage2.venn_patterns.as_ref());
@@ -274,7 +262,6 @@ fn run_kstats(args: KstatsArgs) -> Result<KstatsSummary> {
         matrix_bytes,
         args.threads,
     )?;
-    emit_progress_callback(progress_callback, 3, stage3_total.max(1) as usize, stage3_total.max(1) as usize)?;
 
     if !args.keep_tmp {
         fs::remove_dir_all(&tmp_dir)

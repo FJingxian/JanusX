@@ -16,4 +16,5 @@ pub mod writer;
 
 pub use cli::kmerge_run_py;
 pub use count::kmer_count_run_py;
+pub use inputs::kmer_resolve_inputs_py;
 pub use stats::kstats_run_py;

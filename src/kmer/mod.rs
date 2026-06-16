@@ -3,13 +3,17 @@ pub mod count;
 pub mod encode;
 pub mod ffi;
 pub mod format;
+pub mod inputs;
 pub mod progress;
 pub mod reader;
 pub mod record;
 pub mod stage1_bucket;
 pub mod stage2_merge;
+pub mod stage2_stats;
 pub mod stage3_concat;
+pub mod stats;
 pub mod writer;
 
 pub use cli::kmerge_run_py;
 pub use count::kmer_count_run_py;
+pub use stats::kstats_run_py;

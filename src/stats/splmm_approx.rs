@@ -1,6 +1,15 @@
 use crate::brent::brent_minimize_with_init;
 use crate::cholesky::{SparseJxgrmCholesky, SparseJxgrmCholeskyAnalysis};
 use crate::linalg::{chi2_sf_df1, cholesky_inplace, cholesky_solve_into};
+use crate::splmm::{
+    choose_rhat_rows, decode_rhat_markers_col_major, emit_progress_callback,
+    emit_splmm_null_scan_core_timing, n_rhat_progress_total, scan_to_tsv_with_py_and_rhat,
+    scan_with_py_and_rhat, splmm_top_level_timing_enabled, trivial_pcg_null_info,
+    trivial_pcg_rhat_info, JxlmmPreparedInput, PackedGeneticModel, SplmmScanResult,
+    SplmmScanToTsvResult,
+};
+use pyo3::prelude::*;
+use std::time::Instant;
 
 const SPLMM_APPROX_TINY: f64 = 1e-30_f64;
 
@@ -511,6 +520,207 @@ pub(crate) fn build_residualized_approx_scan_null_from_lambda_and_factor(
         reml: f64::NAN,
         gamma_scale_correction: 1.0_f64 / sigma2_scan,
         factor,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn estimate_residualized_approx_scan_sparse(
+    factor: SparseJxgrmCholesky,
+    scan_prepared: JxlmmPreparedInput,
+    x_design: Vec<f64>,
+    y_vec: Vec<f64>,
+    scan_sample_idx: Vec<usize>,
+    gm: PackedGeneticModel,
+    lbd: f64,
+    threads: usize,
+    block_rows: usize,
+    rhat_markers: usize,
+    rhat_seed: u64,
+    stage1_progress_callback: Option<Py<PyAny>>,
+    scan_progress_callback: Option<Py<PyAny>>,
+    progress_every: usize,
+    approx_fit_tol: f64,
+    approx_fit_max_iter: usize,
+    mmap_window_mb: Option<usize>,
+) -> Result<SplmmScanResult, String> {
+    let _ = (approx_fit_tol, approx_fit_max_iter);
+    let stage1_cb = stage1_progress_callback.as_ref();
+    let n = y_vec.len();
+    let p = x_design.len() / n;
+    let factor_nnz = factor.factor_nnz();
+    if stage1_cb.is_some() {
+        emit_progress_callback(stage1_cb, 5, 0, 1)?;
+    }
+    let fit = build_residualized_approx_scan_null_from_lambda_and_factor(
+        factor,
+        x_design.as_slice(),
+        y_vec.as_slice(),
+        lbd,
+    )?;
+    if stage1_cb.is_some() {
+        emit_progress_callback(stage1_cb, 5, 1, 1)?;
+    }
+    let rhat_rows = choose_rhat_rows(scan_prepared.n_rows(), rhat_markers, rhat_seed);
+    let n_rhat = rhat_rows.len();
+    let rhat_progress_total = n_rhat_progress_total(scan_prepared.n_rows(), rhat_markers);
+    if stage1_cb.is_some() {
+        emit_progress_callback(stage1_cb, 8, 0, rhat_progress_total)?;
+    }
+    let sampled_markers = decode_rhat_markers_col_major(
+        &scan_prepared,
+        scan_sample_idx.as_slice(),
+        gm,
+        rhat_rows.as_slice(),
+        stage1_cb,
+        8,
+        rhat_progress_total,
+        mmap_window_mb,
+    )?;
+    let (gamma, n_used) =
+        fit.estimate_gamma_from_markers(x_design.as_slice(), sampled_markers.as_slice(), n_rhat)?;
+    if stage1_cb.is_some() {
+        emit_progress_callback(stage1_cb, 8, rhat_progress_total, rhat_progress_total)?;
+    }
+    let model = fit.build_scan_model(x_design.as_slice(), gamma)?;
+    let out = scan_with_py_and_rhat(
+        &scan_prepared,
+        x_design.as_slice(),
+        model.score_vec(),
+        model.xtx_chol(),
+        scan_sample_idx.as_slice(),
+        gm,
+        model.gamma(),
+        threads,
+        block_rows,
+        scan_progress_callback.as_ref(),
+        progress_every,
+        9,
+        0,
+        0,
+        mmap_window_mb,
+    )?;
+    Ok((
+        gamma,
+        out,
+        trivial_pcg_null_info(n, p),
+        trivial_pcg_rhat_info(n, n_rhat, n_used),
+        factor_nnz,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn estimate_residualized_approx_scan_to_tsv_sparse(
+    factor: SparseJxgrmCholesky,
+    scan_prepared: JxlmmPreparedInput,
+    x_design: Vec<f64>,
+    y_vec: Vec<f64>,
+    scan_sample_idx: Vec<usize>,
+    gm: PackedGeneticModel,
+    lbd: f64,
+    threads: usize,
+    block_rows: usize,
+    rhat_markers: usize,
+    rhat_seed: u64,
+    chrom: Vec<String>,
+    pos: Vec<i64>,
+    snp: Vec<String>,
+    allele0: Vec<String>,
+    allele1: Vec<String>,
+    out_tsv: String,
+    stage1_progress_callback: Option<Py<PyAny>>,
+    scan_progress_callback: Option<Py<PyAny>>,
+    progress_every: usize,
+    approx_fit_tol: f64,
+    approx_fit_max_iter: usize,
+    factor_load_secs: f64,
+    mmap_window_mb: Option<usize>,
+) -> Result<SplmmScanToTsvResult, String> {
+    let _ = (approx_fit_tol, approx_fit_max_iter);
+    let stage1_cb = stage1_progress_callback.as_ref();
+    let n = y_vec.len();
+    let p = x_design.len() / n;
+    let prepare_t0 = Instant::now();
+    if stage1_cb.is_some() {
+        emit_progress_callback(stage1_cb, 5, 0, 1)?;
+    }
+    let fit = build_residualized_approx_scan_null_from_lambda_and_factor(
+        factor,
+        x_design.as_slice(),
+        y_vec.as_slice(),
+        lbd,
+    )?;
+    if stage1_cb.is_some() {
+        emit_progress_callback(stage1_cb, 5, 1, 1)?;
+    }
+    let rhat_rows = choose_rhat_rows(scan_prepared.n_rows(), rhat_markers, rhat_seed);
+    let n_rhat = rhat_rows.len();
+    let rhat_progress_total = n_rhat_progress_total(scan_prepared.n_rows(), rhat_markers);
+    if stage1_cb.is_some() {
+        emit_progress_callback(stage1_cb, 8, 0, rhat_progress_total)?;
+    }
+    let sampled_markers = decode_rhat_markers_col_major(
+        &scan_prepared,
+        scan_sample_idx.as_slice(),
+        gm,
+        rhat_rows.as_slice(),
+        stage1_cb,
+        8,
+        rhat_progress_total,
+        mmap_window_mb,
+    )?;
+    let (gamma, n_used) =
+        fit.estimate_gamma_from_markers(x_design.as_slice(), sampled_markers.as_slice(), n_rhat)?;
+    if stage1_cb.is_some() {
+        emit_progress_callback(stage1_cb, 8, rhat_progress_total, rhat_progress_total)?;
+    }
+    let model = fit.build_scan_model(x_design.as_slice(), gamma)?;
+    let scan_prepare_secs = prepare_t0.elapsed().as_secs_f64();
+    let scan_exec_t0 = Instant::now();
+    let (written_rows, tsv_timing) = scan_to_tsv_with_py_and_rhat(
+        &scan_prepared,
+        x_design.as_slice(),
+        model.score_vec(),
+        model.xtx_chol(),
+        scan_sample_idx.as_slice(),
+        gm,
+        model.gamma(),
+        threads,
+        block_rows,
+        chrom.as_slice(),
+        pos.as_slice(),
+        snp.as_slice(),
+        allele0.as_slice(),
+        allele1.as_slice(),
+        &out_tsv,
+        scan_progress_callback.as_ref(),
+        progress_every,
+        9,
+        mmap_window_mb,
+    )?;
+    let scan_exec_secs = (scan_exec_t0.elapsed().as_secs_f64() - tsv_timing.finish_secs).max(0.0);
+    if splmm_top_level_timing_enabled() {
+        emit_splmm_null_scan_core_timing(
+            "approx",
+            factor_load_secs,
+            scan_prepare_secs,
+            scan_exec_secs,
+            tsv_timing.finish_secs,
+            scan_prepared.n_rows(),
+            n,
+            p,
+            threads.max(1),
+        );
+    }
+    Ok(SplmmScanToTsvResult {
+        r_hat: gamma,
+        written_rows,
+        factor_nnz: fit.factor_nnz(),
+        null_info: trivial_pcg_null_info(n, p),
+        rhat_info: trivial_pcg_rhat_info(n, n_rhat, n_used),
+        factor_load_secs,
+        scan_prepare_secs,
+        scan_exec_secs,
+        writer_wait_secs: tsv_timing.finish_secs,
     })
 }
 

@@ -1,5 +1,5 @@
-use crate::kmer::ffi::kmc_reader::KmcReader;
 use crate::kmer::format::{KmergeMeta, SampleEntry};
+use crate::kmer::inputs::{inspect_kmc_inputs, resolve_samples};
 use crate::kmer::progress::ProgressFn;
 use crate::kmer::stage1_bucket::{run_stage1, Stage1Config};
 use crate::kmer::stage2_merge::{load_stage2_manifest, run_stage2, Stage2Config};
@@ -9,7 +9,7 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -140,7 +140,7 @@ pub fn run_kmerge(args: KmergeArgs) -> Result<Stage3Summary> {
             "single-sample kmerge with freq > 0 filters out all present k-mers; use freq=0.0 or provide multiple samples"
         );
     }
-    let inspect = inspect_kmerge_inputs(&samples)?;
+    let inspect = inspect_kmc_inputs(&samples)?;
     let k = inspect.k;
     let log_path = args.log_path.as_deref();
     let progress_callback = args.progress_callback.as_deref();
@@ -183,7 +183,7 @@ pub fn run_kmerge(args: KmergeArgs) -> Result<Stage3Summary> {
             progress_callback,
             1,
             0,
-            inspect.total_stage1_records as usize,
+            inspect.total_records.max(1) as usize,
         )?;
         run_stage1(&Stage1Config {
             tmp_dir: &tmp_dir,
@@ -195,13 +195,13 @@ pub fn run_kmerge(args: KmergeArgs) -> Result<Stage3Summary> {
             max_records_per_flush,
             threads: args.threads,
             progress_callback: stage1_progress.clone(),
-            progress_total: inspect.total_stage1_records.max(1),
+            progress_total: inspect.total_records.max(1),
         })?;
         emit_progress_callback(
             progress_callback,
             1,
-            inspect.total_stage1_records as usize,
-            inspect.total_stage1_records as usize,
+            inspect.total_records.max(1) as usize,
+            inspect.total_records.max(1) as usize,
         )?;
     } else {
         emit_run_line(
@@ -288,115 +288,6 @@ fn emit_run_line(log_path: Option<&Path>, line: &str) -> Result<()> {
             .with_context(|| format!("failed to write kmerge log file: {}", path.display()))?;
     }
     Ok(())
-}
-
-fn resolve_samples(
-    db_inputs: &[String],
-    sample_ids_override: Option<&Vec<String>>,
-) -> Result<Vec<SampleEntry>> {
-    let mut raw_pairs = if db_inputs.len() == 1 && looks_like_db_list_file(&db_inputs[0]) {
-        parse_db_list_file(&db_inputs[0])?
-    } else {
-        db_inputs
-            .iter()
-            .map(|raw| {
-                let prefix = normalize_prefix(raw)?;
-                Ok((default_sample_id(&prefix), prefix))
-            })
-            .collect::<Result<Vec<_>>>()?
-    };
-
-    if let Some(overrides) = sample_ids_override {
-        if overrides.len() != raw_pairs.len() {
-            bail!(
-                "sample-id count mismatch: got {}, expected {}",
-                overrides.len(),
-                raw_pairs.len()
-            );
-        }
-        for (idx, sample_id) in overrides.iter().enumerate() {
-            let sid = sample_id.trim();
-            if sid.is_empty() {
-                bail!("sample-id cannot contain empty values");
-            }
-            raw_pairs[idx].0 = sid.to_string();
-        }
-    }
-
-    let mut samples = Vec::with_capacity(raw_pairs.len());
-    for (idx, (sample_id, prefix)) in raw_pairs.into_iter().enumerate() {
-        validate_prefix(&prefix)?;
-        samples.push(SampleEntry {
-            index: idx as u32,
-            sample_id,
-            kmc_prefix: prefix,
-        });
-    }
-    Ok(samples)
-}
-
-fn parse_db_list_file(path: &str) -> Result<Vec<(String, String)>> {
-    let file =
-        File::open(path).with_context(|| format!("failed to open KMC db list file: {path}"))?;
-    let reader = BufReader::new(file);
-    let mut out = Vec::new();
-    for line in reader.lines() {
-        let line = line?;
-        let text = line.trim();
-        if text.is_empty() || text.starts_with('#') {
-            continue;
-        }
-        let fields = text.split_whitespace().collect::<Vec<_>>();
-        let (sample_id, prefix_raw) = if fields.len() == 1 {
-            let prefix = normalize_prefix(fields[0])?;
-            (default_sample_id(&prefix), prefix)
-        } else {
-            (fields[0].to_string(), normalize_prefix(fields[1])?)
-        };
-        out.push((sample_id, prefix_raw));
-    }
-    if out.is_empty() {
-        bail!("KMC db list file is empty: {path}");
-    }
-    Ok(out)
-}
-
-struct KmergeInputInspect {
-    k: u32,
-    total_stage1_records: u64,
-}
-
-fn inspect_kmerge_inputs(samples: &[SampleEntry]) -> Result<KmergeInputInspect> {
-    let mut common_k = None::<u32>;
-    let mut total_stage1_records = 0u64;
-    for sample in samples {
-        let reader = KmcReader::open(&sample.kmc_prefix, 0)
-            .with_context(|| format!("failed to inspect KMC db: {}", sample.kmc_prefix))?;
-        total_stage1_records = total_stage1_records.saturating_add(reader.info().total_kmers);
-        let k = reader.info().kmer_length;
-        if k == 0 {
-            bail!("invalid KMC k-mer length for {}", sample.kmc_prefix);
-        }
-        if k > 31 {
-            bail!("current Rust kmerge only supports k <= 31, got {k}");
-        }
-        if let Some(prev) = common_k {
-            if prev != k {
-                bail!(
-                    "all KMC databases must share one k-mer length, got {} and {}",
-                    prev,
-                    k
-                );
-            }
-        } else {
-            common_k = Some(k);
-        }
-    }
-    Ok(KmergeInputInspect {
-        k: common_k
-            .ok_or_else(|| anyhow::anyhow!("no samples available after resolving KMC inputs"))?,
-        total_stage1_records,
-    })
 }
 
 fn build_progress_callback(cb: Option<&Arc<Py<PyAny>>>, stage: usize) -> Option<ProgressFn> {
@@ -506,69 +397,6 @@ fn max_records_per_flush(
     let usable_by_memory = (per_worker / 2).max(16 * 1024);
     let usable_bytes = usable_by_memory.min(max_run_bytes.max(16 * 1024));
     Ok((usable_bytes / 16).max(1))
-}
-
-fn looks_like_db_list_file(raw: &str) -> bool {
-    let raw = raw.trim();
-    if raw.is_empty() {
-        return false;
-    }
-    let lower = raw.to_ascii_lowercase();
-    if lower.ends_with(".kmc_pre") || lower.ends_with(".kmc_suf") {
-        return false;
-    }
-    Path::new(raw).is_file()
-}
-
-fn normalize_prefix(path_or_prefix: &str) -> Result<String> {
-    let value = path_or_prefix.trim();
-    if value.is_empty() {
-        bail!("KMC prefix cannot be empty");
-    }
-    let lower = value.to_ascii_lowercase();
-    if lower.ends_with(".kmc_pre") {
-        return Ok(value[..value.len() - ".kmc_pre".len()].to_string());
-    }
-    if lower.ends_with(".kmc_suf") {
-        return Ok(value[..value.len() - ".kmc_suf".len()].to_string());
-    }
-    Ok(value.to_string())
-}
-
-fn validate_prefix(prefix: &str) -> Result<()> {
-    let pre = PathBuf::from(format!("{prefix}.kmc_pre"));
-    let suf = PathBuf::from(format!("{prefix}.kmc_suf"));
-    if !pre.is_file() || !suf.is_file() {
-        bail!(
-            "KMC database not complete for prefix `{prefix}`. Expected {} and {}",
-            pre.display(),
-            suf.display()
-        );
-    }
-    Ok(())
-}
-
-fn default_sample_id(prefix: &str) -> String {
-    let name = Path::new(prefix)
-        .file_name()
-        .and_then(|x| x.to_str())
-        .unwrap_or("sample");
-    let mapped = name
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '-') {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>();
-    let trimmed = mapped.trim_matches(|ch| matches!(ch, '.' | '_' | '-'));
-    if trimmed.is_empty() {
-        "sample".to_string()
-    } else {
-        trimmed.to_string()
-    }
 }
 
 fn is_stage_done(path: &Path) -> bool {

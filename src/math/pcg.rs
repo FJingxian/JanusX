@@ -10,7 +10,6 @@ use crate::he::{
     apply_grm_to_mat_f32_with_workspace, build_row_standardization_stats_with_options,
     GrmApplyWorkspace,
 };
-use crate::linalg::cholesky_solve_into;
 use crate::stats_common::get_cached_pool;
 
 #[derive(Clone, Debug)]
@@ -837,8 +836,6 @@ fn pcg_normalize_sample_idx(
 
 #[derive(Clone, Debug)]
 pub(crate) struct PcgJxlmmNullModel {
-    pub(crate) n_samples: usize,
-    pub(crate) n_covariates: usize,
     pub(crate) df: f64,
     pub(crate) ypy: f64,
     pub(crate) sigma2: f64,
@@ -858,104 +855,6 @@ pub(crate) struct PcgJxlmmRHatResult {
     pub(crate) n_markers_used: usize,
     #[allow(dead_code)]
     pub(crate) solve_info: PcgMatrixSolveInfo,
-}
-
-#[inline]
-fn pcg_xt_vec(
-    x_row_major: &[f64],
-    n_samples: usize,
-    n_covariates: usize,
-    vec_in: &[f64],
-    out: &mut [f64],
-) {
-    out.fill(0.0);
-    for i in 0..n_samples {
-        let yi = vec_in[i];
-        let row = &x_row_major[i * n_covariates..(i + 1) * n_covariates];
-        for j in 0..n_covariates {
-            out[j] += row[j] * yi;
-        }
-    }
-}
-
-#[inline]
-fn pcg_validate_jxlmm_state(
-    null_model: &PcgJxlmmNullModel,
-    x_row_major: &[f64],
-) -> Result<(), String> {
-    pcg_validate_matrix_shape(
-        "SparseLMM design matrix",
-        x_row_major,
-        null_model.n_samples,
-        null_model.n_covariates,
-    )?;
-    if !null_model.sigma2.is_finite() || null_model.sigma2 <= 0.0 {
-        return Err(format!(
-            "PCG SparseLMM null model requires finite positive sigma2, got {}",
-            null_model.sigma2
-        ));
-    }
-    if !null_model.df.is_finite() || null_model.df <= 0.0 {
-        return Err(format!(
-            "PCG SparseLMM null model requires finite positive df, got {}",
-            null_model.df
-        ));
-    }
-    if !null_model.ypy.is_finite() || null_model.ypy <= 0.0 {
-        return Err(format!(
-            "PCG SparseLMM null model requires finite positive yPy, got {}",
-            null_model.ypy
-        ));
-    }
-    if null_model.py.len() != null_model.n_samples {
-        return Err("PCG SparseLMM null model state length mismatch".to_string());
-    }
-    pcg_validate_matrix_shape(
-        "SparseLMM XtWX chol",
-        &null_model.xt_w_x_chol,
-        null_model.n_covariates,
-        null_model.n_covariates,
-    )?;
-    Ok(())
-}
-
-pub(crate) fn pcg_jxlmm_s_p0_s_exact(
-    null_model: &PcgJxlmmNullModel,
-    x_row_major: &[f64],
-    snp: &[f64],
-    v_inv_snp: &[f64],
-) -> Result<f64, String> {
-    pcg_validate_jxlmm_state(null_model, x_row_major)?;
-    if snp.len() != null_model.n_samples || v_inv_snp.len() != null_model.n_samples {
-        return Err(format!(
-            "PCG SparseLMM s^T P s length mismatch: snp={}, v_inv_snp={}, expected={}",
-            snp.len(),
-            v_inv_snp.len(),
-            null_model.n_samples
-        ));
-    }
-    let p = null_model.n_covariates;
-    let mut xt_v_inv_s = vec![0.0_f64; p];
-    pcg_xt_vec(
-        x_row_major,
-        null_model.n_samples,
-        p,
-        v_inv_snp,
-        &mut xt_v_inv_s,
-    );
-    let mut gamma = vec![0.0_f64; p];
-    cholesky_solve_into(&null_model.xt_w_x_chol, p, &xt_v_inv_s, &mut gamma);
-    let s_v_inv_s = snp
-        .iter()
-        .zip(v_inv_snp.iter())
-        .map(|(a, b)| a * b)
-        .sum::<f64>();
-    let quad = xt_v_inv_s
-        .iter()
-        .zip(gamma.iter())
-        .map(|(a, b)| a * b)
-        .sum::<f64>();
-    Ok((s_v_inv_s - quad).max(0.0_f64))
 }
 
 #[inline]

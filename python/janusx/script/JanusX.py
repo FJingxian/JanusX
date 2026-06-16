@@ -38,6 +38,7 @@ Modules:
     fastq2count   RNA-seq counting pipeline from FASTQ to count matrix
     kmer          K-mer counting workflow via KMC
     kmerge        Merge multi-sample KMC databases into genotype matrix
+    kstats        Compute pairwise KMC k-mer statistics
     view          View .bkmer/.bsite as plain text for pipes
     tree          Tree workflow entry (`-nj` Neighbor-Joining / `-ml` FastTree ML)
     treeplot      Visualize Newick/GRM trees with toytree
@@ -116,7 +117,7 @@ _MODULE_NAMES = [
     "gwas", "postgwas", "postgarfield", "postbsa",
     "garfield", "grm", "pca", "gstats", "gs", "reml", "postgs",
     "sim", "simulation", "benchmark", "gblupbench", "bayesbench", "garfieldbench", "adamixture", "tree", "gformat", "gmerge", "hybrid", "webui",
-    "fastq2vcf", "fastq2count", "kmer", "kmerge", "view", "treeplot",
+    "fastq2vcf", "fastq2count", "kmer", "kmerge", "kstats", "view", "treeplot",
 ]
 _SCRIPT_MODULE_ALIASES = {
     # Keep CLI surface stable (`jx gwas` / `jx gs`) while routing heavy
@@ -338,6 +339,7 @@ def _print_cli_help() -> None:
     _print_help_entry(4, "fastq2count", "RNA-seq counting pipeline from FASTQ to count matrix", 12, width)
     _print_help_entry(4, "kmer", "K-mer counting workflow via KMC", 12, width)
     _print_help_entry(4, "kmerge", "Merge multi-sample KMC databases into genotype matrix", 12, width)
+    _print_help_entry(4, "kstats", "Compute pairwise KMC k-mer statistics", 12, width)
     _print_help_entry(4, "view", "View .bkmer/.bsite as plain text for shell pipes", 12, width)
     _print_help_entry(4, "tree", "Tree workflow entry (`-nj` Neighbor-Joining / `-ml` FastTree ML)", 12, width)
     _print_help_entry(4, "treeplot", "Visualize Newick/GRM trees with toytree", 12, width)

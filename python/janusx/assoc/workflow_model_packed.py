@@ -75,7 +75,6 @@ from .workflow import (
 
 _WARNED_LM_STREAM_MMAP_LEGACY = False
 _SPLMM_EXACT_N_MAX = 15_000
-_SPLMM_SPARSE_NULL_CLIP_EIG_EXACT_N_MAX = 0
 _SPLMM_KING_THRESHOLD = 0.05
 _SPLMM_SPARSE_GRM_CUTOFF = 0.05
 _SPLMM_SPARSE_GRM_METHOD = 2
@@ -83,7 +82,6 @@ _SPLMM_SPARSE_REML_GRID_SIZE = 17
 _SPLMM_SPARSE_REML_MAX_ITER = 20
 _SPLMM_SPGRM_SINGLE_BLOCK_N_MAX = 2048
 _JXLMM_EXACT_N_MAX = _SPLMM_EXACT_N_MAX
-_JXLMM_SPARSE_NULL_CLIP_EIG_EXACT_N_MAX = _SPLMM_SPARSE_NULL_CLIP_EIG_EXACT_N_MAX
 
 
 def _current_bed_memory_mb() -> float:
@@ -1565,124 +1563,11 @@ def _jxlmm_ols_residualize(y_vec: np.ndarray, x_cov: Union[np.ndarray, None]) ->
     return np.ascontiguousarray(resid, dtype=np.float64)
 
 
-def _jxlmm_pve_from_components(eigvals: np.ndarray, sigma_g2: float, sigma_e2: float) -> float:
-    vals = np.asarray(eigvals, dtype=np.float64).reshape(-1)
-    if vals.size == 0:
-        return float("nan")
-    mean_k = float(np.mean(np.maximum(vals, 0.0)))
-    var_g = float(sigma_g2) * max(mean_k, 0.0)
-    denom = var_g + float(sigma_e2)
-    if np.isfinite(denom) and denom > 0.0:
-        return float(var_g / denom)
-    return float("nan")
-
-
 def _jxlmm_component_ratio(sigma_g2: float, sigma_e2: float) -> float:
     denom = float(sigma_g2) + float(sigma_e2)
     if np.isfinite(denom) and denom > 0.0:
         return float(float(sigma_g2) / denom)
     return float("nan")
-
-
-def _jxlmm_load_sparse_grm_subset_dense(
-    jxgrm_path: str,
-    sample_idx: Union[np.ndarray, None] = None,
-    progress_callback=None,
-) -> np.ndarray:
-    file_size = int(os.path.getsize(jxgrm_path))
-    if file_size < 16:
-        raise RuntimeError(f"Sparse GRM CSC file is too short: {jxgrm_path}")
-    with open(jxgrm_path, "rb") as fh:
-        header = fh.read(16)
-    if len(header) != 16:
-        raise RuntimeError(f"Sparse GRM CSC header is incomplete: {jxgrm_path}")
-
-    n_samples = int.from_bytes(header[0:8], "little", signed=False)
-    nnz = int.from_bytes(header[8:16], "little", signed=False)
-    col_ptr_offset = 16
-    col_ptr_bytes = (n_samples + 1) * 8
-    row_idx_offset = col_ptr_offset + col_ptr_bytes
-    row_idx_bytes = nnz * 4
-    values_offset_legacy = row_idx_offset + row_idx_bytes
-    values_offset_padded = (values_offset_legacy + 7) & ~7
-    values_bytes = nnz * 8
-    expected_legacy = values_offset_legacy + values_bytes
-    expected_padded = values_offset_padded + values_bytes
-    if file_size == expected_padded:
-        values_offset = values_offset_padded
-    elif file_size == expected_legacy:
-        values_offset = values_offset_legacy
-    else:
-        raise RuntimeError(
-            f"Sparse GRM CSC file size mismatch for {jxgrm_path}: got {file_size}, "
-            f"expected {expected_legacy} (legacy) or {expected_padded} (padded)."
-        )
-
-    col_ptr = np.memmap(
-        jxgrm_path,
-        mode="r",
-        dtype="<u8",
-        offset=col_ptr_offset,
-        shape=(n_samples + 1,),
-        order="C",
-    )
-    row_idx = np.memmap(
-        jxgrm_path,
-        mode="r",
-        dtype="<u4",
-        offset=row_idx_offset,
-        shape=(nnz,),
-        order="C",
-    )
-    values = np.memmap(
-        jxgrm_path,
-        mode="r",
-        dtype="<f8",
-        offset=values_offset,
-        shape=(nnz,),
-        order="C",
-    )
-
-    if sample_idx is None:
-        sample_idx_arg = np.arange(n_samples, dtype=np.int64)
-    else:
-        sample_idx_arg = np.ascontiguousarray(
-            np.asarray(sample_idx, dtype=np.int64).reshape(-1),
-            dtype=np.int64,
-        )
-        if np.any(sample_idx_arg < 0) or np.any(sample_idx_arg >= n_samples):
-            raise ValueError(
-                f"SparseLMM sparse GRM subset sample index out of bounds for {jxgrm_path}: "
-                f"n_samples={n_samples}"
-            )
-
-    n_sub = int(sample_idx_arg.shape[0])
-    dense = np.zeros((n_sub, n_sub), dtype=np.float64, order="C")
-    pos_map = np.full(n_samples, -1, dtype=np.int64)
-    pos_map[sample_idx_arg] = np.arange(n_sub, dtype=np.int64)
-
-    total = max(1, n_sub)
-    last_emit = -1
-    if progress_callback is not None:
-        progress_callback(0, total)
-    for j_sub, col_full in enumerate(sample_idx_arg.tolist()):
-        start = int(col_ptr[col_full])
-        end = int(col_ptr[col_full + 1])
-        if end > start:
-            rows = row_idx[start:end]
-            vals = values[start:end]
-            mapped = pos_map[rows]
-            keep = mapped >= 0
-            if np.any(keep):
-                tgt = np.asarray(mapped[keep], dtype=np.intp)
-                dat = np.asarray(vals[keep], dtype=np.float64)
-                dense[tgt, j_sub] = dat
-                dense[j_sub, tgt] = dat
-        done = j_sub + 1
-        if progress_callback is not None and (done == total or done >= last_emit + 32):
-            progress_callback(done, total)
-            last_emit = done
-    return np.ascontiguousarray(dense, dtype=np.float64)
 
 
 def _jxlmm_sparse_grm_diag_stats(
@@ -1775,135 +1660,6 @@ def _plink_fam_sample_ids(prefix: str) -> np.ndarray:
         dtype=str,
     )
     return np.asarray(fam.iloc[:, 0].astype(str), dtype=str)
-
-
-def _jxlmm_exact_null_fit_from_grm(
-    *,
-    grm: np.ndarray,
-    y_vec: np.ndarray,
-    x_cov: Union[np.ndarray, None],
-    threads: int,
-    stage_label: str,
-    progress_callback=None,
-    grm_secs: float = 0.0,
-    strategy: str = "fastlmm_exact_spectral",
-    pve_mode: str = "spectral",
-    keep_buffers: bool = True,
-    extra_fields: Union[dict[str, object], None] = None,
-) -> dict[str, object]:
-    if not hasattr(jxrs, "lmm_reml_null_f32"):
-        raise RuntimeError("Rust extension missing lmm_reml_null_f32 required by SparseLMM exact null fit.")
-
-    y_arg = np.ascontiguousarray(np.asarray(y_vec, dtype=np.float64).reshape(-1), dtype=np.float64)
-    grm_arr = np.ascontiguousarray(np.asarray(grm, dtype=np.float64), dtype=np.float64)
-    n = int(y_arg.shape[0])
-    if grm_arr.shape != (n, n):
-        raise ValueError(f"SparseLMM exact null GRM shape mismatch: got {grm_arr.shape}, expected ({n}, {n}).")
-    grm_local = np.array(grm_arr, dtype=np.float64, copy=True, order="C")
-    np.fill_diagonal(grm_local, np.diag(grm_local) + 1e-6)
-
-    progress_total = 1000
-    if progress_callback is not None:
-        progress_callback(0, progress_total)
-
-    evd_t0 = time.monotonic()
-    eigvals, eigvecs, evd_backend, evd_secs = _gwas_eigh_from_grm(
-        grm_local,
-        threads=max(1, int(threads)),
-        logger=None,
-        stage_label=stage_label,
-        require_rust=True,
-    )
-    evd_secs = max(float(evd_secs), max(time.monotonic() - evd_t0, 0.0))
-    if progress_callback is not None:
-        progress_callback(820, progress_total)
-    ord_desc = np.argsort(np.asarray(eigvals, dtype=np.float64))[::-1]
-    eigvals = np.ascontiguousarray(np.asarray(eigvals, dtype=np.float64).reshape(-1)[ord_desc], dtype=np.float64)
-    eigvecs = np.ascontiguousarray(np.asarray(eigvecs, dtype=np.float64)[:, ord_desc], dtype=np.float64)
-    if eigvecs.shape != (n, n):
-        raise ValueError(f"SparseLMM exact null eigenvector shape mismatch: got {eigvecs.shape}, expected ({n}, {n}).")
-
-    x_design = _jxlmm_design_with_intercept(x_cov, n)
-    s_null = np.ascontiguousarray(np.maximum(np.asarray(eigvals, dtype=np.float64), 0.0), dtype=np.float64)
-    with _gwas_evd_stage_ctx(max(1, int(threads))):
-        utx = np.ascontiguousarray(eigvecs.T @ x_design, dtype=np.float64)
-        uty = np.ascontiguousarray((eigvecs.T @ y_arg).reshape(-1), dtype=np.float64)
-    if progress_callback is not None:
-        progress_callback(900, progress_total)
-    lbd, ml, reml = jxrs.lmm_reml_null_f32(
-        s_null,
-        utx,
-        uty,
-        -5.0,
-        5.0,
-        50,
-        1e-3,
-    )
-    sigma_g2, sigma_e2 = _jxlmm_exact_profile_vc(
-        eigvals=s_null,
-        utx=utx,
-        uty=uty,
-        lbd=float(lbd),
-    )
-    if progress_callback is not None:
-        progress_callback(progress_total, progress_total)
-
-    if str(pve_mode).strip().lower() == "components":
-        pve = _jxlmm_component_ratio(sigma_g2, sigma_e2)
-    else:
-        pve = _jxlmm_pve_from_components(eigvals, sigma_g2, sigma_e2)
-
-    out: dict[str, object] = {
-        "strategy": str(strategy),
-        "sigma_g2": sigma_g2,
-        "sigma_e2": sigma_e2,
-        "pve": pve,
-        "lambda": float(lbd),
-        "ml": float(ml),
-        "reml": float(reml),
-        "converged": True,
-        "used_iter": 0,
-        "grm_secs": float(max(grm_secs, 0.0)),
-        "evd_secs": float(evd_secs),
-        "backend": str(evd_backend),
-    }
-    if keep_buffers:
-        out["eigvals"] = eigvals
-        out["eigvecs"] = eigvecs
-        out["grm"] = grm_local
-    if extra_fields:
-        out.update(extra_fields)
-    return out
-
-
-def _jxlmm_null_progress_stage(route_desc: str, done: int, total: int) -> str:
-    route = str(route_desc).strip() or "null fit"
-    total_use = int(max(1, total))
-    frac = float(max(0, min(int(done), total_use))) / float(total_use)
-    route_l = route.lower()
-    if "sparse" in route_l:
-        if frac < 0.12:
-            stage = "analyze sparse CSC"
-        elif frac < 0.55:
-            stage = "grid lambda search"
-        else:
-            stage = "Brent REML refine"
-    else:
-        if frac < 0.60:
-            stage = "build dense GRM"
-        elif frac < 0.82:
-            stage = "eigendecompose GRM"
-        elif frac < 0.90:
-            stage = "rotate X/y"
-        else:
-            stage = "Brent variance fit"
-    return stage
-
-
-def _jxlmm_null_progress_desc(route_desc: str, done: int, total: int) -> str:
-    route = str(route_desc).strip() or "null fit"
-    stage = _jxlmm_null_progress_stage(route_desc, done, total)
-    return f"SparseLMM null: {route} / {stage}"
 
 
 def _write_splmm_assoc_tsv(
@@ -2263,90 +2019,6 @@ def _splmm_sparse_null_fit(
         if progress_callback is not None:
             progress_callback(1, 1)
         return out_dict
-
-    if (
-        int(_JXLMM_SPARSE_NULL_CLIP_EIG_EXACT_N_MAX) > 0
-        and n_samples_null <= int(_JXLMM_SPARSE_NULL_CLIP_EIG_EXACT_N_MAX)
-    ):
-        fit_t0 = time.monotonic()
-        progress_total = 1000
-        if progress_callback is not None:
-            progress_callback(0, progress_total)
-
-        def _dense_progress(done: int, total: int) -> None:
-            if progress_callback is None:
-                return
-            try:
-                d = int(done)
-                t = int(total)
-            except Exception:
-                return
-            if t <= 0:
-                return
-            mapped = int((max(0, min(d, t)) * 320) / max(1, t))
-            progress_callback(mapped, progress_total)
-
-        grm_t0 = time.monotonic()
-        grm_dense = _jxlmm_load_sparse_grm_subset_dense(
-            str(jxgrm_path),
-            sample_idx=sample_idx_arg,
-            progress_callback=_dense_progress if progress_callback is not None else None,
-        )
-        grm_secs = max(time.monotonic() - grm_t0, 0.0)
-
-        def _exact_progress(done: int, total: int) -> None:
-            if progress_callback is None:
-                return
-            try:
-                d = int(done)
-                t = int(total)
-            except Exception:
-                return
-            if t <= 0:
-                return
-            mapped = 320 + int((max(0, min(d, t)) * 680) / max(1, t))
-            progress_callback(mapped, progress_total)
-
-        out = _jxlmm_exact_null_fit_from_grm(
-            grm=grm_dense,
-            y_vec=y_arg,
-            x_cov=x_arg,
-            threads=max(1, int(detect_effective_threads())),
-            stage_label="SparseLMM sparse exact null eigendecompose clipped sparse subset",
-            progress_callback=_exact_progress if progress_callback is not None else None,
-            grm_secs=float(grm_secs),
-            strategy="sparse_exact_spectral_clipped",
-            pve_mode="components",
-            keep_buffers=False,
-        )
-        fit_secs = max(time.monotonic() - fit_t0, 0.0)
-        lbd = float(out.get("lambda", float("nan")))
-        log10_lambda = float(np.log10(max(lbd, 1e-30))) if np.isfinite(lbd) and lbd > 0.0 else float("nan")
-        out.update(
-            _jxlmm_component_scale_reml(
-                y_vec=y_arg,
-                x_cov=x_arg,
-                sigma_g2=float(out.get("sigma_g2", float("nan"))),
-                sigma_e2=float(out.get("sigma_e2", float("nan"))),
-            )
-        )
-        out.update(
-            {
-                "fit_secs": float(fit_secs),
-                "mean_diag_k": mean_diag_k,
-                "min_diag_k": float(sparse_diag.get("min_diag", float("nan"))),
-                "max_diag_k": float(sparse_diag.get("max_diag", float("nan"))),
-                "n_samples_k": float(n_samples_k),
-                "nnz_k": float(nnz_k),
-                "offdiag_nnz_k": float(offdiag_nnz),
-                "offdiag_density_k": float(offdiag_density),
-                "log10_lambda": log10_lambda,
-                "lambda_boundary": _jxlmm_sparse_lambda_boundary_flag(log10_lambda, -5.0, 5.0),
-            }
-        )
-        if progress_callback is not None:
-            progress_callback(progress_total, progress_total)
-        return out
 
     if not hasattr(jxrs, "spreml_sparse_reml_brent_from_jxgrm"):
         raise RuntimeError(
@@ -4882,7 +4554,7 @@ def run_splmm_packed_fullrank(
             "Rust extension missing splmm_assoc_pcg_bed. Rebuild/install JanusX extension first."
         )
     scan_mode_norm = str(scan_mode).strip().lower()
-    if scan_mode_norm not in {"two_stage", "approx", "exact"}:
+    if scan_mode_norm not in {"approx", "exact"}:
         raise ValueError(f"Unsupported SparseLMM scan mode: {scan_mode}")
     if scan_mode_norm == "approx":
         if not hasattr(jxrs, "splmm_residualized_approx_null_fit_from_jxgrm"):
@@ -5689,7 +5361,6 @@ def run_splmm_packed_fullrank(
         peak_rss_gb = peak_rss / (1024 ** 3)
 
         _scan_mode_desc = {
-            "two_stage": "two-stage approx->exact",
             "approx": "approximate GRAMMAR-gamma",
             "exact": "exact g'Pg",
         }[scan_mode_norm]
@@ -5709,7 +5380,7 @@ def run_splmm_packed_fullrank(
             scan_sigma_mode = "lambda_only_exact_internal_sigma2"
             _sigma_mode_info = (
                 f"scan_param=lambda_only(lambda={scan_lbd_arg:.4g}); "
-                "Rust exact scan uses K+lambda I and per-SNP sigma2=rWr/df internally"
+                "Rust exact scan uses K+lambda I and null sigma2=y'P0y/df internally"
             )
         _scan_diag_msg = (
             f"{scan_route_desc}; mode={_scan_mode_desc}; {_rhat_info}"

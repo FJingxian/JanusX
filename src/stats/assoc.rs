@@ -290,7 +290,7 @@ fn farmcpu_final_ld_merge_r2_threshold() -> f64 {
             }
         }
     }
-    0.7
+    0.5
 }
 
 fn find_parent(parent: &mut [usize], x: usize) -> usize {

@@ -156,6 +156,38 @@ fn algwas_stage1_timing_enabled() -> bool {
 }
 
 #[inline]
+fn algwas_stage1_greedy_fallback_enabled() -> bool {
+    match std::env::var("JX_ALGWAS_STAGE1_GREEDY_FALLBACK") {
+        Ok(v) => {
+            let raw = v.trim().to_ascii_lowercase();
+            !matches!(raw.as_str(), "0" | "false" | "no" | "off")
+        }
+        Err(_) => true,
+    }
+}
+
+#[inline]
+fn algwas_stage1_greedy_fallback_candidates(n_features: usize) -> usize {
+    if n_features == 0 {
+        return 0usize;
+    }
+    std::env::var("JX_ALGWAS_STAGE1_GREEDY_FALLBACK_CANDIDATES")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(DEFAULT_STAGE1_ALASSO_INITIAL_WORKING_SET)
+        .min(n_features)
+}
+
+#[inline]
+fn algwas_stage1_greedy_fallback_patience() -> usize {
+    std::env::var("JX_ALGWAS_STAGE1_GREEDY_FALLBACK_PATIENCE")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(6usize)
+}
+
+#[inline]
 fn algwas_stage2_timing_enabled() -> bool {
     env_var_truthy("JX_ALGWAS_STAGE2_TIMING")
 }
@@ -4039,6 +4071,191 @@ fn fit_algwas_stage1_active_from_stats(
     Ok((beta, rss, converged, iters))
 }
 
+fn fit_stage1_greedy_screen_fallback(
+    design: &AlgwasPackedDesign<'_>,
+    proj: &CovariateProjection,
+    y_resid: &[f32],
+    candidate_rows: &[usize],
+    cfg: &AlgwasConfig,
+    selection_criterion: AlgwasStage1SelectCriterion,
+    tau2: f64,
+    ebic_gamma: f64,
+) -> Result<Option<AlgwasStage1Result>, String> {
+    let n = design.n_samples();
+    let p = design.n_features();
+    if n == 0 || p == 0 || y_resid.len() != n || candidate_rows.is_empty() {
+        return Ok(None);
+    }
+    let cand_cap = algwas_stage1_greedy_fallback_candidates(p).min(candidate_rows.len());
+    if cand_cap == 0 {
+        return Ok(None);
+    }
+    let mut candidates = Vec::<usize>::with_capacity(cand_cap);
+    let mut seen = vec![false; p];
+    for &row in candidate_rows.iter().take(cand_cap) {
+        if row < p && !seen[row] {
+            seen[row] = true;
+            candidates.push(row);
+        }
+    }
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+
+    let mut dense = vec![0.0_f32; candidates.len() * n];
+    decode_rows_resid_standardized_into_f32(design, proj, &candidates, &mut dense)?;
+    let y64: Vec<f64> = y_resid.iter().map(|&v| v as f64).collect();
+    let rss0 = dot_f32_f64(y_resid, y_resid, design.pool.as_ref());
+    let bic0 = algwas_bic_from_rss_df_tau2(n, rss0, 0.0_f64, tau2);
+    let ebic0 = algwas_ebic_from_bic(bic0, p, 0usize, ebic_gamma);
+    let mut path = vec![AlgwasStage1PathPoint {
+        lambda: 0.0_f32,
+        bic: bic0,
+        ebic: ebic0,
+        rss: rss0,
+        nnz: 0usize,
+        df: 0.0_f64,
+        converged: true,
+    }];
+    let site_cap = cfg
+        .qtn_bound
+        .unwrap_or_else(|| algwas_stage1_site_cap(n))
+        .min(candidates.len())
+        .max(1usize);
+    let patience = algwas_stage1_greedy_fallback_patience();
+    let mut selected_local = Vec::<usize>::new();
+    let mut selected_mask = vec![false; candidates.len()];
+    let mut residual = y64.clone();
+    let mut best_step = 0usize;
+    let mut best_score = algwas_stage1_path_score(&path[0], selection_criterion);
+    let mut best_beta_local = Vec::<f64>::new();
+    let mut no_improve = 0usize;
+
+    for _step in 0..site_cap {
+        let mut best_local: Option<usize> = None;
+        let mut best_gain = 0.0_f64;
+        for (local, row) in dense.chunks(n).enumerate() {
+            if selected_mask[local] {
+                continue;
+            }
+            let mut dot = 0.0_f64;
+            let mut ss = 0.0_f64;
+            for i in 0..n {
+                let x = row[i] as f64;
+                dot += x * residual[i];
+                ss += x * x;
+            }
+            if ss <= 1e-12_f64 {
+                continue;
+            }
+            let gain = (dot * dot) / ss;
+            if gain.is_finite() && gain > best_gain {
+                best_gain = gain;
+                best_local = Some(local);
+            }
+        }
+        let Some(local) = best_local else {
+            break;
+        };
+        if best_gain <= 0.0_f64 {
+            break;
+        }
+        selected_mask[local] = true;
+        selected_local.push(local);
+        let q = selected_local.len();
+        let mut x_cols = Vec::<f64>::with_capacity(n * q);
+        for &sel_local in &selected_local {
+            x_cols.extend(dense[sel_local * n..(sel_local + 1) * n].iter().map(|&v| v as f64));
+        }
+        let x = DMatrix::<f64>::from_vec(n, q, x_cols);
+        let xtx = x.transpose() * &x;
+        let xty = x.transpose() * DVector::<f64>::from_column_slice(&y64);
+        let beta = if let Some(chol) = xtx.clone().cholesky() {
+            chol.solve(&xty)
+        } else if let Some(sol) = xtx.clone().lu().solve(&xty) {
+            sol
+        } else {
+            break;
+        };
+        let fitted = &x * &beta;
+        let mut rss = 0.0_f64;
+        for i in 0..n {
+            let r = y64[i] - fitted[i];
+            residual[i] = r;
+            rss += r * r;
+        }
+        let bic = algwas_bic_from_rss_df_tau2(n, rss, q as f64, tau2);
+        let ebic = algwas_ebic_from_bic(bic, p, q, ebic_gamma);
+        path.push(AlgwasStage1PathPoint {
+            lambda: best_gain.sqrt() as f32,
+            bic,
+            ebic,
+            rss,
+            nnz: q,
+            df: q as f64,
+            converged: true,
+        });
+        let score = algwas_stage1_path_score(
+            path.last()
+                .ok_or_else(|| "ALGWAS greedy fallback path unexpectedly empty".to_string())?,
+            selection_criterion,
+        );
+        let improve_tol = 1e-9_f64 * best_score.abs().max(1.0_f64);
+        if score + improve_tol < best_score {
+            best_score = score;
+            best_step = q;
+            best_beta_local = beta.as_slice().to_vec();
+            no_improve = 0;
+        } else {
+            no_improve = no_improve.saturating_add(1);
+            if no_improve >= patience {
+                break;
+            }
+        }
+    }
+    if best_step == 0 {
+        return Ok(None);
+    }
+
+    let mut beta_full = vec![0.0_f32; p];
+    let mut selected_indices = Vec::<usize>::with_capacity(best_step);
+    for (pos, &local) in selected_local.iter().take(best_step).enumerate() {
+        let row_idx = candidates[local];
+        selected_indices.push(row_idx);
+        if pos < best_beta_local.len() {
+            beta_full[row_idx] = best_beta_local[pos] as f32;
+        }
+    }
+    selected_indices.sort_unstable();
+    let best_bic_idx = best_stage1_path_index(&path, AlgwasStage1SelectCriterion::Bic);
+    let best_ebic_idx = best_stage1_path_index(&path, AlgwasStage1SelectCriterion::Ebic);
+    if std::env::var_os("JX_ALGWAS_DEBUG").is_some() {
+        eprintln!(
+            "ALGWAS stage1 greedy fallback selected {} QTNs (best_step={}, bic={:.6e}, ebic={:.6e})",
+            selected_indices.len(),
+            best_step,
+            path.get(best_bic_idx).map(|p| p.bic).unwrap_or(f64::NAN),
+            path.get(best_ebic_idx).map(|p| p.ebic).unwrap_or(f64::NAN),
+        );
+    }
+    Ok(Some(AlgwasStage1Result {
+        selected_indices,
+        beta: beta_full,
+        lambda_best: path.get(best_step).map(|p| p.lambda).unwrap_or(0.0_f32),
+        bic_best: path
+            .get(best_bic_idx)
+            .map(|p| p.bic)
+            .unwrap_or(f64::INFINITY),
+        ebic_best: path
+            .get(best_ebic_idx)
+            .map(|p| p.ebic)
+            .unwrap_or(f64::INFINITY),
+        best_step,
+        path,
+        converged: true,
+    }))
+}
+
 #[inline]
 fn active_mask_to_beta(mask: &[bool], beta_init: &[f32], n_features: usize) -> Vec<f32> {
     let mut out = vec![0.0_f32; n_features];
@@ -4419,6 +4636,42 @@ fn fit_stage1_path_streaming(
             selected_indices.sort_unstable();
         }
     }
+    let mut result = AlgwasStage1Result {
+        selected_indices,
+        beta: beta_best,
+        lambda_best: best_point.lambda,
+        bic_best: path[best_bic_idx].bic,
+        ebic_best: path[best_ebic_idx].ebic,
+        best_step: best_idx,
+        path,
+        converged: best_converged,
+    };
+    if result.selected_indices.is_empty() && algwas_stage1_greedy_fallback_enabled() {
+        if let Some(greedy) = fit_stage1_greedy_screen_fallback(
+            design,
+            proj,
+            &y_resid,
+            &initial_working_set,
+            cfg,
+            selection_criterion,
+            tau2,
+            ebic_gamma,
+        )? {
+            let current_score = result
+                .path
+                .get(result.best_step)
+                .map(|point| algwas_stage1_path_score(point, selection_criterion))
+                .unwrap_or(f64::INFINITY);
+            let greedy_score = greedy
+                .path
+                .get(greedy.best_step)
+                .map(|point| algwas_stage1_path_score(point, selection_criterion))
+                .unwrap_or(f64::INFINITY);
+            if greedy_score < current_score {
+                result = greedy;
+            }
+        }
+    }
 
     if let Some(t0) = stage1_total_t0 {
         let total_secs = t0.elapsed().as_secs_f64().max(1e-12_f64);
@@ -4448,16 +4701,7 @@ fn fit_stage1_path_streaming(
         .map_err(|e| e.to_string())?;
     }
 
-    Ok(AlgwasStage1Result {
-        selected_indices,
-        beta: beta_best,
-        lambda_best: best_point.lambda,
-        bic_best: path[best_bic_idx].bic,
-        ebic_best: path[best_ebic_idx].ebic,
-        best_step: best_idx,
-        path,
-        converged: best_converged,
-    })
+    Ok(result)
 }
 
 fn reconstruct_msgps_beta(

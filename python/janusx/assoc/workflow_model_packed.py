@@ -1093,9 +1093,9 @@ def _qtn_windows_from_meta(qtn_meta: list[dict[str, object]], qtn_cov: np.ndarra
             if str(qtn_meta[i]["chrom"]) == str(qtn_meta[j]["chrom"]) and starts[i] <= ends[j] and starts[j] <= ends[i]:
                 union(i, j)
     try:
-        ld_thr = float(os.environ.get("JX_FARMCPU_FINAL_LD_MERGE_R2", "0.7"))
+        ld_thr = float(os.environ.get("JX_FARMCPU_FINAL_LD_MERGE_R2", "0.5"))
     except Exception:
-        ld_thr = 0.7
+        ld_thr = 0.5
     if k > 1 and np.isfinite(ld_thr) and ld_thr > 0.0 and int(qtn_cov.shape[1]) == k:
         corr = np.corrcoef(np.asarray(qtn_cov, dtype=np.float64), rowvar=False)
         for i in range(k):
@@ -1181,6 +1181,22 @@ def _active_segments_for_windows(
     if cursor < n_active:
         segments.append((cursor, n_active, 0))
     return segments
+
+
+def _plink_bed_n_snps_from_prefix(prefix: str, n_samples: int) -> int:
+    bytes_per_snp = (int(n_samples) + 3) // 4
+    if bytes_per_snp <= 0:
+        raise ValueError("Invalid PLINK sample count while estimating BED SNP count.")
+    bed_path = f"{str(prefix)}.bed"
+    bed_size = int(os.path.getsize(bed_path))
+    if bed_size < 3:
+        raise ValueError(f"BED file is too small: {bed_path}")
+    payload = bed_size - 3
+    if payload % bytes_per_snp != 0:
+        raise ValueError(
+            f"BED payload size is not divisible by bytes_per_snp: {bed_path}"
+        )
+    return int(payload // bytes_per_snp)
 
 
 def run_qtn_segmented_lm_stage2(
@@ -1278,38 +1294,54 @@ def run_qtn_segmented_lm_stage2(
             sample_idx = np.asarray([id_map[str(sid)] for sid in np.asarray(trait_ids, dtype=str)], dtype=np.int64)
         except KeyError as e:
             raise ValueError("Some trait sample IDs are not present in main BED sample order.") from e
-        scan_meta_mmap_window_mb = int(max(1, _current_bed_memory_mb()))
-        meta = _splmm_bed_logic_meta_selected(
-            str(main_prefix),
-            sample_indices=sample_idx,
-            maf_threshold=float(maf_threshold),
-            max_missing_rate=float(max_missing_rate),
-            het_threshold=float(het_threshold),
-            snps_only=bool(snps_only),
-            mmap_window_mb=scan_meta_mmap_window_mb,
-        )
-        active_row_idx = np.asarray(meta["row_indices"], dtype=np.int64).reshape(-1)
+        n_snps_total = _plink_bed_n_snps_from_prefix(str(main_prefix), len(main_ids))
         stage2_mmap_window_mb = auto_mmap_window_mb(
             str(main_prefix),
             int(len(main_ids)),
-            int(meta.get("n_snps_total", max(1, int(active_row_idx.shape[0])))),
+            int(n_snps_total),
             _current_bed_memory_mb(),
         )
-        segments = _active_segments_for_windows(
-            main_prefix=str(main_prefix),
-            active_row_idx=active_row_idx,
-            windows=windows,
-        )
+        if has_compact:
+            segments: list[tuple[int, int, int]] = []
+            source_windows = [
+                (str(w["chrom"]), int(w["start"]), int(w["end"]), int(idx) + 1)
+                for idx, w in enumerate(windows)
+            ]
+            progress_denominator = int(max(1, n_snps_total))
+            index_done = f"{index_desc} ...Finished (total={int(n_snps_total)}, windows={len(source_windows)}, mode=source-window)"
+        else:
+            scan_meta_mmap_window_mb = int(max(1, _current_bed_memory_mb()))
+            meta = _splmm_bed_logic_meta_selected(
+                str(main_prefix),
+                sample_indices=sample_idx,
+                maf_threshold=float(maf_threshold),
+                max_missing_rate=float(max_missing_rate),
+                het_threshold=float(het_threshold),
+                snps_only=bool(snps_only),
+                mmap_window_mb=scan_meta_mmap_window_mb,
+            )
+            active_row_idx = np.asarray(meta["row_indices"], dtype=np.int64).reshape(-1)
+            segments = _active_segments_for_windows(
+                main_prefix=str(main_prefix),
+                active_row_idx=active_row_idx,
+                windows=windows,
+            )
+            source_windows = None
+            progress_denominator = int(max(1, active_row_idx.shape[0]))
+            index_done = (
+                f"{index_desc} ...Finished (active={int(active_row_idx.shape[0])}, "
+                f"total={int(meta.get('n_snps_total', 0))}, segments={len(segments)})"
+            )
         _status_complete(
             index_task,
-            f"{index_desc} ...Finished (active={int(active_row_idx.shape[0])}, total={int(meta.get('n_snps_total', 0))}, segments={len(segments)})",
+            index_done,
         )
     except Exception:
         _status_fail(index_task, f"{index_desc} ...Failed")
         raise
     y_stage2 = np.ascontiguousarray(np.asarray(y_vec, dtype=np.float64).reshape(-1), dtype=np.float64)
     sample_ids_stage2 = [str(x) for x in np.asarray(trait_ids, dtype=str)]
-    progress_every = int(max(1, min(int(max(1, int(chunk_size))), _progress_callback_step(int(max(1, active_row_idx.shape[0]))))))
+    progress_every = int(max(1, min(int(max(1, int(chunk_size))), _progress_callback_step(int(progress_denominator)))))
     mmap_window_arg = None if stage2_mmap_window_mb is None else int(max(1, int(stage2_mmap_window_mb)))
 
     def _compact_setup_status(phase: str, state: str, value_a: int, value_b: int) -> None:
@@ -1350,6 +1382,7 @@ def run_qtn_segmented_lm_stage2(
                 progress_every=progress_every,
                 mmap_window_mb=mmap_window_arg,
                 setup_callback=_compact_setup_status,
+                source_windows=source_windows,
             )
         except Exception:
             task = status_tasks.pop("Building compact QR contexts", None)
@@ -4398,7 +4431,10 @@ def run_algwas_packed_fullrank(
     if main_prefix is None:
         raise ValueError("ALGWAS route requires PLINK BED input or BED cache prefix.")
     if qtn_stage_mode:
-        prefix = str(main_prefix)
+        qtn_prefix = str(qtn_preloaded_packed.get("prefix", "")).strip()
+        if not qtn_prefix:
+            raise ValueError("Invalid QTN packed payload: missing PLINK prefix.")
+        prefix = qtn_prefix
         full_ids = np.asarray(qtn_preloaded_packed.get("full_ids", []), dtype=str)
         packed_ctx_obj = qtn_preloaded_packed.get("packed_ctx")
         if not isinstance(packed_ctx_obj, dict):
@@ -4713,9 +4749,6 @@ def run_algwas_packed_fullrank(
                         threads=int(threads),
                         progress_callback=_algwas_progress,
                         args_obj=type("_AlgwasQtnArgs", (), {"farmcpu_bin_size": [5e5, 5e6, 5e7]})(),
-                        logger=logger,
-                        use_spinner=bool(use_spinner),
-                        status_prefix="ALGWAS stage2",
                     )
                     pseudo_rows = int(max(pseudo_rows, qtn_used))
                     gwas_total = int(max(1, scan_rows2))

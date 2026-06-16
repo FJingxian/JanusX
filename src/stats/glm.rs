@@ -1727,6 +1727,60 @@ fn lm_segment_context_for_active_idx(
     Ok(seg.ctx)
 }
 
+fn lm_build_source_window_map(
+    source_windows: &[LmSourceWindow],
+    n_contexts: usize,
+) -> Result<HashMap<String, Vec<(i64, i64, usize)>>, String> {
+    let mut map = HashMap::<String, Vec<(i64, i64, usize)>>::new();
+    for win in source_windows {
+        if win.start > win.end {
+            return Err(format!(
+                "source window has start > end on {}: {} > {}",
+                win.chrom, win.start, win.end
+            ));
+        }
+        if win.ctx >= n_contexts {
+            return Err(format!(
+                "source window context index {} exceeds context length {}",
+                win.ctx, n_contexts
+            ));
+        }
+        map.entry(win.chrom.clone())
+            .or_default()
+            .push((win.start, win.end, win.ctx));
+    }
+    for windows in map.values_mut() {
+        windows.sort_unstable_by_key(|v| (v.0, v.1, v.2));
+        for pair in windows.windows(2) {
+            if pair[1].0 <= pair[0].1 {
+                return Err("source windows must be non-overlapping within chromosome".to_string());
+            }
+        }
+    }
+    Ok(map)
+}
+
+#[inline]
+fn lm_source_window_context(
+    source_window_map: &HashMap<String, Vec<(i64, i64, usize)>>,
+    chrom: &str,
+    pos: i64,
+) -> usize {
+    let Some(windows) = source_window_map.get(chrom) else {
+        return 0usize;
+    };
+    let idx = windows.partition_point(|w| w.0 <= pos);
+    if idx == 0 {
+        return 0usize;
+    }
+    let (start, end, ctx) = windows[idx - 1];
+    if pos >= start && pos <= end {
+        ctx
+    } else {
+        0usize
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn lm_stream_bed_segments_windowed_unified(
     norm_prefix: &str,
@@ -2128,6 +2182,7 @@ fn lm_stream_bed_segments_compact_windowed_unified(
     q_all: usize,
     compact_contexts: &[LmStage2CompactContext],
     segment_plan: &[LmStreamSegment],
+    source_windows: &[LmSourceWindow],
     out_tsv_path: &str,
     sample_indices: &[usize],
     maf_threshold: f32,
@@ -2206,6 +2261,14 @@ fn lm_stream_bed_segments_compact_windowed_unified(
         .map(|ctx| ctx.rank)
         .max()
         .unwrap_or(0usize);
+    let source_window_map = if source_windows.is_empty() {
+        None
+    } else {
+        Some(lm_build_source_window_map(
+            source_windows,
+            compact_contexts.len(),
+        )?)
+    };
     let scan_chunk_snps = chunk_size.max(1024).min(65536).min(n_snps.max(1));
     let progress_block = if progress_every == 0 {
         scan_chunk_snps.max(1)
@@ -2319,15 +2382,19 @@ fn lm_stream_bed_segments_compact_windowed_unified(
             {
                 continue;
             }
-            let ctx_id = match lm_segment_context_for_active_idx(
-                segment_plan,
-                &mut segment_cursor,
-                active_idx,
-            ) {
-                Ok(v) => v,
-                Err(e) => {
-                    let _ = producer_err_bg.set(e);
-                    return false;
+            let ctx_id = if let Some(window_map) = source_window_map.as_ref() {
+                lm_source_window_context(window_map, &all_chrom[snp_idx], all_pos[snp_idx] as i64)
+            } else {
+                match lm_segment_context_for_active_idx(
+                    segment_plan,
+                    &mut segment_cursor,
+                    active_idx,
+                ) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let _ = producer_err_bg.set(e);
+                        return false;
+                    }
                 }
             };
             if ctx_id >= compact_contexts.len() {
@@ -2473,7 +2540,7 @@ fn lm_stream_bed_segments_compact_windowed_unified(
     if let Some(err) = producer_err.get() {
         return Err(err.clone());
     }
-    if !segment_plan.is_empty() {
+    if source_window_map.is_none() && !segment_plan.is_empty() {
         let expected = segment_plan.last().map(|s| s.end).unwrap_or(0usize);
         if active_idx != expected {
             return Err(format!(
@@ -3293,6 +3360,14 @@ struct LmStreamSegment {
     ctx: usize,
 }
 
+#[derive(Clone, Debug)]
+struct LmSourceWindow {
+    chrom: String,
+    start: i64,
+    end: i64,
+    ctx: usize,
+}
+
 fn parse_lm_x_contexts<'py>(
     y: &[f64],
     x_contexts: Bound<'py, PyAny>,
@@ -3430,6 +3505,45 @@ fn parse_lm_segments_unbounded<'py>(
     Ok(out)
 }
 
+fn parse_lm_source_windows<'py>(
+    source_windows: Option<Bound<'py, PyAny>>,
+    n_contexts: usize,
+) -> PyResult<Vec<LmSourceWindow>> {
+    let Some(source_windows) = source_windows else {
+        return Ok(Vec::new());
+    };
+    let win_list = source_windows.cast::<PyList>().map_err(|_| {
+        PyValueError::new_err(
+            "source_windows must be None or a list of (chrom, start, end, context_index) tuples",
+        )
+    })?;
+    let mut out = Vec::<LmSourceWindow>::with_capacity(win_list.len());
+    for (idx, item) in win_list.iter().enumerate() {
+        let (chrom, start, end, ctx): (String, i64, i64, usize) = item.extract().map_err(|_| {
+            PyValueError::new_err(format!(
+                "source_windows[{idx}] must be a (chrom, start, end, context_index) tuple"
+            ))
+        })?;
+        if start > end {
+            return Err(PyValueError::new_err(format!(
+                "source_windows[{idx}] has start > end: {start} > {end}"
+            )));
+        }
+        if ctx >= n_contexts {
+            return Err(PyValueError::new_err(format!(
+                "source_windows[{idx}] context index {ctx} exceeds context length {n_contexts}"
+            )));
+        }
+        out.push(LmSourceWindow {
+            chrom,
+            start,
+            end,
+            ctx,
+        });
+    }
+    Ok(out)
+}
+
 /// Compact QR-projected LM streaming scan over ordered active marker segments.
 ///
 /// This is the stage2-optimized variant.  Python passes one base design matrix,
@@ -3455,6 +3569,7 @@ fn parse_lm_segments_unbounded<'py>(
     progress_every=0,
     mmap_window_mb=None,
     setup_callback=None,
+    source_windows=None,
 ))]
 pub fn lm_stream_bed_segments_compact_to_tsv<'py>(
     py: Python<'py>,
@@ -3476,6 +3591,7 @@ pub fn lm_stream_bed_segments_compact_to_tsv<'py>(
     progress_every: usize,
     mmap_window_mb: Option<usize>,
     setup_callback: Option<Py<PyAny>>,
+    source_windows: Option<Bound<'py, PyAny>>,
 ) -> PyResult<(usize, usize)> {
     if chunk_size == 0 {
         return Err(PyValueError::new_err("chunk_size must be > 0"));
@@ -3618,6 +3734,7 @@ pub fn lm_stream_bed_segments_compact_to_tsv<'py>(
         )?;
     }
     let segment_plan = parse_lm_segments_unbounded(segments, compact_contexts.len())?;
+    let source_window_plan = parse_lm_source_windows(source_windows, compact_contexts.len())?;
     let out_tsv_path = out_tsv.clone();
 
     py.detach(move || -> PyResult<(usize, usize)> {
@@ -3628,6 +3745,7 @@ pub fn lm_stream_bed_segments_compact_to_tsv<'py>(
             q_all,
             compact_contexts.as_slice(),
             segment_plan.as_slice(),
+            source_window_plan.as_slice(),
             out_tsv_path.as_str(),
             sample_indices.as_slice(),
             maf_threshold,

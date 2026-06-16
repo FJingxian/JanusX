@@ -1512,9 +1512,6 @@ def run_farmcpu_fullmem(
                         threads=int(args.thread),
                         progress_callback=_farmcpu_stage2_progress,
                         args_obj=args,
-                        logger=logger,
-                        use_spinner=bool(use_spinner),
-                        status_prefix="FarmCPU stage2",
                     )
                     eff_snp = int(kept_rows2)
                     n_pseudo_qtn = int(max(n_pseudo_qtn, qtn_used))

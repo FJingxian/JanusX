@@ -105,18 +105,11 @@ def build_parser():
         help="Total memory budget in MB (default: 2048).",
     )
     basic.add_argument(
-        "-mp",
-        "--min-presence",
-        type=int,
-        default=5,
-        help="Keep k-mers present in at least N samples (default: 5).",
-    )
-    basic.add_argument(
         "-freq",
         "--freq",
         type=float,
         default=0.02,
-        help="Keep k-mers with presence rate in [freq, 1-freq] (default: 0.02).",
+        help="Keep k-mers with presence rate between freq and 1-freq (default: 0.02).",
     )
 
     advanced.add_argument(
@@ -180,8 +173,6 @@ def main() -> int:
         parser.error("-t/--thread must be > 0.")
     if args.memory <= 0:
         parser.error("-memory/--memory must be > 0.")
-    if args.min_presence <= 0:
-        parser.error("-mp/--min-presence must be > 0.")
     if args.max_run_size <= 0:
         parser.error("--max-run-size must be > 0.")
     if args.batch_size <= 0:
@@ -232,7 +223,6 @@ def main() -> int:
                 "Filter",
                 [
                     ("Min count", int(args.min_count)),
-                    ("Min presence", int(args.min_presence)),
                     ("Freq", float(args.freq)),
                 ],
             ),
@@ -272,7 +262,6 @@ def main() -> int:
             prefix=prefix,
             thread=threads,
             memory=int(args.memory),
-            min_presence=int(args.min_presence),
             freq=float(args.freq),
             tmp_dir=None if args.tmp_dir is None else str(Path(args.tmp_dir).expanduser().resolve()),
             max_run_size=int(args.max_run_size),

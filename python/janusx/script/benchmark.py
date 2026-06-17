@@ -814,6 +814,57 @@ detect_qtn_from_lines <- function(lines) {
   final_count
 }
 
+compute_marker_freq <- function(geno, ind_idx, threads, max_line, n_markers) {
+  nsnp <- as.integer(n_markers)
+  if (!is.finite(nsnp) || nsnp <= 0L) {
+    stop("Invalid marker count for rMVP frequency calculation.", call. = FALSE)
+  }
+  idx <- as.integer(ind_idx)
+  idx <- idx[is.finite(idx)]
+  if (!length(idx)) {
+    stop("No valid matched sample indices for marker-frequency calculation.", call. = FALSE)
+  }
+  # rMVP internals vary by version; prefer its native helper when available,
+  # otherwise fall back to a direct big.matrix row-mean over the selected samples.
+  big_row_mean <- tryCatch(getFromNamespace("BigRowMean", "rMVP"), error = function(e) NULL)
+  if (is.function(big_row_mean)) {
+    return(big_row_mean(
+      geno@address,
+      TRUE,
+      threads = threads,
+      geno_ind = idx
+    ) / 2)
+  }
+  geno_nr <- tryCatch(as.integer(nrow(geno)), error = function(e) NA_integer_)
+  geno_nc <- tryCatch(as.integer(ncol(geno)), error = function(e) NA_integer_)
+  marker_by_col <- is.finite(geno_nc) && geno_nc == nsnp
+  marker_by_row <- is.finite(geno_nr) && geno_nr == nsnp
+  if (!marker_by_col && !marker_by_row) {
+    stop(
+      sprintf(
+        "Cannot infer rMVP genotype orientation: nrow=%s ncol=%s n_markers=%s",
+        as.character(geno_nr),
+        as.character(geno_nc),
+        as.character(nsnp)
+      ),
+      call. = FALSE
+    )
+  }
+  chunk <- as.integer(max(1L, ifelse(is.finite(max_line) && max_line > 0L, max_line, 10000L)))
+  out <- numeric(nsnp)
+  for (start in seq.int(1L, nsnp, by = chunk)) {
+    end <- min(nsnp, start + chunk - 1L)
+    if (marker_by_col) {
+      block <- geno[idx, start:end, drop = FALSE]
+      out[start:end] <- colMeans(block, na.rm = TRUE) / 2
+    } else {
+      block <- geno[start:end, idx, drop = FALSE]
+      out[start:end] <- rowMeans(block, na.rm = TRUE) / 2
+    }
+  }
+  out
+}
+
 write_meta <- function(meta_file, exit_code, pseudo_qtn, inner_log, note, pseudo_qtn_metric) {
   meta <- data.frame(
     key = c("exit_code", "pseudo_qtn", "pseudo_qtn_metric", "inner_log", "note"),
@@ -967,12 +1018,7 @@ tryCatch(
     ind_idx <- as.integer(matched)
 
     CV_farmcpu <- NULL
-    marker_freq <- rMVP:::BigRowMean(
-      geno@address,
-      TRUE,
-      threads = threads,
-      geno_ind = ind_idx
-    ) / 2
+    marker_freq <- compute_marker_freq(geno, ind_idx, threads, max_line, nrow(map_out))
     if (!is.null(npc_farmcpu) && npc_farmcpu > 0L) {
       K <- rMVP::MVP.K.VanRaden(
         M = geno,

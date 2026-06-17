@@ -58,8 +58,9 @@ Final scan
 
 After stage1 converges, both routes perform the packed association scan using the
 final background design. The unified route additionally enables merged-window
-local re-scans after the relaxed final merge, while the raw route keeps the
-plain final scan and continues to emit pseudo-QTN effect values.
+local re-scans after the relaxed final merge. Pseudo-QTN rows are written for
+both routes; when a unified-route pseudo-QTN falls inside a local re-scan
+window, its output statistics come from that local conditional refit.
 */
 
 use crate::bedmath::{decode_plink_bed_hardcall, packed_row_missing_count_selected};
@@ -103,11 +104,6 @@ impl FarmcpuRoute {
     #[inline]
     fn enable_local_window_merge(self) -> bool {
         matches!(self, Self::Unified)
-    }
-
-    #[inline]
-    fn write_qtn_effects(self) -> bool {
-        matches!(self, Self::Raw)
     }
 }
 
@@ -1619,7 +1615,6 @@ fn write_farmcpu_packed_main_scan(
     qtn_idx: &[usize],
     final_window_bp: i64,
     enable_local_window_merge: bool,
-    write_qtn_effects: bool,
 ) -> Result<(usize, usize), String> {
     let n = y.len();
     if n == 0 {
@@ -1977,35 +1972,21 @@ fn write_farmcpu_packed_main_scan(
             if let Some(ref mut qtn_text_buf) = qtn_text_buf_opt {
                 if qtn_lookup.contains_key(&i) {
                     qtn_rows_written += 1;
-                    if write_qtn_effects {
-                        let _ = write!(
-                            qtn_text_buf,
-                            "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\n",
-                            chrom[i],
-                            pos[i],
-                            snp[i],
-                            allele0[i],
-                            allele1[i],
-                            row_maf[i],
-                            miss_counts[i],
-                            beta,
-                            se,
-                            chisq_txt,
-                            pwald
-                        );
-                    } else {
-                        let _ = write!(
-                            qtn_text_buf,
-                            "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\tNaN\tNaN\tNaN\t1.0000e0\n",
-                            chrom[i],
-                            pos[i],
-                            snp[i],
-                            allele0[i],
-                            allele1[i],
-                            row_maf[i],
-                            miss_counts[i],
-                        );
-                    }
+                    let _ = write!(
+                        qtn_text_buf,
+                        "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\n",
+                        chrom[i],
+                        pos[i],
+                        snp[i],
+                        allele0[i],
+                        allele1[i],
+                        row_maf[i],
+                        miss_counts[i],
+                        beta,
+                        se,
+                        chisq_txt,
+                        pwald
+                    );
                 }
             }
         }
@@ -2570,21 +2551,6 @@ pub fn farmcpu_packed_to_tsv(
                 qtn_union.extend(opt_lead.iter().copied());
                 qtn_union.sort_unstable();
                 qtn_union.dedup();
-                for &idx in qtn_union.iter() {
-                    seen_qtn_idx.insert(idx);
-                    let mut score = femp.get(idx).copied().unwrap_or(1.0);
-                    if !score.is_finite() {
-                        score = 1.0;
-                    }
-                    qtn_best_score
-                        .entry(idx)
-                        .and_modify(|best| {
-                            if score.total_cmp(best).is_lt() {
-                                *best = score;
-                            }
-                        })
-                        .or_insert(score);
-                }
                 let mut qtn_score_map: HashMap<usize, f64> =
                     HashMap::with_capacity(qtn_union.len());
                 for &idx in qtn_union.iter() {
@@ -2614,6 +2580,21 @@ pub fn farmcpu_packed_to_tsv(
                     qtn_stage_cap,
                 )
                 .map_err(PyRuntimeError::new_err)?;
+                for &idx in qtn_next.iter() {
+                    seen_qtn_idx.insert(idx);
+                    let mut score = qtn_score_map.get(&idx).copied().unwrap_or(1.0);
+                    if !score.is_finite() {
+                        score = 1.0;
+                    }
+                    qtn_best_score
+                        .entry(idx)
+                        .and_modify(|best| {
+                            if score.total_cmp(best).is_lt() {
+                                *best = score;
+                            }
+                        })
+                        .or_insert(score);
+                }
 
                 if let Some(cb) = progress_callback.as_ref() {
                     Python::attach(|py2| -> PyResult<()> {
@@ -2938,7 +2919,6 @@ pub fn farmcpu_packed_to_tsv(
             &qtn_idx,
             final_window_bp,
             route.enable_local_window_merge(),
-            route.write_qtn_effects(),
         )
         .map_err(PyRuntimeError::new_err)?;
         writer.finish().map_err(PyRuntimeError::new_err)?;

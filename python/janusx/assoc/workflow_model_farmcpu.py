@@ -585,7 +585,7 @@ def run_farmcpu_fullmem(
     emit_file_dense_warning: bool = True,
 ) -> dict[str, object]:
     """
-    Run FarmCPU in high-memory mode (full genotype + QK + PCA).
+    Run FarmCPU via the Rust packed-BED controller (packed genotype + QK + PCA).
 
     If pheno_preloaded is provided from a non-streaming path, it may be reused.
     When called after streaming GWAS context preparation, FarmCPU must use full
@@ -1085,8 +1085,13 @@ def run_farmcpu_fullmem(
         t0 = time.time()
         gwas_t0 = time.time()
         peak_rss = process.memory_info().rss
-        farm_iter = max(1, int(getattr(args, "farmcpu_iter", 20)))
-        farm_threshold = float(getattr(args, "farmcpu_threshold", 0.05))
+        farm_iter = max(1, int(getattr(args, "farmcpu_iter", 30)))
+        farm_threshold_raw = getattr(args, "farmcpu_threshold", None)
+        farm_threshold = (
+            (1.0 / float(max(1, int(eff_snp))))
+            if farm_threshold_raw is None
+            else float(farm_threshold_raw)
+        )
         farm_qtn_bound_raw = getattr(args, "farmcpu_qtn_bound", None)
         farm_qtn_bound = None if farm_qtn_bound_raw is None else int(farm_qtn_bound_raw)
         farm_nbin = max(1, int(getattr(args, "farmcpu_nbin", 5)))

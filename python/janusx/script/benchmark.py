@@ -7,12 +7,18 @@ Key features:
   - One-command benchmark for two kernels:
       * janusx (jxpy gwas -farmcpu-raw)
       * rmvp   (R, explicit MVP.FarmCPU via temporary inlined runner script)
-  - Unified FarmCPU grid policy to align JanusX and explicit rMVP::MVP.FarmCPU inputs:
+  - Unified FarmCPU grid policy to align JanusX and direct rMVP::MVP.FarmCPU inputs:
       * bin.size      default: 5e5, 5e6, 5e7
       * QTNbound      default: int(sqrt(n / log10(n)))
       * bin.selection derived from QTNbound and nbin:
           step = max(1, QTNbound // nbin)
           seq(step, QTNbound, by=step)
+  - Raw pseudoQTN de-redundancy is intentionally kept at `|r| >= 0.7`
+    because rMVP hardcodes `FarmCPU.Remove(..., threshold = 0.7)`
+  - The direct `rMVP::MVP.FarmCPU(...)` entry point in the installed rMVP
+    build does not expose `vc.method`; this benchmark therefore aligns
+    `method.bin`, grid, and external threshold wiring, while recording
+    `vc.method` only as a requested-but-ineffective metadata field.
   - Outputs:
       * per-kernel GWAS result table
       * per-kernel top-k table
@@ -53,6 +59,7 @@ from janusx.script._common.pathcheck import safe_expanduser  # noqa: E402
 from janusx.script._common.threads import detect_effective_threads  # noqa: E402
 from janusx.script._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog  # noqa: E402
 from janusx.script._common.colspec import parse_zero_based_index_specs  # noqa: E402
+from janusx.gfreader import inspect_genotype_file  # noqa: E402
 
 
 _P_COL_KEYS = (
@@ -440,13 +447,23 @@ def _compute_farmcpu_grid(
     return bound, bin_selection, bin_size
 
 
+def _resolve_effective_farmcpu_threshold(raw_threshold: Optional[float], n_snps: int) -> float:
+    if raw_threshold is not None:
+        thr = float(raw_threshold)
+        if not math.isfinite(thr) or thr <= 0:
+            raise ValueError("--farmcpu-threshold must be > 0.")
+        return thr
+    return 1.0 / float(max(1, int(n_snps)))
+
+
 def _resolve_align_runtime(args: argparse.Namespace) -> AlignRuntime:
     # Single aligned benchmark mode:
-    # direct rMVP::MVP.FarmCPU(...) with explicit BRENT + FaST-LMM settings.
+    # direct rMVP::MVP.FarmCPU(...) with explicit FaST-LMM bin setting.
+    # The direct FarmCPU entry point does not expose vc.method in current rMVP.
     return AlignRuntime(
         rmvp_vc_method="BRENT",
         rmvp_method_bin="FaST-LMM",
-        farmcpu_threshold=float(args.farmcpu_threshold),
+        farmcpu_threshold=1.0,
     )
 
 
@@ -826,20 +843,13 @@ if (!is.finite(threads) || threads < 1L) threads <- 1L
 max_line <- suppressWarnings(as.integer(opts[["max-line"]]))
 if (!is.finite(max_line) || max_line < 1L) max_line <- 10000L
 max_loop <- suppressWarnings(as.integer(opts[["farmcpu-max-loop"]]))
-if (!is.finite(max_loop) || max_loop < 1L) max_loop <- 10L
+if (!is.finite(max_loop) || max_loop < 1L) max_loop <- 30L
 threshold <- suppressWarnings(as.numeric(opts[["farmcpu-threshold"]]))
-if (!is.finite(threshold) || threshold <= 0) threshold <- 0.05
 threshold_output <- suppressWarnings(as.numeric(opts[["farmcpu-threshold-output"]]))
-if (!is.finite(threshold_output) || threshold_output <= 0) threshold_output <- threshold
 p_threshold <- suppressWarnings(as.numeric(opts[["farmcpu-p-threshold"]]))
 p_threshold_raw <- ifelse(is.null(opts[["farmcpu-p-threshold"]]), "", trimws(opts[["farmcpu-p-threshold"]]))
-if (!nzchar(p_threshold_raw) || tolower(p_threshold_raw) %in% c("na", "null", "none")) {
-  p_threshold <- NA_real_
-} else if (!is.finite(p_threshold) || p_threshold <= 0) {
-  p_threshold <- threshold
-}
 qtn_threshold <- suppressWarnings(as.numeric(opts[["farmcpu-qtn-threshold"]]))
-if (!is.finite(qtn_threshold) || qtn_threshold <= 0) qtn_threshold <- threshold
+qtn_threshold_raw <- ifelse(is.null(opts[["farmcpu-qtn-threshold"]]), "", trimws(opts[["farmcpu-qtn-threshold"]]))
 farmcpu_bound <- suppressWarnings(as.integer(opts[["farmcpu-bound"]]))
 if (!is.finite(farmcpu_bound) || farmcpu_bound < 1L) farmcpu_bound <- NULL
 maf <- suppressWarnings(as.numeric(opts[["farmcpu-maf"]]))
@@ -912,6 +922,18 @@ tryCatch(
     map_out <- as.data.frame(map, stringsAsFactors = FALSE)
     # rMVP::MVP.FarmCPU expects only SNP/CHROM/POS here; passing A1/A2 shifts the internal P column.
     map_farmcpu <- map_out[, seq_len(3L), drop = FALSE]
+    if (!is.finite(threshold) || threshold <= 0) threshold <- 1 / max(1L, nrow(map_farmcpu))
+    if (!is.finite(threshold_output) || threshold_output <= 0) threshold_output <- threshold
+    if (!nzchar(p_threshold_raw) || tolower(p_threshold_raw) %in% c("na", "null", "none")) {
+      p_threshold <- NA_real_
+    } else if (!is.finite(p_threshold) || p_threshold <= 0) {
+      p_threshold <- NA_real_
+    }
+    if (!nzchar(qtn_threshold_raw) || tolower(qtn_threshold_raw) %in% c("na", "null", "none")) {
+      qtn_threshold <- NA_real_
+    } else if (!is.finite(qtn_threshold) || qtn_threshold <= 0) {
+      qtn_threshold <- NA_real_
+    }
     ids <- utils::read.table(
       paste0(cache_prefix, ".geno.ind"),
       header = FALSE,
@@ -969,7 +991,7 @@ tryCatch(
       CV_farmcpu <- ipca[, seq_len(min(ncol(ipca), npc_farmcpu)), drop = FALSE]
     }
 
-    farmcpu_out <- rMVP::MVP.FarmCPU(
+    farmcpu_args <- list(
       phe = phe,
       geno = geno,
       map = map_farmcpu,
@@ -990,11 +1012,19 @@ tryCatch(
       threshold.output = threshold_output,
       converge = 1,
       iteration.output = FALSE,
-      p.threshold = p_threshold,
-      QTN.threshold = qtn_threshold,
       bound = farmcpu_bound,
       verbose = TRUE
     )
+    if (is.finite(p_threshold) && p_threshold > 0) {
+      farmcpu_args[["p.threshold"]] <- p_threshold
+    }
+    if (is.finite(qtn_threshold) && qtn_threshold > 0) {
+      farmcpu_args[["QTN.threshold"]] <- qtn_threshold
+    }
+    if (nzchar(vc_method)) {
+      cat("[INFO] direct MVP.FarmCPU path does not expose vc.method; requested value recorded only:", vc_method, "\n")
+    }
+    farmcpu_out <- do.call(rMVP::MVP.FarmCPU, farmcpu_args)
     farmcpu_out <- as.data.frame(farmcpu_out, stringsAsFactors = FALSE)
     if (!nrow(map_out) || !nrow(farmcpu_out)) {
       stop("rMVP returned no FarmCPU result rows.", call. = FALSE)
@@ -1225,10 +1255,6 @@ def _run_kernel_r(
         f"{float(align_runtime.farmcpu_threshold):.17g}",
         "--farmcpu-threshold-output",
         f"{float(align_runtime.farmcpu_threshold):.17g}",
-        "--farmcpu-p-threshold",
-        f"{float(align_runtime.farmcpu_threshold):.17g}",
-        "--farmcpu-qtn-threshold",
-        f"{float(align_runtime.farmcpu_threshold):.17g}",
         "--farmcpu-bound",
         str(int(farm_bound)),
         "--farmcpu-maf",
@@ -1419,7 +1445,8 @@ def _save_summary(out_dir: Path, prefix: str, rows: list[RunResult], extra_cfg: 
             "",
             "**PseudoQTN Count Consistency Matrix (Lower Triangle)**",
             "Formula: `min(qtn_i, qtn_j) / max(qtn_i, qtn_j)`; `NA` means missing/non-positive pseudoQTN.",
-            "Current direct/aligned benchmark uses explicit `rMVP::MVP.FarmCPU(...)` with `vc.method=BRENT` and `method.bin=FaST-LMM`.",
+            "Current direct/aligned benchmark uses explicit `rMVP::MVP.FarmCPU(...)` with `method.bin=FaST-LMM`.",
+            "The installed direct `MVP.FarmCPU` entry point does not expose `vc.method`; config therefore records `rmvp_vc_method_requested` only as requested metadata, not as an effective runtime knob.",
             "The embedded rMVP runner trims the FarmCPU `map` input to `SNP/CHROM/POS`; full map columns are kept only for output annotation.",
             "`rmvp` pseudoQTN is the final `seqQTN` / covariate count parsed from the last loop; `janusx` pseudoQTN is the workflow-reported JanusX count.",
         ]
@@ -1586,15 +1613,15 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     )
     advanced_group.add_argument(
         "--farmcpu-iter",
-        default=20,
+        default=30,
         type=int,
         help=("FarmCPU max loop / iteration." if show_dev_help else argparse.SUPPRESS),
     )
     advanced_group.add_argument(
         "--farmcpu-threshold",
-        default=0.05,
+        default=None,
         type=float,
-        help=("FarmCPU threshold (QTN/p threshold/output)." if show_dev_help else argparse.SUPPRESS),
+        help=("FarmCPU threshold; if unset, defaults to 1 / tested_SNP_count." if show_dev_help else argparse.SUPPRESS),
     )
     advanced_group.add_argument(
         "--force-pseudo-qtn-cap",
@@ -1660,7 +1687,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         p.error("--farmcpu-iter must be >= 1.")
     if int(args.farmcpu_nbin) < 1:
         p.error("--farmcpu-nbin must be >= 1.")
-    if float(args.farmcpu_threshold) <= 0:
+    if args.farmcpu_threshold is not None and float(args.farmcpu_threshold) <= 0:
         p.error("--farmcpu-threshold must be > 0.")
     if args.force_pseudo_qtn_cap is not None and int(args.force_pseudo_qtn_cap) < 1:
         p.error("--force-pseudo-qtn-cap must be >= 1.")
@@ -1728,6 +1755,13 @@ def main() -> None:
         n_for_grid = max(2, int(n_overlap))
     else:
         n_for_grid = max(2, int(ph.shape[0]))
+    if bfile_for_r:
+        n_snps_for_threshold = max(1, int(_count_bim_snps(bfile_for_r)))
+    elif args.bfile:
+        n_snps_for_threshold = max(1, int(_count_bim_snps(gfile)))
+    else:
+        _sample_ids_probe, n_sites_probe = inspect_genotype_file(gfile)
+        n_snps_for_threshold = max(1, int(n_sites_probe))
 
     bin_size = _parse_number_list(args.farmcpu_bin_size, cast=float)
     farm_bound, farm_bin_selection, farm_bin_size = _compute_farmcpu_grid(
@@ -1745,6 +1779,10 @@ def main() -> None:
             farm_bin_selection = [int(farm_bound)]
 
     align_runtime = _resolve_align_runtime(args)
+    align_runtime.farmcpu_threshold = _resolve_effective_farmcpu_threshold(
+        getattr(args, "farmcpu_threshold", None),
+        n_snps_for_threshold,
+    )
 
     rmvp_runner = bench_dir / "tmp" / "rmvp_farmcpu_runner.R"
     rmvp_runner.parent.mkdir(parents=True, exist_ok=True)
@@ -1799,9 +1837,15 @@ def main() -> None:
         "farmcpu_bound": int(farm_bound),
         "farmcpu_bin_selection": [int(x) for x in farm_bin_selection],
         "farmcpu_iter": int(args.farmcpu_iter),
-        "farmcpu_threshold": float(args.farmcpu_threshold),
+        "farmcpu_threshold": float(align_runtime.farmcpu_threshold),
+        "farmcpu_threshold_source": (
+            "cli" if args.farmcpu_threshold is not None else f"auto_1_over_nsnp({int(n_snps_for_threshold)})"
+        ),
         "benchmark_mode": "direct_aligned_explicit_mvp_farmcpu",
-        "rmvp_vc_method": str(align_runtime.rmvp_vc_method),
+        "rmvp_runner_mode": "direct_mvp_farmcpu",
+        "rmvp_vc_method_requested": str(align_runtime.rmvp_vc_method),
+        "rmvp_vc_method_effective": None,
+        "rmvp_vc_method_note": "not_exposed_by_direct_mvp_farmcpu_entrypoint",
         "rmvp_reuse_cache": bool(args.rmvp_reuse_cache),
         "rmvp_force_rebuild": (not bool(args.rmvp_reuse_cache)),
         "rmvp_method_bin": str(align_runtime.rmvp_method_bin),

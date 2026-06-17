@@ -1,16 +1,76 @@
+/*!
+Packed FarmCPU implementation.
+
+Notation
+========
+
+Let
+
+  - `y` be the phenotype vector
+  - `X0 = [1, C]` be the intercept plus user covariates
+  - `S_t` be the pseudo-QTN index set at iteration `t`
+  - `X_t = [X0, G_{S_t}]` be the background design at iteration `t`
+  - `p_t(i)` be the stage1 FEM p-value for marker `i` conditional on `X_t`
+  - `L_t(s, b)` be the lead set selected by window size `s` and lead count `b`
+  - `tau` be the stage1 signal threshold supplied by the caller
+
+Common stage1 pieces
+====================
+
+Both routes run a conditional FEM scan on `X_t` and score REM candidate lead sets
+by minimizing the FarmCPU log-likelihood over `(window_bp, n_lead)` grid pairs.
+
+Raw route: `-farmcpu-raw`
+=========================
+
+This route follows the classic FEM/REM/SUPER chain.
+
+  1. FEM: compute `p_t(i)` conditional on `X_t`
+  2. REM: choose `L_t* = argmin_{s,b} REM(L_t(s,b) | X_t, y)`
+  3. SUPER update: `S_{t+1} = SUPER(S_t ∪ L_t*)`
+     with the classic rMVP-style redundancy rule `|r| >= 0.7`
+  4. Current pseudo-QTN effect p-values are fed back into the update chain
+  5. Stop when no marker passes `tau`, or `S_{t+1} == S_t`, or a 2-cycle is detected
+
+Unified route: `-farmcpu`
+=========================
+
+This route keeps the FEM background scan, adds the same REM scorer, and differs
+from the raw route in how pseudo-QTNs are retained across stage1 and how the
+final stage2 window scan is prepared.
+
+  1. FEM: compute `p_t(i)` conditional on `X_t`
+  2. REM: choose `L_t* = argmin_{s,b} REM(L_t(s,b) | X_t, y)`
+  3. Record additional significant window representatives `R_t`
+  4. Build the stage1 candidate union `U_t = S_t ∪ L_t* ∪ R_t`
+  5. Strictly merge `U_t` within the current iteration using `r^2 >= 0.8`
+     to obtain the next background set `S_{t+1}`
+  6. Add every stage1-selected pseudo-QTN into a persistent seen-set and mask
+     those rows out of later FEM candidate selection so they no longer compete
+     for new lead slots
+  7. Stop when no unmasked marker passes `tau`, or `S_{t+1} == S_t`, or a
+     2-cycle is detected
+  8. After stage1 converges, run one final relaxed merge with `r^2 >= 0.5`
+     before the stage2 merged-window local re-scan
+
+Final scan
+==========
+
+After stage1 converges, both routes perform the packed association scan using the
+final background design. The unified route additionally enables merged-window
+local re-scans after the relaxed final merge, while the raw route keeps the
+plain final scan and continues to emit pseudo-QTN effect values.
+*/
+
 use crate::bedmath::{decode_plink_bed_hardcall, packed_row_missing_count_selected};
 use crate::blas::{cblas_dgemm_dispatch, CblasInt, CBLAS_NO_TRANS, CBLAS_ROW_MAJOR};
 use crate::linalg::{
     chisq_from_beta_se_and_optional_plrt, format_chisq_value, sanitize_assoc_pvalue,
 };
-use crate::math_farmcpu::{
-    decode_packed_rows_to_sample_major, farmcpu_ll_score_from_sample_major,
-    farmcpu_super_keep_from_sample_major, select_lead_indices,
-};
 use crate::stats_common::{
     get_cached_pool, parse_index_vec_i64, resolve_assoc_tsv_metadata, AsyncTsvWriter,
 };
-use nalgebra::DMatrix;
+use nalgebra::{DMatrix, DVector};
 use numpy::PyArray1;
 use numpy::PyArrayMethods;
 use numpy::{PyReadonlyArray1, PyReadonlyArray2};
@@ -21,13 +81,418 @@ use pyo3::BoundObject;
 use rayon::prelude::*;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::f64::consts::PI;
 use std::fmt::Write as _;
 
-// FarmCPU helper kernels moved to `math/farmcpu.rs`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FarmcpuRoute {
+    Unified,
+    Raw,
+}
+
+impl FarmcpuRoute {
+    #[inline]
+    fn from_raw(raw: bool) -> Self {
+        if raw {
+            Self::Raw
+        } else {
+            Self::Unified
+        }
+    }
+
+    #[inline]
+    fn enable_local_window_merge(self) -> bool {
+        matches!(self, Self::Unified)
+    }
+
+    #[inline]
+    fn write_qtn_effects(self) -> bool {
+        matches!(self, Self::Raw)
+    }
+}
 
 #[inline]
 fn dot(a: &[f64], b: &[f64]) -> f64 {
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+}
+
+#[inline]
+pub(crate) fn decode_packed_rows_to_sample_major(
+    packed_flat: &[u8],
+    bytes_per_snp: usize,
+    row_indices: &[usize],
+    packed_row_lookup: Option<&[usize]>,
+    sample_idx: &[usize],
+    row_flip: &[bool],
+    row_maf: &[f32],
+) -> Result<Vec<f64>, String> {
+    if bytes_per_snp == 0 {
+        return Err("invalid bytes_per_snp=0 in packed decode".to_string());
+    }
+    if packed_flat.len() % bytes_per_snp != 0 {
+        return Err("packed length is not divisible by bytes_per_snp in packed decode".to_string());
+    }
+    let n = sample_idx.len();
+    let k = row_indices.len();
+    let packed_rows = packed_flat.len() / bytes_per_snp;
+    let mut out = vec![0.0_f64; n * k];
+    for (col, &local_row_idx) in row_indices.iter().enumerate() {
+        if local_row_idx >= row_flip.len() || local_row_idx >= row_maf.len() {
+            return Err(format!(
+                "row metadata index out of bounds in packed decode: idx={}, row_flip={}, row_maf={}",
+                local_row_idx,
+                row_flip.len(),
+                row_maf.len()
+            ));
+        }
+        let packed_row_idx = if let Some(lookup) = packed_row_lookup {
+            *lookup.get(local_row_idx).ok_or_else(|| {
+                format!(
+                    "packed row lookup index out of bounds in packed decode: idx={}, lookup_len={}",
+                    local_row_idx,
+                    lookup.len()
+                )
+            })?
+        } else {
+            local_row_idx
+        };
+        if packed_row_idx >= packed_rows {
+            return Err(format!(
+                "packed row index out of bounds in packed decode: idx={}, packed_rows={}",
+                packed_row_idx, packed_rows
+            ));
+        }
+        let row =
+            &packed_flat[packed_row_idx * bytes_per_snp..(packed_row_idx + 1) * bytes_per_snp];
+        let flip = row_flip[local_row_idx];
+        let mean_g = 2.0_f64 * row_maf[local_row_idx] as f64;
+        for (i, &sidx) in sample_idx.iter().enumerate() {
+            let b = row[sidx >> 2];
+            let code = (b >> ((sidx & 3) * 2)) & 0b11;
+            let mut gv = match decode_plink_bed_hardcall(code) {
+                Some(v) => v,
+                None => mean_g,
+            };
+            if flip && code != 0b01 {
+                gv = 2.0 - gv;
+            }
+            out[i * k + col] = gv;
+        }
+    }
+    Ok(out)
+}
+
+pub(crate) fn select_lead_indices(
+    sz: i64,
+    n_lead: usize,
+    pvalue: &[f64],
+    pos: &[i64],
+) -> Vec<usize> {
+    let m = pvalue.len();
+    if m == 0 || n_lead == 0 {
+        return Vec::new();
+    }
+    let mut order: Vec<usize> = (0..m).collect();
+    order.sort_by(|&a, &b| {
+        let ba = pos[a].div_euclid(sz);
+        let bb = pos[b].div_euclid(sz);
+        match ba.cmp(&bb) {
+            std::cmp::Ordering::Equal => pvalue[a].total_cmp(&pvalue[b]),
+            other => other,
+        }
+    });
+
+    let mut lead: Vec<usize> = Vec::new();
+    let mut last_bin: Option<i64> = None;
+    for &idx in order.iter() {
+        let b = pos[idx].div_euclid(sz);
+        if last_bin.map_or(true, |lb| lb != b) {
+            lead.push(idx);
+            last_bin = Some(b);
+        }
+    }
+
+    lead.sort_by(|&a, &b| pvalue[a].total_cmp(&pvalue[b]));
+    if lead.len() > n_lead {
+        lead.truncate(n_lead);
+    }
+    lead.sort_unstable();
+    lead
+}
+
+fn solve_linear_system_stable(a: &DMatrix<f64>, b: &DVector<f64>) -> Option<DVector<f64>> {
+    let p = a.nrows();
+    if p == 0 {
+        return Some(DVector::zeros(0));
+    }
+    let eye = DMatrix::<f64>::identity(p, p);
+    for ridge in [0.0_f64, 1e-10, 1e-8, 1e-6] {
+        let mut a_use = a.clone();
+        if ridge > 0.0 {
+            a_use += &eye * ridge;
+        }
+        if let Some(ch) = a_use.cholesky() {
+            return Some(ch.solve(b));
+        }
+    }
+    let lu = a.clone().lu();
+    lu.solve(b)
+}
+
+pub(crate) fn farmcpu_ll_score_from_sample_major(
+    y: &[f64],
+    x: &[f64],
+    n: usize,
+    p: usize,
+    snp_pool_sample_major: &[f64],
+    k: usize,
+    delta_exp_start: f64,
+    delta_exp_end: f64,
+    delta_step: f64,
+    svd_eps: f64,
+) -> Result<f64, String> {
+    if n == 0 || p == 0 {
+        return Err("invalid shape in ll score: empty y/X".to_string());
+    }
+    if y.len() != n {
+        return Err("invalid y length in ll score".to_string());
+    }
+    if x.len() != n * p {
+        return Err("invalid X length in ll score".to_string());
+    }
+    if snp_pool_sample_major.len() != n * k {
+        return Err("invalid snp_pool length in ll score".to_string());
+    }
+    if !(delta_step.is_finite() && delta_step > 0.0) {
+        return Err("delta_step must be positive and finite".to_string());
+    }
+
+    let yvec = DVector::<f64>::from_column_slice(y);
+    let xmat = DMatrix::<f64>::from_row_slice(n, p, x);
+    let snp_pool = if k > 0 {
+        DMatrix::<f64>::from_row_slice(n, k, snp_pool_sample_major)
+    } else {
+        DMatrix::<f64>::zeros(n, 0)
+    };
+
+    let mut d_start = delta_exp_start;
+    let mut d_end = delta_exp_end;
+
+    if k > 0 {
+        let mut has_zero_var = n <= 1;
+        if !has_zero_var {
+            for col in 0..k {
+                let mut mean = 0.0_f64;
+                for i in 0..n {
+                    mean += snp_pool[(i, col)];
+                }
+                mean /= n as f64;
+                let mut ss = 0.0_f64;
+                for i in 0..n {
+                    let d = snp_pool[(i, col)] - mean;
+                    ss += d * d;
+                }
+                let var = ss / ((n - 1) as f64);
+                if var <= 0.0 || !var.is_finite() {
+                    has_zero_var = true;
+                    break;
+                }
+            }
+        }
+        if has_zero_var {
+            d_start = 100.0;
+            d_end = 100.0;
+        }
+    }
+
+    let (u1, d): (DMatrix<f64>, Vec<f64>) = if k == 0 {
+        (DMatrix::<f64>::zeros(n, 0), Vec::new())
+    } else {
+        let svd = snp_pool.svd(true, false);
+        let u = svd
+            .u
+            .ok_or_else(|| "SVD failed to produce U in ll score".to_string())?;
+        let s = svd.singular_values;
+        let keep: Vec<usize> = (0..s.len()).filter(|&i| s[i] > svd_eps).collect();
+        if keep.is_empty() {
+            (DMatrix::<f64>::zeros(n, 0), Vec::new())
+        } else {
+            let r = keep.len();
+            let mut u1_data = Vec::with_capacity(n * r);
+            for i in 0..n {
+                for &c in keep.iter() {
+                    u1_data.push(u[(i, c)]);
+                }
+            }
+            let d = keep.iter().map(|&c| s[c] * s[c]).collect::<Vec<_>>();
+            (DMatrix::<f64>::from_row_slice(n, r, &u1_data), d)
+        }
+    };
+
+    let r = d.len();
+    let u1tx = if r > 0 {
+        u1.transpose() * &xmat
+    } else {
+        DMatrix::<f64>::zeros(0, p)
+    };
+    let u1ty = if r > 0 {
+        u1.transpose() * &yvec
+    } else {
+        DVector::<f64>::zeros(0)
+    };
+    let x_u = if r > 0 {
+        &xmat - &u1 * &u1tx
+    } else {
+        xmat.clone()
+    };
+    let y_u = if r > 0 {
+        &yvec - &u1 * &u1ty
+    } else {
+        yvec.clone()
+    };
+
+    let xtx_u = x_u.transpose() * &x_u;
+    let xty_u = x_u.transpose() * &y_u;
+
+    let mut best_ll = f64::NEG_INFINITY;
+    let mut expv = d_start;
+    let end = d_end + 1e-12;
+    while expv <= end {
+        let delta = expv.exp();
+        if !(delta.is_finite() && delta > 0.0) {
+            expv += delta_step;
+            continue;
+        }
+
+        let mut beta1 = DMatrix::<f64>::zeros(p, p);
+        let mut beta3 = DVector::<f64>::zeros(p);
+        let mut part12 = 0.0_f64;
+
+        if r > 0 {
+            for t in 0..r {
+                let dt = d[t] + delta;
+                if !(dt.is_finite() && dt > 0.0) {
+                    continue;
+                }
+                let w = 1.0 / dt;
+                part12 += dt.ln();
+                for i in 0..p {
+                    let vi = u1tx[(t, i)];
+                    beta3[i] += vi * w * u1ty[t];
+                    for j in 0..p {
+                        beta1[(i, j)] += vi * w * u1tx[(t, j)];
+                    }
+                }
+            }
+        }
+
+        let a = beta1 + (&xtx_u / delta);
+        let b = beta3 + (&xty_u / delta);
+        let Some(beta) = solve_linear_system_stable(&a, &b) else {
+            expv += delta_step;
+            continue;
+        };
+
+        let part11 = (n as f64) * (2.0 * PI).ln();
+        let part13 = ((n - r) as f64) * delta.ln();
+        let part1 = -0.5 * (part11 + part12 + part13);
+
+        let mut part221 = 0.0_f64;
+        if r > 0 {
+            for t in 0..r {
+                let mut pred = 0.0_f64;
+                for j in 0..p {
+                    pred += u1tx[(t, j)] * beta[j];
+                }
+                let resid = u1ty[t] - pred;
+                part221 += (resid * resid) / (d[t] + delta);
+            }
+        }
+
+        let resid_i = &y_u - &x_u * &beta;
+        let part222 = resid_i.dot(&resid_i) / delta;
+        let part22 = part221 + part222;
+        if !(part22.is_finite() && part22 > 0.0) {
+            expv += delta_step;
+            continue;
+        }
+        let part2 = -0.5 * ((n as f64) + (n as f64) * (part22 / (n as f64)).ln());
+        let ll = part1 + part2;
+        if ll > best_ll {
+            best_ll = ll;
+        }
+        expv += delta_step;
+    }
+
+    if !best_ll.is_finite() {
+        return Err("failed to evaluate valid LL in farmcpu ll scorer".to_string());
+    }
+    Ok(-2.0 * best_ll)
+}
+
+pub(crate) fn farmcpu_super_keep_from_sample_major(
+    sample_major: &[f64],
+    n: usize,
+    k: usize,
+    pval: &[f64],
+    thr: f64,
+) -> Vec<bool> {
+    let mut keep = vec![true; k];
+    if k == 0 || n == 0 {
+        return keep;
+    }
+
+    let mut centered = vec![0.0_f64; k * n];
+    let mut std = vec![0.0_f64; k];
+    for c in 0..k {
+        let mut mean = 0.0_f64;
+        for i in 0..n {
+            mean += sample_major[i * k + c];
+        }
+        mean /= n as f64;
+
+        let mut ss = 0.0_f64;
+        for i in 0..n {
+            let z = sample_major[i * k + c] - mean;
+            centered[c * n + i] = z;
+            ss += z * z;
+        }
+        std[c] = if n > 1 {
+            (ss / ((n - 1) as f64)).sqrt()
+        } else {
+            0.0
+        };
+    }
+
+    for i in 0..k {
+        if !keep[i] {
+            continue;
+        }
+        for j in (i + 1)..k {
+            if !keep[j] {
+                continue;
+            }
+            let denom = ((n.saturating_sub(1)) as f64) * std[i] * std[j];
+            let cij = if denom > 0.0 && denom.is_finite() {
+                let mut dot_ij = 0.0_f64;
+                for t in 0..n {
+                    dot_ij += centered[i * n + t] * centered[j * n + t];
+                }
+                dot_ij / denom
+            } else {
+                f64::NAN
+            };
+            if cij >= thr || cij <= -thr {
+                if pval[i] >= pval[j] {
+                    keep[i] = false;
+                } else {
+                    keep[j] = false;
+                    break;
+                }
+            }
+        }
+    }
+    keep
 }
 
 fn betacf(a: f64, b: f64, x: f64) -> f64 {
@@ -282,6 +747,18 @@ struct FarmcpuFinalWindow {
 }
 
 #[inline]
+fn farmcpu_stage1_ld_merge_r2_threshold() -> f64 {
+    if let Ok(raw) = std::env::var("JX_FARMCPU_STAGE1_LD_MERGE_R2") {
+        if let Ok(v) = raw.trim().parse::<f64>() {
+            if v.is_finite() {
+                return v;
+            }
+        }
+    }
+    0.8
+}
+
+#[inline]
 fn farmcpu_final_ld_merge_r2_threshold() -> f64 {
     if let Ok(raw) = std::env::var("JX_FARMCPU_FINAL_LD_MERGE_R2") {
         if let Ok(v) = raw.trim().parse::<f64>() {
@@ -357,6 +834,8 @@ fn build_farmcpu_final_windows(
     sample_idx: &[usize],
     row_flip: &[bool],
     row_maf: &[f32],
+    ld_thr: f64,
+    merge_overlapping_windows: bool,
 ) -> Result<Vec<FarmcpuFinalWindow>, String> {
     let k = qtn_idx.len();
     if k == 0 || final_window_bp < 0 {
@@ -374,17 +853,18 @@ fn build_farmcpu_final_windows(
         ends[j] = pos[idx].saturating_add(bp);
     }
 
-    for a in 0..k {
-        for b in (a + 1)..k {
-            let ia = qtn_idx[a];
-            let ib = qtn_idx[b];
-            if chrom[ia] == chrom[ib] && starts[a] <= ends[b] && starts[b] <= ends[a] {
-                union_parent(&mut parent, a, b);
+    if merge_overlapping_windows {
+        for a in 0..k {
+            for b in (a + 1)..k {
+                let ia = qtn_idx[a];
+                let ib = qtn_idx[b];
+                if chrom[ia] == chrom[ib] && starts[a] <= ends[b] && starts[b] <= ends[a] {
+                    union_parent(&mut parent, a, b);
+                }
             }
         }
     }
 
-    let ld_thr = farmcpu_final_ld_merge_r2_threshold();
     if k > 1 && ld_thr.is_finite() && ld_thr > 0.0 {
         let sample_major = decode_packed_rows_to_sample_major(
             packed_flat,
@@ -436,10 +916,16 @@ fn build_farmcpu_final_windows(
             .then_with(|| a.end.cmp(&b.end))
     });
 
-    let mut merged: Vec<FarmcpuFinalWindow> = Vec::with_capacity(windows.len());
-    for mut w in windows {
+    for w in windows.iter_mut() {
         w.qtn_model_positions.sort_unstable();
         w.qtn_model_positions.dedup();
+    }
+    if !merge_overlapping_windows {
+        return Ok(windows);
+    }
+
+    let mut merged: Vec<FarmcpuFinalWindow> = Vec::with_capacity(windows.len());
+    for w in windows {
         if let Some(last) = merged.last_mut() {
             if last.chrom == w.chrom && w.start <= last.end {
                 last.end = last.end.max(w.end);
@@ -457,7 +943,7 @@ fn build_farmcpu_final_windows(
 #[allow(clippy::too_many_arguments)]
 fn farmcpu_prune_qtn_by_merged_windows(
     qtn_idx: Vec<usize>,
-    marker_pvalues: &[f64],
+    qtn_scores: &HashMap<usize, f64>,
     chrom: &[String],
     pos: &[i64],
     final_window_bp: i64,
@@ -467,6 +953,8 @@ fn farmcpu_prune_qtn_by_merged_windows(
     sample_idx: &[usize],
     row_flip: &[bool],
     row_maf: &[f32],
+    ld_thr: f64,
+    merge_overlapping_windows: bool,
     max_keep: usize,
 ) -> Result<Vec<usize>, String> {
     if qtn_idx.is_empty() || max_keep == 0 {
@@ -483,15 +971,17 @@ fn farmcpu_prune_qtn_by_merged_windows(
         sample_idx,
         row_flip,
         row_maf,
+        ld_thr,
+        merge_overlapping_windows,
     )?;
     let mut reps: Vec<(f64, usize)> = Vec::with_capacity(windows.len());
     for window in windows.iter() {
         let mut best: Option<(f64, usize)> = None;
         for &model_pos in window.qtn_model_positions.iter() {
             let idx = qtn_idx[model_pos];
-            let p = marker_pvalues.get(idx).copied().unwrap_or(1.0);
+            let mut p = qtn_scores.get(&idx).copied().unwrap_or(1.0);
             if !p.is_finite() {
-                continue;
+                p = 1.0;
             }
             match best {
                 Some((bp, bi)) if p.total_cmp(&bp).is_ge() || (p == bp && idx >= bi) => {}
@@ -508,6 +998,88 @@ fn farmcpu_prune_qtn_by_merged_windows(
     out.sort_unstable();
     out.dedup();
     Ok(out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn farmcpu_best_rem_lead_set(
+    y: &[f64],
+    x_qtn: &[f64],
+    q_total: usize,
+    femp: &[f64],
+    global_pos: &[i64],
+    szbin_i64: &[i64],
+    nbin_vals: &[usize],
+    packed_flat: &[u8],
+    bytes_per_snp: usize,
+    row_indices: Option<&[usize]>,
+    sample_idx: &[usize],
+    row_flip: &[bool],
+    row_maf: &[f32],
+    pool: Option<&std::sync::Arc<rayon::ThreadPool>>,
+) -> Result<Vec<usize>, String> {
+    let n = y.len();
+    let mut combine: Vec<(i64, usize)> = Vec::new();
+    for &sz in szbin_i64.iter() {
+        for &nn in nbin_vals.iter() {
+            combine.push((sz, nn));
+        }
+    }
+    if combine.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let rem_task = || {
+        combine
+            .par_iter()
+            .map(|&(sz, nn)| {
+                let leadidx = select_lead_indices(sz, nn, femp, global_pos);
+                let sample_major = decode_packed_rows_to_sample_major(
+                    packed_flat,
+                    bytes_per_snp,
+                    &leadidx,
+                    row_indices,
+                    sample_idx,
+                    row_flip,
+                    row_maf,
+                );
+                let sample_major = match sample_major {
+                    Ok(v) => v,
+                    Err(_) => return (f64::INFINITY, leadidx),
+                };
+                let score = farmcpu_ll_score_from_sample_major(
+                    y,
+                    x_qtn,
+                    n,
+                    q_total,
+                    &sample_major,
+                    leadidx.len(),
+                    -5.0,
+                    5.0,
+                    0.1,
+                    1e-8,
+                )
+                .unwrap_or(f64::INFINITY);
+                (score, leadidx)
+            })
+            .collect::<Vec<(f64, Vec<usize>)>>()
+    };
+    let rem_res = if let Some(p) = pool {
+        p.install(rem_task)
+    } else {
+        rem_task()
+    };
+    if rem_res.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut best_i = 0usize;
+    let mut best_score = rem_res[0].0;
+    for (i, (s, _)) in rem_res.iter().enumerate().skip(1) {
+        if s.total_cmp(&best_score).is_lt() {
+            best_score = *s;
+            best_i = i;
+        }
+    }
+    Ok(rem_res[best_i].1.clone())
 }
 
 fn build_x_with_qtn_packed(
@@ -1046,6 +1618,8 @@ fn write_farmcpu_packed_main_scan(
     qtn_lookup: &HashMap<usize, usize>,
     qtn_idx: &[usize],
     final_window_bp: i64,
+    enable_local_window_merge: bool,
+    write_qtn_effects: bool,
 ) -> Result<(usize, usize), String> {
     let n = y.len();
     if n == 0 {
@@ -1129,7 +1703,7 @@ fn write_farmcpu_packed_main_scan(
     }
 
     let mut local_overrides: HashMap<usize, [f64; 3]> = HashMap::new();
-    if final_window_bp >= 0 && !qtn_idx.is_empty() {
+    if enable_local_window_merge && final_window_bp >= 0 && !qtn_idx.is_empty() {
         let mut base_x = vec![0.0_f64; n * q_base];
         for i in 0..n {
             let src = &x_qtn[i * q0..i * q0 + q_base];
@@ -1147,6 +1721,8 @@ fn write_farmcpu_packed_main_scan(
             sample_idx,
             row_flip,
             row_maf,
+            farmcpu_final_ld_merge_r2_threshold(),
+            true,
         )?;
         let mut chr_to_rows: HashMap<&str, Vec<usize>> = HashMap::new();
         for i in 0..m {
@@ -1401,21 +1977,35 @@ fn write_farmcpu_packed_main_scan(
             if let Some(ref mut qtn_text_buf) = qtn_text_buf_opt {
                 if qtn_lookup.contains_key(&i) {
                     qtn_rows_written += 1;
-                    let _ = write!(
-                        qtn_text_buf,
-                        "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\n",
-                        chrom[i],
-                        pos[i],
-                        snp[i],
-                        allele0[i],
-                        allele1[i],
-                        row_maf[i],
-                        miss_counts[i],
-                        beta,
-                        se,
-                        chisq_txt,
-                        pwald
-                    );
+                    if write_qtn_effects {
+                        let _ = write!(
+                            qtn_text_buf,
+                            "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\n",
+                            chrom[i],
+                            pos[i],
+                            snp[i],
+                            allele0[i],
+                            allele1[i],
+                            row_maf[i],
+                            miss_counts[i],
+                            beta,
+                            se,
+                            chisq_txt,
+                            pwald
+                        );
+                    } else {
+                        let _ = write!(
+                            qtn_text_buf,
+                            "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\tNaN\tNaN\tNaN\t1.0000e0\n",
+                            chrom[i],
+                            pos[i],
+                            snp[i],
+                            allele0[i],
+                            allele1[i],
+                            row_maf[i],
+                            miss_counts[i],
+                        );
+                    }
                 }
             }
         }
@@ -1686,7 +2276,7 @@ pub fn farmcpu_super_packed<'py>(
     out_tsv,
     sample_indices=None,
     row_indices=None,
-    threshold=0.05,
+    threshold=1e-6,
     max_iter=30,
     qtn_bound=None,
     nbin=5,
@@ -1846,7 +2436,9 @@ pub fn farmcpu_packed_to_tsv(
         .collect();
 
     let mut qtn_idx: Vec<usize> = Vec::new();
-    let qtn_threshold_eff = threshold / (m as f64);
+    let mut qtn_prev_idx: Option<Vec<usize>> = None;
+    let route = FarmcpuRoute::from_raw(raw);
+    let qtn_threshold_eff = threshold;
     let max_iter_i = max_iter.max(1);
     let qb = qtn_bound.unwrap_or_else(|| {
         let nf = n as f64;
@@ -1882,11 +2474,15 @@ pub fn farmcpu_packed_to_tsv(
     let qtn_stage_cap = qtn_bound
         .map(|v| v.max(1))
         .unwrap_or_else(|| qb_eff.saturating_mul(nbin_den).max(qb_eff));
+    let stage1_ld_thr = farmcpu_stage1_ld_merge_r2_threshold();
+    let final_ld_thr = farmcpu_final_ld_merge_r2_threshold();
     let pool = get_cached_pool(threads)?;
 
     py.detach(|| -> PyResult<()> {
         let mut final_model_cache: Option<(Vec<f64>, usize, Vec<f64>)> = None;
-        if !raw {
+        let mut seen_qtn_idx: HashSet<usize> = HashSet::new();
+        let mut qtn_best_score: HashMap<usize, f64> = HashMap::new();
+        if matches!(route, FarmcpuRoute::Unified) {
             for it_idx in 0..max_iter_i {
                 let (x_qtn, q_total) = build_x_with_qtn_packed(
                     &base_x,
@@ -1903,7 +2499,7 @@ pub fn farmcpu_packed_to_tsv(
                 .map_err(PyRuntimeError::new_err)?;
                 let ixx =
                     pinv_for_row_major_x(&x_qtn, n, q_total).map_err(PyRuntimeError::new_err)?;
-                let (mut femp, bg_pwald) = farmcpu_scan_packed_marker_pvalues(
+                let (femp, _bg_pwald) = farmcpu_scan_packed_marker_pvalues(
                     y,
                     &x_qtn,
                     &ixx,
@@ -1916,14 +2512,13 @@ pub fn farmcpu_packed_to_tsv(
                     threads,
                 )
                 .map_err(PyRuntimeError::new_err)?;
-                for (j, &idx) in qtn_idx.iter().enumerate() {
-                    let coef_idx = q_base + j;
-                    if idx < femp.len() && coef_idx < bg_pwald.len() {
-                        femp[idx] = bg_pwald[coef_idx];
+                let mut femp_masked = femp.clone();
+                for &idx in seen_qtn_idx.iter() {
+                    if idx < femp_masked.len() {
+                        femp_masked[idx] = 1.0;
                     }
                 }
-
-                let mut candidates: Vec<(f64, usize)> = femp
+                let mut candidates: Vec<(f64, usize)> = femp_masked
                     .iter()
                     .copied()
                     .enumerate()
@@ -1947,19 +2542,64 @@ pub fn farmcpu_packed_to_tsv(
                     }
                     break;
                 }
+                let opt_lead = farmcpu_best_rem_lead_set(
+                    y,
+                    &x_qtn,
+                    q_total,
+                    &femp_masked,
+                    &global_pos,
+                    &szbin_i64,
+                    &nbin_vals,
+                    &packed_flat,
+                    bytes_per_snp,
+                    row_idx.as_deref(),
+                    &sample_idx,
+                    row_flip,
+                    row_maf,
+                    pool.as_ref(),
+                )
+                .map_err(PyRuntimeError::new_err)?;
                 let mut qtn_union = qtn_idx.clone();
                 qtn_union.extend(farmcpu_window_representatives(
-                    candidates,
+                    candidates.clone(),
                     &chrom,
                     &pos,
                     final_window_bp,
                     qtn_stage_cap,
                 ));
+                qtn_union.extend(opt_lead.iter().copied());
                 qtn_union.sort_unstable();
                 qtn_union.dedup();
+                for &idx in qtn_union.iter() {
+                    seen_qtn_idx.insert(idx);
+                    let mut score = femp.get(idx).copied().unwrap_or(1.0);
+                    if !score.is_finite() {
+                        score = 1.0;
+                    }
+                    qtn_best_score
+                        .entry(idx)
+                        .and_modify(|best| {
+                            if score.total_cmp(best).is_lt() {
+                                *best = score;
+                            }
+                        })
+                        .or_insert(score);
+                }
+                let mut qtn_score_map: HashMap<usize, f64> =
+                    HashMap::with_capacity(qtn_union.len());
+                for &idx in qtn_union.iter() {
+                    let mut score = qtn_best_score.get(&idx).copied().unwrap_or_else(|| {
+                        let p = femp.get(idx).copied().unwrap_or(1.0);
+                        if p.is_finite() { p } else { 1.0 }
+                    });
+                    if !score.is_finite() {
+                        score = 1.0;
+                    }
+                    qtn_score_map.insert(idx, score);
+                }
                 let qtn_next = farmcpu_prune_qtn_by_merged_windows(
                     qtn_union,
-                    &femp,
+                    &qtn_score_map,
                     &chrom,
                     &pos,
                     final_window_bp,
@@ -1969,6 +2609,8 @@ pub fn farmcpu_packed_to_tsv(
                     &sample_idx,
                     row_flip,
                     row_maf,
+                    stage1_ld_thr,
+                    false,
                     qtn_stage_cap,
                 )
                 .map_err(PyRuntimeError::new_err)?;
@@ -1985,6 +2627,15 @@ pub fn farmcpu_packed_to_tsv(
                     final_model_cache = Some((x_qtn, q_total, ixx));
                     break;
                 }
+                if qtn_prev_idx
+                    .as_ref()
+                    .map(|prev| *prev == qtn_next)
+                    .unwrap_or(false)
+                {
+                    qtn_idx = qtn_next;
+                    break;
+                }
+                qtn_prev_idx = Some(qtn_idx.clone());
                 qtn_idx = qtn_next;
             }
         } else {
@@ -2077,85 +2728,25 @@ pub fn farmcpu_packed_to_tsv(
                     break;
                 }
 
-                let mut combine: Vec<(i64, usize)> = Vec::new();
-                for &sz in szbin_i64.iter() {
-                    for &nn in nbin_vals.iter() {
-                        combine.push((sz, nn));
-                    }
-                }
-                if combine.is_empty() {
-                    final_model_cache = Some((x_qtn, q_total, ixx));
-                    if let Some(cb) = progress_callback.as_ref() {
-                        Python::attach(|py2| -> PyResult<()> {
-                            py2.check_signals()?;
-                            cb.call1(py2, (it_idx + 1, max_iter_i))?;
-                            Ok(())
-                        })?;
-                    }
-                    break;
-                }
-
-                let rem_task = || {
-                    combine
-                        .par_iter()
-                        .map(|&(sz, nn)| {
-                            let leadidx = select_lead_indices(sz, nn, &femp, &global_pos);
-                            let sample_major = decode_packed_rows_to_sample_major(
-                                &packed_flat,
-                                bytes_per_snp,
-                                &leadidx,
-                                row_idx.as_deref(),
-                                &sample_idx,
-                                row_flip,
-                                row_maf,
-                            );
-                            let sample_major = match sample_major {
-                                Ok(v) => v,
-                                Err(_) => return (f64::INFINITY, leadidx),
-                            };
-                            let score = farmcpu_ll_score_from_sample_major(
-                                y,
-                                &x_qtn,
-                                n,
-                                q_total,
-                                &sample_major,
-                                leadidx.len(),
-                                -5.0,
-                                5.0,
-                                0.1,
-                                1e-8,
-                            )
-                            .unwrap_or(f64::INFINITY);
-                            (score, leadidx)
-                        })
-                        .collect::<Vec<(f64, Vec<usize>)>>()
-                };
-                let rem_res = if let Some(p) = &pool {
-                    p.install(rem_task)
-                } else {
-                    rem_task()
-                };
-                if rem_res.is_empty() {
-                    if let Some(cb) = progress_callback.as_ref() {
-                        Python::attach(|py2| -> PyResult<()> {
-                            py2.check_signals()?;
-                            cb.call1(py2, (it_idx + 1, max_iter_i))?;
-                            Ok(())
-                        })?;
-                    }
-                    break;
-                }
-                let mut best_i = 0usize;
-                let mut best_score = rem_res[0].0;
-                for (i, (s, _)) in rem_res.iter().enumerate().skip(1) {
-                    if s.total_cmp(&best_score).is_lt() {
-                        best_score = *s;
-                        best_i = i;
-                    }
-                }
-                let opt_lead = &rem_res[best_i].1;
+                let opt_lead = farmcpu_best_rem_lead_set(
+                    y,
+                    &x_qtn,
+                    q_total,
+                    &femp,
+                    &global_pos,
+                    &szbin_i64,
+                    &nbin_vals,
+                    &packed_flat,
+                    bytes_per_snp,
+                    row_idx.as_deref(),
+                    &sample_idx,
+                    row_flip,
+                    row_maf,
+                    pool.as_ref(),
+                )
+                .map_err(PyRuntimeError::new_err)?;
                 let mut qtn_union = qtn_idx.clone();
-                qtn_union.extend(opt_lead.iter().copied());
+                qtn_union.extend(opt_lead.into_iter());
                 qtn_union.sort_unstable();
                 qtn_union.dedup();
 
@@ -2199,7 +2790,48 @@ pub fn farmcpu_packed_to_tsv(
                     final_model_cache = Some((x_qtn, q_total, ixx));
                     break;
                 }
+                if qtn_prev_idx
+                    .as_ref()
+                    .map(|prev| *prev == qtn_next)
+                    .unwrap_or(false)
+                {
+                    qtn_idx = qtn_next;
+                    break;
+                }
+                qtn_prev_idx = Some(qtn_idx.clone());
                 qtn_idx = qtn_next;
+            }
+        }
+
+        if matches!(route, FarmcpuRoute::Unified) && !qtn_idx.is_empty() {
+            let mut qtn_score_map: HashMap<usize, f64> = HashMap::with_capacity(qtn_idx.len());
+            for &idx in qtn_idx.iter() {
+                let mut score = qtn_best_score.get(&idx).copied().unwrap_or(1.0);
+                if !score.is_finite() {
+                    score = 1.0;
+                }
+                qtn_score_map.insert(idx, score);
+            }
+            let qtn_final = farmcpu_prune_qtn_by_merged_windows(
+                qtn_idx.clone(),
+                &qtn_score_map,
+                &chrom,
+                &pos,
+                final_window_bp,
+                &packed_flat,
+                bytes_per_snp,
+                row_idx.as_deref(),
+                &sample_idx,
+                row_flip,
+                row_maf,
+                final_ld_thr,
+                true,
+                qtn_idx.len(),
+            )
+            .map_err(PyRuntimeError::new_err)?;
+            if qtn_final != qtn_idx {
+                qtn_idx = qtn_final;
+                final_model_cache = None;
             }
         }
 
@@ -2305,6 +2937,8 @@ pub fn farmcpu_packed_to_tsv(
             &qtn_lookup,
             &qtn_idx,
             final_window_bp,
+            route.enable_local_window_merge(),
+            route.write_qtn_effects(),
         )
         .map_err(PyRuntimeError::new_err)?;
         writer.finish().map_err(PyRuntimeError::new_err)?;

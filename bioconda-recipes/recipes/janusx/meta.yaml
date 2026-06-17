@@ -64,9 +64,8 @@ about:
     This package installs the `jx` and `jxpy` command-line entry points.
 
     Core runtime dependencies are included. Heavier optional extras remain
-    user-managed; `scikit-learn`, `xgboost`, `statsmodels`, `mkl`,
-    `pypardiso`, `toytree`, and `toyplot` can be installed from conda-forge
-    as needed.
+    user-managed; `scikit-learn`, `xgboost`, `statsmodels`, `toytree`, and
+    `toyplot` can be installed from conda-forge as needed.
   license: AGPL-3.0-or-later
   license_file:
     - LICENSE

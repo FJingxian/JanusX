@@ -9,6 +9,7 @@ dependencies = [
     "matplotlib",
     "psutil",
     "rich", "tqdm",
+    "rich-argparse",
     "joblib>=1.5",
     "threadpoolctl",
 ]
@@ -20,9 +21,6 @@ license = {file = "LICENSE"}
 keywords = ["GWAS", "GS", "REML", "Kmer"]
 
 [project.optional-dependencies]
-cli = [
-    "rich-argparse",
-]
 ml = [
     "scikit-learn",
     "xgboost",
@@ -33,24 +31,17 @@ stats = [
 wgcna = [
     "dynamicTreeCut",
 ]
-sparse = [
-    "mkl; (platform_machine == 'x86_64' or platform_machine == 'AMD64') and platform_system != 'Darwin'",
-    "pypardiso; (platform_machine == 'x86_64' or platform_machine == 'AMD64') and platform_system != 'Darwin'",
-]
 treeplot = [
     "toytree",
     "toyplot",
 ]
 full = [
-    "rich-argparse",
     "scikit-learn",
     "xgboost",
     "statsmodels",
     "dynamicTreeCut",
     "toytree",
     "toyplot",
-    "mkl; (platform_machine == 'x86_64' or platform_machine == 'AMD64') and platform_system != 'Darwin'",
-    "pypardiso; (platform_machine == 'x86_64' or platform_machine == 'AMD64') and platform_system != 'Darwin'",
 ]
 
 [tool.uv]

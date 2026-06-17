@@ -4,7 +4,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
 use crate::algwas::algwas_packed_to_tsv;
-use crate::assoc::farmcpu_packed_to_tsv;
+use crate::farmcpu::farmcpu_packed_to_tsv;
 use crate::glm::glmf32_packed_assoc_to_tsv;
 use crate::linalg::{chi2_sf_df1, cholesky_inplace, cholesky_solve_into};
 use crate::lmm_scan::{

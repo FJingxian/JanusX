@@ -6,14 +6,14 @@ use pyo3::Bound;
 mod admixture;
 #[path = "stats/algwas.rs"]
 mod algwas;
-#[path = "stats/assoc.rs"]
-mod assoc;
 #[path = "stats/bayes.rs"]
 mod bayes;
 #[path = "stats/beam.rs"]
 pub mod beam;
 #[path = "stats/bsa.rs"]
 mod bsa;
+#[path = "stats/farmcpu.rs"]
+mod farmcpu;
 #[path = "garfield/mod.rs"]
 pub(crate) mod garfield;
 #[path = "stats/glm.rs"]
@@ -111,8 +111,6 @@ mod king;
 mod lasso;
 #[path = "math/linalg.rs"]
 mod linalg;
-#[path = "math/farmcpu.rs"]
-mod math_farmcpu;
 #[path = "math/ld.rs"]
 mod math_ld;
 #[path = "ml/mod.rs"]
@@ -137,9 +135,6 @@ use admixture::{
     AdmxBedTrainingSession,
 };
 use algwas::algwas_packed_to_tsv;
-use assoc::{
-    farmcpu_packed_to_tsv, farmcpu_rem_packed, farmcpu_super_packed, farmcpu_write_assoc_tsv,
-};
 use bayes::{
     bayesa, bayesa_packed, bayesa_packed_trace, bayesb, bayesb_packed, bayesb_packed_trace,
     bayescpi, bayescpi_packed, bayescpi_packed_trace,
@@ -164,6 +159,9 @@ use bsa::preprocess_bsa;
 use eigh::{
     rust_eigh_debug_f64, rust_eigh_from_array_f64, rust_eigh_from_array_f64_inplace,
     rust_eigh_from_matrix_file_f64, rust_eigh_from_matrix_file_subset_f64,
+};
+use farmcpu::{
+    farmcpu_packed_to_tsv, farmcpu_rem_packed, farmcpu_super_packed, farmcpu_write_assoc_tsv,
 };
 use fast_math::fastlmm_prepare_lowrank_f64;
 use garfield::{
@@ -210,7 +208,7 @@ use gwasio::load_gwas_triplet_fast;
 use he::he_pcg_bed;
 use heritability::{
     prepare_heritability_broad_sparse_cache, prepare_heritability_trait_workflow,
-    SparseOneHotBlupCache,
+    prepare_sparse_onehot_blup_cache, SparseOneHotBlupCache,
 };
 use kmer::{kmer_count_run_py, kmer_resolve_inputs_py, kmerge_run_py, kstats_run_py};
 use ld::{
@@ -409,7 +407,11 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(packed_malpha_mode_f64, m)?)?;
     m.add_function(wrap_pyfunction!(he_pcg_bed, m)?)?;
     m.add_function(wrap_pyfunction!(prepare_heritability_trait_workflow, m)?)?;
-    m.add_function(wrap_pyfunction!(prepare_heritability_broad_sparse_cache, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        prepare_heritability_broad_sparse_cache,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(prepare_sparse_onehot_blup_cache, m)?)?;
     m.add_function(wrap_pyfunction!(splmm_assoc_pcg_bed, m)?)?;
     m.add_function(wrap_pyfunction!(splmm_assoc_pcg_bed_to_tsv, m)?)?;
     m.add_function(wrap_pyfunction!(splmm_scan_grammar_packed, m)?)?;

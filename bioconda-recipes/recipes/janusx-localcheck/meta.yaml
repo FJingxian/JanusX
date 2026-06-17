@@ -78,8 +78,9 @@ about:
     from this package scope.
 
     This recipe focuses on the core runtime only. Optional third-party
-    packages (for example scikit-learn, xgboost, statsmodels, pypardiso)
-    should be installed by users on demand according to their workflow.
+    packages (for example scikit-learn, xgboost, statsmodels, toytree, and
+    toyplot) should be installed by users on demand according to their
+    workflow.
 
     Note:
       - The Python package `dynamicTreeCut` currently has no conda package in

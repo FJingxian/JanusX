@@ -27,9 +27,9 @@ use crate::blas::{
     cblas_daxpy_dispatch, cblas_dgemm_dispatch, CblasInt, OpenBlasThreadGuard, CBLAS_COL_MAJOR,
     CBLAS_NO_TRANS, CBLAS_ROW_MAJOR, CBLAS_TRANS,
 };
+use crate::farmcpu::decode_packed_rows_to_sample_major;
 use crate::he::build_row_standardization_stats;
 use crate::linalg::{chi2_stat_df1_from_sf, format_chisq_value, sanitize_assoc_pvalue};
-use crate::math_farmcpu::decode_packed_rows_to_sample_major;
 use crate::pcg::{pcg_solve, IdentityPreconditioner, PcgOperator};
 use crate::stats_common::{
     get_cached_pool, parse_index_vec_i64, resolve_assoc_tsv_metadata, AsyncTsvWriter,

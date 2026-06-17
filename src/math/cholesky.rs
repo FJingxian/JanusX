@@ -1086,11 +1086,9 @@ impl SparseJxgrmCholeskyAnalysis {
             }
         }
         for (perm_col, &idx) in self.diag_positions.iter().enumerate() {
-            let orig_col = self
-                .perm
-                .get(perm_col)
-                .copied()
-                .ok_or_else(|| format!("Sparse Cholesky permutation index out of bounds: {perm_col}"))?;
+            let orig_col = self.perm.get(perm_col).copied().ok_or_else(|| {
+                format!("Sparse Cholesky permutation index out of bounds: {perm_col}")
+            })?;
             perm_values[idx] += diag[orig_col];
         }
         let prep_secs = prep_t0.elapsed().as_secs_f64();

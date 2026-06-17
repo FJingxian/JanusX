@@ -10,8 +10,7 @@ Models:
   - LM      : streaming, low-memory implementation (slim.LM)
   - SparseLMM: sparse-GRM + sparse-Cholesky mixed-model route
   - ALGWAS  : packed/full-rust adaptive-lasso GWAS route
-  - FarmCPU : in-memory implementation (pyBLUP.farmcpu) that loads the
-              full genotype matrix
+  - FarmCPU : Rust packed-BED controller with stage1/stage2 scan pipeline
 
 Execution mode (automatic)
 --------------------------
@@ -19,7 +18,7 @@ Execution mode (automatic)
   - Default: LM/LMM/FastLMM run in memmap BED mode.
   - Packed BED preload is reserved for FarmCPU and ALGWAS.
   - LM/LMM/FastLMM/FvLMM/SparseLMM stay on memmap / streaming BED routes.
-  - FarmCPU always runs on the full in-memory genotype matrix.
+  - FarmCPU runs on the packed BED controller and no longer maintains a Python fallback.
 
 Caching
 -------
@@ -209,6 +208,18 @@ _REPORT_RULE = "=" * _SECTION_WIDTH
 _REPORT_SUBRULE = "-" * _SECTION_WIDTH
 _GWAS_PROGRESS_BAR_WIDTH = 30
 _GWAS_COL_RANGE_RE = re.compile(r"^\s*(\d+)\s*([:-])\s*(\d+)\s*$")
+
+
+def _format_farmcpu_threshold_display(v: object) -> str:
+    if v is None:
+        return "auto(1/nsnp)"
+    try:
+        fv = float(v)
+    except Exception:
+        return str(v)
+    if not np.isfinite(fv) or fv <= 0:
+        return "auto(1/nsnp)"
+    return f"{fv:g}"
 
 # ======================================================================
 # Basic utilities
@@ -4830,7 +4841,7 @@ def _run_file_dense_fast_once(
         _log_file_only(
             logger,
             logging.INFO,
-            "FILE packed route: preparing shared dense genotype cache once for LM/LMM/FastLMM/FvLMM/FarmCPU.",
+            "FILE packed route: preparing shared reusable genotype/FarmCPU cache once for LM/LMM/FastLMM/FvLMM/FarmCPU.",
         )
     farmcpu_cache_runtime = run_farmcpu_fullmem(
         args=args,
@@ -4867,7 +4878,7 @@ def _run_file_dense_fast_once(
     geno_obj = farmcpu_cache_runtime.get("geno")
     if geno_obj is None:
         raise RuntimeError(
-            "FILE packed route expects dense genotype matrix in FarmCPU cache, got None."
+            "FILE packed route expected a reusable genotype matrix cache entry, got None."
         )
     geno = np.ascontiguousarray(np.asarray(geno_obj, dtype=np.float32))
     if geno.ndim != 2:
@@ -5411,7 +5422,7 @@ def parse_args(argv: Optional[list[str]] = None):
     )
     models_group.add_argument(
         "-farmcpu", "--farmcpu", action="store_true", default=False,
-        help="Run FarmCPU (full genotype in memory; default: %(default)s).",
+        help="Run FarmCPU (Rust packed-BED route; default: %(default)s).",
     )
     models_group.add_argument(
         "-splmm", "--splmm",
@@ -5547,16 +5558,16 @@ def parse_args(argv: Optional[list[str]] = None):
              "(default: %(default)s).",
     )
     optional_group.add_argument(
-        "--farmcpu-iter", type=int, default=20,
+        "--farmcpu-iter", type=int, default=30,
         help=(
             "FarmCPU max iterations (default: %(default)s)."
             if show_dev_help else argparse.SUPPRESS
         ),
     )
     optional_group.add_argument(
-        "--farmcpu-threshold", type=float, default=0.05,
+        "--farmcpu-threshold", type=float, default=None,
         help=(
-            "FarmCPU global threshold (effective per-marker threshold is threshold/m; default: %(default)s)."
+            "FarmCPU stage1 threshold. If unset, defaults to 1 / tested_SNP_count."
             if show_dev_help else argparse.SUPPRESS
         ),
     )
@@ -5584,7 +5595,7 @@ def parse_args(argv: Optional[list[str]] = None):
     optional_group.add_argument(
         "-farmcpu-raw", "--farmcpu-raw", action="store_true", default=False,
         help=(
-            "Use the legacy FarmCPU REM/SUPER stage-1 selector instead of the default unified FEM selector."
+            "Use the legacy FarmCPU REM/SUPER stage-1 selector instead of the default unified FEM/REM selector with staged r^2 merging."
             if show_dev_help else argparse.SUPPRESS
         ),
     )
@@ -5652,7 +5663,9 @@ def parse_args(argv: Optional[list[str]] = None):
         args.farmcpu = True
     if int(args.farmcpu_iter) < 1:
         parser.error("--farmcpu-iter must be >= 1.")
-    if not np.isfinite(float(args.farmcpu_threshold)) or float(args.farmcpu_threshold) <= 0:
+    if args.farmcpu_threshold is not None and (
+        (not np.isfinite(float(args.farmcpu_threshold))) or float(args.farmcpu_threshold) <= 0
+    ):
         parser.error("--farmcpu-threshold must be a finite value > 0.")
     if int(args.farmcpu_nbin) < 1:
         parser.error("--farmcpu-nbin must be >= 1.")
@@ -5940,11 +5953,14 @@ def _run_gwas_pipeline(
             cfg_rows.extend(
                 [
                     ("FarmCPU iter", int(args.farmcpu_iter)),
-                    ("FarmCPU threshold", float(args.farmcpu_threshold)),
+                    ("FarmCPU threshold", _format_farmcpu_threshold_display(args.farmcpu_threshold)),
                     ("FarmCPU nbin", int(args.farmcpu_nbin)),
                     ("FarmCPU QTNbound", "auto" if args.farmcpu_qtn_bound is None else int(args.farmcpu_qtn_bound)),
                     ("FarmCPU szbin", ",".join(f"{float(x):g}" for x in args.farmcpu_bin_size)),
-                    ("FarmCPU stage1", "raw REM/SUPER" if bool(args.farmcpu_raw) else "unified FEM"),
+                    (
+                        "FarmCPU stage1",
+                        "raw REM/SUPER" if bool(args.farmcpu_raw) else "unified FEM/REM + staged r^2 merge",
+                    ),
                 ]
             )
         if args.cov:
@@ -6038,11 +6054,14 @@ def _run_gwas_pipeline(
             advanced_config_rows.extend(
                 [
                     ("FarmCPU Iter", int(args.farmcpu_iter)),
-                    ("FarmCPU Threshold", float(args.farmcpu_threshold)),
+                    ("FarmCPU Threshold", _format_farmcpu_threshold_display(args.farmcpu_threshold)),
                     ("FarmCPU NBin", int(args.farmcpu_nbin)),
                     ("FarmCPU QTNbound", "auto" if args.farmcpu_qtn_bound is None else int(args.farmcpu_qtn_bound)),
                     ("FarmCPU SzBin", ",".join(f"{float(x):g}" for x in args.farmcpu_bin_size)),
-                    ("FarmCPU Stage1", "raw REM/SUPER" if bool(args.farmcpu_raw) else "unified FEM"),
+                    (
+                        "FarmCPU Stage1",
+                        "raw REM/SUPER" if bool(args.farmcpu_raw) else "unified FEM/REM + staged r^2 merge",
+                    ),
                 ]
             )
 

@@ -1,20 +1,11 @@
 import typing
-import platform
 import numpy as np
 from types import SimpleNamespace
 
 from scipy.linalg import cho_solve
 from scipy.optimize import minimize
 from scipy import sparse
-from scipy.sparse.linalg import splu
 from tqdm import tqdm
-
-try:
-    import pypardiso as _pypardiso  # type: ignore[import-not-found]
-    _HAS_PYPARDISO = True
-except Exception:
-    _pypardiso = None  # type: ignore[assignment]
-    _HAS_PYPARDISO = False
 
 try:
     from janusx.janusx import ai_reml_multi_f64 as _rust_ai_reml_multi_f64
@@ -25,33 +16,12 @@ except Exception:
     _rust_ai_reml_null_f64 = None  # type: ignore[assignment]
     _HAS_RUST_AIREML = False
 
+try:
+    from janusx.janusx import prepare_sparse_onehot_blup_cache as _rust_prepare_sparse_onehot_blup_cache
+except Exception:
+    _rust_prepare_sparse_onehot_blup_cache = None  # type: ignore[assignment]
+
 _OBJ_PENALTY = 1e30
-_PLAT_MACHINE = platform.machine().lower()
-_PREFER_PYPARDISO = bool(
-    _HAS_PYPARDISO
-    and (_PLAT_MACHINE in {"x86_64", "amd64"})
-    and (platform.system() != "Darwin")
-)
-
-
-def _pardiso_spsolve(m: sparse.csc_matrix, b: np.ndarray) -> np.ndarray:
-    if _pypardiso is None:
-        raise RuntimeError("pypardiso not available")
-    b_arr = np.asarray(b, dtype=float)
-    if b_arr.ndim == 1:
-        x = _pypardiso.spsolve(m, b_arr)
-        return np.asarray(x, dtype=float)
-    if b_arr.ndim == 2:
-        if b_arr.shape[1] == 0:
-            return np.zeros((b_arr.shape[0], 0), dtype=float)
-        # Keep 2D RHS shape stable (especially n x 1), so downstream matrix math
-        # does not silently broadcast to wrong dimensions.
-        cols = [
-            np.asarray(_pypardiso.spsolve(m, b_arr[:, i]), dtype=float).reshape(-1, 1)
-            for i in range(b_arr.shape[1])
-        ]
-        return np.hstack(cols)
-    raise ValueError(f"rhs must be 1D or 2D, got shape={b_arr.shape}")
 
 def REML(
     theta: np.ndarray,
@@ -326,155 +296,50 @@ def _can_use_sparse_z_reml(
         return False
     return all(_is_onehot_design(z) for z in Z_list)
 
-
-def _to_onehot_csr(z: typing.Union[np.ndarray, sparse.spmatrix]) -> sparse.csr_matrix:
+def _to_onehot_codes(
+    z: typing.Union[np.ndarray, sparse.spmatrix],
+) -> np.ndarray:
     if sparse.issparse(z):
-        return z.tocsr().astype(float)
+        zc = z.tocsr().astype(float)
+        cols = np.empty(zc.shape[0], dtype=np.int64)
+        for i in range(zc.shape[0]):
+            start = zc.indptr[i]
+            end = zc.indptr[i + 1]
+            if (end - start) != 1:
+                raise ValueError(f"Z row {i} is not one-hot")
+            cols[i] = int(zc.indices[start])
+        return cols
     zz = np.asarray(z, dtype=float)
     if zz.ndim != 2:
         raise ValueError(f"Z must be 2D, got shape={zz.shape}")
-    n, q = zz.shape
-    rows = np.arange(n, dtype=np.int64)
-    cols = np.argmax(zz, axis=1).astype(np.int64, copy=False)
-    vals = zz[rows, cols].astype(float, copy=False)
-    return sparse.csr_matrix((vals, (rows, cols)), shape=(n, q), dtype=float)
+    return np.argmax(zz, axis=1).astype(np.int64, copy=False)
 
 
-def _expand_z_theta(theta_z: np.ndarray, z_cols: list[int]) -> np.ndarray:
-    return np.concatenate(
-        [np.full(int(c), float(theta_z[i]), dtype=float) for i, c in enumerate(z_cols)],
-        axis=0,
-    )
-
-
-def _sparse_z_reml_objective(
-    theta: np.ndarray,
+def _prepare_sparse_onehot_blup_cache_py(
     y: np.ndarray,
     X: typing.Union[np.ndarray, sparse.spmatrix],
-    z_csc: sparse.csc_matrix,
-    ztz_csc: sparse.csc_matrix,
-    xty: np.ndarray,
-    xtx: np.ndarray,
-    zty: np.ndarray,
-    ztx: np.ndarray,
-    z_cols: list[int],
-) -> float:
-    theta = np.asarray(theta, dtype=float).reshape(-1)
-    if theta.size != (len(z_cols) + 1):
-        return _OBJ_PENALTY
-    if (not np.all(np.isfinite(theta))) or np.any(theta <= 0.0):
-        return _OBJ_PENALTY
-
-    n, p = int(X.shape[0]), int(X.shape[1])
-    theta_z = theta[:-1]
-    lbd = float(theta[-1])
-    inv_lbd = 1.0 / lbd
-    d = _expand_z_theta(theta_z, z_cols)
-
+    Z_list: list[typing.Union[np.ndarray, sparse.spmatrix]],
+):
+    if _rust_prepare_sparse_onehot_blup_cache is None:
+        return None
     try:
-        m = sparse.diags(1.0 / d, format="csc") + (ztz_csc * inv_lbd)
-        lu = splu(m)
-
-        tmp_y = lu.solve(np.asarray(zty, dtype=float).reshape(-1)).reshape(-1, 1)
-        tmp_x = np.asarray(lu.solve(np.asarray(ztx, dtype=float)), dtype=float)
-        if tmp_x.ndim == 1:
-            tmp_x = tmp_x.reshape(-1, 1)
-
-        xt_vinv_x = np.asarray(xtx, dtype=float) * inv_lbd - (np.asarray(ztx, dtype=float).T @ tmp_x) * (inv_lbd * inv_lbd)
-        xt_vinv_y = np.asarray(xty, dtype=float) * inv_lbd - (np.asarray(ztx, dtype=float).T @ tmp_y) * (inv_lbd * inv_lbd)
-        beta = np.linalg.solve(xt_vinv_x, xt_vinv_y)
-        xbeta = _to_dense_product(X @ beta).reshape(-1, 1)
-        r = y - xbeta
-        rhs_r = np.asarray(z_csc.T @ r, dtype=float).reshape(-1)
-        tmp_r = np.asarray(lu.solve(rhs_r), dtype=float).reshape(-1, 1)
-        vinvr = r * inv_lbd - (z_csc @ tmp_r) * (inv_lbd * inv_lbd)
-        r_t_vinvr = float((r.T @ vinvr)[0, 0])
-        if (not np.isfinite(r_t_vinvr)) or r_t_vinvr <= 0.0:
-            return _OBJ_PENALTY
-
-        udiag = np.asarray(lu.U.diagonal(), dtype=float).reshape(-1)
-        if np.any(udiag == 0.0):
-            return _OBJ_PENALTY
-        log_det_m = float(np.sum(np.log(np.abs(udiag))))
-        log_det_v = (
-            n * np.log(lbd)
-            + float(np.sum(np.log(d)))
-            + log_det_m
-        )
-        sign, log_det_xt_vinv_x = np.linalg.slogdet(xt_vinv_x)
-        if sign <= 0 or (not np.isfinite(log_det_xt_vinv_x)):
-            return _OBJ_PENALTY
-        total_log = (n - p) * np.log(r_t_vinvr) + log_det_v + float(log_det_xt_vinv_x)
-        c = (n - p) * (np.log(n - p) - 1 - np.log(2 * np.pi)) / 2.0
-        out = float(total_log / 2.0 - c)
-        if not np.isfinite(out):
-            return _OBJ_PENALTY
-        return out
+        x_arr = np.asarray(X.toarray(), dtype=np.float64) if sparse.issparse(X) else np.asarray(X, dtype=np.float64)
+        random_terms = []
+        for idx, z in enumerate(Z_list):
+            random_terms.append(
+                {
+                    "name": f"z{idx}",
+                    "codes": _to_onehot_codes(z),
+                }
+            )
+        job = {
+            "y": np.asarray(y, dtype=np.float64).reshape(-1),
+            "x": x_arr,
+            "random_terms": random_terms,
+        }
+        return _rust_prepare_sparse_onehot_blup_cache(job)
     except Exception:
-        return _OBJ_PENALTY
-
-
-def _sparse_z_fit_state(
-    theta: np.ndarray,
-    y: np.ndarray,
-    X: typing.Union[np.ndarray, sparse.spmatrix],
-    z_csc: sparse.csc_matrix,
-    ztz_csc: sparse.csc_matrix,
-    xty: np.ndarray,
-    xtx: np.ndarray,
-    ztx: np.ndarray,
-    z_cols: list[int],
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[np.ndarray], np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    theta = np.asarray(theta, dtype=float).reshape(-1)
-    theta_z = theta[:-1]
-    lbd = float(theta[-1])
-    inv_lbd = 1.0 / lbd
-    d = _expand_z_theta(theta_z, z_cols)
-
-    m = sparse.diags(1.0 / d, format="csc") + (ztz_csc * inv_lbd)
-
-    zty = np.asarray(z_csc.T @ y, dtype=float).reshape(-1)
-    use_pardiso = _PREFER_PYPARDISO
-    if use_pardiso:
-        try:
-            tmp_y = _pardiso_spsolve(m, zty).reshape(-1, 1)
-            tmp_x = _pardiso_spsolve(m, np.asarray(ztx, dtype=float))
-        except Exception:
-            use_pardiso = False
-    if not use_pardiso:
-        lu = splu(m)
-        tmp_y = lu.solve(zty).reshape(-1, 1)
-        tmp_x = lu.solve(np.asarray(ztx, dtype=float))
-    tmp_x = np.asarray(tmp_x, dtype=float)
-    if tmp_x.ndim == 1:
-        tmp_x = tmp_x.reshape(-1, 1)
-
-    xt_vinv_x = np.asarray(xtx, dtype=float) * inv_lbd - (np.asarray(ztx, dtype=float).T @ tmp_x) * (inv_lbd * inv_lbd)
-    xt_vinv_y = np.asarray(xty, dtype=float) * inv_lbd - (np.asarray(ztx, dtype=float).T @ tmp_y) * (inv_lbd * inv_lbd)
-    beta = np.linalg.solve(xt_vinv_x, xt_vinv_y)
-    xbeta = _to_dense_product(X @ beta).reshape(-1, 1)
-    r = y - xbeta
-
-    rhs_r = np.asarray(z_csc.T @ r, dtype=float).reshape(-1)
-    if use_pardiso:
-        u_hat = _pardiso_spsolve(m, rhs_r * inv_lbd).reshape(-1, 1)
-    else:
-        u_hat = lu.solve(rhs_r * inv_lbd).reshape(-1, 1)
-    z_fitted = np.asarray(z_csc @ u_hat, dtype=float)
-    fitted = xbeta + z_fitted
-    residuals = y - fitted
-    vinvr = r * inv_lbd - z_fitted * inv_lbd
-
-    sigma2 = float((r.T @ vinvr)[0, 0]) / max(1, int(X.shape[0]) - int(X.shape[1]))
-    cov_beta = np.linalg.pinv(np.asarray(xt_vinv_x, dtype=float)) * sigma2
-
-    u_by_z: list[np.ndarray] = []
-    start = 0
-    for c in z_cols:
-        end = start + int(c)
-        u_by_z.append(u_hat[start:end])
-        start = end
-    return beta, u_hat, z_fitted, u_by_z, fitted, residuals, vinvr, cov_beta
+        return None
 
 
 def _fit_multi_kernel_ai_reml_rust(
@@ -537,6 +402,60 @@ def _fit_multi_kernel_ai_reml_rust(
         return theta, result
     except Exception:
         return None
+
+
+def _fit_sparse_z_reml_rust(
+    y: np.ndarray,
+    X: typing.Union[np.ndarray, sparse.spmatrix],
+    Z_list: list[typing.Union[np.ndarray, sparse.spmatrix]],
+    maxiter: int,
+    progress: bool,
+) -> tuple[np.ndarray, typing.Any, dict[str, np.ndarray], list[int]] | None:
+    cache = _prepare_sparse_onehot_blup_cache_py(y, X, Z_list)
+    if cache is None:
+        return None
+    p_fixed = int(X.shape[1])
+    z_cols = [int(v) for v in cache.z_cols]
+    theta0 = np.ones(len(z_cols) + 1, dtype=float)
+    bounds = [(1e-12, None)] * theta0.size
+
+    pbar = None
+    callback = None
+    if progress:
+        pbar = tqdm(total=maxiter, desc="REML", ncols=100)
+
+        def callback(theta):
+            pbar.update(1)
+            pbar.set_postfix({"theta": np.round(theta, 4)})
+
+    try:
+        result = minimize(
+            lambda theta: float(cache.objective(np.asarray(theta, dtype=float).tolist())),
+            theta0,
+            method="L-BFGS-B",
+            bounds=bounds,
+            callback=callback,
+            options={"maxiter": maxiter},
+        )
+        theta = np.asarray(result.x, dtype=float).reshape(-1)
+        if (not np.all(np.isfinite(theta))) or np.any(theta <= 0.0):
+            return None
+        fit = cache.fit(theta.tolist())
+        fit_arrays = {
+            "beta": np.asarray(fit["beta"], dtype=float).reshape(-1, 1),
+            "u_hat": np.asarray(fit["u_hat"], dtype=float).reshape(-1, 1),
+            "z_fitted": np.asarray(fit["z_fitted"], dtype=float).reshape(-1, 1),
+            "fitted": np.asarray(fit["fitted"], dtype=float).reshape(-1, 1),
+            "residuals": np.asarray(fit["residuals"], dtype=float).reshape(-1, 1),
+            "vinvr": np.asarray(fit["vinvr"], dtype=float).reshape(-1, 1),
+            "cov_beta": np.asarray(fit["cov_beta"], dtype=float).reshape(p_fixed, p_fixed),
+        }
+        return theta, result, fit_arrays, z_cols
+    except Exception:
+        return None
+    finally:
+        if pbar is not None:
+            pbar.close()
 
 class BLUP:
     def __init__(
@@ -639,16 +558,79 @@ class BLUP:
             if (not use_sparse_z) and sparse.issparse(self.X):
                 self.X = np.asarray(self.X.toarray(), dtype=float)
             if use_sparse_z:
-                z_blocks = [_to_onehot_csr(z) for z in self.Z_list]
-                z_csc = sparse.hstack(z_blocks, format="csc")
-                ztz_csc = (z_csc.T @ z_csc).tocsc()
-                xty = _to_dense_product(self.X.T @ self.y).reshape(-1, 1)
-                xtx = _to_dense_product(self.X.T @ self.X)
-                zty = np.asarray(z_csc.T @ self.y, dtype=float)
-                ztx = _to_dense_product(z_csc.T @ self.X)
-                z_cols = [int(z.shape[1]) for z in self.Z_list]
-                theta0 = np.ones(len(z_cols) + 1, dtype=float)
-                bounds = [(1e-12, None)] * theta0.size
+                rust_sparse_fit = _fit_sparse_z_reml_rust(
+                    self.y,
+                    self.X,
+                    self.Z_list,
+                    self.maxiter,
+                    self.progress,
+                )
+                if rust_sparse_fit is not None:
+                    theta, result, fit_arrays, z_cols = rust_sparse_fit
+                    beta_hat = fit_arrays["beta"]
+                    u_hat = fit_arrays["u_hat"]
+                    z_fitted = fit_arrays["z_fitted"]
+                    fitted = fit_arrays["fitted"]
+                    residuals = fit_arrays["residuals"]
+                    Vinvr = fit_arrays["vinvr"]
+                    cov_beta = fit_arrays["cov_beta"]
+                    u_by_Z: list[np.ndarray] = []
+                    start = 0
+                    for c in z_cols:
+                        end = start + int(c)
+                        u_by_Z.append(u_hat[start:end])
+                        start = end
+                    z_theta = theta[:-1]
+                    g_theta = np.asarray([], dtype=float)
+                    g_scales: list[float] = []
+                    g_by_G: list[np.ndarray] = []
+                    g_total = np.zeros((self.n, 1), dtype=float)
+                    Kdiag_mean = [1.0 for _ in z_cols]
+                    self._z_standardized = False
+                    self.theta = theta
+                    self.var = np.array(
+                        [float(theta[i]) * float(Kdiag_mean[i]) for i in range(len(z_cols))]
+                        + [float(theta[-1])],
+                        dtype=float,
+                    )
+                    self.beta = beta_hat
+                    self.u = u_hat
+                    self.u_by_Z = u_by_Z
+                    self.g = g_total
+                    self.g_by_G = g_by_G
+                    self._Vinvr = Vinvr
+                    self._z_theta = z_theta
+                    self._g_theta = g_theta
+                    self._g_scales = g_scales
+                    self._z_fitted = z_fitted
+                    self._cov_beta = cov_beta
+                    self.fitted = fitted
+                    self.residuals = residuals
+                    self.result = result
+                    return
+            Zstlist = [
+                np.asarray(
+                    (_to_dense(z) - self.onehot_info[num][1])
+                    / self.onehot_info[num][2]
+                    / np.sqrt(self.onehot_info[num][0])
+                )
+                for num, z in enumerate(self.Z_list)
+            ]
+            Gnorm_list, g_scales = _normalize_G(self.G_list)
+            Klist = [np.asarray(z @ z.T, dtype=float) for z in Zstlist] + Gnorm_list
+
+            result = None
+            theta: np.ndarray | None = None
+            rust_fit = _fit_multi_kernel_ai_reml_rust(
+                self.y,
+                self.X,
+                Klist,
+                self.maxiter,
+            )
+            if rust_fit is not None:
+                theta, result = rust_fit
+            else:
+                theta0 = np.ones(len(Klist) + 1, dtype=float)
 
                 pbar = None
                 callback = None
@@ -660,165 +642,78 @@ class BLUP:
                         pbar.set_postfix({"theta": np.round(theta, 4)})
 
                 result = minimize(
-                    _sparse_z_reml_objective,
+                    REML,
                     theta0,
-                    args=(self.y, self.X, z_csc, ztz_csc, xty, xtx, zty, ztx, z_cols),
+                    args=(self.y, self.X, Klist),
                     method="L-BFGS-B",
-                    bounds=bounds,
                     callback=callback,
                     options={"maxiter": self.maxiter},
                 )
+                theta = np.asarray(result.x, dtype=float)
                 if pbar is not None:
                     pbar.close()
-                theta = np.asarray(result.x, dtype=float)
-                if (not np.all(np.isfinite(theta))) or np.any(theta <= 0.0):
-                    raise RuntimeError("Sparse Z REML returned invalid theta.")
+            if theta is None:
+                raise RuntimeError("REML optimization failed to produce theta.")
 
-                beta_hat, u_hat, z_fitted, u_by_Z, fitted, residuals, Vinvr, cov_beta = _sparse_z_fit_state(
-                    theta,
-                    self.y,
-                    self.X,
-                    z_csc,
-                    ztz_csc,
-                    xty,
-                    xtx,
-                    ztx,
-                    z_cols,
+            V = theta[-1]*np.eye(self.n)
+            for num, K in enumerate(Klist):
+                V += theta[num] * K
+            L = np.linalg.cholesky(V)
+            VinvX = cho_solve((L,True), self.X)
+            Vinvy = cho_solve((L,True), self.y)
+            beta_hat = np.linalg.solve(self.X.T @ VinvX, self.X.T @ Vinvy)
+            r = self.y - self.X @ beta_hat
+            Vinvr = cho_solve((L,True), r)
+
+            z_term_count = len(Zstlist)
+            g_term_count = len(Gnorm_list)
+            z_theta = theta[:z_term_count]
+            g_theta = theta[z_term_count : z_term_count + g_term_count]
+
+            if z_term_count > 0:
+                Zall = np.concatenate(Zstlist, axis=1)
+                Gall = np.concatenate(
+                    [z_theta[ind] * np.ones(z.shape[1]) for ind, z in enumerate(Zstlist)]
                 )
-                z_theta = theta[:-1]
-                g_theta = np.asarray([], dtype=float)
-                g_scales: list[float] = []
-                g_by_G: list[np.ndarray] = []
-                g_total = np.zeros((self.n, 1), dtype=float)
-                Kdiag_mean = [1.0 for _ in z_cols]
-                self._z_standardized = False
-                self.theta = theta
-                self.var = np.array(
-                    [float(theta[i]) * float(Kdiag_mean[i]) for i in range(len(z_cols))]
-                    + [float(theta[-1])],
-                    dtype=float,
-                )
-                self.beta = beta_hat
-                self.u = u_hat
-                self.u_by_Z = u_by_Z
-                self.g = g_total
-                self.g_by_G = g_by_G
-                self._Vinvr = Vinvr
-                self._z_theta = z_theta
-                self._g_theta = g_theta
-                self._g_scales = g_scales
-                self._z_fitted = z_fitted
-                self._cov_beta = cov_beta
-                self.fitted = fitted
-                self.residuals = residuals
-                self.result = result
+                u_hat = (Zall.T @ Vinvr) * Gall[:, None]
+                z_fitted = Zall @ u_hat
+                u_by_Z = _split_u(u_hat, Zstlist)
             else:
-                Zstlist = [
-                    np.asarray(
-                        (_to_dense(z) - self.onehot_info[num][1])
-                        / self.onehot_info[num][2]
-                        / np.sqrt(self.onehot_info[num][0])
-                    )
-                    for num, z in enumerate(self.Z_list)
-                ]
-                Gnorm_list, g_scales = _normalize_G(self.G_list)
-                Klist = [np.asarray(z @ z.T, dtype=float) for z in Zstlist] + Gnorm_list
+                u_hat = None
+                z_fitted = np.zeros((self.n, 1), dtype=float)
+                u_by_Z = []
 
-                result = None
-                theta: np.ndarray | None = None
-                rust_fit = _fit_multi_kernel_ai_reml_rust(
-                    self.y,
-                    self.X,
-                    Klist,
-                    self.maxiter,
-                )
-                if rust_fit is not None:
-                    theta, result = rust_fit
-                else:
-                    theta0 = np.ones(len(Klist) + 1, dtype=float)
+            g_by_G: list[np.ndarray] = []
+            g_total = np.zeros((self.n, 1), dtype=float)
+            for idx, gk in enumerate(Gnorm_list):
+                gi = g_theta[idx] * (gk @ Vinvr)
+                g_by_G.append(gi)
+                g_total += gi
 
-                    pbar = None
-                    callback = None
-                    if self.progress:
-                        pbar = tqdm(total=self.maxiter, desc="REML", ncols=100)
+            fitted = self.X @ beta_hat + z_fitted + g_total
+            sigma2 = float((r.T @ Vinvr)[0, 0]) / max(1, self.n - self.p)
+            cov_beta = np.linalg.pinv(self.X.T @ VinvX) * sigma2
 
-                        def callback(theta):
-                            pbar.update(1)
-                            pbar.set_postfix({"theta": np.round(theta, 4)})
-
-                    result = minimize(
-                        REML,
-                        theta0,
-                        args=(self.y, self.X, Klist),
-                        method="L-BFGS-B",
-                        callback=callback,
-                        options={"maxiter": self.maxiter},
-                    )
-                    theta = np.asarray(result.x, dtype=float)
-                    if pbar is not None:
-                        pbar.close()
-                if theta is None:
-                    raise RuntimeError("REML optimization failed to produce theta.")
-
-                V = theta[-1]*np.eye(self.n)
-                for num, K in enumerate(Klist):
-                    V += theta[num] * K
-                L = np.linalg.cholesky(V)
-                VinvX = cho_solve((L,True), self.X)
-                Vinvy = cho_solve((L,True), self.y)
-                beta_hat = np.linalg.solve(self.X.T @ VinvX, self.X.T @ Vinvy)
-                r = self.y - self.X @ beta_hat
-                Vinvr = cho_solve((L,True), r)
-
-                z_term_count = len(Zstlist)
-                g_term_count = len(Gnorm_list)
-                z_theta = theta[:z_term_count]
-                g_theta = theta[z_term_count : z_term_count + g_term_count]
-
-                if z_term_count > 0:
-                    Zall = np.concatenate(Zstlist, axis=1)
-                    Gall = np.concatenate(
-                        [z_theta[ind] * np.ones(z.shape[1]) for ind, z in enumerate(Zstlist)]
-                    )
-                    u_hat = (Zall.T @ Vinvr) * Gall[:, None]
-                    z_fitted = Zall @ u_hat
-                    u_by_Z = _split_u(u_hat, Zstlist)
-                else:
-                    u_hat = None
-                    z_fitted = np.zeros((self.n, 1), dtype=float)
-                    u_by_Z = []
-
-                g_by_G: list[np.ndarray] = []
-                g_total = np.zeros((self.n, 1), dtype=float)
-                for idx, gk in enumerate(Gnorm_list):
-                    gi = g_theta[idx] * (gk @ Vinvr)
-                    g_by_G.append(gi)
-                    g_total += gi
-
-                fitted = self.X @ beta_hat + z_fitted + g_total
-                sigma2 = float((r.T @ Vinvr)[0, 0]) / max(1, self.n - self.p)
-                cov_beta = np.linalg.pinv(self.X.T @ VinvX) * sigma2
-
-                self._z_standardized = True
-                self.theta = theta
-                self.var = np.array(
-                    [theta[ind] * np.diag(Klist[ind]).mean() for ind in range(len(Klist))]
-                    + [theta[-1]]
-                )
-                self.beta = beta_hat
-                self.u = u_hat
-                self.u_by_Z = u_by_Z
-                self.g = g_total
-                self.g_by_G = g_by_G
-                self._Vinvr = Vinvr
-                self._z_theta = z_theta
-                self._g_theta = g_theta
-                self._g_scales = g_scales
-                self._z_fitted = z_fitted
-                self._cov_beta = cov_beta
-                self.fitted = fitted
-                self.residuals = self.y - fitted
-                self.result = result
+            self._z_standardized = True
+            self.theta = theta
+            self.var = np.array(
+                [theta[ind] * np.diag(Klist[ind]).mean() for ind in range(len(Klist))]
+                + [theta[-1]]
+            )
+            self.beta = beta_hat
+            self.u = u_hat
+            self.u_by_Z = u_by_Z
+            self.g = g_total
+            self.g_by_G = g_by_G
+            self._Vinvr = Vinvr
+            self._z_theta = z_theta
+            self._g_theta = g_theta
+            self._g_scales = g_scales
+            self._z_fitted = z_fitted
+            self._cov_beta = cov_beta
+            self.fitted = fitted
+            self.residuals = self.y - fitted
+            self.result = result
 
     def predict(
         self,

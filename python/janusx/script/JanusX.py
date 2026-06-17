@@ -51,7 +51,7 @@ Modules:
     Benchmark:
     sim           Quick simulation workflow
     simulation    Extended simulation and benchmarking workflow
-    benchmark     FarmCPU benchmark workflow (JanusX/GAPIT/rMVP)
+    benchmark     FarmCPU benchmark workflow (JanusX/rMVP)
     gblupbench    GBLUP benchmark workflow (JanusX/sommer/rrBLUP)
     bayesbench    Bayes GS benchmark / convergence / BGLR comparison
     garfieldbench GARFIELD local-interval benchmark workflow
@@ -353,7 +353,7 @@ def _print_cli_help() -> None:
     print(f"  {_style_blue('Benchmark:')}")
     _print_help_entry(4, "sim", "Quick simulation workflow", 12, width)
     _print_help_entry(4, "simulation", "Extended simulation and benchmarking workflow", 12, width)
-    _print_help_entry(4, "benchmark", "FarmCPU benchmark workflow (JanusX/GAPIT/rMVP)", 12, width)
+    _print_help_entry(4, "benchmark", "FarmCPU benchmark workflow (JanusX/rMVP)", 12, width)
     _print_help_entry(4, "gblupbench", "GBLUP benchmark workflow (JanusX/sommer/rrBLUP)", 12, width)
     _print_help_entry(4, "bayesbench", "Bayes GS benchmark / convergence / BGLR comparison", 12, width)
     _print_help_entry(4, "garfieldbench", "GARFIELD local-interval benchmark workflow", 12, width)

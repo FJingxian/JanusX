@@ -69,30 +69,6 @@ pub(crate) fn decode_packed_rows_to_sample_major(
     Ok(out)
 }
 
-#[inline]
-pub(crate) fn decode_dense_rows_to_sample_major(
-    g_arr: &numpy::ndarray::ArrayView2<'_, f32>,
-    g_slice_opt: Option<&[f32]>,
-    n: usize,
-    row_indices: &[usize],
-) -> Vec<f64> {
-    let k = row_indices.len();
-    let mut out = vec![0.0_f64; n * k]; // row-major: (n_samples, k_rows)
-    for (col, &row_idx) in row_indices.iter().enumerate() {
-        if let Some(g_slice) = g_slice_opt {
-            let row = &g_slice[row_idx * n..(row_idx + 1) * n];
-            for i in 0..n {
-                out[i * k + col] = row[i] as f64;
-            }
-        } else {
-            for i in 0..n {
-                out[i * k + col] = g_arr[(row_idx, i)] as f64;
-            }
-        }
-    }
-    out
-}
-
 pub(crate) fn select_lead_indices(
     sz: i64,
     n_lead: usize,

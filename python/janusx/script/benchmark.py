@@ -1,14 +1,13 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-FarmCPU benchmark launcher for JanusX / GAPIT / rMVP.
+FarmCPU benchmark launcher for JanusX / rMVP.
 
 Key features:
-  - One-command benchmark for three kernels:
-      * janusx (jxpy gwas -farmcpu)
-      * gapit  (R, via temporary launcher + run_gwas_r_method.R)
-      * rmvp   (R, via temporary launcher + run_gwas_r_method.R)
-  - Unified FarmCPU grid policy to align with JanusX FarmCPU defaults:
+  - One-command benchmark for two kernels:
+      * janusx (jxpy gwas -farmcpu-raw)
+      * rmvp   (R, explicit MVP.FarmCPU via temporary inlined runner script)
+  - Unified FarmCPU grid policy to align JanusX and explicit rMVP::MVP.FarmCPU inputs:
       * bin.size      default: 5e5, 5e6, 5e7
       * QTNbound      default: int(sqrt(n / log10(n)))
       * bin.selection derived from QTNbound and nbin:
@@ -23,7 +22,6 @@ Key features:
 from __future__ import annotations
 
 import argparse
-import importlib.metadata
 import json
 import math
 import os
@@ -31,14 +29,11 @@ import re
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
-import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
-import numpy as np
 import pandas as pd
 
 
@@ -103,15 +98,9 @@ class EnvCheck:
 
 @dataclass
 class AlignRuntime:
-    mode: str
-    rmvp_engine: str
     rmvp_vc_method: str
     rmvp_method_bin: str
-    gapit_method_bin: str
-    farmcpu_threshold_base: float
-    farmcpu_threshold_effective: float
-    threshold_mode: str
-    snps_for_threshold: int
+    farmcpu_threshold: float
 
 
 def _strip_default_prefix_suffix(path: str) -> str:
@@ -189,16 +178,24 @@ def _detect_time_tool() -> list[str]:
     if gtime:
         return [gtime, "-v"]
     if Path("/usr/bin/time").exists():
-        rc = subprocess.run(
+        rc_v = subprocess.run(
             ["/usr/bin/time", "-v", "true"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             check=False,
             text=False,
         ).returncode
-        if rc == 0:
+        if rc_v == 0:
             return ["/usr/bin/time", "-v"]
-        return ["/usr/bin/time", "-l"]
+        rc_l = subprocess.run(
+            ["/usr/bin/time", "-l", "true"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            text=False,
+        ).returncode
+        if rc_l == 0:
+            return ["/usr/bin/time", "-l"]
     return []
 
 
@@ -417,83 +414,6 @@ def _read_fam_ids(bfile_prefix: str) -> list[str]:
     return fam.iloc[:, 0].astype(str).str.strip().tolist()
 
 
-def _prepare_gapit_inputs_from_bfile(
-    *,
-    bfile_prefix: str,
-    pheno_for_r: Path,
-    out_dir: Path,
-    maf: float,
-    missing_rate: float,
-    snps_only: bool,
-    chunk_size: int,
-) -> tuple[Path, Path]:
-    from janusx.gfreader import load_genotype_chunks
-
-    ph = _read_table_guess(pheno_for_r)
-    if ph.shape[1] < 2:
-        raise ValueError(f"Invalid phenotype file for GAPIT inputs: {pheno_for_r}")
-
-    taxa = ph.iloc[:, 0].astype(str).str.strip()
-    taxa = [x for x in taxa.tolist() if x]
-    taxa = list(dict.fromkeys(taxa))
-    fam_ids = set(_read_fam_ids(bfile_prefix))
-    if len(fam_ids) > 0:
-        taxa = [x for x in taxa if x in fam_ids]
-    if len(taxa) == 0:
-        raise ValueError("No overlapping samples between phenotype and bfile for GAPIT input generation.")
-
-    geno_chunks: list[np.ndarray] = []
-    snp_ids: list[str] = []
-    chroms: list[str] = []
-    positions: list[int] = []
-    seen: dict[str, int] = {}
-
-    for geno_chunk, sites in load_genotype_chunks(
-        bfile_prefix,
-        chunk_size=max(1, int(chunk_size)),
-        maf=float(maf),
-        missing_rate=float(missing_rate),
-        impute=True,
-        model="add",
-        snps_only=bool(snps_only),
-        sample_ids=taxa,
-    ):
-        arr = np.asarray(geno_chunk, dtype=np.float32)
-        if arr.shape[0] == 0:
-            continue
-        geno_chunks.append(arr)
-        for s in sites:
-            chrom = str(s.chrom).strip()
-            pos = int(s.pos)
-            base = f"{chrom}_{pos}"
-            n = int(seen.get(base, 0)) + 1
-            seen[base] = n
-            sid = base if n == 1 else f"{base}_{n}"
-            snp_ids.append(sid)
-            chroms.append(chrom)
-            positions.append(pos)
-
-    if len(geno_chunks) == 0 or len(snp_ids) == 0:
-        raise ValueError("No SNPs available after filtering for GAPIT input generation.")
-
-    geno_mn = np.concatenate(geno_chunks, axis=0)
-    if geno_mn.shape[0] != len(snp_ids):
-        raise RuntimeError("GAPIT input generation mismatch between genotype matrix and site metadata.")
-    if geno_mn.shape[1] != len(taxa):
-        raise RuntimeError("GAPIT input generation mismatch between genotype matrix and sample IDs.")
-
-    gd = pd.DataFrame(geno_mn.T, columns=snp_ids)
-    gd.insert(0, "Taxa", taxa)
-    gm = pd.DataFrame({"SNP": snp_ids, "Chromosome": chroms, "Position": positions})
-
-    out_dir.mkdir(parents=True, exist_ok=True)
-    gd_path = out_dir / "gapit.GD.tsv"
-    gm_path = out_dir / "gapit.GM.tsv"
-    gd.to_csv(gd_path, sep="\t", index=False, float_format="%.6g")
-    gm.to_csv(gm_path, sep="\t", index=False)
-    return gd_path, gm_path
-
-
 def _compute_farmcpu_grid(
     n_samples: int,
     *,
@@ -520,124 +440,14 @@ def _compute_farmcpu_grid(
     return bound, bin_selection, bin_size
 
 
-def _resolve_align_runtime(
-    args: argparse.Namespace,
-    *,
-    n_snps_for_threshold: int,
-) -> AlignRuntime:
-    mode = str(args.align_mode).strip().lower()
-    if mode not in {"legacy", "manuscript"}:
-        mode = "manuscript"
-
-    # Fixed rMVP defaults for reproducible/high-consistency benchmark behavior.
-    rmvp_engine = "mvp"
-    rmvp_vc_method = "BRENT"
-    rmvp_method_bin = "FaST-LMM"
-    gapit_method_bin = "optimum"
-
-    threshold_mode = str(args.farmcpu_threshold_mode).strip().lower()
-    if threshold_mode not in {"auto", "fixed", "per_marker"}:
-        threshold_mode = "auto"
-    if threshold_mode == "auto":
-        threshold_mode = "per_marker" if mode == "manuscript" else "fixed"
-
-    base = float(args.farmcpu_threshold)
-    if threshold_mode == "per_marker":
-        m = max(1, int(n_snps_for_threshold))
-        eff = float(base / float(m))
-    else:
-        eff = float(base)
-
+def _resolve_align_runtime(args: argparse.Namespace) -> AlignRuntime:
+    # Single aligned benchmark mode:
+    # direct rMVP::MVP.FarmCPU(...) with explicit BRENT + FaST-LMM settings.
     return AlignRuntime(
-        mode=mode,
-        rmvp_engine=rmvp_engine,
-        rmvp_vc_method=rmvp_vc_method,
-        rmvp_method_bin=rmvp_method_bin,
-        gapit_method_bin=gapit_method_bin,
-        farmcpu_threshold_base=float(base),
-        farmcpu_threshold_effective=float(eff),
-        threshold_mode=threshold_mode,
-        snps_for_threshold=max(0, int(n_snps_for_threshold)),
+        rmvp_vc_method="BRENT",
+        rmvp_method_bin="FaST-LMM",
+        farmcpu_threshold=float(args.farmcpu_threshold),
     )
-
-
-def _find_repo_root() -> Path:
-    here = Path(__file__).resolve()
-    # Prefer a parent that actually contains the R runner in source tree.
-    for base in [here.parent, *here.parents]:
-        if (base / "build" / "gwasx86" / "run_gwas_r_method.R").exists():
-            return base
-    # Fallback: nearest parent with pyproject.toml (source checkout).
-    for base in [here.parent, *here.parents]:
-        if (base / "pyproject.toml").exists():
-            return base
-    # Last resort: keep historical behavior.
-    return here.parents[3]
-
-
-def _resolve_runner_script() -> Path:
-    override = str(os.environ.get("JANUSX_R_RUNNER", "")).strip()
-    if override:
-        return Path(safe_expanduser(override))
-
-    here = Path(__file__).resolve()
-    env_prefix = Path(sys.prefix).resolve()
-    exe_prefix = Path(sys.executable).resolve().parent.parent
-    cwd = Path.cwd().resolve()
-    candidates = [
-        # Source checkout path.
-        _find_repo_root() / "build" / "gwasx86" / "run_gwas_r_method.R",
-        # Common conda/pip install layouts.
-        here.parents[3] / "build" / "gwasx86" / "run_gwas_r_method.R",
-        env_prefix / "build" / "gwasx86" / "run_gwas_r_method.R",
-        exe_prefix / "build" / "gwasx86" / "run_gwas_r_method.R",
-        # Common local clone layouts.
-        Path.home() / "github" / "JanusX" / "build" / "gwasx86" / "run_gwas_r_method.R",
-        Path.home() / "script" / "JanusX" / "build" / "gwasx86" / "run_gwas_r_method.R",
-        Path.home() / "JanusX" / "build" / "gwasx86" / "run_gwas_r_method.R",
-        # Legacy/flat fallback near benchmark.py.
-        here.parent / "run_gwas_r_method.R",
-    ]
-    # Try cwd ancestors as lightweight autodiscovery.
-    for base in [cwd, *cwd.parents[:4]]:
-        candidates.append(base / "build" / "gwasx86" / "run_gwas_r_method.R")
-
-    for path in candidates:
-        if path.exists():
-            return path
-
-    # Last fallback: download official runner into user cache.
-    cache_dir = Path(safe_expanduser("~/.cache/janusx"))
-    cache_runner = cache_dir / "run_gwas_r_method.R"
-    urls: list[str] = []
-    try:
-        ver = str(importlib.metadata.version("janusx")).strip()
-    except Exception:
-        ver = ""
-    if ver:
-        urls.append(f"https://raw.githubusercontent.com/FJingxian/JanusX/v{ver}/build/gwasx86/run_gwas_r_method.R")
-    urls.extend(
-        [
-            "https://raw.githubusercontent.com/FJingxian/JanusX/main/build/gwasx86/run_gwas_r_method.R",
-            "https://raw.githubusercontent.com/FJingxian/JanusX/master/build/gwasx86/run_gwas_r_method.R",
-        ]
-    )
-    for url in urls:
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": "janusx-benchmark/1"})
-            with urllib.request.urlopen(req, timeout=20) as resp:
-                content = resp.read().decode("utf-8", errors="replace")
-            if "run_gapit" not in content or "run_rmvp" not in content:
-                continue
-            cache_dir.mkdir(parents=True, exist_ok=True)
-            tmp = cache_runner.with_suffix(".tmp")
-            tmp.write_text(content, encoding="utf-8")
-            tmp.replace(cache_runner)
-            return cache_runner
-        except Exception:
-            continue
-
-    return candidates[0]
 
 
 def _is_executable_file(path: Path) -> bool:
@@ -672,9 +482,27 @@ def _resolve_gformat_cmd() -> list[str]:
     return _pick_working_subcmd_cmd("gformat")
 
 
+def _resolve_rscript_path() -> str:
+    cands: list[Path] = []
+    env_bin = Path(sys.executable).resolve().parent
+    cands.append(env_bin / "Rscript")
+    which = shutil.which("Rscript")
+    if which:
+        cands.append(Path(which))
+    seen: set[str] = set()
+    for cand in cands:
+        key = str(cand)
+        if key in seen:
+            continue
+        seen.add(key)
+        if cand.exists() and cand.is_file() and os.access(str(cand), os.X_OK):
+            return str(cand)
+    return ""
+
+
 def _parse_kernels(raw: str) -> list[str]:
     kernels = [k.strip().lower() for k in str(raw).split(",") if k.strip()]
-    kernels = [k for k in kernels if k in {"janusx", "gapit", "rmvp"}]
+    kernels = [k for k in kernels if k in {"janusx", "rmvp"}]
     return kernels
 
 
@@ -696,7 +524,7 @@ def _probe_cmd(cmd: list[str], timeout: int = 120) -> tuple[int, str]:
 
 def _collect_env_checks(args: argparse.Namespace, kernels: list[str]) -> list[EnvCheck]:
     items: list[EnvCheck] = []
-    need_r = any(k in {"gapit", "rmvp"} for k in kernels)
+    need_r = "rmvp" in kernels
 
     # JanusX kernel checks
     if "janusx" in kernels:
@@ -711,10 +539,9 @@ def _collect_env_checks(args: argparse.Namespace, kernels: list[str]) -> list[En
 
     r_bin = ""
     r_ok = True
-    runner = _resolve_runner_script()
 
     if need_r:
-        r_bin = str(shutil.which("Rscript") or "")
+        r_bin = _resolve_rscript_path()
 
         r_ok = bool(r_bin) and Path(r_bin).exists()
         items.append(
@@ -722,13 +549,6 @@ def _collect_env_checks(args: argparse.Namespace, kernels: list[str]) -> list[En
                 "rscript",
                 r_ok,
                 r_bin if r_ok else "Rscript not found in current env PATH",
-            )
-        )
-        items.append(
-            EnvCheck(
-                "r_runner",
-                runner.exists(),
-                str(runner) if runner.exists() else f"missing runner: {runner}",
             )
         )
         if r_ok:
@@ -740,41 +560,6 @@ def _collect_env_checks(args: argparse.Namespace, kernels: list[str]) -> list[En
                     "OK" if rc == 0 else f"failed (exit={rc}): {str(out).splitlines()[:1]}",
                 )
             )
-
-    # GAPIT checks
-    if "gapit" in kernels:
-        if r_ok:
-            rc, _out = _probe_cmd(
-                [
-                    r_bin,
-                    "-e",
-                    'ok <- requireNamespace("GAPIT", quietly=TRUE) || requireNamespace("GAPIT3", quietly=TRUE); quit(status=if (ok) 0 else 1)',
-                ],
-                timeout=90,
-            )
-            pkg_ok = rc == 0
-            vendor_path = runner.parent / "vendor" / "gapit_functions.txt"
-            vendor_ok = vendor_path.exists()
-            if pkg_ok:
-                items.append(EnvCheck("gapit.runtime", True, "GAPIT/GAPIT3 package available"))
-            elif vendor_ok:
-                items.append(
-                    EnvCheck(
-                        "gapit.runtime",
-                        True,
-                        f"package missing; using local GAPIT source fallback: {vendor_path}",
-                    )
-                )
-            else:
-                items.append(
-                    EnvCheck(
-                        "gapit.runtime",
-                        False,
-                        "GAPIT package missing and local vendor fallback not found",
-                    )
-                )
-        else:
-            items.append(EnvCheck("gapit.runtime", False, "Rscript unavailable, cannot check GAPIT"))
 
     # rMVP checks
     if "rmvp" in kernels:
@@ -886,7 +671,7 @@ def _parse_pseudo_from_text(text: str) -> Optional[int]:
             if best is None or v > best:
                 best = v
 
-    # GAPIT/rMVP logs often print pseudo-QTN lists as:
+    # rMVP logs often print pseudo-QTN lists as:
     # "seqQTN" then one or more R-style vector lines (e.g. "[1] 8187 ...").
     # Parse those blocks and count vector entries (excluding the R index token).
     for idx, line in enumerate(lines):
@@ -927,147 +712,340 @@ def _parse_pseudo_from_text(text: str) -> Optional[int]:
     return best
 
 
-def _build_r_launcher_script(path: Path) -> None:
+def _build_rmvp_runner_script(path: Path) -> None:
     script = r"""#!/usr/bin/env Rscript
-env <- Sys.getenv
-runner <- env("JX_RUNNER")
-method <- env("JX_METHOD")
-bfile <- env("JX_BFILE")
-pheno <- env("JX_PHENO")
-trait <- env("JX_TRAIT")
-out_file <- env("JX_OUT_FILE")
-workdir <- env("JX_WORKDIR")
-threads <- env("JX_THREADS")
-gapit_gd <- env("JX_GAPIT_GD")
-gapit_gm <- env("JX_GAPIT_GM")
-gapit_source <- env("JX_GAPIT_SOURCE")
-gapit_source_url <- env("JX_GAPIT_SOURCE_URL")
-farmcpu_bin_size <- env("JX_FARMCPU_BIN_SIZE")
-farmcpu_bin_selection <- env("JX_FARMCPU_BIN_SELECTION")
-farmcpu_max_loop <- env("JX_FARMCPU_MAX_LOOP")
-farmcpu_thr <- env("JX_FARMCPU_THRESHOLD")
-farmcpu_bound <- env("JX_FARMCPU_BOUND")
-farmcpu_maf <- env("JX_FARMCPU_MAF")
-rmvp_engine <- tolower(env("JX_RMVP_ENGINE"))
-rmvp_vc_method <- toupper(env("JX_RMVP_VC_METHOD"))
-rmvp_method_bin <- env("JX_RMVP_METHOD_BIN")
-gapit_method_bin <- env("JX_GAPIT_METHOD_BIN")
-inner_log <- env("JX_INNER_LOG")
-meta_file <- env("JX_META_FILE")
-rscript_exec <- env("JX_RSCRIPT_BIN")
-if (!nzchar(rscript_exec)) {
-  rscript_exec <- file.path(R.home("bin"), "Rscript")
+parse_args <- function(args) {
+  out <- list()
+  i <- 1L
+  while (i <= length(args)) {
+    key <- args[[i]]
+    if (!startsWith(key, "--")) {
+      stop(sprintf("Unexpected argument: %s", key), call. = FALSE)
+    }
+    key <- substring(key, 3L)
+    if (i == length(args) || startsWith(args[[i + 1L]], "--")) {
+      out[[key]] <- "true"
+      i <- i + 1L
+    } else {
+      out[[key]] <- args[[i + 1L]]
+      i <- i + 2L
+    }
+  }
+  out
 }
-if (!nzchar(rmvp_engine)) rmvp_engine <- "mvp"
-if (!nzchar(rmvp_vc_method)) rmvp_vc_method <- "BRENT"
-if (!nzchar(rmvp_method_bin)) rmvp_method_bin <- "FaST-LMM"
-if (!nzchar(gapit_method_bin)) gapit_method_bin <- "optimum"
-method_bin <- if (grepl("^rmvp_", method, ignore.case = TRUE)) rmvp_method_bin else gapit_method_bin
 
-if (!file.exists(runner)) {
-  stop(sprintf("Missing runner script: %s", runner), call. = FALSE)
+require_opt <- function(opts, key) {
+  val <- opts[[key]]
+  if (is.null(val) || !nzchar(val)) {
+    stop(sprintf("Missing required option: --%s", key), call. = FALSE)
+  }
+  val
 }
+
+parse_csv_numeric <- function(text, as_int = FALSE) {
+  if (!nzchar(text)) return(numeric())
+  parts <- strsplit(text, ",", fixed = TRUE)[[1]]
+  parts <- trimws(parts)
+  parts <- parts[nzchar(parts)]
+  if (!length(parts)) return(numeric())
+  vals <- suppressWarnings(as.numeric(parts))
+  vals <- vals[is.finite(vals)]
+  if (!length(vals)) return(numeric())
+  if (as_int) {
+    return(as.integer(round(vals)))
+  }
+  vals
+}
+
+detect_qtn_from_lines <- function(lines) {
+  if (!length(lines)) return(NA_integer_)
+  final_count <- NA_integer_
+
+  for (idx in seq_along(lines)) {
+    if (!grepl("number of covariates in current loop", lines[[idx]], ignore.case = TRUE)) next
+    if (idx >= length(lines)) next
+    nums <- regmatches(lines[[idx + 1L]], gregexpr("\\b[0-9]+\\b", lines[[idx + 1L]], perl = TRUE))[[1]]
+    vv <- suppressWarnings(as.integer(nums))
+    vv <- vv[is.finite(vv)]
+    if (length(vv) > 0L) {
+      final_count <- as.integer(vv[[length(vv)]])
+    }
+  }
+
+  if (is.finite(final_count)) return(final_count)
+
+  for (idx in seq_along(lines)) {
+    if (!grepl("\\bseqQTN\\b", lines[[idx]], ignore.case = TRUE)) next
+    count <- 0L
+    j <- idx + 1L
+    while (j <= length(lines)) {
+      lns <- trimws(lines[[j]])
+      if (!nzchar(lns)) break
+      if (grepl("(current loop|optimizing|scanning|number of covariates|farmcpu\\.lm|genomic inflation)", lns, ignore.case = TRUE)) break
+      nums <- regmatches(lns, gregexpr("\\b[0-9]+\\b", lns, perl = TRUE))[[1]]
+      if (grepl("^\\[[0-9]+\\]\\s*", lns) && length(nums)) {
+        nums <- nums[-1]
+      }
+      count <- count + length(nums)
+      j <- j + 1L
+    }
+    if (count > 0L) {
+      final_count <- as.integer(count)
+    }
+  }
+
+  final_count
+}
+
+write_meta <- function(meta_file, exit_code, pseudo_qtn, inner_log, note, pseudo_qtn_metric) {
+  meta <- data.frame(
+    key = c("exit_code", "pseudo_qtn", "pseudo_qtn_metric", "inner_log", "note"),
+    value = c(
+      as.character(as.integer(exit_code)),
+      ifelse(is.na(pseudo_qtn), "NA", as.character(as.integer(pseudo_qtn))),
+      pseudo_qtn_metric,
+      inner_log,
+      note
+    ),
+    stringsAsFactors = FALSE
+  )
+  utils::write.table(meta, file = meta_file, sep = "\t", row.names = FALSE, quote = FALSE)
+}
+
+opts <- parse_args(commandArgs(trailingOnly = TRUE))
+bfile <- require_opt(opts, "bfile")
+pheno <- require_opt(opts, "pheno")
+out_file <- require_opt(opts, "out-file")
+workdir <- require_opt(opts, "workdir")
+inner_log <- require_opt(opts, "inner-log")
+meta_file <- require_opt(opts, "meta-file")
+cache_prefix <- require_opt(opts, "cache-prefix")
+
+threads <- suppressWarnings(as.integer(opts[["threads"]]))
+if (!is.finite(threads) || threads < 1L) threads <- 1L
+max_line <- suppressWarnings(as.integer(opts[["max-line"]]))
+if (!is.finite(max_line) || max_line < 1L) max_line <- 10000L
+max_loop <- suppressWarnings(as.integer(opts[["farmcpu-max-loop"]]))
+if (!is.finite(max_loop) || max_loop < 1L) max_loop <- 10L
+threshold <- suppressWarnings(as.numeric(opts[["farmcpu-threshold"]]))
+if (!is.finite(threshold) || threshold <= 0) threshold <- 0.05
+threshold_output <- suppressWarnings(as.numeric(opts[["farmcpu-threshold-output"]]))
+if (!is.finite(threshold_output) || threshold_output <= 0) threshold_output <- threshold
+p_threshold <- suppressWarnings(as.numeric(opts[["farmcpu-p-threshold"]]))
+p_threshold_raw <- ifelse(is.null(opts[["farmcpu-p-threshold"]]), "", trimws(opts[["farmcpu-p-threshold"]]))
+if (!nzchar(p_threshold_raw) || tolower(p_threshold_raw) %in% c("na", "null", "none")) {
+  p_threshold <- NA_real_
+} else if (!is.finite(p_threshold) || p_threshold <= 0) {
+  p_threshold <- threshold
+}
+qtn_threshold <- suppressWarnings(as.numeric(opts[["farmcpu-qtn-threshold"]]))
+if (!is.finite(qtn_threshold) || qtn_threshold <= 0) qtn_threshold <- threshold
+farmcpu_bound <- suppressWarnings(as.integer(opts[["farmcpu-bound"]]))
+if (!is.finite(farmcpu_bound) || farmcpu_bound < 1L) farmcpu_bound <- NULL
+maf <- suppressWarnings(as.numeric(opts[["farmcpu-maf"]]))
+if (!is.finite(maf) || maf <= 0 || maf >= 0.5) maf <- NULL
+npc_farmcpu <- suppressWarnings(as.integer(opts[["npc-farmcpu"]]))
+if (!is.finite(npc_farmcpu) || npc_farmcpu < 1L) npc_farmcpu <- NULL
+force_rebuild <- tolower(ifelse(is.null(opts[["force-rebuild"]]), "0", opts[["force-rebuild"]])) %in% c("1", "true", "yes")
+vc_method <- toupper(ifelse(is.null(opts[["rmvp-vc-method"]]), "BRENT", opts[["rmvp-vc-method"]]))
+if (!vc_method %in% c("BRENT", "EMMA", "HE")) vc_method <- "BRENT"
+method_bin <- ifelse(is.null(opts[["rmvp-method-bin"]]), "FaST-LMM", opts[["rmvp-method-bin"]])
+if (!nzchar(method_bin)) method_bin <- "FaST-LMM"
+bin_size <- parse_csv_numeric(ifelse(is.null(opts[["farmcpu-bin-size"]]), "", opts[["farmcpu-bin-size"]]), as_int = FALSE)
+if (!length(bin_size)) bin_size <- c(5e5, 5e6, 5e7)
+bin_selection <- parse_csv_numeric(ifelse(is.null(opts[["farmcpu-bin-selection"]]), "", opts[["farmcpu-bin-selection"]]), as_int = TRUE)
+if (!length(bin_selection)) bin_selection <- as.integer(1L)
+
 dir.create(dirname(out_file), recursive = TRUE, showWarnings = FALSE)
 dir.create(workdir, recursive = TRUE, showWarnings = FALSE)
+dir.create(dirname(inner_log), recursive = TRUE, showWarnings = FALSE)
+dir.create(dirname(meta_file), recursive = TRUE, showWarnings = FALSE)
+dir.create(dirname(cache_prefix), recursive = TRUE, showWarnings = FALSE)
+if (file.exists(inner_log)) unlink(inner_log, force = TRUE)
+file.create(inner_log, showWarnings = FALSE)
+sink(inner_log, split = TRUE)
 
-cmd <- c(
-  runner,
-  "--method", method,
-  "--bfile", bfile,
-  "--pheno", pheno,
-  "--trait", trait,
-  "--out", out_file,
-  "--workdir", workdir,
-  "--threads", threads,
-  "--farmcpu-direct", "true",
-  "--rmvp-farmcpu-engine", rmvp_engine,
-  "--rmvp-vc-method", rmvp_vc_method,
-  "--farmcpu-method-bin", method_bin,
-  "--farmcpu-bin-size", farmcpu_bin_size,
-  "--farmcpu-bin-selection", farmcpu_bin_selection,
-  "--farmcpu-max-loop", farmcpu_max_loop,
-  "--farmcpu-threshold-output", farmcpu_thr,
-  "--farmcpu-qtn-threshold", farmcpu_thr,
-  "--farmcpu-p-threshold", farmcpu_thr,
-  "--farmcpu-bound", farmcpu_bound,
-  "--farmcpu-maf-threshold", farmcpu_maf
-)
-if (nzchar(gapit_gd)) {
-  cmd <- c(cmd, "--gapit-gd", gapit_gd)
-}
-if (nzchar(gapit_gm)) {
-  cmd <- c(cmd, "--gapit-gm", gapit_gm)
-}
-if (nzchar(gapit_source)) {
-  cmd <- c(cmd, "--gapit-source", gapit_source)
-}
-if (nzchar(gapit_source_url)) {
-  cmd <- c(cmd, "--gapit-source-url", gapit_source_url)
-}
+suppressPackageStartupMessages({
+  library(rMVP)
+  library(bigmemory)
+})
 
-out <- system2(rscript_exec, cmd, stdout = TRUE, stderr = TRUE)
-status <- attr(out, "status")
-if (is.null(status)) status <- 0L
-if (is.na(status)) status <- 1L
-if (!nzchar(inner_log)) {
-  inner_log <- file.path(workdir, paste0(method, ".inner.log"))
-}
-writeLines(out, con = inner_log)
+status <- 0L
+note <- "ok"
 
-detect_qtn_from_log <- function(lines) {
-  if (length(lines) == 0) return(NA_integer_)
-  best <- NA_integer_
-  for (ln in lines) {
-    if (!grepl("qtn|pseudo", ln, ignore.case = TRUE)) next
-    nums <- regmatches(ln, gregexpr("[0-9]+", ln, perl = TRUE))[[1]]
-    if (length(nums) == 0) next
-    vals <- suppressWarnings(as.integer(nums))
-    vals <- vals[is.finite(vals)]
-    if (length(vals) == 0) next
-    cand <- max(vals)
-    if (is.na(best) || cand > best) best <- cand
-  }
-  best
-}
-
-detect_qtn_from_files <- function(root) {
-  if (!dir.exists(root)) return(NA_integer_)
-  ff <- list.files(root, recursive = TRUE, full.names = TRUE)
-  if (length(ff) == 0) return(NA_integer_)
-  ff <- ff[grepl("qtn|pseudo", basename(ff), ignore.case = TRUE)]
-  if (length(ff) == 0) return(NA_integer_)
-  best <- NA_integer_
-  for (f in ff) {
-    if (dir.exists(f)) next
-    n <- NA_integer_
-    ext <- tolower(tools::file_ext(f))
-    if (ext %in% c("txt", "tsv", "csv", "out", "dat", "pmap")) {
-      tab <- try(read.table(f, header = TRUE, sep = "", check.names = FALSE, stringsAsFactors = FALSE), silent = TRUE)
-      if (!inherits(tab, "try-error")) {
-        n <- as.integer(nrow(tab))
-      } else {
-        tab2 <- try(read.table(f, header = FALSE, sep = "", check.names = FALSE, stringsAsFactors = FALSE), silent = TRUE)
-        if (!inherits(tab2, "try-error")) n <- as.integer(nrow(tab2))
-      }
+tryCatch(
+  {
+    cache_files <- c(
+      paste0(cache_prefix, ".geno.bin"),
+      paste0(cache_prefix, ".geno.desc"),
+      paste0(cache_prefix, ".geno.map"),
+      paste0(cache_prefix, ".geno.ind")
+    )
+    if (force_rebuild) {
+      unlink(paste0(cache_prefix, ".*"), recursive = FALSE, force = TRUE)
     }
-    if (!is.na(n) && n > 0) {
-      if (is.na(best) || n > best) best <- n
+    if (force_rebuild || any(!file.exists(cache_files))) {
+      cat("[INFO] Building rMVP cache from PLINK prefix:", bfile, "\n")
+      rMVP::MVP.Data(
+        fileBed = bfile,
+        out = cache_prefix,
+        maxLine = max_line,
+        SNP.impute = "Major",
+        verbose = TRUE,
+        ncpus = threads
+      )
+    } else {
+      cat("[INFO] Reusing rMVP cache:", cache_prefix, "\n")
     }
+
+    geno <- bigmemory::attach.big.matrix(paste0(cache_prefix, ".geno.desc"))
+    map <- utils::read.table(
+      paste0(cache_prefix, ".geno.map"),
+      header = TRUE,
+      sep = "\t",
+      stringsAsFactors = FALSE,
+      check.names = FALSE
+    )
+    if (ncol(map) < 3L) {
+      stop("rMVP map cache must contain at least SNP/CHROM/POS columns.", call. = FALSE)
+    }
+    map_out <- as.data.frame(map, stringsAsFactors = FALSE)
+    # rMVP::MVP.FarmCPU expects only SNP/CHROM/POS here; passing A1/A2 shifts the internal P column.
+    map_farmcpu <- map_out[, seq_len(3L), drop = FALSE]
+    ids <- utils::read.table(
+      paste0(cache_prefix, ".geno.ind"),
+      header = FALSE,
+      stringsAsFactors = FALSE,
+      check.names = FALSE
+    )[[1]]
+    ids <- as.character(ids)
+
+    phe_raw <- utils::read.table(
+      pheno,
+      header = TRUE,
+      sep = "\t",
+      stringsAsFactors = FALSE,
+      check.names = FALSE
+    )
+    if (ncol(phe_raw) < 2L) {
+      stop(sprintf("Invalid phenotype file: %s", pheno), call. = FALSE)
+    }
+    sample_ids <- as.character(phe_raw[[1]])
+    trait_vals <- suppressWarnings(as.numeric(phe_raw[[2]]))
+    hit <- match(ids, sample_ids)
+    matched <- which(!is.na(hit) & is.finite(trait_vals[hit]))
+    if (!length(matched)) {
+      stop("No overlapping phenotype rows remain after aligning to the PLINK sample order.", call. = FALSE)
+    }
+    phe <- data.frame(
+      Taxa = ids[matched],
+      PHENO = trait_vals[hit[matched]],
+      stringsAsFactors = FALSE
+    )
+    ind_idx <- as.integer(matched)
+
+    CV_farmcpu <- NULL
+    marker_freq <- rMVP:::BigRowMean(
+      geno@address,
+      TRUE,
+      threads = threads,
+      geno_ind = ind_idx
+    ) / 2
+    if (!is.null(npc_farmcpu) && npc_farmcpu > 0L) {
+      K <- rMVP::MVP.K.VanRaden(
+        M = geno,
+        maxLine = max_line,
+        ind_idx = ind_idx,
+        mrk_idx = NULL,
+        mrk_freq = marker_freq,
+        mrk_bycol = TRUE,
+        cpu = threads,
+        verbose = TRUE,
+        checkNA = FALSE
+      )
+      eigenK <- eigen(K, symmetric = TRUE)
+      npc_keep <- min(nrow(eigenK$vectors), max(3L, npc_farmcpu))
+      ipca <- eigenK$vectors[, seq_len(npc_keep), drop = FALSE]
+      CV_farmcpu <- ipca[, seq_len(min(ncol(ipca), npc_farmcpu)), drop = FALSE]
+    }
+
+    farmcpu_out <- rMVP::MVP.FarmCPU(
+      phe = phe,
+      geno = geno,
+      map = map_farmcpu,
+      CV = CV_farmcpu,
+      ind_idx = ind_idx,
+      mrk_idx = NULL,
+      P = NULL,
+      method.sub = "reward",
+      method.sub.final = "reward",
+      method.bin = method_bin,
+      bin.size = bin_size,
+      bin.selection = bin_selection,
+      memo = "MVP.FarmCPU",
+      Prior = NULL,
+      ncpus = threads,
+      maxLoop = max_loop,
+      maxLine = max_line,
+      threshold.output = threshold_output,
+      converge = 1,
+      iteration.output = FALSE,
+      p.threshold = p_threshold,
+      QTN.threshold = qtn_threshold,
+      bound = farmcpu_bound,
+      verbose = TRUE
+    )
+    farmcpu_out <- as.data.frame(farmcpu_out, stringsAsFactors = FALSE)
+    if (!nrow(map_out) || !nrow(farmcpu_out)) {
+      stop("rMVP returned no FarmCPU result rows.", call. = FALSE)
+    }
+    if (nrow(map_out) != nrow(farmcpu_out)) {
+      stop("rMVP returned mismatched map/result row counts.", call. = FALSE)
+    }
+
+    beta <- suppressWarnings(as.numeric(farmcpu_out[[1]]))
+    se <- suppressWarnings(as.numeric(farmcpu_out[[2]]))
+    pval <- suppressWarnings(as.numeric(farmcpu_out[[ncol(farmcpu_out)]]))
+    need_p <- !is.finite(pval) & is.finite(beta) & is.finite(se) & (se > 0)
+    if (any(need_p)) {
+      pval[need_p] <- stats::pchisq((beta[need_p] / se[need_p])^2, df = 1, lower.tail = FALSE)
+    }
+    chisq <- rep(NA_real_, length(beta))
+    ok <- is.finite(beta) & is.finite(se) & (se > 0)
+    chisq[ok] <- (beta[ok] / se[ok])^2
+    af <- ifelse(marker_freq > 0.5, 1 - marker_freq, marker_freq)
+
+    out_tab <- data.frame(
+      chrom = if ("CHROM" %in% names(map_out)) map_out[["CHROM"]] else NA,
+      pos = if ("POS" %in% names(map_out)) suppressWarnings(as.integer(map_out[["POS"]])) else NA_integer_,
+      snp = if ("SNP" %in% names(map_out)) as.character(map_out[["SNP"]]) else as.character(seq_len(nrow(map_out))),
+      allele0 = if ("A1" %in% names(map_out)) as.character(map_out[["A1"]]) else NA_character_,
+      allele1 = if ("A2" %in% names(map_out)) as.character(map_out[["A2"]]) else NA_character_,
+      af = af,
+      miss = NA_real_,
+      beta = beta,
+      se = se,
+      chisq = chisq,
+      pwald = pval,
+      stringsAsFactors = FALSE
+    )
+    utils::write.table(out_tab, file = out_file, sep = "\t", row.names = FALSE, quote = FALSE)
+  },
+  error = function(e) {
+    status <<- 1L
+    note <<- conditionMessage(e)
+    message(note)
   }
-  best
-}
-
-q1 <- detect_qtn_from_log(out)
-q2 <- detect_qtn_from_files(workdir)
-qtn <- if (is.na(q1)) q2 else if (is.na(q2)) q1 else max(q1, q2)
-
-meta <- data.frame(
-  key = c("exit_code", "pseudo_qtn", "inner_log"),
-  value = c(as.character(status), ifelse(is.na(qtn), "NA", as.character(qtn)), inner_log),
-  stringsAsFactors = FALSE
 )
-write.table(meta, file = meta_file, sep = "\t", row.names = FALSE, quote = FALSE)
-quit(save = "no", status = as.integer(status))
+
+while (sink.number() > 0L) sink()
+
+pseudo_qtn <- NA_integer_
+if (file.exists(inner_log)) {
+  pseudo_qtn <- detect_qtn_from_lines(readLines(inner_log, warn = FALSE))
+}
+write_meta(meta_file, status, pseudo_qtn, inner_log, note, "rmvp_final_seqQTN_count")
+quit(save = "no", status = status)
 """
     path.write_text(script, encoding="utf-8")
 
@@ -1113,13 +1091,11 @@ def _run_kernel_janusx(
         str(gfile),
         "-p",
         str(pheno_for_jx),
-        "-farmcpu",
+        "-farmcpu-raw",
         "-maf",
         str(args.maf),
         "-geno",
         str(args.geno),
-        "-chunksize",
-        str(args.chunksize),
         "-t",
         str(args.thread),
         "-o",
@@ -1129,7 +1105,7 @@ def _run_kernel_janusx(
         "--farmcpu-iter",
         str(int(args.farmcpu_iter)),
         "--farmcpu-threshold",
-        f"{float(align_runtime.farmcpu_threshold_base):.17g}",
+        f"{float(align_runtime.farmcpu_threshold):.17g}",
         "--farmcpu-nbin",
         str(int(args.farmcpu_nbin)),
         "--farmcpu-bin-size",
@@ -1197,8 +1173,11 @@ def _run_kernel_r(
     farm_bin_selection: list[int],
     farm_bin_size: list[float],
     align_runtime: AlignRuntime,
-    r_launcher: Path,
+    rmvp_runner: Path,
 ) -> RunResult:
+    if kernel != "rmvp":
+        raise ValueError(f"Unsupported R kernel: {kernel}")
+
     run_dir = out_dir / kernel
     run_dir.mkdir(parents=True, exist_ok=True)
     log_file = run_dir / f"{kernel}.log"
@@ -1209,83 +1188,81 @@ def _run_kernel_r(
     topk_file = run_dir / f"{args.prefix}.{kernel}.top{args.topk}.tsv"
     workdir = run_dir / "work"
     workdir.mkdir(parents=True, exist_ok=True)
-
-    gapit_gd = ""
-    gapit_gm = ""
-    if kernel == "gapit":
-        gd_path, gm_path = _prepare_gapit_inputs_from_bfile(
-            bfile_prefix=str(bfile_prefix),
-            pheno_for_r=pheno_for_r,
-            out_dir=workdir / "gapit_input",
-            maf=float(args.maf),
-            missing_rate=float(args.geno),
-            snps_only=bool(args.snps_only),
-            chunk_size=max(1000, int(args.chunksize)),
-        )
-        gapit_gd = str(gd_path)
-        gapit_gm = str(gm_path)
-
-    method = "gapit_farmcpu" if kernel == "gapit" else "rmvp_farmcpu"
-    runner = _resolve_runner_script()
-    if not runner.exists():
-        raise FileNotFoundError(f"R runner not found: {runner}")
-
-    env = os.environ.copy()
     rmvp_force_rebuild = "1" if (kernel == "rmvp" and (not bool(getattr(args, "rmvp_reuse_cache", False)))) else "0"
-    env.update(
-        {
-            "JX_RUNNER": str(runner),
-            "JX_METHOD": method,
-            "JX_BFILE": str(bfile_prefix),
-            "JX_PHENO": str(pheno_for_r),
-            "JX_TRAIT": "PHENO",
-            "JX_OUT_FILE": str(result_file),
-            "JX_WORKDIR": str(workdir),
-            "JX_THREADS": str(args.thread),
-            "JX_GAPIT_GD": gapit_gd,
-            "JX_GAPIT_GM": gapit_gm,
-            "JX_GAPIT_SOURCE": "",
-            "JX_GAPIT_SOURCE_URL": "",
-            "JX_FARMCPU_BIN_SIZE": ",".join(str(int(v)) if float(v).is_integer() else str(v) for v in farm_bin_size),
-            "JX_FARMCPU_BIN_SELECTION": ",".join(str(int(v)) for v in farm_bin_selection),
-            "JX_FARMCPU_MAX_LOOP": str(args.farmcpu_iter),
-            "JX_FARMCPU_THRESHOLD": f"{float(align_runtime.farmcpu_threshold_effective):.17g}",
-            "JX_FARMCPU_BOUND": str(int(farm_bound)),
-            "JX_FARMCPU_MAF": str(args.maf),
-            "JX_RMVP_ENGINE": str(align_runtime.rmvp_engine),
-            "JX_RMVP_VC_METHOD": str(align_runtime.rmvp_vc_method),
-            "JX_RMVP_METHOD_BIN": str(align_runtime.rmvp_method_bin),
-            "JX_GAPIT_METHOD_BIN": str(align_runtime.gapit_method_bin),
-            "JX_INNER_LOG": str(inner_log),
-            "JX_META_FILE": str(meta_file),
-            "JX_RSCRIPT_BIN": "",
-            "RMVP_FORCE_REBUILD": rmvp_force_rebuild,
-        }
-    )
 
-    r_bin = shutil.which("Rscript")
+    r_bin = _resolve_rscript_path()
     if not r_bin:
         raise RuntimeError("Rscript not found in current env PATH.")
 
-    cmd = [str(r_bin), str(r_launcher)]
-    rc, elapsed, rss = _run_timed(cmd, log_file=log_file, time_file=time_file, env=env)
+    cmd = [
+        str(r_bin),
+        str(rmvp_runner),
+        "--bfile",
+        str(bfile_prefix),
+        "--pheno",
+        str(pheno_for_r),
+        "--out-file",
+        str(result_file),
+        "--workdir",
+        str(workdir),
+        "--inner-log",
+        str(inner_log),
+        "--meta-file",
+        str(meta_file),
+        "--cache-prefix",
+        str(workdir / "rmvp_cache" / "bench_input"),
+        "--threads",
+        str(args.thread),
+        "--max-line",
+        str(max(1000, int(args.chunksize))),
+        "--farmcpu-bin-size",
+        ",".join(str(int(v)) if float(v).is_integer() else str(v) for v in farm_bin_size),
+        "--farmcpu-bin-selection",
+        ",".join(str(int(v)) for v in farm_bin_selection),
+        "--farmcpu-max-loop",
+        str(args.farmcpu_iter),
+        "--farmcpu-threshold",
+        f"{float(align_runtime.farmcpu_threshold):.17g}",
+        "--farmcpu-threshold-output",
+        f"{float(align_runtime.farmcpu_threshold):.17g}",
+        "--farmcpu-p-threshold",
+        f"{float(align_runtime.farmcpu_threshold):.17g}",
+        "--farmcpu-qtn-threshold",
+        f"{float(align_runtime.farmcpu_threshold):.17g}",
+        "--farmcpu-bound",
+        str(int(farm_bound)),
+        "--farmcpu-maf",
+        str(args.maf),
+        "--rmvp-vc-method",
+        str(align_runtime.rmvp_vc_method),
+        "--rmvp-method-bin",
+        str(align_runtime.rmvp_method_bin),
+        "--npc-farmcpu",
+        str(max(0, int(args.qcov))),
+        "--force-rebuild",
+        rmvp_force_rebuild,
+    ]
+    rc, elapsed, rss = _run_timed(cmd, log_file=log_file, time_file=time_file)
     status = "ok" if rc == 0 else "failed"
     pseudo_qtn = None
     note = ""
+    pseudo_qtn_metric = ""
 
     meta = _read_meta_kv(meta_file)
+    if "pseudo_qtn_metric" in meta:
+        pseudo_qtn_metric = str(meta["pseudo_qtn_metric"]).strip()
     if "pseudo_qtn" in meta:
         try:
             if str(meta["pseudo_qtn"]).strip().upper() != "NA":
                 pseudo_qtn = int(float(meta["pseudo_qtn"]))
         except Exception:
             pseudo_qtn = None
-    if inner_log.exists():
+    if pseudo_qtn is None and inner_log.exists():
         pseudo_qtn_from_log = _parse_pseudo_from_text(inner_log.read_text(errors="ignore"))
-        if pseudo_qtn is None:
+        if pseudo_qtn_from_log is not None:
             pseudo_qtn = pseudo_qtn_from_log
-        elif pseudo_qtn_from_log is not None and pseudo_qtn_from_log > pseudo_qtn:
-            pseudo_qtn = pseudo_qtn_from_log
+            if not pseudo_qtn_metric:
+                pseudo_qtn_metric = "log_fallback"
 
     topk_count = 0
     topk_snps = ""
@@ -1301,6 +1278,9 @@ def _run_kernel_r(
             note = f"{kernel} result file missing: {result_file}"
     else:
         note = f"{kernel} command failed."
+    if status == "ok" and kernel == "rmvp":
+        metric_note = pseudo_qtn_metric or "rmvp_final_seqQTN_count"
+        note = f"{note}; pseudo_qtn_metric={metric_note}" if note else f"pseudo_qtn_metric={metric_note}"
 
     return RunResult(
         kernel=kernel,
@@ -1424,7 +1404,7 @@ def _save_summary(out_dir: Path, prefix: str, rows: list[RunResult], extra_cfg: 
         q = "NA" if pd.isna(r["pseudo_qtn"]) else str(int(r["pseudo_qtn"]))
         lines.append(f"| {r['kernel']} | {r['status']} | {t} | {m} | {q} | {int(r['topk_count'])} |")
 
-    preferred = ["janusx", "gapit", "rmvp"]
+    preferred = ["janusx", "rmvp"]
     seen = {str(x) for x in df["kernel"].tolist()}
     kernel_order = [k for k in preferred if k in seen]
     extras = [str(x) for x in df["kernel"].tolist() if str(x) not in preferred]
@@ -1439,6 +1419,9 @@ def _save_summary(out_dir: Path, prefix: str, rows: list[RunResult], extra_cfg: 
             "",
             "**PseudoQTN Count Consistency Matrix (Lower Triangle)**",
             "Formula: `min(qtn_i, qtn_j) / max(qtn_i, qtn_j)`; `NA` means missing/non-positive pseudoQTN.",
+            "Current direct/aligned benchmark uses explicit `rMVP::MVP.FarmCPU(...)` with `vc.method=BRENT` and `method.bin=FaST-LMM`.",
+            "The embedded rMVP runner trims the FarmCPU `map` input to `SNP/CHROM/POS`; full map columns are kept only for output annotation.",
+            "`rmvp` pseudoQTN is the final `seqQTN` / covariate count parsed from the last loop; `janusx` pseudoQTN is the workflow-reported JanusX count.",
         ]
     )
     mat_head_cnt = "| kernel | " + " | ".join(kernel_order) + " |"
@@ -1509,11 +1492,11 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     p = CliArgumentParser(
         prog="jx benchmark",
         formatter_class=cli_help_formatter(),
-        description="Benchmark FarmCPU kernels: JanusX / GAPIT / rMVP.",
+        description="Benchmark FarmCPU kernels: JanusX -farmcpu-raw / explicit rMVP::MVP.FarmCPU.",
         epilog=minimal_help_epilog(
             [
                 "jx benchmark -bfile example_prefix -p pheno.tsv -n 0",
-                "jx benchmark -vcf example.vcf.gz -p pheno.tsv -n 0 --kernels janusx,gapit,rmvp",
+                "jx benchmark -vcf example.vcf.gz -p pheno.tsv -n 0 --kernels janusx,rmvp",
                 "jx benchmark -h -dev",
             ]
         ),
@@ -1558,13 +1541,19 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     optional_group.add_argument("-prefix", "--prefix", default="benchmark", type=str, help="Output prefix.")
     optional_group.add_argument("-maf", "--maf", default=0.02, type=float, help="MAF filter (default: %(default)s).")
     optional_group.add_argument("-geno", "--geno", default=0.05, type=float, help="Missing-rate filter (default: %(default)s).")
-    optional_group.add_argument("-chunksize", "--chunksize", default=10_000, type=int, help="JanusX chunk size.")
+    optional_group.add_argument(
+        "-chunksize",
+        "--chunksize",
+        default=10_000,
+        type=int,
+        help="Auxiliary chunk size for preprocessing / rMVP cache build (default: %(default)s).",
+    )
     optional_group.add_argument("-t", "--thread", default=detect_effective_threads(), type=int, help="Threads.")
     optional_group.add_argument("-q", "--qcov", default=0, type=int, help="JanusX qcov (PC count).")
     optional_group.add_argument("-c", "--cov", action="append", default=None, help="Additional covariates (JanusX only).")
     optional_group.add_argument("-snps-only", "--snps-only", action="store_true", default=False, help="Use SNPs only.")
     optional_group.add_argument("-mmap-limit", "--mmap-limit", action="store_true", default=False, help="Enable JanusX mmap-limit.")
-    optional_group.add_argument("--kernels", default="janusx,gapit,rmvp", type=str, help="Comma list: janusx,gapit,rmvp.")
+    optional_group.add_argument("--kernels", default="janusx,rmvp", type=str, help="Comma list: janusx,rmvp.")
     optional_group.add_argument("--topk", default=100, type=int, help="Top-k SNP output size (default: %(default)s).")
     optional_group.add_argument(
         "--check",
@@ -1608,30 +1597,6 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         help=("FarmCPU threshold (QTN/p threshold/output)." if show_dev_help else argparse.SUPPRESS),
     )
     advanced_group.add_argument(
-        "--farmcpu-threshold-mode",
-        default="auto",
-        choices=["auto", "fixed", "per_marker"],
-        type=str,
-        help=(
-            "Threshold mode for GAPIT/rMVP launcher. "
-            "'fixed' uses --farmcpu-threshold; 'per_marker' uses threshold/m; "
-            "'auto' = per_marker in manuscript mode, fixed in legacy mode."
-            if show_dev_help
-            else argparse.SUPPRESS
-        ),
-    )
-    advanced_group.add_argument(
-        "--align-mode",
-        default="manuscript",
-        choices=["manuscript", "legacy"],
-        type=str,
-        help=(
-            "Benchmark alignment preset. manuscript: threshold mode per_marker. legacy: threshold mode fixed."
-            if show_dev_help
-            else argparse.SUPPRESS
-        ),
-    )
-    advanced_group.add_argument(
         "--force-pseudo-qtn-cap",
         default=None,
         type=int,
@@ -1652,7 +1617,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         action="store_true",
         default=False,
         help=(
-            "Reuse existing rMVP preprocessing cache (default: rebuild each run for consistency)."
+            "Reuse existing rMVP preprocessing cache under the benchmark workdir (default: rebuild each run for consistency)."
             if show_dev_help
             else argparse.SUPPRESS
         ),
@@ -1707,7 +1672,7 @@ def main() -> None:
 
     kernels = _parse_kernels(args.kernels)
     if len(kernels) == 0:
-        raise ValueError("No valid kernels selected. Use --kernels janusx,gapit,rmvp")
+        raise ValueError("No valid kernels selected. Use --kernels janusx,rmvp")
 
     if args.check:
         checks = _collect_env_checks(args, kernels)
@@ -1743,7 +1708,7 @@ def main() -> None:
     conv_elapsed = 0.0
     conv_rss = math.nan
 
-    needs_r = any(k in {"gapit", "rmvp"} for k in kernels)
+    needs_r = "rmvp" in kernels
     if needs_r:
         conv_log = bench_dir / "logs" / "convert_to_bfile.log"
         conv_time = bench_dir / "logs" / "convert_to_bfile.time"
@@ -1764,12 +1729,6 @@ def main() -> None:
     else:
         n_for_grid = max(2, int(ph.shape[0]))
 
-    n_snps_for_threshold = 0
-    if bfile_for_r:
-        n_snps_for_threshold = _count_bim_snps(bfile_for_r)
-    elif args.bfile:
-        n_snps_for_threshold = _count_bim_snps(gfile)
-
     bin_size = _parse_number_list(args.farmcpu_bin_size, cast=float)
     farm_bound, farm_bin_selection, farm_bin_size = _compute_farmcpu_grid(
         n_for_grid,
@@ -1785,11 +1744,11 @@ def main() -> None:
         if len(farm_bin_selection) == 0:
             farm_bin_selection = [int(farm_bound)]
 
-    align_runtime = _resolve_align_runtime(args, n_snps_for_threshold=n_snps_for_threshold)
+    align_runtime = _resolve_align_runtime(args)
 
-    r_launcher = bench_dir / "tmp" / "farmcpu_r_launcher.R"
-    r_launcher.parent.mkdir(parents=True, exist_ok=True)
-    _build_r_launcher_script(r_launcher)
+    rmvp_runner = bench_dir / "tmp" / "rmvp_farmcpu_runner.R"
+    rmvp_runner.parent.mkdir(parents=True, exist_ok=True)
+    _build_rmvp_runner_script(rmvp_runner)
 
     rows: list[RunResult] = []
     for kernel in kernels:
@@ -1807,7 +1766,7 @@ def main() -> None:
             rr = _apply_pseudo_qtn_cap(rr, args.force_pseudo_qtn_cap)
             rows.append(rr)
             continue
-        if kernel in {"gapit", "rmvp"}:
+        if kernel == "rmvp":
             rr = _run_kernel_r(
                 args,
                 kernel=kernel,
@@ -1818,7 +1777,7 @@ def main() -> None:
                 farm_bin_selection=farm_bin_selection,
                 farm_bin_size=farm_bin_size,
                 align_runtime=align_runtime,
-                r_launcher=r_launcher,
+                rmvp_runner=rmvp_runner,
             )
             rr = _apply_pseudo_qtn_cap(rr, args.force_pseudo_qtn_cap)
             rows.append(rr)
@@ -1841,16 +1800,11 @@ def main() -> None:
         "farmcpu_bin_selection": [int(x) for x in farm_bin_selection],
         "farmcpu_iter": int(args.farmcpu_iter),
         "farmcpu_threshold": float(args.farmcpu_threshold),
-        "farmcpu_threshold_mode": str(align_runtime.threshold_mode),
-        "farmcpu_threshold_effective_r": float(align_runtime.farmcpu_threshold_effective),
-        "snps_for_threshold": int(align_runtime.snps_for_threshold),
-        "align_mode": str(align_runtime.mode),
-        "rmvp_engine": str(align_runtime.rmvp_engine),
+        "benchmark_mode": "direct_aligned_explicit_mvp_farmcpu",
         "rmvp_vc_method": str(align_runtime.rmvp_vc_method),
         "rmvp_reuse_cache": bool(args.rmvp_reuse_cache),
         "rmvp_force_rebuild": (not bool(args.rmvp_reuse_cache)),
         "rmvp_method_bin": str(align_runtime.rmvp_method_bin),
-        "gapit_method_bin": str(align_runtime.gapit_method_bin),
         "force_pseudo_qtn_cap": (None if args.force_pseudo_qtn_cap is None else int(args.force_pseudo_qtn_cap)),
         "conversion_elapsed_sec": float(conv_elapsed),
         "conversion_peak_rss_kb": float(conv_rss),
@@ -1860,8 +1814,8 @@ def main() -> None:
 
     if not args.keep_temp:
         try:
-            if r_launcher.exists():
-                r_launcher.unlink()
+            if rmvp_runner.exists():
+                rmvp_runner.unlink()
         except Exception:
             pass
 

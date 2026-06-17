@@ -31,6 +31,8 @@ mod gstats;
 mod gwas_unified;
 #[path = "stats/he.rs"]
 mod he;
+#[path = "stats/heritability.rs"]
+mod heritability;
 #[path = "stats/ld.rs"]
 mod ld;
 #[path = "stats/lmm.rs"]
@@ -136,8 +138,7 @@ use admixture::{
 };
 use algwas::algwas_packed_to_tsv;
 use assoc::{
-    farmcpu_dense, farmcpu_packed_to_tsv, farmcpu_rem_dense, farmcpu_rem_packed,
-    farmcpu_super_dense, farmcpu_super_packed, farmcpu_write_assoc_tsv,
+    farmcpu_packed_to_tsv, farmcpu_rem_packed, farmcpu_super_packed, farmcpu_write_assoc_tsv,
 };
 use bayes::{
     bayesa, bayesa_packed, bayesa_packed_trace, bayesb, bayesb_packed, bayesb_packed_trace,
@@ -207,6 +208,10 @@ use gwas_unified::{
 };
 use gwasio::load_gwas_triplet_fast;
 use he::he_pcg_bed;
+use heritability::{
+    prepare_heritability_broad_sparse_cache, prepare_heritability_trait_workflow,
+    SparseOneHotBlupCache,
+};
 use kmer::{kmer_count_run_py, kmer_resolve_inputs_py, kmerge_run_py, kstats_run_py};
 use ld::{
     bed_ldblock_r2_rust, bed_packed_ld_prune_maf_priority, bed_prune_to_plink_rust,
@@ -302,6 +307,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_class::<SimTraitAccumulator>()?;
     m.add_class::<SiteInfo>()?;
     m.add_class::<FvLmmAssocCache>()?;
+    m.add_class::<SparseOneHotBlupCache>()?;
     m.add_class::<PyMergeStats>()?;
     m.add_class::<PyConvertStats>()?;
     m.add_function(wrap_pyfunction!(popcount_py, m)?)?;
@@ -402,6 +408,8 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(packed_malpha_f64, m)?)?;
     m.add_function(wrap_pyfunction!(packed_malpha_mode_f64, m)?)?;
     m.add_function(wrap_pyfunction!(he_pcg_bed, m)?)?;
+    m.add_function(wrap_pyfunction!(prepare_heritability_trait_workflow, m)?)?;
+    m.add_function(wrap_pyfunction!(prepare_heritability_broad_sparse_cache, m)?)?;
     m.add_function(wrap_pyfunction!(splmm_assoc_pcg_bed, m)?)?;
     m.add_function(wrap_pyfunction!(splmm_assoc_pcg_bed_to_tsv, m)?)?;
     m.add_function(wrap_pyfunction!(splmm_scan_grammar_packed, m)?)?;
@@ -447,12 +455,9 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(gstats_bed_ldscore, m)?)?;
     m.add_function(wrap_pyfunction!(packed_mtm_f64, m)?)?;
     m.add_function(wrap_pyfunction!(farmcpu_q_packed_grm_pca_f32, m)?)?;
-    m.add_function(wrap_pyfunction!(farmcpu_rem_dense, m)?)?;
     m.add_function(wrap_pyfunction!(farmcpu_rem_packed, m)?)?;
-    m.add_function(wrap_pyfunction!(farmcpu_super_dense, m)?)?;
     m.add_function(wrap_pyfunction!(farmcpu_super_packed, m)?)?;
     m.add_function(wrap_pyfunction!(farmcpu_packed_to_tsv, m)?)?;
-    m.add_function(wrap_pyfunction!(farmcpu_dense, m)?)?;
     m.add_function(wrap_pyfunction!(gwas_packed_unified_to_tsv, m)?)?;
     m.add_function(wrap_pyfunction!(gwas_trait_model_dispatch_v2, m)?)?;
     m.add_function(wrap_pyfunction!(gwas_trait_model_schedule, m)?)?;

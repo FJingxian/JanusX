@@ -1055,6 +1055,70 @@ impl SparseJxgrmCholeskyAnalysis {
         self.factorize_diag_shifted(lambda)
     }
 
+    pub fn factorize_scaled_plus_diag(
+        &self,
+        scale: f64,
+        diag: &[f64],
+    ) -> Result<SparseJxgrmCholesky, String> {
+        if !scale.is_finite() || scale < 0.0 {
+            return Err(format!(
+                "Sparse Cholesky scaled factorization requires finite non-negative scale, got {scale}"
+            ));
+        }
+        if diag.len() != self.n {
+            return Err(format!(
+                "Sparse Cholesky scaled factorization diagonal length mismatch: got {}, expected {}",
+                diag.len(),
+                self.n
+            ));
+        }
+        if diag.iter().any(|v| !v.is_finite() || *v < 0.0) {
+            return Err(
+                "Sparse Cholesky scaled factorization requires finite non-negative diagonal entries"
+                    .to_string(),
+            );
+        }
+        let prep_t0 = Instant::now();
+        let mut perm_values = self.base_perm_values.clone();
+        if scale != 1.0 {
+            for value in perm_values.iter_mut() {
+                *value *= scale;
+            }
+        }
+        for (perm_col, &idx) in self.diag_positions.iter().enumerate() {
+            let orig_col = self
+                .perm
+                .get(perm_col)
+                .copied()
+                .ok_or_else(|| format!("Sparse Cholesky permutation index out of bounds: {perm_col}"))?;
+            perm_values[idx] += diag[orig_col];
+        }
+        let prep_secs = prep_t0.elapsed().as_secs_f64();
+        let parallelism = Parallelism::None;
+        let parallelism_desc = match &parallelism {
+            Parallelism::None => "none".to_string(),
+            Parallelism::Rayon(n_threads) => format!("rayon({n_threads})"),
+        };
+        let (factor, timing) =
+            self.factorize_from_perm_values_with_parallelism_timed(&perm_values, parallelism)?;
+        if sparse_factor_timing_enabled() {
+            emit_sparse_factor_timing(
+                "scaled_plus_diag",
+                prep_secs,
+                timing.numeric_secs,
+                timing.logdet_secs,
+                0.0,
+                prep_secs + timing.total_secs,
+                self.n,
+                self.base_perm_values.len(),
+                factor.factor_nnz(),
+                self.diag_positions.len(),
+                &parallelism_desc,
+            );
+        }
+        Ok(factor)
+    }
+
     /// Like factorize_k_plus_lambda_i but writes into `buf` instead of cloning
     /// base_perm_values internally.  Caller must ensure `buf.len() ==
     /// self.base_perm_values.len()`.

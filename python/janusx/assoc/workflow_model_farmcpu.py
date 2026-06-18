@@ -596,6 +596,25 @@ def run_farmcpu_fullmem(
     qdim = args.qcov
     cov = args.cov
     snps_only = bool(getattr(args, "snps_only", False))
+    farm_raw_requested = bool(getattr(args, "farmcpu_raw", False))
+    effective_qtn_preloaded_packed = (
+        qtn_preloaded_packed if isinstance(qtn_preloaded_packed, dict) else None
+    )
+
+    def _borrow_main_packed_qtn_payload(
+        *,
+        packed_prefix: str,
+        famid_arr: np.ndarray,
+        packed_ctx_obj: dict[str, object],
+    ) -> dict[str, object]:
+        # Reuse the already-loaded main packed payload for stage2 QTN decoding so
+        # `-farmcpu` does not allocate a second packed genotype copy when no
+        # external QTN input is supplied.
+        return {
+            "prefix": str(packed_prefix),
+            "full_ids": np.asarray(famid_arr, dtype=str),
+            "packed_ctx": packed_ctx_obj,
+        }
 
     if (
         farmcpu_cache is None
@@ -627,6 +646,7 @@ def run_farmcpu_fullmem(
             ),
             "qmatrix": np.asarray(qmatrix_preloaded, dtype="float32"),
             "packed_sample_idx": qtn_sample_idx,
+            "_qtn_preloaded_packed": qtn_preloaded_packed,
             "_qtn_stage_mode": True,
         }
 
@@ -984,6 +1004,20 @@ def run_farmcpu_fullmem(
             ),
             use_spinner=bool(use_spinner),
         )
+        stage2_qtn_payload = effective_qtn_preloaded_packed
+        if (
+            stage2_qtn_payload is None
+            and farm_raw_requested
+            and packed_ctx is not None
+            and packed_prefix is not None
+        ):
+            stage2_qtn_payload = _borrow_main_packed_qtn_payload(
+                packed_prefix=str(packed_prefix),
+                famid_arr=famid,
+                packed_ctx_obj=packed_ctx,
+            )
+        effective_qtn_preloaded_packed = stage2_qtn_payload
+
         farmcpu_cache = {
             "pheno": pheno,
             "famid": famid,
@@ -992,6 +1026,9 @@ def run_farmcpu_fullmem(
             "ref_alt": ref_alt,
             "qmatrix": qmatrix,
         }
+        if stage2_qtn_payload is not None:
+            farmcpu_cache["_qtn_preloaded_packed"] = stage2_qtn_payload
+            farmcpu_cache["_qtn_stage_mode"] = True
     else:
         pheno = farmcpu_cache["pheno"]  # type: ignore[assignment]
         famid = np.asarray(farmcpu_cache["famid"], dtype=str)
@@ -1005,6 +1042,27 @@ def run_farmcpu_fullmem(
         packed_ctx = None
         if isinstance(packed_obj, dict):
             packed_ctx = _normalize_packed_ctx_for_farmcpu_cache(packed_obj)
+        stage2_qtn_payload_obj = farmcpu_cache.get("_qtn_preloaded_packed")
+        if effective_qtn_preloaded_packed is None and isinstance(stage2_qtn_payload_obj, dict):
+            effective_qtn_preloaded_packed = stage2_qtn_payload_obj
+        if (
+            effective_qtn_preloaded_packed is None
+            and farm_raw_requested
+            and isinstance(packed_obj, dict)
+        ):
+            effective_qtn_preloaded_packed = _borrow_main_packed_qtn_payload(
+                packed_prefix=str(packed_obj.get("source_prefix", gfile) or gfile),
+                famid_arr=famid,
+                packed_ctx_obj=packed_obj,
+            )
+            farmcpu_cache["_qtn_preloaded_packed"] = effective_qtn_preloaded_packed
+            farmcpu_cache["_qtn_stage_mode"] = True
+        elif (
+            effective_qtn_preloaded_packed is not None
+            and not bool(farmcpu_cache.get("_qtn_stage_mode", False))
+        ):
+            farmcpu_cache["_qtn_preloaded_packed"] = effective_qtn_preloaded_packed
+            farmcpu_cache["_qtn_stage_mode"] = True
         packed_sample_idx_obj = farmcpu_cache.get("packed_sample_idx")
         packed_sample_idx: Union[np.ndarray, None]
         if packed_sample_idx_obj is None:
@@ -1125,6 +1183,8 @@ def run_farmcpu_fullmem(
         pseudo_tsv_hint = os.path.join(outfolder, f"{prefix}.{phename_tag}.farmcpu.qtn")
         n_pseudo_qtn = 0
         pseudo_tsv: Union[str, None] = None
+        stage1_secs = 0.0
+        stage2_secs = 0.0
 
         use_rust_controller = (
             packed_ctx is not None
@@ -1149,6 +1209,7 @@ def run_farmcpu_fullmem(
             if not isinstance(packed_payload, dict):
                 raise ValueError("Internal error: expected packed payload for Rust FarmCPU controller.")
             rust_qtn_written = 0
+            stage1_t0 = time.monotonic()
             try:
                 packed_arr = packed_payload["packed"]
                 row_flip_arr = packed_payload["row_flip"]
@@ -1310,17 +1371,26 @@ def run_farmcpu_fullmem(
                 farm_pbar.finish()
             finally:
                 farm_pbar.close(show_done=False)
+            stage1_secs = max(time.monotonic() - stage1_t0, 0.0)
             n_pseudo_qtn = int(max(0, n_pseudo_qtn))
             if int(rust_qtn_written) > 0 and os.path.exists(pseudo_tsv_hint):
                 pseudo_tsv = pseudo_tsv_hint
             if bool(farmcpu_cache.get("_qtn_stage_mode", False)):
+                if not isinstance(effective_qtn_preloaded_packed, dict):
+                    raise ValueError("FarmCPU QTN stage2 payload is missing.")
                 main_prefix = _as_plink_prefix(gfile)
                 if main_prefix is None:
                     raise ValueError("FarmCPU QTN stage2 requires main genotype PLINK BED prefix.")
                 from janusx.assoc.workflow_model_packed import run_qtn_segmented_lm_stage2
 
                 stage2_done = {"value": 0}
-                stage2_pbar = None
+                stage2_total_hint = int(max(1, int(n_snps_preloaded or eff_snp or 1)))
+                stage2_pbar = _ProgressAdapter(
+                    total=stage2_total_hint,
+                    desc="FarmCPU stage2",
+                    force_animate=bool(use_spinner),
+                    logger=logger,
+                )
 
                 def _farmcpu_stage2_progress(done: int, total: int) -> None:
                     nonlocal peak_rss, stage2_pbar
@@ -1329,13 +1399,6 @@ def run_farmcpu_fullmem(
                         t = int(total)
                     except Exception:
                         return
-                    if stage2_pbar is None:
-                        stage2_pbar = _ProgressAdapter(
-                            total=max(1, int(t if t > 0 else (n_snps_preloaded or eff_snp))),
-                            desc="FarmCPU stage2",
-                            force_animate=bool(use_spinner),
-                            logger=logger,
-                        )
                     if t > 0 and int(stage2_pbar.total) != t and int(stage2_done["value"]) == 0:
                         stage2_pbar.set_total(int(max(1, t)))
                     target = int(max(0, min(int(stage2_pbar.total), d)))
@@ -1349,12 +1412,13 @@ def run_farmcpu_fullmem(
                         pass
 
                 try:
+                    stage2_t0 = time.monotonic()
                     kept_rows2, scan_rows2, qtn_used = run_qtn_segmented_lm_stage2(
                         main_prefix=str(main_prefix),
                         y_vec=np.ascontiguousarray(p_sub, dtype=np.float64).reshape(-1),
                         trait_ids=trait_ids,
                         base_cov=np.ascontiguousarray(q_sub, dtype=np.float64),
-                        qtn_preloaded_packed=qtn_preloaded_packed,  # type: ignore[arg-type]
+                        qtn_preloaded_packed=effective_qtn_preloaded_packed,
                         qtn_tsv=str(pseudo_tsv_hint),
                         tmp_tsv=str(tmp_tsv),
                         maf_threshold=float(args.maf),
@@ -1365,18 +1429,21 @@ def run_farmcpu_fullmem(
                         threads=int(args.thread),
                         progress_callback=_farmcpu_stage2_progress,
                         args_obj=args,
+                        logger=logger,
+                        use_spinner=False,
+                        status_prefix="FarmCPU stage2",
                     )
+                    stage2_secs = max(time.monotonic() - stage2_t0, 0.0)
                     eff_snp = int(kept_rows2)
                     n_pseudo_qtn = int(max(n_pseudo_qtn, qtn_used))
                 finally:
-                    if stage2_pbar is not None:
-                        try:
-                            if int(stage2_done["value"]) < int(stage2_pbar.total):
-                                stage2_pbar.update(int(stage2_pbar.total) - int(stage2_done["value"]))
-                            stage2_pbar.finish()
-                        except Exception:
-                            pass
-                        stage2_pbar.close(show_done=False)
+                    try:
+                        if int(stage2_done["value"]) < int(stage2_pbar.total):
+                            stage2_pbar.update(int(stage2_pbar.total) - int(stage2_done["value"]))
+                        stage2_pbar.finish()
+                    except Exception:
+                        pass
+                    stage2_pbar.close(show_done=False)
         else:
             farm_pbar.close(show_done=False)
             raise RuntimeError(
@@ -1392,7 +1459,9 @@ def run_farmcpu_fullmem(
 
         _finalize_gwas_result_tsv(tmp_tsv, out_tsv, name_source, logger=logger)
 
-        gwas_secs = max(time.time() - gwas_t0, 0.0)
+        gwas_secs = max(stage1_secs + stage2_secs, 0.0)
+        if gwas_secs <= 0.0:
+            gwas_secs = max(time.time() - gwas_t0, 0.0)
         peak_rss = max(peak_rss, process.memory_info().rss)
         cpu_t1 = process.cpu_times()
         wall = max(time.time() - t0, 1e-9)
@@ -1419,6 +1488,8 @@ def run_farmcpu_fullmem(
                 "pve": None,
                 "avg_cpu": float(avg_cpu),
                 "peak_rss_gb": float(peak_rss_gb),
+                "stage1_time_s": float(stage1_secs),
+                "stage2_time_s": float(stage2_secs),
                 "gwas_time_s": float(gwas_secs),
                 "viz_time_s": float(viz_secs),
                 "result_file": str(out_tsv),
@@ -1428,7 +1499,7 @@ def run_farmcpu_fullmem(
         if pseudo_tsv is not None and os.path.exists(pseudo_tsv):
             saved_paths.append(str(pseudo_tsv))
 
-        farm_times = [format_elapsed(gwas_secs)]
+        farm_times = [format_elapsed(stage1_secs), format_elapsed(stage2_secs)]
         if args.plot:
             farm_times.append(format_elapsed(viz_secs))
         farm_done_msg = f"FarmCPU ...Found {n_pseudo_qtn} QTNs [{'/'.join(farm_times)}]"

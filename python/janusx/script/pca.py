@@ -99,16 +99,20 @@ from ._common.threads import detect_effective_threads
 # Helpers: GRM-based PCA (aligned with GWAS module)
 # ======================================================================
 
-DEFAULT_BED_MEMORY_MB = 512.0
+DEFAULT_BED_MEMORY_GB = 1.0
 
 
-def _normalize_memory_mb(memory_mb: Union[int, float, None]) -> float:
-    if memory_mb is None:
-        return float(DEFAULT_BED_MEMORY_MB)
-    mb = float(memory_mb)
-    if (not np.isfinite(mb)) or mb <= 0.0:
-        raise ValueError(f"--memory must be a finite value > 0, got {memory_mb}")
-    return float(mb)
+def _normalize_memory_gb(memory_gb: Union[int, float, None]) -> float:
+    if memory_gb is None:
+        return float(DEFAULT_BED_MEMORY_GB)
+    gb = float(memory_gb)
+    if (not np.isfinite(gb)) or gb <= 0.0:
+        raise ValueError(f"--memory must be a finite value > 0 GB, got {memory_gb}")
+    return float(gb)
+
+
+def _memory_gb_to_mb(memory_gb: Union[int, float, None]) -> float:
+    return float(_normalize_memory_gb(memory_gb) * 1024.0)
 
 
 @contextmanager
@@ -535,7 +539,7 @@ def build_grm_streaming_for_pca(
     genofile: str,
     maf_threshold: float = 0.02,
     max_missing_rate: float = 0.05,
-    memory_mb: float = DEFAULT_BED_MEMORY_MB,
+    memory_mb: float = DEFAULT_BED_MEMORY_GB * 1024.0,
     inspected_meta: Optional[tuple[list[str], int]] = None,
     logger=None,
     emit_progress_done: bool = True,
@@ -869,11 +873,15 @@ def main(log: bool = True):
              "(default: %(default)s).",
     )
     optional_group.add_argument(
-        "-memory", "--memory", type=float, default=DEFAULT_BED_MEMORY_MB,
+        "-mem", "--memory", type=float, default=DEFAULT_BED_MEMORY_GB,
         help=(
-            "Target decode working-set size in MB for BED memmap/packed kernels "
+            "Target BED decode block size in GB for memmap/packed kernels. "
+            "This only controls per-block decode/window sizing, not global process memory "
             "(default: %(default)s)."
         ),
+    )
+    optional_group.add_argument(
+        "-memory", dest="memory", type=float, help=argparse.SUPPRESS
     )
     optional_group.add_argument(
         "-plot", "--plot", action="store_true", default=False,
@@ -992,7 +1000,8 @@ def main(log: bool = True):
     args.out = os.path.normpath(args.out if args.out is not None else ".")
     outprefix = os.path.join(args.out, args.prefix)
     genotype_input_mode = bool(args.vcf or args.hmp or args.file or args.bfile)
-    args.memory = _normalize_memory_mb(args.memory)
+    args.memory = _normalize_memory_gb(args.memory)
+    memory_mb = _memory_gb_to_mb(args.memory)
 
     # Keep index for logging and validate after logger is ready
     palette_idx = int(args.color)
@@ -1035,7 +1044,7 @@ def main(log: bool = True):
                     ("Output PCs", f"top {args.dim}"),
                     ("MAF threshold", args.maf),
                     ("Missing rate", args.geno),
-                    ("Memory MB", args.memory),
+                    ("Decode block GB", args.memory),
                     ("BED backend", "memmap (default)"),
                     ("RSVD mode", args.rsvd),
                 ]
@@ -1174,7 +1183,7 @@ def main(log: bool = True):
                             genofile=rsvd_input,
                             maf_threshold=args.maf,
                             max_missing_rate=args.geno,
-                            memory_mb=float(args.memory),
+                            memory_mb=memory_mb,
                             inspected_meta=(meta_sample_ids, meta_n_snps),
                             logger=None,
                             emit_progress_done=False,
@@ -1235,11 +1244,11 @@ def main(log: bool = True):
                     rsvd_input,
                     len(samples),
                     int(algo_snp),
-                    float(args.memory),
+                    memory_mb,
                 )
 
                 def _run_rsvd_only():
-                    with _bed_block_target_env(float(args.memory)):
+                    with _bed_block_target_env(memory_mb):
                         return _run_rsvd_subprocess(
                             genotype_path=str(rsvd_input),
                             dim=int(args.dim),
@@ -1280,7 +1289,7 @@ def main(log: bool = True):
                         genofile=gfile,
                         maf_threshold=args.maf,
                         max_missing_rate=args.geno,
-                        memory_mb=float(args.memory),
+                        memory_mb=memory_mb,
                         inspected_meta=None,
                         logger=None,
                         emit_progress_done=False,

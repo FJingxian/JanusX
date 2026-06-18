@@ -124,7 +124,7 @@ from janusx.script._common.threads import (
     require_openblas_by_default,
 )
 
-DEFAULT_BED_MEMORY_MB = 512.0
+DEFAULT_BED_MEMORY_GB = 1.0
 from janusx.script._common.genocache import configure_genotype_cache_from_out
 from janusx.script._common.genoio import (
     basename_only as _basename_only,
@@ -348,16 +348,16 @@ def _format_gwas_models_executed(args) -> str:
         models.append("LMM")
     if bool(getattr(args, "lmm2", False)):
         models.append("LMM2")
-    if bool(args.fastlmm):
-        models.append("FastLMM")
     if bool(args.fvlmm):
         models.append("FvLMM")
+    if bool(args.fastlmm):
+        models.append("FastLMM")
     if bool(args.splmm):
         models.append("SparseLMM")
-    if bool(args.algwas):
-        models.append("ALGWAS")
     if bool(args.farmcpu):
         models.append("FarmCPU")
+    if bool(args.algwas):
+        models.append("ALGWAS")
     return ", ".join(models) if len(models) > 0 else "None"
 
 
@@ -990,11 +990,13 @@ def _gwas_model_sort_key(model_name: object) -> tuple[int, str]:
     order = {
         "LM": 0,
         "LMM": 1,
-        "FastLMM": 2,
+        "LMM2": 2,
+        "FvLMM": 3,
+        "FastLMM": 4,
         "SparseLMM": 4,
-        "ALGWAS": 5,
         "Farm": 5,
         "FarmCPU": 5,
+        "ALGWAS": 6,
     }
     return (order.get(model, 99), model.lower())
 
@@ -4102,13 +4104,17 @@ def _finalize_gwas_result_tsv(
     _replace_file_with_retry(str(tmp_tsv), str(out_tsv))
 
 
-def _normalize_bed_memory_mb(memory_mb: Union[int, float, None]) -> float:
-    if memory_mb is None:
-        return float(DEFAULT_BED_MEMORY_MB)
-    mb = float(memory_mb)
-    if (not np.isfinite(mb)) or mb <= 0.0:
-        raise ValueError(f"--memory must be a finite value > 0, got {memory_mb}")
-    return float(mb)
+def _normalize_bed_memory_gb(memory_gb: Union[int, float, None]) -> float:
+    if memory_gb is None:
+        return float(DEFAULT_BED_MEMORY_GB)
+    gb = float(memory_gb)
+    if (not np.isfinite(gb)) or gb <= 0.0:
+        raise ValueError(f"--memory must be a finite value > 0 GB, got {memory_gb}")
+    return float(gb)
+
+
+def _bed_memory_gb_to_mb(memory_gb: Union[int, float, None]) -> float:
+    return float(_normalize_bed_memory_gb(memory_gb) * 1024.0)
 
 
 def _resolve_bed_block_rows_from_memory(
@@ -4917,7 +4923,7 @@ def _run_file_dense_fast_once(
     )
 
     model_sequence = [m for m in stream_models if m in {"lm", "lmm", "lmm2", "fastlmm", "fvlmm"}]
-    gm_tag = str(args.model).lower()
+    gm_tag = "add"
     pheno_aligned, ids = _align_pheno_to_sample_order(pheno, ids)
     trait_iter = list(pheno_aligned.columns)
     multi_trait_mode = len(trait_iter) > 1
@@ -5402,6 +5408,10 @@ def parse_args(argv: Optional[list[str]] = None):
 
     models_group = parser.add_argument_group("Model Arguments")
     models_group.add_argument(
+        "-lm", "--lm", action="store_true", default=False,
+        help="Run the linear model (memmap, low-memory; default: %(default)s).",
+    )
+    models_group.add_argument(
         "-lmm", "--lmm", action="store_true", default=False,
         help="Run the linear mixed model (memmap, low-memory; default: %(default)s).",
     )
@@ -5419,10 +5429,6 @@ def parse_args(argv: Optional[list[str]] = None):
     models_group.add_argument(
         "-fvlmm", "--fvlmm", action="store_true", default=False,
         help="Run the fixed-variance LMM spectral scan using the null-model lambda for the whole GWAS (default: %(default)s).",
-    )
-    models_group.add_argument(
-        "-farmcpu", "--farmcpu", action="store_true", default=False,
-        help="Run FarmCPU (Rust packed-BED route; default: %(default)s).",
     )
     models_group.add_argument(
         "-splmm", "--splmm",
@@ -5452,16 +5458,22 @@ def parse_args(argv: Optional[list[str]] = None):
         ),
     )
     models_group.add_argument(
-        "-algwas", "--algwas", action="store_true", default=False,
+        "-farmcpu", "--farmcpu",
+        dest="farmcpu_raw",
+        action="store_true",
+        default=False,
+        help="Run FarmCPU (classic FEM/REM/SUPER route; default: %(default)s).",
+    )
+    models_group.add_argument(
+        "-frgwas", "--frgwas",
+        dest="farmcpu",
+        action="store_true",
+        default=False,
         help=argparse.SUPPRESS,
     )
     models_group.add_argument(
-        "-lm", "--lm", action="store_true", default=False,
-        help="Run the linear model (memmap, low-memory; default: %(default)s).",
-    )
-    models_group.add_argument(
-        "-model", "--model", type=str, choices=["add", "dom", "rec", "het"], default="add",
-        help="Genetic effect coding model for memmap LM/LMM/LMM2/FvLMM (default: %(default)s).",
+        "-algwas", "--algwas", action="store_true", default=False,
+        help=argparse.SUPPRESS,
     )
 
     optional_group = parser.add_argument_group("Optional Arguments")
@@ -5593,18 +5605,15 @@ def parse_args(argv: Optional[list[str]] = None):
         ),
     )
     optional_group.add_argument(
-        "-farmcpu-raw", "--farmcpu-raw", action="store_true", default=False,
+        "-mem", "--memory", type=float, default=DEFAULT_BED_MEMORY_GB,
         help=(
-            "Use the legacy FarmCPU REM/SUPER stage-1 selector instead of the default unified FEM/REM selector with staged r^2 merging."
-            if show_dev_help else argparse.SUPPRESS
+            "Target BED decode block size in GB for memmap/packed kernels. "
+            "This only controls per-block decode/window sizing, not global process memory "
+            "(default: %(default)s)."
         ),
     )
     optional_group.add_argument(
-        "-memory", "--memory", type=float, default=DEFAULT_BED_MEMORY_MB,
-        help=(
-            "Target decode working-set size in MB for BED memmap/packed kernels "
-            "(affects GRM, GWAS scan blocks, and RSVD; default: %(default)s)."
-        ),
+        "-memory", dest="memory", type=float, help=argparse.SUPPRESS
     )
     optional_group.add_argument(
         "-force-model", "--force-model", action="store_true", default=False,
@@ -5659,6 +5668,8 @@ def parse_args(argv: Optional[list[str]] = None):
         args.qcov = str(_parse_qcov_dim(args.qcov))
     except ValueError as e:
         parser.error(str(e))
+    if bool(getattr(args, "farmcpu", False)) and bool(getattr(args, "farmcpu_raw", False)):
+        parser.error("Only one of -farmcpu / -frgwas may be specified.")
     if bool(getattr(args, "farmcpu_raw", False)):
         args.farmcpu = True
     if int(args.farmcpu_iter) < 1:
@@ -5671,9 +5682,6 @@ def parse_args(argv: Optional[list[str]] = None):
         parser.error("--farmcpu-nbin must be >= 1.")
     if args.farmcpu_qtn_bound is not None and int(args.farmcpu_qtn_bound) < 1:
         parser.error("--farmcpu-qtn-bound must be >= 1.")
-    if bool(args.algwas) and str(args.model).strip().lower() != "add":
-        parser.error("--algwas currently supports additive coding only (--model add).")
-
     # Normalise SPLMM mode flags: exactly one of -splmm / -splmm-approx.
     _splmm_modes = [
         (args.splmm,        "exact"),   # -splmm → exact g'Pg denominator
@@ -5687,8 +5695,6 @@ def parse_args(argv: Optional[list[str]] = None):
     else:
         args._splmm_denom_mode = None
 
-    if bool(args.splmm) and str(args.model).strip().lower() != "add":
-        parser.error("--splmm currently supports additive coding only (--model add).")
     try:
         args.farmcpu_bin_size = _parse_float_csv(
             args.farmcpu_bin_size,
@@ -5696,11 +5702,13 @@ def parse_args(argv: Optional[list[str]] = None):
         )
     except ValueError as e:
         parser.error(str(e))
-    args.memory = _normalize_bed_memory_mb(getattr(args, "memory", DEFAULT_BED_MEMORY_MB))
-    args._memory_user_set = bool(_option_present(argv, "-memory", "--memory"))
+    args.memory = _normalize_bed_memory_gb(getattr(args, "memory", DEFAULT_BED_MEMORY_GB))
+    args._memory_mb = _bed_memory_gb_to_mb(args.memory)
+    args._memory_user_set = bool(_option_present(argv, "-mem", "--memory", "-memory"))
     args._chunksize_user_set = bool(args._memory_user_set)
     args.mmap_limit = False
     args.chunksize = 10_000
+    args.model = "add"
     return args
 
 
@@ -5812,7 +5820,6 @@ def _run_gwas_pipeline(
     if int(args.thread) > int(detected_threads):
         thread_capped = True
         args.thread = int(detected_threads)
-    args.model = args.model.lower()
     if not (0.0 <= args.het <= 0.5):
         raise ValueError("--het must be within [0, 0.5].")
 
@@ -5936,13 +5943,12 @@ def _run_gwas_pipeline(
             ("BED backend", bed_backend_policy),
             ("Packed auto route", packed_auto_mode),
             ("Models", _format_gwas_models_executed(args)),
-            ("Genetic model", args.model),
             ("SNPs only", args.snps_only),
             ("GRM option", args.grm),
             ("Q option", args.qcov),
             ("MAF threshold", args.maf),
             ("Miss threshold", args.geno),
-            ("Memory MB", args.memory),
+            ("Decode block GB", args.memory),
         ]
         if qtn_input_requested and (args.farmcpu or args.algwas):
             _qtn_kind, _qtn_path, _ = _qtn_source_from_args(args) or ("", "", None)
@@ -6032,10 +6038,9 @@ def _run_gwas_pipeline(
         report_logger.info(f"  {cmd_text}")
         advanced_config_rows: list[tuple[str, object]] = [
             ("BED Backend", bed_backend_policy),
-            ("Genetic Model", args.model),
             ("GRM Option", args.grm),
             ("Q Option", args.qcov),
-            ("Memory MB", float(args.memory)),
+            ("Decode block GB", float(args.memory)),
             ("SNPs Only", bool(args.snps_only)),
             ("Force Model", bool(args.force_model)),
         ]
@@ -6098,7 +6103,7 @@ def _run_gwas_pipeline(
         or args.farmcpu
     ):
         logger.error(
-            "No model selected. Use -lm, -lmm, -lmm2, -fvlmm, -splmm, -algwas, and/or -farmcpu."
+            "No model selected. Use -lm, -lmm, -lmm2, -fvlmm, -splmm, -farmcpu, and/or -algwas."
         )
         raise SystemExit(1)
     if args.fastlmm:
@@ -6109,11 +6114,6 @@ def _run_gwas_pipeline(
                 "Use `-fvlmm` for fixed-lambda scans or `-lmm`/`-lmm2` for exact LMM."
             ),
             use_spinner=bool(use_spinner),
-        )
-    if args.farmcpu and args.model != "add":
-        logger.warning(
-            "Warning: --model/--het currently apply to memmap LM/LMM/LMM2/FastLMM/FvLMM; "
-            "FarmCPU keeps additive coding."
         )
     maf_threshold_scan = float(args.maf)
     max_missing_rate_scan = float(args.geno)
@@ -6174,7 +6174,7 @@ def _run_gwas_pipeline(
         )
     if bool(args.farmcpu):
         _append_advanced_note("FarmCPU selected: enabling packed auto route.")
-    os.environ["JX_BED_BLOCK_TARGET_MB"] = f"{float(args.memory):.6g}"
+    os.environ["JX_BED_BLOCK_TARGET_MB"] = f"{float(args._memory_mb):.6g}"
     try:
 
         # --- prepare streaming context once if needed ---
@@ -6375,7 +6375,7 @@ def _run_gwas_pipeline(
                     max_missing_rate=max_missing_rate_scan,
                     genetic_model=args.model,
                     het_threshold=het_threshold_scan,
-                    memory_mb=float(args.memory),
+                    memory_mb=float(args._memory_mb),
                     mgrm=args.grm,
                     pcdim=args.qcov,
                     cov_inputs=args.cov,
@@ -6392,7 +6392,7 @@ def _run_gwas_pipeline(
                 )
                 farmcpu_genofile = str(genofile_stream)
                 args.chunksize = _resolve_bed_block_rows_from_memory(
-                    float(args.memory),
+                    float(args._memory_mb),
                     int(len(ids)),
                     int(n_snps),
                     streaming=True,

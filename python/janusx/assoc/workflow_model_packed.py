@@ -1214,10 +1214,12 @@ def run_qtn_segmented_lm_stage2(
     if not has_compact and not hasattr(jxrs, "lm_stream_bed_segments_to_tsv"):
         raise RuntimeError("Rust extension missing stage2 LM streaming functions; rebuild JanusX.")
     stage_status_enabled = status_prefix is not None
+    stage_label = str(status_prefix).strip() if status_prefix else "QTN stage2"
     status_tasks: dict[str, CliStatus] = {}
+    terminal_status_enabled = bool(stage_status_enabled and use_spinner)
 
     def _status_begin(desc: str) -> Optional[CliStatus]:
-        if not stage_status_enabled:
+        if not terminal_status_enabled:
             return None
         task = CliStatus(f"{desc} ...", enabled=bool(use_spinner))
         task.__enter__()
@@ -1234,6 +1236,10 @@ def run_qtn_segmented_lm_stage2(
             task.fail(message)
         if logger is not None:
             _log_file_only(logger, logging.ERROR, message)
+
+    def _log_stage2_summary(message: str) -> None:
+        if logger is not None:
+            _log_file_only(logger, logging.INFO, f"{stage_label} summary: {message}")
 
     qtn_desc = f"Preparing {status_prefix} QTN covariates" if status_prefix else ""
     qtn_task = _status_begin(qtn_desc)
@@ -1267,6 +1273,9 @@ def run_qtn_segmented_lm_stage2(
         for w in windows:
             qpos = sorted(set(int(x) for x in list(w.get("qtn_positions", []))))
             context_exclude_qtn.append(qpos)
+        base_context_count = 1
+        exclude_qtn_context_count = int(max(0, len(context_exclude_qtn) - base_context_count))
+        total_context_count = int(base_context_count + exclude_qtn_context_count)
         _status_complete(
             qtn_task,
             f"{qtn_desc} ...Finished (n={int(qtn_cov.shape[0])}, nQTN={int(qtn_cov.shape[1])}, windows={len(windows)})",
@@ -1297,8 +1306,12 @@ def run_qtn_segmented_lm_stage2(
                 (str(w["chrom"]), int(w["start"]), int(w["end"]), int(idx) + 1)
                 for idx, w in enumerate(windows)
             ]
+            segment_count = int(len(source_windows))
             progress_denominator = int(max(1, n_snps_total))
-            index_done = f"{index_desc} ...Finished (total={int(n_snps_total)}, windows={len(source_windows)}, mode=source-window)"
+            index_done = (
+                f"{index_desc} ...Finished (total={int(n_snps_total)}, "
+                f"windows={len(source_windows)}, segments={segment_count}, mode=source-window)"
+            )
         else:
             scan_meta_mmap_window_mb = int(max(1, _current_bed_memory_mb()))
             meta = _splmm_bed_logic_meta_selected(
@@ -1317,10 +1330,12 @@ def run_qtn_segmented_lm_stage2(
                 windows=windows,
             )
             source_windows = None
+            segment_count = int(len(segments))
             progress_denominator = int(max(1, active_row_idx.shape[0]))
             index_done = (
                 f"{index_desc} ...Finished (active={int(active_row_idx.shape[0])}, "
-                f"total={int(meta.get('n_snps_total', 0))}, segments={len(segments)})"
+                f"total={int(meta.get('n_snps_total', 0))}, windows={len(windows)}, "
+                f"segments={segment_count}, mode=legacy-segment)"
             )
         _status_complete(
             index_task,
@@ -1408,6 +1423,13 @@ def run_qtn_segmented_lm_stage2(
             progress_every=progress_every,
             mmap_window_mb=mmap_window_arg,
         )
+    _log_stage2_summary(
+        "windows="
+        f"{len(windows)}, segments={segment_count}, qtn_used={int(qtn_cov.shape[1])}, kept_rows={int(kept_rows)}, "
+        f"scan_rows={int(scan_rows)}, base_contexts={base_context_count}, "
+        f"exclude_qtn_contexts={exclude_qtn_context_count}, total_contexts={total_context_count}, "
+        f"mode={'compact-source-window' if has_compact else 'legacy-segment'}"
+    )
     return int(kept_rows), int(scan_rows), int(qtn_cov.shape[1])
 
 
@@ -2873,7 +2895,7 @@ def run_lm_packed_fullrank(
         )
     if str(genetic_model).lower() != "add":
         raise ValueError(
-            "LM full-rust packed route currently supports additive coding only (--model add)."
+            "LM full-rust packed route supports additive coding only."
         )
 
     prefix, full_ids, packed_ctx, sites_all = _prepare_packed_bed_once_for_gwas(
@@ -3181,7 +3203,9 @@ def run_lm_packed_fullrank(
             if not gwas_ok:
                 _cleanup_gwas_result_tmp(tmp_tsv)
 
-        gwas_secs = max(time.monotonic() - gwas_t0, 0.0)
+        gwas_secs = max(stage1_secs + stage2_secs, 0.0)
+        if gwas_secs <= 0.0:
+            gwas_secs = max(time.monotonic() - gwas_t0, 0.0)
         _finalize_gwas_result_tsv(tmp_tsv, out_tsv, prefix, logger=logger)
         saved_paths.append(str(out_tsv))
         viz_secs = 0.0
@@ -3214,13 +3238,15 @@ def run_lm_packed_fullrank(
                 "pve": None,
                 "avg_cpu": float(avg_cpu),
                 "peak_rss_gb": float(peak_rss_gb),
+                "stage1_time_s": float(stage1_secs),
+                "stage2_time_s": float(stage2_secs),
                 "gwas_time_s": float(gwas_secs),
                 "viz_time_s": float(viz_secs),
                 "result_file": str(out_tsv),
             }
         )
 
-        done_times = [format_elapsed(gwas_secs)]
+        done_times = [format_elapsed(stage1_secs), format_elapsed(stage2_secs)]
         if plot:
             done_times.append(format_elapsed(viz_secs))
         _rich_success(
@@ -3632,7 +3658,7 @@ def run_lmm_packed_fullrank(
         )
     if str(genetic_model).lower() != "add":
         raise ValueError(
-            "LMM full-rust packed route currently supports additive coding only (--model add)."
+            "LMM full-rust packed route supports additive coding only."
         )
     if grm is None:
         raise ValueError("LMM full-rust packed route requires a prepared GRM.")
@@ -3976,7 +4002,9 @@ def run_lmm_packed_fullrank(
             if not gwas_ok:
                 _cleanup_gwas_result_tmp(tmp_tsv)
 
-        gwas_secs = max(time.monotonic() - gwas_t0, 0.0)
+        gwas_secs = max(stage1_secs + stage2_secs, 0.0)
+        if gwas_secs <= 0.0:
+            gwas_secs = max(time.monotonic() - gwas_t0, 0.0)
         _finalize_gwas_result_tsv(tmp_tsv, out_tsv, prefix, logger=logger)
         saved_paths.append(str(out_tsv))
         viz_secs = 0.0
@@ -4084,7 +4112,7 @@ def run_algwas_packed_fullrank(
     qtn_preloaded_packed: Union[dict[str, object], None] = None,
 ) -> None:
     if str(genetic_model).lower() != "add":
-        raise ValueError("ALGWAS full-rust packed route currently supports additive coding only (--model add).")
+        raise ValueError("ALGWAS full-rust packed route supports additive coding only.")
     if not hasattr(jxrs, "algwas_packed_to_tsv") and not _gwas_use_rust_unified_v1():
         raise RuntimeError(
             "Rust extension missing ALGWAS packed GWAS symbols. "
@@ -4208,7 +4236,7 @@ def run_algwas_packed_fullrank(
         gwas_pbar: Optional[_ProgressAdapter] = None
 
         def _algwas_stage1_progress(done: int, total: int) -> None:
-            nonlocal stage1_last_done, stage1_pbar, stage1_spin_handle, peak_rss
+            nonlocal stage1_last_done, stage1_pbar, stage1_spin_handle, peak_rss, stage1_done_at
             try:
                 d = int(done)
                 t = int(total)
@@ -4253,6 +4281,8 @@ def run_algwas_packed_fullrank(
                 stage1_pbar.update(stepv)
                 stage1_last_done = d
             if stage1_pbar is not None and t > 0 and d >= t:
+                if stage1_done_at is None:
+                    stage1_done_at = time.monotonic()
                 stage1_pbar.finish()
                 stage1_pbar.close(show_done=False)
                 stage1_pbar = None
@@ -4262,12 +4292,14 @@ def run_algwas_packed_fullrank(
                 pass
 
         def _algwas_progress(done: int, total: int) -> None:
-            nonlocal gwas_last_done, gwas_total, gwas_pbar, peak_rss, stage1_pbar, stage1_spin_handle
+            nonlocal gwas_last_done, gwas_total, gwas_pbar, peak_rss, stage1_pbar, stage1_spin_handle, stage1_done_at
             try:
                 d = int(done)
                 t = int(total)
             except Exception:
                 return
+            if stage1_done_at is None:
+                stage1_done_at = time.monotonic()
             if stage1_spin_handle is not None:
                 try:
                     _stop_indeterminate_progress_bar(stage1_spin_handle)
@@ -4308,9 +4340,14 @@ def run_algwas_packed_fullrank(
         stage2_eff_snp: Optional[int] = None
         gwas_ok = False
         gwas_t0 = time.monotonic()
+        stage1_secs = 0.0
+        stage2_secs = 0.0
+        stage_clock_t0 = gwas_t0
+        stage1_done_at: Optional[float] = None
         try:
             with _gwas_scan_stage_ctx(max(1, int(threads))):
                 unified_done = False
+                stage1_kernel_t0 = time.monotonic()
                 if _gwas_use_rust_unified_v1():
                     try:
                         jobs = [
@@ -4397,7 +4434,13 @@ def run_algwas_packed_fullrank(
                         row_indices=packed_row_idx,
                         bed_prefix=str(prefix),
                     )
+                stage1_kernel_elapsed = max(time.monotonic() - stage1_kernel_t0, 0.0)
+                stage1_kernel_end = stage1_kernel_t0 + stage1_kernel_elapsed
+                if stage1_done_at is None:
+                    stage1_done_at = stage1_kernel_end
+                stage1_secs = max(min(stage1_done_at, stage1_kernel_end) - stage_clock_t0, 0.0)
                 if qtn_stage_mode:
+                    stage2_t0 = time.monotonic()
                     kept_rows2, scan_rows2, qtn_used = run_qtn_segmented_lm_stage2(
                         main_prefix=str(main_prefix),
                         y_vec=y_vec,
@@ -4414,10 +4457,16 @@ def run_algwas_packed_fullrank(
                         threads=int(threads),
                         progress_callback=_algwas_progress,
                         args_obj=type("_AlgwasQtnArgs", (), {"farmcpu_bin_size": [5e5, 5e6, 5e7]})(),
+                        logger=logger,
+                        use_spinner=False,
+                        status_prefix="ALGWAS stage2",
                     )
+                    stage2_secs = max(time.monotonic() - stage2_t0, 0.0)
                     pseudo_rows = int(max(pseudo_rows, qtn_used))
                     gwas_total = int(max(1, scan_rows2))
                     stage2_eff_snp = int(kept_rows2)
+                else:
+                    stage2_secs = max(stage1_kernel_elapsed - stage1_secs, 0.0)
             gwas_ok = True
         finally:
             if stage1_spin_handle is not None:
@@ -4444,7 +4493,9 @@ def run_algwas_packed_fullrank(
                 _cleanup_gwas_result_tmp(tmp_tsv)
                 _cleanup_gwas_result_tmp(tmp_stage1_tsv_hint)
 
-        gwas_secs = max(time.monotonic() - gwas_t0, 0.0)
+        gwas_secs = max(stage1_secs + stage2_secs, 0.0)
+        if gwas_secs <= 0.0:
+            gwas_secs = max(time.monotonic() - gwas_t0, 0.0)
         _finalize_gwas_result_tsv(tmp_tsv, out_tsv, prefix, logger=logger)
         saved_paths.append(str(out_tsv))
         if os.path.exists(tmp_stage1_tsv_hint):
@@ -4498,13 +4549,15 @@ def run_algwas_packed_fullrank(
                 "pve": None,
                 "avg_cpu": float(avg_cpu),
                 "peak_rss_gb": float(peak_rss_gb),
+                "stage1_time_s": float(stage1_secs),
+                "stage2_time_s": float(stage2_secs),
                 "gwas_time_s": float(gwas_secs),
                 "viz_time_s": float(viz_secs),
                 "result_file": str(out_tsv),
             }
         )
 
-        done_times = [format_elapsed(gwas_secs)]
+        done_times = [format_elapsed(stage1_secs), format_elapsed(stage2_secs)]
         if plot:
             done_times.append(format_elapsed(viz_secs))
         _rich_success(
@@ -4548,7 +4601,7 @@ def run_splmm_packed_fullrank(
     scan_mode: str = "exact",
 ) -> None:
     if str(genetic_model).lower() != "add":
-        raise ValueError("SparseLMM full-rust packed route currently supports additive coding only (--model add).")
+        raise ValueError("SparseLMM full-rust packed route supports additive coding only.")
     if not hasattr(jxrs, "splmm_assoc_pcg_bed"):
         raise RuntimeError(
             "Rust extension missing splmm_assoc_pcg_bed. Rebuild/install JanusX extension first."

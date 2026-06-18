@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import logging
 import socket
 import threading
@@ -14,6 +15,21 @@ from ._common.pathcheck import format_kmc_db_pair_for_display, format_path_for_d
 from ._common.progress import ProgressAdapter
 from ._common.status import log_success
 from ._common.threads import detect_effective_threads, format_requested_thread_usage
+
+DEFAULT_MEMORY_GB = 8.0
+
+
+def _normalize_memory_gb(memory_gb: float | int | None) -> float:
+    if memory_gb is None:
+        return float(DEFAULT_MEMORY_GB)
+    gb = float(memory_gb)
+    if gb <= 0.0:
+        raise ValueError(f"--memory must be > 0 GB, got {memory_gb}")
+    return gb
+
+
+def _memory_gb_to_mb(memory_gb: float | int | None) -> int:
+    return max(1, int(round(_normalize_memory_gb(memory_gb) * 1024.0)))
 
 
 def _reopen_file_handlers_append(logger: logging.Logger) -> None:
@@ -134,7 +150,7 @@ def build_parser():
             [
                 "jx kmerge -db /data/kmc/S001 /data/kmc/S002 -o out -prefix maize_k31",
                 "jx kmerge -db '/data/kmc/*' -o out -prefix maize_k31",
-                "jx kmerge -db samples.kmc.tsv -o out -prefix maize_k31 -t 32 -memory 128000",
+                "jx kmerge -db samples.kmc.tsv -o out -prefix maize_k31 -t 32 -mem 128",
                 "jx kmerge -db sampleA.kmc_pre sampleB.kmc_pre -o out -prefix panel --resume",
             ]
         ),
@@ -189,11 +205,21 @@ def build_parser():
         help="Number of worker threads (default: 8).",
     )
     basic.add_argument(
-        "-memory",
+        "-mem",
         "--memory",
-        type=int,
-        default=2048,
-        help="Total memory budget in MB (default: 2048).",
+        type=float,
+        default=DEFAULT_MEMORY_GB,
+        help=(
+            "Runtime memory budget in GB for merge and sorted-run stages. "
+            "Larger values reduce temp-run fragmentation; this is not a decode-block size "
+            "(default: %(default)s)."
+        ),
+    )
+    basic.add_argument(
+        "-memory",
+        dest="memory",
+        type=float,
+        help=argparse.SUPPRESS,
     )
     basic.add_argument(
         "-freq",
@@ -254,14 +280,17 @@ def build_parser():
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
+    try:
+        args.memory = _normalize_memory_gb(args.memory)
+    except ValueError as exc:
+        parser.error(str(exc))
+    memory_mb = _memory_gb_to_mb(args.memory)
 
     db_inputs = [str(item) for group in args.db for item in group]
     if len(db_inputs) == 0:
         parser.error("-db/--db cannot be empty.")
     if args.thread <= 0:
         parser.error("-t/--thread must be > 0.")
-    if args.memory <= 0:
-        parser.error("-memory/--memory must be > 0.")
     if args.max_run_size <= 0:
         parser.error("--max-run-size must be > 0.")
     if args.batch_size <= 0:
@@ -338,7 +367,7 @@ def main() -> int:
                             detected_threads=detected_threads,
                         ),
                     ),
-                    ("Memory MB", int(args.memory)),
+                    ("Memory budget GB", float(args.memory)),
                     ("Bucket bits", int(args.bucket_bits)),
                     ("Batch size", int(args.batch_size)),
                     ("Keep tmp", bool(args.keep_tmp)),
@@ -366,7 +395,7 @@ def main() -> int:
             out=out_dir,
             prefix=output_prefix,
             thread=threads,
-            memory=int(args.memory),
+            memory=memory_mb,
             freq=float(args.freq),
             tmp_dir=None if args.tmp_dir is None else str(Path(args.tmp_dir).expanduser().resolve()),
             max_run_size=int(args.max_run_size),

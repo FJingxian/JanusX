@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import logging
 import socket
 import threading
@@ -14,6 +15,21 @@ from ._common.pathcheck import format_kmc_db_pair_for_display, format_path_for_d
 from ._common.progress import ProgressAdapter
 from ._common.status import log_success
 from ._common.threads import detect_effective_threads, format_requested_thread_usage
+
+DEFAULT_MEMORY_GB = 8.0
+
+
+def _normalize_memory_gb(memory_gb: float | int | None) -> float:
+    if memory_gb is None:
+        return float(DEFAULT_MEMORY_GB)
+    gb = float(memory_gb)
+    if gb <= 0.0:
+        raise ValueError(f"--memory must be > 0 GB, got {memory_gb}")
+    return gb
+
+
+def _memory_gb_to_mb(memory_gb: float | int | None) -> int:
+    return max(1, int(round(_normalize_memory_gb(memory_gb) * 1024.0)))
 
 
 def _reopen_file_handlers_append(logger: logging.Logger) -> None:
@@ -135,7 +151,7 @@ def build_parser():
                 "jx kstats -db sample_A sample_B -pair both -o out",
                 "jx kstats -db sample_A -db sample_B -venn -o out -prefix pairAB",
                 "jx kstats -db './panel/*.jx*' -venn -o out -prefix panel_venn",
-                "jx kstats -db panel.kmc.tsv -pair intersection -sid A B C -o out -t 8 -memory 4096",
+                "jx kstats -db panel.kmc.tsv -pair intersection -sid A B C -o out -t 8 -mem 8",
                 "jx kstats -kbin test.kmer/kmerge -compare WY25=WY2_11.jx,WY2_21.jx WY35P=YY3P_11.jx,YY5P_11.jx -o out",
             ]
         ),
@@ -227,11 +243,21 @@ def build_parser():
         help="Number of worker threads for bucket-parallel stages (default: 8).",
     )
     basic.add_argument(
-        "-memory",
+        "-mem",
         "--memory",
-        type=int,
-        default=2048,
-        help="Total memory budget in MB for stage1 bucket runs (default: 2048).",
+        type=float,
+        default=DEFAULT_MEMORY_GB,
+        help=(
+            "Runtime memory budget in GB for bucket and sorted-run stages. "
+            "Larger values reduce temp-run fragmentation; this is not a decode-block size "
+            "(default: %(default)s)."
+        ),
+    )
+    basic.add_argument(
+        "-memory",
+        dest="memory",
+        type=float,
+        help=argparse.SUPPRESS,
     )
 
     advanced.add_argument(
@@ -280,6 +306,11 @@ def build_parser():
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
+    try:
+        args.memory = _normalize_memory_gb(args.memory)
+    except ValueError as exc:
+        parser.error(str(exc))
+    memory_mb = _memory_gb_to_mb(args.memory)
 
     db_inputs = [str(item) for group in (args.db or []) for item in group]
     has_db = len(db_inputs) > 0
@@ -300,8 +331,6 @@ def main() -> int:
             parser.error("-kbin mode requires at least 2 -compare group definitions.")
     if args.thread <= 0:
         parser.error("-t/--thread must be > 0.")
-    if args.memory <= 0:
-        parser.error("-memory/--memory must be > 0.")
     if args.max_run_size <= 0:
         parser.error("--max-run-size must be > 0.")
     if not (1 <= int(args.bucket_bits) <= 20):
@@ -375,7 +404,7 @@ def main() -> int:
                                 detected_threads=detected_threads,
                             ),
                         ),
-                        ("Memory MB", int(args.memory)),
+                        ("Memory budget GB", float(args.memory)),
                         ("Bucket bits", int(args.bucket_bits)),
                         ("Max run MB", int(args.max_run_size)),
                         ("Batch size", int(args.batch_size)),
@@ -453,7 +482,7 @@ def main() -> int:
             pair=(None if args.pair is None else str(args.pair)),
             venn=bool(args.venn),
             thread=using_threads,
-            memory=int(args.memory),
+            memory=memory_mb,
             tmp_dir=(None if args.tmp_dir is None else str(Path(args.tmp_dir).expanduser().resolve())),
             max_run_size=int(args.max_run_size),
             bucket_bits=int(args.bucket_bits),

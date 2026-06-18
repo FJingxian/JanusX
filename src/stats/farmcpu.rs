@@ -20,7 +20,7 @@ Common stage1 pieces
 Both routes run a conditional FEM scan on `X_t` and score REM candidate lead sets
 by minimizing the FarmCPU log-likelihood over `(window_bp, n_lead)` grid pairs.
 
-Raw route: `-farmcpu-raw`
+Raw route: `-farmcpu`
 =========================
 
 This route follows the classic FEM/REM/SUPER chain.
@@ -32,7 +32,7 @@ This route follows the classic FEM/REM/SUPER chain.
   4. Current pseudo-QTN effect p-values are fed back into the update chain
   5. Stop when no marker passes `tau`, or `S_{t+1} == S_t`, or a 2-cycle is detected
 
-Unified route: `-farmcpu`
+Unified route: `-frgwas`
 =========================
 
 This route keeps the FEM background scan, adds the same REM scorer, and differs

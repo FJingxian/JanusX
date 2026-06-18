@@ -496,7 +496,7 @@ def build_parser() -> argparse.ArgumentParser:
             [
                 "jx kmer -fa sample.fastq.gz -o out -prefix sample_k19 -k 19 -t 8",
                 "jx kmer -fa read_1.fq.gz read_2.fq.gz -o out -prefix sample_pe -k 31 -ci 1",
-                "Common params: -fa/-t/-o/-prefix/-k/-limit-mem",
+                "Common params: -fa/-t/-o/-prefix/-k/-mem",
                 "Count params: -ci/-cx/--counter-max/--tmp-dir",
             ]
         ),
@@ -546,21 +546,31 @@ def build_parser() -> argparse.ArgumentParser:
         help="K-mer length parameter for KMC count workflow (default: 19).",
     )
     common_group.add_argument(
+        "-mem",
+        "--memory",
+        dest="limit_mem_gb",
+        metavar="MEMORY",
+        type=float,
+        default=8,
+        help=(
+            "Runtime memory budget in GB passed to KMC. "
+            "This controls the KMC RAM cap, not a decode-block size "
+            "(default: %(default)s)."
+        ),
+    )
+    common_group.add_argument(
         "-limit-mem",
         "--limit-mem",
         dest="limit_mem_gb",
-        type=int,
-        default=8,
-        help=(
-            "Memory limit in GB (default: 8). "
-            "Passed to KMC as the memory cap."
-        ),
+        metavar="MEMORY",
+        type=float,
+        help=argparse.SUPPRESS,
     )
     common_group.add_argument(
         "-m",
         "--max-ram-gb",
         dest="limit_mem_gb",
-        type=int,
+        type=float,
         help=argparse.SUPPRESS,
     )
 
@@ -664,8 +674,8 @@ def main() -> int:
     if waster_requested:
         parser.error("WASTER workflow in `jx kmer` is hidden and no longer supported.")
 
-    if int(args.limit_mem_gb) < 2:
-        parser.error("-limit-mem/--limit-mem must be >= 2.")
+    if float(args.limit_mem_gb) < 2.0:
+        parser.error("-mem/--memory must be >= 2 GB.")
     if int(args.kmer_len) <= 0:
         parser.error("-k/--kmer-len must be > 0.")
     _require_rust_backend()
@@ -744,7 +754,7 @@ def main() -> int:
                                 detected_threads=detected_threads,
                             ),
                         ),
-                        ("Memory GB", int(args.limit_mem_gb)),
+                        ("Memory budget GB", float(args.limit_mem_gb)),
                         ("Tmp dir", tmp_dir),
                         ("Log file", log_path),
                     ],
@@ -759,7 +769,7 @@ def main() -> int:
         t0 = time.monotonic()
         logger.info(
             f"Running KMC count: inputs={len(input_files)}, k={int(args.kmer_len)}, "
-            f"threads={threads}, limit_mem_gb={int(args.limit_mem_gb)}, input_type={input_type}"
+            f"threads={threads}, limit_mem_gb={float(args.limit_mem_gb):.3g}, input_type={input_type}"
         )
 
         if use_spinner:
@@ -772,7 +782,7 @@ def main() -> int:
                             tmp_dir=tmp_dir,
                             kmer_len=int(args.kmer_len),
                             threads=threads,
-                            max_ram_gb=int(args.limit_mem_gb),
+                            max_ram_gb=max(2, int(math.ceil(float(args.limit_mem_gb)))),
                             cutoff_min=int(args.cutoff_min),
                             cutoff_max=int(args.cutoff_max),
                             counter_max=int(args.counter_max),
@@ -791,7 +801,7 @@ def main() -> int:
                     tmp_dir=tmp_dir,
                     kmer_len=int(args.kmer_len),
                     threads=threads,
-                    max_ram_gb=int(args.limit_mem_gb),
+                    max_ram_gb=max(2, int(math.ceil(float(args.limit_mem_gb)))),
                     cutoff_min=int(args.cutoff_min),
                     cutoff_max=int(args.cutoff_max),
                     counter_max=int(args.counter_max),

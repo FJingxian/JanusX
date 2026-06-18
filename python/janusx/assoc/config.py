@@ -59,7 +59,7 @@ class AssociationConfig:
     threads: int = 0
     chunksize: int = 10000
     mmap_limit: bool = False
-    memory: float = 512.0
+    memory: float = 1.0
     grm: str = "1"
     qcov: int = 0
     model: str = "add"
@@ -156,7 +156,7 @@ class AssociationConfig:
         argv.extend(["-maf", str(float(self.maf))])
         argv.extend(["-geno", str(float(self.geno))])
         argv.extend(["-het", str(float(self.het))])
-        argv.extend(["-memory", str(float(self.memory))])
+        argv.extend(["-mem", str(float(self.memory))])
         argv.extend(["-k", str(self.grm)])
         argv.extend(["-q", str(int(self.qcov))])
         if bool(self.snps_only):

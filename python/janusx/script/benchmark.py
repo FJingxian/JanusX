@@ -5,7 +5,7 @@ FarmCPU benchmark launcher for JanusX / rMVP.
 
 Key features:
   - One-command benchmark for two kernels:
-      * janusx (jxpy gwas -farmcpu-raw)
+      * janusx (jxpy gwas -farmcpu)
       * rmvp   (R, explicit MVP.FarmCPU via temporary inlined runner script)
   - Unified FarmCPU grid policy to align JanusX and direct rMVP::MVP.FarmCPU inputs:
       * bin.size      default: 5e5, 5e6, 5e7
@@ -819,22 +819,6 @@ compute_marker_freq <- function(geno, ind_idx, threads, max_line, n_markers) {
   if (!is.finite(nsnp) || nsnp <= 0L) {
     stop("Invalid marker count for rMVP frequency calculation.", call. = FALSE)
   }
-  idx <- as.integer(ind_idx)
-  idx <- idx[is.finite(idx)]
-  if (!length(idx)) {
-    stop("No valid matched sample indices for marker-frequency calculation.", call. = FALSE)
-  }
-  # rMVP internals vary by version; prefer its native helper when available,
-  # otherwise fall back to a direct big.matrix row-mean over the selected samples.
-  big_row_mean <- tryCatch(getFromNamespace("BigRowMean", "rMVP"), error = function(e) NULL)
-  if (is.function(big_row_mean)) {
-    return(big_row_mean(
-      geno@address,
-      TRUE,
-      threads = threads,
-      geno_ind = idx
-    ) / 2)
-  }
   geno_nr <- tryCatch(as.integer(nrow(geno)), error = function(e) NA_integer_)
   geno_nc <- tryCatch(as.integer(ncol(geno)), error = function(e) NA_integer_)
   marker_by_col <- is.finite(geno_nc) && geno_nc == nsnp
@@ -850,6 +834,25 @@ compute_marker_freq <- function(geno, ind_idx, threads, max_line, n_markers) {
       call. = FALSE
     )
   }
+  idx <- as.integer(ind_idx)
+  idx <- idx[is.finite(idx)]
+  if (!length(idx)) {
+    idx <- if (marker_by_col) seq_len(geno_nr) else seq_len(geno_nc)
+  }
+  if (!length(idx)) {
+    stop("No valid matched sample indices for marker-frequency calculation.", call. = FALSE)
+  }
+  # rMVP internals vary by version; prefer its native helper when available,
+  # otherwise fall back to a direct big.matrix row-mean over the selected samples.
+  big_row_mean <- tryCatch(getFromNamespace("BigRowMean", "rMVP"), error = function(e) NULL)
+  if (is.function(big_row_mean)) {
+    return(big_row_mean(
+      geno@address,
+      TRUE,
+      threads = threads,
+      geno_ind = idx
+    ) / 2)
+  }
   chunk <- as.integer(max(1L, ifelse(is.finite(max_line) && max_line > 0L, max_line, 10000L)))
   out <- numeric(nsnp)
   for (start in seq.int(1L, nsnp, by = chunk)) {
@@ -863,6 +866,141 @@ compute_marker_freq <- function(geno, ind_idx, threads, max_line, n_markers) {
     }
   }
   out
+}
+
+function_has_formal <- function(fun, arg) {
+  fm <- tryCatch(formals(fun), error = function(e) NULL)
+  if (is.null(fm)) return(FALSE)
+  fn_names <- names(fm)
+  if (is.null(fn_names) || !length(fn_names)) return(FALSE)
+  ("..." %in% fn_names) || (arg %in% fn_names)
+}
+
+filter_named_args <- function(fun, args, label) {
+  fm <- tryCatch(formals(fun), error = function(e) NULL)
+  if (is.null(fm)) return(args)
+  fn_names <- names(fm)
+  if (is.null(fn_names) || !length(fn_names) || ("..." %in% fn_names)) {
+    return(args)
+  }
+  arg_names <- names(args)
+  keep <- arg_names %in% fn_names
+  dropped <- arg_names[!keep]
+  if (length(dropped)) {
+    cat("[INFO]", label, "dropping unsupported args:", paste(dropped, collapse = ", "), "\n")
+  }
+  args[keep]
+}
+
+subset_geno_for_individuals <- function(geno, ind_idx, n_markers, cache_prefix, label) {
+  idx <- as.integer(ind_idx)
+  idx <- idx[is.finite(idx)]
+  if (!length(idx)) {
+    stop(sprintf("%s: no valid sample indices supplied for genotype subsetting.", label), call. = FALSE)
+  }
+  nsnp <- as.integer(n_markers)
+  if (!is.finite(nsnp) || nsnp <= 0L) {
+    stop(sprintf("%s: invalid marker count for genotype subsetting.", label), call. = FALSE)
+  }
+  geno_nr <- tryCatch(as.integer(nrow(geno)), error = function(e) NA_integer_)
+  geno_nc <- tryCatch(as.integer(ncol(geno)), error = function(e) NA_integer_)
+  marker_by_col <- is.finite(geno_nc) && geno_nc == nsnp
+  marker_by_row <- is.finite(geno_nr) && geno_nr == nsnp
+  if (!marker_by_col && !marker_by_row) {
+    stop(
+      sprintf(
+        "%s: cannot infer genotype orientation for compatibility subset (nrow=%s, ncol=%s, n_markers=%s).",
+        label,
+        as.character(geno_nr),
+        as.character(geno_nc),
+        as.character(nsnp)
+      ),
+      call. = FALSE
+    )
+  }
+  sub_mat <- if (marker_by_col) {
+    geno[idx, , drop = FALSE]
+  } else {
+    geno[, idx, drop = FALSE]
+  }
+  cache_dir <- dirname(cache_prefix)
+  dir.create(cache_dir, recursive = TRUE, showWarnings = FALSE)
+  backingfile <- paste0(basename(cache_prefix), ".", label, ".geno.bin")
+  descriptorfile <- paste0(basename(cache_prefix), ".", label, ".geno.desc")
+  bin_path <- file.path(cache_dir, backingfile)
+  desc_path <- file.path(cache_dir, descriptorfile)
+  if (file.exists(bin_path)) unlink(bin_path, force = TRUE)
+  if (file.exists(desc_path)) unlink(desc_path, force = TRUE)
+  bm <- bigmemory::filebacked.big.matrix(
+    nrow = nrow(sub_mat),
+    ncol = ncol(sub_mat),
+    type = "char",
+    backingfile = backingfile,
+    backingpath = cache_dir,
+    descriptorfile = descriptorfile,
+    dimnames = c(NULL, NULL)
+  )
+  bm[, ] <- sub_mat[, ]
+  flush(bm)
+  list(
+    geno = bm,
+    ind_idx = NULL,
+    marker_by_col = marker_by_col
+  )
+}
+
+patch_rmvp_farmcpu_burger_if_needed <- function() {
+  ns <- asNamespace("rMVP")
+  if (!exists("FarmCPU.Burger", where = ns, inherits = FALSE)) {
+    return(FALSE)
+  }
+  original <- get("FarmCPU.Burger", envir = ns)
+  body_text <- paste(deparse(body(original)), collapse = "\n")
+  if (!grepl("m > 2", body_text, fixed = TRUE)) {
+    return(FALSE)
+  }
+  patched <- function(Y = NULL, CV = NULL, GK = NULL, ncpus = 2, method = "FaST-LMM") {
+    if (!is.null(CV)) {
+      CV = as.matrix(CV)
+      theCV = as.matrix(cbind(matrix(1, nrow(CV), 1), CV))
+    } else {
+      theCV = matrix(1, nrow(Y), 1)
+    }
+    if (!is.null(GK)) {
+      n = nrow(GK)
+      m = if (is.null(dim(GK))) 1L else ncol(GK)
+      if (m >= 2L) {
+        theGK = as.matrix(GK)
+      } else if (m == 0L) {
+        theGK = NULL
+      } else {
+        theGK = matrix(GK, n, 1)
+      }
+    } else {
+      theGK = GK
+    }
+    if (method == "FaST-LMM") {
+      myFaSTREML = FarmCPU.FaSTLMM.LL(pheno = matrix(Y[, -1], nrow(Y), 1), snp.pool = theGK, X0 = theCV, ncpus = ncpus)
+      REMLs = -2 * myFaSTREML$LL
+      delta = myFaSTREML$delta
+      vg = myFaSTREML$vg
+      ve = myFaSTREML$ve
+    }
+    if (method == "EMMA") {
+      K <- MVP.K.VanRaden(M = as.big.matrix(theGK), verbose = FALSE)
+      myEMMAREML <- MVP.EMMA.Vg.Ve(y = matrix(Y[, -1], nrow(Y), 1), X = theCV, K = K)
+      REMLs = -2 * myEMMAREML$REML
+      delta = myEMMAREML$delta
+      vg = myEMMAREML$vg
+      ve = myEMMAREML$ve
+    }
+    return(list(REMLs = REMLs, vg = vg, ve = ve, delta = delta))
+  }
+  environment(patched) <- environment(original)
+  unlockBinding("FarmCPU.Burger", ns)
+  on.exit(lockBinding("FarmCPU.Burger", ns), add = TRUE)
+  assign("FarmCPU.Burger", patched, envir = ns)
+  TRUE
 }
 
 write_meta <- function(meta_file, exit_code, pseudo_qtn, inner_log, note, pseudo_qtn_metric) {
@@ -902,7 +1040,7 @@ p_threshold_raw <- ifelse(is.null(opts[["farmcpu-p-threshold"]]), "", trimws(opt
 qtn_threshold <- suppressWarnings(as.numeric(opts[["farmcpu-qtn-threshold"]]))
 qtn_threshold_raw <- ifelse(is.null(opts[["farmcpu-qtn-threshold"]]), "", trimws(opts[["farmcpu-qtn-threshold"]]))
 farmcpu_bound <- suppressWarnings(as.integer(opts[["farmcpu-bound"]]))
-if (!is.finite(farmcpu_bound) || farmcpu_bound < 1L) farmcpu_bound <- NULL
+if (length(farmcpu_bound) == 0L || !is.finite(farmcpu_bound) || farmcpu_bound < 1L) farmcpu_bound <- NULL
 maf <- suppressWarnings(as.numeric(opts[["farmcpu-maf"]]))
 if (!is.finite(maf) || maf <= 0 || maf >= 0.5) maf <- NULL
 npc_farmcpu <- suppressWarnings(as.integer(opts[["npc-farmcpu"]]))
@@ -930,6 +1068,9 @@ suppressPackageStartupMessages({
   library(rMVP)
   library(bigmemory)
 })
+if (patch_rmvp_farmcpu_burger_if_needed()) {
+  cat("[INFO] Patched rMVP::FarmCPU.Burger for 2-column FaST-LMM pseudoQTN compatibility.\n")
+}
 
 status <- 0L
 note <- "ok"
@@ -1016,21 +1157,41 @@ tryCatch(
       stringsAsFactors = FALSE
     )
     ind_idx <- as.integer(matched)
+    farmcpu_fun <- rMVP::MVP.FarmCPU
+    kin_fun <- rMVP::MVP.K.VanRaden
+    farmcpu_supports_ind_idx <- function_has_formal(farmcpu_fun, "ind_idx")
+    geno_farmcpu <- geno
+    ind_idx_farmcpu <- ind_idx
+    marker_by_col_farmcpu <- tryCatch(as.integer(ncol(geno)) == nrow(map_out), error = function(e) TRUE)
+    if (!farmcpu_supports_ind_idx) {
+      cat("[INFO] MVP.FarmCPU does not expose ind_idx; materializing matched-sample genotype subset for compatibility.\n")
+      subset_res <- subset_geno_for_individuals(
+        geno = geno,
+        ind_idx = ind_idx,
+        n_markers = nrow(map_out),
+        cache_prefix = cache_prefix,
+        label = "farmcpu"
+      )
+      geno_farmcpu <- subset_res$geno
+      ind_idx_farmcpu <- subset_res$ind_idx
+      marker_by_col_farmcpu <- isTRUE(subset_res$marker_by_col)
+    }
 
     CV_farmcpu <- NULL
-    marker_freq <- compute_marker_freq(geno, ind_idx, threads, max_line, nrow(map_out))
+    marker_freq <- compute_marker_freq(geno_farmcpu, ind_idx_farmcpu, threads, max_line, nrow(map_out))
     if (!is.null(npc_farmcpu) && npc_farmcpu > 0L) {
-      K <- rMVP::MVP.K.VanRaden(
-        M = geno,
+      kin_args <- list(
+        M = geno_farmcpu,
         maxLine = max_line,
-        ind_idx = ind_idx,
+        ind_idx = ind_idx_farmcpu,
         mrk_idx = NULL,
         mrk_freq = marker_freq,
-        mrk_bycol = TRUE,
+        mrk_bycol = marker_by_col_farmcpu,
         cpu = threads,
         verbose = TRUE,
         checkNA = FALSE
       )
+      K <- do.call(kin_fun, filter_named_args(kin_fun, kin_args, "MVP.K.VanRaden"))
       eigenK <- eigen(K, symmetric = TRUE)
       npc_keep <- min(nrow(eigenK$vectors), max(3L, npc_farmcpu))
       ipca <- eigenK$vectors[, seq_len(npc_keep), drop = FALSE]
@@ -1039,10 +1200,10 @@ tryCatch(
 
     farmcpu_args <- list(
       phe = phe,
-      geno = geno,
+      geno = geno_farmcpu,
       map = map_farmcpu,
       CV = CV_farmcpu,
-      ind_idx = ind_idx,
+      ind_idx = ind_idx_farmcpu,
       mrk_idx = NULL,
       P = NULL,
       method.sub = "reward",
@@ -1070,7 +1231,7 @@ tryCatch(
     if (nzchar(vc_method)) {
       cat("[INFO] direct MVP.FarmCPU path does not expose vc.method; requested value recorded only:", vc_method, "\n")
     }
-    farmcpu_out <- do.call(rMVP::MVP.FarmCPU, farmcpu_args)
+    farmcpu_out <- do.call(farmcpu_fun, filter_named_args(farmcpu_fun, farmcpu_args, "MVP.FarmCPU"))
     farmcpu_out <- as.data.frame(farmcpu_out, stringsAsFactors = FALSE)
     if (!nrow(map_out) || !nrow(farmcpu_out)) {
       stop("rMVP returned no FarmCPU result rows.", call. = FALSE)
@@ -1167,7 +1328,7 @@ def _run_kernel_janusx(
         str(gfile),
         "-p",
         str(pheno_for_jx),
-        "-farmcpu-raw",
+        "-farmcpu",
         "-maf",
         str(args.maf),
         "-geno",
@@ -1565,7 +1726,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     p = CliArgumentParser(
         prog="jx benchmark",
         formatter_class=cli_help_formatter(),
-        description="Benchmark FarmCPU kernels: JanusX -farmcpu-raw / explicit rMVP::MVP.FarmCPU.",
+        description="Benchmark FarmCPU kernels: JanusX -farmcpu / explicit rMVP::MVP.FarmCPU.",
         epilog=minimal_help_epilog(
             [
                 "jx benchmark -bfile example_prefix -p pheno.tsv -n 0",

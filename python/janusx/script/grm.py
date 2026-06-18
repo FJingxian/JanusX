@@ -92,7 +92,7 @@ except Exception:
     _spgrm_dense_npy_to_jxgrm = None
 
 
-DEFAULT_BED_MEMORY_MB = 512.0
+DEFAULT_BED_MEMORY_GB = 1.0
 
 
 def _is_plink_prefix_path(path_or_prefix: str) -> bool:
@@ -105,13 +105,17 @@ def _is_plink_prefix_path(path_or_prefix: str) -> bool:
     return all(os.path.isfile(f"{p}.{ext}") for ext in ("bed", "bim", "fam"))
 
 
-def _normalize_memory_mb(memory_mb: Union[int, float, None]) -> float:
-    if memory_mb is None:
-        return float(DEFAULT_BED_MEMORY_MB)
-    mb = float(memory_mb)
-    if (not np.isfinite(mb)) or mb <= 0.0:
-        raise ValueError(f"--memory must be a finite value > 0, got {memory_mb}")
-    return float(mb)
+def _normalize_memory_gb(memory_gb: Union[int, float, None]) -> float:
+    if memory_gb is None:
+        return float(DEFAULT_BED_MEMORY_GB)
+    gb = float(memory_gb)
+    if (not np.isfinite(gb)) or gb <= 0.0:
+        raise ValueError(f"--memory must be a finite value > 0 GB, got {memory_gb}")
+    return float(gb)
+
+
+def _memory_gb_to_mb(memory_gb: Union[int, float, None]) -> float:
+    return float(_normalize_memory_gb(memory_gb) * 1024.0)
 
 
 def _decode_block_rows_from_memory_mb(
@@ -789,11 +793,15 @@ def main(log: bool = True):
              "(default: %(default)s).",
     )
     optional_group.add_argument(
-        "-memory", "--memory", type=float, default=DEFAULT_BED_MEMORY_MB,
+        "-mem", "--memory", type=float, default=DEFAULT_BED_MEMORY_GB,
         help=(
-            "Target decode working-set size in MB for BED memmap/packed kernels "
+            "Target BED decode block size in GB for memmap/packed kernels. "
+            "This only controls per-block decode/window sizing, not global process memory "
             "(default: %(default)s)."
         ),
+    )
+    optional_group.add_argument(
+        "-memory", dest="memory", type=float, help=argparse.SUPPRESS
     )
     optional_group.add_argument(
         "--stage-timing", action="store_true", default=False,
@@ -907,7 +915,7 @@ def main(log: bool = True):
                 ("Sparse GRM cutoff", "disabled" if args.sparse is None else args.sparse),
                 ("MAF threshold", args.maf),
                 ("Missing rate", args.geno),
-                ("Memory MB", args.memory),
+                ("Decode block GB", args.memory),
                 ("Stage timing", bool(args.stage_timing or spgrm_timing_enabled)),
                 (
                     "Threads",
@@ -1061,7 +1069,8 @@ def main(log: bool = True):
     # Defaults match GWAS; can be overridden via CLI.
     maf_threshold = args.maf
     max_missing_rate = args.geno
-    memory_mb = _normalize_memory_mb(args.memory)
+    args.memory = _normalize_memory_gb(args.memory)
+    memory_mb = _memory_gb_to_mb(args.memory)
     stream_block_rows = _decode_block_rows_from_memory_mb(
         n_samples,
         n_snps,
@@ -1141,7 +1150,10 @@ def main(log: bool = True):
         dense_saved_direct = False
 
         if selected_backend == "memmap-bed":
-            logger.info(f"GRM decode memory target: {float(memory_mb):.6g} MB.")
+            logger.info(
+                f"GRM decode block target: {float(args.memory):.6g} GB "
+                f"({float(memory_mb):.6g} MB effective)."
+            )
             if bool(args.stage_timing):
                 logger.info("Memmap GRM stage timing is enabled (decode/GEMM/other).")
             try:

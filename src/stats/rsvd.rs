@@ -1,6 +1,5 @@
 use nalgebra::{DMatrix, SymmetricEigen};
 use numpy::{PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2};
-use pyo3::exceptions::PyKeyboardInterrupt;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::Bound;
@@ -24,28 +23,15 @@ use crate::gfcore::{
     block_rows_from_memory_target_mb, parse_positive_env_f64, parse_positive_env_usize,
 };
 use crate::pipeline::run_double_buffer;
-use crate::stats_common::{admx_madvise_dontneed_bytes, check_admx_memory_limit, get_cached_pool};
-
-const _INTERRUPTED_MSG: &str = "Interrupted by user (Ctrl+C).";
+use crate::stats_common::{
+    admx_madvise_dontneed_bytes, check_admx_memory_limit, check_ctrlc, get_cached_pool,
+    map_err_string_to_py, parse_index_vec_i64_result,
+};
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct RsvdKernelTiming {
     pub(crate) decode_s: f64,
     pub(crate) gemm_s: f64,
-}
-
-#[inline]
-fn _check_ctrlc() -> Result<(), String> {
-    Python::attach(|py| py.check_signals()).map_err(|_| _INTERRUPTED_MSG.to_string())
-}
-
-#[inline]
-fn _map_err_string_to_py(err: String) -> PyErr {
-    if err.contains("Interrupted by user (Ctrl+C)") {
-        PyKeyboardInterrupt::new_err(err)
-    } else {
-        PyRuntimeError::new_err(err)
-    }
 }
 
 #[inline]
@@ -209,7 +195,7 @@ fn packed_subset_row_stats(
     let chunk_rows = omega_stats_chunk_rows(m, n_samples);
 
     for chunk_start in (0..m).step_by(chunk_rows) {
-        _check_ctrlc()?;
+        check_ctrlc()?;
         let chunk_end = (chunk_start + chunk_rows).min(m);
         let chunk_stats: Vec<(f32, bool, f64)> = (chunk_start..chunk_end)
             .into_par_iter()
@@ -512,7 +498,7 @@ pub(crate) fn rsvd_packed_compute_a_omega(
     let _blas_guard = BlasThreadGuard::enter(rayon::current_num_threads().max(1));
 
     for row_start in (0..m).step_by(block_rows) {
-        _check_ctrlc()?;
+        check_ctrlc()?;
         check_admx_memory_limit("rsvd_packed/a_omega")?;
         let row_end = (row_start + block_rows).min(m);
         let cur_rows = row_end - row_start;
@@ -583,7 +569,7 @@ pub(crate) fn rsvd_packed_compute_at_random_omega(
     let _blas_guard = BlasThreadGuard::enter(rayon::current_num_threads().max(1));
 
     for row_start in (0..m).step_by(block_rows) {
-        _check_ctrlc()?;
+        check_ctrlc()?;
         check_admx_memory_limit("rsvd_packed/at_random_omega")?;
         let row_end = (row_start + block_rows).min(m);
         let cur_rows = row_end - row_start;
@@ -675,7 +661,7 @@ pub(crate) fn rsvd_packed_compute_ata_omega(
         let mut row_mean = vec![0.0_f32; block_rows];
         let mut row_inv_sd = vec![1.0_f32; block_rows];
         for row_start in (0..m).step_by(block_rows) {
-            _check_ctrlc()?;
+            check_ctrlc()?;
             check_admx_memory_limit("rsvd_packed/ata_omega")?;
             let row_end = (row_start + block_rows).min(m);
             let cur_rows = row_end - row_start;
@@ -825,7 +811,7 @@ pub(crate) fn rsvd_packed_compute_ata_omega(
                 if buf.rows == 0 {
                     return Ok::<(), String>(());
                 }
-                _check_ctrlc()?;
+                check_ctrlc()?;
                 check_admx_memory_limit("rsvd_packed/ata_omega_gemm")?;
                 let cur_rows = buf.rows;
                 let cur_rows_i = checked_cblas_dim(cur_rows, "cur_rows")?;
@@ -922,7 +908,7 @@ pub(crate) fn rsvd_packed_compute_gram_aq(
     let _blas_guard = BlasThreadGuard::enter(rayon::current_num_threads().max(1));
 
     for row_start in (0..m).step_by(block_rows) {
-        _check_ctrlc()?;
+        check_ctrlc()?;
         check_admx_memory_limit("rsvd_packed/gram_aq")?;
         let row_end = (row_start + block_rows).min(m);
         let cur_rows = row_end - row_start;
@@ -977,21 +963,6 @@ fn fill_random_omega_block(rng: &mut StdRng, omega_block: &mut [f32]) {
     for v in omega_block.iter_mut() {
         *v = rng.sample::<f64, _>(StandardNormal) as f32;
     }
-}
-
-fn parse_index_vec_i64(src: &[i64], n_total: usize, name: &str) -> Result<Vec<usize>, String> {
-    let mut out = Vec::with_capacity(src.len());
-    for (i, &v) in src.iter().enumerate() {
-        if v < 0 {
-            return Err(format!("{name}[{i}] must be >= 0, got {v}"));
-        }
-        let u = v as usize;
-        if u >= n_total {
-            return Err(format!("{name}[{i}] out of range: {u} >= {n_total}"));
-        }
-        out.push(u);
-    }
-    Ok(out)
 }
 
 fn rsvd_tile_cols_env() -> usize {
@@ -1322,7 +1293,7 @@ pub fn rsvd_packed_subset(
     // - first (power-1) rounds: LU normalization with automatic QR fallback on ill-conditioning
     // - final round (or early-exit finalization): QR normalization for stability
     for it in 0..power {
-        _check_ctrlc()?;
+        check_ctrlc()?;
         y = rsvd_packed_compute_ata_omega(packed_view, &q, kp, None)?;
         for idx in 0..(n * kp) {
             y[idx] -= alpha * q[idx];
@@ -1454,7 +1425,7 @@ pub fn py_rsvd_packed_subset<'py>(
 
     let sample_idx: Vec<usize> = if let Some(sidx) = sample_indices {
         let sidx_slice = sidx.as_slice()?;
-        parse_index_vec_i64(sidx_slice, n_samples, "sample_indices")
+        parse_index_vec_i64_result(sidx_slice, n_samples, "sample_indices")
             .map_err(PyRuntimeError::new_err)?
     } else {
         (0..n_samples).collect()
@@ -1485,7 +1456,7 @@ pub fn py_rsvd_packed_subset<'py>(
                 tile_cols,
             )
         })
-        .map_err(_map_err_string_to_py)?;
+        .map_err(map_err_string_to_py)?;
 
     let eval_arr = PyArray1::<f32>::zeros(py, [k_eff], false).into_bound();
     let evec_arr = PyArray2::<f32>::zeros(py, [n, k_eff], false).into_bound();

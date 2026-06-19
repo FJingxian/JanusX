@@ -6,17 +6,19 @@ import struct
 import sys
 from pathlib import Path
 
+from ._common.binsidecar import (
+    BIN01_MAGIC,
+    BIN_SITE_MAGIC,
+    LEGACY_BSITE_HEADER_SIZE,
+    LEGACY_BSITE_MAGIC,
+    LEGACY_BSITE_VERSION,
+)
 from ._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 
-BIN01_MAGIC = b"JXBIN001"
-BIN_SITE_MAGIC = b"JXBSITE1"
 BKMER_MAGIC = b"JXBKMR1\x00"
 BKMER_HEADER_SIZE = 64
 KMER_BSITE_MAGIC = b"JXBSIT1\x00"
 KMER_BSITE_HEADER_SIZE = 80
-LEGACY_BSITE_MAGIC = b"JXBSIT02"
-LEGACY_BSITE_HEADER_SIZE = 36
-LEGACY_BSITE_VERSION = 1
 
 _BITS_LE = tuple("".join("1" if ((b >> i) & 1) else "0" for i in range(8)) for b in range(256))
 _ALLELE_2 = tuple(

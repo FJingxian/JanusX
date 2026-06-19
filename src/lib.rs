@@ -8,10 +8,10 @@ mod admixture;
 mod algwas;
 #[path = "stats/bayes.rs"]
 mod bayes;
-#[path = "stats/beam.rs"]
-pub mod beam;
 #[path = "stats/bsa.rs"]
 mod bsa;
+#[path = "stats/bstats.rs"]
+mod bstats;
 #[path = "decode/decode.rs"]
 mod decode;
 #[path = "stats/farmcpu.rs"]
@@ -71,6 +71,14 @@ mod tree;
 // io
 #[path = "io/assoc2tsv.rs"]
 mod assoc2tsv;
+#[path = "io/bincore.rs"]
+mod bincore;
+#[path = "io/binsidecar.rs"]
+mod binsidecar;
+#[path = "io/binwriter.rs"]
+mod binwriter;
+#[path = "io/breader.rs"]
+mod breader;
 #[path = "io/gfcore.rs"]
 mod gfcore;
 #[path = "io/gfreader.rs"]
@@ -148,11 +156,7 @@ use bayes::{
     bayesa, bayesa_packed, bayesa_packed_trace, bayesb, bayesb_packed, bayesb_packed_trace,
     bayescpi, bayescpi_packed, bayescpi_packed_trace,
 };
-use beam::{
-    beam_scan_windows_binary_mcc_bin_py, beam_scan_windows_continuous_corr_bin_py,
-    beam_search_and_binary_mcc_bin_indices_py, beam_search_and_binary_mcc_bin_py,
-    beam_search_and_continuous_corr_bin_indices_py, beam_search_and_continuous_corr_bin_py,
-};
+use binwriter::Bin01StreamWriter;
 use bitwise::{and_popcount_py, bitand_assign_py, bitnot_masked_py, bitor_into_py, popcount_py};
 use blas::{
     rust_blas_get_num_threads, rust_blas_set_num_threads, rust_eigh_lapack_backend,
@@ -323,6 +327,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_class::<SparseOneHotBlupCache>()?;
     m.add_class::<PyMergeStats>()?;
     m.add_class::<PyConvertStats>()?;
+    m.add_class::<Bin01StreamWriter>()?;
     m.add_function(wrap_pyfunction!(popcount_py, m)?)?;
     m.add_function(wrap_pyfunction!(and_popcount_py, m)?)?;
     m.add_function(wrap_pyfunction!(bitand_assign_py, m)?)?;
@@ -338,21 +343,6 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(score_cont_mean_diff_py, m)?)?;
     m.add_function(wrap_pyfunction!(score_cont_corr_py, m)?)?;
     m.add_function(wrap_pyfunction!(score_cont_mean_diff_corr_batch_py, m)?)?;
-    m.add_function(wrap_pyfunction!(beam_search_and_binary_mcc_bin_py, m)?)?;
-    m.add_function(wrap_pyfunction!(
-        beam_search_and_binary_mcc_bin_indices_py,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(beam_scan_windows_binary_mcc_bin_py, m)?)?;
-    m.add_function(wrap_pyfunction!(beam_search_and_continuous_corr_bin_py, m)?)?;
-    m.add_function(wrap_pyfunction!(
-        beam_search_and_continuous_corr_bin_indices_py,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        beam_scan_windows_continuous_corr_bin_py,
-        m
-    )?)?;
     m.add_function(wrap_pyfunction!(kmer_count_run_py, m)?)?;
     m.add_function(wrap_pyfunction!(kmerge_run_py, m)?)?;
     m.add_function(wrap_pyfunction!(kmer_resolve_inputs_py, m)?)?;

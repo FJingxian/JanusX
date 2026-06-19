@@ -249,7 +249,7 @@ def _ensure_followup_grm(
         het_threshold=0.0,
         chunk_size=65536,
         threads=int(threads),
-        mmap_limit=False,
+        memory_mb=1024.0,
         logger=logger,
         use_spinner=bool(use_spinner),
         ids_preloaded=np.asarray(sample_ids, dtype=str),

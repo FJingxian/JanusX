@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 
 from janusx.gfreader import SiteInfo, prepare_cli_input_cache
+from .binsidecar import LEGACY_BSITE_HEADER_SIZE, LEGACY_BSITE_MAGIC, LEGACY_BSITE_VERSION
 from .pathcheck import safe_expanduser
 from .progress import build_rich_progress, rich_progress_available
 from .status import CliStatus, should_animate_status, stdout_is_tty
@@ -18,6 +19,11 @@ try:
     from janusx.janusx import gfd_packbits_from_dosage_block as _gfd_packbits_from_dosage_block
 except Exception:
     _gfd_packbits_from_dosage_block = None
+
+try:
+    from janusx.janusx import Bin01StreamWriter as _Bin01StreamWriter
+except Exception:
+    _Bin01StreamWriter = None
 
 try:
     from tqdm.auto import tqdm
@@ -349,14 +355,31 @@ def write_bim_file(path: str, sites: Sequence[SiteInfo]) -> None:
             alt = str(site.alt_allele)
             fbim.write(f"{chrom}\t{sid}\t0\t{pos}\t{ref}\t{alt}\n")
 
+def _require_bin01_writer():
+    if _Bin01StreamWriter is None:
+        raise RuntimeError(
+            "Bin01StreamWriter is unavailable in janusx extension. "
+            "Rebuild/install the Rust extension before writing BIN01 outputs."
+        )
+    return _Bin01StreamWriter
 
-BIN01_MAGIC = b"JXBIN001"
-BIN01_HEADER_SIZE = 32
-BIN_SITE_MAGIC = b"JXBSITE1"
-BIN_SITE_HEADER_SIZE = 24
-BSITE_MAGIC = b"JXBSIT02"
-BSITE_HEADER_SIZE = 36
-BSITE_VERSION = 1
+
+def _site_columns_for_bin_writer(
+    sites: Sequence[SiteInfo],
+) -> tuple[list[str], list[int], list[str], list[str]]:
+    chrom: list[str] = []
+    pos: list[int] = []
+    ref: list[str] = []
+    alt: list[str] = []
+    for site in sites:
+        chrom.append(str(site.chrom))
+        try:
+            pos.append(int(site.pos))
+        except Exception:
+            pos.append(0)
+        ref.append(str(site.ref_allele))
+        alt.append(str(site.alt_allele))
+    return chrom, pos, ref, alt
 
 _ALLELE_CHAR_TO_CODE: dict[str, int] = {
     "A": 0,
@@ -370,56 +393,6 @@ _ALLELE_CHAR_TO_CODE: dict[str, int] = {
     "3": 3,
     "4": 4,
 }
-
-
-def _encode_base_2bit(ch: int) -> int:
-    # 2-bit mapping for k-mer site encoding:
-    # A=00, T=01, C=10, G=11
-    if ch in (65, 97):  # A/a
-        return 0
-    if ch in (84, 116):  # T/t
-        return 1
-    if ch in (67, 99):  # C/c
-        return 2
-    if ch in (71, 103):  # G/g
-        return 3
-    raise ValueError(f"Unsupported base in k-mer site encoding: {chr(ch)!r}")
-
-
-def _encode_kmer_2bit(seq: str) -> bytes:
-    raw = str(seq).encode("ascii", errors="strict")
-    n = len(raw)
-    out = bytearray((n + 3) // 4)
-    for i, ch in enumerate(raw):
-        code = _encode_base_2bit(int(ch))
-        out[i >> 2] |= (code & 0b11) << ((i & 0b11) * 2)
-    return bytes(out)
-
-
-def _write_bin_site_header(
-    handle,
-    *,
-    n_sites: int,
-    reserved: int = 0,
-) -> None:
-    handle.seek(0)
-    handle.write(BIN_SITE_MAGIC)
-    handle.write(struct.pack("<Q", int(n_sites)))
-    handle.write(struct.pack("<Q", int(reserved)))
-
-
-def write_bin_site_file(handle, sites: Sequence[SiteInfo]) -> None:
-    for site in sites:
-        kmer = str(site.alt_allele)
-        klen = len(kmer)
-        if klen <= 0:
-            raise ValueError("Empty k-mer in site metadata is not allowed for .bin.site output.")
-        if klen > 0xFFFF:
-            raise ValueError(f"k-mer length exceeds u16 limit: {klen}")
-        packed = _encode_kmer_2bit(kmer)
-        handle.write(struct.pack("<H", int(klen)))
-        handle.write(packed)
-
 
 def _split_chrom_strand(chrom: str) -> tuple[str, int]:
     s = str(chrom).strip()
@@ -456,8 +429,8 @@ def _write_bsite_header(
     flags: int = 0,
 ) -> None:
     handle.seek(0)
-    handle.write(BSITE_MAGIC)
-    handle.write(struct.pack("<H", int(BSITE_VERSION)))
+    handle.write(LEGACY_BSITE_MAGIC)
+    handle.write(struct.pack("<H", int(LEGACY_BSITE_VERSION)))
     handle.write(struct.pack("<H", int(flags)))
     handle.write(struct.pack("<Q", int(n_sites)))
     handle.write(struct.pack("<I", int(n_chrom)))
@@ -512,21 +485,6 @@ def write_bsite_chrom_dict(handle, chrom_names: Sequence[str]) -> int:
         handle.write(raw)
     return offset
 
-
-def _write_bin_header(
-    handle,
-    *,
-    n_sites: int,
-    n_samples: int,
-    reserved: int = 0,
-) -> None:
-    handle.seek(0)
-    handle.write(BIN01_MAGIC)
-    handle.write(struct.pack("<Q", int(n_sites)))
-    handle.write(struct.pack("<Q", int(n_samples)))
-    handle.write(struct.pack("<Q", int(reserved)))
-
-
 def write_bin01_output(
     out_path: str,
     sample_ids: Sequence[str],
@@ -555,51 +513,45 @@ def write_bin01_output(
         write_fam_file(f"{prefix}.fam", sample_ids)
 
     written = 0
-    packed_cols = (n_samples + 7) // 8
+    writer_cls = _require_bin01_writer()
     progress, task_id, pbar = _open_site_progress("Writing BIN", int(total_sites))
-    with open(out_path, "wb") as fbin, open(f"{prefix}.bin.site", "wb") as fsite:
-        fbim = open(f"{prefix}.bim", "w", encoding="utf-8") if write_plink_sidecars else None
-        try:
-            _write_bin_header(fbin, n_sites=0, n_samples=n_samples, reserved=0)
-            _write_bin_site_header(fsite, n_sites=0, reserved=0)
-            for block, sites in chunks:
-                arr = np.asarray(block, dtype=np.float32)
-                if arr.ndim != 2:
-                    raise ValueError("BIN chunk must be 2D (n_sites, n_samples)")
-                if int(arr.shape[1]) != n_samples:
-                    raise ValueError(
-                        f"BIN chunk sample mismatch: got {arr.shape[1]}, expected {n_samples}"
-                    )
-                bin01 = (arr > 0).astype(np.uint8, copy=False)
-                packed = np.packbits(bin01, axis=1, bitorder="little")
-                if int(packed.shape[1]) != packed_cols:
-                    raise ValueError(
-                        f"BIN packbits column mismatch: got {packed.shape[1]}, expected {packed_cols}"
-                    )
-                fbin.write(np.ascontiguousarray(packed).tobytes(order="C"))
-                write_bin_site_file(fsite, sites)
-                if fbim is not None:
-                    for site in sites:
-                        chrom = str(site.chrom)
-                        try:
-                            pos = int(site.pos)
-                        except Exception:
-                            pos = 0
-                        sid = f"{chrom}_{pos}"
-                        ref = str(site.ref_allele)
-                        alt = str(site.alt_allele)
-                        fbim.write(f"{chrom}\t{sid}\t0\t{pos}\t{ref}\t{alt}\n")
-                n_rows = int(arr.shape[0])
-                written += n_rows
-                _advance_site_progress(progress, task_id, pbar, n_rows)
-            _write_bin_header(fbin, n_sites=written, n_samples=n_samples, reserved=0)
-            _write_bin_site_header(fsite, n_sites=written, reserved=0)
-            fbin.flush()
-            fsite.flush()
-        finally:
-            _close_site_progress(progress, pbar)
+    writer = writer_cls(str(out_path), n_samples, "kmer")
+    fbim = open(f"{prefix}.bim", "w", encoding="utf-8") if write_plink_sidecars else None
+    try:
+        for block, sites in chunks:
+            arr = np.asarray(block, dtype=np.float32)
+            if arr.ndim != 2:
+                raise ValueError("BIN chunk must be 2D (n_sites, n_samples)")
+            if int(arr.shape[1]) != n_samples:
+                raise ValueError(
+                    f"BIN chunk sample mismatch: got {arr.shape[1]}, expected {n_samples}"
+                )
+            sites_list = list(sites)
+            if int(arr.shape[0]) != len(sites_list):
+                raise ValueError(
+                    f"BIN chunk rows/sites mismatch: rows={arr.shape[0]}, sites={len(sites_list)}"
+                )
+            chrom, pos, ref, alt = _site_columns_for_bin_writer(sites_list)
+            writer.write_chunk_f32(arr, chrom, pos, ref, alt)
             if fbim is not None:
-                fbim.close()
+                for site in sites_list:
+                    chrom0 = str(site.chrom)
+                    try:
+                        pos0 = int(site.pos)
+                    except Exception:
+                        pos0 = 0
+                    sid = f"{chrom0}_{pos0}"
+                    ref0 = str(site.ref_allele)
+                    alt0 = str(site.alt_allele)
+                    fbim.write(f"{chrom0}\t{sid}\t0\t{pos0}\t{ref0}\t{alt0}\n")
+            n_rows = int(arr.shape[0])
+            written += n_rows
+            _advance_site_progress(progress, task_id, pbar, n_rows)
+    finally:
+        writer.close()
+        _close_site_progress(progress, pbar)
+        if fbim is not None:
+            fbim.close()
 
     if written != int(total_sites):
         print(
@@ -635,15 +587,16 @@ def write_gfd_output(
 
     written = 0
     packed_cols = (n_samples + 7) // 8
+    writer_cls = _require_bin01_writer()
     progress, task_id, pbar = _open_site_progress("Writing GFD", total_sites)
-    with open(out_path, "wb") as fbin, open(f"{prefix}.bsite", "wb") as fsite:
+    writer = writer_cls(str(out_path), n_samples, "none")
+    with open(f"{prefix}.bsite", "wb") as fsite:
         try:
-            _write_bin_header(fbin, n_sites=0, n_samples=n_samples, reserved=0)
             _write_bsite_header(
                 fsite,
                 n_sites=0,
                 n_chrom=0,
-                chrom_dict_offset=BSITE_HEADER_SIZE,
+                chrom_dict_offset=LEGACY_BSITE_HEADER_SIZE,
                 flags=0,
             )
             chrom_codes: dict[str, int] = {}
@@ -664,14 +617,11 @@ def write_gfd_output(
                     )
 
                 if source_is_dosage012:
-                    # Input block is dosage rows (0/1/2 with possible missing),
-                    # expand to two 0/1 rows per site in Rust when available.
                     if _gfd_packbits_from_dosage_block is not None:
                         packed = np.asarray(
                             _gfd_packbits_from_dosage_block(np.asarray(arr, dtype=np.float32))
                         )
                     else:
-                        # Python fallback: mode-impute 0/1/2, then build two Boolean rows.
                         x = np.asarray(arr, dtype=np.float32)
                         g = np.full(x.shape, -9, dtype=np.int8)
                         valid = np.isfinite(x) & (x >= 0.0)
@@ -698,7 +648,7 @@ def write_gfd_output(
                         raise ValueError(
                             f"GFD packbits column mismatch: got {packed.shape[1]}, expected {packed_cols}"
                         )
-                    fbin.write(np.ascontiguousarray(packed).tobytes(order="C"))
+                    writer.write_chunk_packed(np.asarray(packed, dtype=np.uint8))
 
                     out_sites: list[SiteInfo] = []
                     for s in sites_list:
@@ -719,14 +669,7 @@ def write_gfd_output(
                     written += n_rows_out
                     _advance_site_progress(progress, task_id, pbar, n_rows_out)
                 else:
-                    # Input block is already a 0/1 matrix aligned with provided sites.
-                    bin01 = (arr > 0).astype(np.uint8, copy=False)
-                    packed = np.packbits(bin01, axis=1, bitorder="little")
-                    if int(packed.shape[1]) != packed_cols:
-                        raise ValueError(
-                            f"GFD packbits column mismatch: got {packed.shape[1]}, expected {packed_cols}"
-                        )
-                    fbin.write(np.ascontiguousarray(packed).tobytes(order="C"))
+                    writer.write_chunk_f32(np.asarray(arr, dtype=np.float32))
                     write_bsite_records(
                         fsite,
                         sites_list,
@@ -738,7 +681,6 @@ def write_gfd_output(
                     _advance_site_progress(progress, task_id, pbar, n_rows_out)
 
             chrom_dict_offset = write_bsite_chrom_dict(fsite, chrom_names)
-            _write_bin_header(fbin, n_sites=written, n_samples=n_samples, reserved=0)
             _write_bsite_header(
                 fsite,
                 n_sites=written,
@@ -746,9 +688,9 @@ def write_gfd_output(
                 chrom_dict_offset=chrom_dict_offset,
                 flags=0,
             )
-            fbin.flush()
             fsite.flush()
         finally:
+            writer.close()
             _close_site_progress(progress, pbar)
 
     if total_sites is not None and written != int(total_sites):

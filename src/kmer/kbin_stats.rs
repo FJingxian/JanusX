@@ -1,9 +1,9 @@
-use crate::kmer::format::{KmergeMeta, SampleEntry, BSITE_HEADER_SIZE};
+use crate::breader::{open_bkmer_mmap, open_bsite_mmap, typed_body_view, TypedBodyView};
+use crate::kmer::format::{KmergeMeta, SampleEntry};
 use crate::kmer::progress::ProgressFn;
 use anyhow::{bail, Context, Result};
 #[cfg(unix)]
 use memmap2::Advice;
-use memmap2::MmapOptions;
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
 use std::fs::File;
@@ -39,6 +39,7 @@ struct CompareGroupMask {
 pub(crate) struct KbinComparePlan {
     pub meta_path: PathBuf,
     pub idv_path: PathBuf,
+    pub bkmer_path: PathBuf,
     pub bsite_path: PathBuf,
     pub k: u32,
     pub n_samples: usize,
@@ -79,12 +80,40 @@ pub(crate) fn inspect_kbin_compare(
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
     let idv_path = base_dir.join(&meta.idv_file);
+    let bkmer_path = base_dir.join(&meta.bkmer_file);
     let bsite_path = base_dir.join(&meta.bsite_file);
     if !idv_path.is_file() {
         bail!("idv file not found: {}", idv_path.display());
     }
+    if !bkmer_path.is_file() {
+        bail!("bkmer file not found: {}", bkmer_path.display());
+    }
     if !bsite_path.is_file() {
         bail!("bsite file not found: {}", bsite_path.display());
+    }
+
+    let bkmer =
+        open_bkmer_mmap(&bkmer_path, "kbin_compare::inspect.bkmer").map_err(anyhow::Error::msg)?;
+    if bkmer.header.k != meta.k || bkmer.header.n_kmers != meta.n_kmers {
+        bail!(
+            "bkmer header does not match meta for {}",
+            bkmer_path.display()
+        );
+    }
+    let _ = bkmer
+        .body_prefix_for_rows(meta.n_kmers)
+        .map_err(anyhow::Error::msg)?;
+
+    let bsite =
+        open_bsite_mmap(&bsite_path, "kbin_compare::inspect.bsite").map_err(anyhow::Error::msg)?;
+    if bsite.header.n_samples != meta.n_samples
+        || bsite.header.n_kmers != meta.n_kmers
+        || bsite.header.bytes_per_col != meta.bytes_per_col
+    {
+        bail!(
+            "bsite header does not match meta for {}",
+            bsite_path.display()
+        );
     }
 
     let samples = read_idv_file(&idv_path)?;
@@ -127,6 +156,7 @@ pub(crate) fn inspect_kbin_compare(
     Ok(KbinComparePlan {
         meta_path,
         idv_path,
+        bkmer_path,
         bsite_path,
         k: meta.k,
         n_samples,
@@ -151,19 +181,10 @@ pub(crate) fn scan_kbin_compare(
     threads: usize,
     progress_callback: Option<ProgressFn>,
 ) -> Result<KbinPatternScan> {
-    let file = File::open(&plan.bsite_path)
-        .with_context(|| format!("failed to open bsite file: {}", plan.bsite_path.display()))?;
-    let mmap = unsafe {
-        MmapOptions::new()
-            .map(&file)
-            .with_context(|| format!("failed to mmap bsite file: {}", plan.bsite_path.display()))?
-    };
+    let opened = open_bsite_mmap(&plan.bsite_path, "kbin_compare").map_err(anyhow::Error::msg)?;
     #[cfg(unix)]
-    let _ = mmap.advise(Advice::Sequential);
-    if mmap.len() < BSITE_HEADER_SIZE {
-        bail!("truncated bsite file: {}", plan.bsite_path.display());
-    }
-    let header = parse_bsite_header(&mmap[..BSITE_HEADER_SIZE], &plan.bsite_path)?;
+    let _ = opened.mmap.advise(Advice::Sequential);
+    let header = opened.header;
     if header.n_samples != plan.n_samples as u64
         || header.n_kmers != plan.n_kmers
         || header.bytes_per_col != plan.bytes_per_col as u64
@@ -174,15 +195,8 @@ pub(crate) fn scan_kbin_compare(
         );
     }
 
-    let scan_bytes = plan
-        .n_kmers
-        .checked_mul(plan.bytes_per_col as u64)
-        .ok_or_else(|| anyhow::anyhow!("scan byte size overflow"))?;
-    let body_len = usize::try_from(scan_bytes).context("scan byte size does not fit usize")?;
-    if mmap.len() < BSITE_HEADER_SIZE.saturating_add(body_len) {
-        bail!("truncated bsite payload: {}", plan.bsite_path.display());
-    }
-    let body = &mmap[BSITE_HEADER_SIZE..BSITE_HEADER_SIZE + body_len];
+    let body = opened.body().map_err(anyhow::Error::msg)?;
+    let scan_bytes = u64::try_from(body.len()).context("scan byte size does not fit u64")?;
 
     let chunk_rows = chunk_rows_for_scan(plan.bytes_per_col);
     let ranges = build_row_ranges(
@@ -621,39 +635,6 @@ fn detect_packed_u32_kernel() -> PackedU32Kernel {
     PackedU32Kernel::Scalar
 }
 
-#[derive(Clone, Copy, Debug)]
-struct ParsedBsiteHeader {
-    n_samples: u64,
-    n_kmers: u64,
-    bytes_per_col: u64,
-}
-
-fn parse_bsite_header(header: &[u8], path: &Path) -> Result<ParsedBsiteHeader> {
-    if header.len() != BSITE_HEADER_SIZE {
-        bail!("invalid bsite header size in {}", path.display());
-    }
-    if &header[..8] != b"JXBSIT1\0" {
-        bail!("invalid bsite magic in {}", path.display());
-    }
-    let version = u32::from_le_bytes(header[8..12].try_into().expect("version slice"));
-    let layout = u32::from_le_bytes(header[12..16].try_into().expect("layout slice"));
-    if version != 1 {
-        bail!(
-            "unsupported bsite version in {}: {}",
-            path.display(),
-            version
-        );
-    }
-    if layout != 1 {
-        bail!("unsupported bsite layout in {}: {}", path.display(), layout);
-    }
-    Ok(ParsedBsiteHeader {
-        n_samples: u64::from_le_bytes(header[16..24].try_into().expect("n_samples slice")),
-        n_kmers: u64::from_le_bytes(header[24..32].try_into().expect("n_kmers slice")),
-        bytes_per_col: u64::from_le_bytes(header[32..40].try_into().expect("bytes_per_col slice")),
-    })
-}
-
 fn chunk_rows_for_scan(bytes_per_col: usize) -> usize {
     let target_bytes = 64usize * 1024 * 1024;
     (target_bytes / bytes_per_col.max(1)).max(1)
@@ -671,45 +652,6 @@ fn build_row_ranges(total_rows: usize, chunk_rows: usize) -> Vec<(usize, usize)>
         out.push((0, 0));
     }
     out
-}
-
-enum TypedBodyView<'a> {
-    U8(&'a [u8]),
-    U16(&'a [u16]),
-    U32(&'a [u32]),
-    U64(&'a [u64]),
-    Bytes,
-}
-
-fn typed_body_view<'a>(body: &'a [u8], bytes_per_col: usize) -> TypedBodyView<'a> {
-    match bytes_per_col {
-        1 => TypedBodyView::U8(body),
-        2 => {
-            let (prefix, values, suffix) = unsafe { body.align_to::<u16>() };
-            if prefix.is_empty() && suffix.is_empty() {
-                TypedBodyView::U16(values)
-            } else {
-                TypedBodyView::Bytes
-            }
-        }
-        4 => {
-            let (prefix, values, suffix) = unsafe { body.align_to::<u32>() };
-            if prefix.is_empty() && suffix.is_empty() {
-                TypedBodyView::U32(values)
-            } else {
-                TypedBodyView::Bytes
-            }
-        }
-        8 => {
-            let (prefix, values, suffix) = unsafe { body.align_to::<u64>() };
-            if prefix.is_empty() && suffix.is_empty() {
-                TypedBodyView::U64(values)
-            } else {
-                TypedBodyView::Bytes
-            }
-        }
-        _ => TypedBodyView::Bytes,
-    }
 }
 
 fn scan_range_packed_u8(
@@ -1185,7 +1127,7 @@ mod tests {
     use super::{
         inspect_kbin_compare, planned_kbin_outputs, scan_kbin_compare, write_kbin_compare_outputs,
     };
-    use crate::kmer::format::{BsiteHeader, KmergeMeta, SampleEntry};
+    use crate::kmer::format::{BkmerHeader, BsiteHeader, KmergeMeta, SampleEntry};
     use crate::kmer::writer::{write_idv_file, write_meta_json};
     use std::fs::{self, File};
     use std::io::Write;
@@ -1207,6 +1149,7 @@ mod tests {
         let prefix = dir.join("kmerge");
         let meta_path = dir.join("kmerge.meta.json");
         let idv_path = dir.join("kmerge.idv");
+        let bkmer_path = dir.join("kmerge.bkmer");
         let bsite_path = dir.join("kmerge.bsite");
 
         let samples = vec![
@@ -1244,6 +1187,19 @@ mod tests {
             compression: "none".to_string(),
         };
         write_meta_json(&meta_path, &meta).unwrap();
+
+        let mut bk_writer = File::create(&bkmer_path).unwrap();
+        BkmerHeader {
+            k: 5,
+            n_kmers: 5,
+            canonical: 1,
+        }
+        .write_to(&mut bk_writer)
+        .unwrap();
+        for kmer in [1_u64, 2, 3, 4, 5] {
+            bk_writer.write_all(&kmer.to_le_bytes()).unwrap();
+        }
+        bk_writer.flush().unwrap();
 
         let mut writer = File::create(&bsite_path).unwrap();
         BsiteHeader {

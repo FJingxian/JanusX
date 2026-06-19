@@ -379,9 +379,10 @@ fn run_kstats_kbin(args: KstatsArgs) -> Result<KstatsSummary> {
     emit_run_line(
         log_path,
         &format!(
-            "Bitmatrix files: meta={} | idv={} | bsite={}",
+            "Bitmatrix files: meta={} | idv={} | bkmer={} | bsite={}",
             plan.meta_path.display(),
             plan.idv_path.display(),
+            plan.bkmer_path.display(),
             plan.bsite_path.display()
         ),
     )?;

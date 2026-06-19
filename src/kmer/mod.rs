@@ -6,7 +6,6 @@ pub mod format;
 pub mod inputs;
 pub mod kbin_stats;
 pub mod progress;
-pub mod reader;
 pub mod record;
 pub mod stage1_bucket;
 pub mod stage2_merge;

@@ -1,5 +1,6 @@
 use pyo3::exceptions::PyKeyboardInterrupt;
 use pyo3::exceptions::PyRuntimeError;
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -269,27 +270,47 @@ pub(crate) fn get_cached_pool(threads: usize) -> PyResult<Option<Arc<rayon::Thre
     })
 }
 
+fn parse_index_vec_i64_impl(
+    indices: &[i64],
+    upper_bound: usize,
+    label: &str,
+) -> Result<Vec<usize>, String> {
+    let mut out = Vec::with_capacity(indices.len());
+    for (i, &v) in indices.iter().enumerate() {
+        if v < 0 {
+            return Err(format!("{label}[{i}] must be >= 0, got {v}"));
+        }
+        let u = v as usize;
+        if u >= upper_bound {
+            return Err(format!("{label}[{i}] out of range: {u} >= {upper_bound}"));
+        }
+        out.push(u);
+    }
+    Ok(out)
+}
+
 pub(crate) fn parse_index_vec_i64(
     indices: &[i64],
     upper_bound: usize,
     label: &str,
 ) -> PyResult<Vec<usize>> {
-    let mut out = Vec::with_capacity(indices.len());
-    for (i, &v) in indices.iter().enumerate() {
-        if v < 0 {
-            return Err(PyRuntimeError::new_err(format!(
-                "{label}[{i}] must be >= 0, got {v}"
-            )));
-        }
-        let u = v as usize;
-        if u >= upper_bound {
-            return Err(PyRuntimeError::new_err(format!(
-                "{label}[{i}] out of range: {u} >= {upper_bound}"
-            )));
-        }
-        out.push(u);
-    }
-    Ok(out)
+    parse_index_vec_i64_impl(indices, upper_bound, label).map_err(PyRuntimeError::new_err)
+}
+
+pub(crate) fn parse_index_vec_i64_value_error(
+    indices: &[i64],
+    upper_bound: usize,
+    label: &str,
+) -> PyResult<Vec<usize>> {
+    parse_index_vec_i64_impl(indices, upper_bound, label).map_err(PyValueError::new_err)
+}
+
+pub(crate) fn parse_index_vec_i64_result(
+    indices: &[i64],
+    upper_bound: usize,
+    label: &str,
+) -> Result<Vec<usize>, String> {
+    parse_index_vec_i64_impl(indices, upper_bound, label)
 }
 
 pub(crate) struct AsyncTsvWriter {

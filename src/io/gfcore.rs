@@ -5,17 +5,18 @@ use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 use crate::bedmath::packed_byte_lut;
+use crate::bincore::parse_bin01_header as parse_bin01_header_ctx;
+use crate::binsidecar::{
+    BIN_SITE_HEADER_LEN, BIN_SITE_MAGIC, LEGACY_BSITE_HEADER_LEN, LEGACY_BSITE_MAGIC,
+    LEGACY_BSITE_VERSION,
+};
 use flate2::read::MultiGzDecoder;
 use memmap2::{Mmap, MmapOptions};
 
+#[cfg(test)]
+use crate::bincore::BIN01_MAGIC;
+
 const BED_HEADER_LEN: usize = 3;
-const BIN01_MAGIC: &[u8; 8] = b"JXBIN001";
-const BIN01_HEADER_LEN: usize = 32;
-const BIN_SITE_MAGIC: &[u8; 8] = b"JXBSITE1";
-const BIN_SITE_HEADER_LEN: usize = 24;
-const BSITE_MAGIC: &[u8; 8] = b"JXBSIT02";
-const BSITE_HEADER_LEN: usize = 36;
-const BSITE_VERSION: u16 = 1;
 
 #[inline]
 fn system_page_size() -> usize {
@@ -1018,14 +1019,14 @@ fn read_bin_site_file(path: &Path) -> Result<Vec<SiteInfo>, String> {
 
 fn read_bsite_file(path: &Path) -> Result<Vec<SiteInfo>, String> {
     let bytes = fs::read(path).map_err(|e| e.to_string())?;
-    if bytes.len() < BSITE_HEADER_LEN {
+    if bytes.len() < LEGACY_BSITE_HEADER_LEN {
         return Err(format!("failed to read bsite header {}", path.display()));
     }
-    if &bytes[0..8] != BSITE_MAGIC {
+    if &bytes[0..8] != LEGACY_BSITE_MAGIC {
         return Err(format!(
             "invalid bsite magic in {} (expect {:?})",
             path.display(),
-            BSITE_MAGIC
+            LEGACY_BSITE_MAGIC
         ));
     }
     let version = u16::from_le_bytes(
@@ -1033,12 +1034,12 @@ fn read_bsite_file(path: &Path) -> Result<Vec<SiteInfo>, String> {
             .try_into()
             .map_err(|_| "invalid bsite version".to_string())?,
     );
-    if version != BSITE_VERSION {
+    if version != LEGACY_BSITE_VERSION {
         return Err(format!(
             "unsupported bsite version {} in {} (expect {})",
             version,
             path.display(),
-            BSITE_VERSION
+            LEGACY_BSITE_VERSION
         ));
     }
 
@@ -1063,7 +1064,7 @@ fn read_bsite_file(path: &Path) -> Result<Vec<SiteInfo>, String> {
     );
     let dict_offset = usize::try_from(dict_offset_u64)
         .map_err(|_| "bsite dictionary offset too large for this platform".to_string())?;
-    if dict_offset < BSITE_HEADER_LEN || dict_offset > bytes.len() {
+    if dict_offset < LEGACY_BSITE_HEADER_LEN || dict_offset > bytes.len() {
         return Err(format!(
             "invalid bsite dictionary offset in {}: {}",
             path.display(),
@@ -1072,7 +1073,7 @@ fn read_bsite_file(path: &Path) -> Result<Vec<SiteInfo>, String> {
     }
 
     let mut rows: Vec<(usize, u8, i32, String, String)> = Vec::with_capacity(n_sites);
-    let mut cur = BSITE_HEADER_LEN;
+    let mut cur = LEGACY_BSITE_HEADER_LEN;
     for i in 0..n_sites {
         if cur + 13 > dict_offset {
             return Err(format!(
@@ -1307,14 +1308,14 @@ fn read_site_file_text(path: &Path) -> Result<Vec<SiteInfo>, String> {
     Ok(sites)
 }
 
-fn read_site_file(path: &Path) -> Result<Vec<SiteInfo>, String> {
+pub(crate) fn read_site_file(path: &Path) -> Result<Vec<SiteInfo>, String> {
     let mut probe = File::open(path).map_err(|e| e.to_string())?;
     let mut magic = [0u8; 8];
     if probe.read_exact(&mut magic).is_ok() {
         if &magic == BIN_SITE_MAGIC {
             return read_bin_site_file(path);
         }
-        if &magic == BSITE_MAGIC {
+        if &magic == LEGACY_BSITE_MAGIC {
             return read_bsite_file(path);
         }
     }
@@ -1724,40 +1725,9 @@ fn parse_npy_f32_header(bytes: &[u8]) -> Result<(usize, usize, usize), String> {
 }
 
 fn parse_bin01_header(bytes: &[u8]) -> Result<(usize, usize, usize), String> {
-    if bytes.len() < BIN01_HEADER_LEN {
-        return Err("BIN file too small".into());
-    }
-    if &bytes[0..8] != BIN01_MAGIC {
-        return Err("invalid BIN magic".into());
-    }
-    let n_snps = u64::from_le_bytes(
-        bytes[8..16]
-            .try_into()
-            .map_err(|_| "invalid BIN header n_snps".to_string())?,
-    );
-    let n_samples = u64::from_le_bytes(
-        bytes[16..24]
-            .try_into()
-            .map_err(|_| "invalid BIN header n_samples".to_string())?,
-    );
-    let n_snps = usize::try_from(n_snps)
-        .map_err(|_| "BIN n_snps too large for this platform".to_string())?;
-    let n_samples = usize::try_from(n_samples)
-        .map_err(|_| "BIN n_samples too large for this platform".to_string())?;
-    if n_samples == 0 {
-        return Err("BIN n_samples is zero".into());
-    }
-    let row_bytes = (n_samples + 7) / 8;
-    let data_bytes = n_snps
-        .checked_mul(row_bytes)
-        .ok_or_else(|| "BIN data size overflow".to_string())?;
-    let expected_len = BIN01_HEADER_LEN
-        .checked_add(data_bytes)
-        .ok_or_else(|| "BIN file size overflow".to_string())?;
-    if expected_len > bytes.len() {
-        return Err("BIN payload truncated".into());
-    }
-    Ok((n_snps, n_samples, BIN01_HEADER_LEN))
+    let (n_snps, n_samples, _row_bytes, data_offset) =
+        parse_bin01_header_ctx(bytes, "gfcore::parse_bin01_header")?;
+    Ok((n_snps, n_samples, data_offset))
 }
 
 fn convert_text_matrix_to_npy(
@@ -3328,7 +3298,7 @@ impl TxtSnpIter {
 mod tests {
     use super::{
         process_snp_row_with_stats, process_snp_row_with_stats_preserve_alt, read_bim, TxtSnpIter,
-        BIN01_MAGIC, BIN_SITE_MAGIC, BSITE_MAGIC, BSITE_VERSION,
+        BIN01_MAGIC, BIN_SITE_MAGIC, LEGACY_BSITE_MAGIC, LEGACY_BSITE_VERSION,
     };
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -3594,11 +3564,11 @@ mod tests {
 
         let row1_len = 13usize + 2usize + 1usize + 2usize + 1usize;
         let row2_len = 13usize + 2usize + 2usize + 2usize + 1usize;
-        let dict_offset = (36usize + row1_len + row2_len) as u64;
+        let dict_offset = (LEGACY_BSITE_HEADER_LEN + row1_len + row2_len) as u64;
 
         let mut sb: Vec<u8> = Vec::new();
-        sb.extend_from_slice(BSITE_MAGIC);
-        sb.extend_from_slice(&(BSITE_VERSION as u16).to_le_bytes());
+        sb.extend_from_slice(LEGACY_BSITE_MAGIC);
+        sb.extend_from_slice(&LEGACY_BSITE_VERSION.to_le_bytes());
         sb.extend_from_slice(&(0u16).to_le_bytes()); // flags
         sb.extend_from_slice(&(2u64).to_le_bytes()); // n_sites
         sb.extend_from_slice(&(1u32).to_le_bytes()); // n_chrom

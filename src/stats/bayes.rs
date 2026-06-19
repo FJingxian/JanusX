@@ -18,7 +18,7 @@ use crate::blas::{
     cblas_daxpy_dispatch, cblas_ddot_dispatch, cblas_dgemm_dispatch, CblasInt, OpenBlasThreadGuard,
     CBLAS_COL_MAJOR, CBLAS_NO_TRANS, CBLAS_TRANS,
 };
-use crate::stats_common::get_cached_pool;
+use crate::stats_common::{get_cached_pool, parse_index_vec_i64_value_error};
 
 fn array1_to_vec(arr: &PyReadonlyArray1<f64>) -> Vec<f64> {
     arr.as_array().iter().copied().collect()
@@ -36,32 +36,13 @@ fn array2_to_vec(arr: &PyReadonlyArray2<f64>) -> Vec<f64> {
     out
 }
 
-fn parse_index_vec_i64(indices: &[i64], upper_bound: usize, label: &str) -> PyResult<Vec<usize>> {
-    let mut out = Vec::with_capacity(indices.len());
-    for (i, &v) in indices.iter().enumerate() {
-        if v < 0 {
-            return Err(PyValueError::new_err(format!(
-                "{label}[{i}] must be >= 0, got {v}"
-            )));
-        }
-        let u = v as usize;
-        if u >= upper_bound {
-            return Err(PyValueError::new_err(format!(
-                "{label}[{i}] out of range: {u} >= {upper_bound}"
-            )));
-        }
-        out.push(u);
-    }
-    Ok(out)
-}
-
 fn parse_optional_index_vec_i64(
     indices: Option<&PyReadonlyArray1<i64>>,
     upper_bound: usize,
     label: &str,
 ) -> PyResult<Vec<usize>> {
     match indices {
-        Some(arr) => parse_index_vec_i64(arr.as_slice()?, upper_bound, label),
+        Some(arr) => parse_index_vec_i64_value_error(arr.as_slice()?, upper_bound, label),
         None => Ok(Vec::new()),
     }
 }
@@ -3144,7 +3125,8 @@ pub fn bayesa_packed(
         Err(_) => Cow::Owned(array1_to_vec(&y)),
     };
     let n = y_vec.len();
-    let sample_idx = parse_index_vec_i64(sample_indices.as_slice()?, n_samples, "sample_indices")?;
+    let sample_idx =
+        parse_index_vec_i64_value_error(sample_indices.as_slice()?, n_samples, "sample_indices")?;
     if sample_idx.len() != n {
         return Err(PyValueError::new_err(format!(
             "sample_indices length mismatch: got {}, expected len(y)={n}",
@@ -3349,7 +3331,8 @@ pub fn bayesb_packed(
         Err(_) => Cow::Owned(array1_to_vec(&y)),
     };
     let n = y_vec.len();
-    let sample_idx = parse_index_vec_i64(sample_indices.as_slice()?, n_samples, "sample_indices")?;
+    let sample_idx =
+        parse_index_vec_i64_value_error(sample_indices.as_slice()?, n_samples, "sample_indices")?;
     if sample_idx.len() != n {
         return Err(PyValueError::new_err(format!(
             "sample_indices length mismatch: got {}, expected len(y)={n}",
@@ -3567,7 +3550,8 @@ pub fn bayescpi_packed(
         Err(_) => Cow::Owned(array1_to_vec(&y)),
     };
     let n = y_vec.len();
-    let sample_idx = parse_index_vec_i64(sample_indices.as_slice()?, n_samples, "sample_indices")?;
+    let sample_idx =
+        parse_index_vec_i64_value_error(sample_indices.as_slice()?, n_samples, "sample_indices")?;
     if sample_idx.len() != n {
         return Err(PyValueError::new_err(format!(
             "sample_indices length mismatch: got {}, expected len(y)={n}",
@@ -4912,7 +4896,8 @@ pub fn bayesa_packed_trace<'py>(
         Err(_) => Cow::Owned(array1_to_vec(&y)),
     };
     let n = y_vec.len();
-    let sample_idx = parse_index_vec_i64(sample_indices.as_slice()?, n_samples, "sample_indices")?;
+    let sample_idx =
+        parse_index_vec_i64_value_error(sample_indices.as_slice()?, n_samples, "sample_indices")?;
     if sample_idx.len() != n {
         return Err(PyValueError::new_err(format!(
             "sample_indices length mismatch: got {}, expected len(y)={n}",
@@ -5105,7 +5090,8 @@ pub fn bayesb_packed_trace<'py>(
         Err(_) => Cow::Owned(array1_to_vec(&y)),
     };
     let n = y_vec.len();
-    let sample_idx = parse_index_vec_i64(sample_indices.as_slice()?, n_samples, "sample_indices")?;
+    let sample_idx =
+        parse_index_vec_i64_value_error(sample_indices.as_slice()?, n_samples, "sample_indices")?;
     if sample_idx.len() != n {
         return Err(PyValueError::new_err(format!(
             "sample_indices length mismatch: got {}, expected len(y)={n}",
@@ -5303,7 +5289,8 @@ pub fn bayescpi_packed_trace<'py>(
         Err(_) => Cow::Owned(array1_to_vec(&y)),
     };
     let n = y_vec.len();
-    let sample_idx = parse_index_vec_i64(sample_indices.as_slice()?, n_samples, "sample_indices")?;
+    let sample_idx =
+        parse_index_vec_i64_value_error(sample_indices.as_slice()?, n_samples, "sample_indices")?;
     if sample_idx.len() != n {
         return Err(PyValueError::new_err(format!(
             "sample_indices length mismatch: got {}, expected len(y)={n}",

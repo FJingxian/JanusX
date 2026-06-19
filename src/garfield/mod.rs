@@ -1,10 +1,11 @@
-mod bs;
+pub(crate) mod bs;
 mod permutation;
 mod residual;
 mod sampling;
 mod score;
 mod score_gpu;
 
+use self::bs::{beam_search_and_binary_mcc, beam_search_and_continuous_abs_corr, BeamAndResult};
 use self::bs::{
     beam_search_train_test_continuous_with_literal_scores,
     precompute_literal_singleton_scores_batched, LiteralScoreBatchRequest, LiteralSingletonScore,
@@ -21,8 +22,17 @@ use self::permutation::{
     DEFAULT_RULE_STRUCTURE_BOOTSTRAP_MAX_REPEATS, DEFAULT_RULE_STRUCTURE_BOOTSTRAP_MIN_REPEATS,
     DEFAULT_RULE_STRUCTURE_BOOTSTRAP_STABLE_REPEATS, DEFAULT_RULE_STRUCTURE_DENSITY_TOPK,
 };
-use crate::beam::{beam_search_and_binary_mcc, beam_search_and_continuous_abs_corr, BeamAndResult};
+use crate::bincore::{
+    append_suffix, bin01_header_bytes, bin01_id_sidecar_path, bin_prefix, build_windows_from_sites,
+    discover_id_sidecar, discover_site_sidecar, parse_bin01_header, resolve_bin01_path, BinWindow,
+};
+use crate::binwriter::{Bin01SiteMode, Bin01SiteRecordRef, Bin01Writer};
 use crate::bitwise::{bitand_assign, bitnot_masked};
+use crate::breader::{
+    gather_rows_by_indices, gather_rows_by_range, load_bin01_as_u64_words,
+    load_bin01_packed_payload_owned, load_bin01_selected_rows_as_u64_words,
+};
+use crate::bstats::{apply_tail_mask, tail_mask, words_for_samples};
 use crate::gfcore::{
     process_snp_row, read_fam, BedSnpIter, HmpSnpIter, SiteInfo, TxtSnpIter, VcfSnpIter,
 };
@@ -57,10 +67,9 @@ use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
 use std::collections::{HashMap, HashSet};
 use std::env;
-use std::ffi::OsString;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, BufWriter, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -89,8 +98,6 @@ pub use score_gpu::{
     garfield_score_cont_centered_gain_batch_packed_metal_py,
 };
 
-const BIN01_MAGIC: &[u8; 8] = b"JXBIN001";
-const BIN01_HEADER_LEN: usize = 32;
 const GARFIELD_CONSTRAINED_BEAM_PAR_MIN_TOTAL_CANDS: usize = 1_024;
 const GARFIELD_CONSTRAINED_BEAM_PAR_CHUNK_CANDS: usize = 256;
 const GARFIELD_NULL_ML_TOP_FRAC: f64 = 0.80;
@@ -179,6 +186,16 @@ struct EncodedRow {
     bits: Vec<u8>,
 }
 
+fn write_encoded_rows_bin(writer: &mut Bin01Writer, rows: &[EncodedRow]) -> Result<(), String> {
+    for row in rows.iter() {
+        writer.write_bitrow(
+            row.bits.as_slice(),
+            Some(Bin01SiteRecordRef::from(&row.site)),
+        )?;
+    }
+    Ok(())
+}
+
 enum GarfieldInputReader {
     Bed(BedSnpIter),
     Vcf(VcfSnpIter),
@@ -197,13 +214,7 @@ impl GarfieldInputReader {
     }
 }
 
-#[derive(Clone, Debug)]
-struct GarfieldWindow {
-    chrom: String,
-    bp_start: i32,
-    bp_end: i32,
-    indices: Vec<usize>,
-}
+type GarfieldWindow = BinWindow;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct GarfieldNullChunk {
@@ -348,30 +359,6 @@ fn garfield_stage_progress_notify(
         })?;
     }
     Ok(())
-}
-
-#[inline]
-fn words_for_samples(n_samples: usize) -> usize {
-    n_samples.div_ceil(64).max(1)
-}
-
-#[inline]
-fn tail_mask(n_samples: usize) -> Option<u64> {
-    let rem = n_samples & 63;
-    if rem == 0 {
-        None
-    } else {
-        Some((1u64 << rem) - 1u64)
-    }
-}
-
-#[inline]
-fn apply_tail_mask(bits: &mut [u64], mask: Option<u64>) {
-    if let Some(m) = mask {
-        if let Some(last) = bits.last_mut() {
-            *last &= m;
-        }
-    }
 }
 
 #[inline]
@@ -689,299 +676,11 @@ where
     })
 }
 
-fn parse_bin01_header(bytes: &[u8], ctx: &str) -> Result<(usize, usize, usize, usize), String> {
-    if bytes.len() < BIN01_HEADER_LEN {
-        return Err(format!("{ctx}: BIN file too small"));
-    }
-    if &bytes[0..8] != BIN01_MAGIC {
-        return Err(format!("{ctx}: invalid BIN magic (expected JXBIN001)"));
-    }
-
-    let n_rows_u64 = u64::from_le_bytes(
-        bytes[8..16]
-            .try_into()
-            .map_err(|_| format!("{ctx}: malformed BIN header n_rows"))?,
-    );
-    let n_samples_u64 = u64::from_le_bytes(
-        bytes[16..24]
-            .try_into()
-            .map_err(|_| format!("{ctx}: malformed BIN header n_samples"))?,
-    );
-
-    let n_rows = usize::try_from(n_rows_u64)
-        .map_err(|_| format!("{ctx}: n_rows too large for this platform"))?;
-    let n_samples = usize::try_from(n_samples_u64)
-        .map_err(|_| format!("{ctx}: n_samples too large for this platform"))?;
-    if n_samples == 0 {
-        return Err(format!("{ctx}: n_samples is zero"));
-    }
-
-    let row_bytes = n_samples.div_ceil(8);
-    let data_bytes = n_rows
-        .checked_mul(row_bytes)
-        .ok_or_else(|| format!("{ctx}: BIN payload size overflow"))?;
-    let expected = BIN01_HEADER_LEN
-        .checked_add(data_bytes)
-        .ok_or_else(|| format!("{ctx}: BIN file size overflow"))?;
-    if bytes.len() < expected {
-        return Err(format!(
-            "{ctx}: BIN payload truncated (have {}, need at least {})",
-            bytes.len(),
-            expected
-        ));
-    }
-
-    Ok((n_rows, n_samples, row_bytes, BIN01_HEADER_LEN))
-}
-
-fn load_bin01_as_u64_words(path: &str) -> Result<(Vec<u64>, usize, usize, usize), String> {
-    let ctx = "garfield::load_bin01_as_u64_words";
-    let bytes = fs::read(path).map_err(|e| format!("{ctx}: failed to read {path}: {e}"))?;
-    let (n_rows, n_samples, row_bytes, data_offset) = parse_bin01_header(&bytes, ctx)?;
-
-    let row_words = words_for_samples(n_samples);
-    let total_words = n_rows
-        .checked_mul(row_words)
-        .ok_or_else(|| format!("{ctx}: n_rows * row_words overflow"))?;
-    let mut bits_flat = vec![0u64; total_words];
-
-    let mask = tail_mask(n_samples);
-    for r in 0..n_rows {
-        let src_start = data_offset
-            .checked_add(
-                r.checked_mul(row_bytes)
-                    .ok_or_else(|| format!("{ctx}: row byte offset overflow"))?,
-            )
-            .ok_or_else(|| format!("{ctx}: row byte offset overflow"))?;
-        let src_end = src_start
-            .checked_add(row_bytes)
-            .ok_or_else(|| format!("{ctx}: row byte end overflow"))?;
-        let src = &bytes[src_start..src_end];
-
-        let dst_start = r
-            .checked_mul(row_words)
-            .ok_or_else(|| format!("{ctx}: row word offset overflow"))?;
-        let dst = &mut bits_flat[dst_start..dst_start + row_words];
-
-        for w in 0..row_words {
-            let b0 = w * 8;
-            if b0 >= row_bytes {
-                break;
-            }
-            let b1 = (b0 + 8).min(row_bytes);
-            let mut buf = [0u8; 8];
-            let n = b1 - b0;
-            buf[..n].copy_from_slice(&src[b0..b1]);
-            dst[w] = u64::from_le_bytes(buf);
-        }
-        apply_tail_mask(dst, mask);
-    }
-    Ok((bits_flat, row_words, n_rows, n_samples))
-}
-
-fn load_bin01_selected_rows_as_u64_words(
-    path: &str,
-    row_indices: &[usize],
-) -> Result<(Vec<u64>, usize, usize, usize), String> {
-    let ctx = "garfield::load_bin01_selected_rows_as_u64_words";
-    if row_indices.is_empty() {
-        return Err(format!("{ctx}: row_indices is empty"));
-    }
-    let bytes = fs::read(path).map_err(|e| format!("{ctx}: failed to read {path}: {e}"))?;
-    let (n_rows_all, n_samples, row_bytes, data_offset) = parse_bin01_header(&bytes, ctx)?;
-
-    let row_words = words_for_samples(n_samples);
-    let n_rows = row_indices.len();
-    let total_words = n_rows
-        .checked_mul(row_words)
-        .ok_or_else(|| format!("{ctx}: n_rows * row_words overflow"))?;
-    let mut bits_flat = vec![0u64; total_words];
-
-    let mask = tail_mask(n_samples);
-    for (ri, &src_row_idx) in row_indices.iter().enumerate() {
-        if src_row_idx >= n_rows_all {
-            return Err(format!(
-                "{ctx}: row index out of range: {} (n_rows={})",
-                src_row_idx, n_rows_all
-            ));
-        }
-        let src_start = data_offset
-            .checked_add(
-                src_row_idx
-                    .checked_mul(row_bytes)
-                    .ok_or_else(|| format!("{ctx}: row byte offset overflow"))?,
-            )
-            .ok_or_else(|| format!("{ctx}: row byte offset overflow"))?;
-        let src_end = src_start
-            .checked_add(row_bytes)
-            .ok_or_else(|| format!("{ctx}: row byte end overflow"))?;
-        let src = &bytes[src_start..src_end];
-
-        let dst_start = ri
-            .checked_mul(row_words)
-            .ok_or_else(|| format!("{ctx}: row word offset overflow"))?;
-        let dst = &mut bits_flat[dst_start..dst_start + row_words];
-
-        for w in 0..row_words {
-            let b0 = w * 8;
-            if b0 >= row_bytes {
-                break;
-            }
-            let b1 = (b0 + 8).min(row_bytes);
-            let mut buf = [0u8; 8];
-            let n = b1 - b0;
-            buf[..n].copy_from_slice(&src[b0..b1]);
-            dst[w] = u64::from_le_bytes(buf);
-        }
-        apply_tail_mask(dst, mask);
-    }
-    Ok((bits_flat, row_words, n_rows, n_samples))
-}
-
-fn resolve_bin01_path(path: &str) -> Result<PathBuf, String> {
-    let raw = path.trim();
-    if raw.is_empty() {
-        return Err("BIN path must not be empty".to_string());
-    }
-    let p = Path::new(raw);
-    if p.exists() {
-        return Ok(p.to_path_buf());
-    }
-    let mut os = p.as_os_str().to_os_string();
-    os.push(".bin");
-    let with_bin = PathBuf::from(os);
-    if with_bin.exists() {
-        return Ok(with_bin);
-    }
-    Err(format!("BIN file not found: {raw}"))
-}
-
-#[inline]
-fn infer_site_sidecar_delimiter(line: &str) -> Option<char> {
-    if line.contains('\t') {
-        Some('\t')
-    } else if line.contains(',') {
-        Some(',')
-    } else {
-        None
-    }
-}
-
-#[inline]
-fn split_site_sidecar_tokens<'a>(line: &'a str, delimiter: Option<char>) -> Vec<&'a str> {
-    match delimiter {
-        Some(delim) => line
-            .split(delim)
-            .map(|x| x.trim())
-            .filter(|x| !x.is_empty())
-            .collect(),
-        None => line.split_whitespace().collect(),
-    }
-}
-
-fn read_site_sidecar_text(path: &Path) -> Result<Vec<SiteInfo>, String> {
-    let fr = BufReader::new(File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?);
-    let is_bim = path
-        .extension()
-        .and_then(|x| x.to_str())
-        .map(|x| x.eq_ignore_ascii_case("bim"))
-        .unwrap_or(false);
-    let mut sites: Vec<SiteInfo> = Vec::new();
-    let mut delimiter: Option<char> = None;
-    let mut header_ready = false;
-    let mut idx_chr = 0usize;
-    let mut idx_pos = 1usize;
-    let mut idx_ref = 2usize;
-    let mut idx_alt = 3usize;
-
-    for (ln, line) in fr.lines().enumerate() {
-        let raw = line.map_err(|e| format!("read {}:{}: {e}", path.display(), ln + 1))?;
-        let s = raw.trim();
-        if s.is_empty() {
-            continue;
-        }
-        if delimiter.is_none() {
-            delimiter = infer_site_sidecar_delimiter(s);
-        }
-        let toks = split_site_sidecar_tokens(s, delimiter);
-        if toks.is_empty() {
-            continue;
-        }
-        if !header_ready {
-            header_ready = true;
-            let low: Vec<String> = toks.iter().map(|x| x.trim().to_ascii_lowercase()).collect();
-            let pick = |cands: &[&str]| -> Option<usize> {
-                low.iter().position(|v| cands.iter().any(|cand| v == cand))
-            };
-            if let (Some(chr_i), Some(pos_i), Some(ref_i), Some(alt_i)) = (
-                pick(&["#chrom", "chrom", "chr", "chromosome"]),
-                pick(&["pos", "bp", "position", "ps"]),
-                pick(&["ref", "a0", "allele0", "allele_0", "ref_allele"]),
-                pick(&["alt", "a1", "allele1", "allele_1", "alt_allele"]),
-            ) {
-                idx_chr = chr_i;
-                idx_pos = pos_i;
-                idx_ref = ref_i;
-                idx_alt = alt_i;
-                continue;
-            }
-        }
-        if (is_bim || (idx_pos == 1 && idx_ref == 2 && idx_alt == 3)) && toks.len() >= 6 {
-            idx_chr = 0;
-            idx_pos = 3;
-            idx_ref = 4;
-            idx_alt = 5;
-        }
-        if toks.len() <= idx_alt {
-            return Err(format!(
-                "Malformed site sidecar line at {}:{}: {s}",
-                path.display(),
-                ln + 1
-            ));
-        }
-        let pos = toks[idx_pos].parse::<i32>().map_err(|_| {
-            format!(
-                "invalid position at {}:{} -> {}",
-                path.display(),
-                ln + 1,
-                toks[idx_pos]
-            )
-        })?;
-        let chrom = toks[idx_chr].to_string();
-        let snp = if idx_chr != 1 && toks.len() > 1 && !toks[1].trim().is_empty() {
-            toks[1].to_string()
-        } else {
-            format!("{}_{}", chrom, pos)
-        };
-        sites.push(SiteInfo {
-            chrom,
-            pos,
-            snp,
-            ref_allele: toks[idx_ref].to_string(),
-            alt_allele: toks[idx_alt].to_string(),
-        });
-    }
-    if sites.is_empty() {
-        return Err(format!("no site rows found in {}", path.display()));
-    }
-    Ok(sites)
-}
-
 fn load_bin01_sites(path: &str, n_rows: usize) -> Result<Option<Vec<SiteInfo>>, String> {
-    if let Ok(it) = TxtSnpIter::new(path, None) {
-        if it.sites.len() < n_rows {
-            return Err(format!(
-                "BIN sidecar site count mismatch: {} < n_rows={}",
-                it.sites.len(),
-                n_rows
-            ));
-        }
-        return Ok(Some(it.sites));
-    }
     let Some(site_path) = discover_site_sidecar(path) else {
         return Ok(None);
     };
-    let sites = read_site_sidecar_text(&site_path)?;
+    let sites = crate::gfcore::read_site_file(&site_path)?;
     if sites.len() < n_rows {
         return Err(format!(
             "BIN sidecar site count mismatch: {} < n_rows={}",
@@ -1013,16 +712,8 @@ fn load_bin01_packed_owned(
     };
     let resolved = resolve_bin01_path(path)?;
     let resolved_str = resolved.to_string_lossy().to_string();
-    let bytes = fs::read(&resolved)
-        .map_err(|e| format!("{ctx}: failed to read {}: {e}", resolved.display()))?;
-    let (n_rows, n_samples, row_bytes, data_offset) = parse_bin01_header(&bytes, ctx)?;
-    let payload_len = n_rows
-        .checked_mul(row_bytes)
-        .ok_or_else(|| format!("{ctx}: packed payload size overflow"))?;
-    let payload_end = data_offset
-        .checked_add(payload_len)
-        .ok_or_else(|| format!("{ctx}: packed payload end overflow"))?;
-    let packed = bytes[data_offset..payload_end].to_vec();
+    let (packed, n_rows, n_samples, row_bytes) =
+        load_bin01_packed_payload_owned(&resolved_str, ctx)?;
     let group_ids = compute_bin01_group_ids(&resolved_str, n_rows)?;
     if require_grouped_rows {
         let mut seen: HashSet<u64> = HashSet::with_capacity(group_ids.len());
@@ -1040,64 +731,6 @@ fn load_bin01_packed_owned(
         }
     }
     Ok((packed, group_ids, n_samples, n_rows, row_bytes))
-}
-
-#[inline]
-fn append_suffix(prefix: &Path, suffix: &str) -> PathBuf {
-    let mut os: OsString = prefix.as_os_str().to_os_string();
-    os.push(suffix);
-    PathBuf::from(os)
-}
-
-fn bin_prefix(path: &str) -> PathBuf {
-    let p = Path::new(path);
-    let mut out = p.to_path_buf();
-    let is_bin = p
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.eq_ignore_ascii_case("bin"))
-        .unwrap_or(false);
-    if is_bin {
-        out.set_extension("");
-    }
-    out
-}
-
-fn discover_site_sidecar(path: &str) -> Option<PathBuf> {
-    let prefix = bin_prefix(path);
-    let candidates = [
-        append_suffix(&prefix, ".bsite"),
-        append_suffix(&prefix, ".site"),
-        append_suffix(&prefix, ".site.tsv"),
-        append_suffix(&prefix, ".site.txt"),
-        append_suffix(&prefix, ".site.csv"),
-        append_suffix(&prefix, ".sites.tsv"),
-        append_suffix(&prefix, ".sites.txt"),
-        append_suffix(&prefix, ".sites.csv"),
-        append_suffix(&prefix, ".bin.site"),
-        append_suffix(&prefix, ".bim"),
-    ];
-    for cand in candidates {
-        if cand.exists() {
-            return Some(cand);
-        }
-    }
-    None
-}
-
-fn discover_id_sidecar(path: &str) -> Option<PathBuf> {
-    let prefix = bin_prefix(path);
-    let candidates = [
-        append_suffix(&prefix, ".bin.id"),
-        append_suffix(&prefix, ".id"),
-        append_suffix(&prefix, ".fam"),
-    ];
-    for cand in candidates {
-        if cand.exists() {
-            return Some(cand);
-        }
-    }
-    None
 }
 
 fn copy_site_sidecar(src_bin: &str, dst_bin: &str) -> Result<(), String> {
@@ -1200,7 +833,7 @@ fn write_subset_id_sidecar(
         return Ok(false);
     };
     let src_ids = read_sample_ids_from_sidecar(&src_id_path)?;
-    let dst_id_path = out_bin_id_path(dst_bin);
+    let dst_id_path = bin01_id_sidecar_path(dst_bin);
     if let Some(parent) = dst_id_path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
     }
@@ -1306,47 +939,8 @@ fn normalize_genotype3(v: f32) -> Option<u8> {
     }
 }
 
-fn write_bin01_header(file: &mut File, n_rows: u64, n_samples: usize) -> Result<(), String> {
-    file.seek(SeekFrom::Start(0))
-        .map_err(|e| format!("seek BIN header: {e}"))?;
-    file.write_all(BIN01_MAGIC)
-        .map_err(|e| format!("write BIN magic: {e}"))?;
-    file.write_all(&n_rows.to_le_bytes())
-        .map_err(|e| format!("write BIN n_rows: {e}"))?;
-    file.write_all(&(n_samples as u64).to_le_bytes())
-        .map_err(|e| format!("write BIN n_samples: {e}"))?;
-    file.write_all(&(0u64).to_le_bytes())
-        .map_err(|e| format!("write BIN reserved: {e}"))?;
-    Ok(())
-}
-
-#[inline]
-fn bin_output_prefix(out_bin_path: &str) -> PathBuf {
-    let p = Path::new(out_bin_path);
-    let mut out = p.to_path_buf();
-    let is_bin = p
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.eq_ignore_ascii_case("bin"))
-        .unwrap_or(false);
-    if is_bin {
-        out.set_extension("");
-    }
-    out
-}
-
-#[inline]
-fn out_bin_id_path(out_bin_path: &str) -> PathBuf {
-    append_suffix(&bin_output_prefix(out_bin_path), ".bin.id")
-}
-
-#[inline]
-fn out_bin_site_path(out_bin_path: &str) -> PathBuf {
-    append_suffix(&bin_output_prefix(out_bin_path), ".bin.site")
-}
-
 fn write_sample_id_sidecar(out_bin_path: &str, sample_ids: &[String]) -> Result<(), String> {
-    let id_path = out_bin_id_path(out_bin_path);
+    let id_path = bin01_id_sidecar_path(out_bin_path);
     if let Some(parent) = id_path.parent() {
         fs::create_dir_all(parent)
             .map_err(|e| format!("create parent dir {}: {e}", parent.display()))?;
@@ -1544,80 +1138,6 @@ fn encode_batch_rows(
     }
 }
 
-struct GarfieldBinWriter {
-    file: File,
-    site_fw: BufWriter<File>,
-    row_bytes: usize,
-    n_rows_written: usize,
-}
-
-impl GarfieldBinWriter {
-    fn new(out_bin_path: &str, n_samples: usize) -> Result<Self, String> {
-        let out_path = Path::new(out_bin_path);
-        if let Some(parent) = out_path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| format!("create parent dir {}: {e}", parent.display()))?;
-        }
-        let mut file =
-            File::create(out_path).map_err(|e| format!("create {}: {e}", out_path.display()))?;
-        write_bin01_header(&mut file, 0, n_samples)?;
-
-        let site_path = out_bin_site_path(out_bin_path);
-        if let Some(parent) = site_path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| format!("create parent dir {}: {e}", parent.display()))?;
-        }
-        let site_fw = BufWriter::new(
-            File::create(&site_path).map_err(|e| format!("create {}: {e}", site_path.display()))?,
-        );
-        Ok(Self {
-            file,
-            site_fw,
-            row_bytes: row_bytes_for_samples(n_samples),
-            n_rows_written: 0,
-        })
-    }
-
-    fn write_rows(&mut self, rows: &[EncodedRow]) -> Result<(), String> {
-        for row in rows.iter() {
-            if row.bits.len() != self.row_bytes {
-                return Err(format!(
-                    "encoded row byte mismatch: got {}, expected {}",
-                    row.bits.len(),
-                    self.row_bytes
-                ));
-            }
-            self.file
-                .write_all(&row.bits)
-                .map_err(|e| format!("write BIN row: {e}"))?;
-            writeln!(
-                self.site_fw,
-                "{}\t{}\t{}\t{}",
-                row.site.chrom, row.site.pos, row.site.ref_allele, row.site.alt_allele
-            )
-            .map_err(|e| format!("write BIN site row: {e}"))?;
-            self.n_rows_written = self.n_rows_written.saturating_add(1);
-        }
-        Ok(())
-    }
-
-    fn finish(mut self, n_samples: usize) -> Result<usize, String> {
-        self.site_fw
-            .flush()
-            .map_err(|e| format!("flush BIN site sidecar: {e}"))?;
-        self.file
-            .flush()
-            .map_err(|e| format!("flush BIN file: {e}"))?;
-        let n_rows_u64 =
-            u64::try_from(self.n_rows_written).map_err(|_| "n_rows overflows u64".to_string())?;
-        write_bin01_header(&mut self.file, n_rows_u64, n_samples)?;
-        self.file
-            .flush()
-            .map_err(|e| format!("flush BIN header rewrite: {e}"))?;
-        Ok(self.n_rows_written)
-    }
-}
-
 #[inline]
 fn normalize_chrom(chrom: &str) -> String {
     let s = chrom.trim();
@@ -1802,52 +1322,6 @@ fn interval_indices(
         out.push(*idx);
     }
     out
-}
-
-fn gather_rows_by_indices(
-    bits_flat: &[u64],
-    row_words: usize,
-    row_indices: &[usize],
-) -> Result<Vec<u64>, String> {
-    let ctx = "garfield::gather_rows_by_indices";
-    if row_indices.is_empty() {
-        return Ok(Vec::new());
-    }
-    let n_rows_all = bits_flat.len() / row_words;
-    let mut out = vec![0u64; row_indices.len() * row_words];
-    for (dst_r, &src_r) in row_indices.iter().enumerate() {
-        if src_r >= n_rows_all {
-            return Err(format!(
-                "{ctx}: row index out of range: {} >= {}",
-                src_r, n_rows_all
-            ));
-        }
-        let src_st = src_r * row_words;
-        let dst_st = dst_r * row_words;
-        out[dst_st..dst_st + row_words].copy_from_slice(&bits_flat[src_st..src_st + row_words]);
-    }
-    Ok(out)
-}
-
-fn gather_rows_by_range(
-    bits_flat: &[u64],
-    row_words: usize,
-    row_start: usize,
-    row_end: usize,
-) -> Result<Vec<u64>, String> {
-    let ctx = "garfield::gather_rows_by_range";
-    if row_end <= row_start {
-        return Ok(Vec::new());
-    }
-    let n_rows_all = bits_flat.len() / row_words;
-    if row_end > n_rows_all {
-        return Err(format!(
-            "{ctx}: row range out of bounds: [{row_start}, {row_end}) vs n_rows={n_rows_all}"
-        ));
-    }
-    let st = row_start * row_words;
-    let ed = row_end * row_words;
-    Ok(bits_flat[st..ed].to_vec())
 }
 
 fn build_feature_group_ids(sites: &[SiteInfo], n_rows: usize) -> Vec<usize> {
@@ -2107,125 +1581,6 @@ fn run_beam_with_feature_exclusion(
             max_pick,
             beam_width,
         ),
-    }
-}
-
-fn build_windows_from_sites(
-    sites: &[SiteInfo],
-    n_rows: usize,
-    extension: usize,
-    step: usize,
-) -> Vec<GarfieldWindow> {
-    if n_rows == 0 || sites.is_empty() || extension == 0 || step == 0 {
-        return vec![GarfieldWindow {
-            chrom: "ALL".to_string(),
-            bp_start: 0,
-            bp_end: 0,
-            indices: (0..n_rows).collect(),
-        }];
-    }
-
-    let mut groups: HashMap<String, Vec<(i32, usize)>> = HashMap::new();
-    let mut chrom_order: Vec<String> = Vec::new();
-    for (idx, site) in sites.iter().enumerate().take(n_rows) {
-        let chrom = normalize_chrom(&site.chrom);
-        if !groups.contains_key(&chrom) {
-            groups.insert(chrom.clone(), Vec::new());
-            chrom_order.push(chrom.clone());
-        }
-        if let Some(v) = groups.get_mut(&chrom) {
-            v.push((site.pos, idx));
-        }
-    }
-    if groups.is_empty() {
-        return vec![GarfieldWindow {
-            chrom: "ALL".to_string(),
-            bp_start: 0,
-            bp_end: 0,
-            indices: (0..n_rows).collect(),
-        }];
-    }
-
-    let mut windows: Vec<GarfieldWindow> = Vec::new();
-    for chrom in chrom_order {
-        let Some(mut pairs) = groups.remove(&chrom) else {
-            continue;
-        };
-        if pairs.is_empty() {
-            continue;
-        }
-        pairs.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
-        let n = pairs.len();
-        let bps: Vec<i32> = pairs.iter().map(|(bp, _)| *bp).collect();
-        let idxs: Vec<usize> = pairs.iter().map(|(_, i)| *i).collect();
-        let min_bp = bps[0];
-        let max_bp = bps[n - 1];
-        let mut l = 0usize;
-        let mut r = 0usize;
-        let mut center = min_bp;
-        let mut prev_sig: Option<(usize, usize, usize)> = None;
-
-        loop {
-            let left_i64 = (center as i64)
-                .saturating_sub(extension as i64)
-                .max(min_bp as i64);
-            let right_i64 = (center as i64)
-                .saturating_add(extension as i64)
-                .min(max_bp as i64);
-
-            while l < n && (bps[l] as i64) < left_i64 {
-                l += 1;
-            }
-            if r < l {
-                r = l;
-            }
-            while r < n && (bps[r] as i64) <= right_i64 {
-                r += 1;
-            }
-
-            if r > l {
-                let chunk = idxs[l..r].to_vec();
-                let sig = (chunk[0], chunk[chunk.len() - 1], chunk.len());
-                if prev_sig.map_or(true, |s| s != sig) {
-                    windows.push(GarfieldWindow {
-                        chrom: chrom.clone(),
-                        bp_start: left_i64 as i32,
-                        bp_end: right_i64 as i32,
-                        indices: chunk,
-                    });
-                    prev_sig = Some(sig);
-                }
-            }
-
-            if center >= max_bp {
-                break;
-            }
-            center = (center as i64).saturating_add(step as i64) as i32;
-            if center <= min_bp && step > 0 {
-                break;
-            }
-        }
-
-        let has_chrom_window = windows.last().map(|w| w.chrom == chrom).unwrap_or(false);
-        if !has_chrom_window {
-            windows.push(GarfieldWindow {
-                chrom: chrom.clone(),
-                bp_start: min_bp,
-                bp_end: max_bp.saturating_add(1),
-                indices: idxs,
-            });
-        }
-    }
-
-    if windows.is_empty() {
-        vec![GarfieldWindow {
-            chrom: "ALL".to_string(),
-            bp_start: 0,
-            bp_end: 0,
-            indices: (0..n_rows).collect(),
-        }]
-    } else {
-        windows
     }
 }
 
@@ -4042,7 +3397,8 @@ fn build_logic_units(
         "" | "window" => {
             let ext = extension.max(1);
             let step_eff = step.unwrap_or((ext / 2).max(1)).max(1);
-            let windows = build_windows_from_sites(sites, sites.len(), ext, step_eff);
+            let windows =
+                build_windows_from_sites(sites, sites.len(), ext, step_eff, normalize_chrom);
             Ok(windows
                 .into_iter()
                 .map(|w| {
@@ -5177,6 +4533,7 @@ fn prepare_logic_unit_continuous(
         logic_bits.bits_flat.as_slice(),
         logic_bits.row_words,
         selected_global_rows.as_slice(),
+        "garfield::selected_bits_full",
     )?;
 
     Ok(Some(GarfieldUnitPrepared {
@@ -5387,12 +4744,14 @@ fn prepare_logic_chunk_continuous(
             logic_bits.row_words,
             row_start,
             row_end,
+            "garfield::unit_bits_range",
         )?
     } else {
         gather_rows_by_indices(
             logic_bits.bits_flat.as_slice(),
             logic_bits.row_words,
             selected_global_rows.as_slice(),
+            "garfield::unit_bits_indices",
         )?
     };
 
@@ -8236,8 +7595,8 @@ pub fn garfield_prepare_input_bin_py(
         .enumerate()
         .all(|(i, &idx)| i == idx);
     let row_bytes = row_bytes_for_samples(n_samples);
-    let mut writer =
-        GarfieldBinWriter::new(&out_bin_path, n_samples).map_err(PyRuntimeError::new_err)?;
+    let mut writer = Bin01Writer::new(&out_bin_path, n_samples, Bin01SiteMode::TextTsv)
+        .map_err(PyRuntimeError::new_err)?;
 
     let available_threads = std::thread::available_parallelism()
         .map(|x| x.get())
@@ -8317,7 +7676,8 @@ pub fn garfield_prepare_input_bin_py(
                         if let Some(rows) = maybe_rows {
                             n_sites_written = n_sites_written.saturating_add(1);
                             n_rows_written = n_rows_written.saturating_add(rows.len());
-                            writer.write_rows(&rows).map_err(PyRuntimeError::new_err)?;
+                            write_encoded_rows_bin(&mut writer, &rows)
+                                .map_err(PyRuntimeError::new_err)?;
                         }
                     }
                 }
@@ -8333,7 +7693,8 @@ pub fn garfield_prepare_input_bin_py(
                     ) {
                         n_sites_written = n_sites_written.saturating_add(1);
                         n_rows_written = n_rows_written.saturating_add(rows.len());
-                        writer.write_rows(&rows).map_err(PyRuntimeError::new_err)?;
+                        write_encoded_rows_bin(&mut writer, &rows)
+                            .map_err(PyRuntimeError::new_err)?;
                     }
                 }
             }
@@ -8367,8 +7728,7 @@ pub fn garfield_prepare_input_bin_py(
                         if let Some(rows_kept) = rows {
                             n_sites_written = n_sites_written.saturating_add(1);
                             n_rows_written = n_rows_written.saturating_add(rows_kept.len());
-                            writer
-                                .write_rows(&rows_kept)
+                            write_encoded_rows_bin(&mut writer, &rows_kept)
                                 .map_err(PyRuntimeError::new_err)?;
                         }
                     }
@@ -8390,8 +7750,7 @@ pub fn garfield_prepare_input_bin_py(
                     if let Some(rows_kept) = rows {
                         n_sites_written = n_sites_written.saturating_add(1);
                         n_rows_written = n_rows_written.saturating_add(rows_kept.len());
-                        writer
-                            .write_rows(&rows_kept)
+                        write_encoded_rows_bin(&mut writer, &rows_kept)
                             .map_err(PyRuntimeError::new_err)?;
                     }
                 }
@@ -8426,8 +7785,7 @@ pub fn garfield_prepare_input_bin_py(
                         if let Some(rows_kept) = rows {
                             n_sites_written = n_sites_written.saturating_add(1);
                             n_rows_written = n_rows_written.saturating_add(rows_kept.len());
-                            writer
-                                .write_rows(&rows_kept)
+                            write_encoded_rows_bin(&mut writer, &rows_kept)
                                 .map_err(PyRuntimeError::new_err)?;
                         }
                     }
@@ -8449,8 +7807,7 @@ pub fn garfield_prepare_input_bin_py(
                     if let Some(rows_kept) = rows {
                         n_sites_written = n_sites_written.saturating_add(1);
                         n_rows_written = n_rows_written.saturating_add(rows_kept.len());
-                        writer
-                            .write_rows(&rows_kept)
+                        write_encoded_rows_bin(&mut writer, &rows_kept)
                             .map_err(PyRuntimeError::new_err)?;
                     }
                 }
@@ -8482,8 +7839,7 @@ pub fn garfield_prepare_input_bin_py(
                         if let Some(rows_kept) = rows {
                             n_sites_written = n_sites_written.saturating_add(1);
                             n_rows_written = n_rows_written.saturating_add(rows_kept.len());
-                            writer
-                                .write_rows(&rows_kept)
+                            write_encoded_rows_bin(&mut writer, &rows_kept)
                                 .map_err(PyRuntimeError::new_err)?;
                         }
                     }
@@ -8505,8 +7861,7 @@ pub fn garfield_prepare_input_bin_py(
                     if let Some(rows_kept) = rows {
                         n_sites_written = n_sites_written.saturating_add(1);
                         n_rows_written = n_rows_written.saturating_add(rows_kept.len());
-                        writer
-                            .write_rows(&rows_kept)
+                        write_encoded_rows_bin(&mut writer, &rows_kept)
                             .map_err(PyRuntimeError::new_err)?;
                     }
                 }
@@ -8514,7 +7869,7 @@ pub fn garfield_prepare_input_bin_py(
         }
     }
 
-    let header_rows = writer.finish(n_samples).map_err(PyRuntimeError::new_err)?;
+    let header_rows = writer.finish().map_err(PyRuntimeError::new_err)?;
     if header_rows != n_rows_written {
         return Err(PyRuntimeError::new_err(format!(
             "internal row count mismatch: header_rows={}, tracked_rows={}",
@@ -8554,11 +7909,9 @@ pub fn garfield_subset_bin_samples_py(
     let payload_len = n_rows
         .checked_mul(row_bytes_out)
         .ok_or_else(|| PyRuntimeError::new_err(format!("{ctx}: payload overflow")))?;
-    let mut out = Vec::<u8>::with_capacity(BIN01_HEADER_LEN + payload_len);
-    out.extend_from_slice(BIN01_MAGIC);
-    out.extend_from_slice(&(n_rows as u64).to_le_bytes());
-    out.extend_from_slice(&(n_out as u64).to_le_bytes());
-    out.extend_from_slice(&(0u64).to_le_bytes());
+    let header = bin01_header_bytes(n_rows as u64, n_out);
+    let mut out = Vec::<u8>::with_capacity(header.len() + payload_len);
+    out.extend_from_slice(&header);
 
     for r in 0..n_rows {
         let src_start =
@@ -8636,7 +7989,8 @@ pub fn garfield_scan_groups_bin_py(
     let y_bin = y_bin_owned.as_deref();
 
     let (bits_flat_all, row_words, n_rows_all, n_samples) =
-        load_bin01_as_u64_words(&bin_path).map_err(PyRuntimeError::new_err)?;
+        load_bin01_as_u64_words(&bin_path, "garfield_scan_groups_bin")
+            .map_err(PyRuntimeError::new_err)?;
     if y_vec.len() < n_samples {
         return Err(PyValueError::new_err(format!(
             "garfield_scan_groups_bin: y length={} smaller than n_samples={}",
@@ -8777,7 +8131,8 @@ pub fn garfield_scan_windows_bin_py(
     let y_bin = y_bin_owned.as_deref();
 
     let (bits_flat_all, row_words, n_rows_all, n_samples) =
-        load_bin01_as_u64_words(&bin_path).map_err(PyRuntimeError::new_err)?;
+        load_bin01_as_u64_words(&bin_path, "garfield_scan_windows_bin")
+            .map_err(PyRuntimeError::new_err)?;
     if y_vec.len() < n_samples {
         return Err(PyValueError::new_err(format!(
             "garfield_scan_windows_bin: y length={} smaller than n_samples={}",
@@ -8789,7 +8144,7 @@ pub fn garfield_scan_windows_bin_py(
     let sites = TxtSnpIter::new(&bin_path, None)
         .map_err(PyRuntimeError::new_err)?
         .sites;
-    let windows = build_windows_from_sites(&sites, n_rows_all, extension, step_v);
+    let windows = build_windows_from_sites(&sites, n_rows_all, extension, step_v, normalize_chrom);
     if windows.is_empty() {
         return Ok(Vec::new());
     }
@@ -8822,8 +8177,13 @@ pub fn garfield_scan_windows_bin_py(
         let sub = if n_rows == n_rows_all {
             bits_flat_all.clone()
         } else {
-            gather_rows_by_indices(&bits_flat_all, row_words, &win.indices)
-                .map_err(PyRuntimeError::new_err)?
+            gather_rows_by_indices(
+                &bits_flat_all,
+                row_words,
+                &win.indices,
+                "garfield_scan_windows_bin::window_bits",
+            )
+            .map_err(PyRuntimeError::new_err)?
         };
 
         let local_group_ids = if let Some(global_ids) = feature_group_ids_all.as_ref() {
@@ -8895,7 +8255,7 @@ pub fn garfield_eval_rule_bin_py(
     };
 
     let (bits_flat, row_words, n_rows, n_samples) =
-        load_bin01_selected_rows_as_u64_words(&bin_path, &snp_indices)
+        load_bin01_selected_rows_as_u64_words(&bin_path, &snp_indices, "garfield_eval_rule_bin")
             .map_err(PyRuntimeError::new_err)?;
     if n_rows == 0 {
         return Ok((f64::NEG_INFINITY, 0usize, Vec::new()));
@@ -9028,9 +8388,10 @@ mod tests {
         let n_samples = 10usize;
         let sample_ids = (0..n_samples).map(|i| format!("s{i}")).collect::<Vec<_>>();
         write_sample_id_sidecar(bin_str, &sample_ids).unwrap();
-        let mut writer = GarfieldBinWriter::new(bin_str, n_samples).unwrap();
-        writer
-            .write_rows(&[
+        let mut writer = Bin01Writer::new(bin_str, n_samples, Bin01SiteMode::TextTsv).unwrap();
+        write_encoded_rows_bin(
+            &mut writer,
+            &[
                 EncodedRow {
                     site: SiteInfo {
                         chrom: "1".to_string(),
@@ -9051,9 +8412,10 @@ mod tests {
                     },
                     bits: make_row_bits(n_samples, &[0, 4, 9]),
                 },
-            ])
-            .unwrap();
-        writer.finish(n_samples).unwrap();
+            ],
+        )
+        .unwrap();
+        writer.finish().unwrap();
 
         let (packed, group_ids, got_n_samples, n_rows, row_bytes) =
             load_bin01_packed_owned(bin_str, false).unwrap();
@@ -9079,9 +8441,10 @@ mod tests {
         let n_samples = 9usize;
         let sample_ids = (0..n_samples).map(|i| format!("s{i}")).collect::<Vec<_>>();
         write_sample_id_sidecar(bin_str, &sample_ids).unwrap();
-        let mut writer = GarfieldBinWriter::new(bin_str, n_samples).unwrap();
-        writer
-            .write_rows(&[
+        let mut writer = Bin01Writer::new(bin_str, n_samples, Bin01SiteMode::TextTsv).unwrap();
+        write_encoded_rows_bin(
+            &mut writer,
+            &[
                 EncodedRow {
                     site: SiteInfo {
                         chrom: "2".to_string(),
@@ -9142,9 +8505,10 @@ mod tests {
                     },
                     bits: make_row_bits(n_samples, &[2, 3]),
                 },
-            ])
-            .unwrap();
-        writer.finish(n_samples).unwrap();
+            ],
+        )
+        .unwrap();
+        writer.finish().unwrap();
 
         let (packed, group_ids, got_n_samples, n_rows, row_bytes) =
             load_bin01_packed_owned(bin_str, true).unwrap();

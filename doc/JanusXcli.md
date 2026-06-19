@@ -281,4 +281,3 @@ Use launcher `jx` when you want the full external workflow to run.
 - Prefer PLINK BED input when you expect to rerun the same cohort many times. Packed BED paths are reused more efficiently than repeated VCF parsing.
 - Use `-prefix` deliberately. It makes downstream files easier to chain into `postgwas`, `postgs`, and `webui`.
 - For large GS runs, use `-debug` when you need thread policy, BLAS backend, or packed-path diagnostics.
-- There is also a repository script `python -m janusx.script.beam`, but it is not part of the main `jx -h` module surface.

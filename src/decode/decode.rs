@@ -1,8 +1,8 @@
 use crate::bedmath::SubsetDecodePlan;
 use crate::bedmath::{
     decode_row_centered_full_lut, decode_row_centered_full_lut_f64,
-    decode_subset_row_from_full_scratch, decode_subset_row_from_full_scratch_f64,
-    decode_subset_with_plan, packed_byte_lut,
+    decode_standardized_packed_block_rows_f32_with_plan, decode_subset_row_from_full_scratch,
+    decode_subset_row_from_full_scratch_f64, decode_subset_with_plan, packed_byte_lut,
 };
 use crate::gfreader::SampleSubsetPlan;
 use crate::gload::WindowedBedMatrix;
@@ -482,6 +482,248 @@ pub(crate) fn apply_prepared_grm_stream_row_copy_f64(
     }
 }
 
+#[inline]
+pub(crate) fn prepare_packed_block_row_indices(
+    row_indices: Option<&[usize]>,
+    row_start: usize,
+    rows: usize,
+    out_row_indices: &mut [usize],
+) -> Result<(), String> {
+    if out_row_indices.len() < rows {
+        return Err("prepare_packed_block_row_indices: out_row_indices too small".to_string());
+    }
+    if let Some(indices) = row_indices {
+        if indices.len() < row_start.saturating_add(rows) {
+            return Err("prepare_packed_block_row_indices: row_indices too small".to_string());
+        }
+        out_row_indices[..rows].copy_from_slice(&indices[row_start..row_start + rows]);
+    } else {
+        for (off, dst) in out_row_indices[..rows].iter_mut().enumerate() {
+            *dst = row_start + off;
+        }
+    }
+    Ok(())
+}
+
+#[inline]
+pub(crate) fn prepare_packed_block_centered_mean_scale_f32(
+    row_maf: &[f32],
+    row_start: usize,
+    rows: usize,
+    out_mean: &mut [f32],
+    out_scale: &mut [f32],
+) -> Result<(), String> {
+    if out_mean.len() < rows {
+        return Err("prepare_packed_block_centered_mean_scale_f32: out_mean too small".to_string());
+    }
+    if out_scale.len() < rows {
+        return Err(
+            "prepare_packed_block_centered_mean_scale_f32: out_scale too small".to_string(),
+        );
+    }
+    if row_maf.len() < row_start.saturating_add(rows) {
+        return Err("prepare_packed_block_centered_mean_scale_f32: row_maf too small".to_string());
+    }
+    for off in 0..rows {
+        out_mean[off] = 2.0_f32 * row_maf[row_start + off];
+        out_scale[off] = 1.0_f32;
+    }
+    Ok(())
+}
+
+#[inline]
+pub(crate) fn prepare_packed_block_standardized_mean_scale_f32(
+    row_maf: &[f32],
+    row_start: usize,
+    rows: usize,
+    eps: f32,
+    out_mean: &mut [f32],
+    out_scale: &mut [f32],
+) -> Result<(), String> {
+    if out_mean.len() < rows {
+        return Err(
+            "prepare_packed_block_standardized_mean_scale_f32: out_mean too small".to_string(),
+        );
+    }
+    if out_scale.len() < rows {
+        return Err(
+            "prepare_packed_block_standardized_mean_scale_f32: out_scale too small".to_string(),
+        );
+    }
+    if row_maf.len() < row_start.saturating_add(rows) {
+        return Err(
+            "prepare_packed_block_standardized_mean_scale_f32: row_maf too small".to_string(),
+        );
+    }
+    for off in 0..rows {
+        let p = row_maf[row_start + off].clamp(0.0_f32, 1.0_f32);
+        let var = 2.0_f32 * p * (1.0_f32 - p);
+        out_mean[off] = 2.0_f32 * p;
+        out_scale[off] = if var > eps {
+            1.0_f32 / var.sqrt()
+        } else {
+            0.0_f32
+        };
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_prepared_additive_block_packed_f32(
+    packed_flat: &[u8],
+    bytes_per_snp: usize,
+    n_samples: usize,
+    row_flip: &[bool],
+    row_mean: &[f32],
+    row_scale: &[f32],
+    sample_idx: &[usize],
+    full_sample_fast: bool,
+    subset_plan: Option<&SubsetDecodePlan>,
+    packed_row_indices: Option<&[usize]>,
+    row_start: usize,
+    row_end: usize,
+    out_block: &mut [f32],
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) -> Result<(), String> {
+    let cur_rows = row_end.saturating_sub(row_start);
+    let n_out = sample_idx.len();
+    if cur_rows == 0 || n_out == 0 {
+        return Ok(());
+    }
+    if row_flip.len() < row_end {
+        return Err("decode_prepared_additive_block_packed_f32: row_flip too small".to_string());
+    }
+    if row_mean.len() < row_end {
+        return Err("decode_prepared_additive_block_packed_f32: row_mean too small".to_string());
+    }
+    if row_scale.len() < row_end {
+        return Err("decode_prepared_additive_block_packed_f32: row_scale too small".to_string());
+    }
+    if let Some(indices) = packed_row_indices {
+        if indices.len() < row_end {
+            return Err(
+                "decode_prepared_additive_block_packed_f32: packed_row_indices too small"
+                    .to_string(),
+            );
+        }
+    }
+    if out_block.len() < cur_rows.saturating_mul(n_out) {
+        return Err("decode_prepared_additive_block_packed_f32: out_block too small".to_string());
+    }
+    decode_standardized_packed_block_rows_f32_with_plan(
+        packed_flat,
+        bytes_per_snp,
+        n_samples,
+        row_flip,
+        row_mean,
+        row_scale,
+        sample_idx,
+        full_sample_fast,
+        subset_plan,
+        packed_row_indices,
+        row_start,
+        &mut out_block[..cur_rows * n_out],
+        &packed_byte_lut().code4,
+        pool,
+    )
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_centered_additive_block_from_maf_f32(
+    packed_flat: &[u8],
+    bytes_per_snp: usize,
+    n_samples: usize,
+    row_flip: &[bool],
+    row_maf: &[f32],
+    sample_idx: &[usize],
+    full_sample_fast: bool,
+    subset_plan: Option<&SubsetDecodePlan>,
+    packed_row_indices: Option<&[usize]>,
+    row_start: usize,
+    row_end: usize,
+    scratch_row_indices: &mut [usize],
+    scratch_mean: &mut [f32],
+    scratch_scale: &mut [f32],
+    out_block: &mut [f32],
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) -> Result<(), String> {
+    let cur_rows = row_end.saturating_sub(row_start);
+    prepare_packed_block_row_indices(packed_row_indices, row_start, cur_rows, scratch_row_indices)?;
+    prepare_packed_block_centered_mean_scale_f32(
+        row_maf,
+        row_start,
+        cur_rows,
+        scratch_mean,
+        scratch_scale,
+    )?;
+    decode_prepared_additive_block_packed_f32(
+        packed_flat,
+        bytes_per_snp,
+        n_samples,
+        &row_flip[row_start..row_end],
+        &scratch_mean[..cur_rows],
+        &scratch_scale[..cur_rows],
+        sample_idx,
+        full_sample_fast,
+        subset_plan,
+        Some(&scratch_row_indices[..cur_rows]),
+        0usize,
+        cur_rows,
+        out_block,
+        pool,
+    )
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_standardized_additive_block_from_maf_f32(
+    packed_flat: &[u8],
+    bytes_per_snp: usize,
+    n_samples: usize,
+    row_flip: &[bool],
+    row_maf: &[f32],
+    sample_idx: &[usize],
+    full_sample_fast: bool,
+    subset_plan: Option<&SubsetDecodePlan>,
+    packed_row_indices: Option<&[usize]>,
+    row_start: usize,
+    row_end: usize,
+    eps: f32,
+    scratch_row_indices: &mut [usize],
+    scratch_mean: &mut [f32],
+    scratch_scale: &mut [f32],
+    out_block: &mut [f32],
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) -> Result<(), String> {
+    let cur_rows = row_end.saturating_sub(row_start);
+    prepare_packed_block_row_indices(packed_row_indices, row_start, cur_rows, scratch_row_indices)?;
+    prepare_packed_block_standardized_mean_scale_f32(
+        row_maf,
+        row_start,
+        cur_rows,
+        eps,
+        scratch_mean,
+        scratch_scale,
+    )?;
+    decode_prepared_additive_block_packed_f32(
+        packed_flat,
+        bytes_per_snp,
+        n_samples,
+        &row_flip[row_start..row_end],
+        &scratch_mean[..cur_rows],
+        &scratch_scale[..cur_rows],
+        sample_idx,
+        full_sample_fast,
+        subset_plan,
+        Some(&scratch_row_indices[..cur_rows]),
+        0usize,
+        cur_rows,
+        out_block,
+        pool,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn decode_additive_grm_block_f32(
     packed_flat: &[u8],
@@ -519,6 +761,44 @@ pub(crate) fn decode_additive_grm_block_f32(
     let block = &mut out_block[..cur_rows * n_out];
     let varsum = &mut out_varsum[..cur_rows];
     let rowsum = &mut out_rowsum[..cur_rows];
+
+    if method == 2 {
+        let subset_plan = if full_sample_fast {
+            None
+        } else {
+            Some(SubsetDecodePlan::from_sample_idx_with_n_samples(
+                sample_idx, n_samples,
+            ))
+        };
+        let mut scratch_row_indices = vec![0usize; cur_rows];
+        let mut scratch_mean = vec![0.0_f32; cur_rows];
+        let mut scratch_scale = vec![0.0_f32; cur_rows];
+        decode_standardized_additive_block_from_maf_f32(
+            packed_flat,
+            bytes_per_snp,
+            n_samples,
+            row_flip,
+            row_maf,
+            sample_idx,
+            full_sample_fast,
+            subset_plan.as_ref(),
+            None,
+            row_start,
+            row_end,
+            eps,
+            scratch_row_indices.as_mut_slice(),
+            scratch_mean.as_mut_slice(),
+            scratch_scale.as_mut_slice(),
+            block,
+            pool,
+        )?;
+        for off in 0..cur_rows {
+            let p = row_maf[row_start + off].clamp(0.0_f32, 1.0_f32) as f64;
+            varsum[off] = 0.0_f64;
+            rowsum[off] = 2.0_f64 * p * (n_out as f64);
+        }
+        return Ok(());
+    }
 
     let mut decode_run = || {
         if full_sample_fast {

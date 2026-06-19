@@ -246,6 +246,13 @@ def prepare_packed_ctx_from_plink(
                 "std_denom": np.ascontiguousarray(
                     np.asarray(std_raw, dtype=np.float32).reshape(-1), dtype=np.float32
                 ),
+                "dom_af": np.ascontiguousarray(
+                    _packed_row_het_rate(
+                        np.ascontiguousarray(np.asarray(packed_raw, dtype=np.uint8)),
+                        int(packed_n),
+                    ),
+                    dtype=np.float32,
+                ),
                 "row_flip": np.ascontiguousarray(
                     np.asarray(row_flip_raw, dtype=np.bool_).reshape(-1), dtype=np.bool_
                 ),
@@ -364,6 +371,7 @@ def prepare_packed_ctx_from_plink(
                     "af": af_arr,
                     "maf": af_arr,
                     "std_denom": std_arr,
+                    "dom_af": het_arr,
                     "row_flip": row_flip_full,
                     "site_keep": site_keep,
                     "active_row_idx": keep_idx,
@@ -389,12 +397,14 @@ def prepare_packed_ctx_from_plink(
                 miss_keep = np.ascontiguousarray(miss_arr[keep], dtype=np.float32)
                 maf_keep = np.ascontiguousarray(af_arr[keep], dtype=np.float32)
                 std_keep = np.ascontiguousarray(std_arr[keep], dtype=np.float32)
+                dom_keep = np.ascontiguousarray(het_arr[keep], dtype=np.float32)
                 row_flip = np.ascontiguousarray(row_flip_full[keep], dtype=np.bool_)
             else:
                 packed = np.ascontiguousarray(np.asarray(packed_memmap, dtype=np.uint8), dtype=np.uint8)
                 miss_keep = miss_arr
                 maf_keep = af_arr
                 std_keep = std_arr
+                dom_keep = het_arr
                 row_flip = row_flip_full
 
             packed_ctx = {
@@ -403,6 +413,7 @@ def prepare_packed_ctx_from_plink(
                 "af": maf_keep,
                 "maf": maf_keep,
                 "std_denom": std_keep,
+                "dom_af": dom_keep,
                 "row_flip": row_flip,
                 "site_keep": site_keep,
                 "active_row_idx": keep_idx,
@@ -431,6 +442,7 @@ def prepare_packed_ctx_from_plink(
     miss_arr = np.ascontiguousarray(np.asarray(miss_raw, dtype=np.float32).reshape(-1))
     maf_arr = np.ascontiguousarray(np.asarray(maf_raw, dtype=np.float32).reshape(-1))
     std_arr = np.ascontiguousarray(np.asarray(std_raw, dtype=np.float32).reshape(-1))
+    dom_arr = _packed_row_het_rate(packed, int(packed_n))
 
     keep = np.ones(maf_arr.shape[0], dtype=np.bool_)
     maf_thr = float(maf)
@@ -486,6 +498,7 @@ def prepare_packed_ctx_from_plink(
             "af": maf_arr,
             "maf": maf_arr,
             "std_denom": std_arr,
+            "dom_af": dom_arr,
             "row_flip": row_flip_full,
             "site_keep": site_keep,
             "active_row_idx": keep_idx,
@@ -503,6 +516,7 @@ def prepare_packed_ctx_from_plink(
         miss_arr = np.ascontiguousarray(miss_arr[keep], dtype=np.float32)
         maf_arr = np.ascontiguousarray(maf_arr[keep], dtype=np.float32)
         std_arr = np.ascontiguousarray(std_arr[keep], dtype=np.float32)
+        dom_arr = np.ascontiguousarray(dom_arr[keep], dtype=np.float32)
         row_flip = np.ascontiguousarray(row_flip_full[keep], dtype=np.bool_)
     else:
         row_flip = row_flip_full
@@ -513,6 +527,7 @@ def prepare_packed_ctx_from_plink(
         "af": maf_arr,
         "maf": maf_arr,
         "std_denom": std_arr,
+        "dom_af": dom_arr,
         "row_flip": row_flip,
         "site_keep": site_keep,
         "active_row_idx": keep_idx,
@@ -524,3 +539,119 @@ def prepare_packed_ctx_from_plink(
         "source_prefix": str(plink_prefix),
     }
     return sample_ids_arr, packed_ctx
+
+
+def prepare_packed_stats_ctx_from_plink(
+    prefix: str,
+    *,
+    maf: float,
+    missing_rate: float,
+    het_threshold: float = 0.0,
+    snps_only: bool = False,
+    expected_n_samples: int | None = None,
+) -> tuple[np.ndarray, dict[str, typing.Any]]:
+    """
+    Prepare PLINK BED filter metadata without materializing or attaching packed rows.
+
+    The returned context keeps the same filtering/allele-orientation semantics as
+    GWAS packed-BED preprocessing, but omits the `packed` payload so callers can
+    defer actual BED access to later streaming kernels.
+    """
+    plink_prefix = _normalize_plink_prefix(prefix)
+    sample_ids, _ = inspect_genotype_file(str(plink_prefix))
+    sample_ids_arr = np.asarray(sample_ids, dtype=str)
+    if expected_n_samples is not None and int(expected_n_samples) != int(sample_ids_arr.shape[0]):
+        raise ValueError(
+            f"Packed sample size mismatch: expected {int(expected_n_samples)}, "
+            f"got {int(sample_ids_arr.shape[0])} from {plink_prefix}."
+        )
+
+    if scan_bed_2bit_packed_stats is not None:
+        miss_raw, maf_raw, std_raw, row_flip_raw, het_raw, packed_n = scan_bed_2bit_packed_stats(
+            str(plink_prefix)
+        )
+        if int(packed_n) != int(sample_ids_arr.shape[0]):
+            raise ValueError(
+                f"Packed sample size mismatch: packed n={int(packed_n)}, expected {sample_ids_arr.shape[0]}"
+            )
+
+        miss_arr = np.ascontiguousarray(np.asarray(miss_raw, dtype=np.float32).reshape(-1))
+        maf_arr = np.ascontiguousarray(np.asarray(maf_raw, dtype=np.float32).reshape(-1))
+        std_arr = np.ascontiguousarray(np.asarray(std_raw, dtype=np.float32).reshape(-1))
+        row_flip_input = np.ascontiguousarray(
+            np.asarray(row_flip_raw, dtype=np.bool_).reshape(-1),
+            dtype=np.bool_,
+        )
+        af_arr = np.ascontiguousarray(
+            np.where(row_flip_input, 1.0 - maf_arr, maf_arr).astype(np.float32, copy=False),
+            dtype=np.float32,
+        )
+        row_flip_full = np.zeros_like(row_flip_input, dtype=np.bool_)
+        het_arr = np.ascontiguousarray(np.asarray(het_raw, dtype=np.float32).reshape(-1))
+        n_total_sites = int(maf_arr.shape[0])
+
+        keep = np.ones((n_total_sites,), dtype=np.bool_)
+        maf_thr = float(maf)
+        if maf_thr > 0.0:
+            keep &= (maf_arr >= maf_thr) & (maf_arr <= (1.0 - maf_thr))
+        miss_thr = float(missing_rate)
+        if miss_thr < 1.0:
+            keep &= miss_arr <= miss_thr
+        het_thr = float(het_threshold)
+        if het_thr > 0.0:
+            keep &= het_arr <= het_thr
+        if bool(snps_only):
+            snp_mask = _plink_snp_mask(str(plink_prefix))
+            if snp_mask.shape[0] != keep.shape[0]:
+                raise ValueError(
+                    f"BIM SNP mask length mismatch: got {snp_mask.shape[0]}, expected {keep.shape[0]}"
+                )
+            keep &= snp_mask
+        if not np.any(keep):
+            raise ValueError(
+                "No SNPs left after packed BED filtering. Please relax --maf/--geno thresholds."
+            )
+
+        site_keep = np.ascontiguousarray(
+            np.asarray(keep, dtype=np.bool_).reshape(-1),
+            dtype=np.bool_,
+        )
+        keep_idx = np.ascontiguousarray(
+            np.flatnonzero(site_keep).astype(np.int64, copy=False),
+            dtype=np.int64,
+        )
+        stats_ctx: dict[str, typing.Any] = {
+            "missing_rate": miss_arr,
+            "af": af_arr,
+            "maf": af_arr,
+            "std_denom": std_arr,
+            "dom_af": het_arr,
+            "row_flip": row_flip_full,
+            "site_keep": site_keep,
+            "active_row_idx": keep_idx,
+            "n_samples": int(packed_n),
+            "n_total_sites": int(site_keep.shape[0]),
+            "n_active_sites": int(keep_idx.shape[0]),
+            "packed_filter_mode": "stats_only",
+            "packed_storage": "metadata",
+            "source_prefix": str(plink_prefix),
+        }
+        return sample_ids_arr, stats_ctx
+
+    sample_ids_arr, packed_ctx = prepare_packed_ctx_from_plink(
+        str(plink_prefix),
+        maf=float(maf),
+        missing_rate=float(missing_rate),
+        het_threshold=float(het_threshold),
+        snps_only=bool(snps_only),
+        expected_n_samples=expected_n_samples,
+        filter_mode="lazy",
+    )
+    stats_ctx = {
+        key: value
+        for key, value in packed_ctx.items()
+        if key != "packed"
+    }
+    stats_ctx["packed_filter_mode"] = "stats_only"
+    stats_ctx["packed_storage"] = "metadata"
+    return sample_ids_arr, stats_ctx

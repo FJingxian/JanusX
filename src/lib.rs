@@ -29,8 +29,8 @@ mod grm;
 #[doc(hidden)]
 #[path = "grm_bench_support.rs"]
 pub mod grm_bench_support;
-#[path = "stats/gs_native.rs"]
-pub(crate) mod gs_native;
+#[path = "stats/gblup.rs"]
+pub(crate) mod gblup;
 #[path = "stats/gstats.rs"]
 mod gstats;
 #[path = "stats/gwas_unified.rs"]
@@ -49,6 +49,8 @@ mod logreg;
 mod packed;
 #[path = "stats/reml.rs"]
 mod reml;
+#[path = "stats/rrblup.rs"]
+mod rrblup;
 #[path = "stats/rsvd.rs"]
 mod rsvd;
 #[path = "stats/spgrm.rs"]
@@ -153,8 +155,9 @@ use admixture::{
 use algwas::algwas_packed_to_tsv;
 use assoc2tsv::GwasAssocTsvWriter;
 use bayes::{
-    bayesa, bayesa_packed, bayesa_packed_trace, bayesb, bayesb_packed, bayesb_packed_trace,
-    bayescpi, bayescpi_packed, bayescpi_packed_trace,
+    bayesa, bayesa_packed, bayesa_packed_trace, bayesa_stream_bed, bayesb, bayesb_packed,
+    bayesb_packed_trace, bayesb_stream_bed, bayescpi, bayescpi_packed, bayescpi_packed_trace,
+    bayescpi_stream_bed,
 };
 use binwriter::Bin01StreamWriter;
 use bitwise::{and_popcount_py, bitand_assign_py, bitnot_masked_py, bitor_into_py, popcount_py};
@@ -214,8 +217,9 @@ use grm::{
     grm_packed_f32_with_stats, grm_packed_f64, grm_packed_f64_with_stats, grm_sim_bench_f32,
     grm_stream_bed_f32, grm_stream_bed_f32_to_npy, grm_stream_bed_f64, grm_stream_bed_f64_to_npy,
 };
-use gs_native::{
-    farmcpu_q_packed_grm_pca_f32, gblup_reml_packed_bed, packed_mtm_f64, rrblup_pcg_bed,
+use gblup::{
+    farmcpu_q_packed_grm_pca_f32, gblup_effect_from_meta_stream, gblup_reml_packed_bed,
+    packed_mtm_f64,
 };
 use gstats::{
     gstats_bed_individual_stats, gstats_bed_joint_stats, gstats_bed_ldscore, gstats_bed_site_stats,
@@ -245,7 +249,8 @@ use lmm::{
 use logreg::fit_best_and_not_py;
 use ml::{garfield_ml_feature_scores_py, garfield_ml_select_topk_py};
 use packed::{
-    bed_packed_decode_rows_f32, bed_packed_decode_stats_f64, bed_packed_row_flip_mask,
+    bed_decode_rows_f32_from_meta, bed_packed_decode_rows_f32, bed_packed_decode_stats_f64,
+    bed_packed_row_flip_mask,
     bed_packed_signed_hash_f32, bed_packed_signed_hash_kernels_f64,
     bed_packed_signed_hash_ztz_stats_f64, cross_grm_times_alpha_packed_f64, packed_malpha_f64,
     packed_malpha_mode_f64,
@@ -254,6 +259,7 @@ use reml::{
     ai_reml_multi_f64, ai_reml_null_f64, lmm_reml_null_f32, lmm_rotate_x_y_with_ut_f64,
     ml_loglike_null_f32,
 };
+use rrblup::rrblup_pcg_bed;
 use rsvd::py_rsvd_packed_subset;
 use sim::{sim_trait_accumulate_i8_f32, SimChunkGenerator, SimEngine, SimTraitAccumulator};
 use sim_g2p::g2p_simulate_py;
@@ -390,6 +396,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(grm_sim_bench_f32, m)?)?;
     m.add_function(wrap_pyfunction!(bed_packed_row_flip_mask, m)?)?;
     m.add_function(wrap_pyfunction!(bed_packed_decode_rows_f32, m)?)?;
+    m.add_function(wrap_pyfunction!(bed_decode_rows_f32_from_meta, m)?)?;
     m.add_function(wrap_pyfunction!(bed_packed_decode_stats_f64, m)?)?;
     m.add_function(wrap_pyfunction!(bed_packed_ld_prune_maf_priority, m)?)?;
     m.add_function(wrap_pyfunction!(bed_ldblock_r2_rust, m)?)?;
@@ -427,6 +434,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(king::king_unrelated_set_from_bed_py, m)?)?;
     m.add_function(wrap_pyfunction!(rrblup_pcg_bed, m)?)?;
     m.add_function(wrap_pyfunction!(gblup_reml_packed_bed, m)?)?;
+    m.add_function(wrap_pyfunction!(gblup_effect_from_meta_stream, m)?)?;
     m.add_function(wrap_pyfunction!(rust_sgemm_backend, m)?)?;
     m.add_function(wrap_pyfunction!(rust_eigh_lapack_backend, m)?)?;
     m.add_function(wrap_pyfunction!(rust_blas_set_num_threads, m)?)?;
@@ -503,6 +511,9 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(bayesa_packed, m)?)?;
     m.add_function(wrap_pyfunction!(bayesb_packed, m)?)?;
     m.add_function(wrap_pyfunction!(bayescpi_packed, m)?)?;
+    m.add_function(wrap_pyfunction!(bayesa_stream_bed, m)?)?;
+    m.add_function(wrap_pyfunction!(bayesb_stream_bed, m)?)?;
+    m.add_function(wrap_pyfunction!(bayescpi_stream_bed, m)?)?;
     m.add_function(wrap_pyfunction!(bayesa_packed_trace, m)?)?;
     m.add_function(wrap_pyfunction!(bayesb_packed_trace, m)?)?;
     m.add_function(wrap_pyfunction!(bayescpi_packed_trace, m)?)?;

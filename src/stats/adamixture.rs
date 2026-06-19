@@ -17,7 +17,9 @@ use rayon::ThreadPoolBuilder;
 use std::convert::TryFrom;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+use std::mem::align_of;
 use std::path::{Path, PathBuf};
+use std::ptr;
 use std::sync::Arc;
 use std::time::{Instant, UNIX_EPOCH};
 
@@ -29,10 +31,15 @@ use crate::gfcore::{
     parse_positive_env_usize, process_snp_row, read_fam, BedSnpIter, HmpSnpIter, TxtSnpIter,
     VcfSnpIter,
 };
+use crate::gload::{
+    load_file_owned_exact, mmap_readonly_file, open_plink_bed_reader_after_header,
+    read_plink_bed_header_info,
+};
+use crate::he::{row_major_block_mul_mat_f32, row_major_block_t_mul_mat_accum_f32};
 use crate::rsvd::{
     rsvd_block_rows_env, rsvd_packed_compute_a_omega, rsvd_packed_compute_at_random_omega,
-    rsvd_packed_compute_ata_omega, rsvd_packed_compute_gram_aq, rsvd_right_singular_from_gram,
-    PackedRsvdView, RsvdKernelTiming,
+    rsvd_packed_compute_ata_omega, rsvd_packed_compute_gram_aq, rsvd_project_sample_eigvecs,
+    rsvd_right_singular_from_gram, PackedRsvdView, RsvdKernelTiming,
 };
 use crate::stats_common::{
     admx_madvise_dontneed_bytes, check_admx_memory_limit, process_memory_usage,
@@ -183,10 +190,11 @@ struct PackedBedRsvd {
     active_row_idx: Vec<usize>,
     row_freq: Vec<f32>,
     row_flip: Vec<bool>,
+    total_variance: f64,
 }
 
 const PACKED_BED_CACHE_MAGIC: &[u8; 8] = b"JXRSVDC1";
-const PACKED_BED_CACHE_VERSION: u32 = 1;
+const PACKED_BED_CACHE_VERSION: u32 = 2;
 
 #[inline]
 fn packed_bed_cache_enabled() -> bool {
@@ -295,6 +303,84 @@ fn push_f32_le(buf: &mut Vec<u8>, v: f32) {
     buf.extend_from_slice(&v.to_le_bytes());
 }
 
+#[inline]
+fn read_fixed_from_bytes<const N: usize>(bytes: &[u8], cursor: &mut usize) -> Option<[u8; N]> {
+    let end = cursor.checked_add(N)?;
+    let slice = bytes.get(*cursor..end)?;
+    let mut out = [0u8; N];
+    out.copy_from_slice(slice);
+    *cursor = end;
+    Some(out)
+}
+
+#[inline]
+fn read_u32_le_from_bytes(bytes: &[u8], cursor: &mut usize) -> Option<u32> {
+    Some(u32::from_le_bytes(read_fixed_from_bytes::<4>(
+        bytes, cursor,
+    )?))
+}
+
+#[inline]
+fn read_u64_le_from_bytes(bytes: &[u8], cursor: &mut usize) -> Option<u64> {
+    Some(u64::from_le_bytes(read_fixed_from_bytes::<8>(
+        bytes, cursor,
+    )?))
+}
+
+#[inline]
+fn read_f64_le_from_bytes(bytes: &[u8], cursor: &mut usize) -> Option<f64> {
+    Some(f64::from_le_bytes(read_fixed_from_bytes::<8>(
+        bytes, cursor,
+    )?))
+}
+
+#[inline]
+fn copy_le_f32_bytes(bytes: &[u8], out: &mut [f32]) -> bool {
+    if bytes.len() != out.len().saturating_mul(std::mem::size_of::<f32>()) {
+        return false;
+    }
+    if cfg!(target_endian = "little") && (bytes.as_ptr() as usize).is_multiple_of(align_of::<f32>())
+    {
+        unsafe {
+            ptr::copy_nonoverlapping(bytes.as_ptr(), out.as_mut_ptr() as *mut u8, bytes.len());
+        }
+        return true;
+    }
+    for (dst, chunk) in out.iter_mut().zip(bytes.chunks_exact(4)) {
+        *dst = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+    }
+    true
+}
+
+#[inline]
+fn decode_le_u32_indices(bytes: &[u8], n_total_sites: usize) -> Option<Vec<usize>> {
+    if bytes.len() % 4 != 0 {
+        return None;
+    }
+    let n = bytes.len() / 4;
+    let mut out = Vec::with_capacity(n);
+    if cfg!(target_endian = "little") && (bytes.as_ptr() as usize).is_multiple_of(align_of::<u32>())
+    {
+        let src = unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const u32, n) };
+        for &idx_u32 in src {
+            let idx = idx_u32 as usize;
+            if idx >= n_total_sites {
+                return None;
+            }
+            out.push(idx);
+        }
+        return Some(out);
+    }
+    for chunk in bytes.chunks_exact(4) {
+        let idx = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) as usize;
+        if idx >= n_total_sites {
+            return None;
+        }
+        out.push(idx);
+    }
+    Some(out)
+}
+
 fn try_load_packed_bed_cache(
     cache_path: &Path,
     bed_path: &Path,
@@ -303,79 +389,64 @@ fn try_load_packed_bed_cache(
     n_samples: usize,
     n_total_sites: usize,
     bytes_per_snp: usize,
-) -> Option<(Vec<usize>, Vec<f32>, Vec<bool>)> {
+) -> Option<(Vec<usize>, Vec<f32>, Vec<bool>, f64)> {
     if !packed_bed_cache_enabled() || !cache_path.exists() {
         return None;
     }
     let (bed_size, bed_mtime) = file_signature(bed_path)?;
     let (bim_size, bim_mtime) = file_signature(bim_path)?;
     let (fam_size, fam_mtime) = file_signature(fam_path)?;
-    let mut file = File::open(cache_path).ok()?;
-    let mut magic = [0u8; 8];
-    file.read_exact(&mut magic).ok()?;
+    let mmap = mmap_readonly_file(cache_path).ok()?;
+    let bytes = mmap.as_ref();
+    let mut cursor = 0usize;
+    let magic = read_fixed_from_bytes::<8>(bytes, &mut cursor)?;
     if &magic != PACKED_BED_CACHE_MAGIC {
         return None;
     }
-
-    let mut u32_buf = [0u8; 4];
-    file.read_exact(&mut u32_buf).ok()?;
-    if u32::from_le_bytes(u32_buf) != PACKED_BED_CACHE_VERSION {
+    if read_u32_le_from_bytes(bytes, &mut cursor)? != PACKED_BED_CACHE_VERSION {
         return None;
     }
-
-    let read_u64_from_file = |f: &mut File| -> Option<u64> {
-        let mut buf = [0u8; 8];
-        f.read_exact(&mut buf).ok()?;
-        Some(u64::from_le_bytes(buf))
-    };
-    if read_u64_from_file(&mut file)? != bed_size
-        || read_u64_from_file(&mut file)? != bed_mtime
-        || read_u64_from_file(&mut file)? != bim_size
-        || read_u64_from_file(&mut file)? != bim_mtime
-        || read_u64_from_file(&mut file)? != fam_size
-        || read_u64_from_file(&mut file)? != fam_mtime
-        || read_u64_from_file(&mut file)? != n_samples as u64
-        || read_u64_from_file(&mut file)? != n_total_sites as u64
-        || read_u64_from_file(&mut file)? != bytes_per_snp as u64
+    if read_u64_le_from_bytes(bytes, &mut cursor)? != bed_size
+        || read_u64_le_from_bytes(bytes, &mut cursor)? != bed_mtime
+        || read_u64_le_from_bytes(bytes, &mut cursor)? != bim_size
+        || read_u64_le_from_bytes(bytes, &mut cursor)? != bim_mtime
+        || read_u64_le_from_bytes(bytes, &mut cursor)? != fam_size
+        || read_u64_le_from_bytes(bytes, &mut cursor)? != fam_mtime
+        || read_u64_le_from_bytes(bytes, &mut cursor)? != n_samples as u64
+        || read_u64_le_from_bytes(bytes, &mut cursor)? != n_total_sites as u64
+        || read_u64_le_from_bytes(bytes, &mut cursor)? != bytes_per_snp as u64
     {
         return None;
     }
-    let n_active = usize::try_from(read_u64_from_file(&mut file)?).ok()?;
+    let n_active = usize::try_from(read_u64_le_from_bytes(bytes, &mut cursor)?).ok()?;
     if n_active > n_total_sites {
         return None;
     }
-
-    let mut row_freq = vec![0.0_f32; n_active];
-    for value in row_freq.iter_mut() {
-        let mut buf = [0u8; 4];
-        file.read_exact(&mut buf).ok()?;
-        *value = f32::from_le_bytes(buf);
-    }
-    let mut flip_buf = vec![0u8; n_active];
-    file.read_exact(&mut flip_buf).ok()?;
-    let row_flip: Vec<bool> = flip_buf.iter().map(|&v| v != 0).collect();
-
-    let mut active_row_idx = Vec::with_capacity(n_active);
-    for _ in 0..n_active {
-        let mut buf = [0u8; 4];
-        file.read_exact(&mut buf).ok()?;
-        let idx = usize::try_from(u32::from_le_bytes(buf)).ok()?;
-        if idx >= n_total_sites {
-            return None;
-        }
-        active_row_idx.push(idx);
-    }
-    let file_len = usize::try_from(file.metadata().ok()?.len()).ok()?;
-    let pos = 8usize
-        .checked_add(4)?
-        .checked_add(10usize.checked_mul(8)?)?
-        .checked_add(n_active.checked_mul(4)?)?
-        .checked_add(n_active)?
-        .checked_add(n_active.checked_mul(4)?)?;
-    if pos != file_len {
+    let total_variance = read_f64_le_from_bytes(bytes, &mut cursor)?;
+    if !total_variance.is_finite() || total_variance <= 0.0 {
         return None;
     }
-    Some((active_row_idx, row_freq, row_flip))
+    let mut row_freq = vec![0.0_f32; n_active];
+    let row_freq_bytes_len = n_active.checked_mul(4)?;
+    let row_freq_end = cursor.checked_add(row_freq_bytes_len)?;
+    let row_freq_bytes = bytes.get(cursor..row_freq_end)?;
+    if !copy_le_f32_bytes(row_freq_bytes, &mut row_freq) {
+        return None;
+    }
+    cursor = row_freq_end;
+    let flip_end = cursor.checked_add(n_active)?;
+    let flip_buf = bytes.get(cursor..flip_end)?;
+    let row_flip: Vec<bool> = flip_buf.iter().map(|&v| v != 0).collect();
+    cursor = flip_end;
+    let idx_bytes_len = n_active.checked_mul(4)?;
+    let idx_end = cursor.checked_add(idx_bytes_len)?;
+    let idx_bytes = bytes.get(cursor..idx_end)?;
+    let active_row_idx = decode_le_u32_indices(idx_bytes, n_total_sites)?;
+    cursor = idx_end;
+    if cursor != bytes.len() {
+        return None;
+    }
+    Some((active_row_idx, row_freq, row_flip, total_variance))
 }
 
 fn try_store_packed_bed_cache(
@@ -404,7 +475,7 @@ fn try_store_packed_bed_cache(
         return Err("active_row_idx exceeds u32 range for RSVD cache".to_string());
     }
     let n_active = data.active_row_idx.len();
-    let mut buf = Vec::with_capacity(8 + 4 + 9 * 8 + n_active * (4 + 1 + 4));
+    let mut buf = Vec::with_capacity(8 + 4 + 10 * 8 + 8 + n_active * (4 + 1 + 4));
     buf.extend_from_slice(PACKED_BED_CACHE_MAGIC);
     push_u32_le(&mut buf, PACKED_BED_CACHE_VERSION);
     push_u64_le(&mut buf, bed_size);
@@ -417,6 +488,7 @@ fn try_store_packed_bed_cache(
     push_u64_le(&mut buf, n_total_sites as u64);
     push_u64_le(&mut buf, bytes_per_snp as u64);
     push_u64_le(&mut buf, n_active as u64);
+    buf.extend_from_slice(&data.total_variance.to_le_bytes());
     for &freq in data.row_freq.iter() {
         push_f32_le(&mut buf, freq);
     }
@@ -444,21 +516,18 @@ fn try_open_packed_bed_compact_cache_storage(
     if expected_size == 0 {
         return None;
     }
-    let mut file = File::open(compact_path).ok()?;
+    let file = File::open(compact_path).ok()?;
     let file_size = usize::try_from(file.metadata().ok()?.len()).ok()?;
     if file_size != expected_size {
         return None;
     }
     if packed_bed_owned_storage_enabled() {
-        let mut buf = Vec::new();
-        buf.try_reserve_exact(expected_size).ok()?;
-        file.read_to_end(&mut buf).ok()?;
-        if buf.len() == expected_size {
-            return Some(PackedBedStorage::Owned(buf));
-        }
-        return None;
+        let buf = load_file_owned_exact(compact_path, expected_size).ok()?;
+        return Some(PackedBedStorage::Owned(buf));
     }
-    unsafe { Mmap::map(&file).ok().map(PackedBedStorage::Mmap) }
+    mmap_readonly_file(compact_path)
+        .ok()
+        .map(PackedBedStorage::Mmap)
 }
 
 fn build_compact_cache_from_active_rows(
@@ -640,16 +709,18 @@ fn format_f32_vec_bytes(len: usize) -> String {
 }
 
 #[inline]
-fn packed_row_nonmissing_alt_sum_full(row: &[u8], n_samples: usize) -> (usize, f64) {
+fn packed_row_nonmissing_alt_sumsq_full(row: &[u8], n_samples: usize) -> (usize, f64, f64) {
     let byte_lut = packed_byte_lut();
     let full_bytes = n_samples / 4;
     let rem = n_samples % 4;
     let mut non_missing = 0usize;
     let mut alt_sum = 0.0_f64;
+    let mut sq_sum = 0.0_f64;
     for &b in row.iter().take(full_bytes) {
         let idx = b as usize;
         non_missing += byte_lut.nonmiss[idx] as usize;
         alt_sum += byte_lut.alt_sum[idx] as f64;
+        sq_sum += byte_lut.sq_sum[idx] as f64;
     }
     if rem > 0 {
         let codes = &byte_lut.code4[row[full_bytes] as usize];
@@ -661,16 +732,18 @@ fn packed_row_nonmissing_alt_sum_full(row: &[u8], n_samples: usize) -> (usize, f
                 0b10 => {
                     non_missing += 1;
                     alt_sum += 1.0;
+                    sq_sum += 1.0;
                 }
                 0b11 => {
                     non_missing += 1;
                     alt_sum += 2.0;
+                    sq_sum += 4.0;
                 }
                 _ => {}
             }
         }
     }
-    (non_missing, alt_sum)
+    (non_missing, alt_sum, sq_sum)
 }
 
 #[inline]
@@ -777,14 +850,18 @@ fn try_build_packed_bed_backend(cfg: &StreamRsvdConfig) -> Result<Option<PackedB
     let Some(prefix) = detect_bed_prefix(&cfg.genotype_path) else {
         return Ok(None);
     };
+    let t_backend = Instant::now();
     emit_rsvd_rss_debug("packed_backend/open_start", &format!("prefix={prefix}"));
+    emit_rsvd_time_debug("packed_backend/start", &format!("prefix={prefix}"));
     let bed_path = PathBuf::from(format!("{prefix}.bed"));
     let bim_path = PathBuf::from(format!("{prefix}.bim"));
     let fam_path = PathBuf::from(format!("{prefix}.fam"));
     let cache_path = packed_bed_cache_path(&prefix, cfg);
     let compact_path = packed_bed_compact_cache_path(&prefix, cfg);
 
+    let t_stage = Instant::now();
     let samples = read_fam(&prefix)?;
+    let fam_s = t_stage.elapsed().as_secs_f64();
     let n_samples = samples.len();
     if n_samples == 0 {
         return Err("no samples found in PLINK input".to_string());
@@ -794,28 +871,17 @@ fn try_build_packed_bed_backend(cfg: &StreamRsvdConfig) -> Result<Option<PackedB
         "packed_backend/fam_ready",
         &format!("prefix={} n_samples={}", prefix, n_samples),
     );
+    emit_rsvd_time_debug(
+        "packed_backend/fam",
+        &format!("elapsed={} n_samples={}", fmt_stage_secs(fam_s), n_samples),
+    );
 
-    let mut file = File::open(&bed_path).map_err(|e| e.to_string())?;
-    let mut header = [0u8; 3];
-    file.read_exact(&mut header).map_err(|e| e.to_string())?;
-    if header != [0x6C, 0x1B, 0x01] {
-        return Err("Only SNP-major BED supported".to_string());
-    }
-    let bytes_per_snp = (n_samples + 3) / 4;
-    let file_size = usize::try_from(file.metadata().map_err(|e| e.to_string())?.len())
-        .map_err(|_| "BED file size overflow".to_string())?;
-    if file_size < 3 {
-        return Err("BED file is too small".to_string());
-    }
-    let payload_size = file_size - 3;
-    if bytes_per_snp == 0 || payload_size % bytes_per_snp != 0 {
-        return Err(format!(
-            "BED payload size mismatch: payload={payload_size}, bytes_per_snp={bytes_per_snp}"
-        ));
-    }
-    let n_snps_total = payload_size / bytes_per_snp;
-    let expected_payload = payload_size;
-    drop(file);
+    let t_stage = Instant::now();
+    let bed_info = read_plink_bed_header_info(&bed_path, n_samples)?;
+    let bed_header_s = t_stage.elapsed().as_secs_f64();
+    let bytes_per_snp = bed_info.bytes_per_snp;
+    let n_snps_total = bed_info.n_snps_total;
+    let expected_payload = bed_info.payload_size;
     check_admx_memory_limit("bed_backend/after_bed_header")?;
     emit_rsvd_rss_debug(
         "packed_backend/bed_header",
@@ -828,8 +894,21 @@ fn try_build_packed_bed_backend(cfg: &StreamRsvdConfig) -> Result<Option<PackedB
             format_debug_bytes_local(expected_payload as u64),
         ),
     );
+    emit_rsvd_time_debug(
+        "packed_backend/bed_header",
+        &format!(
+            "elapsed={} n_samples={} n_total_sites={} bytes_per_snp={} file_size={} payload={}",
+            fmt_stage_secs(bed_header_s),
+            n_samples,
+            n_snps_total,
+            bytes_per_snp,
+            format_debug_bytes_local(bed_info.file_size as u64),
+            format_debug_bytes_local(expected_payload as u64),
+        ),
+    );
 
-    if let Some((active_row_idx, row_freq, row_flip)) = try_load_packed_bed_cache(
+    let t_stage = Instant::now();
+    let cached_meta = try_load_packed_bed_cache(
         &cache_path,
         &bed_path,
         &bim_path,
@@ -837,7 +916,9 @@ fn try_build_packed_bed_backend(cfg: &StreamRsvdConfig) -> Result<Option<PackedB
         n_samples,
         n_snps_total,
         bytes_per_snp,
-    ) {
+    );
+    let meta_cache_s = t_stage.elapsed().as_secs_f64();
+    if let Some((active_row_idx, row_freq, row_flip, total_variance)) = cached_meta {
         emit_rsvd_rss_debug(
             "packed_backend/cache_hit",
             &format!(
@@ -847,12 +928,23 @@ fn try_build_packed_bed_backend(cfg: &StreamRsvdConfig) -> Result<Option<PackedB
                 row_freq.len(),
             ),
         );
+        emit_rsvd_time_debug(
+            "packed_backend/meta_cache_hit",
+            &format!(
+                "elapsed={} cache={} active_rows={}",
+                fmt_stage_secs(meta_cache_s),
+                cache_path.display(),
+                row_freq.len(),
+            ),
+        );
         if row_freq.is_empty() {
             return Err("no SNPs remain after BED filters".to_string());
         }
+        let t_stage = Instant::now();
         if let Some(storage) =
             try_open_packed_bed_compact_cache_storage(&compact_path, row_freq.len(), bytes_per_snp)
         {
+            let compact_open_s = t_stage.elapsed().as_secs_f64();
             emit_rsvd_rss_debug(
                 "packed_backend/compact_cache_hit",
                 &format!(
@@ -862,6 +954,25 @@ fn try_build_packed_bed_backend(cfg: &StreamRsvdConfig) -> Result<Option<PackedB
                     row_freq.len(),
                     format_debug_bytes_local((row_freq.len().saturating_mul(bytes_per_snp)) as u64),
                     storage.label(),
+                ),
+            );
+            emit_rsvd_time_debug(
+                "packed_backend/compact_cache_hit",
+                &format!(
+                    "elapsed={} cache={} active_rows={} storage={}",
+                    fmt_stage_secs(compact_open_s),
+                    compact_path.display(),
+                    row_freq.len(),
+                    storage.label(),
+                ),
+            );
+            emit_rsvd_time_debug(
+                "packed_backend/summary",
+                &format!(
+                    "elapsed={} mode=meta_cache+compact_cache active_rows={} total_sites={}",
+                    fmt_stage_secs(t_backend.elapsed().as_secs_f64()),
+                    row_freq.len(),
+                    n_snps_total,
                 ),
             );
             return Ok(Some(PackedBedRsvd {
@@ -875,12 +986,24 @@ fn try_build_packed_bed_backend(cfg: &StreamRsvdConfig) -> Result<Option<PackedB
                 active_row_idx,
                 row_freq,
                 row_flip,
+                total_variance,
             }));
         }
+        let compact_open_s = t_stage.elapsed().as_secs_f64();
         emit_rsvd_rss_debug(
             "packed_backend/compact_cache_miss",
             &format!("prefix={} cache={}", prefix, compact_path.display()),
         );
+        emit_rsvd_time_debug(
+            "packed_backend/compact_cache_miss",
+            &format!(
+                "elapsed={} cache={} active_rows={}",
+                fmt_stage_secs(compact_open_s),
+                compact_path.display(),
+                row_freq.len(),
+            ),
+        );
+        let t_stage = Instant::now();
         match build_compact_cache_from_active_rows(
             &compact_path,
             &bed_path,
@@ -890,11 +1013,23 @@ fn try_build_packed_bed_backend(cfg: &StreamRsvdConfig) -> Result<Option<PackedB
             &active_row_idx,
         ) {
             Ok(()) => {
+                let compact_build_s = t_stage.elapsed().as_secs_f64();
+                emit_rsvd_time_debug(
+                    "packed_backend/compact_cache_build",
+                    &format!(
+                        "elapsed={} cache={} active_rows={}",
+                        fmt_stage_secs(compact_build_s),
+                        compact_path.display(),
+                        row_freq.len(),
+                    ),
+                );
+                let t_stage = Instant::now();
                 if let Some(storage) = try_open_packed_bed_compact_cache_storage(
                     &compact_path,
                     row_freq.len(),
                     bytes_per_snp,
                 ) {
+                    let compact_ready_s = t_stage.elapsed().as_secs_f64();
                     emit_rsvd_rss_debug(
                         "packed_backend/compact_cache_built",
                         &format!(
@@ -903,6 +1038,25 @@ fn try_build_packed_bed_backend(cfg: &StreamRsvdConfig) -> Result<Option<PackedB
                             compact_path.display(),
                             row_freq.len(),
                             storage.label(),
+                        ),
+                    );
+                    emit_rsvd_time_debug(
+                        "packed_backend/compact_cache_ready",
+                        &format!(
+                            "elapsed={} cache={} active_rows={} storage={}",
+                            fmt_stage_secs(compact_ready_s),
+                            compact_path.display(),
+                            row_freq.len(),
+                            storage.label(),
+                        ),
+                    );
+                    emit_rsvd_time_debug(
+                        "packed_backend/summary",
+                        &format!(
+                            "elapsed={} mode=meta_cache+compact_rebuild active_rows={} total_sites={}",
+                            fmt_stage_secs(t_backend.elapsed().as_secs_f64()),
+                            row_freq.len(),
+                            n_snps_total,
                         ),
                     );
                     return Ok(Some(PackedBedRsvd {
@@ -916,18 +1070,30 @@ fn try_build_packed_bed_backend(cfg: &StreamRsvdConfig) -> Result<Option<PackedB
                         active_row_idx,
                         row_freq,
                         row_flip,
+                        total_variance,
                     }));
                 }
             }
             Err(e) => {
+                let compact_build_s = t_stage.elapsed().as_secs_f64();
                 emit_rsvd_rss_debug(
                     "packed_backend/compact_cache_build_failed",
                     &format!("prefix={} error={}", prefix, e),
                 );
+                emit_rsvd_time_debug(
+                    "packed_backend/compact_cache_build_failed",
+                    &format!(
+                        "elapsed={} cache={} error={}",
+                        fmt_stage_secs(compact_build_s),
+                        compact_path.display(),
+                        e,
+                    ),
+                );
             }
         }
-        let file = File::open(&bed_path).map_err(|e| e.to_string())?;
-        let mmap = unsafe { Mmap::map(&file) }.map_err(|e| e.to_string())?;
+        let t_stage = Instant::now();
+        let mmap = mmap_readonly_file(&bed_path)?;
+        let mmap_s = t_stage.elapsed().as_secs_f64();
         emit_rsvd_rss_debug(
             "packed_backend/original_mmap_fallback",
             &format!(
@@ -935,6 +1101,24 @@ fn try_build_packed_bed_backend(cfg: &StreamRsvdConfig) -> Result<Option<PackedB
                 prefix,
                 row_freq.len(),
                 format_debug_bytes_local(expected_payload as u64),
+            ),
+        );
+        emit_rsvd_time_debug(
+            "packed_backend/original_mmap_fallback",
+            &format!(
+                "elapsed={} active_rows={} mapped_payload={}",
+                fmt_stage_secs(mmap_s),
+                row_freq.len(),
+                format_debug_bytes_local(expected_payload as u64),
+            ),
+        );
+        emit_rsvd_time_debug(
+            "packed_backend/summary",
+            &format!(
+                "elapsed={} mode=meta_cache+original_mmap active_rows={} total_sites={}",
+                fmt_stage_secs(t_backend.elapsed().as_secs_f64()),
+                row_freq.len(),
+                n_snps_total,
             ),
         );
         return Ok(Some(PackedBedRsvd {
@@ -948,10 +1132,22 @@ fn try_build_packed_bed_backend(cfg: &StreamRsvdConfig) -> Result<Option<PackedB
             active_row_idx,
             row_freq,
             row_flip,
+            total_variance,
         }));
     }
+    emit_rsvd_time_debug(
+        "packed_backend/meta_cache_miss",
+        &format!(
+            "elapsed={} cache={} total_sites={}",
+            fmt_stage_secs(meta_cache_s),
+            cache_path.display(),
+            n_snps_total,
+        ),
+    );
 
+    let t_stage = Instant::now();
     let (bim_sites, simple_snp_mask) = scan_bim_site_count_and_simple_mask(&prefix, cfg.snps_only)?;
+    let bim_scan_s = t_stage.elapsed().as_secs_f64();
     if bim_sites != n_snps_total {
         return Err(format!(
             "BED/BIM site count mismatch: bed={n_snps_total}, bim={bim_sites}"
@@ -965,20 +1161,25 @@ fn try_build_packed_bed_backend(cfg: &StreamRsvdConfig) -> Result<Option<PackedB
             prefix, n_snps_total, cfg.snps_only
         ),
     );
+    emit_rsvd_time_debug(
+        "packed_backend/bim_scan",
+        &format!(
+            "elapsed={} n_total_sites={} snps_only={}",
+            fmt_stage_secs(bim_scan_s),
+            n_snps_total,
+            cfg.snps_only,
+        ),
+    );
 
     let mut active_row_idx: Vec<usize> = Vec::with_capacity(n_snps_total);
     let mut row_freq: Vec<f32> = Vec::with_capacity(n_snps_total);
     let mut row_flip: Vec<bool> = Vec::with_capacity(n_snps_total);
+    let mut total_ss = 0.0_f64;
+    let mut total_var = 0.0_f64;
     let n_samples_f64 = n_samples as f64;
     let chunk_rows = packed_backend_stats_chunk_rows(n_snps_total, n_samples);
-    let mut bed_reader = BufReader::new(File::open(&bed_path).map_err(|e| e.to_string())?);
-    let mut header = [0u8; 3];
-    bed_reader
-        .read_exact(&mut header)
-        .map_err(|e| e.to_string())?;
-    if header != [0x6C, 0x1B, 0x01] {
-        return Err("Only SNP-major BED supported".to_string());
-    }
+    let t_stage = Instant::now();
+    let mut bed_reader = open_plink_bed_reader_after_header(&bed_path)?;
     let compact_tmp_path = compact_path.with_extension("tmp");
     let mut compact_writer = if packed_bed_compact_cache_enabled() {
         match File::create(&compact_tmp_path) {
@@ -999,7 +1200,18 @@ fn try_build_packed_bed_backend(cfg: &StreamRsvdConfig) -> Result<Option<PackedB
     } else {
         None
     };
+    let scan_setup_s = t_stage.elapsed().as_secs_f64();
+    emit_rsvd_time_debug(
+        "packed_backend/scan_setup",
+        &format!(
+            "elapsed={} chunk_rows={} compact_cache_enabled={}",
+            fmt_stage_secs(scan_setup_s),
+            chunk_rows,
+            packed_bed_compact_cache_enabled(),
+        ),
+    );
     let mut chunk_buf = Vec::<u8>::new();
+    let t_stage = Instant::now();
     for chunk_start in (0..n_snps_total).step_by(chunk_rows) {
         check_admx_memory_limit("bed_backend/filter_scan")?;
         let chunk_end = (chunk_start + chunk_rows).min(n_snps_total);
@@ -1008,7 +1220,7 @@ fn try_build_packed_bed_backend(cfg: &StreamRsvdConfig) -> Result<Option<PackedB
         bed_reader
             .read_exact(&mut chunk_buf)
             .map_err(|e| e.to_string())?;
-        let keep_rows: Vec<Option<(usize, usize, f32, bool)>> = (0..row_count)
+        let keep_rows: Vec<Option<(usize, usize, f32, bool, f64, f64)>> = (0..row_count)
             .into_par_iter()
             .map(|local_idx| {
                 let snp_idx = chunk_start + local_idx;
@@ -1023,7 +1235,8 @@ fn try_build_packed_bed_backend(cfg: &StreamRsvdConfig) -> Result<Option<PackedB
                 }
                 let row_start = local_idx * bytes_per_snp;
                 let row = &chunk_buf[row_start..row_start + bytes_per_snp];
-                let (non_missing, alt_sum) = packed_row_nonmissing_alt_sum_full(row, n_samples);
+                let (non_missing, alt_sum, sq_sum) =
+                    packed_row_nonmissing_alt_sumsq_full(row, n_samples);
 
                 let miss_rate = 1.0_f64 - (non_missing as f64 / n_samples_f64);
                 if miss_rate > cfg.missing_rate as f64 {
@@ -1033,7 +1246,7 @@ fn try_build_packed_bed_backend(cfg: &StreamRsvdConfig) -> Result<Option<PackedB
                     if cfg.maf > 0.0 {
                         return None;
                     }
-                    return Some((local_idx, snp_idx, 0.0_f32, false));
+                    return Some((local_idx, snp_idx, 0.0_f32, false, 0.0_f64, 0.0_f64));
                 }
 
                 let p = alt_sum / (2.0 * non_missing as f64);
@@ -1042,14 +1255,19 @@ fn try_build_packed_bed_backend(cfg: &StreamRsvdConfig) -> Result<Option<PackedB
                 if p_minor < cfg.maf as f64 {
                     return None;
                 }
-                Some((local_idx, snp_idx, p_minor as f32, flip))
+                let row_mean = alt_sum / non_missing as f64;
+                let row_ss = (sq_sum - alt_sum * row_mean).max(0.0_f64);
+                let row_var = (2.0_f64 * p_minor * (1.0_f64 - p_minor)).max(0.0_f64);
+                Some((local_idx, snp_idx, p_minor as f32, flip, row_ss, row_var))
             })
             .collect();
         for item in keep_rows.into_iter().flatten() {
-            let (local_idx, snp_idx, freq, flip) = item;
+            let (local_idx, snp_idx, freq, flip, row_ss, row_var) = item;
             active_row_idx.push(snp_idx);
             row_freq.push(freq);
             row_flip.push(flip);
+            total_ss += row_ss;
+            total_var += row_var;
             if let Some(writer) = compact_writer.as_mut() {
                 let row_start = local_idx * bytes_per_snp;
                 writer
@@ -1071,20 +1289,40 @@ fn try_build_packed_bed_backend(cfg: &StreamRsvdConfig) -> Result<Option<PackedB
             );
         }
     }
+    let filter_scan_s = t_stage.elapsed().as_secs_f64();
 
     let n_snps = row_freq.len();
     if n_snps == 0 {
         return Err("no SNPs remain after BED filters".to_string());
     }
+    if !(total_var.is_finite() && total_var > 0.0) {
+        return Err("invalid RSVD packed BED total variance denominator".to_string());
+    }
+    let total_variance = total_ss / total_var;
+    if !(total_variance.is_finite() && total_variance > 0.0) {
+        return Err("invalid RSVD packed BED trace(K)".to_string());
+    }
     emit_rsvd_rss_debug(
         "packed_backend/filter_done",
         &format!(
-            "prefix={} active_rows={} dropped={} row_freq={} row_flip={}",
+            "prefix={} active_rows={} dropped={} row_freq={} row_flip={} traceK={:.6e}",
             prefix,
             n_snps,
             n_snps_total.saturating_sub(n_snps),
             format_debug_bytes_local((row_freq.len() * std::mem::size_of::<f32>()) as u64),
             format_debug_bytes_local((row_flip.len() * std::mem::size_of::<bool>()) as u64),
+            total_variance,
+        ),
+    );
+    emit_rsvd_time_debug(
+        "packed_backend/filter_scan",
+        &format!(
+            "elapsed={} active_rows={} dropped={} traceK={:.6e} chunk_rows={}",
+            fmt_stage_secs(filter_scan_s),
+            n_snps,
+            n_snps_total.saturating_sub(n_snps),
+            total_variance,
+            chunk_rows,
         ),
     );
     let compact_ready = if let Some(mut writer) = compact_writer {
@@ -1101,11 +1339,13 @@ fn try_build_packed_bed_backend(cfg: &StreamRsvdConfig) -> Result<Option<PackedB
     let expected_compact_payload = n_snps
         .checked_mul(bytes_per_snp)
         .ok_or_else(|| "compact BED payload size overflow".to_string())?;
+    let t_stage = Instant::now();
     if compact_ready {
         storage = try_open_packed_bed_compact_cache_storage(&compact_path, n_snps, bytes_per_snp)
             .ok_or_else(|| "failed to open compact BED row cache after build".to_string())?;
         payload_offset = 0;
         compact_rows = true;
+        let storage_ready_s = t_stage.elapsed().as_secs_f64();
         emit_rsvd_rss_debug(
             "packed_backend/compact_cache_ready",
             &format!(
@@ -1116,17 +1356,35 @@ fn try_build_packed_bed_backend(cfg: &StreamRsvdConfig) -> Result<Option<PackedB
                 storage.label(),
             ),
         );
+        emit_rsvd_time_debug(
+            "packed_backend/compact_cache_ready",
+            &format!(
+                "elapsed={} cache={} packed_payload={} storage={}",
+                fmt_stage_secs(storage_ready_s),
+                compact_path.display(),
+                format_debug_bytes_local(expected_compact_payload as u64),
+                storage.label(),
+            ),
+        );
     } else {
-        let file = File::open(&bed_path).map_err(|e| e.to_string())?;
-        let mmap = unsafe { Mmap::map(&file) }.map_err(|e| e.to_string())?;
+        let mmap = mmap_readonly_file(&bed_path)?;
         storage = PackedBedStorage::Mmap(mmap);
         payload_offset = 3;
         compact_rows = false;
+        let storage_ready_s = t_stage.elapsed().as_secs_f64();
         emit_rsvd_rss_debug(
             "packed_backend/original_mmap_ready",
             &format!(
                 "prefix={} mapped_payload={}",
                 prefix,
+                format_debug_bytes_local(expected_payload as u64),
+            ),
+        );
+        emit_rsvd_time_debug(
+            "packed_backend/original_mmap_ready",
+            &format!(
+                "elapsed={} mapped_payload={}",
+                fmt_stage_secs(storage_ready_s),
                 format_debug_bytes_local(expected_payload as u64),
             ),
         );
@@ -1142,7 +1400,9 @@ fn try_build_packed_bed_backend(cfg: &StreamRsvdConfig) -> Result<Option<PackedB
         active_row_idx,
         row_freq,
         row_flip,
+        total_variance,
     };
+    let t_stage = Instant::now();
     let _ = try_store_packed_bed_cache(
         &cache_path,
         &bed_path,
@@ -1151,6 +1411,26 @@ fn try_build_packed_bed_backend(cfg: &StreamRsvdConfig) -> Result<Option<PackedB
         bytes_per_snp,
         n_snps_total,
         &backend,
+    );
+    let cache_store_s = t_stage.elapsed().as_secs_f64();
+    emit_rsvd_time_debug(
+        "packed_backend/cache_store",
+        &format!(
+            "elapsed={} cache={} active_rows={}",
+            fmt_stage_secs(cache_store_s),
+            cache_path.display(),
+            backend.n_snps,
+        ),
+    );
+    emit_rsvd_time_debug(
+        "packed_backend/summary",
+        &format!(
+            "elapsed={} mode=build active_rows={} total_sites={} compact_rows={}",
+            fmt_stage_secs(t_backend.elapsed().as_secs_f64()),
+            backend.n_snps,
+            backend.n_total_sites,
+            backend.compact_rows,
+        ),
     );
     Ok(Some(backend))
 }
@@ -1643,6 +1923,14 @@ fn fill_random_omega_block(rng: &mut StdRng, omega_block: &mut [f32]) {
     }
 }
 
+#[inline]
+fn subtract_scaled_inplace_f32(dst: &mut [f32], alpha: f32, rhs: &[f32]) {
+    debug_assert_eq!(dst.len(), rhs.len());
+    dst.par_iter_mut()
+        .zip(rhs.par_iter())
+        .for_each(|(yi, qi)| *yi -= alpha * *qi);
+}
+
 fn thin_svd_from_tall(
     x: &[f32],
     rows: usize,
@@ -1744,8 +2032,8 @@ fn compute_at_random_omega_stream(
 
     let mut y = vec![0.0_f32; n * kp]; // (n, kp)
     let block_rows = rsvd_block_rows_env(n, m);
-    let n_i = checked_cblas_dim_local(n, "n")?;
-    let kp_i = checked_cblas_dim_local(kp, "kp")?;
+    let _n_i = checked_cblas_dim_local(n, "n")?;
+    let _kp_i = checked_cblas_dim_local(kp, "kp")?;
     let mut rng = StdRng::seed_from_u64(seed);
     let mut omega_block = vec![0.0_f32; block_rows * kp];
     let _blas_guard = BlasThreadGuard::enter(rayon::current_num_threads().max(1));
@@ -1758,24 +2046,8 @@ fn compute_at_random_omega_stream(
             let rows_i = checked_cblas_dim_local(rows_here, "rows_here")?;
             let omega_cur = &mut omega_block[..rows_here * kp];
             fill_random_omega_block(&mut rng, omega_cur);
-            unsafe {
-                cblas_sgemm_dispatch(
-                    CBLAS_ROW_MAJOR,
-                    CBLAS_TRANS,
-                    CBLAS_NO_TRANS,
-                    n_i,
-                    kp_i,
-                    rows_i,
-                    1.0_f32,
-                    block.as_ptr(),
-                    n_i,
-                    omega_cur.as_ptr(),
-                    kp_i,
-                    1.0_f32,
-                    y.as_mut_ptr(),
-                    kp_i,
-                );
-            }
+            let _ = rows_i;
+            row_major_block_t_mul_mat_accum_f32(block, rows_here, n, omega_cur, kp, &mut y, None);
             Ok(())
         },
     )?;
@@ -1804,8 +2076,8 @@ fn compute_a_omega_stream(
 
     let mut out = vec![0.0_f32; m * kp]; // (m, kp)
     let block_rows = rsvd_block_rows_env(n, m);
-    let n_i = checked_cblas_dim_local(n, "n")?;
-    let kp_i = checked_cblas_dim_local(kp, "kp")?;
+    let _n_i = checked_cblas_dim_local(n, "n")?;
+    let _kp_i = checked_cblas_dim_local(kp, "kp")?;
     let _blas_guard = BlasThreadGuard::enter(rayon::current_num_threads().max(1));
     let (seen, seen_n) = for_each_processed_centered_block(
         cfg,
@@ -1815,24 +2087,8 @@ fn compute_a_omega_stream(
         |row_start, rows_here, block| {
             let rows_i = checked_cblas_dim_local(rows_here, "rows_here")?;
             let out_block = &mut out[row_start * kp..(row_start + rows_here) * kp];
-            unsafe {
-                cblas_sgemm_dispatch(
-                    CBLAS_ROW_MAJOR,
-                    CBLAS_NO_TRANS,
-                    CBLAS_NO_TRANS,
-                    rows_i,
-                    kp_i,
-                    n_i,
-                    1.0_f32,
-                    block.as_ptr(),
-                    n_i,
-                    omega.as_ptr(),
-                    kp_i,
-                    0.0_f32,
-                    out_block.as_mut_ptr(),
-                    kp_i,
-                );
-            }
+            let _ = rows_i;
+            row_major_block_mul_mat_f32(block, rows_here, n, omega, kp, out_block, None);
             Ok(())
         },
     )?;
@@ -1862,8 +2118,8 @@ fn compute_ata_omega_stream(
 
     let mut out = vec![0.0_f32; n * kp];
     let block_rows = rsvd_block_rows_env(n, m);
-    let n_i = checked_cblas_dim_local(n, "n")?;
-    let kp_i = checked_cblas_dim_local(kp, "kp")?;
+    let _n_i = checked_cblas_dim_local(n, "n")?;
+    let _kp_i = checked_cblas_dim_local(kp, "kp")?;
     let mut g_block = vec![0.0_f32; block_rows * kp];
     let _blas_guard = BlasThreadGuard::enter(rayon::current_num_threads().max(1));
     let (seen, seen_n) = for_each_processed_centered_block(
@@ -1874,40 +2130,9 @@ fn compute_ata_omega_stream(
         |_row_start, rows_here, block| {
             let rows_i = checked_cblas_dim_local(rows_here, "rows_here")?;
             let cur_g = &mut g_block[..rows_here * kp];
-            unsafe {
-                cblas_sgemm_dispatch(
-                    CBLAS_ROW_MAJOR,
-                    CBLAS_NO_TRANS,
-                    CBLAS_NO_TRANS,
-                    rows_i,
-                    kp_i,
-                    n_i,
-                    1.0_f32,
-                    block.as_ptr(),
-                    n_i,
-                    omega.as_ptr(),
-                    kp_i,
-                    0.0_f32,
-                    cur_g.as_mut_ptr(),
-                    kp_i,
-                );
-                cblas_sgemm_dispatch(
-                    CBLAS_ROW_MAJOR,
-                    CBLAS_TRANS,
-                    CBLAS_NO_TRANS,
-                    n_i,
-                    kp_i,
-                    rows_i,
-                    1.0_f32,
-                    block.as_ptr(),
-                    n_i,
-                    cur_g.as_ptr(),
-                    kp_i,
-                    1.0_f32,
-                    out.as_mut_ptr(),
-                    kp_i,
-                );
-            }
+            row_major_block_mul_mat_f32(block, rows_here, n, omega, kp, cur_g, None);
+            let _ = rows_i;
+            row_major_block_t_mul_mat_accum_f32(block, rows_here, n, cur_g, kp, &mut out, None);
             Ok(())
         },
     )?;
@@ -1935,8 +2160,8 @@ fn compute_gram_aq_stream(
     }
 
     let block_rows = rsvd_block_rows_env(n, m);
-    let n_i = checked_cblas_dim_local(n, "n")?;
-    let kp_i = checked_cblas_dim_local(kp, "kp")?;
+    let _n_i = checked_cblas_dim_local(n, "n")?;
+    let _kp_i = checked_cblas_dim_local(kp, "kp")?;
     let mut gram = vec![0.0_f64; kp * kp];
     let mut gram_block = vec![0.0_f32; kp * kp];
     let mut g_block = vec![0.0_f32; block_rows * kp];
@@ -1949,24 +2174,8 @@ fn compute_gram_aq_stream(
         |_row_start, rows_here, block| {
             let rows_i = checked_cblas_dim_local(rows_here, "rows_here")?;
             let cur_g = &mut g_block[..rows_here * kp];
-            unsafe {
-                cblas_sgemm_dispatch(
-                    CBLAS_ROW_MAJOR,
-                    CBLAS_NO_TRANS,
-                    CBLAS_NO_TRANS,
-                    rows_i,
-                    kp_i,
-                    n_i,
-                    1.0_f32,
-                    block.as_ptr(),
-                    n_i,
-                    q.as_ptr(),
-                    kp_i,
-                    0.0_f32,
-                    cur_g.as_mut_ptr(),
-                    kp_i,
-                );
-            }
+            row_major_block_mul_mat_f32(block, rows_here, n, q, kp, cur_g, None);
+            let _ = rows_i;
             accum_gram_lower_f64_local(cur_g, rows_here, kp, &mut gram, &mut gram_block)?;
             Ok(())
         },
@@ -2198,9 +2407,7 @@ pub fn admx_rsvd_stream<'py>(
         power_mul_s += t_power_mul.elapsed().as_secs_f64();
         power_mul_decode_s += kernel_timing.decode_s;
         power_mul_gemm_s += kernel_timing.gemm_s;
-        for idx in 0..(n * kp) {
-            y[idx] -= alpha * q[idx];
-        }
+        subtract_scaled_inplace_f32(&mut y, alpha, &q);
         let t_power_qr = Instant::now();
         let (q_new, s_y, _) = thin_svd_from_tall(&y, n, kp).map_err(PyRuntimeError::new_err)?;
         power_qr_s += t_power_qr.elapsed().as_secs_f64();
@@ -2331,7 +2538,7 @@ pub fn admx_rsvd_stream_sample<'py>(
     missing_rate: f32,
     delimiter: Option<String>,
     mmap_window_mb: usize,
-) -> PyResult<(Bound<'py, PyArray1<f32>>, Bound<'py, PyArray2<f32>>)> {
+) -> PyResult<(Bound<'py, PyArray1<f32>>, Bound<'py, PyArray2<f32>>, f64)> {
     if k == 0 {
         return Err(PyRuntimeError::new_err("k must be > 0"));
     }
@@ -2359,24 +2566,28 @@ pub fn admx_rsvd_stream_sample<'py>(
     let mut t_stage = Instant::now();
 
     let packed_backend = try_build_packed_bed_backend(&cfg).map_err(PyRuntimeError::new_err)?;
+    let packed_backend_s = t_stage.elapsed().as_secs_f64();
     if let Some(backend) = packed_backend.as_ref() {
-        let (eigvals, eigvecs_sample) =
-            rsvd_stream_sample_packed_impl(backend, k, seed, power, tol)
+        let (eigvals, eigvecs_sample, total_variance) =
+            rsvd_stream_sample_packed_impl(backend, k, seed, power, tol, packed_backend_s)
                 .map_err(PyRuntimeError::new_err)?;
         let k_eff = eigvals.len();
         let eval_arr = row_freq_to_pyarray(py, &eigvals);
         let evec_arr = vec_to_pyarray2_f32(py, backend.n_samples, k_eff, &eigvecs_sample)?;
-        return Ok((eval_arr, evec_arr));
+        return Ok((eval_arr, evec_arr, total_variance));
     }
 
     let mut row_freq: Vec<f32> = Vec::new();
     let mut varsum: f64 = 0.0;
+    let mut total_ss: f64 = 0.0;
     let (m, n) = for_each_processed_row(&cfg, |_idx, row| {
         let mut alt_sum = 0.0_f64;
         let mut non_missing = 0usize;
+        let mut sq_sum = 0.0_f64;
         for &g in row.iter() {
             if g >= 0.0 && g.is_finite() {
                 alt_sum += g as f64;
+                sq_sum += (g as f64) * (g as f64);
                 non_missing += 1;
             }
         }
@@ -2386,6 +2597,10 @@ pub fn admx_rsvd_stream_sample<'py>(
             0.0_f32
         };
         varsum += 2.0_f64 * (freq as f64) * (1.0_f64 - freq as f64);
+        if non_missing > 0 {
+            let row_mean = alt_sum / non_missing as f64;
+            total_ss += (sq_sum - alt_sum * row_mean).max(0.0_f64);
+        }
         row_freq.push(freq);
         Ok(())
     })
@@ -2407,6 +2622,12 @@ pub fn admx_rsvd_stream_sample<'py>(
             "invalid scaling denominator in streaming RSVD (varsum <= 0)",
         ));
     }
+    let total_variance = total_ss / varsum;
+    if !(total_variance.is_finite() && total_variance > 0.0) {
+        return Err(PyRuntimeError::new_err(
+            "invalid total variance in streaming RSVD (trace(K) <= 0)",
+        ));
+    }
 
     let k_eff = k.min(n);
     let kp = admx_rsvd_kp(k_eff, m.max(1).min(n.max(1)));
@@ -2425,7 +2646,7 @@ pub fn admx_rsvd_stream_sample<'py>(
     emit_rsvd_rss_debug(
         "stream_sample/backend_ready",
         &format!(
-            "mode={} n_samples={} n_snps={} kp={} row_freq={} varsum={:.6e}{}",
+            "mode={} n_samples={} n_snps={} kp={} row_freq={} varsum={:.6e} traceK={:.6e}{}",
             if packed_backend.is_some() {
                 "packed_mmap"
             } else {
@@ -2436,6 +2657,7 @@ pub fn admx_rsvd_stream_sample<'py>(
             kp,
             format_f32_vec_bytes(row_freq.len()),
             varsum,
+            total_variance,
             backend_extra,
         ),
     );
@@ -2532,9 +2754,7 @@ pub fn admx_rsvd_stream_sample<'py>(
         power_mul_s += t_power_mul.elapsed().as_secs_f64();
         power_mul_decode_s += kernel_timing.decode_s;
         power_mul_gemm_s += kernel_timing.gemm_s;
-        for idx in 0..(n * kp) {
-            y[idx] -= alpha * q[idx];
-        }
+        subtract_scaled_inplace_f32(&mut y, alpha, &q);
         let t_power_qr = Instant::now();
         let (q_new, s_y, _) = thin_svd_from_tall(&y, n, kp).map_err(PyRuntimeError::new_err)?;
         power_qr_s += t_power_qr.elapsed().as_secs_f64();
@@ -2603,19 +2823,9 @@ pub fn admx_rsvd_stream_sample<'py>(
     }
 
     // Sample-side eigenvectors/right singular vectors: q @ v_small[:, :k_eff]
-    let mut eigvecs_sample = vec![0.0_f32; n * k_eff];
     t_stage = Instant::now();
-    for r in 0..n {
-        let q_row = &q[r * kp..(r + 1) * kp];
-        let out_row = &mut eigvecs_sample[r * k_eff..(r + 1) * k_eff];
-        for c in 0..k_eff {
-            let mut acc = 0.0_f64;
-            for t in 0..kp {
-                acc += (q_row[t] as f64) * (v_small[t * kp + c] as f64);
-            }
-            out_row[c] = acc as f32;
-        }
-    }
+    let eigvecs_sample =
+        rsvd_project_sample_eigvecs(&q, n, kp, &v_small, k_eff).map_err(PyRuntimeError::new_err)?;
     let final_vec_s = t_stage.elapsed().as_secs_f64();
 
     let eval_arr = PyArray1::<f32>::zeros(py, [k_eff], false).into_bound();
@@ -2662,7 +2872,7 @@ pub fn admx_rsvd_stream_sample<'py>(
     );
     eval_slice.copy_from_slice(&eigvals);
     evec_slice.copy_from_slice(&eigvecs_sample);
-    Ok((eval_arr, evec_arr))
+    Ok((eval_arr, evec_arr, total_variance))
 }
 
 fn loglikelihood_f32_impl(g: &ArrayView2<'_, u8>, p: &[f32], q: &[f32], n: usize, k: usize) -> f64 {
@@ -3057,8 +3267,8 @@ fn compute_a_omega_packed_fold_impl(
     let block_rows = rsvd_block_rows_env(n, m);
     let mut out = vec![0.0_f32; m * kp];
     let mut block = vec![0.0_f32; block_rows * n];
-    let n_i = checked_cblas_dim_local(n, "n")?;
-    let kp_i = checked_cblas_dim_local(kp, "kp")?;
+    let _n_i = checked_cblas_dim_local(n, "n")?;
+    let _kp_i = checked_cblas_dim_local(kp, "kp")?;
     let _blas_guard = BlasThreadGuard::enter(rayon::current_num_threads().max(1));
 
     for row_start in (0..m).step_by(block_rows) {
@@ -3076,25 +3286,8 @@ fn compute_a_omega_packed_fold_impl(
             cur_block,
         )?;
         let out_block = &mut out[row_start * kp..row_end * kp];
-        let cur_rows_i = checked_cblas_dim_local(cur_rows, "cur_rows")?;
-        unsafe {
-            cblas_sgemm_dispatch(
-                CBLAS_ROW_MAJOR,
-                CBLAS_NO_TRANS,
-                CBLAS_NO_TRANS,
-                cur_rows_i,
-                kp_i,
-                n_i,
-                1.0_f32,
-                cur_block.as_ptr(),
-                n_i,
-                omega.as_ptr(),
-                kp_i,
-                0.0_f32,
-                out_block.as_mut_ptr(),
-                kp_i,
-            );
-        }
+        let _ = checked_cblas_dim_local(cur_rows, "cur_rows")?;
+        row_major_block_mul_mat_f32(cur_block, cur_rows, n, omega, kp, out_block, None);
     }
     Ok(out)
 }
@@ -3122,8 +3315,8 @@ fn compute_at_random_omega_packed_fold_impl(
     let mut block = vec![0.0_f32; block_rows * n];
     let mut omega_block = vec![0.0_f32; block_rows * kp];
     let mut rng = StdRng::seed_from_u64(seed);
-    let n_i = checked_cblas_dim_local(n, "n")?;
-    let kp_i = checked_cblas_dim_local(kp, "kp")?;
+    let _n_i = checked_cblas_dim_local(n, "n")?;
+    let _kp_i = checked_cblas_dim_local(kp, "kp")?;
     let _blas_guard = BlasThreadGuard::enter(rayon::current_num_threads().max(1));
 
     for row_start in (0..m).step_by(block_rows) {
@@ -3142,25 +3335,8 @@ fn compute_at_random_omega_packed_fold_impl(
         )?;
         let cur_omega = &mut omega_block[..cur_rows * kp];
         fill_random_omega_block(&mut rng, cur_omega);
-        let cur_rows_i = checked_cblas_dim_local(cur_rows, "cur_rows")?;
-        unsafe {
-            cblas_sgemm_dispatch(
-                CBLAS_ROW_MAJOR,
-                CBLAS_TRANS,
-                CBLAS_NO_TRANS,
-                n_i,
-                kp_i,
-                cur_rows_i,
-                1.0_f32,
-                cur_block.as_ptr(),
-                n_i,
-                cur_omega.as_ptr(),
-                kp_i,
-                1.0_f32,
-                out.as_mut_ptr(),
-                kp_i,
-            );
-        }
+        let _ = checked_cblas_dim_local(cur_rows, "cur_rows")?;
+        row_major_block_t_mul_mat_accum_f32(cur_block, cur_rows, n, cur_omega, kp, &mut out, None);
     }
     Ok(out)
 }
@@ -3191,8 +3367,8 @@ fn compute_ata_omega_packed_fold_impl(
     let mut out = vec![0.0_f32; n * kp];
     let mut block = vec![0.0_f32; block_rows * n];
     let mut g_block = vec![0.0_f32; block_rows * kp];
-    let n_i = checked_cblas_dim_local(n, "n")?;
-    let kp_i = checked_cblas_dim_local(kp, "kp")?;
+    let _n_i = checked_cblas_dim_local(n, "n")?;
+    let _kp_i = checked_cblas_dim_local(kp, "kp")?;
     let _blas_guard = BlasThreadGuard::enter(rayon::current_num_threads().max(1));
     let measure_timing = timing.is_some();
     let mut decode_s = 0.0_f64;
@@ -3227,40 +3403,9 @@ fn compute_ata_omega_packed_fold_impl(
         } else {
             None
         };
-        unsafe {
-            cblas_sgemm_dispatch(
-                CBLAS_ROW_MAJOR,
-                CBLAS_NO_TRANS,
-                CBLAS_NO_TRANS,
-                cur_rows_i,
-                kp_i,
-                n_i,
-                1.0_f32,
-                cur_block.as_ptr(),
-                n_i,
-                omega.as_ptr(),
-                kp_i,
-                0.0_f32,
-                cur_g.as_mut_ptr(),
-                kp_i,
-            );
-            cblas_sgemm_dispatch(
-                CBLAS_ROW_MAJOR,
-                CBLAS_TRANS,
-                CBLAS_NO_TRANS,
-                n_i,
-                kp_i,
-                cur_rows_i,
-                1.0_f32,
-                cur_block.as_ptr(),
-                n_i,
-                cur_g.as_ptr(),
-                kp_i,
-                1.0_f32,
-                out.as_mut_ptr(),
-                kp_i,
-            );
-        }
+        row_major_block_mul_mat_f32(cur_block, cur_rows, n, omega, kp, cur_g, None);
+        let _ = cur_rows_i;
+        row_major_block_t_mul_mat_accum_f32(cur_block, cur_rows, n, cur_g, kp, &mut out, None);
         if let Some(t0) = t_gemm {
             gemm_s += t0.elapsed().as_secs_f64();
         }
@@ -3299,8 +3444,8 @@ fn compute_gram_aq_packed_fold_impl(
     let mut aq_block = vec![0.0_f32; block_rows * kp];
     let mut gram = vec![0.0_f64; kp * kp];
     let mut gram_block = vec![0.0_f32; kp * kp];
-    let n_i = checked_cblas_dim_local(n, "n")?;
-    let kp_i = checked_cblas_dim_local(kp, "kp")?;
+    let _n_i = checked_cblas_dim_local(n, "n")?;
+    let _kp_i = checked_cblas_dim_local(kp, "kp")?;
     let _blas_guard = BlasThreadGuard::enter(rayon::current_num_threads().max(1));
 
     for row_start in (0..m).step_by(block_rows) {
@@ -3319,24 +3464,8 @@ fn compute_gram_aq_packed_fold_impl(
             cur_block,
         )?;
         let cur_aq = &mut aq_block[..cur_rows * kp];
-        unsafe {
-            cblas_sgemm_dispatch(
-                CBLAS_ROW_MAJOR,
-                CBLAS_NO_TRANS,
-                CBLAS_NO_TRANS,
-                cur_rows_i,
-                kp_i,
-                n_i,
-                1.0_f32,
-                cur_block.as_ptr(),
-                n_i,
-                q.as_ptr(),
-                kp_i,
-                0.0_f32,
-                cur_aq.as_mut_ptr(),
-                kp_i,
-            );
-        }
+        row_major_block_mul_mat_f32(cur_block, cur_rows, n, q, kp, cur_aq, None);
+        let _ = cur_rows_i;
         accum_gram_lower_f64_local(cur_aq, cur_rows, kp, &mut gram, &mut gram_block)?;
     }
     Ok(gram)
@@ -3348,7 +3477,8 @@ fn rsvd_stream_sample_packed_impl(
     seed: u64,
     power: usize,
     tol: f32,
-) -> Result<(Vec<f32>, Vec<f32>), String> {
+    backend_elapsed_s: f64,
+) -> Result<(Vec<f32>, Vec<f32>, f64), String> {
     if k == 0 {
         return Err("k must be > 0".to_string());
     }
@@ -3360,6 +3490,7 @@ fn rsvd_stream_sample_packed_impl(
     let n = backend.n_samples;
     let m = backend.n_snps;
     let row_freq = &backend.row_freq;
+    let total_variance = backend.total_variance;
     let mut varsum: f64 = 0.0;
     for &freq in row_freq.iter() {
         varsum += 2.0_f64 * (freq as f64) * (1.0_f64 - freq as f64);
@@ -3382,17 +3513,22 @@ fn rsvd_stream_sample_packed_impl(
     emit_rsvd_rss_debug(
         "stream_sample/backend_ready",
         &format!(
-            "mode=packed_session n_samples={} n_snps={} kp={} row_freq={} varsum={:.6e} total_sites={} active_row_idx={}",
+            "mode=packed_session n_samples={} n_snps={} kp={} row_freq={} varsum={:.6e} traceK={:.6e} total_sites={} active_row_idx={}",
             n,
             m,
             kp,
             format_f32_vec_bytes(row_freq.len()),
             varsum,
+            total_variance,
             backend.n_total_sites,
             format_debug_bytes_local(
                 (backend.active_row_idx.len() * std::mem::size_of::<usize>()) as u64
             ),
         ),
+    );
+    emit_rsvd_time_debug(
+        "stream_sample/backend_ready",
+        &format!("elapsed={}", fmt_stage_secs(backend_elapsed_s)),
     );
     emit_rsvd_rss_debug(
         "stream_sample/omega_ready",
@@ -3465,9 +3601,7 @@ fn rsvd_stream_sample_packed_impl(
         power_mul_s += t_power_mul.elapsed().as_secs_f64();
         power_mul_decode_s += kernel_timing.decode_s;
         power_mul_gemm_s += kernel_timing.gemm_s;
-        for idx in 0..(n * kp) {
-            y[idx] -= alpha * q[idx];
-        }
+        subtract_scaled_inplace_f32(&mut y, alpha, &q);
         let t_power_qr = Instant::now();
         let (q_new, s_y, _) = thin_svd_from_tall(&y, n, kp)?;
         check_admx_memory_limit("rsvd_stream_sample/power_qr")?;
@@ -3531,18 +3665,7 @@ fn rsvd_stream_sample_packed_impl(
     }
 
     let t_stage = Instant::now();
-    let mut eigvecs_sample = vec![0.0_f32; n * k_eff];
-    for r in 0..n {
-        let q_row = &q[r * kp..(r + 1) * kp];
-        let out_row = &mut eigvecs_sample[r * k_eff..(r + 1) * k_eff];
-        for c in 0..k_eff {
-            let mut acc = 0.0_f64;
-            for t in 0..kp {
-                acc += (q_row[t] as f64) * (v_small[t * kp + c] as f64);
-            }
-            out_row[c] = acc as f32;
-        }
-    }
+    let eigvecs_sample = rsvd_project_sample_eigvecs(&q, n, kp, &v_small, k_eff)?;
     let final_vec_s = t_stage.elapsed().as_secs_f64();
     emit_rsvd_rss_debug(
         "stream_sample/final_ready",
@@ -3554,13 +3677,13 @@ fn rsvd_stream_sample_packed_impl(
             format_f32_vec_bytes(eigvecs_sample.len()),
         ),
     );
-    let total_s = t_total.elapsed().as_secs_f64();
+    let total_s = backend_elapsed_s + t_total.elapsed().as_secs_f64();
     emit_rsvd_time_debug(
         "stream_sample/summary",
         &format!(
             "total={} backend={} init_proj={} init_q={} power_mul={} power_mul_decode={} power_mul_gemm={} power_qr={} gram={} eig={} final_vec={} power_iters={} block_rows={}",
             fmt_stage_secs(total_s),
-            fmt_stage_secs(0.0),
+            fmt_stage_secs(backend_elapsed_s),
             fmt_stage_secs(init_proj_s),
             fmt_stage_secs(init_q_s),
             fmt_stage_secs(power_mul_s),
@@ -3574,7 +3697,7 @@ fn rsvd_stream_sample_packed_impl(
             block_rows,
         ),
     );
-    Ok((eigvals, eigvecs_sample))
+    Ok((eigvals, eigvecs_sample, total_variance))
 }
 
 fn rsvd_stream_sample_packed_fold_impl(
@@ -3676,9 +3799,7 @@ fn rsvd_stream_sample_packed_fold_impl(
         power_mul_s += t_power_mul.elapsed().as_secs_f64();
         power_mul_decode_s += kernel_timing.decode_s;
         power_mul_gemm_s += kernel_timing.gemm_s;
-        for idx in 0..(n * kp) {
-            y[idx] -= alpha * q[idx];
-        }
+        subtract_scaled_inplace_f32(&mut y, alpha, &q);
         let t_power_qr = Instant::now();
         let (q_new, s_y, _) = thin_svd_from_tall(&y, n, kp)?;
         check_admx_memory_limit("rsvd_stream_sample_fold/power_qr")?;
@@ -3731,18 +3852,7 @@ fn rsvd_stream_sample_packed_fold_impl(
         eigvals[i] = (s_all[i] * s_all[i]) / scale;
     }
 
-    let mut eigvecs_sample = vec![0.0_f32; n * k_eff];
-    for r in 0..n {
-        let q_row = &q[r * kp..(r + 1) * kp];
-        let out_row = &mut eigvecs_sample[r * k_eff..(r + 1) * k_eff];
-        for c in 0..k_eff {
-            let mut acc = 0.0_f64;
-            for t in 0..kp {
-                acc += (q_row[t] as f64) * (v_small[t * kp + c] as f64);
-            }
-            out_row[c] = acc as f32;
-        }
-    }
+    let eigvecs_sample = rsvd_project_sample_eigvecs(&q, n, kp, &v_small, k_eff)?;
 
     let total_s = t_total.elapsed().as_secs_f64();
     emit_rsvd_time_debug(
@@ -4266,7 +4376,8 @@ fn fit_admx_bed_training_session_impl(
         let (p0, q0) = adam_seed_init_rust(m, n, k, seed);
         (p0, q0, f64::NAN, 0usize)
     } else {
-        let (_eigvals, v) = rsvd_stream_sample_packed_impl(backend, k, seed, power, tol)?;
+        let (_eigvals, v, _total_variance) =
+            rsvd_stream_sample_packed_impl(backend, k, seed, power, tol, 0.0)?;
         check_admx_memory_limit("train_session/after_rsvd")?;
         let k_eff = if n == 0 { 0 } else { k.min(n) };
         if k_eff != k {
@@ -6001,14 +6112,14 @@ impl AdmxBedBackend {
         seed: u64,
         power: usize,
         tol: f32,
-    ) -> PyResult<(Bound<'py, PyArray1<f32>>, Bound<'py, PyArray2<f32>>)> {
-        let (eigvals, eigvecs_sample) =
-            rsvd_stream_sample_packed_impl(self.backend.as_ref(), k, seed, power, tol)
+    ) -> PyResult<(Bound<'py, PyArray1<f32>>, Bound<'py, PyArray2<f32>>, f64)> {
+        let (eigvals, eigvecs_sample, total_variance) =
+            rsvd_stream_sample_packed_impl(self.backend.as_ref(), k, seed, power, tol, 0.0)
                 .map_err(PyRuntimeError::new_err)?;
         let k_eff = eigvals.len();
         let eval_arr = row_freq_to_pyarray(py, &eigvals);
         let evec_arr = vec_to_pyarray2_f32(py, self.backend.n_samples, k_eff, &eigvecs_sample)?;
-        Ok((eval_arr, evec_arr))
+        Ok((eval_arr, evec_arr, total_variance))
     }
 
     fn multiply_a_omega<'py>(

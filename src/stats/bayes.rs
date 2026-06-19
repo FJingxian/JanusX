@@ -1,3 +1,30 @@
+//! Bayesian marker-effect solvers over additive PLINK BED blocks.
+//!
+//! Let `Z` denote the standardized additive genotype matrix after marker
+//! filtering and sample subsetting, with markers in rows and samples in
+//! columns. This module fits
+//!
+//! `y = X alpha + Z' beta + e,  e ~ N(0, sigma_e^2 I)`.
+//!
+//! The three maintained priors are:
+//!
+//! - `BayesA`: each marker has its own variance,
+//!   `beta_j | sigma_bj^2 ~ N(0, sigma_bj^2)`,
+//!   `sigma_bj^2 ~ scaled-inv-chi^2`.
+//! - `BayesB`: marker inclusion indicator
+//!   `delta_j ~ Bernoulli(pi)`, inactive markers have `beta_j = 0`, and active
+//!   markers follow the BayesA variance hierarchy.
+//! - `BayesCpi`: the same spike-and-slab inclusion structure as BayesB, but
+//!   active markers share a common marker variance and `pi` is updated from its
+//!   Beta-Binomial posterior.
+//!
+//! All maintained paths stream standardized BED blocks from either resident
+//! packed rows or `WindowedBedMatrix`. Small resident packed inputs may be
+//! predecoded once, but the streaming path remains the default maintained route
+//! for GS. Each MCMC iteration updates fixed effects, residual variance, marker
+//! effects, and inclusion/variance hyperparameters, and posterior means are
+//! returned after burn-in and thinning.
+
 use numpy::ndarray::Array2;
 use numpy::{
     IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods,
@@ -18,6 +45,8 @@ use crate::blas::{
     cblas_daxpy_dispatch, cblas_ddot_dispatch, cblas_dgemm_dispatch, CblasInt, OpenBlasThreadGuard,
     CBLAS_COL_MAJOR, CBLAS_NO_TRANS, CBLAS_TRANS,
 };
+use crate::decode::decode_prepared_additive_block_packed_f32;
+use crate::gload::WindowedBedMatrix;
 use crate::stats_common::{get_cached_pool, parse_index_vec_i64_value_error};
 
 fn array1_to_vec(arr: &PyReadonlyArray1<f64>) -> Vec<f64> {
@@ -45,6 +74,14 @@ fn parse_optional_index_vec_i64(
         Some(arr) => parse_index_vec_i64_value_error(arr.as_slice()?, upper_bound, label),
         None => Ok(Vec::new()),
     }
+}
+
+fn parse_index_vec_i64_string(
+    raw: &[i64],
+    upper_bound: usize,
+    label: &str,
+) -> Result<Vec<usize>, String> {
+    parse_index_vec_i64_value_error(raw, upper_bound, label).map_err(|e| e.to_string())
 }
 
 #[derive(Debug)]
@@ -484,6 +521,145 @@ fn bayes_packed_should_predecode_dense(n: usize, p: usize) -> bool {
 }
 
 #[inline]
+fn bayes_stream_window_mb(n_samples: usize, block_rows: usize) -> usize {
+    let bytes_per_snp = n_samples.div_ceil(4).max(1);
+    let target_bytes = block_rows
+        .max(1)
+        .saturating_mul(bytes_per_snp)
+        .saturating_mul(2);
+    target_bytes.div_ceil(1024 * 1024).max(1)
+}
+
+enum BayesPackedSource<'a> {
+    Resident {
+        packed_flat: &'a [u8],
+        bytes_per_snp: usize,
+    },
+    Windowed(WindowedBedMatrix),
+}
+
+fn build_bayes_source<'a>(
+    resident_packed_flat: Option<&'a [u8]>,
+    prefix: &str,
+    n_samples: usize,
+    block_rows: usize,
+    mmap_window_mb: Option<usize>,
+) -> Result<BayesPackedSource<'a>, String> {
+    if let Some(packed_flat) = resident_packed_flat {
+        return Ok(BayesPackedSource::Resident {
+            packed_flat,
+            bytes_per_snp: n_samples.div_ceil(4),
+        });
+    }
+    if prefix.trim().is_empty() {
+        return Err("Bayes streaming path requires non-empty prefix".to_string());
+    }
+    let window_mb = mmap_window_mb
+        .map(|v| v.max(1))
+        .unwrap_or_else(|| bayes_stream_window_mb(n_samples, block_rows));
+    let matrix = WindowedBedMatrix::open(prefix, window_mb)?;
+    Ok(BayesPackedSource::Windowed(matrix))
+}
+
+#[inline]
+fn decode_source_block_standardized_into(
+    source: &mut BayesPackedSource<'_>,
+    n_samples: usize,
+    row_start: usize,
+    row_end: usize,
+    sample_idx: &[usize],
+    full_sample_fast: bool,
+    packed_row_indices: Option<&[usize]>,
+    row_flip: &[bool],
+    row_mean: &[f32],
+    row_inv_sd: &[f32],
+    code4_lut: &[[u8; 4]; 256],
+    out_block: &mut [f64],
+    n: usize,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+    scratch_f32: &mut Vec<f32>,
+) -> Result<(), String> {
+    let block_rows = row_end - row_start;
+    debug_assert_eq!(out_block.len(), block_rows * n);
+    if scratch_f32.len() < block_rows * n {
+        scratch_f32.resize(block_rows * n, 0.0_f32);
+    }
+    let tmp = &mut scratch_f32[..block_rows * n];
+    match source {
+        BayesPackedSource::Resident {
+            packed_flat,
+            bytes_per_snp,
+        } => {
+            decode_standardized_packed_block_f32(
+                packed_flat,
+                *bytes_per_snp,
+                n_samples,
+                row_flip,
+                row_mean,
+                row_inv_sd,
+                sample_idx,
+                full_sample_fast,
+                row_start,
+                tmp,
+                code4_lut,
+                pool,
+            )?;
+        }
+        BayesPackedSource::Windowed(matrix) => {
+            let cur_rows = row_end - row_start;
+            let bytes_per_snp = matrix.bytes_per_snp();
+            let packed_slice = if let Some(indices) = packed_row_indices {
+                let source_rows = &indices[row_start..row_end];
+                let mut rel_indices = Vec::with_capacity(cur_rows);
+                let packed_slice = matrix.prepare_source_rows(source_rows, &mut rel_indices)?;
+                decode_prepared_additive_block_packed_f32(
+                    packed_slice,
+                    bytes_per_snp,
+                    n_samples,
+                    &row_flip[row_start..row_end],
+                    &row_mean[row_start..row_end],
+                    &row_inv_sd[row_start..row_end],
+                    sample_idx,
+                    full_sample_fast,
+                    None,
+                    Some(rel_indices.as_slice()),
+                    0usize,
+                    cur_rows,
+                    tmp,
+                    pool,
+                )?;
+                for (dst, &src) in out_block.iter_mut().zip(tmp.iter()) {
+                    *dst = src as f64;
+                }
+                return Ok(());
+            } else {
+                matrix.read_source_range(row_start, row_end)?
+            };
+            decode_prepared_additive_block_packed_f32(
+                packed_slice,
+                bytes_per_snp,
+                n_samples,
+                &row_flip[row_start..row_end],
+                &row_mean[row_start..row_end],
+                &row_inv_sd[row_start..row_end],
+                sample_idx,
+                full_sample_fast,
+                None,
+                None,
+                0usize,
+                cur_rows,
+                tmp,
+                pool,
+            )?;
+        }
+    }
+    for (dst, &src) in out_block.iter_mut().zip(tmp.iter()) {
+        *dst = src as f64;
+    }
+    Ok(())
+}
+
+#[inline]
 fn decode_packed_block_standardized_into(
     packed_flat: &[u8],
     bytes_per_snp: usize,
@@ -501,36 +677,32 @@ fn decode_packed_block_standardized_into(
     pool: Option<&Arc<rayon::ThreadPool>>,
     scratch_f32: &mut Vec<f32>,
 ) -> Result<(), String> {
-    let block_rows = row_end - row_start;
-    debug_assert_eq!(out_block.len(), block_rows * n);
-    if scratch_f32.len() < block_rows * n {
-        scratch_f32.resize(block_rows * n, 0.0_f32);
-    }
-    let tmp = &mut scratch_f32[..block_rows * n];
-    decode_standardized_packed_block_f32(
+    let mut source = BayesPackedSource::Resident {
         packed_flat,
         bytes_per_snp,
+    };
+    decode_source_block_standardized_into(
+        &mut source,
         n_samples,
+        row_start,
+        row_end,
+        sample_idx,
+        full_sample_fast,
+        None,
         row_flip,
         row_mean,
         row_inv_sd,
-        sample_idx,
-        full_sample_fast,
-        row_start,
-        tmp,
         code4_lut,
+        out_block,
+        n,
         pool,
-    )?;
-    for (dst, &src) in out_block.iter_mut().zip(tmp.iter()) {
-        *dst = src as f64;
-    }
-    Ok(())
+        scratch_f32,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
-fn maybe_predecode_packed_dense_f64(
-    packed_flat: &[u8],
-    bytes_per_snp: usize,
+fn maybe_predecode_source_dense_f64(
+    source: &mut BayesPackedSource<'_>,
     n_samples: usize,
     row_flip: &[bool],
     row_mean: &[f32],
@@ -538,34 +710,41 @@ fn maybe_predecode_packed_dense_f64(
     sample_idx: &[usize],
     n: usize,
     p: usize,
+    packed_row_indices: Option<&[usize]>,
     code4_lut: &[[u8; 4]; 256],
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> Result<Option<Vec<f64>>, String> {
+    if matches!(source, BayesPackedSource::Windowed(_)) {
+        return Ok(None);
+    }
     if !bayes_packed_should_predecode_dense(n, p) {
         return Ok(None);
     }
     let full_sample_fast = is_identity_indices(sample_idx, n_samples);
     let block_rows = bayes_packed_block_rows(n, p);
-    let mut dense_f32 = vec![0.0_f32; p * n];
+    let mut dense_f64 = vec![0.0_f64; p * n];
+    let mut scratch_f32 = Vec::<f32>::new();
     for st in (0..p).step_by(block_rows) {
         let ed = (st + block_rows).min(p);
         let br = ed - st;
-        decode_standardized_packed_block_f32(
-            packed_flat,
-            bytes_per_snp,
+        decode_source_block_standardized_into(
+            source,
             n_samples,
+            st,
+            ed,
+            sample_idx,
+            full_sample_fast,
+            packed_row_indices,
             row_flip,
             row_mean,
             row_inv_sd,
-            sample_idx,
-            full_sample_fast,
-            st,
-            &mut dense_f32[st * n..(st + br) * n],
             code4_lut,
+            &mut dense_f64[st * n..(st + br) * n],
+            n,
             pool,
+            &mut scratch_f32,
         )?;
     }
-    let dense_f64: Vec<f64> = dense_f32.into_iter().map(|v| v as f64).collect();
     Ok(Some(dense_f64))
 }
 
@@ -1479,13 +1658,13 @@ fn bayesa_core_impl(
 
 fn bayesa_packed_core_impl(
     y: &[f64],
-    packed_flat: &[u8],
-    bytes_per_snp: usize,
+    source: &mut BayesPackedSource<'_>,
     n_samples: usize,
     row_flip: &[bool],
     row_maf: &[f32],
     row_mean: &[f32],
     row_inv_sd: &[f32],
+    packed_row_indices: Option<&[usize]>,
     sample_idx: &[usize],
     x: &[f64],
     n: usize,
@@ -1520,9 +1699,8 @@ fn bayesa_packed_core_impl(
     }
 
     let code4_lut = &packed_byte_lut().code4;
-    if let Some(m_dense) = maybe_predecode_packed_dense_f64(
-        packed_flat,
-        bytes_per_snp,
+    if let Some(m_dense) = maybe_predecode_source_dense_f64(
+        source,
         n_samples,
         row_flip,
         row_mean,
@@ -1530,6 +1708,7 @@ fn bayesa_packed_core_impl(
         sample_idx,
         n,
         p,
+        packed_row_indices,
         code4_lut,
         pool,
     )? {
@@ -1561,14 +1740,14 @@ fn bayesa_packed_core_impl(
     for st in (0..p).step_by(block_rows) {
         let ed = (st + block_rows).min(p);
         let br = ed - st;
-        decode_packed_block_standardized_into(
-            packed_flat,
-            bytes_per_snp,
+        decode_source_block_standardized_into(
+            source,
             n_samples,
             st,
             ed,
             sample_idx,
             full_sample_fast,
+            packed_row_indices,
             row_flip,
             row_mean,
             row_inv_sd,
@@ -1700,14 +1879,14 @@ fn bayesa_packed_core_impl(
         for st in (0..p).step_by(block_rows) {
             let ed = (st + block_rows).min(p);
             let br = ed - st;
-            decode_packed_block_standardized_into(
-                packed_flat,
-                bytes_per_snp,
+            decode_source_block_standardized_into(
+                source,
                 n_samples,
                 st,
                 ed,
                 sample_idx,
                 full_sample_fast,
+                packed_row_indices,
                 row_flip,
                 row_mean,
                 row_inv_sd,
@@ -1800,13 +1979,13 @@ fn bayesa_packed_core_impl(
 
 fn bayesb_packed_core_impl(
     y: &[f64],
-    packed_flat: &[u8],
-    bytes_per_snp: usize,
+    source: &mut BayesPackedSource<'_>,
     n_samples: usize,
     row_flip: &[bool],
     row_maf: &[f32],
     row_mean: &[f32],
     row_inv_sd: &[f32],
+    packed_row_indices: Option<&[usize]>,
     sample_idx: &[usize],
     x: &[f64],
     n: usize,
@@ -1848,9 +2027,8 @@ fn bayesb_packed_core_impl(
     }
 
     let code4_lut = &packed_byte_lut().code4;
-    if let Some(m_dense) = maybe_predecode_packed_dense_f64(
-        packed_flat,
-        bytes_per_snp,
+    if let Some(m_dense) = maybe_predecode_source_dense_f64(
+        source,
         n_samples,
         row_flip,
         row_mean,
@@ -1858,6 +2036,7 @@ fn bayesb_packed_core_impl(
         sample_idx,
         n,
         p,
+        packed_row_indices,
         code4_lut,
         pool,
     )? {
@@ -1906,14 +2085,14 @@ fn bayesb_packed_core_impl(
     for st in (0..p).step_by(block_rows) {
         let ed = (st + block_rows).min(p);
         let br = ed - st;
-        decode_packed_block_standardized_into(
-            packed_flat,
-            bytes_per_snp,
+        decode_source_block_standardized_into(
+            source,
             n_samples,
             st,
             ed,
             sample_idx,
             full_sample_fast,
+            packed_row_indices,
             row_flip,
             row_mean,
             row_inv_sd,
@@ -2042,14 +2221,14 @@ fn bayesb_packed_core_impl(
         for st in (0..p).step_by(block_rows) {
             let ed = (st + block_rows).min(p);
             let br = ed - st;
-            decode_packed_block_standardized_into(
-                packed_flat,
-                bytes_per_snp,
+            decode_source_block_standardized_into(
+                source,
                 n_samples,
                 st,
                 ed,
                 sample_idx,
                 full_sample_fast,
+                packed_row_indices,
                 row_flip,
                 row_mean,
                 row_inv_sd,
@@ -2202,13 +2381,13 @@ fn bayesb_packed_core_impl(
 
 fn bayescpi_packed_core_impl(
     y: &[f64],
-    packed_flat: &[u8],
-    bytes_per_snp: usize,
+    source: &mut BayesPackedSource<'_>,
     n_samples: usize,
     row_flip: &[bool],
     row_maf: &[f32],
     row_mean: &[f32],
     row_inv_sd: &[f32],
+    packed_row_indices: Option<&[usize]>,
     sample_idx: &[usize],
     x: &[f64],
     n: usize,
@@ -2248,9 +2427,8 @@ fn bayescpi_packed_core_impl(
     }
 
     let code4_lut = &packed_byte_lut().code4;
-    if let Some(m_dense) = maybe_predecode_packed_dense_f64(
-        packed_flat,
-        bytes_per_snp,
+    if let Some(m_dense) = maybe_predecode_source_dense_f64(
+        source,
         n_samples,
         row_flip,
         row_mean,
@@ -2258,6 +2436,7 @@ fn bayescpi_packed_core_impl(
         sample_idx,
         n,
         p,
+        packed_row_indices,
         code4_lut,
         pool,
     )? {
@@ -2304,14 +2483,14 @@ fn bayescpi_packed_core_impl(
     for st in (0..p).step_by(block_rows) {
         let ed = (st + block_rows).min(p);
         let br = ed - st;
-        decode_packed_block_standardized_into(
-            packed_flat,
-            bytes_per_snp,
+        decode_source_block_standardized_into(
+            source,
             n_samples,
             st,
             ed,
             sample_idx,
             full_sample_fast,
+            packed_row_indices,
             row_flip,
             row_mean,
             row_inv_sd,
@@ -2437,14 +2616,14 @@ fn bayescpi_packed_core_impl(
         for st in (0..p).step_by(block_rows) {
             let ed = (st + block_rows).min(p);
             let br = ed - st;
-            decode_packed_block_standardized_into(
-                packed_flat,
-                bytes_per_snp,
+            decode_source_block_standardized_into(
+                source,
                 n_samples,
                 st,
                 ed,
                 sample_idx,
                 full_sample_fast,
+                packed_row_indices,
                 row_flip,
                 row_mean,
                 row_inv_sd,
@@ -3158,15 +3337,19 @@ pub fn bayesa_packed(
     let pool_ref = pool_owned.as_ref();
 
     let result = py.detach(|| {
+        let mut source = BayesPackedSource::Resident {
+            packed_flat: packed_flat.as_ref(),
+            bytes_per_snp,
+        };
         bayesa_packed_core_impl(
             y_vec.as_ref(),
-            packed_flat.as_ref(),
-            bytes_per_snp,
+            &mut source,
             n_samples,
             row_flip_vec.as_ref(),
             row_maf_vec.as_ref(),
             row_mean_vec.as_ref(),
             row_inv_sd_vec.as_ref(),
+            None,
             &sample_idx,
             x_vec.as_ref(),
             n,
@@ -3364,15 +3547,19 @@ pub fn bayesb_packed(
     let pool_ref = pool_owned.as_ref();
 
     let result = py.detach(|| {
+        let mut source = BayesPackedSource::Resident {
+            packed_flat: packed_flat.as_ref(),
+            bytes_per_snp,
+        };
         bayesb_packed_core_impl(
             y_vec.as_ref(),
-            packed_flat.as_ref(),
-            bytes_per_snp,
+            &mut source,
             n_samples,
             row_flip_vec.as_ref(),
             row_maf_vec.as_ref(),
             row_mean_vec.as_ref(),
             row_inv_sd_vec.as_ref(),
+            None,
             &sample_idx,
             x_vec.as_ref(),
             n,
@@ -3583,15 +3770,655 @@ pub fn bayescpi_packed(
     let pool_ref = pool_owned.as_ref();
 
     let result = py.detach(|| {
+        let mut source = BayesPackedSource::Resident {
+            packed_flat: packed_flat.as_ref(),
+            bytes_per_snp,
+        };
         bayescpi_packed_core_impl(
             y_vec.as_ref(),
-            packed_flat.as_ref(),
-            bytes_per_snp,
+            &mut source,
             n_samples,
             row_flip_vec.as_ref(),
             row_maf_vec.as_ref(),
             row_mean_vec.as_ref(),
             row_inv_sd_vec.as_ref(),
+            None,
+            &sample_idx,
+            x_vec.as_ref(),
+            n,
+            p,
+            q,
+            n_iter,
+            burnin,
+            thin,
+            r2,
+            df0_b,
+            s0_b,
+            prob_in,
+            counts,
+            df0_e,
+            s0_e,
+            seed,
+            pool_ref,
+        )
+    });
+
+    match result {
+        Ok((beta, alpha, varb_mean, vare, h2_mean, var_h2, prob_in_mean, n_active_mean)) => {
+            let beta_py = beta.into_pyarray(py).into_bound().unbind();
+            let alpha_py = alpha.into_pyarray(py).into_bound().unbind();
+            Ok((
+                beta_py,
+                alpha_py,
+                varb_mean,
+                vare,
+                h2_mean,
+                var_h2,
+                prob_in_mean,
+                n_active_mean,
+            ))
+        }
+        Err(msg) => Err(PyValueError::new_err(msg)),
+    }
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    prefix,
+    y,
+    n_samples,
+    row_indices,
+    row_flip,
+    row_maf,
+    row_mean,
+    row_inv_sd,
+    sample_indices,
+    x = None,
+    n_iter = 200,
+    burnin = 100,
+    thin = 1,
+    r2 = 0.5,
+    df0_b = 5.0,
+    shape0 = 1.1,
+    rate0 = None,
+    s0_b = None,
+    df0_e = 5.0,
+    s0_e = None,
+    min_abs_beta = 1e-9,
+    threads = 0,
+    seed = None,
+    block_rows = None,
+    mmap_window_mb = None
+))]
+pub fn bayesa_stream_bed(
+    py: Python,
+    prefix: String,
+    y: PyReadonlyArray1<f64>,
+    n_samples: usize,
+    row_indices: PyReadonlyArray1<i64>,
+    row_flip: PyReadonlyArray1<bool>,
+    row_maf: PyReadonlyArray1<f32>,
+    row_mean: PyReadonlyArray1<f32>,
+    row_inv_sd: PyReadonlyArray1<f32>,
+    sample_indices: PyReadonlyArray1<i64>,
+    x: Option<PyReadonlyArray2<f64>>,
+    n_iter: usize,
+    burnin: usize,
+    thin: usize,
+    r2: f64,
+    df0_b: f64,
+    shape0: f64,
+    rate0: Option<f64>,
+    s0_b: Option<f64>,
+    df0_e: f64,
+    s0_e: Option<f64>,
+    min_abs_beta: f64,
+    threads: usize,
+    seed: Option<u64>,
+    block_rows: Option<usize>,
+    mmap_window_mb: Option<usize>,
+) -> PyResult<(
+    Py<PyArray1<f64>>,
+    Py<PyArray1<f64>>,
+    Py<PyArray1<f64>>,
+    f64,
+    f64,
+    f64,
+)> {
+    if n_iter <= burnin {
+        return Err(PyValueError::new_err("n_iter must be > burnin"));
+    }
+    if thin == 0 {
+        return Err(PyValueError::new_err("thin must be >= 1"));
+    }
+    if !min_abs_beta.is_finite() || min_abs_beta < 0.0 {
+        return Err(PyValueError::new_err(
+            "min_abs_beta is deprecated/ignored; keep it finite and >= 0 for compatibility",
+        ));
+    }
+    if !(r2 > 0.0 && r2 < 1.0) {
+        return Err(PyValueError::new_err("R2 must be in (0, 1)"));
+    }
+    if df0_b <= 0.0 || df0_e <= 0.0 {
+        return Err(PyValueError::new_err("df0_b and df0_e must be > 0"));
+    }
+    if shape0 <= 0.0 {
+        return Err(PyValueError::new_err("shape0 must be > 0"));
+    }
+    if n_samples == 0 {
+        return Err(PyValueError::new_err("n_samples must be > 0"));
+    }
+
+    let row_idx_raw = row_indices.as_slice()?.to_vec();
+    let p = row_idx_raw.len();
+    if p == 0 {
+        return Err(PyValueError::new_err("row_indices must not be empty"));
+    }
+    let row_flip_vec: Cow<'_, [bool]> = match row_flip.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(row_flip.as_array().iter().copied().collect()),
+    };
+    let row_maf_vec: Cow<'_, [f32]> = match row_maf.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(row_maf.as_array().iter().copied().collect()),
+    };
+    let row_mean_vec: Cow<'_, [f32]> = match row_mean.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(row_mean.as_array().iter().copied().collect()),
+    };
+    let row_inv_sd_vec: Cow<'_, [f32]> = match row_inv_sd.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(row_inv_sd.as_array().iter().copied().collect()),
+    };
+    if row_flip_vec.len() != p
+        || row_maf_vec.len() != p
+        || row_mean_vec.len() != p
+        || row_inv_sd_vec.len() != p
+    {
+        return Err(PyValueError::new_err(
+            "row_flip/row_maf/row_mean/row_inv_sd length must match row_indices",
+        ));
+    }
+
+    let y_vec: Cow<'_, [f64]> = match y.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(array1_to_vec(&y)),
+    };
+    let n = y_vec.len();
+    let sample_idx =
+        parse_index_vec_i64_value_error(sample_indices.as_slice()?, n_samples, "sample_indices")?;
+    if sample_idx.len() != n {
+        return Err(PyValueError::new_err(format!(
+            "sample_indices length mismatch: got {}, expected len(y)={n}",
+            sample_idx.len()
+        )));
+    }
+    let (x_vec, q): (Cow<'_, [f64]>, usize) = match &x {
+        Some(arr) => {
+            let x_shape = arr.shape();
+            if x_shape[0] != n {
+                return Err(PyValueError::new_err("X rows must match len(y)"));
+            }
+            let q = x_shape[1];
+            let xv = match arr.as_slice() {
+                Ok(s) => Cow::Borrowed(s),
+                Err(_) => Cow::Owned(array2_to_vec(arr)),
+            };
+            (xv, q)
+        }
+        None => (Cow::Owned(vec![1.0; n]), 1usize),
+    };
+
+    let pool_owned = get_cached_pool(threads)?;
+    let pool_ref = pool_owned.as_ref();
+    let result = py.detach(|| {
+        let block_rows = block_rows.unwrap_or_else(|| bayes_packed_block_rows(n, p)).max(1);
+        let mut source = build_bayes_source(None, &prefix, n_samples, block_rows, mmap_window_mb)?;
+        let n_source = match &source {
+            BayesPackedSource::Resident { .. } => 0usize,
+            BayesPackedSource::Windowed(matrix) => matrix.n_source_snps(),
+        };
+        let packed_row_indices = parse_index_vec_i64_string(
+            row_idx_raw.as_slice(),
+            n_source,
+            "row_indices",
+        )?;
+        bayesa_packed_core_impl(
+            y_vec.as_ref(),
+            &mut source,
+            n_samples,
+            row_flip_vec.as_ref(),
+            row_maf_vec.as_ref(),
+            row_mean_vec.as_ref(),
+            row_inv_sd_vec.as_ref(),
+            Some(packed_row_indices.as_slice()),
+            &sample_idx,
+            x_vec.as_ref(),
+            n,
+            p,
+            q,
+            n_iter,
+            burnin,
+            thin,
+            r2,
+            df0_b,
+            shape0,
+            rate0,
+            s0_b,
+            df0_e,
+            s0_e,
+            min_abs_beta,
+            seed,
+            pool_ref,
+        )
+    });
+
+    match result {
+        Ok((beta, alpha, varb, vare, h2_mean, var_h2)) => {
+            let beta_py = beta.into_pyarray(py).into_bound().unbind();
+            let alpha_py = alpha.into_pyarray(py).into_bound().unbind();
+            let varb_py = varb.into_pyarray(py).into_bound().unbind();
+            Ok((beta_py, alpha_py, varb_py, vare, h2_mean, var_h2))
+        }
+        Err(msg) => Err(PyValueError::new_err(msg)),
+    }
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    prefix,
+    y,
+    n_samples,
+    row_indices,
+    row_flip,
+    row_maf,
+    row_mean,
+    row_inv_sd,
+    sample_indices,
+    x = None,
+    n_iter = 200,
+    burnin = 100,
+    thin = 1,
+    r2 = 0.5,
+    df0_b = 5.0,
+    shape0 = 1.1,
+    rate0 = None,
+    s0_b = None,
+    prob_in = 0.5,
+    counts = 10.0,
+    df0_e = 5.0,
+    s0_e = None,
+    threads = 0,
+    seed = None,
+    block_rows = None,
+    mmap_window_mb = None
+))]
+pub fn bayesb_stream_bed(
+    py: Python,
+    prefix: String,
+    y: PyReadonlyArray1<f64>,
+    n_samples: usize,
+    row_indices: PyReadonlyArray1<i64>,
+    row_flip: PyReadonlyArray1<bool>,
+    row_maf: PyReadonlyArray1<f32>,
+    row_mean: PyReadonlyArray1<f32>,
+    row_inv_sd: PyReadonlyArray1<f32>,
+    sample_indices: PyReadonlyArray1<i64>,
+    x: Option<PyReadonlyArray2<f64>>,
+    n_iter: usize,
+    burnin: usize,
+    thin: usize,
+    r2: f64,
+    df0_b: f64,
+    shape0: f64,
+    rate0: Option<f64>,
+    s0_b: Option<f64>,
+    prob_in: f64,
+    counts: f64,
+    df0_e: f64,
+    s0_e: Option<f64>,
+    threads: usize,
+    seed: Option<u64>,
+    block_rows: Option<usize>,
+    mmap_window_mb: Option<usize>,
+) -> PyResult<(
+    Py<PyArray1<f64>>,
+    Py<PyArray1<f64>>,
+    Py<PyArray1<f64>>,
+    f64,
+    f64,
+    f64,
+    f64,
+    f64,
+)> {
+    if n_iter <= burnin {
+        return Err(PyValueError::new_err("n_iter must be > burnin"));
+    }
+    if thin == 0 {
+        return Err(PyValueError::new_err("thin must be >= 1"));
+    }
+    if !(r2 > 0.0 && r2 < 1.0) {
+        return Err(PyValueError::new_err("R2 must be in (0, 1)"));
+    }
+    if df0_b <= 0.0 || df0_e <= 0.0 {
+        return Err(PyValueError::new_err("df0_b and df0_e must be > 0"));
+    }
+    if shape0 <= 0.0 {
+        return Err(PyValueError::new_err("shape0 must be > 0"));
+    }
+    if !(prob_in > 0.0 && prob_in < 1.0) {
+        return Err(PyValueError::new_err("prob_in must be in (0, 1)"));
+    }
+    if counts < 0.0 {
+        return Err(PyValueError::new_err("counts must be >= 0"));
+    }
+    if n_samples == 0 {
+        return Err(PyValueError::new_err("n_samples must be > 0"));
+    }
+
+    let row_idx_raw = row_indices.as_slice()?.to_vec();
+    let p = row_idx_raw.len();
+    if p == 0 {
+        return Err(PyValueError::new_err("row_indices must not be empty"));
+    }
+    let row_flip_vec: Cow<'_, [bool]> = match row_flip.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(row_flip.as_array().iter().copied().collect()),
+    };
+    let row_maf_vec: Cow<'_, [f32]> = match row_maf.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(row_maf.as_array().iter().copied().collect()),
+    };
+    let row_mean_vec: Cow<'_, [f32]> = match row_mean.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(row_mean.as_array().iter().copied().collect()),
+    };
+    let row_inv_sd_vec: Cow<'_, [f32]> = match row_inv_sd.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(row_inv_sd.as_array().iter().copied().collect()),
+    };
+    if row_flip_vec.len() != p
+        || row_maf_vec.len() != p
+        || row_mean_vec.len() != p
+        || row_inv_sd_vec.len() != p
+    {
+        return Err(PyValueError::new_err(
+            "row_flip/row_maf/row_mean/row_inv_sd length must match row_indices",
+        ));
+    }
+
+    let y_vec: Cow<'_, [f64]> = match y.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(array1_to_vec(&y)),
+    };
+    let n = y_vec.len();
+    let sample_idx =
+        parse_index_vec_i64_value_error(sample_indices.as_slice()?, n_samples, "sample_indices")?;
+    if sample_idx.len() != n {
+        return Err(PyValueError::new_err(format!(
+            "sample_indices length mismatch: got {}, expected len(y)={n}",
+            sample_idx.len()
+        )));
+    }
+    let (x_vec, q): (Cow<'_, [f64]>, usize) = match &x {
+        Some(arr) => {
+            let x_shape = arr.shape();
+            if x_shape[0] != n {
+                return Err(PyValueError::new_err("X rows must match len(y)"));
+            }
+            let q = x_shape[1];
+            let xv = match arr.as_slice() {
+                Ok(s) => Cow::Borrowed(s),
+                Err(_) => Cow::Owned(array2_to_vec(arr)),
+            };
+            (xv, q)
+        }
+        None => (Cow::Owned(vec![1.0; n]), 1usize),
+    };
+
+    let pool_owned = get_cached_pool(threads)?;
+    let pool_ref = pool_owned.as_ref();
+    let result = py.detach(|| {
+        let block_rows = block_rows.unwrap_or_else(|| bayes_packed_block_rows(n, p)).max(1);
+        let mut source = build_bayes_source(None, &prefix, n_samples, block_rows, mmap_window_mb)?;
+        let n_source = match &source {
+            BayesPackedSource::Resident { .. } => 0usize,
+            BayesPackedSource::Windowed(matrix) => matrix.n_source_snps(),
+        };
+        let packed_row_indices = parse_index_vec_i64_string(
+            row_idx_raw.as_slice(),
+            n_source,
+            "row_indices",
+        )?;
+        bayesb_packed_core_impl(
+            y_vec.as_ref(),
+            &mut source,
+            n_samples,
+            row_flip_vec.as_ref(),
+            row_maf_vec.as_ref(),
+            row_mean_vec.as_ref(),
+            row_inv_sd_vec.as_ref(),
+            Some(packed_row_indices.as_slice()),
+            &sample_idx,
+            x_vec.as_ref(),
+            n,
+            p,
+            q,
+            n_iter,
+            burnin,
+            thin,
+            r2,
+            df0_b,
+            shape0,
+            rate0,
+            s0_b,
+            prob_in,
+            counts,
+            df0_e,
+            s0_e,
+            seed,
+            pool_ref,
+        )
+    });
+
+    match result {
+        Ok((beta, alpha, varb, vare, h2_mean, var_h2, prob_in_mean, n_active_mean)) => {
+            let beta_py = beta.into_pyarray(py).into_bound().unbind();
+            let alpha_py = alpha.into_pyarray(py).into_bound().unbind();
+            let varb_py = varb.into_pyarray(py).into_bound().unbind();
+            Ok((
+                beta_py,
+                alpha_py,
+                varb_py,
+                vare,
+                h2_mean,
+                var_h2,
+                prob_in_mean,
+                n_active_mean,
+            ))
+        }
+        Err(msg) => Err(PyValueError::new_err(msg)),
+    }
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    prefix,
+    y,
+    n_samples,
+    row_indices,
+    row_flip,
+    row_maf,
+    row_mean,
+    row_inv_sd,
+    sample_indices,
+    x = None,
+    n_iter = 200,
+    burnin = 100,
+    thin = 1,
+    r2 = 0.5,
+    df0_b = 5.0,
+    s0_b = None,
+    prob_in = 0.5,
+    counts = 10.0,
+    df0_e = 5.0,
+    s0_e = None,
+    threads = 0,
+    seed = None,
+    block_rows = None,
+    mmap_window_mb = None
+))]
+pub fn bayescpi_stream_bed(
+    py: Python,
+    prefix: String,
+    y: PyReadonlyArray1<f64>,
+    n_samples: usize,
+    row_indices: PyReadonlyArray1<i64>,
+    row_flip: PyReadonlyArray1<bool>,
+    row_maf: PyReadonlyArray1<f32>,
+    row_mean: PyReadonlyArray1<f32>,
+    row_inv_sd: PyReadonlyArray1<f32>,
+    sample_indices: PyReadonlyArray1<i64>,
+    x: Option<PyReadonlyArray2<f64>>,
+    n_iter: usize,
+    burnin: usize,
+    thin: usize,
+    r2: f64,
+    df0_b: f64,
+    s0_b: Option<f64>,
+    prob_in: f64,
+    counts: f64,
+    df0_e: f64,
+    s0_e: Option<f64>,
+    threads: usize,
+    seed: Option<u64>,
+    block_rows: Option<usize>,
+    mmap_window_mb: Option<usize>,
+) -> PyResult<(
+    Py<PyArray1<f64>>,
+    Py<PyArray1<f64>>,
+    f64,
+    f64,
+    f64,
+    f64,
+    f64,
+    f64,
+)> {
+    if n_iter <= burnin {
+        return Err(PyValueError::new_err("n_iter must be > burnin"));
+    }
+    if thin == 0 {
+        return Err(PyValueError::new_err("thin must be >= 1"));
+    }
+    if !(r2 > 0.0 && r2 < 1.0) {
+        return Err(PyValueError::new_err("R2 must be in (0, 1)"));
+    }
+    if df0_b <= 0.0 || df0_e <= 0.0 {
+        return Err(PyValueError::new_err("df0_b and df0_e must be > 0"));
+    }
+    if !(prob_in > 0.0 && prob_in < 1.0) {
+        return Err(PyValueError::new_err("prob_in must be in (0, 1)"));
+    }
+    if counts < 0.0 {
+        return Err(PyValueError::new_err("counts must be >= 0"));
+    }
+    if let Some(v) = s0_b {
+        if v <= 0.0 {
+            return Err(PyValueError::new_err("s0_b must be > 0"));
+        }
+    }
+    if let Some(v) = s0_e {
+        if v <= 0.0 {
+            return Err(PyValueError::new_err("s0_e must be > 0"));
+        }
+    }
+    if n_samples == 0 {
+        return Err(PyValueError::new_err("n_samples must be > 0"));
+    }
+
+    let row_idx_raw = row_indices.as_slice()?.to_vec();
+    let p = row_idx_raw.len();
+    if p == 0 {
+        return Err(PyValueError::new_err("row_indices must not be empty"));
+    }
+    let row_flip_vec: Cow<'_, [bool]> = match row_flip.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(row_flip.as_array().iter().copied().collect()),
+    };
+    let row_maf_vec: Cow<'_, [f32]> = match row_maf.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(row_maf.as_array().iter().copied().collect()),
+    };
+    let row_mean_vec: Cow<'_, [f32]> = match row_mean.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(row_mean.as_array().iter().copied().collect()),
+    };
+    let row_inv_sd_vec: Cow<'_, [f32]> = match row_inv_sd.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(row_inv_sd.as_array().iter().copied().collect()),
+    };
+    if row_flip_vec.len() != p
+        || row_maf_vec.len() != p
+        || row_mean_vec.len() != p
+        || row_inv_sd_vec.len() != p
+    {
+        return Err(PyValueError::new_err(
+            "row_flip/row_maf/row_mean/row_inv_sd length must match row_indices",
+        ));
+    }
+
+    let y_vec: Cow<'_, [f64]> = match y.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(array1_to_vec(&y)),
+    };
+    let n = y_vec.len();
+    let sample_idx =
+        parse_index_vec_i64_value_error(sample_indices.as_slice()?, n_samples, "sample_indices")?;
+    if sample_idx.len() != n {
+        return Err(PyValueError::new_err(format!(
+            "sample_indices length mismatch: got {}, expected len(y)={n}",
+            sample_idx.len()
+        )));
+    }
+    let (x_vec, q): (Cow<'_, [f64]>, usize) = match &x {
+        Some(arr) => {
+            let x_shape = arr.shape();
+            if x_shape[0] != n {
+                return Err(PyValueError::new_err("X rows must match len(y)"));
+            }
+            let q = x_shape[1];
+            let xv = match arr.as_slice() {
+                Ok(s) => Cow::Borrowed(s),
+                Err(_) => Cow::Owned(array2_to_vec(arr)),
+            };
+            (xv, q)
+        }
+        None => (Cow::Owned(vec![1.0; n]), 1usize),
+    };
+
+    let pool_owned = get_cached_pool(threads)?;
+    let pool_ref = pool_owned.as_ref();
+    let result = py.detach(|| {
+        let block_rows = block_rows.unwrap_or_else(|| bayes_packed_block_rows(n, p)).max(1);
+        let mut source = build_bayes_source(None, &prefix, n_samples, block_rows, mmap_window_mb)?;
+        let n_source = match &source {
+            BayesPackedSource::Resident { .. } => 0usize,
+            BayesPackedSource::Windowed(matrix) => matrix.n_source_snps(),
+        };
+        let packed_row_indices = parse_index_vec_i64_string(
+            row_idx_raw.as_slice(),
+            n_source,
+            "row_indices",
+        )?;
+        bayescpi_packed_core_impl(
+            y_vec.as_ref(),
+            &mut source,
+            n_samples,
+            row_flip_vec.as_ref(),
+            row_maf_vec.as_ref(),
+            row_mean_vec.as_ref(),
+            row_inv_sd_vec.as_ref(),
+            Some(packed_row_indices.as_slice()),
             &sample_idx,
             x_vec.as_ref(),
             n,

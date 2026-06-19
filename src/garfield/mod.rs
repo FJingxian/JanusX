@@ -40,6 +40,7 @@ use crate::gfreader::{
     build_sample_selection, load_bed_2bit_packed_subset_owned_for_stats_samples,
     prepare_bed_logic_meta_owned_for_stats_samples_pure_line,
 };
+use crate::gload::load_file_owned;
 use crate::grm::grm_packed_f64_from_stats_rust;
 use crate::linalg::{format_chisq_value, student_t_p_two_sided};
 use crate::ml::common::{
@@ -7892,7 +7893,8 @@ pub fn garfield_subset_bin_samples_py(
             "{ctx}: sample_indices is empty"
         )));
     }
-    let bytes = fs::read(&bin_path).map_err(|e| PyRuntimeError::new_err(format!("{ctx}: {e}")))?;
+    let bytes = load_file_owned(Path::new(&bin_path))
+        .map_err(|e| PyRuntimeError::new_err(format!("{ctx}: {e}")))?;
     let (n_rows, n_samples, row_bytes, data_offset) =
         parse_bin01_header(&bytes, ctx).map_err(PyRuntimeError::new_err)?;
     for &si in sample_indices.iter() {

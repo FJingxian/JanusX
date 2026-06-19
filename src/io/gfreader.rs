@@ -23,6 +23,7 @@ use std::time::Instant;
 use crate::bitwise::and_popcount;
 use crate::gfcore as core;
 use crate::gfcore::{BedSnpIter, HmpSnpIter, TxtSnpIter, VcfSnpIter};
+use crate::gload::load_file_owned_range_exact;
 use crate::vcfout::VcfOut;
 
 // -------- Py-exposed SiteInfo (wrapper) --------
@@ -4042,7 +4043,7 @@ pub fn load_bed_2bit_packed<'py>(
                     format_debug_bytes_local(stats_bytes),
                 ),
             );
-            let packed = packed_src.to_vec();
+            let packed = load_file_owned_range_exact(Path::new(&bed_path), 3, packed_src.len())?;
             emit_gfreader_rss_debug(
                 "load_bed_2bit_packed/packed_copy_done",
                 &format!(
@@ -4931,6 +4932,57 @@ pub(crate) fn load_bed_2bit_packed_subset_owned_for_stats_samples(
     let mut std_keep = vec![0.0_f32; kept_n];
     let mut row_flip_keep = vec![false; kept_n];
 
+    if kept_n == n_snps_total {
+        packed_keep = load_file_owned_range_exact(Path::new(&bed_path), 3, packed_src.len())?;
+        packed_keep
+            .par_chunks(bytes_per_snp)
+            .zip(miss_keep.par_iter_mut())
+            .zip(maf_keep.par_iter_mut())
+            .zip(std_keep.par_iter_mut())
+            .zip(row_flip_keep.par_iter_mut())
+            .for_each(|((((row, miss_v), maf_v), std_v), row_flip_v)| {
+                let (missing, het, hom_alt) = if stats_identity {
+                    count_packed_row_counts(row, n_samples)
+                } else {
+                    count_packed_row_counts_selected_with_excluded(
+                        row,
+                        n_samples,
+                        stats_sample_indices,
+                        stats_excluded_sample_indices.as_deref(),
+                    )
+                };
+                let non_missing = stats_n_samples.saturating_sub(missing);
+                let alt_sum = het.saturating_add(hom_alt.saturating_mul(2));
+                let (miss, _maf, std) =
+                    packed_row_stats_from_counts(stats_n_samples, non_missing, alt_sum);
+                let af = if non_missing > 0 {
+                    (alt_sum as f32) / (2.0_f32 * non_missing as f32)
+                } else {
+                    0.0_f32
+                };
+                *miss_v = miss;
+                *maf_v = af.clamp(0.0, 1.0);
+                *std_v = std;
+                *row_flip_v = false;
+            });
+        emit_gfreader_rss_debug(
+            "load_bed_2bit_packed_subset_owned/full_payload_loaded",
+            &format!(
+                "kept_n={kept_n} packed_bytes={} full_keep_fastpath=1",
+                format_debug_bytes_local(packed_keep.len() as u64),
+            ),
+        );
+        return Ok(PackedBedSubsetOwned {
+            packed: packed_keep,
+            missing_rate: miss_keep,
+            maf: maf_keep,
+            std_denom: std_keep,
+            row_flip: row_flip_keep,
+            n_samples,
+            bytes_per_snp,
+        });
+    }
+
     packed_keep
         .par_chunks_mut(bytes_per_snp)
         .zip(miss_keep.par_iter_mut())
@@ -5078,6 +5130,57 @@ pub(crate) fn load_bed_2bit_packed_subset_owned_for_stats_samples_pure_line(
     let mut maf_keep = vec![0.0_f32; kept_n];
     let mut std_keep = vec![0.0_f32; kept_n];
     let mut row_flip_keep = vec![false; kept_n];
+
+    if kept_n == n_snps_total {
+        packed_keep = load_file_owned_range_exact(Path::new(&bed_path), 3, packed_src.len())?;
+        packed_keep
+            .par_chunks(bytes_per_snp)
+            .zip(miss_keep.par_iter_mut())
+            .zip(maf_keep.par_iter_mut())
+            .zip(std_keep.par_iter_mut())
+            .zip(row_flip_keep.par_iter_mut())
+            .for_each(|((((row, miss_v), maf_v), std_v), row_flip_v)| {
+                let (logic_missing, hom_alt) = if stats_identity {
+                    count_packed_row_pure_line_counts(row, n_samples)
+                } else {
+                    count_packed_row_pure_line_counts_selected_with_excluded(
+                        row,
+                        n_samples,
+                        stats_sample_indices,
+                        stats_excluded_sample_indices.as_deref(),
+                    )
+                };
+                let (miss, _maf, std) =
+                    packed_row_stats_from_counts_pure_line(stats_n_samples, logic_missing, hom_alt);
+                let usable_homo =
+                    stats_n_samples.saturating_sub(logic_missing.min(stats_n_samples));
+                let af = if usable_homo > 0 {
+                    (hom_alt as f32) / (usable_homo as f32)
+                } else {
+                    0.0_f32
+                };
+                *miss_v = miss;
+                *maf_v = af.clamp(0.0, 1.0);
+                *std_v = std;
+                *row_flip_v = false;
+            });
+        emit_gfreader_rss_debug(
+            "load_bed_2bit_packed_subset_owned_pure_line/full_payload_loaded",
+            &format!(
+                "kept_n={kept_n} packed_bytes={} full_keep_fastpath=1",
+                format_debug_bytes_local(packed_keep.len() as u64),
+            ),
+        );
+        return Ok(PackedBedSubsetOwned {
+            packed: packed_keep,
+            missing_rate: miss_keep,
+            maf: maf_keep,
+            std_denom: std_keep,
+            row_flip: row_flip_keep,
+            n_samples,
+            bytes_per_snp,
+        });
+    }
 
     packed_keep
         .par_chunks_mut(bytes_per_snp)

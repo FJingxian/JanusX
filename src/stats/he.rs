@@ -848,7 +848,7 @@ pub(crate) fn row_major_block_mul_mat_f32(
 }
 
 #[inline]
-fn row_major_block_t_mul_mat_accum_f32(
+pub(crate) fn row_major_block_t_mul_mat_accum_f32(
     block: &[f32],
     rows: usize,
     cols: usize,

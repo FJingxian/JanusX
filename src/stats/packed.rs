@@ -14,6 +14,7 @@ use crate::bedmath::{
     decode_plink_bed_hardcall, decode_row_centered_full_lut, is_identity_indices, packed_byte_lut,
 };
 use crate::blas::{cblas_sgemm_dispatch, CblasInt, CBLAS_COL_MAJOR, CBLAS_NO_TRANS, CBLAS_TRANS};
+use crate::gload::WindowedBedMatrix;
 use crate::stats_common::{
     check_ctrlc, get_cached_pool, map_err_string_to_py, parse_index_vec_i64,
 };
@@ -209,6 +210,132 @@ pub fn bed_packed_decode_rows_f32<'py>(
         });
 
     let arr = PyArray2::<f32>::zeros(py, [row_idx.len(), n_out], false).into_bound();
+    let arr_slice = unsafe {
+        arr.as_slice_mut()
+            .map_err(|_| PyRuntimeError::new_err("output not contiguous"))?
+    };
+    arr_slice.copy_from_slice(&out);
+    Ok(arr)
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    prefix,
+    row_indices,
+    row_flip,
+    row_maf,
+    sample_indices=None,
+    mmap_window_mb=None
+))]
+pub fn bed_decode_rows_f32_from_meta<'py>(
+    py: Python<'py>,
+    prefix: String,
+    row_indices: PyReadonlyArray1<'py, i64>,
+    row_flip: PyReadonlyArray1<'py, bool>,
+    row_maf: PyReadonlyArray1<'py, f32>,
+    sample_indices: Option<PyReadonlyArray1<'py, i64>>,
+    mmap_window_mb: Option<usize>,
+) -> PyResult<Bound<'py, PyArray2<f32>>> {
+    let row_idx_raw = row_indices.as_slice()?.to_vec();
+    let row_flip_vec: Vec<bool> = match row_flip.as_slice() {
+        Ok(s) => s.to_vec(),
+        Err(_) => row_flip.as_array().iter().copied().collect(),
+    };
+    let row_maf_vec: Vec<f32> = match row_maf.as_slice() {
+        Ok(s) => s.to_vec(),
+        Err(_) => row_maf.as_array().iter().copied().collect(),
+    };
+    if row_idx_raw.is_empty() {
+        return Ok(PyArray2::<f32>::zeros(py, [0, 0], false).into_bound());
+    }
+    if row_flip_vec.len() != row_idx_raw.len() || row_maf_vec.len() != row_idx_raw.len() {
+        return Err(PyRuntimeError::new_err(format!(
+            "row meta length mismatch: row_indices={}, row_flip={}, row_maf={}",
+            row_idx_raw.len(),
+            row_flip_vec.len(),
+            row_maf_vec.len(),
+        )));
+    }
+    let sample_idx_raw = if let Some(sidx) = sample_indices {
+        Some(sidx.as_slice()?.to_vec())
+    } else {
+        None
+    };
+    let window_mb = mmap_window_mb.unwrap_or(64).max(1);
+
+    let (out, rows, n_out) = py
+        .detach(move || -> Result<(Vec<f32>, usize, usize), String> {
+            let mut matrix = WindowedBedMatrix::open(&prefix, window_mb)?;
+            let n_samples_full = matrix.n_samples_full();
+            let sample_idx = if let Some(raw) = sample_idx_raw.as_ref() {
+                parse_index_vec_i64(raw.as_slice(), n_samples_full, "sample_indices")
+                    .map_err(|e| e.to_string())?
+            } else {
+                (0..n_samples_full).collect::<Vec<_>>()
+            };
+            let n_out = sample_idx.len();
+            if n_out == 0 {
+                return Ok((Vec::new(), row_idx_raw.len(), 0));
+            }
+            let n_source = matrix.n_source_snps();
+            let row_idx = row_idx_raw
+                .iter()
+                .map(|&sid| {
+                    if sid < 0 || (sid as usize) >= n_source {
+                        Err(format!(
+                            "row index out of range: {sid} for n_snps={n_source}"
+                        ))
+                    } else {
+                        Ok(sid as usize)
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let full_sample_fast = is_identity_indices(&sample_idx, n_samples_full);
+            let bytes_per_snp = matrix.bytes_per_snp();
+            let byte_lut = packed_byte_lut();
+            let rows = row_idx.len();
+            let mut rel_indices = Vec::with_capacity(rows);
+            let packed_slice = matrix.prepare_source_rows(row_idx.as_slice(), &mut rel_indices)?;
+            let mut out = vec![0.0_f32; rows * n_out];
+            out.par_chunks_mut(n_out)
+                .enumerate()
+                .for_each(|(i_row, out_row)| {
+                    let src_row = rel_indices[i_row];
+                    let row =
+                        &packed_slice[src_row * bytes_per_snp..(src_row + 1) * bytes_per_snp];
+                    let flip = row_flip_vec[i_row];
+                    let mean_g = (2.0_f32 * row_maf_vec[i_row]).max(0.0);
+                    if full_sample_fast {
+                        let value_lut = if flip {
+                            [2.0_f32, mean_g, 1.0_f32, 0.0_f32]
+                        } else {
+                            [0.0_f32, mean_g, 1.0_f32, 2.0_f32]
+                        };
+                        decode_row_centered_full_lut(
+                            row,
+                            n_samples_full,
+                            &byte_lut.code4,
+                            &value_lut,
+                            out_row,
+                        );
+                    } else {
+                        for (j, &sid) in sample_idx.iter().enumerate() {
+                            let b = row[sid >> 2];
+                            let code = (b >> ((sid & 3) * 2)) & 0b11;
+                            let mut gv =
+                                decode_plink_bed_hardcall(code).map(|v| v as f32).unwrap_or(mean_g);
+                            if flip && code != 0b01 {
+                                gv = 2.0_f32 - gv;
+                            }
+                            out_row[j] = gv;
+                        }
+                    }
+                });
+            Ok((out, rows, n_out))
+        })
+        .map_err(map_err_string_to_py)?;
+
+    let arr = PyArray2::<f32>::zeros(py, [rows, n_out], false).into_bound();
     let arr_slice = unsafe {
         arr.as_slice_mut()
             .map_err(|_| PyRuntimeError::new_err("output not contiguous"))?

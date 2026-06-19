@@ -1,12 +1,13 @@
 use crate::bincore::parse_bin01_header;
 use crate::bstats::{apply_tail_mask, tail_mask, words_for_samples};
+use crate::gload::{load_file_owned_range_exact, mmap_readonly_file};
 use crate::kmer::format::{
     BIT_ORDER_LITTLE, BKMER_HEADER_SIZE, BKMER_MAGIC, BKMER_VERSION, BSITE_HEADER_SIZE,
     BSITE_MAGIC, BSITE_VERSION, COMPRESSION_NONE, ENCODING_ACGT_2BIT,
     MATRIX_LAYOUT_COLUMN_MAJOR_BITSET,
 };
 use memmap2::{Mmap, MmapOptions};
-use std::fs::{self, File};
+use std::fs::File;
 use std::path::Path;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -467,16 +468,19 @@ pub fn load_bin01_packed_payload_owned(
     path: &str,
     ctx: &str,
 ) -> Result<(Vec<u8>, usize, usize, usize), String> {
-    let bytes = fs::read(path).map_err(|e| format!("{ctx}: failed to read {path}: {e}"))?;
+    let path_ref = Path::new(path);
+    let bytes =
+        mmap_readonly_file(path_ref).map_err(|e| format!("{ctx}: failed to mmap {path}: {e}"))?;
     let (n_rows, n_samples, row_bytes, data_offset) = parse_bin01_header(&bytes, ctx)?;
     let payload_len = n_rows
         .checked_mul(row_bytes)
         .ok_or_else(|| format!("{ctx}: packed payload size overflow"))?;
-    let payload_end = data_offset
+    let _payload_end = data_offset
         .checked_add(payload_len)
         .ok_or_else(|| format!("{ctx}: packed payload end overflow"))?;
     Ok((
-        bytes[data_offset..payload_end].to_vec(),
+        load_file_owned_range_exact(path_ref, data_offset, payload_len)
+            .map_err(|e| format!("{ctx}: {e}"))?,
         n_rows,
         n_samples,
         row_bytes,

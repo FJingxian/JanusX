@@ -1,3 +1,32 @@
+//! Randomized SVD kernels for additive genotype matrices on the centered-GRM scale.
+//!
+//! Let `X ∈ R^{m×n}` denote the marker-by-sample genotype matrix after per-marker
+//! mean imputation and major-allele harmonization, with row `j`
+//!
+//! `x_j = g_j - 2 p_j`.
+//!
+//! The PCA target used by this module is the centered genomic relationship matrix
+//!
+//! `K = X^T X / (sum_j 2 p_j (1 - p_j))`.
+//!
+//! This module provides packed-BED randomized range-finder kernels for the sample-side
+//! spectrum of `K` without materializing `X` or `K` densely.
+//!
+//! Given target rank `k` and oversampled subspace dimension `k' ≥ k`, the
+//! approximation follows:
+//!
+//! 1. Draw a Gaussian test matrix `Ω`.
+//! 2. Form block-streamed products such as `X^T Ω`, `X^T (XQ)`, or the projected Gram terms.
+//! 3. Apply optional power iterations through repeated `X^T(X·)` products.
+//! 4. Orthonormalize the sketch to obtain `Q`.
+//! 5. Form the reduced Gram matrix, solve its symmetric eigendecomposition,
+//!    and rescale singular values to the `K` eigenvalue scale.
+//!
+//! The implementation streams packed genotype rows in blocks, decodes each block
+//! into a temporary dense centered matrix, and dispatches the linear algebra through BLAS.
+//! Row-wise allele-frequency statistics are computed once and then reused across
+//! the subsequent randomized projection kernels.
+
 use nalgebra::{DMatrix, SymmetricEigen};
 use numpy::{PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::exceptions::PyRuntimeError;
@@ -12,16 +41,18 @@ use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use crate::bedmath::{
-    decode_standardized_packed_block_rows_f32_with_plan, is_identity_indices, packed_byte_lut,
-    SubsetDecodePlan,
-};
+use crate::bedmath::{is_identity_indices, packed_byte_lut, SubsetDecodePlan};
 use crate::blas::{
     cblas_sgemm_dispatch, BlasThreadGuard, CblasInt, CBLAS_NO_TRANS, CBLAS_ROW_MAJOR, CBLAS_TRANS,
+};
+use crate::decode::{
+    decode_prepared_additive_block_packed_f32, prepare_packed_block_centered_mean_scale_f32,
+    prepare_packed_block_row_indices,
 };
 use crate::gfcore::{
     block_rows_from_memory_target_mb, parse_positive_env_f64, parse_positive_env_usize,
 };
+use crate::he::{row_major_block_mul_mat_f32, row_major_block_t_mul_mat_accum_f32};
 use crate::pipeline::run_double_buffer;
 use crate::stats_common::{
     admx_madvise_dontneed_bytes, check_admx_memory_limit, check_ctrlc, get_cached_pool,
@@ -318,6 +349,26 @@ fn checked_cblas_dim(v: usize, label: &str) -> Result<CblasInt, String> {
     Ok(v as CblasInt)
 }
 
+#[derive(Clone)]
+struct PackedDecodeBuf {
+    row_start: usize,
+    rows: usize,
+    block: Vec<f32>,
+}
+
+#[derive(Clone)]
+struct PackedDecodeOmegaBuf {
+    row_start: usize,
+    rows: usize,
+    block: Vec<f32>,
+    omega: Vec<f32>,
+}
+
+#[inline]
+fn rsvd_packed_overlap_enabled(total_threads: usize, m: usize, block_rows: usize) -> bool {
+    rsvd_packed_pipeline_enabled() && total_threads > 1 && m > block_rows
+}
+
 #[allow(clippy::too_many_arguments)]
 fn decode_block_rows_f32(
     view: PackedRsvdView<'_>,
@@ -333,20 +384,24 @@ fn decode_block_rows_f32(
     decode_pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> Result<(), String> {
     debug_assert!(row_flip_local.len() >= rows);
-    debug_assert!(packed_row_indices_local.len() >= rows);
-    debug_assert!(row_mean.len() >= rows);
-    debug_assert!(row_inv_sd.len() >= rows);
-    debug_assert_eq!(out_block.len(), rows * view.n());
-    for off in 0..rows {
-        row_flip_local[off] = view.row_flip[row_start + off];
-        row_mean[off] = 2.0_f32 * view.row_freq[row_start + off];
-        row_inv_sd[off] = 1.0_f32;
-        packed_row_indices_local[off] = view
-            .packed_row_indices
-            .map(|idx| idx[row_start + off])
-            .unwrap_or(row_start + off);
+    if view.row_flip.len() < row_start.saturating_add(rows) {
+        return Err("decode_block_rows_f32: row_flip slice too small".to_string());
     }
-    decode_standardized_packed_block_rows_f32_with_plan(
+    row_flip_local[..rows].copy_from_slice(&view.row_flip[row_start..row_start + rows]);
+    prepare_packed_block_row_indices(
+        view.packed_row_indices,
+        row_start,
+        rows,
+        packed_row_indices_local,
+    )?;
+    prepare_packed_block_centered_mean_scale_f32(
+        view.row_freq,
+        row_start,
+        rows,
+        row_mean,
+        row_inv_sd,
+    )?;
+    decode_prepared_additive_block_packed_f32(
         view.packed_flat,
         view.bytes_per_snp,
         view.n_samples,
@@ -357,9 +412,9 @@ fn decode_block_rows_f32(
         full_sample_fast,
         subset_plan,
         Some(&packed_row_indices_local[..rows]),
-        0,
+        0usize,
+        rows,
         out_block,
-        &packed_byte_lut().code4,
         decode_pool,
     )
 }
@@ -483,63 +538,153 @@ pub(crate) fn rsvd_packed_compute_a_omega(
     if omega.len() != n * kp {
         return Err("omega shape mismatch in packed RSVD A*Omega".to_string());
     }
+    let total_threads = rayon::current_num_threads().max(1);
     let block_rows = rsvd_block_rows_env(n, m);
-    let decode_pool =
-        get_cached_pool(rayon::current_num_threads().max(1)).map_err(|e| e.to_string())?;
-    let mut out = vec![0.0_f32; m * kp];
-    let mut block = vec![0.0_f32; block_rows * n];
-    let mut row_flip_local = vec![false; block_rows];
-    let mut packed_row_indices_local = vec![0usize; block_rows];
-    let mut row_mean = vec![0.0_f32; block_rows];
-    let mut row_inv_sd = vec![1.0_f32; block_rows];
-    let cur_rows_i = checked_cblas_dim(block_rows, "block_rows")?;
-    let n_i = checked_cblas_dim(n, "n")?;
-    let kp_i = checked_cblas_dim(kp, "kp")?;
-    let _blas_guard = BlasThreadGuard::enter(rayon::current_num_threads().max(1));
-
-    for row_start in (0..m).step_by(block_rows) {
-        check_ctrlc()?;
-        check_admx_memory_limit("rsvd_packed/a_omega")?;
-        let row_end = (row_start + block_rows).min(m);
-        let cur_rows = row_end - row_start;
-        let cur_block = &mut block[..cur_rows * n];
-        decode_block_rows_f32(
-            view,
-            full_sample_fast,
-            subset_plan.as_ref(),
-            row_start,
-            cur_rows,
-            &mut row_flip_local,
-            &mut packed_row_indices_local,
-            &mut row_mean,
-            &mut row_inv_sd,
-            cur_block,
-            decode_pool.as_ref(),
-        )?;
-        madvise_packed_rows_after_decode(view, row_start, cur_rows);
-        let out_block = &mut out[row_start * kp..row_end * kp];
-        let cur_rows_block_i = if cur_rows == block_rows {
-            cur_rows_i
+    let overlap_enabled = rsvd_packed_overlap_enabled(total_threads, m, block_rows);
+    let decode_threads = rsvd_decode_threads(total_threads, overlap_enabled);
+    let blas_threads = rsvd_blas_threads(total_threads, decode_threads, overlap_enabled);
+    let decode_pool = if overlap_enabled {
+        if decode_threads > 1 {
+            get_cached_pool(decode_threads).map_err(|e| e.to_string())?
         } else {
-            checked_cblas_dim(cur_rows, "cur_rows")?
-        };
-        unsafe {
-            cblas_sgemm_dispatch(
-                CBLAS_ROW_MAJOR,
-                CBLAS_NO_TRANS,
-                CBLAS_NO_TRANS,
-                cur_rows_block_i,
-                kp_i,
-                n_i,
-                1.0_f32,
-                cur_block.as_ptr(),
-                n_i,
-                omega.as_ptr(),
-                kp_i,
-                0.0_f32,
-                out_block.as_mut_ptr(),
-                kp_i,
-            );
+            None
+        }
+    } else {
+        get_cached_pool(total_threads).map_err(|e| e.to_string())?
+    };
+    let mut out = vec![0.0_f32; m * kp];
+    let cur_rows_i = checked_cblas_dim(block_rows, "block_rows")?;
+    let _n_i = checked_cblas_dim(n, "n")?;
+    let _kp_i = checked_cblas_dim(kp, "kp")?;
+    let _blas_guard = BlasThreadGuard::enter(blas_threads.max(1));
+
+    if !overlap_enabled {
+        let mut block = vec![0.0_f32; block_rows * n];
+        let mut row_flip_local = vec![false; block_rows];
+        let mut packed_row_indices_local = vec![0usize; block_rows];
+        let mut row_mean = vec![0.0_f32; block_rows];
+        let mut row_inv_sd = vec![1.0_f32; block_rows];
+        for row_start in (0..m).step_by(block_rows) {
+            check_ctrlc()?;
+            check_admx_memory_limit("rsvd_packed/a_omega")?;
+            let row_end = (row_start + block_rows).min(m);
+            let cur_rows = row_end - row_start;
+            let cur_block = &mut block[..cur_rows * n];
+            decode_block_rows_f32(
+                view,
+                full_sample_fast,
+                subset_plan.as_ref(),
+                row_start,
+                cur_rows,
+                &mut row_flip_local,
+                &mut packed_row_indices_local,
+                &mut row_mean,
+                &mut row_inv_sd,
+                cur_block,
+                decode_pool.as_ref(),
+            )?;
+            madvise_packed_rows_after_decode(view, row_start, cur_rows);
+            let out_block = &mut out[row_start * kp..row_end * kp];
+            let _ = if cur_rows == block_rows {
+                cur_rows_i
+            } else {
+                checked_cblas_dim(cur_rows, "cur_rows")?
+            };
+            row_major_block_mul_mat_f32(cur_block, cur_rows, n, omega, kp, out_block, None);
+        }
+    } else {
+        let producer_error = Arc::new(Mutex::new(None::<String>));
+        let producer_error_bg = Arc::clone(&producer_error);
+        let mut next_row_start = 0usize;
+        let mut row_flip_local = vec![false; block_rows];
+        let mut packed_row_indices_local = vec![0usize; block_rows];
+        let mut row_mean = vec![0.0_f32; block_rows];
+        let mut row_inv_sd = vec![1.0_f32; block_rows];
+
+        run_double_buffer(
+            2,
+            || PackedDecodeBuf {
+                row_start: 0usize,
+                rows: 0usize,
+                block: vec![0.0_f32; block_rows * n],
+            },
+            |buf| {
+                if next_row_start >= m {
+                    buf.rows = 0;
+                    return false;
+                }
+                if let Err(e) = check_admx_memory_limit("rsvd_packed/a_omega_decode") {
+                    if let Ok(mut slot) = producer_error_bg.lock() {
+                        *slot = Some(e);
+                    }
+                    buf.rows = 0;
+                    return false;
+                }
+                let row_start = next_row_start;
+                let row_end = (row_start + block_rows).min(m);
+                let cur_rows = row_end - row_start;
+                let cur_block = &mut buf.block[..cur_rows * n];
+                match decode_block_rows_f32(
+                    view,
+                    full_sample_fast,
+                    subset_plan.as_ref(),
+                    row_start,
+                    cur_rows,
+                    &mut row_flip_local,
+                    &mut packed_row_indices_local,
+                    &mut row_mean,
+                    &mut row_inv_sd,
+                    cur_block,
+                    decode_pool.as_ref(),
+                ) {
+                    Ok(()) => {
+                        madvise_packed_rows_after_decode(view, row_start, cur_rows);
+                        buf.row_start = row_start;
+                        buf.rows = cur_rows;
+                        next_row_start = row_end;
+                        next_row_start < m
+                    }
+                    Err(e) => {
+                        if let Ok(mut slot) = producer_error_bg.lock() {
+                            *slot = Some(e);
+                        }
+                        buf.rows = 0;
+                        false
+                    }
+                }
+            },
+            |buf| {
+                if buf.rows == 0 {
+                    return Ok::<(), String>(());
+                }
+                check_ctrlc()?;
+                check_admx_memory_limit("rsvd_packed/a_omega_gemm")?;
+                let row_end = buf.row_start + buf.rows;
+                let out_block = &mut out[buf.row_start * kp..row_end * kp];
+                let _ = if buf.rows == block_rows {
+                    cur_rows_i
+                } else {
+                    checked_cblas_dim(buf.rows, "cur_rows")?
+                };
+                row_major_block_mul_mat_f32(
+                    &buf.block[..buf.rows * n],
+                    buf.rows,
+                    n,
+                    omega,
+                    kp,
+                    out_block,
+                    None,
+                );
+                Ok::<(), String>(())
+            },
+        )?;
+
+        let producer_err = producer_error
+            .lock()
+            .map_err(|_| "packed RSVD A*Omega producer error lock poisoned".to_string())?
+            .take();
+        if let Some(err) = producer_err {
+            return Err(err);
         }
     }
     Ok(out)
@@ -553,61 +698,150 @@ pub(crate) fn rsvd_packed_compute_at_random_omega(
     let (full_sample_fast, subset_plan) = view.validate()?;
     let m = view.m();
     let n = view.n();
+    let total_threads = rayon::current_num_threads().max(1);
     let block_rows = rsvd_block_rows_env(n, m);
-    let decode_pool =
-        get_cached_pool(rayon::current_num_threads().max(1)).map_err(|e| e.to_string())?;
+    let overlap_enabled = rsvd_packed_overlap_enabled(total_threads, m, block_rows);
+    let decode_threads = rsvd_decode_threads(total_threads, overlap_enabled);
+    let blas_threads = rsvd_blas_threads(total_threads, decode_threads, overlap_enabled);
+    let decode_pool = if overlap_enabled {
+        if decode_threads > 1 {
+            get_cached_pool(decode_threads).map_err(|e| e.to_string())?
+        } else {
+            None
+        }
+    } else {
+        get_cached_pool(total_threads).map_err(|e| e.to_string())?
+    };
     let mut out = vec![0.0_f32; n * kp];
-    let mut block = vec![0.0_f32; block_rows * n];
-    let mut omega_block = vec![0.0_f32; block_rows * kp];
-    let mut row_flip_local = vec![false; block_rows];
-    let mut packed_row_indices_local = vec![0usize; block_rows];
-    let mut row_mean = vec![0.0_f32; block_rows];
-    let mut row_inv_sd = vec![1.0_f32; block_rows];
-    let mut rng = StdRng::seed_from_u64(seed);
-    let n_i = checked_cblas_dim(n, "n")?;
-    let kp_i = checked_cblas_dim(kp, "kp")?;
-    let _blas_guard = BlasThreadGuard::enter(rayon::current_num_threads().max(1));
+    let _n_i = checked_cblas_dim(n, "n")?;
+    let _kp_i = checked_cblas_dim(kp, "kp")?;
+    let _blas_guard = BlasThreadGuard::enter(blas_threads.max(1));
 
-    for row_start in (0..m).step_by(block_rows) {
-        check_ctrlc()?;
-        check_admx_memory_limit("rsvd_packed/at_random_omega")?;
-        let row_end = (row_start + block_rows).min(m);
-        let cur_rows = row_end - row_start;
-        let cur_block = &mut block[..cur_rows * n];
-        decode_block_rows_f32(
-            view,
-            full_sample_fast,
-            subset_plan.as_ref(),
-            row_start,
-            cur_rows,
-            &mut row_flip_local,
-            &mut packed_row_indices_local,
-            &mut row_mean,
-            &mut row_inv_sd,
-            cur_block,
-            decode_pool.as_ref(),
-        )?;
-        madvise_packed_rows_after_decode(view, row_start, cur_rows);
-        let cur_omega = &mut omega_block[..cur_rows * kp];
-        fill_random_omega_block(&mut rng, cur_omega);
-        let cur_rows_i = checked_cblas_dim(cur_rows, "cur_rows")?;
-        unsafe {
-            cblas_sgemm_dispatch(
-                CBLAS_ROW_MAJOR,
-                CBLAS_TRANS,
-                CBLAS_NO_TRANS,
-                n_i,
-                kp_i,
-                cur_rows_i,
-                1.0_f32,
-                cur_block.as_ptr(),
-                n_i,
-                cur_omega.as_ptr(),
-                kp_i,
-                1.0_f32,
-                out.as_mut_ptr(),
-                kp_i,
+    if !overlap_enabled {
+        let mut block = vec![0.0_f32; block_rows * n];
+        let mut omega_block = vec![0.0_f32; block_rows * kp];
+        let mut row_flip_local = vec![false; block_rows];
+        let mut packed_row_indices_local = vec![0usize; block_rows];
+        let mut row_mean = vec![0.0_f32; block_rows];
+        let mut row_inv_sd = vec![1.0_f32; block_rows];
+        let mut rng = StdRng::seed_from_u64(seed);
+        for row_start in (0..m).step_by(block_rows) {
+            check_ctrlc()?;
+            check_admx_memory_limit("rsvd_packed/at_random_omega")?;
+            let row_end = (row_start + block_rows).min(m);
+            let cur_rows = row_end - row_start;
+            let cur_block = &mut block[..cur_rows * n];
+            decode_block_rows_f32(
+                view,
+                full_sample_fast,
+                subset_plan.as_ref(),
+                row_start,
+                cur_rows,
+                &mut row_flip_local,
+                &mut packed_row_indices_local,
+                &mut row_mean,
+                &mut row_inv_sd,
+                cur_block,
+                decode_pool.as_ref(),
+            )?;
+            madvise_packed_rows_after_decode(view, row_start, cur_rows);
+            let cur_omega = &mut omega_block[..cur_rows * kp];
+            fill_random_omega_block(&mut rng, cur_omega);
+            let _ = checked_cblas_dim(cur_rows, "cur_rows")?;
+            row_major_block_t_mul_mat_accum_f32(
+                cur_block, cur_rows, n, cur_omega, kp, &mut out, None,
             );
+        }
+    } else {
+        let producer_error = Arc::new(Mutex::new(None::<String>));
+        let producer_error_bg = Arc::clone(&producer_error);
+        let mut next_row_start = 0usize;
+        let mut row_flip_local = vec![false; block_rows];
+        let mut packed_row_indices_local = vec![0usize; block_rows];
+        let mut row_mean = vec![0.0_f32; block_rows];
+        let mut row_inv_sd = vec![1.0_f32; block_rows];
+        let mut rng = StdRng::seed_from_u64(seed);
+
+        run_double_buffer(
+            2,
+            || PackedDecodeOmegaBuf {
+                row_start: 0usize,
+                rows: 0usize,
+                block: vec![0.0_f32; block_rows * n],
+                omega: vec![0.0_f32; block_rows * kp],
+            },
+            |buf| {
+                if next_row_start >= m {
+                    buf.rows = 0;
+                    return false;
+                }
+                if let Err(e) = check_admx_memory_limit("rsvd_packed/at_random_omega_decode") {
+                    if let Ok(mut slot) = producer_error_bg.lock() {
+                        *slot = Some(e);
+                    }
+                    buf.rows = 0;
+                    return false;
+                }
+                let row_start = next_row_start;
+                let row_end = (row_start + block_rows).min(m);
+                let cur_rows = row_end - row_start;
+                let cur_block = &mut buf.block[..cur_rows * n];
+                match decode_block_rows_f32(
+                    view,
+                    full_sample_fast,
+                    subset_plan.as_ref(),
+                    row_start,
+                    cur_rows,
+                    &mut row_flip_local,
+                    &mut packed_row_indices_local,
+                    &mut row_mean,
+                    &mut row_inv_sd,
+                    cur_block,
+                    decode_pool.as_ref(),
+                ) {
+                    Ok(()) => {
+                        madvise_packed_rows_after_decode(view, row_start, cur_rows);
+                        fill_random_omega_block(&mut rng, &mut buf.omega[..cur_rows * kp]);
+                        buf.row_start = row_start;
+                        buf.rows = cur_rows;
+                        next_row_start = row_end;
+                        next_row_start < m
+                    }
+                    Err(e) => {
+                        if let Ok(mut slot) = producer_error_bg.lock() {
+                            *slot = Some(e);
+                        }
+                        buf.rows = 0;
+                        false
+                    }
+                }
+            },
+            |buf| {
+                if buf.rows == 0 {
+                    return Ok::<(), String>(());
+                }
+                check_ctrlc()?;
+                check_admx_memory_limit("rsvd_packed/at_random_omega_gemm")?;
+                let _ = checked_cblas_dim(buf.rows, "cur_rows")?;
+                row_major_block_t_mul_mat_accum_f32(
+                    &buf.block[..buf.rows * n],
+                    buf.rows,
+                    n,
+                    &buf.omega[..buf.rows * kp],
+                    kp,
+                    &mut out,
+                    None,
+                );
+                Ok::<(), String>(())
+            },
+        )?;
+
+        let producer_err = producer_error
+            .lock()
+            .map_err(|_| "packed RSVD A^TΩ producer error lock poisoned".to_string())?
+            .take();
+        if let Some(err) = producer_err {
+            return Err(err);
         }
     }
     Ok(out)
@@ -646,8 +880,8 @@ pub(crate) fn rsvd_packed_compute_ata_omega(
         get_cached_pool(total_threads).map_err(|e| e.to_string())?
     };
     let mut out = vec![0.0_f32; n * kp];
-    let n_i = checked_cblas_dim(n, "n")?;
-    let kp_i = checked_cblas_dim(kp, "kp")?;
+    let _n_i = checked_cblas_dim(n, "n")?;
+    let _kp_i = checked_cblas_dim(kp, "kp")?;
     let _blas_guard = BlasThreadGuard::enter(blas_threads.max(1));
     let measure_timing = timing.is_some();
     let mut decode_s = 0.0_f64;
@@ -695,40 +929,9 @@ pub(crate) fn rsvd_packed_compute_ata_omega(
             } else {
                 None
             };
-            unsafe {
-                cblas_sgemm_dispatch(
-                    CBLAS_ROW_MAJOR,
-                    CBLAS_NO_TRANS,
-                    CBLAS_NO_TRANS,
-                    cur_rows_i,
-                    kp_i,
-                    n_i,
-                    1.0_f32,
-                    cur_block.as_ptr(),
-                    n_i,
-                    omega.as_ptr(),
-                    kp_i,
-                    0.0_f32,
-                    cur_g.as_mut_ptr(),
-                    kp_i,
-                );
-                cblas_sgemm_dispatch(
-                    CBLAS_ROW_MAJOR,
-                    CBLAS_TRANS,
-                    CBLAS_NO_TRANS,
-                    n_i,
-                    kp_i,
-                    cur_rows_i,
-                    1.0_f32,
-                    cur_block.as_ptr(),
-                    n_i,
-                    cur_g.as_ptr(),
-                    kp_i,
-                    1.0_f32,
-                    out.as_mut_ptr(),
-                    kp_i,
-                );
-            }
+            row_major_block_mul_mat_f32(cur_block, cur_rows, n, omega, kp, cur_g, None);
+            let _ = cur_rows_i;
+            row_major_block_t_mul_mat_accum_f32(cur_block, cur_rows, n, cur_g, kp, &mut out, None);
             if let Some(t0) = t_gemm {
                 gemm_s += t0.elapsed().as_secs_f64();
             }
@@ -822,40 +1025,11 @@ pub(crate) fn rsvd_packed_compute_ata_omega(
                 } else {
                     None
                 };
-                unsafe {
-                    cblas_sgemm_dispatch(
-                        CBLAS_ROW_MAJOR,
-                        CBLAS_NO_TRANS,
-                        CBLAS_NO_TRANS,
-                        cur_rows_i,
-                        kp_i,
-                        n_i,
-                        1.0_f32,
-                        cur_block.as_ptr(),
-                        n_i,
-                        omega.as_ptr(),
-                        kp_i,
-                        0.0_f32,
-                        cur_g.as_mut_ptr(),
-                        kp_i,
-                    );
-                    cblas_sgemm_dispatch(
-                        CBLAS_ROW_MAJOR,
-                        CBLAS_TRANS,
-                        CBLAS_NO_TRANS,
-                        n_i,
-                        kp_i,
-                        cur_rows_i,
-                        1.0_f32,
-                        cur_block.as_ptr(),
-                        n_i,
-                        cur_g.as_ptr(),
-                        kp_i,
-                        1.0_f32,
-                        out.as_mut_ptr(),
-                        kp_i,
-                    );
-                }
+                row_major_block_mul_mat_f32(cur_block, cur_rows, n, omega, kp, cur_g, None);
+                let _ = cur_rows_i;
+                row_major_block_t_mul_mat_accum_f32(
+                    cur_block, cur_rows, n, cur_g, kp, &mut out, None,
+                );
                 if let Some(t0) = t_gemm {
                     gemm_s += t0.elapsed().as_secs_f64();
                 }
@@ -892,62 +1066,150 @@ pub(crate) fn rsvd_packed_compute_gram_aq(
     if q.len() != n * kp {
         return Err("q shape mismatch in packed RSVD gram accumulation".to_string());
     }
+    let total_threads = rayon::current_num_threads().max(1);
     let block_rows = rsvd_block_rows_env(n, m);
-    let decode_pool =
-        get_cached_pool(rayon::current_num_threads().max(1)).map_err(|e| e.to_string())?;
+    let overlap_enabled = rsvd_packed_overlap_enabled(total_threads, m, block_rows);
+    let decode_threads = rsvd_decode_threads(total_threads, overlap_enabled);
+    let blas_threads = rsvd_blas_threads(total_threads, decode_threads, overlap_enabled);
+    let decode_pool = if overlap_enabled {
+        if decode_threads > 1 {
+            get_cached_pool(decode_threads).map_err(|e| e.to_string())?
+        } else {
+            None
+        }
+    } else {
+        get_cached_pool(total_threads).map_err(|e| e.to_string())?
+    };
     let mut gram = vec![0.0_f64; kp * kp];
     let mut gram_block = vec![0.0_f32; kp * kp];
-    let mut block = vec![0.0_f32; block_rows * n];
     let mut g_block = vec![0.0_f32; block_rows * kp];
-    let mut row_flip_local = vec![false; block_rows];
-    let mut packed_row_indices_local = vec![0usize; block_rows];
-    let mut row_mean = vec![0.0_f32; block_rows];
-    let mut row_inv_sd = vec![1.0_f32; block_rows];
-    let n_i = checked_cblas_dim(n, "n")?;
-    let kp_i = checked_cblas_dim(kp, "kp")?;
-    let _blas_guard = BlasThreadGuard::enter(rayon::current_num_threads().max(1));
+    let _n_i = checked_cblas_dim(n, "n")?;
+    let _kp_i = checked_cblas_dim(kp, "kp")?;
+    let _blas_guard = BlasThreadGuard::enter(blas_threads.max(1));
 
-    for row_start in (0..m).step_by(block_rows) {
-        check_ctrlc()?;
-        check_admx_memory_limit("rsvd_packed/gram_aq")?;
-        let row_end = (row_start + block_rows).min(m);
-        let cur_rows = row_end - row_start;
-        let cur_block = &mut block[..cur_rows * n];
-        decode_block_rows_f32(
-            view,
-            full_sample_fast,
-            subset_plan.as_ref(),
-            row_start,
-            cur_rows,
-            &mut row_flip_local,
-            &mut packed_row_indices_local,
-            &mut row_mean,
-            &mut row_inv_sd,
-            cur_block,
-            decode_pool.as_ref(),
-        )?;
-        madvise_packed_rows_after_decode(view, row_start, cur_rows);
-        let cur_rows_i = checked_cblas_dim(cur_rows, "cur_rows")?;
-        let cur_g = &mut g_block[..cur_rows * kp];
-        unsafe {
-            cblas_sgemm_dispatch(
-                CBLAS_ROW_MAJOR,
-                CBLAS_NO_TRANS,
-                CBLAS_NO_TRANS,
-                cur_rows_i,
-                kp_i,
-                n_i,
-                1.0_f32,
-                cur_block.as_ptr(),
-                n_i,
-                q.as_ptr(),
-                kp_i,
-                0.0_f32,
-                cur_g.as_mut_ptr(),
-                kp_i,
-            );
+    if !overlap_enabled {
+        let mut block = vec![0.0_f32; block_rows * n];
+        let mut row_flip_local = vec![false; block_rows];
+        let mut packed_row_indices_local = vec![0usize; block_rows];
+        let mut row_mean = vec![0.0_f32; block_rows];
+        let mut row_inv_sd = vec![1.0_f32; block_rows];
+        for row_start in (0..m).step_by(block_rows) {
+            check_ctrlc()?;
+            check_admx_memory_limit("rsvd_packed/gram_aq")?;
+            let row_end = (row_start + block_rows).min(m);
+            let cur_rows = row_end - row_start;
+            let cur_block = &mut block[..cur_rows * n];
+            decode_block_rows_f32(
+                view,
+                full_sample_fast,
+                subset_plan.as_ref(),
+                row_start,
+                cur_rows,
+                &mut row_flip_local,
+                &mut packed_row_indices_local,
+                &mut row_mean,
+                &mut row_inv_sd,
+                cur_block,
+                decode_pool.as_ref(),
+            )?;
+            madvise_packed_rows_after_decode(view, row_start, cur_rows);
+            let cur_rows_i = checked_cblas_dim(cur_rows, "cur_rows")?;
+            let cur_g = &mut g_block[..cur_rows * kp];
+            row_major_block_mul_mat_f32(cur_block, cur_rows, n, q, kp, cur_g, None);
+            let _ = cur_rows_i;
+            accum_gram_lower_f64(cur_g, cur_rows, kp, &mut gram, &mut gram_block)?;
         }
-        accum_gram_lower_f64(cur_g, cur_rows, kp, &mut gram, &mut gram_block)?;
+    } else {
+        let producer_error = Arc::new(Mutex::new(None::<String>));
+        let producer_error_bg = Arc::clone(&producer_error);
+        let mut next_row_start = 0usize;
+        let mut row_flip_local = vec![false; block_rows];
+        let mut packed_row_indices_local = vec![0usize; block_rows];
+        let mut row_mean = vec![0.0_f32; block_rows];
+        let mut row_inv_sd = vec![1.0_f32; block_rows];
+
+        run_double_buffer(
+            2,
+            || PackedDecodeBuf {
+                row_start: 0usize,
+                rows: 0usize,
+                block: vec![0.0_f32; block_rows * n],
+            },
+            |buf| {
+                if next_row_start >= m {
+                    buf.rows = 0;
+                    return false;
+                }
+                if let Err(e) = check_admx_memory_limit("rsvd_packed/gram_aq_decode") {
+                    if let Ok(mut slot) = producer_error_bg.lock() {
+                        *slot = Some(e);
+                    }
+                    buf.rows = 0;
+                    return false;
+                }
+                let row_start = next_row_start;
+                let row_end = (row_start + block_rows).min(m);
+                let cur_rows = row_end - row_start;
+                let cur_block = &mut buf.block[..cur_rows * n];
+                match decode_block_rows_f32(
+                    view,
+                    full_sample_fast,
+                    subset_plan.as_ref(),
+                    row_start,
+                    cur_rows,
+                    &mut row_flip_local,
+                    &mut packed_row_indices_local,
+                    &mut row_mean,
+                    &mut row_inv_sd,
+                    cur_block,
+                    decode_pool.as_ref(),
+                ) {
+                    Ok(()) => {
+                        madvise_packed_rows_after_decode(view, row_start, cur_rows);
+                        buf.row_start = row_start;
+                        buf.rows = cur_rows;
+                        next_row_start = row_end;
+                        next_row_start < m
+                    }
+                    Err(e) => {
+                        if let Ok(mut slot) = producer_error_bg.lock() {
+                            *slot = Some(e);
+                        }
+                        buf.rows = 0;
+                        false
+                    }
+                }
+            },
+            |buf| {
+                if buf.rows == 0 {
+                    return Ok::<(), String>(());
+                }
+                check_ctrlc()?;
+                check_admx_memory_limit("rsvd_packed/gram_aq_gemm")?;
+                let cur_rows_i = checked_cblas_dim(buf.rows, "cur_rows")?;
+                let cur_g = &mut g_block[..buf.rows * kp];
+                row_major_block_mul_mat_f32(
+                    &buf.block[..buf.rows * n],
+                    buf.rows,
+                    n,
+                    q,
+                    kp,
+                    cur_g,
+                    None,
+                );
+                let _ = cur_rows_i;
+                accum_gram_lower_f64(cur_g, buf.rows, kp, &mut gram, &mut gram_block)?;
+                Ok::<(), String>(())
+            },
+        )?;
+
+        let producer_err = producer_error
+            .lock()
+            .map_err(|_| "packed RSVD gram(AQ) producer error lock poisoned".to_string())?
+            .take();
+        if let Some(err) = producer_err {
+            return Err(err);
+        }
     }
 
     for i in 0..kp {
@@ -963,6 +1225,31 @@ fn fill_random_omega_block(rng: &mut StdRng, omega_block: &mut [f32]) {
     for v in omega_block.iter_mut() {
         *v = rng.sample::<f64, _>(StandardNormal) as f32;
     }
+}
+
+pub(crate) fn rsvd_project_sample_eigvecs(
+    q: &[f32],
+    rows: usize,
+    kp: usize,
+    v_small: &[f32],
+    k_eff: usize,
+) -> Result<Vec<f32>, String> {
+    if q.len() != rows.saturating_mul(kp) {
+        return Err("sample RSVD projection q shape mismatch".to_string());
+    }
+    if v_small.len() != kp.saturating_mul(kp) {
+        return Err("sample RSVD projection v_small shape mismatch".to_string());
+    }
+    if k_eff > kp {
+        return Err("sample RSVD projection k_eff exceeds kp".to_string());
+    }
+    let mut rhs = vec![0.0_f32; kp * k_eff];
+    for r in 0..kp {
+        rhs[r * k_eff..(r + 1) * k_eff].copy_from_slice(&v_small[r * kp..r * kp + k_eff]);
+    }
+    let mut out = vec![0.0_f32; rows * k_eff];
+    row_major_block_mul_mat_f32(q, rows, kp, &rhs, k_eff, &mut out, None);
+    Ok(out)
 }
 
 fn rsvd_tile_cols_env() -> usize {
@@ -1295,9 +1582,9 @@ pub fn rsvd_packed_subset(
     for it in 0..power {
         check_ctrlc()?;
         y = rsvd_packed_compute_ata_omega(packed_view, &q, kp, None)?;
-        for idx in 0..(n * kp) {
-            y[idx] -= alpha * q[idx];
-        }
+        y.par_iter_mut()
+            .zip(q.par_iter())
+            .for_each(|(yi, qi)| *yi -= alpha * *qi);
         let force_qr = (it + 1) >= power;
         if force_qr {
             let (q_new, _) = qr_normalize_mgs(&y, n, kp)?;
@@ -1354,18 +1641,7 @@ pub fn rsvd_packed_subset(
         eigvals[i] = (s_all[i] * s_all[i]) / scale;
     }
 
-    let mut eigvecs_sample = vec![0.0_f32; n * k_eff];
-    for r in 0..n {
-        let q_row = &q[r * kp..(r + 1) * kp];
-        let out_row = &mut eigvecs_sample[r * k_eff..(r + 1) * k_eff];
-        for c in 0..k_eff {
-            let mut acc = 0.0_f64;
-            for t in 0..kp {
-                acc += (q_row[t] as f64) * (v_small[t * kp + c] as f64);
-            }
-            out_row[c] = acc as f32;
-        }
-    }
+    let eigvecs_sample = rsvd_project_sample_eigvecs(&q, n, kp, &v_small, k_eff)?;
 
     Ok((eigvals, eigvecs_sample, row_freq, row_flip, k_eff))
 }

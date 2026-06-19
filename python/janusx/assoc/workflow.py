@@ -2840,7 +2840,7 @@ def build_pcs_from_genotype_rsvd(
         ) as task:
             try:
                 with _bed_block_target_env(float(memory_mb)):
-                    _eval_raw, evec_raw = jxrs.admx_rsvd_stream_sample(
+                    _eval_raw, evec_raw, _total_variance = jxrs.admx_rsvd_stream_sample(
                         str(rsvd_input),
                         int(dim_use),
                         42,

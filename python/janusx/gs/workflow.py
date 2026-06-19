@@ -107,6 +107,7 @@ from janusx.bioplotkit.sci_set import color_set
 from janusx.bioplotkit import gsplot
 from janusx._optional_deps import format_missing_dependency_message
 from janusx.gfreader import (
+    calc_decode_block_rows_from_memory_mb,
     inspect_genotype_file,
     load_genotype_chunks,
     load_bed_2bit_packed,
@@ -169,7 +170,10 @@ from janusx.script._common.grmstable import (
     build_stable_packed_ctx_grm_f64,
     stable_grm_builder_available,
 )
-from janusx.script._common.packedctx import prepare_packed_ctx_from_plink
+from janusx.script._common.packedctx import (
+    prepare_packed_ctx_from_plink,
+    prepare_packed_stats_ctx_from_plink,
+)
 from janusx.gs import output as gs_output
 
 try:
@@ -327,15 +331,21 @@ def _emit_packed_load_debug(
     if packed_ctx is None:
         return
     try:
-        packed = np.asarray(packed_ctx["packed"], dtype=np.uint8)
-        if packed.ndim != 2:
-            print(
-                f"[GS-DEBUG] Packed load {label or 'main'} invalid packed ndim={packed.ndim}",
-                flush=True,
-            )
-            return
-        packed_rows = int(packed.shape[0])
-        bytes_per_snp = int(packed.shape[1])
+        packed_raw = packed_ctx.get("packed", None)
+        packed_rows = 0
+        packed_bytes = 0
+        bytes_per_snp = max(1, (int(packed_ctx.get("n_samples", 0)) + 3) // 4)
+        if packed_raw is not None:
+            packed = np.asarray(packed_raw, dtype=np.uint8)
+            if packed.ndim != 2:
+                print(
+                    f"[GS-DEBUG] Packed load {label or 'main'} invalid packed ndim={packed.ndim}",
+                    flush=True,
+                )
+                return
+            packed_rows = int(packed.shape[0])
+            bytes_per_snp = int(packed.shape[1])
+            packed_bytes = int(packed.nbytes)
         active_rows = int(
             packed_ctx.get(
                 "n_active_sites",
@@ -355,7 +365,6 @@ def _emit_packed_load_debug(
             except Exception:
                 source_rows = packed_rows
         source_rows = int(max(packed_rows, source_rows, active_rows))
-        packed_bytes = int(packed.nbytes)
         source_bed_payload_bytes = int(source_rows * bytes_per_snp)
         dropped_rows = int(max(0, source_rows - active_rows))
         label_txt = str(label).strip()
@@ -392,13 +401,23 @@ def _packed_ctx_active_rows(packed_ctx: dict[str, typing.Any]) -> int:
             np.asarray(
                 packed_ctx.get(
                     "active_row_idx",
-                    np.arange(int(np.asarray(packed_ctx["packed"]).shape[0]), dtype=np.int64),
+                    np.arange(
+                        int(
+                            np.asarray(
+                                packed_ctx.get(
+                                    "packed",
+                                    np.asarray(packed_ctx.get("maf", np.asarray([], dtype=np.float32))),
+                                )
+                            ).shape[0]
+                        ),
+                        dtype=np.int64,
+                    ),
                 ),
                 dtype=np.int64,
             ).reshape(-1).shape[0]
         )
     except Exception:
-        return int(np.asarray(packed_ctx["packed"]).shape[0])
+        return int(np.asarray(packed_ctx.get("maf", np.asarray([], dtype=np.float32))).shape[0])
 
 
 def _packed_ctx_active_row_idx(packed_ctx: dict[str, typing.Any]) -> np.ndarray:
@@ -421,8 +440,42 @@ def _packed_ctx_active_row_idx(packed_ctx: dict[str, typing.Any]) -> np.ndarray:
     return np.ascontiguousarray(np.arange(m, dtype=np.int64), dtype=np.int64)
 
 
+def _packed_ctx_dom_af(packed_ctx: dict[str, typing.Any]) -> np.ndarray:
+    dom_raw = packed_ctx.get("dom_af", packed_ctx.get("het_rate", None))
+    if dom_raw is None:
+        raise ValueError(
+            "Packed context is missing dominance AF metadata (`dom_af`). "
+            "Rebuild the packed context with the current JanusX loader."
+        )
+    dom_full = np.ascontiguousarray(
+        np.asarray(dom_raw, dtype=np.float32).reshape(-1),
+        dtype=np.float32,
+    )
+    active_row_idx = _packed_ctx_active_row_idx(packed_ctx)
+    packed_raw = packed_ctx.get("packed", None)
+    compact_from_active = bool(
+        _packed_ctx_is_lazy_full(packed_ctx)
+        or ((packed_raw is None) and (int(dom_full.shape[0]) != int(active_row_idx.shape[0])))
+    )
+    if compact_from_active:
+        active_max = int(np.max(active_row_idx)) if int(active_row_idx.shape[0]) > 0 else -1
+        if int(dom_full.shape[0]) <= active_max:
+            raise ValueError("Packed context dom_af length is inconsistent with active_row_idx.")
+        return np.ascontiguousarray(dom_full[active_row_idx], dtype=np.float32)
+    return dom_full
+
+
 def _packed_ctx_is_lazy_full(packed_ctx: dict[str, typing.Any]) -> bool:
     return str(packed_ctx.get("packed_filter_mode", "")).strip().lower() == "lazy_full"
+
+
+def _looks_like_packed_ctx(obj: typing.Any) -> bool:
+    return (
+        isinstance(obj, dict)
+        and ("n_samples" in obj)
+        and ("maf" in obj)
+        and (("packed" in obj) or ("source_prefix" in obj))
+    )
 
 
 def _normalize_he_thread_policy_name(
@@ -1253,24 +1306,69 @@ def _build_method_effect_table(
 
     packed_local = (
         typing.cast(dict[str, typing.Any], packed_ctx)
-        if _looks_like_packed_payload(packed_ctx)
+        if _looks_like_packed_ctx(packed_ctx)
         else None
     )
 
     if packed_local is not None:
+        active_row_idx = _packed_ctx_active_row_idx(packed_local)
+        packed_raw = packed_local.get("packed", None)
+        compact_from_active = False
+        active_row_idx_max = int(np.max(active_row_idx)) if int(active_row_idx.shape[0]) > 0 else -1
         try:
-            maf_vec = np.ascontiguousarray(
-                np.asarray(packed_local.get("maf", np.zeros((0,), dtype=np.float32)), dtype=np.float64).reshape(-1),
+            maf_full = np.ascontiguousarray(
+                np.asarray(
+                    packed_local.get("maf", np.zeros((0,), dtype=np.float32)),
+                    dtype=np.float64,
+                ).reshape(-1),
                 dtype=np.float64,
             )
-        except Exception:
+            compact_from_active = bool(
+                _packed_ctx_is_lazy_full(packed_local)
+                or (
+                    (packed_raw is None)
+                    and (int(maf_full.shape[0]) != int(active_row_idx.shape[0]))
+                )
+            )
+            if compact_from_active:
+                if int(maf_full.shape[0]) > active_row_idx_max:
+                    maf_vec = np.ascontiguousarray(
+                        np.asarray(maf_full[active_row_idx], dtype=np.float64).reshape(-1),
+                        dtype=np.float64,
+                    )
+                else:
+                    notes.append("maf length shorter than active_row_idx; skipped active-row subsetting")
+                    maf_vec = maf_full
+            else:
+                maf_vec = maf_full
+        except Exception as ex:
+            notes.append(f"maf metadata unavailable: {ex}")
             maf_vec = np.zeros((0,), dtype=np.float64)
         try:
-            row_flip = np.ascontiguousarray(
-                np.asarray(packed_local.get("row_flip", np.zeros((0,), dtype=np.bool_)), dtype=np.bool_).reshape(-1),
-                dtype=np.bool_,
-            )
-        except Exception:
+            row_flip_raw = packed_local.get("row_flip", None)
+            if row_flip_raw is not None:
+                row_flip_full = np.ascontiguousarray(
+                    np.asarray(row_flip_raw, dtype=np.bool_).reshape(-1),
+                    dtype=np.bool_,
+                )
+            elif packed_raw is not None:
+                row_flip_full = _ensure_packed_row_flip_cached(packed_local)
+            else:
+                row_flip_full = np.zeros((0,), dtype=np.bool_)
+            if int(row_flip_full.shape[0]) > 0:
+                if compact_from_active and int(row_flip_full.shape[0]) != int(active_row_idx.shape[0]):
+                    if int(row_flip_full.shape[0]) > active_row_idx_max:
+                        row_flip = np.ascontiguousarray(
+                            np.asarray(row_flip_full[active_row_idx], dtype=np.bool_).reshape(-1),
+                            dtype=np.bool_,
+                        )
+                    else:
+                        notes.append("row_flip length shorter than active_row_idx; skipped active-row subsetting")
+                        row_flip = row_flip_full
+                else:
+                    row_flip = row_flip_full
+        except Exception as ex:
+            notes.append(f"row_flip metadata unavailable: {ex}")
             row_flip = np.zeros((0,), dtype=np.bool_)
 
     prefix_candidates: list[str] = []
@@ -1290,6 +1388,7 @@ def _build_method_effect_table(
             metadata_source = str(cand)
             if packed_local is not None:
                 site_keep_raw = packed_local.get("site_keep", None)
+                active_row_idx = _packed_ctx_active_row_idx(packed_local)
                 if site_keep_raw is not None:
                     site_keep = np.ascontiguousarray(
                         np.asarray(site_keep_raw, dtype=np.bool_).reshape(-1),
@@ -1302,6 +1401,49 @@ def _build_method_effect_table(
                         allele1_meta = np.asarray(allele1_meta[site_keep], dtype=object)
                     else:
                         notes.append("site_keep length mismatch with BIM rows; skipped site_keep alignment")
+                elif (
+                    int(active_row_idx.shape[0]) > 0
+                    and int(active_row_idx.shape[0]) < int(chrom_meta.shape[0])
+                ):
+                    if active_row_idx_max < int(chrom_meta.shape[0]):
+                        chrom_meta = np.asarray(chrom_meta[active_row_idx], dtype=object)
+                        pos_meta = np.asarray(pos_meta[active_row_idx], dtype=np.int64)
+                        allele0_meta = np.asarray(allele0_meta[active_row_idx], dtype=object)
+                        allele1_meta = np.asarray(allele1_meta[active_row_idx], dtype=object)
+                    else:
+                        notes.append("active_row_idx exceeds BIM rows; skipped active-row alignment")
+                maf_meta = maf_vec
+                if int(maf_meta.shape[0]) != int(chrom_meta.shape[0]):
+                    if site_keep_raw is not None:
+                        site_keep = np.ascontiguousarray(
+                            np.asarray(site_keep_raw, dtype=np.bool_).reshape(-1),
+                            dtype=np.bool_,
+                        )
+                        if int(maf_meta.shape[0]) == int(site_keep.shape[0]):
+                            maf_meta = np.ascontiguousarray(maf_meta[site_keep], dtype=np.float64)
+                    elif (
+                        int(maf_meta.shape[0]) > active_row_idx_max
+                        and int(active_row_idx.shape[0]) == int(chrom_meta.shape[0])
+                    ):
+                        maf_meta = np.ascontiguousarray(maf_meta[active_row_idx], dtype=np.float64)
+                maf_vec = maf_meta
+
+                row_flip_meta = row_flip
+                if int(row_flip_meta.shape[0]) != int(chrom_meta.shape[0]):
+                    if site_keep_raw is not None:
+                        site_keep = np.ascontiguousarray(
+                            np.asarray(site_keep_raw, dtype=np.bool_).reshape(-1),
+                            dtype=np.bool_,
+                        )
+                        if int(row_flip_meta.shape[0]) == int(site_keep.shape[0]):
+                            row_flip_meta = np.ascontiguousarray(row_flip_meta[site_keep], dtype=np.bool_)
+                    elif (
+                        int(row_flip_meta.shape[0]) > active_row_idx_max
+                        and int(active_row_idx.shape[0]) == int(chrom_meta.shape[0])
+                    ):
+                        row_flip_meta = np.ascontiguousarray(row_flip_meta[active_row_idx], dtype=np.bool_)
+                row_flip = row_flip_meta
+
                 if int(row_flip.shape[0]) == int(chrom_meta.shape[0]) and int(row_flip.shape[0]) > 0:
                     swap = np.asarray(row_flip, dtype=np.bool_)
                     if np.any(swap):
@@ -1784,36 +1926,83 @@ def _decode_packed_subset_to_dense_raw_f32(
     packed_ctx: dict[str, typing.Any],
     sample_indices: np.ndarray,
 ) -> np.ndarray:
-    if _jxrs is None or (not hasattr(_jxrs, "bed_packed_decode_rows_f32")):
+    if _jxrs is None or (
+        (not hasattr(_jxrs, "bed_packed_decode_rows_f32"))
+        and (not hasattr(_jxrs, "bed_decode_rows_f32_from_meta"))
+    ):
         raise RuntimeError(
             "Rust packed BED decode helper is unavailable. Rebuild/install JanusX extension."
         )
-    packed = np.ascontiguousarray(np.asarray(packed_ctx["packed"], dtype=np.uint8), dtype=np.uint8)
-    maf = np.ascontiguousarray(np.asarray(packed_ctx["maf"], dtype=np.float32).reshape(-1), dtype=np.float32)
+    packed_raw = packed_ctx.get("packed", None)
+    maf_full = np.ascontiguousarray(
+        np.asarray(packed_ctx["maf"], dtype=np.float32).reshape(-1),
+        dtype=np.float32,
+    )
     n_samples = int(packed_ctx["n_samples"])
-    if packed.ndim != 2:
-        raise ValueError("Invalid packed payload: packed must be 2D.")
-    if int(maf.shape[0]) != int(packed.shape[0]):
-        raise ValueError("Packed payload mismatch: maf length does not match packed SNP rows.")
     sidx = np.ascontiguousarray(np.asarray(sample_indices, dtype=np.int64).reshape(-1), dtype=np.int64)
+    active_row_idx = _packed_ctx_active_row_idx(packed_ctx)
+    compact_from_active = bool(
+        _packed_ctx_is_lazy_full(packed_ctx)
+        or ((packed_raw is None) and (int(maf_full.shape[0]) != int(active_row_idx.shape[0])))
+    )
+    if compact_from_active:
+        maf = np.ascontiguousarray(maf_full[active_row_idx], dtype=np.float32)
+        ridx_decode = np.ascontiguousarray(active_row_idx, dtype=np.int64)
+    else:
+        maf = maf_full
+        ridx_decode = np.ascontiguousarray(np.arange(int(maf.shape[0]), dtype=np.int64), dtype=np.int64)
+    m = int(maf.shape[0])
     if int(sidx.size) == 0:
-        return np.zeros((int(packed.shape[0]), 0), dtype=np.float32)
+        return np.zeros((m, 0), dtype=np.float32)
     if np.any(sidx < 0) or np.any(sidx >= int(n_samples)):
         raise ValueError("Packed sample_indices are out of range.")
-    ridx = np.ascontiguousarray(np.arange(int(packed.shape[0]), dtype=np.int64), dtype=np.int64)
-    row_flip = _ensure_packed_row_flip_cached(packed_ctx)
-    decoded = _jxrs.bed_packed_decode_rows_f32(  # type: ignore[union-attr]
-        packed,
-        int(n_samples),
-        ridx,
-        row_flip,
-        maf,
-        sidx,
-    )
+    row_flip_full = _ensure_packed_row_flip_cached(packed_ctx)
+    if compact_from_active:
+        row_flip = np.ascontiguousarray(row_flip_full[active_row_idx], dtype=np.bool_)
+    else:
+        row_flip = row_flip_full
+    if int(row_flip.shape[0]) != m:
+        raise ValueError("Packed payload mismatch: row_flip length does not match active rows.")
+    if packed_raw is not None:
+        packed = np.ascontiguousarray(np.asarray(packed_raw, dtype=np.uint8), dtype=np.uint8)
+        if packed.ndim != 2:
+            raise ValueError("Invalid packed payload: packed must be 2D.")
+        decoded = _jxrs.bed_packed_decode_rows_f32(  # type: ignore[union-attr]
+            packed,
+            int(n_samples),
+            ridx_decode,
+            row_flip,
+            maf,
+            sidx,
+        )
+    else:
+        source_prefix_raw = packed_ctx.get("source_prefix", None)
+        if source_prefix_raw is None or str(source_prefix_raw).strip() == "":
+            raise ValueError(
+                "Streaming packed context requires source_prefix when packed rows are deferred."
+            )
+        decoded = _jxrs.bed_decode_rows_f32_from_meta(  # type: ignore[union-attr]
+            str(source_prefix_raw),
+            ridx_decode,
+            row_flip,
+            maf,
+            sidx,
+        )
     dense = np.ascontiguousarray(np.asarray(decoded, dtype=np.float32), dtype=np.float32)
-    if dense.ndim != 2 or int(dense.shape[0]) != int(packed.shape[0]):
+    if dense.ndim != 2 or int(dense.shape[0]) != m:
         raise ValueError(f"Packed subset decode returned invalid shape: {dense.shape}")
     return dense
+
+
+def _estimate_dense_f32_bytes(
+    n_rows: int,
+    n_cols: int,
+    *,
+    copies: int = 1,
+) -> int:
+    rows = max(0, int(n_rows))
+    cols = max(0, int(n_cols))
+    return int(rows * cols * np.dtype(np.float32).itemsize * max(1, int(copies)))
 
 
 def _build_memmap_cache_from_chunks(
@@ -1952,6 +2141,98 @@ def _env_truthy(name: str, default: str = "0") -> bool:
 
 
 _GS_DEBUG_STAGE = _env_truthy("JX_GS_DEBUG_STAGE", "0")
+
+
+def _normalize_memory_gb(memory_gb: float | int | None) -> float:
+    if memory_gb is None:
+        return 1.0
+    gb = float(memory_gb)
+    if (not np.isfinite(gb)) or gb <= 0.0:
+        raise ValueError(f"--memory must be a finite value > 0 GB, got {memory_gb}")
+    return float(gb)
+
+
+def _memory_gb_to_mb(memory_gb: float | int | None) -> float:
+    return float(_normalize_memory_gb(memory_gb) * 1024.0)
+
+
+def _calc_stream_block_rows(
+    *,
+    n_samples: int,
+    memory_gb: float | int | None,
+    elem_bytes: int,
+    buffers: int,
+    min_rows: int = 1,
+) -> int:
+    rows = calc_decode_block_rows_from_memory_mb(
+        int(max(1, int(n_samples))),
+        float(_memory_gb_to_mb(memory_gb)),
+        elem_bytes=int(max(1, int(elem_bytes))),
+        buffers=int(max(1, int(buffers))),
+        min_rows=int(max(1, int(min_rows))),
+    )
+    return int(max(1, int(1 if rows is None else rows)))
+
+
+def _stream_window_mb_from_block_rows(
+    *,
+    n_samples: int,
+    block_rows: int,
+) -> int:
+    bytes_per_snp = max(1, (int(n_samples) + 3) // 4)
+    return int(
+        max(
+            1,
+            (int(max(1, int(block_rows))) * bytes_per_snp + (1024 * 1024 - 1))
+            // (1024 * 1024),
+        )
+    )
+
+
+def _attach_stream_decode_budget_to_packed_ctx(
+    *,
+    packed_ctx: dict[str, typing.Any] | None,
+    memory_gb: float | int | None,
+    debug: bool = False,
+    logger: logging.Logger | None = None,
+) -> None:
+    if not _looks_like_packed_ctx(packed_ctx):
+        return
+    ctx = typing.cast(dict[str, typing.Any], packed_ctx)
+    n_samples = int(ctx.get("n_samples", 0))
+    if n_samples <= 0:
+        return
+
+    gblup_rows = _calc_stream_block_rows(
+        n_samples=n_samples,
+        memory_gb=memory_gb,
+        elem_bytes=4,
+        buffers=2,
+    )
+    ctx["__gblup_grm_block_rows__"] = int(gblup_rows)
+    ctx["__gblup_grm_window_mb__"] = int(
+        _stream_window_mb_from_block_rows(n_samples=n_samples, block_rows=gblup_rows)
+    )
+
+    bayes_rows = _calc_stream_block_rows(
+        n_samples=n_samples,
+        memory_gb=memory_gb,
+        elem_bytes=8,
+        buffers=2,
+    )
+    ctx["__bayes_stream_block_rows__"] = int(bayes_rows)
+    ctx["__bayes_stream_window_mb__"] = int(
+        _stream_window_mb_from_block_rows(n_samples=n_samples, block_rows=bayes_rows)
+    )
+
+    if debug and (logger is not None):
+        logger.info(
+            "[GS-DEBUG] packed decode budget "
+            f"memory_gb={float(_normalize_memory_gb(memory_gb)):.6g} "
+            f"n_samples={n_samples} "
+            f"gblup_block_rows={int(gblup_rows)} "
+            f"bayes_block_rows={int(bayes_rows)}"
+        )
 
 
 def _parse_positive_env_int(name: str) -> int | None:
@@ -2636,27 +2917,50 @@ def _resolve_train_pred_local_indices(
     return np.ascontiguousarray(picked, dtype=np.int64)
 
 
+def _dense_marker_matrix_for_gblup_kernel(
+    marker_by_sample: np.ndarray,
+    *,
+    kernel_mode: str,
+) -> np.ndarray:
+    mat = np.ascontiguousarray(
+        np.asarray(marker_by_sample, dtype=np.float32),
+        dtype=np.float32,
+    )
+    mode = str(kernel_mode).strip().lower()
+    if mode in {"d", "dom", "dominance"}:
+        return np.ascontiguousarray(mat == 1.0, dtype=np.float32)
+    return mat
+
+
 def _build_gblup_cv_grm_once(
     *,
     train_snp: np.ndarray | None,
     packed_ctx: dict[str, typing.Any] | None,
     train_sample_indices: np.ndarray | None,
     n_jobs: int,
+    kernel_mode: str = "a",
 ) -> np.ndarray | None:
     """
     Build one GRM for GBLUP-CV and reuse it by slicing in each fold.
     """
+    mode_norm = str(kernel_mode).strip().lower()
+    mode_is_dom = bool(mode_norm in {"d", "dom", "dominance"})
     if packed_ctx is not None:
         if train_sample_indices is None:
             raise ValueError("Packed GBLUP-CV requires train sample indices.")
         if _jxrs is None:
             return None
+        can_build_stream_f64 = bool(
+            hasattr(_jxrs, "grm_bed_f64_from_meta")
+            and (str(packed_ctx.get("source_prefix", "") or "").strip() != "")
+        )
         can_build_f32 = bool(
             hasattr(_jxrs, "grm_packed_f32")
             and hasattr(_jxrs, "bed_packed_row_flip_mask")
+            and (not mode_is_dom)
         )
-        can_build_stable_f64 = bool(stable_grm_builder_available())
-        if (not can_build_f32) and (not can_build_stable_f64):
+        can_build_stable_f64 = bool((not mode_is_dom) and stable_grm_builder_available())
+        if (not can_build_stream_f64) and (not can_build_f32) and (not can_build_stable_f64):
             return None
 
         sidx = np.ascontiguousarray(np.asarray(train_sample_indices, dtype=np.int64).reshape(-1))
@@ -2667,11 +2971,53 @@ def _build_gblup_cv_grm_once(
             int(sidx.size) == int(n_samples)
             and np.array_equal(sidx, np.arange(n_samples, dtype=np.int64))
         )
-        block_cols = max(1, min(4096, int(sidx.size) if sidx.size > 0 else int(n_samples)))
+        block_cols = int(
+            max(
+                1,
+                int(
+                    packed_ctx.get(
+                        "__gblup_grm_block_rows__",
+                        min(4096, int(sidx.size) if sidx.size > 0 else int(n_samples)),
+                    )
+                ),
+            )
+        )
 
         grm = None
 
-        if can_build_f32:
+        if can_build_stream_f64:
+            try:
+                (
+                    source_prefix,
+                    _site_keep_arg,
+                    row_source_indices_arg,
+                    row_flip_arg,
+                    row_maf_arg,
+                    gblup_mmap_window_mb,
+                ) = _packed_gblup_stream_metadata(
+                    packed_ctx,
+                    mode=mode_norm,
+                    block_rows=int(block_cols),
+                )
+                sidx_arg = None if full_identity else sidx
+                grm_raw = _jxrs.grm_bed_f64_from_meta(
+                    source_prefix,
+                    row_source_indices_arg,
+                    row_flip_arg,
+                    row_maf_arg,
+                    sample_indices=sidx_arg,
+                    method=(3 if mode_is_dom else 1),
+                    block_cols=int(block_cols),
+                    threads=max(1, int(n_jobs)),
+                    progress_callback=None,
+                    progress_every=0,
+                    mmap_window_mb=int(gblup_mmap_window_mb),
+                )
+                grm = np.asarray(grm_raw, dtype=np.float64)
+            except Exception:
+                grm = None
+
+        if grm is None and can_build_f32 and ("packed" in packed_ctx):
             packed = np.ascontiguousarray(np.asarray(packed_ctx["packed"], dtype=np.uint8))
             maf = np.ascontiguousarray(np.asarray(packed_ctx["maf"], dtype=np.float32).reshape(-1))
             if packed.ndim != 2:
@@ -2738,8 +3084,12 @@ def _build_gblup_cv_grm_once(
     else:
         if train_snp is None:
             return None
-        grm = build_dense_grm_f64(
+        train_marker = _dense_marker_matrix_for_gblup_kernel(
             np.asarray(train_snp, dtype=np.float32),
+            kernel_mode=mode_norm,
+        )
+        grm = build_dense_grm_f64(
+            train_marker,
             block_rows=4096,
         )
 
@@ -2747,6 +3097,88 @@ def _build_gblup_cv_grm_once(
         raise ValueError(f"GBLUP CV GRM must be square; got shape={grm.shape}.")
     grm = 0.5 * (grm + grm.T)
     return np.ascontiguousarray(grm, dtype=np.float64)
+
+
+def _build_gblup_kinship_blocks_once(
+    *,
+    train_snp: np.ndarray | None,
+    test_snp: np.ndarray | None,
+    packed_ctx: dict[str, typing.Any] | None,
+    train_sample_indices: np.ndarray | None,
+    test_sample_indices: np.ndarray | None,
+    n_jobs: int,
+    kernel_mode: str = "a",
+) -> tuple[np.ndarray | None, np.ndarray | None]:
+    mode_norm = str(kernel_mode).strip().lower()
+    if packed_ctx is not None:
+        if train_sample_indices is None:
+            raise ValueError("Packed GBLUP prebuild requires train sample indices.")
+        train_abs = np.ascontiguousarray(
+            np.asarray(train_sample_indices, dtype=np.int64).reshape(-1),
+            dtype=np.int64,
+        )
+        if test_sample_indices is not None and int(np.asarray(test_sample_indices).size) > 0:
+            test_abs = np.ascontiguousarray(
+                np.asarray(test_sample_indices, dtype=np.int64).reshape(-1),
+                dtype=np.int64,
+            )
+            all_abs = np.ascontiguousarray(
+                np.concatenate([train_abs, test_abs]).astype(np.int64, copy=False),
+                dtype=np.int64,
+            )
+            full_grm = _build_gblup_cv_grm_once(
+                train_snp=None,
+                packed_ctx=packed_ctx,
+                train_sample_indices=all_abs,
+                n_jobs=n_jobs,
+                kernel_mode=mode_norm,
+            )
+            if full_grm is None:
+                return None, None
+            n_train = int(train_abs.shape[0])
+            train_grm = np.ascontiguousarray(
+                np.asarray(full_grm[:n_train, :n_train], dtype=np.float64),
+                dtype=np.float64,
+            )
+            test_train_grm = np.ascontiguousarray(
+                np.asarray(full_grm[n_train:, :n_train], dtype=np.float64),
+                dtype=np.float64,
+            )
+            return train_grm, test_train_grm
+
+        train_grm = _build_gblup_cv_grm_once(
+            train_snp=None,
+            packed_ctx=packed_ctx,
+            train_sample_indices=train_abs,
+            n_jobs=n_jobs,
+            kernel_mode=mode_norm,
+        )
+        return train_grm, None
+
+    train_grm = _build_gblup_cv_grm_once(
+        train_snp=train_snp,
+        packed_ctx=None,
+        train_sample_indices=None,
+        n_jobs=n_jobs,
+        kernel_mode=mode_norm,
+    )
+    if train_grm is None:
+        return None, None
+    test_train_grm = None
+    if test_snp is not None and int(test_snp.shape[1]) > 0 and train_snp is not None:
+        train_marker = _dense_marker_matrix_for_gblup_kernel(
+            np.asarray(train_snp, dtype=np.float32),
+            kernel_mode=mode_norm,
+        )
+        test_marker = _dense_marker_matrix_for_gblup_kernel(
+            np.asarray(test_snp, dtype=np.float32),
+            kernel_mode=mode_norm,
+        )
+        test_train_grm = _build_gblup_test_train_cross_from_markers(
+            test_snp=test_marker,
+            train_snp=train_marker,
+        )
+    return train_grm, test_train_grm
 
 
 def _fit_gblup_reml_from_grm(
@@ -2861,6 +3293,105 @@ def _fit_gblup_reml_from_grm(
     }
 
 
+def _fit_gblup_ad_reml_from_grms(
+    y: np.ndarray,
+    grm_add: np.ndarray,
+    grm_dom: np.ndarray,
+) -> dict[str, typing.Any]:
+    if (not _HAS_ADBLUP_PY) or KernelBLUP is None:
+        raise ImportError(
+            "GBLUP(ad) REML/GRM backend is unavailable. "
+            f"Original import error: {_ADBLUP_PY_IMPORT_ERROR}"
+        )
+
+    y_vec = np.asarray(y, dtype=np.float64).reshape(-1, 1)
+    ka = np.asarray(grm_add, dtype=np.float64)
+    kd = np.asarray(grm_dom, dtype=np.float64)
+    if ka.shape != kd.shape or ka.ndim != 2 or ka.shape[0] != ka.shape[1]:
+        raise ValueError(
+            f"GBLUP(ad) expects matching square kernels; got Ka={ka.shape}, Kd={kd.shape}."
+        )
+    if int(y_vec.shape[0]) != int(ka.shape[0]):
+        raise ValueError(
+            f"GBLUP(ad) fit expects y and kernels with matching n. got y={y_vec.shape}, Ka={ka.shape}."
+        )
+
+    n = int(y_vec.shape[0])
+    if n == 0:
+        raise ValueError("GBLUP(ad) fit received empty training set.")
+    if n <= 1:
+        beta0 = float(y_vec[0, 0]) if n == 1 else 0.0
+        return {
+            "model": None,
+            "beta": float(beta0),
+            "vinvr": np.zeros((n,), dtype=np.float64),
+            "g_theta": np.ones((2,), dtype=np.float64),
+            "g_scales": np.ones((2,), dtype=np.float64),
+            "pve": float("nan"),
+            "lambda_reml": float("nan"),
+            "sigma_a2": float("nan"),
+            "sigma_d2": float("nan"),
+            "sigma_e2": float("nan"),
+        }
+
+    ka_fit = np.ascontiguousarray(0.5 * (ka + ka.T), dtype=np.float64)
+    kd_fit = np.ascontiguousarray(0.5 * (kd + kd.T), dtype=np.float64)
+    ka_fit += np.eye(n, dtype=np.float64) * np.float64(1e-6)
+    kd_fit += np.eye(n, dtype=np.float64) * np.float64(1e-6)
+    model = KernelBLUP(y_vec, G=[ka_fit, kd_fit], progress=False)
+
+    beta_fix = np.asarray(
+        getattr(model, "beta", np.asarray([[float(np.mean(y_vec))]], dtype=np.float64)),
+        dtype=np.float64,
+    ).reshape(-1)
+    beta0 = float(beta_fix[0]) if int(beta_fix.size) > 0 else float(np.mean(y_vec))
+    vinvr = np.ascontiguousarray(
+        np.asarray(getattr(model, "_Vinvr", np.zeros((0, 1))), dtype=np.float64).reshape(-1),
+        dtype=np.float64,
+    )
+    g_theta = np.ascontiguousarray(
+        np.asarray(getattr(model, "_g_theta", np.zeros((0,))), dtype=np.float64).reshape(-1),
+        dtype=np.float64,
+    )
+    g_scales = np.ascontiguousarray(
+        np.asarray(getattr(model, "_g_scales", np.ones((0,))), dtype=np.float64).reshape(-1),
+        dtype=np.float64,
+    )
+
+    pve = float("nan")
+    sigma_a2 = float("nan")
+    sigma_d2 = float("nan")
+    sigma_e2 = float("nan")
+    lambda_reml = float("nan")
+    try:
+        var = np.asarray(getattr(model, "var", []), dtype=np.float64).reshape(-1)
+        if int(var.size) >= 3 and np.all(np.isfinite(var[:3])):
+            sigma_a2 = float(var[0])
+            sigma_d2 = float(var[1])
+            sigma_e2 = float(var[2])
+            denom = float(sigma_a2 + sigma_d2 + sigma_e2)
+            if denom > 0.0:
+                pve = float((sigma_a2 + sigma_d2) / denom)
+            vg = float(sigma_a2 + sigma_d2)
+            if vg > 0.0:
+                lambda_reml = float(sigma_e2 / vg)
+    except Exception:
+        pass
+
+    return {
+        "model": model,
+        "beta": float(beta0),
+        "vinvr": vinvr,
+        "g_theta": g_theta,
+        "g_scales": g_scales,
+        "pve": float(pve),
+        "lambda_reml": float(lambda_reml),
+        "sigma_a2": float(sigma_a2),
+        "sigma_d2": float(sigma_d2),
+        "sigma_e2": float(sigma_e2),
+    }
+
+
 def _predict_gblup_from_cross(
     *,
     cross_kernel: np.ndarray,
@@ -2877,6 +3408,103 @@ def _predict_gblup_from_cross(
         )
     out = cross @ a + float(beta)
     return np.asarray(out, dtype=np.float64).reshape(-1, 1)
+
+
+def _predict_gblup_ad_from_cross(
+    *,
+    fit: dict[str, typing.Any],
+    cross_add: np.ndarray,
+    cross_dom: np.ndarray,
+) -> np.ndarray:
+    model = fit.get("model", None)
+    beta0 = float(fit.get("beta", 0.0))
+    ka = np.asarray(cross_add, dtype=np.float64)
+    kd = np.asarray(cross_dom, dtype=np.float64)
+    if ka.shape != kd.shape or ka.ndim != 2:
+        raise ValueError(
+            f"GBLUP(ad) cross-kernel shape mismatch: Ka={ka.shape}, Kd={kd.shape}."
+        )
+    if int(ka.shape[0]) == 0:
+        return np.zeros((0, 1), dtype=np.float64)
+    if model is None:
+        return np.full((int(ka.shape[0]), 1), beta0, dtype=np.float64)
+    pred = model.predict(G=[ka, kd])
+    return np.asarray(pred, dtype=np.float64).reshape(-1, 1)
+
+
+def _kernel_projection_beta_from_backend(
+    *,
+    packed_ctx: dict[str, typing.Any] | None,
+    sample_indices: np.ndarray | None,
+    alpha: np.ndarray,
+    mode: str,
+    coef: float,
+    dense_marker_by_sample: np.ndarray | None,
+    n_jobs: int,
+) -> np.ndarray | None:
+    alpha_vec = np.ascontiguousarray(np.asarray(alpha, dtype=np.float64).reshape(-1), dtype=np.float64)
+    beta_kp: np.ndarray | None = None
+    if (
+        packed_ctx is not None
+        and sample_indices is not None
+        and int(np.asarray(sample_indices).reshape(-1).shape[0]) == int(alpha_vec.shape[0])
+    ):
+        sample_idx_local = np.ascontiguousarray(
+            np.asarray(sample_indices, dtype=np.int64).reshape(-1),
+            dtype=np.int64,
+        )
+        block_rows = int(max(1, int(packed_ctx.get("__gblup_grm_block_rows__", 4096))))
+        if _looks_like_packed_payload(packed_ctx):
+            beta_kp = _kernel_projection_beta_from_packed(
+                packed_ctx=packed_ctx,
+                sample_indices=sample_idx_local,
+                alpha=alpha_vec,
+                mode=mode,
+                coef=float(coef),
+                block_rows=block_rows,
+                threads=max(0, int(n_jobs)),
+            )
+        elif _jxrs is not None and hasattr(_jxrs, "gblup_effect_from_meta_stream"):
+            try:
+                (
+                    source_prefix,
+                    _site_keep_arg,
+                    row_source_indices_arg,
+                    row_flip_arg,
+                    row_maf_arg,
+                    gblup_mmap_window_mb,
+                ) = _packed_gblup_stream_metadata(
+                    packed_ctx,
+                    mode=mode,
+                    block_rows=block_rows,
+                )
+                beta_kp_raw = _jxrs.gblup_effect_from_meta_stream(
+                    source_prefix,
+                    sample_idx_local,
+                    alpha_vec,
+                    row_source_indices_arg,
+                    row_flip_arg,
+                    row_maf_arg,
+                    mode=mode,
+                    block_rows=block_rows,
+                    threads=int(max(0, int(n_jobs))),
+                    mmap_window_mb=int(gblup_mmap_window_mb),
+                )
+                beta_kp = np.ascontiguousarray(
+                    np.asarray(beta_kp_raw, dtype=np.float64).reshape(-1),
+                    dtype=np.float64,
+                )
+                if float(coef) != 1.0:
+                    beta_kp *= float(coef)
+            except Exception:
+                beta_kp = None
+    if beta_kp is None and dense_marker_by_sample is not None:
+        beta_kp = _kernel_projection_beta_from_dense(
+            marker_by_sample=np.asarray(dense_marker_by_sample, dtype=np.float64),
+            alpha=alpha_vec,
+            coef=float(coef),
+        )
+    return beta_kp
 
 
 def _build_gblup_test_train_cross_from_markers(
@@ -3651,18 +4279,6 @@ def _estimate_rrblup_lambda_subsample_reml(
             }
         )
 
-    source_prefix = str(packed_ctx.get("source_prefix", "") or "").strip()
-    site_keep_arg: np.ndarray | None = None
-    site_keep_raw = packed_ctx.get("site_keep", None)
-    if site_keep_raw is not None:
-        site_keep_arr = np.ascontiguousarray(
-            np.asarray(site_keep_raw, dtype=np.bool_).reshape(-1),
-            dtype=np.bool_,
-        )
-        maf_len = int(np.asarray(packed_ctx.get("maf", np.asarray([], dtype=np.float32))).reshape(-1).shape[0])
-        if (maf_len <= 0) or (int(site_keep_arr.shape[0]) == int(maf_len)):
-            site_keep_arg = site_keep_arr
-
     gblup_g_eps = float(max(0.0, float(np.finfo(np.float64).eps)))
     gblup_reml_low = float(cfg_use.get("gblup_reml_low", -6.0))
     gblup_reml_high = float(cfg_use.get("gblup_reml_high", 6.0))
@@ -3679,9 +4295,12 @@ def _estimate_rrblup_lambda_subsample_reml(
         max(
             1,
             int(
-                cfg_use.get(
-                    "gblup_block_rows",
-                    cfg_use.get("pcg_block_rows", cfg_use.get("snp_block_size", 4096)),
+                packed_ctx.get(
+                    "__gblup_grm_block_rows__",
+                    cfg_use.get(
+                        "gblup_block_rows",
+                        cfg_use.get("pcg_block_rows", cfg_use.get("snp_block_size", 4096)),
+                    ),
                 )
             ),
         )
@@ -3689,7 +4308,7 @@ def _estimate_rrblup_lambda_subsample_reml(
     can_use_rust_gblup = bool(
         (_jxrs is not None)
         and hasattr(_jxrs, "gblup_reml_packed_bed")
-        and (source_prefix != "")
+        and (str(packed_ctx.get("source_prefix", "") or "").strip() != "")
     )
 
     def _run_rust_reml(
@@ -3709,6 +4328,23 @@ def _estimate_rrblup_lambda_subsample_reml(
             sub_abs = np.ascontiguousarray(train_abs[local_idx], dtype=np.int64)
             y_sub = np.ascontiguousarray(y_vec[local_idx], dtype=np.float64)
         train_pred_local_empty = np.zeros((0,), dtype=np.int64)
+        (
+            source_prefix,
+            site_keep_arg,
+            row_source_indices_arg,
+            row_flip_arg,
+            row_maf_arg,
+            gblup_mmap_window_mb,
+        ) = _packed_gblup_stream_metadata(
+            packed_ctx,
+            block_rows=int(gblup_block_rows),
+        )
+        gblup_call_kwargs = dict(
+            row_source_indices=row_source_indices_arg,
+            row_flip=row_flip_arg,
+            row_maf=row_maf_arg,
+            mmap_window_mb=int(gblup_mmap_window_mb),
+        )
 
         old_force = os.environ.get("JX_GBLUP_PACKED_FORCE_GRM_EIG", None)
         try:
@@ -3734,6 +4370,8 @@ def _estimate_rrblup_lambda_subsample_reml(
                     int(max(1, int(n_jobs))),
                     True,
                     True,
+                    False,
+                    **gblup_call_kwargs,
                 )
             except TypeError:
                 try:
@@ -3752,6 +4390,7 @@ def _estimate_rrblup_lambda_subsample_reml(
                         int(gblup_block_rows),
                         int(max(1, int(n_jobs))),
                         True,
+                        **gblup_call_kwargs,
                     )
                 except TypeError:
                     g_out = _jxrs.gblup_reml_packed_bed(  # type: ignore[union-attr]
@@ -3768,6 +4407,7 @@ def _estimate_rrblup_lambda_subsample_reml(
                         float(gblup_reml_tol),
                         int(gblup_block_rows),
                         int(max(1, int(n_jobs))),
+                        **gblup_call_kwargs,
                     )
         finally:
             if old_force is None:
@@ -4166,7 +4806,7 @@ def _estimate_bayes_auto_r2_from_blup(
     repeats = int(min(20, max(5, rep_cfg)))
     sub_seed = int(cfg_use.get("subsample_seed", 42))
 
-    is_packed = _looks_like_packed_payload(Xtrain)
+    is_packed = _looks_like_packed_ctx(Xtrain)
     packed_train: dict[str, typing.Any] | None = None
     base_abs: np.ndarray | None = None
     dense: np.ndarray | None = None
@@ -4213,6 +4853,52 @@ def _estimate_bayes_auto_r2_from_blup(
                 if local_idx is None
                 else np.ascontiguousarray(base_abs[local_idx], dtype=np.int64)
             )
+            source_prefix_raw = packed_train.get("source_prefix", None)
+            can_use_rust_gblup = bool(
+                (_jxrs is not None)
+                and hasattr(_jxrs, "gblup_reml_packed_bed")
+                and (source_prefix_raw is not None)
+                and (str(source_prefix_raw).strip() != "")
+            )
+            if can_use_rust_gblup:
+                block_rows = _parse_nonnegative_int(
+                    os.getenv("JX_GBLUP_PACKED_BLOCK_ROWS", "4096")
+                )
+                block_rows = int(max(1, int(4096 if block_rows is None else block_rows)))
+                (
+                    source_prefix,
+                    site_keep_arg,
+                    row_source_indices_arg,
+                    row_flip_arg,
+                    row_maf_arg,
+                    gblup_mmap_window_mb,
+                ) = _packed_gblup_stream_metadata(
+                    packed_train,
+                    block_rows=int(block_rows),
+                )
+                gout = _jxrs.gblup_reml_packed_bed(  # type: ignore[union-attr]
+                    source_prefix,
+                    np.ascontiguousarray(np.asarray(fit_abs, dtype=np.int64).reshape(-1), dtype=np.int64),
+                    np.ascontiguousarray(np.asarray(y_fit, dtype=np.float64).reshape(-1), dtype=np.float64),
+                    None,
+                    np.zeros((0,), dtype=np.int64),
+                    site_keep_arg,
+                    float(max(0.0, float(np.finfo(np.float64).eps))),
+                    -6.0,
+                    6.0,
+                    50,
+                    1e-4,
+                    int(block_rows),
+                    1,
+                    False,
+                    True,
+                    False,
+                    row_source_indices=row_source_indices_arg,
+                    row_flip=row_flip_arg,
+                    row_maf=row_maf_arg,
+                    mmap_window_mb=int(gblup_mmap_window_mb),
+                )
+                return float(tuple(gout)[2])
             model = MLMBLUP(y_fit, packed_train, kinship=1, sample_indices=fit_abs)
         else:
             assert dense is not None
@@ -4356,9 +5042,9 @@ def _ensure_packed_row_flip_cached(
     packed_ctx: dict[str, typing.Any],
 ) -> np.ndarray:
     row_flip_raw = packed_ctx.get("row_flip", None)
-    packed = np.ascontiguousarray(np.asarray(packed_ctx["packed"], dtype=np.uint8))
-    n_samples = int(packed_ctx["n_samples"])
     if row_flip_raw is None:
+        packed = np.ascontiguousarray(np.asarray(packed_ctx["packed"], dtype=np.uint8))
+        n_samples = int(packed_ctx["n_samples"])
         if _jxrs is None or (not hasattr(_jxrs, "bed_packed_row_flip_mask")):
             raise RuntimeError(
                 "Rust packed row-flip kernel is unavailable. Rebuild/install JanusX extension."
@@ -4374,11 +5060,122 @@ def _ensure_packed_row_flip_cached(
             np.asarray(row_flip_raw, dtype=np.bool_).reshape(-1),
             dtype=np.bool_,
         )
-    if int(row_flip.shape[0]) != int(packed.shape[0]):
+    packed_raw = packed_ctx.get("packed", None)
+    if packed_raw is not None:
+        packed = np.ascontiguousarray(np.asarray(packed_raw, dtype=np.uint8))
+        expected_rows = int(packed.shape[0])
+    else:
+        expected_rows = int(
+            np.asarray(packed_ctx.get("maf", np.asarray([], dtype=np.float32))).reshape(-1).shape[0]
+        )
+    if int(row_flip.shape[0]) != int(expected_rows):
         raise ValueError(
             "Packed payload mismatch: row_flip length does not match packed SNP rows."
         )
     return row_flip
+
+
+def _packed_gblup_stream_metadata(
+    packed_ctx: dict[str, typing.Any],
+    *,
+    mode: str = "a",
+    block_rows: int,
+) -> tuple[str, np.ndarray | None, np.ndarray, np.ndarray, np.ndarray, int]:
+    source_prefix_raw = packed_ctx.get("source_prefix", None)
+    if source_prefix_raw is None or str(source_prefix_raw).strip() == "":
+        raise ValueError("Packed GBLUP Rust backend requires source PLINK prefix in packed context.")
+    source_prefix = str(source_prefix_raw)
+
+    site_keep_arg: np.ndarray | None = None
+    site_keep_raw = packed_ctx.get("site_keep", None)
+    if site_keep_raw is not None:
+        site_keep_arg = np.ascontiguousarray(
+            np.asarray(site_keep_raw, dtype=np.bool_).reshape(-1),
+            dtype=np.bool_,
+        )
+
+    active_row_idx = _packed_ctx_active_row_idx(packed_ctx)
+    mode_norm = str(mode).strip().lower()
+    mode_is_dom = bool(mode_norm in {"d", "dom", "dominance"})
+    row_flip_full = (
+        np.zeros((int(active_row_idx.shape[0]),), dtype=np.bool_)
+        if mode_is_dom
+        else _ensure_packed_row_flip_cached(packed_ctx)
+    )
+    maf_full = (
+        _packed_ctx_dom_af(packed_ctx)
+        if mode_is_dom
+        else np.ascontiguousarray(
+            np.asarray(packed_ctx["maf"], dtype=np.float32).reshape(-1),
+            dtype=np.float32,
+        )
+    )
+    packed_raw = packed_ctx.get("packed", None)
+    compact_from_active = bool(
+        _packed_ctx_is_lazy_full(packed_ctx)
+        or (
+            (packed_raw is None)
+            and (int(maf_full.shape[0]) != int(active_row_idx.shape[0]))
+        )
+    )
+    if compact_from_active:
+        if mode_is_dom:
+            row_flip_arg = np.zeros((int(active_row_idx.shape[0]),), dtype=np.bool_)
+            row_maf_arg = np.ascontiguousarray(
+                np.asarray(maf_full, dtype=np.float32).reshape(-1),
+                dtype=np.float32,
+            )
+        else:
+            row_flip_arg = np.ascontiguousarray(
+                np.asarray(row_flip_full[active_row_idx], dtype=np.bool_).reshape(-1),
+                dtype=np.bool_,
+            )
+            row_maf_arg = np.ascontiguousarray(
+                np.asarray(maf_full[active_row_idx], dtype=np.float32).reshape(-1),
+                dtype=np.float32,
+            )
+    else:
+        row_flip_arg = np.ascontiguousarray(
+            np.asarray(row_flip_full, dtype=np.bool_).reshape(-1),
+            dtype=np.bool_,
+        )
+        row_maf_arg = np.ascontiguousarray(
+            np.asarray(maf_full, dtype=np.float32).reshape(-1),
+            dtype=np.float32,
+        )
+    row_source_indices_arg = np.ascontiguousarray(
+        np.asarray(active_row_idx, dtype=np.int64).reshape(-1),
+        dtype=np.int64,
+    )
+    block_rows_eff = int(
+        max(
+            1,
+            int(packed_ctx.get("__gblup_grm_block_rows__", block_rows)),
+        )
+    )
+    mmap_window_override = packed_ctx.get("__gblup_grm_window_mb__", None)
+    if mmap_window_override is None:
+        mmap_window_mb = int(
+            max(
+                1,
+                (
+                    block_rows_eff
+                    * int(max(1, int(packed_ctx["n_samples"] + 3) // 4))
+                    + (1024 * 1024 - 1)
+                )
+                // (1024 * 1024),
+            )
+        )
+    else:
+        mmap_window_mb = int(max(1, int(mmap_window_override)))
+    return (
+        source_prefix,
+        site_keep_arg,
+        row_source_indices_arg,
+        row_flip_arg,
+        row_maf_arg,
+        mmap_window_mb,
+    )
 
 
 def _decode_packed_block_standardized(
@@ -4389,29 +5186,60 @@ def _decode_packed_block_standardized(
     row_mean: np.ndarray,
     row_inv_sd: np.ndarray,
 ) -> np.ndarray:
-    if _jxrs is None or (not hasattr(_jxrs, "bed_packed_decode_rows_f32")):
+    if _jxrs is None or (
+        (not hasattr(_jxrs, "bed_packed_decode_rows_f32"))
+        and (not hasattr(_jxrs, "bed_decode_rows_f32_from_meta"))
+    ):
         raise RuntimeError(
             "Rust packed BED decode helper is unavailable. Rebuild/install JanusX extension."
         )
-    packed = np.ascontiguousarray(np.asarray(packed_ctx["packed"], dtype=np.uint8))
-    maf = np.ascontiguousarray(np.asarray(packed_ctx["maf"], dtype=np.float32).reshape(-1))
-    n_samples = int(packed_ctx["n_samples"])
-    row_flip = _ensure_packed_row_flip_cached(packed_ctx)
+    packed_raw = packed_ctx.get("packed", None)
+    maf_full = np.ascontiguousarray(np.asarray(packed_ctx["maf"], dtype=np.float32).reshape(-1))
+    row_flip_full = _ensure_packed_row_flip_cached(packed_ctx)
     ridx = np.ascontiguousarray(np.asarray(row_idx, dtype=np.int64).reshape(-1))
-    if _packed_ctx_is_lazy_full(packed_ctx):
-        active_row_idx = _packed_ctx_active_row_idx(packed_ctx)
+    active_row_idx = _packed_ctx_active_row_idx(packed_ctx)
+    compact_from_active = bool(
+        _packed_ctx_is_lazy_full(packed_ctx)
+        or ((packed_raw is None) and (int(maf_full.shape[0]) != int(active_row_idx.shape[0])))
+    )
+    if compact_from_active:
+        maf = np.ascontiguousarray(maf_full[active_row_idx], dtype=np.float32)
+        row_flip = np.ascontiguousarray(row_flip_full[active_row_idx], dtype=np.bool_)
         ridx_decode = np.ascontiguousarray(active_row_idx[ridx], dtype=np.int64)
     else:
+        maf = maf_full
+        row_flip = row_flip_full
         ridx_decode = ridx
     sidx = np.ascontiguousarray(np.asarray(sample_indices, dtype=np.int64).reshape(-1))
-    blk = _jxrs.bed_packed_decode_rows_f32(
-        packed,
-        int(n_samples),
-        ridx_decode,
-        row_flip,
-        maf,
-        sidx,
-    )
+    if packed_raw is not None:
+        packed = np.ascontiguousarray(np.asarray(packed_raw, dtype=np.uint8))
+        n_samples = int(packed_ctx["n_samples"])
+        blk = _jxrs.bed_packed_decode_rows_f32(
+            packed,
+            int(n_samples),
+            ridx_decode,
+            row_flip,
+            maf,
+            sidx,
+        )
+    else:
+        source_prefix_raw = packed_ctx.get("source_prefix", None)
+        if source_prefix_raw is None or str(source_prefix_raw).strip() == "":
+            raise ValueError(
+                "Streaming packed context requires source_prefix when packed rows are deferred."
+            )
+        maf_blk = np.ascontiguousarray(np.asarray(maf[ridx], dtype=np.float32).reshape(-1), dtype=np.float32)
+        row_flip_blk = np.ascontiguousarray(
+            np.asarray(row_flip[ridx], dtype=np.bool_).reshape(-1),
+            dtype=np.bool_,
+        )
+        blk = _jxrs.bed_decode_rows_f32_from_meta(
+            str(source_prefix_raw),
+            ridx_decode,
+            row_flip_blk,
+            maf_blk,
+            sidx,
+        )
     x = np.ascontiguousarray(np.asarray(blk, dtype=np.float32), dtype=np.float32)
     mu = np.ascontiguousarray(np.asarray(row_mean[ridx], dtype=np.float32).reshape(-1, 1))
     inv_sd = np.ascontiguousarray(np.asarray(row_inv_sd[ridx], dtype=np.float32).reshape(-1, 1))
@@ -4425,7 +5253,6 @@ def _ensure_packed_standard_stats_cached(
 ) -> tuple[np.ndarray, np.ndarray]:
     mean_raw = packed_ctx.get("__std_row_mean__", None)
     inv_raw = packed_ctx.get("__std_row_inv_sd__", None)
-    packed = np.ascontiguousarray(np.asarray(packed_ctx["packed"], dtype=np.uint8))
     active_row_idx = _packed_ctx_active_row_idx(packed_ctx)
     m = int(active_row_idx.shape[0])
     if mean_raw is not None and inv_raw is not None:
@@ -4435,7 +5262,15 @@ def _ensure_packed_standard_stats_cached(
             return mean, inv
 
     maf_full = np.ascontiguousarray(np.asarray(packed_ctx["maf"], dtype=np.float32).reshape(-1))
-    if _packed_ctx_is_lazy_full(packed_ctx):
+    packed_raw = packed_ctx.get("packed", None)
+    compact_from_active = bool(
+        _packed_ctx_is_lazy_full(packed_ctx)
+        or ((packed_raw is None) and (int(maf_full.shape[0]) != m))
+    )
+    if compact_from_active:
+        maf = np.ascontiguousarray(maf_full[active_row_idx], dtype=np.float32)
+    elif _packed_ctx_is_lazy_full(packed_ctx) and (packed_raw is not None):
+        packed = np.ascontiguousarray(np.asarray(packed_raw, dtype=np.uint8))
         if int(maf_full.shape[0]) != int(packed.shape[0]):
             raise ValueError("Packed context mismatch: maf length != packed rows.")
         maf = np.ascontiguousarray(maf_full[active_row_idx], dtype=np.float32)
@@ -4450,7 +5285,8 @@ def _ensure_packed_standard_stats_cached(
     mean_f64: np.ndarray
     var_f64: np.ndarray
     use_rust_stats = bool(
-        (not _packed_ctx_is_lazy_full(packed_ctx))
+        (packed_raw is not None)
+        and (not _packed_ctx_is_lazy_full(packed_ctx))
         and (_jxrs is not None)
         and hasattr(_jxrs, "bed_packed_decode_stats_f64")
     )
@@ -4785,7 +5621,7 @@ def _predict_bayes_packed_from_effects(
     if n_out == 0:
         return np.zeros((0, 1), dtype=np.float64)
 
-    m = int(np.asarray(packed_ctx["packed"]).shape[0])
+    m = int(_packed_ctx_active_rows(packed_ctx))
     b = np.ascontiguousarray(np.asarray(beta, dtype=np.float64).reshape(-1), dtype=np.float64)
     if int(b.shape[0]) != m:
         raise ValueError(f"Bayes beta length mismatch: got {b.shape[0]}, expected {m}.")
@@ -5578,7 +6414,7 @@ def GSapi(
         train_pred_indices,
         int(Y.reshape(-1).shape[0]),
     )
-    is_packed_input = _looks_like_packed_payload(Xtrain) or _looks_like_packed_payload(Xtest)
+    is_packed_input = _looks_like_packed_ctx(Xtrain) or _looks_like_packed_ctx(Xtest)
     if is_packed_input:
         if PCAdec:
             raise ValueError("PCAdec is not supported with packed genotype payloads.")
@@ -5952,7 +6788,7 @@ def GSapi(
         n_train_local = int(Y.reshape(-1).shape[0])
         n_snp_local = int(
             _packed_ctx_active_rows(typing.cast(dict[str, typing.Any], Xtrain))
-            if _looks_like_packed_payload(Xtrain)
+            if _looks_like_packed_ctx(Xtrain)
             else np.asarray(Xtrain).shape[0]
         )
         resolved_rr_solver = (
@@ -6130,7 +6966,7 @@ def GSapi(
             )
             n_snp_dbg = int(
                 _packed_ctx_active_rows(typing.cast(dict[str, typing.Any], Xtrain))
-                if _looks_like_packed_payload(Xtrain)
+                if _looks_like_packed_ctx(Xtrain)
                 else Xtrain.shape[0]
             )
             print(
@@ -6142,7 +6978,7 @@ def GSapi(
         if method == "GBLUP":
             can_use_rust_gblup = bool(
                 is_packed_input
-                and _looks_like_packed_payload(Xtrain)
+                and _looks_like_packed_ctx(Xtrain)
                 and (_jxrs is not None)
                 and hasattr(_jxrs, "gblup_reml_packed_bed")
             )
@@ -6153,21 +6989,6 @@ def GSapi(
                 can_use_rust_gblup = False
             if can_use_rust_gblup:
                 packed_train = typing.cast(dict[str, typing.Any], Xtrain)
-                source_prefix_raw = packed_train.get("source_prefix", None)
-                if source_prefix_raw is None or str(source_prefix_raw).strip() == "":
-                    raise ValueError(
-                        "Packed GBLUP Rust backend requires source PLINK prefix in packed context."
-                    )
-                source_prefix = str(source_prefix_raw)
-
-                site_keep_raw = packed_train.get("site_keep", None)
-                site_keep_arg = None
-                if site_keep_raw is not None:
-                    site_keep_arg = np.ascontiguousarray(
-                        np.asarray(site_keep_raw, dtype=np.bool_).reshape(-1),
-                        dtype=np.bool_,
-                    )
-
                 n_train_expected = int(np.asarray(Y).reshape(-1).shape[0])
                 if packed_train_indices is None:
                     if int(packed_train["n_samples"]) != n_train_expected:
@@ -6222,7 +7043,28 @@ def GSapi(
                 gblup_block_rows = _parse_nonnegative_int(
                     os.getenv("JX_GBLUP_PACKED_BLOCK_ROWS", "4096")
                 )
-                gblup_block_rows = int(max(1, int(4096 if gblup_block_rows is None else gblup_block_rows)))
+                gblup_block_rows = int(
+                    max(
+                        1,
+                        int(
+                            packed_train.get(
+                                "__gblup_grm_block_rows__",
+                                4096 if gblup_block_rows is None else gblup_block_rows,
+                            )
+                        ),
+                    )
+                )
+                (
+                    source_prefix,
+                    site_keep_arg,
+                    row_source_indices_arg,
+                    row_flip_arg,
+                    row_maf_arg,
+                    gblup_mmap_window_mb,
+                ) = _packed_gblup_stream_metadata(
+                    packed_train,
+                    block_rows=int(gblup_block_rows),
+                )
                 gblup_return_variance_components = bool(
                     (gblup_runtime_state is not None)
                     or _env_truthy("JX_GBLUP_PACKED_RETURN_VC", "0")
@@ -6248,6 +7090,12 @@ def GSapi(
                     rayon_threads=1,
                 ):
                     rust_blas_in_stage = get_rust_blas_threads()
+                    gblup_call_kwargs = dict(
+                        row_source_indices=row_source_indices_arg,
+                        row_flip=row_flip_arg,
+                        row_maf=row_maf_arg,
+                        mmap_window_mb=int(gblup_mmap_window_mb),
+                    )
                     try:
                         g_out = _jxrs.gblup_reml_packed_bed(  # type: ignore[union-attr]
                             source_prefix,
@@ -6266,6 +7114,7 @@ def GSapi(
                             bool(gblup_return_variance_components),
                             False,
                             bool(gblup_return_effect),
+                            **gblup_call_kwargs,
                         )
                     except TypeError:
                         try:
@@ -6284,6 +7133,7 @@ def GSapi(
                                 int(gblup_block_rows),
                                 int(max(1, int(n_jobs))),
                                 bool(gblup_return_variance_components),
+                                **gblup_call_kwargs,
                             )
                         except TypeError:
                             g_out = _jxrs.gblup_reml_packed_bed(  # type: ignore[union-attr]
@@ -6300,6 +7150,7 @@ def GSapi(
                                 float(gblup_reml_tol),
                                 int(gblup_block_rows),
                                 int(max(1, int(n_jobs))),
+                                **gblup_call_kwargs,
                             )
                     g_t = tuple(g_out)
                     if len(g_t) >= 12:
@@ -6359,6 +7210,7 @@ def GSapi(
                         if _evd_backend_l.startswith("marker_fast")
                         else "grm"
                     )
+                    gblup_runtime_state["backend"] = "rust-packed"
                     gblup_runtime_state["rust_backend"] = str(rust_backend)
                     gblup_runtime_state["eigh_backend"] = str(_eigh_backend)
                     gblup_runtime_state["eigh_sec"] = float(_eigh_elapsed)
@@ -6433,12 +7285,16 @@ def GSapi(
                     if source_prefix_raw is None
                     else str(source_prefix_raw).strip()
                 )
-                packed_src_view = np.asarray(packed_train["packed"], dtype=np.uint8)
-                packed_arg = np.ascontiguousarray(
-                    packed_src_view,
-                    dtype=np.uint8,
-                )
-                packed_is_lazy = _packed_ctx_is_lazy_full(packed_train)
+                packed_src_view: np.ndarray | None = None
+                packed_arg: np.ndarray | None = None
+                packed_has_payload = bool("packed" in packed_train)
+                packed_is_lazy = bool(packed_has_payload and _packed_ctx_is_lazy_full(packed_train))
+                if packed_has_payload:
+                    packed_src_view = np.asarray(packed_train["packed"], dtype=np.uint8)
+                    packed_arg = np.ascontiguousarray(
+                        packed_src_view,
+                        dtype=np.uint8,
+                    )
                 maf_arg = np.ascontiguousarray(
                     np.asarray(packed_train["maf"], dtype=np.float32).reshape(-1),
                     dtype=np.float32,
@@ -6450,22 +7306,27 @@ def GSapi(
                 packed_n_samples = int(packed_train["n_samples"])
                 if packed_n_samples <= 0:
                     raise ValueError("Packed rrBLUP-PCG requires n_samples > 0 in packed context.")
-                if packed_arg.ndim != 2:
-                    raise ValueError("Packed rrBLUP-PCG requires packed array shape (m, bytes_per_snp).")
-                if int(packed_arg.shape[0]) != int(maf_arg.shape[0]):
+                if (packed_arg is None) and (source_prefix == ""):
                     raise ValueError(
-                        "Packed rrBLUP-PCG payload mismatch: packed SNP rows != maf length."
+                        "Packed rrBLUP-PCG streaming context requires source_prefix when packed rows are deferred."
                     )
-                if int(packed_arg.shape[0]) != int(row_flip_arg.shape[0]):
-                    raise ValueError(
-                        "Packed rrBLUP-PCG payload mismatch: packed SNP rows != row_flip length."
-                    )
-                expected_bps = int((packed_n_samples + 3) // 4)
-                if int(packed_arg.shape[1]) != expected_bps:
-                    raise ValueError(
-                        f"Packed rrBLUP-PCG payload mismatch: packed bytes_per_snp={packed_arg.shape[1]} "
-                        f"!= expected {expected_bps}."
-                    )
+                if packed_arg is not None:
+                    if packed_arg.ndim != 2:
+                        raise ValueError("Packed rrBLUP-PCG requires packed array shape (m, bytes_per_snp).")
+                    if int(packed_arg.shape[0]) != int(maf_arg.shape[0]):
+                        raise ValueError(
+                            "Packed rrBLUP-PCG payload mismatch: packed SNP rows != maf length."
+                        )
+                    if int(packed_arg.shape[0]) != int(row_flip_arg.shape[0]):
+                        raise ValueError(
+                            "Packed rrBLUP-PCG payload mismatch: packed SNP rows != row_flip length."
+                        )
+                    expected_bps = int((packed_n_samples + 3) // 4)
+                    if int(packed_arg.shape[1]) != expected_bps:
+                        raise ValueError(
+                            f"Packed rrBLUP-PCG payload mismatch: packed bytes_per_snp={packed_arg.shape[1]} "
+                            f"!= expected {expected_bps}."
+                        )
                 site_keep_raw = packed_train.get("site_keep", None)
                 site_keep_arg_legacy = None
                 if site_keep_raw is not None:
@@ -6476,6 +7337,7 @@ def GSapi(
                 site_keep_arg = None
                 if site_keep_arg_legacy is not None and (
                     packed_is_lazy
+                    or (packed_arg is None)
                     or int(site_keep_arg_legacy.shape[0]) == int(packed_arg.shape[0])
                 ):
                     site_keep_arg = site_keep_arg_legacy
@@ -6665,32 +7527,44 @@ def GSapi(
                 )
                 pcg_rss_before: int | None = None
                 if pcg_debug_mode:
-                    packed_c_contig = bool(getattr(packed_arg, "flags", {}).c_contiguous)
-                    packed_same_obj = bool(packed_arg is packed_src_view)
-                    try:
-                        packed_shares_memory = bool(np.shares_memory(packed_arg, packed_src_view))
-                    except Exception:
-                        packed_shares_memory = False
                     pcg_block_bytes = int(
                         int(pcg_block_rows) * int(n_train_expected) * np.dtype(np.float32).itemsize
                     )
                     pcg_rss_before = _get_process_rss_bytes()
-                    print(
-                        (
-                            "[rrBLUP-DEBUG] PCG packed payload "
-                            f"rows={int(packed_arg.shape[0])} "
-                            f"bytes_per_snp={int(packed_arg.shape[1])} "
-                            f"c_contig={int(packed_c_contig)} "
-                            f"shared_with_ctx={int(packed_shares_memory)} "
-                            f"same_obj={int(packed_same_obj)} "
-                            f"nbytes={_format_debug_bytes(int(packed_arg.nbytes))}"
-                        ),
-                        flush=True,
-                    )
+                    if packed_arg is not None and packed_src_view is not None:
+                        packed_c_contig = bool(getattr(packed_arg, "flags", {}).c_contiguous)
+                        packed_same_obj = bool(packed_arg is packed_src_view)
+                        try:
+                            packed_shares_memory = bool(np.shares_memory(packed_arg, packed_src_view))
+                        except Exception:
+                            packed_shares_memory = False
+                        print(
+                            (
+                                "[rrBLUP-DEBUG] PCG packed payload "
+                                f"rows={int(packed_arg.shape[0])} "
+                                f"bytes_per_snp={int(packed_arg.shape[1])} "
+                                f"c_contig={int(packed_c_contig)} "
+                                f"shared_with_ctx={int(packed_shares_memory)} "
+                                f"same_obj={int(packed_same_obj)} "
+                                f"nbytes={_format_debug_bytes(int(packed_arg.nbytes))}"
+                            ),
+                            flush=True,
+                        )
+                    else:
+                        print(
+                            (
+                                "[rrBLUP-DEBUG] PCG streaming payload "
+                                f"source_prefix={source_prefix or '<none>'} "
+                                f"rows={int(maf_arg.shape[0])} "
+                                f"bytes_per_snp={int((packed_n_samples + 3) // 4)} "
+                                f"packed_resident=0"
+                            ),
+                            flush=True,
+                        )
                     print(
                         (
                             "[rrBLUP-DEBUG] PCG workspace estimate "
-                            f"packed={_format_debug_bytes(int(packed_arg.nbytes))} "
+                            f"packed={_format_debug_bytes(0 if packed_arg is None else int(packed_arg.nbytes))} "
                             f"block={_format_debug_bytes(pcg_block_bytes)} "
                             f"rss_before={_format_debug_bytes(pcg_rss_before)}"
                         ),
@@ -7519,8 +8393,8 @@ def GSapi(
             if np.isfinite(cand_r2):
                 resolved_bayes_r2 = float(cand_r2)
         if is_packed_input:
-            if not _looks_like_packed_payload(Xtrain):
-                raise ValueError("Packed Bayes requires packed train payload.")
+            if not _looks_like_packed_ctx(Xtrain):
+                raise ValueError("Packed Bayes requires packed BED metadata context.")
             packed_train = typing.cast(dict[str, typing.Any], Xtrain)
             if packed_train_indices is None:
                 n_total = int(packed_train["n_samples"])
@@ -7547,142 +8421,160 @@ def GSapi(
                     dtype=np.int64,
                 )
 
-            row_mean, row_inv_sd = _ensure_packed_standard_stats_cached(packed_train)
-            row_flip = _ensure_packed_row_flip_cached(packed_train)
-            packed = np.ascontiguousarray(np.asarray(packed_train["packed"], dtype=np.uint8))
-            maf = np.ascontiguousarray(np.asarray(packed_train["maf"], dtype=np.float32).reshape(-1), dtype=np.float32)
-            n_total_samples = int(packed_train["n_samples"])
-            train_abs = np.ascontiguousarray(train_abs, dtype=np.int64)
+        row_mean, row_inv_sd = _ensure_packed_standard_stats_cached(packed_train)
+        row_flip_full = _ensure_packed_row_flip_cached(packed_train)
+        maf_full = np.ascontiguousarray(np.asarray(packed_train["maf"], dtype=np.float32).reshape(-1), dtype=np.float32)
+        n_total_samples = int(packed_train["n_samples"])
+        train_abs = np.ascontiguousarray(train_abs, dtype=np.int64)
+        active_row_idx = _packed_ctx_active_row_idx(packed_train)
+        source_prefix_raw = packed_train.get("source_prefix", None)
+        packed_raw = packed_train.get("packed", None)
+        compact_from_active = bool(
+            _packed_ctx_is_lazy_full(packed_train)
+            or ((packed_raw is None) and (int(maf_full.shape[0]) != int(active_row_idx.shape[0])))
+        )
+        if compact_from_active:
+            maf = np.ascontiguousarray(maf_full[active_row_idx], dtype=np.float32)
+            row_flip = np.ascontiguousarray(row_flip_full[active_row_idx], dtype=np.bool_)
+        else:
+            maf = maf_full
+            row_flip = row_flip_full
 
-            bayes_snp_block = _parse_nonnegative_int(
-                os.getenv("JX_BAYES_PACKED_SNP_BLOCK", "2048")
-            )
-            bayes_sample_chunk = _parse_nonnegative_int(
-                os.getenv("JX_BAYES_PACKED_SAMPLE_CHUNK", "4096")
-            )
-            bayes_snp_block = int(max(1, int(2048 if bayes_snp_block is None else bayes_snp_block)))
-            bayes_sample_chunk = int(max(1, int(4096 if bayes_sample_chunk is None else bayes_sample_chunk)))
+        bayes_snp_block = _parse_nonnegative_int(
+            os.getenv("JX_BAYES_PACKED_SNP_BLOCK", "2048")
+        )
+        bayes_sample_chunk = _parse_nonnegative_int(
+            os.getenv("JX_BAYES_PACKED_SAMPLE_CHUNK", "4096")
+        )
+        bayes_snp_block = int(max(1, int(2048 if bayes_snp_block is None else bayes_snp_block)))
+        bayes_sample_chunk = int(max(1, int(4096 if bayes_sample_chunk is None else bayes_sample_chunk)))
+        bayes_stream_block_rows = int(
+            max(1, int(packed_train.get("__bayes_stream_block_rows__", 2048)))
+        )
+        bayes_stream_window_mb = int(
+            max(1, int(packed_train.get("__bayes_stream_window_mb__", 1)))
+        )
 
-            packed_func_name = {
-                "BayesA": "bayesa_packed",
-                "BayesB": "bayesb_packed",
-                "BayesCpi": "bayescpi_packed",
-            }.get(str(method))
-            use_packed_native = bool(
-                (_jxrs is not None)
-                and (packed_func_name is not None)
-                and hasattr(_jxrs, str(packed_func_name))
-            )
+        packed_func_name = {
+            "BayesA": "bayesa_stream_bed",
+            "BayesB": "bayesb_stream_bed",
+            "BayesCpi": "bayescpi_stream_bed",
+        }.get(str(method))
+        use_packed_native = bool(
+            (_jxrs is not None)
+            and (packed_func_name is not None)
+            and (source_prefix_raw is not None)
+            and (str(source_prefix_raw).strip() != "")
+            and hasattr(_jxrs, str(packed_func_name))
+        )
 
-            if use_packed_native:
-                y_vec = np.ascontiguousarray(np.asarray(Y, dtype=np.float64).reshape(-1), dtype=np.float64)
-                r2_blup = float("nan")
-                r2_source = "provided"
-                r2_n_used = int(y_vec.shape[0])
-                r2_n_total = int(y_vec.shape[0])
-                if resolved_bayes_r2 is None or (not np.isfinite(float(resolved_bayes_r2))):
-                    r2_blup, r2_source, r2_n_used, r2_n_total = _estimate_bayes_auto_r2_from_blup(
-                        y=y_vec,
-                        Xtrain=packed_train,
-                        packed_train_indices=train_abs,
-                        cfg=bayes_auto_cfg,
-                        seed_offset=int(train_abs.shape[0]),
+        if use_packed_native:
+            y_vec = np.ascontiguousarray(np.asarray(Y, dtype=np.float64).reshape(-1), dtype=np.float64)
+            r2_blup = float("nan")
+            r2_source = "provided"
+            r2_n_used = int(y_vec.shape[0])
+            r2_n_total = int(y_vec.shape[0])
+            if resolved_bayes_r2 is None or (not np.isfinite(float(resolved_bayes_r2))):
+                r2_blup, r2_source, r2_n_used, r2_n_total = _estimate_bayes_auto_r2_from_blup(
+                    y=y_vec,
+                    Xtrain=packed_train,
+                    packed_train_indices=train_abs,
+                    cfg=bayes_auto_cfg,
+                    seed_offset=int(train_abs.shape[0]),
+                )
+                r2_fit = float(r2_blup)
+            else:
+                r2_fit = float(resolved_bayes_r2)
+            r2_used = float(min(0.95, max(0.05, float(r2_fit))))
+            packed_kwargs: dict[str, typing.Any] = {
+                "prefix": str(source_prefix_raw),
+                "y": y_vec,
+                "n_samples": int(n_total_samples),
+                "row_indices": np.ascontiguousarray(
+                    np.asarray(active_row_idx, dtype=np.int64).reshape(-1),
+                    dtype=np.int64,
+                ),
+                "row_flip": np.ascontiguousarray(
+                    np.asarray(row_flip, dtype=np.bool_).reshape(-1),
+                    dtype=np.bool_,
+                ),
+                "row_maf": maf,
+                "row_mean": np.ascontiguousarray(
+                    np.asarray(row_mean, dtype=np.float32).reshape(-1),
+                    dtype=np.float32,
+                ),
+                "row_inv_sd": np.ascontiguousarray(
+                    np.asarray(row_inv_sd, dtype=np.float32).reshape(-1),
+                    dtype=np.float32,
+                ),
+                "sample_indices": train_abs,
+                "x": None,
+                "n_iter": 400,
+                "burnin": 200,
+                "thin": 1,
+                "r2": float(r2_used),
+                "threads": int(max(0, int(n_jobs))),
+                "seed": None,
+                "block_rows": int(bayes_stream_block_rows),
+                "mmap_window_mb": int(bayes_stream_window_mb),
+            }
+            if str(method) in {"BayesB", "BayesCpi"}:
+                packed_kwargs["prob_in"] = 0.5
+                packed_kwargs["counts"] = 5.0
+            if str(method) == "BayesA":
+                packed_kwargs["min_abs_beta"] = 1e-9
+
+            packed_fit_fn = getattr(_jxrs, str(packed_func_name))
+            packed_threads_compat_fallback = False
+            try:
+                packed_fit_ret = packed_fit_fn(**packed_kwargs)
+            except TypeError as e:
+                msg = str(e)
+                if "unexpected keyword argument 'threads'" in msg:
+                    packed_kwargs_retry = dict(packed_kwargs)
+                    packed_kwargs_retry.pop("threads", None)
+                    packed_fit_ret = packed_fit_fn(**packed_kwargs_retry)
+                    packed_threads_compat_fallback = True
+                else:
+                    raise
+            if str(method) == "BayesCpi":
+                beta_raw, alpha_raw, _varb_mean, _vare, h2_mean, _var_h2, *diag_tail = packed_fit_ret
+            else:
+                beta_raw, alpha_raw, _varb, _vare, h2_mean, _var_h2, *diag_tail = packed_fit_ret
+
+            pve = float(h2_mean)
+            bayes_beta = np.ascontiguousarray(np.asarray(beta_raw, dtype=np.float64).reshape(-1), dtype=np.float64)
+            bayes_alpha = np.ascontiguousarray(np.asarray(alpha_raw, dtype=np.float64).reshape(-1), dtype=np.float64)
+            bayes_alpha0 = float(bayes_alpha[0]) if int(bayes_alpha.shape[0]) > 0 else 0.0
+
+            if bayes_runtime_state is not None:
+                bayes_runtime_state["r2_used"] = float(r2_used)
+                bayes_runtime_state["r2_blup"] = float(r2_blup)
+                bayes_runtime_state["r2_source"] = str(r2_source)
+                bayes_runtime_state["r2_n_used"] = int(r2_n_used)
+                bayes_runtime_state["r2_n_total"] = int(r2_n_total)
+                bayes_runtime_state["threads_requested"] = int(max(0, int(n_jobs)))
+                bayes_runtime_state["threads_compat_fallback"] = bool(
+                    packed_threads_compat_fallback
+                )
+                if len(diag_tail) >= 2:
+                    bayes_runtime_state["prob_in_mean"] = float(diag_tail[0])
+                    bayes_runtime_state["n_active_mean"] = float(diag_tail[1])
+
+            if need_train_pred:
+                if train_pred_idx is None:
+                    train_pred_abs = train_abs
+                elif int(train_pred_idx.size) == 0:
+                    train_pred_abs = np.zeros((0,), dtype=np.int64)
+                else:
+                    train_pred_abs = np.ascontiguousarray(
+                        train_abs[np.asarray(train_pred_idx, dtype=np.int64).reshape(-1)],
+                        dtype=np.int64,
                     )
-                    r2_fit = float(r2_blup)
-                else:
-                    r2_fit = float(resolved_bayes_r2)
-                r2_used = float(min(0.95, max(0.05, float(r2_fit))))
-
-                packed_kwargs: dict[str, typing.Any] = {
-                    "y": y_vec,
-                    "packed": packed,
-                    "n_samples": int(n_total_samples),
-                    "row_flip": np.ascontiguousarray(np.asarray(row_flip, dtype=np.bool_).reshape(-1), dtype=np.bool_),
-                    "row_maf": maf,
-                    "row_mean": np.ascontiguousarray(np.asarray(row_mean, dtype=np.float32).reshape(-1), dtype=np.float32),
-                    "row_inv_sd": np.ascontiguousarray(np.asarray(row_inv_sd, dtype=np.float32).reshape(-1), dtype=np.float32),
-                    "sample_indices": train_abs,
-                    "x": None,
-                    "n_iter": 400,
-                    "burnin": 200,
-                    "thin": 1,
-                    "r2": float(r2_used),
-                    "threads": int(max(0, int(n_jobs))),
-                    "seed": None,
-                }
-                if str(method) in {"BayesB", "BayesCpi"}:
-                    packed_kwargs["prob_in"] = 0.5
-                    packed_kwargs["counts"] = 5.0
-                if str(method) == "BayesA":
-                    packed_kwargs["min_abs_beta"] = 1e-9
-
-                packed_fit_fn = getattr(_jxrs, str(packed_func_name))
-                packed_threads_compat_fallback = False
-                try:
-                    packed_fit_ret = packed_fit_fn(**packed_kwargs)
-                except TypeError as e:
-                    msg = str(e)
-                    if "unexpected keyword argument 'threads'" in msg:
-                        packed_kwargs_retry = dict(packed_kwargs)
-                        packed_kwargs_retry.pop("threads", None)
-                        packed_fit_ret = packed_fit_fn(**packed_kwargs_retry)
-                        packed_threads_compat_fallback = True
-                    else:
-                        raise
-                if str(method) == "BayesCpi":
-                    beta_raw, alpha_raw, _varb_mean, _vare, h2_mean, _var_h2, *diag_tail = packed_fit_ret
-                else:
-                    beta_raw, alpha_raw, _varb, _vare, h2_mean, _var_h2, *diag_tail = packed_fit_ret
-
-                pve = float(h2_mean)
-                bayes_beta = np.ascontiguousarray(np.asarray(beta_raw, dtype=np.float64).reshape(-1), dtype=np.float64)
-                bayes_alpha = np.ascontiguousarray(np.asarray(alpha_raw, dtype=np.float64).reshape(-1), dtype=np.float64)
-                bayes_alpha0 = float(bayes_alpha[0]) if int(bayes_alpha.shape[0]) > 0 else 0.0
-
-                if bayes_runtime_state is not None:
-                    bayes_runtime_state["r2_used"] = float(r2_used)
-                    bayes_runtime_state["r2_blup"] = float(r2_blup)
-                    bayes_runtime_state["r2_source"] = str(r2_source)
-                    bayes_runtime_state["r2_n_used"] = int(r2_n_used)
-                    bayes_runtime_state["r2_n_total"] = int(r2_n_total)
-                    bayes_runtime_state["threads_requested"] = int(max(0, int(n_jobs)))
-                    bayes_runtime_state["threads_compat_fallback"] = bool(
-                        packed_threads_compat_fallback
-                    )
-                    if len(diag_tail) >= 2:
-                        bayes_runtime_state["prob_in_mean"] = float(diag_tail[0])
-                        bayes_runtime_state["n_active_mean"] = float(diag_tail[1])
-
-                if need_train_pred:
-                    if train_pred_idx is None:
-                        train_pred_abs = train_abs
-                    elif int(train_pred_idx.size) == 0:
-                        train_pred_abs = np.zeros((0,), dtype=np.int64)
-                    else:
-                        train_pred_abs = np.ascontiguousarray(
-                            train_abs[np.asarray(train_pred_idx, dtype=np.int64).reshape(-1)],
-                            dtype=np.int64,
-                        )
-                    if int(train_pred_abs.size) > 0:
-                        train_pred = _predict_bayes_packed_from_effects(
-                            packed_ctx=packed_train,
-                            sample_indices=train_pred_abs,
-                            alpha0=bayes_alpha0,
-                            beta=bayes_beta,
-                            row_mean=row_mean,
-                            row_inv_sd=row_inv_sd,
-                            snp_block_size=bayes_snp_block,
-                            sample_chunk_size=bayes_sample_chunk,
-                        )
-                    else:
-                        train_pred = np.zeros((0, 1), dtype=float)
-                else:
-                    train_pred = np.zeros((0, 1), dtype=float)
-
-                if int(test_abs.size) > 0:
-                    test_pred = _predict_bayes_packed_from_effects(
-                        packed_ctx=typing.cast(dict[str, typing.Any], Xtest),
-                        sample_indices=test_abs,
+                if int(train_pred_abs.size) > 0:
+                    train_pred = _predict_bayes_packed_from_effects(
+                        packed_ctx=packed_train,
+                        sample_indices=train_pred_abs,
                         alpha0=bayes_alpha0,
                         beta=bayes_beta,
                         row_mean=row_mean,
@@ -7691,95 +8583,9 @@ def GSapi(
                         sample_chunk_size=bayes_sample_chunk,
                     )
                 else:
-                    test_pred = np.zeros((0, 1), dtype=float)
-                if model_state is not None:
-                    model_state["kind"] = "bayes_linear"
-                    model_state["method"] = str(method)
-                    model_state["alpha"] = float(bayes_alpha0)
-                    model_state["beta"] = np.ascontiguousarray(
-                        np.asarray(bayes_beta, dtype=np.float64).reshape(-1),
-                        dtype=np.float64,
-                    )
-                    model_state["packed"] = True
-                    model_state["standardized"] = True
-                    model_state["row_mean"] = np.ascontiguousarray(
-                        np.asarray(row_mean, dtype=np.float32).reshape(-1),
-                        dtype=np.float32,
-                    )
-                    model_state["row_inv_sd"] = np.ascontiguousarray(
-                        np.asarray(row_inv_sd, dtype=np.float32).reshape(-1),
-                        dtype=np.float32,
-                    )
-                    model_state["snp_block_size"] = int(max(1, int(bayes_snp_block)))
-                    model_state["sample_chunk_size"] = int(max(1, int(bayes_sample_chunk)))
-                    model_state["pve"] = float(pve)
-                return (
-                    np.asarray(train_pred, dtype=float).reshape(-1, 1),
-                    np.asarray(test_pred, dtype=float).reshape(-1, 1),
-                    pve,
-                )
-
-            # Fallback for old extension builds without packed Bayes kernels.
-            r2_blup_fb = float("nan")
-            r2_source_fb = "provided"
-            r2_n_used_fb = int(np.asarray(Y).reshape(-1).shape[0])
-            r2_n_total_fb = int(np.asarray(Y).reshape(-1).shape[0])
-            if resolved_bayes_r2 is None or (not np.isfinite(float(resolved_bayes_r2))):
-                r2_blup_fb, r2_source_fb, r2_n_used_fb, r2_n_total_fb = _estimate_bayes_auto_r2_from_blup(
-                    y=Y,
-                    Xtrain=packed_train,
-                    packed_train_indices=train_abs,
-                    cfg=bayes_auto_cfg,
-                    seed_offset=int(train_abs.shape[0]) + 17,
-                )
-                resolved_bayes_r2 = float(r2_blup_fb)
-            dense_train = _decode_packed_subset_to_dense_standardized(
-                packed_ctx=packed_train,
-                sample_indices=train_abs,
-                row_mean=row_mean,
-                row_inv_sd=row_inv_sd,
-                out_dtype=np.float64,
-            )
-            model = BAYES(Y.reshape(-1, 1), dense_train, method=method, r2=resolved_bayes_r2)
-            pve = model.pve
-            if bayes_runtime_state is not None:
-                bayes_runtime_state["r2_used"] = float(getattr(model, "r2_used", np.nan))
-                model_r2_blup = float(getattr(model, "r2_blup", np.nan))
-                bayes_runtime_state["r2_blup"] = (
-                    float(model_r2_blup)
-                    if np.isfinite(model_r2_blup)
-                    else float(r2_blup_fb)
-                )
-                model_r2_source = str(getattr(model, "r2_source", "")).strip()
-                bayes_runtime_state["r2_source"] = (
-                    model_r2_source
-                    if model_r2_source != ""
-                    else str(r2_source_fb)
-                )
-                bayes_runtime_state["r2_n_used"] = int(r2_n_used_fb)
-                bayes_runtime_state["r2_n_total"] = int(r2_n_total_fb)
-            bayes_beta = np.ascontiguousarray(
-                np.asarray(getattr(model, "beta_hat", np.zeros((0, 1))), dtype=np.float64).reshape(-1),
-                dtype=np.float64,
-            )
-            bayes_alpha = np.ascontiguousarray(
-                np.asarray(getattr(model, "alpha_hat", np.asarray([[0.0]], dtype=np.float64)), dtype=np.float64).reshape(-1),
-                dtype=np.float64,
-            )
-            bayes_alpha0 = float(bayes_alpha[0]) if int(bayes_alpha.shape[0]) > 0 else 0.0
-
-            if need_train_pred:
-                if train_pred_idx is None:
-                    train_pred = model.predict(dense_train)
-                elif int(train_pred_idx.size) == 0:
                     train_pred = np.zeros((0, 1), dtype=float)
-                else:
-                    train_pred = model.predict(np.asarray(dense_train)[:, train_pred_idx])
             else:
                 train_pred = np.zeros((0, 1), dtype=float)
-
-            del dense_train
-            gc.collect()
 
             if int(test_abs.size) > 0:
                 test_pred = _predict_bayes_packed_from_effects(
@@ -7820,6 +8626,10 @@ def GSapi(
                 np.asarray(test_pred, dtype=float).reshape(-1, 1),
                 pve,
             )
+        raise RuntimeError(
+            "Packed Bayes requires Rust bayes*_stream_bed kernels with source_prefix support. "
+            "Rebuild/install the current JanusX extension."
+        )
 
         if resolved_bayes_r2 is None or (not np.isfinite(float(resolved_bayes_r2))):
             r2_blup, r2_source, r2_n_used, r2_n_total = _estimate_bayes_auto_r2_from_blup(
@@ -8055,7 +8865,7 @@ def _run_method_task(
                 bayes_cv_shared_source = "cache"
         if not np.isfinite(bayes_cv_shared_r2):
             try:
-                if (packed_ctx is not None) and _looks_like_packed_payload(packed_ctx):
+                if (packed_ctx is not None) and _looks_like_packed_ctx(packed_ctx):
                     if train_sample_indices is None:
                         raise ValueError("Packed Bayes CV-r2 reuse requires train_sample_indices.")
                     bayes_cv_shared_r2, _src, _n_used, _n_total = _estimate_bayes_auto_r2_from_blup(
@@ -8098,6 +8908,9 @@ def _run_method_task(
         if _looks_like_packed_payload(packed_ctx)
         else None
     )
+    packed_method_ctx = packed_payload
+    if (method in packed_lmm_methods) and _looks_like_packed_ctx(packed_ctx):
+        packed_method_ctx = typing.cast(dict[str, typing.Any], packed_ctx)
     precomputed_train_grm = None
     precomputed_test_train_grm = None
     precomputed_hash_ztz_test_pred = None
@@ -8140,10 +8953,17 @@ def _run_method_task(
     )
     gblup_cv_grm_full: np.ndarray | None = None
     gblup_final_test_train: np.ndarray | None = None
+    gblup_cv_grm_dom_full: np.ndarray | None = None
+    gblup_final_test_train_dom: np.ndarray | None = None
     gblup_force_kinship = False
+    gblup_kernel_mode = (
+        _gblup_method_kernel_mode(str(method))
+        if _is_gblup_method(str(method))
+        else ""
+    )
     prefer_rust_packed_gblup = bool(
         method == "GBLUP"
-        and packed_payload is not None
+        and _looks_like_packed_ctx(packed_ctx)
         and (_jxrs is not None)
         and hasattr(_jxrs, "gblup_reml_packed_bed")
     )
@@ -8204,15 +9024,7 @@ def _run_method_task(
         )
 
     if method == "GBLUP":
-        if prefer_rust_packed_gblup:
-            gblup_force_kinship = False
-            if _GS_DEBUG_STAGE:
-                print(
-                    "[GS-DEBUG] GBLUP packed policy: route via GSapi->rust_gblup_reml_packed_bed "
-                    "(skip CV GRM prebuild).",
-                    flush=True,
-                )
-        elif precomputed_train_grm is not None:
+        if precomputed_train_grm is not None:
             gblup_cv_grm_full = np.asarray(precomputed_train_grm, dtype=np.float64)
             if precomputed_test_train_grm is not None:
                 gblup_final_test_train = np.asarray(
@@ -8220,13 +9032,27 @@ def _run_method_task(
                     dtype=np.float64,
                 )
             gblup_force_kinship = True
-        elif packed_payload is not None:
+        elif packed_method_ctx is not None:
             # Packed backend policy aligns with dense behavior:
             # - n > m: prefer marker-space/FaST route (avoid explicit n x n GRM prebuild)
             # - m >= n: explicit kinship prebuild can be reused across CV folds
             n_train = int(train_pheno.shape[0])
-            m_snp = int(np.asarray(packed_payload["packed"]).shape[0])
+            packed_ctx_local = typing.cast(dict[str, typing.Any], packed_method_ctx)
+            if "packed" in packed_ctx_local:
+                m_snp = int(np.asarray(packed_ctx_local["packed"]).shape[0])
+            else:
+                m_snp = int(
+                    np.asarray(
+                        packed_ctx_local.get("maf", np.asarray([], dtype=np.float32))
+                    ).reshape(-1).shape[0]
+                )
             gblup_force_kinship = bool(m_snp >= n_train)
+            if (not gblup_force_kinship) and prefer_rust_packed_gblup and _GS_DEBUG_STAGE:
+                print(
+                    "[GS-DEBUG] GBLUP packed policy: route via GSapi->rust_gblup_reml_packed_bed "
+                    "(marker-space/FaST regime).",
+                    flush=True,
+                )
         elif packed_payload is None and train_snp is not None:
             # GBLUP backend policy (dense markers only):
             # - n > m: use marker-space ZTZ/FaST route (no explicit kinship build)
@@ -8236,17 +9062,14 @@ def _run_method_task(
             gblup_force_kinship = bool(m_snp >= n_train)
             if gblup_force_kinship:
                 try:
-                    gblup_cv_grm_full = _build_gblup_cv_grm_once(
+                    gblup_cv_grm_full, gblup_final_test_train = _build_gblup_kinship_blocks_once(
                         train_snp=train_snp,
+                        test_snp=test_snp,
                         packed_ctx=None,
                         train_sample_indices=None,
+                        test_sample_indices=None,
                         n_jobs=max(1, int(n_jobs)),
                     )
-                    if test_snp is not None and int(test_snp.shape[1]) > 0:
-                        gblup_final_test_train = _build_gblup_test_train_cross_from_markers(
-                            test_snp=test_snp,
-                            train_snp=train_snp,
-                        )
                     if _GS_DEBUG_STAGE and gblup_cv_grm_full is not None:
                         print(
                             f"[GS-DEBUG] GBLUP kinship backend prebuilt GRM shape={gblup_cv_grm_full.shape}",
@@ -8262,13 +9085,90 @@ def _run_method_task(
                             f"[GS-DEBUG] GBLUP kinship backend failed -> fallback GSapi: {ex}",
                             flush=True,
                         )
+    elif method == _GBLUP_METHOD_DOM:
+        try:
+            gblup_cv_grm_full, gblup_final_test_train = _build_gblup_kinship_blocks_once(
+                train_snp=train_snp_add,
+                test_snp=test_snp_add,
+                packed_ctx=(
+                    typing.cast(dict[str, typing.Any], packed_method_ctx)
+                    if packed_method_ctx is not None
+                    else None
+                ),
+                train_sample_indices=train_sample_indices,
+                test_sample_indices=test_sample_indices,
+                n_jobs=max(1, int(n_jobs)),
+                kernel_mode="d",
+            )
+            gblup_force_kinship = bool(gblup_cv_grm_full is not None)
+            if _GS_DEBUG_STAGE and gblup_cv_grm_full is not None:
+                print(
+                    f"[GS-DEBUG] GBLUP(d) prebuilt GRM shape={gblup_cv_grm_full.shape}",
+                    flush=True,
+                )
+        except Exception as ex:
+            gblup_cv_grm_full = None
+            gblup_final_test_train = None
+            gblup_force_kinship = False
+            if _GS_DEBUG_STAGE:
+                print(
+                    f"[GS-DEBUG] GBLUP(d) prebuild failed -> fallback GSapi: {ex}",
+                    flush=True,
+                )
+    elif method == _GBLUP_METHOD_AD:
+        try:
+            gblup_cv_grm_full, gblup_final_test_train = _build_gblup_kinship_blocks_once(
+                train_snp=train_snp_add,
+                test_snp=test_snp_add,
+                packed_ctx=(
+                    typing.cast(dict[str, typing.Any], packed_method_ctx)
+                    if packed_method_ctx is not None
+                    else None
+                ),
+                train_sample_indices=train_sample_indices,
+                test_sample_indices=test_sample_indices,
+                n_jobs=max(1, int(n_jobs)),
+                kernel_mode="a",
+            )
+            gblup_cv_grm_dom_full, gblup_final_test_train_dom = _build_gblup_kinship_blocks_once(
+                train_snp=train_snp_add,
+                test_snp=test_snp_add,
+                packed_ctx=(
+                    typing.cast(dict[str, typing.Any], packed_method_ctx)
+                    if packed_method_ctx is not None
+                    else None
+                ),
+                train_sample_indices=train_sample_indices,
+                test_sample_indices=test_sample_indices,
+                n_jobs=max(1, int(n_jobs)),
+                kernel_mode="d",
+            )
+            gblup_force_kinship = bool(
+                (gblup_cv_grm_full is not None)
+                and (gblup_cv_grm_dom_full is not None)
+                and (_HAS_ADBLUP_PY and (KernelBLUP is not None))
+            )
+            if _GS_DEBUG_STAGE and gblup_force_kinship:
+                print(
+                    "[GS-DEBUG] GBLUP(ad) prebuilt kernels "
+                    f"Ka={gblup_cv_grm_full.shape} Kd={gblup_cv_grm_dom_full.shape}",
+                    flush=True,
+                )
+        except Exception as ex:
+            gblup_cv_grm_full = None
+            gblup_final_test_train = None
+            gblup_cv_grm_dom_full = None
+            gblup_final_test_train_dom = None
+            gblup_force_kinship = False
+            if _GS_DEBUG_STAGE:
+                print(
+                    f"[GS-DEBUG] GBLUP(ad) prebuild failed -> fallback GSapi: {ex}",
+                    flush=True,
+                )
 
     need_cv_grm_prebuild = bool(
         (method == "GBLUP")
-        and (
-            gblup_force_kinship
-            or (precomputed_train_grm is not None)
-        )
+        and (gblup_force_kinship or (precomputed_train_grm is not None))
     )
     if use_hash_cv_compact:
         # Compact hash+CV path builds fold-level ZTZ stats directly and does
@@ -8281,10 +9181,16 @@ def _run_method_task(
         and need_cv_grm_prebuild
     ):
         try:
-            gblup_cv_grm_full = _build_gblup_cv_grm_once(
+            gblup_cv_grm_full, gblup_final_test_train = _build_gblup_kinship_blocks_once(
                 train_snp=train_snp,
-                packed_ctx=packed_payload,
+                test_snp=test_snp,
+                packed_ctx=(
+                    typing.cast(dict[str, typing.Any], packed_method_ctx)
+                    if packed_method_ctx is not None
+                    else None
+                ),
                 train_sample_indices=train_sample_indices,
+                test_sample_indices=test_sample_indices,
                 n_jobs=max(1, int(n_jobs)),
             )
             if _GS_DEBUG_STAGE and gblup_cv_grm_full is not None:
@@ -8444,12 +9350,99 @@ def _run_method_task(
                         )
                 else:
                     yhat_train = np.zeros((0, 1), dtype=float)
+            elif (method == _GBLUP_METHOD_DOM) and (gblup_cv_grm_full is not None):
+                y_fold = np.asarray(train_pheno[fold_train_idx], dtype=np.float64).reshape(-1)
+                grm_train = np.asarray(
+                    gblup_cv_grm_full[np.ix_(fold_train_idx, fold_train_idx)],
+                    dtype=np.float64,
+                )
+                fit = _fit_gblup_reml_from_grm(y_fold, grm_train)
+                alpha = np.asarray(fit["alpha"], dtype=np.float64).reshape(-1, 1)
+                beta = float(fit["beta"])
+                pve = float(fit["pve"])
+
+                grm_test_train = np.asarray(
+                    gblup_cv_grm_full[np.ix_(fold_test_idx, fold_train_idx)],
+                    dtype=np.float64,
+                )
+                yhat_test = _predict_gblup_from_cross(
+                    cross_kernel=grm_test_train,
+                    alpha=alpha,
+                    beta=beta,
+                )
+                if need_fold_train_pred:
+                    if fold_train_pred_local_idx is None:
+                        yhat_train = _predict_gblup_from_cross(
+                            cross_kernel=grm_train,
+                            alpha=alpha,
+                            beta=beta,
+                        )
+                    elif int(fold_train_pred_local_idx.size) == 0:
+                        yhat_train = np.zeros((0, 1), dtype=float)
+                    else:
+                        local_idx = np.asarray(fold_train_pred_local_idx, dtype=np.int64).reshape(-1)
+                        grm_pick = np.asarray(grm_train[local_idx, :], dtype=np.float64)
+                        yhat_train = _predict_gblup_from_cross(
+                            cross_kernel=grm_pick,
+                            alpha=alpha,
+                            beta=beta,
+                        )
+                else:
+                    yhat_train = np.zeros((0, 1), dtype=float)
+            elif (
+                (method == _GBLUP_METHOD_AD)
+                and (gblup_cv_grm_full is not None)
+                and (gblup_cv_grm_dom_full is not None)
+                and (_HAS_ADBLUP_PY and (KernelBLUP is not None))
+            ):
+                y_fold = np.asarray(train_pheno[fold_train_idx], dtype=np.float64).reshape(-1)
+                grm_add_train = np.asarray(
+                    gblup_cv_grm_full[np.ix_(fold_train_idx, fold_train_idx)],
+                    dtype=np.float64,
+                )
+                grm_dom_train = np.asarray(
+                    gblup_cv_grm_dom_full[np.ix_(fold_train_idx, fold_train_idx)],
+                    dtype=np.float64,
+                )
+                fit_ad = _fit_gblup_ad_reml_from_grms(y_fold, grm_add_train, grm_dom_train)
+                pve = float(fit_ad["pve"])
+                grm_add_test = np.asarray(
+                    gblup_cv_grm_full[np.ix_(fold_test_idx, fold_train_idx)],
+                    dtype=np.float64,
+                )
+                grm_dom_test = np.asarray(
+                    gblup_cv_grm_dom_full[np.ix_(fold_test_idx, fold_train_idx)],
+                    dtype=np.float64,
+                )
+                yhat_test = _predict_gblup_ad_from_cross(
+                    fit=fit_ad,
+                    cross_add=grm_add_test,
+                    cross_dom=grm_dom_test,
+                )
+                if need_fold_train_pred:
+                    if fold_train_pred_local_idx is None:
+                        train_add_cross = grm_add_train
+                        train_dom_cross = grm_dom_train
+                    elif int(fold_train_pred_local_idx.size) == 0:
+                        train_add_cross = np.zeros((0, grm_add_train.shape[1]), dtype=np.float64)
+                        train_dom_cross = np.zeros((0, grm_dom_train.shape[1]), dtype=np.float64)
+                    else:
+                        local_idx = np.asarray(fold_train_pred_local_idx, dtype=np.int64).reshape(-1)
+                        train_add_cross = np.asarray(grm_add_train[local_idx, :], dtype=np.float64)
+                        train_dom_cross = np.asarray(grm_dom_train[local_idx, :], dtype=np.float64)
+                    yhat_train = _predict_gblup_ad_from_cross(
+                        fit=fit_ad,
+                        cross_add=train_add_cross,
+                        cross_dom=train_dom_cross,
+                    )
+                else:
+                    yhat_train = np.zeros((0, 1), dtype=float)
             else:
-                if (packed_payload is not None) and (method in packed_lmm_methods):
+                if (packed_method_ctx is not None) and (method in packed_lmm_methods):
                     if train_sample_indices is None:
                         raise ValueError("Packed LMM requires train sample indices.")
-                    fold_train = packed_payload
-                    fold_test = packed_payload
+                    fold_train = packed_method_ctx
+                    fold_test = packed_method_ctx
                     fold_train_idx_arg = np.ascontiguousarray(train_sample_indices[fold_train_idx], dtype=np.int64)
                     fold_test_idx_arg = np.ascontiguousarray(train_sample_indices[fold_test_idx], dtype=np.int64)
                     fold_pca = False
@@ -8804,11 +9797,11 @@ def _run_method_task(
 
     final_train_idx_arg = None
     final_test_idx_arg = None
-    if (packed_payload is not None) and (method in packed_lmm_methods):
+    if (packed_method_ctx is not None) and (method in packed_lmm_methods):
         if train_sample_indices is None or test_sample_indices is None:
             raise ValueError("Packed LMM requires train/test sample indices.")
-        final_train = packed_payload
-        final_test = packed_payload
+        final_train = packed_method_ctx
+        final_test = packed_method_ctx
         final_pca = False
         final_train_idx_arg = np.ascontiguousarray(train_sample_indices, dtype=np.int64)
         final_test_idx_arg = np.ascontiguousarray(test_sample_indices, dtype=np.int64)
@@ -8833,7 +9826,7 @@ def _run_method_task(
     # full-data fit does not contribute to fold metrics and only adds runtime.
     # Keep default behavior for all other cases.
     final_test_n = 0
-    if (packed_payload is not None) and (method in packed_lmm_methods):
+    if (packed_method_ctx is not None) and (method in packed_lmm_methods):
         final_test_n = int(0 if final_test_idx_arg is None else int(final_test_idx_arg.size))
     elif hasattr(final_test, "shape") and len(getattr(final_test, "shape")) >= 2:
         final_test_n = int(final_test.shape[1])
@@ -8841,9 +9834,18 @@ def _run_method_task(
 
     skip_final_fit = False
     use_custom_gblup_final = bool(
-        method == "GBLUP"
-        and gblup_cv_grm_full is not None
-        and (gblup_force_kinship or precomputed_train_grm is not None)
+        (
+            method == "GBLUP"
+            and gblup_cv_grm_full is not None
+            and (gblup_force_kinship or precomputed_train_grm is not None)
+        )
+        or (method == _GBLUP_METHOD_DOM and gblup_cv_grm_full is not None)
+        or (
+            method == _GBLUP_METHOD_AD
+            and gblup_cv_grm_full is not None
+            and gblup_cv_grm_dom_full is not None
+            and (_HAS_ADBLUP_PY and (KernelBLUP is not None))
+        )
     )
     # Packed-GRM CV prebuild currently only provides train-train GRM; if we
     # still have external holdout samples but no precomputed test-train cross
@@ -8852,16 +9854,29 @@ def _run_method_task(
     if (
         use_custom_gblup_final
         and has_external_test
-        and (gblup_final_test_train is None)
+        and (
+            (gblup_final_test_train is None)
+            or (
+                method == _GBLUP_METHOD_AD
+                and (gblup_final_test_train_dom is None)
+            )
+        )
     ):
         use_custom_gblup_final = False
     if cv_splits is not None:
         if use_custom_gblup_final:
             skip_final_fit = bool(
-                gblup_final_test_train is None
-                or int(gblup_final_test_train.shape[0]) == 0
+                (
+                    gblup_final_test_train is None
+                    or int(gblup_final_test_train.shape[0]) == 0
+                )
+                and (
+                    method != _GBLUP_METHOD_AD
+                    or gblup_final_test_train_dom is None
+                    or int(gblup_final_test_train_dom.shape[0]) == 0
+                )
             )
-        elif (packed_payload is not None) and (method in packed_lmm_methods):
+        elif (packed_method_ctx is not None) and (method in packed_lmm_methods):
             skip_final_fit = bool(final_test_idx_arg is not None and int(final_test_idx_arg.size) == 0)
         else:
             skip_final_fit = bool(
@@ -8948,41 +9963,206 @@ def _run_method_task(
     elif use_custom_gblup_final:
         _emit_stage("fit_start", method=str(method))
         _t_fit_stage = time.time()
-        fit = _fit_gblup_reml_from_grm(
-            np.asarray(train_pheno, dtype=np.float64).reshape(-1),
-            np.asarray(gblup_cv_grm_full, dtype=np.float64),
+        backend_label = (
+            "packed active"
+            if _looks_like_packed_payload(packed_method_ctx)
+            else ("packed meta" if packed_method_ctx is not None else "dense")
         )
+        fit: dict[str, typing.Any]
+        if method == _GBLUP_METHOD_AD:
+            fit = _fit_gblup_ad_reml_from_grms(
+                np.asarray(train_pheno, dtype=np.float64).reshape(-1),
+                np.asarray(gblup_cv_grm_full, dtype=np.float64),
+                np.asarray(gblup_cv_grm_dom_full, dtype=np.float64),
+            )
+        else:
+            fit = _fit_gblup_reml_from_grm(
+                np.asarray(train_pheno, dtype=np.float64).reshape(-1),
+                np.asarray(gblup_cv_grm_full, dtype=np.float64),
+            )
         _emit_stage("fit_end", method=str(method), elapsed=float(max(0.0, time.time() - _t_fit_stage)))
         _emit_stage("predict_start", method=str(method))
         _t_pred_stage = time.time()
-        alpha = np.asarray(fit["alpha"], dtype=np.float64).reshape(-1, 1)
-        beta = float(fit["beta"])
-        pve_final = float(fit["pve"])
-        if gblup_final_test_train is None or int(gblup_final_test_train.shape[0]) == 0:
-            test_pred = np.zeros((0, 1), dtype=float)
-        else:
-            test_pred = _predict_gblup_from_cross(
-                cross_kernel=np.asarray(gblup_final_test_train, dtype=np.float64),
-                alpha=alpha,
-                beta=beta,
+        dense_add_marker: np.ndarray | None = None
+        dense_dom_marker: np.ndarray | None = None
+        if packed_method_ctx is None and hasattr(final_train, "shape") and len(getattr(final_train, "shape")) >= 2:
+            dense_add_marker = np.ascontiguousarray(np.asarray(final_train, dtype=np.float32), dtype=np.float32)
+            if method in {_GBLUP_METHOD_DOM, _GBLUP_METHOD_AD}:
+                dense_dom_marker = _dense_marker_matrix_for_gblup_kernel(
+                    dense_add_marker,
+                    kernel_mode="d",
+                )
+
+        pve_final = float(fit.get("pve", np.nan))
+        if method == _GBLUP_METHOD_AD:
+            if gblup_final_test_train is None or gblup_final_test_train_dom is None:
+                test_pred = np.zeros((0, 1), dtype=float)
+            else:
+                test_pred = _predict_gblup_ad_from_cross(
+                    fit=fit,
+                    cross_add=np.asarray(gblup_final_test_train, dtype=np.float64),
+                    cross_dom=np.asarray(gblup_final_test_train_dom, dtype=np.float64),
+                )
+            alpha_vec = np.ascontiguousarray(
+                np.asarray(fit.get("vinvr", np.zeros((0,), dtype=np.float64)), dtype=np.float64).reshape(-1),
+                dtype=np.float64,
             )
-        gblup_final_state = {
-            "variance_component_path": "grm",
-            "variance_component": "REML/GRM",
-            "backend": ("packed active" if packed_payload is not None else "dense"),
-        }
-        sigma_g2_fit = float(fit.get("sigma_g2", np.nan))
-        sigma_e2_fit = float(fit.get("sigma_e2", np.nan))
-        lambda_reml_fit = float(fit.get("lambda_reml", np.nan))
-        h2_fit = float(fit.get("pve", np.nan))
-        if np.isfinite(sigma_g2_fit):
-            gblup_final_state["sigma_g2"] = float(sigma_g2_fit)
-        if np.isfinite(sigma_e2_fit):
-            gblup_final_state["sigma_e2"] = float(sigma_e2_fit)
-        if np.isfinite(lambda_reml_fit):
-            gblup_final_state["lambda_reml"] = float(lambda_reml_fit)
-        if np.isfinite(h2_fit):
-            gblup_final_state["h2"] = float(h2_fit)
+            g_theta = np.ascontiguousarray(
+                np.asarray(fit.get("g_theta", np.zeros((0,), dtype=np.float64)), dtype=np.float64).reshape(-1),
+                dtype=np.float64,
+            )
+            g_scales = np.ascontiguousarray(
+                np.asarray(fit.get("g_scales", np.ones((0,), dtype=np.float64)), dtype=np.float64).reshape(-1),
+                dtype=np.float64,
+            )
+            coef_a = (
+                float(g_theta[0]) / float(max(1e-12, float(g_scales[0])))
+                if int(g_theta.size) >= 2 and int(g_scales.size) >= 2
+                else 1.0
+            )
+            coef_d = (
+                float(g_theta[1]) / float(max(1e-12, float(g_scales[1])))
+                if int(g_theta.size) >= 2 and int(g_scales.size) >= 2
+                else 1.0
+            )
+            beta_a = _kernel_projection_beta_from_backend(
+                packed_ctx=(
+                    typing.cast(dict[str, typing.Any], packed_method_ctx)
+                    if packed_method_ctx is not None
+                    else None
+                ),
+                sample_indices=final_train_idx_arg,
+                alpha=alpha_vec,
+                mode="a",
+                coef=float(coef_a),
+                dense_marker_by_sample=dense_add_marker,
+                n_jobs=n_jobs,
+            )
+            beta_d = _kernel_projection_beta_from_backend(
+                packed_ctx=(
+                    typing.cast(dict[str, typing.Any], packed_method_ctx)
+                    if packed_method_ctx is not None
+                    else None
+                ),
+                sample_indices=final_train_idx_arg,
+                alpha=alpha_vec,
+                mode="d",
+                coef=float(coef_d),
+                dense_marker_by_sample=dense_dom_marker,
+                n_jobs=n_jobs,
+            )
+            beta_sum = None
+            if beta_a is not None and beta_d is not None:
+                beta_sum = np.ascontiguousarray(
+                    np.asarray(beta_a, dtype=np.float64) + np.asarray(beta_d, dtype=np.float64),
+                    dtype=np.float64,
+                )
+            model_state_final = {
+                "kind": "gblup_kernel_projection_ad",
+                "method": str(method),
+                "effect_kind": "kernel_projection",
+                "alpha": float(np.mean(np.asarray(train_pheno, dtype=np.float64))),
+                "beta_a": (None if beta_a is None else np.ascontiguousarray(beta_a, dtype=np.float64)),
+                "beta_d": (None if beta_d is None else np.ascontiguousarray(beta_d, dtype=np.float64)),
+                "kernel_projection_a": (None if beta_a is None else np.ascontiguousarray(beta_a, dtype=np.float64)),
+                "kernel_projection_d": (None if beta_d is None else np.ascontiguousarray(beta_d, dtype=np.float64)),
+                "kernel_projection": beta_sum,
+                "beta": beta_sum,
+                "packed": bool(packed_method_ctx is not None),
+                "standardized": False,
+                "kernel_mode": "ad",
+                "pve": float(pve_final),
+            }
+            gblup_final_state = {
+                "variance_component_path": "grm",
+                "variance_component": "REML/GRM",
+                "backend": backend_label,
+                "kernel_mode": "ad",
+            }
+            sigma_a2_fit = float(fit.get("sigma_a2", np.nan))
+            sigma_d2_fit = float(fit.get("sigma_d2", np.nan))
+            sigma_e2_fit = float(fit.get("sigma_e2", np.nan))
+            lambda_reml_fit = float(fit.get("lambda_reml", np.nan))
+            h2_fit = float(fit.get("pve", np.nan))
+            if np.isfinite(sigma_a2_fit) and np.isfinite(sigma_d2_fit):
+                gblup_final_state["sigma_g2"] = float(sigma_a2_fit + sigma_d2_fit)
+            if np.isfinite(sigma_a2_fit):
+                gblup_final_state["sigma_a2"] = float(sigma_a2_fit)
+            if np.isfinite(sigma_d2_fit):
+                gblup_final_state["sigma_d2"] = float(sigma_d2_fit)
+            if np.isfinite(sigma_e2_fit):
+                gblup_final_state["sigma_e2"] = float(sigma_e2_fit)
+            if np.isfinite(lambda_reml_fit):
+                gblup_final_state["lambda_reml"] = float(lambda_reml_fit)
+            if np.isfinite(h2_fit):
+                gblup_final_state["h2"] = float(h2_fit)
+        else:
+            alpha = np.asarray(fit["alpha"], dtype=np.float64).reshape(-1, 1)
+            beta = float(fit["beta"])
+            if gblup_final_test_train is None or int(gblup_final_test_train.shape[0]) == 0:
+                test_pred = np.zeros((0, 1), dtype=float)
+            else:
+                test_pred = _predict_gblup_from_cross(
+                    cross_kernel=np.asarray(gblup_final_test_train, dtype=np.float64),
+                    alpha=alpha,
+                    beta=beta,
+                )
+            alpha_vec = np.asarray(alpha, dtype=np.float64).reshape(-1)
+            beta_kp = _kernel_projection_beta_from_backend(
+                packed_ctx=(
+                    typing.cast(dict[str, typing.Any], packed_method_ctx)
+                    if packed_method_ctx is not None
+                    else None
+                ),
+                sample_indices=final_train_idx_arg,
+                alpha=alpha_vec,
+                mode=("d" if method == _GBLUP_METHOD_DOM else "a"),
+                coef=1.0,
+                dense_marker_by_sample=(
+                    dense_dom_marker if method == _GBLUP_METHOD_DOM else dense_add_marker
+                ),
+                n_jobs=n_jobs,
+            )
+            model_state_final = {
+                "kind": "gblup_kernel_projection",
+                "method": str(method),
+                "effect_kind": "kernel_projection",
+                "alpha": float(np.mean(np.asarray(train_pheno, dtype=np.float64))),
+                "kernel_projection": (
+                    np.ascontiguousarray(beta_kp, dtype=np.float64)
+                    if beta_kp is not None
+                    else None
+                ),
+                "beta": (
+                    np.ascontiguousarray(beta_kp, dtype=np.float64)
+                    if beta_kp is not None
+                    else None
+                ),
+                "packed": bool(packed_method_ctx is not None),
+                "standardized": False,
+                "kernel_mode": ("d" if method == _GBLUP_METHOD_DOM else "a"),
+                "pve": float(pve_final),
+            }
+            gblup_final_state = {
+                "variance_component_path": "grm",
+                "variance_component": "REML/GRM",
+                "backend": backend_label,
+                "kernel_mode": ("d" if method == _GBLUP_METHOD_DOM else "a"),
+            }
+            sigma_g2_fit = float(fit.get("sigma_g2", np.nan))
+            sigma_e2_fit = float(fit.get("sigma_e2", np.nan))
+            lambda_reml_fit = float(fit.get("lambda_reml", np.nan))
+            h2_fit = float(fit.get("pve", np.nan))
+            if np.isfinite(sigma_g2_fit):
+                gblup_final_state["sigma_g2"] = float(sigma_g2_fit)
+                if method == _GBLUP_METHOD_DOM:
+                    gblup_final_state["sigma_d2"] = float(sigma_g2_fit)
+            if np.isfinite(sigma_e2_fit):
+                gblup_final_state["sigma_e2"] = float(sigma_e2_fit)
+            if np.isfinite(lambda_reml_fit):
+                gblup_final_state["lambda_reml"] = float(lambda_reml_fit)
+            if np.isfinite(h2_fit):
+                gblup_final_state["h2"] = float(h2_fit)
         _emit_stage("predict_end", method=str(method), elapsed=float(max(0.0, time.time() - _t_pred_stage)))
     else:
         rr_cfg_final: dict[str, typing.Any] | None = rrblup_adamw_cfg
@@ -9628,15 +10808,21 @@ def _run_methods_parallel(
                     vc_label = "REML/FaST"
             rows.append(("method", vc_label))
             if mode == "ad":
-                rows.append(("backend", "pyBLUP/JAX"))
+                backend_ad = str(gblup_state.get("backend", "")).strip()
+                rows.append(("backend", backend_ad if backend_ad != "" else "REML/GRM"))
             elif mode == "d":
                 backend_d = str(gblup_state.get("backend", "pyBLUP/FaST(d)")).strip()
                 rows.append(("backend", backend_d if backend_d != "" else "pyBLUP/FaST(d)"))
             else:
+                backend_a = str(gblup_state.get("backend", "")).strip()
                 rows.append(
                     (
                         "backend",
-                        ("packed active" if _looks_like_packed_payload(packed_ctx) else "dense"),
+                        (
+                            backend_a
+                            if backend_a != ""
+                            else ("packed active" if _looks_like_packed_payload(packed_ctx) else "dense")
+                        ),
                     )
                 )
             sigma_g2 = float(gblup_state.get("sigma_g2", np.nan))
@@ -11945,6 +13131,27 @@ def _load_plink_packed_for_lmm(
     return sample_ids_arr, packed_ctx
 
 
+def _load_plink_stats_for_lmm(
+    genotype_prefix: str,
+    *,
+    maf: float,
+    missing_rate: float,
+) -> tuple[np.ndarray, dict[str, typing.Any]]:
+    """
+    Load PLINK BED filter metadata for streaming packed-BED kernels.
+
+    Unlike `_load_plink_packed_for_lmm`, this keeps only GWAS-consistent
+    marker statistics and row filters, and defers actual BED payload access.
+    """
+    sample_ids_arr, packed_ctx = prepare_packed_stats_ctx_from_plink(
+        str(genotype_prefix),
+        maf=float(maf),
+        missing_rate=float(missing_rate),
+        snps_only=False,
+    )
+    return sample_ids_arr, packed_ctx
+
+
 def _decode_packed_ctx_to_dense(
     packed_ctx: dict[str, typing.Any],
 ) -> np.ndarray:
@@ -13567,6 +14774,17 @@ def parse_args(argv: typing.Optional[list[str]] = None):
         help="Number of CPU threads (default: %(default)s).",
     )
     optional_group.add_argument(
+        "-mem", "--memory",
+        type=float,
+        default=1.0,
+        help=(
+            "Decode block memory budget in GB for streamed BED kernels in GS. "
+            "Applied to rrBLUP-PCG, GBLUP(add), and BayesA/B/Cpi streamed BED paths; "
+            "if a kernel keeps two decode buffers, each block uses about half of this budget "
+            "(default: %(default)s)."
+        ),
+    )
+    optional_group.add_argument(
         "-limit-predtrain", "--limit-predtrain",
         "-limit-train", "--limit-train",
         type=int,
@@ -13589,7 +14807,7 @@ def parse_args(argv: typing.Optional[list[str]] = None):
     optional_group.add_argument(
         "--rrblup-solver",
         type=str,
-        choices=("exact", "adamw", "pcg", "auto"),
+        choices=("pcg",),
         default="pcg",
         help=argparse.SUPPRESS,
     )
@@ -13963,6 +15181,10 @@ def parse_args(argv: typing.Optional[list[str]] = None):
         parser.error("--rrblup-epochs must be > 0.")
     if int(args.rrblup_batch_size) <= 0:
         parser.error("-batchsize/--batchsize/--rrblup-batch-size must be > 0.")
+    try:
+        args.memory = _normalize_memory_gb(args.memory)
+    except ValueError as e:
+        parser.error(str(e))
     if int(args.rrblup_batch_threads) < 0:
         parser.error("--rrblup-batch-threads must be >= 0.")
     if args.rrblup_snp_block_size is None:
@@ -14473,6 +15695,13 @@ def _run_gs_pipeline(
             "or provide --model with discoverable *.jxmodel files."
         )
         raise SystemExit(1)
+    if args.rrBLUP:
+        if getattr(args, "hash_dim", None) is not None:
+            logger.error("GS rrBLUP no longer supports --hash. Use the direct rrBLUP packed path instead.")
+            raise SystemExit(1)
+        if getattr(args, "ldprune_spec", None) is not None:
+            logger.error("GS rrBLUP no longer supports --ldprune. Use the direct rrBLUP packed path instead.")
+            raise SystemExit(1)
     if model_mode:
         unsupported = [m for m in methods if not _is_jxmodel_export_supported(m)]
         if len(unsupported) > 0:
@@ -14837,11 +16066,23 @@ def _run_gs_pipeline(
         getattr(args, "ldprune_spec", None),
     )
     rrblup_only_mode = bool(args.rrBLUP) and all(str(m) == "rrBLUP" for m in methods)
-    packed_lazy_main_requested = bool(
-        rrblup_only_mode
-        and gfile_is_plink
+    stream_meta_method_set = {
+        _GBLUP_METHOD_ADD,
+        _GBLUP_METHOD_DOM,
+        _GBLUP_METHOD_AD,
+        "rrBLUP",
+        "BayesA",
+        "BayesB",
+        "BayesCpi",
+    }
+    ml_requested = bool(any(m in ml_methods for m in methods))
+    packed_meta_only_main_requested = bool(
+        gfile_is_plink
         and (args.hash_dim is None)
         and (ldprune_spec is None)
+        and (not ml_requested)
+        and len(methods) > 0
+        and all(str(m) in stream_meta_method_set for m in methods)
     )
     preprocess_qc_requested = bool(
         (args.hash_dim is not None) or (ldprune_spec is not None)
@@ -14849,25 +16090,22 @@ def _run_gs_pipeline(
     packed_lmm_ctx: dict[str, typing.Any] | None = None
     packed_qc_baseline_ctx: dict[str, typing.Any] | None = None
     geno_is_memmap = False
-    rrblup_aux_packed_ctx_requested = bool(
-        bool(args.rrBLUP)
-        and (str(rr_solver_mode) in {"pcg", "auto"})
-        and gfile_is_plink
-        and (not use_packed_lmm)
-        and (args.hash_dim is None)
-        and (ldprune_spec is None)
-    )
-    rrblup_aux_packed_ctx: dict[str, typing.Any] | None = None
-    rrblup_aux_dense_to_packed_idx: np.ndarray | None = None
     if use_packed_lmm:
         with CliStatus(f"Loading genotype from {gsrc}...", enabled=use_spinner) as task:
             try:
-                sample_ids, packed_lmm_ctx = _load_plink_packed_for_lmm(
-                    str(gfile),
-                    maf=float(args.maf),
-                    missing_rate=float(args.geno),
-                    filter_mode=("lazy" if packed_lazy_main_requested else "compact"),
-                )
+                if packed_meta_only_main_requested:
+                    sample_ids, packed_lmm_ctx = _load_plink_stats_for_lmm(
+                        str(gfile),
+                        maf=float(args.maf),
+                        missing_rate=float(args.geno),
+                    )
+                else:
+                    sample_ids, packed_lmm_ctx = _load_plink_packed_for_lmm(
+                        str(gfile),
+                        maf=float(args.maf),
+                        missing_rate=float(args.geno),
+                        filter_mode="compact",
+                    )
             except Exception:
                 task.fail(f"Loading genotype from {gsrc} ...Failed")
                 raise
@@ -14877,7 +16115,8 @@ def _run_gs_pipeline(
                 if packed_lmm_ctx is not None
                 else 0
             )
-            task.complete(f"Loading genotype from {gsrc} (n={n}, nSNP={m}, packed)")
+            load_kind = "packed-meta" if packed_meta_only_main_requested else "packed"
+            task.complete(f"Loading genotype from {gsrc} (n={n}, nSNP={m}, {load_kind})")
         _emit_packed_load_debug(
             packed_lmm_ctx,
             label="main",
@@ -15368,59 +16607,67 @@ def _run_gs_pipeline(
                 geno.std(axis=1, keepdims=True) + 1e-6
             )  # standardization for marker-effect models
 
-    if rrblup_aux_packed_ctx_requested:
+    if packed_lmm_ctx is not None:
+        _attach_stream_decode_budget_to_packed_ctx(
+            packed_ctx=packed_lmm_ctx,
+            memory_gb=args.memory,
+            debug=bool(debug_mode),
+            logger=logger,
+        )
+
+    if use_packed_lmm and ml_requested:
+        if not _looks_like_packed_payload(packed_lmm_ctx):
+            raise RuntimeError(
+                "ML methods require a resident packed payload or dense genotype matrix. "
+                "The current GS packed context does not carry `packed` rows."
+            )
+        packed_payload_for_ml = typing.cast(dict[str, typing.Any], packed_lmm_ctx)
+        active_m = _packed_ctx_active_rows(packed_payload_for_ml)
+        n_all = int(packed_payload_for_ml["n_samples"])
+        dense_est = _estimate_dense_f32_bytes(active_m, n_all, copies=1)
         with CliStatus(
-            f"Loading packed rrBLUP helper from {gsrc}...",
+            "Materializing dense genotype for ML methods "
+            f"(est={_format_debug_bytes(dense_est)})...",
             enabled=use_spinner,
         ) as task:
             try:
-                rrblup_aux_sample_ids, rrblup_aux_packed_ctx = _load_plink_packed_for_lmm(
-                    str(gfile),
-                    maf=float(args.maf),
-                    missing_rate=float(args.geno),
-                    filter_mode="lazy",
+                geno_ml_raw = _decode_packed_subset_to_dense_raw_f32(
+                    packed_payload_for_ml,
+                    np.ascontiguousarray(np.arange(n_all, dtype=np.int64), dtype=np.int64),
                 )
             except Exception:
-                task.fail("Loading packed rrBLUP helper ...Failed")
+                task.fail("Materializing dense genotype for ML methods ...Failed")
                 raise
-            dense_ids = np.asarray(samples, dtype=str).reshape(-1)
-            packed_ids = np.asarray(rrblup_aux_sample_ids, dtype=str).reshape(-1)
-            if int(dense_ids.shape[0]) != int(packed_ids.shape[0]):
-                raise RuntimeError(
-                    "Packed rrBLUP helper sample-size mismatch: "
-                    f"dense n={int(dense_ids.shape[0])}, packed n={int(packed_ids.shape[0])}."
-                )
-            if np.array_equal(dense_ids, packed_ids):
-                rrblup_aux_dense_to_packed_idx = np.arange(int(dense_ids.shape[0]), dtype=np.int64)
-            else:
-                packed_pos = {str(sid): int(i) for i, sid in enumerate(packed_ids)}
-                mapped_idx = np.fromiter(
-                    (packed_pos.get(str(sid), -1) for sid in dense_ids),
-                    dtype=np.int64,
-                    count=int(dense_ids.shape[0]),
-                )
-                if np.any(mapped_idx < 0):
-                    missing_ids = dense_ids[mapped_idx < 0]
-                    preview = ",".join([str(x) for x in missing_ids[:3]])
-                    raise RuntimeError(
-                        "Packed rrBLUP helper could not align sample IDs with dense genotype order. "
-                        f"Missing examples: {preview}"
-                    )
-                rrblup_aux_dense_to_packed_idx = np.ascontiguousarray(mapped_idx, dtype=np.int64)
-            m_aux = (
-                _packed_ctx_active_rows(rrblup_aux_packed_ctx)
-                if rrblup_aux_packed_ctx is not None
-                else 0
-            )
             task.complete(
-                "Loading packed rrBLUP helper ...Finished "
-                f"(n={int(packed_ids.shape[0])}, nSNP={m_aux})"
+                "Materializing dense genotype for ML methods ...Finished "
+                f"(n={n_all}, nSNP={active_m}, est={_format_debug_bytes(dense_est)})"
             )
-        _emit_packed_load_debug(
-            rrblup_aux_packed_ctx,
-            label="rrblup_aux",
-            enabled=bool(debug_mode),
+        if bool(debug_mode):
+            logger.info(
+                "[GS-DEBUG] ML dense preload "
+                f"shape={tuple(np.asarray(geno_ml_raw).shape)} "
+                f"est_bytes={dense_est}"
+            )
+
+    if bool(args.rrBLUP) and (str(rr_solver_mode).strip().lower() == "pcg"):
+        memory_mb = _memory_gb_to_mb(args.memory)
+        rr_block_rows = calc_decode_block_rows_from_memory_mb(
+            int(len(samples)),
+            float(memory_mb),
+            elem_bytes=4,
+            buffers=2,
+            min_rows=1,
         )
+        if rr_block_rows is not None:
+            rrblup_adamw_cfg["snp_block_size"] = int(max(1, int(rr_block_rows)))
+            rrblup_adamw_cfg["pcg_block_rows"] = int(max(1, int(rr_block_rows)))
+            if bool(debug_mode):
+                logger.info(
+                    "[GS-DEBUG] rrBLUP-PCG decode budget "
+                    f"memory_gb={float(args.memory):.6g} "
+                    f"n_samples={int(len(samples))} "
+                    f"block_rows={int(rrblup_adamw_cfg['pcg_block_rows'])}"
+                )
 
     # Cache for repeated trait train/test partitions in GBLUP-only hash kinship mode.
     # Key: (train_idx bytes, test_idx bytes) in genotype sample order.
@@ -15594,10 +16841,6 @@ def _run_gs_pipeline(
         trait_use_packed_lmm = bool(use_packed_lmm)
         trait_packed_ctx: dict[str, typing.Any] | None = packed_lmm_ctx
         trait_packed_index_map: np.ndarray | None = None
-        if (not trait_use_packed_lmm) and (trait_packed_ctx is None) and (rrblup_aux_packed_ctx is not None):
-            # Mixed-method runs may still need packed BED for rrBLUP(pcg/auto).
-            trait_packed_ctx = typing.cast(dict[str, typing.Any], rrblup_aux_packed_ctx)
-            trait_packed_index_map = rrblup_aux_dense_to_packed_idx
         gblup_backend_label: str | None = None
         gblup_backend_n: int | None = None
         gblup_backend_m: int | None = None
@@ -16116,6 +17359,13 @@ def _run_gs_pipeline(
                     raise RuntimeError("Internal error: raw genotype matrix for MLGS is missing.")
                 train_snp_ml = geno_ml_raw[:, trainmask]
                 test_snp_ml = geno_ml_raw[:, testmask]
+        elif any(m in ml_methods for m in methods):
+            if geno_ml_raw is None:
+                raise RuntimeError(
+                    "Internal error: ML dense preload is missing for packed GS mixed-method run."
+                )
+            train_snp_ml = geno_ml_raw[:, trainmask]
+            test_snp_ml = geno_ml_raw[:, testmask]
         if single_trait_mode and (not trait_use_packed_lmm) and (geno is not None):
             # In single-trait runs, release full matrices once train/test views are materialized.
             # This avoids carrying an extra full-genotype buffer through model fitting.
@@ -16126,6 +17376,11 @@ def _run_gs_pipeline(
             gc.collect()
             if _GS_DEBUG_STAGE:
                 logger.info(f"[GS-DEBUG][{trait_name}] stage=release_full_geno done=1")
+        elif single_trait_mode and trait_use_packed_lmm and (geno_ml_raw is not None):
+            geno_ml_raw = None
+            gc.collect()
+            if _GS_DEBUG_STAGE:
+                logger.info(f"[GS-DEBUG][{trait_name}] stage=release_ml_dense done=1")
 
         if hash_gblup_only_mode:
             eff_snp = int(args.hash_dim)
@@ -16276,7 +17531,11 @@ def _run_gs_pipeline(
                 ),
                 gblup_variance_component=gblup_variance_component_label,
                 gblup_backend_label=(
-                    "packed active" if _looks_like_packed_payload(trait_packed_ctx) else "dense"
+                    (
+                        "packed active"
+                        if _looks_like_packed_payload(trait_packed_ctx)
+                        else ("packed meta" if _looks_like_packed_ctx(trait_packed_ctx) else "dense")
+                    )
                 ),
                 gblup_pve=float(res_obj.get("pve_final", np.nan)),
             )
@@ -16292,7 +17551,7 @@ def _run_gs_pipeline(
                 if isinstance(state_raw, dict) and len(state_raw) > 0:
                     packed_ctx_for_export = (
                         typing.cast(dict[str, typing.Any], trait_packed_ctx)
-                        if _looks_like_packed_payload(trait_packed_ctx)
+                        if _looks_like_packed_ctx(trait_packed_ctx)
                         else None
                     )
                     if can_model_export:
@@ -16320,11 +17579,9 @@ def _run_gs_pipeline(
                         model_out_export = str(model_out)
                     try:
                         fallback_marker_count = None
-                        if _looks_like_packed_payload(trait_packed_ctx):
-                            fallback_marker_count = int(
-                                np.asarray(
-                                    typing.cast(dict[str, typing.Any], trait_packed_ctx)["packed"]
-                                ).shape[0]
+                        if _looks_like_packed_ctx(trait_packed_ctx):
+                            fallback_marker_count = _packed_ctx_active_rows(
+                                typing.cast(dict[str, typing.Any], trait_packed_ctx)
                             )
                         elif train_snp is not None:
                             fallback_marker_count = int(np.asarray(train_snp).shape[0])

@@ -29,7 +29,7 @@ PCA computation strategy
 
 Output:
   - {prefix}.eigenvec      : sample IDs + PC coordinates (first column is ID)
-  - {prefix}.eigenval      : eigenvalues (variance along each PC)
+  - {prefix}.eigenval      : eigenvalues plus explained-variance ratio per PC
   - Optional plots:
       * {prefix}.eigenvec.2D.pdf
       * {prefix}.eigenvec.3D.gif
@@ -54,22 +54,11 @@ from contextlib import contextmanager
 
 import numpy as np
 import pandas as pd
-import matplotlib as mpl
-import matplotlib.pyplot as plt
 import psutil
 import janusx as jx_pkg
 from janusx import janusx as jxrs
-
-mpl.use("Agg")
-logging.getLogger("fontTools.subset").setLevel(logging.ERROR)
-logging.getLogger("matplotlib.font_manager").setLevel(logging.ERROR)
-mpl.rcParams["pdf.fonttype"] = 42
-mpl.rcParams["ps.fonttype"] = 42
-from janusx.bioplotkit.sci_set import color_set
-from janusx.bioplotkit.pcshow import PCSHOW
 from janusx.gfreader import (
     calc_decode_block_rows_from_memory_mb,
-    load_genotype_chunks,
     inspect_genotype_file,
     auto_mmap_window_mb,
     prepare_cli_input_cache,
@@ -100,6 +89,26 @@ from ._common.threads import detect_effective_threads
 # ======================================================================
 
 DEFAULT_BED_MEMORY_GB = 1.0
+_PCA_PLOT_BACKEND = None
+
+
+def _get_pca_plot_backend():
+    global _PCA_PLOT_BACKEND
+    if _PCA_PLOT_BACKEND is not None:
+        return _PCA_PLOT_BACKEND
+    import matplotlib as mpl
+
+    mpl.use("Agg")
+    logging.getLogger("fontTools.subset").setLevel(logging.ERROR)
+    logging.getLogger("matplotlib.font_manager").setLevel(logging.ERROR)
+    mpl.rcParams["pdf.fonttype"] = 42
+    mpl.rcParams["ps.fonttype"] = 42
+    import matplotlib.pyplot as plt
+    from janusx.bioplotkit.sci_set import color_set
+    from janusx.bioplotkit.pcshow import PCSHOW
+
+    _PCA_PLOT_BACKEND = (mpl, plt, PCSHOW, color_set)
+    return _PCA_PLOT_BACKEND
 
 
 def _normalize_memory_gb(memory_gb: Union[int, float, None]) -> float:
@@ -269,11 +278,12 @@ def _rsvd_worker(
     force_packed_bed: bool,
     eval_path: str,
     evec_path: str,
+    trace_path: str,
 ) -> None:
     try:
         if bool(force_packed_bed):
             os.environ["JANUSX_RSVD_BED_PACKED"] = "1"
-        eval_raw, evec_raw = jxrs.admx_rsvd_stream_sample(
+        eval_raw, evec_raw, total_variance = jxrs.admx_rsvd_stream_sample(
             str(genotype_path),
             int(dim),
             int(seed),
@@ -289,6 +299,7 @@ def _rsvd_worker(
         evec_np = np.asarray(evec_raw, dtype=np.float32)
         np.save(eval_path, eval_np)
         np.save(evec_path, evec_np)
+        np.save(trace_path, np.asarray([float(total_variance)], dtype=np.float64))
         q.put(("ok", ""))
     except Exception as e:
         q.put(("err", str(e)))
@@ -330,12 +341,13 @@ def _run_rsvd_subprocess(
     mmap_window_mb: int,
     force_packed_bed: bool,
     progress_callback=None,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, float]:
     ctx = _select_rsvd_mp_context()
     q = ctx.Queue(maxsize=1)
     tmpdir = tempfile.mkdtemp(prefix="janusx_pca_rsvd_")
     eval_path = os.path.join(tmpdir, "eval.npy")
     evec_path = os.path.join(tmpdir, "evec.npy")
+    trace_path = os.path.join(tmpdir, "trace.npy")
     proc = ctx.Process(
         target=_rsvd_worker,
         args=(
@@ -352,6 +364,7 @@ def _run_rsvd_subprocess(
             bool(force_packed_bed),
             str(eval_path),
             str(evec_path),
+            str(trace_path),
         ),
         daemon=True,
     )
@@ -383,7 +396,15 @@ def _run_rsvd_subprocess(
             raise RuntimeError("Random-SVD worker did not return completion state.")
         eval_np = np.load(eval_path)
         evec_np = np.load(evec_path)
-        return np.asarray(eval_np, dtype=np.float32), np.asarray(evec_np, dtype=np.float32)
+        trace_np = np.asarray(np.load(trace_path), dtype=np.float64).reshape(-1)
+        if trace_np.size == 0 or (not np.isfinite(trace_np[0])) or trace_np[0] <= 0.0:
+            raise RuntimeError("Random-SVD worker returned invalid total variance.")
+        total_variance = float(trace_np[0])
+        return (
+            np.asarray(eval_np, dtype=np.float32),
+            np.asarray(evec_np, dtype=np.float32),
+            total_variance,
+        )
     finally:
         try:
             if proc.is_alive():
@@ -396,6 +417,60 @@ def _run_rsvd_subprocess(
         except Exception:
             pass
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _run_rsvd_direct(
+    *,
+    genotype_path: str,
+    dim: int,
+    seed: int,
+    power: int,
+    tol: float,
+    snps_only: bool,
+    maf: float,
+    missing_rate: float,
+    mmap_window_mb: int,
+    force_packed_bed: bool,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    prev_pack = os.environ.get("JANUSX_RSVD_BED_PACKED")
+    try:
+        if bool(force_packed_bed):
+            os.environ["JANUSX_RSVD_BED_PACKED"] = "1"
+        eval_raw, evec_raw, total_variance = jxrs.admx_rsvd_stream_sample(
+            str(genotype_path),
+            int(dim),
+            int(seed),
+            int(power),
+            float(tol),
+            bool(snps_only),
+            float(maf),
+            float(missing_rate),
+            None,
+            int(mmap_window_mb),
+        )
+    finally:
+        if prev_pack is None:
+            os.environ.pop("JANUSX_RSVD_BED_PACKED", None)
+        else:
+            os.environ["JANUSX_RSVD_BED_PACKED"] = prev_pack
+    total_variance = float(total_variance)
+    if (not np.isfinite(total_variance)) or total_variance <= 0.0:
+        raise RuntimeError("Random-SVD returned invalid total variance.")
+    return (
+        np.asarray(eval_raw, dtype=np.float32),
+        np.asarray(evec_raw, dtype=np.float32),
+        total_variance,
+    )
+
+
+def _use_rsvd_subprocess() -> bool:
+    raw = str(
+        os.environ.get(
+            "JX_PCA_RSVD_SUBPROCESS",
+            os.environ.get("JANUSX_PCA_RSVD_SUBPROCESS", ""),
+        )
+    ).strip().lower()
+    return raw in {"1", "true", "yes", "on"}
 
 
 def _algo_spinner_symbol(elapsed_s: float) -> str:
@@ -497,6 +572,50 @@ def _log_saved_eigen_results(logger, outprefix: str) -> None:
     )
 
 
+def _compute_explained_ratio(
+    eigenval: np.ndarray,
+    total_variance: float | None = None,
+) -> np.ndarray:
+    evals = np.asarray(eigenval, dtype=np.float64).reshape(-1)
+    if total_variance is None:
+        total = float(np.sum(evals))
+    else:
+        total = float(total_variance)
+    if not np.isfinite(total) or total <= 0.0:
+        return np.zeros_like(evals, dtype=np.float64)
+    return evals / total
+
+
+def _write_eigenval_table(
+    out_path: str,
+    eigenval: np.ndarray,
+    total_variance: float | None = None,
+) -> None:
+    evals = np.asarray(eigenval, dtype=np.float64).reshape(-1)
+    explained_ratio = _compute_explained_ratio(evals, total_variance=total_variance)
+    table = np.column_stack([evals, explained_ratio])
+    np.savetxt(
+        out_path,
+        table,
+        fmt=["%.8f", "%.8f"],
+        delimiter="\t",
+    )
+
+
+def _load_eigenval_table(path: str) -> tuple[np.ndarray, np.ndarray]:
+    arr = np.asarray(np.genfromtxt(path, ndmin=2), dtype=np.float64)
+    if arr.size == 0:
+        raise ValueError(f"Empty eigenval table: {path}")
+    if arr.ndim == 2 and arr.shape[1] >= 1:
+        evals = np.asarray(arr[:, 0], dtype=np.float64).reshape(-1)
+        if arr.shape[1] >= 2:
+            ratio = np.asarray(arr[:, 1], dtype=np.float64).reshape(-1)
+            if ratio.shape[0] == evals.shape[0] and np.all(np.isfinite(ratio)):
+                return evals, ratio
+        return evals, _compute_explained_ratio(evals)
+    raise ValueError(f"Invalid eigenval table shape: {arr.shape}")
+
+
 def _log_pca_eigh_backend(logger, evd_backend: str | None) -> None:
     backend = str(evd_backend).strip()
     if backend == "":
@@ -505,34 +624,6 @@ def _log_pca_eigh_backend(logger, evd_backend: str | None) -> None:
         logger.info(f"EIGH backend: {backend}")
     except Exception:
         pass
-
-
-def _count_effective_snps_from_input(
-    genofile: str,
-    *,
-    maf_threshold: float,
-    max_missing_rate: float,
-    snps_only: bool,
-    chunk_size: int = 100_000,
-) -> int:
-    """
-    Count effective SNP rows after MAF/missing filtering from current input.
-
-    For RSVD with VCF/HMP/TXT inputs, `genofile` is already a PLINK BED cache prefix,
-    so this count is read directly from cached BED chunks under the same filter setup.
-    """
-    eff_m = 0
-    scan_chunk = int(max(10_000, int(chunk_size)))
-    for genosub, _sites in load_genotype_chunks(
-        genofile,
-        chunk_size=scan_chunk,
-        maf=float(maf_threshold),
-        missing_rate=float(max_missing_rate),
-        impute=False,
-        snps_only=bool(snps_only),
-    ):
-        eff_m += int(genosub.shape[0])
-    return int(eff_m)
 
 
 def build_grm_streaming_for_pca(
@@ -1019,7 +1110,7 @@ def main(log: bool = True):
     if palette_idx == -1:
         args.color = None
     elif 0 <= palette_idx <= 6:
-        args.color = color_set[palette_idx]
+        args.color = int(palette_idx)
     else:
         logger.error("Color set index out of range; please use 0-6 or -1.")
         raise SystemExit(1)
@@ -1133,10 +1224,12 @@ def main(log: bool = True):
 
     eigenvec = None
     eigenval = None
+    explained_ratio = None
     samples = None
 
     # --- Case 1: VCF / BFILE -> memmap GRM -> PCA (aligned with GWAS) ---
     if args.vcf or args.hmp or args.file or args.bfile:
+        rsvd_total_variance = None
         load_src_disp = os.path.basename(str(gfile).rstrip("/\\")) or format_path_for_display(str(gfile))
         if bool(args.rsvd):
             rsvd_input = str(gfile)
@@ -1249,7 +1342,8 @@ def main(log: bool = True):
 
                 def _run_rsvd_only():
                     with _bed_block_target_env(memory_mb):
-                        return _run_rsvd_subprocess(
+                        run_fn = _run_rsvd_subprocess if _use_rsvd_subprocess() else _run_rsvd_direct
+                        call_kwargs = dict(
                             genotype_path=str(rsvd_input),
                             dim=int(args.dim),
                             seed=int(args.rsvd_seed),
@@ -1260,10 +1354,12 @@ def main(log: bool = True):
                             missing_rate=float(args.geno),
                             mmap_window_mb=int(mmap_window_mb) if mmap_window_mb is not None else 0,
                             force_packed_bed=bool(_is_plink_prefix_path(rsvd_input)),
-                            progress_callback=None,
                         )
+                        if run_fn is _run_rsvd_subprocess:
+                            call_kwargs["progress_callback"] = None
+                        return run_fn(**call_kwargs)
 
-                (eigenval, eigenvec), algo_elapsed_s = _run_with_algo_progress(
+                (eigenval, eigenvec, rsvd_total_variance), algo_elapsed_s = _run_with_algo_progress(
                     algo_name,
                     _run_rsvd_only,
                     logger=logger,
@@ -1337,10 +1433,14 @@ def main(log: bool = True):
             index=False,
             float_format="%.6f",
         )
-        np.savetxt(
+        explained_ratio = _compute_explained_ratio(
+            eigenval,
+            total_variance=rsvd_total_variance,
+        )
+        _write_eigenval_table(
             f"{outprefix}.eigenval",
             eigenval,
-            fmt="%.2f",
+            total_variance=rsvd_total_variance,
         )
         _log_saved_eigen_results(logger, outprefix)
 
@@ -1433,11 +1533,8 @@ def main(log: bool = True):
             index=False,
             float_format="%.6f",
         )
-        np.savetxt(
-            f"{outprefix}.eigenval",
-            eigenval,
-            fmt="%.2f",
-        )
+        explained_ratio = _compute_explained_ratio(eigenval)
+        _write_eigenval_table(f"{outprefix}.eigenval", eigenval)
         _log_saved_eigen_results(logger, outprefix)
 
     # --- Case 3: qcov prefix -> load PC results only for plotting ---
@@ -1447,7 +1544,7 @@ def main(log: bool = True):
         with CliStatus(f"Loading existing PC results from {qsrc}...", enabled=use_spinner) as task:
             try:
                 samples, eigenvec = _read_matrix_with_ids(f"{gfile}.eigenvec", logger, "Eigenvec")
-                eigenval = np.genfromtxt(f"{gfile}.eigenval")
+                eigenval, explained_ratio = _load_eigenval_table(f"{gfile}.eigenval")
             except Exception:
                 task.fail(f"Loading existing PC results from {qsrc} ...Failed")
                 raise
@@ -1467,7 +1564,12 @@ def main(log: bool = True):
 
     # ------------------------- Visualization -------------------------
     if args.plot or args.plot3D:
-        exp = 100 * eigenval / np.sum(eigenval)
+        _, plt, PCSHOW, color_set = _get_pca_plot_backend()
+        if isinstance(args.color, (int, np.integer)):
+            args.color = color_set[int(args.color)]
+        if explained_ratio is None:
+            explained_ratio = _compute_explained_ratio(eigenval)
+        exp = 100.0 * np.asarray(explained_ratio, dtype=np.float64).reshape(-1)
         df_pc = pd.DataFrame(
             eigenvec[:, :3],
             index=samples,

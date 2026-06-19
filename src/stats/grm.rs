@@ -2997,9 +2997,9 @@ pub fn grm_packed_f32<'py>(
     if n_samples == 0 {
         return Err(PyRuntimeError::new_err("n_samples must be > 0"));
     }
-    if method != 1 && method != 2 {
+    if method != 1 && method != 2 && method != 3 {
         return Err(PyRuntimeError::new_err(format!(
-            "unsupported method={method}; expected 1 (centered) or 2 (standardized)"
+            "unsupported method={method}; expected 1 (centered additive), 2 (standardized additive), or 3 (centered dominance)"
         )));
     }
 
@@ -3551,7 +3551,8 @@ pub fn grm_packed_f64<'py>(
     block_cols=65536,
     threads=0,
     progress_callback=None,
-    progress_every=0
+    progress_every=0,
+    mmap_window_mb=None
 ))]
 pub fn grm_bed_f64_from_meta<'py>(
     py: Python<'py>,
@@ -3565,10 +3566,11 @@ pub fn grm_bed_f64_from_meta<'py>(
     threads: usize,
     progress_callback: Option<Py<PyAny>>,
     progress_every: usize,
+    mmap_window_mb: Option<usize>,
 ) -> PyResult<Bound<'py, PyArray2<f64>>> {
-    if method != 1 && method != 2 {
+    if method != 1 && method != 2 && method != 3 {
         return Err(PyRuntimeError::new_err(format!(
-            "unsupported method={method}; expected 1 (centered) or 2 (standardized)"
+            "unsupported method={method}; expected 1 (centered additive), 2 (standardized additive), or 3 (centered dominance)"
         )));
     }
 
@@ -3615,6 +3617,55 @@ pub fn grm_bed_f64_from_meta<'py>(
 
     let grm_vec = py
         .detach(move || -> Result<Vec<f64>, String> {
+            let row_idx: Vec<usize> = row_idx64
+                .iter()
+                .map(|&sid| {
+                    if sid < 0 {
+                        Err(format!("row index must be non-negative, got {sid}"))
+                    } else {
+                        Ok(sid as usize)
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let progress = move |done: usize, total: usize| -> Result<(), String> {
+                if let Some(cb) = progress_callback.as_ref() {
+                    Python::attach(|py2| -> PyResult<()> {
+                        py2.check_signals()?;
+                        cb.call1(py2, (done, total))?;
+                        Ok(())
+                    })
+                    .map_err(|e| e.to_string())?;
+                } else {
+                    Python::attach(|py2| py2.check_signals()).map_err(|e| e.to_string())?;
+                }
+                Ok(())
+            };
+
+            if method == 1 || method == 3 {
+                let total = row_idx.len().max(1);
+                if progress_every > 0 {
+                    progress(0usize, total)?;
+                }
+                let stream_mode = if method == 3 {
+                    crate::gblup::StreamKernelMode::Dominance
+                } else {
+                    crate::gblup::StreamKernelMode::Additive
+                };
+                let (grm, _row_sum, _varsum) = crate::gblup::build_grm_from_meta_stream(
+                    &bed_prefix,
+                    row_idx.as_slice(),
+                    row_flip_vec.as_slice(),
+                    row_maf_vec.as_slice(),
+                    sample_idx.as_slice(),
+                    stream_mode,
+                    block_cols,
+                    threads,
+                    mmap_window_mb,
+                )?;
+                progress(total, total)?;
+                return Ok(grm);
+            }
+
             let bed_path = format!("{bed_prefix}.bed");
             let bed_file =
                 File::open(&bed_path).map_err(|e| format!("failed to open {bed_path}: {e}"))?;
@@ -3634,18 +3685,11 @@ pub fn grm_bed_f64_from_meta<'py>(
                 ));
             }
             let n_snps_total = data_len / bytes_per_snp;
-            let row_idx: Vec<usize> = row_idx64
-                .iter()
-                .map(|&sid| {
-                    if sid < 0 || (sid as usize) >= n_snps_total {
-                        Err(format!(
-                            "row index out of range: {sid} for n_snps={n_snps_total}"
-                        ))
-                    } else {
-                        Ok(sid as usize)
-                    }
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+            if let Some(&bad) = row_idx.iter().find(|&&sid| sid >= n_snps_total) {
+                return Err(format!(
+                    "row index out of range: {bad} for n_snps={n_snps_total}"
+                ));
+            }
             let packed_src = &mmap[3..];
             let rows_identity = row_idx.len() == n_snps_total
                 && row_idx.iter().enumerate().all(|(i, &idx)| i == idx);
@@ -3659,19 +3703,6 @@ pub fn grm_bed_f64_from_meta<'py>(
                     out.extend_from_slice(&packed_src[start..end]);
                 }
                 Cow::Owned(out)
-            };
-            let progress = move |done: usize, total: usize| -> Result<(), String> {
-                if let Some(cb) = progress_callback.as_ref() {
-                    Python::attach(|py2| -> PyResult<()> {
-                        py2.check_signals()?;
-                        cb.call1(py2, (done, total))?;
-                        Ok(())
-                    })
-                    .map_err(|e| e.to_string())?;
-                } else {
-                    Python::attach(|py2| py2.check_signals()).map_err(|e| e.to_string())?;
-                }
-                Ok(())
             };
             let (grm, _row_sum, _varsum) = grm_packed_f64_core_impl(
                 packed_keep.as_ref(),

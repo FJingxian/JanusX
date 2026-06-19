@@ -10,6 +10,7 @@ use crate::binsidecar::{
     BIN_SITE_HEADER_LEN, BIN_SITE_MAGIC, LEGACY_BSITE_HEADER_LEN, LEGACY_BSITE_MAGIC,
     LEGACY_BSITE_VERSION,
 };
+use crate::gload::load_file_owned;
 use flate2::read::MultiGzDecoder;
 use memmap2::{Mmap, MmapOptions};
 
@@ -1018,7 +1019,7 @@ fn read_bin_site_file(path: &Path) -> Result<Vec<SiteInfo>, String> {
 }
 
 fn read_bsite_file(path: &Path) -> Result<Vec<SiteInfo>, String> {
-    let bytes = fs::read(path).map_err(|e| e.to_string())?;
+    let bytes = load_file_owned(path)?;
     if bytes.len() < LEGACY_BSITE_HEADER_LEN {
         return Err(format!("failed to read bsite header {}", path.display()));
     }
@@ -3298,7 +3299,8 @@ impl TxtSnpIter {
 mod tests {
     use super::{
         process_snp_row_with_stats, process_snp_row_with_stats_preserve_alt, read_bim, TxtSnpIter,
-        BIN01_MAGIC, BIN_SITE_MAGIC, LEGACY_BSITE_MAGIC, LEGACY_BSITE_VERSION,
+        BIN01_MAGIC, BIN_SITE_MAGIC, LEGACY_BSITE_HEADER_LEN, LEGACY_BSITE_MAGIC,
+        LEGACY_BSITE_VERSION,
     };
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};

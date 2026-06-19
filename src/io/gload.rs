@@ -11,9 +11,12 @@
 //! self-contained [`UnifiedInput`] that can be passed to downstream scanners.
 
 use std::fs::File;
+use std::io::{BufReader, Read};
+use std::path::Path;
 use std::sync::Arc;
 
 use memmap2::{Mmap, MmapOptions};
+use rayon::prelude::*;
 
 use crate::bedmath::{decode_mean_imputed_additive_packed_block_rows_f32, packed_byte_lut};
 use crate::decode::{decode_centered_block_packed_model_f32, PackedGeneticModel};
@@ -21,6 +24,197 @@ use crate::gfcore;
 use crate::gstats::{compute_bed_filter_meta, BedFilterMetaMode};
 
 const BED_HEADER_LEN: usize = 3;
+
+#[inline]
+fn gload_force_sequential_owned() -> bool {
+    match std::env::var("JX_GLOAD_FORCE_SEQUENTIAL") {
+        Ok(v) => {
+            let s = v.trim().to_ascii_lowercase();
+            !(s.is_empty() || s == "0" || s == "false" || s == "off" || s == "no")
+        }
+        Err(_) => false,
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PlinkBedHeaderInfo {
+    pub(crate) bytes_per_snp: usize,
+    pub(crate) file_size: usize,
+    pub(crate) payload_size: usize,
+    pub(crate) n_snps_total: usize,
+}
+
+#[inline]
+fn validate_plink_bed_header(header: [u8; BED_HEADER_LEN]) -> Result<(), String> {
+    if header != [0x6C, 0x1B, 0x01] {
+        return Err("Only SNP-major BED supported".to_string());
+    }
+    Ok(())
+}
+
+pub(crate) fn read_plink_bed_header_info(
+    bed_path: &Path,
+    n_samples_full: usize,
+) -> Result<PlinkBedHeaderInfo, String> {
+    if n_samples_full == 0 {
+        return Err("no samples found in BED".to_string());
+    }
+    let mut file = File::open(bed_path).map_err(|e| format!("open {}: {e}", bed_path.display()))?;
+    let mut header = [0u8; BED_HEADER_LEN];
+    file.read_exact(&mut header)
+        .map_err(|e| format!("read {} header: {e}", bed_path.display()))?;
+    validate_plink_bed_header(header)?;
+    let bytes_per_snp = n_samples_full.div_ceil(4);
+    let file_size = usize::try_from(
+        file.metadata()
+            .map_err(|e| format!("stat {}: {e}", bed_path.display()))?
+            .len(),
+    )
+    .map_err(|_| format!("BED file size overflow: {}", bed_path.display()))?;
+    if file_size < BED_HEADER_LEN {
+        return Err(format!("BED file is too small: {}", bed_path.display()));
+    }
+    let payload_size = file_size - BED_HEADER_LEN;
+    if bytes_per_snp == 0 || payload_size % bytes_per_snp != 0 {
+        return Err(format!(
+            "BED payload size mismatch: payload={payload_size}, bytes_per_snp={bytes_per_snp}"
+        ));
+    }
+    Ok(PlinkBedHeaderInfo {
+        bytes_per_snp,
+        file_size,
+        payload_size,
+        n_snps_total: payload_size / bytes_per_snp,
+    })
+}
+
+pub(crate) fn open_plink_bed_reader_after_header(
+    bed_path: &Path,
+) -> Result<BufReader<File>, String> {
+    let file = File::open(bed_path).map_err(|e| format!("open {}: {e}", bed_path.display()))?;
+    let mut reader = BufReader::new(file);
+    let mut header = [0u8; BED_HEADER_LEN];
+    reader
+        .read_exact(&mut header)
+        .map_err(|e| format!("read {} header: {e}", bed_path.display()))?;
+    validate_plink_bed_header(header)?;
+    Ok(reader)
+}
+
+pub(crate) fn mmap_readonly_file(path: &Path) -> Result<Mmap, String> {
+    let file = File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    unsafe { Mmap::map(&file) }.map_err(|e| format!("mmap {}: {e}", path.display()))
+}
+
+#[inline]
+fn file_size_usize(file: &File, path: &Path) -> Result<usize, String> {
+    usize::try_from(
+        file.metadata()
+            .map_err(|e| format!("stat {}: {e}", path.display()))?
+            .len(),
+    )
+    .map_err(|_| format!("file size overflow: {}", path.display()))
+}
+
+fn load_file_owned_range_from_file(
+    file: &File,
+    path: &Path,
+    offset: usize,
+    expected_size: usize,
+) -> Result<Vec<u8>, String> {
+    let file_size = file_size_usize(file, path)?;
+    let end = offset
+        .checked_add(expected_size)
+        .ok_or_else(|| format!("file range overflow for {}", path.display()))?;
+    if end > file_size {
+        return Err(format!(
+            "file range out of bounds for {}: offset={} size={} file_size={}",
+            path.display(),
+            offset,
+            expected_size,
+            file_size
+        ));
+    }
+    if expected_size == 0 {
+        return Ok(Vec::new());
+    }
+
+    let threads = if gload_force_sequential_owned() {
+        1usize
+    } else {
+        rayon::current_num_threads().max(1)
+    };
+    let parallel_threshold = 64usize << 20;
+    let min_chunk = 8usize << 20;
+    let mut buf = vec![0u8; expected_size];
+    if threads <= 1 || expected_size < parallel_threshold {
+        #[cfg(any(unix, windows))]
+        {
+            read_file_exact_at(file, &mut buf, offset as u64)?;
+            return Ok(buf);
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            use std::io::{Seek, SeekFrom};
+            let mut reader_file = file
+                .try_clone()
+                .map_err(|e| format!("clone {} for sequential read: {e}", path.display()))?;
+            reader_file
+                .seek(SeekFrom::Start(offset as u64))
+                .map_err(|e| format!("seek {}: {e}", path.display()))?;
+            let mut reader = BufReader::new(reader_file);
+            reader
+                .read_exact(&mut buf)
+                .map_err(|e| format!("read {}: {e}", path.display()))?;
+            return Ok(buf);
+        }
+    }
+
+    let nominal = expected_size.div_ceil(threads);
+    let chunk_size = nominal.max(min_chunk);
+    buf.par_chunks_mut(chunk_size)
+        .enumerate()
+        .try_for_each(|(chunk_idx, chunk)| {
+            let chunk_offset = chunk_idx
+                .checked_mul(chunk_size)
+                .ok_or_else(|| format!("chunk offset overflow: {}", path.display()))?;
+            let file_offset = offset
+                .checked_add(chunk_offset)
+                .ok_or_else(|| format!("file offset overflow: {}", path.display()))?
+                as u64;
+            read_file_exact_at(file, chunk, file_offset)
+        })?;
+    Ok(buf)
+}
+
+pub(crate) fn load_file_owned(path: &Path) -> Result<Vec<u8>, String> {
+    let file = File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    let file_size = file_size_usize(&file, path)?;
+    load_file_owned_range_from_file(&file, path, 0, file_size)
+}
+
+pub(crate) fn load_file_owned_exact(path: &Path, expected_size: usize) -> Result<Vec<u8>, String> {
+    let file = File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    let file_size = file_size_usize(&file, path)?;
+    if file_size != expected_size {
+        return Err(format!(
+            "file size mismatch for {}: expected {}, got {}",
+            path.display(),
+            expected_size,
+            file_size
+        ));
+    }
+    load_file_owned_range_from_file(&file, path, 0, expected_size)
+}
+
+pub(crate) fn load_file_owned_range_exact(
+    path: &Path,
+    offset: usize,
+    expected_size: usize,
+) -> Result<Vec<u8>, String> {
+    let file = File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    load_file_owned_range_from_file(&file, path, offset, expected_size)
+}
 
 #[inline]
 fn system_page_size() -> usize {

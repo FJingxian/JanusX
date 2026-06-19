@@ -844,14 +844,14 @@ def _rsvd(
         if prefix is not None:
             try:
                 if bed_backend is not None and hasattr(bed_backend, "rsvd_stream_sample"):
-                    evals, v = bed_backend.rsvd_stream_sample(
+                    evals, v, _total_variance = bed_backend.rsvd_stream_sample(
                         int(k),
                         int(seed),
                         int(power),
                         float(tol),
                     )
                 else:
-                    evals, v = jxrs.admx_rsvd_stream_sample(
+                    evals, v, _total_variance = jxrs.admx_rsvd_stream_sample(
                         str(genotype_path),
                         int(k),
                         int(seed),

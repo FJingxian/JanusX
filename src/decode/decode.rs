@@ -1,10 +1,15 @@
 use crate::bedmath::SubsetDecodePlan;
-use crate::bedmath::{decode_row_centered_full_lut, decode_subset_with_plan, packed_byte_lut};
+use crate::bedmath::{
+    decode_row_centered_full_lut, decode_row_centered_full_lut_f64,
+    decode_subset_row_from_full_scratch, decode_subset_row_from_full_scratch_f64,
+    decode_subset_with_plan, packed_byte_lut,
+};
 use crate::gfreader::SampleSubsetPlan;
 use crate::gload::WindowedBedMatrix;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::PyResult;
 use rayon::prelude::*;
+use std::sync::Arc;
 
 #[derive(Clone, Debug)]
 pub(crate) struct AdditiveDecodePlan {
@@ -435,4 +440,292 @@ pub(crate) fn decode_indexed_row_model_into_f64(
             Ok(())
         }
     }
+}
+
+#[inline]
+pub(crate) fn apply_prepared_grm_stream_row_copy_f32(
+    src: &[f32],
+    dst: &mut [f32],
+    mean_g: f32,
+    std_scale: f32,
+    flip_major: bool,
+) {
+    for (g_src, g_dst) in src.iter().zip(dst.iter_mut()) {
+        if *g_src < 0.0_f32 {
+            *g_dst = 0.0_f32;
+            continue;
+        }
+        let gv = if flip_major { 2.0_f32 - *g_src } else { *g_src };
+        *g_dst = (gv - mean_g) * std_scale;
+    }
+}
+
+#[inline]
+pub(crate) fn apply_prepared_grm_stream_row_copy_f64(
+    src: &[f32],
+    dst: &mut [f64],
+    mean_g: f64,
+    std_scale: f64,
+    flip_major: bool,
+) {
+    for (g_src, g_dst) in src.iter().zip(dst.iter_mut()) {
+        if *g_src < 0.0_f32 {
+            *g_dst = 0.0_f64;
+            continue;
+        }
+        let gv = if flip_major {
+            2.0_f64 - (*g_src as f64)
+        } else {
+            *g_src as f64
+        };
+        *g_dst = (gv - mean_g) * std_scale;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_additive_grm_block_f32(
+    packed_flat: &[u8],
+    bytes_per_snp: usize,
+    n_samples: usize,
+    row_flip: &[bool],
+    row_maf: &[f32],
+    sample_idx: &[usize],
+    full_sample_fast: bool,
+    method: usize,
+    eps: f32,
+    row_start: usize,
+    row_end: usize,
+    n_out: usize,
+    out_block: &mut [f32],
+    out_varsum: &mut [f64],
+    out_rowsum: &mut [f64],
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) -> Result<(), String> {
+    let cur_rows = row_end.saturating_sub(row_start);
+    if cur_rows == 0 {
+        return Ok(());
+    }
+    if out_block.len() < cur_rows.saturating_mul(n_out) {
+        return Err("decode_additive_grm_block_f32: out_block too small".to_string());
+    }
+    if out_varsum.len() < cur_rows {
+        return Err("decode_additive_grm_block_f32: out_varsum too small".to_string());
+    }
+    if out_rowsum.len() < cur_rows {
+        return Err("decode_additive_grm_block_f32: out_rowsum too small".to_string());
+    }
+
+    let code4_lut = &packed_byte_lut().code4;
+    let block = &mut out_block[..cur_rows * n_out];
+    let varsum = &mut out_varsum[..cur_rows];
+    let rowsum = &mut out_rowsum[..cur_rows];
+
+    let mut decode_run = || {
+        if full_sample_fast {
+            block
+                .par_chunks_mut(n_out)
+                .zip(varsum.par_iter_mut())
+                .zip(rowsum.par_iter_mut())
+                .enumerate()
+                .for_each(|(off, ((out_row, row_varsum_dst), row_sum_dst))| {
+                    let idx = row_start + off;
+                    let row = &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
+                    let p = row_maf[idx].clamp(0.0_f32, 1.0_f32);
+                    let mean_g = 2.0_f32 * p;
+                    let var = 2.0_f32 * p * (1.0_f32 - p);
+                    let std_scale = if method == 2 {
+                        if var > eps {
+                            1.0_f32 / var.sqrt()
+                        } else {
+                            0.0_f32
+                        }
+                    } else {
+                        1.0_f32
+                    };
+                    let value_lut: [f32; 4] = if row_flip[idx] {
+                        [
+                            (2.0_f32 - mean_g) * std_scale,
+                            0.0_f32,
+                            (1.0_f32 - mean_g) * std_scale,
+                            (0.0_f32 - mean_g) * std_scale,
+                        ]
+                    } else {
+                        [
+                            (0.0_f32 - mean_g) * std_scale,
+                            0.0_f32,
+                            (1.0_f32 - mean_g) * std_scale,
+                            (2.0_f32 - mean_g) * std_scale,
+                        ]
+                    };
+                    decode_row_centered_full_lut(row, n_samples, code4_lut, &value_lut, out_row);
+                    if method == 1 {
+                        *row_varsum_dst = var as f64;
+                    }
+                    *row_sum_dst = (mean_g as f64) * (n_out as f64);
+                });
+        } else {
+            block
+                .par_chunks_mut(n_out)
+                .zip(varsum.par_iter_mut())
+                .zip(rowsum.par_iter_mut())
+                .enumerate()
+                .for_each_init(
+                    || vec![0.0_f32; n_samples],
+                    |full_row, (off, ((out_row, row_varsum_dst), row_sum_dst))| {
+                        let idx = row_start + off;
+                        let row = &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
+                        let p = row_maf[idx].clamp(0.0_f32, 1.0_f32);
+                        let default_mean_g = 2.0_f32 * p;
+                        let (var_centered, row_sum) = decode_subset_row_from_full_scratch(
+                            row,
+                            n_samples,
+                            sample_idx,
+                            row_flip[idx],
+                            default_mean_g,
+                            method,
+                            eps,
+                            code4_lut,
+                            full_row.as_mut_slice(),
+                            out_row,
+                        );
+                        if method == 1 {
+                            *row_varsum_dst = var_centered;
+                        }
+                        *row_sum_dst = row_sum;
+                    },
+                );
+        }
+    };
+
+    if let Some(tp) = pool {
+        tp.install(&mut decode_run);
+    } else {
+        decode_run();
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_additive_grm_block_f64(
+    packed_flat: &[u8],
+    bytes_per_snp: usize,
+    n_samples: usize,
+    row_flip: &[bool],
+    row_maf: &[f32],
+    sample_idx: &[usize],
+    full_sample_fast: bool,
+    method: usize,
+    eps: f64,
+    row_start: usize,
+    row_end: usize,
+    n_out: usize,
+    out_block: &mut [f64],
+    out_varsum: &mut [f64],
+    out_rowsum: &mut [f64],
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) -> Result<(), String> {
+    let cur_rows = row_end.saturating_sub(row_start);
+    if cur_rows == 0 {
+        return Ok(());
+    }
+    if out_block.len() < cur_rows.saturating_mul(n_out) {
+        return Err("decode_additive_grm_block_f64: out_block too small".to_string());
+    }
+    if out_varsum.len() < cur_rows {
+        return Err("decode_additive_grm_block_f64: out_varsum too small".to_string());
+    }
+    if out_rowsum.len() < cur_rows {
+        return Err("decode_additive_grm_block_f64: out_rowsum too small".to_string());
+    }
+
+    let code4_lut = &packed_byte_lut().code4;
+    let block = &mut out_block[..cur_rows * n_out];
+    let varsum = &mut out_varsum[..cur_rows];
+    let rowsum = &mut out_rowsum[..cur_rows];
+
+    let mut decode_run = || {
+        if full_sample_fast {
+            block
+                .par_chunks_mut(n_out)
+                .zip(varsum.par_iter_mut())
+                .zip(rowsum.par_iter_mut())
+                .enumerate()
+                .for_each(|(off, ((out_row, row_varsum_dst), row_sum_dst))| {
+                    let idx = row_start + off;
+                    let row = &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
+                    let p = row_maf[idx].clamp(0.0_f32, 1.0_f32) as f64;
+                    let mean_g = 2.0_f64 * p;
+                    let var = 2.0_f64 * p * (1.0_f64 - p);
+                    let std_scale = if method == 2 {
+                        if var > eps {
+                            1.0_f64 / var.sqrt()
+                        } else {
+                            0.0_f64
+                        }
+                    } else {
+                        1.0_f64
+                    };
+                    let value_lut: [f64; 4] = if row_flip[idx] {
+                        [
+                            (2.0_f64 - mean_g) * std_scale,
+                            0.0_f64,
+                            (1.0_f64 - mean_g) * std_scale,
+                            (0.0_f64 - mean_g) * std_scale,
+                        ]
+                    } else {
+                        [
+                            (0.0_f64 - mean_g) * std_scale,
+                            0.0_f64,
+                            (1.0_f64 - mean_g) * std_scale,
+                            (2.0_f64 - mean_g) * std_scale,
+                        ]
+                    };
+                    decode_row_centered_full_lut_f64(
+                        row, n_samples, code4_lut, &value_lut, out_row,
+                    );
+                    if method == 1 {
+                        *row_varsum_dst = var;
+                    }
+                    *row_sum_dst = mean_g * (n_out as f64);
+                });
+        } else {
+            block
+                .par_chunks_mut(n_out)
+                .zip(varsum.par_iter_mut())
+                .zip(rowsum.par_iter_mut())
+                .enumerate()
+                .for_each_init(
+                    || vec![0.0_f64; n_samples],
+                    |full_row, (off, ((out_row, row_varsum_dst), row_sum_dst))| {
+                        let idx = row_start + off;
+                        let row = &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
+                        let p = row_maf[idx].clamp(0.0_f32, 1.0_f32) as f64;
+                        let default_mean_g = 2.0_f64 * p;
+                        let (var_centered, row_sum) = decode_subset_row_from_full_scratch_f64(
+                            row,
+                            n_samples,
+                            sample_idx,
+                            row_flip[idx],
+                            default_mean_g,
+                            method,
+                            eps,
+                            code4_lut,
+                            full_row.as_mut_slice(),
+                            out_row,
+                        );
+                        if method == 1 {
+                            *row_varsum_dst = var_centered;
+                        }
+                        *row_sum_dst = row_sum;
+                    },
+                );
+        }
+    };
+
+    if let Some(tp) = pool {
+        tp.install(&mut decode_run);
+    } else {
+        decode_run();
+    }
+    Ok(())
 }

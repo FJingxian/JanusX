@@ -148,6 +148,25 @@ def _bed_block_target_env(memory_mb: Union[int, float, None]) -> None:
             os.environ["JX_BED_BLOCK_TARGET_MB"] = prev
 
 
+@contextmanager
+def _spgrm_memory_budget_env(memory_mb: Union[int, float, None]) -> None:
+    keys = ("JX_SPGRM_DECODE_TARGET_MB", "JANUSX_SPGRM_DECODE_TARGET_MB")
+    prev = {key: os.environ.get(key) for key in keys}
+    try:
+        if memory_mb is not None:
+            mb = float(memory_mb)
+            target = f"{mb:.6g}"
+            os.environ["JX_SPGRM_DECODE_TARGET_MB"] = target
+            os.environ["JANUSX_SPGRM_DECODE_TARGET_MB"] = target
+        yield
+    finally:
+        for key, old in prev.items():
+            if old is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = old
+
+
 def _resolve_rust_grm_input(
     genofile: str,
     *,
@@ -578,6 +597,12 @@ def build_sparse_grm_packed_bed(
         "Sparse GRM route selected stream-bed: "
         f"n={n_samples}, m={n_snps}, sample-blocked sparse CSC writer."
     )
+    logger.info(
+        "Sparse GRM decode budget: target_mem_gb=%s, mmap_window_mb=%s, "
+        "row/sample blocks resolved in Rust.",
+        ("default" if block_target_mb is None else f"{float(block_target_mb) / 1024.0:.3f}"),
+        ("auto" if mmap_window_mb is None else int(mmap_window_mb)),
+    )
     pbar = ProgressAdapter(
         total=1,
         desc="Sparse GRM (stream-bed)",
@@ -604,22 +629,24 @@ def build_sparse_grm_packed_bed(
         pbar.set_postfix(memory=f"{mem:.2f} GB")
 
     try:
-        sparse_path, sparse_n, sparse_nnz = _spgrm_bed_to_jxgrm(
-            str(genofile),
-            out_prefix=str(out_prefix),
-            method=int(method),
-            threshold=float(kinship_cutoff),
-            maf_threshold=float(maf_threshold),
-            max_missing_rate=float(max_missing_rate),
-            het_threshold=0.0,
-            snps_only=False,
-            block_rows=0,
-            sample_block=0,
-            threads=max(1, int(threads)),
-            mmap_window_mb=(int(mmap_window_mb) if mmap_window_mb is not None else None),
-            progress_callback=_progress_cb,
-            progress_every=1,
-        )
+        with _bed_block_target_env(block_target_mb):
+            with _spgrm_memory_budget_env(block_target_mb):
+                sparse_path, sparse_n, sparse_nnz = _spgrm_bed_to_jxgrm(
+                    str(genofile),
+                    out_prefix=str(out_prefix),
+                    method=int(method),
+                    threshold=float(kinship_cutoff),
+                    maf_threshold=float(maf_threshold),
+                    max_missing_rate=float(max_missing_rate),
+                    het_threshold=0.0,
+                    snps_only=False,
+                    block_rows=0,
+                    sample_block=0,
+                    threads=max(1, int(threads)),
+                    mmap_window_mb=(int(mmap_window_mb) if mmap_window_mb is not None else None),
+                    progress_callback=_progress_cb,
+                    progress_every=1,
+                )
     finally:
         pbar.finish()
         pbar.close()
@@ -1084,6 +1111,12 @@ def main(log: bool = True):
         streaming=False,
     )
     mmap_window_mb = auto_mmap_window_mb(grm_input, n_samples, n_snps, memory_mb)
+    logger.info(
+        "Resolved GRM decode plan: stream_block_rows=%s, packed_block_rows=%s, mmap_window_mb=%s.",
+        int(stream_block_rows),
+        int(packed_block_rows),
+        ("auto" if mmap_window_mb is None else int(mmap_window_mb)),
+    )
 
     if args.sparse is not None:
         sparse_cutoff = float(args.sparse)

@@ -1,3 +1,64 @@
+//! Sparse genomic relationship matrix (sparse GRM) construction.
+//!
+//! Let `g_j` denote the genotype vector of retained marker `j` after missing values are
+//! mean-imputed and the major-allele orientation is harmonized by `row_flip`, and let `p_j`
+//! denote the corresponding minor-allele frequency.
+//!
+//! The dense relationship matrix underlying this module is defined as:
+//!
+//! - centered GRM (`method = 1`)
+//!
+//!   `x_j = g_j - 2 p_j`
+//!
+//!   `K = (sum_j x_j x_j') / (sum_j 2 p_j (1 - p_j))`
+//!
+//! - standardized GRM (`method = 2`)
+//!
+//!   `z_j = (g_j - 2 p_j) / sqrt(2 p_j (1 - p_j))`
+//!
+//!   `K = (sum_j z_j z_j') / m`
+//!
+//! where `m` is the number of retained markers after marker-level quality control.
+//! The sparse GRM is obtained by retaining all diagonal entries and those upper-triangular
+//! off-diagonal entries satisfying the user-specified threshold criterion.
+//!
+//! Construction proceeds as follows.
+//!
+//! 1. Marker preprocessing.
+//!    Input genotypes are filtered by missing rate and minor-allele frequency. For each retained
+//!    marker, the module records allele orientation (`row_flip`) and allele frequency (`row_maf`).
+//!
+//! 2. Block partition.
+//!    The sample axis is partitioned into sample tiles, and retained markers are partitioned into
+//!    SNP blocks. Each sparse GRM task corresponds to one sample-tile pair.
+//!
+//! 3. Block decoding and crossproduct accumulation.
+//!    For each SNP block, the corresponding genotype rows are decoded into dense additive blocks.
+//!    For a diagonal sample-tile pair, the local contribution is accumulated with symmetric
+//!    rank-k updates; for an off-diagonal tile pair, the local contribution is accumulated with
+//!    general matrix multiplication. Summing across all SNP blocks yields the unscaled tile-level
+//!    crossproduct.
+//!
+//! 4. Scaling and thresholding.
+//!    After all SNP blocks have been processed for a given sample-tile pair, the accumulated
+//!    crossproduct is scaled by the denominator of the selected GRM definition. Diagonal entries
+//!    are retained unconditionally, whereas off-diagonal entries are kept only if they satisfy the
+//!    sparse threshold criterion.
+//!
+//! 5. Sparse output.
+//!    Retained entries are emitted in upper-triangular form and written to CSC-based `.spgrm`
+//!    output. When necessary, intermediate sparse chunks are spilled and merged into the final
+//!    sparse GRM file.
+//!
+//! Two data-access routes are implemented.
+//!
+//! - Packed route:
+//!   the filtered packed BED payload and marker metadata are already resident in memory.
+//!
+//! - Stream/mmap route:
+//!   filtered marker metadata are prepared first, after which BED payload blocks are fetched
+//!   through full mmap or windowed mmap and reused across sample-tile tasks within a batch.
+//!
 use memmap2::{Mmap, MmapOptions};
 use numpy::{PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::exceptions::PyRuntimeError;
@@ -11,7 +72,7 @@ use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicU64, Ordering as AtomicOrdering},
-    Arc,
+    Arc, Mutex,
 };
 use std::time::Instant;
 
@@ -23,13 +84,14 @@ use crate::blas::{
     cblas_sgemm_dispatch, cblas_ssyrk_dispatch, BlasThreadGuard, CblasInt, CBLAS_COL_MAJOR,
     CBLAS_LOWER, CBLAS_NO_TRANS, CBLAS_ROW_MAJOR, CBLAS_TRANS, CBLAS_UPPER,
 };
-use crate::gfcore::read_fam;
+use crate::gfcore::{block_rows_from_memory_target_mb, parse_positive_env_f64, read_fam};
 use crate::gfreader::{
     prepare_bed_logic_meta_owned_for_stats_samples_sparse_windowed,
     prepare_bed_logic_meta_owned_for_stats_samples_with_mmap_window,
 };
 use crate::gload::WindowedBedMatrix;
 use crate::grm::decode_grm_block;
+use crate::pipeline::run_double_buffer;
 use crate::stats_common::{
     check_ctrlc, get_cached_pool, map_err_string_to_py, parse_index_vec_i64,
 };
@@ -46,6 +108,7 @@ const SPGRM_DEFAULT_BATCH_DECODED_STRIPE_THREADS_FACTOR: usize = 2;
 const SPGRM_DEFAULT_BATCH_MIN_ACCUM_BYTES: usize = 8 * 1024 * 1024;
 const SPGRM_JXGRM_VALUE_ALIGN_BYTES: usize = std::mem::size_of::<f64>();
 const SPGRM_DEFAULT_STREAMING_MERGE_MIN_BYTES: usize = 2 * 1024 * 1024 * 1024;
+const SPGRM_DECODE_STRIPE_ESTIMATE: usize = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SpgrmNpyFloatDtype {
@@ -165,6 +228,17 @@ struct SpgrmStreamStripeScratch {
     decoded: Vec<f32>,
 }
 
+impl Clone for SpgrmStreamStripeScratch {
+    fn clone(&self) -> Self {
+        Self {
+            stripe: self.stripe,
+            full_sample_fast: self.full_sample_fast,
+            subset_plan: self.subset_plan.clone(),
+            decoded: vec![0.0_f32; self.decoded.len()],
+        }
+    }
+}
+
 impl SpgrmStreamStripeScratch {
     fn new(
         stripe: SpgrmStripe,
@@ -193,6 +267,103 @@ impl SpgrmStreamStripeScratch {
     #[inline]
     fn width(&self) -> usize {
         self.stripe.end - self.stripe.start
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SpgrmMemoryPlan {
+    sample_step: usize,
+    row_step: usize,
+    max_decoded_bytes: usize,
+}
+
+#[derive(Clone, Debug)]
+struct SpgrmDecodedBatchBuffer {
+    stripe_scratch: Vec<SpgrmStreamStripeScratch>,
+    row_start: usize,
+    cur_rows: usize,
+}
+
+#[inline]
+fn spgrm_resolve_packed_memory_plan(
+    m: usize,
+    n_use: usize,
+    n_samples_full: usize,
+    requested_row_step: usize,
+    requested_sample_step: usize,
+    threads: usize,
+) -> SpgrmMemoryPlan {
+    let decode_target_mb = spgrm_decode_target_mb();
+    let sample_step = spgrm_auto_sample_block_with_budget(
+        n_use,
+        m,
+        requested_sample_step,
+        decode_target_mb,
+        1usize,
+    );
+    let decoded_sample_width = sample_step.saturating_mul(SPGRM_DECODE_STRIPE_ESTIMATE);
+    let row_step = spgrm_row_block_rows(
+        requested_row_step,
+        m,
+        decoded_sample_width,
+        n_samples_full,
+        threads,
+        decode_target_mb,
+        1usize,
+    );
+    let max_decoded_bytes = spgrm_batch_max_decoded_bytes(
+        row_step,
+        decoded_sample_width,
+        threads,
+        decode_target_mb,
+        1usize,
+    );
+    SpgrmMemoryPlan {
+        sample_step,
+        row_step,
+        max_decoded_bytes,
+    }
+}
+
+#[inline]
+fn spgrm_resolve_stream_memory_plan(
+    m: usize,
+    n_use: usize,
+    n_samples_full: usize,
+    requested_row_step: usize,
+    requested_sample_step: usize,
+    threads: usize,
+    decode_buffers: usize,
+) -> SpgrmMemoryPlan {
+    let decode_target_mb = spgrm_decode_target_mb();
+    let sample_step = spgrm_auto_sample_block_with_budget(
+        n_use,
+        m,
+        requested_sample_step,
+        decode_target_mb,
+        decode_buffers,
+    );
+    let decoded_sample_width = n_use.max(1);
+    let row_step = spgrm_row_block_rows(
+        requested_row_step,
+        m,
+        decoded_sample_width,
+        n_samples_full,
+        threads,
+        decode_target_mb,
+        decode_buffers,
+    );
+    let max_decoded_bytes = spgrm_batch_max_decoded_bytes(
+        row_step,
+        decoded_sample_width,
+        threads,
+        decode_target_mb,
+        decode_buffers,
+    );
+    SpgrmMemoryPlan {
+        sample_step,
+        row_step,
+        max_decoded_bytes,
     }
 }
 
@@ -322,6 +493,60 @@ fn spgrm_sample_block(n: usize, requested: usize) -> usize {
         requested
     };
     base.max(1).min(n.max(1))
+}
+
+#[inline]
+fn spgrm_decode_target_mb() -> Option<f64> {
+    parse_positive_env_f64(&[
+        "JX_SPGRM_DECODE_TARGET_MB",
+        "JANUSX_SPGRM_DECODE_TARGET_MB",
+        "JX_BED_BLOCK_TARGET_MB",
+        "JANUSX_BED_BLOCK_TARGET_MB",
+    ])
+}
+
+#[inline]
+fn spgrm_stream_double_buffer_requested(threads: usize) -> bool {
+    if let Ok(raw) = std::env::var("JX_SPGRM_STREAM_OVERLAP") {
+        let t = raw.trim().to_ascii_lowercase();
+        return !matches!(t.as_str(), "0" | "false" | "no" | "off");
+    }
+    if let Ok(raw) = std::env::var("JANUSX_SPGRM_STREAM_OVERLAP") {
+        let t = raw.trim().to_ascii_lowercase();
+        return !matches!(t.as_str(), "0" | "false" | "no" | "off");
+    }
+    threads > 1
+}
+
+#[inline]
+fn spgrm_auto_sample_block_with_budget(
+    n_use: usize,
+    m: usize,
+    requested: usize,
+    decode_target_mb: Option<f64>,
+    decode_buffers: usize,
+) -> usize {
+    if requested > 0 {
+        return requested.max(1).min(n_use.max(1));
+    }
+    let heuristic = spgrm_sample_block(n_use, 0usize);
+    if let Some(target_mb) = decode_target_mb {
+        let min_row_step = SPGRM_DEFAULT_SNP_BLOCK_ROWS.min(m.max(1)).max(1);
+        let per_sample_decode_bytes = min_row_step
+            .saturating_mul(SPGRM_DECODE_STRIPE_ESTIMATE)
+            .saturating_mul(std::mem::size_of::<f32>())
+            .max(1);
+        let by_budget = block_rows_from_memory_target_mb(
+            target_mb,
+            per_sample_decode_bytes,
+            n_use.max(1),
+            1,
+            decode_buffers.max(1),
+            0,
+        );
+        return heuristic.min(by_budget.max(1).min(n_use.max(1)));
+    }
+    heuristic
 }
 
 #[inline]
@@ -523,22 +748,41 @@ fn spgrm_npy_read_value(
 fn spgrm_row_block_rows(
     requested: usize,
     m: usize,
-    sample_block: usize,
+    decoded_sample_width: usize,
     n_samples_full: usize,
     threads: usize,
+    decode_target_mb: Option<f64>,
+    decode_buffers: usize,
 ) -> usize {
     if requested > 0 {
         return requested.max(1);
     }
+    if let Some(target_mb) = decode_target_mb {
+        let row_bytes = decoded_sample_width
+            .max(1)
+            .saturating_mul(std::mem::size_of::<f32>())
+            .max(1);
+        return block_rows_from_memory_target_mb(
+            target_mb,
+            row_bytes,
+            m.max(1),
+            1,
+            decode_buffers.max(1),
+            0,
+        )
+        .max(1);
+    }
     let mut out = adaptive_grm_block_rows(
         SPGRM_DEFAULT_SNP_BLOCK_ROWS,
         m.max(1),
-        sample_block.max(1),
+        decoded_sample_width.max(1),
         n_samples_full,
         threads,
     )
     .max(1);
-    if sample_block >= n_samples_full && n_samples_full <= SPGRM_SMALL_N_FULL_SAMPLE_BLOCK_MAX {
+    if decoded_sample_width >= n_samples_full
+        && n_samples_full <= SPGRM_SMALL_N_FULL_SAMPLE_BLOCK_MAX
+    {
         out = out.max(SPGRM_SMALL_N_FULL_SAMPLE_ROW_BLOCK_FLOOR.min(m.max(1)));
     }
     out
@@ -620,10 +864,15 @@ fn spgrm_batch_max_accum_bytes(sample_step: usize, threads: usize) -> usize {
         .max(std::mem::size_of::<f32>())
 }
 
-#[inline]
-fn spgrm_batch_max_decoded_bytes(row_step: usize, sample_step: usize, threads: usize) -> usize {
-    let full_stripe_bytes = row_step
-        .saturating_mul(sample_step.max(1))
+fn spgrm_batch_max_decoded_bytes(
+    row_step: usize,
+    decoded_sample_width: usize,
+    threads: usize,
+    decode_target_mb: Option<f64>,
+    decode_buffers: usize,
+) -> usize {
+    let full_batch_bytes = row_step
+        .saturating_mul(decoded_sample_width.max(1))
         .saturating_mul(std::mem::size_of::<f32>())
         .max(std::mem::size_of::<f32>());
     if let Some(mb) = std::env::var("JANUSX_SPGRM_BATCH_MAX_DECODED_MB")
@@ -634,31 +883,49 @@ fn spgrm_batch_max_decoded_bytes(row_step: usize, sample_step: usize, threads: u
         return mb
             .saturating_mul(1024)
             .saturating_mul(1024)
-            .max(full_stripe_bytes);
+            .max(full_batch_bytes);
     }
     if let Some(n_stripes) = std::env::var("JANUSX_SPGRM_BATCH_MAX_UNIQUE_STRIPES")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|&v| v > 0)
     {
-        return full_stripe_bytes
+        let single_stripe_bytes = row_step
+            .saturating_mul(
+                decoded_sample_width
+                    .max(1)
+                    .div_ceil(SPGRM_DECODE_STRIPE_ESTIMATE.max(1)),
+            )
+            .saturating_mul(std::mem::size_of::<f32>())
+            .max(std::mem::size_of::<f32>());
+        return single_stripe_bytes
             .saturating_mul(n_stripes)
-            .max(full_stripe_bytes);
+            .max(full_batch_bytes);
     }
-    full_stripe_bytes
+    if let Some(target_mb) = decode_target_mb {
+        let per_buffer_bytes =
+            ((target_mb * 1024.0_f64 * 1024.0_f64) as usize).saturating_div(decode_buffers.max(1));
+        return per_buffer_bytes.max(full_batch_bytes);
+    }
+    full_batch_bytes
         .saturating_mul(
             threads
                 .max(1)
                 .saturating_mul(SPGRM_DEFAULT_BATCH_DECODED_STRIPE_THREADS_FACTOR)
                 .max(SPGRM_DEFAULT_BATCH_DECODED_STRIPE_FLOOR),
         )
-        .max(full_stripe_bytes)
+        .max(full_batch_bytes)
 }
 
 #[inline]
-fn spgrm_batch_limits(row_step: usize, sample_step: usize, threads: usize) -> SpgrmTaskBatchLimits {
+fn spgrm_batch_limits(
+    _row_step: usize,
+    sample_step: usize,
+    max_decoded_bytes: usize,
+    threads: usize,
+) -> SpgrmTaskBatchLimits {
     SpgrmTaskBatchLimits {
-        max_decoded_bytes: spgrm_batch_max_decoded_bytes(row_step, sample_step, threads),
+        max_decoded_bytes,
         max_accum_bytes: spgrm_batch_max_accum_bytes(sample_step, threads),
     }
 }
@@ -1250,14 +1517,16 @@ fn prepare_spgrm_build(
         method,
         threshold,
     )?;
-    let sample_step = spgrm_sample_block(n_use, sample_block);
-    let row_step = spgrm_row_block_rows(
-        block_rows,
+    let memory_plan = spgrm_resolve_packed_memory_plan(
         m,
-        sample_step.saturating_mul(2),
+        n_use,
         n_samples_full,
+        block_rows,
+        sample_block,
         threads,
     );
+    let sample_step = memory_plan.sample_step;
+    let row_step = memory_plan.row_step;
     let denom = if method == 1 {
         centered_varsum_from_packed(
             packed_flat,
@@ -1280,7 +1549,12 @@ fn prepare_spgrm_build(
     let task_batches = build_spgrm_task_batches(
         tasks.as_slice(),
         row_step,
-        spgrm_batch_limits(row_step, sample_step, threads),
+        spgrm_batch_limits(
+            row_step,
+            sample_step,
+            memory_plan.max_decoded_bytes,
+            threads,
+        ),
     );
     Ok(SpgrmPreparedBuild {
         m,
@@ -1698,6 +1972,149 @@ fn spgrm_build_stream_batch(
         )
         .collect::<Vec<_>>();
     (stripe_scratch, task_accum)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spgrm_decode_stream_batch_buffer(
+    buf: &mut SpgrmDecodedBatchBuffer,
+    row_start: usize,
+    row_step: usize,
+    m: usize,
+    sample_idx: &[usize],
+    meta: &crate::gfreader::PreparedBedLogicMetaOwned,
+    row_mean: &[f32],
+    row_inv_sd: &[f32],
+    bed_window: Option<&mut WindowedBedMatrix>,
+    full_mmap: Option<&Mmap>,
+    rel_row_indices: &mut Vec<usize>,
+    code4_lut: &[[u8; 4]; 256],
+    pool: Option<&std::sync::Arc<rayon::ThreadPool>>,
+    timing: Option<&SpgrmStageTiming>,
+) -> Result<(), String> {
+    let cur_rows = (row_start + row_step).min(m).saturating_sub(row_start);
+    if cur_rows == 0 {
+        buf.row_start = row_start;
+        buf.cur_rows = 0;
+        return Ok(());
+    }
+    let packed_block: &[u8];
+    let packed_row_indices: Option<&[usize]>;
+    let decode_row_start: usize;
+    let row_flip_use: &[bool];
+    let row_mean_use: &[f32];
+    let row_inv_sd_use: &[f32];
+
+    if let Some(window) = bed_window {
+        let row_end = row_start + cur_rows;
+        packed_block = window.prepare_source_rows(
+            &meta.row_source_indices[row_start..row_end],
+            rel_row_indices,
+        )?;
+        packed_row_indices = Some(rel_row_indices.as_slice());
+        decode_row_start = 0usize;
+        row_flip_use = &meta.row_flip[row_start..row_end];
+        row_mean_use = &row_mean[row_start..row_end];
+        row_inv_sd_use = &row_inv_sd[row_start..row_end];
+    } else {
+        let mmap = full_mmap.ok_or_else(|| "internal error: missing full BED mmap".to_string())?;
+        packed_block = &mmap[3..];
+        packed_row_indices = Some(meta.row_source_indices.as_slice());
+        decode_row_start = row_start;
+        row_flip_use = meta.row_flip.as_slice();
+        row_mean_use = row_mean;
+        row_inv_sd_use = row_inv_sd;
+    }
+
+    for stripe in buf.stripe_scratch.iter_mut() {
+        let stripe_idx = &sample_idx[stripe.stripe.start..stripe.stripe.end];
+        let stripe_width = stripe.width();
+        let t_decode = Instant::now();
+        decode_standardized_packed_block_rows_f32_with_plan(
+            packed_block,
+            meta.bytes_per_snp,
+            meta.n_samples,
+            row_flip_use,
+            row_mean_use,
+            row_inv_sd_use,
+            stripe_idx,
+            stripe.full_sample_fast,
+            stripe.subset_plan.as_ref(),
+            packed_row_indices,
+            decode_row_start,
+            &mut stripe.decoded[..cur_rows * stripe_width],
+            code4_lut,
+            pool,
+        )?;
+        if let Some(timing) = timing {
+            timing.add_decode_ns(spgrm_elapsed_ns(t_decode));
+        }
+    }
+
+    buf.row_start = row_start;
+    buf.cur_rows = cur_rows;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spgrm_consume_stream_batch_buffer(
+    buf: &SpgrmDecodedBatchBuffer,
+    task_accum: &mut [SpgrmBatchTaskAccum],
+    batch_idx: usize,
+    m: usize,
+    progress_done_offset: usize,
+    total_progress: usize,
+    notify_step: usize,
+    last_notified: &mut usize,
+    progress_callback: Option<&Py<PyAny>>,
+    threads: usize,
+    pool: Option<&std::sync::Arc<rayon::ThreadPool>>,
+    timing: Option<&SpgrmStageTiming>,
+) -> Result<(), String> {
+    if buf.cur_rows == 0 {
+        return Ok(());
+    }
+    let beta = if buf.row_start == 0 { 0.0_f32 } else { 1.0_f32 };
+    if threads > 1 && task_accum.len() > 1 {
+        let timing_ref = timing;
+        let stripe_scratch = buf.stripe_scratch.as_slice();
+        let mut gemm_work = || {
+            task_accum.par_iter_mut().for_each(|task_acc| {
+                spgrm_accumulate_task_gemm(
+                    task_acc,
+                    stripe_scratch,
+                    buf.cur_rows,
+                    beta,
+                    timing_ref,
+                );
+            });
+        };
+        if let Some(tp) = pool {
+            tp.install(gemm_work);
+        } else {
+            gemm_work();
+        }
+    } else {
+        for task_acc in task_accum.iter_mut() {
+            spgrm_accumulate_task_gemm(
+                task_acc,
+                buf.stripe_scratch.as_slice(),
+                buf.cur_rows,
+                beta,
+                timing,
+            );
+        }
+    }
+
+    let batch_progress_offset = batch_idx.saturating_mul(m);
+    let done_rows = batch_progress_offset.saturating_add(buf.row_start + buf.cur_rows);
+    spgrm_progress_notify(
+        progress_callback,
+        progress_done_offset.saturating_add(done_rows),
+        total_progress,
+        notify_step,
+        last_notified,
+        false,
+    )
 }
 
 fn spgrm_open_bed_payload_mmap(
@@ -2783,14 +3200,19 @@ fn spgrm_stream_bed_to_jxgrm_core(
         return Err("Sparse GRM metadata length mismatch".to_string());
     }
     let n_use = sample_idx.len();
-    let sample_step = spgrm_sample_block(n_use, sample_block);
-    let row_step = spgrm_row_block_rows(
-        block_rows,
+    let stream_double_buffer = spgrm_stream_double_buffer_requested(threads);
+    let decode_buffers = if stream_double_buffer { 2usize } else { 1usize };
+    let memory_plan = spgrm_resolve_stream_memory_plan(
         m,
-        sample_step.saturating_mul(2),
+        n_use,
         n_samples_full,
+        block_rows,
+        sample_block,
         threads,
+        decode_buffers,
     );
+    let sample_step = memory_plan.sample_step;
+    let row_step = memory_plan.row_step;
     let denom = if method == 1 {
         let acc = meta
             .maf
@@ -2813,7 +3235,12 @@ fn spgrm_stream_bed_to_jxgrm_core(
     let task_batches = build_spgrm_task_batches(
         tasks.as_slice(),
         row_step,
-        spgrm_batch_limits(row_step, sample_step, threads),
+        spgrm_batch_limits(
+            row_step,
+            sample_step,
+            memory_plan.max_decoded_bytes,
+            threads,
+        ),
     );
     let total_batches = task_batches.len().max(1);
     let total_progress = progress_done_offset
@@ -2855,6 +3282,7 @@ fn spgrm_stream_bed_to_jxgrm_core(
     };
     let code4_lut = &packed_byte_lut().code4;
     let pool = get_cached_pool(threads).map_err(|e| e.to_string())?;
+    let use_double_buffer = stream_double_buffer && m > row_step;
     let stream_split_single_task =
         spgrm_single_diag_task_subtile_step(tasks.as_slice(), threads).is_some();
     let blas_threads = if threads <= 1 {
@@ -2866,7 +3294,6 @@ fn spgrm_stream_bed_to_jxgrm_core(
     };
     let _blas_guard = blas_threads.map(BlasThreadGuard::enter);
     let mut chunk_paths = Vec::<PathBuf>::new();
-    let mut rel_row_indices = Vec::<usize>::new();
     let write_result = (|| -> Result<(usize, usize), String> {
         let mut last_notified = 0usize;
         let mut chunk_idx = 0usize;
@@ -2884,107 +3311,125 @@ fn spgrm_stream_bed_to_jxgrm_core(
 
         for (batch_idx, batch) in task_batches.iter().enumerate() {
             let task_batch = &tasks[batch.start..batch.end];
-            let (mut stripe_scratch, mut task_accum) =
+            let (stripe_template, mut task_accum) =
                 spgrm_build_stream_batch(task_batch, row_step, sample_idx, n_samples_full, threads);
 
-            for row_start in (0..m).step_by(row_step) {
-                let cur_rows = (row_start + row_step).min(m) - row_start;
-                let beta = if row_start == 0 { 0.0_f32 } else { 1.0_f32 };
-                let packed_block: &[u8];
-                let packed_row_indices: Option<&[usize]>;
-                let decode_row_start: usize;
-                let row_flip_use: &[bool];
-                let row_mean_use: &[f32];
-                let row_inv_sd_use: &[f32];
-
-                if let Some(window) = bed_window.as_mut() {
-                    let row_end = row_start + cur_rows;
-                    packed_block = window.prepare_source_rows(
-                        &meta.row_source_indices[row_start..row_end],
+            if use_double_buffer {
+                let decode_error = Arc::new(Mutex::new(None::<String>));
+                let producer_error = decode_error.clone();
+                let mut next_row_start = 0usize;
+                let mut rel_row_indices = Vec::<usize>::new();
+                let make_buffer = || SpgrmDecodedBatchBuffer {
+                    stripe_scratch: stripe_template.clone(),
+                    row_start: 0usize,
+                    cur_rows: 0usize,
+                };
+                let producer = |buf: &mut SpgrmDecodedBatchBuffer| -> bool {
+                    if next_row_start >= m {
+                        buf.row_start = 0usize;
+                        buf.cur_rows = 0usize;
+                        return false;
+                    }
+                    let row_start = next_row_start;
+                    match spgrm_decode_stream_batch_buffer(
+                        buf,
+                        row_start,
+                        row_step,
+                        m,
+                        sample_idx,
+                        &meta,
+                        row_mean.as_slice(),
+                        row_inv_sd.as_slice(),
+                        bed_window.as_mut(),
+                        full_mmap.as_ref(),
                         &mut rel_row_indices,
-                    )?;
-                    packed_row_indices = Some(rel_row_indices.as_slice());
-                    decode_row_start = 0usize;
-                    row_flip_use = &meta.row_flip[row_start..row_end];
-                    row_mean_use = &row_mean[row_start..row_end];
-                    row_inv_sd_use = &row_inv_sd[row_start..row_end];
-                } else {
-                    let mmap = full_mmap
-                        .as_ref()
-                        .ok_or_else(|| "internal error: missing full BED mmap".to_string())?;
-                    packed_block = &mmap[3..];
-                    packed_row_indices = Some(meta.row_source_indices.as_slice());
-                    decode_row_start = row_start;
-                    row_flip_use = meta.row_flip.as_slice();
-                    row_mean_use = row_mean.as_slice();
-                    row_inv_sd_use = row_inv_sd.as_slice();
-                }
-
-                for stripe in stripe_scratch.iter_mut() {
-                    let stripe_idx = &sample_idx[stripe.stripe.start..stripe.stripe.end];
-                    let stripe_width = stripe.width();
-                    let t_decode = Instant::now();
-                    decode_standardized_packed_block_rows_f32_with_plan(
-                        packed_block,
-                        meta.bytes_per_snp,
-                        n_samples_full,
-                        row_flip_use,
-                        row_mean_use,
-                        row_inv_sd_use,
-                        stripe_idx,
-                        stripe.full_sample_fast,
-                        stripe.subset_plan.as_ref(),
-                        packed_row_indices,
-                        decode_row_start,
-                        &mut stripe.decoded[..cur_rows * stripe_width],
                         code4_lut,
                         pool.as_ref(),
+                        timing.as_deref(),
+                    ) {
+                        Ok(()) => {
+                            next_row_start = row_start + buf.cur_rows;
+                            next_row_start < m
+                        }
+                        Err(err) => {
+                            *producer_error.lock().unwrap() = Some(err);
+                            buf.row_start = usize::MAX;
+                            buf.cur_rows = 0usize;
+                            false
+                        }
+                    }
+                };
+                let consumer_error = decode_error.clone();
+                let consumer = |buf: &mut SpgrmDecodedBatchBuffer| -> Result<(), String> {
+                    if buf.cur_rows == 0 {
+                        if buf.row_start == usize::MAX {
+                            return Err(consumer_error
+                                .lock()
+                                .unwrap()
+                                .take()
+                                .unwrap_or_else(|| "Sparse GRM decode failed".to_string()));
+                        }
+                        return Ok(());
+                    }
+                    spgrm_consume_stream_batch_buffer(
+                        buf,
+                        task_accum.as_mut_slice(),
+                        batch_idx,
+                        m,
+                        progress_done_offset,
+                        total_progress,
+                        notify_step,
+                        &mut last_notified,
+                        progress_callback,
+                        threads,
+                        pool.as_ref(),
+                        timing.as_deref(),
+                    )
+                };
+                run_double_buffer(2usize, make_buffer, producer, consumer)?;
+                let decode_err = decode_error.lock().unwrap().take();
+                if let Some(err) = decode_err {
+                    return Err(err);
+                }
+            } else {
+                let mut decoded = SpgrmDecodedBatchBuffer {
+                    stripe_scratch: stripe_template,
+                    row_start: 0usize,
+                    cur_rows: 0usize,
+                };
+                let mut rel_row_indices = Vec::<usize>::new();
+                for row_start in (0..m).step_by(row_step) {
+                    spgrm_decode_stream_batch_buffer(
+                        &mut decoded,
+                        row_start,
+                        row_step,
+                        m,
+                        sample_idx,
+                        &meta,
+                        row_mean.as_slice(),
+                        row_inv_sd.as_slice(),
+                        bed_window.as_mut(),
+                        full_mmap.as_ref(),
+                        &mut rel_row_indices,
+                        code4_lut,
+                        pool.as_ref(),
+                        timing.as_deref(),
                     )?;
-                    if let Some(timing) = timing.as_deref() {
-                        timing.add_decode_ns(spgrm_elapsed_ns(t_decode));
-                    }
+                    spgrm_consume_stream_batch_buffer(
+                        &decoded,
+                        task_accum.as_mut_slice(),
+                        batch_idx,
+                        m,
+                        progress_done_offset,
+                        total_progress,
+                        notify_step,
+                        &mut last_notified,
+                        progress_callback,
+                        threads,
+                        pool.as_ref(),
+                        timing.as_deref(),
+                    )?;
                 }
-
-                let timing_ref = timing.as_deref();
-                if threads > 1 && task_accum.len() > 1 {
-                    let mut gemm_work = || {
-                        task_accum.par_iter_mut().for_each(|task_acc| {
-                            spgrm_accumulate_task_gemm(
-                                task_acc,
-                                stripe_scratch.as_slice(),
-                                cur_rows,
-                                beta,
-                                timing_ref,
-                            );
-                        });
-                    };
-                    if let Some(tp) = pool.as_ref() {
-                        tp.install(gemm_work);
-                    } else {
-                        gemm_work();
-                    }
-                } else {
-                    for task_acc in task_accum.iter_mut() {
-                        spgrm_accumulate_task_gemm(
-                            task_acc,
-                            stripe_scratch.as_slice(),
-                            cur_rows,
-                            beta,
-                            timing_ref,
-                        );
-                    }
-                }
-
-                let batch_progress_offset = batch_idx.saturating_mul(m);
-                let done_rows = batch_progress_offset.saturating_add(row_start + cur_rows);
-                spgrm_progress_notify(
-                    progress_callback,
-                    progress_done_offset.saturating_add(done_rows),
-                    total_progress,
-                    notify_step,
-                    &mut last_notified,
-                    false,
-                )?;
             }
 
             let t_threshold = Instant::now();

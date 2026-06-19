@@ -15,14 +15,15 @@ use std::io::{BufWriter, Write};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
-use crate::bedmath::{
-    adaptive_grm_block_rows, decode_row_centered_full_lut, decode_row_centered_full_lut_f64,
-    decode_subset_row_from_full_scratch, decode_subset_row_from_full_scratch_f64,
-    is_identity_indices, packed_byte_lut,
-};
+use crate::bedmath::{adaptive_grm_block_rows, is_identity_indices, packed_byte_lut};
 use crate::blas::{
     cblas_dgemm_dispatch, cblas_dsyrk_dispatch, cblas_sgemm_dispatch, cblas_ssyrk_dispatch,
     CblasInt, OpenBlasThreadGuard, CBLAS_COL_MAJOR, CBLAS_NO_TRANS, CBLAS_TRANS, CBLAS_UPPER,
+};
+use crate::decode::{
+    apply_prepared_grm_stream_row_copy_f32 as decode_apply_prepared_grm_stream_row_copy_f32,
+    apply_prepared_grm_stream_row_copy_f64 as decode_apply_prepared_grm_stream_row_copy_f64,
+    decode_additive_grm_block_f32, decode_additive_grm_block_f64,
 };
 use crate::gfcore::{
     block_rows_from_memory_target_mb, parse_positive_env_f64, parse_positive_env_usize, read_fam,
@@ -65,96 +66,26 @@ pub(crate) fn decode_grm_block(
     if cur_rows == 0 {
         return Ok(());
     }
-    if out_block.len() < cur_rows.saturating_mul(n) {
-        return Err("decode_grm_block: out_block too small".to_string());
-    }
-    if out_varsum.len() < cur_rows {
-        return Err("decode_grm_block: out_varsum too small".to_string());
-    }
-    let block = &mut out_block[..cur_rows * n];
-    let varsum = &mut out_varsum[..cur_rows];
-
-    let mut decode_run = || {
-        if full_sample_fast {
-            block
-                .par_chunks_mut(n)
-                .zip(varsum.par_iter_mut())
-                .enumerate()
-                .for_each(|(off, (out_row, row_varsum_dst))| {
-                    let idx = row_start + off;
-                    let row = &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
-                    let flip = row_flip_vec[idx];
-                    let p = row_maf_vec[idx].clamp(0.0, 1.0);
-                    let mean_g = 2.0_f32 * p;
-                    let var = 2.0_f32 * p * (1.0_f32 - p);
-                    let std_scale = if method == 2 {
-                        if var > eps {
-                            1.0_f32 / var.sqrt()
-                        } else {
-                            0.0_f32
-                        }
-                    } else {
-                        1.0_f32
-                    };
-                    let value_lut: [f32; 4] = if flip {
-                        [
-                            (2.0_f32 - mean_g) * std_scale,
-                            0.0_f32,
-                            (1.0_f32 - mean_g) * std_scale,
-                            (0.0_f32 - mean_g) * std_scale,
-                        ]
-                    } else {
-                        [
-                            (0.0_f32 - mean_g) * std_scale,
-                            0.0_f32,
-                            (1.0_f32 - mean_g) * std_scale,
-                            (2.0_f32 - mean_g) * std_scale,
-                        ]
-                    };
-                    decode_row_centered_full_lut(row, n_samples, code4_lut, &value_lut, out_row);
-                    if method == 1 {
-                        *row_varsum_dst = var as f64;
-                    }
-                });
-        } else {
-            block
-                .par_chunks_mut(n)
-                .zip(varsum.par_iter_mut())
-                .enumerate()
-                .for_each_init(
-                    || vec![0.0_f32; n_samples],
-                    |full_row, (off, (out_row, row_varsum_dst))| {
-                        let idx = row_start + off;
-                        let row = &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
-                        let flip = row_flip_vec[idx];
-                        let p = row_maf_vec[idx].clamp(0.0, 1.0);
-                        let default_mean_g = 2.0_f32 * p;
-                        let (var_centered, _row_sum) = decode_subset_row_from_full_scratch(
-                            row,
-                            n_samples,
-                            sample_idx,
-                            flip,
-                            default_mean_g,
-                            method,
-                            eps,
-                            code4_lut,
-                            full_row.as_mut_slice(),
-                            out_row,
-                        );
-                        if method == 1 {
-                            *row_varsum_dst = var_centered;
-                        }
-                    },
-                );
-        }
-    };
-
-    if let Some(tp) = pool {
-        tp.install(&mut decode_run);
-    } else {
-        decode_run();
-    }
-    Ok(())
+    let _ = code4_lut;
+    let mut dummy_rowsum = vec![0.0_f64; cur_rows];
+    decode_additive_grm_block_f32(
+        packed_flat,
+        bytes_per_snp,
+        n_samples,
+        row_flip_vec,
+        row_maf_vec,
+        sample_idx,
+        full_sample_fast,
+        method,
+        eps,
+        row_start,
+        row_end,
+        n,
+        out_block,
+        out_varsum,
+        dummy_rowsum.as_mut_slice(),
+        pool,
+    )
 }
 
 #[inline]
@@ -345,9 +276,6 @@ where
     let local_xxt_rows = adaptive_packed_local_xxt_rows(n);
     let eps = 1e-12_f32;
 
-    // --- shared immutable data ---
-    let byte_lut = packed_byte_lut();
-
     // --- output buffers ---
     let _blas_guard = OpenBlasThreadGuard::enter(blas_threads.max(1));
     let mut grm = Vec::<f64>::with_capacity(n * n);
@@ -365,103 +293,30 @@ where
         for row_start in (0..m).step_by(row_step) {
             let row_end = (row_start + row_step).min(m);
             let cur_rows = row_end - row_start;
-            let cur_block = &mut block[..cur_rows * n];
             let mut block_varsum = vec![0.0_f64; cur_rows];
             let mut block_rowsum = vec![0.0_f64; cur_rows];
-
-            let mut decode_run = || {
-                if full_sample_fast {
-                    cur_block
-                        .par_chunks_mut(n)
-                        .zip(block_varsum.par_iter_mut())
-                        .zip(block_rowsum.par_iter_mut())
-                        .enumerate()
-                        .for_each(|(off, ((out_row, row_varsum_dst), row_sum_dst))| {
-                            let idx = row_start + off;
-                            let row = &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
-                            let p = row_maf_vec[idx].clamp(0.0_f32, 1.0_f32);
-                            let mean_g = 2.0_f32 * p;
-                            let var = 2.0_f32 * p * (1.0_f32 - p);
-                            let std_scale = if method == 2 {
-                                if var > eps {
-                                    1.0_f32 / var.sqrt()
-                                } else {
-                                    0.0_f32
-                                }
-                            } else {
-                                1.0_f32
-                            };
-                            let value_lut: [f32; 4] = if row_flip_vec[idx] {
-                                [
-                                    (2.0_f32 - mean_g) * std_scale,
-                                    0.0_f32,
-                                    (1.0_f32 - mean_g) * std_scale,
-                                    (0.0_f32 - mean_g) * std_scale,
-                                ]
-                            } else {
-                                [
-                                    (0.0_f32 - mean_g) * std_scale,
-                                    0.0_f32,
-                                    (1.0_f32 - mean_g) * std_scale,
-                                    (2.0_f32 - mean_g) * std_scale,
-                                ]
-                            };
-                            decode_row_centered_full_lut(
-                                row,
-                                n_samples,
-                                &byte_lut.code4,
-                                &value_lut,
-                                out_row,
-                            );
-                            if method == 1 {
-                                *row_varsum_dst = var as f64;
-                            }
-                            *row_sum_dst = (mean_g as f64) * (n as f64);
-                        });
-                } else {
-                    cur_block
-                        .par_chunks_mut(n)
-                        .zip(block_varsum.par_iter_mut())
-                        .zip(block_rowsum.par_iter_mut())
-                        .enumerate()
-                        .for_each_init(
-                            || vec![0.0_f32; n_samples],
-                            |full_row, (off, ((out_row, row_varsum_dst), row_sum_dst))| {
-                                let idx = row_start + off;
-                                let row =
-                                    &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
-                                let p = row_maf_vec[idx].clamp(0.0_f32, 1.0_f32);
-                                let default_mean_g = 2.0_f32 * p;
-                                let (var_centered, row_sum) = decode_subset_row_from_full_scratch(
-                                    row,
-                                    n_samples,
-                                    sample_idx,
-                                    row_flip_vec[idx],
-                                    default_mean_g,
-                                    method,
-                                    eps,
-                                    &byte_lut.code4,
-                                    full_row.as_mut_slice(),
-                                    out_row,
-                                );
-                                if method == 1 {
-                                    *row_varsum_dst = var_centered;
-                                }
-                                *row_sum_dst = row_sum;
-                            },
-                        );
-                }
-            };
-
-            if let Some(tp) = &decode_pool {
-                tp.install(&mut decode_run);
-            } else {
-                decode_run();
-            }
+            decode_additive_grm_block_f32(
+                packed_flat,
+                bytes_per_snp,
+                n_samples,
+                row_flip_vec,
+                row_maf_vec,
+                sample_idx,
+                full_sample_fast,
+                method,
+                eps,
+                row_start,
+                row_end,
+                n,
+                &mut block[..cur_rows * n],
+                block_varsum.as_mut_slice(),
+                block_rowsum.as_mut_slice(),
+                decode_pool.as_ref(),
+            )?;
 
             grm_rankk_update_raw_mixed_f32_to_f64(
                 grm_ptr,
-                cur_block,
+                &block[..cur_rows * n],
                 cur_rows,
                 n,
                 GrmAccumMode::Syrk,
@@ -542,90 +397,25 @@ where
         let cur_rows = row_end - next_start;
         buf.start = next_start;
         buf.rows = cur_rows;
-        let cur_block = &mut buf.data[..cur_rows * n];
-        let cur_varsum = &mut buf.varsum[..cur_rows];
-        let cur_rowsum = &mut buf.rowsum[..cur_rows];
-
-        if full_sample_fast {
-            cur_block
-                .par_chunks_mut(n)
-                .zip(cur_varsum.par_iter_mut())
-                .zip(cur_rowsum.par_iter_mut())
-                .enumerate()
-                .for_each(|(off, ((out_row, row_varsum_dst), row_sum_dst))| {
-                    let idx = next_start + off;
-                    let row = &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
-                    let p = row_maf_vec[idx].clamp(0.0_f32, 1.0_f32);
-                    let mean_g = 2.0_f32 * p;
-                    let var = 2.0_f32 * p * (1.0_f32 - p);
-                    let std_scale = if method == 2 {
-                        if var > eps {
-                            1.0_f32 / var.sqrt()
-                        } else {
-                            0.0_f32
-                        }
-                    } else {
-                        1.0_f32
-                    };
-                    let value_lut: [f32; 4] = if row_flip_vec[idx] {
-                        [
-                            (2.0_f32 - mean_g) * std_scale,
-                            0.0_f32,
-                            (1.0_f32 - mean_g) * std_scale,
-                            (0.0_f32 - mean_g) * std_scale,
-                        ]
-                    } else {
-                        [
-                            (0.0_f32 - mean_g) * std_scale,
-                            0.0_f32,
-                            (1.0_f32 - mean_g) * std_scale,
-                            (2.0_f32 - mean_g) * std_scale,
-                        ]
-                    };
-                    decode_row_centered_full_lut(
-                        row,
-                        n_samples,
-                        &byte_lut.code4,
-                        &value_lut,
-                        out_row,
-                    );
-                    if method == 1 {
-                        *row_varsum_dst = var as f64;
-                    }
-                    *row_sum_dst = (mean_g as f64) * (n as f64);
-                });
-        } else {
-            cur_block
-                .par_chunks_mut(n)
-                .zip(cur_varsum.par_iter_mut())
-                .zip(cur_rowsum.par_iter_mut())
-                .enumerate()
-                .for_each_init(
-                    || vec![0.0_f32; n_samples],
-                    |full_row, (off, ((out_row, row_varsum_dst), row_sum_dst))| {
-                        let idx = next_start + off;
-                        let row = &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
-                        let p = row_maf_vec[idx].clamp(0.0_f32, 1.0_f32);
-                        let default_mean_g = 2.0_f32 * p;
-                        let (var_centered, row_sum) = decode_subset_row_from_full_scratch(
-                            row,
-                            n_samples,
-                            sample_idx,
-                            row_flip_vec[idx],
-                            default_mean_g,
-                            method,
-                            eps,
-                            &byte_lut.code4,
-                            full_row.as_mut_slice(),
-                            out_row,
-                        );
-                        if method == 1 {
-                            *row_varsum_dst = var_centered;
-                        }
-                        *row_sum_dst = row_sum;
-                    },
-                );
-        }
+        decode_additive_grm_block_f32(
+            packed_flat,
+            bytes_per_snp,
+            n_samples,
+            row_flip_vec,
+            row_maf_vec,
+            sample_idx,
+            full_sample_fast,
+            method,
+            eps,
+            next_start,
+            row_end,
+            n,
+            &mut buf.data[..cur_rows * n],
+            &mut buf.varsum[..cur_rows],
+            &mut buf.rowsum[..cur_rows],
+            decode_pool.as_ref(),
+        )
+        .expect("packed GRM producer decode failed");
         next_start = row_end;
         next_start < m
     };
@@ -740,7 +530,6 @@ where
     let mut block = vec![0.0_f64; row_step * n];
     let mut varsum_acc = varsum_full;
     let eps = 1e-12_f64;
-    let byte_lut = packed_byte_lut();
     let mut row_sum_all = vec![0.0_f64; m];
     let mut last_notified = 0usize;
     let mut is_first_block = true;
@@ -748,102 +537,30 @@ where
     for row_start in (0..m).step_by(row_step) {
         let row_end = (row_start + row_step).min(m);
         let cur_rows = row_end - row_start;
-        let cur_block = &mut block[..cur_rows * n];
         let mut block_varsum = vec![0.0_f64; cur_rows];
         let mut block_rowsum = vec![0.0_f64; cur_rows];
-
-        let mut decode_run = || {
-            if full_sample_fast {
-                cur_block
-                    .par_chunks_mut(n)
-                    .zip(block_varsum.par_iter_mut())
-                    .zip(block_rowsum.par_iter_mut())
-                    .enumerate()
-                    .for_each(|(off, ((out_row, row_varsum_dst), row_sum_dst))| {
-                        let idx = row_start + off;
-                        let row = &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
-                        let p = row_maf_vec[idx].clamp(0.0_f32, 1.0_f32) as f64;
-                        let mean_g = 2.0_f64 * p;
-                        let var = 2.0_f64 * p * (1.0_f64 - p);
-                        let std_scale = if method == 2 {
-                            if var > eps {
-                                1.0_f64 / var.sqrt()
-                            } else {
-                                0.0_f64
-                            }
-                        } else {
-                            1.0_f64
-                        };
-                        let value_lut: [f64; 4] = if row_flip_vec[idx] {
-                            [
-                                (2.0_f64 - mean_g) * std_scale,
-                                0.0_f64,
-                                (1.0_f64 - mean_g) * std_scale,
-                                (0.0_f64 - mean_g) * std_scale,
-                            ]
-                        } else {
-                            [
-                                (0.0_f64 - mean_g) * std_scale,
-                                0.0_f64,
-                                (1.0_f64 - mean_g) * std_scale,
-                                (2.0_f64 - mean_g) * std_scale,
-                            ]
-                        };
-                        decode_row_centered_full_lut_f64(
-                            row,
-                            n_samples,
-                            &byte_lut.code4,
-                            &value_lut,
-                            out_row,
-                        );
-                        if method == 1 {
-                            *row_varsum_dst = var;
-                        }
-                        *row_sum_dst = mean_g * (n as f64);
-                    });
-            } else {
-                cur_block
-                    .par_chunks_mut(n)
-                    .zip(block_varsum.par_iter_mut())
-                    .zip(block_rowsum.par_iter_mut())
-                    .enumerate()
-                    .for_each_init(
-                        || vec![0.0_f64; n_samples],
-                        |full_row, (off, ((out_row, row_varsum_dst), row_sum_dst))| {
-                            let idx = row_start + off;
-                            let row = &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
-                            let p = row_maf_vec[idx].clamp(0.0_f32, 1.0_f32) as f64;
-                            let default_mean_g = 2.0_f64 * p;
-                            let (var_centered, row_sum) = decode_subset_row_from_full_scratch_f64(
-                                row,
-                                n_samples,
-                                sample_idx,
-                                row_flip_vec[idx],
-                                default_mean_g,
-                                method,
-                                eps,
-                                &byte_lut.code4,
-                                full_row.as_mut_slice(),
-                                out_row,
-                            );
-                            if method == 1 {
-                                *row_varsum_dst = var_centered;
-                            }
-                            *row_sum_dst = row_sum;
-                        },
-                    );
-            }
-        };
-
-        if let Some(tp) = &pool {
-            tp.install(&mut decode_run);
-        } else {
-            decode_run();
-        }
+        decode_additive_grm_block_f64(
+            packed_flat,
+            bytes_per_snp,
+            n_samples,
+            row_flip_vec,
+            row_maf_vec,
+            sample_idx,
+            full_sample_fast,
+            method,
+            eps,
+            row_start,
+            row_end,
+            n,
+            &mut block[..cur_rows * n],
+            block_varsum.as_mut_slice(),
+            block_rowsum.as_mut_slice(),
+            pool.as_ref(),
+        )?;
 
         grm_rankk_update_f64(
             &mut grm,
-            cur_block,
+            &block[..cur_rows * n],
             cur_rows,
             n,
             cblas_copy_rhs,
@@ -1793,18 +1510,13 @@ fn apply_grm_stream_prepared_row_copy_f64(
     dst: &mut [f64],
     prep: GrmStreamRowPreparedF64,
 ) {
-    for (g_src, g_dst) in src.iter().zip(dst.iter_mut()) {
-        if *g_src < 0.0_f32 {
-            *g_dst = 0.0_f64;
-            continue;
-        }
-        let gv = if prep.flip_major {
-            2.0_f64 - (*g_src as f64)
-        } else {
-            *g_src as f64
-        };
-        *g_dst = (gv - prep.mean_g) * prep.std_scale;
-    }
+    decode_apply_prepared_grm_stream_row_copy_f64(
+        src,
+        dst,
+        prep.mean_g,
+        prep.std_scale,
+        prep.flip_major,
+    );
 }
 
 #[inline]
@@ -1813,18 +1525,13 @@ fn apply_grm_stream_prepared_row_copy_f32(
     dst: &mut [f32],
     prep: GrmStreamRowPreparedF32,
 ) {
-    for (g_src, g_dst) in src.iter().zip(dst.iter_mut()) {
-        if *g_src < 0.0_f32 {
-            *g_dst = 0.0_f32;
-            continue;
-        }
-        let gv = if prep.flip_major {
-            2.0_f32 - *g_src
-        } else {
-            *g_src
-        };
-        *g_dst = (gv - prep.mean_g) * prep.std_scale;
-    }
+    decode_apply_prepared_grm_stream_row_copy_f32(
+        src,
+        dst,
+        prep.mean_g,
+        prep.std_scale,
+        prep.flip_major,
+    );
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
@@ -2465,8 +2172,7 @@ fn grm_stream_block_rows(
     ])
     .unwrap_or(1024.0_f64);
     let row_bytes = n_samples.saturating_mul(elem_bytes.max(1)).max(1);
-    let max_rows =
-        parse_positive_env_usize(&["JX_GRM_STREAM_BLOCK_MAX_ROWS"]).unwrap_or(65_536usize);
+    let max_rows = parse_positive_env_usize(&["JX_GRM_STREAM_BLOCK_MAX_ROWS"]).unwrap_or(m.max(1));
     let cap_rows = block_rows_from_memory_target_mb(target_mb, row_bytes, m.max(1), 1, 2, 0);
     base.min(cap_rows).min(max_rows).max(1).min(m.max(1))
 }

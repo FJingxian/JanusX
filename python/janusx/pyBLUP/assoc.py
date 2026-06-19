@@ -207,7 +207,7 @@ def _resolve_matrix_file_hint(matrix: object) -> Optional[str]:
 from janusx.janusx import (
     fastlmm_prepare_lowrank_f64,
     fastlmm_assoc_from_snp_f32,
-    glmf32,
+    lm_block_assoc_f32,
     lmm_reml_chunk_f32,
     lmm_reml_null_f32,
     ml_loglike_null_f32,
@@ -216,11 +216,6 @@ from janusx.janusx import (
     fastlmm_reml_null_f32,
     fastlmm_assoc_chunk_f32,
 )
-try:
-    from janusx.janusx import glm_ixx_from_x_qr as _glm_ixx_from_x_qr
-except Exception:
-    _glm_ixx_from_x_qr = None
-
 try:
     from janusx.janusx import (
         lmm_reml_chunk_from_snp_f32 as _lmm_reml_chunk_from_snp_f32,
@@ -265,16 +260,12 @@ except Exception:
 
 try:
     from janusx.janusx import (
-        glmf32_packed as _glmf32_packed,
         lm_block_assoc_packed as _lm_block_assoc_packed,
-        lm_block_assoc_packed_to_tsv as _lm_block_assoc_packed_to_tsv,
         bed_packed_row_flip_mask as _bed_packed_row_flip_mask,
         bed_packed_decode_rows_f32 as _bed_packed_decode_rows_f32,
     )
 except Exception:
-    _glmf32_packed = None
     _lm_block_assoc_packed = None
-    _lm_block_assoc_packed_to_tsv = None
     _bed_packed_row_flip_mask = None
     _bed_packed_decode_rows_f32 = None
 
@@ -459,6 +450,36 @@ def _select_snp_rows(
     return np.ascontiguousarray(np.asarray(decoded, dtype=np.float32), dtype=np.float32)
 
 
+def _lm_precompute_ixx_qr(X: np.ndarray) -> np.ndarray:
+    """
+    Compute (X'X)^(-1) / pseudo-inverse on the LM design scale.
+
+    For the small LM covariate systems used here, a local QR/pinv path is
+    simpler than keeping a dedicated Rust export alive just for pyBLUP.
+    """
+    X = np.ascontiguousarray(np.asarray(X, dtype=np.float64))
+    if X.ndim != 2:
+        raise ValueError("X must be 2D for LM QR precomputation.")
+    n, q = X.shape
+    if n == 0 or q == 0:
+        raise ValueError("X must be non-empty for LM QR precomputation.")
+    _qmat, r = np.linalg.qr(X, mode="reduced")
+    diag = np.abs(np.diag(r))
+    max_diag = float(diag.max()) if diag.size else 0.0
+    tol = np.finfo(np.float64).eps * float(max(n, q)) * max_diag
+    rank = int(np.sum(diag > tol))
+    if rank == q:
+        rinv = np.linalg.inv(r)
+        ixx = rinv @ rinv.T
+    else:
+        xtx = X.T @ X
+        try:
+            ixx = np.linalg.pinv(xtx, hermitian=True)
+        except TypeError:
+            ixx = np.linalg.pinv(xtx)
+    return np.ascontiguousarray(np.asarray(ixx, dtype=np.float64), dtype=np.float64)
+
+
 def FEM(
     y: np.ndarray,
     X: np.ndarray,
@@ -469,10 +490,7 @@ def FEM(
     sample_indices: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """
-    Fixed Effects Model (FEM) GWAS scan (fast GLM/LM in Rust, chunked).
-
-    This is a thin wrapper around the Rust function `glmf32`, which evaluates
-    SNP-by-SNP association under a fixed-effect linear model.
+    Fixed Effects Model (FEM) GWAS scan on the LM block-association path.
 
     Parameters
     ----------
@@ -500,7 +518,7 @@ def FEM(
         - Larger chunks increase peak memory traffic / cache pressure
 
     threads : int, default=1
-        Number of Rust worker threads used inside glmf32.
+        Number of Rust worker threads used inside the LM block kernel.
         (This is *not* joblib threads; it's passed to Rust.)
 
     sample_indices : np.ndarray or None
@@ -510,11 +528,8 @@ def FEM(
     Returns
     -------
     result : np.ndarray
-        Rust returns an array-like object which is converted to a NumPy array.
-        The exact output column layout depends on your Rust implementation.
-
-        In your downstream code you treat it as:
-            result[:, [0, 1, -1]]  -> beta, se, p
+        Per-SNP result matrix. Downstream code uses columns `[0, 1, 2]`
+        corresponding to `beta, se, pwald`.
 
     Raises
     ------
@@ -524,34 +539,14 @@ def FEM(
     Notes
     -----
     - This function never transposes M. Ensure SNP-major input (m,n).
-    - Ensure your Rust `glmf32` expects:
-        y: float64[n]
-        X: float64[n,p]
-        ixx: float64[p,p]  (pinv of X'X)
-        M: float32[m,n]
+    - Both dense and packed paths now use the `lm_block_assoc_*` kernels.
     """
     # ---- Validate / normalize inputs for Rust ----
     y = np.ascontiguousarray(y, dtype=np.float64).ravel()
     X = np.ascontiguousarray(X, dtype=np.float64)
 
-    # Precompute (X'X)^(-1) once unless caller provides a cached matrix.
-    # Rust-only: do not fallback to NumPy pinv.
     if ixx is None:
-        if _glm_ixx_from_x_qr is None:
-            raise RuntimeError(
-                "Rust extension missing glm_ixx_from_x_qr. "
-                "Rebuild janusx extension for Rust-only GWAS mode."
-            )
-        ixx = np.ascontiguousarray(
-            np.asarray(
-                _glm_ixx_from_x_qr(
-                    y,
-                    X,
-                ),
-                dtype=np.float64,
-            ),
-            dtype=np.float64,
-        )
+        ixx = _lm_precompute_ixx_qr(X)
     else:
         ixx = np.ascontiguousarray(ixx, dtype=np.float64)
 
@@ -582,12 +577,12 @@ def FEM(
                     int(threads),
                 )
             )
-        if _glmf32_packed is None:
+        if _lm_block_assoc_packed is None:
             raise RuntimeError(
-                "Rust extension missing glmf32_packed. Rebuild janusx extension."
+                "Rust extension missing lm_block_assoc_packed. Rebuild janusx extension."
             )
         return np.asarray(
-            _glmf32_packed(
+            _lm_block_assoc_packed(
                 y,
                 X,
                 ixx,
@@ -598,7 +593,8 @@ def FEM(
                 sidx,
                 int(chunksize),
                 int(threads),
-            )
+            ),
+            dtype=np.float64,
         )
 
     M = np.asarray(M)
@@ -613,21 +609,17 @@ def FEM(
                 f"M must be shape (m, n). Got M.shape={M.shape}, but n=len(y)={y.shape[0]}"
             )
         M = np.ascontiguousarray(M, dtype=np.float32)
-
-    result = []
-    for start in range(0, M.shape[0], chunksize):
-        end = min(start + chunksize, M.shape[0])
-        result.append(
-            glmf32(
-                y,
-                X,
-                ixx,
-                M[start:end],
-                int(end - start),
-                int(threads),
-            )
-        )
-    return np.concatenate(result, axis=0)
+    return np.asarray(
+        lm_block_assoc_f32(
+            y,
+            X,
+            ixx,
+            M,
+            int(max(1, int(chunksize))),
+            int(threads),
+        ),
+        dtype=np.float64,
+    )
 
 
 def lmm_reml(
@@ -2118,17 +2110,7 @@ class LM:
             if X is not None
             else np.ones((self.y.shape[0], 1))
         )
-        # Cache (X'X)^(-1) for repeated chunk scans on the same trait.
-        # Rust-only: compute via Rust QR path, no NumPy pinv fallback.
-        if _glm_ixx_from_x_qr is None:
-            raise RuntimeError(
-                "Rust extension missing glm_ixx_from_x_qr. "
-                "Rebuild janusx extension for Rust-only GWAS mode."
-            )
-        self.ixx = np.ascontiguousarray(
-            np.asarray(_glm_ixx_from_x_qr(self.y.ravel(), self.X), dtype=np.float64),
-            dtype=np.float64,
-        )
+        self.ixx = _lm_precompute_ixx_qr(self.X)
 
     def gwas(self, snp: np.ndarray, threads: int = 1) -> np.ndarray:
         """

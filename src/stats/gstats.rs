@@ -11,10 +11,15 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
+use std::time::Instant;
 
 use crate::bedmath::{packed_byte_lut, packed_pair_lut};
 use crate::gfcore;
-use crate::gfreader::count_packed_row_counts as count_packed_row_counts_simd;
+use crate::gfreader::{
+    count_packed_row_counts as count_packed_row_counts_simd,
+    count_packed_row_counts_selected_with_excluded, evaluate_packed_row_keep_and_flip,
+    packed_row_stats_from_counts, SampleSubsetPlan,
+};
 use crate::math_ld::{
     build_bitplanes_u64, compute_packed_row_stats, dot_nomiss_pair_bitplanes,
     dot_nomiss_pair_from_packed, r2_pairwise_complete_bitplanes, r2_pairwise_complete_from_packed,
@@ -69,6 +74,27 @@ struct GstatsBlockResult {
     het_ct: Option<Vec<u64>>,
 }
 
+/// Marker-level metadata reused by downstream GWAS loaders after
+/// bitwise filtering on the raw BED rows.
+#[derive(Clone, Debug)]
+pub(crate) struct BedFilterMeta {
+    pub maf: Vec<f32>,
+    pub miss: Vec<f32>,
+    pub het: Vec<f32>,
+    pub row_flip: Vec<bool>,
+    pub row_source_indices: Vec<usize>,
+    pub site_keep: Vec<bool>,
+    pub n_samples_full: usize,
+    pub n_markers_total: usize,
+    pub bytes_per_snp: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BedFilterMetaMode {
+    FullDecodeMeta,
+    SiteStatsOnly,
+}
+
 #[inline]
 fn normalize_plink_prefix(p: &str) -> String {
     let s = p.trim();
@@ -87,6 +113,11 @@ fn normalize_chr_token(s: &str) -> String {
     } else {
         t.to_string()
     }
+}
+
+#[inline]
+fn is_simple_snp_allele(allele: &str) -> bool {
+    matches!(allele, "A" | "C" | "G" | "T" | "a" | "c" | "g" | "t")
 }
 
 fn open_bed_mmap(prefix: &str) -> Result<(Mmap, usize, usize, usize), String> {
@@ -246,6 +277,277 @@ fn compute_site_stats_core(
         run();
     }
     Ok((maf, miss, het))
+}
+
+fn compute_bed_filter_meta_core(
+    packed_src: &[u8],
+    n_samples_full: usize,
+    n_markers_total: usize,
+    bytes_per_snp: usize,
+    maf_threshold: f32,
+    max_missing_rate: f32,
+    het_threshold: f32,
+    sites_all: Option<&[gfcore::SiteInfo]>,
+    sample_indices: Option<&[usize]>,
+    mode: BedFilterMetaMode,
+    threads: usize,
+) -> Result<BedFilterMeta, String> {
+    let subset_plan = SampleSubsetPlan::from_optional_indices(n_samples_full, sample_indices);
+    let stats_identity = subset_plan.is_identity();
+    let stats_n = subset_plan.n_selected();
+    let apply_het = het_threshold > 0.0;
+    let pool = get_cached_pool(threads).map_err(|e| e.to_string())?;
+
+    if matches!(mode, BedFilterMetaMode::SiteStatsOnly)
+        && !snps_only_for_light_mode(sites_all)
+        && maf_threshold <= 0.0
+        && max_missing_rate >= 1.0
+        && !apply_het
+    {
+        let mut maf = vec![0.0_f32; n_markers_total];
+        let mut miss = vec![0.0_f32; n_markers_total];
+        let mut het = vec![0.0_f32; n_markers_total];
+        let mut run = || {
+            maf.par_iter_mut()
+                .zip(miss.par_iter_mut())
+                .zip(het.par_iter_mut())
+                .enumerate()
+                .for_each(|(i, ((maf_dst, miss_dst), het_dst))| {
+                    let row = &packed_src[i * bytes_per_snp..(i + 1) * bytes_per_snp];
+                    let (missing, het_count, hom_alt) = if stats_identity {
+                        count_packed_row_counts_simd(row, n_samples_full)
+                    } else {
+                        count_packed_row_counts_selected_with_excluded(
+                            row,
+                            n_samples_full,
+                            subset_plan.selected().unwrap(),
+                            subset_plan.excluded(),
+                        )
+                    };
+                    let (maf_v, miss_v, het_v) =
+                        packed_site_rates(stats_n, missing, het_count, hom_alt);
+                    *maf_dst = maf_v;
+                    *miss_dst = miss_v;
+                    *het_dst = het_v;
+                });
+        };
+        if let Some(ref tp) = pool {
+            tp.install(run);
+        } else {
+            run();
+        }
+        return Ok(BedFilterMeta {
+            maf,
+            miss,
+            het,
+            row_flip: Vec::new(),
+            row_source_indices: Vec::new(),
+            site_keep: Vec::new(),
+            n_samples_full,
+            n_markers_total,
+            bytes_per_snp,
+        });
+    }
+
+    let keep_flip_stats: Vec<(bool, bool, f32, f32, f32)> = {
+        let run = || -> Vec<(bool, bool, f32, f32, f32)> {
+            packed_src
+                .par_chunks(bytes_per_snp)
+                .enumerate()
+                .map(|(i, row)| {
+                    let (missing, het, hom_alt) = if stats_identity {
+                        count_packed_row_counts_simd(row, n_samples_full)
+                    } else {
+                        count_packed_row_counts_selected_with_excluded(
+                            row,
+                            n_samples_full,
+                            subset_plan.selected().unwrap(),
+                            subset_plan.excluded(),
+                        )
+                    };
+                    let non_missing = stats_n.saturating_sub(missing);
+                    let alt_sum = het.saturating_add(hom_alt.saturating_mul(2));
+                    let het_count = if apply_het { het } else { 0 };
+                    let (miss, maf, _std) =
+                        packed_row_stats_from_counts(stats_n, non_missing, alt_sum);
+                    let (_, _, het_v) = packed_site_rates(stats_n, missing, het, hom_alt);
+                    let (pass_num, flip) = evaluate_packed_row_keep_and_flip(
+                        stats_n,
+                        non_missing,
+                        alt_sum,
+                        het_count,
+                        maf_threshold,
+                        max_missing_rate,
+                        apply_het,
+                        het_threshold,
+                    );
+                    let pass_snp = if let Some(sites) = sites_all {
+                        is_simple_snp_allele(&sites[i].ref_allele)
+                            && is_simple_snp_allele(&sites[i].alt_allele)
+                    } else {
+                        true
+                    };
+                    (
+                        pass_num && pass_snp,
+                        (pass_num && pass_snp) && flip,
+                        miss,
+                        maf,
+                        het_v,
+                    )
+                })
+                .collect()
+        };
+        if let Some(ref tp) = pool {
+            tp.install(run)
+        } else {
+            run()
+        }
+    };
+
+    let site_keep: Vec<bool> = keep_flip_stats
+        .iter()
+        .map(|(keep, _, _, _, _)| *keep)
+        .collect();
+    let kept_n = site_keep.iter().filter(|&&keep| keep).count();
+    if kept_n == 0 {
+        return Err("No SNPs left after filtering".to_string());
+    }
+
+    let mut maf = Vec::with_capacity(kept_n);
+    let mut miss = Vec::with_capacity(kept_n);
+    let mut het = Vec::with_capacity(kept_n);
+    let mut row_flip = Vec::with_capacity(kept_n);
+    let mut row_source_indices = Vec::with_capacity(kept_n);
+    for (row_idx, &(keep, flip, miss_v, maf_v, het_v)) in keep_flip_stats.iter().enumerate() {
+        if keep {
+            maf.push(maf_v);
+            miss.push(miss_v);
+            het.push(het_v);
+            row_flip.push(flip);
+            row_source_indices.push(row_idx);
+        }
+    }
+
+    Ok(BedFilterMeta {
+        maf,
+        miss,
+        het,
+        row_flip,
+        row_source_indices,
+        site_keep,
+        n_samples_full,
+        n_markers_total,
+        bytes_per_snp,
+    })
+}
+
+pub(crate) fn compute_bed_filter_meta(
+    prefix: &str,
+    maf_threshold: f32,
+    max_missing_rate: f32,
+    het_threshold: f32,
+    snps_only: bool,
+    sample_indices: Option<&[usize]>,
+    mode: BedFilterMetaMode,
+    threads: usize,
+) -> Result<BedFilterMeta, String> {
+    let bed_prefix = normalize_plink_prefix(prefix);
+    let (mmap, n_samples_full, n_markers_total, bytes_per_snp) = open_bed_mmap(&bed_prefix)?;
+    let packed_src = &mmap[3..];
+    let sites_all = if snps_only {
+        Some(gfcore::read_bim(&bed_prefix).map_err(|e| e.to_string())?)
+    } else {
+        None
+    };
+    compute_bed_filter_meta_core(
+        packed_src,
+        n_samples_full,
+        n_markers_total,
+        bytes_per_snp,
+        maf_threshold,
+        max_missing_rate,
+        het_threshold,
+        sites_all.as_deref(),
+        sample_indices,
+        mode,
+        threads,
+    )
+}
+
+#[inline]
+fn snps_only_for_light_mode(sites_all: Option<&[gfcore::SiteInfo]>) -> bool {
+    sites_all.is_some()
+}
+
+fn compute_site_stats_legacy_from_prefix(
+    prefix: &str,
+    threads: usize,
+) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>, usize, usize), String> {
+    let bed_prefix = normalize_plink_prefix(prefix);
+    let (mmap, n_samples, n_snps, bytes_per_snp) = open_bed_mmap(&bed_prefix)?;
+    let packed_src = &mmap[3..];
+    let (maf, miss, het) =
+        compute_site_stats_core(packed_src, n_samples, n_snps, bytes_per_snp, threads)?;
+    Ok((maf, miss, het, n_samples, n_snps))
+}
+
+fn compute_site_stats_unified_from_prefix(
+    prefix: &str,
+    threads: usize,
+) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>, usize, usize), String> {
+    let meta = compute_bed_filter_meta(
+        prefix,
+        0.0,
+        1.0,
+        0.0,
+        false,
+        None,
+        BedFilterMetaMode::SiteStatsOnly,
+        threads,
+    )?;
+    Ok((
+        meta.maf,
+        meta.miss,
+        meta.het,
+        meta.n_samples_full,
+        meta.n_markers_total,
+    ))
+}
+
+fn compute_joint_site_only_via_meta(
+    prefix: &str,
+    request: GstatsRequest,
+    threads: usize,
+) -> Result<(GstatsCombinedOutput, usize, usize), String> {
+    let meta = compute_bed_filter_meta(
+        prefix,
+        0.0,
+        1.0,
+        0.0,
+        false,
+        None,
+        BedFilterMetaMode::SiteStatsOnly,
+        threads,
+    )?;
+    Ok((
+        GstatsCombinedOutput {
+            site_maf: request.site_maf.then_some(meta.maf),
+            site_miss: request.site_miss.then_some(meta.miss),
+            site_het: request.site_het.then_some(meta.het),
+            individual_miss: None,
+            individual_het: None,
+        },
+        meta.n_samples_full,
+        meta.n_markers_total,
+    ))
+}
+
+#[inline]
+fn max_abs_diff_f32(a: &[f32], b: &[f32]) -> f32 {
+    a.iter()
+        .zip(b.iter())
+        .map(|(&x, &y)| (x - y).abs())
+        .fold(0.0_f32, f32::max)
 }
 
 fn compute_individual_stats_core(
@@ -880,14 +1182,11 @@ pub fn gstats_bed_site_stats<'py>(
     Bound<'py, PyArray1<f32>>,
     usize,
 )> {
-    let bed_prefix = normalize_plink_prefix(&prefix);
     let (maf, miss, het, n_samples) = py
         .detach(
             move || -> Result<(Vec<f32>, Vec<f32>, Vec<f32>, usize), String> {
-                let (mmap, n_samples, n_snps, bytes_per_snp) = open_bed_mmap(&bed_prefix)?;
-                let packed_src = &mmap[3..];
-                let (maf, miss, het) =
-                    compute_site_stats_core(packed_src, n_samples, n_snps, bytes_per_snp, threads)?;
+                let (maf, miss, het, n_samples, _n_snps) =
+                    compute_site_stats_unified_from_prefix(&prefix, threads)?;
                 Ok((maf, miss, het, n_samples))
             },
         )
@@ -938,17 +1237,21 @@ pub fn gstats_bed_joint_stats<'py>(
     let out = py
         .detach(
             move || -> Result<(GstatsCombinedOutput, usize, usize), String> {
-                let (mmap, n_samples, n_snps, bytes_per_snp) = open_bed_mmap(&bed_prefix)?;
-                let packed_src = &mmap[3..];
-                let out = compute_joint_stats_core(
-                    packed_src,
-                    n_samples,
-                    n_snps,
-                    bytes_per_snp,
-                    request,
-                    threads,
-                )?;
-                Ok((out, n_samples, n_snps))
+                if !request.needs_individual() {
+                    compute_joint_site_only_via_meta(&bed_prefix, request, threads)
+                } else {
+                    let (mmap, n_samples, n_snps, bytes_per_snp) = open_bed_mmap(&bed_prefix)?;
+                    let packed_src = &mmap[3..];
+                    let out = compute_joint_stats_core(
+                        packed_src,
+                        n_samples,
+                        n_snps,
+                        bytes_per_snp,
+                        request,
+                        threads,
+                    )?;
+                    Ok((out, n_samples, n_snps))
+                }
             },
         )
         .map_err(map_err_string_to_py)?;
@@ -972,6 +1275,57 @@ pub fn gstats_bed_joint_stats<'py>(
     Ok((
         maf_arr, miss_arr, het_arr, imiss_arr, ihet_arr, n_samples, n_snps,
     ))
+}
+
+#[pyfunction]
+#[pyo3(signature = (prefix, threads=0, repeats=3))]
+pub fn gstats_bed_site_stats_compare<'py>(
+    py: Python<'py>,
+    prefix: String,
+    threads: usize,
+    repeats: usize,
+) -> PyResult<(f64, f64, f32, f32, f32, usize, usize)> {
+    let reps = repeats.max(1);
+    py.detach(move || -> Result<(f64, f64, f32, f32, f32, usize, usize), String> {
+        let (maf_legacy, miss_legacy, het_legacy, n_samples_legacy, n_snps_legacy) =
+            compute_site_stats_legacy_from_prefix(&prefix, threads)?;
+        let (maf_unified, miss_unified, het_unified, n_samples_unified, n_snps_unified) =
+            compute_site_stats_unified_from_prefix(&prefix, threads)?;
+        if n_samples_legacy != n_samples_unified || n_snps_legacy != n_snps_unified {
+            return Err(format!(
+                "site-stats shape mismatch: legacy=({n_samples_legacy},{n_snps_legacy}) unified=({n_samples_unified},{n_snps_unified})"
+            ));
+        }
+        let maf_diff = max_abs_diff_f32(&maf_legacy, &maf_unified);
+        let miss_diff = max_abs_diff_f32(&miss_legacy, &miss_unified);
+        let het_diff = max_abs_diff_f32(&het_legacy, &het_unified);
+
+        let mut legacy_secs = 0.0_f64;
+        let mut unified_secs = 0.0_f64;
+        for _ in 0..reps {
+            let t0 = Instant::now();
+            let (maf, miss, het, _n_samples, _n_snps) =
+                compute_site_stats_legacy_from_prefix(&prefix, threads)?;
+            let _ = (maf.len(), miss.len(), het.len());
+            legacy_secs += t0.elapsed().as_secs_f64();
+
+            let t0 = Instant::now();
+            let (maf, miss, het, _n_samples, _n_snps) =
+                compute_site_stats_unified_from_prefix(&prefix, threads)?;
+            let _ = (maf.len(), miss.len(), het.len());
+            unified_secs += t0.elapsed().as_secs_f64();
+        }
+        Ok((
+            legacy_secs / reps as f64,
+            unified_secs / reps as f64,
+            maf_diff,
+            miss_diff,
+            het_diff,
+            n_samples_legacy,
+            n_snps_legacy,
+        ))
+    })
+    .map_err(map_err_string_to_py)
 }
 
 #[pyfunction]

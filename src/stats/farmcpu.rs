@@ -63,14 +63,13 @@ both routes; when a unified-route pseudo-QTN falls inside a local re-scan
 window, its output statistics come from that local conditional refit.
 */
 
+use crate::assoc2tsv::resolve_assoc_tsv_metadata;
 use crate::bedmath::{decode_plink_bed_hardcall, packed_row_missing_count_selected};
 use crate::blas::{cblas_dgemm_dispatch, CblasInt, CBLAS_NO_TRANS, CBLAS_ROW_MAJOR};
 use crate::linalg::{
     chisq_from_beta_se_and_optional_plrt, format_chisq_value, sanitize_assoc_pvalue,
 };
-use crate::stats_common::{
-    get_cached_pool, parse_index_vec_i64, resolve_assoc_tsv_metadata, AsyncTsvWriter,
-};
+use crate::stats_common::{get_cached_pool, parse_index_vec_i64, AsyncTsvWriter};
 use nalgebra::{DMatrix, DVector};
 use numpy::PyArray1;
 use numpy::PyArrayMethods;
@@ -2556,7 +2555,11 @@ pub fn farmcpu_packed_to_tsv(
                 for &idx in qtn_union.iter() {
                     let mut score = qtn_best_score.get(&idx).copied().unwrap_or_else(|| {
                         let p = femp.get(idx).copied().unwrap_or(1.0);
-                        if p.is_finite() { p } else { 1.0 }
+                        if p.is_finite() {
+                            p
+                        } else {
+                            1.0
+                        }
                     });
                     if !score.is_finite() {
                         score = 1.0;

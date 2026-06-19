@@ -13,7 +13,6 @@ use std::arch::x86 as x86_avx2;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64 as x86_avx2;
 use std::collections::{HashMap, HashSet};
-use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -24,10 +23,6 @@ use std::time::Instant;
 use crate::bitwise::and_popcount;
 use crate::gfcore as core;
 use crate::gfcore::{BedSnpIter, HmpSnpIter, TxtSnpIter, VcfSnpIter};
-use crate::linalg::{
-    chisq_from_beta_se_and_optional_plrt, format_chisq_value, sanitize_assoc_pvalue,
-};
-use crate::stats_common::AsyncTsvWriter;
 use crate::vcfout::VcfOut;
 
 // -------- Py-exposed SiteInfo (wrapper) --------
@@ -69,303 +64,6 @@ impl SiteInfo {
             ref_allele,
             alt_allele,
         }
-    }
-}
-
-#[inline]
-fn transform_alleles_by_model_local(
-    ref_allele: &str,
-    alt_allele: &str,
-    model_key: &str,
-) -> (String, String) {
-    match model_key {
-        "dom" => (
-            format!("{ref_allele}{ref_allele}"),
-            format!("{ref_allele}{alt_allele}/{alt_allele}{alt_allele}"),
-        ),
-        "rec" => (
-            format!("{ref_allele}{alt_allele}/{ref_allele}{ref_allele}"),
-            format!("{alt_allele}{alt_allele}"),
-        ),
-        "het" => (
-            format!("{ref_allele}{ref_allele}/{alt_allele}{alt_allele}"),
-            format!("{ref_allele}{alt_allele}"),
-        ),
-        _ => (ref_allele.to_string(), alt_allele.to_string()),
-    }
-}
-
-#[pyclass]
-pub struct GwasAssocTsvWriter {
-    path: String,
-    model_key: String,
-    result_cols: Option<usize>,
-    rows_written: usize,
-    buffer_bytes: usize,
-    text_buf: String,
-    writer: Option<AsyncTsvWriter>,
-}
-
-#[inline]
-fn gwas_assoc_header_for_result_cols(result_cols: usize) -> PyResult<&'static [u8]> {
-    match result_cols {
-        3 => Ok(b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\n"),
-        4 => Ok(b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n"),
-        6 => Ok(
-            b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\tlambda\tml\tplrt\n",
-        ),
-        other => Err(PyValueError::new_err(format!(
-            "unsupported GWAS result column count: {other} (expected 3, 4, or 6)"
-        ))),
-    }
-}
-
-#[pymethods]
-impl GwasAssocTsvWriter {
-    #[new]
-    #[pyo3(signature = (path, genetic_model="add"))]
-    fn new(path: String, genetic_model: &str) -> PyResult<Self> {
-        let model_key = genetic_model.trim().to_ascii_lowercase();
-        if !matches!(model_key.as_str(), "add" | "dom" | "rec" | "het") {
-            return Err(PyValueError::new_err(
-                "genetic_model must be one of: add, dom, rec, het",
-            ));
-        }
-        Ok(Self {
-            path,
-            model_key,
-            result_cols: None,
-            rows_written: 0,
-            buffer_bytes: 8 * 1024 * 1024,
-            text_buf: String::with_capacity(8 * 1024 * 1024),
-            writer: None,
-        })
-    }
-
-    fn write_chunk(
-        &mut self,
-        sites: Vec<SiteInfo>,
-        snp: Vec<String>,
-        maf: PyReadonlyArray1<'_, f32>,
-        miss: PyReadonlyArray1<'_, f32>,
-        results: PyReadonlyArray2<'_, f64>,
-    ) -> PyResult<usize> {
-        if sites.is_empty() {
-            return Ok(0);
-        }
-        if snp.len() != sites.len() {
-            return Err(PyValueError::new_err(format!(
-                "snp length mismatch: snp={}, sites={}",
-                snp.len(),
-                sites.len()
-            )));
-        }
-
-        let maf_arr = maf.as_slice()?;
-        if maf_arr.len() != sites.len() {
-            return Err(PyValueError::new_err(format!(
-                "maf length mismatch: maf={}, sites={}",
-                maf_arr.len(),
-                sites.len()
-            )));
-        }
-        let miss_arr = miss.as_slice()?;
-        if miss_arr.len() != sites.len() {
-            return Err(PyValueError::new_err(format!(
-                "miss length mismatch: miss={}, sites={}",
-                miss_arr.len(),
-                sites.len()
-            )));
-        }
-
-        let res = results.as_array();
-        let shape = res.shape();
-        if shape.len() != 2 {
-            return Err(PyValueError::new_err("results must be 2D"));
-        }
-        if shape[0] != sites.len() {
-            return Err(PyValueError::new_err(format!(
-                "results row mismatch: results={}, sites={}",
-                shape[0],
-                sites.len()
-            )));
-        }
-        if shape[1] < 3 {
-            return Err(PyValueError::new_err(format!(
-                "results must have at least 3 columns, got {}",
-                shape[1]
-            )));
-        }
-        let result_cols = shape[1];
-        let header = gwas_assoc_header_for_result_cols(result_cols)?;
-        match self.result_cols {
-            None => {
-                self.result_cols = Some(result_cols);
-                self.writer = Some(
-                    AsyncTsvWriter::with_config(&self.path, header, 64 * 1024 * 1024, 16)
-                        .map_err(PyIOError::new_err)?,
-                );
-            }
-            Some(prev) => {
-                if prev != result_cols {
-                    return Err(PyValueError::new_err(
-                        "inconsistent results columns across chunks",
-                    ));
-                }
-            }
-        }
-
-        for i in 0..sites.len() {
-            let s = &sites[i];
-            let (a0, a1) =
-                transform_alleles_by_model_local(&s.ref_allele, &s.alt_allele, &self.model_key);
-            let beta = res[[i, 0]];
-            let se = res[[i, 1]];
-            let pwald = sanitize_assoc_pvalue(beta, se, res[[i, 2]]);
-            let chisq = chisq_from_beta_se_and_optional_plrt(beta, se, None);
-            let chisq_txt = format_chisq_value(chisq);
-            if result_cols == 6 {
-                let _ = writeln!(
-                    self.text_buf,
-                    "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\t{:.6e}\t{:.6e}\t{:.4e}",
-                    s.chrom,
-                    s.pos,
-                    snp[i],
-                    a0,
-                    a1,
-                    maf_arr[i],
-                    miss_arr[i].round() as i64,
-                    beta,
-                    se,
-                    chisq_txt,
-                    pwald,
-                    res[[i, 3]],
-                    res[[i, 4]],
-                    res[[i, 5]]
-                );
-            } else if result_cols == 4 {
-                let _ = writeln!(
-                    self.text_buf,
-                    "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\t{:.4e}",
-                    s.chrom,
-                    s.pos,
-                    snp[i],
-                    a0,
-                    a1,
-                    maf_arr[i],
-                    miss_arr[i].round() as i64,
-                    beta,
-                    se,
-                    chisq_txt,
-                    pwald,
-                    res[[i, 3]]
-                );
-            } else {
-                let _ = writeln!(
-                    self.text_buf,
-                    "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}",
-                    s.chrom,
-                    s.pos,
-                    snp[i],
-                    a0,
-                    a1,
-                    maf_arr[i],
-                    miss_arr[i].round() as i64,
-                    beta,
-                    se,
-                    chisq_txt,
-                    pwald,
-                );
-            }
-        }
-        self.rows_written = self.rows_written.saturating_add(sites.len());
-        if self.text_buf.len() >= self.buffer_bytes {
-            self.send_pending_block()?;
-        }
-        Ok(sites.len())
-    }
-
-    /// Append pre-formatted TSV text (e.g. from fvlmm_assoc_chunk_from_snp_to_tsv_f32).
-    /// The text must NOT contain a header line.
-    fn append_text(&mut self, text: String, has_plrt: bool, rows: usize) -> PyResult<()> {
-        if rows == 0 || text.is_empty() {
-            return Ok(());
-        }
-        let result_cols = if has_plrt { 4usize } else { 3usize };
-        let header = gwas_assoc_header_for_result_cols(result_cols)?;
-        match self.result_cols {
-            None => {
-                self.result_cols = Some(result_cols);
-                self.writer = Some(
-                    AsyncTsvWriter::with_config(&self.path, header, 64 * 1024 * 1024, 16)
-                        .map_err(PyIOError::new_err)?,
-                );
-            }
-            Some(prev) => {
-                if prev != result_cols {
-                    return Err(PyValueError::new_err(
-                        "inconsistent results columns across chunks",
-                    ));
-                }
-            }
-        }
-        self.rows_written = self.rows_written.saturating_add(rows);
-        if let Some(ref w) = self.writer {
-            w.send(text.into_bytes()).map_err(PyIOError::new_err)?;
-        }
-        Ok(())
-    }
-
-    /// Send a raw byte block to the writer. The writer must already be initialized
-    /// (via a prior `append_text` call).
-    fn send_block(&mut self, data: Vec<u8>) -> PyResult<()> {
-        if data.is_empty() {
-            return Ok(());
-        }
-        match self.writer.as_ref() {
-            Some(w) => w.send(data).map_err(PyIOError::new_err)?,
-            None => {
-                return Err(PyRuntimeError::new_err(
-                    "send_block called before writer is initialized (call append_text first)",
-                ))
-            }
-        }
-        Ok(())
-    }
-
-    fn flush(&mut self) -> PyResult<()> {
-        self.send_pending_block()?;
-        Ok(())
-    }
-
-    fn close(&mut self) -> PyResult<()> {
-        self.send_pending_block()?;
-        if let Some(w) = self.writer.take() {
-            w.finish().map_err(PyIOError::new_err)?;
-        }
-        Ok(())
-    }
-
-    #[getter]
-    fn rows_written(&self) -> usize {
-        self.rows_written
-    }
-}
-
-impl GwasAssocTsvWriter {
-    fn send_pending_block(&mut self) -> PyResult<()> {
-        if self.text_buf.is_empty() {
-            return Ok(());
-        }
-        let writer = self
-            .writer
-            .as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("writer is closed"))?;
-        let payload =
-            std::mem::replace(&mut self.text_buf, String::with_capacity(self.buffer_bytes))
-                .into_bytes();
-        writer.send(payload).map_err(PyIOError::new_err)?;
-        Ok(())
     }
 }
 
@@ -967,6 +665,67 @@ impl SiteFilterExpr {
 #[inline]
 pub(crate) fn sample_indices_are_identity(indices: &[usize]) -> bool {
     indices.iter().enumerate().all(|(i, &idx)| idx == i)
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SampleSubsetPlan {
+    n_samples_full: usize,
+    selected: Option<Vec<usize>>,
+    excluded: Option<Vec<usize>>,
+    identity: bool,
+}
+
+impl SampleSubsetPlan {
+    pub(crate) fn from_optional_indices(
+        n_samples_full: usize,
+        sample_indices: Option<&[usize]>,
+    ) -> Self {
+        match sample_indices {
+            Some(indices)
+                if !(indices.is_empty()
+                    || (indices.len() == n_samples_full
+                        && sample_indices_are_identity(indices))) =>
+            {
+                let selected = indices.to_vec();
+                let excluded = precompute_excluded_sample_indices(n_samples_full, indices);
+                Self {
+                    n_samples_full,
+                    selected: Some(selected),
+                    excluded,
+                    identity: false,
+                }
+            }
+            _ => Self {
+                n_samples_full,
+                selected: None,
+                excluded: None,
+                identity: true,
+            },
+        }
+    }
+
+    #[inline]
+    pub(crate) fn is_identity(&self) -> bool {
+        self.identity
+    }
+
+    #[inline]
+    pub(crate) fn n_selected(&self) -> usize {
+        self.selected
+            .as_ref()
+            .map(|indices| indices.len())
+            .unwrap_or(self.n_samples_full)
+    }
+
+    #[inline]
+    pub(crate) fn selected(&self) -> Option<&[usize]> {
+        self.selected.as_deref()
+    }
+
+    #[inline]
+    pub(crate) fn excluded(&self) -> Option<&[usize]> {
+        self.excluded.as_deref()
+    }
 }
 
 #[inline]

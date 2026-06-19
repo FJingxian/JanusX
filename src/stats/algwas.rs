@@ -19,6 +19,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use crate::active_path::{
     run_active_kkt_path, validate_active_path_state, ActivePathSolveConfig, ActivePathState,
 };
+use crate::assoc2tsv::resolve_assoc_tsv_metadata;
 use crate::bedmath::{
     adaptive_grm_block_rows, decode_plink_bed_hardcall, decode_row_centered_full_lut_f64,
     decode_standardized_packed_block_rows_f32, is_identity_indices, packed_byte_lut,
@@ -31,9 +32,7 @@ use crate::farmcpu::decode_packed_rows_to_sample_major;
 use crate::he::build_row_standardization_stats;
 use crate::linalg::{chi2_stat_df1_from_sf, format_chisq_value, sanitize_assoc_pvalue};
 use crate::pcg::{pcg_solve, IdentityPreconditioner, PcgOperator};
-use crate::stats_common::{
-    get_cached_pool, parse_index_vec_i64, resolve_assoc_tsv_metadata, AsyncTsvWriter,
-};
+use crate::stats_common::{get_cached_pool, parse_index_vec_i64, AsyncTsvWriter};
 
 const DEFAULT_STANDARDIZE_EPS32: f32 = 1e-12_f32;
 const DEFAULT_STAGE1_PATH_STEPS: usize = 64;

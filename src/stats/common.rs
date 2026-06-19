@@ -11,66 +11,6 @@ use std::thread::JoinHandle;
 
 pub(crate) const INTERRUPTED_MSG: &str = "Interrupted by user (Ctrl+C).";
 
-pub(crate) type AssocTsvMetadata = (Vec<String>, Vec<i64>, Vec<String>, Vec<String>, Vec<String>);
-
-pub(crate) fn resolve_assoc_tsv_metadata(
-    bed_prefix: Option<&str>,
-    chrom: Vec<String>,
-    pos: Vec<i64>,
-    snp: Vec<String>,
-    allele0: Vec<String>,
-    allele1: Vec<String>,
-    row_indices: Option<&[usize]>,
-    expected_len: usize,
-) -> Result<AssocTsvMetadata, String> {
-    let all_empty = chrom.is_empty()
-        && pos.is_empty()
-        && snp.is_empty()
-        && allele0.is_empty()
-        && allele1.is_empty();
-    if all_empty {
-        let prefix = bed_prefix
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| "empty TSV metadata requires non-empty bed_prefix".to_string())?;
-        let (chrom2, pos2, snp2, allele02, allele12) =
-            crate::gfcore::read_bim_columns(prefix, row_indices)?;
-        if chrom2.len() != expected_len
-            || pos2.len() != expected_len
-            || snp2.len() != expected_len
-            || allele02.len() != expected_len
-            || allele12.len() != expected_len
-        {
-            return Err(format!(
-                "BIM metadata length mismatch: expected={expected_len}, chrom={}, pos={}, snp={}, allele0={}, allele1={}",
-                chrom2.len(),
-                pos2.len(),
-                snp2.len(),
-                allele02.len(),
-                allele12.len(),
-            ));
-        }
-        let pos64 = pos2.into_iter().map(|v| v as i64).collect::<Vec<i64>>();
-        return Ok((chrom2, pos64, snp2, allele02, allele12));
-    }
-    if chrom.len() != expected_len
-        || pos.len() != expected_len
-        || snp.len() != expected_len
-        || allele0.len() != expected_len
-        || allele1.len() != expected_len
-    {
-        return Err(format!(
-            "TSV metadata length mismatch: rows={expected_len}, chrom={}, pos={}, snp={}, allele0={}, allele1={}",
-            chrom.len(),
-            pos.len(),
-            snp.len(),
-            allele0.len(),
-            allele1.len()
-        ));
-    }
-    Ok((chrom, pos, snp, allele0, allele1))
-}
-
 #[inline]
 pub(crate) fn check_ctrlc() -> Result<(), String> {
     Python::attach(|py| py.check_signals()).map_err(|_| INTERRUPTED_MSG.to_string())

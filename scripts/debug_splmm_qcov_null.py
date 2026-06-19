@@ -11,7 +11,7 @@ import numpy as np
 from janusx.assoc.workflow import prepare_streaming_context
 from janusx.assoc.workflow_model_packed import (
     _ensure_splmm_sparse_grm,
-    _jxlmm_sparse_null_fit,
+    _splmm_sparse_null_fit,
 )
 from janusx.script._common.genoio import read_id_file
 from janusx.script._common.log import setup_logging
@@ -155,7 +155,7 @@ def main() -> int:
         x_cov = np.ascontiguousarray(qmatrix[keep_idx], dtype=np.float64)
         x_arg = x_cov if int(x_cov.shape[1]) > 0 else None
 
-        fit = _jxlmm_sparse_null_fit(
+        fit = _splmm_sparse_null_fit(
             jxgrm_path=str(sparse_path),
             sample_idx=sample_idx,
             y_vec=y_vec,

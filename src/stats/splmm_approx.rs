@@ -1,12 +1,25 @@
+// SparseLMM approximate scan on the residualized / GRAMMAR-gamma scale:
+// M_X = I - X(X'X)^{-1}X'
+// y_tilde = M_X y, g_tilde = M_X g
+// fit lambda from y_tilde under V_lambda = K_sparse + lambda I
+// a = V_lambda^{-1} y_tilde
+// gamma approximates E[g_tilde'V_lambda^{-1}g_tilde / (g_tilde'g_tilde)]
+// beta_hat ~= (g_tilde' a) / (gamma * g_tilde'g_tilde)
+// se(beta_hat) ~= 1 / sqrt(gamma * g_tilde'g_tilde)
+//
+// This path keeps the null fit and scan on the same residualized scale and does not
+// reuse the exact SparseLMM sigma2 chain.
+
 use crate::brent::brent_minimize_with_init;
 use crate::cholesky::{SparseJxgrmCholesky, SparseJxgrmCholeskyAnalysis};
+use crate::decode::PackedGeneticModel;
 use crate::linalg::{chi2_sf_df1, cholesky_inplace, cholesky_solve_into};
 use crate::splmm::{
     choose_rhat_rows, decode_rhat_markers_col_major, emit_progress_callback,
     emit_splmm_null_scan_core_timing, n_rhat_progress_total, scan_to_tsv_with_py_and_rhat,
     scan_with_py_and_rhat, splmm_top_level_timing_enabled, trivial_pcg_null_info,
-    trivial_pcg_rhat_info, JxlmmPreparedInput, PackedGeneticModel, SplmmScanResult,
-    SplmmScanToTsvResult,
+    trivial_pcg_rhat_info, SplmmPreparedInput, SplmmScanResult, SplmmScanToTsvResult,
+    SplmmTsvMetaInput,
 };
 use pyo3::prelude::*;
 use std::time::Instant;
@@ -526,7 +539,7 @@ pub(crate) fn build_residualized_approx_scan_null_from_lambda_and_factor(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn estimate_residualized_approx_scan_sparse(
     factor: SparseJxgrmCholesky,
-    scan_prepared: JxlmmPreparedInput,
+    scan_prepared: SplmmPreparedInput,
     x_design: Vec<f64>,
     y_vec: Vec<f64>,
     scan_sample_idx: Vec<usize>,
@@ -611,7 +624,7 @@ pub(crate) fn estimate_residualized_approx_scan_sparse(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn estimate_residualized_approx_scan_to_tsv_sparse(
     factor: SparseJxgrmCholesky,
-    scan_prepared: JxlmmPreparedInput,
+    scan_prepared: SplmmPreparedInput,
     x_design: Vec<f64>,
     y_vec: Vec<f64>,
     scan_sample_idx: Vec<usize>,
@@ -621,11 +634,7 @@ pub(crate) fn estimate_residualized_approx_scan_to_tsv_sparse(
     block_rows: usize,
     rhat_markers: usize,
     rhat_seed: u64,
-    chrom: Vec<String>,
-    pos: Vec<i64>,
-    snp: Vec<String>,
-    allele0: Vec<String>,
-    allele1: Vec<String>,
+    meta_input: SplmmTsvMetaInput,
     out_tsv: String,
     stage1_progress_callback: Option<Py<PyAny>>,
     scan_progress_callback: Option<Py<PyAny>>,
@@ -686,11 +695,7 @@ pub(crate) fn estimate_residualized_approx_scan_to_tsv_sparse(
         model.gamma(),
         threads,
         block_rows,
-        chrom.as_slice(),
-        pos.as_slice(),
-        snp.as_slice(),
-        allele0.as_slice(),
-        allele1.as_slice(),
+        meta_input,
         &out_tsv,
         scan_progress_callback.as_ref(),
         progress_every,

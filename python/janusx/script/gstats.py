@@ -650,15 +650,24 @@ def main() -> None:
     site_stats = None
     if args.freq or args.miss or args.het:
         with CliStatus("Computing genotype statistics...", enabled=True) as task:
-            maf_raw, lmiss_raw, lhet_raw, imiss_raw, ihet_raw, n_samples, n_sites = jxrs.gstats_bed_joint_stats(
-                str(bed_prefix),
-                site_maf=bool(args.freq),
-                site_miss=bool(args.miss),
-                site_het=bool(args.het),
-                individual_miss=bool(args.miss),
-                individual_het=bool(args.het),
-                threads=int(args.threads),
-            )
+            if args.freq and not args.miss and not args.het:
+                maf_raw, lmiss_raw, lhet_raw, n_samples = jxrs.gstats_bed_site_stats(
+                    str(bed_prefix),
+                    threads=int(args.threads),
+                )
+                imiss_raw = None
+                ihet_raw = None
+                n_sites = int(np.asarray(maf_raw).size)
+            else:
+                maf_raw, lmiss_raw, lhet_raw, imiss_raw, ihet_raw, n_samples, n_sites = jxrs.gstats_bed_joint_stats(
+                    str(bed_prefix),
+                    site_maf=bool(args.freq),
+                    site_miss=bool(args.miss),
+                    site_het=bool(args.het),
+                    individual_miss=bool(args.miss),
+                    individual_het=bool(args.het),
+                    threads=int(args.threads),
+                )
             task.complete("Computing genotype statistics ...Finished")
         site_stats = {
             "maf": None if maf_raw is None else np.asarray(maf_raw, dtype=np.float32).reshape(-1),

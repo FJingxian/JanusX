@@ -107,6 +107,134 @@ pub struct SiteInfo {
     pub alt_allele: String,
 }
 
+pub struct BimChunkReader {
+    path: PathBuf,
+    reader: BufReader<File>,
+    next_row: usize,
+}
+
+impl BimChunkReader {
+    pub fn open(prefix: &str) -> Result<Self, String> {
+        let path = PathBuf::from(format!("{prefix}.bim"));
+        let file = File::open(&path).map_err(|e| e.to_string())?;
+        Ok(Self {
+            path,
+            reader: BufReader::new(file),
+            next_row: 0usize,
+        })
+    }
+
+    pub fn read_range(&mut self, start: usize, end: usize) -> Result<Vec<SiteInfo>, String> {
+        if start > end {
+            return Err(format!("invalid BIM range: start {start} > end {end}"));
+        }
+        if start < self.next_row {
+            return Err(format!(
+                "BIM range must be read sequentially: requested start {start} < current {}",
+                self.next_row
+            ));
+        }
+        if start == end {
+            return Ok(Vec::new());
+        }
+
+        while self.next_row < start {
+            self.read_next_site()?.ok_or_else(|| {
+                format!(
+                    "BIM ended early: needed row {start} but only saw {} rows from {}",
+                    self.next_row,
+                    self.path.display()
+                )
+            })?;
+        }
+
+        let mut sites = Vec::with_capacity(end - start);
+        while self.next_row < end {
+            let site = self.read_next_site()?.ok_or_else(|| {
+                format!(
+                    "BIM ended early: needed row {end} but only saw {} rows from {}",
+                    self.next_row,
+                    self.path.display()
+                )
+            })?;
+            sites.push(site);
+        }
+        Ok(sites)
+    }
+
+    pub fn read_selected_rows(&mut self, row_indices: &[usize]) -> Result<Vec<SiteInfo>, String> {
+        if row_indices.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut sites = Vec::with_capacity(row_indices.len());
+        let mut prev = None::<usize>;
+        for &target in row_indices {
+            if let Some(prev_idx) = prev {
+                if target < prev_idx {
+                    return Err(format!(
+                        "BIM selected rows must be nondecreasing: requested {target} after {prev_idx}"
+                    ));
+                }
+            }
+            if target < self.next_row {
+                return Err(format!(
+                    "BIM selected rows must be read sequentially: requested row {target} < current {}",
+                    self.next_row
+                ));
+            }
+            while self.next_row < target {
+                self.read_next_site()?.ok_or_else(|| {
+                    format!(
+                        "BIM ended early: needed row {target} but only saw {} rows from {}",
+                        self.next_row,
+                        self.path.display()
+                    )
+                })?;
+            }
+            let site = self.read_next_site()?.ok_or_else(|| {
+                format!(
+                    "BIM ended early: needed row {target} but only saw {} rows from {}",
+                    self.next_row,
+                    self.path.display()
+                )
+            })?;
+            sites.push(site);
+            prev = Some(target);
+        }
+        Ok(sites)
+    }
+
+    pub fn ensure_exhausted(&mut self, expected_rows: usize) -> Result<(), String> {
+        let mut line = String::new();
+        let bytes = self
+            .reader
+            .read_line(&mut line)
+            .map_err(|e| format!("{}:{}: {}", self.path.display(), self.next_row + 1, e))?;
+        if bytes == 0 {
+            return Ok(());
+        }
+        Err(format!(
+            "BIM site count exceeds BED SNP count: expected {expected_rows}, saw extra row {} in {}",
+            self.next_row + 1,
+            self.path.display()
+        ))
+    }
+
+    fn read_next_site(&mut self) -> Result<Option<SiteInfo>, String> {
+        let mut line = String::new();
+        let bytes = self
+            .reader
+            .read_line(&mut line)
+            .map_err(|e| format!("{}:{}: {}", self.path.display(), self.next_row + 1, e))?;
+        if bytes == 0 {
+            return Ok(None);
+        }
+        let row_idx = self.next_row;
+        self.next_row = self.next_row.saturating_add(1);
+        parse_bim_line(&self.path, row_idx + 1, line.trim_end()).map(Some)
+    }
+}
+
 // ---------------------------
 // PLINK helpers
 // ---------------------------
@@ -1215,29 +1343,64 @@ fn read_bim_file(path: &Path) -> Result<Vec<SiteInfo>, String> {
     let mut sites = Vec::new();
     for (line_no, line) in reader.lines().enumerate() {
         let l = line.map_err(|e| format!("{}:{}: {}", path.display(), line_no + 1, e))?;
-        let cols: Vec<&str> = l.split_whitespace().collect();
-        if cols.len() < 6 {
-            return Err(format!(
-                "Malformed BIM line at {}:{}: {l}",
-                path.display(),
-                line_no + 1
-            ));
-        }
-        let chrom = cols[0].to_string();
-        let pos: i32 = cols[3].parse().unwrap_or(0);
-        let snp = cols[1].to_string();
-        let a1 = cols[4].to_string();
-        let a2 = cols[5].to_string();
-
-        sites.push(SiteInfo {
-            chrom,
-            pos,
-            snp,
-            ref_allele: a1,
-            alt_allele: a2,
-        });
+        sites.push(parse_bim_line(path, line_no + 1, &l)?);
     }
     Ok(sites)
+}
+
+#[inline]
+fn parse_bim_line(path: &Path, line_no: usize, line: &str) -> Result<SiteInfo, String> {
+    let mut cols = line.split_whitespace();
+    let chrom_tok = cols.next().ok_or_else(|| {
+        format!(
+            "Malformed BIM line at {}:{}: {line}",
+            path.display(),
+            line_no
+        )
+    })?;
+    let snp_tok = cols.next().ok_or_else(|| {
+        format!(
+            "Malformed BIM line at {}:{}: {line}",
+            path.display(),
+            line_no
+        )
+    })?;
+    let _cm_tok = cols.next().ok_or_else(|| {
+        format!(
+            "Malformed BIM line at {}:{}: {line}",
+            path.display(),
+            line_no
+        )
+    })?;
+    let pos_tok = cols.next().ok_or_else(|| {
+        format!(
+            "Malformed BIM line at {}:{}: {line}",
+            path.display(),
+            line_no
+        )
+    })?;
+    let a1_tok = cols.next().ok_or_else(|| {
+        format!(
+            "Malformed BIM line at {}:{}: {line}",
+            path.display(),
+            line_no
+        )
+    })?;
+    let a2_tok = cols.next().ok_or_else(|| {
+        format!(
+            "Malformed BIM line at {}:{}: {line}",
+            path.display(),
+            line_no
+        )
+    })?;
+
+    Ok(SiteInfo {
+        chrom: chrom_tok.to_string(),
+        pos: pos_tok.parse::<i32>().unwrap_or(0),
+        snp: snp_tok.to_string(),
+        ref_allele: a1_tok.to_string(),
+        alt_allele: a2_tok.to_string(),
+    })
 }
 
 fn read_bim_columns_file(
@@ -1294,56 +1457,12 @@ fn read_bim_columns_file(
                 continue;
             }
         }
-
-        let mut cols = l.split_whitespace();
-        let chrom_tok = cols.next().ok_or_else(|| {
-            format!(
-                "Malformed BIM line at {}:{}: {l}",
-                path.display(),
-                line_no + 1
-            )
-        })?;
-        let snp_tok = cols.next().ok_or_else(|| {
-            format!(
-                "Malformed BIM line at {}:{}: {l}",
-                path.display(),
-                line_no + 1
-            )
-        })?;
-        let _cm_tok = cols.next().ok_or_else(|| {
-            format!(
-                "Malformed BIM line at {}:{}: {l}",
-                path.display(),
-                line_no + 1
-            )
-        })?;
-        let pos_tok = cols.next().ok_or_else(|| {
-            format!(
-                "Malformed BIM line at {}:{}: {l}",
-                path.display(),
-                line_no + 1
-            )
-        })?;
-        let a1_tok = cols.next().ok_or_else(|| {
-            format!(
-                "Malformed BIM line at {}:{}: {l}",
-                path.display(),
-                line_no + 1
-            )
-        })?;
-        let a2_tok = cols.next().ok_or_else(|| {
-            format!(
-                "Malformed BIM line at {}:{}: {l}",
-                path.display(),
-                line_no + 1
-            )
-        })?;
-
-        chrom.push(chrom_tok.to_string());
-        pos.push(pos_tok.parse::<i32>().unwrap_or(0));
-        snp.push(snp_tok.to_string());
-        allele0.push(a1_tok.to_string());
-        allele1.push(a2_tok.to_string());
+        let site = parse_bim_line(path, line_no + 1, &l)?;
+        chrom.push(site.chrom);
+        pos.push(site.pos);
+        snp.push(site.snp);
+        allele0.push(site.ref_allele);
+        allele1.push(site.alt_allele);
         if select.is_some() {
             want_ptr += 1;
         }

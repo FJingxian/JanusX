@@ -191,7 +191,7 @@ def compute_jx_rhat(
     rhat_markers: int,
     rhat_seed: int,
 ) -> dict[str, float]:
-    meta = w._jxlmm_bed_logic_meta_selected(
+    meta = w._splmm_bed_logic_meta_selected(
         str(bfile),
         sample_indices=sample_idx,
         maf_threshold=float(maf),
@@ -293,7 +293,7 @@ def main() -> int:
             geno=float(cfg["geno"]),
         )
 
-        null_fit = w._jxlmm_sparse_null_fit(
+        null_fit = w._splmm_sparse_null_fit(
             jxgrm_path=str(cfg["jx_spgrm"]),
             sample_idx=sample_idx,
             y_vec=y_vec,

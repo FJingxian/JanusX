@@ -1033,6 +1033,35 @@ def _prepare_txtlike_input_for_cache(kind: str, prefix: str, src_path: Union[str
     return staged
 
 
+def _read_plink_fam_sample_ids(prefix: str) -> list[str]:
+    fam_path = f"{prefix}.fam"
+    sample_ids: list[str] = []
+    with open(fam_path, "r", encoding="utf-8", errors="replace") as handle:
+        for line_no, line in enumerate(handle, start=1):
+            row = line.strip()
+            if not row:
+                continue
+            cols = row.split()
+            if len(cols) < 2:
+                raise ValueError(f"Malformed FAM line at {fam_path}:{line_no}: {row}")
+            sample_ids.append(cols[1])
+    if not sample_ids:
+        raise ValueError(f"FAM contains zero samples: {fam_path}")
+    return sample_ids
+
+
+def _count_plink_bim_rows(prefix: str) -> int:
+    bim_path = f"{prefix}.bim"
+    n_snps = 0
+    with open(bim_path, "r", encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            if line.strip():
+                n_snps += 1
+    if n_snps <= 0:
+        raise ValueError(f"BIM contains zero variants: {bim_path}")
+    return n_snps
+
+
 def calc_decode_block_rows_from_memory_mb(
     n_samples: int,
     memory_mb: Union[int, float],
@@ -1901,8 +1930,7 @@ def inspect_genotype_file(
         return reader.sample_ids, reader.n_snps
 
     if kind == "plink":
-        reader = BedChunkReader(prefix, 0.0, 1.0)
-        return reader.sample_ids, reader.n_snps
+        return _read_plink_fam_sample_ids(prefix), _count_plink_bim_rows(prefix)
 
     raise ValueError(
         "Unable to infer genotype input type. Provide a VCF path, "

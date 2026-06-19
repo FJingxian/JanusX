@@ -1,16 +1,15 @@
-use numpy::{PyReadonlyArray1, PyReadonlyArray2};
+use numpy::{PyArray2, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
 use crate::algwas::algwas_packed_to_tsv;
 use crate::farmcpu::farmcpu_packed_to_tsv;
-use crate::glm::glmf32_packed_assoc_to_tsv;
+use crate::fvlmm::{fastlmm_assoc_packed_f32_to_tsv, fvlmm_assoc_packed_f32_to_tsv};
+use crate::glm::ixx_from_x_qr;
+use crate::glm::lm_block_assoc_packed_to_tsv;
 use crate::linalg::{chi2_sf_df1, cholesky_inplace, cholesky_solve_into};
-use crate::lmm_scan::{
-    fastlmm_assoc_packed_f32_to_tsv, fvlmm_assoc_packed_f32_to_tsv,
-    lmm_reml_assoc_packed_f32_to_tsv,
-};
+use crate::lmm::lmm_reml_assoc_packed_f32_to_tsv;
 
 fn req_item<'py>(d: &Bound<'py, PyDict>, key: &str) -> PyResult<Bound<'py, PyAny>> {
     d.get_item(key)?.ok_or_else(|| {
@@ -231,6 +230,7 @@ pub fn gwas_trait_model_dispatch_v2<'py>(
     include_farmcpu: bool,
     use_packed_fastlmm: bool,
 ) -> PyResult<Bound<'py, PyList>> {
+    let _ = use_packed_fastlmm;
     let out = PyList::empty(py);
     if traits.is_empty() {
         return Ok(out);
@@ -266,23 +266,11 @@ pub fn gwas_trait_model_dispatch_v2<'py>(
         let trait_name = trait_name_raw.trim().to_string();
         for (model_idx, model_name) in model_list.iter().enumerate() {
             let route = match model_name.as_str() {
-                "lm" => "lm_packed",
-                "lmm" => "lmm_packed",
+                "lm" => "lm_stream",
+                "lmm" => "lmm_stream",
                 "lmm2" => "lmm2_stream",
-                "fastlmm" => {
-                    if use_packed_fastlmm {
-                        "fastlmm_packed"
-                    } else {
-                        "fastlmm_stream"
-                    }
-                }
-                "fvlmm" => {
-                    if use_packed_fastlmm {
-                        "fvlmm_packed"
-                    } else {
-                        "fvlmm_stream"
-                    }
-                }
+                "fastlmm" => "fastlmm_stream",
+                "fvlmm" => "fvlmm_stream",
                 "farmcpu" => "farmcpu",
                 "algwas" => "algwas",
                 "splmm" => "splmm",
@@ -394,6 +382,14 @@ pub fn gwas_packed_unified_to_tsv<'py>(
             "lm" => {
                 let y: PyReadonlyArray1<'py, f64> = req_item(&job, "y")?.extract()?;
                 let x: PyReadonlyArray2<'py, f64> = req_item(&job, "x")?.extract()?;
+                let y_slice = y.as_slice()?;
+                let x_arr = x.as_array();
+                let q0 = x_arr.shape()[1];
+                if q0 == 0 {
+                    return Err(PyRuntimeError::new_err(
+                        "x must contain at least one column",
+                    ));
+                }
                 let ixx: Option<PyReadonlyArray2<'py, f64>> = match opt_item(&job, "ixx")? {
                     Some(v) if !v.is_none() => Some(v.extract()?),
                     _ => None,
@@ -408,11 +404,32 @@ pub fn gwas_packed_unified_to_tsv<'py>(
                         Some(v) if !v.is_none() => Some(v.extract()?),
                         _ => None,
                     };
-                let n_written = glmf32_packed_assoc_to_tsv(
+                let ixx_owned = if let Some(ixx_in) = ixx {
+                    let ixx_arr = ixx_in.as_array();
+                    if ixx_arr.shape()[0] != q0 || ixx_arr.shape()[1] != q0 {
+                        return Err(PyRuntimeError::new_err("ixx must be (q0,q0)"));
+                    }
+                    match ixx_in.as_slice() {
+                        Ok(s) => s.to_vec(),
+                        Err(_) => ixx_arr.iter().copied().collect(),
+                    }
+                } else {
+                    let x_flat: Vec<f64> = match x.as_slice() {
+                        Ok(s) => s.to_vec(),
+                        Err(_) => x_arr.iter().copied().collect(),
+                    };
+                    ixx_from_x_qr(x_flat.as_slice(), y_slice.len(), q0)
+                        .map_err(PyRuntimeError::new_err)?
+                };
+                let ixx_rows: Vec<Vec<f64>> =
+                    ixx_owned.chunks(q0).map(|row| row.to_vec()).collect();
+                let ixx_bound = PyArray2::from_vec2(py, &ixx_rows)
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                let (n_written, _scanned_rows) = lm_block_assoc_packed_to_tsv(
                     py,
                     y,
                     x,
-                    ixx,
+                    ixx_bound.readonly(),
                     packed.clone(),
                     n_samples,
                     row_flip.clone(),
@@ -424,6 +441,9 @@ pub fn gwas_packed_unified_to_tsv<'py>(
                     allele0.clone(),
                     allele1.clone(),
                     out_tsv.as_str(),
+                    0.0,
+                    1.0,
+                    0.0,
                     sample_indices,
                     row_indices.clone(),
                     step_use,

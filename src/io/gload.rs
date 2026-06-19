@@ -16,13 +16,9 @@ use std::sync::Arc;
 use memmap2::{Mmap, MmapOptions};
 
 use crate::bedmath::{decode_mean_imputed_additive_packed_block_rows_f32, packed_byte_lut};
+use crate::decode::{decode_centered_block_packed_model_f32, PackedGeneticModel};
 use crate::gfcore;
-use crate::gfreader::{
-    count_packed_row_counts, count_packed_row_counts_selected_with_excluded,
-    evaluate_packed_row_keep_and_flip, packed_row_stats_from_counts,
-    precompute_excluded_sample_indices,
-};
-use crate::stats_common::get_cached_pool;
+use crate::gstats::{compute_bed_filter_meta, BedFilterMetaMode};
 
 const BED_HEADER_LEN: usize = 3;
 
@@ -821,133 +817,25 @@ pub fn compute_global_stats_mmap(
     sample_indices: Option<&[usize]>,
     threads: usize,
 ) -> Result<GlobalStats, String> {
-    let bed_prefix = normalize_plink_prefix(prefix);
-    let n_samples_full = gfcore::read_fam(&bed_prefix)
-        .map_err(|e| e.to_string())?
-        .len();
-    let bytes_per_snp = n_samples_full.div_ceil(4);
-
-    let bed_path = format!("{bed_prefix}.bed");
-    let bed_file = File::open(&bed_path).map_err(|e| format!("open {bed_path}: {e}"))?;
-    let mmap = unsafe { Mmap::map(&bed_file) }.map_err(|e| format!("mmap {bed_path}: {e}"))?;
-    if mmap.len() < 3 || mmap[0] != 0x6C || mmap[1] != 0x1B || mmap[2] != 0x01 {
-        return Err("invalid or non-SNP-major BED".to_string());
-    }
-    let packed_full = &mmap[3..];
-    let n_markers_total = packed_full.len() / bytes_per_snp;
-    if n_markers_total == 0 {
-        return Err("BED contains no SNPs".to_string());
-    }
-
-    let sites_all = if snps_only {
-        Some(gfcore::read_bim(&bed_prefix).map_err(|e| e.to_string())?)
-    } else {
-        None
-    };
-
-    let stats_identity = sample_indices
-        .map(|s| {
-            s.is_empty()
-                || (s.len() == n_samples_full && s.iter().enumerate().all(|(i, &sid)| sid == i))
-        })
-        .unwrap_or(true);
-    let stats_n = if stats_identity {
-        n_samples_full
-    } else {
-        sample_indices.unwrap().len()
-    };
-    let stats_excluded_sample_indices = if stats_identity {
-        None
-    } else {
-        precompute_excluded_sample_indices(n_samples_full, sample_indices.unwrap())
-    };
-    let apply_het = het_threshold > 0.0;
-    let pool = get_cached_pool(threads).map_err(|e| e.to_string())?;
-
-    let keep_flip_stats: Vec<(bool, bool, f32, f32)> = {
-        let si_ref = sample_indices;
-        let run = || -> Vec<(bool, bool, f32, f32)> {
-            use rayon::prelude::*;
-            packed_full
-                .par_chunks(bytes_per_snp)
-                .enumerate()
-                .map(|(i, row)| {
-                    let (missing, het, hom_alt) = if stats_identity {
-                        count_packed_row_counts(row, n_samples_full)
-                    } else {
-                        count_packed_row_counts_selected_with_excluded(
-                            row,
-                            n_samples_full,
-                            si_ref.unwrap(),
-                            stats_excluded_sample_indices.as_deref(),
-                        )
-                    };
-                    let non_missing = stats_n.saturating_sub(missing);
-                    let alt_sum = het.saturating_add(hom_alt.saturating_mul(2));
-                    let het_count = if apply_het { het } else { 0 };
-                    let (miss, maf, _std) =
-                        packed_row_stats_from_counts(stats_n, non_missing, alt_sum);
-                    let (pass_num, flip) = evaluate_packed_row_keep_and_flip(
-                        stats_n,
-                        non_missing,
-                        alt_sum,
-                        het_count,
-                        maf_threshold,
-                        max_missing_rate,
-                        apply_het,
-                        het_threshold,
-                    );
-                    let pass_snp = if let Some(ref sites) = sites_all {
-                        is_simple_snp_allele(&sites[i].ref_allele)
-                            && is_simple_snp_allele(&sites[i].alt_allele)
-                    } else {
-                        true
-                    };
-                    (
-                        pass_num && pass_snp,
-                        (pass_num && pass_snp) && flip,
-                        miss,
-                        maf,
-                    )
-                })
-                .collect()
-        };
-        if let Some(ref tp) = pool {
-            tp.install(run)
-        } else {
-            run()
-        }
-    };
-
-    let site_keep: Vec<bool> = keep_flip_stats.iter().map(|(k, _, _, _)| *k).collect();
-    let kept_n = site_keep.iter().filter(|&&x| x).count();
-    if kept_n == 0 {
-        return Err("No SNPs left after filtering".to_string());
-    }
-
-    let mut maf_keep = Vec::with_capacity(kept_n);
-    let mut miss_keep = Vec::with_capacity(kept_n);
-    let mut row_flip_keep = Vec::with_capacity(kept_n);
-    let mut row_source_indices = Vec::with_capacity(kept_n);
-    for i in 0..n_markers_total {
-        if site_keep[i] {
-            let (_, flip, miss, maf) = keep_flip_stats[i];
-            maf_keep.push(maf);
-            miss_keep.push(miss);
-            row_flip_keep.push(flip);
-            row_source_indices.push(i);
-        }
-    }
-
+    let meta = compute_bed_filter_meta(
+        prefix,
+        maf_threshold,
+        max_missing_rate,
+        het_threshold,
+        snps_only,
+        sample_indices,
+        BedFilterMetaMode::FullDecodeMeta,
+        threads,
+    )?;
     Ok(GlobalStats {
-        maf: maf_keep,
-        miss: miss_keep,
-        row_flip: row_flip_keep,
-        row_source_indices,
-        site_keep,
-        n_samples_full,
-        n_markers_total,
-        bytes_per_snp,
+        maf: meta.maf,
+        miss: meta.miss,
+        row_flip: meta.row_flip,
+        row_source_indices: meta.row_source_indices,
+        site_keep: meta.site_keep,
+        n_samples_full: meta.n_samples_full,
+        n_markers_total: meta.n_markers_total,
+        bytes_per_snp: meta.bytes_per_snp,
     })
 }
 
@@ -989,31 +877,12 @@ fn normalize_plink_prefix(prefix: &str) -> String {
     out
 }
 
-#[inline]
-#[allow(dead_code)]
-fn is_simple_snp_allele(allele: &str) -> bool {
-    matches!(allele, "A" | "C" | "G" | "T" | "a" | "c" | "g" | "t")
-}
-
-// ---------------------------------------------------------------------------
-// PackedGeneticModel — shared model enum for centered decode
-// ---------------------------------------------------------------------------
-
-#[derive(Clone, Copy)]
-#[allow(dead_code)]
-pub enum PackedGeneticModel {
-    Add,
-    Dom,
-    Rec,
-    Het,
-}
-
 // ---------------------------------------------------------------------------
 // Centered decode (zero-mean, used by LMM / FastLMM / FvLMM)
 // ---------------------------------------------------------------------------
 
 /// Centered block decode for any GenotypeMatrix backend.
-/// Uses `crate::lmm_scan::decode_centered_block_packed_f32` internally.
+/// Uses the shared `crate::decode` packed centered-decode path internally.
 #[allow(dead_code)]
 pub fn decode_centered_block_unified<G: GenotypeMatrix>(
     matrix: &G,
@@ -1024,7 +893,6 @@ pub fn decode_centered_block_unified<G: GenotypeMatrix>(
     sample_idx: &[usize],
     sample_identity: bool,
 ) -> Result<(), String> {
-    use crate::lmm_scan::PackedGeneticModel as LmmModel;
     let n = if sample_identity {
         stats.n_samples_full
     } else {
@@ -1034,13 +902,7 @@ pub fn decode_centered_block_unified<G: GenotypeMatrix>(
     if rows_here == 0 {
         return Ok(());
     }
-    let gm_lmm = match gm {
-        PackedGeneticModel::Add => LmmModel::Add,
-        PackedGeneticModel::Dom => LmmModel::Dom,
-        PackedGeneticModel::Rec => LmmModel::Rec,
-        PackedGeneticModel::Het => LmmModel::Het,
-    };
-    crate::lmm_scan::decode_centered_block_packed_f32(
+    decode_centered_block_packed_model_f32(
         matrix.packed_flat(),
         stats.bytes_per_snp,
         stats.row_flip_slice(row_start, rows_here),
@@ -1049,7 +911,7 @@ pub fn decode_centered_block_unified<G: GenotypeMatrix>(
         row_start,
         rows_here,
         n,
-        gm_lmm,
+        gm,
         sample_identity,
         None,
         None,

@@ -128,7 +128,7 @@ def main() -> int:
         Path(cfg["extract"]),
     )
 
-    null_fit = w._jxlmm_sparse_null_fit(
+    null_fit = w._splmm_sparse_null_fit(
         jxgrm_path=str(cfg["jx_spgrm"]),
         sample_idx=sample_idx,
         y_vec=y_vec,
@@ -138,7 +138,7 @@ def main() -> int:
     sigma_g2 = float(null_fit["sigma_g2"])
     sigma_e2 = float(null_fit["sigma_e2"])
 
-    meta = w._jxlmm_bed_logic_meta_selected(
+    meta = w._splmm_bed_logic_meta_selected(
         str(cfg["bfile"]),
         sample_indices=sample_idx,
         maf_threshold=float(cfg["maf"]),
@@ -163,7 +163,7 @@ def main() -> int:
     )
     packed = np.ascontiguousarray(np.asarray(packed_raw, dtype=np.uint8))
 
-    k_dense = w._jxlmm_load_sparse_grm_subset_dense(str(cfg["jx_spgrm"]), sample_idx)
+    k_dense = w._splmm_load_sparse_grm_subset_dense(str(cfg["jx_spgrm"]), sample_idx)
     n = int(sample_idx.shape[0])
     x = np.ones((n, 1), dtype=np.float64)
     v = sigma_g2 * k_dense + sigma_e2 * np.eye(n, dtype=np.float64)

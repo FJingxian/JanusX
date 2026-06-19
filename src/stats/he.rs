@@ -10,8 +10,8 @@ use crate::bedmath::{
     decode_standardized_packed_block_rows_f32, is_identity_indices, packed_byte_lut,
 };
 use crate::blas::{
-    cblas_sgemm_dispatch, rust_sgemm_prefers_rayon_rowmajor_f32_kernel, CblasInt,
-    OpenBlasThreadGuard, CBLAS_NO_TRANS, CBLAS_ROW_MAJOR, CBLAS_TRANS,
+    cblas_sgemm_dispatch, CblasInt, OpenBlasThreadGuard, CBLAS_NO_TRANS, CBLAS_ROW_MAJOR,
+    CBLAS_TRANS,
 };
 use crate::linalg::{cholesky_inplace, cholesky_solve_into};
 use crate::packed::bed_packed_row_flip_mask;
@@ -349,12 +349,10 @@ fn prefer_parallel_small_rhs(
     if tp.current_num_threads() <= 1 {
         return false;
     }
-    n_rhs <= 64
-        && rows.saturating_mul(cols).saturating_mul(n_rhs) >= 1_048_576
-        && rust_sgemm_prefers_rayon_rowmajor_f32_kernel()
+    let work = rows.saturating_mul(cols).saturating_mul(n_rhs);
+    n_rhs <= 64 && work >= 262_144
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 #[inline(always)]
 fn accum_scaled_rhs_f32(out_row: &mut [f32], rhs_row: &[f32], a: f32) {
     debug_assert_eq!(out_row.len(), rhs_row.len());
@@ -735,6 +733,52 @@ fn splitmix64(mut x: u64) -> u64 {
 }
 
 #[inline]
+pub(crate) fn row_major_block_mul_mat_f32_small_rhs(
+    block: &[f32],
+    rows: usize,
+    cols: usize,
+    rhs: &[f32], // row-major (cols, n_rhs)
+    n_rhs: usize,
+    out: &mut [f32], // row-major (rows, n_rhs)
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) {
+    debug_assert_eq!(block.len(), rows.saturating_mul(cols));
+    debug_assert_eq!(rhs.len(), cols.saturating_mul(n_rhs));
+    debug_assert_eq!(out.len(), rows.saturating_mul(n_rhs));
+    if n_rhs == 0 {
+        return;
+    }
+    let row_block = SMALL_RHS_PAR_ROW_BLOCK.max(1);
+    let mut run = || {
+        out.par_chunks_mut(n_rhs * row_block)
+            .enumerate()
+            .for_each(|(chunk_id, out_chunk)| {
+                out_chunk.fill(0.0_f32);
+                let row_start = chunk_id * row_block;
+                let rows_here = out_chunk.len() / n_rhs;
+                for local_r in 0..rows_here {
+                    let r = row_start + local_r;
+                    let out_row = &mut out_chunk[local_r * n_rhs..(local_r + 1) * n_rhs];
+                    let row = &block[r * cols..(r + 1) * cols];
+                    for c in 0..cols {
+                        let a = row[c];
+                        if a == 0.0_f32 {
+                            continue;
+                        }
+                        let rhs_row = &rhs[c * n_rhs..(c + 1) * n_rhs];
+                        accum_scaled_rhs_f32(out_row, rhs_row, a);
+                    }
+                }
+            });
+    };
+    if let Some(tp) = pool {
+        tp.install(run);
+    } else {
+        run();
+    }
+}
+
+#[inline]
 pub(crate) fn row_major_block_mul_mat_f32(
     block: &[f32],
     rows: usize,
@@ -751,78 +795,8 @@ pub(crate) fn row_major_block_mul_mat_f32(
         return;
     }
     if prefer_parallel_small_rhs(rows, cols, n_rhs, pool) {
-        #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
-        {
-            let row_block = SMALL_RHS_PAR_ROW_BLOCK.max(1);
-            let mut run = || {
-                out.par_chunks_mut(n_rhs * row_block).enumerate().for_each(
-                    |(chunk_id, out_chunk)| {
-                        let row_start = chunk_id * row_block;
-                        let rows_here = out_chunk.len() / n_rhs;
-                        if rows_here == 0 {
-                            return;
-                        }
-                        unsafe {
-                            cblas_sgemm_dispatch(
-                                CBLAS_ROW_MAJOR,
-                                CBLAS_NO_TRANS,
-                                CBLAS_NO_TRANS,
-                                rows_here as CblasInt,
-                                n_rhs as CblasInt,
-                                cols as CblasInt,
-                                1.0,
-                                block.as_ptr().add(row_start * cols),
-                                cols as CblasInt,
-                                rhs.as_ptr(),
-                                n_rhs as CblasInt,
-                                0.0,
-                                out_chunk.as_mut_ptr(),
-                                n_rhs as CblasInt,
-                            );
-                        }
-                    },
-                );
-            };
-            if let Some(tp) = pool {
-                tp.install(run);
-            } else {
-                run();
-            }
-            return;
-        }
-
-        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-        {
-            let row_block = SMALL_RHS_PAR_ROW_BLOCK.max(1);
-            let mut run = || {
-                out.par_chunks_mut(n_rhs * row_block).enumerate().for_each(
-                    |(chunk_id, out_chunk)| {
-                        out_chunk.fill(0.0_f32);
-                        let row_start = chunk_id * row_block;
-                        let rows_here = out_chunk.len() / n_rhs;
-                        for local_r in 0..rows_here {
-                            let r = row_start + local_r;
-                            let out_row = &mut out_chunk[local_r * n_rhs..(local_r + 1) * n_rhs];
-                            let row = &block[r * cols..(r + 1) * cols];
-                            for c in 0..cols {
-                                let a = row[c];
-                                if a == 0.0_f32 {
-                                    continue;
-                                }
-                                let rhs_row = &rhs[c * n_rhs..(c + 1) * n_rhs];
-                                accum_scaled_rhs_f32(out_row, rhs_row, a);
-                            }
-                        }
-                    },
-                );
-            };
-            if let Some(tp) = pool {
-                tp.install(run);
-            } else {
-                run();
-            }
-            return;
-        }
+        row_major_block_mul_mat_f32_small_rhs(block, rows, cols, rhs, n_rhs, out, pool);
+        return;
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]

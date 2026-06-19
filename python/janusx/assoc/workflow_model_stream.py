@@ -1,5 +1,8 @@
 # -*- coding: utf-8 -*-
-"""Streaming GWAS model runners (extracted from workflow.py)."""
+"""Windowed BED/memmap GWAS model runners.
+
+Packed single-entry GWAS routes are no longer maintained here for LM/LMM/LMM2/FvLMM.
+"""
 
 from __future__ import annotations
 
@@ -53,9 +56,7 @@ from .workflow import (
     format_elapsed,
     jxrs,
     rich_progress_available,
-    run_lm_packed_fullrank,
     run_lm_stream_bed_single_entry,
-    run_lmm_packed_fullrank,
     should_animate_status,
 )
 
@@ -276,7 +277,7 @@ def run_chunked_gwas_lmm_lm(
     force_model: bool = False,
 ) -> None:
     """
-    Run LMM/FastLMM/LM GWAS using a streaming pipeline.
+    Run LM/LMM/LMM2/FastLMM/FvLMM GWAS through the maintained windowed BED path.
 
     Important: This function assumes pheno/ids/grm/q/cov have already been prepared
     once (no repeated "Loading phenotype" / "Loading GRM/Q" logs).
@@ -308,6 +309,7 @@ def run_chunked_gwas_lmm_lm(
             logging.INFO,
             f"{base_model_label} route: using prepared streaming GRM + trait slicing (packed GRM rebuild disabled).",
         )
+    _ = bool(prefer_packed_fullrust)
     if model_key == "lm":
         can_single_entry = (
             _as_plink_prefix(genofile) is not None
@@ -347,116 +349,16 @@ def run_chunked_gwas_lmm_lm(
                 mmap_limit=bool(mmap_limit),
             )
             return
-        packed_fullrust_enabled = bool(prefer_packed_fullrust)
-        can_packed = _as_plink_prefix(genofile) is not None
-        has_symbols = hasattr(jxrs, "glmf32_packed_assoc_to_tsv")
-        is_add = str(genetic_model).lower() == "add"
-        if can_packed and has_symbols and is_add:
-            if not packed_fullrust_enabled:
-                _log_file_only(
-                    logger,
-                    logging.INFO,
-                    "LM route: using streaming orchestrator (packed route disabled).",
-                )
-            else:
-                _log_file_only(
-                    logger,
-                    logging.INFO,
-                    "LM route: using full-rust packed pipeline (single-entry scan).",
-                )
-                run_lm_packed_fullrank(
-                    genofile=genofile,
-                    pheno=pheno,
-                    ids=ids,
-                    outprefix=outprefix,
-                    maf_threshold=maf_threshold,
-                    max_missing_rate=max_missing_rate,
-                    genetic_model=genetic_model,
-                    het_threshold=het_threshold,
-                    chunk_size=chunk_size,
-                    qmatrix=qmatrix,
-                    cov_all=cov_all,
-                    plot=plot,
-                    threads=threads,
-                    logger=logger,
-                    use_spinner=use_spinner,
-                    snps_only=bool(snps_only),
-                    eff_snp_by_trait=eff_snp_by_trait,
-                    summary_rows=summary_rows,
-                    saved_paths=saved_paths,
-                    trait_names=trait_names,
-                    emit_trait_header=emit_trait_header,
-                )
-                return
-        reasons: list[str] = []
-        if not packed_fullrust_enabled:
-            reasons.append("packed route disabled")
-        if not can_packed:
-            reasons.append("input is not PLINK BED prefix")
-        if not has_symbols:
-            reasons.append("required rust symbols unavailable")
-        if not is_add:
-            reasons.append("non-additive model is not yet supported by LM full-rust route")
         _log_file_only(
             logger,
             logging.INFO,
-            "LM route: using streaming orchestrator "
-            f"({'; '.join(reasons) if len(reasons) > 0 else 'unknown reason'}).",
+            "LM route: using streaming orchestrator (windowed BED path only).",
         )
     if model_key == "lmm":
-        packed_fullrust_enabled = bool(prefer_packed_fullrust)
-        can_packed = _as_plink_prefix(genofile) is not None
-        has_symbols = hasattr(jxrs, "lmm_reml_assoc_packed_f32")
-        has_grm = grm is not None
-        is_add = str(genetic_model).lower() == "add"
-        if packed_fullrust_enabled and can_packed and has_symbols and has_grm and is_add:
-            _log_file_only(
-                logger,
-                logging.INFO,
-                "LMM route: using full-rust packed pipeline (EVD+single-entry scan).",
-            )
-            run_lmm_packed_fullrank(
-                genofile=genofile,
-                pheno=pheno,
-                ids=ids,
-                grm=grm,
-                outprefix=outprefix,
-                maf_threshold=maf_threshold,
-                max_missing_rate=max_missing_rate,
-                genetic_model=genetic_model,
-                het_threshold=het_threshold,
-                chunk_size=chunk_size,
-                qmatrix=qmatrix,
-                cov_all=cov_all,
-                plot=plot,
-                threads=threads,
-                logger=logger,
-                use_spinner=use_spinner,
-                snps_only=bool(snps_only),
-                eff_snp_by_trait=eff_snp_by_trait,
-                summary_rows=summary_rows,
-                saved_paths=saved_paths,
-                trait_names=trait_names,
-                emit_trait_header=emit_trait_header,
-                force_model=bool(force_model),
-            )
-            return
-        reasons: list[str] = []
-        if not packed_fullrust_enabled:
-            reasons.append("packed route disabled")
-        if not can_packed:
-            reasons.append("input is not PLINK BED prefix")
-        if not has_symbols:
-            reasons.append("required rust symbols unavailable")
-        if not has_grm:
-            reasons.append("GRM is unavailable")
-        if not is_add:
-            reasons.append("non-additive model is not yet supported by LMM full-rust route")
         _log_file_only(
             logger,
             logging.INFO,
-            "LMM route: using streaming orchestrator "
-            f"({'; '.join(reasons) if len(reasons) > 0 else 'unknown reason'}).",
+            "LMM route: using streaming orchestrator (windowed BED path only).",
         )
 
     def _apply_genetic_model(geno_chunk: np.ndarray, model: str) -> np.ndarray:
@@ -676,6 +578,16 @@ def run_chunked_gwas_lmm_lm(
                     f"LM auto chunk-size: {int(chunk_size)} -> {int(model_chunk_size)} "
                     f"(n={int(n_idv)}).",
                 )
+        elif (
+            int(model_chunk_size) != int(chunk_size)
+            and bool(getattr(logger, "_janusx_gwas_verbose", False))
+        ):
+            _log_file_only(
+                logger,
+                logging.INFO,
+                f"{base_model_label} scan chunk-size adjusted for peak working-set: "
+                f"{int(chunk_size)} -> {int(model_chunk_size)} (n={int(n_idv)}).",
+            )
 
         header_pve: Optional[float] = None
         init_log_message: Optional[str] = None

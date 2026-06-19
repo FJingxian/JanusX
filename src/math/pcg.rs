@@ -835,7 +835,7 @@ fn pcg_normalize_sample_idx(
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct PcgJxlmmNullModel {
+pub(crate) struct PcgSplmmNullModel {
     pub(crate) df: f64,
     pub(crate) ypy: f64,
     pub(crate) sigma2: f64,
@@ -844,13 +844,13 @@ pub(crate) struct PcgJxlmmNullModel {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct PcgJxlmmNullModelInfo {
+pub(crate) struct PcgSplmmNullModelInfo {
     pub(crate) v_inv_y: PcgSolveInfo,
     pub(crate) v_inv_x: PcgMatrixSolveInfo,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct PcgJxlmmRHatResult {
+pub(crate) struct PcgSplmmRHatResult {
     pub(crate) n_markers_requested: usize,
     pub(crate) n_markers_used: usize,
     #[allow(dead_code)]

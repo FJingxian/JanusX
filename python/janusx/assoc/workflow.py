@@ -4166,36 +4166,48 @@ def _resolve_stream_scan_chunk_size(
       user did not pass --memory, so per-chunk compute is large enough to
       amortize Python orchestration and file-write overhead.
     """
-    _ = bool(use_spinner)
-    base = max(1, int(chunk_size))
-    n_snps = int(max(1, int(n_snps_hint)))
-    if bool(user_specified):
-        return base
-
     if isinstance(model_keys, str):
         models = {str(model_keys).lower()}
     elif model_keys is None:
         models = set()
     else:
         models = {str(x).lower() for x in model_keys}
-    if "lm" not in models:
-        return base
 
-    n_samples = int(max(1, int(n_samples_hint or 0)))
-    if n_samples <= 0:
-        return base
+    _ = bool(use_spinner)
+    base = max(1, int(chunk_size))
+    n_snps = int(max(1, int(n_snps_hint)))
+    resolved = base
 
-    # Heuristic target block size in memory for LM scan matrix (float32):
-    # rows * n_samples * 4 bytes ~= target_bytes.
-    target_mb = 192
-    target_bytes = int(target_mb * 1024 * 1024)
-    auto_rows = int(target_bytes // max(1, (4 * n_samples)))
-    auto_rows = max(base, auto_rows)
-    # Hard cap to bound transient memory while still improving throughput.
-    auto_rows = min(auto_rows, min(250_000, n_snps))
-    if auto_rows >= 10_000:
-        auto_rows = int((auto_rows // 1_000) * 1_000)
-    return max(base, auto_rows)
+    if (not bool(user_specified)) and ("lm" in models):
+        n_samples = int(max(1, int(n_samples_hint or 0)))
+        if n_samples > 0:
+            # Heuristic target block size in memory for LM scan matrix (float32):
+            # rows * n_samples * 4 bytes ~= target_bytes.
+            target_mb = 192
+            target_bytes = int(target_mb * 1024 * 1024)
+            auto_rows = int(target_bytes // max(1, (4 * n_samples)))
+            auto_rows = max(base, auto_rows)
+            # Hard cap to bound transient memory while still improving throughput.
+            auto_rows = min(auto_rows, min(250_000, n_snps))
+            if auto_rows >= 10_000:
+                auto_rows = int((auto_rows // 1_000) * 1_000)
+            resolved = max(base, auto_rows)
+
+    # Model-specific peak working-set adjustment:
+    # - `chunk_size` is derived from the user memory target assuming two float32
+    #   decode buffers (`buffers=2`) for streaming scans.
+    # - The unified BED fastpaths for FvLMM/LMM/LMM2 use a double-buffer
+    #   pipeline where *each* in-flight chunk holds both decoded and rotated
+    #   SNP blocks. Peak float32 working set is therefore roughly:
+    #     2 pipeline chunks * (decode + rotate) = 4 row-buffers,
+    #   which is about 2x the default assumption.
+    # - Halve chunk rows here so the scan-stage resident set stays close to the
+    #   user `-mem/--memory` target instead of drifting toward ~2x.
+    # - SparseLMM is handled separately.
+    if "fvlmm" in models or "lmm" in models or "lmm2" in models:
+        resolved = max(1, int(resolved // 2))
+
+    return min(n_snps, max(1, int(resolved)))
 
 
 def _status_stage_thread_budget(threads: int) -> int:
@@ -4722,9 +4734,12 @@ def run_algwas_packed_fullrank(*args, **kwargs):
     from janusx.assoc.workflow_model_packed import run_algwas_packed_fullrank as _impl
     return _impl(*args, **kwargs)
 
-def run_splmm_packed_fullrank(*args, **kwargs):
-    from janusx.assoc.workflow_model_packed import run_splmm_packed_fullrank as _impl
+def run_splmm_windowed_fullrank(*args, **kwargs):
+    from janusx.assoc.workflow_model_packed import run_splmm_windowed_fullrank as _impl
     return _impl(*args, **kwargs)
+
+def run_splmm_packed_fullrank(*args, **kwargs):
+    return run_splmm_windowed_fullrank(*args, **kwargs)
 
 def run_chunked_gwas_lmm_lm(*args, **kwargs):
     from janusx.assoc.workflow_model_stream import run_chunked_gwas_lmm_lm as _impl
@@ -6479,17 +6494,16 @@ def _run_gwas_pipeline(
         if len(stream_models) > 0:
             rust_only_model_routes = True
             if rust_only_model_routes:
-                # v3: packed/stream routes execute via trait/model task plan (Rust route planner
+                # v3: model routes execute via the trait/model task plan (Rust route planner
                 # + thin Python executor) so single-model paths no longer bypass the unified route.
                 use_trait_grouped_fast = True
                 if use_trait_grouped_fast:
                     farmcpu_cache_prefill: Union[dict[str, object], None] = None
                     farmcpu_cache_runtime: Union[dict[str, object], None] = None
-                    packed_preload_ready = packed_preload_is_ready(preloaded_packed)
                     if has_farmcpu:
                         context_prepared = bool(pheno is not None and ids is not None and n_snps is not None)
                         if (
-                            packed_preload_ready
+                            packed_preload_is_ready(preloaded_packed)
                             and pheno is not None
                             and ids is not None
                             and qmatrix is not None
@@ -6605,125 +6619,6 @@ def _run_gwas_pipeline(
                             "Rust-only GWAS mode requires Rust task scheduler/dispatcher; "
                             f"unable to build model task plan ({err_text})."
                         )
-                    def _run_route_lm_packed(
-                        trait_one: list[str], emit_trait_header_model: bool
-                    ) -> None:
-                        run_lm_packed_fullrank(
-                            genofile=genofile_stream,
-                            pheno=pheno,
-                            ids=ids,
-                            outprefix=outprefix,
-                            maf_threshold=maf_threshold_scan,
-                            max_missing_rate=max_missing_rate_scan,
-                            genetic_model=args.model,
-                            het_threshold=het_threshold_scan,
-                            chunk_size=args.chunksize,
-                            qmatrix=qmatrix,
-                            cov_all=cov_all,
-                            plot=args.plot,
-                            threads=args.thread,
-                            logger=logger,
-                            use_spinner=use_spinner,
-                            snps_only=bool(args.snps_only),
-                            eff_snp_by_trait=eff_snp_by_trait,
-                            summary_rows=gwas_summary_rows,
-                            saved_paths=saved_result_paths,
-                            trait_names=trait_one,
-                            emit_trait_header=bool(emit_trait_header_model),
-                            preloaded_packed=preloaded_packed,
-                            force_model=bool(args.force_model),
-                        )
-
-                    def _run_route_lmm_packed(
-                        trait_one: list[str], emit_trait_header_model: bool
-                    ) -> None:
-                        run_lmm_packed_fullrank(
-                            genofile=genofile_stream,
-                            pheno=pheno,
-                            ids=ids,
-                            grm=grm,
-                            outprefix=outprefix,
-                            maf_threshold=maf_threshold_scan,
-                            max_missing_rate=max_missing_rate_scan,
-                            genetic_model=args.model,
-                            het_threshold=het_threshold_scan,
-                            chunk_size=args.chunksize,
-                            qmatrix=qmatrix,
-                            cov_all=cov_all,
-                            plot=args.plot,
-                            threads=args.thread,
-                            logger=logger,
-                            use_spinner=use_spinner,
-                            snps_only=bool(args.snps_only),
-                            eff_snp_by_trait=eff_snp_by_trait,
-                            summary_rows=gwas_summary_rows,
-                            saved_paths=saved_result_paths,
-                            trait_names=trait_one,
-                            emit_trait_header=bool(emit_trait_header_model),
-                            preloaded_packed=preloaded_packed,
-                            force_model=bool(args.force_model),
-                        )
-
-                    def _run_route_fastlmm_packed(
-                        trait_one: list[str], emit_trait_header_model: bool
-                    ) -> None:
-                        run_fastlmm_packed_fullrank(
-                            genofile=genofile_stream,
-                            pheno=pheno,
-                            ids=ids,
-                            grm=grm,
-                            outprefix=outprefix,
-                            maf_threshold=maf_threshold_scan,
-                            max_missing_rate=max_missing_rate_scan,
-                            genetic_model=args.model,
-                            het_threshold=het_threshold_scan,
-                            chunk_size=args.chunksize,
-                            qmatrix=qmatrix,
-                            cov_all=cov_all,
-                            plot=args.plot,
-                            threads=args.thread,
-                            logger=logger,
-                            use_spinner=use_spinner,
-                            snps_only=bool(args.snps_only),
-                            eff_snp_by_trait=eff_snp_by_trait,
-                            summary_rows=gwas_summary_rows,
-                            saved_paths=saved_result_paths,
-                            trait_names=trait_one,
-                            emit_trait_header=bool(emit_trait_header_model),
-                            preloaded_packed=preloaded_packed,
-                            force_model=bool(args.force_model),
-                        )
-
-                    def _run_route_fvlmm_packed(
-                        trait_one: list[str], emit_trait_header_model: bool
-                    ) -> None:
-                        run_fvlmm_packed_fullrank(
-                            genofile=genofile_stream,
-                            pheno=pheno,
-                            ids=ids,
-                            grm=grm,
-                            outprefix=outprefix,
-                            maf_threshold=maf_threshold_scan,
-                            max_missing_rate=max_missing_rate_scan,
-                            genetic_model=args.model,
-                            het_threshold=het_threshold_scan,
-                            chunk_size=args.chunksize,
-                            qmatrix=qmatrix,
-                            cov_all=cov_all,
-                            plot=args.plot,
-                            threads=args.thread,
-                            logger=logger,
-                            use_spinner=use_spinner,
-                            snps_only=bool(args.snps_only),
-                            eff_snp_by_trait=eff_snp_by_trait,
-                            summary_rows=gwas_summary_rows,
-                            saved_paths=saved_result_paths,
-                            trait_names=trait_one,
-                            emit_trait_header=bool(emit_trait_header_model),
-                            preloaded_packed=preloaded_packed,
-                            force_model=bool(args.force_model),
-                        )
-
                     def _run_route_algwas_packed(
                         trait_one: list[str], emit_trait_header_model: bool
                     ) -> None:
@@ -6753,10 +6648,10 @@ def _run_gwas_pipeline(
                             qtn_preloaded_packed=qtn_preloaded_packed,
                         )
 
-                    def _run_route_splmm_packed(
+                    def _run_route_splmm_windowed(
                         trait_one: list[str], emit_trait_header_model: bool
                     ) -> None:
-                        run_splmm_packed_fullrank(
+                        run_splmm_windowed_fullrank(
                             genofile=genofile_stream,
                             splmm_source=args.splmm,
                             splmm_sparse_cutoff=prepared_splmm_sparse_cutoff,
@@ -6820,7 +6715,6 @@ def _run_gwas_pipeline(
                             chunk_size_user_set=bool(
                                 getattr(args, "_chunksize_user_set", True)
                             ),
-                            prefer_packed_fullrust=False,
                             force_model=bool(args.force_model),
                         )
 
@@ -6857,7 +6751,6 @@ def _run_gwas_pipeline(
                             chunk_size_user_set=bool(
                                 getattr(args, "_chunksize_user_set", True)
                             ),
-                            prefer_packed_fullrust=False,
                             force_model=bool(args.force_model),
                         )
 
@@ -6894,7 +6787,6 @@ def _run_gwas_pipeline(
                             chunk_size_user_set=bool(
                                 getattr(args, "_chunksize_user_set", True)
                             ),
-                            prefer_packed_fullrust=False,
                             force_model=bool(args.force_model),
                         )
 
@@ -6931,7 +6823,6 @@ def _run_gwas_pipeline(
                             chunk_size_user_set=bool(
                                 getattr(args, "_chunksize_user_set", True)
                             ),
-                            prefer_packed_fullrust=False,
                             force_model=bool(args.force_model),
                         )
 
@@ -6968,7 +6859,6 @@ def _run_gwas_pipeline(
                             chunk_size_user_set=bool(
                                 getattr(args, "_chunksize_user_set", True)
                             ),
-                            prefer_packed_fullrust=False,
                             force_model=bool(args.force_model),
                         )
 
@@ -6999,11 +6889,7 @@ def _run_gwas_pipeline(
                         farmcpu_handled_in_trait_loop = True
 
                     route_handlers = {
-                        "lm_packed": _run_route_lm_packed,
-                        "lmm_packed": _run_route_lmm_packed,
-                        "fastlmm_packed": _run_route_fastlmm_packed,
-                        "fvlmm_packed": _run_route_fvlmm_packed,
-                        "splmm": _run_route_splmm_packed,
+                        "splmm": _run_route_splmm_windowed,
                         "algwas": _run_route_algwas_packed,
                         "lm_stream": _run_route_lm_stream,
                         "lmm_stream": _run_route_lmm_stream,
@@ -7053,32 +6939,6 @@ def _run_gwas_pipeline(
                             else:
                                 route = "unknown"
                         route = route_aliases.get(route, route)
-                        # Policy guardrail:
-                        # packed single-entry GWAS routes are reserved for FarmCPU/ALGWAS.
-                        if route in {
-                            "lm_packed",
-                            "lmm_packed",
-                            "fastlmm_packed",
-                            "fvlmm_packed",
-                        }:
-                            route = {
-                                "lm_packed": "lm_stream",
-                                "lmm_packed": "lmm_stream",
-                                "fastlmm_packed": "fastlmm_stream",
-                                "fvlmm_packed": "fvlmm_stream",
-                            }[route]
-                        if (not packed_preload_ready) and route in {
-                            "lm_packed",
-                            "lmm_packed",
-                            "fastlmm_packed",
-                            "fvlmm_packed",
-                        }:
-                            route = {
-                                "lm_packed": "lm_stream",
-                                "lmm_packed": "lmm_stream",
-                                "fastlmm_packed": "fastlmm_stream",
-                                "fvlmm_packed": "fvlmm_stream",
-                            }[route]
                         normalized_tasks.append(
                             {
                                 "model": mk,

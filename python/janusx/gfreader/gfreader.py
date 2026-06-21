@@ -65,6 +65,12 @@ try:
 except Exception:
     _build_rich_progress = None
 
+from janusx.script._common.grmio import (
+    genotype_cache_fallback_message as _genotype_cache_fallback_message,
+    genotype_cache_permission_retry_message as _genotype_cache_permission_retry_message,
+    genotype_cache_staged_input_message as _genotype_cache_staged_input_message,
+)
+
 _WARNED_BED_MODEL_FALLBACK = False
 _GENO_CACHE_ENV = "JANUSX_CACHE_DIR"
 _WARNED_CACHE_FALLBACK_KEYS: set[str] = set()
@@ -718,10 +724,9 @@ def _ensure_plink_cache(
     if fallback is not None and not _dir_is_writable(os.path.dirname(primary) or "."):
         _warn_cache_once(
             f"vcf:{prefix}:{cache_dir}",
-            (
-                f"No write permission for genotype-side cache directory: "
-                f"{os.path.dirname(primary) or '.'}. "
-                f"Falling back to cache directory from {_GENO_CACHE_ENV}: {cache_dir}"
+            _genotype_cache_fallback_message(
+                os.path.dirname(primary) or ".",
+                str(cache_dir),
             ),
         )
         _ensure_plink_cache_at(
@@ -751,10 +756,7 @@ def _ensure_plink_cache(
             raise
         _warn_cache_once(
             f"vcf-perm:{prefix}:{cache_dir}",
-            (
-                f"Failed to build/read genotype-side cache at '{primary}' due to permission issue. "
-                f"Falling back to {_GENO_CACHE_ENV}={cache_dir}."
-            ),
+            _genotype_cache_permission_retry_message(primary, str(cache_dir)),
         )
         _ensure_plink_cache_at(
             fallback,
@@ -791,10 +793,9 @@ def _ensure_plink_cache_for_cli_source(
     if fallback is not None and not _dir_is_writable(os.path.dirname(primary) or "."):
         _warn_cache_once(
             f"{source_label.lower()}:{prefix}:{cache_dir}",
-            (
-                f"No write permission for genotype-side cache directory: "
-                f"{os.path.dirname(primary) or '.'}. "
-                f"Falling back to cache directory from {_GENO_CACHE_ENV}: {cache_dir}"
+            _genotype_cache_fallback_message(
+                os.path.dirname(primary) or ".",
+                str(cache_dir),
             ),
         )
         _ensure_plink_cache_from_source_at(
@@ -820,10 +821,7 @@ def _ensure_plink_cache_for_cli_source(
             raise
         _warn_cache_once(
             f"{source_label.lower()}-perm:{prefix}:{cache_dir}",
-            (
-                f"Failed to build/read genotype-side cache at '{primary}' due to permission issue. "
-                f"Falling back to {_GENO_CACHE_ENV}={cache_dir}."
-            ),
+            _genotype_cache_permission_retry_message(primary, str(cache_dir)),
         )
         _ensure_plink_cache_from_source_at(
             fallback,
@@ -1024,10 +1022,9 @@ def _prepare_txtlike_input_for_cache(kind: str, prefix: str, src_path: Union[str
 
     _warn_cache_once(
         f"txt:{prefix}:{cache_dir}",
-        (
-            f"No write permission for genotype-side cache directory: "
-            f"{os.path.dirname(primary_cache_prefix) or '.'}. "
-            f"Using staged input under {_GENO_CACHE_ENV}: {stage_root}"
+        _genotype_cache_staged_input_message(
+            os.path.dirname(primary_cache_prefix) or ".",
+            stage_root,
         ),
     )
     return staged

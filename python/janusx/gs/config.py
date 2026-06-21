@@ -47,6 +47,7 @@ class GsConfig:
     out: str = "."
     prefix: Optional[str] = None
     gblup_kernels: tuple[str, ...] = ("a",)
+    blup: bool = False
     rrblup: bool = False
     bayesa: bool = False
     bayesb: bool = False
@@ -83,6 +84,7 @@ class GsConfig:
         n = 0
         if len(self.gblup_kernels) > 0:
             n += 1
+        n += int(bool(self.blup))
         n += int(bool(self.rrblup))
         n += int(bool(self.bayesa))
         n += int(bool(self.bayesb))
@@ -119,6 +121,8 @@ class GsConfig:
                 argv.append("-GBLUP")
             else:
                 argv.extend(["-GBLUP"] + g_tokens)
+        if bool(self.blup):
+            argv.append("-BLUP")
         if bool(self.rrblup):
             argv.append("-rrBLUP")
         if bool(self.bayesa):

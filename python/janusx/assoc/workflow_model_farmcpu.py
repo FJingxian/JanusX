@@ -11,7 +11,7 @@ from typing import Union
 import numpy as np
 import pandas as pd
 import psutil
-from janusx.script._common.packedctx import (
+from janusx.script._common.genoio import (
     packed_preload_is_disabled,
     packed_preload_is_ready,
     prepare_packed_ctx_from_plink,

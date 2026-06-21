@@ -34,6 +34,17 @@ from janusx.script._common.helptext import (
     cli_help_formatter,
     minimal_help_epilog,
 )
+from janusx.script._common.cli import (
+    add_common_covariate_file_arg,
+    add_common_grm_file_arg,
+    add_common_out_arg,
+    add_common_pheno_arg,
+    add_common_prefix_arg,
+    add_common_thread_arg,
+    add_common_trait_selector_args,
+    add_common_variant_filter_args,
+    parse_trait_selector_specs,
+)
 from janusx.script._common.pathcheck import (
     ensure_all_true,
     ensure_file_exists,
@@ -41,7 +52,6 @@ from janusx.script._common.pathcheck import (
     ensure_plink_prefix_exists,
 )
 from janusx.script._common.status import CliStatus, log_success, warn_deprecated_alias_usage, stdout_is_tty
-from janusx.script._common.colspec import parse_zero_based_index_specs
 from janusx.script._common.threads import (
     apply_blas_thread_env,
     detect_effective_threads,
@@ -152,12 +162,12 @@ def main() -> None:
     geno_group = required_group.add_mutually_exclusive_group(required=False)
     geno_group.add_argument("-bfile", "--bfile", type=str, help="Pseudo genotype PLINK prefix.")
     geno_group.add_argument("-vcf", "--vcf", type=str, help="Pseudo genotype VCF/VCF.GZ file.")
-    required_group.add_argument(
-        "-p", "--pheno", type=str, required=False, help="Phenotype file."
-    )
-    required_group.add_argument(
-        "-k", "--grm", type=str, required=False,
-        help="Required GRM file path for LMM (no auto-build).",
+    add_common_pheno_arg(required_group, required=False, help_text="Phenotype file.")
+    add_common_grm_file_arg(
+        required_group,
+        required=False,
+        dest="grm",
+        help_profile="required_lmm",
     )
 
     # ------------------------- Optional arguments -------------------------
@@ -166,46 +176,38 @@ def main() -> None:
         "-q", "--qcov", type=str, default=None,
         help="Optional Q matrix file path (PC covariates).",
     )
-    optional_group.add_argument(
-        "-cov", "--cov", type=str, default=None,
-        help="Optional covariate file (first column is sample ID).",
+    add_common_covariate_file_arg(
+        optional_group,
+        dest="cov",
+        default=None,
+        help_text="Optional covariate file (first column is sample ID).",
+        option_strings=("-cov", "--cov"),
     )
-    optional_group.add_argument(
-        "-n", "--n", action="extend", nargs="+", metavar="COL", default=None, type=str, dest="ncol",
-        help=(
-            "Phenotype column(s), zero-based index (excluding sample ID), "
-            "comma list (e.g. 0,2), or numeric range (e.g. 0:2). "
-            "Repeat this flag for multiple traits."
-        ),
+    add_common_trait_selector_args(optional_group, dest="ncol")
+    add_common_out_arg(
+        optional_group,
+        default=".",
+        help_profile="current_dir",
     )
-    optional_group.add_argument(
-        "--ncol", action="extend", nargs="+", metavar="COL", default=None, type=str, dest="ncol",
-        help=argparse.SUPPRESS,
+    add_common_prefix_arg(
+        optional_group,
+        default=None,
+        help_profile="inferred_input",
     )
-    optional_group.add_argument(
-        "-o", "--out", type=str, default=".",
-        help="Output directory for results (default: current directory).",
-    )
-    optional_group.add_argument(
-        "-prefix", "--prefix", type=str, default=None,
-        help="Output prefix (default: inferred from genotype file).",
-    )
-    optional_group.add_argument(
-        "-maf", "--maf", type=float, default=0.02,
-        help="MAF threshold for GWAS (default: %(default)s).",
-    )
-    optional_group.add_argument(
-        "-geno", "--geno", type=float, default=0.05,
-        help="Missing rate threshold for GWAS (default: %(default)s).",
+    add_common_variant_filter_args(
+        optional_group,
+        help_profile="gwas_threshold",
+        include_maf=True,
+        include_geno=True,
+        include_het=False,
+        maf_default=0.02,
+        geno_default=0.05,
     )
     optional_group.add_argument(
         "-chunksize", "--chunksize", type=int, default=100_000,
         help="Chunk size for streaming GWAS (default: %(default)s).",
     )
-    optional_group.add_argument(
-        "-t", "--thread", type=int, default=detect_effective_threads(),
-        help="Number of CPU threads (default: %(default)s).",
-    )
+    add_common_thread_arg(optional_group, default_threads=detect_effective_threads())
     optional_group.add_argument(
         "--pseudo", type=str, default=None,
         help="Pseudo mapping file (default: {genofile}.pseudo).",
@@ -282,7 +284,7 @@ def main() -> None:
     if len(extras) > 0:
         parser.error("unrecognized arguments: " + " ".join(extras))
     try:
-        args.ncol = parse_zero_based_index_specs(args.ncol, label="-n/--n")
+        args.ncol = parse_trait_selector_specs(args.ncol, label="-n/--n")
     except ValueError as e:
         parser.error(str(e))
     if args.only_set is not None and args.only_set < 0:

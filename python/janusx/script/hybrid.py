@@ -35,6 +35,11 @@ import pandas as pd
 
 from janusx.gfreader import SiteInfo, inspect_genotype_file, load_genotype_chunks, save_genotype_streaming
 
+from ._common.cli import (
+    add_common_genotype_source_args,
+    add_common_out_arg,
+    add_common_prefix_arg,
+)
 from ._common.genoio import (
     GENOTYPE_SUFFIXES,
     GENOTYPE_TEXT_SUFFIXES,
@@ -671,17 +676,10 @@ def build_parser() -> CliArgumentParser:
 
     in_group = parser.add_argument_group("Genotype Input")
     src = in_group.add_mutually_exclusive_group(required=True)
-    src.add_argument("-vcf", "--vcf", type=str, help="Input VCF/VCF.GZ genotype file.")
-    src.add_argument("-bfile", "--bfile", type=str, help="Input PLINK prefix (.bed/.bim/.fam).")
-    src.add_argument(
-        "-file",
-        "--file",
-        type=str,
-        help=(
-            "Input genotype matrix (.txt/.tsv/.csv/.npy) or prefix. "
-            "Requires sibling prefix.id. Optional site metadata: prefix.site or prefix.bim. "
-            "When prefix-matched .npy exists, it is preferred."
-        ),
+    add_common_genotype_source_args(
+        src,
+        include_hmp=False,
+        help_profile="hybrid",
     )
 
     req = parser.add_argument_group("Required Arguments")
@@ -689,20 +687,8 @@ def build_parser() -> CliArgumentParser:
     req.add_argument("-p2", "--p2", required=True, type=str, help="Parent-2 sample list (one ID per line).")
 
     opt = parser.add_argument_group("Optional Arguments")
-    opt.add_argument(
-        "-o",
-        "--out",
-        default=".",
-        type=str,
-        help="Output directory (default: current directory).",
-    )
-    opt.add_argument(
-        "-prefix",
-        "--prefix",
-        type=str,
-        default=None,
-        help="Output prefix. Default: inferred from genotype input.",
-    )
+    add_common_out_arg(opt, default=".", help_profile="current_dir")
+    add_common_prefix_arg(opt, default=None, help_profile="inferred_genotype_input")
     opt.add_argument(
         "-fmt",
         "--fmt",

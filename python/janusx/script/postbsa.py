@@ -36,6 +36,7 @@ from contextlib import nullcontext
 from typing import Any, Optional
 from janusx.gtools.cleaner import chrom_sort_key as _chrom_sort_key
 
+from ._common.cli import add_common_out_arg, add_common_prefix_arg, add_common_thread_arg
 from ._common.log import setup_logging
 from ._common.config_render import emit_cli_configuration
 from ._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog
@@ -1758,29 +1759,12 @@ def build_parser() -> argparse.ArgumentParser:
             "A single color is auto-expanded to a two-color style."
         ),
     )
-    optional_group.add_argument(
-        "-o",
-        "--out",
-        type=str,
-        default=".",
-        help="Output directory (default: %(default)s).",
-    )
-    optional_group.add_argument(
-        "-prefix",
-        "--prefix",
-        type=str,
-        default=None,
-        help="Output prefix. Defaults to the input filename stem.",
-    )
-    optional_group.add_argument(
-        "-t",
-        "--thread",
-        type=int,
-        default=detect_effective_threads(),
-        help=(
-            "Number of CPU threads (default: %(default)s). "
-            "For glob input, this is also the max parallel chromosome jobs."
-        ),
+    add_common_out_arg(optional_group, default=".", help_profile="default")
+    add_common_prefix_arg(optional_group, default=None, help_profile="input_filename_stem")
+    add_common_thread_arg(
+        optional_group,
+        default_threads=detect_effective_threads(),
+        help_profile="glob_jobs",
     )
     return parser
 

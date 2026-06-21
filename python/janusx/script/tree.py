@@ -39,6 +39,16 @@ from janusx.janusx import (
     nj_newick_from_alignment_u8,
 )
 
+from ._common.cli import (
+    add_common_genotype_source_args,
+    add_common_maf_arg,
+    add_common_geno_arg,
+    add_common_het_arg,
+    add_common_out_arg,
+    add_common_prefix_arg,
+    add_common_snps_only_arg,
+    add_common_thread_arg,
+)
 from ._common.genoio import determine_genotype_source_from_args
 from ._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 from ._common.log import setup_logging
@@ -438,25 +448,7 @@ def _genotype_to_alignment(
 def _add_tree_input_args(parser: CliArgumentParser, *, required: bool) -> None:
     required_group = parser.add_argument_group("Required arguments")
     g = required_group.add_mutually_exclusive_group(required=required)
-    g.add_argument(
-        "-vcf", "--vcf", dest="vcf", type=str,
-        help="Input genotype file in VCF format (.vcf or .vcf.gz).",
-    )
-    g.add_argument(
-        "-hmp", "--hmp", dest="hmp", type=str,
-        help="Input genotype file in HMP format (.hmp or .hmp.gz).",
-    )
-    g.add_argument(
-        "-file", "--file", dest="file", type=str,
-        help=(
-            "Input genotype numeric matrix (.txt/.tsv/.csv/.npy) or prefix. "
-            "Requires sibling prefix.id. Optional site metadata: prefix.site or prefix.bim."
-        ),
-    )
-    g.add_argument(
-        "-bfile", "--bfile", dest="bfile", type=str,
-        help="Input genotype in PLINK binary format (prefix for .bed, .bim, .fam).",
-    )
+    add_common_genotype_source_args(g, help_profile="default")
     g.add_argument(
         "-fa", "--fasta", dest="fasta", type=str,
         help="Input aligned FASTA file (.fa/.fasta).",
@@ -474,39 +466,18 @@ def _add_tree_optional_args(
         "-chunksize", "--chunksize", dest="chunksize", type=int, default=10_000,
         help="SNP chunk size for streaming read (default: %(default)s).",
     )
-    optional_group.add_argument(
-        "-maf", "--maf", dest="maf", type=float, default=0.02,
-        help="Exclude variants with minor allele frequency lower than a threshold (default: %(default)s).",
-    )
-    optional_group.add_argument(
-        "-geno", "--geno", dest="geno", type=float, default=0.05,
-        help="Exclude variants with missing call frequencies greater than a threshold (default: %(default)s).",
-    )
-    optional_group.add_argument(
-        "-het", "--het", dest="het", type=float, default=0.02,
-        help="Heterozygosity filter threshold (default: %(default)s).",
-    )
-    optional_group.add_argument(
-        "-snps-only", "--snps-only", dest="snps_only", action="store_true", default=False,
-        help="Exclude non-SNP variants.",
-    )
+    add_common_maf_arg(optional_group, default=0.02, help_profile="default")
+    add_common_geno_arg(optional_group, default=0.05, help_profile="default")
+    add_common_het_arg(optional_group, default=0.02, help_profile="default")
+    add_common_snps_only_arg(optional_group, default=False, help_profile="default")
     if include_hidden_approx_legacy:
         optional_group.add_argument(
             "--approx", dest="approx_legacy", action="store_true", default=False,
             help=argparse.SUPPRESS,
         )
-    optional_group.add_argument(
-        "-t", "--thread", dest="thread", type=int, default=0,
-        help="Thread count for tree inference (0=auto; default: %(default)s).",
-    )
-    optional_group.add_argument(
-        "-o", "--out", dest="out", type=str, default=".",
-        help="Output directory for results (default: %(default)s).",
-    )
-    optional_group.add_argument(
-        "-prefix", "--prefix", dest="prefix", type=str, default=None,
-        help="Output file prefix (default: inferred from genotype file name).",
-    )
+    add_common_thread_arg(optional_group, default_threads=0, help_profile="tree_auto")
+    add_common_out_arg(optional_group, default=".", help_profile="default")
+    add_common_prefix_arg(optional_group, default=None, help_profile="tree_inferred_genotype")
     optional_group.add_argument(
         "--write-phylip", dest="write_phylip", action="store_true",
         help="Also write relaxed PHYLIP alignment: <out>/<prefix>.phy",

@@ -64,6 +64,14 @@ from janusx.gfreader import (
     prepare_cli_input_cache,
 )
 from ._common.log import setup_logging
+from ._common.cli import (
+    add_common_genotype_source_args,
+    add_common_memory_arg,
+    add_common_out_arg,
+    add_common_prefix_arg,
+    add_common_thread_arg,
+    add_common_variant_filter_args,
+)
 from ._common.config_render import emit_cli_configuration
 from ._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 from ._common.pathcheck import (
@@ -78,11 +86,19 @@ from ._common.status import CliStatus, format_elapsed, log_success, stdout_is_tt
 from ._common.genocache import configure_genotype_cache_from_out
 from ._common.genoio import (
     determine_genotype_source as _determine_genotype_source,
+    genotype_load_status_done,
+    genotype_load_status_fail,
+    genotype_load_status_open,
     read_id_file as _read_id_file,
     read_matrix_with_ids as _read_matrix_with_ids,
     strip_default_prefix_suffix,
 )
-from ._common.threads import detect_effective_threads
+from ._common.threads import (
+    apply_blas_thread_env,
+    detect_effective_threads,
+    format_requested_thread_usage,
+    set_rust_blas_threads,
+)
 
 # ======================================================================
 # Helpers: GRM-based PCA (aligned with GWAS module)
@@ -276,11 +292,14 @@ def _rsvd_worker(
     missing_rate: float,
     mmap_window_mb: int,
     force_packed_bed: bool,
+    threads: int,
     eval_path: str,
     evec_path: str,
     trace_path: str,
 ) -> None:
     try:
+        if int(threads) > 0 and hasattr(jxrs, "admx_set_threads"):
+            jxrs.admx_set_threads(int(threads))
         if bool(force_packed_bed):
             os.environ["JANUSX_RSVD_BED_PACKED"] = "1"
         eval_raw, evec_raw, total_variance = jxrs.admx_rsvd_stream_sample(
@@ -340,6 +359,7 @@ def _run_rsvd_subprocess(
     missing_rate: float,
     mmap_window_mb: int,
     force_packed_bed: bool,
+    threads: int,
     progress_callback=None,
 ) -> tuple[np.ndarray, np.ndarray, float]:
     ctx = _select_rsvd_mp_context()
@@ -362,6 +382,7 @@ def _run_rsvd_subprocess(
             float(missing_rate),
             int(mmap_window_mb),
             bool(force_packed_bed),
+            int(threads),
             str(eval_path),
             str(evec_path),
             str(trace_path),
@@ -431,9 +452,12 @@ def _run_rsvd_direct(
     missing_rate: float,
     mmap_window_mb: int,
     force_packed_bed: bool,
+    threads: int,
 ) -> tuple[np.ndarray, np.ndarray, float]:
     prev_pack = os.environ.get("JANUSX_RSVD_BED_PACKED")
     try:
+        if int(threads) > 0 and hasattr(jxrs, "admx_set_threads"):
+            jxrs.admx_set_threads(int(threads))
         if bool(force_packed_bed):
             os.environ["JANUSX_RSVD_BED_PACKED"] = "1"
         eval_raw, evec_raw, total_variance = jxrs.admx_rsvd_stream_sample(
@@ -635,6 +659,7 @@ def build_grm_streaming_for_pca(
     logger=None,
     emit_progress_done: bool = True,
     snps_only: bool = False,
+    threads: int = 0,
 ) -> tuple[np.ndarray, np.ndarray, int]:
     """
     Construct the GRM in memmap mode via Rust BED kernel
@@ -700,7 +725,7 @@ def build_grm_streaming_for_pca(
                 maf_threshold=float(maf_threshold),
                 max_missing_rate=float(max_missing_rate),
                 block_cols=max(1, int(block_rows)),
-                threads=0,
+                threads=max(1, int(threads)) if int(threads) > 0 else 0,
                 progress_callback=_progress_cb,
                 progress_every=max(1, int(block_rows)),
                 mmap_window_mb=(int(mmap_window_mb) if mmap_window_mb is not None else None),
@@ -724,7 +749,12 @@ def build_grm_streaming_for_pca(
     return grm, sample_ids, int(eff_m)
 
 
-def eigendecompose_grm(grm: np.ndarray, logger=None) -> tuple[np.ndarray, np.ndarray, str]:
+def eigendecompose_grm(
+    grm: np.ndarray,
+    logger=None,
+    *,
+    threads: int | None = None,
+) -> tuple[np.ndarray, np.ndarray, str]:
     """
     Perform eigen decomposition of a symmetric GRM with Rust LAPACK backend:
       GRM = V Λ V^T
@@ -747,7 +777,7 @@ def eigendecompose_grm(grm: np.ndarray, logger=None) -> tuple[np.ndarray, np.nda
         raise RuntimeError(f"PCA eigh expects non-empty square GRM, got shape={g0.shape}")
     g = np.ascontiguousarray(g0)
     n = int(g.shape[0])
-    threads = max(1, int(detect_effective_threads()))
+    threads = max(1, int(detect_effective_threads() if threads is None else threads))
 
     # Keep PCA aligned with GWAS default strategy:
     # default to Rust "auto", but switch large full-vector problems to dsyevr
@@ -819,7 +849,12 @@ def eigendecompose_grm(grm: np.ndarray, logger=None) -> tuple[np.ndarray, np.nda
     return eigvec, eigval, backend
 
 
-def eigendecompose_grm_file(grm_file: str, logger=None) -> tuple[np.ndarray, np.ndarray, str, int]:
+def eigendecompose_grm_file(
+    grm_file: str,
+    logger=None,
+    *,
+    threads: int | None = None,
+) -> tuple[np.ndarray, np.ndarray, str, int]:
     """
     Rust-native file-path eigendecomposition for precomputed GRM:
       - .npy: parsed directly in Rust
@@ -834,7 +869,7 @@ def eigendecompose_grm_file(grm_file: str, logger=None) -> tuple[np.ndarray, np.
             "Rust extension is missing rust_eigh_from_matrix_file_f64. "
             "Rebuild/install JanusX extension first."
         )
-    threads = max(1, int(detect_effective_threads()))
+    threads = max(1, int(detect_effective_threads() if threads is None else threads))
     raw_driver = str(
         os.environ.get(
             "JX_PCA_EIGH_DRIVER",
@@ -899,28 +934,7 @@ def main(log: bool = True):
     # ------------------------- Required arguments -------------------------
     required_group = parser.add_argument_group("Required Arguments")
     geno_group = required_group.add_mutually_exclusive_group(required=True)
-    geno_group.add_argument(
-        "-vcf", "--vcf", type=str,
-        help="Input genotype file in VCF format (.vcf or .vcf.gz).",
-    )
-    geno_group.add_argument(
-        "-hmp", "--hmp", type=str,
-        help="Input genotype file in HMP format (.hmp or .hmp.gz).",
-    )
-    geno_group.add_argument(
-        "-bfile", "--bfile", type=str,
-        help=(
-            "Input genotype in PLINK binary format "
-            "(prefix for .bed, .bim, .fam)."
-        ),
-    )
-    geno_group.add_argument(
-        "-file", "--file", type=str,
-        help=(
-            "Input genotype numeric matrix (.txt/.tsv/.csv/.npy) or prefix. "
-            "Requires sibling prefix.id. Optional site metadata: prefix.site or prefix.bim."
-        ),
-    )
+    add_common_genotype_source_args(geno_group, help_profile="default")
     geno_group.add_argument(
         "-k", "--grm", type=str,
         help=(
@@ -941,39 +955,30 @@ def main(log: bool = True):
 
     # ------------------------- Optional arguments -------------------------
     optional_group = parser.add_argument_group("Optional Arguments")
-    optional_group.add_argument(
-        "-o", "--out", type=str, default=".",
-        help="Output directory for PCA results (default: current directory).",
-    )
-    optional_group.add_argument(
-        "-prefix", "--prefix", type=str, default=None,
-        help="Prefix of output files (default: inferred from input file name).",
+    add_common_out_arg(optional_group, default=".", help_profile="pca_results")
+    add_common_prefix_arg(
+        optional_group,
+        default=None,
+        help_profile="inferred_input_filename",
     )
     optional_group.add_argument(
         "-dim", "--dim", type=int, default=3,
         help="Number of leading principal components to output (default: %(default)s).",
     )
-    optional_group.add_argument(
-        "-maf", "--maf", type=float, default=0.02,
-        help="Exclude variants with minor allele frequency lower than a threshold "
-             "(default: %(default)s).",
+    add_common_variant_filter_args(
+        optional_group,
+        help_profile="default",
+        include_het=False,
+        maf_default=0.02,
+        geno_default=0.05,
     )
-    optional_group.add_argument(
-        "-geno", "--geno", type=float, default=0.05,
-        help="Exclude variants with missing call frequencies greater than a threshold "
-             "(default: %(default)s).",
+    add_common_memory_arg(
+        optional_group,
+        default=DEFAULT_BED_MEMORY_GB,
+        help_profile="gwas_decode",
+        include_hidden_legacy_single_dash_alias=True,
     )
-    optional_group.add_argument(
-        "-mem", "--memory", type=float, default=DEFAULT_BED_MEMORY_GB,
-        help=(
-            "Target BED decode block size in GB for memmap/packed kernels. "
-            "This only controls per-block decode/window sizing, not global process memory "
-            "(default: %(default)s)."
-        ),
-    )
-    optional_group.add_argument(
-        "-memory", dest="memory", type=float, help=argparse.SUPPRESS
-    )
+    add_common_thread_arg(optional_group, default_threads=detect_effective_threads())
     optional_group.add_argument(
         "-plot", "--plot", action="store_true", default=False,
         help="Generate 2D scatter plots for PC1 vs PC2 and PC1 vs PC3 "
@@ -1010,6 +1015,14 @@ def main(log: bool = True):
     )
 
     args = parser.parse_args()
+    detected_threads = detect_effective_threads()
+    requested_threads = int(args.thread)
+    thread_capped = False
+    if int(args.thread) <= 0:
+        args.thread = int(detected_threads)
+    if int(args.thread) > int(detected_threads):
+        thread_capped = True
+        args.thread = int(detected_threads)
 
     # Parse -rsvd optional values: -rsvd [power] [tol]
     # Seed is fixed to 42 to keep CLI concise and deterministic.
@@ -1102,6 +1115,18 @@ def main(log: bool = True):
     configure_genotype_cache_from_out(args.out)
     log_path = f"{outprefix}.pca.log"
     logger = setup_logging(log_path)
+    if thread_capped:
+        logger.warning(
+            f"Requested threads={requested_threads} exceeds detected available={detected_threads}; "
+            f"using {int(args.thread)}."
+        )
+    apply_blas_thread_env(int(args.thread))
+    set_rust_blas_threads(int(args.thread))
+    if hasattr(jxrs, "admx_set_threads"):
+        try:
+            jxrs.admx_set_threads(int(args.thread))
+        except Exception:
+            pass
     # Keep algorithm status visible immediately.
     use_spinner = True
     # if genotype_input_mode and (not bool(args.mmap_limit)):
@@ -1135,6 +1160,14 @@ def main(log: bool = True):
                     ("Output PCs", f"top {args.dim}"),
                     ("MAF threshold", args.maf),
                     ("Missing rate", args.geno),
+                    (
+                        "Threads",
+                        format_requested_thread_usage(
+                            requested_threads=int(requested_threads),
+                            using_threads=int(args.thread),
+                            detected_threads=int(detected_threads),
+                        ),
+                    ),
                     ("Decode block GB", args.memory),
                     ("BED backend", "memmap (default)"),
                     ("RSVD mode", args.rsvd),
@@ -1151,7 +1184,20 @@ def main(log: bool = True):
                     ]
                 )
         elif args.grm:
-            cfg_rows.extend([("GRM prefix", gfile), ("Output PCs", f"top {args.dim}")])
+            cfg_rows.extend(
+                [
+                    ("GRM prefix", gfile),
+                    ("Output PCs", f"top {args.dim}"),
+                    (
+                        "Threads",
+                        format_requested_thread_usage(
+                            requested_threads=int(requested_threads),
+                            using_threads=int(args.thread),
+                            detected_threads=int(detected_threads),
+                        ),
+                    ),
+                ]
+            )
         elif args.qcov:
             cfg_rows.append(("PCA prefix", f"{gfile} (visualization only)"))
         if args.plot or args.plot3D:
@@ -1267,7 +1313,7 @@ def main(log: bool = True):
                     missing_rate=float(args.geno),
                 )
                 with CliStatus(
-                    f"Loading genotype from {load_src_disp}...",
+                    genotype_load_status_open(load_src_disp),
                     enabled=use_spinner,
                     use_process=True,
                 ) as task:
@@ -1281,17 +1327,26 @@ def main(log: bool = True):
                             logger=None,
                             emit_progress_done=False,
                             snps_only=bool(rsvd_snps_only),
+                            threads=int(args.thread),
                         )
                     except Exception:
-                        task.fail(f"Loading genotype from {load_src_disp} ...Failed")
+                        task.fail(genotype_load_status_fail(load_src_disp))
                         raise
                     algo_n = int(len(samples))
                     task.complete(
-                        f"Loading genotype from {load_src_disp} (n={algo_n}, nSNP={int(algo_snp)})"
+                        genotype_load_status_done(
+                            load_src_disp,
+                            n_samples=algo_n,
+                            n_snps=int(algo_snp),
+                        )
                     )
 
                 def _run_txt_force_eig_only():
-                    eigenvec_local, eigenval_local, evd_backend_local = eigendecompose_grm(grm, logger=None)
+                    eigenvec_local, eigenval_local, evd_backend_local = eigendecompose_grm(
+                        grm,
+                        logger=None,
+                        threads=int(args.thread),
+                    )
                     return eigenvec_local, eigenval_local, evd_backend_local
 
                 (eigenvec, eigenval, evd_backend), algo_elapsed_s = _run_with_algo_progress(
@@ -1313,7 +1368,7 @@ def main(log: bool = True):
                         "Rebuild/install JanusX extension first."
                     )
                 with CliStatus(
-                    f"Loading genotype from {load_src_disp}...",
+                    genotype_load_status_open(load_src_disp),
                     enabled=use_spinner,
                     use_process=True,
                 ) as task:
@@ -1326,11 +1381,15 @@ def main(log: bool = True):
                         )
                         samples = np.asarray(sample_ids, dtype=str)
                     except Exception:
-                        task.fail(f"Loading genotype from {load_src_disp} ...Failed")
+                        task.fail(genotype_load_status_fail(load_src_disp))
                         raise
                     algo_n = int(samples.shape[0])
                     task.complete(
-                        f"Loading genotype from {load_src_disp} (n={algo_n}, nSNP={int(algo_snp)})"
+                        genotype_load_status_done(
+                            load_src_disp,
+                            n_samples=algo_n,
+                            n_snps=int(algo_snp),
+                        )
                     )
 
                 mmap_window_mb = auto_mmap_window_mb(
@@ -1354,6 +1413,7 @@ def main(log: bool = True):
                             missing_rate=float(args.geno),
                             mmap_window_mb=int(mmap_window_mb) if mmap_window_mb is not None else 0,
                             force_packed_bed=bool(_is_plink_prefix_path(rsvd_input)),
+                            threads=int(args.thread),
                         )
                         if run_fn is _run_rsvd_subprocess:
                             call_kwargs["progress_callback"] = None
@@ -1376,7 +1436,7 @@ def main(log: bool = True):
             )
         else:
             with CliStatus(
-                f"Loading genotype from {load_src_disp}...",
+                genotype_load_status_open(load_src_disp),
                 enabled=use_spinner,
                 use_process=True,
             ) as task:
@@ -1390,17 +1450,26 @@ def main(log: bool = True):
                         logger=None,
                         emit_progress_done=False,
                         snps_only=bool(args.vcf),
+                        threads=int(args.thread),
                     )
                 except Exception:
-                    task.fail(f"Loading genotype from {load_src_disp} ...Failed")
+                    task.fail(genotype_load_status_fail(load_src_disp))
                     raise
                 algo_n = int(len(samples))
                 task.complete(
-                    f"Loading genotype from {load_src_disp} (n={algo_n}, nSNP={int(algo_snp)})"
+                    genotype_load_status_done(
+                        load_src_disp,
+                        n_samples=algo_n,
+                        n_snps=int(algo_snp),
+                    )
                 )
 
             def _run_memmap_eig_only():
-                eigenvec_local, eigenval_local, evd_backend_local = eigendecompose_grm(grm, logger=None)
+                eigenvec_local, eigenval_local, evd_backend_local = eigendecompose_grm(
+                    grm,
+                    logger=None,
+                    threads=int(args.thread),
+                )
                 return eigenvec_local, eigenval_local, evd_backend_local
 
             (eigenvec, eigenval, evd_backend), algo_elapsed_s = _run_with_algo_progress(
@@ -1503,6 +1572,7 @@ def main(log: bool = True):
                     eigenvec, eigenval, evd_backend, n_rust = eigendecompose_grm_file(
                         grm_file,
                         logger=None,
+                        threads=int(args.thread),
                     )
                     if int(n_rust) != int(len(samples)):
                         raise ValueError(
@@ -1511,7 +1581,11 @@ def main(log: bool = True):
                 else:
                     if grm is None:
                         raise RuntimeError("GRM matrix is not loaded for PCA eigendecomposition.")
-                    eigenvec, eigenval, evd_backend = eigendecompose_grm(grm, logger=None)
+                    eigenvec, eigenval, evd_backend = eigendecompose_grm(
+                        grm,
+                        logger=None,
+                        threads=int(args.thread),
+                    )
             except Exception:
                 task.fail("Computing Eigen-Decomposition ...Failed")
                 raise

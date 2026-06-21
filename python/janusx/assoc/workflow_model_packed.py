@@ -18,11 +18,11 @@ import numpy as np
 import pandas as pd
 import psutil
 from janusx.assoc.workflow_cache import _is_writable_dir, _resolve_gwas_cache_dir
-from janusx.script._common.packedctx import (
-    prepare_packed_ctx_from_plink,
+from janusx.script._common.genoio import (
     packed_preload_is_disabled,
     packed_preload_is_ready,
     packed_preload_reason,
+    prepare_packed_ctx_from_plink,
 )
 
 from .workflow import (

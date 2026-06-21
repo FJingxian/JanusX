@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import struct
 import sys
@@ -9,7 +10,27 @@ from typing import Any, Iterable, Iterator, Sequence
 import numpy as np
 import pandas as pd
 
-from janusx.gfreader import SiteInfo, prepare_cli_input_cache
+from janusx.gfreader import (
+    SiteInfo,
+    inspect_genotype_file,
+    load_bed_2bit_packed,
+    prepare_cli_input_cache,
+)
+try:
+    from janusx.gfreader import scan_bed_2bit_packed_stats
+except Exception:
+    scan_bed_2bit_packed_stats = None  # type: ignore[assignment]
+try:
+    from janusx.gfreader import prepare_bed_2bit_packed
+except Exception:
+    prepare_bed_2bit_packed = None  # type: ignore[assignment]
+
+from .grmio import (
+    format_grm_cache_num,
+    genotype_cache_prefix as _shared_genotype_cache_prefix,
+    grm_cache_lock,
+    latest_genotype_mtime,
+)
 from .binsidecar import LEGACY_BSITE_HEADER_SIZE, LEGACY_BSITE_MAGIC, LEGACY_BSITE_VERSION
 from .pathcheck import safe_expanduser
 from .progress import build_rich_progress, rich_progress_available
@@ -33,6 +54,15 @@ except Exception:
 
 GENOTYPE_TEXT_SUFFIXES: tuple[str, ...] = (".txt", ".tsv", ".csv")
 GENOTYPE_SUFFIXES: tuple[str, ...] = GENOTYPE_TEXT_SUFFIXES + (".npy", ".bin")
+PACKED_META_CACHE_VERSION = 1
+
+_BYTE_LUT = np.arange(256, dtype=np.uint16)
+_NONMISS_LUT = np.zeros((256,), dtype=np.uint8)
+_HET_LUT = np.zeros((256,), dtype=np.uint8)
+for _within in range(4):
+    _code = (_BYTE_LUT >> (_within * 2)) & 0b11
+    _NONMISS_LUT += (_code != 0b01).astype(np.uint8)
+    _HET_LUT += (_code == 0b10).astype(np.uint8)
 
 
 def find_duplicates(items: Sequence[str]) -> list[str]:
@@ -223,6 +253,969 @@ def basename_only(path: str) -> str:
     p = str(path).replace("\\", "/").rstrip("/")
     b = os.path.basename(p)
     return b if b else p
+
+
+def genotype_load_status_open(src: str) -> str:
+    return f"Loading genotype from {src}..."
+
+
+def genotype_load_status_fail(src: str) -> str:
+    return f"Loading genotype from {src} ...Failed"
+
+
+def genotype_load_status_progress(src: str, detail: str) -> str:
+    return f"Loading genotype from {src}... {str(detail).strip()}"
+
+
+def genotype_load_status_done(
+    src: str,
+    *,
+    n_samples: int,
+    n_snps: int,
+    mode: str | None = None,
+) -> str:
+    base = f"Loading genotype from {src} (n={int(n_samples)}, nSNP={int(n_snps)}"
+    if mode is not None and str(mode).strip() != "":
+        return f"{base}, {str(mode).strip()})"
+    return f"{base})"
+
+
+def packed_prepare_failed_message(
+    plink_prefix: str,
+    attempt_errors: list[tuple[str, Exception]] | None = None,
+) -> str:
+    if not attempt_errors:
+        return f"Packed BED preparation failed for {plink_prefix}."
+    detail = "; ".join(
+        f"{name}: {type(ex).__name__}: {ex}" for name, ex in attempt_errors
+    )
+    return f"Packed BED preparation failed for {plink_prefix}. attempts={detail}"
+
+
+def packed_sample_size_mismatch_message(
+    *,
+    expected_n: int,
+    got_n: int,
+) -> str:
+    return f"Packed sample size mismatch: packed n={int(got_n)}, expected {int(expected_n)}"
+
+
+def packed_expected_sample_size_mismatch_message(
+    *,
+    expected_n: int,
+    got_n: int,
+    source_prefix: str,
+) -> str:
+    return (
+        f"Packed sample size mismatch: expected {int(expected_n)}, "
+        f"got {int(got_n)} from {source_prefix}."
+    )
+
+
+def packed_no_snps_after_filter_message() -> str:
+    return "No SNPs left after packed BED filtering. Please relax --maf/--geno thresholds."
+
+
+def normalize_plink_prefix(path_or_prefix: str) -> str:
+    p = str(path_or_prefix).strip()
+    low = p.lower()
+    if low.endswith(".bed") or low.endswith(".bim") or low.endswith(".fam"):
+        return p[:-4]
+    return p
+
+
+def _is_simple_snp_allele(allele: str) -> bool:
+    a = str(allele).strip().upper()
+    return len(a) == 1 and a in {"A", "C", "G", "T"}
+
+
+def plink_snp_mask(prefix: str) -> np.ndarray:
+    mask: list[bool] = []
+    bim_path = f"{normalize_plink_prefix(prefix)}.bim"
+    with open(bim_path, "r", encoding="utf-8", errors="ignore") as fh:
+        for ln, line in enumerate(fh, start=1):
+            s = line.strip()
+            if s == "":
+                continue
+            toks = s.split()
+            if len(toks) < 6:
+                raise ValueError(f"Malformed BIM line at {bim_path}:{ln}")
+            a0 = str(toks[4])
+            a1 = str(toks[5])
+            mask.append(_is_simple_snp_allele(a0) and _is_simple_snp_allele(a1))
+    return np.asarray(mask, dtype=np.bool_)
+
+
+def open_plink_bed_payload_memmap(
+    prefix: str,
+    *,
+    n_samples: int,
+    n_snps: int,
+) -> np.memmap:
+    plink_prefix = normalize_plink_prefix(prefix)
+    bed_path = f"{plink_prefix}.bed"
+    if not os.path.isfile(bed_path):
+        raise ValueError(f"Cannot find BED file for PLINK prefix: {plink_prefix}")
+    bytes_per_snp = (int(n_samples) + 3) // 4
+    expected_size = 3 + int(n_snps) * int(bytes_per_snp)
+    actual_size = int(os.path.getsize(bed_path))
+    if actual_size != expected_size:
+        raise ValueError(
+            f"BED payload size mismatch: file={actual_size}, expected={expected_size} "
+            f"(n_samples={int(n_samples)}, n_snps={int(n_snps)}, bytes_per_snp={int(bytes_per_snp)})"
+        )
+    return np.memmap(
+        bed_path,
+        dtype=np.uint8,
+        mode="r",
+        offset=3,
+        shape=(int(n_snps), int(bytes_per_snp)),
+        order="C",
+    )
+
+
+def packed_row_het_rate(packed: np.ndarray, n_samples: int) -> np.ndarray:
+    arr = np.ascontiguousarray(np.asarray(packed, dtype=np.uint8))
+    if arr.ndim != 2:
+        raise ValueError(f"packed matrix must be 2D, got shape={arr.shape}")
+    n_rows, bytes_per_row = arr.shape
+    expected = int((int(n_samples) + 3) // 4)
+    if bytes_per_row != expected:
+        raise ValueError(
+            f"packed byte-width mismatch: got {bytes_per_row}, expected {expected} for n_samples={n_samples}"
+        )
+    if n_rows == 0:
+        return np.zeros((0,), dtype=np.float32)
+
+    full = int(n_samples) // 4
+    rem = int(n_samples) % 4
+    non_missing = np.zeros((n_rows,), dtype=np.int32)
+    het = np.zeros((n_rows,), dtype=np.int32)
+    if full > 0:
+        base = arr[:, :full]
+        non_missing += _NONMISS_LUT[base].sum(axis=1, dtype=np.int64).astype(np.int32, copy=False)
+        het += _HET_LUT[base].sum(axis=1, dtype=np.int64).astype(np.int32, copy=False)
+
+    if rem > 0:
+        tail = arr[:, full]
+        for within in range(rem):
+            code = (tail >> (within * 2)) & 0b11
+            non_missing += (code != 0b01).astype(np.int32, copy=False)
+            het += (code == 0b10).astype(np.int32, copy=False)
+
+    out = np.zeros((n_rows,), dtype=np.float32)
+    ok = non_missing > 0
+    out[ok] = het[ok] / non_missing[ok]
+    return out
+
+
+def normalize_packed_filter_mode(mode: str) -> str:
+    key = str(mode or "compact").strip().lower()
+    if key in {"", "compact", "filtered", "subset"}:
+        return "compact"
+    if key in {"lazy_owned", "owned_full", "full_owned"}:
+        return "lazy_owned"
+    if key in {"lazy", "lazy_full", "full", "mask"}:
+        return "lazy"
+    if key == "auto":
+        return "auto"
+    raise ValueError(f"Unsupported packed filter_mode: {mode!r}")
+
+
+def packed_preload_failure_state(prefix: str | None, reason: object) -> dict[str, Any]:
+    return {
+        "_packed_preload_disabled": True,
+        "prefix": "" if prefix is None else str(prefix),
+        "reason": str(reason),
+    }
+
+
+def packed_preload_is_disabled(obj: object) -> bool:
+    return isinstance(obj, dict) and bool(obj.get("_packed_preload_disabled", False))
+
+
+def packed_preload_is_ready(obj: object) -> bool:
+    return (
+        isinstance(obj, dict)
+        and (not packed_preload_is_disabled(obj))
+        and isinstance(obj.get("packed_ctx"), dict)
+    )
+
+
+def packed_preload_reason(obj: object) -> str:
+    if isinstance(obj, dict):
+        return str(obj.get("reason", ""))
+    return ""
+
+
+def _raise_packed_prepare_error(
+    plink_prefix: str,
+    attempt_errors: list[tuple[str, Exception]],
+) -> None:
+    if len(attempt_errors) == 0:
+        raise RuntimeError(packed_prepare_failed_message(plink_prefix, None))
+    last_ex = attempt_errors[-1][1]
+    raise RuntimeError(packed_prepare_failed_message(plink_prefix, attempt_errors)) from last_ex
+
+
+def packed_meta_active_row_idx(meta: dict[str, Any]) -> np.ndarray:
+    raw = meta.get("active_row_idx", None)
+    if raw is not None:
+        arr = np.ascontiguousarray(np.asarray(raw, dtype=np.int64).reshape(-1), dtype=np.int64)
+        if arr.size > 0:
+            return arr
+    site_keep_raw = meta.get("site_keep", None)
+    if site_keep_raw is not None:
+        site_keep = np.ascontiguousarray(
+            np.asarray(site_keep_raw, dtype=np.bool_).reshape(-1),
+            dtype=np.bool_,
+        )
+        return np.ascontiguousarray(
+            np.flatnonzero(site_keep).astype(np.int64, copy=False),
+            dtype=np.int64,
+        )
+    n = int(meta.get("n_active_sites", 0) or 0)
+    return np.ascontiguousarray(np.arange(max(0, n), dtype=np.int64), dtype=np.int64)
+
+
+def packed_meta_filter_param_tag(
+    *,
+    maf: float,
+    missing_rate: float,
+    het_threshold: float,
+    snps_only: bool,
+) -> str:
+    return (
+        f".maf{format_grm_cache_num(float(maf))}"
+        f".geno{format_grm_cache_num(float(missing_rate))}"
+        f".het{format_grm_cache_num(float(het_threshold))}"
+        f".snp{1 if bool(snps_only) else 0}"
+    )
+
+
+def packed_meta_cache_prefix(
+    prefix: str,
+    *,
+    maf: float,
+    missing_rate: float,
+    het_threshold: float = 0.0,
+    snps_only: bool = False,
+    cache_dir: str | None = None,
+    logger: Any = None,
+    warning_collector: list[str] | None = None,
+) -> str:
+    plink_prefix = normalize_plink_prefix(prefix)
+    base = _shared_genotype_cache_prefix(
+        plink_prefix,
+        snps_only=bool(snps_only),
+        cache_dir=cache_dir,
+        logger=logger,
+        warning_collector=warning_collector,
+    )
+    return (
+        f"{base}"
+        f"{packed_meta_filter_param_tag(maf=float(maf), missing_rate=float(missing_rate), het_threshold=float(het_threshold), snps_only=bool(snps_only))}"
+    )
+
+
+def _packed_meta_cache_paths(cache_prefix: str) -> dict[str, str]:
+    stem = f"{cache_prefix}.pmeta"
+    return {
+        "json": f"{stem}.json",
+        "site_keep": f"{stem}.site_keep.npy",
+        "row_missing": f"{stem}.row_missing.npy",
+        "row_maf": f"{stem}.row_maf.npy",
+        "row_flip": f"{stem}.row_flip.npy",
+        "std_denom": f"{stem}.std_denom.npy",
+        "dom_af": f"{stem}.dom_af.npy",
+    }
+
+
+def _packed_meta_required_keys(layer: str) -> tuple[str, ...]:
+    key = str(layer).strip().lower()
+    if key == "basic":
+        return ("site_keep", "row_missing", "row_maf", "row_flip")
+    if key == "std":
+        return ("site_keep", "row_missing", "row_maf", "row_flip", "std_denom")
+    if key == "dom":
+        return ("site_keep", "row_missing", "row_maf", "row_flip", "std_denom", "dom_af")
+    raise ValueError(f"Unsupported packed meta layer: {layer!r}")
+
+
+def _atomic_save_npy(path: str, arr: np.ndarray) -> None:
+    tmp = f"{path}.tmp.{os.getpid()}.npy"
+    np.save(tmp, np.asarray(arr))
+    os.replace(tmp, path)
+
+
+def _atomic_save_json(path: str, payload: dict[str, Any]) -> None:
+    tmp = f"{path}.tmp.{os.getpid()}.json"
+    with open(tmp, "w", encoding="utf-8") as fw:
+        json.dump(payload, fw, indent=2, sort_keys=True)
+        fw.write("\n")
+    os.replace(tmp, path)
+
+
+def _load_npy_checked(path: str, *, dtype: np.dtype | type) -> np.ndarray:
+    return np.ascontiguousarray(np.asarray(np.load(path), dtype=dtype).reshape(-1), dtype=dtype)
+
+
+def _build_packed_meta_context(
+    *,
+    source_prefix: str,
+    n_samples: int,
+    row_missing: np.ndarray,
+    row_maf: np.ndarray,
+    row_flip: np.ndarray,
+    site_keep: np.ndarray,
+    std_denom: np.ndarray | None = None,
+    dom_af: np.ndarray | None = None,
+) -> dict[str, Any]:
+    active_row_idx = np.ascontiguousarray(
+        np.flatnonzero(site_keep).astype(np.int64, copy=False),
+        dtype=np.int64,
+    )
+    ctx: dict[str, Any] = {
+        "missing_rate": np.ascontiguousarray(np.asarray(row_missing, dtype=np.float32).reshape(-1), dtype=np.float32),
+        "af": np.ascontiguousarray(np.asarray(row_maf, dtype=np.float32).reshape(-1), dtype=np.float32),
+        "maf": np.ascontiguousarray(np.asarray(row_maf, dtype=np.float32).reshape(-1), dtype=np.float32),
+        "row_flip": np.ascontiguousarray(np.asarray(row_flip, dtype=np.bool_).reshape(-1), dtype=np.bool_),
+        "site_keep": np.ascontiguousarray(np.asarray(site_keep, dtype=np.bool_).reshape(-1), dtype=np.bool_),
+        "active_row_idx": active_row_idx,
+        "n_samples": int(n_samples),
+        "n_total_sites": int(np.asarray(site_keep).reshape(-1).shape[0]),
+        "n_active_sites": int(active_row_idx.shape[0]),
+        "packed_filter_mode": "stats_only",
+        "packed_storage": "metadata",
+        "source_prefix": str(source_prefix),
+    }
+    if std_denom is not None:
+        ctx["std_denom"] = np.ascontiguousarray(
+            np.asarray(std_denom, dtype=np.float32).reshape(-1),
+            dtype=np.float32,
+        )
+    if dom_af is not None:
+        ctx["dom_af"] = np.ascontiguousarray(
+            np.asarray(dom_af, dtype=np.float32).reshape(-1),
+            dtype=np.float32,
+        )
+    return ctx
+
+
+def _load_cached_packed_meta(
+    *,
+    cache_prefix: str,
+    layer: str,
+    source_prefix: str,
+    expected_n_samples: int | None,
+) -> dict[str, Any] | None:
+    paths = _packed_meta_cache_paths(cache_prefix)
+    json_path = paths["json"]
+    if not os.path.isfile(json_path):
+        return None
+    try:
+        with open(json_path, "r", encoding="utf-8") as fr:
+            meta_info = json.load(fr)
+    except Exception:
+        return None
+    if int(meta_info.get("version", -1)) != int(PACKED_META_CACHE_VERSION):
+        return None
+    current_source_mtime = latest_genotype_mtime(str(source_prefix))
+    cached_source_mtime = meta_info.get("source_mtime", None)
+    if (
+        current_source_mtime is not None
+        and cached_source_mtime is not None
+        and float(cached_source_mtime) + 1e-9 < float(current_source_mtime)
+    ):
+        return None
+    n_samples_cached = meta_info.get("n_samples", None)
+    if expected_n_samples is not None and n_samples_cached is not None:
+        if int(n_samples_cached) != int(expected_n_samples):
+            return None
+    required = _packed_meta_required_keys(layer)
+    if any(not os.path.isfile(paths[key]) for key in required):
+        return None
+    try:
+        row_missing = _load_npy_checked(paths["row_missing"], dtype=np.float32)
+        row_maf = _load_npy_checked(paths["row_maf"], dtype=np.float32)
+        row_flip = _load_npy_checked(paths["row_flip"], dtype=np.bool_)
+        site_keep = _load_npy_checked(paths["site_keep"], dtype=np.bool_)
+        std_denom = (
+            _load_npy_checked(paths["std_denom"], dtype=np.float32)
+            if "std_denom" in required
+            else None
+        )
+        dom_af = (
+            _load_npy_checked(paths["dom_af"], dtype=np.float32)
+            if "dom_af" in required
+            else None
+        )
+    except Exception:
+        return None
+
+    n_total = int(site_keep.shape[0])
+    for _arr_name, arr in (
+        ("row_missing", row_missing),
+        ("row_maf", row_maf),
+        ("row_flip", row_flip),
+        ("std_denom", std_denom),
+        ("dom_af", dom_af),
+    ):
+        if arr is None:
+            continue
+        if int(arr.shape[0]) != n_total:
+            return None
+    return _build_packed_meta_context(
+        source_prefix=str(source_prefix),
+        n_samples=int(meta_info.get("n_samples", expected_n_samples or 0)),
+        row_missing=row_missing,
+        row_maf=row_maf,
+        row_flip=row_flip,
+        site_keep=site_keep,
+        std_denom=std_denom,
+        dom_af=dom_af,
+    )
+
+
+def _save_packed_meta_cache(
+    *,
+    cache_prefix: str,
+    layer: str,
+    source_prefix: str,
+    ctx: dict[str, Any],
+) -> None:
+    paths = _packed_meta_cache_paths(cache_prefix)
+    required = _packed_meta_required_keys(layer)
+    _atomic_save_npy(paths["site_keep"], np.asarray(ctx["site_keep"], dtype=np.bool_))
+    _atomic_save_npy(paths["row_missing"], np.asarray(ctx["missing_rate"], dtype=np.float32))
+    _atomic_save_npy(paths["row_maf"], np.asarray(ctx["maf"], dtype=np.float32))
+    _atomic_save_npy(paths["row_flip"], np.asarray(ctx["row_flip"], dtype=np.bool_))
+    if "std_denom" in required:
+        _atomic_save_npy(paths["std_denom"], np.asarray(ctx["std_denom"], dtype=np.float32))
+    if "dom_af" in required:
+        _atomic_save_npy(paths["dom_af"], np.asarray(ctx["dom_af"], dtype=np.float32))
+    layer_order = ["basic"]
+    if layer in {"std", "dom"}:
+        layer_order.append("std")
+    if layer == "dom":
+        layer_order.append("dom")
+    _atomic_save_json(
+        paths["json"],
+        {
+            "version": int(PACKED_META_CACHE_VERSION),
+            "source_prefix": str(source_prefix),
+            "source_mtime": latest_genotype_mtime(str(source_prefix)),
+            "n_samples": int(ctx.get("n_samples", 0) or 0),
+            "n_total_sites": int(ctx.get("n_total_sites", 0) or 0),
+            "n_active_sites": int(ctx.get("n_active_sites", 0) or 0),
+            "layers": layer_order,
+        },
+    )
+
+
+def _build_packed_meta_layer(
+    prefix: str,
+    *,
+    sample_ids_arr: np.ndarray,
+    maf: float,
+    missing_rate: float,
+    het_threshold: float,
+    snps_only: bool,
+    layer: str,
+) -> dict[str, Any]:
+    plink_prefix = normalize_plink_prefix(prefix)
+    n_expected = int(sample_ids_arr.shape[0])
+    want_std = str(layer).strip().lower() in {"std", "dom"}
+    want_dom = str(layer).strip().lower() == "dom"
+
+    if scan_bed_2bit_packed_stats is not None:
+        miss_raw, maf_raw, std_raw, row_flip_raw, het_raw, packed_n = scan_bed_2bit_packed_stats(
+            str(plink_prefix)
+        )
+        if int(packed_n) != n_expected:
+            raise ValueError(
+                packed_sample_size_mismatch_message(
+                    expected_n=int(n_expected),
+                    got_n=int(packed_n),
+                )
+            )
+        miss_arr = np.ascontiguousarray(np.asarray(miss_raw, dtype=np.float32).reshape(-1), dtype=np.float32)
+        maf_minor = np.ascontiguousarray(np.asarray(maf_raw, dtype=np.float32).reshape(-1), dtype=np.float32)
+        row_flip_input = np.ascontiguousarray(
+            np.asarray(row_flip_raw, dtype=np.bool_).reshape(-1),
+            dtype=np.bool_,
+        )
+        row_maf = np.ascontiguousarray(
+            np.where(row_flip_input, 1.0 - maf_minor, maf_minor).astype(np.float32, copy=False),
+            dtype=np.float32,
+        )
+        row_flip = np.zeros_like(row_flip_input, dtype=np.bool_)
+        std_arr = (
+            np.ascontiguousarray(np.asarray(std_raw, dtype=np.float32).reshape(-1), dtype=np.float32)
+            if want_std
+            else None
+        )
+        het_arr = np.ascontiguousarray(np.asarray(het_raw, dtype=np.float32).reshape(-1), dtype=np.float32)
+        keep = np.ones((int(maf_minor.shape[0]),), dtype=np.bool_)
+        maf_thr = float(maf)
+        if maf_thr > 0.0:
+            keep &= (maf_minor >= maf_thr) & (maf_minor <= (1.0 - maf_thr))
+        miss_thr = float(missing_rate)
+        if miss_thr < 1.0:
+            keep &= miss_arr <= miss_thr
+        het_thr = float(het_threshold)
+        if het_thr > 0.0:
+            keep &= het_arr <= het_thr
+        if bool(snps_only):
+            snp_mask = plink_snp_mask(str(plink_prefix))
+            if snp_mask.shape[0] != keep.shape[0]:
+                raise ValueError(
+                    f"BIM SNP mask length mismatch: got {snp_mask.shape[0]}, expected {keep.shape[0]}"
+                )
+            keep &= snp_mask
+        if not np.any(keep):
+            raise ValueError(packed_no_snps_after_filter_message())
+        return _build_packed_meta_context(
+            source_prefix=str(plink_prefix),
+            n_samples=int(packed_n),
+            row_missing=miss_arr,
+            row_maf=row_maf,
+            row_flip=row_flip,
+            site_keep=np.ascontiguousarray(keep, dtype=np.bool_),
+            std_denom=std_arr,
+            dom_af=het_arr if want_dom else None,
+        )
+
+    packed_raw, miss_raw, maf_raw, std_raw, packed_n = load_bed_2bit_packed(str(plink_prefix))
+    if int(packed_n) != n_expected:
+        raise ValueError(
+            packed_sample_size_mismatch_message(
+                expected_n=int(n_expected),
+                got_n=int(packed_n),
+            )
+        )
+    packed = np.ascontiguousarray(np.asarray(packed_raw, dtype=np.uint8))
+    miss_arr = np.ascontiguousarray(np.asarray(miss_raw, dtype=np.float32).reshape(-1), dtype=np.float32)
+    row_maf = np.ascontiguousarray(np.asarray(maf_raw, dtype=np.float32).reshape(-1), dtype=np.float32)
+    std_arr = (
+        np.ascontiguousarray(np.asarray(std_raw, dtype=np.float32).reshape(-1), dtype=np.float32)
+        if want_std
+        else None
+    )
+    dom_arr = (
+        packed_row_het_rate(packed, int(packed_n))
+        if (want_dom or (float(het_threshold) > 0.0))
+        else None
+    )
+    keep = np.ones((int(row_maf.shape[0]),), dtype=np.bool_)
+    maf_thr = float(maf)
+    if maf_thr > 0.0:
+        keep &= (row_maf >= maf_thr) & (row_maf <= (1.0 - maf_thr))
+    miss_thr = float(missing_rate)
+    if miss_thr < 1.0:
+        keep &= miss_arr <= miss_thr
+    if float(het_threshold) > 0.0:
+        if dom_arr is None:
+            dom_arr = packed_row_het_rate(packed, int(packed_n))
+        keep &= dom_arr <= float(het_threshold)
+    if bool(snps_only):
+        snp_mask = plink_snp_mask(str(plink_prefix))
+        if snp_mask.shape[0] != keep.shape[0]:
+            raise ValueError(
+                f"BIM SNP mask length mismatch: got {snp_mask.shape[0]}, expected {keep.shape[0]}"
+            )
+        keep &= snp_mask
+    if not np.any(keep):
+        raise ValueError(packed_no_snps_after_filter_message())
+    return _build_packed_meta_context(
+        source_prefix=str(plink_prefix),
+        n_samples=int(packed_n),
+        row_missing=miss_arr,
+        row_maf=row_maf,
+        row_flip=np.zeros((int(row_maf.shape[0]),), dtype=np.bool_),
+        site_keep=np.ascontiguousarray(keep, dtype=np.bool_),
+        std_denom=std_arr,
+        dom_af=dom_arr if want_dom else None,
+    )
+
+
+def _load_or_build_packed_meta_layer(
+    prefix: str,
+    *,
+    maf: float,
+    missing_rate: float,
+    het_threshold: float = 0.0,
+    snps_only: bool = False,
+    expected_n_samples: int | None = None,
+    layer: str,
+    cache_dir: str | None = None,
+    logger: Any = None,
+    warning_collector: list[str] | None = None,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    plink_prefix = normalize_plink_prefix(prefix)
+    sample_ids, _ = inspect_genotype_file(str(plink_prefix))
+    sample_ids_arr = np.asarray(sample_ids, dtype=str)
+    if expected_n_samples is not None and int(expected_n_samples) != int(sample_ids_arr.shape[0]):
+        raise ValueError(
+            packed_expected_sample_size_mismatch_message(
+                expected_n=int(expected_n_samples),
+                got_n=int(sample_ids_arr.shape[0]),
+                source_prefix=str(plink_prefix),
+            )
+        )
+    cache_prefix = packed_meta_cache_prefix(
+        str(plink_prefix),
+        maf=float(maf),
+        missing_rate=float(missing_rate),
+        het_threshold=float(het_threshold),
+        snps_only=bool(snps_only),
+        cache_dir=cache_dir,
+        logger=logger,
+        warning_collector=warning_collector,
+    )
+    cached = _load_cached_packed_meta(
+        cache_prefix=str(cache_prefix),
+        layer=str(layer),
+        source_prefix=str(plink_prefix),
+        expected_n_samples=int(sample_ids_arr.shape[0]),
+    )
+    if cached is not None:
+        return sample_ids_arr, cached
+    with grm_cache_lock(str(cache_prefix)):
+        cached = _load_cached_packed_meta(
+            cache_prefix=str(cache_prefix),
+            layer=str(layer),
+            source_prefix=str(plink_prefix),
+            expected_n_samples=int(sample_ids_arr.shape[0]),
+        )
+        if cached is not None:
+            return sample_ids_arr, cached
+        built = _build_packed_meta_layer(
+            str(plink_prefix),
+            sample_ids_arr=sample_ids_arr,
+            maf=float(maf),
+            missing_rate=float(missing_rate),
+            het_threshold=float(het_threshold),
+            snps_only=bool(snps_only),
+            layer=str(layer),
+        )
+        _save_packed_meta_cache(
+            cache_prefix=str(cache_prefix),
+            layer=str(layer),
+            source_prefix=str(plink_prefix),
+            ctx=built,
+        )
+        return sample_ids_arr, built
+
+
+def load_or_build_packed_meta_basic(
+    prefix: str,
+    *,
+    maf: float,
+    missing_rate: float,
+    het_threshold: float = 0.0,
+    snps_only: bool = False,
+    expected_n_samples: int | None = None,
+    cache_dir: str | None = None,
+    logger: Any = None,
+    warning_collector: list[str] | None = None,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    return _load_or_build_packed_meta_layer(
+        prefix,
+        maf=float(maf),
+        missing_rate=float(missing_rate),
+        het_threshold=float(het_threshold),
+        snps_only=bool(snps_only),
+        expected_n_samples=expected_n_samples,
+        layer="basic",
+        cache_dir=cache_dir,
+        logger=logger,
+        warning_collector=warning_collector,
+    )
+
+
+def load_or_build_packed_meta_std(
+    prefix: str,
+    *,
+    maf: float,
+    missing_rate: float,
+    het_threshold: float = 0.0,
+    snps_only: bool = False,
+    expected_n_samples: int | None = None,
+    cache_dir: str | None = None,
+    logger: Any = None,
+    warning_collector: list[str] | None = None,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    return _load_or_build_packed_meta_layer(
+        prefix,
+        maf=float(maf),
+        missing_rate=float(missing_rate),
+        het_threshold=float(het_threshold),
+        snps_only=bool(snps_only),
+        expected_n_samples=expected_n_samples,
+        layer="std",
+        cache_dir=cache_dir,
+        logger=logger,
+        warning_collector=warning_collector,
+    )
+
+
+def load_or_build_packed_meta_dom(
+    prefix: str,
+    *,
+    maf: float,
+    missing_rate: float,
+    het_threshold: float = 0.0,
+    snps_only: bool = False,
+    expected_n_samples: int | None = None,
+    cache_dir: str | None = None,
+    logger: Any = None,
+    warning_collector: list[str] | None = None,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    return _load_or_build_packed_meta_layer(
+        prefix,
+        maf=float(maf),
+        missing_rate=float(missing_rate),
+        het_threshold=float(het_threshold),
+        snps_only=bool(snps_only),
+        expected_n_samples=expected_n_samples,
+        layer="dom",
+        cache_dir=cache_dir,
+        logger=logger,
+        warning_collector=warning_collector,
+    )
+
+
+def prepare_packed_ctx_from_plink(
+    prefix: str,
+    *,
+    maf: float,
+    missing_rate: float,
+    het_threshold: float = 0.0,
+    snps_only: bool = False,
+    expected_n_samples: int | None = None,
+    filter_mode: str = "compact",
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """
+    Load/filter PLINK BED into a packed context for packed/full-Rust GWAS routes.
+
+    The metadata/filter semantics are shared with the layered packed-meta cache in
+    this module. When the Rust-side compact loader is unavailable or when lazy
+    payload modes are requested, this function materializes the packed payload on
+    top of the same cached metadata layer.
+    """
+    filter_mode_key = normalize_packed_filter_mode(filter_mode)
+    plink_prefix = normalize_plink_prefix(prefix)
+    sample_ids, _ = inspect_genotype_file(str(plink_prefix))
+    sample_ids_arr = np.asarray(sample_ids, dtype=str)
+    attempt_errors: list[tuple[str, Exception]] = []
+
+    if expected_n_samples is not None and int(expected_n_samples) != int(sample_ids_arr.shape[0]):
+        raise ValueError(
+            packed_expected_sample_size_mismatch_message(
+                expected_n=int(expected_n_samples),
+                got_n=int(sample_ids_arr.shape[0]),
+                source_prefix=str(plink_prefix),
+            )
+        )
+
+    if (filter_mode_key == "compact") and (prepare_bed_2bit_packed is not None):
+        try:
+            (
+                packed_raw,
+                miss_raw,
+                maf_raw,
+                std_raw,
+                row_flip_raw,
+                site_keep_raw,
+                packed_n,
+                total_sites,
+            ) = prepare_bed_2bit_packed(
+                str(plink_prefix),
+                maf_threshold=float(maf),
+                max_missing_rate=float(missing_rate),
+                het_threshold=float(het_threshold),
+                snps_only=bool(snps_only),
+            )
+            if int(packed_n) != int(sample_ids_arr.shape[0]):
+                raise ValueError(
+                    packed_sample_size_mismatch_message(
+                        expected_n=int(sample_ids_arr.shape[0]),
+                        got_n=int(packed_n),
+                    )
+                )
+            packed_ctx: dict[str, Any] = {
+                "packed": np.ascontiguousarray(np.asarray(packed_raw, dtype=np.uint8)),
+                "missing_rate": np.ascontiguousarray(
+                    np.asarray(miss_raw, dtype=np.float32).reshape(-1),
+                    dtype=np.float32,
+                ),
+                "af": np.ascontiguousarray(
+                    np.asarray(maf_raw, dtype=np.float32).reshape(-1),
+                    dtype=np.float32,
+                ),
+                "maf": np.ascontiguousarray(
+                    np.asarray(maf_raw, dtype=np.float32).reshape(-1),
+                    dtype=np.float32,
+                ),
+                "std_denom": np.ascontiguousarray(
+                    np.asarray(std_raw, dtype=np.float32).reshape(-1),
+                    dtype=np.float32,
+                ),
+                "dom_af": np.ascontiguousarray(
+                    packed_row_het_rate(
+                        np.ascontiguousarray(np.asarray(packed_raw, dtype=np.uint8)),
+                        int(packed_n),
+                    ),
+                    dtype=np.float32,
+                ),
+                "row_flip": np.ascontiguousarray(
+                    np.asarray(row_flip_raw, dtype=np.bool_).reshape(-1),
+                    dtype=np.bool_,
+                ),
+                "site_keep": np.ascontiguousarray(
+                    np.asarray(site_keep_raw, dtype=np.bool_).reshape(-1),
+                    dtype=np.bool_,
+                ),
+                "n_samples": int(packed_n),
+                "n_total_sites": int(total_sites),
+                "n_active_sites": int(np.asarray(maf_raw).reshape(-1).shape[0]),
+                "active_row_idx": np.ascontiguousarray(
+                    np.flatnonzero(
+                        np.asarray(site_keep_raw, dtype=np.bool_).reshape(-1)
+                    ).astype(np.int64, copy=False),
+                    dtype=np.int64,
+                ),
+                "packed_filter_mode": "compact",
+                "packed_storage": "owned",
+                "source_prefix": str(plink_prefix),
+            }
+            return sample_ids_arr, packed_ctx
+        except Exception as ex:
+            attempt_errors.append(("prepare_bed_2bit_packed", ex))
+
+    try:
+        _sample_ids_meta, meta_ctx = load_or_build_packed_meta_dom(
+            str(plink_prefix),
+            maf=float(maf),
+            missing_rate=float(missing_rate),
+            het_threshold=float(het_threshold),
+            snps_only=bool(snps_only),
+            expected_n_samples=int(sample_ids_arr.shape[0]),
+        )
+        site_keep = np.ascontiguousarray(
+            np.asarray(meta_ctx["site_keep"], dtype=np.bool_).reshape(-1),
+            dtype=np.bool_,
+        )
+        keep_idx = packed_meta_active_row_idx(meta_ctx)
+        keep_ratio = (
+            float(keep_idx.shape[0]) / float(site_keep.shape[0])
+            if int(site_keep.shape[0]) > 0
+            else 0.0
+        )
+        use_lazy = False
+        if filter_mode_key in {"lazy", "lazy_owned"}:
+            use_lazy = True
+        elif filter_mode_key == "auto":
+            lazy_keep_ratio = float(
+                os.environ.get("JX_PACKED_LAZY_KEEP_RATIO", "0.98").strip() or "0.98"
+            )
+            if not np.isfinite(lazy_keep_ratio):
+                lazy_keep_ratio = 0.98
+            lazy_keep_ratio = min(1.0, max(0.0, lazy_keep_ratio))
+            use_lazy = bool(keep_ratio >= lazy_keep_ratio)
+
+        packed_memmap = open_plink_bed_payload_memmap(
+            str(plink_prefix),
+            n_samples=int(meta_ctx["n_samples"]),
+            n_snps=int(meta_ctx["n_total_sites"]),
+        )
+        if use_lazy:
+            if filter_mode_key == "lazy_owned":
+                packed_payload: np.ndarray = np.array(
+                    packed_memmap,
+                    dtype=np.uint8,
+                    order="C",
+                    copy=True,
+                )
+                packed_storage = "owned"
+            else:
+                packed_payload = packed_memmap
+                packed_storage = "memmap"
+            packed_ctx = dict(meta_ctx)
+            packed_ctx["packed"] = packed_payload
+            packed_ctx["packed_filter_mode"] = "lazy_full"
+            packed_ctx["packed_storage"] = packed_storage
+            return sample_ids_arr, packed_ctx
+
+        if bool(np.all(site_keep)):
+            packed = np.ascontiguousarray(
+                np.asarray(packed_memmap, dtype=np.uint8),
+                dtype=np.uint8,
+            )
+            packed_ctx = dict(meta_ctx)
+        else:
+            packed = np.ascontiguousarray(
+                np.asarray(packed_memmap[site_keep], dtype=np.uint8),
+                dtype=np.uint8,
+            )
+            packed_ctx = dict(meta_ctx)
+            packed_ctx["missing_rate"] = np.ascontiguousarray(
+                np.asarray(meta_ctx["missing_rate"], dtype=np.float32).reshape(-1)[site_keep],
+                dtype=np.float32,
+            )
+            packed_ctx["af"] = np.ascontiguousarray(
+                np.asarray(meta_ctx["af"], dtype=np.float32).reshape(-1)[site_keep],
+                dtype=np.float32,
+            )
+            packed_ctx["maf"] = np.ascontiguousarray(
+                np.asarray(meta_ctx["maf"], dtype=np.float32).reshape(-1)[site_keep],
+                dtype=np.float32,
+            )
+            packed_ctx["row_flip"] = np.ascontiguousarray(
+                np.asarray(meta_ctx["row_flip"], dtype=np.bool_).reshape(-1)[site_keep],
+                dtype=np.bool_,
+            )
+            if "std_denom" in meta_ctx:
+                packed_ctx["std_denom"] = np.ascontiguousarray(
+                    np.asarray(meta_ctx["std_denom"], dtype=np.float32).reshape(-1)[site_keep],
+                    dtype=np.float32,
+                )
+            if "dom_af" in meta_ctx:
+                packed_ctx["dom_af"] = np.ascontiguousarray(
+                    np.asarray(meta_ctx["dom_af"], dtype=np.float32).reshape(-1)[site_keep],
+                    dtype=np.float32,
+                )
+        packed_ctx["packed"] = packed
+        packed_ctx["active_row_idx"] = keep_idx
+        packed_ctx["packed_filter_mode"] = "compact"
+        packed_ctx["packed_storage"] = "owned"
+        return sample_ids_arr, packed_ctx
+    except Exception as ex:
+        attempt_errors.append(("load_or_build_packed_meta_dom", ex))
+        _raise_packed_prepare_error(str(plink_prefix), attempt_errors)
+
+
+def prepare_packed_stats_ctx_from_plink(
+    prefix: str,
+    *,
+    maf: float,
+    missing_rate: float,
+    het_threshold: float = 0.0,
+    snps_only: bool = False,
+    expected_n_samples: int | None = None,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """
+    Prepare packed BED filter metadata without attaching the packed payload.
+    """
+    return load_or_build_packed_meta_dom(
+        str(normalize_plink_prefix(prefix)),
+        maf=float(maf),
+        missing_rate=float(missing_rate),
+        het_threshold=float(het_threshold),
+        snps_only=bool(snps_only),
+        expected_n_samples=expected_n_samples,
+    )
 
 
 def read_id_file(

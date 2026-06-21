@@ -71,7 +71,17 @@ from janusx.script._common.threads import (  # noqa: E402
     require_openblas_by_default,
 )
 from janusx.script._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog  # noqa: E402
-from janusx.script._common.colspec import parse_zero_based_index_specs  # noqa: E402
+from janusx.script._common.cli import (  # noqa: E402
+    add_common_genotype_source_args,
+    add_common_out_arg,
+    add_common_pheno_arg,
+    add_common_prefix_arg,
+    add_common_thread_arg,
+    add_common_trait_selector_args,
+    add_common_variant_filter_args,
+    parse_trait_selector_specs,
+    resolve_trait_selectors,
+)  # noqa: E402
 from janusx.script._common.status import CliStatus, stdout_is_tty  # noqa: E402
 from janusx.script import sim as sim_mod  # noqa: E402
 from janusx.gfreader import convert_genotypes, inspect_genotype_file, load_genotype_chunks, save_genotype_streaming  # noqa: E402
@@ -577,25 +587,29 @@ def _read_table_guess(path: Path) -> pd.DataFrame:
     raise RuntimeError(f"Unable to parse table: {path}")
 
 
-def _read_pheno(path: Path, ncol: Optional[list[int]]) -> tuple[pd.DataFrame, str]:
+def _read_pheno(path: Path, ncol: Optional[list[object]]) -> tuple[pd.DataFrame, str]:
     df = _read_table_guess(path)
     if df.shape[1] < 2:
         raise ValueError("Phenotype file must contain sample ID and at least one trait column.")
     id_col = df.columns[0]
+    trait_cols = list(df.columns[1:])
     if ncol is None:
-        trait_col = df.columns[1]
+        trait_col = trait_cols[0]
     else:
         if len(ncol) == 0:
-            raise ValueError("`-n/--n` is empty. Provide one zero-based phenotype column index.")
+            raise ValueError("`-n/--n` is empty. Provide one phenotype selector.")
         if len(ncol) > 1:
-            raise ValueError("`jx gblupbench` currently supports one trait at a time; pass a single `-n/--n`.")
-        idx = int(ncol[0]) + 1
-        if idx < 1 or idx >= int(df.shape[1]):
+            raise ValueError("`jx gblupbench` currently supports one trait at a time; pass a single `-n/--n` selector.")
+        selected_cols, invalid_specs = resolve_trait_selectors(trait_cols, ncol, label="-n/--n")
+        if len(selected_cols) == 0:
             raise ValueError(
-                f"`-n/--n` out of range: {ncol[0]}. Valid range is 0..{int(df.shape[1]) - 2} "
-                "(zero-based phenotype columns, excluding sample ID)."
+                f"`-n/--n` not found: {ncol[0]}. Valid index range is 0..{int(df.shape[1]) - 2} "
+                f"or one of columns: {', '.join(str(c) for c in trait_cols[:10])}"
+                + (" ..." if len(trait_cols) > 10 else "")
             )
-        trait_col = df.columns[idx]
+        if len(invalid_specs) > 0:
+            raise ValueError(f"`-n/--n` not found: {invalid_specs[0]}")
+        trait_col = trait_cols[int(selected_cols[0])]
 
     out = pd.DataFrame(
         {
@@ -673,43 +687,32 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
 
     required_group = p.add_argument_group("Required arguments")
     g = required_group.add_mutually_exclusive_group(required=False)
-    g.add_argument("-bfile", "--bfile", type=str, help="Input PLINK prefix (.bed/.bim/.fam).")
-    g.add_argument("-vcf", "--vcf", type=str, help="Input VCF/VCF.GZ genotype.")
-    g.add_argument("-hmp", "--hmp", type=str, help="Input HMP/HMP.GZ genotype.")
-    g.add_argument("-file", "--file", type=str, help="Input text/NPY genotype matrix or prefix.")
-    required_group.add_argument("-p", "--pheno", required=False, type=str, help="Phenotype file (first col sample ID).")
+    add_common_genotype_source_args(g, include_file=True)
+    add_common_pheno_arg(required_group, required=False, help_text="Phenotype file (first col sample ID).")
 
     optional_group = p.add_argument_group("Optional arguments")
-    optional_group.add_argument(
-        "-n",
-        "--n",
-        action="extend",
-        nargs="+",
-        metavar="COL",
-        default=None,
-        type=str,
+    add_common_trait_selector_args(
+        optional_group,
         dest="ncol",
-        help=(
-            "Phenotype column(s), zero-based index (excluding sample ID), comma list, or numeric range. "
+        help_text=(
+            "Phenotype column selector, accepted as zero-based index (excluding sample ID), "
+            "column name, comma list, or numeric range. "
             "This benchmark currently supports one selected trait."
         ),
     )
-    optional_group.add_argument(
-        "--ncol",
-        action="extend",
-        nargs="+",
-        metavar="COL",
-        default=None,
-        type=str,
-        dest="ncol",
-        help=argparse.SUPPRESS,
+    add_common_out_arg(optional_group, default=".", help_profile="simple")
+    add_common_prefix_arg(optional_group, default="gblupbench", help_profile="simple")
+    add_common_variant_filter_args(
+        optional_group,
+        help_profile="short",
+        include_maf=True,
+        include_geno=True,
+        include_het=False,
+        maf_default=0.02,
+        geno_default=0.05,
     )
-    optional_group.add_argument("-o", "--out", default=".", type=str, help="Output directory.")
-    optional_group.add_argument("-prefix", "--prefix", default="gblupbench", type=str, help="Output prefix.")
-    optional_group.add_argument("-maf", "--maf", default=0.02, type=float, help="MAF filter (default: %(default)s).")
-    optional_group.add_argument("-geno", "--geno", default=0.05, type=float, help="Missing-rate filter (default: %(default)s).")
     optional_group.add_argument("-chunksize", "--chunksize", default=50_000, type=int, help="Genotype chunk size.")
-    optional_group.add_argument("-t", "--thread", default=detect_effective_threads(), type=int, help="Threads.")
+    add_common_thread_arg(optional_group, default_threads=detect_effective_threads(), help_profile="short")
     optional_group.add_argument(
         "-limit-mem",
         "--limit-mem",
@@ -770,7 +773,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         (tk == "-trait") or tk.startswith("-trait=") or (tk == "--trait") or tk.startswith("--trait=")
         for tk in tokens
     ):
-        p.error("`-trait/--trait` has been replaced by `-n/--n` (zero-based phenotype column index, excluding sample ID).")
+        p.error("`-trait/--trait` has been replaced by `-n/--n` (phenotype selector: zero-based index or column name, excluding sample ID).")
 
     args, extras = p.parse_known_args(argv)
     if len(extras) > 0:
@@ -794,11 +797,11 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
             )
 
     try:
-        args.ncol = parse_zero_based_index_specs(args.ncol, label="-n/--n")
+        args.ncol = parse_trait_selector_specs(args.ncol, label="-n/--n")
     except ValueError as e:
         p.error(str(e))
     if args.ncol is not None and len(args.ncol) > 1:
-        p.error("`jx gblupbench` currently supports one trait at a time; pass a single `-n/--n`.")
+        p.error("`jx gblupbench` currently supports one trait at a time; pass a single `-n/--n` selector.")
 
     if int(args.cv) < 2:
         p.error("--cv must be >= 2.")

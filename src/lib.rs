@@ -259,7 +259,10 @@ use reml::{
     ai_reml_multi_f64, ai_reml_null_f64, lmm_reml_null_f32, lmm_rotate_x_y_with_ut_f64,
     ml_loglike_null_f32,
 };
-use rrblup::rrblup_pcg_bed;
+use rrblup::{
+    rrblup_exact_snp_fit_prepared, rrblup_exact_snp_packed, rrblup_exact_snp_prepare_packed,
+    rrblup_pcg_bed, RrblupExactSnpCache,
+};
 use rsvd::py_rsvd_packed_subset;
 use sim::{sim_trait_accumulate_i8_f32, SimChunkGenerator, SimEngine, SimTraitAccumulator};
 use sim_g2p::g2p_simulate_py;
@@ -330,6 +333,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_class::<SimTraitAccumulator>()?;
     m.add_class::<SiteInfo>()?;
     m.add_class::<FvLmmAssocCache>()?;
+    m.add_class::<RrblupExactSnpCache>()?;
     m.add_class::<SparseOneHotBlupCache>()?;
     m.add_class::<PyMergeStats>()?;
     m.add_class::<PyConvertStats>()?;
@@ -433,6 +437,9 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(spreml_sparse_reml_brent_from_jxgrm, m)?)?;
     m.add_function(wrap_pyfunction!(king::king_unrelated_set_from_bed_py, m)?)?;
     m.add_function(wrap_pyfunction!(rrblup_pcg_bed, m)?)?;
+    m.add_function(wrap_pyfunction!(rrblup_exact_snp_prepare_packed, m)?)?;
+    m.add_function(wrap_pyfunction!(rrblup_exact_snp_fit_prepared, m)?)?;
+    m.add_function(wrap_pyfunction!(rrblup_exact_snp_packed, m)?)?;
     m.add_function(wrap_pyfunction!(gblup_reml_packed_bed, m)?)?;
     m.add_function(wrap_pyfunction!(gblup_effect_from_meta_stream, m)?)?;
     m.add_function(wrap_pyfunction!(rust_sgemm_backend, m)?)?;

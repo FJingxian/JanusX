@@ -51,13 +51,19 @@ from janusx.gs.workflow import (  # noqa: E402
     _ensure_packed_standard_stats_cached,
     _predict_bayes_packed_from_effects,
 )
-from janusx.script._common.genoio import determine_genotype_source  # noqa: E402
+from janusx.script._common.genoio import determine_genotype_source, prepare_packed_ctx_from_plink  # noqa: E402
 from janusx.script._common.helptext import (  # noqa: E402
     CliArgumentParser,
     cli_help_formatter,
     minimal_help_epilog,
 )
-from janusx.script._common.packedctx import prepare_packed_ctx_from_plink  # noqa: E402
+from janusx.script._common.cli import (  # noqa: E402
+    add_common_genotype_source_args,
+    add_common_snps_only_arg,
+    add_common_variant_filter_args,
+    parse_trait_selector_specs,
+    resolve_trait_selectors,
+)
 
 
 _METHOD_ALIASES = {
@@ -136,15 +142,15 @@ def _parse_row_blocks(raw: str) -> list[int | None]:
     return vals
 
 
-def _parse_single_trait_arg(raw: str | None) -> int | None:
+def _parse_single_trait_arg(raw: str | None) -> object | None:
     if raw is None:
         return None
-    tok = str(raw).strip()
-    if tok == "":
+    parsed = parse_trait_selector_specs([raw], label="-n/--n")
+    if parsed is None or len(parsed) == 0:
         return None
-    if "," in tok or ":" in tok:
-        raise ValueError("`-n/--n` for bayesbench currently accepts one zero-based trait index.")
-    return int(tok)
+    if len(parsed) > 1:
+        raise ValueError("`-n/--n` for bayesbench currently accepts one phenotype selector.")
+    return parsed[0]
 
 
 def _parse_seed_list(raw: str | None, chains: int, base_seed: int) -> list[int]:
@@ -408,26 +414,35 @@ def _read_table_guess(path: Path) -> pd.DataFrame:
     raise RuntimeError(f"Unable to parse table: {path}")
 
 
-def _read_pheno(path: Path, trait_idx: int | None, trait_name: str | None) -> tuple[pd.DataFrame, str]:
+def _read_pheno(path: Path, trait_selector: object | None, trait_name: str | None) -> tuple[pd.DataFrame, str]:
     df = _read_table_guess(path)
     if df.shape[1] < 2:
         raise ValueError("Phenotype file must contain sample ID and at least one trait column.")
-    if trait_idx is not None and trait_name is not None:
+    if trait_selector is not None and trait_name is not None:
         raise ValueError("Use either `-n/--n` or `--trait`, not both.")
     id_col = df.columns[0]
     if trait_name is not None:
         if trait_name not in df.columns:
             raise ValueError(f"Trait {trait_name!r} was not found in phenotype columns.")
         target_col = trait_name
-    elif trait_idx is None:
+    elif trait_selector is None:
         target_col = df.columns[1]
     else:
-        idx = int(trait_idx) + 1
-        if idx < 1 or idx >= int(df.shape[1]):
+        trait_cols = list(df.columns[1:])
+        selected_cols, invalid_specs = resolve_trait_selectors(
+            trait_cols,
+            [trait_selector],
+            label="-n/--n",
+        )
+        if len(selected_cols) == 0:
             raise ValueError(
-                f"`-n/--n` out of range: {trait_idx}. Valid range is 0..{int(df.shape[1]) - 2}."
+                f"`-n/--n` not found: {trait_selector}. Valid index range is 0..{int(df.shape[1]) - 2} "
+                f"or one of columns: {', '.join(str(c) for c in trait_cols[:10])}"
+                + (" ..." if len(trait_cols) > 10 else "")
             )
-        target_col = df.columns[idx]
+        if len(invalid_specs) > 0:
+            raise ValueError(f"`-n/--n` not found: {invalid_specs[0]}")
+        target_col = trait_cols[int(selected_cols[0])]
     out = pd.DataFrame(
         {
             "Taxa": df[id_col].astype(str).str.strip(),
@@ -485,7 +500,7 @@ def _resolve_rscript_bin(args: argparse.Namespace) -> str:
 
 
 def _load_builtin_wheat_dataset(args: argparse.Namespace) -> dict[str, Any]:
-    trait_idx = _parse_single_trait_arg(getattr(args, "ncol", None))
+    trait_selector = _parse_single_trait_arg(getattr(args, "ncol", None))
     trait_name = None if getattr(args, "trait", None) in {None, ""} else str(args.trait).strip()
     rscript_bin = _resolve_rscript_bin(args)
     with tempfile.TemporaryDirectory(prefix="jx_bayesbench_wheat_") as td:
@@ -526,15 +541,23 @@ def _load_builtin_wheat_dataset(args: argparse.Namespace) -> dict[str, Any]:
                 f"Valid names are: {', '.join(trait_labels)}."
             )
         target_idx = trait_labels.index(trait_name)
-    elif trait_idx is None:
+    elif trait_selector is None:
         target_idx = 0
     else:
-        target_idx = int(trait_idx)
-        if target_idx < 0 or target_idx >= int(y_mat.shape[1]):
+        selected_cols, invalid_specs = resolve_trait_selectors(
+            trait_labels,
+            [trait_selector],
+            label="-n/--n",
+        )
+        if len(selected_cols) == 0:
             raise ValueError(
-                f"`-n/--n` out of range for builtin wheat: {target_idx}. "
-                f"Valid range is 0..{int(y_mat.shape[1]) - 1}."
+                f"`-n/--n` not found for builtin wheat: {trait_selector}. "
+                f"Valid selectors are 0..{int(y_mat.shape[1]) - 1} or "
+                + ", ".join(trait_labels)
             )
+        if len(invalid_specs) > 0:
+            raise ValueError(f"`-n/--n` not found for builtin wheat: {invalid_specs[0]}")
+        target_idx = int(selected_cols[0])
     y = np.asarray(y_mat[:, target_idx], dtype=np.float64).reshape(-1)
     keep_samples = np.isfinite(y)
     if int(np.sum(keep_samples)) < 8:
@@ -656,10 +679,10 @@ def _load_real_dataset(args: argparse.Namespace) -> dict[str, Any]:
         max_snps=(None if getattr(args, "max_snps", None) is None else int(args.max_snps)),
         seed=int(getattr(args, "seed", 20260429)),
     )
-    trait_idx = _parse_single_trait_arg(getattr(args, "ncol", None))
+    trait_selector = _parse_single_trait_arg(getattr(args, "ncol", None))
     pheno_df, trait_name = _read_pheno(
         Path(str(args.pheno)).expanduser(),
-        trait_idx=trait_idx,
+        trait_selector=trait_selector,
         trait_name=(None if getattr(args, "trait", None) in {None, ""} else str(args.trait)),
     )
     pheno_map = {
@@ -2333,14 +2356,17 @@ def _build_parser() -> argparse.ArgumentParser:
     ):
         sp = sub.add_parser(name, help=help_text, formatter_class=cli_help_formatter())
         geno = sp.add_argument_group("Genotype Input")
-        geno.add_argument("-bfile", "--bfile", type=str, help="PLINK prefix (.bed/.bim/.fam).")
-        geno.add_argument("-vcf", "--vcf", type=str, help="VCF/VCF.GZ genotype input.")
-        geno.add_argument("-hmp", "--hmp", type=str, help="Hapmap genotype input.")
-        geno.add_argument("-file", "--file", type=str, help="Text genotype input.")
+        add_common_genotype_source_args(geno, help_profile="admixture")
         sp.add_argument("--builtin", choices=["wheat"], default=None, help="Use built-in BGLR benchmark dataset instead of genotype/pheno files.")
         sp.add_argument("-p", "--pheno", required=False, type=str, help="Phenotype table. Not required for `--builtin wheat`.")
-        sp.add_argument("-n", "--ncol", type=str, default=None, help="One zero-based phenotype column index.")
-        sp.add_argument("--trait", type=str, default=None, help="Trait column name in phenotype file.")
+        sp.add_argument(
+            "-n",
+            "--ncol",
+            type=str,
+            default=None,
+            help="One phenotype selector: zero-based index (excluding sample ID) or column name.",
+        )
+        sp.add_argument("--trait", type=str, default=None, help=argparse.SUPPRESS)
         sp.add_argument("--methods", default="BayesA,BayesB,BayesCpi", help="Comma list from BayesA,BayesB,BayesCpi.")
         sp.add_argument("--n-iter", type=int, default=50000, help="Total MCMC iterations.")
         sp.add_argument("--burnin", type=int, default=10000, help="Burn-in iterations.")
@@ -2355,9 +2381,21 @@ def _build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--s0-b", type=float, default=None, help="Optional marker prior scale S0_b.")
         sp.add_argument("--df0-e", type=float, default=5.0, help="Residual prior df0.")
         sp.add_argument("--s0-e", type=float, default=None, help="Optional residual prior scale S0_e.")
-        sp.add_argument("-maf", "--maf", type=float, default=0.02, help="MAF threshold for packed filtering.")
-        sp.add_argument("-geno", "--geno", type=float, default=0.05, help="Missing-rate threshold for packed filtering.")
-        sp.add_argument("--snps-only", action="store_true", default=False, help="Restrict to SNP sites when caching text/VCF input.")
+        add_common_variant_filter_args(
+            sp,
+            help_profile="packed_filter",
+            include_maf=True,
+            include_geno=True,
+            include_het=False,
+            maf_default=0.02,
+            geno_default=0.05,
+        )
+        add_common_snps_only_arg(
+            sp,
+            dest="snps_only",
+            default=False,
+            help_profile="packed_filter",
+        )
         sp.add_argument("--cache-input", action="store_true", default=True, help=argparse.SUPPRESS)
         sp.add_argument("--max-snps", type=int, default=None, help="Optional random cap on active SNPs after QC (0 disables).")
         sp.add_argument("--rscript", type=str, default=(shutil.which("Rscript") or "Rscript"), help="Rscript executable. Required for `--builtin wheat` and BGLR compare.")

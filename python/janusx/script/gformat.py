@@ -29,6 +29,7 @@ Notes
 
 from __future__ import annotations
 
+import argparse
 import os
 import socket
 import time
@@ -81,6 +82,12 @@ except Exception:
     _packed_prune_kernel_stats = None
 
 from ._common.config_render import emit_cli_configuration
+from ._common.cli import (
+    add_common_genotype_source_args,
+    add_common_out_arg,
+    add_common_prefix_arg,
+    add_common_thread_arg,
+)
 from ._common.genoio import (
     GENOTYPE_TEXT_SUFFIXES,
     build_prefix_candidates,
@@ -1729,29 +1736,15 @@ def build_parser() -> CliArgumentParser:
 
     req = parser.add_argument_group("Input Arguments")
     src = req.add_mutually_exclusive_group(required=True)
-    src.add_argument("-vcf", "--vcf", type=str, help="Input genotype file in VCF format (.vcf or .vcf.gz).")
-    src.add_argument("-hmp", "--hmp", type=str, help="Input genotype file in HMP format (.hmp or .hmp.gz).")
-    src.add_argument("-bfile", "--bfile", type=str, help="Input genotype in PLINK binary format (prefix for .bed/.bim/.fam).")
-    src.add_argument(
-        "-file",
-        "--file",
-        type=str,
-        help=(
-            "Input genotype numeric matrix (.txt/.tsv/.csv/.npy) or prefix. "
-            "Requires sibling prefix.id. Optional site metadata: prefix.bsite/prefix.site or prefix.bim."
-        ),
-    )
+    add_common_genotype_source_args(src, help_profile="gformat")
 
     opt = parser.add_argument_group("Optional Arguments")
-    opt.add_argument(
-        "-t",
-        "--thread",
-        "--threads",
-        dest="thread",
-        type=int,
-        default=detect_effective_threads(),
-        help="Number of CPU threads for packed Rust kernels (default: %(default)s).",
+    add_common_thread_arg(
+        opt,
+        default_threads=detect_effective_threads(),
+        help_profile="packed_rust",
     )
+    opt.add_argument("--threads", dest="thread", type=int, help=argparse.SUPPRESS)
     opt.add_argument(
         "-fmt",
         "--fmt",
@@ -1760,18 +1753,8 @@ def build_parser() -> CliArgumentParser:
         default="plink",
         help="Output genotype format: plink, vcf, hmp, txt, npy, gfd (default: plink).",
     )
-    opt.add_argument(
-        "-o",
-        "--out",
-        default=".",
-        help="Output directory for converted results (default: %(default)s).",
-    )
-    opt.add_argument(
-        "-prefix",
-        "--prefix",
-        default=None,
-        help="Output prefix (default: input basename).",
-    )
+    add_common_out_arg(opt, default=".", help_profile="converted_results")
+    add_common_prefix_arg(opt, default=None, help_profile="input_basename")
     opt.add_argument(
         "-maf",
         "--maf",

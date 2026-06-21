@@ -12,6 +12,12 @@ import numpy as np
 import pandas as pd
 
 from janusx.gfreader import prepare_cli_input_cache
+from ._common.cli import (
+    add_common_genotype_source_args,
+    add_common_out_arg,
+    add_common_prefix_arg,
+    add_common_thread_arg,
+)
 from ._common.config_render import emit_cli_configuration
 from ._common.genoio import determine_genotype_source
 from ._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog
@@ -475,18 +481,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     geno = parser.add_argument_group("Genotype input")
-    geno.add_argument("-bfile", "--bfile", type=str, help="PLINK prefix (.bed/.bim/.fam).")
-    geno.add_argument("-vcf", "--vcf", type=str, help="Input VCF/VCF.GZ; will be cached as BED before statistics.")
-    geno.add_argument("-hmp", "--hmp", type=str, help="Input HapMap/HMP(.gz); will be cached as BED before statistics.")
-    geno.add_argument(
-        "-file",
-        "--file",
-        type=str,
-        help=(
-            "Input genotype numeric matrix (.txt/.tsv/.csv/.npy/.bin) or prefix. "
-            "Requires sibling prefix.id; BED caching also requires prefix.site or prefix.bim."
-        ),
-    )
+    add_common_genotype_source_args(geno, include_file=True, help_profile="gstats")
 
     stats = parser.add_argument_group("Statistics")
     stats.add_argument("-freq", action="store_true", help="Write site MAF table: <prefix>.freq and a PDF histogram.")
@@ -514,17 +509,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     out = parser.add_argument_group("Output / runtime")
-    out.add_argument("-o", "--out", type=str, default=".", help="Output directory (default: current directory).")
-    out.add_argument("-prefix", "--prefix", type=str, default=None, help="Output prefix (default: inferred from input).")
+    add_common_out_arg(out, default=".", help_profile="current_dir")
+    add_common_prefix_arg(out, default=None, help_profile="inferred_input")
+    add_common_thread_arg(
+        out,
+        default_threads=max(1, int(detect_effective_threads())),
+        dest="threads",
+        help_profile="rust_auto",
+    )
     out.add_argument(
-        "-t",
-        "--thread",
         "--threads",
         "-threads",
         dest="threads",
         type=int,
-        default=max(1, int(detect_effective_threads())),
-        help="Thread count for Rust kernels (default: auto-detected).",
+        default=argparse.SUPPRESS,
+        help=argparse.SUPPRESS,
     )
     return parser
 

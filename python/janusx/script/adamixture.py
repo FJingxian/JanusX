@@ -30,6 +30,14 @@ from janusx.adamixture import ADAMixtureConfig, evaluate_adamixture_cverror, tra
 from janusx.adamixture.core import _admx_py_mem_debug, load_genotype_u8_matrix
 from janusx.gfreader import inspect_genotype_file
 from ._common.interrupt import force_exit
+from ._common.cli import (
+    add_common_genotype_source_args,
+    add_common_out_arg,
+    add_common_prefix_arg,
+    add_common_snps_only_arg,
+    add_common_thread_arg,
+    add_common_variant_filter_args,
+)
 from ._common.config_render import emit_cli_configuration
 from ._common.genoio import determine_genotype_source_from_args, strip_default_prefix_suffix
 from ._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog
@@ -1339,15 +1347,7 @@ def _build_parser() -> CliArgumentParser:
 
     req_geno = parser.add_argument_group("Required Genotype Input (Choose one)")
     geno = req_geno.add_mutually_exclusive_group(required=True)
-    geno.add_argument("-bfile", "--bfile", type=str, help="PLINK prefix (.bed/.bim/.fam).")
-    geno.add_argument("-vcf", "--vcf", type=str, help="VCF/VCF.GZ genotype file.")
-    geno.add_argument("-hmp", "--hmp", type=str, help="HMP/HMP.GZ genotype file.")
-    geno.add_argument(
-        "-file",
-        "--file",
-        type=str,
-        help="Text/NumPy genotype matrix prefix (requires sidecar .id).",
-    )
+    add_common_genotype_source_args(geno, include_file=True, help_profile="admixture")
     req_model = parser.add_argument_group("Required Nclusters")
     req_model.add_argument(
         "-k",
@@ -1360,14 +1360,8 @@ def _build_parser() -> CliArgumentParser:
         ),
     )
     input_output = parser.add_argument_group("Input/Output Arguments")
-    input_output.add_argument(
-        "-o",
-        "--out",
-        type=str,
-        default=".",
-        help="Output directory (default: current directory).",
-    )
-    input_output.add_argument("-prefix", "--prefix", type=str, default=None, help="Output prefix.")
+    add_common_out_arg(input_output, default=".", help_profile="current_dir")
+    add_common_prefix_arg(input_output, default=None, help_profile="simple")
     input_output.add_argument(
         "-tag",
         "--tag",
@@ -1391,35 +1385,26 @@ def _build_parser() -> CliArgumentParser:
         default=50000,
         help="Number of SNPs per loading chunk (default: 50000).",
     )
-    input_output.add_argument(
-        "-snps-only",
-        "--snps-only",
-        action="store_true",
+    add_common_snps_only_arg(
+        input_output,
+        dest="snps_only",
         default=False,
-        help="Input VCF/HMP: keep SNP variants only during loading.",
+        help_profile="loading_stage",
     )
-    input_output.add_argument(
-        "-maf",
-        "--maf",
-        type=float,
-        default=0.02,
-        help="Minor allele frequency threshold in loading stage (default: 0.02).",
-    )
-    input_output.add_argument(
-        "-geno",
-        "--geno",
-        type=float,
-        default=0.05,
-        help="Missing-rate threshold in loading stage (default: 0.05).",
+    add_common_variant_filter_args(
+        input_output,
+        help_profile="loading_stage",
+        include_maf=True,
+        include_geno=True,
+        include_het=False,
+        maf_default=0.02,
+        geno_default=0.05,
     )
     runtime = parser.add_argument_group("Runtime Arguments")
-    runtime.add_argument(
-        "-t",
-        "--thread",
+    add_common_thread_arg(
+        runtime,
+        default_threads=detect_effective_threads(),
         dest="thread",
-        type=int,
-        default=detect_effective_threads(),
-        help="Number of CPU threads (default: %(default)s).",
     )
     runtime.add_argument(
         "-threads",

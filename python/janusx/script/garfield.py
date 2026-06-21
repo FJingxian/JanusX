@@ -18,7 +18,18 @@ from janusx.assoc.workflow import (
 )
 from janusx.assoc.workflow_cache import _gwas_cache_prefix_with_params
 from janusx.gtools.reader import readanno
-from janusx.script._common.colspec import parse_zero_based_index_specs
+from janusx.script._common.cli import (
+    add_common_covariate_file_or_site_arg,
+    add_common_genotype_source_args,
+    add_common_grm_file_arg,
+    add_common_out_arg,
+    add_common_pheno_arg,
+    add_common_prefix_arg,
+    add_common_thread_arg,
+    add_common_trait_selector_args,
+    add_common_variant_filter_args,
+    parse_trait_selector_specs,
+)
 from janusx.script._common.config_render import emit_cli_configuration
 from janusx.script._common.genoio import determine_genotype_source_from_args as determine_genotype_source
 from janusx.script._common.genocache import configure_genotype_cache_from_out
@@ -628,8 +639,15 @@ def main() -> None:
     parser = CliArgumentParser(prog="jx garfield", formatter_class=cli_help_formatter())
 
     required_group = parser.add_argument_group("Required Arguments")
-    required_group.add_argument("-bfile", "--bfile", type=str, required=False, help="PLINK prefix (.bed/.bim/.fam).")
-    required_group.add_argument("-p", "--pheno", type=str, required=False, help="Phenotype file.")
+    add_common_genotype_source_args(
+        required_group,
+        include_vcf=False,
+        include_hmp=False,
+        include_file=False,
+        include_bfile=True,
+        help_profile="plink_prefix_short",
+    )
+    add_common_pheno_arg(required_group, required=False, help_text="Phenotype file.")
 
     optional_group = parser.add_argument_group("Optional Arguments")
     optional_group.add_argument(
@@ -658,30 +676,17 @@ def main() -> None:
         default=None,
         help=argparse.SUPPRESS,
     )
-    optional_group.add_argument(
-        "-n",
-        "--n",
-        action="extend",
-        nargs="+",
-        metavar="COL",
-        default=None,
-        type=str,
-        dest="ncol",
-        help=(
-            "Phenotype column(s), zero-based index (excluding sample ID), comma list (e.g. 0,2), "
-            "or numeric range (e.g. 0:2). Repeat this flag for multiple traits."
-        ),
-    )
-    optional_group.add_argument("--ncol", action="extend", nargs="+", metavar="COL", default=None, type=str, dest="ncol", help=argparse.SUPPRESS)
+    add_common_trait_selector_args(optional_group, dest="ncol")
     optional_group.add_argument("-ext", "--extension", type=int, default=100_000, help="Window extension in bp.")
     optional_group.add_argument("-step", "--step", dest="step", type=int, default=None, help="Window step size (default: extension/2).")
-    optional_group.add_argument("-maf", "--maf", type=float, default=0.02, help="Minor allele frequency threshold.")
-    optional_group.add_argument(
-        "-geno",
-        "--geno",
-        type=float,
-        default=0.05,
-        help="Maximum pure-line missing rate threshold; heterozygotes (1) and true missing (NA) are both counted as missing.",
+    add_common_variant_filter_args(
+        optional_group,
+        help_profile="pureline",
+        include_maf=True,
+        include_geno=True,
+        include_het=False,
+        maf_default=0.02,
+        geno_default=0.05,
     )
     optional_group.add_argument(
         "-dev",
@@ -689,28 +694,16 @@ def main() -> None:
         action="store_true",
         help="Deprecated compatibility flag. Under pure-line GARFIELD it aliases BIN encoding.",
     )
-    optional_group.add_argument(
-        "-k",
-        "--grm",
-        type=str,
+    add_common_grm_file_arg(
+        optional_group,
         default=None,
-        help="Optional precomputed GRM/kernel (.npy or text). If set, GARFIELD residualization uses this matrix on the aligned sample set instead of rebuilding GRM from BED.",
+        dest="grm",
+        help_profile="garfield_residualization",
     )
-    optional_group.add_argument(
-        "-c",
-        "--cov",
-        action="append",
-        type=str,
-        default=None,
+    add_common_covariate_file_or_site_arg(
+        optional_group,
         dest="cov_inputs",
-        help=(
-            "Additional covariate input (repeatable). Each -c accepts either: "
-            "(1) covariate file path, or "
-            "    covariate file format: first column sample ID, remaining columns numeric covariates; or "
-            "(2) single-site token chr:pos / chr:start:end (start must equal end, "
-            "supports full-width colon). "
-            "Examples: -c cov.tsv -c 1:1000 -c 1:1000:1000."
-        ),
+        default=None,
     )
     optional_group.add_argument(
         "-engine",
@@ -772,10 +765,10 @@ def main() -> None:
         help=argparse.SUPPRESS,
     )
     optional_group.add_argument("--seed", type=int, default=42, help="Random seed.")
-    optional_group.add_argument("-t", "--thread", dest="thread", type=int, default=detect_effective_threads(), help="CPU threads.")
+    add_common_thread_arg(optional_group, default_threads=detect_effective_threads(), help_profile="cpu_short")
     optional_group.add_argument("--threads", dest="thread", type=int, default=argparse.SUPPRESS, help=argparse.SUPPRESS)
-    optional_group.add_argument("-o", "--out", type=str, default=".", help="Output directory.")
-    optional_group.add_argument("-prefix", "--prefix", type=str, default=None, help="Output prefix.")
+    add_common_out_arg(optional_group, default=".", help_profile="simple")
+    add_common_prefix_arg(optional_group, default=None, help_profile="simple")
     optional_group.add_argument(
         "-simbench",
         "--simbench",
@@ -874,7 +867,7 @@ def main() -> None:
     args.gain_start_layer_runtime = 2
 
     try:
-        args.ncol = parse_zero_based_index_specs(args.ncol, label="-n/--n")
+        args.ncol = parse_trait_selector_specs(args.ncol, label="-n/--n")
     except ValueError as e:
         parser.error(str(e))
 

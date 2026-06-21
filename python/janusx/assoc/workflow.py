@@ -93,6 +93,30 @@ from janusx.pyBLUP.QK2 import QK
 from janusx import janusx as jxrs
 from janusx.script._common.log import setup_logging
 from janusx.script._common.config_render import emit_cli_configuration
+from janusx.script._common.cli import (
+    add_common_covariate_file_or_site_arg,
+    add_common_genotype_source_args,
+    add_common_grm_option_arg,
+    add_common_memory_arg,
+    add_common_out_arg,
+    add_common_pheno_arg,
+    add_common_prefix_arg,
+    add_common_snps_only_arg,
+    add_common_thread_arg,
+    add_common_trait_selector_args,
+    add_common_variant_filter_args,
+    parse_trait_selector_specs,
+)
+from janusx.script._common.genoio import (
+    genotype_load_status_done,
+    genotype_load_status_fail,
+    genotype_load_status_open,
+    genotype_load_status_progress,
+    packed_preload_failure_state,
+    packed_preload_is_disabled,
+    packed_preload_is_ready,
+    prepare_packed_ctx_from_plink,
+)
 from janusx.script._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 from janusx.script._common.pathcheck import (
     ensure_all_true,
@@ -134,6 +158,13 @@ from janusx.script._common.genoio import (
 from janusx.script._common.grmstable import (
     save_grm_npy_blocked,
 )
+from janusx.script._common.grmio import (
+    grm_load_status_done,
+    grm_load_status_fail,
+    grm_load_status_open,
+    grm_text_materialized_message,
+    load_or_materialize_square_grm_cache,
+)
 
 
 def _resolve_pyblup_assoc_symbol(name: str):
@@ -165,12 +196,6 @@ LMM2 = _LazyPyBlupAssocSymbol("LMM2")
 FastLMM = _LazyPyBlupAssocSymbol("FastLMM")
 FvLMM = _LazyPyBlupAssocSymbol("FvLMM")
 farmcpu = _LazyPyBlupAssocSymbol("farmcpu")
-from janusx.script._common.packedctx import (
-    packed_preload_failure_state,
-    packed_preload_is_disabled,
-    packed_preload_is_ready,
-    prepare_packed_ctx_from_plink,
-)
 
 from janusx.assoc.workflow_ui import (
     _format_progress_metric,
@@ -207,7 +232,6 @@ _SECTION_WIDTH = 80
 _REPORT_RULE = "=" * _SECTION_WIDTH
 _REPORT_SUBRULE = "-" * _SECTION_WIDTH
 _GWAS_PROGRESS_BAR_WIDTH = 30
-_GWAS_COL_RANGE_RE = re.compile(r"^\s*(\d+)\s*([:-])\s*(\d+)\s*$")
 
 
 def _format_farmcpu_threshold_display(v: object) -> str:
@@ -527,72 +551,6 @@ def _fastlmm_should_switch_to_lmm(pve: Optional[float]) -> bool:
     if not np.isfinite(v):
         return False
     return bool(v > _FASTLMM_PVE_HIGH)
-
-
-def _parse_gwas_pheno_col_specs(
-    values: Optional[list[object]],
-    *,
-    label: str = "-n/--n",
-) -> Optional[list[object]]:
-    """
-    Parse GWAS phenotype selectors from CLI.
-
-    Supported forms:
-      - zero-based column index: 0
-      - inclusive numeric range: 0:3 / 0-3
-      - column name: TraitA
-      - mixed use across repeated flags
-    """
-    if values is None:
-        return None
-
-    tokens: list[str] = []
-    for raw in values:
-        s = str(raw).strip()
-        if s == "":
-            continue
-        for part in s.split(","):
-            p = str(part).strip()
-            if p != "":
-                tokens.append(p)
-
-    if len(tokens) == 0:
-        return []
-
-    parsed: list[object] = []
-    for tk in tokens:
-        m = _GWAS_COL_RANGE_RE.match(tk)
-        if m is not None:
-            left = int(m.group(1))
-            right = int(m.group(3))
-            step = 1 if right >= left else -1
-            parsed.extend(int(i) for i in range(left, right + step, step))
-            continue
-        if tk.isdigit():
-            parsed.append(int(tk))
-            continue
-        parsed.append(tk)
-
-    out: list[object] = []
-    seen: set[tuple[str, str]] = set()
-    for item in parsed:
-        if isinstance(item, int):
-            if item < 0:
-                raise ValueError(
-                    f"Invalid {label} index: {item}. Indices must be >= 0 (zero-based)."
-                )
-            key = ("i", str(int(item)))
-            val: object = int(item)
-        else:
-            text = str(item).strip()
-            if text == "":
-                continue
-            key = ("s", text)
-            val = text
-        if key not in seen:
-            out.append(val)
-            seen.add(key)
-    return out
 
 
 def _mixed_model_switch_to_lm_decision(
@@ -1958,7 +1916,7 @@ def _inspect_genotype_with_status(
         # .bim/.fam inputs; use process-backed spinner so animation does not
         # freeze even when Rust/Python call path holds the GIL.
         with CliStatus(
-            f"Loading genotype from {src}...",
+            genotype_load_status_open(src),
             enabled=status_enabled,
             use_process=True,
         ) as task:
@@ -1972,12 +1930,18 @@ def _inspect_genotype_with_status(
                     force_kind=force_kind,
                 )
             except Exception:
-                task.fail(f"Loading genotype from {src} ...Failed")
+                task.fail(genotype_load_status_fail(src))
                 raise
-            task.complete(f"Loading genotype from {src} (n={len(ids)}, nSNP={n_snps})")
+            task.complete(
+                genotype_load_status_done(
+                    src,
+                    n_samples=len(ids),
+                    n_snps=int(n_snps),
+                )
+            )
         return np.asarray(ids, dtype=str), int(n_snps)
 
-    with CliStatus(f"Loading genotype from {src}...", enabled=status_enabled) as task:
+    with CliStatus(genotype_load_status_open(src), enabled=status_enabled) as task:
         out: dict[str, tuple[np.ndarray, int]] = {}
         err: dict[str, Exception] = {}
         warn_msgs: list[str] = []
@@ -1986,8 +1950,8 @@ def _inspect_genotype_with_status(
         plain_t0 = time.monotonic()
         last_wait_beat = plain_t0
         if plain_progress:
-            logger.info(f"Loading genotype from {src}... [{format_elapsed(0.0)}]")
-            last_plain_msg = f"Loading genotype from {src}..."
+            logger.info(f"{genotype_load_status_open(src)} [{format_elapsed(0.0)}]")
+            last_plain_msg = genotype_load_status_open(src)
             last_plain_emit = plain_t0
 
         def _emit_plain(msg: str, *, allow_same_after: float = 5.0) -> None:
@@ -2104,7 +2068,7 @@ def _inspect_genotype_with_status(
                         bim_progressed = True
                         if bim_count != last_count:
                             last_count = bim_count
-                            msg = f"Loading genotype from {src}... SNP={bim_count}"
+                            msg = genotype_load_status_progress(src, f"SNP={bim_count}")
                             task.desc = msg
                             _emit_plain(msg)
                 except Exception:
@@ -2115,7 +2079,7 @@ def _inspect_genotype_with_status(
                         bsz = int(os.path.getsize(bed_path))
                         if bsz != last_size:
                             last_size = bsz
-                            msg = f"Loading genotype from {src}... cache={_format_cache_size(bsz)}"
+                            msg = genotype_load_status_progress(src, f"cache={_format_cache_size(bsz)}")
                             task.desc = msg
                             _emit_plain(msg)
                     except Exception:
@@ -2125,7 +2089,7 @@ def _inspect_genotype_with_status(
                     sz = int(os.path.getsize(bed_path))
                     if sz != last_size:
                         last_size = sz
-                        msg = f"Loading genotype from {src}... cache={_format_cache_size(sz)}"
+                        msg = genotype_load_status_progress(src, f"cache={_format_cache_size(sz)}")
                         task.desc = msg
                         _emit_plain(msg)
                 except Exception:
@@ -2135,7 +2099,7 @@ def _inspect_genotype_with_status(
                     sz = int(os.path.getsize(npy_path))
                     if sz != last_size:
                         last_size = sz
-                        msg = f"Loading genotype from {src}... cache={_format_cache_size(sz)}"
+                        msg = genotype_load_status_progress(src, f"cache={_format_cache_size(sz)}")
                         task.desc = msg
                         _emit_plain(msg)
                 except Exception:
@@ -2143,7 +2107,7 @@ def _inspect_genotype_with_status(
             now = time.monotonic()
             if now - last_wait_beat >= 3.0:
                 dots = "." * (1 + (int((now - plain_t0) // 3) % 3))
-                wait_msg = f"Loading genotype from {src}... waiting{dots}"
+                wait_msg = genotype_load_status_progress(src, f"waiting{dots}")
                 task.desc = wait_msg
                 _emit_plain(wait_msg, allow_same_after=3.0)
                 last_wait_beat = now
@@ -2167,7 +2131,7 @@ def _inspect_genotype_with_status(
             except Exception:
                 pass
         if "value" in err:
-            task.fail(f"Loading genotype from {src} ...Failed")
+            task.fail(genotype_load_status_fail(src))
             raise err["value"]
 
         ids, n_snps = out["value"]
@@ -2176,8 +2140,14 @@ def _inspect_genotype_with_status(
         else:
             for wmsg in warn_msgs:
                 logger.warning(wmsg)
-        task.desc = f"Loading genotype from {src}... SNP={n_snps}"
-        task.complete(f"Loading genotype from {src} (n={len(ids)}, nSNP={n_snps})")
+        task.desc = genotype_load_status_progress(src, f"SNP={n_snps}")
+        task.complete(
+            genotype_load_status_done(
+                src,
+                n_samples=len(ids),
+                n_snps=int(n_snps),
+            )
+        )
         if _gwas_logger_verbose(logger):
             _log_info(logger, f"Genotype sites cached: {n_snps}", use_spinner=use_spinner)
         return ids, n_snps
@@ -2561,11 +2531,22 @@ def load_or_build_grm_with_cache(
                         except Exception:
                             pass
 
-            if os.path.exists(grm_path) and (not cache_is_stale):
-                src = _basename_only(grm_path)
-                with CliStatus(f"Loading GRM from {src}...", enabled=bool(use_spinner)) as task:
+            grm_cache_source: str | None = None
+            cached_grm = None
+            if not cache_is_stale:
+                cached_grm, grm_cache_source = load_or_materialize_square_grm_cache(
+                    grm_path,
+                    expected_n=int(n_samples),
+                    mmap_mode="r",
+                    expected_dtype=np.float32,
+                    npy_dtype=np.float32,
+                    cache_id_path=id_path,
+                )
+
+            if cached_grm is not None:
+                with CliStatus(grm_load_status_open(grm_path), enabled=bool(use_spinner)) as task:
                     try:
-                        grm = np.load(grm_path, mmap_mode='r')
+                        grm = cached_grm
                         grm = grm.reshape(n_samples, n_samples)
                         grm_ids = _read_id_file(
                             id_path,
@@ -2582,9 +2563,15 @@ def load_or_build_grm_with_cache(
                             raise ValueError(f"GRM must be square; got shape={grm.shape}")
                         eff_m = n_snps  # approximate; exact effective M not critical here
                     except Exception:
-                        task.fail(f"Loading GRM from {src} ...Failed")
+                        task.fail(grm_load_status_fail(grm_path))
                         raise
-                    task.complete(f"Loading GRM from {src} (n={grm.shape[0]})")
+                    task.complete(grm_load_status_done(grm_path, int(grm.shape[0])))
+                if str(grm_cache_source) == "txt->npy":
+                    _log_file_only(
+                        logger,
+                        logging.INFO,
+                        grm_text_materialized_message(grm_path),
+                    )
             else:
                 method_int = int(mgrm)
                 grm_calc_t0 = time.monotonic()
@@ -2646,8 +2633,7 @@ def load_or_build_grm_with_cache(
             msg = f"GRM file not found: {mgrm}"
             logger.error(msg)
             raise ValueError(msg)
-        src = _basename_only(mgrm)
-        with CliStatus(f"Loading GRM from {src}...", enabled=bool(use_spinner)) as task:
+        with CliStatus(grm_load_status_open(mgrm), enabled=bool(use_spinner)) as task:
             try:
                 if mgrm.endswith('.npy'):
                     grm = np.load(mgrm,mmap_mode='r')
@@ -2679,9 +2665,9 @@ def load_or_build_grm_with_cache(
                     raise ValueError(f"GRM must be square; got shape={grm.shape}")
                 eff_m = n_snps
             except Exception:
-                task.fail(f"Loading GRM from {src} ...Failed")
+                task.fail(grm_load_status_fail(mgrm))
                 raise
-            task.complete(f"Loading GRM from {src} (n={grm.shape[0]})")
+            task.complete(grm_load_status_done(mgrm, int(grm.shape[0])))
 
     if _gwas_logger_verbose(logger):
         _log_info(logger, f"GRM shape: {grm.shape}", use_spinner=use_spinner)
@@ -5395,30 +5381,12 @@ def parse_args(argv: Optional[list[str]] = None):
     required_group = parser.add_argument_group("Required arguments")
 
     geno_group = required_group.add_mutually_exclusive_group(required=False)
-    geno_group.add_argument(
-        "-vcf", "--vcf", type=str,
-        help="Input genotype file in VCF format (.vcf or .vcf.gz).",
-    )
-    geno_group.add_argument(
-        "-hmp", "--hmp", type=str,
-        help="Input genotype file in HMP format (.hmp or .hmp.gz).",
-    )
-    geno_group.add_argument(
-        "-file", "--file", type=str,
-        help=(
-            "Input genotype numeric matrix (.txt/.tsv/.csv/.npy) or prefix. "
-            "Requires sibling prefix.id. Optional site metadata: prefix.site or prefix.bim."
-        ),
-    )
-    geno_group.add_argument(
-        "-bfile", "--bfile", type=str,
-        help="Input genotype in PLINK binary format "
-             "(prefix for .bed, .bim, .fam).",
-    )
+    add_common_genotype_source_args(geno_group, include_file=True)
 
-    required_group.add_argument(
-        "-p", "--pheno", type=str, required=False,
-        help="Phenotype file (tab-delimited, sample IDs in the first column).",
+    add_common_pheno_arg(
+        required_group,
+        required=False,
+        help_text="Phenotype file (tab-delimited, sample IDs in the first column).",
     )
 
     models_group = parser.add_argument_group("Model Arguments")
@@ -5492,25 +5460,8 @@ def parse_args(argv: Optional[list[str]] = None):
     )
 
     optional_group = parser.add_argument_group("Optional Arguments")
-    optional_group.add_argument(
-        "-n", "--n", action="extend", nargs="+", metavar="COL",
-        default=None, type=str, dest="ncol",
-        help=(
-            "Phenotype column(s), accepted as zero-based index (excluding sample ID), "
-            "column name, comma list (e.g. 0,2 or TraitA,TraitB), "
-            "or numeric range (e.g. 0:2). "
-            "Repeat this flag for multiple traits."
-        ),
-    )
-    optional_group.add_argument(
-        "--ncol", action="extend", nargs="+", metavar="COL",
-        default=None, type=str, dest="ncol", help=argparse.SUPPRESS,
-    )
-    optional_group.add_argument(
-        "-k", "--grm", type=str, default="1",
-        help="GRM option: 1 (centering), 2 (standardization), "
-             "or a path to a precomputed GRM file (default: %(default)s).",
-    )
+    add_common_trait_selector_args(optional_group, dest="ncol")
+    add_common_grm_option_arg(optional_group, default="1", dest="grm")
     optional_group.add_argument(
         "-spk", "--grm-sparse", type=str, default="1", dest="grm_sparse",
         help="Sparse GRM option for SparseLMM (-splmm / -splmm-approx): "
@@ -5524,17 +5475,7 @@ def parse_args(argv: Optional[list[str]] = None):
             "For external covariates, use -c <file> (default: %(default)s)."
         ),
     )
-    optional_group.add_argument(
-        "-c", "--cov", action="append", type=str, default=None,
-        help=(
-            "Additional covariate input (repeatable). Each -c accepts either: "
-            "(1) covariate file path, or "
-            "    covariate file format: first column sample ID, remaining columns numeric covariates; or "
-            "(2) single-site token chr:pos / chr:start:end (start must equal end, "
-            "supports full-width colon). "
-            "Examples: -c cov.tsv -c 1:1000 -c 1:1000:1000."
-        ),
-    )
+    add_common_covariate_file_or_site_arg(optional_group, dest="cov", default=None)
     qtn_group = optional_group.add_mutually_exclusive_group(required=False)
     qtn_group.add_argument(
         "-qvcf", "--qtn-vcf", type=str, default=None,
@@ -5564,25 +5505,20 @@ def parse_args(argv: Optional[list[str]] = None):
             "Ignored by other models."
         ),
     )
-    optional_group.add_argument(
-        "-snps-only", "--snps-only", "-only-snps", "--only-snps", action="store_true", default=False,
-        help="Exclude non-SNP variants.",
+    add_common_snps_only_arg(
+        optional_group,
+        dest="snps_only",
+        default=False,
+        include_legacy_only_snps_aliases=True,
     )
-    optional_group.add_argument(
-        "-maf", "--maf", type=float, default=0.02,
-        help="Exclude variants with minor allele frequency lower than a threshold "
-             "(default: %(default)s).",
-    )
-    optional_group.add_argument(
-        "-geno", "--geno", type=float, default=0.05,
-        help="Exclude variants with missing call frequencies greater than a threshold "
-             "(default: %(default)s).",
-    )
-    optional_group.add_argument(
-        "-het", "--het", type=float, default=0.0,
-        help="Maximum allowed heterozygosity rate threshold. "
-             "Sites with het rate greater than this threshold are removed; 0 disables this filter "
-             "(default: %(default)s).",
+    add_common_variant_filter_args(
+        optional_group,
+        include_maf=True,
+        include_geno=True,
+        include_het=True,
+        maf_default=0.02,
+        geno_default=0.05,
+        het_default=0.0,
     )
     optional_group.add_argument(
         "--farmcpu-iter", type=int, default=30,
@@ -5619,16 +5555,12 @@ def parse_args(argv: Optional[list[str]] = None):
             if show_dev_help else argparse.SUPPRESS
         ),
     )
-    optional_group.add_argument(
-        "-mem", "--memory", type=float, default=DEFAULT_BED_MEMORY_GB,
-        help=(
-            "Target BED decode block size in GB for memmap/packed kernels. "
-            "This only controls per-block decode/window sizing, not global process memory "
-            "(default: %(default)s)."
-        ),
-    )
-    optional_group.add_argument(
-        "-memory", dest="memory", type=float, help=argparse.SUPPRESS
+    add_common_memory_arg(
+        optional_group,
+        default=DEFAULT_BED_MEMORY_GB,
+        help_profile="gwas_decode",
+        dest="memory",
+        include_hidden_legacy_single_dash_alias=True,
     )
     optional_group.add_argument(
         "-force-model", "--force-model", action="store_true", default=False,
@@ -5637,18 +5569,9 @@ def parse_args(argv: Optional[list[str]] = None):
             "fixed-variance/mixed-model fallback switching."
         ),
     )
-    optional_group.add_argument(
-        "-t", "--thread", type=int, default=detect_effective_threads(),
-        help="Number of CPU threads (default: %(default)s).",
-    )
-    optional_group.add_argument(
-        "-o", "--out", type=str, default=".",
-        help="Output directory for results (default: %(default)s).",
-    )
-    optional_group.add_argument(
-        "-prefix", "--prefix", type=str, default=None,
-        help="Prefix for output files (default: %(default)s).",
-    )
+    add_common_thread_arg(optional_group, default_threads=detect_effective_threads())
+    add_common_out_arg(optional_group, default=".")
+    add_common_prefix_arg(optional_group, default=None)
     optional_group.add_argument(
         "-v", "--verbose", action="store_true", default=False,
         help="Show advanced diagnostics and configuration details at the end of the report.",
@@ -5676,7 +5599,7 @@ def parse_args(argv: Optional[list[str]] = None):
     if len(extras) > 0:
         parser.error("unrecognized arguments: " + " ".join(extras))
     try:
-        args.ncol = _parse_gwas_pheno_col_specs(args.ncol, label="-n/--n")
+        args.ncol = parse_trait_selector_specs(args.ncol, label="-n/--n")
     except ValueError as e:
         parser.error(str(e))
     try:

@@ -17,10 +17,10 @@ Implementation:
   - SNPs are filtered by MAF and missing rate inside Rust kernels.
 
 Output:
-  - {prefix}.cGRM.txt / {prefix}.sGRM.txt    : GRM as plain text (if --npy is not used)
-  - {prefix}.cGRM.txt.id / {prefix}.sGRM.txt.id : sample IDs for text GRM
-  - {prefix}.cGRM.npy / {prefix}.sGRM.npy    : binary GRM (if --npy is used)
+  - {prefix}.cGRM.npy / {prefix}.sGRM.npy       : binary GRM (default)
   - {prefix}.cGRM.npy.id / {prefix}.sGRM.npy.id : sample IDs for NPY GRM
+  - {prefix}.cGRM.txt / {prefix}.sGRM.txt       : GRM as plain text (if --txt is used)
+  - {prefix}.cGRM.txt.id / {prefix}.sGRM.txt.id : sample IDs for text GRM
 """
 
 import os
@@ -41,6 +41,15 @@ from janusx.gfreader import (
     prepare_cli_input_cache,
 )
 from ._common.log import setup_logging
+from ._common.cli import (
+    add_common_genotype_source_args,
+    add_common_memory_arg,
+    add_common_out_arg,
+    add_common_prefix_arg,
+    add_common_snps_only_arg,
+    add_common_thread_arg,
+    add_common_variant_filter_args,
+)
 from ._common.config_render import emit_cli_configuration
 from ._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 from ._common.pathcheck import (
@@ -53,7 +62,12 @@ from ._common.pathcheck import (
 from ._common.progress import ProgressAdapter
 from ._common.status import CliStatus, format_elapsed, log_success
 from ._common.genocache import configure_genotype_cache_from_out
-from ._common.genoio import determine_genotype_source as _determine_genotype_source
+from ._common.genoio import (
+    determine_genotype_source as _determine_genotype_source,
+    genotype_load_status_done,
+    genotype_load_status_fail,
+    genotype_load_status_open,
+)
 from ._common.threads import (
     apply_blas_thread_env,
     detect_rust_blas_backend,
@@ -173,6 +187,7 @@ def _resolve_rust_grm_input(
     from_vcf: bool,
     from_hmp: bool,
     from_file: bool,
+    snps_only: bool,
 ) -> str:
     if _is_plink_prefix_path(str(genofile)):
         p = str(genofile).strip()
@@ -187,7 +202,7 @@ def _resolve_rust_grm_input(
     delim = "," if (from_file and str(genofile).lower().endswith(".csv")) else None
     cached = prepare_cli_input_cache(
         str(genofile),
-        snps_only=bool(from_vcf),
+        snps_only=bool(snps_only),
         delimiter=delim,
         prefer_plink_for_txt=True,
     )
@@ -261,14 +276,7 @@ def _write_sparse_grm_meta(
         json.dump(meta, fh, ensure_ascii=True, sort_keys=True)
 
 
-def _select_cli_grm_backend(*, fast: bool = False) -> tuple[str, str]:
-    if bool(fast):
-        if _grm_packed_bed_f32 is not None:
-            return ("packed-bed", "fast flag: force packed BED backend")
-        raise RuntimeError(
-            "Packed BED GRM kernel is unavailable. Rebuild JanusX extension to export "
-            "`grm_packed_bed_f32`."
-        )
+def _select_cli_grm_backend() -> tuple[str, str]:
     if _grm_stream_bed_f32 is not None:
         return ("memmap-bed", "full-sample GRM build")
     if _grm_packed_bed_f32 is not None:
@@ -286,6 +294,8 @@ def build_grm_streaming(
     method: int,
     maf_threshold: float,
     max_missing_rate: float,
+    het_threshold: float,
+    snps_only: bool,
     block_rows: int,
     mmap_window_mb: Union[int , None],
     threads: int,
@@ -364,6 +374,8 @@ def build_grm_streaming(
                     method=int(method),
                     maf_threshold=float(maf_threshold),
                     max_missing_rate=float(max_missing_rate),
+                    het_threshold=float(het_threshold),
+                    snps_only=bool(snps_only),
                     block_cols=max(1, int(block_rows)),
                     threads=max(1, int(threads)),
                     progress_callback=_progress_cb,
@@ -403,6 +415,8 @@ def build_grm_streaming_to_npy(
     method: int,
     maf_threshold: float,
     max_missing_rate: float,
+    het_threshold: float,
+    snps_only: bool,
     block_rows: int,
     mmap_window_mb: Union[int, None],
     threads: int,
@@ -457,6 +471,8 @@ def build_grm_streaming_to_npy(
                     method=int(method),
                     maf_threshold=float(maf_threshold),
                     max_missing_rate=float(max_missing_rate),
+                    het_threshold=float(het_threshold),
+                    snps_only=bool(snps_only),
                     block_cols=max(1, int(block_rows)),
                     threads=max(1, int(threads)),
                     progress_callback=_progress_cb,
@@ -494,6 +510,8 @@ def build_grm_packed_bed(
     method: int,
     maf_threshold: float,
     max_missing_rate: float,
+    het_threshold: float,
+    snps_only: bool,
     block_rows: int,
     threads: int,
     memory_mb: Union[float, None],
@@ -541,6 +559,8 @@ def build_grm_packed_bed(
                     method=int(method),
                     maf_threshold=float(maf_threshold),
                     max_missing_rate=float(max_missing_rate),
+                    het_threshold=float(het_threshold),
+                    snps_only=bool(snps_only),
                     block_cols=max(1, int(block_rows)),
                     threads=max(1, int(threads)),
                     progress_callback=_progress_cb,
@@ -581,6 +601,8 @@ def build_sparse_grm_packed_bed(
     kinship_cutoff: float,
     maf_threshold: float,
     max_missing_rate: float,
+    het_threshold: float,
+    snps_only: bool,
     chunk_size: int,
     mmap_window_mb: Union[int, None],
     threads: int,
@@ -638,8 +660,8 @@ def build_sparse_grm_packed_bed(
                     threshold=float(kinship_cutoff),
                     maf_threshold=float(maf_threshold),
                     max_missing_rate=float(max_missing_rate),
-                    het_threshold=0.0,
-                    snps_only=False,
+                    het_threshold=float(het_threshold),
+                    snps_only=bool(snps_only),
                     block_rows=0,
                     sample_block=0,
                     threads=max(1, int(threads)),
@@ -742,7 +764,8 @@ def main(log: bool = True):
         epilog=minimal_help_epilog([
             "jx grm -vcf geno.vcf.gz -o outdir -prefix demo",
             "jx grm -hmp geno.hmp.gz -o outdir -prefix demo",
-            "jx grm -bfile geno_prefix -m 1 --npy",
+            "jx grm -bfile geno_prefix -m 1",
+            "jx grm -bfile geno_prefix -m 1 --txt",
         ]),
     )
 
@@ -751,26 +774,7 @@ def main(log: bool = True):
     # ------------------------------------------------------------------
     required_group = parser.add_argument_group("Required Arguments")
     geno_group = required_group.add_mutually_exclusive_group(required=True)
-    geno_group.add_argument(
-        "-vcf", "--vcf", type=str,
-        help="Input genotype file in VCF format (.vcf or .vcf.gz).",
-    )
-    geno_group.add_argument(
-        "-hmp", "--hmp", type=str,
-        help="Input genotype file in HMP format (.hmp or .hmp.gz).",
-    )
-    geno_group.add_argument(
-        "-bfile", "--bfile", type=str,
-        help="Input genotype in PLINK binary format "
-             "(prefix for .bed, .bim, .fam).",
-    )
-    geno_group.add_argument(
-        "-file", "--file", type=str,
-        help=(
-            "Input genotype numeric matrix (.txt/.tsv/.csv/.npy) or prefix. "
-            "Requires sibling prefix.id. Optional site metadata: prefix.site or prefix.bim."
-        ),
-    )
+    add_common_genotype_source_args(geno_group, include_file=True, help_profile="default")
     geno_group.add_argument(
         "-k", "--dense-grm", type=str, dest="dense_grm",
         help=(
@@ -783,18 +787,9 @@ def main(log: bool = True):
     # Optional arguments
     # ------------------------------------------------------------------
     optional_group = parser.add_argument_group("Optional Arguments")
-    optional_group.add_argument(
-        "-t", "--thread", type=int, default=detect_effective_threads(),
-        help="Number of CPU threads (default: %(default)s).",
-    )
-    optional_group.add_argument(
-        "-o", "--out", type=str, default=".",
-        help="Output directory for results (default: current directory).",
-    )
-    optional_group.add_argument(
-        "-prefix", "--prefix", type=str, default=None,
-        help="Prefix of output files (default: inferred from input file name).",
-    )
+    add_common_thread_arg(optional_group, default_threads=detect_effective_threads())
+    add_common_out_arg(optional_group, default=".", help_profile="current_dir")
+    add_common_prefix_arg(optional_group, default=None, help_profile="inferred_input_filename")
     optional_group.add_argument(
         "-m", "--method", type=int, default=1,
         help=(
@@ -809,26 +804,23 @@ def main(log: bool = True):
             "kinship entries >= cutoff (default cutoff when flag is present: %(const)s)."
         ),
     )
-    optional_group.add_argument(
-        "-maf", "--maf", type=float, default=0.02,
-        help="Exclude variants with minor allele frequency lower than a threshold "
-             "(default: %(default)s).",
+    add_common_variant_filter_args(
+        optional_group,
+        help_profile="default",
+        include_maf=True,
+        include_geno=True,
+        include_het=True,
+        maf_default=0.02,
+        geno_default=0.05,
+        het_default=0.0,
     )
-    optional_group.add_argument(
-        "-geno", "--geno", type=float, default=0.05,
-        help="Exclude variants with missing call frequencies greater than a threshold "
-             "(default: %(default)s).",
-    )
-    optional_group.add_argument(
-        "-mem", "--memory", type=float, default=DEFAULT_BED_MEMORY_GB,
-        help=(
-            "Target BED decode block size in GB for memmap/packed kernels. "
-            "This only controls per-block decode/window sizing, not global process memory "
-            "(default: %(default)s)."
-        ),
-    )
-    optional_group.add_argument(
-        "-memory", dest="memory", type=float, help=argparse.SUPPRESS
+    add_common_snps_only_arg(optional_group, default=False, help_profile="default")
+    add_common_memory_arg(
+        optional_group,
+        default=DEFAULT_BED_MEMORY_GB,
+        help_profile="gwas_decode",
+        dest="memory",
+        include_hidden_legacy_single_dash_alias=True,
     )
     optional_group.add_argument(
         "--stage-timing", action="store_true", default=False,
@@ -838,16 +830,8 @@ def main(log: bool = True):
         ),
     )
     optional_group.add_argument(
-        "-npy", "--npy", action="store_true", default=False,
-        help="Save GRM as binary NPY instead of plain text (default: %(default)s).",
-    )
-    optional_group.add_argument(
-        "-fast", "--fast", action="store_true", default=False,
-        help=(
-            "Force packed BED backend (full in-memory load). "
-            "Faster for f64 GRM; for f32 the default streaming backend "
-            "with pipeline overlap is usually faster."
-        ),
+        "-txt", "--txt", action="store_true", default=False,
+        help="Write dense GRM as plain text instead of the default NPY output.",
     )
 
     args = parser.parse_args()
@@ -933,7 +917,7 @@ def main(log: bool = True):
                         detected_threads=int(detected_threads),
                     ),
                 ),
-                ("Save as NPY", args.npy),
+                ("Save as text", args.txt),
             ]
             if getattr(args, "dense_grm", None)
             else [
@@ -942,6 +926,8 @@ def main(log: bool = True):
                 ("Sparse GRM cutoff", "disabled" if args.sparse is None else args.sparse),
                 ("MAF threshold", args.maf),
                 ("Missing rate", args.geno),
+                ("Het threshold", args.het),
+                ("SNP-only", bool(args.snps_only)),
                 ("Decode block GB", args.memory),
                 ("Stage timing", bool(args.stage_timing or spgrm_timing_enabled)),
                 (
@@ -953,7 +939,7 @@ def main(log: bool = True):
                     ),
                 ),
                 ("BED backend", bed_backend_policy),
-                ("Save as NPY", args.npy),
+                ("Save as text", args.txt),
             ]
         )
         emit_cli_configuration(
@@ -991,8 +977,8 @@ def main(log: bool = True):
             raise RuntimeError(
                 f"Sparse GRM cutoff must be finite and >= 0, got {args.sparse}"
             )
-        if args.npy:
-            logger.warning("`--npy` is ignored for sparse GRM output; writing `.spgrm` CSC.")
+        if args.txt:
+            logger.warning("`--txt` is ignored for sparse GRM output; writing `.spgrm` CSC.")
         dense_id_path = resolve_grm_id_path(gfile)
         if dense_id_path is None:
             raise RuntimeError(
@@ -1061,6 +1047,7 @@ def main(log: bool = True):
                 from_vcf=bool(args.vcf),
                 from_hmp=bool(args.hmp),
                 from_file=bool(args.file),
+                snps_only=bool(args.snps_only),
             )
             if str(grm_input) != str(gfile):
                 logger.info(
@@ -1078,24 +1065,35 @@ def main(log: bool = True):
     # ------------------------------------------------------------------
     genotype_src = format_path_for_display(str(gfile))
     with CliStatus(
-        f"Loading genotype from {genotype_src}...",
+        genotype_load_status_open(genotype_src),
         enabled=True,
         use_process=True,
     ) as task:
         try:
-            sample_ids, n_snps = inspect_genotype_file(grm_input)
+            sample_ids, n_snps = inspect_genotype_file(
+                grm_input,
+                snps_only=bool(args.snps_only),
+                maf=float(args.maf),
+                missing_rate=float(args.geno),
+                het=float(args.het),
+            )
         except Exception:
-            task.fail(f"Loading genotype from {genotype_src} ...Failed")
+            task.fail(genotype_load_status_fail(genotype_src))
             raise
         sample_ids = np.array(sample_ids, dtype=str)
         n_samples = len(sample_ids)
         task.complete(
-            f"Loading genotype from {genotype_src} (n={n_samples}, nSNP={n_snps})"
+            genotype_load_status_done(
+                genotype_src,
+                n_samples=n_samples,
+                n_snps=int(n_snps),
+            )
         )
 
     # Defaults match GWAS; can be overridden via CLI.
     maf_threshold = args.maf
     max_missing_rate = args.geno
+    het_threshold = float(args.het)
     args.memory = _normalize_memory_gb(args.memory)
     memory_mb = _memory_gb_to_mb(args.memory)
     stream_block_rows = _decode_block_rows_from_memory_mb(
@@ -1124,8 +1122,8 @@ def main(log: bool = True):
             raise RuntimeError(
                 f"Sparse GRM cutoff must be finite and >= 0, got {args.sparse}"
             )
-        if args.npy:
-            logger.warning("`--npy` is ignored for sparse GRM output; writing `.spgrm` CSC.")
+        if args.txt:
+            logger.warning("`--txt` is ignored for sparse GRM output; writing `.spgrm` CSC.")
         logger.info(
             "GRM auto route selected backend: sparse-stream-bed "
             "(BED pre-scan + blockwise streaming sparse CSC writer)."
@@ -1140,6 +1138,8 @@ def main(log: bool = True):
             kinship_cutoff=sparse_cutoff,
             maf_threshold=maf_threshold,
             max_missing_rate=max_missing_rate,
+            het_threshold=het_threshold,
+            snps_only=bool(args.snps_only),
             chunk_size=stream_block_rows,
             mmap_window_mb=mmap_window_mb,
             threads=int(args.thread),
@@ -1154,8 +1154,8 @@ def main(log: bool = True):
             method=int(args.method),
             maf_threshold=maf_threshold,
             max_missing_rate=max_missing_rate,
-            het_threshold=0.0,
-            snps_only=False,
+            het_threshold=het_threshold,
+            snps_only=bool(args.snps_only),
             dense_grm_path=None,
         )
         id_path = f"{grm_path}.id"
@@ -1168,14 +1168,14 @@ def main(log: bool = True):
             f"  {format_path_for_display(f'{grm_path}.meta.json')}",
         )
     else:
-        selected_backend, backend_reason = _select_cli_grm_backend(fast=bool(args.fast))
+        selected_backend, backend_reason = _select_cli_grm_backend()
         logger.info(
             f"GRM auto route selected backend: {selected_backend} ({backend_reason})."
         )
         method_tag = _grm_method_tag(args.method)
         direct_npy_path = (
             f"{outprefix}.{method_tag}.npy"
-            if (args.npy and selected_backend == "memmap-bed")
+            if ((not args.txt) and selected_backend == "memmap-bed")
             else None
         )
         grm = None
@@ -1199,6 +1199,8 @@ def main(log: bool = True):
                         method=args.method,
                         maf_threshold=maf_threshold,
                         max_missing_rate=max_missing_rate,
+                        het_threshold=het_threshold,
+                        snps_only=bool(args.snps_only),
                         block_rows=stream_block_rows,
                         mmap_window_mb=mmap_window_mb,
                         threads=int(args.thread),
@@ -1216,6 +1218,8 @@ def main(log: bool = True):
                         method=args.method,
                         maf_threshold=maf_threshold,
                         max_missing_rate=max_missing_rate,
+                        het_threshold=het_threshold,
+                        snps_only=bool(args.snps_only),
                         block_rows=stream_block_rows,
                         mmap_window_mb=mmap_window_mb,
                         threads=int(args.thread),
@@ -1235,6 +1239,8 @@ def main(log: bool = True):
                     method=args.method,
                     maf_threshold=maf_threshold,
                     max_missing_rate=max_missing_rate,
+                    het_threshold=het_threshold,
+                    snps_only=bool(args.snps_only),
                     block_rows=packed_block_rows,
                     threads=int(args.thread),
                     memory_mb=memory_mb,
@@ -1250,6 +1256,8 @@ def main(log: bool = True):
                 method=args.method,
                 maf_threshold=maf_threshold,
                 max_missing_rate=max_missing_rate,
+                het_threshold=het_threshold,
+                snps_only=bool(args.snps_only),
                 block_rows=packed_block_rows,
                 threads=int(args.thread),
                 memory_mb=memory_mb,
@@ -1262,7 +1270,7 @@ def main(log: bool = True):
     # ------------------------------------------------------------------
     if args.sparse is None:
         method_tag = _grm_method_tag(args.method)
-        if args.npy:
+        if not args.txt:
             if grm_path is None:
                 grm_path = f"{outprefix}.{method_tag}.npy"
             if not dense_saved_direct:

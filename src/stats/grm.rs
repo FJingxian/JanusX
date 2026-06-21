@@ -1385,15 +1385,34 @@ fn grm_accum_mode_name(mode: GrmAccumMode) -> &'static str {
 }
 
 #[inline]
-fn grm_stream_row_prepare_from_stats_f64(
+fn grm_stream_site_passes_snp_only(site: &crate::gfcore::SiteInfo) -> bool {
+    crate::gfreader::is_simple_snp_allele(&site.ref_allele)
+        && crate::gfreader::is_simple_snp_allele(&site.alt_allele)
+}
+
+#[inline]
+fn grm_stream_row_prepare_from_counts_f64(
     method: usize,
     maf_thr: f32,
     miss_thr: f32,
+    het_thr: f32,
+    require_simple_snp: bool,
+    site_passes_snp_only: bool,
     eps: f64,
     n_samples: usize,
     mut alt_sum: f64,
     non_missing: usize,
+    het_count: usize,
 ) -> Option<(GrmStreamRowPreparedF64, f64)> {
+    if require_simple_snp && !site_passes_snp_only {
+        return None;
+    }
+    if het_thr > 0.0_f32 && non_missing > 0 {
+        let het_rate = (het_count as f64) / (non_missing as f64);
+        if het_rate > het_thr as f64 {
+            return None;
+        }
+    }
     if n_samples == 0 {
         return None;
     }
@@ -1445,15 +1464,53 @@ fn grm_stream_row_prepare_from_stats_f64(
 }
 
 #[inline]
-fn grm_stream_row_prepare_from_stats_f32(
+fn grm_stream_row_prepare_from_stats_f64(
     method: usize,
     maf_thr: f32,
     miss_thr: f32,
+    eps: f64,
+    n_samples: usize,
+    alt_sum: f64,
+    non_missing: usize,
+) -> Option<(GrmStreamRowPreparedF64, f64)> {
+    grm_stream_row_prepare_from_counts_f64(
+        method,
+        maf_thr,
+        miss_thr,
+        0.0_f32,
+        false,
+        true,
+        eps,
+        n_samples,
+        alt_sum,
+        non_missing,
+        0usize,
+    )
+}
+
+#[inline]
+fn grm_stream_row_prepare_from_counts_f32(
+    method: usize,
+    maf_thr: f32,
+    miss_thr: f32,
+    het_thr: f32,
+    require_simple_snp: bool,
+    site_passes_snp_only: bool,
     eps: f32,
     n_samples: usize,
     mut alt_sum: f64,
     non_missing: usize,
+    het_count: usize,
 ) -> Option<(GrmStreamRowPreparedF32, f64)> {
+    if require_simple_snp && !site_passes_snp_only {
+        return None;
+    }
+    if het_thr > 0.0_f32 && non_missing > 0 {
+        let het_rate = (het_count as f64) / (non_missing as f64);
+        if het_rate > het_thr as f64 {
+            return None;
+        }
+    }
     if n_samples == 0 {
         return None;
     }
@@ -1502,6 +1559,31 @@ fn grm_stream_row_prepare_from_stats_f32(
         flip_major,
     };
     Some((prep, var))
+}
+
+#[inline]
+fn grm_stream_row_prepare_from_stats_f32(
+    method: usize,
+    maf_thr: f32,
+    miss_thr: f32,
+    eps: f32,
+    n_samples: usize,
+    alt_sum: f64,
+    non_missing: usize,
+) -> Option<(GrmStreamRowPreparedF32, f64)> {
+    grm_stream_row_prepare_from_counts_f32(
+        method,
+        maf_thr,
+        miss_thr,
+        0.0_f32,
+        false,
+        true,
+        eps,
+        n_samples,
+        alt_sum,
+        non_missing,
+        0usize,
+    )
 }
 
 #[inline]
@@ -2004,6 +2086,8 @@ fn grm_stream_scan_prestats_f64(
     method: usize,
     maf_thr: f32,
     miss_thr: f32,
+    het_thr: f32,
+    snps_only: bool,
     eps: f64,
     progress_callback: Option<&Py<PyAny>>,
     notify_step: usize,
@@ -2015,8 +2099,64 @@ fn grm_stream_scan_prestats_f64(
     let mut eff_m = 0usize;
     let mut varsum = 0.0_f64;
     let mut scanned = 0usize;
+    let use_extra_filters = snps_only || het_thr > 0.0_f32;
 
-    while let Some((snp_idx, alt_sum, non_missing)) = it.next_snp_stats_only() {
+    if use_extra_filters && snps_only && it.sites.len() != n_total {
+        return Err("snps_only filter requires BED site metadata during GRM pre-scan".to_string());
+    }
+
+    if !use_extra_filters {
+        while let Some((snp_idx, alt_sum, non_missing)) = it.next_snp_stats_only() {
+            scanned = scanned.saturating_add(1);
+            if (scanned & 0x3FFF) == 0 {
+                check_ctrlc()?;
+            }
+            let done_mapped = grm_progress_map_ratio(scanned, n_total, phase1_cap);
+            grm_progress_notify(
+                progress_callback,
+                done_mapped,
+                n_total,
+                notify_step,
+                last_notified,
+                false,
+            )?;
+            if let Some((prep, var)) = grm_stream_row_prepare_from_stats_f64(
+                method,
+                maf_thr,
+                miss_thr,
+                eps,
+                n_samples,
+                alt_sum,
+                non_missing,
+            ) {
+                keep_indices.push(snp_idx);
+                prepared_rows.push(prep);
+                eff_m = eff_m.saturating_add(1);
+                if method == 1 {
+                    varsum += var;
+                }
+            }
+        }
+        grm_progress_notify(
+            progress_callback,
+            phase1_cap,
+            n_total,
+            notify_step,
+            last_notified,
+            true,
+        )?;
+
+        return Ok(GrmStreamPreStatsF64 {
+            keep_indices,
+            prepared_rows,
+            eff_m,
+            varsum,
+        });
+    }
+
+    while it.cursor() < n_total {
+        let snp_idx = it.cursor();
+        it.set_cursor(snp_idx.saturating_add(1));
         scanned = scanned.saturating_add(1);
         if (scanned & 0x3FFF) == 0 {
             check_ctrlc()?;
@@ -2030,14 +2170,27 @@ fn grm_stream_scan_prestats_f64(
             last_notified,
             false,
         )?;
-        if let Some((prep, var)) = grm_stream_row_prepare_from_stats_f64(
+        it.ensure_window_for_snp(snp_idx)?;
+        let counts = it
+            .decode_snp_counts_only_at(snp_idx)
+            .ok_or_else(|| format!("failed to decode BED counts for SNP index {snp_idx}"))?;
+        let site_ok = if snps_only {
+            grm_stream_site_passes_snp_only(&it.sites[snp_idx])
+        } else {
+            true
+        };
+        if let Some((prep, var)) = grm_stream_row_prepare_from_counts_f64(
             method,
             maf_thr,
             miss_thr,
+            het_thr,
+            snps_only,
+            site_ok,
             eps,
             n_samples,
-            alt_sum,
-            non_missing,
+            counts.alt_sum,
+            counts.non_missing,
+            counts.het_count,
         ) {
             keep_indices.push(snp_idx);
             prepared_rows.push(prep);
@@ -2072,6 +2225,8 @@ fn grm_stream_scan_prestats_f32(
     method: usize,
     maf_thr: f32,
     miss_thr: f32,
+    het_thr: f32,
+    snps_only: bool,
     eps: f32,
     progress_callback: Option<&Py<PyAny>>,
     notify_step: usize,
@@ -2083,8 +2238,64 @@ fn grm_stream_scan_prestats_f32(
     let mut eff_m = 0usize;
     let mut varsum = 0.0_f64;
     let mut scanned = 0usize;
+    let use_extra_filters = snps_only || het_thr > 0.0_f32;
 
-    while let Some((snp_idx, alt_sum, non_missing)) = it.next_snp_stats_only() {
+    if use_extra_filters && snps_only && it.sites.len() != n_total {
+        return Err("snps_only filter requires BED site metadata during GRM pre-scan".to_string());
+    }
+
+    if !use_extra_filters {
+        while let Some((snp_idx, alt_sum, non_missing)) = it.next_snp_stats_only() {
+            scanned = scanned.saturating_add(1);
+            if (scanned & 0x3FFF) == 0 {
+                check_ctrlc()?;
+            }
+            let done_mapped = grm_progress_map_ratio(scanned, n_total, phase1_cap);
+            grm_progress_notify(
+                progress_callback,
+                done_mapped,
+                n_total,
+                notify_step,
+                last_notified,
+                false,
+            )?;
+            if let Some((prep, var)) = grm_stream_row_prepare_from_stats_f32(
+                method,
+                maf_thr,
+                miss_thr,
+                eps,
+                n_samples,
+                alt_sum,
+                non_missing,
+            ) {
+                keep_indices.push(snp_idx);
+                prepared_rows.push(prep);
+                eff_m = eff_m.saturating_add(1);
+                if method == 1 {
+                    varsum += var;
+                }
+            }
+        }
+        grm_progress_notify(
+            progress_callback,
+            phase1_cap,
+            n_total,
+            notify_step,
+            last_notified,
+            true,
+        )?;
+
+        return Ok(GrmStreamPreStatsF32 {
+            keep_indices,
+            prepared_rows,
+            eff_m,
+            varsum,
+        });
+    }
+
+    while it.cursor() < n_total {
+        let snp_idx = it.cursor();
+        it.set_cursor(snp_idx.saturating_add(1));
         scanned = scanned.saturating_add(1);
         if (scanned & 0x3FFF) == 0 {
             check_ctrlc()?;
@@ -2098,14 +2309,27 @@ fn grm_stream_scan_prestats_f32(
             last_notified,
             false,
         )?;
-        if let Some((prep, var)) = grm_stream_row_prepare_from_stats_f32(
+        it.ensure_window_for_snp(snp_idx)?;
+        let counts = it
+            .decode_snp_counts_only_at(snp_idx)
+            .ok_or_else(|| format!("failed to decode BED counts for SNP index {snp_idx}"))?;
+        let site_ok = if snps_only {
+            grm_stream_site_passes_snp_only(&it.sites[snp_idx])
+        } else {
+            true
+        };
+        if let Some((prep, var)) = grm_stream_row_prepare_from_counts_f32(
             method,
             maf_thr,
             miss_thr,
+            het_thr,
+            snps_only,
+            site_ok,
             eps,
             n_samples,
-            alt_sum,
-            non_missing,
+            counts.alt_sum,
+            counts.non_missing,
+            counts.het_count,
         ) {
             keep_indices.push(snp_idx);
             prepared_rows.push(prep);
@@ -3735,6 +3959,8 @@ pub fn grm_bed_f64_from_meta<'py>(
     method=1,
     maf_threshold=0.02,
     max_missing_rate=0.05,
+    het_threshold=0.0,
+    snps_only=false,
     block_cols=65536,
     threads=0,
     progress_callback=None,
@@ -3746,6 +3972,8 @@ pub fn grm_packed_bed_f32<'py>(
     method: usize,
     maf_threshold: f32,
     max_missing_rate: f32,
+    het_threshold: f32,
+    snps_only: bool,
     block_cols: usize,
     threads: usize,
     progress_callback: Option<Py<PyAny>>,
@@ -3762,7 +3990,14 @@ pub fn grm_packed_bed_f32<'py>(
         _site_keep_arr,
         n_samples,
         _n_total_sites,
-    ) = crate::gfreader::prepare_bed_2bit_packed(py, prefix, maf_thr, miss_thr, 0.0_f32, false)?;
+    ) = crate::gfreader::prepare_bed_2bit_packed(
+        py,
+        prefix,
+        maf_thr,
+        miss_thr,
+        het_threshold.clamp(0.0, 1.0),
+        snps_only,
+    )?;
     let packed_ro = packed_arr.readonly();
     let packed_view = packed_ro.as_array();
     if packed_view.ndim() != 2 {
@@ -3808,6 +4043,8 @@ pub fn grm_packed_bed_f32<'py>(
     method=1,
     maf_threshold=0.02,
     max_missing_rate=0.05,
+    het_threshold=0.0,
+    snps_only=false,
     block_cols=65536,
     threads=0,
     progress_callback=None,
@@ -3819,6 +4056,8 @@ pub fn grm_packed_bed_f64<'py>(
     method: usize,
     maf_threshold: f32,
     max_missing_rate: f32,
+    het_threshold: f32,
+    snps_only: bool,
     block_cols: usize,
     threads: usize,
     progress_callback: Option<Py<PyAny>>,
@@ -3835,7 +4074,14 @@ pub fn grm_packed_bed_f64<'py>(
         _site_keep_arr,
         n_samples,
         _n_total_sites,
-    ) = crate::gfreader::prepare_bed_2bit_packed(py, prefix, maf_thr, miss_thr, 0.0_f32, false)?;
+    ) = crate::gfreader::prepare_bed_2bit_packed(
+        py,
+        prefix,
+        maf_thr,
+        miss_thr,
+        het_threshold.clamp(0.0, 1.0),
+        snps_only,
+    )?;
     let packed_ro = packed_arr.readonly();
     let packed_view = packed_ro.as_array();
     if packed_view.ndim() != 2 {
@@ -3881,6 +4127,8 @@ pub fn grm_packed_bed_f64<'py>(
     method=1,
     maf_threshold=0.02,
     max_missing_rate=0.05,
+    het_threshold=0.0,
+    snps_only=false,
     block_cols=65536,
     threads=0,
     progress_callback=None,
@@ -3893,6 +4141,8 @@ pub fn grm_stream_bed_f64<'py>(
     method: usize,
     maf_threshold: f32,
     max_missing_rate: f32,
+    het_threshold: f32,
+    snps_only: bool,
     block_cols: usize,
     threads: usize,
     progress_callback: Option<Py<PyAny>>,
@@ -3906,6 +4156,8 @@ pub fn grm_stream_bed_f64<'py>(
     }
     let maf_thr = maf_threshold.clamp(0.0, 0.5);
     let miss_thr = max_missing_rate.clamp(0.0, 1.0);
+    let het_thr = het_threshold.clamp(0.0, 1.0);
+    let use_extra_filters = snps_only || het_thr > 0.0_f32;
     let two_stage_default_on = std::env::var("JX_GRM_STREAM_TWO_STAGE")
         .ok()
         .map(|s| {
@@ -3929,8 +4181,8 @@ pub fn grm_stream_bed_f64<'py>(
             prefix.clone(),
             maf_thr,
             miss_thr,
-            0.0_f32,
-            false,
+            het_thr,
+            snps_only,
         )?;
         let packed_ro = packed_arr.readonly();
         let packed_view = packed_ro.as_array();
@@ -3970,7 +4222,10 @@ pub fn grm_stream_bed_f64<'py>(
         return Ok((grm, eff_m, n_samples));
     }
 
-    let mut it = if let Some(window_mb) = mmap_window_mb {
+    let mut it = if use_extra_filters {
+        BedSnpIter::new_with_fill(&prefix, 0.0, 1.0, false, false, het_thr)
+            .map_err(PyRuntimeError::new_err)?
+    } else if let Some(window_mb) = mmap_window_mb {
         BedSnpIter::new_for_grm_window(&prefix, window_mb).map_err(PyRuntimeError::new_err)?
     } else {
         BedSnpIter::new_for_grm(&prefix).map_err(PyRuntimeError::new_err)?
@@ -4059,7 +4314,7 @@ pub fn grm_stream_bed_f64<'py>(
         })
         // Default to one-stage true streaming unless explicitly enabled.
         .unwrap_or(false);
-    let stream_prestat_core = stream_prestat_core_requested && !it.is_windowed();
+    let stream_prestat_core = (stream_prestat_core_requested && !it.is_windowed()) || use_extra_filters;
     let stage_timing = env_truthy("JX_GRM_STREAM_STAGE_TIMING");
 
     let grm_vec = py
@@ -4101,6 +4356,8 @@ pub fn grm_stream_bed_f64<'py>(
                     method,
                     maf_thr,
                     miss_thr,
+                    het_thr,
+                    snps_only,
                     eps,
                     progress_callback.as_ref(),
                     notify_step,
@@ -4625,6 +4882,8 @@ threads_total={}, decode_threads={}, blas_threads={}, overlap={}, par_decode={},
     method=1,
     maf_threshold=0.02,
     max_missing_rate=0.05,
+    het_threshold=0.0,
+    snps_only=false,
     block_cols=65536,
     threads=0,
     progress_callback=None,
@@ -4637,6 +4896,8 @@ pub fn grm_stream_bed_f32<'py>(
     method: usize,
     maf_threshold: f32,
     max_missing_rate: f32,
+    het_threshold: f32,
+    snps_only: bool,
     block_cols: usize,
     threads: usize,
     progress_callback: Option<Py<PyAny>>,
@@ -4650,6 +4911,8 @@ pub fn grm_stream_bed_f32<'py>(
     }
     let maf_thr = maf_threshold.clamp(0.0, 0.5);
     let miss_thr = max_missing_rate.clamp(0.0, 1.0);
+    let het_thr = het_threshold.clamp(0.0, 1.0);
+    let use_extra_filters = snps_only || het_thr > 0.0_f32;
     let two_stage_default_on = std::env::var("JX_GRM_STREAM_TWO_STAGE")
         .ok()
         .map(|s| {
@@ -4674,8 +4937,8 @@ pub fn grm_stream_bed_f32<'py>(
             prefix.clone(),
             maf_thr,
             miss_thr,
-            0.0_f32,
-            false,
+            het_thr,
+            snps_only,
         )?;
         let packed_ro = packed_arr.readonly();
         let packed_view = packed_ro.as_array();
@@ -4726,7 +4989,10 @@ pub fn grm_stream_bed_f32<'py>(
         return Ok((grm32, eff_m, n_samples));
     }
 
-    let mut it = if let Some(window_mb) = mmap_window_mb {
+    let mut it = if use_extra_filters {
+        BedSnpIter::new_with_fill(&prefix, 0.0, 1.0, false, false, het_thr)
+            .map_err(PyRuntimeError::new_err)?
+    } else if let Some(window_mb) = mmap_window_mb {
         BedSnpIter::new_for_grm_window(&prefix, window_mb).map_err(PyRuntimeError::new_err)?
     } else {
         BedSnpIter::new_for_grm(&prefix).map_err(PyRuntimeError::new_err)?
@@ -4814,7 +5080,7 @@ pub fn grm_stream_bed_f32<'py>(
             !matches!(t.as_str(), "0" | "false" | "no" | "off")
         })
         .unwrap_or(false);
-    let stream_prestat_core = stream_prestat_core_requested && !it.is_windowed();
+    let stream_prestat_core = (stream_prestat_core_requested && !it.is_windowed()) || use_extra_filters;
     let stage_timing = env_truthy("JX_GRM_STREAM_STAGE_TIMING");
 
     let grm_vec = py
@@ -4858,6 +5124,8 @@ pub fn grm_stream_bed_f32<'py>(
                         method,
                         maf_thr,
                         miss_thr,
+                        het_thr,
+                        snps_only,
                         eps,
                         progress_callback.as_ref(),
                         notify_step,
@@ -5408,6 +5676,8 @@ threads_total={}, decode_threads={}, blas_threads={}, overlap={}, par_decode={},
     method=1,
     maf_threshold=0.02,
     max_missing_rate=0.05,
+    het_threshold=0.0,
+    snps_only=false,
     block_cols=65536,
     threads=0,
     progress_callback=None,
@@ -5421,6 +5691,8 @@ pub fn grm_stream_bed_f64_to_npy(
     method: usize,
     maf_threshold: f32,
     max_missing_rate: f32,
+    het_threshold: f32,
+    snps_only: bool,
     block_cols: usize,
     threads: usize,
     progress_callback: Option<Py<PyAny>>,
@@ -5433,6 +5705,8 @@ pub fn grm_stream_bed_f64_to_npy(
         method,
         maf_threshold,
         max_missing_rate,
+        het_threshold,
+        snps_only,
         block_cols,
         threads,
         progress_callback,
@@ -5455,6 +5729,8 @@ pub fn grm_stream_bed_f64_to_npy(
     method=1,
     maf_threshold=0.02,
     max_missing_rate=0.05,
+    het_threshold=0.0,
+    snps_only=false,
     block_cols=65536,
     threads=0,
     progress_callback=None,
@@ -5468,6 +5744,8 @@ pub fn grm_stream_bed_f32_to_npy(
     method: usize,
     maf_threshold: f32,
     max_missing_rate: f32,
+    het_threshold: f32,
+    snps_only: bool,
     block_cols: usize,
     threads: usize,
     progress_callback: Option<Py<PyAny>>,
@@ -5480,6 +5758,8 @@ pub fn grm_stream_bed_f32_to_npy(
         method,
         maf_threshold,
         max_missing_rate,
+        het_threshold,
+        snps_only,
         block_cols,
         threads,
         progress_callback,

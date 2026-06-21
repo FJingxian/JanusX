@@ -648,6 +648,8 @@ pub fn garfield_residualize_bed_py<'py>(
         1,
         maf_threshold,
         max_missing_rate,
+        0.0,
+        false,
         block_cols,
         threads,
         progress_callback,

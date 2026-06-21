@@ -71,6 +71,32 @@ class GenomicSelection:
         cfg = replace(
             self.config,
             gblup_kernels=tuple(str(x).strip().lower() for x in kernels),
+            blup=False,
+            rrblup=False,
+            bayesa=False,
+            bayesb=False,
+            bayescpi=False,
+            rf=False,
+            et=False,
+            gbdt=False,
+            xgb=False,
+            svm=False,
+            enet=False,
+        )
+        payload = run_gs_config(cfg, out=out, prefix=prefix, log=bool(log))
+        return GsResult.from_payload(payload)
+
+    def blup(
+        self,
+        *,
+        out: Optional[str] = None,
+        prefix: Optional[str] = None,
+        log: bool = True,
+    ) -> GsResult:
+        cfg = replace(
+            self.config,
+            gblup_kernels=tuple(),
+            blup=True,
             rrblup=False,
             bayesa=False,
             bayesb=False,
@@ -95,6 +121,7 @@ class GenomicSelection:
         cfg = replace(
             self.config,
             gblup_kernels=tuple(),
+            blup=False,
             rrblup=True,
             bayesa=False,
             bayesb=False,

@@ -18,6 +18,7 @@ try:
 except Exception:
     jxrs = None
 
+from ._common.cli import add_common_out_arg, add_common_prefix_arg, add_common_thread_arg
 from ._common.config_render import emit_cli_configuration
 from ._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 from ._common.log import setup_logging
@@ -516,28 +517,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Input FASTQ/FASTA files (one or more). Multiple files are counted into one KMC database.",
     )
 
-    common_group.add_argument(
-        "-t",
-        "--thread",
-        metavar="THREAD",
-        type=int,
-        default=8,
-        help="Number of CPU threads (default: 8).",
-    )
-    common_group.add_argument(
-        "-o",
-        "--out",
-        type=str,
-        default=".",
-        help="Output directory for results (default: .).",
-    )
-    common_group.add_argument(
-        "-prefix",
-        "--prefix",
-        type=str,
-        default=None,
-        help="Prefix for output files (default: inferred from first input).",
-    )
+    add_common_thread_arg(common_group, default_threads=8, help_profile="default")
+    add_common_out_arg(common_group, default=".", help_profile="default")
+    add_common_prefix_arg(common_group, default=None, help_profile="first_input")
     common_group.add_argument(
         "-k",
         "--kmer-len",

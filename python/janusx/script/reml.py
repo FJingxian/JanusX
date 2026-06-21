@@ -36,6 +36,7 @@ from scipy.stats import t as student_t
 
 from janusx.pyBLUP.assoc import LMM
 from janusx.pyBLUP.blup import BLUP
+from ._common.cli import add_common_out_arg, add_common_prefix_arg
 from ._common.log import setup_logging
 from ._common.config_render import emit_cli_configuration
 from ._common.grmio import load_grm_matrix, read_id_file, resolve_grm_id_path
@@ -1413,20 +1414,8 @@ def build_parser() -> argparse.ArgumentParser:
             "Optional GRM matrix. When provided, narrow-sense h2 and genomic BLUP are estimated in addition to broad-sense H2 and BLUE."
         ),
     )
-    opt.add_argument(
-        "-o",
-        "--out",
-        type=str,
-        default=".",
-        help="Output directory (default: current directory).",
-    )
-    opt.add_argument(
-        "-prefix",
-        "--prefix",
-        type=str,
-        default=None,
-        help="Output prefix (default: inferred from input file name).",
-    )
+    add_common_out_arg(opt, default=".", help_profile="current_dir")
+    add_common_prefix_arg(opt, default=None, help_profile="inferred_input_filename")
     opt.add_argument(
         "-maxiter",
         "--maxiter",

@@ -717,14 +717,17 @@ fn compute_effect_beta_from_meta_stream(
             &mut block_rowsum[..cur_rows],
             pool_ref,
         )?;
-        for off in 0..cur_rows {
-            let row = &block[off * n_out..(off + 1) * n_out];
-            let mut acc = 0.0_f64;
-            for (g, a) in row.iter().zip(alpha.iter()) {
-                acc += (*g as f64) * *a;
-            }
-            out[row_start + off] = acc;
-        }
+        out[row_start..row_end]
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(off, dst)| {
+                let row = &block[off * n_out..(off + 1) * n_out];
+                let mut acc = 0.0_f64;
+                for (g, a) in row.iter().zip(alpha.iter()) {
+                    acc += (*g as f64) * *a;
+                }
+                *dst = acc;
+            });
         varsum_acc += block_varsum[..cur_rows].iter().sum::<f64>();
     }
 

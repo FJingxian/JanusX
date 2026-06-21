@@ -28,6 +28,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from ._common.cli import add_common_out_arg, add_common_prefix_arg
 from ._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 
 
@@ -424,20 +425,8 @@ def build_parser() -> argparse.ArgumentParser:
             "sample,label,show_label,group,label_color,node_color,node_size"
         ),
     )
-    opt.add_argument(
-        "-o",
-        "--out",
-        type=str,
-        default=".",
-        help="Output directory (default: .).",
-    )
-    opt.add_argument(
-        "-prefix",
-        "--prefix",
-        type=str,
-        default=None,
-        help="Output prefix (default: inferred from input).",
-    )
+    add_common_out_arg(opt, default=".", help_profile="current_dir")
+    add_common_prefix_arg(opt, default=None, help_profile="inferred_input")
     opt.add_argument(
         "--height",
         type=float,

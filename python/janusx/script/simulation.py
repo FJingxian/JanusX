@@ -19,6 +19,13 @@ import numpy as np
 from janusx.gfreader import inspect_genotype_file
 from janusx.janusx import g2p_simulate
 
+from ._common.cli import (
+    add_common_genotype_source_args,
+    add_common_grm_file_arg,
+    add_common_out_arg,
+    add_common_prefix_arg,
+    add_common_variant_filter_args,
+)
 from ._common.config_render import emit_cli_configuration
 from ._common.genocache import configure_genotype_cache_from_out
 from ._common.genoio import determine_genotype_source_from_args as determine_genotype_source
@@ -481,28 +488,15 @@ def build_parser() -> argparse.ArgumentParser:
     bg_group = parser.add_argument_group("Background effect distribution")
 
     geno_group = required_group.add_mutually_exclusive_group(required=True)
-    geno_group.add_argument("-vcf", "--vcf", type=str, help="Input genotype file in VCF format (.vcf or .vcf.gz).")
-    geno_group.add_argument("-hmp", "--hmp", type=str, help="Input genotype file in HMP format (.hmp or .hmp.gz).")
-    geno_group.add_argument("-bfile", "--bfile", type=str, help="Input genotype in PLINK binary format (prefix for .bed, .bim, .fam).")
-    geno_group.add_argument(
-        "-file",
-        "--file",
-        type=str,
-        help=(
-            "Input genotype numeric matrix (.txt/.tsv/.csv/.npy) or prefix. "
-            "Requires sibling prefix.id. "
-            "Optional site metadata: prefix.site or prefix.bim."
-        ),
-    )
+    add_common_genotype_source_args(geno_group, include_file=True, help_profile="default")
 
-    optional_group.add_argument("-o", "--out", type=str, default=".", help="Output directory for results (default: .).")
-    optional_group.add_argument("-prefix", "--prefix", type=str, default=None, help="Prefix for output files (default: None).")
-    optional_group.add_argument(
-        "-k",
-        "--grm",
-        type=str,
+    add_common_out_arg(optional_group, default=".")
+    add_common_prefix_arg(optional_group, default=None)
+    add_common_grm_file_arg(
+        optional_group,
         default=None,
-        help="Optional precomputed GRM/kernel (.npy or text). If set, background effects are drawn from this kernel instead of marker-wise genotype effects.",
+        dest="grm",
+        help_profile="background_kernel",
     )
     optional_group.add_argument(
         "-kid",
@@ -520,14 +514,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=100_000,
         help="Compatibility placeholder; simulation core streams in Rust (default: 100,000).",
     )
-    filter_group.add_argument("-maf", "--maf", type=float, default=0.02, help="Exclude variants with minor allele frequency lower than a threshold (default: 0.02).")
-    filter_group.add_argument("-geno", "--geno", type=float, default=0.05, help="Exclude variants with missing call frequencies greater than a threshold (default: 0.05).")
-    filter_group.add_argument(
-        "-het",
-        "--het",
-        type=float,
-        default=None,
-        help="Optional maximum heterozygosity rate per variant in [0,1]. Disabled by default.",
+    add_common_variant_filter_args(
+        filter_group,
+        help_profile="simulation",
+        include_maf=True,
+        include_geno=True,
+        include_het=True,
+        maf_default=0.02,
+        geno_default=0.05,
+        het_default=None,
     )
 
     pve_group.add_argument(

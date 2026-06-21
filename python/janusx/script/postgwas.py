@@ -24,6 +24,7 @@ Citation
 
 import logging
 import os
+from ._common.cli import add_common_out_arg, add_common_prefix_arg, add_common_thread_arg
 from ._common.log import setup_logging
 from ._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 from ._common.pathcheck import (
@@ -4860,17 +4861,12 @@ def main():
         "-ab", "--annobroaden", type=float, default=None,
         help="Broaden the annotation window around SNPs (Kb) (default: %(default)s).",
     )
-    optional_group.add_argument(
-        "-o", "--out", type=str, default=".",
-        help="Output directory for plots and annotation (default: current directory).",
-    )
-    optional_group.add_argument(
-        "-prefix", "--prefix", type=str, default=None,
-        help="Prefix of the log file (default: JanusX).",
-    )
-    optional_group.add_argument(
-        "-t", "--thread", type=int, default=detect_effective_threads(),
-        help="Number of CPU threads (default: %(default)s).",
+    add_common_out_arg(optional_group, default=".", help_profile="plot_annotation")
+    add_common_prefix_arg(optional_group, default=None, help_profile="janusx_log")
+    add_common_thread_arg(
+        optional_group,
+        default_threads=detect_effective_threads(),
+        help_profile="default",
     )
 
     args = parser.parse_args()

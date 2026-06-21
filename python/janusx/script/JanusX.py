@@ -9,9 +9,6 @@ Usage:
 Options:
     -h, --help             Show this help message
     -v, --version          Show version/build information
-    Note: launcher-only flags are not supported in jxpy:
-          -update/-clean/-list/-upgrade/-uninstall
-          Please use launcher command: `jx ...`
 
 Modules:
     Genome-wide Association Studies (GWAS):
@@ -26,16 +23,9 @@ Modules:
     reml          Estimate broad/narrow heritability and BLUE by REML
     postgs        Summarize and visualize GS results
 
-    Genetic Association by Random Forest and InterpretivE Logic Decisions (GARFIELD):
-    garfield      Random-forest based marker-trait association
-    postgarfield  Summarize and visualize GARFIELD outputs
-
-    Bulk Segregation Analysis (BSA):
-    postbsa       Post-process and visualize BSA results
-
     Pipeline and utility:
-    fastq2vcf     Variant-calling pipeline from FASTQ to VCF
-    fastq2count   RNA-seq counting pipeline from FASTQ to count matrix
+    garfield      Random-forest based marker-trait association
+    postbsa       Post-process and visualize BSA results
     kmer          K-mer counting workflow via KMC
     kmerge        Merge multi-sample KMC databases into genotype matrix
     kstats        Compute pairwise KMC k-mer statistics
@@ -46,15 +36,6 @@ Modules:
     hybrid        Build pairwise hybrid genotype matrix from parent lists
     gformat       Convert genotype files across plink/vcf/txt/npy
     gmerge        Merge genotype/variant tables
-    webui         Start JanusX web UI (postgwas first)
-
-    Benchmark:
-    sim           Quick simulation workflow
-    simulation    Extended simulation and benchmarking workflow
-    benchmark     FarmCPU benchmark workflow (JanusX/rMVP)
-    gblupbench    GBLUP benchmark workflow (JanusX/sommer/rrBLUP)
-    bayesbench    Bayes GS benchmark / convergence / BGLR comparison
-    garfieldbench GARFIELD local-interval benchmark workflow
 '''
 import sys
 import subprocess
@@ -299,15 +280,6 @@ def _print_cli_help() -> None:
     _print_help_entry(2, "-h, --help", "Show this help message", 16, width)
     _print_help_entry(2, "-v, --version", "Show version/build information", 16, width)
     print()
-    print(f"  {_style_blue('Launcher-only flags (use `jx`):')}")
-    _print_help_entry(
-        4,
-        "-update/-clean/-list/-upgrade/-uninstall",
-        "Not available in `jxpy`; please use launcher command `jx ...`.",
-        40,
-        width,
-    )
-    print()
 
     print(_style_orange("Modules:"))
     print(f"  {_style_blue('Genome-wide Association Studies (GWAS):')}")
@@ -323,20 +295,9 @@ def _print_cli_help() -> None:
     _print_help_entry(4, "postgs", "Summarize and visualize GS results", 12, width)
     print()
 
-    print(
-        f"  {_style_blue('Genetic Association by Random Forest and InterpretivE Logic Decisions (GARFIELD):')}"
-    )
-    _print_help_entry(4, "garfield", "Random-forest based marker-trait association", 12, width)
-    _print_help_entry(4, "postgarfield", "Summarize and visualize GARFIELD outputs", 12, width)
-    print()
-
-    print(f"  {_style_blue('Bulk Segregation Analysis (BSA):')}")
-    _print_help_entry(4, "postbsa", "Post-process and visualize BSA results", 12, width)
-    print()
-
     print(f"  {_style_blue('Pipeline and utility:')}")
-    _print_help_entry(4, "fastq2vcf", "Variant-calling pipeline from FASTQ to VCF", 12, width)
-    _print_help_entry(4, "fastq2count", "RNA-seq counting pipeline from FASTQ to count matrix", 12, width)
+    _print_help_entry(4, "garfield", "Random-forest based marker-trait association", 12, width)
+    _print_help_entry(4, "postbsa", "Post-process and visualize BSA results", 12, width)
     _print_help_entry(4, "kmer", "K-mer counting workflow via KMC", 12, width)
     _print_help_entry(4, "kmerge", "Merge multi-sample KMC databases into genotype matrix", 12, width)
     _print_help_entry(4, "kstats", "Compute pairwise KMC k-mer statistics", 12, width)
@@ -347,16 +308,6 @@ def _print_cli_help() -> None:
     _print_help_entry(4, "hybrid", "Build pairwise hybrid genotype matrix from parent lists", 12, width)
     _print_help_entry(4, "gformat", "Convert genotype files across plink/vcf/txt/npy", 12, width)
     _print_help_entry(4, "gmerge", "Merge genotype/variant tables", 12, width)
-    _print_help_entry(4, "webui", "Start JanusX web UI (postgwas first)", 12, width)
-    print()
-
-    print(f"  {_style_blue('Benchmark:')}")
-    _print_help_entry(4, "sim", "Quick simulation workflow", 12, width)
-    _print_help_entry(4, "simulation", "Extended simulation and benchmarking workflow", 12, width)
-    _print_help_entry(4, "benchmark", "FarmCPU benchmark workflow (JanusX/rMVP)", 12, width)
-    _print_help_entry(4, "gblupbench", "GBLUP benchmark workflow (JanusX/sommer/rrBLUP)", 12, width)
-    _print_help_entry(4, "bayesbench", "Bayes GS benchmark / convergence / BGLR comparison", 12, width)
-    _print_help_entry(4, "garfieldbench", "GARFIELD local-interval benchmark workflow", 12, width)
 
 
 def _print_help() -> None:

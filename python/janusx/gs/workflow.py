@@ -159,10 +159,10 @@ from janusx.script._common.progress import (
     SpinnerStatusAdapter,
     build_rich_progress,
     rich_progress_available,
-)
-from janusx.script._common.status import (
     CliStatus,
+    failed_status_text,
     failure_symbol,
+    finished_status_text,
     log_success,
     print_success,
     print_failure,
@@ -16253,6 +16253,12 @@ def parse_args(argv: typing.Optional[list[str]] = None):
         default=False,
         help="Enable runtime debug logs (thread/runtime/model diagnostics).",
     )
+    optional_group.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        default=False,
+        help="Show advanced backend and thread diagnostics.",
+    )
     add_common_out_arg(
         optional_group,
         default=".",
@@ -16595,11 +16601,12 @@ def _run_gs_pipeline(
         if text != "":
             _file_only_logger.info(text)
 
-    logger.info(f"Thread detect: {format_thread_budget_summary(thread_budget)}")
-    logger.info(
-        "Thread plan: "
-        f"requested={requested_threads}, using={int(args.thread)}"
-    )
+    if bool(getattr(args, "verbose", False)):
+        logger.info(f"Thread detect: {format_thread_budget_summary(thread_budget)}")
+        logger.info(
+            "Thread plan: "
+            f"requested={requested_threads}, using={int(args.thread)}"
+        )
     if thread_capped:
         logger.warning(
             f"Requested threads={requested_threads} exceeds local effective={detected_threads}; "
@@ -17301,11 +17308,15 @@ def _run_gs_pipeline(
                             f"reloaded={sample_ids_reload.shape[0]}, loaded={sample_ids.shape[0]}"
                         )
                 except Exception:
-                    task.fail("Promoting resident packed payload for Bayes ...Failed")
+                    task.fail(
+                        failed_status_text("Promoting resident packed payload for Bayes")
+                    )
                     raise
                 task.complete(
-                    "Promoting resident packed payload for Bayes "
-                    f"({_format_debug_bytes(resident_est_bytes)})"
+                    finished_status_text(
+                        "Promoting resident packed payload for Bayes "
+                        f"({_format_debug_bytes(resident_est_bytes)})"
+                    )
                 )
             _emit_packed_load_debug(
                 packed_lmm_ctx,
@@ -18164,7 +18175,7 @@ def _run_gs_pipeline(
                         and shared_additive_gblup_cache_file is not None
                         and str(shared_additive_gblup_cache_file).strip() != ""
                     )
-                    else "Prebuilding shared additive GBLUP full GRM ...Failed"
+                    else failed_status_text("Prebuilding shared additive GBLUP full GRM")
                 )
                 raise
             if str(shared_additive_gblup_cache.storage) != "memmap-cache-miss":
@@ -18175,11 +18186,7 @@ def _run_gs_pipeline(
                     )
                 )
             else:
-                task.complete(
-                    "Prebuilding shared additive GBLUP full GRM ...Finished "
-                    f"(storage={shared_additive_gblup_cache.storage}, "
-                    f"shape={shared_additive_gblup_cache.grm.shape[0]}x{shared_additive_gblup_cache.grm.shape[1]})"
-                )
+                task.complete(finished_status_text("Prebuilding shared additive GBLUP full GRM"))
         if bool(debug_mode):
             logger.info(
                 "[GS-DEBUG] shared additive GBLUP full-GRM ready "

@@ -59,8 +59,7 @@ from ._common.pathcheck import (
     format_path_for_display,
     ensure_plink_prefix_exists,
 )
-from ._common.progress import ProgressAdapter
-from ._common.status import CliStatus, format_elapsed, log_success
+from ._common.progress import CliStatus, ProgressAdapter, format_elapsed, log_success
 from ._common.genocache import configure_genotype_cache_from_out
 from ._common.genoio import (
     determine_genotype_source as _determine_genotype_source,
@@ -823,6 +822,10 @@ def main(log: bool = True):
         include_hidden_legacy_single_dash_alias=True,
     )
     optional_group.add_argument(
+        "-v", "--verbose", action="store_true", default=False,
+        help="Show advanced backend and thread diagnostics.",
+    )
+    optional_group.add_argument(
         "--stage-timing", action="store_true", default=False,
         help=(
             "Print stage timing breakdown (decode/GEMM/other) from the selected "
@@ -882,13 +885,14 @@ def main(log: bool = True):
     rust_blas_threads_text = (
         "NA" if rust_blas_threads is None else str(int(rust_blas_threads))
     )
-    logger.info(
-        "Rust SGEMM backend: %s; requested_threads=%s; rust_blas_threads=%s; direct_set=%s.",
-        rust_blas_backend,
-        int(args.thread),
-        rust_blas_threads_text,
-        "ok" if rust_blas_set_ok else "no",
-    )
+    if bool(getattr(args, "verbose", False)):
+        logger.info(
+            "Rust SGEMM backend: %s; requested_threads=%s; rust_blas_threads=%s; direct_set=%s.",
+            rust_blas_backend,
+            int(args.thread),
+            rust_blas_threads_text,
+            "ok" if rust_blas_set_ok else "no",
+        )
     if require_openblas_by_default() and rust_blas_backend not in {"openblas"}:
         logger.warning(
             "Rust SGEMM backend is '%s', not openblas. Dense GRM build may underutilize threads.",

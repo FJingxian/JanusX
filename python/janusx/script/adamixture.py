@@ -49,8 +49,15 @@ from ._common.pathcheck import (
     format_path_for_display,
     ensure_plink_prefix_exists,
 )
-from ._common.progress import build_rich_progress, rich_progress_available
-from ._common.status import CliStatus, log_success, print_failure, print_success, stdout_is_tty
+from ._common.progress import (
+    CliStatus,
+    build_rich_progress,
+    log_success,
+    print_failure,
+    print_success,
+    rich_progress_available,
+    stdout_is_tty,
+)
 from ._common.threads import (
     apply_blas_thread_env,
     detect_effective_threads,

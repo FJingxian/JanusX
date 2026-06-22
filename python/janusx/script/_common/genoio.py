@@ -33,8 +33,13 @@ from .grmio import (
 )
 from .binsidecar import LEGACY_BSITE_HEADER_SIZE, LEGACY_BSITE_MAGIC, LEGACY_BSITE_VERSION
 from .pathcheck import safe_expanduser
-from .progress import build_rich_progress, rich_progress_available
-from .status import CliStatus, should_animate_status, stdout_is_tty
+from .progress import (
+    CliStatus,
+    build_rich_progress,
+    rich_progress_available,
+    should_animate_status,
+    stdout_is_tty,
+)
 
 try:
     from janusx.janusx import gfd_packbits_from_dosage_block as _gfd_packbits_from_dosage_block

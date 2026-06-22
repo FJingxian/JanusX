@@ -82,7 +82,7 @@ from janusx.script._common.cli import (  # noqa: E402
     parse_trait_selector_specs,
     resolve_trait_selectors,
 )  # noqa: E402
-from janusx.script._common.status import CliStatus, stdout_is_tty  # noqa: E402
+from janusx.script._common.progress import CliStatus, stdout_is_tty  # noqa: E402
 from janusx.script import sim as sim_mod  # noqa: E402
 from janusx.gfreader import convert_genotypes, inspect_genotype_file, load_genotype_chunks, save_genotype_streaming  # noqa: E402
 from janusx.gs.workflow import build_cv_splits  # noqa: E402

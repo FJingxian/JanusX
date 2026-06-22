@@ -53,7 +53,7 @@ from ._common.helptext import CliArgumentParser, cli_help_formatter, minimal_hel
 from ._common.genocache import configure_genotype_cache_from_out
 from ._common.log import setup_logging
 from ._common.pathcheck import format_output_display, format_path_for_display, safe_expanduser
-from ._common.status import CliStatus, print_success, print_warning, stdout_is_tty
+from ._common.progress import CliStatus, print_success, print_warning, stdout_is_tty
 
 
 @dataclass

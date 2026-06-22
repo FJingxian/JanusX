@@ -1179,6 +1179,7 @@ def full_flow(outdir: Path, logdir: Path, postgs_enabled: bool) -> None:
             "-lmm",
             "-lm",
             "-fastlmm",
+            "-fvlmm",
             "-algwas",
             "-splmm",
             "-k",
@@ -1373,7 +1374,6 @@ def backend_thread_checks(outdir: Path, *, bench_threads: int = 0) -> None:
                     str(outdir),
                     "-prefix",
                     prefix,
-                    "-npy",
                 ]
             )
             elapsed = time.perf_counter() - t0

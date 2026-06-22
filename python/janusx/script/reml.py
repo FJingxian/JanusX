@@ -43,7 +43,7 @@ from ._common.grmio import load_grm_matrix, read_id_file, resolve_grm_id_path
 from ._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 from ._common.pathcheck import ensure_file_exists, format_path_for_display
 from ._common.genoio import strip_default_prefix_suffix
-from ._common.status import log_success, print_failure, format_elapsed, success_symbol
+from ._common.progress import log_success, print_failure, format_elapsed, success_symbol
 
 
 @dataclass

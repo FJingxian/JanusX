@@ -2015,11 +2015,6 @@ impl MsgpsXtxCache {
         }
     }
 
-    #[inline]
-    fn is_spill_active(&self) -> bool {
-        !self.entries.is_empty()
-    }
-
     fn log_line(&self, label: &str, row_idx: Option<usize>) {
         let stats = self.stats();
         let row_part = row_idx
@@ -2067,7 +2062,7 @@ impl MsgpsXtxCache {
     }
 
     fn maybe_log_final_summary(&self) {
-        if self.log_enabled || self.is_spill_active() {
+        if self.log_enabled {
             self.log_line("final", None);
         }
     }

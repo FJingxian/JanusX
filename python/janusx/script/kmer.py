@@ -23,7 +23,7 @@ from ._common.config_render import emit_cli_configuration
 from ._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 from ._common.log import setup_logging
 from ._common.pathcheck import format_path_for_display
-from ._common.status import CliStatus, format_elapsed, log_success, stdout_is_tty
+from ._common.progress import CliStatus, format_elapsed, log_success, stdout_is_tty
 from ._common.threads import detect_effective_threads, format_requested_thread_usage
 
 

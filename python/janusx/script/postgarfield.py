@@ -51,7 +51,7 @@ from janusx.script._common.pathcheck import (
     format_path_for_display,
     ensure_plink_prefix_exists,
 )
-from janusx.script._common.status import CliStatus, log_success, warn_deprecated_alias_usage, stdout_is_tty
+from janusx.script._common.progress import CliStatus, log_success, warn_deprecated_alias_usage, stdout_is_tty
 from janusx.script._common.threads import (
     apply_blas_thread_env,
     detect_effective_threads,

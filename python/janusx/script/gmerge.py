@@ -50,7 +50,7 @@ from ._common.pathcheck import (
     format_path_for_display,
     safe_expanduser,
 )
-from ._common.status import CliStatus, log_success, stdout_is_tty
+from ._common.progress import CliStatus, log_success, stdout_is_tty
 from janusx.gfreader import SiteInfo, inspect_genotype_file, load_genotype_chunks, save_genotype_streaming
 from janusx.gfreader.gmerge import merge
 

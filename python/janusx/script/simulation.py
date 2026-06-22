@@ -39,8 +39,7 @@ from ._common.pathcheck import (
     ensure_plink_prefix_exists,
     format_path_for_display,
 )
-from ._common.progress import ProgressAdapter
-from ._common.status import CliStatus, format_elapsed, log_success
+from ._common.progress import CliStatus, ProgressAdapter, format_elapsed, log_success
 
 
 def _parse_bimrange(text: str) -> tuple[str, int, int]:

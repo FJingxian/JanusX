@@ -81,8 +81,7 @@ from ._common.pathcheck import (
     ensure_plink_prefix_exists,
     format_path_for_display,
 )
-from ._common.progress import ProgressAdapter
-from ._common.status import CliStatus, format_elapsed, log_success, stdout_is_tty
+from ._common.progress import CliStatus, ProgressAdapter, format_elapsed, log_success, stdout_is_tty
 from ._common.genocache import configure_genotype_cache_from_out
 from ._common.genoio import (
     determine_genotype_source as _determine_genotype_source,
@@ -106,6 +105,15 @@ from ._common.threads import (
 
 DEFAULT_BED_MEMORY_GB = 1.0
 _PCA_PLOT_BACKEND = None
+
+
+def _pca_logger_verbose(logger) -> bool:
+    if logger is None:
+        return False
+    try:
+        return bool(getattr(logger, "_janusx_pca_verbose"))
+    except Exception:
+        return False
 
 
 def _get_pca_plot_backend():
@@ -642,7 +650,7 @@ def _load_eigenval_table(path: str) -> tuple[np.ndarray, np.ndarray]:
 
 def _log_pca_eigh_backend(logger, evd_backend: str | None) -> None:
     backend = str(evd_backend).strip()
-    if backend == "":
+    if backend == "" or (not _pca_logger_verbose(logger)):
         return
     try:
         logger.info(f"EIGH backend: {backend}")
@@ -843,7 +851,7 @@ def eigendecompose_grm(
     eigvec = eigvec[:, idx]
 
     backend = str(_evd_backend).strip()
-    if logger is not None:
+    if logger is not None and _pca_logger_verbose(logger):
         logger.info(f"Eigen decomposition finished (backend={backend}).")
 
     return eigvec, eigval, backend
@@ -907,7 +915,7 @@ def eigendecompose_grm_file(
     eigval = eigval[idx]
     eigvec = eigvec[:, idx]
     backend = str(_evd_backend).strip()
-    if logger is not None:
+    if logger is not None and _pca_logger_verbose(logger):
         logger.info(f"Eigen decomposition finished (backend={backend}, n={int(n)}).")
     return eigvec, eigval, backend, int(n)
 
@@ -977,6 +985,10 @@ def main(log: bool = True):
         default=DEFAULT_BED_MEMORY_GB,
         help_profile="gwas_decode",
         include_hidden_legacy_single_dash_alias=True,
+    )
+    optional_group.add_argument(
+        "-v", "--verbose", action="store_true", default=False,
+        help="Show advanced backend and thread diagnostics.",
     )
     add_common_thread_arg(optional_group, default_threads=detect_effective_threads())
     optional_group.add_argument(
@@ -1115,6 +1127,7 @@ def main(log: bool = True):
     configure_genotype_cache_from_out(args.out)
     log_path = f"{outprefix}.pca.log"
     logger = setup_logging(log_path)
+    setattr(logger, "_janusx_pca_verbose", bool(getattr(args, "verbose", False)))
     if thread_capped:
         logger.warning(
             f"Requested threads={requested_threads} exceeds detected available={detected_threads}; "

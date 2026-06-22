@@ -108,8 +108,14 @@ from ._common.pathcheck import (
     format_path_for_display,
     ensure_plink_prefix_exists,
 )
-from ._common.progress import ProgressAdapter, build_rich_progress
-from ._common.status import CliStatus, log_success, stdout_is_tty, _emit_to_file_handlers
+from ._common.progress import (
+    CliStatus,
+    ProgressAdapter,
+    _emit_to_file_handlers,
+    build_rich_progress,
+    log_success,
+    stdout_is_tty,
+)
 from ._common.genocache import configure_genotype_cache_from_out
 from ._common.threads import (
     apply_blas_thread_env,

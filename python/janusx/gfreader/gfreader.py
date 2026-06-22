@@ -55,7 +55,7 @@ except Exception:
     _HAS_RICH_PROGRESS = False
 
 try:
-    from janusx.script._common.status import get_rich_spinner_name as _get_rich_spinner_name
+    from janusx.script._common.progress import get_rich_spinner_name as _get_rich_spinner_name
 except Exception:
     def _get_rich_spinner_name() -> str:  # type: ignore[override]
         return "dots"

@@ -41,7 +41,7 @@ from janusx.script._common.pathcheck import (
     ensure_plink_prefix_exists,
     format_path_for_display,
 )
-from janusx.script._common.status import CliStatus, log_success
+from janusx.script._common.progress import CliStatus, log_success
 from janusx.script._common.threads import detect_effective_threads, format_requested_thread_usage
 from janusx.script.simulation import simulate_phenotype_from_genofile, write_phenotypes, write_sites
 

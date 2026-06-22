@@ -126,7 +126,7 @@ from janusx.script._common.pathcheck import (
     safe_expanduser,
     safe_resolve,
 )
-from janusx.script._common.status import (
+from janusx.script._common.progress import (
     CliStatus,
     is_skip_status_text,
     print_success,
@@ -617,7 +617,7 @@ def _gwas_use_packed_grm_build() -> bool:
     Whether GRM construction should prefer packed BED + Rust CBLAS route.
 
     Default is True. In current GWAS policy, packed GRM reuse is reserved for
-    packed-only model routes; standard LM/LMM/FaSTLMM/FvLMM/SparseLMM scans
+    packed-only model routes; standard LM/LMM/FastLMM/FvLMM/SparseLMM scans
     stay on memmap/streaming backends.
     """
     raw = str(os.environ.get("JX_GWAS_USE_PACKED_GRM", "")).strip().lower()
@@ -5797,6 +5797,11 @@ def _run_gwas_pipeline(
             setattr(_lg, "_janusx_gwas_stream_logger", terminal_logger if terminal_rich else None)
         except Exception:
             continue
+    _prev_algwas_xtx_cache_log = os.environ.get("JX_ALGWAS_XTX_CACHE_LOG")
+    if bool(getattr(args, "verbose", False)):
+        os.environ["JX_ALGWAS_XTX_CACHE_LOG"] = "1"
+    else:
+        os.environ.pop("JX_ALGWAS_XTX_CACHE_LOG", None)
 
     advanced_notes: list[str] = []
 
@@ -6048,7 +6053,7 @@ def _run_gwas_pipeline(
         _emit_warning_line(
             logger,
             (
-                "FaSTLMM is deprecated and will be removed in JanusX 1.0.26. "
+                "`-fastlmm` is deprecated and will be removed in JanusX 1.0.26. "
                 "Use `-fvlmm` for fixed-lambda scans or `-lmm`/`-lmm2` for exact LMM."
             ),
             use_spinner=bool(use_spinner),
@@ -6099,7 +6104,7 @@ def _run_gwas_pipeline(
     )
     if force_bed_stream_scan and bool(args.file) and (not bool(fast_mode)):
         _append_advanced_note(
-            "FILE matrix input for LM/LMM/FaSTLMM: materializing PLINK BED cache for Rust streaming scan."
+            "FILE matrix input for LM/LMM/FastLMM: materializing PLINK BED cache for Rust streaming scan."
         )
     if (not bool(fast_mode)) and bool(args.lmm or getattr(args, "lmm2", False) or args.fastlmm or args.fvlmm or qcov_needs_grm):
         _append_advanced_note(
@@ -7094,6 +7099,11 @@ def _run_gwas_pipeline(
         run_status = "failed"
         run_error = str(e)
         logger.exception(f"Error in JanusX GWAS pipeline: {e}")
+    finally:
+        if _prev_algwas_xtx_cache_log is None:
+            os.environ.pop("JX_ALGWAS_XTX_CACHE_LOG", None)
+        else:
+            os.environ["JX_ALGWAS_XTX_CACHE_LOG"] = _prev_algwas_xtx_cache_log
 
     if terminal_rich:
         lt = time.localtime()

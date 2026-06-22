@@ -18,8 +18,6 @@ from janusx.script._common.cjk import contains_cjk as _contains_cjk, ensure_cjk_
 from janusx.script._common.progress import (
     ProgressBarAdapter as _BaseProgressAdapter,
     SpinnerStatusAdapter,
-)
-from janusx.script._common.status import (
     CliStatus,
     format_elapsed,
     is_skip_status_text,

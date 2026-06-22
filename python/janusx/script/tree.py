@@ -58,7 +58,7 @@ from ._common.pathcheck import (
     ensure_plink_prefix_exists,
     format_path_for_display,
 )
-from ._common.status import format_elapsed, log_success
+from ._common.progress import format_elapsed, log_success
 
 
 @contextmanager

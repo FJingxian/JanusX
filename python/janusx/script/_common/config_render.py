@@ -4,7 +4,7 @@ import sys
 from typing import Any, Optional, Sequence
 
 from .pathcheck import format_path_for_display
-from .status import stdout_is_tty
+from .progress import stdout_is_tty
 
 try:
     from rich.console import Console, Group

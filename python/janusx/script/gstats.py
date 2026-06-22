@@ -30,7 +30,7 @@ from ._common.pathcheck import (
     ensure_plink_prefix_exists,
     format_path_for_display,
 )
-from ._common.status import CliStatus, format_elapsed, log_success
+from ._common.progress import CliStatus, format_elapsed, log_success
 from ._common.threads import detect_effective_threads, format_requested_thread_usage
 
 try:

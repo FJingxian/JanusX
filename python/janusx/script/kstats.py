@@ -12,8 +12,7 @@ from ._common.config_render import emit_cli_configuration
 from ._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 from ._common.log import setup_logging
 from ._common.pathcheck import format_kmc_db_pair_for_display, format_path_for_display
-from ._common.progress import ProgressAdapter
-from ._common.status import log_success
+from ._common.progress import ProgressAdapter, log_success
 from ._common.threads import detect_effective_threads, format_requested_thread_usage
 
 DEFAULT_MEMORY_GB = 8.0

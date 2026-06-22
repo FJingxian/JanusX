@@ -12,7 +12,7 @@ from tqdm import tqdm
 import os
 import sys
 from time import monotonic
-from janusx.script._common.status import (
+from janusx.script._common.progress import (
     get_rich_spinner_name,
     print_success,
     print_failure,

@@ -35,7 +35,7 @@ from ._common.pathcheck import (
     format_path_for_display,
     ensure_plink_prefix_exists,
 )
-from ._common.status import (
+from ._common.progress import (
     log_success,
     print_success,
     print_failure,

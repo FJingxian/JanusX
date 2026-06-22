@@ -56,6 +56,7 @@ def _bootstrap_repo_python_path() -> None:
 _bootstrap_repo_python_path()
 
 from janusx.script._common.pathcheck import safe_expanduser  # noqa: E402
+from janusx.script._common.genoio import prepare_packed_stats_ctx_from_plink  # noqa: E402
 from janusx.script._common.threads import detect_effective_threads  # noqa: E402
 from janusx.script._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog  # noqa: E402
 from janusx.script._common.cli import (  # noqa: E402
@@ -120,6 +121,43 @@ class AlignRuntime:
     rmvp_vc_method: str
     rmvp_method_bin: str
     farmcpu_threshold: float
+
+
+def _build_benchmark_marker_manifest(
+    *,
+    bfile_prefix: str,
+    maf: float,
+    geno: float,
+    snps_only: bool,
+    expected_n_samples: int | None = None,
+) -> tuple[list[int], int]:
+    sample_ids, meta_ctx = prepare_packed_stats_ctx_from_plink(
+        bfile_prefix,
+        maf=float(maf),
+        missing_rate=float(geno),
+        het_threshold=0.0,
+        snps_only=bool(snps_only),
+        expected_n_samples=expected_n_samples,
+    )
+    active_row_idx = meta_ctx.get("active_row_idx", None)
+    if active_row_idx is None:
+        raise RuntimeError("Packed stats context missing active_row_idx for benchmark marker manifest.")
+    active = [int(x) for x in pd.Series(active_row_idx).astype("int64").tolist()]
+    return active, int(len(sample_ids))
+
+
+def _write_benchmark_marker_manifest(
+    *,
+    out_path: Path,
+    active_rows: list[int],
+) -> Path:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame({"row_idx0": [int(x) for x in active_rows]}).to_csv(
+        out_path,
+        sep="\t",
+        index=False,
+    )
+    return out_path
 
 
 def _strip_default_prefix_suffix(path: str) -> str:
@@ -965,6 +1003,66 @@ subset_geno_for_individuals <- function(geno, ind_idx, n_markers, cache_prefix, 
   )
 }
 
+subset_geno_for_markers <- function(geno, marker_idx0, n_markers, cache_prefix, label) {
+  nsnp <- as.integer(n_markers)
+  if (!is.finite(nsnp) || nsnp <= 0L) {
+    stop(sprintf("%s: invalid marker count for genotype subsetting.", label), call. = FALSE)
+  }
+  idx0 <- as.integer(marker_idx0)
+  idx0 <- idx0[is.finite(idx0)]
+  idx0 <- unique(idx0)
+  idx0 <- idx0[idx0 >= 0L & idx0 < nsnp]
+  if (!length(idx0)) {
+    stop(sprintf("%s: no valid marker indices supplied for genotype subsetting.", label), call. = FALSE)
+  }
+  idx <- idx0 + 1L
+  geno_nr <- tryCatch(as.integer(nrow(geno)), error = function(e) NA_integer_)
+  geno_nc <- tryCatch(as.integer(ncol(geno)), error = function(e) NA_integer_)
+  marker_by_col <- is.finite(geno_nc) && geno_nc == nsnp
+  marker_by_row <- is.finite(geno_nr) && geno_nr == nsnp
+  if (!marker_by_col && !marker_by_row) {
+    stop(
+      sprintf(
+        "%s: cannot infer genotype orientation for marker subset (nrow=%s, ncol=%s, n_markers=%s).",
+        label,
+        as.character(geno_nr),
+        as.character(geno_nc),
+        as.character(nsnp)
+      ),
+      call. = FALSE
+    )
+  }
+  sub_mat <- if (marker_by_col) {
+    geno[, idx, drop = FALSE]
+  } else {
+    geno[idx, , drop = FALSE]
+  }
+  cache_dir <- dirname(cache_prefix)
+  dir.create(cache_dir, recursive = TRUE, showWarnings = FALSE)
+  backingfile <- paste0(basename(cache_prefix), ".", label, ".geno.bin")
+  descriptorfile <- paste0(basename(cache_prefix), ".", label, ".geno.desc")
+  bin_path <- file.path(cache_dir, backingfile)
+  desc_path <- file.path(cache_dir, descriptorfile)
+  if (file.exists(bin_path)) unlink(bin_path, force = TRUE)
+  if (file.exists(desc_path)) unlink(desc_path, force = TRUE)
+  bm <- bigmemory::filebacked.big.matrix(
+    nrow = nrow(sub_mat),
+    ncol = ncol(sub_mat),
+    type = "char",
+    backingfile = backingfile,
+    backingpath = cache_dir,
+    descriptorfile = descriptorfile,
+    dimnames = c(NULL, NULL)
+  )
+  bm[, ] <- sub_mat[, ]
+  flush(bm)
+  list(
+    geno = bm,
+    marker_by_col = marker_by_col,
+    kept_idx0 = idx0
+  )
+}
+
 patch_rmvp_farmcpu_burger_if_needed <- function() {
   ns <- asNamespace("rMVP")
   if (!exists("FarmCPU.Burger", where = ns, inherits = FALSE)) {
@@ -1085,6 +1183,7 @@ workdir <- require_opt(opts, "workdir")
 inner_log <- require_opt(opts, "inner-log")
 meta_file <- require_opt(opts, "meta-file")
 cache_prefix <- require_opt(opts, "cache-prefix")
+marker_manifest_path <- ifelse(is.null(opts[["marker-manifest"]]), "", trimws(opts[["marker-manifest"]]))
 
 threads <- suppressWarnings(as.integer(opts[["threads"]]))
 if (!is.finite(threads) || threads < 1L) threads <- 1L
@@ -1174,6 +1273,37 @@ tryCatch(
       stop("rMVP map cache must contain at least SNP/CHROM/POS columns.", call. = FALSE)
     }
     map_out <- as.data.frame(map, stringsAsFactors = FALSE)
+    if (nzchar(marker_manifest_path)) {
+      if (!file.exists(marker_manifest_path)) {
+        stop(sprintf("Marker manifest not found: %s", marker_manifest_path), call. = FALSE)
+      }
+      marker_manifest <- utils::read.table(
+        marker_manifest_path,
+        header = TRUE,
+        sep = "\t",
+        stringsAsFactors = FALSE,
+        check.names = FALSE
+      )
+      if (!("row_idx0" %in% names(marker_manifest))) {
+        stop("Marker manifest must contain a `row_idx0` column.", call. = FALSE)
+      }
+      marker_idx0 <- suppressWarnings(as.integer(marker_manifest[["row_idx0"]]))
+      marker_idx0 <- marker_idx0[is.finite(marker_idx0)]
+      if (!length(marker_idx0)) {
+        stop("Marker manifest is empty after parsing `row_idx0`.", call. = FALSE)
+      }
+      cat("[INFO] Applying JanusX marker manifest:", marker_manifest_path, "kept=", length(marker_idx0), "\n")
+      marker_subset <- subset_geno_for_markers(
+        geno = geno,
+        marker_idx0 = marker_idx0,
+        n_markers = nrow(map_out),
+        cache_prefix = cache_prefix,
+        label = "farmcpu_markers"
+      )
+      geno <- marker_subset$geno
+      map_out <- map_out[marker_subset$kept_idx0 + 1L, , drop = FALSE]
+      rownames(map_out) <- NULL
+    }
     # rMVP::MVP.FarmCPU expects only SNP/CHROM/POS here; passing A1/A2 shifts the internal P column.
     map_farmcpu <- map_out[, seq_len(3L), drop = FALSE]
     if (!is.finite(threshold) || threshold <= 0) threshold <- 1 / max(1L, nrow(map_farmcpu))
@@ -1466,6 +1596,7 @@ def _run_kernel_r(
     *,
     kernel: str,
     bfile_prefix: str,
+    marker_manifest: Optional[Path],
     pheno_for_r: Path,
     out_dir: Path,
     farm_bound: int,
@@ -1537,6 +1668,8 @@ def _run_kernel_r(
         "--force-rebuild",
         rmvp_force_rebuild,
     ]
+    if marker_manifest is not None:
+        cmd += ["--marker-manifest", str(marker_manifest)]
     rc, elapsed, rss = _run_timed(cmd, log_file=log_file, time_file=time_file)
     status = "ok" if rc == 0 else "failed"
     pseudo_qtn = None
@@ -2001,6 +2134,7 @@ def main() -> None:
     bfile_for_r = ""
     conv_elapsed = 0.0
     conv_rss = math.nan
+    marker_manifest_path: Optional[Path] = None
 
     needs_r = "rmvp" in kernels
     if needs_r:
@@ -2051,6 +2185,22 @@ def main() -> None:
         n_snps_for_threshold,
     )
 
+    if "rmvp" in kernels:
+        bfile_for_manifest = bfile_for_r or (str(gfile) if bool(args.bfile) else "")
+        if not bfile_for_manifest:
+            raise RuntimeError("Benchmark marker manifest requires a PLINK BED prefix for rMVP alignment.")
+        active_rows, _manifest_n_samples = _build_benchmark_marker_manifest(
+            bfile_prefix=str(bfile_for_manifest),
+            maf=float(args.maf),
+            geno=float(args.geno),
+            snps_only=bool(args.snps_only),
+            expected_n_samples=(len(fam_ids) if len(fam_ids) > 0 else None),
+        )
+        marker_manifest_path = _write_benchmark_marker_manifest(
+            out_path=bench_dir / "input" / "janusx_marker_manifest.tsv",
+            active_rows=active_rows,
+        )
+
     rmvp_runner = bench_dir / "tmp" / "rmvp_farmcpu_runner.R"
     rmvp_runner.parent.mkdir(parents=True, exist_ok=True)
     _build_rmvp_runner_script(rmvp_runner)
@@ -2076,6 +2226,7 @@ def main() -> None:
                 args,
                 kernel=kernel,
                 bfile_prefix=bfile_for_r,
+                marker_manifest=marker_manifest_path,
                 pheno_for_r=ph_for_r,
                 out_dir=bench_dir / "runs",
                 farm_bound=farm_bound,
@@ -2120,6 +2271,7 @@ def main() -> None:
         "conversion_elapsed_sec": float(conv_elapsed),
         "conversion_peak_rss_kb": float(conv_rss),
         "benchmark_dir": str(bench_dir),
+        "rmvp_marker_manifest": (str(marker_manifest_path) if marker_manifest_path is not None else None),
     }
     _save_summary(bench_dir / "summary", args.prefix, rows, cfg)
 

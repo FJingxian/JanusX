@@ -720,6 +720,9 @@ def _emit_gwas_summary_legacy(
                     pve_text = f"{pve_val:.3f}"
         except Exception:
             pve_text = "NA"
+        peak_rss = r.get("peak_rss_gb", None)
+        peak_footprint = r.get("peak_footprint_gb", None)
+        mem_gb = peak_footprint if peak_footprint is not None else peak_rss
         out_rows.append(
             [
                 str(r.get("phenotype", "")),
@@ -727,7 +730,11 @@ def _emit_gwas_summary_legacy(
                 f"{int(r.get('nidv', 0))}",
                 f"{int(r.get('eff_snp', 0))}",
                 pve_text,
-                f"{float(r.get('peak_rss_gb', 0.0)):.2f}",
+                (
+                    f"{float(mem_gb):.2f}"
+                    if mem_gb is not None and np.isfinite(float(mem_gb))
+                    else "NA"
+                ),
                 f"{float(r.get('gwas_time_s', 0.0)):.1f}",
                 f"{float(r.get('viz_time_s', 0.0)):.1f}",
             ]
@@ -776,6 +783,9 @@ def _emit_gwas_summary(
                     pve_text = f"{pve_val:.3f}"
         except Exception:
             pve_text = "NA"
+        peak_rss = r.get("peak_rss_gb", None)
+        peak_footprint = r.get("peak_footprint_gb", None)
+        mem_gb = peak_footprint if peak_footprint is not None else peak_rss
         out_rows.append(
             [
                 str(r.get("phenotype", "")),
@@ -783,7 +793,11 @@ def _emit_gwas_summary(
                 f"{int(r.get('nidv', 0))}",
                 f"{int(r.get('eff_snp', 0))}",
                 pve_text,
-                f"{float(r.get('peak_rss_gb', 0.0)):.2f}",
+                (
+                    f"{float(mem_gb):.2f}"
+                    if mem_gb is not None and np.isfinite(float(mem_gb))
+                    else "NA"
+                ),
                 f"{float(r.get('gwas_time_s', 0.0)):.1f}",
                 f"{float(r.get('viz_time_s', 0.0)):.1f}",
             ]

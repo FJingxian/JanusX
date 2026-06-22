@@ -654,7 +654,7 @@ pub fn gwas_packed_unified_to_tsv<'py>(
                     .and_then(|v| v.extract().ok())
                     .unwrap_or(false);
 
-                let (rows_n, qtn_n, pseudo_n) = farmcpu_packed_to_tsv(
+                let (rows_n, qtn_n, pseudo_n, stage1_time_s, stage2_time_s) = farmcpu_packed_to_tsv(
                     py,
                     y,
                     x_cov,
@@ -686,6 +686,8 @@ pub fn gwas_packed_unified_to_tsv<'py>(
                 result_obj.set_item("qtn_count", qtn_n)?;
                 result_obj.set_item("pseudo_rows", pseudo_n)?;
                 result_obj.set_item("written_rows", rows_n)?;
+                result_obj.set_item("stage1_time_s", stage1_time_s)?;
+                result_obj.set_item("stage2_time_s", stage2_time_s)?;
             }
             "algwas" => {
                 let y: PyReadonlyArray1<'py, f64> = req_item(&job, "y")?.extract()?;

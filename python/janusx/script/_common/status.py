@@ -168,6 +168,36 @@ def format_elapsed(seconds: Optional[float]) -> str:
     return f"{hours}h{mins:02d}m"
 
 
+def format_elapsed_parts(
+    parts: Optional[Iterable[object]],
+    *,
+    fallback_seconds: Optional[float] = None,
+) -> str:
+    out: list[str] = []
+    if parts is not None:
+        for item in parts:
+            if isinstance(item, (tuple, list)) and len(item) >= 2:
+                label = str(item[0]).strip()
+                value = item[1]
+                if isinstance(value, (int, float)):
+                    value_text = format_elapsed(float(value))
+                else:
+                    value_text = str(value).strip()
+                if value_text == "":
+                    continue
+                out.append(f"{label} {value_text}" if label != "" else value_text)
+                continue
+            if isinstance(item, (int, float)):
+                out.append(format_elapsed(float(item)))
+                continue
+            text = str(item).strip()
+            if text != "":
+                out.append(text)
+    if out:
+        return "/".join(out)
+    return format_elapsed(fallback_seconds)
+
+
 def spinner_refresh_interval(seconds: Optional[float]) -> float:
     _ = seconds
     # Keep spinner animation cadence independent from elapsed-time formatting.
@@ -417,6 +447,7 @@ class CliStatus:
         timeout: float = 0.08,
         show_elapsed: bool = True,
         use_process: bool = False,
+        force_animate: bool = False,
     ) -> None:
         self.desc = str(desc)
         self.enabled = bool(enabled)
@@ -426,7 +457,9 @@ class CliStatus:
         # Restrict spinner animation to interactive TTY only; in non-TTY
         # contexts keep output clean and emit only completion lines.
         self._animate = bool(
-            self.enabled and should_animate_status(self.desc) and stdout_is_tty()
+            self.enabled
+            and stdout_is_tty()
+            and (bool(force_animate) or should_animate_status(self.desc))
         )
         self._backend = "none"
         self._done = False
@@ -569,11 +602,20 @@ class CliStatus:
     def _format_elapsed(seconds: Optional[float]) -> str:
         return format_elapsed(seconds)
 
-    def _compose_line(self, symbol: str, message: str) -> str:
+    def _compose_line(
+        self,
+        symbol: str,
+        message: str,
+        *,
+        elapsed_parts: Optional[Iterable[object]] = None,
+    ) -> str:
         base = f"{symbol} {str(message)}"
         if not self.show_elapsed:
             return base
-        elapsed_text = self._format_elapsed(self._elapsed_seconds())
+        elapsed_text = format_elapsed_parts(
+            elapsed_parts,
+            fallback_seconds=self._elapsed_seconds(),
+        )
         return f"{base} [{elapsed_text}]"
 
     def _running_line(self) -> str:
@@ -581,7 +623,12 @@ class CliStatus:
             return self.desc
         return f"{self.desc} [{self._format_elapsed(self._elapsed_seconds())}]"
 
-    def complete(self, message: str) -> None:
+    def complete(
+        self,
+        message: str,
+        *,
+        elapsed_parts: Optional[Iterable[object]] = None,
+    ) -> None:
         if self._done:
             return
         self._stop_spinner()
@@ -591,7 +638,7 @@ class CliStatus:
             # together on terminals that keep cursor at line tail.
             _clear_current_console_line()
         symbol = _SUCCESS_SYMBOL
-        line = self._compose_line(symbol, str(message))
+        line = self._compose_line(symbol, str(message), elapsed_parts=elapsed_parts)
         if should_animate_status(message) or is_completed_status_text(message):
             if self._backend == "rich" and self._console is not None:
                 self._console.print(f"[green]{line}[/green]")
@@ -607,11 +654,20 @@ class CliStatus:
         else:
             plain = str(message)
             if self.show_elapsed:
-                plain = f"{plain} [{self._format_elapsed(self._elapsed_seconds())}]"
+                plain = (
+                    f"{plain} ["
+                    f"{format_elapsed_parts(elapsed_parts, fallback_seconds=self._elapsed_seconds())}"
+                    f"]"
+                )
             _safe_print(plain)
         self._done = True
 
-    def fail(self, message: str) -> None:
+    def fail(
+        self,
+        message: str,
+        *,
+        elapsed_parts: Optional[Iterable[object]] = None,
+    ) -> None:
         if self._done:
             return
         self._stop_spinner()
@@ -621,12 +677,16 @@ class CliStatus:
         if is_skip_status_text(message):
             plain = str(message)
             if self.show_elapsed:
-                plain = f"{plain} [{self._format_elapsed(self._elapsed_seconds())}]"
+                plain = (
+                    f"{plain} ["
+                    f"{format_elapsed_parts(elapsed_parts, fallback_seconds=self._elapsed_seconds())}"
+                    f"]"
+                )
             print_warning(plain, force_color=bool(self.enabled))
             self._done = True
             return
         symbol = _FAIL_SYMBOL
-        line = self._compose_line(symbol, str(message))
+        line = self._compose_line(symbol, str(message), elapsed_parts=elapsed_parts)
         tail = line[len(symbol):]
         if self._backend == "rich" and self._console is not None:
             self._console.print(f"[red]{symbol}[/red]{tail}")
@@ -634,6 +694,26 @@ class CliStatus:
             _safe_print(f"{_RED}{symbol}{_RESET}{tail}")
         else:
             _safe_print(line)
+        self._done = True
+
+    def close(
+        self,
+        *,
+        show_done: bool = False,
+        message: Optional[str] = None,
+        elapsed_parts: Optional[Iterable[object]] = None,
+    ) -> None:
+        if self._done:
+            return
+        if show_done:
+            self.complete(
+                str(self.desc if message is None else message),
+                elapsed_parts=elapsed_parts,
+            )
+            return
+        self._stop_spinner()
+        if self._backend in ("plain", "process") and stdout_is_tty():
+            _clear_current_console_line()
         self._done = True
 
     def __exit__(self, exc_type, exc, tb) -> None:

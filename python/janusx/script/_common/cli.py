@@ -303,7 +303,7 @@ def _resolve_memory_help(profile: str) -> str:
         ),
         "gs_decode": (
             "Decode block memory budget in GB for streamed BED kernels in GS. "
-            "Applied to rrBLUP-PCG, GBLUP(add), and BayesA/B/Cpi streamed BED paths; "
+            "Applied to BLUP-routed GBLUP/rrBLUP and BayesA/B/Cpi streamed BED paths; "
             "also used as the default Bayes resident-packed promotion cap when "
             "JX_GS_BAYES_PACKED_MAX_MB is not set; "
             "if a kernel keeps two decode buffers, each block uses about half of this budget "

@@ -983,17 +983,29 @@ patch_rmvp_farmcpu_burger_if_needed <- function() {
       theCV = matrix(1, nrow(Y), 1)
     }
     if (!is.null(GK)) {
-      n = nrow(GK)
-      m = if (is.null(dim(GK))) 1L else ncol(GK)
+      if (is.null(dim(GK))) {
+        n = length(GK)
+        m = if (n > 0L) 1L else 0L
+      } else {
+        n = nrow(GK)
+        m = ncol(GK)
+      }
       if (m >= 2L) {
         theGK = as.matrix(GK)
-      } else if (m == 0L) {
-        theGK = NULL
       } else {
-        theGK = matrix(GK, n, 1)
+        theGK = if (m == 1L && n > 0L) matrix(GK, nrow = n, ncol = 1L) else NULL
       }
     } else {
       theGK = GK
+    }
+    if (
+      is.null(theGK) ||
+      !length(theGK) ||
+      is.null(dim(theGK)) ||
+      nrow(theGK) < 1L ||
+      ncol(theGK) < 1L
+    ) {
+      return(list(REMLs = Inf, vg = NA_real_, ve = NA_real_, delta = NA_real_))
     }
     if (method == "FaST-LMM") {
       myFaSTREML = FarmCPU.FaSTLMM.LL(pheno = matrix(Y[, -1], nrow(Y), 1), snp.pool = theGK, X0 = theCV, ncpus = ncpus)
@@ -1016,6 +1028,37 @@ patch_rmvp_farmcpu_burger_if_needed <- function() {
   unlockBinding("FarmCPU.Burger", ns)
   on.exit(lockBinding("FarmCPU.Burger", ns), add = TRUE)
   assign("FarmCPU.Burger", patched, envir = ns)
+  TRUE
+}
+
+patch_rmvp_fastlmm_ll_if_needed <- function() {
+  ns <- asNamespace("rMVP")
+  if (!exists("FarmCPU.FaSTLMM.LL", where = ns, inherits = FALSE)) {
+    return(FALSE)
+  }
+  original <- get("FarmCPU.FaSTLMM.LL", envir = ns)
+  body_text <- paste(deparse(body(original)), collapse = "\n")
+  needle <- "snp.pool = snp.pool[, ]"
+  if (!grepl(needle, body_text, fixed = TRUE)) {
+    return(FALSE)
+  }
+  replacement <- paste(
+    "if (!is.null(snp.pool)) {",
+    "    if (is.null(dim(snp.pool))) {",
+    "        snp.pool = matrix(snp.pool, ncol = 1L)",
+    "    } else {",
+    "        snp.pool = snp.pool[, , drop = FALSE]",
+    "    }",
+    "}",
+    sep = "\n"
+  )
+  patched_body <- sub(needle, replacement, body_text, fixed = TRUE)
+  patched <- original
+  body(patched) <- parse(text = patched_body)[[1]]
+  environment(patched) <- environment(original)
+  unlockBinding("FarmCPU.FaSTLMM.LL", ns)
+  on.exit(lockBinding("FarmCPU.FaSTLMM.LL", ns), add = TRUE)
+  assign("FarmCPU.FaSTLMM.LL", patched, envir = ns)
   TRUE
 }
 
@@ -1084,8 +1127,11 @@ suppressPackageStartupMessages({
   library(rMVP)
   library(bigmemory)
 })
+if (patch_rmvp_fastlmm_ll_if_needed()) {
+  cat("[INFO] Patched rMVP::FarmCPU.FaSTLMM.LL to preserve single-column pseudoQTN matrices.\n")
+}
 if (patch_rmvp_farmcpu_burger_if_needed()) {
-  cat("[INFO] Patched rMVP::FarmCPU.Burger for 2-column FaST-LMM pseudoQTN compatibility.\n")
+  cat("[INFO] Patched rMVP::FarmCPU.Burger for 1/2-column FaST-LMM pseudoQTN compatibility.\n")
 }
 
 status <- 0L

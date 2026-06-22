@@ -4776,11 +4776,21 @@ def run_splmm_windowed_fullrank(
             else None
         )
 
-        def _stop_prepare_handle() -> None:
+        def _stop_prepare_handle(
+            *,
+            show_done: bool = False,
+            message: Optional[str] = None,
+            elapsed_parts: Optional[list[object]] = None,
+        ) -> None:
             nonlocal prepare_handle
             if prepare_handle is not None:
                 try:
-                    _stop_indeterminate_progress_bar(prepare_handle)
+                    _stop_indeterminate_progress_bar(
+                        prepare_handle,
+                        show_done=show_done,
+                        message=message,
+                        elapsed_parts=elapsed_parts,
+                    )
                 except Exception:
                     pass
                 prepare_handle = None
@@ -4839,6 +4849,7 @@ def run_splmm_windowed_fullrank(
             null_fit_obj, null_fit_secs = _run_sparse_null_fit_task()
             null_fit = dict(null_fit_obj)
         null_secs = max(time.monotonic() - null_prepare_t0, 0.0)
+        _stop_prepare_handle(show_done=False)
         peak_rss = max(peak_rss, process.memory_info().rss)
         if bool(use_preloaded_scan_meta):
             n_scan_sites_hint = int(np.asarray(scan_row_idx, dtype=np.int64).reshape(-1).shape[0])

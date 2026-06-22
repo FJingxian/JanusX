@@ -1153,6 +1153,12 @@ fn build_rrblup_exact_snp_cache_from_packed(
     threads: usize,
     blas_threads: usize,
 ) -> Result<RrblupExactSnpPreparedInner, String> {
+    let stage_timing = env_truthy("JX_GS_EXACT_STAGE_TIMING") || env_truthy("JX_GS_DEBUG_STAGE");
+    let prepare_t0 = if stage_timing {
+        Some(Instant::now())
+    } else {
+        None
+    };
     let n_train = train_idx.len();
     if n_train <= 1 {
         return Err("rrBLUP exact SNP cache requires at least two training samples.".to_string());
@@ -1172,6 +1178,9 @@ fn build_rrblup_exact_snp_cache_from_packed(
     let mut row_sum = vec![0.0_f64; eff_m];
     let mut block_f32 = vec![0.0_f32; eff_m * sample_block_use];
     let mut block_f64 = vec![0.0_f64; eff_m * sample_block_use];
+    let mut build_a_decode_secs = 0.0_f64;
+    let mut build_a_cast_secs = 0.0_f64;
+    let mut build_a_rankk_secs = 0.0_f64;
     let blas_threads_effective = if blas_threads > 0 {
         blas_threads.max(1)
     } else {
@@ -1183,6 +1192,11 @@ fn build_rrblup_exact_snp_cache_from_packed(
         let ced = (cst + sample_block_use).min(n_train);
         let cur_n = ced - cst;
         let blk_slice_f32 = &mut block_f32[..eff_m * cur_n];
+        let t_decode = if stage_timing {
+            Some(Instant::now())
+        } else {
+            None
+        };
         decode_standardized_block_f32(
             &mut source,
             n_samples,
@@ -1197,7 +1211,15 @@ fn build_rrblup_exact_snp_cache_from_packed(
             &code4_lut,
             pool_ref,
         )?;
+        if let Some(t0) = t_decode {
+            build_a_decode_secs += t0.elapsed().as_secs_f64();
+        }
         let blk_slice_f64 = &mut block_f64[..eff_m * cur_n];
+        let t_cast = if stage_timing {
+            Some(Instant::now())
+        } else {
+            None
+        };
         row_major_block_row_sum_and_cast_f64(
             blk_slice_f32,
             eff_m,
@@ -1206,6 +1228,14 @@ fn build_rrblup_exact_snp_cache_from_packed(
             blk_slice_f64,
             pool_ref,
         );
+        if let Some(t0) = t_cast {
+            build_a_cast_secs += t0.elapsed().as_secs_f64();
+        }
+        let t_rankk = if stage_timing {
+            Some(Instant::now())
+        } else {
+            None
+        };
         unsafe {
             cblas_dsyrk_dispatch(
                 CBLAS_ROW_MAJOR,
@@ -1221,12 +1251,31 @@ fn build_rrblup_exact_snp_cache_from_packed(
                 eff_m as CblasInt,
             );
         }
+        if let Some(t0) = t_rankk {
+            build_a_rankk_secs += t0.elapsed().as_secs_f64();
+        }
         check_ctrlc()?;
     }
 
+    let t_center = if stage_timing {
+        Some(Instant::now())
+    } else {
+        None
+    };
     let center_scale = 1.0_f64 / (n_train as f64);
     symmetrize_upper_minus_rank1_in_place(&mut a_star, eff_m, &row_sum, center_scale);
+    let center_secs = t_center
+        .map(|t0| t0.elapsed().as_secs_f64())
+        .unwrap_or(0.0_f64);
+    let t_eigh = if stage_timing {
+        Some(Instant::now())
+    } else {
+        None
+    };
     let (evals_all, evecs_all, eig_backend) = symmetric_eigh_f64_row_major(&a_star, eff_m)?;
+    let eigh_secs = t_eigh
+        .map(|t0| t0.elapsed().as_secs_f64())
+        .unwrap_or(0.0_f64);
     let max_eval = evals_all.last().copied().unwrap_or(0.0_f64).max(0.0_f64);
     let tol = f64::EPSILON * max_eval.max(1.0_f64) * (eff_m.max(1) as f64);
     let n_eff = n_train.saturating_sub(1);
@@ -1247,11 +1296,47 @@ fn build_rrblup_exact_snp_cache_from_packed(
             "rrblup_exact_snp_packed invalid effective df: n_eff={n_eff}, rank={rank}"
         ));
     }
+    let t_basis = if stage_timing {
+        Some(Instant::now())
+    } else {
+        None
+    };
     let mut evecs = vec![0.0_f64; eff_m * rank];
     for i in 0..eff_m {
         let src = &evecs_all[i * eff_m + keep_start..i * eff_m + eff_m];
         let dst = &mut evecs[i * rank..(i + 1) * rank];
         dst.copy_from_slice(src);
+    }
+    let basis_secs = t_basis
+        .map(|t0| t0.elapsed().as_secs_f64())
+        .unwrap_or(0.0_f64);
+    if let Some(t0) = prepare_t0 {
+        let total_secs = t0.elapsed().as_secs_f64().max(1e-12_f64);
+        let build_a_secs =
+            build_a_decode_secs + build_a_cast_secs + build_a_rankk_secs + center_secs;
+        let known_secs = build_a_secs + eigh_secs + basis_secs;
+        let other_secs = (total_secs - known_secs).max(0.0_f64);
+        let pct = |x: f64| -> f64 { (x * 100.0) / total_secs };
+        eprintln!(
+            "rrBLUP-EXACT prepare timing n_train={} m={} rank={} build_A={:.3}s ({:.1}%) [decode={:.3}s cast={:.3}s syrk={:.3}s center={:.3}s] eigh={:.3}s ({:.1}%) basis={:.3}s ({:.1}%) other={:.3}s ({:.1}%) total={:.3}s backend={}",
+            n_train,
+            eff_m,
+            rank,
+            build_a_secs,
+            pct(build_a_secs),
+            build_a_decode_secs,
+            build_a_cast_secs,
+            build_a_rankk_secs,
+            center_secs,
+            eigh_secs,
+            pct(eigh_secs),
+            basis_secs,
+            pct(basis_secs),
+            other_secs,
+            pct(other_secs),
+            total_secs,
+            eig_backend,
+        );
     }
 
     Ok(RrblupExactSnpPreparedInner {
@@ -1288,7 +1373,13 @@ fn fit_rrblup_exact_snp_from_cache_packed(
     reml_max_iter: usize,
     threads: usize,
     blas_threads: usize,
-) -> Result<(Vec<f64>, Vec<f64>, f64, f64, f64, Vec<f32>, String), String> {
+) -> Result<(Vec<f64>, Vec<f64>, f64, f64, f64, f64, f64, Vec<f32>, String), String> {
+    let stage_timing = env_truthy("JX_GS_EXACT_STAGE_TIMING") || env_truthy("JX_GS_DEBUG_STAGE");
+    let fit_t0 = if stage_timing {
+        Some(Instant::now())
+    } else {
+        None
+    };
     if n_samples != cache.n_samples {
         return Err(format!(
             "rrBLUP exact SNP cache sample-count mismatch: got {n_samples}, expected {}",
@@ -1324,10 +1415,17 @@ fn fit_rrblup_exact_snp_from_cache_packed(
     let mut z = vec![0.0_f64; cache.m];
     let mut tmp_dot = vec![0.0_f32; cache.m];
     let mut block_f32 = vec![0.0_f32; cache.m * cache.sample_block.max(1)];
+    let mut z_decode_secs = 0.0_f64;
+    let mut z_mul_secs = 0.0_f64;
     for cst in (0..cache.n_train).step_by(cache.sample_block.max(1)) {
         let ced = (cst + cache.sample_block).min(cache.n_train);
         let cur_n = ced - cst;
         let blk_slice_f32 = &mut block_f32[..cache.m * cur_n];
+        let t_decode = if stage_timing {
+            Some(Instant::now())
+        } else {
+            None
+        };
         decode_standardized_block_f32(
             &mut source,
             n_samples,
@@ -1342,6 +1440,14 @@ fn fit_rrblup_exact_snp_from_cache_packed(
             &code4_lut,
             pool_ref,
         )?;
+        if let Some(t0) = t_decode {
+            z_decode_secs += t0.elapsed().as_secs_f64();
+        }
+        let t_mul = if stage_timing {
+            Some(Instant::now())
+        } else {
+            None
+        };
         row_major_block_mul_vec_f32(
             blk_slice_f32,
             cache.m,
@@ -1350,6 +1456,9 @@ fn fit_rrblup_exact_snp_from_cache_packed(
             &mut tmp_dot,
             pool_ref,
         );
+        if let Some(t0) = t_mul {
+            z_mul_secs += t0.elapsed().as_secs_f64();
+        }
         for j in 0..cache.m {
             z[j] += tmp_dot[j] as f64;
         }
@@ -1362,6 +1471,11 @@ fn fit_rrblup_exact_snp_from_cache_packed(
         1usize
     };
     let _blas_guard = OpenBlasThreadGuard::enter(blas_threads_effective);
+    let t_project = if stage_timing {
+        Some(Instant::now())
+    } else {
+        None
+    };
     let mut coeff = vec![0.0_f64; cache.rank];
     unsafe {
         cblas_dgemm_dispatch(
@@ -1385,8 +1499,16 @@ fn fit_rrblup_exact_snp_from_cache_packed(
     for k in 0..cache.rank {
         y_proj[k] = coeff[k] / cache.eigvals[k].sqrt();
     }
+    let project_secs = t_project
+        .map(|t0| t0.elapsed().as_secs_f64())
+        .unwrap_or(0.0_f64);
     let low = log10_lambda_low.min(log10_lambda_high);
     let high = log10_lambda_low.max(log10_lambda_high);
+    let t_reml = if stage_timing {
+        Some(Instant::now())
+    } else {
+        None
+    };
     let (best_log10, best_cost) = brent_minimize(
         |x| {
             let lam = 10.0_f64.powf(x);
@@ -1403,7 +1525,15 @@ fn fit_rrblup_exact_snp_from_cache_packed(
         reml_tol,
         reml_max_iter,
     );
+    let reml_secs = t_reml
+        .map(|t0| t0.elapsed().as_secs_f64())
+        .unwrap_or(0.0_f64);
     let lambda_opt = 10.0_f64.powf(best_log10).max(1e-12_f64);
+    let t_solve = if stage_timing {
+        Some(Instant::now())
+    } else {
+        None
+    };
     let mut quad = 0.0_f64;
     let mut y_proj_ss = 0.0_f64;
     let mut g_center_ss = 0.0_f64;
@@ -1444,6 +1574,9 @@ fn fit_rrblup_exact_snp_from_cache_packed(
             1 as CblasInt,
         );
     }
+    let solve_secs = t_solve
+        .map(|t0| t0.elapsed().as_secs_f64())
+        .unwrap_or(0.0_f64);
     let beta_f32: Vec<f32> = beta_f64.iter().map(|&v| v as f32).collect();
     let pred_block_rows = 1024usize.min(cache.m.max(1));
     let var_g = if cache.n_train > 1 {
@@ -1458,6 +1591,11 @@ fn fit_rrblup_exact_snp_from_cache_packed(
         f64::NAN
     };
 
+    let t_pred_train = if stage_timing {
+        Some(Instant::now())
+    } else {
+        None
+    };
     let pred_train_ret = if let Some(local_idx) = &train_pred_pick {
         if local_idx.is_empty() {
             Vec::new()
@@ -1512,8 +1650,16 @@ fn fit_rrblup_exact_snp_from_cache_packed(
             .map(|v| (v as f64) + y_mean)
             .collect()
     };
+    let pred_train_secs = t_pred_train
+        .map(|t0| t0.elapsed().as_secs_f64())
+        .unwrap_or(0.0_f64);
 
     let mut pred_test_ret = Vec::new();
+    let t_pred_test = if stage_timing && !test_idx.is_empty() {
+        Some(Instant::now())
+    } else {
+        None
+    };
     if !test_idx.is_empty() {
         let mut pred_test_source = RrblupPcgSource::Resident {
             packed_flat,
@@ -1539,6 +1685,41 @@ fn fit_rrblup_exact_snp_from_cache_packed(
             .map(|v| (*v as f64) + y_mean)
             .collect();
     }
+    let pred_test_secs = t_pred_test
+        .map(|t0| t0.elapsed().as_secs_f64())
+        .unwrap_or(0.0_f64);
+    if let Some(t0) = fit_t0 {
+        let total_secs = t0.elapsed().as_secs_f64().max(1e-12_f64);
+        let build_z_secs = z_decode_secs + z_mul_secs;
+        let predict_secs = pred_train_secs + pred_test_secs;
+        let known_secs = build_z_secs + project_secs + reml_secs + solve_secs + predict_secs;
+        let other_secs = (total_secs - known_secs).max(0.0_f64);
+        let pct = |x: f64| -> f64 { (x * 100.0) / total_secs };
+        eprintln!(
+            "rrBLUP-EXACT fit timing n_train={} m={} rank={} build_z={:.3}s ({:.1}%) [decode={:.3}s mul={:.3}s] project={:.3}s ({:.1}%) reml={:.3}s ({:.1}%) solve_beta={:.3}s ({:.1}%) predict={:.3}s ({:.1}%) [train={:.3}s test={:.3}s] other={:.3}s ({:.1}%) total={:.3}s backend={}",
+            cache.n_train,
+            cache.m,
+            cache.rank,
+            build_z_secs,
+            pct(build_z_secs),
+            z_decode_secs,
+            z_mul_secs,
+            project_secs,
+            pct(project_secs),
+            reml_secs,
+            pct(reml_secs),
+            solve_secs,
+            pct(solve_secs),
+            predict_secs,
+            pct(predict_secs),
+            pred_train_secs,
+            pred_test_secs,
+            other_secs,
+            pct(other_secs),
+            total_secs,
+            cache.eig_backend,
+        );
+    }
 
     Ok((
         pred_train_ret,
@@ -1546,6 +1727,8 @@ fn fit_rrblup_exact_snp_from_cache_packed(
         pve_trainvar,
         lambda_opt,
         -best_cost,
+        var_g,
+        sigma_e2,
         beta_f32,
         cache.eig_backend.clone(),
     ))
@@ -1767,6 +1950,7 @@ pub fn rrblup_exact_snp_fit_prepared<'py>(
     f64,
     f64,
     f64,
+    (f64, f64),
     usize,
     f64,
     Bound<'py, PyArray1<f32>>,
@@ -1837,6 +2021,8 @@ pub fn rrblup_exact_snp_fit_prepared<'py>(
         pve_trainvar,
         lambda_opt,
         reml_opt,
+        var_g,
+        sigma_e2,
         beta_ret,
         eig_backend,
     ) = py
@@ -1885,6 +2071,7 @@ pub fn rrblup_exact_snp_fit_prepared<'py>(
         pve_trainvar,
         lambda_opt,
         reml_opt,
+        (var_g, sigma_e2),
         m_effective,
         alpha,
         beta_arr,
@@ -1939,6 +2126,7 @@ pub fn rrblup_exact_snp_packed<'py>(
     f64,
     f64,
     f64,
+    (f64, f64),
     usize,
     f64,
     Bound<'py, PyArray1<f32>>,
@@ -2157,6 +2345,8 @@ pub fn rrblup_exact_snp_packed<'py>(
         pve_trainvar,
         lambda_opt,
         reml_opt,
+        var_g,
+        sigma_e2,
         beta_ret,
         eig_backend,
     ) = py
@@ -2200,6 +2390,7 @@ pub fn rrblup_exact_snp_packed<'py>(
         pve_trainvar,
         lambda_opt,
         reml_opt,
+        (var_g, sigma_e2),
         m_effective,
         y_mean,
         beta_arr,

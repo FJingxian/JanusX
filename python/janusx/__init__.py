@@ -208,6 +208,48 @@ def _init_macos_openblas_path() -> None:
 
 _init_macos_openblas_path()
 
+
+def _should_prewarm_macos_native_eigh_backend() -> bool:
+    if sys.platform != "darwin":
+        return False
+    raw_pref = str(
+        os.environ.get(
+            "JX_RUST_EIGH_LAPACK_BACKEND",
+            os.environ.get("JX_RUST_LAPACK_BACKEND", "auto"),
+        )
+    ).strip().lower()
+    # Respect explicit Accelerate requests.
+    if raw_pref in ("accelerate", "veclib"):
+        return False
+    return True
+
+
+def _prewarm_macos_native_eigh_backend() -> str:
+    """
+    Best-effort early native-LAPACK prewarm on macOS.
+
+    Import the JanusX extension and probe the Rust eigh backend before heavy
+    optional dependencies (SciPy/sklearn/xgboost/matplotlib) can pull a
+    foreign OpenMP runtime into the process and force auto-selection back to
+    Accelerate.
+    """
+    if not _should_prewarm_macos_native_eigh_backend():
+        return ""
+    try:
+        from . import janusx as _jx
+    except Exception:
+        return ""
+    try:
+        probe = getattr(_jx, "rust_eigh_lapack_backend", None)
+        if not callable(probe):
+            return ""
+        return str(probe()).strip().lower()
+    except Exception:
+        return ""
+
+
+_ = _prewarm_macos_native_eigh_backend()
+
 from . import linalg as linalg
 
 

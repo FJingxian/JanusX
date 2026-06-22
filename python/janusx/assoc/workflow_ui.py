@@ -6,7 +6,6 @@ from __future__ import annotations
 import logging
 import os
 import re
-import threading
 import time
 from typing import Optional
 
@@ -16,24 +15,18 @@ import numpy as np
 import pandas as pd
 
 from janusx.script._common.cjk import contains_cjk as _contains_cjk, ensure_cjk_font as _ensure_cjk_font
-from janusx.script._common.progress import build_rich_progress, rich_progress_available
+from janusx.script._common.progress import (
+    ProgressBarAdapter as _BaseProgressAdapter,
+    SpinnerStatusAdapter,
+)
 from janusx.script._common.status import (
     CliStatus,
     format_elapsed,
     is_skip_status_text,
     print_success,
     print_warning,
-    should_animate_status,
     stdout_is_tty,
 )
-
-try:
-    from tqdm.auto import tqdm
-
-    _HAS_TQDM = True
-except Exception:
-    tqdm = None  # type: ignore[assignment]
-    _HAS_TQDM = False
 
 
 _GWAS_PROGRESS_BAR_WIDTH = 30
@@ -237,10 +230,8 @@ def _rich_success(
         logger.info(file_msg)
 
 
-class _ProgressAdapter:
-    """
-    Progress bar adapter with rich-first rendering and tqdm fallback.
-    """
+class _ProgressAdapter(_BaseProgressAdapter):
+    """GWAS progress wrapper over the shared progress-bar adapter."""
 
     def __init__(
         self,
@@ -251,67 +242,31 @@ class _ProgressAdapter:
         logger: Optional[logging.Logger] = None,
         log_unit: str = "SNP",
     ) -> None:
-        self.total = int(max(0, total))
-        self.desc = str(desc)
         self._log_progress_enabled = _gwas_progress_enabled(logger)
-        self._animate = bool((force_animate or should_animate_status(self.desc)) and stdout_is_tty())
         self._logger = logger
         self._log_unit = str(log_unit).strip() or "item"
-        self._backend = "none"
-        self._progress = None
-        self._task_id = None
-        self._tqdm = None
-        self._start_ts = time.monotonic()
-        self._finished = False
         self._done = 0
         self._tick = 0
         self._memory_text = ""
         self._memory_until_tick = 0
-        self._hb_stop = threading.Event()
-        self._hb_thread: Optional[threading.Thread] = None
         self._log_last_cells = -1
-        self._log_last_desc = self.desc
+        self._log_last_desc = str(desc)
         self._log_last_memory = ""
         self._log_last_emit_ts = 0.0
         self._log_finished = False
-
-        if self._animate and rich_progress_available():
-            try:
-                self._progress = build_rich_progress(
-                    description_template="[green]{task.description:<8}",
-                    show_remaining=False,
-                    show_percentage=False,
-                    field_templates=["{task.fields[metric]}"],
-                    bar_width=_GWAS_PROGRESS_BAR_WIDTH,
-                    finished_text=" ",
-                    transient=True,
-                )
-                if self._progress is None:
-                    raise RuntimeError("rich progress unavailable")
-                self._progress.start()
-                self._task_id = self._progress.add_task(
-                    self.desc,
-                    total=self.total,
-                    metric=_format_progress_metric(0, self.total, None),
-                )
-                self._backend = "rich"
-            except Exception:
-                self._progress = None
-                self._task_id = None
-
-        if self._animate and self._backend == "none" and _HAS_TQDM and stdout_is_tty():
-            self._tqdm = tqdm(
-                total=self.total,
-                desc=self.desc,
-                leave=False,
-                dynamic_ncols=True,
-                bar_format="{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt}",
-            )
-            self._backend = "tqdm"
-
-        if self._animate and self._backend in {"rich", "tqdm"}:
-            self._hb_thread = threading.Thread(target=self._heartbeat, daemon=True)
-            self._hb_thread.start()
+        super().__init__(
+            total=total,
+            desc=desc,
+            show_spinner=True,
+            show_postfix=True,
+            keep_display=False,
+            show_remaining=True,
+            emit_done=True,
+            bar_width=_GWAS_PROGRESS_BAR_WIDTH,
+            force_animate=force_animate,
+            logger=logger,
+            log_unit=log_unit,
+        )
         self._emit_log_progress(force=True)
 
     def _active_memory_text(self) -> str:
@@ -369,146 +324,69 @@ class _ProgressAdapter:
         self._log_last_memory = mem_text
         self._log_last_emit_ts = now
 
-    def _metric_text(self) -> str:
-        mem = self._active_memory_text()
-        return _format_progress_metric(self._done, self.total, mem if mem else None)
-
-    def _refresh_metric(self) -> None:
-        if self._backend == "rich" and self._progress is not None and self._task_id is not None:
-            self._progress.update(self._task_id, metric=self._metric_text())
-        elif self._backend == "tqdm" and self._tqdm is not None:
-            self._tqdm.set_postfix_str(self._metric_text())
-
-    def _heartbeat(self) -> None:
-        while not self._hb_stop.wait(0.25):
-            try:
-                if self._backend == "rich" and self._progress is not None and self._task_id is not None:
-                    self._progress.update(self._task_id, metric=self._metric_text())
-                elif self._backend == "tqdm" and self._tqdm is not None:
-                    self._tqdm.refresh()
-            except Exception:
-                continue
-
     def update(self, step: int = 1) -> None:
         if self._finished:
             return
         step = int(max(0, step))
         if step == 0:
             return
+        super().update(step)
         self._done = int(min(self.total, self._done + step))
         self._tick += 1
-        if self._backend == "rich" and self._progress is not None and self._task_id is not None:
-            self._progress.update(self._task_id, advance=step, metric=self._metric_text())
-        elif self._backend == "tqdm" and self._tqdm is not None:
-            self._tqdm.update(step)
-            self._tqdm.set_postfix_str(self._metric_text())
         self._emit_log_progress(force=False)
 
     def set_postfix(self, *, memory: Optional[str] = None) -> None:
         if memory is not None:
             self._memory_text = str(memory).replace(" ", "")
             self._memory_until_tick = self._tick + 5
-        self._refresh_metric()
+        mem = self._active_memory_text()
+        super().set_postfix(memory=mem) if mem != "" else super().set_postfix()
         self._emit_log_progress(force=False)
 
     def set_description(self, desc: str) -> None:
-        self.desc = str(desc)
-        if self._backend == "rich" and self._progress is not None and self._task_id is not None:
-            self._progress.update(self._task_id, description=self.desc, metric=self._metric_text())
-        elif self._backend == "tqdm" and self._tqdm is not None:
-            self._tqdm.set_description_str(self.desc)
+        super().set_description(desc)
         self._emit_log_progress(force=True)
 
     def set_total(self, total: int) -> None:
-        self.total = int(max(0, total))
+        super().set_total(total)
         self._done = int(min(self._done, self.total))
-        if self._backend == "rich" and self._progress is not None and self._task_id is not None:
-            self._progress.update(self._task_id, total=self.total, metric=self._metric_text())
-        elif self._backend == "tqdm" and self._tqdm is not None:
-            self._tqdm.total = self.total
-            self._tqdm.refresh()
         self._emit_log_progress(force=True)
 
-    def finish(self) -> None:
-        if self._finished:
-            return
+    def finish(self, *, message=None, elapsed_parts=None) -> None:
         self._done = self.total
-        if self._backend == "rich" and self._progress is not None and self._task_id is not None:
-            self._progress.update(self._task_id, completed=self.total, metric=self._metric_text())
-        elif self._backend == "tqdm" and self._tqdm is not None:
-            self._tqdm.n = self._tqdm.total
-            self._tqdm.set_postfix_str(self._metric_text())
-            self._tqdm.refresh()
-        self._finished = True
+        super().finish(message=message, elapsed_parts=elapsed_parts)
         self._emit_log_progress(force=True)
 
-    def close(self, *, show_done: bool = True) -> None:
-        if self._hb_thread is not None:
-            self._hb_stop.set()
-            try:
-                self._hb_thread.join(timeout=0.2)
-            except Exception:
-                pass
-            self._hb_thread = None
-        if self._backend == "rich" and self._progress is not None:
-            try:
-                if show_done and self._task_id is not None:
-                    self._progress.update(self._task_id, metric=self._metric_text())
-            finally:
-                self._progress.stop()
-                self._progress = None
-                self._task_id = None
-        elif self._backend == "tqdm" and self._tqdm is not None:
-            self._tqdm.close()
-            self._tqdm = None
+    def close(self, *, show_done: bool = True, message=None, elapsed_parts=None) -> None:
         if show_done and self._finished and (not self._log_finished):
             self._emit_log_progress(force=True)
-        self._backend = "none"
-        self._finished = True
+        super().close(show_done=show_done, message=message, elapsed_parts=elapsed_parts)
 
 
 def _start_indeterminate_progress_bar(
     desc: str,
     *,
-    total: int = 100,
-    tick_interval: float = 0.08,
-) -> Optional[tuple[_ProgressAdapter, threading.Event, threading.Thread]]:
-    pbar = _ProgressAdapter(total=total, desc=str(desc), force_animate=True)
-    if getattr(pbar, "_backend", "none") == "none":
-        return None
-    stop_evt = threading.Event()
-
-    def _runner() -> None:
-        while not stop_evt.wait(max(0.01, float(tick_interval))):
-            try:
-                pbar.update(1)
-            except Exception:
-                return
-
-    th = threading.Thread(target=_runner, daemon=True)
-    th.start()
-    return (pbar, stop_evt, th)
+    enabled: bool = True,
+    timeout: float = 0.08,
+) -> Optional[SpinnerStatusAdapter]:
+    handle = SpinnerStatusAdapter(
+        str(desc),
+        enabled=bool(enabled),
+        timeout=float(timeout),
+    )
+    return handle.start()
 
 
 def _stop_indeterminate_progress_bar(
-    handle: Optional[tuple[_ProgressAdapter, threading.Event, threading.Thread]],
+    handle: Optional[SpinnerStatusAdapter],
+    *,
+    show_done: bool = False,
+    message: Optional[str] = None,
+    elapsed_parts: Optional[list[object]] = None,
 ) -> None:
     if handle is None:
         return
-    pbar, stop_evt, th = handle
-    stop_evt.set()
-    try:
-        th.join(timeout=0.2)
-    except Exception:
-        pass
-    try:
-        pbar.finish()
-    except Exception:
-        pass
-    try:
-        pbar.close(show_done=False)
-    except Exception:
-        pass
+    handle.close(show_done=show_done, message=message, elapsed_parts=elapsed_parts)
 
 
 def fastplot(

@@ -68,8 +68,9 @@ def describe_blup_dispatch_policy(
     if force_mode == "pcg":
         return f"forced by {BLUP_FORCE_ENV}=2 -> PCG rrBLUP + HE"
     return (
-        f"auto dispatch: n/m cutoff=({int(threshold_n)},{int(threshold_m)}), "
-        "GBLUP | exact rrBLUP(snp) | PCG rrBLUP+HE"
+        f"auto dispatch: n<={int(threshold_n)} -> GBLUP; "
+        f"n>{int(threshold_n)} and m<={int(threshold_m)} -> exact rrBLUP(snp); "
+        f"n>{int(threshold_n)} and m>{int(threshold_m)} -> PCG rrBLUP+HE"
     )
 
 
@@ -124,29 +125,13 @@ def resolve_blup_dispatch(
             threshold_n=n_cut,
             threshold_m=m_cut,
         )
-    small_n = bool(n <= n_cut)
-    small_m = bool(m <= m_cut)
-
-    if small_n and small_m:
-        if n > m:
-            return BlupDispatch(
-                requested_method=BLUP_METHOD,
-                effective_method="rrBLUP",
-                rrblup_solver="exact",
-                rrblup_exact_backend="snp",
-                route_key="exact_rrblup_snp_small",
-                route_label="rrBLUP exact spectral REML",
-                n_samples=n,
-                n_markers=m,
-                threshold_n=n_cut,
-                threshold_m=m_cut,
-            )
+    if n <= n_cut:
         return BlupDispatch(
             requested_method=BLUP_METHOD,
             effective_method="GBLUP",
             rrblup_solver=None,
             rrblup_exact_backend=None,
-            route_key="gblup_small",
+            route_key="gblup_n_le_threshold",
             route_label="GBLUP REML/GRM",
             n_samples=n,
             n_markers=m,
@@ -154,27 +139,13 @@ def resolve_blup_dispatch(
             threshold_m=m_cut,
         )
 
-    if small_n and (not small_m):
-        return BlupDispatch(
-            requested_method=BLUP_METHOD,
-            effective_method="GBLUP",
-            rrblup_solver=None,
-            rrblup_exact_backend=None,
-            route_key="gblup_large_m",
-            route_label="GBLUP REML/GRM",
-            n_samples=n,
-            n_markers=m,
-            threshold_n=n_cut,
-            threshold_m=m_cut,
-        )
-
-    if (not small_n) and small_m:
+    if m <= m_cut:
         return BlupDispatch(
             requested_method=BLUP_METHOD,
             effective_method="rrBLUP",
             rrblup_solver="exact",
             rrblup_exact_backend="snp",
-            route_key="exact_rrblup_snp_large_n",
+            route_key="exact_rrblup_snp_n_gt_threshold_m_le_threshold",
             route_label="rrBLUP exact spectral REML",
             n_samples=n,
             n_markers=m,

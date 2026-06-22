@@ -963,7 +963,7 @@ def run_chunked_gwas_lmm_lm(
                         snp_chunk,
                         np.asarray(maf_chunk, dtype=np.float32),
                         np.asarray(miss_chunk, dtype=np.float32),
-                        np.asarray(results, dtype=np.float64),
+                        np.ascontiguousarray(results, dtype=np.float64),
                     )
                 else:
                     chunk_text, result_cols, n_rows = _format_chunk_tsv_text(
@@ -2137,7 +2137,7 @@ def run_chunked_gwas_streaming_shared(
                     snp_chunk,
                     np.asarray(maf_chunk, dtype=np.float32),
                     np.asarray(miss_chunk, dtype=np.float32),
-                    np.asarray(results, dtype=np.float64),
+                    np.ascontiguousarray(results, dtype=np.float64),
                 )
             else:
                 info_chunk = [

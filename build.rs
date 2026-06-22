@@ -871,7 +871,7 @@ fn set_exec_permissions(path: &Path) {
 fn set_exec_permissions(_path: &Path) {}
 
 fn compile_fasttree_executable() {
-    println!("cargo:rerun-if-changed=todo/FastTree.c");
+    println!("cargo:rerun-if-changed=src/phylo/vendor/FastTree.c");
     println!("cargo:rerun-if-env-changed=CC");
     println!("cargo:rerun-if-env-changed=CFLAGS");
     println!("cargo:rerun-if-env-changed=CONDA_PREFIX");
@@ -881,7 +881,11 @@ fn compile_fasttree_executable() {
     println!("cargo:rerun-if-env-changed=JANUSX_FASTTREE_NATIVE");
 
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
-    let src_path = Path::new(&manifest_dir).join("todo").join("FastTree.c");
+    let src_path = Path::new(&manifest_dir)
+        .join("src")
+        .join("phylo")
+        .join("vendor")
+        .join("FastTree.c");
     if !src_path.is_file() {
         panic!("FastTree source not found: {}", src_path.to_string_lossy());
     }

@@ -44,13 +44,6 @@ serde_json = "1.0.145"
 cc = "1.2"
 pkg-config = "0.3"
 
-[dev-dependencies]
-criterion = "0.5.1"
-
-[[bench]]
-name = "grm_dtype"
-harness = false
-
 [profile.dev]
 debug = 1
 

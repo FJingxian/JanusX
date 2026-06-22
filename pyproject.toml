@@ -61,7 +61,7 @@ python-source = "python"
 cargo-extra-args = "--locked --features python-extension"
 include = [
     { path = "scripts/build_backend.py", format = "sdist" },
-    { path = "todo/FastTree.c", format = "sdist" },
+    { path = "src/phylo/vendor/FastTree.c", format = "sdist" },
     { path = "python/janusx/native/vendor/kmc/3rd_party/cloudflare/zlib.h", format = "sdist" },
     { path = "python/janusx/native/vendor/kmc/kmc_core/*.h", format = "sdist" },
     { path = "python/janusx/native/vendor/kmc/kmc_core/*.cpp", format = "sdist" },

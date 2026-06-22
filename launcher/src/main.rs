@@ -14,8 +14,6 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod dlc;
-mod fastq2count;
-mod fastq2vcf;
 mod pipeline;
 
 const PYPI_SPEC: &str = "janusx";
@@ -263,12 +261,6 @@ fn run() -> Result<i32, String> {
     if dlc::is_dlc_tool(head) {
         let home = runtime_home()?;
         return dlc::run_dlc_tool(head, &args[1..], &home);
-    }
-    if head == "fastq2count" {
-        return fastq2count::run_fastq2count_module(&args[1..]);
-    }
-    if head == "fastq2vcf" {
-        return fastq2vcf::run_fastq2vcf_module(&args[1..]);
     }
     let home = runtime_home()?;
     let python = ensure_runtime(false)?;

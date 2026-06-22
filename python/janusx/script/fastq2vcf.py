@@ -1,8 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import sys
 
 from janusx.pipeline import format_report, run_fastq2vcf_checks
+
+try:
+    from janusx import janusx as jxrs
+except Exception:
+    jxrs = None
 
 from ._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 
@@ -31,19 +37,29 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    if any(tok in {"-h", "--help"} for tok in sys.argv[1:]):
+        if jxrs is None or not hasattr(jxrs, "fastq2vcf_run"):
+            build_parser().print_help()
+            return 0
+        return int(jxrs.fastq2vcf_run(list(sys.argv[1:])))
+
     parser = build_parser()
-    _, passthrough = parser.parse_known_args()
+    parsed, passthrough = parser.parse_known_args()
+
+    if jxrs is None or not hasattr(jxrs, "fastq2vcf_run"):
+        raise RuntimeError(
+            "JanusX Rust extension is unavailable or missing `fastq2vcf_run`. "
+            "Please rebuild/install the extension first."
+        )
 
     report = run_fastq2vcf_checks()
     print(format_report(report))
 
     if not report.passed:
         return 1
-    if passthrough:
-        print("Compatibility gate passed, but Python `jxpy fastq2vcf` only performs preflight checks.")
-        print("Run launcher pipeline command to execute workflow: `jx fastq2vcf ...`")
-        return 2
-    return 0
+    if parsed.check_only and not passthrough:
+        return 0
+    return int(jxrs.fastq2vcf_run(list(sys.argv[1:])))
 
 
 if __name__ == "__main__":

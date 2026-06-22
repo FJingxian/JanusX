@@ -639,8 +639,8 @@ def remove_if_exists(paths: Iterable[Path]) -> None:
 
 def find_grm(outdir: Path) -> Path:
     candidates = [
-        outdir / "mouse_hs1940.cGRM.txt",
-        outdir / "mouse_hs1940.grm.txt",
+        outdir / "mouse_hs1940.cGRM.npy",
+        outdir / "mouse_hs1940.grm.npy",
     ]
     return require_any_file("GRM file not found for GWAS (-k).", candidates)
 
@@ -1132,7 +1132,7 @@ def smoke_flow(outdir: Path, logdir: Path, threads: int, cv_folds: int) -> None:
             "example/mouse_hs1940.pheno",
             "-n",
             "0",
-            "-rrBLUP",
+            "-BLUP",
             "-cv",
             str(cv_folds),
             "-t",
@@ -1226,10 +1226,7 @@ def full_flow(outdir: Path, logdir: Path, postgs_enabled: bool) -> None:
             "example/mouse_hs1940.pheno",
             "-n",
             "0",
-            "-GBLUP",
-            "-GBLUP",
-            "ad",
-            "-rrBLUP",
+            "-BLUP",
             "-BayesA",
             "-BayesB",
             "-BayesCpi",

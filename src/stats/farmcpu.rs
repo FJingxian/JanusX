@@ -1352,35 +1352,6 @@ fn pinv_for_row_major_x(x_flat: &[f64], n: usize, q: usize) -> Result<Vec<f64>, 
     Ok(ixx)
 }
 
-fn farmcpu_window_representatives(
-    sorted_candidates: Vec<(f64, usize)>,
-    chrom: &[String],
-    pos: &[i64],
-    window_bp: i64,
-    max_keep: usize,
-) -> Vec<usize> {
-    let mut out: Vec<usize> = Vec::with_capacity(max_keep.min(sorted_candidates.len()));
-    let bp = window_bp.max(0) as u64;
-    'candidate: for (_p, idx) in sorted_candidates {
-        if idx >= chrom.len() || idx >= pos.len() {
-            continue;
-        }
-        for &kept in out.iter() {
-            if kept < chrom.len() && kept < pos.len() && chrom[kept] == chrom[idx] {
-                if pos[kept].abs_diff(pos[idx]) <= bp {
-                    continue 'candidate;
-                }
-            }
-        }
-        out.push(idx);
-        if out.len() >= max_keep {
-            break;
-        }
-    }
-    out.sort_unstable();
-    out
-}
-
 #[derive(Clone, Debug)]
 struct FarmcpuFinalWindow {
     chrom: String,

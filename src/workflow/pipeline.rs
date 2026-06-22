@@ -89,8 +89,9 @@ fn setup_interrupt_trap() {
         const SIGINT: i32 = 2;
         const SIGTERM: i32 = 15;
         INSTALL_SIGNAL_HANDLER_ONCE.call_once(|| unsafe {
-            let _ = signal(SIGINT, janusx_signal_handler as usize);
-            let _ = signal(SIGTERM, janusx_signal_handler as usize);
+            let handler = janusx_signal_handler as *const () as usize;
+            let _ = signal(SIGINT, handler);
+            let _ = signal(SIGTERM, handler);
         });
     }
     INTERRUPT_REQUESTED.store(false, Ordering::SeqCst);

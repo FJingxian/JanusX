@@ -618,6 +618,32 @@ fn compact_full_decode_by_kept_ranges(
 }
 
 #[inline]
+fn compact_full_decode_by_kept_ranges_f64_with_stats(
+    full_row: &[f64],
+    kept_ranges: &[(usize, usize)],
+    rhs: &[f64],
+    out_row: &mut [f64],
+) -> (f64, f64) {
+    let mut dst = 0usize;
+    let mut sy = 0.0_f64;
+    let mut ss = 0.0_f64;
+    for &(start, end) in kept_ranges {
+        let len = end.saturating_sub(start);
+        let src = &full_row[start..end];
+        let rhs_slice = &rhs[dst..dst + len];
+        let dst_slice = &mut out_row[dst..dst + len];
+        dst_slice.copy_from_slice(src);
+        for (g, &rv) in src.iter().zip(rhs_slice.iter()) {
+            sy += *g * rv;
+            ss += *g * *g;
+        }
+        dst += len;
+    }
+    debug_assert_eq!(dst, out_row.len());
+    (sy, ss)
+}
+
+#[inline]
 fn subset_plan_full_scratch_len(plan: Option<&SubsetDecodePlan>) -> usize {
     match plan {
         Some(SubsetDecodePlan::NearFull { n_samples_full, .. }) => *n_samples_full,
@@ -646,6 +672,60 @@ fn decode_subset_plan_row_f32(
             let full_row = &mut full_row_scratch[..*n_samples_full];
             decode_row_centered_full_lut(row, *n_samples_full, code4_lut, value_lut, full_row);
             compact_full_decode_by_kept_ranges(full_row, kept_ranges, out_row);
+        }
+    }
+}
+
+#[inline]
+fn decode_subset_with_plan_f64(
+    row: &[u8],
+    plan: &SubsetDecodePlan,
+    value_lut: &[f64; 4],
+    out_row: &mut [f64],
+) {
+    let SubsetDecodePlan::Gather {
+        byte_idx,
+        shift_bits,
+    } = plan
+    else {
+        unreachable!("subset gather decode requires Gather plan");
+    };
+    let n = byte_idx.len();
+    for t in 0..n {
+        let code = (row[byte_idx[t]] >> shift_bits[t]) & 0b11;
+        out_row[t] = value_lut[code as usize];
+    }
+}
+
+#[inline]
+fn decode_subset_plan_row_f64_with_stats(
+    row: &[u8],
+    plan: &SubsetDecodePlan,
+    code4_lut: &[[u8; 4]; 256],
+    value_lut: &[f64; 4],
+    rhs: &[f64],
+    full_row_scratch: &mut [f64],
+    out_row: &mut [f64],
+) -> (f64, f64) {
+    match plan {
+        SubsetDecodePlan::Gather { .. } => {
+            decode_subset_with_plan_f64(row, plan, value_lut, out_row);
+            let mut sy = 0.0_f64;
+            let mut ss = 0.0_f64;
+            for (g, &rv) in out_row.iter().zip(rhs.iter()) {
+                sy += *g * rv;
+                ss += *g * *g;
+            }
+            (sy, ss)
+        }
+        SubsetDecodePlan::NearFull {
+            n_samples_full,
+            kept_ranges,
+        } => {
+            debug_assert!(full_row_scratch.len() >= *n_samples_full);
+            let full_row = &mut full_row_scratch[..*n_samples_full];
+            decode_row_centered_full_lut_f64(row, *n_samples_full, code4_lut, value_lut, full_row);
+            compact_full_decode_by_kept_ranges_f64_with_stats(full_row, kept_ranges, rhs, out_row)
         }
     }
 }
@@ -883,6 +963,139 @@ pub(crate) fn decode_mean_imputed_additive_packed_block_rows_f32(
         let mut full_row_scratch = vec![0.0_f32; full_scratch_len];
         for (local_row, out_row) in out.chunks_mut(n_out).enumerate() {
             decode_one(local_row, out_row, full_row_scratch.as_mut_slice());
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_mean_imputed_additive_packed_block_rows_f64_stats(
+    packed_flat: &[u8],
+    bytes_per_snp: usize,
+    n_samples: usize,
+    row_flip: &[bool],
+    row_maf: &[f32],
+    sample_idx: &[usize],
+    full_sample_fast: bool,
+    packed_row_indices: Option<&[usize]>,
+    row_start: usize,
+    rhs: &[f64],
+    out: &mut [f64],
+    rhs_dot_out: &mut [f64],
+    ss_out: &mut [f64],
+    code4_lut: &[[u8; 4]; 256],
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) -> Result<(), String> {
+    let n_out = sample_idx.len();
+    if n_out == 0 {
+        return Ok(());
+    }
+    if rhs.len() != n_out {
+        return Err(
+            "decode_mean_imputed_additive_packed_block_rows_f64_stats: rhs length mismatch"
+                .to_string(),
+        );
+    }
+    if out.len() % n_out != 0 {
+        return Err(
+            "decode_mean_imputed_additive_packed_block_rows_f64_stats: output length mismatch"
+                .to_string(),
+        );
+    }
+    let cur_rows = out.len() / n_out;
+    if cur_rows == 0 {
+        return Ok(());
+    }
+    if rhs_dot_out.len() != cur_rows || ss_out.len() != cur_rows {
+        return Err(
+            "decode_mean_imputed_additive_packed_block_rows_f64_stats: stats length mismatch"
+                .to_string(),
+        );
+    }
+    let subset_plan = if full_sample_fast {
+        None
+    } else {
+        Some(SubsetDecodePlan::from_sample_idx_with_n_samples(
+            sample_idx, n_samples,
+        ))
+    };
+    let full_scratch_len = subset_plan_full_scratch_len(subset_plan.as_ref());
+
+    let decode_one = |local_row: usize,
+                      out_row: &mut [f64],
+                      rhs_dot_slot: &mut f64,
+                      ss_slot: &mut f64,
+                      full_row_scratch: &mut [f64]| {
+        let row_idx_local = row_start + local_row;
+        let row_idx_packed = packed_row_indices
+            .map(|idx| idx[row_idx_local])
+            .unwrap_or(row_idx_local);
+        let row =
+            &packed_flat[row_idx_packed * bytes_per_snp..(row_idx_packed + 1) * bytes_per_snp];
+        let mean_g = (2.0_f64 * row_maf[row_idx_local] as f64).clamp(0.0_f64, 2.0_f64);
+        let value_lut: [f64; 4] = if row_flip[row_idx_local] {
+            [2.0_f64, mean_g, 1.0_f64, 0.0_f64]
+        } else {
+            [0.0_f64, mean_g, 1.0_f64, 2.0_f64]
+        };
+        let (sy, ss) = if full_sample_fast {
+            decode_row_centered_full_lut_f64(row, n_samples, code4_lut, &value_lut, out_row);
+            let mut sy = 0.0_f64;
+            let mut ss = 0.0_f64;
+            for (g, &rv) in out_row.iter().zip(rhs.iter()) {
+                sy += *g * rv;
+                ss += *g * *g;
+            }
+            (sy, ss)
+        } else {
+            decode_subset_plan_row_f64_with_stats(
+                row,
+                subset_plan.as_ref().expect("subset plan missing"),
+                code4_lut,
+                &value_lut,
+                rhs,
+                full_row_scratch,
+                out_row,
+            )
+        };
+        *rhs_dot_slot = sy;
+        *ss_slot = ss;
+    };
+
+    if let Some(tp) = pool {
+        tp.install(|| {
+            out.par_chunks_mut(n_out)
+                .zip(rhs_dot_out.par_iter_mut())
+                .zip(ss_out.par_iter_mut())
+                .enumerate()
+                .for_each_init(
+                    || vec![0.0_f64; full_scratch_len],
+                    |full_row_scratch, (local_row, ((out_row, rhs_dot_slot), ss_slot))| {
+                        decode_one(
+                            local_row,
+                            out_row,
+                            rhs_dot_slot,
+                            ss_slot,
+                            full_row_scratch.as_mut_slice(),
+                        )
+                    },
+                );
+        });
+    } else {
+        let mut full_row_scratch = vec![0.0_f64; full_scratch_len];
+        for (local_row, ((out_row, rhs_dot_slot), ss_slot)) in out
+            .chunks_mut(n_out)
+            .zip(rhs_dot_out.iter_mut())
+            .zip(ss_out.iter_mut())
+            .enumerate()
+        {
+            decode_one(
+                local_row,
+                out_row,
+                rhs_dot_slot,
+                ss_slot,
+                full_row_scratch.as_mut_slice(),
+            );
         }
     }
     Ok(())

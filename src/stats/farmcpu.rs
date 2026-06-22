@@ -64,7 +64,10 @@ window, its output statistics come from that local conditional refit.
 */
 
 use crate::assoc2tsv::resolve_assoc_tsv_metadata;
-use crate::bedmath::{decode_plink_bed_hardcall, packed_row_missing_count_selected};
+use crate::bedmath::{
+    decode_mean_imputed_additive_packed_block_rows_f64_stats, decode_plink_bed_hardcall,
+    packed_byte_lut, packed_row_missing_count_selected,
+};
 use crate::blas::{
     cblas_dgemm_dispatch, CblasInt, OpenBlasThreadGuard, CBLAS_NO_TRANS, CBLAS_ROW_MAJOR,
 };
@@ -73,7 +76,7 @@ use crate::eigh::symmetric_eigh_f64_row_major;
 use crate::linalg::{
     chisq_from_beta_se_and_optional_plrt, format_chisq_value, sanitize_assoc_pvalue,
 };
-use crate::stats_common::{get_cached_pool, parse_index_vec_i64, AsyncTsvWriter};
+use crate::stats_common::{env_truthy, get_cached_pool, parse_index_vec_i64, AsyncTsvWriter};
 use nalgebra::DMatrix;
 use numpy::PyArray1;
 use numpy::PyArrayMethods;
@@ -89,6 +92,7 @@ use std::f64::consts::LN_10;
 use std::fmt::Write as _;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
+use std::time::Instant;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FarmcpuRoute {
@@ -110,6 +114,153 @@ impl FarmcpuRoute {
     fn enable_local_window_merge(self) -> bool {
         matches!(self, Self::Unified)
     }
+}
+
+#[inline]
+fn farmcpu_stage1_timing_enabled() -> bool {
+    env_truthy("JX_FARMCPU_STAGE1_TIMING")
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct FarmcpuStage1TimingAccum {
+    iter_count: usize,
+    build_x_secs: f64,
+    pinv_secs: f64,
+    fem_secs: f64,
+    rem_secs: f64,
+    merge_secs: f64,
+    callback_secs: f64,
+    total_secs: f64,
+    final_merge_secs: f64,
+}
+
+impl FarmcpuStage1TimingAccum {
+    #[inline]
+    fn add_iter(
+        &mut self,
+        build_x_secs: f64,
+        pinv_secs: f64,
+        fem_secs: f64,
+        rem_secs: f64,
+        merge_secs: f64,
+        callback_secs: f64,
+        total_secs: f64,
+    ) {
+        self.iter_count += 1;
+        self.build_x_secs += build_x_secs;
+        self.pinv_secs += pinv_secs;
+        self.fem_secs += fem_secs;
+        self.rem_secs += rem_secs;
+        self.merge_secs += merge_secs;
+        self.callback_secs += callback_secs;
+        self.total_secs += total_secs;
+    }
+}
+
+fn farmcpu_stage1_emit_iter_timing(
+    route: FarmcpuRoute,
+    iter_idx: usize,
+    max_iter: usize,
+    qtn_in: usize,
+    qtn_out: usize,
+    candidate_count: usize,
+    build_x_secs: f64,
+    pinv_secs: f64,
+    fem_secs: f64,
+    rem_secs: f64,
+    merge_secs: f64,
+    callback_secs: f64,
+    total_secs: f64,
+) {
+    let route_label = if matches!(route, FarmcpuRoute::Raw) {
+        "raw"
+    } else {
+        "unified"
+    };
+    let known = build_x_secs + pinv_secs + fem_secs + rem_secs + merge_secs + callback_secs;
+    let other_secs = (total_secs - known).max(0.0_f64);
+    let pct = |x: f64| -> f64 {
+        if total_secs > 0.0_f64 {
+            (x * 100.0_f64) / total_secs
+        } else {
+            0.0_f64
+        }
+    };
+    eprintln!(
+        "FarmCPU stage1 iter timing route={} iter={}/{} qtn_in={} qtn_out={} candidates={} build_x={:.3}s ({:.1}%) pinv={:.3}s ({:.1}%) fem={:.3}s ({:.1}%) rem={:.3}s ({:.1}%) merge={:.3}s ({:.1}%) callback={:.3}s ({:.1}%) other={:.3}s ({:.1}%) total={:.3}s",
+        route_label,
+        iter_idx + 1,
+        max_iter,
+        qtn_in,
+        qtn_out,
+        candidate_count,
+        build_x_secs,
+        pct(build_x_secs),
+        pinv_secs,
+        pct(pinv_secs),
+        fem_secs,
+        pct(fem_secs),
+        rem_secs,
+        pct(rem_secs),
+        merge_secs,
+        pct(merge_secs),
+        callback_secs,
+        pct(callback_secs),
+        other_secs,
+        pct(other_secs),
+        total_secs,
+    );
+}
+
+fn farmcpu_stage1_emit_total_timing(route: FarmcpuRoute, acc: &FarmcpuStage1TimingAccum) {
+    if acc.iter_count == 0 {
+        return;
+    }
+    let route_label = if matches!(route, FarmcpuRoute::Raw) {
+        "raw"
+    } else {
+        "unified"
+    };
+    let known = acc.build_x_secs
+        + acc.pinv_secs
+        + acc.fem_secs
+        + acc.rem_secs
+        + acc.merge_secs
+        + acc.callback_secs
+        + acc.final_merge_secs;
+    let other_secs = (acc.total_secs - known).max(0.0_f64);
+    let pct = |x: f64| -> f64 {
+        if acc.total_secs > 0.0_f64 {
+            (x * 100.0_f64) / acc.total_secs
+        } else {
+            0.0_f64
+        }
+    };
+    let fem_side_secs = acc.build_x_secs + acc.pinv_secs + acc.fem_secs;
+    eprintln!(
+        "FarmCPU stage1 total timing route={} iters={} fem_side={:.3}s ({:.1}%) [build_x={:.3}s ({:.1}%) pinv={:.3}s ({:.1}%) fem_scan={:.3}s ({:.1}%)] rem={:.3}s ({:.1}%) merge={:.3}s ({:.1}%) final_merge={:.3}s ({:.1}%) callback={:.3}s ({:.1}%) other={:.3}s ({:.1}%) total={:.3}s",
+        route_label,
+        acc.iter_count,
+        fem_side_secs,
+        pct(fem_side_secs),
+        acc.build_x_secs,
+        pct(acc.build_x_secs),
+        acc.pinv_secs,
+        pct(acc.pinv_secs),
+        acc.fem_secs,
+        pct(acc.fem_secs),
+        acc.rem_secs,
+        pct(acc.rem_secs),
+        acc.merge_secs,
+        pct(acc.merge_secs),
+        acc.final_merge_secs,
+        pct(acc.final_merge_secs),
+        acc.callback_secs,
+        pct(acc.callback_secs),
+        other_secs,
+        pct(other_secs),
+        acc.total_secs,
+    );
 }
 
 #[inline]
@@ -1511,9 +1662,14 @@ fn scan_packed_full_matrix_reduced(
             "q_base exceeds background design width: q_base={q_base}, q0={q0}"
         ));
     }
+    if row_indices
+        .map(|v| v.iter().any(|&idx| idx >= m_packed))
+        .unwrap_or(false)
+    {
+        return Err("row_indices out of bounds for packed rows".to_string());
+    }
 
     let k_qtn = q0.saturating_sub(q_base);
-    let dim = q0 + 1;
     let mut xy = vec![0.0_f64; q0];
     for i in 0..n {
         let yi = y[i];
@@ -1523,110 +1679,216 @@ fn scan_packed_full_matrix_reduced(
         }
     }
     let yy: f64 = y.iter().map(|v| v * v).sum();
+    let bg_df = (n as i32) - (q0 as i32);
+    if bg_df <= 0 {
+        return Err(format!(
+            "n too small for reduced FarmCPU scan background: n={n}, q={q0}"
+        ));
+    }
+    let mut bg_beta = vec![0.0_f64; q0];
+    matvec_into(ixx_flat, q0, &xy, &mut bg_beta);
+    let bg_beta_rhs = dot(&bg_beta, &xy);
+    let qtn_bg_beta = bg_beta[q_base..].to_vec();
+    let qtn_diag_ixx = (q_base..q0)
+        .map(|idx| ixx_flat[idx * q0 + idx])
+        .collect::<Vec<f64>>();
+    let code4_lut = &packed_byte_lut().code4;
+    let full_sample_fast = sample_idx.iter().enumerate().all(|(i, &s)| i == s);
+
     let mut marker_p = vec![1.0_f64; m];
     let pool = get_cached_pool(threads).map_err(|e| e.to_string())?;
-    let chunk_rows = 256usize;
-    let mut runner = || {
-        marker_p
-            .par_chunks_mut(chunk_rows)
-            .enumerate()
-            .map_init(
-                || GlmScratch::new(q0),
-                |scr, (chunk_idx, p_chunk)| {
-                    let mut local_qtn_min = vec![1.0_f64; k_qtn];
-                    let start = chunk_idx * chunk_rows;
-                    for (off, p_out) in p_chunk.iter_mut().enumerate() {
-                        let idx = start + off;
-                        scr.reset_xs();
-                        let src_row = row_indices.map(|v| v[idx]).unwrap_or(idx);
-                        let row =
-                            &packed_flat[src_row * bytes_per_snp..(src_row + 1) * bytes_per_snp];
-                        let flip = row_flip[idx];
-                        let mean_g = (2.0_f64 * row_maf[idx] as f64).max(0.0);
-                        let mut sy = 0.0_f64;
-                        let mut ss = 0.0_f64;
-                        for (k, &sidx) in sample_idx.iter().enumerate() {
-                            let b = row[sidx >> 2];
-                            let code = (b >> ((sidx & 3) * 2)) & 0b11;
-                            let mut gv = match decode_plink_bed_hardcall(code) {
-                                Some(v) => v,
-                                None => mean_g,
-                            };
-                            if flip && code != 0b01 {
-                                gv = 2.0 - gv;
-                            }
-                            sy += gv * y[k];
-                            ss += gv * gv;
-                            let xrow = &x_flat[k * q0..(k + 1) * q0];
-                            for j in 0..q0 {
-                                scr.xs[j] += xrow[j] * gv;
-                            }
-                        }
-                        xs_t_ixx_into(&scr.xs, ixx_flat, q0, &mut scr.b21);
-                        let t2 = dot(&scr.b21, &scr.xs);
-                        let b22 = ss - t2;
-                        let (invb22, df) = if b22 < 1e-8 {
-                            (0.0, (n as i32) - (q0 as i32))
-                        } else {
-                            (1.0 / b22, (n as i32) - (q0 as i32) - 1)
-                        };
-                        if df <= 0 {
-                            *p_out = 1.0;
-                            continue;
-                        }
-                        build_ixxs_into(ixx_flat, &scr.b21, invb22, q0, &mut scr.ixxs);
-                        scr.rhs[..q0].copy_from_slice(&xy);
-                        scr.rhs[q0] = sy;
-                        matvec_into(&scr.ixxs, dim, &scr.rhs, &mut scr.beta);
-                        let beta_rhs = dot(&scr.beta, &scr.rhs);
-                        let ve = (yy - beta_rhs) / (df as f64);
-                        if invb22 == 0.0 || !ve.is_finite() || ve < 0.0 {
-                            *p_out = 1.0;
-                            continue;
-                        }
+    let row_block = 8192usize;
+    let mut geno_buf = vec![0.0_f64; row_block * n];
+    let mut xs_buf = vec![0.0_f64; row_block * q0];
+    let mut b21_buf = vec![0.0_f64; row_block * q0];
+    let mut sy_buf = vec![0.0_f64; row_block];
+    let mut ss_buf = vec![0.0_f64; row_block];
+    let mut qtn_min_p = vec![1.0_f64; k_qtn];
 
-                        let mut marker_p_here = 1.0_f64;
-                        for ff in 0..dim {
-                            let se = (scr.ixxs[ff * dim + ff] * ve).sqrt();
-                            let p = if se.is_finite() && se > 0.0 && scr.beta[ff].is_finite() {
-                                student_t_p_two_sided(scr.beta[ff] / se, df)
+    for row_start in (0..m).step_by(row_block) {
+        let row_end = (row_start + row_block).min(m);
+        let n_block = row_end - row_start;
+        let geno_slice = &mut geno_buf[..n_block * n];
+        let sy_slice = &mut sy_buf[..n_block];
+        let ss_slice = &mut ss_buf[..n_block];
+        let mut decode_runner = || {
+            decode_mean_imputed_additive_packed_block_rows_f64_stats(
+                packed_flat,
+                bytes_per_snp,
+                n_samples,
+                row_flip,
+                row_maf,
+                sample_idx,
+                full_sample_fast,
+                row_indices,
+                row_start,
+                y,
+                geno_slice,
+                sy_slice,
+                ss_slice,
+                code4_lut,
+                pool.as_ref(),
+            )
+        };
+        if let Some(p) = &pool {
+            p.install(&mut decode_runner)?;
+        } else {
+            decode_runner()?;
+        }
+
+        let xs_slice = &mut xs_buf[..n_block * q0];
+        let b21_slice = &mut b21_buf[..n_block * q0];
+        unsafe {
+            cblas_dgemm_dispatch(
+                CBLAS_ROW_MAJOR,
+                CBLAS_NO_TRANS,
+                CBLAS_NO_TRANS,
+                n_block as CblasInt,
+                q0 as CblasInt,
+                n as CblasInt,
+                1.0_f64,
+                geno_slice.as_ptr(),
+                n as CblasInt,
+                x_flat.as_ptr(),
+                q0 as CblasInt,
+                0.0_f64,
+                xs_slice.as_mut_ptr(),
+                q0 as CblasInt,
+            );
+            cblas_dgemm_dispatch(
+                CBLAS_ROW_MAJOR,
+                CBLAS_NO_TRANS,
+                CBLAS_NO_TRANS,
+                n_block as CblasInt,
+                q0 as CblasInt,
+                q0 as CblasInt,
+                1.0_f64,
+                xs_slice.as_ptr(),
+                q0 as CblasInt,
+                ixx_flat.as_ptr(),
+                q0 as CblasInt,
+                0.0_f64,
+                b21_slice.as_mut_ptr(),
+                q0 as CblasInt,
+            );
+        }
+
+        let p_slice = &mut marker_p[row_start..row_end];
+        let block_qtn_min = if k_qtn > 0 {
+            let mut stat_runner = || {
+                p_slice
+                    .par_iter_mut()
+                    .enumerate()
+                    .fold(
+                        || vec![1.0_f64; k_qtn],
+                        |mut local_qtn_min, (local_idx, p_out)| -> Vec<f64> {
+                            let xs = &xs_slice[local_idx * q0..(local_idx + 1) * q0];
+                            let b21 = &b21_slice[local_idx * q0..(local_idx + 1) * q0];
+                            let b22 = ss_slice[local_idx] - dot(b21, xs);
+                            let df = bg_df - 1;
+                            if df <= 0 || b22 <= 1e-8 || !b22.is_finite() {
+                                *p_out = 1.0;
+                                return local_qtn_min;
+                            }
+
+                            let sy_adj = sy_slice[local_idx] - dot(xs, &bg_beta);
+                            let beta_marker = sy_adj / b22;
+                            let beta_rhs = bg_beta_rhs + sy_adj * beta_marker;
+                            let ve = (yy - beta_rhs) / (df as f64);
+                            if !beta_marker.is_finite() || !ve.is_finite() || ve < 0.0 {
+                                *p_out = 1.0;
+                                return local_qtn_min;
+                            }
+
+                            let se_marker = (ve / b22).sqrt();
+                            let marker_p_raw = if se_marker.is_finite() && se_marker > 0.0 {
+                                student_t_p_two_sided(beta_marker / se_marker, df)
                             } else {
                                 1.0_f64
                             };
-                            if ff >= q_base && ff < q0 {
-                                let slot = ff - q_base;
-                                if slot < local_qtn_min.len()
-                                    && p.is_finite()
-                                    && p < local_qtn_min[slot]
-                                {
-                                    local_qtn_min[slot] = p;
+                            *p_out = sanitize_assoc_pvalue(beta_marker, se_marker, marker_p_raw);
+
+                            for slot in 0..k_qtn {
+                                let beta_q = qtn_bg_beta[slot] - b21[q_base + slot] * beta_marker;
+                                let diag_q = qtn_diag_ixx[slot]
+                                    + b21[q_base + slot] * b21[q_base + slot] / b22;
+                                let se_q = (diag_q * ve).sqrt();
+                                if !beta_q.is_finite() || !se_q.is_finite() || se_q <= 0.0 {
+                                    continue;
                                 }
-                            } else if ff == q0 {
-                                marker_p_here = sanitize_assoc_pvalue(scr.beta[ff], se, p);
+                                let p_q = student_t_p_two_sided(beta_q / se_q, df);
+                                if p_q.is_finite() && p_q.total_cmp(&local_qtn_min[slot]).is_lt() {
+                                    local_qtn_min[slot] = p_q;
+                                }
                             }
+                            local_qtn_min
+                        },
+                    )
+                    .reduce(
+                        || vec![1.0_f64; k_qtn],
+                        |mut acc, local| {
+                            for (dst, src) in acc.iter_mut().zip(local.iter()) {
+                                if src.is_finite() && src.total_cmp(dst).is_lt() {
+                                    *dst = *src;
+                                }
+                            }
+                            acc
+                        },
+                    )
+            };
+            if let Some(p) = &pool {
+                p.install(&mut stat_runner)
+            } else {
+                stat_runner()
+            }
+        } else {
+            let mut stat_runner = || {
+                p_slice
+                    .par_iter_mut()
+                    .enumerate()
+                    .for_each(|(local_idx, p_out)| {
+                        let xs = &xs_slice[local_idx * q0..(local_idx + 1) * q0];
+                        let b21 = &b21_slice[local_idx * q0..(local_idx + 1) * q0];
+                        let b22 = ss_slice[local_idx] - dot(b21, xs);
+                        let df = bg_df - 1;
+                        if df <= 0 || b22 <= 1e-8 || !b22.is_finite() {
+                            *p_out = 1.0;
+                            return;
                         }
-                        *p_out = marker_p_here;
-                    }
-                    local_qtn_min
-                },
-            )
-            .reduce(
-                || vec![1.0_f64; k_qtn],
-                |mut acc, local| {
-                    for (dst, src) in acc.iter_mut().zip(local.iter()) {
-                        if src.is_finite() && src.total_cmp(dst).is_lt() {
-                            *dst = *src;
+
+                        let sy_adj = sy_slice[local_idx] - dot(xs, &bg_beta);
+                        let beta_marker = sy_adj / b22;
+                        let beta_rhs = bg_beta_rhs + sy_adj * beta_marker;
+                        let ve = (yy - beta_rhs) / (df as f64);
+                        if !beta_marker.is_finite() || !ve.is_finite() || ve < 0.0 {
+                            *p_out = 1.0;
+                            return;
                         }
-                    }
-                    acc
-                },
-            )
-    };
-    let qtn_min_p = if let Some(p) = &pool {
-        p.install(&mut runner)
-    } else {
-        runner()
-    };
+
+                        let se_marker = (ve / b22).sqrt();
+                        let marker_p_raw = if se_marker.is_finite() && se_marker > 0.0 {
+                            student_t_p_two_sided(beta_marker / se_marker, df)
+                        } else {
+                            1.0_f64
+                        };
+                        *p_out = sanitize_assoc_pvalue(beta_marker, se_marker, marker_p_raw);
+                    });
+            };
+            if let Some(p) = &pool {
+                p.install(&mut stat_runner);
+            } else {
+                stat_runner();
+            }
+            Vec::new()
+        };
+
+        for (dst, src) in qtn_min_p.iter_mut().zip(block_qtn_min.iter()) {
+            if src.is_finite() && src.total_cmp(dst).is_lt() {
+                *dst = *src;
+            }
+        }
+    }
+
     Ok((marker_p, qtn_min_p))
 }
 
@@ -1846,6 +2108,8 @@ fn farmcpu_scan_packed_marker_pvalues(
     }
 
     let pool = get_cached_pool(threads).map_err(|e| e.to_string())?;
+    let code4_lut = &packed_byte_lut().code4;
+    let full_sample_fast = sample_idx.iter().enumerate().all(|(i, &s)| i == s);
     let row_block = 8192usize;
     let mut geno_buf = vec![0.0_f64; row_block * n];
     let mut xs_buf = vec![0.0_f64; row_block * q0];
@@ -1861,41 +2125,28 @@ fn farmcpu_scan_packed_marker_pvalues(
         let sy_slice = &mut sy_resid_buf[..n_block];
         let ss_slice = &mut ss_buf[..n_block];
         let mut decode_runner = || {
-            geno_slice
-                .par_chunks_mut(n)
-                .zip(sy_slice.par_iter_mut())
-                .zip(ss_slice.par_iter_mut())
-                .enumerate()
-                .for_each(|(local_idx, ((geno_row, sy_out), ss_out))| {
-                    let idx = row_start + local_idx;
-                    let src_row = row_indices.map(|v| v[idx]).unwrap_or(idx);
-                    let row = &packed_flat[src_row * bytes_per_snp..(src_row + 1) * bytes_per_snp];
-                    let flip = row_flip[idx];
-                    let mean_g = (2.0_f64 * row_maf[idx] as f64).max(0.0);
-                    let mut sy_resid = 0.0_f64;
-                    let mut ss = 0.0_f64;
-                    for (k, &sidx) in sample_idx.iter().enumerate() {
-                        let b = row[sidx >> 2];
-                        let code = (b >> ((sidx & 3) * 2)) & 0b11;
-                        let mut gv = match decode_plink_bed_hardcall(code) {
-                            Some(v) => v,
-                            None => mean_g,
-                        };
-                        if flip && code != 0b01 {
-                            gv = 2.0 - gv;
-                        }
-                        geno_row[k] = gv;
-                        sy_resid += gv * y_resid[k];
-                        ss += gv * gv;
-                    }
-                    *sy_out = sy_resid;
-                    *ss_out = ss;
-                });
+            decode_mean_imputed_additive_packed_block_rows_f64_stats(
+                packed_flat,
+                bytes_per_snp,
+                n_samples,
+                row_flip,
+                row_maf,
+                sample_idx,
+                full_sample_fast,
+                row_indices,
+                row_start,
+                &y_resid,
+                geno_slice,
+                sy_slice,
+                ss_slice,
+                code4_lut,
+                pool.as_ref(),
+            )
         };
         if let Some(p) = &pool {
-            p.install(&mut decode_runner);
+            p.install(&mut decode_runner)?;
         } else {
-            decode_runner();
+            decode_runner()?;
         }
 
         let xs_slice = &mut xs_buf[..n_block * q0];
@@ -2160,6 +2411,8 @@ fn write_farmcpu_packed_main_scan(
     }
 
     let pool = get_cached_pool(threads).map_err(|e| e.to_string())?;
+    let code4_lut = &packed_byte_lut().code4;
+    let full_sample_fast = sample_idx.iter().enumerate().all(|(i, &s)| i == s);
     let row_block = 8192usize;
     let row_stride = 3usize;
     let mut geno_buf = vec![0.0_f64; row_block * n];
@@ -2186,41 +2439,28 @@ fn write_farmcpu_packed_main_scan(
         let sy_slice = &mut sy_resid_buf[..n_block];
         let ss_slice = &mut ss_buf[..n_block];
         let mut decode_runner = || {
-            geno_slice
-                .par_chunks_mut(n)
-                .zip(sy_slice.par_iter_mut())
-                .zip(ss_slice.par_iter_mut())
-                .enumerate()
-                .for_each(|(local_idx, ((geno_row, sy_out), ss_out))| {
-                    let idx = row_start + local_idx;
-                    let src_row = row_indices.map(|v| v[idx]).unwrap_or(idx);
-                    let row = &packed_flat[src_row * bytes_per_snp..(src_row + 1) * bytes_per_snp];
-                    let flip = row_flip[idx];
-                    let mean_g = (2.0_f64 * row_maf[idx] as f64).max(0.0);
-                    let mut sy_resid = 0.0_f64;
-                    let mut ss = 0.0_f64;
-                    for (k, &sidx) in sample_idx.iter().enumerate() {
-                        let b = row[sidx >> 2];
-                        let code = (b >> ((sidx & 3) * 2)) & 0b11;
-                        let mut gv = match decode_plink_bed_hardcall(code) {
-                            Some(v) => v,
-                            None => mean_g,
-                        };
-                        if flip && code != 0b01 {
-                            gv = 2.0 - gv;
-                        }
-                        geno_row[k] = gv;
-                        sy_resid += gv * y_resid[k];
-                        ss += gv * gv;
-                    }
-                    *sy_out = sy_resid;
-                    *ss_out = ss;
-                });
+            decode_mean_imputed_additive_packed_block_rows_f64_stats(
+                packed_flat,
+                bytes_per_snp,
+                n_samples,
+                row_flip,
+                row_maf,
+                sample_idx,
+                full_sample_fast,
+                row_indices,
+                row_start,
+                &y_resid,
+                geno_slice,
+                sy_slice,
+                ss_slice,
+                code4_lut,
+                pool.as_ref(),
+            )
         };
         if let Some(p) = &pool {
-            p.install(&mut decode_runner);
+            p.install(&mut decode_runner)?;
         } else {
-            decode_runner();
+            decode_runner()?;
         }
 
         let xs_slice = &mut xs_buf[..n_block * q0];
@@ -2967,8 +3207,22 @@ pub fn farmcpu_packed_to_tsv(
         let mut final_model_cache: Option<(Vec<f64>, usize, Vec<f64>)> = None;
         let mut seen_qtn_idx: HashSet<usize> = HashSet::new();
         let mut qtn_best_score: HashMap<usize, f64> = HashMap::new();
+        let stage1_timing = farmcpu_stage1_timing_enabled();
+        let mut stage1_timing_acc = FarmcpuStage1TimingAccum::default();
         if matches!(route, FarmcpuRoute::Unified) {
             for it_idx in 0..max_iter_i {
+                let iter_t0 = if stage1_timing {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
+                let qtn_in = qtn_idx.len();
+                let mut build_x_secs = 0.0_f64;
+                let mut pinv_secs = 0.0_f64;
+                let mut fem_secs = 0.0_f64;
+                let mut rem_secs = 0.0_f64;
+                let mut merge_secs = 0.0_f64;
+                let mut callback_secs = 0.0_f64;
                 let (x_qtn, q_total) = build_x_with_qtn_packed(
                     &base_x,
                     n,
@@ -2982,8 +3236,24 @@ pub fn farmcpu_packed_to_tsv(
                     row_maf,
                 )
                 .map_err(PyRuntimeError::new_err)?;
+                if let Some(t0) = iter_t0 {
+                    build_x_secs = t0.elapsed().as_secs_f64();
+                }
+                let t_pinv = if stage1_timing {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
                 let ixx =
                     pinv_for_row_major_x(&x_qtn, n, q_total).map_err(PyRuntimeError::new_err)?;
+                if let Some(t0) = t_pinv {
+                    pinv_secs = t0.elapsed().as_secs_f64();
+                }
+                let t_fem = if stage1_timing {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
                 let (femp, _bg_pwald) = farmcpu_scan_packed_marker_pvalues(
                     y,
                     &x_qtn,
@@ -2997,6 +3267,9 @@ pub fn farmcpu_packed_to_tsv(
                     threads,
                 )
                 .map_err(PyRuntimeError::new_err)?;
+                if let Some(t0) = t_fem {
+                    fem_secs = t0.elapsed().as_secs_f64();
+                }
                 let mut femp_masked = femp.clone();
                 for &idx in seen_qtn_idx.iter() {
                     if idx < femp_masked.len() {
@@ -3018,6 +3291,11 @@ pub fn farmcpu_packed_to_tsv(
                 candidates.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
                 if candidates.is_empty() {
                     final_model_cache = Some((x_qtn, q_total, ixx));
+                    let t_cb = if stage1_timing {
+                        Some(Instant::now())
+                    } else {
+                        None
+                    };
                     if let Some(cb) = progress_callback.as_ref() {
                         Python::attach(|py2| -> PyResult<()> {
                             py2.check_signals()?;
@@ -3025,8 +3303,44 @@ pub fn farmcpu_packed_to_tsv(
                             Ok(())
                         })?;
                     }
+                    if let Some(t0) = t_cb {
+                        callback_secs += t0.elapsed().as_secs_f64();
+                    }
+                    if let Some(t0) = iter_t0 {
+                        let total_secs = t0.elapsed().as_secs_f64();
+                        stage1_timing_acc.add_iter(
+                            build_x_secs,
+                            pinv_secs,
+                            fem_secs,
+                            rem_secs,
+                            merge_secs,
+                            callback_secs,
+                            total_secs,
+                        );
+                        farmcpu_stage1_emit_iter_timing(
+                            route,
+                            it_idx,
+                            max_iter_i,
+                            qtn_in,
+                            qtn_in,
+                            0usize,
+                            build_x_secs,
+                            pinv_secs,
+                            fem_secs,
+                            rem_secs,
+                            merge_secs,
+                            callback_secs,
+                            total_secs,
+                        );
+                    }
                     break;
                 }
+                let candidate_count = candidates.len();
+                let t_rem = if stage1_timing {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
                 let opt_lead = farmcpu_best_rem_lead_set(
                     y,
                     &x_qtn,
@@ -3044,6 +3358,14 @@ pub fn farmcpu_packed_to_tsv(
                     pool.as_ref(),
                 )
                 .map_err(PyRuntimeError::new_err)?;
+                if let Some(t0) = t_rem {
+                    rem_secs = t0.elapsed().as_secs_f64();
+                }
+                let t_merge = if stage1_timing {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
                 let mut qtn_union = qtn_idx.clone();
                 qtn_union.extend(farmcpu_window_representatives(
                     candidates.clone(),
@@ -3103,13 +3425,51 @@ pub fn farmcpu_packed_to_tsv(
                         })
                         .or_insert(score);
                 }
+                if let Some(t0) = t_merge {
+                    merge_secs = t0.elapsed().as_secs_f64();
+                }
 
+                let t_cb = if stage1_timing {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
                 if let Some(cb) = progress_callback.as_ref() {
                     Python::attach(|py2| -> PyResult<()> {
                         py2.check_signals()?;
                         cb.call1(py2, (it_idx + 1, max_iter_i))?;
                         Ok(())
                     })?;
+                }
+                if let Some(t0) = t_cb {
+                    callback_secs += t0.elapsed().as_secs_f64();
+                }
+                if let Some(t0) = iter_t0 {
+                    let total_secs = t0.elapsed().as_secs_f64();
+                    stage1_timing_acc.add_iter(
+                        build_x_secs,
+                        pinv_secs,
+                        fem_secs,
+                        rem_secs,
+                        merge_secs,
+                        callback_secs,
+                        total_secs,
+                    );
+                    farmcpu_stage1_emit_iter_timing(
+                        route,
+                        it_idx,
+                        max_iter_i,
+                        qtn_in,
+                        qtn_next.len(),
+                        candidate_count,
+                        build_x_secs,
+                        pinv_secs,
+                        fem_secs,
+                        rem_secs,
+                        merge_secs,
+                        callback_secs,
+                        total_secs,
+                    );
                 }
 
                 if qtn_next == qtn_idx {
@@ -3129,6 +3489,18 @@ pub fn farmcpu_packed_to_tsv(
             }
         } else {
             for it_idx in 0..max_iter_i {
+                let iter_t0 = if stage1_timing {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
+                let qtn_in = qtn_idx.len();
+                let mut build_x_secs = 0.0_f64;
+                let mut pinv_secs = 0.0_f64;
+                let mut fem_secs = 0.0_f64;
+                let mut rem_secs = 0.0_f64;
+                let mut merge_secs = 0.0_f64;
+                let mut callback_secs = 0.0_f64;
                 let (x_qtn, q_total) = build_x_with_qtn_packed(
                     &base_x,
                     n,
@@ -3142,7 +3514,15 @@ pub fn farmcpu_packed_to_tsv(
                     row_maf,
                 )
                 .map_err(PyRuntimeError::new_err)?;
+                if let Some(t0) = iter_t0 {
+                    build_x_secs = t0.elapsed().as_secs_f64();
+                }
 
+                let t_pinv = if stage1_timing {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
                 let mut xtx = vec![0.0_f64; q_total * q_total];
                 for i in 0..n {
                     let row = &x_qtn[i * q_total..(i + 1) * q_total];
@@ -3154,6 +3534,14 @@ pub fn farmcpu_packed_to_tsv(
                     }
                 }
                 let ixx = pinv_xtx(&xtx, q_total).map_err(PyRuntimeError::new_err)?;
+                if let Some(t0) = t_pinv {
+                    pinv_secs = t0.elapsed().as_secs_f64();
+                }
+                let t_fem = if stage1_timing {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
                 let (mut femp, qtn_min_p) = scan_packed_full_matrix_reduced(
                     y,
                     &x_qtn,
@@ -3168,17 +3556,26 @@ pub fn farmcpu_packed_to_tsv(
                     threads,
                 )
                 .map_err(PyRuntimeError::new_err)?;
+                if let Some(t0) = t_fem {
+                    fem_secs = t0.elapsed().as_secs_f64();
+                }
                 for (j, &idx) in qtn_idx.iter().enumerate() {
                     if idx < m && qtn_min_p[j].is_finite() {
                         femp[idx] = qtn_min_p[j];
                     }
                 }
 
-                let has_signal = femp
+                let signal_count = femp
                     .iter()
-                    .any(|&p| p.is_finite() && p <= qtn_threshold_eff);
-                if !has_signal {
+                    .filter(|&&p| p.is_finite() && p <= qtn_threshold_eff)
+                    .count();
+                if signal_count == 0 {
                     final_model_cache = Some((x_qtn, q_total, ixx));
+                    let t_cb = if stage1_timing {
+                        Some(Instant::now())
+                    } else {
+                        None
+                    };
                     if let Some(cb) = progress_callback.as_ref() {
                         Python::attach(|py2| -> PyResult<()> {
                             py2.check_signals()?;
@@ -3186,9 +3583,44 @@ pub fn farmcpu_packed_to_tsv(
                             Ok(())
                         })?;
                     }
+                    if let Some(t0) = t_cb {
+                        callback_secs += t0.elapsed().as_secs_f64();
+                    }
+                    if let Some(t0) = iter_t0 {
+                        let total_secs = t0.elapsed().as_secs_f64();
+                        stage1_timing_acc.add_iter(
+                            build_x_secs,
+                            pinv_secs,
+                            fem_secs,
+                            rem_secs,
+                            merge_secs,
+                            callback_secs,
+                            total_secs,
+                        );
+                        farmcpu_stage1_emit_iter_timing(
+                            route,
+                            it_idx,
+                            max_iter_i,
+                            qtn_in,
+                            qtn_in,
+                            signal_count,
+                            build_x_secs,
+                            pinv_secs,
+                            fem_secs,
+                            rem_secs,
+                            merge_secs,
+                            callback_secs,
+                            total_secs,
+                        );
+                    }
                     break;
                 }
 
+                let t_rem = if stage1_timing {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
                 let opt_lead = farmcpu_best_rem_lead_set(
                     y,
                     &x_qtn,
@@ -3206,6 +3638,14 @@ pub fn farmcpu_packed_to_tsv(
                     pool.as_ref(),
                 )
                 .map_err(PyRuntimeError::new_err)?;
+                if let Some(t0) = t_rem {
+                    rem_secs = t0.elapsed().as_secs_f64();
+                }
+                let t_merge = if stage1_timing {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
                 let mut qtn_union = qtn_idx.clone();
                 qtn_union.extend(opt_lead.into_iter());
                 qtn_union.sort_unstable();
@@ -3235,16 +3675,54 @@ pub fn farmcpu_packed_to_tsv(
                     qtn_union
                         .iter()
                         .zip(keep.iter())
-                        .filter_map(|(&ix, &k)| if k { Some(ix) } else { None })
-                        .collect()
+                            .filter_map(|(&ix, &k)| if k { Some(ix) } else { None })
+                            .collect()
                 };
+                if let Some(t0) = t_merge {
+                    merge_secs = t0.elapsed().as_secs_f64();
+                }
 
+                let t_cb = if stage1_timing {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
                 if let Some(cb) = progress_callback.as_ref() {
                     Python::attach(|py2| -> PyResult<()> {
                         py2.check_signals()?;
                         cb.call1(py2, (it_idx + 1, max_iter_i))?;
                         Ok(())
                     })?;
+                }
+                if let Some(t0) = t_cb {
+                    callback_secs += t0.elapsed().as_secs_f64();
+                }
+                if let Some(t0) = iter_t0 {
+                    let total_secs = t0.elapsed().as_secs_f64();
+                    stage1_timing_acc.add_iter(
+                        build_x_secs,
+                        pinv_secs,
+                        fem_secs,
+                        rem_secs,
+                        merge_secs,
+                        callback_secs,
+                        total_secs,
+                    );
+                    farmcpu_stage1_emit_iter_timing(
+                        route,
+                        it_idx,
+                        max_iter_i,
+                        qtn_in,
+                        qtn_next.len(),
+                        signal_count,
+                        build_x_secs,
+                        pinv_secs,
+                        fem_secs,
+                        rem_secs,
+                        merge_secs,
+                        callback_secs,
+                        total_secs,
+                    );
                 }
 
                 if qtn_next == qtn_idx {
@@ -3265,6 +3743,12 @@ pub fn farmcpu_packed_to_tsv(
         }
 
         if matches!(route, FarmcpuRoute::Unified) && !qtn_idx.is_empty() {
+            let t_final_merge = if stage1_timing {
+                Some(Instant::now())
+            } else {
+                None
+            };
+            let qtn_before_final_merge = qtn_idx.len();
             let mut qtn_score_map: HashMap<usize, f64> = HashMap::with_capacity(qtn_idx.len());
             for &idx in qtn_idx.iter() {
                 let mut score = qtn_best_score.get(&idx).copied().unwrap_or(1.0);
@@ -3294,6 +3778,20 @@ pub fn farmcpu_packed_to_tsv(
                 qtn_idx = qtn_final;
                 final_model_cache = None;
             }
+            if let Some(t0) = t_final_merge {
+                let final_merge_secs = t0.elapsed().as_secs_f64();
+                stage1_timing_acc.final_merge_secs += final_merge_secs;
+                eprintln!(
+                    "FarmCPU stage1 final merge timing route=unified qtn_in={} qtn_out={} total={:.3}s",
+                    qtn_before_final_merge,
+                    qtn_idx.len(),
+                    final_merge_secs,
+                );
+            }
+        }
+
+        if stage1_timing {
+            farmcpu_stage1_emit_total_timing(route, &stage1_timing_acc);
         }
 
         let (x_qtn, _q_total, ixx) = if let Some(cached) = final_model_cache.take() {
@@ -3675,3 +4173,136 @@ pub fn farmcpu_write_assoc_tsv(
 }
 
 // =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn encode_bed_code(call: Option<u8>) -> u8 {
+        match call {
+            Some(0) => 0b00,
+            Some(1) => 0b10,
+            Some(2) => 0b11,
+            None => 0b01,
+            Some(v) => panic!("unsupported hardcall dosage in test: {v}"),
+        }
+    }
+
+    fn pack_bed_rows(rows: &[Vec<Option<u8>>]) -> Vec<u8> {
+        let n_samples = rows.first().map(|r| r.len()).unwrap_or(0);
+        let bytes_per_snp = n_samples.div_ceil(4);
+        let mut packed = vec![0u8; rows.len() * bytes_per_snp];
+        for (row_idx, row) in rows.iter().enumerate() {
+            assert_eq!(row.len(), n_samples);
+            for (sample_idx, &call) in row.iter().enumerate() {
+                let byte_idx = row_idx * bytes_per_snp + (sample_idx >> 2);
+                let shift = (sample_idx & 3) * 2;
+                packed[byte_idx] |= encode_bed_code(call) << shift;
+            }
+        }
+        packed
+    }
+
+    fn assert_close_or_nan(lhs: f64, rhs: f64, tol: f64) {
+        if lhs.is_nan() || rhs.is_nan() {
+            assert!(lhs.is_nan() && rhs.is_nan(), "lhs={lhs:?}, rhs={rhs:?}");
+        } else {
+            assert!(
+                (lhs - rhs).abs() <= tol,
+                "lhs={lhs:.16e}, rhs={rhs:.16e}, diff={:.16e}, tol={tol:.1e}",
+                (lhs - rhs).abs()
+            );
+        }
+    }
+
+    #[test]
+    fn reduced_packed_scan_matches_full_scan_reference() {
+        let y = vec![1.2, -0.4, 0.8, 2.1, -1.3];
+        let x_flat = vec![
+            1.0, -1.2, 0.3, //
+            1.0, 0.5, 1.1, //
+            1.0, 1.3, -0.4, //
+            1.0, -0.7, 2.0, //
+            1.0, 0.2, 0.8,
+        ];
+        let q_base = 2usize;
+        let q0 = 3usize;
+        let n = y.len();
+        let mut xtx = vec![0.0_f64; q0 * q0];
+        for i in 0..n {
+            let row = &x_flat[i * q0..(i + 1) * q0];
+            for a in 0..q0 {
+                let va = row[a];
+                for b in 0..q0 {
+                    xtx[a * q0 + b] += va * row[b];
+                }
+            }
+        }
+        let ixx = pinv_xtx(&xtx, q0).expect("pinv_xtx should succeed");
+
+        let packed_rows = vec![
+            vec![Some(0), Some(1), None, Some(2), Some(1), Some(0), Some(2)],
+            vec![Some(2), Some(2), Some(1), Some(0), None, Some(1), Some(0)],
+            vec![None, Some(0), Some(0), Some(1), Some(2), Some(2), Some(1)],
+            vec![Some(1), Some(1), Some(2), None, Some(0), Some(0), Some(2)],
+            vec![Some(0), None, Some(1), Some(2), Some(2), Some(1), Some(0)],
+        ];
+        let packed_flat = pack_bed_rows(&packed_rows);
+        let n_samples = 7usize;
+        let sample_idx = vec![0usize, 1, 3, 4, 6];
+        let row_indices = vec![4usize, 1, 3];
+        let row_flip = vec![false, true, false];
+        let row_maf = vec![0.25_f32, 0.40_f32, 0.15_f32];
+
+        let (full_stats, m_ref, row_stride) = scan_packed_full_matrix(
+            &y,
+            &x_flat,
+            &ixx,
+            &packed_flat,
+            n_samples,
+            &row_flip,
+            &row_maf,
+            Some(&row_indices),
+            &sample_idx,
+            1,
+        )
+        .expect("full packed scan should succeed");
+        assert_eq!(m_ref, row_indices.len());
+        assert_eq!(row_stride, q0 + 3);
+
+        let (marker_p, qtn_min_p) = scan_packed_full_matrix_reduced(
+            &y,
+            &x_flat,
+            &ixx,
+            &packed_flat,
+            n_samples,
+            &row_flip,
+            &row_maf,
+            Some(&row_indices),
+            &sample_idx,
+            q_base,
+            1,
+        )
+        .expect("reduced packed scan should succeed");
+
+        let mut marker_ref = vec![1.0_f64; m_ref];
+        let mut qtn_ref = vec![1.0_f64; q0 - q_base];
+        for idx in 0..m_ref {
+            let row = &full_stats[idx * row_stride..(idx + 1) * row_stride];
+            marker_ref[idx] = sanitize_assoc_pvalue(row[0], row[1], row[2 + q0]);
+            for slot in 0..(q0 - q_base) {
+                let p = row[2 + q_base + slot];
+                if p.is_finite() && p.total_cmp(&qtn_ref[slot]).is_lt() {
+                    qtn_ref[slot] = p;
+                }
+            }
+        }
+
+        for (lhs, rhs) in marker_p.iter().zip(marker_ref.iter()) {
+            assert_close_or_nan(*lhs, *rhs, 1e-10);
+        }
+        for (lhs, rhs) in qtn_min_p.iter().zip(qtn_ref.iter()) {
+            assert_close_or_nan(*lhs, *rhs, 1e-10);
+        }
+    }
+}

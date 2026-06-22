@@ -3972,17 +3972,16 @@ pub fn bayesa_stream_bed(
     let pool_owned = get_cached_pool(threads)?;
     let pool_ref = pool_owned.as_ref();
     let result = py.detach(|| {
-        let block_rows = block_rows.unwrap_or_else(|| bayes_packed_block_rows(n, p)).max(1);
+        let block_rows = block_rows
+            .unwrap_or_else(|| bayes_packed_block_rows(n, p))
+            .max(1);
         let mut source = build_bayes_source(None, &prefix, n_samples, block_rows, mmap_window_mb)?;
         let n_source = match &source {
             BayesPackedSource::Resident { .. } => 0usize,
             BayesPackedSource::Windowed(matrix) => matrix.n_source_snps(),
         };
-        let packed_row_indices = parse_index_vec_i64_string(
-            row_idx_raw.as_slice(),
-            n_source,
-            "row_indices",
-        )?;
+        let packed_row_indices =
+            parse_index_vec_i64_string(row_idx_raw.as_slice(), n_source, "row_indices")?;
         bayesa_packed_core_impl(
             y_vec.as_ref(),
             &mut source,
@@ -4179,17 +4178,16 @@ pub fn bayesb_stream_bed(
     let pool_owned = get_cached_pool(threads)?;
     let pool_ref = pool_owned.as_ref();
     let result = py.detach(|| {
-        let block_rows = block_rows.unwrap_or_else(|| bayes_packed_block_rows(n, p)).max(1);
+        let block_rows = block_rows
+            .unwrap_or_else(|| bayes_packed_block_rows(n, p))
+            .max(1);
         let mut source = build_bayes_source(None, &prefix, n_samples, block_rows, mmap_window_mb)?;
         let n_source = match &source {
             BayesPackedSource::Resident { .. } => 0usize,
             BayesPackedSource::Windowed(matrix) => matrix.n_source_snps(),
         };
-        let packed_row_indices = parse_index_vec_i64_string(
-            row_idx_raw.as_slice(),
-            n_source,
-            "row_indices",
-        )?;
+        let packed_row_indices =
+            parse_index_vec_i64_string(row_idx_raw.as_slice(), n_source, "row_indices")?;
         bayesb_packed_core_impl(
             y_vec.as_ref(),
             &mut source,
@@ -4399,17 +4397,16 @@ pub fn bayescpi_stream_bed(
     let pool_owned = get_cached_pool(threads)?;
     let pool_ref = pool_owned.as_ref();
     let result = py.detach(|| {
-        let block_rows = block_rows.unwrap_or_else(|| bayes_packed_block_rows(n, p)).max(1);
+        let block_rows = block_rows
+            .unwrap_or_else(|| bayes_packed_block_rows(n, p))
+            .max(1);
         let mut source = build_bayes_source(None, &prefix, n_samples, block_rows, mmap_window_mb)?;
         let n_source = match &source {
             BayesPackedSource::Resident { .. } => 0usize,
             BayesPackedSource::Windowed(matrix) => matrix.n_source_snps(),
         };
-        let packed_row_indices = parse_index_vec_i64_string(
-            row_idx_raw.as_slice(),
-            n_source,
-            "row_indices",
-        )?;
+        let packed_row_indices =
+            parse_index_vec_i64_string(row_idx_raw.as_slice(), n_source, "row_indices")?;
         bayescpi_packed_core_impl(
             y_vec.as_ref(),
             &mut source,

@@ -4314,7 +4314,8 @@ pub fn grm_stream_bed_f64<'py>(
         })
         // Default to one-stage true streaming unless explicitly enabled.
         .unwrap_or(false);
-    let stream_prestat_core = (stream_prestat_core_requested && !it.is_windowed()) || use_extra_filters;
+    let stream_prestat_core =
+        (stream_prestat_core_requested && !it.is_windowed()) || use_extra_filters;
     let stage_timing = env_truthy("JX_GRM_STREAM_STAGE_TIMING");
 
     let grm_vec = py
@@ -5080,7 +5081,8 @@ pub fn grm_stream_bed_f32<'py>(
             !matches!(t.as_str(), "0" | "false" | "no" | "off")
         })
         .unwrap_or(false);
-    let stream_prestat_core = (stream_prestat_core_requested && !it.is_windowed()) || use_extra_filters;
+    let stream_prestat_core =
+        (stream_prestat_core_requested && !it.is_windowed()) || use_extra_filters;
     let stage_timing = env_truthy("JX_GRM_STREAM_STAGE_TIMING");
 
     let grm_vec = py

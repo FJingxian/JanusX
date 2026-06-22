@@ -279,8 +279,7 @@ fn decode_centered_meta_block_f32(
                 .enumerate()
                 .for_each(|(local_row, ((dst, row_varsum_dst), row_sum_dst))| {
                     let rel_row = packed_row_indices[local_row];
-                    let row =
-                        &packed_flat[rel_row * bytes_per_snp..(rel_row + 1) * bytes_per_snp];
+                    let row = &packed_flat[rel_row * bytes_per_snp..(rel_row + 1) * bytes_per_snp];
                     let p = row_maf[local_row].clamp(0.0_f32, 1.0_f32) as f64;
                     let (mean_g, var, value_lut): (f64, f64, [f32; 4]) = match mode {
                         StreamKernelMode::Additive => {
@@ -559,10 +558,7 @@ pub(crate) fn build_grm_from_meta_stream(
         };
 
         crate::pipeline::run_double_buffer(2usize, make_chunk, producer, consumer)?;
-        let producer_err_tail = producer_err
-            .lock()
-            .ok()
-            .and_then(|mut slot| slot.take());
+        let producer_err_tail = producer_err.lock().ok().and_then(|mut slot| slot.take());
         if let Some(err) = producer_err_tail {
             return Err(err);
         }
@@ -615,8 +611,8 @@ fn compute_malpha_from_meta_stream(
         check_ctrlc()?;
         let row_end = (row_start + row_step).min(eff_m);
         let cur_rows = row_end - row_start;
-        let packed_slice =
-            matrix.prepare_source_rows(&row_source_indices[row_start..row_end], &mut rel_indices)?;
+        let packed_slice = matrix
+            .prepare_source_rows(&row_source_indices[row_start..row_end], &mut rel_indices)?;
         decode_mean_imputed_additive_packed_block_rows_f32(
             packed_slice,
             bytes_per_snp,
@@ -661,7 +657,9 @@ fn compute_effect_beta_from_meta_stream(
 ) -> Result<Vec<f64>, String> {
     let eff_m = row_source_indices.len();
     if row_flip.len() != eff_m || row_maf.len() != eff_m {
-        return Err("compute_effect_beta_from_meta_stream: row metadata length mismatch".to_string());
+        return Err(
+            "compute_effect_beta_from_meta_stream: row metadata length mismatch".to_string(),
+        );
     }
     if sample_idx.len() != alpha.len() {
         return Err("compute_effect_beta_from_meta_stream: alpha length mismatch".to_string());
@@ -671,7 +669,9 @@ fn compute_effect_beta_from_meta_stream(
         return Err("compute_effect_beta_from_meta_stream: empty marker set".to_string());
     }
     if n_out == 0 {
-        return Err("compute_effect_beta_from_meta_stream: sample_idx must not be empty".to_string());
+        return Err(
+            "compute_effect_beta_from_meta_stream: sample_idx must not be empty".to_string(),
+        );
     }
     let n_samples = crate::gfcore::read_fam(prefix)?.len();
     let bytes_per_snp = n_samples.div_ceil(4);
@@ -700,8 +700,8 @@ fn compute_effect_beta_from_meta_stream(
         check_ctrlc()?;
         let row_end = (row_start + row_step).min(eff_m);
         let cur_rows = row_end - row_start;
-        let packed_slice =
-            matrix.prepare_source_rows(&row_source_indices[row_start..row_end], &mut rel_indices)?;
+        let packed_slice = matrix
+            .prepare_source_rows(&row_source_indices[row_start..row_end], &mut rel_indices)?;
         decode_centered_meta_block_f32(
             packed_slice,
             rel_indices.as_slice(),
@@ -779,8 +779,8 @@ fn predict_from_effect_stream(
         check_ctrlc()?;
         let row_end = (row_start + row_step).min(eff_m);
         let cur_rows = row_end - row_start;
-        let packed_slice =
-            matrix.prepare_source_rows(&row_source_indices[row_start..row_end], &mut rel_indices)?;
+        let packed_slice = matrix
+            .prepare_source_rows(&row_source_indices[row_start..row_end], &mut rel_indices)?;
         decode_mean_imputed_additive_packed_block_rows_f32(
             packed_slice,
             bytes_per_snp,
@@ -796,13 +796,15 @@ fn predict_from_effect_stream(
             pool_ref,
         )?;
         let beta_block = &effect_beta[row_start..row_end];
-        out.par_iter_mut().enumerate().for_each(|(sample_pos, dst)| {
-            let mut acc = 0.0_f64;
-            for local_row in 0..cur_rows {
-                acc += (block[local_row * n_out + sample_pos] as f64) * beta_block[local_row];
-            }
-            *dst += acc;
-        });
+        out.par_iter_mut()
+            .enumerate()
+            .for_each(|(sample_pos, dst)| {
+                let mut acc = 0.0_f64;
+                for local_row in 0..cur_rows {
+                    acc += (block[local_row * n_out + sample_pos] as f64) * beta_block[local_row];
+                }
+                *dst += acc;
+            });
     }
     Ok(out)
 }
@@ -910,8 +912,7 @@ pub fn gblup_reml_packed_bed<'py>(
             Ok(s) => s.to_vec(),
             Err(_) => row_maf.as_array().iter().copied().collect(),
         };
-        if row_flip_vec.len() != row_source_vec.len() || row_maf_vec.len() != row_source_vec.len()
-        {
+        if row_flip_vec.len() != row_source_vec.len() || row_maf_vec.len() != row_source_vec.len() {
             return Err(PyRuntimeError::new_err(format!(
                 "metadata length mismatch: row_source_indices={}, row_flip={}, row_maf={}",
                 row_source_vec.len(),
@@ -957,7 +958,8 @@ pub fn gblup_reml_packed_bed<'py>(
         } else {
             Vec::new()
         };
-        let train_pred_pick: Option<Vec<usize>> = if let Some(local_idx) = train_pred_local_indices {
+        let train_pred_pick: Option<Vec<usize>> = if let Some(local_idx) = train_pred_local_indices
+        {
             Some(parse_index_vec_i64(
                 local_idx.as_slice()?,
                 train_idx.len(),
@@ -2118,11 +2120,7 @@ pub fn gblup_effect_from_meta_stream<'py>(
     if n_samples == 0 {
         return Err(PyRuntimeError::new_err("No samples found in BED input."));
     }
-    let sample_idx = parse_index_vec_i64(
-        sample_indices.as_slice()?,
-        n_samples,
-        "sample_indices",
-    )?;
+    let sample_idx = parse_index_vec_i64(sample_indices.as_slice()?, n_samples, "sample_indices")?;
     let alpha_vec: Vec<f64> = match alpha.as_slice() {
         Ok(s) => s.to_vec(),
         Err(_) => alpha.as_array().iter().copied().collect(),

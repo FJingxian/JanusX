@@ -65,12 +65,16 @@ window, its output statistics come from that local conditional refit.
 
 use crate::assoc2tsv::resolve_assoc_tsv_metadata;
 use crate::bedmath::{decode_plink_bed_hardcall, packed_row_missing_count_selected};
-use crate::blas::{cblas_dgemm_dispatch, CblasInt, CBLAS_NO_TRANS, CBLAS_ROW_MAJOR};
+use crate::blas::{
+    cblas_dgemm_dispatch, CblasInt, OpenBlasThreadGuard, CBLAS_NO_TRANS, CBLAS_ROW_MAJOR,
+};
+use crate::brent::brent_minimize;
+use crate::eigh::symmetric_eigh_f64_row_major;
 use crate::linalg::{
     chisq_from_beta_se_and_optional_plrt, format_chisq_value, sanitize_assoc_pvalue,
 };
 use crate::stats_common::{get_cached_pool, parse_index_vec_i64, AsyncTsvWriter};
-use nalgebra::{DMatrix, DVector};
+use nalgebra::DMatrix;
 use numpy::PyArray1;
 use numpy::PyArrayMethods;
 use numpy::{PyReadonlyArray1, PyReadonlyArray2};
@@ -81,7 +85,7 @@ use pyo3::BoundObject;
 use rayon::prelude::*;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::f64::consts::PI;
+use std::f64::consts::LN_10;
 use std::fmt::Write as _;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -111,6 +115,17 @@ impl FarmcpuRoute {
 #[inline]
 fn dot(a: &[f64], b: &[f64]) -> f64 {
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+}
+
+#[derive(Clone, Debug)]
+struct FarmcpuExactRemPrepared {
+    n: usize,
+    p: usize,
+    rank_x: usize,
+    x_flat: Vec<f64>,
+    ixx: Vec<f64>,
+    y_resid: Vec<f64>,
+    y_resid_ss: f64,
 }
 
 fn resolve_assoc_chrom_pos_metadata(
@@ -198,9 +213,7 @@ fn resolve_assoc_chrom_pos_metadata(
         if want_ptr != idx.len() {
             return Err(format!(
                 "BIM ended early: needed row {} but only resolved {} selected rows from {}",
-                idx[want_ptr],
-                want_ptr,
-                bim_path
+                idx[want_ptr], want_ptr, bim_path
             ));
         }
     }
@@ -318,23 +331,270 @@ pub(crate) fn select_lead_indices(
     lead
 }
 
-fn solve_linear_system_stable(a: &DMatrix<f64>, b: &DVector<f64>) -> Option<DVector<f64>> {
-    let p = a.nrows();
-    if p == 0 {
-        return Some(DVector::zeros(0));
+fn farmcpu_exact_reml_log10_bounds_from_legacy_delta(
+    delta_exp_start: f64,
+    delta_exp_end: f64,
+) -> (f64, f64) {
+    let mut low = delta_exp_start.min(delta_exp_end) / LN_10;
+    let mut high = delta_exp_start.max(delta_exp_end) / LN_10;
+    if !low.is_finite() || !high.is_finite() {
+        low = -6.0;
+        high = 6.0;
     }
-    let eye = DMatrix::<f64>::identity(p, p);
-    for ridge in [0.0_f64, 1e-10, 1e-8, 1e-6] {
-        let mut a_use = a.clone();
-        if ridge > 0.0 {
-            a_use += &eye * ridge;
+    if low == high {
+        low -= 1.0;
+        high += 1.0;
+    }
+    (low, high)
+}
+
+#[inline]
+fn farmcpu_exact_reml_cost_from_spectrum(
+    lambda: f64,
+    eigvals: &[f64],
+    y_proj: &[f64],
+    y_resid_ss: f64,
+    n_eff: usize,
+) -> f64 {
+    if !(lambda.is_finite() && lambda > 0.0) {
+        return f64::INFINITY;
+    }
+    let r = eigvals.len();
+    if r != y_proj.len() || n_eff == 0 || n_eff < r {
+        return f64::INFINITY;
+    }
+    let mut quad = 0.0_f64;
+    let mut log_det = 0.0_f64;
+    let mut y_proj_ss = 0.0_f64;
+    for k in 0..r {
+        let s = eigvals[k];
+        let yk = y_proj[k];
+        if !(s.is_finite() && s >= 0.0 && yk.is_finite()) {
+            return f64::INFINITY;
         }
-        if let Some(ch) = a_use.cholesky() {
-            return Some(ch.solve(b));
+        let vk = s + lambda;
+        if !(vk.is_finite() && vk > 0.0) {
+            return f64::INFINITY;
+        }
+        quad += (yk * yk) / vk;
+        log_det += vk.ln();
+        y_proj_ss += yk * yk;
+    }
+    let null_df = n_eff.saturating_sub(r);
+    let null_ss = (y_resid_ss - y_proj_ss).max(0.0_f64);
+    if null_df > 0 {
+        quad += null_ss / lambda;
+        log_det += (null_df as f64) * lambda.ln();
+    }
+    if !(quad.is_finite() && quad > 0.0 && log_det.is_finite()) {
+        return f64::INFINITY;
+    }
+    0.5_f64 * ((n_eff as f64) * quad.ln() + log_det)
+}
+
+fn prepare_farmcpu_exact_rem(
+    y: &[f64],
+    x: &[f64],
+    n: usize,
+    p: usize,
+) -> Result<FarmcpuExactRemPrepared, String> {
+    if n == 0 || p == 0 {
+        return Err("invalid shape in ll score: empty y/X".to_string());
+    }
+    if y.len() != n {
+        return Err("invalid y length in ll score".to_string());
+    }
+    if x.len() != n * p {
+        return Err("invalid X length in ll score".to_string());
+    }
+    let (ixx, rank_x) = pinv_for_row_major_x_with_rank(x, n, p)?;
+    if rank_x == 0 || rank_x >= n {
+        return Err(format!(
+            "invalid fixed-effect rank for exact FarmCPU REML: rank_x={rank_x}, n={n}"
+        ));
+    }
+    let mut xty = vec![0.0_f64; p];
+    for i in 0..n {
+        let yi = y[i];
+        let row = &x[i * p..(i + 1) * p];
+        for a in 0..p {
+            xty[a] += row[a] * yi;
         }
     }
-    let lu = a.clone().lu();
-    lu.solve(b)
+    let mut beta_y = vec![0.0_f64; p];
+    matvec_into(&ixx, p, &xty, &mut beta_y);
+    let mut y_resid = vec![0.0_f64; n];
+    for i in 0..n {
+        let row = &x[i * p..(i + 1) * p];
+        y_resid[i] = y[i] - dot(row, &beta_y);
+    }
+    let y_resid_ss = y_resid.iter().map(|v| v * v).sum::<f64>();
+    Ok(FarmcpuExactRemPrepared {
+        n,
+        p,
+        rank_x,
+        x_flat: x.to_vec(),
+        ixx,
+        y_resid,
+        y_resid_ss,
+    })
+}
+
+fn farmcpu_ll_score_from_sample_major_prepared(
+    prepared: &FarmcpuExactRemPrepared,
+    snp_pool_sample_major: &[f64],
+    k: usize,
+    delta_exp_start: f64,
+    delta_exp_end: f64,
+    reml_tol: f64,
+    reml_max_iter: usize,
+    eig_eps: f64,
+) -> Result<f64, String> {
+    if k == 0 {
+        return Err("FarmCPU exact REML scorer received zero candidate markers".to_string());
+    }
+    if snp_pool_sample_major.len() != prepared.n * k {
+        return Err("invalid snp_pool length in ll score".to_string());
+    }
+    if !(reml_tol.is_finite() && reml_tol > 0.0) {
+        return Err("exact FarmCPU REML requires finite reml_tol > 0".to_string());
+    }
+    if reml_max_iter == 0 {
+        return Err("exact FarmCPU REML requires reml_max_iter > 0".to_string());
+    }
+    let n_eff = prepared.n.saturating_sub(prepared.rank_x);
+    if n_eff == 0 {
+        return Err("exact FarmCPU REML has zero effective degrees of freedom".to_string());
+    }
+
+    let mut xtg = vec![0.0_f64; prepared.p * k];
+    for i in 0..prepared.n {
+        let x_row = &prepared.x_flat[i * prepared.p..(i + 1) * prepared.p];
+        let g_row = &snp_pool_sample_major[i * k..(i + 1) * k];
+        for a in 0..prepared.p {
+            let xa = x_row[a];
+            for j in 0..k {
+                xtg[a * k + j] += xa * g_row[j];
+            }
+        }
+    }
+
+    let mut x_proj_g = vec![0.0_f64; prepared.p * k];
+    for a in 0..prepared.p {
+        let ixx_row = &prepared.ixx[a * prepared.p..(a + 1) * prepared.p];
+        for j in 0..k {
+            let mut acc = 0.0_f64;
+            for b in 0..prepared.p {
+                acc += ixx_row[b] * xtg[b * k + j];
+            }
+            x_proj_g[a * k + j] = acc;
+        }
+    }
+
+    let mut g_resid = vec![0.0_f64; prepared.n * k];
+    for i in 0..prepared.n {
+        let x_row = &prepared.x_flat[i * prepared.p..(i + 1) * prepared.p];
+        let g_row = &snp_pool_sample_major[i * k..(i + 1) * k];
+        let out_row = &mut g_resid[i * k..(i + 1) * k];
+        for j in 0..k {
+            let mut fit = 0.0_f64;
+            for a in 0..prepared.p {
+                fit += x_row[a] * x_proj_g[a * k + j];
+            }
+            out_row[j] = g_row[j] - fit;
+        }
+    }
+
+    let mut a_star = vec![0.0_f64; k * k];
+    let mut z = vec![0.0_f64; k];
+    for i in 0..prepared.n {
+        let g_row = &g_resid[i * k..(i + 1) * k];
+        let yr = prepared.y_resid[i];
+        for a in 0..k {
+            let ga = g_row[a];
+            z[a] += ga * yr;
+            for b in a..k {
+                a_star[a * k + b] += ga * g_row[b];
+            }
+        }
+    }
+    for a in 0..k {
+        for b in 0..a {
+            a_star[a * k + b] = a_star[b * k + a];
+        }
+    }
+
+    // Stage1 evaluates several (window, lead-count) combinations in parallel,
+    // so keep each exact eigh single-threaded to avoid nested BLAS oversubscription.
+    let _blas_guard = OpenBlasThreadGuard::enter(1);
+    let (evals_all, evecs_all, _eig_backend) = symmetric_eigh_f64_row_major(&a_star, k)?;
+    if evals_all.is_empty() {
+        return Err("exact FarmCPU REML eigendecomposition returned empty spectrum".to_string());
+    }
+    let max_eval = evals_all.last().copied().unwrap_or(0.0_f64).max(0.0_f64);
+    let tol = eig_eps
+        .max(1e-12_f64)
+        .max(f64::EPSILON * max_eval.max(1.0_f64) * (k.max(1) as f64));
+    let mut keep_start = evals_all
+        .iter()
+        .position(|&v| v > tol)
+        .ok_or_else(|| "exact FarmCPU REML found no positive spectrum".to_string())?;
+    let rank_pos = k.saturating_sub(keep_start);
+    if rank_pos > n_eff {
+        keep_start = k.saturating_sub(n_eff);
+    }
+    let eigvals = &evals_all[keep_start..];
+    let rank = eigvals.len();
+    if rank == 0 || rank > n_eff {
+        return Err(format!(
+            "invalid exact FarmCPU REML rank after projection: rank={rank}, n_eff={n_eff}"
+        ));
+    }
+
+    let mut coeff = vec![0.0_f64; rank];
+    for comp in 0..rank {
+        let eig_col = keep_start + comp;
+        let mut acc = 0.0_f64;
+        for row in 0..k {
+            acc += evecs_all[row * k + eig_col] * z[row];
+        }
+        coeff[comp] = acc;
+    }
+    let mut y_proj = vec![0.0_f64; rank];
+    for comp in 0..rank {
+        y_proj[comp] = coeff[comp] / eigvals[comp].sqrt().max(1e-18_f64);
+    }
+
+    let (log10_low, log10_high) =
+        farmcpu_exact_reml_log10_bounds_from_legacy_delta(delta_exp_start, delta_exp_end);
+    let (best_log10, best_cost) = brent_minimize(
+        |x0| {
+            let lambda = 10.0_f64.powf(x0);
+            farmcpu_exact_reml_cost_from_spectrum(
+                lambda,
+                eigvals,
+                y_proj.as_slice(),
+                prepared.y_resid_ss,
+                n_eff,
+            )
+        },
+        log10_low,
+        log10_high,
+        reml_tol,
+        reml_max_iter,
+    );
+    let lambda_best = 10.0_f64.powf(best_log10);
+    let final_cost = farmcpu_exact_reml_cost_from_spectrum(
+        lambda_best,
+        eigvals,
+        y_proj.as_slice(),
+        prepared.y_resid_ss,
+        n_eff,
+    );
+    if !best_cost.is_finite() || !final_cost.is_finite() {
+        return Err("exact FarmCPU REML failed to evaluate a finite optimum".to_string());
+    }
+    Ok(2.0_f64 * final_cost)
 }
 
 pub(crate) fn farmcpu_ll_score_from_sample_major(
@@ -349,183 +609,18 @@ pub(crate) fn farmcpu_ll_score_from_sample_major(
     delta_step: f64,
     svd_eps: f64,
 ) -> Result<f64, String> {
-    if n == 0 || p == 0 {
-        return Err("invalid shape in ll score: empty y/X".to_string());
-    }
-    if y.len() != n {
-        return Err("invalid y length in ll score".to_string());
-    }
-    if x.len() != n * p {
-        return Err("invalid X length in ll score".to_string());
-    }
-    if snp_pool_sample_major.len() != n * k {
-        return Err("invalid snp_pool length in ll score".to_string());
-    }
-    if !(delta_step.is_finite() && delta_step > 0.0) {
-        return Err("delta_step must be positive and finite".to_string());
-    }
-
-    let yvec = DVector::<f64>::from_column_slice(y);
-    let xmat = DMatrix::<f64>::from_row_slice(n, p, x);
-    let snp_pool = if k > 0 {
-        DMatrix::<f64>::from_row_slice(n, k, snp_pool_sample_major)
-    } else {
-        DMatrix::<f64>::zeros(n, 0)
-    };
-
-    let mut d_start = delta_exp_start;
-    let mut d_end = delta_exp_end;
-
-    if k > 0 {
-        let mut has_zero_var = n <= 1;
-        if !has_zero_var {
-            for col in 0..k {
-                let mut mean = 0.0_f64;
-                for i in 0..n {
-                    mean += snp_pool[(i, col)];
-                }
-                mean /= n as f64;
-                let mut ss = 0.0_f64;
-                for i in 0..n {
-                    let d = snp_pool[(i, col)] - mean;
-                    ss += d * d;
-                }
-                let var = ss / ((n - 1) as f64);
-                if var <= 0.0 || !var.is_finite() {
-                    has_zero_var = true;
-                    break;
-                }
-            }
-        }
-        if has_zero_var {
-            d_start = 100.0;
-            d_end = 100.0;
-        }
-    }
-
-    let (u1, d): (DMatrix<f64>, Vec<f64>) = if k == 0 {
-        (DMatrix::<f64>::zeros(n, 0), Vec::new())
-    } else {
-        let svd = snp_pool.svd(true, false);
-        let u = svd
-            .u
-            .ok_or_else(|| "SVD failed to produce U in ll score".to_string())?;
-        let s = svd.singular_values;
-        let keep: Vec<usize> = (0..s.len()).filter(|&i| s[i] > svd_eps).collect();
-        if keep.is_empty() {
-            (DMatrix::<f64>::zeros(n, 0), Vec::new())
-        } else {
-            let r = keep.len();
-            let mut u1_data = Vec::with_capacity(n * r);
-            for i in 0..n {
-                for &c in keep.iter() {
-                    u1_data.push(u[(i, c)]);
-                }
-            }
-            let d = keep.iter().map(|&c| s[c] * s[c]).collect::<Vec<_>>();
-            (DMatrix::<f64>::from_row_slice(n, r, &u1_data), d)
-        }
-    };
-
-    let r = d.len();
-    let u1tx = if r > 0 {
-        u1.transpose() * &xmat
-    } else {
-        DMatrix::<f64>::zeros(0, p)
-    };
-    let u1ty = if r > 0 {
-        u1.transpose() * &yvec
-    } else {
-        DVector::<f64>::zeros(0)
-    };
-    let x_u = if r > 0 {
-        &xmat - &u1 * &u1tx
-    } else {
-        xmat.clone()
-    };
-    let y_u = if r > 0 {
-        &yvec - &u1 * &u1ty
-    } else {
-        yvec.clone()
-    };
-
-    let xtx_u = x_u.transpose() * &x_u;
-    let xty_u = x_u.transpose() * &y_u;
-
-    let mut best_ll = f64::NEG_INFINITY;
-    let mut expv = d_start;
-    let end = d_end + 1e-12;
-    while expv <= end {
-        let delta = expv.exp();
-        if !(delta.is_finite() && delta > 0.0) {
-            expv += delta_step;
-            continue;
-        }
-
-        let mut beta1 = DMatrix::<f64>::zeros(p, p);
-        let mut beta3 = DVector::<f64>::zeros(p);
-        let mut part12 = 0.0_f64;
-
-        if r > 0 {
-            for t in 0..r {
-                let dt = d[t] + delta;
-                if !(dt.is_finite() && dt > 0.0) {
-                    continue;
-                }
-                let w = 1.0 / dt;
-                part12 += dt.ln();
-                for i in 0..p {
-                    let vi = u1tx[(t, i)];
-                    beta3[i] += vi * w * u1ty[t];
-                    for j in 0..p {
-                        beta1[(i, j)] += vi * w * u1tx[(t, j)];
-                    }
-                }
-            }
-        }
-
-        let a = beta1 + (&xtx_u / delta);
-        let b = beta3 + (&xty_u / delta);
-        let Some(beta) = solve_linear_system_stable(&a, &b) else {
-            expv += delta_step;
-            continue;
-        };
-
-        let part11 = (n as f64) * (2.0 * PI).ln();
-        let part13 = ((n - r) as f64) * delta.ln();
-        let part1 = -0.5 * (part11 + part12 + part13);
-
-        let mut part221 = 0.0_f64;
-        if r > 0 {
-            for t in 0..r {
-                let mut pred = 0.0_f64;
-                for j in 0..p {
-                    pred += u1tx[(t, j)] * beta[j];
-                }
-                let resid = u1ty[t] - pred;
-                part221 += (resid * resid) / (d[t] + delta);
-            }
-        }
-
-        let resid_i = &y_u - &x_u * &beta;
-        let part222 = resid_i.dot(&resid_i) / delta;
-        let part22 = part221 + part222;
-        if !(part22.is_finite() && part22 > 0.0) {
-            expv += delta_step;
-            continue;
-        }
-        let part2 = -0.5 * ((n as f64) + (n as f64) * (part22 / (n as f64)).ln());
-        let ll = part1 + part2;
-        if ll > best_ll {
-            best_ll = ll;
-        }
-        expv += delta_step;
-    }
-
-    if !best_ll.is_finite() {
-        return Err("failed to evaluate valid LL in farmcpu ll scorer".to_string());
-    }
-    Ok(-2.0 * best_ll)
+    let _ = delta_step;
+    let prepared = prepare_farmcpu_exact_rem(y, x, n, p)?;
+    farmcpu_ll_score_from_sample_major_prepared(
+        &prepared,
+        snp_pool_sample_major,
+        k,
+        delta_exp_start,
+        delta_exp_end,
+        1e-4_f64,
+        50usize,
+        svd_eps,
+    )
 }
 
 pub(crate) fn farmcpu_super_keep_from_sample_major(
@@ -746,9 +841,9 @@ impl GlmScratch {
     }
 }
 
-fn pinv_xtx(xtx: &[f64], q: usize) -> Result<Vec<f64>, String> {
+fn pinv_xtx_with_rank(xtx: &[f64], q: usize) -> Result<(Vec<f64>, usize), String> {
     if q == 0 {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), 0usize));
     }
     let a = DMatrix::<f64>::from_row_slice(q, q, xtx);
     let svd = a.svd(true, true);
@@ -762,15 +857,22 @@ fn pinv_xtx(xtx: &[f64], q: usize) -> Result<Vec<f64>, String> {
     let smax = svd.singular_values.iter().copied().fold(0.0_f64, f64::max);
     let rcond = 1e-12_f64;
     let cutoff = rcond * smax.max(1.0);
+    let mut rank = 0usize;
     for i in 0..q {
         let s = svd.singular_values[i];
         if s.is_finite() && s > cutoff {
             s_inv[(i, i)] = 1.0 / s;
+            rank += 1;
         }
     }
     let v = vt.transpose();
     let ixx = v * s_inv * u.transpose();
-    Ok(ixx.as_slice().to_vec())
+    Ok((ixx.as_slice().to_vec(), rank))
+}
+
+fn pinv_xtx(xtx: &[f64], q: usize) -> Result<Vec<f64>, String> {
+    let (ixx, _rank) = pinv_xtx_with_rank(xtx, q)?;
+    Ok(ixx)
 }
 
 #[inline]
@@ -790,7 +892,11 @@ fn farmcpu_final_window_bp(szbin: &[i64]) -> i64 {
         .unwrap_or(500_000_i64)
 }
 
-fn pinv_for_row_major_x(x_flat: &[f64], n: usize, q: usize) -> Result<Vec<f64>, String> {
+fn pinv_for_row_major_x_with_rank(
+    x_flat: &[f64],
+    n: usize,
+    q: usize,
+) -> Result<(Vec<f64>, usize), String> {
     if x_flat.len() != n.saturating_mul(q) {
         return Err("X shape mismatch for X'X pseudo-inverse".to_string());
     }
@@ -804,7 +910,12 @@ fn pinv_for_row_major_x(x_flat: &[f64], n: usize, q: usize) -> Result<Vec<f64>, 
             }
         }
     }
-    pinv_xtx(&xtx, q)
+    pinv_xtx_with_rank(&xtx, q)
+}
+
+fn pinv_for_row_major_x(x_flat: &[f64], n: usize, q: usize) -> Result<Vec<f64>, String> {
+    let (ixx, _rank) = pinv_for_row_major_x_with_rank(x_flat, n, q)?;
+    Ok(ixx)
 }
 
 fn farmcpu_window_representatives(
@@ -1116,6 +1227,7 @@ fn farmcpu_best_rem_lead_set(
     pool: Option<&std::sync::Arc<rayon::ThreadPool>>,
 ) -> Result<Vec<usize>, String> {
     let n = y.len();
+    let rem_prepared = prepare_farmcpu_exact_rem(y, x_qtn, n, q_total)?;
     let mut combine: Vec<(i64, usize)> = Vec::new();
     for &sz in szbin_i64.iter() {
         for &nn in nbin_vals.iter() {
@@ -1144,16 +1256,14 @@ fn farmcpu_best_rem_lead_set(
                     Ok(v) => v,
                     Err(_) => return (f64::INFINITY, leadidx),
                 };
-                let score = farmcpu_ll_score_from_sample_major(
-                    y,
-                    x_qtn,
-                    n,
-                    q_total,
+                let score = farmcpu_ll_score_from_sample_major_prepared(
+                    &rem_prepared,
                     &sample_major,
                     leadidx.len(),
                     -5.0,
                     5.0,
-                    0.1,
+                    1e-4,
+                    50,
                     1e-8,
                 )
                 .unwrap_or(f64::INFINITY);
@@ -1485,7 +1595,10 @@ fn scan_packed_full_matrix_reduced(
                             };
                             if ff >= q_base && ff < q0 {
                                 let slot = ff - q_base;
-                                if slot < local_qtn_min.len() && p.is_finite() && p < local_qtn_min[slot] {
+                                if slot < local_qtn_min.len()
+                                    && p.is_finite()
+                                    && p < local_qtn_min[slot]
+                                {
                                     local_qtn_min[slot] = p;
                                 }
                             } else if ff == q0 {
@@ -2742,14 +2855,9 @@ pub fn farmcpu_packed_to_tsv(
     if m == 0 {
         return Err(PyRuntimeError::new_err("empty packed marker matrix"));
     }
-    let (chrom, pos) = resolve_assoc_chrom_pos_metadata(
-        bed_prefix,
-        chrom,
-        pos,
-        row_idx.as_deref(),
-        m,
-    )
-    .map_err(PyRuntimeError::new_err)?;
+    let (chrom, pos) =
+        resolve_assoc_chrom_pos_metadata(bed_prefix, chrom, pos, row_idx.as_deref(), m)
+            .map_err(PyRuntimeError::new_err)?;
     let string_metadata = if skip_main_scan {
         None
     } else {

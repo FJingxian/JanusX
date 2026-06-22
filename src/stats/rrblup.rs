@@ -42,8 +42,8 @@ use crate::bedmath::{
 };
 use crate::blas::{
     cblas_dgemm_dispatch, cblas_dsyrk_dispatch, cblas_sgemm_dispatch,
-    rust_sgemm_prefers_rayon_rowmajor_f32_kernel, CblasInt, OpenBlasThreadGuard,
-    CBLAS_COL_MAJOR, CBLAS_NO_TRANS, CBLAS_ROW_MAJOR, CBLAS_TRANS, CBLAS_UPPER,
+    rust_sgemm_prefers_rayon_rowmajor_f32_kernel, CblasInt, OpenBlasThreadGuard, CBLAS_COL_MAJOR,
+    CBLAS_NO_TRANS, CBLAS_ROW_MAJOR, CBLAS_TRANS, CBLAS_UPPER,
 };
 use crate::brent::brent_minimize;
 use crate::decode::decode_prepared_additive_block_packed_f32;
@@ -1279,12 +1279,9 @@ fn build_rrblup_exact_snp_cache_from_packed(
     let max_eval = evals_all.last().copied().unwrap_or(0.0_f64).max(0.0_f64);
     let tol = f64::EPSILON * max_eval.max(1.0_f64) * (eff_m.max(1) as f64);
     let n_eff = n_train.saturating_sub(1);
-    let mut keep_start = evals_all
-        .iter()
-        .position(|&v| v > tol)
-        .ok_or_else(|| {
-            "rrblup_exact_snp_packed found no positive spectrum after centering.".to_string()
-        })?;
+    let mut keep_start = evals_all.iter().position(|&v| v > tol).ok_or_else(|| {
+        "rrblup_exact_snp_packed found no positive spectrum after centering.".to_string()
+    })?;
     let rank_pos = eff_m.saturating_sub(keep_start);
     if rank_pos > n_eff {
         keep_start = eff_m.saturating_sub(n_eff);
@@ -1373,7 +1370,20 @@ fn fit_rrblup_exact_snp_from_cache_packed(
     reml_max_iter: usize,
     threads: usize,
     blas_threads: usize,
-) -> Result<(Vec<f64>, Vec<f64>, f64, f64, f64, f64, f64, Vec<f32>, String), String> {
+) -> Result<
+    (
+        Vec<f64>,
+        Vec<f64>,
+        f64,
+        f64,
+        f64,
+        f64,
+        f64,
+        Vec<f32>,
+        String,
+    ),
+    String,
+> {
     let stage_timing = env_truthy("JX_GS_EXACT_STAGE_TIMING") || env_truthy("JX_GS_DEBUG_STAGE");
     let fit_t0 = if stage_timing {
         Some(Instant::now())
@@ -1600,7 +1610,8 @@ fn fit_rrblup_exact_snp_from_cache_packed(
         if local_idx.is_empty() {
             Vec::new()
         } else {
-            let train_pred_abs: Vec<usize> = local_idx.iter().map(|&i| cache.train_idx[i]).collect();
+            let train_pred_abs: Vec<usize> =
+                local_idx.iter().map(|&i| cache.train_idx[i]).collect();
             let mut pred_source = RrblupPcgSource::Resident {
                 packed_flat,
                 bytes_per_snp,
@@ -1680,10 +1691,7 @@ fn fit_rrblup_exact_snp_from_cache_packed(
             pool_ref,
             None,
         )?;
-        pred_test_ret = pred_test_f32
-            .iter()
-            .map(|v| (*v as f64) + y_mean)
-            .collect();
+        pred_test_ret = pred_test_f32.iter().map(|v| (*v as f64) + y_mean).collect();
     }
     let pred_test_secs = t_pred_test
         .map(|t0| t0.elapsed().as_secs_f64())
@@ -2044,12 +2052,7 @@ pub fn rrblup_exact_snp_fit_prepared<'py>(
             )
         })
         .map_err(map_err_string_to_py)?;
-    let alpha = y_train
-        .as_slice()?
-        .iter()
-        .copied()
-        .sum::<f64>()
-        / (cache.inner.n_train as f64);
+    let alpha = y_train.as_slice()?.iter().copied().sum::<f64>() / (cache.inner.n_train as f64);
     let train_arr = PyArray2::from_owned_array(
         py,
         Array2::from_shape_vec((pred_train_ret.len(), 1), pred_train_ret)

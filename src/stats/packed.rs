@@ -301,8 +301,7 @@ pub fn bed_decode_rows_f32_from_meta<'py>(
                 .enumerate()
                 .for_each(|(i_row, out_row)| {
                     let src_row = rel_indices[i_row];
-                    let row =
-                        &packed_slice[src_row * bytes_per_snp..(src_row + 1) * bytes_per_snp];
+                    let row = &packed_slice[src_row * bytes_per_snp..(src_row + 1) * bytes_per_snp];
                     let flip = row_flip_vec[i_row];
                     let mean_g = (2.0_f32 * row_maf_vec[i_row]).max(0.0);
                     if full_sample_fast {
@@ -322,8 +321,9 @@ pub fn bed_decode_rows_f32_from_meta<'py>(
                         for (j, &sid) in sample_idx.iter().enumerate() {
                             let b = row[sid >> 2];
                             let code = (b >> ((sid & 3) * 2)) & 0b11;
-                            let mut gv =
-                                decode_plink_bed_hardcall(code).map(|v| v as f32).unwrap_or(mean_g);
+                            let mut gv = decode_plink_bed_hardcall(code)
+                                .map(|v| v as f32)
+                                .unwrap_or(mean_g);
                             if flip && code != 0b01 {
                                 gv = 2.0_f32 - gv;
                             }

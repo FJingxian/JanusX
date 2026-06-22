@@ -22,6 +22,8 @@ mod fastlmm_lowrank;
 mod fvlmm;
 #[path = "garfield/mod.rs"]
 pub(crate) mod garfield;
+#[path = "stats/gblup.rs"]
+pub(crate) mod gblup;
 #[path = "stats/glm.rs"]
 mod glm;
 #[path = "stats/grm.rs"]
@@ -29,8 +31,6 @@ mod grm;
 #[doc(hidden)]
 #[path = "grm_bench_support.rs"]
 pub mod grm_bench_support;
-#[path = "stats/gblup.rs"]
-pub(crate) mod gblup;
 #[path = "stats/gstats.rs"]
 mod gstats;
 #[path = "stats/gwas_unified.rs"]
@@ -199,6 +199,10 @@ use garfield::{
     score_binary_mcc_py, score_cont_corr_py, score_cont_mean_diff_corr_batch_py,
     score_cont_mean_diff_py,
 };
+use gblup::{
+    farmcpu_q_packed_grm_pca_f32, gblup_effect_from_meta_stream, gblup_reml_packed_bed,
+    packed_mtm_f64,
+};
 use gfreader::{
     bed_filter_stream_to_plink_rust, bed_filter_to_plink_rust, bed_mmap_filter_to_plink_rust,
     count_hmp_snps, count_vcf_snps, gfd_packbits_from_dosage_block, load_bed_2bit_packed,
@@ -216,10 +220,6 @@ use grm::{
     grm_bed_f64_from_meta, grm_packed_bed_f32, grm_packed_bed_f64, grm_packed_f32,
     grm_packed_f32_with_stats, grm_packed_f64, grm_packed_f64_with_stats, grm_sim_bench_f32,
     grm_stream_bed_f32, grm_stream_bed_f32_to_npy, grm_stream_bed_f64, grm_stream_bed_f64_to_npy,
-};
-use gblup::{
-    farmcpu_q_packed_grm_pca_f32, gblup_effect_from_meta_stream, gblup_reml_packed_bed,
-    packed_mtm_f64,
 };
 use gstats::{
     gstats_bed_individual_stats, gstats_bed_joint_stats, gstats_bed_ldscore, gstats_bed_site_stats,
@@ -250,8 +250,7 @@ use logreg::fit_best_and_not_py;
 use ml::{garfield_ml_feature_scores_py, garfield_ml_select_topk_py};
 use packed::{
     bed_decode_rows_f32_from_meta, bed_packed_decode_rows_f32, bed_packed_decode_stats_f64,
-    bed_packed_row_flip_mask,
-    bed_packed_signed_hash_f32, bed_packed_signed_hash_kernels_f64,
+    bed_packed_row_flip_mask, bed_packed_signed_hash_f32, bed_packed_signed_hash_kernels_f64,
     bed_packed_signed_hash_ztz_stats_f64, cross_grm_times_alpha_packed_f64, packed_malpha_f64,
     packed_malpha_mode_f64,
 };

@@ -148,6 +148,25 @@ def _sanitize_plot_text(text: object) -> str:
     return fallback if fallback != "" else "NA"
 
 
+def _strip_postgwas_input_suffix(path: object) -> str:
+    name = os.path.basename(str(path).rstrip("/\\"))
+    lower = name.lower()
+    for ext in (".tsv.gz", ".txt.gz", ".csv.gz", ".tsv", ".txt", ".csv", ".gz"):
+        if lower.endswith(ext):
+            stem = name[: -len(ext)]
+            return stem if stem != "" else name
+    stem = os.path.splitext(name)[0]
+    return stem if stem != "" else name
+
+
+def _resolve_postgwas_output_stem(file: str, plot_prefix: object | None) -> str:
+    base_stem = _strip_postgwas_input_suffix(file)
+    prefix_text = str(plot_prefix).strip() if plot_prefix is not None else ""
+    if prefix_text == "":
+        return base_stem
+    return f"{prefix_text}.{base_stem}"
+
+
 def _prepare_cjk_plotting() -> None:
     # Try to enable a CJK font. If unavailable, silence glyph warnings and
     # fallback labels to ASCII where possible.
@@ -2640,10 +2659,9 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
         message=".*ChainedAssignmentError.*",
     )
 
-    args.prefix = (
-        os.path.basename(file)
-        .replace(".tsv", "")
-        .replace(".txt", "")
+    output_stem = _resolve_postgwas_output_stem(
+        file,
+        getattr(args, "_postgwas_plot_prefix", None),
     )
 
     chr_col, pos_col, p_col = args.chr, args.pos, args.pvalue
@@ -2962,7 +2980,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
             manh_height_in = fig.get_figheight()
             fig.tight_layout()
             manh_axes_bounds = ax.get_position().bounds
-            manh_path = os.path.join(args.out, f"{args.prefix}.manh.{args.format}")
+            manh_path = os.path.join(args.out, f"{output_stem}.manh.{args.format}")
             if enable_pure_manhqq_parallel:
                 pending_manh_fig = fig
                 pending_manh_path = manh_path
@@ -3048,7 +3066,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                         ax2.set_xlabel("")
                         ax2.set_ylabel("")
                     fig.tight_layout()
-                    qq_path = os.path.join(args.out, f"{args.prefix}.qq.{args.format}")
+                    qq_path = os.path.join(args.out, f"{output_stem}.qq.{args.format}")
                     fig.savefig(qq_path, transparent=True)
                     plt.close(fig)
             finally:
@@ -3295,7 +3313,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                 dpi=dpi,
             )
             ax_ld = fig_ld.add_subplot(111)
-            ld_path = os.path.join(args.out, f"{args.prefix}.ldblock.{args.format}")
+            ld_path = os.path.join(args.out, f"{output_stem}.ldblock.{args.format}")
             _draw_ld_axis(ax_ld)
 
             fig_ld.subplots_adjust(
@@ -3347,7 +3365,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                     mx0, _my0, mw, _mh = manh_axes_bounds
                     _cx0, cy0, _cw, ch = ax_gene.get_position().bounds
                     ax_gene.set_position([mx0, cy0, mw, ch])
-                gene_path = os.path.join(args.out, f"{args.prefix}.gene.{args.format}")
+                gene_path = os.path.join(args.out, f"{output_stem}.gene.{args.format}")
                 fig_gene.savefig(gene_path, transparent=True)
                 plt.close(fig_gene)
             else:
@@ -3489,7 +3507,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                     label_fontsize=max(3.0, float(_tmp_fontsize) * 0.85),
                 )
 
-            manhld_path = os.path.join(args.out, f"{args.prefix}.manhld.{args.format}")
+            manhld_path = os.path.join(args.out, f"{output_stem}.manhld.{args.format}")
             fig_manhld.savefig(manhld_path, transparent=True)
             plt.close(fig_manhld)
         else:
@@ -3682,7 +3700,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
 
             logger.info(df_out)
 
-            anno_path = os.path.join(args.out, f"{args.prefix}.{threshold}.anno.tsv")
+            anno_path = os.path.join(args.out, f"{output_stem}.{threshold}.anno.tsv")
             df_out.to_csv(anno_path, sep="\t", index=False)
             log_success(logger, f"Annotation table saved to {format_path_for_display(anno_path)}")
             log_success(logger, f"Annotation completed in {round(time.time() - t_anno, 2)} seconds.\n")
@@ -4862,7 +4880,15 @@ def main():
         help="Broaden the annotation window around SNPs (Kb) (default: %(default)s).",
     )
     add_common_out_arg(optional_group, default=".", help_profile="plot_annotation")
-    add_common_prefix_arg(optional_group, default=None, help_profile="janusx_log")
+    add_common_prefix_arg(
+        optional_group,
+        default=None,
+        help_text=(
+            "Output prefix. For single-GWAS plotting, figures are saved as "
+            "<prefix>.<input-stem>.* ; if omitted, use the input filename stem. "
+            "The same prefix is also used for the run log stem."
+        ),
+    )
     add_common_thread_arg(
         optional_group,
         default_threads=detect_effective_threads(),
@@ -4888,7 +4914,9 @@ def main():
     )
 
     args.out = os.path.normpath(args.out if args.out is not None else ".")
-    args.prefix = "JanusX" if args.prefix is None else args.prefix
+    user_prefix = str(args.prefix).strip() if args.prefix is not None else ""
+    args._postgwas_plot_prefix = user_prefix
+    args.prefix = "JanusX" if user_prefix == "" else user_prefix
 
     # Create output directory if needed
     if args.out != "":

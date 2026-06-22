@@ -6468,6 +6468,7 @@ def _run_gwas_pipeline(
                                         "famid": np.asarray(ids, dtype=str),
                                         "geno": None,
                                         "packed_ctx": packed_ctx_prefill,
+                                        "packed_full_ids": full_ids_prefill,
                                         "ref_alt": _make_deferred_bim_metadata(
                                             str(preloaded_packed.get("prefix", farmcpu_genofile)),
                                             row_idx_prefill_arr,
@@ -7011,6 +7012,7 @@ def _run_gwas_pipeline(
                             "famid": np.asarray(ids, dtype=str),
                             "geno": None,
                             "packed_ctx": packed_ctx_prefill,
+                            "packed_full_ids": full_ids_prefill,
                             "ref_alt": _make_deferred_bim_metadata(
                                 str(preloaded_packed.get("prefix", farmcpu_genofile)),
                                 row_idx_prefill_arr,

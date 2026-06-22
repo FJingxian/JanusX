@@ -655,40 +655,69 @@ def _packed_ctx_active_view_for_gwas(
             np.asarray(row_flip_raw, dtype=np.bool_).reshape(-1),
             dtype=np.bool_,
         )
-    packed_mode = str(packed_ctx.get("packed_filter_mode", "compact")).strip().lower()
-    if packed_mode == "lazy_full":
-        if int(miss_full.shape[0]) != int(packed.shape[0]):
-            raise ValueError("Packed GWAS lazy-full context mismatch: missing_rate length != packed rows.")
-        if int(af_full.shape[0]) != int(packed.shape[0]):
-            raise ValueError("Packed GWAS lazy-full context mismatch: af length != packed rows.")
-        if int(row_flip_full.shape[0]) != int(packed.shape[0]):
-            raise ValueError("Packed GWAS lazy-full context mismatch: row_flip length != packed rows.")
+    packed_rows = int(packed.shape[0])
+
+    def _resolve_active_row_idx() -> np.ndarray:
+        active_row_idx_obj = packed_ctx.get("active_row_idx")
+        if active_row_idx_obj is None:
+            active_row_idx_obj = packed_ctx.get("row_indices")
+        if active_row_idx_obj is not None:
+            return np.ascontiguousarray(
+                np.asarray(active_row_idx_obj, dtype=np.int64).reshape(-1),
+                dtype=np.int64,
+            )
         site_keep_raw = packed_ctx.get("site_keep", None)
         if site_keep_raw is None:
-            active_row_idx = np.ascontiguousarray(
-                np.arange(int(packed.shape[0]), dtype=np.int64),
+            return np.ascontiguousarray(
+                np.arange(packed_rows, dtype=np.int64),
                 dtype=np.int64,
             )
-        else:
-            site_keep = np.ascontiguousarray(
-                np.asarray(site_keep_raw, dtype=np.bool_).reshape(-1),
-                dtype=np.bool_,
-            )
-            active_row_idx = np.ascontiguousarray(
-                np.asarray(
-                    packed_ctx.get(
-                        "active_row_idx",
-                        np.flatnonzero(site_keep).astype(np.int64, copy=False),
-                    ),
-                    dtype=np.int64,
-                ).reshape(-1),
-                dtype=np.int64,
-            )
-            if int(site_keep.shape[0]) < int(active_row_idx.shape[0]):
-                raise ValueError("Packed GWAS context mismatch: active_row_idx exceeds site_keep length.")
-        if int(active_row_idx.shape[0]) > 0:
-            if int(active_row_idx.min()) < 0 or int(active_row_idx.max()) >= int(packed.shape[0]):
-                raise ValueError("Packed GWAS lazy-full context mismatch: active_row_idx out of packed bounds.")
+        site_keep = np.ascontiguousarray(
+            np.asarray(site_keep_raw, dtype=np.bool_).reshape(-1),
+            dtype=np.bool_,
+        )
+        return np.ascontiguousarray(
+            np.flatnonzero(site_keep).astype(np.int64, copy=False),
+            dtype=np.int64,
+        )
+
+    def _validate_active_row_idx(active_row_idx: np.ndarray, label: str) -> None:
+        if int(active_row_idx.shape[0]) == 0:
+            return
+        if int(active_row_idx.min()) < 0 or int(active_row_idx.max()) >= packed_rows:
+            raise ValueError(f"Packed GWAS {label} context mismatch: active_row_idx out of packed bounds.")
+
+    active_row_idx = _resolve_active_row_idx()
+    active_stats_shape = (
+        int(active_row_idx.shape[0]) == int(miss_full.shape[0])
+        and int(active_row_idx.shape[0]) == int(af_full.shape[0])
+        and int(active_row_idx.shape[0]) == int(row_flip_full.shape[0])
+    )
+    packed_mode = str(packed_ctx.get("packed_filter_mode", "compact")).strip().lower()
+    if packed_mode == "lazy_full":
+        if (
+            int(miss_full.shape[0]) == packed_rows
+            and int(af_full.shape[0]) == packed_rows
+            and int(row_flip_full.shape[0]) == packed_rows
+        ):
+            _validate_active_row_idx(active_row_idx, "lazy-full")
+            maf_active = np.ascontiguousarray(af_full[active_row_idx], dtype=np.float32)
+            miss_active = np.ascontiguousarray(miss_full[active_row_idx], dtype=np.float32)
+            row_flip_active = np.ascontiguousarray(row_flip_full[active_row_idx], dtype=np.bool_)
+            return packed, packed_n, active_row_idx, maf_active, miss_active, row_flip_active
+        if active_stats_shape:
+            # FarmCPU may borrow the full packed BED together with already-filtered
+            # per-row statistics. In that case active_row_idx carries the source-row
+            # mapping and the statistics are already aligned to it.
+            _validate_active_row_idx(active_row_idx, "lazy-indexed")
+            return packed, packed_n, active_row_idx, af_full, miss_full, row_flip_full
+        if int(miss_full.shape[0]) != packed_rows:
+            raise ValueError("Packed GWAS lazy-full context mismatch: missing_rate length != packed rows.")
+        if int(af_full.shape[0]) != packed_rows:
+            raise ValueError("Packed GWAS lazy-full context mismatch: af length != packed rows.")
+        if int(row_flip_full.shape[0]) != packed_rows:
+            raise ValueError("Packed GWAS lazy-full context mismatch: row_flip length != packed rows.")
+        _validate_active_row_idx(active_row_idx, "lazy-full")
         maf_active = np.ascontiguousarray(af_full[active_row_idx], dtype=np.float32)
         miss_active = np.ascontiguousarray(miss_full[active_row_idx], dtype=np.float32)
         row_flip_active = np.ascontiguousarray(row_flip_full[active_row_idx], dtype=np.bool_)
@@ -931,10 +960,20 @@ def _read_qtn_rows(qtn_tsv: str) -> pd.DataFrame:
     need = {"chrom", "pos", "snp"}
     if not need.issubset(set(df.columns)):
         raise ValueError(f"QTN TSV lacks required columns {sorted(need)}: {qtn_tsv}")
-    out = df.loc[:, ["chrom", "pos", "snp"]].copy()
+    keep_cols = ["chrom", "pos", "snp"]
+    for opt_col in ("allele0", "allele1", "source_row"):
+        if opt_col in df.columns:
+            keep_cols.append(opt_col)
+    out = df.loc[:, keep_cols].copy()
     out["chrom"] = out["chrom"].astype(str)
     out["pos"] = out["pos"].astype(np.int64)
     out["snp"] = out["snp"].astype(str)
+    if "allele0" in out.columns:
+        out["allele0"] = out["allele0"].astype(str)
+    if "allele1" in out.columns:
+        out["allele1"] = out["allele1"].astype(str)
+    if "source_row" in out.columns:
+        out["source_row"] = pd.to_numeric(out["source_row"], errors="coerce").astype("Int64")
     return out
 
 
@@ -946,6 +985,31 @@ def _selected_qtn_active_indices(
 ) -> tuple[np.ndarray, list[dict[str, object]]]:
     if qtn_rows.empty:
         return np.zeros((0,), dtype=np.int64), []
+    if "source_row" in qtn_rows.columns:
+        source_row_series = qtn_rows["source_row"]
+        if bool(source_row_series.notna().all()):
+            active_src = np.asarray(qtn_active_row_idx, dtype=np.int64).reshape(-1)
+            src = np.asarray(source_row_series, dtype=np.int64).reshape(-1)
+            loc = np.searchsorted(active_src, src)
+            valid = (loc >= 0) & (loc < int(active_src.shape[0]))
+            if np.any(valid):
+                matched = np.zeros_like(valid, dtype=np.bool_)
+                matched[valid] = active_src[loc[valid]] == src[valid]
+                valid = matched
+            if bool(np.all(valid)):
+                active = np.ascontiguousarray(loc.astype(np.int64, copy=False), dtype=np.int64)
+                meta: list[dict[str, object]] = []
+                for row in qtn_rows.itertuples(index=False):
+                    meta.append(
+                        {
+                            "chrom": str(row.chrom),
+                            "pos": int(row.pos),
+                            "snp": str(row.snp),
+                            "allele0": str(getattr(row, "allele0", "")),
+                            "allele1": str(getattr(row, "allele1", "")),
+                        }
+                    )
+                return active, meta
     snp_to_order: dict[str, list[int]] = {}
     pos_to_order: dict[tuple[str, int], list[int]] = {}
     for i, row in qtn_rows.iterrows():
@@ -1225,6 +1289,8 @@ def run_qtn_segmented_lm_stage2(
     qtn_task = _status_begin(qtn_desc)
     try:
         qtn_rows = _read_qtn_rows(qtn_tsv)
+        if qtn_rows.empty:
+            raise ValueError(f"{stage_label} requires at least one pseudo-QTN row, but {qtn_tsv} is empty.")
         _qtn_packed, _qtn_n, qtn_active_row_idx, _qtn_maf, _qtn_miss, _qtn_flip = _packed_ctx_active_view_for_gwas(
             qtn_preloaded_packed["packed_ctx"]  # type: ignore[arg-type]
         )
@@ -1233,11 +1299,19 @@ def run_qtn_segmented_lm_stage2(
             qtn_active_row_idx=qtn_active_row_idx,
             qtn_rows=qtn_rows,
         )
+        if int(qtn_active_sel.shape[0]) == 0:
+            raise ValueError(
+                f"{stage_label} could not map pseudo-QTN rows from {qtn_tsv} back to the packed genotype."
+            )
         qtn_cov = _decode_qtn_covariates(
             qtn_preloaded_packed=qtn_preloaded_packed,
             qtn_active_indices=qtn_active_sel,
             trait_ids=np.asarray(trait_ids, dtype=str),
         )
+        if int(qtn_cov.shape[1]) != int(len(qtn_meta)):
+            raise ValueError(
+                f"{stage_label} decoded QTN covariates shape mismatch: qtn_cov={int(qtn_cov.shape[1])}, meta={len(qtn_meta)}"
+            )
         base_design = np.ascontiguousarray(
             np.concatenate(
                 [
@@ -1258,7 +1332,11 @@ def run_qtn_segmented_lm_stage2(
         total_context_count = int(base_context_count + exclude_qtn_context_count)
         _status_complete(
             qtn_task,
-            f"{qtn_desc} ...Finished (n={int(qtn_cov.shape[0])}, nQTN={int(qtn_cov.shape[1])}, windows={len(windows)})",
+            (
+                f"{qtn_desc} ...Finished (n={int(qtn_cov.shape[0])}, "
+                f"baseCov={int(np.asarray(base_cov).shape[1])}, "
+                f"nQTN={int(qtn_cov.shape[1])}, windows={len(windows)})"
+            ),
         )
     except Exception:
         _status_fail(qtn_task, f"{qtn_desc} ...Failed")
@@ -1349,7 +1427,8 @@ def run_qtn_segmented_lm_stage2(
         raise
     _log_stage2_summary(
         "windows="
-        f"{len(windows)}, segments={segment_count}, qtn_used={int(qtn_cov.shape[1])}, kept_rows={int(kept_rows)}, "
+        f"{len(windows)}, segments={segment_count}, base_cov_cols={int(np.asarray(base_cov).shape[1])}, "
+        f"qtn_used={int(qtn_cov.shape[1])}, kept_rows={int(kept_rows)}, "
         f"scan_rows={int(scan_rows)}, base_contexts={base_context_count}, "
         f"exclude_qtn_contexts={exclude_qtn_context_count}, total_contexts={total_context_count}, "
         "mode=compact-source-window"

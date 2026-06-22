@@ -610,10 +610,11 @@ def run_farmcpu_fullmem(
         # Reuse the already-loaded main packed payload for stage2 QTN decoding so
         # `-farmcpu` does not allocate a second packed genotype copy when no
         # external QTN input is supplied.
+        packed_ctx_norm = _normalize_packed_ctx_for_farmcpu_cache(packed_ctx_obj)
         return {
             "prefix": str(packed_prefix),
             "full_ids": np.asarray(famid_arr, dtype=str),
-            "packed_ctx": packed_ctx_obj,
+            "packed_ctx": packed_ctx_norm,
         }
 
     if (
@@ -1050,9 +1051,15 @@ def run_farmcpu_fullmem(
             and farm_raw_requested
             and isinstance(packed_obj, dict)
         ):
+            packed_full_ids_obj = farmcpu_cache.get("packed_full_ids")
+            packed_full_ids = (
+                famid
+                if packed_full_ids_obj is None
+                else np.asarray(packed_full_ids_obj, dtype=str)
+            )
             effective_qtn_preloaded_packed = _borrow_main_packed_qtn_payload(
                 packed_prefix=str(packed_obj.get("source_prefix", gfile) or gfile),
-                famid_arr=famid,
+                famid_arr=packed_full_ids,
                 packed_ctx_obj=packed_obj,
             )
             farmcpu_cache["_qtn_preloaded_packed"] = effective_qtn_preloaded_packed
@@ -1209,6 +1216,7 @@ def run_farmcpu_fullmem(
             if not isinstance(packed_payload, dict):
                 raise ValueError("Internal error: expected packed payload for Rust FarmCPU controller.")
             rust_qtn_written = 0
+            skip_stage1_main_scan = bool(farmcpu_cache.get("_qtn_stage_mode", False))
             stage1_t0 = time.monotonic()
             try:
                 packed_arr = packed_payload["packed"]
@@ -1268,7 +1276,75 @@ def run_farmcpu_fullmem(
                         )
                     return packed_compact, row_flip_compact, maf_compact
 
-                if hasattr(jxrs, "gwas_packed_unified_to_tsv"):
+                if hasattr(jxrs, "farmcpu_packed_to_tsv"):
+                    try:
+                        _m_written, n_pseudo_qtn, rust_qtn_written = jxrs.farmcpu_packed_to_tsv(
+                            np.ascontiguousarray(p_sub, dtype=np.float64).reshape(-1),
+                            np.ascontiguousarray(q_sub, dtype=np.float64),
+                            chrom_col,
+                            pos_col,
+                            snp_col,
+                            allele0_col,
+                            allele1_col,
+                            packed_arr,
+                            int(packed_payload["n_samples"]),
+                            row_flip_arr,
+                            maf_arr,
+                            miss_arr,
+                            tmp_tsv,
+                            sample_idx_use,
+                            row_indices=row_idx_arr,
+                            threshold=float(farm_threshold),
+                            max_iter=int(farm_iter),
+                            qtn_bound=farm_qtn_bound,
+                            nbin=int(farm_nbin),
+                            szbin=[float(x) for x in farm_szbin],
+                            threads=int(args.thread),
+                            progress_callback=_farmcpu_progress,
+                            pseudo_tsv=pseudo_tsv_hint,
+                            bed_prefix=bed_prefix_meta,
+                            raw=bool(farm_raw),
+                            skip_main_scan=bool(skip_stage1_main_scan),
+                        )
+                    except Exception as ex:
+                        msg = str(ex)
+                        can_retry_compact = (
+                            ("metadata length mismatch" in msg or "row metadata length mismatch" in msg)
+                            and int(packed_rows) != int(meta_rows)
+                            and int(row_idx_arr.shape[0]) == int(meta_rows)
+                        )
+                        if not can_retry_compact:
+                            raise
+                        packed_compact, row_flip_compact, maf_compact = _compact_packed_for_metadata_alignment()
+                        _m_written, n_pseudo_qtn, rust_qtn_written = jxrs.farmcpu_packed_to_tsv(
+                            np.ascontiguousarray(p_sub, dtype=np.float64).reshape(-1),
+                            np.ascontiguousarray(q_sub, dtype=np.float64),
+                            chrom_col,
+                            pos_col,
+                            snp_col,
+                            allele0_col,
+                            allele1_col,
+                            packed_compact,
+                            int(packed_payload["n_samples"]),
+                            row_flip_compact,
+                            maf_compact,
+                            miss_arr,
+                            tmp_tsv,
+                            sample_idx_use,
+                            row_indices=None,
+                            threshold=float(farm_threshold),
+                            max_iter=int(farm_iter),
+                            qtn_bound=farm_qtn_bound,
+                            nbin=int(farm_nbin),
+                            szbin=[float(x) for x in farm_szbin],
+                            threads=int(args.thread),
+                            progress_callback=_farmcpu_progress,
+                            pseudo_tsv=pseudo_tsv_hint,
+                            bed_prefix=None,
+                            raw=bool(farm_raw),
+                            skip_main_scan=bool(skip_stage1_main_scan),
+                        )
+                elif hasattr(jxrs, "gwas_packed_unified_to_tsv"):
                     jobs = [
                         {
                             "model": "farmcpu",
@@ -1283,6 +1359,7 @@ def run_farmcpu_fullmem(
                             "nbin": int(farm_nbin),
                             "szbin": [float(x) for x in farm_szbin],
                             "raw": bool(farm_raw),
+                            "skip_main_scan": bool(skip_stage1_main_scan),
                             "pseudo_tsv": str(pseudo_tsv_hint),
                             "scan_progress_callback": _farmcpu_progress,
                         }
@@ -1337,36 +1414,12 @@ def run_farmcpu_fullmem(
                             bed_prefix=None,
                         )
                     r0 = _res[0]
-                    n_pseudo_qtn = int(r0.get("pseudo_rows", 0))
-                    rust_qtn_written = int(r0.get("written_rows", 0))
+                    n_pseudo_qtn = int(r0.get("qtn_count", 0))
+                    rust_qtn_written = int(r0.get("pseudo_rows", 0))
                     _m_written = int(r0.get("written_rows", 0))
                 else:
-                    _m_written, n_pseudo_qtn, rust_qtn_written = jxrs.farmcpu_packed_to_tsv(
-                        np.ascontiguousarray(p_sub, dtype=np.float64).reshape(-1),
-                        np.ascontiguousarray(q_sub, dtype=np.float64),
-                        chrom_col,
-                        pos_col,
-                        snp_col,
-                        allele0_col,
-                        allele1_col,
-                        packed_arr,
-                        int(packed_payload["n_samples"]),
-                        row_flip_arr,
-                        maf_arr,
-                        miss_arr,
-                        tmp_tsv,
-                        sample_idx_use,
-                        row_indices=row_idx_arr,
-                        threshold=float(farm_threshold),
-                        max_iter=int(farm_iter),
-                        qtn_bound=farm_qtn_bound,
-                        nbin=int(farm_nbin),
-                        szbin=[float(x) for x in farm_szbin],
-                        threads=int(args.thread),
-                        progress_callback=_farmcpu_progress,
-                        pseudo_tsv=pseudo_tsv_hint,
-                        bed_prefix=bed_prefix_meta,
-                        raw=bool(farm_raw),
+                    raise RuntimeError(
+                        "Rust FarmCPU controller is unavailable: expected farmcpu_packed_to_tsv."
                     )
                 farm_pbar.finish()
             finally:
@@ -1375,7 +1428,11 @@ def run_farmcpu_fullmem(
             n_pseudo_qtn = int(max(0, n_pseudo_qtn))
             if int(rust_qtn_written) > 0 and os.path.exists(pseudo_tsv_hint):
                 pseudo_tsv = pseudo_tsv_hint
-            if bool(farmcpu_cache.get("_qtn_stage_mode", False)):
+            if bool(skip_stage1_main_scan) and int(n_pseudo_qtn) > 0 and pseudo_tsv is None:
+                raise ValueError(
+                    "FarmCPU stage1 selected pseudo-QTNs but did not produce a readable pseudo-QTN TSV for stage2."
+                )
+            if bool(farmcpu_cache.get("_qtn_stage_mode", False)) and int(n_pseudo_qtn) > 0:
                 if not isinstance(effective_qtn_preloaded_packed, dict):
                     raise ValueError("FarmCPU QTN stage2 payload is missing.")
                 main_prefix = _as_plink_prefix(gfile)

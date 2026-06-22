@@ -650,8 +650,11 @@ pub fn gwas_packed_unified_to_tsv<'py>(
                 let raw: bool = opt_item(&job, "raw")?
                     .and_then(|v| v.extract().ok())
                     .unwrap_or(false);
+                let skip_main_scan: bool = opt_item(&job, "skip_main_scan")?
+                    .and_then(|v| v.extract().ok())
+                    .unwrap_or(false);
 
-                let (qtn_n, pseudo_n, rows_n) = farmcpu_packed_to_tsv(
+                let (rows_n, qtn_n, pseudo_n) = farmcpu_packed_to_tsv(
                     py,
                     y,
                     x_cov,
@@ -678,6 +681,7 @@ pub fn gwas_packed_unified_to_tsv<'py>(
                     pseudo_tsv.as_deref(),
                     bed_prefix,
                     raw,
+                    skip_main_scan,
                 )?;
                 result_obj.set_item("qtn_count", qtn_n)?;
                 result_obj.set_item("pseudo_rows", pseudo_n)?;

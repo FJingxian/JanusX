@@ -7265,6 +7265,22 @@ def GSapi(
             _set_float("lambda_vc_sigma_e2", "vc_sigma_e2")
             _set_float("lambda_vc_pve", "vc_pve")
 
+        def _recover_trainvar_from_pve(
+            pve_hint: float,
+            sigma_e2: float,
+        ) -> float:
+            if np.isfinite(pve_hint) and np.isfinite(sigma_e2) and sigma_e2 >= 0.0:
+                pve_clamped = float(min(max(float(pve_hint), 0.0), 1.0))
+                if pve_clamped < 1.0:
+                    return float(
+                        sigma_e2
+                        * (
+                            pve_clamped
+                            / max(np.finfo(np.float64).eps, 1.0 - pve_clamped)
+                        )
+                    )
+            return float("nan")
+
         def _rrblup_trainvar_pve(var_g: float, sigma_e2: float) -> float:
             denom = float(var_g) + float(sigma_e2)
             if np.isfinite(float(var_g)) and np.isfinite(denom) and denom > 0.0:
@@ -7315,15 +7331,7 @@ def GSapi(
                 except Exception:
                     pass
             if np.isfinite(pve_hint) and np.isfinite(sigma_e2) and sigma_e2 >= 0.0:
-                pve_clamped = float(min(max(float(pve_hint), 0.0), 1.0))
-                if pve_clamped < 1.0:
-                    var_g = float(
-                        sigma_e2
-                        * (
-                            pve_clamped
-                            / max(np.finfo(np.float64).eps, 1.0 - pve_clamped)
-                        )
-                    )
+                var_g = _recover_trainvar_from_pve(float(pve_hint), float(sigma_e2))
             if (not np.isfinite(var_g)) and np.isfinite(sigma_g2):
                 var_g = float(sigma_g2)
             return (
@@ -7360,6 +7368,35 @@ def GSapi(
             )
             if np.isfinite(pve_use):
                 rrblup_runtime_state["pve_trainvar"] = float(pve_use)
+
+        def _sync_gblup_trainvar_state(
+            *,
+            sigma_g2: float,
+            sigma_e2: float,
+            pve_trainvar: float | None = None,
+        ) -> None:
+            if (not _is_gblup_method(str(method))) or (gblup_runtime_state is None):
+                return
+            if np.isfinite(float(sigma_g2)):
+                gblup_runtime_state["sigma_g2"] = float(sigma_g2)
+            if np.isfinite(float(sigma_e2)):
+                gblup_runtime_state["sigma_e2"] = float(sigma_e2)
+            pve_use = (
+                float(pve_trainvar)
+                if pve_trainvar is not None
+                else float(gblup_runtime_state.get("pve_trainvar", np.nan))
+            )
+            if np.isfinite(pve_use):
+                gblup_runtime_state["pve_trainvar"] = float(pve_use)
+            var_g = _recover_trainvar_from_pve(float(pve_use), float(sigma_e2))
+            if not np.isfinite(var_g):
+                return
+            gblup_runtime_state["var_g"] = float(var_g)
+            kernel_mode = str(_gblup_method_kernel_mode(str(method))).strip().lower()
+            if kernel_mode == "a":
+                gblup_runtime_state["va"] = float(var_g)
+            elif kernel_mode == "d":
+                gblup_runtime_state["vd"] = float(var_g)
 
         if _GS_DEBUG_STAGE:
             t_fit = time.time()
@@ -7631,10 +7668,11 @@ def GSapi(
                     gblup_runtime_state["variance_component"] = (
                         "REML/FaST" if _vc_path == "fast" else "REML/GRM"
                     )
-                    if np.isfinite(float(_sigma_g2)):
-                        gblup_runtime_state["sigma_g2"] = float(_sigma_g2)
-                    if np.isfinite(float(_sigma_e2)):
-                        gblup_runtime_state["sigma_e2"] = float(_sigma_e2)
+                    _sync_gblup_trainvar_state(
+                        sigma_g2=float(_sigma_g2),
+                        sigma_e2=float(_sigma_e2),
+                        pve_trainvar=float(pve),
+                    )
                 if (model_state is not None) and (gblup_return_effect or (gblup_effect_vec is not None)):
                     model_state["kind"] = "gblup_kernel_projection"
                     model_state["method"] = str(method)
@@ -8753,28 +8791,92 @@ def GSapi(
                         f"threads={int(max(1, int(n_jobs)))}",
                         flush=True,
                     )
-                with runtime_thread_stage(
-                    blas_threads=int(max(1, int(n_jobs))),
-                    rayon_threads=int(max(1, int(n_jobs))),
-                ):
-                    rr_out = _jxrs.rrblup_exact_snp_packed(  # type: ignore[union-attr]
-                        packed_arg,
-                        int(packed_n_samples),
-                        train_abs,
-                        y_train_vec,
-                        test_abs,
-                        train_pred_local_arg,
-                        site_keep_arg,
-                        maf_arg,
-                        row_flip_arg,
-                        float(exact_log10_low),
-                        float(exact_log10_high),
-                        float(exact_reml_tol),
-                        int(exact_reml_max_iter),
-                        int(exact_sample_block),
-                        float(exact_std_eps),
-                        int(max(1, int(n_jobs))),
-                        int(max(1, int(n_jobs))),
+                can_use_split_exact_snp = bool(
+                    hasattr(_jxrs, "rrblup_exact_snp_prepare_packed")
+                    and hasattr(_jxrs, "rrblup_exact_snp_fit_prepared")
+                )
+                if can_use_split_exact_snp:
+                    _emit_rrblup_progress(
+                        "exact_snp_prepare_start",
+                        backend="snp",
+                    )
+                    with runtime_thread_stage(
+                        blas_threads=int(max(1, int(n_jobs))),
+                        rayon_threads=int(max(1, int(n_jobs))),
+                    ):
+                        rr_exact_cache = _jxrs.rrblup_exact_snp_prepare_packed(  # type: ignore[union-attr]
+                            packed_arg,
+                            int(packed_n_samples),
+                            train_abs,
+                            site_keep_arg,
+                            maf_arg,
+                            row_flip_arg,
+                            int(exact_sample_block),
+                            float(exact_std_eps),
+                            int(max(1, int(n_jobs))),
+                            int(max(1, int(n_jobs))),
+                        )
+                    _emit_rrblup_progress(
+                        "exact_snp_prepare_end",
+                        backend="snp",
+                    )
+                    _emit_rrblup_progress(
+                        "exact_snp_fit_start",
+                        backend="snp",
+                    )
+                    with runtime_thread_stage(
+                        blas_threads=int(max(1, int(n_jobs))),
+                        rayon_threads=int(max(1, int(n_jobs))),
+                    ):
+                        rr_out = _jxrs.rrblup_exact_snp_fit_prepared(  # type: ignore[union-attr]
+                            rr_exact_cache,
+                            packed_arg,
+                            int(packed_n_samples),
+                            y_train_vec,
+                            test_abs,
+                            train_pred_local_arg,
+                            float(exact_log10_low),
+                            float(exact_log10_high),
+                            float(exact_reml_tol),
+                            int(exact_reml_max_iter),
+                            int(max(1, int(n_jobs))),
+                            int(max(1, int(n_jobs))),
+                        )
+                    _emit_rrblup_progress(
+                        "exact_snp_fit_end",
+                        backend="snp",
+                    )
+                else:
+                    _emit_rrblup_progress(
+                        "exact_snp_total_start",
+                        backend="snp",
+                    )
+                    with runtime_thread_stage(
+                        blas_threads=int(max(1, int(n_jobs))),
+                        rayon_threads=int(max(1, int(n_jobs))),
+                    ):
+                        rr_out = _jxrs.rrblup_exact_snp_packed(  # type: ignore[union-attr]
+                            packed_arg,
+                            int(packed_n_samples),
+                            train_abs,
+                            y_train_vec,
+                            test_abs,
+                            train_pred_local_arg,
+                            site_keep_arg,
+                            maf_arg,
+                            row_flip_arg,
+                            float(exact_log10_low),
+                            float(exact_log10_high),
+                            float(exact_reml_tol),
+                            int(exact_reml_max_iter),
+                            int(exact_sample_block),
+                            float(exact_std_eps),
+                            int(max(1, int(n_jobs))),
+                            int(max(1, int(n_jobs))),
+                        )
+                    _emit_rrblup_progress(
+                        "exact_snp_total_end",
+                        backend="snp",
                     )
                 rr_out_t = tuple(rr_out)
                 if len(rr_out_t) >= 12:
@@ -8987,6 +9089,11 @@ def GSapi(
                 gblup_runtime_state["h2"] = float(h2)
             if np.isfinite(lambda_reml):
                 gblup_runtime_state["lambda_reml"] = float(lambda_reml)
+            _sync_gblup_trainvar_state(
+                sigma_g2=float(sigma_g2),
+                sigma_e2=float(sigma_e2),
+                pve_trainvar=float(getattr(model, "pve", np.nan)),
+            )
         if method == "rrBLUP":
             _set_rrblup_solver_state(str(resolved_rr_solver))
             _set_rrblup_exact_backend_state("fast")
@@ -9704,6 +9811,21 @@ def _run_method_task(
             _float_or_nan(state.get("sigma_e2", state.get("ve", np.nan))),
         )
 
+    def _trainvar_from_pve_ve(pve: typing.Any, ve: typing.Any) -> float:
+        pve_f = _float_or_nan(pve)
+        ve_f = _float_or_nan(ve)
+        if np.isfinite(pve_f) and np.isfinite(ve_f) and ve_f >= 0.0:
+            pve_clamped = float(min(max(float(pve_f), 0.0), 1.0))
+            if pve_clamped < 1.0:
+                return float(
+                    ve_f
+                    * (
+                        pve_clamped
+                        / max(np.finfo(np.float64).eps, 1.0 - pve_clamped)
+                    )
+                )
+        return float("nan")
+
     use_hash_cv_compact = bool(
         method == "GBLUP"
         and cv_splits is not None
@@ -10005,12 +10127,6 @@ def _run_method_task(
         _emit_stage("cv_start", method=str(method), total=int(cv_total))
         for fold_id, (test_idx, train_idx) in enumerate(cv_splits, start=1):
             t_fold = time.time()
-            _emit_stage(
-                "cv_fold_start",
-                method=str(method),
-                fold=int(fold_id),
-                total=int(cv_total),
-            )
             fold_train_idx_arg = None
             fold_test_idx_arg = None
             fold_train_pred_local_idx: np.ndarray | None = _resolve_train_pred_local_indices(
@@ -10305,6 +10421,8 @@ def _run_method_task(
                 if method == "rrBLUP" and rrblup_progress_hook is not None:
                     def _fold_rr_progress(event: str, payload: dict[str, typing.Any], *, _fold_id: int = int(fold_id), _cv_total: int = int(cv_total)) -> None:
                         pp = dict(payload)
+                        pp.setdefault("fold", int(_fold_id))
+                        pp.setdefault("cv_total", int(_cv_total))
                         pp.setdefault("phase_label", f"fold {_fold_id}/{_cv_total}")
                         rrblup_progress_hook(str(event), pp)
                     rr_progress_call = _fold_rr_progress
@@ -10929,6 +11047,7 @@ def _run_method_task(
             sigma_e2_fit = float(fit.get("sigma_e2", np.nan))
             lambda_reml_fit = float(fit.get("lambda_reml", np.nan))
             h2_fit = float(fit.get("pve", np.nan))
+            var_g_fit = _trainvar_from_pve_ve(h2_fit, sigma_e2_fit)
             if np.isfinite(sigma_a2_fit) and np.isfinite(sigma_d2_fit):
                 gblup_final_state["sigma_g2"] = float(sigma_a2_fit + sigma_d2_fit)
             if np.isfinite(sigma_a2_fit):
@@ -10937,6 +11056,8 @@ def _run_method_task(
                 gblup_final_state["sigma_d2"] = float(sigma_d2_fit)
             if np.isfinite(sigma_e2_fit):
                 gblup_final_state["sigma_e2"] = float(sigma_e2_fit)
+            if np.isfinite(var_g_fit):
+                gblup_final_state["var_g"] = float(var_g_fit)
             if np.isfinite(lambda_reml_fit):
                 gblup_final_state["lambda_reml"] = float(lambda_reml_fit)
             if np.isfinite(h2_fit):
@@ -10999,12 +11120,19 @@ def _run_method_task(
             sigma_e2_fit = float(fit.get("sigma_e2", np.nan))
             lambda_reml_fit = float(fit.get("lambda_reml", np.nan))
             h2_fit = float(fit.get("pve", np.nan))
+            var_g_fit = _trainvar_from_pve_ve(h2_fit, sigma_e2_fit)
             if np.isfinite(sigma_g2_fit):
                 gblup_final_state["sigma_g2"] = float(sigma_g2_fit)
                 if method == _GBLUP_METHOD_DOM:
                     gblup_final_state["sigma_d2"] = float(sigma_g2_fit)
             if np.isfinite(sigma_e2_fit):
                 gblup_final_state["sigma_e2"] = float(sigma_e2_fit)
+            if np.isfinite(var_g_fit):
+                gblup_final_state["var_g"] = float(var_g_fit)
+                if method == _GBLUP_METHOD_DOM:
+                    gblup_final_state["vd"] = float(var_g_fit)
+                else:
+                    gblup_final_state["va"] = float(var_g_fit)
             if np.isfinite(lambda_reml_fit):
                 gblup_final_state["lambda_reml"] = float(lambda_reml_fit)
             if np.isfinite(h2_fit):
@@ -11037,6 +11165,7 @@ def _run_method_task(
             if rrblup_progress_hook is not None:
                 def _final_rr_progress(event: str, payload: dict[str, typing.Any]) -> None:
                     pp = dict(payload)
+                    pp.setdefault("phase", "final")
                     pp.setdefault("phase_label", "final")
                     rrblup_progress_hook(str(event), pp)
                 rr_progress_final = _final_rr_progress
@@ -11700,8 +11829,13 @@ def _run_methods_parallel(
             sigma_e2 = float(gblup_state.get("sigma_e2", np.nan))
             sigma_a2 = float(gblup_state.get("sigma_a2", np.nan))
             sigma_d2 = float(gblup_state.get("sigma_d2", np.nan))
-            va = sigma_a2 if np.isfinite(sigma_a2) else sigma_g2
-            vd = sigma_d2 if np.isfinite(sigma_d2) else sigma_g2
+            var_g = float(gblup_state.get("var_g", np.nan))
+            va = sigma_a2 if np.isfinite(sigma_a2) else (
+                var_g if (mode == "a" and np.isfinite(var_g)) else sigma_g2
+            )
+            vd = sigma_d2 if np.isfinite(sigma_d2) else (
+                var_g if (mode == "d" and np.isfinite(var_g)) else sigma_g2
+            )
             def _fmt_var_or_na(x: float) -> str:
                 return f"{x:.6g}" if np.isfinite(x) else "NA"
             if mode in {"a", "ad"}:
@@ -11963,6 +12097,7 @@ def _run_methods_parallel(
         if (name_key != "rrBLUP") and (not _is_blup_method(name_key)):
             return False
         solver_mode = str(rrblup_solver).strip().lower()
+        exact_backend_mode = str((rrblup_adamw_cfg or {}).get("exact_backend", "auto")).strip().lower()
         n_snp = _marker_count_from_inputs(
             packed_ctx=packed_ctx,
             train_snp=train_snp,
@@ -11981,10 +12116,23 @@ def _run_methods_parallel(
                     n_samples=int(max(0, n_train_try)),
                     n_markers=int(n_snp),
                 )
-                return bool(
-                    dispatch_try.effective_method == "rrBLUP"
-                    and dispatch_try.rrblup_solver == "pcg"
-                )
+                if dispatch_try.effective_method != "rrBLUP":
+                    continue
+                if dispatch_try.rrblup_solver == "pcg":
+                    return True
+                if dispatch_try.rrblup_solver == "exact":
+                    exact_backend_try = str(
+                        dispatch_try.rrblup_exact_backend
+                        or _resolve_rrblup_exact_backend(
+                            backend=exact_backend_mode,
+                            n_snp=int(n_snp),
+                            is_packed_input=_looks_like_packed_payload(packed_ctx),
+                            cfg=rrblup_adamw_cfg,
+                        )
+                    ).strip().lower()
+                    if exact_backend_try == "snp":
+                        return True
+                continue
             resolved = _resolve_rrblup_solver(
                 solver=solver_mode,
                 n_train=int(max(0, n_train_try)),
@@ -11993,6 +12141,15 @@ def _run_methods_parallel(
             )
             if str(resolved) in {"adamw", "pcg"}:
                 return True
+            if str(resolved) == "exact":
+                exact_backend_try = _resolve_rrblup_exact_backend(
+                    backend=exact_backend_mode,
+                    n_snp=int(n_snp),
+                    is_packed_input=_looks_like_packed_payload(packed_ctx),
+                    cfg=rrblup_adamw_cfg,
+                )
+                if str(exact_backend_try).strip().lower() == "snp":
+                    return True
         return False
 
     rrblup_progress_enabled_by_method = {
@@ -12269,7 +12426,6 @@ def _run_methods_parallel(
                 res: dict[str, typing.Any] | None = None
                 t0 = time.monotonic()
                 cv_units_per_fold = 100
-                cv_fold_start_units = 10
                 cv_total_units = int(max(1, cv_total * cv_units_per_fold))
                 cv_done_folds = 0
                 cv_done_units = 0
@@ -12459,11 +12615,6 @@ def _run_methods_parallel(
                     if ev == "cv_start":
                         _ensure_cv_bar()
                         return
-                    if ev == "cv_fold_start":
-                        fold_no = int(max(1, int(payload.get("fold", (cv_done_folds + 1)))))
-                        target_units = ((fold_no - 1) * cv_units_per_fold) + cv_fold_start_units
-                        _advance_cv_units(target_units)
-                        return
                     if ev == "cv_end":
                         return
                     if ev == "fit_start":
@@ -12630,6 +12781,27 @@ def _run_methods_parallel(
                             rr_bar.update(delta)
                             rr_bar_done += delta
 
+                def _rr_exact_desc(event: str, payload: dict[str, typing.Any]) -> str:
+                    _ = payload
+                    ev_key = str(event).strip().lower()
+                    if "prepare" in ev_key:
+                        return "Prepare SNP spectrum"
+                    if "fit" in ev_key:
+                        return "Solve exact rrBLUP"
+                    return "Exact rrBLUP"
+
+                def _advance_rr_cv_units(
+                    payload: dict[str, typing.Any],
+                    *,
+                    units_within_fold: int,
+                ) -> None:
+                    fold_raw = payload.get("fold", None)
+                    if fold_raw is None:
+                        return
+                    fold_no = int(max(1, int(fold_raw)))
+                    target_units = ((fold_no - 1) * cv_units_per_fold) + int(units_within_fold)
+                    _advance_cv_units(target_units)
+
                 def _search_hook(event: str, payload: dict[str, typing.Any]) -> None:
                     nonlocal search_done, search_total, search_total_fixed
                     ev = str(event)
@@ -12673,6 +12845,25 @@ def _run_methods_parallel(
                         return
                     ev = str(event)
                     _mark_rr_subprogress()
+                    if ev == "exact_snp_prepare_start":
+                        _start_rr_spinner(_rr_exact_desc(ev, payload))
+                        return
+                    if ev == "exact_snp_prepare_end":
+                        _advance_rr_cv_units(payload, units_within_fold=90)
+                        _close_rr_spinner()
+                        return
+                    if ev == "exact_snp_fit_start":
+                        _start_rr_spinner(_rr_exact_desc(ev, payload))
+                        return
+                    if ev == "exact_snp_fit_end":
+                        _close_rr_spinner()
+                        return
+                    if ev == "exact_snp_total_start":
+                        _start_rr_spinner(_rr_exact_desc(ev, payload))
+                        return
+                    if ev == "exact_snp_total_end":
+                        _close_rr_spinner()
+                        return
                     if ev == "pcg_lambda_vc_start":
                         _start_rr_spinner(_rr_lambda_label(payload))
                         return
@@ -12913,7 +13104,6 @@ def _run_methods_parallel(
             cv_line_emitted = bool(enable_tqdm_progress and show_method_progress)
             rr_subprogress_seen = False
             cv_units_per_fold = 100
-            cv_fold_start_units = 10
             cv_total_units = int(max(1, cv_total * cv_units_per_fold))
             cv_done_folds = 0
             cv_done_units = 0
@@ -13255,6 +13445,27 @@ def _run_methods_parallel(
                     return _rr_phase_title("Estimate lambda (subsample REML)", payload)
                 return _rr_phase_title("Estimate lambda", payload)
 
+            def _rr_exact_desc(event: str, payload: dict[str, typing.Any]) -> str:
+                _ = payload
+                ev_key = str(event).strip().lower()
+                if "prepare" in ev_key:
+                    return "Prepare SNP spectrum"
+                if "fit" in ev_key:
+                    return "Solve exact rrBLUP"
+                return "Exact rrBLUP"
+
+            def _advance_rr_cv_units(
+                payload: dict[str, typing.Any],
+                *,
+                units_within_fold: int,
+            ) -> None:
+                fold_raw = payload.get("fold", None)
+                if fold_raw is None:
+                    return
+                fold_no = int(max(1, int(fold_raw)))
+                target_units = ((fold_no - 1) * cv_units_per_fold) + int(units_within_fold)
+                _advance_cv_units(target_units)
+
             def _mark_rr_subprogress() -> None:
                 nonlocal fit_status, rr_subprogress_seen
                 rr_subprogress_seen = True
@@ -13271,11 +13482,6 @@ def _run_methods_parallel(
                 ev = str(event)
                 if ev == "cv_start":
                     _ensure_cv_bar()
-                    return
-                if ev == "cv_fold_start":
-                    fold_no = int(max(1, int(payload.get("fold", (cv_done_folds + 1)))))
-                    target_units = ((fold_no - 1) * cv_units_per_fold) + cv_fold_start_units
-                    _advance_cv_units(target_units)
                     return
                 if ev == "cv_end":
                     return
@@ -13376,6 +13582,40 @@ def _run_methods_parallel(
                     return
                 ev = str(event)
                 _mark_rr_subprogress()
+                if ev == "exact_snp_prepare_start":
+                    _close_adam_bar()
+                    _close_lambda_bar()
+                    _ensure_lambda_bar(
+                        _rr_exact_desc(ev, payload),
+                        indeterminate=True,
+                    )
+                    return
+                if ev == "exact_snp_prepare_end":
+                    _advance_rr_cv_units(payload, units_within_fold=90)
+                    _close_lambda_bar()
+                    return
+                if ev == "exact_snp_fit_start":
+                    _close_adam_bar()
+                    _close_lambda_bar()
+                    _ensure_lambda_bar(
+                        _rr_exact_desc(ev, payload),
+                        indeterminate=True,
+                    )
+                    return
+                if ev == "exact_snp_fit_end":
+                    _close_lambda_bar()
+                    return
+                if ev == "exact_snp_total_start":
+                    _close_adam_bar()
+                    _close_lambda_bar()
+                    _ensure_lambda_bar(
+                        _rr_exact_desc(ev, payload),
+                        indeterminate=True,
+                    )
+                    return
+                if ev == "exact_snp_total_end":
+                    _close_lambda_bar()
+                    return
                 if ev == "pcg_lambda_vc_start":
                     _close_adam_bar()
                     _close_lambda_bar()

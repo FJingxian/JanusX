@@ -6,7 +6,6 @@ Sync project versions from a git tag.
 Files synced:
   - pyproject.toml
   - Cargo.toml
-  - launcher/Cargo.toml
   - bioconda-recipes/recipes/janusx/meta.yaml
   - bioconda-recipes/recipes/janusx-localcheck/meta.yaml
 
@@ -27,7 +26,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 PYPROJECT = ROOT / "pyproject.toml"
 CARGO = ROOT / "Cargo.toml"
-LAUNCHER_CARGO = ROOT / "launcher" / "Cargo.toml"
 JANUSX_CLI = ROOT / "python" / "janusx" / "script" / "JanusX.py"
 BIOCONDA_META = ROOT / "bioconda-recipes" / "recipes" / "janusx" / "meta.yaml"
 BIOCONDA_LOCALCHECK_META = ROOT / "bioconda-recipes" / "recipes" / "janusx-localcheck" / "meta.yaml"
@@ -133,7 +131,6 @@ def main(argv: list[str] | None = None) -> int:
     build_date = _git_head_date()
     _replace_section_version(PYPROJECT, "project", version)
     _replace_section_version(CARGO, "package", rust_version)
-    _replace_section_version(LAUNCHER_CARGO, "package", rust_version)
     _replace_build_date_fallback(JANUSX_CLI, build_date)
     _replace_recipe_version(BIOCONDA_META, version)
     _replace_recipe_version(BIOCONDA_LOCALCHECK_META, version)

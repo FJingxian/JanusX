@@ -868,22 +868,22 @@ detect_qtn_from_lines <- function(lines) {
   final_count
 }
 
-compute_marker_freq <- function(geno, ind_idx, threads, max_line, n_markers) {
-  nsnp <- as.integer(n_markers)
-  if (!is.finite(nsnp) || nsnp <= 0L) {
+compute_marker_freq <- function(geno, ind_idx, mrk_idx, threads, max_line, n_markers_total) {
+  nsnp_total <- as.integer(n_markers_total)
+  if (!is.finite(nsnp_total) || nsnp_total <= 0L) {
     stop("Invalid marker count for rMVP frequency calculation.", call. = FALSE)
   }
   geno_nr <- tryCatch(as.integer(nrow(geno)), error = function(e) NA_integer_)
   geno_nc <- tryCatch(as.integer(ncol(geno)), error = function(e) NA_integer_)
-  marker_by_col <- is.finite(geno_nc) && geno_nc == nsnp
-  marker_by_row <- is.finite(geno_nr) && geno_nr == nsnp
+  marker_by_col <- is.finite(geno_nc) && geno_nc == nsnp_total
+  marker_by_row <- is.finite(geno_nr) && geno_nr == nsnp_total
   if (!marker_by_col && !marker_by_row) {
     stop(
       sprintf(
         "Cannot infer rMVP genotype orientation: nrow=%s ncol=%s n_markers=%s",
         as.character(geno_nr),
         as.character(geno_nc),
-        as.character(nsnp)
+        as.character(nsnp_total)
       ),
       call. = FALSE
     )
@@ -896,26 +896,40 @@ compute_marker_freq <- function(geno, ind_idx, threads, max_line, n_markers) {
   if (!length(idx)) {
     stop("No valid matched sample indices for marker-frequency calculation.", call. = FALSE)
   }
+  mrk <- as.integer(mrk_idx)
+  mrk <- mrk[is.finite(mrk)]
+  mrk <- unique(mrk)
+  if (!length(mrk)) {
+    mrk <- NULL
+  }
   # rMVP internals vary by version; prefer its native helper when available,
   # otherwise fall back to a direct big.matrix row-mean over the selected samples.
   big_row_mean <- tryCatch(getFromNamespace("BigRowMean", "rMVP"), error = function(e) NULL)
   if (is.function(big_row_mean)) {
-    return(big_row_mean(
+    freq_all <- big_row_mean(
       geno@address,
-      TRUE,
+      marker_by_col,
+      step = max(1L, as.integer(ifelse(is.finite(max_line) && max_line > 0L, max_line, 10000L))),
       threads = threads,
-      geno_ind = idx
-    ) / 2)
+      geno_ind = idx,
+      verbose = FALSE
+    ) / 2
+    if (!is.null(mrk)) {
+      return(freq_all[mrk])
+    }
+    return(freq_all)
   }
   chunk <- as.integer(max(1L, ifelse(is.finite(max_line) && max_line > 0L, max_line, 10000L)))
-  out <- numeric(nsnp)
-  for (start in seq.int(1L, nsnp, by = chunk)) {
-    end <- min(nsnp, start + chunk - 1L)
+  target <- if (is.null(mrk)) seq_len(nsnp_total) else mrk
+  out <- numeric(length(target))
+  for (start in seq.int(1L, length(target), by = chunk)) {
+    end <- min(length(target), start + chunk - 1L)
+    sel <- target[start:end]
     if (marker_by_col) {
-      block <- geno[idx, start:end, drop = FALSE]
+      block <- geno[idx, sel, drop = FALSE]
       out[start:end] <- colMeans(block, na.rm = TRUE) / 2
     } else {
-      block <- geno[start:end, idx, drop = FALSE]
+      block <- geno[sel, idx, drop = FALSE]
       out[start:end] <- rowMeans(block, na.rm = TRUE) / 2
     }
   }
@@ -972,33 +986,9 @@ subset_geno_for_individuals <- function(geno, ind_idx, n_markers, cache_prefix, 
       call. = FALSE
     )
   }
-  sub_mat <- if (marker_by_col) {
-    geno[idx, , drop = FALSE]
-  } else {
-    geno[, idx, drop = FALSE]
-  }
-  cache_dir <- dirname(cache_prefix)
-  dir.create(cache_dir, recursive = TRUE, showWarnings = FALSE)
-  backingfile <- paste0(basename(cache_prefix), ".", label, ".geno.bin")
-  descriptorfile <- paste0(basename(cache_prefix), ".", label, ".geno.desc")
-  bin_path <- file.path(cache_dir, backingfile)
-  desc_path <- file.path(cache_dir, descriptorfile)
-  if (file.exists(bin_path)) unlink(bin_path, force = TRUE)
-  if (file.exists(desc_path)) unlink(desc_path, force = TRUE)
-  bm <- bigmemory::filebacked.big.matrix(
-    nrow = nrow(sub_mat),
-    ncol = ncol(sub_mat),
-    type = "char",
-    backingfile = backingfile,
-    backingpath = cache_dir,
-    descriptorfile = descriptorfile,
-    dimnames = c(NULL, NULL)
-  )
-  bm[, ] <- sub_mat[, ]
-  flush(bm)
   list(
-    geno = bm,
-    ind_idx = NULL,
+    geno = geno,
+    ind_idx = idx,
     marker_by_col = marker_by_col
   )
 }
@@ -1032,32 +1022,8 @@ subset_geno_for_markers <- function(geno, marker_idx0, n_markers, cache_prefix, 
       call. = FALSE
     )
   }
-  sub_mat <- if (marker_by_col) {
-    geno[, idx, drop = FALSE]
-  } else {
-    geno[idx, , drop = FALSE]
-  }
-  cache_dir <- dirname(cache_prefix)
-  dir.create(cache_dir, recursive = TRUE, showWarnings = FALSE)
-  backingfile <- paste0(basename(cache_prefix), ".", label, ".geno.bin")
-  descriptorfile <- paste0(basename(cache_prefix), ".", label, ".geno.desc")
-  bin_path <- file.path(cache_dir, backingfile)
-  desc_path <- file.path(cache_dir, descriptorfile)
-  if (file.exists(bin_path)) unlink(bin_path, force = TRUE)
-  if (file.exists(desc_path)) unlink(desc_path, force = TRUE)
-  bm <- bigmemory::filebacked.big.matrix(
-    nrow = nrow(sub_mat),
-    ncol = ncol(sub_mat),
-    type = "char",
-    backingfile = backingfile,
-    backingpath = cache_dir,
-    descriptorfile = descriptorfile,
-    dimnames = c(NULL, NULL)
-  )
-  bm[, ] <- sub_mat[, ]
-  flush(bm)
   list(
-    geno = bm,
+    geno = geno,
     marker_by_col = marker_by_col,
     kept_idx0 = idx0
   )
@@ -1273,6 +1239,7 @@ tryCatch(
       stop("rMVP map cache must contain at least SNP/CHROM/POS columns.", call. = FALSE)
     }
     map_out <- as.data.frame(map, stringsAsFactors = FALSE)
+    map_farmcpu_idx0 <- NULL
     if (nzchar(marker_manifest_path)) {
       if (!file.exists(marker_manifest_path)) {
         stop(sprintf("Marker manifest not found: %s", marker_manifest_path), call. = FALSE)
@@ -1301,6 +1268,7 @@ tryCatch(
         label = "farmcpu_markers"
       )
       geno <- marker_subset$geno
+      map_farmcpu_idx0 <- as.integer(marker_subset$kept_idx0)
       map_out <- map_out[marker_subset$kept_idx0 + 1L, , drop = FALSE]
       rownames(map_out) <- NULL
     }
@@ -1354,9 +1322,10 @@ tryCatch(
     farmcpu_supports_ind_idx <- function_has_formal(farmcpu_fun, "ind_idx")
     geno_farmcpu <- geno
     ind_idx_farmcpu <- ind_idx
-    marker_by_col_farmcpu <- tryCatch(as.integer(ncol(geno)) == nrow(map_out), error = function(e) TRUE)
+    mrk_idx_farmcpu <- if (is.null(map_farmcpu_idx0)) NULL else as.integer(map_farmcpu_idx0 + 1L)
+    marker_by_col_farmcpu <- tryCatch(as.integer(ncol(geno)) == nrow(map), error = function(e) TRUE)
     if (!farmcpu_supports_ind_idx) {
-      cat("[INFO] MVP.FarmCPU does not expose ind_idx; materializing matched-sample genotype subset for compatibility.\n")
+      cat("[INFO] MVP.FarmCPU does not expose ind_idx; keeping original big.matrix and carrying explicit matched sample indices.\n")
       subset_res <- subset_geno_for_individuals(
         geno = geno,
         ind_idx = ind_idx,
@@ -1370,13 +1339,20 @@ tryCatch(
     }
 
     CV_farmcpu <- NULL
-    marker_freq <- compute_marker_freq(geno_farmcpu, ind_idx_farmcpu, threads, max_line, nrow(map_out))
+    marker_freq <- compute_marker_freq(
+      geno_farmcpu,
+      ind_idx_farmcpu,
+      mrk_idx_farmcpu,
+      threads,
+      max_line,
+      nrow(map)
+    )
     if (!is.null(npc_farmcpu) && npc_farmcpu > 0L) {
       kin_args <- list(
         M = geno_farmcpu,
         maxLine = max_line,
         ind_idx = ind_idx_farmcpu,
-        mrk_idx = NULL,
+        mrk_idx = mrk_idx_farmcpu,
         mrk_freq = marker_freq,
         mrk_bycol = marker_by_col_farmcpu,
         cpu = threads,
@@ -1393,10 +1369,10 @@ tryCatch(
     farmcpu_args <- list(
       phe = phe,
       geno = geno_farmcpu,
-      map = map_farmcpu,
+      map = if (is.null(mrk_idx_farmcpu)) map_farmcpu else as.data.frame(map, stringsAsFactors = FALSE)[, seq_len(3L), drop = FALSE],
       CV = CV_farmcpu,
       ind_idx = ind_idx_farmcpu,
-      mrk_idx = NULL,
+      mrk_idx = mrk_idx_farmcpu,
       P = NULL,
       method.sub = "reward",
       method.sub.final = "reward",
@@ -2163,6 +2139,7 @@ def main() -> None:
     else:
         _sample_ids_probe, n_sites_probe = inspect_genotype_file(gfile)
         n_snps_for_threshold = max(1, int(n_sites_probe))
+    n_snps_for_threshold_source = f"pre_filter({int(n_snps_for_threshold)})"
 
     bin_size = _parse_number_list(args.farmcpu_bin_size, cast=float)
     farm_bound, farm_bin_selection, farm_bin_size = _compute_farmcpu_grid(
@@ -2200,6 +2177,8 @@ def main() -> None:
             out_path=bench_dir / "input" / "janusx_marker_manifest.tsv",
             active_rows=active_rows,
         )
+        n_snps_for_threshold = max(1, int(len(active_rows)))
+        n_snps_for_threshold_source = f"post_filter_manifest({int(n_snps_for_threshold)})"
 
     rmvp_runner = bench_dir / "tmp" / "rmvp_farmcpu_runner.R"
     rmvp_runner.parent.mkdir(parents=True, exist_ok=True)
@@ -2257,7 +2236,7 @@ def main() -> None:
         "farmcpu_iter": int(args.farmcpu_iter),
         "farmcpu_threshold": float(align_runtime.farmcpu_threshold),
         "farmcpu_threshold_source": (
-            "cli" if args.farmcpu_threshold is not None else f"auto_1_over_nsnp({int(n_snps_for_threshold)})"
+            "cli" if args.farmcpu_threshold is not None else f"auto_1_over_nsnp:{n_snps_for_threshold_source}"
         ),
         "benchmark_mode": "direct_aligned_explicit_mvp_farmcpu",
         "rmvp_runner_mode": "direct_mvp_farmcpu",

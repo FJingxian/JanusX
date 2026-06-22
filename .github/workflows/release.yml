@@ -10,14 +10,6 @@ on:
         description: "Git ref (tag/sha/branch) to build from"
         required: false
         default: ""
-      release_tag:
-        description: "GitHub Release tag to upload installers (e.g. v1.0.13)"
-        required: false
-        default: ""
-      installers_only:
-        description: "Only rebuild/upload release installers (skip wheels/sdist/PyPI)"
-        required: false
-        default: "false"
       publish_pypi:
         description: "Publish to official PyPI (requires PYPI_API_TOKEN); skips TestPyPI in this run"
         required: false
@@ -27,261 +19,8 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
-  build-installers:
-    name: Build launcher installers (${{ matrix.asset_suffix }})
-    if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.publish_pypi != 'true' || github.event.inputs.installers_only == 'true' }}
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            rust_targets: x86_64-unknown-linux-gnu
-            zig_target: x86_64-unknown-linux-gnu.2.17
-            use_zigbuild: true
-            asset_suffix: linux-x86_64
-            ext: ""
-          - runner: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-            rust_targets: aarch64-unknown-linux-gnu
-            zig_target: aarch64-unknown-linux-gnu.2.17
-            use_zigbuild: true
-            asset_suffix: linux-aarch64
-            ext: ""
-          - runner: macos-14
-            target: universal-apple-darwin
-            rust_targets: aarch64-apple-darwin,x86_64-apple-darwin
-            use_zigbuild: false
-            asset_suffix: darwin-universal
-            ext: ""
-          - runner: windows-2025-vs2026
-            target: x86_64-pc-windows-msvc
-            rust_targets: x86_64-pc-windows-msvc
-            use_zigbuild: false
-            asset_suffix: windows-x86_64
-            ext: exe
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-        with:
-          ref: ${{ github.event.inputs.ref || github.ref }}
-
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.rust_targets }}
-
-      - name: Sync version from tag
-        shell: bash
-        run: |
-          REF="${{ github.event.inputs.ref || github.ref_name }}"
-          if [[ "$REF" == refs/tags/* ]]; then
-            REF="${REF#refs/tags/}"
-          fi
-          if [[ ! "$REF" =~ ^v ]]; then
-            echo "Skip sync_version_from_tag.py (non-tag ref: $REF)"
-            exit 0
-          fi
-          PY=python
-          command -v python >/dev/null 2>&1 || PY=python3
-          $PY scripts/sync_version_from_tag.py "$REF"
-
-      - name: Set up Zig (Linux compatibility build)
-        if: ${{ matrix.use_zigbuild }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          ZIG_VERSION=0.14.0
-          case "${{ matrix.target }}" in
-            x86_64-unknown-linux-gnu) ZIG_ARCH=x86_64 ;;
-            aarch64-unknown-linux-gnu) ZIG_ARCH=aarch64 ;;
-            *)
-              echo "Unsupported Zig install target: ${{ matrix.target }}"
-              exit 1
-              ;;
-          esac
-          ZIG_BASENAME="zig-linux-${ZIG_ARCH}-${ZIG_VERSION}"
-          ZIG_URL="https://ziglang.org/download/${ZIG_VERSION}/${ZIG_BASENAME}.tar.xz"
-          ZIG_ROOT="${RUNNER_TEMP}/${ZIG_BASENAME}"
-          rm -rf "${ZIG_ROOT}"
-          curl --retry 5 --retry-connrefused --location --silent --show-error --fail \
-            "${ZIG_URL}" -o "${RUNNER_TEMP}/${ZIG_BASENAME}.tar.xz"
-          mkdir -p "${ZIG_ROOT}"
-          tar -xJf "${RUNNER_TEMP}/${ZIG_BASENAME}.tar.xz" -C "${ZIG_ROOT}" --strip-components=1
-          echo "${ZIG_ROOT}" >> "${GITHUB_PATH}"
-          "${ZIG_ROOT}/zig" version
-
-      - name: Install cargo-zigbuild
-        if: ${{ matrix.use_zigbuild }}
-        shell: bash
-        run: |
-          cargo install cargo-zigbuild --locked
-
-      - name: Build launcher
-        shell: bash
-        run: |
-          if [[ "${{ matrix.use_zigbuild }}" == "true" ]]; then
-            cargo zigbuild --release --manifest-path launcher/Cargo.toml --target "${{ matrix.zig_target }}"
-          elif [[ "${{ matrix.asset_suffix }}" == "darwin-universal" ]]; then
-            cargo build --release --manifest-path launcher/Cargo.toml --target aarch64-apple-darwin
-            cargo build --release --manifest-path launcher/Cargo.toml --target x86_64-apple-darwin
-            mkdir -p launcher/target/universal-apple-darwin/release
-            lipo -create \
-              launcher/target/aarch64-apple-darwin/release/jx \
-              launcher/target/x86_64-apple-darwin/release/jx \
-              -output launcher/target/universal-apple-darwin/release/jx
-          else
-            cargo build --release --manifest-path launcher/Cargo.toml --target "${{ matrix.target }}"
-          fi
-
-      - name: Windows launcher smoke test (-upgrade latest + -uninstall -yes)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          ./scripts/ci/windows_launcher_smoke.ps1 `
-            -LauncherPath "launcher/target/${{ matrix.target }}/release/jx.exe" `
-            -WorkspaceRoot "$env:RUNNER_TEMP\jx-launcher-smoke"
-
-      - name: Package installer (Unix)
-        if: runner.os != 'Windows'
-        shell: bash
-        run: |
-          BUILD_TARGET="${{ matrix.target }}"
-          if [[ "${{ matrix.use_zigbuild }}" == "true" ]]; then
-            BUILD_TARGET="${{ matrix.zig_target }}"
-          fi
-          TAG="${{ github.event.inputs.release_tag || github.event.inputs.ref || github.ref_name }}"
-          TAG="${TAG#refs/tags/}"
-          if [ -z "$TAG" ]; then TAG="dev"; fi
-          if [ -n "${{ matrix.ext }}" ]; then
-            OUT="JanusX-${TAG}-${{ matrix.asset_suffix }}.${{ matrix.ext }}"
-          else
-            OUT="JanusX-${TAG}-${{ matrix.asset_suffix }}"
-          fi
-          BIN_PATH=""
-          for c in \
-            "launcher/target/${BUILD_TARGET}/release/jx" \
-            "launcher/target/${{ matrix.target }}/release/jx"
-          do
-            if [[ -f "$c" ]]; then
-              BIN_PATH="$c"
-              break
-            fi
-          done
-          if [[ -z "$BIN_PATH" ]]; then
-            BIN_PATH="$(find launcher/target -type f -path '*/release/jx' | head -n 1 || true)"
-          fi
-          if [[ -z "$BIN_PATH" || ! -f "$BIN_PATH" ]]; then
-            echo "Cannot find built launcher binary under launcher/target."
-            find launcher/target -maxdepth 3 -type d -print || true
-            exit 1
-          fi
-          cp "$BIN_PATH" "$OUT"
-          chmod +x "$OUT"
-          FILES="$OUT"
-          if [[ "${{ matrix.target }}" == *"unknown-linux-gnu" ]]; then
-            WRAP="${OUT}.run"
-            {
-              printf '%s\n' '#!/usr/bin/env bash'
-              printf '%s\n' 'set -euo pipefail'
-              printf '%s\n' 'SELF="$0"'
-              printf '%s\n' 'TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/janusx-installer.XXXXXX")"'
-              printf '%s\n' 'cleanup() { rm -rf "$TMPDIR"; }'
-              printf '%s\n' 'trap cleanup EXIT'
-              printf '%s\n' "PAYLOAD_LINE=\"\$(awk '/^__JANUSX_PAYLOAD_BELOW__\$/ {print NR + 1; exit 0;}' \"\$SELF\")\""
-              printf '%s\n' 'if [[ -z "${PAYLOAD_LINE:-}" ]]; then'
-              printf '%s\n' '  echo "Installer payload missing."'
-              printf '%s\n' '  exit 1'
-              printf '%s\n' 'fi'
-              printf '%s\n' 'BIN="$TMPDIR/JanusX-installer"'
-              printf '%s\n' 'tail -n +"$PAYLOAD_LINE" "$SELF" > "$BIN"'
-              printf '%s\n' 'chmod +x "$BIN"'
-              printf '%s\n' 'exec "$BIN" "$@"'
-              printf '%s\n' 'exit 0'
-              printf '%s\n' '__JANUSX_PAYLOAD_BELOW__'
-            } > "$WRAP"
-            cat "$OUT" >> "$WRAP"
-            chmod +x "$WRAP"
-            FILES="$WRAP"
-          elif [[ "${{ matrix.target }}" == *"apple-darwin" ]]; then
-            WRAP="${OUT}.command"
-            {
-              printf '%s\n' '#!/usr/bin/env bash'
-              printf '%s\n' 'set -euo pipefail'
-              printf '%s\n' 'SELF="$0"'
-              printf '%s\n' 'TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/janusx-installer.XXXXXX")"'
-              printf '%s\n' 'cleanup() { rm -rf "$TMPDIR"; }'
-              printf '%s\n' 'trap cleanup EXIT'
-              printf '%s\n' "PAYLOAD_LINE=\"\$(awk '/^__JANUSX_PAYLOAD_BELOW__\$/ {print NR + 1; exit 0;}' \"\$SELF\")\""
-              printf '%s\n' 'if [[ -z "${PAYLOAD_LINE:-}" ]]; then'
-              printf '%s\n' '  echo "Installer payload missing."'
-              printf '%s\n' '  exit 1'
-              printf '%s\n' 'fi'
-              printf '%s\n' 'BIN="$TMPDIR/JanusX-installer"'
-              printf '%s\n' 'tail -n +"$PAYLOAD_LINE" "$SELF" > "$BIN"'
-              printf '%s\n' 'chmod +x "$BIN"'
-              printf '%s\n' 'exec "$BIN" "$@"'
-              printf '%s\n' 'exit 0'
-              printf '%s\n' '__JANUSX_PAYLOAD_BELOW__'
-            } > "$WRAP"
-            cat "$OUT" >> "$WRAP"
-            chmod +x "$WRAP"
-            FILES="$WRAP"
-          fi
-          {
-            echo "PACKAGED_FILE<<EOF"
-            echo "$FILES"
-            echo "EOF"
-          } >> "$GITHUB_ENV"
-
-      - name: Package installer (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $tag = "${{ github.event.inputs.release_tag || github.event.inputs.ref || github.ref_name }}"
-          if ($tag.StartsWith("refs/tags/")) { $tag = $tag.Substring(10) }
-          if ([string]::IsNullOrWhiteSpace($tag)) { $tag = "dev" }
-          $out = "JanusX-$tag-${{ matrix.asset_suffix }}.${{ matrix.ext }}"
-          Copy-Item "launcher/target/${{ matrix.target }}/release/jx.exe" $out
-          "PACKAGED_FILE=$out" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-
-      - name: Optional sign installer (Windows Authenticode)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        env:
-          WIN_SIGN_CERT_PFX_BASE64: ${{ secrets.WIN_SIGN_CERT_PFX_BASE64 }}
-          WIN_SIGN_CERT_PASSWORD: ${{ secrets.WIN_SIGN_CERT_PASSWORD }}
-          WIN_SIGN_TIMESTAMP_URL: ${{ secrets.WIN_SIGN_TIMESTAMP_URL }}
-        run: |
-          if ([string]::IsNullOrWhiteSpace($env:WIN_SIGN_CERT_PFX_BASE64) -or [string]::IsNullOrWhiteSpace($env:WIN_SIGN_CERT_PASSWORD)) {
-            Write-Host "Skipping Windows signing: missing WIN_SIGN_CERT_PFX_BASE64 / WIN_SIGN_CERT_PASSWORD."
-            exit 0
-          }
-
-          $certPath = Join-Path $env:RUNNER_TEMP "janusx-signing.pfx"
-          [IO.File]::WriteAllBytes($certPath, [Convert]::FromBase64String($env:WIN_SIGN_CERT_PFX_BASE64))
-
-          $signtool = (Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\**\x64\signtool.exe" -ErrorAction SilentlyContinue |
-            Sort-Object FullName -Descending | Select-Object -First 1).FullName
-          if (-not $signtool) { throw "signtool.exe not found on runner." }
-
-          $timestamp = if ([string]::IsNullOrWhiteSpace($env:WIN_SIGN_TIMESTAMP_URL)) { "http://timestamp.digicert.com" } else { $env:WIN_SIGN_TIMESTAMP_URL }
-          & $signtool sign /fd SHA256 /f $certPath /p $env:WIN_SIGN_CERT_PASSWORD /tr $timestamp /td SHA256 $env:PACKAGED_FILE
-          if ($LASTEXITCODE -ne 0) { throw "signtool sign failed with exit code $LASTEXITCODE." }
-
-          & $signtool verify /pa /v $env:PACKAGED_FILE
-          if ($LASTEXITCODE -ne 0) { throw "signtool verify failed with exit code $LASTEXITCODE." }
-
-      - name: Upload installer artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: installer-${{ matrix.asset_suffix }}
-          path: ${{ env.PACKAGED_FILE }}
-
   resolve-package-version:
     name: Resolve package version
-    if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.installers_only != 'true' }}
     runs-on: ubuntu-latest
     outputs:
       package_version: ${{ steps.resolve.outputs.package_version }}
@@ -364,7 +103,6 @@ jobs:
 
   build-wheels:
     name: Build wheels (${{ matrix.label }})
-    if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.installers_only != 'true' }}
     needs:
       - resolve-package-version
     runs-on: ${{ matrix.runner }}
@@ -697,26 +435,7 @@ jobs:
           command -v python >/dev/null 2>&1 || PY=python3
           "$PY" -m pip install --upgrade pip
           "$PY" -m pip install --force-reinstall --no-deps dist/*.whl
-          "$PY" - <<'PY'
-          import glob
-          import zipfile
-
-          wheels = sorted(glob.glob("dist/*.whl"))
-          if len(wheels) != 1:
-              raise SystemExit(f"Strict mode failed: expected one wheel, got {len(wheels)}")
-          wheel = wheels[0]
-          with zipfile.ZipFile(wheel, "r") as zf:
-              names = zf.namelist()
-          kmc_entries = [
-              n for n in names
-              if n.startswith("janusx/_kmc_count")
-              and (n.endswith(".so") or n.endswith(".pyd") or ".so." in n)
-          ]
-          print(f"[janusx] wheel={wheel}")
-          print(f"[janusx] kmc_entries={kmc_entries}")
-          if not kmc_entries:
-              raise SystemExit("Strict mode failed: wheel does not include janusx/_kmc_count extension")
-          PY
+          "$PY" scripts/ci/check_wheel_kmc.py --exactly-one
           "$PY" scripts/ci/check_installed_runtime.py --check-kmc-load
 
       - name: Wheel runtime smoke test (GWAS + rrBLUP)
@@ -873,7 +592,6 @@ jobs:
 
   build-sdist:
     name: Build sdist
-    if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.installers_only != 'true' }}
     needs:
       - resolve-package-version
     runs-on: ubuntu-latest
@@ -918,7 +636,7 @@ jobs:
 
   publish:
     name: Publish to TestPyPI
-    if: ${{ (github.event_name != 'workflow_dispatch' || github.event.inputs.installers_only != 'true') && (github.event_name != 'workflow_dispatch' || github.event.inputs.publish_pypi != 'true') && (startsWith(github.ref, 'refs/tags/v') || startsWith(github.event.inputs.ref, 'v') || startsWith(github.event.inputs.ref, 'refs/tags/v')) }}
+    if: ${{ (github.event_name != 'workflow_dispatch' || github.event.inputs.publish_pypi != 'true') && (startsWith(github.ref, 'refs/tags/v') || startsWith(github.event.inputs.ref, 'v') || startsWith(github.event.inputs.ref, 'refs/tags/v')) }}
     runs-on: ubuntu-latest
     needs:
       - build-wheels
@@ -965,7 +683,7 @@ jobs:
 
   publish-pypi:
     name: Publish to PyPI
-    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.installers_only != 'true' && github.event.inputs.publish_pypi == 'true' && (startsWith(github.ref, 'refs/tags/v') || startsWith(github.event.inputs.ref, 'v') || startsWith(github.event.inputs.ref, 'refs/tags/v')) }}
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.publish_pypi == 'true' && (startsWith(github.ref, 'refs/tags/v') || startsWith(github.event.inputs.ref, 'v') || startsWith(github.event.inputs.ref, 'refs/tags/v')) }}
     runs-on: ubuntu-latest
     needs:
       - build-wheels
@@ -1011,89 +729,18 @@ jobs:
 
   update-bioconda-pr:
     name: Update Bioconda PR
-    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.installers_only != 'true' && github.event.inputs.publish_pypi == 'true' && (startsWith(github.ref, 'refs/tags/v') || startsWith(github.event.inputs.release_tag, 'v') || startsWith(github.event.inputs.ref, 'v') || startsWith(github.event.inputs.ref, 'refs/tags/v')) }}
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.publish_pypi == 'true' && (startsWith(github.ref, 'refs/tags/v') || startsWith(github.event.inputs.ref, 'v') || startsWith(github.event.inputs.ref, 'refs/tags/v')) }}
     needs:
       - publish-pypi
     uses: ./.github/workflows/bioconda-pr-update.yml
     with:
-      release_tag: ${{ github.event.inputs.release_tag || github.event.inputs.ref || github.ref_name }}
+      release_tag: ${{ github.event.inputs.ref || github.ref_name }}
       bioconda_fork: FJingxian/bioconda-recipes
     secrets: inherit
 
-  publish-installers:
-    name: Publish launcher installers to GitHub Release
-    runs-on: ubuntu-latest
-    needs:
-      - build-installers
-    if: ${{ (github.event_name != 'workflow_dispatch' || github.event.inputs.publish_pypi != 'true') && (startsWith(github.ref, 'refs/tags/v') || startsWith(github.event.inputs.release_tag, 'v') || startsWith(github.event.inputs.ref, 'v') || startsWith(github.event.inputs.ref, 'refs/tags/v')) }}
-    permissions:
-      contents: write
-    steps:
-      - name: Resolve installer release tag
-        shell: bash
-        run: |
-          TAG="${{ github.event.inputs.release_tag || github.event.inputs.ref || github.ref_name }}"
-          TAG="${TAG#refs/tags/}"
-          if [[ -z "$TAG" || ! "$TAG" =~ ^v ]]; then
-            echo "Invalid tag for release upload: '$TAG'"
-            exit 1
-          fi
-          echo "RELEASE_TAG=$TAG" >> "$GITHUB_ENV"
-
-      - name: Fetch staged installer artifacts
-        uses: actions/download-artifact@v8
-        with:
-          path: dist-installers
-          merge-multiple: true
-
-      - name: Restore Unix execute bits
-        shell: bash
-        run: |
-          shopt -s nullglob
-          for f in dist-installers/JanusX-*.command dist-installers/JanusX-*.run; do
-            chmod +x "$f" || true
-          done
-
-      - name: Package installer archives
-        shell: bash
-        run: |
-          shopt -s nullglob
-          for f in dist-installers/JanusX-*; do
-            [ -f "$f" ] || continue
-            b="$(basename "$f")"
-            stem="$b"
-            stem="${stem%.command}"
-            stem="${stem%.run}"
-            stem="${stem%.exe}"
-            out="dist-installers/${stem}.tar.gz"
-            tar -czf "$out" -C dist-installers "$b"
-          done
-          find dist-installers -maxdepth 1 -type f -name 'JanusX-*' ! -name '*.tar.gz' -delete
-
-      - name: Generate installer SHA256 sidecars
-        shell: bash
-        run: |
-          shopt -s nullglob
-          for f in dist-installers/JanusX-*.tar.gz; do
-            b="$(basename "$f")"
-            (
-              cd dist-installers
-              sha256sum "$b" > "${b}.sha256"
-            )
-          done
-
-      - name: Publish installer archives and checksums
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ env.RELEASE_TAG }}
-          files: |
-            dist-installers/JanusX-*.tar.gz
-            dist-installers/JanusX-*.tar.gz.sha256
-          overwrite_files: true
-
   sync-version-back-to-repo:
     name: Sync Version Back To Repo
-    if: ${{ startsWith(github.ref, 'refs/tags/v') && (github.event_name != 'workflow_dispatch' || github.event.inputs.installers_only != 'true') }}
+    if: ${{ startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
     needs:
       - publish
@@ -1116,20 +763,20 @@ jobs:
       - name: Commit and push changes
         shell: bash
         run: |
-          if git diff --quiet -- pyproject.toml Cargo.toml launcher/Cargo.toml python/janusx/script/JanusX.py bioconda-recipes/recipes/janusx/meta.yaml bioconda-recipes/recipes/janusx-localcheck/meta.yaml; then
+          if git diff --quiet -- pyproject.toml Cargo.toml python/janusx/script/JanusX.py bioconda-recipes/recipes/janusx/meta.yaml bioconda-recipes/recipes/janusx-localcheck/meta.yaml; then
             echo "No version/build-date changes to commit."
             exit 0
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add pyproject.toml Cargo.toml launcher/Cargo.toml python/janusx/script/JanusX.py bioconda-recipes/recipes/janusx/meta.yaml bioconda-recipes/recipes/janusx-localcheck/meta.yaml
+          git add pyproject.toml Cargo.toml python/janusx/script/JanusX.py bioconda-recipes/recipes/janusx/meta.yaml bioconda-recipes/recipes/janusx-localcheck/meta.yaml
           git commit -m "chore(release): sync version from ${GITHUB_REF_NAME}"
           git pull --rebase origin "${{ github.event.repository.default_branch }}"
           git push origin HEAD:"${{ github.event.repository.default_branch }}"
 
   sync-version-back-to-repo-from-pypi:
     name: Sync Version Back To Repo (PyPI)
-    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.installers_only != 'true' && github.event.inputs.publish_pypi == 'true' && (startsWith(github.ref, 'refs/tags/v') || startsWith(github.event.inputs.release_tag, 'v') || startsWith(github.event.inputs.ref, 'v') || startsWith(github.event.inputs.ref, 'refs/tags/v')) }}
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.publish_pypi == 'true' && (startsWith(github.ref, 'refs/tags/v') || startsWith(github.event.inputs.ref, 'v') || startsWith(github.event.inputs.ref, 'refs/tags/v')) }}
     runs-on: ubuntu-latest
     needs:
       - publish-pypi
@@ -1145,7 +792,7 @@ jobs:
       - name: Resolve sync tag
         shell: bash
         run: |
-          SYNC_TAG="${{ github.event.inputs.release_tag || github.event.inputs.ref || github.ref_name }}"
+          SYNC_TAG="${{ github.event.inputs.ref || github.ref_name }}"
           SYNC_TAG="${SYNC_TAG#refs/tags/}"
           if [[ -z "$SYNC_TAG" || ! "$SYNC_TAG" =~ ^v ]]; then
             echo "Invalid sync tag for PyPI publish: '$SYNC_TAG'"
@@ -1163,13 +810,13 @@ jobs:
       - name: Commit and push changes
         shell: bash
         run: |
-          if git diff --quiet -- pyproject.toml Cargo.toml launcher/Cargo.toml python/janusx/script/JanusX.py bioconda-recipes/recipes/janusx/meta.yaml bioconda-recipes/recipes/janusx-localcheck/meta.yaml; then
+          if git diff --quiet -- pyproject.toml Cargo.toml python/janusx/script/JanusX.py bioconda-recipes/recipes/janusx/meta.yaml bioconda-recipes/recipes/janusx-localcheck/meta.yaml; then
             echo "No version/build-date changes to commit."
             exit 0
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add pyproject.toml Cargo.toml launcher/Cargo.toml python/janusx/script/JanusX.py bioconda-recipes/recipes/janusx/meta.yaml bioconda-recipes/recipes/janusx-localcheck/meta.yaml
+          git add pyproject.toml Cargo.toml python/janusx/script/JanusX.py bioconda-recipes/recipes/janusx/meta.yaml bioconda-recipes/recipes/janusx-localcheck/meta.yaml
           git commit -m "chore(release): sync version from ${SYNC_TAG}"
           git pull --rebase origin "${{ github.event.repository.default_branch }}"
           git push origin HEAD:"${{ github.event.repository.default_branch }}"

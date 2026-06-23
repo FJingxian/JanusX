@@ -1126,6 +1126,37 @@ patch_rmvp_fastlmm_ll_if_needed <- function() {
   TRUE
 }
 
+patch_rmvp_farmcpu_zero_p_guard_if_needed <- function() {
+  ns <- asNamespace("rMVP")
+  if (!exists("MVP.FarmCPU", where = ns, inherits = FALSE)) {
+    return(FALSE)
+  }
+  original <- get("MVP.FarmCPU", envir = ns)
+  body_text <- paste(deparse(body(original)), collapse = "\n")
+  needle <- "P[P == 0] <- min(P[P != 0], na.rm = TRUE) * 0.01"
+  if (!grepl(needle, body_text, fixed = TRUE)) {
+    return(FALSE)
+  }
+  replacement <- paste(
+    "zero_idx <- which(P == 0)",
+    "if (length(zero_idx)) {",
+    "    p_nonzero <- P[is.finite(P) & P != 0]",
+    "    if (length(p_nonzero)) {",
+    "        P[zero_idx] <- min(p_nonzero, na.rm = TRUE) * 0.01",
+    "    }",
+    "}",
+    sep = "\n"
+  )
+  patched_body <- gsub(needle, replacement, body_text, fixed = TRUE)
+  patched <- original
+  body(patched) <- parse(text = patched_body)[[1]]
+  environment(patched) <- environment(original)
+  unlockBinding("MVP.FarmCPU", ns)
+  on.exit(lockBinding("MVP.FarmCPU", ns), add = TRUE)
+  assign("MVP.FarmCPU", patched, envir = ns)
+  TRUE
+}
+
 write_meta <- function(meta_file, exit_code, pseudo_qtn, inner_log, note, pseudo_qtn_metric) {
   meta <- data.frame(
     key = c("exit_code", "pseudo_qtn", "pseudo_qtn_metric", "inner_log", "note"),
@@ -1197,6 +1228,9 @@ if (patch_rmvp_fastlmm_ll_if_needed()) {
 }
 if (patch_rmvp_farmcpu_burger_if_needed()) {
   cat("[INFO] Patched rMVP::FarmCPU.Burger for 1/2-column FaST-LMM pseudoQTN compatibility.\n")
+}
+if (patch_rmvp_farmcpu_zero_p_guard_if_needed()) {
+  cat("[INFO] Patched rMVP::MVP.FarmCPU zero-P fallback to avoid empty min() warnings.\n")
 }
 
 status <- 0L

@@ -1022,8 +1022,32 @@ subset_geno_for_markers <- function(geno, marker_idx0, n_markers, cache_prefix, 
       call. = FALSE
     )
   }
+  sub_mat <- if (marker_by_col) {
+    geno[, idx, drop = FALSE]
+  } else {
+    geno[idx, , drop = FALSE]
+  }
+  cache_dir <- dirname(cache_prefix)
+  dir.create(cache_dir, recursive = TRUE, showWarnings = FALSE)
+  backingfile <- paste0(basename(cache_prefix), ".", label, ".geno.bin")
+  descriptorfile <- paste0(basename(cache_prefix), ".", label, ".geno.desc")
+  bin_path <- file.path(cache_dir, backingfile)
+  desc_path <- file.path(cache_dir, descriptorfile)
+  if (file.exists(bin_path)) unlink(bin_path, force = TRUE)
+  if (file.exists(desc_path)) unlink(desc_path, force = TRUE)
+  bm <- bigmemory::filebacked.big.matrix(
+    nrow = nrow(sub_mat),
+    ncol = ncol(sub_mat),
+    type = "char",
+    backingfile = backingfile,
+    backingpath = cache_dir,
+    descriptorfile = descriptorfile,
+    dimnames = c(NULL, NULL)
+  )
+  bm[, ] <- sub_mat[, ]
+  flush(bm)
   list(
-    geno = geno,
+    geno = bm,
     marker_by_col = marker_by_col,
     kept_idx0 = idx0
   )
@@ -1273,7 +1297,6 @@ tryCatch(
       stop("rMVP map cache must contain at least SNP/CHROM/POS columns.", call. = FALSE)
     }
     map_out <- as.data.frame(map, stringsAsFactors = FALSE)
-    map_farmcpu_idx0 <- NULL
     marker_manifest_is_identity <- FALSE
     if (nzchar(marker_manifest_path)) {
       if (!file.exists(marker_manifest_path)) {
@@ -1295,23 +1318,22 @@ tryCatch(
         stop("Marker manifest is empty after parsing `row_idx0`.", call. = FALSE)
       }
       cat("[INFO] Applying JanusX marker manifest:", marker_manifest_path, "kept=", length(marker_idx0), "\n")
-      marker_subset <- subset_geno_for_markers(
-        geno = geno,
-        marker_idx0 = marker_idx0,
-        n_markers = nrow(map_out),
-        cache_prefix = cache_prefix,
-        label = "farmcpu_markers"
-      )
-      geno <- marker_subset$geno
-      map_farmcpu_idx0 <- as.integer(marker_subset$kept_idx0)
-      map_out <- map_out[marker_subset$kept_idx0 + 1L, , drop = FALSE]
-      rownames(map_out) <- NULL
       marker_manifest_is_identity <-
-        length(map_farmcpu_idx0) == nrow(map) &&
-        all(map_farmcpu_idx0 == (seq_len(nrow(map)) - 1L))
+        length(marker_idx0) == nrow(map) &&
+        all(marker_idx0 == (seq_len(nrow(map)) - 1L))
       if (marker_manifest_is_identity) {
-        cat("[INFO] Marker manifest is identity on the current rMVP cache; using direct FarmCPU map without mrk_idx.\n")
-        map_farmcpu_idx0 <- NULL
+        cat("[INFO] Marker manifest is identity on the current rMVP cache; using direct FarmCPU cache without marker subsetting.\n")
+      } else {
+        marker_subset <- subset_geno_for_markers(
+          geno = geno,
+          marker_idx0 = marker_idx0,
+          n_markers = nrow(map_out),
+          cache_prefix = cache_prefix,
+          label = "farmcpu_markers"
+        )
+        geno <- marker_subset$geno
+        map_out <- map_out[marker_subset$kept_idx0 + 1L, , drop = FALSE]
+        rownames(map_out) <- NULL
       }
     }
     # rMVP::MVP.FarmCPU expects only SNP/CHROM/POS here; passing A1/A2 shifts the internal P column.
@@ -1364,8 +1386,7 @@ tryCatch(
     farmcpu_supports_ind_idx <- function_has_formal(farmcpu_fun, "ind_idx")
     geno_farmcpu <- geno
     ind_idx_farmcpu <- ind_idx
-    mrk_idx_farmcpu <- if (is.null(map_farmcpu_idx0)) NULL else as.integer(map_farmcpu_idx0 + 1L)
-    marker_by_col_farmcpu <- tryCatch(as.integer(ncol(geno)) == nrow(map), error = function(e) TRUE)
+    marker_by_col_farmcpu <- tryCatch(as.integer(ncol(geno)) == nrow(map_out), error = function(e) TRUE)
     if (!farmcpu_supports_ind_idx) {
       cat("[INFO] MVP.FarmCPU does not expose ind_idx; keeping original big.matrix and carrying explicit matched sample indices.\n")
       subset_res <- subset_geno_for_individuals(
@@ -1384,17 +1405,17 @@ tryCatch(
     marker_freq <- compute_marker_freq(
       geno_farmcpu,
       ind_idx_farmcpu,
-      mrk_idx_farmcpu,
+      NULL,
       threads,
       max_line,
-      nrow(map)
+      nrow(map_out)
     )
     if (!is.null(npc_farmcpu) && npc_farmcpu > 0L) {
       kin_args <- list(
         M = geno_farmcpu,
         maxLine = max_line,
         ind_idx = ind_idx_farmcpu,
-        mrk_idx = mrk_idx_farmcpu,
+        mrk_idx = NULL,
         mrk_freq = marker_freq,
         mrk_bycol = marker_by_col_farmcpu,
         cpu = threads,
@@ -1411,10 +1432,10 @@ tryCatch(
     farmcpu_args <- list(
       phe = phe,
       geno = geno_farmcpu,
-      map = if (is.null(mrk_idx_farmcpu)) map_farmcpu else as.data.frame(map, stringsAsFactors = FALSE)[, seq_len(3L), drop = FALSE],
+      map = map_farmcpu,
       CV = CV_farmcpu,
       ind_idx = ind_idx_farmcpu,
-      mrk_idx = mrk_idx_farmcpu,
+      mrk_idx = NULL,
       P = NULL,
       method.sub = "reward",
       method.sub.final = "reward",

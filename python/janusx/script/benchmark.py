@@ -1048,6 +1048,9 @@ subset_geno_for_markers <- function(geno, marker_idx0, n_markers, cache_prefix, 
     descriptorfile = descriptorfile,
     dimnames = c(NULL, NULL)
   )
+  old_typecast_warn <- getOption("bigmemory.typecast.warning")
+  options(bigmemory.typecast.warning = FALSE)
+  on.exit(options(bigmemory.typecast.warning = old_typecast_warn), add = TRUE)
   chunk <- 1024L
   if (marker_by_col) {
     starts <- seq.int(1L, length(idx), by = chunk)

@@ -447,10 +447,11 @@ jobs:
           "$PY" -m pip install --upgrade pip
           # Install with dependencies to cover real runtime paths.
           "$PY" -m pip install --force-reinstall dist/*.whl
-          JX_GGVAL_MODE=smoke \
-          JX_GGVAL_THREADS=2 \
-          JX_GGVAL_CV=2 \
-          bash scripts/ggval.sh
+          "$PY" scripts/ggval.py \
+            --mode smoke \
+            --threads 2 \
+            --cv 2 \
+            --no-backend-thread-checks
 
       - name: Verify macOS wheel links OpenBLAS only
         if: ${{ matrix.platform == 'macos' && matrix.blas_backend == 'openblas' }}

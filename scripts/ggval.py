@@ -2141,6 +2141,14 @@ def parse_args() -> argparse.Namespace:
         help="Skip postGS validation in full mode.",
     )
     parser.add_argument(
+        "--no-backend-thread-checks",
+        action="store_true",
+        help=(
+            "Skip backend report and 1-core/all-core timing checks after "
+            "the main smoke/full validation flow."
+        ),
+    )
+    parser.add_argument(
         "--testHE",
         "--test-he",
         dest="test_he",
@@ -2293,12 +2301,16 @@ def main() -> int:
         special_done += 1
         report_special_progress(special_done, special_total, "PCG")
         ran_special = True
+    run_backend_checks = not bool(args.no_backend_thread_checks)
+
     if not ran_special and args.mode == "smoke":
         smoke_flow(outdir, logdir, args.threads, args.cv)
-        backend_thread_checks(outdir, bench_threads=int(args.bench_threads))
+        if run_backend_checks:
+            backend_thread_checks(outdir, bench_threads=int(args.bench_threads))
     elif not ran_special:
         full_flow(outdir, logdir, postgs_enabled=not args.no_postgs)
-        backend_thread_checks(outdir, bench_threads=int(args.bench_threads))
+        if run_backend_checks:
+            backend_thread_checks(outdir, bench_threads=int(args.bench_threads))
 
     step("Validation completed")
     if args.test_he or args.test_pcg:

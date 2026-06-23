@@ -377,12 +377,6 @@ fn configure_kmc_build(build: &mut cc::Build, compat_include: &Path, kmc_src_dir
 fn compile_kmc_arch_sources(compat_include: &Path, kmc_src_dir: &Path, arch_sources: &[PathBuf]) {
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     if target_arch == "aarch64" {
-        if let Some(src) = arch_sources.first() {
-            let mut build = cc::Build::new();
-            configure_kmc_build(&mut build, compat_include, kmc_src_dir);
-            build.file(src);
-            build.compile("jx_kmc_wrapper_raduls_neon");
-        }
         return;
     }
     if target_arch != "x86_64" && target_arch != "x86" {
@@ -438,6 +432,7 @@ fn compile_kmc_wrapper() {
         .join("kmc_wrapper.cpp");
     let common_sources = kmc_common_source_files(&kmc_src_dir);
     let arch_sources = kmc_arch_source_files(&kmc_src_dir);
+    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     for src in common_sources.iter().chain(arch_sources.iter()) {
         println!("cargo:rerun-if-changed={}", src.to_string_lossy());
     }
@@ -447,6 +442,11 @@ fn compile_kmc_wrapper() {
     build.file(&wrapper_cpp);
     for src in common_sources.iter() {
         build.file(src);
+    }
+    if target_arch == "aarch64" {
+        for src in arch_sources.iter() {
+            build.file(src);
+        }
     }
     build.compile("jx_kmc_wrapper");
     compile_kmc_arch_sources(&compat_include, &kmc_src_dir, &arch_sources);

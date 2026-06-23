@@ -428,6 +428,7 @@ fn compile_kmc_arch_sources(compat_include: &Path, kmc_src_dir: &Path, arch_sour
 
 fn compile_kmc_wrapper() {
     println!("cargo:rerun-if-env-changed=JANUSX_KMC_SRC");
+    println!("cargo:rerun-if-env-changed=JANUSX_ZLIB_LIB");
     println!("cargo:rerun-if-env-changed=JANUSX_ZLIB_LIB_DIR");
     println!("cargo:rerun-if-env-changed=VCPKG_LIB_DIR");
     println!("cargo:rerun-if-env-changed=OPENBLAS_LIB_DIR");
@@ -664,6 +665,48 @@ fn windows_kmc_zlib_probe_dirs() -> Vec<PathBuf> {
     unique_existing_dirs(out)
 }
 
+fn windows_find_kmc_zlib_candidate() -> Option<PathBuf> {
+    if let Some(raw) = env::var_os("JANUSX_ZLIB_LIB") {
+        let cand = PathBuf::from(raw);
+        if cand.is_file() {
+            return Some(cand);
+        }
+    }
+
+    let preferred_names = ["zlibstatic.lib", "zlib.lib", "zlib1.lib", "z.lib"];
+    for dir in windows_kmc_zlib_probe_dirs() {
+        for name in preferred_names {
+            let cand = dir.join(name);
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let Some(name) = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_ascii_lowercase())
+            else {
+                continue;
+            };
+            if !name.ends_with(".lib") {
+                continue;
+            }
+            if name == "z.lib" || name.starts_with("zlib") {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
 fn try_link_windows_kmc_zlib(target_arch: &str, kmc_src_dir: &Path) -> bool {
     let vendored_zlib_static = kmc_src_dir
         .join("kmc_core")
@@ -681,22 +724,17 @@ fn try_link_windows_kmc_zlib(target_arch: &str, kmc_src_dir: &Path) -> bool {
         return true;
     }
 
-    for dir in windows_kmc_zlib_probe_dirs() {
-        for lib_name in ["zlibstatic", "zlib", "z"] {
-            let cand = dir.join(format!("{lib_name}.lib"));
-            if !cand.is_file() {
-                continue;
-            }
-            println!("cargo:rustc-link-search=native={}", dir.to_string_lossy());
-            println!("cargo:rustc-link-lib=static={lib_name}");
-            emit_verbose_note(format!(
-                "KMC zlib linked from {} as {} for target arch {}",
-                dir.to_string_lossy(),
-                lib_name,
-                target_arch
-            ));
-            return true;
+    if let Some(cand) = windows_find_kmc_zlib_candidate() {
+        if let Some(parent) = cand.parent() {
+            println!("cargo:rustc-link-search=native={}", parent.to_string_lossy());
         }
+        println!("cargo:rustc-link-arg={}", cand.to_string_lossy());
+        emit_verbose_note(format!(
+            "KMC zlib linked from {} for target arch {}",
+            cand.to_string_lossy(),
+            target_arch
+        ));
+        return true;
     }
 
     false

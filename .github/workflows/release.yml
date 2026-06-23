@@ -280,6 +280,10 @@ jobs:
 
           $installed = Join-Path $vcpkgRoot "installed\$triplet"
           $binDir = Join-Path $installed "bin"
+          $zlibLib = Get-ChildItem -Path "$installed\lib" -Filter "z*.lib" -File | Select-Object -First 1
+          if (-not $zlibLib) {
+            throw "No zlib .lib found under $installed\\lib"
+          }
           if (Test-Path $binDir) {
             "OPENBLAS_BIN_DIR=$binDir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           }
@@ -287,6 +291,7 @@ jobs:
           "OPENBLAS_INCLUDE_DIR=$installed\include" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "VCPKG_LIB_DIR=$installed\lib" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "JANUSX_ZLIB_LIB_DIR=$installed\lib" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "JANUSX_ZLIB_LIB=$($zlibLib.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Build wheels (Linux)
         if: ${{ matrix.platform == 'linux' }}

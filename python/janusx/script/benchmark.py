@@ -1274,6 +1274,7 @@ tryCatch(
     }
     map_out <- as.data.frame(map, stringsAsFactors = FALSE)
     map_farmcpu_idx0 <- NULL
+    marker_manifest_is_identity <- FALSE
     if (nzchar(marker_manifest_path)) {
       if (!file.exists(marker_manifest_path)) {
         stop(sprintf("Marker manifest not found: %s", marker_manifest_path), call. = FALSE)
@@ -1305,6 +1306,13 @@ tryCatch(
       map_farmcpu_idx0 <- as.integer(marker_subset$kept_idx0)
       map_out <- map_out[marker_subset$kept_idx0 + 1L, , drop = FALSE]
       rownames(map_out) <- NULL
+      marker_manifest_is_identity <-
+        length(map_farmcpu_idx0) == nrow(map) &&
+        all(map_farmcpu_idx0 == (seq_len(nrow(map)) - 1L))
+      if (marker_manifest_is_identity) {
+        cat("[INFO] Marker manifest is identity on the current rMVP cache; using direct FarmCPU map without mrk_idx.\n")
+        map_farmcpu_idx0 <- NULL
+      }
     }
     # rMVP::MVP.FarmCPU expects only SNP/CHROM/POS here; passing A1/A2 shifts the internal P column.
     map_farmcpu <- map_out[, seq_len(3L), drop = FALSE]

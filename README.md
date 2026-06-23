@@ -35,7 +35,7 @@ JanusX (Joint Association and Novel Utility for Selection) is a GWAS and genomic
 
 ## Installation
 
-### Quick start: Python with uv (Recommend)
+### Quick installation: Python with uv (Recommend)
 
 * Linux | MacOS
 ```bash
@@ -43,7 +43,8 @@ curl -fsSL https://raw.githubusercontent.com/FJingxian/JanusX/main/scripts/insta
 ```
 
 * Windows
-```
+```powershell
+Set-ExecutionPolicy RemoteSigned -scope CurrentUser
 irm https://raw.githubusercontent.com/FJingxian/JanusX/main/scripts/install.ps1 | iex
 ```
 

@@ -21,4 +21,4 @@ uv pip install --python "$ENV_PATH/bin/python" $PACKAGE >/dev/null 2>&1
 echo ""
 echo "Done."
 echo "Script:"
-echo "\033[1;32m$ENV_PATH/bin/jx\033[0m"
+echo "$ENV_PATH/bin/jx"

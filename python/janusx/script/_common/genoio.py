@@ -1213,7 +1213,7 @@ def prepare_packed_stats_ctx_from_plink(
     """
     Prepare packed BED filter metadata without attaching the packed payload.
     """
-    return load_or_build_packed_meta_dom(
+    return load_or_build_packed_meta_basic(
         str(normalize_plink_prefix(prefix)),
         maf=float(maf),
         missing_rate=float(missing_rate),

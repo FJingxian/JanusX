@@ -36,10 +36,12 @@ import shutil
 import subprocess
 import sys
 import time
+import gc
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
+import numpy as np
 import pandas as pd
 
 
@@ -142,8 +144,13 @@ def _build_benchmark_marker_manifest(
     active_row_idx = meta_ctx.get("active_row_idx", None)
     if active_row_idx is None:
         raise RuntimeError("Packed stats context missing active_row_idx for benchmark marker manifest.")
-    active = [int(x) for x in pd.Series(active_row_idx).astype("int64").tolist()]
-    return active, int(len(sample_ids))
+    active = np.ascontiguousarray(np.asarray(active_row_idx, dtype=np.int64).reshape(-1), dtype=np.int64)
+    n_samples = int(len(sample_ids))
+    del active_row_idx
+    del meta_ctx
+    del sample_ids
+    gc.collect()
+    return active.tolist(), n_samples
 
 
 def _write_benchmark_marker_manifest(
@@ -1022,11 +1029,6 @@ subset_geno_for_markers <- function(geno, marker_idx0, n_markers, cache_prefix, 
       call. = FALSE
     )
   }
-  sub_mat <- if (marker_by_col) {
-    geno[, idx, drop = FALSE]
-  } else {
-    geno[idx, , drop = FALSE]
-  }
   cache_dir <- dirname(cache_prefix)
   dir.create(cache_dir, recursive = TRUE, showWarnings = FALSE)
   backingfile <- paste0(basename(cache_prefix), ".", label, ".geno.bin")
@@ -1035,16 +1037,35 @@ subset_geno_for_markers <- function(geno, marker_idx0, n_markers, cache_prefix, 
   desc_path <- file.path(cache_dir, descriptorfile)
   if (file.exists(bin_path)) unlink(bin_path, force = TRUE)
   if (file.exists(desc_path)) unlink(desc_path, force = TRUE)
+  target_nrow <- if (marker_by_col) geno_nr else length(idx)
+  target_ncol <- if (marker_by_col) length(idx) else geno_nc
   bm <- bigmemory::filebacked.big.matrix(
-    nrow = nrow(sub_mat),
-    ncol = ncol(sub_mat),
+    nrow = target_nrow,
+    ncol = target_ncol,
     type = "char",
     backingfile = backingfile,
     backingpath = cache_dir,
     descriptorfile = descriptorfile,
     dimnames = c(NULL, NULL)
   )
-  bm[, ] <- sub_mat[, ]
+  chunk <- 1024L
+  if (marker_by_col) {
+    starts <- seq.int(1L, length(idx), by = chunk)
+    for (start in starts) {
+      end <- min(length(idx), start + chunk - 1L)
+      src <- idx[start:end]
+      dst <- start:end
+      bm[, dst] <- geno[, src, drop = FALSE]
+    }
+  } else {
+    starts <- seq.int(1L, length(idx), by = chunk)
+    for (start in starts) {
+      end <- min(length(idx), start + chunk - 1L)
+      src <- idx[start:end]
+      dst <- start:end
+      bm[dst, ] <- geno[src, , drop = FALSE]
+    }
+  }
   flush(bm)
   list(
     geno = bm,

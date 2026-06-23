@@ -1060,16 +1060,16 @@ fn resolve_no_progress_timeout(step: &PipelineStep, opts: &PipelineOptions) -> O
     Some(Duration::from_secs(sec))
 }
 
-fn set_script_executable(path: &Path) -> Result<(), String> {
+fn set_script_executable(_path: &Path) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(path)
-            .map_err(|e| format!("Failed to stat {}: {e}", path.display()))?
+        let mut perms = fs::metadata(_path)
+            .map_err(|e| format!("Failed to stat {}: {e}", _path.display()))?
             .permissions();
         perms.set_mode(0o755);
-        fs::set_permissions(path, perms)
-            .map_err(|e| format!("Failed to chmod {}: {e}", path.display()))?;
+        fs::set_permissions(_path, perms)
+            .map_err(|e| format!("Failed to chmod {}: {e}", _path.display()))?;
     }
     Ok(())
 }

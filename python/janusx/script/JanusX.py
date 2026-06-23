@@ -98,7 +98,7 @@ _MODULE_NAMES = [
     "gwas", "postgwas", "postgarfield", "postbsa",
     "garfield", "grm", "pca", "gstats", "gs", "reml", "postgs",
     "sim", "simulation", "benchmark", "gblupbench", "bayesbench", "garfieldbench", "adamixture", "tree", "gformat", "gmerge", "hybrid", "webui",
-    "fastq2vcf", "fastq2count", "kmer", "kmerge", "kstats", "view", "treeplot",
+    "fastq2vcf", "fastq2count", "kmer", "kmerge", "kstats", "view", "treeplot", "refcheck",
 ]
 _SCRIPT_MODULE_ALIASES = {
     # Keep CLI surface stable (`jx gwas` / `jx gs`) while routing heavy

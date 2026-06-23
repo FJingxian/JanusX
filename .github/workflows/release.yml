@@ -273,6 +273,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             throw "vcpkg install openblas[threads] failed for triplet $triplet"
           }
+          & "$vcpkgRoot\vcpkg.exe" install "zlib:$triplet"
+          if ($LASTEXITCODE -ne 0) {
+            throw "vcpkg install zlib failed for triplet $triplet"
+          }
 
           $installed = Join-Path $vcpkgRoot "installed\$triplet"
           $binDir = Join-Path $installed "bin"
@@ -281,6 +285,8 @@ jobs:
           }
           "OPENBLAS_LIB_DIR=$installed\lib" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "OPENBLAS_INCLUDE_DIR=$installed\include" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "VCPKG_LIB_DIR=$installed\lib" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "JANUSX_ZLIB_LIB_DIR=$installed\lib" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Build wheels (Linux)
         if: ${{ matrix.platform == 'linux' }}

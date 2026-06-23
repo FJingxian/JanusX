@@ -428,6 +428,11 @@ fn compile_kmc_arch_sources(compat_include: &Path, kmc_src_dir: &Path, arch_sour
 
 fn compile_kmc_wrapper() {
     println!("cargo:rerun-if-env-changed=JANUSX_KMC_SRC");
+    println!("cargo:rerun-if-env-changed=JANUSX_ZLIB_LIB_DIR");
+    println!("cargo:rerun-if-env-changed=VCPKG_LIB_DIR");
+    println!("cargo:rerun-if-env-changed=OPENBLAS_LIB_DIR");
+    println!("cargo:rerun-if-env-changed=LIBRARY_LIB");
+    println!("cargo:rerun-if-env-changed=LIB");
     println!("cargo:rerun-if-changed=src/kmer/ffi/kmc_wrapper.cpp");
     println!("cargo:rerun-if-changed=src/kmer/ffi/kmc_wrapper.h");
 
@@ -442,6 +447,7 @@ fn compile_kmc_wrapper() {
     let common_sources = kmc_common_source_files(&kmc_src_dir);
     let arch_sources = kmc_arch_source_files(&kmc_src_dir);
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     for src in common_sources.iter().chain(arch_sources.iter()) {
         println!("cargo:rerun-if-changed={}", src.to_string_lossy());
     }
@@ -460,20 +466,8 @@ fn compile_kmc_wrapper() {
     build.compile("jx_kmc_wrapper");
     compile_kmc_arch_sources(&compat_include, &kmc_src_dir, &arch_sources);
 
-    if cfg!(target_os = "windows") {
-        let zlib_static = kmc_src_dir
-            .join("kmc_core")
-            .join("libs")
-            .join("zlibstat.lib");
-        if zlib_static.is_file() {
-            if let Some(parent) = zlib_static.parent() {
-                println!(
-                    "cargo:rustc-link-search=native={}",
-                    parent.to_string_lossy()
-                );
-            }
-            println!("cargo:rustc-link-lib=static=zlibstat");
-        } else {
+    if target_os == "windows" {
+        if !try_link_windows_kmc_zlib(&target_arch, &kmc_src_dir) {
             println!("cargo:rustc-link-lib=zlib");
         }
     } else {
@@ -634,6 +628,78 @@ fn path_env_dirs(names: &[&str]) -> Vec<PathBuf> {
         }
     }
     out
+}
+
+fn unique_existing_dirs(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+    for path in paths {
+        if !path.is_dir() {
+            continue;
+        }
+        let canon = fs::canonicalize(&path).unwrap_or(path.clone());
+        let key = canon.to_string_lossy().to_ascii_lowercase();
+        if seen.iter().any(|s| s == &key) {
+            continue;
+        }
+        seen.push(key);
+        out.push(canon);
+    }
+    out
+}
+
+fn windows_kmc_zlib_probe_dirs() -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    for name in [
+        "JANUSX_ZLIB_LIB_DIR",
+        "VCPKG_LIB_DIR",
+        "OPENBLAS_LIB_DIR",
+        "LIBRARY_LIB",
+    ] {
+        if let Some(dir) = env::var_os(name).map(PathBuf::from) {
+            out.push(dir);
+        }
+    }
+    out.extend(path_env_dirs(&["LIB"]));
+    unique_existing_dirs(out)
+}
+
+fn try_link_windows_kmc_zlib(target_arch: &str, kmc_src_dir: &Path) -> bool {
+    let vendored_zlib_static = kmc_src_dir
+        .join("kmc_core")
+        .join("libs")
+        .join("zlibstat.lib");
+
+    if (target_arch == "x86_64" || target_arch == "x86") && vendored_zlib_static.is_file() {
+        if let Some(parent) = vendored_zlib_static.parent() {
+            println!(
+                "cargo:rustc-link-search=native={}",
+                parent.to_string_lossy()
+            );
+        }
+        println!("cargo:rustc-link-lib=static=zlibstat");
+        return true;
+    }
+
+    for dir in windows_kmc_zlib_probe_dirs() {
+        for lib_name in ["zlibstatic", "zlib", "z"] {
+            let cand = dir.join(format!("{lib_name}.lib"));
+            if !cand.is_file() {
+                continue;
+            }
+            println!("cargo:rustc-link-search=native={}", dir.to_string_lossy());
+            println!("cargo:rustc-link-lib=static={lib_name}");
+            emit_verbose_note(format!(
+                "KMC zlib linked from {} as {} for target arch {}",
+                dir.to_string_lossy(),
+                lib_name,
+                target_arch
+            ));
+            return true;
+        }
+    }
+
+    false
 }
 
 fn file_name_lower(path: &Path) -> Option<String> {

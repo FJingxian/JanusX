@@ -35,29 +35,25 @@ JanusX (Joint Association and Novel Utility for Selection) is a GWAS and genomic
 
 ## Installation
 
-### Option A: Python package install (Recommend)
+### Quick start: Python with uv (Recommend)
+
+* Linux | MacOS
+```bash
+curl -fsSL https://raw.githubusercontent.com/FJingxian/JanusX/main/scripts/install.sh | sh
+```
+
+* Windows
+```
+irm https://raw.githubusercontent.com/FJingxian/JanusX/main/scripts/install.ps1 | iex
+```
+
+### Option A: Python package install
 
 ```bash
 pip install janusx==1.0.24
 ```
 
-### Option B: launcher install
-
-Download installer assets from [Releases](https://github.com/FJingxian/JanusX/releases):
-
-Then run installer:
-
-```bash
-# Linux
-./JanusX-vX.Y.Z-linux-x86_64.run
-
-# macOS
-./JanusX-vX.Y.Z-darwin-universal.command
-```
-
-On Windows, double click or run the `.exe` installer.
-
-### Option C: Conda / Bioconda
+### Option B: Conda / Bioconda
 
 Recommended Bioconda channel order:
 
@@ -76,9 +72,11 @@ conda create -n janusx \
 
 ```bash
 # Estimate variance once in NULL model, similar with EMMAX. (Fast, recommand)
-jx gwas -vcf example/mouse_hs1940.vcf.gz -p example/mouse_hs1940.pheno -fastlmm -o test
+jx gwas -vcf example/mouse_hs1940.vcf.gz -p example/mouse_hs1940.pheno -fvlmm -o test
 # Estimate variance for every snp, similar with GEMMA. (Exact)
 jx gwas -vcf example/mouse_hs1940.vcf.gz -p example/mouse_hs1940.pheno -lmm -o test
+# Linear mixed model with sparse GRM, similar with fastGWA. (Fast, grammar gamma)
+jx gwas -vcf example/mouse_hs1940.vcf.gz -p example/mouse_hs1940.pheno -splmm-approx -o test
 # FarmCPU (Fast, and more sites)
 jx gwas -vcf example/mouse_hs1940.vcf.gz -p example/mouse_hs1940.pheno -farmcpu -o test
 ```
@@ -100,49 +98,45 @@ jx postgwas -gwasfile test/mouse_hs1940.test0.add.lmm.tsv -manh -qq -thr 1e-6 -o
 ### 3) Genomic selection
 
 ```bash
-# GBLUP is a kernel method for small samples or small sites
-# (n<15,000 or m<15,000>)
-jx gs -vcf example/mouse_hs1940.vcf.gz -p example/mouse_hs1940.pheno -GBLUP -cv 5 -o testgs
-# rrBLUP is a linear model designed for population with huge size
-# (UKB, n~500,000 and m~500,000).
-jx gs -vcf example/mouse_hs1940.vcf.gz -p example/mouse_hs1940.pheno -rrBLUP -cv 5 -o testgs
+# BLUP method
+# n≤15,000 GBLUP
+# n>15,000 & m≤15,000 rrBLUP
+# n>15,000 & m>15,000 rrBLUP with PCG (Jacobi)
+jx gs -vcf example/mouse_hs1940.vcf.gz -p example/mouse_hs1940.pheno -BLUP -BayesA -BayesB -BayesCpi -o test -cv 5
 ```
 
 ```text
 * Genomic Selection for trait: test0
 Train size: 1410, Test size: 530, EffSNPs: 8960
-✔︎ GBLUP ...Finished [3.5s]
-✔︎ adBLUP ...Finished [10.1s]
-✔︎ BayesA ...Finished [32.6s]
-✔︎ BayesB ...Finished [34.2s]
-✔︎ BayesCpi ...Finished [32.0s]
-✔︎ RF ...Finished [1m46s]
-✔︎ XGB ...Finished [9m27s]
-✔︎ SVM ...Finished [2m05s]
-✔︎ ENET ...Finished [9.7s]
-Fold Method     Pearsonr Spearmanr     R² h²/PVE time(secs)
-   1 GBLUP         0.704     0.671  0.493  0.610      0.531
-   1 adBLUP        0.717     0.679  0.512  0.694      2.341
-   1 BayesA        0.721     0.695  0.514  0.714      5.307
-   1 BayesB        0.722     0.693  0.517  0.667      5.522
-   1 BayesCpi      0.699     0.671  0.476  0.672      4.971
-   1 RF            0.709     0.702  0.471  0.468      3.055
-   1 XGB           0.754     0.733  0.564  0.563      5.231
-   1 SVM           0.703     0.664  0.490  0.485      9.027
-   1 ENET          0.720     0.704  0.514  0.517      0.274
+** BLUP
+✔︎ Cross-validation ...Finished [0.8s]
+✔︎ Fitting ...Finished [0.3s]
+✔︎ Predicting ...Finished [0.0s]
+** BayesA
+✔︎ Cross-validation ...Finished [17.9s]
+✔︎ Fitting ...Finished [4.1s]
+✔︎ Predicting ...Finished [0.0s]
+...
+------------------------------------------------------------
+Fold Method     Pearsonr Spearmanr R2     time(s)  Best
+1    BLUP       0.704    0.675     0.493  0.198    
+1    BayesA     0.709    0.680     0.493  3.507    
+...
+------------------------------------------------------------
 ```
 
 <p align="center">
   <img src="./doc/mouse_hs1940.test0.gs.XGB.svg" alt="gsoverview" />
 </p>
 
-**See full usages in [CLI Guide](./doc/JanusXcli.md).**
-
 ### 4) Get module help
 
 ```bash
+jx -h
 jx <module> -h
 ```
+
+**See full usages in [CLI Guide](./doc/JanusXcli.md).**
 
 ---
 
@@ -154,24 +148,24 @@ jx <module> -h
 - `pca`
 - `gwas`
 - `postgwas` (Visualization, `manh` `qq` `ldblock`)
-- `adamixture` (Optimized admixture based on [ADAMIXTURE](https://github.com/AI-sandbox/ADAMIXTURE.git))
+- `adamixture` (Based on https://github.com/AI-sandbox/ADAMIXTURE.git)
 
 **Genomic Selection (GS)**:
 
 - `gs`
-- `postgs` (Visualization, `manh` `violin` `pcctime`)
+- `postgs` (Visualization)
 - `reml` (Estimation of broaden heritability and blup values)
 
-**[GARFIELD](https://github.com/heroalone/Garfield)**:
+**GARFIELD**:
 
-- `garfield`
+- `garfield` (Based on https://github.com/heroalone/Garfield)
 - `postgarfield`
 
 **Utility**:
 
-- `hybrid` (Generate F1 genotype base on Parents)
-- `gformat` (Conversion between genotype data formats)
+- `gformat` (Conversion between genotype data formats, support fast splicing/filtering/prune)
 - `gmerge` (Merge genotype between samples)
+- `gstats` (State freq/het/missing/ldscore of genotype)
 
 ---
 

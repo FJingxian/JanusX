@@ -360,11 +360,20 @@ fn kmc_arch_source_files(kmc_src_dir: &Path) -> Vec<PathBuf> {
 }
 
 fn configure_kmc_build(build: &mut cc::Build, compat_include: &Path, kmc_src_dir: &Path) {
+    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+
     build.cpp(true).warnings(false);
     build.include(compat_include);
     build.include(kmc_src_dir);
     build.include(kmc_src_dir.join("kmc_core"));
     build.include(kmc_src_dir.join("kmc_api"));
+    // Vendored KMC detects AArch64 only via __aarch64__. MSVC ARM64 cross
+    // builds define _M_ARM64 instead, which otherwise falls through to the
+    // x86 cpuid path and fails in cpu_info.cpp.
+    if target_arch == "aarch64" && target_os == "windows" {
+        build.define("__aarch64__", None);
+    }
     build.flag_if_supported("-std=c++14");
     build.flag_if_supported("/std:c++14");
     build.flag_if_supported("-Wno-unused-parameter");

@@ -241,6 +241,7 @@ pub fn gwas_trait_model_dispatch_v2<'py>(
         let mk = raw.trim().to_ascii_lowercase();
         let norm = match mk.as_str() {
             "lm" => Some("lm"),
+            "lm2" => Some("lm2"),
             "lmm" => Some("lmm"),
             "lmm2" => Some("lmm2"),
             "fastlmm" => Some("fastlmm"),
@@ -267,6 +268,7 @@ pub fn gwas_trait_model_dispatch_v2<'py>(
         for (model_idx, model_name) in model_list.iter().enumerate() {
             let route = match model_name.as_str() {
                 "lm" => "lm_stream",
+                "lm2" => "lm2_stream",
                 "lmm" => "lmm_stream",
                 "lmm2" => "lmm2_stream",
                 "fastlmm" => "fastlmm_stream",

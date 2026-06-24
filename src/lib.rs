@@ -37,6 +37,8 @@ pub(crate) mod garfield;
 pub(crate) mod gblup;
 #[path = "stats/glm.rs"]
 mod glm;
+#[path = "stats/glm2.rs"]
+mod glm2;
 #[path = "stats/grm.rs"]
 mod grm;
 #[path = "stats/gstats.rs"]
@@ -223,6 +225,7 @@ use glm::{
     lm_block_assoc_f32, lm_block_assoc_packed, lm_block_assoc_packed_to_tsv,
     lm_stream_bed_segments_compact_to_tsv, lm_stream_bed_to_tsv,
 };
+use glm2::lm2_stream_bed_to_tsv;
 use gmerge::{convert_genotypes, merge_genotypes, PyConvertStats, PyMergeStats};
 use grm::{
     grm_bed_f64_from_meta, grm_packed_bed_f32, grm_packed_bed_f64, grm_packed_f32,
@@ -732,6 +735,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(lm_block_assoc_f32, m)?)?;
     m.add_function(wrap_pyfunction!(algwas_packed_to_tsv, m)?)?;
     m.add_function(wrap_pyfunction!(lm_stream_bed_to_tsv, m)?)?;
+    m.add_function(wrap_pyfunction!(lm2_stream_bed_to_tsv, m)?)?;
     m.add_function(wrap_pyfunction!(lm_stream_bed_segments_compact_to_tsv, m)?)?;
     m.add_function(wrap_pyfunction!(lm_block_assoc_packed, m)?)?;
     m.add_function(wrap_pyfunction!(lm_block_assoc_packed_to_tsv, m)?)?;

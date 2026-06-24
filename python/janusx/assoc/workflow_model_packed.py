@@ -3332,14 +3332,18 @@ def run_lm_stream_bed_single_entry(
     emit_trait_header: bool = True,
     chunk_size_user_set: bool = True,
     mmap_limit: bool = False,
+    model_key: str = "lm",
+    lm2_covariate_indices: Union[np.ndarray, None] = None,
 ) -> None:
-    if not hasattr(jxrs, "lm_stream_bed_to_tsv"):
+    model_key_norm = str(model_key).strip().lower()
+    rust_symbol = "lm2_stream_bed_to_tsv" if model_key_norm == "lm2" else "lm_stream_bed_to_tsv"
+    if not hasattr(jxrs, rust_symbol):
         raise RuntimeError(
-            "Rust extension missing lm_stream_bed_to_tsv. Rebuild/install JanusX extension first."
+            f"Rust extension missing {rust_symbol}. Rebuild/install JanusX extension first."
         )
     prefix = _as_plink_prefix(genofile)
     if prefix is None:
-        raise ValueError("LM rust streaming single-entry route requires PLINK BED input.")
+        raise ValueError(f"{str(model_key_norm).upper()} rust streaming single-entry route requires PLINK BED input.")
 
     process = psutil.Process()
     n_cores = detect_effective_threads()
@@ -3397,12 +3401,14 @@ def run_lm_stream_bed_single_entry(
             dtype=np.float64,
         )
 
+        model_label = str(model_key_norm).upper()
+        model_keys_for_chunk = ["lm", "lm2"] if model_key_norm == "lm2" else "lm"
         model_chunk_size = _resolve_stream_scan_chunk_size(
             int(chunk_size),
             int(n_snps),
             use_spinner=bool(use_spinner),
             n_samples_hint=int(n_idv),
-            model_keys="lm",
+            model_keys=model_keys_for_chunk,
             user_specified=bool(chunk_size_user_set),
         )
         mmap_window_mb = (
@@ -3414,16 +3420,16 @@ def run_lm_stream_bed_single_entry(
             _log_file_only(
                 logger,
                 logging.INFO,
-                f"LM auto chunk-size: {int(chunk_size)} -> {int(model_chunk_size)} "
+                f"{model_label} auto chunk-size: {int(chunk_size)} -> {int(model_chunk_size)} "
                 f"(n={int(n_idv)}).",
             )
 
         gm_tag = str(genetic_model).lower()
         pname_tag = _safe_trait_file_label(pname)
         if gm_tag == "add":
-            out_tsv = f"{outprefix}.{pname_tag}.lm.tsv"
+            out_tsv = f"{outprefix}.{pname_tag}.{model_key_norm}.tsv"
         else:
-            out_tsv = f"{outprefix}.{pname_tag}.{gm_tag}.lm.tsv"
+            out_tsv = f"{outprefix}.{pname_tag}.{gm_tag}.{model_key_norm}.tsv"
         tmp_tsv = _gwas_result_tmp_path(out_tsv)
 
         scan_threads = int(threads)
@@ -3433,18 +3439,18 @@ def run_lm_stream_bed_single_entry(
         pbar_total_hint = int(eff_snp_by_trait.get(str(pname), n_snps))
         pbar: Optional[_ProgressAdapter] = None
         if not bool(use_spinner):
-            pbar = _ProgressAdapter(
-                total=int(max(1, pbar_total_hint)),
-                desc="LM",
-                force_animate=True,
-                logger=logger,
-            )
+                pbar = _ProgressAdapter(
+                    total=int(max(1, pbar_total_hint)),
+                    desc=model_label,
+                    force_animate=True,
+                    logger=logger,
+                )
         pbar_done = 0
         warm_task: Optional[CliStatus] = None
         warm_active = False
         if bool(use_spinner):
             warm_task = CliStatus(
-                "Waiting for LM GWAS",
+                f"Waiting for {model_label} GWAS",
                 enabled=True,
                 use_process=True,
             )
@@ -3468,7 +3474,7 @@ def run_lm_stream_bed_single_entry(
                 total_use = int(max(1, t if t > 0 else pbar_total_hint))
                 pbar = _ProgressAdapter(
                     total=total_use,
-                    desc="LM",
+                    desc=model_label,
                     force_animate=True,
                     logger=logger,
                 )
@@ -3514,6 +3520,27 @@ def run_lm_stream_bed_single_entry(
                     if mmap_window_mb is not None:
                         kwargs_use["mmap_window_mb"] = int(max(1, int(mmap_window_mb)))
                     try:
+                        if model_key_norm == "lm2":
+                            if cov_all is None:
+                                raise ValueError("LM2 requires cov_all to be prepared.")
+                            if lm2_covariate_indices is None:
+                                raise ValueError(
+                                    "LM2 requires explicit interaction columns; use -lm2 0,3 style selectors or fall back to -lm."
+                                )
+                            cov_idx = np.asarray(lm2_covariate_indices, dtype=np.int64)
+                            if int(cov_idx.size) <= 0:
+                                raise ValueError(
+                                    "LM2 received an empty interaction-column set; use -lm when no interactions are requested."
+                                )
+                            return jxrs.lm2_stream_bed_to_tsv(
+                                str(prefix),
+                                y_vec,
+                                x_design,
+                                np.ascontiguousarray(cov_all[keep_idx], dtype=np.float64),
+                                cov_idx,
+                                str(tmp_tsv),
+                                **kwargs_use,
+                            )
                         return jxrs.lm_stream_bed_to_tsv(
                             str(prefix),
                             y_vec,
@@ -3540,6 +3567,27 @@ def run_lm_stream_bed_single_entry(
                                     ),
                                     use_spinner=bool(use_spinner),
                                 )
+                            if model_key_norm == "lm2":
+                                if cov_all is None:
+                                    raise ValueError("LM2 requires cov_all to be prepared.")
+                                if lm2_covariate_indices is None:
+                                    raise ValueError(
+                                        "LM2 requires explicit interaction columns; use -lm2 0,3 style selectors or fall back to -lm."
+                                    )
+                                cov_idx = np.asarray(lm2_covariate_indices, dtype=np.int64)
+                                if int(cov_idx.size) <= 0:
+                                    raise ValueError(
+                                        "LM2 received an empty interaction-column set; use -lm when no interactions are requested."
+                                    )
+                                return jxrs.lm2_stream_bed_to_tsv(
+                                    str(prefix),
+                                    y_vec,
+                                    x_design,
+                                    np.ascontiguousarray(cov_all[keep_idx], dtype=np.float64),
+                                    cov_idx,
+                                    str(tmp_tsv),
+                                    **kwargs_use,
+                                )
                             return jxrs.lm_stream_bed_to_tsv(
                                 str(prefix),
                                 y_vec,
@@ -3553,6 +3601,8 @@ def run_lm_stream_bed_single_entry(
                     kept_rows, scan_all_rows = _call_lm_stream(None)
                 except TypeError:
                     # Backward-compat fallback for older extensions that require ixx.
+                    if model_key_norm == "lm2":
+                        raise
                     ixx = _lm_precompute_ixx_qr(x_design)
                     kept_rows, scan_all_rows = _call_lm_stream(ixx)
             scan_ok = True
@@ -3586,31 +3636,31 @@ def run_lm_stream_bed_single_entry(
 
         _log_model_line(
             logger,
-            "LM",
+            str(model_key_norm).upper(),
             "single-entry rust streaming scan",
             use_spinner=bool(use_spinner),
         )
         _log_model_line(
             logger,
-            "LM",
+            str(model_key_norm).upper(),
             f"avg CPU ~ {avg_cpu:.1f}% of {n_cores} c, peak RSS ~ {peak_rss_gb:.2f} G",
             use_spinner=bool(use_spinner),
         )
         _log_file_only(
             logger,
             logging.INFO,
-            f"LM stream source SNP rows scanned: {int(scan_all_rows)}",
+            f"{str(model_key_norm).upper()} stream source SNP rows scanned: {int(scan_all_rows)}",
         )
 
         done_snps = int(kept_rows)
         if done_snps <= 0:
             _cleanup_gwas_result_tmp(tmp_tsv)
-            logger.info(f"LM: no SNPs passed filters for trait {pname}.")
+            logger.info(f"{str(model_key_norm).upper()}: no SNPs passed filters for trait {pname}.")
             eff_snp_by_trait[str(pname)] = int(done_snps)
             summary_rows.append(
                 {
                     "phenotype": str(pname),
-                    "model": "LM",
+                    "model": str(model_key_norm).upper(),
                     "nidv": int(n_idv),
                     "eff_snp": int(done_snps),
                     "pve": None,
@@ -3629,7 +3679,7 @@ def run_lm_stream_bed_single_entry(
         saved_paths.append(str(out_tsv))
         _log_model_line(
             logger,
-            "LM",
+            str(model_key_norm).upper(),
             f"Results saved to {_display_path(str(out_tsv))}",
             use_spinner=bool(use_spinner),
         )
@@ -3649,7 +3699,7 @@ def run_lm_stream_bed_single_entry(
         summary_rows.append(
             {
                 "phenotype": str(pname),
-                "model": "LM",
+                "model": str(model_key_norm).upper(),
                 "nidv": int(n_idv),
                 "eff_snp": int(done_snps),
                 "pve": None,
@@ -3666,7 +3716,7 @@ def run_lm_stream_bed_single_entry(
             done_parts.append(format_elapsed(viz_secs))
         _rich_success(
             logger,
-            f"LM ...Finished [{'/'.join(done_parts)}]",
+            f"{str(model_key_norm).upper()} ...Finished [{'/'.join(done_parts)}]",
             use_spinner=bool(use_spinner),
         )
         if multi_trait_mode:

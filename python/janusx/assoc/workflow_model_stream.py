@@ -275,6 +275,7 @@ def run_chunked_gwas_lmm_lm(
     chunk_size_user_set: bool = True,
     prefer_packed_fullrust: bool = False,
     force_model: bool = False,
+    lm2_covariate_indices: Union[np.ndarray, None] = None,
 ) -> None:
     """
     Run LM/LMM/LMM2/FastLMM/FvLMM GWAS through the maintained windowed BED path.
@@ -286,6 +287,7 @@ def run_chunked_gwas_lmm_lm(
         "lmm": LMM,
         "lmm2": LMM2,
         "lm": LM,
+        "lm2": LM,
         "fastlmm": FastLMM,
         "fvlmm": FvLMM,
     }
@@ -295,6 +297,7 @@ def run_chunked_gwas_lmm_lm(
         "lmm": "LMM",
         "lmm2": "LMM2",
         "lm": "LM",
+        "lm2": "LM2",
         "fastlmm": "FastLMM",
         "fvlmm": "FvLMM",
     }[model_key]
@@ -353,6 +356,51 @@ def run_chunked_gwas_lmm_lm(
             logger,
             logging.INFO,
             "LM route: using streaming orchestrator (windowed BED path only).",
+        )
+    if model_key == "lm2":
+        can_single_entry = (
+            _as_plink_prefix(genofile) is not None
+            and hasattr(jxrs, "lm2_stream_bed_to_tsv")
+        )
+        if can_single_entry:
+            _log_file_only(
+                logger,
+                logging.INFO,
+                "LM2 route: using rust single-entry BED streaming pipeline.",
+            )
+            run_lm_stream_bed_single_entry(
+                genofile=genofile,
+                pheno=pheno,
+                ids=ids,
+                n_snps=n_snps,
+                outprefix=outprefix,
+                maf_threshold=maf_threshold,
+                max_missing_rate=max_missing_rate,
+                genetic_model=genetic_model,
+                het_threshold=het_threshold,
+                chunk_size=chunk_size,
+                qmatrix=qmatrix,
+                cov_all=cov_all,
+                plot=plot,
+                threads=threads,
+                logger=logger,
+                use_spinner=use_spinner,
+                snps_only=bool(snps_only),
+                eff_snp_by_trait=eff_snp_by_trait,
+                summary_rows=summary_rows,
+                saved_paths=saved_paths,
+                trait_names=trait_names,
+                emit_trait_header=emit_trait_header,
+                chunk_size_user_set=bool(chunk_size_user_set),
+                mmap_limit=bool(mmap_limit),
+                model_key="lm2",
+                lm2_covariate_indices=lm2_covariate_indices,
+            )
+            return
+        _log_file_only(
+            logger,
+            logging.INFO,
+            "LM2 route: using streaming orchestrator (windowed BED path only).",
         )
     if model_key == "lmm":
         _log_file_only(

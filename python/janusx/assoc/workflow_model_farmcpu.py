@@ -41,12 +41,14 @@ from .workflow import (
     _gwas_result_tmp_path,
     _inspect_genotype_with_status,
     _load_covariates_for_models,
+    _load_pca_cache_with_ids,
     _load_phenotype_with_status,
     _log_file_only,
     _normalize_cov_inputs,
     _parse_qcov_dim,
     _pca_cache_path,
     _pca_cache_path_legacy,
+    _write_pca_cache_with_ids,
     _bim_metadata_len,
     _make_deferred_bim_metadata,
     _read_id_file,
@@ -249,7 +251,8 @@ def build_qmatrix_farmcpu(
     mmap_limit: bool = False,
     preloaded_packed: Union[dict[str, object], None] = None,
     packed_ctx_preloaded: Union[dict[str, object], None] = None,
-) -> np.ndarray:
+    return_ids: bool = False,
+) -> Union[np.ndarray, tuple[np.ndarray, np.ndarray]]:
     """
     Build or load Q matrix for FarmCPU (PCs + optional covariates).
     Note: external Q file via -q is no longer supported; pass external
@@ -277,6 +280,7 @@ def build_qmatrix_farmcpu(
         "evd_backend": "",
         "evd_secs": 0.0,
     }
+    q_ids: Union[np.ndarray, None] = None
 
     def _build_grm_from_packed_ctx_rust(
         packed_ctx_obj: dict[str, object],
@@ -482,6 +486,7 @@ def build_qmatrix_farmcpu(
 
     if q_int == 0:
         qmatrix = np.zeros((n, 0), dtype="float32")
+        q_ids = None if sid_arr is None else np.asarray(sid_arr, dtype=str)
         _emit_warning_line(
             logger,
             "PC dimension set to 0; using empty Q matrix.",
@@ -492,13 +497,9 @@ def build_qmatrix_farmcpu(
         legacy_q_path = _pca_cache_path_legacy(gfile_prefix, mgrm="1", qdim=int(q_int))
         with _cache_lock(q_path):
             if (not os.path.isfile(q_path)) and os.path.isfile(legacy_q_path):
-                try:
-                    _replace_file_with_retry(legacy_q_path, q_path)
-                    _farm_log(
-                        f"* Migrated legacy PCA cache name: {legacy_q_path} -> {q_path}"
-                    )
-                except Exception:
-                    pass
+                _farm_log(
+                    f"* Ignoring legacy PCA cache and rebuilding in new format: {legacy_q_path}"
+                )
             cache_ready = os.path.isfile(q_path)
             if cache_ready:
                 g_mtime = latest_genotype_mtime(genofile)
@@ -511,17 +512,26 @@ def build_qmatrix_farmcpu(
                     f"Loading Q matrix from {q_src}...",
                     enabled=bool(use_spinner),
                 ) as task:
-                    qmatrix = np.loadtxt(q_path, dtype="float32", delimiter="\t")
-                    if qmatrix.ndim == 1:
-                        qmatrix = qmatrix.reshape(-1, 1)
-                    if qmatrix.shape != (n, int(q_int)):
-                        raise ValueError(
-                            f"PCA cache shape mismatch: expected ({n},{q_int}), got {qmatrix.shape}"
+                    try:
+                        q_ids, qmatrix = _load_pca_cache_with_ids(
+                            q_path,
+                            expected_rows=int(n),
+                            expected_dim=int(q_int),
+                            expected_ids=sid_arr,
                         )
-                    task.complete(
-                        f"Loading Q matrix from {q_src} (n={qmatrix.shape[0]}, nPC={qmatrix.shape[1]}) ...Finished"
-                    )
-            else:
+                    except Exception as ex:
+                        task.fail(f"Loading Q matrix from {q_src} ...Failed")
+                        cache_ready = False
+                        _emit_warning_line(
+                            logger,
+                            f"PCA cache format/content invalid; rebuilding cache. path={q_src}, reason={ex}",
+                            use_spinner=bool(use_spinner),
+                        )
+                    if cache_ready:
+                        task.complete(
+                            f"Loading Q matrix from {q_src} (n={qmatrix.shape[0]}, nPC={qmatrix.shape[1]}) ...Finished"
+                        )
+            if not cache_ready:
                 _farm_log(f"* PCA dimension for FarmCPU Q matrix: {q_int}")
                 grm = _load_or_build_grm_cache_for_pca()
                 q_direct_obj = q_direct_state.get("q")
@@ -549,8 +559,11 @@ def build_qmatrix_farmcpu(
                         require_rust=True,
                     )
                     qmatrix = np.asarray(eigvec[:, -q_int:], dtype="float32")
+                q_ids = None if sid_arr is None else np.asarray(sid_arr, dtype=str)
                 tmp_q = f"{q_path}.tmp.{os.getpid()}"
-                np.savetxt(tmp_q, qmatrix, fmt="%.8g", delimiter="\t")
+                if sid_arr is None:
+                    raise ValueError("FarmCPU PCA cache write requires sample IDs.")
+                _write_pca_cache_with_ids(tmp_q, sid_arr, qmatrix)
                 _replace_file_with_retry(tmp_q, q_path)
                 _farm_log(f"Cached PCA written to {q_path}")
 
@@ -570,16 +583,22 @@ def build_qmatrix_farmcpu(
         if cov_arr is not None:
             if cov_ids is None:
                 raise ValueError("Internal error: covariate IDs are missing for FarmCPU.")
-            sid = sid_arr
-            if cov_arr.shape[0] != sid.shape[0]:
-                raise ValueError(
-                    f"FarmCPU covariate rows ({cov_arr.shape[0]}) do not match sample count ({sid.shape[0]})."
-                )
-            if not np.array_equal(np.asarray(cov_ids, dtype=str), sid):
-                raise ValueError(
-                    "FarmCPU covariate sample order does not match genotype sample order after alignment."
-                )
-            qmatrix = np.concatenate([qmatrix, cov_arr], axis=1)
+            cov_ids_arr = np.asarray(cov_ids, dtype=str)
+            if q_ids is None:
+                q_ids = np.asarray(sid_arr, dtype=str)
+            q_ids_arr = np.asarray(q_ids, dtype=str)
+            cov_id_set = set(cov_ids_arr.tolist())
+            common_ids = [sid for sid in q_ids_arr.tolist() if sid in cov_id_set]
+            if len(common_ids) == 0:
+                raise ValueError("No overlapping samples between FarmCPU PCA cache and covariates.")
+            q_index = {sid: i for i, sid in enumerate(q_ids_arr.tolist())}
+            cov_index = {sid: i for i, sid in enumerate(cov_ids_arr.tolist())}
+            q_take = np.asarray([q_index[sid] for sid in common_ids], dtype=np.int64)
+            cov_take = np.asarray([cov_index[sid] for sid in common_ids], dtype=np.int64)
+            qmatrix = np.ascontiguousarray(qmatrix[q_take], dtype="float32")
+            cov_use = np.ascontiguousarray(cov_arr[cov_take], dtype="float32")
+            qmatrix = np.concatenate([qmatrix, cov_use], axis=1)
+            q_ids = np.asarray(common_ids, dtype=str)
     else:
         _emit_warning_line(
             logger,
@@ -588,6 +607,12 @@ def build_qmatrix_farmcpu(
         )
 
     _farm_log(f"Q matrix (FarmCPU) shape: {qmatrix.shape}")
+    if q_ids is None:
+        if sid_arr is None:
+            raise ValueError("FarmCPU Q matrix IDs are unavailable.")
+        q_ids = np.asarray(sid_arr, dtype=str)
+    if bool(return_ids):
+        return qmatrix, np.asarray(q_ids, dtype=str)
     return qmatrix
 
 
@@ -978,7 +1003,8 @@ def run_farmcpu_fullmem(
             snps_only=bool(snps_only),
             logger=logger,
         )
-        qmatrix = build_qmatrix_farmcpu(
+        famid_full = np.asarray(famid, dtype=str)
+        qmatrix, q_ids = build_qmatrix_farmcpu(
             genofile=gfile,
             gfile_prefix=gfile_prefix,
             geno=geno,
@@ -998,16 +1024,34 @@ def run_farmcpu_fullmem(
             mmap_limit=bool(args.mmap_limit),
             preloaded_packed=preloaded_packed,
             packed_ctx_preloaded=packed_ctx,
+            return_ids=True,
         )
+        q_ids = np.asarray(q_ids, dtype=str)
+        q_id_set = set(q_ids.tolist())
+        pheno_ids_set = set(np.asarray(pheno.index, dtype=str))
+        common_ids = [
+            sid for sid in famid_full.tolist()
+            if sid in q_id_set and sid in pheno_ids_set
+        ]
+        if len(common_ids) == 0:
+            raise ValueError("No overlapping samples across FarmCPU genotype/phenotype/Q/cov.")
+        q_index = {sid: i for i, sid in enumerate(q_ids.tolist())}
+        q_take = np.asarray([q_index[sid] for sid in common_ids], dtype=np.int64)
+        qmatrix = np.ascontiguousarray(qmatrix[q_take], dtype="float32")
+        full_index = {sid: i for i, sid in enumerate(famid_full.tolist())}
+        packed_sample_idx = np.asarray(
+            [full_index[sid] for sid in common_ids],
+            dtype=np.int64,
+        )
+        famid = np.asarray(common_ids, dtype=str)
 
         cov_n: Union[int, str] = "NA"
         if len(_normalize_cov_inputs(cov)) > 0:
-            cov_n = int(famid.shape[0])
-        geno_n = int(famid.shape[0]) if geno is None else int(geno.shape[1])
-        pheno_ids_set = set(np.asarray(pheno.index, dtype=str))
-        common_n = int(sum(1 for sid in np.asarray(famid, dtype=str) if sid in pheno_ids_set))
+            cov_n = int(len(common_ids))
+        geno_n = int(famid_full.shape[0]) if geno is None else int(geno.shape[1])
+        common_n = int(len(common_ids))
         q_n: Union[int, str] = (
-            int(qmatrix.shape[0]) if (np.asarray(qmatrix).ndim == 2 and int(qmatrix.shape[1]) > 0) else "NA"
+            int(q_ids.shape[0]) if (np.asarray(qmatrix).ndim == 2 and int(qmatrix.shape[1]) > 0) else "NA"
         )
         _emit_plain_info_line(
             logger,
@@ -1024,6 +1068,7 @@ def run_farmcpu_fullmem(
             "packed_ctx": packed_ctx,
             "ref_alt": ref_alt,
             "qmatrix": qmatrix,
+            "packed_sample_idx": packed_sample_idx,
         }
         if effective_qtn_preloaded_packed is not None:
             farmcpu_cache["_qtn_preloaded_packed"] = effective_qtn_preloaded_packed

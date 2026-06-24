@@ -127,13 +127,20 @@ class AssociationConfig:
             raise ValueError("build_gwas_argv is only valid for file-mode config.")
         self.validate()
         mk = str(model_key).strip().lower()
-        if mk not in {"lm", "lmm", "lmm2", "fastlmm", "fvlmm", "farmcpu", "algwas", "splmm"}:
+        if mk not in {"lm", "lm2", "lmm", "lmm2", "fastlmm", "fvlmm", "farmcpu", "algwas", "splmm"}:
             raise ValueError(f"unsupported model_key: {model_key}")
 
         flag, src = _detect_genotype_cli_flag(str(self.genotype))
         argv: list[str] = [flag, src, "-p", _normalize_path_text(str(self.phenotype))]
         if mk == "lm":
             argv.append("-lm")
+        elif mk == "lm2":
+            argv.append("-lm2")
+            lm2_cov = None
+            if isinstance(self.extra, dict):
+                lm2_cov = self.extra.get("lm2_cov")
+            if lm2_cov is not None and str(lm2_cov).strip() != "":
+                argv.append(str(lm2_cov).strip())
         elif mk == "lmm":
             argv.append("-lmm")
         elif mk == "lmm2":

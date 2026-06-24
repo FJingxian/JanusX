@@ -17,6 +17,85 @@ pub(crate) fn chi2_sf_df1(stat: f64) -> f64 {
 }
 
 #[inline]
+fn gamma_q(a: f64, x: f64) -> f64 {
+    if !(a.is_finite() && x.is_finite()) || a <= 0.0 {
+        return f64::NAN;
+    }
+    if x <= 0.0 {
+        return 1.0;
+    }
+    if x.is_infinite() {
+        return 0.0;
+    }
+
+    const ITMAX: usize = 200;
+    const EPS: f64 = 3e-14;
+    const FPMIN: f64 = 1e-300;
+    let gln = libm::lgamma(a);
+
+    if x < a + 1.0 {
+        let mut ap = a;
+        let mut del = 1.0 / a;
+        let mut sum = del;
+        for _ in 0..ITMAX {
+            ap += 1.0;
+            del *= x / ap;
+            sum += del;
+            if del.abs() <= sum.abs() * EPS {
+                break;
+            }
+        }
+        let p = sum * (-x + a * x.ln() - gln).exp();
+        return (1.0 - p).clamp(0.0, 1.0);
+    }
+
+    let mut b = x + 1.0 - a;
+    let mut c = 1.0 / FPMIN;
+    let mut d = 1.0 / b.max(FPMIN);
+    let mut h = d;
+    for i in 1..=ITMAX {
+        let fi = i as f64;
+        let an = -fi * (fi - a);
+        b += 2.0;
+        d = an * d + b;
+        if d.abs() < FPMIN {
+            d = FPMIN;
+        }
+        c = b + an / c;
+        if c.abs() < FPMIN {
+            c = FPMIN;
+        }
+        d = 1.0 / d;
+        let del = d * c;
+        h *= del;
+        if (del - 1.0).abs() <= EPS {
+            break;
+        }
+    }
+    let q = (-x + a * x.ln() - gln).exp() * h;
+    q.clamp(0.0, 1.0)
+}
+
+#[inline]
+pub(crate) fn chi2_sf(stat: f64, df: f64) -> f64 {
+    if !stat.is_finite() || stat <= 0.0 {
+        return 1.0;
+    }
+    if !(df.is_finite() && df > 0.0) {
+        return 1.0;
+    }
+    if (df - 1.0).abs() <= f64::EPSILON {
+        return chi2_sf_df1(stat);
+    }
+    let p = gamma_q(0.5 * df, 0.5 * stat);
+    if p.is_finite() {
+        p.clamp(f64::MIN_POSITIVE, 1.0)
+    } else {
+        1.0
+    }
+}
+
+#[inline]
 pub(crate) fn sanitize_assoc_pvalue(beta: f64, se: f64, p: f64) -> f64 {
     if !(beta.is_finite() && se.is_finite() && se > 0.0) {
         return 1.0;
@@ -289,7 +368,7 @@ pub(crate) fn cholesky_logdet(l: &[f64], dim: usize) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{chi2_stat_df1_from_sf, sanitize_assoc_pvalue};
+    use super::{chi2_sf, chi2_stat_df1_from_sf, sanitize_assoc_pvalue};
 
     #[test]
     fn chi2_df1_inverse_surv_handles_tiny_p_values() {
@@ -303,6 +382,17 @@ mod tests {
         assert!(chi2_stat_df1_from_sf(f64::NAN).is_nan());
         assert_eq!(chi2_stat_df1_from_sf(0.0), f64::INFINITY);
         assert_eq!(chi2_stat_df1_from_sf(1.0), 0.0);
+    }
+
+    #[test]
+    fn chi2_sf_matches_closed_forms_for_small_df() {
+        let stat = 5.0_f64;
+        let p_df2 = chi2_sf(stat, 2.0);
+        let p_df4 = chi2_sf(stat, 4.0);
+        let expect_df2 = (-0.5 * stat).exp();
+        let expect_df4 = (-0.5 * stat).exp() * (1.0 + 0.5 * stat);
+        assert!((p_df2 - expect_df2).abs() < 1.0e-12);
+        assert!((p_df4 - expect_df4).abs() < 1.0e-12);
     }
 
     #[test]

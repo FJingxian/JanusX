@@ -229,7 +229,7 @@ pub(crate) fn ixx_from_x_qr(x_flat: &[f64], n: usize, q0: usize) -> Result<Vec<f
 }
 
 #[derive(Clone, Debug)]
-struct LmQrProjection {
+pub(crate) struct LmQrProjection {
     q: Vec<f64>,
     q_f32: Vec<f32>,
     qty: Vec<f64>,
@@ -240,7 +240,12 @@ struct LmQrProjection {
 }
 
 impl LmQrProjection {
-    fn from_design(x_flat: &[f64], y: &[f64], n: usize, q0: usize) -> Result<Self, String> {
+    pub(crate) fn from_design(
+        x_flat: &[f64],
+        y: &[f64],
+        n: usize,
+        q0: usize,
+    ) -> Result<Self, String> {
         if x_flat.len() != n.saturating_mul(q0) {
             return Err("X shape mismatch".to_string());
         }
@@ -348,6 +353,26 @@ impl LmQrProjection {
             n,
         })
     }
+
+    #[inline]
+    pub(crate) fn q(&self) -> &[f64] {
+        self.q.as_slice()
+    }
+
+    #[inline]
+    pub(crate) fn y_resid(&self) -> &[f64] {
+        self.y_resid.as_slice()
+    }
+
+    #[inline]
+    pub(crate) fn rss0(&self) -> f64 {
+        self.rss0
+    }
+
+    #[inline]
+    pub(crate) fn rank(&self) -> usize {
+        self.rank
+    }
 }
 
 fn betacf(a: f64, b: f64, x: f64) -> f64 {
@@ -425,7 +450,7 @@ fn betai(a: f64, b: f64, x: f64) -> f64 {
 }
 
 #[inline]
-fn student_t_p_two_sided(t: f64, df: i32) -> f64 {
+pub(crate) fn student_t_p_two_sided(t: f64, df: i32) -> f64 {
     if df <= 0 {
         return f64::NAN;
     }
@@ -462,7 +487,7 @@ fn chi2_sf_df1(stat: f64) -> f64 {
 }
 
 #[inline]
-fn lm_plrt_from_t2(t2: f64, n_obs: usize, df: i32) -> f64 {
+pub(crate) fn lm_plrt_from_t2(t2: f64, n_obs: usize, df: i32) -> f64 {
     if df <= 0 || !t2.is_finite() || t2 < 0.0 {
         return f64::NAN;
     }
@@ -471,7 +496,7 @@ fn lm_plrt_from_t2(t2: f64, n_obs: usize, df: i32) -> f64 {
 }
 
 #[inline]
-fn normalize_plink_prefix_local(prefix: &str) -> String {
+pub(crate) fn normalize_plink_prefix_local(prefix: &str) -> String {
     let s = prefix.trim();
     let low = s.to_ascii_lowercase();
     if low.ends_with(".bed") || low.ends_with(".bim") || low.ends_with(".fam") {
@@ -482,7 +507,7 @@ fn normalize_plink_prefix_local(prefix: &str) -> String {
 }
 
 #[inline]
-fn is_simple_snp_allele(a: &str) -> bool {
+pub(crate) fn is_simple_snp_allele(a: &str) -> bool {
     let t = a.trim().to_ascii_uppercase();
     if t.len() != 1 {
         return false;
@@ -491,7 +516,7 @@ fn is_simple_snp_allele(a: &str) -> bool {
 }
 
 #[inline]
-fn lm_resolve_snp_name(snp: &str, chrom: &str, pos: i32) -> String {
+pub(crate) fn lm_resolve_snp_name(snp: &str, chrom: &str, pos: i32) -> String {
     if snp.is_empty() || snp == "." {
         format!("{chrom}_{pos}")
     } else {

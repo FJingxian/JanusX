@@ -226,6 +226,74 @@ from janusx.assoc.workflow_cache import (
     genotype_cache_prefix,
 )
 
+
+def _write_pca_cache_with_ids(path: str, sample_ids: np.ndarray, qmatrix: np.ndarray) -> None:
+    sid = np.asarray(sample_ids, dtype=str).reshape(-1)
+    q = np.asarray(qmatrix, dtype=np.float32)
+    if q.ndim == 1:
+        q = q.reshape(-1, 1)
+    if q.shape[0] != sid.shape[0]:
+        raise ValueError(
+            f"PCA cache write shape mismatch: ids={sid.shape[0]}, rows={q.shape[0]}"
+        )
+    df = pd.DataFrame(q, columns=[f"PC{i + 1}" for i in range(int(q.shape[1]))])
+    df.insert(0, "sample_id", sid)
+    df.to_csv(
+        path,
+        sep="\t",
+        header=False,
+        index=False,
+        float_format="%.6f",
+    )
+
+
+def _load_pca_cache_with_ids(
+    path: str,
+    *,
+    expected_rows: Union[int, None],
+    expected_dim: int,
+    expected_ids: Union[np.ndarray, None] = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    tab = pd.read_csv(
+        path,
+        sep="\t",
+        header=None,
+        dtype=str,
+        keep_default_na=False,
+    )
+    expected_cols = int(expected_dim) + 1
+    if tab.shape[1] != expected_cols:
+        raise ValueError(
+            f"PCA cache column mismatch: expected {expected_cols} columns (ID + {int(expected_dim)} PCs), got {tab.shape[1]} ({path})"
+        )
+    ids = tab.iloc[:, 0].astype(str).to_numpy(dtype=str)
+    qmatrix = tab.iloc[:, 1:].apply(pd.to_numeric, errors="coerce").to_numpy(dtype="float32")
+    if qmatrix.ndim == 1:
+        qmatrix = qmatrix.reshape(-1, 1)
+    row_n = int(ids.shape[0])
+    if row_n == 0:
+        raise ValueError(f"PCA cache is empty: {path}")
+    if qmatrix.shape != (row_n, int(expected_dim)):
+        raise ValueError(
+            f"PCA cache shape mismatch: expected (*,{int(expected_dim)}) with ID column, got ids={ids.shape[0]}, q={qmatrix.shape}"
+        )
+    if len(set(ids.tolist())) != row_n:
+        raise ValueError(f"PCA cache contains duplicated sample IDs: {path}")
+    if expected_ids is None and expected_rows is not None and row_n != int(expected_rows):
+        raise ValueError(
+            f"PCA cache row-count mismatch: expected {int(expected_rows)}, got {row_n} ({path})"
+        )
+    if expected_ids is not None:
+        expect = set(np.asarray(expected_ids, dtype=str).reshape(-1).tolist())
+        overlap = sum(1 for sid in ids.tolist() if sid in expect)
+        if overlap <= 0:
+            raise ValueError(
+                f"PCA cache has no overlapping sample IDs with current genotype: {path}"
+            )
+    if not np.all(np.isfinite(qmatrix)):
+        raise ValueError(f"PCA cache contains non-finite values: {path}")
+    return ids, qmatrix
+
 _FASTLMM_PVE_LOW = 0.05
 _FASTLMM_PVE_HIGH = 0.995
 _SECTION_WIDTH = 80
@@ -368,6 +436,16 @@ def _format_gwas_models_executed(args) -> str:
     models: list[str] = []
     if bool(args.lm):
         models.append("LM")
+    if bool(getattr(args, "lm2", None) is not None):
+        lm2_selector = list(getattr(args, "lm2_cov_cols", []) or [])
+        lm2_missing_external_cov = not bool(getattr(args, "cov", None))
+        lm2_will_fallback = bool(getattr(args, "_lm2_fallback_to_lm", False)) or (
+            len(lm2_selector) == 0
+        ) or lm2_missing_external_cov
+        if lm2_will_fallback:
+            models.append("LM2->LM")
+        else:
+            models.append("LM2")
     if bool(args.lmm):
         models.append("LMM")
     if bool(getattr(args, "lmm2", False)):
@@ -383,6 +461,87 @@ def _format_gwas_models_executed(args) -> str:
     if bool(args.algwas):
         models.append("ALGWAS")
     return ", ".join(models) if len(models) > 0 else "None"
+
+
+def _parse_lm2_covariate_selector(
+    value: object,
+    *,
+    label: str = "-lm2/--lm2",
+) -> list[int]:
+    raw = str(value).strip() if value is not None else ""
+    if raw == "" or raw == "__SELF__":
+        return []
+
+    picks: list[int] = []
+    seen: set[int] = set()
+
+    def _push(idx0: int) -> None:
+        if idx0 < 0:
+            raise ValueError(
+                f"{label}: covariate column indices must be >= 0, got {idx0}."
+            )
+        if idx0 not in seen:
+            seen.add(idx0)
+            picks.append(idx0)
+
+    for token in [str(x).strip() for x in raw.split(",") if str(x).strip() != ""]:
+        if ":" in token:
+            left, right = token.split(":", 1)
+            left = left.strip()
+            right = right.strip()
+            if left == "" and right == "":
+                raise ValueError(
+                    f"{label}: invalid empty covariate range '{token}'."
+                )
+            if left == "":
+                start = 0
+            else:
+                if not left.lstrip("+-").isdigit():
+                    raise ValueError(
+                        f"{label}: invalid covariate range start '{left}'."
+                    )
+                start = int(left)
+            if right == "":
+                raise ValueError(
+                    f"{label}: open-ended covariate range '{token}' is not supported; provide an explicit end."
+                )
+            if not right.lstrip("+-").isdigit():
+                raise ValueError(
+                    f"{label}: invalid covariate range end '{right}'."
+                )
+            end = int(right)
+            step = 1 if end >= start else -1
+            for idx1 in range(start, end + step, step):
+                _push(idx1)
+            continue
+        if not token.lstrip("+-").isdigit():
+            raise ValueError(
+                f"{label}: invalid covariate selector '{token}'. Use 0-based indices/ranges like 0, 0:3, :2, 0,3."
+            )
+        _push(int(token))
+    return picks
+
+
+def _resolve_lm2_covariate_indices(
+    cov_all,
+    selector_zero_based: list[int],
+    *,
+    label: str = "-lm2/--lm2",
+) -> np.ndarray:
+    arr = np.asarray(cov_all, dtype=np.float32)
+    if arr.ndim != 2:
+        raise ValueError("LM2 requires a 2D merged covariate matrix.")
+    ncov = int(arr.shape[1])
+    if ncov <= 0:
+        raise ValueError("LM2 requires at least one covariate column from -c.")
+    if len(selector_zero_based) == 0:
+        return np.asarray([], dtype=np.int64)
+    bad = [int(i) for i in selector_zero_based if int(i) < 0 or int(i) >= ncov]
+    if bad:
+        raise ValueError(
+            f"{label}: covariate column index out of range: {bad[0]}. valid=[0..{ncov - 1}]"
+        )
+    return np.asarray(selector_zero_based, dtype=np.int64)
 
 
 def _format_gwas_packed_route_status(
@@ -2905,15 +3064,11 @@ def load_or_build_q_with_cache(
         legacy_q_path = _pca_cache_path_legacy(cache_prefix, mgrm=str(mgrm), qdim=int(dim))
         with _cache_lock(q_path):
             if (not os.path.isfile(q_path)) and os.path.isfile(legacy_q_path):
-                try:
-                    _replace_file_with_retry(legacy_q_path, q_path)
-                    _log_file_only(
-                        logger,
-                        logging.INFO,
-                        f"Migrated legacy PCA cache name: {legacy_q_path} -> {q_path}",
-                    )
-                except Exception:
-                    pass
+                _log_file_only(
+                    logger,
+                    logging.INFO,
+                    f"Ignoring legacy PCA cache and rebuilding in new format: {legacy_q_path}",
+                )
             cache_ready = os.path.isfile(q_path)
             if cache_ready:
                 g_mtime = latest_genotype_mtime(genofile)
@@ -2925,21 +3080,27 @@ def load_or_build_q_with_cache(
                 src = _basename_only(q_path)
                 with CliStatus(f"Loading Q matrix from {src}...", enabled=bool(use_spinner)) as task:
                     try:
-                        qmatrix = np.loadtxt(q_path, dtype="float32", delimiter="\t")
-                        if qmatrix.ndim == 1:
-                            qmatrix = qmatrix.reshape(-1, 1)
-                        if qmatrix.shape != (n, int(dim)):
-                            raise ValueError(
-                                f"PCA cache shape mismatch: expected ({n},{dim}), got {qmatrix.shape}"
-                            )
-                        q_ids = ids
-                    except Exception:
+                        q_ids, qmatrix = _load_pca_cache_with_ids(
+                            q_path,
+                            expected_rows=int(n),
+                            expected_dim=int(dim),
+                            expected_ids=np.asarray(ids, dtype=str),
+                        )
+                    except Exception as ex:
                         task.fail(f"Loading Q matrix from {src} ...Failed")
-                        raise
-                    task.complete(
-                        f"Loading Q matrix from {src} (n={qmatrix.shape[0]}, nPC={qmatrix.shape[1]}) ...Finished"
-                    )
-            else:
+                        cache_ready = False
+                        _emit_warning_line(
+                            logger,
+                            f"PCA cache format/content invalid; rebuilding cache. path={src}, reason={ex}",
+                            use_spinner=bool(use_spinner),
+                        )
+                    if not cache_ready:
+                        pass
+                    else:
+                        task.complete(
+                            f"Loading Q matrix from {src} (n={qmatrix.shape[0]}, nPC={qmatrix.shape[1]}) ...Finished"
+                        )
+            if not cache_ready:
                 pc_calc_t0 = time.monotonic()
                 pc_backend = "unknown"
                 try:
@@ -2985,7 +3146,7 @@ def load_or_build_q_with_cache(
                 _log_file_only(logger, logging.INFO, pc_msg)
                 print_success(pc_msg, force_color=bool(use_spinner))
                 tmp_q = f"{q_path}.tmp.{os.getpid()}"
-                np.savetxt(tmp_q, qmatrix, fmt="%.8g", delimiter="\t")
+                _write_pca_cache_with_ids(tmp_q, np.asarray(q_ids, dtype=str), qmatrix)
                 _replace_file_with_retry(tmp_q, q_path)
                 q_ids = ids
                 _log_file_only(
@@ -3222,15 +3383,11 @@ def prepare_streaming_context(
         q_path = _pca_cache_path(cache_prefix, mgrm=str(mgrm), qdim=int(qdim))
         legacy_q_path = _pca_cache_path_legacy(cache_prefix, mgrm=str(mgrm), qdim=int(qdim))
         if (not os.path.isfile(q_path)) and os.path.isfile(legacy_q_path):
-            try:
-                _replace_file_with_retry(legacy_q_path, q_path)
-                _log_file_only(
-                    logger,
-                    logging.INFO,
-                    f"Migrated legacy PCA cache name: {legacy_q_path} -> {q_path}",
-                )
-            except Exception:
-                pass
+            _log_file_only(
+                logger,
+                logging.INFO,
+                f"Ignoring legacy PCA cache and rebuilding in new format: {legacy_q_path}",
+            )
         if not os.path.isfile(q_path):
             need_generate_q = True
         else:
@@ -3240,11 +3397,12 @@ def prepare_streaming_context(
                 need_generate_q = True
             else:
                 try:
-                    q_probe = np.loadtxt(q_path, dtype="float32", delimiter="\t")
-                    if q_probe.ndim == 1:
-                        q_probe = q_probe.reshape(-1, 1)
-                    if q_probe.shape != (n_samples, int(qdim)):
-                        need_generate_q = True
+                    _load_pca_cache_with_ids(
+                        q_path,
+                        expected_rows=int(n_samples),
+                        expected_dim=int(qdim),
+                        expected_ids=np.asarray(ids, dtype=str),
+                    )
                 except Exception:
                     need_generate_q = True
     need_grm = bool(require_kinship or need_generate_q)
@@ -4937,7 +5095,7 @@ def _run_file_dense_fast_once(
         ],
     )
 
-    model_sequence = [m for m in stream_models if m in {"lm", "lmm", "lmm2", "fastlmm", "fvlmm"}]
+    model_sequence = [m for m in stream_models if m in {"lm", "lm2", "lmm", "lmm2", "fastlmm", "fvlmm"}]
     gm_tag = "add"
     pheno_aligned, ids = _align_pheno_to_sample_order(pheno, ids)
     trait_iter = list(pheno_aligned.columns)
@@ -5409,6 +5567,18 @@ def parse_args(argv: Optional[list[str]] = None):
         help="Run the linear model (memmap, low-memory; default: %(default)s).",
     )
     models_group.add_argument(
+        "-lm2", "--lm2",
+        nargs="?",
+        const="__SELF__",
+        default=None,
+        metavar="COVCOL",
+        help=(
+            "Run LM with SNP-by-covariate interaction terms from selected merged -c covariate columns. "
+            "Column selectors are 0-based and accept items like 0, 0:3, :2, 0,3. "
+            "If no interaction columns are specified, LM2 falls back to the LM fast path."
+        ),
+    )
+    models_group.add_argument(
         "-lmm", "--lmm", action="store_true", default=False,
         help="Run the linear mixed model (memmap, low-memory; default: %(default)s).",
     )
@@ -5617,6 +5787,10 @@ def parse_args(argv: Optional[list[str]] = None):
     except ValueError as e:
         parser.error(str(e))
     try:
+        args.lm2_cov_cols = _parse_lm2_covariate_selector(getattr(args, "lm2", None))
+    except ValueError as e:
+        parser.error(str(e))
+    try:
         args.qcov = str(_parse_qcov_dim(args.qcov))
     except ValueError as e:
         parser.error(str(e))
@@ -5762,6 +5936,8 @@ def _run_gwas_pipeline(
     # it to keep visualization out of end-to-end runtime comparisons.
     args.plot = _gwas_plot_enabled()
     args.cov = _normalize_cov_inputs(args.cov)
+    args._lm2_cov_idx = None
+    args._lm2_fallback_to_lm = False
     thread_budget = detect_thread_budget_info()
     detected_threads = int(thread_budget["effective_threads"])
     requested_threads = int(args.thread)
@@ -5864,6 +6040,7 @@ def _run_gwas_pipeline(
     qtn_input_requested = _qtn_source_from_args(args) is not None
     standard_stream_models_requested = bool(
         args.lm
+        or (getattr(args, "lm2", None) is not None)
         or args.lmm
         or getattr(args, "lmm2", False)
         or args.fastlmm
@@ -6051,6 +6228,7 @@ def _run_gwas_pipeline(
 
     if not (
         args.lm
+        or (getattr(args, "lm2", None) is not None)
         or args.lmm
         or getattr(args, "lmm2", False)
         or args.fastlmm
@@ -6060,7 +6238,7 @@ def _run_gwas_pipeline(
         or args.farmcpu
     ):
         logger.error(
-            "No model selected. Use -lm, -lmm, -lmm2, -fvlmm, -splmm, -farmcpu, and/or -algwas."
+            "No model selected. Use -lm, -lm2, -lmm, -lmm2, -fvlmm, -splmm, -farmcpu, and/or -algwas."
         )
         raise SystemExit(1)
     if args.fastlmm:
@@ -6108,7 +6286,14 @@ def _run_gwas_pipeline(
     # - packed full-load remains the fallback when memmap is unavailable
     allow_packed_grm_reuse = False
     force_bed_stream_scan = bool(
-        (args.lm or args.lmm or getattr(args, "lmm2", False) or args.fastlmm or args.fvlmm)
+        (
+            args.lm
+            or (getattr(args, "lm2", None) is not None)
+            or args.lmm
+            or getattr(args, "lmm2", False)
+            or args.fastlmm
+            or args.fvlmm
+        )
         and input_is_file_matrix
         and (not bool(fast_mode))
     )
@@ -6149,6 +6334,8 @@ def _run_gwas_pipeline(
         stream_models: list[str] = []
         if args.lm:
             stream_models.append("lm")
+        if getattr(args, "lm2", None) is not None:
+            stream_models.append("lm2")
         if args.lmm:
             stream_models.append("lmm")
         if getattr(args, "lmm2", False):
@@ -6347,6 +6534,39 @@ def _run_gwas_pipeline(
                     post_grm_hook=post_grm_hook,
                     force_kind=("hmp" if bool(getattr(args, "hmp", None)) else None),
                 )
+                if getattr(args, "lm2", None) is not None:
+                    lm2_selector = list(getattr(args, "lm2_cov_cols", []) or [])
+                    if cov_all is None:
+                        args._lm2_fallback_to_lm = True
+                        args._lm2_cov_idx = None
+                        if "lm2" in stream_models:
+                            if "lm" in stream_models:
+                                stream_models = [m for m in stream_models if m != "lm2"]
+                            else:
+                                stream_models = ["lm" if m == "lm2" else m for m in stream_models]
+                        _emit_warning_line(
+                            logger,
+                            "LM2 received no external covariates from -c; falling back to LM.",
+                            use_spinner=bool(use_spinner),
+                        )
+                    elif len(lm2_selector) == 0:
+                        args._lm2_fallback_to_lm = True
+                        args._lm2_cov_idx = None
+                        if "lm2" in stream_models:
+                            if "lm" in stream_models:
+                                stream_models = [m for m in stream_models if m != "lm2"]
+                            else:
+                                stream_models = ["lm" if m == "lm2" else m for m in stream_models]
+                        _emit_warning_line(
+                            logger,
+                            "LM2 received no explicit interaction columns; falling back to LM.",
+                            use_spinner=bool(use_spinner),
+                        )
+                    else:
+                        args._lm2_cov_idx = _resolve_lm2_covariate_indices(
+                            cov_all,
+                            lm2_selector,
+                        )
                 farmcpu_genofile = str(genofile_stream)
                 args.chunksize = _resolve_bed_block_rows_from_memory(
                     float(args._memory_mb),
@@ -6556,12 +6776,49 @@ def _run_gwas_pipeline(
                             )
                         except Exception as ex:
                             rust_plan_errors.append(f"gwas_trait_model_schedule: {ex}")
+                    plan_models: set[str] = set()
+                    if task_plan is not None:
+                        try:
+                            for task_item in task_plan:
+                                if hasattr(task_item, "get"):
+                                    mk_plan = str(task_item.get("model", "")).lower().strip()
+                                    if mk_plan != "":
+                                        plan_models.add(mk_plan)
+                        except Exception as ex:
+                            rust_plan_errors.append(f"task-plan-parse: {ex}")
+                            task_plan = None
+                    if task_plan is not None:
+                        requested_models = {
+                            str(m).lower().strip() for m in stream_models if str(m).strip() != ""
+                        }
+                        if ("lm2" in requested_models) and ("lm2" not in plan_models):
+                            rust_plan_errors.append(
+                                "rust task planner returned no lm2 tasks; falling back to Python task plan"
+                            )
+                            task_plan = None
+                        elif (len(requested_models) > 0) and (len(plan_models) == 0):
+                            rust_plan_errors.append(
+                                "rust task planner returned an empty task plan; falling back to Python task plan"
+                            )
+                            task_plan = None
                     if task_plan is None:
-                        err_text = "; ".join(rust_plan_errors) if len(rust_plan_errors) > 0 else "no rust scheduler symbols"
-                        raise RuntimeError(
-                            "Rust-only GWAS mode requires Rust task scheduler/dispatcher; "
-                            f"unable to build model task plan ({err_text})."
-                        )
+                        task_plan = []
+                        for ti, trait_name_use in enumerate(trait_order):
+                            for mi, model_name_use in enumerate(stream_models):
+                                task_plan.append(
+                                    {
+                                        "model": str(model_name_use),
+                                        "trait": str(trait_name_use),
+                                        "emit_trait_header": bool(mi == 0),
+                                        "emit_blank_after": bool(mi == (len(stream_models) - 1) and ti < (len(trait_order) - 1)),
+                                    }
+                                )
+                        if len(task_plan) == 0:
+                            err_text = "; ".join(rust_plan_errors) if len(rust_plan_errors) > 0 else "no rust scheduler symbols"
+                            raise RuntimeError(
+                                "Rust-only GWAS mode requires Rust task scheduler/dispatcher; "
+                                f"unable to build model task plan ({err_text})."
+                            )
                     def _run_route_algwas_packed(
                         trait_one: list[str], emit_trait_header_model: bool
                     ) -> None:
@@ -6733,6 +6990,43 @@ def _run_gwas_pipeline(
                             force_model=bool(args.force_model),
                         )
 
+                    def _run_route_lm2_stream(
+                        trait_one: list[str], emit_trait_header_model: bool
+                    ) -> None:
+                        run_chunked_gwas_lmm_lm(
+                            model_name="lm2",
+                            genofile=genofile_stream,
+                            pheno=pheno,
+                            ids=ids,
+                            n_snps=n_snps,
+                            outprefix=outprefix,
+                            maf_threshold=maf_threshold_scan,
+                            max_missing_rate=max_missing_rate_scan,
+                            genetic_model=args.model,
+                            het_threshold=het_threshold_scan,
+                            chunk_size=args.chunksize,
+                            mmap_limit=mmap_limit_effective,
+                            grm=grm,
+                            qmatrix=qmatrix,
+                            cov_all=cov_all,
+                            eff_m=eff_m,
+                            plot=args.plot,
+                            threads=args.thread,
+                            logger=logger,
+                            use_spinner=use_spinner,
+                            snps_only=bool(args.snps_only),
+                            eff_snp_by_trait=eff_snp_by_trait,
+                            summary_rows=gwas_summary_rows,
+                            saved_paths=saved_result_paths,
+                            trait_names=trait_one,
+                            emit_trait_header=bool(emit_trait_header_model),
+                            chunk_size_user_set=bool(
+                                getattr(args, "_chunksize_user_set", True)
+                            ),
+                            force_model=bool(args.force_model),
+                            lm2_covariate_indices=getattr(args, "_lm2_cov_idx", None),
+                        )
+
                     def _run_route_lmm_stream(
                         trait_one: list[str], emit_trait_header_model: bool
                     ) -> None:
@@ -6835,6 +7129,7 @@ def _run_gwas_pipeline(
                         "splmm": _run_route_splmm_windowed,
                         "algwas": _run_route_algwas_packed,
                         "lm_stream": _run_route_lm_stream,
+                        "lm2_stream": _run_route_lm2_stream,
                         "lmm_stream": _run_route_lmm_stream,
                         "lmm2_stream": _run_route_lmm2_stream,
                         "fastlmm_stream": _run_route_fastlmm_stream,
@@ -6845,6 +7140,9 @@ def _run_gwas_pipeline(
                         "lm_stream": "lm_stream",
                         "lm_memmap": "lm_stream",
                         "lm_rust": "lm_stream",
+                        "lm2_stream": "lm2_stream",
+                        "lm2_memmap": "lm2_stream",
+                        "lm2_rust": "lm2_stream",
                         "lmm_stream": "lmm_stream",
                         "lmm_memmap": "lmm_stream",
                         "lmm_rust": "lmm_stream",
@@ -6857,7 +7155,7 @@ def _run_gwas_pipeline(
                         "fvlmm_rust": "fvlmm_stream",
                         "farm": "farmcpu",
                     }
-                    stream_group_routes = {"lm_stream", "lmm_stream", "lmm2_stream", "fastlmm_stream", "fvlmm_stream"}
+                    stream_group_routes = {"lm_stream", "lm2_stream", "lmm_stream", "lmm2_stream", "fastlmm_stream", "fvlmm_stream"}
                     normalized_tasks: list[dict[str, object]] = []
                     for task_item in task_plan:
                         mk = str(task_item.get("model", "")).lower().strip()
@@ -6865,6 +7163,8 @@ def _run_gwas_pipeline(
                         if not route:
                             if mk == "lm":
                                 route = "lm_stream"
+                            elif mk == "lm2":
+                                route = "lm2_stream"
                             elif mk == "lmm":
                                 route = "lmm_stream"
                             elif mk == "lmm2":
@@ -6907,21 +7207,21 @@ def _run_gwas_pipeline(
                         )
                         emit_blank_after = bool(task_item.get("emit_blank_after", False))
 
-                        if route in stream_group_routes:
+                        if route in stream_group_routes and mk != "lm2":
                             group_end = task_idx + 1
                             grouped_models: list[str] = [mk]
                             while group_end < len(normalized_tasks):
                                 next_item = normalized_tasks[group_end]
                                 next_route = str(next_item.get("route", "")).lower().strip()
                                 next_trait = str(next_item.get("trait", ""))
+                                next_model = str(next_item.get("model", "")).lower().strip()
                                 if (
                                     next_route not in stream_group_routes
                                     or next_trait != trait_name_use
+                                    or next_model == "lm2"
                                 ):
                                     break
-                                grouped_models.append(
-                                    str(next_item.get("model", "")).lower().strip()
-                                )
+                                grouped_models.append(next_model)
                                 group_end += 1
                             if len(grouped_models) >= 2:
                                 run_chunked_gwas_streaming_shared(

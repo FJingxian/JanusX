@@ -4697,7 +4697,7 @@ def main():
     # ------------------------------------------------------------------
     input_group = parser.add_argument_group("Input Arguments")
     input_group.add_argument(
-        "-gwasfile", "--gwasfile", nargs="+", type=str, required=False, default=None,
+        "-i", "-gwasfile", "--gwasfile", nargs="+", type=str, required=False, default=None,
         help=(
             "One or more GWAS result files (tab-delimited). "
             "Optional when running LD block only with genotype input."
@@ -4835,7 +4835,7 @@ def main():
         ),
     )
     optional_group.add_argument(
-        "-palette", "--palette", "-pallete", "--pallete", dest="palette", type=str, default=None,
+        "-palette", "--palette", dest="palette", type=str, default=None,
         help=(
             "Manhattan color palette (QQ keeps black/grey). "
             "Supports cmap names (e.g. tab10, tab20) or ';'-separated colors "
@@ -4846,7 +4846,7 @@ def main():
         ),
     )
     optional_group.add_argument(
-        "--ldblock-palette", "--ldblock-pallete",
+        "-ldblock-palette", "--ldblock-palette",
         dest="ldblock_palette",
         type=str,
         default=None,

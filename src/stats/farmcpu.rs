@@ -1082,11 +1082,16 @@ pub(crate) fn farmcpu_super_keep_from_sample_major(
                 f64::NAN
             };
             if cij >= thr || cij <= -thr {
-                if pval[i] >= pval[j] {
+                if pval[i] > pval[j] {
                     keep[i] = false;
-                } else {
+                } else if pval[i] < pval[j] {
                     keep[j] = false;
                     break;
+                } else {
+                    // Tie-break exact/near-exact proxy SNPs by preserving the earlier
+                    // candidate in the current seqQTN order. This matches rMVP more
+                    // closely on duplicate-LD representatives.
+                    keep[j] = false;
                 }
             }
         }

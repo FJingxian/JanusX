@@ -90,8 +90,8 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::f64::consts::LN_10;
 use std::fmt::Write as _;
-use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::fs::{File, OpenOptions};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::time::Instant;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -278,6 +278,136 @@ fn farmcpu_stage1_emit_total_timing(route: FarmcpuRoute, acc: &FarmcpuStage1Timi
         pct(other_secs),
         acc.total_secs,
     );
+}
+
+#[inline]
+fn farmcpu_stage1_debug_path() -> Option<String> {
+    match std::env::var("JX_FARMCPU_STAGE1_DEBUG_PATH") {
+        Ok(raw) => {
+            let s = raw.trim();
+            if s.is_empty() {
+                None
+            } else {
+                Some(s.to_string())
+            }
+        }
+        Err(_) => None,
+    }
+}
+
+struct FarmcpuStage1DebugSink {
+    writer: BufWriter<File>,
+}
+
+impl FarmcpuStage1DebugSink {
+    fn from_env() -> Result<Option<Self>, String> {
+        let Some(path) = farmcpu_stage1_debug_path() else {
+            return Ok(None);
+        };
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|e| format!("failed to open FarmCPU stage1 debug path '{path}': {e}"))?;
+        Ok(Some(Self {
+            writer: BufWriter::new(file),
+        }))
+    }
+
+    fn write_line(&mut self, line: &str) -> Result<(), String> {
+        self.writer
+            .write_all(line.as_bytes())
+            .map_err(|e| format!("failed to write FarmCPU stage1 debug line: {e}"))?;
+        self.writer
+            .write_all(b"\n")
+            .map_err(|e| format!("failed to terminate FarmCPU stage1 debug line: {e}"))
+    }
+
+    fn flush(&mut self) -> Result<(), String> {
+        self.writer
+            .flush()
+            .map_err(|e| format!("failed to flush FarmCPU stage1 debug sink: {e}"))
+    }
+}
+
+fn farmcpu_debug_format_idx_list_1based(idx: &[usize], row_idx: Option<&[usize]>) -> String {
+    if idx.is_empty() {
+        return "NULL".to_string();
+    }
+    let mut out = String::new();
+    for (i, &marker_idx) in idx.iter().enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        let src1 = row_idx
+            .and_then(|rows| rows.get(marker_idx).copied())
+            .unwrap_or(marker_idx)
+            .saturating_add(1);
+        let _ = write!(out, "{src1}");
+    }
+    out
+}
+
+fn farmcpu_debug_format_marker_list(
+    idx: &[usize],
+    row_idx: Option<&[usize]>,
+    chrom: &[String],
+    pos: &[i64],
+    pval: &[f64],
+) -> String {
+    if idx.is_empty() {
+        return "NULL".to_string();
+    }
+    let mut out = String::new();
+    for (i, &marker_idx) in idx.iter().enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        let src1 = row_idx
+            .and_then(|rows| rows.get(marker_idx).copied())
+            .unwrap_or(marker_idx)
+            .saturating_add(1);
+        let chrom_name = chrom
+            .get(marker_idx)
+            .map(|v| v.as_str())
+            .unwrap_or("<missing_chr>");
+        let pos_bp = pos.get(marker_idx).copied().unwrap_or(-1_i64);
+        let p = pval.get(marker_idx).copied().unwrap_or(1.0_f64);
+        if p.is_finite() {
+            let _ = write!(out, "{src1}|{chrom_name}:{pos_bp}|{p:.6e}");
+        } else {
+            let _ = write!(out, "{src1}|{chrom_name}:{pos_bp}|NA");
+        }
+    }
+    out
+}
+
+fn farmcpu_debug_format_marker_names(
+    idx: &[usize],
+    row_idx: Option<&[usize]>,
+    chrom: &[String],
+    pos: &[i64],
+) -> String {
+    if idx.is_empty() {
+        return "NULL".to_string();
+    }
+    let mut out = String::new();
+    for (i, &marker_idx) in idx.iter().enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        let src1 = row_idx
+            .and_then(|rows| rows.get(marker_idx).copied())
+            .unwrap_or(marker_idx)
+            .saturating_add(1);
+        let chrom_name = chrom
+            .get(marker_idx)
+            .map(|v| v.as_str())
+            .unwrap_or("<missing_chr>");
+        let pos_bp = pos.get(marker_idx).copied().unwrap_or(-1_i64);
+        let _ = write!(out, "{src1}|{chrom_name}:{pos_bp}");
+    }
+    out
 }
 
 #[inline]
@@ -958,8 +1088,7 @@ fn farmcpu_ll_score_from_sample_major_legacy_prepared(
 
                 let mut part222 = 0.0_f64;
                 for row in 0..n {
-                    let resid_i =
-                        y_resid[row] - dot(&x_resid[row * p..(row + 1) * p], &beta);
+                    let resid_i = y_resid[row] - dot(&x_resid[row * p..(row + 1) * p], &beta);
                     part222 += resid_i * resid_i;
                 }
                 part222 /= delta;
@@ -3514,6 +3643,38 @@ pub fn farmcpu_packed_to_tsv(
         let mut qtn_best_score: HashMap<usize, f64> = HashMap::new();
         let stage1_timing = farmcpu_stage1_timing_enabled();
         let mut stage1_timing_acc = FarmcpuStage1TimingAccum::default();
+        let mut stage1_debug =
+            FarmcpuStage1DebugSink::from_env().map_err(PyRuntimeError::new_err)?;
+        if let Some(debug) = stage1_debug.as_mut() {
+            debug
+                .write_line(&format!(
+                    "run_start route={:?} threshold={:.6e} raw_threshold={:.6e} qtn_bound={} qtn_stage_cap={} nbin={} nbin_vals={} szbin_bp={} final_window_bp={} stage1_ld_r2={:.6} final_ld_r2={:.6} markers={} samples={} q_base={}",
+                    route,
+                    qtn_threshold_eff,
+                    raw_qtn_threshold_eff,
+                    qb_eff,
+                    qtn_stage_cap,
+                    nbin_den,
+                    nbin_vals
+                        .iter()
+                        .map(|v| v.to_string())
+                        .collect::<Vec<String>>()
+                        .join(","),
+                    szbin_i64
+                        .iter()
+                        .map(|v| v.to_string())
+                        .collect::<Vec<String>>()
+                        .join(","),
+                    final_window_bp,
+                    stage1_ld_thr,
+                    final_ld_thr,
+                    m,
+                    n,
+                    q_base,
+                ))
+                .map_err(PyRuntimeError::new_err)?;
+            debug.flush().map_err(PyRuntimeError::new_err)?;
+        }
         if matches!(route, FarmcpuRoute::Unified) {
             for it_idx in 0..max_iter_i {
                 let iter_t0 = if stage1_timing {
@@ -3727,6 +3888,31 @@ pub fn farmcpu_packed_to_tsv(
                 if let Some(t0) = t_merge {
                     merge_secs = t0.elapsed().as_secs_f64();
                 }
+                if let Some(debug) = stage1_debug.as_mut() {
+                    debug
+                        .write_line(&format!(
+                            "iter route=unified iter={} qtn_in_n={} candidate_n={} lead_n={} qtn_next_n={} qtn_in_rows1={} lead_rows1={} qtn_next_rows1={}",
+                            it_idx + 1,
+                            qtn_in,
+                            candidate_count,
+                            opt_lead.len(),
+                            qtn_next.len(),
+                            farmcpu_debug_format_idx_list_1based(&qtn_idx, row_idx.as_deref()),
+                            farmcpu_debug_format_idx_list_1based(&opt_lead, row_idx.as_deref()),
+                            farmcpu_debug_format_idx_list_1based(&qtn_next, row_idx.as_deref()),
+                        ))
+                        .map_err(PyRuntimeError::new_err)?;
+                    debug
+                        .write_line(&format!(
+                            "iter_detail route=unified iter={} qtn_in={} lead={} qtn_next={}",
+                            it_idx + 1,
+                            farmcpu_debug_format_marker_list(&qtn_idx, row_idx.as_deref(), &chrom, &pos, &femp),
+                            farmcpu_debug_format_marker_list(&opt_lead, row_idx.as_deref(), &chrom, &pos, &femp_masked),
+                            farmcpu_debug_format_marker_list(&qtn_next, row_idx.as_deref(), &chrom, &pos, &femp),
+                        ))
+                        .map_err(PyRuntimeError::new_err)?;
+                    debug.flush().map_err(PyRuntimeError::new_err)?;
+                }
 
                 let t_cb = if stage1_timing {
                     Some(Instant::now())
@@ -3869,6 +4055,25 @@ pub fn farmcpu_packed_to_tsv(
                     .filter(|&&p| p.is_finite() && p <= raw_qtn_threshold_eff)
                     .count();
                 if signal_count == 0 {
+                    if let Some(debug) = stage1_debug.as_mut() {
+                        debug
+                            .write_line(&format!(
+                                "iter route=raw iter={} qtn_in_n={} signal_n=0 lead_n=0 qtn_next_n={} qtn_in_rows1={}",
+                                it_idx + 1,
+                                qtn_in,
+                                qtn_in,
+                                farmcpu_debug_format_idx_list_1based(&qtn_idx, row_idx.as_deref()),
+                            ))
+                            .map_err(PyRuntimeError::new_err)?;
+                        debug
+                            .write_line(&format!(
+                            "iter_detail route=raw iter={} qtn_in={}",
+                            it_idx + 1,
+                            farmcpu_debug_format_marker_list(&qtn_idx, row_idx.as_deref(), &chrom, &pos, &femp),
+                            ))
+                            .map_err(PyRuntimeError::new_err)?;
+                        debug.flush().map_err(PyRuntimeError::new_err)?;
+                    }
                     final_model_cache = Some((x_qtn, q_total, ixx));
                     let t_cb = if stage1_timing {
                         Some(Instant::now())
@@ -3947,7 +4152,7 @@ pub fn farmcpu_packed_to_tsv(
                     None
                 };
                 let mut qtn_union = qtn_idx.clone();
-                qtn_union.extend(opt_lead.into_iter());
+                qtn_union.extend(opt_lead.iter().copied());
                 qtn_union.sort_unstable();
                 qtn_union.dedup();
 
@@ -3978,8 +4183,44 @@ pub fn farmcpu_packed_to_tsv(
                             .filter_map(|(&ix, &k)| if k { Some(ix) } else { None })
                             .collect()
                 };
+                let opt_lead_outside_threshold: Vec<usize> = opt_lead
+                    .iter()
+                    .copied()
+                    .filter(|&idx| {
+                        let p = femp.get(idx).copied().unwrap_or(1.0_f64);
+                        !(p.is_finite() && p <= raw_qtn_threshold_eff)
+                    })
+                    .collect();
                 if let Some(t0) = t_merge {
                     merge_secs = t0.elapsed().as_secs_f64();
+                }
+                if let Some(debug) = stage1_debug.as_mut() {
+                    debug
+                        .write_line(&format!(
+                            "iter route=raw iter={} qtn_in_n={} signal_n={} lead_n={} lead_outside_threshold_n={} qtn_next_n={} qtn_in_rows1={} lead_rows1={} lead_outside_threshold_rows1={} qtn_next_rows1={}",
+                            it_idx + 1,
+                            qtn_in,
+                            signal_count,
+                            opt_lead.len(),
+                            opt_lead_outside_threshold.len(),
+                            qtn_next.len(),
+                            farmcpu_debug_format_idx_list_1based(&qtn_idx, row_idx.as_deref()),
+                            farmcpu_debug_format_idx_list_1based(&opt_lead, row_idx.as_deref()),
+                            farmcpu_debug_format_idx_list_1based(&opt_lead_outside_threshold, row_idx.as_deref()),
+                            farmcpu_debug_format_idx_list_1based(&qtn_next, row_idx.as_deref()),
+                        ))
+                        .map_err(PyRuntimeError::new_err)?;
+                    debug
+                        .write_line(&format!(
+                            "iter_detail route=raw iter={} qtn_in={} lead={} lead_outside_threshold={} qtn_next={}",
+                            it_idx + 1,
+                            farmcpu_debug_format_marker_list(&qtn_idx, row_idx.as_deref(), &chrom, &pos, &femp),
+                            farmcpu_debug_format_marker_list(&opt_lead, row_idx.as_deref(), &chrom, &pos, &femp),
+                            farmcpu_debug_format_marker_list(&opt_lead_outside_threshold, row_idx.as_deref(), &chrom, &pos, &femp),
+                            farmcpu_debug_format_marker_list(&qtn_next, row_idx.as_deref(), &chrom, &pos, &femp),
+                        ))
+                        .map_err(PyRuntimeError::new_err)?;
+                    debug.flush().map_err(PyRuntimeError::new_err)?;
                 }
 
                 let t_cb = if stage1_timing {
@@ -4088,6 +4329,18 @@ pub fn farmcpu_packed_to_tsv(
                     final_merge_secs,
                 );
             }
+        }
+        if let Some(debug) = stage1_debug.as_mut() {
+            debug
+                .write_line(&format!(
+                    "run_final route={:?} final_qtn_n={} final_qtn_rows1={} final_qtn={}",
+                    route,
+                    qtn_idx.len(),
+                    farmcpu_debug_format_idx_list_1based(&qtn_idx, row_idx.as_deref()),
+                    farmcpu_debug_format_marker_names(&qtn_idx, row_idx.as_deref(), &chrom, &pos),
+                ))
+                .map_err(PyRuntimeError::new_err)?;
+            debug.flush().map_err(PyRuntimeError::new_err)?;
         }
 
         if stage1_timing {

@@ -554,7 +554,10 @@ pub(crate) fn wrap_help_text(text: &str, width: usize) -> Vec<String> {
     out
 }
 
-pub(crate) fn run_with_spinner(cmd: &mut Command, desc: &str) -> Result<(Output, Duration), String> {
+pub(crate) fn run_with_spinner(
+    cmd: &mut Command,
+    desc: &str,
+) -> Result<(Output, Duration), String> {
     let start = Instant::now();
     let is_tty = io::stdout().is_terminal();
     let done = Arc::new(AtomicBool::new(false));

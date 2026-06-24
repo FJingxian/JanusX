@@ -111,6 +111,7 @@ class RunResult:
     log_file: str
     time_file: str
     note: str
+    debug_file: str = ""
 
 
 @dataclass
@@ -436,6 +437,104 @@ def _write_qtn_sidecar_from_assoc_result(
             if row is None:
                 continue
             writer.writerow(row if has_source_row else [*row, str(row_idx0)])
+
+
+def _collect_assoc_rows_by_index(
+    result_file: Path,
+    source_rows_0based: list[int],
+) -> tuple[list[str], dict[int, list[str]]]:
+    wanted: list[int] = []
+    seen: set[int] = set()
+    for idx0 in source_rows_0based:
+        try:
+            idx = int(idx0)
+        except Exception:
+            continue
+        if idx < 0 or idx in seen:
+            continue
+        seen.add(idx)
+        wanted.append(idx)
+    if not result_file.exists():
+        return [], {}
+    with result_file.open("r", encoding="utf-8", errors="ignore", newline="") as rf:
+        reader = csv.reader(rf, delimiter="\t")
+        header = next(reader, None)
+        if header is None:
+            return [], {}
+        if len(wanted) == 0:
+            return header, {}
+        wanted_set = set(wanted)
+        selected_rows: dict[int, list[str]] = {}
+        remaining = len(wanted_set)
+        for row_idx0, row in enumerate(reader):
+            if row_idx0 not in wanted_set:
+                continue
+            selected_rows[row_idx0] = row
+            remaining -= 1
+            if remaining <= 0:
+                break
+    return header, selected_rows
+
+
+def _write_rmvp_seqqtn_debug_sidecar_from_assoc_result(
+    result_file: Path,
+    debug_file: Path,
+    seq_blocks: list[dict[str, Any]],
+) -> None:
+    if not result_file.exists():
+        return
+    source_rows_0based: list[int] = []
+    for block in seq_blocks:
+        for idx1 in block.get("source_rows_1based", []):
+            try:
+                idx0 = int(idx1) - 1
+            except Exception:
+                continue
+            if idx0 >= 0:
+                source_rows_0based.append(idx0)
+    header, selected_rows = _collect_assoc_rows_by_index(result_file, source_rows_0based)
+    if not header:
+        return
+    debug_file.parent.mkdir(parents=True, exist_ok=True)
+    debug_header = [
+        "block_idx",
+        "current_loop",
+        "is_final_block",
+        "block_qtn_count",
+        "qtn_order",
+        "source_row1",
+        "source_row0",
+        *header,
+    ]
+    final_block_idx = len(seq_blocks)
+    with debug_file.open("w", encoding="utf-8", newline="") as wf:
+        writer = csv.writer(wf, delimiter="\t", lineterminator="\n")
+        writer.writerow(debug_header)
+        for block in seq_blocks:
+            block_idx = int(block.get("block_idx", 0) or 0)
+            current_loop = block.get("current_loop", None)
+            current_loop_out = "" if current_loop is None else str(int(current_loop))
+            source_rows_1based = [int(x) for x in block.get("source_rows_1based", []) if int(x) > 0]
+            block_qtn_count = len(source_rows_1based)
+            if block_qtn_count == 0:
+                continue
+            for qtn_order, idx1 in enumerate(source_rows_1based, start=1):
+                idx0 = int(idx1) - 1
+                row = selected_rows.get(idx0)
+                if row is None:
+                    continue
+                writer.writerow(
+                    [
+                        str(block_idx),
+                        current_loop_out,
+                        "1" if block_idx == final_block_idx else "0",
+                        str(block_qtn_count),
+                        str(qtn_order),
+                        str(idx1),
+                        str(idx0),
+                        *row,
+                    ]
+                )
 
 
 def _first_col(colmap: dict[str, str], keys: Iterable[str]) -> Optional[str]:
@@ -1768,6 +1867,7 @@ def _run_kernel_janusx(
         log_file=str(log_file),
         time_file=str(time_file),
         note=note,
+        debug_file="",
     )
 
 
@@ -1854,6 +1954,7 @@ def _run_kernel_r(
     status = "ok" if rc == 0 else "failed"
     pseudo_qtn = None
     qtn_file = ""
+    debug_file = ""
     note = ""
     pseudo_qtn_metric = ""
 
@@ -1887,6 +1988,20 @@ def _run_kernel_r(
                 )
                 if qtn_file_path.exists():
                     qtn_file = str(qtn_file_path)
+                if bool(getattr(args, "rmvp_debug_seqqtn", False)) and inner_log.exists():
+                    try:
+                        seq_blocks = _parse_rmvp_seqqtn_blocks(inner_log.read_text(errors="ignore"))
+                        debug_file_path = result_file.with_suffix(".seqqtn.debug.tsv")
+                        _write_rmvp_seqqtn_debug_sidecar_from_assoc_result(
+                            result_file=result_file,
+                            debug_file=debug_file_path,
+                            seq_blocks=seq_blocks,
+                        )
+                        if debug_file_path.exists():
+                            debug_file = str(debug_file_path)
+                    except Exception as e:
+                        warn = f"rmvp seqQTN debug sidecar failed: {e}"
+                        note = f"{note}; {warn}" if note else warn
                 topk_count, topk_snps = _extract_topk(result_file, topk_file, args.topk)
             except Exception as e:
                 status = "failed"
@@ -1915,6 +2030,7 @@ def _run_kernel_r(
         log_file=str(log_file),
         time_file=str(time_file),
         note=note,
+        debug_file=debug_file if debug_file and Path(debug_file).exists() else "",
     )
 
 
@@ -2018,12 +2134,35 @@ _SEQQTN_BLOCK_STOP_RE = re.compile(
     r"(current loop|optimizing|scanning|number of covariates|farmcpu\.lm|genomic inflation)",
     re.IGNORECASE,
 )
+_CURRENT_LOOP_RE = re.compile(r"current loop:\s*(\d+)", re.IGNORECASE)
 
 
-def _parse_rmvp_final_seqqtn_indices(text: str) -> list[int]:
+def _unique_positive_ints_preserve_order(values: Iterable[Any]) -> list[int]:
+    out: list[int] = []
+    seen: set[int] = set()
+    for raw in values:
+        try:
+            val = int(raw)
+        except Exception:
+            continue
+        if val <= 0 or val in seen:
+            continue
+        seen.add(val)
+        out.append(val)
+    return out
+
+
+def _parse_rmvp_seqqtn_blocks(text: str) -> list[dict[str, Any]]:
     lines = str(text).splitlines()
-    last: Optional[list[int]] = None
+    blocks: list[dict[str, Any]] = []
+    current_loop: Optional[int] = None
     for idx, line in enumerate(lines):
+        m_loop = _CURRENT_LOOP_RE.search(line)
+        if m_loop is not None:
+            try:
+                current_loop = int(m_loop.group(1))
+            except Exception:
+                current_loop = None
         if not re.search(r"\bseqQTN\b", line, re.IGNORECASE):
             continue
         vals: list[int] = []
@@ -2044,12 +2183,24 @@ def _parse_rmvp_final_seqqtn_indices(text: str) -> list[int]:
                 nums = nums[1:]
             vals.extend(nums)
             j += 1
-        if saw_payload:
-            last = vals
-    if last is None:
+        if not saw_payload:
+            continue
+        blocks.append(
+            {
+                "block_idx": len(blocks) + 1,
+                "current_loop": current_loop,
+                "source_rows_1based": _unique_positive_ints_preserve_order(vals),
+            }
+        )
+    return blocks
+
+
+def _parse_rmvp_final_seqqtn_indices(text: str) -> list[int]:
+    blocks = _parse_rmvp_seqqtn_blocks(text)
+    if len(blocks) == 0:
         return []
-    uniq = sorted({int(v) for v in last if int(v) > 0})
-    return uniq
+    last = blocks[-1].get("source_rows_1based", [])
+    return [int(v) for v in last if int(v) > 0]
 
 
 def _rmvp_pseudo_qtn_snp_set_from_summary_row(row: pd.Series) -> set[str]:
@@ -2145,6 +2296,7 @@ def _save_summary(out_dir: Path, prefix: str, rows: list[RunResult], extra_cfg: 
                 "log_file": r.log_file,
                 "time_file": r.time_file,
                 "note": r.note,
+                "debug_file": r.debug_file,
             }
         )
     df = pd.DataFrame(recs)
@@ -2215,6 +2367,7 @@ def _save_summary(out_dir: Path, prefix: str, rows: list[RunResult], extra_cfg: 
             "The embedded rMVP runner trims the FarmCPU `map` input to `SNP/CHROM/POS`; full map columns are kept only for output annotation.",
             "`rmvp` pseudoQTN is the final `seqQTN` / covariate count parsed from the last loop; `janusx` pseudoQTN is the workflow-reported JanusX count.",
             "`qtn_file` is a post-run sidecar and is not included in the timed rMVP execution.",
+            "`debug_file` (when enabled via `--rmvp-debug-seqqtn`) is also a post-run sidecar and is not included in the timed rMVP execution.",
         ]
     )
     mat_head_cnt = "| kernel | " + " | ".join(kernel_order) + " |"
@@ -2443,6 +2596,16 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
             else argparse.SUPPRESS
         ),
     )
+    advanced_group.add_argument(
+        "--rmvp-debug-seqqtn",
+        action="store_true",
+        default=False,
+        help=(
+            "Write a post-run rMVP seqQTN debug sidecar with block/loop/source_row/chr/pos/snp mapping."
+            if show_dev_help
+            else argparse.SUPPRESS
+        ),
+    )
 
     if any(
         (tk == "-trait") or tk.startswith("-trait=") or (tk == "--trait") or tk.startswith("--trait=")
@@ -2663,6 +2826,7 @@ def main() -> None:
         "rmvp_vc_method_note": "not_exposed_by_direct_mvp_farmcpu_entrypoint",
         "rmvp_reuse_cache": bool(args.rmvp_reuse_cache),
         "rmvp_force_rebuild": (not bool(args.rmvp_reuse_cache)),
+        "rmvp_debug_seqqtn": bool(args.rmvp_debug_seqqtn),
         "rmvp_method_bin": str(align_runtime.rmvp_method_bin),
         "force_pseudo_qtn_cap": (None if args.force_pseudo_qtn_cap is None else int(args.force_pseudo_qtn_cap)),
         "conversion_elapsed_sec": float(conv_elapsed),

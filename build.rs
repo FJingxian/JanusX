@@ -726,7 +726,10 @@ fn try_link_windows_kmc_zlib(target_arch: &str, kmc_src_dir: &Path) -> bool {
 
     if let Some(cand) = windows_find_kmc_zlib_candidate() {
         if let Some(parent) = cand.parent() {
-            println!("cargo:rustc-link-search=native={}", parent.to_string_lossy());
+            println!(
+                "cargo:rustc-link-search=native={}",
+                parent.to_string_lossy()
+            );
         }
         println!("cargo:rustc-link-arg={}", cand.to_string_lossy());
         emit_verbose_note(format!(

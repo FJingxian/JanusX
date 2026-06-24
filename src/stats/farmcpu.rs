@@ -138,6 +138,29 @@ fn farmcpu_stage1_timing_enabled() -> bool {
     env_truthy("JX_FARMCPU_STAGE1_TIMING")
 }
 
+#[inline]
+fn farmcpu_raw_major_impute_enabled() -> bool {
+    std::env::var("JX_FARMCPU_RAW_IMPUTE_MAJOR").map_or(true, |v| {
+        let raw = v.trim().to_ascii_lowercase();
+        if matches!(raw.as_str(), "1" | "true" | "yes" | "y" | "on") {
+            true
+        } else if matches!(raw.as_str(), "0" | "false" | "no" | "n" | "off") {
+            false
+        } else {
+            true
+        }
+    })
+}
+
+#[inline]
+fn farmcpu_missing_impute_value(mean_g: f64, impute_major: bool) -> f64 {
+    if impute_major {
+        if mean_g > 1.0_f64 { 2.0_f64 } else { 0.0_f64 }
+    } else {
+        mean_g
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct FarmcpuStage1TimingAccum {
     iter_count: usize,
@@ -411,6 +434,77 @@ fn farmcpu_debug_format_marker_names(
 }
 
 #[inline]
+fn farmcpu_debug_format_score(v: f64) -> String {
+    if v.is_nan() {
+        "NaN".to_string()
+    } else if v.is_infinite() {
+        if v.is_sign_negative() {
+            "-Inf".to_string()
+        } else {
+            "Inf".to_string()
+        }
+    } else {
+        format!("{v:.6e}")
+    }
+}
+
+#[derive(Clone, Debug)]
+struct FarmcpuRemComboResult {
+    sz: i64,
+    n_lead: usize,
+    score: f64,
+    leadidx: Vec<usize>,
+}
+
+#[derive(Clone, Debug)]
+struct FarmcpuRemLeadSearchResult {
+    best_combo_idx: usize,
+    combos: Vec<FarmcpuRemComboResult>,
+}
+
+fn farmcpu_stage1_emit_rem_combo_debug(
+    debug: &mut FarmcpuStage1DebugSink,
+    route: FarmcpuRoute,
+    iter_idx1: usize,
+    rem_result: &FarmcpuRemLeadSearchResult,
+    row_idx: Option<&[usize]>,
+    chrom: &[String],
+    pos: &[i64],
+    pval: &[f64],
+) -> Result<(), String> {
+    let route_label = if matches!(route, FarmcpuRoute::Raw) {
+        "raw"
+    } else {
+        "unified"
+    };
+    for (combo_idx0, combo) in rem_result.combos.iter().enumerate() {
+        let combo_idx1 = combo_idx0 + 1;
+        debug.write_line(&format!(
+            "rem_combo route={} iter={} combo_idx={} is_best={} sz={} nbin={} lead_n={} score={} lead_rows1={}",
+            route_label,
+            iter_idx1,
+            combo_idx1,
+            if combo_idx0 == rem_result.best_combo_idx { 1 } else { 0 },
+            combo.sz,
+            combo.n_lead,
+            combo.leadidx.len(),
+            farmcpu_debug_format_score(combo.score),
+            farmcpu_debug_format_idx_list_1based(&combo.leadidx, row_idx),
+        ))?;
+        debug.write_line(&format!(
+            "rem_combo_detail route={} iter={} combo_idx={} sz={} nbin={} lead={}",
+            route_label,
+            iter_idx1,
+            combo_idx1,
+            combo.sz,
+            combo.n_lead,
+            farmcpu_debug_format_marker_list(&combo.leadidx, row_idx, chrom, pos, pval),
+        ))?;
+    }
+    debug.flush()
+}
+
+#[inline]
 fn dot(a: &[f64], b: &[f64]) -> f64 {
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
 }
@@ -545,6 +639,7 @@ pub(crate) fn decode_packed_rows_to_sample_major(
     let n = sample_idx.len();
     let k = row_indices.len();
     let packed_rows = packed_flat.len() / bytes_per_snp;
+    let impute_major = farmcpu_raw_major_impute_enabled();
     let mut out = vec![0.0_f64; n * k];
     for (col, &local_row_idx) in row_indices.iter().enumerate() {
         if local_row_idx >= row_flip.len() || local_row_idx >= row_maf.len() {
@@ -576,12 +671,13 @@ pub(crate) fn decode_packed_rows_to_sample_major(
             &packed_flat[packed_row_idx * bytes_per_snp..(packed_row_idx + 1) * bytes_per_snp];
         let flip = row_flip[local_row_idx];
         let mean_g = 2.0_f64 * row_maf[local_row_idx] as f64;
+        let missing_g = farmcpu_missing_impute_value(mean_g, impute_major);
         for (i, &sidx) in sample_idx.iter().enumerate() {
             let b = row[sidx >> 2];
             let code = (b >> ((sidx & 3) * 2)) & 0b11;
             let mut gv = match decode_plink_bed_hardcall(code) {
                 Some(v) => v,
-                None => mean_g,
+                None => missing_g,
             };
             if flip && code != 0b01 {
                 gv = 2.0 - gv;
@@ -1777,7 +1873,7 @@ fn farmcpu_best_rem_lead_set(
     row_flip: &[bool],
     row_maf: &[f32],
     pool: Option<&std::sync::Arc<rayon::ThreadPool>>,
-) -> Result<Vec<usize>, String> {
+) -> Result<FarmcpuRemLeadSearchResult, String> {
     let n = y.len();
     let rem_prepared = Some(prepare_farmcpu_exact_rem(y, x_qtn, n, q_total)?);
     let raw_rem_scorer = farmcpu_raw_rem_scorer_mode();
@@ -1788,7 +1884,10 @@ fn farmcpu_best_rem_lead_set(
         }
     }
     if combine.is_empty() {
-        return Ok(Vec::new());
+        return Ok(FarmcpuRemLeadSearchResult {
+            best_combo_idx: 0usize,
+            combos: Vec::new(),
+        });
     }
 
     let rem_task = || {
@@ -1807,7 +1906,14 @@ fn farmcpu_best_rem_lead_set(
                 );
                 let sample_major = match sample_major {
                     Ok(v) => v,
-                    Err(_) => return (f64::INFINITY, leadidx),
+                    Err(_) => {
+                        return FarmcpuRemComboResult {
+                            sz,
+                            n_lead: nn,
+                            score: f64::INFINITY,
+                            leadidx,
+                        }
+                    }
                 };
                 let score = match route {
                     FarmcpuRoute::Raw => match raw_rem_scorer {
@@ -1848,9 +1954,14 @@ fn farmcpu_best_rem_lead_set(
                     ),
                 }
                 .unwrap_or(f64::INFINITY);
-                (score, leadidx)
+                FarmcpuRemComboResult {
+                    sz,
+                    n_lead: nn,
+                    score,
+                    leadidx,
+                }
             })
-            .collect::<Vec<(f64, Vec<usize>)>>()
+            .collect::<Vec<FarmcpuRemComboResult>>()
     };
     let rem_res = if let Some(p) = pool {
         p.install(rem_task)
@@ -1858,17 +1969,23 @@ fn farmcpu_best_rem_lead_set(
         rem_task()
     };
     if rem_res.is_empty() {
-        return Ok(Vec::new());
+        return Ok(FarmcpuRemLeadSearchResult {
+            best_combo_idx: 0usize,
+            combos: Vec::new(),
+        });
     }
     let mut best_i = 0usize;
-    let mut best_score = rem_res[0].0;
-    for (i, (s, _)) in rem_res.iter().enumerate().skip(1) {
-        if s.total_cmp(&best_score).is_lt() {
-            best_score = *s;
+    let mut best_score = rem_res[0].score;
+    for (i, combo) in rem_res.iter().enumerate().skip(1) {
+        if combo.score.total_cmp(&best_score).is_lt() {
+            best_score = combo.score;
             best_i = i;
         }
     }
-    Ok(rem_res[best_i].1.clone())
+    Ok(FarmcpuRemLeadSearchResult {
+        best_combo_idx: best_i,
+        combos: rem_res,
+    })
 }
 
 fn build_x_with_qtn_packed(
@@ -1972,6 +2089,7 @@ fn scan_packed_full_matrix(
     let yy: f64 = y.iter().map(|v| v * v).sum();
     let mut out = vec![f64::NAN; m * row_stride];
     let pool = get_cached_pool(threads).map_err(|e| e.to_string())?;
+    let impute_major = farmcpu_raw_major_impute_enabled();
     let mut runner = || {
         out.par_chunks_mut(row_stride).enumerate().for_each_init(
             || GlmScratch::new(q0),
@@ -1981,6 +2099,7 @@ fn scan_packed_full_matrix(
                 let row = &packed_flat[src_row * bytes_per_snp..(src_row + 1) * bytes_per_snp];
                 let flip = row_flip[idx];
                 let mean_g = (2.0_f64 * row_maf[idx] as f64).max(0.0);
+                let missing_g = farmcpu_missing_impute_value(mean_g, impute_major);
                 let mut sy = 0.0_f64;
                 let mut ss = 0.0_f64;
                 for (k, &sidx) in sample_idx.iter().enumerate() {
@@ -1988,7 +2107,7 @@ fn scan_packed_full_matrix(
                     let code = (b >> ((sidx & 3) * 2)) & 0b11;
                     let mut gv = match decode_plink_bed_hardcall(code) {
                         Some(v) => v,
-                        None => mean_g,
+                        None => missing_g,
                     };
                     if flip && code != 0b01 {
                         gv = 2.0 - gv;
@@ -2124,6 +2243,7 @@ fn scan_packed_full_matrix_reduced(
         .collect::<Vec<f64>>();
     let code4_lut = &packed_byte_lut().code4;
     let full_sample_fast = sample_idx.iter().enumerate().all(|(i, &s)| i == s);
+    let impute_major = farmcpu_raw_major_impute_enabled();
 
     let mut marker_p = vec![1.0_f64; m];
     let pool = get_cached_pool(threads).map_err(|e| e.to_string())?;
@@ -2148,6 +2268,7 @@ fn scan_packed_full_matrix_reduced(
                 n_samples,
                 row_flip,
                 row_maf,
+                impute_major,
                 sample_idx,
                 full_sample_fast,
                 row_indices,
@@ -2395,6 +2516,7 @@ fn farmcpu_conditional_subset_stats(
 
     let mut out = vec![[f64::NAN; 3]; target_rows.len()];
     let pool = get_cached_pool(threads).map_err(|e| e.to_string())?;
+    let impute_major = farmcpu_raw_major_impute_enabled();
     let mut runner = || {
         out.par_iter_mut()
             .zip(target_rows.par_iter())
@@ -2409,6 +2531,7 @@ fn farmcpu_conditional_subset_stats(
                     let row = &packed_flat[src_row * bytes_per_snp..(src_row + 1) * bytes_per_snp];
                     let flip = row_flip[idx];
                     let mean_g = (2.0_f64 * row_maf[idx] as f64).max(0.0);
+                    let missing_g = farmcpu_missing_impute_value(mean_g, impute_major);
                     let mut sy_resid = 0.0_f64;
                     let mut ss = 0.0_f64;
                     for (k, &sidx) in sample_idx.iter().enumerate() {
@@ -2416,7 +2539,7 @@ fn farmcpu_conditional_subset_stats(
                         let code = (b >> ((sidx & 3) * 2)) & 0b11;
                         let mut gv = match decode_plink_bed_hardcall(code) {
                             Some(v) => v,
-                            None => mean_g,
+                            None => missing_g,
                         };
                         if flip && code != 0b01 {
                             gv = 2.0 - gv;
@@ -2540,6 +2663,7 @@ fn farmcpu_scan_packed_marker_pvalues(
     let pool = get_cached_pool(threads).map_err(|e| e.to_string())?;
     let code4_lut = &packed_byte_lut().code4;
     let full_sample_fast = sample_idx.iter().enumerate().all(|(i, &s)| i == s);
+    let impute_major = farmcpu_raw_major_impute_enabled();
     let row_block = 8192usize;
     let mut geno_buf = vec![0.0_f64; row_block * n];
     let mut xs_buf = vec![0.0_f64; row_block * q0];
@@ -2561,6 +2685,7 @@ fn farmcpu_scan_packed_marker_pvalues(
                 n_samples,
                 row_flip,
                 row_maf,
+                impute_major,
                 sample_idx,
                 full_sample_fast,
                 row_indices,
@@ -2843,6 +2968,7 @@ fn write_farmcpu_packed_main_scan(
     let pool = get_cached_pool(threads).map_err(|e| e.to_string())?;
     let code4_lut = &packed_byte_lut().code4;
     let full_sample_fast = sample_idx.iter().enumerate().all(|(i, &s)| i == s);
+    let impute_major = farmcpu_raw_major_impute_enabled();
     let row_block = 8192usize;
     let row_stride = 3usize;
     let mut geno_buf = vec![0.0_f64; row_block * n];
@@ -2875,6 +3001,7 @@ fn write_farmcpu_packed_main_scan(
                 n_samples,
                 row_flip,
                 row_maf,
+                impute_major,
                 sample_idx,
                 full_sample_fast,
                 row_indices,
@@ -3807,7 +3934,7 @@ pub fn farmcpu_packed_to_tsv(
                 } else {
                     None
                 };
-                let opt_lead = farmcpu_best_rem_lead_set(
+                let rem_result = farmcpu_best_rem_lead_set(
                     route,
                     y,
                     &x_qtn,
@@ -3825,8 +3952,26 @@ pub fn farmcpu_packed_to_tsv(
                     pool.as_ref(),
                 )
                 .map_err(PyRuntimeError::new_err)?;
+                let opt_lead = rem_result
+                    .combos
+                    .get(rem_result.best_combo_idx)
+                    .map(|combo| combo.leadidx.clone())
+                    .unwrap_or_default();
                 if let Some(t0) = t_rem {
                     rem_secs = t0.elapsed().as_secs_f64();
+                }
+                if let Some(debug) = stage1_debug.as_mut() {
+                    farmcpu_stage1_emit_rem_combo_debug(
+                        debug,
+                        route,
+                        it_idx + 1,
+                        &rem_result,
+                        row_idx.as_deref(),
+                        &chrom,
+                        &pos,
+                        &femp_masked,
+                    )
+                    .map_err(PyRuntimeError::new_err)?;
                 }
                 let t_merge = if stage1_timing {
                     Some(Instant::now())
@@ -4125,7 +4270,7 @@ pub fn farmcpu_packed_to_tsv(
                 } else {
                     None
                 };
-                let opt_lead = farmcpu_best_rem_lead_set(
+                let rem_result = farmcpu_best_rem_lead_set(
                     route,
                     y,
                     &x_qtn,
@@ -4143,8 +4288,26 @@ pub fn farmcpu_packed_to_tsv(
                     pool.as_ref(),
                 )
                 .map_err(PyRuntimeError::new_err)?;
+                let opt_lead = rem_result
+                    .combos
+                    .get(rem_result.best_combo_idx)
+                    .map(|combo| combo.leadidx.clone())
+                    .unwrap_or_default();
                 if let Some(t0) = t_rem {
                     rem_secs = t0.elapsed().as_secs_f64();
+                }
+                if let Some(debug) = stage1_debug.as_mut() {
+                    farmcpu_stage1_emit_rem_combo_debug(
+                        debug,
+                        route,
+                        it_idx + 1,
+                        &rem_result,
+                        row_idx.as_deref(),
+                        &chrom,
+                        &pos,
+                        &femp,
+                    )
+                    .map_err(PyRuntimeError::new_err)?;
                 }
                 let t_merge = if stage1_timing {
                     Some(Instant::now())

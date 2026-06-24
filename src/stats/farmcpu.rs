@@ -1384,6 +1384,18 @@ fn farmcpu_final_ld_merge_r2_threshold() -> f64 {
     0.5
 }
 
+#[inline]
+fn farmcpu_raw_benchmark_qtn_threshold_override() -> Option<f64> {
+    if let Ok(raw) = std::env::var("JX_FARMCPU_RAW_BENCH_QTN_THRESHOLD") {
+        if let Ok(v) = raw.trim().parse::<f64>() {
+            if v.is_finite() && v > 0.0 {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
 fn find_parent(parent: &mut [usize], x: usize) -> usize {
     let mut r = x;
     while parent[r] != r {
@@ -3448,6 +3460,8 @@ pub fn farmcpu_packed_to_tsv(
     let mut qtn_prev_idx: Option<Vec<usize>> = None;
     let route = FarmcpuRoute::from_raw(raw);
     let qtn_threshold_eff = threshold;
+    let raw_qtn_threshold_eff =
+        farmcpu_raw_benchmark_qtn_threshold_override().unwrap_or(qtn_threshold_eff);
     let max_iter_i = max_iter.max(1);
     let qb = qtn_bound.unwrap_or_else(|| {
         let nf = n as f64;
@@ -3847,7 +3861,7 @@ pub fn farmcpu_packed_to_tsv(
 
                 let signal_count = femp
                     .iter()
-                    .filter(|&&p| p.is_finite() && p <= qtn_threshold_eff)
+                    .filter(|&&p| p.is_finite() && p <= raw_qtn_threshold_eff)
                     .count();
                 if signal_count == 0 {
                     final_model_cache = Some((x_qtn, q_total, ixx));

@@ -359,6 +359,13 @@ def _run_timed(
     return int(proc.returncode), float(elapsed), float(rss)
 
 
+def _merge_env_with_updates(updates: dict[str, str]) -> dict[str, str]:
+    env = os.environ.copy()
+    for key, val in updates.items():
+        env[str(key)] = str(val)
+    return env
+
+
 def _read_table_guess(path: Path) -> pd.DataFrame:
     # 1) tab, 2) csv, 3) whitespace
     tries = [
@@ -712,7 +719,14 @@ def _convert_to_bfile_if_needed(
         "-geno",
         str(args.geno),
     ]
-    rc, elapsed, rss = _run_timed(cmd, log_file=log_file, time_file=time_file)
+    janusx_env = _merge_env_with_updates(
+        {
+            # Benchmark-only override: keep the raw main threshold aligned as-is,
+            # but use the rMVP default late pseudoQTN gate on JanusX raw route.
+            "JX_FARMCPU_RAW_BENCH_QTN_THRESHOLD": "0.01",
+        }
+    )
+    rc, elapsed, rss = _run_timed(cmd, log_file=log_file, time_file=time_file, env=janusx_env)
     if rc != 0:
         raise RuntimeError(f"gformat conversion to PLINK failed (exit={rc}). See log: {log_file}")
     for ext in ("bed", "bim", "fam"):
@@ -1833,6 +1847,130 @@ def _topk_snp_set_from_summary_row(row: pd.Series) -> set[str]:
     return {x.strip() for x in raw.split(";") if x.strip()}
 
 
+def _ordered_snp_ids_from_assoc_df(df: pd.DataFrame) -> list[str]:
+    cols = {str(c).strip().lstrip("#").lower(): c for c in df.columns}
+    chr_col = _first_col(cols, _CHR_COL_KEYS)
+    pos_col = _first_col(cols, _POS_COL_KEYS)
+    snp_col = _first_col(cols, _SNP_COL_KEYS)
+
+    if snp_col is not None:
+        snp_series = df[snp_col].astype(str).str.strip()
+    elif chr_col is not None and pos_col is not None:
+        chrom = df[chr_col].astype(str).str.replace(r"^chr", "", regex=True, case=False).str.strip()
+        pos = pd.to_numeric(df[pos_col], errors="coerce")
+        snp_series = chrom.astype(str) + "_" + pos.round().astype("Int64").astype(str)
+    else:
+        raise ValueError("Neither SNP id nor (chr,pos) columns found.")
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in snp_series.tolist():
+        sid = str(raw).strip()
+        if (not sid) or (sid.lower() == "nan") or (sid == "<NA>"):
+            continue
+        if sid in seen:
+            continue
+        seen.add(sid)
+        out.append(sid)
+    return out
+
+
+def _read_snp_set_from_table(path: Path) -> set[str]:
+    df = _read_table_guess(path)
+    return set(_ordered_snp_ids_from_assoc_df(df))
+
+
+def _guess_janusx_qtn_file_from_summary_row(row: pd.Series) -> Optional[Path]:
+    result_file = str(row.get("result_file", "") or "").strip()
+    if not result_file:
+        return None
+    rf = Path(result_file)
+    cands: list[Path] = []
+    if rf.suffix.lower() == ".tsv":
+        cands.append(rf.with_suffix(".qtn"))
+    cands.extend(sorted(rf.parent.glob("*.farmcpu.qtn")))
+    seen: set[str] = set()
+    for cand in cands:
+        key = str(cand)
+        if key in seen:
+            continue
+        seen.add(key)
+        if cand.exists():
+            return cand
+    return None
+
+
+_SEQQTN_BLOCK_STOP_RE = re.compile(
+    r"(current loop|optimizing|scanning|number of covariates|farmcpu\.lm|genomic inflation)",
+    re.IGNORECASE,
+)
+
+
+def _parse_rmvp_final_seqqtn_indices(text: str) -> list[int]:
+    lines = str(text).splitlines()
+    last: Optional[list[int]] = None
+    for idx, line in enumerate(lines):
+        if not re.search(r"\bseqQTN\b", line, re.IGNORECASE):
+            continue
+        vals: list[int] = []
+        saw_payload = False
+        j = idx + 1
+        while j < len(lines):
+            lns = lines[j].strip()
+            if not lns:
+                break
+            if _SEQQTN_BLOCK_STOP_RE.search(lns):
+                break
+            saw_payload = True
+            if re.fullmatch(r"NULL", lns, re.IGNORECASE):
+                vals = []
+                break
+            nums = [int(x) for x in re.findall(r"\b\d+\b", lns)]
+            if re.match(r"^\[\d+\]\s*", lns) and nums:
+                nums = nums[1:]
+            vals.extend(nums)
+            j += 1
+        if saw_payload:
+            last = vals
+    if last is None:
+        return []
+    uniq = sorted({int(v) for v in last if int(v) > 0})
+    return uniq
+
+
+def _rmvp_pseudo_qtn_snp_set_from_summary_row(row: pd.Series) -> set[str]:
+    result_file = str(row.get("result_file", "") or "").strip()
+    log_file = str(row.get("log_file", "") or "").strip()
+    if not result_file or not log_file:
+        return set()
+    rf = Path(result_file)
+    lf = Path(log_file)
+    if not rf.exists() or not lf.exists():
+        return set()
+    seq_idx1 = _parse_rmvp_final_seqqtn_indices(lf.read_text(errors="ignore"))
+    if len(seq_idx1) == 0:
+        return set()
+    snp_order = _ordered_snp_ids_from_assoc_df(_read_table_guess(rf))
+    out: set[str] = set()
+    for idx1 in seq_idx1:
+        idx0 = int(idx1) - 1
+        if 0 <= idx0 < len(snp_order):
+            out.add(snp_order[idx0])
+    return out
+
+
+def _pseudo_qtn_snp_set_from_summary_row(row: pd.Series) -> set[str]:
+    kernel = str(row.get("kernel", "") or "").strip().lower()
+    if kernel == "rmvp":
+        return _rmvp_pseudo_qtn_snp_set_from_summary_row(row)
+    if kernel == "janusx":
+        qtn_file = _guess_janusx_qtn_file_from_summary_row(row)
+        if qtn_file is None or (not qtn_file.exists()):
+            return set()
+        return _read_snp_set_from_table(qtn_file)
+    return set()
+
+
 def _pseudo_qtn_consistency(a: set[str], b: set[str]) -> Optional[float]:
     if len(a) == 0 or len(b) == 0:
         return None
@@ -1855,6 +1993,13 @@ def _pseudo_qtn_count_consistency(a: Any, b: Any) -> Optional[float]:
     if hi <= 0:
         return None
     return float(lo / hi)
+
+
+def _precision_recall_vs_reference(pred: set[str], ref: set[str]) -> tuple[int, Optional[float], Optional[float]]:
+    tp = int(len(pred & ref))
+    precision = None if len(pred) == 0 else float(tp / float(len(pred)))
+    recall = None if len(ref) == 0 else float(tp / float(len(ref)))
+    return tp, precision, recall
 
 
 def _save_summary(out_dir: Path, prefix: str, rows: list[RunResult], extra_cfg: dict[str, Any]) -> None:
@@ -1880,30 +2025,62 @@ def _save_summary(out_dir: Path, prefix: str, rows: list[RunResult], extra_cfg: 
             }
         )
     df = pd.DataFrame(recs)
+    row_by_kernel: dict[str, pd.Series] = {}
+    for _, r in df.iterrows():
+        row_by_kernel[str(r["kernel"])] = r
+
+    pseudo_qtn_sets: dict[str, set[str]] = {}
+    for kernel, row in row_by_kernel.items():
+        try:
+            pseudo_qtn_sets[kernel] = _pseudo_qtn_snp_set_from_summary_row(row)
+        except Exception:
+            pseudo_qtn_sets[kernel] = set()
+
+    ref_kernel = "rmvp" if "rmvp" in row_by_kernel else ""
+    ref_qtn_set = pseudo_qtn_sets.get(ref_kernel, set()) if ref_kernel else set()
+    df["pseudo_qtn_set_size"] = [int(len(pseudo_qtn_sets.get(str(k), set()))) for k in df["kernel"].tolist()]
+    df["pseudo_qtn_tp_vs_rmvp"] = pd.Series([pd.NA] * len(df), dtype="Int64")
+    df["pseudo_qtn_precision_vs_rmvp"] = math.nan
+    df["pseudo_qtn_recall_vs_rmvp"] = math.nan
+    if ref_kernel:
+        tp_vals: list[Any] = []
+        prec_vals: list[float] = []
+        rec_vals: list[float] = []
+        for kernel in df["kernel"].tolist():
+            pred = pseudo_qtn_sets.get(str(kernel), set())
+            tp, prec, rec = _precision_recall_vs_reference(pred, ref_qtn_set)
+            tp_vals.append(int(tp))
+            prec_vals.append(math.nan if prec is None else float(prec))
+            rec_vals.append(math.nan if rec is None else float(rec))
+        df["pseudo_qtn_tp_vs_rmvp"] = pd.Series(tp_vals, dtype="Int64")
+        df["pseudo_qtn_precision_vs_rmvp"] = prec_vals
+        df["pseudo_qtn_recall_vs_rmvp"] = rec_vals
+
     tsv = out_dir / f"{prefix}.{_SUMMARY_TAG}.tsv"
     md = out_dir / f"{prefix}.{_SUMMARY_TAG}.md"
     cfg = out_dir / f"{prefix}.{_SUMMARY_TAG}.config.json"
     df.to_csv(tsv, sep="\t", index=False)
 
     lines = [
-        "| Kernel | Status | Time(s) | Peak RSS(GB) | pseudoQTN | topK |",
-        "|---|---|---:|---:|---:|---:|",
+        "| Kernel | Status | Time(s) | Peak RSS(GB) | pseudoQTN | QTN Set | Prec(rMVP) | Rec(rMVP) | topK |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for _, r in df.iterrows():
         t = "NA" if pd.isna(r["elapsed_sec"]) else f"{float(r['elapsed_sec']):.2f}"
         m = "NA" if pd.isna(r["peak_rss_gb"]) else f"{float(r['peak_rss_gb']):.3f}"
         q = "NA" if pd.isna(r["pseudo_qtn"]) else str(int(r["pseudo_qtn"]))
-        lines.append(f"| {r['kernel']} | {r['status']} | {t} | {m} | {q} | {int(r['topk_count'])} |")
+        qset = "NA" if pd.isna(r["pseudo_qtn_set_size"]) else str(int(r["pseudo_qtn_set_size"]))
+        prec = "NA" if pd.isna(r["pseudo_qtn_precision_vs_rmvp"]) else f"{float(r['pseudo_qtn_precision_vs_rmvp']):.3f}"
+        rec = "NA" if pd.isna(r["pseudo_qtn_recall_vs_rmvp"]) else f"{float(r['pseudo_qtn_recall_vs_rmvp']):.3f}"
+        lines.append(
+            f"| {r['kernel']} | {r['status']} | {t} | {m} | {q} | {qset} | {prec} | {rec} | {int(r['topk_count'])} |"
+        )
 
     preferred = ["janusx", "rmvp"]
     seen = {str(x) for x in df["kernel"].tolist()}
     kernel_order = [k for k in preferred if k in seen]
     extras = [str(x) for x in df["kernel"].tolist() if str(x) not in preferred]
     kernel_order.extend(extras)
-
-    row_by_kernel: dict[str, pd.Series] = {}
-    for _, r in df.iterrows():
-        row_by_kernel[str(r["kernel"])] = r
 
     lines.extend(
         [
@@ -1936,6 +2113,36 @@ def _save_summary(out_dir: Path, prefix: str, rows: list[RunResult], extra_cfg: 
                 val = _pseudo_qtn_count_consistency(qi, qj)
             row_cells.append("NA" if val is None else f"{val:.3f}")
         lines.append("| " + " | ".join(row_cells) + " |")
+
+    if ref_kernel:
+        lines.extend(
+            [
+                "",
+                f"**PseudoQTN Precision/Recall vs {ref_kernel} (Exact SNP Match)**",
+                "Formula: `precision=|A∩R|/|A|`, `recall=|A∩R|/|R|`, where `R` is the final rMVP pseudoQTN SNP set.",
+                "Matching is exact by SNP ID; same-locus but different representative SNPs count as mismatch.",
+                "| kernel | match | pred_qtn | ref_qtn | precision | recall |",
+                "|---|---:|---:|---:|---:|---:|",
+            ]
+        )
+        ref_n = int(len(ref_qtn_set))
+        for kernel in kernel_order:
+            pred = pseudo_qtn_sets.get(kernel, set())
+            tp, prec, rec = _precision_recall_vs_reference(pred, ref_qtn_set)
+            lines.append(
+                "| "
+                + " | ".join(
+                    [
+                        kernel,
+                        str(int(tp)),
+                        str(int(len(pred))),
+                        str(ref_n),
+                        ("NA" if prec is None else f"{prec:.3f}"),
+                        ("NA" if rec is None else f"{rec:.3f}"),
+                    ]
+                )
+                + " |"
+            )
 
     topk_sets: dict[str, set[str]] = {}
     for k in kernel_order:
@@ -2243,12 +2450,6 @@ def main() -> None:
         if len(farm_bin_selection) == 0:
             farm_bin_selection = [int(farm_bound)]
 
-    align_runtime = _resolve_align_runtime(args)
-    align_runtime.farmcpu_threshold = _resolve_effective_farmcpu_threshold(
-        getattr(args, "farmcpu_threshold", None),
-        n_snps_for_threshold,
-    )
-
     if "rmvp" in kernels:
         bfile_for_manifest = bfile_for_r or (str(gfile) if bool(args.bfile) else "")
         if not bfile_for_manifest:
@@ -2266,6 +2467,12 @@ def main() -> None:
         )
         n_snps_for_threshold = max(1, int(len(active_rows)))
         n_snps_for_threshold_source = f"post_filter_manifest({int(n_snps_for_threshold)})"
+
+    align_runtime = _resolve_align_runtime(args)
+    align_runtime.farmcpu_threshold = _resolve_effective_farmcpu_threshold(
+        getattr(args, "farmcpu_threshold", None),
+        n_snps_for_threshold,
+    )
 
     rmvp_runner = bench_dir / "tmp" / "rmvp_farmcpu_runner.R"
     rmvp_runner.parent.mkdir(parents=True, exist_ok=True)

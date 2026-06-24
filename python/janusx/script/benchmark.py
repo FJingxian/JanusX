@@ -28,6 +28,7 @@ Key features:
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import math
 import os
@@ -103,6 +104,7 @@ class RunResult:
     peak_rss_kb: float
     result_file: str
     topk_file: str
+    qtn_file: str
     topk_count: int
     topk_snps: str
     pseudo_qtn: Optional[int]
@@ -387,6 +389,55 @@ def _read_table_guess(path: Path) -> pd.DataFrame:
     raise RuntimeError(f"Unable to parse table: {path}")
 
 
+def _write_qtn_sidecar_from_assoc_result(
+    result_file: Path,
+    qtn_file: Path,
+    source_rows_1based: list[int],
+) -> None:
+    if not result_file.exists():
+        return
+    wanted: list[int] = []
+    seen: set[int] = set()
+    for idx1 in source_rows_1based:
+        try:
+            idx0 = int(idx1) - 1
+        except Exception:
+            continue
+        if idx0 < 0 or idx0 in seen:
+            continue
+        seen.add(idx0)
+        wanted.append(idx0)
+    qtn_file.parent.mkdir(parents=True, exist_ok=True)
+    with result_file.open("r", encoding="utf-8", errors="ignore", newline="") as rf, qtn_file.open(
+        "w", encoding="utf-8", newline=""
+    ) as wf:
+        reader = csv.reader(rf, delimiter="\t")
+        writer = csv.writer(wf, delimiter="\t", lineterminator="\n")
+        header = next(reader, None)
+        if header is None:
+            return
+        header_low = [str(col).strip().lower() for col in header]
+        has_source_row = "source_row" in header_low
+        writer.writerow(header if has_source_row else [*header, "source_row"])
+        if len(wanted) == 0:
+            return
+        wanted_set = set(wanted)
+        selected_rows: dict[int, list[str]] = {}
+        remaining = len(wanted_set)
+        for row_idx0, row in enumerate(reader):
+            if row_idx0 not in wanted_set:
+                continue
+            selected_rows[row_idx0] = row
+            remaining -= 1
+            if remaining <= 0:
+                break
+        for row_idx0 in wanted:
+            row = selected_rows.get(row_idx0)
+            if row is None:
+                continue
+            writer.writerow(row if has_source_row else [*row, str(row_idx0)])
+
+
 def _first_col(colmap: dict[str, str], keys: Iterable[str]) -> Optional[str]:
     for k in keys:
         if k in colmap:
@@ -571,6 +622,33 @@ def _resolve_rscript_path() -> str:
     cands: list[Path] = []
     env_bin = Path(sys.executable).resolve().parent
     cands.append(env_bin / "Rscript")
+    for root_var in ("CONDA_PREFIX", "MAMBA_ROOT_PREFIX", "MINICONDA_PREFIX"):
+        root = os.environ.get(root_var, "").strip()
+        if not root:
+            continue
+        root_path = Path(root)
+        cands.append(root_path / "bin" / "Rscript")
+        cands.append(root_path / "lib" / "R" / "bin" / "Rscript")
+        envs_dir = root_path / "envs"
+        if envs_dir.exists():
+            for sub in sorted(envs_dir.iterdir()):
+                cands.append(sub / "bin" / "Rscript")
+                cands.append(sub / "lib" / "R" / "bin" / "Rscript")
+    home = Path.home()
+    for base in (
+        home / "miniconda3",
+        home / "anaconda3",
+        home / "mambaforge",
+        home / ".conda",
+        home / ".docker_mamba",
+    ):
+        cands.append(base / "bin" / "Rscript")
+        cands.append(base / "lib" / "R" / "bin" / "Rscript")
+        envs_dir = base / "envs"
+        if envs_dir.exists():
+            for sub in sorted(envs_dir.iterdir()):
+                cands.append(sub / "bin" / "Rscript")
+                cands.append(sub / "lib" / "R" / "bin" / "Rscript")
     which = shutil.which("Rscript")
     if which:
         cands.append(Path(which))
@@ -741,6 +819,26 @@ def _guess_janusx_result_file(run_out: Path) -> Path:
     if len(cands) == 0:
         raise FileNotFoundError(f"No JanusX FarmCPU result file found under: {run_out}")
     return cands[0]
+
+
+def _guess_janusx_qtn_file_from_result_file(result_file: Path) -> Optional[Path]:
+    cands: list[Path] = []
+    if result_file.suffix.lower() == ".tsv":
+        cands.append(result_file.with_suffix(".qtn"))
+        cands.append(result_file.with_suffix(".qtn.tsv"))
+    cands.extend(sorted(result_file.parent.glob("*.farmcpu.qtn")))
+    cands.extend(sorted(result_file.parent.glob("*.farmcpu.qtn.tsv")))
+    cands.extend(sorted(result_file.parent.glob("*.qtn")))
+    cands.extend(sorted(result_file.parent.glob("*.qtn.tsv")))
+    seen: set[str] = set()
+    for cand in cands:
+        key = str(cand)
+        if key in seen:
+            continue
+        seen.add(key)
+        if cand.exists():
+            return cand
+    return None
 
 
 def _parse_pseudo_from_text(text: str) -> Optional[int]:
@@ -1632,6 +1730,7 @@ def _run_kernel_janusx(
     status = "ok" if rc == 0 else "failed"
     result_file = ""
     topk_file = str(run_dir / f"{args.prefix}.janusx.top{args.topk}.tsv")
+    qtn_file = ""
     topk_count = 0
     topk_snps = ""
     note = ""
@@ -1644,6 +1743,9 @@ def _run_kernel_janusx(
         try:
             rf = _guess_janusx_result_file(gwas_out)
             result_file = str(rf)
+            qtn_guess = _guess_janusx_qtn_file_from_result_file(rf)
+            if qtn_guess is not None:
+                qtn_file = str(qtn_guess)
             topk_count, topk_snps = _extract_topk(rf, Path(topk_file), args.topk)
         except Exception as e:
             status = "failed"
@@ -1659,6 +1761,7 @@ def _run_kernel_janusx(
         peak_rss_kb=rss,
         result_file=result_file,
         topk_file=topk_file if Path(topk_file).exists() else "",
+        qtn_file=qtn_file if qtn_file and Path(qtn_file).exists() else "",
         topk_count=int(topk_count),
         topk_snps=topk_snps,
         pseudo_qtn=pseudo_qtn,
@@ -1750,6 +1853,7 @@ def _run_kernel_r(
     rc, elapsed, rss = _run_timed(cmd, log_file=log_file, time_file=time_file)
     status = "ok" if rc == 0 else "failed"
     pseudo_qtn = None
+    qtn_file = ""
     note = ""
     pseudo_qtn_metric = ""
 
@@ -1774,6 +1878,15 @@ def _run_kernel_r(
     if rc == 0:
         if result_file.exists():
             try:
+                seq_idx1 = _parse_rmvp_final_seqqtn_indices(inner_log.read_text(errors="ignore")) if inner_log.exists() else []
+                qtn_file_path = result_file.with_suffix(".qtn.tsv")
+                _write_qtn_sidecar_from_assoc_result(
+                    result_file=result_file,
+                    qtn_file=qtn_file_path,
+                    source_rows_1based=seq_idx1,
+                )
+                if qtn_file_path.exists():
+                    qtn_file = str(qtn_file_path)
                 topk_count, topk_snps = _extract_topk(result_file, topk_file, args.topk)
             except Exception as e:
                 status = "failed"
@@ -1795,6 +1908,7 @@ def _run_kernel_r(
         peak_rss_kb=rss,
         result_file=str(result_file) if result_file.exists() else "",
         topk_file=str(topk_file) if topk_file.exists() else "",
+        qtn_file=qtn_file if qtn_file and Path(qtn_file).exists() else "",
         topk_count=int(topk_count),
         topk_snps=topk_snps,
         pseudo_qtn=pseudo_qtn,
@@ -1962,6 +2076,14 @@ def _rmvp_pseudo_qtn_snp_set_from_summary_row(row: pd.Series) -> set[str]:
 def _pseudo_qtn_snp_set_from_summary_row(row: pd.Series) -> set[str]:
     kernel = str(row.get("kernel", "") or "").strip().lower()
     if kernel == "rmvp":
+        qtn_file = str(row.get("qtn_file", "") or "").strip()
+        if qtn_file:
+            qtn_path = Path(qtn_file)
+            if qtn_path.exists():
+                try:
+                    return _read_snp_set_from_table(qtn_path)
+                except Exception:
+                    pass
         return _rmvp_pseudo_qtn_snp_set_from_summary_row(row)
     if kernel == "janusx":
         qtn_file = _guess_janusx_qtn_file_from_summary_row(row)
@@ -2019,6 +2141,7 @@ def _save_summary(out_dir: Path, prefix: str, rows: list[RunResult], extra_cfg: 
                 "topk_snps": r.topk_snps,
                 "result_file": r.result_file,
                 "topk_file": r.topk_file,
+                "qtn_file": r.qtn_file,
                 "log_file": r.log_file,
                 "time_file": r.time_file,
                 "note": r.note,
@@ -2091,6 +2214,7 @@ def _save_summary(out_dir: Path, prefix: str, rows: list[RunResult], extra_cfg: 
             "The installed direct `MVP.FarmCPU` entry point does not expose `vc.method`; config therefore records `rmvp_vc_method_requested` only as requested metadata, not as an effective runtime knob.",
             "The embedded rMVP runner trims the FarmCPU `map` input to `SNP/CHROM/POS`; full map columns are kept only for output annotation.",
             "`rmvp` pseudoQTN is the final `seqQTN` / covariate count parsed from the last loop; `janusx` pseudoQTN is the workflow-reported JanusX count.",
+            "`qtn_file` is a post-run sidecar and is not included in the timed rMVP execution.",
         ]
     )
     mat_head_cnt = "| kernel | " + " | ".join(kernel_order) + " |"

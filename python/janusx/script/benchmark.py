@@ -77,6 +77,11 @@ from janusx.script._common.cli import (  # noqa: E402
 )
 from janusx.gfreader import inspect_genotype_file  # noqa: E402
 
+try:
+    from janusx.janusx import bed_ldblock_r2_rust as _bed_ldblock_r2_rust
+except Exception:
+    _bed_ldblock_r2_rust = None
+
 
 _P_COL_KEYS = (
     "p",
@@ -126,6 +131,13 @@ class AlignRuntime:
     rmvp_vc_method: str
     rmvp_method_bin: str
     farmcpu_threshold: float
+
+
+@dataclass(frozen=True)
+class AssocSite:
+    snp: str
+    chrom: str
+    pos: Optional[int]
 
 
 def _build_benchmark_marker_manifest(
@@ -798,6 +810,16 @@ def _collect_env_checks(args: argparse.Namespace, kernels: list[str]) -> list[En
             env_bin = Path(sys.executable).resolve().parent
             detail = f"No jx/jxpy executable found in current env: {env_bin}"
             items.append(EnvCheck("janusx.gwas_cli", False, detail))
+        if str(getattr(args, "pseudo_qtn_match", "exact")).strip().lower() == "ld":
+            items.append(
+                EnvCheck(
+                    "janusx.ld_backend",
+                    _bed_ldblock_r2_rust is not None,
+                    "bed_ldblock_r2_rust available"
+                    if _bed_ldblock_r2_rust is not None
+                    else "missing bed_ldblock_r2_rust; LD-match summary would fall back to exact",
+                )
+            )
 
     r_bin = ""
     r_ok = True
@@ -2077,6 +2099,13 @@ def _topk_snp_set_from_summary_row(row: pd.Series) -> set[str]:
     return {x.strip() for x in raw.split(";") if x.strip()}
 
 
+def _normalize_chr_token_py(raw: Any) -> str:
+    text = str(raw or "").strip()
+    if len(text) >= 3 and text[:3].lower() == "chr":
+        return text[3:]
+    return text
+
+
 def _ordered_snp_ids_from_assoc_df(df: pd.DataFrame) -> list[str]:
     cols = {str(c).strip().lstrip("#").lower(): c for c in df.columns}
     chr_col = _first_col(cols, _CHR_COL_KEYS)
@@ -2108,6 +2137,57 @@ def _ordered_snp_ids_from_assoc_df(df: pd.DataFrame) -> list[str]:
 def _read_snp_set_from_table(path: Path) -> set[str]:
     df = _read_table_guess(path)
     return set(_ordered_snp_ids_from_assoc_df(df))
+
+
+def _ordered_assoc_sites_from_assoc_df(df: pd.DataFrame) -> list[AssocSite]:
+    std = _standardize_assoc(df)
+    out: list[AssocSite] = []
+    for _, row in std.iterrows():
+        snp = str(row.get("SNP", "") or "").strip()
+        if not snp:
+            continue
+        chrom = _normalize_chr_token_py(row.get("CHR", ""))
+        pos_val = pd.to_numeric(pd.Series([row.get("POS", pd.NA)]), errors="coerce").iloc[0]
+        pos: Optional[int]
+        if pd.isna(pos_val):
+            pos = None
+        else:
+            try:
+                pos = int(round(float(pos_val)))
+            except Exception:
+                pos = None
+        out.append(AssocSite(snp=snp, chrom=chrom, pos=pos))
+    return out
+
+
+def _read_assoc_sites_from_table(path: Path) -> list[AssocSite]:
+    return _ordered_assoc_sites_from_assoc_df(_read_table_guess(path))
+
+
+def _selected_assoc_rows_to_df(
+    result_file: Path,
+    source_rows_0based: list[int],
+) -> pd.DataFrame:
+    header, selected_rows = _collect_assoc_rows_by_index(result_file, source_rows_0based)
+    if not header:
+        return pd.DataFrame()
+    ordered_rows: list[list[str]] = []
+    seen: set[int] = set()
+    for idx0 in source_rows_0based:
+        try:
+            idx = int(idx0)
+        except Exception:
+            continue
+        if idx < 0 or idx in seen:
+            continue
+        seen.add(idx)
+        row = selected_rows.get(idx)
+        if row is None:
+            continue
+        ordered_rows.append(row)
+    if len(ordered_rows) == 0:
+        return pd.DataFrame(columns=header)
+    return pd.DataFrame(ordered_rows, columns=header)
 
 
 def _guess_janusx_qtn_file_from_summary_row(row: pd.Series) -> Optional[Path]:
@@ -2203,45 +2283,147 @@ def _parse_rmvp_final_seqqtn_indices(text: str) -> list[int]:
     return [int(v) for v in last if int(v) > 0]
 
 
-def _rmvp_pseudo_qtn_snp_set_from_summary_row(row: pd.Series) -> set[str]:
+def _rmvp_pseudo_qtn_sites_from_summary_row(row: pd.Series) -> list[AssocSite]:
+    qtn_file = str(row.get("qtn_file", "") or "").strip()
+    if qtn_file:
+        qtn_path = Path(qtn_file)
+        if qtn_path.exists():
+            try:
+                return _read_assoc_sites_from_table(qtn_path)
+            except Exception:
+                pass
     result_file = str(row.get("result_file", "") or "").strip()
     log_file = str(row.get("log_file", "") or "").strip()
     if not result_file or not log_file:
-        return set()
+        return []
     rf = Path(result_file)
     lf = Path(log_file)
     if not rf.exists() or not lf.exists():
-        return set()
+        return []
     seq_idx1 = _parse_rmvp_final_seqqtn_indices(lf.read_text(errors="ignore"))
     if len(seq_idx1) == 0:
-        return set()
-    snp_order = _ordered_snp_ids_from_assoc_df(_read_table_guess(rf))
-    out: set[str] = set()
-    for idx1 in seq_idx1:
-        idx0 = int(idx1) - 1
-        if 0 <= idx0 < len(snp_order):
-            out.add(snp_order[idx0])
-    return out
+        return []
+    df = _selected_assoc_rows_to_df(rf, [int(idx1) - 1 for idx1 in seq_idx1 if int(idx1) > 0])
+    if df.empty:
+        return []
+    return _ordered_assoc_sites_from_assoc_df(df)
 
 
-def _pseudo_qtn_snp_set_from_summary_row(row: pd.Series) -> set[str]:
+def _pseudo_qtn_sites_from_summary_row(row: pd.Series) -> list[AssocSite]:
     kernel = str(row.get("kernel", "") or "").strip().lower()
     if kernel == "rmvp":
-        qtn_file = str(row.get("qtn_file", "") or "").strip()
-        if qtn_file:
-            qtn_path = Path(qtn_file)
-            if qtn_path.exists():
-                try:
-                    return _read_snp_set_from_table(qtn_path)
-                except Exception:
-                    pass
-        return _rmvp_pseudo_qtn_snp_set_from_summary_row(row)
+        return _rmvp_pseudo_qtn_sites_from_summary_row(row)
     if kernel == "janusx":
         qtn_file = _guess_janusx_qtn_file_from_summary_row(row)
         if qtn_file is None or (not qtn_file.exists()):
-            return set()
-        return _read_snp_set_from_table(qtn_file)
-    return set()
+            return []
+        return _read_assoc_sites_from_table(qtn_file)
+    return []
+
+
+def _site_snp_set(sites: list[AssocSite]) -> set[str]:
+    return {site.snp for site in sites if site.snp}
+
+
+def _site_has_coords(site: AssocSite) -> bool:
+    return bool(site.chrom) and (site.pos is not None) and (int(site.pos) >= 0)
+
+
+def _maximum_bipartite_match_size(adj: list[list[int]], right_n: int) -> int:
+    match_r = [-1] * max(0, int(right_n))
+
+    def _dfs(left_idx: int, seen: list[bool]) -> bool:
+        for right_idx in adj[left_idx]:
+            if right_idx < 0 or right_idx >= right_n or seen[right_idx]:
+                continue
+            seen[right_idx] = True
+            if match_r[right_idx] == -1 or _dfs(match_r[right_idx], seen):
+                match_r[right_idx] = left_idx
+                return True
+        return False
+
+    matched = 0
+    for left_idx in range(len(adj)):
+        seen = [False] * right_n
+        if _dfs(left_idx, seen):
+            matched += 1
+    return int(matched)
+
+
+def _ld_match_tp_from_sites(
+    pred_sites: list[AssocSite],
+    ref_sites: list[AssocSite],
+    *,
+    bfile_prefix: str,
+    r2_threshold: float,
+    threads: int,
+) -> int:
+    if len(pred_sites) == 0 or len(ref_sites) == 0:
+        return 0
+
+    adj_sets: list[set[int]] = [set() for _ in pred_sites]
+    ref_by_snp: dict[str, list[int]] = {}
+    for ref_idx, ref_site in enumerate(ref_sites):
+        if ref_site.snp:
+            ref_by_snp.setdefault(ref_site.snp, []).append(ref_idx)
+    for pred_idx, pred_site in enumerate(pred_sites):
+        for ref_idx in ref_by_snp.get(pred_site.snp, []):
+            adj_sets[pred_idx].add(ref_idx)
+
+    if _bed_ldblock_r2_rust is None:
+        return _maximum_bipartite_match_size([sorted(v) for v in adj_sets], len(ref_sites))
+
+    coord_keys: list[tuple[str, int]] = []
+    seen_keys: set[tuple[str, int]] = set()
+    for site in [*pred_sites, *ref_sites]:
+        if not _site_has_coords(site):
+            continue
+        key = (str(site.chrom), int(site.pos))
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        coord_keys.append(key)
+
+    if len(coord_keys) > 0:
+        chrom_ranges = [chrom for chrom, _pos in coord_keys]
+        start_bp = [int(pos) for _chrom, pos in coord_keys]
+        end_bp = [int(pos) for _chrom, pos in coord_keys]
+        selected_chrom = [chrom for chrom, _pos in coord_keys]
+        selected_pos = [int(pos) for _chrom, pos in coord_keys]
+        ld_raw, chr_raw, pos_raw = _bed_ldblock_r2_rust(
+            str(bfile_prefix),
+            chrom_ranges,
+            start_bp,
+            end_bp,
+            selected_chrom=selected_chrom,
+            selected_pos=selected_pos,
+            threads=int(max(0, int(threads))),
+        )
+        ld_mat = np.ascontiguousarray(np.asarray(ld_raw, dtype=np.float32))
+        ld_index: dict[tuple[str, int], int] = {}
+        for idx, (chrom, pos) in enumerate(zip(list(chr_raw), list(pos_raw))):
+            ld_index[(_normalize_chr_token_py(chrom), int(pos))] = idx
+
+        for pred_idx, pred_site in enumerate(pred_sites):
+            if not _site_has_coords(pred_site):
+                continue
+            pred_key = (str(pred_site.chrom), int(pred_site.pos))
+            pred_mat_idx = ld_index.get(pred_key)
+            if pred_mat_idx is None:
+                continue
+            for ref_idx, ref_site in enumerate(ref_sites):
+                if not _site_has_coords(ref_site):
+                    continue
+                if str(pred_site.chrom) != str(ref_site.chrom):
+                    continue
+                ref_key = (str(ref_site.chrom), int(ref_site.pos))
+                ref_mat_idx = ld_index.get(ref_key)
+                if ref_mat_idx is None:
+                    continue
+                if float(ld_mat[pred_mat_idx, ref_mat_idx]) >= float(r2_threshold):
+                    adj_sets[pred_idx].add(ref_idx)
+
+    return _maximum_bipartite_match_size([sorted(v) for v in adj_sets], len(ref_sites))
 
 
 def _pseudo_qtn_consistency(a: set[str], b: set[str]) -> Optional[float]:
@@ -2275,6 +2457,32 @@ def _precision_recall_vs_reference(pred: set[str], ref: set[str]) -> tuple[int, 
     return tp, precision, recall
 
 
+def _precision_recall_vs_reference_sites(
+    pred_sites: list[AssocSite],
+    ref_sites: list[AssocSite],
+    *,
+    match_mode: str,
+    ld_bfile_prefix: str,
+    ld_r2_threshold: float,
+    threads: int,
+) -> tuple[int, Optional[float], Optional[float]]:
+    pred_n = int(len(pred_sites))
+    ref_n = int(len(ref_sites))
+    if str(match_mode).lower() == "ld":
+        tp = _ld_match_tp_from_sites(
+            pred_sites,
+            ref_sites,
+            bfile_prefix=ld_bfile_prefix,
+            r2_threshold=float(ld_r2_threshold),
+            threads=int(max(0, int(threads))),
+        )
+    else:
+        tp = int(len(_site_snp_set(pred_sites) & _site_snp_set(ref_sites)))
+    precision = None if pred_n == 0 else float(tp / float(pred_n))
+    recall = None if ref_n == 0 else float(tp / float(ref_n))
+    return int(tp), precision, recall
+
+
 def _save_summary(out_dir: Path, prefix: str, rows: list[RunResult], extra_cfg: dict[str, Any]) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     recs: list[dict[str, Any]] = []
@@ -2304,16 +2512,37 @@ def _save_summary(out_dir: Path, prefix: str, rows: list[RunResult], extra_cfg: 
     for _, r in df.iterrows():
         row_by_kernel[str(r["kernel"])] = r
 
-    pseudo_qtn_sets: dict[str, set[str]] = {}
+    pseudo_qtn_sites: dict[str, list[AssocSite]] = {}
     for kernel, row in row_by_kernel.items():
         try:
-            pseudo_qtn_sets[kernel] = _pseudo_qtn_snp_set_from_summary_row(row)
+            pseudo_qtn_sites[kernel] = _pseudo_qtn_sites_from_summary_row(row)
         except Exception:
-            pseudo_qtn_sets[kernel] = set()
+            pseudo_qtn_sites[kernel] = []
 
     ref_kernel = "rmvp" if "rmvp" in row_by_kernel else ""
-    ref_qtn_set = pseudo_qtn_sets.get(ref_kernel, set()) if ref_kernel else set()
-    df["pseudo_qtn_set_size"] = [int(len(pseudo_qtn_sets.get(str(k), set()))) for k in df["kernel"].tolist()]
+    match_mode_requested = str(extra_cfg.get("pseudo_qtn_match_mode", "exact") or "exact").strip().lower()
+    if match_mode_requested not in {"exact", "ld"}:
+        match_mode_requested = "exact"
+    match_mode_effective = match_mode_requested
+    match_note = ""
+    ld_bfile_prefix = str(extra_cfg.get("pseudo_qtn_ld_bfile", "") or "").strip()
+    ld_r2_threshold = _safe_float(extra_cfg.get("pseudo_qtn_ld_r2", 0.7), 0.7)
+    ld_threads = int(extra_cfg.get("threads", 0) or 0)
+    if ref_kernel and match_mode_effective == "ld":
+        if _bed_ldblock_r2_rust is None:
+            match_mode_effective = "exact"
+            match_note = "requested LD match but `bed_ldblock_r2_rust` is unavailable; fell back to exact SNP matching."
+        elif not ld_bfile_prefix or (not Path(f"{ld_bfile_prefix}.bed").exists()):
+            match_mode_effective = "exact"
+            match_note = "requested LD match but PLINK BED prefix for LD calculation is unavailable; fell back to exact SNP matching."
+    extra_cfg["pseudo_qtn_match_mode_requested"] = match_mode_requested
+    extra_cfg["pseudo_qtn_match_mode_effective"] = match_mode_effective
+    if match_note:
+        extra_cfg["pseudo_qtn_match_note"] = match_note
+
+    ref_qtn_sites = pseudo_qtn_sites.get(ref_kernel, []) if ref_kernel else []
+    df["pseudo_qtn_set_size"] = [int(len(pseudo_qtn_sites.get(str(k), []))) for k in df["kernel"].tolist()]
+    df["pseudo_qtn_match_mode_vs_rmvp"] = (match_mode_effective if ref_kernel else pd.NA)
     df["pseudo_qtn_tp_vs_rmvp"] = pd.Series([pd.NA] * len(df), dtype="Int64")
     df["pseudo_qtn_precision_vs_rmvp"] = math.nan
     df["pseudo_qtn_recall_vs_rmvp"] = math.nan
@@ -2322,8 +2551,15 @@ def _save_summary(out_dir: Path, prefix: str, rows: list[RunResult], extra_cfg: 
         prec_vals: list[float] = []
         rec_vals: list[float] = []
         for kernel in df["kernel"].tolist():
-            pred = pseudo_qtn_sets.get(str(kernel), set())
-            tp, prec, rec = _precision_recall_vs_reference(pred, ref_qtn_set)
+            pred_sites = pseudo_qtn_sites.get(str(kernel), [])
+            tp, prec, rec = _precision_recall_vs_reference_sites(
+                pred_sites,
+                ref_qtn_sites,
+                match_mode=match_mode_effective,
+                ld_bfile_prefix=ld_bfile_prefix,
+                ld_r2_threshold=ld_r2_threshold,
+                threads=ld_threads,
+            )
             tp_vals.append(int(tp))
             prec_vals.append(math.nan if prec is None else float(prec))
             rec_vals.append(math.nan if rec is None else float(rec))
@@ -2337,18 +2573,19 @@ def _save_summary(out_dir: Path, prefix: str, rows: list[RunResult], extra_cfg: 
     df.to_csv(tsv, sep="\t", index=False)
 
     lines = [
-        "| Kernel | Status | Time(s) | Peak RSS(GB) | pseudoQTN | QTN Set | Prec(rMVP) | Rec(rMVP) | topK |",
-        "|---|---|---:|---:|---:|---:|---:|---:|---:|",
+        "| Kernel | Status | Time(s) | Peak RSS(GB) | pseudoQTN | QTN Set | Match | Prec(rMVP) | Rec(rMVP) | topK |",
+        "|---|---|---:|---:|---:|---:|---|---:|---:|---:|",
     ]
     for _, r in df.iterrows():
         t = "NA" if pd.isna(r["elapsed_sec"]) else f"{float(r['elapsed_sec']):.2f}"
         m = "NA" if pd.isna(r["peak_rss_gb"]) else f"{float(r['peak_rss_gb']):.3f}"
         q = "NA" if pd.isna(r["pseudo_qtn"]) else str(int(r["pseudo_qtn"]))
         qset = "NA" if pd.isna(r["pseudo_qtn_set_size"]) else str(int(r["pseudo_qtn_set_size"]))
+        match_txt = "NA" if pd.isna(r["pseudo_qtn_match_mode_vs_rmvp"]) else str(r["pseudo_qtn_match_mode_vs_rmvp"])
         prec = "NA" if pd.isna(r["pseudo_qtn_precision_vs_rmvp"]) else f"{float(r['pseudo_qtn_precision_vs_rmvp']):.3f}"
         rec = "NA" if pd.isna(r["pseudo_qtn_recall_vs_rmvp"]) else f"{float(r['pseudo_qtn_recall_vs_rmvp']):.3f}"
         lines.append(
-            f"| {r['kernel']} | {r['status']} | {t} | {m} | {q} | {qset} | {prec} | {rec} | {int(r['topk_count'])} |"
+            f"| {r['kernel']} | {r['status']} | {t} | {m} | {q} | {qset} | {match_txt} | {prec} | {rec} | {int(r['topk_count'])} |"
         )
 
     preferred = ["janusx", "rmvp"]
@@ -2370,6 +2607,8 @@ def _save_summary(out_dir: Path, prefix: str, rows: list[RunResult], extra_cfg: 
             "`debug_file` (when enabled via `--rmvp-debug-seqqtn`) is also a post-run sidecar and is not included in the timed rMVP execution.",
         ]
     )
+    if match_note:
+        lines.append(match_note)
     mat_head_cnt = "| kernel | " + " | ".join(kernel_order) + " |"
     mat_sep_cnt = "|---|" + "|".join(["---:" for _ in kernel_order]) + "|"
     lines.extend([mat_head_cnt, mat_sep_cnt])
@@ -2392,27 +2631,47 @@ def _save_summary(out_dir: Path, prefix: str, rows: list[RunResult], extra_cfg: 
         lines.append("| " + " | ".join(row_cells) + " |")
 
     if ref_kernel:
+        match_title = "Exact SNP Match"
+        match_formula = "Formula: `precision=|A∩R|/|A|`, `recall=|A∩R|/|R|`, where `R` is the final rMVP pseudoQTN SNP set."
+        match_detail = "Matching is exact by SNP ID; same-locus but different representative SNPs count as mismatch."
+        if match_mode_effective == "ld":
+            match_title = f"LD Match (one-to-one, r2 >= {ld_r2_threshold:.3f})"
+            match_formula = (
+                "Formula: `precision=TP/|A|`, `recall=TP/|R|`, where `TP` is the maximum one-to-one bipartite match count "
+                "between predicted and reference pseudoQTN SNPs."
+            )
+            match_detail = (
+                "An edge is created by exact SNP-ID match or same-chrom LD with `r2 >= "
+                f"{ld_r2_threshold:.3f}`; same-locus different representative SNPs can therefore match."
+            )
         lines.extend(
             [
                 "",
-                f"**PseudoQTN Precision/Recall vs {ref_kernel} (Exact SNP Match)**",
-                "Formula: `precision=|A∩R|/|A|`, `recall=|A∩R|/|R|`, where `R` is the final rMVP pseudoQTN SNP set.",
-                "Matching is exact by SNP ID; same-locus but different representative SNPs count as mismatch.",
+                f"**PseudoQTN Precision/Recall vs {ref_kernel} ({match_title})**",
+                match_formula,
+                match_detail,
                 "| kernel | match | pred_qtn | ref_qtn | precision | recall |",
                 "|---|---:|---:|---:|---:|---:|",
             ]
         )
-        ref_n = int(len(ref_qtn_set))
+        ref_n = int(len(ref_qtn_sites))
         for kernel in kernel_order:
-            pred = pseudo_qtn_sets.get(kernel, set())
-            tp, prec, rec = _precision_recall_vs_reference(pred, ref_qtn_set)
+            pred_sites = pseudo_qtn_sites.get(kernel, [])
+            tp, prec, rec = _precision_recall_vs_reference_sites(
+                pred_sites,
+                ref_qtn_sites,
+                match_mode=match_mode_effective,
+                ld_bfile_prefix=ld_bfile_prefix,
+                ld_r2_threshold=ld_r2_threshold,
+                threads=ld_threads,
+            )
             lines.append(
                 "| "
                 + " | ".join(
                     [
                         kernel,
                         str(int(tp)),
-                        str(int(len(pred))),
+                        str(int(len(pred_sites))),
                         str(ref_n),
                         ("NA" if prec is None else f"{prec:.3f}"),
                         ("NA" if rec is None else f"{rec:.3f}"),
@@ -2606,6 +2865,26 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
             else argparse.SUPPRESS
         ),
     )
+    advanced_group.add_argument(
+        "--pseudo-qtn-match",
+        default="exact",
+        choices=["exact", "ld"],
+        help=(
+            "PseudoQTN precision/recall matching mode: `exact` by SNP ID, or `ld` for looser one-to-one LD matching."
+            if show_dev_help
+            else argparse.SUPPRESS
+        ),
+    )
+    advanced_group.add_argument(
+        "--pseudo-qtn-ld-r2",
+        default=0.7,
+        type=float,
+        help=(
+            "When `--pseudo-qtn-match ld` is used, count same-chrom SNP pairs with r2 >= this threshold as match edges."
+            if show_dev_help
+            else argparse.SUPPRESS
+        ),
+    )
 
     if any(
         (tk == "-trait") or tk.startswith("-trait=") or (tk == "--trait") or tk.startswith("--trait=")
@@ -2648,6 +2927,8 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         p.error("--farmcpu-threshold must be > 0.")
     if args.force_pseudo_qtn_cap is not None and int(args.force_pseudo_qtn_cap) < 1:
         p.error("--force-pseudo-qtn-cap must be >= 1.")
+    if not (0.0 <= float(args.pseudo_qtn_ld_r2) <= 1.0):
+        p.error("--pseudo-qtn-ld-r2 must be in [0, 1].")
     return args
 
 
@@ -2829,6 +3110,9 @@ def main() -> None:
         "rmvp_debug_seqqtn": bool(args.rmvp_debug_seqqtn),
         "rmvp_method_bin": str(align_runtime.rmvp_method_bin),
         "force_pseudo_qtn_cap": (None if args.force_pseudo_qtn_cap is None else int(args.force_pseudo_qtn_cap)),
+        "pseudo_qtn_match_mode": str(args.pseudo_qtn_match),
+        "pseudo_qtn_ld_r2": float(args.pseudo_qtn_ld_r2),
+        "pseudo_qtn_ld_bfile": (str(bfile_for_r) if bfile_for_r else (str(gfile) if bool(args.bfile) else "")),
         "conversion_elapsed_sec": float(conv_elapsed),
         "conversion_peak_rss_kb": float(conv_rss),
         "benchmark_dir": str(bench_dir),

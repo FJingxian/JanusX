@@ -155,7 +155,11 @@ fn farmcpu_raw_major_impute_enabled() -> bool {
 #[inline]
 fn farmcpu_missing_impute_value(mean_g: f64, impute_major: bool) -> f64 {
     if impute_major {
-        if mean_g > 1.0_f64 { 2.0_f64 } else { 0.0_f64 }
+        if mean_g > 1.0_f64 {
+            2.0_f64
+        } else {
+            0.0_f64
+        }
     } else {
         mean_g
     }

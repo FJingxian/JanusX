@@ -2445,38 +2445,11 @@ def _sum_unique_ndarray_nbytes(values: typing.Iterable[typing.Any]) -> int:
 def _estimate_gblup_stream_reserve_bytes(
     packed_ctx: dict[str, typing.Any] | None,
 ) -> int:
-    if not _looks_like_packed_ctx(packed_ctx):
-        return 0
-    ctx = typing.cast(dict[str, typing.Any], packed_ctx)
-    n_samples = int(ctx.get("n_samples", 0) or 0)
-    n_active_sites = int(ctx.get("n_active_sites", 0) or 0)
-    if n_active_sites <= 0:
-        try:
-            n_active_sites = int(_packed_ctx_active_rows(ctx))
-        except Exception:
-            n_active_sites = 0
-    resident_meta_bytes = _sum_unique_ndarray_nbytes(
-        (
-            ctx.get("packed", None),
-            ctx.get("missing_rate", None),
-            ctx.get("maf", None),
-            ctx.get("af", None),
-            ctx.get("std_denom", None),
-            ctx.get("dom_af", None),
-            ctx.get("row_flip", None),
-            ctx.get("site_keep", None),
-            ctx.get("active_row_idx", None),
-        )
-    )
-    # `build_grm_from_meta_stream()` keeps these arrays concurrently with the
-    # decode buffers on the exact GRM path:
-    # - `row_sum_all`: O(m) f64
-    # - `grm`:        O(n^2) f64
-    # - `grm_tmp`:    O(n^2) f32
-    algo_bytes = int(max(0, n_active_sites)) * 8
-    algo_bytes += int(max(0, n_samples)) * int(max(0, n_samples)) * (8 + 4)
-    slack_bytes = 64 * 1024 * 1024
-    return int(max(0, resident_meta_bytes + algo_bytes + slack_bytes))
+    # GS `--memory` controls streamed decode size only. Any extra in-flight copy
+    # should be modeled through `buffers`, not by subtracting metadata or
+    # algorithm workspaces here.
+    _ = packed_ctx
+    return 0
 
 
 def _calc_stream_block_rows(
@@ -3539,16 +3512,16 @@ def _plan_shared_additive_gblup_traits(
         train_n = int(np.sum(~pheno[trait_name].isna()))
         if train_n <= 0:
             continue
-        if has_additive_gblup and (m_eff >= train_n):
-            pending.add(str(trait_name))
-            continue
+        need_shared_full_grm = bool(has_additive_gblup and train_n <= int(BLUP_SMALL_N))
         if has_blup:
             dispatch = resolve_blup_dispatch(
                 n_samples=int(train_n),
                 n_markers=int(m_eff),
             )
             if dispatch.effective_method == "GBLUP":
-                pending.add(str(trait_name))
+                need_shared_full_grm = True
+        if need_shared_full_grm:
+            pending.add(str(trait_name))
     return pending
 
 
@@ -3658,6 +3631,33 @@ def _build_shared_additive_gblup_full_grm_cache(
             "Shared additive GBLUP full-GRM sample ID count does not match sample count: "
             f"ids={len(sample_id_arr)}, n={int(n_samples)}."
         )
+    cache_dir = os.path.dirname(path)
+    if cache_dir != "":
+        os.makedirs(cache_dir, exist_ok=True)
+
+    can_stream_direct_to_npy = bool(
+        (packed_ctx is not None)
+        and (_jxrs is not None)
+        and hasattr(_jxrs, "gblup_grm_from_meta_to_npy")
+    )
+    shared_build_block_rows = int(
+        max(
+            1,
+            min(
+                int(n_samples),
+                int(
+                    _calc_stream_block_rows(
+                        n_samples=int(n_samples),
+                        memory_gb=float(_normalize_memory_gb(memory_gb)),
+                        elem_bytes=4,
+                        buffers=2,
+                        reserve_bytes=0,
+                        min_rows=1,
+                    )
+                ),
+            ),
+        )
+    )
 
     used_legacy_cache = False
     with grm_cache_lock(path):
@@ -3734,6 +3734,75 @@ def _build_shared_additive_gblup_full_grm_cache(
                 pending_traits=set(str(x) for x in pending_traits),
             )
 
+    if packed_ctx is not None and can_stream_direct_to_npy:
+        (
+            source_prefix,
+            _site_keep_arg,
+            row_source_indices_arg,
+            row_flip_arg,
+            row_maf_arg,
+            gblup_mmap_window_mb,
+        ) = _packed_gblup_stream_metadata(
+            packed_ctx,
+            mode="a",
+            block_rows=int(shared_build_block_rows),
+            use_ctx_budget=False,
+        )
+        with grm_cache_lock(path):
+            grm_mm, cache_source = load_or_materialize_square_grm_cache(
+                path,
+                expected_n=int(n_samples),
+                mmap_mode="r",
+                expected_dtype=np.float32,
+                npy_dtype=np.float32,
+                cache_id_path=id_path,
+            )
+            if grm_mm is None:
+                tmp_path = f"{path}.tmp.{os.getpid()}"
+                try:
+                    _jxrs.gblup_grm_from_meta_to_npy(  # type: ignore[union-attr]
+                        source_prefix,
+                        tmp_path,
+                        row_source_indices_arg,
+                        row_flip_arg,
+                        row_maf_arg,
+                        sample_indices=None,
+                        method=1,
+                        block_rows=int(shared_build_block_rows),
+                        threads=max(1, int(n_jobs)),
+                        progress_callback=None,
+                        progress_every=0,
+                        mmap_window_mb=int(gblup_mmap_window_mb),
+                    )
+                    os.replace(tmp_path, path)
+                finally:
+                    if os.path.exists(tmp_path):
+                        try:
+                            os.remove(tmp_path)
+                        except Exception:
+                            pass
+                write_id_file(id_path, sample_id_arr)
+                grm_mm = np.load(path, mmap_mode="r")
+                storage = "memmap-cache-miss"
+            else:
+                if not os.path.exists(id_path):
+                    write_id_file(id_path, sample_id_arr)
+                storage = (
+                    "memmap-cache-from-txt"
+                    if str(cache_source) == "txt->npy"
+                    else "memmap-cache-hit"
+                )
+        return _SharedGblupFullGrmCache(
+            grm=grm_mm,
+            n_samples=int(n_samples),
+            n_markers=int(n_markers),
+            storage=str(storage),
+            slice_block_rows=int(slice_block_rows),
+            persistent=True,
+            path=path,
+            pending_traits=set(str(x) for x in pending_traits),
+        )
+
     if packed_ctx is not None:
         sample_indices = np.arange(n_samples, dtype=np.int64)
         grm_full = _build_gblup_cv_grm_once(
@@ -3754,7 +3823,6 @@ def _build_shared_additive_gblup_full_grm_cache(
     if grm_full is None:
         raise RuntimeError("Shared additive GBLUP full-GRM build returned no result.")
 
-    grm_arr = np.ascontiguousarray(np.asarray(grm_full, dtype=np.float64), dtype=np.float64)
     with grm_cache_lock(path):
         grm_mm, cache_source = load_or_materialize_square_grm_cache(
             path,
@@ -3767,10 +3835,12 @@ def _build_shared_additive_gblup_full_grm_cache(
         if grm_mm is None:
             save_grm_npy_blocked(
                 path,
-                grm_arr,
+                grm_full,
                 dtype=np.float32,
                 block_rows=int(max(256, min(int(slice_block_rows), int(n_samples)))),
             )
+            del grm_full
+            gc.collect()
             write_id_file(id_path, sample_id_arr)
             grm_mm = np.load(path, mmap_mode="r")
             storage = "memmap-cache-miss"
@@ -3782,8 +3852,6 @@ def _build_shared_additive_gblup_full_grm_cache(
                 if str(cache_source) == "txt->npy"
                 else "memmap-cache-hit"
             )
-    del grm_arr
-    gc.collect()
 
     return _SharedGblupFullGrmCache(
         grm=grm_mm,
@@ -3804,20 +3872,24 @@ def _make_trait_ctx_with_shared_additive_gblup(
     train_sample_indices: np.ndarray,
     test_sample_indices: np.ndarray,
 ) -> dict[str, typing.Any]:
-    train_grm, test_train_grm = _build_trait_gblup_kernels_from_full_grm(
-        cache,
-        train_sample_indices=train_sample_indices,
-        test_sample_indices=test_sample_indices,
-    )
     trait_ctx = (
         dict(typing.cast(dict[str, typing.Any], base_packed_ctx))
         if isinstance(base_packed_ctx, dict)
         else {}
     )
-    trait_ctx["__gblup_train_grm__"] = train_grm
-    trait_ctx["__gblup_test_train_grm__"] = test_train_grm
     trait_ctx["__gblup_shared_full_grm__"] = True
     trait_ctx["__gblup_shared_full_grm_storage__"] = str(cache.storage)
+    if cache.path is not None and str(cache.path).strip() != "":
+        trait_ctx["__gblup_shared_full_grm_path__"] = str(cache.path)
+    if isinstance(base_packed_ctx, dict):
+        return trait_ctx
+    train_grm, test_train_grm = _build_trait_gblup_kernels_from_full_grm(
+        cache,
+        train_sample_indices=train_sample_indices,
+        test_sample_indices=test_sample_indices,
+    )
+    trait_ctx["__gblup_train_grm__"] = train_grm
+    trait_ctx["__gblup_test_train_grm__"] = test_train_grm
     return trait_ctx
 
 
@@ -5747,6 +5819,7 @@ def _packed_gblup_stream_metadata(
     *,
     mode: str = "a",
     block_rows: int,
+    use_ctx_budget: bool = True,
 ) -> tuple[str, np.ndarray | None, np.ndarray, np.ndarray, np.ndarray, int]:
     source_prefix_raw = packed_ctx.get("source_prefix", None)
     if source_prefix_raw is None or str(source_prefix_raw).strip() == "":
@@ -5814,13 +5887,17 @@ def _packed_gblup_stream_metadata(
         np.asarray(active_row_idx, dtype=np.int64).reshape(-1),
         dtype=np.int64,
     )
-    block_rows_eff = int(
-        max(
-            1,
-            int(packed_ctx.get("__gblup_grm_block_rows__", block_rows)),
+    if use_ctx_budget:
+        block_rows_eff = int(
+            max(
+                1,
+                int(packed_ctx.get("__gblup_grm_block_rows__", block_rows)),
+            )
         )
-    )
-    mmap_window_override = packed_ctx.get("__gblup_grm_window_mb__", None)
+        mmap_window_override = packed_ctx.get("__gblup_grm_window_mb__", None)
+    else:
+        block_rows_eff = int(max(1, int(block_rows)))
+        mmap_window_override = None
     if mmap_window_override is None:
         mmap_window_mb = int(
             max(
@@ -7544,6 +7621,117 @@ def GSapi(
                     (model_state is not None)
                     and _cfg_truthy(os.getenv("JX_GS_GBLUP_RETURN_EFFECT", "1"), default=True)
                 )
+                shared_grm_path = str(
+                    packed_train.get("__gblup_shared_full_grm_path__", "")
+                ).strip()
+                can_use_rust_gblup_grm_cache = bool(
+                    shared_grm_path != ""
+                    and (_jxrs is not None)
+                    and hasattr(_jxrs, "gblup_reml_npy_grm")
+                )
+                if can_use_rust_gblup_grm_cache and gblup_return_effect:
+                    can_use_rust_gblup_grm_cache = False
+                if can_use_rust_gblup_grm_cache:
+                    if _GS_DEBUG_STAGE:
+                        rust_blas_before = get_rust_blas_threads()
+                        print(
+                            "[GS-DEBUG] GBLUP additive packed route=rust_gblup_reml_npy_grm "
+                            f"threads={int(max(1, int(n_jobs)))}, "
+                            f"stage_threads=(blas={int(max(1, int(n_jobs)))},rayon=1), "
+                            f"rust_blas_threads_before={rust_blas_before} "
+                            f"grm={shared_grm_path}",
+                            flush=True,
+                        )
+                    rust_blas_in_stage: int | None = None
+                    with runtime_thread_stage(
+                        blas_threads=int(max(1, int(n_jobs))),
+                        rayon_threads=1,
+                    ):
+                        rust_blas_in_stage = get_rust_blas_threads()
+                        g_out = _jxrs.gblup_reml_npy_grm(  # type: ignore[union-attr]
+                            shared_grm_path,
+                            train_abs,
+                            y_train_vec,
+                            test_abs,
+                            train_pred_local_arg,
+                            float(gblup_g_eps),
+                            float(gblup_reml_low),
+                            float(gblup_reml_high),
+                            int(gblup_reml_max_iter),
+                            float(gblup_reml_tol),
+                            int(max(1, int(n_jobs))),
+                            bool(gblup_return_variance_components),
+                            False,
+                        )
+                    g_t = tuple(g_out)
+                    if len(g_t) >= 12:
+                        (
+                            pred_train_raw,
+                            pred_test_raw,
+                            pve,
+                            _lambda_opt,
+                            _ml,
+                            _reml,
+                            _eigh_backend,
+                            _eigh_elapsed,
+                            _m_eff,
+                            _sigma_g2,
+                            _sigma_e2,
+                            _gblup_effect_unused,
+                        ) = g_t[:12]
+                    elif len(g_t) >= 11:
+                        (
+                            pred_train_raw,
+                            pred_test_raw,
+                            pve,
+                            _lambda_opt,
+                            _ml,
+                            _reml,
+                            _eigh_backend,
+                            _eigh_elapsed,
+                            _m_eff,
+                            _sigma_g2,
+                            _sigma_e2,
+                        ) = g_t[:11]
+                    else:
+                        raise RuntimeError(
+                            "gblup_reml_npy_grm returned unexpected payload size: "
+                            f"{len(g_t)}"
+                        )
+                    if gblup_runtime_state is not None:
+                        gblup_runtime_state["backend"] = "rust-grm-cache"
+                        gblup_runtime_state["rust_backend"] = str(rust_backend)
+                        gblup_runtime_state["eigh_backend"] = str(_eigh_backend)
+                        gblup_runtime_state["eigh_sec"] = float(_eigh_elapsed)
+                        gblup_runtime_state["lambda_reml"] = float(_lambda_opt)
+                        gblup_runtime_state["ml"] = float(_ml)
+                        gblup_runtime_state["reml"] = float(_reml)
+                        gblup_runtime_state["m_effective"] = int(_m_eff)
+                        gblup_runtime_state["variance_component_path"] = "grm"
+                        gblup_runtime_state["variance_component"] = "REML/GRM"
+                        _sync_gblup_trainvar_state(
+                            sigma_g2=float(_sigma_g2),
+                            sigma_e2=float(_sigma_e2),
+                            pve_trainvar=float(pve),
+                        )
+                    pred_train = (
+                        np.zeros((0, 1), dtype=float)
+                        if (not need_train_pred)
+                        else np.asarray(pred_train_raw, dtype=float).reshape(-1, 1)
+                    )
+                    pred_test = np.asarray(pred_test_raw, dtype=float).reshape(-1, 1)
+                    if _GS_DEBUG_STAGE:
+                        rust_blas_after = get_rust_blas_threads()
+                        print(
+                            f"[GS-DEBUG] GSapi model_fit_done method={method}(rust-grm-cache) "
+                            f"elapsed={time.time() - t_fit:.3f}s "
+                            f"eigh_backend={str(_eigh_backend)} "
+                            f"eigh_sec={float(_eigh_elapsed):.3f} "
+                            f"rust_blas_threads_in_stage={rust_blas_in_stage} "
+                            f"rust_blas_threads_after={rust_blas_after}",
+                            flush=True,
+                        )
+                    return pred_train, pred_test, float(pve)
 
                 if _GS_DEBUG_STAGE:
                     rust_blas_before = get_rust_blas_threads()
@@ -9943,33 +10131,32 @@ def _run_method_task(
                 )
             gblup_force_kinship = True
         elif packed_method_ctx is not None:
-            # Packed backend policy aligns with dense behavior:
-            # - n > m: prefer marker-space/FaST route (avoid explicit n x n GRM prebuild)
-            # - m >= n: explicit kinship prebuild can be reused across CV folds
-            n_train = int(train_pheno.shape[0])
-            packed_ctx_local = typing.cast(dict[str, typing.Any], packed_method_ctx)
-            if "packed" in packed_ctx_local:
-                m_snp = int(np.asarray(packed_ctx_local["packed"]).shape[0])
-            else:
-                m_snp = int(
-                    np.asarray(
-                        packed_ctx_local.get("maf", np.asarray([], dtype=np.float32))
-                    ).reshape(-1).shape[0]
-                )
-            gblup_force_kinship = bool(m_snp >= n_train)
-            if (not gblup_force_kinship) and prefer_rust_packed_gblup and _GS_DEBUG_STAGE:
+            # Packed GBLUP stays on the Rust route. Kernel-space details are
+            # resolved inside Rust, optionally via the shared full-GRM cache.
+            gblup_force_kinship = False
+            if prefer_rust_packed_gblup and _GS_DEBUG_STAGE:
+                packed_ctx_local = typing.cast(dict[str, typing.Any], packed_method_ctx)
+                shared_grm_path = str(
+                    packed_ctx_local.get("__gblup_shared_full_grm_path__", "")
+                ).strip()
                 print(
-                    "[GS-DEBUG] GBLUP packed policy: route via GSapi->rust_gblup_reml_packed_bed "
-                    "(marker-space/FaST regime).",
+                    (
+                        "[GS-DEBUG] GBLUP packed policy: route via GSapi->rust_gblup_reml_npy_grm "
+                        f"(shared_full_grm={shared_grm_path})"
+                    )
+                    if shared_grm_path != ""
+                    else (
+                        "[GS-DEBUG] GBLUP packed policy: route via GSapi->rust_gblup_reml_packed_bed "
+                        "(kernel path resolved in Rust)."
+                    ),
                     flush=True,
                 )
         elif packed_payload is None and train_snp is not None:
             # GBLUP backend policy (dense markers only):
-            # - n > m: use marker-space ZTZ/FaST route (no explicit kinship build)
-            # - m >= n: build kinship once and reuse by slicing
+            # - n <= BLUP_SMALL_N: build kinship once and reuse by slicing
+            # - n > BLUP_SMALL_N: keep the non-kinship route
             n_train = int(train_pheno.shape[0])
-            m_snp = int(train_snp.shape[0])
-            gblup_force_kinship = bool(m_snp >= n_train)
+            gblup_force_kinship = bool(n_train <= int(BLUP_SMALL_N))
             if gblup_force_kinship:
                 try:
                     gblup_cv_grm_full, gblup_final_test_train = _build_gblup_kinship_blocks_once(

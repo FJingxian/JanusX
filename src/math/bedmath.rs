@@ -1035,7 +1035,11 @@ pub(crate) fn decode_mean_imputed_additive_packed_block_rows_f64_stats(
             &packed_flat[row_idx_packed * bytes_per_snp..(row_idx_packed + 1) * bytes_per_snp];
         let mean_g = (2.0_f64 * row_maf[row_idx_local] as f64).clamp(0.0_f64, 2.0_f64);
         let missing_g = if impute_major {
-            if mean_g > 1.0_f64 { 2.0_f64 } else { 0.0_f64 }
+            if mean_g > 1.0_f64 {
+                2.0_f64
+            } else {
+                0.0_f64
+            }
         } else {
             mean_g
         };

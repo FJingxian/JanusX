@@ -747,6 +747,154 @@ fn load_square_matrix_subset_sym_col_major_f64(
     }
 }
 
+pub(crate) fn load_square_matrix_subset_row_major_f64(
+    path: &str,
+    subset: &[usize],
+    diag_shift: f64,
+) -> Result<(Vec<f64>, usize), String> {
+    let (a_col_major, n) = load_square_matrix_subset_sym_col_major_f64(path, subset, diag_shift)?;
+    Ok((copy_col_major_to_row_major(&a_col_major, n), n))
+}
+
+pub(crate) fn square_matrix_subset_cross_dot_f64(
+    path: &str,
+    row_indices: &[usize],
+    col_indices: &[usize],
+    weights: &[f64],
+) -> Result<Vec<f64>, String> {
+    if col_indices.len() != weights.len() {
+        return Err(format!(
+            "square_matrix_subset_cross_dot_f64 weight length mismatch: cols={} weights={}",
+            col_indices.len(),
+            weights.len()
+        ));
+    }
+    if row_indices.is_empty() {
+        return Ok(Vec::new());
+    }
+    if col_indices.is_empty() {
+        return Ok(vec![0.0_f64; row_indices.len()]);
+    }
+
+    let p = Path::new(path);
+    let ext = p
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if ext != "npy" {
+        let (a_row_major, n) = load_square_matrix_from_text_f64(path, 0.0)?;
+        validate_subset_indices_usize(
+            row_indices,
+            n,
+            "square_matrix_subset_cross_dot_f64(row_indices)",
+        )?;
+        validate_subset_indices_usize(
+            col_indices,
+            n,
+            "square_matrix_subset_cross_dot_f64(col_indices)",
+        )?;
+        let mut out = vec![0.0_f64; row_indices.len()];
+        for (dst_row, &src_row) in row_indices.iter().enumerate() {
+            let mut acc = 0.0_f64;
+            for (&src_col, &w) in col_indices.iter().zip(weights.iter()) {
+                let a_rc = a_row_major[src_row * n + src_col];
+                let a_cr = a_row_major[src_col * n + src_row];
+                if !a_rc.is_finite() {
+                    return Err(format!(
+                        "square_matrix_subset_cross_dot_f64: non-finite value at ({src_row}, {src_col})"
+                    ));
+                }
+                if !a_cr.is_finite() {
+                    return Err(format!(
+                        "square_matrix_subset_cross_dot_f64: non-finite value at ({src_col}, {src_row})"
+                    ));
+                }
+                let v = if src_row == src_col {
+                    a_rc
+                } else {
+                    0.5_f64 * (a_rc + a_cr)
+                };
+                acc += v * w;
+            }
+            out[dst_row] = acc;
+        }
+        return Ok(out);
+    }
+
+    let file = File::open(path).map_err(|e| format!("open NPY failed: {e}"))?;
+    let mmap = unsafe { MmapOptions::new().map(&file).map_err(|e| e.to_string())? };
+    let (rows, cols, data_offset, dtype) = parse_npy_header_for_float_matrix(&mmap[..])?;
+    if rows == 0 || cols == 0 || rows != cols {
+        return Err(format!(
+            "GRM/kinship matrix must be non-empty square, got ({rows}, {cols})"
+        ));
+    }
+    let n = rows;
+    validate_subset_indices_usize(
+        row_indices,
+        n,
+        "square_matrix_subset_cross_dot_f64(row_indices)",
+    )?;
+    validate_subset_indices_usize(
+        col_indices,
+        n,
+        "square_matrix_subset_cross_dot_f64(col_indices)",
+    )?;
+    let n_elem = n
+        .checked_mul(n)
+        .ok_or_else(|| "matrix element count overflow".to_string())?;
+    let bytes_per = match dtype {
+        NpyFloatDtype::F32Le => 4usize,
+        NpyFloatDtype::F64Le => 8usize,
+    };
+    let payload_bytes = n_elem
+        .checked_mul(bytes_per)
+        .ok_or_else(|| "matrix payload size overflow".to_string())?;
+    let data_end = data_offset
+        .checked_add(payload_bytes)
+        .ok_or_else(|| "matrix payload end overflow".to_string())?;
+    if data_end > mmap.len() {
+        return Err("NPY data truncated".to_string());
+    }
+    let payload = &mmap[data_offset..data_end];
+
+    let mut out = vec![0.0_f64; row_indices.len()];
+    for (dst_row, &src_row) in row_indices.iter().enumerate() {
+        let mut acc = 0.0_f64;
+        for (&src_col, &w) in col_indices.iter().zip(weights.iter()) {
+            let idx_rc = src_row
+                .checked_mul(n)
+                .and_then(|v| v.checked_add(src_col))
+                .ok_or_else(|| "square_matrix_subset_cross_dot_f64 index overflow".to_string())?;
+            let idx_cr = src_col
+                .checked_mul(n)
+                .and_then(|v| v.checked_add(src_row))
+                .ok_or_else(|| "square_matrix_subset_cross_dot_f64 index overflow".to_string())?;
+            let a_rc = read_npy_float_elem_as_f64(payload, dtype, idx_rc)?;
+            let a_cr = read_npy_float_elem_as_f64(payload, dtype, idx_cr)?;
+            if !a_rc.is_finite() {
+                return Err(format!(
+                    "square_matrix_subset_cross_dot_f64: non-finite value at ({src_row}, {src_col})"
+                ));
+            }
+            if !a_cr.is_finite() {
+                return Err(format!(
+                    "square_matrix_subset_cross_dot_f64: non-finite value at ({src_col}, {src_row})"
+                ));
+            }
+            let v = if src_row == src_col {
+                a_rc
+            } else {
+                0.5_f64 * (a_rc + a_cr)
+            };
+            acc += v * w;
+        }
+        out[dst_row] = acc;
+    }
+    Ok(out)
+}
+
 fn parse_text_matrix_row(line: &str) -> Vec<&str> {
     if line.contains('\t') {
         line.split('\t')

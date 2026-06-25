@@ -210,8 +210,9 @@ use garfield::{
     score_cont_mean_diff_py,
 };
 use gblup::{
-    farmcpu_q_packed_grm_pca_f32, gblup_effect_from_meta_stream, gblup_reml_packed_bed,
-    packed_mtm_f64,
+    farmcpu_q_packed_grm_pca_f32, gblup_effect_from_meta_stream, gblup_grm_from_meta_to_npy,
+    gblup_reml_npy_grm,
+    gblup_reml_packed_bed, packed_mtm_f64,
 };
 use gfreader::{
     bed_filter_stream_to_plink_rust, bed_filter_to_plink_rust, bed_mmap_filter_to_plink_rust,
@@ -786,7 +787,9 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(rrblup_exact_snp_fit_prepared, m)?)?;
     m.add_function(wrap_pyfunction!(rrblup_exact_snp_packed, m)?)?;
     m.add_function(wrap_pyfunction!(gblup_reml_packed_bed, m)?)?;
+    m.add_function(wrap_pyfunction!(gblup_reml_npy_grm, m)?)?;
     m.add_function(wrap_pyfunction!(gblup_effect_from_meta_stream, m)?)?;
+    m.add_function(wrap_pyfunction!(gblup_grm_from_meta_to_npy, m)?)?;
     m.add_function(wrap_pyfunction!(rust_sgemm_backend, m)?)?;
     m.add_function(wrap_pyfunction!(rust_eigh_lapack_backend, m)?)?;
     m.add_function(wrap_pyfunction!(rust_blas_set_num_threads, m)?)?;

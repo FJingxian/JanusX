@@ -39,6 +39,8 @@ use pyo3::BoundObject;
 use rayon::prelude::*;
 use std::borrow::Cow;
 use std::f64::consts::PI;
+use std::fs::File;
+use std::io::{BufWriter, Write};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -49,7 +51,10 @@ use crate::bedmath::{
 };
 use crate::blas::OpenBlasThreadGuard;
 use crate::brent::brent_minimize;
-use crate::eigh::symmetric_eigh_f64_row_major;
+use crate::eigh::{
+    load_square_matrix_subset_row_major_f64, square_matrix_subset_cross_dot_f64,
+    symmetric_eigh_f64_row_major,
+};
 use crate::fast_math::gblup_marker_fast_packed;
 use crate::gload::WindowedBedMatrix;
 use crate::grm::{self, grm_rankk_update_raw_mixed_f32_to_f64, GrmAccumMode};
@@ -571,6 +576,223 @@ pub(crate) fn build_grm_from_meta_stream(
     Ok((grm, row_sum_all, varsum_acc))
 }
 
+fn write_npy_f32_matrix_from_f64(
+    path: &str,
+    data: &[f64],
+    rows: usize,
+    cols: usize,
+) -> Result<(), String> {
+    let expected = rows.saturating_mul(cols);
+    if data.len() != expected {
+        return Err(format!(
+            "write_npy_f32_matrix_from_f64: data length mismatch, got {}, expected {}",
+            data.len(),
+            expected
+        ));
+    }
+
+    let f = File::create(path).map_err(|e| format!("create npy file failed: {e}"))?;
+    let mut w = BufWriter::new(f);
+    let mut header =
+        format!("{{'descr': '<f4', 'fortran_order': False, 'shape': ({rows}, {cols}), }}");
+    while (10 + header.len() + 1) % 16 != 0 {
+        header.push(' ');
+    }
+    header.push('\n');
+    let header_len_u16 = u16::try_from(header.len())
+        .map_err(|_| "npy header too long for v1.0 format".to_string())?;
+
+    w.write_all(b"\x93NUMPY")
+        .map_err(|e| format!("write npy magic failed: {e}"))?;
+    w.write_all(&[1_u8, 0_u8])
+        .map_err(|e| format!("write npy version failed: {e}"))?;
+    w.write_all(&header_len_u16.to_le_bytes())
+        .map_err(|e| format!("write npy header length failed: {e}"))?;
+    w.write_all(header.as_bytes())
+        .map_err(|e| format!("write npy header failed: {e}"))?;
+
+    #[cfg(target_endian = "little")]
+    {
+        let mut chunk = vec![0.0_f32; 8192];
+        for src in data.chunks(chunk.len()) {
+            let used = src.len();
+            for (dst, &v) in chunk[..used].iter_mut().zip(src.iter()) {
+                *dst = v as f32;
+            }
+            let byte_len = used.saturating_mul(std::mem::size_of::<f32>());
+            let bytes =
+                unsafe { std::slice::from_raw_parts(chunk.as_ptr() as *const u8, byte_len) };
+            w.write_all(bytes)
+                .map_err(|e| format!("write npy payload failed: {e}"))?;
+        }
+    }
+    #[cfg(not(target_endian = "little"))]
+    {
+        for &v in data.iter() {
+            w.write_all(&(v as f32).to_le_bytes())
+                .map_err(|e| format!("write npy payload failed: {e}"))?;
+        }
+    }
+
+    w.flush()
+        .map_err(|e| format!("flush npy file failed: {e}"))?;
+    Ok(())
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    prefix,
+    out_npy_path,
+    row_source_indices,
+    row_flip,
+    row_maf,
+    sample_indices=None,
+    method=1,
+    block_rows=65536,
+    threads=0,
+    progress_callback=None,
+    progress_every=0,
+    mmap_window_mb=None
+))]
+pub fn gblup_grm_from_meta_to_npy<'py>(
+    py: Python<'py>,
+    prefix: String,
+    out_npy_path: String,
+    row_source_indices: PyReadonlyArray1<'py, i64>,
+    row_flip: PyReadonlyArray1<'py, bool>,
+    row_maf: PyReadonlyArray1<'py, f32>,
+    sample_indices: Option<PyReadonlyArray1<'py, i64>>,
+    method: usize,
+    block_rows: usize,
+    threads: usize,
+    progress_callback: Option<Py<PyAny>>,
+    progress_every: usize,
+    mmap_window_mb: Option<usize>,
+) -> PyResult<(usize, usize)> {
+    if method != 1 && method != 3 {
+        return Err(PyRuntimeError::new_err(format!(
+            "unsupported method={method}; expected 1 (centered additive) or 3 (centered dominance)"
+        )));
+    }
+
+    let mut bed_prefix = prefix.trim().to_string();
+    let lower = bed_prefix.to_ascii_lowercase();
+    if lower.ends_with(".bed") || lower.ends_with(".bim") || lower.ends_with(".fam") {
+        bed_prefix.truncate(bed_prefix.len().saturating_sub(4));
+    }
+    let n_samples_full = crate::gfcore::read_fam(&bed_prefix)
+        .map_err(PyRuntimeError::new_err)?
+        .len();
+    if n_samples_full == 0 {
+        return Err(PyRuntimeError::new_err("no samples found in PLINK input"));
+    }
+
+    let sample_idx: Vec<usize> = if let Some(sample_indices) = sample_indices {
+        parse_index_vec_i64(sample_indices.as_slice()?, n_samples_full, "sample_indices")?
+    } else {
+        (0..n_samples_full).collect()
+    };
+    if sample_idx.is_empty() {
+        return Err(PyRuntimeError::new_err("sample_indices must not be empty"));
+    }
+
+    let row_idx64 = row_source_indices
+        .as_slice()
+        .map_err(|_| PyRuntimeError::new_err("row_source_indices must be contiguous int64"))?
+        .to_vec();
+    let row_flip_vec = match row_flip.as_slice() {
+        Ok(s) => s.to_vec(),
+        Err(_) => row_flip.as_array().iter().copied().collect(),
+    };
+    let row_maf_vec = match row_maf.as_slice() {
+        Ok(s) => s.to_vec(),
+        Err(_) => row_maf.as_array().iter().copied().collect(),
+    };
+    if row_idx64.is_empty() {
+        return Err(PyRuntimeError::new_err(
+            "row_source_indices must not be empty",
+        ));
+    }
+    if row_flip_vec.len() != row_idx64.len() || row_maf_vec.len() != row_idx64.len() {
+        return Err(PyRuntimeError::new_err(format!(
+            "row meta length mismatch: row_source_indices={}, row_flip={}, row_maf={}",
+            row_idx64.len(),
+            row_flip_vec.len(),
+            row_maf_vec.len(),
+        )));
+    }
+
+    let out_npy_path_owned = out_npy_path.clone();
+    let n_out = sample_idx.len();
+    let eff_m = row_idx64.len();
+    let (eff_m_out, n_samples_out) = py
+        .detach(move || -> Result<(usize, usize), String> {
+            let row_idx: Vec<usize> = row_idx64
+                .iter()
+                .map(|&sid| {
+                    if sid < 0 {
+                        Err(format!("row index must be non-negative, got {sid}"))
+                    } else {
+                        Ok(sid as usize)
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+
+            let progress = move |done: usize, total: usize| -> Result<(), String> {
+                if let Some(cb) = progress_callback.as_ref() {
+                    Python::attach(|py2| -> PyResult<()> {
+                        py2.check_signals()?;
+                        cb.call1(py2, (done, total))?;
+                        Ok(())
+                    })
+                    .map_err(|e| e.to_string())?;
+                } else {
+                    Python::attach(|py2| py2.check_signals()).map_err(|e| e.to_string())?;
+                }
+                Ok(())
+            };
+
+            if progress_every > 0 {
+                progress(0usize, eff_m.max(1))?;
+            } else {
+                check_ctrlc()?;
+            }
+
+            let stream_mode = if method == 3 {
+                StreamKernelMode::Dominance
+            } else {
+                StreamKernelMode::Additive
+            };
+            let (grm, _row_sum, _varsum) = build_grm_from_meta_stream(
+                &bed_prefix,
+                row_idx.as_slice(),
+                row_flip_vec.as_slice(),
+                row_maf_vec.as_slice(),
+                sample_idx.as_slice(),
+                stream_mode,
+                block_rows,
+                threads,
+                mmap_window_mb,
+            )?;
+            write_npy_f32_matrix_from_f64(
+                &out_npy_path_owned,
+                grm.as_slice(),
+                n_out,
+                n_out,
+            )?;
+
+            if progress_every > 0 {
+                progress(eff_m, eff_m.max(1))?;
+            } else {
+                check_ctrlc()?;
+            }
+            Ok((eff_m, n_out))
+        })
+        .map_err(map_err_string_to_py)?;
+
+    Ok((eff_m_out, n_samples_out))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn compute_malpha_from_meta_stream(
     prefix: &str,
@@ -807,6 +1029,419 @@ fn predict_from_effect_stream(
             });
     }
     Ok(out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fit_gblup_reml_from_grm_row_major_f64(
+    grm_f64: &[f64],
+    y_vec: &[f64],
+    low: f64,
+    high: f64,
+    tol: f64,
+    max_iter: usize,
+    threads: usize,
+) -> Result<(Vec<f64>, f64, f64, f64, f64, f64, String, f64, f64, f64), String> {
+    let n = y_vec.len();
+    if n <= 1 {
+        return Err("GBLUP REML requires at least 2 training samples.".to_string());
+    }
+    if grm_f64.len() != n.saturating_mul(n) {
+        return Err(format!(
+            "GBLUP GRM shape mismatch: got {} values, expected {}",
+            grm_f64.len(),
+            n.saturating_mul(n)
+        ));
+    }
+
+    let _blas_guard = OpenBlasThreadGuard::enter(threads.max(1));
+    let y_mean = y_vec.iter().sum::<f64>() / (n as f64);
+    let y_center: Vec<f64> = y_vec.iter().map(|v| *v - y_mean).collect();
+
+    let t_evd = Instant::now();
+    let (s, u, evd_backend) = symmetric_eigh_f64_row_major(grm_f64, n)?;
+    let evd_elapsed = t_evd.elapsed().as_secs_f64();
+
+    let mut x_rot = vec![0.0_f64; n];
+    let mut y_rot = vec![0.0_f64; n];
+    for k in 0..n {
+        let mut xk = 0.0_f64;
+        let mut yk = 0.0_f64;
+        for r in 0..n {
+            let urk = u[r * n + k];
+            xk += urk;
+            yk += urk * y_center[r];
+        }
+        x_rot[k] = xk;
+        y_rot[k] = yk;
+    }
+
+    let v_floor = 1e-12_f64;
+    let n_eff = (n - 1) as f64;
+    let c_reml = n_eff * (n_eff.ln() - 1.0 - (2.0 * PI).ln()) / 2.0;
+    let c_ml = (n as f64) * ((n as f64).ln() - 1.0 - (2.0 * PI).ln()) / 2.0;
+
+    let eval_reml = |log10_lbd: f64| -> Option<(f64, f64, f64, f64, Vec<f64>, Vec<f64>)> {
+        let lbd = 10.0_f64.powf(log10_lbd);
+        if !(lbd.is_finite() && lbd > 0.0) {
+            return None;
+        }
+        let mut v_inv = vec![0.0_f64; n];
+        let mut log_det_v = 0.0_f64;
+        let mut xtvx = 0.0_f64;
+        let mut xtvy = 0.0_f64;
+        for i in 0..n {
+            let vi = (s[i] + lbd).max(v_floor);
+            log_det_v += vi.ln();
+            let invi = 1.0_f64 / vi;
+            v_inv[i] = invi;
+            xtvx += invi * x_rot[i] * x_rot[i];
+            xtvy += invi * x_rot[i] * y_rot[i];
+        }
+        if !(xtvx.is_finite() && xtvx > v_floor) {
+            return None;
+        }
+        let beta = xtvy / xtvx;
+        let mut r = vec![0.0_f64; n];
+        let mut rtv_invr = 0.0_f64;
+        for i in 0..n {
+            let ri = y_rot[i] - x_rot[i] * beta;
+            r[i] = ri;
+            rtv_invr += v_inv[i] * ri * ri;
+        }
+        if !(rtv_invr.is_finite() && rtv_invr > v_floor) {
+            return None;
+        }
+        let log_det_xtv = xtvx.ln();
+        let reml = c_reml - 0.5 * (n_eff * rtv_invr.ln() + log_det_v + log_det_xtv);
+        let ml = c_ml - 0.5 * (((n as f64) * rtv_invr.ln()) + log_det_v);
+        if !(reml.is_finite() && ml.is_finite()) {
+            return None;
+        }
+        Some((reml, ml, beta, rtv_invr, v_inv, r))
+    };
+
+    let (best_log10, _best_cost) = brent_minimize(
+        |x0| match eval_reml(x0) {
+            Some((reml_v, _, _, _, _, _)) => -reml_v,
+            None => 1e100,
+        },
+        low,
+        high,
+        tol,
+        max_iter,
+    );
+    let (reml_best, ml_best, beta_rot, rtv_invr, v_inv, r) = eval_reml(best_log10)
+        .ok_or_else(|| "GBLUP REML optimization failed to produce a valid optimum.".to_string())?;
+    let lambda = 10.0_f64.powf(best_log10);
+
+    let mut alpha = vec![0.0_f64; n];
+    for row in 0..n {
+        let mut acc = 0.0_f64;
+        for k in 0..n {
+            acc += u[row * n + k] * (v_inv[k] * r[k]);
+        }
+        alpha[row] = acc;
+    }
+
+    let sigma_g2 = rtv_invr / n_eff.max(1.0);
+    let sigma_e2 = lambda * sigma_g2;
+    let mean_s = s.iter().copied().sum::<f64>() / (n as f64);
+    let var_g = sigma_g2 * mean_s.max(0.0);
+    let denom = var_g + sigma_e2;
+    let pve = if denom.is_finite() && denom > 0.0 {
+        var_g / denom
+    } else {
+        f64::NAN
+    };
+    let beta0 = y_mean + beta_rot;
+
+    Ok((
+        alpha,
+        beta0,
+        lambda,
+        pve,
+        ml_best,
+        reml_best,
+        evd_backend.to_string(),
+        evd_elapsed,
+        sigma_g2,
+        sigma_e2,
+    ))
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    grm_path,
+    train_sample_indices,
+    y_train,
+    test_sample_indices=None,
+    train_pred_local_indices=None,
+    g_eps=1e-8_f64,
+    low=-6.0_f64,
+    high=6.0_f64,
+    max_iter=50,
+    tol=1e-4_f64,
+    threads=0,
+    return_variance_components=false,
+    estimate_only=false
+))]
+pub fn gblup_reml_npy_grm<'py>(
+    py: Python<'py>,
+    grm_path: String,
+    train_sample_indices: PyReadonlyArray1<'py, i64>,
+    y_train: PyReadonlyArray1<'py, f64>,
+    test_sample_indices: Option<PyReadonlyArray1<'py, i64>>,
+    train_pred_local_indices: Option<PyReadonlyArray1<'py, i64>>,
+    g_eps: f64,
+    low: f64,
+    high: f64,
+    max_iter: usize,
+    tol: f64,
+    threads: usize,
+    return_variance_components: bool,
+    estimate_only: bool,
+) -> PyResult<(
+    Bound<'py, PyArray2<f64>>,
+    Bound<'py, PyArray2<f64>>,
+    f64,
+    f64,
+    f64,
+    f64,
+    String,
+    f64,
+    usize,
+    f64,
+    f64,
+    Bound<'py, PyArray1<f64>>,
+)> {
+    if !(g_eps.is_finite() && g_eps >= 0.0) {
+        return Err(PyRuntimeError::new_err("g_eps must be finite and >= 0"));
+    }
+    if !(low.is_finite() && high.is_finite() && low < high) {
+        return Err(PyRuntimeError::new_err(
+            "low/high must be finite and low < high",
+        ));
+    }
+    if max_iter == 0 {
+        return Err(PyRuntimeError::new_err("max_iter must be > 0"));
+    }
+    if !(tol.is_finite() && tol > 0.0) {
+        return Err(PyRuntimeError::new_err("tol must be finite and > 0"));
+    }
+
+    let train_idx_raw = train_sample_indices.as_slice()?;
+    if train_idx_raw.is_empty() {
+        return Err(PyRuntimeError::new_err(
+            "train_sample_indices must not be empty.",
+        ));
+    }
+    let mut train_idx = Vec::<usize>::with_capacity(train_idx_raw.len());
+    for (pos, &idx) in train_idx_raw.iter().enumerate() {
+        if idx < 0 {
+            return Err(PyRuntimeError::new_err(format!(
+                "train_sample_indices index at position {} is negative ({})",
+                pos, idx
+            )));
+        }
+        train_idx.push(idx as usize);
+    }
+
+    let y_vec: Vec<f64> = match y_train.as_slice() {
+        Ok(s) => s.to_vec(),
+        Err(_) => y_train.as_array().iter().copied().collect(),
+    };
+    if y_vec.len() != train_idx.len() {
+        return Err(PyRuntimeError::new_err(format!(
+            "y_train length mismatch: got {}, expected {}",
+            y_vec.len(),
+            train_idx.len()
+        )));
+    }
+    if y_vec.iter().any(|v| !v.is_finite()) {
+        return Err(PyRuntimeError::new_err(
+            "y_train contains non-finite values.",
+        ));
+    }
+
+    let mut test_idx = Vec::<usize>::new();
+    if let Some(sidx) = test_sample_indices {
+        for (pos, &idx) in sidx.as_slice()?.iter().enumerate() {
+            if idx < 0 {
+                return Err(PyRuntimeError::new_err(format!(
+                    "test_sample_indices index at position {} is negative ({})",
+                    pos, idx
+                )));
+            }
+            test_idx.push(idx as usize);
+        }
+    }
+    let train_pred_pick: Option<Vec<usize>> = if let Some(local_idx) = train_pred_local_indices {
+        Some(parse_index_vec_i64(
+            local_idx.as_slice()?,
+            train_idx.len(),
+            "train_pred_local_indices",
+        )?)
+    } else {
+        None
+    };
+
+    let grm_path_owned = grm_path.clone();
+    let train_idx_owned = train_idx;
+    let test_idx_owned = test_idx;
+    let y_vec_owned = y_vec;
+    let train_pred_pick_owned = train_pred_pick;
+    let threads_owned = threads.max(1);
+
+    let (
+        pred_train,
+        pred_test,
+        pve,
+        lambda_opt,
+        ml,
+        reml,
+        evd_backend,
+        evd_elapsed,
+        sigma_g2,
+        sigma_e2,
+    ) = py
+        .detach(move || -> Result<
+            (
+                Vec<f64>,
+                Vec<f64>,
+                f64,
+                f64,
+                f64,
+                f64,
+                String,
+                f64,
+                f64,
+                f64,
+            ),
+            String,
+        > {
+            let (grm_train, n_train) = load_square_matrix_subset_row_major_f64(
+                &grm_path_owned,
+                train_idx_owned.as_slice(),
+                g_eps,
+            )?;
+            if n_train != train_idx_owned.len() {
+                return Err(format!(
+                    "train subset size mismatch: got {}, expected {}",
+                    n_train,
+                    train_idx_owned.len()
+                ));
+            }
+
+            let (
+                alpha,
+                beta0,
+                lambda,
+                pve_fit,
+                ml_fit,
+                reml_fit,
+                evd_backend_fit,
+                evd_elapsed_fit,
+                sigma_g2_fit,
+                sigma_e2_fit,
+            ) = fit_gblup_reml_from_grm_row_major_f64(
+                grm_train.as_slice(),
+                y_vec_owned.as_slice(),
+                low,
+                high,
+                tol,
+                max_iter,
+                threads_owned,
+            )?;
+
+            if estimate_only {
+                return Ok((
+                    Vec::new(),
+                    Vec::new(),
+                    pve_fit,
+                    lambda,
+                    ml_fit,
+                    reml_fit,
+                    evd_backend_fit,
+                    evd_elapsed_fit,
+                    sigma_g2_fit,
+                    sigma_e2_fit,
+                ));
+            }
+
+            let train_pred_abs: Vec<usize> = if let Some(local_idx) = &train_pred_pick_owned {
+                local_idx.iter().map(|&i| train_idx_owned[i]).collect()
+            } else {
+                train_idx_owned.clone()
+            };
+            let mut pred_train = square_matrix_subset_cross_dot_f64(
+                &grm_path_owned,
+                train_pred_abs.as_slice(),
+                train_idx_owned.as_slice(),
+                alpha.as_slice(),
+            )?;
+            pred_train.iter_mut().for_each(|v| *v += beta0);
+
+            let mut pred_test = square_matrix_subset_cross_dot_f64(
+                &grm_path_owned,
+                test_idx_owned.as_slice(),
+                train_idx_owned.as_slice(),
+                alpha.as_slice(),
+            )?;
+            pred_test.iter_mut().for_each(|v| *v += beta0);
+
+            Ok((
+                pred_train,
+                pred_test,
+                pve_fit,
+                lambda,
+                ml_fit,
+                reml_fit,
+                evd_backend_fit,
+                evd_elapsed_fit,
+                sigma_g2_fit,
+                sigma_e2_fit,
+            ))
+        })
+        .map_err(map_err_string_to_py)?;
+
+    let sigma_g2_out = if return_variance_components {
+        sigma_g2
+    } else {
+        f64::NAN
+    };
+    let sigma_e2_out = if return_variance_components {
+        sigma_e2
+    } else {
+        f64::NAN
+    };
+    let train_arr = PyArray2::from_owned_array(
+        py,
+        Array2::from_shape_vec((pred_train.len(), 1), pred_train)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+    )
+    .into_bound();
+    let test_arr = PyArray2::from_owned_array(
+        py,
+        Array2::from_shape_vec((pred_test.len(), 1), pred_test)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+    )
+    .into_bound();
+    let effect_arr =
+        PyArray1::from_owned_array(py, Array1::from_vec(Vec::<f64>::new())).into_bound();
+    Ok((
+        train_arr,
+        test_arr,
+        pve,
+        lambda_opt,
+        ml,
+        reml,
+        evd_backend,
+        evd_elapsed,
+        0usize,
+        sigma_g2_out,
+        sigma_e2_out,
+        effect_arr,
+    ))
 }
 
 #[pyfunction]

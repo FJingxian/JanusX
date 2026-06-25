@@ -36,7 +36,7 @@ def plot_admixture_structure(
     *,
     sample_ids: Optional[Sequence[str]] = None,
     out_path: Optional[str] = None,
-    threshold: float = 0.7,
+    threshold: float = 0.5,
     tag_samples: Optional[Sequence[str]] = None,
     show_xticks: bool = False,
     figsize: tuple[float, float] = (10.0, 3.0),

@@ -46,6 +46,7 @@ import socket
 import argparse
 import logging
 import re
+import colorsys
 import multiprocessing as mp
 import tempfile
 import shutil
@@ -148,6 +149,147 @@ def _memory_gb_to_mb(memory_gb: Union[int, float, None]) -> float:
     return float(_normalize_memory_gb(memory_gb) * 1024.0)
 
 
+def _get_palette_helpers():
+    import matplotlib as mpl
+
+    mpl.use("Agg")
+    from matplotlib import colors as mcolors
+
+    return mpl, mcolors
+
+
+def _get_palette_cmap(name: str):
+    mpl, _mcolors = _get_palette_helpers()
+    try:
+        return mpl.colormaps.get_cmap(str(name))
+    except Exception as exc:
+        raise ValueError(f"Invalid --palette colormap: {name}") from exc
+
+
+def _parse_rgb_triplet(token: str) -> str:
+    _mpl, mcolors = _get_palette_helpers()
+    text = str(token).strip()
+    if not (text.startswith("(") and text.endswith(")")):
+        raise ValueError(f"Invalid RGB tuple token: {token}")
+    parts = [p.strip() for p in text[1:-1].split(",")]
+    if len(parts) != 3:
+        raise ValueError(f"RGB tuple must have 3 values: {token}")
+    try:
+        rgb = [int(p) for p in parts]
+    except ValueError as exc:
+        raise ValueError(f"RGB tuple must be integers: {token}") from exc
+    if any(v < 0 or v > 255 for v in rgb):
+        raise ValueError(f"RGB tuple values must be in [0, 255]: {token}")
+    return mcolors.to_hex([rgb[0] / 255.0, rgb[1] / 255.0, rgb[2] / 255.0])
+
+
+def _split_palette_tokens(text: str) -> list[str]:
+    out: list[str] = []
+    buf: list[str] = []
+    depth = 0
+    for ch in str(text):
+        if ch == "(":
+            depth += 1
+            buf.append(ch)
+            continue
+        if ch == ")":
+            depth = max(0, depth - 1)
+            buf.append(ch)
+            continue
+        if depth == 0 and ch in {";", ","}:
+            tok = "".join(buf).strip()
+            if tok != "":
+                out.append(tok)
+            buf = []
+            continue
+        buf.append(ch)
+    tok = "".join(buf).strip()
+    if tok != "":
+        out.append(tok)
+    return out
+
+
+def _parse_custom_palette(text: str) -> list[str]:
+    _mpl, mcolors = _get_palette_helpers()
+    colors: list[str] = []
+    for token in _split_palette_tokens(text):
+        tok = token.strip()
+        if tok == "":
+            continue
+        if tok.startswith("(") and tok.endswith(")"):
+            colors.append(_parse_rgb_triplet(tok))
+            continue
+        try:
+            colors.append(mcolors.to_hex(mcolors.to_rgba(tok)))
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid --palette color token: {tok}. Use #RRGGBB, color names, or (R,G,B)."
+            ) from exc
+    if len(colors) == 0:
+        raise ValueError("Invalid --palette: empty color list.")
+    return colors
+
+
+def _parse_palette_spec(value: object) -> Optional[tuple[str, object]]:
+    _mpl, mcolors = _get_palette_helpers()
+    if value is None:
+        return None
+    text = str(value).strip()
+    if text == "":
+        raise ValueError("Invalid --palette: value is empty.")
+    if (";" in text) or ("," in text):
+        toks = _split_palette_tokens(text)
+        if len(toks) >= 2:
+            return ("list", _parse_custom_palette(text))
+    try:
+        _get_palette_cmap(text)
+        return ("cmap", text)
+    except ValueError:
+        if text.startswith("(") and text.endswith(")"):
+            return ("list", [_parse_rgb_triplet(text)])
+        try:
+            return ("list", [mcolors.to_hex(mcolors.to_rgba(text))])
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid --palette: {text}. Use a cmap name (e.g. tab10) or ',' / ';' separated colors."
+            ) from exc
+
+
+def _desaturate_color(color: str, sat_scale: float = 0.90) -> str:
+    _mpl, mcolors = _get_palette_helpers()
+    r, g, b = mcolors.to_rgb(color)
+    h, s, v = colorsys.rgb_to_hsv(r, g, b)
+    s2 = float(np.clip(float(s) * float(sat_scale), 0.0, 1.0))
+    r2, g2, b2 = colorsys.hsv_to_rgb(h, s2, v)
+    return mcolors.to_hex((r2, g2, b2))
+
+
+def _resolve_palette_colors(spec: Optional[tuple[str, object]], n_series: int) -> list[str]:
+    _mpl, mcolors = _get_palette_helpers()
+    if n_series <= 0:
+        return []
+    if spec is None:
+        spec = ("cmap", "tab10")
+
+    mode, payload = spec
+    if mode == "list":
+        colors = [mcolors.to_hex(mcolors.to_rgba(c)) for c in list(payload)]
+        if len(colors) == 0:
+            colors = [mcolors.to_hex(_get_palette_cmap("tab10")(i / max(1, n_series - 1))) for i in range(n_series)]
+        return [colors[i % len(colors)] for i in range(n_series)]
+
+    cmap_name = str(payload).strip()
+    cmap = _get_palette_cmap(cmap_name)
+    if getattr(cmap, "N", 256) <= 32:
+        n_bins = max(1, int(cmap.N))
+        colors = [mcolors.to_hex(cmap(i % n_bins)) for i in range(n_series)]
+    else:
+        colors = [mcolors.to_hex(cmap(i / max(1, n_series - 1))) for i in range(n_series)]
+    if cmap_name.lower() == "tab10":
+        colors = [_desaturate_color(c, 0.90) for c in colors]
+    return colors
+
+
 @contextmanager
 def _bed_block_target_env(memory_mb: Union[int, float, None]) -> None:
     prev = os.environ.get("JX_BED_BLOCK_TARGET_MB")
@@ -171,6 +313,33 @@ def load_group_table(group_path: str) -> tuple[pd.DataFrame, Union[str , None], 
     group_df = group_df.iloc[:, :2]
     group_df.columns = ["group", "label"]
     return group_df, "group", "label"
+
+
+def extract_group_order(group_df: pd.DataFrame, group_col: Union[str, None]) -> Union[list, None]:
+    if group_col is None or group_col not in group_df.columns:
+        return None
+    return pd.Index(group_df[group_col].dropna()).unique().tolist()
+
+
+def resolve_group_levels(data: pd.DataFrame, group_col: Union[str, None], group_order: Union[list, None]) -> list:
+    if group_col is None or group_col not in data.columns:
+        return []
+    present_groups = pd.Index(data[group_col].dropna().unique()).tolist()
+    if group_order is None:
+        return present_groups
+
+    present_set = set(present_groups)
+    ordered_groups = []
+    seen = set()
+    for g in group_order:
+        if pd.isna(g) or g not in present_set or g in seen:
+            continue
+        ordered_groups.append(g)
+        seen.add(g)
+    for g in present_groups:
+        if g not in seen:
+            ordered_groups.append(g)
+    return ordered_groups
 
 
 def _is_plink_prefix_path(path_or_prefix: str) -> bool:
@@ -1009,9 +1178,12 @@ def main(log: bool = True):
         ),
     )
     optional_group.add_argument(
-        "-color", "--color", type=int, default=-1,
-        help="Color palette index for PCA plots, 0-6; -1 uses auto palette "
-             "(default: %(default)s).",
+        "-palette", "--palette", type=str, default="tab10",
+        help=(
+            "Palette for grouped PCA plots. Supports cmap names (e.g. tab10, tab20) "
+            "or ',' / ';' separated colors such as 'red,green,yellow' "
+            "(default: %(default)s)."
+        ),
     )
     optional_group.add_argument(
         "-rsvd",
@@ -1119,9 +1291,6 @@ def main(log: bool = True):
     args.memory = _normalize_memory_gb(args.memory)
     memory_mb = _memory_gb_to_mb(args.memory)
 
-    # Keep index for logging and validate after logger is ready
-    palette_idx = int(args.color)
-
     # ------------------------- Logging -------------------------
     os.makedirs(args.out, 0o755, exist_ok=True)
     configure_genotype_cache_from_out(args.out)
@@ -1145,12 +1314,10 @@ def main(log: bool = True):
     # if genotype_input_mode and (not bool(args.mmap_limit)):
     #     logger.info("PCA backend policy: memmap (default).")
 
-    if palette_idx == -1:
-        args.color = None
-    elif 0 <= palette_idx <= 6:
-        args.color = int(palette_idx)
-    else:
-        logger.error("Color set index out of range; please use 0-6 or -1.")
+    try:
+        args.palette_spec = _parse_palette_spec(args.palette)
+    except ValueError as exc:
+        logger.error(str(exc))
         raise SystemExit(1)
 
     if log:
@@ -1224,7 +1391,7 @@ def main(log: bool = True):
             cfg_rows.extend(
                 [
                     ("Group file", args.group),
-                    ("Color palette", "auto" if palette_idx == -1 else f"index {palette_idx}"),
+                    ("Palette", str(args.palette)),
                 ]
             )
         emit_cli_configuration(
@@ -1651,9 +1818,7 @@ def main(log: bool = True):
 
     # ------------------------- Visualization -------------------------
     if args.plot or args.plot3D:
-        _, plt, PCSHOW, color_set = _get_pca_plot_backend()
-        if isinstance(args.color, (int, np.integer)):
-            args.color = color_set[int(args.color)]
+        _, plt, PCSHOW, _legacy_color_set = _get_pca_plot_backend()
         if explained_ratio is None:
             explained_ratio = _compute_explained_ratio(eigenval)
         exp = 100.0 * np.asarray(explained_ratio, dtype=np.float64).reshape(-1)
@@ -1666,10 +1831,17 @@ def main(log: bool = True):
         )
 
         group = None
+        group_order = None
         textanno = None
+        plot_colors = None
         if args.group:
             group_df, group, textanno = load_group_table(args.group)
+            group_order = extract_group_order(group_df, group)
             df_pc = df_pc.join(group_df, how="left")
+            plot_colors = _resolve_palette_colors(
+                args.palette_spec,
+                len(resolve_group_levels(df_pc, group, group_order)),
+            )
 
     if args.plot:
         logger.info("* Generating 2D PCA scatter plots...")
@@ -1687,16 +1859,18 @@ def main(log: bool = True):
             df_pc.columns[0],
             df_pc.columns[1],
             group=group,
+            group_order=group_order,
             ax=ax1,
-            color_set=args.color,
+            color_set=plot_colors,
             anno_tag=textanno,
         )
         pcshow.pcplot(
             df_pc.columns[0],
             df_pc.columns[2],
             group=group,
+            group_order=group_order,
             ax=ax2,
-            color_set=args.color,
+            color_set=plot_colors,
             anno_tag=textanno,
         )
 
@@ -1715,8 +1889,9 @@ def main(log: bool = True):
             df_pc.columns[1],
             df_pc.columns[2],
             group=group,
+            group_order=group_order,
             anno_tag=textanno,
-            color_set=args.color,
+            color_set=plot_colors,
             out_gif=out_gif,
         )
         log_success(logger, f"3D PCA GIF saved to {format_path_for_display(out_gif)}")

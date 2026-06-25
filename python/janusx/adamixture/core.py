@@ -810,6 +810,24 @@ def _admx_rsvd_k_prime(k_eff: int, max_cols: int) -> int:
     return min(kp, limit)
 
 
+def _normalize_rsvd_stream_sample_output(
+    raw: Any,
+) -> tuple[Any, Any, Optional[float]]:
+    if not isinstance(raw, (tuple, list)):
+        raise TypeError(
+            f"invalid RSVD stream-sample output type: {type(raw)!r}"
+        )
+    if len(raw) == 3:
+        evals, eigvecs, total_variance = raw
+        return evals, eigvecs, float(total_variance)
+    if len(raw) == 2:
+        evals, eigvecs = raw
+        return evals, eigvecs, None
+    raise ValueError(
+        f"invalid RSVD stream-sample output arity: expected 2 or 3 values, got {len(raw)}"
+    )
+
+
 def _rsvd(
     g: Optional[np.ndarray],
     f: np.ndarray,
@@ -839,29 +857,34 @@ def _rsvd(
 
     _emit_progress(callback, "rsvd_start", power=int(power))
     logger.info(f"{'RSVD':<22}: start")
+    stream_sample_error: Optional[Exception] = None
     if use_stream_sample and genotype_path and hasattr(jxrs, "admx_rsvd_stream_sample"):
         prefix = _plink_prefix_path(str(genotype_path))
         if prefix is not None:
             try:
                 if bed_backend is not None and hasattr(bed_backend, "rsvd_stream_sample"):
-                    evals, v, _total_variance = bed_backend.rsvd_stream_sample(
-                        int(k),
-                        int(seed),
-                        int(power),
-                        float(tol),
+                    evals, v, _total_variance = _normalize_rsvd_stream_sample_output(
+                        bed_backend.rsvd_stream_sample(
+                            int(k),
+                            int(seed),
+                            int(power),
+                            float(tol),
+                        )
                     )
                 else:
-                    evals, v, _total_variance = jxrs.admx_rsvd_stream_sample(
-                        str(genotype_path),
-                        int(k),
-                        int(seed),
-                        int(power),
-                        float(tol),
-                        bool(snps_only),
-                        float(maf),
-                        float(missing_rate),
-                        None,
-                        0,
+                    evals, v, _total_variance = _normalize_rsvd_stream_sample_output(
+                        jxrs.admx_rsvd_stream_sample(
+                            str(genotype_path),
+                            int(k),
+                            int(seed),
+                            int(power),
+                            float(tol),
+                            bool(snps_only),
+                            float(maf),
+                            float(missing_rate),
+                            None,
+                            0,
+                        )
                     )
                 eigvals = np.ascontiguousarray(np.asarray(evals, dtype=np.float32))
                 v = np.ascontiguousarray(np.asarray(v, dtype=np.float32))
@@ -914,11 +937,16 @@ def _rsvd(
             except Exception as ex:
                 if _is_admx_memory_limit_error(ex):
                     raise
+                stream_sample_error = ex
                 logger.warning(
                     f"{'RSVD fallback':<22}: stream-sample BED failed ({ex}); retry in-memory"
                 )
 
     if g is None:
+        if stream_sample_error is not None:
+            raise ValueError(
+                "BED stream-sample RSVD failed and no dense genotype matrix is available for in-memory fallback."
+            ) from stream_sample_error
         raise ValueError("In-memory RSVD fallback requires dense genotype matrix.")
 
     rng = np.random.default_rng(int(seed))

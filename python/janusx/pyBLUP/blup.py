@@ -416,7 +416,7 @@ def _fit_sparse_z_reml_rust(
         return None
     p_fixed = int(X.shape[1])
     z_cols = [int(v) for v in cache.z_cols]
-    theta0 = np.ones(len(z_cols) + 1, dtype=float)
+    theta0 = np.ones(len(z_cols), dtype=float)
     bounds = [(1e-12, None)] * theta0.size
 
     pbar = None
@@ -426,30 +426,49 @@ def _fit_sparse_z_reml_rust(
 
         def callback(theta):
             pbar.update(1)
-            pbar.set_postfix({"theta": np.round(theta, 4)})
+            full_theta = np.concatenate([np.asarray(theta, dtype=float).reshape(-1), [1.0]])
+            pbar.set_postfix({"theta": np.round(full_theta, 4)})
 
     try:
         result = minimize(
-            lambda theta: float(cache.objective(np.asarray(theta, dtype=float).tolist())),
+            lambda theta: float(
+                cache.objective(
+                    np.concatenate([np.asarray(theta, dtype=float).reshape(-1), [1.0]]).tolist()
+                )
+            ),
             theta0,
             method="L-BFGS-B",
             bounds=bounds,
             callback=callback,
             options={"maxiter": maxiter},
         )
-        theta = np.asarray(result.x, dtype=float).reshape(-1)
+        theta = np.concatenate([np.asarray(result.x, dtype=float).reshape(-1), [1.0]])
         if (not np.all(np.isfinite(theta))) or np.any(theta <= 0.0):
             return None
         fit = cache.fit(theta.tolist())
+        residuals = np.asarray(fit["residuals"], dtype=float).reshape(-1, 1)
+        vinvr = np.asarray(fit["vinvr"], dtype=float).reshape(-1, 1)
+        sigma2_raw = fit.get("sigma2", np.nan)
+        try:
+            sigma2 = float(sigma2_raw)
+        except Exception:
+            sigma2 = float("nan")
+        if (not np.isfinite(sigma2)) or sigma2 <= 0.0:
+            sigma2 = float((residuals.T @ vinvr)[0, 0]) / max(1, int(y.shape[0]) - int(p_fixed))
         fit_arrays = {
             "beta": np.asarray(fit["beta"], dtype=float).reshape(-1, 1),
             "u_hat": np.asarray(fit["u_hat"], dtype=float).reshape(-1, 1),
             "z_fitted": np.asarray(fit["z_fitted"], dtype=float).reshape(-1, 1),
             "fitted": np.asarray(fit["fitted"], dtype=float).reshape(-1, 1),
-            "residuals": np.asarray(fit["residuals"], dtype=float).reshape(-1, 1),
-            "vinvr": np.asarray(fit["vinvr"], dtype=float).reshape(-1, 1),
+            "residuals": residuals,
+            "vinvr": vinvr,
             "cov_beta": np.asarray(fit["cov_beta"], dtype=float).reshape(p_fixed, p_fixed),
+            "sigma2": float(sigma2),
         }
+        try:
+            result.x = theta.copy()
+        except Exception:
+            pass
         return theta, result, fit_arrays, z_cols
     except Exception:
         return None
@@ -567,6 +586,10 @@ class BLUP:
                 )
                 if rust_sparse_fit is not None:
                     theta, result, fit_arrays, z_cols = rust_sparse_fit
+                    sigma2 = float(fit_arrays.get("sigma2", np.nan))
+                    theta_scaled = np.asarray(theta, dtype=float).reshape(-1)
+                    if np.isfinite(sigma2) and sigma2 > 0.0:
+                        theta_scaled = theta_scaled * sigma2
                     beta_hat = fit_arrays["beta"]
                     u_hat = fit_arrays["u_hat"]
                     z_fitted = fit_arrays["z_fitted"]
@@ -580,19 +603,14 @@ class BLUP:
                         end = start + int(c)
                         u_by_Z.append(u_hat[start:end])
                         start = end
-                    z_theta = theta[:-1]
+                    z_theta = theta_scaled[:-1]
                     g_theta = np.asarray([], dtype=float)
                     g_scales: list[float] = []
                     g_by_G: list[np.ndarray] = []
                     g_total = np.zeros((self.n, 1), dtype=float)
-                    Kdiag_mean = [1.0 for _ in z_cols]
                     self._z_standardized = False
-                    self.theta = theta
-                    self.var = np.array(
-                        [float(theta[i]) * float(Kdiag_mean[i]) for i in range(len(z_cols))]
-                        + [float(theta[-1])],
-                        dtype=float,
-                    )
+                    self.theta = theta_scaled
+                    self.var = np.asarray(theta_scaled, dtype=float).reshape(-1)
                     self.beta = beta_hat
                     self.u = u_hat
                     self.u_by_Z = u_by_Z
@@ -606,6 +624,10 @@ class BLUP:
                     self._cov_beta = cov_beta
                     self.fitted = fitted
                     self.residuals = residuals
+                    try:
+                        result.x = theta_scaled.copy()
+                    except Exception:
+                        pass
                     self.result = result
                     return
             Zstlist = [

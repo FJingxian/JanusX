@@ -13,6 +13,24 @@ class PCSHOW:
         self.marker = None
         pass
 
+    def _resolve_groups(self, group: str, group_order: Union[list, None] = None) -> list:
+        present_groups = pd.Index(self.data[group].dropna().unique()).tolist()
+        if group_order is None:
+            return present_groups
+
+        present_set = set(present_groups)
+        ordered_groups = []
+        seen = set()
+        for g in group_order:
+            if pd.isna(g) or g not in present_set or g in seen:
+                continue
+            ordered_groups.append(g)
+            seen.add(g)
+        for g in present_groups:
+            if g not in seen:
+                ordered_groups.append(g)
+        return ordered_groups
+
     def _auto_colors(self, n: int) -> list[str]:
         if n <= 10:
             cmap = plt.get_cmap("tab10")
@@ -26,7 +44,7 @@ class PCSHOW:
         ax = ax if ax is not None else plt.gca()
         if group is not None:
             groupmask = self.data[group].isna()
-            groups = self.data.loc[~groupmask,group].unique() if group_order is None else group_order
+            groups = self._resolve_groups(group, group_order)
             colors = color_set if color_set is not None else self._auto_colors(len(groups))
             color = dict(zip(groups,[colors[i%len(colors)] for i in range(len(groups))]))
             marker = dict(zip(groups,[marker_set[i%len(marker_set)] for i in range(len(groups))]))
@@ -55,6 +73,7 @@ class PCSHOW:
         y: str,
         z: str,
         group: Union[str,None] = None,
+        group_order: Union[list,None] = None,
         anno_tag: Union[str,None] = None,
         color_set: Union[list,None] = None,
         out_gif: str = "pcshow_3d.gif",
@@ -75,10 +94,14 @@ class PCSHOW:
 
         data = self.data.copy()
         if group is not None:
+            groups = self._resolve_groups(group, group_order)
             data[group] = data[group].fillna("others")
-            groups = data[group].unique()
+            if (data[group] == "others").any():
+                groups = groups + ["others"]
             colors = color_set if color_set is not None else self._auto_colors(len(groups))
             color_map = dict(zip(groups, [colors[i % len(colors)] for i in range(len(groups))]))
+            if "others" in groups:
+                color_map["others"] = "#808080"
             for g in groups:
                 data_g = data[data[group] == g]
                 ax.scatter(

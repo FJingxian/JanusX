@@ -1021,6 +1021,68 @@ def _fit_stage1_blue_weighted_ls(
     )
 
 
+def _random_term_fitted_values(
+    model: BLUP,
+    z_term: typing.Union[np.ndarray, sparse.spmatrix],
+    z_idx: int,
+) -> np.ndarray:
+    if getattr(model, "u_by_Z", None) is None or z_idx < 0 or z_idx >= len(model.u_by_Z):
+        return np.zeros(int(z_term.shape[0]), dtype=float)
+
+    coef = np.asarray(model.u_by_Z[z_idx], dtype=float).reshape(-1)
+    q, mean_vec, std_vec = model.onehot_info[z_idx]
+    scale = np.sqrt(float(q)) if float(q) > 0.0 else 1.0
+    mean_arr = np.asarray(mean_vec, dtype=float)
+    std_arr = np.asarray(std_vec, dtype=float)
+
+    if bool(getattr(model, "_z_standardized", False)):
+        if mean_arr.ndim == 0 and std_arr.ndim == 0:
+            std_scalar = float(std_arr) if abs(float(std_arr)) > 0.0 else 1.0
+            scaled_coef = coef / (std_scalar * scale)
+            if sparse.issparse(z_term):
+                fitted = np.asarray(z_term @ scaled_coef, dtype=float).reshape(-1)
+            else:
+                fitted = np.asarray(np.asarray(z_term, dtype=float) @ scaled_coef, dtype=float).reshape(-1)
+            mean_scalar = float(mean_arr)
+            if abs(mean_scalar) > 0.0:
+                fitted = fitted - float(mean_scalar * np.sum(scaled_coef))
+            return fitted
+
+        mean_vec_arr = mean_arr.reshape(-1)
+        std_vec_arr = std_arr.reshape(-1)
+        std_vec_arr = np.where(np.abs(std_vec_arr) > 0.0, std_vec_arr, 1.0)
+        scaled_coef = coef / (std_vec_arr * scale)
+        if sparse.issparse(z_term):
+            fitted = np.asarray(z_term @ scaled_coef, dtype=float).reshape(-1)
+        else:
+            fitted = np.asarray(np.asarray(z_term, dtype=float) @ scaled_coef, dtype=float).reshape(-1)
+        return fitted - float(mean_vec_arr @ scaled_coef)
+
+    if sparse.issparse(z_term):
+        return np.asarray(z_term @ coef, dtype=float).reshape(-1)
+    return np.asarray(np.asarray(z_term, dtype=float) @ coef, dtype=float).reshape(-1)
+
+
+def _line_level_blup_from_broad_model(
+    model: BLUP,
+    sub: pd.DataFrame,
+    *,
+    line_col: str,
+    line_z: typing.Union[np.ndarray, sparse.spmatrix],
+    line_term_idx: int,
+) -> dict[str, float]:
+    fixed_fitted = np.asarray(model.X @ model.beta, dtype=float).reshape(-1)
+    line_fitted = _random_term_fitted_values(model, line_z, line_term_idx)
+    obs_pred = fixed_fitted + line_fitted
+    line_ids = sub[line_col].astype("string").fillna("NA").astype(str)
+    agg = (
+        pd.DataFrame({"line": line_ids.to_numpy(dtype=object), "pred": obs_pred})
+        .groupby("line", sort=False, observed=False)["pred"]
+        .mean()
+    )
+    return {str(k): float(v) for k, v in agg.items()}
+
+
 def _line_level_noise_diag(
     sub: pd.DataFrame,
     *,
@@ -1569,6 +1631,7 @@ def main() -> None:
     )
 
     blue_out = pd.DataFrame({line_col: unique_lines.to_numpy(dtype=object)})
+    blup_out = pd.DataFrame({line_col: unique_lines.to_numpy(dtype=object)})
     gblup_out = (
         pd.DataFrame({line_col: unique_lines.to_numpy(dtype=object)})
         if grm_ctx is not None
@@ -1587,6 +1650,7 @@ def main() -> None:
             used_obs = int(mask.sum())
             used_lines = int(df.loc[mask, line_col].astype(str).nunique(dropna=False))
             blue_out[trait] = np.nan
+            blup_out[trait] = np.nan
             if gblup_out is not None:
                 gblup_out[trait] = np.nan
 
@@ -1710,14 +1774,14 @@ def main() -> None:
             r_eff = 1.0
             status = "ok"
             single_obs_per_line = bool(int(line_ids_sub.shape[0]) == int(line_ids_sub.nunique(dropna=False)))
+            line_idx = z_names.index(line_col) if line_col in z_names else -1
+            gxe_idx = z_names.index(gxe_name) if gxe_name in z_names else -1
             if getattr(broad_model, "var", None) is not None and len(z_names) > 0:
                 var_all = np.asarray(broad_model.var, dtype=float).reshape(-1)
                 if var_all.size >= (len(z_names) + 1):
                     rand_var = var_all[: len(z_names)]
                     ve = float(var_all[-1])
                     total_var = float(np.sum(rand_var) + ve)
-                    line_idx = z_names.index(line_col) if line_col in z_names else -1
-                    gxe_idx = z_names.index(gxe_name) if gxe_name in z_names else -1
                     vg = float(rand_var[line_idx]) if line_idx >= 0 else np.nan
                     vge = float(rand_var[gxe_idx]) if gxe_idx >= 0 else 0.0
                     if total_var > 0.0 and line_idx >= 0:
@@ -1747,6 +1811,20 @@ def main() -> None:
                 logger.warning(
                     f"Trait {trait}: only one observation per line and no ENV/random replication; broad-sense H2 is non-identifiable."
                 )
+
+            blup_map = _line_level_blup_from_broad_model(
+                broad_model,
+                sub,
+                line_col=line_col,
+                line_z=line_z,
+                line_term_idx=line_idx,
+            )
+            blup_out[trait] = (
+                blup_out[line_col]
+                .astype(str)
+                .map(blup_map)
+                .to_numpy(dtype=float)
+            )
 
             stage1_random_terms, stage2_fixed_terms = _build_stage1_blue_terms(
                 sub,
@@ -1874,10 +1952,10 @@ def main() -> None:
                     )
                     narrow_method = "skipped_grm_overlap"
 
-            logger.info("-" * 72)
-            logger.info(
-                f"{success_symbol()} Trait={trait} | obs={used_obs} | lines={used_lines} | H2={_fmt_metric(hsqr)} | h2={_fmt_metric(h2_narrow)} | method={narrow_method} | elapsed={format_elapsed(time.time() - step_t0)}"
-            )
+            # logger.info("-" * 72)
+            # logger.info(
+            #     f"{success_symbol()} Trait={trait} | obs={used_obs} | lines={used_lines} | H2={_fmt_metric(hsqr)} | h2={_fmt_metric(h2_narrow)} | method={narrow_method} | elapsed={format_elapsed(time.time() - step_t0)}"
+            # )
             if np.isfinite(h2_blue_raw):
                 logger.info(
                     f"  narrow(raw BLUE scale)={_fmt_metric(h2_blue_raw)}"
@@ -1920,6 +1998,7 @@ def main() -> None:
         except Exception as exc:
             logger.exception(f"Trait {trait}: REML failed: {exc}")
             blue_out[trait] = np.nan
+            blup_out[trait] = np.nan
             if gblup_out is not None:
                 gblup_out[trait] = np.nan
             summary_rows.append(
@@ -1956,7 +2035,7 @@ def main() -> None:
     out_blup = f"{outprefix}.blup.txt"
     out_summary = f"{outprefix}.reml.summary.tsv"
     blue_out.to_csv(out_blue, sep="\t", index=False)
-    blue_out.to_csv(out_blup, sep="\t", index=False)
+    blup_out.to_csv(out_blup, sep="\t", index=False)
     if gblup_out is not None:
         out_gblup = f"{outprefix}.gblup.txt"
         gblup_out.to_csv(out_gblup, sep="\t", index=False)
@@ -1965,11 +2044,11 @@ def main() -> None:
 
     summary_console = _render_summary_table(summary_rows, log_style=False)
     summary_log = _render_summary_table(summary_rows, log_style=True)
-    if summary_console != "":
-        print(summary_console)
+    # if summary_console != "":
+    #     print(summary_console)
     if summary_log != "":
         logger.info(summary_log)
-    logger.info("=" * 60)
+    # logger.info("=" * 60)
     log_success(logger, f"BLUE table saved: {format_path_for_display(out_blue)}")
     log_success(logger, f"BLUP table saved: {format_path_for_display(out_blup)}")
     if gblup_out is not None:

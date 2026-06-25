@@ -717,6 +717,36 @@ def _guess_effect_col_by_hints(
     return None
 
 
+def _resolve_effect_col(
+    df: pd.DataFrame,
+    *,
+    hint_cols: list[str],
+) -> str:
+    hit = _guess_effect_col_by_hints(df, hint_cols=hint_cols)
+    if hit is not None:
+        return str(hit)
+    meta_cols = {
+        "chrom",
+        "chr",
+        "pos",
+        "bp",
+        "position",
+        "id",
+        "snp",
+        "marker",
+        "allele0",
+        "allele1",
+        "maf",
+    }
+    for c in df.columns:
+        if str(c).strip().lower() in meta_cols:
+            continue
+        vals = pd.to_numeric(df[c], errors="coerce").to_numpy(dtype=float)
+        if int(np.isfinite(vals).sum()) > 0:
+            return str(c)
+    raise ValueError("No numeric effect columns found.")
+
+
 def _load_effect_table(path: str) -> pd.DataFrame:
     ext = Path(path).suffix.lower()
     if ext == ".csv":
@@ -728,6 +758,202 @@ def _load_effect_table(path: str) -> pd.DataFrame:
     except Exception:
         pass
     return pd.read_csv(path, sep=None, engine="python")
+
+
+_POSTGS_EFFECT_PANEL_TARGET_POINTS = 20_000
+_POSTGS_EFFECT_MERGED_TARGET_POINTS = 30_000
+_POSTGS_EFFECT_STRONG_KEEP_RATIO = 0.25
+
+
+def _natkey(text: Any) -> tuple[Any, ...]:
+    parts = re.split(r"(\d+)", str(text))
+    key: list[Any] = []
+    for p in parts:
+        if p.isdigit():
+            key.append(int(p))
+        else:
+            key.append(p.lower())
+    return tuple(key)
+
+
+def _chrom_sort_key(value: Any) -> tuple[Any, Any]:
+    if value is None:
+        return (3, "")
+    if isinstance(value, (int, np.integer)):
+        return (0, int(value))
+    if isinstance(value, (float, np.floating)):
+        fv = float(value)
+        if np.isfinite(fv):
+            iv = int(round(fv))
+            if abs(fv - float(iv)) <= 1e-9:
+                return (0, iv)
+            return (0, fv)
+        return (3, "")
+
+    text = str(value).strip()
+    if text == "":
+        return (3, "")
+    upper = text.upper()
+    if upper.startswith("CHR"):
+        upper = upper[3:].strip()
+    try:
+        fv = float(upper)
+        if np.isfinite(fv):
+            iv = int(round(fv))
+            if abs(fv - float(iv)) <= 1e-9:
+                return (0, iv)
+            return (0, fv)
+    except Exception:
+        pass
+
+    special_rank = {
+        "X": 1,
+        "Y": 2,
+        "XY": 3,
+        "M": 4,
+        "MT": 5,
+    }
+    if upper in special_rank:
+        return (1, int(special_rank[upper]))
+    return (2, _natkey(upper))
+
+
+def _compress_effect_table_core(
+    effect_df: pd.DataFrame,
+    *,
+    effect_col: str,
+    chr_col: Optional[str],
+    pos_col: Optional[str],
+    max_points: int,
+) -> pd.DataFrame:
+    target = max(1, int(max_points))
+    if effect_df.shape[0] <= target:
+        return effect_df.reset_index(drop=True)
+
+    effect_vals = pd.to_numeric(effect_df[effect_col], errors="coerce")
+    valid_mask = np.isfinite(effect_vals.to_numpy(dtype=float))
+    pos_vals_series: Optional[pd.Series] = None
+    if (
+        chr_col is not None
+        and pos_col is not None
+        and chr_col in effect_df.columns
+        and pos_col in effect_df.columns
+    ):
+        pos_vals_series = pd.to_numeric(effect_df[pos_col], errors="coerce")
+        valid_mask &= np.isfinite(pos_vals_series.to_numpy(dtype=float))
+
+    valid_idx = np.flatnonzero(valid_mask)
+    if valid_idx.size == 0:
+        return effect_df.iloc[0:0].copy()
+    if valid_idx.size <= target:
+        return effect_df.iloc[valid_idx].reset_index(drop=True)
+
+    effect_arr = effect_vals.to_numpy(dtype=float, copy=False)[valid_mask]
+    abs_effect = np.abs(effect_arr)
+    strong_target = int(round(float(target) * float(_POSTGS_EFFECT_STRONG_KEEP_RATIO)))
+    if target >= 4096:
+        strong_target = max(strong_target, 1024)
+    strong_target = max(1, min(target, strong_target))
+
+    if strong_target >= valid_idx.size:
+        return effect_df.iloc[valid_idx].reset_index(drop=True)
+
+    strong_rel = np.argpartition(-abs_effect, strong_target - 1)[:strong_target]
+    keep_rel_mask = np.zeros(valid_idx.size, dtype=bool)
+    keep_rel_mask[strong_rel] = True
+
+    if pos_vals_series is not None:
+        chr_series = effect_df[chr_col]
+        chr_levels = list(pd.unique(chr_series))
+        chr_levels.sort(key=_chrom_sort_key)
+        chr_map = {level: i for i, level in enumerate(chr_levels)}
+        chr_codes = (
+            pd.to_numeric(chr_series.map(chr_map), errors="coerce")
+            .fillna(-1)
+            .to_numpy(dtype=np.int32, copy=False)[valid_mask]
+        )
+        pos_vals = pos_vals_series.to_numpy(dtype=float, copy=False)[valid_mask]
+        order = np.lexsort((pos_vals, chr_codes))
+    else:
+        order = np.arange(valid_idx.size, dtype=np.int64)
+
+    remainder_target = max(0, target - strong_rel.size)
+    if remainder_target > 0:
+        ordered_remainder = order[~keep_rel_mask[order]]
+        if ordered_remainder.size <= remainder_target:
+            keep_rel_mask[ordered_remainder] = True
+        elif ordered_remainder.size > 0:
+            edges = np.linspace(
+                0,
+                int(ordered_remainder.size),
+                num=int(remainder_target) + 1,
+                dtype=np.int64,
+            )
+            for start, stop in zip(edges[:-1], edges[1:]):
+                if stop <= start:
+                    continue
+                chunk = ordered_remainder[start:stop]
+                winner = chunk[int(np.argmax(abs_effect[chunk]))]
+                keep_rel_mask[int(winner)] = True
+
+    final_rel = order[keep_rel_mask[order]]
+    final_idx = valid_idx[final_rel]
+    return effect_df.iloc[final_idx].reset_index(drop=True)
+
+
+def _compress_effect_table(
+    effect_df: pd.DataFrame,
+    *,
+    effect_col: str,
+    max_points: int,
+    group_col: Optional[str] = None,
+) -> pd.DataFrame:
+    target = max(1, int(max_points))
+    if effect_df.shape[0] <= target:
+        return effect_df.reset_index(drop=True)
+
+    chr_col, pos_col = _resolve_chr_pos_cols(effect_df)
+    if (
+        group_col is not None
+        and group_col in effect_df.columns
+        and effect_df[group_col].nunique(dropna=False) > 1
+    ):
+        groups = pd.unique(effect_df[group_col])
+        per_group_target = max(1, int(np.ceil(float(target) / max(1, len(groups)))))
+        parts: list[pd.DataFrame] = []
+        for group_value in groups:
+            sub = effect_df.loc[effect_df[group_col] == group_value]
+            if sub.shape[0] == 0:
+                continue
+            parts.append(
+                _compress_effect_table_core(
+                    sub,
+                    effect_col=effect_col,
+                    chr_col=chr_col,
+                    pos_col=pos_col,
+                    max_points=per_group_target,
+                )
+            )
+        if len(parts) == 0:
+            return effect_df.iloc[0:0].copy()
+        merged = pd.concat(parts, axis=0, ignore_index=True)
+        if merged.shape[0] <= target:
+            return merged.reset_index(drop=True)
+        return _compress_effect_table_core(
+            merged,
+            effect_col=effect_col,
+            chr_col=chr_col,
+            pos_col=pos_col,
+            max_points=target,
+        )
+
+    return _compress_effect_table_core(
+        effect_df,
+        effect_col=effect_col,
+        chr_col=chr_col,
+        pos_col=pos_col,
+        max_points=target,
+    )
 
 
 def _plot_and_save_effect(
@@ -742,11 +968,20 @@ def _plot_and_save_effect(
     saved_paths: list[str],
     x_label: Optional[str] = None,
 ) -> str:
+    effect_col = _resolve_effect_col(
+        effect_df,
+        hint_cols=[effect_hint] if effect_hint is not None else [],
+    )
+    plot_df = _compress_effect_table(
+        effect_df,
+        effect_col=effect_col,
+        max_points=_POSTGS_EFFECT_PANEL_TARGET_POINTS,
+    )
     fig = plt.figure(figsize=fig_size, dpi=300)
     ax = fig.add_subplot(111)
-    ax, effect_col = gsplot.plot_signed_effect(
-        effect_df,
-        effect_col=effect_hint,
+    ax, _effect_col = gsplot.plot_signed_effect(
+        plot_df,
+        effect_col=effect_col,
         ax=ax,
         palette=palette,
         rasterized=True,
@@ -797,8 +1032,13 @@ def _plot_and_save_trait_effect_panels(
         eff_df = panel.get("effect_df", None)
         eff_col = panel.get("effect_col", None)
         if isinstance(eff_df, pd.DataFrame):
-            gsplot.plot_signed_effect(
+            plot_df = _compress_effect_table(
                 eff_df,
+                effect_col=str(eff_col) if eff_col is not None else _resolve_effect_col(eff_df, hint_cols=[]),
+                max_points=_POSTGS_EFFECT_PANEL_TARGET_POINTS,
+            )
+            gsplot.plot_signed_effect(
+                plot_df,
                 effect_col=str(eff_col) if eff_col is not None else None,
                 ax=ax,
                 palette=palette,
@@ -825,8 +1065,14 @@ def _plot_and_save_trait_effect_panels(
 
     if has_merged:
         ax = ax_list[idx]
-        gsplot.plot_effect_models_layered(
+        merged_plot_df = _compress_effect_table(
             merged_df,
+            effect_col="Effect",
+            max_points=_POSTGS_EFFECT_MERGED_TARGET_POINTS,
+            group_col="Model",
+        )
+        gsplot.plot_effect_models_layered(
+            merged_plot_df,
             ax=ax,
             palette=palette,
             model_col="Model",
@@ -882,11 +1128,26 @@ def _log_results_overview(
     _ = out_dir
     _ = prefix
     logger.info("Results saved:")
+    if len(uniq) == 0:
+        logger.info("  (none)")
+        return
     cwd = os.getcwd()
     for p in uniq:
         abs_p = os.path.abspath(str(p))
         rel_p = os.path.relpath(abs_p, start=cwd)
         logger.info(f"  {rel_p}")
+
+
+def _log_missing_effect_hint(logger: Any, summary: dict[str, Any]) -> None:
+    usage = summary.get("usage", {})
+    effect_pattern = str(usage.get("effect_file_pattern", "{prefix}.{trait}.gs.effect")).strip()
+    if effect_pattern == "":
+        effect_pattern = "{prefix}.{trait}.gs.effect"
+    logger.warning("No effect files were found in summary.json; effect plotting was skipped.")
+    logger.warning(
+        "Rerun `jx gs` with `-save-model` to export `%s`, or pass `-effect <file>` to `jx postgs`.",
+        effect_pattern,
+    )
 
 
 def main() -> None:
@@ -1022,10 +1283,10 @@ def main() -> None:
     effect_specs_by_trait = _collect_trait_effect_specs(summary, summary_dir=summary_dir)
     effect_table_cache: dict[str, pd.DataFrame] = {}
 
-    # Keep only effect plotting for now: disable global runtime/violin outputs.
-    do_manh = True
-    do_violin = False
-    do_pcctime = False
+    has_selector = any(x is not None for x in (args.manh, args.violin, args.pcctime))
+    do_manh = bool(args.effect is not None) or (not has_selector) or (args.manh is not None)
+    do_violin = (not has_selector) or (args.violin is not None)
+    do_pcctime = (not has_selector) or (args.pcctime is not None)
     manh_ratio, manh_palette = _parse_ratio_palette_spec(args.manh, default_ratio=2.0)
     violin_ratio, violin_palette = _parse_ratio_palette_spec(args.violin, default_ratio=1.0)
     pcctime_ratio, pcctime_palette = _parse_ratio_palette_spec(args.pcctime, default_ratio=1.0)
@@ -1046,7 +1307,7 @@ def main() -> None:
     df = _summary_rows_frame(summary)
     cv_long = _cv_accuracy_long_frame(summary)
     trait_eval_items = sorted(df["trait"].astype(str).unique().tolist(), key=str)
-    ui = _PostGsNoopUI()
+    ui = _PostGsCliUI(stream=sys.stdout)
 
     if do_pcctime or do_violin:
         phase1 = ui.start_phase("[1/2] Generating trait-wise evaluation plots...")
@@ -1120,6 +1381,8 @@ def main() -> None:
         phase2_empty = ui.start_phase("[2/2] Plotting marker effects...")
         if do_manh:
             phase2_empty.note("  - no effect files")
+            if args.effect is None:
+                _log_missing_effect_hint(logger, summary)
         else:
             phase2_empty.note("  - disabled")
         phase2_empty.complete()

@@ -946,6 +946,30 @@ def _is_effect_export_supported(method: str) -> bool:
     return bool(_is_gblup_method(m) or _is_jxmodel_export_supported(m))
 
 
+def _resolve_effect_export_method(
+    requested_method: str,
+    result: typing.Mapping[str, typing.Any] | None = None,
+) -> str:
+    method = str(requested_method).strip()
+    if (method == "") or (not _is_blup_method(method)):
+        return method
+    if isinstance(result, typing.Mapping):
+        dispatch = result.get("blup_dispatch", None)
+        if isinstance(dispatch, typing.Mapping):
+            effective_method = str(dispatch.get("effective_method", "")).strip()
+            if effective_method != "":
+                return effective_method
+        backend_method = str(result.get("method_backend", "")).strip()
+        if backend_method != "":
+            return backend_method
+        model_state = result.get("model_state", None)
+        if isinstance(model_state, typing.Mapping):
+            state_method = str(model_state.get("method", "")).strip()
+            if state_method != "":
+                return state_method
+    return method
+
+
 def _known_jxmodel_methods() -> set[str]:
     return _GBLUP_METHOD_SET | {"rrBLUP", "BayesA", "BayesB", "BayesCpi"} | set(_ML_METHOD_MAP.keys())
 
@@ -18968,7 +18992,8 @@ def _run_gs_pipeline(
             effect_meta: dict[str, typing.Any] | None = None
             model_export_meta: dict[str, typing.Any] | None = None
             can_model_export = bool(_is_jxmodel_export_supported(m_key))
-            can_effect_export = bool(_is_effect_export_supported(m_key))
+            effect_export_method = _resolve_effect_export_method(m_key, res_obj)
+            can_effect_export = bool(_is_effect_export_supported(effect_export_method))
             want_model_export = bool(args.save_model) and can_model_export
             want_effect_export = bool(args.save_model) and can_effect_export
             if (args.model is None) and (not top_enabled) and (want_model_export or want_effect_export):

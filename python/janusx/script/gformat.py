@@ -46,6 +46,7 @@ from typing import Iterator, Sequence
 import numpy as np
 
 from janusx.gfreader import (
+    convert_genotypes,
     inspect_genotype_file,
     load_bed_2bit_packed,
     load_genotype_chunks,
@@ -491,6 +492,11 @@ def _parse_prune_args(values: list[str] | None) -> PruneSpec | None:
 def _env_truthy(name: str, default: str = "0") -> bool:
     v = str(os.getenv(name, default)).strip().lower()
     return v in {"1", "true", "yes", "y", "on"}
+
+
+def _rust_convert_fastpath_enabled() -> bool:
+    raw = str(os.getenv("JANUSX_GFORMAT_CONVERT_DIRECT", "1")).strip().lower()
+    return raw not in {"0", "false", "no", "off"}
 
 
 def _resolve_max_output_sites_env() -> int | None:
@@ -2229,6 +2235,109 @@ def main() -> None:
         if len(keep_sample_ids) == 0:
             miss_preview = ", ".join(keep_list[:10])
             raise ValueError(f"--keep selected 0 samples. Missing examples: {miss_preview}")
+
+    use_rust_convert_direct = bool(
+        _rust_convert_fastpath_enabled()
+        and prune_spec is None
+        and source_kind in {"plink", "vcf", "hmp"}
+        and out_fmt in {"plink", "vcf", "hmp"}
+        and push_snp_sites is None
+        and push_bim_range is None
+        and (not post_filter.active())
+        and output_site_limit is None
+    )
+    if use_rust_convert_direct:
+        direct_input = str(gfile if source_kind == "plink" else (source_path or gfile))
+        direct_output = str(out_prefix if out_fmt == "plink" else out_path)
+        out_n = int(len(keep_sample_ids) if keep_sample_ids is not None else len(sample_ids))
+        progress_every = max(1000, int(max(1, int(n_sites)) // 200))
+        convert_stats = None
+        backend = "rust-direct-io"
+
+        if status_enabled:
+            pbar = ProgressAdapter(
+                total=max(1, int(n_sites)),
+                desc="Converting formats",
+                force_animate=True,
+                keep_display=False,
+                show_remaining=True,
+                emit_done=False,
+            )
+            convert_done = 0
+            convert_total = max(1, int(n_sites))
+
+            def _on_convert_progress(done: int, total: int) -> None:
+                nonlocal convert_done, convert_total
+                try:
+                    d = int(done)
+                    t = int(total)
+                except Exception:
+                    return
+                if t > 0 and t != convert_total and convert_done == 0:
+                    convert_total = t
+                    pbar.set_total(int(max(1, convert_total)))
+                d = int(max(0, d))
+                d = int(min(d, max(1, convert_total)))
+                if d > convert_done:
+                    pbar.update(d - convert_done)
+                    convert_done = d
+
+            try:
+                t_direct = time.time()
+                convert_stats = convert_genotypes(
+                    direct_input,
+                    direct_output,
+                    out_fmt=str(out_fmt),
+                    progress_callback=_on_convert_progress,
+                    progress_every=int(progress_every),
+                    threads=int(args.thread),
+                    snps_only=True,
+                    maf=float(args.maf),
+                    geno=float(args.geno),
+                    impute=False,
+                    model=reader_model,
+                    het=reader_het,
+                    sample_ids=keep_sample_ids,
+                )
+                seen_n = int(getattr(convert_stats, "n_sites_seen", 0))
+                if seen_n > 0 and convert_done < seen_n:
+                    pbar.set_total(int(max(1, max(convert_total, seen_n))))
+                    pbar.update(seen_n - convert_done)
+                    convert_done = seen_n
+                if seen_n > 0:
+                    pbar.finish()
+            finally:
+                pbar.close()
+        else:
+            t_direct = time.time()
+            convert_stats = convert_genotypes(
+                direct_input,
+                direct_output,
+                out_fmt=str(out_fmt),
+                threads=int(args.thread),
+                snps_only=True,
+                maf=float(args.maf),
+                geno=float(args.geno),
+                impute=False,
+                model=reader_model,
+                het=reader_het,
+                sample_ids=keep_sample_ids,
+            )
+
+        kept_n = int(getattr(convert_stats, "n_sites_written", 0))
+        seen_n = int(getattr(convert_stats, "n_sites_seen", 0))
+        dropped_n = int(max(0, seen_n - kept_n))
+        if not status_enabled:
+            _log_status_file_only(
+                logger,
+                "Converting formats ...Finished "
+                f"(backend={backend}, kept={kept_n}, dropped={dropped_n})",
+            )
+        print(f"Genotype source: {format_path_for_display(gfile)}")
+        print(f"Samples: {out_n}, sites: {kept_n}")
+        log_success(logger, f"Format conversion completed in {time.time() - t_direct:.2f} s")
+        log_success(logger, f"Output written: {output_display}")
+        return
 
     def _make_chunks() -> Iterator[tuple[np.ndarray, list[SiteInfo]]]:
         if use_direct_no_cache and source_kind == "vcf":

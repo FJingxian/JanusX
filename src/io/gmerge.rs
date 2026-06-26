@@ -5,7 +5,7 @@ use pyo3::{prelude::*, BoundObject};
 use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::fs::File;
-use std::io::{BufRead, BufWriter, Write};
+use std::io::BufRead;
 use std::path::Path;
 
 use memmap2::Mmap;
@@ -16,7 +16,7 @@ use crate::gfcore::{
     open_text_maybe_gz, process_snp_row, read_bim, read_fam, HmpSnpIter, SiteInfo,
 };
 use crate::gfreader::build_sample_selection;
-use crate::vcfout::VcfOut;
+use crate::gwriter::{HmpWriter, PlinkBfileWriter, SampleRecord, VcfWriter};
 
 // ============================================================
 // Output format
@@ -25,6 +25,7 @@ use crate::vcfout::VcfOut;
 #[derive(Clone, Copy, Debug)]
 enum OutFmt {
     Vcf,
+    Hmp,
     Plink,
 }
 
@@ -55,15 +56,19 @@ fn infer_out_fmt(out: &str, out_fmt: &str) -> Result<OutFmt, String> {
     if f == "auto" {
         if is_vcf_path(out) {
             Ok(OutFmt::Vcf)
+        } else if is_hmp_path(out) {
+            Ok(OutFmt::Hmp)
         } else {
             Ok(OutFmt::Plink)
         }
     } else if f == "vcf" {
         Ok(OutFmt::Vcf)
+    } else if f == "hmp" {
+        Ok(OutFmt::Hmp)
     } else if f == "plink" || f == "bfile" || f == "bed" {
         Ok(OutFmt::Plink)
     } else {
-        Err("out_fmt must be one of: auto, vcf, plink".to_string())
+        Err("out_fmt must be one of: auto, vcf, hmp, plink".to_string())
     }
 }
 
@@ -81,6 +86,16 @@ impl SampleKey {
     /// VCF sample name.
     fn vcf_name(&self) -> String {
         self.iid.clone()
+    }
+}
+
+impl SampleRecord for SampleKey {
+    fn fid(&self) -> &str {
+        &self.fid
+    }
+
+    fn iid(&self) -> &str {
+        &self.iid
     }
 }
 
@@ -338,16 +353,6 @@ fn dosage_to_i8_rounded(g: f32) -> i8 {
         1 => 1,
         2 => 2,
         _ => -9,
-    }
-}
-
-#[inline]
-fn i8_to_vcf_gt(g: i8) -> &'static str {
-    match g {
-        0 => "0/0",
-        1 => "0/1",
-        2 => "1/1",
-        _ => "./.",
     }
 }
 
@@ -657,75 +662,6 @@ impl InputIter {
     }
 }
 
-// ============================================================
-// Output writers
-// ============================================================
-
-struct VcfWriter {
-    out: VcfOut,
-    n_samples_total: usize,
-}
-
-impl VcfWriter {
-    fn new(out: &str, sample_ids: &[String]) -> Result<Self, String> {
-        let mut out = VcfOut::from_path(out).map_err(|e| e.to_string())?;
-
-        out.write_all(b"##fileformat=VCFv4.2\n")
-            .map_err(|e| e.to_string())?;
-        out.write_all(b"##source=JanusX-merge\n")
-            .map_err(|e| e.to_string())?;
-        out.write_all(b"##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n")
-            .map_err(|e| e.to_string())?;
-
-        out.write_all(b"#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT")
-            .map_err(|e| e.to_string())?;
-        for s in sample_ids {
-            out.write_all(b"\t").map_err(|e| e.to_string())?;
-            out.write_all(s.as_bytes()).map_err(|e| e.to_string())?;
-        }
-        out.write_all(b"\n").map_err(|e| e.to_string())?;
-
-        Ok(Self {
-            out,
-            n_samples_total: sample_ids.len(),
-        })
-    }
-
-    fn write_site(
-        &mut self,
-        site: &SiteInfo,
-        gref: &str,
-        galt: &str,
-        row_i8: &[i8],
-    ) -> Result<(), String> {
-        let vid = format!("{}_{}", site.chrom, site.pos); // keep consistent with BIM style
-        let prefix = format!(
-            "{}\t{}\t{}\t{}\t{}\t.\tPASS\t.\tGT",
-            site.chrom, site.pos, vid, gref, galt
-        );
-        self.out
-            .write_all(prefix.as_bytes())
-            .map_err(|e| e.to_string())?;
-
-        if row_i8.len() != self.n_samples_total {
-            return Err("Internal error: VCF row length mismatch".into());
-        }
-        for &g in row_i8 {
-            self.out.write_all(b"\t").map_err(|e| e.to_string())?;
-            self.out
-                .write_all(i8_to_vcf_gt(g).as_bytes())
-                .map_err(|e| e.to_string())?;
-        }
-        self.out.write_all(b"\n").map_err(|e| e.to_string())?;
-        Ok(())
-    }
-
-    fn finish(self) -> Result<(), String> {
-        self.out.finish().map_err(|e| e.to_string())?;
-        Ok(())
-    }
-}
-
 enum RowOutcome {
     Keep {
         site: SiteInfo,
@@ -736,122 +672,6 @@ enum RowOutcome {
     DropMulti,
     DropNonSnp,
     DropFiltered,
-}
-
-struct PlinkBfileWriter {
-    fam: BufWriter<File>,
-    bim: BufWriter<File>,
-    bed: BufWriter<File>,
-    n_samples: usize,
-    bytes_per_snp: usize,
-    row_buf: Vec<u8>,
-}
-
-impl PlinkBfileWriter {
-    fn new(prefix: &str, samples: &[SampleKey]) -> Result<Self, String> {
-        let fam = BufWriter::with_capacity(
-            4 * 1024 * 1024,
-            File::create(format!("{prefix}.fam")).map_err(|e| e.to_string())?,
-        );
-        let bim = BufWriter::with_capacity(
-            4 * 1024 * 1024,
-            File::create(format!("{prefix}.bim")).map_err(|e| e.to_string())?,
-        );
-        let mut bed = BufWriter::with_capacity(
-            8 * 1024 * 1024,
-            File::create(format!("{prefix}.bed")).map_err(|e| e.to_string())?,
-        );
-
-        // SNP-major BED header
-        bed.write_all(&[0x6C, 0x1B, 0x01])
-            .map_err(|e| e.to_string())?;
-
-        // FAM: FID IID PID MID SEX PHENO
-        {
-            let mut famw = fam;
-            for s in samples {
-                writeln!(famw, "{}\t{}\t0\t0\t1\t-9", s.fid, s.iid).map_err(|e| e.to_string())?;
-            }
-            famw.flush().map_err(|e| e.to_string())?;
-            let fam = famw;
-
-            let n_samples = samples.len();
-            let bytes_per_snp = (n_samples + 3) / 4;
-            let row_buf = vec![0u8; bytes_per_snp];
-
-            Ok(Self {
-                fam,
-                bim,
-                bed,
-                n_samples,
-                bytes_per_snp,
-                row_buf,
-            })
-        }
-    }
-
-    #[inline]
-    fn encode_row_i8_into(&mut self, row: &[i8]) {
-        // PLINK 2-bit:
-        // 00 -> homo A1 (0)
-        // 10 -> het    (1)
-        // 11 -> homo A2 (2)
-        // 01 -> missing
-        debug_assert_eq!(self.row_buf.len(), self.bytes_per_snp);
-        for byte_idx in 0..self.bytes_per_snp {
-            let mut b: u8 = 0;
-            for within in 0..4 {
-                let i = byte_idx * 4 + within;
-                let code: u8 = if i >= self.n_samples {
-                    0b01
-                } else {
-                    match row[i] {
-                        0 => 0b00,
-                        1 => 0b10,
-                        2 => 0b11,
-                        _ => 0b01,
-                    }
-                };
-                b |= code << (within * 2);
-            }
-            self.row_buf[byte_idx] = b;
-        }
-    }
-
-    fn write_site_and_row(
-        &mut self,
-        site: &SiteInfo,
-        gref: &str,
-        galt: &str,
-        row_i8: &[i8],
-    ) -> Result<(), String> {
-        if row_i8.len() != self.n_samples {
-            return Err("Internal error: PLINK row length mismatch".into());
-        }
-
-        // BIM: CHR SNP CM BP A1 A2
-        // SNP id: chr_pos (as requested)
-        let snp_id = format!("{}_{}", site.chrom, site.pos);
-        writeln!(
-            self.bim,
-            "{}\t{}\t0\t{}\t{}\t{}",
-            site.chrom, snp_id, site.pos, gref, galt
-        )
-        .map_err(|e| e.to_string())?;
-
-        self.encode_row_i8_into(row_i8);
-        self.bed
-            .write_all(&self.row_buf)
-            .map_err(|e| e.to_string())?;
-        Ok(())
-    }
-
-    fn finish(mut self) -> Result<(), String> {
-        self.fam.flush().map_err(|e| e.to_string())?;
-        self.bim.flush().map_err(|e| e.to_string())?;
-        self.bed.flush().map_err(|e| e.to_string())?;
-        Ok(())
-    }
 }
 
 // ============================================================
@@ -938,6 +758,7 @@ pub fn merge_genotypes(
         n_inputs: iters.len(),
         out_fmt: match fmt {
             OutFmt::Vcf => "vcf".into(),
+            OutFmt::Hmp => "hmp".into(),
             OutFmt::Plink => "plink".into(),
         },
         out: out.clone(),
@@ -961,17 +782,24 @@ pub fn merge_genotypes(
 
     // writers
     let mut vcf_w: Option<VcfWriter> = None;
+    let mut hmp_w: Option<HmpWriter> = None;
     let mut plink_w: Option<PlinkBfileWriter> = None;
     match fmt {
         OutFmt::Vcf => {
             vcf_w = Some(
-                VcfWriter::new(&out, &merged_sample_names_vcf)
+                VcfWriter::new(&out, &merged_sample_names_vcf, Some("JanusX-merge"))
+                    .map_err(pyo3::exceptions::PyRuntimeError::new_err)?,
+            );
+        }
+        OutFmt::Hmp => {
+            hmp_w = Some(
+                HmpWriter::new(&out, &merged_sample_names_vcf)
                     .map_err(pyo3::exceptions::PyRuntimeError::new_err)?,
             );
         }
         OutFmt::Plink => {
             plink_w = Some(
-                PlinkBfileWriter::new(&out, &merged_samples)
+                PlinkBfileWriter::new(&out, &merged_samples, None)
                     .map_err(pyo3::exceptions::PyRuntimeError::new_err)?,
             );
         }
@@ -1194,11 +1022,18 @@ pub fn merge_genotypes(
                     .write_site(&min_site, &gref, &galt, &merged_row)
                     .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
             }
+            OutFmt::Hmp => {
+                hmp_w
+                    .as_mut()
+                    .unwrap()
+                    .write_site(&min_site, &gref, &galt, &merged_row)
+                    .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+            }
             OutFmt::Plink => {
                 plink_w
                     .as_mut()
                     .unwrap()
-                    .write_site_and_row(&min_site, &gref, &galt, &merged_row)
+                    .write_site(&min_site, &gref, &galt, &merged_row)
                     .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
             }
         }
@@ -1216,6 +1051,13 @@ pub fn merge_genotypes(
     match fmt {
         OutFmt::Vcf => {
             vcf_w
+                .take()
+                .unwrap()
+                .finish()
+                .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+        }
+        OutFmt::Hmp => {
+            hmp_w
                 .take()
                 .unwrap()
                 .finish()
@@ -1310,6 +1152,7 @@ pub fn convert_genotypes(
         input: input.clone(),
         out_fmt: match fmt {
             OutFmt::Vcf => "vcf".into(),
+            OutFmt::Hmp => "hmp".into(),
             OutFmt::Plink => "plink".into(),
         },
         out: out.clone(),
@@ -1321,11 +1164,18 @@ pub fn convert_genotypes(
     };
 
     let mut vcf_w: Option<VcfWriter> = None;
+    let mut hmp_w: Option<HmpWriter> = None;
     let mut plink_w: Option<PlinkBfileWriter> = None;
     match fmt {
         OutFmt::Vcf => {
             vcf_w = Some(
-                VcfWriter::new(&out, &selected_sample_ids)
+                VcfWriter::new(&out, &selected_sample_ids, None)
+                    .map_err(pyo3::exceptions::PyRuntimeError::new_err)?,
+            );
+        }
+        OutFmt::Hmp => {
+            hmp_w = Some(
+                HmpWriter::new(&out, &selected_sample_ids)
                     .map_err(pyo3::exceptions::PyRuntimeError::new_err)?,
             );
         }
@@ -1338,7 +1188,7 @@ pub fn convert_genotypes(
                 })
                 .collect();
             plink_w = Some(
-                PlinkBfileWriter::new(&out, &samples)
+                PlinkBfileWriter::new(&out, &samples, None)
                     .map_err(pyo3::exceptions::PyRuntimeError::new_err)?,
             );
         }
@@ -1459,11 +1309,18 @@ pub fn convert_genotypes(
                                     .write_site(&site, &gref, &galt, &row_i8)
                                     .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
                             }
+                            OutFmt::Hmp => {
+                                hmp_w
+                                    .as_mut()
+                                    .unwrap()
+                                    .write_site(&site, &gref, &galt, &row_i8)
+                                    .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+                            }
                             OutFmt::Plink => {
                                 plink_w
                                     .as_mut()
                                     .unwrap()
-                                    .write_site_and_row(&site, &gref, &galt, &row_i8)
+                                    .write_site(&site, &gref, &galt, &row_i8)
                                     .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
                             }
                         }
@@ -1543,11 +1400,18 @@ pub fn convert_genotypes(
                         .write_site(&site, &gref, &galt, &row_i8)
                         .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
                 }
+                OutFmt::Hmp => {
+                    hmp_w
+                        .as_mut()
+                        .unwrap()
+                        .write_site(&site, &gref, &galt, &row_i8)
+                        .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+                }
                 OutFmt::Plink => {
                     plink_w
                         .as_mut()
                         .unwrap()
-                        .write_site_and_row(&site, &gref, &galt, &row_i8)
+                        .write_site(&site, &gref, &galt, &row_i8)
                         .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
                 }
             }
@@ -1564,6 +1428,13 @@ pub fn convert_genotypes(
     match fmt {
         OutFmt::Vcf => {
             vcf_w
+                .take()
+                .unwrap()
+                .finish()
+                .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+        }
+        OutFmt::Hmp => {
+            hmp_w
                 .take()
                 .unwrap()
                 .finish()

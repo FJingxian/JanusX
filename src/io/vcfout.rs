@@ -1,7 +1,7 @@
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, Result, Write};
 
 /// Internal writer wrapper: either plain text or gzip-compressed text.
 pub enum VcfOut {
@@ -49,5 +49,25 @@ impl VcfOut {
                 Ok(())
             }
         }
+    }
+}
+
+impl Write for VcfOut {
+    #[inline]
+    fn write(&mut self, buf: &[u8]) -> Result<usize> {
+        match self {
+            VcfOut::Plain(w) => w.write(buf),
+            VcfOut::Gzip(w) => w.write(buf),
+        }
+    }
+
+    #[inline]
+    fn flush(&mut self) -> Result<()> {
+        VcfOut::flush(self)
+    }
+
+    #[inline]
+    fn write_all(&mut self, buf: &[u8]) -> Result<()> {
+        VcfOut::write_all(self, buf)
     }
 }

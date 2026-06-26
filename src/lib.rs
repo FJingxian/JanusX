@@ -95,6 +95,8 @@ mod breader;
 mod gfcore;
 #[path = "io/gfreader.rs"]
 mod gfreader;
+#[path = "io/gwriter.rs"]
+mod gwriter;
 #[path = "io/gload.rs"]
 mod gload;
 #[path = "io/gmerge.rs"]
@@ -219,13 +221,13 @@ use gfreader::{
     count_hmp_snps, count_vcf_snps, gfd_packbits_from_dosage_block, load_bed_2bit_packed,
     load_bed_u8_matrix, load_bim_columns, load_site_info, prepare_bed_2bit_packed,
     prepare_bed_logic_meta_selected, scan_bed_2bit_packed_stats, BedChunkReader, BedMmapReader,
-    HmpChunkReader, HmpStreamWriter, NpyMmapReader, PlinkStreamWriter, SiteInfo, TxtChunkReader,
-    VcfChunkReader, VcfStreamWriter,
+    HmpChunkReader, NpyMmapReader, SiteInfo, TxtChunkReader, VcfChunkReader,
 };
 use glm::{
     lm_block_assoc_f32, lm_block_assoc_packed, lm_block_assoc_packed_to_tsv,
     lm_stream_bed_segments_compact_to_tsv, lm_stream_bed_to_tsv,
 };
+use gwriter::{HmpStreamWriter, PlinkStreamWriter, VcfStreamWriter};
 use glm2::lm2_stream_bed_to_tsv;
 use gmerge::{convert_genotypes, merge_genotypes, PyConvertStats, PyMergeStats};
 use grm::{

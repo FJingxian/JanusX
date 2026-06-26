@@ -130,6 +130,7 @@ from janusx.script._common.progress import (
     print_success,
     print_warning,
     format_elapsed,
+    log_success,
     should_animate_status,
     stdout_is_tty,
 )
@@ -155,6 +156,11 @@ from janusx.script._common.threads import (
 )
 
 DEFAULT_BED_MEMORY_GB = 1.0
+_GWAS_AUTO_MEM_MIN_GB = 0.125
+_GWAS_AUTO_MEM_LM_TARGET_MB = 192.0
+_GWAS_AUTO_MEM_GRM_BLOCK_ROWS = 4096
+_GWAS_AUTO_MEM_COPY_DECODE_BLOCK_ROWS = 8192
+_GWAS_AUTO_MEM_PACKED_BLOCK_ROWS = 4096
 from janusx.script._common.genocache import configure_genotype_cache_from_out
 from janusx.script._common.genoio import (
     basename_only as _basename_only,
@@ -3233,6 +3239,9 @@ def prepare_streaming_context(
     require_bed_stream: bool = False,
     post_grm_hook: Optional[Callable[[str, Optional[str]], None]] = None,
     force_kind: Optional[str] = None,
+    preinspected_ids: Optional[np.ndarray] = None,
+    preinspected_n_snps: Optional[int] = None,
+    preinspect_warnings: Optional[list[str]] = None,
 ):
     """
     Prepare all shared resources for streaming LMM/LM once:
@@ -3249,27 +3258,31 @@ def prepare_streaming_context(
         use_spinner=use_spinner,
     )
 
-    deferred_cache_warnings: list[str] = []
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        ids, n_snps = _inspect_genotype_with_status(
-            genofile,
-            logger,
-            use_spinner=use_spinner,
-            snps_only=bool(snps_only),
-            maf_threshold=float(maf_threshold),
-            max_missing_rate=float(max_missing_rate),
-            het_threshold=float(het_threshold),
-            warning_collector=deferred_cache_warnings,
-            force_kind=force_kind,
-        )
-        for w in caught:
-            try:
-                msg = str(w.message).strip()
-            except Exception:
-                msg = ""
-            if _is_cache_warning_message(msg):
-                deferred_cache_warnings.append(msg)
+    deferred_cache_warnings: list[str] = list(preinspect_warnings or [])
+    if (preinspected_ids is not None) and (preinspected_n_snps is not None):
+        ids = np.asarray(preinspected_ids, dtype=str)
+        n_snps = int(preinspected_n_snps)
+    else:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            ids, n_snps = _inspect_genotype_with_status(
+                genofile,
+                logger,
+                use_spinner=use_spinner,
+                snps_only=bool(snps_only),
+                maf_threshold=float(maf_threshold),
+                max_missing_rate=float(max_missing_rate),
+                het_threshold=float(het_threshold),
+                warning_collector=deferred_cache_warnings,
+                force_kind=force_kind,
+            )
+            for w in caught:
+                try:
+                    msg = str(w.message).strip()
+                except Exception:
+                    msg = ""
+                if _is_cache_warning_message(msg):
+                    deferred_cache_warnings.append(msg)
     n_samples = len(ids)
     chunk_size = _resolve_bed_block_rows_from_memory(
         float(memory_mb),
@@ -4276,7 +4289,9 @@ def _finalize_gwas_result_tsv(
     _replace_file_with_retry(str(tmp_tsv), str(out_tsv))
 
 
-def _normalize_bed_memory_gb(memory_gb: Union[int, float, None]) -> float:
+def _normalize_bed_memory_gb(memory_gb: Union[int, float, None]) -> float | None:
+    if memory_gb is None:
+        return None
     return float(
         _common_normalize_decode_memory_gb(
             memory_gb,
@@ -4292,6 +4307,109 @@ def _bed_memory_gb_to_mb(memory_gb: Union[int, float, None]) -> float:
             default_gb=float(DEFAULT_BED_MEMORY_GB),
         )
     )
+
+
+def _memory_gb_for_target_decode_shape(
+    row_width: int,
+    target_rows: int,
+    *,
+    elem_bytes: int = 4,
+    min_gb: float = _GWAS_AUTO_MEM_MIN_GB,
+) -> float:
+    width = int(max(1, int(row_width)))
+    rows = int(max(1, int(target_rows)))
+    bytes_need = width * rows * int(max(1, int(elem_bytes)))
+    gb_need = float(bytes_need) / float(1024 ** 3)
+    return float(max(float(min_gb), gb_need))
+
+
+def _format_gwas_memory_cfg(
+    memory_gb: Union[int, float, None],
+    *,
+    auto_requested: bool,
+) -> str:
+    if memory_gb is None:
+        return "auto (route-aware)"
+    suffix = " (auto)" if bool(auto_requested) else ""
+    return f"{float(memory_gb):.6g} GB{suffix}"
+
+
+def _resolve_gwas_auto_decode_memory_gb(
+    *,
+    n_samples_total: int,
+    n_markers_total: int,
+    requested_models: list[str],
+    qcov_needs_grm: bool,
+) -> tuple[float, str]:
+    n_total = int(max(1, int(n_samples_total)))
+    m_total = int(max(1, int(n_markers_total)))
+    models = {str(x).strip().lower() for x in requested_models if str(x).strip() != ""}
+    candidates: list[tuple[float, str]] = []
+    seen: set[str] = set()
+
+    def _push(memory_gb: float, reason: str) -> None:
+        reason_txt = str(reason).strip()
+        if reason_txt == "" or reason_txt in seen:
+            return
+        seen.add(reason_txt)
+        candidates.append((float(memory_gb), reason_txt))
+
+    if len(models & {"lm", "lm2"}) > 0:
+        lm_target_bytes = int(float(_GWAS_AUTO_MEM_LM_TARGET_MB) * 1024.0 * 1024.0)
+        lm_rows = int(
+            min(
+                m_total,
+                max(1, lm_target_bytes // max(1, 4 * n_total)),
+            )
+        )
+        _push(
+            _memory_gb_for_target_decode_shape(
+                n_total,
+                lm_rows,
+                elem_bytes=4,
+            ),
+            f"LM/LM2 target≈{float(_GWAS_AUTO_MEM_LM_TARGET_MB):g}MB rows={int(lm_rows)}",
+        )
+
+    if len(models & {"lmm", "lmm2", "fastlmm", "fvlmm"}) > 0:
+        copy_rows = int(min(m_total, int(_GWAS_AUTO_MEM_COPY_DECODE_BLOCK_ROWS)))
+        _push(
+            _memory_gb_for_target_decode_shape(
+                n_total,
+                copy_rows,
+                elem_bytes=4,
+            ),
+            f"LMM/FvLMM copy-aware decode block_rows={int(copy_rows)}",
+        )
+
+    packed_models = sorted(models & {"splmm", "algwas", "farmcpu"})
+    if len(packed_models) > 0:
+        packed_rows = int(min(m_total, int(_GWAS_AUTO_MEM_PACKED_BLOCK_ROWS)))
+        packed_label = "/".join(packed_models)
+        _push(
+            _memory_gb_for_target_decode_shape(
+                n_total,
+                packed_rows,
+                elem_bytes=4,
+            ),
+            f"{packed_label} block_rows={int(packed_rows)}",
+        )
+
+    if bool(qcov_needs_grm) or len(models & {"lmm", "lmm2", "fastlmm", "fvlmm"}) > 0:
+        grm_rows = int(min(m_total, int(_GWAS_AUTO_MEM_GRM_BLOCK_ROWS)))
+        _push(
+            _memory_gb_for_target_decode_shape(
+                n_total,
+                grm_rows,
+                elem_bytes=4,
+            ),
+            f"GRM/PCA block_rows={int(grm_rows)}",
+        )
+
+    if len(candidates) == 0:
+        return (float(DEFAULT_BED_MEMORY_GB), "fallback default=1GB")
+    picked_gb, _picked_reason = max(candidates, key=lambda item: float(item[0]))
+    return (float(picked_gb), "; ".join(reason for _gb, reason in candidates))
 
 
 def _resolve_bed_block_rows_from_memory(
@@ -5746,8 +5864,12 @@ def parse_args(argv: Optional[list[str]] = None):
     )
     add_common_memory_arg(
         optional_group,
-        default=DEFAULT_BED_MEMORY_GB,
-        help_profile="gwas_decode",
+        default=None,
+        help_text=(
+            "Decode block memory budget in GB for BED GWAS kernels. "
+            "When omitted, GWAS chooses a route-aware default from loaded sample/marker counts; "
+            "explicit -mem keeps the requested fixed budget."
+        ),
         dest="memory",
         include_hidden_legacy_single_dash_alias=True,
     )
@@ -5833,9 +5955,15 @@ def parse_args(argv: Optional[list[str]] = None):
         )
     except ValueError as e:
         parser.error(str(e))
-    args.memory = _normalize_bed_memory_gb(getattr(args, "memory", DEFAULT_BED_MEMORY_GB))
-    args._memory_mb = _bed_memory_gb_to_mb(args.memory)
     args._memory_user_set = bool(_option_present(argv, "-mem", "--memory", "-memory"))
+    try:
+        args.memory = _normalize_bed_memory_gb(getattr(args, "memory", None))
+    except ValueError as e:
+        parser.error(str(e))
+    args._memory_auto_requested = bool(args.memory is None)
+    args._memory_mb = (
+        None if args.memory is None else _bed_memory_gb_to_mb(args.memory)
+    )
     args._chunksize_user_set = bool(args._memory_user_set)
     args.mmap_limit = False
     args.chunksize = 10_000
@@ -6000,11 +6128,28 @@ def _run_gwas_pipeline(
         os.environ.pop("JX_ALGWAS_XTX_CACHE_LOG", None)
 
     advanced_notes: list[str] = []
+    preconfig_terminal_successes: list[str] = []
+    preconfig_successes_flushed = False
 
     def _append_advanced_note(msg: str) -> None:
         text = str(msg).strip()
         if text != "":
             advanced_notes.append(text)
+
+    def _queue_preconfig_success(message: str) -> None:
+        text = str(message).strip()
+        if text != "":
+            preconfig_terminal_successes.append(text)
+
+    def _flush_preconfig_successes() -> None:
+        nonlocal preconfig_successes_flushed
+        if len(preconfig_terminal_successes) <= 0:
+            return
+        pending = list(preconfig_terminal_successes)
+        preconfig_terminal_successes.clear()
+        for msg in pending:
+            _rich_success(logger, msg, use_spinner=bool(terminal_rich))
+        preconfig_successes_flushed = True
 
     fvlmm_scan_spec: dict[str, int] | None = None
     if bool(getattr(args, "fvlmm", False)):
@@ -6044,6 +6189,27 @@ def _run_gwas_pipeline(
     _, _file_matrix_path_cli = _resolve_file_input_matrix(gfile)
     input_is_file_matrix = bool(_file_matrix_path_cli is not None)
     qtn_input_requested = _qtn_source_from_args(args) is not None
+    requested_stream_models: list[str] = []
+    if args.lm:
+        requested_stream_models.append("lm")
+    if getattr(args, "lm2", None) is not None:
+        requested_stream_models.append("lm2")
+    if args.lmm:
+        requested_stream_models.append("lmm")
+    if getattr(args, "lmm2", False):
+        requested_stream_models.append("lmm2")
+    if args.fastlmm:
+        requested_stream_models.append("fastlmm")
+    if args.fvlmm:
+        requested_stream_models.append("fvlmm")
+    if args.splmm:
+        requested_stream_models.append("splmm")
+    if args.algwas:
+        requested_stream_models.append("algwas")
+    requested_memory_models = list(requested_stream_models)
+    if bool(args.farmcpu):
+        requested_memory_models.append("farmcpu")
+    qcov_needs_grm = str(getattr(args, "qcov", "0")).strip() not in {"", "0"}
     standard_stream_models_requested = bool(
         args.lm
         or (getattr(args, "lm2", None) is not None)
@@ -6063,9 +6229,74 @@ def _run_gwas_pipeline(
     # PLINK cache then using packed/stream scans, instead of dense Python path.
     file_fast_rust_mode = bool(input_is_file_matrix and fast_mode)
     file_fast_dense_mode = False
+    preinspect_ids: Optional[np.ndarray] = None
+    preinspect_n_snps: Optional[int] = None
+    preinspect_warnings: list[str] = []
+    if not (
+        args.lm
+        or (getattr(args, "lm2", None) is not None)
+        or args.lmm
+        or getattr(args, "lmm2", False)
+        or args.fastlmm
+        or args.fvlmm
+        or args.splmm
+        or args.algwas
+        or args.farmcpu
+    ):
+        logger.error(
+            "No model selected. Use -lm, -lm2, -lmm, -lmm2, -fvlmm, -splmm, -farmcpu, and/or -algwas."
+        )
+        raise SystemExit(1)
+    if args.memory is None:
+        inspect_force_kind = "hmp" if bool(getattr(args, "hmp", None)) else None
+        preinspect_src = _basename_only(gfile)
+        preinspect_t0 = time.monotonic()
+        with CliStatus(genotype_load_status_open(preinspect_src), enabled=False, use_process=True) as task:
+            try:
+                preinspect_ids_raw, preinspect_n_snps, preinspect_warn_msgs = _inspect_genotype_file_with_warnings(
+                    gfile,
+                    snps_only=bool(args.snps_only),
+                    maf_threshold=float(args.maf),
+                    max_missing_rate=float(args.geno),
+                    het_threshold=float(args.het),
+                    force_kind=inspect_force_kind,
+                )
+            except Exception:
+                task.fail(genotype_load_status_fail(preinspect_src))
+                raise
+        preinspect_ids = np.asarray(preinspect_ids_raw, dtype=str)
+        preinspect_n_snps = int(preinspect_n_snps)
+        preinspect_warnings.extend(preinspect_warn_msgs)
+        _queue_preconfig_success(
+            f"{genotype_load_status_done(preinspect_src, n_samples=len(preinspect_ids), n_snps=int(preinspect_n_snps))} "
+            f"[{format_elapsed(time.monotonic() - preinspect_t0)}]"
+        )
+        auto_memory_gb, auto_memory_reason = _resolve_gwas_auto_decode_memory_gb(
+            n_samples_total=int(len(preinspect_ids)),
+            n_markers_total=int(preinspect_n_snps),
+            requested_models=list(requested_memory_models),
+            qcov_needs_grm=bool(qcov_needs_grm),
+        )
+        args.memory = float(auto_memory_gb)
+        args._memory_mb = _bed_memory_gb_to_mb(args.memory)
+        args._memory_auto_reason = str(auto_memory_reason)
+        auto_memory_msg = (
+            "GWAS decode memory auto: "
+            f"{float(args.memory):.6g} GB "
+            f"(reason: {str(auto_memory_reason).strip() or 'route-aware default'}). "
+            "Override with -mem/--memory to keep a fixed decode budget."
+        )
+        if _gwas_logger_verbose(logger):
+            logger.info(auto_memory_msg)
+        else:
+            _log_file_only(logger, logging.INFO, auto_memory_msg)
 
     if log:
         packed_auto_mode = bool(fast_mode)
+        memory_cfg = _format_gwas_memory_cfg(
+            args.memory,
+            auto_requested=bool(getattr(args, "_memory_auto_requested", False)),
+        )
         if file_fast_rust_mode:
             bed_backend_policy = (
                 "mixed (memmap default; packed only for FarmCPU/ALGWAS; FILE->BED cache)"
@@ -6088,7 +6319,7 @@ def _run_gwas_pipeline(
             ("Q option", args.qcov),
             ("MAF threshold", args.maf),
             ("Miss threshold", args.geno),
-            ("Decode block GB", args.memory),
+            ("Decode block GB", memory_cfg),
         ]
         if qtn_input_requested and (args.farmcpu or args.algwas):
             _qtn_kind, _qtn_path, _ = _qtn_source_from_args(args) or ("", "", None)
@@ -6134,6 +6365,8 @@ def _run_gwas_pipeline(
                 footer_rows=footer_rows,
                 line_max_chars=_gwas_terminal_config_line_max_chars(60),
             )
+        if not bool(terminal_rich):
+            _flush_preconfig_successes()
 
         _emit_report_banner(report_logger, "JanusX - GWAS Pipeline Analysis")
         _emit_report_block(report_logger, "System Context")
@@ -6163,6 +6396,7 @@ def _run_gwas_pipeline(
             "Thresholds",
             f"MAF={float(args.maf):g} | Miss={float(args.geno):g}",
         )
+        _emit_report_kv(report_logger, "Decode Block", memory_cfg)
         _emit_report_kv(report_logger, "Output Prefix", _display_path(str(outprefix)))
         _emit_report_kv(
             report_logger,
@@ -6180,7 +6414,7 @@ def _run_gwas_pipeline(
             ("BED Backend", bed_backend_policy),
             ("GRM Option", args.grm),
             ("Q Option", args.qcov),
-            ("Decode block GB", float(args.memory)),
+            ("Decode block GB", memory_cfg),
             ("SNPs Only", bool(args.snps_only)),
             ("Force Model", bool(args.force_model)),
         ]
@@ -6209,6 +6443,8 @@ def _run_gwas_pipeline(
                     ),
                 ]
             )
+    if not bool(terminal_rich):
+        _flush_preconfig_successes()
 
     checks: list[bool] = []
     if args.bfile:
@@ -6232,21 +6468,6 @@ def _run_gwas_pipeline(
     if not ensure_all_true(checks):
         raise SystemExit(1)
 
-    if not (
-        args.lm
-        or (getattr(args, "lm2", None) is not None)
-        or args.lmm
-        or getattr(args, "lmm2", False)
-        or args.fastlmm
-        or args.fvlmm
-        or args.splmm
-        or args.algwas
-        or args.farmcpu
-    ):
-        logger.error(
-            "No model selected. Use -lm, -lm2, -lmm, -lmm2, -fvlmm, -splmm, -farmcpu, and/or -algwas."
-        )
-        raise SystemExit(1)
     if args.fastlmm:
         _emit_warning_line(
             logger,
@@ -6285,7 +6506,6 @@ def _run_gwas_pipeline(
         _append_advanced_note(
             "SparseLMM default backend: BED memmap/streaming metadata."
         )
-    qcov_needs_grm = str(getattr(args, "qcov", "0")).strip() not in {"", "0"}
     # GRM route policy:
     # - default full-sample GRM builds prefer memmap BED
     # - packed reuse is disabled for standard GWAS model routes
@@ -6337,23 +6557,7 @@ def _run_gwas_pipeline(
         eff_snp_by_trait: dict[str, int] = {}
         qtn_preloaded_packed: Optional[dict[str, object]] = None
 
-        stream_models: list[str] = []
-        if args.lm:
-            stream_models.append("lm")
-        if getattr(args, "lm2", None) is not None:
-            stream_models.append("lm2")
-        if args.lmm:
-            stream_models.append("lmm")
-        if getattr(args, "lmm2", False):
-            stream_models.append("lmm2")
-        if args.fastlmm:
-            stream_models.append("fastlmm")
-        if args.fvlmm:
-            stream_models.append("fvlmm")
-        if args.splmm:
-            stream_models.append("splmm")
-        if args.algwas:
-            stream_models.append("algwas")
+        stream_models: list[str] = list(requested_stream_models)
         has_farmcpu = bool(args.farmcpu)
         farmcpu_handled_in_trait_loop = False
         preloaded_packed: Union[dict[str, object], None] = None
@@ -6362,6 +6566,8 @@ def _run_gwas_pipeline(
         splmm_post_grm_hook: Optional[Callable[[str, Optional[str]], None]] = None
 
         if file_fast_dense_mode:
+            if (not bool(preconfig_successes_flushed)) and len(preconfig_terminal_successes) > 0:
+                _flush_preconfig_successes()
             pheno, ids, n_snps = _run_file_dense_fast_once(
                 args=args,
                 gfile=str(gfile),
@@ -6516,6 +6722,8 @@ def _run_gwas_pipeline(
             if shared_context_needed:
                 if terminal_rich:
                     _section(terminal_logger, "GWAS task")
+                if (not bool(preconfig_successes_flushed)) and len(preconfig_terminal_successes) > 0:
+                    _flush_preconfig_successes()
                 _append_advanced_note("Prepare shared context (phenotype/genotype meta/GRM/Q/cov)")
                 pheno, ids, n_snps, grm, qmatrix, cov_all, eff_m, genofile_stream, preloaded_packed = prepare_streaming_context(
                     genofile=genofile_stream,
@@ -6539,6 +6747,9 @@ def _run_gwas_pipeline(
                     require_bed_stream=bool(stream_selected or qtn_input_requested),
                     post_grm_hook=post_grm_hook,
                     force_kind=("hmp" if bool(getattr(args, "hmp", None)) else None),
+                    preinspected_ids=preinspect_ids,
+                    preinspected_n_snps=preinspect_n_snps,
+                    preinspect_warnings=preinspect_warnings,
                 )
                 if getattr(args, "lm2", None) is not None:
                     lm2_selector = list(getattr(args, "lm2_cov_cols", []) or [])

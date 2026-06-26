@@ -467,7 +467,7 @@ def add_common_snps_only_arg(
 def add_common_memory_arg(
     group: argparse._ArgumentGroup,
     *,
-    default: float,
+    default: float | None,
     help_profile: str | None = None,
     help_text: str | None = None,
     dest: str = "memory",
@@ -477,7 +477,7 @@ def add_common_memory_arg(
         "-mem",
         "--memory",
         type=float,
-        default=float(default),
+        default=(None if default is None else float(default)),
         dest=str(dest),
         help=(
             str(help_text)

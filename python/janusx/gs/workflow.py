@@ -2318,9 +2318,16 @@ def _env_truthy(name: str, default: str = "0") -> bool:
 
 
 _GS_DEBUG_STAGE = _env_truthy("JX_GS_DEBUG_STAGE", "0")
+_GS_AUTO_MEM_GBLUP_BLOCK_ROWS = 4096
+_GS_AUTO_MEM_PCG_BLOCK_ROWS = 4096
+_GS_AUTO_MEM_EXACT_SAMPLE_BLOCK = 2048
+_GS_AUTO_MEM_BAYES_BLOCK_ROWS = 2048
+_GS_AUTO_MEM_MIN_GB = 0.125
 
 
-def _normalize_memory_gb(memory_gb: float | int | None) -> float:
+def _normalize_memory_gb(memory_gb: float | int | None) -> float | None:
+    if memory_gb is None:
+        return None
     return float(
         _common_normalize_decode_memory_gb(
             memory_gb,
@@ -2336,6 +2343,169 @@ def _memory_gb_to_mb(memory_gb: float | int | None) -> float:
             default_gb=1.0,
         )
     )
+
+
+def _memory_gb_for_target_decode_shape(
+    row_width: int,
+    target_rows: int,
+    *,
+    elem_bytes: int = 4,
+    min_gb: float = _GS_AUTO_MEM_MIN_GB,
+) -> float:
+    width = int(max(1, int(row_width)))
+    rows = int(max(1, int(target_rows)))
+    bytes_need = width * rows * int(max(1, int(elem_bytes)))
+    gb_need = float(bytes_need) / float(1024 ** 3)
+    return float(max(float(min_gb), gb_need))
+
+
+def _format_gs_memory_cfg(
+    memory_gb: float | int | None,
+    *,
+    auto_requested: bool,
+    resolved: bool,
+) -> str:
+    if memory_gb is None:
+        return "auto (route-aware; pending inspect)"
+    suffix = " (auto)" if bool(auto_requested and resolved) else ""
+    return f"{float(memory_gb):.6g} GB{suffix}"
+
+
+def _estimate_gs_train_size_for_dispatch(
+    n_samples_total: int,
+    cv_folds: int | None,
+) -> int:
+    n_total = int(max(1, int(n_samples_total)))
+    if cv_folds is None:
+        return n_total
+    try:
+        folds = int(cv_folds)
+    except Exception:
+        return n_total
+    if folds <= 1:
+        return n_total
+    return int(max(1, (n_total * max(1, folds - 1)) // folds))
+
+
+def _resolve_gs_auto_decode_memory_gb(
+    *,
+    methods: list[str],
+    n_samples_total: int,
+    n_markers_total: int,
+    n_route_samples_hint: int | None,
+    cv_folds: int | None,
+    rr_solver_mode: str,
+    rrblup_cfg: dict[str, typing.Any] | None,
+) -> tuple[float, str]:
+    n_total = int(max(1, int(n_samples_total)))
+    m_total = int(max(0, int(n_markers_total)))
+    n_route_total = int(max(1, int(n_route_samples_hint if n_route_samples_hint is not None else n_total)))
+    n_train_est = _estimate_gs_train_size_for_dispatch(n_route_total, cv_folds)
+    candidates: list[tuple[float, str]] = []
+    seen: set[str] = set()
+
+    def _push_candidate(memory_gb: float, reason: str) -> None:
+        reason_txt = str(reason).strip()
+        if reason_txt == "" or reason_txt in seen:
+            return
+        seen.add(reason_txt)
+        candidates.append((float(memory_gb), reason_txt))
+
+    for method_name in methods:
+        method_key = str(method_name)
+        if method_key in {"BayesA", "BayesB", "BayesCpi"}:
+            _push_candidate(
+                _memory_gb_for_target_decode_shape(
+                    n_total,
+                    _GS_AUTO_MEM_BAYES_BLOCK_ROWS,
+                    elem_bytes=8,
+                ),
+                f"{method_key} block_rows={int(_GS_AUTO_MEM_BAYES_BLOCK_ROWS)}",
+            )
+            continue
+
+        if _is_gblup_method(method_key):
+            _push_candidate(
+                _memory_gb_for_target_decode_shape(
+                    n_total,
+                    _GS_AUTO_MEM_GBLUP_BLOCK_ROWS,
+                    elem_bytes=4,
+                ),
+                f"{method_key} block_rows={int(_GS_AUTO_MEM_GBLUP_BLOCK_ROWS)}",
+            )
+            continue
+
+        if _is_blup_method(method_key):
+            dispatch = resolve_blup_dispatch(
+                n_samples=int(n_train_est),
+                n_markers=int(m_total),
+            )
+            if dispatch.effective_method == "GBLUP":
+                _push_candidate(
+                    _memory_gb_for_target_decode_shape(
+                        n_total,
+                        _GS_AUTO_MEM_GBLUP_BLOCK_ROWS,
+                        elem_bytes=4,
+                    ),
+                    f"{method_key}->GBLUP block_rows={int(_GS_AUTO_MEM_GBLUP_BLOCK_ROWS)}",
+                )
+            elif dispatch.effective_method == "rrBLUP" and dispatch.rrblup_solver == "pcg":
+                _push_candidate(
+                    _memory_gb_for_target_decode_shape(
+                        n_total,
+                        _GS_AUTO_MEM_PCG_BLOCK_ROWS,
+                        elem_bytes=4,
+                    ),
+                    f"{method_key}->rrBLUP-PCG/HE block_rows={int(_GS_AUTO_MEM_PCG_BLOCK_ROWS)}",
+                )
+            elif dispatch.effective_method == "rrBLUP" and dispatch.rrblup_solver == "exact":
+                if m_total > 0:
+                    _push_candidate(
+                        _memory_gb_for_target_decode_shape(
+                            m_total,
+                            _GS_AUTO_MEM_EXACT_SAMPLE_BLOCK,
+                            elem_bytes=4,
+                        ),
+                        (
+                            f"{method_key}->rrBLUP-exact "
+                            f"sample_block={int(_GS_AUTO_MEM_EXACT_SAMPLE_BLOCK)}"
+                        ),
+                    )
+            continue
+
+        if method_key == "rrBLUP":
+            solver_use = str(
+                _resolve_rrblup_solver(
+                    solver=str(rr_solver_mode),
+                    n_train=int(n_train_est),
+                    n_snp=int(m_total),
+                    cfg=rrblup_cfg,
+                )
+            ).strip().lower()
+            if solver_use in {"pcg", "adamw"}:
+                _push_candidate(
+                    _memory_gb_for_target_decode_shape(
+                        n_total,
+                        _GS_AUTO_MEM_PCG_BLOCK_ROWS,
+                        elem_bytes=4,
+                    ),
+                    f"{method_key}->{solver_use} block_rows={int(_GS_AUTO_MEM_PCG_BLOCK_ROWS)}",
+                )
+            elif solver_use == "exact" and m_total > 0:
+                _push_candidate(
+                    _memory_gb_for_target_decode_shape(
+                        m_total,
+                        _GS_AUTO_MEM_EXACT_SAMPLE_BLOCK,
+                        elem_bytes=4,
+                    ),
+                    f"{method_key}->exact sample_block={int(_GS_AUTO_MEM_EXACT_SAMPLE_BLOCK)}",
+                )
+
+    if len(candidates) == 0:
+        return (1.0, "fallback default=1GB")
+    picked_gb, _picked_reason = max(candidates, key=lambda item: float(item[0]))
+    reason_join = "; ".join(reason for _gb, reason in candidates)
+    return (float(picked_gb), reason_join)
 
 
 def _normalize_int64_index_array(idx: np.ndarray | typing.Sequence[int] | None) -> np.ndarray:
@@ -16903,8 +17073,12 @@ def parse_args(argv: typing.Optional[list[str]] = None):
     add_common_thread_arg(optional_group, default_threads=detect_effective_threads())
     add_common_memory_arg(
         optional_group,
-        default=1.0,
-        help_profile="gs_decode",
+        default=None,
+        help_text=(
+            "Decode block memory budget in GB for streamed BED kernels in GS. "
+            "When omitted, GS chooses a route-aware default from loaded sample/marker counts; "
+            "explicit -mem keeps the requested fixed budget."
+        ),
         dest="memory",
     )
     optional_group.add_argument(
@@ -17965,7 +18139,27 @@ def _run_gs_pipeline(
         )
         raise SystemExit(1)
 
-    if log:
+    gs_memory_auto_requested = bool(args.memory is None)
+    gs_config_emitted = False
+    preconfig_terminal_successes: list[str] = []
+
+    def _queue_preconfig_success(message: str) -> None:
+        text = str(message).strip()
+        if text != "":
+            preconfig_terminal_successes.append(text)
+
+    def _flush_preconfig_successes() -> None:
+        if len(preconfig_terminal_successes) <= 0:
+            return
+        pending = list(preconfig_terminal_successes)
+        preconfig_terminal_successes.clear()
+        for msg in pending:
+            log_success(logger, msg, force_color=True)
+
+    def _emit_gs_configuration() -> None:
+        nonlocal gs_config_emitted
+        if (not bool(log)) or bool(gs_config_emitted):
+            return
         ncol_cfg = (
             "All"
             if args.ncol is None
@@ -18020,6 +18214,11 @@ def _run_gs_pipeline(
             elif str(m) in {"BayesA", "BayesB", "BayesCpi"}:
                 detail = "bayesian marker model"
             model_rows.append((f"{i}. {_method_display_name(str(m))}", detail))
+        memory_cfg = _format_gs_memory_cfg(
+            args.memory,
+            auto_requested=bool(gs_memory_auto_requested),
+            resolved=bool(args.memory is not None),
+        )
 
         emit_cli_configuration(
             logger,
@@ -18056,6 +18255,7 @@ def _run_gs_pipeline(
                                 detected_threads=int(detected_threads),
                             ),
                         ),
+                        ("Memory", memory_cfg),
                         ("CV", cv_cfg),
                         ("Model mode", ("on" if model_mode else "off")),
                         (
@@ -18074,6 +18274,38 @@ def _run_gs_pipeline(
             footer_rows=[("Output prefix", outprefix)],
             line_max_chars=62,
         )
+        gs_config_emitted = True
+        _flush_preconfig_successes()
+
+    def _ensure_gs_memory_and_config(
+        n_samples_total: int,
+        n_markers_total: int,
+    ) -> None:
+        if args.memory is None:
+            auto_memory_gb, auto_memory_reason = _resolve_gs_auto_decode_memory_gb(
+                methods=list(methods),
+                n_samples_total=int(n_samples_total),
+                n_markers_total=int(n_markers_total),
+                n_route_samples_hint=int(min(int(n_samples_total), int(pheno.shape[0]))),
+                cv_folds=(None if not cv_enabled else int(args.cv)),
+                rr_solver_mode=str(rr_solver_mode),
+                rrblup_cfg=rrblup_adamw_cfg,
+            )
+            args.memory = float(auto_memory_gb)
+            auto_memory_msg = (
+                "GS decode memory auto: "
+                f"{float(args.memory):.6g} GB "
+                f"(reason: {str(auto_memory_reason).strip() or 'route-aware default'}). "
+                "Override with -mem/--memory to keep a fixed decode budget."
+            )
+            if bool(debug_mode):
+                logger.info(auto_memory_msg)
+            else:
+                _log_file_only(auto_memory_msg)
+        _emit_gs_configuration()
+
+    if log and (not gs_memory_auto_requested):
+        _emit_gs_configuration()
 
     if packed_preprocess_requested and (not gfile_is_plink):
         if (
@@ -18157,15 +18389,26 @@ def _run_gs_pipeline(
     # ------------------------------------------------------------------
     t_loading = time.time()
     psrc = os.path.basename(str(args.pheno).rstrip("/\\")) or str(args.pheno)
-    with CliStatus(f"Loading phenotype from {psrc}...", enabled=use_spinner) as task:
+    defer_pheno_load_status = not bool(gs_config_emitted)
+    pheno_t0 = time.monotonic()
+    with CliStatus(
+        f"Loading phenotype from {psrc}...",
+        enabled=(bool(use_spinner) and (not bool(defer_pheno_load_status))),
+    ) as task:
         try:
             pheno = _load_phenotype_flexible(args.pheno)
         except Exception:
             task.fail(f"Loading phenotype from {psrc} ...Failed")
             raise
-        task.complete(
+        pheno_done_msg = (
             f"Loading phenotype from {psrc} (n={pheno.shape[0]}, npheno={pheno.shape[1]})"
         )
+        if bool(defer_pheno_load_status):
+            _queue_preconfig_success(
+                f"{pheno_done_msg} [{format_elapsed(time.monotonic() - pheno_t0)}]"
+            )
+        else:
+            task.complete(pheno_done_msg)
 
     if pheno.shape[1] <= 0:
         logger.error(
@@ -18296,7 +18539,12 @@ def _run_gs_pipeline(
     packed_qc_baseline_ctx: dict[str, typing.Any] | None = None
     geno_is_memmap = False
     if use_packed_lmm:
-        with CliStatus(genotype_load_status_open(gsrc), enabled=use_spinner) as task:
+        defer_geno_load_status = not bool(gs_config_emitted)
+        geno_load_t0 = time.monotonic()
+        with CliStatus(
+            genotype_load_status_open(gsrc),
+            enabled=(bool(use_spinner) and (not bool(defer_geno_load_status))),
+        ) as task:
             try:
                 if packed_meta_only_main_requested:
                     sample_ids, packed_lmm_ctx = _load_plink_stats_for_lmm(
@@ -18322,19 +18570,24 @@ def _run_gs_pipeline(
                 else 0
             )
             load_kind = "packed-meta" if packed_meta_only_main_requested else "packed"
-            task.complete(
-                genotype_load_status_done(
-                    gsrc,
-                    n_samples=n,
-                    n_snps=m,
-                    mode=load_kind,
-                )
+            geno_done_msg = genotype_load_status_done(
+                gsrc,
+                n_samples=n,
+                n_snps=m,
+                mode=load_kind,
             )
+            if bool(defer_geno_load_status):
+                _queue_preconfig_success(
+                    f"{geno_done_msg} [{format_elapsed(time.monotonic() - geno_load_t0)}]"
+                )
+            else:
+                task.complete(geno_done_msg)
         _emit_packed_load_debug(
             packed_lmm_ctx,
             label="main",
             enabled=bool(debug_mode),
         )
+        _ensure_gs_memory_and_config(int(n), int(m))
         if (
             packed_meta_only_main_requested
             and bayes_requested
@@ -18537,7 +18790,12 @@ def _run_gs_pipeline(
     elif gfile_is_plink and (args.hash_dim is not None):
         # Global hash path for non-packed-model sets:
         # load packed BED -> optional LD prune -> hash projection -> dense hashed matrix.
-        with CliStatus(genotype_load_status_open(gsrc), enabled=use_spinner) as task:
+        defer_geno_load_status = not bool(gs_config_emitted)
+        geno_load_t0 = time.monotonic()
+        with CliStatus(
+            genotype_load_status_open(gsrc),
+            enabled=(bool(use_spinner) and (not bool(defer_geno_load_status))),
+        ) as task:
             try:
                 sample_ids, packed_lmm_ctx = _load_plink_packed_for_lmm(
                     str(gfile),
@@ -18554,19 +18812,24 @@ def _run_gs_pipeline(
                 if packed_lmm_ctx is not None
                 else 0
             )
-            task.complete(
-                genotype_load_status_done(
-                    gsrc,
-                    n_samples=n,
-                    n_snps=m,
-                    mode="packed",
-                )
+            geno_done_msg = genotype_load_status_done(
+                gsrc,
+                n_samples=n,
+                n_snps=m,
+                mode="packed",
             )
+            if bool(defer_geno_load_status):
+                _queue_preconfig_success(
+                    f"{geno_done_msg} [{format_elapsed(time.monotonic() - geno_load_t0)}]"
+                )
+            else:
+                task.complete(geno_done_msg)
         _emit_packed_load_debug(
             packed_lmm_ctx,
             label="hash",
             enabled=bool(debug_mode),
         )
+        _ensure_gs_memory_and_config(int(n), int(m))
         packed_qc_baseline_ctx = _snapshot_packed_ctx_for_qc(packed_lmm_ctx)
 
         if ldprune_spec is not None:
@@ -18713,7 +18976,12 @@ def _run_gs_pipeline(
     elif gfile_is_plink and (ldprune_spec is not None):
         # For non-GBLUP/rrBLUP model sets, allow global LD prune by
         # pruning on packed BED first, then decoding once to dense matrix.
-        with CliStatus(genotype_load_status_open(gsrc), enabled=use_spinner) as task:
+        defer_geno_load_status = not bool(gs_config_emitted)
+        geno_load_t0 = time.monotonic()
+        with CliStatus(
+            genotype_load_status_open(gsrc),
+            enabled=(bool(use_spinner) and (not bool(defer_geno_load_status))),
+        ) as task:
             try:
                 sample_ids, packed_lmm_ctx = _load_plink_packed_for_lmm(
                     str(gfile),
@@ -18730,19 +18998,24 @@ def _run_gs_pipeline(
                 if packed_lmm_ctx is not None
                 else 0
             )
-            task.complete(
-                genotype_load_status_done(
-                    gsrc,
-                    n_samples=n,
-                    n_snps=m,
-                    mode="packed",
-                )
+            geno_done_msg = genotype_load_status_done(
+                gsrc,
+                n_samples=n,
+                n_snps=m,
+                mode="packed",
             )
+            if bool(defer_geno_load_status):
+                _queue_preconfig_success(
+                    f"{geno_done_msg} [{format_elapsed(time.monotonic() - geno_load_t0)}]"
+                )
+            else:
+                task.complete(geno_done_msg)
         _emit_packed_load_debug(
             packed_lmm_ctx,
             label="ldprune",
             enabled=bool(debug_mode),
         )
+        _ensure_gs_memory_and_config(int(n), int(m))
         packed_qc_baseline_ctx = _snapshot_packed_ctx_for_qc(packed_lmm_ctx)
 
         _spec = typing.cast(_GsLdPruneSpec, ldprune_spec)
@@ -18834,7 +19107,12 @@ def _run_gs_pipeline(
                 geno.std(axis=1, keepdims=True) + 1e-6
             )
     else:
-        with CliStatus(genotype_load_status_open(gsrc), enabled=use_spinner) as task:
+        defer_geno_load_status = not bool(gs_config_emitted)
+        geno_load_t0 = time.monotonic()
+        with CliStatus(
+            genotype_load_status_open(gsrc),
+            enabled=(bool(use_spinner) and (not bool(defer_geno_load_status))),
+        ) as task:
             try:
                 if file_memmap_preferred:
                     sample_ids, geno = _build_memmap_cache_from_chunks(
@@ -18856,22 +19134,25 @@ def _run_gs_pipeline(
                 raise
             m, n = geno.shape
             if geno_is_memmap:
-                task.complete(
-                    genotype_load_status_done(
-                        gsrc,
-                        n_samples=n,
-                        n_snps=m,
-                        mode="memmap",
-                    )
+                geno_done_msg = genotype_load_status_done(
+                    gsrc,
+                    n_samples=n,
+                    n_snps=m,
+                    mode="memmap",
                 )
             else:
-                task.complete(
-                    genotype_load_status_done(
-                        gsrc,
-                        n_samples=n,
-                        n_snps=m,
-                    )
+                geno_done_msg = genotype_load_status_done(
+                    gsrc,
+                    n_samples=n,
+                    n_snps=m,
                 )
+            if bool(defer_geno_load_status):
+                _queue_preconfig_success(
+                    f"{geno_done_msg} [{format_elapsed(time.monotonic() - geno_load_t0)}]"
+                )
+            else:
+                task.complete(geno_done_msg)
+        _ensure_gs_memory_and_config(int(n), int(m))
 
         samples = sample_ids
         # GBLUP computes kinship-driven scaling inside MLMBLUP(kinship=1),
@@ -18890,6 +19171,8 @@ def _run_gs_pipeline(
             geno = (geno - geno.mean(axis=1, keepdims=True)) / (
                 geno.std(axis=1, keepdims=True) + 1e-6
             )  # standardization for marker-effect models
+
+    _flush_preconfig_successes()
 
     if packed_lmm_ctx is not None:
         _attach_stream_decode_budget_to_packed_ctx(

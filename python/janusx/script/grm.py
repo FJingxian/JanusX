@@ -111,6 +111,10 @@ except Exception:
 
 
 DEFAULT_BED_MEMORY_GB = 1.0
+_GRM_AUTO_MEM_DENSE_BLOCK_ROWS = 4096
+_GRM_AUTO_MEM_SPARSE_BLOCK_ROWS = 4096
+_GRM_AUTO_MEM_PACKED_BLOCK_ROWS = 4096
+_GRM_AUTO_MEM_MIN_GB = 0.125
 
 
 def _is_plink_prefix_path(path_or_prefix: str) -> bool:
@@ -123,7 +127,44 @@ def _is_plink_prefix_path(path_or_prefix: str) -> bool:
     return all(os.path.isfile(f"{p}.{ext}") for ext in ("bed", "bim", "fam"))
 
 
-def _normalize_memory_gb(memory_gb: Union[int, float, None]) -> float:
+def _log_file_only(
+    logger: logging.Logger,
+    level: int,
+    msg: str,
+    *args: object,
+) -> None:
+    if logger is None:
+        return
+    record = logger.makeRecord(
+        logger.name,
+        int(level),
+        fn="",
+        lno=0,
+        msg=str(msg),
+        args=args,
+        exc_info=None,
+    )
+    for handler in list(getattr(logger, "handlers", [])):
+        if isinstance(handler, logging.FileHandler):
+            handler.handle(record)
+
+
+def _log_verbose_or_file_only(
+    logger: logging.Logger,
+    *,
+    verbose: bool,
+    msg: str,
+    args: tuple[object, ...] = (),
+) -> None:
+    if bool(verbose):
+        logger.info(str(msg), *args)
+    else:
+        _log_file_only(logger, logging.INFO, str(msg), *args)
+
+
+def _normalize_memory_gb(memory_gb: Union[int, float, None]) -> float | None:
+    if memory_gb is None:
+        return None
     return float(
         _common_normalize_decode_memory_gb(
             memory_gb,
@@ -138,6 +179,144 @@ def _memory_gb_to_mb(memory_gb: Union[int, float, None]) -> float:
             memory_gb,
             default_gb=float(DEFAULT_BED_MEMORY_GB),
         )
+    )
+
+
+def _memory_gb_for_target_decode_shape(
+    row_width: int,
+    target_rows: int,
+    *,
+    elem_bytes: int = 4,
+    min_gb: float = _GRM_AUTO_MEM_MIN_GB,
+) -> float:
+    width = int(max(1, int(row_width)))
+    rows = int(max(1, int(target_rows)))
+    bytes_need = width * rows * int(max(1, int(elem_bytes)))
+    gb_need = float(bytes_need) / float(1024 ** 3)
+    return float(max(float(min_gb), gb_need))
+
+
+def _resolve_grm_auto_decode_memory_gb(
+    *,
+    n_samples_total: int,
+    n_markers_total: int,
+    sparse: bool,
+) -> tuple[float, str]:
+    n_total = int(max(1, int(n_samples_total)))
+    m_total = int(max(1, int(n_markers_total)))
+    if bool(sparse):
+        block_rows = min(int(_GRM_AUTO_MEM_SPARSE_BLOCK_ROWS), m_total)
+        return (
+            _memory_gb_for_target_decode_shape(
+                n_total,
+                block_rows,
+                elem_bytes=4,
+            ),
+            f"sparse-GRM stream-bed block_rows={int(block_rows)}",
+        )
+    dense_block_rows = min(
+        m_total,
+        max(
+            int(_GRM_AUTO_MEM_DENSE_BLOCK_ROWS),
+            int(_GRM_AUTO_MEM_PACKED_BLOCK_ROWS),
+        ),
+    )
+    return (
+        _memory_gb_for_target_decode_shape(
+            n_total,
+            dense_block_rows,
+            elem_bytes=4,
+        ),
+        (
+            "dense-GRM memmap/packed block_rows="
+            f"{int(dense_block_rows)}"
+        ),
+    )
+
+
+def _format_grm_memory_cfg(
+    memory_gb: Union[int, float, None],
+    *,
+    auto_requested: bool,
+    resolved: bool,
+) -> str:
+    if memory_gb is None:
+        return "auto (route-aware; pending inspect)"
+    suffix = " (auto)" if bool(auto_requested and resolved) else ""
+    return f"{float(memory_gb):.6g} GB{suffix}"
+
+
+def _emit_grm_configuration(
+    *,
+    logger,
+    gfile: str,
+    args: argparse.Namespace,
+    requested_threads: int,
+    detected_threads: int,
+    outprefix: str,
+    auto_memory_requested: bool,
+    memory_resolved: bool,
+) -> None:
+    spgrm_timing_env = str(os.environ.get("JANUSX_SPGRM_TIMING", "")).strip().lower()
+    spgrm_timing_enabled = bool(
+        spgrm_timing_env and spgrm_timing_env not in {"0", "false", "no", "off"}
+    )
+    memory_cfg = _format_grm_memory_cfg(
+        getattr(args, "memory", None),
+        auto_requested=bool(auto_memory_requested),
+        resolved=bool(memory_resolved),
+    )
+    bed_backend_policy = "auto: memmap primary, packed fallback"
+    general_rows = (
+        [
+            ("Dense GRM file", gfile),
+            ("Sparse GRM cutoff", "disabled" if args.sparse is None else args.sparse),
+            (
+                "Threads",
+                format_requested_thread_usage(
+                    requested_threads=int(requested_threads),
+                    using_threads=int(args.thread),
+                    detected_threads=int(detected_threads),
+                ),
+            ),
+            ("Save as text", args.txt),
+        ]
+        if getattr(args, "dense_grm", None)
+        else [
+            ("Genotype file", gfile),
+            ("GRM method", "Centered" if args.method == 1 else "Standardized/weighted"),
+            ("Sparse GRM cutoff", "disabled" if args.sparse is None else args.sparse),
+            ("MAF threshold", args.maf),
+            ("Missing rate", args.geno),
+            ("Het threshold", args.het),
+            ("SNP-only", bool(args.snps_only)),
+            ("Decode block GB", memory_cfg),
+            ("Stage timing", bool(args.stage_timing or spgrm_timing_enabled)),
+            (
+                "Threads",
+                format_requested_thread_usage(
+                    requested_threads=int(requested_threads),
+                    using_threads=int(args.thread),
+                    detected_threads=int(detected_threads),
+                ),
+            ),
+            ("BED backend", bed_backend_policy),
+            ("Save as text", args.txt),
+        ]
+    )
+    emit_cli_configuration(
+        logger,
+        app_title="JanusX - GRM",
+        config_title="GRM CONFIG",
+        host=socket.gethostname(),
+        sections=[
+            (
+                "General",
+                general_rows,
+            )
+        ],
+        footer_rows=[("Output prefix", outprefix)],
+        line_max_chars=60,
     )
 
 
@@ -822,8 +1001,12 @@ def main(log: bool = True):
     add_common_snps_only_arg(optional_group, default=False, help_profile="default")
     add_common_memory_arg(
         optional_group,
-        default=DEFAULT_BED_MEMORY_GB,
-        help_profile="gwas_decode",
+        default=None,
+        help_text=(
+            "Decode block memory budget in GB for BED GRM kernels. "
+            "When omitted, GRM chooses a route-aware default from loaded sample counts; "
+            "explicit -mem keeps the requested fixed budget."
+        ),
         dest="memory",
         include_hidden_legacy_single_dash_alias=True,
     )
@@ -846,6 +1029,7 @@ def main(log: bool = True):
     args = parser.parse_args()
     detected_threads = detect_effective_threads()
     requested_threads = int(args.thread)
+    memory_auto_requested = bool(args.memory is None)
     thread_capped = False
     if int(args.thread) <= 0:
         args.thread = int(detected_threads)
@@ -909,62 +1093,36 @@ def main(log: bool = True):
     #     strict=require_openblas_by_default(),
     # )
 
-    if log:
-        spgrm_timing_env = str(os.environ.get("JANUSX_SPGRM_TIMING", "")).strip().lower()
-        spgrm_timing_enabled = bool(
-            spgrm_timing_env and spgrm_timing_env not in {"0", "false", "no", "off"}
-        )
-        bed_backend_policy = "auto: memmap primary, packed fallback"
-        general_rows = (
-            [
-                ("Dense GRM file", gfile),
-                ("Sparse GRM cutoff", "disabled" if args.sparse is None else args.sparse),
-                (
-                    "Threads",
-                    format_requested_thread_usage(
-                        requested_threads=int(requested_threads),
-                        using_threads=int(args.thread),
-                        detected_threads=int(detected_threads),
-                    ),
-                ),
-                ("Save as text", args.txt),
-            ]
-            if getattr(args, "dense_grm", None)
-            else [
-                ("Genotype file", gfile),
-                ("GRM method", "Centered" if args.method == 1 else "Standardized/weighted"),
-                ("Sparse GRM cutoff", "disabled" if args.sparse is None else args.sparse),
-                ("MAF threshold", args.maf),
-                ("Missing rate", args.geno),
-                ("Het threshold", args.het),
-                ("SNP-only", bool(args.snps_only)),
-                ("Decode block GB", args.memory),
-                ("Stage timing", bool(args.stage_timing or spgrm_timing_enabled)),
-                (
-                    "Threads",
-                    format_requested_thread_usage(
-                        requested_threads=int(requested_threads),
-                        using_threads=int(args.thread),
-                        detected_threads=int(detected_threads),
-                    ),
-                ),
-                ("BED backend", bed_backend_policy),
-                ("Save as text", args.txt),
-            ]
-        )
-        emit_cli_configuration(
-            logger,
-            app_title="JanusX - GRM",
-            config_title="GRM CONFIG",
-            host=socket.gethostname(),
-            sections=[
-                (
-                    "General",
-                    general_rows,
-                )
-            ],
-            footer_rows=[("Output prefix", outprefix)],
-            line_max_chars=60,
+    preconfig_terminal_successes: list[str] = []
+
+    def _queue_preconfig_success(message: str) -> None:
+        text = str(message).strip()
+        if text != "":
+            preconfig_terminal_successes.append(text)
+
+    def _flush_preconfig_successes() -> None:
+        if len(preconfig_terminal_successes) <= 0:
+            return
+        pending = list(preconfig_terminal_successes)
+        preconfig_terminal_successes.clear()
+        for msg in pending:
+            log_success(logger, msg, force_color=True)
+
+    defer_config_emit = bool(
+        log
+        and (not bool(getattr(args, "dense_grm", None)))
+        and bool(memory_auto_requested)
+    )
+    if log and (not defer_config_emit):
+        _emit_grm_configuration(
+            logger=logger,
+            gfile=gfile,
+            args=args,
+            requested_threads=int(requested_threads),
+            detected_threads=int(detected_threads),
+            outprefix=outprefix,
+            auto_memory_requested=bool(memory_auto_requested),
+            memory_resolved=True,
         )
 
     checks: list[bool] = []
@@ -1075,9 +1233,11 @@ def main(log: bool = True):
     # Inspect genotype and build GRM
     # ------------------------------------------------------------------
     genotype_src = format_path_for_display(str(gfile))
+    preconfig_inspect_deferred = bool(defer_config_emit)
+    inspect_t0 = time.monotonic()
     with CliStatus(
         genotype_load_status_open(genotype_src),
-        enabled=True,
+        enabled=(not bool(preconfig_inspect_deferred)),
         use_process=True,
     ) as task:
         try:
@@ -1093,18 +1253,52 @@ def main(log: bool = True):
             raise
         sample_ids = np.array(sample_ids, dtype=str)
         n_samples = len(sample_ids)
-        task.complete(
-            genotype_load_status_done(
-                genotype_src,
-                n_samples=n_samples,
-                n_snps=int(n_snps),
-            )
+        inspect_done_msg = genotype_load_status_done(
+            genotype_src,
+            n_samples=n_samples,
+            n_snps=int(n_snps),
         )
+        if bool(preconfig_inspect_deferred):
+            _queue_preconfig_success(
+                f"{inspect_done_msg} [{format_elapsed(time.monotonic() - inspect_t0)}]"
+            )
+        else:
+            task.complete(inspect_done_msg)
 
     # Defaults match GWAS; can be overridden via CLI.
     maf_threshold = args.maf
     max_missing_rate = args.geno
     het_threshold = float(args.het)
+    if args.memory is None:
+        auto_memory_gb, auto_memory_reason = _resolve_grm_auto_decode_memory_gb(
+            n_samples_total=int(n_samples),
+            n_markers_total=int(n_snps),
+            sparse=(args.sparse is not None),
+        )
+        args.memory = float(auto_memory_gb)
+        if defer_config_emit:
+            _emit_grm_configuration(
+                logger=logger,
+                gfile=gfile,
+                args=args,
+                requested_threads=int(requested_threads),
+                detected_threads=int(detected_threads),
+                outprefix=outprefix,
+                auto_memory_requested=bool(memory_auto_requested),
+                memory_resolved=True,
+            )
+            _flush_preconfig_successes()
+        _log_verbose_or_file_only(
+            logger,
+            verbose=bool(getattr(args, "verbose", False)),
+            msg=(
+                "GRM decode memory auto: "
+                f"{float(args.memory):.6g} GB "
+                f"(reason: {str(auto_memory_reason).strip() or 'route-aware default'}). "
+                "Override with -mem/--memory to keep a fixed decode budget."
+            ),
+        )
+    _flush_preconfig_successes()
     args.memory = _normalize_memory_gb(args.memory)
     memory_mb = _memory_gb_to_mb(args.memory)
     stream_block_rows = _decode_block_rows_from_memory_mb(
@@ -1126,11 +1320,15 @@ def main(log: bool = True):
         memory_mb,
         needs_copy=False,
     )
-    logger.info(
-        "Resolved GRM decode plan: stream_block_rows=%s, packed_block_rows=%s, mmap_window_mb=%s.",
-        int(stream_block_rows),
-        int(packed_block_rows),
-        ("auto" if mmap_window_mb is None else int(mmap_window_mb)),
+    _log_verbose_or_file_only(
+        logger,
+        verbose=bool(getattr(args, "verbose", False)),
+        msg="Resolved GRM decode plan: stream_block_rows=%s, packed_block_rows=%s, mmap_window_mb=%s.",
+        args=(
+            int(stream_block_rows),
+            int(packed_block_rows),
+            ("auto" if mmap_window_mb is None else int(mmap_window_mb)),
+        ),
     )
 
     if args.sparse is not None:
@@ -1141,9 +1339,13 @@ def main(log: bool = True):
             )
         if args.txt:
             logger.warning("`--txt` is ignored for sparse GRM output; writing `.spgrm` CSC.")
-        logger.info(
-            "GRM auto route selected backend: sparse-stream-bed "
-            "(BED pre-scan + blockwise streaming sparse CSC writer)."
+        _log_verbose_or_file_only(
+            logger,
+            verbose=bool(getattr(args, "verbose", False)),
+            msg=(
+                "GRM auto route selected backend: sparse-stream-bed "
+                "(BED pre-scan + blockwise streaming sparse CSC writer)."
+            ),
         )
         sparse_prefix = f"{outprefix}.{_grm_method_tag(args.method)}"
         grm_path, sparse_n, sparse_nnz = build_sparse_grm_packed_bed(
@@ -1186,8 +1388,10 @@ def main(log: bool = True):
         )
     else:
         selected_backend, backend_reason = _select_cli_grm_backend()
-        logger.info(
-            f"GRM auto route selected backend: {selected_backend} ({backend_reason})."
+        _log_verbose_or_file_only(
+            logger,
+            verbose=bool(getattr(args, "verbose", False)),
+            msg=f"GRM auto route selected backend: {selected_backend} ({backend_reason}).",
         )
         method_tag = _grm_method_tag(args.method)
         direct_npy_path = (

@@ -121,16 +121,16 @@ fn choose_xtmul_kernel_strategy(
     if !prefer_parallel {
         return XtMulKernelStrategy::Blas;
     }
-    let threads = pool.map(|tp| tp.current_num_threads()).unwrap_or(1).max(1);
+    // `rows` here is the decoded SNP block height, not the sample count. In the
+    // PCG BED path it is driven by `block_rows`/`--memory`, so a "small rows,
+    // very wide cols" front-half window can still occur on large-sample folds.
+    // Keep a dedicated column-chunk fast path for that shape, and otherwise
+    // prefer the explicit Rayon reduction kernel over dropping back to serial
+    // BLAS under the default `rayon_parallel_blas_serial` thread policy.
     if cols >= 65_536 && rows <= 4_096 {
         return XtMulKernelStrategy::ColChunk;
     }
-    let row_tasks = rows.div_ceil(xtmul_row_chunk(rows));
-    if row_tasks >= threads.saturating_mul(2) {
-        XtMulKernelStrategy::RowReduce
-    } else {
-        XtMulKernelStrategy::Blas
-    }
+    XtMulKernelStrategy::RowReduce
 }
 
 #[inline]
@@ -443,6 +443,16 @@ struct DecodedBlockBuffer {
     block: Vec<f32>,
 }
 
+struct PrepDecodedBlockBuffer {
+    row_start: usize,
+    row_end: usize,
+    decode_secs: f64,
+    block: Vec<f32>,
+    dot: Vec<f32>,
+}
+
+const RRBLUP_PAR_VEC_THRESHOLD: usize = 16_384;
+
 #[inline]
 fn rrblup_stream_window_mb(n_samples: usize, block_rows: usize) -> usize {
     let bytes_per_snp = n_samples.div_ceil(4).max(1);
@@ -451,6 +461,63 @@ fn rrblup_stream_window_mb(n_samples: usize, block_rows: usize) -> usize {
         .saturating_mul(bytes_per_snp)
         .saturating_mul(2);
     target_bytes.div_ceil(1024 * 1024).max(1)
+}
+
+#[inline]
+fn rrblup_parallel_row_standardization(
+    maf_keep: &[f32],
+    std_eps32: f32,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) -> (Vec<f32>, Vec<f32>, usize) {
+    let m = maf_keep.len();
+    let mut row_mean = vec![0.0_f32; m];
+    let mut row_inv_sd = vec![0.0_f32; m];
+    if m == 0 {
+        return (row_mean, row_inv_sd, 0usize);
+    }
+    let mut run_parallel = || {
+        row_mean
+            .par_iter_mut()
+            .zip(row_inv_sd.par_iter_mut())
+            .zip(maf_keep.par_iter())
+            .map(|((mean_slot, inv_slot), &maf_raw)| {
+                let p = maf_raw.clamp(0.0, 0.5);
+                let mean = 2.0_f32 * p;
+                let var = (2.0_f32 * p * (1.0_f32 - p)).max(0.0);
+                *mean_slot = mean;
+                if var > std_eps32 {
+                    *inv_slot = 1.0_f32 / var.sqrt();
+                    1usize
+                } else {
+                    *inv_slot = 0.0_f32;
+                    0usize
+                }
+            })
+            .sum::<usize>()
+    };
+    let m_effective = if m >= RRBLUP_PAR_VEC_THRESHOLD {
+        if let Some(tp) = pool {
+            tp.install(run_parallel)
+        } else {
+            run_parallel()
+        }
+    } else {
+        let mut count = 0usize;
+        for j in 0..m {
+            let p = maf_keep[j].clamp(0.0, 0.5);
+            let mean = 2.0_f32 * p;
+            let var = (2.0_f32 * p * (1.0_f32 - p)).max(0.0);
+            row_mean[j] = mean;
+            if var > std_eps32 {
+                row_inv_sd[j] = 1.0_f32 / var.sqrt();
+                count += 1;
+            } else {
+                row_inv_sd[j] = 0.0_f32;
+            }
+        }
+        count
+    };
+    (row_mean, row_inv_sd, m_effective)
 }
 
 fn build_rrblup_source<'a>(
@@ -473,6 +540,182 @@ fn build_rrblup_source<'a>(
             bytes_per_snp,
         })
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rrblup_prepare_rhs_diag(
+    source: &mut RrblupPcgSource<'_>,
+    n_samples: usize,
+    row_flip: &[bool],
+    row_mean: &[f32],
+    row_inv_sd: &[f32],
+    sample_idx: &[usize],
+    full_sample_fast: bool,
+    packed_row_indices: Option<&[usize]>,
+    block_rows: usize,
+    y_center_f32: &[f32],
+    lambda_use: f32,
+    code4_lut: &[[u8; 4]; 256],
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) -> Result<(Vec<f32>, Vec<f32>, f64, f64, f64, f64), String> {
+    let m = row_flip.len();
+    let n_train = sample_idx.len();
+    let row_step = block_rows.max(1).min(m.max(1));
+    let mut b = vec![0.0_f32; m];
+    let mut diag_inv = vec![0.0_f32; m];
+    let mut sum_ss_global = 0.0_f64;
+    let mut decode_acc = 0.0_f64;
+    let mut rhs_acc = 0.0_f64;
+    let mut diag_acc = 0.0_f64;
+    let use_double_buffer = matches!(source, RrblupPcgSource::Windowed { .. }) && m > row_step;
+
+    if use_double_buffer {
+        let pool_cloned = pool.cloned();
+        let mut next_row = 0usize;
+        let producer_err: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let producer_err_bg = Arc::clone(&producer_err);
+        run_double_buffer(
+            2usize,
+            || PrepDecodedBlockBuffer {
+                row_start: 0,
+                row_end: 0,
+                decode_secs: 0.0,
+                block: vec![0.0_f32; row_step * n_train],
+                dot: vec![0.0_f32; row_step],
+            },
+            |buf| {
+                if next_row >= m {
+                    return false;
+                }
+                let st = next_row;
+                let ed = (st + row_step).min(m);
+                let cur_rows = ed - st;
+                buf.row_start = st;
+                buf.row_end = ed;
+                let blk_slice = &mut buf.block[..cur_rows * n_train];
+                let t_decode = Instant::now();
+                if let Err(err) = decode_standardized_block_f32(
+                    source,
+                    n_samples,
+                    row_flip,
+                    row_mean,
+                    row_inv_sd,
+                    sample_idx,
+                    full_sample_fast,
+                    packed_row_indices,
+                    st,
+                    blk_slice,
+                    code4_lut,
+                    pool_cloned.as_ref(),
+                ) {
+                    if let Ok(mut slot) = producer_err_bg.lock() {
+                        *slot = Some(err);
+                    }
+                    buf.row_end = buf.row_start;
+                    next_row = m;
+                    return false;
+                }
+                buf.decode_secs = t_decode.elapsed().as_secs_f64();
+                next_row = ed;
+                next_row < m
+            },
+            |buf| {
+                if let Ok(slot) = producer_err.lock() {
+                    if let Some(err) = slot.as_ref() {
+                        return Err(err.clone());
+                    }
+                }
+                let st = buf.row_start;
+                let ed = buf.row_end;
+                let cur_rows = ed - st;
+                decode_acc += buf.decode_secs;
+                let blk_slice = &buf.block[..cur_rows * n_train];
+                let dot_slice = &mut buf.dot[..cur_rows];
+                let t_rhs = Instant::now();
+                row_major_block_mul_vec_f32(
+                    blk_slice,
+                    cur_rows,
+                    n_train,
+                    y_center_f32,
+                    dot_slice,
+                    pool,
+                );
+                rhs_acc += t_rhs.elapsed().as_secs_f64();
+                let t_diag = Instant::now();
+                sum_ss_global += row_major_block_prepare_rhs_diag_f32(
+                    blk_slice,
+                    cur_rows,
+                    n_train,
+                    dot_slice,
+                    lambda_use,
+                    &mut b[st..ed],
+                    &mut diag_inv[st..ed],
+                    pool,
+                );
+                diag_acc += t_diag.elapsed().as_secs_f64();
+                check_ctrlc()?;
+                Ok::<(), String>(())
+            },
+        )?;
+        let final_err = producer_err.lock().ok().and_then(|slot| slot.clone());
+        if let Some(err) = final_err {
+            return Err(err);
+        }
+    } else {
+        let mut block = vec![0.0_f32; row_step * n_train];
+        let mut dot_blk = vec![0.0_f32; row_step];
+        let mut tick = 0usize;
+        for st in (0..m).step_by(row_step) {
+            let ed = (st + row_step).min(m);
+            let cur_rows = ed - st;
+            let blk_slice = &mut block[..cur_rows * n_train];
+            let t_decode = Instant::now();
+            decode_standardized_block_f32(
+                source,
+                n_samples,
+                row_flip,
+                row_mean,
+                row_inv_sd,
+                sample_idx,
+                full_sample_fast,
+                packed_row_indices,
+                st,
+                blk_slice,
+                code4_lut,
+                pool,
+            )?;
+            decode_acc += t_decode.elapsed().as_secs_f64();
+            let t_rhs = Instant::now();
+            row_major_block_mul_vec_f32(
+                blk_slice,
+                cur_rows,
+                n_train,
+                y_center_f32,
+                &mut dot_blk[..cur_rows],
+                pool,
+            );
+            rhs_acc += t_rhs.elapsed().as_secs_f64();
+            let t_diag = Instant::now();
+            sum_ss_global += row_major_block_prepare_rhs_diag_f32(
+                blk_slice,
+                cur_rows,
+                n_train,
+                &dot_blk[..cur_rows],
+                lambda_use,
+                &mut b[st..ed],
+                &mut diag_inv[st..ed],
+                pool,
+            );
+            diag_acc += t_diag.elapsed().as_secs_f64();
+            tick += cur_rows;
+            if tick >= row_step.saturating_mul(64).max(1) {
+                check_ctrlc()?;
+                tick = 0;
+            }
+        }
+    }
+
+    Ok((b, diag_inv, sum_ss_global, decode_acc, rhs_acc, diag_acc))
 }
 
 struct RrblupPcgOperator<'a> {
@@ -949,17 +1192,36 @@ fn pcg_xt_mul_rows(
 }
 
 #[inline]
-fn sample_var_f64(v: &[f64]) -> f64 {
+fn sample_var_f64(v: &[f64], pool: Option<&Arc<rayon::ThreadPool>>) -> f64 {
     let n = v.len();
     if n <= 1 {
         return 0.0;
     }
-    let mean = v.iter().sum::<f64>() / (n as f64);
-    let mut ss = 0.0_f64;
-    for &x in v {
-        let d = x - mean;
-        ss += d * d;
-    }
+    let use_parallel = pool.is_some() && n >= RRBLUP_PAR_VEC_THRESHOLD;
+    let mean = if use_parallel {
+        let run = || v.par_iter().copied().sum::<f64>() / (n as f64);
+        if let Some(tp) = pool { tp.install(run) } else { run() }
+    } else {
+        v.iter().sum::<f64>() / (n as f64)
+    };
+    let ss = if use_parallel {
+        let run = || {
+            v.par_iter()
+                .map(|&x| {
+                    let d = x - mean;
+                    d * d
+                })
+                .sum::<f64>()
+        };
+        if let Some(tp) = pool { tp.install(run) } else { run() }
+    } else {
+        let mut ss_local = 0.0_f64;
+        for &x in v {
+            let d = x - mean;
+            ss_local += d * d;
+        }
+        ss_local
+    };
     ss / ((n - 1) as f64)
 }
 
@@ -3184,21 +3446,8 @@ pub fn rrblup_pcg_bed<'py>(
         .filter(|&v| v > 0)
         .unwrap_or(100usize);
 
-    let mut row_mean = vec![0.0_f32; m];
-    let mut row_inv_sd = vec![0.0_f32; m];
-    let mut m_effective = 0usize;
-    for j in 0..m {
-        let p = maf_keep[j].clamp(0.0, 0.5);
-        let mean = 2.0_f32 * p;
-        let var = (2.0_f32 * p * (1.0_f32 - p)).max(0.0);
-        row_mean[j] = mean;
-        if var > std_eps32 {
-            row_inv_sd[j] = 1.0_f32 / var.sqrt();
-            m_effective += 1;
-        } else {
-            row_inv_sd[j] = 0.0_f32;
-        }
-    }
+    let (row_mean, row_inv_sd, m_effective) =
+        rrblup_parallel_row_standardization(maf_keep.as_ref(), std_eps32, pool_ref);
 
     let y_mean = y_vec_f64.iter().sum::<f64>() / (n_train as f64);
     let y_center_f32: Vec<f32> = y_vec_f64.iter().map(|v| (*v - y_mean) as f32).collect();
@@ -3223,74 +3472,37 @@ pub fn rrblup_pcg_bed<'py>(
                 };
                 let _pcg_blas_guard = OpenBlasThreadGuard::enter(blas_threads_effective);
                 let stage_accum = Arc::new(Mutex::new(PcgStageTimingAccum::default()));
-                let mut b = vec![0.0_f32; m];
-                let mut diag_inv = vec![0.0_f32; m];
-                let mut sum_ss_global = 0.0_f64;
                 let prep_t0 = Instant::now();
-                let mut prep_decode_secs = 0.0_f64;
-                let mut prep_rhs_secs = 0.0_f64;
-                let mut prep_diag_secs = 0.0_f64;
-                {
-                    let resident_packed = resident_packed_flat.as_ref().map(|cow| cow.as_ref());
-                    let mut prep_source = build_rrblup_source(
-                        resident_packed,
-                        bytes_per_snp,
-                        prefix.as_str(),
-                        n_samples,
-                        row_step,
-                    )?;
-                    let mut block = vec![0.0_f32; row_step * n_train];
-                    let mut dot_blk = vec![0.0_f32; row_step];
-                    let mut tick = 0usize;
-                    for st in (0..m).step_by(row_step) {
-                        let ed = (st + row_step).min(m);
-                        let cur_rows = ed - st;
-                        let blk_slice = &mut block[..cur_rows * n_train];
-                        let t_decode = Instant::now();
-                        decode_standardized_block_f32(
-                            &mut prep_source,
-                            n_samples,
-                            row_flip_keep.as_ref(),
-                            &row_mean,
-                            &row_inv_sd,
-                            &train_idx,
-                            full_train_fast,
-                            packed_row_indices.as_deref(),
-                            st,
-                            blk_slice,
-                            &code4_lut,
-                            pool_ref,
-                        )?;
-                        prep_decode_secs += t_decode.elapsed().as_secs_f64();
-                        let t_rhs = Instant::now();
-                        row_major_block_mul_vec_f32(
-                            blk_slice,
-                            cur_rows,
-                            n_train,
-                            &y_center_f32,
-                            &mut dot_blk[..cur_rows],
-                            pool_ref,
-                        );
-                        prep_rhs_secs += t_rhs.elapsed().as_secs_f64();
-                        let t_diag = Instant::now();
-                        sum_ss_global += row_major_block_prepare_rhs_diag_f32(
-                            blk_slice,
-                            cur_rows,
-                            n_train,
-                            &dot_blk[..cur_rows],
-                            lambda_use,
-                            &mut b[st..ed],
-                            &mut diag_inv[st..ed],
-                            pool_ref,
-                        );
-                        prep_diag_secs += t_diag.elapsed().as_secs_f64();
-                        tick += cur_rows;
-                        if tick >= row_step.saturating_mul(64).max(1) {
-                            check_ctrlc()?;
-                            tick = 0;
-                        }
-                    }
-                }
+                let resident_packed = resident_packed_flat.as_ref().map(|cow| cow.as_ref());
+                let mut prep_source = build_rrblup_source(
+                    resident_packed,
+                    bytes_per_snp,
+                    prefix.as_str(),
+                    n_samples,
+                    row_step,
+                )?;
+                let (
+                    b,
+                    diag_inv,
+                    sum_ss_global,
+                    prep_decode_secs,
+                    prep_rhs_secs,
+                    prep_diag_secs,
+                ) = rrblup_prepare_rhs_diag(
+                    &mut prep_source,
+                    n_samples,
+                    row_flip_keep.as_ref(),
+                    &row_mean,
+                    &row_inv_sd,
+                    &train_idx,
+                    full_train_fast,
+                    packed_row_indices.as_deref(),
+                    row_step,
+                    &y_center_f32,
+                    lambda_use,
+                    &code4_lut,
+                    pool_ref,
+                )?;
                 if stage_timing {
                     let prep_total = prep_t0.elapsed().as_secs_f64().max(1e-12_f64);
                     let prep_decode_s = prep_decode_secs.max(0.0);
@@ -3475,17 +3687,25 @@ pub fn rrblup_pcg_bed<'py>(
                     };
 
                     if compute_trainvar {
-                        let mut g_hat = pred_train_f64.clone();
-                        for g in &mut g_hat {
-                            *g -= y_mean;
-                        }
-                        let resid: Vec<f64> = y_vec_f64
-                            .iter()
-                            .zip(pred_train_f64.iter())
-                            .map(|(y, p)| *y - *p)
-                            .collect();
-                        let var_g = sample_var_f64(&g_hat);
-                        let var_e = sample_var_f64(&resid);
+                        let resid: Vec<f64> =
+                            if let Some(tp) = pool_ref.filter(|_| y_vec_f64.len() >= RRBLUP_PAR_VEC_THRESHOLD)
+                            {
+                                tp.install(|| {
+                                    y_vec_f64
+                                        .par_iter()
+                                        .zip(pred_train_f64.par_iter())
+                                        .map(|(y, p)| *y - *p)
+                                        .collect()
+                                })
+                            } else {
+                                y_vec_f64
+                                    .iter()
+                                    .zip(pred_train_f64.iter())
+                                    .map(|(y, p)| *y - *p)
+                                    .collect()
+                            };
+                        let var_g = sample_var_f64(&pred_train_f64, pool_ref);
+                        let var_e = sample_var_f64(&resid, pool_ref);
                         let denom = var_g + var_e;
                         if denom.is_finite() && denom > 0.0 {
                             var_g / denom
@@ -3747,11 +3967,11 @@ mod tests {
                 expect: XtMulKernelStrategy::RowReduce,
             },
             XtMulBenchCase {
-                name: "blas_fallback_window",
+                name: "row_reduce_fallback_window",
                 rows: 1_024,
                 cols: 32_768,
                 threads: 16,
-                expect: XtMulKernelStrategy::Blas,
+                expect: XtMulKernelStrategy::RowReduce,
             },
         ];
 

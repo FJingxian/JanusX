@@ -4575,71 +4575,12 @@ def _estimate_rrblup_lambda_subsample_reml(
     he_enable = _cfg_truthy(cfg_use.get("he_enable", "on"), default=True)
     can_try_he = bool(
         he_enable
-        and
-        (_jxrs is not None)
+        and (_jxrs is not None)
         and hasattr(_jxrs, "he_pcg_bed")
-        and _looks_like_packed_payload(packed_ctx)
+        and _looks_like_packed_ctx(packed_ctx)
     )
     if can_try_he:
         try:
-            packed_src_view = np.asarray(packed_ctx["packed"], dtype=np.uint8)
-            packed_arg = np.ascontiguousarray(
-                packed_src_view,
-                dtype=np.uint8,
-            )
-            packed_is_lazy = _packed_ctx_is_lazy_full(packed_ctx)
-            maf_arg = np.ascontiguousarray(
-                np.asarray(packed_ctx["maf"], dtype=np.float32).reshape(-1),
-                dtype=np.float32,
-            )
-            n_samples_full = int(packed_ctx["n_samples"])
-            if packed_arg.ndim != 2:
-                raise ValueError("HE lambda-auto requires packed matrix with ndim=2.")
-            if int(maf_arg.shape[0]) != int(packed_arg.shape[0]):
-                raise ValueError("HE lambda-auto packed payload mismatch: maf length != packed SNP rows.")
-            exp_bps = (n_samples_full + 3) // 4
-            if int(packed_arg.shape[1]) != int(exp_bps):
-                raise ValueError(
-                    "HE lambda-auto packed payload mismatch: "
-                    f"bytes_per_snp={packed_arg.shape[1]} expected={exp_bps}."
-                )
-
-            row_flip_raw = packed_ctx.get("row_flip", None)
-            if row_flip_raw is None:
-                row_flip_arg = np.ascontiguousarray(
-                    np.asarray(
-                        _jxrs.bed_packed_row_flip_mask(packed_arg, int(n_samples_full)),  # type: ignore[union-attr]
-                        dtype=np.bool_,
-                    ).reshape(-1),
-                    dtype=np.bool_,
-                )
-                packed_ctx["row_flip"] = row_flip_arg
-            else:
-                row_flip_arg = np.ascontiguousarray(
-                    np.asarray(row_flip_raw, dtype=np.bool_).reshape(-1),
-                    dtype=np.bool_,
-                )
-            if int(row_flip_arg.shape[0]) != int(packed_arg.shape[0]):
-                raise ValueError("HE lambda-auto packed payload mismatch: row_flip length != packed SNP rows.")
-
-            site_keep_arg: np.ndarray | None = None
-            site_keep_raw = packed_ctx.get("site_keep", None)
-            if site_keep_raw is not None:
-                site_keep_arg = np.ascontiguousarray(
-                    np.asarray(site_keep_raw, dtype=np.bool_).reshape(-1),
-                    dtype=np.bool_,
-                )
-                if (not packed_is_lazy) and (int(site_keep_arg.shape[0]) != int(maf_arg.shape[0])):
-                    site_keep_arg = None
-            he_site_keep_mode, he_site_keep_note = _describe_he_site_keep_mode(
-                site_keep_raw,
-                site_keep_arg,
-                int(maf_arg.shape[0]),
-                packed_is_lazy=bool(packed_is_lazy),
-            )
-            he_diag["he_site_keep_mode"] = str(he_site_keep_mode)
-
-            source_prefix = str(packed_ctx.get("source_prefix", "") or "").strip()
             he_trace_samples = int(
                 max(
                     8,
@@ -4712,14 +4653,96 @@ def _estimate_rrblup_lambda_subsample_reml(
             he_diag["stage_blas_threads"] = int(he_thread_spec["blas_threads"])
             he_diag["stage_rayon_threads"] = int(he_thread_spec["rayon_threads"])
             he_diag["he_threads_arg"] = int(he_thread_spec["he_threads"])
+
+            n_samples_full = int(packed_ctx["n_samples"])
+            packed_is_lazy = _packed_ctx_is_lazy_full(packed_ctx)
+            source_prefix = str(packed_ctx.get("source_prefix", "") or "").strip()
+            packed_raw = packed_ctx.get("packed", None)
+            use_resident_packed = packed_raw is not None
+            site_keep_arg: np.ndarray | None = None
+            row_source_indices_arg: np.ndarray | None = None
+            he_mmap_window_mb: int | None = None
+            he_call_path = "external_packed"
+            he_call_api = "kwargs_blas_threads"
+            packed_arg: np.ndarray | None = None
+            packed_src_view: np.ndarray | None = None
+
+            if use_resident_packed:
+                packed_src_view = np.asarray(packed_raw, dtype=np.uint8)
+                packed_arg = np.ascontiguousarray(
+                    packed_src_view,
+                    dtype=np.uint8,
+                )
+                maf_arg = np.ascontiguousarray(
+                    np.asarray(packed_ctx["maf"], dtype=np.float32).reshape(-1),
+                    dtype=np.float32,
+                )
+                if packed_arg.ndim != 2:
+                    raise ValueError("HE lambda-auto requires packed matrix with ndim=2.")
+                if int(maf_arg.shape[0]) != int(packed_arg.shape[0]):
+                    raise ValueError("HE lambda-auto packed payload mismatch: maf length != packed SNP rows.")
+                exp_bps = (n_samples_full + 3) // 4
+                if int(packed_arg.shape[1]) != int(exp_bps):
+                    raise ValueError(
+                        "HE lambda-auto packed payload mismatch: "
+                        f"bytes_per_snp={packed_arg.shape[1]} expected={exp_bps}."
+                    )
+
+                row_flip_raw = packed_ctx.get("row_flip", None)
+                if row_flip_raw is None:
+                    row_flip_arg = np.ascontiguousarray(
+                        np.asarray(
+                            _jxrs.bed_packed_row_flip_mask(packed_arg, int(n_samples_full)),  # type: ignore[union-attr]
+                            dtype=np.bool_,
+                        ).reshape(-1),
+                        dtype=np.bool_,
+                    )
+                    packed_ctx["row_flip"] = row_flip_arg
+                else:
+                    row_flip_arg = np.ascontiguousarray(
+                        np.asarray(row_flip_raw, dtype=np.bool_).reshape(-1),
+                        dtype=np.bool_,
+                    )
+                if int(row_flip_arg.shape[0]) != int(packed_arg.shape[0]):
+                    raise ValueError("HE lambda-auto packed payload mismatch: row_flip length != packed SNP rows.")
+
+                site_keep_raw = packed_ctx.get("site_keep", None)
+                if site_keep_raw is not None:
+                    site_keep_arg = np.ascontiguousarray(
+                        np.asarray(site_keep_raw, dtype=np.bool_).reshape(-1),
+                        dtype=np.bool_,
+                    )
+                    if (not packed_is_lazy) and (int(site_keep_arg.shape[0]) != int(maf_arg.shape[0])):
+                        site_keep_arg = None
+                he_site_keep_mode, he_site_keep_note = _describe_he_site_keep_mode(
+                    site_keep_raw,
+                    site_keep_arg,
+                    int(maf_arg.shape[0]),
+                    packed_is_lazy=bool(packed_is_lazy),
+                )
+            else:
+                (
+                    source_prefix,
+                    site_keep_arg,
+                    row_source_indices_arg,
+                    row_flip_arg,
+                    maf_arg,
+                    he_mmap_window_mb,
+                ) = _packed_gblup_stream_metadata(
+                    packed_ctx,
+                    block_rows=int(he_block_rows),
+                )
+                he_call_path = "metadata_stream"
+                he_site_keep_mode, he_site_keep_note = _describe_he_site_keep_mode(
+                    packed_ctx.get("site_keep", None),
+                    site_keep_arg,
+                    int(row_source_indices_arg.shape[0]),
+                    packed_is_lazy=bool(packed_is_lazy),
+                )
+            he_diag["he_site_keep_mode"] = str(he_site_keep_mode)
+
             he_rss_before: int | None = None
             if he_debug_mode:
-                packed_c_contig = bool(getattr(packed_arg, "flags", {}).c_contiguous)
-                packed_same_obj = bool(packed_arg is packed_src_view)
-                try:
-                    packed_shares_memory = bool(np.shares_memory(packed_arg, packed_src_view))
-                except Exception:
-                    packed_shares_memory = False
                 he_block_bytes = int(int(he_block_rows) * int(n_train) * np.dtype(np.float32).itemsize)
                 he_probe_bytes = int(
                     int(n_train) * int(he_trace_probe_batch) * np.dtype(np.float32).itemsize
@@ -4732,28 +4755,55 @@ def _estimate_rrblup_lambda_subsample_reml(
                     ),
                     flush=True,
                 )
-                print(
-                    (
-                        "[rrBLUP-DEBUG] HE packed payload "
-                        f"rows={int(packed_arg.shape[0])} "
-                        f"bytes_per_snp={int(packed_arg.shape[1])} "
-                        f"c_contig={int(packed_c_contig)} "
-                        f"shared_with_ctx={int(packed_shares_memory)} "
-                        f"same_obj={int(packed_same_obj)} "
-                        f"nbytes={_format_debug_bytes(int(packed_arg.nbytes))}"
-                    ),
-                    flush=True,
-                )
-                print(
-                    (
-                        "[rrBLUP-DEBUG] HE workspace estimate "
-                        f"packed={_format_debug_bytes(int(packed_arg.nbytes))} "
-                        f"block={_format_debug_bytes(he_block_bytes)} "
-                        f"probe={_format_debug_bytes(he_probe_bytes)} x2 "
-                        f"rss_before={_format_debug_bytes(he_rss_before)}"
-                    ),
-                    flush=True,
-                )
+                if use_resident_packed:
+                    packed_c_contig = bool(getattr(packed_arg, "flags", {}).c_contiguous)
+                    packed_same_obj = bool(packed_arg is packed_src_view)
+                    try:
+                        packed_shares_memory = bool(np.shares_memory(packed_arg, packed_src_view))
+                    except Exception:
+                        packed_shares_memory = False
+                    print(
+                        (
+                            "[rrBLUP-DEBUG] HE packed payload "
+                            f"rows={int(packed_arg.shape[0])} "
+                            f"bytes_per_snp={int(packed_arg.shape[1])} "
+                            f"c_contig={int(packed_c_contig)} "
+                            f"shared_with_ctx={int(packed_shares_memory)} "
+                            f"same_obj={int(packed_same_obj)} "
+                            f"nbytes={_format_debug_bytes(int(packed_arg.nbytes))}"
+                        ),
+                        flush=True,
+                    )
+                    print(
+                        (
+                            "[rrBLUP-DEBUG] HE workspace estimate "
+                            f"packed={_format_debug_bytes(int(packed_arg.nbytes))} "
+                            f"block={_format_debug_bytes(he_block_bytes)} "
+                            f"probe={_format_debug_bytes(he_probe_bytes)} x2 "
+                            f"rss_before={_format_debug_bytes(he_rss_before)}"
+                        ),
+                        flush=True,
+                    )
+                else:
+                    print(
+                        (
+                            "[rrBLUP-DEBUG] HE metadata stream "
+                            f"rows={int(row_source_indices_arg.shape[0])} "
+                            f"window_mb={int(he_mmap_window_mb)} "
+                            f"source_prefix={source_prefix}"
+                        ),
+                        flush=True,
+                    )
+                    print(
+                        (
+                            "[rrBLUP-DEBUG] HE workspace estimate "
+                            f"packed=streamed "
+                            f"block={_format_debug_bytes(he_block_bytes)} "
+                            f"probe={_format_debug_bytes(he_probe_bytes)} x2 "
+                            f"rss_before={_format_debug_bytes(he_rss_before)}"
+                        ),
+                        flush=True,
+                    )
 
             _emit(
                 "pcg_lambda_vc_start",
@@ -4771,7 +4821,6 @@ def _estimate_rrblup_lambda_subsample_reml(
                     rayon_threads=int(he_thread_spec["rayon_threads"]),
                 ):
                     he_call_kwargs = dict(
-                        site_keep=site_keep_arg,
                         trace_samples=int(he_trace_samples),
                         trace_probe_batch=int(he_trace_probe_batch),
                         tol=float(he_tol),
@@ -4782,11 +4831,16 @@ def _estimate_rrblup_lambda_subsample_reml(
                         threads=int(he_thread_spec["he_threads"]),
                         blas_threads=int(he_thread_spec["blas_threads"]),
                         seed=int(he_seed),
-                        packed=packed_arg,
-                        packed_n_samples=int(n_samples_full),
                         maf=maf_arg,
                         row_flip=row_flip_arg,
                     )
+                    if use_resident_packed:
+                        he_call_kwargs["site_keep"] = site_keep_arg
+                        he_call_kwargs["packed"] = packed_arg
+                        he_call_kwargs["packed_n_samples"] = int(n_samples_full)
+                    else:
+                        he_call_kwargs["row_source_indices"] = row_source_indices_arg
+                        he_call_kwargs["mmap_window_mb"] = int(he_mmap_window_mb)
                     try:
                         he_out = _jxrs.he_pcg_bed(  # type: ignore[union-attr]
                             source_prefix,
@@ -4795,8 +4849,8 @@ def _estimate_rrblup_lambda_subsample_reml(
                             **he_call_kwargs,
                         )
                         _emit_he_call_path(
-                            "external_packed",
-                            "kwargs_blas_threads",
+                            str(he_call_path),
+                            str(he_call_api),
                         )
                     except TypeError:
                         he_call_kwargs.pop("blas_threads", None)
@@ -4808,30 +4862,38 @@ def _estimate_rrblup_lambda_subsample_reml(
                                 **he_call_kwargs,
                             )
                             _emit_he_call_path(
-                                "external_packed",
+                                str(he_call_path),
                                 "kwargs_no_blas_threads",
                                 note="extension_missing_he_blas_threads_kw",
                             )
                         except TypeError:
-                            _emit_he_call_path(
-                                "legacy_prefix_reload",
-                                "legacy_positional",
-                                note="extension_missing_packed_he_signature",
-                            )
-                            he_out = _jxrs.he_pcg_bed(  # type: ignore[union-attr]
-                                source_prefix,
-                                train_abs,
-                                y_vec,
-                                site_keep_arg,
-                                int(he_trace_samples),
-                                float(he_tol),
-                                int(he_max_iter),
-                                int(he_block_rows),
-                                float(std_eps),
-                                bool(he_use_train_maf),
-                                int(he_thread_spec["he_threads"]),
-                                int(he_seed),
-                            )
+                            if use_resident_packed:
+                                _emit_he_call_path(
+                                    "legacy_prefix_reload",
+                                    "legacy_positional",
+                                    note="extension_missing_packed_he_signature",
+                                )
+                                he_out = _jxrs.he_pcg_bed(  # type: ignore[union-attr]
+                                    source_prefix,
+                                    train_abs,
+                                    y_vec,
+                                    site_keep_arg,
+                                    int(he_trace_samples),
+                                    float(he_tol),
+                                    int(he_max_iter),
+                                    int(he_block_rows),
+                                    float(std_eps),
+                                    bool(he_use_train_maf),
+                                    int(he_thread_spec["he_threads"]),
+                                    int(he_seed),
+                                )
+                            else:
+                                _emit_he_call_path(
+                                    "metadata_stream",
+                                    "kwargs_missing_stream_signature",
+                                    note="extension_missing_stream_he_signature",
+                                )
+                                raise
             finally:
                 if he_debug_mode:
                     he_rss_after = _get_process_rss_bytes()

@@ -967,15 +967,20 @@ def _plot_and_save_effect(
     fmts: list[str],
     saved_paths: list[str],
     x_label: Optional[str] = None,
+    fullscatter: bool = False,
 ) -> str:
     effect_col = _resolve_effect_col(
         effect_df,
         hint_cols=[effect_hint] if effect_hint is not None else [],
     )
-    plot_df = _compress_effect_table(
-        effect_df,
-        effect_col=effect_col,
-        max_points=_POSTGS_EFFECT_PANEL_TARGET_POINTS,
+    plot_df = (
+        effect_df.reset_index(drop=True)
+        if bool(fullscatter)
+        else _compress_effect_table(
+            effect_df,
+            effect_col=effect_col,
+            max_points=_POSTGS_EFFECT_PANEL_TARGET_POINTS,
+        )
     )
     fig = plt.figure(figsize=fig_size, dpi=300)
     ax = fig.add_subplot(111)
@@ -1010,6 +1015,7 @@ def _plot_and_save_trait_effect_panels(
     fmts: list[str],
     saved_paths: list[str],
     x_label: str,
+    fullscatter: bool = False,
 ) -> bool:
     n_signed = len(signed_panels)
     has_merged = merged_df is not None and isinstance(merged_df, pd.DataFrame) and merged_df.shape[0] > 0
@@ -1032,10 +1038,14 @@ def _plot_and_save_trait_effect_panels(
         eff_df = panel.get("effect_df", None)
         eff_col = panel.get("effect_col", None)
         if isinstance(eff_df, pd.DataFrame):
-            plot_df = _compress_effect_table(
-                eff_df,
-                effect_col=str(eff_col) if eff_col is not None else _resolve_effect_col(eff_df, hint_cols=[]),
-                max_points=_POSTGS_EFFECT_PANEL_TARGET_POINTS,
+            plot_df = (
+                eff_df.reset_index(drop=True)
+                if bool(fullscatter)
+                else _compress_effect_table(
+                    eff_df,
+                    effect_col=str(eff_col) if eff_col is not None else _resolve_effect_col(eff_df, hint_cols=[]),
+                    max_points=_POSTGS_EFFECT_PANEL_TARGET_POINTS,
+                )
             )
             gsplot.plot_signed_effect(
                 plot_df,
@@ -1065,11 +1075,15 @@ def _plot_and_save_trait_effect_panels(
 
     if has_merged:
         ax = ax_list[idx]
-        merged_plot_df = _compress_effect_table(
-            merged_df,
-            effect_col="Effect",
-            max_points=_POSTGS_EFFECT_MERGED_TARGET_POINTS,
-            group_col="Model",
+        merged_plot_df = (
+            merged_df.reset_index(drop=True)
+            if bool(fullscatter)
+            else _compress_effect_table(
+                merged_df,
+                effect_col="Effect",
+                max_points=_POSTGS_EFFECT_MERGED_TARGET_POINTS,
+                group_col="Model",
+            )
         )
         gsplot.plot_effect_models_layered(
             merged_plot_df,
@@ -1249,6 +1263,19 @@ def main() -> None:
         type=float,
         default=4.0,
         help="Base scatter size control for effect plots (runtime scatter uses scaled size).",
+    )
+    opt.add_argument(
+        "-full",
+        "--full",
+        "-fullscatter",
+        "--fullscatter",
+        dest="fullscatter",
+        action="store_true",
+        default=False,
+        help=(
+            "Disable effect scatter compression and draw all marker-effect points "
+            "(single panels, merged panels, and standalone -effect plots)."
+        ),
     )
     args, extras = parser.parse_known_args()
     if len(extras) > 0:
@@ -1467,6 +1494,7 @@ def main() -> None:
                 fmts=fmts,
                 saved_paths=saved_paths,
                 x_label=trait_xlabel,
+                fullscatter=bool(args.fullscatter),
             )
             phase2.ok("Combined effect panel", time.time() - step_t0)
         else:
@@ -1492,6 +1520,7 @@ def main() -> None:
             fmts=fmts,
             saved_paths=saved_paths,
             x_label="manual (n=NA, m=NA)",
+            fullscatter=bool(args.fullscatter),
         )
         _log_step_ok(logger, "Standalone signed effect", time.time() - step_t0)
     elif args.effect is not None and not do_manh:

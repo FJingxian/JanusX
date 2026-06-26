@@ -3338,7 +3338,7 @@ def prepare_streaming_context(
                     delimiter=delim,
                     prefer_plink_for_txt=True,
                     force_kind=force_kind,
-                    threads=int(args.thread),
+                    threads=int(max(1, int(threads))),
                 )
             )
             cached_prefix = _as_plink_prefix(cached_cli)

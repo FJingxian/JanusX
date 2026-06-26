@@ -45,7 +45,7 @@ use crate::gfreader::{
     count_packed_row_counts, count_packed_row_counts_selected_with_excluded,
     prepare_bed_logic_meta_owned_for_stats_samples,
 };
-use crate::gload::{GenotypeMatrix, UnifiedInput, WindowedBedMatrix};
+use crate::gload::{GenotypeMatrix, GlobalStats, UnifiedInput, WindowedBedMatrix};
 use crate::he::row_major_block_mul_mat_f32;
 use crate::linalg::{chi2_sf_df1, cholesky_inplace, cholesky_solve_into};
 use crate::pcg::{
@@ -5046,6 +5046,285 @@ impl GenotypeMatrix for SplmmPreparedMatrixAdapter<'_> {
             ),
         }
     }
+}
+
+/// Dense SNP-major matrix adapter for exact SparseLMM scans.
+///
+/// This is intentionally additive-only and exists purely as a thin wrapper so
+/// Python-facing APIs can reuse the exact sparse-factor scan core on arbitrary
+/// dense floating-point matrices without routing through BED decode.
+struct DenseRowMajorF32Matrix {
+    data: Vec<f32>,
+    n_rows: usize,
+    n_cols: usize,
+}
+
+impl DenseRowMajorF32Matrix {
+    #[inline]
+    fn row_slice(&self, row_idx: usize) -> &[f32] {
+        let start = row_idx.saturating_mul(self.n_cols);
+        &self.data[start..start + self.n_cols]
+    }
+}
+
+impl GenotypeMatrix for DenseRowMajorF32Matrix {
+    fn n_samples_full(&self) -> usize {
+        self.n_cols
+    }
+
+    fn bytes_per_snp(&self) -> usize {
+        0usize
+    }
+
+    fn packed_flat(&self) -> &[u8] {
+        &[]
+    }
+
+    fn source_row_bytes(&self, _source_idx: usize) -> &[u8] {
+        &[]
+    }
+
+    fn decode_additive_block(
+        &mut self,
+        _stats: &GlobalStats,
+        row_start: usize,
+        out: &mut [f32],
+        sample_idx: &[usize],
+        sample_identity: bool,
+        pool: Option<&Arc<rayon::ThreadPool>>,
+    ) -> Result<(), String> {
+        let cols = if sample_identity {
+            self.n_cols
+        } else {
+            sample_idx.len()
+        };
+        let rows_here = out.len().saturating_div(cols.max(1));
+        if rows_here == 0 {
+            return Ok(());
+        }
+        if row_start.saturating_add(rows_here) > self.n_rows {
+            return Err(format!(
+                "Dense SparseLMM block out of bounds: row_start={row_start}, rows_here={rows_here}, n_rows={}",
+                self.n_rows
+            ));
+        }
+        if sample_identity {
+            let mut run_copy = || {
+                out.par_chunks_mut(cols)
+                    .enumerate()
+                    .for_each(|(local_row, dst)| dst.copy_from_slice(self.row_slice(row_start + local_row)));
+            };
+            if let Some(tp) = pool {
+                tp.install(run_copy);
+            } else {
+                run_copy();
+            }
+            return Ok(());
+        }
+        if sample_idx.iter().any(|&idx| idx >= self.n_cols) {
+            return Err(format!(
+                "Dense SparseLMM sample index exceeds matrix width: n_cols={}",
+                self.n_cols
+            ));
+        }
+        let mut run_gather = || {
+            out.par_chunks_mut(cols).enumerate().for_each(|(local_row, dst)| {
+                let src = self.row_slice(row_start + local_row);
+                for (j, &sample_col) in sample_idx.iter().enumerate() {
+                    dst[j] = src[sample_col];
+                }
+            });
+        };
+        if let Some(tp) = pool {
+            tp.install(run_gather);
+        } else {
+            run_gather();
+        }
+        Ok(())
+    }
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    g,
+    y,
+    lbd,
+    sparse_jxgrm_path,
+    x_cov=None,
+    sparse_sample_indices=None,
+    threads=0,
+    block_rows=0
+))]
+pub fn splmm_assoc_pcg_dense_f32<'py>(
+    py: Python<'py>,
+    g: PyReadonlyArray2<'py, f32>,
+    y: PyReadonlyArray1<'py, f64>,
+    lbd: f64,
+    sparse_jxgrm_path: String,
+    x_cov: Option<PyReadonlyArray2<'py, f64>>,
+    sparse_sample_indices: Option<PyReadonlyArray1<'py, i64>>,
+    threads: usize,
+    block_rows: usize,
+) -> PyResult<Bound<'py, PyArray2<f64>>> {
+    if !(lbd.is_finite() && lbd >= 0.0) {
+        return Err(PyRuntimeError::new_err("lbd must be finite and >= 0"));
+    }
+
+    let g_arr = g.as_array();
+    if g_arr.ndim() != 2 {
+        return Err(PyRuntimeError::new_err("g must be 2D SNP-major (m, n)"));
+    }
+    let (m, n) = (g_arr.shape()[0], g_arr.shape()[1]);
+    if n == 0 || m == 0 {
+        return Err(PyRuntimeError::new_err(
+            "g must have positive shape (m > 0, n > 0)",
+        ));
+    }
+
+    let y_vec = y.as_slice()?.to_vec();
+    if y_vec.len() != n {
+        return Err(PyRuntimeError::new_err(format!(
+            "Dense SparseLMM requires len(y) to equal g.shape[1], got len(y)={} and n={n}",
+            y_vec.len()
+        )));
+    }
+
+    let (x_cov_owned, p_cov) = if let Some(x_cov) = &x_cov {
+        let x_arr = x_cov.as_array();
+        if x_arr.ndim() != 2 {
+            return Err(PyRuntimeError::new_err("x_cov must be 2D (n, p_cov)"));
+        }
+        let (xn, xp) = (x_arr.shape()[0], x_arr.shape()[1]);
+        if xn != n {
+            return Err(PyRuntimeError::new_err(format!(
+                "x_cov row count mismatch: got {xn}, expected {n}"
+            )));
+        }
+        let owned = match x_cov.as_slice() {
+            Ok(s) => s.to_vec(),
+            Err(_) => x_arr.iter().copied().collect(),
+        };
+        (Some(owned), xp)
+    } else {
+        (None, 0usize)
+    };
+    let x_design = build_design_with_intercept(x_cov_owned.as_deref(), n, p_cov);
+    let p = p_cov + 1;
+    if n <= p {
+        return Err(PyRuntimeError::new_err(format!(
+            "Dense SparseLMM requires n > p, got n={n}, p={p}"
+        )));
+    }
+
+    let g_owned = match g.as_slice() {
+        Ok(s) => s.to_vec(),
+        Err(_) => g_arr.iter().copied().collect(),
+    };
+
+    let sparse_n =
+        sparse_jxgrm_header_n_samples(&sparse_jxgrm_path).map_err(PyRuntimeError::new_err)?;
+    let sparse_factor_sample_idx = parse_optional_index_array(
+        sparse_sample_indices.as_ref(),
+        sparse_n,
+        "sparse_sample_indices",
+    )?;
+    let sparse_expected_n = sparse_factor_sample_idx
+        .as_ref()
+        .map(|idx| idx.len())
+        .unwrap_or(n);
+    if sparse_expected_n != n {
+        return Err(PyRuntimeError::new_err(format!(
+            "Dense SparseLMM scan requires factor subset n to match g/y n; factor_n={}, y_n={n}",
+            sparse_expected_n
+        )));
+    }
+
+    let threads_use = threads.max(1);
+    let scan_sample_idx: Vec<usize> = (0..n).collect();
+    let row_source_indices: Vec<usize> = (0..m).collect();
+    let row_zeros_f32 = vec![0.0_f32; m];
+    let row_false = vec![false; m];
+    let g_stats = GlobalStats {
+        maf: row_zeros_f32.clone(),
+        miss: row_zeros_f32,
+        row_flip: row_false,
+        row_source_indices,
+        site_keep: Vec::new(),
+        n_samples_full: n,
+        n_markers_total: m,
+        bytes_per_snp: 0usize,
+    };
+
+    let out = py
+        .detach(move || {
+            let factor = sparse_splmm_load_factor(
+                "",
+                Some(&sparse_jxgrm_path),
+                sparse_expected_n,
+                sparse_factor_sample_idx
+                    .as_deref()
+                    .unwrap_or(scan_sample_idx.as_slice()),
+                lbd,
+                threads_use,
+                None,
+            )?;
+
+            let scan_block_hint = block_rows.max(512).max(1);
+            let est_block_rows = adaptive_exact_block_rows(
+                adaptive_grm_block_rows(scan_block_hint, m, n, 0usize, threads_use).max(1),
+                n,
+            );
+            let solve_cap = est_block_rows.max(p).max(1);
+            let mut solve_workspace = factor.make_solve_workspace(solve_cap)?;
+            let null_state = build_sparse_splmm_null_state(
+                &factor,
+                x_design.as_slice(),
+                y_vec.as_slice(),
+                &mut solve_workspace,
+                None,
+            )?;
+
+            let mut input = UnifiedInput {
+                matrix: DenseRowMajorF32Matrix {
+                    data: g_owned,
+                    n_rows: m,
+                    n_cols: n,
+                },
+                stats: g_stats,
+            };
+            let mut out = vec![0.0_f64; m.saturating_mul(3)];
+            let mut sink = |row_start: usize, rows_here: usize, block: &[f64]| {
+                out[row_start * 3..][..rows_here * 3].copy_from_slice(block);
+                Ok(())
+            };
+            exact_scan_blocks_core(
+                &factor,
+                &mut input,
+                x_design.as_slice(),
+                null_state.x_design_col_major.as_slice(),
+                null_state.null_model.py.as_slice(),
+                null_state.null_model.ypy,
+                null_state.null_model.df,
+                null_state.null_model.xt_w_x_chol.as_slice(),
+                scan_sample_idx.as_slice(),
+                PackedGeneticModel::Add,
+                threads_use,
+                block_rows,
+                None,
+                0usize,
+                9usize,
+                0usize,
+                0usize,
+                &mut solve_workspace,
+                &mut sink,
+            )?;
+            Ok::<Vec<f64>, String>(out)
+        })
+        .map_err(PyRuntimeError::new_err)?;
+
+    let out_arr = numpy::ndarray::Array2::from_shape_vec((m, 3), out)
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    Ok(PyArray2::from_owned_array(py, out_arr))
 }
 
 #[cfg(test)]

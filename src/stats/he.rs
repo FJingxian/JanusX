@@ -13,6 +13,7 @@ use crate::blas::{
     cblas_sgemm_dispatch, CblasInt, OpenBlasThreadGuard, CBLAS_NO_TRANS, CBLAS_ROW_MAJOR,
     CBLAS_TRANS,
 };
+use crate::gload::WindowedBedMatrix;
 use crate::linalg::{cholesky_inplace, cholesky_solve_into};
 use crate::packed::bed_packed_row_flip_mask;
 use crate::stats_common::{env_truthy, get_cached_pool, map_err_string_to_py, parse_index_vec_i64};
@@ -116,6 +117,55 @@ impl HeApplyTiming {
 
 const SMALL_RHS_PAR_ROW_BLOCK: usize = 64;
 const SMALL_RHS_PAR_COL_BLOCK: usize = 256;
+
+enum HeGrmSource<'a> {
+    Resident {
+        packed_flat: &'a [u8],
+        bytes_per_snp: usize,
+    },
+    Windowed {
+        matrix: WindowedBedMatrix,
+        bytes_per_snp: usize,
+    },
+}
+
+impl HeGrmSource<'_> {
+    #[inline]
+    fn bytes_per_snp(&self) -> usize {
+        match self {
+            Self::Resident { bytes_per_snp, .. } | Self::Windowed { bytes_per_snp, .. } => {
+                *bytes_per_snp
+            }
+        }
+    }
+
+    #[inline]
+    fn total_rows(&self) -> usize {
+        match self {
+            Self::Resident {
+                packed_flat,
+                bytes_per_snp,
+            } => packed_flat.len() / (*bytes_per_snp).max(1),
+            Self::Windowed { matrix, .. } => matrix.n_source_snps(),
+        }
+    }
+}
+
+#[inline]
+fn he_stream_window_mb(
+    block_rows: usize,
+    bytes_per_snp: usize,
+    mmap_window_mb: Option<usize>,
+) -> usize {
+    if let Some(v) = mmap_window_mb {
+        return v.max(1);
+    }
+    let need_bytes = block_rows
+        .max(1)
+        .saturating_mul(bytes_per_snp.max(1))
+        .max(1);
+    need_bytes.div_ceil(1024 * 1024).max(1)
+}
 
 fn emit_he_stage_timing(
     label: &str,
@@ -631,6 +681,122 @@ pub fn build_row_standardization_stats(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+fn build_row_standardization_stats_from_source(
+    source: &mut HeGrmSource<'_>,
+    row_flip: &[bool],
+    row_maf: &[f32],
+    sample_idx: &[usize],
+    row_source_indices: Option<&[usize]>,
+    block_rows: usize,
+    std_eps32: f32,
+    use_train_maf: bool,
+    compute_sample_diag: bool,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) -> Result<RowStdStats, String> {
+    let m = row_flip.len();
+    if row_maf.len() != m {
+        return Err("build_row_standardization_stats_from_source: row metadata length mismatch"
+            .to_string());
+    }
+    if let Some(row_idx) = row_source_indices {
+        if row_idx.len() != m {
+            return Err(
+                "build_row_standardization_stats_from_source: row source index length mismatch"
+                    .to_string(),
+            );
+        }
+        if row_idx.iter().any(|&idx| idx >= source.total_rows()) {
+            return Err(
+                "build_row_standardization_stats_from_source: row source index out of bounds"
+                    .to_string(),
+            );
+        }
+    } else if source.total_rows() < m {
+        return Err("build_row_standardization_stats_from_source: source has fewer rows than row metadata"
+            .to_string());
+    } else if matches!(source, HeGrmSource::Resident { .. }) && source.total_rows() != m {
+        return Err("build_row_standardization_stats_from_source: resident packed row count mismatch"
+            .to_string());
+    }
+
+    let row_step = block_rows.max(1).min(m.max(1));
+    let bytes_per_snp = source.bytes_per_snp();
+    let mut row_mean = vec![0.0_f32; m];
+    let mut row_inv_sd = vec![0.0_f32; m];
+    let mut sample_diag_sum = if compute_sample_diag {
+        Some(vec![0.0_f32; sample_idx.len()])
+    } else {
+        None
+    };
+    let mut m_effective = 0usize;
+    let mut rel_indices = Vec::<usize>::with_capacity(row_step);
+    let mut source_rows_tmp = Vec::<usize>::with_capacity(row_step);
+
+    for st in (0..m).step_by(row_step) {
+        let ed = (st + row_step).min(m);
+        let cur_rows = ed - st;
+        let chunk = match source {
+            HeGrmSource::Resident { packed_flat, .. } => build_row_standardization_stats_with_options(
+                packed_flat,
+                bytes_per_snp,
+                &row_flip[st..ed],
+                &row_maf[st..ed],
+                sample_idx,
+                row_source_indices.map(|idx| &idx[st..ed]),
+                std_eps32,
+                use_train_maf,
+                compute_sample_diag,
+                pool,
+                None::<&mut fn(usize, usize) -> Result<(), String>>,
+                0,
+            )?,
+            HeGrmSource::Windowed { matrix, .. } => {
+                let source_rows = if let Some(idx) = row_source_indices {
+                    &idx[st..ed]
+                } else {
+                    source_rows_tmp.clear();
+                    source_rows_tmp.extend(st..ed);
+                    source_rows_tmp.as_slice()
+                };
+                let packed_slice = matrix.prepare_source_rows(source_rows, &mut rel_indices)?;
+                build_row_standardization_stats_with_options(
+                    packed_slice,
+                    bytes_per_snp,
+                    &row_flip[st..ed],
+                    &row_maf[st..ed],
+                    sample_idx,
+                    Some(rel_indices.as_slice()),
+                    std_eps32,
+                    use_train_maf,
+                    compute_sample_diag,
+                    pool,
+                    None::<&mut fn(usize, usize) -> Result<(), String>>,
+                    0,
+                )?
+            }
+        };
+        row_mean[st..ed].copy_from_slice(chunk.row_mean.as_slice());
+        row_inv_sd[st..ed].copy_from_slice(chunk.row_inv_sd.as_slice());
+        m_effective += chunk.m_effective;
+        if let (Some(dst), Some(src)) = (sample_diag_sum.as_mut(), chunk.sample_diag_sum.as_ref()) {
+            for (dst_v, src_v) in dst.iter_mut().zip(src.iter()) {
+                *dst_v += *src_v;
+            }
+        }
+        if cur_rows == 0 {
+            break;
+        }
+    }
+
+    Ok(RowStdStats {
+        row_mean,
+        row_inv_sd,
+        m_effective,
+        sample_diag_sum,
+    })
+}
+
 #[inline]
 fn he_residual_sq_2x2(a00: f64, a01: f64, a11: f64, b0: f64, b1: f64, x0: f64, x1: f64) -> f64 {
     let r0 = a00.mul_add(x0, a01 * x1) - b0;
@@ -984,6 +1150,7 @@ pub(crate) fn row_major_block_t_mul_mat_accum_f32(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 fn decode_standardized_block_f32(
     packed_flat: &[u8],
     bytes_per_snp: usize,
@@ -1017,16 +1184,15 @@ fn decode_standardized_block_f32(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn apply_grm_to_mat_f32_with_workspace(
-    packed_flat: &[u8],
-    bytes_per_snp: usize,
+fn apply_grm_to_mat_f32_with_workspace_from_source(
+    source: &mut HeGrmSource<'_>,
     n_samples: usize,
     row_flip: &[bool],
     row_mean: &[f32],
     row_inv_sd: &[f32],
     sample_idx: &[usize],
     full_sample_fast: bool,
-    packed_row_indices: Option<&[usize]>,
+    row_source_indices: Option<&[usize]>,
     block_rows: usize,
     rhs: &[f32], // row-major (n_out, n_rhs)
     n_rhs: usize,
@@ -1039,6 +1205,36 @@ pub(crate) fn apply_grm_to_mat_f32_with_workspace(
 ) -> Result<(), String> {
     let m = row_flip.len();
     let n_out = sample_idx.len();
+    if row_mean.len() != m || row_inv_sd.len() != m {
+        return Err(
+            "apply_grm_to_mat_f32_with_workspace_from_source row stats length mismatch"
+                .to_string(),
+        );
+    }
+    if let Some(row_idx) = row_source_indices {
+        if row_idx.len() != m {
+            return Err(
+                "apply_grm_to_mat_f32_with_workspace_from_source row source index length mismatch"
+                    .to_string(),
+            );
+        }
+        if row_idx.iter().any(|&idx| idx >= source.total_rows()) {
+            return Err(
+                "apply_grm_to_mat_f32_with_workspace_from_source row source index out of bounds"
+                    .to_string(),
+            );
+        }
+    } else if source.total_rows() < m {
+        return Err(
+            "apply_grm_to_mat_f32_with_workspace_from_source source row count mismatch"
+                .to_string(),
+        );
+    } else if matches!(source, HeGrmSource::Resident { .. }) && source.total_rows() != m {
+        return Err(
+            "apply_grm_to_mat_f32_with_workspace_from_source resident packed row count mismatch"
+                .to_string(),
+        );
+    }
     if rhs.len() != n_out.saturating_mul(n_rhs) {
         return Err(format!(
             "apply_grm_to_mat_f32_with_workspace RHS length mismatch: got {}, expected {}",
@@ -1061,31 +1257,61 @@ pub(crate) fn apply_grm_to_mat_f32_with_workspace(
         return Ok(());
     }
     let row_step = block_rows.max(1).min(m.max(1));
+    let bytes_per_snp = source.bytes_per_snp();
     workspace.ensure(row_step, n_out, n_rhs);
     let mut decode_acc = 0.0_f64;
     let mut xmul_acc = 0.0_f64;
     let mut xtmul_acc = 0.0_f64;
+    let mut rel_indices = Vec::<usize>::with_capacity(row_step);
+    let mut source_rows_tmp = Vec::<usize>::with_capacity(row_step);
 
     for st in (0..m).step_by(row_step) {
         let ed = (st + row_step).min(m);
         let cur_rows = ed - st;
         let blk_slice = &mut workspace.block[..cur_rows * n_out];
         let t_decode = Instant::now();
-        decode_standardized_block_f32(
-            packed_flat,
-            bytes_per_snp,
-            n_samples,
-            row_flip,
-            row_mean,
-            row_inv_sd,
-            sample_idx,
-            full_sample_fast,
-            packed_row_indices,
-            st,
-            blk_slice,
-            code4_lut,
-            pool,
-        )?;
+        match source {
+            HeGrmSource::Resident { packed_flat, .. } => decode_standardized_packed_block_rows_f32(
+                packed_flat,
+                bytes_per_snp,
+                n_samples,
+                &row_flip[st..ed],
+                &row_mean[st..ed],
+                &row_inv_sd[st..ed],
+                sample_idx,
+                full_sample_fast,
+                row_source_indices.map(|idx| &idx[st..ed]),
+                0,
+                blk_slice,
+                code4_lut,
+                pool,
+            )?,
+            HeGrmSource::Windowed { matrix, .. } => {
+                let source_rows = if let Some(idx) = row_source_indices {
+                    &idx[st..ed]
+                } else {
+                    source_rows_tmp.clear();
+                    source_rows_tmp.extend(st..ed);
+                    source_rows_tmp.as_slice()
+                };
+                let packed_slice = matrix.prepare_source_rows(source_rows, &mut rel_indices)?;
+                decode_standardized_packed_block_rows_f32(
+                    packed_slice,
+                    bytes_per_snp,
+                    n_samples,
+                    &row_flip[st..ed],
+                    &row_mean[st..ed],
+                    &row_inv_sd[st..ed],
+                    sample_idx,
+                    full_sample_fast,
+                    Some(rel_indices.as_slice()),
+                    0,
+                    blk_slice,
+                    code4_lut,
+                    pool,
+                )?;
+            }
+        }
         decode_acc += t_decode.elapsed().as_secs_f64();
         let tmp_slice = &mut workspace.tmp[..cur_rows * n_rhs];
         let t_xmul = Instant::now();
@@ -1108,6 +1334,101 @@ pub(crate) fn apply_grm_to_mat_f32_with_workspace(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_grm_to_mat_f32_with_workspace(
+    packed_flat: &[u8],
+    bytes_per_snp: usize,
+    n_samples: usize,
+    row_flip: &[bool],
+    row_mean: &[f32],
+    row_inv_sd: &[f32],
+    sample_idx: &[usize],
+    full_sample_fast: bool,
+    packed_row_indices: Option<&[usize]>,
+    block_rows: usize,
+    rhs: &[f32], // row-major (n_out, n_rhs)
+    n_rhs: usize,
+    m_scale: f32,
+    code4_lut: &[[u8; 4]; 256],
+    pool: Option<&Arc<rayon::ThreadPool>>,
+    workspace: &mut GrmApplyWorkspace,
+    timing: Option<&mut HeApplyTiming>,
+    out: &mut [f32], // row-major (n_out, n_rhs)
+) -> Result<(), String> {
+    let mut source = HeGrmSource::Resident {
+        packed_flat,
+        bytes_per_snp,
+    };
+    apply_grm_to_mat_f32_with_workspace_from_source(
+        &mut source,
+        n_samples,
+        row_flip,
+        row_mean,
+        row_inv_sd,
+        sample_idx,
+        full_sample_fast,
+        packed_row_indices,
+        block_rows,
+        rhs,
+        n_rhs,
+        m_scale,
+        code4_lut,
+        pool,
+        workspace,
+        timing,
+        out,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_grm_to_vec_f32_with_workspace_from_source(
+    source: &mut HeGrmSource<'_>,
+    n_samples: usize,
+    row_flip: &[bool],
+    row_mean: &[f32],
+    row_inv_sd: &[f32],
+    sample_idx: &[usize],
+    full_sample_fast: bool,
+    row_source_indices: Option<&[usize]>,
+    block_rows: usize,
+    vec_in: &[f32],
+    m_scale: f32,
+    code4_lut: &[[u8; 4]; 256],
+    pool: Option<&Arc<rayon::ThreadPool>>,
+    workspace: &mut GrmApplyWorkspace,
+    timing: Option<&mut HeApplyTiming>,
+) -> Result<Vec<f32>, String> {
+    let n_out = sample_idx.len();
+    if vec_in.len() != n_out {
+        return Err(format!(
+            "apply_grm_to_vec_f32_with_workspace length mismatch: len(vec_in)={} != n_samples_subset={n_out}",
+            vec_in.len()
+        ));
+    }
+    let mut out = vec![0.0_f32; n_out];
+    apply_grm_to_mat_f32_with_workspace_from_source(
+        source,
+        n_samples,
+        row_flip,
+        row_mean,
+        row_inv_sd,
+        sample_idx,
+        full_sample_fast,
+        row_source_indices,
+        block_rows,
+        vec_in,
+        1,
+        m_scale,
+        code4_lut,
+        pool,
+        workspace,
+        timing,
+        &mut out,
+    )?;
+    Ok(out)
+}
+
+#[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 pub(crate) fn apply_grm_to_vec_f32_with_workspace(
     packed_flat: &[u8],
     bytes_per_snp: usize,
@@ -1126,17 +1447,12 @@ pub(crate) fn apply_grm_to_vec_f32_with_workspace(
     workspace: &mut GrmApplyWorkspace,
     timing: Option<&mut HeApplyTiming>,
 ) -> Result<Vec<f32>, String> {
-    let n_out = sample_idx.len();
-    if vec_in.len() != n_out {
-        return Err(format!(
-            "apply_grm_to_vec_f32_with_workspace length mismatch: len(vec_in)={} != n_samples_subset={n_out}",
-            vec_in.len()
-        ));
-    }
-    let mut out = vec![0.0_f32; n_out];
-    apply_grm_to_mat_f32_with_workspace(
+    let mut source = HeGrmSource::Resident {
         packed_flat,
         bytes_per_snp,
+    };
+    apply_grm_to_vec_f32_with_workspace_from_source(
+        &mut source,
         n_samples,
         row_flip,
         row_mean,
@@ -1146,15 +1462,12 @@ pub(crate) fn apply_grm_to_vec_f32_with_workspace(
         packed_row_indices,
         block_rows,
         vec_in,
-        1,
         m_scale,
         code4_lut,
         pool,
         workspace,
         timing,
-        &mut out,
-    )?;
-    Ok(out)
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1225,6 +1538,115 @@ pub fn he_variance_components_packed_with_covariates(
     exact_trace_max_n: usize,
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> Result<HePcgResult, String> {
+    let mut source = HeGrmSource::Resident {
+        packed_flat,
+        bytes_per_snp,
+    };
+    he_variance_components_with_source(
+        &mut source,
+        n_samples,
+        row_flip,
+        row_maf,
+        sample_idx,
+        packed_row_indices,
+        y,
+        x_cov,
+        p_cov,
+        trace_samples,
+        trace_probe_batch,
+        block_rows,
+        std_eps,
+        use_train_maf,
+        max_iter,
+        tol,
+        seed,
+        exact_trace_debug,
+        exact_trace_max_n,
+        pool,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn he_variance_components_meta_stream_with_covariates(
+    prefix: &str,
+    row_source_indices: &[usize],
+    row_flip: &[bool],
+    row_maf: &[f32],
+    sample_idx: &[usize],
+    y: &[f64],
+    x_cov: Option<&[f64]>,
+    p_cov: usize,
+    trace_samples: usize,
+    trace_probe_batch: usize,
+    block_rows: usize,
+    std_eps: f64,
+    use_train_maf: bool,
+    max_iter: usize,
+    tol: f64,
+    seed: u64,
+    exact_trace_debug: bool,
+    exact_trace_max_n: usize,
+    mmap_window_mb: Option<usize>,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) -> Result<HePcgResult, String> {
+    let n_samples = crate::gfcore::read_fam(prefix)?.len();
+    if n_samples == 0 {
+        return Err("No samples found in BED input.".to_string());
+    }
+    let bytes_per_snp = n_samples.div_ceil(4);
+    let window_mb = he_stream_window_mb(block_rows, bytes_per_snp, mmap_window_mb);
+    let matrix = WindowedBedMatrix::open(prefix, window_mb)?;
+    let mut source = HeGrmSource::Windowed {
+        matrix,
+        bytes_per_snp,
+    };
+    he_variance_components_with_source(
+        &mut source,
+        n_samples,
+        row_flip,
+        row_maf,
+        sample_idx,
+        Some(row_source_indices),
+        y,
+        x_cov,
+        p_cov,
+        trace_samples,
+        trace_probe_batch,
+        block_rows,
+        std_eps,
+        use_train_maf,
+        max_iter,
+        tol,
+        seed,
+        exact_trace_debug,
+        exact_trace_max_n,
+        pool,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn he_variance_components_with_source(
+    source: &mut HeGrmSource<'_>,
+    n_samples: usize,
+    row_flip: &[bool],
+    row_maf: &[f32],
+    sample_idx: &[usize],
+    row_source_indices: Option<&[usize]>,
+    y: &[f64],
+    x_cov: Option<&[f64]>,
+    p_cov: usize,
+    trace_samples: usize,
+    trace_probe_batch: usize,
+    block_rows: usize,
+    std_eps: f64,
+    use_train_maf: bool,
+    max_iter: usize,
+    tol: f64,
+    seed: u64,
+    exact_trace_debug: bool,
+    exact_trace_max_n: usize,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) -> Result<HePcgResult, String> {
     let stage_timing = env_truthy("JX_GS_HE_STAGE_TIMING");
     let stage_log_every = std::env::var("JX_GS_HE_STAGE_LOG_EVERY")
         .ok()
@@ -1245,26 +1667,20 @@ pub fn he_variance_components_packed_with_covariates(
             row_maf.len()
         ));
     }
-    if bytes_per_snp == 0 || (packed_flat.len() % bytes_per_snp) != 0 {
-        return Err("packed payload size mismatch".to_string());
-    }
-    let m_packed = packed_flat.len() / bytes_per_snp;
-    if let Some(row_idx) = packed_row_indices {
+    if let Some(row_idx) = row_source_indices {
         if row_idx.len() != m {
             return Err(format!(
-                "packed row index length mismatch: got {}, expected {m}",
+                "row source index length mismatch: got {}, expected {m}",
                 row_idx.len()
             ));
         }
-        if row_idx.iter().any(|&idx| idx >= m_packed) {
-            return Err("packed row index out of bounds".to_string());
+        if row_idx.iter().any(|&idx| idx >= source.total_rows()) {
+            return Err("row source index out of bounds".to_string());
         }
-    } else if m_packed != m {
-        return Err(format!(
-            "packed payload size mismatch: got {}, expected {}",
-            packed_flat.len(),
-            m.saturating_mul(bytes_per_snp)
-        ));
+    } else if source.total_rows() < m {
+        return Err("source row count mismatch".to_string());
+    } else if matches!(source, HeGrmSource::Resident { .. }) && source.total_rows() != m {
+        return Err("resident packed payload size mismatch".to_string());
     }
     if sample_idx.is_empty() {
         return Err("sample_idx must not be empty".to_string());
@@ -1303,15 +1719,16 @@ pub fn he_variance_components_packed_with_covariates(
 
     let std_eps32 = std_eps.max(1e-12_f64) as f32;
     let train_maf_t0 = Instant::now();
-    let row_stats = build_row_standardization_stats(
-        packed_flat,
-        bytes_per_snp,
+    let row_stats = build_row_standardization_stats_from_source(
+        source,
         row_flip,
         row_maf,
         sample_idx,
-        packed_row_indices,
+        row_source_indices,
+        block_rows,
         std_eps32,
         use_train_maf,
+        false,
         pool,
     )?;
     let train_maf_secs = train_maf_t0.elapsed().as_secs_f64();
@@ -1345,16 +1762,15 @@ pub fn he_variance_components_packed_with_covariates(
     let mut grm_ws = GrmApplyWorkspace::new();
     let mut ky_apply_t = HeApplyTiming::default();
 
-    let k_y = apply_grm_to_vec_f32_with_workspace(
-        packed_flat,
-        bytes_per_snp,
+    let k_y = apply_grm_to_vec_f32_with_workspace_from_source(
+        source,
         n_samples,
         row_flip,
         &row_stats.row_mean,
         &row_stats.row_inv_sd,
         sample_idx,
         full_sample_fast,
-        packed_row_indices,
+        row_source_indices,
         block_rows,
         &y_f32,
         m_scale,
@@ -1396,16 +1812,15 @@ pub fn he_variance_components_packed_with_covariates(
             }
             projector.project_mat_f32_in_place(&mut probe_batch, batch_cols, &mut proj_ws)?;
             kv_batch.fill(0.0_f32);
-            apply_grm_to_mat_f32_with_workspace(
-                packed_flat,
-                bytes_per_snp,
+            apply_grm_to_mat_f32_with_workspace_from_source(
+                source,
                 n_samples,
                 row_flip,
                 &row_stats.row_mean,
                 &row_stats.row_inv_sd,
                 sample_idx,
                 full_sample_fast,
-                packed_row_indices,
+                row_source_indices,
                 block_rows,
                 &probe_batch,
                 batch_cols,
@@ -1472,16 +1887,15 @@ pub fn he_variance_components_packed_with_covariates(
             }
             projector.project_mat_f32_in_place(&mut probe_batch, batch_cols, &mut proj_ws)?;
             kv_batch.fill(0.0_f32);
-            apply_grm_to_mat_f32_with_workspace(
-                packed_flat,
-                bytes_per_snp,
+            apply_grm_to_mat_f32_with_workspace_from_source(
+                source,
                 n_samples,
                 row_flip,
                 &row_stats.row_mean,
                 &row_stats.row_inv_sd,
                 sample_idx,
                 full_sample_fast,
-                packed_row_indices,
+                row_source_indices,
                 block_rows,
                 &probe_batch,
                 batch_cols,
@@ -1673,9 +2087,12 @@ pub fn he_variance_components_packed_with_covariates(
     packed_n_samples=0,
     maf=None,
     row_flip=None,
+    row_source_indices=None,
     x_cov=None,
-    blas_threads=0
+    blas_threads=0,
+    mmap_window_mb=None
 ))]
+#[allow(unused_assignments)]
 pub fn he_pcg_bed<'py>(
     py: Python<'py>,
     prefix: String,
@@ -1697,8 +2114,10 @@ pub fn he_pcg_bed<'py>(
     packed_n_samples: usize,
     maf: Option<PyReadonlyArray1<'py, f32>>,
     row_flip: Option<PyReadonlyArray1<'py, bool>>,
+    row_source_indices: Option<PyReadonlyArray1<'py, i64>>,
     x_cov: Option<PyReadonlyArray2<'py, f64>>,
     blas_threads: usize,
+    mmap_window_mb: Option<usize>,
 ) -> PyResult<(
     f64,
     f64,
@@ -1729,102 +2148,249 @@ pub fn he_pcg_bed<'py>(
         return Err(PyRuntimeError::new_err("std_eps must be finite and > 0"));
     }
 
-    let use_external_packed =
-        packed.is_some() || maf.is_some() || row_flip.is_some() || packed_n_samples > 0;
-    let mut loaded_packed_arr = None;
-    let mut loaded_maf_arr = None;
-    let mut external_maf_ro: Option<PyReadonlyArray1<'py, f32>> = None;
-    let mut external_row_flip_ro: Option<PyReadonlyArray1<'py, bool>> = None;
+    let external_packed_requested = packed.is_some() || packed_n_samples > 0;
+    let metadata_stream_requested = row_source_indices.is_some();
+    if external_packed_requested && metadata_stream_requested {
+        return Err(PyRuntimeError::new_err(
+            "he_pcg_bed: provide either packed payload inputs or row_source_indices metadata streaming inputs, not both.",
+        ));
+    }
+    if !external_packed_requested
+        && !metadata_stream_requested
+        && (maf.is_some() || row_flip.is_some())
+    {
+        return Err(PyRuntimeError::new_err(
+            "he_pcg_bed: external maf/row_flip without packed payload requires row_source_indices for metadata streaming.",
+        ));
+    }
 
     let n_samples: usize;
-    let packed_ro: PyReadonlyArray2<'py, u8>;
-    if use_external_packed {
-        packed_ro = packed.ok_or_else(|| {
+    let mut eff_m = 0usize;
+    let mut resident_bytes_per_snp = 0usize;
+    let mut resident_packed_ro_opt: Option<PyReadonlyArray2<'py, u8>> = None;
+    let mut resident_maf_full: Option<Vec<f32>> = None;
+    let mut resident_row_flip_full: Option<Vec<bool>> = None;
+    let mut packed_row_indices: Option<Vec<usize>> = None;
+    let mut stream_row_source_indices: Option<Vec<usize>> = None;
+    let mut stream_maf: Option<Vec<f32>> = None;
+    let mut stream_row_flip: Option<Vec<bool>> = None;
+    let mut loaded_packed_arr: Option<pyo3::Bound<'py, numpy::PyArray2<u8>>> = None;
+    let mut loaded_maf_arr: Option<pyo3::Bound<'py, numpy::PyArray1<f32>>> = None;
+
+    if external_packed_requested {
+        let packed_ro = packed.ok_or_else(|| {
             PyRuntimeError::new_err("he_pcg_bed: packed payload path requires `packed` argument.")
         })?;
-        external_maf_ro = Some(maf.ok_or_else(|| {
+        let maf_ro = maf.ok_or_else(|| {
             PyRuntimeError::new_err("he_pcg_bed: packed payload path requires `maf` argument.")
-        })?);
-        external_row_flip_ro = Some(row_flip.ok_or_else(|| {
+        })?;
+        let row_flip_ro = row_flip.ok_or_else(|| {
             PyRuntimeError::new_err("he_pcg_bed: packed payload path requires `row_flip` argument.")
-        })?);
+        })?;
         if packed_n_samples == 0 {
             return Err(PyRuntimeError::new_err(
                 "he_pcg_bed: packed payload path requires packed_n_samples > 0.",
             ));
         }
         n_samples = packed_n_samples;
+
+        let packed_view = packed_ro.as_array();
+        if packed_view.ndim() != 2 {
+            return Err(PyRuntimeError::new_err(
+                "packed BED payload must be 2D (m, bytes_per_snp).",
+            ));
+        }
+        let m_total = packed_view.shape()[0];
+        if m_total == 0 {
+            return Err(PyRuntimeError::new_err("No SNP rows found in BED input."));
+        }
+        resident_bytes_per_snp = packed_view.shape()[1];
+        let expected_bps = n_samples.div_ceil(4);
+        if resident_bytes_per_snp != expected_bps {
+            return Err(PyRuntimeError::new_err(format!(
+                "packed second dimension mismatch: got {resident_bytes_per_snp}, expected {expected_bps}"
+            )));
+        }
+
+        let maf_full: Vec<f32> = match maf_ro.as_slice() {
+            Ok(s) => s.to_vec(),
+            Err(_) => maf_ro.as_array().iter().copied().collect(),
+        };
+        if maf_full.len() != m_total {
+            return Err(PyRuntimeError::new_err(format!(
+                "maf length mismatch: got {}, expected {m_total}",
+                maf_full.len()
+            )));
+        }
+        let row_flip_full: Vec<bool> = match row_flip_ro.as_slice() {
+            Ok(s) => s.to_vec(),
+            Err(_) => row_flip_ro.as_array().iter().copied().collect(),
+        };
+        if row_flip_full.len() != m_total {
+            return Err(PyRuntimeError::new_err(format!(
+                "row_flip length mismatch: got {}, expected {m_total}",
+                row_flip_full.len()
+            )));
+        }
+
+        eff_m = m_total;
+        if let Some(mask) = site_keep {
+            let mask_vec: Vec<bool> = match mask.as_slice() {
+                Ok(s) => s.to_vec(),
+                Err(_) => mask.as_array().iter().copied().collect(),
+            };
+            if mask_vec.len() != m_total {
+                return Err(PyRuntimeError::new_err(format!(
+                    "site_keep length mismatch: got {}, expected {m_total}",
+                    mask_vec.len()
+                )));
+            }
+            let keep_idx: Vec<usize> = mask_vec
+                .iter()
+                .enumerate()
+                .filter_map(|(i, &k)| if k { Some(i) } else { None })
+                .collect();
+            if keep_idx.is_empty() {
+                return Err(PyRuntimeError::new_err(
+                    "No SNPs remained after applying site_keep mask.",
+                ));
+            }
+            let keep_is_identity = (keep_idx.len() == m_total)
+                && keep_idx
+                    .iter()
+                    .enumerate()
+                    .all(|(dst_row, &src_row)| dst_row == src_row);
+            if !keep_is_identity {
+                eff_m = keep_idx.len();
+                let mut maf_subset = vec![0.0_f32; eff_m];
+                let mut row_flip_subset = vec![false; eff_m];
+                for (dst_row, &src_row) in keep_idx.iter().enumerate() {
+                    maf_subset[dst_row] = maf_full[src_row];
+                    row_flip_subset[dst_row] = row_flip_full[src_row];
+                }
+                resident_maf_full = Some(maf_subset);
+                resident_row_flip_full = Some(row_flip_subset);
+                packed_row_indices = Some(keep_idx);
+            }
+        }
+        if resident_maf_full.is_none() {
+            resident_maf_full = Some(maf_full);
+            resident_row_flip_full = Some(row_flip_full);
+        }
+        resident_packed_ro_opt = Some(packed_ro);
+    } else if metadata_stream_requested {
+        if site_keep.is_some() {
+            return Err(PyRuntimeError::new_err(
+                "he_pcg_bed: metadata streaming path does not accept site_keep; subset rows via row_source_indices instead.",
+            ));
+        }
+        n_samples = crate::gfcore::read_fam(&prefix)
+            .map_err(map_err_string_to_py)?
+            .len();
+        if n_samples == 0 {
+            return Err(PyRuntimeError::new_err("No samples found in BED input."));
+        }
+
+        let row_source_ro = row_source_indices
+            .as_ref()
+            .expect("row_source_indices must exist for metadata stream path");
+        let row_source_vec_i64: Vec<i64> = match row_source_ro.as_slice() {
+            Ok(s) => s.to_vec(),
+            Err(_) => row_source_ro.as_array().iter().copied().collect(),
+        };
+        if row_source_vec_i64.is_empty() {
+            return Err(PyRuntimeError::new_err(
+                "row_source_indices must not be empty for metadata streaming path.",
+            ));
+        }
+        let mut row_source_vec = Vec::<usize>::with_capacity(row_source_vec_i64.len());
+        for &idx in row_source_vec_i64.iter() {
+            if idx < 0 {
+                return Err(PyRuntimeError::new_err(
+                    "row_source_indices must be non-negative.",
+                ));
+            }
+            row_source_vec.push(idx as usize);
+        }
+
+        let maf_ro = maf.as_ref().ok_or_else(|| {
+            PyRuntimeError::new_err(
+                "he_pcg_bed: metadata streaming path requires `maf` argument.",
+            )
+        })?;
+        let row_flip_ro = row_flip.as_ref().ok_or_else(|| {
+            PyRuntimeError::new_err(
+                "he_pcg_bed: metadata streaming path requires `row_flip` argument.",
+            )
+        })?;
+        let maf_vec: Vec<f32> = match maf_ro.as_slice() {
+            Ok(s) => s.to_vec(),
+            Err(_) => maf_ro.as_array().iter().copied().collect(),
+        };
+        let row_flip_vec: Vec<bool> = match row_flip_ro.as_slice() {
+            Ok(s) => s.to_vec(),
+            Err(_) => row_flip_ro.as_array().iter().copied().collect(),
+        };
+        if maf_vec.len() != row_source_vec.len() || row_flip_vec.len() != row_source_vec.len() {
+            return Err(PyRuntimeError::new_err(format!(
+                "metadata length mismatch: row_source_indices={}, row_flip={}, row_maf={}",
+                row_source_vec.len(),
+                row_flip_vec.len(),
+                maf_vec.len(),
+            )));
+        }
+        eff_m = row_source_vec.len();
+        stream_row_source_indices = Some(row_source_vec);
+        stream_maf = Some(maf_vec);
+        stream_row_flip = Some(row_flip_vec);
     } else {
         let (packed_arr, _miss_arr, maf_arr, _std_arr, n_samples_loaded) =
-            crate::gfreader::load_bed_2bit_packed(py, prefix)?;
+            crate::gfreader::load_bed_2bit_packed(py, prefix.clone())?;
         if n_samples_loaded == 0 {
             return Err(PyRuntimeError::new_err("No samples found in BED input."));
         }
         n_samples = n_samples_loaded;
         loaded_packed_arr = Some(packed_arr);
         loaded_maf_arr = Some(maf_arr);
-        packed_ro = loaded_packed_arr
+
+        let packed_ro = loaded_packed_arr
             .as_ref()
             .expect("packed array must exist")
             .readonly();
-    }
-
-    let packed_view = packed_ro.as_array();
-    if packed_view.ndim() != 2 {
-        return Err(PyRuntimeError::new_err(
-            "packed BED payload must be 2D (m, bytes_per_snp).",
-        ));
-    }
-    let m_total = packed_view.shape()[0];
-    if m_total == 0 {
-        return Err(PyRuntimeError::new_err("No SNP rows found in BED input."));
-    }
-    let bytes_per_snp = packed_view.shape()[1];
-    let expected_bps = n_samples.div_ceil(4);
-    if bytes_per_snp != expected_bps {
-        return Err(PyRuntimeError::new_err(format!(
-            "packed second dimension mismatch: got {bytes_per_snp}, expected {expected_bps}"
-        )));
-    }
-    let packed_flat: Cow<[u8]> = match packed_ro.as_slice() {
-        Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(packed_view.iter().copied().collect()),
-    };
-
-    let maf_full: Vec<f32> = if use_external_packed {
-        let maf_ro = external_maf_ro
-            .as_ref()
-            .expect("external maf must exist for packed payload path");
-        match maf_ro.as_slice() {
-            Ok(s) => s.to_vec(),
-            Err(_) => maf_ro.as_array().iter().copied().collect(),
+        let packed_view = packed_ro.as_array();
+        if packed_view.ndim() != 2 {
+            return Err(PyRuntimeError::new_err(
+                "packed BED payload must be 2D (m, bytes_per_snp).",
+            ));
         }
-    } else {
-        let maf_ro = loaded_maf_arr
+        let m_total = packed_view.shape()[0];
+        if m_total == 0 {
+            return Err(PyRuntimeError::new_err("No SNP rows found in BED input."));
+        }
+        resident_bytes_per_snp = packed_view.shape()[1];
+        let expected_bps = n_samples.div_ceil(4);
+        if resident_bytes_per_snp != expected_bps {
+            return Err(PyRuntimeError::new_err(format!(
+                "packed second dimension mismatch: got {resident_bytes_per_snp}, expected {expected_bps}"
+            )));
+        }
+
+        let maf_full: Vec<f32> = loaded_maf_arr
             .as_ref()
             .expect("maf array must exist")
-            .readonly();
-        match maf_ro.as_slice() {
-            Ok(s) => s.to_vec(),
-            Err(_) => maf_ro.as_array().iter().copied().collect(),
-        }
-    };
-    if maf_full.len() != m_total {
-        return Err(PyRuntimeError::new_err(format!(
-            "maf length mismatch: got {}, expected {m_total}",
-            maf_full.len()
-        )));
-    }
-
-    let row_flip_full: Vec<bool> = if use_external_packed {
-        let row_flip_ro = external_row_flip_ro
-            .as_ref()
-            .expect("external row_flip must exist for packed payload path");
-        match row_flip_ro.as_slice() {
-            Ok(s) => s.to_vec(),
-            Err(_) => row_flip_ro.as_array().iter().copied().collect(),
-        }
-    } else {
+            .readonly()
+            .as_slice()
+            .map(|s| s.to_vec())
+            .unwrap_or_else(|_| {
+                loaded_maf_arr
+                    .as_ref()
+                    .expect("maf array must exist")
+                    .readonly()
+                    .as_array()
+                    .iter()
+                    .copied()
+                    .collect()
+            });
         let row_flip_full_arr = bed_packed_row_flip_mask(
             py,
             loaded_packed_arr
@@ -1833,62 +2399,57 @@ pub fn he_pcg_bed<'py>(
                 .readonly(),
             n_samples,
         )?;
-        let row_flip_ro = row_flip_full_arr.readonly();
-        match row_flip_ro.as_slice() {
-            Ok(s) => s.to_vec(),
-            Err(_) => row_flip_ro.as_array().iter().copied().collect(),
-        }
-    };
-    if row_flip_full.len() != m_total {
-        return Err(PyRuntimeError::new_err(format!(
-            "row_flip length mismatch: got {}, expected {m_total}",
-            row_flip_full.len()
-        )));
-    }
+        let row_flip_full: Vec<bool> = row_flip_full_arr
+            .readonly()
+            .as_slice()
+            .map(|s| s.to_vec())
+            .unwrap_or_else(|_| row_flip_full_arr.readonly().as_array().iter().copied().collect());
 
-    let mut eff_m = m_total;
-    let packed_keep: Cow<[u8]> = Cow::Borrowed(packed_flat.as_ref());
-    let mut maf_keep: Cow<[f32]> = Cow::Borrowed(maf_full.as_slice());
-    let mut row_flip_keep: Cow<[bool]> = Cow::Borrowed(row_flip_full.as_slice());
-    let mut packed_row_indices: Option<Vec<usize>> = None;
-    if let Some(mask) = site_keep {
-        let mask_vec: Vec<bool> = match mask.as_slice() {
-            Ok(s) => s.to_vec(),
-            Err(_) => mask.as_array().iter().copied().collect(),
-        };
-        if mask_vec.len() != m_total {
-            return Err(PyRuntimeError::new_err(format!(
-                "site_keep length mismatch: got {}, expected {m_total}",
-                mask_vec.len()
-            )));
-        }
-        let keep_idx: Vec<usize> = mask_vec
-            .iter()
-            .enumerate()
-            .filter_map(|(i, &k)| if k { Some(i) } else { None })
-            .collect();
-        if keep_idx.is_empty() {
-            return Err(PyRuntimeError::new_err(
-                "No SNPs remained after applying site_keep mask.",
-            ));
-        }
-        let keep_is_identity = (keep_idx.len() == m_total)
-            && keep_idx
+        eff_m = m_total;
+        if let Some(mask) = site_keep {
+            let mask_vec: Vec<bool> = match mask.as_slice() {
+                Ok(s) => s.to_vec(),
+                Err(_) => mask.as_array().iter().copied().collect(),
+            };
+            if mask_vec.len() != m_total {
+                return Err(PyRuntimeError::new_err(format!(
+                    "site_keep length mismatch: got {}, expected {m_total}",
+                    mask_vec.len()
+                )));
+            }
+            let keep_idx: Vec<usize> = mask_vec
                 .iter()
                 .enumerate()
-                .all(|(dst_row, &src_row)| dst_row == src_row);
-        if !keep_is_identity {
-            eff_m = keep_idx.len();
-            let mut maf_subset = vec![0.0_f32; eff_m];
-            let mut row_flip_subset = vec![false; eff_m];
-            for (dst_row, &src_row) in keep_idx.iter().enumerate() {
-                maf_subset[dst_row] = maf_full[src_row];
-                row_flip_subset[dst_row] = row_flip_full[src_row];
+                .filter_map(|(i, &k)| if k { Some(i) } else { None })
+                .collect();
+            if keep_idx.is_empty() {
+                return Err(PyRuntimeError::new_err(
+                    "No SNPs remained after applying site_keep mask.",
+                ));
             }
-            maf_keep = Cow::Owned(maf_subset);
-            row_flip_keep = Cow::Owned(row_flip_subset);
-            packed_row_indices = Some(keep_idx);
+            let keep_is_identity = (keep_idx.len() == m_total)
+                && keep_idx
+                    .iter()
+                    .enumerate()
+                    .all(|(dst_row, &src_row)| dst_row == src_row);
+            if !keep_is_identity {
+                eff_m = keep_idx.len();
+                let mut maf_subset = vec![0.0_f32; eff_m];
+                let mut row_flip_subset = vec![false; eff_m];
+                for (dst_row, &src_row) in keep_idx.iter().enumerate() {
+                    maf_subset[dst_row] = maf_full[src_row];
+                    row_flip_subset[dst_row] = row_flip_full[src_row];
+                }
+                resident_maf_full = Some(maf_subset);
+                resident_row_flip_full = Some(row_flip_subset);
+                packed_row_indices = Some(keep_idx);
+            }
         }
+        if resident_maf_full.is_none() {
+            resident_maf_full = Some(maf_full);
+            resident_row_flip_full = Some(row_flip_full);
+        }
+        resident_packed_ro_opt = Some(packed_ro);
     }
 
     let train_idx = parse_index_vec_i64(
@@ -1955,11 +2516,67 @@ pub fn he_pcg_bed<'py>(
 
     let pool_owned = get_cached_pool(threads)?;
     let pool_ref = pool_owned.as_ref();
-    let he_res = py
-        .detach(move || {
-            // Keep OpenBLAS stage control independent from Rayon pool sizing when an
-            // explicit BLAS cap is provided, but preserve the legacy behavior of
-            // following `threads` when `blas_threads` is left at its default.
+    let he_res = if metadata_stream_requested {
+        let prefix_owned = prefix;
+        let row_source_keep = stream_row_source_indices
+            .take()
+            .expect("stream row source indices must exist");
+        let maf_keep = stream_maf.take().expect("stream maf must exist");
+        let row_flip_keep = stream_row_flip
+            .take()
+            .expect("stream row_flip must exist");
+        py.detach(move || {
+            let blas_threads_effective = if blas_threads > 0 {
+                blas_threads.max(1)
+            } else if threads > 0 {
+                threads.max(1)
+            } else {
+                0
+            };
+            let _blas_guard = if blas_threads_effective > 0 {
+                Some(OpenBlasThreadGuard::enter(blas_threads_effective))
+            } else {
+                None
+            };
+            he_variance_components_meta_stream_with_covariates(
+                &prefix_owned,
+                row_source_keep.as_slice(),
+                row_flip_keep.as_slice(),
+                maf_keep.as_slice(),
+                &train_idx,
+                &y_vec_f64,
+                x_cov_train.as_deref(),
+                p_cov,
+                trace_samples,
+                trace_probe_batch,
+                block_rows,
+                std_eps,
+                use_train_maf,
+                max_iter,
+                tol,
+                seed,
+                exact_trace_debug,
+                exact_trace_max_n,
+                mmap_window_mb,
+                pool_ref,
+            )
+        })
+    } else {
+        let resident_packed_ro = resident_packed_ro_opt
+            .take()
+            .expect("packed payload must exist");
+        let packed_view = resident_packed_ro.as_array();
+        let packed_flat: Cow<[u8]> = match resident_packed_ro.as_slice() {
+            Ok(s) => Cow::Borrowed(s),
+            Err(_) => Cow::Owned(packed_view.iter().copied().collect()),
+        };
+        let maf_keep = resident_maf_full
+            .take()
+            .expect("maf metadata must exist");
+        let row_flip_keep = resident_row_flip_full
+            .take()
+            .expect("row_flip metadata must exist");
+        py.detach(move || {
             let blas_threads_effective = if blas_threads > 0 {
                 blas_threads.max(1)
             } else if threads > 0 {
@@ -1973,11 +2590,11 @@ pub fn he_pcg_bed<'py>(
                 None
             };
             he_variance_components_packed_with_covariates(
-                packed_keep.as_ref(),
-                bytes_per_snp,
+                packed_flat.as_ref(),
+                resident_bytes_per_snp,
                 n_samples,
-                row_flip_keep.as_ref(),
-                maf_keep.as_ref(),
+                row_flip_keep.as_slice(),
+                maf_keep.as_slice(),
                 &train_idx,
                 packed_row_indices.as_deref(),
                 &y_vec_f64,
@@ -1996,7 +2613,8 @@ pub fn he_pcg_bed<'py>(
                 pool_ref,
             )
         })
-        .map_err(map_err_string_to_py)?;
+    }
+    .map_err(map_err_string_to_py)?;
 
     Ok((
         he_res.sigma_g2,

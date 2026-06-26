@@ -477,6 +477,7 @@ def _ensure_plink_cache_at(
     maf: Union[float, None] = None,
     missing_rate: Union[float, None] = None,
     het: Union[float, None] = None,
+    threads: int = 0,
 ) -> None:
     _ensure_plink_cache_from_source_at(
         cache_prefix,
@@ -484,6 +485,7 @@ def _ensure_plink_cache_at(
         vcf_path,
         source_label="VCF",
         snps_only=snps_only,
+        threads=threads,
     )
 
 
@@ -494,7 +496,9 @@ def _ensure_plink_cache_from_source_at(
     *,
     source_label: str,
     snps_only: bool = True,
+    threads: int = 0,
 ) -> None:
+    eff_threads = 0 if threads is None else max(0, int(threads))
     cache_files = [f"{cache_prefix}.bed", f"{cache_prefix}.bim", f"{cache_prefix}.fam"]
     with _cache_lock(cache_prefix):
         cache_present = any(os.path.exists(p) for p in cache_files)
@@ -519,7 +523,13 @@ def _ensure_plink_cache_from_source_at(
                 _remove_plink_cache_files(cache_prefix)
 
         try:
-            convert_genotypes(source_path, cache_prefix, out_fmt="plink", snps_only=bool(snps_only))
+            convert_genotypes(
+                source_path,
+                cache_prefix,
+                out_fmt="plink",
+                threads=eff_threads,
+                snps_only=bool(snps_only),
+            )
         except Exception as ex:
             # Backward-compat fallback:
             # older Rust extension builds may not support HMP as convert_genotypes input.
@@ -776,6 +786,7 @@ def _ensure_plink_cache_for_cli_source(
     *,
     source_label: str,
     snps_only: bool = False,
+    threads: int = 0,
 ) -> str:
     mode_tag = ".snp1" if bool(snps_only) else ".snp0"
     primary = f"{_cache_prefix(prefix)}{mode_tag}"
@@ -804,6 +815,7 @@ def _ensure_plink_cache_for_cli_source(
             source_path,
             source_label=source_label,
             snps_only=bool(snps_only),
+            threads=threads,
         )
         return fallback
 
@@ -814,6 +826,7 @@ def _ensure_plink_cache_for_cli_source(
             source_path,
             source_label=source_label,
             snps_only=bool(snps_only),
+            threads=threads,
         )
         return primary
     except Exception as ex:
@@ -829,6 +842,7 @@ def _ensure_plink_cache_for_cli_source(
             source_path,
             source_label=source_label,
             snps_only=bool(snps_only),
+            threads=threads,
         )
         return fallback
 
@@ -871,6 +885,7 @@ def prepare_cli_input_cache(
     delimiter: Union[str, None] = None,
     prefer_plink_for_txt: bool = False,
     force_kind: Union[str, None] = None,
+    threads: int = 0,
 ) -> str:
     """
     Normalize CLI genotype input to cache-backed paths:
@@ -887,6 +902,7 @@ def prepare_cli_input_cache(
             src_path,
             source_label="VCF",
             snps_only=bool(snps_only),
+            threads=threads,
         )
     if kind == "hmp":
         if src_path is None:
@@ -896,6 +912,7 @@ def prepare_cli_input_cache(
             src_path,
             source_label="HMP",
             snps_only=bool(snps_only),
+            threads=threads,
         )
     if kind == "txt":
         if src_path is None:
@@ -906,6 +923,7 @@ def prepare_cli_input_cache(
                 src_path,
                 source_label="TXT",
                 snps_only=bool(snps_only),
+                threads=threads,
             )
         return _ensure_txt_npy_cache_for_cli(prefix, src_path, delimiter=delimiter)
     if kind == "npy":
@@ -916,6 +934,7 @@ def prepare_cli_input_cache(
                 src,
                 source_label="TXT",
                 snps_only=bool(snps_only),
+                threads=threads,
             )
         if src_path is not None:
             return src_path
@@ -928,6 +947,7 @@ def prepare_cli_input_cache(
                 src,
                 source_label="TXT",
                 snps_only=bool(snps_only),
+                threads=threads,
             )
         if src_path is not None:
             return src_path

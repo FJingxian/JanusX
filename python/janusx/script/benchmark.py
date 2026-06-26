@@ -1200,6 +1200,37 @@ filter_named_args <- function(fun, args, label) {
   args[keep]
 }
 
+compute_rmvp_kinship <- function(kin_fun, kin_args, threads) {
+  fm <- tryCatch(formals(kin_fun), error = function(e) NULL)
+  fn_names <- if (is.null(fm)) character() else names(fm)
+  supports_priority <- length(fn_names) && ("priority" %in% fn_names || "..." %in% fn_names)
+  supports_maxline <- length(fn_names) && ("maxLine" %in% fn_names || "..." %in% fn_names)
+  kin_args_use <- kin_args
+  if (supports_priority) {
+    kin_args_use[["priority"]] <- "memory"
+  }
+  if (supports_maxline && is.null(kin_args_use[["maxLine"]])) {
+    kin_args_use[["maxLine"]] <- 2048L
+  }
+  mode_label <- if (supports_priority) "priority='memory'" else "chunked maxLine fallback"
+  cat("[INFO] Computing rMVP kinship with", mode_label, sprintf("(cpu=%d).\n", threads))
+  first_try <- try(do.call(kin_fun, filter_named_args(kin_fun, kin_args_use, "MVP.K.VanRaden")), silent = TRUE)
+  if (!inherits(first_try, "try-error")) {
+    return(first_try)
+  }
+  msg <- conditionMessage(attr(first_try, "condition"))
+  if (!supports_maxline) {
+    stop(first_try)
+  }
+  cat("[WARN] Initial rMVP kinship attempt failed; retrying with maxLine=512:", msg, "\n")
+  kin_args_use[["maxLine"]] <- 512L
+  second_try <- try(do.call(kin_fun, filter_named_args(kin_fun, kin_args_use, "MVP.K.VanRaden")), silent = TRUE)
+  if (!inherits(second_try, "try-error")) {
+    return(second_try)
+  }
+  stop(second_try)
+}
+
 subset_geno_for_individuals <- function(geno, ind_idx, n_markers, cache_prefix, label) {
   idx <- as.integer(ind_idx)
   idx <- idx[is.finite(idx)]
@@ -1679,7 +1710,7 @@ tryCatch(
         verbose = TRUE,
         checkNA = FALSE
       )
-      K <- do.call(kin_fun, filter_named_args(kin_fun, kin_args, "MVP.K.VanRaden"))
+      K <- compute_rmvp_kinship(kin_fun, kin_args, threads)
       eigenK <- eigen(K, symmetric = TRUE)
       npc_keep <- min(nrow(eigenK$vectors), max(3L, npc_farmcpu))
       ipca <- eigenK$vectors[, seq_len(npc_keep), drop = FALSE]

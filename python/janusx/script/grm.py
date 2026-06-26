@@ -191,6 +191,7 @@ def _resolve_rust_grm_input(
     from_hmp: bool,
     from_file: bool,
     snps_only: bool,
+    threads: int = 0,
 ) -> str:
     if _is_plink_prefix_path(str(genofile)):
         p = str(genofile).strip()
@@ -208,6 +209,7 @@ def _resolve_rust_grm_input(
         snps_only=bool(snps_only),
         delimiter=delim,
         prefer_plink_for_txt=True,
+        threads=int(threads),
     )
     if not _is_plink_prefix_path(str(cached)):
         raise RuntimeError(
@@ -1056,6 +1058,7 @@ def main(log: bool = True):
                 from_hmp=bool(args.hmp),
                 from_file=bool(args.file),
                 snps_only=bool(args.snps_only),
+                threads=int(args.thread),
             )
             if str(grm_input) != str(gfile):
                 logger.info(

@@ -1565,6 +1565,7 @@ def _compute_ld_from_bed_rust(
                 snps_only=True,
                 delimiter=delim,
                 prefer_plink_for_txt=True,
+                threads=int(threads),
             )
             cached_prefix = _normalize_plink_prefix(cached)
             if _is_existing_plink_prefix(cached_prefix):

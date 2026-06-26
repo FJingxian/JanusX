@@ -373,6 +373,7 @@ def _resolve_rust_grm_input_for_pca(
     genofile: str,
     *,
     snps_only: bool,
+    threads: int = 0,
 ) -> str:
     p = str(genofile).strip()
     if _is_plink_prefix_path(p):
@@ -383,6 +384,7 @@ def _resolve_rust_grm_input_for_pca(
         snps_only=bool(snps_only),
         delimiter=delim,
         prefer_plink_for_txt=True,
+        threads=int(threads),
     )
     if not _is_plink_prefix_path(str(cached)):
         raise RuntimeError(
@@ -853,6 +855,7 @@ def build_grm_streaming_for_pca(
     rust_input = _resolve_rust_grm_input_for_pca(
         str(genofile),
         snps_only=bool(snps_only),
+        threads=int(threads),
     )
 
     # Inspect genotype meta information
@@ -1481,6 +1484,7 @@ def main(log: bool = True):
                         snps_only=bool(rsvd_snps_only),
                         delimiter=txt_delim,
                         prefer_plink_for_txt=False,
+                        threads=int(args.thread),
                     )
 
             force_cache_bed = bool(args.vcf or args.hmp or (args.file and _is_txt_like_input_path(gfile) and not txt_force_eig))
@@ -1490,6 +1494,7 @@ def main(log: bool = True):
                     snps_only=bool(rsvd_snps_only),
                     delimiter=txt_delim,
                     prefer_plink_for_txt=True,
+                    threads=int(args.thread),
                 )
 
             algo_name = "Eigen-Decomposition" if txt_force_eig else "Random-SVD"

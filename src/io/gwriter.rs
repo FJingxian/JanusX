@@ -484,14 +484,8 @@ impl PlinkBfileWriter {
         );
         for (i, sample) in samples.iter().enumerate() {
             let ph = phenotype.map(|p| p[i]).unwrap_or(-9.0);
-            writeln!(
-                fam,
-                "{}\t{}\t0\t0\t1\t{}",
-                sample.fid(),
-                sample.iid(),
-                ph
-            )
-            .map_err(|e| e.to_string())?;
+            writeln!(fam, "{}\t{}\t0\t0\t1\t{}", sample.fid(), sample.iid(), ph)
+                .map_err(|e| e.to_string())?;
         }
         fam.flush().map_err(|e| e.to_string())?;
 
@@ -577,6 +571,40 @@ impl PlinkBfileWriter {
         self.bed
             .write_all(&self.row_buf)
             .map_err(|e| e.to_string())?;
+        self.written_sites = self.written_sites.saturating_add(1);
+        Ok(())
+    }
+
+    pub(crate) fn write_site_encoded<S: SiteRecord>(
+        &mut self,
+        site: &S,
+        gref: &str,
+        galt: &str,
+        row_bed: &[u8],
+    ) -> Result<(), String> {
+        if row_bed.len() != self.bytes_per_snp {
+            return Err(format!(
+                "Internal error: PLINK encoded row length mismatch: expected {}, got {}",
+                self.bytes_per_snp,
+                row_bed.len()
+            ));
+        }
+
+        self.line_buf.clear();
+        writeln!(
+            &mut self.line_buf,
+            "{}\t{}\t0\t{}\t{}\t{}",
+            site.chrom(),
+            site_row_id(site),
+            site.pos(),
+            gref,
+            galt
+        )
+        .map_err(|e| e.to_string())?;
+        self.bim
+            .write_all(&self.line_buf)
+            .map_err(|e| e.to_string())?;
+        self.bed.write_all(row_bed).map_err(|e| e.to_string())?;
         self.written_sites = self.written_sites.saturating_add(1);
         Ok(())
     }

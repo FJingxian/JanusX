@@ -630,6 +630,7 @@ def main() -> None:
                 snps_only=False,
                 delimiter=delim,
                 prefer_plink_for_txt=True,
+                threads=int(args.threads),
             )
             task.complete("Caching genotype as PLINK BED ...Finished")
         bed_prefix = _normalize_plink_prefix(str(bed_prefix))

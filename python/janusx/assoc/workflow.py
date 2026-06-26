@@ -2625,6 +2625,7 @@ def load_or_build_grm_with_cache(
                     snps_only=bool(snps_only),
                     delimiter=delim,
                     prefer_plink_for_txt=True,
+                    threads=int(args.thread),
                 )
             )
         except Exception as ex:
@@ -2986,6 +2987,7 @@ def build_pcs_from_genotype_rsvd(
                 snps_only=bool(snps_only),
                 delimiter=delim,
                 prefer_plink_for_txt=True,
+                threads=int(args.thread),
             )
         )
     sample_ids, algo_snp = inspect_genotype_file(
@@ -3336,6 +3338,7 @@ def prepare_streaming_context(
                     delimiter=delim,
                     prefer_plink_for_txt=True,
                     force_kind=force_kind,
+                    threads=int(args.thread),
                 )
             )
             cached_prefix = _as_plink_prefix(cached_cli)
@@ -5876,6 +5879,7 @@ def _prepare_qtn_packed_preload(
                 delimiter=("," if str(path).lower().endswith(".csv") else None),
                 prefer_plink_for_txt=True,
                 force_kind=force_kind,
+                threads=int(args.thread),
             )
         )
         if prefix is None:

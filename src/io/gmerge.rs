@@ -610,6 +610,308 @@ impl HmpSnpIterRaw {
     }
 }
 
+struct VcfLineBatchReader {
+    reader: Box<dyn BufRead + Send>,
+    finished: bool,
+}
+
+impl VcfLineBatchReader {
+    fn new(path: &str) -> Result<Self, String> {
+        let p = Path::new(path);
+        let mut reader = open_text_maybe_gz(p)?;
+
+        let mut header_line = String::new();
+        loop {
+            header_line.clear();
+            let n = reader
+                .read_line(&mut header_line)
+                .map_err(|e| e.to_string())?;
+            if n == 0 {
+                return Err("No #CHROM header found in VCF".into());
+            }
+            if header_line.starts_with("#CHROM") {
+                break;
+            }
+        }
+
+        Ok(Self {
+            reader,
+            finished: false,
+        })
+    }
+
+    fn next_batch(&mut self, batch_size: usize) -> Result<Vec<String>, String> {
+        if self.finished {
+            return Ok(Vec::new());
+        }
+
+        let mut batch: Vec<String> = Vec::with_capacity(batch_size.max(1));
+        let mut line = String::new();
+        while batch.len() < batch_size.max(1) {
+            line.clear();
+            let n = self
+                .reader
+                .read_line(&mut line)
+                .map_err(|e| e.to_string())?;
+            if n == 0 {
+                self.finished = true;
+                break;
+            }
+            if line.starts_with('#') || line.trim().is_empty() {
+                continue;
+            }
+            batch.push(line.clone());
+        }
+        Ok(batch)
+    }
+}
+
+#[inline]
+fn hmp_is_dna_base(c: char) -> bool {
+    matches!(c, 'A' | 'C' | 'G' | 'T')
+}
+
+#[inline]
+fn hmp_default_alt_for_ref(r: char) -> char {
+    match r {
+        'A' => 'C',
+        'C' => 'A',
+        'G' => 'A',
+        'T' => 'A',
+        _ => 'A',
+    }
+}
+
+#[inline]
+fn hmp_iupac_to_pair(c: char) -> Option<(char, char)> {
+    match c {
+        'R' => Some(('A', 'G')),
+        'Y' => Some(('C', 'T')),
+        'S' => Some(('G', 'C')),
+        'W' => Some(('A', 'T')),
+        'K' => Some(('G', 'T')),
+        'M' => Some(('A', 'C')),
+        _ => None,
+    }
+}
+
+fn split_hmp_fields_local(line: &str) -> Vec<&str> {
+    let tab_cols: Vec<&str> = line.trim_end().split('\t').collect();
+    if tab_cols.len() >= 12 {
+        return tab_cols;
+    }
+    line.split_whitespace().collect()
+}
+
+fn parse_hmp_alleles_field_local(field: &str) -> Option<(char, char)> {
+    let up = field.trim().to_ascii_uppercase();
+    if up.is_empty() {
+        return None;
+    }
+    let mut bases: Vec<char> = Vec::new();
+    for part in up.split(|c: char| c == '/' || c == '|' || c == ',' || c == ';') {
+        if part.is_empty() {
+            continue;
+        }
+        let b = part.chars().find(|c| hmp_is_dna_base(*c));
+        if let Some(x) = b {
+            if !bases.contains(&x) {
+                bases.push(x);
+            }
+        }
+    }
+    if bases.len() >= 2 {
+        return Some((bases[0], bases[1]));
+    }
+    let letters: Vec<char> = up.chars().filter(|c| c.is_ascii_alphabetic()).collect();
+    if letters.len() == 2 && hmp_is_dna_base(letters[0]) && hmp_is_dna_base(letters[1]) {
+        if letters[0] != letters[1] {
+            return Some((letters[0], letters[1]));
+        }
+        return Some((letters[0], hmp_default_alt_for_ref(letters[0])));
+    }
+    if letters.len() == 1 && hmp_is_dna_base(letters[0]) {
+        return Some((letters[0], hmp_default_alt_for_ref(letters[0])));
+    }
+    None
+}
+
+fn parse_hmp_gt_token_local(token: &str) -> Option<(char, char)> {
+    let up = token.trim().to_ascii_uppercase();
+    if up.is_empty() {
+        return None;
+    }
+    if matches!(
+        up.as_str(),
+        "." | "./." | ".|." | "-" | "--" | "N" | "NN" | "NA"
+    ) {
+        return None;
+    }
+
+    if up.contains('/') || up.contains('|') {
+        let mut alleles: Vec<char> = Vec::with_capacity(2);
+        for part in up.split(|c: char| c == '/' || c == '|') {
+            if part.is_empty() {
+                continue;
+            }
+            if let Some(c) = part.chars().find(|x| hmp_is_dna_base(*x)) {
+                alleles.push(c);
+                if alleles.len() >= 2 {
+                    break;
+                }
+            }
+        }
+        if alleles.len() >= 2 {
+            return Some((alleles[0], alleles[1]));
+        }
+        return None;
+    }
+
+    let letters: Vec<char> = up.chars().filter(|c| c.is_ascii_alphabetic()).collect();
+    if letters.len() == 1 {
+        let c = letters[0];
+        if hmp_is_dna_base(c) {
+            return Some((c, c));
+        }
+        if let Some((a, b)) = hmp_iupac_to_pair(c) {
+            return Some((a, b));
+        }
+        return None;
+    }
+    if letters.len() >= 2 && hmp_is_dna_base(letters[0]) && hmp_is_dna_base(letters[1]) {
+        return Some((letters[0], letters[1]));
+    }
+    None
+}
+
+fn infer_hmp_ref_alt_from_samples_local(sample_fields: &[&str]) -> (char, char) {
+    let mut seen: Vec<char> = Vec::new();
+    for tok in sample_fields.iter() {
+        if let Some((a, b)) = parse_hmp_gt_token_local(tok) {
+            for x in [a, b] {
+                if hmp_is_dna_base(x) && !seen.contains(&x) {
+                    seen.push(x);
+                    if seen.len() >= 2 {
+                        return (seen[0], seen[1]);
+                    }
+                }
+            }
+        }
+    }
+    if seen.len() == 1 {
+        return (seen[0], hmp_default_alt_for_ref(seen[0]));
+    }
+    ('A', 'C')
+}
+
+fn hmp_gt_token_to_dosage(token: &str, ref_c: char, alt_c: char) -> f32 {
+    if let Some((a1, a2)) = parse_hmp_gt_token_local(token) {
+        if (a1 == ref_c || a1 == alt_c) && (a2 == ref_c || a2 == alt_c) {
+            let mut d = 0.0f32;
+            if a1 == alt_c {
+                d += 1.0;
+            }
+            if a2 == alt_c {
+                d += 1.0;
+            }
+            d
+        } else {
+            -9.0
+        }
+    } else {
+        -9.0
+    }
+}
+
+struct HmpLineBatchReader {
+    reader: Box<dyn BufRead + Send + Sync + 'static>,
+    finished: bool,
+}
+
+impl HmpLineBatchReader {
+    fn new(path: &str) -> Result<Self, String> {
+        let p = Path::new(path);
+        let mut reader = open_text_maybe_gz(p)?;
+        let mut header_line = String::new();
+
+        loop {
+            header_line.clear();
+            let n = reader
+                .read_line(&mut header_line)
+                .map_err(|e| e.to_string())?;
+            if n == 0 {
+                return Err("No HapMap header found".into());
+            }
+            let trimmed = header_line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            let parts = split_hmp_fields_local(trimmed);
+            if parts.len() < 12 {
+                return Err("Malformed HapMap header: expected >=12 columns".into());
+            }
+            break;
+        }
+
+        Ok(Self {
+            reader,
+            finished: false,
+        })
+    }
+
+    fn next_batch(&mut self, batch_size: usize) -> Result<Vec<String>, String> {
+        if self.finished {
+            return Ok(Vec::new());
+        }
+
+        let mut batch: Vec<String> = Vec::with_capacity(batch_size.max(1));
+        let mut line = String::new();
+        while batch.len() < batch_size.max(1) {
+            line.clear();
+            let n = self
+                .reader
+                .read_line(&mut line)
+                .map_err(|e| e.to_string())?;
+            if n == 0 {
+                self.finished = true;
+                break;
+            }
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            batch.push(line.clone());
+        }
+        Ok(batch)
+    }
+}
+
+enum TextLineBatchReader {
+    Vcf(VcfLineBatchReader),
+    Hmp(HmpLineBatchReader),
+}
+
+impl TextLineBatchReader {
+    fn new(path: &str) -> Result<Self, String> {
+        if is_vcf_path(path) {
+            Ok(Self::Vcf(VcfLineBatchReader::new(path)?))
+        } else if is_hmp_path(path) {
+            Ok(Self::Hmp(HmpLineBatchReader::new(path)?))
+        } else {
+            Err(format!(
+                "Unsupported text genotype input for batch reader: {path}"
+            ))
+        }
+    }
+
+    fn next_batch(&mut self, batch_size: usize) -> Result<Vec<String>, String> {
+        match self {
+            Self::Vcf(reader) => reader.next_batch(batch_size),
+            Self::Hmp(reader) => reader.next_batch(batch_size),
+        }
+    }
+}
+
 enum InputIter {
     Bed(BedSnpIterRaw),
     Vcf(VcfSnpIterRaw),
@@ -672,6 +974,312 @@ enum RowOutcome {
     DropMulti,
     DropNonSnp,
     DropFiltered,
+}
+
+enum PackedPlinkRowOutcome {
+    Keep {
+        site: SiteInfo,
+        gref: String,
+        galt: String,
+        row_bed: Vec<u8>,
+    },
+    SkipInput,
+    DropMulti,
+    DropNonSnp,
+    DropFiltered,
+    Error(String),
+}
+
+#[inline]
+fn dosage_to_plink2bits_rounded(g: f32) -> u8 {
+    match dosage_to_i8_rounded(g) {
+        0 => 0b00,
+        1 => 0b10,
+        2 => 0b11,
+        _ => 0b01,
+    }
+}
+
+fn encode_plink_row_from_f32(row: &[f32]) -> Vec<u8> {
+    let n_samples = row.len();
+    let bytes_per_snp = (n_samples + 3) / 4;
+    let mut row_bed = vec![0u8; bytes_per_snp];
+    for byte_idx in 0..bytes_per_snp {
+        let mut packed: u8 = 0;
+        for within in 0..4 {
+            let samp_idx = byte_idx * 4 + within;
+            let code = if samp_idx < n_samples {
+                dosage_to_plink2bits_rounded(row[samp_idx])
+            } else {
+                0b01
+            };
+            packed |= code << (within * 2);
+        }
+        row_bed[byte_idx] = packed;
+    }
+    row_bed
+}
+
+fn select_row_by_indices(row: &[f32], sample_indices: &[usize]) -> Result<Vec<f32>, String> {
+    let mut selected = Vec::with_capacity(sample_indices.len());
+    for &idx in sample_indices.iter() {
+        if idx >= row.len() {
+            return Err("sample index out of range while converting row".into());
+        }
+        selected.push(row[idx]);
+    }
+    Ok(selected)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process_row_for_plink_output(
+    row: Vec<f32>,
+    site: SiteInfo,
+    selected_indices: &[usize],
+    full_sample_selection: bool,
+    snps_only: bool,
+    maf_f32: f32,
+    geno_f32: f32,
+    impute: bool,
+    apply_het_filter: bool,
+    het_f32: f32,
+) -> PackedPlinkRowOutcome {
+    let (mut gref, mut galt) =
+        match normalize_biallelic_variant(&site.ref_allele, &site.alt_allele, snps_only) {
+            Some(x) => x,
+            None => {
+                if site.ref_allele.contains(',') || site.alt_allele.contains(',') {
+                    return PackedPlinkRowOutcome::DropMulti;
+                }
+                return PackedPlinkRowOutcome::DropNonSnp;
+            }
+        };
+
+    let mut row_sel = if full_sample_selection {
+        row
+    } else {
+        match select_row_by_indices(&row, selected_indices) {
+            Ok(v) => v,
+            Err(msg) => return PackedPlinkRowOutcome::Error(msg),
+        }
+    };
+
+    let keep = process_snp_row(
+        &mut row_sel,
+        &mut gref,
+        &mut galt,
+        maf_f32,
+        geno_f32,
+        impute,
+        apply_het_filter,
+        het_f32,
+    );
+    if !keep {
+        return PackedPlinkRowOutcome::DropFiltered;
+    }
+
+    PackedPlinkRowOutcome::Keep {
+        site,
+        gref,
+        galt,
+        row_bed: encode_plink_row_from_f32(&row_sel),
+    }
+}
+
+fn parse_vcf_line_to_selected_row(
+    line: &str,
+    expected_input_samples: usize,
+    selected_indices: &[usize],
+    full_sample_selection: bool,
+) -> Result<Option<(Vec<f32>, SiteInfo)>, String> {
+    let parts: Vec<_> = line.trim_end().split('\t').collect();
+    if parts.len() < 10 {
+        return Ok(None);
+    }
+
+    let format = parts[8];
+    if !format.split(':').any(|f| f == "GT") {
+        return Ok(None);
+    }
+
+    let sample_fields = &parts[9..];
+    if sample_fields.len() != expected_input_samples {
+        return Err(format!(
+            "VCF sample column count mismatch: expected {}, got {}",
+            expected_input_samples,
+            sample_fields.len()
+        ));
+    }
+
+    let site = SiteInfo {
+        chrom: parts[0].to_string(),
+        pos: parts[1].parse().unwrap_or(0),
+        snp: if parts.len() > 2 && !parts[2].trim().is_empty() && parts[2] != "." {
+            parts[2].to_string()
+        } else {
+            format!("{}_{}", parts[0], parts[1])
+        },
+        ref_allele: parts[3].to_string(),
+        alt_allele: parts[4].to_string(),
+    };
+
+    let row = if full_sample_selection {
+        sample_fields
+            .iter()
+            .map(|field| {
+                let gt = field.split(':').next().unwrap_or(".");
+                gt_to_dosage(gt)
+            })
+            .collect()
+    } else {
+        let mut row: Vec<f32> = Vec::with_capacity(selected_indices.len());
+        for &idx in selected_indices.iter() {
+            if idx >= sample_fields.len() {
+                return Err("sample index out of range while converting row".into());
+            }
+            let gt = sample_fields[idx].split(':').next().unwrap_or(".");
+            row.push(gt_to_dosage(gt));
+        }
+        row
+    };
+
+    Ok(Some((row, site)))
+}
+
+fn parse_hmp_line_to_selected_row(
+    line: &str,
+    expected_input_samples: usize,
+    selected_indices: &[usize],
+    full_sample_selection: bool,
+) -> Result<Option<(Vec<f32>, SiteInfo)>, String> {
+    let trimmed = line.trim();
+    let parts = split_hmp_fields_local(trimmed);
+    if parts.len() < 11 {
+        return Ok(None);
+    }
+
+    let chrom = parts[2].to_string();
+    let pos: i32 = parts[3].parse().unwrap_or(0);
+    let sample_fields = if parts.len() > 11 {
+        &parts[11..]
+    } else {
+        &[][..]
+    };
+    if sample_fields.len() != expected_input_samples {
+        return Err(format!(
+            "HMP sample column count mismatch: expected {}, got {}",
+            expected_input_samples,
+            sample_fields.len()
+        ));
+    }
+
+    let (ref_c, alt_c) = if let Some((r, a)) = parse_hmp_alleles_field_local(parts[1]) {
+        if r != a {
+            (r, a)
+        } else {
+            infer_hmp_ref_alt_from_samples_local(sample_fields)
+        }
+    } else {
+        infer_hmp_ref_alt_from_samples_local(sample_fields)
+    };
+
+    let row = if full_sample_selection {
+        sample_fields
+            .iter()
+            .map(|tok| hmp_gt_token_to_dosage(tok, ref_c, alt_c))
+            .collect()
+    } else {
+        let mut row: Vec<f32> = Vec::with_capacity(selected_indices.len());
+        for &idx in selected_indices.iter() {
+            if idx >= sample_fields.len() {
+                return Err("sample index out of range while converting row".into());
+            }
+            row.push(hmp_gt_token_to_dosage(sample_fields[idx], ref_c, alt_c));
+        }
+        row
+    };
+
+    let site = SiteInfo {
+        chrom: chrom.clone(),
+        pos,
+        snp: format!("{}_{}", chrom, pos),
+        ref_allele: ref_c.to_string(),
+        alt_allele: alt_c.to_string(),
+    };
+
+    Ok(Some((row, site)))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process_vcf_line_for_plink_output(
+    line: String,
+    expected_input_samples: usize,
+    selected_indices: &[usize],
+    full_sample_selection: bool,
+    snps_only: bool,
+    maf_f32: f32,
+    geno_f32: f32,
+    impute: bool,
+    apply_het_filter: bool,
+    het_f32: f32,
+) -> PackedPlinkRowOutcome {
+    match parse_vcf_line_to_selected_row(
+        &line,
+        expected_input_samples,
+        selected_indices,
+        full_sample_selection,
+    ) {
+        Ok(Some((row, site))) => process_row_for_plink_output(
+            row,
+            site,
+            &[],
+            true,
+            snps_only,
+            maf_f32,
+            geno_f32,
+            impute,
+            apply_het_filter,
+            het_f32,
+        ),
+        Ok(None) => PackedPlinkRowOutcome::SkipInput,
+        Err(msg) => PackedPlinkRowOutcome::Error(msg),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process_hmp_line_for_plink_output(
+    line: String,
+    expected_input_samples: usize,
+    selected_indices: &[usize],
+    full_sample_selection: bool,
+    snps_only: bool,
+    maf_f32: f32,
+    geno_f32: f32,
+    impute: bool,
+    apply_het_filter: bool,
+    het_f32: f32,
+) -> PackedPlinkRowOutcome {
+    match parse_hmp_line_to_selected_row(
+        &line,
+        expected_input_samples,
+        selected_indices,
+        full_sample_selection,
+    ) {
+        Ok(Some((row, site))) => process_row_for_plink_output(
+            row,
+            site,
+            &[],
+            true,
+            snps_only,
+            maf_f32,
+            geno_f32,
+            impute,
+            apply_het_filter,
+            het_f32,
+        ),
+        Ok(None) => PackedPlinkRowOutcome::SkipInput,
+        Err(msg) => PackedPlinkRowOutcome::Error(msg),
+    }
 }
 
 // ============================================================
@@ -1205,8 +1813,12 @@ pub fn convert_genotypes(
     };
     let mut last_report: u64 = 0;
 
-    let use_parallel = threads > 1 && matches!(&it, InputIter::Bed(_));
-    if use_parallel {
+    let use_parallel_bed = threads > 1 && matches!(&it, InputIter::Bed(_));
+    let use_parallel_text_to_plink = threads > 1
+        && matches!(fmt, OutFmt::Plink)
+        && matches!(&it, InputIter::Vcf(_) | InputIter::Hmp(_));
+
+    if use_parallel_bed {
         let pool = ThreadPoolBuilder::new()
             .num_threads(threads)
             .build()
@@ -1336,6 +1948,135 @@ pub fn convert_genotypes(
                 }
             }
         }
+    } else if use_parallel_text_to_plink {
+        let pool = ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+
+        let input_samples = it.n_samples();
+        let text_is_vcf = matches!(&it, InputIter::Vcf(_));
+        let mut line_reader =
+            TextLineBatchReader::new(&input).map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+        let target_bytes = 16usize * 1024 * 1024;
+        let bytes_per_row = input_samples.max(1) * std::mem::size_of::<f32>();
+        let mut chunk_size = (target_bytes / bytes_per_row.max(1)).max(1);
+        if chunk_size > 1024 {
+            chunk_size = 1024;
+        }
+
+        loop {
+            let batch = line_reader
+                .next_batch(chunk_size)
+                .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+            if batch.is_empty() {
+                break;
+            }
+
+            let selected_indices_ref = &selected_indices;
+            let rows: Vec<PackedPlinkRowOutcome> = py.detach(|| {
+                pool.install(|| {
+                    batch
+                        .into_par_iter()
+                        .map(|line| {
+                            if text_is_vcf {
+                                process_vcf_line_for_plink_output(
+                                    line,
+                                    input_samples,
+                                    selected_indices_ref,
+                                    full_sample_selection,
+                                    snps_only,
+                                    maf_f32,
+                                    geno_f32,
+                                    impute,
+                                    apply_het_filter,
+                                    het_f32,
+                                )
+                            } else {
+                                process_hmp_line_for_plink_output(
+                                    line,
+                                    input_samples,
+                                    selected_indices_ref,
+                                    full_sample_selection,
+                                    snps_only,
+                                    maf_f32,
+                                    geno_f32,
+                                    impute,
+                                    apply_het_filter,
+                                    het_f32,
+                                )
+                            }
+                        })
+                        .collect()
+                })
+            });
+
+            for row in rows {
+                match row {
+                    PackedPlinkRowOutcome::SkipInput => {}
+                    PackedPlinkRowOutcome::Keep {
+                        site,
+                        gref,
+                        galt,
+                        row_bed,
+                    } => {
+                        stats.n_sites_seen += 1;
+                        if report_progress
+                            && stats.n_sites_seen - last_report >= progress_every as u64
+                        {
+                            if let Some(cb) = progress_callback.as_ref() {
+                                cb.call1(py, (stats.n_sites_seen, total_sites))?;
+                            }
+                            last_report = stats.n_sites_seen;
+                        }
+                        plink_w
+                            .as_mut()
+                            .unwrap()
+                            .write_site_encoded(&site, &gref, &galt, &row_bed)
+                            .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+                        stats.n_sites_written += 1;
+                    }
+                    PackedPlinkRowOutcome::DropMulti => {
+                        stats.n_sites_seen += 1;
+                        if report_progress
+                            && stats.n_sites_seen - last_report >= progress_every as u64
+                        {
+                            if let Some(cb) = progress_callback.as_ref() {
+                                cb.call1(py, (stats.n_sites_seen, total_sites))?;
+                            }
+                            last_report = stats.n_sites_seen;
+                        }
+                        stats.n_sites_dropped_multiallelic += 1;
+                    }
+                    PackedPlinkRowOutcome::DropNonSnp => {
+                        stats.n_sites_seen += 1;
+                        if report_progress
+                            && stats.n_sites_seen - last_report >= progress_every as u64
+                        {
+                            if let Some(cb) = progress_callback.as_ref() {
+                                cb.call1(py, (stats.n_sites_seen, total_sites))?;
+                            }
+                            last_report = stats.n_sites_seen;
+                        }
+                        stats.n_sites_dropped_non_snp += 1;
+                    }
+                    PackedPlinkRowOutcome::DropFiltered => {
+                        stats.n_sites_seen += 1;
+                        if report_progress
+                            && stats.n_sites_seen - last_report >= progress_every as u64
+                        {
+                            if let Some(cb) = progress_callback.as_ref() {
+                                cb.call1(py, (stats.n_sites_seen, total_sites))?;
+                            }
+                            last_report = stats.n_sites_seen;
+                        }
+                    }
+                    PackedPlinkRowOutcome::Error(msg) => {
+                        return Err(pyo3::exceptions::PyRuntimeError::new_err(msg));
+                    }
+                }
+            }
+        }
     } else {
         let mut row_i8: Vec<i8> = Vec::with_capacity(n_samples.max(1));
         while let Some((row, site)) = it.next_snp() {
@@ -1363,16 +2104,8 @@ pub fn convert_genotypes(
             let mut row_sel = if full_sample_selection {
                 row
             } else {
-                let mut v = Vec::with_capacity(selected_indices.len());
-                for &idx in selected_indices.iter() {
-                    if idx >= row.len() {
-                        return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                            "sample index out of range while converting row",
-                        ));
-                    }
-                    v.push(row[idx]);
-                }
-                v
+                select_row_by_indices(&row, &selected_indices)
+                    .map_err(pyo3::exceptions::PyRuntimeError::new_err)?
             };
 
             let keep = process_snp_row(

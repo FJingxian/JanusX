@@ -12644,10 +12644,21 @@ def _run_methods_parallel(
             line_printer(
                 f"Cross-validation ...Skipped [{format_elapsed(elapsed_total if np.isfinite(elapsed_total) else 0.0)}]"
             )
-        if bool(result.get("final_fit_skipped", False)) and (not bool(result.get("__stage_lines_emitted", False))):
-            line_printer(f"Fitting ...Skipped [{format_elapsed(0.0)}]")
-        if bool(result.get("final_predict_skipped", False)) and (not bool(result.get("__stage_lines_emitted", False))):
-            line_printer(f"Predicting ...Skipped [{format_elapsed(0.0)}]")
+        if not bool(result.get("__stage_lines_emitted", False)):
+            if bool(result.get("final_fit_skipped", False)):
+                line_printer(f"Fitting ...Skipped [{format_elapsed(0.0)}]")
+            else:
+                elapsed_fit = _float_or_nan(result.get("elapsed_fit_sec", np.nan))
+                line_printer(
+                    f"Fitting ...Finished [{format_elapsed(elapsed_fit if np.isfinite(elapsed_fit) else 0.0)}]"
+                )
+            if bool(result.get("final_predict_skipped", False)):
+                line_printer(f"Predicting ...Skipped [{format_elapsed(0.0)}]")
+            else:
+                elapsed_predict = _float_or_nan(result.get("elapsed_predict_sec", np.nan))
+                line_printer(
+                    f"Predicting ...Finished [{format_elapsed(elapsed_predict if np.isfinite(elapsed_predict) else 0.0)}]"
+                )
 
     def _method_expects_rrblup_iter_progress(name: str) -> bool:
         name_key = str(name)
@@ -13118,6 +13129,11 @@ def _run_methods_parallel(
                     skipped: bool = False,
                 ) -> None:
                     nonlocal fit_status, stage_lines_emitted
+                    if (cv_splits is None) or (len(cv_splits) == 0):
+                        if fit_status is not None:
+                            fit_status.close(show_done=False)
+                            fit_status = None
+                        return
                     elapsed_parts = (
                         [float(elapsed_payload)]
                         if (elapsed_payload is not None and np.isfinite(float(elapsed_payload)))
@@ -13159,6 +13175,11 @@ def _run_methods_parallel(
                     skipped: bool = False,
                 ) -> None:
                     nonlocal pred_status, stage_lines_emitted
+                    if (cv_splits is None) or (len(cv_splits) == 0):
+                        if pred_status is not None:
+                            pred_status.close(show_done=False)
+                            pred_status = None
+                        return
                     elapsed_parts = (
                         [float(elapsed_payload)]
                         if (elapsed_payload is not None and np.isfinite(float(elapsed_payload)))
@@ -14143,6 +14164,11 @@ def _run_methods_parallel(
                 skipped: bool = False,
             ) -> None:
                 nonlocal fit_status, stage_lines_emitted
+                if (cv_splits is None) or (len(cv_splits) == 0):
+                    if fit_status is not None:
+                        fit_status.close(show_done=False)
+                        fit_status = None
+                    return
                 elapsed_parts = (
                     [float(elapsed)]
                     if (elapsed is not None and np.isfinite(float(elapsed)))
@@ -14197,6 +14223,11 @@ def _run_methods_parallel(
                 skipped: bool = False,
             ) -> None:
                 nonlocal pred_status, stage_lines_emitted
+                if (cv_splits is None) or (len(cv_splits) == 0):
+                    if pred_status is not None:
+                        pred_status.close(show_done=False)
+                        pred_status = None
+                    return
                 elapsed_parts = (
                     [float(elapsed)]
                     if (elapsed is not None and np.isfinite(float(elapsed)))
@@ -18002,6 +18033,7 @@ def _run_gs_pipeline(
                         delimiter=None,
                         # Prefer PLINK cache for GS packed Rust routes, including FILE inputs.
                         prefer_plink_for_txt=True,
+                        threads=int(args.thread),
                     )
                 except Exception as ex:
                     if hard_packed_preprocess_requested:

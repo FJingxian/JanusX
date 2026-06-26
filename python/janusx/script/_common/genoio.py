@@ -132,6 +132,7 @@ def determine_genotype_source(
     snps_only: bool = False,
     delimiter: str | None = None,
     apply_cache: bool = False,
+    threads: int = 0,
 ) -> tuple[str, str]:
     if vcf:
         gfile = str(vcf)
@@ -156,6 +157,7 @@ def determine_genotype_source(
             snps_only=bool(snps_only),
             delimiter=delimiter,
             force_kind=force_kind,
+            threads=int(threads),
         )
         gfile_norm = str(gfile_norm).replace("\\", "/")
 
@@ -172,6 +174,7 @@ def determine_genotype_source_from_args(args: Any) -> tuple[str, str]:
         prefix=getattr(args, "prefix", None),
         snps_only=bool(getattr(args, "snps_only", False)),
         delimiter=getattr(args, "delimiter", None),
+        threads=int(getattr(args, "thread", 0) or 0),
         # Cache conversion is delayed to first real genotype read so CLI can
         # print config/help promptly instead of blocking at startup.
         apply_cache=bool(getattr(args, "cache_input", False)),

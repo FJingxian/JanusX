@@ -13,7 +13,6 @@ import pandas as pd
 from janusx.gfreader import (
     SiteInfo,
     inspect_genotype_file,
-    load_bed_2bit_packed,
     prepare_cli_input_cache,
 )
 try:
@@ -64,10 +63,12 @@ PACKED_META_CACHE_VERSION = 1
 _BYTE_LUT = np.arange(256, dtype=np.uint16)
 _NONMISS_LUT = np.zeros((256,), dtype=np.uint8)
 _HET_LUT = np.zeros((256,), dtype=np.uint8)
+_ALT_SUM_LUT = np.zeros((256,), dtype=np.uint8)
 for _within in range(4):
     _code = (_BYTE_LUT >> (_within * 2)) & 0b11
     _NONMISS_LUT += (_code != 0b01).astype(np.uint8)
     _HET_LUT += (_code == 0b10).astype(np.uint8)
+    _ALT_SUM_LUT += ((_code == 0b10).astype(np.uint8) + (2 * (_code == 0b11).astype(np.uint8)))
 
 
 def find_duplicates(items: Sequence[str]) -> list[str]:
@@ -417,6 +418,110 @@ def packed_row_het_rate(packed: np.ndarray, n_samples: int) -> np.ndarray:
     return out
 
 
+def _scan_bed_2bit_packed_stats_fallback(
+    prefix: str,
+    *,
+    n_expected_samples: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, int]:
+    """
+    Stream packed BED row statistics from a memmap when the Rust-side scan
+    helper is unavailable in the installed extension.
+    """
+    plink_prefix = normalize_plink_prefix(prefix)
+    _sample_ids_check, n_snps = inspect_genotype_file(str(plink_prefix))
+    n_samples = int(n_expected_samples)
+    if n_samples <= 0:
+        raise ValueError("Packed BED stats fallback requires n_samples > 0.")
+    packed_memmap = open_plink_bed_payload_memmap(
+        str(plink_prefix),
+        n_samples=n_samples,
+        n_snps=int(n_snps),
+    )
+    bytes_per_snp = int(packed_memmap.shape[1]) if packed_memmap.ndim == 2 else 0
+    if bytes_per_snp <= 0:
+        raise ValueError("Packed BED stats fallback found invalid bytes_per_snp.")
+
+    chunk_mb_raw = os.environ.get("JX_PACKED_META_SCAN_CHUNK_MB", "64").strip()
+    try:
+        chunk_mb = float(chunk_mb_raw)
+    except Exception:
+        chunk_mb = 64.0
+    if (not np.isfinite(chunk_mb)) or (chunk_mb <= 0.0):
+        chunk_mb = 64.0
+    chunk_target_bytes = max(1, int(chunk_mb * 1024.0 * 1024.0))
+    chunk_rows = max(1, min(int(n_snps), chunk_target_bytes // max(1, bytes_per_snp)))
+
+    full = n_samples // 4
+    rem = n_samples % 4
+    n_snps_i = int(n_snps)
+    miss_arr = np.zeros((n_snps_i,), dtype=np.float32)
+    maf_arr = np.zeros((n_snps_i,), dtype=np.float32)
+    std_arr = np.zeros((n_snps_i,), dtype=np.float32)
+    row_flip_arr = np.zeros((n_snps_i,), dtype=np.bool_)
+    het_arr = np.zeros((n_snps_i,), dtype=np.float32)
+
+    for row_start in range(0, n_snps_i, int(chunk_rows)):
+        row_end = min(n_snps_i, row_start + int(chunk_rows))
+        chunk = packed_memmap[row_start:row_end]
+        n_rows = int(row_end - row_start)
+        non_missing = np.zeros((n_rows,), dtype=np.int64)
+        het = np.zeros((n_rows,), dtype=np.int64)
+        alt_sum = np.zeros((n_rows,), dtype=np.int64)
+
+        if full > 0:
+            base = np.asarray(chunk[:, :full], dtype=np.uint8)
+            non_missing += _NONMISS_LUT[base].sum(axis=1, dtype=np.int64)
+            het += _HET_LUT[base].sum(axis=1, dtype=np.int64)
+            alt_sum += _ALT_SUM_LUT[base].sum(axis=1, dtype=np.int64)
+
+        if rem > 0:
+            tail = np.asarray(chunk[:, full], dtype=np.uint8)
+            for within in range(rem):
+                code = (tail >> (within * 2)) & 0b11
+                het_mask = (code == 0b10)
+                hom_alt_mask = (code == 0b11)
+                non_missing += (code != 0b01).astype(np.int64, copy=False)
+                het += het_mask.astype(np.int64, copy=False)
+                alt_sum += (
+                    het_mask.astype(np.int64, copy=False)
+                    + (2 * hom_alt_mask.astype(np.int64, copy=False))
+                )
+
+        missing = int(n_samples) - non_missing
+        miss_arr[row_start:row_end] = (
+            missing.astype(np.float32, copy=False) / float(n_samples)
+        )
+        ok = non_missing > 0
+        if np.any(ok):
+            p_alt = np.zeros((n_rows,), dtype=np.float32)
+            het_chunk = np.zeros((n_rows,), dtype=np.float32)
+            p_alt[ok] = alt_sum[ok].astype(np.float32, copy=False) / (
+                2.0 * non_missing[ok].astype(np.float32, copy=False)
+            )
+            het_chunk[ok] = (
+                het[ok].astype(np.float32, copy=False)
+                / non_missing[ok].astype(np.float32, copy=False)
+            )
+            maf_arr[row_start:row_end] = np.minimum(
+                p_alt,
+                1.0 - p_alt,
+            ).astype(np.float32, copy=False)
+            std_arr[row_start:row_end] = np.sqrt(
+                np.maximum(0.0, 2.0 * p_alt * (1.0 - p_alt))
+            ).astype(np.float32, copy=False)
+            row_flip_arr[row_start:row_end] = p_alt > 0.5
+            het_arr[row_start:row_end] = het_chunk
+
+    return (
+        miss_arr,
+        maf_arr,
+        std_arr,
+        row_flip_arr,
+        het_arr,
+        int(n_samples),
+    )
+
+
 def normalize_packed_filter_mode(mode: str) -> str:
     key = str(mode or "compact").strip().lower()
     if key in {"", "compact", "filtered", "subset"}:
@@ -740,61 +845,11 @@ def _build_packed_meta_layer(
         miss_raw, maf_raw, std_raw, row_flip_raw, het_raw, packed_n = scan_bed_2bit_packed_stats(
             str(plink_prefix)
         )
-        if int(packed_n) != n_expected:
-            raise ValueError(
-                packed_sample_size_mismatch_message(
-                    expected_n=int(n_expected),
-                    got_n=int(packed_n),
-                )
-            )
-        miss_arr = np.ascontiguousarray(np.asarray(miss_raw, dtype=np.float32).reshape(-1), dtype=np.float32)
-        maf_minor = np.ascontiguousarray(np.asarray(maf_raw, dtype=np.float32).reshape(-1), dtype=np.float32)
-        row_flip_input = np.ascontiguousarray(
-            np.asarray(row_flip_raw, dtype=np.bool_).reshape(-1),
-            dtype=np.bool_,
+    else:
+        miss_raw, maf_raw, std_raw, row_flip_raw, het_raw, packed_n = _scan_bed_2bit_packed_stats_fallback(
+            str(plink_prefix),
+            n_expected_samples=int(n_expected),
         )
-        row_maf = np.ascontiguousarray(
-            np.where(row_flip_input, 1.0 - maf_minor, maf_minor).astype(np.float32, copy=False),
-            dtype=np.float32,
-        )
-        row_flip = np.zeros_like(row_flip_input, dtype=np.bool_)
-        std_arr = (
-            np.ascontiguousarray(np.asarray(std_raw, dtype=np.float32).reshape(-1), dtype=np.float32)
-            if want_std
-            else None
-        )
-        het_arr = np.ascontiguousarray(np.asarray(het_raw, dtype=np.float32).reshape(-1), dtype=np.float32)
-        keep = np.ones((int(maf_minor.shape[0]),), dtype=np.bool_)
-        maf_thr = float(maf)
-        if maf_thr > 0.0:
-            keep &= (maf_minor >= maf_thr) & (maf_minor <= (1.0 - maf_thr))
-        miss_thr = float(missing_rate)
-        if miss_thr < 1.0:
-            keep &= miss_arr <= miss_thr
-        het_thr = float(het_threshold)
-        if het_thr > 0.0:
-            keep &= het_arr <= het_thr
-        if bool(snps_only):
-            snp_mask = plink_snp_mask(str(plink_prefix))
-            if snp_mask.shape[0] != keep.shape[0]:
-                raise ValueError(
-                    f"BIM SNP mask length mismatch: got {snp_mask.shape[0]}, expected {keep.shape[0]}"
-                )
-            keep &= snp_mask
-        if not np.any(keep):
-            raise ValueError(packed_no_snps_after_filter_message())
-        return _build_packed_meta_context(
-            source_prefix=str(plink_prefix),
-            n_samples=int(packed_n),
-            row_missing=miss_arr,
-            row_maf=row_maf,
-            row_flip=row_flip,
-            site_keep=np.ascontiguousarray(keep, dtype=np.bool_),
-            std_denom=std_arr,
-            dom_af=het_arr if want_dom else None,
-        )
-
-    packed_raw, miss_raw, maf_raw, std_raw, packed_n = load_bed_2bit_packed(str(plink_prefix))
     if int(packed_n) != n_expected:
         raise ValueError(
             packed_sample_size_mismatch_message(
@@ -802,30 +857,33 @@ def _build_packed_meta_layer(
                 got_n=int(packed_n),
             )
         )
-    packed = np.ascontiguousarray(np.asarray(packed_raw, dtype=np.uint8))
     miss_arr = np.ascontiguousarray(np.asarray(miss_raw, dtype=np.float32).reshape(-1), dtype=np.float32)
-    row_maf = np.ascontiguousarray(np.asarray(maf_raw, dtype=np.float32).reshape(-1), dtype=np.float32)
+    maf_minor = np.ascontiguousarray(np.asarray(maf_raw, dtype=np.float32).reshape(-1), dtype=np.float32)
+    row_flip_input = np.ascontiguousarray(
+        np.asarray(row_flip_raw, dtype=np.bool_).reshape(-1),
+        dtype=np.bool_,
+    )
+    row_maf = np.ascontiguousarray(
+        np.where(row_flip_input, 1.0 - maf_minor, maf_minor).astype(np.float32, copy=False),
+        dtype=np.float32,
+    )
+    row_flip = np.zeros_like(row_flip_input, dtype=np.bool_)
     std_arr = (
         np.ascontiguousarray(np.asarray(std_raw, dtype=np.float32).reshape(-1), dtype=np.float32)
         if want_std
         else None
     )
-    dom_arr = (
-        packed_row_het_rate(packed, int(packed_n))
-        if (want_dom or (float(het_threshold) > 0.0))
-        else None
-    )
-    keep = np.ones((int(row_maf.shape[0]),), dtype=np.bool_)
+    het_arr = np.ascontiguousarray(np.asarray(het_raw, dtype=np.float32).reshape(-1), dtype=np.float32)
+    keep = np.ones((int(maf_minor.shape[0]),), dtype=np.bool_)
     maf_thr = float(maf)
     if maf_thr > 0.0:
-        keep &= (row_maf >= maf_thr) & (row_maf <= (1.0 - maf_thr))
+        keep &= (maf_minor >= maf_thr) & (maf_minor <= (1.0 - maf_thr))
     miss_thr = float(missing_rate)
     if miss_thr < 1.0:
         keep &= miss_arr <= miss_thr
-    if float(het_threshold) > 0.0:
-        if dom_arr is None:
-            dom_arr = packed_row_het_rate(packed, int(packed_n))
-        keep &= dom_arr <= float(het_threshold)
+    het_thr = float(het_threshold)
+    if het_thr > 0.0:
+        keep &= het_arr <= het_thr
     if bool(snps_only):
         snp_mask = plink_snp_mask(str(plink_prefix))
         if snp_mask.shape[0] != keep.shape[0]:
@@ -840,10 +898,10 @@ def _build_packed_meta_layer(
         n_samples=int(packed_n),
         row_missing=miss_arr,
         row_maf=row_maf,
-        row_flip=np.zeros((int(row_maf.shape[0]),), dtype=np.bool_),
+        row_flip=row_flip,
         site_keep=np.ascontiguousarray(keep, dtype=np.bool_),
         std_denom=std_arr,
-        dom_af=dom_arr if want_dom else None,
+        dom_af=het_arr if want_dom else None,
     )
 
 

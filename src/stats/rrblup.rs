@@ -963,6 +963,26 @@ fn sample_var_f64(v: &[f64]) -> f64 {
     ss / ((n - 1) as f64)
 }
 
+#[inline]
+fn parse_nonnegative_index_vec_i64(values: &[i64], name: &str) -> Result<Vec<usize>, String> {
+    let mut out = Vec::with_capacity(values.len());
+    for (i, &raw) in values.iter().enumerate() {
+        if raw < 0 {
+            return Err(format!("{name}[{i}] must be >= 0, got {raw}"));
+        }
+        out.push(raw as usize);
+    }
+    Ok(out)
+}
+
+#[inline]
+fn is_identity_row_indices(indices: &[usize]) -> bool {
+    indices
+        .iter()
+        .enumerate()
+        .all(|(dst_row, &src_row)| dst_row == src_row)
+}
+
 struct RrblupExactSnpPreparedInner {
     n_samples: usize,
     n_train: usize,
@@ -1139,9 +1159,8 @@ fn rrblup_exact_reml_cost_from_spectrum(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_rrblup_exact_snp_cache_from_packed(
-    packed_flat: &[u8],
-    bytes_per_snp: usize,
+fn build_rrblup_exact_snp_cache_from_source(
+    mut source: RrblupPcgSource<'_>,
     n_samples: usize,
     train_idx: Vec<usize>,
     row_flip_keep: Vec<bool>,
@@ -1170,10 +1189,6 @@ fn build_rrblup_exact_snp_cache_from_packed(
     let pool_owned = get_cached_pool(threads).map_err(|e| e.to_string())?;
     let pool_ref = pool_owned.as_ref();
     let code4_lut = packed_byte_lut().code4;
-    let mut source = RrblupPcgSource::Resident {
-        packed_flat,
-        bytes_per_snp,
-    };
     let mut a_star = vec![0.0_f64; eff_m * eff_m];
     let mut row_sum = vec![0.0_f64; eff_m];
     let mut block_f32 = vec![0.0_f32; eff_m * sample_block_use];
@@ -1356,9 +1371,43 @@ fn build_rrblup_exact_snp_cache_from_packed(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn fit_rrblup_exact_snp_from_cache_packed(
-    cache: &RrblupExactSnpPreparedInner,
+fn build_rrblup_exact_snp_cache_from_packed(
     packed_flat: &[u8],
+    bytes_per_snp: usize,
+    n_samples: usize,
+    train_idx: Vec<usize>,
+    row_flip_keep: Vec<bool>,
+    row_mean: Vec<f32>,
+    row_inv_sd: Vec<f32>,
+    packed_row_indices: Option<Vec<usize>>,
+    sample_block_use: usize,
+    m_effective: usize,
+    threads: usize,
+    blas_threads: usize,
+) -> Result<RrblupExactSnpPreparedInner, String> {
+    build_rrblup_exact_snp_cache_from_source(
+        RrblupPcgSource::Resident {
+            packed_flat,
+            bytes_per_snp,
+        },
+        n_samples,
+        train_idx,
+        row_flip_keep,
+        row_mean,
+        row_inv_sd,
+        packed_row_indices,
+        sample_block_use,
+        m_effective,
+        threads,
+        blas_threads,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fit_rrblup_exact_snp_from_cache_source(
+    cache: &RrblupExactSnpPreparedInner,
+    resident_packed_flat: Option<&[u8]>,
+    prefix: &str,
     bytes_per_snp: usize,
     n_samples: usize,
     y_vec_f64: Vec<f64>,
@@ -1418,10 +1467,13 @@ fn fit_rrblup_exact_snp_from_cache_packed(
             d * d
         })
         .sum::<f64>();
-    let mut source = RrblupPcgSource::Resident {
-        packed_flat,
+    let mut source = build_rrblup_source(
+        resident_packed_flat,
         bytes_per_snp,
-    };
+        prefix,
+        n_samples,
+        cache.m.max(1),
+    )?;
     let mut z = vec![0.0_f64; cache.m];
     let mut tmp_dot = vec![0.0_f32; cache.m];
     let mut block_f32 = vec![0.0_f32; cache.m * cache.sample_block.max(1)];
@@ -1612,10 +1664,13 @@ fn fit_rrblup_exact_snp_from_cache_packed(
         } else {
             let train_pred_abs: Vec<usize> =
                 local_idx.iter().map(|&i| cache.train_idx[i]).collect();
-            let mut pred_source = RrblupPcgSource::Resident {
-                packed_flat,
+            let mut pred_source = build_rrblup_source(
+                resident_packed_flat,
                 bytes_per_snp,
-            };
+                prefix,
+                n_samples,
+                pred_block_rows,
+            )?;
             let pred_train_subset = pcg_x_mul_samples(
                 &mut pred_source,
                 n_samples,
@@ -1637,10 +1692,13 @@ fn fit_rrblup_exact_snp_from_cache_packed(
                 .collect()
         }
     } else {
-        let mut pred_source = RrblupPcgSource::Resident {
-            packed_flat,
+        let mut pred_source = build_rrblup_source(
+            resident_packed_flat,
             bytes_per_snp,
-        };
+            prefix,
+            n_samples,
+            pred_block_rows,
+        )?;
         let pred_train_full = pcg_x_mul_samples(
             &mut pred_source,
             n_samples,
@@ -1672,10 +1730,13 @@ fn fit_rrblup_exact_snp_from_cache_packed(
         None
     };
     if !test_idx.is_empty() {
-        let mut pred_test_source = RrblupPcgSource::Resident {
-            packed_flat,
+        let mut pred_test_source = build_rrblup_source(
+            resident_packed_flat,
             bytes_per_snp,
-        };
+            prefix,
+            n_samples,
+            pred_block_rows,
+        )?;
         let pred_test_f32 = pcg_x_mul_samples(
             &mut pred_test_source,
             n_samples,
@@ -1740,6 +1801,53 @@ fn fit_rrblup_exact_snp_from_cache_packed(
         beta_f32,
         cache.eig_backend.clone(),
     ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fit_rrblup_exact_snp_from_cache_packed(
+    cache: &RrblupExactSnpPreparedInner,
+    packed_flat: &[u8],
+    bytes_per_snp: usize,
+    n_samples: usize,
+    y_vec_f64: Vec<f64>,
+    test_idx: Vec<usize>,
+    train_pred_pick: Option<Vec<usize>>,
+    log10_lambda_low: f64,
+    log10_lambda_high: f64,
+    reml_tol: f64,
+    reml_max_iter: usize,
+    threads: usize,
+    blas_threads: usize,
+) -> Result<
+    (
+        Vec<f64>,
+        Vec<f64>,
+        f64,
+        f64,
+        f64,
+        f64,
+        f64,
+        Vec<f32>,
+        String,
+    ),
+    String,
+> {
+    fit_rrblup_exact_snp_from_cache_source(
+        cache,
+        Some(packed_flat),
+        "",
+        bytes_per_snp,
+        n_samples,
+        y_vec_f64,
+        test_idx,
+        train_pred_pick,
+        log10_lambda_low,
+        log10_lambda_high,
+        reml_tol,
+        reml_max_iter,
+        threads,
+        blas_threads,
+    )
 }
 
 #[pyfunction]
@@ -2038,6 +2146,307 @@ pub fn rrblup_exact_snp_fit_prepared<'py>(
             fit_rrblup_exact_snp_from_cache_packed(
                 cache_inner.as_ref(),
                 packed_flat.as_ref(),
+                bytes_per_snp,
+                n_samples,
+                y_vec_f64,
+                test_idx,
+                train_pred_pick,
+                log10_lambda_low,
+                log10_lambda_high,
+                reml_tol,
+                reml_max_iter,
+                threads,
+                blas_threads,
+            )
+        })
+        .map_err(map_err_string_to_py)?;
+    let alpha = y_train.as_slice()?.iter().copied().sum::<f64>() / (cache.inner.n_train as f64);
+    let train_arr = PyArray2::from_owned_array(
+        py,
+        Array2::from_shape_vec((pred_train_ret.len(), 1), pred_train_ret)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+    )
+    .into_bound();
+    let test_arr = PyArray2::from_owned_array(
+        py,
+        Array2::from_shape_vec((pred_test_ret.len(), 1), pred_test_ret)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+    )
+    .into_bound();
+    let beta_arr = PyArray1::from_owned_array(py, Array1::from_vec(beta_ret)).into_bound();
+    let mean_arr = PyArray1::from_owned_array(py, Array1::from_vec(row_mean_ret)).into_bound();
+    let inv_arr = PyArray1::from_owned_array(py, Array1::from_vec(row_inv_sd_ret)).into_bound();
+    Ok((
+        train_arr,
+        test_arr,
+        pve_trainvar,
+        lambda_opt,
+        reml_opt,
+        (var_g, sigma_e2),
+        m_effective,
+        alpha,
+        beta_arr,
+        mean_arr,
+        inv_arr,
+        eig_backend,
+    ))
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    source_prefix,
+    train_sample_indices,
+    row_source_indices,
+    maf,
+    row_flip,
+    sample_block=2048,
+    std_eps=1e-12_f64,
+    threads=0,
+    blas_threads=0
+))]
+pub fn rrblup_exact_snp_prepare_bed_from_meta<'py>(
+    py: Python<'py>,
+    source_prefix: String,
+    train_sample_indices: PyReadonlyArray1<'py, i64>,
+    row_source_indices: PyReadonlyArray1<'py, i64>,
+    maf: PyReadonlyArray1<'py, f32>,
+    row_flip: PyReadonlyArray1<'py, bool>,
+    sample_block: usize,
+    std_eps: f64,
+    threads: usize,
+    blas_threads: usize,
+) -> PyResult<RrblupExactSnpCache> {
+    if str::trim(source_prefix.as_str()).is_empty() {
+        return Err(PyRuntimeError::new_err(
+            "rrblup_exact_snp_prepare_bed_from_meta requires non-empty source_prefix.",
+        ));
+    }
+    if !(std_eps.is_finite() && std_eps > 0.0) {
+        return Err(PyRuntimeError::new_err(
+            "rrblup_exact_snp_prepare_bed_from_meta requires finite std_eps > 0.",
+        ));
+    }
+    let n_samples = crate::gfcore::read_fam(&source_prefix)
+        .map_err(PyRuntimeError::new_err)?
+        .len();
+    if n_samples == 0 {
+        return Err(PyRuntimeError::new_err(
+            "rrblup_exact_snp_prepare_bed_from_meta found zero samples in source_prefix.fam.",
+        ));
+    }
+    let train_idx = parse_index_vec_i64(
+        train_sample_indices.as_slice()?,
+        n_samples,
+        "train_sample_indices",
+    )?;
+    if train_idx.len() <= 1 {
+        return Err(PyRuntimeError::new_err(
+            "rrblup_exact_snp_prepare_bed_from_meta requires at least two training samples.",
+        ));
+    }
+    let row_source_idx = parse_nonnegative_index_vec_i64(
+        row_source_indices.as_slice()?,
+        "row_source_indices",
+    )
+    .map_err(PyRuntimeError::new_err)?;
+    let eff_m = row_source_idx.len();
+    if eff_m == 0 {
+        return Err(PyRuntimeError::new_err(
+            "rrblup_exact_snp_prepare_bed_from_meta received zero active markers.",
+        ));
+    }
+    let maf_keep: Vec<f32> = match maf.as_slice() {
+        Ok(s) => s.to_vec(),
+        Err(_) => maf.as_array().iter().copied().collect(),
+    };
+    let row_flip_keep: Vec<bool> = match row_flip.as_slice() {
+        Ok(s) => s.to_vec(),
+        Err(_) => row_flip.as_array().iter().copied().collect(),
+    };
+    if maf_keep.len() != eff_m {
+        return Err(PyRuntimeError::new_err(format!(
+            "maf length mismatch: got {}, expected {eff_m}",
+            maf_keep.len()
+        )));
+    }
+    if row_flip_keep.len() != eff_m {
+        return Err(PyRuntimeError::new_err(format!(
+            "row_flip length mismatch: got {}, expected {eff_m}",
+            row_flip_keep.len()
+        )));
+    }
+    let packed_row_indices = if is_identity_row_indices(&row_source_idx) {
+        None
+    } else {
+        Some(row_source_idx)
+    };
+    let std_eps32 = std_eps.max(1e-12) as f32;
+    let mut row_mean = vec![0.0_f32; eff_m];
+    let mut row_inv_sd = vec![0.0_f32; eff_m];
+    let mut m_effective = 0usize;
+    for j in 0..eff_m {
+        let p = maf_keep[j].clamp(0.0, 0.5);
+        let mean = 2.0_f32 * p;
+        let var = (2.0_f32 * p * (1.0_f32 - p)).max(0.0);
+        row_mean[j] = mean;
+        if var > std_eps32 {
+            row_inv_sd[j] = 1.0_f32 / var.sqrt();
+            m_effective += 1;
+        } else {
+            row_inv_sd[j] = 0.0_f32;
+        }
+    }
+    if m_effective == 0 {
+        return Err(PyRuntimeError::new_err(
+            "rrblup_exact_snp_prepare_bed_from_meta found zero effective markers after standardization.",
+        ));
+    }
+    let bytes_per_snp = n_samples.div_ceil(4);
+    let sample_block_use = sample_block.max(1).min(train_idx.len().max(1));
+    let cache_inner = py
+        .detach(move || {
+            let source = build_rrblup_source(
+                None,
+                bytes_per_snp,
+                source_prefix.as_str(),
+                n_samples,
+                eff_m.max(1),
+            )?;
+            build_rrblup_exact_snp_cache_from_source(
+                source,
+                n_samples,
+                train_idx,
+                row_flip_keep,
+                row_mean,
+                row_inv_sd,
+                packed_row_indices,
+                sample_block_use,
+                m_effective,
+                threads,
+                blas_threads,
+            )
+        })
+        .map_err(map_err_string_to_py)?;
+    Ok(RrblupExactSnpCache {
+        inner: Arc::new(cache_inner),
+    })
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    cache,
+    source_prefix,
+    y_train,
+    test_sample_indices=None,
+    train_pred_local_indices=None,
+    log10_lambda_low=-6.0_f64,
+    log10_lambda_high=6.0_f64,
+    reml_tol=1e-4_f64,
+    reml_max_iter=50,
+    threads=0,
+    blas_threads=0
+))]
+pub fn rrblup_exact_snp_fit_prepared_bed<'py>(
+    py: Python<'py>,
+    cache: PyRef<'py, RrblupExactSnpCache>,
+    source_prefix: String,
+    y_train: PyReadonlyArray1<'py, f64>,
+    test_sample_indices: Option<PyReadonlyArray1<'py, i64>>,
+    train_pred_local_indices: Option<PyReadonlyArray1<'py, i64>>,
+    log10_lambda_low: f64,
+    log10_lambda_high: f64,
+    reml_tol: f64,
+    reml_max_iter: usize,
+    threads: usize,
+    blas_threads: usize,
+) -> PyResult<(
+    Bound<'py, PyArray2<f64>>,
+    Bound<'py, PyArray2<f64>>,
+    f64,
+    f64,
+    f64,
+    (f64, f64),
+    usize,
+    f64,
+    Bound<'py, PyArray1<f32>>,
+    Bound<'py, PyArray1<f32>>,
+    Bound<'py, PyArray1<f32>>,
+    String,
+)> {
+    if str::trim(source_prefix.as_str()).is_empty() {
+        return Err(PyRuntimeError::new_err(
+            "rrblup_exact_snp_fit_prepared_bed requires non-empty source_prefix.",
+        ));
+    }
+    if !(log10_lambda_low.is_finite() && log10_lambda_high.is_finite()) {
+        return Err(PyRuntimeError::new_err(
+            "rrblup_exact_snp_fit_prepared_bed requires finite log10(lambda) bounds.",
+        ));
+    }
+    if !(reml_tol.is_finite() && reml_tol > 0.0) {
+        return Err(PyRuntimeError::new_err(
+            "rrblup_exact_snp_fit_prepared_bed requires finite reml_tol > 0.",
+        ));
+    }
+    if reml_max_iter == 0 {
+        return Err(PyRuntimeError::new_err(
+            "rrblup_exact_snp_fit_prepared_bed requires reml_max_iter > 0.",
+        ));
+    }
+    let n_samples = crate::gfcore::read_fam(&source_prefix)
+        .map_err(PyRuntimeError::new_err)?
+        .len();
+    if n_samples == 0 {
+        return Err(PyRuntimeError::new_err(
+            "rrblup_exact_snp_fit_prepared_bed found zero samples in source_prefix.fam.",
+        ));
+    }
+    if n_samples != cache.inner.n_samples {
+        return Err(PyRuntimeError::new_err(format!(
+            "rrblup exact SNP bed cache sample-count mismatch: got {n_samples}, expected {}",
+            cache.inner.n_samples
+        )));
+    }
+    let y_vec_f64: Vec<f64> = match y_train.as_slice() {
+        Ok(s) => s.to_vec(),
+        Err(_) => y_train.as_array().iter().copied().collect(),
+    };
+    let test_idx = if let Some(sidx) = test_sample_indices {
+        parse_index_vec_i64(sidx.as_slice()?, n_samples, "test_sample_indices")?
+    } else {
+        Vec::new()
+    };
+    let train_pred_pick = if let Some(local_idx) = train_pred_local_indices {
+        Some(parse_index_vec_i64(
+            local_idx.as_slice()?,
+            cache.inner.n_train,
+            "train_pred_local_indices",
+        )?)
+    } else {
+        None
+    };
+    let cache_inner = Arc::clone(&cache.inner);
+    let row_mean_ret = cache_inner.row_mean.clone();
+    let row_inv_sd_ret = cache_inner.row_inv_sd.clone();
+    let m_effective = cache_inner.m_effective;
+    let bytes_per_snp = n_samples.div_ceil(4);
+    let source_prefix_fit = source_prefix.clone();
+    let (
+        pred_train_ret,
+        pred_test_ret,
+        pve_trainvar,
+        lambda_opt,
+        reml_opt,
+        var_g,
+        sigma_e2,
+        beta_ret,
+        eig_backend,
+    ) = py
+        .detach(move || {
+            fit_rrblup_exact_snp_from_cache_source(
+                cache_inner.as_ref(),
+                None,
+                source_prefix_fit.as_str(),
                 bytes_per_snp,
                 n_samples,
                 y_vec_f64,

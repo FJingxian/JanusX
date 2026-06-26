@@ -26,11 +26,7 @@ class BlupDispatch:
 
     @property
     def requires_resident_packed(self) -> bool:
-        return bool(
-            self.effective_method == "rrBLUP"
-            and self.rrblup_solver == "exact"
-            and self.rrblup_exact_backend == "snp"
-        )
+        return False
 
 
 def is_blup_method(method: str) -> bool:

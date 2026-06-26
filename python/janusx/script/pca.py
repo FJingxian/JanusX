@@ -59,9 +59,7 @@ import psutil
 import janusx as jx_pkg
 from janusx import janusx as jxrs
 from janusx.gfreader import (
-    calc_decode_block_rows_from_memory_mb,
     inspect_genotype_file,
-    auto_mmap_window_mb,
     prepare_cli_input_cache,
 )
 from ._common.log import setup_logging
@@ -98,6 +96,13 @@ from ._common.threads import (
     detect_effective_threads,
     format_requested_thread_usage,
     set_rust_blas_threads,
+)
+from ._common.memory import (
+    bed_block_target_env as _common_bed_block_target_env,
+    decode_memory_gb_to_mb as _common_decode_memory_gb_to_mb,
+    normalize_decode_memory_gb as _common_normalize_decode_memory_gb,
+    resolve_decode_block_rows as _common_resolve_decode_block_rows,
+    resolve_decode_mmap_window_mb as _common_resolve_decode_mmap_window_mb,
 )
 
 # ======================================================================
@@ -137,16 +142,21 @@ def _get_pca_plot_backend():
 
 
 def _normalize_memory_gb(memory_gb: Union[int, float, None]) -> float:
-    if memory_gb is None:
-        return float(DEFAULT_BED_MEMORY_GB)
-    gb = float(memory_gb)
-    if (not np.isfinite(gb)) or gb <= 0.0:
-        raise ValueError(f"--memory must be a finite value > 0 GB, got {memory_gb}")
-    return float(gb)
+    return float(
+        _common_normalize_decode_memory_gb(
+            memory_gb,
+            default_gb=float(DEFAULT_BED_MEMORY_GB),
+        )
+    )
 
 
 def _memory_gb_to_mb(memory_gb: Union[int, float, None]) -> float:
-    return float(_normalize_memory_gb(memory_gb) * 1024.0)
+    return float(
+        _common_decode_memory_gb_to_mb(
+            memory_gb,
+            default_gb=float(DEFAULT_BED_MEMORY_GB),
+        )
+    )
 
 
 def _get_palette_helpers():
@@ -292,16 +302,8 @@ def _resolve_palette_colors(spec: Optional[tuple[str, object]], n_series: int) -
 
 @contextmanager
 def _bed_block_target_env(memory_mb: Union[int, float, None]) -> None:
-    prev = os.environ.get("JX_BED_BLOCK_TARGET_MB")
-    if memory_mb is not None:
-        os.environ["JX_BED_BLOCK_TARGET_MB"] = f"{float(memory_mb):.6g}"
-    try:
+    with _common_bed_block_target_env(memory_mb, needs_copy=False):
         yield
-    finally:
-        if prev is None:
-            os.environ.pop("JX_BED_BLOCK_TARGET_MB", None)
-        else:
-            os.environ["JX_BED_BLOCK_TARGET_MB"] = prev
 
 def load_group_table(group_path: str) -> tuple[pd.DataFrame, Union[str , None], Union[str , None]]:
     group_df = pd.read_csv(group_path, sep="\t", header=None, index_col=0)
@@ -865,13 +867,13 @@ def build_grm_streaming_for_pca(
         sample_ids_raw, n_snps = inspected_meta
     sample_ids = np.array(sample_ids_raw, dtype=str)
     n_samples = len(sample_ids)
-    block_rows = calc_decode_block_rows_from_memory_mb(
+    block_rows = _common_resolve_decode_block_rows(
         n_samples,
         float(memory_mb),
-        buffers=2,
         max_rows=max(1, int(n_snps)),
+        needs_copy=False,
     )
-    block_rows = max(1, int(block_rows if block_rows is not None else 1))
+    block_rows = max(1, int(block_rows))
     pbar = ProgressAdapter(
         total=n_snps,
         desc="GRM (rust-memmap)",
@@ -893,7 +895,13 @@ def build_grm_streaming_for_pca(
             mem = process.memory_info().rss / 1024**3
             pbar.set_postfix(memory=f"{mem:.2f} GB")
 
-    mmap_window_mb = auto_mmap_window_mb(rust_input, n_samples, n_snps, float(memory_mb))
+    mmap_window_mb = _common_resolve_decode_mmap_window_mb(
+        rust_input,
+        n_samples,
+        n_snps,
+        float(memory_mb),
+        needs_copy=False,
+    )
     try:
         with _bed_block_target_env(memory_mb):
             grm_raw, eff_m_raw, stream_n_raw = jxrs.grm_stream_bed_f32(
@@ -1572,11 +1580,12 @@ def main(log: bool = True):
                         )
                     )
 
-                mmap_window_mb = auto_mmap_window_mb(
+                mmap_window_mb = _common_resolve_decode_mmap_window_mb(
                     rsvd_input,
                     len(samples),
                     int(algo_snp),
                     memory_mb,
+                    needs_copy=False,
                 )
 
                 def _run_rsvd_only():

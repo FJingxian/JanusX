@@ -16,6 +16,10 @@ from typing import Optional, Union
 import numpy as np
 import pandas as pd
 import psutil
+from janusx.script._common.memory import (
+    bed_block_target_env as _common_bed_block_target_env,
+    resolve_decode_mmap_window_mb as _common_resolve_decode_mmap_window_mb,
+)
 
 from .workflow import (
     CliStatus,
@@ -50,7 +54,6 @@ from .workflow import (
     _run_result_write_with_status,
     _safe_trait_file_label,
     _trait_values_and_mask,
-    auto_mmap_window_mb,
     build_rich_progress,
     detect_effective_threads,
     format_elapsed,
@@ -784,8 +787,15 @@ def run_chunked_gwas_lmm_lm(
         tmp_tsv = _gwas_result_tmp_path(out_tsv)
         wrote_header = False
         mmap_window_mb = (
-            auto_mmap_window_mb(genofile, len(ids), n_snps, _current_bed_memory_mb())
-            if mmap_limit else None
+            _common_resolve_decode_mmap_window_mb(
+                genofile,
+                len(ids),
+                n_snps,
+                _current_bed_memory_mb(),
+                needs_copy=(str(effective_model_key).lower() in {"lmm", "lmm2", "fvlmm"}),
+            )
+            if mmap_limit
+            else None
         )
 
         # Always pass trait-specific sample IDs to the reader to keep column
@@ -1092,7 +1102,10 @@ def run_chunked_gwas_lmm_lm(
             if str(effective_model_key).lower() == "fvlmm"
             else _gwas_scan_stage_ctx
         )
-        with scan_stage_ctx(scan_threads):
+        with scan_stage_ctx(scan_threads), _common_bed_block_target_env(
+            _current_bed_memory_mb(),
+            needs_copy=(str(effective_model_key).lower() in {"lmm", "lmm2", "fvlmm"}),
+        ):
             if _use_fvlmm_unified:
                 # Unified FvLMM path: single Rust call replaces entire chunk loop.
                 # The Rust function mmaps BED, filters SNPs, and runs the full
@@ -2140,8 +2153,15 @@ def run_chunked_gwas_streaming_shared(
                 f"(n={int(n_idv)}).",
             )
     mmap_window_mb = (
-        auto_mmap_window_mb(genofile, len(ids), n_snps, _current_bed_memory_mb())
-        if mmap_limit else None
+        _common_resolve_decode_mmap_window_mb(
+            genofile,
+            len(ids),
+            n_snps,
+            _current_bed_memory_mb(),
+            needs_copy=(str(effective_model_key).lower() in {"lmm", "lmm2", "fvlmm"}),
+        )
+        if mmap_limit
+        else None
     )
     sample_sub = trait_ids
     expected_n = int(sample_sub.shape[0])
@@ -2218,7 +2238,10 @@ def run_chunked_gwas_streaming_shared(
         if len(model_order) == 1 and str(model_order[0]).lower() == "fvlmm"
         else _gwas_scan_stage_ctx
     )
-    with scan_stage_ctx(scan_threads):
+    with scan_stage_ctx(scan_threads), _common_bed_block_target_env(
+        _current_bed_memory_mb(),
+        needs_copy=any(str(m).lower() in {"lmm", "lmm2", "fvlmm"} for m in model_order),
+    ):
         try:
             bed_prefix = _as_plink_prefix(genofile)
             if bed_prefix is None:

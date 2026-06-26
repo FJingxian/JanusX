@@ -159,15 +159,28 @@ def emit_method_stage_lines(
     *,
     cv_folds: int | None,
     cv_elapsed_sec: float,
+    cv_skipped: bool,
     fit_elapsed_sec: float,
+    fit_skipped: bool,
     predict_elapsed_sec: float,
+    predict_skipped: bool,
+    total_elapsed_sec: float | None,
     include_fit: bool,
     include_predict: bool = True,
     terminal_columns: int,
     format_elapsed: typing.Callable[[float], str],
     log_success: SuccessLogger,
 ) -> None:
-    if cv_folds is not None and int(cv_folds) > 0:
+    if cv_skipped:
+        total_sec = float(total_elapsed_sec) if total_elapsed_sec is not None else 0.0
+        if not math.isfinite(total_sec):
+            total_sec = 0.0
+        log_success(
+            logger,
+            f"Cross-validation ...Skipped [{format_elapsed(total_sec)}]",
+            force_color=True,
+        )
+    elif cv_folds is not None and int(cv_folds) > 0:
         total = int(max(1, int(cv_folds)))
         elapsed_text = format_elapsed(float(cv_elapsed_sec) if math.isfinite(float(cv_elapsed_sec)) else 0.0)
         bar_w = max(
@@ -187,12 +200,26 @@ def emit_method_stage_lines(
         )
 
     if include_fit:
-        fit_sec = float(fit_elapsed_sec) if math.isfinite(float(fit_elapsed_sec)) else 0.0
-        log_success(logger, f"Fitting ...Finished [{fit_sec:.3f}s]", force_color=True)
+        if fit_skipped:
+            log_success(
+                logger,
+                f"Fitting ...Skipped [{format_elapsed(0.0)}]",
+                force_color=True,
+            )
+        else:
+            fit_sec = float(fit_elapsed_sec) if math.isfinite(float(fit_elapsed_sec)) else 0.0
+            log_success(logger, f"Fitting ...Finished [{fit_sec:.3f}s]", force_color=True)
 
     if include_predict:
-        pred_sec = float(predict_elapsed_sec) if math.isfinite(float(predict_elapsed_sec)) else 0.0
-        log_success(logger, f"Predicting ...Finished [{pred_sec:.3f}s]", force_color=True)
+        if predict_skipped:
+            log_success(
+                logger,
+                f"Predicting ...Skipped [{format_elapsed(0.0)}]",
+                force_color=True,
+            )
+        else:
+            pred_sec = float(predict_elapsed_sec) if math.isfinite(float(predict_elapsed_sec)) else 0.0
+            log_success(logger, f"Predicting ...Finished [{pred_sec:.3f}s]", force_color=True)
 
 
 def emit_method_detail_lines(
@@ -229,8 +256,6 @@ def emit_method_detail_lines(
             pve_val = float("nan")
         if math.isfinite(pve_val):
             logger.info(f"PVE                 {pve_val:.3f}")
-        else:
-            logger.info("PVE                 NA")
 
 
 def emit_cv_fold_table(

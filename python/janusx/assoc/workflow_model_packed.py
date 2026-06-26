@@ -18,6 +18,9 @@ import numpy as np
 import pandas as pd
 import psutil
 from janusx.assoc.workflow_cache import _is_writable_dir, _resolve_gwas_cache_dir
+from janusx.script._common.memory import (
+    resolve_decode_mmap_window_mb as _common_resolve_decode_mmap_window_mb,
+)
 from janusx.script._common.genoio import (
     packed_preload_is_disabled,
     packed_preload_is_ready,
@@ -66,7 +69,6 @@ from .workflow import (
     _site_tuple_parts,
     _subset_square_matrix_identity_aware,
     _trait_values_and_mask,
-    auto_mmap_window_mb,
     detect_effective_threads,
     format_elapsed,
     jxrs,
@@ -1352,11 +1354,12 @@ def run_qtn_segmented_lm_stage2(
         except KeyError as e:
             raise ValueError("Some trait sample IDs are not present in main BED sample order.") from e
         n_snps_total = _plink_bed_n_snps_from_prefix(str(main_prefix), len(main_ids))
-        stage2_mmap_window_mb = auto_mmap_window_mb(
+        stage2_mmap_window_mb = _common_resolve_decode_mmap_window_mb(
             str(main_prefix),
             int(len(main_ids)),
             int(n_snps_total),
             _current_bed_memory_mb(),
+            needs_copy=False,
         )
         segments: list[tuple[int, int, int]] = []
         source_windows = [
@@ -3412,7 +3415,13 @@ def run_lm_stream_bed_single_entry(
             user_specified=bool(chunk_size_user_set),
         )
         mmap_window_mb = (
-            auto_mmap_window_mb(genofile, len(ids), n_snps, _current_bed_memory_mb())
+            _common_resolve_decode_mmap_window_mb(
+                genofile,
+                len(ids),
+                n_snps,
+                _current_bed_memory_mb(),
+                needs_copy=False,
+            )
             if bool(mmap_limit)
             else None
         )
@@ -5279,11 +5288,12 @@ def run_splmm_windowed_fullrank(
             trait_scan_row_flip = np.ascontiguousarray(np.asarray(scan_meta["row_flip"], dtype=np.bool_).reshape(-1), dtype=np.bool_)
             trait_site_keep = np.ascontiguousarray(np.asarray(scan_meta["site_keep"], dtype=np.bool_).reshape(-1), dtype=np.bool_)
         n_trait_sites = int(trait_row_idx.shape[0])
-        mmap_window_mb = auto_mmap_window_mb(
+        mmap_window_mb = _common_resolve_decode_mmap_window_mb(
             genofile,
             len(ids),
             n_trait_sites,
             _current_bed_memory_mb(),
+            needs_copy=False,
         )
         supports_direct_tsv = bool(hasattr(jxrs, "splmm_assoc_pcg_bed_to_tsv"))
         # BIM metadata (chrom/pos/snp/alleles) is now read inside the Rust

@@ -35,9 +35,7 @@ from typing import Union
 import numpy as np
 import psutil
 from janusx.gfreader import (
-    calc_decode_block_rows_from_memory_mb,
     inspect_genotype_file,
-    auto_mmap_window_mb,
     prepare_cli_input_cache,
 )
 from ._common.log import setup_logging
@@ -81,6 +79,13 @@ from ._common.grmstable import (
     save_grm_npy_blocked,
 )
 from ._common.grmio import read_id_file, resolve_grm_id_path
+from ._common.memory import (
+    bed_block_target_env as _common_bed_block_target_env,
+    decode_memory_gb_to_mb as _common_decode_memory_gb_to_mb,
+    normalize_decode_memory_gb as _common_normalize_decode_memory_gb,
+    resolve_decode_block_rows as _common_resolve_decode_block_rows,
+    resolve_decode_mmap_window_mb as _common_resolve_decode_mmap_window_mb,
+)
 
 try:
     from janusx.janusx import (
@@ -119,16 +124,21 @@ def _is_plink_prefix_path(path_or_prefix: str) -> bool:
 
 
 def _normalize_memory_gb(memory_gb: Union[int, float, None]) -> float:
-    if memory_gb is None:
-        return float(DEFAULT_BED_MEMORY_GB)
-    gb = float(memory_gb)
-    if (not np.isfinite(gb)) or gb <= 0.0:
-        raise ValueError(f"--memory must be a finite value > 0 GB, got {memory_gb}")
-    return float(gb)
+    return float(
+        _common_normalize_decode_memory_gb(
+            memory_gb,
+            default_gb=float(DEFAULT_BED_MEMORY_GB),
+        )
+    )
 
 
 def _memory_gb_to_mb(memory_gb: Union[int, float, None]) -> float:
-    return float(_normalize_memory_gb(memory_gb) * 1024.0)
+    return float(
+        _common_decode_memory_gb_to_mb(
+            memory_gb,
+            default_gb=float(DEFAULT_BED_MEMORY_GB),
+        )
+    )
 
 
 def _decode_block_rows_from_memory_mb(
@@ -138,27 +148,21 @@ def _decode_block_rows_from_memory_mb(
     *,
     streaming: bool,
 ) -> int:
-    rows = calc_decode_block_rows_from_memory_mb(
-        int(n_samples),
-        float(memory_mb),
-        buffers=(2 if streaming else 1),
-        max_rows=max(1, int(n_snps)),
+    _ = streaming
+    return int(
+        _common_resolve_decode_block_rows(
+            int(n_samples),
+            float(memory_mb),
+            max_rows=max(1, int(n_snps)),
+            needs_copy=False,
+        )
     )
-    return max(1, int(rows if rows is not None else 1))
 
 
 @contextmanager
 def _bed_block_target_env(memory_mb: Union[int, float, None]) -> None:
-    prev = os.environ.get("JX_BED_BLOCK_TARGET_MB")
-    if memory_mb is not None:
-        os.environ["JX_BED_BLOCK_TARGET_MB"] = f"{float(memory_mb):.6g}"
-    try:
+    with _common_bed_block_target_env(memory_mb, needs_copy=False):
         yield
-    finally:
-        if prev is None:
-            os.environ.pop("JX_BED_BLOCK_TARGET_MB", None)
-        else:
-            os.environ["JX_BED_BLOCK_TARGET_MB"] = prev
 
 
 @contextmanager
@@ -1112,7 +1116,13 @@ def main(log: bool = True):
         memory_mb,
         streaming=False,
     )
-    mmap_window_mb = auto_mmap_window_mb(grm_input, n_samples, n_snps, memory_mb)
+    mmap_window_mb = _common_resolve_decode_mmap_window_mb(
+        grm_input,
+        n_samples,
+        n_snps,
+        memory_mb,
+        needs_copy=False,
+    )
     logger.info(
         "Resolved GRM decode plan: stream_block_rows=%s, packed_block_rows=%s, mmap_window_mb=%s.",
         int(stream_block_rows),

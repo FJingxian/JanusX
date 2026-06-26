@@ -83,10 +83,8 @@ except Exception:
 import psutil
 import janusx as jx_pkg
 from janusx.gfreader import (
-    calc_decode_block_rows_from_memory_mb,
     load_genotype_chunks,
     inspect_genotype_file,
-    auto_mmap_window_mb,
     prepare_cli_input_cache,
 )
 from janusx.pyBLUP.QK2 import QK
@@ -136,6 +134,14 @@ from janusx.script._common.progress import (
     stdout_is_tty,
 )
 from janusx.script._common.progress import build_rich_progress, rich_progress_available
+from janusx.script._common.memory import (
+    bed_block_target_env as _common_bed_block_target_env,
+    decode_memory_gb_to_mb as _common_decode_memory_gb_to_mb,
+    normalize_decode_memory_gb as _common_normalize_decode_memory_gb,
+    resolve_decode_block_rows as _common_resolve_decode_block_rows,
+    resolve_decode_mmap_window_mb as _common_resolve_decode_mmap_window_mb,
+    scale_decode_rows_for_copy as _common_scale_decode_rows_for_copy,
+)
 from janusx.script._common.threads import (
     apply_outer_thread_cap,
     detect_effective_threads,
@@ -2763,8 +2769,12 @@ def load_or_build_grm_with_cache(
                     max_missing_rate=max_missing_rate,
                     chunk_size=chunk_size,
                     method=method_int,
-                    mmap_window_mb=auto_mmap_window_mb(
-                        genofile_for_grm, n_samples, n_snps, float(memory_mb)
+                    mmap_window_mb=_common_resolve_decode_mmap_window_mb(
+                        genofile_for_grm,
+                        n_samples,
+                        n_snps,
+                        float(memory_mb),
+                        needs_copy=False,
                     ),
                     memory_mb=float(memory_mb),
                     threads=threads,
@@ -2985,11 +2995,12 @@ def build_pcs_from_genotype_rsvd(
         missing_rate=float(max_missing_rate),
     )
     samples = np.asarray(sample_ids, dtype=str)
-    mmap_window_mb = auto_mmap_window_mb(
+    mmap_window_mb = _common_resolve_decode_mmap_window_mb(
         rsvd_input,
         int(samples.shape[0]),
         int(algo_snp),
         float(memory_mb),
+        needs_copy=False,
     )
     with runtime_thread_stage(rayon_threads=int(threads_use)):
         with CliStatus(
@@ -4263,16 +4274,21 @@ def _finalize_gwas_result_tsv(
 
 
 def _normalize_bed_memory_gb(memory_gb: Union[int, float, None]) -> float:
-    if memory_gb is None:
-        return float(DEFAULT_BED_MEMORY_GB)
-    gb = float(memory_gb)
-    if (not np.isfinite(gb)) or gb <= 0.0:
-        raise ValueError(f"--memory must be a finite value > 0 GB, got {memory_gb}")
-    return float(gb)
+    return float(
+        _common_normalize_decode_memory_gb(
+            memory_gb,
+            default_gb=float(DEFAULT_BED_MEMORY_GB),
+        )
+    )
 
 
 def _bed_memory_gb_to_mb(memory_gb: Union[int, float, None]) -> float:
-    return float(_normalize_bed_memory_gb(memory_gb) * 1024.0)
+    return float(
+        _common_decode_memory_gb_to_mb(
+            memory_gb,
+            default_gb=float(DEFAULT_BED_MEMORY_GB),
+        )
+    )
 
 
 def _resolve_bed_block_rows_from_memory(
@@ -4282,27 +4298,21 @@ def _resolve_bed_block_rows_from_memory(
     *,
     streaming: bool,
 ) -> int:
-    rows = calc_decode_block_rows_from_memory_mb(
-        int(n_samples),
-        float(memory_mb),
-        buffers=(2 if streaming else 1),
-        max_rows=max(1, int(n_snps_hint)),
+    _ = streaming
+    return int(
+        _common_resolve_decode_block_rows(
+            int(n_samples),
+            float(memory_mb),
+            max_rows=max(1, int(n_snps_hint)),
+            needs_copy=False,
+        )
     )
-    return max(1, int(rows if rows is not None else 1))
 
 
 @contextmanager
-def _bed_block_target_env(memory_mb: Union[int, float, None]):
-    prev = os.environ.get("JX_BED_BLOCK_TARGET_MB")
-    if memory_mb is not None:
-        os.environ["JX_BED_BLOCK_TARGET_MB"] = f"{float(memory_mb):.6g}"
-    try:
+def _bed_block_target_env(memory_mb: Union[int, float, None], *, needs_copy: bool = False):
+    with _common_bed_block_target_env(memory_mb, needs_copy=bool(needs_copy)):
         yield
-    finally:
-        if prev is None:
-            os.environ.pop("JX_BED_BLOCK_TARGET_MB", None)
-        else:
-            os.environ["JX_BED_BLOCK_TARGET_MB"] = prev
 
 
 def _resolve_stream_scan_chunk_size(
@@ -4351,19 +4361,11 @@ def _resolve_stream_scan_chunk_size(
                 auto_rows = int((auto_rows // 1_000) * 1_000)
             resolved = max(base, auto_rows)
 
-    # Model-specific peak working-set adjustment:
-    # - `chunk_size` is derived from the user memory target assuming two float32
-    #   decode buffers (`buffers=2`) for streaming scans.
-    # - The unified BED fastpaths for FvLMM/LMM/LMM2 use a double-buffer
-    #   pipeline where *each* in-flight chunk holds both decoded and rotated
-    #   SNP blocks. Peak float32 working set is therefore roughly:
-    #     2 pipeline chunks * (decode + rotate) = 4 row-buffers,
-    #   which is about 2x the default assumption.
-    # - Halve chunk rows here so the scan-stage resident set stays close to the
-    #   user `-mem/--memory` target instead of drifting toward ~2x.
-    # - SparseLMM is handled separately.
     if "fvlmm" in models or "lmm" in models or "lmm2" in models:
-        resolved = max(1, int(resolved // 2))
+        resolved = _common_scale_decode_rows_for_copy(
+            int(resolved),
+            needs_copy=True,
+        )
 
     return min(n_snps, max(1, int(resolved)))
 

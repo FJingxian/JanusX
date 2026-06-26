@@ -4,11 +4,15 @@
 from __future__ import annotations
 
 import ctypes
+import math
 import os
 import sys
+from contextlib import contextmanager
 from typing import Optional
+from typing import Union
 
 import psutil
+from janusx.gfreader import auto_mmap_window_mb, calc_decode_block_rows_from_memory_mb
 
 try:
     import resource
@@ -18,6 +22,7 @@ except Exception:  # pragma: no cover - platform dependent
 
 _MAC_PROC_PID_RUSAGE = None
 _MAC_RUSAGE_INFO_V4 = None
+DEFAULT_DECODE_MEMORY_GB = 1.0
 
 
 def process_memory_info_bytes(
@@ -138,6 +143,122 @@ def finalize_peak_memory_metrics(
         "peak_vms_bytes": peak_vms if peak_vms > 0 else None,
         "peak_footprint_bytes": peak_footprint if (peak_footprint or 0) > 0 else None,
     }
+
+
+def normalize_decode_memory_gb(
+    memory_gb: Union[int, float, None],
+    *,
+    default_gb: float = DEFAULT_DECODE_MEMORY_GB,
+    arg_name: str = "--memory",
+) -> float:
+    if memory_gb is None:
+        return float(default_gb)
+    gb = float(memory_gb)
+    if (not math.isfinite(gb)) or gb <= 0.0:
+        raise ValueError(f"{arg_name} must be a finite value > 0 GB, got {memory_gb}")
+    return float(gb)
+
+
+def decode_memory_gb_to_mb(
+    memory_gb: Union[int, float, None],
+    *,
+    default_gb: float = DEFAULT_DECODE_MEMORY_GB,
+    arg_name: str = "--memory",
+) -> float:
+    return float(
+        normalize_decode_memory_gb(
+            memory_gb,
+            default_gb=float(default_gb),
+            arg_name=str(arg_name),
+        )
+        * 1024.0
+    )
+
+
+def effective_decode_memory_mb(
+    memory_mb: Union[int, float],
+    *,
+    needs_copy: bool = False,
+) -> float:
+    mb = float(memory_mb)
+    if (not math.isfinite(mb)) or mb <= 0.0:
+        raise ValueError(f"decode memory must be finite and > 0 MB, got {memory_mb}")
+    return float(mb * (0.5 if bool(needs_copy) else 1.0))
+
+
+def scale_decode_rows_for_copy(
+    rows: int,
+    *,
+    needs_copy: bool = False,
+) -> int:
+    base = max(1, int(rows))
+    if not bool(needs_copy):
+        return base
+    return max(1, int(base // 2))
+
+
+def resolve_decode_block_rows(
+    row_width: int,
+    memory_mb: Union[int, float],
+    *,
+    max_rows: Union[int, None] = None,
+    elem_bytes: int = 4,
+    needs_copy: bool = False,
+    min_rows: int = 1,
+) -> int:
+    rows = calc_decode_block_rows_from_memory_mb(
+        int(max(1, int(row_width))),
+        effective_decode_memory_mb(float(memory_mb), needs_copy=bool(needs_copy)),
+        elem_bytes=int(max(1, int(elem_bytes))),
+        buffers=1,
+        min_rows=int(max(1, int(min_rows))),
+        max_rows=(None if max_rows is None else max(1, int(max_rows))),
+    )
+    return max(1, int(rows if rows is not None else 1))
+
+
+def resolve_decode_mmap_window_mb(
+    path_or_prefix: str,
+    n_samples: int,
+    n_snps: int,
+    memory_mb: Union[int, float],
+    *,
+    elem_bytes: int = 4,
+    needs_copy: bool = False,
+    min_rows: int = 1,
+    max_rows: Union[int, None] = None,
+    min_chunks: int = 2,
+) -> Optional[int]:
+    return auto_mmap_window_mb(
+        str(path_or_prefix),
+        int(n_samples),
+        int(n_snps),
+        effective_decode_memory_mb(float(memory_mb), needs_copy=bool(needs_copy)),
+        elem_bytes=int(max(1, int(elem_bytes))),
+        buffers=1,
+        min_rows=int(max(1, int(min_rows))),
+        max_rows=(None if max_rows is None else max(1, int(max_rows))),
+        min_chunks=int(max(1, int(min_chunks))),
+    )
+
+
+@contextmanager
+def bed_block_target_env(
+    memory_mb: Union[int, float, None],
+    *,
+    needs_copy: bool = False,
+):
+    prev = os.environ.get("JX_BED_BLOCK_TARGET_MB")
+    if memory_mb is not None:
+        target_mb = effective_decode_memory_mb(float(memory_mb), needs_copy=bool(needs_copy))
+        os.environ["JX_BED_BLOCK_TARGET_MB"] = f"{float(target_mb):.6g}"
+    try:
+        yield
+    finally:
+        if prev is None:
+            os.environ.pop("JX_BED_BLOCK_TARGET_MB", None)
+        else:
+            os.environ["JX_BED_BLOCK_TARGET_MB"] = prev
 
 
 def bytes_to_gib(value: Optional[int]) -> Optional[float]:

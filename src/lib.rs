@@ -271,8 +271,9 @@ use reml::{
     ml_loglike_null_f32,
 };
 use rrblup::{
-    rrblup_exact_snp_fit_prepared, rrblup_exact_snp_packed, rrblup_exact_snp_prepare_packed,
-    rrblup_pcg_bed, RrblupExactSnpCache,
+    rrblup_exact_snp_fit_prepared, rrblup_exact_snp_fit_prepared_bed,
+    rrblup_exact_snp_packed, rrblup_exact_snp_prepare_bed_from_meta,
+    rrblup_exact_snp_prepare_packed, rrblup_pcg_bed, RrblupExactSnpCache,
 };
 use rsvd::py_rsvd_packed_subset;
 use sim::{sim_trait_accumulate_i8_f32, SimChunkGenerator, SimEngine, SimTraitAccumulator};
@@ -785,6 +786,8 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(rrblup_pcg_bed, m)?)?;
     m.add_function(wrap_pyfunction!(rrblup_exact_snp_prepare_packed, m)?)?;
     m.add_function(wrap_pyfunction!(rrblup_exact_snp_fit_prepared, m)?)?;
+    m.add_function(wrap_pyfunction!(rrblup_exact_snp_prepare_bed_from_meta, m)?)?;
+    m.add_function(wrap_pyfunction!(rrblup_exact_snp_fit_prepared_bed, m)?)?;
     m.add_function(wrap_pyfunction!(rrblup_exact_snp_packed, m)?)?;
     m.add_function(wrap_pyfunction!(gblup_reml_packed_bed, m)?)?;
     m.add_function(wrap_pyfunction!(gblup_reml_npy_grm, m)?)?;

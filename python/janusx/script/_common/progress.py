@@ -355,7 +355,7 @@ def print_success(message: str, *, force_color: bool = False) -> None:
     if leading:
         _safe_write(leading)
     if is_skip_status_text(msg):
-        print_warning(msg, force_color=bool(force_color))
+        print_skipped(msg, force_color=bool(force_color))
         return
     if (not is_loading_status_text(msg)) and (not is_completed_status_text(msg)):
         _safe_print(msg)
@@ -379,7 +379,7 @@ def print_failure(message: str, *, force_color: bool = False) -> None:
     if leading:
         _safe_write(leading)
     if is_skip_status_text(msg):
-        print_warning(msg, force_color=bool(force_color))
+        print_skipped(msg, force_color=bool(force_color))
         return
     line = f"{_FAIL_SYMBOL} {msg}" if msg != "" else f"{_FAIL_SYMBOL}"
     console = _console_for_print(force_color=bool(force_color))
@@ -402,6 +402,24 @@ def print_warning(message: str, *, force_color: bool = False) -> None:
     msg = str(msg)
     body = msg if msg.startswith("Warning: ") else f"Warning: {msg}"
     line = f"{_WARN_SYMBOL} {body}"
+    console = _console_for_print(force_color=bool(force_color))
+    if console is not None:
+        try:
+            console.print(f"[yellow]{line}[/yellow]")
+            return
+        except Exception:
+            pass
+    if stdout_is_tty() or bool(force_color):
+        _safe_print(f"{_YELLOW}{line}{_RESET}")
+    else:
+        _safe_print(line)
+
+
+def print_skipped(message: str, *, force_color: bool = False) -> None:
+    leading, msg = _split_leading_newlines(message)
+    if leading:
+        _safe_write(leading)
+    line = f"{_SUCCESS_SYMBOL} {msg}" if msg != "" else f"{_SUCCESS_SYMBOL}"
     console = _console_for_print(force_color=bool(force_color))
     if console is not None:
         try:
@@ -449,10 +467,10 @@ def log_success(
     file_msg = str(msg if log_message is None else log_message)
     if is_skip_status_text(msg):
         if stdout_is_tty() or bool(force_color):
-            _emit_to_file_handlers(logger, logging.WARNING, file_msg)
-            print_warning(msg, force_color=bool(force_color))
+            _emit_to_file_handlers(logger, logging.INFO, file_msg)
+            print_skipped(msg, force_color=bool(force_color))
         else:
-            logger.warning(file_msg)
+            logger.info(file_msg)
         return
     if stdout_is_tty() or bool(force_color):
         _emit_to_file_handlers(logger, logging.INFO, file_msg)
@@ -750,8 +768,12 @@ class CliStatus:
         elif is_skip_status_text(message):
             plain = str(message)
             if self.show_elapsed:
-                plain = f"{plain} [{self._format_elapsed(self._elapsed_seconds())}]"
-            print_warning(plain, force_color=bool(self.enabled))
+                plain = (
+                    f"{plain} ["
+                    f"{format_elapsed_parts(elapsed_parts, fallback_seconds=self._elapsed_seconds())}"
+                    f"]"
+                )
+            print_skipped(plain, force_color=bool(self.enabled))
         else:
             plain = str(message)
             if self.show_elapsed:
@@ -783,7 +805,7 @@ class CliStatus:
                     f"{format_elapsed_parts(elapsed_parts, fallback_seconds=self._elapsed_seconds())}"
                     f"]"
                 )
-            print_warning(plain, force_color=bool(self.enabled))
+            print_skipped(plain, force_color=bool(self.enabled))
             self._done = True
             return
         symbol = _FAIL_SYMBOL
@@ -1213,6 +1235,7 @@ __all__ = [
     "is_skip_status_text",
     "log_success",
     "print_failure",
+    "print_skipped",
     "print_success",
     "print_warning",
     "rich_progress_available",

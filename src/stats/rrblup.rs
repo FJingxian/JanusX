@@ -888,6 +888,57 @@ fn decode_standardized_block_f32(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn decode_standardized_block_rows_chunked_f32(
+    source: &mut RrblupPcgSource<'_>,
+    n_samples: usize,
+    row_flip: &[bool],
+    row_mean: &[f32],
+    row_inv_sd: &[f32],
+    sample_idx: &[usize],
+    full_sample_fast: bool,
+    packed_row_indices: Option<&[usize]>,
+    row_block: usize,
+    out: &mut [f32],
+    code4_lut: &[[u8; 4]; 256],
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) -> Result<(), String> {
+    let n_out = sample_idx.len();
+    if n_out == 0 || out.is_empty() {
+        return Ok(());
+    }
+    let total_rows = out.len().saturating_div(n_out.max(1));
+    if total_rows == 0 {
+        return Ok(());
+    }
+    let row_step = row_block.max(1).min(total_rows);
+    let mut tick = 0usize;
+    for row_start in (0..total_rows).step_by(row_step) {
+        let row_end = (row_start + row_step).min(total_rows);
+        let out_slice = &mut out[row_start * n_out..row_end * n_out];
+        decode_standardized_block_f32(
+            source,
+            n_samples,
+            row_flip,
+            row_mean,
+            row_inv_sd,
+            sample_idx,
+            full_sample_fast,
+            packed_row_indices,
+            row_start,
+            out_slice,
+            code4_lut,
+            pool,
+        )?;
+        tick += row_end - row_start;
+        if tick >= row_step.saturating_mul(64).max(1) {
+            check_ctrlc()?;
+            tick = 0;
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn pcg_x_mul_samples(
     source: &mut RrblupPcgSource<'_>,
     n_samples: usize,
@@ -1253,6 +1304,7 @@ struct RrblupExactSnpPreparedInner {
     rank: usize,
     m_effective: usize,
     sample_block: usize,
+    stream_row_block: usize,
     train_idx: Vec<usize>,
     packed_row_indices: Option<Vec<usize>>,
     row_flip: Vec<bool>,
@@ -1430,6 +1482,7 @@ fn build_rrblup_exact_snp_cache_from_source(
     row_inv_sd: Vec<f32>,
     packed_row_indices: Option<Vec<usize>>,
     sample_block_use: usize,
+    stream_row_block: usize,
     m_effective: usize,
     threads: usize,
     blas_threads: usize,
@@ -1464,6 +1517,8 @@ fn build_rrblup_exact_snp_cache_from_source(
         1usize
     };
     let _blas_guard = OpenBlasThreadGuard::enter(blas_threads_effective);
+    let use_chunked_stream_decode = matches!(source, RrblupPcgSource::Windowed { .. })
+        && stream_row_block < eff_m;
 
     for cst in (0..n_train).step_by(sample_block_use.max(1)) {
         let ced = (cst + sample_block_use).min(n_train);
@@ -1474,20 +1529,37 @@ fn build_rrblup_exact_snp_cache_from_source(
         } else {
             None
         };
-        decode_standardized_block_f32(
-            &mut source,
-            n_samples,
-            row_flip_keep.as_slice(),
-            row_mean.as_slice(),
-            row_inv_sd.as_slice(),
-            &train_idx[cst..ced],
-            is_identity_indices(&train_idx[cst..ced], n_samples),
-            packed_row_indices.as_deref(),
-            0usize,
-            blk_slice_f32,
-            &code4_lut,
-            pool_ref,
-        )?;
+        if use_chunked_stream_decode {
+            decode_standardized_block_rows_chunked_f32(
+                &mut source,
+                n_samples,
+                row_flip_keep.as_slice(),
+                row_mean.as_slice(),
+                row_inv_sd.as_slice(),
+                &train_idx[cst..ced],
+                is_identity_indices(&train_idx[cst..ced], n_samples),
+                packed_row_indices.as_deref(),
+                stream_row_block,
+                blk_slice_f32,
+                &code4_lut,
+                pool_ref,
+            )?;
+        } else {
+            decode_standardized_block_f32(
+                &mut source,
+                n_samples,
+                row_flip_keep.as_slice(),
+                row_mean.as_slice(),
+                row_inv_sd.as_slice(),
+                &train_idx[cst..ced],
+                is_identity_indices(&train_idx[cst..ced], n_samples),
+                packed_row_indices.as_deref(),
+                0usize,
+                blk_slice_f32,
+                &code4_lut,
+                pool_ref,
+            )?;
+        }
         if let Some(t0) = t_decode {
             build_a_decode_secs += t0.elapsed().as_secs_f64();
         }
@@ -1621,6 +1693,7 @@ fn build_rrblup_exact_snp_cache_from_source(
         rank,
         m_effective,
         sample_block: sample_block_use,
+        stream_row_block,
         train_idx,
         packed_row_indices,
         row_flip: row_flip_keep,
@@ -1643,6 +1716,7 @@ fn build_rrblup_exact_snp_cache_from_packed(
     row_inv_sd: Vec<f32>,
     packed_row_indices: Option<Vec<usize>>,
     sample_block_use: usize,
+    stream_row_block: usize,
     m_effective: usize,
     threads: usize,
     blas_threads: usize,
@@ -1659,6 +1733,7 @@ fn build_rrblup_exact_snp_cache_from_packed(
         row_inv_sd,
         packed_row_indices,
         sample_block_use,
+        stream_row_block,
         m_effective,
         threads,
         blas_threads,
@@ -1734,57 +1809,62 @@ fn fit_rrblup_exact_snp_from_cache_source(
         bytes_per_snp,
         prefix,
         n_samples,
-        cache.m.max(1),
+        cache.stream_row_block.max(1),
     )?;
     let mut z = vec![0.0_f64; cache.m];
-    let mut tmp_dot = vec![0.0_f32; cache.m];
-    let mut block_f32 = vec![0.0_f32; cache.m * cache.sample_block.max(1)];
+    let row_step = cache.stream_row_block.max(1).min(cache.m.max(1));
+    let mut tmp_dot = vec![0.0_f32; row_step];
+    let mut block_f32 = vec![0.0_f32; row_step * cache.sample_block.max(1)];
     let mut z_decode_secs = 0.0_f64;
     let mut z_mul_secs = 0.0_f64;
     for cst in (0..cache.n_train).step_by(cache.sample_block.max(1)) {
         let ced = (cst + cache.sample_block).min(cache.n_train);
         let cur_n = ced - cst;
-        let blk_slice_f32 = &mut block_f32[..cache.m * cur_n];
-        let t_decode = if stage_timing {
-            Some(Instant::now())
-        } else {
-            None
-        };
-        decode_standardized_block_f32(
-            &mut source,
-            n_samples,
-            cache.row_flip.as_slice(),
-            cache.row_mean.as_slice(),
-            cache.row_inv_sd.as_slice(),
-            &cache.train_idx[cst..ced],
-            is_identity_indices(&cache.train_idx[cst..ced], n_samples),
-            cache.packed_row_indices.as_deref(),
-            0usize,
-            blk_slice_f32,
-            &code4_lut,
-            pool_ref,
-        )?;
-        if let Some(t0) = t_decode {
-            z_decode_secs += t0.elapsed().as_secs_f64();
-        }
-        let t_mul = if stage_timing {
-            Some(Instant::now())
-        } else {
-            None
-        };
-        row_major_block_mul_vec_f32(
-            blk_slice_f32,
-            cache.m,
-            cur_n,
-            &y_center_f32[cst..ced],
-            &mut tmp_dot,
-            pool_ref,
-        );
-        if let Some(t0) = t_mul {
-            z_mul_secs += t0.elapsed().as_secs_f64();
-        }
-        for j in 0..cache.m {
-            z[j] += tmp_dot[j] as f64;
+        for rst in (0..cache.m).step_by(row_step) {
+            let red = (rst + row_step).min(cache.m);
+            let cur_rows = red - rst;
+            let blk_slice_f32 = &mut block_f32[..cur_rows * cur_n];
+            let t_decode = if stage_timing {
+                Some(Instant::now())
+            } else {
+                None
+            };
+            decode_standardized_block_f32(
+                &mut source,
+                n_samples,
+                cache.row_flip.as_slice(),
+                cache.row_mean.as_slice(),
+                cache.row_inv_sd.as_slice(),
+                &cache.train_idx[cst..ced],
+                is_identity_indices(&cache.train_idx[cst..ced], n_samples),
+                cache.packed_row_indices.as_deref(),
+                rst,
+                blk_slice_f32,
+                &code4_lut,
+                pool_ref,
+            )?;
+            if let Some(t0) = t_decode {
+                z_decode_secs += t0.elapsed().as_secs_f64();
+            }
+            let t_mul = if stage_timing {
+                Some(Instant::now())
+            } else {
+                None
+            };
+            row_major_block_mul_vec_f32(
+                blk_slice_f32,
+                cur_rows,
+                cur_n,
+                &y_center_f32[cst..ced],
+                &mut tmp_dot[..cur_rows],
+                pool_ref,
+            );
+            if let Some(t0) = t_mul {
+                z_mul_secs += t0.elapsed().as_secs_f64();
+            }
+            for j in 0..cur_rows {
+                z[rst + j] += tmp_dot[j] as f64;
+            }
         }
         check_ctrlc()?;
     }
@@ -2270,6 +2350,7 @@ pub fn rrblup_exact_snp_prepare_packed<'py>(
         Err(_) => Cow::Owned(packed_arr.iter().copied().collect()),
     };
     let sample_block_use = sample_block.max(1).min(train_idx.len().max(1));
+    let stream_row_block = eff_m.max(1);
     let cache_inner = py
         .detach(move || {
             build_rrblup_exact_snp_cache_from_packed(
@@ -2282,6 +2363,7 @@ pub fn rrblup_exact_snp_prepare_packed<'py>(
                 row_inv_sd,
                 packed_row_indices,
                 sample_block_use,
+                stream_row_block,
                 m_effective,
                 threads,
                 blas_threads,
@@ -2565,6 +2647,7 @@ pub fn rrblup_exact_snp_prepare_bed_from_meta<'py>(
     }
     let bytes_per_snp = n_samples.div_ceil(4);
     let sample_block_use = sample_block.max(1).min(train_idx.len().max(1));
+    let stream_row_block = sample_block_use.max(1).min(eff_m.max(1));
     let cache_inner = py
         .detach(move || {
             let source = build_rrblup_source(
@@ -2572,7 +2655,7 @@ pub fn rrblup_exact_snp_prepare_bed_from_meta<'py>(
                 bytes_per_snp,
                 source_prefix.as_str(),
                 n_samples,
-                eff_m.max(1),
+                stream_row_block,
             )?;
             build_rrblup_exact_snp_cache_from_source(
                 source,
@@ -2583,6 +2666,7 @@ pub fn rrblup_exact_snp_prepare_bed_from_meta<'py>(
                 row_inv_sd,
                 packed_row_indices,
                 sample_block_use,
+                stream_row_block,
                 m_effective,
                 threads,
                 blas_threads,
@@ -2991,6 +3075,7 @@ pub fn rrblup_exact_snp_packed<'py>(
     };
     let packed_flat_fit = packed_flat.clone();
     let sample_block_use = sample_block.max(1).min(n_train.max(1));
+    let stream_row_block = eff_m.max(1);
     let cache_inner = py
         .detach(move || {
             build_rrblup_exact_snp_cache_from_packed(
@@ -3003,6 +3088,7 @@ pub fn rrblup_exact_snp_packed<'py>(
                 row_inv_sd,
                 packed_row_indices,
                 sample_block_use,
+                stream_row_block,
                 m_effective,
                 threads,
                 blas_threads,

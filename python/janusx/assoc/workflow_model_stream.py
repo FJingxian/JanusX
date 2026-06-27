@@ -201,6 +201,34 @@ def _new_bed_chunk_reader_for_stream(
         raise
 
 
+def _new_bed_chunk_reader_from_meta_for_stream(
+    *,
+    bed_prefix: str,
+    row_indices: np.ndarray,
+    row_flip: np.ndarray,
+    row_missing: np.ndarray,
+    row_maf: np.ndarray,
+    sample_ids: list[str],
+    mmap_window_mb: Union[int, None],
+) -> object:
+    if not hasattr(jxrs, "BedChunkReaderFromMeta"):
+        raise RuntimeError(
+            "Rust-only GWAS meta-shared mode requires BedChunkReaderFromMeta. "
+            "Rebuild/reinstall JanusX extension."
+        )
+    kwargs = dict(
+        prefix=str(bed_prefix),
+        row_indices=np.ascontiguousarray(np.asarray(row_indices, dtype=np.int64).reshape(-1), dtype=np.int64),
+        row_flip=np.ascontiguousarray(np.asarray(row_flip, dtype=np.bool_).reshape(-1), dtype=np.bool_),
+        row_missing=np.ascontiguousarray(np.asarray(row_missing, dtype=np.float32).reshape(-1), dtype=np.float32),
+        row_maf=np.ascontiguousarray(np.asarray(row_maf, dtype=np.float32).reshape(-1), dtype=np.float32),
+        sample_ids=list(sample_ids),
+    )
+    if mmap_window_mb is not None:
+        kwargs["mmap_window_mb"] = int(max(1, int(mmap_window_mb)))
+    return jxrs.BedChunkReaderFromMeta(**kwargs)
+
+
 def _bed_next_chunk_prepared_compat(
     *,
     bed_reader: object,
@@ -279,6 +307,7 @@ def run_chunked_gwas_lmm_lm(
     prefer_packed_fullrust: bool = False,
     force_model: bool = False,
     lm2_covariate_indices: Union[np.ndarray, None] = None,
+    trait_prepared_meta: Optional[dict[str, object]] = None,
 ) -> None:
     """
     Run LM/LMM/LMM2/FastLMM/FvLMM GWAS through the maintained windowed BED path.
@@ -485,13 +514,6 @@ def run_chunked_gwas_lmm_lm(
         and hasattr(jxrs, "BedChunkReader")
         and hasattr(getattr(jxrs, "BedChunkReader"), "next_chunk_prepared")
     )
-    fvlmm_has_dedicated_bed_fastpath = bool(
-        bed_prefix is not None
-        and (
-            hasattr(jxrs, "fvlmm_assoc_bed_to_tsv_f32")
-            or hasattr(jxrs, "fvlmm_assoc_chunk_from_snp_to_tsv_f32")
-        )
-    )
     lmm_has_dedicated_bed_fastpath = bool(
         bed_prefix is not None
         and hasattr(jxrs, "lmm_reml_assoc_bed_to_tsv_f32")
@@ -502,11 +524,22 @@ def run_chunked_gwas_lmm_lm(
         and hasattr(jxrs, "lmm_reml_lmm2_assoc_bed_to_tsv_f32")
         and os.environ.get("JX_DISABLE_LMM2_UNIFIED") != "1"
     )
-
+    fvlmm_has_dedicated_bed_fastpath = bool(
+        bed_prefix is not None
+        and (
+            (
+                hasattr(jxrs, "fvlmm_assoc_chunk_from_snp_to_tsv_f32")
+                and os.environ.get("JX_DISABLE_FVLMM_TSV_FASTPATH") != "1"
+            )
+            or (
+                hasattr(jxrs, "fvlmm_assoc_bed_to_tsv_f32")
+                and os.environ.get("JX_DISABLE_FVLMM_UNIFIED") != "1"
+            )
+        )
+    )
     # For single-model kinship models on PLINK BED input, reuse the shared
     # prepared-chunk scan bus (same Rust read-block path as multi-model mode)
-    # to reduce Python per-chunk orchestration overhead. Keep single-model
-    # FvLMM on the dedicated runner when its Rust fastpaths are available.
+    # to reduce Python per-chunk orchestration overhead.
     if (
         model_key in {"lmm", "lmm2", "fastlmm", "fvlmm"}
         and has_prepared_bed_bus
@@ -548,6 +581,7 @@ def run_chunked_gwas_lmm_lm(
                 chunk_size_user_set=bool(chunk_size_user_set),
                 force_model=bool(force_model),
                 emit_trait_header=bool(emit_trait_header),
+                trait_prepared_meta=trait_prepared_meta,
             )
             if multi_trait_mode and trait_idx < len(trait_iter) - 1:
                 logger.info("")
@@ -939,16 +973,19 @@ def run_chunked_gwas_lmm_lm(
             str(effective_model_key).lower() == "fvlmm"
             and hasattr(jxrs, "fvlmm_assoc_bed_to_tsv_f32")
             and os.environ.get("JX_DISABLE_FVLMM_UNIFIED") != "1"
+            and trait_prepared_meta is None
         )
         _use_lmm_unified = (
             str(effective_model_key).lower() == "lmm"
             and hasattr(jxrs, "lmm_reml_assoc_bed_to_tsv_f32")
             and os.environ.get("JX_DISABLE_LMM_UNIFIED") != "1"
+            and trait_prepared_meta is None
         )
         _use_lmm2_unified = (
             str(effective_model_key).lower() == "lmm2"
             and hasattr(jxrs, "lmm_reml_lmm2_assoc_bed_to_tsv_f32")
             and os.environ.get("JX_DISABLE_LMM2_UNIFIED") != "1"
+            and trait_prepared_meta is None
         )
 
         def _format_chunk_tsv_text(
@@ -1602,6 +1639,7 @@ def run_chunked_gwas_streaming_shared(
     chunk_size_user_set: bool = True,
     force_model: bool = False,
     emit_trait_header: bool = True,
+    trait_prepared_meta: Optional[dict[str, object]] = None,
 ) -> None:
     """
     Shared-chunk streaming GWAS for multiple models on one trait.
@@ -2261,16 +2299,36 @@ def run_chunked_gwas_streaming_shared(
                     "Rust-only GWAS scan requires rust symbol BedChunkReader."
                 )
             try:
-                bed_reader = _new_bed_chunk_reader_for_stream(
-                    bed_prefix=str(bed_prefix),
-                    maf_threshold=float(maf_threshold),
-                    max_missing_rate=float(max_missing_rate),
-                    sample_ids=sample_sub.tolist(),
-                    model=str(genetic_model),
-                    het_threshold=float(het_threshold),
-                    mmap_window_mb=(int(mmap_window_mb) if mmap_window_mb is not None else None),
-                    logger=logger,
-                )
+                if (
+                    trait_prepared_meta is not None
+                    and str(genetic_model).lower() == "add"
+                ):
+                    bed_reader = _new_bed_chunk_reader_from_meta_for_stream(
+                        bed_prefix=str(bed_prefix),
+                        row_indices=np.asarray(trait_prepared_meta["row_indices"], dtype=np.int64),
+                        row_flip=np.asarray(trait_prepared_meta["row_flip"], dtype=np.bool_),
+                        row_missing=np.asarray(
+                            trait_prepared_meta.get(
+                                "missing_count",
+                                trait_prepared_meta["missing_rate"],
+                            ),
+                            dtype=np.float32,
+                        ),
+                        row_maf=np.asarray(trait_prepared_meta["maf"], dtype=np.float32),
+                        sample_ids=sample_sub.tolist(),
+                        mmap_window_mb=(int(mmap_window_mb) if mmap_window_mb is not None else None),
+                    )
+                else:
+                    bed_reader = _new_bed_chunk_reader_for_stream(
+                        bed_prefix=str(bed_prefix),
+                        maf_threshold=float(maf_threshold),
+                        max_missing_rate=float(max_missing_rate),
+                        sample_ids=sample_sub.tolist(),
+                        model=str(genetic_model),
+                        het_threshold=float(het_threshold),
+                        mmap_window_mb=(int(mmap_window_mb) if mmap_window_mb is not None else None),
+                        logger=logger,
+                    )
             except Exception as ex:
                 raise RuntimeError(
                     f"Failed to initialize Rust BedChunkReader for GWAS scan: {ex}"

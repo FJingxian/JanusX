@@ -3915,6 +3915,142 @@ pub fn spgrm_bed_to_jxgrm<'py>(
 
 #[pyfunction]
 #[pyo3(signature = (
+    prefix,
+    row_source_indices,
+    row_flip,
+    row_maf,
+    n_total_sites,
+    out_prefix=None,
+    sample_indices=None,
+    method=1,
+    threshold=0.05_f64,
+    abs_threshold=false,
+    block_rows=0,
+    sample_block=0,
+    threads=0,
+    mmap_window_mb=None,
+    progress_callback=None,
+    progress_every=0
+))]
+pub fn spgrm_bed_to_jxgrm_from_meta<'py>(
+    prefix: String,
+    row_source_indices: PyReadonlyArray1<'py, i64>,
+    row_flip: PyReadonlyArray1<'py, bool>,
+    row_maf: PyReadonlyArray1<'py, f32>,
+    n_total_sites: usize,
+    out_prefix: Option<String>,
+    sample_indices: Option<PyReadonlyArray1<'py, i64>>,
+    method: usize,
+    threshold: f64,
+    abs_threshold: bool,
+    block_rows: usize,
+    sample_block: usize,
+    threads: usize,
+    mmap_window_mb: Option<usize>,
+    progress_callback: Option<Py<PyAny>>,
+    progress_every: usize,
+) -> PyResult<(String, usize, usize)> {
+    let bed_prefix = normalize_plink_prefix_local(&prefix);
+    let n_samples_full = read_fam(&bed_prefix)
+        .map_err(PyRuntimeError::new_err)?
+        .len();
+    if n_samples_full == 0 {
+        return Err(PyRuntimeError::new_err("No samples found in BED input."));
+    }
+    if n_total_sites == 0 {
+        return Err(PyRuntimeError::new_err(
+            "n_total_sites must be positive for sparse GRM meta route.",
+        ));
+    }
+
+    let sample_idx_vec: Option<Vec<usize>> = if let Some(sample_indices) = sample_indices {
+        Some(parse_index_vec_i64(
+            sample_indices.as_slice()?,
+            n_samples_full,
+            "sample_indices",
+        )?)
+    } else {
+        None
+    };
+    let selected_idx: Cow<'_, [usize]> = match sample_idx_vec.as_deref() {
+        Some(idx) => Cow::Borrowed(idx),
+        None => Cow::Owned((0..n_samples_full).collect()),
+    };
+
+    let row_source_vec: Vec<usize> = row_source_indices
+        .as_slice()
+        .map_err(|_| PyRuntimeError::new_err("row_source_indices must be contiguous int64"))?
+        .iter()
+        .map(|&rid| {
+            if rid < 0 {
+                Err(PyRuntimeError::new_err(format!(
+                    "row_source_indices must be non-negative, got {rid}"
+                )))
+            } else {
+                Ok(rid as usize)
+            }
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    let row_flip_vec: Vec<bool> = match row_flip.as_slice() {
+        Ok(s) => s.to_vec(),
+        Err(_) => row_flip.as_array().iter().copied().collect(),
+    };
+    let row_maf_vec: Vec<f32> = match row_maf.as_slice() {
+        Ok(s) => s.to_vec(),
+        Err(_) => row_maf.as_array().iter().copied().collect(),
+    };
+    if row_source_vec.is_empty() {
+        return Err(PyRuntimeError::new_err(
+            "row_source_indices must not be empty",
+        ));
+    }
+    if row_flip_vec.len() != row_source_vec.len() || row_maf_vec.len() != row_source_vec.len() {
+        return Err(PyRuntimeError::new_err(format!(
+            "row meta length mismatch: row_source_indices={}, row_flip={}, row_maf={}",
+            row_source_vec.len(),
+            row_flip_vec.len(),
+            row_maf_vec.len(),
+        )));
+    }
+    if let Some(&bad) = row_source_vec.iter().find(|&&rid| rid >= n_total_sites) {
+        return Err(PyRuntimeError::new_err(format!(
+            "row_source index out of range: {bad} >= n_total_sites={n_total_sites}"
+        )));
+    }
+
+    let meta = crate::gfreader::PreparedBedLogicMetaOwned {
+        site_keep: Vec::new(),
+        row_flip: row_flip_vec,
+        row_source_indices: row_source_vec,
+        missing_rate: Vec::new(),
+        maf: row_maf_vec,
+        sites: Vec::new(),
+        n_samples: n_samples_full,
+        n_snps_total: n_total_sites,
+        bytes_per_snp: n_samples_full.div_ceil(4),
+    };
+    let out_use = out_prefix.unwrap_or_else(|| bed_prefix.clone());
+    spgrm_stream_bed_to_jxgrm_core(
+        &bed_prefix,
+        selected_idx.as_ref(),
+        meta,
+        &out_use,
+        method,
+        threshold,
+        abs_threshold,
+        block_rows,
+        sample_block,
+        threads,
+        mmap_window_mb,
+        progress_callback.as_ref(),
+        progress_every,
+        0usize,
+    )
+    .map_err(map_err_string_to_py)
+}
+
+#[pyfunction]
+#[pyo3(signature = (
     grm,
     out_prefix,
     threshold=0.05_f64,

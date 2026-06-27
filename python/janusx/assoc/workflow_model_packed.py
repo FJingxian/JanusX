@@ -17,7 +17,8 @@ from typing import Optional, Union
 import numpy as np
 import pandas as pd
 import psutil
-from janusx.assoc.workflow_cache import _is_writable_dir, _resolve_gwas_cache_dir
+from janusx.assoc.workflow_cache import _cache_lock, _is_writable_dir, _resolve_gwas_cache_dir
+from janusx.script._common.grmio import format_grm_cache_num
 from janusx.script._common.memory import (
     resolve_decode_mmap_window_mb as _common_resolve_decode_mmap_window_mb,
 )
@@ -58,6 +59,7 @@ from .workflow import (
     _mixed_model_switch_to_lm_decision,
     _progress_callback_step,
     _coerce_bim_site_columns,
+    latest_genotype_mtime,
     _resolve_bim_site_columns_meta,
     _replace_file_with_retry,
     _resolve_trait_iter,
@@ -83,6 +85,7 @@ _SPLMM_SPARSE_GRM_METHOD = 2
 _SPLMM_SPARSE_REML_GRID_SIZE = 17
 _SPLMM_SPARSE_REML_MAX_ITER = 20
 _SPLMM_SPGRM_SINGLE_BLOCK_N_MAX = 2048
+_SPLMM_META_CACHE_VERSION = 1
 
 
 def _current_bed_memory_mb() -> float:
@@ -238,6 +241,213 @@ def _splmm_sparse_out_prefix_for_gwas(
     if desired_base == "":
         desired_base = os.path.basename(str(prefix).rstrip("/\\")) or "sparse_grm"
     return os.path.join(fallback_root, desired_base).replace("\\", "/")
+
+
+def _splmm_meta_cache_tag(
+    *,
+    maf_threshold: float,
+    max_missing_rate: float,
+    het_threshold: float,
+    snps_only: bool,
+) -> str:
+    return (
+        f".maf{format_grm_cache_num(float(maf_threshold))}"
+        f".geno{format_grm_cache_num(float(max_missing_rate))}"
+        f".het{format_grm_cache_num(float(het_threshold))}"
+        f".snp{1 if bool(snps_only) else 0}"
+    )
+
+
+def _splmm_meta_cache_prefix_for_gwas(
+    prefix: str,
+    sample_indices: np.ndarray,
+    *,
+    maf_threshold: float,
+    max_missing_rate: float,
+    het_threshold: float,
+    snps_only: bool,
+    outprefix: Optional[str] = None,
+    logger: Optional[logging.Logger] = None,
+) -> str:
+    sample_idx = np.ascontiguousarray(
+        np.asarray(sample_indices, dtype=np.int64).reshape(-1),
+        dtype=np.int64,
+    )
+    desired = (
+        f"{prefix}.splmm.meta.n{int(sample_idx.shape[0])}."
+        f"{_splmm_sparse_sample_hash(sample_idx)}"
+        f"{_splmm_meta_cache_tag(
+            maf_threshold=float(maf_threshold),
+            max_missing_rate=float(max_missing_rate),
+            het_threshold=float(het_threshold),
+            snps_only=bool(snps_only),
+        )}"
+    )
+    desired_dir = os.path.abspath(os.path.dirname(str(desired)) or ".")
+    if _is_writable_dir(desired_dir):
+        return str(desired)
+    cache_dir = None
+    if outprefix is not None and str(outprefix).strip() != "":
+        cache_dir = os.path.abspath(os.path.dirname(str(outprefix)))
+    fallback_root = _resolve_gwas_cache_dir(
+        str(prefix),
+        cache_dir=cache_dir,
+        logger=logger,
+    )
+    desired_base = os.path.basename(str(desired).rstrip("/\\"))
+    if desired_base == "":
+        desired_base = os.path.basename(str(prefix).rstrip("/\\")) or "splmm_meta"
+    return os.path.join(fallback_root, desired_base).replace("\\", "/")
+
+
+def _splmm_meta_cache_paths(cache_prefix: str) -> dict[str, str]:
+    stem = f"{cache_prefix}.scanmeta"
+    return {
+        "json": f"{stem}.json",
+        "row_idx": f"{stem}.row_idx.npy",
+        "miss": f"{stem}.miss.npy",
+        "maf": f"{stem}.maf.npy",
+        "row_flip": f"{stem}.row_flip.npy",
+        "site_keep": f"{stem}.site_keep.npy",
+    }
+
+
+def _atomic_save_npy_local(path: str, arr: np.ndarray) -> None:
+    tmp = f"{path}.tmp.{os.getpid()}.{uuid.uuid4().hex}.npy"
+    np.save(tmp, np.asarray(arr))
+    os.replace(tmp, path)
+
+
+def _atomic_save_json_local(path: str, payload: dict[str, object]) -> None:
+    tmp = f"{path}.tmp.{os.getpid()}.{uuid.uuid4().hex}.json"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, ensure_ascii=True, sort_keys=True)
+        fh.write("\n")
+    os.replace(tmp, path)
+
+
+def _splmm_meta_cache_spec(
+    *,
+    prefix: str,
+    sample_indices: np.ndarray,
+    maf_threshold: float,
+    max_missing_rate: float,
+    het_threshold: float,
+    snps_only: bool,
+) -> dict[str, object]:
+    sample_idx = np.ascontiguousarray(
+        np.asarray(sample_indices, dtype=np.int64).reshape(-1),
+        dtype=np.int64,
+    )
+    return {
+        "source_prefix": os.path.normpath(str(prefix)),
+        "sample_hash": _splmm_sparse_sample_hash(sample_idx),
+        "sample_n": int(sample_idx.shape[0]),
+        "maf_threshold": float(maf_threshold),
+        "max_missing_rate": float(max_missing_rate),
+        "het_threshold": float(het_threshold),
+        "snps_only": bool(snps_only),
+    }
+
+
+def _load_splmm_meta_cache(
+    *,
+    cache_prefix: str,
+    spec: dict[str, object],
+) -> Optional[dict[str, object]]:
+    paths = _splmm_meta_cache_paths(str(cache_prefix))
+    required = (
+        paths["json"],
+        paths["row_idx"],
+        paths["miss"],
+        paths["maf"],
+        paths["row_flip"],
+        paths["site_keep"],
+    )
+    if not all(os.path.isfile(p) for p in required):
+        return None
+    try:
+        with open(paths["json"], "r", encoding="utf-8") as fh:
+            meta_info = json.load(fh)
+    except Exception:
+        return None
+    if int(meta_info.get("version", -1)) != int(_SPLMM_META_CACHE_VERSION):
+        return None
+    if meta_info.get("spec") != spec:
+        return None
+    current_mtime = latest_genotype_mtime(str(spec["source_prefix"]))
+    cached_mtime = meta_info.get("source_mtime", None)
+    if (
+        current_mtime is not None
+        and cached_mtime is not None
+        and float(current_mtime) != float(cached_mtime)
+    ):
+        return None
+    try:
+        row_idx = np.ascontiguousarray(
+            np.asarray(np.load(paths["row_idx"]), dtype=np.int64).reshape(-1),
+            dtype=np.int64,
+        )
+        miss = np.ascontiguousarray(
+            np.asarray(np.load(paths["miss"]), dtype=np.float32).reshape(-1),
+            dtype=np.float32,
+        )
+        maf = np.ascontiguousarray(
+            np.asarray(np.load(paths["maf"]), dtype=np.float32).reshape(-1),
+            dtype=np.float32,
+        )
+        row_flip = np.ascontiguousarray(
+            np.asarray(np.load(paths["row_flip"]), dtype=np.bool_).reshape(-1),
+            dtype=np.bool_,
+        )
+        site_keep = np.ascontiguousarray(
+            np.asarray(np.load(paths["site_keep"]), dtype=np.bool_).reshape(-1),
+            dtype=np.bool_,
+        )
+    except Exception:
+        return None
+    n_rows = int(row_idx.shape[0])
+    if (
+        int(miss.shape[0]) != n_rows
+        or int(maf.shape[0]) != n_rows
+        or int(row_flip.shape[0]) != n_rows
+    ):
+        return None
+    return {
+        "row_indices": row_idx,
+        "missing_rate": miss,
+        "af": maf,
+        "maf": maf,
+        "row_flip": row_flip,
+        "site_keep": site_keep,
+        "n_samples_full": int(meta_info.get("n_samples_full", 0) or 0),
+        "n_snps_total": int(meta_info.get("n_snps_total", int(site_keep.shape[0])) or 0),
+    }
+
+
+def _save_splmm_meta_cache(
+    *,
+    cache_prefix: str,
+    spec: dict[str, object],
+    meta: dict[str, object],
+) -> None:
+    paths = _splmm_meta_cache_paths(str(cache_prefix))
+    _atomic_save_npy_local(paths["row_idx"], np.asarray(meta["row_indices"], dtype=np.int64))
+    _atomic_save_npy_local(paths["miss"], np.asarray(meta["missing_rate"], dtype=np.float32))
+    _atomic_save_npy_local(paths["maf"], np.asarray(meta["maf"], dtype=np.float32))
+    _atomic_save_npy_local(paths["row_flip"], np.asarray(meta["row_flip"], dtype=np.bool_))
+    _atomic_save_npy_local(paths["site_keep"], np.asarray(meta["site_keep"], dtype=np.bool_))
+    _atomic_save_json_local(
+        paths["json"],
+        {
+            "version": int(_SPLMM_META_CACHE_VERSION),
+            "spec": spec,
+            "source_mtime": latest_genotype_mtime(str(spec["source_prefix"])),
+            "n_samples_full": int(meta.get("n_samples_full", 0) or 0),
+            "n_snps_total": int(meta.get("n_snps_total", 0) or 0),
+            "n_active_sites": int(np.asarray(meta["row_indices"]).reshape(-1).shape[0]),
+        },
+    )
 
 
 def _splmm_sparse_layout_rebuild_reason(sparse_path: str) -> Optional[str]:
@@ -601,6 +811,69 @@ def _splmm_bed_logic_meta_selected(
     }
 
 
+def _splmm_bed_logic_meta_selected_cached(
+    prefix: str,
+    *,
+    sample_indices: np.ndarray,
+    maf_threshold: float,
+    max_missing_rate: float,
+    het_threshold: float,
+    snps_only: bool,
+    mmap_window_mb: Optional[int] = None,
+    outprefix: Optional[str] = None,
+    logger: Optional[logging.Logger] = None,
+) -> dict[str, object]:
+    sample_idx = np.ascontiguousarray(
+        np.asarray(sample_indices, dtype=np.int64).reshape(-1),
+        dtype=np.int64,
+    )
+    if int(sample_idx.shape[0]) == 0:
+        raise ValueError("SparseLMM metadata cache sample subset must not be empty.")
+    spec = _splmm_meta_cache_spec(
+        prefix=str(prefix),
+        sample_indices=sample_idx,
+        maf_threshold=float(maf_threshold),
+        max_missing_rate=float(max_missing_rate),
+        het_threshold=float(het_threshold),
+        snps_only=bool(snps_only),
+    )
+    cache_prefix = _splmm_meta_cache_prefix_for_gwas(
+        str(prefix),
+        sample_idx,
+        maf_threshold=float(maf_threshold),
+        max_missing_rate=float(max_missing_rate),
+        het_threshold=float(het_threshold),
+        snps_only=bool(snps_only),
+        outprefix=outprefix,
+        logger=logger,
+    )
+    cached = _load_splmm_meta_cache(cache_prefix=str(cache_prefix), spec=spec)
+    if cached is not None:
+        return cached
+    with _cache_lock(str(cache_prefix)):
+        cached = _load_splmm_meta_cache(cache_prefix=str(cache_prefix), spec=spec)
+        if cached is not None:
+            return cached
+        built = _splmm_bed_logic_meta_selected(
+            str(prefix),
+            sample_indices=sample_idx,
+            maf_threshold=float(maf_threshold),
+            max_missing_rate=float(max_missing_rate),
+            het_threshold=float(het_threshold),
+            snps_only=bool(snps_only),
+            mmap_window_mb=mmap_window_mb,
+        )
+        try:
+            _save_splmm_meta_cache(
+                cache_prefix=str(cache_prefix),
+                spec=spec,
+                meta=built,
+            )
+        except Exception:
+            pass
+        return built
+
+
 def _lm_precompute_ixx_qr(x_design: np.ndarray) -> np.ndarray:
     """
     Stable LM precompute for IXX without explicitly forming/inverting X'X.
@@ -738,6 +1011,87 @@ def _packed_ctx_active_view_for_gwas(
     return packed, packed_n, local_row_idx, af_full, miss_full, row_flip_full
 
 
+def _packed_ctx_scan_meta_for_gwas(
+    packed_ctx: dict[str, object],
+) -> tuple[int, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    packed_obj = packed_ctx.get("packed", None)
+    if packed_obj is not None:
+        _packed, packed_n, active_row_idx, maf, miss, row_flip = _packed_ctx_active_view_for_gwas(
+            packed_ctx
+        )
+        return packed_n, active_row_idx, maf, miss, row_flip
+
+    packed_n = int(packed_ctx.get("n_samples", 0) or 0)
+    miss_full = np.ascontiguousarray(
+        np.asarray(packed_ctx["missing_rate"], dtype=np.float32).reshape(-1),
+        dtype=np.float32,
+    )
+    af_full = np.ascontiguousarray(
+        np.asarray(packed_ctx.get("af", packed_ctx["maf"]), dtype=np.float32).reshape(-1),
+        dtype=np.float32,
+    )
+    row_flip_full = np.ascontiguousarray(
+        np.asarray(
+            packed_ctx.get("row_flip", np.zeros((int(af_full.shape[0]),), dtype=np.bool_)),
+            dtype=np.bool_,
+        ).reshape(-1),
+        dtype=np.bool_,
+    )
+    site_keep_raw = packed_ctx.get("site_keep", None)
+    site_keep = (
+        np.ascontiguousarray(np.asarray(site_keep_raw, dtype=np.bool_).reshape(-1), dtype=np.bool_)
+        if site_keep_raw is not None
+        else None
+    )
+    active_row_idx_obj = packed_ctx.get("active_row_idx", packed_ctx.get("row_indices"))
+    if active_row_idx_obj is not None:
+        active_row_idx = np.ascontiguousarray(
+            np.asarray(active_row_idx_obj, dtype=np.int64).reshape(-1),
+            dtype=np.int64,
+        )
+    elif site_keep is not None:
+        active_row_idx = np.ascontiguousarray(
+            np.flatnonzero(site_keep).astype(np.int64, copy=False),
+            dtype=np.int64,
+        )
+    else:
+        active_row_idx = np.ascontiguousarray(
+            np.arange(int(miss_full.shape[0]), dtype=np.int64),
+            dtype=np.int64,
+        )
+    active_stats_shape = (
+        int(active_row_idx.shape[0]) == int(miss_full.shape[0])
+        and int(active_row_idx.shape[0]) == int(af_full.shape[0])
+        and int(active_row_idx.shape[0]) == int(row_flip_full.shape[0])
+    )
+    n_total_sites = (
+        int(site_keep.shape[0])
+        if site_keep is not None
+        else max(int(miss_full.shape[0]), int(af_full.shape[0]), int(row_flip_full.shape[0]))
+    )
+    full_stats_shape = (
+        int(miss_full.shape[0]) == int(n_total_sites)
+        and int(af_full.shape[0]) == int(n_total_sites)
+        and int(row_flip_full.shape[0]) == int(n_total_sites)
+    )
+    if full_stats_shape:
+        if int(active_row_idx.shape[0]) > 0 and (
+            int(active_row_idx.min()) < 0 or int(active_row_idx.max()) >= int(n_total_sites)
+        ):
+            raise ValueError(
+                "Packed GWAS metadata context mismatch: active_row_idx out of metadata bounds."
+            )
+        maf_active = np.ascontiguousarray(af_full[active_row_idx], dtype=np.float32)
+        miss_active = np.ascontiguousarray(miss_full[active_row_idx], dtype=np.float32)
+        row_flip_active = np.ascontiguousarray(row_flip_full[active_row_idx], dtype=np.bool_)
+        return packed_n, active_row_idx, maf_active, miss_active, row_flip_active
+    if active_stats_shape:
+        return packed_n, active_row_idx, af_full, miss_full, row_flip_full
+    raise ValueError(
+        "Packed GWAS metadata context mismatch: unable to align row statistics with active_row_idx."
+    )
+
+
 def _resolve_packed_sites_all(
     prefix: str,
     packed_row_idx: np.ndarray,
@@ -797,7 +1151,6 @@ def _prepare_packed_bed_once_for_gwas(
         if not isinstance(packed_ctx_obj, dict):
             raise ValueError("Invalid preloaded packed context: missing packed_ctx dict.")
         packed_ctx = {
-            "packed": np.ascontiguousarray(np.asarray(packed_ctx_obj["packed"], dtype=np.uint8)),
             "missing_rate": np.ascontiguousarray(
                 np.asarray(packed_ctx_obj["missing_rate"], dtype=np.float32).reshape(-1),
                 dtype=np.float32,
@@ -818,20 +1171,49 @@ def _prepare_packed_bed_once_for_gwas(
                 np.asarray(packed_ctx_obj.get("site_keep"), dtype=np.bool_).reshape(-1),
                 dtype=np.bool_,
             ) if packed_ctx_obj.get("site_keep", None) is not None else None,
-            "active_row_idx": np.ascontiguousarray(
-                np.asarray(
-                    packed_ctx_obj.get(
-                        "active_row_idx",
-                        np.arange(int(np.asarray(packed_ctx_obj["packed"]).shape[0]), dtype=np.int64),
-                    ),
-                    dtype=np.int64,
-                ).reshape(-1),
-                dtype=np.int64,
-            ),
             "packed_filter_mode": str(packed_ctx_obj.get("packed_filter_mode", "compact")),
             "n_samples": int(packed_ctx_obj["n_samples"]),
             "source_prefix": str(prefix),
         }
+        packed_payload_obj = packed_ctx_obj.get("packed", None)
+        if packed_payload_obj is not None:
+            packed_ctx["packed"] = np.ascontiguousarray(
+                np.asarray(packed_payload_obj, dtype=np.uint8),
+                dtype=np.uint8,
+            )
+        active_row_idx_obj = packed_ctx_obj.get("active_row_idx", packed_ctx_obj.get("row_indices"))
+        if active_row_idx_obj is None:
+            if packed_ctx.get("site_keep", None) is not None:
+                active_row_idx_obj = np.flatnonzero(
+                    np.asarray(packed_ctx["site_keep"], dtype=np.bool_).reshape(-1)
+                ).astype(np.int64, copy=False)
+            elif packed_payload_obj is not None:
+                active_row_idx_obj = np.arange(
+                    int(np.asarray(packed_payload_obj).shape[0]),
+                    dtype=np.int64,
+                )
+            else:
+                active_row_idx_obj = np.arange(
+                    int(np.asarray(packed_ctx["missing_rate"]).shape[0]),
+                    dtype=np.int64,
+                )
+        packed_ctx["active_row_idx"] = np.ascontiguousarray(
+            np.asarray(active_row_idx_obj, dtype=np.int64).reshape(-1),
+            dtype=np.int64,
+        )
+        packed_storage = packed_ctx_obj.get("packed_storage", None)
+        if packed_storage is not None:
+            packed_ctx["packed_storage"] = str(packed_storage)
+        if "std_denom" in packed_ctx_obj:
+            packed_ctx["std_denom"] = np.ascontiguousarray(
+                np.asarray(packed_ctx_obj["std_denom"], dtype=np.float32).reshape(-1),
+                dtype=np.float32,
+            )
+        if "dom_af" in packed_ctx_obj:
+            packed_ctx["dom_af"] = np.ascontiguousarray(
+                np.asarray(packed_ctx_obj["dom_af"], dtype=np.float32).reshape(-1),
+                dtype=np.float32,
+            )
         sites_pre = pre.get("site_meta", pre.get("sites_all"))
         site_meta = _coerce_bim_site_columns(sites_pre)
         if load_site_meta and site_meta is not None and len(site_meta) > 0:
@@ -888,14 +1270,25 @@ def _prepare_packed_bed_once_for_gwas(
             "source_prefix": str(prefix),
         }
 
+    active_row_idx_obj = packed_ctx.get("active_row_idx")
+    if active_row_idx_obj is None:
+        site_keep_obj = packed_ctx.get("site_keep", None)
+        if site_keep_obj is not None:
+            active_row_idx_obj = np.flatnonzero(
+                np.asarray(site_keep_obj, dtype=np.bool_).reshape(-1)
+            ).astype(np.int64, copy=False)
+        elif packed_ctx.get("packed", None) is not None:
+            active_row_idx_obj = np.arange(
+                int(np.asarray(packed_ctx["packed"]).shape[0]),
+                dtype=np.int64,
+            )
+        else:
+            active_row_idx_obj = np.arange(
+                int(np.asarray(packed_ctx["missing_rate"]).shape[0]),
+                dtype=np.int64,
+            )
     active_row_idx = np.ascontiguousarray(
-        np.asarray(
-            packed_ctx.get(
-                "active_row_idx",
-                np.arange(int(np.asarray(packed_ctx["packed"]).shape[0]), dtype=np.int64),
-            ),
-            dtype=np.int64,
-        ).reshape(-1),
+        np.asarray(active_row_idx_obj, dtype=np.int64).reshape(-1),
         dtype=np.int64,
     )
     if not load_site_meta:
@@ -4704,6 +5097,7 @@ def run_splmm_windowed_fullrank(
     trait_names: Union[list[str], None] = None,
     emit_trait_header: bool = True,
     preloaded_packed: Union[dict[str, object], None] = None,
+    trait_prepared_meta: Union[dict[str, object], None] = None,
     force_model: bool = False,
     scan_mode: str = "exact",
 ) -> None:
@@ -4750,6 +5144,36 @@ def run_splmm_windowed_fullrank(
     scan_maf = None
     scan_miss = None
     scan_row_flip = None
+    if isinstance(trait_prepared_meta, dict):
+        try:
+            scan_row_idx = np.ascontiguousarray(
+                np.asarray(trait_prepared_meta["row_indices"], dtype=np.int64).reshape(-1),
+                dtype=np.int64,
+            )
+            scan_maf = np.ascontiguousarray(
+                np.asarray(trait_prepared_meta["maf"], dtype=np.float32).reshape(-1),
+                dtype=np.float32,
+            )
+            scan_miss = np.ascontiguousarray(
+                np.asarray(trait_prepared_meta["missing_rate"], dtype=np.float32).reshape(-1),
+                dtype=np.float32,
+            )
+            scan_row_flip = np.ascontiguousarray(
+                np.asarray(trait_prepared_meta["row_flip"], dtype=np.bool_).reshape(-1),
+                dtype=np.bool_,
+            )
+            if (
+                int(scan_row_idx.shape[0]) == int(scan_maf.shape[0])
+                and int(scan_row_idx.shape[0]) == int(scan_miss.shape[0])
+                and int(scan_row_idx.shape[0]) == int(scan_row_flip.shape[0])
+            ):
+                use_preloaded_scan_meta = True
+        except Exception:
+            use_preloaded_scan_meta = False
+            scan_row_idx = None
+            scan_maf = None
+            scan_miss = None
+            scan_row_flip = None
     if packed_preload_is_ready(preloaded_packed):
         prefix_packed, full_ids_packed, packed_ctx_packed, sites_all_packed = _prepare_packed_bed_once_for_gwas(
             genofile=genofile,
@@ -4769,13 +5193,12 @@ def run_splmm_windowed_fullrank(
         )
         packed_ctx = packed_ctx_packed
         (
-            _scan_packed_unused,
             scan_packed_n,
             scan_row_idx,
             scan_maf,
             scan_miss,
             scan_row_flip,
-        ) = _packed_ctx_active_view_for_gwas(packed_ctx_packed)
+        ) = _packed_ctx_scan_meta_for_gwas(packed_ctx_packed)
         if scan_packed_n <= 0:
             raise ValueError("Packed BED reported invalid sample count.")
         if (
@@ -4942,7 +5365,7 @@ def run_splmm_windowed_fullrank(
 
         def _run_sparse_scan_meta_task() -> tuple[object, float]:
             task_t0 = time.monotonic()
-            out = _splmm_bed_logic_meta_selected(
+            out = _splmm_bed_logic_meta_selected_cached(
                 str(kinship_prefix),
                 sample_indices=kinship_sample_idx_trait,
                 maf_threshold=float(maf_threshold),
@@ -4950,6 +5373,8 @@ def run_splmm_windowed_fullrank(
                 het_threshold=float(het_threshold),
                 snps_only=bool(snps_only),
                 mmap_window_mb=scan_meta_mmap_window_mb,
+                outprefix=str(outprefix),
+                logger=logger,
             )
             return out, max(time.monotonic() - task_t0, 0.0)
 
@@ -5156,6 +5581,8 @@ def run_splmm_windowed_fullrank(
             )
             if multi_trait_mode:
                 logger.info("")
+            scan_meta = None
+            null_fit = None
             _stop_prepare_handle()
             continue
 
@@ -5209,6 +5636,8 @@ def run_splmm_windowed_fullrank(
                 )
                 if multi_trait_mode:
                     logger.info("")
+                scan_meta = None
+                null_fit = None
                 _stop_prepare_handle()
                 continue
 
@@ -5712,6 +6141,19 @@ def run_splmm_windowed_fullrank(
         _stop_prepare_handle()
         if multi_trait_mode:
             logger.info("")
+        scan_meta = None
+        null_fit = None
+        trait_row_idx = None
+        trait_scan_maf = None
+        trait_scan_miss = None
+        trait_scan_row_flip = None
+        trait_site_keep = None
+        scan_row_idx = None
+        scan_maf = None
+        scan_miss = None
+        scan_row_flip = None
+        packed_ctx = None
+        arr = None
 
 
 def run_splmm_packed_fullrank(*args, **kwargs) -> None:

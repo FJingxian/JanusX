@@ -64,6 +64,8 @@ from ._common.genoio import (
     genotype_load_status_done,
     genotype_load_status_fail,
     genotype_load_status_open,
+    load_or_build_packed_meta_basic,
+    packed_meta_active_row_idx,
 )
 from ._common.threads import (
     apply_blas_thread_env,
@@ -89,11 +91,15 @@ from ._common.memory import (
 
 try:
     from janusx.janusx import (
+        gblup_grm_from_meta_to_npy as _gblup_grm_from_meta_to_npy,
+        grm_bed_f64_from_meta as _grm_bed_f64_from_meta,
         grm_packed_bed_f32 as _grm_packed_bed_f32,
         grm_stream_bed_f32 as _grm_stream_bed_f32,
         grm_stream_bed_f32_to_npy as _grm_stream_bed_f32_to_npy,
     )
 except Exception:
+    _gblup_grm_from_meta_to_npy = None
+    _grm_bed_f64_from_meta = None
     _grm_packed_bed_f32 = None
     _grm_stream_bed_f32 = None
     _grm_stream_bed_f32_to_npy = None
@@ -101,11 +107,13 @@ except Exception:
 try:
     from janusx.janusx import (
         spgrm_bed_to_jxgrm as _spgrm_bed_to_jxgrm,
+        spgrm_bed_to_jxgrm_from_meta as _spgrm_bed_to_jxgrm_from_meta,
         spgrm_dense_f32_to_jxgrm as _spgrm_dense_f32_to_jxgrm,
         spgrm_dense_npy_to_jxgrm as _spgrm_dense_npy_to_jxgrm,
     )
 except Exception:
     _spgrm_bed_to_jxgrm = None
+    _spgrm_bed_to_jxgrm_from_meta = None
     _spgrm_dense_f32_to_jxgrm = None
     _spgrm_dense_npy_to_jxgrm = None
 
@@ -416,8 +424,77 @@ def _resolve_rust_grm_input(
         raise RuntimeError(
             "Rust GRM backend requires PLINK BED-compatible input. "
             f"Failed to materialize BED cache from: {genofile}"
-        )
+    )
     return str(cached)
+
+
+def _packed_ctx_is_lazy_full(packed_ctx: dict) -> bool:
+    return str(packed_ctx.get("packed_filter_mode", "")).strip().lower() == "lazy_full"
+
+
+def _packed_ctx_prefers_metadata_stream(packed_ctx: dict) -> bool:
+    if not _packed_ctx_is_lazy_full(packed_ctx):
+        return False
+    source_prefix = str(packed_ctx.get("source_prefix", "") or "").strip()
+    return source_prefix != ""
+
+
+def _grm_stream_meta_payload(
+    packed_ctx: dict,
+    *,
+    block_rows: int,
+    mmap_window_mb: Union[int, None],
+) -> tuple[str, np.ndarray, np.ndarray, np.ndarray, int]:
+    source_prefix_raw = packed_ctx.get("source_prefix", None)
+    if source_prefix_raw is None or str(source_prefix_raw).strip() == "":
+        raise ValueError("GRM meta stream route requires source_prefix in packed metadata.")
+    source_prefix = str(source_prefix_raw).strip()
+    active_row_idx = np.ascontiguousarray(
+        np.asarray(packed_meta_active_row_idx(packed_ctx), dtype=np.int64).reshape(-1),
+        dtype=np.int64,
+    )
+    if int(active_row_idx.size) <= 0:
+        raise ValueError("GRM meta stream route resolved zero active rows.")
+
+    maf_full = np.ascontiguousarray(
+        np.asarray(packed_ctx["maf"], dtype=np.float32).reshape(-1),
+        dtype=np.float32,
+    )
+    row_flip_full = np.ascontiguousarray(
+        np.asarray(packed_ctx["row_flip"], dtype=np.bool_).reshape(-1),
+        dtype=np.bool_,
+    )
+    packed_raw = packed_ctx.get("packed", None)
+    compact_from_active = bool(
+        _packed_ctx_is_lazy_full(packed_ctx)
+        or ((packed_raw is None) and (int(maf_full.shape[0]) != int(active_row_idx.shape[0])))
+    )
+    if compact_from_active:
+        row_flip_arg = np.ascontiguousarray(row_flip_full[active_row_idx], dtype=np.bool_)
+        row_maf_arg = np.ascontiguousarray(maf_full[active_row_idx], dtype=np.float32)
+    else:
+        row_flip_arg = row_flip_full
+        row_maf_arg = maf_full
+
+    if mmap_window_mb is None:
+        n_samples = int(packed_ctx["n_samples"])
+        bytes_per_snp = max(1, (n_samples + 3) // 4)
+        mmap_window_mb_resolved = int(
+            max(
+                1,
+                (int(max(1, int(block_rows))) * bytes_per_snp + (1024 * 1024 - 1))
+                // (1024 * 1024),
+            )
+        )
+    else:
+        mmap_window_mb_resolved = int(max(1, int(mmap_window_mb)))
+    return (
+        source_prefix,
+        active_row_idx,
+        row_flip_arg,
+        row_maf_arg,
+        mmap_window_mb_resolved,
+    )
 
 
 def _grm_method_tag(method: int) -> str:
@@ -709,6 +786,202 @@ def build_grm_streaming_to_npy(
     return eff_m
 
 
+def build_grm_streaming_from_meta(
+    genofile: str,
+    n_samples: int,
+    method: int,
+    maf_threshold: float,
+    max_missing_rate: float,
+    het_threshold: float,
+    snps_only: bool,
+    block_rows: int,
+    mmap_window_mb: Union[int, None],
+    threads: int,
+    logger,
+) -> tuple[np.ndarray, int]:
+    if int(method) != 1:
+        raise RuntimeError("GRM meta-stream ndarray route currently supports method=1 only.")
+    if _grm_bed_f64_from_meta is None:
+        raise RuntimeError(
+            "Rust GRM meta kernel is unavailable. Rebuild JanusX extension to export "
+            "`grm_bed_f64_from_meta`."
+        )
+    _sample_ids_meta, packed_meta_ctx = load_or_build_packed_meta_basic(
+        str(genofile),
+        maf=float(maf_threshold),
+        missing_rate=float(max_missing_rate),
+        het_threshold=float(het_threshold),
+        snps_only=bool(snps_only),
+        expected_n_samples=int(n_samples),
+    )
+    (
+        source_prefix,
+        row_source_indices,
+        row_flip,
+        row_maf,
+        mmap_window_mb_resolved,
+    ) = _grm_stream_meta_payload(
+        packed_meta_ctx,
+        block_rows=int(block_rows),
+        mmap_window_mb=mmap_window_mb,
+    )
+    eff_m_hint = int(row_source_indices.shape[0])
+    pbar = ProgressAdapter(
+        total=max(1, eff_m_hint),
+        desc="GRM (rust-meta)",
+        emit_done=False,
+        force_animate=True,
+    )
+    stream_t0 = time.monotonic()
+    process = psutil.Process()
+    mem_tick_span = max(1, 10 * int(max(1, block_rows)))
+    last_done = 0
+    last_total = max(1, eff_m_hint)
+
+    def _progress_cb(done: int, total: int) -> None:
+        nonlocal last_done, last_total
+        d = max(0, int(done))
+        t = max(1, int(total))
+        if t != last_total:
+            pbar.set_total(t)
+            last_total = t
+        d = min(d, t)
+        if d > last_done:
+            pbar.update(d - last_done)
+            last_done = d
+        if d % mem_tick_span == 0:
+            mem = process.memory_info().rss / 1024**3
+            pbar.set_postfix(memory=f"{mem:.2f} GB")
+
+    try:
+        grm_raw = _grm_bed_f64_from_meta(
+            str(source_prefix),
+            row_source_indices,
+            row_flip,
+            row_maf,
+            sample_indices=None,
+            method=1,
+            block_cols=max(1, int(block_rows)),
+            threads=max(1, int(threads)),
+            progress_callback=_progress_cb,
+            progress_every=max(1, int(block_rows)),
+            mmap_window_mb=int(mmap_window_mb_resolved),
+        )
+    finally:
+        pbar.finish()
+        pbar.close()
+    stream_elapsed = max(0.0, time.monotonic() - stream_t0)
+    grm = np.ascontiguousarray(np.asarray(grm_raw, dtype=np.float32))
+    log_success(
+        logger,
+        f"GRM (Effective SNPs: {eff_m_hint}, rust-meta kernel) ...Finished "
+        f"[{format_elapsed(stream_elapsed)}]",
+        force_color=True,
+    )
+    return grm, eff_m_hint
+
+
+def build_grm_streaming_from_meta_to_npy(
+    genofile: str,
+    out_npy_path: str,
+    n_samples: int,
+    method: int,
+    maf_threshold: float,
+    max_missing_rate: float,
+    het_threshold: float,
+    snps_only: bool,
+    block_rows: int,
+    mmap_window_mb: Union[int, None],
+    threads: int,
+    logger,
+) -> int:
+    if int(method) != 1:
+        raise RuntimeError("GRM meta-stream NPY route currently supports method=1 only.")
+    if _gblup_grm_from_meta_to_npy is None:
+        raise RuntimeError(
+            "Rust GRM meta->NPY kernel is unavailable. Rebuild JanusX extension to export "
+            "`gblup_grm_from_meta_to_npy`."
+        )
+    _sample_ids_meta, packed_meta_ctx = load_or_build_packed_meta_basic(
+        str(genofile),
+        maf=float(maf_threshold),
+        missing_rate=float(max_missing_rate),
+        het_threshold=float(het_threshold),
+        snps_only=bool(snps_only),
+        expected_n_samples=int(n_samples),
+    )
+    (
+        source_prefix,
+        row_source_indices,
+        row_flip,
+        row_maf,
+        mmap_window_mb_resolved,
+    ) = _grm_stream_meta_payload(
+        packed_meta_ctx,
+        block_rows=int(block_rows),
+        mmap_window_mb=mmap_window_mb,
+    )
+    eff_m_hint = int(row_source_indices.shape[0])
+    pbar = ProgressAdapter(
+        total=max(1, eff_m_hint),
+        desc="GRM (rust-meta)",
+        emit_done=False,
+        force_animate=True,
+    )
+    stream_t0 = time.monotonic()
+    process = psutil.Process()
+    mem_tick_span = max(1, 10 * int(max(1, block_rows)))
+    last_done = 0
+    last_total = max(1, eff_m_hint)
+
+    def _progress_cb(done: int, total: int) -> None:
+        nonlocal last_done, last_total
+        d = max(0, int(done))
+        t = max(1, int(total))
+        if t != last_total:
+            pbar.set_total(t)
+            last_total = t
+        d = min(d, t)
+        if d > last_done:
+            pbar.update(d - last_done)
+            last_done = d
+        if d % mem_tick_span == 0:
+            mem = process.memory_info().rss / 1024**3
+            pbar.set_postfix(memory=f"{mem:.2f} GB")
+
+    try:
+        eff_m_raw, meta_n = _gblup_grm_from_meta_to_npy(
+            str(source_prefix),
+            str(out_npy_path),
+            row_source_indices,
+            row_flip,
+            row_maf,
+            sample_indices=None,
+            method=1,
+            block_rows=max(1, int(block_rows)),
+            threads=max(1, int(threads)),
+            progress_callback=_progress_cb,
+            progress_every=max(1, int(block_rows)),
+            mmap_window_mb=int(mmap_window_mb_resolved),
+        )
+    finally:
+        pbar.finish()
+        pbar.close()
+    stream_elapsed = max(0.0, time.monotonic() - stream_t0)
+    if int(meta_n) != int(n_samples):
+        raise RuntimeError(
+            f"Meta GRM sample count mismatch: meta={int(meta_n)}, expected={int(n_samples)}"
+        )
+    eff_m = int(eff_m_raw)
+    log_success(
+        logger,
+        f"GRM (Effective SNPs: {eff_m}, rust-meta kernel -> npy) ...Finished "
+        f"[{format_elapsed(stream_elapsed)}]",
+        force_color=True,
+    )
+    return eff_m
+
+
 def build_grm_packed_bed(
     genofile: str,
     n_samples: int,
@@ -887,6 +1160,124 @@ def build_sparse_grm_packed_bed(
     log_success(
         logger,
         f"Sparse GRM (NNZ: {int(sparse_nnz)}) ...Finished "
+        f"[{format_elapsed(build_elapsed)}]",
+        force_color=True,
+    )
+    return str(sparse_path), int(sparse_n), int(sparse_nnz)
+
+
+def build_sparse_grm_from_meta(
+    genofile: str,
+    out_prefix: str,
+    n_samples: int,
+    method: int,
+    kinship_cutoff: float,
+    maf_threshold: float,
+    max_missing_rate: float,
+    het_threshold: float,
+    snps_only: bool,
+    chunk_size: int,
+    mmap_window_mb: Union[int, None],
+    threads: int,
+    block_target_mb: Union[float, None],
+    logger,
+) -> tuple[str, int, int]:
+    if _spgrm_bed_to_jxgrm_from_meta is None:
+        raise RuntimeError(
+            "Sparse GRM meta kernel is unavailable. Rebuild JanusX extension to export "
+            "`spgrm_bed_to_jxgrm_from_meta`."
+        )
+    _sample_ids_meta, packed_meta_ctx = load_or_build_packed_meta_basic(
+        str(genofile),
+        maf=float(maf_threshold),
+        missing_rate=float(max_missing_rate),
+        het_threshold=float(het_threshold),
+        snps_only=bool(snps_only),
+        expected_n_samples=int(n_samples),
+    )
+    (
+        source_prefix,
+        row_source_indices,
+        row_flip,
+        row_maf,
+        mmap_window_mb_resolved,
+    ) = _grm_stream_meta_payload(
+        packed_meta_ctx,
+        block_rows=int(chunk_size),
+        mmap_window_mb=mmap_window_mb,
+    )
+    n_total_sites = int(packed_meta_ctx.get("n_total_sites", 0) or 0)
+    if n_total_sites <= 0:
+        raise RuntimeError("Sparse GRM meta route resolved invalid n_total_sites.")
+
+    logger.info(
+        "Sparse GRM route selected meta-stream: "
+        f"n={n_samples}, m={int(row_source_indices.shape[0])}, cached filter metadata + prepared BED decode."
+    )
+    logger.info(
+        "Sparse GRM decode budget: target_mem_gb=%s, mmap_window_mb=%s, "
+        "row/sample blocks resolved in Rust.",
+        ("default" if block_target_mb is None else f"{float(block_target_mb) / 1024.0:.3f}"),
+        int(mmap_window_mb_resolved),
+    )
+    pbar = ProgressAdapter(
+        total=max(1, int(row_source_indices.shape[0])),
+        desc="Sparse GRM (meta-stream)",
+        emit_done=False,
+        force_animate=True,
+    )
+    build_t0 = time.monotonic()
+    process = psutil.Process()
+    last_done = 0
+    last_total = max(1, int(row_source_indices.shape[0]))
+
+    def _progress_cb(done: int, total: int) -> None:
+        nonlocal last_done, last_total
+        d = max(0, int(done))
+        t = max(1, int(total))
+        if t != last_total:
+            pbar.set_total(t)
+            last_total = t
+        d = min(d, t)
+        if d > last_done:
+            pbar.update(d - last_done)
+            last_done = d
+        mem = process.memory_info().rss / 1024**3
+        pbar.set_postfix(memory=f"{mem:.2f} GB")
+
+    try:
+        with _bed_block_target_env(block_target_mb):
+            with _spgrm_memory_budget_env(block_target_mb):
+                sparse_path, sparse_n, sparse_nnz = _spgrm_bed_to_jxgrm_from_meta(
+                    str(source_prefix),
+                    row_source_indices,
+                    row_flip,
+                    row_maf,
+                    int(n_total_sites),
+                    out_prefix=str(out_prefix),
+                    sample_indices=None,
+                    method=int(method),
+                    threshold=float(kinship_cutoff),
+                    abs_threshold=False,
+                    block_rows=max(1, int(chunk_size)),
+                    sample_block=0,
+                    threads=max(1, int(threads)),
+                    mmap_window_mb=int(mmap_window_mb_resolved),
+                    progress_callback=_progress_cb,
+                    progress_every=max(1, int(chunk_size)),
+                )
+    finally:
+        pbar.finish()
+        pbar.close()
+
+    build_elapsed = max(0.0, time.monotonic() - build_t0)
+    if int(sparse_n) != int(n_samples):
+        raise RuntimeError(
+            f"Sparse GRM sample count mismatch: sparse={int(sparse_n)}, expected={int(n_samples)}"
+        )
+    log_success(
+        logger,
+        f"Sparse GRM (NNZ: {int(sparse_nnz)}, rust-meta kernel) ...Finished "
         f"[{format_elapsed(build_elapsed)}]",
         force_color=True,
     )
@@ -1366,33 +1757,57 @@ def main(log: bool = True):
             logger,
             verbose=bool(getattr(args, "verbose", False)),
             msg=(
-                "GRM auto route selected backend: sparse-stream-bed "
-                "(BED pre-scan + blockwise streaming sparse CSC writer)."
+                "GRM auto route selected backend: sparse-meta-stream "
+                "(cached filter metadata + blockwise streaming sparse CSC writer)."
             ),
         )
         sparse_prefix = f"{outprefix}.{_grm_method_tag(args.method)}"
-        grm_path, sparse_n, sparse_nnz = build_sparse_grm_packed_bed(
-            genofile=grm_input,
-            out_prefix=sparse_prefix,
-            n_samples=n_samples,
-            n_snps=n_snps,
-            method=args.method,
-            kinship_cutoff=sparse_cutoff,
-            maf_threshold=maf_threshold,
-            max_missing_rate=max_missing_rate,
-            het_threshold=het_threshold,
-            snps_only=bool(args.snps_only),
-            chunk_size=stream_block_rows,
-            mmap_window_mb=mmap_window_mb,
-            threads=int(args.thread),
-            block_target_mb=memory_mb,
-            stage_timing=bool(args.stage_timing),
-            logger=logger,
-        )
+        sparse_meta_source = "bed"
+        try:
+            grm_path, sparse_n, sparse_nnz = build_sparse_grm_from_meta(
+                genofile=grm_input,
+                out_prefix=sparse_prefix,
+                n_samples=n_samples,
+                method=args.method,
+                kinship_cutoff=sparse_cutoff,
+                maf_threshold=maf_threshold,
+                max_missing_rate=max_missing_rate,
+                het_threshold=het_threshold,
+                snps_only=bool(args.snps_only),
+                chunk_size=stream_block_rows,
+                mmap_window_mb=mmap_window_mb,
+                threads=int(args.thread),
+                block_target_mb=memory_mb,
+                logger=logger,
+            )
+            sparse_meta_source = "bed_meta"
+        except Exception as ex:
+            logger.warning(
+                "Sparse GRM meta kernel failed; fallback to BED prepare route. "
+                f"reason={ex}"
+            )
+            grm_path, sparse_n, sparse_nnz = build_sparse_grm_packed_bed(
+                genofile=grm_input,
+                out_prefix=sparse_prefix,
+                n_samples=n_samples,
+                n_snps=n_snps,
+                method=args.method,
+                kinship_cutoff=sparse_cutoff,
+                maf_threshold=maf_threshold,
+                max_missing_rate=max_missing_rate,
+                het_threshold=het_threshold,
+                snps_only=bool(args.snps_only),
+                chunk_size=stream_block_rows,
+                mmap_window_mb=mmap_window_mb,
+                threads=int(args.thread),
+                block_target_mb=memory_mb,
+                stage_timing=bool(args.stage_timing),
+                logger=logger,
+            )
         _write_sparse_grm_meta(
             grm_path,
             cutoff=sparse_cutoff,
-            source="bed",
+            source=str(sparse_meta_source),
             method=int(args.method),
             maf_threshold=maf_threshold,
             max_missing_rate=max_missing_rate,
@@ -1425,8 +1840,52 @@ def main(log: bool = True):
         grm = None
         grm_path = None
         dense_saved_direct = False
+        prefer_meta_stream = bool(int(args.method) == 1 and (not bool(args.stage_timing)))
 
-        if selected_backend == "memmap-bed":
+        if prefer_meta_stream:
+            try:
+                if not args.txt:
+                    direct_npy_path = f"{outprefix}.{method_tag}.npy"
+                    eff_m = build_grm_streaming_from_meta_to_npy(
+                        genofile=grm_input,
+                        out_npy_path=direct_npy_path,
+                        n_samples=n_samples,
+                        method=args.method,
+                        maf_threshold=maf_threshold,
+                        max_missing_rate=max_missing_rate,
+                        het_threshold=het_threshold,
+                        snps_only=bool(args.snps_only),
+                        block_rows=stream_block_rows,
+                        mmap_window_mb=mmap_window_mb,
+                        threads=int(args.thread),
+                        logger=logger,
+                    )
+                    grm_path = direct_npy_path
+                    dense_saved_direct = True
+                else:
+                    grm, eff_m = build_grm_streaming_from_meta(
+                        genofile=grm_input,
+                        n_samples=n_samples,
+                        method=args.method,
+                        maf_threshold=maf_threshold,
+                        max_missing_rate=max_missing_rate,
+                        het_threshold=het_threshold,
+                        snps_only=bool(args.snps_only),
+                        block_rows=stream_block_rows,
+                        mmap_window_mb=mmap_window_mb,
+                        threads=int(args.thread),
+                        logger=logger,
+                    )
+            except Exception as ex:
+                logger.warning(
+                    "GRM meta kernel failed; fallback to existing memmap/packed backends. "
+                    f"reason={ex}"
+                )
+                grm = None
+                grm_path = None
+                dense_saved_direct = False
+
+        if (grm is None) and (grm_path is None) and selected_backend == "memmap-bed":
             logger.info(
                 f"GRM memory target: {float(args.memory):.6g} GB "
                 f"({float(memory_mb):.6g} MB effective)."
@@ -1491,7 +1950,7 @@ def main(log: bool = True):
                     stage_timing=bool(args.stage_timing),
                     logger=logger,
                 )
-        else:
+        elif (grm is None) and (grm_path is None):
             logger.info("Memmap GRM kernel unavailable; using Rust Packed BED backend.")
             grm, eff_m = build_grm_packed_bed(
                 genofile=grm_input,

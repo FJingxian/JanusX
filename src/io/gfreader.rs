@@ -16,14 +16,17 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
+use std::sync::Arc;
 #[cfg(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64"))]
 use std::sync::OnceLock;
 use std::time::Instant;
 
 use crate::bitwise::and_popcount;
+use crate::bedmath::SubsetDecodePlan;
+use crate::decode::decode_prepared_additive_block_packed_f32;
 use crate::gfcore as core;
 use crate::gfcore::{BedSnpIter, HmpSnpIter, TxtSnpIter, VcfSnpIter};
-use crate::gload::load_file_owned_range_exact;
+use crate::gload::{load_file_owned_range_exact, WindowedBedMatrix};
 use crate::gwriter::write_fam_simple;
 
 // -------- Py-exposed SiteInfo (wrapper) --------
@@ -5741,6 +5744,304 @@ pub fn prepare_bed_logic_meta_selected<'py>(
         prepared.n_samples,
         prepared.n_snps_total,
     ))
+}
+
+#[pyclass]
+pub struct BedChunkReaderFromMeta {
+    matrix: WindowedBedMatrix,
+    sites_all: Vec<core::SiteInfo>,
+    row_source_indices: Vec<usize>,
+    row_missing: Vec<f32>,
+    row_alt_mean: Vec<f32>,
+    snp_pos: usize,
+    sample_indices: Vec<usize>,
+    sample_ids: Vec<String>,
+    sample_identity: bool,
+    subset_plan: Option<SubsetDecodePlan>,
+    rel_row_indices: Vec<usize>,
+    scratch_row_mean: Vec<f32>,
+    scratch_row_scale: Vec<f32>,
+    scratch_row_decode_flip: Vec<bool>,
+    scratch_block: Vec<f32>,
+    decode_pool: Option<Arc<rayon::ThreadPool>>,
+}
+
+#[pymethods]
+impl BedChunkReaderFromMeta {
+    #[new]
+    #[pyo3(signature = (
+        prefix,
+        row_indices,
+        row_flip,
+        row_missing,
+        row_maf,
+        sample_ids=None,
+        sample_indices=None,
+        mmap_window_mb=None,
+    ))]
+    fn new<'py>(
+        prefix: String,
+        row_indices: PyReadonlyArray1<'py, i64>,
+        row_flip: PyReadonlyArray1<'py, bool>,
+        row_missing: PyReadonlyArray1<'py, f32>,
+        row_maf: PyReadonlyArray1<'py, f32>,
+        sample_ids: Option<Vec<String>>,
+        sample_indices: Option<Vec<usize>>,
+        mmap_window_mb: Option<usize>,
+    ) -> PyResult<Self> {
+        let norm_prefix = normalize_plink_prefix_local(&prefix);
+        let samples = core::read_fam(&norm_prefix)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        if samples.is_empty() {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "no samples found in PLINK input",
+            ));
+        }
+        let sites_all = core::read_bim(&norm_prefix)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        let (sample_indices, sample_ids) =
+            build_sample_selection(&samples, sample_ids, sample_indices)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+
+        let n_samples_full = samples.len();
+        let sample_identity = sample_indices.len() == n_samples_full
+            && sample_indices_are_identity(&sample_indices);
+        let subset_plan = if sample_identity {
+            None
+        } else {
+            Some(SubsetDecodePlan::from_sample_idx_with_n_samples(
+                &sample_indices,
+                n_samples_full,
+            ))
+        };
+        let n_snps_total = sites_all.len();
+        let row_idx64 = row_indices
+            .as_slice()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("row_indices must be contiguous int64"))?;
+        let row_flip_slice = row_flip
+            .as_slice()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("row_flip must be contiguous bool"))?;
+        let row_missing_slice = row_missing
+            .as_slice()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("row_missing must be contiguous float32"))?;
+        let row_maf_slice = row_maf
+            .as_slice()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("row_maf must be contiguous float32"))?;
+
+        let m = row_idx64.len();
+        if row_flip_slice.len() != m || row_missing_slice.len() != m || row_maf_slice.len() != m {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "metadata length mismatch: row_indices={m}, row_flip={}, row_missing={}, row_maf={}",
+                row_flip_slice.len(),
+                row_missing_slice.len(),
+                row_maf_slice.len()
+            )));
+        }
+        let mut row_source_indices = Vec::<usize>::with_capacity(m);
+        let mut prev_src_row: Option<usize> = None;
+        for &rid in row_idx64 {
+            if rid < 0 || (rid as usize) >= n_snps_total {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "row index out of range: {rid} for n_snps={n_snps_total}"
+                )));
+            }
+            let src_row = rid as usize;
+            if let Some(prev) = prev_src_row {
+                if src_row < prev {
+                    return Err(pyo3::exceptions::PyValueError::new_err(
+                        "row_indices must be sorted in ascending BED order",
+                    ));
+                }
+            }
+            prev_src_row = Some(src_row);
+            row_source_indices.push(src_row);
+        }
+        let row_missing_vec = row_missing_slice.to_vec();
+        let row_alt_mean: Vec<f32> = row_maf_slice
+            .iter()
+            .zip(row_flip_slice.iter())
+            .map(|(&maf_minor, &flip)| {
+                let maf_minor = maf_minor.clamp(0.0_f32, 1.0_f32);
+                let alt_freq = if flip {
+                    1.0_f32 - maf_minor
+                } else {
+                    maf_minor
+                }
+                .clamp(0.0_f32, 1.0_f32);
+                2.0_f32 * alt_freq
+            })
+            .collect();
+        let window_mb = mmap_window_mb
+            .filter(|&v| v > 0)
+            .or_else(|| {
+                core::parse_positive_env_f64(&[
+                    "JX_GFREADER_META_WINDOW_MB",
+                    "JX_GWAS_MMAP_WINDOW_MB",
+                    "JX_BED_BLOCK_TARGET_MB",
+                ])
+                .map(|v| v.ceil().max(1.0_f64) as usize)
+            })
+            .unwrap_or(128usize);
+        let matrix = WindowedBedMatrix::open(&norm_prefix, window_mb)
+            .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+        let decode_threads = core::parse_positive_env_usize(&[
+            "JX_MLM_RUST_THREADS",
+            "RAYON_NUM_THREADS",
+            "JX_THREADS",
+        ])
+        .or_else(|| std::thread::available_parallelism().ok().map(|v| v.get()))
+        .unwrap_or(1);
+        let decode_pool = if decode_threads > 1 {
+            crate::stats_common::get_cached_pool(decode_threads).map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!("rayon pool: {e}"))
+            })?
+        } else {
+            None
+        };
+
+        Ok(Self {
+            matrix,
+            sites_all,
+            row_source_indices,
+            row_missing: row_missing_vec,
+            row_alt_mean,
+            snp_pos: 0usize,
+            sample_indices,
+            sample_ids,
+            sample_identity,
+            subset_plan,
+            rel_row_indices: Vec::new(),
+            scratch_row_mean: Vec::new(),
+            scratch_row_scale: Vec::new(),
+            scratch_row_decode_flip: Vec::new(),
+            scratch_block: Vec::new(),
+            decode_pool,
+        })
+    }
+
+    #[getter]
+    fn n_samples(&self) -> usize {
+        self.sample_indices.len()
+    }
+
+    #[getter]
+    fn n_snps(&self) -> usize {
+        self.row_source_indices.len()
+    }
+
+    #[getter]
+    fn sample_ids(&self) -> Vec<String> {
+        self.sample_ids.clone()
+    }
+
+    #[pyo3(signature = (chunk_size, coding=None, snps_only=false))]
+    fn next_chunk_prepared<'py>(
+        &mut self,
+        py: Python<'py>,
+        chunk_size: usize,
+        coding: Option<String>,
+        snps_only: bool,
+    ) -> PyResult<
+        Option<(
+            Bound<'py, PyArray2<f32>>,
+            Vec<SiteInfo>,
+            Bound<'py, PyArray1<f32>>,
+            Bound<'py, PyArray1<f32>>,
+        )>,
+    > {
+        if chunk_size == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "chunk_size must be > 0",
+            ));
+        }
+        let coding_key = coding
+            .unwrap_or_else(|| "add".to_string())
+            .trim()
+            .to_ascii_lowercase();
+        if coding_key != "add" {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "BedChunkReaderFromMeta currently supports additive coding only",
+            ));
+        }
+        let n = self.sample_indices.len();
+        if n == 0 {
+            return Ok(None);
+        }
+        let mut meta_indices: Vec<usize> = Vec::with_capacity(chunk_size);
+        let mut source_rows: Vec<usize> = Vec::with_capacity(chunk_size);
+        let mut sites: Vec<SiteInfo> = Vec::with_capacity(chunk_size);
+        let mut af: Vec<f32> = Vec::with_capacity(chunk_size);
+        let mut miss: Vec<f32> = Vec::with_capacity(chunk_size);
+        self.scratch_row_mean.clear();
+        self.scratch_row_scale.clear();
+        self.scratch_row_decode_flip.clear();
+
+        while meta_indices.len() < chunk_size && self.snp_pos < self.row_source_indices.len() {
+            let meta_idx = self.snp_pos;
+            self.snp_pos += 1;
+            let src_row = self.row_source_indices[meta_idx];
+            let site = self.sites_all.get(src_row).ok_or_else(|| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "source SNP row out of bounds in BIM metadata: {src_row}"
+                ))
+            })?;
+            if snps_only
+                && (!is_simple_snp_allele(&site.ref_allele)
+                    || !is_simple_snp_allele(&site.alt_allele))
+            {
+                continue;
+            }
+            meta_indices.push(meta_idx);
+            source_rows.push(src_row);
+            sites.push(site.clone().into());
+            self.scratch_row_mean.push(self.row_alt_mean[meta_idx]);
+            self.scratch_row_scale.push(1.0_f32);
+            self.scratch_row_decode_flip.push(false);
+            af.push(self.row_alt_mean[meta_idx] * 0.5_f32);
+            miss.push(self.row_missing[meta_idx]);
+        }
+
+        let kept = meta_indices.len();
+        if kept == 0 {
+            return Ok(None);
+        }
+        let bytes_per_snp = self.matrix.bytes_per_snp();
+        let n_samples_full = self.matrix.n_samples_full();
+        let packed_slice = self
+            .matrix
+            .prepare_source_rows(source_rows.as_slice(), &mut self.rel_row_indices)
+            .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+        let need = kept.saturating_mul(n);
+        if self.scratch_block.len() < need {
+            self.scratch_block.resize(need, 0.0_f32);
+        }
+        decode_prepared_additive_block_packed_f32(
+            packed_slice,
+            bytes_per_snp,
+            n_samples_full,
+            self.scratch_row_decode_flip.as_slice(),
+            self.scratch_row_mean.as_slice(),
+            self.scratch_row_scale.as_slice(),
+            self.sample_indices.as_slice(),
+            self.sample_identity,
+            self.subset_plan.as_ref(),
+            Some(&self.rel_row_indices[..kept]),
+            0usize,
+            kept,
+            &mut self.scratch_block[..need],
+            self.decode_pool.as_ref(),
+        )
+        .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+        let mat = Array2::from_shape_vec((kept, n), self.scratch_block[..need].to_vec())
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        #[allow(deprecated)]
+        let py_mat = PyArray2::from_owned_array(py, mat).into_bound();
+        #[allow(deprecated)]
+        let py_af = PyArray1::from_owned_array(py, Array1::from_vec(af)).into_bound();
+        #[allow(deprecated)]
+        let py_miss = PyArray1::from_owned_array(py, Array1::from_vec(miss)).into_bound();
+        Ok(Some((py_mat, sites, py_af, py_miss)))
+    }
 }
 
 #[pyfunction]

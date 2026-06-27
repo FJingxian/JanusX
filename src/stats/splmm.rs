@@ -1304,7 +1304,7 @@ fn prepare_splmm_assoc_inputs<'py>(
     row_missing: Option<PyReadonlyArray1<'py, f32>>,
     row_indices: Option<PyReadonlyArray1<'py, i64>>,
     model: &str,
-    mmap_window_mb: Option<usize>,
+    _mmap_window_mb: Option<usize>,
 ) -> PyResult<PreparedSplmmAssoc> {
     let gm = PackedGeneticModel::parse(model)?;
     let bed_prefix = normalize_plink_prefix_local(prefix);
@@ -1372,11 +1372,7 @@ fn prepare_splmm_assoc_inputs<'py>(
         "operator_sample_indices",
     )?
     .or_else(|| scan_sample_probe.clone());
-    let windowed_requested = mmap_window_mb.filter(|&v| v > 0).is_some();
-    let skip_resident_bed_payload = use_external_mmap_meta && windowed_requested;
     let shared_bed_mmap = if use_external_packed {
-        None
-    } else if skip_resident_bed_payload {
         None
     } else {
         let bed_path = format!("{bed_prefix}.bed");
@@ -1405,7 +1401,7 @@ fn prepare_splmm_assoc_inputs<'py>(
             row_missing,
             row_indices,
             shared_bed_mmap.as_ref().map(Arc::clone),
-            !skip_resident_bed_payload,
+            true,
         )?
     } else {
         prepare_prefix_input(
@@ -4934,22 +4930,30 @@ fn unified_input_from_splmm_prepared(
     prepared: &SplmmPreparedInput,
     mmap_window_mb: Option<usize>,
 ) -> Result<UnifiedInput<SplmmPreparedMatrixAdapter<'_>>, String> {
-    let matrix = if let Some(window_mb) = mmap_window_mb.filter(|&v| v > 0) {
-        if let Some(prefix) = prepared.bed_prefix.as_deref() {
-            SplmmPreparedMatrixAdapter::Windowed {
-                matrix: WindowedBedMatrix::open(prefix, window_mb)?,
+    let matrix = if prepared.payload.is_some() {
+        // Prefer direct decode whenever a file-backed resident payload is
+        // available. This avoids regressing into slower windowed row/block
+        // preparation after the caller has already prepared per-trait row
+        // metadata.
+        SplmmPreparedMatrixAdapter::Direct { inner: prepared }
+    } else {
+        if let Some(window_mb) = mmap_window_mb.filter(|&v| v > 0) {
+            if let Some(prefix) = prepared.bed_prefix.as_deref() {
+                SplmmPreparedMatrixAdapter::Windowed {
+                    matrix: WindowedBedMatrix::open(prefix, window_mb)?,
+                }
+            } else {
+                return Err(
+                    "SparseLMM windowed decode requires a PLINK BED prefix when no resident payload is retained."
+                        .to_string(),
+                );
             }
         } else {
-            SplmmPreparedMatrixAdapter::Direct { inner: prepared }
-        }
-    } else {
-        if prepared.payload.is_none() {
             return Err(
                 "SparseLMM direct BED scan requires a resident BED payload; provide mmap_window_mb to use windowed scanning."
                     .to_string(),
             );
         }
-        SplmmPreparedMatrixAdapter::Direct { inner: prepared }
     };
     Ok(UnifiedInput {
         matrix,

@@ -5077,6 +5077,14 @@ def run_splmm_windowed_fullrank(*args, **kwargs):
     from janusx.assoc.workflow_model_packed import run_splmm_windowed_fullrank as _impl
     return _impl(*args, **kwargs)
 
+def _splmm_bed_logic_meta_selected_cached(*args, **kwargs):
+    from janusx.assoc.workflow_model_packed import _splmm_bed_logic_meta_selected_cached as _impl
+    return _impl(*args, **kwargs)
+
+def _plink_fam_sample_ids(*args, **kwargs):
+    from janusx.assoc.workflow_model_packed import _plink_fam_sample_ids as _impl
+    return _impl(*args, **kwargs)
+
 def run_splmm_packed_fullrank(*args, **kwargs):
     return run_splmm_windowed_fullrank(*args, **kwargs)
 
@@ -7132,7 +7140,10 @@ def _run_gwas_pipeline(
                         )
 
                     def _run_route_splmm_windowed(
-                        trait_one: list[str], emit_trait_header_model: bool
+                        trait_one: list[str],
+                        emit_trait_header_model: bool,
+                        preloaded_packed: Union[dict[str, object], None] = None,
+                        trait_prepared_meta: Union[dict[str, object], None] = None,
                     ) -> None:
                         run_splmm_windowed_fullrank(
                             genofile=genofile_stream,
@@ -7160,13 +7171,16 @@ def _run_gwas_pipeline(
                             saved_paths=saved_result_paths,
                             trait_names=trait_one,
                             emit_trait_header=bool(emit_trait_header_model),
-                            preloaded_packed=None,
+                            preloaded_packed=preloaded_packed,
+                            trait_prepared_meta=trait_prepared_meta,
                             force_model=bool(args.force_model),
                             scan_mode=str(args._splmm_denom_mode or "exact"),
                         )
 
                     def _run_route_fastlmm_stream(
-                        trait_one: list[str], emit_trait_header_model: bool
+                        trait_one: list[str],
+                        emit_trait_header_model: bool,
+                        trait_prepared_meta: Union[dict[str, object], None] = None,
                     ) -> None:
                         run_chunked_gwas_lmm_lm(
                             model_name="fastlmm",
@@ -7199,10 +7213,13 @@ def _run_gwas_pipeline(
                                 getattr(args, "_chunksize_user_set", True)
                             ),
                             force_model=bool(args.force_model),
+                            trait_prepared_meta=trait_prepared_meta,
                         )
 
                     def _run_route_fvlmm_stream(
-                        trait_one: list[str], emit_trait_header_model: bool
+                        trait_one: list[str],
+                        emit_trait_header_model: bool,
+                        trait_prepared_meta: Union[dict[str, object], None] = None,
                     ) -> None:
                         run_chunked_gwas_lmm_lm(
                             model_name="fvlmm",
@@ -7235,10 +7252,13 @@ def _run_gwas_pipeline(
                                 getattr(args, "_chunksize_user_set", True)
                             ),
                             force_model=bool(args.force_model),
+                            trait_prepared_meta=trait_prepared_meta,
                         )
 
                     def _run_route_lm_stream(
-                        trait_one: list[str], emit_trait_header_model: bool
+                        trait_one: list[str],
+                        emit_trait_header_model: bool,
+                        trait_prepared_meta: Union[dict[str, object], None] = None,
                     ) -> None:
                         run_chunked_gwas_lmm_lm(
                             model_name="lm",
@@ -7271,10 +7291,13 @@ def _run_gwas_pipeline(
                                 getattr(args, "_chunksize_user_set", True)
                             ),
                             force_model=bool(args.force_model),
+                            trait_prepared_meta=trait_prepared_meta,
                         )
 
                     def _run_route_lm2_stream(
-                        trait_one: list[str], emit_trait_header_model: bool
+                        trait_one: list[str],
+                        emit_trait_header_model: bool,
+                        trait_prepared_meta: Union[dict[str, object], None] = None,
                     ) -> None:
                         run_chunked_gwas_lmm_lm(
                             model_name="lm2",
@@ -7308,10 +7331,13 @@ def _run_gwas_pipeline(
                             ),
                             force_model=bool(args.force_model),
                             lm2_covariate_indices=getattr(args, "_lm2_cov_idx", None),
+                            trait_prepared_meta=trait_prepared_meta,
                         )
 
                     def _run_route_lmm_stream(
-                        trait_one: list[str], emit_trait_header_model: bool
+                        trait_one: list[str],
+                        emit_trait_header_model: bool,
+                        trait_prepared_meta: Union[dict[str, object], None] = None,
                     ) -> None:
                         run_chunked_gwas_lmm_lm(
                             model_name="lmm",
@@ -7344,10 +7370,13 @@ def _run_gwas_pipeline(
                                 getattr(args, "_chunksize_user_set", True)
                             ),
                             force_model=bool(args.force_model),
+                            trait_prepared_meta=trait_prepared_meta,
                         )
 
                     def _run_route_lmm2_stream(
-                        trait_one: list[str], emit_trait_header_model: bool
+                        trait_one: list[str],
+                        emit_trait_header_model: bool,
+                        trait_prepared_meta: Union[dict[str, object], None] = None,
                     ) -> None:
                         run_chunked_gwas_lmm_lm(
                             model_name="lmm2",
@@ -7380,6 +7409,7 @@ def _run_gwas_pipeline(
                                 getattr(args, "_chunksize_user_set", True)
                             ),
                             force_model=bool(args.force_model),
+                            trait_prepared_meta=trait_prepared_meta,
                         )
 
                     def _run_route_farmcpu(
@@ -7439,6 +7469,10 @@ def _run_gwas_pipeline(
                         "farm": "farmcpu",
                     }
                     stream_group_routes = {"lm_stream", "lm2_stream", "lmm_stream", "lmm2_stream", "fastlmm_stream", "fvlmm_stream"}
+                    share_trait_meta_enabled = str(
+                        os.environ.get("JX_GWAS_TRAIT_META_SHARE", "1")
+                    ).strip().lower() not in {"0", "false", "no", "off"}
+                    trait_shared_meta_cache: dict[str, dict[str, object]] = {}
                     normalized_tasks: list[dict[str, object]] = []
                     for task_item in task_plan:
                         mk = str(task_item.get("model", "")).lower().strip()
@@ -7478,6 +7512,37 @@ def _run_gwas_pipeline(
                                 ),
                             }
                         )
+                    trait_stream_route_counts: dict[str, int] = {}
+                    for item in normalized_tasks:
+                        route_key = str(item.get("route", "")).lower().strip()
+                        model_key = str(item.get("model", "")).lower().strip()
+                        if route_key in stream_group_routes and model_key != "lm2":
+                            trait_key = str(item.get("trait", ""))
+                            trait_stream_route_counts[trait_key] = (
+                                int(trait_stream_route_counts.get(trait_key, 0)) + 1
+                            )
+                    traits_with_splmm = {
+                        str(item.get("trait", ""))
+                        for item in normalized_tasks
+                        if str(item.get("route", "")).lower().strip() == "splmm"
+                    }
+                    trait_meta_share_candidates = {
+                        trait_key
+                        for trait_key, route_count in trait_stream_route_counts.items()
+                        if int(route_count) >= 2 and trait_key in traits_with_splmm
+                    }
+
+                    def _trait_meta_needed_later(start_idx: int, trait_name: str) -> bool:
+                        for idx in range(int(start_idx), len(normalized_tasks)):
+                            future_trait = str(normalized_tasks[idx].get("trait", ""))
+                            if future_trait != trait_name:
+                                continue
+                            future_route = str(
+                                normalized_tasks[idx].get("route", "")
+                            ).lower().strip()
+                            if future_route in (stream_group_routes | {"splmm"}):
+                                return True
+                        return False
 
                     task_idx = 0
                     while task_idx < len(normalized_tasks):
@@ -7489,6 +7554,69 @@ def _run_gwas_pipeline(
                             task_item.get("emit_trait_header", False)
                         )
                         emit_blank_after = bool(task_item.get("emit_blank_after", False))
+                        trait_meta_shared = trait_shared_meta_cache.get(trait_name_use)
+
+                        if (
+                            share_trait_meta_enabled
+                            and trait_meta_shared is None
+                            and trait_name_use in trait_meta_share_candidates
+                            and route in (stream_group_routes | {"splmm"})
+                            and str(args.model).lower() == "add"
+                            and pheno is not None
+                            and ids is not None
+                            and genofile_stream is not None
+                        ):
+                            _, sameidx_meta = _trait_values_and_mask(pheno, trait_name_use)
+                            keep_idx_meta = np.flatnonzero(sameidx_meta).astype(np.int64, copy=False)
+                            if int(keep_idx_meta.shape[0]) > 0:
+                                ids_arr_meta = np.asarray(ids, dtype=str).reshape(-1)
+                                trait_ids_meta = np.asarray(ids_arr_meta[keep_idx_meta], dtype=str)
+                                prefix_meta = _as_plink_prefix(genofile_stream)
+                                if prefix_meta is not None:
+                                    full_ids_meta = _plink_fam_sample_ids(str(prefix_meta))
+                                    id_to_full_meta = {sid: i for i, sid in enumerate(full_ids_meta)}
+                                    try:
+                                        sample_idx_meta = np.asarray(
+                                            [id_to_full_meta[str(sid)] for sid in trait_ids_meta],
+                                            dtype=np.int64,
+                                        )
+                                    except KeyError:
+                                        sample_idx_meta = None
+                                    if sample_idx_meta is not None:
+                                        try:
+                                            trait_meta_shared = _splmm_bed_logic_meta_selected_cached(
+                                                str(prefix_meta),
+                                                sample_indices=sample_idx_meta,
+                                                maf_threshold=float(maf_threshold_scan),
+                                                max_missing_rate=float(max_missing_rate_scan),
+                                                het_threshold=float(het_threshold_scan),
+                                                snps_only=bool(args.snps_only),
+                                                mmap_window_mb=int(
+                                                    max(
+                                                        1,
+                                                        float(
+                                                            os.environ.get(
+                                                                "JX_BED_BLOCK_TARGET_MB",
+                                                                "512",
+                                                            )
+                                                        ),
+                                                    )
+                                                ),
+                                                outprefix=str(outprefix),
+                                                logger=logger,
+                                            )
+                                        except Exception:
+                                            trait_meta_shared = None
+                                        if trait_meta_shared is not None:
+                                            miss_rate_meta = np.asarray(
+                                                trait_meta_shared["missing_rate"],
+                                                dtype=np.float32,
+                                            ).reshape(-1)
+                                            trait_meta_shared["missing_count"] = np.ascontiguousarray(
+                                                miss_rate_meta * float(sample_idx_meta.shape[0]),
+                                                dtype=np.float32,
+                                            )
+                                            trait_shared_meta_cache[trait_name_use] = trait_meta_shared
 
                         if route in stream_group_routes and mk != "lm2":
                             group_end = task_idx + 1
@@ -7537,6 +7665,7 @@ def _run_gwas_pipeline(
                                     ),
                                     force_model=bool(args.force_model),
                                     emit_trait_header=bool(emit_trait_header_model),
+                                    trait_prepared_meta=trait_meta_shared,
                                 )
                                 if bool(
                                     normalized_tasks[group_end - 1].get(
@@ -7544,13 +7673,31 @@ def _run_gwas_pipeline(
                                     )
                                 ):
                                     logger.info("")
+                                if not _trait_meta_needed_later(
+                                    group_end, trait_name_use
+                                ):
+                                    trait_shared_meta_cache.pop(trait_name_use, None)
                                 task_idx = group_end
                                 continue
 
                         trait_one = [trait_name_use]
                         route_handler = route_handlers.get(route)
                         if route_handler is not None:
-                            route_handler(trait_one, bool(emit_trait_header_model))
+                            if route == "splmm":
+                                route_handler(
+                                    trait_one,
+                                    bool(emit_trait_header_model),
+                                    preloaded_packed=None,
+                                    trait_prepared_meta=trait_meta_shared,
+                                )
+                            elif route in stream_group_routes:
+                                route_handler(
+                                    trait_one,
+                                    bool(emit_trait_header_model),
+                                    trait_prepared_meta=trait_meta_shared,
+                                )
+                            else:
+                                route_handler(trait_one, bool(emit_trait_header_model))
                         else:
                             raise RuntimeError(
                                 "Rust-only GWAS mode received unsupported task route: "
@@ -7558,6 +7705,10 @@ def _run_gwas_pipeline(
                             )
                         if emit_blank_after:
                             logger.info("")
+                        if not _trait_meta_needed_later(
+                            task_idx + 1, trait_name_use
+                        ):
+                            trait_shared_meta_cache.pop(trait_name_use, None)
                         task_idx += 1
             else:
                 raise RuntimeError(

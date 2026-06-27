@@ -220,8 +220,9 @@ use gfreader::{
     bed_filter_stream_to_plink_rust, bed_filter_to_plink_rust, bed_mmap_filter_to_plink_rust,
     count_hmp_snps, count_vcf_snps, gfd_packbits_from_dosage_block, load_bed_2bit_packed,
     load_bed_u8_matrix, load_bim_columns, load_site_info, prepare_bed_2bit_packed,
-    prepare_bed_logic_meta_selected, scan_bed_2bit_packed_stats, BedChunkReader, BedMmapReader,
-    HmpChunkReader, NpyMmapReader, SiteInfo, TxtChunkReader, VcfChunkReader,
+    prepare_bed_logic_meta_selected, scan_bed_2bit_packed_stats, BedChunkReader,
+    BedChunkReaderFromMeta, BedMmapReader, HmpChunkReader, NpyMmapReader, SiteInfo,
+    TxtChunkReader, VcfChunkReader,
 };
 use glm::{
     lm_block_assoc_f32, lm_block_assoc_packed, lm_block_assoc_packed_to_tsv,
@@ -281,7 +282,8 @@ use rsvd::py_rsvd_packed_subset;
 use sim::{sim_trait_accumulate_i8_f32, SimChunkGenerator, SimEngine, SimTraitAccumulator};
 use sim_g2p::g2p_simulate_py;
 use spgrm::{
-    spgrm_bed_to_jxgrm, spgrm_dense_f32_to_jxgrm, spgrm_dense_npy_to_jxgrm, spgrm_packed_to_jxgrm,
+    spgrm_bed_to_jxgrm, spgrm_bed_to_jxgrm_from_meta, spgrm_dense_f32_to_jxgrm,
+    spgrm_dense_npy_to_jxgrm, spgrm_packed_to_jxgrm,
 };
 use splmm::{
     splmm_assoc_pcg_bed, splmm_assoc_pcg_bed_to_tsv, splmm_assoc_pcg_dense_f32,
@@ -666,6 +668,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_class::<AdmxBedFoldBackend>()?;
     m.add_class::<AdmxBedTrainingSession>()?;
     m.add_class::<BedChunkReader>()?;
+    m.add_class::<BedChunkReaderFromMeta>()?;
     m.add_class::<BedMmapReader>()?;
     m.add_class::<NpyMmapReader>()?;
     m.add_class::<VcfChunkReader>()?;
@@ -695,6 +698,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(score_binary_ba_mcc_batch_py, m)?)?;
     m.add_function(wrap_pyfunction!(spgrm_packed_to_jxgrm, m)?)?;
     m.add_function(wrap_pyfunction!(spgrm_bed_to_jxgrm, m)?)?;
+    m.add_function(wrap_pyfunction!(spgrm_bed_to_jxgrm_from_meta, m)?)?;
     m.add_function(wrap_pyfunction!(spgrm_dense_f32_to_jxgrm, m)?)?;
     m.add_function(wrap_pyfunction!(spgrm_dense_npy_to_jxgrm, m)?)?;
     m.add_function(wrap_pyfunction!(score_cont_mean_diff_py, m)?)?;

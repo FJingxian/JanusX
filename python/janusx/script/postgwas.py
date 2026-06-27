@@ -54,6 +54,7 @@ from ._common.threads import (
     format_requested_thread_usage,
     maybe_warn_non_openblas,
     require_openblas_by_default,
+    runtime_thread_stage,
 )
 
 # Ensure matplotlib uses a non-interactive backend.
@@ -80,11 +81,12 @@ import socket
 import sys
 import colorsys
 import concurrent.futures as cf
+import multiprocessing as mp
+from concurrent.futures.process import BrokenProcessPool
 from contextlib import nullcontext, redirect_stdout, redirect_stderr
 from typing import Any, Optional, Tuple
 from janusx import janusx as jxrs
 from janusx.gtools.reader import GFFQuery, bedreader, readanno
-from joblib import Parallel, delayed
 import warnings
 from ._common.cjk import contains_cjk as _contains_cjk, ensure_cjk_font as _ensure_cjk_font
 
@@ -134,6 +136,133 @@ def _allow_windows_postgwas_process_pool() -> bool:
     if os.name != "nt":
         return True
     return _env_truthy("JANUSX_POSTGWAS_WINDOWS_PROCESS_POOL", False)
+
+
+class _PostgwasFilePrefixFormatter(logging.Formatter):
+    """Prefix warning/error records in worker append-mode log handlers."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        msg = super().format(record)
+        if record.levelno >= logging.ERROR:
+            return msg if msg.startswith("Error: ") else f"Error: {msg}"
+        if record.levelno == logging.WARNING:
+            return msg if msg.startswith("Warning: ") else f"Warning: {msg}"
+        return msg
+
+
+def _select_postgwas_mp_context():
+    """
+    Choose a multiprocessing start method for postgwas workers.
+
+    Prefer spawn/forkserver to avoid Python 3.12+ warnings and potential
+    deadlocks when forking from a multi-threaded parent after matplotlib /
+    native runtimes have already been initialized. Allow manual override via
+    JANUSX_POSTGWAS_MP_START_METHOD or the broader JANUSX_MP_START_METHOD.
+    """
+    try:
+        methods = [str(m).strip().lower() for m in mp.get_all_start_methods()]
+    except Exception:
+        methods = []
+    if len(methods) == 0:
+        return None
+
+    env_method = str(os.environ.get("JANUSX_POSTGWAS_MP_START_METHOD", "")).strip().lower()
+    if env_method == "":
+        env_method = str(os.environ.get("JANUSX_MP_START_METHOD", "")).strip().lower()
+    if env_method != "" and env_method in methods:
+        return mp.get_context(env_method)
+
+    for name in ("spawn", "forkserver", "fork"):
+        if name in methods:
+            return mp.get_context(name)
+    return None
+
+
+def _build_postgwas_process_pool(max_workers: int) -> cf.ProcessPoolExecutor:
+    kwargs: dict[str, Any] = {"max_workers": max(1, int(max_workers))}
+    mp_ctx = _select_postgwas_mp_context()
+    if mp_ctx is not None:
+        kwargs["mp_context"] = mp_ctx
+    return cf.ProcessPoolExecutor(**kwargs)
+
+
+def _resolve_postgwas_worker_count(requested_threads: int, n_files: int) -> int:
+    """
+    Decide outer postgwas process count.
+
+    Plotting workers are memory-heavy (pandas + matplotlib + optional LD/gene
+    structures). Keep a conservative default cap, but allow explicit override.
+    """
+    req = max(1, int(requested_threads))
+    total = max(1, int(n_files))
+
+    env_raw = str(os.environ.get("JANUSX_POSTGWAS_MAX_WORKERS", "")).strip()
+    if env_raw != "":
+        try:
+            env_cap = max(1, int(env_raw))
+        except Exception:
+            env_cap = None
+        if env_cap is not None:
+            return max(1, min(req, total, env_cap))
+
+    default_cap = 4
+    return max(1, min(req, total, default_cap))
+
+
+def _log_postgwas_broken_pool_hint(
+    logger: logging.Logger,
+    *,
+    n_workers: int,
+    req_threads: int,
+    n_files: int,
+) -> None:
+    mp_ctx = _select_postgwas_mp_context()
+    method = ""
+    try:
+        if mp_ctx is not None:
+            method = str(mp_ctx.get_start_method()).strip()
+    except Exception:
+        method = ""
+    method_text = method if method != "" else "default"
+    logger.error(
+        "PostGWAS worker process exited unexpectedly. "
+        f"Likely causes: native crash in matplotlib/numpy stack, OOM kill, or unsafe fork-style startup. "
+        f"Current workers={int(n_workers)} (requested threads={int(req_threads)}, files={int(n_files)}), "
+        f"mp_start={method_text}. "
+        "Try rerunning with fewer outer workers, for example `-t 1` or "
+        "`JANUSX_POSTGWAS_MAX_WORKERS=1`, and optionally force "
+        "`JANUSX_POSTGWAS_MP_START_METHOD=spawn`."
+    )
+
+
+def _ensure_postgwas_worker_file_logging(args, logger: logging.Logger) -> logging.Logger:
+    """
+    Spawned workers do not inherit the parent's file handlers. Reattach an
+    append-mode file handler so per-task logs are preserved in the main log.
+    """
+    log_path = str(getattr(args, "_postgwas_log_path", "")).strip()
+    if log_path == "":
+        return logger
+    target = os.path.abspath(log_path)
+    for handler in list(logger.handlers):
+        if not isinstance(handler, logging.FileHandler):
+            continue
+        try:
+            base = os.path.abspath(str(handler.baseFilename))
+        except Exception:
+            base = ""
+        if base == target:
+            return logger
+    try:
+        file_handler = logging.FileHandler(target, mode="a", encoding="utf-8")
+    except Exception:
+        return logger
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(_PostgwasFilePrefixFormatter())
+    logger.setLevel(logging.INFO)
+    logger.addHandler(file_handler)
+    logging.captureWarnings(True)
+    return logger
 
 
 def _sanitize_plot_text(text: object) -> str:
@@ -4304,19 +4433,26 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
 
 
 def _run_one_postgwas_task(file: str, args, logger: logging.Logger) -> str:
+    logger = _ensure_postgwas_worker_file_logging(args, logger)
     mute_stream = bool(getattr(args, "_postgwas_worker_mute_stream", False))
     detached_handlers: list[logging.Handler] = []
+    thread_ctx = (
+        runtime_thread_stage(blas_threads=1, rayon_threads=1)
+        if int(getattr(args, "_postgwas_job_workers", 1)) > 1
+        else nullcontext()
+    )
     if mute_stream:
         detached_handlers = _detach_stream_handlers(logger)
     try:
-        if mute_stream:
-            # In parallel worker mode, fully silence worker stdout/stderr to
-            # avoid corrupting parent-side progress/spinner rendering.
-            with open(os.devnull, "w", encoding="utf-8") as devnull:
-                with redirect_stdout(devnull), redirect_stderr(devnull):
-                    GWASplot(file, args, logger)
-        else:
-            GWASplot(file, args, logger)
+        with thread_ctx:
+            if mute_stream:
+                # In parallel worker mode, fully silence worker stdout/stderr to
+                # avoid corrupting parent-side progress/spinner rendering.
+                with open(os.devnull, "w", encoding="utf-8") as devnull:
+                    with redirect_stdout(devnull), redirect_stderr(devnull):
+                        GWASplot(file, args, logger)
+            else:
+                GWASplot(file, args, logger)
     finally:
         if mute_stream:
             _restore_handlers(logger, detached_handlers)
@@ -4479,6 +4615,50 @@ def _run_postgwas_ldblock_only(args, logger: logging.Logger) -> None:
     )
 
 
+def _run_postgwas_tasks_serial(
+    files: list[str],
+    args,
+    logger: logging.Logger,
+    *,
+    total_start_ts: float,
+    done_count: int = 0,
+    file_to_idx: Optional[dict[str, int]] = None,
+    skip_files: Optional[set[str]] = None,
+    emit_final_success: bool = True,
+) -> int:
+    n_total = len(files)
+    idx_map = (
+        {str(k): int(v) for k, v in file_to_idx.items()}
+        if file_to_idx is not None
+        else {str(f): i for i, f in enumerate(files, start=1)}
+    )
+    skip = {str(x) for x in (skip_files or set())}
+    setattr(args, "_postgwas_job_workers", 1)
+    setattr(args, "_postgwas_worker_mute_stream", False)
+    for file_path in files:
+        if file_path in skip:
+            continue
+        idx = idx_map.get(file_path, 0)
+        task_start_ts = time.monotonic()
+        try:
+            GWASplot(file_path, args, logger)
+        except Exception:
+            elapsed = format_elapsed(time.monotonic() - task_start_ts)
+            print_failure(
+                f"Task {idx}/{n_total}: "
+                f"{os.path.basename(file_path)} ...Failed [{elapsed}]"
+            )
+            raise
+        done_count += 1
+    if emit_final_success:
+        total_elapsed = format_elapsed(time.monotonic() - total_start_ts)
+        print_success(
+            f"Task {done_count}/{n_total} ...Finished [{total_elapsed}]",
+            force_color=True,
+        )
+    return int(done_count)
+
+
 def _run_postgwas_tasks(args, logger: logging.Logger) -> None:
     files = [str(f) for f in args.gwasfile]
     if len(files) == 0:
@@ -4492,7 +4672,7 @@ def _run_postgwas_tasks(args, logger: logging.Logger) -> None:
     total_start_ts = time.monotonic()
     done_count = 0
     req_threads = int(args.thread)
-    logical_workers = max(1, min(req_threads, len(files)))
+    logical_workers = _resolve_postgwas_worker_count(req_threads, len(files))
 
     if (len(files) > 1) and (os.name == "nt") and (not _allow_windows_postgwas_process_pool()):
         logger.warning(
@@ -4501,25 +4681,12 @@ def _run_postgwas_tasks(args, logger: logging.Logger) -> None:
             "Set JANUSX_POSTGWAS_WINDOWS_PROCESS_POOL=1 to force experimental "
             "process-pool mode."
         )
-        setattr(args, "_postgwas_job_workers", 1)
-        setattr(args, "_postgwas_worker_mute_stream", False)
-        n_total = len(files)
-        for idx, file_path in enumerate(files, start=1):
-            task_start_ts = time.monotonic()
-            try:
-                GWASplot(file_path, args, logger)
-            except Exception:
-                elapsed = format_elapsed(time.monotonic() - task_start_ts)
-                print_failure(
-                    f"Task {idx}/{n_total}: "
-                    f"{os.path.basename(file_path)} ...Failed [{elapsed}]"
-                )
-                raise
-            done_count += 1
-        total_elapsed = format_elapsed(time.monotonic() - total_start_ts)
-        print_success(
-            f"Task {done_count}/{n_total} ...Finished [{total_elapsed}]",
-            force_color=True,
+        _run_postgwas_tasks_serial(
+            files,
+            args,
+            logger,
+            total_start_ts=total_start_ts,
+            done_count=done_count,
         )
         return
 
@@ -4532,7 +4699,7 @@ def _run_postgwas_tasks(args, logger: logging.Logger) -> None:
         name_width = max((len(x) for x in basenames), default=0)
         idx_width = len(str(n_total))
         max_visible = min(5, n_total)
-        n_workers = max(1, min(req_threads, max_visible, n_total))
+        n_workers = int(logical_workers)
         setattr(args, "_postgwas_job_workers", int(n_workers))
         file_to_idx = {f: i for i, f in enumerate(files, start=1)}
         progress = build_rich_progress(
@@ -4548,6 +4715,7 @@ def _run_postgwas_tasks(args, logger: logging.Logger) -> None:
             task_start_ts: dict[str, float] = {}
             task_map: dict[str, int] = {}
             future_map: dict[cf.Future[str], str] = {}
+            completed_files: set[str] = set()
             pending_iter = iter(files)
 
             def _add_visible_task(file_path: str) -> None:
@@ -4584,7 +4752,7 @@ def _run_postgwas_tasks(args, logger: logging.Logger) -> None:
                     _add_visible_task(running_file)
 
             try:
-                with cf.ProcessPoolExecutor(max_workers=n_workers) as ex:
+                with _build_postgwas_process_pool(n_workers) as ex:
                     for _ in range(min(n_workers, n_total)):
                         if not _submit_next(ex):
                             break
@@ -4619,6 +4787,8 @@ def _run_postgwas_tasks(args, logger: logging.Logger) -> None:
                         )
                         try:
                             done_file = str(fut.result())
+                        except BrokenProcessPool:
+                            raise
                         except Exception:
                             idx = file_to_idx.get(file_path, 0)
                             print_failure(
@@ -4627,9 +4797,37 @@ def _run_postgwas_tasks(args, logger: logging.Logger) -> None:
                             )
                             raise
                         _ = done_file
+                        completed_files.add(file_path)
                         done_count += 1
                         _submit_next(ex)
                         _fill_visible_from_running()
+            except BrokenProcessPool:
+                _log_postgwas_broken_pool_hint(
+                    logger,
+                    n_workers=n_workers,
+                    req_threads=req_threads,
+                    n_files=n_total,
+                )
+                print_warning(
+                    f"PostGWAS worker pool broke after {done_count}/{n_total} tasks; "
+                    "retrying remaining tasks serially."
+                )
+                for f, tid in list(task_map.items()):
+                    try:
+                        progress.remove_task(tid)
+                    except Exception:
+                        pass
+                    task_map.pop(f, None)
+                _run_postgwas_tasks_serial(
+                    files,
+                    args,
+                    logger,
+                    total_start_ts=total_start_ts,
+                    done_count=done_count,
+                    file_to_idx=file_to_idx,
+                    skip_files=completed_files,
+                )
+                return
             except Exception:
                 for f, tid in list(task_map.items()):
                     try:
@@ -4653,20 +4851,57 @@ def _run_postgwas_tasks(args, logger: logging.Logger) -> None:
             bar_format="{desc}: {percentage:3.0f}%|{bar}| "
                        "[{elapsed}<{remaining}, {rate_fmt}{postfix}]",
         )
-        task_start_ts = {f: time.monotonic() for f in files}
+        task_start_ts: dict[str, float] = {}
+        file_to_idx = {f: i for i, f in enumerate(files, start=1)}
+        completed_files: set[str] = set()
         try:
-            done_iter = Parallel(
-                n_jobs=args.thread,
-                backend="loky",
-                return_as="generator_unordered",
-            )(
-                delayed(_run_one_postgwas_task)(f, args, logger) for f in files
+            future_map: dict[cf.Future[str], str] = {}
+            with _build_postgwas_process_pool(logical_workers) as ex:
+                for file_path in files:
+                    future_map[ex.submit(_run_one_postgwas_task, file_path, args, logger)] = file_path
+                    task_start_ts[file_path] = time.monotonic()
+                for fut in cf.as_completed(future_map):
+                    file_path = future_map[fut]
+                    elapsed = format_elapsed(
+                        time.monotonic()
+                        - task_start_ts.get(file_path, time.monotonic())
+                    )
+                    try:
+                        done_file = str(fut.result())
+                    except BrokenProcessPool:
+                        raise
+                    except Exception:
+                        idx = file_to_idx.get(file_path, 0)
+                        print_failure(
+                            f"Task {idx}/{len(files)}: "
+                            f"{os.path.basename(file_path)} ...Failed [{elapsed}]"
+                        )
+                        raise
+                    pbar.update(1)
+                    pbar.set_postfix(file=os.path.basename(str(done_file)))
+                    completed_files.add(file_path)
+                    done_count += 1
+        except BrokenProcessPool:
+            _log_postgwas_broken_pool_hint(
+                logger,
+                n_workers=logical_workers,
+                req_threads=req_threads,
+                n_files=len(files),
             )
-            for done_file in done_iter:
-                pbar.update(1)
-                pbar.set_postfix(file=os.path.basename(str(done_file)))
-                _ = done_file
-                done_count += 1
+            print_warning(
+                f"PostGWAS worker pool broke after {done_count}/{len(files)} tasks; "
+                "retrying remaining tasks serially."
+            )
+            _run_postgwas_tasks_serial(
+                files,
+                args,
+                logger,
+                total_start_ts=total_start_ts,
+                done_count=done_count,
+                file_to_idx=file_to_idx,
+                skip_files=completed_files,
+            )
+            return
         finally:
             pbar.close()
         total_elapsed = format_elapsed(time.monotonic() - total_start_ts)
@@ -4674,9 +4909,57 @@ def _run_postgwas_tasks(args, logger: logging.Logger) -> None:
         return
 
     setattr(args, "_postgwas_job_workers", int(logical_workers))
-    Parallel(n_jobs=args.thread, backend="loky")(
-        delayed(GWASplot)(file, args, logger) for file in files
-    )
+    task_start_ts: dict[str, float] = {}
+    file_to_idx = {f: i for i, f in enumerate(files, start=1)}
+    future_map: dict[cf.Future[str], str] = {}
+    completed_files: set[str] = set()
+    try:
+        with _build_postgwas_process_pool(logical_workers) as ex:
+            for file_path in files:
+                future_map[ex.submit(_run_one_postgwas_task, file_path, args, logger)] = file_path
+                task_start_ts[file_path] = time.monotonic()
+            for fut in cf.as_completed(future_map):
+                file_path = future_map[fut]
+                elapsed = format_elapsed(
+                    time.monotonic()
+                    - task_start_ts.get(file_path, time.monotonic())
+                )
+                try:
+                    _ = str(fut.result())
+                except BrokenProcessPool:
+                    raise
+                except Exception:
+                    idx = file_to_idx.get(file_path, 0)
+                    print_failure(
+                        f"Task {idx}/{len(files)}: "
+                        f"{os.path.basename(file_path)} ...Failed [{elapsed}]"
+                    )
+                    raise
+                completed_files.add(file_path)
+                done_count += 1
+    except BrokenProcessPool:
+        _log_postgwas_broken_pool_hint(
+            logger,
+            n_workers=logical_workers,
+            req_threads=req_threads,
+            n_files=len(files),
+        )
+        print_warning(
+            f"PostGWAS worker pool broke after {done_count}/{len(files)} tasks; "
+            "retrying remaining tasks serially."
+        )
+        _run_postgwas_tasks_serial(
+            files,
+            args,
+            logger,
+            total_start_ts=total_start_ts,
+            done_count=done_count,
+            file_to_idx=file_to_idx,
+            skip_files=completed_files,
+        )
+        return
+    total_elapsed = format_elapsed(time.monotonic() - total_start_ts)
+    print_success(f"Task {done_count}/{len(files)} ...Finished [{total_elapsed}]", force_color=True)
 
 
 def main():
@@ -4929,6 +5212,7 @@ def main():
     outprefix_base = os.path.join(args.out, args.prefix)
     log_path = f"{outprefix_base}.postGWAS.log"
     logger = setup_logging(log_path)
+    args._postgwas_log_path = str(log_path)
     if thread_capped:
         logger.warning(
             f"Warning: Requested threads={requested_threads} exceeds detected available={detected_threads}; "
@@ -5126,6 +5410,9 @@ def main():
             "Single GWAS input detected; forcing --thread to 1."
         )
         args.thread = 1
+    args._postgwas_outer_workers = int(
+        _resolve_postgwas_worker_count(int(args.thread), len(args.gwasfile))
+    ) if len(args.gwasfile) > 1 else 1
 
     args.ldblock_only_mode = bool(
         (not args.merge_mode)
@@ -5331,9 +5618,11 @@ def main():
             config_lines_terminal.append(_fmt_kv(str(name), str(value), truncate=True))
     config_lines_full.append(f"Output prefix: {output_prefix_text}")
     config_lines_full.append(f"Threads:       {threads_text}")
+    config_lines_full.append(f"PostGWAS workers: {int(getattr(args, '_postgwas_outer_workers', 1))}")
     config_lines_full.append(divider_full + "\n")
     config_lines_terminal.append(_truncate_config_line(f"Output prefix: {output_prefix_text}"))
     config_lines_terminal.append(_truncate_config_line(f"Threads:       {threads_text}"))
+    config_lines_terminal.append(_truncate_config_line(f"PostGWAS workers: {int(getattr(args, '_postgwas_outer_workers', 1))}"))
     config_lines_terminal.append(divider + "\n")
 
     rich_rendered = _render_postgwas_config_rich(

@@ -793,6 +793,7 @@ def run_chunked_gwas_lmm_lm(
                 n_snps,
                 _current_bed_memory_mb(),
                 needs_copy=(str(effective_model_key).lower() in {"lmm", "lmm2", "fvlmm"}),
+                buffers=(3 if str(effective_model_key).lower() in {"lmm", "lmm2", "fvlmm"} else 1),
             )
             if mmap_limit
             else None
@@ -1105,6 +1106,7 @@ def run_chunked_gwas_lmm_lm(
         with scan_stage_ctx(scan_threads), _common_bed_block_target_env(
             _current_bed_memory_mb(),
             needs_copy=(str(effective_model_key).lower() in {"lmm", "lmm2", "fvlmm"}),
+            buffers=(3 if str(effective_model_key).lower() in {"lmm", "lmm2", "fvlmm"} else 1),
         ):
             if _use_fvlmm_unified:
                 # Unified FvLMM path: single Rust call replaces entire chunk loop.
@@ -2159,6 +2161,7 @@ def run_chunked_gwas_streaming_shared(
             n_snps,
             _current_bed_memory_mb(),
             needs_copy=(str(effective_model_key).lower() in {"lmm", "lmm2", "fvlmm"}),
+            buffers=(3 if str(effective_model_key).lower() in {"lmm", "lmm2", "fvlmm"} else 1),
         )
         if mmap_limit
         else None
@@ -2241,6 +2244,11 @@ def run_chunked_gwas_streaming_shared(
     with scan_stage_ctx(scan_threads), _common_bed_block_target_env(
         _current_bed_memory_mb(),
         needs_copy=any(str(m).lower() in {"lmm", "lmm2", "fvlmm"} for m in model_order),
+        buffers=(
+            3
+            if any(str(m).lower() in {"lmm", "lmm2", "fvlmm"} for m in model_order)
+            else 1
+        ),
     ):
         try:
             bed_prefix = _as_plink_prefix(genofile)

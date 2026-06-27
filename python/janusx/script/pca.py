@@ -110,6 +110,7 @@ from ._common.memory import (
 # ======================================================================
 
 DEFAULT_BED_MEMORY_GB = 1.0
+_PCA_WORKING_BUFFERS_STREAM = 2
 _PCA_PLOT_BACKEND = None
 
 
@@ -302,7 +303,11 @@ def _resolve_palette_colors(spec: Optional[tuple[str, object]], n_series: int) -
 
 @contextmanager
 def _bed_block_target_env(memory_mb: Union[int, float, None]) -> None:
-    with _common_bed_block_target_env(memory_mb, needs_copy=False):
+    with _common_bed_block_target_env(
+        memory_mb,
+        needs_copy=False,
+        buffers=_PCA_WORKING_BUFFERS_STREAM,
+    ):
         yield
 
 def load_group_table(group_path: str) -> tuple[pd.DataFrame, Union[str , None], Union[str , None]]:
@@ -874,7 +879,7 @@ def build_grm_streaming_for_pca(
         n_samples,
         float(memory_mb),
         max_rows=max(1, int(n_snps)),
-        needs_copy=False,
+        buffers=_PCA_WORKING_BUFFERS_STREAM,
     )
     block_rows = max(1, int(block_rows))
     pbar = ProgressAdapter(
@@ -903,7 +908,7 @@ def build_grm_streaming_for_pca(
         n_samples,
         n_snps,
         float(memory_mb),
-        needs_copy=False,
+        buffers=_PCA_WORKING_BUFFERS_STREAM,
     )
     try:
         with _bed_block_target_env(memory_mb):
@@ -1163,7 +1168,10 @@ def main(log: bool = True):
     add_common_memory_arg(
         optional_group,
         default=DEFAULT_BED_MEMORY_GB,
-        help_profile="gwas_decode",
+        help_text=(
+            "Working memory budget in GB for PCA BED/GRM kernels. "
+            "Explicit -mem keeps the requested fixed budget."
+        ),
         include_hidden_legacy_single_dash_alias=True,
     )
     optional_group.add_argument(
@@ -1359,7 +1367,7 @@ def main(log: bool = True):
                             detected_threads=int(detected_threads),
                         ),
                     ),
-                    ("Decode block GB", args.memory),
+                    ("Memory", args.memory),
                     ("BED backend", "memmap (default)"),
                     ("RSVD mode", args.rsvd),
                 ]
@@ -1590,7 +1598,7 @@ def main(log: bool = True):
                     len(samples),
                     int(algo_snp),
                     memory_mb,
-                    needs_copy=False,
+                    buffers=_PCA_WORKING_BUFFERS_STREAM,
                 )
 
                 def _run_rsvd_only():

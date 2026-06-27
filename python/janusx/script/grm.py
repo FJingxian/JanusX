@@ -115,6 +115,8 @@ _GRM_AUTO_MEM_DENSE_BLOCK_ROWS = 4096
 _GRM_AUTO_MEM_SPARSE_BLOCK_ROWS = 4096
 _GRM_AUTO_MEM_PACKED_BLOCK_ROWS = 4096
 _GRM_AUTO_MEM_MIN_GB = 0.125
+_GRM_WORKING_BUFFERS_DENSE = 2
+_GRM_WORKING_BUFFERS_SPARSE = 2
 
 
 def _is_plink_prefix_path(path_or_prefix: str) -> bool:
@@ -187,11 +189,17 @@ def _memory_gb_for_target_decode_shape(
     target_rows: int,
     *,
     elem_bytes: int = 4,
+    buffers: int = 1,
     min_gb: float = _GRM_AUTO_MEM_MIN_GB,
 ) -> float:
     width = int(max(1, int(row_width)))
     rows = int(max(1, int(target_rows)))
-    bytes_need = width * rows * int(max(1, int(elem_bytes)))
+    bytes_need = (
+        width
+        * rows
+        * int(max(1, int(elem_bytes)))
+        * int(max(1, int(buffers)))
+    )
     gb_need = float(bytes_need) / float(1024 ** 3)
     return float(max(float(min_gb), gb_need))
 
@@ -211,8 +219,12 @@ def _resolve_grm_auto_decode_memory_gb(
                 n_total,
                 block_rows,
                 elem_bytes=4,
+                buffers=_GRM_WORKING_BUFFERS_SPARSE,
             ),
-            f"sparse-GRM stream-bed block_rows={int(block_rows)}",
+            (
+                f"sparse-GRM stream-bed block_rows={int(block_rows)} "
+                f"x{int(_GRM_WORKING_BUFFERS_SPARSE)}"
+            ),
         )
     dense_block_rows = min(
         m_total,
@@ -226,10 +238,12 @@ def _resolve_grm_auto_decode_memory_gb(
             n_total,
             dense_block_rows,
             elem_bytes=4,
+            buffers=_GRM_WORKING_BUFFERS_DENSE,
         ),
         (
             "dense-GRM memmap/packed block_rows="
-            f"{int(dense_block_rows)}"
+            f"{int(dense_block_rows)} "
+            f"x{int(_GRM_WORKING_BUFFERS_DENSE)}"
         ),
     )
 
@@ -290,7 +304,7 @@ def _emit_grm_configuration(
             ("Missing rate", args.geno),
             ("Het threshold", args.het),
             ("SNP-only", bool(args.snps_only)),
-            ("Decode block GB", memory_cfg),
+            ("Memory", memory_cfg),
             ("Stage timing", bool(args.stage_timing or spgrm_timing_enabled)),
             (
                 "Threads",
@@ -333,14 +347,22 @@ def _decode_block_rows_from_memory_mb(
             int(n_samples),
             float(memory_mb),
             max_rows=max(1, int(n_snps)),
-            needs_copy=False,
+            buffers=(
+                _GRM_WORKING_BUFFERS_SPARSE
+                if bool(streaming)
+                else _GRM_WORKING_BUFFERS_DENSE
+            ),
         )
     )
 
 
 @contextmanager
 def _bed_block_target_env(memory_mb: Union[int, float, None]) -> None:
-    with _common_bed_block_target_env(memory_mb, needs_copy=False):
+    with _common_bed_block_target_env(
+        memory_mb,
+        needs_copy=False,
+        buffers=_GRM_WORKING_BUFFERS_DENSE,
+    ):
         yield
 
 
@@ -351,7 +373,7 @@ def _spgrm_memory_budget_env(memory_mb: Union[int, float, None]) -> None:
     try:
         if memory_mb is not None:
             mb = float(memory_mb)
-            target = f"{mb:.6g}"
+            target = f"{(mb / float(_GRM_WORKING_BUFFERS_SPARSE)):.6g}"
             os.environ["JX_SPGRM_DECODE_TARGET_MB"] = target
             os.environ["JANUSX_SPGRM_DECODE_TARGET_MB"] = target
         yield
@@ -1003,7 +1025,7 @@ def main(log: bool = True):
         optional_group,
         default=None,
         help_text=(
-            "Decode block memory budget in GB for BED GRM kernels. "
+            "Working memory budget in GB for BED GRM kernels. "
             "When omitted, GRM chooses a route-aware default from loaded sample counts; "
             "explicit -mem keeps the requested fixed budget."
         ),
@@ -1295,7 +1317,7 @@ def main(log: bool = True):
                 "GRM decode memory auto: "
                 f"{float(args.memory):.6g} GB "
                 f"(reason: {str(auto_memory_reason).strip() or 'route-aware default'}). "
-                "Override with -mem/--memory to keep a fixed decode budget."
+                "Override with -mem/--memory to keep a fixed working-memory budget."
             ),
         )
     _flush_preconfig_successes()
@@ -1319,6 +1341,7 @@ def main(log: bool = True):
         n_snps,
         memory_mb,
         needs_copy=False,
+        buffers=_GRM_WORKING_BUFFERS_DENSE,
     )
     _log_verbose_or_file_only(
         logger,
@@ -1405,7 +1428,7 @@ def main(log: bool = True):
 
         if selected_backend == "memmap-bed":
             logger.info(
-                f"GRM decode block target: {float(args.memory):.6g} GB "
+                f"GRM memory target: {float(args.memory):.6g} GB "
                 f"({float(memory_mb):.6g} MB effective)."
             )
             if bool(args.stage_timing):

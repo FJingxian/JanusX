@@ -579,6 +579,15 @@ def _packed_ctx_is_lazy_full(packed_ctx: dict[str, typing.Any]) -> bool:
     return str(packed_ctx.get("packed_filter_mode", "")).strip().lower() == "lazy_full"
 
 
+def _packed_ctx_prefers_metadata_stream(
+    packed_ctx: dict[str, typing.Any],
+) -> bool:
+    if not _packed_ctx_is_lazy_full(packed_ctx):
+        return False
+    source_prefix = str(packed_ctx.get("source_prefix", "") or "").strip()
+    return source_prefix != ""
+
+
 def _looks_like_packed_ctx(obj: typing.Any) -> bool:
     return (
         isinstance(obj, dict)
@@ -2323,6 +2332,9 @@ _GS_AUTO_MEM_PCG_BLOCK_ROWS = 4096
 _GS_AUTO_MEM_EXACT_SAMPLE_BLOCK = 2048
 _GS_AUTO_MEM_BAYES_BLOCK_ROWS = 2048
 _GS_AUTO_MEM_MIN_GB = 0.125
+_GS_WORKING_BUFFERS_GBLUP = 2
+_GS_WORKING_BUFFERS_PCG = 2
+_GS_WORKING_BUFFERS_BAYES = 1
 
 
 def _normalize_memory_gb(memory_gb: float | int | None) -> float | None:
@@ -2350,11 +2362,17 @@ def _memory_gb_for_target_decode_shape(
     target_rows: int,
     *,
     elem_bytes: int = 4,
+    buffers: int = 1,
     min_gb: float = _GS_AUTO_MEM_MIN_GB,
 ) -> float:
     width = int(max(1, int(row_width)))
     rows = int(max(1, int(target_rows)))
-    bytes_need = width * rows * int(max(1, int(elem_bytes)))
+    bytes_need = (
+        width
+        * rows
+        * int(max(1, int(elem_bytes)))
+        * int(max(1, int(buffers)))
+    )
     gb_need = float(bytes_need) / float(1024 ** 3)
     return float(max(float(min_gb), gb_need))
 
@@ -2419,8 +2437,12 @@ def _resolve_gs_auto_decode_memory_gb(
                     n_total,
                     _GS_AUTO_MEM_BAYES_BLOCK_ROWS,
                     elem_bytes=8,
+                    buffers=_GS_WORKING_BUFFERS_BAYES,
                 ),
-                f"{method_key} block_rows={int(_GS_AUTO_MEM_BAYES_BLOCK_ROWS)}",
+                (
+                    f"{method_key} block_rows={int(_GS_AUTO_MEM_BAYES_BLOCK_ROWS)} "
+                    f"x{int(_GS_WORKING_BUFFERS_BAYES)}"
+                ),
             )
             continue
 
@@ -2430,8 +2452,12 @@ def _resolve_gs_auto_decode_memory_gb(
                     n_total,
                     _GS_AUTO_MEM_GBLUP_BLOCK_ROWS,
                     elem_bytes=4,
+                    buffers=_GS_WORKING_BUFFERS_GBLUP,
                 ),
-                f"{method_key} block_rows={int(_GS_AUTO_MEM_GBLUP_BLOCK_ROWS)}",
+                (
+                    f"{method_key} block_rows={int(_GS_AUTO_MEM_GBLUP_BLOCK_ROWS)} "
+                    f"x{int(_GS_WORKING_BUFFERS_GBLUP)}"
+                ),
             )
             continue
 
@@ -2446,8 +2472,12 @@ def _resolve_gs_auto_decode_memory_gb(
                         n_total,
                         _GS_AUTO_MEM_GBLUP_BLOCK_ROWS,
                         elem_bytes=4,
+                        buffers=_GS_WORKING_BUFFERS_GBLUP,
                     ),
-                    f"{method_key}->GBLUP block_rows={int(_GS_AUTO_MEM_GBLUP_BLOCK_ROWS)}",
+                    (
+                        f"{method_key}->GBLUP block_rows={int(_GS_AUTO_MEM_GBLUP_BLOCK_ROWS)} "
+                        f"x{int(_GS_WORKING_BUFFERS_GBLUP)}"
+                    ),
                 )
             elif dispatch.effective_method == "rrBLUP" and dispatch.rrblup_solver == "pcg":
                 _push_candidate(
@@ -2455,8 +2485,12 @@ def _resolve_gs_auto_decode_memory_gb(
                         n_total,
                         _GS_AUTO_MEM_PCG_BLOCK_ROWS,
                         elem_bytes=4,
+                        buffers=_GS_WORKING_BUFFERS_PCG,
                     ),
-                    f"{method_key}->rrBLUP-PCG/HE block_rows={int(_GS_AUTO_MEM_PCG_BLOCK_ROWS)}",
+                    (
+                        f"{method_key}->rrBLUP-PCG/HE block_rows={int(_GS_AUTO_MEM_PCG_BLOCK_ROWS)} "
+                        f"x{int(_GS_WORKING_BUFFERS_PCG)}"
+                    ),
                 )
             elif dispatch.effective_method == "rrBLUP" and dispatch.rrblup_solver == "exact":
                 if m_total > 0:
@@ -2488,8 +2522,12 @@ def _resolve_gs_auto_decode_memory_gb(
                         n_total,
                         _GS_AUTO_MEM_PCG_BLOCK_ROWS,
                         elem_bytes=4,
+                        buffers=_GS_WORKING_BUFFERS_PCG,
                     ),
-                    f"{method_key}->{solver_use} block_rows={int(_GS_AUTO_MEM_PCG_BLOCK_ROWS)}",
+                    (
+                        f"{method_key}->{solver_use} block_rows={int(_GS_AUTO_MEM_PCG_BLOCK_ROWS)} "
+                        f"x{int(_GS_WORKING_BUFFERS_PCG)}"
+                    ),
                 )
             elif solver_use == "exact" and m_total > 0:
                 _push_candidate(
@@ -2641,14 +2679,13 @@ def _calc_stream_block_rows(
 ) -> int:
     # Keep the public helper signature stable, but route the actual sizing
     # through the shared CLI decode-budget policy.
-    _ = buffers
     _ = reserve_bytes
     return int(
         _common_resolve_decode_block_rows(
             int(max(1, int(n_samples))),
             float(_memory_gb_to_mb(memory_gb)),
             elem_bytes=int(max(1, int(elem_bytes))),
-            needs_copy=False,
+            buffers=int(max(1, int(buffers))),
             min_rows=int(max(1, int(min_rows))),
         )
     )
@@ -2688,7 +2725,7 @@ def _attach_stream_decode_budget_to_packed_ctx(
         n_samples=n_samples,
         memory_gb=memory_gb,
         elem_bytes=4,
-        buffers=2,
+        buffers=_GS_WORKING_BUFFERS_GBLUP,
         reserve_bytes=gblup_reserve_bytes,
     )
     ctx["__gblup_grm_block_rows__"] = int(gblup_rows)
@@ -2701,7 +2738,7 @@ def _attach_stream_decode_budget_to_packed_ctx(
         n_samples=n_samples,
         memory_gb=memory_gb,
         elem_bytes=8,
-        buffers=2,
+        buffers=_GS_WORKING_BUFFERS_BAYES,
     )
     ctx["__bayes_stream_block_rows__"] = int(bayes_rows)
     ctx["__bayes_stream_window_mb__"] = int(
@@ -3501,7 +3538,9 @@ def _build_gblup_cv_grm_once(
             except Exception:
                 grm = None
 
-        if grm is None and can_build_f32 and ("packed" in packed_ctx):
+        prefer_metadata_stream = _packed_ctx_prefers_metadata_stream(packed_ctx)
+
+        if grm is None and can_build_f32 and ("packed" in packed_ctx) and (not prefer_metadata_stream):
             packed = np.ascontiguousarray(np.asarray(packed_ctx["packed"], dtype=np.uint8))
             maf = np.ascontiguousarray(np.asarray(packed_ctx["maf"], dtype=np.float32).reshape(-1))
             if packed.ndim != 2:
@@ -3552,7 +3591,7 @@ def _build_gblup_cv_grm_once(
             except Exception:
                 grm = None
 
-        if grm is None and can_build_stable_f64:
+        if grm is None and can_build_stable_f64 and (not prefer_metadata_stream):
             try:
                 grm, _eff_m = build_stable_packed_ctx_grm_f64(
                     packed_ctx=packed_ctx,
@@ -4828,7 +4867,9 @@ def _estimate_rrblup_lambda_subsample_reml(
             packed_is_lazy = _packed_ctx_is_lazy_full(packed_ctx)
             source_prefix = str(packed_ctx.get("source_prefix", "") or "").strip()
             packed_raw = packed_ctx.get("packed", None)
-            use_resident_packed = packed_raw is not None
+            use_resident_packed = bool(
+                (packed_raw is not None) and ((not packed_is_lazy) or (source_prefix == ""))
+            )
             site_keep_arg: np.ndarray | None = None
             row_source_indices_arg: np.ndarray | None = None
             he_mmap_window_mb: int | None = None
@@ -4918,6 +4959,14 @@ def _estimate_rrblup_lambda_subsample_reml(
                     int(n_train) * int(he_trace_probe_batch) * np.dtype(np.float32).itemsize
                 )
                 he_rss_before = _get_process_rss_bytes()
+                if (packed_raw is not None) and (not use_resident_packed):
+                    print(
+                        (
+                            "[rrBLUP-DEBUG] HE lazy_full payload detected -> force metadata stream "
+                            f"source_prefix={source_prefix}"
+                        ),
+                        flush=True,
+                    )
                 print(
                     (
                         "[rrBLUP-DEBUG] HE site_keep mode="
@@ -6081,10 +6130,26 @@ def _packed_gblup_stream_metadata(
     active_row_idx = _packed_ctx_active_row_idx(packed_ctx)
     mode_norm = str(mode).strip().lower()
     mode_is_dom = bool(mode_norm in {"d", "dom", "dominance"})
+    if (not mode_is_dom) and _packed_ctx_prefers_metadata_stream(packed_ctx):
+        if "row_flip" not in packed_ctx:
+            raise ValueError(
+                "Streaming packed context requires cached row_flip metadata; "
+                "rebuild packed-meta cache or disable lazy_full packed fallback."
+            )
     row_flip_full = (
         np.zeros((int(active_row_idx.shape[0]),), dtype=np.bool_)
         if mode_is_dom
-        else _ensure_packed_row_flip_cached(packed_ctx)
+        else (
+            np.ascontiguousarray(
+                np.asarray(
+                    packed_ctx["row_flip"],
+                    dtype=np.bool_,
+                ).reshape(-1),
+                dtype=np.bool_,
+            )
+            if _packed_ctx_prefers_metadata_stream(packed_ctx) and ("row_flip" in packed_ctx)
+            else _ensure_packed_row_flip_cached(packed_ctx)
+        )
     )
     maf_full = (
         _packed_ctx_dom_af(packed_ctx)
@@ -8193,20 +8258,47 @@ def GSapi(
                 packed_arg: np.ndarray | None = None
                 packed_has_payload = bool("packed" in packed_train)
                 packed_is_lazy = bool(packed_has_payload and _packed_ctx_is_lazy_full(packed_train))
-                if packed_has_payload:
+                use_resident_packed = bool(
+                    packed_has_payload and ((not packed_is_lazy) or (source_prefix == ""))
+                )
+                pcg_stream_meta_block_rows = int(
+                    max(
+                        1,
+                        int(
+                            (rrblup_adamw_cfg or {}).get(
+                                "pcg_block_rows",
+                                (rrblup_adamw_cfg or {}).get("snp_block_size", 4096),
+                            )
+                        ),
+                    )
+                )
+                site_keep_arg_legacy = None
+                if use_resident_packed:
                     packed_src_view = np.asarray(packed_train["packed"], dtype=np.uint8)
                     packed_arg = np.ascontiguousarray(
                         packed_src_view,
                         dtype=np.uint8,
                     )
-                maf_arg = np.ascontiguousarray(
-                    np.asarray(packed_train["maf"], dtype=np.float32).reshape(-1),
-                    dtype=np.float32,
-                )
-                row_flip_arg = np.ascontiguousarray(
-                    np.asarray(_ensure_packed_row_flip_cached(packed_train), dtype=np.bool_).reshape(-1),
-                    dtype=np.bool_,
-                )
+                    maf_arg = np.ascontiguousarray(
+                        np.asarray(packed_train["maf"], dtype=np.float32).reshape(-1),
+                        dtype=np.float32,
+                    )
+                    row_flip_arg = np.ascontiguousarray(
+                        np.asarray(_ensure_packed_row_flip_cached(packed_train), dtype=np.bool_).reshape(-1),
+                        dtype=np.bool_,
+                    )
+                else:
+                    (
+                        _pcg_source_prefix,
+                        site_keep_arg_legacy,
+                        _pcg_row_source_indices_arg,
+                        row_flip_arg,
+                        maf_arg,
+                        _pcg_mmap_window_mb,
+                    ) = _packed_gblup_stream_metadata(
+                        packed_train,
+                        block_rows=int(pcg_stream_meta_block_rows),
+                    )
                 packed_n_samples = int(packed_train["n_samples"])
                 if packed_n_samples <= 0:
                     raise ValueError("Packed rrBLUP-PCG requires n_samples > 0 in packed context.")
@@ -8232,19 +8324,20 @@ def GSapi(
                             f"!= expected {expected_bps}."
                         )
                 site_keep_raw = packed_train.get("site_keep", None)
-                site_keep_arg_legacy = None
-                if site_keep_raw is not None:
+                if use_resident_packed and site_keep_raw is not None:
                     site_keep_arg_legacy = np.ascontiguousarray(
                         np.asarray(site_keep_raw, dtype=np.bool_).reshape(-1),
                         dtype=np.bool_,
                     )
                 site_keep_arg = None
-                if site_keep_arg_legacy is not None and (
-                    packed_is_lazy
-                    or (packed_arg is None)
-                    or int(site_keep_arg_legacy.shape[0]) == int(packed_arg.shape[0])
-                ):
-                    site_keep_arg = site_keep_arg_legacy
+                if site_keep_arg_legacy is not None:
+                    expected_site_keep_len = (
+                        int(packed_arg.shape[0])
+                        if packed_arg is not None
+                        else int(maf_arg.shape[0])
+                    )
+                    if int(site_keep_arg_legacy.shape[0]) == int(expected_site_keep_len):
+                        site_keep_arg = site_keep_arg_legacy
 
                 n_train_expected = int(np.asarray(Y).reshape(-1).shape[0])
                 if packed_train_indices is None:
@@ -8435,6 +8528,14 @@ def GSapi(
                         int(pcg_block_rows) * int(n_train_expected) * np.dtype(np.float32).itemsize
                     )
                     pcg_rss_before = _get_process_rss_bytes()
+                    if packed_has_payload and (not use_resident_packed):
+                        print(
+                            (
+                                "[rrBLUP-DEBUG] PCG lazy_full payload detected -> force metadata stream "
+                                f"source_prefix={source_prefix or '<none>'}"
+                            ),
+                            flush=True,
+                        )
                     if packed_arg is not None and packed_src_view is not None:
                         packed_c_contig = bool(getattr(packed_arg, "flags", {}).c_contiguous)
                         packed_same_obj = bool(packed_arg is packed_src_view)
@@ -17075,7 +17176,7 @@ def parse_args(argv: typing.Optional[list[str]] = None):
         optional_group,
         default=None,
         help_text=(
-            "Decode block memory budget in GB for streamed BED kernels in GS. "
+            "Working memory budget in GB for streamed BED kernels in GS. "
             "When omitted, GS chooses a route-aware default from loaded sample/marker counts; "
             "explicit -mem keeps the requested fixed budget."
         ),
@@ -18296,7 +18397,7 @@ def _run_gs_pipeline(
                 "GS decode memory auto: "
                 f"{float(args.memory):.6g} GB "
                 f"(reason: {str(auto_memory_reason).strip() or 'route-aware default'}). "
-                "Override with -mem/--memory to keep a fixed decode budget."
+                "Override with -mem/--memory to keep a fixed working-memory budget."
             )
             if bool(debug_mode):
                 logger.info(auto_memory_msg)
@@ -19225,7 +19326,7 @@ def _run_gs_pipeline(
                 int(len(samples)),
                 float(memory_mb),
                 elem_bytes=4,
-                needs_copy=False,
+                buffers=_GS_WORKING_BUFFERS_PCG,
                 min_rows=1,
             )
         if rr_block_rows is not None:

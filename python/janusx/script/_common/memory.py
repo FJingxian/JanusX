@@ -179,22 +179,41 @@ def effective_decode_memory_mb(
     memory_mb: Union[int, float],
     *,
     needs_copy: bool = False,
+    buffers: int = 1,
 ) -> float:
     mb = float(memory_mb)
     if (not math.isfinite(mb)) or mb <= 0.0:
         raise ValueError(f"decode memory must be finite and > 0 MB, got {memory_mb}")
-    return float(mb * (0.5 if bool(needs_copy) else 1.0))
+    working_buffers = resolve_decode_working_buffers(
+        buffers=int(max(1, int(buffers))),
+        needs_copy=bool(needs_copy),
+    )
+    return float(mb / float(working_buffers))
+
+
+def resolve_decode_working_buffers(
+    *,
+    buffers: int = 1,
+    needs_copy: bool = False,
+) -> int:
+    base = max(1, int(buffers))
+    if bool(needs_copy):
+        base = max(base, 2)
+    return base
 
 
 def scale_decode_rows_for_copy(
     rows: int,
     *,
     needs_copy: bool = False,
+    buffers: int = 1,
 ) -> int:
     base = max(1, int(rows))
-    if not bool(needs_copy):
-        return base
-    return max(1, int(base // 2))
+    working_buffers = resolve_decode_working_buffers(
+        buffers=int(max(1, int(buffers))),
+        needs_copy=bool(needs_copy),
+    )
+    return max(1, int(base // working_buffers))
 
 
 def resolve_decode_block_rows(
@@ -204,13 +223,18 @@ def resolve_decode_block_rows(
     max_rows: Union[int, None] = None,
     elem_bytes: int = 4,
     needs_copy: bool = False,
+    buffers: int = 1,
     min_rows: int = 1,
 ) -> int:
+    working_buffers = resolve_decode_working_buffers(
+        buffers=int(max(1, int(buffers))),
+        needs_copy=bool(needs_copy),
+    )
     rows = calc_decode_block_rows_from_memory_mb(
         int(max(1, int(row_width))),
-        effective_decode_memory_mb(float(memory_mb), needs_copy=bool(needs_copy)),
+        float(memory_mb),
         elem_bytes=int(max(1, int(elem_bytes))),
-        buffers=1,
+        buffers=int(working_buffers),
         min_rows=int(max(1, int(min_rows))),
         max_rows=(None if max_rows is None else max(1, int(max_rows))),
     )
@@ -225,17 +249,22 @@ def resolve_decode_mmap_window_mb(
     *,
     elem_bytes: int = 4,
     needs_copy: bool = False,
+    buffers: int = 1,
     min_rows: int = 1,
     max_rows: Union[int, None] = None,
     min_chunks: int = 2,
 ) -> Optional[int]:
+    working_buffers = resolve_decode_working_buffers(
+        buffers=int(max(1, int(buffers))),
+        needs_copy=bool(needs_copy),
+    )
     return auto_mmap_window_mb(
         str(path_or_prefix),
         int(n_samples),
         int(n_snps),
-        effective_decode_memory_mb(float(memory_mb), needs_copy=bool(needs_copy)),
+        float(memory_mb),
         elem_bytes=int(max(1, int(elem_bytes))),
-        buffers=1,
+        buffers=int(working_buffers),
         min_rows=int(max(1, int(min_rows))),
         max_rows=(None if max_rows is None else max(1, int(max_rows))),
         min_chunks=int(max(1, int(min_chunks))),
@@ -247,10 +276,15 @@ def bed_block_target_env(
     memory_mb: Union[int, float, None],
     *,
     needs_copy: bool = False,
+    buffers: int = 1,
 ):
     prev = os.environ.get("JX_BED_BLOCK_TARGET_MB")
     if memory_mb is not None:
-        target_mb = effective_decode_memory_mb(float(memory_mb), needs_copy=bool(needs_copy))
+        target_mb = effective_decode_memory_mb(
+            float(memory_mb),
+            needs_copy=bool(needs_copy),
+            buffers=int(max(1, int(buffers))),
+        )
         os.environ["JX_BED_BLOCK_TARGET_MB"] = f"{float(target_mb):.6g}"
     try:
         yield

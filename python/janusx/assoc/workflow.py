@@ -141,7 +141,6 @@ from janusx.script._common.memory import (
     normalize_decode_memory_gb as _common_normalize_decode_memory_gb,
     resolve_decode_block_rows as _common_resolve_decode_block_rows,
     resolve_decode_mmap_window_mb as _common_resolve_decode_mmap_window_mb,
-    scale_decode_rows_for_copy as _common_scale_decode_rows_for_copy,
 )
 from janusx.script._common.threads import (
     apply_outer_thread_cap,
@@ -161,6 +160,10 @@ _GWAS_AUTO_MEM_LM_TARGET_MB = 192.0
 _GWAS_AUTO_MEM_GRM_BLOCK_ROWS = 4096
 _GWAS_AUTO_MEM_COPY_DECODE_BLOCK_ROWS = 8192
 _GWAS_AUTO_MEM_PACKED_BLOCK_ROWS = 4096
+_GWAS_WORKING_BUFFERS_LM = 1
+_GWAS_WORKING_BUFFERS_GRM = 2
+_GWAS_WORKING_BUFFERS_PACKED = 2
+_GWAS_WORKING_BUFFERS_COPY = 3
 from janusx.script._common.genocache import configure_genotype_cache_from_out
 from janusx.script._common.genoio import (
     basename_only as _basename_only,
@@ -2465,7 +2468,7 @@ def build_grm_streaming(
         grm: Union[np.ndarray, None] = None
         eff_m = 0
         cache_target = str(cache_write_path).strip() if cache_write_path is not None else ""
-        with _bed_block_target_env(memory_mb):
+        with _bed_block_target_env(memory_mb, buffers=_GWAS_WORKING_BUFFERS_GRM):
             if backend_kind == "packed-preloaded":
                 pre = preloaded_packed if packed_preload_is_ready(preloaded_packed) else None
                 if not isinstance(pre, dict) or str(pre.get("prefix", "")) != str(packed_prefix):
@@ -2782,6 +2785,7 @@ def load_or_build_grm_with_cache(
                         n_snps,
                         float(memory_mb),
                         needs_copy=False,
+                        buffers=_GWAS_WORKING_BUFFERS_GRM,
                     ),
                     memory_mb=float(memory_mb),
                     threads=threads,
@@ -3242,6 +3246,7 @@ def prepare_streaming_context(
     preinspected_ids: Optional[np.ndarray] = None,
     preinspected_n_snps: Optional[int] = None,
     preinspect_warnings: Optional[list[str]] = None,
+    working_buffers: int = 1,
 ):
     """
     Prepare all shared resources for streaming LMM/LM once:
@@ -3289,6 +3294,7 @@ def prepare_streaming_context(
         int(n_samples),
         int(n_snps),
         streaming=True,
+        working_buffers=int(max(1, int(working_buffers))),
     )
     if _gwas_logger_verbose(logger):
         _log_info(
@@ -4314,13 +4320,48 @@ def _memory_gb_for_target_decode_shape(
     target_rows: int,
     *,
     elem_bytes: int = 4,
+    buffers: int = 1,
     min_gb: float = _GWAS_AUTO_MEM_MIN_GB,
 ) -> float:
     width = int(max(1, int(row_width)))
     rows = int(max(1, int(target_rows)))
-    bytes_need = width * rows * int(max(1, int(elem_bytes)))
+    bytes_need = (
+        width
+        * rows
+        * int(max(1, int(elem_bytes)))
+        * int(max(1, int(buffers)))
+    )
     gb_need = float(bytes_need) / float(1024 ** 3)
     return float(max(float(min_gb), gb_need))
+
+
+def _gwas_model_working_buffers(model_key: str) -> int:
+    key = str(model_key).strip().lower()
+    if key in {"lmm", "lmm2", "fastlmm", "fvlmm"}:
+        return int(_GWAS_WORKING_BUFFERS_COPY)
+    if key in {"splmm", "algwas", "farmcpu"}:
+        return int(_GWAS_WORKING_BUFFERS_PACKED)
+    if key in {"lm", "lm2"}:
+        return int(_GWAS_WORKING_BUFFERS_LM)
+    return 1
+
+
+def _gwas_requested_working_buffers(
+    *,
+    requested_models: list[str] | set[str],
+    qcov_needs_grm: bool,
+) -> int:
+    models = {
+        str(x).strip().lower()
+        for x in requested_models
+        if str(x).strip() != ""
+    }
+    buffers = 1
+    for model_key in models:
+        buffers = max(buffers, _gwas_model_working_buffers(str(model_key)))
+    if bool(qcov_needs_grm) or len(models & {"lmm", "lmm2", "fastlmm", "fvlmm"}) > 0:
+        buffers = max(buffers, int(_GWAS_WORKING_BUFFERS_GRM))
+    return int(max(1, buffers))
 
 
 def _format_gwas_memory_cfg(
@@ -4367,6 +4408,7 @@ def _resolve_gwas_auto_decode_memory_gb(
                 n_total,
                 lm_rows,
                 elem_bytes=4,
+                buffers=_GWAS_WORKING_BUFFERS_LM,
             ),
             f"LM/LM2 target≈{float(_GWAS_AUTO_MEM_LM_TARGET_MB):g}MB rows={int(lm_rows)}",
         )
@@ -4378,8 +4420,12 @@ def _resolve_gwas_auto_decode_memory_gb(
                 n_total,
                 copy_rows,
                 elem_bytes=4,
+                buffers=_GWAS_WORKING_BUFFERS_COPY,
             ),
-            f"LMM/FvLMM copy-aware decode block_rows={int(copy_rows)}",
+            (
+                f"LMM/FvLMM copy-aware decode block_rows={int(copy_rows)} "
+                f"x{int(_GWAS_WORKING_BUFFERS_COPY)}"
+            ),
         )
 
     packed_models = sorted(models & {"splmm", "algwas", "farmcpu"})
@@ -4391,8 +4437,12 @@ def _resolve_gwas_auto_decode_memory_gb(
                 n_total,
                 packed_rows,
                 elem_bytes=4,
+                buffers=_GWAS_WORKING_BUFFERS_PACKED,
             ),
-            f"{packed_label} block_rows={int(packed_rows)}",
+            (
+                f"{packed_label} block_rows={int(packed_rows)} "
+                f"x{int(_GWAS_WORKING_BUFFERS_PACKED)}"
+            ),
         )
 
     if bool(qcov_needs_grm) or len(models & {"lmm", "lmm2", "fastlmm", "fvlmm"}) > 0:
@@ -4402,8 +4452,12 @@ def _resolve_gwas_auto_decode_memory_gb(
                 n_total,
                 grm_rows,
                 elem_bytes=4,
+                buffers=_GWAS_WORKING_BUFFERS_GRM,
             ),
-            f"GRM/PCA block_rows={int(grm_rows)}",
+            (
+                f"GRM/PCA block_rows={int(grm_rows)} "
+                f"x{int(_GWAS_WORKING_BUFFERS_GRM)}"
+            ),
         )
 
     if len(candidates) == 0:
@@ -4418,6 +4472,7 @@ def _resolve_bed_block_rows_from_memory(
     n_snps_hint: int,
     *,
     streaming: bool,
+    working_buffers: int = 1,
 ) -> int:
     _ = streaming
     return int(
@@ -4425,14 +4480,23 @@ def _resolve_bed_block_rows_from_memory(
             int(n_samples),
             float(memory_mb),
             max_rows=max(1, int(n_snps_hint)),
-            needs_copy=False,
+            buffers=int(max(1, int(working_buffers))),
         )
     )
 
 
 @contextmanager
-def _bed_block_target_env(memory_mb: Union[int, float, None], *, needs_copy: bool = False):
-    with _common_bed_block_target_env(memory_mb, needs_copy=bool(needs_copy)):
+def _bed_block_target_env(
+    memory_mb: Union[int, float, None],
+    *,
+    needs_copy: bool = False,
+    buffers: int = 1,
+):
+    with _common_bed_block_target_env(
+        memory_mb,
+        needs_copy=bool(needs_copy),
+        buffers=int(max(1, int(buffers))),
+    ):
         yield
 
 
@@ -4481,12 +4545,6 @@ def _resolve_stream_scan_chunk_size(
             if auto_rows >= 10_000:
                 auto_rows = int((auto_rows // 1_000) * 1_000)
             resolved = max(base, auto_rows)
-
-    if "fvlmm" in models or "lmm" in models or "lmm2" in models:
-        resolved = _common_scale_decode_rows_for_copy(
-            int(resolved),
-            needs_copy=True,
-        )
 
     return min(n_snps, max(1, int(resolved)))
 
@@ -5866,7 +5924,7 @@ def parse_args(argv: Optional[list[str]] = None):
         optional_group,
         default=None,
         help_text=(
-            "Decode block memory budget in GB for BED GWAS kernels. "
+            "Working memory budget in GB for BED GWAS kernels. "
             "When omitted, GWAS chooses a route-aware default from loaded sample/marker counts; "
             "explicit -mem keeps the requested fixed budget."
         ),
@@ -6284,7 +6342,7 @@ def _run_gwas_pipeline(
             "GWAS decode memory auto: "
             f"{float(args.memory):.6g} GB "
             f"(reason: {str(auto_memory_reason).strip() or 'route-aware default'}). "
-            "Override with -mem/--memory to keep a fixed decode budget."
+            "Override with -mem/--memory to keep a fixed working-memory budget."
         )
         if _gwas_logger_verbose(logger):
             logger.info(auto_memory_msg)
@@ -6319,7 +6377,7 @@ def _run_gwas_pipeline(
             ("Q option", args.qcov),
             ("MAF threshold", args.maf),
             ("Miss threshold", args.geno),
-            ("Decode block GB", memory_cfg),
+            ("Memory", memory_cfg),
         ]
         if qtn_input_requested and (args.farmcpu or args.algwas):
             _qtn_kind, _qtn_path, _ = _qtn_source_from_args(args) or ("", "", None)
@@ -6414,7 +6472,7 @@ def _run_gwas_pipeline(
             ("BED Backend", bed_backend_policy),
             ("GRM Option", args.grm),
             ("Q Option", args.qcov),
-            ("Decode block GB", memory_cfg),
+            ("Memory", memory_cfg),
             ("SNPs Only", bool(args.snps_only)),
             ("Force Model", bool(args.force_model)),
         ]
@@ -6750,6 +6808,10 @@ def _run_gwas_pipeline(
                     preinspected_ids=preinspect_ids,
                     preinspected_n_snps=preinspect_n_snps,
                     preinspect_warnings=preinspect_warnings,
+                    working_buffers=_gwas_requested_working_buffers(
+                        requested_models=list(requested_memory_models),
+                        qcov_needs_grm=bool(qcov_needs_grm),
+                    ),
                 )
                 if getattr(args, "lm2", None) is not None:
                     lm2_selector = list(getattr(args, "lm2_cov_cols", []) or [])
@@ -6790,6 +6852,10 @@ def _run_gwas_pipeline(
                     int(len(ids)),
                     int(n_snps),
                     streaming=True,
+                    working_buffers=_gwas_requested_working_buffers(
+                        requested_models=list(requested_memory_models),
+                        qcov_needs_grm=bool(qcov_needs_grm),
+                    ),
                 )
                 if (
                     bool(packed_model_routes_enabled)

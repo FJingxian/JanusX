@@ -4612,6 +4612,93 @@ def _rrblup_lambda_equation_to_raw(
     return float(lam_eq)
 
 
+def _rrblup_lambda_k_to_equation(
+    *,
+    lambda_k: float,
+    m_effective: int,
+) -> float:
+    lam_k = float(lambda_k)
+    if (not np.isfinite(lam_k)) or (lam_k < 0.0):
+        return float("nan")
+    return float(lam_k * float(max(1, int(m_effective))))
+
+
+def _rrblup_lambda_auto_vc_terms(
+    lambda_info: dict[str, typing.Any] | None,
+) -> tuple[float, int, int, float, float]:
+    if lambda_info is None:
+        return float("nan"), 0, 0, float("nan"), float("nan")
+
+    def _as_nonneg_int(raw: typing.Any) -> int:
+        try:
+            out = int(raw)
+        except Exception:
+            return 0
+        return int(out) if out > 0 else 0
+
+    sigma_g2 = float(lambda_info.get("vc_sigma_g2", np.nan))
+    sigma_e2 = float(lambda_info.get("vc_sigma_e2", np.nan))
+    lambda_k_payload = float(
+        lambda_info.get(
+            "lambda_k_vc",
+            lambda_info.get("lambda_k", np.nan),
+        )
+    )
+    if (
+        np.isfinite(sigma_g2)
+        and (sigma_g2 > 0.0)
+        and np.isfinite(sigma_e2)
+        and (sigma_e2 >= 0.0)
+    ):
+        lambda_k_vc = float(sigma_e2 / sigma_g2)
+    elif np.isfinite(lambda_k_payload) and (lambda_k_payload >= 0.0):
+        lambda_k_vc = float(lambda_k_payload)
+    else:
+        lambda_k_vc = float("nan")
+
+    m_effective_rrblup = _as_nonneg_int(
+        lambda_info.get("m_effective_rrblup", lambda_info.get("m_effective", 0))
+    )
+    m_effective_vc = _as_nonneg_int(
+        lambda_info.get("m_effective_vc", m_effective_rrblup)
+    )
+    lambda_equation_rrblup = (
+        _rrblup_lambda_k_to_equation(
+            lambda_k=float(lambda_k_vc),
+            m_effective=int(m_effective_rrblup),
+        )
+        if m_effective_rrblup > 0
+        else float("nan")
+    )
+    lambda_equation_vc = (
+        _rrblup_lambda_k_to_equation(
+            lambda_k=float(lambda_k_vc),
+            m_effective=int(m_effective_vc),
+        )
+        if m_effective_vc > 0
+        else float("nan")
+    )
+    return (
+        float(lambda_k_vc),
+        int(m_effective_rrblup),
+        int(m_effective_vc),
+        float(lambda_equation_rrblup),
+        float(lambda_equation_vc),
+    )
+
+
+def _rrblup_m_effective_from_maf(
+    maf: np.ndarray | typing.Sequence[typing.Any],
+    std_eps: float,
+) -> int:
+    maf_arr = np.asarray(maf, dtype=np.float64).reshape(-1)
+    if int(maf_arr.size) == 0:
+        return 0
+    p = np.clip(maf_arr, 0.0, 0.5)
+    var = 2.0 * p * (1.0 - p)
+    return int(np.count_nonzero(np.isfinite(var) & (var > float(std_eps))))
+
+
 def _estimate_rrblup_lambda_subsample_reml(
     *,
     y_train: np.ndarray,
@@ -4700,6 +4787,37 @@ def _estimate_rrblup_lambda_subsample_reml(
     ).strip().lower()
     if lambda_auto_strategy not in {"he_first", "he_only", "reml_first"}:
         lambda_auto_strategy = "he_first"
+
+    def _normalize_lambda_payload(payload: dict[str, typing.Any]) -> dict[str, typing.Any]:
+        out = dict(payload)
+        out["m_effective"] = int(max(1, int(out.get("m_effective", m_effective))))
+        out["m_effective_rrblup"] = int(
+            max(1, int(out.get("m_effective_rrblup", out["m_effective"])))
+        )
+        (
+            lambda_k_vc,
+            _m_effective_rrblup,
+            m_effective_vc,
+            lambda_equation_rrblup,
+            lambda_equation_vc,
+        ) = _rrblup_lambda_auto_vc_terms(out)
+        if np.isfinite(lambda_k_vc):
+            out["lambda_k_vc"] = float(lambda_k_vc)
+            if not np.isfinite(float(out.get("lambda_k", np.nan))):
+                out["lambda_k"] = float(lambda_k_vc)
+        else:
+            out["lambda_k_vc"] = float("nan")
+        out["m_effective_vc"] = int(
+            max(1, int(m_effective_vc if m_effective_vc > 0 else out["m_effective"]))
+        )
+        out["lambda_equation_rrblup"] = float(lambda_equation_rrblup)
+        out["lambda_equation_vc"] = float(lambda_equation_vc)
+        if not np.isfinite(float(out.get("lambda_equation", np.nan))):
+            if np.isfinite(float(lambda_equation_rrblup)):
+                out["lambda_equation"] = float(lambda_equation_rrblup)
+            elif np.isfinite(float(lambda_equation_vc)):
+                out["lambda_equation"] = float(lambda_equation_vc)
+        return out
 
     def _merge_he_diag(payload: dict[str, typing.Any]) -> dict[str, typing.Any]:
         out = dict(payload)
@@ -4840,7 +4958,7 @@ def _estimate_rrblup_lambda_subsample_reml(
             )
             he_max_iter = int(max(1, int(cfg_use.get("he_max_iter", cfg_use.get("pcg_max_iter", 32)))))
             he_seed = int(cfg_use.get("he_seed", seed))
-            he_use_train_maf = _cfg_truthy(cfg_use.get("he_use_train_maf", "on"), default=True)
+            he_use_train_maf = _cfg_truthy(cfg_use.get("he_use_train_maf", "off"), default=False)
             he_thread_policy_raw = cfg_use.get(
                 "he_thread_policy",
                 cfg_use.get(
@@ -5250,7 +5368,7 @@ def _estimate_rrblup_lambda_subsample_reml(
     he_diag["he_reject_reason"] = ",".join(he_reject_reasons)
     if lambda_auto_strategy in {"he_first", "he_only"}:
         if he_ok:
-            return _merge_he_diag(
+            return _normalize_lambda_payload(_merge_he_diag(
                 {
                     "lambda_equation": float(he_lam_eq_raw),
                     "lambda_k": float(he_lam_k_raw) if np.isfinite(he_lam_k_raw) else float("nan"),
@@ -5263,10 +5381,11 @@ def _estimate_rrblup_lambda_subsample_reml(
                     "vc_sigma_g2": float(he_sigma_g2),
                     "vc_sigma_e2": float(he_sigma_e2),
                     "vc_pve": float(he_diag.get("h2", np.nan)),
+                    "m_effective_vc": int(max(1, he_m_eff if he_m_eff > 0 else int(m_effective))),
                 }
-            )
+            ))
         if lambda_auto_strategy == "he_only":
-            return _merge_he_diag(
+            return _normalize_lambda_payload(_merge_he_diag(
                 {
                     "lambda_equation": float("nan"),
                     "lambda_k": float("nan"),
@@ -5279,8 +5398,9 @@ def _estimate_rrblup_lambda_subsample_reml(
                     "vc_sigma_g2": float(he_sigma_g2),
                     "vc_sigma_e2": float(he_sigma_e2),
                     "vc_pve": float(he_diag.get("h2", np.nan)),
+                    "m_effective_vc": int(max(1, he_m_eff if he_m_eff > 0 else int(m_effective))),
                 }
-            )
+            ))
 
     def _method_payload(
         *,
@@ -5294,22 +5414,27 @@ def _estimate_rrblup_lambda_subsample_reml(
         vc_sigma_g2: float,
         vc_sigma_e2: float,
         vc_pve: float,
+        m_effective_vc: int | None = None,
     ) -> dict[str, typing.Any]:
-        return _merge_he_diag(
-            {
-                "lambda_equation": float(lambda_equation),
-                "lambda_k": float(lambda_k),
-                "n_sub": int(n_sub_used),
-                "repeats": int(repeats_used),
-                "ok_repeats": int(ok_repeats_used),
-                "m_effective": int(m_effective),
-                "strategy": str(strategy),
-                "vc_method": str(vc_method),
-                "vc_sigma_g2": float(vc_sigma_g2),
-                "vc_sigma_e2": float(vc_sigma_e2),
-                "vc_pve": float(vc_pve),
-            }
-        )
+        payload = {
+            "lambda_equation": float(lambda_equation),
+            "lambda_k": float(lambda_k),
+            "n_sub": int(n_sub_used),
+            "repeats": int(repeats_used),
+            "ok_repeats": int(ok_repeats_used),
+            "m_effective": int(m_effective),
+            "m_effective_rrblup": int(m_effective),
+            "strategy": str(strategy),
+            "vc_method": str(vc_method),
+            "vc_sigma_g2": float(vc_sigma_g2),
+            "vc_sigma_e2": float(vc_sigma_e2),
+            "vc_pve": float(vc_pve),
+        }
+        if m_effective_vc is not None and int(m_effective_vc) > 0:
+            payload["m_effective_vc"] = int(m_effective_vc)
+        elif np.isfinite(float(lambda_k)) and float(lambda_k) >= 0.0:
+            payload["m_effective_vc"] = int(m_effective)
+        return _normalize_lambda_payload(_merge_he_diag(payload))
 
     gblup_g_eps = float(max(0.0, float(np.finfo(np.float64).eps)))
     gblup_reml_low = float(cfg_use.get("gblup_reml_low", -6.0))
@@ -5472,7 +5597,15 @@ def _estimate_rrblup_lambda_subsample_reml(
             "sigma_g2": float(sigma_g2),
             "sigma_e2": float(sigma_e2),
             "pve": float(pve),
+            "m_effective_vc": int(_m_eff) if int(_m_eff) > 0 else int(m_effective),
         }
+        if int(fit["m_effective_vc"]) > 0 and np.isfinite(lam_sub_k) and lam_sub_k > 0.0:
+            fit["lambda_eq"] = float(
+                _rrblup_lambda_k_to_equation(
+                    lambda_k=float(lam_sub_k),
+                    m_effective=int(fit["m_effective_vc"]),
+                )
+            )
         return fit, str(evd_backend)
 
     def _fit_once_grm(local_idx: np.ndarray) -> dict[str, float]:
@@ -5506,6 +5639,7 @@ def _estimate_rrblup_lambda_subsample_reml(
             "sigma_g2": float(fit_sub.get("sigma_g2", np.nan)),
             "sigma_e2": float(fit_sub.get("sigma_e2", np.nan)),
             "pve": float(fit_sub.get("pve", np.nan)),
+            "m_effective_vc": int(m_effective),
         }
 
     def _recover_lambda_from_model(model: typing.Any) -> tuple[float, float, float]:
@@ -5570,6 +5704,7 @@ def _estimate_rrblup_lambda_subsample_reml(
             "sigma_g2": float(sigma_g2),
             "sigma_e2": float(sigma_e2),
             "pve": float(getattr(model, "pve", np.nan)),
+            "m_effective_vc": int(m_effective),
         }
 
     large_cutoff = int(max(2, int(cfg_use.get("lambda_large_cutoff", 15_000))))
@@ -5615,6 +5750,7 @@ def _estimate_rrblup_lambda_subsample_reml(
                 vc_sigma_g2=float(fit_one["sigma_g2"]),
                 vc_sigma_e2=float(fit_one["sigma_e2"]),
                 vc_pve=float(fit_one["pve"]),
+                m_effective_vc=int(fit_one.get("m_effective_vc", m_effective)),
             )
 
     # 2) FaST+REML (many-sample + few-SNP bucket under 15k threshold)
@@ -5654,6 +5790,7 @@ def _estimate_rrblup_lambda_subsample_reml(
                 vc_sigma_g2=float(fit_fast["sigma_g2"]),
                 vc_sigma_e2=float(fit_fast["sigma_e2"]),
                 vc_pve=float(fit_fast["pve"]),
+                m_effective_vc=int(fit_fast.get("m_effective_vc", m_effective)),
             )
 
     # 3) Subsample REML (many-sample + many-SNP)
@@ -5734,6 +5871,7 @@ def _estimate_rrblup_lambda_subsample_reml(
                 vc_sigma_g2=float(he_diag.get("sigma_g2", np.nan)),
                 vc_sigma_e2=float(he_diag.get("sigma_e2", np.nan)),
                 vc_pve=float(he_diag.get("h2", np.nan)),
+                m_effective_vc=int(he_diag.get("m_effective_vc", he_diag.get("m_effective", m_effective))),
             )
         return _method_payload(
             lambda_equation=float("nan"),
@@ -5784,6 +5922,7 @@ def _estimate_rrblup_lambda_subsample_reml(
         vc_sigma_g2=float(vc_sigma_g2),
         vc_sigma_e2=float(vc_sigma_e2),
         vc_pve=float(vc_pve),
+        m_effective_vc=int(m_effective),
     )
 
 
@@ -8400,7 +8539,12 @@ def GSapi(
                             **dict(payload),
                         ),
                     )
-                    lam_auto = float(lambda_auto_info.get("lambda_equation", np.nan))
+                    lam_auto = float(
+                        lambda_auto_info.get(
+                            "lambda_equation_rrblup",
+                            lambda_auto_info.get("lambda_equation", np.nan),
+                        )
+                    )
                     lam_auto_strategy = (
                         str(lambda_auto_info.get("strategy", "lambda_auto")).strip() or "lambda_auto"
                     )
@@ -8449,6 +8593,34 @@ def GSapi(
                     raise ValueError(
                         f"rrBLUP PCG std_eps must be finite and > 0, got {pcg_std_eps!r}."
                     )
+                pcg_m_effective_rrblup = int(
+                    max(
+                        1,
+                        _rrblup_m_effective_from_maf(
+                            maf_arg,
+                            float(pcg_std_eps),
+                        ),
+                    )
+                )
+                if lambda_auto_info is not None:
+                    lambda_auto_info["m_effective_rrblup"] = int(pcg_m_effective_rrblup)
+                    (
+                        lambda_k_vc_now,
+                        _m_rr,
+                        _m_vc,
+                        lambda_eq_rrblup_now,
+                        _lambda_eq_vc_now,
+                    ) = _rrblup_lambda_auto_vc_terms(lambda_auto_info)
+                    if np.isfinite(lambda_k_vc_now):
+                        lambda_auto_info["lambda_k_vc"] = float(lambda_k_vc_now)
+                    if np.isfinite(lambda_eq_rrblup_now) and lambda_eq_rrblup_now >= 0.0:
+                        lambda_auto_info["lambda_equation_rrblup"] = float(lambda_eq_rrblup_now)
+                        lambda_equation = float(lambda_eq_rrblup_now)
+                        lambda_raw = _rrblup_lambda_equation_to_raw(
+                            lambda_equation=float(lambda_equation),
+                            lambda_scale=lambda_scale,
+                            n_train=int(n_train_local),
+                        )
                 pve_mode = str(rr_cfg.get("pve_mode", "lambda")).strip().lower()
                 if pve_mode not in {"lambda", "trainvar"}:
                     pve_mode = "lambda"
@@ -8751,6 +8923,24 @@ def GSapi(
                     else float(pve_lambda_formula)
                 )
                 pve = float(pve_lambda if pve_mode == "lambda" else float(pve_trainvar))
+                pve_vc = float("nan")
+                lambda_reml_vc = float("nan")
+                vc_sigma_g2 = float("nan")
+                vc_sigma_e2 = float("nan")
+                if lambda_auto_info is not None:
+                    pve_vc = float(lambda_auto_info.get("vc_pve", np.nan))
+                    lambda_reml_vc = float(lambda_auto_info.get("lambda_k", np.nan))
+                    vc_sigma_g2 = float(lambda_auto_info.get("vc_sigma_g2", np.nan))
+                    vc_sigma_e2 = float(lambda_auto_info.get("vc_sigma_e2", np.nan))
+                if (not np.isfinite(lambda_reml_vc)) and np.isfinite(vc_sigma_g2) and np.isfinite(vc_sigma_e2) and (vc_sigma_g2 > 0.0):
+                    lambda_reml_vc = float(vc_sigma_e2 / vc_sigma_g2)
+                if (not np.isfinite(lambda_reml_vc)) and np.isfinite(float(lambda_equation)) and (m_eff > 0):
+                    lambda_reml_vc = float(float(lambda_equation) / float(m_eff))
+                pve_trainvar_report = float(pve_trainvar)
+                if (not np.isfinite(pve_trainvar_report)) and np.isfinite(pve_vc):
+                    pve_trainvar_report = float(pve_vc)
+                if np.isfinite(pve_vc):
+                    pve = float(pve_vc)
 
                 _set_rrblup_solver_state("pcg")
                 if rrblup_runtime_state is not None:
@@ -8759,11 +8949,25 @@ def GSapi(
                     rrblup_runtime_state["pcg_rel_res"] = float(pcg_rel_res)
                     rrblup_runtime_state["pcg_rel_res_trace"] = [dict(x) for x in pcg_rel_res_trace]
                     rrblup_runtime_state["m_effective"] = int(m_eff)
+                    rrblup_runtime_state["m_effective_rrblup"] = int(m_eff)
                     rrblup_runtime_state["thread_policy"] = str(pcg_thread_spec["policy"])
                     rrblup_runtime_state["stage_blas_threads"] = int(pcg_thread_spec["blas_threads"])
                     rrblup_runtime_state["stage_rayon_threads"] = int(pcg_thread_spec["rayon_threads"])
                     rrblup_runtime_state["pcg_threads_arg"] = int(pcg_thread_spec["pcg_threads"])
                     rrblup_runtime_state["lambda_equation"] = float(lambda_equation)
+                    if lambda_auto_info is not None:
+                        rrblup_runtime_state["lambda_equation_rrblup"] = float(
+                            lambda_auto_info.get("lambda_equation_rrblup", np.nan)
+                        )
+                        rrblup_runtime_state["lambda_equation_vc"] = float(
+                            lambda_auto_info.get("lambda_equation_vc", np.nan)
+                        )
+                        rrblup_runtime_state["lambda_k_vc"] = float(
+                            lambda_auto_info.get("lambda_k_vc", np.nan)
+                        )
+                        rrblup_runtime_state["m_effective_vc"] = int(
+                            lambda_auto_info.get("m_effective_vc", 0)
+                        )
                     rrblup_runtime_state["selected_lambda"] = float(lambda_raw)
                     rrblup_runtime_state["lambda_source"] = str(lambda_source)
                     rrblup_runtime_state["lambda_auto_enabled"] = bool(lambda_auto_enabled)
@@ -8783,7 +8987,38 @@ def GSapi(
                     rrblup_runtime_state["pve_lambda"] = float(pve_lambda)
                     rrblup_runtime_state["pve_lambda_formula"] = float(pve_lambda_formula)
                     rrblup_runtime_state["pve_lambda_trace"] = float(pve_lambda_trace)
-                    rrblup_runtime_state["pve_trainvar"] = float(pve_trainvar)
+                    rrblup_runtime_state["pve_trainvar"] = float(pve_trainvar_report)
+                    if np.isfinite(pve_vc):
+                        rrblup_runtime_state["pve_vc"] = float(pve_vc)
+                    else:
+                        rrblup_runtime_state.pop("pve_vc", None)
+                    if np.isfinite(lambda_reml_vc):
+                        rrblup_runtime_state["lambda_reml"] = float(lambda_reml_vc)
+                    else:
+                        rrblup_runtime_state.pop("lambda_reml", None)
+                    if np.isfinite(vc_sigma_g2):
+                        rrblup_runtime_state["sigma_g2"] = float(vc_sigma_g2)
+                    else:
+                        rrblup_runtime_state.pop("sigma_g2", None)
+                    if np.isfinite(vc_sigma_e2):
+                        rrblup_runtime_state["sigma_e2"] = float(vc_sigma_e2)
+                        rrblup_runtime_state["ve"] = float(vc_sigma_e2)
+                    else:
+                        rrblup_runtime_state.pop("sigma_e2", None)
+                        rrblup_runtime_state.pop("ve", None)
+                    if np.isfinite(pve_vc) and np.isfinite(vc_sigma_e2) and (0.0 <= float(pve_vc) < 1.0):
+                        var_g_vc = float(
+                            float(vc_sigma_e2)
+                            * (
+                                float(pve_vc)
+                                / max(np.finfo(np.float64).eps, 1.0 - float(pve_vc))
+                            )
+                        )
+                        rrblup_runtime_state["var_g"] = float(var_g_vc)
+                        rrblup_runtime_state["va"] = float(var_g_vc)
+                    else:
+                        rrblup_runtime_state.pop("var_g", None)
+                        rrblup_runtime_state.pop("va", None)
                     rrblup_runtime_state["k_trace_mean"] = float(k_trace_mean)
                 if model_state is not None and beta_export is not None:
                     row_mean_pc, row_inv_pc = _ensure_packed_standard_stats_cached(packed_train)
@@ -11354,6 +11589,9 @@ def _run_method_task(
                     pve_used_f = _float_or_nan(pve)
                     pve_trainvar_f = _float_or_nan(rr_state_call.get("pve_trainvar", np.nan))
                     pve_lambda_f = _float_or_nan(rr_state_call.get("pve_lambda", np.nan))
+                    pve_vc_f = _float_or_nan(
+                        rr_state_call.get("pve_vc", rr_state_call.get("pve_used", np.nan))
+                    )
                     if (not np.isfinite(pve_trainvar_f)) and rr_cfg_mode == "trainvar":
                         pve_trainvar_f = pve_used_f
                     if (not np.isfinite(pve_lambda_f)) and rr_cfg_mode == "lambda":
@@ -11393,6 +11631,7 @@ def _run_method_task(
                             "pve_used": pve_used_f,
                             "pve_trainvar": pve_trainvar_f,
                             "pve_lambda": pve_lambda_f,
+                            "pve_vc": pve_vc_f,
                             "pve_exact": _float_or_nan(rr_state_call.get("pve_exact", np.nan)),
                             "va": float(va_f),
                             "ve": float(ve_f),
@@ -11714,6 +11953,10 @@ def _run_method_task(
                 [float(x.get("ve", np.nan)) for x in rrblup_pve_rows],
                 dtype=np.float64,
             )
+            pv = np.asarray(
+                [float(x.get("pve_vc", np.nan)) for x in rrblup_pve_rows],
+                dtype=np.float64,
+            )
             itv = np.asarray(
                 [float(x.get("iter_like", np.nan)) for x in rrblup_pve_rows],
                 dtype=np.float64,
@@ -11744,6 +11987,9 @@ def _run_method_task(
                 ),
                 "pve_lambda": (
                     float(np.nanmean(lv)) if int(lv.size) > 0 and np.any(np.isfinite(lv)) else float("nan")
+                ),
+                "pve_vc": (
+                    float(np.nanmean(pv)) if int(pv.size) > 0 and np.any(np.isfinite(pv)) else float("nan")
                 ),
                 "va": (
                     float(np.nanmean(vv)) if int(vv.size) > 0 and np.any(np.isfinite(vv)) else float("nan")
@@ -12098,6 +12344,9 @@ def _run_method_task(
             pve_used_f = _float_or_nan(pve_final)
             pve_trainvar_f = _float_or_nan(rr_state_final.get("pve_trainvar", np.nan))
             pve_lambda_f = _float_or_nan(rr_state_final.get("pve_lambda", np.nan))
+            pve_vc_f = _float_or_nan(
+                rr_state_final.get("pve_vc", rr_state_final.get("pve_used", np.nan))
+            )
             if (not np.isfinite(pve_trainvar_f)) and mode_used == "trainvar":
                 pve_trainvar_f = pve_used_f
             if (not np.isfinite(pve_lambda_f)) and mode_used == "lambda":
@@ -12123,6 +12372,7 @@ def _run_method_task(
                 "pve_used": pve_used_f,
                 "pve_trainvar": pve_trainvar_f,
                 "pve_lambda": pve_lambda_f,
+                "pve_vc": pve_vc_f,
                 "pve_exact": _float_or_nan(rr_state_final.get("pve_exact", np.nan)),
                 "va": float(va_final),
                 "ve": float(ve_final),
@@ -12801,8 +13051,17 @@ def _run_methods_parallel(
                 )
                 pve_vc = float(
                     rr_pve_final.get(
-                        "pve_trainvar",
-                        rr_state.get("lambda_vc_pve", np.nan),
+                        "pve_vc",
+                        rr_pve_final.get(
+                            "pve_used",
+                            rr_pve_final.get(
+                                "pve_trainvar",
+                                rr_state.get(
+                                    "pve_vc",
+                                    rr_state.get("lambda_vc_pve", np.nan),
+                                ),
+                            ),
+                        ),
                     )
                 )
                 if not np.isfinite(pve_vc):
@@ -20467,8 +20726,17 @@ def _run_gs_pipeline(
                         )
                         pve_vc = _detail_float_or_nan(
                             rr_pve_final.get(
-                                "pve_trainvar",
-                                rr_state.get("lambda_vc_pve", rr_state.get("pve_used", np.nan)),
+                                "pve_vc",
+                                rr_pve_final.get(
+                                    "pve_used",
+                                    rr_pve_final.get(
+                                        "pve_trainvar",
+                                        rr_state.get(
+                                            "pve_vc",
+                                            rr_state.get("lambda_vc_pve", rr_state.get("pve_used", np.nan)),
+                                        ),
+                                    ),
+                                ),
                             )
                         )
                         if np.isfinite(va):

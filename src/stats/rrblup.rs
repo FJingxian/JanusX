@@ -93,6 +93,16 @@ fn xtmul_col_chunk(cols: usize, threads: usize) -> usize {
 }
 
 #[inline]
+fn xtmul_prefers_col_chunk_shape(rows: usize, cols: usize) -> bool {
+    // In GS rrBLUP-PCG, `rows` is the decoded SNP-block height and `cols` is the
+    // train-sample width. The memory planner already chooses a near-optimal
+    // block height, so auto strategy should track block aspect ratio instead of
+    // hard-coded absolute thresholds. Once the row-major block is wide enough,
+    // column chunking avoids the extra reduction pass in RowReduce.
+    cols >= 32_768 && cols >= rows.saturating_mul(8)
+}
+
+#[inline]
 fn xtmul_forced_strategy() -> Option<XtMulKernelStrategy> {
     static OVERRIDE: OnceLock<Option<XtMulKernelStrategy>> = OnceLock::new();
     *OVERRIDE.get_or_init(|| {
@@ -121,11 +131,7 @@ fn choose_xtmul_kernel_strategy(
     if !prefer_parallel {
         return XtMulKernelStrategy::Blas;
     }
-    // `rows` here is the decoded SNP block height, not the sample count. In
-    // the GS PCG BED path large folds often show up as "short and wide" row-
-    // major blocks, where the column-chunk kernel avoids the extra reduction
-    // overhead of RowReduce and has proven faster in benchmarked CV runs.
-    if cols >= 65_536 && rows <= 4_096 {
+    if xtmul_prefers_col_chunk_shape(rows, cols) {
         return XtMulKernelStrategy::ColChunk;
     }
     XtMulKernelStrategy::RowReduce
@@ -4055,7 +4061,7 @@ mod tests {
                 rows: 1_024,
                 cols: 32_768,
                 threads: 16,
-                expect: XtMulKernelStrategy::RowReduce,
+                expect: XtMulKernelStrategy::ColChunk,
             },
         ];
 

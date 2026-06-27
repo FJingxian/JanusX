@@ -1760,6 +1760,21 @@ fn build_rrblup_exact_snp_cache_from_packed(
     )
 }
 
+#[inline]
+fn rrblup_exact_predict_block_rows(
+    m: usize,
+    sample_block: usize,
+    n_out: usize,
+    stream_row_block: usize,
+) -> usize {
+    let m_use = m.max(1);
+    let n_out_use = n_out.max(1);
+    let max_rows = 1024usize.min(stream_row_block.max(1)).min(m_use);
+    let budget_cells = m_use.saturating_mul(sample_block.max(1));
+    let budget_rows = budget_cells / n_out_use;
+    budget_rows.max(1).min(max_rows)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn fit_rrblup_exact_snp_from_cache_source(
     cache: &RrblupExactSnpPreparedInner,
@@ -2008,7 +2023,6 @@ fn fit_rrblup_exact_snp_from_cache_source(
         .unwrap_or(0.0_f64);
     let beta_f32: Vec<f32> = beta_f64.iter().map(|&v| v as f32).collect();
     drop(beta_f64);
-    let pred_block_rows = 1024usize.min(cache.m.max(1));
     let var_g = if cache.n_train > 1 {
         g_center_ss / ((cache.n_train - 1) as f64)
     } else {
@@ -2032,6 +2046,12 @@ fn fit_rrblup_exact_snp_from_cache_source(
         } else {
             let train_pred_abs: Vec<usize> =
                 local_idx.iter().map(|&i| cache.train_idx[i]).collect();
+            let pred_block_rows = rrblup_exact_predict_block_rows(
+                cache.m,
+                cache.sample_block,
+                train_pred_abs.len(),
+                cache.stream_row_block,
+            );
             let mut pred_source = build_rrblup_source(
                 resident_packed_flat,
                 bytes_per_snp,
@@ -2060,6 +2080,12 @@ fn fit_rrblup_exact_snp_from_cache_source(
                 .collect()
         }
     } else {
+        let pred_block_rows = rrblup_exact_predict_block_rows(
+            cache.m,
+            cache.sample_block,
+            cache.train_idx.len(),
+            cache.stream_row_block,
+        );
         let mut pred_source = build_rrblup_source(
             resident_packed_flat,
             bytes_per_snp,
@@ -2098,6 +2124,12 @@ fn fit_rrblup_exact_snp_from_cache_source(
         None
     };
     if !test_idx.is_empty() {
+        let pred_block_rows = rrblup_exact_predict_block_rows(
+            cache.m,
+            cache.sample_block,
+            test_idx.len(),
+            cache.stream_row_block,
+        );
         let mut pred_test_source = build_rrblup_source(
             resident_packed_flat,
             bytes_per_snp,

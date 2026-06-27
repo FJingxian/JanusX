@@ -696,8 +696,9 @@ fn build_row_standardization_stats_from_source(
 ) -> Result<RowStdStats, String> {
     let m = row_flip.len();
     if row_maf.len() != m {
-        return Err("build_row_standardization_stats_from_source: row metadata length mismatch"
-            .to_string());
+        return Err(
+            "build_row_standardization_stats_from_source: row metadata length mismatch".to_string(),
+        );
     }
     if let Some(row_idx) = row_source_indices {
         if row_idx.len() != m {
@@ -713,11 +714,15 @@ fn build_row_standardization_stats_from_source(
             );
         }
     } else if source.total_rows() < m {
-        return Err("build_row_standardization_stats_from_source: source has fewer rows than row metadata"
-            .to_string());
+        return Err(
+            "build_row_standardization_stats_from_source: source has fewer rows than row metadata"
+                .to_string(),
+        );
     } else if matches!(source, HeGrmSource::Resident { .. }) && source.total_rows() != m {
-        return Err("build_row_standardization_stats_from_source: resident packed row count mismatch"
-            .to_string());
+        return Err(
+            "build_row_standardization_stats_from_source: resident packed row count mismatch"
+                .to_string(),
+        );
     }
 
     let row_step = block_rows.max(1).min(m.max(1));
@@ -737,20 +742,22 @@ fn build_row_standardization_stats_from_source(
         let ed = (st + row_step).min(m);
         let cur_rows = ed - st;
         let chunk = match source {
-            HeGrmSource::Resident { packed_flat, .. } => build_row_standardization_stats_with_options(
-                packed_flat,
-                bytes_per_snp,
-                &row_flip[st..ed],
-                &row_maf[st..ed],
-                sample_idx,
-                row_source_indices.map(|idx| &idx[st..ed]),
-                std_eps32,
-                use_train_maf,
-                compute_sample_diag,
-                pool,
-                None::<&mut fn(usize, usize) -> Result<(), String>>,
-                0,
-            )?,
+            HeGrmSource::Resident { packed_flat, .. } => {
+                build_row_standardization_stats_with_options(
+                    packed_flat,
+                    bytes_per_snp,
+                    &row_flip[st..ed],
+                    &row_maf[st..ed],
+                    sample_idx,
+                    row_source_indices.map(|idx| &idx[st..ed]),
+                    std_eps32,
+                    use_train_maf,
+                    compute_sample_diag,
+                    pool,
+                    None::<&mut fn(usize, usize) -> Result<(), String>>,
+                    0,
+                )?
+            }
             HeGrmSource::Windowed { matrix, .. } => {
                 let source_rows = if let Some(idx) = row_source_indices {
                     &idx[st..ed]
@@ -1207,8 +1214,7 @@ fn apply_grm_to_mat_f32_with_workspace_from_source(
     let n_out = sample_idx.len();
     if row_mean.len() != m || row_inv_sd.len() != m {
         return Err(
-            "apply_grm_to_mat_f32_with_workspace_from_source row stats length mismatch"
-                .to_string(),
+            "apply_grm_to_mat_f32_with_workspace_from_source row stats length mismatch".to_string(),
         );
     }
     if let Some(row_idx) = row_source_indices {
@@ -1226,8 +1232,7 @@ fn apply_grm_to_mat_f32_with_workspace_from_source(
         }
     } else if source.total_rows() < m {
         return Err(
-            "apply_grm_to_mat_f32_with_workspace_from_source source row count mismatch"
-                .to_string(),
+            "apply_grm_to_mat_f32_with_workspace_from_source source row count mismatch".to_string(),
         );
     } else if matches!(source, HeGrmSource::Resident { .. }) && source.total_rows() != m {
         return Err(
@@ -2314,9 +2319,7 @@ pub fn he_pcg_bed<'py>(
         }
 
         let maf_ro = maf.as_ref().ok_or_else(|| {
-            PyRuntimeError::new_err(
-                "he_pcg_bed: metadata streaming path requires `maf` argument.",
-            )
+            PyRuntimeError::new_err("he_pcg_bed: metadata streaming path requires `maf` argument.")
         })?;
         let row_flip_ro = row_flip.as_ref().ok_or_else(|| {
             PyRuntimeError::new_err(
@@ -2403,7 +2406,14 @@ pub fn he_pcg_bed<'py>(
             .readonly()
             .as_slice()
             .map(|s| s.to_vec())
-            .unwrap_or_else(|_| row_flip_full_arr.readonly().as_array().iter().copied().collect());
+            .unwrap_or_else(|_| {
+                row_flip_full_arr
+                    .readonly()
+                    .as_array()
+                    .iter()
+                    .copied()
+                    .collect()
+            });
 
         eff_m = m_total;
         if let Some(mask) = site_keep {
@@ -2522,9 +2532,7 @@ pub fn he_pcg_bed<'py>(
             .take()
             .expect("stream row source indices must exist");
         let maf_keep = stream_maf.take().expect("stream maf must exist");
-        let row_flip_keep = stream_row_flip
-            .take()
-            .expect("stream row_flip must exist");
+        let row_flip_keep = stream_row_flip.take().expect("stream row_flip must exist");
         py.detach(move || {
             let blas_threads_effective = if blas_threads > 0 {
                 blas_threads.max(1)
@@ -2570,9 +2578,7 @@ pub fn he_pcg_bed<'py>(
             Ok(s) => Cow::Borrowed(s),
             Err(_) => Cow::Owned(packed_view.iter().copied().collect()),
         };
-        let maf_keep = resident_maf_full
-            .take()
-            .expect("maf metadata must exist");
+        let maf_keep = resident_maf_full.take().expect("maf metadata must exist");
         let row_flip_keep = resident_row_flip_full
             .take()
             .expect("row_flip metadata must exist");

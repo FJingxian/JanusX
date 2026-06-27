@@ -1255,7 +1255,11 @@ fn sample_var_f64(v: &[f64], pool: Option<&Arc<rayon::ThreadPool>>) -> f64 {
     let use_parallel = pool.is_some() && n >= RRBLUP_PAR_VEC_THRESHOLD;
     let mean = if use_parallel {
         let run = || v.par_iter().copied().sum::<f64>() / (n as f64);
-        if let Some(tp) = pool { tp.install(run) } else { run() }
+        if let Some(tp) = pool {
+            tp.install(run)
+        } else {
+            run()
+        }
     } else {
         v.iter().sum::<f64>() / (n as f64)
     };
@@ -1268,7 +1272,11 @@ fn sample_var_f64(v: &[f64], pool: Option<&Arc<rayon::ThreadPool>>) -> f64 {
                 })
                 .sum::<f64>()
         };
-        if let Some(tp) = pool { tp.install(run) } else { run() }
+        if let Some(tp) = pool {
+            tp.install(run)
+        } else {
+            run()
+        }
     } else {
         let mut ss_local = 0.0_f64;
         for &x in v {
@@ -1521,8 +1529,8 @@ fn build_rrblup_exact_snp_cache_from_source(
         1usize
     };
     let _blas_guard = OpenBlasThreadGuard::enter(blas_threads_effective);
-    let use_chunked_stream_decode = matches!(source, RrblupPcgSource::Windowed { .. })
-        && stream_row_block < eff_m;
+    let use_chunked_stream_decode =
+        matches!(source, RrblupPcgSource::Windowed { .. }) && stream_row_block < eff_m;
 
     for cst in (0..n_train).step_by(sample_block_use.max(1)) {
         let ced = (cst + sample_block_use).min(n_train);
@@ -1609,6 +1617,9 @@ fn build_rrblup_exact_snp_cache_from_source(
         }
         check_ctrlc()?;
     }
+    drop(source);
+    drop(block_f32);
+    drop(block_f64);
 
     let t_center = if stage_timing {
         Some(Instant::now())
@@ -1617,6 +1628,7 @@ fn build_rrblup_exact_snp_cache_from_source(
     };
     let center_scale = 1.0_f64 / (n_train as f64);
     symmetrize_upper_minus_rank1_in_place(&mut a_star, eff_m, &row_sum, center_scale);
+    drop(row_sum);
     let center_secs = t_center
         .map(|t0| t0.elapsed().as_secs_f64())
         .unwrap_or(0.0_f64);
@@ -1625,7 +1637,8 @@ fn build_rrblup_exact_snp_cache_from_source(
     } else {
         None
     };
-    let (evals_all, evecs_all, eig_backend) = symmetric_eigh_f64_row_major(&a_star, eff_m)?;
+    let (evals_all, mut evecs, eig_backend) = symmetric_eigh_f64_row_major(&a_star, eff_m)?;
+    drop(a_star);
     let eigh_secs = t_eigh
         .map(|t0| t0.elapsed().as_secs_f64())
         .unwrap_or(0.0_f64);
@@ -1651,11 +1664,14 @@ fn build_rrblup_exact_snp_cache_from_source(
     } else {
         None
     };
-    let mut evecs = vec![0.0_f64; eff_m * rank];
-    for i in 0..eff_m {
-        let src = &evecs_all[i * eff_m + keep_start..i * eff_m + eff_m];
-        let dst = &mut evecs[i * rank..(i + 1) * rank];
-        dst.copy_from_slice(src);
+    if rank < eff_m || keep_start > 0 {
+        for i in 0..eff_m {
+            let src_start = i * eff_m + keep_start;
+            let src_end = i * eff_m + eff_m;
+            let dst_start = i * rank;
+            evecs.copy_within(src_start..src_end, dst_start);
+        }
+        evecs.truncate(eff_m * rank);
     }
     let basis_secs = t_basis
         .map(|t0| t0.elapsed().as_secs_f64())
@@ -1872,6 +1888,10 @@ fn fit_rrblup_exact_snp_from_cache_source(
         }
         check_ctrlc()?;
     }
+    drop(source);
+    drop(block_f32);
+    drop(tmp_dot);
+    drop(y_center_f32);
 
     let blas_threads_effective = if blas_threads > 0 {
         blas_threads.max(1)
@@ -1903,6 +1923,7 @@ fn fit_rrblup_exact_snp_from_cache_source(
             1 as CblasInt,
         );
     }
+    drop(z);
     let mut y_proj = vec![0.0_f64; cache.rank];
     for k in 0..cache.rank {
         y_proj[k] = coeff[k] / cache.eigvals[k].sqrt();
@@ -1986,6 +2007,7 @@ fn fit_rrblup_exact_snp_from_cache_source(
         .map(|t0| t0.elapsed().as_secs_f64())
         .unwrap_or(0.0_f64);
     let beta_f32: Vec<f32> = beta_f64.iter().map(|&v| v as f32).collect();
+    drop(beta_f64);
     let pred_block_rows = 1024usize.min(cache.m.max(1));
     let var_g = if cache.n_train > 1 {
         g_center_ss / ((cache.n_train - 1) as f64)
@@ -2548,6 +2570,7 @@ pub fn rrblup_exact_snp_fit_prepared<'py>(
     maf,
     row_flip,
     sample_block=2048,
+    stream_row_block=2048,
     std_eps=1e-12_f64,
     threads=0,
     blas_threads=0
@@ -2560,6 +2583,7 @@ pub fn rrblup_exact_snp_prepare_bed_from_meta<'py>(
     maf: PyReadonlyArray1<'py, f32>,
     row_flip: PyReadonlyArray1<'py, bool>,
     sample_block: usize,
+    stream_row_block: usize,
     std_eps: f64,
     threads: usize,
     blas_threads: usize,
@@ -2592,11 +2616,9 @@ pub fn rrblup_exact_snp_prepare_bed_from_meta<'py>(
             "rrblup_exact_snp_prepare_bed_from_meta requires at least two training samples.",
         ));
     }
-    let row_source_idx = parse_nonnegative_index_vec_i64(
-        row_source_indices.as_slice()?,
-        "row_source_indices",
-    )
-    .map_err(PyRuntimeError::new_err)?;
+    let row_source_idx =
+        parse_nonnegative_index_vec_i64(row_source_indices.as_slice()?, "row_source_indices")
+            .map_err(PyRuntimeError::new_err)?;
     let eff_m = row_source_idx.len();
     if eff_m == 0 {
         return Err(PyRuntimeError::new_err(
@@ -2651,7 +2673,7 @@ pub fn rrblup_exact_snp_prepare_bed_from_meta<'py>(
     }
     let bytes_per_snp = n_samples.div_ceil(4);
     let sample_block_use = sample_block.max(1).min(train_idx.len().max(1));
-    let stream_row_block = sample_block_use.max(1).min(eff_m.max(1));
+    let stream_row_block_use = stream_row_block.max(1).min(eff_m.max(1));
     let cache_inner = py
         .detach(move || {
             let source = build_rrblup_source(
@@ -2659,7 +2681,7 @@ pub fn rrblup_exact_snp_prepare_bed_from_meta<'py>(
                 bytes_per_snp,
                 source_prefix.as_str(),
                 n_samples,
-                stream_row_block,
+                stream_row_block_use,
             )?;
             build_rrblup_exact_snp_cache_from_source(
                 source,
@@ -2670,7 +2692,7 @@ pub fn rrblup_exact_snp_prepare_bed_from_meta<'py>(
                 row_inv_sd,
                 packed_row_indices,
                 sample_block_use,
-                stream_row_block,
+                stream_row_block_use,
                 m_effective,
                 threads,
                 blas_threads,

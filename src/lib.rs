@@ -95,14 +95,14 @@ mod breader;
 mod gfcore;
 #[path = "io/gfreader.rs"]
 mod gfreader;
-#[path = "io/gwriter.rs"]
-mod gwriter;
 #[path = "io/gload.rs"]
 mod gload;
 #[path = "io/gmerge.rs"]
 mod gmerge;
 #[path = "io/gwasio.rs"]
 mod gwasio;
+#[path = "io/gwriter.rs"]
+mod gwriter;
 #[path = "kmer/mod.rs"]
 pub mod kmer;
 #[path = "io/pipeline.rs"]
@@ -213,22 +213,20 @@ use garfield::{
 };
 use gblup::{
     farmcpu_q_packed_grm_pca_f32, gblup_effect_from_meta_stream, gblup_grm_from_meta_to_npy,
-    gblup_reml_npy_grm,
-    gblup_reml_packed_bed, packed_mtm_f64,
+    gblup_reml_npy_grm, gblup_reml_packed_bed, packed_mtm_f64,
 };
 use gfreader::{
     bed_filter_stream_to_plink_rust, bed_filter_to_plink_rust, bed_mmap_filter_to_plink_rust,
     count_hmp_snps, count_vcf_snps, gfd_packbits_from_dosage_block, load_bed_2bit_packed,
     load_bed_u8_matrix, load_bim_columns, load_site_info, prepare_bed_2bit_packed,
     prepare_bed_logic_meta_selected, scan_bed_2bit_packed_stats, BedChunkReader,
-    BedChunkReaderFromMeta, BedMmapReader, HmpChunkReader, NpyMmapReader, SiteInfo,
-    TxtChunkReader, VcfChunkReader,
+    BedChunkReaderFromMeta, BedMmapReader, HmpChunkReader, NpyMmapReader, SiteInfo, TxtChunkReader,
+    VcfChunkReader,
 };
 use glm::{
     lm_block_assoc_f32, lm_block_assoc_packed, lm_block_assoc_packed_to_tsv,
     lm_stream_bed_segments_compact_to_tsv, lm_stream_bed_to_tsv,
 };
-use gwriter::{HmpStreamWriter, PlinkStreamWriter, VcfStreamWriter};
 use glm2::lm2_stream_bed_to_tsv;
 use gmerge::{convert_genotypes, merge_genotypes, PyConvertStats, PyMergeStats};
 use grm::{
@@ -245,6 +243,7 @@ use gwas_unified::{
     gwas_trait_model_schedule,
 };
 use gwasio::load_gwas_triplet_fast;
+use gwriter::{HmpStreamWriter, PlinkStreamWriter, VcfStreamWriter};
 use he::he_pcg_bed;
 use heritability::{
     prepare_heritability_broad_sparse_cache, prepare_heritability_trait_workflow,
@@ -274,9 +273,9 @@ use reml::{
     ml_loglike_null_f32,
 };
 use rrblup::{
-    rrblup_exact_snp_fit_prepared, rrblup_exact_snp_fit_prepared_bed,
-    rrblup_exact_snp_packed, rrblup_exact_snp_prepare_bed_from_meta,
-    rrblup_exact_snp_prepare_packed, rrblup_pcg_bed, RrblupExactSnpCache,
+    rrblup_exact_snp_fit_prepared, rrblup_exact_snp_fit_prepared_bed, rrblup_exact_snp_packed,
+    rrblup_exact_snp_prepare_bed_from_meta, rrblup_exact_snp_prepare_packed, rrblup_pcg_bed,
+    RrblupExactSnpCache,
 };
 use rsvd::py_rsvd_packed_subset;
 use sim::{sim_trait_accumulate_i8_f32, SimChunkGenerator, SimEngine, SimTraitAccumulator};
@@ -287,9 +286,9 @@ use spgrm::{
 };
 use splmm::{
     splmm_assoc_pcg_bed, splmm_assoc_pcg_bed_to_tsv, splmm_assoc_pcg_dense_f32,
-    splmm_load_sparse_grm_subset_dense,
-    splmm_residualized_approx_null_fit_from_jxgrm, splmm_scan_exact_packed,
-    splmm_scan_grammar_packed, splmm_sparse_grm_diag_stats, splmm_sparse_null_model_debug,
+    splmm_load_sparse_grm_subset_dense, splmm_residualized_approx_null_fit_from_jxgrm,
+    splmm_scan_exact_packed, splmm_scan_grammar_packed, splmm_sparse_grm_diag_stats,
+    splmm_sparse_null_model_debug,
 };
 use spreml::{spreml_sparse_reml_brent_from_jxgrm, spreml_sparse_reml_grid_from_jxgrm};
 use top::{top_fit_model_py, top_rank_to_target_sample_py, top_rank_to_target_values_py};

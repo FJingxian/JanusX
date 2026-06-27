@@ -774,12 +774,7 @@ pub fn gblup_grm_from_meta_to_npy<'py>(
                 threads,
                 mmap_window_mb,
             )?;
-            write_npy_f32_matrix_from_f64(
-                &out_npy_path_owned,
-                grm.as_slice(),
-                n_out,
-                n_out,
-            )?;
+            write_npy_f32_matrix_from_f64(&out_npy_path_owned, grm.as_slice(), n_out, n_out)?;
 
             if progress_every > 0 {
                 progress(eff_m, eff_m.max(1))?;

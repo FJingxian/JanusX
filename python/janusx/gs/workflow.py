@@ -2338,6 +2338,7 @@ _GS_DEBUG_STAGE = _env_truthy("JX_GS_DEBUG_STAGE", "0")
 _GS_AUTO_MEM_GBLUP_BLOCK_ROWS = 4096
 _GS_AUTO_MEM_PCG_BLOCK_ROWS = 4096
 _GS_AUTO_MEM_EXACT_SAMPLE_BLOCK = 2048
+_GS_AUTO_MEM_EXACT_SAMPLE_CELL_BYTES = 12
 _GS_AUTO_MEM_BAYES_BLOCK_ROWS = 2048
 _GS_AUTO_MEM_MIN_GB = 0.125
 _GS_WORKING_BUFFERS_GBLUP = 2
@@ -2506,7 +2507,7 @@ def _resolve_gs_auto_decode_memory_gb(
                         _memory_gb_for_target_decode_shape(
                             m_total,
                             _GS_AUTO_MEM_EXACT_SAMPLE_BLOCK,
-                            elem_bytes=4,
+                            elem_bytes=_GS_AUTO_MEM_EXACT_SAMPLE_CELL_BYTES,
                         ),
                         (
                             f"{method_key}->rrBLUP-exact "
@@ -2542,7 +2543,7 @@ def _resolve_gs_auto_decode_memory_gb(
                     _memory_gb_for_target_decode_shape(
                         m_total,
                         _GS_AUTO_MEM_EXACT_SAMPLE_BLOCK,
-                        elem_bytes=4,
+                        elem_bytes=_GS_AUTO_MEM_EXACT_SAMPLE_CELL_BYTES,
                     ),
                     f"{method_key}->exact sample_block={int(_GS_AUTO_MEM_EXACT_SAMPLE_BLOCK)}",
                 )
@@ -9522,6 +9523,18 @@ def GSapi(
                     )
                 )
                 exact_sample_block = int(min(exact_sample_block, max(1, n_train_expected)))
+                exact_stream_row_block = int(
+                    max(
+                        1,
+                        int(
+                            rr_cfg_shared.get(
+                                "exact_stream_row_block",
+                                min(int(n_snp_local), int(_GS_AUTO_MEM_PCG_BLOCK_ROWS)),
+                            )
+                        ),
+                    )
+                )
+                exact_stream_row_block = int(min(exact_stream_row_block, max(1, n_snp_local)))
                 y_train_vec = np.ascontiguousarray(
                     np.asarray(Y, dtype=np.float64).reshape(-1),
                     dtype=np.float64,
@@ -9532,6 +9545,7 @@ def GSapi(
                         f"{'rust_rrblup_exact_snp_packed' if use_rust_exact_snp_packed else 'rust_rrblup_exact_snp_prepare_bed_from_meta'} "
                         f"n_train={n_train_expected} n_snp={n_snp_local} "
                         f"sample_block={exact_sample_block} "
+                        f"stream_row_block={exact_stream_row_block} "
                         f"threads={int(max(1, int(n_jobs)))}",
                         flush=True,
                     )
@@ -9694,6 +9708,7 @@ def GSapi(
                             row_maf_arg,
                             row_flip_stream_arg,
                             int(exact_sample_block),
+                            int(exact_stream_row_block),
                             float(exact_std_eps),
                             int(max(1, int(n_jobs))),
                             int(max(1, int(n_jobs))),
@@ -19581,10 +19596,29 @@ def _run_gs_pipeline(
                     f"block_rows={int(rrblup_adamw_cfg['pcg_block_rows'])}"
                 )
         active_m_rr = int(_packed_ctx_active_rows(packed_lmm_ctx))
+        rr_exact_stream_row_block = _common_resolve_decode_block_rows(
+            int(max(1, (int(len(samples)) + 3) // 4)),
+            float(memory_mb),
+            elem_bytes=1,
+            buffers=2,
+            min_rows=1,
+            max_rows=active_m_rr,
+        )
+        if rr_exact_stream_row_block is not None:
+            rrblup_adamw_cfg["exact_stream_row_block"] = int(
+                max(1, int(rr_exact_stream_row_block))
+            )
+            if bool(debug_mode):
+                logger.info(
+                    "[GS-DEBUG] rrBLUP exact-SNP stream decode budget "
+                    f"memory_gb={float(args.memory):.6g} "
+                    f"n_samples={int(len(samples))} "
+                    f"stream_row_block={int(rrblup_adamw_cfg['exact_stream_row_block'])}"
+                )
         rr_exact_sample_block = _common_resolve_decode_block_rows(
             int(max(1, active_m_rr)),
             float(memory_mb),
-            elem_bytes=4,
+            elem_bytes=_GS_AUTO_MEM_EXACT_SAMPLE_CELL_BYTES,
             needs_copy=False,
             min_rows=1,
         )

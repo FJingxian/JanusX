@@ -21,8 +21,8 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Instant;
 
-use crate::bitwise::and_popcount;
 use crate::bedmath::SubsetDecodePlan;
+use crate::bitwise::and_popcount;
 use crate::decode::decode_prepared_additive_block_packed_f32;
 use crate::gfcore as core;
 use crate::gfcore::{BedSnpIter, HmpSnpIter, TxtSnpIter, VcfSnpIter};
@@ -5804,8 +5804,8 @@ impl BedChunkReaderFromMeta {
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
 
         let n_samples_full = samples.len();
-        let sample_identity = sample_indices.len() == n_samples_full
-            && sample_indices_are_identity(&sample_indices);
+        let sample_identity =
+            sample_indices.len() == n_samples_full && sample_indices_are_identity(&sample_indices);
         let subset_plan = if sample_identity {
             None
         } else {
@@ -5815,18 +5815,18 @@ impl BedChunkReaderFromMeta {
             ))
         };
         let n_snps_total = sites_all.len();
-        let row_idx64 = row_indices
-            .as_slice()
-            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("row_indices must be contiguous int64"))?;
-        let row_flip_slice = row_flip
-            .as_slice()
-            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("row_flip must be contiguous bool"))?;
-        let row_missing_slice = row_missing
-            .as_slice()
-            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("row_missing must be contiguous float32"))?;
-        let row_maf_slice = row_maf
-            .as_slice()
-            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("row_maf must be contiguous float32"))?;
+        let row_idx64 = row_indices.as_slice().map_err(|_| {
+            pyo3::exceptions::PyRuntimeError::new_err("row_indices must be contiguous int64")
+        })?;
+        let row_flip_slice = row_flip.as_slice().map_err(|_| {
+            pyo3::exceptions::PyRuntimeError::new_err("row_flip must be contiguous bool")
+        })?;
+        let row_missing_slice = row_missing.as_slice().map_err(|_| {
+            pyo3::exceptions::PyRuntimeError::new_err("row_missing must be contiguous float32")
+        })?;
+        let row_maf_slice = row_maf.as_slice().map_err(|_| {
+            pyo3::exceptions::PyRuntimeError::new_err("row_maf must be contiguous float32")
+        })?;
 
         let m = row_idx64.len();
         if row_flip_slice.len() != m || row_missing_slice.len() != m || row_maf_slice.len() != m {
@@ -5862,12 +5862,8 @@ impl BedChunkReaderFromMeta {
             .zip(row_flip_slice.iter())
             .map(|(&maf_minor, &flip)| {
                 let maf_minor = maf_minor.clamp(0.0_f32, 1.0_f32);
-                let alt_freq = if flip {
-                    1.0_f32 - maf_minor
-                } else {
-                    maf_minor
-                }
-                .clamp(0.0_f32, 1.0_f32);
+                let alt_freq =
+                    if flip { 1.0_f32 - maf_minor } else { maf_minor }.clamp(0.0_f32, 1.0_f32);
                 2.0_f32 * alt_freq
             })
             .collect();

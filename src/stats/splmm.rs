@@ -5116,7 +5116,9 @@ impl GenotypeMatrix for DenseRowMajorF32Matrix {
             let mut run_copy = || {
                 out.par_chunks_mut(cols)
                     .enumerate()
-                    .for_each(|(local_row, dst)| dst.copy_from_slice(self.row_slice(row_start + local_row)));
+                    .for_each(|(local_row, dst)| {
+                        dst.copy_from_slice(self.row_slice(row_start + local_row))
+                    });
             };
             if let Some(tp) = pool {
                 tp.install(run_copy);
@@ -5132,12 +5134,14 @@ impl GenotypeMatrix for DenseRowMajorF32Matrix {
             ));
         }
         let mut run_gather = || {
-            out.par_chunks_mut(cols).enumerate().for_each(|(local_row, dst)| {
-                let src = self.row_slice(row_start + local_row);
-                for (j, &sample_col) in sample_idx.iter().enumerate() {
-                    dst[j] = src[sample_col];
-                }
-            });
+            out.par_chunks_mut(cols)
+                .enumerate()
+                .for_each(|(local_row, dst)| {
+                    let src = self.row_slice(row_start + local_row);
+                    for (j, &sample_col) in sample_idx.iter().enumerate() {
+                        dst[j] = src[sample_col];
+                    }
+                });
         };
         if let Some(tp) = pool {
             tp.install(run_gather);

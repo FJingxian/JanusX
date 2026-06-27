@@ -582,6 +582,14 @@ def _packed_ctx_is_lazy_full(packed_ctx: dict[str, typing.Any]) -> bool:
 def _packed_ctx_prefers_metadata_stream(
     packed_ctx: dict[str, typing.Any],
 ) -> bool:
+    force_resident = str(
+        os.getenv(
+            "JX_GS_RRBLUP_FORCE_RESIDENT_PACKED",
+            os.getenv("JX_RRBLUP_FORCE_RESIDENT_PACKED", ""),
+        )
+    ).strip().lower()
+    if force_resident in {"1", "true", "yes", "on"}:
+        return False
     if not _packed_ctx_is_lazy_full(packed_ctx):
         return False
     source_prefix = str(packed_ctx.get("source_prefix", "") or "").strip()
@@ -8400,17 +8408,6 @@ def GSapi(
                 use_resident_packed = bool(
                     packed_has_payload and ((not packed_is_lazy) or (source_prefix == ""))
                 )
-                pcg_stream_meta_block_rows = int(
-                    max(
-                        1,
-                        int(
-                            (rrblup_adamw_cfg or {}).get(
-                                "pcg_block_rows",
-                                (rrblup_adamw_cfg or {}).get("snp_block_size", 4096),
-                            )
-                        ),
-                    )
-                )
                 site_keep_arg_legacy = None
                 if use_resident_packed:
                     packed_src_view = np.asarray(packed_train["packed"], dtype=np.uint8)
@@ -8427,16 +8424,13 @@ def GSapi(
                         dtype=np.bool_,
                     )
                 else:
-                    (
-                        _pcg_source_prefix,
-                        site_keep_arg_legacy,
-                        _pcg_row_source_indices_arg,
-                        row_flip_arg,
-                        maf_arg,
-                        _pcg_mmap_window_mb,
-                    ) = _packed_gblup_stream_metadata(
-                        packed_train,
-                        block_rows=int(pcg_stream_meta_block_rows),
+                    maf_arg = np.ascontiguousarray(
+                        np.asarray(packed_train["maf"], dtype=np.float32).reshape(-1),
+                        dtype=np.float32,
+                    )
+                    row_flip_arg = np.ascontiguousarray(
+                        np.asarray(_ensure_packed_row_flip_cached(packed_train), dtype=np.bool_).reshape(-1),
+                        dtype=np.bool_,
                     )
                 packed_n_samples = int(packed_train["n_samples"])
                 if packed_n_samples <= 0:
@@ -8468,14 +8462,19 @@ def GSapi(
                         np.asarray(site_keep_raw, dtype=np.bool_).reshape(-1),
                         dtype=np.bool_,
                     )
+                elif (not use_resident_packed) and site_keep_raw is not None:
+                    site_keep_arg_legacy = np.ascontiguousarray(
+                        np.asarray(site_keep_raw, dtype=np.bool_).reshape(-1),
+                        dtype=np.bool_,
+                    )
                 site_keep_arg = None
                 if site_keep_arg_legacy is not None:
-                    expected_site_keep_len = (
-                        int(packed_arg.shape[0])
-                        if packed_arg is not None
-                        else int(maf_arg.shape[0])
-                    )
-                    if int(site_keep_arg_legacy.shape[0]) == int(expected_site_keep_len):
+                    expected_site_keep_len = int(maf_arg.shape[0])
+                    if (
+                        (not use_resident_packed)
+                        or (packed_is_lazy)
+                        or (int(site_keep_arg_legacy.shape[0]) == int(expected_site_keep_len))
+                    ):
                         site_keep_arg = site_keep_arg_legacy
 
                 n_train_expected = int(np.asarray(Y).reshape(-1).shape[0])
@@ -21050,13 +21049,30 @@ def _run_gs_pipeline(
                     phase_label = str(trace_row.get("phase_label", "")).strip() or str(
                         trace_row.get("phase", "")
                     ).strip()
+                    prev_rel_res = float("nan")
                     for rec in list(trace_row.get("trace", []) or []):
+                        rel_res_now = float(rec.get("rel_res", np.nan))
+                        delta_rel_res = (
+                            float(rel_res_now - prev_rel_res)
+                            if np.isfinite(rel_res_now) and np.isfinite(prev_rel_res)
+                            else float("nan")
+                        )
+                        ratio_rel_res = (
+                            float(rel_res_now / prev_rel_res)
+                            if np.isfinite(rel_res_now)
+                            and np.isfinite(prev_rel_res)
+                            and abs(prev_rel_res) > float(np.finfo(np.float64).tiny)
+                            else float("nan")
+                        )
                         _log_file_only(
                             "[rrBLUP-PCG] "
                             f"trait={trait_name} method={m_key} phase={phase_label} "
                             f"iter={int(rec.get('iter', 0))}/{int(rec.get('total', 1))} "
-                            f"rel_res={float(rec.get('rel_res', np.nan)):.12g}"
+                            f"rel_res={rel_res_now:.12g} "
+                            f"delta={delta_rel_res:.12g} "
+                            f"ratio={ratio_rel_res:.12g}"
                         )
+                        prev_rel_res = rel_res_now
                 _log_file_only(f"[rrBLUP-PCG][trait={trait_name}][method={m_key}] residual_trace_end")
             trait_method_summary[str(trait_name)][str(m_key)] = {
                 "method_display": str(m_disp),

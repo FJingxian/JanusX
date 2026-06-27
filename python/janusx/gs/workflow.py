@@ -9210,10 +9210,16 @@ def GSapi(
                 if (is_packed_input and _looks_like_packed_ctx(Xtrain))
                 else None
             )
+            exact_source_prefix = (
+                ""
+                if packed_train_probe is None
+                else str(packed_train_probe.get("source_prefix", "") or "").strip()
+            )
             can_use_rust_exact_snp_packed = bool(
                 packed_train_probe is not None
                 and (_jxrs is not None)
                 and hasattr(_jxrs, "rrblup_exact_snp_packed")
+                and (exact_source_prefix == "")
                 and (not _packed_ctx_is_lazy_full(packed_train_probe))
                 and ("packed" in packed_train_probe)
             )
@@ -9222,12 +9228,17 @@ def GSapi(
                 and (_jxrs is not None)
                 and hasattr(_jxrs, "rrblup_exact_snp_prepare_bed_from_meta")
                 and hasattr(_jxrs, "rrblup_exact_snp_fit_prepared_bed")
-                and str(packed_train_probe.get("source_prefix", "") or "").strip() != ""
+                and (exact_source_prefix != "")
             )
+            use_rust_exact_snp_meta = bool(can_use_rust_exact_snp_meta)
+            use_rust_exact_snp_packed = bool((not use_rust_exact_snp_meta) and can_use_rust_exact_snp_packed)
             if resolved_rr_exact_backend == "snp" and (
-                (not can_use_rust_exact_snp_packed) and (not can_use_rust_exact_snp_meta)
+                (not use_rust_exact_snp_packed) and (not use_rust_exact_snp_meta)
             ):
-                exact_backend_fallback_reason = "exact_snp_backend_unavailable"
+                if exact_source_prefix != "":
+                    exact_backend_fallback_reason = "exact_snp_meta_backend_unavailable_for_source_prefix"
+                else:
+                    exact_backend_fallback_reason = "exact_snp_backend_unavailable"
                 resolved_rr_exact_backend = "fast"
             _set_rrblup_exact_backend_state(
                 str(resolved_rr_exact_backend),
@@ -9312,13 +9323,13 @@ def GSapi(
                 if _GS_DEBUG_STAGE:
                     print(
                         "[GS-DEBUG] rrBLUP exact SNP route="
-                        f"{'rust_rrblup_exact_snp_packed' if can_use_rust_exact_snp_packed else 'rust_rrblup_exact_snp_prepare_bed_from_meta'} "
+                        f"{'rust_rrblup_exact_snp_packed' if use_rust_exact_snp_packed else 'rust_rrblup_exact_snp_prepare_bed_from_meta'} "
                         f"n_train={n_train_expected} n_snp={n_snp_local} "
                         f"sample_block={exact_sample_block} "
                         f"threads={int(max(1, int(n_jobs)))}",
                         flush=True,
                     )
-                if can_use_rust_exact_snp_packed:
+                if use_rust_exact_snp_packed:
                     packed_arg = np.ascontiguousarray(
                         np.asarray(packed_train["packed"], dtype=np.uint8),
                         dtype=np.uint8,

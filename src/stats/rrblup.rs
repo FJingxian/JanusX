@@ -121,15 +121,13 @@ fn choose_xtmul_kernel_strategy(
     if !prefer_parallel {
         return XtMulKernelStrategy::Blas;
     }
-    // `rows` here is the decoded SNP block height, not the sample count. In the
-    // PCG BED path it is driven by `block_rows`/`--memory`, so a "small rows,
-    // very wide cols" front-half window can still occur on large-sample folds.
-    // Keep a dedicated column-chunk fast path for that shape, and otherwise
-    // prefer the explicit Rayon reduction kernel over dropping back to serial
-    // BLAS under the default `rayon_parallel_blas_serial` thread policy.
-    if cols >= 65_536 && rows <= 4_096 {
-        return XtMulKernelStrategy::ColChunk;
-    }
+    // In the GS PCG BED path `rows` is the decoded SNP-block height, not the
+    // sample count. Large CV folds therefore commonly land in "small rows, very
+    // wide cols" shapes where the column-chunk kernel looks plausible on paper
+    // but performs worse in practice because it repeatedly sweeps the same
+    // row-major block and amplifies page traffic. Keep ColChunk available via
+    // `JX_GS_PCG_XTMUL_KERNEL=col_chunk`, but prefer RowReduce in auto mode.
+    let _ = (rows, cols);
     XtMulKernelStrategy::RowReduce
 }
 
@@ -4043,7 +4041,7 @@ mod tests {
                 rows: 768,
                 cols: 262_144,
                 threads: 8,
-                expect: XtMulKernelStrategy::ColChunk,
+                expect: XtMulKernelStrategy::RowReduce,
             },
             XtMulBenchCase {
                 name: "row_reduce_friendly",

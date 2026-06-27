@@ -8539,12 +8539,12 @@ def GSapi(
                             **dict(payload),
                         ),
                     )
-                    lam_auto = float(
-                        lambda_auto_info.get(
-                            "lambda_equation_rrblup",
-                            lambda_auto_info.get("lambda_equation", np.nan),
-                        )
-                    )
+                    # Keep the actual PCG solve lambda on the estimator-returned
+                    # equation scale. VC-derived fields are useful for reporting,
+                    # but reprojecting sigma_e2/sigma_g2 back onto a fresh
+                    # m_effective changes the linear system and can materially
+                    # worsen convergence even when Va/Ve/PVE look unchanged.
+                    lam_auto = float(lambda_auto_info.get("lambda_equation", np.nan))
                     lam_auto_strategy = (
                         str(lambda_auto_info.get("strategy", "lambda_auto")).strip() or "lambda_auto"
                     )
@@ -8593,34 +8593,6 @@ def GSapi(
                     raise ValueError(
                         f"rrBLUP PCG std_eps must be finite and > 0, got {pcg_std_eps!r}."
                     )
-                pcg_m_effective_rrblup = int(
-                    max(
-                        1,
-                        _rrblup_m_effective_from_maf(
-                            maf_arg,
-                            float(pcg_std_eps),
-                        ),
-                    )
-                )
-                if lambda_auto_info is not None:
-                    lambda_auto_info["m_effective_rrblup"] = int(pcg_m_effective_rrblup)
-                    (
-                        lambda_k_vc_now,
-                        _m_rr,
-                        _m_vc,
-                        lambda_eq_rrblup_now,
-                        _lambda_eq_vc_now,
-                    ) = _rrblup_lambda_auto_vc_terms(lambda_auto_info)
-                    if np.isfinite(lambda_k_vc_now):
-                        lambda_auto_info["lambda_k_vc"] = float(lambda_k_vc_now)
-                    if np.isfinite(lambda_eq_rrblup_now) and lambda_eq_rrblup_now >= 0.0:
-                        lambda_auto_info["lambda_equation_rrblup"] = float(lambda_eq_rrblup_now)
-                        lambda_equation = float(lambda_eq_rrblup_now)
-                        lambda_raw = _rrblup_lambda_equation_to_raw(
-                            lambda_equation=float(lambda_equation),
-                            lambda_scale=lambda_scale,
-                            n_train=int(n_train_local),
-                        )
                 pve_mode = str(rr_cfg.get("pve_mode", "lambda")).strip().lower()
                 if pve_mode not in {"lambda", "trainvar"}:
                     pve_mode = "lambda"

@@ -2343,6 +2343,7 @@ _GS_AUTO_MEM_BAYES_BLOCK_ROWS = 2048
 _GS_AUTO_MEM_MIN_GB = 0.125
 _GS_WORKING_BUFFERS_GBLUP = 2
 _GS_WORKING_BUFFERS_PCG = 2
+_GS_WORKING_BUFFERS_EXACT_STREAM = 2
 _GS_WORKING_BUFFERS_BAYES = 1
 
 
@@ -2384,6 +2385,20 @@ def _memory_gb_for_target_decode_shape(
     )
     gb_need = float(bytes_need) / float(1024 ** 3)
     return float(max(float(min_gb), gb_need))
+
+
+def _memory_gb_for_rrblup_exact_stream(
+    n_samples_total: int,
+    n_markers_total: int,
+) -> float:
+    n_total = int(max(1, int(n_samples_total)))
+    m_total = int(max(1, int(n_markers_total)))
+    return _memory_gb_for_target_decode_shape(
+        int(max(1, (n_total + 3) // 4)),
+        int(min(m_total, int(_GS_AUTO_MEM_PCG_BLOCK_ROWS))),
+        elem_bytes=1,
+        buffers=_GS_WORKING_BUFFERS_EXACT_STREAM,
+    )
 
 
 def _format_gs_memory_cfg(
@@ -2504,6 +2519,17 @@ def _resolve_gs_auto_decode_memory_gb(
             elif dispatch.effective_method == "rrBLUP" and dispatch.rrblup_solver == "exact":
                 if m_total > 0:
                     _push_candidate(
+                        _memory_gb_for_rrblup_exact_stream(
+                            n_total,
+                            m_total,
+                        ),
+                        (
+                            f"{method_key}->rrBLUP-exact "
+                            f"stream_row_block={int(min(m_total, int(_GS_AUTO_MEM_PCG_BLOCK_ROWS)))} "
+                            f"x{int(_GS_WORKING_BUFFERS_EXACT_STREAM)}"
+                        ),
+                    )
+                    _push_candidate(
                         _memory_gb_for_target_decode_shape(
                             m_total,
                             _GS_AUTO_MEM_EXACT_SAMPLE_BLOCK,
@@ -2539,6 +2565,17 @@ def _resolve_gs_auto_decode_memory_gb(
                     ),
                 )
             elif solver_use == "exact" and m_total > 0:
+                _push_candidate(
+                    _memory_gb_for_rrblup_exact_stream(
+                        n_total,
+                        m_total,
+                    ),
+                    (
+                        f"{method_key}->exact "
+                        f"stream_row_block={int(min(m_total, int(_GS_AUTO_MEM_PCG_BLOCK_ROWS)))} "
+                        f"x{int(_GS_WORKING_BUFFERS_EXACT_STREAM)}"
+                    ),
+                )
                 _push_candidate(
                     _memory_gb_for_target_decode_shape(
                         m_total,

@@ -3534,6 +3534,7 @@ pub fn spgrm_bed_to_jxgrm_core(
                 maf_threshold,
                 max_missing_rate,
                 het_threshold,
+                snps_only,
                 sample_idx,
                 window_mb,
                 threads,

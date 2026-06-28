@@ -3669,10 +3669,6 @@ pub fn grm_bed_f64_from_meta<'py>(
             };
 
             if method == 1 || method == 3 {
-                let total = row_idx.len().max(1);
-                if progress_every > 0 {
-                    progress(0usize, total)?;
-                }
                 let stream_mode = if method == 3 {
                     crate::gblup::StreamKernelMode::Dominance
                 } else {
@@ -3688,8 +3684,9 @@ pub fn grm_bed_f64_from_meta<'py>(
                     block_cols,
                     threads,
                     mmap_window_mb,
+                    progress_every,
+                    Some(progress),
                 )?;
-                progress(total, total)?;
                 return Ok(grm);
             }
 

@@ -622,6 +622,20 @@ def _ensure_splmm_sparse_grm(
         and os.path.exists(dense_grm_path_use)
         and have_dense_npy_sparse
     )
+    sparse_mmap_window_mb: Optional[int] = None
+    if not use_dense_extract:
+        try:
+            n_samples_full = int(_read_bed_fam_iids(str(prefix)).shape[0])
+            n_snps_total = int(_plink_bed_n_snps_from_prefix(str(prefix), n_samples_full))
+            sparse_mmap_window_mb = _common_resolve_decode_mmap_window_mb(
+                str(prefix),
+                n_samples_full,
+                n_snps_total,
+                _current_bed_memory_mb(),
+                needs_copy=False,
+            )
+        except Exception:
+            sparse_mmap_window_mb = None
     progress_desc = (
         "Calculating sparse GRM from dense GRM"
         if use_dense_extract
@@ -695,6 +709,11 @@ def _ensure_splmm_sparse_grm(
                 block_rows=0,
                 sample_block=0,
                 threads=int(threads_use),
+                mmap_window_mb=(
+                    None
+                    if sparse_mmap_window_mb is None
+                    else int(max(1, int(sparse_mmap_window_mb)))
+                ),
                 progress_callback=_progress_cb,
                 progress_every=1,
             )
@@ -761,6 +780,7 @@ def _ensure_splmm_sparse_grm(
             f"({', '.join(built_shape)}, "
             f"source={'dense_grm_npy' if use_dense_extract else 'bed'}, "
             f"method={'standardized' if int(method) == 2 else 'centered'}, "
+            f"mmap_window_mb={('n/a' if use_dense_extract else (int(sparse_mmap_window_mb) if sparse_mmap_window_mb is not None else 'full'))}, "
             f"BLAS=1, Rayon={int(threads_use)}, "
             f"sample_block=auto, "
             f"time={format_elapsed(build_secs)})"

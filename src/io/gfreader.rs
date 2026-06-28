@@ -4120,6 +4120,7 @@ pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples_sparse_windowed(
     maf_threshold: f32,
     max_missing_rate: f32,
     het_threshold: f32,
+    snps_only: bool,
     stats_sample_indices: Option<&[usize]>,
     mmap_window_mb: usize,
     threads: usize,
@@ -4171,6 +4172,25 @@ pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples_sparse_windowed(
             "prefix={bed_prefix} n_samples={n_samples} stats_n_samples={stats_n_samples} n_snps={n_snps} bytes_per_snp={bytes_per_snp} mmap_window_mb={mmap_window_mb}"
         ),
     );
+    let mut read_bim_secs = 0.0_f64;
+    let sites_all = if snps_only {
+        let read_bim_t0 = Instant::now();
+        let sites = core::read_bim(&bed_prefix).map_err(|e| e.to_string())?;
+        read_bim_secs = read_bim_t0.elapsed().as_secs_f64();
+        if sites.len() != n_snps {
+            return Err(format!(
+                "BED/BIM SNP count mismatch: bed={n_snps}, bim={}",
+                sites.len()
+            ));
+        }
+        emit_gfreader_rss_debug(
+            "prepare_bed_logic_meta/windowed_read_bim",
+            &format!("prefix={bed_prefix} n_snps={n_snps}"),
+        );
+        Some(sites)
+    } else {
+        None
+    };
 
     let apply_het_filter = het_threshold > 0.0_f32;
     let row_stats_t0 = Instant::now();
@@ -4221,6 +4241,7 @@ pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples_sparse_windowed(
 
         let mut run = || {
             let it_ref: &BedSnpIter = &it;
+            let sites_all_ref = sites_all.as_ref();
             keep_flags[..scan_rows]
                 .par_iter_mut()
                 .zip(missing_batch[..scan_rows].par_iter_mut())
@@ -4258,7 +4279,14 @@ pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples_sparse_windowed(
                     } else {
                         alt_freq.min(1.0_f32 - alt_freq) >= maf_threshold
                     };
-                    *keep_dst = if keep { 1 } else { 0 };
+                    let pass_snp = if let Some(sites_all_ref) = sites_all_ref {
+                        let site = &sites_all_ref[snp_idx];
+                        is_simple_snp_allele(&site.ref_allele)
+                            && is_simple_snp_allele(&site.alt_allele)
+                    } else {
+                        true
+                    };
+                    *keep_dst = if keep && pass_snp { 1 } else { 0 };
                     *missing_dst = missing_rate;
                     *maf_dst = alt_freq;
                 });
@@ -4322,7 +4350,7 @@ pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples_sparse_windowed(
     emit_bed_logic_meta_timing(
         "prepare_bed_logic_meta_owned_for_stats_samples_windowed",
         open_iter_secs,
-        0.0,
+        read_bim_secs,
         0.0,
         row_stats_secs,
         0.0,
@@ -4398,12 +4426,13 @@ pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples_with_mmap_window(
     }
 
     if let Some(window_mb) = mmap_window_mb {
-        if stats_only && !snps_only {
+        if stats_only {
             return prepare_bed_logic_meta_owned_for_stats_samples_sparse_windowed(
                 &bed_prefix,
                 maf_threshold,
                 max_missing_rate,
                 het_threshold,
+                snps_only,
                 stats_sample_indices,
                 window_mb,
                 1usize,

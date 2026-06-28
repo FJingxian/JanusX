@@ -366,7 +366,7 @@ fn decode_centered_meta_block_f32(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn build_grm_from_meta_stream(
+pub(crate) fn build_grm_from_meta_stream<P>(
     prefix: &str,
     row_source_indices: &[usize],
     row_flip: &[bool],
@@ -376,7 +376,12 @@ pub(crate) fn build_grm_from_meta_stream(
     block_rows: usize,
     threads: usize,
     mmap_window_mb: Option<usize>,
-) -> Result<(Vec<f64>, Vec<f64>, f64), String> {
+    progress_every: usize,
+    mut progress: Option<P>,
+) -> Result<(Vec<f64>, Vec<f64>, f64), String>
+where
+    P: FnMut(usize, usize) -> Result<(), String>,
+{
     let eff_m = row_source_indices.len();
     let n_train = train_idx.len();
     if eff_m == 0 || n_train == 0 {
@@ -403,6 +408,11 @@ pub(crate) fn build_grm_from_meta_stream(
         threads,
     )
     .max(1);
+    let notify_step = if progress_every == 0 {
+        row_step
+    } else {
+        progress_every.max(1)
+    };
 
     let _blas_guard = OpenBlasThreadGuard::enter(threads.max(1));
     let mut grm = vec![0.0_f64; n_train * n_train];
@@ -410,6 +420,7 @@ pub(crate) fn build_grm_from_meta_stream(
     let mut grm_tmp = vec![0.0_f32; n_train * n_train];
     let mut varsum_acc = 0.0_f64;
     let mut row_sum_all = vec![0.0_f64; eff_m];
+    let mut last_notified = 0usize;
     let overlap_enabled = std::env::var("JX_GBLUP_GRM_OVERLAP")
         .ok()
         .map(|s| {
@@ -462,6 +473,13 @@ pub(crate) fn build_grm_from_meta_stream(
             is_first_block = false;
             varsum_acc += block_varsum[..cur_rows].iter().sum::<f64>();
             row_sum_all[row_start..row_end].copy_from_slice(&block_rowsum[..cur_rows]);
+            let done = row_end;
+            if (done >= last_notified.saturating_add(notify_step)) || (done == eff_m) {
+                last_notified = done;
+                if let Some(cb) = progress.as_mut() {
+                    cb(done, eff_m)?;
+                }
+            }
         }
     } else {
         struct Chunk {
@@ -559,6 +577,13 @@ pub(crate) fn build_grm_from_meta_stream(
             varsum_acc += buf.varsum[..cur_rows].iter().sum::<f64>();
             let row_end = buf.start + cur_rows;
             row_sum_all[buf.start..row_end].copy_from_slice(&buf.rowsum[..cur_rows]);
+            let done = row_end;
+            if (done >= last_notified.saturating_add(notify_step)) || (done == eff_m) {
+                last_notified = done;
+                if let Some(cb) = progress.as_mut() {
+                    cb(done, eff_m)?;
+                }
+            }
             Ok(())
         };
 
@@ -752,12 +777,6 @@ pub fn gblup_grm_from_meta_to_npy<'py>(
                 Ok(())
             };
 
-            if progress_every > 0 {
-                progress(0usize, eff_m.max(1))?;
-            } else {
-                check_ctrlc()?;
-            }
-
             let stream_mode = if method == 3 {
                 StreamKernelMode::Dominance
             } else {
@@ -773,14 +792,10 @@ pub fn gblup_grm_from_meta_to_npy<'py>(
                 block_rows,
                 threads,
                 mmap_window_mb,
+                progress_every,
+                Some(progress),
             )?;
             write_npy_f32_matrix_from_f64(&out_npy_path_owned, grm.as_slice(), n_out, n_out)?;
-
-            if progress_every > 0 {
-                progress(eff_m, eff_m.max(1))?;
-            } else {
-                check_ctrlc()?;
-            }
             Ok((eff_m, n_out))
         })
         .map_err(map_err_string_to_py)?;
@@ -1662,6 +1677,8 @@ pub fn gblup_reml_packed_bed<'py>(
                     block_rows_owned,
                     threads_owned,
                     mmap_window_mb_owned,
+                    0usize,
+                    None::<fn(usize, usize) -> Result<(), String>>,
                 )?;
                 for i in 0..n_train {
                     grm_f64[i * n_train + i] += g_eps;

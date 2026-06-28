@@ -8773,10 +8773,46 @@ def GSapi(
                         stage="pcg",
                         reason="legacy_rrblup_pcg_bed_signature",
                     )
+                    allow_legacy_prefix_reload = _cfg_truthy(
+                        os.getenv(
+                            "JX_GS_ALLOW_LEGACY_PCG_PREFIX_RELOAD",
+                            os.getenv(
+                                "JX_RRBLUP_ALLOW_LEGACY_PCG_PREFIX_RELOAD",
+                                "off",
+                            ),
+                        ),
+                        default=False,
+                    )
+                    legacy_prefix_reload_reason = ""
+                    if packed_arg is not None:
+                        legacy_prefix_reload_reason = "packed_signature_missing"
+                    elif source_prefix != "":
+                        legacy_prefix_reload_reason = "stream_signature_missing"
+                    if (
+                        legacy_prefix_reload_reason != ""
+                        and (not bool(allow_legacy_prefix_reload))
+                    ):
+                        raise RuntimeError(
+                            "Current JanusX extension does not support the rrBLUP-PCG "
+                            "packed/streaming signature required by this workflow. "
+                            "Legacy fallback would reload the full BED payload from prefix "
+                            "and can explode memory usage. Rebuild/reinstall the extension, "
+                            "or set JX_GS_ALLOW_LEGACY_PCG_PREFIX_RELOAD=1 to force the old "
+                            f"prefix-reload path ({legacy_prefix_reload_reason})."
+                        )
                     if source_prefix == "":
                         raise RuntimeError(
                             "Current JanusX extension does not support direct packed rrBLUP-PCG "
                             "arguments, and packed context has no source_prefix for legacy fallback."
+                        )
+                    if _GS_DEBUG_STAGE:
+                        print(
+                            (
+                                "[GS-DEBUG] rrBLUP PCG legacy prefix reload fallback "
+                                f"allowed=1 reason={legacy_prefix_reload_reason or 'unknown'} "
+                                f"source_prefix={source_prefix}"
+                            ),
+                            flush=True,
                         )
                     with runtime_thread_stage(
                         blas_threads=int(pcg_thread_spec["blas_threads"]),

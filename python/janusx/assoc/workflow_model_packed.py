@@ -273,15 +273,16 @@ def _splmm_meta_cache_prefix_for_gwas(
         np.asarray(sample_indices, dtype=np.int64).reshape(-1),
         dtype=np.int64,
     )
+    cache_tag = _splmm_meta_cache_tag(
+        maf_threshold=float(maf_threshold),
+        max_missing_rate=float(max_missing_rate),
+        het_threshold=float(het_threshold),
+        snps_only=bool(snps_only),
+    )
     desired = (
         f"{prefix}.splmm.meta.n{int(sample_idx.shape[0])}."
         f"{_splmm_sparse_sample_hash(sample_idx)}"
-        f"{_splmm_meta_cache_tag(
-            maf_threshold=float(maf_threshold),
-            max_missing_rate=float(max_missing_rate),
-            het_threshold=float(het_threshold),
-            snps_only=bool(snps_only),
-        )}"
+        f"{cache_tag}"
     )
     desired_dir = os.path.abspath(os.path.dirname(str(desired)) or ".")
     if _is_writable_dir(desired_dir):

@@ -53,7 +53,8 @@ use crate::packed::bed_packed_row_flip_mask;
 use crate::pcg::{pcg_solve, DiagonalPreconditioner, PcgOperator};
 use crate::pipeline::run_double_buffer;
 use crate::stats_common::{
-    check_ctrlc, env_truthy, get_cached_pool, map_err_string_to_py, parse_index_vec_i64,
+    check_ctrlc, env_truthy, format_bytes, get_cached_pool, map_err_string_to_py,
+    parse_index_vec_i64, process_memory_usage,
 };
 
 #[inline]
@@ -115,6 +116,30 @@ fn xtmul_forced_strategy() -> Option<XtMulKernelStrategy> {
             _ => None,
         }
     })
+}
+
+#[inline]
+fn rrblup_exact_memory_snapshot() -> String {
+    match process_memory_usage() {
+        Some(usage) => {
+            let rss = usage
+                .rss_bytes
+                .map(format_bytes)
+                .unwrap_or_else(|| "NA".to_string());
+            let footprint = usage
+                .footprint_bytes
+                .map(format_bytes)
+                .unwrap_or_else(|| "NA".to_string());
+            format!(
+                "{}={} rss={} footprint={}",
+                usage.metric,
+                format_bytes(usage.current_bytes),
+                rss,
+                footprint,
+            )
+        }
+        None => "memory=NA".to_string(),
+    }
 }
 
 #[inline]
@@ -1516,10 +1541,39 @@ fn build_rrblup_exact_snp_cache_from_source(
     let pool_owned = get_cached_pool(threads).map_err(|e| e.to_string())?;
     let pool_ref = pool_owned.as_ref();
     let code4_lut = packed_byte_lut().code4;
+    let source_backend = if matches!(source, RrblupPcgSource::Resident { .. }) {
+        "resident"
+    } else {
+        "windowed"
+    };
+    let window_target_bytes = if source_backend == "windowed" {
+        stream_row_block
+            .max(1)
+            .saturating_mul(n_samples.div_ceil(4).max(1))
+            .saturating_mul(2)
+    } else {
+        0usize
+    };
     let mut a_star = vec![0.0_f64; eff_m * eff_m];
     let mut row_sum = vec![0.0_f64; eff_m];
     let mut block_f32 = vec![0.0_f32; eff_m * sample_block_use];
     let mut block_f64 = vec![0.0_f64; eff_m * sample_block_use];
+    if stage_timing {
+        eprintln!(
+            "rrBLUP-EXACT prepare workspace n_train={} m={} sample_block={} stream_row_block={} backend={} alloc[a_star={} row_sum={} block_f32={} block_f64={} window_target={}] {}",
+            n_train,
+            eff_m,
+            sample_block_use,
+            stream_row_block,
+            source_backend,
+            format_bytes((a_star.len() * std::mem::size_of::<f64>()) as u64),
+            format_bytes((row_sum.len() * std::mem::size_of::<f64>()) as u64),
+            format_bytes((block_f32.len() * std::mem::size_of::<f32>()) as u64),
+            format_bytes((block_f64.len() * std::mem::size_of::<f64>()) as u64),
+            format_bytes(window_target_bytes as u64),
+            rrblup_exact_memory_snapshot(),
+        );
+    }
     let mut build_a_decode_secs = 0.0_f64;
     let mut build_a_cast_secs = 0.0_f64;
     let mut build_a_rankk_secs = 0.0_f64;
@@ -1620,6 +1674,12 @@ fn build_rrblup_exact_snp_cache_from_source(
     drop(source);
     drop(block_f32);
     drop(block_f64);
+    if stage_timing {
+        eprintln!(
+            "rrBLUP-EXACT prepare checkpoint stage=post_build_A {}",
+            rrblup_exact_memory_snapshot(),
+        );
+    }
 
     let t_center = if stage_timing {
         Some(Instant::now())
@@ -1639,6 +1699,13 @@ fn build_rrblup_exact_snp_cache_from_source(
     };
     let (evals_all, mut evecs, eig_backend) = symmetric_eigh_f64_row_major(&a_star, eff_m)?;
     drop(a_star);
+    if stage_timing {
+        eprintln!(
+            "rrBLUP-EXACT prepare checkpoint stage=post_eigh backend={} {}",
+            eig_backend,
+            rrblup_exact_memory_snapshot(),
+        );
+    }
     let eigh_secs = t_eigh
         .map(|t0| t0.elapsed().as_secs_f64())
         .unwrap_or(0.0_f64);
@@ -1839,6 +1906,34 @@ fn fit_rrblup_exact_snp_from_cache_source(
             d * d
         })
         .sum::<f64>();
+    if stage_timing {
+        eprintln!(
+            "rrBLUP-EXACT fit workspace n_train={} m={} rank={} sample_block={} stream_row_block={} n_test={} train_pred={} backend={} alloc[y_center={} coeff={} y_proj={} beta={} pred_out={}] {}",
+            cache.n_train,
+            cache.m,
+            cache.rank,
+            cache.sample_block,
+            cache.stream_row_block,
+            test_idx.len(),
+            train_pred_pick
+                .as_ref()
+                .map(|idx| idx.len())
+                .unwrap_or(cache.train_idx.len()),
+            if resident_packed_flat.is_some() {
+                "resident"
+            } else {
+                "windowed"
+            },
+            format_bytes((y_center_f32.len() * std::mem::size_of::<f32>()) as u64),
+            format_bytes((cache.rank * std::mem::size_of::<f64>()) as u64),
+            format_bytes((cache.rank * std::mem::size_of::<f64>()) as u64),
+            format_bytes((cache.m * std::mem::size_of::<f32>()) as u64),
+            format_bytes(
+                ((cache.train_idx.len() + test_idx.len()) * std::mem::size_of::<f64>()) as u64
+            ),
+            rrblup_exact_memory_snapshot(),
+        );
+    }
     let mut source = build_rrblup_source(
         resident_packed_flat,
         bytes_per_snp,
@@ -1907,6 +2002,12 @@ fn fit_rrblup_exact_snp_from_cache_source(
     drop(block_f32);
     drop(tmp_dot);
     drop(y_center_f32);
+    if stage_timing {
+        eprintln!(
+            "rrBLUP-EXACT fit checkpoint stage=post_build_z {}",
+            rrblup_exact_memory_snapshot(),
+        );
+    }
 
     let blas_threads_effective = if blas_threads > 0 {
         blas_threads.max(1)
@@ -2028,6 +2129,15 @@ fn fit_rrblup_exact_snp_from_cache_source(
     } else {
         0.0_f64
     };
+    if stage_timing {
+        eprintln!(
+            "rrBLUP-EXACT fit checkpoint stage=post_solve lambda={:.6e} var_g={:.6e} sigma_e2={:.6e} {}",
+            lambda_opt,
+            var_g,
+            sigma_e2,
+            rrblup_exact_memory_snapshot(),
+        );
+    }
     let denom = var_g + sigma_e2;
     let pve_trainvar = if denom.is_finite() && denom > 0.0_f64 {
         var_g / denom

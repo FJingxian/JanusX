@@ -315,6 +315,7 @@ _SECTION_WIDTH = 80
 _REPORT_RULE = "=" * _SECTION_WIDTH
 _REPORT_SUBRULE = "-" * _SECTION_WIDTH
 _GWAS_PROGRESS_BAR_WIDTH = 30
+_GWAS_PCA_GRM_EIGH_SAMPLE_THRESHOLD = 15_000
 
 
 def _format_farmcpu_threshold_display(v: object) -> str:
@@ -2881,37 +2882,26 @@ def build_pcs_from_grm(
 
     GWAS policy: enforce Rust eigh backend for PCA construction.
     """
-    if use_spinner:
-        with CliStatus(f"Computing top {dim} PCs from GRM...", enabled=True) as task:
-            try:
-                _eigval, eigvec, _evd_backend, _evd_secs = _gwas_eigh_from_grm(
-                    grm,
-                    threads=int(threads),
-                    logger=logger,
-                    stage_label="GWAS-PCA",
-                    require_rust=True,
-                )
-                pcs = eigvec[:, -dim:]
-            except Exception:
-                task.fail(f"Computing top {dim} PCs from GRM ...Failed")
-                raise
-            task.complete(
-                f"Computing top {dim} PCs from GRM (n={pcs.shape[0]}, nPC={pcs.shape[1]})"
+    with CliStatus(
+        f"Calculating PCs via GRM + eigh (n={int(grm.shape[0])}, nPC={int(dim)})...",
+        enabled=bool(use_spinner),
+        use_process=True,
+    ) as task:
+        try:
+            _eigval, eigvec, _evd_backend, _evd_secs = _gwas_eigh_from_grm(
+                grm,
+                threads=int(threads),
+                logger=logger,
+                stage_label="GWAS-PCA",
+                require_rust=True,
             )
-        _log_file_only(logger, logging.INFO, f"Computing top {dim} PCs from GRM...")
-        _log_file_only(logger, logging.INFO, "PC computation finished.")
-        return pcs
-
-    logger.info(f"Computing top {dim} PCs from GRM...")
-    _eigval, eigvec, _evd_backend, _evd_secs = _gwas_eigh_from_grm(
-        grm,
-        threads=int(threads),
-        logger=logger,
-        stage_label="GWAS-PCA",
-        require_rust=True,
-    )
-    pcs = eigvec[:, -dim:]
-    logger.info("PC computation finished.")
+            pcs = eigvec[:, -dim:]
+        except Exception:
+            task.fail("Calculating PCs via GRM + eigh ...Failed")
+            raise
+        task.complete(
+            f"Calculating PCs via GRM + eigh (n={pcs.shape[0]}, nPC={pcs.shape[1]})"
+        )
     return pcs
 
 
@@ -3046,10 +3036,33 @@ def build_pcs_from_genotype_rsvd(
     return qmatrix, samples, "rsvd_stream"
 
 
+def _gwas_pca_backend_display_name(backend: object) -> str:
+    key = str(backend or "").strip().lower()
+    if key in {"rsvd_stream", "rsvd_packed_preload"}:
+        return "RSVD"
+    if key in {"grm_eigh", "grm_eigh_fallback"}:
+        return "GRM + eigh"
+    if key == "":
+        return "PCA"
+    return str(backend)
+
+
+def _gwas_qcov_prefers_grm_route(qcov_opt: object, n_samples: int) -> bool:
+    try:
+        qdim = int(_parse_qcov_dim(qcov_opt))
+    except Exception:
+        return False
+    if int(qdim) <= 0:
+        return False
+    return bool(int(n_samples) <= int(_GWAS_PCA_GRM_EIGH_SAMPLE_THRESHOLD))
+
+
 def load_or_build_q_with_cache(
     genofile: str,
     grm: Union[np.ndarray, None],
+    grm_ids: Union[np.ndarray, None],
     n_samples: int,
+    n_snps_preloaded: Union[int, None],
     cache_prefix: str,
     pcdim: str,
     mgrm: str,
@@ -3064,14 +3077,17 @@ def load_or_build_q_with_cache(
     logger,
     use_spinner: bool = False,
     preloaded_packed: Union[dict[str, object], None] = None,
+    allow_packed_full_load: bool = False,
 ) -> tuple[np.ndarray, Union[np.ndarray, None]]:
     """
     Load or build Q matrix (PCs) with caching for streaming LMM/LM.
     Note: external Q file via -q is no longer supported; pass external
     covariate matrices via -c.
 
-    GWAS policy: default to Rust RSVD on genotype input; fallback to GRM eigh
-    only when RSVD is unavailable or fails.
+    GWAS policy:
+      - n <= 15k: prefer GRM + eigh
+      - n > 15k: prefer Rust RSVD on genotype input, fallback to GRM eigh
+        only when RSVD is unavailable or fails.
     """
     n = int(n_samples)
     qdim = _parse_qcov_dim(pcdim)
@@ -3085,6 +3101,44 @@ def load_or_build_q_with_cache(
         dim = int(qdim)
         q_path = _pca_cache_path(cache_prefix, mgrm=str(mgrm), qdim=int(dim))
         legacy_q_path = _pca_cache_path_legacy(cache_prefix, mgrm=str(mgrm), qdim=int(dim))
+        grm_local = grm
+        grm_ids_local = (
+            None
+            if grm_ids is None
+            else np.asarray(grm_ids, dtype=str).reshape(-1)
+        )
+
+        def _ensure_grm_for_q_build() -> tuple[np.ndarray, Union[np.ndarray, None]]:
+            nonlocal grm_local, grm_ids_local
+            if grm_local is not None:
+                return grm_local, grm_ids_local
+            grm_local, _eff_m_local, grm_ids_loaded, _grm_cache_path_local = load_or_build_grm_with_cache(
+                genofile=str(genofile),
+                cache_prefix=str(cache_prefix),
+                mgrm=str(mgrm),
+                maf_threshold=float(maf_threshold),
+                max_missing_rate=float(max_missing_rate),
+                het_threshold=float(het_threshold),
+                chunk_size=int(chunk_size),
+                memory_mb=float(memory_mb),
+                threads=int(threads),
+                logger=logger,
+                use_spinner=bool(use_spinner),
+                ids_preloaded=np.asarray(ids, dtype=str),
+                n_snps_preloaded=(
+                    None if n_snps_preloaded is None else int(n_snps_preloaded)
+                ),
+                snps_only=bool(snps_only),
+                allow_packed_full_load=bool(allow_packed_full_load),
+                preloaded_packed=preloaded_packed,
+            )
+            grm_ids_local = (
+                None
+                if grm_ids_loaded is None
+                else np.asarray(grm_ids_loaded, dtype=str).reshape(-1)
+            )
+            return grm_local, grm_ids_local
+
         with _cache_lock(q_path):
             if (not os.path.isfile(q_path)) and os.path.isfile(legacy_q_path):
                 _log_file_only(
@@ -3126,48 +3180,69 @@ def load_or_build_q_with_cache(
             if not cache_ready:
                 pc_calc_t0 = time.monotonic()
                 pc_backend = "unknown"
-                try:
-                    qmatrix, q_ids, pc_backend = build_pcs_from_genotype_rsvd(
-                        genofile=str(genofile),
-                        dim=int(dim),
+                prefer_grm_eigh = bool(int(n) <= int(_GWAS_PCA_GRM_EIGH_SAMPLE_THRESHOLD))
+                if prefer_grm_eigh:
+                    grm_for_q, grm_ids_for_q = _ensure_grm_for_q_build()
+                    qmatrix = build_pcs_from_grm(
+                        grm_for_q,
+                        int(dim),
                         logger=logger,
-                        maf_threshold=float(maf_threshold),
-                        max_missing_rate=float(max_missing_rate),
-                        chunk_size=int(chunk_size),
-                        memory_mb=float(memory_mb),
-                        snps_only=bool(snps_only),
                         threads=int(threads),
                         use_spinner=bool(use_spinner),
-                        preloaded_packed=preloaded_packed,
                     )
-                except Exception as rsvd_ex:
-                    if grm is None:
-                        raise
-                    _emit_warning_line(
-                        logger,
-                        f"RSVD PCA build failed; falling back to GRM eigh. reason={rsvd_ex}",
-                        use_spinner=bool(use_spinner),
+                    qmatrix = np.asarray(qmatrix, dtype="float32")
+                    q_ids = (
+                        np.asarray(grm_ids_for_q, dtype=str)
+                        if grm_ids_for_q is not None
+                        else np.asarray(ids, dtype=str)
                     )
-                    _eigval, eigvec, _evd_backend, _evd_secs = _gwas_eigh_from_grm(
-                        grm,
-                        threads=int(threads),
-                        logger=logger,
-                        stage_label="GWAS-Q-build",
-                        require_rust=True,
-                    )
-                    qmatrix = np.asarray(eigvec[:, -dim:], dtype="float32")
-                    q_ids = ids
-                    pc_backend = "grm_eigh_fallback"
+                    pc_backend = "grm_eigh"
+                else:
+                    try:
+                        qmatrix, q_ids, pc_backend = build_pcs_from_genotype_rsvd(
+                            genofile=str(genofile),
+                            dim=int(dim),
+                            logger=logger,
+                            maf_threshold=float(maf_threshold),
+                            max_missing_rate=float(max_missing_rate),
+                            chunk_size=int(chunk_size),
+                            memory_mb=float(memory_mb),
+                            snps_only=bool(snps_only),
+                            threads=int(threads),
+                            use_spinner=bool(use_spinner),
+                            preloaded_packed=preloaded_packed,
+                        )
+                    except Exception as rsvd_ex:
+                        _emit_warning_line(
+                            logger,
+                            f"RSVD PCA build failed; falling back to GRM eigh. reason={rsvd_ex}",
+                            use_spinner=bool(use_spinner),
+                        )
+                        grm_for_q, grm_ids_for_q = _ensure_grm_for_q_build()
+                        _eigval, eigvec, _evd_backend, _evd_secs = _gwas_eigh_from_grm(
+                            grm_for_q,
+                            threads=int(threads),
+                            logger=logger,
+                            stage_label="GWAS-Q-build",
+                            require_rust=True,
+                        )
+                        qmatrix = np.asarray(eigvec[:, -dim:], dtype="float32")
+                        q_ids = (
+                            np.asarray(grm_ids_for_q, dtype=str)
+                            if grm_ids_for_q is not None
+                            else np.asarray(ids, dtype=str)
+                        )
+                        pc_backend = "grm_eigh_fallback"
                 if qmatrix.shape != (n, int(dim)):
                     raise ValueError(
                         f"PCA build shape mismatch: expected ({n},{dim}), got {qmatrix.shape}"
                     )
                 pc_msg = (
-                    f"Calculating PCs via {pc_backend} (n={qmatrix.shape[0]}, nPC={qmatrix.shape[1]}) "
+                    f"Calculating PCs via {_gwas_pca_backend_display_name(pc_backend)} "
+                    f"(n={qmatrix.shape[0]}, nPC={qmatrix.shape[1]}) "
                     f"...Finished [{format_elapsed(time.monotonic() - pc_calc_t0)}]"
                 )
                 _log_file_only(logger, logging.INFO, pc_msg)
-                print_success(pc_msg, force_color=bool(use_spinner))
                 tmp_q = f"{q_path}.tmp.{os.getpid()}"
                 _write_pca_cache_with_ids(tmp_q, np.asarray(q_ids, dtype=str), qmatrix)
                 _replace_file_with_retry(tmp_q, q_path)
@@ -3289,12 +3364,19 @@ def prepare_streaming_context(
                 if _is_cache_warning_message(msg):
                     deferred_cache_warnings.append(msg)
     n_samples = len(ids)
+    qcov_prefers_grm_local = _gwas_qcov_prefers_grm_route(pcdim, int(n_samples))
+    working_buffers_effective = int(max(1, int(working_buffers)))
+    if bool(qcov_prefers_grm_local):
+        working_buffers_effective = max(
+            int(working_buffers_effective),
+            int(_GWAS_WORKING_BUFFERS_GRM),
+        )
     chunk_size = _resolve_bed_block_rows_from_memory(
         float(memory_mb),
         int(n_samples),
         int(n_snps),
         streaming=True,
-        working_buffers=int(max(1, int(working_buffers))),
+        working_buffers=int(working_buffers_effective),
     )
     if _gwas_logger_verbose(logger):
         _log_info(
@@ -3410,35 +3492,7 @@ def prepare_streaming_context(
             )
             preloaded_packed = packed_preload_failure_state(stream_genofile, ex)
 
-    need_generate_q = False
-    if pcdim in np.arange(1, n_samples).astype(str):
-        qdim = int(pcdim)
-        q_path = _pca_cache_path(cache_prefix, mgrm=str(mgrm), qdim=int(qdim))
-        legacy_q_path = _pca_cache_path_legacy(cache_prefix, mgrm=str(mgrm), qdim=int(qdim))
-        if (not os.path.isfile(q_path)) and os.path.isfile(legacy_q_path):
-            _log_file_only(
-                logger,
-                logging.INFO,
-                f"Ignoring legacy PCA cache and rebuilding in new format: {legacy_q_path}",
-            )
-        if not os.path.isfile(q_path):
-            need_generate_q = True
-        else:
-            g_mtime = latest_genotype_mtime(genofile)
-            q_mtime = os.path.getmtime(q_path)
-            if g_mtime is not None and g_mtime > q_mtime:
-                need_generate_q = True
-            else:
-                try:
-                    _load_pca_cache_with_ids(
-                        q_path,
-                        expected_rows=int(n_samples),
-                        expected_dim=int(qdim),
-                        expected_ids=np.asarray(ids, dtype=str),
-                    )
-                except Exception:
-                    need_generate_q = True
-    need_grm = bool(require_kinship or need_generate_q)
+    need_grm = bool(require_kinship)
 
     grm: Union[np.ndarray, None] = None
     eff_m = n_snps
@@ -3482,7 +3536,9 @@ def prepare_streaming_context(
         qmatrix, q_ids = load_or_build_q_with_cache(
             genofile=stream_genofile,
             grm=grm,
+            grm_ids=grm_ids,
             n_samples=n_samples,
+            n_snps_preloaded=int(n_snps),
             cache_prefix=cache_prefix,
             pcdim=pcdim,
             mgrm=mgrm,
@@ -3497,6 +3553,7 @@ def prepare_streaming_context(
             logger=logger,
             use_spinner=use_spinner,
             preloaded_packed=preloaded_packed,
+            allow_packed_full_load=bool(allow_packed_grm),
         )
 
         cov_all, cov_ids = _load_covariate_for_streaming(
@@ -6279,7 +6336,8 @@ def _run_gwas_pipeline(
     requested_memory_models = list(requested_stream_models)
     if bool(args.farmcpu):
         requested_memory_models.append("farmcpu")
-    qcov_needs_grm = str(getattr(args, "qcov", "0")).strip() not in {"", "0"}
+    qcov_requested = str(getattr(args, "qcov", "0")).strip() not in {"", "0"}
+    qcov_needs_grm = False
     standard_stream_models_requested = bool(
         args.lm
         or (getattr(args, "lm2", None) is not None)
@@ -6337,6 +6395,7 @@ def _run_gwas_pipeline(
         preinspect_ids = np.asarray(preinspect_ids_raw, dtype=str)
         preinspect_n_snps = int(preinspect_n_snps)
         preinspect_warnings.extend(preinspect_warn_msgs)
+        qcov_needs_grm = _gwas_qcov_prefers_grm_route(args.qcov, int(len(preinspect_ids)))
         _queue_preconfig_success(
             f"{genotype_load_status_done(preinspect_src, n_samples=len(preinspect_ids), n_snps=int(preinspect_n_snps))} "
             f"[{format_elapsed(time.monotonic() - preinspect_t0)}]"
@@ -6360,6 +6419,8 @@ def _run_gwas_pipeline(
             logger.info(auto_memory_msg)
         else:
             _log_file_only(logger, logging.INFO, auto_memory_msg)
+    elif preinspect_ids is not None:
+        qcov_needs_grm = _gwas_qcov_prefers_grm_route(args.qcov, int(len(preinspect_ids)))
 
     if log:
         packed_auto_mode = bool(fast_mode)
@@ -6612,6 +6673,10 @@ def _run_gwas_pipeline(
         _append_advanced_note(
             "GWAS GRM auto route: memmap stays primary for full-sample builds; packed is "
             "reused only when a compatible preloaded packed payload is already available."
+        )
+    elif bool(qcov_requested):
+        _append_advanced_note(
+            "GWAS PCA auto route: large-sample Q build uses RSVD directly from genotype; GRM is not preloaded."
         )
     if bool(args.farmcpu):
         _append_advanced_note("FarmCPU selected: enabling packed auto route.")

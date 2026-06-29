@@ -72,13 +72,17 @@ conda create -n janusx \
 ### 1) GWAS
 
 ```bash
-# Estimate variance once in NULL model, similar with EMMAX. (Fast, recommand)
-jx gwas -vcf example/mouse_hs1940.vcf.gz -p example/mouse_hs1940.pheno -fvlmm -o test
-# Estimate variance for every snp, similar with GEMMA. (Exact)
+# Estimate variance for every snp, similar with GEMMA. (Exact, recommand)
 jx gwas -vcf example/mouse_hs1940.vcf.gz -p example/mouse_hs1940.pheno -lmm -o test
-# Linear mixed model with sparse GRM, similar with fastGWA. (Fast, grammar gamma)
+# Estimate variance for every snp, similar with GEMMA. (Exact, wald and LR test, recommand)
+jx gwas -vcf example/mouse_hs1940.vcf.gz -p example/mouse_hs1940.pheno -lmm2 -o test
+# Estimate variance once in NULL model, similar with EMMAX. (Fast)
+jx gwas -vcf example/mouse_hs1940.vcf.gz -p example/mouse_hs1940.pheno -fvlmm -o test
+# Linear mixed model with sparse GRM, similar with fastGWA. (Fast, grammar gamma, prepared for biobank cohorts)
 jx gwas -vcf example/mouse_hs1940.vcf.gz -p example/mouse_hs1940.pheno -splmm-approx -o test
-# FarmCPU (Fast, and more sites)
+# Linear mixed model with sparse GRM, similar with fastGWA. (Low peak RSS, prepared for biobank cohorts)
+jx gwas -vcf example/mouse_hs1940.vcf.gz -p example/mouse_hs1940.pheno -splmm -o test
+# FarmCPU (Fast, and more sites, prepared for biobank cohorts)
 jx gwas -vcf example/mouse_hs1940.vcf.gz -p example/mouse_hs1940.pheno -farmcpu -o test
 ```
 
@@ -89,7 +93,7 @@ jx gwas -vcf example/mouse_hs1940.vcf.gz -p example/mouse_hs1940.pheno -farmcpu 
 ### 2) Post-GWAS
 
 ```bash
-jx postgwas -gwasfile test/mouse_hs1940.test0.add.lmm.tsv -manh -qq -thr 1e-6 -o testpost
+jx postgwas -i test/mouse_hs1940.test0.lmm.tsv -manh -qq -thr 1e-6 -o testpost
 ```
 
 <p align="center">
@@ -99,11 +103,13 @@ jx postgwas -gwasfile test/mouse_hs1940.test0.add.lmm.tsv -manh -qq -thr 1e-6 -o
 ### 3) Genomic selection
 
 ```bash
-# BLUP method
+# BLUP method, prepared for biobank cohorts
 # n≤15,000 GBLUP
 # n>15,000 & m≤15,000 rrBLUP
 # n>15,000 & m>15,000 rrBLUP with PCG (Jacobi)
-jx gs -vcf example/mouse_hs1940.vcf.gz -p example/mouse_hs1940.pheno -BLUP -BayesA -BayesB -BayesCpi -o test -cv 5
+jx gs -vcf example/mouse_hs1940.vcf.gz -p example/mouse_hs1940.pheno -BLUP -o test -cv 5
+# Bayesian methods
+jx gs -vcf example/mouse_hs1940.vcf.gz -p example/mouse_hs1940.pheno -BayesA -BayesB -BayesCpi -o test -cv 5
 ```
 
 ```text

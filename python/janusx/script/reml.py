@@ -41,14 +41,12 @@ from janusx.assoc.workflow_model_packed import (
 )
 from janusx.pyBLUP.assoc import LMM
 from janusx.pyBLUP.blup import BLUP
-from ._common.cli import (
-    CliArgumentParser,
+from ._common.cli_args import (
     add_common_out_arg,
     add_common_prefix_arg,
     add_common_thread_arg,
-    cli_help_formatter,
-    minimal_help_epilog,
 )
+from ._common.cli_core import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 from ._common.log import setup_logging
 from ._common.config_render import emit_cli_configuration
 from ._common.grmio import load_grm_matrix, read_id_file, resolve_grm_id_path

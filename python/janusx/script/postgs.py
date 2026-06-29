@@ -26,7 +26,7 @@ import numpy as np
 import pandas as pd
 
 from janusx.bioplotkit import gsplot
-from janusx.script._common.cli import (
+from janusx.script._common.cli_core import (
     CliArgumentParser,
     cli_help_formatter,
     minimal_help_epilog,

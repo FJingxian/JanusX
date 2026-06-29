@@ -12,7 +12,7 @@ import numpy as np
 import pandas as pd
 
 from janusx.gfreader import prepare_cli_input_cache
-from ._common.cli import (
+from ._common.cli_args import (
     add_common_genotype_source_args,
     add_common_out_arg,
     add_common_prefix_arg,
@@ -20,7 +20,7 @@ from ._common.cli import (
 )
 from ._common.config_render import emit_cli_configuration
 from ._common.genoio import determine_genotype_source
-from ._common.cli import CliArgumentParser, cli_help_formatter, minimal_help_epilog
+from ._common.cli_core import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 from ._common.log import setup_logging
 from ._common.pathcheck import (
     ensure_all_true,

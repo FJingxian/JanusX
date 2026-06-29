@@ -19,7 +19,7 @@ import numpy as np
 from janusx.gfreader import inspect_genotype_file
 from janusx.janusx import g2p_simulate
 
-from ._common.cli import (
+from ._common.cli_args import (
     add_common_genotype_source_args,
     add_common_grm_file_arg,
     add_common_out_arg,
@@ -30,7 +30,7 @@ from ._common.config_render import emit_cli_configuration
 from ._common.genocache import configure_genotype_cache_from_out
 from ._common.genoio import determine_genotype_source_from_args as determine_genotype_source
 from ._common.grmio import load_and_align_grm
-from ._common.cli import CliArgumentParser, cli_help_formatter, minimal_help_epilog
+from ._common.cli_core import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 from ._common.log import setup_logging
 from ._common.pathcheck import (
     ensure_all_true,

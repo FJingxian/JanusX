@@ -29,12 +29,12 @@ import pandas as pd
 from janusx.garfield.decode import decode
 from janusx.script._common.log import setup_logging
 from janusx.script._common.config_render import emit_cli_configuration
-from janusx.script._common.cli import (
+from janusx.script._common.cli_core import (
     CliArgumentParser,
     cli_help_formatter,
     minimal_help_epilog,
 )
-from janusx.script._common.cli import (
+from janusx.script._common.cli_args import (
     add_common_covariate_file_arg,
     add_common_grm_file_arg,
     add_common_out_arg,

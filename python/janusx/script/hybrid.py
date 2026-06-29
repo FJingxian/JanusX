@@ -35,7 +35,7 @@ import pandas as pd
 
 from janusx.gfreader import SiteInfo, inspect_genotype_file, load_genotype_chunks, save_genotype_streaming
 
-from ._common.cli import (
+from ._common.cli_args import (
     add_common_genotype_source_args,
     add_common_out_arg,
     add_common_prefix_arg,
@@ -49,7 +49,7 @@ from ._common.genoio import (
     write_npy_output,
     write_text_output,
 )
-from ._common.cli import CliArgumentParser, cli_help_formatter, minimal_help_epilog
+from ._common.cli_core import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 from ._common.genocache import configure_genotype_cache_from_out
 from ._common.log import setup_logging
 from ._common.pathcheck import format_output_display, format_path_for_display, safe_expanduser

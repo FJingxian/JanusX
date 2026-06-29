@@ -35,7 +35,7 @@ from janusx.adamixture.core import (
 )
 from janusx.gfreader import inspect_genotype_file
 from ._common.interrupt import force_exit
-from ._common.cli import (
+from ._common.cli_args import (
     add_common_genotype_source_args,
     add_common_memory_arg,
     add_common_out_arg,
@@ -46,7 +46,7 @@ from ._common.cli import (
 )
 from ._common.config_render import emit_cli_configuration
 from ._common.genoio import determine_genotype_source_from_args, strip_default_prefix_suffix
-from ._common.cli import CliArgumentParser, cli_help_formatter, minimal_help_epilog
+from ._common.cli_core import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 from ._common.log import setup_logging
 from ._common.memory import (
     DEFAULT_DECODE_MEMORY_GB,

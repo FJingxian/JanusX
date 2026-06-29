@@ -18,7 +18,7 @@ from janusx.assoc.workflow import (
 )
 from janusx.assoc.workflow_cache import _gwas_cache_prefix_with_params
 from janusx.gtools.reader import readanno
-from janusx.script._common.cli import (
+from janusx.script._common.cli_args import (
     add_common_covariate_file_or_site_arg,
     add_common_genotype_source_args,
     add_common_grm_file_arg,
@@ -34,7 +34,7 @@ from janusx.script._common.config_render import emit_cli_configuration
 from janusx.script._common.genoio import determine_genotype_source_from_args as determine_genotype_source
 from janusx.script._common.genocache import configure_genotype_cache_from_out
 from janusx.script._common.grmio import load_and_align_grm
-from janusx.script._common.cli import CliArgumentParser, cli_help_formatter
+from janusx.script._common.cli_core import CliArgumentParser, cli_help_formatter
 from janusx.script._common.log import setup_logging
 from janusx.script._common.pathcheck import (
     ensure_all_true,

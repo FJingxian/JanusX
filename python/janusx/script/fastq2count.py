@@ -10,7 +10,7 @@ try:
 except Exception:
     jxrs = None
 
-from ._common.cli import CliArgumentParser, cli_help_formatter, minimal_help_epilog
+from ._common.cli_core import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 
 
 def build_parser() -> argparse.ArgumentParser:

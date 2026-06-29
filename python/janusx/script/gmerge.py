@@ -40,7 +40,7 @@ from ._common.genoio import (
     write_npy_output,
     write_text_output,
 )
-from ._common.cli import CliArgumentParser, cli_help_formatter, minimal_help_epilog
+from ._common.cli_core import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 from ._common.genocache import configure_genotype_cache_from_out
 from ._common.log import setup_logging
 from ._common.pathcheck import (

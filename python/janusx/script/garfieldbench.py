@@ -32,7 +32,7 @@ from janusx.gfreader.gfreader import save_genotype_streaming
 from janusx.script._common.config_render import emit_cli_configuration
 from janusx.script._common.genoio import determine_genotype_source_from_args as determine_genotype_source
 from janusx.script._common.genocache import configure_genotype_cache_from_out
-from janusx.script._common.cli import CliArgumentParser, cli_help_formatter, minimal_help_epilog
+from janusx.script._common.cli_core import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 from janusx.script._common.log import setup_logging
 from janusx.script._common.pathcheck import (
     ensure_all_true,

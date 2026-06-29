@@ -39,7 +39,7 @@ from janusx.janusx import (
     nj_newick_from_alignment_u8,
 )
 
-from ._common.cli import (
+from ._common.cli_args import (
     add_common_genotype_source_args,
     add_common_maf_arg,
     add_common_geno_arg,
@@ -50,7 +50,7 @@ from ._common.cli import (
     add_common_thread_arg,
 )
 from ._common.genoio import determine_genotype_source_from_args
-from ._common.cli import CliArgumentParser, cli_help_formatter, minimal_help_epilog
+from ._common.cli_core import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 from ._common.log import setup_logging
 from ._common.pathcheck import (
     ensure_file_exists,

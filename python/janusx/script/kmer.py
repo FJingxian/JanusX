@@ -18,9 +18,9 @@ try:
 except Exception:
     jxrs = None
 
-from ._common.cli import add_common_out_arg, add_common_prefix_arg, add_common_thread_arg
+from ._common.cli_args import add_common_out_arg, add_common_prefix_arg, add_common_thread_arg
 from ._common.config_render import emit_cli_configuration
-from ._common.cli import CliArgumentParser, cli_help_formatter, minimal_help_epilog
+from ._common.cli_core import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 from ._common.log import setup_logging
 from ._common.pathcheck import format_path_for_display
 from ._common.progress import CliStatus, format_elapsed, log_success, stdout_is_tty

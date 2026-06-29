@@ -83,7 +83,7 @@ except Exception:
     _packed_prune_kernel_stats = None
 
 from ._common.config_render import emit_cli_configuration
-from ._common.cli import (
+from ._common.cli_args import (
     add_common_genotype_source_args,
     add_common_out_arg,
     add_common_prefix_arg,
@@ -99,7 +99,7 @@ from ._common.genoio import (
     write_npy_output,
     write_text_output,
 )
-from ._common.cli import CliArgumentParser, cli_help_formatter, minimal_help_epilog
+from ._common.cli_core import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 from ._common.log import setup_logging
 from ._common.pathcheck import (
     ensure_all_true,

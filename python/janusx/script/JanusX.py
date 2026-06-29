@@ -32,7 +32,7 @@ Modules:
     view          View .bkmer/.bsite as plain text for pipes
     tree          Tree workflow entry (`-nj` Neighbor-Joining / `-ml` FastTree ML)
     treeplot      Visualize Newick/GRM trees with toytree
-    adamixture    ADAMIXTURE ancestry inference
+    fastpop       FastPop ancestry inference
     hybrid        Build pairwise hybrid genotype matrix from parent lists
     gformat       Convert genotype files across plink/vcf/txt/npy
     gmerge        Merge genotype/variant tables
@@ -138,7 +138,7 @@ _CLI_MODULE_SECTIONS = [
             ("view", "View .bkmer/.bsite as plain text for shell pipes"),
             ("tree", "Tree workflow entry (`-nj` Neighbor-Joining / `-ml` FastTree ML)"),
             ("treeplot", "Visualize Newick/GRM trees with toytree"),
-            ("adamixture", "ADAMIXTURE ancestry inference"),
+            ("fastpop", "FastPop ancestry inference"),
             ("hybrid", "Build pairwise hybrid genotype matrix from parent lists"),
             ("gformat", "Convert genotype files across plink/vcf/txt/npy"),
             ("gmerge", "Merge genotype/variant tables"),
@@ -149,7 +149,7 @@ _CLI_MODULE_SECTIONS = [
 _MODULE_NAMES = [
     "gwas", "postgwas", "postgarfield", "postbsa",
     "garfield", "grm", "pca", "gstats", "gs", "reml", "postgs",
-    "sim", "simulation", "benchmark", "gblupbench", "bayesbench", "garfieldbench", "adamixture", "tree", "gformat", "gmerge", "hybrid", "webui",
+    "sim", "simulation", "benchmark", "gblupbench", "bayesbench", "garfieldbench", "fastpop", "adamixture", "tree", "gformat", "gmerge", "hybrid", "webui",
     "fastq2vcf", "fastq2count", "kmer", "kmerge", "kstats", "view", "treeplot", "refcheck",
 ]
 _SCRIPT_MODULE_ALIASES = {

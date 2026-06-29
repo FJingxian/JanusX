@@ -13,7 +13,7 @@ from ._common.binsidecar import (
     LEGACY_BSITE_MAGIC,
     LEGACY_BSITE_VERSION,
 )
-from ._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog
+from ._common.cli import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 
 BKMER_MAGIC = b"JXBKMR1\x00"
 BKMER_HEADER_SIZE = 64

@@ -29,7 +29,7 @@ import numpy as np
 import pandas as pd
 
 from ._common.cli import add_common_out_arg, add_common_prefix_arg
-from ._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog
+from ._common.cli import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 
 
 def _normalize_prefix(path_or_prefix: str) -> str:

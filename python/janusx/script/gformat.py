@@ -99,7 +99,7 @@ from ._common.genoio import (
     write_npy_output,
     write_text_output,
 )
-from ._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog
+from ._common.cli import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 from ._common.log import setup_logging
 from ._common.pathcheck import (
     ensure_all_true,

@@ -28,7 +28,7 @@ JanusX (Joint Association and Novel Utility for Selection) is a GWAS and genomic
 - Genomic selection: `GBLUP`, `adBLUP`, `rrBLUP`, `BayesA/B/Cpi`, and ML models (`RF/ET/GBDT/XGB/SVM/ENET`)
 - Streaming genotype IO for VCF/HMP/PLINK/TXT/NPY
 - Post-analysis workflows: `postgwas`, `postgarfield`, `postbsa`
-- Utility workflows: `grm`, `pca`, `gformat`, `gmerge`, `hybrid`, `adamixture`, `webui`, `sim`, `simulation`
+- Utility workflows: `grm`, `pca`, `gformat`, `gmerge`, `hybrid`, `fastpop`, `webui`, `sim`, `simulation`
 - Launcher pipelines: `fastq2vcf`, `fastq2count`
 
 ---
@@ -155,7 +155,12 @@ jx <module> -h
 - `pca`
 - `gwas`
 - `postgwas` (Visualization, `manh` `qq` `ldblock`)
-- `adamixture` (Based on https://github.com/AI-sandbox/ADAMIXTURE.git)
+- `fastpop` (population-structure analysis; `jx adamixture` kept as compatibility alias)
+
+Attribution note:
+
+- FastPop is JanusX's own population-structure workflow and public name for this module.
+- Historical JanusX releases referenced ADAMIXTURE as a related implementation; the BSD-3-Clause attribution notice is recorded in [THIRD_PARTY_NOTICES.md](./doc/THIRD_PARTY_NOTICES.md).
 
 **Genomic Selection (GS)**:
 

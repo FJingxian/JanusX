@@ -15,7 +15,7 @@ Use these modules as the main public surface:
 | `janusx.gs` | GS-style wrappers and result objects | mirrors `jx gs` |
 | `janusx.pyBLUP` | direct in-memory association, GRM, BLUP, and ML kernels | lower-level than `assoc` / `gs` |
 | `janusx.pyBLUP.bayes` | `BayesA`, `BayesB`, `BayesCpi`, `BAYES` | Bayesian GS imports live here, not at `janusx.pyBLUP` top level |
-| `janusx.adamixture` | RSVD, ancestry decomposition, CVerror | mirrors `jx adamixture` |
+| `janusx.fastpop` | RSVD, ancestry decomposition, CVerror | mirrors `jx fastpop` |
 | `janusx.garfield.logreg` | logical conjunction search on binary features | lightweight Python-facing GARFIELD entry |
 | `janusx.gtools` | GFF/BED readers and region queries | annotation-centric helpers |
 | `janusx.bioplotkit` | GWAS, PCA, GS, and structure plots | some helpers live in submodules rather than the top-level export list |
@@ -269,13 +269,17 @@ Important caveat:
 - for large on-disk GRM work, use the CLI `jx grm`
 - advanced users can inspect native functions such as `janusx.janusx.grm_stream_bed_f32` and `janusx.janusx.grm_packed_bed_f32`, but those are lower-level interfaces
 
-## 6. ADAMixture, annotation, and plotting
+## 6. FastPop, annotation, and plotting
 
-### 6.1 ADAMixture
+### 6.1 FastPop
+
+Preferred public API names are `janusx.fastpop.FastPopConfig`,
+`janusx.fastpop.train_fastpop`, and `janusx.fastpop.evaluate_fastpop_cverror`.
+Older `janusx.adamixture.*` names remain as compatibility aliases.
 
 ```python
 import logging
-from janusx.adamixture import ADAMixtureConfig, rsvd_streaming, train_adamixture
+from janusx.fastpop import FastPopConfig, rsvd_streaming, train_fastpop
 
 eigvals, eigvecs = rsvd_streaming(
     "example/~mouse_hs1940",
@@ -289,18 +293,18 @@ eigvals, eigvecs = rsvd_streaming(
 )
 print(eigvals.shape, eigvecs.shape)
 
-cfg = ADAMixtureConfig(
+cfg = FastPopConfig(
     genotype_path="example/~mouse_hs1940",
     k=4,
-    outdir="demo/admixture",
+    outdir="demo/fastpop",
     prefix="mouse_hs1940",
     threads=8,
 )
-logger = logging.getLogger("admixture")
+logger = logging.getLogger("fastpop")
 logger.addHandler(logging.StreamHandler())
 logger.setLevel(logging.INFO)
 
-P, Q, m, n = train_adamixture(cfg, logger)
+P, Q, m, n = train_fastpop(cfg, logger)
 print(P.shape, Q.shape, m, n)
 ```
 
@@ -355,15 +359,18 @@ Use `janusx.pipeline` for environment compatibility checks. Use `janusx.ui` when
 
 ## 8. CLI-to-Python mapping
 
+Compatibility note: `jx fastpop` is the preferred module name. `jx adamixture`
+and `janusx.adamixture.*` remain supported aliases for existing code.
+
 | CLI module | Recommended Python entry |
 | --- | --- |
 | `jx gwas` | `janusx.assoc.AssociationConfig`, `run_gwas_config`, `LinearModel` |
 | `jx gs` | `janusx.gs.GsConfig`, `run_gs_config`, `GenomicSelection` |
-| `jx adamixture` | `janusx.adamixture.ADAMixtureConfig`, `rsvd_streaming`, `train_adamixture` |
+| `jx fastpop` | `janusx.fastpop.FastPopConfig`, `rsvd_streaming`, `train_fastpop` |
 | `jx gformat` | `janusx.gfreader.load_genotype_chunks`, `save_genotype_streaming` |
 | `jx gmerge` | `janusx.gfreader.gmerge.merge` |
 | `jx grm` | CLI recommended for file-backed runs; `janusx.pyBLUP.GRM` or `QK` for in-memory matrices |
-| `jx pca` | `janusx.adamixture.rsvd_streaming`, `janusx.pyBLUP.QK.PCA()`, or plotting helpers, depending on the workflow |
+| `jx pca` | `janusx.fastpop.rsvd_streaming`, `janusx.pyBLUP.QK.PCA()`, or plotting helpers, depending on the workflow |
 | `jx fastq2vcf` / `jx fastq2count` | `janusx.pipeline.run_fastq2vcf_checks`, `run_fastq2count_checks` |
 
 ## 9. Practical notes

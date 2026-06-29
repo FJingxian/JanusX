@@ -235,7 +235,7 @@ pub(crate) fn check_admx_memory_limit(stage: &str) -> Result<(), String> {
         .map(format_bytes)
         .unwrap_or_else(|| "NA".to_string());
     Err(format!(
-        "ADAMIXTURE memory limit exceeded at {stage}: {}={} (rss={}, footprint={}, limit={}).",
+        "FastPop memory limit exceeded at {stage}: {}={} (rss={}, footprint={}, limit={}).",
         usage.metric,
         format_bytes(usage.current_bytes),
         rss,

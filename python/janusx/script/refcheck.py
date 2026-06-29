@@ -11,7 +11,7 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
-from ._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog
+from ._common.cli import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 
 
 @dataclass

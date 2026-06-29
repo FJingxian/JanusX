@@ -218,3 +218,7 @@ def plot_admixture_structure(
         "tag_missing": missing_tags,
         "out_path": (None if out_path is None else str(out_path)),
     }
+
+
+def plot_fastpop_structure(*args: Any, **kwargs: Any) -> dict[str, Any]:
+    return plot_admixture_structure(*args, **kwargs)

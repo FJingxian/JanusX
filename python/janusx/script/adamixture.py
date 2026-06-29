@@ -1,17 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-JanusX: ADAMIXTURE ancestry inference (Rust-kernel backend)
+JanusX: FastPop ancestry inference (Rust-kernel backend)
 
 Examples
 --------
-  jx adamixture -bfile data/geno -k 8 -o out -prefix cohort
-  jx adamixture -vcf data/geno.vcf.gz -k 6 -t 16
+  jx fastpop -bfile data/geno -k 8 -o out -prefix cohort
+  jx fastpop -vcf data/geno.vcf.gz -k 6 -t 16
 """
 
 from __future__ import annotations
 
 import argparse
 import ctypes
+import gzip
 import logging
 import math
 import os
@@ -27,11 +28,16 @@ import numpy as np
 
 from janusx import janusx as jxrs
 from janusx.adamixture import ADAMixtureConfig, evaluate_adamixture_cverror, train_adamixture
-from janusx.adamixture.core import _admx_py_mem_debug, load_genotype_u8_matrix
+from janusx.adamixture.core import (
+    _admx_py_mem_debug,
+    _is_admx_memory_limit_error,
+    load_genotype_u8_matrix,
+)
 from janusx.gfreader import inspect_genotype_file
 from ._common.interrupt import force_exit
 from ._common.cli import (
     add_common_genotype_source_args,
+    add_common_memory_arg,
     add_common_out_arg,
     add_common_prefix_arg,
     add_common_snps_only_arg,
@@ -40,8 +46,13 @@ from ._common.cli import (
 )
 from ._common.config_render import emit_cli_configuration
 from ._common.genoio import determine_genotype_source_from_args, strip_default_prefix_suffix
-from ._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog
+from ._common.cli import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 from ._common.log import setup_logging
+from ._common.memory import (
+    DEFAULT_DECODE_MEMORY_GB,
+    decode_memory_gb_to_mb,
+    resolve_decode_block_rows,
+)
 from ._common.pathcheck import (
     ensure_all_true,
     ensure_file_exists,
@@ -68,6 +79,33 @@ from ._common.threads import (
 
 _DEFAULT_CVERROR_FOLDS = 5
 _ADMX_PROGRESS_BAR_WIDTH = 24
+
+
+def _popstruct_brand() -> dict[str, str]:
+    raw = str(os.environ.get("JANUSX_POPSTRUCT_BRAND", "")).strip().lower()
+    if raw == "fastpop":
+        return {
+            "display": "FastPop",
+            "cli": "fastpop",
+            "app_title": "JanusX - FastPop",
+            "config_title": "FASTPOP CONFIG",
+            "summary_stem": "fastpop",
+            "plot_stem": "fastpop",
+            "run_log_stem": "fastpop",
+            "logger_name": "janusx.fastpop.bootstrap",
+        }
+    return {
+        # Keep `jx adamixture` as a CLI/output alias, but present the module as
+        # FastPop everywhere user-facing.
+        "display": "FastPop",
+        "cli": "adamixture",
+        "app_title": "JanusX - FastPop",
+        "config_title": "FASTPOP CONFIG",
+        "summary_stem": "fastpop",
+        "plot_stem": "fastpop",
+        "run_log_stem": "fastpop",
+        "logger_name": "janusx.fastpop.bootstrap",
+    }
 
 
 def _parse_cv_spec(cv_raw: Optional[str]) -> tuple[bool, int, str]:
@@ -106,17 +144,18 @@ def _bool_env(name: str, default: bool = True) -> bool:
     return raw not in {"0", "false", "no", "off"}
 
 
-def _default_max_rss_gb() -> float:
-    raw = str(os.environ.get("JANUSX_ADMX_MAX_RSS_GB", "")).strip()
-    if raw == "":
-        return 10.0
-    try:
-        value = float(raw)
-    except Exception:
-        return 10.0
-    if not math.isfinite(value):
-        return 10.0
-    return float(value)
+def _resolve_admx_rss_cap_gb_from_env() -> Optional[float]:
+    for name in ("JANUSX_ADMX_MAX_FOOTPRINT_GB", "JANUSX_ADMX_MAX_RSS_GB"):
+        raw = str(os.environ.get(name, "")).strip()
+        if raw == "":
+            continue
+        try:
+            value = float(raw)
+        except Exception:
+            continue
+        if math.isfinite(value) and value > 0.0:
+            return float(value)
+    return None
 
 
 class _AdmixtureMemoryWatchdog:
@@ -145,7 +184,7 @@ class _AdmixtureMemoryWatchdog:
         self._psutil = psutil
         self._thread = threading.Thread(
             target=self._run,
-            name="janusx-admixture-rss-watchdog",
+            name="janusx-fastpop-rss-watchdog",
             daemon=True,
         )
         self._thread.start()
@@ -255,8 +294,9 @@ class _AdmixtureMemoryWatchdog:
             limit_label = (
                 f"{self.limit_gb:.3f}" if self.limit_gb < 0.01 else f"{self.limit_gb:.2f}"
             )
+            brand = _popstruct_brand()
             msg = (
-                "ADAMIXTURE task aborted: memory limit exceeded "
+                f"{brand['display']} task aborted: memory limit exceeded "
                 f"(limit={limit_label} GB, {metric}={mem_gb:.2f} GB)."
             )
             try:
@@ -298,61 +338,101 @@ def _try_read_plink_sample_ids(genotype_path: str) -> Optional[list[str]]:
     return sample_ids
 
 
-def _build_k_warm_start(
-    prev_model: Optional[dict[str, Any]],
+def _open_text_auto(path: str):
+    if str(path).lower().endswith(".gz"):
+        return gzip.open(path, "rt", encoding="utf-8", errors="ignore")
+    return open(path, "r", encoding="utf-8", errors="ignore")
+
+
+def _lightweight_sample_count(
+    genotype_path: str,
     *,
-    target_k: int,
-    seed: int,
-) -> Optional[tuple[np.ndarray, np.ndarray]]:
-    if prev_model is None:
-        return None
-    prev_k = int(prev_model.get("k", 0))
-    if int(target_k) <= int(prev_k):
-        return None
-    p_prev = np.ascontiguousarray(np.asarray(prev_model.get("p"), dtype=np.float32))
-    q_prev = np.ascontiguousarray(np.asarray(prev_model.get("q"), dtype=np.float32))
-    if p_prev.ndim != 2 or q_prev.ndim != 2:
-        return None
-    if p_prev.shape[1] != int(prev_k) or q_prev.shape[1] != int(prev_k):
+    source_label: str,
+    snps_only: bool,
+    maf: float,
+    missing_rate: float,
+) -> Optional[int]:
+    src = str(source_label).strip().upper()
+    if src == "BFILE":
+        ids = _try_read_plink_sample_ids(genotype_path)
+        return (None if ids is None or len(ids) <= 0 else int(len(ids)))
+
+    if src == "VCF":
+        with _open_text_auto(genotype_path) as fr:
+            for line in fr:
+                if line.startswith("#CHROM"):
+                    toks = str(line).rstrip("\r\n").split()
+                    return max(0, int(len(toks) - 9))
         return None
 
-    m = int(p_prev.shape[0])
-    n = int(q_prev.shape[0])
-    dk = int(target_k) - int(prev_k)
-    if dk <= 0:
+    if src == "HMP":
+        with _open_text_auto(genotype_path) as fr:
+            for line in fr:
+                raw = str(line).strip()
+                if raw == "" or raw.startswith("#"):
+                    continue
+                toks = raw.split()
+                return max(0, int(len(toks) - 11))
         return None
 
-    rng = np.random.default_rng(int(seed) + int(target_k) * 7919)
-    p_extra = rng.random(size=(m, dk), dtype=np.float32)
-    p0 = np.ascontiguousarray(
-        np.clip(np.concatenate([p_prev, p_extra], axis=1), 1e-5, 1.0 - 1e-5),
-        dtype=np.float32,
+    sample_ids, _n_snps = inspect_genotype_file(
+        genotype_path,
+        snps_only=bool(snps_only),
+        maf=float(maf),
+        missing_rate=float(missing_rate),
     )
+    return int(len(sample_ids)) if len(sample_ids) > 0 else None
 
-    mass_raw = str(os.environ.get("JANUSX_ADMX_K_WARM_QMASS", "0.02")).strip()
+
+def _resolve_fastpop_chunk_rows(
+    *,
+    genotype_path: str,
+    source_label: str,
+    snps_only: bool,
+    maf: float,
+    missing_rate: float,
+    memory_gb: float,
+) -> int:
+    memory_mb = decode_memory_gb_to_mb(
+        memory_gb,
+        default_gb=DEFAULT_DECODE_MEMORY_GB,
+        arg_name="-mem/--memory",
+    )
+    sample_count: Optional[int] = None
     try:
-        new_mass = float(mass_raw)
+        sample_count = _lightweight_sample_count(
+            genotype_path,
+            source_label=source_label,
+            snps_only=bool(snps_only),
+            maf=float(maf),
+            missing_rate=float(missing_rate),
+        )
     except Exception:
-        new_mass = 0.02
-    new_mass = min(0.20, max(1e-4, float(new_mass)))
+        sample_count = None
 
-    q_prev = np.clip(q_prev, 1e-8, None)
-    s_prev = q_prev.sum(axis=1, keepdims=True)
-    s_prev[s_prev <= 0] = 1.0
-    q_prev = q_prev / s_prev
+    if sample_count is not None and int(sample_count) > 0:
+        return int(
+            max(
+                1000,
+                resolve_decode_block_rows(
+                    int(sample_count),
+                    float(memory_mb),
+                    elem_bytes=4,
+                    buffers=1,
+                    min_rows=1000,
+                ),
+            )
+        )
 
-    q_extra = rng.random(size=(n, dk), dtype=np.float32)
-    s_extra = q_extra.sum(axis=1, keepdims=True)
-    s_extra[s_extra <= 0] = 1.0
-    q_extra = q_extra / s_extra
+    budget_bytes = int(max(1.0, float(memory_mb)) * 1024.0 * 1024.0)
+    fallback_rows = int(budget_bytes // (8192 * 4))
+    return int(max(1000, fallback_rows))
 
-    q_old = q_prev * float(1.0 - new_mass)
-    q_new = q_extra * float(new_mass)
-    q0 = np.ascontiguousarray(
-        np.clip(np.concatenate([q_old, q_new], axis=1), 1e-8, None),
-        dtype=np.float32,
-    )
-    return p0, q0
+
+def _format_fastpop_memory_cfg(memory_gb: float | int | None) -> str:
+    if memory_gb is None:
+        return "NA"
+    return f"{float(memory_gb):.6g} GB"
 
 
 def _mute_stdout_info_logs(
@@ -1033,11 +1113,10 @@ def _run_single_k(
     cv_label: str,
     tag_samples: list[str],
     shared_g: Optional[np.ndarray],
-    warm_start: Optional[tuple[np.ndarray, np.ndarray]],
-    keep_model_for_warmstart: bool,
-) -> tuple[dict[str, Any], Optional[dict[str, Any]]]:
+) -> dict[str, Any]:
+    brand = _popstruct_brand()
     use_batch_progress = bool(batch_progress is not None and batch_progress.enabled)
-    log_path = os.path.join(outdir, f"{prefix}.{int(k)}.adamix.log")
+    log_path = os.path.join(outdir, f"{prefix}.{int(k)}.{brand['run_log_stem']}.log")
     logger = setup_logging(log_path)
     apply_blas_thread_env(int(resolved_threads))
     if not use_batch_progress:
@@ -1052,7 +1131,7 @@ def _run_single_k(
     p_npy_out = os.path.join(outdir, f"{prefix}.{int(k)}.P.npy")
     p_site_out = os.path.join(outdir, f"{prefix}.{int(k)}.P.site")
     structure_fmt = "svg"
-    structure_out = os.path.join(outdir, f"{prefix}.{int(k)}.admix.{structure_fmt}")
+    structure_out = os.path.join(outdir, f"{prefix}.{int(k)}.{brand['plot_stem']}.{structure_fmt}")
     plot_enabled = not bool(getattr(args, "no_plot", False))
 
     model_rows = [
@@ -1067,7 +1146,6 @@ def _run_single_k(
     ]
     if int(total_k) > 1:
         model_rows.append(("K spec", str(k_spec)))
-        model_rows.append(("K warmstart", ("on" if warm_start is not None else "off")))
 
     cfg_mute: list[tuple[logging.Handler, int]] = []
     if not emit_config_to_stdout:
@@ -1079,8 +1157,8 @@ def _run_single_k(
         )
         emit_cli_configuration(
             logger,
-            app_title="JanusX - ADAMIXTURE",
-            config_title="ADAMIXTURE CONFIG",
+            app_title=brand["app_title"],
+            config_title=brand["config_title"],
             host=socket.gethostname(),
             sections=[
                 (
@@ -1088,7 +1166,6 @@ def _run_single_k(
                     [
                         ("Genotype", genotype_path),
                         ("Input type", source_label),
-                        ("Chunk size", int(args.chunksize)),
                         ("SNPs only", bool(args.snps_only)),
                         ("MAF threshold", float(args.maf)),
                         ("Miss threshold", float(args.geno)),
@@ -1107,6 +1184,7 @@ def _run_single_k(
                                 detected_threads=int(detected_threads),
                             ),
                         ),
+                        ("Memory", _format_fastpop_memory_cfg(getattr(args, "memory", None))),
                         ("Seed", int(args.seed)),
                     ],
                 ),
@@ -1133,7 +1211,7 @@ def _run_single_k(
         prefix=prefix,
         seed=int(args.seed),
         threads=max(1, int(resolved_threads)),
-        chunk_size=max(1000, int(args.chunksize)),
+        chunk_size=int(max(1000, int(getattr(args, "_resolved_chunk_rows", 50000)))),
         snps_only=bool(args.snps_only),
         maf=float(args.maf),
         geno=float(args.geno),
@@ -1172,7 +1250,6 @@ def _run_single_k(
                 logger,
                 callback=callback,
                 g_matrix=(None if bed_stream_session else shared_g),
-                warm_start=warm_start,
             )
             _admx_py_mem_debug(
                 "cli/run_single_k/after_train",
@@ -1273,16 +1350,16 @@ def _run_single_k(
         _restore_handler_levels(muted)
         if progress_ui is not None:
             try:
-                progress_ui.fail("ADAMIXTURE ...Failed")
+                progress_ui.fail(f"{brand['display']} ...Failed")
             except Exception:
                 pass
-        if "ADAMIXTURE memory limit exceeded" in str(e):
+        if _is_admx_memory_limit_error(e):
             msg = str(e)
             logger.error(msg)
-            print_failure("ADAMIXTURE memory limit exceeded", force_color=True)
+            print_failure(f"{brand['display']} memory limit exceeded", force_color=True)
             force_exit(137, msg)
-        logger.exception(f"ADAMIXTURE failed: {e}")
-        print_failure("ADAMIXTURE ...Failed", force_color=True)
+        logger.exception(f"{brand['display']} failed: {e}")
+        print_failure(f"{brand['display']} ...Failed", force_color=True)
         raise
 
     _restore_handler_levels(muted)
@@ -1325,36 +1402,25 @@ def _run_single_k(
         "structure_plot": (None if structure_plot_path is None else str(structure_plot_path)),
         "log_path": log_path,
     }
-    model_state: Optional[dict[str, Any]] = None
-    if keep_model_for_warmstart:
-        model_state = {
-            "k": int(k),
-            "p": np.ascontiguousarray(np.asarray(p_mat, dtype=np.float32)),
-            "q": np.ascontiguousarray(np.asarray(q_mat, dtype=np.float32)),
-        }
-    return row, model_state
+    return row
 
 
 def _build_parser() -> CliArgumentParser:
+    brand = _popstruct_brand()
+    cli = f"jx {brand['cli']}"
+    help_profile = ("fastpop" if brand["cli"] == "fastpop" else "admixture")
     parser = CliArgumentParser(
-        prog="jx adamixture",
+        prog=cli,
         formatter_class=cli_help_formatter(),
         epilog=minimal_help_epilog([
-            "jx adamixture -bfile data/geno -k 8 -o out -prefix cohort",
-            "jx adamixture -vcf data/geno.vcf.gz -k 1..10 -t 16",
-            "jx adamixture -vcf data/geno.vcf.gz -k 1..10..3 -t 16",
-            "jx adamixture -vcf data/geno.vcf.gz -k 1,3,5 -t 16",
-            "jx adamixture -vcf data/geno.vcf.gz -k 1..10 -cv",
-            "jx adamixture -vcf data/geno.vcf.gz -k 1..10 -cv 5",
-            "jx adamixture -vcf data/geno.vcf.gz -k 6 -tag sample1,sample2",
-            "jx adamixture -vcf data/geno.vcf.gz -k 6 --tag tag_samples.txt",
-            "jx adamixture -vcf data/geno.vcf.gz -k 1..10 -cv --k-warmstart",
+            f"{cli} -bfile data/geno -k 8 -o out -prefix cohort",
+            f"{cli} -vcf data/geno.vcf.gz -k 1..10 -t 16",
         ]),
     )
 
     req_geno = parser.add_argument_group("Required Genotype Input (Choose one)")
     geno = req_geno.add_mutually_exclusive_group(required=True)
-    add_common_genotype_source_args(geno, include_file=True, help_profile="admixture")
+    add_common_genotype_source_args(geno, include_file=True, help_profile=help_profile)
     req_model = parser.add_argument_group("Required Nclusters")
     req_model.add_argument(
         "-k",
@@ -1384,13 +1450,6 @@ def _build_parser() -> CliArgumentParser:
         action="store_true",
         default=False,
         help="Skip structure plot rendering and only write Q/P/site/log outputs.",
-    )
-    input_output.add_argument(
-        "-chunksize",
-        "--chunksize",
-        type=int,
-        default=50000,
-        help="Number of SNPs per loading chunk (default: 50000).",
     )
     add_common_snps_only_arg(
         input_output,
@@ -1422,14 +1481,16 @@ def _build_parser() -> CliArgumentParser:
         help=argparse.SUPPRESS,
     )
     runtime.add_argument("-seed", "--seed", type=int, default=42, help="Random seed (default: 42).")
-    runtime.add_argument(
-        "--max-rss-gb",
-        type=float,
-        default=_default_max_rss_gb(),
-        help=(
-            "Abort the task if current RSS exceeds this memory cap in GB "
-            f"(default: {_default_max_rss_gb():g}; use 0 to disable)."
+    add_common_memory_arg(
+        runtime,
+        default=DEFAULT_DECODE_MEMORY_GB,
+        help_text=(
+            "Working memory budget in GB for FastPop streamed genotype loading/decode. "
+            "This controls internal chunk sizing rather than total process RSS; "
+            "explicit -mem keeps the requested fixed budget (default: %(default)s)."
         ),
+        dest="memory",
+        include_hidden_legacy_single_dash_alias=True,
     )
 
     model = parser.add_argument_group("Model/Optimization Arguments")
@@ -1478,19 +1539,11 @@ def _build_parser() -> CliArgumentParser:
             "Omit -cv to disable CVerror."
         ),
     )
-    model.add_argument(
-        "--k-warmstart",
-        action="store_true",
-        default=False,
-        help=(
-            "Enable warm-start between consecutive K values in K-scan mode "
-            "(default: disabled, for consistency)."
-        ),
-    )
     return parser
 
 
 def main() -> None:
+    brand = _popstruct_brand()
     parser = _build_parser()
     args = parser.parse_args()
     if not (0.0 <= float(args.maf) <= 0.5):
@@ -1505,9 +1558,12 @@ def main() -> None:
         parser.error("-check/--check must be a positive integer.")
     if int(args.thread) <= 0:
         parser.error("-t/--thread must be a positive integer.")
-    if (not math.isfinite(float(args.max_rss_gb))) or float(args.max_rss_gb) < 0.0:
-        parser.error("--max-rss-gb must be >= 0.")
-    os.environ["JANUSX_ADMX_MAX_RSS_GB"] = str(float(args.max_rss_gb))
+    memory_mb = decode_memory_gb_to_mb(
+        getattr(args, "memory", DEFAULT_DECODE_MEMORY_GB),
+        default_gb=DEFAULT_DECODE_MEMORY_GB,
+        arg_name="-mem/--memory",
+    )
+    os.environ["JANUSX_ADMX_LOAD_MB"] = str(int(max(1, round(float(memory_mb)))))
     try:
         k_values = _parse_k_spec(str(args.k))
     except Exception as ex:
@@ -1528,15 +1584,16 @@ def main() -> None:
     os.makedirs(outdir, exist_ok=True)
     t0 = time.time()
 
-    tmp_logger = logging.getLogger("janusx.adamixture.bootstrap")
+    tmp_logger = logging.getLogger(brand["logger_name"])
     if not tmp_logger.handlers:
         h = logging.StreamHandler()
         h.setFormatter(logging.Formatter("%(message)s"))
         tmp_logger.addHandler(h)
     tmp_logger.setLevel(logging.INFO)
     tmp_logger.propagate = False
+    rss_cap_gb = _resolve_admx_rss_cap_gb_from_env()
     rss_watchdog = _AdmixtureMemoryWatchdog(
-        limit_gb=float(args.max_rss_gb),
+        limit_gb=float(0.0 if rss_cap_gb is None else rss_cap_gb),
         logger=tmp_logger,
     )
     try:
@@ -1550,10 +1607,17 @@ def main() -> None:
     prefix = args.prefix or auto_prefix
     multi_k = len(k_values) > 1
     enable_spinner = bool(stdout_is_tty())
-    k_warmstart_enabled = bool(multi_k and bool(args.k_warmstart))
     bed_stream_session = _bed_stream_session_available(source_label)
     use_geno_cache = _bool_env("JANUSX_ADMX_CACHE_GENO", True)
     effective_geno_cache = bool(use_geno_cache and (not bed_stream_session))
+    args._resolved_chunk_rows = _resolve_fastpop_chunk_rows(
+        genotype_path=genotype_path,
+        source_label=source_label,
+        snps_only=bool(args.snps_only),
+        maf=float(args.maf),
+        missing_rate=float(args.geno),
+        memory_gb=float(getattr(args, "memory", DEFAULT_DECODE_MEMORY_GB)),
+    )
     if multi_k:
         if cv_enabled:
             cv_msg = str(cv_label)
@@ -1567,17 +1631,12 @@ def main() -> None:
             f"CVerror={cv_msg}, solver={args.solver}, "
             f"max_iter={int(args.max_iter)}, check={int(args.check)}, "
             f"threads={int(resolved_threads)}, "
-            f"k_warmstart={'on' if k_warmstart_enabled else 'off'}, "
+            f"memory={_format_fastpop_memory_cfg(getattr(args, 'memory', None))}, "
             f"geno_cache={'on' if effective_geno_cache else 'off'}, "
             f"bed_stream={'on' if bed_stream_session else 'off'}, "
             f"tag={'on' if len(tag_samples) > 0 else 'off'}",
             flush=True,
         )
-        if k_warmstart_enabled:
-            tmp_logger.warning(
-                "Warning: --k-warmstart is experimental and may alter convergence; "
-                "for strict reproducibility use default (warm-start off)."
-            )
     if bed_stream_session:
         if hasattr(jxrs, "AdmxBedTrainingSession"):
             tmp_logger.info(
@@ -1612,12 +1671,11 @@ def main() -> None:
     if effective_geno_cache:
         shared_g = load_genotype_u8_matrix(
             genotype_path,
-            chunk_size=max(1000, int(args.chunksize)),
+            chunk_size=int(max(1000, int(getattr(args, "_resolved_chunk_rows", 50000)))),
             snps_only=bool(args.snps_only),
             maf=float(args.maf),
             missing_rate=float(args.geno),
         )
-    prev_model_state: Optional[dict[str, Any]] = None
     summary_rows: list[dict[str, Any]] = []
     try:
         with _AdmixtureBatchProgress(
@@ -1628,14 +1686,7 @@ def main() -> None:
         ) as batch_progress:
             for idx, k in enumerate(k_values, start=1):
                 batch_progress.start_k(k=int(k))
-                warm_start = None
-                if k_warmstart_enabled:
-                    warm_start = _build_k_warm_start(
-                        prev_model_state,
-                        target_k=int(k),
-                        seed=int(args.seed),
-                    )
-                row, model_state = _run_single_k(
+                row = _run_single_k(
                     genotype_path=genotype_path,
                     source_label=source_label,
                     prefix=prefix,
@@ -1656,21 +1707,17 @@ def main() -> None:
                     cv_label=str(cv_label),
                     tag_samples=list(tag_samples),
                     shared_g=shared_g,
-                    warm_start=warm_start,
-                    keep_model_for_warmstart=bool(k_warmstart_enabled),
                 )
                 summary_rows.append(row)
-                if k_warmstart_enabled:
-                    prev_model_state = model_state
                 batch_progress.advance_k(steps=1)
     finally:
         rss_watchdog.stop()
 
-    summary_log = os.path.join(outdir, f"{prefix}.adamixture.summary.log")
+    summary_log = os.path.join(outdir, f"{prefix}.{brand['summary_stem']}.summary.log")
     logger = setup_logging(summary_log)
     if cv_enabled:
         cv_rows = [r for r in summary_rows if r.get("cverror") is not None]
-        summary_tsv = os.path.join(outdir, f"{prefix}.adamixture.cverror.summary.tsv")
+        summary_tsv = os.path.join(outdir, f"{prefix}.{brand['summary_stem']}.cverror.summary.tsv")
         _write_cverror_summary_tsv(summary_tsv, cv_rows)
         logger.info("")
         _log_cverror_summary(logger, cv_rows, summary_tsv)

@@ -50,7 +50,7 @@ from ._common.cli import (
     add_common_thread_arg,
 )
 from ._common.genoio import determine_genotype_source_from_args
-from ._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog
+from ._common.cli import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 from ._common.log import setup_logging
 from ._common.pathcheck import (
     ensure_file_exists,

@@ -41,14 +41,21 @@ from janusx.assoc.workflow_model_packed import (
 )
 from janusx.pyBLUP.assoc import LMM
 from janusx.pyBLUP.blup import BLUP
-from ._common.cli import add_common_out_arg, add_common_prefix_arg
+from ._common.cli import (
+    CliArgumentParser,
+    add_common_out_arg,
+    add_common_prefix_arg,
+    add_common_thread_arg,
+    cli_help_formatter,
+    minimal_help_epilog,
+)
 from ._common.log import setup_logging
 from ._common.config_render import emit_cli_configuration
 from ._common.grmio import load_grm_matrix, read_id_file, resolve_grm_id_path
-from ._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 from ._common.pathcheck import ensure_file_exists, format_path_for_display
 from ._common.genoio import strip_default_prefix_suffix
 from ._common.progress import log_success, print_failure, format_elapsed, success_symbol
+from ._common.threads import apply_outer_thread_cap, detect_effective_threads
 
 
 @dataclass
@@ -1557,6 +1564,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_common_out_arg(opt, default=".", help_profile="current_dir")
     add_common_prefix_arg(opt, default=None, help_profile="inferred_input_filename")
+    add_common_thread_arg(
+        opt,
+        default_threads=detect_effective_threads(),
+        help_profile="default",
+    )
     opt.add_argument(
         "-maxiter",
         "--maxiter",
@@ -1570,6 +1582,9 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     t0 = time.time()
     args = build_parser().parse_args()
+    if int(args.thread) <= 0:
+        raise ValueError("-t/--thread must be a positive integer.")
+    args.thread = int(apply_outer_thread_cap(int(args.thread)))
     if args.grm is not None and args.grm_sparse is not None:
         raise ValueError("Please provide only one of -k/--grm or -spk/--grm-sparse.")
     if args.grm_sparse is not None:
@@ -2079,6 +2094,7 @@ def main() -> None:
                                 x_cov=x_stage2,
                                 progress_callback=None,
                                 objective_mode=str(args.grm_sparse_mode),
+                                threads=int(args.thread),
                             )
                             h2_blue_raw = float(sparse_null.get("pve", float("nan")))
                             h2_narrow = h2_blue_raw

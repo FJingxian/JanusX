@@ -61,7 +61,7 @@ _bootstrap_repo_python_path()
 from janusx.script._common.pathcheck import safe_expanduser  # noqa: E402
 from janusx.script._common.genoio import prepare_packed_stats_ctx_from_plink  # noqa: E402
 from janusx.script._common.threads import detect_effective_threads  # noqa: E402
-from janusx.script._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog  # noqa: E402
+from janusx.script._common.cli import CliArgumentParser, cli_help_formatter, minimal_help_epilog  # noqa: E402
 from janusx.script._common.cli import (  # noqa: E402
     add_common_covariate_file_or_site_arg,
     add_common_genotype_source_args,

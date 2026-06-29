@@ -52,7 +52,7 @@ from janusx.gs.workflow import (  # noqa: E402
     _predict_bayes_packed_from_effects,
 )
 from janusx.script._common.genoio import determine_genotype_source, prepare_packed_ctx_from_plink  # noqa: E402
-from janusx.script._common.helptext import (  # noqa: E402
+from janusx.script._common.cli import (  # noqa: E402
     CliArgumentParser,
     cli_help_formatter,
     minimal_help_epilog,

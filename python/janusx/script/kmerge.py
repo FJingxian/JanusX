@@ -9,7 +9,7 @@ from pathlib import Path
 from janusx import janusx as jxrs
 
 from ._common.config_render import emit_cli_configuration
-from ._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog
+from ._common.cli import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 from ._common.log import setup_logging
 from ._common.pathcheck import format_kmc_db_pair_for_display, format_path_for_display
 from ._common.progress import ProgressAdapter, log_success

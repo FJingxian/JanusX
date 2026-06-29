@@ -146,7 +146,7 @@ from janusx.script._common.cli import (
     parse_trait_selector_specs,
     resolve_trait_selectors,
 )
-from janusx.script._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog
+from janusx.script._common.cli import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 from janusx.script._common.pathcheck import (
     ensure_all_true,
     ensure_file_exists,

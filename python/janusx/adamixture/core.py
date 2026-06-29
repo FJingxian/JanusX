@@ -29,7 +29,8 @@ def _emit_progress(callback: ProgressCallback, event: str, **payload: Any) -> No
 
 
 def _is_admx_memory_limit_error(ex: BaseException) -> bool:
-    return "ADAMIXTURE memory limit exceeded" in str(ex)
+    msg = str(ex)
+    return ("ADAMIXTURE memory limit exceeded" in msg) or ("FastPop memory limit exceeded" in msg)
 
 
 def _admx_debug_enabled() -> bool:

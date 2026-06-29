@@ -70,7 +70,7 @@ from janusx.script._common.threads import (  # noqa: E402
     maybe_warn_non_openblas,
     require_openblas_by_default,
 )
-from janusx.script._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog  # noqa: E402
+from janusx.script._common.cli import CliArgumentParser, cli_help_formatter, minimal_help_epilog  # noqa: E402
 from janusx.script._common.cli import (  # noqa: E402
     add_common_genotype_source_args,
     add_common_out_arg,

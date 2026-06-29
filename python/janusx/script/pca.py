@@ -72,7 +72,7 @@ from ._common.cli import (
     add_common_variant_filter_args,
 )
 from ._common.config_render import emit_cli_configuration
-from ._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog
+from ._common.cli import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 from ._common.pathcheck import (
     ensure_all_true,
     ensure_file_exists,

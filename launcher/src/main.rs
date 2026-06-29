@@ -36,7 +36,7 @@ const WARMUP_MARKER: &str = ".runtime_warmed";
 const LAUNCHER_VERSION_MARKER: &str = ".launcher_version";
 const RUNTIME_OWNER_MARKER: &str = ".launcher_runtime_owner";
 const UNINSTALL_HELPER_NAME: &str = "jx_uninstall_cleanup.cmd";
-const KNOWN_MODULES: [&str; 29] = [
+const KNOWN_MODULES: [&str; 30] = [
     "grm",
     "pca",
     "gwas",
@@ -53,6 +53,7 @@ const KNOWN_MODULES: [&str; 29] = [
     "kmer",
     "kmerge",
     "view",
+    "fastpop",
     "adamixture",
     "tree",
     "treeplot",
@@ -96,7 +97,7 @@ const MODULE_LIST_ENTRIES: [(&str, &str); 29] = [
         "Merge multi-sample KMC databases into genotype matrix",
     ),
     ("view", "View .bin/.bin.site as plain text for shell pipes"),
-    ("adamixture", "ADAMIXTURE ancestry inference"),
+    ("fastpop", "FastPop ancestry inference"),
     (
         "tree",
         "Tree workflow entry (-nj Neighbor-Joining / -ml Rust ML v1)",
@@ -5643,7 +5644,7 @@ fn print_cli_help() {
         12,
         width,
     );
-    print_help_entry(4, "adamixture", "ADAMIXTURE ancestry inference", 12, width);
+    print_help_entry(4, "fastpop", "FastPop ancestry inference", 12, width);
     print_help_entry(
         4,
         "tree",

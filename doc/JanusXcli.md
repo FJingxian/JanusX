@@ -41,7 +41,7 @@ Most scientific modules accept one of these input families:
 - `-bfile`: PLINK prefix for `.bed/.bim/.fam`
 - `-file`: numeric genotype matrix `.txt/.tsv/.csv/.npy`, or a shared prefix
 
-For large repeated analyses, `-bfile` is usually the best default because packed BED paths can be reused across `grm`, `pca`, `gwas`, `gs`, `adamixture`, `gformat`, and related workflows.
+For large repeated analyses, `-bfile` is usually the best default because packed BED paths can be reused across `grm`, `pca`, `gwas`, `gs`, `fastpop`, `gformat`, and related workflows.
 
 ### 2.2 `-file` sidecars
 
@@ -157,12 +157,14 @@ Useful notes:
 - `-ldprune` and `-hash` are available for preprocessing before GS model fitting
 - `-debug` prints thread and backend diagnostics for GS
 
-### 3.4 Run ADAMixture
+### 3.4 Run FastPop
 
 ```bash
-jx adamixture -bfile example/~mouse_hs1940 -k 1..6 -cv -o demo -prefix mouse_hs1940
-jx adamixture -bfile example/~mouse_hs1940 -k 4 -tag sample1,sample2 -o demo -prefix mouse_hs1940
+jx fastpop -bfile example/~mouse_hs1940 -k 1..6 -cv -o demo -prefix mouse_hs1940
+jx fastpop -bfile example/~mouse_hs1940 -k 4 -tag sample1,sample2 -o demo -prefix mouse_hs1940
 ```
+
+Compatibility note: `jx adamixture` is still accepted as an alias.
 
 Accepted `-k` forms:
 
@@ -254,7 +256,7 @@ Use launcher `jx` when you want the full external workflow to run.
 - `gmerge`: merge multiple genotype panels
 - `view`: print `.bin` and `.bin.site` style files as plain text
 - `hybrid`: generate pairwise hybrid genotype matrices from parent lists
-- `adamixture`: ancestry inference and CVerror scan
+- `fastpop`: ancestry inference and CVerror scan (`jx adamixture` remains a compatibility alias)
 - `tree`: tree workflow entry
 - `treeplot`: visualize Newick or GRM-derived trees
 - `webui`: start the JanusX web interface

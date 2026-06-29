@@ -39,7 +39,7 @@ from janusx.gtools.cleaner import chrom_sort_key as _chrom_sort_key
 from ._common.cli import add_common_out_arg, add_common_prefix_arg, add_common_thread_arg
 from ._common.log import setup_logging
 from ._common.config_render import emit_cli_configuration
-from ._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog
+from ._common.cli import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 from ._common.pathcheck import ensure_all_true, ensure_file_exists, format_path_for_display
 from ._common.progress import (
     CliStatus,

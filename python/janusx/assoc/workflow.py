@@ -115,7 +115,7 @@ from janusx.script._common.genoio import (
     packed_preload_is_ready,
     prepare_packed_ctx_from_plink,
 )
-from janusx.script._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog
+from janusx.script._common.cli import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 from janusx.script._common.pathcheck import (
     ensure_all_true,
     ensure_file_exists,

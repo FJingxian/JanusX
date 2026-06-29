@@ -31,11 +31,83 @@ option aliases without reimplementing parser boilerplate.
 from __future__ import annotations
 
 import argparse
+import os
 import re
+import shutil
+import sys
 from typing import Sequence
 
+try:
+    from rich_argparse import RichHelpFormatter, RawDescriptionRichHelpFormatter
+except Exception:
+    RichHelpFormatter = None  # type: ignore[assignment]
+    RawDescriptionRichHelpFormatter = None  # type: ignore[assignment]
 
+_CITATION_URL = "https://github.com/FJingxian/JanusX/"
+_ORANGE_ANSI = "\033[38;5;208m"
+_RESET_ANSI = "\033[0m"
 _TRAIT_RANGE_RE = re.compile(r"^\s*(\d+)\s*([:-])\s*(\d+)\s*$")
+
+
+def _heading_orange(text: str) -> str:
+    if RawDescriptionRichHelpFormatter is not None or RichHelpFormatter is not None:
+        return f"[orange3]{text}[/orange3]"
+    if os.environ.get("NO_COLOR"):
+        return text
+    if str(os.environ.get("TERM", "")).lower() == "dumb":
+        return text
+    if bool(getattr(sys.stdout, "isatty", lambda: False)()):
+        return f"{_ORANGE_ANSI}{text}{_RESET_ANSI}"
+    return text
+
+
+def cli_help_formatter() -> type[argparse.HelpFormatter]:
+    term_width = max(40, int(shutil.get_terminal_size((100, 20)).columns))
+    help_pos = min(32, max(20, term_width // 3))
+
+    if RawDescriptionRichHelpFormatter is not None:
+        class _Formatter(RawDescriptionRichHelpFormatter):  # type: ignore[misc, valid-type]
+            styles = RawDescriptionRichHelpFormatter.styles.copy()  # type: ignore[attr-defined]
+            styles["argparse.groups"] = "orange3"
+
+            def __init__(self, prog: str) -> None:
+                super().__init__(prog, width=term_width, max_help_position=help_pos)
+        return _Formatter
+
+    if RichHelpFormatter is not None:
+        class _Formatter(RichHelpFormatter):  # type: ignore[misc, valid-type]
+            styles = RichHelpFormatter.styles.copy()  # type: ignore[attr-defined]
+            styles["argparse.groups"] = "orange3"
+
+            def __init__(self, prog: str) -> None:
+                super().__init__(prog, width=term_width, max_help_position=help_pos)
+        return _Formatter
+
+    class _Formatter(argparse.RawDescriptionHelpFormatter):
+        def __init__(self, prog: str) -> None:
+            super().__init__(prog, width=term_width, max_help_position=help_pos)
+    return _Formatter
+
+
+class CliArgumentParser(argparse.ArgumentParser):
+    """
+    Keep argparse usage formatting, but standardize error line as:
+    Error: <message>
+    """
+
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        self.exit(2, f"Error: {message}\n")
+
+
+def minimal_help_epilog(examples: Sequence[str]) -> str:
+    lines = [_heading_orange("Examples:")]
+    for ex in examples:
+        lines.append(f"  {str(ex)}")
+    lines.append("")
+    lines.append(_heading_orange("Citation:"))
+    lines.append(f"  {_CITATION_URL}")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -67,6 +139,12 @@ def _resolve_genotype_source_help(
             "bfile": "PLINK prefix (.bed/.bim/.fam).",
         },
         "admixture": {
+            "vcf": "VCF/VCF.GZ genotype file.",
+            "hmp": "HMP/HMP.GZ genotype file.",
+            "file": "Text/NumPy genotype matrix prefix (requires sidecar .id).",
+            "bfile": "PLINK prefix (.bed/.bim/.fam).",
+        },
+        "fastpop": {
             "vcf": "VCF/VCF.GZ genotype file.",
             "hmp": "HMP/HMP.GZ genotype file.",
             "file": "Text/NumPy genotype matrix prefix (requires sidecar .id).",
@@ -296,6 +374,11 @@ def _resolve_prefix_help(profile: str) -> str:
 def _resolve_memory_help(profile: str) -> str:
     key = str(profile).strip().lower()
     table = {
+        "fastpop_decode": (
+            "Working memory budget in GB for FastPop streamed genotype loading/decode. "
+            "This controls internal chunk sizing rather than total process RSS "
+            "(default: %(default)s)."
+        ),
         "gwas_decode": (
             "Target BED decode block size in GB for memmap/packed kernels. "
             "This only controls per-block decode/window sizing, not global process memory "

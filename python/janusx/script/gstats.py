@@ -20,7 +20,7 @@ from ._common.cli import (
 )
 from ._common.config_render import emit_cli_configuration
 from ._common.genoio import determine_genotype_source
-from ._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog
+from ._common.cli import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 from ._common.log import setup_logging
 from ._common.pathcheck import (
     ensure_all_true,

@@ -604,6 +604,16 @@ class ASSOC:
     def sparse_abs_threshold_(self) -> bool:
         return bool(self.model_args.get("abs_threshold", False))
 
+    @property
+    def sparse_null_objective_(self) -> str:
+        raw = self.model_args.get("sparse_null_objective", self.model_args.get("spk_mode", "fastgwa"))
+        mode = str(raw).strip().lower()
+        if mode not in {"raw", "fastgwa"}:
+            raise ValueError(
+                f"sparse_null_objective must be 'raw' or 'fastgwa', got {raw!r}"
+            )
+        return mode
+
     @staticmethod
     def toy_data(seed: int = 42) -> dict[str, Any]:
         """
@@ -669,6 +679,7 @@ class ASSOC:
             "chunk_size": int(self.chunk_size_),
             "has_sample_index": bool(self.sample_index_ is not None),
             "sparse_grm_path": self.sparse_grm_path_,
+            "sparse_null_objective": (self.sparse_null_objective_ if self.route_ == "splmm" else None),
             "used_sparse_subset": bool(
                 self.sparse_sample_idx_ is not None and int(self.sparse_sample_idx_.shape[0]) > 0
             ),
@@ -1027,6 +1038,7 @@ class ASSOC:
                 x_cov=x_cov,
                 progress_callback=None,
                 residualized_approx=False,
+                objective_mode=self.sparse_null_objective_,
                 threads=self.threads_,
             )
             lbd = float(null_fit.get("lambda", float("nan")))

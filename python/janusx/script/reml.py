@@ -34,6 +34,11 @@ from scipy.optimize import minimize
 from scipy.sparse.linalg import spsolve
 from scipy.stats import t as student_t
 
+from janusx.assoc.workflow_model_packed import (
+    _splmm_normalize_sparse_grm_path,
+    _splmm_sparse_grm_diag_stats,
+    _splmm_sparse_null_fit,
+)
 from janusx.pyBLUP.assoc import LMM
 from janusx.pyBLUP.blup import BLUP
 from ._common.cli import add_common_out_arg, add_common_prefix_arg
@@ -58,6 +63,15 @@ class _GrmContext:
     ids: list[str]
     id_path: str | None
     index: dict[str, int]
+
+
+@dataclass
+class _SparseGrmContext:
+    path: str
+    ids: list[str]
+    id_path: str | None
+    index: dict[str, int]
+    n_samples: int
 
 
 @dataclass
@@ -684,6 +698,48 @@ def _load_grm_context(
             raise ValueError(f"GRM IDs contain duplicate line ID: {sid}")
         index[sid] = i
     return _GrmContext(matrix=grm, ids=ids, id_path=id_path, index=index)
+
+
+def _load_sparse_grm_context(
+    grm_path: str,
+    grm_id_path: str | None,
+    fallback_ids: list[str],
+) -> _SparseGrmContext:
+    sparse_path = _splmm_normalize_sparse_grm_path(grm_path)
+    diag = _splmm_sparse_grm_diag_stats(sparse_path, None)
+    n_samples_raw = float(diag.get("n_samples", float("nan")))
+    if (not np.isfinite(n_samples_raw)) or int(n_samples_raw) <= 0:
+        raise ValueError(
+            f"Sparse GRM sample size is unavailable or invalid: path={sparse_path}, n={n_samples_raw}"
+        )
+    n_samples = int(n_samples_raw)
+    id_path = resolve_grm_id_path(sparse_path, grm_id_path)
+    if id_path is not None:
+        ids = [str(x) for x in read_id_file(id_path)]
+        if len(ids) != n_samples:
+            raise ValueError(
+                f"Sparse GRM ID count mismatch: sparse n={n_samples} but ID file has {len(ids)} rows."
+            )
+    else:
+        if n_samples != len(fallback_ids):
+            raise ValueError(
+                f"Sparse GRM shape n={n_samples} does not match phenotype unique line count {len(fallback_ids)}, "
+                "and no Sparse GRM ID file was found for reordering."
+            )
+        ids = [str(x) for x in fallback_ids]
+
+    index: dict[str, int] = {}
+    for i, sid in enumerate(ids):
+        if sid in index:
+            raise ValueError(f"Sparse GRM IDs contain duplicate line ID: {sid}")
+        index[sid] = i
+    return _SparseGrmContext(
+        path=sparse_path,
+        ids=ids,
+        id_path=id_path,
+        index=index,
+        n_samples=n_samples,
+    )
 
 
 def _lmm_null_stats(model: LMM) -> _LmmNullStats:
@@ -1404,6 +1460,7 @@ def build_parser() -> argparse.ArgumentParser:
             [
                 "jx reml -file pheno.tsv -l sample_id -e year,loc -o outdir",
                 "jx reml -file pheno.tsv -l sample_id -e year,loc -f PCA1,PCA2 -r block -k data.cGRM.npy -p Yield",
+                "jx reml -file pheno.tsv -l sample_id -spk data.cGRM.spgrm -p Yield -o outdir",
             ]
         ),
     )
@@ -1476,6 +1533,28 @@ def build_parser() -> argparse.ArgumentParser:
             "Optional GRM matrix. When provided, narrow-sense h2 and genomic BLUP are estimated in addition to broad-sense H2 and BLUE."
         ),
     )
+    opt.add_argument(
+        "-spk",
+        "--grm-sparse",
+        dest="grm_sparse",
+        default=None,
+        metavar="FILE",
+        help=(
+            "Optional precomputed Sparse GRM (.spgrm/.jxgrm). When provided, narrow-sense h2 is estimated via Sparse REML on the BLUE phenotype scale for fast debugging and narrow heritability checks."
+        ),
+    )
+    opt.add_argument(
+        "--spk-mode",
+        dest="grm_sparse_mode",
+        choices=("raw", "fastgwa"),
+        default="fastgwa",
+        help=(
+            "Sparse REML objective for -spk/--grm-sparse. "
+            "`raw` uses JanusX profile REML on the sparse K directly; "
+            "`fastgwa` uses a fastGWA-compatible fixed-Vp sparse REML objective "
+            "matched to GCTA fastGWA-REML behavior (default: %(default)s)."
+        ),
+    )
     add_common_out_arg(opt, default=".", help_profile="current_dir")
     add_common_prefix_arg(opt, default=None, help_profile="inferred_input_filename")
     opt.add_argument(
@@ -1491,6 +1570,10 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     t0 = time.time()
     args = build_parser().parse_args()
+    if args.grm is not None and args.grm_sparse is not None:
+        raise ValueError("Please provide only one of -k/--grm or -spk/--grm-sparse.")
+    if args.grm_sparse is not None:
+        args.grm_sparse = _splmm_normalize_sparse_grm_path(str(args.grm_sparse))
     outdir = os.path.normpath(str(args.out or "."))
     os.makedirs(outdir, mode=0o755, exist_ok=True)
     prefix = str(args.prefix or strip_default_prefix_suffix(os.path.basename(str(args.file))))
@@ -1501,6 +1584,8 @@ def main() -> None:
     if not ensure_file_exists(logger, str(args.file), "Input file"):
         return
     if args.grm is not None and not ensure_file_exists(logger, str(args.grm), "GRM file"):
+        return
+    if args.grm_sparse is not None and not ensure_file_exists(logger, str(args.grm_sparse), "Sparse GRM file"):
         return
 
     load_t0 = time.time()
@@ -1572,11 +1657,32 @@ def main() -> None:
     random_label = _format_random_label(random_cols)
 
     grm_ctx: _GrmContext | None = None
+    sparse_grm_ctx: _SparseGrmContext | None = None
     if args.grm is not None:
         grm_ctx = _load_grm_context(
             str(args.grm),
             None,
             unique_lines.astype(str).tolist(),
+        )
+    if args.grm_sparse is not None:
+        sparse_grm_ctx = _load_sparse_grm_context(
+            str(args.grm_sparse),
+            None,
+            unique_lines.astype(str).tolist(),
+        )
+        if sparse_grm_ctx.id_path is None:
+            logger.warning(
+                "Sparse GRM has no sibling ID file; REML is assuming the phenotype unique-line order matches the Sparse GRM sample order."
+            )
+
+    narrow_path_label = "None"
+    if grm_ctx is not None:
+        narrow_path_label = "BLUE -> GWAS null LMM"
+    elif sparse_grm_ctx is not None:
+        narrow_path_label = (
+            "BLUE -> Sparse REML"
+            if str(args.grm_sparse_mode) == "raw"
+            else "BLUE -> Sparse REML (fastGWA-compatible)"
         )
 
     emit_cli_configuration(
@@ -1612,7 +1718,10 @@ def main() -> None:
                     ("GRM file", str(args.grm) if args.grm is not None else "None"),
                     ("GRM ID file", "auto-detect <grm>.id" if args.grm is not None else "None"),
                     ("GRM n", int(grm_ctx.matrix.shape[0]) if grm_ctx is not None else "NA"),
-                    ("Narrow path", "BLUE -> GWAS null LMM" if args.grm is not None else "None"),
+                    ("Sparse GRM file", str(args.grm_sparse) if args.grm_sparse is not None else "None"),
+                    ("Sparse GRM ID file", "auto-detect <spgrm>.id" if args.grm_sparse is not None else "None"),
+                    ("Sparse GRM n", int(sparse_grm_ctx.n_samples) if sparse_grm_ctx is not None else "NA"),
+                    ("Narrow path", narrow_path_label),
                 ],
             ),
             (
@@ -1682,6 +1791,13 @@ def main() -> None:
                         "h_plot": np.nan,
                         "blue_n": np.nan,
                         "missing_grm": np.nan,
+                        "narrow_lambda": np.nan,
+                        "narrow_sigma_g2": np.nan,
+                        "narrow_sigma_e2": np.nan,
+                        "narrow_mean_diag_k": np.nan,
+                        "narrow_pve_diag_scaled": np.nan,
+                        "narrow_nnz_k": np.nan,
+                        "narrow_offdiag_density_k": np.nan,
                         "narrow_method": "skipped",
                         "elapsed_sec": float(time.time() - step_t0),
                         "status": "skipped_too_few_observations",
@@ -1863,9 +1979,16 @@ def main() -> None:
             vline_joint = np.nan
             noise_mean_joint = np.nan
             missing_grm = np.nan
+            narrow_lambda = np.nan
+            narrow_sigma_g2 = np.nan
+            narrow_sigma_e2 = np.nan
+            narrow_mean_diag_k = np.nan
+            narrow_pve_diag_scaled = np.nan
+            narrow_nnz_k = np.nan
+            narrow_offdiag_density_k = np.nan
             narrow_method = "none"
             blue_n = int(len(stage1_blue.sample_ids))
-            if grm_ctx is not None:
+            if grm_ctx is not None or sparse_grm_ctx is not None:
                 blue_trait_df = pd.DataFrame(
                     {
                         line_col: np.asarray(stage1_blue.sample_ids, dtype=object),
@@ -1886,17 +2009,16 @@ def main() -> None:
                     )
 
                 sid_series = blue_trait_df[line_col].astype(str)
-                keep_mask = sid_series.isin(set(grm_ctx.index.keys()))
+                kinship_index = grm_ctx.index if grm_ctx is not None else sparse_grm_ctx.index
+                keep_mask = sid_series.isin(set(kinship_index.keys()))
                 missing_grm = int((~keep_mask).sum())
                 if missing_grm > 0:
                     logger.warning(
-                        f"Trait {trait}: dropped {missing_grm} BLUE lines absent from GRM."
+                        f"Trait {trait}: dropped {missing_grm} BLUE lines absent from kinship input."
                     )
                 if int(keep_mask.sum()) > 2:
                     kept = blue_trait_df.loc[keep_mask].reset_index(drop=True)
                     kept_ids = kept[line_col].astype(str).tolist()
-                    grm_idx = [grm_ctx.index[sid] for sid in kept_ids]
-                    kinship = grm_ctx.matrix[np.ix_(grm_idx, grm_idx)]
                     x_stage2, _ = _encode_fixed_design(
                         kept,
                         stage2_fixed_terms,
@@ -1912,45 +2034,86 @@ def main() -> None:
                         ve=ve,
                     )
                     try:
-                        # Future hook:
-                        #   exact/approx joint additive + line nonadditive REML
-                        # is intentionally disabled for now. We currently use the
-                        # BLUE phenotype directly in the GWAS null model.
-                        lmm = LMM(
-                            y=kept[trait].to_numpy(dtype=float),
-                            X=x_stage2,
-                            kinship=kinship,
-                        )
-                        h2_blue_raw = float(lmm.pve) if np.isfinite(lmm.pve) else np.nan
-                        h2_narrow = h2_blue_raw
                         noise_mean_joint = float(np.mean(noise_diag)) if noise_diag.size > 0 else np.nan
-                        narrow_method = "blue_null_lmm"
-                        if np.isfinite(hsqr) and np.isfinite(h2_narrow) and (h2_narrow > hsqr * 1.02):
-                            logger.warning(
-                                f"Trait {trait}: BLUE-null narrow h2 ({h2_narrow:.6g}) exceeds broad H2 ({hsqr:.6g}); broad and narrow estimators are on different effective scales."
+                        if grm_ctx is not None:
+                            grm_idx = [grm_ctx.index[sid] for sid in kept_ids]
+                            kinship = grm_ctx.matrix[np.ix_(grm_idx, grm_idx)]
+                            # Future hook:
+                            #   exact/approx joint additive + line nonadditive REML
+                            # is intentionally disabled for now. We currently use the
+                            # BLUE phenotype directly in the GWAS null model.
+                            lmm = LMM(
+                                y=kept[trait].to_numpy(dtype=float),
+                                X=x_stage2,
+                                kinship=kinship,
                             )
-                        narrow_stats = _lmm_null_stats(lmm)
-                        g_map = {
-                            kept_ids[i]: float(narrow_stats.g_blup[i])
-                            for i in range(len(kept_ids))
-                        }
-                        assert gblup_out is not None
-                        gblup_out[trait] = (
-                            gblup_out[line_col]
-                            .astype(str)
-                            .map(g_map)
-                            .to_numpy(dtype=float)
-                        )
-                    except Exception as lmm_exc:
-                        logger.warning(
-                            f"Trait {trait}: BLUE-null GWAS LMM failed ({type(lmm_exc).__name__}: {lmm_exc}); narrow-sense h2 skipped."
-                        )
-                        narrow_method = "failed_blue_null_lmm"
+                            h2_blue_raw = float(lmm.pve) if np.isfinite(lmm.pve) else np.nan
+                            h2_narrow = h2_blue_raw
+                            narrow_lambda = float(lmm.lbd_null) if np.isfinite(float(lmm.lbd_null)) else np.nan
+                            narrow_method = "blue_null_lmm"
+                            if np.isfinite(hsqr) and np.isfinite(h2_narrow) and (h2_narrow > hsqr * 1.02):
+                                logger.warning(
+                                    f"Trait {trait}: BLUE-null narrow h2 ({h2_narrow:.6g}) exceeds broad H2 ({hsqr:.6g}); broad and narrow estimators are on different effective scales."
+                                )
+                            narrow_stats = _lmm_null_stats(lmm)
+                            g_map = {
+                                kept_ids[i]: float(narrow_stats.g_blup[i])
+                                for i in range(len(kept_ids))
+                            }
+                            assert gblup_out is not None
+                            gblup_out[trait] = (
+                                gblup_out[line_col]
+                                .astype(str)
+                                .map(g_map)
+                                .to_numpy(dtype=float)
+                            )
+                        else:
+                            sparse_idx = np.ascontiguousarray(
+                                np.asarray([sparse_grm_ctx.index[sid] for sid in kept_ids], dtype=np.int64),
+                                dtype=np.int64,
+                            )
+                            sparse_null = _splmm_sparse_null_fit(
+                                jxgrm_path=str(sparse_grm_ctx.path),
+                                sample_idx=sparse_idx,
+                                y_vec=kept[trait].to_numpy(dtype=float),
+                                x_cov=x_stage2,
+                                progress_callback=None,
+                                objective_mode=str(args.grm_sparse_mode),
+                            )
+                            h2_blue_raw = float(sparse_null.get("pve", float("nan")))
+                            h2_narrow = h2_blue_raw
+                            narrow_lambda = float(sparse_null.get("lambda", float("nan")))
+                            narrow_sigma_g2 = float(sparse_null.get("sigma_g2", float("nan")))
+                            narrow_sigma_e2 = float(sparse_null.get("sigma_e2", float("nan")))
+                            narrow_mean_diag_k = float(sparse_null.get("mean_diag_k", float("nan")))
+                            narrow_pve_diag_scaled = float(sparse_null.get("pve_diag_scaled", float("nan")))
+                            narrow_nnz_k = float(sparse_null.get("nnz_k", float("nan")))
+                            narrow_offdiag_density_k = float(sparse_null.get("offdiag_density_k", float("nan")))
+                            narrow_method = (
+                                "blue_null_sparse_reml_fastgwa"
+                                if str(args.grm_sparse_mode) == "fastgwa"
+                                else "blue_null_sparse_reml"
+                            )
+                            if np.isfinite(hsqr) and np.isfinite(h2_narrow) and (h2_narrow > hsqr * 1.02):
+                                logger.warning(
+                                    f"Trait {trait}: BLUE-null sparse narrow h2 ({h2_narrow:.6g}) exceeds broad H2 ({hsqr:.6g}); broad and narrow estimators are on different effective scales."
+                                )
+                    except Exception as narrow_exc:
+                        if grm_ctx is not None:
+                            logger.warning(
+                                f"Trait {trait}: BLUE-null GWAS LMM failed ({type(narrow_exc).__name__}: {narrow_exc}); narrow-sense h2 skipped."
+                            )
+                            narrow_method = "failed_blue_null_lmm"
+                        else:
+                            logger.warning(
+                                f"Trait {trait}: BLUE-null Sparse REML failed ({type(narrow_exc).__name__}: {narrow_exc}); narrow-sense h2 skipped."
+                            )
+                            narrow_method = "failed_blue_null_sparse_reml"
                 else:
                     logger.warning(
-                        f"Trait {trait}: too few lines overlap with GRM after filtering; narrow-sense h2 skipped."
+                        f"Trait {trait}: too few lines overlap with kinship input after filtering; narrow-sense h2 skipped."
                     )
-                    narrow_method = "skipped_grm_overlap"
+                    narrow_method = "skipped_grm_overlap" if grm_ctx is not None else "skipped_sparse_grm_overlap"
 
             # logger.info("-" * 72)
             # logger.info(
@@ -1959,6 +2122,17 @@ def main() -> None:
             if np.isfinite(h2_blue_raw):
                 logger.info(
                     f"  narrow(raw BLUE scale)={_fmt_metric(h2_blue_raw)}"
+                )
+            if np.isfinite(narrow_mean_diag_k) or np.isfinite(narrow_sigma_g2) or np.isfinite(narrow_sigma_e2):
+                logger.info(
+                    "  sparse lambda=%s | sigma_g2=%s | sigma_e2=%s | mean_diag(K)=%s | pve_diag_scaled=%s | nnz(K)=%s | offdiag_density=%s",
+                    _fmt_metric(narrow_lambda),
+                    _fmt_metric(narrow_sigma_g2),
+                    _fmt_metric(narrow_sigma_e2),
+                    _fmt_metric(narrow_mean_diag_k),
+                    _fmt_metric(narrow_pve_diag_scaled),
+                    _fmt_metric(narrow_nnz_k),
+                    _fmt_metric(narrow_offdiag_density_k),
                 )
             if np.isfinite(va_joint):
                 logger.info(
@@ -1990,6 +2164,13 @@ def main() -> None:
                     "r": float(r_eff),
                     "blue_n": float(blue_n),
                     "missing_grm": float(missing_grm) if np.isfinite(missing_grm) else np.nan,
+                    "narrow_lambda": float(narrow_lambda) if np.isfinite(narrow_lambda) else np.nan,
+                    "narrow_sigma_g2": float(narrow_sigma_g2) if np.isfinite(narrow_sigma_g2) else np.nan,
+                    "narrow_sigma_e2": float(narrow_sigma_e2) if np.isfinite(narrow_sigma_e2) else np.nan,
+                    "narrow_mean_diag_k": float(narrow_mean_diag_k) if np.isfinite(narrow_mean_diag_k) else np.nan,
+                    "narrow_pve_diag_scaled": float(narrow_pve_diag_scaled) if np.isfinite(narrow_pve_diag_scaled) else np.nan,
+                    "narrow_nnz_k": float(narrow_nnz_k) if np.isfinite(narrow_nnz_k) else np.nan,
+                    "narrow_offdiag_density_k": float(narrow_offdiag_density_k) if np.isfinite(narrow_offdiag_density_k) else np.nan,
                     "narrow_method": narrow_method,
                     "elapsed_sec": float(time.time() - step_t0),
                     "status": status,
@@ -2025,6 +2206,13 @@ def main() -> None:
                     "h_plot": np.nan,
                     "blue_n": np.nan,
                     "missing_grm": np.nan,
+                    "narrow_lambda": np.nan,
+                    "narrow_sigma_g2": np.nan,
+                    "narrow_sigma_e2": np.nan,
+                    "narrow_mean_diag_k": np.nan,
+                    "narrow_pve_diag_scaled": np.nan,
+                    "narrow_nnz_k": np.nan,
+                    "narrow_offdiag_density_k": np.nan,
                     "narrow_method": "failed",
                     "elapsed_sec": float(time.time() - step_t0),
                     "status": f"failed:{type(exc).__name__}",

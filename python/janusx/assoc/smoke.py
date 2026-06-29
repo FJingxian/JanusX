@@ -58,6 +58,16 @@ def run_assoc_api_smoke() -> None:
     splmm_chunk = splmm.assoc(G, threads=2, chunk_size=2)
     assert np.allclose(splmm_res.to_numpy(dtype=float), splmm_chunk.to_numpy(dtype=float), equal_nan=True)
 
+    splmm_fastgwa = ASSOC(
+        model="splmm",
+        model_args={"threads": 1, "sparse_cutoff": 0.0, "sparse_null_objective": "fastgwa"},
+    )
+    splmm_fastgwa.fit(y, X, K)
+    _assert_common_fit_state(splmm_fastgwa, route="splmm", kinship_kind="sparse")
+    assert splmm_fastgwa.fit_result_["sparse_null_objective"] == "fastgwa"
+    assert splmm_fastgwa.null_fit_["route"] == "splmm"
+    assert splmm_fastgwa.null_fit_["pve"] is not None
+
     if toy["K_sparse"] is not None:
         auto_sparse = ASSOC(model="lmm", model_args={"threads": 1, "sparse_cutoff": 0.0})
         auto_sparse.fit(y, X, toy["K_sparse"])

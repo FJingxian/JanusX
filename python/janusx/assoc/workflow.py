@@ -6011,8 +6011,12 @@ def parse_args(argv: Optional[list[str]] = None):
         parser.error("Only one of -splmm / -splmm-approx may be specified.")
     if _active_splmm_modes:
         args.splmm, args._splmm_denom_mode = _active_splmm_modes[0]
+        args._splmm_null_objective_mode = (
+            "raw" if str(args._splmm_denom_mode) == "approx" else "fastgwa"
+        )
     else:
         args._splmm_denom_mode = None
+        args._splmm_null_objective_mode = None
 
     try:
         args.farmcpu_bin_size = _parse_float_csv(
@@ -6493,6 +6497,9 @@ def _run_gwas_pipeline(
         if args.splmm:
             advanced_config_rows.append(
                 ("SparseLMM Mode", str(getattr(args, "_splmm_denom_mode", "exact") or "exact"))
+            )
+            advanced_config_rows.append(
+                ("SparseLMM Null Objective", str(getattr(args, "_splmm_null_objective_mode", "fastgwa") or "fastgwa"))
             )
             advanced_config_rows.append(("Sparse GRM Input", str(getattr(args, "grm_sparse", "1"))))
         if args.farmcpu:
@@ -7175,6 +7182,7 @@ def _run_gwas_pipeline(
                             trait_prepared_meta=trait_prepared_meta,
                             force_model=bool(args.force_model),
                             scan_mode=str(args._splmm_denom_mode or "exact"),
+                            null_objective_mode=str(args._splmm_null_objective_mode or "fastgwa"),
                         )
 
                     def _run_route_fastlmm_stream(

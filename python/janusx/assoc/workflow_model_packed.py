@@ -2316,6 +2316,133 @@ def _splmm_exact_reml_objective(
     return float(logdet_v + logdet_xt + float(n_minus_p) * np.log(sigma_g2))
 
 
+def _splmm_exact_fixed_vp_reml_h2_fit_from_grm(
+    *,
+    grm: np.ndarray,
+    y_vec: np.ndarray,
+    x_cov: Union[np.ndarray, None],
+    h2_limit: float = 1.6,
+) -> dict[str, float]:
+    y = np.ascontiguousarray(np.asarray(y_vec, dtype=np.float64).reshape(-1), dtype=np.float64)
+    k = np.ascontiguousarray(np.asarray(grm, dtype=np.float64), dtype=np.float64)
+    if k.ndim != 2 or int(k.shape[0]) != int(k.shape[1]):
+        raise ValueError(f"SparseLMM fixed-Vp exact fit expects square GRM, got {k.shape}")
+    if int(k.shape[0]) != int(y.shape[0]):
+        raise ValueError(f"SparseLMM fixed-Vp exact fit GRM/y mismatch: grm={k.shape}, y={y.shape}")
+    if not np.all(np.isfinite(k)):
+        raise ValueError("SparseLMM fixed-Vp exact fit GRM contains NaN/Inf values.")
+    k = np.ascontiguousarray((k + k.T) * 0.5, dtype=np.float64)
+    n = int(y.shape[0])
+    if n <= 1:
+        raise ValueError(f"SparseLMM fixed-Vp exact fit requires n > 1, got n={n}")
+    x_condition = _splmm_design_with_intercept(x_cov, n)
+    p_condition = int(x_condition.shape[1])
+    if n <= p_condition:
+        raise ValueError(
+            f"SparseLMM fixed-Vp exact fit requires n > p for phenotype residualization, got n={n}, p={p_condition}"
+        )
+    xtx = np.ascontiguousarray(x_condition.T @ x_condition, dtype=np.float64)
+    xty = np.ascontiguousarray(x_condition.T @ y, dtype=np.float64)
+    beta_ols = _splmm_solve_linear(xtx, xty)
+    y_centered = np.ascontiguousarray(y - (x_condition @ beta_ols), dtype=np.float64)
+    y_centered = np.ascontiguousarray(y_centered - float(np.mean(y_centered)), dtype=np.float64)
+    vp = float(np.dot(y_centered, y_centered) / float(n - 1))
+    if (not np.isfinite(vp)) or vp <= 0.0:
+        raise ValueError(f"SparseLMM fixed-Vp exact fit got invalid phenotype variance proxy: {vp}")
+
+    evals, u = np.linalg.eigh(k)
+    evals = np.ascontiguousarray(np.asarray(evals, dtype=np.float64).reshape(-1), dtype=np.float64)
+    x_reml = np.ones((n, 1), dtype=np.float64)
+    utx = np.ascontiguousarray(u.T @ x_reml, dtype=np.float64)
+    uty = np.ascontiguousarray(u.T @ y_centered, dtype=np.float64)
+    max_vg = float(vp * max(float(h2_limit), 0.0))
+
+    def _loglik_for_vg(vg: float) -> float:
+        vg_f = float(vg)
+        if (not np.isfinite(vg_f)) or vg_f < 0.0:
+            return float("-inf")
+        ve = float(vp - vg_f)
+        v = np.ascontiguousarray(vg_f * evals + ve, dtype=np.float64)
+        if np.any(v <= 0.0) or (not np.all(np.isfinite(v))):
+            return float("-inf")
+        v_inv = np.ascontiguousarray(1.0 / v, dtype=np.float64)
+        xtv_inv_x = (utx.T * v_inv) @ utx
+        sign_xt, logdet_xt = np.linalg.slogdet(xtv_inv_x)
+        if sign_xt <= 0 or (not np.isfinite(logdet_xt)):
+            return float("-inf")
+        xtv_inv_y = (utx.T * v_inv) @ uty
+        beta = _splmm_solve_linear(xtv_inv_x, xtv_inv_y)
+        resid = uty - (utx @ beta)
+        ypy = float(np.dot(v_inv, np.square(resid)))
+        if (not np.isfinite(ypy)) or ypy <= 0.0:
+            return float("-inf")
+        logdet_v = float(np.sum(np.log(v)))
+        return float(-0.5 * (logdet_v + logdet_xt + ypy))
+
+    trails = [101] + [16] * 12
+    start = 0.0
+    end = max_vg
+    best_logl = float("-inf")
+    best_vg = 0.0
+    for n_trails in trails:
+        if n_trails < 2:
+            continue
+        if end < start:
+            start, end = end, start
+        if abs(end - start) <= 0.0:
+            best_vg = float(start)
+            best_logl = _loglik_for_vg(best_vg)
+            break
+        grid = np.linspace(float(start), float(end), int(n_trails), dtype=np.float64)
+        vals = np.asarray([_loglik_for_vg(vg) for vg in grid], dtype=np.float64)
+        idx = int(np.nanargmax(vals))
+        best_logl = float(vals[idx])
+        best_vg = float(grid[idx])
+        if idx <= 0:
+            start = float(grid[idx])
+            end = float(grid[min(idx + 1, len(grid) - 1)])
+        elif idx >= len(grid) - 1:
+            start = float(grid[max(idx - 1, 0)])
+            end = float(grid[idx])
+        else:
+            start = float(grid[idx - 1])
+            end = float(grid[idx + 1])
+
+    sigma_g2 = float(min(max((start + end) * 0.5, 0.0), max(vp - 1e-12, 0.0)))
+    sigma_e2 = float(vp - sigma_g2)
+    denom = sigma_g2 + sigma_e2
+    lambda_fit = float(sigma_e2 / sigma_g2) if sigma_g2 > 0.0 else float("inf")
+    final_logl = _loglik_for_vg(sigma_g2)
+    out = {
+        "strategy": "dense_grm_fixed_vp_fastgwa_grid",
+        "backend": "dense_eigh_fixed_vp",
+        "converged": bool(np.isfinite(sigma_g2) and np.isfinite(sigma_e2)),
+        "used_iter": float(len(trails)),
+        "h2": float(sigma_g2 / vp) if vp > 0.0 else float("nan"),
+        "pve": float(sigma_g2 / denom) if denom > 0.0 else float("nan"),
+        "lambda": lambda_fit,
+        "log10_lambda": (
+            float(np.log10(lambda_fit))
+            if np.isfinite(lambda_fit) and lambda_fit > 0.0
+            else float("nan")
+        ),
+        "sigma_g2": sigma_g2,
+        "sigma_e2": sigma_e2,
+        "vp_fixed": vp,
+        "reml": float(final_logl if np.isfinite(final_logl) else best_logl),
+        "ml": float("nan"),
+    }
+    out.update(
+        _splmm_component_scale_reml(
+            y_vec=y,
+            x_cov=x_cov,
+            sigma_g2=sigma_g2,
+            sigma_e2=sigma_e2,
+        )
+    )
+    return out
+
+
 def _splmm_design_with_intercept(
     x_cov: Union[np.ndarray, None],
     n: int,
@@ -2530,6 +2657,7 @@ def _splmm_sparse_null_fit(
     x_cov: Union[np.ndarray, None],
     progress_callback=None,
     residualized_approx: bool = False,
+    objective_mode: Union[str, None] = None,
     threads: Union[int, None] = None,
 ) -> dict[str, object]:
     y_arg = np.ascontiguousarray(np.asarray(y_vec, dtype=np.float64).reshape(-1), dtype=np.float64)
@@ -2557,6 +2685,66 @@ def _splmm_sparse_null_fit(
     offdiag_total = max(1, int(n_samples_k) * max(0, int(n_samples_k) - 1) // 2)
     offdiag_density = float(offdiag_nnz / offdiag_total) if int(n_samples_k) > 1 else float("nan")
     threads_use = int(max(1, int(threads) if threads is not None and int(threads) > 0 else detect_effective_threads()))
+    objective_mode_norm = (
+        ("raw" if bool(residualized_approx) else "fastgwa")
+        if objective_mode is None
+        else str(objective_mode).strip().lower()
+    )
+    if objective_mode_norm not in {"raw", "fastgwa"}:
+        raise ValueError(
+            f"SparseLMM sparse null fit objective_mode must be one of {{'raw', 'fastgwa'}}, got {objective_mode!r}"
+        )
+    if residualized_approx and objective_mode_norm != "raw":
+        raise ValueError(
+            "SparseLMM residualized approximate null fit currently supports only objective_mode='raw'."
+        )
+
+    if objective_mode_norm == "fastgwa":
+        fit_t0 = time.monotonic()
+        dense_grm = _splmm_load_sparse_grm_subset_dense(str(jxgrm_path), sample_idx_arg)
+        out_dict = dict(
+            _splmm_exact_fixed_vp_reml_h2_fit_from_grm(
+                grm=dense_grm,
+                y_vec=y_arg,
+                x_cov=x_arg,
+            )
+        )
+        fit_secs = max(time.monotonic() - fit_t0, 0.0)
+        sigma_g2 = float(out_dict.get("sigma_g2", float("nan")))
+        sigma_e2 = float(out_dict.get("sigma_e2", float("nan")))
+        var_g_diag_scaled = (
+            float(sigma_g2) * max(mean_diag_k, 0.0)
+            if np.isfinite(sigma_g2) and np.isfinite(mean_diag_k)
+            else float("nan")
+        )
+        denom_diag_scaled = float(var_g_diag_scaled + sigma_e2)
+        pve_diag_scaled = (
+            float(var_g_diag_scaled / denom_diag_scaled)
+            if np.isfinite(denom_diag_scaled) and denom_diag_scaled > 0.0
+            else float("nan")
+        )
+        out_dict.update(
+            {
+                "strategy": "sparse_reml_fastgwa_fixed_vp",
+                "fit_secs": float(fit_secs),
+                "grid_log10": [],
+                "grid_reml": [],
+                "grid_sigma_g2": [],
+                "grid_sigma_e2": [],
+                "mean_diag_k": mean_diag_k,
+                "pve_diag_scaled": pve_diag_scaled,
+                "min_diag_k": float(sparse_diag.get("min_diag", float("nan"))),
+                "max_diag_k": float(sparse_diag.get("max_diag", float("nan"))),
+                "n_samples_k": float(n_samples_k),
+                "nnz_k": float(nnz_k),
+                "offdiag_nnz_k": float(offdiag_nnz),
+                "offdiag_density_k": float(offdiag_density),
+                "lambda_boundary": None,
+            }
+        )
+        if progress_callback is not None:
+            progress_callback(1, 1)
+        return out_dict
 
     if residualized_approx:
         if not hasattr(jxrs, "splmm_residualized_approx_null_fit_from_jxgrm"):
@@ -5121,6 +5309,7 @@ def run_splmm_windowed_fullrank(
     trait_prepared_meta: Union[dict[str, object], None] = None,
     force_model: bool = False,
     scan_mode: str = "exact",
+    null_objective_mode: Optional[str] = None,
 ) -> None:
     if str(genetic_model).lower() != "add":
         raise ValueError("SparseLMM windowed BED route supports additive coding only.")
@@ -5131,6 +5320,19 @@ def run_splmm_windowed_fullrank(
     scan_mode_norm = str(scan_mode).strip().lower()
     if scan_mode_norm not in {"approx", "exact"}:
         raise ValueError(f"Unsupported SparseLMM scan mode: {scan_mode}")
+    null_objective_mode_norm = (
+        ("raw" if scan_mode_norm == "approx" else "fastgwa")
+        if null_objective_mode is None
+        else str(null_objective_mode).strip().lower()
+    )
+    if null_objective_mode_norm not in {"raw", "fastgwa"}:
+        raise ValueError(
+            f"Unsupported SparseLMM null objective mode: {null_objective_mode}"
+        )
+    if scan_mode_norm == "approx" and null_objective_mode_norm != "raw":
+        raise ValueError(
+            "SparseLMM approximate scan mode supports only null_objective_mode='raw'."
+        )
     if scan_mode_norm == "approx":
         if not hasattr(jxrs, "splmm_residualized_approx_null_fit_from_jxgrm"):
             raise RuntimeError(
@@ -5408,6 +5610,7 @@ def run_splmm_windowed_fullrank(
                 x_cov=x_arg,
                 progress_callback=None,
                 residualized_approx=bool(scan_mode_norm == "approx"),
+                objective_mode=null_objective_mode_norm,
                 threads=int(threads),
             )
             return out, max(time.monotonic() - task_t0, 0.0)
@@ -5482,8 +5685,9 @@ def run_splmm_windowed_fullrank(
             )
         null_backend = str(null_fit.get("backend", "unknown"))
         null_strategy = str(null_fit.get("strategy", "unknown"))
+        null_objective_label = str(null_objective_mode_norm)
         _null_fit_msg = (
-            f"{null_strategy} null fit h2~{float(null_pve):.3f}, "
+            f"{null_strategy} null fit objective={null_objective_label}, h2~{float(null_pve):.3f}, "
             f"mean_diag(K)={null_mean_diag_k:.4g}, "
             f"nnz(K)={null_nnz_k}, "
             f"offdiag_density={null_offdiag_density_k:.4g}, "
@@ -5498,7 +5702,7 @@ def run_splmm_windowed_fullrank(
             f"lambda_boundary={null_lambda_boundary or 'interior'}, "
             f"backend={null_backend} [null_fit={format_elapsed(null_fit_secs)}]"
             if np.isfinite(null_pve)
-            else f"{null_strategy} null fit sigma_g2={sigma_g2:.4g}, sigma_e2={sigma_e2:.4g}, "
+            else f"{null_strategy} null fit objective={null_objective_label}, sigma_g2={sigma_g2:.4g}, sigma_e2={sigma_e2:.4g}, "
             f"backend={null_backend} [null_fit={format_elapsed(null_fit_secs)}]"
         )
         if bool(use_spinner):
@@ -5974,6 +6178,7 @@ def run_splmm_windowed_fullrank(
             scan_sigma_mode = "lambda_only_residualized_approx"
             _sigma_mode_info = (
                 f"scan_param=lambda_only(lambda={scan_lbd_arg:.4g}); "
+                f"null_objective={null_objective_label}; "
                 f"Rust residualized approx builds scan-scale sigma2 internally; "
                 f"sampled markers={rhat_used}/{rhat_requested}"
             )
@@ -5981,6 +6186,7 @@ def run_splmm_windowed_fullrank(
             scan_sigma_mode = "lambda_only_exact_internal_sigma2"
             _sigma_mode_info = (
                 f"scan_param=lambda_only(lambda={scan_lbd_arg:.4g}); "
+                f"null_objective={null_objective_label}; "
                 "Rust exact scan uses K+lambda I and null sigma2=y'P0y/df internally"
             )
         _scan_diag_msg = (
@@ -6129,6 +6335,8 @@ def run_splmm_windowed_fullrank(
                 "splmm_scan_sigma2": None,
                 "splmm_scan_sigma_g2": None,
                 "splmm_scan_sigma_e2": None,
+                "splmm_null_objective": str(null_objective_label),
+                "splmm_null_strategy": str(null_strategy),
                 "splmm_resid_var_reml": (
                     float(resid_var_reml) if np.isfinite(resid_var_reml) else None
                 ),

@@ -41,11 +41,16 @@ import sys
 import subprocess
 import importlib
 import os
-import textwrap
 import re
+import difflib
+import textwrap
 from datetime import date
 from pathlib import Path
 from importlib.metadata import version, PackageNotFoundError
+from rich import box
+from rich.console import Console, Group
+from rich.panel import Panel
+from rich.text import Text
 from janusx._optional_deps import format_missing_dependency_for_module
 from ._common.interrupt import install_interrupt_handlers, force_exit
 from ._common.threads import apply_outer_thread_cap, detect_effective_threads
@@ -53,6 +58,11 @@ try:
     v = version("janusx")
 except PackageNotFoundError:
     v = "0.0.0"
+
+_CONSOLE = Console()
+_CLI_HELP_MAX_WIDTH = 100
+_CLI_HELP_KEY_WIDTH = 14
+_CLI_HELP_GAP = 2
 
 __BUILD_DATE_FALLBACK__ = "2026-06-26"
 
@@ -88,11 +98,53 @@ __logo__ = r'''
   \____/ \__,_|_| |_|\__,_|___/_/ \_\ Tools for GWAS and GS
   ---------------------------------------------------------
 '''
+_BUILD_DATE = _build_date()
+_HELP_BUILD_DATE = __BUILD_DATE_FALLBACK__ or _BUILD_DATE
 __version__ = (
     f"JanusX v{v} by Jingxian FU, Huazhong Agricultural University\n"
     "Please report issues to <fujingxian@webmail.hzau.edu.cn>\n"
-    f"Build date: {_build_date()}\n"
+    f"Build date: {_BUILD_DATE}\n"
 )
+_CLI_FLAGS = [
+    ("-h, --help", "Show this help message"),
+    ("-v, --version", "Show version/build information"),
+]
+_CLI_MODULE_SECTIONS = [
+    (
+        "Genome-wide Association Studies (GWAS)",
+        [
+            ("grm", "Build genomic relationship matrix"),
+            ("pca", "Principal component analysis for population structure"),
+            ("gwas", "Run genome-wide association analysis"),
+            ("postgwas", "Post-process GWAS results and downstream plots"),
+        ],
+    ),
+    (
+        "Genomic Selection (GS)",
+        [
+            ("gs", "Genomic prediction and model-based selection"),
+            ("reml", "Estimate broad/narrow heritability and BLUE by REML"),
+            ("postgs", "Summarize and visualize GS results"),
+        ],
+    ),
+    (
+        "Pipeline and Utility",
+        [
+            ("garfield", "Random-forest based marker-trait association"),
+            ("postbsa", "Post-process and visualize BSA results"),
+            ("kmer", "K-mer counting workflow via KMC"),
+            ("kmerge", "Merge multi-sample KMC databases into genotype matrix"),
+            ("kstats", "Compute pairwise KMC k-mer statistics"),
+            ("view", "View .bkmer/.bsite as plain text for shell pipes"),
+            ("tree", "Tree workflow entry (`-nj` Neighbor-Joining / `-ml` FastTree ML)"),
+            ("treeplot", "Visualize Newick/GRM trees with toytree"),
+            ("adamixture", "ADAMIXTURE ancestry inference"),
+            ("hybrid", "Build pairwise hybrid genotype matrix from parent lists"),
+            ("gformat", "Convert genotype files across plink/vcf/txt/npy"),
+            ("gmerge", "Merge genotype/variant tables"),
+        ],
+    ),
+]
 
 _MODULE_NAMES = [
     "gwas", "postgwas", "postgarfield", "postbsa",
@@ -185,129 +237,129 @@ def _load_script_module(name: str):
     return importlib.import_module(f"janusx.script.{target}")
 
 
-def _supports_color() -> bool:
-    """Match launcher behavior: color only when stdout is a terminal."""
-    return bool(getattr(sys.stdout, "isatty", lambda: False)())
+def _suggest_module_names(name: str, limit: int = 1) -> list[str]:
+    query = str(name).strip().lower()
+    if query == "":
+        return []
+
+    candidates = sorted(set(_MODULE_NAMES))
+    lowered = {candidate.lower(): candidate for candidate in candidates}
+    matches = difflib.get_close_matches(query, list(lowered.keys()), n=max(1, int(limit)), cutoff=0.5)
+    return [lowered[match] for match in matches]
 
 
-def _style_green(text: str) -> str:
-    if _supports_color():
-        return f"\033[32m{text}\033[0m"
-    return text
+def _print_unknown_module_error(module_name: str) -> None:
+    suggestions = _suggest_module_names(module_name)
+    _CONSOLE.print(f"[bold red]Error:[/bold red] '{module_name}' is not a recognized JanusX module.")
+    if len(suggestions) == 1:
+        _CONSOLE.print("The most similar module is:")
+        _CONSOLE.print(f"    [green]{suggestions[0]}[/green]")
 
 
-def _style_yellow(text: str) -> str:
-    if _supports_color():
-        return f"\033[33m{text}\033[0m"
-    return text
+def _render_logo() -> Panel:
+    logo = Text(__logo__.strip("\n"), style="bold green")
+    return Panel.fit(logo, border_style="green", padding=(0, 1))
 
 
-def _style_blue(text: str) -> str:
-    if _supports_color():
-        return f"\033[34m{text}\033[0m"
-    return text
-
-
-def _style_orange(text: str) -> str:
-    if _supports_color():
-        return f"\033[38;5;208m{text}\033[0m"
-    return text
-
-
-def _style_white(text: str) -> str:
-    if _supports_color():
-        return f"\033[37m{text}\033[0m"
-    return text
-
-
-def _help_line_width() -> int:
-    cols = 100
-    val = str(os.environ.get("COLUMNS", "")).strip()
-    if val.isdigit():
-        try:
-            parsed = int(val)
-            if parsed > 0:
-                cols = parsed
-        except Exception:
-            pass
-    return max(48, min(160, cols - 2))
-
-
-def _wrap_help_text(text: str, width: int) -> list[str]:
+def _help_panel_width() -> int:
+    try:
+        width = int(_CONSOLE.size.width)
+    except Exception:
+        width = _CLI_HELP_MAX_WIDTH
     if width <= 0:
-        return [text]
-    wrapped = textwrap.wrap(
-        text,
-        width=width,
-        break_long_words=False,
-        break_on_hyphens=False,
+        return _CLI_HELP_MAX_WIDTH
+    return min(width, _CLI_HELP_MAX_WIDTH)
+
+
+def _help_content_width() -> int:
+    return max(20, _help_panel_width() - 4)
+
+
+def _render_help_header() -> Panel:
+    title = Text(f"JanusX (v{v}  Build date: {_HELP_BUILD_DATE})", style="bold green", justify="center")
+    return Panel(
+        title,
+        border_style="green",
+        box=box.ROUNDED,
+        padding=(0, 1),
+        width=_help_panel_width(),
     )
-    return wrapped if wrapped else [""]
 
 
-def _print_help_entry(indent: int, key: str, desc: str, key_width: int, total_width: int) -> None:
-    lead = " " * indent
-    min_desc_width = 20
-    key_padded = f"{key:<{key_width}}"
-    min_total = indent + key_width + 2 + min_desc_width
-    if total_width <= min_total:
-        print(f"{lead}{_style_green(key)}")
-        for line in _wrap_help_text(desc, max(min_desc_width, total_width - indent - 2)):
-            print(f"{lead}  {_style_white(line)}")
-        return
+def _render_help_text(
+    rows: list[tuple[str, str]],
+    *,
+    key_style: str = "bold green",
+    desc_style: str = "white",
+    first_key_style: str | None = None,
+    first_desc_style: str | None = None,
+) -> Text:
+    text = Text()
+    content_width = _help_content_width()
+    key_width = int(_CLI_HELP_KEY_WIDTH)
+    gap = " " * int(_CLI_HELP_GAP)
+    desc_width = max(10, content_width - key_width - len(gap))
+    for idx, (key_raw, desc_raw) in enumerate(rows):
+        key = str(key_raw)
+        desc = str(desc_raw)
+        key_row_style = first_key_style if idx == 0 and first_key_style is not None else key_style
+        desc_row_style = first_desc_style if idx == 0 and first_desc_style is not None else desc_style
+        wrapped = textwrap.wrap(
+            desc,
+            width=desc_width,
+            break_long_words=False,
+            break_on_hyphens=False,
+        ) or [""]
+        for line_idx, line in enumerate(wrapped):
+            line_key = key if line_idx == 0 else ""
+            text.append(f"{line_key:<{key_width}}", style=key_row_style if line_idx == 0 else "")
+            text.append(gap)
+            text.append(line, style=desc_row_style)
+            if not (idx == len(rows) - 1 and line_idx == len(wrapped) - 1):
+                text.append("\n")
+    return text
 
-    desc_width = total_width - indent - key_width - 2
-    wrapped = _wrap_help_text(desc, desc_width)
-    if not wrapped:
-        print(f"{lead}{_style_green(key_padded)}")
-        return
 
-    print(f"{lead}{_style_green(key_padded)}  {_style_white(wrapped[0])}")
-    pad = " " * key_width
-    for line in wrapped[1:]:
-        print(f"{lead}{pad}  {_style_white(line)}")
+def _render_module_section(title: str, rows: list[tuple[str, str]]) -> Panel:
+    return Panel(
+        _render_help_text([(str(key), str(desc)) for key, desc in rows]),
+        title=f"[bold blue]{title}[/bold blue]",
+        title_align="left",
+        border_style="blue",
+        box=box.ROUNDED,
+        padding=(0, 1),
+        width=_help_panel_width(),
+    )
 
 
 def _print_cli_help() -> None:
-    width = _help_line_width()
-    print(__logo__)
-    print(_style_orange("Usage:"))
-    print(f"  {_style_green('jx [flags]')}")
-    print(f"  {_style_green('jx [module] -h')}")
-    print()
-
-    print(_style_orange("Flags:"))
-    _print_help_entry(2, "-h, --help", "Show this help message", 16, width)
-    _print_help_entry(2, "-v, --version", "Show version/build information", 16, width)
-    print()
-
-    print(_style_orange("Modules:"))
-    print(f"  {_style_blue('Genome-wide Association Studies (GWAS):')}")
-    _print_help_entry(4, "grm", "Build genomic relationship matrix", 12, width)
-    _print_help_entry(4, "pca", "Principal component analysis for population structure", 12, width)
-    _print_help_entry(4, "gwas", "Run genome-wide association analysis", 12, width)
-    _print_help_entry(4, "postgwas", "Post-process GWAS results and downstream plots", 12, width)
-    print()
-
-    print(f"  {_style_blue('Genomic Selection (GS):')}")
-    _print_help_entry(4, "gs", "Genomic prediction and model-based selection", 12, width)
-    _print_help_entry(4, "reml", "Estimate broad/narrow heritability and BLUE by REML", 12, width)
-    _print_help_entry(4, "postgs", "Summarize and visualize GS results", 12, width)
-    print()
-
-    print(f"  {_style_blue('Pipeline and utility:')}")
-    _print_help_entry(4, "garfield", "Random-forest based marker-trait association", 12, width)
-    _print_help_entry(4, "postbsa", "Post-process and visualize BSA results", 12, width)
-    _print_help_entry(4, "kmer", "K-mer counting workflow via KMC", 12, width)
-    _print_help_entry(4, "kmerge", "Merge multi-sample KMC databases into genotype matrix", 12, width)
-    _print_help_entry(4, "kstats", "Compute pairwise KMC k-mer statistics", 12, width)
-    _print_help_entry(4, "view", "View .bkmer/.bsite as plain text for shell pipes", 12, width)
-    _print_help_entry(4, "tree", "Tree workflow entry (`-nj` Neighbor-Joining / `-ml` FastTree ML)", 12, width)
-    _print_help_entry(4, "treeplot", "Visualize Newick/GRM trees with toytree", 12, width)
-    _print_help_entry(4, "adamixture", "ADAMIXTURE ancestry inference", 12, width)
-    _print_help_entry(4, "hybrid", "Build pairwise hybrid genotype matrix from parent lists", 12, width)
-    _print_help_entry(4, "gformat", "Convert genotype files across plink/vcf/txt/npy", 12, width)
-    _print_help_entry(4, "gmerge", "Merge genotype/variant tables", 12, width)
+    parts: list[object] = [
+        _render_help_header(),
+        Panel(
+            Group(
+                _render_help_text(
+                    [
+                        ("Usage", "jx [flags]"),
+                        ("", "jx [module] -h"),
+                    ],
+                    first_key_style="bold orange3",
+                    first_desc_style="bold green",
+                    desc_style="bold green",
+                ),
+                Text(""),
+                _render_help_text([(str(key), str(desc)) for key, desc in _CLI_FLAGS]),
+            ),
+            title="[bold orange3]CLI[/bold orange3]",
+            title_align="left",
+            border_style="orange3",
+            box=box.ROUNDED,
+            padding=(0, 1),
+            width=_help_panel_width(),
+        ),
+    ]
+    for title, rows in _CLI_MODULE_SECTIONS:
+        parts.append(_render_module_section(title, rows))
+    _CONSOLE.print(Group(*parts))
 
 
 def _print_help() -> None:
@@ -317,11 +369,10 @@ def _print_help() -> None:
 def main():
     install_interrupt_handlers()
     if sys.version_info < (3, 10):
-        print(
-            _style_yellow(
-                f"Python {sys.version_info.major}.{sys.version_info.minor} is not supported. "
-                "JanusX requires Python >= 3.10."
-            )
+        _CONSOLE.print(
+            "[bold red]Error:[/bold red] "
+            f"Python {sys.version_info.major}.{sys.version_info.minor} is not supported. "
+            "JanusX requires Python >= 3.10."
         )
         raise SystemExit(1)
     if str(os.environ.get("JANUSX_ENTRYPOINT", "")).strip() == "":
@@ -332,20 +383,24 @@ def main():
         if sys.argv[1] == '-h' or sys.argv[1] == '--help':
             _print_help()
         elif sys.argv[1] == '-v' or sys.argv[1] == '--version':
-            print(__logo__)
-            print(__version__)
+            _CONSOLE.print(_render_logo())
+            _CONSOLE.print(__version__.rstrip())
         elif sys.argv[1] in _LAUNCHER_ONLY_FLAGS:
-            print(__logo__)
+            _CONSOLE.print(_render_logo())
             launcher_cmd = "jx " + " ".join(sys.argv[1:])
-            print(_style_yellow(f"Error: `{sys.argv[1]}` is launcher-only and not available in `jxpy`."))
-            print(_style_yellow(f"Please use launcher command: `{launcher_cmd}`"))
+            _CONSOLE.print(
+                f"[bold red]Error:[/bold red] `{sys.argv[1]}` is launcher-only and not available in `jxpy`."
+            )
+            _CONSOLE.print(f"[yellow]Please use launcher command:[/yellow] `{launcher_cmd}`")
         else:
             module_name = sys.argv[1]
             if module_name in _LAUNCHER_ONLY_MODULES:
-                print(__logo__)
+                _CONSOLE.print(_render_logo())
                 launcher_cmd = "jx " + " ".join(sys.argv[1:])
-                print(_style_yellow(f"Error: module `{module_name}` is launcher-only and not available in `jxpy`."))
-                print(_style_yellow(f"Please use launcher command: `{launcher_cmd}`"))
+                _CONSOLE.print(
+                    f"[bold red]Error:[/bold red] module `{module_name}` is launcher-only and not available in `jxpy`."
+                )
+                _CONSOLE.print(f"[yellow]Please use launcher command:[/yellow] `{launcher_cmd}`")
                 return
             if module_name in _MODULE_NAMES:
                 _apply_early_thread_env_from_cli(module_name, sys.argv[2:])
@@ -364,14 +419,13 @@ def main():
                     )
                     if msg is None:
                         raise
-                    print(__logo__)
-                    print(f"Error: {msg}")
+                    _CONSOLE.print(_render_logo())
+                    _CONSOLE.print(f"[bold red]Error:[/bold red] {msg}")
                     raise SystemExit(1)
                 except KeyboardInterrupt:
                     force_exit(130, "Interrupted by user (Ctrl+C).")
             elif module_name not in _MODULE_NAMES:
-                print(_style_yellow(f"Unknown module: {sys.argv[1]}"))
-                _print_help()
+                _print_unknown_module_error(module_name)
     else:
         _print_help()
 

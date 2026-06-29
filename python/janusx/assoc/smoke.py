@@ -50,6 +50,7 @@ def run_assoc_api_smoke() -> None:
     splmm_res = splmm.assoc(G)
     _assert_common_fit_state(splmm, route="splmm", kinship_kind="sparse")
     assert splmm_res.shape == (5, 3)
+    assert splmm.fit_result_["sparse_null_objective"] == "fastgwa"
     assert splmm.fit_result_["backend"] is not None
     assert splmm.fit_result_["sparse_grm_path"] is not None
     assert splmm.null_fit_["lambda"] is not None

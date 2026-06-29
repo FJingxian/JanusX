@@ -78,9 +78,9 @@ jx gwas -vcf example/mouse_hs1940.vcf.gz -p example/mouse_hs1940.pheno -lmm -o t
 jx gwas -vcf example/mouse_hs1940.vcf.gz -p example/mouse_hs1940.pheno -lmm2 -o test
 # Estimate variance once in NULL model, similar with EMMAX. (Fast)
 jx gwas -vcf example/mouse_hs1940.vcf.gz -p example/mouse_hs1940.pheno -fvlmm -o test
-# Linear mixed model with sparse GRM, similar with fastGWA. (Fast, grammar gamma, prepared for biobank cohorts)
+# Linear mixed model with sparse GRM, fastGWA-compatible sparse REML null + approximate GRAMMAR-gamma scan.
 jx gwas -vcf example/mouse_hs1940.vcf.gz -p example/mouse_hs1940.pheno -splmm-approx -o test
-# Linear mixed model with sparse GRM, similar with fastGWA. (Low peak RSS, prepared for biobank cohorts)
+# Linear mixed model with sparse GRM, fastGWA-compatible sparse REML null + exact g'Pg scan.
 jx gwas -vcf example/mouse_hs1940.vcf.gz -p example/mouse_hs1940.pheno -splmm -o test
 # FarmCPU (Fast, and more sites, prepared for biobank cohorts)
 jx gwas -vcf example/mouse_hs1940.vcf.gz -p example/mouse_hs1940.pheno -farmcpu -o test

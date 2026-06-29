@@ -2686,17 +2686,13 @@ def _splmm_sparse_null_fit(
     offdiag_density = float(offdiag_nnz / offdiag_total) if int(n_samples_k) > 1 else float("nan")
     threads_use = int(max(1, int(threads) if threads is not None and int(threads) > 0 else detect_effective_threads()))
     objective_mode_norm = (
-        ("raw" if bool(residualized_approx) else "fastgwa")
+        "fastgwa"
         if objective_mode is None
         else str(objective_mode).strip().lower()
     )
     if objective_mode_norm not in {"raw", "fastgwa"}:
         raise ValueError(
             f"SparseLMM sparse null fit objective_mode must be one of {{'raw', 'fastgwa'}}, got {objective_mode!r}"
-        )
-    if residualized_approx and objective_mode_norm != "raw":
-        raise ValueError(
-            "SparseLMM residualized approximate null fit currently supports only objective_mode='raw'."
         )
 
     if objective_mode_norm == "fastgwa":
@@ -5321,17 +5317,13 @@ def run_splmm_windowed_fullrank(
     if scan_mode_norm not in {"approx", "exact"}:
         raise ValueError(f"Unsupported SparseLMM scan mode: {scan_mode}")
     null_objective_mode_norm = (
-        ("raw" if scan_mode_norm == "approx" else "fastgwa")
+        "fastgwa"
         if null_objective_mode is None
         else str(null_objective_mode).strip().lower()
     )
     if null_objective_mode_norm not in {"raw", "fastgwa"}:
         raise ValueError(
             f"Unsupported SparseLMM null objective mode: {null_objective_mode}"
-        )
-    if scan_mode_norm == "approx" and null_objective_mode_norm != "raw":
-        raise ValueError(
-            "SparseLMM approximate scan mode supports only null_objective_mode='raw'."
         )
     if scan_mode_norm == "approx":
         if not hasattr(jxrs, "splmm_residualized_approx_null_fit_from_jxgrm"):

@@ -6068,9 +6068,7 @@ def parse_args(argv: Optional[list[str]] = None):
         parser.error("Only one of -splmm / -splmm-approx may be specified.")
     if _active_splmm_modes:
         args.splmm, args._splmm_denom_mode = _active_splmm_modes[0]
-        args._splmm_null_objective_mode = (
-            "raw" if str(args._splmm_denom_mode) == "approx" else "fastgwa"
-        )
+        args._splmm_null_objective_mode = "fastgwa"
     else:
         args._splmm_denom_mode = None
         args._splmm_null_objective_mode = None

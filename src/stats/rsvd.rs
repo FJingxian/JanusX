@@ -198,8 +198,8 @@ fn rows_from_target_mb(target_mb: usize, n_cols: usize, max_rows: usize) -> usiz
 }
 
 #[inline]
-fn omega_stats_chunk_rows(m: usize, n_cols: usize) -> usize {
-    let rows = rsvd_block_rows_env(n_cols, m)
+fn omega_stats_chunk_rows(m: usize, n_cols: usize, target_mb: Option<usize>) -> usize {
+    let rows = rsvd_block_rows_with_target_mb(n_cols, m, target_mb)
         .saturating_mul(16)
         .clamp(1024, 16384);
     rows.min(m.max(1))
@@ -223,7 +223,7 @@ fn packed_subset_row_stats(
     let mut row_flip = vec![false; m];
     let mut varsum = 0.0_f64;
     let full_sample_fast = is_identity_indices(sample_idx, n_samples);
-    let chunk_rows = omega_stats_chunk_rows(m, n_samples);
+    let chunk_rows = omega_stats_chunk_rows(m, n_samples, None);
 
     for chunk_start in (0..m).step_by(chunk_rows) {
         check_ctrlc()?;
@@ -272,6 +272,7 @@ pub(crate) struct PackedRsvdView<'a> {
     pub(crate) row_flip: &'a [bool],
     pub(crate) sample_idx: &'a [usize],
     pub(crate) packed_row_indices: Option<&'a [usize]>,
+    pub(crate) block_target_mb: Option<usize>,
 }
 
 impl<'a> PackedRsvdView<'a> {
@@ -317,6 +318,18 @@ impl<'a> PackedRsvdView<'a> {
         };
         Ok((full_sample_fast, subset_plan))
     }
+}
+
+#[inline]
+pub(crate) fn rsvd_block_rows_with_target_mb(
+    n_cols: usize,
+    max_rows: usize,
+    target_mb: Option<usize>,
+) -> usize {
+    if let Some(target_mb) = target_mb.filter(|&v| v > 0) {
+        return rows_from_target_mb(target_mb, n_cols, max_rows);
+    }
+    rsvd_block_rows_env(n_cols, max_rows)
 }
 
 #[inline]
@@ -539,7 +552,7 @@ pub(crate) fn rsvd_packed_compute_a_omega(
         return Err("omega shape mismatch in packed RSVD A*Omega".to_string());
     }
     let total_threads = rayon::current_num_threads().max(1);
-    let block_rows = rsvd_block_rows_env(n, m);
+    let block_rows = rsvd_block_rows_with_target_mb(n, m, view.block_target_mb);
     let overlap_enabled = rsvd_packed_overlap_enabled(total_threads, m, block_rows);
     let decode_threads = rsvd_decode_threads(total_threads, overlap_enabled);
     let blas_threads = rsvd_blas_threads(total_threads, decode_threads, overlap_enabled);
@@ -699,7 +712,7 @@ pub(crate) fn rsvd_packed_compute_at_random_omega(
     let m = view.m();
     let n = view.n();
     let total_threads = rayon::current_num_threads().max(1);
-    let block_rows = rsvd_block_rows_env(n, m);
+    let block_rows = rsvd_block_rows_with_target_mb(n, m, view.block_target_mb);
     let overlap_enabled = rsvd_packed_overlap_enabled(total_threads, m, block_rows);
     let decode_threads = rsvd_decode_threads(total_threads, overlap_enabled);
     let blas_threads = rsvd_blas_threads(total_threads, decode_threads, overlap_enabled);
@@ -866,7 +879,7 @@ pub(crate) fn rsvd_packed_compute_ata_omega(
         return Err("omega shape mismatch in packed RSVD A^T*(A*Omega)".to_string());
     }
     let total_threads = rayon::current_num_threads().max(1);
-    let block_rows = rsvd_block_rows_env(n, m);
+    let block_rows = rsvd_block_rows_with_target_mb(n, m, view.block_target_mb);
     let overlap_enabled = rsvd_packed_pipeline_enabled() && total_threads > 1 && m > block_rows;
     let decode_threads = rsvd_decode_threads(total_threads, overlap_enabled);
     let blas_threads = rsvd_blas_threads(total_threads, decode_threads, overlap_enabled);
@@ -1067,7 +1080,7 @@ pub(crate) fn rsvd_packed_compute_gram_aq(
         return Err("q shape mismatch in packed RSVD gram accumulation".to_string());
     }
     let total_threads = rayon::current_num_threads().max(1);
-    let block_rows = rsvd_block_rows_env(n, m);
+    let block_rows = rsvd_block_rows_with_target_mb(n, m, view.block_target_mb);
     let overlap_enabled = rsvd_packed_overlap_enabled(total_threads, m, block_rows);
     let decode_threads = rsvd_decode_threads(total_threads, overlap_enabled);
     let blas_threads = rsvd_blas_threads(total_threads, decode_threads, overlap_enabled);
@@ -1566,6 +1579,7 @@ pub fn rsvd_packed_subset(
         row_flip: &row_flip,
         sample_idx,
         packed_row_indices: None,
+        block_target_mb: None,
     };
 
     let mut y = rsvd_packed_compute_at_random_omega(packed_view, kp, seed)?;

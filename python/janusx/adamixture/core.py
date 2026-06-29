@@ -109,6 +109,7 @@ class ADAMixtureConfig:
     seed: int = 42
     threads: int = 1
     chunk_size: int = 50000
+    memory_mb: int = 0
     snps_only: bool = True
     maf: float = 0.02
     geno: float = 0.05
@@ -469,6 +470,7 @@ def rsvd_streaming(
     missing_rate: float = 0.05,
     delimiter: Optional[str] = None,
     mmap_window_mb: int = 0,
+    memory_mb: int = 0,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Streaming RSVD fully in Rust.
@@ -492,6 +494,7 @@ def rsvd_streaming(
         float(missing_rate),
         (None if delimiter is None else str(delimiter)),
         int(mmap_window_mb),
+        int(max(0, int(memory_mb))),
     )
     return (
         np.ascontiguousarray(np.asarray(evals, dtype=np.float32)),
@@ -649,6 +652,7 @@ def _bed_training_meta(
     snps_only: bool,
     maf: float,
     missing_rate: float,
+    memory_mb: int = 0,
     bed_backend: Any = None,
 ) -> tuple[np.ndarray, int]:
     prefix = _plink_prefix_path(genotype_path)
@@ -663,6 +667,7 @@ def _bed_training_meta(
             bool(snps_only),
             float(maf),
             float(missing_rate),
+            int(max(0, int(memory_mb))),
         )
     else:
         _row_idx, _miss, maf_arr, _row_flip, _site_keep, n_samples, _n_total = (
@@ -690,6 +695,7 @@ def _open_bed_backend(
     snps_only: bool,
     maf: float,
     missing_rate: float,
+    memory_mb: int = 0,
     logger: Optional[logging.Logger] = None,
 ) -> Any:
     prefix = _plink_prefix_path(genotype_path)
@@ -701,6 +707,7 @@ def _open_bed_backend(
             bool(snps_only),
             float(maf),
             float(missing_rate),
+            int(max(0, int(memory_mb))),
         )
     except Exception as ex:
         if logger is not None:
@@ -716,6 +723,7 @@ def _open_bed_training_session(
     snps_only: bool,
     maf: float,
     missing_rate: float,
+    memory_mb: int = 0,
     logger: Optional[logging.Logger] = None,
 ) -> Any:
     _admx_py_mem_debug(
@@ -739,6 +747,7 @@ def _open_bed_training_session(
                 bool(snps_only),
                 float(maf),
                 float(missing_rate),
+                int(max(0, int(memory_mb))),
             )
             _admx_py_mem_debug(
                 "open_bed_training_session/after_rust_open",
@@ -751,6 +760,7 @@ def _open_bed_training_session(
             bool(snps_only),
             float(maf),
             float(missing_rate),
+            int(max(0, int(memory_mb))),
         )
         _admx_py_mem_debug(
             "open_bed_training_session/after_rust_open",
@@ -842,6 +852,7 @@ def _rsvd(
     snps_only: bool = True,
     maf: float = 0.02,
     missing_rate: float = 0.05,
+    memory_mb: int = 0,
     use_stream_sample: bool = False,
     bed_backend: Any = None,
     logger: logging.Logger,
@@ -885,6 +896,7 @@ def _rsvd(
                             float(missing_rate),
                             None,
                             0,
+                            int(max(0, int(memory_mb))),
                         )
                     )
                 eigvals = np.ascontiguousarray(np.asarray(evals, dtype=np.float32))
@@ -920,6 +932,7 @@ def _rsvd(
                                 float(missing_rate),
                                 None,
                                 0,
+                                int(max(0, int(memory_mb))),
                             ),
                             dtype=np.float32,
                         )
@@ -1131,6 +1144,7 @@ def _adam_em_optimize(
     snps_only: bool = True,
     maf: float = 0.02,
     missing_rate: float = 0.05,
+    memory_mb: int = 0,
     bed_backend: Any = None,
     lr: float,
     beta1: float,
@@ -1214,6 +1228,7 @@ def _adam_em_optimize(
                 bool(snps_only),
                 float(maf),
                 float(missing_rate),
+                int(max(0, int(memory_mb))),
             )
     else:
         if g is None:
@@ -1471,6 +1486,7 @@ def _fit_adamixture_on_bed_backend(
         snps_only=bool(cfg.snps_only),
         maf=float(cfg.maf),
         missing_rate=float(cfg.geno),
+        memory_mb=int(cfg.memory_mb),
         bed_backend=bed_backend,
     )
     m = int(f.size)
@@ -1510,6 +1526,7 @@ def _fit_adamixture_on_bed_backend(
             snps_only=bool(cfg.snps_only),
             maf=float(cfg.maf),
             missing_rate=float(cfg.geno),
+            memory_mb=int(cfg.memory_mb),
             use_stream_sample=True,
             bed_backend=bed_backend,
             logger=logger,
@@ -1533,6 +1550,7 @@ def _fit_adamixture_on_bed_backend(
                         bool(cfg.snps_only),
                         float(cfg.maf),
                         float(cfg.geno),
+                        int(cfg.memory_mb),
                     )
                 )
             p0, q0 = _als_init(
@@ -1563,6 +1581,7 @@ def _fit_adamixture_on_bed_backend(
         snps_only=bool(cfg.snps_only),
         maf=float(cfg.maf),
         missing_rate=float(cfg.geno),
+        memory_mb=int(cfg.memory_mb),
         bed_backend=bed_backend,
         lr=float(cfg.lr),
         beta1=float(cfg.beta1),
@@ -1600,6 +1619,7 @@ def _fit_adamixture_on_bed(
             snps_only=bool(cfg.snps_only),
             maf=float(cfg.maf),
             missing_rate=float(cfg.geno),
+            memory_mb=int(cfg.memory_mb),
             logger=logger,
         )
         _admx_py_mem_debug("fit_bed/after_open_training_session", f"has_session={session is not None}")
@@ -1624,6 +1644,7 @@ def _fit_adamixture_on_bed(
         snps_only=bool(cfg.snps_only),
         maf=float(cfg.maf),
         missing_rate=float(cfg.geno),
+        memory_mb=int(cfg.memory_mb),
         logger=logger,
     )
     return _fit_adamixture_on_bed_backend(
@@ -1660,6 +1681,7 @@ def evaluate_adamixture_cverror_bed(
             snps_only=bool(cfg.snps_only),
             maf=float(cfg.maf),
             missing_rate=float(cfg.geno),
+            memory_mb=int(cfg.memory_mb),
             logger=logger,
         )
     if bed_backend is None:
@@ -1805,6 +1827,7 @@ def evaluate_adamixture_cverror(
             snps_only=bool(cfg.snps_only),
             maf=float(cfg.maf),
             missing_rate=float(cfg.geno),
+            memory_mb=int(cfg.memory_mb),
             logger=logger,
         )
         if (

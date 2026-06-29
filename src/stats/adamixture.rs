@@ -37,9 +37,10 @@ use crate::gload::{
 };
 use crate::he::{row_major_block_mul_mat_f32, row_major_block_t_mul_mat_accum_f32};
 use crate::rsvd::{
-    rsvd_block_rows_env, rsvd_packed_compute_a_omega, rsvd_packed_compute_at_random_omega,
-    rsvd_packed_compute_ata_omega, rsvd_packed_compute_gram_aq, rsvd_project_sample_eigvecs,
-    rsvd_right_singular_from_gram, PackedRsvdView, RsvdKernelTiming,
+    rsvd_block_rows_with_target_mb, rsvd_packed_compute_a_omega,
+    rsvd_packed_compute_at_random_omega, rsvd_packed_compute_ata_omega,
+    rsvd_packed_compute_gram_aq, rsvd_project_sample_eigvecs, rsvd_right_singular_from_gram,
+    PackedRsvdView, RsvdKernelTiming,
 };
 use crate::stats_common::{
     admx_madvise_dontneed_bytes, check_admx_memory_limit, process_memory_usage,
@@ -65,6 +66,7 @@ struct StreamRsvdConfig {
     missing_rate: f32,
     delimiter: Option<String>,
     mmap_window_mb: usize,
+    memory_mb: usize,
 }
 
 enum StreamSnpIter {
@@ -191,6 +193,7 @@ struct PackedBedRsvd {
     row_freq: Vec<f32>,
     row_flip: Vec<bool>,
     total_variance: f64,
+    block_target_mb: Option<usize>,
 }
 
 const PACKED_BED_CACHE_MAGIC: &[u8; 8] = b"JXRSVDC1";
@@ -537,6 +540,7 @@ fn build_compact_cache_from_active_rows(
     n_samples: usize,
     bytes_per_snp: usize,
     active_row_idx: &[usize],
+    target_mb: Option<usize>,
 ) -> Result<(), String> {
     if !packed_bed_compact_cache_enabled() {
         return Err("compact BED row cache is disabled".to_string());
@@ -552,7 +556,7 @@ fn build_compact_cache_from_active_rows(
 
     let tmp_path = compact_path.with_extension("tmp");
     let mut writer = BufWriter::new(File::create(&tmp_path).map_err(|e| e.to_string())?);
-    let chunk_rows = packed_backend_stats_chunk_rows(n_total_sites, n_samples);
+    let chunk_rows = packed_backend_stats_chunk_rows(n_total_sites, n_samples, target_mb);
     let mut chunk_buf = Vec::<u8>::new();
     let mut active_ptr = 0usize;
     for chunk_start in (0..n_total_sites).step_by(chunk_rows) {
@@ -747,8 +751,31 @@ fn packed_row_nonmissing_alt_sumsq_full(row: &[u8], n_samples: usize) -> (usize,
 }
 
 #[inline]
-fn packed_backend_stats_chunk_rows(n_rows: usize, n_samples: usize) -> usize {
-    let rows = rsvd_block_rows_env(n_samples, n_rows)
+fn stream_rsvd_target_mb(cfg: &StreamRsvdConfig) -> Option<usize> {
+    if cfg.memory_mb > 0 {
+        Some(cfg.memory_mb)
+    } else {
+        None
+    }
+}
+
+#[inline]
+fn stream_rsvd_block_rows(cfg: &StreamRsvdConfig, n_cols: usize, max_rows: usize) -> usize {
+    rsvd_block_rows_with_target_mb(n_cols, max_rows, stream_rsvd_target_mb(cfg))
+}
+
+#[inline]
+fn packed_backend_block_rows(backend: &PackedBedRsvd, max_rows: usize) -> usize {
+    rsvd_block_rows_with_target_mb(backend.n_samples, max_rows, backend.block_target_mb)
+}
+
+#[inline]
+fn packed_backend_stats_chunk_rows(
+    n_rows: usize,
+    n_samples: usize,
+    target_mb: Option<usize>,
+) -> usize {
+    let rows = rsvd_block_rows_with_target_mb(n_samples, n_rows, target_mb)
         .saturating_mul(16)
         .clamp(1024, 16384);
     rows.min(n_rows.max(1))
@@ -987,6 +1014,7 @@ fn try_build_packed_bed_backend(cfg: &StreamRsvdConfig) -> Result<Option<PackedB
                 row_freq,
                 row_flip,
                 total_variance,
+                block_target_mb: stream_rsvd_target_mb(cfg),
             }));
         }
         let compact_open_s = t_stage.elapsed().as_secs_f64();
@@ -1011,6 +1039,7 @@ fn try_build_packed_bed_backend(cfg: &StreamRsvdConfig) -> Result<Option<PackedB
             n_samples,
             bytes_per_snp,
             &active_row_idx,
+            stream_rsvd_target_mb(cfg),
         ) {
             Ok(()) => {
                 let compact_build_s = t_stage.elapsed().as_secs_f64();
@@ -1071,6 +1100,7 @@ fn try_build_packed_bed_backend(cfg: &StreamRsvdConfig) -> Result<Option<PackedB
                         row_freq,
                         row_flip,
                         total_variance,
+                        block_target_mb: stream_rsvd_target_mb(cfg),
                     }));
                 }
             }
@@ -1133,6 +1163,7 @@ fn try_build_packed_bed_backend(cfg: &StreamRsvdConfig) -> Result<Option<PackedB
             row_freq,
             row_flip,
             total_variance,
+            block_target_mb: stream_rsvd_target_mb(cfg),
         }));
     }
     emit_rsvd_time_debug(
@@ -1177,7 +1208,8 @@ fn try_build_packed_bed_backend(cfg: &StreamRsvdConfig) -> Result<Option<PackedB
     let mut total_ss = 0.0_f64;
     let mut total_var = 0.0_f64;
     let n_samples_f64 = n_samples as f64;
-    let chunk_rows = packed_backend_stats_chunk_rows(n_snps_total, n_samples);
+    let chunk_rows =
+        packed_backend_stats_chunk_rows(n_snps_total, n_samples, stream_rsvd_target_mb(cfg));
     let t_stage = Instant::now();
     let mut bed_reader = open_plink_bed_reader_after_header(&bed_path)?;
     let compact_tmp_path = compact_path.with_extension("tmp");
@@ -1401,6 +1433,7 @@ fn try_build_packed_bed_backend(cfg: &StreamRsvdConfig) -> Result<Option<PackedB
         row_freq,
         row_flip,
         total_variance,
+        block_target_mb: stream_rsvd_target_mb(cfg),
     };
     let t_stage = Instant::now();
     let _ = try_store_packed_bed_cache(
@@ -1440,6 +1473,7 @@ fn open_packed_bed_backend_for_training(
     snps_only: bool,
     maf: f32,
     missing_rate: f32,
+    memory_mb: usize,
 ) -> Result<(PackedBedRsvd, String), String> {
     if !(0.0..=0.5).contains(&maf) {
         return Err("maf must be within [0, 0.5]".to_string());
@@ -1456,6 +1490,7 @@ fn open_packed_bed_backend_for_training(
         missing_rate,
         delimiter: None,
         mmap_window_mb: 0,
+        memory_mb,
     };
     let Some(backend) = try_build_packed_bed_backend(&cfg)? else {
         return Err("BED backend is unavailable or disabled for this input".to_string());
@@ -1519,6 +1554,7 @@ fn compute_a_omega_packed(
         row_flip: &backend.row_flip,
         sample_idx: &sample_idx,
         packed_row_indices: packed_backend_row_indices(backend),
+        block_target_mb: backend.block_target_mb,
     };
     rsvd_packed_compute_a_omega(packed_view, omega, kp)
 }
@@ -1537,6 +1573,7 @@ fn compute_at_random_omega_packed(
         row_flip: &backend.row_flip,
         sample_idx: &sample_idx,
         packed_row_indices: packed_backend_row_indices(backend),
+        block_target_mb: backend.block_target_mb,
     };
     rsvd_packed_compute_at_random_omega(packed_view, kp, seed)
 }
@@ -1556,6 +1593,7 @@ fn compute_ata_omega_packed(
         row_flip: &backend.row_flip,
         sample_idx: &sample_idx,
         packed_row_indices: packed_backend_row_indices(backend),
+        block_target_mb: backend.block_target_mb,
     };
     rsvd_packed_compute_ata_omega(packed_view, omega, kp, timing)
 }
@@ -1574,6 +1612,7 @@ fn compute_gram_aq_packed(
         row_flip: &backend.row_flip,
         sample_idx: &sample_idx,
         packed_row_indices: packed_backend_row_indices(backend),
+        block_target_mb: backend.block_target_mb,
     };
     rsvd_packed_compute_gram_aq(packed_view, q, kp)
 }
@@ -2031,7 +2070,7 @@ fn compute_at_random_omega_stream(
     }
 
     let mut y = vec![0.0_f32; n * kp]; // (n, kp)
-    let block_rows = rsvd_block_rows_env(n, m);
+    let block_rows = stream_rsvd_block_rows(cfg, n, m);
     let _n_i = checked_cblas_dim_local(n, "n")?;
     let _kp_i = checked_cblas_dim_local(kp, "kp")?;
     let mut rng = StdRng::seed_from_u64(seed);
@@ -2075,7 +2114,7 @@ fn compute_a_omega_stream(
     }
 
     let mut out = vec![0.0_f32; m * kp]; // (m, kp)
-    let block_rows = rsvd_block_rows_env(n, m);
+    let block_rows = stream_rsvd_block_rows(cfg, n, m);
     let _n_i = checked_cblas_dim_local(n, "n")?;
     let _kp_i = checked_cblas_dim_local(kp, "kp")?;
     let _blas_guard = BlasThreadGuard::enter(rayon::current_num_threads().max(1));
@@ -2117,7 +2156,7 @@ fn compute_ata_omega_stream(
     }
 
     let mut out = vec![0.0_f32; n * kp];
-    let block_rows = rsvd_block_rows_env(n, m);
+    let block_rows = stream_rsvd_block_rows(cfg, n, m);
     let _n_i = checked_cblas_dim_local(n, "n")?;
     let _kp_i = checked_cblas_dim_local(kp, "kp")?;
     let mut g_block = vec![0.0_f32; block_rows * kp];
@@ -2159,7 +2198,7 @@ fn compute_gram_aq_stream(
         return Err("row_freq length mismatch in streaming gram(AQ)".to_string());
     }
 
-    let block_rows = rsvd_block_rows_env(n, m);
+    let block_rows = stream_rsvd_block_rows(cfg, n, m);
     let _n_i = checked_cblas_dim_local(n, "n")?;
     let _kp_i = checked_cblas_dim_local(kp, "kp")?;
     let mut gram = vec![0.0_f64; kp * kp];
@@ -2204,7 +2243,8 @@ fn compute_gram_aq_stream(
     maf=0.02,
     missing_rate=0.05,
     delimiter=None,
-    mmap_window_mb=0
+    mmap_window_mb=0,
+    memory_mb=0
 ))]
 pub fn admx_rsvd_stream<'py>(
     py: Python<'py>,
@@ -2218,6 +2258,7 @@ pub fn admx_rsvd_stream<'py>(
     missing_rate: f32,
     delimiter: Option<String>,
     mmap_window_mb: usize,
+    memory_mb: usize,
 ) -> PyResult<(Bound<'py, PyArray1<f32>>, Bound<'py, PyArray2<f32>>)> {
     if k == 0 {
         return Err(PyRuntimeError::new_err("k must be > 0"));
@@ -2241,6 +2282,7 @@ pub fn admx_rsvd_stream<'py>(
         missing_rate,
         delimiter,
         mmap_window_mb,
+        memory_mb,
     };
     let t_total = Instant::now();
     let mut t_stage = Instant::now();
@@ -2286,7 +2328,11 @@ pub fn admx_rsvd_stream<'py>(
 
     let k_eff = k.min(m);
     let kp = admx_rsvd_kp(k_eff, m.max(1).min(n.max(1)));
-    let block_rows = rsvd_block_rows_env(n, m);
+    let block_rows = if let Some(backend) = packed_backend.as_ref() {
+        packed_backend_block_rows(backend, m)
+    } else {
+        stream_rsvd_block_rows(&cfg, n, m)
+    };
     let backend_extra = if let Some(backend) = packed_backend.as_ref() {
         format!(
             " total_sites={} active_row_idx={}",
@@ -2524,7 +2570,8 @@ pub fn admx_rsvd_stream<'py>(
     maf=0.02,
     missing_rate=0.05,
     delimiter=None,
-    mmap_window_mb=0
+    mmap_window_mb=0,
+    memory_mb=0
 ))]
 pub fn admx_rsvd_stream_sample<'py>(
     py: Python<'py>,
@@ -2538,6 +2585,7 @@ pub fn admx_rsvd_stream_sample<'py>(
     missing_rate: f32,
     delimiter: Option<String>,
     mmap_window_mb: usize,
+    memory_mb: usize,
 ) -> PyResult<(Bound<'py, PyArray1<f32>>, Bound<'py, PyArray2<f32>>, f64)> {
     if k == 0 {
         return Err(PyRuntimeError::new_err("k must be > 0"));
@@ -2561,6 +2609,7 @@ pub fn admx_rsvd_stream_sample<'py>(
         missing_rate,
         delimiter,
         mmap_window_mb,
+        memory_mb,
     };
     let t_total = Instant::now();
     let mut t_stage = Instant::now();
@@ -2631,7 +2680,11 @@ pub fn admx_rsvd_stream_sample<'py>(
 
     let k_eff = k.min(n);
     let kp = admx_rsvd_kp(k_eff, m.max(1).min(n.max(1)));
-    let block_rows = rsvd_block_rows_env(n, m);
+    let block_rows = if let Some(backend) = packed_backend.as_ref() {
+        packed_backend_block_rows(backend, m)
+    } else {
+        stream_rsvd_block_rows(&cfg, n, m)
+    };
     let backend_extra = if let Some(backend) = packed_backend.as_ref() {
         format!(
             " total_sites={} active_row_idx={}",
@@ -3014,7 +3067,7 @@ fn cv_observed_fold_counts_packed_impl(
     let full_bytes = n / 4;
     let rem = n % 4;
     let byte_lut = packed_byte_lut();
-    let chunk_rows = rsvd_block_rows_env(n, m)
+    let chunk_rows = packed_backend_block_rows(backend, m)
         .saturating_mul(16)
         .clamp(1024, 16384)
         .min(m.max(1));
@@ -3092,7 +3145,7 @@ fn cv_training_row_freq_packed_impl(
     let full_bytes = n / 4;
     let rem = n % 4;
     let byte_lut = packed_byte_lut();
-    let chunk_rows = rsvd_block_rows_env(n, m)
+    let chunk_rows = packed_backend_block_rows(backend, m)
         .saturating_mul(16)
         .clamp(1024, 16384)
         .min(m.max(1));
@@ -3264,7 +3317,7 @@ fn compute_a_omega_packed_fold_impl(
     if omega.len() != n * kp {
         return Err("omega shape mismatch in masked packed RSVD A*Omega".to_string());
     }
-    let block_rows = rsvd_block_rows_env(n, m);
+    let block_rows = packed_backend_block_rows(backend, m);
     let mut out = vec![0.0_f32; m * kp];
     let mut block = vec![0.0_f32; block_rows * n];
     let _n_i = checked_cblas_dim_local(n, "n")?;
@@ -3310,7 +3363,7 @@ fn compute_at_random_omega_packed_fold_impl(
             row_freq_train.len()
         ));
     }
-    let block_rows = rsvd_block_rows_env(n, m);
+    let block_rows = packed_backend_block_rows(backend, m);
     let mut out = vec![0.0_f32; n * kp];
     let mut block = vec![0.0_f32; block_rows * n];
     let mut omega_block = vec![0.0_f32; block_rows * kp];
@@ -3363,7 +3416,7 @@ fn compute_ata_omega_packed_fold_impl(
     if omega.len() != n * kp {
         return Err("omega shape mismatch in masked packed RSVD A^T*(A*Omega)".to_string());
     }
-    let block_rows = rsvd_block_rows_env(n, m);
+    let block_rows = packed_backend_block_rows(backend, m);
     let mut out = vec![0.0_f32; n * kp];
     let mut block = vec![0.0_f32; block_rows * n];
     let mut g_block = vec![0.0_f32; block_rows * kp];
@@ -3439,7 +3492,7 @@ fn compute_gram_aq_packed_fold_impl(
     if q.len() != n * kp {
         return Err("Q shape mismatch in masked packed RSVD gram(AQ)".to_string());
     }
-    let block_rows = rsvd_block_rows_env(n, m);
+    let block_rows = packed_backend_block_rows(backend, m);
     let mut block = vec![0.0_f32; block_rows * n];
     let mut aq_block = vec![0.0_f32; block_rows * kp];
     let mut gram = vec![0.0_f64; kp * kp];
@@ -3509,7 +3562,7 @@ fn rsvd_stream_sample_packed_impl(
 
     let k_eff = k.min(n);
     let kp = admx_rsvd_kp(k_eff, m.max(1).min(n.max(1)));
-    let block_rows = rsvd_block_rows_env(n, m);
+    let block_rows = packed_backend_block_rows(backend, m);
     emit_rsvd_rss_debug(
         "stream_sample/backend_ready",
         &format!(
@@ -3754,7 +3807,7 @@ fn rsvd_stream_sample_packed_fold_impl(
 
     let k_eff = k.min(n);
     let kp = admx_rsvd_kp(k_eff, m.max(1).min(n.max(1)));
-    let block_rows = rsvd_block_rows_env(n, m);
+    let block_rows = packed_backend_block_rows(backend, m);
     let mut y = compute_at_random_omega_packed_fold_impl(
         backend,
         row_freq_train,
@@ -5900,12 +5953,24 @@ impl AdmxBedTrainingSession {
         genotype_path,
         snps_only=true,
         maf=0.02,
-        missing_rate=0.05
+        missing_rate=0.05,
+        memory_mb=0
     ))]
-    fn new(genotype_path: String, snps_only: bool, maf: f32, missing_rate: f32) -> PyResult<Self> {
-        let (backend, prefix) =
-            open_packed_bed_backend_for_training(&genotype_path, snps_only, maf, missing_rate)
-                .map_err(PyRuntimeError::new_err)?;
+    fn new(
+        genotype_path: String,
+        snps_only: bool,
+        maf: f32,
+        missing_rate: f32,
+        memory_mb: usize,
+    ) -> PyResult<Self> {
+        let (backend, prefix) = open_packed_bed_backend_for_training(
+            &genotype_path,
+            snps_only,
+            maf,
+            missing_rate,
+            memory_mb,
+        )
+        .map_err(PyRuntimeError::new_err)?;
         Ok(Self {
             backend: Arc::new(backend),
             prefix,
@@ -5920,7 +5985,8 @@ impl AdmxBedTrainingSession {
         genotype_path,
         snps_only=true,
         maf=0.02,
-        missing_rate=0.05
+        missing_rate=0.05,
+        memory_mb=0
     ))]
     fn open(
         py: Python<'_>,
@@ -5928,10 +5994,17 @@ impl AdmxBedTrainingSession {
         snps_only: bool,
         maf: f32,
         missing_rate: f32,
+        memory_mb: usize,
     ) -> PyResult<Self> {
         let (backend, prefix) = py
             .detach(move || {
-                open_packed_bed_backend_for_training(&genotype_path, snps_only, maf, missing_rate)
+                open_packed_bed_backend_for_training(
+                    &genotype_path,
+                    snps_only,
+                    maf,
+                    missing_rate,
+                    memory_mb,
+                )
             })
             .map_err(PyRuntimeError::new_err)?;
         Ok(Self {
@@ -6071,12 +6144,24 @@ impl AdmxBedBackend {
         genotype_path,
         snps_only=true,
         maf=0.02,
-        missing_rate=0.05
+        missing_rate=0.05,
+        memory_mb=0
     ))]
-    fn new(genotype_path: String, snps_only: bool, maf: f32, missing_rate: f32) -> PyResult<Self> {
-        let (backend, prefix) =
-            open_packed_bed_backend_for_training(&genotype_path, snps_only, maf, missing_rate)
-                .map_err(PyRuntimeError::new_err)?;
+    fn new(
+        genotype_path: String,
+        snps_only: bool,
+        maf: f32,
+        missing_rate: f32,
+        memory_mb: usize,
+    ) -> PyResult<Self> {
+        let (backend, prefix) = open_packed_bed_backend_for_training(
+            &genotype_path,
+            snps_only,
+            maf,
+            missing_rate,
+            memory_mb,
+        )
+        .map_err(PyRuntimeError::new_err)?;
         Ok(Self {
             backend: Arc::new(backend),
             prefix,
@@ -6629,7 +6714,8 @@ impl AdmxBedFoldBackend {
     maf=0.02,
     missing_rate=0.05,
     delimiter=None,
-    mmap_window_mb=0
+    mmap_window_mb=0,
+    memory_mb=0
 ))]
 pub fn admx_multiply_a_omega_bed<'py>(
     py: Python<'py>,
@@ -6641,6 +6727,7 @@ pub fn admx_multiply_a_omega_bed<'py>(
     missing_rate: f32,
     delimiter: Option<String>,
     mmap_window_mb: usize,
+    memory_mb: usize,
 ) -> PyResult<Bound<'py, PyArray2<f32>>> {
     let omega = omega.as_array();
     let (n, kp) = omega.dim();
@@ -6657,6 +6744,7 @@ pub fn admx_multiply_a_omega_bed<'py>(
         missing_rate,
         delimiter,
         mmap_window_mb,
+        memory_mb,
     };
     let packed_backend = try_build_packed_bed_backend(&cfg).map_err(PyRuntimeError::new_err)?;
     let out_vec = if let Some(backend) = packed_backend.as_ref() {
@@ -6674,7 +6762,8 @@ pub fn admx_multiply_a_omega_bed<'py>(
     genotype_path,
     snps_only=true,
     maf=0.02,
-    missing_rate=0.05
+    missing_rate=0.05,
+    memory_mb=0
 ))]
 pub fn admx_bed_training_meta<'py>(
     py: Python<'py>,
@@ -6682,6 +6771,7 @@ pub fn admx_bed_training_meta<'py>(
     snps_only: bool,
     maf: f32,
     missing_rate: f32,
+    memory_mb: usize,
 ) -> PyResult<(Bound<'py, PyArray1<f32>>, usize)> {
     if !(0.0..=0.5).contains(&maf) {
         return Err(PyRuntimeError::new_err("maf must be within [0, 0.5]"));
@@ -6693,7 +6783,13 @@ pub fn admx_bed_training_meta<'py>(
     }
     let (backend, _prefix) = py
         .detach(move || {
-            open_packed_bed_backend_for_training(&genotype_path, snps_only, maf, missing_rate)
+            open_packed_bed_backend_for_training(
+                &genotype_path,
+                snps_only,
+                maf,
+                missing_rate,
+                memory_mb,
+            )
         })
         .map_err(PyRuntimeError::new_err)?;
     let row_freq_arr = row_freq_to_pyarray(py, &backend.row_freq);
@@ -6708,7 +6804,8 @@ pub fn admx_bed_training_meta<'py>(
     q,
     snps_only=true,
     maf=0.02,
-    missing_rate=0.05
+    missing_rate=0.05,
+    memory_mb=0
 ))]
 pub fn admx_loglikelihood_bed_f32(
     genotype_path: String,
@@ -6717,10 +6814,16 @@ pub fn admx_loglikelihood_bed_f32(
     snps_only: bool,
     maf: f32,
     missing_rate: f32,
+    memory_mb: usize,
 ) -> PyResult<f64> {
-    let (backend, _prefix) =
-        open_packed_bed_backend_for_training(&genotype_path, snps_only, maf, missing_rate)
-            .map_err(PyRuntimeError::new_err)?;
+    let (backend, _prefix) = open_packed_bed_backend_for_training(
+        &genotype_path,
+        snps_only,
+        maf,
+        missing_rate,
+        memory_mb,
+    )
+    .map_err(PyRuntimeError::new_err)?;
     loglikelihood_packed_checked_impl(&backend, &p.as_array(), &q.as_array())
         .map_err(PyRuntimeError::new_err)
 }
@@ -8471,7 +8574,8 @@ pub fn admx_adam_optimize_f32<'py>(
     min_lr=1e-6,
     snps_only=true,
     maf=0.02,
-    missing_rate=0.05
+    missing_rate=0.05,
+    memory_mb=0
 ))]
 pub fn admx_adam_optimize_bed_f32<'py>(
     py: Python<'py>,
@@ -8489,15 +8593,21 @@ pub fn admx_adam_optimize_bed_f32<'py>(
     snps_only: bool,
     maf: f32,
     missing_rate: f32,
+    memory_mb: usize,
 ) -> PyResult<(
     Bound<'py, PyArray2<f32>>,
     Bound<'py, PyArray2<f32>>,
     f64,
     usize,
 )> {
-    let (backend, _prefix) =
-        open_packed_bed_backend_for_training(&genotype_path, snps_only, maf, missing_rate)
-            .map_err(PyRuntimeError::new_err)?;
+    let (backend, _prefix) = open_packed_bed_backend_for_training(
+        &genotype_path,
+        snps_only,
+        maf,
+        missing_rate,
+        memory_mb,
+    )
+    .map_err(PyRuntimeError::new_err)?;
     let p0v = p0.as_array();
     let q0v = q0.as_array();
     let (p_best, q_best, ll_best, last_iter) = adam_optimize_packed_impl(

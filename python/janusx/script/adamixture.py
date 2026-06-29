@@ -404,13 +404,8 @@ def _resolve_fastpop_chunk_rows(
     snps_only: bool,
     maf: float,
     missing_rate: float,
-    memory_gb: float,
+    memory_mb: float,
 ) -> int:
-    memory_mb = decode_memory_gb_to_mb(
-        memory_gb,
-        default_gb=DEFAULT_DECODE_MEMORY_GB,
-        arg_name="-mem/--memory",
-    )
     sample_count: Optional[int] = None
     try:
         sample_count = _lightweight_sample_count(
@@ -442,10 +437,83 @@ def _resolve_fastpop_chunk_rows(
     return int(max(1000, fallback_rows))
 
 
-def _format_fastpop_memory_cfg(memory_gb: float | int | None) -> str:
-    if memory_gb is None:
+def _align_fastpop_block_rows(rows: int) -> int:
+    rows_i = max(1, int(rows))
+    if rows_i < 256:
+        return rows_i
+    return max(256, (rows_i // 256) * 256)
+
+
+def _admx_k_prime_hint(k: int, n: int) -> int:
+    k_eff = min(max(1, int(k)), max(1, int(n)))
+    return int(min(max(k_eff + 10, 20), max(1, int(n))))
+
+
+def _fastpop_operator_auto_memory_mb(sample_count: int, max_k: int) -> int:
+    n = max(1, int(sample_count))
+    rows = _align_fastpop_block_rows(min(4096, max(256, n)))
+    kp = _admx_k_prime_hint(int(max_k), n)
+    decode_row_bytes = n * 4
+    operator_bytes = [
+        rows * (decode_row_bytes * 2 + kp * 4),
+        rows * (decode_row_bytes * 2),
+        rows * decode_row_bytes,
+    ]
+    peak_bytes = max(operator_bytes)
+    return int(max(128, math.ceil(float(peak_bytes) / (1024.0 * 1024.0))))
+
+
+def _resolve_fastpop_memory_mb(
+    *,
+    genotype_path: str,
+    source_label: str,
+    snps_only: bool,
+    maf: float,
+    missing_rate: float,
+    requested_memory_gb: float,
+    max_k: int,
+    user_set: bool,
+) -> int:
+    requested_mb = int(
+        max(
+            1,
+            round(
+                decode_memory_gb_to_mb(
+                    requested_memory_gb,
+                    default_gb=DEFAULT_DECODE_MEMORY_GB,
+                    arg_name="-mem/--memory",
+                )
+            ),
+        )
+    )
+    if bool(user_set):
+        return requested_mb
+
+    sample_count: Optional[int] = None
+    try:
+        sample_count = _lightweight_sample_count(
+            genotype_path,
+            source_label=source_label,
+            snps_only=bool(snps_only),
+            maf=float(maf),
+            missing_rate=float(missing_rate),
+        )
+    except Exception:
+        sample_count = None
+    if sample_count is None or int(sample_count) <= 0:
+        return requested_mb
+    return int(max(requested_mb, _fastpop_operator_auto_memory_mb(int(sample_count), int(max_k))))
+
+
+def _format_fastpop_memory_cfg(
+    memory_mb: float | int | None,
+    *,
+    user_set: bool,
+) -> str:
+    if memory_mb is None:
         return "NA"
-    return f"{float(memory_gb):.6g} GB"
+    label = f"{(float(memory_mb) / 1024.0):.6g} GB"
+    return f"{label} ({'fixed' if user_set else 'auto'})"
 
 
 def _apply_fastpop_rust_memory_budget_env(memory_mb: int, *, user_set: bool) -> None:
@@ -933,6 +1001,7 @@ def _try_write_bed_p_site_file(
     snps_only: bool,
     maf: float,
     missing_rate: float,
+    memory_mb: int,
     out_site_path: str,
     logger: logging.Logger,
 ) -> bool:
@@ -944,6 +1013,7 @@ def _try_write_bed_p_site_file(
             bool(snps_only),
             float(maf),
             float(missing_rate),
+            int(max(0, int(memory_mb))),
         )
         if not hasattr(backend, "write_site_file"):
             return False
@@ -1218,7 +1288,13 @@ def _run_single_k(
                                 detected_threads=int(detected_threads),
                             ),
                         ),
-                        ("Memory", _format_fastpop_memory_cfg(getattr(args, "memory", None))),
+                        (
+                            "Memory",
+                            _format_fastpop_memory_cfg(
+                                getattr(args, "_resolved_memory_mb", None),
+                                user_set=bool(getattr(args, "_memory_user_set", False)),
+                            ),
+                        ),
                         ("Seed", int(args.seed)),
                     ],
                 ),
@@ -1246,6 +1322,7 @@ def _run_single_k(
         seed=int(args.seed),
         threads=max(1, int(resolved_threads)),
         chunk_size=int(max(1000, int(getattr(args, "_resolved_chunk_rows", 50000)))),
+        memory_mb=int(max(0, int(getattr(args, "_resolved_memory_mb", 0)))),
         snps_only=bool(args.snps_only),
         maf=float(args.maf),
         geno=float(args.geno),
@@ -1312,6 +1389,7 @@ def _run_single_k(
                 snps_only=bool(args.snps_only),
                 maf=float(args.maf),
                 missing_rate=float(args.geno),
+                memory_mb=int(max(0, int(getattr(args, "_resolved_memory_mb", 0)))),
                 out_site_path=p_site_out,
                 logger=logger,
             )
@@ -1521,8 +1599,9 @@ def _build_parser() -> CliArgumentParser:
         help_text=(
             "Working memory budget in GB for FastPop streamed genotype loading/decode "
             "and Rust BED block sizing. "
-            "This controls internal chunk sizing rather than total process RSS; "
-            "explicit -mem keeps the requested fixed budget (default: %(default)s)."
+            "When omitted, FastPop auto-resolves the largest decode budget needed by "
+            "its main operators for preferred block shapes; explicit -mem keeps the "
+            "requested fixed budget (default: %(default)s)."
         ),
         dest="memory",
         include_hidden_legacy_single_dash_alias=True,
@@ -1595,16 +1674,6 @@ def main() -> None:
     if int(args.thread) <= 0:
         parser.error("-t/--thread must be a positive integer.")
     args._memory_user_set = bool(_option_present(argv, "-mem", "--memory", "-memory"))
-    memory_mb = decode_memory_gb_to_mb(
-        getattr(args, "memory", DEFAULT_DECODE_MEMORY_GB),
-        default_gb=DEFAULT_DECODE_MEMORY_GB,
-        arg_name="-mem/--memory",
-    )
-    os.environ["JANUSX_ADMX_LOAD_MB"] = str(int(max(1, round(float(memory_mb)))))
-    _apply_fastpop_rust_memory_budget_env(
-        int(max(1, round(float(memory_mb)))),
-        user_set=bool(getattr(args, "_memory_user_set", False)),
-    )
     try:
         k_values = _parse_k_spec(str(args.k))
     except Exception as ex:
@@ -1644,6 +1713,21 @@ def main() -> None:
         print_failure(str(e), force_color=True)
         raise
     tag_samples = _parse_tag_samples(args.tag, logger=tmp_logger)
+    args._resolved_memory_mb = _resolve_fastpop_memory_mb(
+        genotype_path=genotype_path,
+        source_label=source_label,
+        snps_only=bool(args.snps_only),
+        maf=float(args.maf),
+        missing_rate=float(args.geno),
+        requested_memory_gb=float(getattr(args, "memory", DEFAULT_DECODE_MEMORY_GB)),
+        max_k=int(max(k_values)),
+        user_set=bool(getattr(args, "_memory_user_set", False)),
+    )
+    os.environ["JANUSX_ADMX_LOAD_MB"] = str(int(max(1, int(args._resolved_memory_mb))))
+    _apply_fastpop_rust_memory_budget_env(
+        int(max(1, int(args._resolved_memory_mb))),
+        user_set=bool(getattr(args, "_memory_user_set", False)),
+    )
 
     prefix = args.prefix or auto_prefix
     multi_k = len(k_values) > 1
@@ -1657,7 +1741,7 @@ def main() -> None:
         snps_only=bool(args.snps_only),
         maf=float(args.maf),
         missing_rate=float(args.geno),
-        memory_gb=float(getattr(args, "memory", DEFAULT_DECODE_MEMORY_GB)),
+        memory_mb=float(getattr(args, "_resolved_memory_mb", DEFAULT_DECODE_MEMORY_GB * 1024.0)),
     )
     if multi_k:
         if cv_enabled:
@@ -1672,7 +1756,7 @@ def main() -> None:
             f"CVerror={cv_msg}, solver={args.solver}, "
             f"max_iter={int(args.max_iter)}, check={int(args.check)}, "
             f"threads={int(resolved_threads)}, "
-            f"memory={_format_fastpop_memory_cfg(getattr(args, 'memory', None))}, "
+            f"memory={_format_fastpop_memory_cfg(getattr(args, '_resolved_memory_mb', None), user_set=bool(getattr(args, '_memory_user_set', False)))}, "
             f"geno_cache={'on' if effective_geno_cache else 'off'}, "
             f"bed_stream={'on' if bed_stream_session else 'off'}, "
             f"tag={'on' if len(tag_samples) > 0 else 'off'}",

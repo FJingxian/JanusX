@@ -137,6 +137,19 @@ def _parse_cv_spec(cv_raw: Optional[str]) -> tuple[bool, int, str]:
     return True, int(n), f"{int(n)}-fold"
 
 
+def _option_present(argv: Optional[list[str]], *flags: str) -> bool:
+    args = list(sys.argv[1:] if argv is None else argv)
+    wanted = {str(x) for x in flags}
+    for tok in args:
+        cur = str(tok)
+        if cur in wanted:
+            return True
+        for flag in wanted:
+            if cur.startswith(f"{flag}="):
+                return True
+    return False
+
+
 def _bool_env(name: str, default: bool = True) -> bool:
     raw = str(os.environ.get(name, "")).strip().lower()
     if raw == "":
@@ -433,6 +446,27 @@ def _format_fastpop_memory_cfg(memory_gb: float | int | None) -> str:
     if memory_gb is None:
         return "NA"
     return f"{float(memory_gb):.6g} GB"
+
+
+def _apply_fastpop_rust_memory_budget_env(memory_mb: int, *, user_set: bool) -> None:
+    target_mb = str(int(max(1, int(memory_mb))))
+    override_names = (
+        "JANUSX_RSVD_BLOCK_MB",
+        "JANUSX_BED_BLOCK_TARGET_MB",
+    )
+    existing_names = (
+        "JANUSX_RSVD_BLOCK_MB",
+        "JX_RSVD_BLOCK_MB",
+        "JANUSX_BED_BLOCK_TARGET_MB",
+        "JX_BED_BLOCK_TARGET_MB",
+    )
+    if bool(user_set):
+        for name in override_names:
+            os.environ[name] = target_mb
+        return
+    if any(str(os.environ.get(name, "")).strip() != "" for name in existing_names):
+        return
+    os.environ["JANUSX_BED_BLOCK_TARGET_MB"] = target_mb
 
 
 def _mute_stdout_info_logs(
@@ -1485,7 +1519,8 @@ def _build_parser() -> CliArgumentParser:
         runtime,
         default=DEFAULT_DECODE_MEMORY_GB,
         help_text=(
-            "Working memory budget in GB for FastPop streamed genotype loading/decode. "
+            "Working memory budget in GB for FastPop streamed genotype loading/decode "
+            "and Rust BED block sizing. "
             "This controls internal chunk sizing rather than total process RSS; "
             "explicit -mem keeps the requested fixed budget (default: %(default)s)."
         ),
@@ -1544,6 +1579,7 @@ def _build_parser() -> CliArgumentParser:
 
 def main() -> None:
     brand = _popstruct_brand()
+    argv = sys.argv[1:]
     parser = _build_parser()
     args = parser.parse_args()
     if not (0.0 <= float(args.maf) <= 0.5):
@@ -1558,12 +1594,17 @@ def main() -> None:
         parser.error("-check/--check must be a positive integer.")
     if int(args.thread) <= 0:
         parser.error("-t/--thread must be a positive integer.")
+    args._memory_user_set = bool(_option_present(argv, "-mem", "--memory", "-memory"))
     memory_mb = decode_memory_gb_to_mb(
         getattr(args, "memory", DEFAULT_DECODE_MEMORY_GB),
         default_gb=DEFAULT_DECODE_MEMORY_GB,
         arg_name="-mem/--memory",
     )
     os.environ["JANUSX_ADMX_LOAD_MB"] = str(int(max(1, round(float(memory_mb)))))
+    _apply_fastpop_rust_memory_budget_env(
+        int(max(1, round(float(memory_mb)))),
+        user_set=bool(getattr(args, "_memory_user_set", False)),
+    )
     try:
         k_values = _parse_k_spec(str(args.k))
     except Exception as ex:

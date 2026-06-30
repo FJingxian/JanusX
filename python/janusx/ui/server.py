@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
 
-from ..script._common.cli import cli_help_formatter, minimal_help_epilog
+from ..script._common.cli_core import cli_help_formatter, minimal_help_epilog
 from ..script._common.pathcheck import safe_expanduser, safe_home, safe_resolve
 from ..script._common.gwas_history import (
     get_gwas_history_row,

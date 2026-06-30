@@ -134,7 +134,7 @@ except Exception as _adblup_py_exc:
     _ADBLUP_PY_IMPORT_ERROR = _adblup_py_exc
 from janusx.script._common.log import setup_logging
 from janusx.script._common.config_render import emit_cli_configuration
-from janusx.script._common.cli import (
+from janusx.script._common.cli_args import (
     add_common_genotype_source_args,
     add_common_memory_arg,
     add_common_out_arg,
@@ -146,7 +146,7 @@ from janusx.script._common.cli import (
     parse_trait_selector_specs,
     resolve_trait_selectors,
 )
-from janusx.script._common.cli import CliArgumentParser, cli_help_formatter, minimal_help_epilog
+from janusx.script._common.cli_core import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 from janusx.script._common.pathcheck import (
     ensure_all_true,
     ensure_file_exists,

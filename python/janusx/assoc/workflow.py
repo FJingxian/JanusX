@@ -91,7 +91,7 @@ from janusx.pyBLUP.QK2 import QK
 from janusx import janusx as jxrs
 from janusx.script._common.log import setup_logging
 from janusx.script._common.config_render import emit_cli_configuration
-from janusx.script._common.cli import (
+from janusx.script._common.cli_args import (
     add_common_covariate_file_or_site_arg,
     add_common_genotype_source_args,
     add_common_grm_option_arg,
@@ -115,7 +115,7 @@ from janusx.script._common.genoio import (
     packed_preload_is_ready,
     prepare_packed_ctx_from_plink,
 )
-from janusx.script._common.cli import CliArgumentParser, cli_help_formatter, minimal_help_epilog
+from janusx.script._common.cli_core import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 from janusx.script._common.pathcheck import (
     ensure_all_true,
     ensure_file_exists,

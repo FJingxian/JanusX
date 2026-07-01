@@ -4658,6 +4658,23 @@ def _rrblup_lambda_equation_to_raw(
     return float(lam_eq)
 
 
+def _resolve_rrblup_operator_mode(
+    cfg: dict[str, typing.Any] | None = None,
+) -> str:
+    cfg_use = cfg or {}
+    raw = cfg_use.get(
+        "operator_mode",
+        os.getenv(
+            "JX_RRBLUP_OPERATOR_MODE",
+            os.getenv("JX_RRBLUP_OPERATOR", "standardized"),
+        ),
+    )
+    mode = str(raw).strip().lower()
+    if mode in {"centered", "center", "vanraden1", "vr1", "gblup"}:
+        return "centered"
+    return "standardized"
+
+
 def _rrblup_lambda_k_to_equation(
     *,
     lambda_k: float,
@@ -4666,7 +4683,27 @@ def _rrblup_lambda_k_to_equation(
     lam_k = float(lambda_k)
     if (not np.isfinite(lam_k)) or (lam_k < 0.0):
         return float("nan")
-    return float(lam_k * float(max(1, int(m_effective))))
+    scale = float(m_effective)
+    if (not np.isfinite(scale)) or (scale <= 0.0):
+        scale = float(max(1, int(m_effective)))
+    return float(lam_k * scale)
+
+
+def _rrblup_operator_maf_stats(
+    maf: np.ndarray | typing.Sequence[typing.Any],
+    std_eps: float,
+    operator_mode: str,
+) -> tuple[int, float]:
+    maf_arr = np.asarray(maf, dtype=np.float64).reshape(-1)
+    if int(maf_arr.size) == 0:
+        return 0, 0.0
+    p = np.clip(maf_arr, 0.0, 0.5)
+    var = 2.0 * p * (1.0 - p)
+    active = np.isfinite(var) & (var > float(std_eps))
+    m_effective = int(np.count_nonzero(active))
+    if str(operator_mode).strip().lower() == "centered":
+        return m_effective, float(np.sum(var[active], dtype=np.float64))
+    return m_effective, float(max(1, m_effective))
 
 
 def _rrblup_lambda_auto_vc_terms(
@@ -4708,20 +4745,32 @@ def _rrblup_lambda_auto_vc_terms(
     m_effective_vc = _as_nonneg_int(
         lambda_info.get("m_effective_vc", m_effective_rrblup)
     )
+    equation_scale_rrblup = float(
+        lambda_info.get(
+            "equation_scale_rrblup",
+            lambda_info.get("m_effective_rrblup", lambda_info.get("m_effective", 0)),
+        )
+    )
+    equation_scale_vc = float(
+        lambda_info.get(
+            "equation_scale_vc",
+            lambda_info.get("m_effective_vc", m_effective_vc),
+        )
+    )
     lambda_equation_rrblup = (
         _rrblup_lambda_k_to_equation(
             lambda_k=float(lambda_k_vc),
-            m_effective=int(m_effective_rrblup),
+            m_effective=float(equation_scale_rrblup),
         )
-        if m_effective_rrblup > 0
+        if equation_scale_rrblup > 0.0
         else float("nan")
     )
     lambda_equation_vc = (
         _rrblup_lambda_k_to_equation(
             lambda_k=float(lambda_k_vc),
-            m_effective=int(m_effective_vc),
+            m_effective=float(equation_scale_vc),
         )
-        if m_effective_vc > 0
+        if equation_scale_vc > 0.0
         else float("nan")
     )
     return (
@@ -4779,6 +4828,7 @@ def _estimate_rrblup_lambda_subsample_reml(
     seed = int(cfg_use.get("lambda_subsample_seed", 42))
     rng = np.random.default_rng(seed)
     std_eps = float(max(np.finfo(np.float32).eps, float(cfg_use.get("pcg_std_eps", 1e-12))))
+    operator_mode = _resolve_rrblup_operator_mode(cfg_use)
     maf_all = np.asarray(packed_ctx.get("maf", np.asarray([], dtype=np.float32)), dtype=np.float64).reshape(-1)
     site_keep_raw = packed_ctx.get("site_keep", None)
     if site_keep_raw is not None and int(maf_all.size) > 0:
@@ -4789,13 +4839,11 @@ def _estimate_rrblup_lambda_subsample_reml(
             maf_use = maf_all
     else:
         maf_use = maf_all
-    if int(maf_use.size) > 0:
-        p_use = np.clip(maf_use, 0.0, 0.5)
-        var_use = 2.0 * p_use * (1.0 - p_use)
-        m_effective = int(np.count_nonzero(np.isfinite(var_use) & (var_use > float(std_eps))))
-    else:
-        m_effective = 0
-    m_scale = float(max(1, int(m_effective)))
+    m_effective, m_scale = _rrblup_operator_maf_stats(
+        maf_use,
+        float(std_eps),
+        operator_mode,
+    )
 
     he_diag: dict[str, typing.Any] = {
         "sigma_g2": float("nan"),
@@ -4839,6 +4887,23 @@ def _estimate_rrblup_lambda_subsample_reml(
         out["m_effective"] = int(max(1, int(out.get("m_effective", m_effective))))
         out["m_effective_rrblup"] = int(
             max(1, int(out.get("m_effective_rrblup", out["m_effective"])))
+        )
+        out["operator_mode"] = str(out.get("operator_mode", operator_mode)).strip().lower()
+        out["equation_scale_rrblup"] = float(
+            out.get(
+                "equation_scale_rrblup",
+                m_scale if m_scale > 0.0 else float(max(1, int(out["m_effective_rrblup"]))),
+            )
+        )
+        out["equation_scale_vc"] = float(
+            out.get(
+                "equation_scale_vc",
+                (
+                    m_scale
+                    if m_scale > 0.0
+                    else float(max(1, int(out.get("m_effective_vc", out["m_effective"])) ))
+                ),
+            )
         )
         (
             lambda_k_vc,
@@ -6573,6 +6638,51 @@ def _ensure_packed_standard_stats_cached(
     packed_ctx["__std_row_mean__"] = mean
     packed_ctx["__std_row_inv_sd__"] = inv
     return mean, inv
+
+
+def _ensure_packed_centered_stats_cached(
+    packed_ctx: dict[str, typing.Any],
+    *,
+    std_eps: float = 1e-12,
+) -> tuple[np.ndarray, np.ndarray]:
+    mean_raw = packed_ctx.get("__ctr_row_mean__", None)
+    inv_raw = packed_ctx.get("__ctr_row_inv_sd__", None)
+    active_row_idx = _packed_ctx_active_row_idx(packed_ctx)
+    m = int(active_row_idx.shape[0])
+    if mean_raw is not None and inv_raw is not None:
+        mean = np.ascontiguousarray(np.asarray(mean_raw, dtype=np.float32).reshape(-1), dtype=np.float32)
+        inv = np.ascontiguousarray(np.asarray(inv_raw, dtype=np.float32).reshape(-1), dtype=np.float32)
+        if int(mean.shape[0]) == m and int(inv.shape[0]) == m:
+            return mean, inv
+
+    maf_full = np.ascontiguousarray(np.asarray(packed_ctx["maf"], dtype=np.float32).reshape(-1))
+    if int(maf_full.shape[0]) == m:
+        maf = maf_full
+    else:
+        maf = np.ascontiguousarray(maf_full[active_row_idx], dtype=np.float32)
+    p = np.clip(np.asarray(maf, dtype=np.float64), 0.0, 0.5)
+    var = 2.0 * p * (1.0 - p)
+    mean = np.ascontiguousarray(np.asarray(2.0 * p, dtype=np.float32), dtype=np.float32)
+    inv = np.zeros((m,), dtype=np.float32)
+    good = np.isfinite(var) & (var > float(std_eps))
+    inv[good] = np.float32(1.0)
+    packed_ctx["__ctr_row_mean__"] = mean
+    packed_ctx["__ctr_row_inv_sd__"] = inv
+    return mean, inv
+
+
+def _ensure_packed_rrblup_operator_stats_cached(
+    packed_ctx: dict[str, typing.Any],
+    operator_mode: str,
+    *,
+    std_eps: float = 1e-12,
+) -> tuple[np.ndarray, np.ndarray]:
+    if str(operator_mode).strip().lower() == "centered":
+        return _ensure_packed_centered_stats_cached(
+            packed_ctx,
+            std_eps=float(std_eps),
+        )
+    return _ensure_packed_standard_stats_cached(packed_ctx)
 
 
 def _decode_packed_subset_to_dense_standardized(
@@ -8546,6 +8656,24 @@ def GSapi(
                     )
 
                 rr_cfg = dict(rrblup_adamw_cfg or {})
+                rr_operator_mode = _resolve_rrblup_operator_mode(rr_cfg)
+                rrblup_pcg_fn = (
+                    None
+                    if _jxrs is None
+                    else getattr(
+                        _jxrs,
+                        (
+                            "rrblupc_pcg_bed"
+                            if rr_operator_mode == "centered"
+                            else "rrblup_pcg_bed"
+                        ),
+                        None,
+                    )
+                )
+                if rrblup_pcg_fn is None:
+                    raise RuntimeError(
+                        "Requested rrBLUP PCG operator backend is unavailable. Rebuild/install JanusX extension."
+                    )
                 lambda_raw = float(rr_cfg.get("lambda_value", 1.0))
                 lambda_scale = str(rr_cfg.get("lambda_scale", "equation")).strip().lower()
                 stage_rayon_threads = int(max(1, int(n_jobs)))
@@ -8772,7 +8900,7 @@ def GSapi(
                             blas_threads=int(pcg_thread_spec["blas_threads"]),
                         )
                         try:
-                            rr_out = _jxrs.rrblup_pcg_bed(  # type: ignore[union-attr]
+                            rr_out = rrblup_pcg_fn(
                                 source_prefix,
                                 train_abs,
                                 y_train_vec,
@@ -8789,7 +8917,7 @@ def GSapi(
                             )
                         except TypeError:
                             pcg_call_kwargs.pop("blas_threads", None)
-                            rr_out = _jxrs.rrblup_pcg_bed(  # type: ignore[union-attr]
+                            rr_out = rrblup_pcg_fn(
                                 source_prefix,
                                 train_abs,
                                 y_train_vec,
@@ -8855,7 +8983,7 @@ def GSapi(
                         blas_threads=int(pcg_thread_spec["blas_threads"]),
                         rayon_threads=int(pcg_thread_spec["rayon_threads"]),
                     ):
-                        rr_out = _jxrs.rrblup_pcg_bed(  # type: ignore[union-attr]
+                        rr_out = rrblup_pcg_fn(
                             source_prefix,
                             train_abs,
                             y_train_vec,
@@ -8989,6 +9117,7 @@ def GSapi(
 
                 _set_rrblup_solver_state("pcg")
                 if rrblup_runtime_state is not None:
+                    rrblup_runtime_state["operator_mode"] = str(rr_operator_mode)
                     rrblup_runtime_state["pcg_converged"] = bool(pcg_converged)
                     rrblup_runtime_state["pcg_iters"] = int(pcg_iters)
                     rrblup_runtime_state["pcg_rel_res"] = float(pcg_rel_res)
@@ -9066,10 +9195,15 @@ def GSapi(
                         rrblup_runtime_state.pop("va", None)
                     rrblup_runtime_state["k_trace_mean"] = float(k_trace_mean)
                 if model_state is not None and beta_export is not None:
-                    row_mean_pc, row_inv_pc = _ensure_packed_standard_stats_cached(packed_train)
+                    row_mean_pc, row_inv_pc = _ensure_packed_rrblup_operator_stats_cached(
+                        packed_train,
+                        rr_operator_mode,
+                        std_eps=float(pcg_std_eps),
+                    )
                     model_state["kind"] = "rrblup_linear"
                     model_state["method"] = "rrBLUP"
                     model_state["solver"] = "pcg"
+                    model_state["operator_mode"] = str(rr_operator_mode)
                     model_state["alpha"] = float(np.mean(np.asarray(Y, dtype=np.float64)))
                     model_state["beta"] = np.ascontiguousarray(
                         np.asarray(beta_export, dtype=np.float32).reshape(-1),
@@ -9478,6 +9612,72 @@ def GSapi(
             )
 
         if method == "rrBLUP" and resolved_rr_solver == "exact":
+            rr_operator_mode = _resolve_rrblup_operator_mode(rr_cfg_shared)
+            exact_packed_fn = (
+                None
+                if _jxrs is None
+                else getattr(
+                    _jxrs,
+                    (
+                        "rrblupc_exact_snp_packed"
+                        if rr_operator_mode == "centered"
+                        else "rrblup_exact_snp_packed"
+                    ),
+                    None,
+                )
+            )
+            exact_prepare_packed_fn = (
+                None
+                if _jxrs is None
+                else getattr(
+                    _jxrs,
+                    (
+                        "rrblupc_exact_snp_prepare_packed"
+                        if rr_operator_mode == "centered"
+                        else "rrblup_exact_snp_prepare_packed"
+                    ),
+                    None,
+                )
+            )
+            exact_fit_packed_fn = (
+                None
+                if _jxrs is None
+                else getattr(
+                    _jxrs,
+                    (
+                        "rrblupc_exact_snp_fit_prepared"
+                        if rr_operator_mode == "centered"
+                        else "rrblup_exact_snp_fit_prepared"
+                    ),
+                    None,
+                )
+            )
+            exact_prepare_meta_fn = (
+                None
+                if _jxrs is None
+                else getattr(
+                    _jxrs,
+                    (
+                        "rrblupc_exact_snp_prepare_bed_from_meta"
+                        if rr_operator_mode == "centered"
+                        else "rrblup_exact_snp_prepare_bed_from_meta"
+                    ),
+                    None,
+                )
+            )
+            exact_fit_meta_fn = (
+                None
+                if _jxrs is None
+                else getattr(
+                    _jxrs,
+                    (
+                        "rrblupc_exact_snp_fit_prepared_bed"
+                        if rr_operator_mode == "centered"
+                        else "rrblup_exact_snp_fit_prepared_bed"
+                    ),
+                    None,
+                )
+            )
             resolved_rr_exact_backend = _resolve_rrblup_exact_backend(
                 backend=requested_rr_exact_backend,
                 n_snp=n_snp_local,
@@ -9497,17 +9697,15 @@ def GSapi(
             )
             can_use_rust_exact_snp_packed = bool(
                 packed_train_probe is not None
-                and (_jxrs is not None)
-                and hasattr(_jxrs, "rrblup_exact_snp_packed")
+                and (exact_packed_fn is not None)
                 and (exact_source_prefix == "")
                 and (not _packed_ctx_is_lazy_full(packed_train_probe))
                 and ("packed" in packed_train_probe)
             )
             can_use_rust_exact_snp_meta = bool(
                 packed_train_probe is not None
-                and (_jxrs is not None)
-                and hasattr(_jxrs, "rrblup_exact_snp_prepare_bed_from_meta")
-                and hasattr(_jxrs, "rrblup_exact_snp_fit_prepared_bed")
+                and (exact_prepare_meta_fn is not None)
+                and (exact_fit_meta_fn is not None)
                 and (exact_source_prefix != "")
             )
             use_rust_exact_snp_meta = bool(can_use_rust_exact_snp_meta)
@@ -9666,8 +9864,8 @@ def GSapi(
                         if int(site_keep_arr.shape[0]) == int(packed_arg.shape[0]):
                             site_keep_arg = site_keep_arr
                     can_use_split_exact_snp = bool(
-                        hasattr(_jxrs, "rrblup_exact_snp_prepare_packed")
-                        and hasattr(_jxrs, "rrblup_exact_snp_fit_prepared")
+                        (exact_prepare_packed_fn is not None)
+                        and (exact_fit_packed_fn is not None)
                     )
                     if can_use_split_exact_snp:
                         _emit_rrblup_progress(
@@ -9678,7 +9876,7 @@ def GSapi(
                             blas_threads=int(max(1, int(n_jobs))),
                             rayon_threads=int(max(1, int(n_jobs))),
                         ):
-                            rr_exact_cache = _jxrs.rrblup_exact_snp_prepare_packed(  # type: ignore[union-attr]
+                            rr_exact_cache = exact_prepare_packed_fn(
                                 packed_arg,
                                 int(packed_n_samples),
                                 train_abs,
@@ -9702,7 +9900,7 @@ def GSapi(
                             blas_threads=int(max(1, int(n_jobs))),
                             rayon_threads=int(max(1, int(n_jobs))),
                         ):
-                            rr_out = _jxrs.rrblup_exact_snp_fit_prepared(  # type: ignore[union-attr]
+                            rr_out = exact_fit_packed_fn(
                                 rr_exact_cache,
                                 packed_arg,
                                 int(packed_n_samples),
@@ -9729,7 +9927,7 @@ def GSapi(
                             blas_threads=int(max(1, int(n_jobs))),
                             rayon_threads=int(max(1, int(n_jobs))),
                         ):
-                            rr_out = _jxrs.rrblup_exact_snp_packed(  # type: ignore[union-attr]
+                            rr_out = exact_packed_fn(
                                 packed_arg,
                                 int(packed_n_samples),
                                 train_abs,
@@ -9774,7 +9972,7 @@ def GSapi(
                         blas_threads=int(max(1, int(n_jobs))),
                         rayon_threads=int(max(1, int(n_jobs))),
                     ):
-                        rr_exact_cache = _jxrs.rrblup_exact_snp_prepare_bed_from_meta(  # type: ignore[union-attr]
+                        rr_exact_cache = exact_prepare_meta_fn(
                             str(source_prefix_arg),
                             train_abs,
                             row_source_indices_arg,
@@ -9798,7 +9996,7 @@ def GSapi(
                         blas_threads=int(max(1, int(n_jobs))),
                         rayon_threads=int(max(1, int(n_jobs))),
                     ):
-                        rr_out = _jxrs.rrblup_exact_snp_fit_prepared_bed(  # type: ignore[union-attr]
+                        rr_out = exact_fit_meta_fn(
                             rr_exact_cache,
                             str(source_prefix_arg),
                             y_train_vec,
@@ -9863,6 +10061,7 @@ def GSapi(
                 _set_rrblup_solver_state("exact")
                 _set_rrblup_exact_backend_state("snp")
                 if rrblup_runtime_state is not None:
+                    rrblup_runtime_state["operator_mode"] = str(rr_operator_mode)
                     _sync_rrblup_exact_vc_state(
                         var_g=float(var_g_exact),
                         sigma_e2=float(sigma_e2_exact),
@@ -9886,6 +10085,7 @@ def GSapi(
                     model_state["method"] = "rrBLUP"
                     model_state["solver"] = "exact"
                     model_state["exact_backend"] = "snp"
+                    model_state["operator_mode"] = str(rr_operator_mode)
                     model_state["alpha"] = float(alpha_exact)
                     model_state["beta"] = np.ascontiguousarray(
                         np.asarray(beta_exact, dtype=np.float32).reshape(-1),

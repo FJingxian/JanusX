@@ -61,6 +61,8 @@ mod packed;
 mod reml;
 #[path = "stats/rrblup.rs"]
 mod rrblup;
+#[path = "stats/rrblupc.rs"]
+mod rrblupc;
 #[path = "stats/rsvd.rs"]
 mod rsvd;
 #[path = "stats/spgrm.rs"]
@@ -276,6 +278,11 @@ use rrblup::{
     rrblup_exact_snp_fit_prepared, rrblup_exact_snp_fit_prepared_bed, rrblup_exact_snp_packed,
     rrblup_exact_snp_prepare_bed_from_meta, rrblup_exact_snp_prepare_packed, rrblup_pcg_bed,
     RrblupExactSnpCache,
+};
+use rrblupc::{
+    rrblupc_exact_snp_fit_prepared, rrblupc_exact_snp_fit_prepared_bed, rrblupc_exact_snp_packed,
+    rrblupc_exact_snp_prepare_bed_from_meta, rrblupc_exact_snp_prepare_packed, rrblupc_pcg_bed,
+    RrblupCenteredExactSnpCache,
 };
 use rsvd::py_rsvd_packed_subset;
 use sim::{sim_trait_accumulate_i8_f32, SimChunkGenerator, SimEngine, SimTraitAccumulator};
@@ -683,6 +690,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_class::<SiteInfo>()?;
     m.add_class::<FvLmmAssocCache>()?;
     m.add_class::<RrblupExactSnpCache>()?;
+    m.add_class::<RrblupCenteredExactSnpCache>()?;
     m.add_class::<SparseOneHotBlupCache>()?;
     m.add_class::<PyMergeStats>()?;
     m.add_class::<PyConvertStats>()?;
@@ -796,6 +804,12 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(rrblup_exact_snp_prepare_bed_from_meta, m)?)?;
     m.add_function(wrap_pyfunction!(rrblup_exact_snp_fit_prepared_bed, m)?)?;
     m.add_function(wrap_pyfunction!(rrblup_exact_snp_packed, m)?)?;
+    m.add_function(wrap_pyfunction!(rrblupc_pcg_bed, m)?)?;
+    m.add_function(wrap_pyfunction!(rrblupc_exact_snp_prepare_packed, m)?)?;
+    m.add_function(wrap_pyfunction!(rrblupc_exact_snp_fit_prepared, m)?)?;
+    m.add_function(wrap_pyfunction!(rrblupc_exact_snp_prepare_bed_from_meta, m)?)?;
+    m.add_function(wrap_pyfunction!(rrblupc_exact_snp_fit_prepared_bed, m)?)?;
+    m.add_function(wrap_pyfunction!(rrblupc_exact_snp_packed, m)?)?;
     m.add_function(wrap_pyfunction!(gblup_reml_packed_bed, m)?)?;
     m.add_function(wrap_pyfunction!(gblup_reml_npy_grm, m)?)?;
     m.add_function(wrap_pyfunction!(gblup_effect_from_meta_stream, m)?)?;

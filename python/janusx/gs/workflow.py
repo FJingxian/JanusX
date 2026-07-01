@@ -4715,6 +4715,15 @@ def _resolve_rrblup_standardized_mode(
         "2p_1_p",
     }:
         return "hwe_global"
+    if mode in {
+        "strict_train",
+        "strict-train",
+        "train",
+        "train_only",
+        "empirical_train",
+        "train_empirical",
+    }:
+        return "strict_train"
     return "empirical_global"
 
 
@@ -6588,16 +6597,107 @@ def _decode_packed_block_standardized(
     return x
 
 
+def _compute_packed_empirical_stats_for_samples(
+    packed_ctx: dict[str, typing.Any],
+    sample_indices: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    active_row_idx = _packed_ctx_active_row_idx(packed_ctx)
+    m = int(active_row_idx.shape[0])
+    n_samples_full = int(packed_ctx["n_samples"])
+    sample_idx = np.ascontiguousarray(
+        np.asarray(sample_indices, dtype=np.int64).reshape(-1),
+        dtype=np.int64,
+    )
+    if int(sample_idx.shape[0]) <= 0:
+        raise ValueError("strict-train rrBLUP stats require non-empty train sample indices.")
+    if _jxrs is None:
+        raise RuntimeError("Rust packed BED stats helpers are unavailable. Rebuild/install JanusX extension.")
+
+    row_flip_full = np.ascontiguousarray(
+        np.asarray(_ensure_packed_row_flip_cached(packed_ctx), dtype=np.bool_).reshape(-1),
+        dtype=np.bool_,
+    )
+    packed_raw = packed_ctx.get("packed", None)
+    packed: np.ndarray | None = None
+    if packed_raw is not None:
+        packed = np.ascontiguousarray(np.asarray(packed_raw, dtype=np.uint8), dtype=np.uint8)
+
+    sum_rows_arr: np.ndarray | None = None
+    sq_rows_arr: np.ndarray | None = None
+    use_packed_stats = bool(
+        (packed is not None)
+        and (_jxrs is not None)
+        and hasattr(_jxrs, "bed_packed_empirical_stats_subset_f64")
+    )
+    if use_packed_stats:
+        if packed is None:
+            raise ValueError("Packed context mismatch: resident packed payload missing.")
+        row_flip_use = row_flip_full
+        packed_use = packed
+        if int(packed_use.shape[0]) != m:
+            packed_use = np.ascontiguousarray(
+                np.asarray(packed_use[active_row_idx, :], dtype=np.uint8),
+                dtype=np.uint8,
+            )
+            row_flip_use = np.ascontiguousarray(row_flip_full[active_row_idx], dtype=np.bool_)
+        sum_blk, sq_blk = _jxrs.bed_packed_empirical_stats_subset_f64(  # type: ignore[union-attr]
+            packed_use,
+            int(n_samples_full),
+            row_flip_use,
+            sample_idx,
+        )
+        sum_rows_arr = np.ascontiguousarray(np.asarray(sum_blk, dtype=np.float64).reshape(-1), dtype=np.float64)
+        sq_rows_arr = np.ascontiguousarray(np.asarray(sq_blk, dtype=np.float64).reshape(-1), dtype=np.float64)
+    else:
+        source_prefix_raw = packed_ctx.get("source_prefix", None)
+        use_stream_stats = bool(
+            (_jxrs is not None)
+            and hasattr(_jxrs, "bed_stream_empirical_stats_subset_f64")
+            and (source_prefix_raw is not None)
+            and (str(source_prefix_raw).strip() != "")
+        )
+        if use_stream_stats:
+            (
+                source_prefix,
+                _site_keep_arg,
+                row_source_indices_arg,
+                row_flip_arg,
+                _row_maf_arg,
+                mmap_window_mb,
+            ) = _packed_gblup_stream_metadata(
+                packed_ctx,
+                mode="a",
+                block_rows=int(max(1, min(8192, m))),
+                use_ctx_budget=False,
+            )
+            sum_blk, sq_blk = _jxrs.bed_stream_empirical_stats_subset_f64(  # type: ignore[union-attr]
+                str(source_prefix),
+                row_source_indices_arg,
+                row_flip_arg,
+                sample_idx,
+                int(mmap_window_mb),
+            )
+            sum_rows_arr = np.ascontiguousarray(np.asarray(sum_blk, dtype=np.float64).reshape(-1), dtype=np.float64)
+            sq_rows_arr = np.ascontiguousarray(np.asarray(sq_blk, dtype=np.float64).reshape(-1), dtype=np.float64)
+
+    if sum_rows_arr is None or sq_rows_arr is None:
+        raise RuntimeError("strict-train rrBLUP stats backend is unavailable for the packed context.")
+    return sum_rows_arr, sq_rows_arr
+
+
 def _ensure_packed_standard_stats_cached(
     packed_ctx: dict[str, typing.Any],
+    *,
+    sample_indices: np.ndarray | None = None,
+    std_mode: str | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    std_mode = _resolve_rrblup_standardized_mode()
+    std_mode = _resolve_rrblup_standardized_mode() if std_mode is None else str(std_mode).strip().lower()
     mean_raw = packed_ctx.get("__std_row_mean__", None)
     inv_raw = packed_ctx.get("__std_row_inv_sd__", None)
     mode_raw = str(packed_ctx.get("__std_mode__", "")).strip().lower()
     active_row_idx = _packed_ctx_active_row_idx(packed_ctx)
     m = int(active_row_idx.shape[0])
-    if mean_raw is not None and inv_raw is not None:
+    if std_mode != "strict_train" and mean_raw is not None and inv_raw is not None:
         mean = np.ascontiguousarray(np.asarray(mean_raw, dtype=np.float32).reshape(-1), dtype=np.float32)
         inv = np.ascontiguousarray(np.asarray(inv_raw, dtype=np.float32).reshape(-1), dtype=np.float32)
         if int(mean.shape[0]) == m and int(inv.shape[0]) == m and mode_raw == std_mode:
@@ -6618,7 +6718,20 @@ def _ensure_packed_standard_stats_cached(
 
     mean_f64: np.ndarray
     var_f64: np.ndarray
-    if std_mode == "empirical_global":
+    if std_mode == "strict_train":
+        if sample_indices is None:
+            raise ValueError(
+                "strict-train rrBLUP standardization requires train sample indices "
+                "so test data can reuse the training mean/var."
+            )
+        sum_rows_arr, sq_rows_arr = _compute_packed_empirical_stats_for_samples(
+            packed_ctx,
+            sample_indices,
+        )
+        n_subset = int(np.asarray(sample_indices, dtype=np.int64).reshape(-1).shape[0])
+        mean_f64 = np.asarray(sum_rows_arr / float(n_subset), dtype=np.float64)
+        var_f64 = np.asarray((sq_rows_arr / float(n_subset)) - mean_f64 * mean_f64, dtype=np.float64)
+    elif std_mode == "empirical_global":
         sum_rows_arr: np.ndarray | None = None
         sq_rows_arr: np.ndarray | None = None
         use_packed_stats = bool(
@@ -6690,9 +6803,10 @@ def _ensure_packed_standard_stats_cached(
     inv_f64 = np.asarray(np.where(np.isfinite(inv_f64), inv_f64, 0.0), dtype=np.float64)
     mean = np.ascontiguousarray(np.asarray(mean_f64, dtype=np.float32), dtype=np.float32)
     inv = np.ascontiguousarray(np.asarray(inv_f64, dtype=np.float32), dtype=np.float32)
-    packed_ctx["__std_row_mean__"] = mean
-    packed_ctx["__std_row_inv_sd__"] = inv
-    packed_ctx["__std_mode__"] = str(std_mode)
+    if std_mode != "strict_train":
+        packed_ctx["__std_row_mean__"] = mean
+        packed_ctx["__std_row_inv_sd__"] = inv
+        packed_ctx["__std_mode__"] = str(std_mode)
     return mean, inv
 
 
@@ -6700,30 +6814,49 @@ def _ensure_packed_centered_stats_cached(
     packed_ctx: dict[str, typing.Any],
     *,
     std_eps: float = 1e-12,
+    sample_indices: np.ndarray | None = None,
+    std_mode: str | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
+    std_mode = _resolve_rrblup_standardized_mode() if std_mode is None else str(std_mode).strip().lower()
     mean_raw = packed_ctx.get("__ctr_row_mean__", None)
     inv_raw = packed_ctx.get("__ctr_row_inv_sd__", None)
     active_row_idx = _packed_ctx_active_row_idx(packed_ctx)
     m = int(active_row_idx.shape[0])
-    if mean_raw is not None and inv_raw is not None:
+    if std_mode != "strict_train" and mean_raw is not None and inv_raw is not None:
         mean = np.ascontiguousarray(np.asarray(mean_raw, dtype=np.float32).reshape(-1), dtype=np.float32)
         inv = np.ascontiguousarray(np.asarray(inv_raw, dtype=np.float32).reshape(-1), dtype=np.float32)
         if int(mean.shape[0]) == m and int(inv.shape[0]) == m:
             return mean, inv
 
-    maf_full = np.ascontiguousarray(np.asarray(packed_ctx["maf"], dtype=np.float32).reshape(-1))
-    if int(maf_full.shape[0]) == m:
-        maf = maf_full
+    if std_mode == "strict_train":
+        if sample_indices is None:
+            raise ValueError(
+                "strict-train rrBLUP centering requires train sample indices "
+                "so test data can reuse the training mean."
+            )
+        sum_rows_arr, sq_rows_arr = _compute_packed_empirical_stats_for_samples(
+            packed_ctx,
+            sample_indices,
+        )
+        n_subset = int(np.asarray(sample_indices, dtype=np.int64).reshape(-1).shape[0])
+        mean_f64 = np.asarray(sum_rows_arr / float(n_subset), dtype=np.float64)
+        var = np.asarray((sq_rows_arr / float(n_subset)) - mean_f64 * mean_f64, dtype=np.float64)
+        mean = np.ascontiguousarray(np.asarray(mean_f64, dtype=np.float32), dtype=np.float32)
     else:
-        maf = np.ascontiguousarray(maf_full[active_row_idx], dtype=np.float32)
-    p = np.clip(np.asarray(maf, dtype=np.float64), 0.0, 0.5)
-    var = 2.0 * p * (1.0 - p)
-    mean = np.ascontiguousarray(np.asarray(2.0 * p, dtype=np.float32), dtype=np.float32)
+        maf_full = np.ascontiguousarray(np.asarray(packed_ctx["maf"], dtype=np.float32).reshape(-1))
+        if int(maf_full.shape[0]) == m:
+            maf = maf_full
+        else:
+            maf = np.ascontiguousarray(maf_full[active_row_idx], dtype=np.float32)
+        p = np.clip(np.asarray(maf, dtype=np.float64), 0.0, 0.5)
+        var = 2.0 * p * (1.0 - p)
+        mean = np.ascontiguousarray(np.asarray(2.0 * p, dtype=np.float32), dtype=np.float32)
     inv = np.zeros((m,), dtype=np.float32)
     good = np.isfinite(var) & (var > float(std_eps))
     inv[good] = np.float32(1.0)
-    packed_ctx["__ctr_row_mean__"] = mean
-    packed_ctx["__ctr_row_inv_sd__"] = inv
+    if std_mode != "strict_train":
+        packed_ctx["__ctr_row_mean__"] = mean
+        packed_ctx["__ctr_row_inv_sd__"] = inv
     return mean, inv
 
 
@@ -6732,13 +6865,21 @@ def _ensure_packed_rrblup_operator_stats_cached(
     operator_mode: str,
     *,
     std_eps: float = 1e-12,
+    sample_indices: np.ndarray | None = None,
+    std_mode: str | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     if str(operator_mode).strip().lower() == "centered":
         return _ensure_packed_centered_stats_cached(
             packed_ctx,
             std_eps=float(std_eps),
+            sample_indices=sample_indices,
+            std_mode=std_mode,
         )
-    return _ensure_packed_standard_stats_cached(packed_ctx)
+    return _ensure_packed_standard_stats_cached(
+        packed_ctx,
+        sample_indices=sample_indices,
+        std_mode=std_mode,
+    )
 
 
 def _decode_packed_subset_to_dense_standardized(
@@ -7861,6 +8002,7 @@ def GSapi(
         if requested_rr_solver not in {"exact", "adamw", "pcg", "auto"}:
             requested_rr_solver = "auto"
         rr_cfg_shared = dict(rrblup_adamw_cfg or {})
+        rr_std_mode = _resolve_rrblup_standardized_mode(rr_cfg_shared)
         requested_rr_exact_backend = str(
             rr_cfg_shared.get("exact_backend", "auto")
         ).strip().lower()
@@ -7886,6 +8028,8 @@ def GSapi(
 
         if method == "rrBLUP":
             _set_rrblup_solver_state(str(resolved_rr_solver))
+            if rrblup_runtime_state is not None:
+                rrblup_runtime_state["standardized_mode"] = str(rr_std_mode)
 
         def _set_rrblup_exact_backend_state(
             backend_name: str,
@@ -8960,6 +9104,8 @@ def GSapi(
                                 packed_train,
                                 rr_operator_mode,
                                 std_eps=float(pcg_std_eps),
+                                sample_indices=train_abs,
+                                std_mode=rr_std_mode,
                             )
                             pcg_call_kwargs["row_mean"] = row_mean_arg
                             pcg_call_kwargs["row_inv_sd"] = row_inv_arg
@@ -9263,11 +9409,14 @@ def GSapi(
                         packed_train,
                         rr_operator_mode,
                         std_eps=float(pcg_std_eps),
+                        sample_indices=train_abs,
+                        std_mode=rr_std_mode,
                     )
                     model_state["kind"] = "rrblup_linear"
                     model_state["method"] = "rrBLUP"
                     model_state["solver"] = "pcg"
                     model_state["operator_mode"] = str(rr_operator_mode)
+                    model_state["standardized_mode"] = str(rr_std_mode)
                     model_state["alpha"] = float(np.mean(np.asarray(Y, dtype=np.float64)))
                     model_state["beta"] = np.ascontiguousarray(
                         np.asarray(beta_export, dtype=np.float32).reshape(-1),
@@ -9881,6 +10030,8 @@ def GSapi(
                         packed_train,
                         rr_operator_mode,
                         std_eps=float(exact_std_eps),
+                        sample_indices=train_abs,
+                        std_mode=rr_std_mode,
                     )
                 if _GS_DEBUG_STAGE:
                     print(
@@ -10164,6 +10315,7 @@ def GSapi(
                     model_state["solver"] = "exact"
                     model_state["exact_backend"] = "snp"
                     model_state["operator_mode"] = str(rr_operator_mode)
+                    model_state["standardized_mode"] = str(rr_std_mode)
                     model_state["alpha"] = float(alpha_exact)
                     model_state["beta"] = np.ascontiguousarray(
                         np.asarray(beta_exact, dtype=np.float32).reshape(-1),
@@ -12852,12 +13004,22 @@ def _predict_from_loaded_model_state(
         block_rows = int(max(1, int(model_state.get("snp_block_size", 2048))))
         sample_chunk = int(max(1, int(model_state.get("sample_chunk_size", 4096))))
         is_std = bool(model_state.get("standardized", True))
+        std_mode = _resolve_rrblup_standardized_mode(
+            {"standardized_mode": model_state.get("standardized_mode", None)}
+        )
         if packed_ctx is not None and packed_sample_indices is not None:
             if is_std:
                 row_mean = model_state.get("row_mean", None)
                 row_inv = model_state.get("row_inv_sd", None)
                 if row_mean is None or row_inv is None:
-                    row_mean_arr, row_inv_arr = _ensure_packed_standard_stats_cached(packed_ctx)
+                    if std_mode == "strict_train":
+                        raise ValueError(
+                            "Loaded strict-train rrBLUP model is missing saved row_mean/row_inv_sd."
+                        )
+                    row_mean_arr, row_inv_arr = _ensure_packed_standard_stats_cached(
+                        packed_ctx,
+                        std_mode=std_mode,
+                    )
                 else:
                     row_mean_arr = np.ascontiguousarray(
                         np.asarray(row_mean, dtype=np.float32).reshape(-1),
@@ -18392,6 +18554,7 @@ def _run_gs_pipeline(
         "log_every": int(args.rrblup_log_every),
         "sample_chunk_size": int(args.rrblup_sample_chunk_size),
         "pve_mode": str(args.rrblup_pve_mode),
+        "standardized_mode": _resolve_rrblup_standardized_mode(),
         "auto_grid": str(args.rrblup_auto_grid),
         "grid_size": int(args.rrblup_grid_size),
         "grid_min_samples": int(args.rrblup_grid_min_samples),

@@ -266,9 +266,10 @@ use logreg::fit_best_and_not_py;
 use ml::{garfield_ml_feature_scores_py, garfield_ml_select_topk_py};
 use packed::{
     bed_decode_rows_f32_from_meta, bed_packed_decode_rows_f32, bed_packed_decode_stats_f64,
-    bed_packed_empirical_stats_f64, bed_packed_row_flip_mask, bed_packed_signed_hash_f32,
-    bed_packed_signed_hash_kernels_f64, bed_packed_signed_hash_ztz_stats_f64,
-    bed_stream_empirical_stats_f64, cross_grm_times_alpha_packed_f64, packed_malpha_f64,
+    bed_packed_empirical_stats_f64, bed_packed_empirical_stats_subset_f64,
+    bed_packed_row_flip_mask, bed_packed_signed_hash_f32, bed_packed_signed_hash_kernels_f64,
+    bed_packed_signed_hash_ztz_stats_f64, bed_stream_empirical_stats_f64,
+    bed_stream_empirical_stats_subset_f64, cross_grm_times_alpha_packed_f64, packed_malpha_f64,
     packed_malpha_mode_f64,
 };
 use reml::{
@@ -765,7 +766,9 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(bed_decode_rows_f32_from_meta, m)?)?;
     m.add_function(wrap_pyfunction!(bed_packed_decode_stats_f64, m)?)?;
     m.add_function(wrap_pyfunction!(bed_packed_empirical_stats_f64, m)?)?;
+    m.add_function(wrap_pyfunction!(bed_packed_empirical_stats_subset_f64, m)?)?;
     m.add_function(wrap_pyfunction!(bed_stream_empirical_stats_f64, m)?)?;
+    m.add_function(wrap_pyfunction!(bed_stream_empirical_stats_subset_f64, m)?)?;
     m.add_function(wrap_pyfunction!(bed_packed_ld_prune_maf_priority, m)?)?;
     m.add_function(wrap_pyfunction!(bed_ldblock_r2_rust, m)?)?;
     m.add_function(wrap_pyfunction!(packed_prune_kernel_stats, m)?)?;

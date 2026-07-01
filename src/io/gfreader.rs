@@ -7258,7 +7258,6 @@ pub fn count_hmp_snps(path: String) -> PyResult<usize> {
     Ok(n)
 }
 
-#[inline]
 #[cfg(test)]
 mod tests {
     use super::{

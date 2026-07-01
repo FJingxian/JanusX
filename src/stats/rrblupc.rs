@@ -1,6 +1,6 @@
-//! rrBLUP marker-effect solvers over additive PLINK BED blocks.
+//! Centered-operator rrBLUP marker-effect solvers over additive PLINK BED blocks.
 //!
-//! Let `W` denote the standardized additive genotype matrix after site
+//! Let `W` denote the centered additive genotype matrix after site
 //! filtering and sample subsetting, with markers in rows and samples in
 //! columns. With phenotype `y`, fixed-effect design `X`, and
 //! `lambda = sigma_e^2 / sigma_beta^2`, rrBLUP solves
@@ -388,6 +388,15 @@ fn row_major_row_sumsq_f64(row: &[f32]) -> f64 {
 }
 
 #[inline]
+fn row_major_row_sum_f64(row: &[f32]) -> f64 {
+    let mut sum = 0.0_f64;
+    for &v in row {
+        sum += v as f64;
+    }
+    sum
+}
+
+#[inline]
 fn row_major_block_prepare_rhs_diag_f32(
     block: &[f32],
     rows: usize,
@@ -396,12 +405,14 @@ fn row_major_block_prepare_rhs_diag_f32(
     lambda_use: f32,
     b_out: &mut [f32],
     diag_inv_out: &mut [f32],
+    train_row_mean_out: &mut [f32],
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> f64 {
     debug_assert_eq!(block.len(), rows.saturating_mul(cols));
     debug_assert!(dot_blk.len() >= rows);
     debug_assert!(b_out.len() >= rows);
     debug_assert!(diag_inv_out.len() >= rows);
+    debug_assert!(train_row_mean_out.len() >= rows);
 
     if prefer_parallel_block_vec(rows, cols, pool) {
         let mut run = || {
@@ -411,11 +422,16 @@ fn row_major_block_prepare_rhs_diag_f32(
                 .zip(
                     b_out[..rows]
                         .par_iter_mut()
-                        .zip(diag_inv_out[..rows].par_iter_mut()),
+                        .zip(diag_inv_out[..rows].par_iter_mut())
+                        .zip(train_row_mean_out[..rows].par_iter_mut()),
                 )
-                .map(|((row, dot), (b_slot, diag_slot))| {
-                    let ss = row_major_row_sumsq_f64(row);
+                .map(|((row, dot), ((b_slot, diag_slot), mean_slot))| {
+                    let sum = row_major_row_sum_f64(row);
+                    let mean = sum / (cols as f64);
+                    let ss_raw = row_major_row_sumsq_f64(row);
+                    let ss = (ss_raw - (cols as f64) * mean * mean).max(0.0_f64);
                     *b_slot = *dot;
+                    *mean_slot = mean as f32;
                     let d = ((ss as f32) + lambda_use).max(1e-12_f32);
                     *diag_slot = 1.0_f32 / d;
                     ss
@@ -431,9 +447,13 @@ fn row_major_block_prepare_rhs_diag_f32(
     let mut sum_ss = 0.0_f64;
     for r in 0..rows {
         let row = &block[r * cols..(r + 1) * cols];
-        let ss = row_major_row_sumsq_f64(row);
+        let sum = row_major_row_sum_f64(row);
+        let mean = sum / (cols as f64);
+        let ss_raw = row_major_row_sumsq_f64(row);
+        let ss = (ss_raw - (cols as f64) * mean * mean).max(0.0_f64);
         sum_ss += ss;
         b_out[r] = dot_blk[r];
+        train_row_mean_out[r] = mean as f32;
         let d = ((ss as f32) + lambda_use).max(1e-12_f32);
         diag_inv_out[r] = 1.0_f32 / d;
     }
@@ -515,7 +535,7 @@ fn rrblup_parallel_row_standardization(
                 let var = (2.0_f32 * p * (1.0_f32 - p)).max(0.0);
                 *mean_slot = mean;
                 if var > std_eps32 {
-                    *inv_slot = 1.0_f32 / var.sqrt();
+                    *inv_slot = 1.0_f32;
                     1usize
                 } else {
                     *inv_slot = 0.0_f32;
@@ -538,7 +558,7 @@ fn rrblup_parallel_row_standardization(
             let var = (2.0_f32 * p * (1.0_f32 - p)).max(0.0);
             row_mean[j] = mean;
             if var > std_eps32 {
-                row_inv_sd[j] = 1.0_f32 / var.sqrt();
+                row_inv_sd[j] = 1.0_f32;
                 count += 1;
             } else {
                 row_inv_sd[j] = 0.0_f32;
@@ -547,65 +567,6 @@ fn rrblup_parallel_row_standardization(
         count
     };
     (row_mean, row_inv_sd, m_effective)
-}
-
-fn rrblup_subset_or_validate_stats(
-    row_mean_external: Option<Vec<f32>>,
-    row_inv_sd_external: Option<Vec<f32>>,
-    packed_row_indices: Option<&[usize]>,
-    full_len: usize,
-    eff_m: usize,
-    std_eps32: f32,
-    maf_keep: &[f32],
-    pool: Option<&Arc<rayon::ThreadPool>>,
-) -> Result<(Vec<f32>, Vec<f32>, usize), String> {
-    match (row_mean_external, row_inv_sd_external) {
-        (Some(row_mean_vec), Some(row_inv_sd_vec)) => {
-            let pair = if row_mean_vec.len() == eff_m && row_inv_sd_vec.len() == eff_m {
-                (row_mean_vec, row_inv_sd_vec)
-            } else if row_mean_vec.len() == full_len && row_inv_sd_vec.len() == full_len {
-                let keep_idx = packed_row_indices.ok_or_else(|| {
-                    format!(
-                        "External row_mean/row_inv_sd length mismatch: got full-length arrays ({full_len}) but no packed_row_indices were provided for active subset size {eff_m}."
-                    )
-                })?;
-                let mut mean_subset = vec![0.0_f32; eff_m];
-                let mut inv_subset = vec![0.0_f32; eff_m];
-                for (dst, &src) in keep_idx.iter().enumerate() {
-                    mean_subset[dst] = row_mean_vec[src];
-                    inv_subset[dst] = row_inv_sd_vec[src];
-                }
-                (mean_subset, inv_subset)
-            } else {
-                return Err(format!(
-                    "External row_mean/row_inv_sd length mismatch: mean={}, inv={}, expected active={eff_m} or full={full_len}.",
-                    row_mean_vec.len(),
-                    row_inv_sd_vec.len(),
-                ));
-            };
-            let (row_mean, row_inv_sd) = pair;
-            let m_effective = row_inv_sd
-                .iter()
-                .filter(|&&v| v.is_finite() && (v > 0.0_f32))
-                .count();
-            if m_effective == 0 {
-                return Err(
-                    "rrBLUP standardization received zero effective markers from external row_inv_sd."
-                        .to_string(),
-                );
-            }
-            Ok((row_mean, row_inv_sd, m_effective))
-        }
-        (None, None) => Ok(rrblup_parallel_row_standardization(
-            maf_keep,
-            std_eps32,
-            pool,
-        )),
-        _ => Err(
-            "rrBLUP standardization requires row_mean and row_inv_sd together when overriding row stats."
-                .to_string(),
-        ),
-    }
 }
 
 fn build_rrblup_source<'a>(
@@ -645,12 +606,13 @@ fn rrblup_prepare_rhs_diag(
     lambda_use: f32,
     code4_lut: &[[u8; 4]; 256],
     pool: Option<&Arc<rayon::ThreadPool>>,
-) -> Result<(Vec<f32>, Vec<f32>, f64, f64, f64, f64), String> {
+) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>, f64, f64, f64, f64), String> {
     let m = row_flip.len();
     let n_train = sample_idx.len();
     let row_step = block_rows.max(1).min(m.max(1));
     let mut b = vec![0.0_f32; m];
     let mut diag_inv = vec![0.0_f32; m];
+    let mut train_row_mean = vec![0.0_f32; m];
     let mut sum_ss_global = 0.0_f64;
     let mut decode_acc = 0.0_f64;
     let mut rhs_acc = 0.0_f64;
@@ -738,6 +700,7 @@ fn rrblup_prepare_rhs_diag(
                     lambda_use,
                     &mut b[st..ed],
                     &mut diag_inv[st..ed],
+                    &mut train_row_mean[st..ed],
                     pool,
                 );
                 diag_acc += t_diag.elapsed().as_secs_f64();
@@ -792,6 +755,7 @@ fn rrblup_prepare_rhs_diag(
                 lambda_use,
                 &mut b[st..ed],
                 &mut diag_inv[st..ed],
+                &mut train_row_mean[st..ed],
                 pool,
             );
             diag_acc += t_diag.elapsed().as_secs_f64();
@@ -803,15 +767,25 @@ fn rrblup_prepare_rhs_diag(
         }
     }
 
-    Ok((b, diag_inv, sum_ss_global, decode_acc, rhs_acc, diag_acc))
+    Ok((
+        b,
+        diag_inv,
+        train_row_mean,
+        sum_ss_global,
+        decode_acc,
+        rhs_acc,
+        diag_acc,
+    ))
 }
 
 struct RrblupPcgOperator<'a> {
     source: RrblupPcgSource<'a>,
     n_samples: usize,
+    n_train: usize,
     row_flip: &'a [bool],
     row_mean: &'a [f32],
     row_inv_sd: &'a [f32],
+    train_row_mean: &'a [f32],
     sample_idx: &'a [usize],
     full_sample_fast: bool,
     packed_row_indices: Option<&'a [usize]>,
@@ -865,14 +839,25 @@ impl PcgOperator<f32> for RrblupPcgOperator<'_> {
                 None
             },
         )?;
+        let mean_dot = self
+            .train_row_mean
+            .iter()
+            .zip(input.iter())
+            .map(|(mu, pj)| (*mu as f64) * (*pj as f64))
+            .sum::<f64>() as f32;
         if let Some(tp) = self.pool {
             tp.install(|| {
                 ap.par_iter_mut()
                     .zip(input.par_iter())
-                    .for_each(|(apj, pj)| *apj += self.lambda_use * *pj);
+                    .zip(self.train_row_mean.par_iter())
+                    .for_each(|((apj, pj), mu)| {
+                        *apj -= (self.n_train as f32) * *mu * mean_dot;
+                        *apj += self.lambda_use * *pj;
+                    });
             });
         } else {
             for j in 0..ap.len() {
+                ap[j] -= (self.n_train as f32) * self.train_row_mean[j] * mean_dot;
                 ap[j] += self.lambda_use * input[j];
             }
         }
@@ -1406,18 +1391,19 @@ struct RrblupExactSnpPreparedInner {
     row_flip: Vec<bool>,
     row_mean: Vec<f32>,
     row_inv_sd: Vec<f32>,
+    train_row_mean: Vec<f32>,
     eigvals: Vec<f64>,
     evecs: Vec<f64>, // row-major (m, rank)
     eig_backend: String,
 }
 
-#[pyclass]
-pub struct RrblupExactSnpCache {
+#[pyclass(name = "RrblupCenteredExactSnpCache")]
+pub struct RrblupCenteredExactSnpCache {
     inner: Arc<RrblupExactSnpPreparedInner>,
 }
 
 #[pymethods]
-impl RrblupExactSnpCache {
+impl RrblupCenteredExactSnpCache {
     #[getter]
     fn n_samples(&self) -> usize {
         self.inner.n_samples
@@ -1746,6 +1732,10 @@ fn build_rrblup_exact_snp_cache_from_source(
         None
     };
     let center_scale = 1.0_f64 / (n_train as f64);
+    let train_row_mean: Vec<f32> = row_sum
+        .iter()
+        .map(|v| (*v / (n_train as f64)) as f32)
+        .collect();
     symmetrize_upper_minus_rank1_in_place(&mut a_star, eff_m, &row_sum, center_scale);
     drop(row_sum);
     let center_secs = t_center
@@ -1845,6 +1835,7 @@ fn build_rrblup_exact_snp_cache_from_source(
         row_flip: row_flip_keep,
         row_mean,
         row_inv_sd,
+        train_row_mean,
         eigvals,
         evecs,
         eig_backend: eig_backend.to_string(),
@@ -1921,6 +1912,7 @@ fn fit_rrblup_exact_snp_from_cache_source(
     (
         Vec<f64>,
         Vec<f64>,
+        f64,
         f64,
         f64,
         f64,
@@ -2183,6 +2175,13 @@ fn fit_rrblup_exact_snp_from_cache_source(
         .unwrap_or(0.0_f64);
     let beta_f32: Vec<f32> = beta_f64.iter().map(|&v| v as f32).collect();
     drop(beta_f64);
+    let alpha_use = y_mean
+        - cache
+            .train_row_mean
+            .iter()
+            .zip(beta_f32.iter())
+            .map(|(mu, beta)| (*mu as f64) * (*beta as f64))
+            .sum::<f64>();
     let var_g = if cache.n_train > 1 {
         g_center_ss / ((cache.n_train - 1) as f64)
     } else {
@@ -2245,7 +2244,7 @@ fn fit_rrblup_exact_snp_from_cache_source(
             )?;
             pred_train_subset
                 .into_iter()
-                .map(|v| (v as f64) + y_mean)
+                .map(|v| (v as f64) + alpha_use)
                 .collect()
         }
     } else {
@@ -2279,7 +2278,7 @@ fn fit_rrblup_exact_snp_from_cache_source(
         )?;
         pred_train_full
             .into_iter()
-            .map(|v| (v as f64) + y_mean)
+            .map(|v| (v as f64) + alpha_use)
             .collect()
     };
     let pred_train_secs = t_pred_train
@@ -2321,7 +2320,10 @@ fn fit_rrblup_exact_snp_from_cache_source(
             pool_ref,
             None,
         )?;
-        pred_test_ret = pred_test_f32.iter().map(|v| (*v as f64) + y_mean).collect();
+        pred_test_ret = pred_test_f32
+            .iter()
+            .map(|v| (*v as f64) + alpha_use)
+            .collect();
     }
     let pred_test_secs = t_pred_test
         .map(|t0| t0.elapsed().as_secs_f64())
@@ -2367,6 +2369,7 @@ fn fit_rrblup_exact_snp_from_cache_source(
         -best_cost,
         var_g,
         sigma_e2,
+        alpha_use,
         beta_f32,
         cache.eig_backend.clone(),
     ))
@@ -2391,6 +2394,7 @@ fn fit_rrblup_exact_snp_from_cache_packed(
     (
         Vec<f64>,
         Vec<f64>,
+        f64,
         f64,
         f64,
         f64,
@@ -2427,14 +2431,12 @@ fn fit_rrblup_exact_snp_from_cache_packed(
     site_keep=None,
     maf=None,
     row_flip=None,
-    row_mean=None,
-    row_inv_sd=None,
     sample_block=2048,
     std_eps=1e-12_f64,
     threads=0,
     blas_threads=0
 ))]
-pub fn rrblup_exact_snp_prepare_packed<'py>(
+pub fn rrblupc_exact_snp_prepare_packed<'py>(
     py: Python<'py>,
     packed: PyReadonlyArray2<'py, u8>,
     n_samples: usize,
@@ -2442,13 +2444,11 @@ pub fn rrblup_exact_snp_prepare_packed<'py>(
     site_keep: Option<PyReadonlyArray1<'py, bool>>,
     maf: Option<PyReadonlyArray1<'py, f32>>,
     row_flip: Option<PyReadonlyArray1<'py, bool>>,
-    row_mean: Option<PyReadonlyArray1<'py, f32>>,
-    row_inv_sd: Option<PyReadonlyArray1<'py, f32>>,
     sample_block: usize,
     std_eps: f64,
     threads: usize,
     blas_threads: usize,
-) -> PyResult<RrblupExactSnpCache> {
+) -> PyResult<RrblupCenteredExactSnpCache> {
     if n_samples == 0 {
         return Err(PyRuntimeError::new_err("n_samples must be > 0"));
     }
@@ -2497,22 +2497,6 @@ pub fn rrblup_exact_snp_prepare_packed<'py>(
             row_flip_full.len()
         )));
     }
-    let row_mean_external_full: Option<Vec<f32>> = if let Some(row_mean_ro) = row_mean {
-        Some(match row_mean_ro.as_slice() {
-            Ok(s) => s.to_vec(),
-            Err(_) => row_mean_ro.as_array().iter().copied().collect(),
-        })
-    } else {
-        None
-    };
-    let row_inv_sd_external_full: Option<Vec<f32>> = if let Some(row_inv_sd_ro) = row_inv_sd {
-        Some(match row_inv_sd_ro.as_slice() {
-            Ok(s) => s.to_vec(),
-            Err(_) => row_inv_sd_ro.as_array().iter().copied().collect(),
-        })
-    } else {
-        None
-    };
     let mut eff_m = m_total;
     let mut maf_keep: Cow<[f32]> = Cow::Borrowed(maf_full.as_slice());
     let mut row_flip_keep: Cow<[bool]> = Cow::Borrowed(row_flip_full.as_slice());
@@ -2572,17 +2556,21 @@ pub fn rrblup_exact_snp_prepare_packed<'py>(
         ));
     }
     let std_eps32 = std_eps.max(1e-12) as f32;
-    let (row_mean, row_inv_sd, m_effective) = rrblup_subset_or_validate_stats(
-        row_mean_external_full,
-        row_inv_sd_external_full,
-        packed_row_indices.as_deref(),
-        m_total,
-        eff_m,
-        std_eps32,
-        maf_keep.as_ref(),
-        None,
-    )
-    .map_err(PyRuntimeError::new_err)?;
+    let mut row_mean = vec![0.0_f32; eff_m];
+    let mut row_inv_sd = vec![0.0_f32; eff_m];
+    let mut m_effective = 0usize;
+    for j in 0..eff_m {
+        let p = maf_keep[j].clamp(0.0, 0.5);
+        let mean = 2.0_f32 * p;
+        let var = (2.0_f32 * p * (1.0_f32 - p)).max(0.0);
+        row_mean[j] = mean;
+        if var > std_eps32 {
+            row_inv_sd[j] = 1.0_f32;
+            m_effective += 1;
+        } else {
+            row_inv_sd[j] = 0.0_f32;
+        }
+    }
     if m_effective == 0 {
         return Err(PyRuntimeError::new_err(
             "rrblup_exact_snp_prepare_packed found zero effective markers after standardization.",
@@ -2613,7 +2601,7 @@ pub fn rrblup_exact_snp_prepare_packed<'py>(
             )
         })
         .map_err(map_err_string_to_py)?;
-    Ok(RrblupExactSnpCache {
+    Ok(RrblupCenteredExactSnpCache {
         inner: Arc::new(cache_inner),
     })
 }
@@ -2633,9 +2621,9 @@ pub fn rrblup_exact_snp_prepare_packed<'py>(
     threads=0,
     blas_threads=0
 ))]
-pub fn rrblup_exact_snp_fit_prepared<'py>(
+pub fn rrblupc_exact_snp_fit_prepared<'py>(
     py: Python<'py>,
-    cache: PyRef<'py, RrblupExactSnpCache>,
+    cache: PyRef<'py, RrblupCenteredExactSnpCache>,
     packed: PyReadonlyArray2<'py, u8>,
     n_samples: usize,
     y_train: PyReadonlyArray1<'py, f64>,
@@ -2726,6 +2714,7 @@ pub fn rrblup_exact_snp_fit_prepared<'py>(
         reml_opt,
         var_g,
         sigma_e2,
+        alpha_ret,
         beta_ret,
         eig_backend,
     ) = py
@@ -2747,7 +2736,6 @@ pub fn rrblup_exact_snp_fit_prepared<'py>(
             )
         })
         .map_err(map_err_string_to_py)?;
-    let alpha = y_train.as_slice()?.iter().copied().sum::<f64>() / (cache.inner.n_train as f64);
     let train_arr = PyArray2::from_owned_array(
         py,
         Array2::from_shape_vec((pred_train_ret.len(), 1), pred_train_ret)
@@ -2771,7 +2759,7 @@ pub fn rrblup_exact_snp_fit_prepared<'py>(
         reml_opt,
         (var_g, sigma_e2),
         m_effective,
-        alpha,
+        alpha_ret,
         beta_arr,
         mean_arr,
         inv_arr,
@@ -2786,29 +2774,25 @@ pub fn rrblup_exact_snp_fit_prepared<'py>(
     row_source_indices,
     maf,
     row_flip,
-    row_mean=None,
-    row_inv_sd=None,
     sample_block=2048,
     stream_row_block=2048,
     std_eps=1e-12_f64,
     threads=0,
     blas_threads=0
 ))]
-pub fn rrblup_exact_snp_prepare_bed_from_meta<'py>(
+pub fn rrblupc_exact_snp_prepare_bed_from_meta<'py>(
     py: Python<'py>,
     source_prefix: String,
     train_sample_indices: PyReadonlyArray1<'py, i64>,
     row_source_indices: PyReadonlyArray1<'py, i64>,
     maf: PyReadonlyArray1<'py, f32>,
     row_flip: PyReadonlyArray1<'py, bool>,
-    row_mean: Option<PyReadonlyArray1<'py, f32>>,
-    row_inv_sd: Option<PyReadonlyArray1<'py, f32>>,
     sample_block: usize,
     stream_row_block: usize,
     std_eps: f64,
     threads: usize,
     blas_threads: usize,
-) -> PyResult<RrblupExactSnpCache> {
+) -> PyResult<RrblupCenteredExactSnpCache> {
     if str::trim(source_prefix.as_str()).is_empty() {
         return Err(PyRuntimeError::new_err(
             "rrblup_exact_snp_prepare_bed_from_meta requires non-empty source_prefix.",
@@ -2854,22 +2838,6 @@ pub fn rrblup_exact_snp_prepare_bed_from_meta<'py>(
         Ok(s) => s.to_vec(),
         Err(_) => row_flip.as_array().iter().copied().collect(),
     };
-    let row_mean_external: Option<Vec<f32>> = if let Some(row_mean_ro) = row_mean {
-        Some(match row_mean_ro.as_slice() {
-            Ok(s) => s.to_vec(),
-            Err(_) => row_mean_ro.as_array().iter().copied().collect(),
-        })
-    } else {
-        None
-    };
-    let row_inv_sd_external: Option<Vec<f32>> = if let Some(row_inv_sd_ro) = row_inv_sd {
-        Some(match row_inv_sd_ro.as_slice() {
-            Ok(s) => s.to_vec(),
-            Err(_) => row_inv_sd_ro.as_array().iter().copied().collect(),
-        })
-    } else {
-        None
-    };
     if maf_keep.len() != eff_m {
         return Err(PyRuntimeError::new_err(format!(
             "maf length mismatch: got {}, expected {eff_m}",
@@ -2888,17 +2856,21 @@ pub fn rrblup_exact_snp_prepare_bed_from_meta<'py>(
         Some(row_source_idx)
     };
     let std_eps32 = std_eps.max(1e-12) as f32;
-    let (row_mean, row_inv_sd, m_effective) = rrblup_subset_or_validate_stats(
-        row_mean_external,
-        row_inv_sd_external,
-        packed_row_indices.as_deref(),
-        eff_m,
-        eff_m,
-        std_eps32,
-        maf_keep.as_slice(),
-        None,
-    )
-    .map_err(PyRuntimeError::new_err)?;
+    let mut row_mean = vec![0.0_f32; eff_m];
+    let mut row_inv_sd = vec![0.0_f32; eff_m];
+    let mut m_effective = 0usize;
+    for j in 0..eff_m {
+        let p = maf_keep[j].clamp(0.0, 0.5);
+        let mean = 2.0_f32 * p;
+        let var = (2.0_f32 * p * (1.0_f32 - p)).max(0.0);
+        row_mean[j] = mean;
+        if var > std_eps32 {
+            row_inv_sd[j] = 1.0_f32;
+            m_effective += 1;
+        } else {
+            row_inv_sd[j] = 0.0_f32;
+        }
+    }
     if m_effective == 0 {
         return Err(PyRuntimeError::new_err(
             "rrblup_exact_snp_prepare_bed_from_meta found zero effective markers after standardization.",
@@ -2932,7 +2904,7 @@ pub fn rrblup_exact_snp_prepare_bed_from_meta<'py>(
             )
         })
         .map_err(map_err_string_to_py)?;
-    Ok(RrblupExactSnpCache {
+    Ok(RrblupCenteredExactSnpCache {
         inner: Arc::new(cache_inner),
     })
 }
@@ -2951,9 +2923,9 @@ pub fn rrblup_exact_snp_prepare_bed_from_meta<'py>(
     threads=0,
     blas_threads=0
 ))]
-pub fn rrblup_exact_snp_fit_prepared_bed<'py>(
+pub fn rrblupc_exact_snp_fit_prepared_bed<'py>(
     py: Python<'py>,
-    cache: PyRef<'py, RrblupExactSnpCache>,
+    cache: PyRef<'py, RrblupCenteredExactSnpCache>,
     source_prefix: String,
     y_train: PyReadonlyArray1<'py, f64>,
     test_sample_indices: Option<PyReadonlyArray1<'py, i64>>,
@@ -3044,6 +3016,7 @@ pub fn rrblup_exact_snp_fit_prepared_bed<'py>(
         reml_opt,
         var_g,
         sigma_e2,
+        alpha_ret,
         beta_ret,
         eig_backend,
     ) = py
@@ -3066,7 +3039,6 @@ pub fn rrblup_exact_snp_fit_prepared_bed<'py>(
             )
         })
         .map_err(map_err_string_to_py)?;
-    let alpha = y_train.as_slice()?.iter().copied().sum::<f64>() / (cache.inner.n_train as f64);
     let train_arr = PyArray2::from_owned_array(
         py,
         Array2::from_shape_vec((pred_train_ret.len(), 1), pred_train_ret)
@@ -3090,7 +3062,7 @@ pub fn rrblup_exact_snp_fit_prepared_bed<'py>(
         reml_opt,
         (var_g, sigma_e2),
         m_effective,
-        alpha,
+        alpha_ret,
         beta_arr,
         mean_arr,
         inv_arr,
@@ -3109,8 +3081,6 @@ pub fn rrblup_exact_snp_fit_prepared_bed<'py>(
     site_keep=None,
     maf=None,
     row_flip=None,
-    row_mean=None,
-    row_inv_sd=None,
     log10_lambda_low=-6.0_f64,
     log10_lambda_high=6.0_f64,
     reml_tol=1e-4_f64,
@@ -3120,7 +3090,7 @@ pub fn rrblup_exact_snp_fit_prepared_bed<'py>(
     threads=0,
     blas_threads=0
 ))]
-pub fn rrblup_exact_snp_packed<'py>(
+pub fn rrblupc_exact_snp_packed<'py>(
     py: Python<'py>,
     packed: PyReadonlyArray2<'py, u8>,
     n_samples: usize,
@@ -3131,8 +3101,6 @@ pub fn rrblup_exact_snp_packed<'py>(
     site_keep: Option<PyReadonlyArray1<'py, bool>>,
     maf: Option<PyReadonlyArray1<'py, f32>>,
     row_flip: Option<PyReadonlyArray1<'py, bool>>,
-    row_mean: Option<PyReadonlyArray1<'py, f32>>,
-    row_inv_sd: Option<PyReadonlyArray1<'py, f32>>,
     log10_lambda_low: f64,
     log10_lambda_high: f64,
     reml_tol: f64,
@@ -3219,22 +3187,6 @@ pub fn rrblup_exact_snp_packed<'py>(
             row_flip_full.len()
         )));
     }
-    let row_mean_external_full: Option<Vec<f32>> = if let Some(row_mean_ro) = row_mean {
-        Some(match row_mean_ro.as_slice() {
-            Ok(s) => s.to_vec(),
-            Err(_) => row_mean_ro.as_array().iter().copied().collect(),
-        })
-    } else {
-        None
-    };
-    let row_inv_sd_external_full: Option<Vec<f32>> = if let Some(row_inv_sd_ro) = row_inv_sd {
-        Some(match row_inv_sd_ro.as_slice() {
-            Ok(s) => s.to_vec(),
-            Err(_) => row_inv_sd_ro.as_array().iter().copied().collect(),
-        })
-    } else {
-        None
-    };
 
     let mut eff_m = m_total;
     let mut maf_keep: Cow<[f32]> = Cow::Borrowed(maf_full.as_slice());
@@ -3327,17 +3279,21 @@ pub fn rrblup_exact_snp_packed<'py>(
     };
 
     let std_eps32 = std_eps.max(1e-12) as f32;
-    let (row_mean, row_inv_sd, m_effective) = rrblup_subset_or_validate_stats(
-        row_mean_external_full,
-        row_inv_sd_external_full,
-        packed_row_indices.as_deref(),
-        m_total,
-        eff_m,
-        std_eps32,
-        maf_keep.as_ref(),
-        None,
-    )
-    .map_err(PyRuntimeError::new_err)?;
+    let mut row_mean = vec![0.0_f32; eff_m];
+    let mut row_inv_sd = vec![0.0_f32; eff_m];
+    let mut m_effective = 0usize;
+    for j in 0..eff_m {
+        let p = maf_keep[j].clamp(0.0, 0.5);
+        let mean = 2.0_f32 * p;
+        let var = (2.0_f32 * p * (1.0_f32 - p)).max(0.0);
+        row_mean[j] = mean;
+        if var > std_eps32 {
+            row_inv_sd[j] = 1.0_f32;
+            m_effective += 1;
+        } else {
+            row_inv_sd[j] = 0.0_f32;
+        }
+    }
     if m_effective == 0 {
         return Err(PyRuntimeError::new_err(
             "rrblup_exact_snp_packed found zero effective markers after standardization.",
@@ -3373,7 +3329,6 @@ pub fn rrblup_exact_snp_packed<'py>(
     let row_mean_ret = cache_inner.row_mean.clone();
     let row_inv_sd_ret = cache_inner.row_inv_sd.clone();
     let m_effective = cache_inner.m_effective;
-    let y_mean = y_vec_f64.iter().sum::<f64>() / (n_train as f64);
     let (
         pred_train_ret,
         pred_test_ret,
@@ -3382,6 +3337,7 @@ pub fn rrblup_exact_snp_packed<'py>(
         reml_opt,
         var_g,
         sigma_e2,
+        alpha_ret,
         beta_ret,
         eig_backend,
     ) = py
@@ -3427,7 +3383,7 @@ pub fn rrblup_exact_snp_packed<'py>(
         reml_opt,
         (var_g, sigma_e2),
         m_effective,
-        y_mean,
+        alpha_ret,
         beta_arr,
         mean_arr,
         inv_arr,
@@ -3456,11 +3412,9 @@ pub fn rrblup_exact_snp_packed<'py>(
     packed_n_samples=0,
     maf=None,
     row_flip=None,
-    row_mean=None,
-    row_inv_sd=None,
     blas_threads=0
 ))]
-pub fn rrblup_pcg_bed<'py>(
+pub fn rrblupc_pcg_bed<'py>(
     py: Python<'py>,
     prefix: String,
     train_sample_indices: PyReadonlyArray1<'py, i64>,
@@ -3481,8 +3435,6 @@ pub fn rrblup_pcg_bed<'py>(
     packed_n_samples: usize,
     maf: Option<PyReadonlyArray1<'py, f32>>,
     row_flip: Option<PyReadonlyArray1<'py, bool>>,
-    row_mean: Option<PyReadonlyArray1<'py, f32>>,
-    row_inv_sd: Option<PyReadonlyArray1<'py, f32>>,
     blas_threads: usize,
 ) -> PyResult<(
     Bound<'py, PyArray2<f64>>,
@@ -3699,22 +3651,6 @@ pub fn rrblup_pcg_bed<'py>(
             row_flip_full.len()
         )));
     }
-    let row_mean_external_full: Option<Vec<f32>> = if let Some(row_mean_ro) = row_mean {
-        Some(match row_mean_ro.as_slice() {
-            Ok(s) => s.to_vec(),
-            Err(_) => row_mean_ro.as_array().iter().copied().collect(),
-        })
-    } else {
-        None
-    };
-    let row_inv_sd_external_full: Option<Vec<f32>> = if let Some(row_inv_sd_ro) = row_inv_sd {
-        Some(match row_inv_sd_ro.as_slice() {
-            Ok(s) => s.to_vec(),
-            Err(_) => row_inv_sd_ro.as_array().iter().copied().collect(),
-        })
-    } else {
-        None
-    };
 
     let mut eff_m = m_total;
     let mut maf_keep: Cow<[f32]> = Cow::Borrowed(maf_full.as_slice());
@@ -3827,17 +3763,8 @@ pub fn rrblup_pcg_bed<'py>(
         .filter(|&v| v > 0)
         .unwrap_or(100usize);
 
-    let (row_mean, row_inv_sd, m_effective) = rrblup_subset_or_validate_stats(
-        row_mean_external_full,
-        row_inv_sd_external_full,
-        packed_row_indices.as_deref(),
-        m_total,
-        eff_m,
-        std_eps32,
-        maf_keep.as_ref(),
-        pool_ref,
-    )
-    .map_err(PyRuntimeError::new_err)?;
+    let (row_mean, row_inv_sd, m_effective) =
+        rrblup_parallel_row_standardization(maf_keep.as_ref(), std_eps32, pool_ref);
 
     let y_mean = y_vec_f64.iter().sum::<f64>() / (n_train as f64);
     let y_center_f32: Vec<f32> = y_vec_f64.iter().map(|v| (*v - y_mean) as f32).collect();
@@ -3874,6 +3801,7 @@ pub fn rrblup_pcg_bed<'py>(
                 let (
                     b,
                     diag_inv,
+                    train_row_mean,
                     sum_ss_global,
                     prep_decode_secs,
                     prep_rhs_secs,
@@ -3923,9 +3851,11 @@ pub fn rrblup_pcg_bed<'py>(
                         row_step,
                     )?,
                     n_samples,
+                    n_train,
                     row_flip: row_flip_keep.as_ref(),
                     row_mean: &row_mean,
                     row_inv_sd: &row_inv_sd,
+                    train_row_mean: &train_row_mean,
                     sample_idx: &train_idx,
                     full_sample_fast: full_train_fast,
                     packed_row_indices: packed_row_indices.as_deref(),
@@ -4005,6 +3935,12 @@ pub fn rrblup_pcg_bed<'py>(
                     },
                 )?;
                 let beta = pcg_res.x;
+                let alpha_use = (y_mean as f32)
+                    - train_row_mean
+                        .iter()
+                        .zip(beta.iter())
+                        .map(|(mu, bj)| *mu * *bj)
+                        .sum::<f32>();
                 let converged = pcg_res.converged;
                 let iters_done = pcg_res.iters;
                 let rel_res = pcg_res.rel_res;
@@ -4066,7 +4002,7 @@ pub fn rrblup_pcg_bed<'py>(
                         None,
                     )?;
                     for v in pred_train_full.iter_mut() {
-                        *v += y_mean as f32;
+                        *v += alpha_use;
                     }
                     let pred_train_f64: Vec<f64> =
                         pred_train_full.iter().map(|v| *v as f64).collect();
@@ -4136,7 +4072,7 @@ pub fn rrblup_pcg_bed<'py>(
                                 None,
                             )?;
                             for v in &mut pred_train_sub {
-                                *v += y_mean as f32;
+                                *v += alpha_use;
                             }
                             pred_train_ret =
                                 pred_train_sub.iter().map(|v| *v as f64).collect();
@@ -4189,7 +4125,7 @@ pub fn rrblup_pcg_bed<'py>(
                     )?;
                     pred_test_ret = test_pred_f32
                         .iter()
-                        .map(|v| (*v as f64) + y_mean)
+                        .map(|v| (*v as f64) + (alpha_use as f64))
                         .collect();
                 }
 

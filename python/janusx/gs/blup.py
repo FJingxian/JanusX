@@ -58,15 +58,15 @@ def describe_blup_dispatch_policy(
 ) -> str:
     force_mode = resolve_blup_force_mode()
     if force_mode == "gblup":
-        return f"forced by {BLUP_FORCE_ENV}=0 -> GBLUP REML/GRM"
+        return f"forced by {BLUP_FORCE_ENV}=0 -> GBLUP"
     if force_mode == "exact":
         return f"forced by {BLUP_FORCE_ENV}=1 -> exact rrBLUP(snp spectral REML)"
     if force_mode == "pcg":
-        return f"forced by {BLUP_FORCE_ENV}=2 -> PCG rrBLUP + HE"
+        return f"forced by {BLUP_FORCE_ENV}=2 -> PCG rrBLUP"
     return (
         f"auto dispatch: n<={int(threshold_n)} -> GBLUP; "
         f"n>{int(threshold_n)} and m<={int(threshold_m)} -> exact rrBLUP(snp); "
-        f"n>{int(threshold_n)} and m>{int(threshold_m)} -> PCG rrBLUP+HE"
+        f"n>{int(threshold_n)} and m>{int(threshold_m)} -> PCG rrBLUP"
     )
 
 
@@ -89,7 +89,7 @@ def resolve_blup_dispatch(
             rrblup_solver=None,
             rrblup_exact_backend=None,
             route_key="gblup_forced_env0",
-            route_label=f"GBLUP REML/GRM (forced by {BLUP_FORCE_ENV}=0)",
+            route_label=f"GBLUP (forced by {BLUP_FORCE_ENV}=0)",
             n_samples=n,
             n_markers=m,
             threshold_n=n_cut,
@@ -115,7 +115,7 @@ def resolve_blup_dispatch(
             rrblup_solver="pcg",
             rrblup_exact_backend=None,
             route_key="pcg_rrblup_he_forced_env2",
-            route_label=f"rrBLUP PCG + HE (forced by {BLUP_FORCE_ENV}=2)",
+            route_label=f"rrBLUP PCG (forced by {BLUP_FORCE_ENV}=2)",
             n_samples=n,
             n_markers=m,
             threshold_n=n_cut,
@@ -128,7 +128,7 @@ def resolve_blup_dispatch(
             rrblup_solver=None,
             rrblup_exact_backend=None,
             route_key="gblup_n_le_threshold",
-            route_label="GBLUP REML/GRM",
+            route_label="GBLUP",
             n_samples=n,
             n_markers=m,
             threshold_n=n_cut,
@@ -155,7 +155,7 @@ def resolve_blup_dispatch(
         rrblup_solver="pcg",
         rrblup_exact_backend=None,
         route_key="pcg_rrblup_he_large",
-        route_label="rrBLUP PCG + HE",
+        route_label="rrBLUP PCG",
         n_samples=n,
         n_markers=m,
         threshold_n=n_cut,

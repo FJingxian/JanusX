@@ -244,10 +244,7 @@ def emit_method_detail_lines(
 
     if is_gblup:
         logger.info(f"kernel              {str(gblup_kernel_label or 'additive')}")
-        logger.info(
-            f"variance component  {str(gblup_variance_component or 'REML/FaST')}"
-        )
-        logger.info(f"backend             {str(gblup_backend_label or 'dense')}")
+        logger.info(f"vc                  {str(gblup_variance_component or 'GRMreml')}")
         pve_val = float("nan")
         try:
             if gblup_pve is not None:

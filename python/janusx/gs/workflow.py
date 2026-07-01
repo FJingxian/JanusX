@@ -307,6 +307,18 @@ def _rrblup_vc_method_display(name: object) -> str:
     return txt
 
 
+def _gblup_vc_method_display(name: object) -> str:
+    txt = str(name).strip()
+    if txt == "":
+        return ""
+    norm = re.sub(r"[^a-z0-9]+", "", txt.lower())
+    if norm in {"remlgrm", "grmreml"}:
+        return "GRMreml"
+    if norm in {"remlfast", "fastreml"}:
+        return "FaSTreml"
+    return txt
+
+
 def _format_debug_bytes(n_bytes: object) -> str:
     try:
         value = int(n_bytes)
@@ -4675,6 +4687,37 @@ def _resolve_rrblup_operator_mode(
     return "standardized"
 
 
+def _resolve_rrblup_standardized_mode(
+    cfg: dict[str, typing.Any] | None = None,
+) -> str:
+    cfg_use = cfg or {}
+    raw = cfg_use.get(
+        "standardized_mode",
+        os.getenv(
+            "JX_RRBLUP_STANDARDIZED_MODE",
+            os.getenv("JX_RRBLUP_STD_MODE", "empirical_global"),
+        ),
+    )
+    mode = str(raw).strip().lower().replace("-", "_")
+    if mode in {
+        "empirical",
+        "empirical_global",
+        "empirical_standardized",
+        "global_empirical",
+    }:
+        return "empirical_global"
+    if mode in {
+        "hwe",
+        "hwe_global",
+        "hwe_standardized",
+        "vanraden2",
+        "vr2",
+        "2p_1_p",
+    }:
+        return "hwe_global"
+    return "empirical_global"
+
+
 def _rrblup_lambda_k_to_equation(
     *,
     lambda_k: float,
@@ -4881,6 +4924,8 @@ def _estimate_rrblup_lambda_subsample_reml(
     ).strip().lower()
     if lambda_auto_strategy not in {"he_first", "he_only", "reml_first"}:
         lambda_auto_strategy = "he_first"
+    large_cutoff = int(max(2, int(cfg_use.get("lambda_large_cutoff", 15_000))))
+    small_sample_force_grm_reml = bool(int(n_train) < int(large_cutoff))
 
     def _normalize_lambda_payload(payload: dict[str, typing.Any]) -> dict[str, typing.Any]:
         out = dict(payload)
@@ -5478,7 +5523,7 @@ def _estimate_rrblup_lambda_subsample_reml(
     he_diag["he_accepted"] = bool(he_ok)
     he_diag["he_reject_reason"] = ",".join(he_reject_reasons)
     if lambda_auto_strategy in {"he_first", "he_only"}:
-        if he_ok:
+        if he_ok and ((not small_sample_force_grm_reml) or (lambda_auto_strategy == "he_only")):
             return _normalize_lambda_payload(_merge_he_diag(
                 {
                     "lambda_equation": float(he_lam_eq_raw),
@@ -5710,13 +5755,6 @@ def _estimate_rrblup_lambda_subsample_reml(
             "pve": float(pve),
             "m_effective_vc": int(_m_eff) if int(_m_eff) > 0 else int(m_effective),
         }
-        if int(fit["m_effective_vc"]) > 0 and np.isfinite(lam_sub_k) and lam_sub_k > 0.0:
-            fit["lambda_eq"] = float(
-                _rrblup_lambda_k_to_equation(
-                    lambda_k=float(lam_sub_k),
-                    m_effective=int(fit["m_effective_vc"]),
-                )
-            )
         return fit, str(evd_backend)
 
     def _fit_once_grm(local_idx: np.ndarray) -> dict[str, float]:
@@ -5818,7 +5856,6 @@ def _estimate_rrblup_lambda_subsample_reml(
             "m_effective_vc": int(m_effective),
         }
 
-    large_cutoff = int(max(2, int(cfg_use.get("lambda_large_cutoff", 15_000))))
     many_samples = bool(int(n_train) >= int(large_cutoff))
     many_snps = bool(int(m_effective) >= int(large_cutoff))
     prefer_subsample = bool(many_samples and many_snps)
@@ -6554,14 +6591,16 @@ def _decode_packed_block_standardized(
 def _ensure_packed_standard_stats_cached(
     packed_ctx: dict[str, typing.Any],
 ) -> tuple[np.ndarray, np.ndarray]:
+    std_mode = _resolve_rrblup_standardized_mode()
     mean_raw = packed_ctx.get("__std_row_mean__", None)
     inv_raw = packed_ctx.get("__std_row_inv_sd__", None)
+    mode_raw = str(packed_ctx.get("__std_mode__", "")).strip().lower()
     active_row_idx = _packed_ctx_active_row_idx(packed_ctx)
     m = int(active_row_idx.shape[0])
     if mean_raw is not None and inv_raw is not None:
         mean = np.ascontiguousarray(np.asarray(mean_raw, dtype=np.float32).reshape(-1), dtype=np.float32)
         inv = np.ascontiguousarray(np.asarray(inv_raw, dtype=np.float32).reshape(-1), dtype=np.float32)
-        if int(mean.shape[0]) == m and int(inv.shape[0]) == m:
+        if int(mean.shape[0]) == m and int(inv.shape[0]) == m and mode_raw == std_mode:
             return mean, inv
 
     maf_full = np.ascontiguousarray(np.asarray(packed_ctx["maf"], dtype=np.float32).reshape(-1))
@@ -6569,59 +6608,75 @@ def _ensure_packed_standard_stats_cached(
     packed: np.ndarray | None = None
     if packed_raw is not None:
         packed = np.ascontiguousarray(np.asarray(packed_raw, dtype=np.uint8))
-    compact_from_active = bool(
-        _packed_ctx_is_lazy_full(packed_ctx)
-        or ((packed_raw is None) and (int(maf_full.shape[0]) != m))
-    )
-    if compact_from_active:
-        maf = np.ascontiguousarray(maf_full[active_row_idx], dtype=np.float32)
-    elif _packed_ctx_is_lazy_full(packed_ctx) and (packed is not None):
-        if int(maf_full.shape[0]) != int(packed.shape[0]):
-            raise ValueError("Packed context mismatch: maf length != packed rows.")
+    if int(maf_full.shape[0]) != m:
         maf = np.ascontiguousarray(maf_full[active_row_idx], dtype=np.float32)
     else:
         maf = maf_full
-        if int(maf.shape[0]) != m:
-            raise ValueError("Packed context mismatch: maf length != packed rows.")
     n_samples = int(packed_ctx["n_samples"])
     if n_samples <= 0:
         raise ValueError("Packed context invalid: n_samples must be > 0.")
 
     mean_f64: np.ndarray
     var_f64: np.ndarray
-    use_rust_stats = bool(
-        (packed is not None)
-        and (not _packed_ctx_is_lazy_full(packed_ctx))
-        and (_jxrs is not None)
-        and hasattr(_jxrs, "bed_packed_decode_stats_f64")
-    )
-    if use_rust_stats:
-        if packed is None:
-            raise ValueError("Packed context mismatch: resident packed payload missing.")
-        row_flip = _ensure_packed_row_flip_cached(packed_ctx)
-        sum_rows = np.zeros((m,), dtype=np.float64)
-        sq_rows = np.zeros((m,), dtype=np.float64)
-        step = int(max(1, min(8192, n_samples)))
-        threads_raw = os.getenv("JX_MLM_RUST_THREADS", "").strip()
-        try:
-            rust_threads = int(threads_raw) if threads_raw != "" else 0
-        except Exception:
-            rust_threads = 0
-        for st in range(0, n_samples, step):
-            ed = min(st + step, n_samples)
-            sidx = np.ascontiguousarray(np.arange(st, ed, dtype=np.int64), dtype=np.int64)
-            _blk, sum_blk, sq_blk = _jxrs.bed_packed_decode_stats_f64(  # type: ignore[union-attr]
+    if std_mode == "empirical_global":
+        sum_rows_arr: np.ndarray | None = None
+        sq_rows_arr: np.ndarray | None = None
+        use_packed_stats = bool(
+            (packed is not None)
+            and (not _packed_ctx_is_lazy_full(packed_ctx))
+            and (_jxrs is not None)
+            and hasattr(_jxrs, "bed_packed_empirical_stats_f64")
+        )
+        if use_packed_stats:
+            if packed is None:
+                raise ValueError("Packed context mismatch: resident packed payload missing.")
+            row_flip = _ensure_packed_row_flip_cached(packed_ctx)
+            sum_blk, sq_blk = _jxrs.bed_packed_empirical_stats_f64(  # type: ignore[union-attr]
                 packed,
                 int(n_samples),
-                row_flip,
-                maf,
-                sidx,
-                threads=int(rust_threads),
+                np.ascontiguousarray(np.asarray(row_flip, dtype=np.bool_).reshape(-1), dtype=np.bool_),
             )
-            sum_rows += np.asarray(sum_blk, dtype=np.float64).reshape(-1)
-            sq_rows += np.asarray(sq_blk, dtype=np.float64).reshape(-1)
-        mean_f64 = np.asarray(sum_rows / float(n_samples), dtype=np.float64)
-        var_f64 = np.asarray((sq_rows / float(n_samples)) - mean_f64 * mean_f64, dtype=np.float64)
+            sum_rows_arr = np.ascontiguousarray(np.asarray(sum_blk, dtype=np.float64).reshape(-1), dtype=np.float64)
+            sq_rows_arr = np.ascontiguousarray(np.asarray(sq_blk, dtype=np.float64).reshape(-1), dtype=np.float64)
+            if int(sum_rows_arr.shape[0]) != m:
+                sum_rows_arr = np.ascontiguousarray(sum_rows_arr[active_row_idx], dtype=np.float64)
+                sq_rows_arr = np.ascontiguousarray(sq_rows_arr[active_row_idx], dtype=np.float64)
+        else:
+            source_prefix_raw = packed_ctx.get("source_prefix", None)
+            use_stream_stats = bool(
+                (_jxrs is not None)
+                and hasattr(_jxrs, "bed_stream_empirical_stats_f64")
+                and (source_prefix_raw is not None)
+                and (str(source_prefix_raw).strip() != "")
+            )
+            if use_stream_stats:
+                (
+                    source_prefix,
+                    _site_keep_arg,
+                    row_source_indices_arg,
+                    row_flip_arg,
+                    _row_maf_arg,
+                    mmap_window_mb,
+                ) = _packed_gblup_stream_metadata(
+                    packed_ctx,
+                    mode="a",
+                    block_rows=int(max(1, min(8192, m))),
+                    use_ctx_budget=False,
+                )
+                sum_blk, sq_blk = _jxrs.bed_stream_empirical_stats_f64(  # type: ignore[union-attr]
+                    str(source_prefix),
+                    row_source_indices_arg,
+                    row_flip_arg,
+                    int(mmap_window_mb),
+                )
+                sum_rows_arr = np.ascontiguousarray(np.asarray(sum_blk, dtype=np.float64).reshape(-1), dtype=np.float64)
+                sq_rows_arr = np.ascontiguousarray(np.asarray(sq_blk, dtype=np.float64).reshape(-1), dtype=np.float64)
+        if sum_rows_arr is not None and sq_rows_arr is not None:
+            mean_f64 = np.asarray(sum_rows_arr / float(n_samples), dtype=np.float64)
+            var_f64 = np.asarray((sq_rows_arr / float(n_samples)) - mean_f64 * mean_f64, dtype=np.float64)
+        else:
+            mean_f64 = np.asarray(2.0 * maf, dtype=np.float64)
+            var_f64 = np.asarray(2.0 * maf * (1.0 - maf), dtype=np.float64)
     else:
         mean_f64 = np.asarray(2.0 * maf, dtype=np.float64)
         var_f64 = np.asarray(2.0 * maf * (1.0 - maf), dtype=np.float64)
@@ -6637,6 +6692,7 @@ def _ensure_packed_standard_stats_cached(
     inv = np.ascontiguousarray(np.asarray(inv_f64, dtype=np.float32), dtype=np.float32)
     packed_ctx["__std_row_mean__"] = mean
     packed_ctx["__std_row_inv_sd__"] = inv
+    packed_ctx["__std_mode__"] = str(std_mode)
     return mean, inv
 
 
@@ -8899,6 +8955,14 @@ def GSapi(
                             row_flip=row_flip_arg,
                             blas_threads=int(pcg_thread_spec["blas_threads"]),
                         )
+                        if rr_operator_mode != "centered":
+                            row_mean_arg, row_inv_arg = _ensure_packed_rrblup_operator_stats_cached(
+                                packed_train,
+                                rr_operator_mode,
+                                std_eps=float(pcg_std_eps),
+                            )
+                            pcg_call_kwargs["row_mean"] = row_mean_arg
+                            pcg_call_kwargs["row_inv_sd"] = row_inv_arg
                         try:
                             rr_out = rrblup_pcg_fn(
                                 source_prefix,
@@ -9810,6 +9874,14 @@ def GSapi(
                     np.asarray(Y, dtype=np.float64).reshape(-1),
                     dtype=np.float64,
                 )
+                rr_row_mean_arg: np.ndarray | None = None
+                rr_row_inv_arg: np.ndarray | None = None
+                if rr_operator_mode != "centered":
+                    rr_row_mean_arg, rr_row_inv_arg = _ensure_packed_rrblup_operator_stats_cached(
+                        packed_train,
+                        rr_operator_mode,
+                        std_eps=float(exact_std_eps),
+                    )
                 if _GS_DEBUG_STAGE:
                     print(
                         "[GS-DEBUG] rrBLUP exact SNP route="
@@ -9883,6 +9955,8 @@ def GSapi(
                                 site_keep_arg,
                                 maf_arg,
                                 row_flip_arg,
+                                rr_row_mean_arg,
+                                rr_row_inv_arg,
                                 int(exact_sample_block),
                                 float(exact_std_eps),
                                 int(max(1, int(n_jobs))),
@@ -9937,6 +10011,8 @@ def GSapi(
                                 site_keep_arg,
                                 maf_arg,
                                 row_flip_arg,
+                                rr_row_mean_arg,
+                                rr_row_inv_arg,
                                 float(exact_log10_low),
                                 float(exact_log10_high),
                                 float(exact_reml_tol),
@@ -9978,6 +10054,8 @@ def GSapi(
                             row_source_indices_arg,
                             row_maf_arg,
                             row_flip_stream_arg,
+                            rr_row_mean_arg,
+                            rr_row_inv_arg,
                             int(exact_sample_block),
                             int(exact_stream_row_block),
                             float(exact_std_eps),
@@ -13178,25 +13256,8 @@ def _run_methods_parallel(
                     vc_label = "REML/GRM"
                 else:
                     vc_label = "REML/FaST"
-            rows.append(("method", vc_label))
-            if mode == "ad":
-                backend_ad = str(gblup_state.get("backend", "")).strip()
-                rows.append(("backend", backend_ad if backend_ad != "" else "REML/GRM"))
-            elif mode == "d":
-                backend_d = str(gblup_state.get("backend", "pyBLUP/FaST(d)")).strip()
-                rows.append(("backend", backend_d if backend_d != "" else "pyBLUP/FaST(d)"))
-            else:
-                backend_a = str(gblup_state.get("backend", "")).strip()
-                rows.append(
-                    (
-                        "backend",
-                        (
-                            backend_a
-                            if backend_a != ""
-                            else ("packed active" if _looks_like_packed_payload(packed_ctx) else "dense")
-                        ),
-                    )
-                )
+            vc_label = _gblup_vc_method_display(vc_label)
+            rows.append(("vc", vc_label))
             sigma_g2 = float(gblup_state.get("sigma_g2", np.nan))
             sigma_e2 = float(gblup_state.get("sigma_e2", np.nan))
             sigma_a2 = float(gblup_state.get("sigma_a2", np.nan))
@@ -13279,7 +13340,7 @@ def _run_methods_parallel(
                         vc_method = "GRMreml"
                 vc_method = _rrblup_vc_method_display(vc_method)
                 if vc_method != "":
-                    rows.append(("method", vc_method))
+                    rows.append(("vc", vc_method))
                 he_thread_policy = str(rr_state.get("lambda_he_thread_policy", "")).strip()
                 if he_thread_policy != "":
                     he_blas_threads = int(max(0, int(rr_state.get("lambda_he_stage_blas_threads", 0) or 0)))
@@ -17516,7 +17577,7 @@ def parse_args(argv: typing.Optional[list[str]] = None):
             "Use automatic BLUP dispatch. "
             f"When n<= {BLUP_SMALL_N}, choose GBLUP; "
             f"when n> {BLUP_SMALL_N} and m<= {BLUP_SMALL_M}, choose exact rrBLUP(snp spectral REML); "
-            f"when n> {BLUP_SMALL_N} and m> {BLUP_SMALL_M}, choose PCG rrBLUP + HE. "
+            f"when n> {BLUP_SMALL_N} and m> {BLUP_SMALL_M}, choose PCG rrBLUP. "
             "For benchmarking, set env GS_BLUP=0/1/2 to force GBLUP / exact rrBLUP / PCG rrBLUP."
         ),
     )
@@ -20890,29 +20951,8 @@ def _run_gs_pipeline(
                             vc_label = "REML/GRM"
                         else:
                             vc_label = "REML/FaST"
-                    rows.append(("method", vc_label))
-                    if mode == "ad":
-                        backend_ad = str(gblup_state.get("backend", "")).strip()
-                        rows.append(("backend", backend_ad if backend_ad != "" else "REML/GRM"))
-                    elif mode == "d":
-                        backend_d = str(gblup_state.get("backend", "pyBLUP/FaST(d)")).strip()
-                        rows.append(("backend", backend_d if backend_d != "" else "pyBLUP/FaST(d)"))
-                    else:
-                        backend_a = str(gblup_state.get("backend", "")).strip()
-                        rows.append(
-                            (
-                                "backend",
-                                (
-                                    backend_a
-                                    if backend_a != ""
-                                    else (
-                                        "packed active"
-                                        if _looks_like_packed_payload(trait_packed_ctx)
-                                        else ("packed meta" if _looks_like_packed_ctx(trait_packed_ctx) else "dense")
-                                    )
-                                ),
-                            )
-                        )
+                    vc_label = _gblup_vc_method_display(vc_label)
+                    rows.append(("vc", vc_label))
                     sigma_g2 = _detail_float_or_nan(gblup_state.get("sigma_g2", np.nan))
                     sigma_e2 = _detail_float_or_nan(gblup_state.get("sigma_e2", np.nan))
                     sigma_a2 = _detail_float_or_nan(gblup_state.get("sigma_a2", np.nan))
@@ -20989,7 +21029,7 @@ def _run_gs_pipeline(
                                 vc_method = "GRMreml"
                         vc_method = _rrblup_vc_method_display(vc_method)
                         if vc_method != "":
-                            rows.append(("method", vc_method))
+                            rows.append(("vc", vc_method))
                         va = _detail_float_or_nan(
                             rr_pve_final.get(
                                 "va",
@@ -21127,7 +21167,7 @@ def _run_gs_pipeline(
                 gblup_mode = _gblup_method_kernel_mode(m_key)
                 if gblup_mode == "ad":
                     # Additive+dominance path uses explicit dual-kernel REML.
-                    gblup_variance_component_label = "REML/GRM"
+                    gblup_variance_component_label = "GRMreml"
                 else:
                     gblup_state = dict(
                         typing.cast(
@@ -21140,11 +21180,11 @@ def _run_gs_pipeline(
                     vc_path = str(gblup_state.get("variance_component_path", "")).strip().lower()
                     eigh_backend = str(gblup_state.get("eigh_backend", "")).strip().lower()
                     if vc_label != "":
-                        gblup_variance_component_label = vc_label
+                        gblup_variance_component_label = _gblup_vc_method_display(vc_label)
                     elif vc_path in {"fast", "marker_fast"} or eigh_backend.startswith("marker_fast"):
-                        gblup_variance_component_label = "REML/FaST"
+                        gblup_variance_component_label = "FaSTreml"
                     elif vc_path == "grm" or eigh_backend != "":
-                        gblup_variance_component_label = "REML/GRM"
+                        gblup_variance_component_label = "GRMreml"
                     else:
                         m_eff = 0
                         try:
@@ -21160,9 +21200,9 @@ def _run_gs_pipeline(
                             m_eff = 0
                         n_eff = int(np.asarray(train_pheno).reshape(-1).shape[0])
                         gblup_variance_component_label = (
-                            "REML/FaST"
+                            "FaSTreml"
                             if (m_eff > 0 and n_eff > m_eff)
-                            else "REML/GRM"
+                            else "GRMreml"
                         )
             gs_output.emit_method_detail_lines(
                 logger,

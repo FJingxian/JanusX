@@ -14,6 +14,8 @@ use crate::bedmath::{
     decode_plink_bed_hardcall, decode_row_centered_full_lut, is_identity_indices, packed_byte_lut,
 };
 use crate::blas::{cblas_sgemm_dispatch, CblasInt, CBLAS_COL_MAJOR, CBLAS_NO_TRANS, CBLAS_TRANS};
+use crate::gfcore;
+use crate::gfreader::count_packed_row_counts;
 use crate::gload::WindowedBedMatrix;
 use crate::stats_common::{
     check_ctrlc, get_cached_pool, map_err_string_to_py, parse_index_vec_i64,
@@ -116,6 +118,230 @@ pub fn bed_packed_row_flip_mask<'py>(
         });
 
     Ok(out)
+}
+
+#[inline]
+fn packed_row_sum_sq_from_counts(
+    missing: usize,
+    het: usize,
+    hom_alt: usize,
+    n_samples: usize,
+    flip: bool,
+) -> (f64, f64) {
+    let non_missing = n_samples.saturating_sub(missing);
+    let ref_hom = non_missing.saturating_sub(het).saturating_sub(hom_alt);
+    if flip {
+        (
+            (het.saturating_add(ref_hom.saturating_mul(2))) as f64,
+            (het.saturating_add(ref_hom.saturating_mul(4))) as f64,
+        )
+    } else {
+        (
+            (het.saturating_add(hom_alt.saturating_mul(2))) as f64,
+            (het.saturating_add(hom_alt.saturating_mul(4))) as f64,
+        )
+    }
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    packed,
+    n_samples,
+    row_flip,
+    threads=0
+))]
+pub fn bed_packed_empirical_stats_f64<'py>(
+    py: Python<'py>,
+    packed: PyReadonlyArray2<'py, u8>,
+    n_samples: usize,
+    row_flip: PyReadonlyArray1<'py, bool>,
+    threads: usize,
+) -> PyResult<(Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>)> {
+    let packed_arr = packed.as_array();
+    if packed_arr.ndim() != 2 {
+        return Err(PyRuntimeError::new_err(
+            "packed must be 2D (m, bytes_per_snp)",
+        ));
+    }
+    if n_samples == 0 {
+        return Err(PyRuntimeError::new_err("n_samples must be > 0"));
+    }
+    let m = packed_arr.shape()[0];
+    let bytes_per_snp = packed_arr.shape()[1];
+    let expected_bps = (n_samples + 3) / 4;
+    if bytes_per_snp != expected_bps {
+        return Err(PyRuntimeError::new_err(format!(
+            "packed second dimension mismatch: got {bytes_per_snp}, expected {expected_bps} for n_samples={n_samples}"
+        )));
+    }
+    let row_flip_vec: Cow<[bool]> = match row_flip.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(row_flip.as_array().iter().copied().collect()),
+    };
+    if row_flip_vec.len() != m {
+        return Err(PyRuntimeError::new_err(format!(
+            "row_flip length mismatch: got {}, expected {m}",
+            row_flip_vec.len()
+        )));
+    }
+    let packed_flat: Cow<[u8]> = match packed.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(packed_arr.iter().copied().collect()),
+    };
+    let pool = get_cached_pool(threads)?;
+    let (sum_rows, sq_sum_rows) = py
+        .detach(|| -> Result<_, String> {
+            let mut sum_rows = vec![0.0_f64; m];
+            let mut sq_sum_rows = vec![0.0_f64; m];
+            let mut run = || {
+                sum_rows
+                    .par_iter_mut()
+                    .zip(sq_sum_rows.par_iter_mut())
+                    .enumerate()
+                    .for_each(|(row_idx, (sum_dst, sq_dst))| {
+                        let row =
+                            &packed_flat[row_idx * bytes_per_snp..(row_idx + 1) * bytes_per_snp];
+                        let (missing, het, hom_alt) = count_packed_row_counts(row, n_samples);
+                        let (sum_x, sum_x2) = packed_row_sum_sq_from_counts(
+                            missing,
+                            het,
+                            hom_alt,
+                            n_samples,
+                            row_flip_vec[row_idx],
+                        );
+                        *sum_dst = sum_x;
+                        *sq_dst = sum_x2;
+                    });
+            };
+            if let Some(tp) = &pool {
+                tp.install(run);
+            } else {
+                run();
+            }
+            Ok((sum_rows, sq_sum_rows))
+        })
+        .map_err(map_err_string_to_py)?;
+    let sum_arr = PyArray1::from_owned_array(py, Array1::from_vec(sum_rows)).into_bound();
+    let sq_arr = PyArray1::from_owned_array(py, Array1::from_vec(sq_sum_rows)).into_bound();
+    Ok((sum_arr, sq_arr))
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    source_prefix,
+    row_source_indices,
+    row_flip,
+    mmap_window_mb=0,
+    threads=0
+))]
+pub fn bed_stream_empirical_stats_f64<'py>(
+    py: Python<'py>,
+    source_prefix: String,
+    row_source_indices: PyReadonlyArray1<'py, i64>,
+    row_flip: PyReadonlyArray1<'py, bool>,
+    mmap_window_mb: usize,
+    threads: usize,
+) -> PyResult<(Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>)> {
+    if source_prefix.trim().is_empty() {
+        return Err(PyRuntimeError::new_err("source_prefix must not be empty"));
+    }
+    let n_samples = gfcore::read_fam(&source_prefix)
+        .map_err(PyRuntimeError::new_err)?
+        .len();
+    if n_samples == 0 {
+        return Err(PyRuntimeError::new_err(
+            "bed_stream_empirical_stats_f64 found zero samples in source_prefix.fam",
+        ));
+    }
+    let row_source_idx: Vec<usize> = row_source_indices
+        .as_slice()?
+        .iter()
+        .enumerate()
+        .map(|(i, &raw)| {
+            if raw < 0 {
+                Err(PyRuntimeError::new_err(format!(
+                    "row_source_indices[{i}] must be >= 0, got {raw}"
+                )))
+            } else {
+                Ok(raw as usize)
+            }
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    let eff_m = row_source_idx.len();
+    if eff_m == 0 {
+        return Err(PyRuntimeError::new_err(
+            "row_source_indices must not be empty",
+        ));
+    }
+    let row_flip_vec: Cow<[bool]> = match row_flip.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(row_flip.as_array().iter().copied().collect()),
+    };
+    if row_flip_vec.len() != eff_m {
+        return Err(PyRuntimeError::new_err(format!(
+            "row_flip length mismatch: got {}, expected {eff_m}",
+            row_flip_vec.len()
+        )));
+    }
+    let bytes_per_snp = (n_samples + 3) / 4;
+    let block_rows = 2048usize.min(eff_m.max(1));
+    let target_window_mb = if mmap_window_mb > 0 {
+        mmap_window_mb
+    } else {
+        ((block_rows
+            .saturating_mul(bytes_per_snp)
+            .saturating_add(1024 * 1024 - 1))
+            / (1024 * 1024))
+            .max(1)
+    };
+    let pool = get_cached_pool(threads)?;
+    let (sum_rows, sq_sum_rows) = py
+        .detach(|| -> Result<_, String> {
+            let mut matrix = WindowedBedMatrix::open(&source_prefix, target_window_mb)?;
+            let mut rel_indices = Vec::<usize>::with_capacity(block_rows);
+            let mut sum_rows = vec![0.0_f64; eff_m];
+            let mut sq_sum_rows = vec![0.0_f64; eff_m];
+            for row_start in (0..eff_m).step_by(block_rows) {
+                let row_end = (row_start + block_rows).min(eff_m);
+                let cur_rows = row_end - row_start;
+                let packed_slice = matrix
+                    .prepare_source_rows(&row_source_idx[row_start..row_end], &mut rel_indices)?;
+                let mut run = || {
+                    sum_rows[row_start..row_end]
+                        .par_iter_mut()
+                        .zip(sq_sum_rows[row_start..row_end].par_iter_mut())
+                        .enumerate()
+                        .for_each(|(local_row, (sum_dst, sq_dst))| {
+                            let rel_row = rel_indices[local_row];
+                            let row = &packed_slice
+                                [rel_row * bytes_per_snp..(rel_row + 1) * bytes_per_snp];
+                            let (missing, het, hom_alt) = count_packed_row_counts(row, n_samples);
+                            let (sum_x, sum_x2) = packed_row_sum_sq_from_counts(
+                                missing,
+                                het,
+                                hom_alt,
+                                n_samples,
+                                row_flip_vec[row_start + local_row],
+                            );
+                            *sum_dst = sum_x;
+                            *sq_dst = sum_x2;
+                        });
+                };
+                if let Some(tp) = &pool {
+                    tp.install(run);
+                } else {
+                    run();
+                }
+                if cur_rows >= block_rows.saturating_mul(64).max(1) {
+                    check_ctrlc()?;
+                }
+            }
+            Ok((sum_rows, sq_sum_rows))
+        })
+        .map_err(map_err_string_to_py)?;
+    let sum_arr = PyArray1::from_owned_array(py, Array1::from_vec(sum_rows)).into_bound();
+    let sq_arr = PyArray1::from_owned_array(py, Array1::from_vec(sq_sum_rows)).into_bound();
+    Ok((sum_arr, sq_arr))
 }
 
 #[pyfunction]

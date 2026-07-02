@@ -1399,7 +1399,10 @@ fn rrblupc_subset_or_validate_stats(
             full
         }
     } else {
-        maf_keep.iter().map(|&p| 2.0_f32 * p.clamp(0.0, 0.5)).collect()
+        maf_keep
+            .iter()
+            .map(|&p| 2.0_f32 * p.clamp(0.0, 0.5))
+            .collect()
     };
     if row_mean.len() != eff_m {
         return Err(format!(

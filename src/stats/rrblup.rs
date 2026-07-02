@@ -388,6 +388,11 @@ fn row_major_row_sumsq_f64(row: &[f32]) -> f64 {
 }
 
 #[inline]
+fn row_major_row_sum_f64(row: &[f32]) -> f64 {
+    row.iter().map(|&v| v as f64).sum::<f64>()
+}
+
+#[inline]
 fn row_major_block_prepare_rhs_diag_f32(
     block: &[f32],
     rows: usize,
@@ -396,12 +401,14 @@ fn row_major_block_prepare_rhs_diag_f32(
     lambda_use: f32,
     b_out: &mut [f32],
     diag_inv_out: &mut [f32],
+    train_row_mean_out: &mut [f32],
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> f64 {
     debug_assert_eq!(block.len(), rows.saturating_mul(cols));
     debug_assert!(dot_blk.len() >= rows);
     debug_assert!(b_out.len() >= rows);
     debug_assert!(diag_inv_out.len() >= rows);
+    debug_assert!(train_row_mean_out.len() >= rows);
 
     if prefer_parallel_block_vec(rows, cols, pool) {
         let mut run = || {
@@ -411,11 +418,16 @@ fn row_major_block_prepare_rhs_diag_f32(
                 .zip(
                     b_out[..rows]
                         .par_iter_mut()
-                        .zip(diag_inv_out[..rows].par_iter_mut()),
+                        .zip(diag_inv_out[..rows].par_iter_mut())
+                        .zip(train_row_mean_out[..rows].par_iter_mut()),
                 )
-                .map(|((row, dot), (b_slot, diag_slot))| {
-                    let ss = row_major_row_sumsq_f64(row);
+                .map(|((row, dot), ((b_slot, diag_slot), mean_slot))| {
+                    let sum = row_major_row_sum_f64(row);
+                    let mean = sum / (cols as f64);
+                    let ss_raw = row_major_row_sumsq_f64(row);
+                    let ss = (ss_raw - (cols as f64) * mean * mean).max(0.0_f64);
                     *b_slot = *dot;
+                    *mean_slot = mean as f32;
                     let d = ((ss as f32) + lambda_use).max(1e-12_f32);
                     *diag_slot = 1.0_f32 / d;
                     ss
@@ -431,9 +443,13 @@ fn row_major_block_prepare_rhs_diag_f32(
     let mut sum_ss = 0.0_f64;
     for r in 0..rows {
         let row = &block[r * cols..(r + 1) * cols];
-        let ss = row_major_row_sumsq_f64(row);
+        let sum = row_major_row_sum_f64(row);
+        let mean = sum / (cols as f64);
+        let ss_raw = row_major_row_sumsq_f64(row);
+        let ss = (ss_raw - (cols as f64) * mean * mean).max(0.0_f64);
         sum_ss += ss;
         b_out[r] = dot_blk[r];
+        train_row_mean_out[r] = mean as f32;
         let d = ((ss as f32) + lambda_use).max(1e-12_f32);
         diag_inv_out[r] = 1.0_f32 / d;
     }
@@ -645,12 +661,13 @@ fn rrblup_prepare_rhs_diag(
     lambda_use: f32,
     code4_lut: &[[u8; 4]; 256],
     pool: Option<&Arc<rayon::ThreadPool>>,
-) -> Result<(Vec<f32>, Vec<f32>, f64, f64, f64, f64), String> {
+) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>, f64, f64, f64, f64), String> {
     let m = row_flip.len();
     let n_train = sample_idx.len();
     let row_step = block_rows.max(1).min(m.max(1));
     let mut b = vec![0.0_f32; m];
     let mut diag_inv = vec![0.0_f32; m];
+    let mut train_row_mean = vec![0.0_f32; m];
     let mut sum_ss_global = 0.0_f64;
     let mut decode_acc = 0.0_f64;
     let mut rhs_acc = 0.0_f64;
@@ -738,6 +755,7 @@ fn rrblup_prepare_rhs_diag(
                     lambda_use,
                     &mut b[st..ed],
                     &mut diag_inv[st..ed],
+                    &mut train_row_mean[st..ed],
                     pool,
                 );
                 diag_acc += t_diag.elapsed().as_secs_f64();
@@ -792,6 +810,7 @@ fn rrblup_prepare_rhs_diag(
                 lambda_use,
                 &mut b[st..ed],
                 &mut diag_inv[st..ed],
+                &mut train_row_mean[st..ed],
                 pool,
             );
             diag_acc += t_diag.elapsed().as_secs_f64();
@@ -803,15 +822,25 @@ fn rrblup_prepare_rhs_diag(
         }
     }
 
-    Ok((b, diag_inv, sum_ss_global, decode_acc, rhs_acc, diag_acc))
+    Ok((
+        b,
+        diag_inv,
+        train_row_mean,
+        sum_ss_global,
+        decode_acc,
+        rhs_acc,
+        diag_acc,
+    ))
 }
 
 struct RrblupPcgOperator<'a> {
     source: RrblupPcgSource<'a>,
     n_samples: usize,
+    n_train: usize,
     row_flip: &'a [bool],
     row_mean: &'a [f32],
     row_inv_sd: &'a [f32],
+    train_row_mean: &'a [f32],
     sample_idx: &'a [usize],
     full_sample_fast: bool,
     packed_row_indices: Option<&'a [usize]>,
@@ -865,14 +894,25 @@ impl PcgOperator<f32> for RrblupPcgOperator<'_> {
                 None
             },
         )?;
+        let mean_dot = self
+            .train_row_mean
+            .iter()
+            .zip(input.iter())
+            .map(|(mu, pj)| (*mu as f64) * (*pj as f64))
+            .sum::<f64>() as f32;
         if let Some(tp) = self.pool {
             tp.install(|| {
                 ap.par_iter_mut()
                     .zip(input.par_iter())
-                    .for_each(|(apj, pj)| *apj += self.lambda_use * *pj);
+                    .zip(self.train_row_mean.par_iter())
+                    .for_each(|((apj, pj), mu)| {
+                        *apj -= (self.n_train as f32) * *mu * mean_dot;
+                        *apj += self.lambda_use * *pj;
+                    });
             });
         } else {
             for j in 0..ap.len() {
+                ap[j] -= (self.n_train as f32) * self.train_row_mean[j] * mean_dot;
                 ap[j] += self.lambda_use * input[j];
             }
         }
@@ -1406,6 +1446,7 @@ struct RrblupExactSnpPreparedInner {
     row_flip: Vec<bool>,
     row_mean: Vec<f32>,
     row_inv_sd: Vec<f32>,
+    train_row_mean: Vec<f32>,
     eigvals: Vec<f64>,
     evecs: Vec<f64>, // row-major (m, rank)
     eig_backend: String,
@@ -1746,6 +1787,10 @@ fn build_rrblup_exact_snp_cache_from_source(
         None
     };
     let center_scale = 1.0_f64 / (n_train as f64);
+    let train_row_mean: Vec<f32> = row_sum
+        .iter()
+        .map(|v| (*v / (n_train as f64)) as f32)
+        .collect();
     symmetrize_upper_minus_rank1_in_place(&mut a_star, eff_m, &row_sum, center_scale);
     drop(row_sum);
     let center_secs = t_center
@@ -1845,6 +1890,7 @@ fn build_rrblup_exact_snp_cache_from_source(
         row_flip: row_flip_keep,
         row_mean,
         row_inv_sd,
+        train_row_mean,
         eigvals,
         evecs,
         eig_backend: eig_backend.to_string(),
@@ -2183,6 +2229,13 @@ fn fit_rrblup_exact_snp_from_cache_source(
         .unwrap_or(0.0_f64);
     let beta_f32: Vec<f32> = beta_f64.iter().map(|&v| v as f32).collect();
     drop(beta_f64);
+    let alpha_use = y_mean
+        - cache
+            .train_row_mean
+            .iter()
+            .zip(beta_f32.iter())
+            .map(|(mu, beta)| (*mu as f64) * (*beta as f64))
+            .sum::<f64>();
     let var_g = if cache.n_train > 1 {
         g_center_ss / ((cache.n_train - 1) as f64)
     } else {
@@ -2245,7 +2298,7 @@ fn fit_rrblup_exact_snp_from_cache_source(
             )?;
             pred_train_subset
                 .into_iter()
-                .map(|v| (v as f64) + y_mean)
+                .map(|v| (v as f64) + alpha_use)
                 .collect()
         }
     } else {
@@ -2279,7 +2332,7 @@ fn fit_rrblup_exact_snp_from_cache_source(
         )?;
         pred_train_full
             .into_iter()
-            .map(|v| (v as f64) + y_mean)
+            .map(|v| (v as f64) + alpha_use)
             .collect()
     };
     let pred_train_secs = t_pred_train
@@ -2321,7 +2374,10 @@ fn fit_rrblup_exact_snp_from_cache_source(
             pool_ref,
             None,
         )?;
-        pred_test_ret = pred_test_f32.iter().map(|v| (*v as f64) + y_mean).collect();
+        pred_test_ret = pred_test_f32
+            .iter()
+            .map(|v| (*v as f64) + alpha_use)
+            .collect();
     }
     let pred_test_secs = t_pred_test
         .map(|t0| t0.elapsed().as_secs_f64())
@@ -3874,6 +3930,7 @@ pub fn rrblup_pcg_bed<'py>(
                 let (
                     b,
                     diag_inv,
+                    train_row_mean,
                     sum_ss_global,
                     prep_decode_secs,
                     prep_rhs_secs,
@@ -3923,9 +3980,11 @@ pub fn rrblup_pcg_bed<'py>(
                         row_step,
                     )?,
                     n_samples,
+                    n_train,
                     row_flip: row_flip_keep.as_ref(),
                     row_mean: &row_mean,
                     row_inv_sd: &row_inv_sd,
+                    train_row_mean: &train_row_mean,
                     sample_idx: &train_idx,
                     full_sample_fast: full_train_fast,
                     packed_row_indices: packed_row_indices.as_deref(),
@@ -4005,6 +4064,12 @@ pub fn rrblup_pcg_bed<'py>(
                     },
                 )?;
                 let beta = pcg_res.x;
+                let alpha_use = (y_mean as f32)
+                    - train_row_mean
+                        .iter()
+                        .zip(beta.iter())
+                        .map(|(mu, bj)| *mu * *bj)
+                        .sum::<f32>();
                 let converged = pcg_res.converged;
                 let iters_done = pcg_res.iters;
                 let rel_res = pcg_res.rel_res;
@@ -4066,7 +4131,7 @@ pub fn rrblup_pcg_bed<'py>(
                         None,
                     )?;
                     for v in pred_train_full.iter_mut() {
-                        *v += y_mean as f32;
+                        *v += alpha_use;
                     }
                     let pred_train_f64: Vec<f64> =
                         pred_train_full.iter().map(|v| *v as f64).collect();
@@ -4136,7 +4201,7 @@ pub fn rrblup_pcg_bed<'py>(
                                 None,
                             )?;
                             for v in &mut pred_train_sub {
-                                *v += y_mean as f32;
+                                *v += alpha_use;
                             }
                             pred_train_ret =
                                 pred_train_sub.iter().map(|v| *v as f64).collect();
@@ -4189,7 +4254,7 @@ pub fn rrblup_pcg_bed<'py>(
                     )?;
                     pred_test_ret = test_pred_f32
                         .iter()
-                        .map(|v| (*v as f64) + y_mean)
+                        .map(|v| (*v as f64) + (alpha_use as f64))
                         .collect();
                 }
 
@@ -4301,6 +4366,7 @@ mod tests {
 
         let mut b_serial = vec![0.0_f32; rows];
         let mut diag_serial = vec![0.0_f32; rows];
+        let mut mean_serial = vec![0.0_f32; rows];
         let ss_serial = row_major_block_prepare_rhs_diag_f32(
             &block,
             rows,
@@ -4309,6 +4375,7 @@ mod tests {
             lambda_use,
             &mut b_serial,
             &mut diag_serial,
+            &mut mean_serial,
             None,
         );
 
@@ -4320,6 +4387,7 @@ mod tests {
         );
         let mut b_parallel = vec![0.0_f32; rows];
         let mut diag_parallel = vec![0.0_f32; rows];
+        let mut mean_parallel = vec![0.0_f32; rows];
         let ss_parallel = row_major_block_prepare_rhs_diag_f32(
             &block,
             rows,
@@ -4328,12 +4396,14 @@ mod tests {
             lambda_use,
             &mut b_parallel,
             &mut diag_parallel,
+            &mut mean_parallel,
             Some(&pool),
         );
 
         assert!((ss_serial - ss_parallel).abs() <= 1e-6_f64 * ss_serial.abs().max(1.0));
         assert!(max_abs_diff(&b_serial, &b_parallel) <= 1e-6_f32);
         assert!(max_abs_diff(&diag_serial, &diag_parallel) <= 1e-6_f32);
+        assert!(max_abs_diff(&mean_serial, &mean_parallel) <= 1e-6_f32);
     }
 
     #[test]

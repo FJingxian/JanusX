@@ -24,6 +24,26 @@ os.environ.setdefault("MATURIN_NO_MISSING_BUILD_BACKEND_WARNING", "1")
 _MATURIN = importlib.import_module("maturin")
 
 
+def _filter_optional_linux_build_requires(requires: list[str]) -> list[str]:
+    # Linux wheel builds in this project are repaired later with auditwheel, so
+    # `patchelf` must not be treated as a hard PEP517 build dependency.
+    if not sys.platform.startswith("linux"):
+        return requires
+    filtered: list[str] = []
+    skipped = False
+    for req in requires:
+        if str(req).strip().lower().startswith("patchelf"):
+            skipped = True
+            continue
+        filtered.append(req)
+    if skipped:
+        print(
+            "[build-backend] linux build: skipping optional `patchelf` PEP517 dependency.",
+            flush=True,
+        )
+    return filtered
+
+
 def _prepend_path_entry(path_entry: str) -> None:
     entry = str(path_entry).strip()
     if not entry:
@@ -638,7 +658,9 @@ def _inject_artifacts_into_wheel(
 
 
 def get_requires_for_build_wheel(config_settings: dict[str, Any] | None = None) -> list[str]:
-    return _MATURIN.get_requires_for_build_wheel(config_settings)
+    return _filter_optional_linux_build_requires(
+        list(_MATURIN.get_requires_for_build_wheel(config_settings))
+    )
 
 
 def get_requires_for_build_sdist(config_settings: dict[str, Any] | None = None) -> list[str]:
@@ -656,7 +678,7 @@ def get_requires_for_build_editable(config_settings: dict[str, Any] | None = Non
     fn = getattr(_MATURIN, "get_requires_for_build_editable", None)
     if fn is None:
         return get_requires_for_build_wheel(config_settings)
-    return fn(config_settings)
+    return _filter_optional_linux_build_requires(list(fn(config_settings)))
 
 
 def prepare_metadata_for_build_editable(

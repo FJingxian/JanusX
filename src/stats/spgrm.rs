@@ -336,7 +336,7 @@ fn spgrm_resolve_stream_memory_plan(
     decode_buffers: usize,
 ) -> SpgrmMemoryPlan {
     let decode_target_mb = spgrm_decode_target_mb();
-    let sample_step = spgrm_auto_sample_block_with_budget(
+    let sample_step = spgrm_auto_stream_sample_block_with_budget(
         n_use,
         m,
         requested_sample_step,
@@ -547,6 +547,40 @@ fn spgrm_auto_sample_block_with_budget(
         return heuristic.min(by_budget.max(1).min(n_use.max(1)));
     }
     heuristic
+}
+
+#[inline]
+fn spgrm_auto_stream_sample_block_with_budget(
+    n_use: usize,
+    m: usize,
+    requested: usize,
+    decode_target_mb: Option<f64>,
+    decode_buffers: usize,
+) -> usize {
+    if requested > 0 {
+        return requested.max(1).min(n_use.max(1));
+    }
+    if let Some(target_mb) = decode_target_mb {
+        let min_row_step = SPGRM_DEFAULT_SNP_BLOCK_ROWS.min(m.max(1)).max(1);
+        let per_sample_decode_bytes = min_row_step
+            .saturating_mul(SPGRM_DECODE_STRIPE_ESTIMATE)
+            .saturating_mul(std::mem::size_of::<f32>())
+            .max(1);
+        let by_budget = block_rows_from_memory_target_mb(
+            target_mb,
+            per_sample_decode_bytes,
+            n_use.max(1),
+            1,
+            decode_buffers.max(1),
+            0,
+        );
+        // Stream batches keep decoded stripes in a shared batch buffer instead of
+        // per-worker scratch, so they can safely spend the full decode budget on
+        // wider sample tiles. This avoids over-fragmenting the sample axis into
+        // many column groups and repeatedly re-decoding the same SNP blocks.
+        return by_budget.max(1).min(n_use.max(1));
+    }
+    spgrm_sample_block(n_use, 0usize)
 }
 
 #[inline]
@@ -3552,6 +3586,7 @@ pub fn spgrm_bed_to_jxgrm_core(
                 sample_idx,
                 true,
                 mmap_window_mb,
+                threads.max(1),
             )?
         }
     } else {
@@ -3564,6 +3599,7 @@ pub fn spgrm_bed_to_jxgrm_core(
             sample_idx,
             true,
             mmap_window_mb,
+            threads.max(1),
         )?
     };
     let selected_idx: Cow<'_, [usize]> = match sample_idx {
@@ -4499,6 +4535,31 @@ mod tests {
         let _ = std::fs::remove_file(path_full);
         let _ = std::fs::remove_file(path_window);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn spgrm_stream_auto_sample_block_uses_full_decode_budget() {
+        let sample_step = spgrm_auto_stream_sample_block_with_budget(
+            5_000usize,
+            997_897usize,
+            0usize,
+            Some(153.0),
+            2usize,
+        );
+        assert_eq!(sample_step, 2_448usize);
+        assert!(sample_step > SPGRM_DEFAULT_SAMPLE_BLOCK);
+    }
+
+    #[test]
+    fn spgrm_packed_auto_sample_block_remains_capped_by_worker_scratch_budget() {
+        let sample_step = spgrm_auto_sample_block_with_budget(
+            5_000usize,
+            997_897usize,
+            0usize,
+            Some(153.0),
+            2usize,
+        );
+        assert_eq!(sample_step, SPGRM_DEFAULT_SAMPLE_BLOCK);
     }
 
     #[test]

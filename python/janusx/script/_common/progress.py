@@ -57,8 +57,8 @@ except Exception:
     _HAS_TQDM = False
 
 _SPINNER_NAME = "dots"
-_SPINNER_FRAMES = ["/", "-", "\\", "|"]
-_SPINNER_REFRESH_SEC = 0.1
+_SPINNER_FRAMES = [".  ", ".. ", "...", " ..", "  .", " . "]
+_SPINNER_REFRESH_SEC = 0.2
 _SPINNER_FALLBACKS = ("dots", "simpleDots", "line", "bouncingBar")
 _GREEN = "\033[32m"
 _YELLOW = "\033[33m"
@@ -302,6 +302,10 @@ def spinner_refresh_interval(seconds: Optional[float]) -> float:
     _ = seconds
     # Keep spinner animation cadence independent from elapsed-time formatting.
     return float(_SPINNER_REFRESH_SEC)
+
+
+def plain_spinner_frames() -> tuple[str, ...]:
+    return tuple(str(frame) for frame in _SPINNER_FRAMES)
 
 
 def ensure_rich_spinner_registered() -> None:
@@ -882,6 +886,40 @@ class MaybeHiddenBarColumn(BarColumn):
         return super().render(task)
 
 
+class FixedRateSpinnerColumn(SpinnerColumn):
+    """Spinner column with a fixed wall-clock animation cadence."""
+
+    def __init__(
+        self,
+        *,
+        frame_interval_sec: float,
+        spinner_name: str = "dots",
+        style: str | None = "progress.spinner",
+        finished_text: str | object = " ",
+    ) -> None:
+        super().__init__(
+            spinner_name=str(spinner_name),
+            style=style,
+            speed=1.0,
+            finished_text=finished_text,
+        )
+        self._frame_interval_sec = max(0.01, float(frame_interval_sec))
+        self._anim_start: float | None = None
+
+    def render(self, task: "Task"):  # type: ignore[override]
+        if task.finished:
+            return self.finished_text
+        if self._anim_start is None:
+            self._anim_start = monotonic()
+        elapsed = max(0.0, monotonic() - self._anim_start)
+        frames = list(getattr(self.spinner, "frames", ()) or ["."])
+        idx = int(elapsed / self._frame_interval_sec) % len(frames)
+        frame = frames[idx]
+        if Text is None:
+            return str(frame)
+        return Text(str(frame), style=self.spinner.style or "")
+
+
 def build_rich_progress(
     *,
     description_template: str = "[green]{task.description}",
@@ -906,13 +944,15 @@ def build_rich_progress(
     if show_spinner:
         spinner_name = get_rich_spinner_name()
         try:
-            spinner_col = SpinnerColumn(
+            spinner_col = FixedRateSpinnerColumn(
+                frame_interval_sec=_SPINNER_REFRESH_SEC,
                 spinner_name=spinner_name,
                 style="cyan",
                 finished_text=str(finished_text),
             )
         except Exception:
-            spinner_col = SpinnerColumn(
+            spinner_col = FixedRateSpinnerColumn(
+                frame_interval_sec=_SPINNER_REFRESH_SEC,
                 spinner_name="dots",
                 style="cyan",
                 finished_text=str(finished_text),
@@ -938,7 +978,12 @@ def build_rich_progress(
         columns.append(TimeRemainingColumn())
     for template in (field_templates or []):
         columns.append(TextColumn(str(template)))
-    return Progress(*columns, transient=bool(transient))
+    return Progress(
+        *columns,
+        auto_refresh=True,
+        refresh_per_second=max(1.0, 1.0 / _SPINNER_REFRESH_SEC),
+        transient=bool(transient),
+    )
 
 
 class SpinnerStatusAdapter:
@@ -1238,6 +1283,7 @@ __all__ = [
     "print_skipped",
     "print_success",
     "print_warning",
+    "plain_spinner_frames",
     "rich_progress_available",
     "running_status_text",
     "should_animate_status",

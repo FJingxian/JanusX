@@ -282,7 +282,7 @@ def _run_subprocess_checked(
             if math.isfinite(peak_mb):
                 extra = f", peak_rss={peak_mb:.1f}MB"
             raise RuntimeError(
-                f"{label} failed: memory limit exceeded ({limit_gb:.3f}GB){extra}.\n"
+                f"{label} failed: memory limit exceeded ({limit_gb:.2f}GB){extra}.\n"
                 f"Command: {' '.join(shlex.quote(x) for x in cmd)}"
             )
         return subprocess.CompletedProcess(args=cmd, returncode=rc, stdout=out, stderr=err)
@@ -345,7 +345,7 @@ def _run_waster_tree_pipeline(
 
     print(
         f"Running WASTER workflow: mode={int(waster_mode)}, inputs={len(input_files)}, "
-        f"threads={int(threads)}, limit_mem_gb={float(limit_mem_gb):.1f}",
+        f"threads={int(threads)}, limit_mem_gb={float(limit_mem_gb):.2f}",
         flush=True,
     )
     print(
@@ -751,7 +751,7 @@ def main() -> int:
         t0 = time.monotonic()
         logger.info(
             f"Running KMC count: inputs={len(input_files)}, k={int(args.kmer_len)}, "
-            f"threads={threads}, limit_mem_gb={float(args.limit_mem_gb):.3g}, input_type={input_type}"
+            f"threads={threads}, limit_mem_gb={float(args.limit_mem_gb):.2f}, input_type={input_type}"
         )
 
         if use_spinner:

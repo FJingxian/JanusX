@@ -148,10 +148,26 @@ def _is_path_like_key(key: str) -> bool:
     return any(m in k for m in markers)
 
 
+def _is_memory_budget_key(key: str) -> bool:
+    k = str(key).strip().lower()
+    if k == "memory":
+        return True
+    if "memory budget" in k or "memory limit" in k:
+        return True
+    if "limit_mem_gb" in k or "mem_gb" in k:
+        return True
+    return ("memory" in k) and ("gb" in k)
+
+
 def _format_config_value_for_display(key: str, value: object) -> str:
-    s = str(value)
     if _is_path_like_key(key):
-        return format_path_for_display(s)
+        return format_path_for_display(str(value))
+    if _is_memory_budget_key(key) and isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            return f"{float(value):.2f}"
+        except Exception:
+            pass
+    s = str(value)
     return s
 
 

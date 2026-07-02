@@ -4429,7 +4429,7 @@ def _format_gwas_memory_cfg(
     if memory_gb is None:
         return "auto (route-aware)"
     suffix = " (auto)" if bool(auto_requested) else ""
-    return f"{float(memory_gb):.6g} GB{suffix}"
+    return f"{float(memory_gb):.2f} GB{suffix}"
 
 
 def _resolve_gwas_auto_decode_memory_gb(
@@ -6419,7 +6419,7 @@ def _run_gwas_pipeline(
         args._memory_auto_reason = str(auto_memory_reason)
         auto_memory_msg = (
             "GWAS decode memory auto: "
-            f"{float(args.memory):.6g} GB "
+            f"{float(args.memory):.2f} GB "
             f"(reason: {str(auto_memory_reason).strip() or 'route-aware default'}). "
             "Override with -mem/--memory to keep a fixed working-memory budget."
         )

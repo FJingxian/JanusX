@@ -80,7 +80,14 @@ from ._common.pathcheck import (
     ensure_plink_prefix_exists,
     format_path_for_display,
 )
-from ._common.progress import CliStatus, ProgressAdapter, format_elapsed, log_success, stdout_is_tty
+from ._common.progress import (
+    CliStatus,
+    ProgressAdapter,
+    format_elapsed,
+    log_success,
+    plain_spinner_frames,
+    stdout_is_tty,
+)
 from ._common.genocache import configure_genotype_cache_from_out
 from ._common.genoio import (
     determine_genotype_source as _determine_genotype_source,
@@ -684,8 +691,7 @@ def _use_rsvd_subprocess() -> bool:
 
 
 def _algo_spinner_symbol(elapsed_s: float) -> str:
-    # Keep the first frame as "\" on Windows for consistency with prior UX.
-    frames = ("\\", "|", "/", "-") if os.name == "nt" else ("/", "-", "\\", "|")
+    frames = plain_spinner_frames()
     idx = int(max(0.0, float(elapsed_s)) * 10.0) % len(frames)
     return frames[idx]
 

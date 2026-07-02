@@ -265,7 +265,17 @@ def _format_grm_memory_cfg(
     if memory_gb is None:
         return "auto (route-aware; pending inspect)"
     suffix = " (auto)" if bool(auto_requested and resolved) else ""
-    return f"{float(memory_gb):.6g} GB{suffix}"
+    return f"{float(memory_gb):.2f} GB{suffix}"
+
+
+def _format_memory_budget_gb(memory_gb: Union[int, float, None]) -> str:
+    if memory_gb is None:
+        return "default"
+    return f"{float(memory_gb):.2f}"
+
+
+def _format_memory_budget_mb(memory_mb: Union[int, float]) -> str:
+    return f"{float(memory_mb):.2f}"
 
 
 def _emit_grm_configuration(
@@ -1087,6 +1097,7 @@ def build_sparse_grm_packed_bed(
     threads: int,
     block_target_mb: Union[float, None],
     stage_timing: bool,
+    verbose: bool,
     logger,
 ) -> tuple[str, int, int]:
     if _spgrm_bed_to_jxgrm is None:
@@ -1094,15 +1105,27 @@ def build_sparse_grm_packed_bed(
             "Sparse GRM BED kernel is unavailable. Rebuild JanusX extension to export "
             "`spgrm_bed_to_jxgrm`."
         )
-    logger.info(
-        "Sparse GRM route selected stream-bed: "
-        f"n={n_samples}, m={n_snps}, sample-blocked sparse CSC writer."
+    _log_verbose_or_file_only(
+        logger,
+        verbose=bool(verbose),
+        msg=(
+            "Sparse GRM route selected stream-bed: "
+            f"n={n_samples}, m={n_snps}, sample-blocked sparse CSC writer."
+        ),
     )
-    logger.info(
-        "Sparse GRM decode budget: target_mem_gb=%s, mmap_window_mb=%s, "
-        "row/sample blocks resolved in Rust.",
-        ("default" if block_target_mb is None else f"{float(block_target_mb) / 1024.0:.3f}"),
-        ("auto" if mmap_window_mb is None else int(mmap_window_mb)),
+    _log_verbose_or_file_only(
+        logger,
+        verbose=bool(verbose),
+        msg=(
+            "Sparse GRM decode budget: target_mem_gb=%s, mmap_window_mb=%s, "
+            "row/sample blocks resolved in Rust."
+        ),
+        args=(
+            _format_memory_budget_gb(
+                None if block_target_mb is None else (float(block_target_mb) / 1024.0)
+            ),
+            ("auto" if mmap_window_mb is None else int(mmap_window_mb)),
+        ),
     )
     pbar = ProgressAdapter(
         total=1,
@@ -1180,6 +1203,7 @@ def build_sparse_grm_from_meta(
     mmap_window_mb: Union[int, None],
     threads: int,
     block_target_mb: Union[float, None],
+    verbose: bool,
     logger,
 ) -> tuple[str, int, int]:
     if _spgrm_bed_to_jxgrm_from_meta is None:
@@ -1210,15 +1234,27 @@ def build_sparse_grm_from_meta(
     if n_total_sites <= 0:
         raise RuntimeError("Sparse GRM meta route resolved invalid n_total_sites.")
 
-    logger.info(
-        "Sparse GRM route selected meta-stream: "
-        f"n={n_samples}, m={int(row_source_indices.shape[0])}, cached filter metadata + prepared BED decode."
+    _log_verbose_or_file_only(
+        logger,
+        verbose=bool(verbose),
+        msg=(
+            "Sparse GRM route selected meta-stream: "
+            f"n={n_samples}, m={int(row_source_indices.shape[0])}, cached filter metadata + prepared BED decode."
+        ),
     )
-    logger.info(
-        "Sparse GRM decode budget: target_mem_gb=%s, mmap_window_mb=%s, "
-        "row/sample blocks resolved in Rust.",
-        ("default" if block_target_mb is None else f"{float(block_target_mb) / 1024.0:.3f}"),
-        int(mmap_window_mb_resolved),
+    _log_verbose_or_file_only(
+        logger,
+        verbose=bool(verbose),
+        msg=(
+            "Sparse GRM decode budget: target_mem_gb=%s, mmap_window_mb=%s, "
+            "row/sample blocks resolved in Rust."
+        ),
+        args=(
+            _format_memory_budget_gb(
+                None if block_target_mb is None else (float(block_target_mb) / 1024.0)
+            ),
+            int(mmap_window_mb_resolved),
+        ),
     )
     pbar = ProgressAdapter(
         total=max(1, int(row_source_indices.shape[0])),
@@ -1706,7 +1742,7 @@ def main(log: bool = True):
             verbose=bool(getattr(args, "verbose", False)),
             msg=(
                 "GRM decode memory auto: "
-                f"{float(args.memory):.6g} GB "
+                f"{float(args.memory):.2f} GB "
                 f"(reason: {str(auto_memory_reason).strip() or 'route-aware default'}). "
                 "Override with -mem/--memory to keep a fixed working-memory budget."
             ),
@@ -1778,6 +1814,7 @@ def main(log: bool = True):
                 mmap_window_mb=mmap_window_mb,
                 threads=int(args.thread),
                 block_target_mb=memory_mb,
+                verbose=bool(getattr(args, "verbose", False)),
                 logger=logger,
             )
             sparse_meta_source = "bed_meta"
@@ -1802,6 +1839,7 @@ def main(log: bool = True):
                 threads=int(args.thread),
                 block_target_mb=memory_mb,
                 stage_timing=bool(args.stage_timing),
+                verbose=bool(getattr(args, "verbose", False)),
                 logger=logger,
             )
         _write_sparse_grm_meta(
@@ -1887,8 +1925,8 @@ def main(log: bool = True):
 
         if (grm is None) and (grm_path is None) and selected_backend == "memmap-bed":
             logger.info(
-                f"GRM memory target: {float(args.memory):.6g} GB "
-                f"({float(memory_mb):.6g} MB effective)."
+                f"GRM memory target: {float(args.memory):.2f} GB "
+                f"({_format_memory_budget_mb(memory_mb)} MB effective)."
             )
             if bool(args.stage_timing):
                 logger.info("Memmap GRM stage timing is enabled (decode/GEMM/other).")

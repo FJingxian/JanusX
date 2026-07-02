@@ -2422,7 +2422,7 @@ def _format_gs_memory_cfg(
     if memory_gb is None:
         return "auto (route-aware; pending inspect)"
     suffix = " (auto)" if bool(auto_requested and resolved) else ""
-    return f"{float(memory_gb):.6g} GB{suffix}"
+    return f"{float(memory_gb):.2f} GB{suffix}"
 
 
 def _estimate_gs_train_size_for_dispatch(
@@ -2806,7 +2806,7 @@ def _attach_stream_decode_budget_to_packed_ctx(
     if debug and (logger is not None):
         logger.info(
             "[GS-DEBUG] packed decode budget "
-            f"memory_gb={float(_normalize_memory_gb(memory_gb)):.6g} "
+            f"memory_gb={float(_normalize_memory_gb(memory_gb)):.2f} "
             f"n_samples={n_samples} "
             f"gblup_reserve={_format_debug_bytes(int(gblup_reserve_bytes))} "
             f"gblup_block_rows={int(gblup_rows)} "
@@ -18408,14 +18408,15 @@ def parse_args(argv: typing.Optional[list[str]] = None):
     optional_group.add_argument(
         "-debug", "--debug",
         action="store_true",
+        dest="verbose",
         default=False,
-        help="Enable runtime debug logs (thread/runtime/model diagnostics).",
+        help=argparse.SUPPRESS,
     )
     optional_group.add_argument(
         "-v", "--verbose",
         action="store_true",
         default=False,
-        help="Show advanced backend and thread diagnostics.",
+        help="Show advanced backend, runtime, and model diagnostics.",
     )
     add_common_out_arg(
         optional_group,
@@ -18616,7 +18617,7 @@ def _run_gs_pipeline(
     use_spinner = stdout_is_tty()
     if args is None:
         args = parse_args(argv)
-    debug_mode = bool(getattr(args, "debug", False))
+    debug_mode = bool(getattr(args, "verbose", False))
     if bool(debug_mode):
         os.environ.setdefault("JX_GFREADER_RSS_DEBUG", "1")
         os.environ.setdefault("JX_GS_DEBUG_STAGE", "1")
@@ -19247,7 +19248,7 @@ def _run_gs_pipeline(
             args.memory = float(auto_memory_gb)
             auto_memory_msg = (
                 "GS decode memory auto: "
-                f"{float(args.memory):.6g} GB "
+                f"{float(args.memory):.2f} GB "
                 f"(reason: {str(auto_memory_reason).strip() or 'route-aware default'}). "
                 "Override with -mem/--memory to keep a fixed working-memory budget."
             )
@@ -20187,7 +20188,7 @@ def _run_gs_pipeline(
             if bool(debug_mode):
                 logger.info(
                     "[GS-DEBUG] rrBLUP-PCG decode budget "
-                    f"memory_gb={float(args.memory):.6g} "
+                    f"memory_gb={float(args.memory):.2f} "
                     f"n_samples={int(len(samples))} "
                     f"block_rows={int(rrblup_adamw_cfg['pcg_block_rows'])}"
                 )
@@ -20207,7 +20208,7 @@ def _run_gs_pipeline(
             if bool(debug_mode):
                 logger.info(
                     "[GS-DEBUG] rrBLUP exact-SNP stream decode budget "
-                    f"memory_gb={float(args.memory):.6g} "
+                    f"memory_gb={float(args.memory):.2f} "
                     f"n_samples={int(len(samples))} "
                     f"stream_row_block={int(rrblup_adamw_cfg['exact_stream_row_block'])}"
                 )
@@ -20223,7 +20224,7 @@ def _run_gs_pipeline(
             if bool(debug_mode):
                 logger.info(
                     "[GS-DEBUG] rrBLUP exact-SNP decode budget "
-                    f"memory_gb={float(args.memory):.6g} "
+                    f"memory_gb={float(args.memory):.2f} "
                     f"n_markers={int(active_m_rr)} "
                     f"sample_block={int(rrblup_adamw_cfg['exact_sample_block'])}"
                 )

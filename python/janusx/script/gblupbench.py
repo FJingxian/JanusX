@@ -515,8 +515,8 @@ def _run_timed(
                         lf.write(
                             (
                                 "\n[gblupbench] memory limit exceeded: "
-                                f"{float(rss_now) / 1024.0 / 1024.0:.6f} GB > "
-                                f"{float(limit_mem_gb):.6f} GB; killing process tree.\n"
+                                f"{float(rss_now) / 1024.0 / 1024.0:.2f} GB > "
+                                f"{float(limit_mem_gb):.2f} GB; killing process tree.\n"
                             )
                         )
                         lf.flush()
@@ -558,8 +558,8 @@ def _run_timed(
                 lf.write(
                     (
                         "\n[gblupbench] memory limit exceeded (post-check): "
-                        f"{float(rss) / 1024.0 / 1024.0:.6f} GB > "
-                        f"{float(limit_mem_gb):.6f} GB.\n"
+                        f"{float(rss) / 1024.0 / 1024.0:.2f} GB > "
+                        f"{float(limit_mem_gb):.2f} GB.\n"
                     )
                 )
         except Exception:
@@ -2759,7 +2759,7 @@ def _run_engine_janusx(
             if int(rc) != 0:
                 note = f"{method_name} fold={fd} failed (exit={int(rc)})."
                 if int(rc) == 137 and args.limit_mem is not None:
-                    note = f"{method_name} fold={fd} failed: memory limit exceeded ({float(args.limit_mem):g} GB)."
+                    note = f"{method_name} fold={fd} failed: memory limit exceeded ({float(args.limit_mem):.2f} GB)."
                 task.fail(note)
                 return _fail(note)
 
@@ -2925,7 +2925,7 @@ def _run_engine_r(
     if not note:
         note = f"engine failed (exit={rc})"
     if int(rc) == 137 and args.limit_mem is not None:
-        note = f"engine failed: memory limit exceeded ({float(args.limit_mem):g} GB)"
+        note = f"engine failed: memory limit exceeded ({float(args.limit_mem):.2f} GB)"
     run_task.fail(f"{str(engine).upper()} run failed: {note}")
     return EngineRunResult(
         engine=engine,
@@ -3024,7 +3024,7 @@ def _run_engine_hiblup(
             if rc != 0:
                 note = f"HIBLUP failed on fold {fd} (exit={rc})."
                 if int(rc) == 137 and args.limit_mem is not None:
-                    note = f"HIBLUP failed on fold {fd}: memory limit exceeded ({float(args.limit_mem):g} GB)."
+                    note = f"HIBLUP failed on fold {fd}: memory limit exceeded ({float(args.limit_mem):.2f} GB)."
                 fold_task.fail(note)
                 break
             if not rand_file.exists():
@@ -3413,7 +3413,7 @@ def _run_engine_blupf90(
         if rc1 != 0:
             note = f"preGSf90 failed on fold {fd} (exit={rc1})."
             if int(rc1) == 137 and args.limit_mem is not None:
-                note = f"preGSf90 failed on fold {fd}: memory limit exceeded ({float(args.limit_mem):g} GB)."
+                note = f"preGSf90 failed on fold {fd}: memory limit exceeded ({float(args.limit_mem):.2f} GB)."
             if use_apy:
                 try:
                     tail = "\n".join(log_file.read_text(encoding="utf-8", errors="ignore").splitlines()[-120:])
@@ -3547,7 +3547,7 @@ def _run_engine_blupf90(
             if int(rc2) == 137 and args.limit_mem is not None:
                 note = (
                     f"{Path(blupf90_bin).name} failed on fold {fd}: "
-                    f"memory limit exceeded ({float(args.limit_mem):g} GB)."
+                    f"memory limit exceeded ({float(args.limit_mem):.2f} GB)."
                 )
             try:
                 tail = "\n".join(log_file.read_text(encoding="utf-8", errors="ignore").splitlines()[-80:])

@@ -35,9 +35,15 @@ from janusx.gfreader import (
 )
 from janusx.garfield.logreg import logreg
 try:
-    from janusx.script._common.progress import ProgressAdapter as _CliProgressAdapter
+    from janusx.script._common.progress import (
+        ProgressAdapter as _CliProgressAdapter,
+        plain_spinner_frames as _plain_spinner_frames,
+        spinner_refresh_interval as _spinner_refresh_interval,
+    )
 except Exception:
     _CliProgressAdapter = None
+    _plain_spinner_frames = None
+    _spinner_refresh_interval = None
 
 try:
     from tqdm import tqdm as _tqdm
@@ -45,8 +51,16 @@ except Exception:
     _tqdm = None
 
 
-_TQDM_SPINNER_FRAMES: tuple[str, ...] = ("/", "-", "\\", "|")
-_TQDM_REFRESH_SECONDS = 0.3
+_TQDM_SPINNER_FRAMES: tuple[str, ...] = (
+    _plain_spinner_frames()
+    if callable(_plain_spinner_frames)
+    else (".  ", ".. ", "...", " ..", "  .", " . ")
+)
+_TQDM_REFRESH_SECONDS = (
+    float(_spinner_refresh_interval(None))
+    if callable(_spinner_refresh_interval)
+    else 0.2
+)
 _TQDM_GREEN = "\033[32m"
 _TQDM_RESET = "\033[0m"
 GarfieldImportance = Literal["imp", "permutation"]
@@ -205,7 +219,7 @@ def _build_sklearn_garfield_model(
 
 class _TqdmSpinnerAdapter:
     """
-    TQDM wrapper that adds a rotating left spinner and green running style.
+    TQDM wrapper that adds a dot spinner and green running style.
     """
 
     def __init__(

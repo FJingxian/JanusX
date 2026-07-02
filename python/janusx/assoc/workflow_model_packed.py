@@ -806,11 +806,18 @@ def _splmm_bed_logic_meta_selected(
     het_threshold: float,
     snps_only: bool,
     mmap_window_mb: Optional[int] = None,
+    threads: Optional[int] = None,
 ) -> dict[str, object]:
     if not hasattr(jxrs, "prepare_bed_logic_meta_selected"):
         raise RuntimeError(
             "Rust extension missing prepare_bed_logic_meta_selected required by SparseLMM memmap path."
         )
+    threads_use = int(
+        max(
+            1,
+            int(threads) if threads is not None and int(threads) > 0 else detect_effective_threads(),
+        )
+    )
     row_idx, miss, af, row_flip, site_keep, n_samples_full, n_snps_total = jxrs.prepare_bed_logic_meta_selected(
         str(prefix),
         sample_indices=np.ascontiguousarray(np.asarray(sample_indices, dtype=np.int64), dtype=np.int64),
@@ -819,6 +826,7 @@ def _splmm_bed_logic_meta_selected(
         het_threshold=float(het_threshold),
         snps_only=bool(snps_only),
         mmap_window_mb=(None if mmap_window_mb is None else int(max(1, int(mmap_window_mb)))),
+        threads=threads_use,
     )
     return {
         "row_indices": np.ascontiguousarray(np.asarray(row_idx, dtype=np.int64), dtype=np.int64),
@@ -843,6 +851,7 @@ def _splmm_bed_logic_meta_selected_cached(
     mmap_window_mb: Optional[int] = None,
     outprefix: Optional[str] = None,
     logger: Optional[logging.Logger] = None,
+    threads: Optional[int] = None,
 ) -> dict[str, object]:
     sample_idx = np.ascontiguousarray(
         np.asarray(sample_indices, dtype=np.int64).reshape(-1),
@@ -883,6 +892,7 @@ def _splmm_bed_logic_meta_selected_cached(
             het_threshold=float(het_threshold),
             snps_only=bool(snps_only),
             mmap_window_mb=mmap_window_mb,
+            threads=threads,
         )
         try:
             _save_splmm_meta_cache(
@@ -2322,6 +2332,7 @@ def _splmm_exact_fixed_vp_reml_h2_fit_from_grm(
     y_vec: np.ndarray,
     x_cov: Union[np.ndarray, None],
     h2_limit: float = 1.6,
+    threads: Union[int, None] = None,
 ) -> dict[str, float]:
     y = np.ascontiguousarray(np.asarray(y_vec, dtype=np.float64).reshape(-1), dtype=np.float64)
     k = np.ascontiguousarray(np.asarray(grm, dtype=np.float64), dtype=np.float64)
@@ -2335,22 +2346,17 @@ def _splmm_exact_fixed_vp_reml_h2_fit_from_grm(
     n = int(y.shape[0])
     if n <= 1:
         raise ValueError(f"SparseLMM fixed-Vp exact fit requires n > 1, got n={n}")
-    x_condition = _splmm_design_with_intercept(x_cov, n)
-    p_condition = int(x_condition.shape[1])
-    if n <= p_condition:
-        raise ValueError(
-            f"SparseLMM fixed-Vp exact fit requires n > p for phenotype residualization, got n={n}, p={p_condition}"
-        )
-    xtx = np.ascontiguousarray(x_condition.T @ x_condition, dtype=np.float64)
-    xty = np.ascontiguousarray(x_condition.T @ y, dtype=np.float64)
-    beta_ols = _splmm_solve_linear(xtx, xty)
-    y_centered = np.ascontiguousarray(y - (x_condition @ beta_ols), dtype=np.float64)
-    y_centered = np.ascontiguousarray(y_centered - float(np.mean(y_centered)), dtype=np.float64)
-    vp = float(np.dot(y_centered, y_centered) / float(n - 1))
-    if (not np.isfinite(vp)) or vp <= 0.0:
-        raise ValueError(f"SparseLMM fixed-Vp exact fit got invalid phenotype variance proxy: {vp}")
+    y_centered, vp = _splmm_fastgwa_fixed_vp_prepare_response(y, x_cov)
 
-    evals, u = np.linalg.eigh(k)
+    threads_use = int(max(1, int(threads) if threads is not None and int(threads) > 0 else detect_effective_threads()))
+    evals, u, _evd_backend, _evd_secs = _gwas_eigh_from_grm(
+        k,
+        threads=threads_use,
+        logger=None,
+        stage_label="SparseLMM fastgwa null",
+        require_rust=True,
+        diag_ridge=0.0,
+    )
     evals = np.ascontiguousarray(np.asarray(evals, dtype=np.float64).reshape(-1), dtype=np.float64)
     x_reml = np.ones((n, 1), dtype=np.float64)
     utx = np.ascontiguousarray(u.T @ x_reml, dtype=np.float64)
@@ -2441,6 +2447,31 @@ def _splmm_exact_fixed_vp_reml_h2_fit_from_grm(
         )
     )
     return out
+
+
+def _splmm_fastgwa_fixed_vp_prepare_response(
+    y_vec: np.ndarray,
+    x_cov: Union[np.ndarray, None],
+) -> tuple[np.ndarray, float]:
+    y = np.ascontiguousarray(np.asarray(y_vec, dtype=np.float64).reshape(-1), dtype=np.float64)
+    n = int(y.shape[0])
+    if n <= 1:
+        raise ValueError(f"SparseLMM fixed-Vp preparation requires n > 1, got n={n}")
+    x_condition = _splmm_design_with_intercept(x_cov, n)
+    p_condition = int(x_condition.shape[1])
+    if n <= p_condition:
+        raise ValueError(
+            f"SparseLMM fixed-Vp preparation requires n > p, got n={n}, p={p_condition}"
+        )
+    xtx = np.ascontiguousarray(x_condition.T @ x_condition, dtype=np.float64)
+    xty = np.ascontiguousarray(x_condition.T @ y, dtype=np.float64)
+    beta_ols = _splmm_solve_linear(xtx, xty)
+    y_centered = np.ascontiguousarray(y - (x_condition @ beta_ols), dtype=np.float64)
+    y_centered = np.ascontiguousarray(y_centered - float(np.mean(y_centered)), dtype=np.float64)
+    vp = float(np.dot(y_centered, y_centered) / float(n - 1))
+    if (not np.isfinite(vp)) or vp <= 0.0:
+        raise ValueError(f"SparseLMM fixed-Vp preparation got invalid phenotype variance proxy: {vp}")
+    return y_centered, vp
 
 
 def _splmm_design_with_intercept(
@@ -2558,7 +2589,6 @@ def _splmm_exact_null_fit_from_grm(
     stage_label: Optional[str] = None,
     keep_buffers: bool = False,
 ) -> dict[str, object]:
-    del threads
     y = np.ascontiguousarray(np.asarray(y_vec, dtype=np.float64).reshape(-1), dtype=np.float64)
     k = np.ascontiguousarray(np.asarray(grm, dtype=np.float64), dtype=np.float64)
     if k.ndim != 2 or int(k.shape[0]) != int(k.shape[1]):
@@ -2574,7 +2604,15 @@ def _splmm_exact_null_fit_from_grm(
     if n <= p:
         raise ValueError(f"SparseLMM exact null fit requires n > p, got n={n}, p={p}")
 
-    evals, u = np.linalg.eigh(k)
+    threads_use = int(max(1, int(threads) if threads is not None and int(threads) > 0 else detect_effective_threads()))
+    evals, u, _evd_backend, _evd_secs = _gwas_eigh_from_grm(
+        k,
+        threads=threads_use,
+        logger=None,
+        stage_label=(str(stage_label) if stage_label else "SparseLMM exact null"),
+        require_rust=True,
+        diag_ridge=0.0,
+    )
     evals = np.ascontiguousarray(np.maximum(evals, 0.0), dtype=np.float64)
     utx = np.ascontiguousarray(u.T @ x_design, dtype=np.float64)
     uty = np.ascontiguousarray(u.T @ y, dtype=np.float64)
@@ -2696,18 +2734,44 @@ def _splmm_sparse_null_fit(
         )
 
     if objective_mode_norm == "fastgwa":
-        fit_t0 = time.monotonic()
-        dense_grm = _splmm_load_sparse_grm_subset_dense(str(jxgrm_path), sample_idx_arg)
-        out_dict = dict(
-            _splmm_exact_fixed_vp_reml_h2_fit_from_grm(
-                grm=dense_grm,
-                y_vec=y_arg,
-                x_cov=x_arg,
+        if not hasattr(jxrs, "spreml_sparse_fastgwa_fixed_vp_brent_from_jxgrm"):
+            raise RuntimeError(
+                "Rust extension missing spreml_sparse_fastgwa_fixed_vp_brent_from_jxgrm required by SparseLMM fastGWA sparse null fit."
             )
+        fit_t0 = time.monotonic()
+        y_centered, vp_fixed = _splmm_fastgwa_fixed_vp_prepare_response(y_arg, x_arg)
+        low = -5.0
+        high = 5.0
+        out = jxrs.spreml_sparse_fastgwa_fixed_vp_brent_from_jxgrm(
+            str(jxgrm_path),
+            y_centered,
+            float(vp_fixed),
+            sample_indices=sample_idx_arg,
+            low=low,
+            high=high,
+            grid_size=int(_SPLMM_SPARSE_REML_GRID_SIZE),
+            tol=1e-3,
+            max_iter=int(_SPLMM_SPARSE_REML_MAX_ITER),
+            threads=int(threads_use),
+            progress_callback=progress_callback,
         )
         fit_secs = max(time.monotonic() - fit_t0, 0.0)
-        sigma_g2 = float(out_dict.get("sigma_g2", float("nan")))
-        sigma_e2 = float(out_dict.get("sigma_e2", float("nan")))
+        (
+            lbd,
+            sigma_g2,
+            sigma_e2,
+            ml,
+            reml,
+            log10_lambda,
+            grid_log10,
+            grid_reml,
+            grid_sigma_g2,
+            grid_sigma_e2,
+        ) = tuple(out)
+        sigma_g2 = float(sigma_g2)
+        sigma_e2 = float(sigma_e2)
+        sigma_sum = float(sigma_g2 + sigma_e2)
+        pve = _splmm_component_ratio(sigma_g2, sigma_e2)
         var_g_diag_scaled = (
             float(sigma_g2) * max(mean_diag_k, 0.0)
             if np.isfinite(sigma_g2) and np.isfinite(mean_diag_k)
@@ -2719,27 +2783,45 @@ def _splmm_sparse_null_fit(
             if np.isfinite(denom_diag_scaled) and denom_diag_scaled > 0.0
             else float("nan")
         )
+        lambda_boundary = _splmm_sparse_lambda_boundary_flag(float(log10_lambda), low, high)
+        out_dict = {
+            "strategy": "sparse_reml_fastgwa_fixed_vp",
+            "backend": "sparse_cholesky_fixed_vp",
+            "converged": bool(np.isfinite(float(lbd)) and np.isfinite(sigma_g2) and np.isfinite(sigma_e2)),
+            "used_iter": 0,
+            "h2": float(sigma_g2 / vp_fixed) if vp_fixed > 0.0 else float("nan"),
+            "pve": pve,
+            "lambda": float(lbd),
+            "log10_lambda": float(log10_lambda),
+            "sigma_g2": sigma_g2,
+            "sigma_e2": sigma_e2,
+            "vp_fixed": float(vp_fixed),
+            "reml": float(reml),
+            "ml": float(ml),
+            "fit_secs": float(fit_secs),
+            "grid_log10": list(np.asarray(grid_log10, dtype=np.float64).reshape(-1)),
+            "grid_reml": list(np.asarray(grid_reml, dtype=np.float64).reshape(-1)),
+            "grid_sigma_g2": list(np.asarray(grid_sigma_g2, dtype=np.float64).reshape(-1)),
+            "grid_sigma_e2": list(np.asarray(grid_sigma_e2, dtype=np.float64).reshape(-1)),
+            "mean_diag_k": mean_diag_k,
+            "pve_diag_scaled": pve_diag_scaled,
+            "min_diag_k": float(sparse_diag.get("min_diag", float("nan"))),
+            "max_diag_k": float(sparse_diag.get("max_diag", float("nan"))),
+            "n_samples_k": float(n_samples_k),
+            "nnz_k": float(nnz_k),
+            "offdiag_nnz_k": float(offdiag_nnz),
+            "offdiag_density_k": float(offdiag_density),
+            "lambda_boundary": lambda_boundary,
+            "sigma_sum_profile": sigma_sum,
+        }
         out_dict.update(
-            {
-                "strategy": "sparse_reml_fastgwa_fixed_vp",
-                "fit_secs": float(fit_secs),
-                "grid_log10": [],
-                "grid_reml": [],
-                "grid_sigma_g2": [],
-                "grid_sigma_e2": [],
-                "mean_diag_k": mean_diag_k,
-                "pve_diag_scaled": pve_diag_scaled,
-                "min_diag_k": float(sparse_diag.get("min_diag", float("nan"))),
-                "max_diag_k": float(sparse_diag.get("max_diag", float("nan"))),
-                "n_samples_k": float(n_samples_k),
-                "nnz_k": float(nnz_k),
-                "offdiag_nnz_k": float(offdiag_nnz),
-                "offdiag_density_k": float(offdiag_density),
-                "lambda_boundary": None,
-            }
+            _splmm_component_scale_reml(
+                y_vec=y_arg,
+                x_cov=x_arg,
+                sigma_g2=sigma_g2,
+                sigma_e2=sigma_e2,
+            )
         )
-        if progress_callback is not None:
-            progress_callback(1, 1)
         return out_dict
 
     if residualized_approx:
@@ -2827,6 +2909,7 @@ def _splmm_sparse_null_fit(
         grid_size=int(_SPLMM_SPARSE_REML_GRID_SIZE),
         tol=1e-3,
         max_iter=int(_SPLMM_SPARSE_REML_MAX_ITER),
+        threads=int(threads_use),
         progress_callback=progress_callback,
     )
     fit_secs = max(time.monotonic() - fit_t0, 0.0)
@@ -5548,7 +5631,10 @@ def run_splmm_windowed_fullrank(
             )
             sparse_kinship_cache[sparse_cache_key] = str(trait_sparse_kinship_path)
         prepare_handle = (
-            _start_indeterminate_progress_bar("Prepare for SparseLMM...")
+            _start_indeterminate_progress_bar(
+                "Prepare for SparseLMM...",
+                use_process=True,
+            )
             if bool(use_spinner)
             else None
         )
@@ -5591,6 +5677,7 @@ def run_splmm_windowed_fullrank(
                 mmap_window_mb=scan_meta_mmap_window_mb,
                 outprefix=str(outprefix),
                 logger=logger,
+                threads=int(threads),
             )
             return out, max(time.monotonic() - task_t0, 0.0)
 

@@ -17,6 +17,12 @@ use crate::stats_common::{map_err_string_to_py, parse_index_vec_i64};
 
 const SPREML_TINY: f64 = 1e-30_f64;
 
+#[derive(Clone, Copy, Debug)]
+enum SparseRemlObjective {
+    Profile,
+    FastGwaFixedVp { vp_fixed: f64 },
+}
+
 #[derive(Clone, Debug)]
 struct SparseRemlEval {
     log10_lambda: f64,
@@ -380,6 +386,8 @@ fn evaluate_sparse_reml_at_lambda(
     x_design: &[f64],
     y: &[f64],
     log10_lambda: f64,
+    objective: SparseRemlObjective,
+    threads: usize,
     evaluator: &mut SparseRemlEvaluator,
 ) -> Result<(SparseRemlEval, SparseRemlEvalTiming), String> {
     let total_t0 = Instant::now();
@@ -403,8 +411,11 @@ fn evaluate_sparse_reml_at_lambda(
     }
 
     let factorize_t0 = Instant::now();
-    let factor =
-        analysis.factorize_k_plus_lambda_i_buffered(lambda, &mut evaluator.perm_values_buf)?;
+    let factor = analysis.factorize_k_plus_lambda_i_buffered_parallel(
+        lambda,
+        &mut evaluator.perm_values_buf,
+        threads.max(1),
+    )?;
     timing.factorize_secs = factorize_t0.elapsed().as_secs_f64();
     let fill_rhs_t0 = Instant::now();
     evaluator.fill_rhs(x_design, y);
@@ -443,21 +454,43 @@ fn evaluate_sparse_reml_at_lambda(
     }
 
     let df = (n - p) as f64;
-    let sigma_g2 = ypy / df;
-    if !sigma_g2.is_finite() || sigma_g2 <= 0.0 {
-        return Err(format!(
-            "SPREML sigma_g2 is invalid at lambda={lambda}: sigma_g2={sigma_g2}"
-        ));
-    }
-    let sigma_e2 = lambda * sigma_g2;
-    let log_det_v = factor.logdet();
-    let log_det_xt_vinv_x = cholesky_logdet(&xt_vinv_x_chol, p);
-    let c_reml = df * (df.ln() - 1.0 - (2.0 * PI).ln()) * 0.5;
-    let reml = c_reml - 0.5 * (df * ypy.ln() + log_det_v + log_det_xt_vinv_x);
-    let n_f = n as f64;
-    let c_ml = n_f * (n_f.ln() - 1.0 - (2.0 * PI).ln()) * 0.5;
-    let ml = c_ml - 0.5 * (n_f * ypy.ln() + log_det_v);
-    if !reml.is_finite() || !ml.is_finite() {
+    let log_det_m = factor.logdet();
+    let log_det_xt_m_inv_x = cholesky_logdet(&xt_vinv_x_chol, p);
+    let (sigma_g2, sigma_e2, ml, reml) = match objective {
+        SparseRemlObjective::Profile => {
+            let sigma_g2 = ypy / df;
+            if !sigma_g2.is_finite() || sigma_g2 <= 0.0 {
+                return Err(format!(
+                    "SPREML sigma_g2 is invalid at lambda={lambda}: sigma_g2={sigma_g2}"
+                ));
+            }
+            let sigma_e2 = lambda * sigma_g2;
+            let c_reml = df * (df.ln() - 1.0 - (2.0 * PI).ln()) * 0.5;
+            let reml = c_reml - 0.5 * (df * ypy.ln() + log_det_m + log_det_xt_m_inv_x);
+            let n_f = n as f64;
+            let c_ml = n_f * (n_f.ln() - 1.0 - (2.0 * PI).ln()) * 0.5;
+            let ml = c_ml - 0.5 * (n_f * ypy.ln() + log_det_m);
+            (sigma_g2, sigma_e2, ml, reml)
+        }
+        SparseRemlObjective::FastGwaFixedVp { vp_fixed } => {
+            if !vp_fixed.is_finite() || vp_fixed <= 0.0 {
+                return Err(format!(
+                    "SPREML fastGWA fixed-Vp objective requires finite vp_fixed > 0, got {vp_fixed}"
+                ));
+            }
+            let sigma_g2 = vp_fixed / (1.0 + lambda);
+            if !sigma_g2.is_finite() || sigma_g2 <= 0.0 {
+                return Err(format!(
+                    "SPREML fastGWA sigma_g2 is invalid at lambda={lambda}: sigma_g2={sigma_g2}"
+                ));
+            }
+            let sigma_e2 = lambda * sigma_g2;
+            let reml =
+                -0.5 * (df * sigma_g2.ln() + log_det_m + log_det_xt_m_inv_x + (ypy / sigma_g2));
+            (sigma_g2, sigma_e2, f64::NAN, reml)
+        }
+    };
+    if !reml.is_finite() || !(ml.is_finite() || ml.is_nan()) {
         return Err(format!(
             "SPREML likelihood is invalid at lambda={lambda}: ml={ml}, reml={reml}"
         ));
@@ -485,6 +518,8 @@ fn sparse_reml_grid_search_core(
     low: f64,
     high: f64,
     grid_size: usize,
+    objective: SparseRemlObjective,
+    threads: usize,
     progress_callback: Option<&Py<PyAny>>,
     progress_offset: usize,
     progress_total: usize,
@@ -509,7 +544,15 @@ fn sparse_reml_grid_search_core(
             idx as f64 / (grid_n - 1) as f64
         };
         let log10_lambda = low + (high - low) * t;
-        match evaluate_sparse_reml_at_lambda(analysis, x_design, y, log10_lambda, &mut evaluator) {
+        match evaluate_sparse_reml_at_lambda(
+            analysis,
+            x_design,
+            y,
+            log10_lambda,
+            objective,
+            threads,
+            &mut evaluator,
+        ) {
             Ok((eval, eval_timing)) => {
                 phase_timing.add_eval(&eval_timing);
                 if best
@@ -545,18 +588,6 @@ fn sparse_reml_grid_search_core(
     Ok((SparseRemlSearchResult { best, grid: evals }, phase_timing))
 }
 
-fn sparse_reml_grid_search(
-    analysis: &SparseJxgrmCholeskyAnalysis,
-    x_design: &[f64],
-    y: &[f64],
-    low: f64,
-    high: f64,
-    grid_size: usize,
-) -> Result<SparseRemlSearchResult, String> {
-    sparse_reml_grid_search_core(analysis, x_design, y, low, high, grid_size, None, 0, 1)
-        .map(|(result, _timing)| result)
-}
-
 fn sparse_reml_brent_search_with_progress(
     analysis: &SparseJxgrmCholeskyAnalysis,
     x_design: &[f64],
@@ -566,6 +597,8 @@ fn sparse_reml_brent_search_with_progress(
     grid_size: usize,
     tol: f64,
     max_iter: usize,
+    objective: SparseRemlObjective,
+    threads: usize,
     progress_callback: Option<&Py<PyAny>>,
     progress_offset: usize,
     progress_total: usize,
@@ -589,6 +622,8 @@ fn sparse_reml_brent_search_with_progress(
         low,
         high,
         grid_size,
+        objective,
+        threads,
         progress_callback,
         progress_offset,
         progress_total,
@@ -650,6 +685,8 @@ fn sparse_reml_brent_search_with_progress(
                 x_design,
                 y,
                 x0,
+                objective,
+                threads,
                 &mut evaluator.borrow_mut(),
             ) {
                 Ok((eval, eval_timing)) => {
@@ -696,6 +733,8 @@ fn sparse_reml_brent_search_with_progress(
         x_design,
         y,
         best_log10,
+        objective,
+        threads,
         &mut evaluator.into_inner(),
     )
     .map_err(|err| match brent_eval_err.into_inner() {
@@ -794,7 +833,8 @@ fn result_to_tuple(
     sample_indices=None,
     low=-5.0,
     high=5.0,
-    grid_size=33
+    grid_size=33,
+    threads=1
 ))]
 pub fn spreml_sparse_reml_grid_from_jxgrm<'py>(
     py: Python<'py>,
@@ -805,6 +845,7 @@ pub fn spreml_sparse_reml_grid_from_jxgrm<'py>(
     low: f64,
     high: f64,
     grid_size: usize,
+    threads: usize,
 ) -> PyResult<(
     f64,
     f64,
@@ -859,7 +900,20 @@ pub fn spreml_sparse_reml_grid_from_jxgrm<'py>(
             None => (None, 0usize),
         };
         let x_design = build_design_matrix(x_cov_slice, y_vec.len(), p0)?;
-        let result = sparse_reml_grid_search(&analysis, &x_design, &y_vec, low, high, grid_size)?;
+        let result = sparse_reml_grid_search_core(
+            &analysis,
+            &x_design,
+            &y_vec,
+            low,
+            high,
+            grid_size,
+            SparseRemlObjective::Profile,
+            threads.max(1),
+            None,
+            0,
+            1,
+        )?
+        .0;
         Ok(result_to_tuple(result))
     })
     .map_err(map_err_string_to_py)
@@ -876,6 +930,7 @@ pub fn spreml_sparse_reml_grid_from_jxgrm<'py>(
     grid_size=9,
     tol=1e-3,
     max_iter=20,
+    threads=1,
     progress_callback=None
 ))]
 pub fn spreml_sparse_reml_brent_from_jxgrm<'py>(
@@ -889,6 +944,7 @@ pub fn spreml_sparse_reml_brent_from_jxgrm<'py>(
     grid_size: usize,
     tol: f64,
     max_iter: usize,
+    threads: usize,
     progress_callback: Option<Py<PyAny>>,
 ) -> PyResult<(
     f64,
@@ -965,6 +1021,116 @@ pub fn spreml_sparse_reml_brent_from_jxgrm<'py>(
             grid_size,
             tol,
             max_iter,
+            SparseRemlObjective::Profile,
+            threads.max(1),
+            progress_callback.as_ref(),
+            1,
+            total_progress,
+        )?;
+        timing.analysis_load_secs = analysis_load_secs;
+        timing.design_secs = design_secs;
+        timing.total_secs = total_t0.elapsed().as_secs_f64();
+        if timing_enabled {
+            emit_sparse_reml_timing(&timing, y_vec.len(), p, grid_size.max(2), max_iter.max(1));
+        }
+        emit_sparse_reml_progress(progress_callback.as_ref(), total_progress, total_progress)?;
+        Ok(result_to_tuple(result))
+    })
+    .map_err(map_err_string_to_py)
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    jxgrm_path,
+    y_resid,
+    vp_fixed,
+    sample_indices=None,
+    low=-5.0,
+    high=5.0,
+    grid_size=9,
+    tol=1e-3,
+    max_iter=20,
+    threads=1,
+    progress_callback=None
+))]
+pub fn spreml_sparse_fastgwa_fixed_vp_brent_from_jxgrm<'py>(
+    py: Python<'py>,
+    jxgrm_path: String,
+    y_resid: PyReadonlyArray1<'py, f64>,
+    vp_fixed: f64,
+    sample_indices: Option<PyReadonlyArray1<'py, i64>>,
+    low: f64,
+    high: f64,
+    grid_size: usize,
+    tol: f64,
+    max_iter: usize,
+    threads: usize,
+    progress_callback: Option<Py<PyAny>>,
+) -> PyResult<(
+    f64,
+    f64,
+    f64,
+    f64,
+    f64,
+    f64,
+    Vec<f64>,
+    Vec<f64>,
+    Vec<f64>,
+    Vec<f64>,
+)> {
+    let y_vec = y_resid
+        .as_slice()
+        .map_err(|_| PyRuntimeError::new_err("y_resid must be contiguous"))?
+        .to_vec();
+    if y_vec.is_empty() {
+        return Err(PyRuntimeError::new_err(
+            "SparseLMM fastGWA sparse null fit requires non-empty y_resid",
+        ));
+    }
+    if !(vp_fixed.is_finite() && vp_fixed > 0.0) {
+        return Err(PyRuntimeError::new_err(format!(
+            "SparseLMM fastGWA sparse null fit requires finite vp_fixed > 0, got {vp_fixed}"
+        )));
+    }
+    let sample_idx_raw = if let Some(sidx) = sample_indices {
+        Some(sidx.as_slice()?.to_vec())
+    } else {
+        None
+    };
+
+    py.detach(move || {
+        let total_t0 = Instant::now();
+        let timing_enabled = sparse_reml_timing_enabled();
+        let total_progress = 1usize
+            .saturating_add(grid_size.max(2))
+            .saturating_add(max_iter.max(1));
+        emit_sparse_reml_progress(progress_callback.as_ref(), 0, total_progress)?;
+        let analysis_t0 = Instant::now();
+        let analysis = load_subset_analysis_from_path(&jxgrm_path, sample_idx_raw.as_deref())?;
+        let analysis_load_secs = analysis_t0.elapsed().as_secs_f64();
+        emit_sparse_reml_progress(progress_callback.as_ref(), 1, total_progress)?;
+        if analysis.dim() != y_vec.len() {
+            return Err(format!(
+                "SparseLMM fastGWA sparse null fit sample size mismatch: sparse n={}, phenotype n={}",
+                analysis.dim(),
+                y_vec.len()
+            ));
+        }
+        let design_t0 = Instant::now();
+        let x_design = build_design_matrix(None, y_vec.len(), 0usize)?;
+        let design_secs = design_t0.elapsed().as_secs_f64();
+        let p = x_design.len() / y_vec.len().max(1);
+        let (result, mut timing) = sparse_reml_brent_search_with_progress(
+            &analysis,
+            &x_design,
+            &y_vec,
+            low,
+            high,
+            grid_size,
+            tol,
+            max_iter,
+            SparseRemlObjective::FastGwaFixedVp { vp_fixed },
+            threads.max(1),
             progress_callback.as_ref(),
             1,
             total_progress,
@@ -1007,7 +1173,21 @@ mod tests {
         let analysis = sparse_cholesky_analyze_jxgrm_csc(&csc).unwrap();
         let y = vec![1.0, 0.5, -0.3];
         let x = build_design_matrix(None, 3, 0).unwrap();
-        let res = sparse_reml_grid_search(&analysis, &x, &y, -3.0, 2.0, 9).unwrap();
+        let res = sparse_reml_grid_search_core(
+            &analysis,
+            &x,
+            &y,
+            -3.0,
+            2.0,
+            9,
+            SparseRemlObjective::Profile,
+            1,
+            None,
+            0,
+            1,
+        )
+        .unwrap()
+        .0;
         assert!(res.best.lambda.is_finite() && res.best.lambda > 0.0);
         assert!(res.best.sigma_g2.is_finite() && res.best.sigma_g2 > 0.0);
         assert!(!res.grid.is_empty());
@@ -1044,9 +1224,16 @@ mod tests {
         let lambda = 1.5_f64;
         let log10_lambda = lambda.log10();
 
-        let (eval, _timing) =
-            evaluate_sparse_reml_at_lambda(&analysis, &x, &y, log10_lambda, &mut evaluator)
-                .unwrap();
+        let (eval, _timing) = evaluate_sparse_reml_at_lambda(
+            &analysis,
+            &x,
+            &y,
+            log10_lambda,
+            SparseRemlObjective::Profile,
+            1,
+            &mut evaluator,
+        )
+        .unwrap();
 
         let k = DMatrix::<f64>::from_row_slice(2, 2, &[1.0, 2.0, 2.0, 1.0]);
         let v = k + DMatrix::<f64>::identity(2, 2) * lambda;
@@ -1076,5 +1263,67 @@ mod tests {
         assert_close(eval.sigma_e2, lambda * sigma_g2, 1e-12_f64, "sigma_e2");
         assert_close(eval.reml, reml, 1e-12_f64, "reml");
         assert_close(eval.ml, ml, 1e-12_f64, "ml");
+    }
+
+    #[test]
+    fn sparse_fastgwa_fixed_vp_matches_dense_fixed_vp_objective() {
+        let csc = SparseGrmCsc {
+            n_samples: 3,
+            nnz: 5,
+            col_ptr: vec![0, 2, 4, 5],
+            row_indices: vec![0, 1, 1, 2, 2],
+            values: vec![1.0, 0.2, 1.0, 0.1, 1.0],
+        };
+        let analysis = sparse_cholesky_analyze_jxgrm_csc(&csc).unwrap();
+        let y = vec![0.75_f64, -0.10_f64, -0.65_f64];
+        let x = build_design_matrix(None, 3, 0).unwrap();
+        let mut evaluator = SparseRemlEvaluator::new(y.len(), 1, &analysis);
+        let lambda = 1.25_f64;
+        let log10_lambda = lambda.log10();
+        let vp_fixed = 1.2_f64;
+
+        let (eval, _timing) = evaluate_sparse_reml_at_lambda(
+            &analysis,
+            &x,
+            &y,
+            log10_lambda,
+            SparseRemlObjective::FastGwaFixedVp { vp_fixed },
+            1,
+            &mut evaluator,
+        )
+        .unwrap();
+
+        let sigma_g2 = vp_fixed / (1.0 + lambda);
+        let sigma_e2 = lambda * sigma_g2;
+        let k = DMatrix::<f64>::from_row_slice(
+            3,
+            3,
+            &[
+                1.0, 0.2, 0.0, //
+                0.2, 1.0, 0.1, //
+                0.0, 0.1, 1.0,
+            ],
+        );
+        let v = k.scale(sigma_g2) + DMatrix::<f64>::identity(3, 3).scale(sigma_e2);
+        let chol_v = v.clone().cholesky().unwrap();
+        let y_vec = DVector::<f64>::from_row_slice(&y);
+        let x_mat = DMatrix::<f64>::from_row_slice(3, 1, &[1.0, 1.0, 1.0]);
+        let vinv_y = chol_v.solve(&y_vec);
+        let vinv_x = chol_v.solve(&x_mat);
+        let xt_vinv_x = x_mat.transpose() * &vinv_x;
+        let chol_x = xt_vinv_x.clone().cholesky().unwrap();
+        let xt_vinv_y = x_mat.transpose() * &vinv_y;
+        let beta = chol_x.solve(&xt_vinv_y);
+        let py = vinv_y - vinv_x * beta;
+        let ypy = y_vec.dot(&py);
+        let log_det_v = 2.0_f64 * chol_v.l().diagonal().iter().map(|d| d.ln()).sum::<f64>();
+        let log_det_xt = 2.0_f64 * chol_x.l().diagonal().iter().map(|d| d.ln()).sum::<f64>();
+        let reml = -0.5_f64 * (log_det_v + log_det_xt + ypy);
+
+        assert_close(eval.lambda, lambda, 1e-12_f64, "fastgwa lambda");
+        assert_close(eval.sigma_g2, sigma_g2, 1e-12_f64, "fastgwa sigma_g2");
+        assert_close(eval.sigma_e2, sigma_e2, 1e-12_f64, "fastgwa sigma_e2");
+        assert_close(eval.reml, reml, 1e-12_f64, "fastgwa reml");
+        assert!(eval.ml.is_nan(), "fastgwa ml should remain NaN");
     }
 }

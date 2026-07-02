@@ -4394,6 +4394,7 @@ pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples(
         stats_sample_indices,
         stats_only,
         None,
+        rayon::current_num_threads().max(1),
     )
 }
 
@@ -4406,6 +4407,7 @@ pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples_with_mmap_window(
     stats_sample_indices: Option<&[usize]>,
     stats_only: bool,
     mmap_window_mb: Option<usize>,
+    threads: usize,
 ) -> Result<PreparedBedLogicMetaOwned, String> {
     let total_t0 = Instant::now();
     let mut read_bim_secs = 0.0_f64;
@@ -4435,7 +4437,7 @@ pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples_with_mmap_window(
                 snps_only,
                 stats_sample_indices,
                 window_mb,
-                1usize,
+                threads.max(1),
                 None,
                 0usize,
                 0usize,
@@ -5657,6 +5659,7 @@ pub fn prepare_bed_2bit_packed<'py>(
     het_threshold=0.0,
     snps_only=false,
     mmap_window_mb=None,
+    threads=1,
 ))]
 pub fn prepare_bed_logic_meta_selected<'py>(
     py: Python<'py>,
@@ -5667,6 +5670,7 @@ pub fn prepare_bed_logic_meta_selected<'py>(
     het_threshold: f32,
     snps_only: bool,
     mmap_window_mb: Option<usize>,
+    threads: usize,
 ) -> PyResult<(
     Bound<'py, PyArray1<i64>>,
     Bound<'py, PyArray1<f32>>,
@@ -5730,6 +5734,7 @@ pub fn prepare_bed_logic_meta_selected<'py>(
                 sample_idx.as_deref(),
                 true, // stats_only: skip Vec<SiteInfo> allocation
                 mmap_window_mb.filter(|&v| v > 0),
+                threads.max(1),
             )
         })
         .map_err(PyRuntimeError::new_err)?;

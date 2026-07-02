@@ -202,7 +202,7 @@ class _AdmixtureMemoryWatchdog:
         )
         self._thread.start()
         self._started = True
-        limit_label = f"{self.limit_gb:.3f}" if self.limit_gb < 0.01 else f"{self.limit_gb:.2f}"
+        limit_label = f"{self.limit_gb:.2f}"
         self.logger.info(
             f"{'Memory limit':<22}: {limit_label} GB "
             "(0 disables; macOS uses current phys_footprint, other platforms use RSS)"
@@ -304,9 +304,7 @@ class _AdmixtureMemoryWatchdog:
             if mem_bytes <= self.limit_bytes:
                 continue
             mem_gb = float(mem_bytes) / (1024.0**3)
-            limit_label = (
-                f"{self.limit_gb:.3f}" if self.limit_gb < 0.01 else f"{self.limit_gb:.2f}"
-            )
+            limit_label = f"{self.limit_gb:.2f}"
             brand = _popstruct_brand()
             msg = (
                 f"{brand['display']} task aborted: memory limit exceeded "
@@ -512,7 +510,7 @@ def _format_fastpop_memory_cfg(
 ) -> str:
     if memory_mb is None:
         return "NA"
-    label = f"{(float(memory_mb) / 1024.0):.6g} GB"
+    label = f"{(float(memory_mb) / 1024.0):.2f} GB"
     return f"{label} ({'fixed' if user_set else 'auto'})"
 
 

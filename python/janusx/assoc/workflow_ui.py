@@ -366,11 +366,13 @@ def _start_indeterminate_progress_bar(
     *,
     enabled: bool = True,
     timeout: float = 0.08,
+    use_process: bool = False,
 ) -> Optional[SpinnerStatusAdapter]:
     handle = SpinnerStatusAdapter(
         str(desc),
         enabled=bool(enabled),
         timeout=float(timeout),
+        use_process=bool(use_process),
     )
     return handle.start()
 

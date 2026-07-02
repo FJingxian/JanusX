@@ -2,6 +2,13 @@
 name = "jx-launcher"
 version = "1.0.25"
 edition = "2021"
+description = "Rust launcher for JanusX runtime management and pipeline orchestration"
+license = "AGPL-3.0-or-later"
+license-file = "../LICENSE"
+readme = "README.md"
+documentation = "https://github.com/FJingxian/JanusX/blob/main/launcher/README.md"
+homepage = "https://github.com/FJingxian/JanusX"
+repository = "https://github.com/FJingxian/JanusX"
 
 [[bin]]
 name = "jx"

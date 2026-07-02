@@ -2721,6 +2721,29 @@ def _safe_neglog10_p(values: object) -> np.ndarray:
     return -np.log10(arr)
 
 
+def _postgwas_output_format_from_path(path: str) -> str:
+    _, ext = os.path.splitext(str(path))
+    return ext.lstrip(".").strip().lower()
+
+
+def _postgwas_should_rasterize_dense_layers(output_format: object) -> bool:
+    fmt = str(output_format).strip().lower()
+    # Keep PDF fully vector to avoid Adobe Illustrator color-collapse issues
+    # observed on mixed-color scatter layers.
+    return fmt != "pdf"
+
+
+def _postgwas_savefig_kwargs(output_format: object) -> dict[str, object]:
+    fmt = str(output_format).strip().lower()
+    if fmt == "pdf":
+        return {
+            "transparent": False,
+            "facecolor": "white",
+            "edgecolor": "white",
+        }
+    return {"transparent": True}
+
+
 def _qq_select_points_with_threshold(
     pvals: np.ndarray,
     *,
@@ -2766,7 +2789,7 @@ def _qq_select_points_with_threshold(
 
 
 def _save_figure_and_close(fig: plt.Figure, path: str) -> None:
-    fig.savefig(path, transparent=True)
+    fig.savefig(path, **_postgwas_savefig_kwargs(_postgwas_output_format_from_path(path)))
     plt.close(fig)
 
 
@@ -2956,7 +2979,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                     ax.get_xlim(),
                 )
 
-            rasterized = True
+            rasterized = _postgwas_should_rasterize_dense_layers(args.format)
 
             if args.highlight:
                 # Highlight specific SNPs (bed-like file: chr, start, end, gene, desc)
@@ -3167,6 +3190,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                             if (manh_ylim is not None and len(manh_ylim) >= 1)
                             else None
                         ),
+                        rasterized=rasterized,
                     )
                     qq_xmax = float(np.log10(plotmodel_qq.df.shape[0] + 1))
                     if np.isfinite(qq_xmax) and qq_xmax > 0:
@@ -3197,7 +3221,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                         ax2.set_ylabel("")
                     fig.tight_layout()
                     qq_path = os.path.join(args.out, f"{output_stem}.qq.{args.format}")
-                    fig.savefig(qq_path, transparent=True)
+                    fig.savefig(qq_path, **_postgwas_savefig_kwargs(args.format))
                     plt.close(fig)
             finally:
                 if manh_save_future is not None:
@@ -3471,7 +3495,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                 new_w = ref_w * float(fx1 - fx0)
                 ax_ld.set_position([new_x0, cy0, new_w, ch])
                 ax_ld.set_anchor("N")
-            fig_ld.savefig(ld_path, transparent=True)
+            fig_ld.savefig(ld_path, **_postgwas_savefig_kwargs(args.format))
             plt.close(fig_ld)
 
             if use_gene_bridge:
@@ -3496,7 +3520,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                     _cx0, cy0, _cw, ch = ax_gene.get_position().bounds
                     ax_gene.set_position([mx0, cy0, mw, ch])
                 gene_path = os.path.join(args.out, f"{output_stem}.gene.{args.format}")
-                fig_gene.savefig(gene_path, transparent=True)
+                fig_gene.savefig(gene_path, **_postgwas_savefig_kwargs(args.format))
                 plt.close(fig_gene)
             else:
                 gene_path = None
@@ -3638,7 +3662,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                 )
 
             manhld_path = os.path.join(args.out, f"{output_stem}.manhld.{args.format}")
-            fig_manhld.savefig(manhld_path, transparent=True)
+            fig_manhld.savefig(manhld_path, **_postgwas_savefig_kwargs(args.format))
             plt.close(fig_manhld)
         else:
             ld_path = None
@@ -4045,9 +4069,9 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
         plot_df["_ylog"] = np.asarray([], dtype=float)
 
     width_in = 8.0
-    # In merge mode, always rasterize dense scatter layers to keep output files
-    # lightweight and easier to edit in vector tools (e.g. Adobe Illustrator).
-    rasterized = True
+    # Keep PDF output vector-safe for Illustrator; other formats still
+    # rasterize dense scatter layers to control file size.
+    rasterized = _postgwas_should_rasterize_dense_layers(args.format)
     manh_path = None
     manh_height_in = None
     manh_fontsize: Optional[float] = None
@@ -4161,7 +4185,7 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
         fig.tight_layout()
         manh_axes_bounds = ax.get_position().bounds
         manh_path = os.path.join(args.out, f"{args.prefix}.merge.manh.{args.format}")
-        fig.savefig(manh_path, transparent=True)
+        fig.savefig(manh_path, **_postgwas_savefig_kwargs(args.format))
         manh_height_in = fig.get_figheight()
         plt.close(fig)
 
@@ -4242,7 +4266,7 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
         )
         fig.tight_layout()
         qq_path = os.path.join(args.out, f"{args.prefix}.merge.qq.{args.format}")
-        fig.savefig(qq_path, transparent=True)
+        fig.savefig(qq_path, **_postgwas_savefig_kwargs(args.format))
         plt.close(fig)
 
     ld_path = None
@@ -4338,7 +4362,7 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
             ax_ld.set_position([new_x0, cy0, new_w, ch])
             ax_ld.set_anchor("N")
         ld_path = os.path.join(args.out, f"{args.prefix}.merge.ldblock.{args.format}")
-        fig_ld.savefig(ld_path, transparent=True)
+        fig_ld.savefig(ld_path, **_postgwas_savefig_kwargs(args.format))
         plt.close(fig_ld)
 
         if args.anno:
@@ -4406,7 +4430,7 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
                         _cx0, cy0, _cw, ch = ax_gene.get_position().bounds
                         ax_gene.set_position([mx0, cy0, mw, ch])
                     gene_path = os.path.join(args.out, f"{args.prefix}.merge.gene.{args.format}")
-                    fig_gene.savefig(gene_path, transparent=True)
+                    fig_gene.savefig(gene_path, **_postgwas_savefig_kwargs(args.format))
                     plt.close(fig_gene)
 
     saved_paths: list[tuple[str, str]] = []
@@ -4607,7 +4631,7 @@ def _run_postgwas_ldblock_only(args, logger: logging.Logger) -> None:
             ax_gene.set_anchor("N")
 
     ld_path = os.path.join(args.out, f"{args.prefix}.ldblock.{args.format}")
-    fig_ld.savefig(ld_path, transparent=True)
+    fig_ld.savefig(ld_path, **_postgwas_savefig_kwargs(args.format))
     plt.close(fig_ld)
     log_success(
         logger,

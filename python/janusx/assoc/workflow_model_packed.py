@@ -5432,7 +5432,8 @@ def run_splmm_windowed_fullrank(
                 _emit_warning_line(
                     logger,
                     (
-                        "SparseLMM only accepts an optional numeric sparse cutoff via -splmm; "
+                        "SparseLMM only accepts an optional numeric sparse cutoff via "
+                        "-splmm / -splmm-exact; "
                         f"ignoring non-numeric argument: {ignored_splmm_arg}"
                     ),
                     use_spinner=bool(use_spinner),

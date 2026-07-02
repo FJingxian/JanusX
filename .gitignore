@@ -71,3 +71,5 @@ CLAUDE.md
 doc/agent
 
 *.dSYM/
+
+.janusx_test

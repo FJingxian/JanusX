@@ -5851,24 +5851,34 @@ def parse_args(argv: Optional[list[str]] = None):
         default=None,
         metavar="CUTOFF",
         help=(
-            "Run SparseLMM (additive-only) with exact g'Pg denominator for every SNP. "
+            "Run SparseLMM (additive-only) with the GRAMMAR-gamma scan approximation. "
             "SparseLMM builds or reuses sparse GRM from the main genotype input, "
-            "estimates variance components, then scans via sparse Cholesky. "
+            "estimates variance components, then scans with the faster "
+            "GRAMMAR-gamma denominator. "
             "Optional CUTOFF sets the sparse kinship cutoff (example: -splmm 0.001; default: 0.05)."
         ),
     )
     models_group.add_argument(
-        "-splmm-approx", "--splmm-approx",
-        dest="splmm_approx",
+        "-splmm-exact", "--splmm-exact",
+        dest="splmm_exact",
         nargs="?",
         const="__SELF__",
         default=None,
         metavar="CUTOFF",
         help=(
-            "Run SparseLMM with GRAMMAR-gamma approximate denominator (faster, "
-            "but p-values may be slightly inflated). "
+            "Run SparseLMM with the exact sparse-Cholesky g'Pg scan denominator "
+            "for every SNP. "
             "Optional CUTOFF sets the sparse kinship cutoff."
         ),
+    )
+    models_group.add_argument(
+        "-splmm-approx", "--splmm-approx",
+        dest="splmm_exact",
+        nargs="?",
+        const="__SELF__",
+        default=argparse.SUPPRESS,
+        metavar="CUTOFF",
+        help=argparse.SUPPRESS,
     )
     models_group.add_argument(
         "-farmcpu", "--farmcpu",
@@ -5894,7 +5904,7 @@ def parse_args(argv: Optional[list[str]] = None):
     add_common_grm_option_arg(optional_group, default="1", dest="grm")
     optional_group.add_argument(
         "-spk", "--grm-sparse", type=str, default="1", dest="grm_sparse",
-        help="Sparse GRM option for SparseLMM (-splmm / -splmm-approx): "
+        help="Sparse GRM option for SparseLMM (-splmm / -splmm-exact): "
              "1 (centering), 2 (standardization), "
              "or a path to a precomputed Sparse GRM file (default: %(default)s).",
     )
@@ -6058,14 +6068,14 @@ def parse_args(argv: Optional[list[str]] = None):
         parser.error("--farmcpu-nbin must be >= 1.")
     if args.farmcpu_qtn_bound is not None and int(args.farmcpu_qtn_bound) < 1:
         parser.error("--farmcpu-qtn-bound must be >= 1.")
-    # Normalise SPLMM mode flags: exactly one of -splmm / -splmm-approx.
+    # Normalise SparseLMM mode flags: exactly one of -splmm / -splmm-exact.
     _splmm_modes = [
-        (args.splmm,        "exact"),   # -splmm → exact g'Pg denominator
-        (args.splmm_approx,  "approx"),
+        (args.splmm, "approx"),  # -splmm → GRAMMAR-gamma scan
+        (getattr(args, "splmm_exact", None), "exact"),
     ]
     _active_splmm_modes = [(val, mode) for val, mode in _splmm_modes if val is not None]
     if len(_active_splmm_modes) > 1:
-        parser.error("Only one of -splmm / -splmm-approx may be specified.")
+        parser.error("Only one of -splmm / -splmm-exact may be specified.")
     if _active_splmm_modes:
         args.splmm, args._splmm_denom_mode = _active_splmm_modes[0]
         args._splmm_null_objective_mode = "fastgwa"
@@ -6554,8 +6564,13 @@ def _run_gwas_pipeline(
         if args.cov:
             advanced_config_rows.append(("Covariates", "; ".join(str(x) for x in args.cov)))
         if args.splmm:
+            splmm_mode = str(getattr(args, "_splmm_denom_mode", "exact") or "exact")
+            splmm_mode_display = {"approx": "grammar_gamma", "exact": "exact"}.get(
+                splmm_mode,
+                splmm_mode,
+            )
             advanced_config_rows.append(
-                ("SparseLMM Mode", str(getattr(args, "_splmm_denom_mode", "exact") or "exact"))
+                ("SparseLMM Mode", splmm_mode_display)
             )
             advanced_config_rows.append(
                 ("SparseLMM Null Objective", str(getattr(args, "_splmm_null_objective_mode", "fastgwa") or "fastgwa"))
@@ -6740,7 +6755,8 @@ def _run_gwas_pipeline(
                     _emit_warning_line(
                         logger,
                         (
-                            "SparseLMM only accepts an optional numeric sparse cutoff via -splmm; "
+                            "SparseLMM only accepts an optional numeric sparse cutoff via "
+                            "-splmm / -splmm-exact; "
                             f"ignoring non-numeric argument: {ignored_splmm_arg}"
                         ),
                         use_spinner=bool(use_spinner),
@@ -6771,7 +6787,8 @@ def _run_gwas_pipeline(
                         _emit_warning_line(
                             logger,
                             (
-                                "SparseLMM received both `-spk <path>` and `-splmm <cutoff>`; "
+                                "SparseLMM received both `-spk <path>` and a SparseLMM cutoff "
+                                "(`-splmm` / `-splmm-exact`); "
                                 "the cutoff is ignored when a precomputed sparse GRM path is supplied."
                             ),
                             use_spinner=bool(use_spinner),
@@ -6970,7 +6987,7 @@ def _run_gwas_pipeline(
                     ("Q Matrix", _format_gwas_q_status(qmatrix)),
                     ("Covariates", _format_gwas_cov_status(cov_all)),
                 ]
-                if bool(args.splmm) or bool(args.splmm_approx):
+                if bool(args.splmm):
                     logger_task_rows.append(
                         (
                             "Sparse GRM",

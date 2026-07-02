@@ -49,7 +49,11 @@ index-url = "https://pypi.tuna.tsinghua.edu.cn/simple"
 python-install-mirror = "https://registry.npmmirror.com/-/binary/python-build-standalone/"
 
 [build-system]
-requires = ["maturin>=1.7,<2", "numpy>=1.23,!=2.4.3"]
+requires = [
+    "maturin>=1.7,<2",
+    "numpy>=1.23,!=2.4.3",
+    "patchelf; sys_platform == 'linux'",
+]
 build-backend = "build_backend"
 backend-path = ["scripts"]
 

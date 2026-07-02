@@ -375,12 +375,17 @@ class GWASPLOT:
         plot_kwargs.setdefault("linewidths", 0.0)
 
         mask_ignore = ~df.index.isin(ignore)
-        ax.scatter(
-            df.loc[mask_ignore, "x"],
-            df.loc[mask_ignore, "y"],
-            color=df.loc[mask_ignore, "z"].map(chr_color_map),
-            **plot_kwargs,
-        )
+        draw_df = df.loc[mask_ignore, ["x", "y", "z"]]
+        for chr_id in self.chr_ids:
+            chr_mask = draw_df["z"] == chr_id
+            if not bool(np.any(chr_mask)):
+                continue
+            ax.scatter(
+                draw_df.loc[chr_mask, "x"],
+                draw_df.loc[chr_mask, "y"],
+                color=chr_color_map[chr_id],
+                **plot_kwargs,
+            )
 
         # Highlight SNPs above genome-wide threshold
         if threshold is not None and df["y"].max() >= threshold:
@@ -460,6 +465,7 @@ class GWASPLOT:
         qq_band_max_points: Union[int, None] = 20_000,
         sig_p_threshold: Union[float, None] = None,
         axis_min: Union[float, None] = None,
+        rasterized: bool = True,
     ) -> plt.Axes:
         """
         Draw a QQ plot of observed vs expected -log10(p) with a beta-based
@@ -607,7 +613,7 @@ class GWASPLOT:
                 upper[band_mask],
                 color=band_color,
                 alpha=0.3,
-                rasterized=True,
+                rasterized=bool(rasterized),
             )
 
         # Diagonal reference line y = x
@@ -627,7 +633,7 @@ class GWASPLOT:
             obs_scatter[scatter_mask],
             s=scatter_size,
             alpha=0.75,
-            rasterized=True,
+            rasterized=bool(rasterized),
             color=point_color,
             edgecolors="none",
             linewidths=0.0,

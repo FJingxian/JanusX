@@ -1363,23 +1363,33 @@ pub(crate) fn decode_subset_row_from_full_scratch(
     } else {
         (default_mean_g, 0.0_f32, 0.0_f32)
     };
+    let p_global = (0.5_f32 * default_mean_g).clamp(0.0_f32, 1.0_f32);
+    let var_global_centered = (2.0_f32 * p_global * (1.0_f32 - p_global)).max(0.0_f32);
 
-    let std_scale = if method == 2 {
-        if var_standardized > eps {
-            1.0_f32 / var_standardized.sqrt()
-        } else {
-            0.0_f32
+    let (center_mean, std_scale) = match method {
+        1 => (default_mean_g, 1.0_f32),
+        2 => {
+            let center_mean = mean_g;
+            let std_scale = if var_standardized > eps {
+                1.0_f32 / var_standardized.sqrt()
+            } else {
+                0.0_f32
+            };
+            (center_mean, std_scale)
         }
-    } else {
-        1.0_f32
+        _ => (mean_g, 1.0_f32),
     };
     for v in out_row.iter_mut() {
-        let gv = if *v >= 0.0_f32 { *v } else { mean_g };
-        *v = (gv - mean_g) * std_scale;
+        let gv = if *v >= 0.0_f32 { *v } else { default_mean_g };
+        *v = (gv - center_mean) * std_scale;
     }
 
-    let row_sum = (mean_g as f64) * (n as f64);
-    (var_centered as f64, row_sum)
+    let row_sum = (center_mean as f64) * (n as f64);
+    let varsum = match method {
+        1 => var_global_centered as f64,
+        _ => var_centered as f64,
+    };
+    (varsum, row_sum)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1436,23 +1446,33 @@ pub(crate) fn decode_subset_row_from_full_scratch_f64(
     } else {
         (default_mean_g, 0.0_f64, 0.0_f64)
     };
+    let p_global = (0.5_f64 * default_mean_g).clamp(0.0_f64, 1.0_f64);
+    let var_global_centered = (2.0_f64 * p_global * (1.0_f64 - p_global)).max(0.0_f64);
 
-    let std_scale = if method == 2 {
-        if var_standardized > eps {
-            1.0_f64 / var_standardized.sqrt()
-        } else {
-            0.0_f64
+    let (center_mean, std_scale) = match method {
+        1 => (default_mean_g, 1.0_f64),
+        2 => {
+            let center_mean = mean_g;
+            let std_scale = if var_standardized > eps {
+                1.0_f64 / var_standardized.sqrt()
+            } else {
+                0.0_f64
+            };
+            (center_mean, std_scale)
         }
-    } else {
-        1.0_f64
+        _ => (mean_g, 1.0_f64),
     };
     for v in out_row.iter_mut() {
-        let gv = if *v >= 0.0_f64 { *v } else { mean_g };
-        *v = (gv - mean_g) * std_scale;
+        let gv = if *v >= 0.0_f64 { *v } else { default_mean_g };
+        *v = (gv - center_mean) * std_scale;
     }
 
-    let row_sum = mean_g * (n as f64);
-    (var_centered, row_sum)
+    let row_sum = center_mean * (n as f64);
+    let varsum = match method {
+        1 => var_global_centered,
+        _ => var_centered,
+    };
+    (varsum, row_sum)
 }
 
 #[cfg(test)]
@@ -1558,5 +1578,37 @@ mod tests {
         for (lhs, rhs) in out_near_full.iter().zip(out_gather.iter()) {
             assert!((lhs - rhs).abs() <= 1e-6_f32);
         }
+    }
+
+    #[test]
+    fn centered_subset_decode_uses_global_mean_for_method1() {
+        let codes = [0u8, 0, 0, 2, 2, 2, 2, 2];
+        let packed = pack_codes(&codes);
+        let sample_idx = vec![0usize, 1, 2];
+        let code4_lut = &packed_byte_lut().code4;
+        let mut full_row = vec![0.0_f32; codes.len()];
+        let mut out = vec![0.0_f32; sample_idx.len()];
+        let global_mean = 1.25_f32;
+        let (var_centered, row_sum) = decode_subset_row_from_full_scratch(
+            packed.as_slice(),
+            codes.len(),
+            sample_idx.as_slice(),
+            false,
+            global_mean,
+            1,
+            1e-12_f32,
+            code4_lut,
+            full_row.as_mut_slice(),
+            out.as_mut_slice(),
+        );
+
+        let expected = vec![-global_mean, -global_mean, -global_mean];
+        for (lhs, rhs) in out.iter().zip(expected.iter()) {
+            assert!((lhs - rhs).abs() <= 1e-6_f32);
+        }
+        assert!((row_sum - f64::from(global_mean) * sample_idx.len() as f64).abs() <= 1e-9_f64);
+        let p_global = 0.5_f64 * f64::from(global_mean);
+        let var_expected = 2.0_f64 * p_global * (1.0_f64 - p_global);
+        assert!((var_centered - var_expected).abs() <= 1e-9_f64);
     }
 }

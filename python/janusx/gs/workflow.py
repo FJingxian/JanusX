@@ -3680,6 +3680,80 @@ def _build_gblup_cv_grm_once(
     return np.ascontiguousarray(grm, dtype=np.float64)
 
 
+def _build_rrblup_standardized_grm_once(
+    *,
+    packed_ctx: dict[str, typing.Any],
+    train_sample_indices: np.ndarray,
+    n_jobs: int,
+    std_mode: str,
+    stats_sample_indices: np.ndarray | None = None,
+) -> np.ndarray:
+    """
+    Build a train-train GRM consistent with the active rrBLUP standardized
+    operator, including empirical-global and strict-train row statistics.
+    """
+    sample_idx = np.ascontiguousarray(
+        np.asarray(train_sample_indices, dtype=np.int64).reshape(-1),
+        dtype=np.int64,
+    )
+    n = int(sample_idx.shape[0])
+    if n <= 0:
+        raise ValueError("rrBLUP standardized GRM build requires non-empty sample indices.")
+
+    stats_idx = (
+        sample_idx
+        if stats_sample_indices is None
+        else np.ascontiguousarray(
+            np.asarray(stats_sample_indices, dtype=np.int64).reshape(-1),
+            dtype=np.int64,
+        )
+    )
+    row_mean, row_inv_sd = _ensure_packed_standard_stats_cached(
+        packed_ctx,
+        sample_indices=stats_idx,
+        std_mode=std_mode,
+    )
+    row_inv_f64 = np.asarray(row_inv_sd, dtype=np.float64).reshape(-1)
+    m_effective = int(np.count_nonzero(np.isfinite(row_inv_f64) & (row_inv_f64 > 0.0)))
+    if m_effective <= 0:
+        raise ValueError("rrBLUP standardized GRM build found zero effective markers.")
+
+    m = int(_packed_ctx_active_rows(packed_ctx))
+    block_rows_cfg = int(max(1, int(packed_ctx.get("__gblup_grm_block_rows__", 4096))))
+    block_mb = float(os.getenv("JX_RRBLUP_STD_GRM_BLOCK_MB", "128").strip() or "128")
+    if (not np.isfinite(block_mb)) or (block_mb <= 0.0):
+        block_mb = 128.0
+    row_bytes = max(1, n) * np.dtype(np.float32).itemsize
+    block_rows_budget = int(max(1, (block_mb * 1024.0 * 1024.0) // float(row_bytes)))
+    block_rows = int(max(1, min(m, block_rows_cfg, block_rows_budget)))
+
+    grm = np.zeros((n, n), dtype=np.float64)
+    for st in range(0, m, block_rows):
+        ed = min(st + block_rows, m)
+        good = np.flatnonzero(
+            np.asarray(row_inv_sd[st:ed], dtype=np.float32).reshape(-1) > 0.0
+        )
+        if int(good.size) <= 0:
+            continue
+        ridx = np.ascontiguousarray(
+            np.asarray(st + good, dtype=np.int64).reshape(-1),
+            dtype=np.int64,
+        )
+        x_blk = _decode_packed_block_standardized(
+            packed_ctx=packed_ctx,
+            row_idx=ridx,
+            sample_indices=sample_idx,
+            row_mean=row_mean,
+            row_inv_sd=row_inv_sd,
+        )
+        x64 = np.ascontiguousarray(np.asarray(x_blk, dtype=np.float64), dtype=np.float64)
+        grm += x64.T @ x64
+
+    grm *= 1.0 / float(m_effective)
+    grm = 0.5 * (grm + grm.T)
+    return np.ascontiguousarray(grm, dtype=np.float64)
+
+
 def _build_gblup_kinship_blocks_once(
     *,
     train_snp: np.ndarray | None,
@@ -4881,6 +4955,7 @@ def _estimate_rrblup_lambda_subsample_reml(
     rng = np.random.default_rng(seed)
     std_eps = float(max(np.finfo(np.float32).eps, float(cfg_use.get("pcg_std_eps", 1e-12))))
     operator_mode = _resolve_rrblup_operator_mode(cfg_use)
+    rr_std_mode = _resolve_rrblup_standardized_mode(cfg_use)
     maf_all = np.asarray(packed_ctx.get("maf", np.asarray([], dtype=np.float32)), dtype=np.float64).reshape(-1)
     site_keep_raw = packed_ctx.get("site_keep", None)
     if site_keep_raw is not None and int(maf_all.size) > 0:
@@ -5885,7 +5960,31 @@ def _estimate_rrblup_lambda_subsample_reml(
                 vc_method="GRMreml",
                 strategy="grm_reml",
             )
-            fit_one = _fit_once_grm(np.arange(n_train, dtype=np.int64))
+            if operator_mode == "centered":
+                fit_one = _fit_once_grm(np.arange(n_train, dtype=np.int64))
+            else:
+                grm_one = _build_rrblup_standardized_grm_once(
+                    packed_ctx=packed_ctx,
+                    train_sample_indices=train_abs,
+                    n_jobs=max(1, int(n_jobs)),
+                    std_mode=rr_std_mode,
+                    stats_sample_indices=train_abs,
+                )
+                fit_grm = _fit_gblup_reml_from_grm(y_vec, grm_one)
+                lam_sub_k = float(fit_grm.get("lambda_reml", np.nan))
+                lam_sub_eq = (
+                    float(lam_sub_k * m_scale)
+                    if (np.isfinite(lam_sub_k) and lam_sub_k > 0.0)
+                    else float("nan")
+                )
+                fit_one = {
+                    "lambda_k": float(lam_sub_k),
+                    "lambda_eq": float(lam_sub_eq),
+                    "sigma_g2": float(fit_grm.get("sigma_g2", np.nan)),
+                    "sigma_e2": float(fit_grm.get("sigma_e2", np.nan)),
+                    "pve": float(fit_grm.get("pve", np.nan)),
+                    "m_effective_vc": int(m_effective),
+                }
         except Exception:
             pass
         finally:

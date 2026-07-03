@@ -1466,11 +1466,6 @@ def run_farmcpu_fullmem(
             packed_ctx is not None
             and bool(hasattr(jxrs, "farmcpu_packed_to_tsv"))
         )
-        expected_meta_rows = int(eff_snp)
-        chrom_col, pos_col, snp_col, allele0_col, allele1_col = _resolve_ref_alt_columns(
-            ref_alt,
-            expected_rows=expected_meta_rows,
-        )
         bed_prefix_meta: Union[str, None] = None
         if use_rust_controller:
             packed_payload = m_input
@@ -1509,7 +1504,35 @@ def run_farmcpu_fullmem(
                     dtype=np.int64,
                 )
                 packed_rows = int(np.asarray(packed_arr, dtype=np.uint8).shape[0])
-                meta_rows = int(len(chrom_col))
+                meta_rows = int(row_idx_arr.shape[0])
+                if isinstance(ref_alt, dict) and str(ref_alt.get("_kind", "")) == "deferred_bim":
+                    bed_prefix_raw = str(ref_alt.get("bed_prefix", "") or "").strip()
+                    if bed_prefix_raw != "":
+                        bed_prefix_meta = bed_prefix_raw
+                if not bed_prefix_meta:
+                    bed_prefix_raw = str(packed_payload.get("source_prefix", "") or "").strip()
+                    if bed_prefix_raw != "":
+                        bed_prefix_meta = bed_prefix_raw
+                if not bed_prefix_meta:
+                    bed_prefix_detected = _as_plink_prefix(gfile)
+                    if bed_prefix_detected is not None:
+                        bed_prefix_meta = str(bed_prefix_detected)
+                if not bed_prefix_meta:
+                    raise ValueError("FarmCPU packed Rust path requires a non-empty PLINK bed_prefix for BIM metadata.")
+
+                fallback_meta_cols: Union[tuple[list[str], list[int], list[str], list[str], list[str]], None] = None
+
+                def _resolve_meta_columns_for_fallback() -> tuple[list[str], list[int], list[str], list[str], list[str]]:
+                    nonlocal fallback_meta_cols
+                    if fallback_meta_cols is None:
+                        fallback_meta_cols = _resolve_ref_alt_columns(
+                            ref_alt,
+                            expected_rows=meta_rows,
+                            prefix=str(bed_prefix_meta),
+                            row_indices=row_idx_arr,
+                        )
+                    return fallback_meta_cols
+
                 def _compact_packed_for_metadata_alignment() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
                     row_idx_local = np.ascontiguousarray(
                         np.asarray(row_idx_arr, dtype=np.int64).reshape(-1),
@@ -1544,11 +1567,6 @@ def run_farmcpu_fullmem(
                         rust_result = jxrs.farmcpu_packed_to_tsv(
                             np.ascontiguousarray(p_sub, dtype=np.float64).reshape(-1),
                             np.ascontiguousarray(q_sub, dtype=np.float64),
-                            chrom_col,
-                            pos_col,
-                            snp_col,
-                            allele0_col,
-                            allele1_col,
                             packed_arr,
                             int(packed_payload["n_samples"]),
                             row_flip_arr,
@@ -1557,6 +1575,7 @@ def run_farmcpu_fullmem(
                             tmp_tsv,
                             sample_idx_use,
                             row_indices=row_idx_arr,
+                            source_row_indices=row_idx_arr,
                             threshold=float(farm_threshold),
                             max_iter=int(farm_iter),
                             qtn_bound=farm_qtn_bound,
@@ -1580,7 +1599,7 @@ def run_farmcpu_fullmem(
                     except Exception as ex:
                         msg = str(ex)
                         can_retry_compact = (
-                            ("metadata length mismatch" in msg or "row metadata length mismatch" in msg)
+                            ("metadata length mismatch" in msg or "row metadata length mismatch" in msg or "row_indices[" in msg)
                             and int(packed_rows) != int(meta_rows)
                             and int(row_idx_arr.shape[0]) == int(meta_rows)
                         )
@@ -1590,11 +1609,6 @@ def run_farmcpu_fullmem(
                         rust_result = jxrs.farmcpu_packed_to_tsv(
                             np.ascontiguousarray(p_sub, dtype=np.float64).reshape(-1),
                             np.ascontiguousarray(q_sub, dtype=np.float64),
-                            chrom_col,
-                            pos_col,
-                            snp_col,
-                            allele0_col,
-                            allele1_col,
                             packed_compact,
                             int(packed_payload["n_samples"]),
                             row_flip_compact,
@@ -1603,6 +1617,7 @@ def run_farmcpu_fullmem(
                             tmp_tsv,
                             sample_idx_use,
                             row_indices=None,
+                            source_row_indices=row_idx_arr,
                             threshold=float(farm_threshold),
                             max_iter=int(farm_iter),
                             qtn_bound=farm_qtn_bound,
@@ -1612,7 +1627,7 @@ def run_farmcpu_fullmem(
                             stage1_progress_callback=_farmcpu_stage1_progress,
                             progress_callback=(None if skip_stage1_main_scan else _farmcpu_scan_progress),
                             pseudo_tsv=pseudo_tsv_hint,
-                            bed_prefix=None,
+                            bed_prefix=bed_prefix_meta,
                             raw=bool(farm_raw),
                             skip_main_scan=bool(skip_stage1_main_scan),
                         )
@@ -1644,6 +1659,7 @@ def run_farmcpu_fullmem(
                             "scan_progress_callback": (None if skip_stage1_main_scan else _farmcpu_scan_progress),
                         }
                     ]
+                    chrom_col, pos_col, snp_col, allele0_col, allele1_col = _resolve_meta_columns_for_fallback()
                     try:
                         _res = jxrs.gwas_packed_unified_to_tsv(
                             jobs,
@@ -1667,7 +1683,7 @@ def run_farmcpu_fullmem(
                     except Exception as ex:
                         msg = str(ex)
                         can_retry_compact = (
-                            ("metadata length mismatch" in msg or "row metadata length mismatch" in msg)
+                            ("metadata length mismatch" in msg or "row metadata length mismatch" in msg or "row_indices[" in msg)
                             and int(packed_rows) != int(meta_rows)
                             and int(row_idx_arr.shape[0]) == int(meta_rows)
                         )

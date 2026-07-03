@@ -624,6 +624,22 @@ fn resolve_assoc_chrom_pos_metadata(
     Ok((chrom_out, pos_out))
 }
 
+fn parse_nonnegative_index_vec_i64(
+    indices: &[i64],
+    label: &str,
+) -> PyResult<Vec<usize>> {
+    let mut out = Vec::with_capacity(indices.len());
+    for (i, &v) in indices.iter().enumerate() {
+        if v < 0 {
+            return Err(PyRuntimeError::new_err(format!(
+                "{label}[{i}] must be >= 0, got {v}"
+            )));
+        }
+        out.push(v as usize);
+    }
+    Ok(out)
+}
+
 #[inline]
 pub(crate) fn decode_packed_rows_to_sample_major(
     packed_flat: &[u8],
@@ -3547,11 +3563,6 @@ pub fn farmcpu_super_packed<'py>(
 #[pyo3(signature = (
     y,
     x_cov,
-    chrom,
-    pos,
-    snp,
-    allele0,
-    allele1,
     packed,
     n_samples,
     row_flip,
@@ -3560,6 +3571,7 @@ pub fn farmcpu_super_packed<'py>(
     out_tsv,
     sample_indices=None,
     row_indices=None,
+    source_row_indices=None,
     threshold=1e-6,
     max_iter=30,
     qtn_bound=None,
@@ -3577,11 +3589,6 @@ pub fn farmcpu_packed_to_tsv(
     py: Python<'_>,
     y: PyReadonlyArray1<'_, f64>,
     x_cov: PyReadonlyArray2<'_, f64>,
-    chrom: Vec<String>,
-    pos: Vec<i64>,
-    snp: Vec<String>,
-    allele0: Vec<String>,
-    allele1: Vec<String>,
     packed: PyReadonlyArray2<'_, u8>,
     n_samples: usize,
     row_flip: PyReadonlyArray1<'_, bool>,
@@ -3590,6 +3597,7 @@ pub fn farmcpu_packed_to_tsv(
     out_tsv: &str,
     sample_indices: Option<PyReadonlyArray1<'_, i64>>,
     row_indices: Option<PyReadonlyArray1<'_, i64>>,
+    source_row_indices: Option<PyReadonlyArray1<'_, i64>>,
     threshold: f64,
     max_iter: usize,
     qtn_bound: Option<usize>,
@@ -3667,8 +3675,25 @@ pub fn farmcpu_packed_to_tsv(
     if m == 0 {
         return Err(PyRuntimeError::new_err("empty packed marker matrix"));
     }
+    let source_row_idx: Option<Vec<usize>> = if let Some(src_idx) = source_row_indices {
+        Some(parse_nonnegative_index_vec_i64(
+            src_idx.as_slice()?,
+            "source_row_indices",
+        )?)
+    } else {
+        None
+    };
+    if let Some(src_idx) = source_row_idx.as_ref() {
+        if src_idx.len() != m {
+            return Err(PyRuntimeError::new_err(format!(
+                "source_row_indices length mismatch: got {}, expected {m}",
+                src_idx.len(),
+            )));
+        }
+    }
+    let meta_row_idx = source_row_idx.as_deref().or(row_idx.as_deref());
     let (chrom, pos) =
-        resolve_assoc_chrom_pos_metadata(bed_prefix, chrom, pos, row_idx.as_deref(), m)
+        resolve_assoc_chrom_pos_metadata(bed_prefix, Vec::new(), Vec::new(), meta_row_idx, m)
             .map_err(PyRuntimeError::new_err)?;
     let string_metadata = if skip_main_scan {
         None
@@ -3676,12 +3701,12 @@ pub fn farmcpu_packed_to_tsv(
         Some(
             resolve_assoc_tsv_metadata(
                 bed_prefix,
-                chrom.clone(),
-                pos.clone(),
-                snp,
-                allele0,
-                allele1,
-                row_idx.as_deref(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                meta_row_idx,
                 m,
             )
             .map_err(PyRuntimeError::new_err)?,
@@ -3779,6 +3804,7 @@ pub fn farmcpu_packed_to_tsv(
 
     let (written_rows, qtn_count, qtn_rows_written, stage1_search_secs, stage2_scan_secs) =
         py.detach(|| -> PyResult<(usize, usize, usize, f64, f64)> {
+        let meta_row_idx = source_row_idx.as_deref().or(row_idx.as_deref());
         let stage1_wall_t0 = Instant::now();
         let mut final_model_cache: Option<(Vec<f64>, usize, Vec<f64>)> = None;
         let mut seen_qtn_idx: HashSet<usize> = HashSet::new();
@@ -3981,7 +4007,7 @@ pub fn farmcpu_packed_to_tsv(
                         route,
                         it_idx + 1,
                         &rem_result,
-                        row_idx.as_deref(),
+                        meta_row_idx,
                         &chrom,
                         &pos,
                         &femp_masked,
@@ -4057,18 +4083,18 @@ pub fn farmcpu_packed_to_tsv(
                             candidate_count,
                             opt_lead.len(),
                             qtn_next.len(),
-                            farmcpu_debug_format_idx_list_1based(&qtn_idx, row_idx.as_deref()),
-                            farmcpu_debug_format_idx_list_1based(&opt_lead, row_idx.as_deref()),
-                            farmcpu_debug_format_idx_list_1based(&qtn_next, row_idx.as_deref()),
+                            farmcpu_debug_format_idx_list_1based(&qtn_idx, meta_row_idx),
+                            farmcpu_debug_format_idx_list_1based(&opt_lead, meta_row_idx),
+                            farmcpu_debug_format_idx_list_1based(&qtn_next, meta_row_idx),
                         ))
                         .map_err(PyRuntimeError::new_err)?;
                     debug
                         .write_line(&format!(
                             "iter_detail route=unified iter={} qtn_in={} lead={} qtn_next={}",
                             it_idx + 1,
-                            farmcpu_debug_format_marker_list(&qtn_idx, row_idx.as_deref(), &chrom, &pos, &femp),
-                            farmcpu_debug_format_marker_list(&opt_lead, row_idx.as_deref(), &chrom, &pos, &femp_masked),
-                            farmcpu_debug_format_marker_list(&qtn_next, row_idx.as_deref(), &chrom, &pos, &femp),
+                            farmcpu_debug_format_marker_list(&qtn_idx, meta_row_idx, &chrom, &pos, &femp),
+                            farmcpu_debug_format_marker_list(&opt_lead, meta_row_idx, &chrom, &pos, &femp_masked),
+                            farmcpu_debug_format_marker_list(&qtn_next, meta_row_idx, &chrom, &pos, &femp),
                         ))
                         .map_err(PyRuntimeError::new_err)?;
                     debug.flush().map_err(PyRuntimeError::new_err)?;
@@ -4222,14 +4248,14 @@ pub fn farmcpu_packed_to_tsv(
                                 it_idx + 1,
                                 qtn_in,
                                 qtn_in,
-                                farmcpu_debug_format_idx_list_1based(&qtn_idx, row_idx.as_deref()),
+                                farmcpu_debug_format_idx_list_1based(&qtn_idx, meta_row_idx),
                             ))
                             .map_err(PyRuntimeError::new_err)?;
                         debug
                             .write_line(&format!(
                             "iter_detail route=raw iter={} qtn_in={}",
                             it_idx + 1,
-                            farmcpu_debug_format_marker_list(&qtn_idx, row_idx.as_deref(), &chrom, &pos, &femp),
+                            farmcpu_debug_format_marker_list(&qtn_idx, meta_row_idx, &chrom, &pos, &femp),
                             ))
                             .map_err(PyRuntimeError::new_err)?;
                         debug.flush().map_err(PyRuntimeError::new_err)?;
@@ -4317,7 +4343,7 @@ pub fn farmcpu_packed_to_tsv(
                         route,
                         it_idx + 1,
                         &rem_result,
-                        row_idx.as_deref(),
+                        meta_row_idx,
                         &chrom,
                         &pos,
                         &femp,
@@ -4382,20 +4408,20 @@ pub fn farmcpu_packed_to_tsv(
                             opt_lead.len(),
                             opt_lead_outside_threshold.len(),
                             qtn_next.len(),
-                            farmcpu_debug_format_idx_list_1based(&qtn_idx, row_idx.as_deref()),
-                            farmcpu_debug_format_idx_list_1based(&opt_lead, row_idx.as_deref()),
-                            farmcpu_debug_format_idx_list_1based(&opt_lead_outside_threshold, row_idx.as_deref()),
-                            farmcpu_debug_format_idx_list_1based(&qtn_next, row_idx.as_deref()),
+                            farmcpu_debug_format_idx_list_1based(&qtn_idx, meta_row_idx),
+                            farmcpu_debug_format_idx_list_1based(&opt_lead, meta_row_idx),
+                            farmcpu_debug_format_idx_list_1based(&opt_lead_outside_threshold, meta_row_idx),
+                            farmcpu_debug_format_idx_list_1based(&qtn_next, meta_row_idx),
                         ))
                         .map_err(PyRuntimeError::new_err)?;
                     debug
                         .write_line(&format!(
                             "iter_detail route=raw iter={} qtn_in={} lead={} lead_outside_threshold={} qtn_next={}",
                             it_idx + 1,
-                            farmcpu_debug_format_marker_list(&qtn_idx, row_idx.as_deref(), &chrom, &pos, &femp),
-                            farmcpu_debug_format_marker_list(&opt_lead, row_idx.as_deref(), &chrom, &pos, &femp),
-                            farmcpu_debug_format_marker_list(&opt_lead_outside_threshold, row_idx.as_deref(), &chrom, &pos, &femp),
-                            farmcpu_debug_format_marker_list(&qtn_next, row_idx.as_deref(), &chrom, &pos, &femp),
+                            farmcpu_debug_format_marker_list(&qtn_idx, meta_row_idx, &chrom, &pos, &femp),
+                            farmcpu_debug_format_marker_list(&opt_lead, meta_row_idx, &chrom, &pos, &femp),
+                            farmcpu_debug_format_marker_list(&opt_lead_outside_threshold, meta_row_idx, &chrom, &pos, &femp),
+                            farmcpu_debug_format_marker_list(&qtn_next, meta_row_idx, &chrom, &pos, &femp),
                         ))
                         .map_err(PyRuntimeError::new_err)?;
                     debug.flush().map_err(PyRuntimeError::new_err)?;
@@ -4514,8 +4540,8 @@ pub fn farmcpu_packed_to_tsv(
                     "run_final route={:?} final_qtn_n={} final_qtn_rows1={} final_qtn={}",
                     route,
                     qtn_idx.len(),
-                    farmcpu_debug_format_idx_list_1based(&qtn_idx, row_idx.as_deref()),
-                    farmcpu_debug_format_marker_names(&qtn_idx, row_idx.as_deref(), &chrom, &pos),
+                    farmcpu_debug_format_idx_list_1based(&qtn_idx, meta_row_idx),
+                    farmcpu_debug_format_marker_names(&qtn_idx, meta_row_idx, &chrom, &pos),
                 ))
                 .map_err(PyRuntimeError::new_err)?;
             debug.flush().map_err(PyRuntimeError::new_err)?;
@@ -4567,7 +4593,7 @@ pub fn farmcpu_packed_to_tsv(
                 if !qtn_idx.is_empty() {
                     let qtn_row_lookup = qtn_idx
                         .iter()
-                        .map(|&idx| row_idx.as_ref().map(|v| v[idx]).unwrap_or(idx))
+                        .map(|&idx| meta_row_idx.map(|v| v[idx]).unwrap_or(idx))
                         .collect::<Vec<usize>>();
                     let (q_chrom, q_pos, q_snp, q_allele0, q_allele1) =
                         resolve_assoc_tsv_metadata(
@@ -4623,7 +4649,7 @@ pub fn farmcpu_packed_to_tsv(
                     Vec::new(),
                     Vec::new(),
                     Vec::new(),
-                    row_idx.as_deref(),
+                    meta_row_idx,
                     m,
                 )
                 .map_err(PyRuntimeError::new_err)?)

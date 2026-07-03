@@ -8068,6 +8068,15 @@ def _run_gwas_pipeline(
             emit_farmcpu_trait_header = len(stream_models) == 0
             trait_names_full = [str(t) for t in trait_order] if len(trait_order) > 0 else None
             farmcpu_cache_prefill: Union[dict[str, object], None] = None
+            def _force_farmcpu_trait_prepared_deferred_load(
+                cache_obj: Union[dict[str, object], None],
+            ) -> Union[dict[str, object], None]:
+                if not isinstance(cache_obj, dict):
+                    return cache_obj
+                cache_obj["packed_ctx"] = None
+                cache_obj["ref_alt"] = None
+                cache_obj["_defer_packed_trait_load"] = True
+                return cache_obj
             if (
                 bool(fast_mode)
                 and packed_preload_is_ready(preloaded_packed)
@@ -8163,6 +8172,7 @@ def _run_gwas_pipeline(
             strict_prefix_meta = None
             strict_ids_arr_meta = None
             strict_id_to_full_meta = None
+            global_trait_meta_single: Union[dict[str, object], None] = None
             if (
                 gwas_row_stat_mode == "strict-train"
                 and str(args.model).lower() == "add"
@@ -8185,6 +8195,22 @@ def _run_gwas_pipeline(
                         strict_prefix_meta = None
                         strict_ids_arr_meta = None
                         strict_id_to_full_meta = None
+            elif (
+                gwas_row_stat_mode == "global"
+                and str(args.model).lower() == "add"
+            ):
+                global_prefix_meta = _as_plink_prefix(genofile_stream)
+                if global_prefix_meta is not None:
+                    global_trait_meta_single = _gwas_logic_meta_global_cached(
+                        str(global_prefix_meta),
+                        maf_threshold=float(maf_threshold_scan),
+                        max_missing_rate=float(max_missing_rate_scan),
+                        het_threshold=float(het_threshold_scan),
+                        snps_only=bool(args.snps_only),
+                        outprefix=str(outprefix),
+                        logger=logger,
+                        use_spinner=False,
+                    )
             if bool(strict_trait_meta_ready) and len(trait_names_seq) > 0:
                 gwas_meta_window_mb = int(
                     max(
@@ -8257,6 +8283,9 @@ def _run_gwas_pipeline(
                             task.complete(
                                 "Computing trait-subset row statistics ...Finished"
                             )
+                    farmcpu_cache_runtime = _force_farmcpu_trait_prepared_deferred_load(
+                        farmcpu_cache_runtime,
+                    )
                     farmcpu_cache_runtime = run_farmcpu_fullmem(
                         args=args,
                         gfile=farmcpu_genofile,
@@ -8281,6 +8310,10 @@ def _run_gwas_pipeline(
                     if trait_idx_use < (len(trait_names_seq) - 1):
                         logger.info("")
             else:
+                if global_trait_meta_single is not None:
+                    farmcpu_cache_runtime = _force_farmcpu_trait_prepared_deferred_load(
+                        farmcpu_cache_runtime,
+                    )
                 _ = run_farmcpu_fullmem(
                     args=args,
                     gfile=farmcpu_genofile,
@@ -8300,6 +8333,7 @@ def _run_gwas_pipeline(
                     emit_trait_header=bool(emit_farmcpu_trait_header),
                     preloaded_packed=preloaded_packed,
                     qtn_preloaded_packed=qtn_preloaded_packed,
+                    trait_prepared_meta=global_trait_meta_single,
                 )
 
         if len(gwas_summary_rows) > 0:

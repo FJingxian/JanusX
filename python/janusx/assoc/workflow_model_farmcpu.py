@@ -973,7 +973,14 @@ def run_farmcpu_fullmem(
                         f"Loading phenotype from dataframe (n={pheno.shape[0]}, npheno={pheno.shape[1]})"
                     )
 
+        preloaded_packed_ready = (
+            preloaded_packed if packed_preload_is_ready(preloaded_packed) else None
+        )
         packed_prefix = _as_plink_prefix(gfile)
+        if packed_prefix is None and isinstance(preloaded_packed_ready, dict):
+            packed_prefix = _as_plink_prefix(
+                str(preloaded_packed_ready.get("prefix", ""))
+            )
         if packed_prefix is None:
             cache_guess = _gwas_cache_prefix_with_params(
                 gfile,
@@ -1029,7 +1036,6 @@ def run_farmcpu_fullmem(
         can_use_packed = (
             bool(getattr(args, "model", "add") == "add")
             and packed_prefix is not None
-            and matrix_path_cli is None
         )
         defer_packed_trait_load = bool(context_prepared)
         if can_use_packed:

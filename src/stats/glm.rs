@@ -2114,7 +2114,9 @@ fn lm_stream_bed_additive_prepared_unified(
     for &src_row in source_rows.iter() {
         if let Some(prev) = prev_src {
             if src_row < prev {
-                return Err("prepared row_indices must be sorted in ascending BED order".to_string());
+                return Err(
+                    "prepared row_indices must be sorted in ascending BED order".to_string()
+                );
             }
         }
         prev_src = Some(src_row);

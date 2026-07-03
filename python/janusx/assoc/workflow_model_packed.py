@@ -1164,6 +1164,34 @@ def _build_gwas_global_logic_meta(
     n_expected = int(full_ids.shape[0])
     if n_expected <= 0:
         raise ValueError("GWAS global scan metadata requires non-empty PLINK samples.")
+
+    if hasattr(jxrs, "prepare_bed_logic_meta_selected"):
+        threads_use = int(max(1, detect_effective_threads()))
+        mmap_window_mb = int(max(1, _current_bed_memory_mb()))
+        row_idx, miss, af, row_flip, _site_keep, n_samples_full, n_snps_total = jxrs.prepare_bed_logic_meta_selected(
+            str(plink_prefix),
+            sample_indices=None,
+            maf_threshold=float(maf_threshold),
+            max_missing_rate=float(max_missing_rate),
+            het_threshold=float(het_threshold),
+            snps_only=bool(snps_only),
+            mmap_window_mb=int(mmap_window_mb),
+            threads=threads_use,
+        )
+        row_idx_arr = np.ascontiguousarray(np.asarray(row_idx, dtype=np.int64).reshape(-1), dtype=np.int64)
+        if int(row_idx_arr.shape[0]) == 0:
+            raise ValueError("GWAS global scan metadata produced zero active SNPs after filtering.")
+        return {
+            "row_indices": row_idx_arr,
+            "missing_rate": np.ascontiguousarray(np.asarray(miss, dtype=np.float32).reshape(-1), dtype=np.float32),
+            "af": np.ascontiguousarray(np.asarray(af, dtype=np.float32).reshape(-1), dtype=np.float32),
+            "maf": np.ascontiguousarray(np.asarray(af, dtype=np.float32).reshape(-1), dtype=np.float32),
+            "row_flip": np.ascontiguousarray(np.asarray(row_flip, dtype=np.bool_).reshape(-1), dtype=np.bool_),
+            "site_keep": None,
+            "n_samples_full": int(n_samples_full),
+            "n_snps_total": int(n_snps_total),
+        }
+
     if scan_bed_2bit_packed_stats is not None:
         miss_raw, maf_raw, _std_raw, row_flip_raw, het_raw, packed_n = scan_bed_2bit_packed_stats(
             str(plink_prefix)

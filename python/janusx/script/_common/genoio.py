@@ -393,6 +393,27 @@ def open_plink_bed_payload_memmap(
     n_samples: int,
     n_snps: int,
 ) -> np.memmap:
+    bed_path, bytes_per_snp, _expected_size = inspect_plink_bed_payload_layout(
+        prefix,
+        n_samples=n_samples,
+        n_snps=n_snps,
+    )
+    return np.memmap(
+        bed_path,
+        dtype=np.uint8,
+        mode="r",
+        offset=3,
+        shape=(int(n_snps), int(bytes_per_snp)),
+        order="C",
+    )
+
+
+def inspect_plink_bed_payload_layout(
+    prefix: str,
+    *,
+    n_samples: int,
+    n_snps: int,
+) -> tuple[str, int, int]:
     plink_prefix = normalize_plink_prefix(prefix)
     bed_path = f"{plink_prefix}.bed"
     if not os.path.isfile(bed_path):
@@ -405,14 +426,50 @@ def open_plink_bed_payload_memmap(
             f"BED payload size mismatch: file={actual_size}, expected={expected_size} "
             f"(n_samples={int(n_samples)}, n_snps={int(n_snps)}, bytes_per_snp={int(bytes_per_snp)})"
         )
-    return np.memmap(
-        bed_path,
-        dtype=np.uint8,
-        mode="r",
-        offset=3,
-        shape=(int(n_snps), int(bytes_per_snp)),
-        order="C",
+    return bed_path, int(bytes_per_snp), int(expected_size)
+
+
+def load_plink_bed_payload_owned(
+    prefix: str,
+    *,
+    n_samples: int,
+    n_snps: int,
+) -> np.ndarray:
+    bed_path, bytes_per_snp, expected_size = inspect_plink_bed_payload_layout(
+        prefix,
+        n_samples=n_samples,
+        n_snps=n_snps,
     )
+    payload = np.empty((int(n_snps), int(bytes_per_snp)), dtype=np.uint8, order="C")
+    payload_view = memoryview(payload).cast("B")
+    payload_bytes = int(payload_view.nbytes)
+    if payload_bytes != (expected_size - 3):
+        raise ValueError(
+            f"BED payload byte mismatch: array={payload_bytes}, expected={expected_size - 3}"
+        )
+
+    chunk_mb_raw = os.environ.get("JX_PACKED_OWNED_READ_CHUNK_MB", "64").strip()
+    try:
+        chunk_mb = float(chunk_mb_raw)
+    except Exception:
+        chunk_mb = 64.0
+    if (not np.isfinite(chunk_mb)) or (chunk_mb <= 0.0):
+        chunk_mb = 64.0
+    chunk_bytes = max(1, int(chunk_mb * 1024.0 * 1024.0))
+
+    with open(bed_path, "rb") as fh:
+        fh.seek(3, os.SEEK_SET)
+        offset = 0
+        while offset < payload_bytes:
+            end = min(payload_bytes, offset + chunk_bytes)
+            n_read = fh.readinto(payload_view[offset:end])
+            if n_read is None or int(n_read) <= 0:
+                raise ValueError(
+                    f"Unexpected EOF while reading BED payload from {bed_path}: "
+                    f"read={offset}, expected={payload_bytes}"
+                )
+            offset += int(n_read)
+    return payload
 
 
 def packed_row_het_rate(packed: np.ndarray, n_samples: int) -> np.ndarray:
@@ -1223,21 +1280,23 @@ def prepare_packed_ctx_from_plink(
             lazy_keep_ratio = min(1.0, max(0.0, lazy_keep_ratio))
             use_lazy = bool(keep_ratio >= lazy_keep_ratio)
 
-        packed_memmap = open_plink_bed_payload_memmap(
-            str(plink_prefix),
-            n_samples=int(meta_ctx["n_samples"]),
-            n_snps=int(meta_ctx["n_total_sites"]),
-        )
+        packed_memmap: np.memmap | None = None
+        if filter_mode_key != "lazy_owned":
+            packed_memmap = open_plink_bed_payload_memmap(
+                str(plink_prefix),
+                n_samples=int(meta_ctx["n_samples"]),
+                n_snps=int(meta_ctx["n_total_sites"]),
+            )
         if use_lazy:
             if filter_mode_key == "lazy_owned":
-                packed_payload: np.ndarray = np.array(
-                    packed_memmap,
-                    dtype=np.uint8,
-                    order="C",
-                    copy=True,
+                packed_payload = load_plink_bed_payload_owned(
+                    str(plink_prefix),
+                    n_samples=int(meta_ctx["n_samples"]),
+                    n_snps=int(meta_ctx["n_total_sites"]),
                 )
                 packed_storage = "owned"
             else:
+                assert packed_memmap is not None
                 packed_payload = packed_memmap
                 packed_storage = "memmap"
             packed_ctx = dict(meta_ctx)
@@ -1246,10 +1305,17 @@ def prepare_packed_ctx_from_plink(
             packed_ctx["packed_storage"] = packed_storage
             return sample_ids_arr, packed_ctx
 
+        if packed_memmap is None:
+            packed_memmap = open_plink_bed_payload_memmap(
+                str(plink_prefix),
+                n_samples=int(meta_ctx["n_samples"]),
+                n_snps=int(meta_ctx["n_total_sites"]),
+            )
         if bool(np.all(site_keep)):
-            packed = np.ascontiguousarray(
-                np.asarray(packed_memmap, dtype=np.uint8),
-                dtype=np.uint8,
+            packed = load_plink_bed_payload_owned(
+                str(plink_prefix),
+                n_samples=int(meta_ctx["n_samples"]),
+                n_snps=int(meta_ctx["n_total_sites"]),
             )
             packed_ctx = dict(meta_ctx)
         else:

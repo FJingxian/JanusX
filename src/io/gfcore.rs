@@ -2292,7 +2292,9 @@ impl BedSnpIter {
             let excluded_counts =
                 self.decode_snp_bytes_selected_counts_only(snp_bytes, excluded_sample_indices);
             counts.alt_sum -= excluded_counts.alt_sum;
-            counts.non_missing = counts.non_missing.saturating_sub(excluded_counts.non_missing);
+            counts.non_missing = counts
+                .non_missing
+                .saturating_sub(excluded_counts.non_missing);
             counts.het_count = counts.het_count.saturating_sub(excluded_counts.het_count);
             return counts;
         }

@@ -1089,7 +1089,7 @@ where
             if let Some(prev) = prev_src {
                 if src_row < prev {
                     return Err(
-                        "prepared row_indices must be sorted in ascending BED order".to_string(),
+                        "prepared row_indices must be sorted in ascending BED order".to_string()
                     );
                 }
             }
@@ -1142,14 +1142,18 @@ where
         }
         chunk.clear();
         let chunk_end = (chunk_start + scan_chunk_snps).min(total_scan_units);
-        let prepared_batch = prepared_source_rows.as_ref().zip(prepared_meta).map(|(source_rows_all, meta)| {
-            (
-                &source_rows_all[chunk_start..chunk_end],
-                &meta.row_flip[chunk_start..chunk_end],
-                &meta.row_maf[chunk_start..chunk_end],
-                &meta.miss_counts[chunk_start..chunk_end],
-            )
-        });
+        let prepared_batch =
+            prepared_source_rows
+                .as_ref()
+                .zip(prepared_meta)
+                .map(|(source_rows_all, meta)| {
+                    (
+                        &source_rows_all[chunk_start..chunk_end],
+                        &meta.row_flip[chunk_start..chunk_end],
+                        &meta.row_maf[chunk_start..chunk_end],
+                        &meta.miss_counts[chunk_start..chunk_end],
+                    )
+                });
         let prepared_src_start = prepared_batch
             .as_ref()
             .and_then(|(source_rows, _, _, _)| source_rows.first().copied());
@@ -1161,7 +1165,8 @@ where
                 return chunk_start < total_scan_units;
             }
             match bed_window.as_mut() {
-                Some(window) => match window.prepare_source_rows(source_rows, &mut rel_row_indices) {
+                Some(window) => match window.prepare_source_rows(source_rows, &mut rel_row_indices)
+                {
                     Ok(slice) => slice,
                     Err(e) => {
                         let _ = producer_err_bg.set(e);
@@ -1257,8 +1262,8 @@ where
                 .into_par_iter()
                 .map(|snp_idx| {
                     let local_idx = snp_idx - chunk_start;
-                    let row = &chunk_packed
-                        [local_idx * bytes_per_snp..(local_idx + 1) * bytes_per_snp];
+                    let row =
+                        &chunk_packed[local_idx * bytes_per_snp..(local_idx + 1) * bytes_per_snp];
                     let (missing, het, hom_alt) = if use_selected {
                         count_packed_row_counts_selected_with_excluded(
                             row,
@@ -1412,10 +1417,7 @@ where
                     py2.check_signals()?;
                     cb.call1(
                         py2,
-                        (
-                            chunk.scanned_to.min(total_scan_units),
-                            total_scan_units,
-                        ),
+                        (chunk.scanned_to.min(total_scan_units), total_scan_units),
                     )?;
                     Ok(())
                 });

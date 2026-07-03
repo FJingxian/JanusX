@@ -2546,16 +2546,16 @@ pub fn fvlmm_assoc_bed_to_tsv_f32<'py>(
                 }
                 chunk.clear();
                 let chunk_end = (chunk_start + scan_chunk_snps).min(total_scan_units);
-                let prepared_batch = prepared_meta
-                    .as_ref()
-                    .map(|(source_rows, row_flip_all, row_maf_all, miss_count_all)| {
+                let prepared_batch = prepared_meta.as_ref().map(
+                    |(source_rows, row_flip_all, row_maf_all, miss_count_all)| {
                         (
                             &source_rows[chunk_start..chunk_end],
                             &row_flip_all[chunk_start..chunk_end],
                             &row_maf_all[chunk_start..chunk_end],
                             &miss_count_all[chunk_start..chunk_end],
                         )
-                    });
+                    },
+                );
                 let prepared_src_start = prepared_batch
                     .as_ref()
                     .and_then(|(source_rows, _, _, _)| source_rows.first().copied());
@@ -2567,13 +2567,15 @@ pub fn fvlmm_assoc_bed_to_tsv_f32<'py>(
                         return chunk_start < total_scan_units;
                     }
                     match bed_window.as_mut() {
-                        Some(window) => match window.prepare_source_rows(source_rows, &mut rel_row_indices) {
-                            Ok(slice) => slice,
-                            Err(e) => {
-                                let _ = producer_err_bg.set(e);
-                                return false;
+                        Some(window) => {
+                            match window.prepare_source_rows(source_rows, &mut rel_row_indices) {
+                                Ok(slice) => slice,
+                                Err(e) => {
+                                    let _ = producer_err_bg.set(e);
+                                    return false;
+                                }
                             }
-                        },
+                        }
                         None => {
                             let mmap = match full_mmap.as_ref() {
                                 Some(mmap) => mmap,
@@ -2853,10 +2855,7 @@ pub fn fvlmm_assoc_bed_to_tsv_f32<'py>(
                             py2.check_signals()?;
                             cb.call1(
                                 py2,
-                                (
-                                    chunk.scanned_to.min(total_scan_units),
-                                    total_scan_units,
-                                ),
+                                (chunk.scanned_to.min(total_scan_units), total_scan_units),
                             )?;
                             Ok(())
                         });

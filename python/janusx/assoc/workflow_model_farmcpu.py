@@ -114,6 +114,11 @@ def _format_farmcpu_done_elapsed(seconds: float) -> str:
     return format_elapsed(s)
 
 
+def _farmcpu_compact_retry_enabled() -> bool:
+    raw = str(os.environ.get("JX_FARMCPU_COMPACT_RETRY", "off")).strip().lower()
+    return raw in {"1", "true", "yes", "y", "on"}
+
+
 def _normalize_packed_ctx_for_farmcpu_cache(
     packed_obj: dict[str, object],
 ) -> dict[str, object]:
@@ -824,7 +829,204 @@ def run_farmcpu_fullmem(
         emit_status: bool = True,
     ) -> tuple[dict[str, object], object]:
         if isinstance(trait_prepared_meta, dict):
-            from janusx.assoc.workflow_model_packed import _prepare_packed_bed_once_for_gwas
+            from janusx.assoc.workflow_model_packed import (
+                _coerce_trait_prepared_scan_meta,
+                _prepare_packed_bed_once_for_gwas,
+            )
+
+            prepared_scan_meta = _coerce_trait_prepared_scan_meta(trait_prepared_meta)
+            if prepared_scan_meta is not None:
+                row_idx_prepared, miss_rate_prepared, maf_prepared, row_flip_prepared = prepared_scan_meta
+
+                packed_ctx_full_obj = None
+                if isinstance(farmcpu_cache, dict):
+                    packed_ctx_full_candidate = farmcpu_cache.get("_packed_ctx_full")
+                    if isinstance(packed_ctx_full_candidate, dict):
+                        packed_ctx_full_obj = packed_ctx_full_candidate
+
+                if packed_ctx_full_obj is None:
+                    preloaded_packed_ready_local = (
+                        preloaded_packed if packed_preload_is_ready(preloaded_packed) else None
+                    )
+                    if (
+                        isinstance(preloaded_packed_ready_local, dict)
+                        and str(preloaded_packed_ready_local.get("prefix", "")).strip()
+                        == str(packed_prefix).strip()
+                    ):
+                        packed_ctx_preloaded_obj = preloaded_packed_ready_local.get("packed_ctx")
+                        if isinstance(packed_ctx_preloaded_obj, dict):
+                            packed_ctx_full_obj = packed_ctx_preloaded_obj
+
+                packed_ctx_prepared: Union[dict[str, object], None] = None
+                packed_rows_full = 0
+                if isinstance(packed_ctx_full_obj, dict):
+                    packed_mode_full = str(
+                        packed_ctx_full_obj.get("packed_filter_mode", "")
+                    ).strip().lower()
+                    if packed_mode_full == "lazy_full":
+                        packed_num_full = np.ascontiguousarray(
+                            np.asarray(packed_ctx_full_obj["packed"], dtype=np.uint8)
+                        )
+                        packed_rows_full = int(packed_num_full.shape[0])
+                        if (
+                            int(row_idx_prepared.shape[0]) > 0
+                            and int(row_idx_prepared.min()) >= 0
+                            and int(row_idx_prepared.max()) < packed_rows_full
+                        ):
+                            site_keep_prepared = np.zeros((packed_rows_full,), dtype=np.bool_)
+                            site_keep_prepared[row_idx_prepared] = True
+                            packed_ctx_prepared = {
+                                "packed": packed_num_full,
+                                "missing_rate": miss_rate_prepared,
+                                "af": maf_prepared,
+                                "maf": maf_prepared,
+                                "row_flip": row_flip_prepared,
+                                "site_keep": site_keep_prepared,
+                                "active_row_idx": row_idx_prepared,
+                                "row_indices": row_idx_prepared,
+                                "packed_filter_mode": "lazy_full",
+                                "packed_storage": str(
+                                    packed_ctx_full_obj.get("packed_storage", "owned")
+                                ),
+                                "n_samples": int(packed_ctx_full_obj["n_samples"]),
+                                "n_total_sites": int(packed_rows_full),
+                                "n_active_sites": int(row_idx_prepared.shape[0]),
+                                "source_prefix": str(packed_prefix),
+                            }
+                            if isinstance(farmcpu_cache, dict) and "_packed_ctx_full" not in farmcpu_cache:
+                                farmcpu_cache["_packed_ctx_full"] = packed_ctx_full_obj
+
+                if packed_ctx_prepared is None:
+                    try:
+                        if bool(emit_status):
+                            with CliStatus(f"{status_label}...", enabled=bool(use_spinner)) as task:
+                                try:
+                                    _sample_ids_packed, packed_ctx_full_loaded = prepare_packed_ctx_from_plink(
+                                        str(packed_prefix),
+                                        maf=float(args.maf),
+                                        missing_rate=float(args.geno),
+                                        snps_only=False,
+                                        expected_n_samples=int(expected_n_samples),
+                                        filter_mode="lazy_owned",
+                                    )
+                                except Exception:
+                                    task.fail(f"{status_label} ...Failed")
+                                    raise
+                                task.complete(f"{status_label} ...Finished")
+                        else:
+                            _sample_ids_packed, packed_ctx_full_loaded = prepare_packed_ctx_from_plink(
+                                str(packed_prefix),
+                                maf=float(args.maf),
+                                missing_rate=float(args.geno),
+                                snps_only=False,
+                                expected_n_samples=int(expected_n_samples),
+                                filter_mode="lazy_owned",
+                            )
+                        packed_ctx_full_obj = {
+                            "packed": np.ascontiguousarray(
+                                np.asarray(packed_ctx_full_loaded["packed"], dtype=np.uint8)
+                            ),
+                            "missing_rate": np.ascontiguousarray(
+                                np.asarray(
+                                    packed_ctx_full_loaded["missing_rate"],
+                                    dtype=np.float32,
+                                ).reshape(-1),
+                                dtype=np.float32,
+                            ),
+                            "af": np.ascontiguousarray(
+                                np.asarray(
+                                    packed_ctx_full_loaded.get(
+                                        "af",
+                                        packed_ctx_full_loaded["maf"],
+                                    ),
+                                    dtype=np.float32,
+                                ).reshape(-1),
+                                dtype=np.float32,
+                            ),
+                            "maf": np.ascontiguousarray(
+                                np.asarray(
+                                    packed_ctx_full_loaded.get(
+                                        "af",
+                                        packed_ctx_full_loaded["maf"],
+                                    ),
+                                    dtype=np.float32,
+                                ).reshape(-1),
+                                dtype=np.float32,
+                            ),
+                            "row_flip": np.ascontiguousarray(
+                                np.asarray(
+                                    packed_ctx_full_loaded["row_flip"],
+                                    dtype=np.bool_,
+                                ).reshape(-1),
+                                dtype=np.bool_,
+                            ),
+                            "site_keep": np.ascontiguousarray(
+                                np.asarray(
+                                    packed_ctx_full_loaded.get("site_keep"),
+                                    dtype=np.bool_,
+                                ).reshape(-1),
+                                dtype=np.bool_,
+                            ) if packed_ctx_full_loaded.get("site_keep", None) is not None else None,
+                            "active_row_idx": np.ascontiguousarray(
+                                np.asarray(
+                                    packed_ctx_full_loaded.get(
+                                        "active_row_idx",
+                                        np.arange(
+                                            int(np.asarray(packed_ctx_full_loaded["packed"]).shape[0]),
+                                            dtype=np.int64,
+                                        ),
+                                    ),
+                                    dtype=np.int64,
+                                ).reshape(-1),
+                                dtype=np.int64,
+                            ),
+                            "packed_filter_mode": str(
+                                packed_ctx_full_loaded.get("packed_filter_mode", "lazy_full")
+                            ),
+                            "packed_storage": str(
+                                packed_ctx_full_loaded.get("packed_storage", "owned")
+                            ),
+                            "n_samples": int(packed_ctx_full_loaded["n_samples"]),
+                            "source_prefix": str(packed_prefix),
+                        }
+                        if isinstance(farmcpu_cache, dict):
+                            farmcpu_cache["_packed_ctx_full"] = packed_ctx_full_obj
+                        packed_num_full = np.ascontiguousarray(
+                            np.asarray(packed_ctx_full_obj["packed"], dtype=np.uint8)
+                        )
+                        packed_rows_full = int(packed_num_full.shape[0])
+                        if int(row_idx_prepared.shape[0]) == 0 or int(row_idx_prepared.max()) >= packed_rows_full:
+                            raise ValueError(
+                                "FarmCPU trait-prepared row indices exceed lazy-owned packed bounds."
+                            )
+                        site_keep_prepared = np.zeros((packed_rows_full,), dtype=np.bool_)
+                        site_keep_prepared[row_idx_prepared] = True
+                        packed_ctx_prepared = {
+                            "packed": packed_num_full,
+                            "missing_rate": miss_rate_prepared,
+                            "af": maf_prepared,
+                            "maf": maf_prepared,
+                            "row_flip": row_flip_prepared,
+                            "site_keep": site_keep_prepared,
+                            "active_row_idx": row_idx_prepared,
+                            "row_indices": row_idx_prepared,
+                            "packed_filter_mode": "lazy_full",
+                            "packed_storage": "owned",
+                            "n_samples": int(packed_ctx_full_obj["n_samples"]),
+                            "n_total_sites": int(packed_rows_full),
+                            "n_active_sites": int(row_idx_prepared.shape[0]),
+                            "source_prefix": str(packed_prefix),
+                        }
+                    except Exception:
+                        packed_ctx_prepared = None
+
+                if packed_ctx_prepared is not None:
+                    ref_alt_prepared = _make_deferred_bim_metadata(
+                        str(packed_prefix),
+                        row_idx_prepared,
+                        n_markers=int(row_idx_prepared.shape[0]),
+                    )
+                    return packed_ctx_prepared, ref_alt_prepared
 
             _prefix_loaded, _full_ids_loaded, packed_ctx_prepared, _sites_meta = _prepare_packed_bed_once_for_gwas(
                 genofile=str(packed_prefix),
@@ -1598,12 +1800,20 @@ def run_farmcpu_fullmem(
                         ) = _parse_farmcpu_rust_tsv_result(rust_result)
                     except Exception as ex:
                         msg = str(ex)
-                        can_retry_compact = (
+                        compact_retry_candidate = (
                             ("metadata length mismatch" in msg or "row metadata length mismatch" in msg or "row_indices[" in msg)
                             and int(packed_rows) != int(meta_rows)
                             and int(row_idx_arr.shape[0]) == int(meta_rows)
                         )
+                        can_retry_compact = bool(
+                            compact_retry_candidate and _farmcpu_compact_retry_enabled()
+                        )
                         if not can_retry_compact:
+                            if compact_retry_candidate:
+                                raise RuntimeError(
+                                    f"{msg} (FarmCPU compact packed retry is disabled to avoid duplicating the full BED payload; "
+                                    "set JX_FARMCPU_COMPACT_RETRY=1 to restore the old fallback.)"
+                                ) from ex
                             raise
                         packed_compact, row_flip_compact, maf_compact = _compact_packed_for_metadata_alignment()
                         rust_result = jxrs.farmcpu_packed_to_tsv(
@@ -1682,12 +1892,20 @@ def run_farmcpu_fullmem(
                         )
                     except Exception as ex:
                         msg = str(ex)
-                        can_retry_compact = (
+                        compact_retry_candidate = (
                             ("metadata length mismatch" in msg or "row metadata length mismatch" in msg or "row_indices[" in msg)
                             and int(packed_rows) != int(meta_rows)
                             and int(row_idx_arr.shape[0]) == int(meta_rows)
                         )
+                        can_retry_compact = bool(
+                            compact_retry_candidate and _farmcpu_compact_retry_enabled()
+                        )
                         if not can_retry_compact:
+                            if compact_retry_candidate:
+                                raise RuntimeError(
+                                    f"{msg} (FarmCPU compact packed retry is disabled to avoid duplicating the full BED payload; "
+                                    "set JX_FARMCPU_COMPACT_RETRY=1 to restore the old fallback.)"
+                                ) from ex
                             raise
                         packed_compact, row_flip_compact, maf_compact = _compact_packed_for_metadata_alignment()
                         _res = jxrs.gwas_packed_unified_to_tsv(

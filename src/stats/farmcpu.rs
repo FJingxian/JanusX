@@ -76,7 +76,10 @@ use crate::eigh::symmetric_eigh_f64_row_major;
 use crate::linalg::{
     chisq_from_beta_se_and_optional_plrt, format_chisq_value, sanitize_assoc_pvalue,
 };
-use crate::stats_common::{env_truthy, get_cached_pool, parse_index_vec_i64, AsyncTsvWriter};
+use crate::stats_common::{
+    env_truthy, format_bytes, get_cached_pool, parse_index_vec_i64, process_memory_usage,
+    AsyncTsvWriter,
+};
 use nalgebra::DMatrix;
 use numpy::PyArray1;
 use numpy::PyArrayMethods;
@@ -136,6 +139,49 @@ fn farmcpu_raw_rem_scorer_mode() -> FarmcpuRawRemScorer {
 #[inline]
 fn farmcpu_stage1_timing_enabled() -> bool {
     env_truthy("JX_FARMCPU_STAGE1_TIMING")
+}
+
+#[inline]
+fn farmcpu_mem_debug_enabled() -> bool {
+    env_truthy("JX_FARMCPU_MEM_DEBUG")
+}
+
+#[inline]
+fn farmcpu_emit_mem_debug(stage: &str, detail: &str) {
+    if !farmcpu_mem_debug_enabled() {
+        return;
+    }
+    if let Some(usage) = process_memory_usage() {
+        let rss = usage
+            .rss_bytes
+            .map(format_bytes)
+            .unwrap_or_else(|| "NA".to_string());
+        let footprint = usage
+            .footprint_bytes
+            .map(format_bytes)
+            .unwrap_or_else(|| "NA".to_string());
+        eprintln!(
+            "[farmcpu-mem] stage={stage} {}={} rss={} footprint={} detail={detail}",
+            usage.metric,
+            format_bytes(usage.current_bytes),
+            rss,
+            footprint,
+        );
+    } else {
+        eprintln!("[farmcpu-mem] stage={stage} rss=NA detail={detail}");
+    }
+}
+
+#[inline]
+fn farmcpu_scan_blas_threads(_total_threads: usize) -> usize {
+    if let Ok(raw) = std::env::var("JX_FARMCPU_BLAS_THREADS") {
+        if let Ok(parsed) = raw.trim().parse::<usize>() {
+            if parsed > 0 {
+                return parsed;
+            }
+        }
+    }
+    1usize
 }
 
 #[inline]
@@ -624,10 +670,80 @@ fn resolve_assoc_chrom_pos_metadata(
     Ok((chrom_out, pos_out))
 }
 
-fn parse_nonnegative_index_vec_i64(
-    indices: &[i64],
-    label: &str,
-) -> PyResult<Vec<usize>> {
+struct BimSelectedFieldStream {
+    bim_path: String,
+    reader: BufReader<File>,
+    next_line_no: usize,
+}
+
+impl BimSelectedFieldStream {
+    fn open(prefix: &str) -> Result<Self, String> {
+        let bim_path = format!("{prefix}.bim");
+        let file = File::open(&bim_path).map_err(|e| format!("{bim_path}: {e}"))?;
+        Ok(Self {
+            bim_path,
+            reader: BufReader::with_capacity(8 * 1024 * 1024, file),
+            next_line_no: 0usize,
+        })
+    }
+
+    fn read_block(
+        &mut self,
+        source_rows: &[usize],
+    ) -> Result<(Vec<String>, Vec<String>, Vec<String>), String> {
+        if source_rows.is_empty() {
+            return Ok((Vec::new(), Vec::new(), Vec::new()));
+        }
+        if !source_rows.windows(2).all(|w| w[0] <= w[1]) {
+            return Err("BIM field stream requires sorted source_rows".to_string());
+        }
+        let mut snp = Vec::<String>::with_capacity(source_rows.len());
+        let mut allele0 = Vec::<String>::with_capacity(source_rows.len());
+        let mut allele1 = Vec::<String>::with_capacity(source_rows.len());
+        let mut want_ptr = 0usize;
+        let mut line = String::new();
+        while want_ptr < source_rows.len() {
+            line.clear();
+            let n_read = self
+                .reader
+                .read_line(&mut line)
+                .map_err(|e| format!("{}:{}: {}", self.bim_path, self.next_line_no + 1, e))?;
+            if n_read == 0 {
+                return Err(format!(
+                    "BIM ended early: needed row {} but only resolved {} selected rows from {}",
+                    source_rows[want_ptr], want_ptr, self.bim_path
+                ));
+            }
+            let cur_line_no = self.next_line_no;
+            self.next_line_no += 1;
+            let want_row = source_rows[want_ptr];
+            if cur_line_no < want_row {
+                continue;
+            }
+            if cur_line_no > want_row {
+                return Err(format!(
+                    "BIM stream advanced past requested row: current={}, requested={} ({})",
+                    cur_line_no, want_row, self.bim_path
+                ));
+            }
+            let toks: Vec<&str> = line.split_whitespace().collect();
+            if toks.len() < 6 {
+                return Err(format!(
+                    "{}:{}: malformed BIM row (need >=6 columns)",
+                    self.bim_path,
+                    cur_line_no + 1
+                ));
+            }
+            snp.push(toks[1].to_string());
+            allele0.push(toks[4].to_string());
+            allele1.push(toks[5].to_string());
+            want_ptr += 1;
+        }
+        Ok((snp, allele0, allele1))
+    }
+}
+
+fn parse_nonnegative_index_vec_i64(indices: &[i64], label: &str) -> PyResult<Vec<usize>> {
     let mut out = Vec::with_capacity(indices.len());
     for (i, &v) in indices.iter().enumerate() {
         if v < 0 {
@@ -1497,6 +1613,166 @@ impl GlmScratch {
     }
 }
 
+struct FarmcpuScanBlock {
+    row_start: usize,
+    rows: usize,
+    geno_block: Vec<f64>,
+    sy_block: Vec<f64>,
+    ss_block: Vec<f64>,
+    xs_block: Vec<f64>,
+    b21_block: Vec<f64>,
+    stat_block: Vec<f64>,
+}
+
+impl FarmcpuScanBlock {
+    fn new(capacity: usize, n: usize, q0: usize, stat_stride: usize) -> Self {
+        Self {
+            row_start: 0usize,
+            rows: 0usize,
+            geno_block: vec![0.0_f64; capacity.saturating_mul(n)],
+            sy_block: vec![0.0_f64; capacity],
+            ss_block: vec![0.0_f64; capacity],
+            xs_block: vec![0.0_f64; capacity.saturating_mul(q0)],
+            b21_block: vec![0.0_f64; capacity.saturating_mul(q0)],
+            stat_block: vec![f64::NAN; capacity.saturating_mul(stat_stride.max(1))],
+        }
+    }
+}
+
+struct FarmcpuQtnColumnCache {
+    n: usize,
+    columns: HashMap<usize, Vec<f64>>,
+}
+
+impl FarmcpuQtnColumnCache {
+    #[inline]
+    fn new(n: usize) -> Self {
+        Self {
+            n,
+            columns: HashMap::new(),
+        }
+    }
+
+    #[inline]
+    fn ensure_decoded(
+        &mut self,
+        qtn_idx: &[usize],
+        packed_flat: &[u8],
+        bytes_per_snp: usize,
+        row_indices: Option<&[usize]>,
+        sample_idx: &[usize],
+        row_flip: &[bool],
+        row_maf: &[f32],
+    ) -> Result<(), String> {
+        let mut missing = Vec::<usize>::new();
+        for &idx in qtn_idx.iter() {
+            if !self.columns.contains_key(&idx) {
+                missing.push(idx);
+            }
+        }
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let decoded = decode_packed_rows_to_sample_major(
+            packed_flat,
+            bytes_per_snp,
+            &missing,
+            row_indices,
+            sample_idx,
+            row_flip,
+            row_maf,
+        )?;
+        let k_missing = missing.len();
+        for (col_pos, &idx) in missing.iter().enumerate() {
+            let mut col = vec![0.0_f64; self.n];
+            for i in 0..self.n {
+                col[i] = decoded[i * k_missing + col_pos];
+            }
+            self.columns.insert(idx, col);
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn build_x_from_base(
+        &mut self,
+        base_x: &[f64],
+        q_base: usize,
+        qtn_idx: &[usize],
+        packed_flat: &[u8],
+        bytes_per_snp: usize,
+        row_indices: Option<&[usize]>,
+        sample_idx: &[usize],
+        row_flip: &[bool],
+        row_maf: &[f32],
+    ) -> Result<(Vec<f64>, usize), String> {
+        if base_x.len() != self.n.saturating_mul(q_base) {
+            return Err("base X shape mismatch".to_string());
+        }
+        self.ensure_decoded(
+            qtn_idx,
+            packed_flat,
+            bytes_per_snp,
+            row_indices,
+            sample_idx,
+            row_flip,
+            row_maf,
+        )?;
+        let k = qtn_idx.len();
+        let q_total = q_base + k;
+        let mut out = vec![0.0_f64; self.n.saturating_mul(q_total)];
+        for i in 0..self.n {
+            let src = &base_x[i * q_base..(i + 1) * q_base];
+            let dst = &mut out[i * q_total..i * q_total + q_base];
+            dst.copy_from_slice(src);
+        }
+        for (j, &idx) in qtn_idx.iter().enumerate() {
+            let col = self
+                .columns
+                .get(&idx)
+                .ok_or_else(|| format!("QTN cache missing decoded column for row {idx}"))?;
+            for i in 0..self.n {
+                out[i * q_total + q_base + j] = col[i];
+            }
+        }
+        Ok((out, q_total))
+    }
+
+    #[inline]
+    fn sample_major_matrix(
+        &mut self,
+        qtn_idx: &[usize],
+        packed_flat: &[u8],
+        bytes_per_snp: usize,
+        row_indices: Option<&[usize]>,
+        sample_idx: &[usize],
+        row_flip: &[bool],
+        row_maf: &[f32],
+    ) -> Result<Vec<f64>, String> {
+        self.ensure_decoded(
+            qtn_idx,
+            packed_flat,
+            bytes_per_snp,
+            row_indices,
+            sample_idx,
+            row_flip,
+            row_maf,
+        )?;
+        let k = qtn_idx.len();
+        let mut out = vec![0.0_f64; self.n.saturating_mul(k)];
+        for (j, &idx) in qtn_idx.iter().enumerate() {
+            let col = self
+                .columns
+                .get(&idx)
+                .ok_or_else(|| format!("QTN cache missing decoded column for row {idx}"))?;
+            for i in 0..self.n {
+                out[i * k + j] = col[i];
+            }
+        }
+        Ok(out)
+    }
+}
+
 fn pinv_xtx_with_rank(xtx: &[f64], q: usize) -> Result<(Vec<f64>, usize), String> {
     if q == 0 {
         return Ok((Vec::new(), 0usize));
@@ -1712,6 +1988,7 @@ fn build_farmcpu_final_windows(
     row_maf: &[f32],
     ld_thr: f64,
     merge_overlapping_windows: bool,
+    qtn_cache: Option<&mut FarmcpuQtnColumnCache>,
 ) -> Result<Vec<FarmcpuFinalWindow>, String> {
     let k = qtn_idx.len();
     if k == 0 || final_window_bp < 0 {
@@ -1742,15 +2019,27 @@ fn build_farmcpu_final_windows(
     }
 
     if k > 1 && ld_thr.is_finite() && ld_thr > 0.0 {
-        let sample_major = decode_packed_rows_to_sample_major(
-            packed_flat,
-            bytes_per_snp,
-            qtn_idx,
-            row_indices,
-            sample_idx,
-            row_flip,
-            row_maf,
-        )?;
+        let sample_major = if let Some(cache) = qtn_cache {
+            cache.sample_major_matrix(
+                qtn_idx,
+                packed_flat,
+                bytes_per_snp,
+                row_indices,
+                sample_idx,
+                row_flip,
+                row_maf,
+            )?
+        } else {
+            decode_packed_rows_to_sample_major(
+                packed_flat,
+                bytes_per_snp,
+                qtn_idx,
+                row_indices,
+                sample_idx,
+                row_flip,
+                row_maf,
+            )?
+        };
         for a in 0..k {
             for b in (a + 1)..k {
                 let ia = qtn_idx[a];
@@ -1832,6 +2121,7 @@ fn farmcpu_prune_qtn_by_merged_windows(
     ld_thr: f64,
     merge_overlapping_windows: bool,
     max_keep: usize,
+    qtn_cache: Option<&mut FarmcpuQtnColumnCache>,
 ) -> Result<Vec<usize>, String> {
     if qtn_idx.is_empty() || max_keep == 0 {
         return Ok(Vec::new());
@@ -1849,6 +2139,7 @@ fn farmcpu_prune_qtn_by_merged_windows(
         row_maf,
         ld_thr,
         merge_overlapping_windows,
+        qtn_cache,
     )?;
     let mut reps: Vec<(f64, usize)> = Vec::with_capacity(windows.len());
     for window in windows.iter() {
@@ -2019,7 +2310,21 @@ fn build_x_with_qtn_packed(
     sample_idx: &[usize],
     row_flip: &[bool],
     row_maf: &[f32],
+    qtn_cache: Option<&mut FarmcpuQtnColumnCache>,
 ) -> Result<(Vec<f64>, usize), String> {
+    if let Some(cache) = qtn_cache {
+        return cache.build_x_from_base(
+            base_x,
+            q_base,
+            qtn_idx,
+            packed_flat,
+            bytes_per_snp,
+            row_indices,
+            sample_idx,
+            row_flip,
+            row_maf,
+        );
+    }
     if base_x.len() != n * q_base {
         return Err("base X shape mismatch".to_string());
     }
@@ -2264,23 +2569,27 @@ fn scan_packed_full_matrix_reduced(
     let code4_lut = &packed_byte_lut().code4;
     let full_sample_fast = sample_idx.iter().enumerate().all(|(i, &s)| i == s);
     let impute_major = farmcpu_raw_major_impute_enabled();
+    let blas_threads = farmcpu_scan_blas_threads(threads);
 
     let mut marker_p = vec![1.0_f64; m];
     let pool = get_cached_pool(threads).map_err(|e| e.to_string())?;
     let row_block = 8192usize;
-    let mut geno_buf = vec![0.0_f64; row_block * n];
-    let mut xs_buf = vec![0.0_f64; row_block * q0];
-    let mut b21_buf = vec![0.0_f64; row_block * q0];
-    let mut sy_buf = vec![0.0_f64; row_block];
-    let mut ss_buf = vec![0.0_f64; row_block];
     let mut qtn_min_p = vec![1.0_f64; k_qtn];
-
-    for row_start in (0..m).step_by(row_block) {
+    let producer_err = std::sync::Arc::new(std::sync::OnceLock::<String>::new());
+    let producer_err_bg = std::sync::Arc::clone(&producer_err);
+    let mut next_row_start = 0usize;
+    let producer = |chunk: &mut FarmcpuScanBlock| -> bool {
+        if next_row_start >= m {
+            return false;
+        }
+        let row_start = next_row_start;
         let row_end = (row_start + row_block).min(m);
         let n_block = row_end - row_start;
-        let geno_slice = &mut geno_buf[..n_block * n];
-        let sy_slice = &mut sy_buf[..n_block];
-        let ss_slice = &mut ss_buf[..n_block];
+        chunk.row_start = row_start;
+        chunk.rows = n_block;
+        let geno_slice = &mut chunk.geno_block[..n_block * n];
+        let sy_slice = &mut chunk.sy_block[..n_block];
+        let ss_slice = &mut chunk.ss_block[..n_block];
         let mut decode_runner = || {
             decode_mean_imputed_additive_packed_block_rows_f64_stats(
                 packed_flat,
@@ -2301,14 +2610,32 @@ fn scan_packed_full_matrix_reduced(
                 pool.as_ref(),
             )
         };
-        if let Some(p) = &pool {
-            p.install(&mut decode_runner)?;
+        let decode_res = if let Some(p) = &pool {
+            p.install(&mut decode_runner)
         } else {
-            decode_runner()?;
+            decode_runner()
+        };
+        if let Err(err) = decode_res {
+            let _ = producer_err_bg.set(err);
+            chunk.rows = 0usize;
+            return false;
         }
-
-        let xs_slice = &mut xs_buf[..n_block * q0];
-        let b21_slice = &mut b21_buf[..n_block * q0];
+        next_row_start = row_end;
+        next_row_start < m
+    };
+    let consumer = |chunk: &mut FarmcpuScanBlock| -> Result<(), String> {
+        let row_start = chunk.row_start;
+        let n_block = chunk.rows;
+        if n_block == 0 {
+            return Ok(());
+        }
+        let row_end = row_start + n_block;
+        let geno_slice = &chunk.geno_block[..n_block * n];
+        let sy_slice = &chunk.sy_block[..n_block];
+        let ss_slice = &chunk.ss_block[..n_block];
+        let xs_slice = &mut chunk.xs_block[..n_block * q0];
+        let b21_slice = &mut chunk.b21_block[..n_block * q0];
+        let _blas_guard = OpenBlasThreadGuard::enter(blas_threads);
         unsafe {
             cblas_dgemm_dispatch(
                 CBLAS_ROW_MAJOR,
@@ -2458,6 +2785,16 @@ fn scan_packed_full_matrix_reduced(
                 *dst = *src;
             }
         }
+        Ok(())
+    };
+    crate::pipeline::run_double_buffer(
+        2usize,
+        || FarmcpuScanBlock::new(row_block, n, q0, 1usize),
+        producer,
+        consumer,
+    )?;
+    if let Some(err) = producer_err.get() {
+        return Err(err.clone());
     }
 
     Ok((marker_p, qtn_min_p))
@@ -2684,20 +3021,24 @@ fn farmcpu_scan_packed_marker_pvalues(
     let code4_lut = &packed_byte_lut().code4;
     let full_sample_fast = sample_idx.iter().enumerate().all(|(i, &s)| i == s);
     let impute_major = farmcpu_raw_major_impute_enabled();
+    let blas_threads = farmcpu_scan_blas_threads(threads);
     let row_block = 8192usize;
-    let mut geno_buf = vec![0.0_f64; row_block * n];
-    let mut xs_buf = vec![0.0_f64; row_block * q0];
-    let mut b21_buf = vec![0.0_f64; row_block * q0];
-    let mut sy_resid_buf = vec![0.0_f64; row_block];
-    let mut ss_buf = vec![0.0_f64; row_block];
     let mut pvals = vec![1.0_f64; m];
-
-    for row_start in (0..m).step_by(row_block) {
+    let producer_err = std::sync::Arc::new(std::sync::OnceLock::<String>::new());
+    let producer_err_bg = std::sync::Arc::clone(&producer_err);
+    let mut next_row_start = 0usize;
+    let producer = |chunk: &mut FarmcpuScanBlock| -> bool {
+        if next_row_start >= m {
+            return false;
+        }
+        let row_start = next_row_start;
         let row_end = (row_start + row_block).min(m);
         let n_block = row_end - row_start;
-        let geno_slice = &mut geno_buf[..n_block * n];
-        let sy_slice = &mut sy_resid_buf[..n_block];
-        let ss_slice = &mut ss_buf[..n_block];
+        chunk.row_start = row_start;
+        chunk.rows = n_block;
+        let geno_slice = &mut chunk.geno_block[..n_block * n];
+        let sy_slice = &mut chunk.sy_block[..n_block];
+        let ss_slice = &mut chunk.ss_block[..n_block];
         let mut decode_runner = || {
             decode_mean_imputed_additive_packed_block_rows_f64_stats(
                 packed_flat,
@@ -2718,14 +3059,32 @@ fn farmcpu_scan_packed_marker_pvalues(
                 pool.as_ref(),
             )
         };
-        if let Some(p) = &pool {
-            p.install(&mut decode_runner)?;
+        let decode_res = if let Some(p) = &pool {
+            p.install(&mut decode_runner)
         } else {
-            decode_runner()?;
+            decode_runner()
+        };
+        if let Err(err) = decode_res {
+            let _ = producer_err_bg.set(err);
+            chunk.rows = 0usize;
+            return false;
         }
-
-        let xs_slice = &mut xs_buf[..n_block * q0];
-        let b21_slice = &mut b21_buf[..n_block * q0];
+        next_row_start = row_end;
+        next_row_start < m
+    };
+    let consumer = |chunk: &mut FarmcpuScanBlock| -> Result<(), String> {
+        let row_start = chunk.row_start;
+        let n_block = chunk.rows;
+        if n_block == 0 {
+            return Ok(());
+        }
+        let row_end = row_start + n_block;
+        let geno_slice = &chunk.geno_block[..n_block * n];
+        let sy_slice = &chunk.sy_block[..n_block];
+        let ss_slice = &chunk.ss_block[..n_block];
+        let xs_slice = &mut chunk.xs_block[..n_block * q0];
+        let b21_slice = &mut chunk.b21_block[..n_block * q0];
+        let _blas_guard = OpenBlasThreadGuard::enter(blas_threads);
         unsafe {
             cblas_dgemm_dispatch(
                 CBLAS_ROW_MAJOR,
@@ -2792,6 +3151,16 @@ fn farmcpu_scan_packed_marker_pvalues(
         } else {
             stat_runner();
         }
+        Ok(())
+    };
+    crate::pipeline::run_double_buffer(
+        2usize,
+        || FarmcpuScanBlock::new(row_block, n, q0, 1usize),
+        producer,
+        consumer,
+    )?;
+    if let Some(err) = producer_err.get() {
+        return Err(err.clone());
     }
 
     Ok((pvals, bg_pwald))
@@ -2815,15 +3184,14 @@ fn write_farmcpu_packed_main_scan(
     scan_progress_callback: Option<&Py<PyAny>>,
     chrom: &[String],
     pos: &[i64],
-    snp: &[String],
-    allele0: &[String],
-    allele1: &[String],
     miss_counts: &[usize],
     q_base: usize,
     qtn_lookup: &HashMap<usize, usize>,
     qtn_idx: &[usize],
     final_window_bp: i64,
     enable_local_window_merge: bool,
+    qtn_cache: &mut FarmcpuQtnColumnCache,
+    bim_stream: &mut BimSelectedFieldStream,
 ) -> Result<(usize, usize), String> {
     let n = y.len();
     if n == 0 {
@@ -2843,14 +3211,7 @@ fn write_farmcpu_packed_main_scan(
         return Err("ixx shape mismatch".to_string());
     }
     let m = chrom.len();
-    if pos.len() != m
-        || snp.len() != m
-        || allele0.len() != m
-        || allele1.len() != m
-        || row_flip.len() != m
-        || row_maf.len() != m
-        || miss_counts.len() != m
-    {
+    if pos.len() != m || row_flip.len() != m || row_maf.len() != m || miss_counts.len() != m {
         return Err("FarmCPU metadata length mismatch during streaming scan".to_string());
     }
 
@@ -2927,6 +3288,7 @@ fn write_farmcpu_packed_main_scan(
             row_maf,
             farmcpu_final_ld_merge_r2_threshold(),
             true,
+            Some(qtn_cache),
         )?;
         let mut chr_to_rows: HashMap<&str, Vec<usize>> = HashMap::new();
         for i in 0..m {
@@ -2965,6 +3327,7 @@ fn write_farmcpu_packed_main_scan(
                 sample_idx,
                 row_flip,
                 row_maf,
+                Some(qtn_cache),
             )?;
             let ixx_local = pinv_for_row_major_x(&x_local, n, q_local)?;
             let local_stats = farmcpu_conditional_subset_stats(
@@ -2990,14 +3353,9 @@ fn write_farmcpu_packed_main_scan(
     let code4_lut = &packed_byte_lut().code4;
     let full_sample_fast = sample_idx.iter().enumerate().all(|(i, &s)| i == s);
     let impute_major = farmcpu_raw_major_impute_enabled();
+    let blas_threads = farmcpu_scan_blas_threads(threads);
     let row_block = 8192usize;
     let row_stride = 3usize;
-    let mut geno_buf = vec![0.0_f64; row_block * n];
-    let mut xs_buf = vec![0.0_f64; row_block * q0];
-    let mut b21_buf = vec![0.0_f64; row_block * q0];
-    let mut sy_resid_buf = vec![0.0_f64; row_block];
-    let mut ss_buf = vec![0.0_f64; row_block];
-    let mut stats_buf = vec![f64::NAN; row_block * 3];
     let mut text_buf = String::with_capacity(row_block * 128);
     let mut qtn_text_buf_opt = if qtn_writer.is_some() {
         Some(String::with_capacity(
@@ -3007,14 +3365,21 @@ fn write_farmcpu_packed_main_scan(
         None
     };
     let mut qtn_rows_written = 0usize;
-
-    for row_start in (0..m).step_by(row_block) {
+    let producer_err = std::sync::Arc::new(std::sync::OnceLock::<String>::new());
+    let producer_err_bg = std::sync::Arc::clone(&producer_err);
+    let mut next_row_start = 0usize;
+    let producer = |chunk: &mut FarmcpuScanBlock| -> bool {
+        if next_row_start >= m {
+            return false;
+        }
+        let row_start = next_row_start;
         let row_end = (row_start + row_block).min(m);
         let n_block = row_end - row_start;
-        let stats_slice = &mut stats_buf[..n_block * row_stride];
-        let geno_slice = &mut geno_buf[..n_block * n];
-        let sy_slice = &mut sy_resid_buf[..n_block];
-        let ss_slice = &mut ss_buf[..n_block];
+        chunk.row_start = row_start;
+        chunk.rows = n_block;
+        let geno_slice = &mut chunk.geno_block[..n_block * n];
+        let sy_slice = &mut chunk.sy_block[..n_block];
+        let ss_slice = &mut chunk.ss_block[..n_block];
         let mut decode_runner = || {
             decode_mean_imputed_additive_packed_block_rows_f64_stats(
                 packed_flat,
@@ -3035,14 +3400,41 @@ fn write_farmcpu_packed_main_scan(
                 pool.as_ref(),
             )
         };
-        if let Some(p) = &pool {
-            p.install(&mut decode_runner)?;
+        let decode_res = if let Some(p) = &pool {
+            p.install(&mut decode_runner)
         } else {
-            decode_runner()?;
+            decode_runner()
+        };
+        if let Err(err) = decode_res {
+            let _ = producer_err_bg.set(err);
+            chunk.rows = 0usize;
+            return false;
         }
-
-        let xs_slice = &mut xs_buf[..n_block * q0];
-        let b21_slice = &mut b21_buf[..n_block * q0];
+        next_row_start = row_end;
+        next_row_start < m
+    };
+    let consumer = |chunk: &mut FarmcpuScanBlock| -> Result<(), String> {
+        let row_start = chunk.row_start;
+        let n_block = chunk.rows;
+        if n_block == 0 {
+            return Ok(());
+        }
+        let row_end = row_start + n_block;
+        let geno_slice = &chunk.geno_block[..n_block * n];
+        let sy_slice = &chunk.sy_block[..n_block];
+        let ss_slice = &chunk.ss_block[..n_block];
+        let xs_slice = &mut chunk.xs_block[..n_block * q0];
+        let b21_slice = &mut chunk.b21_block[..n_block * q0];
+        let stats_slice = &mut chunk.stat_block[..n_block * row_stride];
+        let source_rows_owned;
+        let source_rows_block: &[usize] = if let Some(all_rows) = row_indices {
+            &all_rows[row_start..row_end]
+        } else {
+            source_rows_owned = (row_start..row_end).collect::<Vec<usize>>();
+            source_rows_owned.as_slice()
+        };
+        let (snp_block, allele0_block, allele1_block) = bim_stream.read_block(source_rows_block)?;
+        let _blas_guard = OpenBlasThreadGuard::enter(blas_threads);
         unsafe {
             cblas_dgemm_dispatch(
                 CBLAS_ROW_MAJOR,
@@ -3129,7 +3521,7 @@ fn write_farmcpu_packed_main_scan(
         }
         for local_idx in 0..n_block {
             let i = row_start + local_idx;
-            let stat_base = local_idx * 3;
+            let stat_base = local_idx * row_stride;
             let mut beta = stats_slice[stat_base];
             let mut se = stats_slice[stat_base + 1];
             let mut pwald = stats_slice[stat_base + 2];
@@ -3159,9 +3551,9 @@ fn write_farmcpu_packed_main_scan(
                 "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\n",
                 chrom[i],
                 pos[i],
-                snp[i],
-                allele0[i],
-                allele1[i],
+                snp_block[local_idx],
+                allele0_block[local_idx],
+                allele1_block[local_idx],
                 row_maf[i],
                 miss_counts[i],
                 beta,
@@ -3177,9 +3569,9 @@ fn write_farmcpu_packed_main_scan(
                         "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\t{}\n",
                         chrom[i],
                         pos[i],
-                        snp[i],
-                        allele0[i],
-                        allele1[i],
+                        snp_block[local_idx],
+                        allele0_block[local_idx],
+                        allele1_block[local_idx],
                         row_maf[i],
                         miss_counts[i],
                         beta,
@@ -3212,6 +3604,16 @@ fn write_farmcpu_packed_main_scan(
             })
             .map_err(|e| e.to_string())?;
         }
+        Ok(())
+    };
+    crate::pipeline::run_double_buffer(
+        2usize,
+        || FarmcpuScanBlock::new(row_block, n, q0, row_stride),
+        producer,
+        consumer,
+    )?;
+    if let Some(err) = producer_err.get() {
+        return Err(err.clone());
     }
 
     Ok((m, qtn_rows_written))
@@ -3430,8 +3832,31 @@ pub fn farmcpu_rem_packed(
     let leadidx = select_lead_indices(sz, n_lead, pvalue, pos);
     let k = leadidx.len();
     let packed_flat: Cow<[u8]> = match packed.as_slice() {
-        Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(packed_arr.iter().copied().collect()),
+        Ok(s) => {
+            farmcpu_emit_mem_debug(
+                "farmcpu_rem_packed/packed_slice",
+                &format!(
+                    "mode=borrowed rows={m} bytes_per_snp={bytes_per_snp} packed_bytes={}",
+                    format_bytes(s.len() as u64),
+                ),
+            );
+            Cow::Borrowed(s)
+        }
+        Err(_) => {
+            farmcpu_emit_mem_debug(
+                "farmcpu_rem_packed/packed_slice",
+                &format!("mode=owned_copy_start rows={m} bytes_per_snp={bytes_per_snp}"),
+            );
+            let owned: Vec<u8> = packed_arr.iter().copied().collect();
+            farmcpu_emit_mem_debug(
+                "farmcpu_rem_packed/packed_slice",
+                &format!(
+                    "mode=owned_copy_done packed_bytes={}",
+                    format_bytes(owned.len() as u64)
+                ),
+            );
+            Cow::Owned(owned)
+        }
     };
     let (score, leadidx_i64) = py.detach(|| -> PyResult<(f64, Vec<i64>)> {
         let snp_pool_sample_major = decode_packed_rows_to_sample_major(
@@ -3695,23 +4120,6 @@ pub fn farmcpu_packed_to_tsv(
     let (chrom, pos) =
         resolve_assoc_chrom_pos_metadata(bed_prefix, Vec::new(), Vec::new(), meta_row_idx, m)
             .map_err(PyRuntimeError::new_err)?;
-    let string_metadata = if skip_main_scan {
-        None
-    } else {
-        Some(
-            resolve_assoc_tsv_metadata(
-                bed_prefix,
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                meta_row_idx,
-                m,
-            )
-            .map_err(PyRuntimeError::new_err)?,
-        )
-    };
     let row_flip = row_flip.as_slice()?;
     let row_maf = row_maf.as_slice()?;
     let row_missing = row_missing.as_slice()?;
@@ -3724,8 +4132,33 @@ pub fn farmcpu_packed_to_tsv(
         )));
     }
     let packed_flat: Cow<[u8]> = match packed.as_slice() {
-        Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(packed_arr.iter().copied().collect()),
+        Ok(s) => {
+            farmcpu_emit_mem_debug(
+                "farmcpu_packed_to_tsv/packed_slice",
+                &format!(
+                    "mode=borrowed rows={m_packed} active_rows={m} bytes_per_snp={bytes_per_snp} packed_bytes={}",
+                    format_bytes(s.len() as u64),
+                ),
+            );
+            Cow::Borrowed(s)
+        }
+        Err(_) => {
+            farmcpu_emit_mem_debug(
+                "farmcpu_packed_to_tsv/packed_slice",
+                &format!(
+                    "mode=owned_copy_start rows={m_packed} active_rows={m} bytes_per_snp={bytes_per_snp}"
+                ),
+            );
+            let owned: Vec<u8> = packed_arr.iter().copied().collect();
+            farmcpu_emit_mem_debug(
+                "farmcpu_packed_to_tsv/packed_slice",
+                &format!(
+                    "mode=owned_copy_done packed_bytes={}",
+                    format_bytes(owned.len() as u64)
+                ),
+            );
+            Cow::Owned(owned)
+        }
     };
     if packed_flat.len() != m_packed * bytes_per_snp {
         return Err(PyRuntimeError::new_err("invalid packed flattened length"));
@@ -3807,6 +4240,7 @@ pub fn farmcpu_packed_to_tsv(
         let meta_row_idx = source_row_idx.as_deref().or(row_idx.as_deref());
         let stage1_wall_t0 = Instant::now();
         let mut final_model_cache: Option<(Vec<f64>, usize, Vec<f64>)> = None;
+        let mut qtn_cache = FarmcpuQtnColumnCache::new(n);
         let mut seen_qtn_idx: HashSet<usize> = HashSet::new();
         let mut qtn_best_score: HashMap<usize, f64> = HashMap::new();
         let stage1_timing = farmcpu_stage1_timing_enabled();
@@ -3868,6 +4302,7 @@ pub fn farmcpu_packed_to_tsv(
                     &sample_idx,
                     row_flip,
                     row_maf,
+                    Some(&mut qtn_cache),
                 )
                 .map_err(PyRuntimeError::new_err)?;
                 if let Some(t0) = iter_t0 {
@@ -4054,6 +4489,7 @@ pub fn farmcpu_packed_to_tsv(
                     stage1_ld_thr,
                     false,
                     qtn_stage_cap,
+                    Some(&mut qtn_cache),
                 )
                 .map_err(PyRuntimeError::new_err)?;
                 for &idx in qtn_next.iter() {
@@ -4183,6 +4619,7 @@ pub fn farmcpu_packed_to_tsv(
                     &sample_idx,
                     row_flip,
                     row_maf,
+                    Some(&mut qtn_cache),
                 )
                 .map_err(PyRuntimeError::new_err)?;
                 if let Some(t0) = iter_t0 {
@@ -4363,16 +4800,17 @@ pub fn farmcpu_packed_to_tsv(
                 let qtn_next: Vec<usize> = if qtn_union.is_empty() {
                     Vec::new()
                 } else {
-                    let sample_major = decode_packed_rows_to_sample_major(
-                        &packed_flat,
-                        bytes_per_snp,
-                        &qtn_union,
-                        row_idx.as_deref(),
-                        &sample_idx,
-                        row_flip,
-                        row_maf,
-                    )
-                    .map_err(PyRuntimeError::new_err)?;
+                    let sample_major = qtn_cache
+                        .sample_major_matrix(
+                            &qtn_union,
+                            &packed_flat,
+                            bytes_per_snp,
+                            row_idx.as_deref(),
+                            &sample_idx,
+                            row_flip,
+                            row_maf,
+                        )
+                        .map_err(PyRuntimeError::new_err)?;
                     let pvals: Vec<f64> = qtn_union.iter().map(|&ix| femp[ix]).collect();
                     let keep = farmcpu_super_keep_from_sample_major(
                         &sample_major,
@@ -4517,6 +4955,7 @@ pub fn farmcpu_packed_to_tsv(
                 final_ld_thr,
                 true,
                 qtn_idx.len(),
+                Some(&mut qtn_cache),
             )
             .map_err(PyRuntimeError::new_err)?;
             if qtn_final != qtn_idx {
@@ -4567,6 +5006,7 @@ pub fn farmcpu_packed_to_tsv(
                 &sample_idx,
                 row_flip,
                 row_maf,
+                Some(&mut qtn_cache),
             )
             .map_err(PyRuntimeError::new_err)?;
             let mut xtx = vec![0.0_f64; q_total * q_total];
@@ -4641,27 +5081,6 @@ pub fn farmcpu_packed_to_tsv(
                 0usize
             }
         } else {
-            let owned_meta = if string_metadata.is_none() {
-                Some(resolve_assoc_tsv_metadata(
-                    bed_prefix,
-                    Vec::new(),
-                    Vec::new(),
-                    Vec::new(),
-                    Vec::new(),
-                    Vec::new(),
-                    meta_row_idx,
-                    m,
-                )
-                .map_err(PyRuntimeError::new_err)?)
-            } else {
-                None
-            };
-            let meta_ref = if let Some(meta) = string_metadata.as_ref() {
-                meta
-            } else {
-                owned_meta.as_ref().expect("owned metadata just assigned")
-            };
-            let (_chrom_all, _pos_all, snp_all, allele0_all, allele1_all) = meta_ref;
             let mut miss_counts = vec![0usize; m];
             let mut fill_miss = || {
                 miss_counts
@@ -4705,6 +5124,16 @@ pub fn farmcpu_packed_to_tsv(
                     );
                 }
             }
+            let prefix_for_stream = bed_prefix
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    PyRuntimeError::new_err(
+                        "FarmCPU streaming scan requires non-empty bed_prefix",
+                    )
+                })?;
+            let mut bim_stream =
+                BimSelectedFieldStream::open(prefix_for_stream).map_err(PyRuntimeError::new_err)?;
 
             let (written_rows, qtn_rows_written) = write_farmcpu_packed_main_scan(
                 &writer,
@@ -4723,15 +5152,14 @@ pub fn farmcpu_packed_to_tsv(
                 progress_callback.as_ref(),
                 &chrom,
                 &pos,
-                snp_all,
-                allele0_all,
-                allele1_all,
                 &miss_counts,
                 q_base,
                 &qtn_lookup,
                 &qtn_idx,
                 final_window_bp,
                 route.enable_local_window_merge(),
+                &mut qtn_cache,
+                &mut bim_stream,
             )
             .map_err(PyRuntimeError::new_err)?;
             writer.finish().map_err(PyRuntimeError::new_err)?;

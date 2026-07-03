@@ -676,6 +676,45 @@ def _phase_split(logger: logging.Logger) -> None:
     logger.info("-" * _gwas_terminal_rule_width(_SECTION_WIDTH, logger=logger))
 
 
+def _set_pending_gwas_overlap_line(
+    logger: Optional[logging.Logger],
+    line: Optional[str],
+) -> None:
+    if logger is None:
+        return
+    try:
+        setattr(
+            logger,
+            "_janusx_gwas_pending_overlap_line",
+            (None if line is None else str(line)),
+        )
+    except Exception:
+        pass
+
+
+def _flush_pending_gwas_overlap_line(
+    logger: Optional[logging.Logger],
+    *,
+    use_spinner: bool,
+) -> None:
+    if logger is None:
+        return
+    try:
+        line = getattr(logger, "_janusx_gwas_pending_overlap_line", None)
+    except Exception:
+        line = None
+    if not line:
+        return
+    line_text = str(line)
+    stream_logger = _gwas_stream_logger(logger)
+    if bool(use_spinner) and _gwas_terminal_rich(logger) and stream_logger is not None:
+        _log_file_only(logger, logging.INFO, line_text)
+        stream_logger.info(line_text)
+    else:
+        _emit_plain_info_line(logger, line_text, use_spinner=bool(use_spinner))
+    _set_pending_gwas_overlap_line(logger, None)
+
+
 def _replace_file_with_retry(
     src: str,
     dst: str,
@@ -3765,19 +3804,16 @@ def prepare_streaming_context(
 
     for wmsg in _dedupe_cache_warning_messages(deferred_cache_warnings):
         logger.warning(wmsg)
-    grm_n: Union[int, str] = "NA" if grm_ids is None else int(len(grm_ids))
     q_has_pc = bool(np.asarray(qmatrix).ndim == 2 and int(qmatrix.shape[1]) > 0)
     q_n: Union[int, str] = "NA" if (q_ids is None or (not q_has_pc)) else int(len(q_ids))
     cov_n: Union[int, str] = "NA" if cov_ids is None else int(len(cov_ids))
-    if _gwas_logger_verbose(logger):
-        _emit_plain_info_line(
-            logger,
-            (
-                f"Sample overlap: geno={len(geno_ids)}, pheno={len(pheno_ids)}, "
-                f"grm={grm_n}, q={q_n}, cov={cov_n}, common={len(common_ids)}"
-            ),
-            use_spinner=use_spinner,
-        )
+    _set_pending_gwas_overlap_line(
+        logger,
+        (
+            f"Sample overlap: geno={len(geno_ids)}, pheno={len(pheno_ids)}, "
+            f"q={q_n}, cov={cov_n}, common={len(common_ids)}"
+        ),
+    )
 
     # index maps
     geno_index = {sid: i for i, sid in enumerate(geno_ids)}
@@ -6463,7 +6499,7 @@ def _run_gwas_pipeline(
     )
     farmcpu_auto_fast = bool(args.farmcpu)
     algwas_auto_fast = bool(args.algwas)
-    packed_model_routes_enabled = bool((args.farmcpu or args.algwas) and not qtn_input_requested)
+    packed_model_routes_enabled = bool(args.farmcpu or args.algwas)
     packed_model_startup_preload = False
     gwas_row_stat_mode = "global" if bool(getattr(args, "global_stats", False)) else "strict-train"
     defer_genotype_success_until_scanmeta = bool(
@@ -7022,7 +7058,9 @@ def _run_gwas_pipeline(
                     snps_only=bool(args.snps_only),
                     allow_packed_grm=bool(allow_packed_grm_effective),
                     preload_packed_context=bool(packed_model_startup_preload),
-                    require_bed_stream=bool(stream_selected or qtn_input_requested),
+                    require_bed_stream=bool(
+                        stream_selected or qtn_input_requested or packed_model_routes_enabled
+                    ),
                     post_grm_hook=post_grm_hook,
                     force_kind=determine_genotype_source_force_kind_from_args(args),
                     preinspected_ids=preinspect_ids,
@@ -7110,6 +7148,10 @@ def _run_gwas_pipeline(
                             f"Packed preload unavailable; falling back to on-demand packed load. reason={ex}"
                         )
                         preloaded_packed = packed_preload_failure_state(genofile_stream, ex)
+                _flush_pending_gwas_overlap_line(
+                    logger,
+                    use_spinner=bool(use_spinner),
+                )
                 if terminal_rich and len(stream_models) > 0:
                     _phase_split(terminal_logger)
                 logger_task_rows: list[tuple[str, object]] = [
@@ -8105,6 +8147,10 @@ def _run_gwas_pipeline(
                 emit_trait_header=False,
                 preloaded_packed=preloaded_packed,
                 qtn_preloaded_packed=qtn_preloaded_packed,
+            )
+            _flush_pending_gwas_overlap_line(
+                logger,
+                use_spinner=bool(use_spinner),
             )
             if terminal_rich:
                 _phase_split(terminal_logger)

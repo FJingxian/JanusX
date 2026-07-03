@@ -59,10 +59,34 @@ struct RotatedLmm2AssocState {
 }
 
 #[inline]
-fn copy_rotated_snp_row_to_f64(src: &[f32], dst: &mut [f64]) {
+fn copy_rotated_snp_row_to_f64(src: &[f32], dst: &mut [f64]) -> f64 {
+    let mut ssq = 0.0_f64;
     for i in 0..src.len() {
-        dst[i] = src[i] as f64;
+        let v = src[i] as f64;
+        dst[i] = v;
+        ssq += v * v;
     }
+    ssq
+}
+
+#[inline]
+fn fill_invalid_rotated_assoc_row(out_row: &mut [f64], with_plrt: bool) {
+    out_row[0] = f64::NAN;
+    out_row[1] = f64::NAN;
+    out_row[2] = 1.0;
+    if with_plrt {
+        out_row[3] = 1.0;
+    }
+}
+
+#[inline]
+fn fill_invalid_rotated_lmm2_row(out_row: &mut [f64]) {
+    out_row[0] = f64::NAN;
+    out_row[1] = f64::NAN;
+    out_row[2] = 1.0;
+    out_row[3] = f64::NAN;
+    out_row[4] = f64::NAN;
+    out_row[5] = 1.0;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -100,7 +124,11 @@ fn run_rotated_reml_assoc_block_f32(
             last_log10_lbd: None,
         },
         |_, row, state, out_row| {
-            copy_rotated_snp_row_to_f64(row, &mut state.snp_vec);
+            let snp_ssq = copy_rotated_snp_row_to_f64(row, &mut state.snp_vec);
+            if !snp_ssq.is_finite() || snp_ssq <= 1e-12 {
+                fill_invalid_rotated_assoc_row(out_row, with_plrt);
+                return;
+            }
 
             let init_guess = if carry_warm_start {
                 state.last_log10_lbd.or(init_log10_lbd)
@@ -137,7 +165,8 @@ fn run_rotated_reml_assoc_block_f32(
                 let z = beta / se;
                 (2.0 * normal_sf(z.abs())).clamp(f64::MIN_POSITIVE, 1.0)
             } else {
-                1.0
+                fill_invalid_rotated_assoc_row(out_row, with_plrt);
+                return;
             };
 
             out_row[0] = beta;
@@ -202,7 +231,11 @@ fn run_rotated_lmm2_assoc_block_f32(
             last_log10_lbd_ml: None,
         },
         |_, row, state, out_row| {
-            copy_rotated_snp_row_to_f64(row, &mut state.snp_vec);
+            let snp_ssq = copy_rotated_snp_row_to_f64(row, &mut state.snp_vec);
+            if !snp_ssq.is_finite() || snp_ssq <= 1e-12 {
+                fill_invalid_rotated_lmm2_row(out_row);
+                return;
+            }
 
             let reml_init_guess = if use_warm_start {
                 state
@@ -237,7 +270,8 @@ fn run_rotated_lmm2_assoc_block_f32(
                 let z = beta / se;
                 (2.0 * normal_sf(z.abs())).clamp(f64::MIN_POSITIVE, 1.0)
             } else {
-                1.0
+                fill_invalid_rotated_lmm2_row(out_row);
+                return;
             };
 
             let ml_init_guess = if use_warm_start {

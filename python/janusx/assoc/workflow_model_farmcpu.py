@@ -1182,14 +1182,15 @@ def run_farmcpu_fullmem(
             q_n = (
                 int(q_ids.shape[0]) if (np.asarray(qmatrix).ndim == 2 and int(qmatrix.shape[1]) > 0) else "NA"
             )
-        _emit_plain_info_line(
-            logger,
-            (
-                f"Sample overlap: geno={geno_n}, pheno={pheno.shape[0]}, "
-                f"q={q_n}, cov={cov_n}, common={common_n}"
-            ),
-            use_spinner=bool(use_spinner),
-        )
+        if not bool(context_prepared):
+            _emit_plain_info_line(
+                logger,
+                (
+                    f"Sample overlap: geno={geno_n}, pheno={pheno.shape[0]}, "
+                    f"q={q_n}, cov={cov_n}, common={common_n}"
+                ),
+                use_spinner=bool(use_spinner),
+            )
         farmcpu_cache = {
             "pheno": pheno,
             "famid": famid,

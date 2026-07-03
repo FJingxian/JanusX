@@ -92,6 +92,7 @@ _SPLMM_SPARSE_GRM_METHOD = 2
 _SPLMM_SPARSE_REML_GRID_SIZE = 17
 _SPLMM_SPARSE_REML_MAX_ITER = 20
 _SPLMM_SPGRM_SINGLE_BLOCK_N_MAX = 2048
+_SPLMM_APPROX_RHAT_MARKERS_DEFAULT = 1000
 _SPLMM_META_CACHE_VERSION = 1
 _SCANMETA_CACHE_MAGIC = b"JXSMETA\0"
 _SCANMETA_CACHE_VERSION = 1
@@ -6325,7 +6326,10 @@ def run_splmm_windowed_fullrank(
             )
             return out, max(time.monotonic() - task_t0, 0.0)
 
-        def _run_sparse_null_fit_task() -> tuple[dict[str, object], float]:
+        def _run_sparse_null_fit_task(
+            *,
+            residualized_approx: bool,
+        ) -> tuple[dict[str, object], float]:
             task_t0 = time.monotonic()
             out = _splmm_sparse_null_fit(
                 jxgrm_path=str(trait_sparse_kinship_path),
@@ -6333,7 +6337,7 @@ def run_splmm_windowed_fullrank(
                 y_vec=y_vec,
                 x_cov=x_arg,
                 progress_callback=None,
-                residualized_approx=bool(scan_mode_norm == "approx"),
+                residualized_approx=bool(residualized_approx),
                 objective_mode=null_objective_mode_norm,
                 threads=int(threads),
             )
@@ -6343,7 +6347,10 @@ def run_splmm_windowed_fullrank(
             with cf.ThreadPoolExecutor(max_workers=2, thread_name_prefix="jx-splmm-prepare") as ex:
                 future_map: dict[cf.Future, str] = {
                     ex.submit(_run_sparse_scan_meta_task): "scan_meta",
-                    ex.submit(_run_sparse_null_fit_task): "null_fit",
+                    ex.submit(
+                        _run_sparse_null_fit_task,
+                        residualized_approx=bool(scan_mode_norm == "approx"),
+                    ): "null_fit",
                 }
                 future_results: dict[str, tuple[object, float]] = {}
                 try:
@@ -6357,7 +6364,9 @@ def run_splmm_windowed_fullrank(
             null_fit_obj, null_fit_secs = future_results["null_fit"]
             null_fit = dict(null_fit_obj)
         else:
-            null_fit_obj, null_fit_secs = _run_sparse_null_fit_task()
+            null_fit_obj, null_fit_secs = _run_sparse_null_fit_task(
+                residualized_approx=bool(scan_mode_norm == "approx"),
+            )
             null_fit = dict(null_fit_obj)
         null_secs = max(time.monotonic() - null_prepare_t0, 0.0)
         _stop_prepare_handle(show_done=False)
@@ -6370,6 +6379,27 @@ def run_splmm_windowed_fullrank(
             n_scan_sites_hint = int(
                 np.asarray(scan_meta["row_indices"], dtype=np.int64).reshape(-1).shape[0]
             )
+        effective_scan_mode = str(scan_mode_norm)
+        if (
+            effective_scan_mode == "approx"
+            and int(n_scan_sites_hint) < int(_SPLMM_APPROX_RHAT_MARKERS_DEFAULT)
+        ):
+            _emit_warning_line(
+                logger,
+                (
+                    "SparseLMM approx scan has fewer filtered markers than the default "
+                    f"gamma sample size ({int(n_scan_sites_hint)} < "
+                    f"{int(_SPLMM_APPROX_RHAT_MARKERS_DEFAULT)}); "
+                    "falling back to splmm-exact for this trait."
+                ),
+                use_spinner=bool(use_spinner),
+            )
+            null_fit_obj, null_fit_secs = _run_sparse_null_fit_task(
+                residualized_approx=False,
+            )
+            null_fit = dict(null_fit_obj)
+            null_secs = max(time.monotonic() - null_prepare_t0, 0.0)
+            effective_scan_mode = "exact"
 
         sigma_g2 = float(null_fit["sigma_g2"])
         sigma_e2 = float(null_fit["sigma_e2"])
@@ -6391,7 +6421,7 @@ def run_splmm_windowed_fullrank(
         sigma_scale_p0_to_mx = float(null_fit.get("sigma_scale_p0_to_mx", float("nan")))
         sigma_scale_reml = float(null_fit.get("sigma_scale_reml", float("nan")))
         residualized_approx_null = bool(
-            scan_mode_norm == "approx"
+            effective_scan_mode == "approx"
             and str(null_fit.get("strategy", "")).strip().lower() == "residualized_sparse_reml_brent"
         )
         if not _splmm_null_components_valid(sigma_g2, sigma_e2):
@@ -6744,7 +6774,7 @@ def run_splmm_windowed_fullrank(
                         use_train_maf=True,
                         threads=int(threads),
                         model="add",
-                        rhat_markers=1000,
+                        rhat_markers=int(_SPLMM_APPROX_RHAT_MARKERS_DEFAULT),
                         rhat_seed=20260527,
                         packed=None,
                         packed_n_samples=0,
@@ -6757,7 +6787,7 @@ def run_splmm_windowed_fullrank(
                         scan_progress_callback=sparse_progress,
                         progress_every=int(max(512, min(int(block_rows_use), 4096))),
                         rhat_tol=1e-3,
-                        scan_mode=scan_mode_norm,
+                        scan_mode=effective_scan_mode,
                         mmap_window_mb=(int(mmap_window_mb) if mmap_window_mb is not None else None),
                     )
                 else:
@@ -6776,7 +6806,7 @@ def run_splmm_windowed_fullrank(
                         use_train_maf=True,
                         threads=int(threads),
                         model="add",
-                        rhat_markers=1000,
+                        rhat_markers=int(_SPLMM_APPROX_RHAT_MARKERS_DEFAULT),
                         rhat_seed=20260527,
                         packed=None,
                         packed_n_samples=0,
@@ -6789,7 +6819,7 @@ def run_splmm_windowed_fullrank(
                         scan_progress_callback=sparse_progress,
                         progress_every=int(max(512, min(int(block_rows_use), 4096))),
                         rhat_tol=1e-3,
-                        scan_mode=scan_mode_norm,
+                        scan_mode=effective_scan_mode,
                         mmap_window_mb=(int(mmap_window_mb) if mmap_window_mb is not None else None),
                     )
             scan_ok = True
@@ -6897,13 +6927,13 @@ def run_splmm_windowed_fullrank(
         _scan_mode_desc = {
             "approx": "approximate GRAMMAR-gamma",
             "exact": "exact g'Pg",
-        }[scan_mode_norm]
+        }[effective_scan_mode]
         _rhat_info = (
             f"r_hat={r_hat:.4g}, sampled {rhat_used}/{rhat_requested}, "
             if int(rhat_requested) > 0
             else ""
         )
-        if scan_mode_norm == "approx":
+        if effective_scan_mode == "approx":
             scan_sigma_mode = "lambda_only_residualized_approx"
             _sigma_mode_info = (
                 f"scan_param=lambda_only(lambda={scan_lbd_arg:.4g}); "

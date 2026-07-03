@@ -6503,7 +6503,7 @@ def _run_gwas_pipeline(
     packed_model_startup_preload = False
     gwas_row_stat_mode = "global" if bool(getattr(args, "global_stats", False)) else "strict-train"
     defer_genotype_success_until_scanmeta = bool(
-        standard_stream_models_requested
+        (standard_stream_models_requested or farmcpu_auto_fast or algwas_auto_fast)
         and gwas_row_stat_mode == "global"
         and str(args.model).lower() == "add"
     )

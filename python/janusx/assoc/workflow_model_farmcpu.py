@@ -1343,23 +1343,95 @@ def run_farmcpu_fullmem(
         farm_nbin = max(1, int(getattr(args, "farmcpu_nbin", 5)))
         farm_szbin = [float(x) for x in getattr(args, "farmcpu_bin_size", [5e5, 5e6, 5e7])]
         farm_raw = bool(getattr(args, "farmcpu_raw", False))
-        farm_label = "FarmCPU"
-        farm_pbar = _ProgressAdapter(
+        farm_stage1_pbar = _ProgressAdapter(
             total=farm_iter,
-            desc=farm_label,
+            desc="FarmCPU stage1",
             force_animate=bool(use_spinner),
             logger=logger,
             log_unit="iter",
         )
-        farm_state = {"done": 0}
+        farm_stage1_state = {"done": 0}
+        farm_scan_pbar = None
+        farm_scan_state = {"done": 0}
+        farm_scan_total_hint = int(max(1, int(eff_snp)))
 
-        def _farmcpu_progress(done: int, total: int) -> None:
-            nonlocal peak_rss
-            target = int(max(0, min(int(total), int(done))))
-            delta = target - int(farm_state["done"])
+        def _close_farm_stage1(*, force_fill: bool = False) -> None:
+            nonlocal farm_stage1_pbar
+            if farm_stage1_pbar is None:
+                return
+            try:
+                total_now = int(max(1, int(farm_stage1_pbar.total)))
+                if force_fill and int(farm_stage1_state["done"]) < total_now:
+                    farm_stage1_pbar.update(total_now - int(farm_stage1_state["done"]))
+                    farm_stage1_state["done"] = total_now
+                farm_stage1_pbar.finish()
+            except Exception:
+                pass
+            try:
+                farm_stage1_pbar.close(show_done=False)
+            except Exception:
+                pass
+            farm_stage1_pbar = None
+
+        def _close_farm_scan(*, force_fill: bool = False) -> None:
+            nonlocal farm_scan_pbar
+            if farm_scan_pbar is None:
+                return
+            try:
+                total_now = int(max(1, int(farm_scan_pbar.total)))
+                if force_fill and int(farm_scan_state["done"]) < total_now:
+                    farm_scan_pbar.update(total_now - int(farm_scan_state["done"]))
+                    farm_scan_state["done"] = total_now
+                farm_scan_pbar.finish()
+            except Exception:
+                pass
+            try:
+                farm_scan_pbar.close(show_done=False)
+            except Exception:
+                pass
+            farm_scan_pbar = None
+
+        def _farmcpu_stage1_progress(done: int, total: int) -> None:
+            nonlocal peak_rss, farm_stage1_pbar
+            if farm_stage1_pbar is None:
+                return
+            total_use = int(max(1, int(total) if int(total) > 0 else int(farm_stage1_pbar.total)))
+            if int(farm_stage1_pbar.total) != total_use:
+                farm_stage1_pbar.set_total(total_use)
+            target = int(max(0, min(total_use, int(done))))
+            delta = target - int(farm_stage1_state["done"])
             if delta > 0:
-                farm_pbar.update(delta)
-                farm_state["done"] = target
+                farm_stage1_pbar.update(delta)
+                farm_stage1_state["done"] = target
+            if int(total) > 0 and int(done) >= int(total):
+                _close_farm_stage1(force_fill=False)
+            try:
+                rss_now, _ = process_memory_info_bytes(process)
+                peak_rss = max(peak_rss, int(rss_now or 0))
+            except Exception:
+                pass
+
+        def _farmcpu_scan_progress(done: int, total: int) -> None:
+            nonlocal peak_rss, farm_scan_pbar
+            if farm_stage1_pbar is not None:
+                _close_farm_stage1(force_fill=True)
+            total_use = int(max(1, int(total) if int(total) > 0 else farm_scan_total_hint))
+            if farm_scan_pbar is None:
+                farm_scan_pbar = _ProgressAdapter(
+                    total=total_use,
+                    desc="FarmCPU stage2",
+                    force_animate=bool(use_spinner),
+                    logger=logger,
+                )
+            elif int(farm_scan_pbar.total) != total_use:
+                farm_scan_pbar.set_total(total_use)
+            target = int(max(0, min(int(farm_scan_pbar.total), int(done))))
+            delta = target - int(farm_scan_state["done"])
+            if delta > 0:
+                farm_scan_pbar.update(delta)
+                farm_scan_state["done"] = target
+            if int(total) > 0 and int(done) >= int(total):
+                _close_farm_scan(force_fill=False)
             try:
                 rss_now, _ = process_memory_info_bytes(process)
                 peak_rss = max(peak_rss, int(rss_now or 0))
@@ -1476,7 +1548,8 @@ def run_farmcpu_fullmem(
                             nbin=int(farm_nbin),
                             szbin=[float(x) for x in farm_szbin],
                             threads=int(args.thread),
-                            progress_callback=_farmcpu_progress,
+                            stage1_progress_callback=_farmcpu_stage1_progress,
+                            progress_callback=(None if skip_stage1_main_scan else _farmcpu_scan_progress),
                             pseudo_tsv=pseudo_tsv_hint,
                             bed_prefix=bed_prefix_meta,
                             raw=bool(farm_raw),
@@ -1521,7 +1594,8 @@ def run_farmcpu_fullmem(
                             nbin=int(farm_nbin),
                             szbin=[float(x) for x in farm_szbin],
                             threads=int(args.thread),
-                            progress_callback=_farmcpu_progress,
+                            stage1_progress_callback=_farmcpu_stage1_progress,
+                            progress_callback=(None if skip_stage1_main_scan else _farmcpu_scan_progress),
                             pseudo_tsv=pseudo_tsv_hint,
                             bed_prefix=None,
                             raw=bool(farm_raw),
@@ -1551,7 +1625,8 @@ def run_farmcpu_fullmem(
                             "raw": bool(farm_raw),
                             "skip_main_scan": bool(skip_stage1_main_scan),
                             "pseudo_tsv": str(pseudo_tsv_hint),
-                            "scan_progress_callback": _farmcpu_progress,
+                            "stage1_progress_callback": _farmcpu_stage1_progress,
+                            "scan_progress_callback": (None if skip_stage1_main_scan else _farmcpu_scan_progress),
                         }
                     ]
                     try:
@@ -1615,9 +1690,9 @@ def run_farmcpu_fullmem(
                     raise RuntimeError(
                         "Rust FarmCPU controller is unavailable: expected farmcpu_packed_to_tsv."
                     )
-                farm_pbar.finish()
             finally:
-                farm_pbar.close(show_done=False)
+                _close_farm_stage1(force_fill=True)
+                _close_farm_scan(force_fill=True)
             stage1_total_secs = max(time.monotonic() - stage1_wall_t0, 0.0)
             stage1_secs = (
                 max(float(rust_stage1_secs), 0.0)
@@ -1704,7 +1779,8 @@ def run_farmcpu_fullmem(
                         pass
                     stage2_pbar.close(show_done=False)
         else:
-            farm_pbar.close(show_done=False)
+            _close_farm_stage1(force_fill=False)
+            _close_farm_scan(force_fill=False)
             raise RuntimeError(
                 "FarmCPU requires the Rust packed controller (`farmcpu_packed_to_tsv` "
                 "or `gwas_packed_unified_to_tsv`). Dense/Python fallback has been removed."

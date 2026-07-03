@@ -199,7 +199,6 @@ from janusx.script._common.grmio import (
     grm_cache_lock,
     grm_cache_paths,
     grm_cache_prefix_with_params,
-    grm_load_status_done,
     grm_load_status_fail,
     grm_load_status_open,
     latest_genotype_mtime,
@@ -2446,6 +2445,27 @@ def _gs_stream_logger(logger: logging.Logger) -> logging.Logger | None:
     return None
 
 
+def _gs_terminal_rule_width(
+    default: int = 60,
+    *,
+    logger: logging.Logger | None = None,
+) -> int:
+    if logger is not None:
+        try:
+            width = int(getattr(logger, "_janusx_cli_config_panel_width"))
+            if width > 0:
+                return width
+        except Exception:
+            pass
+    if not stdout_is_tty():
+        return int(max(20, default))
+    try:
+        cols = int(os.get_terminal_size().columns)
+    except Exception:
+        cols = int(default)
+    return int(max(40, min(120, cols)))
+
+
 def _gs_invocation_command(argv: list[str] | None = None) -> str:
     tokens = [str(x) for x in (sys.argv[1:] if argv is None else argv)]
     prog_raw = str(sys.argv[0]).strip() if len(sys.argv) > 0 else ""
@@ -2549,10 +2569,11 @@ def _emit_gs_summary_legacy(
 ) -> None:
     if len(rows) == 0:
         return
+    rule = "=" * _gs_terminal_rule_width(_SECTION_WIDTH, logger=logger)
     logger.info("")
-    logger.info("=" * _SECTION_WIDTH)
+    logger.info(rule)
     logger.info("Summary")
-    logger.info("=" * _SECTION_WIDTH)
+    logger.info(rule)
     headers = ["trait", "model", "ntrain", "ntest", "r2", "pear", "time(s)"]
     out_rows: list[list[str]] = []
     for row in _ordered_gs_summary_rows(rows):
@@ -19558,10 +19579,6 @@ def _run_gs_pipeline_impl(
                 if cached_prefix is not None and _is_plink_prefix(str(cached_prefix)):
                     gfile = str(cached_prefix).replace("\\", "/")
                     gfile_is_plink = True
-                    task.complete(
-                        "Preparing PLINK cache for packed GS ...Finished "
-                        f"({format_path_for_display(gfile)})"
-                    )
                 elif cached_prefix is not None:
                     if hard_packed_preprocess_requested:
                         task.fail("Preparing PLINK cache for packed GS ...Failed")
@@ -20643,12 +20660,7 @@ def _run_gs_pipeline_impl(
                 )
                 raise
             if str(shared_additive_gblup_cache.storage) != "memmap-cache-miss":
-                task.complete(
-                    grm_load_status_done(
-                        str(shared_additive_gblup_cache.path or shared_additive_gblup_cache_file or ""),
-                        int(shared_additive_gblup_cache.grm.shape[0]),
-                    )
-                )
+                task.close()
             else:
                 task.complete(finished_status_text("Prebuilding shared additive GBLUP full GRM"))
         if bool(debug_mode):
@@ -21333,7 +21345,7 @@ def _run_gs_pipeline_impl(
             gblup_backend_m = int(train_snp.shape[0])
             gblup_backend_label = "ZTZ" if gblup_backend_n > gblup_backend_m else "kinship"
 
-        sep_w = max(40, min(80, _terminal_columns()))
+        sep_w = max(40, min(60, _terminal_columns()))
         gs_output.emit_trait_header(
             terminal_logger if terminal_rich else logger,
             trait_name=str(trait_name),

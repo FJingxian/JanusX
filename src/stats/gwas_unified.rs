@@ -633,6 +633,11 @@ pub fn gwas_packed_unified_to_tsv<'py>(
                         Some(v) if !v.is_none() => Some(v.extract()?),
                         _ => None,
                     };
+                let stage1_progress_callback: Option<Py<PyAny>> =
+                    match opt_item(&job, "stage1_progress_callback")? {
+                        Some(v) if !v.is_none() => Some(v.extract()?),
+                        _ => None,
+                    };
                 let threshold: f64 = opt_item(&job, "threshold")?
                     .and_then(|v| v.extract().ok())
                     .unwrap_or(0.05);
@@ -680,6 +685,7 @@ pub fn gwas_packed_unified_to_tsv<'py>(
                         nbin,
                         szbin,
                         threads,
+                        stage1_progress_callback,
                         scan_progress_callback,
                         pseudo_tsv.as_deref(),
                         bed_prefix,

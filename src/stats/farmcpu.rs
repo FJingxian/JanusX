@@ -2796,6 +2796,7 @@ fn write_farmcpu_packed_main_scan(
     row_indices: Option<&[usize]>,
     sample_idx: &[usize],
     threads: usize,
+    scan_progress_callback: Option<&Py<PyAny>>,
     chrom: &[String],
     pos: &[i64],
     snp: &[String],
@@ -3187,6 +3188,14 @@ fn write_farmcpu_packed_main_scan(
                     .map_err(|e| format!("{qtn_path_for_err}: {e}"))?;
             }
         }
+        if let Some(cb) = scan_progress_callback {
+            Python::attach(|py2| -> PyResult<()> {
+                py2.check_signals()?;
+                cb.call1(py2, (row_end, m))?;
+                Ok(())
+            })
+            .map_err(|e| e.to_string())?;
+        }
     }
 
     Ok((m, qtn_rows_written))
@@ -3557,6 +3566,7 @@ pub fn farmcpu_super_packed<'py>(
     nbin=5,
     szbin=vec![5e5, 5e6, 5e7],
     threads=0,
+    stage1_progress_callback=None,
     progress_callback=None,
     pseudo_tsv=None,
     bed_prefix=None,
@@ -3586,6 +3596,7 @@ pub fn farmcpu_packed_to_tsv(
     nbin: usize,
     szbin: Vec<f64>,
     threads: usize,
+    stage1_progress_callback: Option<Py<PyAny>>,
     progress_callback: Option<Py<PyAny>>,
     pseudo_tsv: Option<&str>,
     bed_prefix: Option<&str>,
@@ -3893,7 +3904,7 @@ pub fn farmcpu_packed_to_tsv(
                     } else {
                         None
                     };
-                    if let Some(cb) = progress_callback.as_ref() {
+                    if let Some(cb) = stage1_progress_callback.as_ref() {
                         Python::attach(|py2| -> PyResult<()> {
                             py2.check_signals()?;
                             cb.call1(py2, (it_idx + 1, max_iter_i))?;
@@ -4068,7 +4079,7 @@ pub fn farmcpu_packed_to_tsv(
                 } else {
                     None
                 };
-                if let Some(cb) = progress_callback.as_ref() {
+                if let Some(cb) = stage1_progress_callback.as_ref() {
                     Python::attach(|py2| -> PyResult<()> {
                         py2.check_signals()?;
                         cb.call1(py2, (it_idx + 1, max_iter_i))?;
@@ -4229,7 +4240,7 @@ pub fn farmcpu_packed_to_tsv(
                     } else {
                         None
                     };
-                    if let Some(cb) = progress_callback.as_ref() {
+                    if let Some(cb) = stage1_progress_callback.as_ref() {
                         Python::attach(|py2| -> PyResult<()> {
                             py2.check_signals()?;
                             cb.call1(py2, (it_idx + 1, max_iter_i))?;
@@ -4395,7 +4406,7 @@ pub fn farmcpu_packed_to_tsv(
                 } else {
                     None
                 };
-                if let Some(cb) = progress_callback.as_ref() {
+                if let Some(cb) = stage1_progress_callback.as_ref() {
                     Python::attach(|py2| -> PyResult<()> {
                         py2.check_signals()?;
                         cb.call1(py2, (it_idx + 1, max_iter_i))?;
@@ -4683,6 +4694,7 @@ pub fn farmcpu_packed_to_tsv(
                 row_idx.as_deref(),
                 &sample_idx,
                 threads,
+                progress_callback.as_ref(),
                 &chrom,
                 &pos,
                 snp_all,

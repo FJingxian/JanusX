@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import heapq
 import json
 import math
 import os
@@ -117,6 +118,26 @@ class RunResult:
     time_file: str
     note: str
     debug_file: str = ""
+
+
+@dataclass(frozen=True)
+class _AssocTopKRecord:
+    snp: str
+    chrom: Optional[str]
+    pos: Optional[int]
+    p: float
+
+
+class _AssocTopKHeapItem:
+    __slots__ = ("record",)
+
+    def __init__(self, record: _AssocTopKRecord):
+        self.record = record
+
+    def __lt__(self, other: object) -> bool:
+        if not isinstance(other, _AssocTopKHeapItem):
+            return NotImplemented
+        return (self.record.p, self.record.snp) > (other.record.p, other.record.snp)
 
 
 @dataclass
@@ -598,13 +619,189 @@ def _extract_topk(
     out_topk: Path,
     k: int,
 ) -> tuple[int, str]:
-    df = _read_table_guess(assoc_file)
-    std = _standardize_assoc(df)
-    top = std.sort_values("P", ascending=True).head(max(1, int(k))).copy()
+    top = _extract_topk_streaming_assoc(assoc_file, max(1, int(k)))
     out_topk.parent.mkdir(parents=True, exist_ok=True)
     top.to_csv(out_topk, sep="\t", index=False)
     top_snps = ";".join(top["SNP"].astype(str).head(10).tolist())
     return int(top.shape[0]), top_snps
+
+
+def _assoc_result_delimiter_from_header(header_line: str) -> Optional[str]:
+    if "\t" in header_line:
+        return "\t"
+    if "," in header_line:
+        return ","
+    return None
+
+
+def _assoc_result_header_map(header_fields: list[str]) -> dict[str, int]:
+    return {
+        str(col).strip().lstrip("#").lower(): idx
+        for idx, col in enumerate(header_fields)
+    }
+
+
+def _assoc_record_from_fields(
+    fields: list[str],
+    *,
+    p_idx: int,
+    chr_idx: Optional[int],
+    pos_idx: Optional[int],
+    snp_idx: Optional[int],
+) -> Optional[_AssocTopKRecord]:
+    try:
+        p_raw = float(str(fields[p_idx]).strip())
+    except Exception:
+        return None
+    if (not math.isfinite(p_raw)) or p_raw <= 0.0 or p_raw > 1.0:
+        return None
+
+    chrom_out: Optional[str] = None
+    pos_out: Optional[int] = None
+    snp_out = ""
+    if chr_idx is not None and pos_idx is not None:
+        try:
+            chrom_raw = str(fields[chr_idx]).strip()
+            chrom_norm = re.sub(r"^chr", "", chrom_raw, flags=re.IGNORECASE).strip()
+            pos_raw = float(str(fields[pos_idx]).strip())
+            if chrom_norm == "" or (not math.isfinite(pos_raw)):
+                return None
+            pos_int = int(round(pos_raw))
+        except Exception:
+            return None
+        chrom_out = chrom_norm
+        pos_out = pos_int
+        snp_out = f"{chrom_norm}_{pos_int}"
+    elif snp_idx is not None:
+        snp_out = str(fields[snp_idx]).strip()
+        if snp_out == "":
+            return None
+    else:
+        return None
+
+    return _AssocTopKRecord(
+        snp=snp_out,
+        chrom=chrom_out,
+        pos=pos_out,
+        p=float(p_raw),
+    )
+
+
+def _prune_topk_heap(
+    heap: list[_AssocTopKHeapItem],
+    best_by_snp: dict[str, _AssocTopKRecord],
+) -> None:
+    while heap:
+        current = best_by_snp.get(heap[0].record.snp)
+        if current is heap[0].record:
+            break
+        heapq.heappop(heap)
+
+
+def _extract_topk_streaming_assoc(
+    assoc_file: Path,
+    k: int,
+) -> pd.DataFrame:
+    heap: list[_AssocTopKHeapItem] = []
+    best_by_snp: dict[str, _AssocTopKRecord] = {}
+
+    with assoc_file.open("r", encoding="utf-8", errors="ignore", newline="") as fh:
+        header_line = fh.readline()
+        if header_line == "":
+            raise ValueError(f"Empty association result: {assoc_file}")
+        delim = _assoc_result_delimiter_from_header(header_line)
+        if delim is None:
+            header_fields = header_line.strip().split()
+
+            def row_iter() -> Iterable[list[str]]:
+                for line in fh:
+                    line = line.strip()
+                    if line == "":
+                        continue
+                    yield line.split()
+        else:
+            header_fields = next(csv.reader([header_line], delimiter=delim))
+
+            def row_iter() -> Iterable[list[str]]:
+                reader = csv.reader(fh, delimiter=delim)
+                for row in reader:
+                    if len(row) == 0:
+                        continue
+                    yield row
+
+        cols = _assoc_result_header_map(list(header_fields))
+        p_col = _first_col(cols, _P_COL_KEYS)
+        if p_col is None:
+            raise ValueError("P-value column not found in GWAS result.")
+        chr_col = _first_col(cols, _CHR_COL_KEYS)
+        pos_col = _first_col(cols, _POS_COL_KEYS)
+        snp_col = _first_col(cols, _SNP_COL_KEYS)
+        if (chr_col is None or pos_col is None) and snp_col is None:
+            raise ValueError("Neither (chr,pos) nor SNP id columns found.")
+
+        p_idx = int(cols[p_col])
+        chr_idx = None if chr_col is None else int(cols[chr_col])
+        pos_idx = None if pos_col is None else int(cols[pos_col])
+        snp_idx = None if snp_col is None else int(cols[snp_col])
+        need_cols = [p_idx]
+        if chr_idx is not None:
+            need_cols.append(chr_idx)
+        if pos_idx is not None:
+            need_cols.append(pos_idx)
+        if snp_idx is not None:
+            need_cols.append(snp_idx)
+        max_need_idx = max(need_cols)
+
+        for fields in row_iter():
+            if len(fields) <= max_need_idx:
+                continue
+            rec = _assoc_record_from_fields(
+                fields,
+                p_idx=p_idx,
+                chr_idx=chr_idx,
+                pos_idx=pos_idx,
+                snp_idx=snp_idx,
+            )
+            if rec is None:
+                continue
+
+            current = best_by_snp.get(rec.snp)
+            if current is not None:
+                if (rec.p, rec.snp) < (current.p, current.snp):
+                    best_by_snp[rec.snp] = rec
+                    heapq.heappush(heap, _AssocTopKHeapItem(rec))
+                continue
+
+            _prune_topk_heap(heap, best_by_snp)
+            if len(best_by_snp) < k:
+                best_by_snp[rec.snp] = rec
+                heapq.heappush(heap, _AssocTopKHeapItem(rec))
+                continue
+
+            if not heap:
+                best_by_snp[rec.snp] = rec
+                heapq.heappush(heap, _AssocTopKHeapItem(rec))
+                continue
+
+            worst = heap[0].record
+            if (rec.p, rec.snp) < (worst.p, worst.snp):
+                del best_by_snp[worst.snp]
+                heapq.heapreplace(heap, _AssocTopKHeapItem(rec))
+                best_by_snp[rec.snp] = rec
+
+    top_rows = sorted(best_by_snp.values(), key=lambda r: (r.p, r.snp))[:k]
+    return pd.DataFrame(
+        [
+            {
+                "SNP": rec.snp,
+                "CHR": (rec.chrom if rec.chrom is not None else pd.NA),
+                "POS": (rec.pos if rec.pos is not None else pd.NA),
+                "P": float(rec.p),
+            }
+            for rec in top_rows
+        ],
+        columns=["SNP", "CHR", "POS", "P"],
+    )
 
 
 def _read_pheno(path: Path, ncol: Optional[list[object]]) -> tuple[pd.DataFrame, str]:

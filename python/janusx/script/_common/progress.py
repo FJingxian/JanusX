@@ -57,7 +57,7 @@ except Exception:
     _HAS_TQDM = False
 
 _SPINNER_NAME = "dots"
-_SPINNER_FRAMES = [".  ", ".. ", "...", " ..", "  .", " . "]
+_SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 _SPINNER_REFRESH_SEC = 0.2
 _SPINNER_FALLBACKS = ("dots", "simpleDots", "line", "bouncingBar")
 _GREEN = "\033[32m"
@@ -590,8 +590,9 @@ class CliStatus:
         self._proc = None
         self._proc_stop_evt = None
         self._plain_done = False
-        self._status_cm = None
         self._console = None
+        self._rich_progress = None
+        self._rich_task_id = None
         self._start_ts: Optional[float] = None
 
     def _animate_plain(self) -> None:
@@ -610,11 +611,7 @@ class CliStatus:
 
     def _animate_rich(self) -> None:
         while not self._plain_done:
-            if self._status_cm is None:
-                break
-            try:
-                self._status_cm.update(_rich_status_text(self._running_line()))
-            except Exception:
+            if self._rich_progress is None or self._rich_task_id is None:
                 break
             sleep(max(self.timeout, spinner_refresh_interval(self._elapsed_seconds())))
 
@@ -660,20 +657,33 @@ class CliStatus:
                 ensure_rich_spinner_registered()
                 assert Console is not None
                 self._console = Console()
-                self._status_cm = self._console.status(
-                    _rich_status_text(self._running_line()),
-                    spinner=get_rich_spinner_name(),
-                    spinner_style="cyan",
+                self._rich_progress = build_rich_progress(
+                    description_template="[green]{task.description}",
+                    show_spinner=True,
+                    show_bar=False,
+                    show_percentage=False,
+                    show_elapsed=bool(self.show_elapsed),
+                    show_remaining=False,
+                    finished_text=" ",
+                    transient=True,
                 )
-                self._status_cm.__enter__()
+                if self._rich_progress is None:
+                    raise RuntimeError("rich progress unavailable")
+                self._rich_progress.start()
+                self._rich_task_id = self._rich_progress.add_task(
+                    _truncate_console_text(self.desc),
+                    total=None,
+                )
                 self._backend = "rich"
-                if self.show_elapsed:
-                    self._plain_done = False
-                    self._thread = Thread(target=self._animate_rich, daemon=True)
-                    self._thread.start()
                 return self
             except Exception:
-                self._status_cm = None
+                try:
+                    if self._rich_progress is not None:
+                        self._rich_progress.stop()
+                except Exception:
+                    pass
+                self._rich_progress = None
+                self._rich_task_id = None
                 self._console = None
 
         self._backend = "plain"
@@ -706,9 +716,12 @@ class CliStatus:
                 self._proc = None
                 self._proc_stop_evt = None
 
-        if self._backend == "rich" and self._status_cm is not None:
-            self._status_cm.__exit__(None, None, None)
-            self._status_cm = None
+        if self._backend == "rich" and self._rich_progress is not None:
+            try:
+                self._rich_progress.stop()
+            finally:
+                self._rich_progress = None
+                self._rich_task_id = None
             return
 
         if self._backend in ("plain", "process"):

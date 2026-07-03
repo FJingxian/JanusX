@@ -22,7 +22,7 @@ use crate::glm::{
 };
 use crate::gload::WindowedBedMatrix;
 use crate::linalg::{chi2_sf, format_chisq_value, sanitize_assoc_pvalue};
-use crate::stats_common::get_cached_pool;
+use crate::stats_common::{get_cached_pool, parse_index_vec_i64};
 
 fn pinv_svd_square(a: &DMatrix<f64>) -> Result<DMatrix<f64>, String> {
     let q = a.nrows();
@@ -370,6 +370,10 @@ fn append_lm2_row_text(
     cov_indices,
     out_tsv,
     sample_ids=None,
+    row_indices=None,
+    row_flip=None,
+    row_missing=None,
+    row_maf=None,
     maf_threshold=0.0,
     max_missing_rate=1.0,
     genetic_model="add",
@@ -390,6 +394,10 @@ pub fn lm2_stream_bed_to_tsv(
     cov_indices: PyReadonlyArray1<'_, i64>,
     out_tsv: String,
     sample_ids: Option<Vec<String>>,
+    row_indices: Option<PyReadonlyArray1<'_, i64>>,
+    row_flip: Option<PyReadonlyArray1<'_, bool>>,
+    row_missing: Option<PyReadonlyArray1<'_, f32>>,
+    row_maf: Option<PyReadonlyArray1<'_, f32>>,
     maf_threshold: f32,
     max_missing_rate: f32,
     genetic_model: &str,
@@ -476,6 +484,30 @@ pub fn lm2_stream_bed_to_tsv(
             cov_selected[r * n_interactions + j] = cov_arr[(r, src_j)];
         }
     }
+    let prepared_meta_input = match (row_indices, row_flip, row_missing, row_maf) {
+        (None, None, None, None) => None,
+        (Some(row_idx), Some(row_flip), Some(row_missing), Some(row_maf)) => {
+            let row_idx_vec = row_idx.as_slice()?.to_vec();
+            let row_flip_vec = match row_flip.as_slice() {
+                Ok(slc) => slc.to_vec(),
+                Err(_) => row_flip.as_array().iter().copied().collect(),
+            };
+            let row_missing_vec = match row_missing.as_slice() {
+                Ok(slc) => slc.to_vec(),
+                Err(_) => row_missing.as_array().iter().copied().collect(),
+            };
+            let row_maf_vec = match row_maf.as_slice() {
+                Ok(slc) => slc.to_vec(),
+                Err(_) => row_maf.as_array().iter().copied().collect(),
+            };
+            Some((row_idx_vec, row_flip_vec, row_missing_vec, row_maf_vec))
+        }
+        _ => {
+            return Err(PyRuntimeError::new_err(
+                "prepared row metadata must provide all or none of: row_indices, row_flip, row_missing, row_maf",
+            ))
+        }
+    };
 
     let norm_prefix = normalize_plink_prefix_local(&prefix);
     let samples = gfcore::read_fam(&norm_prefix).map_err(PyRuntimeError::new_err)?;
@@ -504,6 +536,52 @@ pub fn lm2_stream_bed_to_tsv(
                 .map_err(PyRuntimeError::new_err)?;
         let n_snps = bed_window.n_source_snps();
         let bytes_per_snp = bed_window.bytes_per_snp();
+        let prepared_meta = match prepared_meta_input.as_ref() {
+            None => None,
+            Some((row_idx64, row_flip_vec, row_missing_vec, row_maf_vec)) => {
+                let m = row_idx64.len();
+                if row_flip_vec.len() != m
+                    || row_missing_vec.len() != m
+                    || row_maf_vec.len() != m
+                {
+                    return Err(PyRuntimeError::new_err(format!(
+                        "prepared row metadata length mismatch: row_indices={m}, row_flip={}, row_missing={}, row_maf={}",
+                        row_flip_vec.len(),
+                        row_missing_vec.len(),
+                        row_maf_vec.len(),
+                    )));
+                }
+                let source_rows =
+                    parse_index_vec_i64(row_idx64.as_slice(), n_snps, "row_indices")
+                        .map_err(PyRuntimeError::new_err)?;
+                let mut prev_src: Option<usize> = None;
+                for &src_row in source_rows.iter() {
+                    if let Some(prev) = prev_src {
+                        if src_row < prev {
+                            return Err(PyRuntimeError::new_err(
+                                "prepared row_indices must be sorted in ascending BED order",
+                            ));
+                        }
+                    }
+                    prev_src = Some(src_row);
+                }
+                let miss_counts: Vec<usize> = row_missing_vec
+                    .iter()
+                    .map(|&v| {
+                        if !v.is_finite() || v < 0.0_f32 {
+                            0usize
+                        } else {
+                            v.round() as usize
+                        }
+                    })
+                    .collect();
+                Some((source_rows, row_flip_vec.clone(), miss_counts, row_maf_vec.clone()))
+            }
+        };
+        let total_scan_units = prepared_meta
+            .as_ref()
+            .map(|(source_rows, _, _, _)| source_rows.len())
+            .unwrap_or(n_snps);
 
         let mut sink = AssocTsvSink::with_config(out_path, 8 * 1024 * 1024, 16);
         sink.ensure_custom_header(lm2_header(cov_pick.as_slice()).as_slice())
@@ -514,23 +592,55 @@ pub fn lm2_stream_bed_to_tsv(
         } else {
             progress_every.max(1)
         };
-        let mut next_progress_emit = progress_block.min(n_snps);
+        let mut next_progress_emit = progress_block.min(total_scan_units);
         let mut kept_total = 0usize;
         let mut chunk_start = 0usize;
         let mut text = String::with_capacity(8 * 1024 * 1024);
         let mut g_raw = vec![0.0_f64; n];
         let mut lm2_scratch = Lm2Scratch::new(base_cache.q_rank, n_interactions);
+        let mut rel_row_indices = Vec::<usize>::with_capacity(chunk_size.max(1));
 
-        while chunk_start < n_snps {
-            let chunk_end = (chunk_start + chunk_size).min(n_snps);
-            let chunk_packed = bed_window
-                .read_source_range(chunk_start, chunk_end)
-                .map_err(PyRuntimeError::new_err)?;
-            let chunk_sites = bim_reader
-                .read_range(chunk_start, chunk_end)
-                .map_err(PyRuntimeError::new_err)?;
+        while chunk_start < total_scan_units {
+            let chunk_end = (chunk_start + chunk_size).min(total_scan_units);
+            let prepared_batch = prepared_meta
+                .as_ref()
+                .map(|(source_rows, row_flip_all, miss_count_all, row_maf_all)| {
+                    (
+                        &source_rows[chunk_start..chunk_end],
+                        &row_flip_all[chunk_start..chunk_end],
+                        &miss_count_all[chunk_start..chunk_end],
+                        &row_maf_all[chunk_start..chunk_end],
+                    )
+                });
+            let chunk_packed = if let Some((source_rows, _, _, _)) = prepared_batch.as_ref() {
+                bed_window
+                    .prepare_source_rows(source_rows, &mut rel_row_indices)
+                    .map_err(PyRuntimeError::new_err)?
+            } else {
+                bed_window
+                    .read_source_range(chunk_start, chunk_end)
+                    .map_err(PyRuntimeError::new_err)?
+            };
+            let chunk_sites = if let Some((source_rows, _, _, _)) = prepared_batch.as_ref() {
+                bim_reader
+                    .read_selected_rows(source_rows)
+                    .map_err(PyRuntimeError::new_err)?
+            } else {
+                bim_reader
+                    .read_range(chunk_start, chunk_end)
+                    .map_err(PyRuntimeError::new_err)?
+            };
 
-            let counts: Vec<Option<(f32, usize)>> = if let Some(tp) = pool.as_ref() {
+            let counts: Vec<Option<(f32, usize)>> = if let Some((_, _, miss_count_batch, row_maf_batch)) =
+                prepared_batch.as_ref()
+            {
+                row_maf_batch
+                    .iter()
+                    .copied()
+                    .zip(miss_count_batch.iter().copied())
+                    .map(|(maf, missing_count)| Some((maf, missing_count)))
+                    .collect()
+            } else if let Some(tp) = pool.as_ref() {
                 tp.install(|| {
                     (chunk_start..chunk_end)
                         .into_par_iter()
@@ -625,11 +735,19 @@ pub fn lm2_stream_bed_to_tsv(
                                 {
                                     return Ok(None);
                                 }
-                                let row = &chunk_packed
-                                    [offset * bytes_per_snp..(offset + 1) * bytes_per_snp];
+                                let row_local_idx = if prepared_batch.is_some() {
+                                    rel_row_indices[offset]
+                                } else {
+                                    offset
+                                };
+                                let row = &chunk_packed[row_local_idx * bytes_per_snp
+                                    ..(row_local_idx + 1) * bytes_per_snp];
                                 decode_packed_row_model_enum_into_f64(
                                     row,
-                                    false,
+                                    prepared_batch
+                                        .as_ref()
+                                        .map(|(_, row_flip_batch, _, _)| row_flip_batch[offset])
+                                        .unwrap_or(false),
                                     maf,
                                     n,
                                     gm,
@@ -683,10 +801,19 @@ pub fn lm2_stream_bed_to_tsv(
                     {
                         continue;
                     }
-                    let row = &chunk_packed[offset * bytes_per_snp..(offset + 1) * bytes_per_snp];
+                    let row_local_idx = if prepared_batch.is_some() {
+                        rel_row_indices[offset]
+                    } else {
+                        offset
+                    };
+                    let row = &chunk_packed
+                        [row_local_idx * bytes_per_snp..(row_local_idx + 1) * bytes_per_snp];
                     decode_packed_row_model_enum_into_f64(
                         row,
-                        false,
+                        prepared_batch
+                            .as_ref()
+                            .map(|(_, row_flip_batch, _, _)| row_flip_batch[offset])
+                            .unwrap_or(false),
                         *maf,
                         n,
                         gm,
@@ -728,13 +855,19 @@ pub fn lm2_stream_bed_to_tsv(
                 if let Some(cb) = progress_callback.as_ref() {
                     let _ = Python::attach(|py2| -> PyResult<()> {
                         py2.check_signals()?;
-                        cb.call1(py2, (scanned_total.min(n_snps), n_snps))?;
+                        cb.call1(
+                            py2,
+                            (
+                                scanned_total.min(total_scan_units),
+                                total_scan_units,
+                            ),
+                        )?;
                         Ok(())
                     });
                 }
                 next_progress_emit = (scanned_total / progress_block + 1)
                     .saturating_mul(progress_block)
-                    .min(n_snps);
+                    .min(total_scan_units);
             }
             chunk_start = chunk_end;
         }
@@ -742,11 +875,11 @@ pub fn lm2_stream_bed_to_tsv(
         if let Some(cb) = progress_callback.as_ref() {
             let _ = Python::attach(|py2| -> PyResult<()> {
                 py2.check_signals()?;
-                cb.call1(py2, (n_snps, n_snps))?;
+                cb.call1(py2, (total_scan_units, total_scan_units))?;
                 Ok(())
             });
         }
         sink.finish().map_err(PyRuntimeError::new_err)?;
-        Ok((kept_total, n_snps))
+        Ok((kept_total, total_scan_units))
     })
 }

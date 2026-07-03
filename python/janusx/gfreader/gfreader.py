@@ -1,5 +1,6 @@
 from typing import Union
 from contextlib import contextmanager
+import gzip
 import os
 import warnings
 import shutil
@@ -36,29 +37,6 @@ try:
     from janusx.janusx import prepare_bed_2bit_packed as _prepare_bed_2bit_packed
 except Exception:
     _prepare_bed_2bit_packed = None
-
-try:
-    from rich.progress import (
-        Progress,
-        SpinnerColumn,
-        BarColumn,
-        TextColumn,
-        TimeElapsedColumn,
-    )
-    _HAS_RICH_PROGRESS = True
-except Exception:
-    Progress = None  # type: ignore[assignment]
-    SpinnerColumn = None  # type: ignore[assignment]
-    BarColumn = None  # type: ignore[assignment]
-    TextColumn = None  # type: ignore[assignment]
-    TimeElapsedColumn = None  # type: ignore[assignment]
-    _HAS_RICH_PROGRESS = False
-
-try:
-    from janusx.script._common.progress import get_rich_spinner_name as _get_rich_spinner_name
-except Exception:
-    def _get_rich_spinner_name() -> str:  # type: ignore[override]
-        return "dots"
 
 try:
     from janusx.script._common.progress import build_rich_progress as _build_rich_progress
@@ -376,6 +354,172 @@ def _strip_known_suffix(path_or_prefix: str) -> str:
     return p
 
 
+def _matrix_kind_from_path(path: str) -> Union[str, None]:
+    low = str(path).lower()
+    if low.endswith((".txt", ".tsv", ".csv")):
+        return "txt"
+    if low.endswith(".npy"):
+        return "npy"
+    if low.endswith(".bin"):
+        return "bin"
+    return None
+
+
+def _normalize_matrix_prefix(prefix: str, kind: str) -> str:
+    if kind in {"npy", "bin"}:
+        base = os.path.basename(prefix)
+        if base.startswith("~"):
+            return os.path.join(os.path.dirname(prefix), base[1:])
+    return prefix
+
+
+def _plink_missing_files(prefix: str) -> list[str]:
+    return [
+        f"{prefix}.{ext}"
+        for ext in ("bed", "bim", "fam")
+        if not os.path.isfile(f"{prefix}.{ext}")
+    ]
+
+
+def _raise_plink_prefix_error(prefix: str) -> None:
+    missing = _plink_missing_files(prefix)
+    lines = [f"PLINK BED prefix is incomplete or not found: {prefix}"]
+    for path in missing:
+        lines.append(f"Missing file: {path}")
+    raise ValueError("\n".join(lines))
+
+
+def _peek_text_lines(path: str, limit: int = 32) -> list[str]:
+    opener = gzip.open if str(path).lower().endswith(".gz") else open
+    lines: list[str] = []
+    with opener(path, "rt", encoding="utf-8", errors="replace") as handle:
+        for _ in range(max(1, int(limit))):
+            line = handle.readline()
+            if line == "":
+                break
+            lines.append(line.rstrip("\r\n"))
+    return lines
+
+
+def _looks_like_vcf_file(path: str) -> bool:
+    try:
+        lines = _peek_text_lines(path, limit=64)
+    except Exception as ex:
+        raise ValueError(f"Unable to read VCF header from '{path}': {ex}") from ex
+    saw_fileformat = False
+    saw_chrom = False
+    for line in lines:
+        row = line.strip()
+        if not row:
+            continue
+        if row.startswith("##fileformat=VCF"):
+            saw_fileformat = True
+            continue
+        if row.startswith("#CHROM"):
+            saw_chrom = True
+            break
+        if not row.startswith("#"):
+            break
+    return saw_fileformat or saw_chrom
+
+
+def _looks_like_hmp_file(path: str) -> bool:
+    try:
+        lines = _peek_text_lines(path, limit=8)
+    except Exception as ex:
+        raise ValueError(f"Unable to read HMP header from '{path}': {ex}") from ex
+    for line in lines:
+        row = line.strip()
+        if not row:
+            continue
+        cols = [str(x).strip().lower() for x in row.split()]
+        if len(cols) < 5:
+            return False
+        return cols[:5] == ["rs#", "alleles", "chrom", "pos", "strand"]
+    return False
+
+
+def _resolve_existing_text_source(
+    path_or_prefix: str,
+    *,
+    suffixes: tuple[str, ...],
+) -> tuple[str, Union[str, None]]:
+    p = str(path_or_prefix)
+    if os.path.isfile(p):
+        return _strip_known_suffix(p), p
+    prefix = _strip_known_suffix(p)
+    for suffix in suffixes:
+        cand = f"{prefix}{suffix}"
+        if os.path.isfile(cand):
+            return _strip_known_suffix(cand), cand
+    return prefix, None
+
+
+def _raise_missing_text_source(kind: str, path_or_prefix: str, *, suffixes: tuple[str, ...]) -> None:
+    prefix = _strip_known_suffix(str(path_or_prefix))
+    tried: list[str] = []
+    p = str(path_or_prefix)
+    if p != prefix or os.path.splitext(p)[1]:
+        tried.append(p)
+    else:
+        tried.extend(f"{prefix}{suffix}" for suffix in suffixes)
+    lines = [f"{kind.upper()} input not found: {path_or_prefix}"]
+    for cand in tried:
+        lines.append(f"Tried file: {cand}")
+    raise ValueError("\n".join(lines))
+
+
+def _raise_invalid_text_format(kind: str, path: str) -> None:
+    label = "VCF" if kind == "vcf" else "HMP"
+    fmt = "VCF" if kind == "vcf" else "HapMap"
+    raise ValueError(f"{label} input format check failed: {path} does not look like a {fmt} file.")
+
+
+def _file_matrix_candidates(
+    path_or_prefix: str,
+    *,
+    expected_kind: Union[str, None],
+) -> tuple[str, list[tuple[str, str]]]:
+    p = str(path_or_prefix)
+    matrix_kind = _matrix_kind_from_path(p)
+    if matrix_kind is not None:
+        return _strip_known_suffix(p), [(matrix_kind, p)]
+    prefix = p
+    if expected_kind == "txt":
+        return prefix, [("txt", f"{prefix}.txt"), ("txt", f"{prefix}.tsv"), ("txt", f"{prefix}.csv")]
+    if expected_kind == "npy":
+        return prefix, [("npy", f"{prefix}.npy")]
+    if expected_kind == "bin":
+        return prefix, [("bin", f"{prefix}.bin")]
+    return prefix, [
+        ("npy", f"{prefix}.npy"),
+        ("bin", f"{prefix}.bin"),
+        ("txt", f"{prefix}.txt"),
+        ("txt", f"{prefix}.tsv"),
+        ("txt", f"{prefix}.csv"),
+    ]
+
+
+def _file_sidecar_candidates(prefix: str, kind: str) -> list[str]:
+    if kind == "bin":
+        return [f"{prefix}.bin.id", f"{prefix}.id", f"{prefix}.fam"]
+    return [f"{prefix}.id", f"{prefix}.fam"]
+
+
+def _raise_file_input_error(
+    path_or_prefix: str,
+    *,
+    matrix_candidates: list[str],
+    sidecar_candidates: list[str],
+) -> None:
+    lines = [f"FILE input is incomplete or not found: {path_or_prefix}"]
+    for cand in matrix_candidates:
+        lines.append(f"Missing matrix file: {cand}")
+    for cand in sidecar_candidates:
+        lines.append(f"Missing sample ID sidecar: {cand}")
+    raise ValueError("\n".join(lines))
+
+
 def _resolve_input(path_or_prefix: str, force_kind: Union[str, None] = None):
     """
     Resolve input kind and prefix.
@@ -384,29 +528,58 @@ def _resolve_input(path_or_prefix: str, force_kind: Union[str, None] = None):
     """
     p = str(path_or_prefix)
     fk = str(force_kind or "").strip().lower()
-    if fk in {"vcf", "hmp", "txt", "file", "npy", "bin", "plink"}:
-        if fk == "file":
-            fk = "txt"
-        if fk == "plink":
+    if fk in {"vcf", "hmp", "txt", "file", "npy", "bin", "plink", "bfile"}:
+        if fk in {"plink", "bfile"}:
             prefix = p[:-4] if p.lower().endswith((".bed", ".bim", ".fam")) else p
-            if _is_plink_prefix(prefix):
-                return "plink", prefix, None
+            missing = _plink_missing_files(prefix)
+            if missing:
+                _raise_plink_prefix_error(prefix)
             return "plink", prefix, None
-        if os.path.exists(p):
-            return fk, _strip_known_suffix(p), p
-        prefix = _strip_known_suffix(p)
-        if fk == "hmp":
-            for cand in (p, f"{prefix}.hmp.gz", f"{prefix}.hmp"):
-                if os.path.exists(cand):
-                    return "hmp", _strip_known_suffix(cand), cand
-            return "hmp", prefix, p
         if fk == "vcf":
-            for cand in (p, f"{prefix}.vcf.gz", f"{prefix}.vcf"):
-                if os.path.exists(cand):
-                    return "vcf", _strip_known_suffix(cand), cand
-            return "vcf", prefix, p
-        if fk in {"txt", "npy", "bin"}:
-            return fk, prefix, p
+            prefix, src_path = _resolve_existing_text_source(
+                p,
+                suffixes=(".vcf.gz", ".vcf"),
+            )
+            if src_path is None:
+                _raise_missing_text_source("vcf", p, suffixes=(".vcf.gz", ".vcf"))
+            if not _looks_like_vcf_file(src_path):
+                _raise_invalid_text_format("vcf", src_path)
+            return "vcf", prefix, src_path
+        if fk == "hmp":
+            prefix, src_path = _resolve_existing_text_source(
+                p,
+                suffixes=(".hmp.gz", ".hmp"),
+            )
+            if src_path is None:
+                _raise_missing_text_source("hmp", p, suffixes=(".hmp.gz", ".hmp"))
+            if not _looks_like_hmp_file(src_path):
+                _raise_invalid_text_format("hmp", src_path)
+            return "hmp", prefix, src_path
+        expected_kind = None if fk == "file" else fk
+        prefix, candidates = _file_matrix_candidates(p, expected_kind=expected_kind)
+        matrix_path = None
+        matrix_kind = None
+        for cand_kind, cand_path in candidates:
+            if expected_kind is not None and cand_kind != expected_kind:
+                continue
+            if os.path.isfile(cand_path):
+                matrix_kind = cand_kind
+                matrix_path = cand_path
+                break
+        if matrix_path is None or matrix_kind is None:
+            _raise_file_input_error(
+                p,
+                matrix_candidates=[cand_path for _, cand_path in candidates],
+                sidecar_candidates=[],
+            )
+        sidecar_candidates = _file_sidecar_candidates(prefix, matrix_kind)
+        if not any(os.path.isfile(cand) for cand in sidecar_candidates):
+            _raise_file_input_error(
+                p,
+                matrix_candidates=[],
+                sidecar_candidates=sidecar_candidates,
+            )
+        return matrix_kind, _normalize_matrix_prefix(prefix, matrix_kind), matrix_path
     low = p.lower()
 
     if _is_plink_prefix(p):
@@ -2082,52 +2255,37 @@ def save_genotype_streaming(
     else:
         w = VcfStreamWriter(str(out), sample_ids)
 
-    use_rich = bool(_HAS_RICH_PROGRESS and getattr(sys.stdout, "isatty", lambda: False)())
+    use_rich = bool((_build_rich_progress is not None) and getattr(sys.stdout, "isatty", lambda: False)())
     pbar = None
     progress = None
     task_id = None
     if use_rich:
-        if _build_rich_progress is not None:
-            progress = _build_rich_progress(
-                description_template="[green]{task.description}",
-                show_bar=(total_snps is not None),
-                show_percentage=(total_snps is not None),
-                show_elapsed=True,
-                show_remaining=False,
-                bar_width=(40 if total_snps is not None else None),
-                finished_text=" ",
-                transient=True,
+        progress = _build_rich_progress(
+            description_template="[green]{task.description}",
+            show_bar=(total_snps is not None),
+            show_percentage=(total_snps is not None),
+            show_elapsed=True,
+            show_remaining=False,
+            bar_width=(40 if total_snps is not None else None),
+            finished_text=" ",
+            transient=True,
+        )
+        if progress is not None:
+            task_id = progress.add_task(
+                str(desc),
+                total=(None if total_snps is None else float(total_snps)),
             )
-            if progress is not None:
-                task_id = progress.add_task(
-                    str(desc),
-                    total=(None if total_snps is None else float(total_snps)),
-                )
-                progress.start()
-        if progress is None:
-            spinner_name = "dots"
-            try:
-                spinner_name = str(_get_rich_spinner_name() or "dots")
-            except Exception:
-                spinner_name = "dots"
-            if total_snps is None:
-                progress = Progress(
-                    SpinnerColumn(spinner_name=spinner_name, style="green", finished_text=" "),
-                    TextColumn("[green]{task.description}"),
-                    TimeElapsedColumn(),
-                )
-                task_id = progress.add_task(desc, total=None)
-            else:
-                progress = Progress(
-                    SpinnerColumn(spinner_name=spinner_name, style="green", finished_text=" "),
-                    TextColumn("[green]{task.description}"),
-                    BarColumn(bar_width=40),
-                    TextColumn("{task.percentage:>5.1f}%"),
-                    TimeElapsedColumn(),
-                )
-                task_id = progress.add_task(desc, total=float(total_snps))
             progress.start()
     else:
+        pbar = tqdm(
+            total=total_snps,
+            unit="SNP",
+            desc=desc,
+            disable=(total_snps is None),
+            bar_format="{desc}: {percentage:3.0f}%|{bar}| "
+                       "[{elapsed}<{remaining}, {rate_fmt}{postfix}]",
+        )
+    if use_rich and progress is None:
         pbar = tqdm(
             total=total_snps,
             unit="SNP",

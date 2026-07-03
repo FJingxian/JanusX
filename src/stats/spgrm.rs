@@ -3817,6 +3817,7 @@ fn spgrm_dense_npy_to_jxgrm_core(
     progress_every=0
 ))]
 pub fn spgrm_packed_to_jxgrm<'py>(
+    py: Python<'py>,
     packed: PyReadonlyArray2<'py, u8>,
     n_samples: usize,
     row_flip: PyReadonlyArray1<'py, bool>,
@@ -3845,9 +3846,9 @@ pub fn spgrm_packed_to_jxgrm<'py>(
             "packed second dimension mismatch: got {bytes_per_snp}, expected {expected_bps}"
         )));
     }
-    let packed_flat: Cow<'_, [u8]> = match packed.as_slice() {
-        Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(packed_arr.iter().copied().collect()),
+    let packed_flat: Vec<u8> = match packed.as_slice() {
+        Ok(s) => s.to_vec(),
+        Err(_) => packed_arr.iter().copied().collect(),
     };
     let row_flip_vec = row_flip.as_slice()?.to_vec();
     let row_maf_vec = row_maf.as_slice()?.to_vec();
@@ -3856,22 +3857,24 @@ pub fn spgrm_packed_to_jxgrm<'py>(
     } else {
         (0..n_samples).collect()
     };
-    spgrm_packed_to_jxgrm_core(
-        packed_flat.as_ref(),
-        n_samples,
-        row_flip_vec.as_slice(),
-        row_maf_vec.as_slice(),
-        sample_idx.as_slice(),
-        &out_prefix,
-        method,
-        threshold,
-        abs_threshold,
-        block_rows,
-        sample_block,
-        threads,
-        progress_callback.as_ref(),
-        progress_every,
-    )
+    py.detach(move || {
+        spgrm_packed_to_jxgrm_core(
+            packed_flat.as_slice(),
+            n_samples,
+            row_flip_vec.as_slice(),
+            row_maf_vec.as_slice(),
+            sample_idx.as_slice(),
+            &out_prefix,
+            method,
+            threshold,
+            abs_threshold,
+            block_rows,
+            sample_block,
+            threads,
+            progress_callback.as_ref(),
+            progress_every,
+        )
+    })
     .map_err(map_err_string_to_py)
 }
 
@@ -3895,6 +3898,7 @@ pub fn spgrm_packed_to_jxgrm<'py>(
     progress_every=0
 ))]
 pub fn spgrm_bed_to_jxgrm<'py>(
+    py: Python<'py>,
     prefix: String,
     out_prefix: Option<String>,
     sample_indices: Option<PyReadonlyArray1<'py, i64>>,
@@ -3929,24 +3933,26 @@ pub fn spgrm_bed_to_jxgrm<'py>(
         None
     };
     let out_use = out_prefix.unwrap_or_else(|| bed_prefix.clone());
-    spgrm_bed_to_jxgrm_core(
-        &bed_prefix,
-        sample_idx_vec.as_deref(),
-        &out_use,
-        method,
-        threshold,
-        abs_threshold,
-        maf_threshold,
-        max_missing_rate,
-        het_threshold,
-        snps_only,
-        block_rows,
-        sample_block,
-        threads,
-        mmap_window_mb,
-        progress_callback.as_ref(),
-        progress_every,
-    )
+    py.detach(move || {
+        spgrm_bed_to_jxgrm_core(
+            &bed_prefix,
+            sample_idx_vec.as_deref(),
+            &out_use,
+            method,
+            threshold,
+            abs_threshold,
+            maf_threshold,
+            max_missing_rate,
+            het_threshold,
+            snps_only,
+            block_rows,
+            sample_block,
+            threads,
+            mmap_window_mb,
+            progress_callback.as_ref(),
+            progress_every,
+        )
+    })
     .map_err(map_err_string_to_py)
 }
 
@@ -3970,6 +3976,7 @@ pub fn spgrm_bed_to_jxgrm<'py>(
     progress_every=0
 ))]
 pub fn spgrm_bed_to_jxgrm_from_meta<'py>(
+    py: Python<'py>,
     prefix: String,
     row_source_indices: PyReadonlyArray1<'py, i64>,
     row_flip: PyReadonlyArray1<'py, bool>,
@@ -4009,11 +4016,6 @@ pub fn spgrm_bed_to_jxgrm_from_meta<'py>(
     } else {
         None
     };
-    let selected_idx: Cow<'_, [usize]> = match sample_idx_vec.as_deref() {
-        Some(idx) => Cow::Borrowed(idx),
-        None => Cow::Owned((0..n_samples_full).collect()),
-    };
-
     let row_source_vec: Vec<usize> = row_source_indices
         .as_slice()
         .map_err(|_| PyRuntimeError::new_err("row_source_indices must be contiguous int64"))?
@@ -4055,34 +4057,40 @@ pub fn spgrm_bed_to_jxgrm_from_meta<'py>(
         )));
     }
 
-    let meta = crate::gfreader::PreparedBedLogicMetaOwned {
-        site_keep: Vec::new(),
-        row_flip: row_flip_vec,
-        row_source_indices: row_source_vec,
-        missing_rate: Vec::new(),
-        maf: row_maf_vec,
-        sites: Vec::new(),
-        n_samples: n_samples_full,
-        n_snps_total: n_total_sites,
-        bytes_per_snp: n_samples_full.div_ceil(4),
-    };
     let out_use = out_prefix.unwrap_or_else(|| bed_prefix.clone());
-    spgrm_stream_bed_to_jxgrm_core(
-        &bed_prefix,
-        selected_idx.as_ref(),
-        meta,
-        &out_use,
-        method,
-        threshold,
-        abs_threshold,
-        block_rows,
-        sample_block,
-        threads,
-        mmap_window_mb,
-        progress_callback.as_ref(),
-        progress_every,
-        0usize,
-    )
+    py.detach(move || {
+        let selected_idx: Cow<'_, [usize]> = match sample_idx_vec.as_deref() {
+            Some(idx) => Cow::Borrowed(idx),
+            None => Cow::Owned((0..n_samples_full).collect()),
+        };
+        let meta = crate::gfreader::PreparedBedLogicMetaOwned {
+            site_keep: Vec::new(),
+            row_flip: row_flip_vec,
+            row_source_indices: row_source_vec,
+            missing_rate: Vec::new(),
+            maf: row_maf_vec,
+            sites: Vec::new(),
+            n_samples: n_samples_full,
+            n_snps_total: n_total_sites,
+            bytes_per_snp: n_samples_full.div_ceil(4),
+        };
+        spgrm_stream_bed_to_jxgrm_core(
+            &bed_prefix,
+            selected_idx.as_ref(),
+            meta,
+            &out_use,
+            method,
+            threshold,
+            abs_threshold,
+            block_rows,
+            sample_block,
+            threads,
+            mmap_window_mb,
+            progress_callback.as_ref(),
+            progress_every,
+            0usize,
+        )
+    })
     .map_err(map_err_string_to_py)
 }
 
@@ -4096,6 +4104,7 @@ pub fn spgrm_bed_to_jxgrm_from_meta<'py>(
     progress_every=0
 ))]
 pub fn spgrm_dense_f32_to_jxgrm<'py>(
+    py: Python<'py>,
     grm: PyReadonlyArray2<'py, f32>,
     out_prefix: String,
     threshold: f64,
@@ -4115,19 +4124,21 @@ pub fn spgrm_dense_f32_to_jxgrm<'py>(
         )));
     }
     let n_samples = shape[0];
-    let grm_flat: Cow<'_, [f32]> = match grm.as_slice() {
-        Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(grm_arr.iter().copied().collect()),
+    let grm_flat: Vec<f32> = match grm.as_slice() {
+        Ok(s) => s.to_vec(),
+        Err(_) => grm_arr.iter().copied().collect(),
     };
-    spgrm_dense_f32_to_jxgrm_core(
-        grm_flat.as_ref(),
-        n_samples,
-        &out_prefix,
-        threshold,
-        abs_threshold,
-        progress_callback.as_ref(),
-        progress_every,
-    )
+    py.detach(move || {
+        spgrm_dense_f32_to_jxgrm_core(
+            grm_flat.as_slice(),
+            n_samples,
+            &out_prefix,
+            threshold,
+            abs_threshold,
+            progress_callback.as_ref(),
+            progress_every,
+        )
+    })
     .map_err(map_err_string_to_py)
 }
 
@@ -4140,7 +4151,8 @@ pub fn spgrm_dense_f32_to_jxgrm<'py>(
     progress_callback=None,
     progress_every=0
 ))]
-pub fn spgrm_dense_npy_to_jxgrm(
+pub fn spgrm_dense_npy_to_jxgrm<'py>(
+    py: Python<'py>,
     npy_path: String,
     out_prefix: String,
     threshold: f64,
@@ -4148,14 +4160,16 @@ pub fn spgrm_dense_npy_to_jxgrm(
     progress_callback: Option<Py<PyAny>>,
     progress_every: usize,
 ) -> PyResult<(String, usize, usize)> {
-    spgrm_dense_npy_to_jxgrm_core(
-        &npy_path,
-        &out_prefix,
-        threshold,
-        abs_threshold,
-        progress_callback.as_ref(),
-        progress_every,
-    )
+    py.detach(move || {
+        spgrm_dense_npy_to_jxgrm_core(
+            &npy_path,
+            &out_prefix,
+            threshold,
+            abs_threshold,
+            progress_callback.as_ref(),
+            progress_every,
+        )
+    })
     .map_err(map_err_string_to_py)
 }
 

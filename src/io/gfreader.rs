@@ -4163,6 +4163,11 @@ pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples_sparse_windowed(
     if stats_n_samples == 0 {
         return Err("selected sample set for BED logic preparation is empty".to_string());
     }
+    let stats_excluded_sample_indices = if stats_identity {
+        None
+    } else {
+        precompute_excluded_sample_indices(n_samples, stats_sample_indices)
+    };
 
     let n_snps = it.n_snps();
     let bytes_per_snp = n_samples.div_ceil(4);
@@ -4255,7 +4260,11 @@ pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples_sparse_windowed(
                             .expect("windowed pre-stat SNP index out of range")
                     } else {
                         it_ref
-                            .decode_snp_selected_counts_only_at(snp_idx, stats_sample_indices)
+                            .decode_snp_selected_counts_only_at(
+                                snp_idx,
+                                stats_sample_indices,
+                                stats_excluded_sample_indices.as_deref(),
+                            )
                             .expect("windowed pre-stat selected SNP index out of range")
                     };
                     let non_missing = counts.non_missing;

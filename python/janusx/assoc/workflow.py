@@ -106,6 +106,7 @@ from janusx.script._common.cli_args import (
     parse_trait_selector_specs,
 )
 from janusx.script._common.genoio import (
+    determine_genotype_source_force_kind_from_args,
     genotype_load_status_done,
     genotype_load_status_fail,
     genotype_load_status_open,
@@ -2012,6 +2013,7 @@ def _load_phenotype_with_status(
     *,
     id_col: int = 0,
     use_spinner: bool = False,
+    emit_complete: bool = True,
 ) -> pd.DataFrame:
     """
     Load phenotype with rich/plain CLI status.
@@ -2031,9 +2033,10 @@ def _load_phenotype_with_status(
         except Exception:
             task.fail(f"Loading phenotype from {src} ...Failed")
             raise
-        task.complete(
-            f"Loading phenotype from {src} (n={pheno.shape[0]}, npheno={pheno.shape[1]})"
-        )
+        if bool(emit_complete):
+            task.complete(
+                f"Loading phenotype from {src} (n={pheno.shape[0]}, npheno={pheno.shape[1]})"
+            )
     return pheno
 
 
@@ -2070,6 +2073,18 @@ def _inspect_genotype_file_with_warnings(
     return np.asarray(ids0, dtype=str), int(ns0), warn_msgs
 
 
+def _abort_cli_input_error(logger: logging.Logger, ex: Exception) -> None:
+    msg = str(ex).strip()
+    if msg:
+        for line in msg.splitlines():
+            line_text = str(line).strip()
+            if line_text:
+                logger.error(line_text)
+    else:
+        logger.error(type(ex).__name__)
+    raise SystemExit(1) from None
+
+
 def _inspect_genotype_with_status(
     genofile: str,
     logger: logging.Logger,
@@ -2081,6 +2096,7 @@ def _inspect_genotype_with_status(
     het_threshold: float = 0.01,
     warning_collector: Union[list[str], None] = None,
     force_kind: Optional[str] = None,
+    emit_complete: bool = True,
 ) -> tuple[np.ndarray, int]:
     """
     Inspect genotype metadata with optional cache-status spinner.
@@ -2118,16 +2134,20 @@ def _inspect_genotype_with_status(
                     het=float(het_threshold),
                     force_kind=force_kind,
                 )
+            except ValueError as ex:
+                task.fail(genotype_load_status_fail(src))
+                _abort_cli_input_error(logger, ex)
             except Exception:
                 task.fail(genotype_load_status_fail(src))
                 raise
-            task.complete(
-                genotype_load_status_done(
-                    src,
-                    n_samples=len(ids),
-                    n_snps=int(n_snps),
+            if bool(emit_complete):
+                task.complete(
+                    genotype_load_status_done(
+                        src,
+                        n_samples=len(ids),
+                        n_snps=int(n_snps),
+                    )
                 )
-            )
         return np.asarray(ids, dtype=str), int(n_snps)
 
     with CliStatus(genotype_load_status_open(src), enabled=status_enabled) as task:
@@ -2321,6 +2341,8 @@ def _inspect_genotype_with_status(
                 pass
         if "value" in err:
             task.fail(genotype_load_status_fail(src))
+            if isinstance(err["value"], ValueError):
+                _abort_cli_input_error(logger, err["value"])
             raise err["value"]
 
         ids, n_snps = out["value"]
@@ -2330,13 +2352,14 @@ def _inspect_genotype_with_status(
             for wmsg in warn_msgs:
                 logger.warning(wmsg)
         task.desc = genotype_load_status_progress(src, f"SNP={n_snps}")
-        task.complete(
-            genotype_load_status_done(
-                src,
-                n_samples=len(ids),
-                n_snps=int(n_snps),
+        if bool(emit_complete):
+            task.complete(
+                genotype_load_status_done(
+                    src,
+                    n_samples=len(ids),
+                    n_snps=int(n_snps),
+                )
             )
-        )
         if _gwas_logger_verbose(logger):
             _log_info(logger, f"Genotype sites cached: {n_snps}", use_spinner=use_spinner)
         return ids, n_snps
@@ -2444,25 +2467,14 @@ def build_grm_streaming(
         force_animate=True,
         logger=logger,
     )
-    process = psutil.Process()
-    mem_tick_span = max(1, 10 * int(chunk_size))
     last_done = 0
-    next_mem_tick = mem_tick_span
-    last_mem_ts = 0.0
 
     def _on_packed_progress(done: int, _total: int) -> None:
-        nonlocal last_done, next_mem_tick, last_mem_ts
+        nonlocal last_done
         d = int(done)
         if d > last_done:
             pbar.update(d - last_done)
             last_done = d
-        now = time.monotonic()
-        if d >= next_mem_tick or (d >= int(n_snps) and (now - last_mem_ts) >= 0.2):
-            mem = process.memory_info().rss / 1024**3
-            pbar.set_postfix(memory=f"{mem:.2f}GB")
-            last_mem_ts = now
-            while next_mem_tick <= d:
-                next_mem_tick += mem_tick_span
 
     try:
         grm_raw = None
@@ -2593,8 +2605,6 @@ def build_grm_streaming(
 
         if grm is None:
             grm = np.ascontiguousarray(np.asarray(grm_raw, dtype=np.float32))
-        mem = process.memory_info().rss / 1024**3
-        pbar.set_postfix(memory=f"{mem:.2f}GB")
         pbar.finish()
     finally:
         pbar.close(show_done=False)
@@ -3320,8 +3330,12 @@ def prepare_streaming_context(
     force_kind: Optional[str] = None,
     preinspected_ids: Optional[np.ndarray] = None,
     preinspected_n_snps: Optional[int] = None,
+    preinspected_genotype_elapsed_secs: Optional[float] = None,
+    preinspected_genotype_src: Optional[str] = None,
     preinspect_warnings: Optional[list[str]] = None,
     working_buffers: int = 1,
+    prewarm_global_scanmeta: bool = False,
+    scanmeta_outprefix: Optional[str] = None,
 ):
     """
     Prepare all shared resources for streaming LMM/LM once:
@@ -3330,19 +3344,31 @@ def prepare_streaming_context(
       - GRM + Q (cached)
       - covariates (optional)
     """
+    delay_pheno_complete = bool(prewarm_global_scanmeta)
+    pheno_src = _basename_only(phenofile)
+    pheno_t0 = time.monotonic() if delay_pheno_complete else None
     pheno = _load_phenotype_with_status(
         phenofile,
         pheno_cols,
         logger,
         id_col=0,
         use_spinner=use_spinner,
+        emit_complete=(not delay_pheno_complete),
     )
 
     deferred_cache_warnings: list[str] = list(preinspect_warnings or [])
+    delay_genotype_complete = bool(prewarm_global_scanmeta)
+    genotype_src = str(preinspected_genotype_src).strip() or _basename_only(genofile)
+    genotype_elapsed_secs = (
+        float(preinspected_genotype_elapsed_secs)
+        if preinspected_genotype_elapsed_secs is not None
+        else 0.0
+    )
     if (preinspected_ids is not None) and (preinspected_n_snps is not None):
         ids = np.asarray(preinspected_ids, dtype=str)
         n_snps = int(preinspected_n_snps)
     else:
+        genotype_t0 = time.monotonic()
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             ids, n_snps = _inspect_genotype_with_status(
@@ -3355,6 +3381,7 @@ def prepare_streaming_context(
                 het_threshold=float(het_threshold),
                 warning_collector=deferred_cache_warnings,
                 force_kind=force_kind,
+                emit_complete=(not delay_genotype_complete),
             )
             for w in caught:
                 try:
@@ -3363,6 +3390,7 @@ def prepare_streaming_context(
                     msg = ""
                 if _is_cache_warning_message(msg):
                     deferred_cache_warnings.append(msg)
+        genotype_elapsed_secs = max(time.monotonic() - genotype_t0, 0.0)
     n_samples = len(ids)
     qcov_prefers_grm_local = _gwas_qcov_prefers_grm_route(pcdim, int(n_samples))
     working_buffers_effective = int(max(1, int(working_buffers)))
@@ -3491,6 +3519,43 @@ def prepare_streaming_context(
                 use_spinner=bool(use_spinner),
             )
             preloaded_packed = packed_preload_failure_state(stream_genofile, ex)
+
+    prewarm_scanmeta_secs = 0.0
+    if bool(prewarm_global_scanmeta):
+        bed_prefix_global = _as_plink_prefix(stream_genofile)
+        if bed_prefix_global is not None:
+            scanmeta_t0 = time.monotonic()
+            _ = _gwas_logic_meta_global_cached(
+                str(bed_prefix_global),
+                maf_threshold=float(maf_threshold),
+                max_missing_rate=float(max_missing_rate),
+                het_threshold=float(het_threshold),
+                snps_only=bool(snps_only),
+                outprefix=scanmeta_outprefix,
+                logger=logger,
+                use_spinner=False,
+                emit_status=False,
+            )
+            prewarm_scanmeta_secs = max(time.monotonic() - scanmeta_t0, 0.0)
+    if delay_genotype_complete:
+        log_success(
+            logger,
+            (
+                f"{genotype_load_status_done(genotype_src, n_samples=len(ids), n_snps=int(n_snps))} "
+                f"[{format_elapsed(float(genotype_elapsed_secs) + float(prewarm_scanmeta_secs))}]"
+            ),
+            force_color=bool(use_spinner),
+        )
+    if delay_pheno_complete:
+        log_success(
+            logger,
+            (
+                f"Loading phenotype from {pheno_src} "
+                f"(n={pheno.shape[0]}, npheno={pheno.shape[1]}) "
+                f"[{format_elapsed(None if pheno_t0 is None else (time.monotonic() - pheno_t0))}]"
+            ),
+            force_color=bool(use_spinner),
+        )
 
     need_grm = bool(require_kinship)
 
@@ -5138,6 +5203,18 @@ def _splmm_bed_logic_meta_selected_cached(*args, **kwargs):
     from janusx.assoc.workflow_model_packed import _splmm_bed_logic_meta_selected_cached as _impl
     return _impl(*args, **kwargs)
 
+def _gwas_logic_meta_selected_cached(*args, **kwargs):
+    from janusx.assoc.workflow_model_packed import _gwas_logic_meta_selected_cached as _impl
+    return _impl(*args, **kwargs)
+
+def _gwas_logic_meta_from_packed_ctx(*args, **kwargs):
+    from janusx.assoc.workflow_model_packed import _gwas_logic_meta_from_packed_ctx as _impl
+    return _impl(*args, **kwargs)
+
+def _gwas_logic_meta_global_cached(*args, **kwargs):
+    from janusx.assoc.workflow_model_packed import _gwas_logic_meta_global_cached as _impl
+    return _impl(*args, **kwargs)
+
 def _plink_fam_sample_ids(*args, **kwargs):
     from janusx.assoc.workflow_model_packed import _plink_fam_sample_ids as _impl
     return _impl(*args, **kwargs)
@@ -6013,6 +6090,26 @@ def parse_args(argv: Optional[list[str]] = None):
             "fixed-variance/mixed-model fallback switching."
         ),
     )
+    optional_group.add_argument(
+        "-strict-train", "--strict-train",
+        "-strict-trait", "--strict-trait",
+        dest="strict_train",
+        action="store_true",
+        default=False,
+        help=argparse.SUPPRESS,
+    )
+    optional_group.add_argument(
+        "-global", "--global",
+        dest="global_stats",
+        action="store_true",
+        default=False,
+        help=(
+            "Reuse a single full-sample GWAS scanmeta cache across traits/folds "
+            "instead of recomputing row statistics on each training subset. "
+            "Default is strict-train."
+            if show_dev_help else argparse.SUPPRESS
+        ),
+    )
     add_common_thread_arg(optional_group, default_threads=detect_effective_threads())
     add_common_out_arg(optional_group, default=".")
     add_common_prefix_arg(optional_group, default=None)
@@ -6112,9 +6209,9 @@ def _qtn_source_from_args(args) -> Optional[tuple[str, str, Optional[str]]]:
     if getattr(args, "qtn_hmp", None):
         return "hmp", str(args.qtn_hmp), "hmp"
     if getattr(args, "qtn_bfile", None):
-        return "bfile", str(args.qtn_bfile), None
+        return "bfile", str(args.qtn_bfile), "plink"
     if getattr(args, "qtn_file", None):
-        return "file", str(args.qtn_file), None
+        return "file", str(args.qtn_file), "file"
     return None
 
 
@@ -6133,20 +6230,29 @@ def _prepare_qtn_packed_preload(
     if kind == "bfile":
         prefix = _as_plink_prefix(path)
         if prefix is None:
-            raise ValueError(f"QTN PLINK prefix is invalid or incomplete: {path}")
-    else:
-        prefix = _as_plink_prefix(
-            prepare_cli_input_cache(
-                path,
-                snps_only=bool(getattr(args, "snps_only", False)),
-                delimiter=("," if str(path).lower().endswith(".csv") else None),
-                prefer_plink_for_txt=True,
-                force_kind=force_kind,
-                threads=int(args.thread),
+            _abort_cli_input_error(
+                logger,
+                ValueError(f"QTN PLINK prefix is invalid or incomplete: {path}"),
             )
-        )
+    else:
+        try:
+            prefix = _as_plink_prefix(
+                prepare_cli_input_cache(
+                    path,
+                    snps_only=bool(getattr(args, "snps_only", False)),
+                    delimiter=("," if str(path).lower().endswith(".csv") else None),
+                    prefer_plink_for_txt=True,
+                    force_kind=force_kind,
+                    threads=int(args.thread),
+                )
+            )
+        except ValueError as ex:
+            _abort_cli_input_error(logger, ex)
         if prefix is None:
-            raise ValueError(f"Unable to materialize QTN input as PLINK BED: {path}")
+            _abort_cli_input_error(
+                logger,
+                ValueError(f"Unable to materialize QTN input as PLINK BED: {path}"),
+            )
     with CliStatus(
         "Loading QTN genotype (Full packed)...",
         enabled=bool(use_spinner),
@@ -6358,6 +6464,13 @@ def _run_gwas_pipeline(
     farmcpu_auto_fast = bool(args.farmcpu)
     algwas_auto_fast = bool(args.algwas)
     packed_model_routes_enabled = bool((args.farmcpu or args.algwas) and not qtn_input_requested)
+    packed_model_startup_preload = False
+    gwas_row_stat_mode = "global" if bool(getattr(args, "global_stats", False)) else "strict-train"
+    defer_genotype_success_until_scanmeta = bool(
+        standard_stream_models_requested
+        and gwas_row_stat_mode == "global"
+        and str(args.model).lower() == "add"
+    )
     fast_mode = bool(
         farmcpu_auto_fast or algwas_auto_fast
     )
@@ -6367,6 +6480,8 @@ def _run_gwas_pipeline(
     file_fast_dense_mode = False
     preinspect_ids: Optional[np.ndarray] = None
     preinspect_n_snps: Optional[int] = None
+    preinspect_elapsed_secs: Optional[float] = None
+    preinspect_src_for_merge: Optional[str] = None
     preinspect_warnings: list[str] = []
     if not (
         args.lm
@@ -6384,7 +6499,7 @@ def _run_gwas_pipeline(
         )
         raise SystemExit(1)
     if args.memory is None:
-        inspect_force_kind = "hmp" if bool(getattr(args, "hmp", None)) else None
+        inspect_force_kind = determine_genotype_source_force_kind_from_args(args)
         preinspect_src = _basename_only(gfile)
         preinspect_t0 = time.monotonic()
         with CliStatus(genotype_load_status_open(preinspect_src), enabled=False, use_process=True) as task:
@@ -6397,17 +6512,23 @@ def _run_gwas_pipeline(
                     het_threshold=float(args.het),
                     force_kind=inspect_force_kind,
                 )
+            except ValueError as ex:
+                task.fail(genotype_load_status_fail(preinspect_src))
+                _abort_cli_input_error(logger, ex)
             except Exception:
                 task.fail(genotype_load_status_fail(preinspect_src))
                 raise
         preinspect_ids = np.asarray(preinspect_ids_raw, dtype=str)
         preinspect_n_snps = int(preinspect_n_snps)
         preinspect_warnings.extend(preinspect_warn_msgs)
+        preinspect_elapsed_secs = max(time.monotonic() - preinspect_t0, 0.0)
+        preinspect_src_for_merge = str(preinspect_src)
         qcov_needs_grm = _gwas_qcov_prefers_grm_route(args.qcov, int(len(preinspect_ids)))
-        _queue_preconfig_success(
-            f"{genotype_load_status_done(preinspect_src, n_samples=len(preinspect_ids), n_snps=int(preinspect_n_snps))} "
-            f"[{format_elapsed(time.monotonic() - preinspect_t0)}]"
-        )
+        if not bool(defer_genotype_success_until_scanmeta):
+            _queue_preconfig_success(
+                f"{genotype_load_status_done(preinspect_src, n_samples=len(preinspect_ids), n_snps=int(preinspect_n_snps))} "
+                f"[{format_elapsed(preinspect_elapsed_secs)}]"
+            )
         auto_memory_gb, auto_memory_reason = _resolve_gwas_auto_decode_memory_gb(
             n_samples_total=int(len(preinspect_ids)),
             n_markers_total=int(preinspect_n_snps),
@@ -6693,6 +6814,10 @@ def _run_gwas_pipeline(
         )
     if bool(args.farmcpu):
         _append_advanced_note("FarmCPU selected: enabling packed auto route.")
+    _append_advanced_note(
+        f"GWAS scan row-stat mode: {gwas_row_stat_mode} "
+        f"({'per-trait recompute without disk cache' if gwas_row_stat_mode == 'strict-train' else 'single cached full-sample reuse'})."
+    )
     os.environ["JX_BED_BLOCK_TARGET_MB"] = f"{float(args._memory_mb):.6g}"
     try:
 
@@ -6802,7 +6927,7 @@ def _run_gwas_pipeline(
                             f"Loading sparse GRM from {src}...",
                             enabled=bool(use_spinner),
                         ) as task:
-                            task.complete(f"Loading sparse GRM from {src} ...Finished")
+                            task.complete(f"Loading sparse GRM from {src}...")
 
                     splmm_post_grm_hook = _prepare_splmm_sparse_after_grm
                 else:
@@ -6896,17 +7021,24 @@ def _run_gwas_pipeline(
                     use_spinner=use_spinner,
                     snps_only=bool(args.snps_only),
                     allow_packed_grm=bool(allow_packed_grm_effective),
-                    preload_packed_context=bool(packed_model_routes_enabled),
+                    preload_packed_context=bool(packed_model_startup_preload),
                     require_bed_stream=bool(stream_selected or qtn_input_requested),
                     post_grm_hook=post_grm_hook,
-                    force_kind=("hmp" if bool(getattr(args, "hmp", None)) else None),
+                    force_kind=determine_genotype_source_force_kind_from_args(args),
                     preinspected_ids=preinspect_ids,
                     preinspected_n_snps=preinspect_n_snps,
+                    preinspected_genotype_elapsed_secs=preinspect_elapsed_secs,
+                    preinspected_genotype_src=preinspect_src_for_merge,
                     preinspect_warnings=preinspect_warnings,
                     working_buffers=_gwas_requested_working_buffers(
                         requested_models=list(requested_memory_models),
                         qcov_needs_grm=bool(qcov_needs_grm),
                     ),
+                    prewarm_global_scanmeta=bool(
+                        gwas_row_stat_mode == "global"
+                        and str(args.model).lower() == "add"
+                    ),
+                    scanmeta_outprefix=str(outprefix),
                 )
                 if getattr(args, "lm2", None) is not None:
                     lm2_selector = list(getattr(args, "lm2_cov_cols", []) or [])
@@ -6953,7 +7085,7 @@ def _run_gwas_pipeline(
                     ),
                 )
                 if (
-                    bool(packed_model_routes_enabled)
+                    bool(packed_model_startup_preload)
                     and (not packed_preload_is_ready(preloaded_packed))
                     and (not packed_preload_is_disabled(preloaded_packed))
                 ):
@@ -6978,11 +7110,12 @@ def _run_gwas_pipeline(
                             f"Packed preload unavailable; falling back to on-demand packed load. reason={ex}"
                         )
                         preloaded_packed = packed_preload_failure_state(genofile_stream, ex)
-                if terminal_rich:
+                if terminal_rich and len(stream_models) > 0:
                     _phase_split(terminal_logger)
                 logger_task_rows: list[tuple[str, object]] = [
                     ("Data Loaded", f"{int(len(ids))} Samples | {int(n_snps)} SNPs"),
                     ("Genotype Cache", _display_path(str(genofile_stream))),
+                    ("GWAS Stats", str(gwas_row_stat_mode)),
                     ("GRM Status", _format_gwas_grm_status(grm, args.grm)),
                     ("Q Matrix", _format_gwas_q_status(qmatrix)),
                     ("Covariates", _format_gwas_cov_status(cov_all)),
@@ -7198,7 +7331,9 @@ def _run_gwas_pipeline(
                                 f"unable to build model task plan ({err_text})."
                             )
                     def _run_route_algwas_packed(
-                        trait_one: list[str], emit_trait_header_model: bool
+                        trait_one: list[str],
+                        emit_trait_header_model: bool,
+                        trait_prepared_meta: Union[dict[str, object], None] = None,
                     ) -> None:
                         run_algwas_packed_fullrank(
                             genofile=genofile_stream,
@@ -7224,6 +7359,7 @@ def _run_gwas_pipeline(
                             emit_trait_header=bool(emit_trait_header_model),
                             preloaded_packed=preloaded_packed,
                             qtn_preloaded_packed=qtn_preloaded_packed,
+                            trait_prepared_meta=trait_prepared_meta,
                         )
 
                     def _run_route_splmm_windowed(
@@ -7501,7 +7637,9 @@ def _run_gwas_pipeline(
                         )
 
                     def _run_route_farmcpu(
-                        trait_one: list[str], emit_trait_header_model: bool
+                        trait_one: list[str],
+                        emit_trait_header_model: bool,
+                        trait_prepared_meta: Union[dict[str, object], None] = None,
                     ) -> None:
                         nonlocal farmcpu_cache_runtime, farmcpu_handled_in_trait_loop
                         farmcpu_cache_runtime = run_farmcpu_fullmem(
@@ -7520,9 +7658,10 @@ def _run_gwas_pipeline(
                             saved_paths=saved_result_paths,
                             trait_names=trait_one,
                             farmcpu_cache=farmcpu_cache_runtime,
-                            emit_trait_header=False,
+                            emit_trait_header=bool(emit_trait_header_model),
                             preloaded_packed=preloaded_packed,
                             qtn_preloaded_packed=qtn_preloaded_packed,
+                            trait_prepared_meta=trait_prepared_meta,
                         )
                         farmcpu_handled_in_trait_loop = True
 
@@ -7557,10 +7696,9 @@ def _run_gwas_pipeline(
                         "farm": "farmcpu",
                     }
                     stream_group_routes = {"lm_stream", "lm2_stream", "lmm_stream", "lmm2_stream", "fastlmm_stream", "fvlmm_stream"}
-                    share_trait_meta_enabled = str(
-                        os.environ.get("JX_GWAS_TRAIT_META_SHARE", "1")
-                    ).strip().lower() not in {"0", "false", "no", "off"}
+                    meta_capable_routes = stream_group_routes | {"splmm", "algwas", "farmcpu"}
                     trait_shared_meta_cache: dict[str, dict[str, object]] = {}
+                    global_trait_meta_shared: Union[dict[str, object], None] = None
                     normalized_tasks: list[dict[str, object]] = []
                     for task_item in task_plan:
                         mk = str(task_item.get("model", "")).lower().strip()
@@ -7600,25 +7738,37 @@ def _run_gwas_pipeline(
                                 ),
                             }
                         )
-                    trait_stream_route_counts: dict[str, int] = {}
-                    for item in normalized_tasks:
-                        route_key = str(item.get("route", "")).lower().strip()
-                        model_key = str(item.get("model", "")).lower().strip()
-                        if route_key in stream_group_routes and model_key != "lm2":
-                            trait_key = str(item.get("trait", ""))
-                            trait_stream_route_counts[trait_key] = (
-                                int(trait_stream_route_counts.get(trait_key, 0)) + 1
-                            )
-                    traits_with_splmm = {
-                        str(item.get("trait", ""))
-                        for item in normalized_tasks
-                        if str(item.get("route", "")).lower().strip() == "splmm"
-                    }
-                    trait_meta_share_candidates = {
-                        trait_key
-                        for trait_key, route_count in trait_stream_route_counts.items()
-                        if int(route_count) >= 2 and trait_key in traits_with_splmm
-                    }
+                    prefix_meta = (
+                        _as_plink_prefix(genofile_stream)
+                        if (
+                            genofile_stream is not None
+                            and pheno is not None
+                            and ids is not None
+                            and str(args.model).lower() == "add"
+                        )
+                        else None
+                    )
+                    ids_arr_meta = (
+                        np.asarray(ids, dtype=str).reshape(-1)
+                        if ids is not None
+                        else None
+                    )
+                    full_ids_meta = (
+                        _plink_fam_sample_ids(str(prefix_meta))
+                        if prefix_meta is not None
+                        else None
+                    )
+                    id_to_full_meta = (
+                        {sid: i for i, sid in enumerate(full_ids_meta)}
+                        if full_ids_meta is not None
+                        else None
+                    )
+                    gwas_meta_window_mb = int(
+                        max(
+                            1,
+                            float(os.environ.get("JX_BED_BLOCK_TARGET_MB", "512")),
+                        )
+                    )
 
                     def _trait_meta_needed_later(start_idx: int, trait_name: str) -> bool:
                         for idx in range(int(start_idx), len(normalized_tasks)):
@@ -7628,9 +7778,110 @@ def _run_gwas_pipeline(
                             future_route = str(
                                 normalized_tasks[idx].get("route", "")
                             ).lower().strip()
-                            if future_route in (stream_group_routes | {"splmm"}):
+                            if future_route in meta_capable_routes:
                                 return True
                         return False
+
+                    def _build_trait_sample_indices(trait_name: str) -> Union[np.ndarray, None]:
+                        if pheno is None or ids_arr_meta is None or id_to_full_meta is None:
+                            return None
+                        _, sameidx_meta = _trait_values_and_mask(pheno, trait_name)
+                        keep_idx_meta = np.flatnonzero(sameidx_meta).astype(np.int64, copy=False)
+                        if int(keep_idx_meta.shape[0]) == 0:
+                            return None
+                        trait_ids_meta = np.asarray(ids_arr_meta[keep_idx_meta], dtype=str)
+                        try:
+                            return np.ascontiguousarray(
+                                np.asarray(
+                                    [id_to_full_meta[str(sid)] for sid in trait_ids_meta],
+                                    dtype=np.int64,
+                                ),
+                                dtype=np.int64,
+                            )
+                        except KeyError:
+                            return None
+
+                    def _trait_prepared_meta_needs_build(
+                        trait_name: str,
+                        route_name: str,
+                    ) -> tuple[bool, Union[np.ndarray, None]]:
+                        route_key = str(route_name).lower().strip()
+                        if (
+                            route_key not in meta_capable_routes
+                            or prefix_meta is None
+                            or str(args.model).lower() != "add"
+                            or gwas_row_stat_mode != "strict-train"
+                        ):
+                            return False, None
+                        cached_meta = trait_shared_meta_cache.get(trait_name)
+                        if cached_meta is not None:
+                            return False, None
+                        sample_idx_meta = _build_trait_sample_indices(trait_name)
+                        if sample_idx_meta is None:
+                            return False, None
+                        return True, sample_idx_meta
+
+                    def _resolve_trait_prepared_meta(
+                        trait_name: str,
+                        route_name: str,
+                        sample_idx_meta_prefetched: Union[np.ndarray, None] = None,
+                    ) -> Union[dict[str, object], None]:
+                        nonlocal global_trait_meta_shared
+                        route_key = str(route_name).lower().strip()
+                        if (
+                            route_key not in meta_capable_routes
+                            or prefix_meta is None
+                            or str(args.model).lower() != "add"
+                        ):
+                            return None
+                        if gwas_row_stat_mode != "strict-train":
+                            if global_trait_meta_shared is not None:
+                                return global_trait_meta_shared
+                            global_trait_meta_shared = _gwas_logic_meta_global_cached(
+                                str(prefix_meta),
+                                maf_threshold=float(maf_threshold_scan),
+                                max_missing_rate=float(max_missing_rate_scan),
+                                het_threshold=float(het_threshold_scan),
+                                snps_only=bool(args.snps_only),
+                                outprefix=str(outprefix),
+                                logger=logger,
+                                use_spinner=False,
+                            )
+                            return global_trait_meta_shared
+
+                        cached_meta = trait_shared_meta_cache.get(trait_name)
+                        if cached_meta is not None:
+                            return cached_meta
+                        sample_idx_meta = sample_idx_meta_prefetched
+                        if sample_idx_meta is None:
+                            sample_idx_meta = _build_trait_sample_indices(trait_name)
+                        if sample_idx_meta is None:
+                            return None
+                        with CliStatus(
+                            "Computing trait-subset row statistics...",
+                            enabled=bool(use_spinner),
+                            use_process=True,
+                        ) as task:
+                            try:
+                                cached_meta = _gwas_logic_meta_selected_cached(
+                                    str(prefix_meta),
+                                    sample_indices=sample_idx_meta,
+                                    maf_threshold=float(maf_threshold_scan),
+                                    max_missing_rate=float(max_missing_rate_scan),
+                                    het_threshold=float(het_threshold_scan),
+                                    snps_only=bool(args.snps_only),
+                                    mmap_window_mb=int(gwas_meta_window_mb),
+                                    outprefix=str(outprefix),
+                                    logger=logger,
+                                    threads=int(args.thread),
+                                    use_cache=False,
+                                )
+                            except Exception:
+                                task.fail("Computing trait-subset row statistics ...Failed")
+                                raise
+                            task.complete("Computing trait-subset row statistics ...Finished")
+                        trait_shared_meta_cache[trait_name] = cached_meta
+                        return cached_meta
 
                     task_idx = 0
                     while task_idx < len(normalized_tasks):
@@ -7642,69 +7893,29 @@ def _run_gwas_pipeline(
                             task_item.get("emit_trait_header", False)
                         )
                         emit_blank_after = bool(task_item.get("emit_blank_after", False))
-                        trait_meta_shared = trait_shared_meta_cache.get(trait_name_use)
-
-                        if (
-                            share_trait_meta_enabled
-                            and trait_meta_shared is None
-                            and trait_name_use in trait_meta_share_candidates
-                            and route in (stream_group_routes | {"splmm"})
-                            and str(args.model).lower() == "add"
-                            and pheno is not None
-                            and ids is not None
-                            and genofile_stream is not None
-                        ):
-                            _, sameidx_meta = _trait_values_and_mask(pheno, trait_name_use)
-                            keep_idx_meta = np.flatnonzero(sameidx_meta).astype(np.int64, copy=False)
-                            if int(keep_idx_meta.shape[0]) > 0:
-                                ids_arr_meta = np.asarray(ids, dtype=str).reshape(-1)
-                                trait_ids_meta = np.asarray(ids_arr_meta[keep_idx_meta], dtype=str)
-                                prefix_meta = _as_plink_prefix(genofile_stream)
-                                if prefix_meta is not None:
-                                    full_ids_meta = _plink_fam_sample_ids(str(prefix_meta))
-                                    id_to_full_meta = {sid: i for i, sid in enumerate(full_ids_meta)}
-                                    try:
-                                        sample_idx_meta = np.asarray(
-                                            [id_to_full_meta[str(sid)] for sid in trait_ids_meta],
-                                            dtype=np.int64,
-                                        )
-                                    except KeyError:
-                                        sample_idx_meta = None
-                                    if sample_idx_meta is not None:
-                                        try:
-                                            trait_meta_shared = _splmm_bed_logic_meta_selected_cached(
-                                                str(prefix_meta),
-                                                sample_indices=sample_idx_meta,
-                                                maf_threshold=float(maf_threshold_scan),
-                                                max_missing_rate=float(max_missing_rate_scan),
-                                                het_threshold=float(het_threshold_scan),
-                                                snps_only=bool(args.snps_only),
-                                                mmap_window_mb=int(
-                                                    max(
-                                                        1,
-                                                        float(
-                                                            os.environ.get(
-                                                                "JX_BED_BLOCK_TARGET_MB",
-                                                                "512",
-                                                            )
-                                                        ),
-                                                    )
-                                                ),
-                                                outprefix=str(outprefix),
-                                                logger=logger,
-                                            )
-                                        except Exception:
-                                            trait_meta_shared = None
-                                        if trait_meta_shared is not None:
-                                            miss_rate_meta = np.asarray(
-                                                trait_meta_shared["missing_rate"],
-                                                dtype=np.float32,
-                                            ).reshape(-1)
-                                            trait_meta_shared["missing_count"] = np.ascontiguousarray(
-                                                miss_rate_meta * float(sample_idx_meta.shape[0]),
-                                                dtype=np.float32,
-                                            )
-                                            trait_shared_meta_cache[trait_name_use] = trait_meta_shared
+                        prefetched_trait_meta_indices: Union[np.ndarray, None] = None
+                        if bool(emit_trait_header_model):
+                            meta_build_needed, prefetched_trait_meta_indices = (
+                                _trait_prepared_meta_needs_build(
+                                    trait_name_use,
+                                    route,
+                                )
+                            )
+                            if meta_build_needed:
+                                _emit_trait_header(
+                                    logger,
+                                    trait_name_use,
+                                    int(prefetched_trait_meta_indices.shape[0]),
+                                    pve=None,
+                                    use_spinner=bool(use_spinner),
+                                    width=60,
+                                )
+                                emit_trait_header_model = False
+                        trait_meta_shared = _resolve_trait_prepared_meta(
+                            trait_name_use,
+                            route,
+                            sample_idx_meta_prefetched=prefetched_trait_meta_indices,
+                        )
 
                         if route in stream_group_routes and mk != "lm2":
                             group_end = task_idx + 1
@@ -7763,7 +7974,7 @@ def _run_gwas_pipeline(
                                     logger.info("")
                                 if not _trait_meta_needed_later(
                                     group_end, trait_name_use
-                                ):
+                                ) and gwas_row_stat_mode == "strict-train":
                                     trait_shared_meta_cache.pop(trait_name_use, None)
                                 task_idx = group_end
                                 continue
@@ -7784,6 +7995,12 @@ def _run_gwas_pipeline(
                                     bool(emit_trait_header_model),
                                     trait_prepared_meta=trait_meta_shared,
                                 )
+                            elif route in {"algwas", "farmcpu"}:
+                                route_handler(
+                                    trait_one,
+                                    bool(emit_trait_header_model),
+                                    trait_prepared_meta=trait_meta_shared,
+                                )
                             else:
                                 route_handler(trait_one, bool(emit_trait_header_model))
                         else:
@@ -7795,7 +8012,7 @@ def _run_gwas_pipeline(
                             logger.info("")
                         if not _trait_meta_needed_later(
                             task_idx + 1, trait_name_use
-                        ):
+                        ) and gwas_row_stat_mode == "strict-train":
                             trait_shared_meta_cache.pop(trait_name_use, None)
                         task_idx += 1
             else:
@@ -7868,7 +8085,7 @@ def _run_gwas_pipeline(
                         }
                 except Exception:
                     farmcpu_cache_prefill = None
-            _ = run_farmcpu_fullmem(
+            farmcpu_cache_runtime = run_farmcpu_fullmem(
                 args=args,
                 gfile=farmcpu_genofile,
                 prefix=prefix,
@@ -7884,10 +8101,160 @@ def _run_gwas_pipeline(
                 saved_paths=saved_result_paths,
                 trait_names=trait_names_full,
                 farmcpu_cache=farmcpu_cache_prefill,
-                emit_trait_header=bool(emit_farmcpu_trait_header),
+                prepare_only=True,
+                emit_trait_header=False,
                 preloaded_packed=preloaded_packed,
                 qtn_preloaded_packed=qtn_preloaded_packed,
             )
+            if terminal_rich:
+                _phase_split(terminal_logger)
+            trait_names_seq = (
+                [str(t) for t in trait_names_full]
+                if trait_names_full is not None
+                else [str(t) for t in trait_order]
+            )
+            strict_trait_meta_ready = False
+            strict_prefix_meta = None
+            strict_ids_arr_meta = None
+            strict_id_to_full_meta = None
+            if (
+                gwas_row_stat_mode == "strict-train"
+                and str(args.model).lower() == "add"
+                and pheno is not None
+                and ids is not None
+            ):
+                strict_prefix_meta = _as_plink_prefix(genofile_stream)
+                if strict_prefix_meta is not None:
+                    try:
+                        strict_ids_arr_meta = np.asarray(ids, dtype=str).reshape(-1)
+                        strict_full_ids_meta = _plink_fam_sample_ids(
+                            str(strict_prefix_meta)
+                        )
+                        strict_id_to_full_meta = {
+                            sid: i for i, sid in enumerate(strict_full_ids_meta)
+                        }
+                        strict_trait_meta_ready = True
+                    except Exception:
+                        strict_trait_meta_ready = False
+                        strict_prefix_meta = None
+                        strict_ids_arr_meta = None
+                        strict_id_to_full_meta = None
+            if bool(strict_trait_meta_ready) and len(trait_names_seq) > 0:
+                gwas_meta_window_mb = int(
+                    max(
+                        1,
+                        float(os.environ.get("JX_BED_BLOCK_TARGET_MB", "512")),
+                    )
+                )
+                for trait_idx_use, trait_name_use in enumerate(trait_names_seq):
+                    trait_meta_single: Union[dict[str, object], None] = None
+                    emit_trait_header_now = bool(emit_farmcpu_trait_header)
+                    sample_idx_meta = None
+                    try:
+                        _, sameidx_meta = _trait_values_and_mask(pheno, trait_name_use)
+                        keep_idx_meta = np.flatnonzero(sameidx_meta).astype(
+                            np.int64,
+                            copy=False,
+                        )
+                        if int(keep_idx_meta.shape[0]) > 0:
+                            trait_ids_meta = np.asarray(
+                                strict_ids_arr_meta[keep_idx_meta],
+                                dtype=str,
+                            )
+                            sample_idx_meta = np.ascontiguousarray(
+                                np.asarray(
+                                    [
+                                        strict_id_to_full_meta[str(sid)]
+                                        for sid in trait_ids_meta
+                                    ],
+                                    dtype=np.int64,
+                                ),
+                                dtype=np.int64,
+                            )
+                    except Exception:
+                        sample_idx_meta = None
+                    if sample_idx_meta is not None and int(sample_idx_meta.shape[0]) > 0:
+                        if emit_trait_header_now:
+                            _emit_trait_header(
+                                logger,
+                                trait_name_use,
+                                int(sample_idx_meta.shape[0]),
+                                pve=None,
+                                use_spinner=bool(use_spinner),
+                                width=60,
+                            )
+                            emit_trait_header_now = False
+                        with CliStatus(
+                            "Computing trait-subset row statistics...",
+                            enabled=bool(use_spinner),
+                            use_process=True,
+                        ) as task:
+                            try:
+                                trait_meta_single = _gwas_logic_meta_selected_cached(
+                                    str(strict_prefix_meta),
+                                    sample_indices=sample_idx_meta,
+                                    maf_threshold=float(maf_threshold_scan),
+                                    max_missing_rate=float(max_missing_rate_scan),
+                                    het_threshold=float(het_threshold_scan),
+                                    snps_only=bool(args.snps_only),
+                                    mmap_window_mb=int(gwas_meta_window_mb),
+                                    outprefix=str(outprefix),
+                                    logger=logger,
+                                    threads=int(args.thread),
+                                    use_cache=False,
+                                )
+                            except Exception:
+                                task.fail(
+                                    "Computing trait-subset row statistics ...Failed"
+                                )
+                                raise
+                            task.complete(
+                                "Computing trait-subset row statistics ...Finished"
+                            )
+                    farmcpu_cache_runtime = run_farmcpu_fullmem(
+                        args=args,
+                        gfile=farmcpu_genofile,
+                        prefix=prefix,
+                        logger=logger,
+                        pheno_preloaded=pheno,
+                        ids_preloaded=ids,
+                        n_snps_preloaded=n_snps,
+                        qmatrix_preloaded=qmatrix,
+                        cov_preloaded=cov_all,
+                        use_spinner=use_spinner,
+                        context_prepared=context_prepared,
+                        summary_rows=gwas_summary_rows,
+                        saved_paths=saved_result_paths,
+                        trait_names=[str(trait_name_use)],
+                        farmcpu_cache=farmcpu_cache_runtime,
+                        emit_trait_header=bool(emit_trait_header_now),
+                        preloaded_packed=preloaded_packed,
+                        qtn_preloaded_packed=qtn_preloaded_packed,
+                        trait_prepared_meta=trait_meta_single,
+                    )
+                    if trait_idx_use < (len(trait_names_seq) - 1):
+                        logger.info("")
+            else:
+                _ = run_farmcpu_fullmem(
+                    args=args,
+                    gfile=farmcpu_genofile,
+                    prefix=prefix,
+                    logger=logger,
+                    pheno_preloaded=pheno,
+                    ids_preloaded=ids,
+                    n_snps_preloaded=n_snps,
+                    qmatrix_preloaded=qmatrix,
+                    cov_preloaded=cov_all,
+                    use_spinner=use_spinner,
+                    context_prepared=context_prepared,
+                    summary_rows=gwas_summary_rows,
+                    saved_paths=saved_result_paths,
+                    trait_names=trait_names_full,
+                    farmcpu_cache=farmcpu_cache_runtime,
+                    emit_trait_header=bool(emit_farmcpu_trait_header),
+                    preloaded_packed=preloaded_packed,
+                    qtn_preloaded_packed=qtn_preloaded_packed,
+                )
 
         if len(gwas_summary_rows) > 0:
             for row in gwas_summary_rows:

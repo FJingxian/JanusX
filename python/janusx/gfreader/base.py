@@ -13,30 +13,11 @@ import os
 import sys
 from time import monotonic
 from janusx.script._common.progress import (
-    get_rich_spinner_name,
+    build_rich_progress,
     print_success,
     print_failure,
     format_elapsed,
 )
-
-try:
-    from rich.progress import (
-        Progress,
-        SpinnerColumn,
-        BarColumn,
-        TextColumn,
-        TimeElapsedColumn,
-        TimeRemainingColumn,
-    )
-    _HAS_RICH_PROGRESS = True
-except Exception:
-    Progress = None  # type: ignore[assignment]
-    SpinnerColumn = None  # type: ignore[assignment]
-    BarColumn = None  # type: ignore[assignment]
-    TextColumn = None  # type: ignore[assignment]
-    TimeElapsedColumn = None  # type: ignore[assignment]
-    TimeRemainingColumn = None  # type: ignore[assignment]
-    _HAS_RICH_PROGRESS = False
 
 process = psutil.Process()
 def get_process_info():
@@ -65,21 +46,20 @@ class _LoadProgressAdapter:
         if (not self.enabled):
             return
 
-        if _HAS_RICH_PROGRESS and getattr(sys.stdout, "isatty", lambda: False)():
+        if getattr(sys.stdout, "isatty", lambda: False)():
             try:
-                self._progress = Progress(
-                    SpinnerColumn(
-                        spinner_name=get_rich_spinner_name(),
-                        style="cyan",
-                        finished_text="[green]✔︎[/green]",
-                    ),
-                    TextColumn("[green]{task.description}"),
-                    BarColumn(),
-                    TextColumn("{task.percentage:>6.1f}%"),
-                    TimeElapsedColumn(),
-                    TimeRemainingColumn(),
+                self._progress = build_rich_progress(
+                    description_template="[green]{task.description}",
+                    show_spinner=True,
+                    show_bar=True,
+                    show_percentage=True,
+                    show_elapsed=True,
+                    show_remaining=True,
+                    finished_text="[green]✔︎[/green]",
                     transient=True,
                 )
+                if self._progress is None:
+                    raise RuntimeError("rich progress unavailable")
                 self._progress.start()
                 self._task_id = self._progress.add_task(self.desc, total=self.total)
                 self._backend = "rich"

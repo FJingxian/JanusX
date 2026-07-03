@@ -1086,7 +1086,7 @@ def smoke_flow(outdir: Path, logdir: Path, threads: int, cv_folds: int) -> None:
     remove_if_exists(Path(f"{vcf_cache_base}{suffix}") for suffix in [".snp0.bed", ".snp0.bim", ".snp0.fam", ".snp1.bed", ".snp1.bim", ".snp1.fam"])
     sep()
 
-    step("SMOKE 2. GWAS runtime check (LM/LMM/FastLMM/FarmCPU)")
+    step("SMOKE 2. GWAS runtime check (LM/LMM/FVLMM/FarmCPU)")
     run(["jx", "grm", "-bfile", str(outdir / "mouse_hs1940"), "-o", str(outdir)])
     run_pca_with_backend_report(
         ["jx", "pca", "-bfile", str(outdir / "mouse_hs1940"), "-o", str(outdir)],
@@ -1104,10 +1104,9 @@ def smoke_flow(outdir: Path, logdir: Path, threads: int, cv_folds: int) -> None:
             "example/mouse_hs1940.pheno",
             "-farmcpu",
             "-lmm",
+            "-lmm2",
             "-lm",
-            "-fastlmm",
             "-fvlmm",
-            "-algwas",
             "-splmm",
             "-k",
             str(grm_k),
@@ -1177,10 +1176,9 @@ def full_flow(outdir: Path, logdir: Path, postgs_enabled: bool) -> None:
             "example/mouse_hs1940.pheno",
             "-farmcpu",
             "-lmm",
+            "-lmm2",
             "-lm",
-            "-fastlmm",
             "-fvlmm",
-            "-algwas",
             "-splmm",
             "-k",
             str(grm_k),

@@ -33,7 +33,6 @@ from contextlib import contextmanager
 from typing import Union
 
 import numpy as np
-import psutil
 from janusx.gfreader import (
     inspect_genotype_file,
     prepare_cli_input_cache,
@@ -272,10 +271,6 @@ def _format_memory_budget_gb(memory_gb: Union[int, float, None]) -> str:
     if memory_gb is None:
         return "default"
     return f"{float(memory_gb):.2f}"
-
-
-def _format_memory_budget_mb(memory_mb: Union[int, float]) -> str:
-    return f"{float(memory_mb):.2f}"
 
 
 def _emit_grm_configuration(
@@ -639,8 +634,6 @@ def build_grm_streaming(
         force_animate=True,
     )
     stream_t0 = time.monotonic()
-    process = psutil.Process()
-    mem_tick_span = max(1, 10 * int(block_rows))
     last_done = 0
 
     def _progress_cb(done: int, _total: int) -> None:
@@ -649,10 +642,6 @@ def build_grm_streaming(
         if d > last_done:
             pbar.update(d - last_done)
             last_done = d
-        if d % mem_tick_span == 0:
-            mem = process.memory_info().rss / 1024**3
-            pbar.set_postfix(memory=f"{mem:.2f} GB")
-
     prev_stage_timing = os.environ.get("JX_GRM_STREAM_STAGE_TIMING")
     stage_timing_set = False
     if bool(stage_timing):
@@ -735,8 +724,6 @@ def build_grm_streaming_to_npy(
         force_animate=True,
     )
     stream_t0 = time.monotonic()
-    process = psutil.Process()
-    mem_tick_span = max(1, 10 * int(block_rows))
     last_done = 0
 
     def _progress_cb(done: int, _total: int) -> None:
@@ -745,10 +732,6 @@ def build_grm_streaming_to_npy(
         if d > last_done:
             pbar.update(d - last_done)
             last_done = d
-        if d % mem_tick_span == 0:
-            mem = process.memory_info().rss / 1024**3
-            pbar.set_postfix(memory=f"{mem:.2f} GB")
-
     prev_stage_timing = os.environ.get("JX_GRM_STREAM_STAGE_TIMING")
     stage_timing_set = False
     if bool(stage_timing):
@@ -843,8 +826,6 @@ def build_grm_streaming_from_meta(
         force_animate=True,
     )
     stream_t0 = time.monotonic()
-    process = psutil.Process()
-    mem_tick_span = max(1, 10 * int(max(1, block_rows)))
     last_done = 0
     last_total = max(1, eff_m_hint)
 
@@ -859,10 +840,6 @@ def build_grm_streaming_from_meta(
         if d > last_done:
             pbar.update(d - last_done)
             last_done = d
-        if d % mem_tick_span == 0:
-            mem = process.memory_info().rss / 1024**3
-            pbar.set_postfix(memory=f"{mem:.2f} GB")
-
     try:
         grm_raw = _grm_bed_f64_from_meta(
             str(source_prefix),
@@ -939,8 +916,6 @@ def build_grm_streaming_from_meta_to_npy(
         force_animate=True,
     )
     stream_t0 = time.monotonic()
-    process = psutil.Process()
-    mem_tick_span = max(1, 10 * int(max(1, block_rows)))
     last_done = 0
     last_total = max(1, eff_m_hint)
 
@@ -955,10 +930,6 @@ def build_grm_streaming_from_meta_to_npy(
         if d > last_done:
             pbar.update(d - last_done)
             last_done = d
-        if d % mem_tick_span == 0:
-            mem = process.memory_info().rss / 1024**3
-            pbar.set_postfix(memory=f"{mem:.2f} GB")
-
     try:
         eff_m_raw, meta_n = _gblup_grm_from_meta_to_npy(
             str(source_prefix),
@@ -1020,8 +991,6 @@ def build_grm_packed_bed(
         force_animate=True,
     )
     stream_t0 = time.monotonic()
-    process = psutil.Process()
-    mem_tick_span = max(1, 10 * int(block_rows))
     last_done = 0
 
     def _progress_cb(done: int, _total: int) -> None:
@@ -1030,10 +999,6 @@ def build_grm_packed_bed(
         if d > last_done:
             pbar.update(d - last_done)
             last_done = d
-        if d % mem_tick_span == 0:
-            mem = process.memory_info().rss / 1024**3
-            pbar.set_postfix(memory=f"{mem:.2f} GB")
-
     prev_stage_timing = os.environ.get("JX_GRM_PACKED_STAGE_TIMING")
     stage_timing_set = False
     if bool(stage_timing):
@@ -1134,7 +1099,6 @@ def build_sparse_grm_packed_bed(
         force_animate=True,
     )
     build_t0 = time.monotonic()
-    process = psutil.Process()
     last_done = 0
     last_total = 1
 
@@ -1149,9 +1113,6 @@ def build_sparse_grm_packed_bed(
         if d > last_done:
             pbar.update(d - last_done)
             last_done = d
-        mem = process.memory_info().rss / 1024**3
-        pbar.set_postfix(memory=f"{mem:.2f} GB")
-
     try:
         with _bed_block_target_env(block_target_mb):
             with _spgrm_memory_budget_env(block_target_mb):
@@ -1263,7 +1224,6 @@ def build_sparse_grm_from_meta(
         force_animate=True,
     )
     build_t0 = time.monotonic()
-    process = psutil.Process()
     last_done = 0
     last_total = max(1, int(row_source_indices.shape[0]))
 
@@ -1278,9 +1238,6 @@ def build_sparse_grm_from_meta(
         if d > last_done:
             pbar.update(d - last_done)
             last_done = d
-        mem = process.memory_info().rss / 1024**3
-        pbar.set_postfix(memory=f"{mem:.2f} GB")
-
     try:
         with _bed_block_target_env(block_target_mb):
             with _spgrm_memory_budget_env(block_target_mb):
@@ -1343,7 +1300,6 @@ def build_sparse_grm_dense_npy(
         force_animate=True,
     )
     build_t0 = time.monotonic()
-    process = psutil.Process()
     last_done = 0
     last_total = 1
 
@@ -1358,9 +1314,6 @@ def build_sparse_grm_dense_npy(
         if d > last_done:
             pbar.update(d - last_done)
             last_done = d
-        mem = process.memory_info().rss / 1024**3
-        pbar.set_postfix(memory=f"{mem:.2f} GB")
-
     try:
         sparse_path, sparse_n, sparse_nnz = _spgrm_dense_npy_to_jxgrm(
             str(dense_grm_path),
@@ -1924,10 +1877,6 @@ def main(log: bool = True):
                 dense_saved_direct = False
 
         if (grm is None) and (grm_path is None) and selected_backend == "memmap-bed":
-            logger.info(
-                f"GRM memory target: {float(args.memory):.2f} GB "
-                f"({_format_memory_budget_mb(memory_mb)} MB effective)."
-            )
             if bool(args.stage_timing):
                 logger.info("Memmap GRM stage timing is enabled (decode/GEMM/other).")
             try:

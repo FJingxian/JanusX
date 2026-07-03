@@ -42,7 +42,9 @@ use crate::gload::WindowedBedMatrix;
 use crate::linalg::{
     chi2_sf_df1, cholesky_inplace, cholesky_logdet, cholesky_solve_into, normal_sf,
 };
-use crate::stats_common::{env_truthy, get_cached_pool, parse_index_vec_i64, AsyncTsvWriter};
+use crate::stats_common::{
+    env_truthy, get_cached_pool, parse_index_vec_i64, parse_index_vec_i64_result, AsyncTsvWriter,
+};
 use memmap2::Mmap;
 use std::fs::File;
 
@@ -2224,6 +2226,10 @@ pub fn fvlmm_assoc_chunk_from_snp_to_tsv_f32<'py>(
     genetic_model = "add",
     snps_only = false,
     sample_ids = None,
+    row_indices = None,
+    row_flip = None,
+    row_missing = None,
+    row_maf = None,
     threads = 0,
     nullml = None,
     rotate_block_rows = 512,
@@ -2246,6 +2252,10 @@ pub fn fvlmm_assoc_bed_to_tsv_f32<'py>(
     genetic_model: &str,
     snps_only: bool,
     sample_ids: Option<Vec<String>>,
+    row_indices: Option<PyReadonlyArray1<'py, i64>>,
+    row_flip: Option<PyReadonlyArray1<'py, bool>>,
+    row_missing: Option<PyReadonlyArray1<'py, f32>>,
+    row_maf: Option<PyReadonlyArray1<'py, f32>>,
     threads: usize,
     nullml: Option<f64>,
     rotate_block_rows: usize,
@@ -2288,6 +2298,63 @@ pub fn fvlmm_assoc_bed_to_tsv_f32<'py>(
     let ut_flat: Cow<[f32]> = match u_t.as_slice() {
         Ok(slc) => Cow::Borrowed(slc),
         Err(_) => Cow::Owned(ut_arr.iter().copied().collect()),
+    };
+    let prepared_row_indices = match row_indices {
+        Some(arr) => Some(
+            arr.as_slice()
+                .map_err(|_| PyRuntimeError::new_err("row_indices must be contiguous int64"))?
+                .to_vec(),
+        ),
+        None => None,
+    };
+    let prepared_row_flip = match row_flip {
+        Some(arr) => Some(
+            arr.as_slice()
+                .map_err(|_| PyRuntimeError::new_err("row_flip must be contiguous bool"))?
+                .to_vec(),
+        ),
+        None => None,
+    };
+    let prepared_row_missing = match row_missing {
+        Some(arr) => Some(
+            arr.as_slice()
+                .map_err(|_| PyRuntimeError::new_err("row_missing must be contiguous float32"))?
+                .to_vec(),
+        ),
+        None => None,
+    };
+    let prepared_row_maf = match row_maf {
+        Some(arr) => Some(
+            arr.as_slice()
+                .map_err(|_| PyRuntimeError::new_err("row_maf must be contiguous float32"))?
+                .to_vec(),
+        ),
+        None => None,
+    };
+    let prepared_meta_input = match (
+        prepared_row_indices,
+        prepared_row_flip,
+        prepared_row_missing,
+        prepared_row_maf,
+    ) {
+        (None, None, None, None) => None,
+        (Some(row_idx), Some(row_flip_vec), Some(row_missing_vec), Some(row_maf_vec)) => {
+            let m = row_idx.len();
+            if row_flip_vec.len() != m || row_missing_vec.len() != m || row_maf_vec.len() != m {
+                return Err(PyRuntimeError::new_err(format!(
+                    "prepared row metadata length mismatch: row_indices={m}, row_flip={}, row_missing={}, row_maf={}",
+                    row_flip_vec.len(),
+                    row_missing_vec.len(),
+                    row_maf_vec.len(),
+                )));
+            }
+            Some((row_idx, row_flip_vec, row_missing_vec, row_maf_vec))
+        }
+        _ => {
+            return Err(PyRuntimeError::new_err(
+                "prepared row metadata must provide all or none of: row_indices, row_flip, row_missing, row_maf",
+            ))
+        }
     };
 
     let bed_prefix_owned = bed_prefix.to_string();
@@ -2367,6 +2434,49 @@ pub fn fvlmm_assoc_bed_to_tsv_f32<'py>(
                 (mmap.len() - 3) / bytes_per_snp
             };
             let mut bim_reader = BimChunkReader::open(&bed_prefix_owned)?;
+            let prepared_meta: Option<(Vec<usize>, Vec<bool>, Vec<f32>, Vec<usize>)> =
+                match prepared_meta_input.as_ref() {
+                    None => None,
+                    Some((row_idx64, row_flip_vec, row_missing_vec, row_maf_vec)) => {
+                        let source_rows = parse_index_vec_i64_result(
+                            row_idx64.as_slice(),
+                            n_snps,
+                            "row_indices",
+                        )?;
+                        let mut prev_src: Option<usize> = None;
+                        for &src_row in source_rows.iter() {
+                            if let Some(prev) = prev_src {
+                                if src_row < prev {
+                                    return Err(
+                                        "prepared row_indices must be sorted in ascending BED order"
+                                            .to_string(),
+                                    );
+                                }
+                            }
+                            prev_src = Some(src_row);
+                        }
+                        let miss_counts: Vec<usize> = row_missing_vec
+                            .iter()
+                            .map(|&v| {
+                                if !v.is_finite() || v < 0.0_f32 {
+                                    0usize
+                                } else {
+                                    v.round() as usize
+                                }
+                            })
+                            .collect();
+                        Some((
+                            source_rows,
+                            row_flip_vec.clone(),
+                            row_maf_vec.clone(),
+                            miss_counts,
+                        ))
+                    }
+                };
+            let total_scan_units = prepared_meta
+                .as_ref()
+                .map(|(source_rows, _, _, _)| source_rows.len())
+                .unwrap_or(n_snps);
 
             let decode_plan = AdditiveDecodePlan::from_sample_indices(n_samples_full, &sample_idx);
             let sample_identity = decode_plan.sample_identity();
@@ -2407,7 +2517,7 @@ pub fn fvlmm_assoc_bed_to_tsv_f32<'py>(
             // Double-buffer pipeline: count+decode (bg) || rotate+assoc+write (main)
             // Uses generic pipeline from src/io/pipeline.rs.
             // ============================================================
-            let scan_chunk_snps = rotate_block_rows.max(1).min(n_snps.max(1));
+            let scan_chunk_snps = rotate_block_rows.max(1).min(total_scan_units.max(1));
 
             let mut text_buf = String::with_capacity(scan_chunk_snps * 128);
             let mut total_rows = 0usize;
@@ -2420,144 +2530,227 @@ pub fn fvlmm_assoc_bed_to_tsv_f32<'py>(
                 progress_every.max(1)
             };
             let mut next_progress_emit = if progress_block > 0 {
-                progress_block.min(n_snps).max(1)
+                progress_block.min(total_scan_units).max(1)
             } else {
                 0
             };
+            let mut rel_row_indices: Vec<usize> = Vec::with_capacity(scan_chunk_snps);
 
             // --- Producer: count (rayon) + filter + metadata + decode ---
             let mut chunk_start = 0usize;
             let producer_err = Arc::new(OnceLock::<String>::new());
             let producer_err_bg = Arc::clone(&producer_err);
             let producer = |chunk: &mut StreamingChunk| -> bool {
-                if chunk_start >= n_snps {
+                if chunk_start >= total_scan_units {
                     return false;
                 }
                 chunk.clear();
-                let chunk_end = (chunk_start + scan_chunk_snps).min(n_snps);
-                let chunk_packed = match bed_window.as_mut() {
-                    Some(window) => match window.read_source_range(chunk_start, chunk_end) {
-                        Ok(slice) => slice,
+                let chunk_end = (chunk_start + scan_chunk_snps).min(total_scan_units);
+                let prepared_batch = prepared_meta
+                    .as_ref()
+                    .map(|(source_rows, row_flip_all, row_maf_all, miss_count_all)| {
+                        (
+                            &source_rows[chunk_start..chunk_end],
+                            &row_flip_all[chunk_start..chunk_end],
+                            &row_maf_all[chunk_start..chunk_end],
+                            &miss_count_all[chunk_start..chunk_end],
+                        )
+                    });
+                let prepared_src_start = prepared_batch
+                    .as_ref()
+                    .and_then(|(source_rows, _, _, _)| source_rows.first().copied());
+                let prepared_uses_window = prepared_batch.is_some() && bed_window.is_some();
+                let chunk_packed = if let Some((source_rows, _, _, _)) = prepared_batch.as_ref() {
+                    if source_rows.is_empty() {
+                        chunk.scanned_to = chunk_end;
+                        chunk_start = chunk_end;
+                        return chunk_start < total_scan_units;
+                    }
+                    match bed_window.as_mut() {
+                        Some(window) => match window.prepare_source_rows(source_rows, &mut rel_row_indices) {
+                            Ok(slice) => slice,
+                            Err(e) => {
+                                let _ = producer_err_bg.set(e);
+                                return false;
+                            }
+                        },
+                        None => {
+                            let mmap = match full_mmap.as_ref() {
+                                Some(mmap) => mmap,
+                                None => {
+                                    let _ = producer_err_bg
+                                        .set("internal error: missing full BED mmap".to_string());
+                                    return false;
+                                }
+                            };
+                            let packed = &mmap[3..];
+                            let src_start = source_rows[0];
+                            let src_end = source_rows[source_rows.len() - 1] + 1;
+                            let start_byte = src_start * bytes_per_snp;
+                            let end_byte = src_end * bytes_per_snp;
+                            &packed[start_byte..end_byte]
+                        }
+                    }
+                } else {
+                    match bed_window.as_mut() {
+                        Some(window) => match window.read_source_range(chunk_start, chunk_end) {
+                            Ok(slice) => slice,
+                            Err(e) => {
+                                let _ = producer_err_bg.set(e);
+                                return false;
+                            }
+                        },
+                        None => {
+                            let mmap = match full_mmap.as_ref() {
+                                Some(mmap) => mmap,
+                                None => {
+                                    let _ = producer_err_bg
+                                        .set("internal error: missing full BED mmap".to_string());
+                                    return false;
+                                }
+                            };
+                            let packed = &mmap[3..];
+                            let start_byte = chunk_start * bytes_per_snp;
+                            let end_byte = chunk_end * bytes_per_snp;
+                            &packed[start_byte..end_byte]
+                        }
+                    }
+                };
+                let chunk_sites = if let Some((source_rows, _, _, _)) = prepared_batch.as_ref() {
+                    match bim_reader.read_selected_rows(source_rows) {
+                        Ok(sites) => sites,
                         Err(e) => {
                             let _ = producer_err_bg.set(e);
                             return false;
                         }
-                    },
-                    None => {
-                        let mmap = match full_mmap.as_ref() {
-                            Some(mmap) => mmap,
-                            None => {
-                                let _ = producer_err_bg
-                                    .set("internal error: missing full BED mmap".to_string());
-                                return false;
-                            }
-                        };
-                        let packed = &mmap[3..];
-                        let start_byte = chunk_start * bytes_per_snp;
-                        let end_byte = chunk_end * bytes_per_snp;
-                        &packed[start_byte..end_byte]
                     }
-                };
-                let chunk_sites = match bim_reader.read_range(chunk_start, chunk_end) {
-                    Ok(sites) => sites,
-                    Err(e) => {
-                        let _ = producer_err_bg.set(e);
-                        return false;
-                    }
-                };
-
-                // ---- rayon parallel: per-SNP counting + numeric filter ----
-                let counts: Vec<Option<SnpCounts>> = (chunk_start..chunk_end)
-                    .into_par_iter()
-                    .map(|snp_idx| {
-                        let local_idx = snp_idx - chunk_start;
-                        let row = &chunk_packed
-                            [local_idx * bytes_per_snp..(local_idx + 1) * bytes_per_snp];
-                        let (missing, het, hom_alt) = if use_selected {
-                            count_packed_row_counts_selected_with_excluded(
-                                row,
-                                n_samples_full,
-                                &sample_idx,
-                                selected_excluded_sample_indices,
-                            )
-                        } else {
-                            count_packed_row_counts(row, n_samples_full)
-                        };
-                        let non_missing = n.saturating_sub(missing);
-
-                        let miss_rate = if n > 0 {
-                            missing as f32 / n as f32
-                        } else {
-                            1.0_f32
-                        };
-                        if miss_rate > miss_thr {
-                            return None;
+                } else {
+                    match bim_reader.read_range(chunk_start, chunk_end) {
+                        Ok(sites) => sites,
+                        Err(e) => {
+                            let _ = producer_err_bg.set(e);
+                            return false;
                         }
+                    }
+                };
 
-                        if non_missing == 0 {
-                            return if maf_thr > 0.0 {
-                                None
+                if let Some((source_rows, row_flip_batch, row_maf_batch, miss_count_batch)) =
+                    prepared_batch.as_ref()
+                {
+                    let src_start = prepared_src_start.unwrap_or(0usize);
+                    for (offset, site) in chunk_sites.into_iter().enumerate() {
+                        let snp_name = resolve_snp_name(&site.snp, &site.chrom, site.pos);
+                        let local_src = if prepared_uses_window {
+                            rel_row_indices[offset]
+                        } else {
+                            source_rows[offset].saturating_sub(src_start)
+                        };
+                        chunk.indices.push(local_src);
+                        chunk.flip.push(row_flip_batch[offset]);
+                        chunk.maf.push(row_maf_batch[offset]);
+                        chunk.miss_rate.push(0.0_f32);
+                        chunk.miss_block[chunk.rows] = miss_count_batch[offset];
+                        chunk.chrom.push(site.chrom);
+                        chunk.pos.push(site.pos as i64);
+                        chunk.snp.push(snp_name);
+                        chunk.a0.push(site.ref_allele);
+                        chunk.a1.push(site.alt_allele);
+                        chunk.rows += 1;
+                    }
+                } else {
+                    // ---- rayon parallel: per-SNP counting + numeric filter ----
+                    let counts: Vec<Option<SnpCounts>> = (chunk_start..chunk_end)
+                        .into_par_iter()
+                        .map(|snp_idx| {
+                            let local_idx = snp_idx - chunk_start;
+                            let row = &chunk_packed
+                                [local_idx * bytes_per_snp..(local_idx + 1) * bytes_per_snp];
+                            let (missing, het, hom_alt) = if use_selected {
+                                count_packed_row_counts_selected_with_excluded(
+                                    row,
+                                    n_samples_full,
+                                    &sample_idx,
+                                    selected_excluded_sample_indices,
+                                )
                             } else {
-                                Some(SnpCounts {
-                                    flip: false,
-                                    maf: 0.0_f32,
-                                    miss_rate,
-                                    missing_count: missing,
-                                })
+                                count_packed_row_counts(row, n_samples_full)
                             };
-                        }
+                            let non_missing = n.saturating_sub(missing);
 
-                        if het_thr > 0.0 {
-                            let het_rate = het as f32 / non_missing as f32;
-                            if het_rate > het_thr {
+                            let miss_rate = if n > 0 {
+                                missing as f32 / n as f32
+                            } else {
+                                1.0_f32
+                            };
+                            if miss_rate > miss_thr {
                                 return None;
                             }
-                        }
 
-                        let alt_sum = het.saturating_add(hom_alt.saturating_mul(2));
-                        let alt_freq = alt_sum as f32 / (2.0_f32 * non_missing as f32);
-                        let maf_v = alt_freq.min(1.0_f32 - alt_freq);
+                            if non_missing == 0 {
+                                return if maf_thr > 0.0 {
+                                    None
+                                } else {
+                                    Some(SnpCounts {
+                                        flip: false,
+                                        maf: 0.0_f32,
+                                        miss_rate,
+                                        missing_count: missing,
+                                    })
+                                };
+                            }
 
-                        if maf_v < maf_thr {
-                            return None;
-                        }
+                            if het_thr > 0.0 {
+                                let het_rate = het as f32 / non_missing as f32;
+                                if het_rate > het_thr {
+                                    return None;
+                                }
+                            }
 
-                        Some(SnpCounts {
-                            flip: false,
-                            maf: alt_freq,
-                            miss_rate,
-                            missing_count: missing,
+                            let alt_sum = het.saturating_add(hom_alt.saturating_mul(2));
+                            let alt_freq = alt_sum as f32 / (2.0_f32 * non_missing as f32);
+                            let maf_v = alt_freq.min(1.0_f32 - alt_freq);
+
+                            if maf_v < maf_thr {
+                                return None;
+                            }
+
+                            Some(SnpCounts {
+                                flip: false,
+                                maf: alt_freq,
+                                miss_rate,
+                                missing_count: missing,
+                            })
                         })
-                    })
-                    .collect();
+                        .collect();
 
-                // ---- Sequential: snps_only filter + metadata collection ----
-                for (offset, (cnts_opt, site)) in
-                    counts.into_iter().zip(chunk_sites.into_iter()).enumerate()
-                {
-                    let cnts = match cnts_opt {
-                        Some(c) => c,
-                        None => continue,
-                    };
-                    if snps_only {
-                        if !is_simple_snp_allele(&site.ref_allele)
-                            || !is_simple_snp_allele(&site.alt_allele)
-                        {
-                            continue;
+                    // ---- Sequential: snps_only filter + metadata collection ----
+                    for (offset, (cnts_opt, site)) in
+                        counts.into_iter().zip(chunk_sites.into_iter()).enumerate()
+                    {
+                        let cnts = match cnts_opt {
+                            Some(c) => c,
+                            None => continue,
+                        };
+                        if snps_only {
+                            if !is_simple_snp_allele(&site.ref_allele)
+                                || !is_simple_snp_allele(&site.alt_allele)
+                            {
+                                continue;
+                            }
                         }
+                        let snp_name = resolve_snp_name(&site.snp, &site.chrom, site.pos);
+                        chunk.indices.push(offset);
+                        chunk.flip.push(cnts.flip);
+                        chunk.maf.push(cnts.maf);
+                        chunk.miss_rate.push(cnts.miss_rate);
+                        chunk.miss_block[chunk.rows] = cnts.missing_count;
+                        chunk.chrom.push(site.chrom);
+                        chunk.pos.push(site.pos as i64);
+                        chunk.snp.push(snp_name);
+                        chunk.a0.push(site.ref_allele);
+                        chunk.a1.push(site.alt_allele);
+                        chunk.rows += 1;
                     }
-                    let snp_name = resolve_snp_name(&site.snp, &site.chrom, site.pos);
-                    chunk.indices.push(offset);
-                    chunk.flip.push(cnts.flip);
-                    chunk.maf.push(cnts.maf);
-                    chunk.miss_rate.push(cnts.miss_rate);
-                    chunk.miss_block[chunk.rows] = cnts.missing_count;
-                    chunk.chrom.push(site.chrom);
-                    chunk.pos.push(site.pos as i64);
-                    chunk.snp.push(snp_name);
-                    chunk.a0.push(site.ref_allele);
-                    chunk.a1.push(site.alt_allele);
-                    chunk.rows += 1;
                 }
 
                 // ---- Decode ----
@@ -2581,7 +2774,7 @@ pub fn fvlmm_assoc_bed_to_tsv_f32<'py>(
 
                 chunk.scanned_to = chunk_end;
                 chunk_start = chunk_end;
-                chunk_start < n_snps
+                chunk_start < total_scan_units
             };
 
             // --- Consumer: Rotate + assoc + format TSV + write ---
@@ -2658,13 +2851,19 @@ pub fn fvlmm_assoc_bed_to_tsv_f32<'py>(
                     if let Some(ref cb) = progress_callback {
                         let _ = Python::attach(|py2| -> PyResult<()> {
                             py2.check_signals()?;
-                            cb.call1(py2, (chunk.scanned_to.min(n_snps), n_snps))?;
+                            cb.call1(
+                                py2,
+                                (
+                                    chunk.scanned_to.min(total_scan_units),
+                                    total_scan_units,
+                                ),
+                            )?;
                             Ok(())
                         });
                     }
                     next_progress_emit = (chunk.scanned_to / progress_block + 1)
                         .saturating_mul(progress_block)
-                        .min(n_snps);
+                        .min(total_scan_units);
                 }
 
                 Ok::<(), String>(())
@@ -2679,12 +2878,14 @@ pub fn fvlmm_assoc_bed_to_tsv_f32<'py>(
             if let Some(err) = producer_err.get() {
                 return Err(err.clone());
             }
-            bim_reader.ensure_exhausted(n_snps)?;
+            if prepared_meta.is_none() {
+                bim_reader.ensure_exhausted(n_snps)?;
+            }
 
             if let Some(ref cb) = progress_callback {
                 let _ = Python::attach(|py2| -> PyResult<()> {
                     py2.check_signals()?;
-                    cb.call1(py2, (n_snps, n_snps))?;
+                    cb.call1(py2, (total_scan_units, total_scan_units))?;
                     Ok(())
                 });
             }

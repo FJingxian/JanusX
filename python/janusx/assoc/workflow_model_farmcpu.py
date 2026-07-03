@@ -12,6 +12,8 @@ import numpy as np
 import pandas as pd
 import psutil
 from janusx.script._common.genoio import (
+    determine_genotype_source_force_kind_from_args,
+    inspect_genotype_file,
     packed_preload_is_disabled,
     packed_preload_is_ready,
     prepare_packed_ctx_from_plink,
@@ -637,6 +639,7 @@ def run_farmcpu_fullmem(
     preloaded_packed: Union[dict[str, object], None] = None,
     qtn_preloaded_packed: Union[dict[str, object], None] = None,
     emit_file_dense_warning: bool = True,
+    trait_prepared_meta: Union[dict[str, object], None] = None,
 ) -> dict[str, object]:
     """
     Run FarmCPU via the Rust packed-BED controller (packed genotype + QK + PCA).
@@ -805,11 +808,155 @@ def run_farmcpu_fullmem(
         )
         return ref_alt_df, keep
 
+    def _load_farmcpu_packed_ctx(
+        packed_prefix: str,
+        expected_n_samples: int,
+        *,
+        status_label: str,
+        trait_prepared_meta: Union[dict[str, object], None] = None,
+        emit_status: bool = True,
+    ) -> tuple[dict[str, object], object]:
+        if isinstance(trait_prepared_meta, dict):
+            from janusx.assoc.workflow_model_packed import _prepare_packed_bed_once_for_gwas
+
+            _prefix_loaded, _full_ids_loaded, packed_ctx_prepared, _sites_meta = _prepare_packed_bed_once_for_gwas(
+                genofile=str(packed_prefix),
+                maf_threshold=float(args.maf),
+                max_missing_rate=float(args.geno),
+                het_threshold=float(args.het),
+                snps_only=bool(snps_only),
+                use_spinner=bool(use_spinner),
+                preloaded_packed=None,
+                load_site_meta=False,
+                status_label=str(status_label),
+                trait_prepared_meta=trait_prepared_meta,
+                emit_status=bool(emit_status),
+            )
+            row_idx_prepared = np.ascontiguousarray(
+                np.asarray(
+                    packed_ctx_prepared.get(
+                        "row_indices",
+                        packed_ctx_prepared.get("active_row_idx", []),
+                    ),
+                    dtype=np.int64,
+                ).reshape(-1),
+                dtype=np.int64,
+            )
+            if int(row_idx_prepared.shape[0]) == 0:
+                raise ValueError("FarmCPU trait-prepared packed context produced zero active SNPs.")
+            ref_alt_prepared = _make_deferred_bim_metadata(
+                str(packed_prefix),
+                row_idx_prepared,
+                n_markers=int(row_idx_prepared.shape[0]),
+            )
+            return packed_ctx_prepared, ref_alt_prepared
+
+        packed_load_t0 = time.monotonic()
+        if bool(emit_status):
+            with CliStatus(f"{status_label}...", enabled=bool(use_spinner)) as task:
+                try:
+                    _sample_ids_packed, packed_ctx_raw = prepare_packed_ctx_from_plink(
+                        str(packed_prefix),
+                        maf=float(args.maf),
+                        missing_rate=float(args.geno),
+                        snps_only=False,
+                        expected_n_samples=int(expected_n_samples),
+                        filter_mode="lazy_owned",
+                    )
+                except Exception:
+                    task.fail(f"{status_label} ...Failed")
+                    raise
+                task.complete(f"{status_label} ...Finished")
+        else:
+            _sample_ids_packed, packed_ctx_raw = prepare_packed_ctx_from_plink(
+                str(packed_prefix),
+                maf=float(args.maf),
+                missing_rate=float(args.geno),
+                snps_only=False,
+                expected_n_samples=int(expected_n_samples),
+                filter_mode="lazy_owned",
+            )
+
+        _log_file_only(
+            logger,
+            logging.INFO,
+            f"{status_label} ({int(expected_n_samples)} samples) "
+            f"[{format_elapsed(time.monotonic() - packed_load_t0)}]",
+        )
+
+        keep_numeric = np.ascontiguousarray(
+            np.asarray(packed_ctx_raw["site_keep"], dtype=np.bool_).reshape(-1),
+            dtype=np.bool_,
+        )
+        _ref_alt_df, keep_final = _load_bim_ref_alt_filtered(
+            str(packed_prefix),
+            keep_numeric,
+            snps_only_mode=bool(snps_only),
+            return_metadata=False,
+        )
+        if not np.any(keep_final):
+            raise ValueError("After filtering, number of SNPs is zero for FarmCPU.")
+
+        packed_num = np.ascontiguousarray(np.asarray(packed_ctx_raw["packed"], dtype=np.uint8))
+        miss_num = np.ascontiguousarray(
+            np.asarray(packed_ctx_raw["missing_rate"], dtype=np.float32).reshape(-1),
+            dtype=np.float32,
+        )
+        maf_num = np.ascontiguousarray(
+            np.asarray(packed_ctx_raw.get("af", packed_ctx_raw["maf"]), dtype=np.float32).reshape(-1),
+            dtype=np.float32,
+        )
+        active_row_idx = np.ascontiguousarray(
+            np.flatnonzero(keep_final).astype(np.int64, copy=False),
+            dtype=np.int64,
+        )
+        miss_arr = np.ascontiguousarray(miss_num[active_row_idx], dtype=np.float32)
+        maf_arr = np.ascontiguousarray(maf_num[active_row_idx], dtype=np.float32)
+
+        row_flip_raw = packed_ctx_raw.get("row_flip")
+        if row_flip_raw is None:
+            row_flip_raw = np.zeros(int(packed_num.shape[0]), dtype=np.bool_)
+        row_flip_full = np.ascontiguousarray(
+            np.asarray(row_flip_raw, dtype=np.bool_).reshape(-1),
+            dtype=np.bool_,
+        )
+        if int(row_flip_full.shape[0]) != int(packed_num.shape[0]):
+            raise ValueError("Packed row_flip length mismatch for FarmCPU packed context.")
+        row_flip_arr = np.ascontiguousarray(row_flip_full[active_row_idx], dtype=np.bool_)
+
+        loaded_snps = int(active_row_idx.shape[0])
+        ref_alt = _make_deferred_bim_metadata(
+            str(packed_prefix),
+            active_row_idx,
+            n_markers=loaded_snps,
+        )
+        packed_ctx = {
+            "packed": packed_num,
+            "missing_rate": miss_arr,
+            "af": maf_arr,
+            "maf": maf_arr,
+            "row_flip": row_flip_arr,
+            "row_indices": active_row_idx,
+            "site_keep": np.ascontiguousarray(keep_final, dtype=np.bool_),
+            "packed_filter_mode": "lazy_full",
+            "n_samples": int(packed_ctx_raw["n_samples"]),
+            "source_prefix": str(packed_prefix),
+        }
+        return packed_ctx, ref_alt
+
     if farmcpu_cache is None:
         t_loading = time.time()
+        reuse_shared_context = bool(
+            context_prepared
+            and pheno_preloaded is not None
+            and ids_preloaded is not None
+            and qmatrix_preloaded is not None
+        )
         # If FarmCPU is invoked after streaming models, pheno_preloaded/ids_preloaded
         # are usually intersection-aligned. FarmCPU must operate on full genotype IDs.
-        reuse_preloaded_pheno = bool(pheno_preloaded is not None) and (not bool(context_prepared))
+        reuse_preloaded_pheno = bool(pheno_preloaded is not None) and (
+            bool(reuse_shared_context) or (not bool(context_prepared))
+        )
         pheno = pheno_preloaded if reuse_preloaded_pheno else None
         if pheno is None:
             pheno = _load_phenotype_with_status(
@@ -825,22 +972,6 @@ def run_farmcpu_fullmem(
                     task.complete(
                         f"Loading phenotype from dataframe (n={pheno.shape[0]}, npheno={pheno.shape[1]})"
                     )
-
-        # Always inspect full genotype metadata for FarmCPU to avoid reusing
-        # streaming-intersection IDs (which can be smaller than packed BED n).
-        famid, n_snps = _inspect_genotype_with_status(
-            gfile,
-            logger,
-            use_spinner=use_spinner,
-            snps_only=bool(snps_only),
-            maf_threshold=float(args.maf),
-            max_missing_rate=float(args.geno),
-            het_threshold=float(args.het),
-            force_kind=("hmp" if bool(getattr(args, "hmp", None)) else None),
-        )
-        famid = np.asarray(famid, dtype=str)
-        geno = None
-        packed_ctx: Union[dict[str, object], None] = None
 
         packed_prefix = _as_plink_prefix(gfile)
         if packed_prefix is None:
@@ -860,116 +991,61 @@ def run_farmcpu_fullmem(
             )
             packed_prefix = _as_plink_prefix(cache_guess_plain)
 
+        geno = None
+        packed_ctx: Union[dict[str, object], None] = None
+        ref_alt = None
+        famid_full: Union[np.ndarray, None] = None
+        n_snps_full: Union[int, None] = None
+        if packed_prefix is not None:
+            try:
+                famid_full_raw, n_snps_full = inspect_genotype_file(str(packed_prefix))
+                famid_full = np.asarray(famid_full_raw, dtype=str)
+            except Exception:
+                famid_full = None
+                n_snps_full = None
+
+        if bool(reuse_shared_context):
+            famid = np.asarray(ids_preloaded, dtype=str)
+            n_snps = int(n_snps_preloaded) if n_snps_preloaded is not None else int(n_snps_full or 0)
+        else:
+            # Always inspect full genotype metadata for FarmCPU to avoid reusing
+            # streaming-intersection IDs (which can be smaller than packed BED n).
+            famid_raw, n_snps = _inspect_genotype_with_status(
+                gfile,
+                logger,
+                use_spinner=use_spinner,
+                snps_only=bool(snps_only),
+                maf_threshold=float(args.maf),
+                max_missing_rate=float(args.geno),
+                het_threshold=float(args.het),
+                force_kind=determine_genotype_source_force_kind_from_args(args),
+            )
+            famid = np.asarray(famid_raw, dtype=str)
+            if famid_full is None:
+                famid_full = np.asarray(famid, dtype=str)
+                n_snps_full = int(n_snps)
+
         _matrix_prefix_cli, matrix_path_cli = _resolve_file_input_matrix(str(gfile))
         can_use_packed = (
             bool(getattr(args, "model", "add") == "add")
             and packed_prefix is not None
             and matrix_path_cli is None
         )
+        defer_packed_trait_load = bool(context_prepared)
         if can_use_packed:
-            packed_load_t0 = time.monotonic()
-            packed_ctx_raw = None
-            pre = preloaded_packed if packed_preload_is_ready(preloaded_packed) else None
-            if pre is not None and str(pre.get("prefix", "")) == str(packed_prefix):
-                packed_ctx_obj = pre.get("packed_ctx")
-                if isinstance(packed_ctx_obj, dict):
-                    packed_ctx_raw = packed_ctx_obj
-                    _log_file_only(
-                        logger,
-                        logging.INFO,
-                        "Reusing preloaded packed BED genotype for FarmCPU.",
-                    )
-            if packed_ctx_raw is None and (not packed_preload_is_disabled(preloaded_packed)):
-                packed_status = CliStatus(
-                    "Loading genotype (Full)...",
-                    enabled=bool(use_spinner),
+            if not defer_packed_trait_load:
+                packed_ctx, ref_alt = _load_farmcpu_packed_ctx(
+                    str(packed_prefix),
+                    int(
+                        famid_full.shape[0]
+                        if famid_full is not None
+                        else famid.shape[0]
+                    ),
+                    status_label="Loading genotype (Full)",
                 )
-                with packed_status as task:
-                    try:
-                        _sample_ids_packed, packed_ctx_raw = prepare_packed_ctx_from_plink(
-                            str(packed_prefix),
-                            maf=float(args.maf),
-                            missing_rate=float(args.geno),
-                            snps_only=False,
-                            expected_n_samples=int(famid.shape[0]),
-                            filter_mode="lazy_owned",
-                        )
-                    except Exception:
-                        task.fail("Loading genotype (Full) ...Failed")
-                        raise
-            if packed_ctx_raw is None and packed_preload_is_disabled(preloaded_packed):
-                raise RuntimeError(
-                    "Packed BED preload is disabled for this run; FarmCPU packed "
-                    "cache path is unavailable."
-                )
-            _log_file_only(
-                logger,
-                logging.INFO,
-                f"Loading genotype (Full, {int(n_snps)} SNPs) "
-                f"[{format_elapsed(time.monotonic() - packed_load_t0)}]",
-            )
-
-            keep_numeric = np.ascontiguousarray(
-                np.asarray(packed_ctx_raw["site_keep"], dtype=np.bool_).reshape(-1), dtype=np.bool_
-            )
-
-            _ref_alt_df, keep_final = _load_bim_ref_alt_filtered(
-                str(packed_prefix),
-                keep_numeric,
-                snps_only_mode=bool(snps_only),
-                return_metadata=False,
-            )
-            if not np.any(keep_final):
-                raise ValueError("After filtering, number of SNPs is zero for FarmCPU.")
-
-            packed_num = np.ascontiguousarray(np.asarray(packed_ctx_raw["packed"], dtype=np.uint8))
-            miss_num = np.ascontiguousarray(
-                np.asarray(packed_ctx_raw["missing_rate"], dtype=np.float32).reshape(-1),
-                dtype=np.float32,
-            )
-            maf_num = np.ascontiguousarray(
-                np.asarray(packed_ctx_raw.get("af", packed_ctx_raw["maf"]), dtype=np.float32).reshape(-1),
-                dtype=np.float32,
-            )
-            active_row_idx = np.ascontiguousarray(
-                np.flatnonzero(keep_final).astype(np.int64, copy=False),
-                dtype=np.int64,
-            )
-            packed = np.ascontiguousarray(packed_num, dtype=np.uint8)
-            miss_arr = np.ascontiguousarray(miss_num[active_row_idx], dtype=np.float32)
-            maf_arr = np.ascontiguousarray(maf_num[active_row_idx], dtype=np.float32)
-
-            row_flip_raw = packed_ctx_raw.get("row_flip")
-            if row_flip_raw is None:
-                row_flip_raw = np.zeros(int(packed_num.shape[0]), dtype=np.bool_)
-            row_flip_full = np.ascontiguousarray(
-                np.asarray(row_flip_raw, dtype=np.bool_).reshape(-1),
-                dtype=np.bool_,
-            )
-            if int(row_flip_full.shape[0]) != int(packed_num.shape[0]):
-                raise ValueError(
-                    "Packed row_flip length mismatch for FarmCPU packed context."
-                )
-            row_flip_arr = np.ascontiguousarray(row_flip_full[active_row_idx], dtype=np.bool_)
-
-            loaded_snps = int(active_row_idx.shape[0])
-            ref_alt = _make_deferred_bim_metadata(
-                str(packed_prefix),
-                active_row_idx,
-                n_markers=loaded_snps,
-            )
-            packed_ctx = {
-                "packed": packed,
-                "missing_rate": miss_arr,
-                "af": maf_arr,
-                "maf": maf_arr,
-                "row_flip": row_flip_arr,
-                "row_indices": active_row_idx,
-                "site_keep": np.ascontiguousarray(keep_final, dtype=np.bool_),
-                "packed_filter_mode": "lazy_full",
-                "n_samples": int(packed_ctx_raw["n_samples"]),
-                "source_prefix": str(packed_prefix),
-            }
+            else:
+                packed_ctx = None
+                ref_alt = None
             geno = None
         else:
             raise ValueError(_FARMCPU_PACKED_ONLY_MSG)
@@ -989,7 +1065,7 @@ def run_farmcpu_fullmem(
                 logging.INFO,
                 f"Genotype and phenotype loaded in {t_loaded:.2f} seconds",
             )
-        if int(_bim_metadata_len(ref_alt)) == 0:
+        if (ref_alt is not None) and int(_bim_metadata_len(ref_alt)) == 0:
             msg = "After filtering, number of SNPs is zero for FarmCPU."
             logger.error(msg)
             raise ValueError(msg)
@@ -1003,56 +1079,103 @@ def run_farmcpu_fullmem(
             snps_only=bool(snps_only),
             logger=logger,
         )
-        famid_full = np.asarray(famid, dtype=str)
-        qmatrix, q_ids = build_qmatrix_farmcpu(
-            genofile=gfile,
-            gfile_prefix=gfile_prefix,
-            geno=geno,
-            qdim=qdim,
-            maf_threshold=float(args.maf),
-            max_missing_rate=float(args.geno),
-            het_threshold=float(args.het),
-            cov_inputs=cov,
-            chunk_size=args.chunksize,
-            logger=logger,
-            sample_ids=famid.astype(str),
-            use_spinner=use_spinner,
-            quiet_terminal=bool(context_prepared or prepare_only),
-            snps_only=bool(snps_only),
-            n_snps_hint=int(_bim_metadata_len(ref_alt)),
-            threads=int(args.thread),
-            mmap_limit=bool(args.mmap_limit),
-            preloaded_packed=preloaded_packed,
-            packed_ctx_preloaded=packed_ctx,
-            return_ids=True,
-        )
-        q_ids = np.asarray(q_ids, dtype=str)
-        q_id_set = set(q_ids.tolist())
-        pheno_ids_set = set(np.asarray(pheno.index, dtype=str))
-        common_ids = [
-            sid for sid in famid_full.tolist()
-            if sid in q_id_set and sid in pheno_ids_set
-        ]
-        if len(common_ids) == 0:
-            raise ValueError("No overlapping samples across FarmCPU genotype/phenotype/Q/cov.")
-        q_index = {sid: i for i, sid in enumerate(q_ids.tolist())}
-        q_take = np.asarray([q_index[sid] for sid in common_ids], dtype=np.int64)
-        qmatrix = np.ascontiguousarray(qmatrix[q_take], dtype="float32")
-        full_index = {sid: i for i, sid in enumerate(famid_full.tolist())}
-        packed_sample_idx = np.asarray(
-            [full_index[sid] for sid in common_ids],
-            dtype=np.int64,
-        )
-        famid = np.asarray(common_ids, dtype=str)
-
-        cov_n: Union[int, str] = "NA"
-        if len(_normalize_cov_inputs(cov)) > 0:
-            cov_n = int(len(common_ids))
-        geno_n = int(famid_full.shape[0]) if geno is None else int(geno.shape[1])
-        common_n = int(len(common_ids))
-        q_n: Union[int, str] = (
-            int(q_ids.shape[0]) if (np.asarray(qmatrix).ndim == 2 and int(qmatrix.shape[1]) > 0) else "NA"
-        )
+        if famid_full is None:
+            famid_full = np.asarray(famid, dtype=str)
+        if bool(reuse_shared_context):
+            q_base = np.ascontiguousarray(
+                np.asarray(qmatrix_preloaded, dtype="float32"),
+                dtype="float32",
+            )
+            if q_base.ndim != 2:
+                raise ValueError("FarmCPU shared-context Q matrix must be 2D.")
+            cov_base = None
+            if cov_preloaded is not None:
+                cov_base = np.ascontiguousarray(
+                    np.asarray(cov_preloaded, dtype="float32"),
+                    dtype="float32",
+                )
+                if cov_base.ndim != 2:
+                    raise ValueError("FarmCPU shared-context covariate matrix must be 2D.")
+                if int(cov_base.shape[0]) != int(famid.shape[0]):
+                    raise ValueError(
+                        "FarmCPU shared-context covariates row count mismatch: "
+                        f"cov={int(cov_base.shape[0])}, ids={int(famid.shape[0])}."
+                    )
+            qmatrix = q_base
+            if cov_base is not None and int(cov_base.shape[1]) > 0:
+                qmatrix = np.ascontiguousarray(
+                    np.concatenate([q_base, cov_base], axis=1),
+                    dtype="float32",
+                )
+            q_ids = np.asarray(famid, dtype=str)
+            common_ids = q_ids.tolist()
+            full_index = {sid: i for i, sid in enumerate(famid_full.tolist())}
+            packed_sample_idx = np.asarray(
+                [full_index[sid] for sid in common_ids],
+                dtype=np.int64,
+            )
+            cov_n = (
+                int(famid.shape[0])
+                if (cov_preloaded is not None and int(np.asarray(cov_preloaded).shape[1]) > 0)
+                else "NA"
+            )
+            geno_n = int(famid_full.shape[0])
+            common_n = int(len(common_ids))
+            q_n = (
+                int(q_ids.shape[0])
+                if int(q_base.shape[1]) > 0
+                else "NA"
+            )
+        else:
+            famid_full = np.asarray(famid, dtype=str)
+            qmatrix, q_ids = build_qmatrix_farmcpu(
+                genofile=gfile,
+                gfile_prefix=gfile_prefix,
+                geno=geno,
+                qdim=qdim,
+                maf_threshold=float(args.maf),
+                max_missing_rate=float(args.geno),
+                het_threshold=float(args.het),
+                cov_inputs=cov,
+                chunk_size=args.chunksize,
+                logger=logger,
+                sample_ids=famid.astype(str),
+                use_spinner=use_spinner,
+                quiet_terminal=bool(context_prepared or prepare_only),
+                snps_only=bool(snps_only),
+                n_snps_hint=int(_bim_metadata_len(ref_alt) if ref_alt is not None else int(n_snps)),
+                threads=int(args.thread),
+                mmap_limit=bool(args.mmap_limit),
+                preloaded_packed=preloaded_packed,
+                packed_ctx_preloaded=packed_ctx,
+                return_ids=True,
+            )
+            q_ids = np.asarray(q_ids, dtype=str)
+            q_id_set = set(q_ids.tolist())
+            pheno_ids_set = set(np.asarray(pheno.index, dtype=str))
+            common_ids = [
+                sid for sid in famid_full.tolist()
+                if sid in q_id_set and sid in pheno_ids_set
+            ]
+            if len(common_ids) == 0:
+                raise ValueError("No overlapping samples across FarmCPU genotype/phenotype/Q/cov.")
+            q_index = {sid: i for i, sid in enumerate(q_ids.tolist())}
+            q_take = np.asarray([q_index[sid] for sid in common_ids], dtype=np.int64)
+            qmatrix = np.ascontiguousarray(qmatrix[q_take], dtype="float32")
+            full_index = {sid: i for i, sid in enumerate(famid_full.tolist())}
+            packed_sample_idx = np.asarray(
+                [full_index[sid] for sid in common_ids],
+                dtype=np.int64,
+            )
+            famid = np.asarray(common_ids, dtype=str)
+            cov_n = "NA"
+            if len(_normalize_cov_inputs(cov)) > 0:
+                cov_n = int(len(common_ids))
+            geno_n = int(famid_full.shape[0]) if geno is None else int(geno.shape[1])
+            common_n = int(len(common_ids))
+            q_n = (
+                int(q_ids.shape[0]) if (np.asarray(qmatrix).ndim == 2 and int(qmatrix.shape[1]) > 0) else "NA"
+            )
         _emit_plain_info_line(
             logger,
             (
@@ -1069,6 +1192,9 @@ def run_farmcpu_fullmem(
             "ref_alt": ref_alt,
             "qmatrix": qmatrix,
             "packed_sample_idx": packed_sample_idx,
+            "packed_prefix": str(packed_prefix),
+            "packed_full_ids": famid_full,
+            "_defer_packed_trait_load": bool(defer_packed_trait_load),
         }
         if effective_qtn_preloaded_packed is not None:
             farmcpu_cache["_qtn_preloaded_packed"] = effective_qtn_preloaded_packed
@@ -1086,6 +1212,7 @@ def run_farmcpu_fullmem(
         packed_ctx = None
         if isinstance(packed_obj, dict):
             packed_ctx = _normalize_packed_ctx_for_farmcpu_cache(packed_obj)
+        defer_packed_trait_load = bool(farmcpu_cache.get("_defer_packed_trait_load", False))
         stage2_qtn_payload_obj = farmcpu_cache.get("_qtn_preloaded_packed")
         if effective_qtn_preloaded_packed is None and isinstance(stage2_qtn_payload_obj, dict):
             effective_qtn_preloaded_packed = stage2_qtn_payload_obj
@@ -1108,10 +1235,11 @@ def run_farmcpu_fullmem(
                 raise ValueError(
                     "FarmCPU cache packed_sample_idx length mismatch with famid."
                 )
-        ref_alt = farmcpu_cache["ref_alt"]  # type: ignore[assignment]
+        ref_alt = farmcpu_cache.get("ref_alt")
         qmatrix = np.asarray(farmcpu_cache["qmatrix"], dtype="float32")
     if farmcpu_cache is None:
         packed_sample_idx = None
+        defer_packed_trait_load = False
 
     if bool(prepare_only):
         return farmcpu_cache if farmcpu_cache is not None else {}
@@ -1139,6 +1267,33 @@ def run_farmcpu_fullmem(
         q_sub = qmatrix[keep_idx]
         trait_ids = np.asarray(famid[keep_idx], dtype=str)
         n_idv = int(keep_idx.shape[0])
+        if packed_ctx is None and bool(defer_packed_trait_load):
+            packed_prefix_cached = str(farmcpu_cache.get("packed_prefix", "")).strip()
+            if packed_prefix_cached == "":
+                packed_prefix_cached = str(_as_plink_prefix(gfile) or "")
+            if packed_prefix_cached == "":
+                raise ValueError("FarmCPU deferred packed load requires a PLINK BED prefix.")
+            full_ids_cached = np.asarray(
+                farmcpu_cache.get("packed_full_ids", []),
+                dtype=str,
+            ).reshape(-1)
+            expected_n_samples = int(full_ids_cached.shape[0]) if int(full_ids_cached.shape[0]) > 0 else int(famid.shape[0])
+            packed_ctx, ref_alt = _load_farmcpu_packed_ctx(
+                packed_prefix_cached,
+                expected_n_samples,
+                status_label="Loading BED genotype of trait-subset",
+                trait_prepared_meta=trait_prepared_meta,
+                emit_status=False,
+            )
+            farmcpu_cache["packed_ctx"] = packed_ctx
+            farmcpu_cache["ref_alt"] = ref_alt
+            if packed_sample_idx is None and int(full_ids_cached.shape[0]) > 0:
+                id_to_full = {str(sid): i for i, sid in enumerate(full_ids_cached.tolist())}
+                packed_sample_idx = np.ascontiguousarray(
+                    np.asarray([id_to_full[str(sid)] for sid in famid], dtype=np.int64),
+                    dtype=np.int64,
+                )
+                farmcpu_cache["packed_sample_idx"] = packed_sample_idx
         if packed_ctx is None:
             raise ValueError(_FARMCPU_PACKED_ONLY_MSG)
         else:
@@ -1622,6 +1777,11 @@ def run_farmcpu_fullmem(
         _rich_success(logger, farm_done_msg, use_spinner=use_spinner)
         if multi_trait_mode:
             logger.info("")
+        if bool(defer_packed_trait_load):
+            packed_ctx = None
+            ref_alt = None
+            farmcpu_cache["packed_ctx"] = None
+            farmcpu_cache["ref_alt"] = None
     return farmcpu_cache
 
 

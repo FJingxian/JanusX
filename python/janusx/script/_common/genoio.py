@@ -152,7 +152,12 @@ def determine_genotype_source(
 
     gfile_norm = gfile.replace("\\", "/")
     if apply_cache:
-        force_kind = "hmp" if hmp else None
+        force_kind = determine_genotype_source_force_kind(
+            vcf=vcf,
+            hmp=hmp,
+            file=file,
+            bfile=bfile,
+        )
         gfile_norm = prepare_cli_input_cache(
             gfile_norm,
             snps_only=bool(snps_only),
@@ -164,6 +169,33 @@ def determine_genotype_source(
 
     resolved_prefix = str(prefix) if prefix is not None else auto_prefix
     return gfile_norm, resolved_prefix
+
+
+def determine_genotype_source_force_kind(
+    *,
+    vcf: str | None,
+    hmp: str | None,
+    file: str | None,
+    bfile: str | None,
+) -> str | None:
+    if vcf:
+        return "vcf"
+    if hmp:
+        return "hmp"
+    if file:
+        return "file"
+    if bfile:
+        return "plink"
+    return None
+
+
+def determine_genotype_source_force_kind_from_args(args: Any) -> str | None:
+    return determine_genotype_source_force_kind(
+        vcf=getattr(args, "vcf", None),
+        hmp=getattr(args, "hmp", None),
+        file=getattr(args, "file", None),
+        bfile=getattr(args, "bfile", None),
+    )
 
 
 def determine_genotype_source_from_args(args: Any) -> tuple[str, str]:

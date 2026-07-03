@@ -63,6 +63,7 @@ import socket
 import argparse
 import warnings
 import sys
+import shlex
 import re
 import math
 import gc
@@ -156,6 +157,7 @@ from janusx.script._common.pathcheck import (
 )
 from janusx.script._common.memory import (
     decode_memory_gb_to_mb as _common_decode_memory_gb_to_mb,
+    finalize_peak_memory_metrics as _finalize_peak_memory_metrics,
     normalize_decode_memory_gb as _common_normalize_decode_memory_gb,
     resolve_decode_block_rows as _common_resolve_decode_block_rows,
 )
@@ -256,6 +258,9 @@ _RRBLUP_EXACT_MAX_MARKERS = 15_000
 _RRBLUP_LAMBDA_SUBSAMPLE_MIN_N = 2_000
 _RRBLUP_LAMBDA_SUBSAMPLE_MAX_N = 5_000
 _RRBLUP_LAMBDA_SUBSAMPLE_REPEATS = 9
+_SECTION_WIDTH = 80
+_REPORT_RULE = "=" * _SECTION_WIDTH
+_REPORT_SUBRULE = "-" * _SECTION_WIDTH
 _RUST_GBLUP_BACKEND_WARN_LOCK = threading.Lock()
 _RUST_GBLUP_BACKEND_WARNED: set[str] = set()
 
@@ -333,6 +338,78 @@ def _format_debug_bytes(n_bytes: object) -> str:
     if value >= 1024:
         return f"{value / 1024:.1f} KiB"
     return f"{value} B"
+
+
+def _bytes_to_gb(n_bytes: object) -> float | None:
+    try:
+        value = int(n_bytes)
+    except Exception:
+        return None
+    if value <= 0:
+        return None
+    return float(value / float(1024 ** 3))
+
+
+def _collect_gs_resource_metrics() -> dict[str, typing.Any]:
+    raw = _finalize_peak_memory_metrics()
+    peak_rss_bytes = raw.get("peak_rss_bytes")
+    peak_vms_bytes = raw.get("peak_vms_bytes")
+    peak_footprint_bytes = raw.get("peak_footprint_bytes")
+    resource_note = (
+        "Peak RSS is process-level max RSS; peak footprint is available on macOS only."
+    )
+    return {
+        "rss_bytes": raw.get("rss_bytes"),
+        "vms_bytes": raw.get("vms_bytes"),
+        "peak_rss_bytes": peak_rss_bytes,
+        "peak_vms_bytes": peak_vms_bytes,
+        "peak_footprint_bytes": peak_footprint_bytes,
+        "rss_gb": _bytes_to_gb(raw.get("rss_bytes")),
+        "vms_gb": _bytes_to_gb(raw.get("vms_bytes")),
+        "peak_rss_gb": _bytes_to_gb(peak_rss_bytes),
+        "peak_vms_gb": _bytes_to_gb(peak_vms_bytes),
+        "peak_footprint_gb": _bytes_to_gb(peak_footprint_bytes),
+        "memory_note": resource_note,
+    }
+
+
+def _emit_gs_resource_report(
+    logger: logging.Logger,
+    resource_metrics: dict[str, typing.Any],
+) -> None:
+    report_logger = _gs_report_logger(logger)
+    report_logger.info("")
+    _emit_report_block(report_logger, "Resources")
+    _emit_report_kv(
+        report_logger,
+        "RSS Now",
+        _format_debug_bytes(resource_metrics.get("rss_bytes")),
+    )
+    _emit_report_kv(
+        report_logger,
+        "Peak RSS",
+        _format_debug_bytes(resource_metrics.get("peak_rss_bytes")),
+    )
+    _emit_report_kv(
+        report_logger,
+        "Peak VMS",
+        _format_debug_bytes(resource_metrics.get("peak_vms_bytes")),
+    )
+    peak_footprint_bytes = resource_metrics.get("peak_footprint_bytes")
+    _emit_report_kv(
+        report_logger,
+        "Peak Footprint",
+        (
+            _format_debug_bytes(peak_footprint_bytes)
+            if peak_footprint_bytes is not None
+            else "Unavailable on this platform"
+        ),
+    )
+    _emit_report_kv(
+        report_logger,
+        "Memory Note",
+        resource_metrics.get("memory_note", ""),
+    )
 
 
 def _get_process_rss_bytes() -> int | None:
@@ -1913,89 +1990,6 @@ def _order_gs_saved_result_paths(paths: typing.Sequence[str]) -> list[str]:
     return primary + model_effect + summary
 
 
-def _format_gs_saved_result_report(
-    paths: typing.Sequence[str],
-    *,
-    trait_order: typing.Sequence[str] | None = None,
-) -> str:
-    dedup = list(dict.fromkeys([str(p) for p in paths if str(p).strip() != ""]))
-    trait_blocks: "OrderedDict[str, dict[str, list[str]]]" = OrderedDict()
-    summary_path: str | None = None
-    extras: list[str] = []
-
-    if trait_order is not None:
-        for t in list(trait_order):
-            tt = str(t).strip()
-            if tt != "" and tt not in trait_blocks:
-                trait_blocks[tt] = {"pred": [], "effect": [], "model": []}
-
-    def _ensure_trait(trait_name: str) -> dict[str, list[str]]:
-        t = str(trait_name).strip()
-        if t == "":
-            t = "unknown"
-        if t not in trait_blocks:
-            trait_blocks[t] = {"pred": [], "effect": [], "model": []}
-        return trait_blocks[t]
-
-    for p in dedup:
-        low = str(p).lower()
-        if low.endswith(".svg"):
-            continue
-        if low.endswith("summary.json"):
-            summary_path = str(p)
-            continue
-
-        base = os.path.basename(str(p))
-        parts = base.split(".")
-        # Prediction table: {prefix}.{trait}.gs.tsv
-        if len(parts) >= 4 and parts[-2] == "gs" and parts[-1] == "tsv":
-            bucket = _ensure_trait(parts[-3])
-            if str(p) not in bucket["pred"]:
-                bucket["pred"].append(str(p))
-            continue
-        # Effect table: {prefix}.{trait}.gs.effect (or legacy *.effect.tsv)
-        if len(parts) >= 4 and parts[-2] == "gs" and parts[-1] == "effect":
-            bucket = _ensure_trait(parts[-3])
-            if str(p) not in bucket["effect"]:
-                bucket["effect"].append(str(p))
-            continue
-        if len(parts) >= 3 and parts[-2] == "effect" and parts[-1] == "tsv":
-            bucket = _ensure_trait(parts[-3])
-            if str(p) not in bucket["effect"]:
-                bucket["effect"].append(str(p))
-            continue
-        # Model: {trait}.{method}.jxmodel (exclude TOP bundle)
-        if low.endswith(".jxmodel") and (not low.endswith(".gs.top.jxmodel")):
-            stem = base[: -len(".jxmodel")]
-            if "." in stem:
-                trait_token = stem.rsplit(".", 1)[0]
-                bucket = _ensure_trait(trait_token)
-                if str(p) not in bucket["model"]:
-                    bucket["model"].append(str(p))
-                continue
-
-        extras.append(str(p))
-
-    lines: list[str] = []
-    for trait_name, bucket in trait_blocks.items():
-        rows: list[str] = []
-        for key in ("pred", "effect", "model"):
-            for fp in list(bucket.get(key, [])):
-                rows.append(f"  {key:<10}{format_path_for_display(str(fp))}")
-        if len(rows) <= 0:
-            continue
-        lines.append(str(trait_name))
-        lines.extend(rows)
-
-    for p in extras:
-        lines.append(f"extra    {format_path_for_display(str(p))}")
-
-    if summary_path is not None:
-        lines.append(f"summary  {format_path_for_display(str(summary_path))}")
-
-    return "\n".join(lines).strip()
-
-
 def _resolve_top_bundle_model_file(
     *,
     model_arg: str,
@@ -2423,6 +2417,216 @@ def _format_gs_memory_cfg(
         return "auto (route-aware; pending inspect)"
     suffix = " (auto)" if bool(auto_requested and resolved) else ""
     return f"{float(memory_gb):.2f} GB{suffix}"
+
+
+def _gs_terminal_rich(logger: logging.Logger | None) -> bool:
+    try:
+        return bool(getattr(logger, "_janusx_gs_terminal_rich"))
+    except Exception:
+        return False
+
+
+def _gs_report_logger(logger: logging.Logger) -> logging.Logger:
+    try:
+        report_logger = getattr(logger, "_janusx_gs_report_logger")
+        if isinstance(report_logger, logging.Logger):
+            return report_logger
+    except Exception:
+        pass
+    return logger
+
+
+def _gs_stream_logger(logger: logging.Logger) -> logging.Logger | None:
+    try:
+        stream_logger = getattr(logger, "_janusx_gs_stream_logger")
+        if isinstance(stream_logger, logging.Logger):
+            return stream_logger
+    except Exception:
+        pass
+    return None
+
+
+def _gs_invocation_command(argv: list[str] | None = None) -> str:
+    tokens = [str(x) for x in (sys.argv[1:] if argv is None else argv)]
+    prog_raw = str(sys.argv[0]).strip() if len(sys.argv) > 0 else ""
+    if prog_raw == "":
+        prog_raw = "jx gs"
+    try:
+        prog_parts = shlex.split(prog_raw)
+    except Exception:
+        prog_parts = [prog_raw]
+    if len(prog_parts) == 0:
+        prog_parts = ["jx", "gs"]
+    return shlex.join([str(x) for x in (prog_parts + tokens)])
+
+
+def _emit_report_banner(logger: logging.Logger, title: str) -> None:
+    logger.info(_REPORT_RULE)
+    logger.info(str(title))
+    logger.info(_REPORT_RULE)
+    logger.info("")
+
+
+def _emit_report_block(logger: logging.Logger, title: str) -> None:
+    logger.info(f"[ {str(title)} ]")
+
+
+def _emit_report_major_section(logger: logging.Logger, title: str) -> None:
+    logger.info("")
+    logger.info(_REPORT_RULE)
+    logger.info(f"[ {str(title)} ]")
+    logger.info(_REPORT_SUBRULE)
+
+
+def _emit_report_kv(
+    logger: logging.Logger,
+    key: str,
+    value: object,
+    *,
+    key_width: int = 16,
+) -> None:
+    logger.info(f"  {str(key):<{int(key_width)}} : {str(value)}")
+
+
+def _format_gs_models_executed(methods: typing.Sequence[str]) -> str:
+    names = [str(_method_display_name(str(m))) for m in methods if str(m).strip() != ""]
+    return ", ".join(names) if len(names) > 0 else "None"
+
+
+def _ordered_gs_summary_rows(
+    rows: list[dict[str, typing.Any]],
+) -> list[dict[str, typing.Any]]:
+    return sorted(
+        [dict(r) for r in rows],
+        key=lambda r: (str(r.get("trait", "")), str(r.get("model", ""))),
+    )
+
+
+def _format_gs_summary_metric(value: object, fmt: str) -> str:
+    try:
+        num = float(value)
+    except Exception:
+        return "NA"
+    if not np.isfinite(num):
+        return "NA"
+    return format(num, fmt)
+
+
+def _emit_gs_trait_header(
+    logger: logging.Logger,
+    *,
+    trait_name: str,
+    train_size: int,
+    test_size: int,
+    methods: typing.Sequence[str],
+    cv_enabled: bool,
+    model_mode: bool,
+    top_enabled: bool,
+) -> None:
+    report_logger = _gs_report_logger(logger)
+    _emit_report_major_section(report_logger, f"Task Execution: {trait_name}")
+    _emit_report_kv(
+        report_logger,
+        "Trait Split",
+        f"train={int(train_size)} | test={int(test_size)}",
+    )
+    cv_text = (
+        "predict-only"
+        if bool(model_mode and not cv_enabled)
+        else ("on" if bool(cv_enabled) else "off")
+    )
+    _emit_report_kv(
+        report_logger,
+        "Trait Mode",
+        f"CV={cv_text} | TOP={'on' if bool(top_enabled) else 'off'}",
+    )
+    _emit_report_kv(report_logger, "Trait Models", _format_gs_models_executed(methods))
+
+
+def _emit_gs_summary_legacy(
+    logger: logging.Logger,
+    rows: list[dict[str, typing.Any]],
+) -> None:
+    if len(rows) == 0:
+        return
+    logger.info("")
+    logger.info("=" * _SECTION_WIDTH)
+    logger.info("Summary")
+    logger.info("=" * _SECTION_WIDTH)
+    headers = ["trait", "model", "ntrain", "ntest", "r2", "pear", "time(s)"]
+    out_rows: list[list[str]] = []
+    for row in _ordered_gs_summary_rows(rows):
+        out_rows.append(
+            [
+                str(row.get("trait", "")),
+                str(row.get("model", "")),
+                f"{int(row.get('n_train', 0))}",
+                f"{int(row.get('n_test', 0))}",
+                _format_gs_summary_metric(row.get("r2_cv_mean", np.nan), ".3f"),
+                _format_gs_summary_metric(row.get("pearsonr_cv_mean", np.nan), ".3f"),
+                _format_gs_summary_metric(row.get("time_cv_mean_sec", np.nan), ".1f"),
+            ]
+        )
+    widths = [len(h) for h in headers]
+    for row in out_rows:
+        for i, value in enumerate(row):
+            widths[i] = max(widths[i], len(value))
+    logger.info("  ".join(headers[i].ljust(widths[i]) for i in range(len(headers))))
+    for row in out_rows:
+        logger.info("  ".join(row[i].ljust(widths[i]) for i in range(len(row))))
+
+
+def _emit_gs_summary(
+    logger: logging.Logger,
+    rows: list[dict[str, typing.Any]],
+) -> None:
+    if len(rows) == 0:
+        return
+    report_logger = _gs_report_logger(logger)
+    _emit_report_major_section(report_logger, "Summary Report")
+    headers = [
+        "Trait",
+        "Model",
+        "N_Train",
+        "N_Test",
+        "Pearsonr",
+        "Spearmanr",
+        "R2",
+        "MSE",
+        "MAE",
+        "PVE",
+        "Time(s)",
+    ]
+    out_rows: list[list[str]] = []
+    for row in _ordered_gs_summary_rows(rows):
+        out_rows.append(
+            [
+                str(row.get("trait", "")),
+                str(row.get("model", "")),
+                f"{int(row.get('n_train', 0))}",
+                f"{int(row.get('n_test', 0))}",
+                _format_gs_summary_metric(row.get("pearsonr_cv_mean", np.nan), ".3f"),
+                _format_gs_summary_metric(row.get("spearmanr_cv_mean", np.nan), ".3f"),
+                _format_gs_summary_metric(row.get("r2_cv_mean", np.nan), ".3f"),
+                _format_gs_summary_metric(row.get("mse_cv_mean", np.nan), ".4g"),
+                _format_gs_summary_metric(row.get("mae_cv_mean", np.nan), ".4g"),
+                _format_gs_summary_metric(row.get("pve_final", np.nan), ".3f"),
+                _format_gs_summary_metric(row.get("time_cv_mean_sec", np.nan), ".1f"),
+            ]
+        )
+    widths = [len(h) for h in headers]
+    for row in out_rows:
+        for i, value in enumerate(row):
+            widths[i] = max(widths[i], len(value))
+    report_logger.info("  ".join(headers[i].ljust(widths[i]) for i in range(len(headers))))
+    for row in out_rows:
+        report_logger.info("  ".join(row[i].ljust(widths[i]) for i in range(len(row))))
+    report_logger.info(_REPORT_SUBRULE)
+
+    if _gs_terminal_rich(logger):
+        stream_logger = _gs_stream_logger(logger)
+        if stream_logger is not None:
+            _emit_gs_summary_legacy(stream_logger, rows)
 
 
 def _estimate_gs_train_size_for_dispatch(
@@ -18606,7 +18810,47 @@ def parse_args(argv: typing.Optional[list[str]] = None):
     return args
 
 
-def _run_gs_pipeline(
+def _resolve_gs_pipeline_paths(
+    args,
+) -> tuple[str, str, str, str]:
+    if args.vcf:
+        gfile = str(args.vcf)
+        args.prefix = (
+            os.path.basename(gfile)
+            .replace(".gz", "")
+            .replace(".vcf", "")
+            if args.prefix is None else args.prefix
+        )
+    elif args.hmp:
+        gfile = str(args.hmp)
+        args.prefix = (
+            os.path.basename(gfile)
+            .replace(".gz", "")
+            .replace(".hmp", "")
+            if args.prefix is None else args.prefix
+        )
+    elif args.file:
+        gfile = str(args.file)
+        base = os.path.basename(gfile)
+        for ext in (".npy", ".txt", ".tsv", ".csv"):
+            if base.lower().endswith(ext):
+                base = base[: -len(ext)]
+                break
+        args.prefix = base if args.prefix is None else args.prefix
+    elif args.bfile:
+        gfile = str(args.bfile)
+        args.prefix = os.path.basename(gfile) if args.prefix is None else args.prefix
+    else:
+        raise ValueError("No genotype input detected. Use -vcf, -hmp, -file or -bfile.")
+
+    args.out = os.path.normpath(args.out if args.out is not None else ".")
+    outprefix = os.path.join(str(args.out), str(args.prefix))
+    gs_model_dir = os.path.join(str(args.out), f"{args.prefix}.gs.model")
+    log_path = f"{outprefix}.gs.log"
+    return gfile, outprefix, gs_model_dir, log_path
+
+
+def _run_gs_pipeline_impl(
     args=None,
     *,
     argv: typing.Optional[list[str]] = None,
@@ -18688,39 +18932,7 @@ def _run_gs_pipeline(
     # ------------------------------------------------------------------
     # Determine genotype file and output prefix
     # ------------------------------------------------------------------
-    if args.vcf:
-        gfile = args.vcf
-        args.prefix = (
-            os.path.basename(gfile)
-            .replace(".gz", "")
-            .replace(".vcf", "")
-            if args.prefix is None else args.prefix
-        )
-    elif args.hmp:
-        gfile = args.hmp
-        args.prefix = (
-            os.path.basename(gfile)
-            .replace(".gz", "")
-            .replace(".hmp", "")
-            if args.prefix is None else args.prefix
-        )
-    elif args.file:
-        gfile = args.file
-        base = os.path.basename(gfile)
-        for ext in (".npy", ".txt", ".tsv", ".csv"):
-            if base.lower().endswith(ext):
-                base = base[: -len(ext)]
-                break
-        args.prefix = base if args.prefix is None else args.prefix
-    elif args.bfile:
-        gfile = args.bfile
-        args.prefix = os.path.basename(gfile) if args.prefix is None else args.prefix
-    else:
-        raise ValueError("No genotype input detected. Use -vcf, -hmp, -file or -bfile.")
-
-    args.out = os.path.normpath(args.out if args.out is not None else ".")
-    outprefix = os.path.join(args.out, args.prefix)
-    gs_model_dir = os.path.join(args.out, f"{args.prefix}.gs.model")
+    gfile, outprefix, gs_model_dir, log_path = _resolve_gs_pipeline_paths(args)
     thread_budget = detect_thread_budget_info()
     detected_threads = int(thread_budget["effective_threads"])
     requested_threads = int(args.thread)
@@ -18740,7 +18952,6 @@ def _run_gs_pipeline(
     os.makedirs(args.out, 0o755, exist_ok=True)
     os.makedirs(gs_model_dir, 0o755, exist_ok=True)
     configure_genotype_cache_from_out(args.out)
-    log_path = f"{outprefix}.gs.log"
     logger = setup_logging(log_path)
     _file_only_logger = logging.getLogger("janusx.gs.file_only")
     _file_only_logger.handlers.clear()
@@ -18755,6 +18966,17 @@ def _run_gs_pipeline(
             _file_only_logger.addHandler(_h)
         elif isinstance(_h, logging.StreamHandler):
             _stream_only_logger.addHandler(_h)
+    terminal_rich = bool(use_spinner)
+    report_logger = _file_only_logger if terminal_rich else logger
+    terminal_logger = _stream_only_logger if terminal_rich else logger
+    for _lg in {logger, _file_only_logger, _stream_only_logger, report_logger, terminal_logger}:
+        try:
+            setattr(_lg, "_janusx_gs_verbose", bool(getattr(args, "verbose", False)))
+            setattr(_lg, "_janusx_gs_terminal_rich", terminal_rich)
+            setattr(_lg, "_janusx_gs_report_logger", report_logger)
+            setattr(_lg, "_janusx_gs_stream_logger", terminal_logger if terminal_rich else None)
+        except Exception:
+            continue
 
     def _log_file_only(msg: str) -> None:
         text = str(msg).strip()
@@ -19095,20 +19317,6 @@ def _run_gs_pipeline(
 
     gs_memory_auto_requested = bool(args.memory is None)
     gs_config_emitted = False
-    preconfig_terminal_successes: list[str] = []
-
-    def _queue_preconfig_success(message: str) -> None:
-        text = str(message).strip()
-        if text != "":
-            preconfig_terminal_successes.append(text)
-
-    def _flush_preconfig_successes() -> None:
-        if len(preconfig_terminal_successes) <= 0:
-            return
-        pending = list(preconfig_terminal_successes)
-        preconfig_terminal_successes.clear()
-        for msg in pending:
-            log_success(logger, msg, force_color=True)
 
     def _emit_gs_configuration() -> None:
         nonlocal gs_config_emitted
@@ -19173,63 +19381,117 @@ def _run_gs_pipeline(
             auto_requested=bool(gs_memory_auto_requested),
             resolved=bool(args.memory is not None),
         )
-
-        emit_cli_configuration(
-            logger,
-            app_title="JanusX GS configuration",
-            config_title="GS configuration",
-            host=socket.gethostname(),
-            sections=[
-                (
-                    "Input",
-                    [
-                        ("Genotype", gfile),
-                        ("Phenotype", args.pheno),
-                        ("Trait/Pcol", ncol_cfg),
-                    ],
-                ),
-                (
-                    "Data filters",
-                    [
-                        ("MAF", float(args.maf)),
-                        ("Missing", float(args.geno)),
-                        ("LD prune", ld_cfg),
-                        ("Hash", hash_cfg),
-                        ("PCA", ("on" if bool(args.pcd) else "off")),
-                    ],
-                ),
-                (
-                    "Runtime",
-                    [
-                        (
-                            "Threads",
-                            format_requested_thread_usage(
-                                requested_threads=int(requested_threads),
-                                using_threads=int(args.thread),
-                                detected_threads=int(detected_threads),
-                            ),
-                        ),
-                        ("Memory", memory_cfg),
-                        ("CV", cv_cfg),
-                        ("Model mode", ("on" if model_mode else "off")),
-                        (
-                            "TOP",
-                            (
-                                f"on ({str(args.model_select_metric).strip().lower()})"
-                                if top_enabled
-                                else "off"
-                            ),
-                        ),
-                        ("Train prediction", ("All" if args.limit_predtrain is None else int(args.limit_predtrain))),
-                    ],
-                ),
-                ("Enabled models", model_rows),
-            ],
-            footer_rows=[("Output prefix", outprefix)],
-            line_max_chars=62,
+        route_tags: list[str] = []
+        if gfile_is_plink:
+            route_tags.append("PLINK")
+        elif input_vcf_hmp_requested:
+            route_tags.append("VCF/HMP")
+        elif file_input_requested:
+            route_tags.append("FILE")
+        else:
+            route_tags.append("Generic")
+        if packed_preprocess_requested and (not gfile_is_plink):
+            route_tags.append("cache->PLINK")
+        elif file_memmap_preferred:
+            route_tags.append("memmap-preferred")
+        genotype_route_cfg = " | ".join(route_tags)
+        top_cfg = (
+            f"on ({str(args.model_select_metric).strip().lower()})"
+            if top_enabled
+            else "off"
         )
+        if terminal_rich:
+            emit_cli_configuration(
+                terminal_logger,
+                app_title="JanusX - GS",
+                config_title="GS CONFIG",
+                host=socket.gethostname(),
+                sections=[
+                    (
+                        "Input",
+                        [
+                            ("Genotype", gfile),
+                            ("Phenotype", args.pheno),
+                            ("Trait/Pcol", ncol_cfg),
+                            ("Route", genotype_route_cfg),
+                        ],
+                    ),
+                    (
+                        "Data filters",
+                        [
+                            ("MAF", float(args.maf)),
+                            ("Missing", float(args.geno)),
+                            ("LD prune", ld_cfg),
+                            ("Hash", hash_cfg),
+                            ("PCA", ("on" if bool(args.pcd) else "off")),
+                        ],
+                    ),
+                    (
+                        "Runtime",
+                        [
+                            (
+                                "Threads",
+                                format_requested_thread_usage(
+                                    requested_threads=int(requested_threads),
+                                    using_threads=int(args.thread),
+                                    detected_threads=int(detected_threads),
+                                ),
+                            ),
+                            ("Memory", memory_cfg),
+                            ("CV", cv_cfg),
+                            ("Model mode", ("on" if model_mode else "off")),
+                            ("TOP", top_cfg),
+                            (
+                                "Train prediction",
+                                ("All" if args.limit_predtrain is None else int(args.limit_predtrain)),
+                            ),
+                        ],
+                    ),
+                    ("Enabled models", model_rows),
+                ],
+                footer_rows=[("Output prefix", outprefix)],
+                line_max_chars=62,
+            )
+
+        _emit_report_banner(report_logger, "JanusX - GS Pipeline Analysis")
+        _emit_report_block(report_logger, "System Context")
+        _emit_report_kv(report_logger, "Host", socket.gethostname())
+        _emit_report_kv(
+            report_logger,
+            "Threads",
+            f"Requested={requested_threads} | Using={int(args.thread)} (Local Effective: {detected_threads})",
+        )
+        _emit_report_kv(
+            report_logger,
+            "Thread Detect",
+            format_thread_budget_summary(thread_budget),
+        )
+        report_logger.info("")
+        _emit_report_block(report_logger, "Configuration")
+        _emit_report_kv(report_logger, "Genotype File", format_path_for_display(str(gfile)))
+        _emit_report_kv(report_logger, "Phenotype File", format_path_for_display(str(args.pheno)))
+        _emit_report_kv(report_logger, "Trait Cols", ncol_cfg)
+        _emit_report_kv(report_logger, "Models Executed", _format_gs_models_executed(methods))
+        _emit_report_kv(
+            report_logger,
+            "Thresholds",
+            f"MAF={float(args.maf):g} | Missing={float(args.geno):g}",
+        )
+        _emit_report_kv(report_logger, "Decode Block", memory_cfg)
+        _emit_report_kv(report_logger, "CV Mode", cv_cfg)
+        _emit_report_kv(report_logger, "TOP", top_cfg)
+        _emit_report_kv(report_logger, "Input Route", genotype_route_cfg)
+        if model_mode:
+            _emit_report_kv(
+                report_logger,
+                "Loaded Model",
+                format_path_for_display(str(loaded_bundle_file or args.model)),
+            )
+        _emit_report_kv(report_logger, "Output Prefix", format_path_for_display(str(outprefix)))
+        report_logger.info("")
+        _emit_report_block(report_logger, "Command")
+        report_logger.info(f"  {_gs_invocation_command(argv)}")
         gs_config_emitted = True
-        _flush_preconfig_successes()
 
     def _ensure_gs_memory_and_config(
         n_samples_total: int,
@@ -19344,7 +19606,6 @@ def _run_gs_pipeline(
     t_loading = time.time()
     psrc = os.path.basename(str(args.pheno).rstrip("/\\")) or str(args.pheno)
     defer_pheno_load_status = not bool(gs_config_emitted)
-    pheno_t0 = time.monotonic()
     with CliStatus(
         f"Loading phenotype from {psrc}...",
         enabled=(bool(use_spinner) and (not bool(defer_pheno_load_status))),
@@ -19354,15 +19615,6 @@ def _run_gs_pipeline(
         except Exception:
             task.fail(f"Loading phenotype from {psrc} ...Failed")
             raise
-        pheno_done_msg = (
-            f"Loading phenotype from {psrc} (n={pheno.shape[0]}, npheno={pheno.shape[1]})"
-        )
-        if bool(defer_pheno_load_status):
-            _queue_preconfig_success(
-                f"{pheno_done_msg} [{format_elapsed(time.monotonic() - pheno_t0)}]"
-            )
-        else:
-            task.complete(pheno_done_msg)
 
     if pheno.shape[1] <= 0:
         logger.error(
@@ -19494,7 +19746,6 @@ def _run_gs_pipeline(
     geno_is_memmap = False
     if use_packed_lmm:
         defer_geno_load_status = not bool(gs_config_emitted)
-        geno_load_t0 = time.monotonic()
         with CliStatus(
             genotype_load_status_open(gsrc),
             enabled=(bool(use_spinner) and (not bool(defer_geno_load_status))),
@@ -19523,19 +19774,6 @@ def _run_gs_pipeline(
                 if packed_lmm_ctx is not None
                 else 0
             )
-            load_kind = "packed-meta" if packed_meta_only_main_requested else "packed"
-            geno_done_msg = genotype_load_status_done(
-                gsrc,
-                n_samples=n,
-                n_snps=m,
-                mode=load_kind,
-            )
-            if bool(defer_geno_load_status):
-                _queue_preconfig_success(
-                    f"{geno_done_msg} [{format_elapsed(time.monotonic() - geno_load_t0)}]"
-                )
-            else:
-                task.complete(geno_done_msg)
         _emit_packed_load_debug(
             packed_lmm_ctx,
             label="main",
@@ -19745,7 +19983,6 @@ def _run_gs_pipeline(
         # Global hash path for non-packed-model sets:
         # load packed BED -> optional LD prune -> hash projection -> dense hashed matrix.
         defer_geno_load_status = not bool(gs_config_emitted)
-        geno_load_t0 = time.monotonic()
         with CliStatus(
             genotype_load_status_open(gsrc),
             enabled=(bool(use_spinner) and (not bool(defer_geno_load_status))),
@@ -19766,18 +20003,6 @@ def _run_gs_pipeline(
                 if packed_lmm_ctx is not None
                 else 0
             )
-            geno_done_msg = genotype_load_status_done(
-                gsrc,
-                n_samples=n,
-                n_snps=m,
-                mode="packed",
-            )
-            if bool(defer_geno_load_status):
-                _queue_preconfig_success(
-                    f"{geno_done_msg} [{format_elapsed(time.monotonic() - geno_load_t0)}]"
-                )
-            else:
-                task.complete(geno_done_msg)
         _emit_packed_load_debug(
             packed_lmm_ctx,
             label="hash",
@@ -19931,7 +20156,6 @@ def _run_gs_pipeline(
         # For non-GBLUP/rrBLUP model sets, allow global LD prune by
         # pruning on packed BED first, then decoding once to dense matrix.
         defer_geno_load_status = not bool(gs_config_emitted)
-        geno_load_t0 = time.monotonic()
         with CliStatus(
             genotype_load_status_open(gsrc),
             enabled=(bool(use_spinner) and (not bool(defer_geno_load_status))),
@@ -19952,18 +20176,6 @@ def _run_gs_pipeline(
                 if packed_lmm_ctx is not None
                 else 0
             )
-            geno_done_msg = genotype_load_status_done(
-                gsrc,
-                n_samples=n,
-                n_snps=m,
-                mode="packed",
-            )
-            if bool(defer_geno_load_status):
-                _queue_preconfig_success(
-                    f"{geno_done_msg} [{format_elapsed(time.monotonic() - geno_load_t0)}]"
-                )
-            else:
-                task.complete(geno_done_msg)
         _emit_packed_load_debug(
             packed_lmm_ctx,
             label="ldprune",
@@ -20062,7 +20274,6 @@ def _run_gs_pipeline(
             )
     else:
         defer_geno_load_status = not bool(gs_config_emitted)
-        geno_load_t0 = time.monotonic()
         with CliStatus(
             genotype_load_status_open(gsrc),
             enabled=(bool(use_spinner) and (not bool(defer_geno_load_status))),
@@ -20087,25 +20298,6 @@ def _run_gs_pipeline(
                 task.fail(genotype_load_status_fail(gsrc))
                 raise
             m, n = geno.shape
-            if geno_is_memmap:
-                geno_done_msg = genotype_load_status_done(
-                    gsrc,
-                    n_samples=n,
-                    n_snps=m,
-                    mode="memmap",
-                )
-            else:
-                geno_done_msg = genotype_load_status_done(
-                    gsrc,
-                    n_samples=n,
-                    n_snps=m,
-                )
-            if bool(defer_geno_load_status):
-                _queue_preconfig_success(
-                    f"{geno_done_msg} [{format_elapsed(time.monotonic() - geno_load_t0)}]"
-                )
-            else:
-                task.complete(geno_done_msg)
         _ensure_gs_memory_and_config(int(n), int(m))
 
         samples = sample_ids
@@ -20125,8 +20317,6 @@ def _run_gs_pipeline(
             geno = (geno - geno.mean(axis=1, keepdims=True)) / (
                 geno.std(axis=1, keepdims=True) + 1e-6
             )  # standardization for marker-effect models
-
-    _flush_preconfig_successes()
 
     if packed_lmm_ctx is not None:
         _attach_stream_decode_budget_to_packed_ctx(
@@ -20469,6 +20659,57 @@ def _run_gs_pipeline(
                 f"m={shared_additive_gblup_cache.n_markers} "
                 f"slice_block_rows={shared_additive_gblup_cache.slice_block_rows}"
             )
+    if bool(log):
+        loaded_marker_count = (
+            int(_packed_ctx_active_rows(packed_lmm_ctx))
+            if packed_lmm_ctx is not None
+            else (
+                int(np.asarray(geno_add_raw).shape[0])
+                if geno_add_raw is not None
+                else (
+                    int(np.asarray(geno_raw).shape[0])
+                    if geno_raw is not None
+                    else (int(np.asarray(geno).shape[0]) if geno is not None else 0)
+                )
+            )
+        )
+        backend_tags: list[str] = []
+        if packed_lmm_ctx is not None:
+            backend_tags.append("packed-meta" if packed_meta_only_main_requested else "packed")
+        elif args.hash_dim is not None and geno is not None:
+            backend_tags.append(f"hashed-dense(k={int(args.hash_dim)})")
+        elif geno_is_memmap:
+            backend_tags.append("dense-memmap")
+        elif geno is not None:
+            backend_tags.append("dense")
+        else:
+            backend_tags.append("unknown")
+        if ldprune_spec is not None:
+            backend_tags.append(f"ldprune={ldprune_spec.label()}")
+        if geno_ml_raw is not None and packed_lmm_ctx is not None:
+            backend_tags.append("ml-dense-preload")
+        report_logger.info("")
+        _emit_report_block(report_logger, "Input Summary")
+        _emit_report_kv(
+            report_logger,
+            "Genotype Loaded",
+            f"n={int(len(samples))} | nSNP={int(loaded_marker_count)} | backend={' | '.join(backend_tags)}",
+        )
+        _emit_report_kv(
+            report_logger,
+            "Phenotypes Loaded",
+            f"n={int(pheno.shape[0])} | traits={int(pheno.shape[1])}",
+        )
+        _emit_report_kv(
+            report_logger,
+            "Trait Plan",
+            f"{int(pheno.shape[1])} traits | models={_format_gs_models_executed(methods)}",
+        )
+        _emit_report_kv(
+            report_logger,
+            "Resource Note",
+            "Final resource block records process-level peak RSS and, on macOS, peak footprint.",
+        )
     gs_summary_rows: list[dict[str, typing.Any]] = []
     saved_result_paths: list[str] = []
     exported_model_artifacts: list[dict[str, typing.Any]] = []
@@ -21094,7 +21335,7 @@ def _run_gs_pipeline(
 
         sep_w = max(40, min(80, _terminal_columns()))
         gs_output.emit_trait_header(
-            logger,
+            terminal_logger if terminal_rich else logger,
             trait_name=str(trait_name),
             train_size=int(np.sum(trainmask)),
             test_size=int(np.sum(testmask)),
@@ -21127,6 +21368,16 @@ def _run_gs_pipeline(
                 continue
             trait_methods = [sel_from_bundle]
 
+        _emit_gs_trait_header(
+            logger,
+            trait_name=str(trait_name),
+            train_size=int(np.sum(trainmask)),
+            test_size=int(np.sum(testmask)),
+            methods=trait_methods,
+            cv_enabled=bool(cv_enabled),
+            model_mode=bool(model_mode),
+            top_enabled=bool(top_enabled),
+        )
         method_display_map = {str(m): _method_display_name(str(m)) for m in trait_methods}
         out_tsv = f"{outprefix}.{trait_name}.gs.tsv"
         out_effect_merged = f"{outprefix}.{trait_name}.gs.effect"
@@ -22540,6 +22791,7 @@ def _run_gs_pipeline(
                     saved_result_paths.append(str(top_rank_out))
                     log_success(logger, f"Saved TOP rank to {format_path_for_display(top_rank_out)}")
 
+    resource_metrics = _collect_gs_resource_metrics()
     run_finished_unix = float(time.time())
     summary_out = os.path.join(gs_model_dir, "summary.json")
     ordered_saved_paths = _order_gs_saved_result_paths([str(x) for x in saved_result_paths])
@@ -22570,10 +22822,7 @@ def _run_gs_pipeline(
         "top_selected_by_trait": dict(top_trait_selected_method),
         "model_artifacts": list(exported_model_artifacts),
         "result_files": result_files_for_summary,
-        "resource": {
-            "memory_peak_rss": None,
-            "memory_note": "Not collected yet in GS workflow.",
-        },
+        "resource": dict(resource_metrics),
         "usage": {
             "model_directory": str(gs_model_dir),
             "single_trait_model_file_pattern": "{trait}.{method}.jxmodel",
@@ -22594,28 +22843,26 @@ def _run_gs_pipeline(
     except Exception as ex:
         logger.warning(f"Failed to write GS summary.json: {ex}")
     saved_result_paths = _order_gs_saved_result_paths([str(x) for x in saved_result_paths])
+    if len(gs_summary_rows) > 0:
+        _emit_gs_summary(logger, gs_summary_rows)
+    _emit_gs_resource_report(logger, resource_metrics)
     if len(saved_result_paths) > 0:
-        logger.info("")
-        saved_body = _format_gs_saved_result_report(
-            saved_result_paths,
-            trait_order=[str(x) for x in trait_order],
-        )
-        if saved_body.strip() == "":
-            saved_body = "\n".join(
-                [f"  {format_path_for_display(str(p))}" for p in saved_result_paths]
-            )
-        log_success(logger, f"Results saved:\n{saved_body}")
+        report_logger.info("")
+        _emit_report_block(report_logger, "Outputs Generated")
+        for path in saved_result_paths:
+            report_logger.info(f"  * {format_path_for_display(str(path))}")
 
     # ----------------------------------------------------------------------
     # Final summary
     # ----------------------------------------------------------------------
-    lt = time.localtime()
-    endinfo = (
-        f"\nFinished, total time: {round(time.time() - t_start, 2)} secs\n"
-        f"{lt.tm_year}-{lt.tm_mon}-{lt.tm_mday} "
-        f"{lt.tm_hour}:{lt.tm_min}:{lt.tm_sec}"
+    report_logger.info("")
+    _emit_report_kv(report_logger, "Total Wall Time", f"{max(time.time() - t_start, 0.0):.2f}s")
+    _emit_report_kv(
+        report_logger,
+        "Finished At",
+        time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
     )
-    log_success(logger, endinfo)
+    report_logger.info(_REPORT_RULE)
     if bool(return_result):
         return {
             "status": "done",
@@ -22630,7 +22877,106 @@ def _run_gs_pipeline(
             "elapsed_sec": float(max(time.time() - t_start, 0.0)),
             "traits": [str(x) for x in trait_order],
             "methods": [str(_method_display_name(str(x))) for x in methods],
+            "resource": dict(resource_metrics),
         }
+
+
+def _run_gs_pipeline(
+    args=None,
+    *,
+    argv: typing.Optional[list[str]] = None,
+    log: bool = True,
+    return_result: bool = False,
+) -> typing.Optional[dict[str, typing.Any]]:
+    if args is None:
+        args = parse_args(argv)
+    t_start = time.time()
+    try:
+        return _run_gs_pipeline_impl(
+            args=args,
+            argv=argv,
+            log=log,
+            return_result=return_result,
+        )
+    except KeyboardInterrupt:
+        run_status = "failed"
+        run_error = "Interrupted by user (Ctrl+C)."
+        exc: Exception | None = None
+    except Exception as e:
+        run_status = "failed"
+        run_error = str(e)
+        exc = e
+
+    gfile = ""
+    outprefix = ""
+    gs_model_dir = ""
+    log_path = ""
+    try:
+        gfile, outprefix, gs_model_dir, log_path = _resolve_gs_pipeline_paths(args)
+    except Exception:
+        pass
+
+    logger: logging.Logger = logging.getLogger(__name__)
+    if bool(log) and log_path.strip() != "":
+        try:
+            out_dir = str(getattr(args, "out", ".") or ".")
+            os.makedirs(out_dir, 0o755, exist_ok=True)
+            if gs_model_dir.strip() != "":
+                os.makedirs(gs_model_dir, 0o755, exist_ok=True)
+            logger = setup_logging(log_path)
+        except Exception:
+            logger = logging.getLogger(__name__)
+
+    if exc is None:
+        logger.info("Interrupted by user (Ctrl+C).")
+        if os.name == "nt":
+            try:
+                logger.info("Terminating all GS workers immediately on Windows.")
+            except Exception:
+                pass
+            try:
+                logging.shutdown()
+            finally:
+                os._exit(130)
+    else:
+        logger.exception(f"Error in JanusX GS pipeline: {exc}")
+
+    resource_metrics = _collect_gs_resource_metrics()
+    try:
+        _emit_gs_resource_report(logger, resource_metrics)
+        report_logger = _gs_report_logger(logger)
+        report_logger.info("")
+        _emit_report_kv(report_logger, "Total Wall Time", f"{max(time.time() - t_start, 0.0):.2f}s")
+        _emit_report_kv(
+            report_logger,
+            "Finished At",
+            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+        )
+        report_logger.info(_REPORT_RULE)
+    except Exception:
+        pass
+
+    if bool(return_result):
+        return {
+            "status": str(run_status),
+            "error": str(run_error),
+            "genofile": str(gfile),
+            "outprefix": str(outprefix),
+            "model_dir": str(gs_model_dir),
+            "summary_json": (
+                str(os.path.join(gs_model_dir, "summary.json"))
+                if gs_model_dir.strip() != ""
+                else ""
+            ),
+            "log_file": str(log_path),
+            "summary_rows": [],
+            "result_files": [],
+            "elapsed_sec": float(max(time.time() - t_start, 0.0)),
+            "traits": [],
+            "methods": [],
+            "resource": dict(resource_metrics),
+        }
+    return None
 
 
 def main(

@@ -2281,6 +2281,25 @@ impl BedSnpIter {
     }
 
     #[inline]
+    fn decode_snp_bytes_selected_counts_only_with_excluded(
+        &self,
+        snp_bytes: &[u8],
+        sample_indices: &[usize],
+        excluded_sample_indices: Option<&[usize]>,
+    ) -> DecodedSnpRowCounts {
+        if let Some(excluded_sample_indices) = excluded_sample_indices {
+            let mut counts = self.decode_snp_bytes_counts_only(snp_bytes);
+            let excluded_counts =
+                self.decode_snp_bytes_selected_counts_only(snp_bytes, excluded_sample_indices);
+            counts.alt_sum -= excluded_counts.alt_sum;
+            counts.non_missing = counts.non_missing.saturating_sub(excluded_counts.non_missing);
+            counts.het_count = counts.het_count.saturating_sub(excluded_counts.het_count);
+            return counts;
+        }
+        self.decode_snp_bytes_selected_counts_only(snp_bytes, sample_indices)
+    }
+
+    #[inline]
     fn decode_snp_bytes_stats_only(&self, snp_bytes: &[u8]) -> (f64, usize) {
         let counts = self.decode_snp_bytes_counts_only(snp_bytes);
         (counts.alt_sum, counts.non_missing)
@@ -2298,12 +2317,17 @@ impl BedSnpIter {
         &self,
         snp_idx: usize,
         sample_indices: &[usize],
+        excluded_sample_indices: Option<&[usize]>,
     ) -> Option<DecodedSnpRowCounts> {
         if snp_idx >= self.n_snps {
             return None;
         }
         let snp_bytes = self.snp_bytes(snp_idx)?;
-        Some(self.decode_snp_bytes_selected_counts_only(snp_bytes, sample_indices))
+        Some(self.decode_snp_bytes_selected_counts_only_with_excluded(
+            snp_bytes,
+            sample_indices,
+            excluded_sample_indices,
+        ))
     }
 
     /// Random-access decode for one SNP row into caller-provided buffer.

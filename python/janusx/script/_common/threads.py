@@ -232,26 +232,48 @@ def detect_thread_budget_info() -> dict[str, Any]:
 
 
 def format_thread_budget_summary(info: dict[str, Any]) -> str:
-    def _fmt(value: Any, source: Any = None) -> str:
+    def _fmt(value: Any, source: Any = None) -> str | None:
         if value is None:
-            return "NA"
+            return None
         if source is None or str(source).strip() == "":
             return str(value)
         return f"{value} [{source}]"
 
     effective_sources = info.get("effective_sources") or ()
     effective_src_text = ",".join(str(x) for x in effective_sources if str(x).strip())
-    return (
-        "scheduler total="
-        f"{_fmt(info.get('scheduler_total_threads'), info.get('scheduler_total_source'))}, "
-        "scheduler local="
-        f"{_fmt(info.get('scheduler_local_threads'), info.get('scheduler_local_source'))}, "
-        f"affinity={_fmt(info.get('affinity_threads'))}, "
-        f"cgroup={_fmt(info.get('cgroup_threads'))}, "
-        f"host_visible={_fmt(info.get('host_visible_threads'))}, "
-        "local effective="
-        f"{_fmt(info.get('effective_threads'), effective_src_text)}"
+    parts: list[str] = []
+
+    scheduler_total = _fmt(
+        info.get("scheduler_total_threads"),
+        info.get("scheduler_total_source"),
     )
+    if scheduler_total is not None:
+        parts.append(f"scheduler total={scheduler_total}")
+
+    scheduler_local = _fmt(
+        info.get("scheduler_local_threads"),
+        info.get("scheduler_local_source"),
+    )
+    if scheduler_local is not None:
+        parts.append(f"scheduler local={scheduler_local}")
+
+    affinity = _fmt(info.get("affinity_threads"))
+    if affinity is not None:
+        parts.append(f"affinity={affinity}")
+
+    cgroup = _fmt(info.get("cgroup_threads"))
+    if cgroup is not None:
+        parts.append(f"cgroup={cgroup}")
+
+    host_visible = _fmt(info.get("host_visible_threads"))
+    if host_visible is not None:
+        parts.append(f"host_visible={host_visible}")
+
+    effective = _fmt(info.get("effective_threads"), effective_src_text)
+    if effective is not None:
+        parts.append(f"local effective={effective}")
+
+    return ", ".join(parts)
 
 
 def format_affinity_cpu_summary(info: dict[str, Any]) -> str:

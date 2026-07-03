@@ -382,6 +382,7 @@ def run_chunked_gwas_lmm_lm(
                 emit_trait_header=emit_trait_header,
                 chunk_size_user_set=bool(chunk_size_user_set),
                 mmap_limit=bool(mmap_limit),
+                trait_prepared_meta=trait_prepared_meta,
             )
             return
         _log_file_only(
@@ -427,6 +428,7 @@ def run_chunked_gwas_lmm_lm(
                 mmap_limit=bool(mmap_limit),
                 model_key="lm2",
                 lm2_covariate_indices=lm2_covariate_indices,
+                trait_prepared_meta=trait_prepared_meta,
             )
             return
         _log_file_only(
@@ -540,13 +542,17 @@ def run_chunked_gwas_lmm_lm(
     # For single-model kinship models on PLINK BED input, reuse the shared
     # prepared-chunk scan bus (same Rust read-block path as multi-model mode)
     # to reduce Python per-chunk orchestration overhead.
-    if (
-        model_key in {"lmm", "lmm2", "fastlmm", "fvlmm"}
+    use_shared_prepared_bus_single = bool(
+        (
+            model_key in {"lmm", "lmm2", "fastlmm", "fvlmm"}
+            or (model_key == "lm" and trait_prepared_meta is not None)
+        )
         and has_prepared_bed_bus
         and not (model_key == "fvlmm" and fvlmm_has_dedicated_bed_fastpath)
         and not (model_key == "lmm" and lmm_has_dedicated_bed_fastpath)
         and not (model_key == "lmm2" and lmm2_has_dedicated_bed_fastpath)
-    ):
+    )
+    if use_shared_prepared_bus_single:
         _log_file_only(
             logger,
             logging.INFO,
@@ -973,19 +979,16 @@ def run_chunked_gwas_lmm_lm(
             str(effective_model_key).lower() == "fvlmm"
             and hasattr(jxrs, "fvlmm_assoc_bed_to_tsv_f32")
             and os.environ.get("JX_DISABLE_FVLMM_UNIFIED") != "1"
-            and trait_prepared_meta is None
         )
         _use_lmm_unified = (
             str(effective_model_key).lower() == "lmm"
             and hasattr(jxrs, "lmm_reml_assoc_bed_to_tsv_f32")
             and os.environ.get("JX_DISABLE_LMM_UNIFIED") != "1"
-            and trait_prepared_meta is None
         )
         _use_lmm2_unified = (
             str(effective_model_key).lower() == "lmm2"
             and hasattr(jxrs, "lmm_reml_lmm2_assoc_bed_to_tsv_f32")
             and os.environ.get("JX_DISABLE_LMM2_UNIFIED") != "1"
-            and trait_prepared_meta is None
         )
 
         def _format_chunk_tsv_text(
@@ -1155,6 +1158,33 @@ def run_chunked_gwas_lmm_lm(
                         "Rust-only GWAS scan requires PLINK BED input/prefix."
                     )
                 sample_ids = [str(s) for s in sample_sub]
+                prepared_row_indices = None
+                prepared_row_flip = None
+                prepared_row_missing = None
+                prepared_row_maf = None
+                if trait_prepared_meta is not None:
+                    prepared_row_indices = np.ascontiguousarray(
+                        np.asarray(trait_prepared_meta["row_indices"], dtype=np.int64).reshape(-1),
+                        dtype=np.int64,
+                    )
+                    prepared_row_flip = np.ascontiguousarray(
+                        np.asarray(trait_prepared_meta["row_flip"], dtype=np.bool_).reshape(-1),
+                        dtype=np.bool_,
+                    )
+                    prepared_row_missing = np.ascontiguousarray(
+                        np.asarray(
+                            trait_prepared_meta.get(
+                                "missing_count",
+                                trait_prepared_meta["missing_rate"],
+                            ),
+                            dtype=np.float32,
+                        ).reshape(-1),
+                        dtype=np.float32,
+                    )
+                    prepared_row_maf = np.ascontiguousarray(
+                        np.asarray(trait_prepared_meta["maf"], dtype=np.float32).reshape(-1),
+                        dtype=np.float32,
+                    )
                 rows_written, _pve, _log_det_v = jxrs.fvlmm_assoc_bed_to_tsv_f32(
                     bed_prefix=str(bed_prefix),
                     out_tsv=str(tmp_tsv),
@@ -1169,6 +1199,10 @@ def run_chunked_gwas_lmm_lm(
                     genetic_model=str(genetic_model),
                     snps_only=bool(snps_only),
                     sample_ids=sample_ids,
+                    row_indices=prepared_row_indices,
+                    row_flip=prepared_row_flip,
+                    row_missing=prepared_row_missing,
+                    row_maf=prepared_row_maf,
                     threads=int(scan_threads),
                     nullml=mod.ML0,
                     rotate_block_rows=int(model_chunk_size),
@@ -1201,6 +1235,33 @@ def run_chunked_gwas_lmm_lm(
                         "Rust-only GWAS scan requires PLINK BED input/prefix."
                     )
                 sample_ids = [str(s) for s in sample_sub]
+                prepared_row_indices = None
+                prepared_row_flip = None
+                prepared_row_missing = None
+                prepared_row_maf = None
+                if trait_prepared_meta is not None:
+                    prepared_row_indices = np.ascontiguousarray(
+                        np.asarray(trait_prepared_meta["row_indices"], dtype=np.int64).reshape(-1),
+                        dtype=np.int64,
+                    )
+                    prepared_row_flip = np.ascontiguousarray(
+                        np.asarray(trait_prepared_meta["row_flip"], dtype=np.bool_).reshape(-1),
+                        dtype=np.bool_,
+                    )
+                    prepared_row_missing = np.ascontiguousarray(
+                        np.asarray(
+                            trait_prepared_meta.get(
+                                "missing_count",
+                                trait_prepared_meta["missing_rate"],
+                            ),
+                            dtype=np.float32,
+                        ).reshape(-1),
+                        dtype=np.float32,
+                    )
+                    prepared_row_maf = np.ascontiguousarray(
+                        np.asarray(trait_prepared_meta["maf"], dtype=np.float32).reshape(-1),
+                        dtype=np.float32,
+                    )
                 null_ml0: Optional[float] = None
                 init_log10_lbd: Optional[float] = None
                 try:
@@ -1236,6 +1297,10 @@ def run_chunked_gwas_lmm_lm(
                     genetic_model=str(genetic_model),
                     snps_only=bool(snps_only),
                     sample_ids=sample_ids,
+                    row_indices=prepared_row_indices,
+                    row_flip=prepared_row_flip,
+                    row_missing=prepared_row_missing,
+                    row_maf=prepared_row_maf,
                     low=float(lmm_low),
                     high=float(lmm_high),
                     # Match LMM.gwas()/lmm_reml_from_snp legacy scan defaults.
@@ -1276,6 +1341,33 @@ def run_chunked_gwas_lmm_lm(
                         "Rust-only GWAS scan requires PLINK BED input/prefix."
                     )
                 sample_ids = [str(s) for s in sample_sub]
+                prepared_row_indices = None
+                prepared_row_flip = None
+                prepared_row_missing = None
+                prepared_row_maf = None
+                if trait_prepared_meta is not None:
+                    prepared_row_indices = np.ascontiguousarray(
+                        np.asarray(trait_prepared_meta["row_indices"], dtype=np.int64).reshape(-1),
+                        dtype=np.int64,
+                    )
+                    prepared_row_flip = np.ascontiguousarray(
+                        np.asarray(trait_prepared_meta["row_flip"], dtype=np.bool_).reshape(-1),
+                        dtype=np.bool_,
+                    )
+                    prepared_row_missing = np.ascontiguousarray(
+                        np.asarray(
+                            trait_prepared_meta.get(
+                                "missing_count",
+                                trait_prepared_meta["missing_rate"],
+                            ),
+                            dtype=np.float32,
+                        ).reshape(-1),
+                        dtype=np.float32,
+                    )
+                    prepared_row_maf = np.ascontiguousarray(
+                        np.asarray(trait_prepared_meta["maf"], dtype=np.float32).reshape(-1),
+                        dtype=np.float32,
+                    )
                 null_ml0: Optional[float] = None
                 init_log10_lbd_reml: Optional[float] = None
                 init_log10_lbd_ml: Optional[float] = None
@@ -1318,6 +1410,10 @@ def run_chunked_gwas_lmm_lm(
                     genetic_model=str(genetic_model),
                     snps_only=bool(snps_only),
                     sample_ids=sample_ids,
+                    row_indices=prepared_row_indices,
+                    row_flip=prepared_row_flip,
+                    row_missing=prepared_row_missing,
+                    row_maf=prepared_row_maf,
                     low=float(lmm_low),
                     high=float(lmm_high),
                     max_iter=30,

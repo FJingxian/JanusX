@@ -2028,6 +2028,286 @@ fn lm_stream_bed_segments_compact_windowed_unified(
     Ok((kept_total, n_snps))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn lm_stream_bed_additive_prepared_unified(
+    norm_prefix: &str,
+    qr_ctx: &LmQrProjection,
+    rhs_add_f32: &[f32],
+    out_tsv_path: &str,
+    sample_indices: &[usize],
+    prepared_meta_input: (Vec<i64>, Vec<bool>, Vec<f32>, Vec<f32>),
+    chunk_size: usize,
+    threads: usize,
+    progress_callback: Option<&Py<PyAny>>,
+    progress_every: usize,
+    mmap_window_mb: Option<usize>,
+) -> Result<(usize, usize), String> {
+    let n = qr_ctx.n;
+    if sample_indices.len() != n {
+        return Err(format!(
+            "sample_ids length mismatch: selected n={} but len(y)={n}",
+            sample_indices.len()
+        ));
+    }
+    let q_rank = qr_ctx.rank;
+    let rhs_add_cols = q_rank.saturating_add(1);
+    let (row_idx64, row_flip, row_missing, row_maf) = prepared_meta_input;
+    let m = row_idx64.len();
+    if row_flip.len() != m || row_missing.len() != m || row_maf.len() != m {
+        return Err(format!(
+            "prepared row metadata length mismatch: row_indices={m}, row_flip={}, row_missing={}, row_maf={}",
+            row_flip.len(),
+            row_missing.len(),
+            row_maf.len(),
+        ));
+    }
+
+    let full_samples = gfcore::read_fam(norm_prefix)?;
+    let n_samples_full = full_samples.len();
+    if n_samples_full == 0 {
+        return Err("no samples in PLINK FAM".to_string());
+    }
+    if let Some(max_sid) = sample_indices.iter().copied().max() {
+        if max_sid >= n_samples_full {
+            return Err(format!(
+                "sample index {max_sid} out of bounds for {n_samples_full} BED samples"
+            ));
+        }
+    }
+    let bytes_per_snp = (n_samples_full + 3) / 4;
+    if bytes_per_snp == 0 {
+        return Err("bytes_per_snp is zero".to_string());
+    }
+    let bed_path = format!("{norm_prefix}.bed");
+    let mut bed_window = if let Some(window_mb) = mmap_window_mb.filter(|&v| v > 0) {
+        Some(WindowedBedMatrix::open(norm_prefix, window_mb)?)
+    } else {
+        None
+    };
+    let full_mmap = if bed_window.is_none() {
+        let bed_file = File::open(&bed_path).map_err(|e| format!("open {bed_path}: {e}"))?;
+        let mmap = unsafe { Mmap::map(&bed_file) }.map_err(|e| format!("mmap {bed_path}: {e}"))?;
+        if mmap.len() < 3 || mmap[0] != 0x6C || mmap[1] != 0x1B || mmap[2] != 0x01 {
+            return Err("Only SNP-major BED supported".to_string());
+        }
+        let data_len = mmap.len() - 3;
+        if data_len % bytes_per_snp != 0 {
+            return Err(format!(
+                "BED payload length {data_len} not a multiple of {bytes_per_snp}"
+            ));
+        }
+        Some(mmap)
+    } else {
+        None
+    };
+    let n_snps = if let Some(window) = bed_window.as_ref() {
+        window.n_source_snps()
+    } else {
+        let mmap = full_mmap
+            .as_ref()
+            .ok_or_else(|| "internal error: missing BED source".to_string())?;
+        (mmap.len() - 3) / bytes_per_snp
+    };
+    let source_rows = parse_index_vec_i64(row_idx64.as_slice(), n_snps, "row_indices")
+        .map_err(|e| e.to_string())?;
+    let mut prev_src: Option<usize> = None;
+    for &src_row in source_rows.iter() {
+        if let Some(prev) = prev_src {
+            if src_row < prev {
+                return Err("prepared row_indices must be sorted in ascending BED order".to_string());
+            }
+        }
+        prev_src = Some(src_row);
+    }
+    let total_scan_units = source_rows.len();
+
+    let decode_plan = AdditiveDecodePlan::from_sample_indices(n_samples_full, sample_indices);
+    let sample_identity = decode_plan.sample_identity();
+
+    let pool = get_cached_pool(threads).map_err(|e| e.to_string())?;
+    let scan_block_rows =
+        adaptive_grm_block_rows(chunk_size.max(512), total_scan_units, n, 0usize, threads).max(1);
+    let progress_block = if progress_every == 0 {
+        scan_block_rows.max(1)
+    } else {
+        progress_every.max(1)
+    };
+    let output_row_limit = lm_max_output_rows_env();
+    let mut written_total = 0usize;
+    let code4_lut = &packed_byte_lut().code4;
+    let lm_parallel_rhs =
+        lm_prefer_parallel_small_rhs(scan_block_rows.max(1), n, rhs_add_cols, pool.as_ref());
+    let blas_threads = if lm_parallel_rhs || rust_sgemm_prefers_rayon_rowmajor_f32_kernel() {
+        1usize
+    } else {
+        threads.max(1)
+    };
+    let _blas_guard = BlasThreadGuard::enter(blas_threads);
+    let writer = AsyncTsvWriter::with_config(
+        out_tsv_path,
+        b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\n",
+        64 * 1024 * 1024,
+        16,
+    )?;
+    let mut bim_reader = BimChunkReader::open(norm_prefix)?;
+    let mut block = vec![0.0_f32; scan_block_rows * n];
+    let mut gy_block = vec![0.0_f64; scan_block_rows];
+    let mut xts_block = vec![0.0_f32; scan_block_rows * rhs_add_cols.max(1)];
+    let mut row_ss = vec![0.0_f64; scan_block_rows];
+    let mut out_buf = vec![0.0_f64; scan_block_rows * 5];
+    let mut xts_tmp = vec![0.0_f64; q_rank.max(1)];
+    let mut text = String::with_capacity(scan_block_rows * 112);
+    let mut rel_row_indices = Vec::<usize>::with_capacity(scan_block_rows);
+    let mut contig_row_indices = Vec::<usize>::with_capacity(scan_block_rows);
+    let mut row_start = 0usize;
+    let mut next_progress_emit = progress_block.min(total_scan_units).max(1);
+    let mut kept_total = 0usize;
+
+    while row_start < total_scan_units {
+        let row_end = (row_start + scan_block_rows).min(total_scan_units);
+        let rows_here = row_end - row_start;
+        let source_rows_batch = &source_rows[row_start..row_end];
+        let row_flip_batch = &row_flip[row_start..row_end];
+        let row_maf_batch = &row_maf[row_start..row_end];
+        let row_missing_batch = &row_missing[row_start..row_end];
+        let chunk_sites = bim_reader.read_selected_rows(source_rows_batch)?;
+
+        let (chunk_packed, local_row_indices): (&[u8], &[usize]) = match bed_window.as_mut() {
+            Some(window) => {
+                let slice = window.prepare_source_rows(source_rows_batch, &mut rel_row_indices)?;
+                (slice, rel_row_indices.as_slice())
+            }
+            None => {
+                let mmap = full_mmap
+                    .as_ref()
+                    .ok_or_else(|| "internal error: missing full BED mmap".to_string())?;
+                let packed = &mmap[3..];
+                let src_start = source_rows_batch[0];
+                let src_end = source_rows_batch[source_rows_batch.len() - 1] + 1;
+                let start_byte = src_start * bytes_per_snp;
+                let end_byte = src_end * bytes_per_snp;
+                contig_row_indices.clear();
+                contig_row_indices.extend(
+                    source_rows_batch
+                        .iter()
+                        .map(|&src_row| src_row.saturating_sub(src_start)),
+                );
+                (&packed[start_byte..end_byte], contig_row_indices.as_slice())
+            }
+        };
+
+        let block_slice = &mut block[..rows_here * n];
+        let gy_slice = &mut gy_block[..rows_here];
+        let xts_slice = &mut xts_block[..rows_here * rhs_add_cols];
+        let ss_slice = &mut row_ss[..rows_here];
+        let out_slice = &mut out_buf[..rows_here * 5];
+        decode_mean_imputed_additive_packed_block_rows_f32(
+            chunk_packed,
+            bytes_per_snp,
+            n_samples_full,
+            row_flip_batch,
+            row_maf_batch,
+            sample_indices,
+            sample_identity,
+            Some(local_row_indices),
+            0,
+            block_slice,
+            code4_lut,
+            pool.as_ref(),
+        )?;
+        row_major_block_mul_mat_f32_lm(
+            block_slice,
+            rows_here,
+            n,
+            rhs_add_f32,
+            rhs_add_cols,
+            xts_slice,
+            pool.as_ref(),
+        );
+        row_major_block_first_col_f32_to_f64(
+            xts_slice,
+            rows_here,
+            rhs_add_cols,
+            gy_slice,
+            pool.as_ref(),
+        );
+        row_major_block_sumsq_f64(block_slice, rows_here, n, ss_slice, pool.as_ref());
+        for local_idx in 0..rows_here {
+            let xts_row =
+                &xts_slice[local_idx * rhs_add_cols + 1..local_idx * rhs_add_cols + 1 + q_rank];
+            for j in 0..q_rank {
+                xts_tmp[j] = xts_row[j] as f64;
+            }
+            let stats = lm_assoc_from_qr_projection_raw(
+                &xts_tmp[..q_rank],
+                gy_slice[local_idx],
+                ss_slice[local_idx],
+                qr_ctx,
+            );
+            out_slice[local_idx * 5..(local_idx + 1) * 5].copy_from_slice(&stats);
+        }
+
+        let write_rows = output_row_limit
+            .map(|limit| limit.saturating_sub(written_total).min(rows_here))
+            .unwrap_or(rows_here);
+        if write_rows > 0 {
+            text.clear();
+            let miss_counts: Vec<i64> = row_missing_batch[..write_rows]
+                .iter()
+                .map(|&v| v.round() as i64)
+                .collect();
+            append_assoc_block_from_core_sites(
+                &mut text,
+                AssocResultLayout::PrecomputedChisqBasic3 {
+                    row_stride: 5,
+                    beta_col: 0,
+                    se_col: 1,
+                    chisq_col: 2,
+                    raw_p_col: 3,
+                },
+                "add",
+                AssocCoreSitesBlock {
+                    sites: &chunk_sites[..write_rows],
+                    maf: &row_maf_batch[..write_rows],
+                    miss: AssocMissBlock::CountI64(miss_counts.as_slice()),
+                },
+                &out_slice[..write_rows * 5],
+            )?;
+            send_text_buf(&writer, &mut text)?;
+            written_total = written_total.saturating_add(write_rows);
+        }
+
+        if let Some(cb) = progress_callback {
+            if row_end >= next_progress_emit || row_end == total_scan_units {
+                while next_progress_emit <= row_end {
+                    next_progress_emit = next_progress_emit.saturating_add(progress_block);
+                    if next_progress_emit == 0 {
+                        break;
+                    }
+                }
+                let done_now = row_end.min(total_scan_units);
+                let _ = Python::attach(|py2| -> PyResult<()> {
+                    py2.check_signals()?;
+                    cb.call1(py2, (done_now, total_scan_units))?;
+                    Ok(())
+                });
+            }
+        }
+        kept_total = kept_total.saturating_add(rows_here);
+        row_start = row_end;
+    }
+
+    if let Some(cb) = progress_callback {
+        let _ = Python::attach(|py2| -> PyResult<()> {
+            py2.check_signals()?;
+            cb.call1(py2, (total_scan_units, total_scan_units))?;
+            Ok(())
+        });
+    }
+    writer.finish()?;
+    Ok((kept_total, total_scan_units))
+}
+
 /// End-to-end LM streaming scan on PLINK BED:
 /// read BED chunk -> per-row filter/model/center -> parallel LM assoc -> write TSV
 #[pyfunction]
@@ -2038,6 +2318,10 @@ fn lm_stream_bed_segments_compact_windowed_unified(
     ixx,
     out_tsv,
     sample_ids=None,
+    row_indices=None,
+    row_flip=None,
+    row_missing=None,
+    row_maf=None,
     maf_threshold=0.0,
     max_missing_rate=1.0,
     genetic_model="add",
@@ -2057,6 +2341,10 @@ pub fn lm_stream_bed_to_tsv(
     ixx: Option<PyReadonlyArray2<'_, f64>>,
     out_tsv: String,
     sample_ids: Option<Vec<String>>,
+    row_indices: Option<PyReadonlyArray1<'_, i64>>,
+    row_flip: Option<PyReadonlyArray1<'_, bool>>,
+    row_missing: Option<PyReadonlyArray1<'_, f32>>,
+    row_maf: Option<PyReadonlyArray1<'_, f32>>,
     maf_threshold: f32,
     max_missing_rate: f32,
     genetic_model: &str,
@@ -2140,9 +2428,65 @@ pub fn lm_stream_bed_to_tsv(
     } else {
         None
     };
+    let prepared_meta_input = match (row_indices, row_flip, row_missing, row_maf) {
+        (None, None, None, None) => None,
+        (Some(row_idx), Some(row_flip), Some(row_missing), Some(row_maf)) => {
+            let row_idx_vec = row_idx.as_slice()?.to_vec();
+            let row_flip_vec = match row_flip.as_slice() {
+                Ok(slc) => slc.to_vec(),
+                Err(_) => row_flip.as_array().iter().copied().collect(),
+            };
+            let row_missing_vec = match row_missing.as_slice() {
+                Ok(slc) => slc.to_vec(),
+                Err(_) => row_missing.as_array().iter().copied().collect(),
+            };
+            let row_maf_vec = match row_maf.as_slice() {
+                Ok(slc) => slc.to_vec(),
+                Err(_) => row_maf.as_array().iter().copied().collect(),
+            };
+            Some((row_idx_vec, row_flip_vec, row_missing_vec, row_maf_vec))
+        }
+        _ => {
+            return Err(PyRuntimeError::new_err(
+                "prepared row metadata must provide all or none of: row_indices, row_flip, row_missing, row_maf",
+            ))
+        }
+    };
 
     let norm_prefix = normalize_plink_prefix_local(&prefix);
     if additive_model {
+        if let Some(prepared_meta_input) = prepared_meta_input {
+            let samples = gfcore::read_fam(&norm_prefix).map_err(PyRuntimeError::new_err)?;
+            let (sample_indices, _sample_ids_ordered) =
+                build_sample_selection(&samples, sample_ids, None)
+                    .map_err(PyRuntimeError::new_err)?;
+            if sample_indices.len() != n {
+                return Err(PyRuntimeError::new_err(format!(
+                    "sample_ids length mismatch: selected n={} but len(y)={n}",
+                    sample_indices.len()
+                )));
+            }
+            let out_tsv_path = out_tsv.clone();
+            return py.detach(move || -> PyResult<(usize, usize)> {
+                lm_stream_bed_additive_prepared_unified(
+                    norm_prefix.as_str(),
+                    &qr_ctx,
+                    rhs_add_f32
+                        .as_ref()
+                        .expect("additive RHS missing")
+                        .as_slice(),
+                    out_tsv_path.as_str(),
+                    sample_indices.as_slice(),
+                    prepared_meta_input,
+                    chunk_size,
+                    threads,
+                    progress_callback.as_ref(),
+                    progress_every,
+                    mmap_window_mb,
+                )
+                .map_err(PyRuntimeError::new_err)
+            });
+        }
         if let Some(window_mb) = mmap_window_mb {
             let samples = gfcore::read_fam(&norm_prefix).map_err(PyRuntimeError::new_err)?;
             let (sample_indices, _sample_ids_ordered) =

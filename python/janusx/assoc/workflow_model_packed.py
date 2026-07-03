@@ -8,6 +8,7 @@ import gc
 import hashlib
 import logging
 import os
+import struct
 import time
 import uuid
 import json
@@ -23,10 +24,16 @@ from janusx.script._common.memory import (
     resolve_decode_mmap_window_mb as _common_resolve_decode_mmap_window_mb,
 )
 from janusx.script._common.genoio import (
+    inspect_genotype_file,
+    open_plink_bed_payload_memmap,
     packed_preload_is_disabled,
     packed_preload_is_ready,
     packed_preload_reason,
     prepare_packed_ctx_from_plink,
+    _scan_bed_2bit_packed_stats_fallback,
+    normalize_plink_prefix,
+    plink_snp_mask,
+    scan_bed_2bit_packed_stats,
 )
 
 from .workflow import (
@@ -86,6 +93,9 @@ _SPLMM_SPARSE_REML_GRID_SIZE = 17
 _SPLMM_SPARSE_REML_MAX_ITER = 20
 _SPLMM_SPGRM_SINGLE_BLOCK_N_MAX = 2048
 _SPLMM_META_CACHE_VERSION = 1
+_SCANMETA_CACHE_MAGIC = b"JXSMETA\0"
+_SCANMETA_CACHE_VERSION = 1
+_SCANMETA_HEADER_PREFIX = struct.Struct("<8sII")
 
 
 def _current_bed_memory_mb() -> float:
@@ -301,9 +311,44 @@ def _splmm_meta_cache_prefix_for_gwas(
     return os.path.join(fallback_root, desired_base).replace("\\", "/")
 
 
+def _gwas_global_meta_cache_prefix(
+    prefix: str,
+    *,
+    maf_threshold: float,
+    max_missing_rate: float,
+    het_threshold: float,
+    snps_only: bool,
+    outprefix: Optional[str] = None,
+    logger: Optional[logging.Logger] = None,
+) -> str:
+    cache_tag = _splmm_meta_cache_tag(
+        maf_threshold=float(maf_threshold),
+        max_missing_rate=float(max_missing_rate),
+        het_threshold=float(het_threshold),
+        snps_only=bool(snps_only),
+    )
+    desired = f"{prefix}.gwas.scanmeta.global{cache_tag}"
+    desired_dir = os.path.abspath(os.path.dirname(str(desired)) or ".")
+    if _is_writable_dir(desired_dir):
+        return str(desired)
+    cache_dir = None
+    if outprefix is not None and str(outprefix).strip() != "":
+        cache_dir = os.path.abspath(os.path.dirname(str(outprefix)))
+    fallback_root = _resolve_gwas_cache_dir(
+        str(prefix),
+        cache_dir=cache_dir,
+        logger=logger,
+    )
+    desired_base = os.path.basename(str(desired).rstrip("/\\"))
+    if desired_base == "":
+        desired_base = os.path.basename(str(prefix).rstrip("/\\")) or "gwas_scanmeta"
+    return os.path.join(fallback_root, desired_base).replace("\\", "/")
+
+
 def _splmm_meta_cache_paths(cache_prefix: str) -> dict[str, str]:
     stem = f"{cache_prefix}.scanmeta"
     return {
+        "cache": f"{stem}.cache",
         "json": f"{stem}.json",
         "row_idx": f"{stem}.row_idx.npy",
         "miss": f"{stem}.miss.npy",
@@ -311,6 +356,10 @@ def _splmm_meta_cache_paths(cache_prefix: str) -> dict[str, str]:
         "row_flip": f"{stem}.row_flip.npy",
         "site_keep": f"{stem}.site_keep.npy",
     }
+
+
+def _scanmeta_single_cache_path(cache_prefix: str) -> str:
+    return _splmm_meta_cache_paths(str(cache_prefix))["cache"]
 
 
 def _atomic_save_npy_local(path: str, arr: np.ndarray) -> None:
@@ -325,6 +374,122 @@ def _atomic_save_json_local(path: str, payload: dict[str, object]) -> None:
         json.dump(payload, fh, ensure_ascii=True, sort_keys=True)
         fh.write("\n")
     os.replace(tmp, path)
+
+
+def _atomic_save_scanmeta_cache_local(
+    path: str,
+    *,
+    header: dict[str, object],
+    row_idx: np.ndarray,
+    miss: np.ndarray,
+    maf: np.ndarray,
+    row_flip: np.ndarray,
+) -> None:
+    tmp = f"{path}.tmp.{os.getpid()}.{uuid.uuid4().hex}.cache"
+    header_raw = json.dumps(header, ensure_ascii=True, sort_keys=True).encode("utf-8")
+    row_idx_arr = np.ascontiguousarray(np.asarray(row_idx, dtype=np.int64).reshape(-1), dtype=np.int64)
+    miss_arr = np.ascontiguousarray(np.asarray(miss, dtype=np.float32).reshape(-1), dtype=np.float32)
+    maf_arr = np.ascontiguousarray(np.asarray(maf, dtype=np.float32).reshape(-1), dtype=np.float32)
+    row_flip_arr = np.ascontiguousarray(
+        np.asarray(row_flip, dtype=np.bool_).reshape(-1).astype(np.uint8, copy=False),
+        dtype=np.uint8,
+    )
+    with open(tmp, "wb") as fh:
+        fh.write(
+            _SCANMETA_HEADER_PREFIX.pack(
+                _SCANMETA_CACHE_MAGIC,
+                int(_SCANMETA_CACHE_VERSION),
+                int(len(header_raw)),
+            )
+        )
+        fh.write(header_raw)
+        fh.write(row_idx_arr.tobytes(order="C"))
+        fh.write(miss_arr.tobytes(order="C"))
+        fh.write(maf_arr.tobytes(order="C"))
+        fh.write(row_flip_arr.tobytes(order="C"))
+    os.replace(tmp, path)
+
+
+def _read_exact_bytes(fh, n_bytes: int) -> bytes:
+    buf = fh.read(int(n_bytes))
+    if len(buf) != int(n_bytes):
+        raise EOFError(f"expected {int(n_bytes)} bytes, got {len(buf)}")
+    return buf
+
+
+def _load_scanmeta_single_cache(
+    *,
+    cache_path: str,
+    spec: dict[str, object],
+) -> Optional[dict[str, object]]:
+    if not os.path.isfile(cache_path):
+        return None
+    try:
+        with open(cache_path, "rb") as fh:
+            prefix_raw = fh.read(_SCANMETA_HEADER_PREFIX.size)
+            if len(prefix_raw) != _SCANMETA_HEADER_PREFIX.size:
+                return None
+            magic, cache_version, header_len = _SCANMETA_HEADER_PREFIX.unpack(prefix_raw)
+            if magic != _SCANMETA_CACHE_MAGIC:
+                return None
+            if int(cache_version) != int(_SCANMETA_CACHE_VERSION):
+                return None
+            if int(header_len) <= 0:
+                return None
+            header = json.loads(_read_exact_bytes(fh, int(header_len)).decode("utf-8"))
+            if int(header.get("version", -1)) != int(_SCANMETA_CACHE_VERSION):
+                return None
+            if header.get("spec") != spec:
+                return None
+            source_prefix = str(spec.get("source_prefix", ""))
+            current_mtime = latest_genotype_mtime(source_prefix) if source_prefix != "" else None
+            cached_mtime = header.get("source_mtime", None)
+            if (
+                current_mtime is not None
+                and cached_mtime is not None
+                and float(current_mtime) != float(cached_mtime)
+            ):
+                return None
+            n_active = int(header.get("n_active_sites", 0) or 0)
+            n_samples_full = int(header.get("n_samples_full", 0) or 0)
+            n_snps_total = int(header.get("n_snps_total", 0) or 0)
+            row_idx = np.frombuffer(
+                _read_exact_bytes(fh, int(n_active) * np.dtype(np.int64).itemsize),
+                dtype=np.int64,
+            ).copy()
+            miss = np.frombuffer(
+                _read_exact_bytes(fh, int(n_active) * np.dtype(np.float32).itemsize),
+                dtype=np.float32,
+            ).copy()
+            maf = np.frombuffer(
+                _read_exact_bytes(fh, int(n_active) * np.dtype(np.float32).itemsize),
+                dtype=np.float32,
+            ).copy()
+            row_flip = np.frombuffer(
+                _read_exact_bytes(fh, int(n_active)),
+                dtype=np.uint8,
+            ).copy()
+            if len(fh.read(1)) != 0:
+                return None
+    except Exception:
+        return None
+    if (
+        int(row_idx.shape[0]) != int(n_active)
+        or int(miss.shape[0]) != int(n_active)
+        or int(maf.shape[0]) != int(n_active)
+        or int(row_flip.shape[0]) != int(n_active)
+    ):
+        return None
+    return {
+        "row_indices": np.ascontiguousarray(row_idx, dtype=np.int64),
+        "missing_rate": np.ascontiguousarray(miss, dtype=np.float32),
+        "af": np.ascontiguousarray(maf, dtype=np.float32),
+        "maf": np.ascontiguousarray(maf, dtype=np.float32),
+        "row_flip": np.ascontiguousarray((row_flip != 0), dtype=np.bool_),
+        "site_keep": None,
+        "n_samples_full": int(n_samples_full),
+        "n_snps_total": int(n_snps_total),
+    }
 
 
 def _splmm_meta_cache_spec(
@@ -351,11 +516,37 @@ def _splmm_meta_cache_spec(
     }
 
 
+def _gwas_global_meta_cache_spec(
+    *,
+    prefix: str,
+    maf_threshold: float,
+    max_missing_rate: float,
+    het_threshold: float,
+    snps_only: bool,
+) -> dict[str, object]:
+    return {
+        "source_prefix": os.path.normpath(str(prefix)),
+        "scope": "global",
+        "maf_threshold": float(maf_threshold),
+        "max_missing_rate": float(max_missing_rate),
+        "het_threshold": float(het_threshold),
+        "snps_only": bool(snps_only),
+    }
+
+
 def _load_splmm_meta_cache(
     *,
     cache_prefix: str,
     spec: dict[str, object],
 ) -> Optional[dict[str, object]]:
+    cache_path = _scanmeta_single_cache_path(str(cache_prefix))
+    cached_single = _load_scanmeta_single_cache(
+        cache_path=str(cache_path),
+        spec=spec,
+    )
+    if cached_single is not None:
+        return cached_single
+
     paths = _splmm_meta_cache_paths(str(cache_prefix))
     required = (
         paths["json"],
@@ -363,7 +554,6 @@ def _load_splmm_meta_cache(
         paths["miss"],
         paths["maf"],
         paths["row_flip"],
-        paths["site_keep"],
     )
     if not all(os.path.isfile(p) for p in required):
         return None
@@ -401,12 +591,17 @@ def _load_splmm_meta_cache(
             np.asarray(np.load(paths["row_flip"]), dtype=np.bool_).reshape(-1),
             dtype=np.bool_,
         )
-        site_keep = np.ascontiguousarray(
-            np.asarray(np.load(paths["site_keep"]), dtype=np.bool_).reshape(-1),
-            dtype=np.bool_,
-        )
     except Exception:
         return None
+    site_keep = None
+    if os.path.isfile(paths["site_keep"]):
+        try:
+            site_keep = np.ascontiguousarray(
+                np.asarray(np.load(paths["site_keep"]), dtype=np.bool_).reshape(-1),
+                dtype=np.bool_,
+            )
+        except Exception:
+            site_keep = None
     n_rows = int(row_idx.shape[0])
     if (
         int(miss.shape[0]) != n_rows
@@ -414,6 +609,12 @@ def _load_splmm_meta_cache(
         or int(row_flip.shape[0]) != n_rows
     ):
         return None
+    if site_keep is not None:
+        n_snps_total = int(meta_info.get("n_snps_total", int(site_keep.shape[0])) or 0)
+        if int(site_keep.shape[0]) != n_snps_total:
+            site_keep = None
+    else:
+        n_snps_total = int(meta_info.get("n_snps_total", 0) or 0)
     return {
         "row_indices": row_idx,
         "missing_rate": miss,
@@ -422,7 +623,7 @@ def _load_splmm_meta_cache(
         "row_flip": row_flip,
         "site_keep": site_keep,
         "n_samples_full": int(meta_info.get("n_samples_full", 0) or 0),
-        "n_snps_total": int(meta_info.get("n_snps_total", int(site_keep.shape[0])) or 0),
+        "n_snps_total": n_snps_total,
     }
 
 
@@ -432,22 +633,37 @@ def _save_splmm_meta_cache(
     spec: dict[str, object],
     meta: dict[str, object],
 ) -> None:
-    paths = _splmm_meta_cache_paths(str(cache_prefix))
-    _atomic_save_npy_local(paths["row_idx"], np.asarray(meta["row_indices"], dtype=np.int64))
-    _atomic_save_npy_local(paths["miss"], np.asarray(meta["missing_rate"], dtype=np.float32))
-    _atomic_save_npy_local(paths["maf"], np.asarray(meta["maf"], dtype=np.float32))
-    _atomic_save_npy_local(paths["row_flip"], np.asarray(meta["row_flip"], dtype=np.bool_))
-    _atomic_save_npy_local(paths["site_keep"], np.asarray(meta["site_keep"], dtype=np.bool_))
-    _atomic_save_json_local(
-        paths["json"],
-        {
-            "version": int(_SPLMM_META_CACHE_VERSION),
+    cache_path = _scanmeta_single_cache_path(str(cache_prefix))
+    row_idx = np.ascontiguousarray(
+        np.asarray(meta["row_indices"], dtype=np.int64).reshape(-1),
+        dtype=np.int64,
+    )
+    miss = np.ascontiguousarray(
+        np.asarray(meta["missing_rate"], dtype=np.float32).reshape(-1),
+        dtype=np.float32,
+    )
+    maf = np.ascontiguousarray(
+        np.asarray(meta["maf"], dtype=np.float32).reshape(-1),
+        dtype=np.float32,
+    )
+    row_flip = np.ascontiguousarray(
+        np.asarray(meta["row_flip"], dtype=np.bool_).reshape(-1),
+        dtype=np.bool_,
+    )
+    _atomic_save_scanmeta_cache_local(
+        str(cache_path),
+        header={
+            "version": int(_SCANMETA_CACHE_VERSION),
             "spec": spec,
             "source_mtime": latest_genotype_mtime(str(spec["source_prefix"])),
             "n_samples_full": int(meta.get("n_samples_full", 0) or 0),
             "n_snps_total": int(meta.get("n_snps_total", 0) or 0),
-            "n_active_sites": int(np.asarray(meta["row_indices"]).reshape(-1).shape[0]),
+            "n_active_sites": int(row_idx.shape[0]),
         },
+        row_idx=row_idx,
+        miss=miss,
+        maf=maf,
+        row_flip=row_flip,
     )
 
 
@@ -586,7 +802,7 @@ def _ensure_splmm_sparse_grm(
                 f"Loading sparse GRM from {src}...",
                 enabled=bool(use_spinner),
             ) as task:
-                task.complete(f"Loading sparse GRM from {src} ...Finished")
+                task.complete(f"Loading sparse GRM from {src}...")
             _log_file_only(
                 logger,
                 logging.INFO,
@@ -671,10 +887,6 @@ def _ensure_splmm_sparse_grm(
         if d > last_done:
             pbar.update(d - last_done)
             last_done = d
-        try:
-            pbar.set_postfix(memory=f"{psutil.Process().memory_info().rss / 1024**3:.2f} GB")
-        except Exception:
-            pass
 
     build_ok = False
     build_result = None
@@ -852,6 +1064,7 @@ def _splmm_bed_logic_meta_selected_cached(
     outprefix: Optional[str] = None,
     logger: Optional[logging.Logger] = None,
     threads: Optional[int] = None,
+    use_cache: bool = False,
 ) -> dict[str, object]:
     sample_idx = np.ascontiguousarray(
         np.asarray(sample_indices, dtype=np.int64).reshape(-1),
@@ -859,6 +1072,17 @@ def _splmm_bed_logic_meta_selected_cached(
     )
     if int(sample_idx.shape[0]) == 0:
         raise ValueError("SparseLMM metadata cache sample subset must not be empty.")
+    if not bool(use_cache):
+        return _splmm_bed_logic_meta_selected(
+            str(prefix),
+            sample_indices=sample_idx,
+            maf_threshold=float(maf_threshold),
+            max_missing_rate=float(max_missing_rate),
+            het_threshold=float(het_threshold),
+            snps_only=bool(snps_only),
+            mmap_window_mb=mmap_window_mb,
+            threads=threads,
+        )
     spec = _splmm_meta_cache_spec(
         prefix=str(prefix),
         sample_indices=sample_idx,
@@ -877,12 +1101,33 @@ def _splmm_bed_logic_meta_selected_cached(
         outprefix=outprefix,
         logger=logger,
     )
+    cache_path = _scanmeta_single_cache_path(str(cache_prefix))
     cached = _load_splmm_meta_cache(cache_prefix=str(cache_prefix), spec=spec)
     if cached is not None:
+        if not os.path.isfile(cache_path):
+            with _cache_lock(str(cache_prefix)):
+                if not os.path.isfile(cache_path):
+                    try:
+                        _save_splmm_meta_cache(
+                            cache_prefix=str(cache_prefix),
+                            spec=spec,
+                            meta=cached,
+                        )
+                    except Exception:
+                        pass
         return cached
     with _cache_lock(str(cache_prefix)):
         cached = _load_splmm_meta_cache(cache_prefix=str(cache_prefix), spec=spec)
         if cached is not None:
+            if not os.path.isfile(cache_path):
+                try:
+                    _save_splmm_meta_cache(
+                        cache_prefix=str(cache_prefix),
+                        spec=spec,
+                        meta=cached,
+                    )
+                except Exception:
+                    pass
             return cached
         built = _splmm_bed_logic_meta_selected(
             str(prefix),
@@ -903,6 +1148,292 @@ def _splmm_bed_logic_meta_selected_cached(
         except Exception:
             pass
         return built
+
+
+def _build_gwas_global_logic_meta(
+    prefix: str,
+    *,
+    maf_threshold: float,
+    max_missing_rate: float,
+    het_threshold: float,
+    snps_only: bool,
+) -> dict[str, object]:
+    plink_prefix = normalize_plink_prefix(str(prefix))
+    full_ids = _read_bed_fam_iids(str(plink_prefix))
+    n_expected = int(full_ids.shape[0])
+    if n_expected <= 0:
+        raise ValueError("GWAS global scan metadata requires non-empty PLINK samples.")
+    if scan_bed_2bit_packed_stats is not None:
+        miss_raw, maf_raw, _std_raw, row_flip_raw, het_raw, packed_n = scan_bed_2bit_packed_stats(
+            str(plink_prefix)
+        )
+    else:
+        miss_raw, maf_raw, _std_raw, row_flip_raw, het_raw, packed_n = _scan_bed_2bit_packed_stats_fallback(
+            str(plink_prefix),
+            n_expected_samples=int(n_expected),
+        )
+    if int(packed_n) != int(n_expected):
+        raise ValueError(
+            f"GWAS global scan metadata sample count mismatch: expected={int(n_expected)}, got={int(packed_n)}"
+        )
+    miss_arr = np.ascontiguousarray(np.asarray(miss_raw, dtype=np.float32).reshape(-1), dtype=np.float32)
+    maf_minor = np.ascontiguousarray(np.asarray(maf_raw, dtype=np.float32).reshape(-1), dtype=np.float32)
+    row_flip_input = np.ascontiguousarray(
+        np.asarray(row_flip_raw, dtype=np.bool_).reshape(-1),
+        dtype=np.bool_,
+    )
+    het_arr = np.ascontiguousarray(np.asarray(het_raw, dtype=np.float32).reshape(-1), dtype=np.float32)
+    row_maf = np.ascontiguousarray(
+        np.where(row_flip_input, 1.0 - maf_minor, maf_minor).astype(np.float32, copy=False),
+        dtype=np.float32,
+    )
+    keep = np.ones((int(maf_minor.shape[0]),), dtype=np.bool_)
+    maf_thr = float(maf_threshold)
+    if maf_thr > 0.0:
+        keep &= (maf_minor >= maf_thr) & (maf_minor <= (1.0 - maf_thr))
+    miss_thr = float(max_missing_rate)
+    if miss_thr < 1.0:
+        keep &= miss_arr <= miss_thr
+    het_thr = float(het_threshold)
+    if het_thr > 0.0:
+        keep &= het_arr <= het_thr
+    if bool(snps_only):
+        snp_mask = plink_snp_mask(str(plink_prefix))
+        if int(snp_mask.shape[0]) != int(keep.shape[0]):
+            raise ValueError(
+                f"GWAS global scan metadata SNP mask length mismatch: got={int(snp_mask.shape[0])}, expected={int(keep.shape[0])}"
+            )
+        keep &= snp_mask
+    row_idx = np.ascontiguousarray(
+        np.flatnonzero(keep).astype(np.int64, copy=False),
+        dtype=np.int64,
+    )
+    if int(row_idx.shape[0]) == 0:
+        raise ValueError("GWAS global scan metadata produced zero active SNPs after filtering.")
+    return {
+        "row_indices": row_idx,
+        "missing_rate": np.ascontiguousarray(miss_arr[row_idx], dtype=np.float32),
+        "af": np.ascontiguousarray(row_maf[row_idx], dtype=np.float32),
+        "maf": np.ascontiguousarray(row_maf[row_idx], dtype=np.float32),
+        "row_flip": np.zeros((int(row_idx.shape[0]),), dtype=np.bool_),
+        "site_keep": None,
+        "n_samples_full": int(packed_n),
+        "n_snps_total": int(keep.shape[0]),
+    }
+
+
+def _gwas_logic_meta_global_cached(
+    prefix: str,
+    *,
+    maf_threshold: float,
+    max_missing_rate: float,
+    het_threshold: float,
+    snps_only: bool,
+    outprefix: Optional[str] = None,
+    logger: Optional[logging.Logger] = None,
+    use_spinner: bool = False,
+    emit_status: bool = True,
+) -> dict[str, object]:
+    cache_prefix = _gwas_global_meta_cache_prefix(
+        str(prefix),
+        maf_threshold=float(maf_threshold),
+        max_missing_rate=float(max_missing_rate),
+        het_threshold=float(het_threshold),
+        snps_only=bool(snps_only),
+        outprefix=outprefix,
+        logger=logger,
+    )
+    spec = _gwas_global_meta_cache_spec(
+        prefix=str(prefix),
+        maf_threshold=float(maf_threshold),
+        max_missing_rate=float(max_missing_rate),
+        het_threshold=float(het_threshold),
+        snps_only=bool(snps_only),
+    )
+    cache_path = _scanmeta_single_cache_path(str(cache_prefix))
+    cached = _load_scanmeta_single_cache(
+        cache_path=str(cache_path),
+        spec=spec,
+    )
+    if cached is not None:
+        return _gwas_logic_meta_with_missing_count(
+            cached,
+            n_samples_used=int(cached.get("n_samples_full", 0) or 0),
+        )
+
+    with _cache_lock(str(cache_prefix)):
+        cached = _load_scanmeta_single_cache(
+            cache_path=str(cache_path),
+            spec=spec,
+        )
+        if cached is not None:
+            return _gwas_logic_meta_with_missing_count(
+                cached,
+                n_samples_used=int(cached.get("n_samples_full", 0) or 0),
+            )
+
+        task_label = f"Preparing GWAS global scan metadata from {os.path.basename(str(prefix))}..."
+        with CliStatus(
+            task_label,
+            enabled=bool(use_spinner),
+            use_process=True,
+        ) as task:
+            try:
+                built = _build_gwas_global_logic_meta(
+                    str(prefix),
+                    maf_threshold=float(maf_threshold),
+                    max_missing_rate=float(max_missing_rate),
+                    het_threshold=float(het_threshold),
+                    snps_only=bool(snps_only),
+                )
+                _atomic_save_scanmeta_cache_local(
+                    str(cache_path),
+                    header={
+                        "version": int(_SCANMETA_CACHE_VERSION),
+                        "spec": spec,
+                        "source_mtime": latest_genotype_mtime(str(spec["source_prefix"])),
+                        "n_samples_full": int(built.get("n_samples_full", 0) or 0),
+                        "n_snps_total": int(built.get("n_snps_total", 0) or 0),
+                        "n_active_sites": int(np.asarray(built["row_indices"]).reshape(-1).shape[0]),
+                    },
+                    row_idx=np.asarray(built["row_indices"], dtype=np.int64),
+                    miss=np.asarray(built["missing_rate"], dtype=np.float32),
+                    maf=np.asarray(built["maf"], dtype=np.float32),
+                    row_flip=np.asarray(built["row_flip"], dtype=np.bool_),
+                )
+            except Exception:
+                task.fail("Preparing GWAS global scan metadata ...Failed")
+                raise
+            if bool(emit_status):
+                task.complete(
+                    f"Preparing GWAS global scan metadata from {os.path.basename(str(prefix))} "
+                    f"...Finished (nSNP={int(np.asarray(built['row_indices']).shape[0])})"
+                )
+    return _gwas_logic_meta_with_missing_count(
+        built,
+        n_samples_used=int(built.get("n_samples_full", 0) or 0),
+    )
+
+
+def _gwas_logic_meta_with_missing_count(
+    meta: dict[str, object],
+    *,
+    n_samples_used: int,
+) -> dict[str, object]:
+    out = dict(meta)
+    miss_rate = np.ascontiguousarray(
+        np.asarray(out["missing_rate"], dtype=np.float32).reshape(-1),
+        dtype=np.float32,
+    )
+    out["missing_rate"] = miss_rate
+    out["missing_count"] = np.ascontiguousarray(
+        miss_rate * float(max(0, int(n_samples_used))),
+        dtype=np.float32,
+    )
+    return out
+
+
+def _coerce_trait_prepared_scan_meta(
+    trait_prepared_meta: Union[dict[str, object], None],
+) -> Union[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray], None]:
+    if not isinstance(trait_prepared_meta, dict):
+        return None
+    try:
+        row_idx = np.ascontiguousarray(
+            np.asarray(trait_prepared_meta["row_indices"], dtype=np.int64).reshape(-1),
+            dtype=np.int64,
+        )
+        miss_rate = np.ascontiguousarray(
+            np.asarray(trait_prepared_meta["missing_rate"], dtype=np.float32).reshape(-1),
+            dtype=np.float32,
+        )
+        maf = np.ascontiguousarray(
+            np.asarray(trait_prepared_meta["maf"], dtype=np.float32).reshape(-1),
+            dtype=np.float32,
+        )
+        row_flip = np.ascontiguousarray(
+            np.asarray(trait_prepared_meta["row_flip"], dtype=np.bool_).reshape(-1),
+            dtype=np.bool_,
+        )
+    except Exception:
+        return None
+    if (
+        int(row_idx.shape[0]) == 0
+        or int(row_idx.shape[0]) != int(miss_rate.shape[0])
+        or int(row_idx.shape[0]) != int(maf.shape[0])
+        or int(row_idx.shape[0]) != int(row_flip.shape[0])
+    ):
+        return None
+    return row_idx, miss_rate, maf, row_flip
+
+
+def _gwas_logic_meta_selected_cached(
+    prefix: str,
+    *,
+    sample_indices: np.ndarray,
+    maf_threshold: float,
+    max_missing_rate: float,
+    het_threshold: float,
+    snps_only: bool,
+    mmap_window_mb: Optional[int] = None,
+    outprefix: Optional[str] = None,
+    logger: Optional[logging.Logger] = None,
+    threads: Optional[int] = None,
+    use_cache: bool = False,
+) -> dict[str, object]:
+    sample_idx = np.ascontiguousarray(
+        np.asarray(sample_indices, dtype=np.int64).reshape(-1),
+        dtype=np.int64,
+    )
+    meta = _splmm_bed_logic_meta_selected_cached(
+        prefix,
+        sample_indices=sample_idx,
+        maf_threshold=float(maf_threshold),
+        max_missing_rate=float(max_missing_rate),
+        het_threshold=float(het_threshold),
+        snps_only=bool(snps_only),
+        mmap_window_mb=mmap_window_mb,
+        outprefix=outprefix,
+        logger=logger,
+        threads=threads,
+        use_cache=bool(use_cache),
+    )
+    return _gwas_logic_meta_with_missing_count(
+        meta,
+        n_samples_used=int(sample_idx.shape[0]),
+    )
+
+
+def _gwas_logic_meta_from_packed_ctx(
+    packed_ctx: dict[str, object],
+) -> dict[str, object]:
+    packed_n, row_idx, maf, miss, row_flip = _packed_ctx_scan_meta_for_gwas(packed_ctx)
+    site_keep_raw = packed_ctx.get("site_keep", None)
+    site_keep = (
+        np.ascontiguousarray(
+            np.asarray(site_keep_raw, dtype=np.bool_).reshape(-1),
+            dtype=np.bool_,
+        )
+        if site_keep_raw is not None
+        else None
+    )
+    if site_keep is not None:
+        n_snps_total = int(site_keep.shape[0])
+    elif int(row_idx.shape[0]) > 0:
+        n_snps_total = int(np.max(row_idx)) + 1
+    else:
+        n_snps_total = 0
+    meta = {
+        "row_indices": np.ascontiguousarray(np.asarray(row_idx, dtype=np.int64), dtype=np.int64),
+        "missing_rate": np.ascontiguousarray(np.asarray(miss, dtype=np.float32), dtype=np.float32),
+        "af": np.ascontiguousarray(np.asarray(maf, dtype=np.float32), dtype=np.float32),
+        "maf": np.ascontiguousarray(np.asarray(maf, dtype=np.float32), dtype=np.float32),
+        "row_flip": np.ascontiguousarray(np.asarray(row_flip, dtype=np.bool_), dtype=np.bool_),
+        "site_keep": site_keep,
+        "n_samples_full": int(packed_n),
+        "n_snps_total": int(n_snps_total),
+    }
+    return _gwas_logic_meta_with_missing_count(meta, n_samples_used=int(packed_n))
 
 
 def _lm_precompute_ixx_qr(x_design: np.ndarray) -> np.ndarray:
@@ -1153,6 +1684,9 @@ def _prepare_packed_bed_once_for_gwas(
     use_spinner: bool,
     preloaded_packed: Union[dict[str, object], None] = None,
     load_site_meta: bool = False,
+    status_label: str = "Loading packed BED genotype",
+    trait_prepared_meta: Union[dict[str, object], None] = None,
+    emit_status: bool = True,
 ) -> tuple[str, np.ndarray, dict[str, object], Union[_BimSiteColumns, None]]:
     """
     Resolve packed BED context for GWAS full-rust routes.
@@ -1174,6 +1708,67 @@ def _prepare_packed_bed_once_for_gwas(
             "Packed BED preload is disabled for this run. "
             f"reason={reason or 'unknown'}"
         )
+
+    prepared_scan_meta = _coerce_trait_prepared_scan_meta(trait_prepared_meta)
+    if prepared_scan_meta is not None:
+        row_idx, miss_rate, maf, row_flip = prepared_scan_meta
+        full_ids, n_snps = inspect_genotype_file(str(normalize_plink_prefix(prefix)))
+        full_ids = np.asarray(full_ids, dtype=str)
+        if int(row_idx.min()) < 0 or int(row_idx.max()) >= int(n_snps):
+            raise ValueError(
+                "Trait-prepared GWAS packed metadata row indices exceed PLINK BED bounds: "
+                f"max_row={int(row_idx.max())}, n_snps={int(n_snps)}."
+            )
+        if bool(emit_status):
+            with CliStatus(f"{status_label}...", enabled=bool(use_spinner)) as task:
+                try:
+                    packed_memmap = open_plink_bed_payload_memmap(
+                        str(prefix),
+                        n_samples=int(full_ids.shape[0]),
+                        n_snps=int(n_snps),
+                    )
+                    packed_payload = packed_memmap
+                except Exception:
+                    task.fail(f"{status_label} ...Failed")
+                    raise
+                task.complete(f"{status_label} ...Finished")
+        else:
+            packed_payload = open_plink_bed_payload_memmap(
+                str(prefix),
+                n_samples=int(full_ids.shape[0]),
+                n_snps=int(n_snps),
+            )
+        site_keep = np.zeros((int(n_snps),), dtype=np.bool_)
+        site_keep[row_idx] = True
+        packed_ctx = {
+            "packed": packed_payload,
+            "missing_rate": miss_rate,
+            "af": maf,
+            "maf": maf,
+            "row_flip": row_flip,
+            "site_keep": site_keep,
+            "active_row_idx": row_idx,
+            "row_indices": row_idx,
+            "packed_filter_mode": "lazy_full",
+            "packed_storage": "memmap",
+            "n_samples": int(full_ids.shape[0]),
+            "n_total_sites": int(n_snps),
+            "n_active_sites": int(row_idx.shape[0]),
+            "source_prefix": str(prefix),
+        }
+        if not load_site_meta:
+            return str(prefix), full_ids, packed_ctx, None
+        site_meta = _resolve_bim_site_columns_meta(
+            _make_deferred_bim_metadata(
+                str(prefix),
+                row_idx,
+                n_markers=int(row_idx.shape[0]),
+            ),
+            prefix=str(prefix),
+            row_indices=row_idx,
+            expected_rows=int(row_idx.shape[0]),
+        )
+        return str(prefix), full_ids, packed_ctx, site_meta
 
     pre = preloaded_packed if packed_preload_is_ready(preloaded_packed) else None
     if pre is not None and str(pre.get("prefix", "")) == str(prefix):
@@ -1252,20 +1847,30 @@ def _prepare_packed_bed_once_for_gwas(
         if not load_site_meta:
             return str(prefix), full_ids, packed_ctx, None
     else:
-        with CliStatus("Loading packed BED genotype...", enabled=bool(use_spinner)) as task:
-            try:
-                full_ids, packed_ctx = prepare_packed_ctx_from_plink(
-                    str(prefix),
-                    maf=float(maf_threshold),
-                    missing_rate=float(max_missing_rate),
-                    het_threshold=float(het_threshold),
-                    snps_only=bool(snps_only),
-                    filter_mode="lazy_owned",
-                )
-            except Exception:
-                task.fail("Loading packed BED genotype ...Failed")
-                raise
-            task.complete("Loading packed BED genotype ...Finished")
+        if bool(emit_status):
+            with CliStatus(f"{status_label}...", enabled=bool(use_spinner)) as task:
+                try:
+                    full_ids, packed_ctx = prepare_packed_ctx_from_plink(
+                        str(prefix),
+                        maf=float(maf_threshold),
+                        missing_rate=float(max_missing_rate),
+                        het_threshold=float(het_threshold),
+                        snps_only=bool(snps_only),
+                        filter_mode="lazy_owned",
+                    )
+                except Exception:
+                    task.fail(f"{status_label} ...Failed")
+                    raise
+                task.complete(f"{status_label} ...Finished")
+        else:
+            full_ids, packed_ctx = prepare_packed_ctx_from_plink(
+                str(prefix),
+                maf=float(maf_threshold),
+                missing_rate=float(max_missing_rate),
+                het_threshold=float(het_threshold),
+                snps_only=bool(snps_only),
+                filter_mode="lazy_owned",
+            )
         full_ids = np.asarray(full_ids, dtype=str)
         packed_ctx = {
             "packed": np.ascontiguousarray(np.asarray(packed_ctx["packed"], dtype=np.uint8)),
@@ -3935,9 +4540,7 @@ def run_lm_packed_fullrank(
             if not gwas_ok:
                 _cleanup_gwas_result_tmp(tmp_tsv)
 
-        gwas_secs = max(stage1_secs + stage2_secs, 0.0)
-        if gwas_secs <= 0.0:
-            gwas_secs = max(time.monotonic() - gwas_t0, 0.0)
+        gwas_secs = max(time.monotonic() - gwas_t0, 0.0)
         _finalize_gwas_result_tsv(tmp_tsv, out_tsv, prefix, logger=logger)
         saved_paths.append(str(out_tsv))
         viz_secs = 0.0
@@ -3959,7 +4562,7 @@ def run_lm_packed_fullrank(
         avg_cpu = 100.0 * cpu_used / (wall * max(1, n_cores))
         peak_rss_gb = peak_rss / (1024 ** 3)
 
-        eff_snp = int(_written_rows) if use_block_lm else int(n_sites_active)
+        eff_snp = int(_written_rows)
         eff_snp_by_trait[pname] = eff_snp
         summary_rows.append(
             {
@@ -3970,15 +4573,13 @@ def run_lm_packed_fullrank(
                 "pve": None,
                 "avg_cpu": float(avg_cpu),
                 "peak_rss_gb": float(peak_rss_gb),
-                "stage1_time_s": float(stage1_secs),
-                "stage2_time_s": float(stage2_secs),
                 "gwas_time_s": float(gwas_secs),
                 "viz_time_s": float(viz_secs),
                 "result_file": str(out_tsv),
             }
         )
 
-        done_times = [format_elapsed(stage1_secs), format_elapsed(stage2_secs)]
+        done_times = [format_elapsed(gwas_secs)]
         if plot:
             done_times.append(format_elapsed(viz_secs))
         _rich_success(
@@ -4016,6 +4617,7 @@ def run_lm_stream_bed_single_entry(
     emit_trait_header: bool = True,
     chunk_size_user_set: bool = True,
     mmap_limit: bool = False,
+    trait_prepared_meta: Union[dict[str, object], None] = None,
     model_key: str = "lm",
     lm2_covariate_indices: Union[np.ndarray, None] = None,
 ) -> None:
@@ -4178,6 +4780,39 @@ def run_lm_stream_bed_single_entry(
         kept_rows = 0
         scan_all_rows = 0
         scan_ok = False
+        prepared_row_indices = None
+        prepared_row_flip = None
+        prepared_row_missing = None
+        prepared_row_maf = None
+        if isinstance(trait_prepared_meta, dict):
+            try:
+                prepared_row_indices = np.ascontiguousarray(
+                    np.asarray(trait_prepared_meta["row_indices"], dtype=np.int64).reshape(-1),
+                    dtype=np.int64,
+                )
+                prepared_row_flip = np.ascontiguousarray(
+                    np.asarray(trait_prepared_meta["row_flip"], dtype=np.bool_).reshape(-1),
+                    dtype=np.bool_,
+                )
+                prepared_row_missing = np.ascontiguousarray(
+                    np.asarray(
+                        trait_prepared_meta.get(
+                            "missing_count",
+                            trait_prepared_meta["missing_rate"],
+                        ),
+                        dtype=np.float32,
+                    ).reshape(-1),
+                    dtype=np.float32,
+                )
+                prepared_row_maf = np.ascontiguousarray(
+                    np.asarray(trait_prepared_meta["maf"], dtype=np.float32).reshape(-1),
+                    dtype=np.float32,
+                )
+            except Exception:
+                prepared_row_indices = None
+                prepared_row_flip = None
+                prepared_row_missing = None
+                prepared_row_maf = None
         try:
             with _gwas_scan_stage_ctx(int(max(1, scan_threads))):
                 kwargs_stream: dict[str, object] = {
@@ -4203,6 +4838,11 @@ def run_lm_stream_bed_single_entry(
                     "threads": int(max(1, scan_threads)),
                     **kwargs_stream,
                 }
+                if prepared_row_indices is not None:
+                    lm_base_kwargs["row_indices"] = prepared_row_indices
+                    lm_base_kwargs["row_flip"] = prepared_row_flip
+                    lm_base_kwargs["row_missing"] = prepared_row_missing
+                    lm_base_kwargs["row_maf"] = prepared_row_maf
 
                 def _call_lm_stream(ixx_opt: object) -> tuple[int, int]:
                     global _WARNED_LM_STREAM_MMAP_LEGACY
@@ -4898,6 +5538,7 @@ def run_algwas_packed_fullrank(
     emit_trait_header: bool = True,
     preloaded_packed: Union[dict[str, object], None] = None,
     qtn_preloaded_packed: Union[dict[str, object], None] = None,
+    trait_prepared_meta: Union[dict[str, object], None] = None,
 ) -> None:
     if str(genetic_model).lower() != "add":
         raise ValueError("ALGWAS full-rust packed route supports additive coding only.")
@@ -4932,6 +5573,8 @@ def run_algwas_packed_fullrank(
             use_spinner=bool(use_spinner),
             preloaded_packed=preloaded_packed,
             load_site_meta=False,
+            status_label="Loading BED genotype of trait-subset",
+            trait_prepared_meta=trait_prepared_meta,
         )
     id_to_idx = {sid: i for i, sid in enumerate(full_ids)}
     try:
@@ -5678,6 +6321,7 @@ def run_splmm_windowed_fullrank(
                 outprefix=str(outprefix),
                 logger=logger,
                 threads=int(threads),
+                use_cache=False,
             )
             return out, max(time.monotonic() - task_t0, 0.0)
 
@@ -6020,7 +6664,12 @@ def run_splmm_windowed_fullrank(
             trait_scan_maf = np.ascontiguousarray(np.asarray(scan_meta["maf"], dtype=np.float32).reshape(-1), dtype=np.float32)
             trait_scan_miss = np.ascontiguousarray(np.asarray(scan_meta["missing_rate"], dtype=np.float32).reshape(-1), dtype=np.float32)
             trait_scan_row_flip = np.ascontiguousarray(np.asarray(scan_meta["row_flip"], dtype=np.bool_).reshape(-1), dtype=np.bool_)
-            trait_site_keep = np.ascontiguousarray(np.asarray(scan_meta["site_keep"], dtype=np.bool_).reshape(-1), dtype=np.bool_)
+            scan_site_keep = scan_meta.get("site_keep", None)
+            trait_site_keep = (
+                np.ascontiguousarray(np.asarray(scan_site_keep, dtype=np.bool_).reshape(-1), dtype=np.bool_)
+                if scan_site_keep is not None
+                else None
+            )
         n_trait_sites = int(trait_row_idx.shape[0])
         mmap_window_mb = _common_resolve_decode_mmap_window_mb(
             genofile,

@@ -54,7 +54,7 @@ except Exception:
 _TQDM_SPINNER_FRAMES: tuple[str, ...] = (
     _plain_spinner_frames()
     if callable(_plain_spinner_frames)
-    else (".  ", ".. ", "...", " ..", "  .", " . ")
+    else ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
 )
 _TQDM_REFRESH_SECONDS = (
     float(_spinner_refresh_interval(None))

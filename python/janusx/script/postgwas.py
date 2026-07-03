@@ -2917,6 +2917,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
         width_in = 8.0
         gene_panel_h_in = width_in / 20.0
         dpi = 300
+        rasterized = _postgwas_should_rasterize_dense_layers(args.format)
         manh_ratio_for_font = float(args.manh_ratio) if args.manh_ratio is not None else 2.0
         manh_fontsize_target = _scaled_fontsize_for_manhattan(
             manh_ratio_for_font,
@@ -2978,8 +2979,6 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                     float(manh_fontsize_target),
                     ax.get_xlim(),
                 )
-
-            rasterized = _postgwas_should_rasterize_dense_layers(args.format)
 
             if args.highlight:
                 # Highlight specific SNPs (bed-like file: chr, start, end, gene, desc)

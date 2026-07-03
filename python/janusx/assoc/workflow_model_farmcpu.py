@@ -697,6 +697,7 @@ def run_farmcpu_fullmem(
         *,
         snps_only_mode: bool,
         return_metadata: bool = True,
+        emit_status: bool = True,
     ) -> tuple[Union[pd.DataFrame, None], np.ndarray]:
         bim_path = f"{prefix}.bim"
         src = _basename_only(bim_path)
@@ -734,11 +735,15 @@ def run_farmcpu_fullmem(
         else:
             chrom = pos = snp = allele0 = allele1 = None
 
-        pbar = _ProgressAdapter(
-            total=n_total,
-            desc=f"Loading site metadata ({src})",
-            logger=logger,
-            log_unit="row",
+        pbar = (
+            _ProgressAdapter(
+                total=n_total,
+                desc=f"Loading site metadata ({src})",
+                logger=logger,
+                log_unit="row",
+            )
+            if bool(emit_status)
+            else None
         )
         lines = 0
         done = 0
@@ -779,7 +784,7 @@ def run_farmcpu_fullmem(
                             allele1[out] = a1
                             out += 1
 
-                    if lines - done >= 200_000:
+                    if (pbar is not None) and (lines - done >= 200_000):
                         step = lines - done
                         pbar.update(step)
                         done = lines
@@ -788,11 +793,13 @@ def run_farmcpu_fullmem(
                 raise ValueError(
                     f"BIM row count mismatch: bim={lines}, genotype={n_total} ({src})"
                 )
-            if done < n_total:
+            if (pbar is not None) and done < n_total:
                 pbar.update(n_total - done)
-            pbar.finish()
+            if pbar is not None:
+                pbar.finish()
         finally:
-            pbar.close()
+            if pbar is not None:
+                pbar.close()
 
         if not bool(return_metadata):
             return None, keep
@@ -893,6 +900,7 @@ def run_farmcpu_fullmem(
             keep_numeric,
             snps_only_mode=bool(snps_only),
             return_metadata=False,
+            emit_status=False,
         )
         if not np.any(keep_final):
             raise ValueError("After filtering, number of SNPs is zero for FarmCPU.")

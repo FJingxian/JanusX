@@ -1848,6 +1848,7 @@ def _run_kernel_janusx(
         "-p",
         str(pheno_for_jx),
         "-farmcpu",
+        "-global",
         "-maf",
         str(args.maf),
         "-geno",
@@ -2758,7 +2759,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     p = CliArgumentParser(
         prog="jx benchmark",
         formatter_class=cli_help_formatter(),
-        description="Benchmark FarmCPU kernels: JanusX -farmcpu / explicit rMVP::MVP.FarmCPU.",
+        description="Benchmark FarmCPU kernels: JanusX -farmcpu -global / explicit rMVP::MVP.FarmCPU.",
         epilog=minimal_help_epilog(
             [
                 "jx benchmark -bfile example_prefix -p pheno.tsv -n 0",
@@ -3132,6 +3133,7 @@ def main() -> None:
             "cli" if args.farmcpu_threshold is not None else f"auto_1_over_nsnp:{n_snps_for_threshold_source}"
         ),
         "benchmark_mode": "direct_aligned_explicit_mvp_farmcpu",
+        "janusx_gwas_row_stat_mode": "global",
         "rmvp_runner_mode": "direct_mvp_farmcpu",
         "rmvp_vc_method_requested": str(align_runtime.rmvp_vc_method),
         "rmvp_vc_method_effective": None,

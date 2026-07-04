@@ -10,7 +10,7 @@ source:
   sha256: e9bc111e1a5b5a634751d2a25f5330f54aec7176d2faef4cf30e99cce0af4f47
 
 build:
-  number: 1
+  number: 0
   skip: true  # [win or py<310]
   script_env:
     - CARGO_BUILD_JOBS

@@ -633,9 +633,9 @@ def _render_summary_table(
         return ""
 
     if log_style:
-        headers = ["Trait", "N_Obs (Lines)", "Env / Fixed", "Random", "H2 (Broad)", "h2 (Narrow)"]
+        headers = ["Trait", "N_Obs (Lines)", "Env / Fixed", "Random", "H2 (Broad)", "h2 (Narrow)", "PVEc"]
     else:
-        headers = ["Trait", "N_Obs(Lines)", "Env/Fixed", "Random", "H2", "h2"]
+        headers = ["Trait", "N_Obs(Lines)", "Env/Fixed", "Random", "H2", "h2", "PVEc"]
 
     body: list[list[str]] = []
     for row in rows:
@@ -650,6 +650,7 @@ def _render_summary_table(
                 str(row.get("random_label", "None")),
                 _fmt_metric(row.get("hsqr")),
                 _fmt_metric(row.get("h2_narrow")),
+                _fmt_metric(row.get("pvec")),
             ]
         )
 
@@ -1791,6 +1792,7 @@ def main() -> None:
                         "random_label": random_label,
                         "hsqr": np.nan,
                         "h2_narrow": np.nan,
+                        "pvec": np.nan,
                         "h2_blue_raw": np.nan,
                         "va_joint": np.nan,
                         "vline_joint": np.nan,
@@ -1987,6 +1989,7 @@ def main() -> None:
             )
 
             h2_narrow = np.nan
+            pvec = np.nan
             h2_blue_raw = np.nan
             va_joint = np.nan
             vline_joint = np.nan
@@ -2062,6 +2065,7 @@ def main() -> None:
                             )
                             h2_blue_raw = float(lmm.pve) if np.isfinite(lmm.pve) else np.nan
                             h2_narrow = h2_blue_raw
+                            pvec = np.nan
                             narrow_lambda = float(lmm.lbd_null) if np.isfinite(float(lmm.lbd_null)) else np.nan
                             narrow_method = "blue_null_lmm"
                             if np.isfinite(hsqr) and np.isfinite(h2_narrow) and (h2_narrow > hsqr * 1.02):
@@ -2096,11 +2100,12 @@ def main() -> None:
                             )
                             h2_blue_raw = float(sparse_null.get("pve", float("nan")))
                             h2_narrow = h2_blue_raw
+                            pvec = float(sparse_null.get("pve_diag_scaled", float("nan")))
                             narrow_lambda = float(sparse_null.get("lambda", float("nan")))
                             narrow_sigma_g2 = float(sparse_null.get("sigma_g2", float("nan")))
                             narrow_sigma_e2 = float(sparse_null.get("sigma_e2", float("nan")))
                             narrow_mean_diag_k = float(sparse_null.get("mean_diag_k", float("nan")))
-                            narrow_pve_diag_scaled = float(sparse_null.get("pve_diag_scaled", float("nan")))
+                            narrow_pve_diag_scaled = pvec
                             narrow_nnz_k = float(sparse_null.get("nnz_k", float("nan")))
                             narrow_offdiag_density_k = float(sparse_null.get("offdiag_density_k", float("nan")))
                             narrow_method = (
@@ -2137,14 +2142,18 @@ def main() -> None:
                 logger.info(
                     f"  narrow(raw BLUE scale)={_fmt_metric(h2_blue_raw)}"
                 )
+            if np.isfinite(pvec):
+                logger.info(
+                    f"  narrow(corrected sparse PVEc)={_fmt_metric(pvec)}"
+                )
             if np.isfinite(narrow_mean_diag_k) or np.isfinite(narrow_sigma_g2) or np.isfinite(narrow_sigma_e2):
                 logger.info(
-                    "  sparse lambda=%s | sigma_g2=%s | sigma_e2=%s | mean_diag(K)=%s | pve_diag_scaled=%s | nnz(K)=%s | offdiag_density=%s",
+                    "  sparse lambda=%s | sigma_g2=%s | sigma_e2=%s | mean_diag(K)=%s | PVEc=%s | nnz(K)=%s | offdiag_density=%s",
                     _fmt_metric(narrow_lambda),
                     _fmt_metric(narrow_sigma_g2),
                     _fmt_metric(narrow_sigma_e2),
                     _fmt_metric(narrow_mean_diag_k),
-                    _fmt_metric(narrow_pve_diag_scaled),
+                    _fmt_metric(pvec),
                     _fmt_metric(narrow_nnz_k),
                     _fmt_metric(narrow_offdiag_density_k),
                 )
@@ -2164,6 +2173,7 @@ def main() -> None:
                     "random_label": random_label,
                     "hsqr": float(hsqr) if np.isfinite(hsqr) else np.nan,
                     "h2_narrow": float(h2_narrow) if np.isfinite(h2_narrow) else np.nan,
+                    "pvec": float(pvec) if np.isfinite(pvec) else np.nan,
                     "h2_blue_raw": float(h2_blue_raw) if np.isfinite(h2_blue_raw) else np.nan,
                     "va_joint": float(va_joint) if np.isfinite(va_joint) else np.nan,
                     "vline_joint": float(vline_joint) if np.isfinite(vline_joint) else np.nan,
@@ -2207,6 +2217,7 @@ def main() -> None:
                     "random_label": random_label,
                     "hsqr": np.nan,
                     "h2_narrow": np.nan,
+                    "pvec": np.nan,
                     "h2_blue_raw": np.nan,
                     "va_joint": np.nan,
                     "vline_joint": np.nan,

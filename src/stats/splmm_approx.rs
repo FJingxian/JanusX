@@ -3,7 +3,14 @@
 // y_tilde = M_X y, g_tilde = M_X g
 // fit lambda from y_tilde under V_lambda = K_sparse + lambda I
 // a = V_lambda^{-1} y_tilde
-// gamma approximates E[g_tilde'V_lambda^{-1}g_tilde / (g_tilde'g_tilde)]
+// gamma is tuned on sampled markers using fastGWA-style null-SNP filtering:
+// keep sampled markers with chi^2 = (g_tilde'a)^2 / (g_tilde'V_lambda^{-1}g_tilde) < 5
+// then average gamma_j = (g_tilde'V_lambda^{-1}g_tilde) / (g_tilde'g_tilde)
+//
+// For diagnostics we also track the exact Schur-form quantity
+// g'P_lambda g / (g_tilde'g_tilde), where
+// P_lambda = V_lambda^{-1}
+//          - V_lambda^{-1}X(X'V_lambda^{-1}X)^{-1}X'V_lambda^{-1}
 // beta_hat ~= (g_tilde' a) / (gamma * g_tilde'g_tilde)
 // se(beta_hat) ~= 1 / sqrt(gamma * g_tilde'g_tilde)
 //
@@ -25,6 +32,7 @@ use pyo3::prelude::*;
 use std::time::Instant;
 
 const SPLMM_APPROX_TINY: f64 = 1e-30_f64;
+const SPLMM_APPROX_FASTGWA_NULL_CHISQ_MAX: f64 = 5.0_f64;
 
 #[derive(Clone, Debug)]
 struct ResidualizedApproxEval {
@@ -45,7 +53,8 @@ pub(crate) struct ResidualizedApproxNullFit {
     pub(crate) sigma_e2: f64,
     pub(crate) ml: f64,
     pub(crate) reml: f64,
-    // Keeps gamma on the same V^-1 scale as a_vec when the factor is K + lambda I only.
+    // Keeps sampled-marker gamma on the same V^-1 scale as a_vec when the factor is
+    // K + lambda I only.
     gamma_scale_correction: f64,
     factor: SparseJxgrmCholesky,
 }
@@ -214,6 +223,45 @@ fn xt_vec_row_major(x_design: &[f64], n: usize, p: usize, y: &[f64], out: &mut [
             out[j] += row[j] * yi;
         }
     }
+}
+
+fn xt_v_inv_x_chol_from_factor(
+    factor: &SparseJxgrmCholesky,
+    x_design: &[f64],
+    n: usize,
+    p: usize,
+) -> Result<Vec<f64>, String> {
+    if x_design.len() != n.saturating_mul(p) {
+        return Err(format!(
+            "SparseLMM residualized approx design length mismatch: got {}, expected {}",
+            x_design.len(),
+            n.saturating_mul(p)
+        ));
+    }
+    let mut x_col = vec![0.0_f64; n];
+    let mut x_v_inv_cols = vec![0.0_f64; n * p];
+    for col in 0..p {
+        for i in 0..n {
+            x_col[i] = x_design[i * p + col];
+        }
+        let z = factor.solve_vec(x_col.as_slice())?;
+        x_v_inv_cols[col * n..(col + 1) * n].copy_from_slice(z.as_slice());
+    }
+    let mut xt_v_inv_x = vec![0.0_f64; p * p];
+    for a in 0..p {
+        for b in 0..p {
+            let mut sum = 0.0_f64;
+            for i in 0..n {
+                sum += x_design[i * p + a] * x_v_inv_cols[b * n + i];
+            }
+            xt_v_inv_x[a * p + b] = sum;
+        }
+    }
+    spd_cholesky_with_jitter(
+        xt_v_inv_x.as_slice(),
+        p,
+        "SparseLMM residualized approx XtVinvX",
+    )
 }
 
 fn validate_design_and_response(x_design: &[f64], y: &[f64]) -> Result<(usize, usize), String> {
@@ -589,8 +637,12 @@ pub(crate) fn estimate_residualized_approx_scan_sparse(
         rhat_progress_total,
         mmap_window_mb,
     )?;
-    let (gamma, n_used) =
-        fit.estimate_gamma_from_markers(x_design.as_slice(), sampled_markers.as_slice(), n_rhat)?;
+    let (gamma, n_used) = fit.estimate_gamma_from_markers(
+        x_design.as_slice(),
+        sampled_markers.as_slice(),
+        n_rhat,
+        rhat_markers,
+    )?;
     if stage1_cb.is_some() {
         emit_progress_callback(stage1_cb, 8, rhat_progress_total, rhat_progress_total)?;
     }
@@ -677,8 +729,12 @@ pub(crate) fn estimate_residualized_approx_scan_to_tsv_sparse(
         rhat_progress_total,
         mmap_window_mb,
     )?;
-    let (gamma, n_used) =
-        fit.estimate_gamma_from_markers(x_design.as_slice(), sampled_markers.as_slice(), n_rhat)?;
+    let (gamma, n_used) = fit.estimate_gamma_from_markers(
+        x_design.as_slice(),
+        sampled_markers.as_slice(),
+        n_rhat,
+        rhat_markers,
+    )?;
     if stage1_cb.is_some() {
         emit_progress_callback(stage1_cb, 8, rhat_progress_total, rhat_progress_total)?;
     }
@@ -740,6 +796,7 @@ impl ResidualizedApproxNullFit {
         x_design: &[f64],
         markers_col_major: &[f64],
         n_markers: usize,
+        soft_cap_markers: usize,
     ) -> Result<(f64, usize), String> {
         let (n, p) = validate_design_and_response(x_design, self.y_resid.as_slice())?;
         if markers_col_major.len() != n.saturating_mul(n_markers) {
@@ -750,10 +807,23 @@ impl ResidualizedApproxNullFit {
             ));
         }
         let xtx_chol = xtx_chol_from_design(x_design, n, p)?;
+        let xt_v_inv_x_chol = xt_v_inv_x_chol_from_factor(&self.factor, x_design, n, p)?;
+        let gamma_debug = std::env::var("JX_SPLMM_APPROX_GAMMA_DEBUG")
+            .map(|v| {
+                let s = v.trim().to_ascii_lowercase();
+                !(s.is_empty() || s == "0" || s == "false" || s == "off" || s == "no")
+            })
+            .unwrap_or(false);
         let mut xtg = vec![0.0_f64; p];
+        let mut xtz = vec![0.0_f64; p];
         let mut alpha = vec![0.0_f64; p];
         let mut g_resid = vec![0.0_f64; n];
-        let mut ratio_sum = 0.0_f64;
+        let mut fastgwa_ratio_sum = 0.0_f64;
+        let mut residualized_ratio_sum = 0.0_f64;
+        let mut schur_sum = 0.0_f64;
+        let mut s_ms_sum = 0.0_f64;
+        let mut exact_ratio_sum = 0.0_f64;
+        let mut residualized_n_used = 0usize;
         let mut n_used = 0usize;
         for marker_idx in 0..n_markers {
             let g = &markers_col_major[marker_idx * n..(marker_idx + 1) * n];
@@ -769,27 +839,104 @@ impl ResidualizedApproxNullFit {
             if !s_ms.is_finite() || s_ms <= SPLMM_APPROX_TINY {
                 continue;
             }
-            let v_inv_g = self.factor.solve_vec(g_resid.as_slice())?;
-            let s_v_s = dot_f64(g_resid.as_slice(), v_inv_g.as_slice());
-            if !s_v_s.is_finite() || s_v_s <= SPLMM_APPROX_TINY {
+            let residualized_v_inv_g = self.factor.solve_vec(g_resid.as_slice())?;
+            let residualized_s_v_s = dot_f64(g_resid.as_slice(), residualized_v_inv_g.as_slice());
+            if !residualized_s_v_s.is_finite() || residualized_s_v_s <= SPLMM_APPROX_TINY {
                 continue;
             }
-            let ratio = s_v_s / s_ms;
-            if ratio.is_finite() && ratio > 0.0 {
-                ratio_sum += ratio;
+            let residualized_ratio = residualized_s_v_s / s_ms;
+            if !residualized_ratio.is_finite() || residualized_ratio <= 0.0 {
+                continue;
+            }
+            residualized_ratio_sum += residualized_ratio;
+            residualized_n_used += 1;
+
+            let score = dot_f64(g_resid.as_slice(), self.a_vec.as_slice());
+            let chisq = (score * score) / residualized_s_v_s;
+            if chisq.is_finite() && chisq < SPLMM_APPROX_FASTGWA_NULL_CHISQ_MAX {
+                fastgwa_ratio_sum += residualized_ratio;
                 n_used += 1;
             }
+
+            if gamma_debug {
+                let v_inv_g = self.factor.solve_vec(g)?;
+                let s_v_s = dot_f64(g, v_inv_g.as_slice());
+                if s_v_s.is_finite() && s_v_s > SPLMM_APPROX_TINY {
+                    xt_vec_row_major(x_design, n, p, v_inv_g.as_slice(), &mut xtz);
+                    cholesky_solve_into(xt_v_inv_x_chol.as_slice(), p, xtz.as_slice(), &mut alpha);
+                    let x_quad = xtz
+                        .iter()
+                        .zip(alpha.iter())
+                        .map(|(a, b)| a * b)
+                        .sum::<f64>();
+                    let schur = (s_v_s - x_quad).max(0.0_f64);
+                    if schur.is_finite() && schur > SPLMM_APPROX_TINY {
+                        exact_ratio_sum += schur / s_ms;
+                        schur_sum += schur;
+                        s_ms_sum += s_ms;
+                    }
+                }
+            }
+            if marker_idx + 1 >= soft_cap_markers && n_used >= 100 {
+                break;
+            }
         }
-        if n_used == 0 {
+        if n_used == 0 && residualized_n_used == 0 {
             return Err(
                 "SparseLMM residualized approx gamma estimation found no valid sampled markers"
                     .to_string(),
             );
         }
-        Ok((
-            (ratio_sum / (n_used as f64)) * self.gamma_scale_correction,
-            n_used,
-        ))
+        let use_fastgwa_nulls = n_used >= 100;
+        let gamma_mean = if use_fastgwa_nulls {
+            fastgwa_ratio_sum / (n_used as f64)
+        } else {
+            residualized_ratio_sum / (residualized_n_used as f64)
+        };
+        let gamma_n_used = if use_fastgwa_nulls {
+            n_used
+        } else {
+            residualized_n_used
+        };
+        if gamma_debug {
+            let exact_ratio_of_sums = if s_ms_sum > SPLMM_APPROX_TINY {
+                schur_sum / s_ms_sum
+            } else {
+                f64::NAN
+            };
+            let exact_mean = if residualized_n_used > 0 {
+                exact_ratio_sum / (residualized_n_used as f64)
+            } else {
+                f64::NAN
+            };
+            let residualized_mean = if residualized_n_used > 0 {
+                residualized_ratio_sum / (residualized_n_used as f64)
+            } else {
+                f64::NAN
+            };
+            let fastgwa_mean = if n_used > 0 {
+                fastgwa_ratio_sum / (n_used as f64)
+            } else {
+                f64::NAN
+            };
+            eprintln!(
+                "SparseLMM approx gamma debug: exact_mean={:.9e}, exact_ratio_of_sums={:.9e}, residualized_mean={:.9e}, fastgwa_null_mean={:.9e}, scale_correction={:.9e}, exact_mean_scaled={:.9e}, exact_ratio_of_sums_scaled={:.9e}, residualized_mean_scaled={:.9e}, fastgwa_null_mean_scaled={:.9e}, residualized_used={}, fastgwa_null_used={}, selected={}, selected_used={}",
+                exact_mean,
+                exact_ratio_of_sums,
+                residualized_mean,
+                fastgwa_mean,
+                self.gamma_scale_correction,
+                exact_mean * self.gamma_scale_correction,
+                exact_ratio_of_sums * self.gamma_scale_correction,
+                residualized_mean * self.gamma_scale_correction,
+                fastgwa_mean * self.gamma_scale_correction,
+                residualized_n_used,
+                n_used,
+                if use_fastgwa_nulls { "fastgwa_null" } else { "residualized_all_fallback" },
+                gamma_n_used,
+            );
+        }
+        Ok((gamma_mean * self.gamma_scale_correction, gamma_n_used))
     }
 
     pub(crate) fn build_scan_model(
@@ -1024,10 +1171,10 @@ mod tests {
             2.0_f64, 0.0_f64, 1.0_f64, 1.0_f64,
         ];
         let (gamma_component, used_component) = component_fit
-            .estimate_gamma_from_markers(&x_design, sampled_markers.as_slice(), 2)
+            .estimate_gamma_from_markers(&x_design, sampled_markers.as_slice(), 2, 2)
             .unwrap();
         let (gamma_lambda, used_lambda) = lambda_fit
-            .estimate_gamma_from_markers(&x_design, sampled_markers.as_slice(), 2)
+            .estimate_gamma_from_markers(&x_design, sampled_markers.as_slice(), 2, 2)
             .unwrap();
         assert_eq!(used_component, used_lambda);
         assert!((gamma_component - gamma_lambda).abs() <= 1e-12_f64);
@@ -1046,5 +1193,53 @@ mod tests {
         assert!((assoc_component.0 - assoc_lambda.0).abs() <= 1e-12_f64);
         assert!((assoc_component.1 - assoc_lambda.1).abs() <= 1e-12_f64);
         assert!((assoc_component.2 - assoc_lambda.2).abs() <= 1e-12_f64);
+    }
+
+    #[test]
+    fn sampled_gamma_matches_exact_schur_reference_for_intercept_only_design() {
+        let k_diag = [1.0_f64, 1.5_f64, 2.0_f64, 3.0_f64];
+        let analysis = make_diag_analysis(&k_diag);
+        let x_design = vec![1.0_f64, 1.0_f64, 1.0_f64, 1.0_f64];
+        let y = vec![1.0_f64, -0.25_f64, 0.75_f64, 1.5_f64];
+        let sigma_g2 = 2.5_f64;
+        let sigma_e2 = 1.25_f64;
+        let fit = build_residualized_approx_null_from_components(
+            &analysis, &x_design, &y, sigma_g2, sigma_e2,
+        )
+        .unwrap();
+        let sampled_markers = vec![
+            0.0_f64, 1.0_f64, 2.0_f64, 1.0_f64, //
+            2.0_f64, 0.0_f64, 1.0_f64, 1.0_f64,
+        ];
+        let (gamma, used) = fit
+            .estimate_gamma_from_markers(&x_design, sampled_markers.as_slice(), 2, 2)
+            .unwrap();
+        assert_eq!(used, 2);
+
+        let v_inv = k_diag
+            .iter()
+            .map(|k| 1.0_f64 / (sigma_g2 * k + sigma_e2))
+            .collect::<Vec<_>>();
+        let x_v_inv_x = v_inv.iter().sum::<f64>();
+        let mut ratio_sum = 0.0_f64;
+        for marker_idx in 0..2 {
+            let g = &sampled_markers[marker_idx * 4..(marker_idx + 1) * 4];
+            let mean = g.iter().sum::<f64>() / 4.0_f64;
+            let s_ms = g.iter().map(|gi| (gi - mean) * (gi - mean)).sum::<f64>();
+            let s_v_s = g
+                .iter()
+                .zip(v_inv.iter())
+                .map(|(gi, wi)| gi * gi * wi)
+                .sum::<f64>();
+            let xtz = g
+                .iter()
+                .zip(v_inv.iter())
+                .map(|(gi, wi)| gi * wi)
+                .sum::<f64>();
+            let schur = s_v_s - (xtz * xtz) / x_v_inv_x;
+            ratio_sum += schur / s_ms;
+        }
+        let gamma_ref = ratio_sum / 2.0_f64;
+        assert!((gamma - gamma_ref).abs() <= 1e-12_f64);
     }
 }

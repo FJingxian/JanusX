@@ -14,7 +14,7 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::Bound;
 use rand::rngs::StdRng;
-use rand::seq::index::sample;
+use rand::Rng;
 use rand::SeedableRng;
 use rayon::prelude::*;
 use std::fs::File;
@@ -1478,13 +1478,18 @@ fn prepare_splmm_assoc_inputs<'py>(
 }
 
 pub(crate) fn choose_rhat_rows(m: usize, count: usize, seed: u64) -> Vec<usize> {
-    let k = count.min(m);
-    if k == m {
+    let soft_cap = count.min(m);
+    if soft_cap == m {
         return (0..m).collect();
     }
     let mut rng = StdRng::seed_from_u64(seed);
-    let mut out = sample(&mut rng, m, k).into_vec();
+    let draw_count = soft_cap.saturating_mul(2).max(soft_cap);
+    let mut out = Vec::with_capacity(draw_count);
+    for _ in 0..draw_count {
+        out.push(rng.random_range(0..m));
+    }
     out.sort_unstable();
+    out.dedup();
     out
 }
 

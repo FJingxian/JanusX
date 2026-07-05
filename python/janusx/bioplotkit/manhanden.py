@@ -43,6 +43,32 @@ def _finite_positive(values) -> np.ndarray:
     return arr[np.isfinite(arr) & (arr > 0.0)]
 
 
+def resolve_manhattan_chr_gap(
+    lengths: Union[np.ndarray, list[float], list[int]],
+    *,
+    interval_ratio: float = 0.5,
+) -> float:
+    """
+    Compute chromosome-gap width for Manhattan plots.
+
+    Gap = interval_ratio * median(chromosome_length) / 3
+    where interval_ratio is expected in [0, 1].
+    """
+    positive = _finite_positive(lengths)
+    if positive.size == 0:
+        return 0.0
+    ratio = float(interval_ratio)
+    if not np.isfinite(ratio):
+        ratio = 0.0
+    ratio = float(np.clip(ratio, 0.0, 1.0))
+    if ratio <= 0.0:
+        return 0.0
+    median_len = float(np.median(positive))
+    if not np.isfinite(median_len) or median_len <= 0.0:
+        return 0.0
+    return float(ratio * median_len / 3.0)
+
+
 def _marker_scatter_style(marker: str) -> dict[str, object]:
     try:
         marker_obj = MarkerStyle(str(marker))
@@ -177,8 +203,8 @@ class GWASPLOT:
     pvalue : str, default 'p'
         Column name for p-values.
     interval_rate : float, default 0.1
-        Spacing ratio between chromosomes on the x-axis
-        (absolute spacing = interval_rate * max_position).
+        Spacing ratio between chromosomes on the x-axis.
+        Absolute spacing = interval_rate * median(chromosome_length) / 3.
     compression : bool, default True
         If True, down-sample SNPs to roughly ~100,000 points for plotting:
           - keep all highly significant points (p <= 10000 / n),
@@ -298,15 +324,16 @@ class GWASPLOT:
                 copy=False,
             )
 
-            # base spacing between chromosomes
-            self.interval = int(interval_rate * int(pos_arr.max()))
-
             # boundaries of each chromosome block in the sorted table
             starts = np.r_[0, np.flatnonzero(np.diff(chr_arr) != 0) + 1]
             ends = np.r_[starts[1:], chr_arr.size] - 1
 
             # cumulative offsets: sum(max_pos of previous chromosomes)
             max_pos_per_chr = np.maximum.reduceat(pos_arr, starts)
+            self.interval = int(round(resolve_manhattan_chr_gap(
+                max_pos_per_chr,
+                interval_ratio=float(interval_rate),
+            )))
             chr_offsets = np.zeros_like(max_pos_per_chr, dtype=np.int64)
             if chr_offsets.size > 1:
                 chr_offsets[1:] = np.cumsum(max_pos_per_chr[:-1], dtype=np.int64)

@@ -65,7 +65,13 @@ for key in ["MPLBACKEND"]:
 
 import matplotlib as mpl
 mpl.use("Agg")
-from janusx.bioplotkit import GWASPLOT, LDblock, apply_integer_xticks, apply_integer_yticks
+from janusx.bioplotkit import (
+    GWASPLOT,
+    LDblock,
+    apply_integer_xticks,
+    apply_integer_yticks,
+    resolve_manhattan_chr_gap,
+)
 from janusx.bioplotkit.geneplot import draw_gene_structure_records
 from janusx.gfreader import load_genotype_chunks, prepare_cli_input_cache
 
@@ -1183,11 +1189,19 @@ def _filter_df_by_bimranges(
     return out, seg_defs, n_before
 
 
-def _build_bimrange_layout(seg_defs: list[dict[str, object]]) -> list[dict[str, object]]:
+def _build_bimrange_layout(
+    seg_defs: list[dict[str, object]],
+    *,
+    interval_ratio: float = 0.5,
+) -> list[dict[str, object]]:
     if len(seg_defs) == 0:
         return []
-    max_len = max(float(s["length"]) for s in seg_defs)
-    gap = (0.06 * max_len) if len(seg_defs) > 1 else 0.0
+    seg_lengths = [float(s["length"]) for s in seg_defs]
+    gap = (
+        float(resolve_manhattan_chr_gap(seg_lengths, interval_ratio=float(interval_ratio)))
+        if len(seg_defs) > 1
+        else 0.0
+    )
     offset = 0.0
     layout: list[dict[str, object]] = []
     for s in seg_defs:
@@ -2300,6 +2314,8 @@ def _ld_min_height_over_width(n_sites: int) -> float:
 
 def _build_layout_from_bimrange_tuples(
     bimrange_tuples: list[tuple[str, int, int]],
+    *,
+    interval_ratio: float = 0.5,
 ) -> list[dict[str, object]]:
     if len(bimrange_tuples) == 0:
         return []
@@ -2315,7 +2331,7 @@ def _build_layout_from_bimrange_tuples(
                 "length": float(max(1, int(end) - int(start))),
             }
         )
-    return _build_bimrange_layout(seg_defs)
+    return _build_bimrange_layout(seg_defs, interval_ratio=float(interval_ratio))
 
 
 def _load_gene_like_records_from_anno(
@@ -3040,7 +3056,10 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
             df = df_sel
         else:
             df = df_sel
-            bim_layout = _build_bimrange_layout(seg_defs)
+            bim_layout = _build_bimrange_layout(
+                seg_defs,
+                interval_ratio=float(args.interval),
+            )
             logger.info(
                 f"Applied {len(args.bimrange_tuples)} bimrange settings: kept {n_after}/{n_before} SNPs."
             )
@@ -3077,7 +3096,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                 chr_col,
                 pos_col,
                 p_col,
-                0.1,
+                float(args.interval),
                 compression=(not args.disable_compression),
             )
             if args.bimrange_tuples is not None and len(bim_layout) > 1:
@@ -3090,7 +3109,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                     chr_col,
                     pos_col,
                     p_col,
-                    0.1,
+                    float(args.interval),
                     compression=False,
                 )
         width_in = float(_PANEL_WIDTH_IN)
@@ -3496,7 +3515,14 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                         logger.info(f"LD block built from {len(sig_keys)} {mode_text}.")
 
             region_ranges = args.bimrange_tuples if args.bimrange_tuples is not None else []
-            region_layout = bim_layout if len(bim_layout) > 0 else _build_layout_from_bimrange_tuples(region_ranges)
+            region_layout = (
+                bim_layout
+                if len(bim_layout) > 0
+                else _build_layout_from_bimrange_tuples(
+                    region_ranges,
+                    interval_ratio=float(args.interval),
+                )
+            )
             use_segmented_gene_x = len(region_layout) > 1
             gene_track_df = pd.DataFrame(
                 columns=["feature", "strand", "attribute", "x_start", "x_end"]
@@ -4185,7 +4211,10 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
             plot_df = df_sel
         else:
             plot_df = df_sel
-            bim_layout = _build_bimrange_layout(seg_defs)
+            bim_layout = _build_bimrange_layout(
+                seg_defs,
+                interval_ratio=float(args.interval),
+            )
             logger.info(
                 f"Applied {len(args.bimrange_tuples)} bimrange settings in merge mode: kept {n_after}/{n_before} SNPs."
             )
@@ -4200,6 +4229,9 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
     xticklabels: list[str] = []
     x_separators: list[float] = []
     use_segmented_layout = len(bim_layout) > 0
+    x_axis_left: Optional[float] = None
+    x_axis_right: Optional[float] = None
+    x_edge_padding: float = 0.0
 
     if needs_positional_merge:
         if use_segmented_layout:
@@ -4223,10 +4255,28 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
                 x_end = float(bim_layout[i]["x_end"])
                 x_next = float(bim_layout[i + 1]["x_start"])
                 x_separators.append(0.5 * (x_end + x_next))
+            x_axis_left = float(bim_layout[0]["x_start"])
+            x_axis_right = float(bim_layout[-1]["x_end"])
+            if len(bim_layout) > 1:
+                seg_gaps = np.asarray(
+                    [
+                        float(bim_layout[i + 1]["x_start"]) - float(bim_layout[i]["x_end"])
+                        for i in range(len(bim_layout) - 1)
+                    ],
+                    dtype=float,
+                )
+                seg_gaps = seg_gaps[np.isfinite(seg_gaps) & (seg_gaps > 0.0)]
+                if seg_gaps.size > 0:
+                    x_edge_padding = 0.5 * float(np.median(seg_gaps))
         else:
+            min_pos_by_chr: dict[str, int] = {}
             max_pos_by_chr: dict[str, int] = {}
             if plot_df.shape[0] > 0:
-                chr_max = plot_df.groupby(chr_col)[pos_col].max()
+                chr_pos = plot_df.groupby(chr_col)[pos_col]
+                chr_min = chr_pos.min()
+                chr_max = chr_pos.max()
+                for chrom, min_pos in chr_min.items():
+                    min_pos_by_chr[str(chrom)] = int(min_pos)
                 for chrom, max_pos in chr_max.items():
                     max_pos_by_chr[str(chrom)] = int(max_pos)
             chrom_order = sorted(max_pos_by_chr.keys(), key=_chrom_sort_key)
@@ -4237,9 +4287,12 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
                 [max(1, int(max_pos_by_chr[c])) for c in chrom_order],
                 dtype=float,
             )
-            gap = int(max(1.0, float(np.nanmedian(chr_lens)) * 0.02))
-            offsets: dict[str, int] = {}
-            cursor = 0
+            gap = float(resolve_manhattan_chr_gap(
+                chr_lens,
+                interval_ratio=float(args.interval),
+            ))
+            offsets: dict[str, float] = {}
+            cursor = 0.0
             for i, chrom in enumerate(chrom_order):
                 length = max(1, int(max_pos_by_chr[chrom]))
                 offsets[chrom] = cursor
@@ -4253,6 +4306,12 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
                 plot_df[chr_col].astype(str).map(offsets).fillna(0).astype(float)
                 + pd.to_numeric(plot_df[pos_col], errors="coerce").fillna(0.0).astype(float)
             )
+            first_chr = chrom_order[0]
+            last_chr = chrom_order[-1]
+            x_axis_left = float(offsets[first_chr]) + float(min_pos_by_chr.get(first_chr, 0))
+            x_axis_right = float(offsets[last_chr]) + float(max_pos_by_chr.get(last_chr, 1))
+            if gap > 0.0:
+                x_edge_padding = 0.5 * float(gap)
 
     if plot_df.shape[0] > 0:
         pvals_draw = np.asarray(plot_df[p_col], dtype=float)
@@ -4360,7 +4419,15 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
 
         ax.set_xlabel("chrom")
         ax.set_ylabel("-log10(p)")
-        if len(draw_xmins) > 0 and len(draw_xmaxs) > 0:
+        if (
+            x_axis_left is not None
+            and x_axis_right is not None
+            and np.isfinite(float(x_axis_left))
+            and np.isfinite(float(x_axis_right))
+        ):
+            xmin = float(x_axis_left) - float(max(0.0, x_edge_padding))
+            xmax = float(x_axis_right) + float(max(0.0, x_edge_padding))
+        elif len(draw_xmins) > 0 and len(draw_xmaxs) > 0:
             xmin = float(np.nanmin(np.asarray(draw_xmins, dtype=float)))
             xmax = float(np.nanmax(np.asarray(draw_xmaxs, dtype=float)))
         else:
@@ -4384,6 +4451,16 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
                 bim_layout,
                 label_fontsize=manh_loc_fontsize,
             )
+            if (
+                x_axis_left is not None
+                and x_axis_right is not None
+                and np.isfinite(float(x_axis_left))
+                and np.isfinite(float(x_axis_right))
+            ):
+                left = float(x_axis_left) - float(max(0.0, x_edge_padding))
+                right = float(x_axis_right) + float(max(0.0, x_edge_padding))
+                if right > left:
+                    ax.set_xlim(left, right)
         else:
             for xsep in x_separators:
                 ax.axvline(
@@ -4684,7 +4761,10 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
                 region_layout = (
                     bim_layout
                     if len(bim_layout) > 0
-                    else _build_layout_from_bimrange_tuples(region_ranges)
+                    else _build_layout_from_bimrange_tuples(
+                        region_ranges,
+                        interval_ratio=float(args.interval),
+                    )
                 )
                 use_segmented_gene_x = len(region_layout) > 1
                 gene_track_df = _project_gene_records_to_plot_x(
@@ -5537,6 +5617,14 @@ def main(argv: Optional[list[str]] = None):
         help="Scatter marker size for Manhattan and QQ plots (default: %(default)s).",
     )
     optional_group.add_argument(
+        "-interval", "--interval", type=float, default=0.5,
+        help=(
+            "Chromosome-gap ratio for Manhattan x-axis spacing in [0,1]. "
+            "Gap = ratio * median(chromosome length) / 10. "
+            "Default: %(default)s."
+        ),
+    )
+    optional_group.add_argument(
         "-marker", "--marker", type=str, default=None,
         help=(
             "Scatter marker(s). Single/non-merge plotting uses the first marker only "
@@ -5634,8 +5722,23 @@ def main(argv: Optional[list[str]] = None):
             "(choose from: pdf, png, svg, tif)"
         )
         raise SystemExit(1)
+    if args.format == "pdf" and _postgwas_resolve_pdf_backend() is None:
+        logger.warning(
+            "Warning: Cairo PDF backend is unavailable because `pycairo` is not installed. "
+            "PDF export will fall back to the default Matplotlib backend. "
+            "If you need to edit the PDF in Adobe Illustrator, please run: "
+            "`pip install pycairo`."
+        )
     if args.scatter_size <= 0:
         logger.error("scatter-size must be > 0.")
+        raise SystemExit(1)
+    try:
+        args.interval = float(args.interval)
+    except Exception:
+        logger.error("interval must be a finite number in [0,1].")
+        raise SystemExit(1)
+    if (not np.isfinite(args.interval)) or (args.interval < 0.0) or (args.interval > 1.0):
+        logger.error("interval must be in [0,1].")
         raise SystemExit(1)
     try:
         if args.ylim is not None:
@@ -5959,6 +6062,7 @@ def main(argv: Optional[list[str]] = None):
                 (
                     "Single Manhattan",
                     f"ratio={args.manh_ratio}, palette={single_manh_pal_text}, "
+                    f"interval={args.interval:g}, "
                     f"ylim={args.ylim if args.ylim is not None else 'auto'}, "
                     f"compression={comp_text}",
                 )
@@ -5983,6 +6087,7 @@ def main(argv: Optional[list[str]] = None):
                 (
                     "Merged Manhattan",
                     f"ratio={args._merge_manh_ratio}, palette={merge_manh_pal_text}, "
+                    f"interval={args.interval:g}, "
                     f"ylim={args.ylim if args.ylim is not None else 'auto'}",
                 )
             )

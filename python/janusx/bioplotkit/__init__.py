@@ -12,6 +12,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
     "GWASPLOT": ("janusx.bioplotkit.manhanden", "GWASPLOT"),
     "apply_integer_xticks": ("janusx.bioplotkit.manhanden", "apply_integer_xticks"),
     "apply_integer_yticks": ("janusx.bioplotkit.manhanden", "apply_integer_yticks"),
+    "resolve_manhattan_chr_gap": ("janusx.bioplotkit.manhanden", "resolve_manhattan_chr_gap"),
     "LDblock": ("janusx.bioplotkit.LDBlock", "LDblock"),
     "gsplot": ("janusx.bioplotkit.gsplot", None),
     "color_set": ("janusx.bioplotkit.sci_set", "color_set"),

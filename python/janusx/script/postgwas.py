@@ -1312,7 +1312,7 @@ def _apply_multi_bimrange_manhattan_axis(
         x_end = float(layout[i]["x_end"])
         x_next = float(layout[i + 1]["x_start"])
         xb = 0.5 * (x_end + x_next)
-        ax.axvline(x=xb, color="black", linestyle=":", linewidth=0.7, alpha=1)
+        ax.axvline(x=xb, color="black", linestyle=":", linewidth=0.7, alpha=0.9)
         prev_end_lab = _sanitize_plot_text(
             f"{layout[i]['chrom']}:{int(layout[i]['end']) / 1_000_000:g}Mb"
         )
@@ -2670,7 +2670,7 @@ def _overlay_manhattan_threshold_points(
             color="red",
             marker=str(marker),
             s=float(base_size) * 1.5,
-            alpha=1,
+            alpha=0.85,
             rasterized=rasterized,
             zorder=6,
             **_marker_scatter_style(str(marker)),
@@ -2968,6 +2968,42 @@ def _save_figure_and_close(fig: plt.Figure, path: str) -> None:
     plt.close(fig)
 
 
+def _add_postgwas_annotation_source_args(
+    group: argparse._ArgumentGroup,
+) -> None:
+    anno_src_group = group.add_mutually_exclusive_group(required=False)
+    anno_src_group.add_argument(
+        "-gff",
+        "--gff",
+        type=str,
+        default=None,
+        help=(
+            "Annotation source in GFF/GFF3 format, shared by "
+            "--anno output and --ldblock/--ldblock-all gene-structure tracks."
+        ),
+    )
+    anno_src_group.add_argument(
+        "-bed",
+        "--bed",
+        type=str,
+        default=None,
+        help=(
+            "Annotation source in BED format, shared by "
+            "--anno output and --ldblock/--ldblock-all gene-structure tracks."
+        ),
+    )
+
+
+def _resolve_postgwas_annotation_file(args) -> Optional[str]:
+    gff = str(getattr(args, "gff", "") or "").strip()
+    if gff != "":
+        return gff
+    bed = str(getattr(args, "bed", "") or "").strip()
+    if bed != "":
+        return bed
+    return None
+
+
 def GWASplot(file: str, args, logger:logging.Logger) -> None:
     """
     Plot Manhattan/QQ figures and optionally annotate significant hits
@@ -2994,8 +3030,8 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
 
     chr_col, pos_col, p_col = args.chr, args.pos, args.pvalue
     anno_suffix = (
-        str(args.anno).replace(".gz", "").split(".")[-1].lower()
-        if args.anno
+        str(args.anno_file).replace(".gz", "").split(".")[-1].lower()
+        if args.anno_file
         else None
     )
     gff_query_cache: Optional[GFFQuery] = None
@@ -3222,7 +3258,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                         draw_hl_y,
                         marker="D",
                         color="red",
-                        alpha=1,
+                        alpha=0.85,
                         zorder=10,
                         s=args.scatter_size,
                         **_marker_scatter_style("D"),
@@ -3528,11 +3564,11 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                 columns=["feature", "strand", "attribute", "x_start", "x_end"]
             )
             use_gene_bridge = False
-            if args.anno:
+            if args.anno_file:
                 if anno_suffix in {"gff", "gff3"} and gff_query_cache is None:
-                    gff_query_cache = GFFQuery.from_file(args.anno)
+                    gff_query_cache = GFFQuery.from_file(args.anno_file)
                 gene_raw = _load_gene_like_records_from_anno(
-                    args.anno,
+                    args.anno_file,
                     region_ranges,
                     logger,
                     gff_query=gff_query_cache,
@@ -3895,7 +3931,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
             f"Annotating significant SNPs from {src}...",
             enabled=status_enabled,
         ) as anno_status:
-            if not os.path.exists(args.anno):
+            if not args.anno_file or (not os.path.exists(args.anno_file)):
                 anno_status.complete(
                     "Annotating significant SNPs ...Skipped (annotation file not found)"
                 )
@@ -3966,9 +4002,9 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                     #   anno[3] = gene ID
                     #   anno[4], anno[5] = description fields
                     if anno_suffix in {"gff", "gff3"} and gff_query_cache is not None:
-                        anno = readanno(args.anno, _ANNO_DESC_KEY, gff_data=gff_query_cache.gff)
+                        anno = readanno(args.anno_file, _ANNO_DESC_KEY, gff_data=gff_query_cache.gff)
                     else:
-                        anno = readanno(args.anno, _ANNO_DESC_KEY)
+                        anno = readanno(args.anno_file, _ANNO_DESC_KEY)
                     anno_chr = anno[0].astype(str).map(_normalize_chr)
 
                     # Exact overlap annotation
@@ -4385,7 +4421,7 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
                     y_keep[nonsig_keep],
                     color="lightgrey",
                     marker=series_markers[i],
-                    alpha=1,
+                    alpha=0.45,
                     s=args.scatter_size,
                     rasterized=rasterized,
                     **_marker_scatter_style(series_markers[i]),
@@ -4396,7 +4432,7 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
                     y_keep[sig_keep],
                     color=series_colors[i],
                     marker=series_markers[i],
-                    alpha=1,
+                    alpha=0.75,
                     s=args.scatter_size,
                     rasterized=rasterized,
                     **_marker_scatter_style(series_markers[i]),
@@ -4407,7 +4443,7 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
                     [],
                     color=series_colors[i],
                     marker=series_markers[i],
-                    alpha=1,
+                    alpha=0.75,
                     s=args.scatter_size,
                     label=series_labels[i],
                     **_marker_scatter_style(series_markers[i]),
@@ -4551,7 +4587,7 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
                 obs,
                 s=args.scatter_size,
                 marker=series_markers[i],
-                alpha=1,
+                alpha=0.5,
                 rasterized=rasterized,
                 color=series_colors[i],
                 **_marker_scatter_style(series_markers[i]),
@@ -4562,7 +4598,7 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
                     [],
                     s=args.scatter_size,
                     marker=series_markers[i],
-                    alpha=1,
+                    alpha=0.75,
                     color=series_colors[i],
                     label=series_labels[i],
                     **_marker_scatter_style(series_markers[i]),
@@ -4742,18 +4778,18 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
         ld_path = os.path.join(args.out, f"{args.prefix}.merge.ldblock.{args.format}")
         _save_figure_and_close(fig_ld, ld_path)
 
-        if args.anno:
+        if args.anno_file:
             if len(region_ranges) == 0:
                 logger.warning(
-                    "Warning: --anno in merge mode requires --bimrange for gene-structure plotting; gene plot skipped."
+                    "Warning: annotation source in merge mode requires --bimrange for gene-structure plotting; gene plot skipped."
                 )
             else:
-                anno_suffix = str(args.anno).replace(".gz", "").split(".")[-1].lower()
+                anno_suffix = str(args.anno_file).replace(".gz", "").split(".")[-1].lower()
                 gff_query_cache: Optional[GFFQuery] = None
                 if anno_suffix in {"gff", "gff3"}:
-                    gff_query_cache = GFFQuery.from_file(args.anno)
+                    gff_query_cache = GFFQuery.from_file(args.anno_file)
                 gene_raw = _load_gene_like_records_from_anno(
-                    args.anno,
+                    args.anno_file,
                     region_ranges,
                     logger,
                     gff_query=gff_query_cache,
@@ -4940,13 +4976,13 @@ def _run_postgwas_ldblock_only(args, logger: logging.Logger) -> None:
 
     gene_track_df = pd.DataFrame(columns=["feature", "strand", "attribute", "x_start", "x_end"])
     use_gene_panel = False
-    if args.anno:
-        anno_suffix = str(args.anno).replace(".gz", "").split(".")[-1].lower()
+    if args.anno_file:
+        anno_suffix = str(args.anno_file).replace(".gz", "").split(".")[-1].lower()
         gff_query_cache: Optional[GFFQuery] = None
         if anno_suffix in {"gff", "gff3"}:
-            gff_query_cache = GFFQuery.from_file(args.anno)
+            gff_query_cache = GFFQuery.from_file(args.anno_file)
         gene_raw = _load_gene_like_records_from_anno(
-            args.anno,
+            args.anno_file,
             region_ranges,
             logger,
             gff_query=gff_query_cache,
@@ -5435,23 +5471,85 @@ def main(argv: Optional[list[str]] = None):
         epilog=minimal_help_epilog([
             "jx postgwas -gwasfile result.lmm.tsv -manh -qq",
             "jx postgwas -i a.tsv b.tsv -manh-merge -qq-merge -marker '1,o,x'",
-            "jx postgwas -gwasfile result.lmm.tsv -a genes.bed -ab 50",
-            "jx postgwas -bfile test/geno -bimrange 1:1-2 -ldblock-all",
+            "jx postgwas -gwasfile result.lmm.tsv -a -gff genes.gff3 -ab 50",
+            "jx postgwas -bfile test/geno -bimrange 1:1-2 -ldblock-all -bed genes.bed",
         ]),
     )
 
     # ------------------------------------------------------------------
-    # Input arguments
+    # Required GWAS input
     # ------------------------------------------------------------------
-    input_group = parser.add_argument_group("Input Arguments")
-    input_group.add_argument(
+    required_group = parser.add_argument_group("Required GWAS Input")
+    required_group.add_argument(
         "-i", "-gwasfile", "--gwasfile", nargs="+", type=str, required=False, default=None,
         help=(
             "One or more GWAS result files (tab-delimited). "
             "Optional only when running LD block only with genotype input."
         ),
     )
-    geno_group = input_group.add_mutually_exclusive_group(required=False)
+
+    # ------------------------------------------------------------------
+    # Manhattan Plot
+    # ------------------------------------------------------------------
+    manh_group = parser.add_argument_group("Manhattan Plot")
+    manh_group.add_argument(
+        "-manh", "--manh", type=str, nargs="?", const="2", default=None,
+        help=(
+            "Enable Manhattan plotting with aspect ratio (width/height). "
+            "Examples: --manh (default 2), --manh 2, --manh 3/2."
+        ),
+    )
+    manh_group.add_argument(
+        "-manh-merge", "--manh-merge", dest="manh_merge", type=str, nargs="?", const="2", default=None,
+        help=(
+            "Draw one merged Manhattan plot from the GWAS files passed by -i. "
+            "Ratio parsing matches --manh."
+        ),
+    )
+    manh_group.add_argument(
+        "-palette", "--palette", dest="palette", type=str, default=None,
+        help=(
+            "Manhattan color palette and QQ scatter color palette "
+            "(QQ confidence band always stays grey). "
+            "Supports cmap names (e.g. tab10, tab20) or ';'-separated colors "
+            "(e.g. #1f77b4;#ff7f0e or (215,123,254);(1,1,1)). "
+            "A single color is also accepted. "
+            "If omitted, use default black for QQ scatter and black/grey for Manhattan."
+        ),
+    )
+    manh_group.add_argument(
+        "-interval", "--interval", type=float, default=0.5,
+        help=(
+            "Chromosome-gap ratio for Manhattan x-axis spacing in [0,1]. "
+            "Gap = ratio * median(chromosome length) / 10. "
+            "Default: %(default)s."
+        ),
+    )
+
+    # ------------------------------------------------------------------
+    # QQ Plot
+    # ------------------------------------------------------------------
+    qq_group = parser.add_argument_group("Q-Q Plot")
+    qq_group.add_argument(
+        "-qq", "--qq", type=str, nargs="?", const="5/4", default=None,
+        help=(
+            "Enable QQ plotting in auto mode with aspect ratio (width/height). "
+            "Examples: --qq (default 5/4), --qq 5/4, --qq 2."
+        ),
+    )
+    qq_group.add_argument(
+        "-qq-merge", "--qq-merge", dest="qq_merge", type=str, nargs="?", const="5/4", default=None,
+        help=(
+            "Draw one merged QQ plot from the GWAS files passed by -i. "
+            "Ratio parsing matches --qq."
+        ),
+    )
+
+    # ------------------------------------------------------------------
+    # LDBlock Plot
+    # ------------------------------------------------------------------
+    ldblock_group = parser.add_argument_group("LDBlock Plot")
+    geno_group = ldblock_group.add_mutually_exclusive_group(required=False)
     geno_group.add_argument(
         "-bfile", "--bfile", type=str, default=None,
         help="Genotype PLINK prefix (for LD block/LD clump).",
@@ -5471,24 +5569,8 @@ def main(argv: Optional[list[str]] = None):
             "Requires sibling prefix.id. For LD/LDclump, also requires real prefix.site or prefix.bim."
         ),
     )
-    input_group.add_argument(
-        "-a", "--anno", type=str, default=None,
-        help="Annotation file: .gff/.gff3 or .bed.",
-    )
-
-    # ------------------------------------------------------------------
-    # Plot arguments
-    # ------------------------------------------------------------------
-    plot_group = parser.add_argument_group("Plot Arguments")
-    plot_group.add_argument(
-        "-manh", "--manh", type=str, nargs="?", const="2", default=None,
-        help=(
-            "Enable Manhattan plotting with aspect ratio (width/height). "
-            "Examples: --manh (default 2), --manh 2, --manh 3/2."
-        ),
-    )
-    ldblock_group = plot_group.add_mutually_exclusive_group(required=False)
-    ldblock_group.add_argument(
+    ldblock_mode_group = ldblock_group.add_mutually_exclusive_group(required=False)
+    ldblock_mode_group.add_argument(
         "-ldblock", "--ldblock", type=str, nargs="?", const="2", default=None,
         help=(
             "Enable LD block inverted triangle plotting with aspect ratio (width/height), "
@@ -5500,7 +5582,7 @@ def main(argv: Optional[list[str]] = None):
             "which keeps ratio=2 by default."
         ),
     )
-    ldblock_group.add_argument(
+    ldblock_mode_group.add_argument(
         "-ldblock-all", "--ldblock-all", dest="ldblock_all", type=str, nargs="?", const="2", default=None,
         help=(
             "Enable LD block inverted triangle plotting with aspect ratio (width/height), "
@@ -5512,95 +5594,7 @@ def main(argv: Optional[list[str]] = None):
             "which keeps ratio=2 by default."
         ),
     )
-    plot_group.add_argument(
-        "-qq", "--qq", type=str, nargs="?", const="5/4", default=None,
-        help=(
-            "Enable QQ plotting in auto mode with aspect ratio (width/height). "
-            "Examples: --qq (default 5/4), --qq 5/4, --qq 2."
-        ),
-    )
-    plot_group.add_argument(
-        "-manh-merge", "--manh-merge", dest="manh_merge", type=str, nargs="?", const="2", default=None,
-        help=(
-            "Draw one merged Manhattan plot from the GWAS files passed by -i. "
-            "Ratio parsing matches --manh."
-        ),
-    )
-    plot_group.add_argument(
-        "-qq-merge", "--qq-merge", dest="qq_merge", type=str, nargs="?", const="5/4", default=None,
-        help=(
-            "Draw one merged QQ plot from the GWAS files passed by -i. "
-            "Ratio parsing matches --qq."
-        ),
-    )
-
-    # ------------------------------------------------------------------
-    # Optional arguments
-    # ------------------------------------------------------------------
-    optional_group = parser.add_argument_group("Optional Arguments")
-    optional_group.add_argument(
-        "-chr", "--chr", type=str, default="chrom",
-        help="Column name for chromosome (default: %(default)s).",
-    )
-    optional_group.add_argument(
-        "-pos", "--pos", type=str, default="pos",
-        help="Column name for base position (default: %(default)s).",
-    )
-    optional_group.add_argument(
-        "-pvalue", "--pvalue", type=str, default="pwald",
-        help="Column name for p-value (default: %(default)s).",
-    )
-    optional_group.add_argument(
-        "-thr", "--thr", dest="thr", type=float, default=None,
-        help="P-value threshold; if not set, use 0.05 / nSNP (default: %(default)s).",
-    )
-    optional_group.add_argument(
-        "-threshold", "--threshold", dest="thr", type=float, default=argparse.SUPPRESS,
-        help=argparse.SUPPRESS,
-    )
-    optional_group.add_argument(
-        "-LDclump", "--LDclump", dest="ldclump", nargs=2, default=None,
-        metavar=("WINDOW", "R2"),
-        help=(
-            "Enable LD clumping for annotation output using threshold-passing SNPs only. "
-            "Format: --LDclump <window> <r2>, e.g. --LDclump 500kb 0.8. "
-            "Window supports kb/mb/bp (no unit defaults to kb). "
-            "Requires genotype input via --bfile/--vcf/--hmp/--file."
-        ),
-    )
-    optional_group.add_argument(
-        "-bimrange", "--bimrange", type=str, action="append", default=None,
-        help=(
-            "Plotting range filter in Mb, format chr:start-end "
-            "(also accepts chr:start:end). "
-            "If start/end are integer-like and >6 digits, they are auto-treated as bp "
-            "(with warning) and axis labels are shown in Mb. "
-            "Can be specified multiple times."
-        ),
-    )
-    optional_group.add_argument(
-        "-ylim", "--ylim", type=str, default=None,
-        help=(
-            "Y range for Manhattan as <max>, <min:max>, <min:>, or <:max> "
-            "(also accepts '-' as separator), e.g. --ylim 6, --ylim 0:6, "
-            "--ylim 2:, --ylim :6. Missing bound is auto-determined. "
-            "Points outside this range are filtered before Manhattan scatter "
-            "to speed plotting. QQ keeps all threshold-passing points and "
-            "can down-sample sub-threshold points for speed."
-        ),
-    )
-    optional_group.add_argument(
-        "-palette", "--palette", dest="palette", type=str, default=None,
-        help=(
-            "Manhattan color palette and QQ scatter color palette "
-            "(QQ confidence band always stays grey). "
-            "Supports cmap names (e.g. tab10, tab20) or ';'-separated colors "
-            "(e.g. #1f77b4;#ff7f0e or (215,123,254);(1,1,1)). "
-            "A single color is also accepted. "
-            "If omitted, use default black for QQ scatter and black/grey for Manhattan."
-        ),
-    )
-    optional_group.add_argument(
+    ldblock_group.add_argument(
         "-ldblock-palette", "--ldblock-palette",
         dest="ldblock_palette",
         type=str,
@@ -5612,48 +5606,109 @@ def main(argv: Optional[list[str]] = None):
             "If omitted, LD block keeps default greyscale."
         ),
     )
-    optional_group.add_argument(
-        "-scatter-size", "--scatter-size", type=float, default=8.0,
-        help="Scatter marker size for Manhattan and QQ plots (default: %(default)s).",
-    )
-    optional_group.add_argument(
-        "-interval", "--interval", type=float, default=0.5,
+
+    # ------------------------------------------------------------------
+    # Variant Annotation
+    # ------------------------------------------------------------------
+    anno_group = parser.add_argument_group("Variant Annotation")
+    anno_group.add_argument(
+        "-a", "--anno", action="store_true", default=False,
         help=(
-            "Chromosome-gap ratio for Manhattan x-axis spacing in [0,1]. "
-            "Gap = ratio * median(chromosome length) / 10. "
-            "Default: %(default)s."
+            "Enable significant-variant annotation table output. "
+            "Requires one annotation source from --gff or --bed."
         ),
     )
-    optional_group.add_argument(
+    anno_group.add_argument(
+        "-ab", "--annobroaden", type=float, default=None,
+        help="Broaden the annotation window around SNPs (Kb) (default: %(default)s).",
+    )
+    anno_group.add_argument(
+        "-LDclump", "--LDclump", dest="ldclump", nargs=2, default=None,
+        metavar=("WINDOW", "R2"),
+        help=(
+            "Enable LD clumping for annotation output using threshold-passing SNPs only. "
+            "Format: --LDclump <window> <r2>, e.g. --LDclump 500kb 0.8. "
+            "Window supports kb/mb/bp (no unit defaults to kb). "
+            "Requires genotype input via --bfile/--vcf/--hmp/--file."
+        ),
+    )
+
+    # ------------------------------------------------------------------
+    # Common Parameters
+    # ------------------------------------------------------------------
+    common_group = parser.add_argument_group("Common Parameters")
+    common_group.add_argument(
+        "-chr", "--chr", type=str, default="chrom",
+        help="Column name for chromosome (default: %(default)s).",
+    )
+    common_group.add_argument(
+        "-pos", "--pos", type=str, default="pos",
+        help="Column name for base position (default: %(default)s).",
+    )
+    common_group.add_argument(
+        "-pvalue", "--pvalue", type=str, default="pwald",
+        help="Column name for p-value (default: %(default)s).",
+    )
+    common_group.add_argument(
+        "-thr", "--thr", dest="thr", type=float, default=None,
+        help="P-value threshold; if not set, use 0.05 / nSNP (default: %(default)s).",
+    )
+    common_group.add_argument(
+        "-threshold", "--threshold", dest="thr", type=float, default=argparse.SUPPRESS,
+        help=argparse.SUPPRESS,
+    )
+    common_group.add_argument(
+        "-bimrange", "--bimrange", type=str, action="append", default=None,
+        help=(
+            "Shared plotting range filter for single/merged Manhattan, LD block, "
+            "and Manhattan+LD/gene-track layouts. Format chr:start-end "
+            "(also accepts chr:start:end). If start/end are integer-like and >6 digits, "
+            "they are auto-treated as bp (with warning) and axis labels are shown in Mb. "
+            "Can be specified multiple times. QQ/QQ-merge are disabled when this is set."
+        ),
+    )
+    common_group.add_argument(
+        "-ylim", "--ylim", type=str, default=None,
+        help=(
+            "Shared y-range control for Manhattan, merged Manhattan, QQ, and merged QQ "
+            "as <max>, <min:max>, <min:>, or <:max> (also accepts '-' as separator). "
+            "Examples: --ylim 6, --ylim 0:6, --ylim 2:, --ylim :6."
+        ),
+    )
+    common_group.add_argument(
+        "-scatter-size", "--scatter-size", type=float, default=8.0,
+        help=(
+            "Shared scatter marker size for Manhattan, merged Manhattan, QQ, and merged QQ "
+            "(default: %(default)s)."
+        ),
+    )
+    common_group.add_argument(
         "-marker", "--marker", type=str, default=None,
         help=(
-            "Scatter marker(s). Single/non-merge plotting uses the first marker only "
-            "(default: o). Merge plotting cycles markers by input GWAS file; "
-            "default cycle is 1,2,3,4,*,+,x. "
+            "Shared scatter marker control for single Manhattan/QQ and merged Manhattan/QQ. "
+            "Single/non-merge uses the first marker only (default: o). "
+            "Merge plotting cycles markers by input GWAS file; default cycle is 1,2,3,4,*,+,x. "
             "Example: --marker '1,o,x'."
         ),
     )
-    optional_group.add_argument(
+    common_group.add_argument(
         "-full", "--full", "-fullscatter", "--fullscatter",
         dest="fullscatter",
         action="store_true",
         default=False,
         help=(
-            "Disable scatter compression for both Manhattan and QQ and draw all points "
-            "(no fast optimization; no 0.5 cut)."
+            "Disable scatter compression for single/merged Manhattan and single/merged QQ "
+            "and draw all points (no fast optimization; no 0.5 cut)."
         ),
     )
-    optional_group.add_argument(
+    _add_postgwas_annotation_source_args(common_group)
+    common_group.add_argument(
         "-fmt", "--fmt", dest="format", type=str, default="png",
         help="Output figure format: pdf, png, svg, tif (default: %(default)s).",
     )
-    optional_group.add_argument(
-        "-ab", "--annobroaden", type=float, default=None,
-        help="Broaden the annotation window around SNPs (Kb) (default: %(default)s).",
-    )
-    add_common_out_arg(optional_group, default=".", help_profile="plot_annotation")
+    add_common_out_arg(common_group, default=".", help_profile="plot_annotation")
     add_common_prefix_arg(
-        optional_group,
+        common_group,
         default=None,
         help_text=(
             "Output prefix. For single-GWAS plotting, figures are saved as "
@@ -5662,7 +5717,7 @@ def main(argv: Optional[list[str]] = None):
         ),
     )
     add_common_thread_arg(
-        optional_group,
+        common_group,
         default_threads=detect_effective_threads(),
         help_profile="default",
     )
@@ -5684,6 +5739,7 @@ def main(argv: Optional[list[str]] = None):
         if args.gwasfile is not None
         else []
     )
+    args.anno_file = _resolve_postgwas_annotation_file(args)
 
     args.out = os.path.normpath(args.out if args.out is not None else ".")
     user_prefix = str(args.prefix).strip() if args.prefix is not None else ""
@@ -5739,6 +5795,9 @@ def main(argv: Optional[list[str]] = None):
         raise SystemExit(1)
     if (not np.isfinite(args.interval)) or (args.interval < 0.0) or (args.interval > 1.0):
         logger.error("interval must be in [0,1].")
+        raise SystemExit(1)
+    if bool(args.anno) and args.anno_file is None:
+        logger.error("Variant annotation requires one annotation source from --gff or --bed.")
         raise SystemExit(1)
     try:
         if args.ylim is not None:
@@ -5900,7 +5959,7 @@ def main(argv: Optional[list[str]] = None):
         )
         args.ldclump_window_bp = None
         args.ldclump_r2 = None
-    if args.ldclump_window_bp is not None and args.anno is None:
+    if args.ldclump_window_bp is not None and (not bool(args.anno)):
         logger.warning(
             "Warning: --LDclump only affects --anno output; --LDclump is ignored."
         )
@@ -5913,7 +5972,7 @@ def main(argv: Optional[list[str]] = None):
     single_plot_requested = bool(
         (args.manh_ratio is not None)
         or (args.qq_ratio is not None)
-        or (args.anno is not None)
+        or bool(args.anno)
         or ((args.ldblock_ratio is not None) and (len(args.gwasfile) > 0))
     )
     args.merge_mode = bool(merge_plot_requested)
@@ -5958,9 +6017,9 @@ def main(argv: Optional[list[str]] = None):
                 "Warning: --qq requires GWAS result file(s); it is ignored in LD-only mode."
             )
             args.qq_ratio = None
-        if args.anno is not None:
+        if args.anno_file is not None:
             logger.info(
-                "LD-only mode: --anno will be used for gene-structure track above LD block."
+                "LD-only mode: annotation source will be used for gene-structure track above LD block."
             )
         if args.ldclump_window_bp is not None:
             logger.warning(
@@ -6128,12 +6187,13 @@ def main(argv: Optional[list[str]] = None):
                 ),
             )
     anno_rows: Optional[list[tuple[str, str]]] = None
-    if args.anno:
+    if bool(args.anno) or args.anno_file is not None:
         anno_rows = [
-            ("Anno file", str(args.anno)),
+            ("Variant annotation", "on" if bool(args.anno) else "off"),
+            ("Annotation source", str(args.anno_file) if args.anno_file is not None else "NA"),
             ("Window (kb)", str(args.annobroaden)),
         ]
-        if args.ldclump_window_bp is None:
+        if (not bool(args.anno)) or args.ldclump_window_bp is None:
             anno_rows.append(("LD clump", "off"))
         else:
             anno_rows.append(
@@ -6178,8 +6238,8 @@ def main(argv: Optional[list[str]] = None):
     checks: list[bool] = [
         ensure_file_exists(logger, f, "GWAS result file") for f in check_gwas_files
     ]
-    if args.anno:
-        checks.append(ensure_file_exists(logger, args.anno, "Annotation file"))
+    if args.anno_file is not None:
+        checks.append(ensure_file_exists(logger, args.anno_file, "Annotation file"))
     if args.vcf:
         checks.append(ensure_file_exists(logger, args.vcf, "Genotype VCF file"))
     if args.hmp:

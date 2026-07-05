@@ -39,6 +39,29 @@ def _heading_orange(text: str) -> str:
     return text
 
 
+def _format_help_group_name(text: str) -> str:
+    """
+    Title-case plain argparse headings while preserving acronym-heavy tokens.
+
+    Examples:
+      required gwas input -> Required Gwas Input
+      Required GWAS Input -> Required GWAS Input
+      LDBlock Plot -> LDBlock Plot
+      Q-Q Plot -> Q-Q Plot
+    """
+
+    def _format_token(token: str) -> str:
+        if token == "":
+            return token
+        if any(ch.isupper() for ch in token[1:]) or token.isupper() or any(ch.isdigit() for ch in token):
+            return token
+        if "-" in token:
+            return "-".join(_format_token(part) for part in token.split("-"))
+        return token[:1].upper() + token[1:]
+
+    return " ".join(_format_token(part) for part in str(text).split(" "))
+
+
 def cli_help_formatter() -> type[argparse.HelpFormatter]:
     term_width = max(40, int(shutil.get_terminal_size((100, 20)).columns))
     help_pos = min(32, max(20, term_width // 3))
@@ -48,6 +71,7 @@ def cli_help_formatter() -> type[argparse.HelpFormatter]:
         class _Formatter(RawDescriptionRichHelpFormatter):  # type: ignore[misc, valid-type]
             styles = RawDescriptionRichHelpFormatter.styles.copy()  # type: ignore[attr-defined]
             styles["argparse.groups"] = "orange3"
+            group_name_formatter = staticmethod(_format_help_group_name)
 
             def __init__(self, prog: str) -> None:
                 super().__init__(prog, width=term_width, max_help_position=help_pos)
@@ -59,6 +83,7 @@ def cli_help_formatter() -> type[argparse.HelpFormatter]:
         class _Formatter(RichHelpFormatter):  # type: ignore[misc, valid-type]
             styles = RichHelpFormatter.styles.copy()  # type: ignore[attr-defined]
             styles["argparse.groups"] = "orange3"
+            group_name_formatter = staticmethod(_format_help_group_name)
 
             def __init__(self, prog: str) -> None:
                 super().__init__(prog, width=term_width, max_help_position=help_pos)

@@ -23,7 +23,6 @@ from janusx.script._common.memory import (
 
 from .workflow import (
     CliStatus,
-    FastLMM,
     FvLMM,
     LM,
     LMM,
@@ -34,7 +33,6 @@ from .workflow import (
     _as_plink_prefix,
     _display_path,
     _emit_trait_header,
-    _fastlmm_should_switch_to_lmm,
     _finalize_gwas_result_tsv,
     _format_progress_metric,
     _cleanup_gwas_result_tmp,
@@ -310,7 +308,7 @@ def run_chunked_gwas_lmm_lm(
     trait_prepared_meta: Optional[dict[str, object]] = None,
 ) -> None:
     """
-    Run LM/LMM/LMM2/FastLMM/FvLMM GWAS through the maintained windowed BED path.
+    Run LM/LMM/LMM2/FvLMM GWAS through the maintained windowed BED path.
 
     Important: This function assumes pheno/ids/grm/q/cov have already been prepared
     once (no repeated "Loading phenotype" / "Loading GRM/Q" logs).
@@ -320,7 +318,6 @@ def run_chunked_gwas_lmm_lm(
         "lmm2": LMM2,
         "lm": LM,
         "lm2": LM,
-        "fastlmm": FastLMM,
         "fvlmm": FvLMM,
     }
     model_key = model_name.lower()
@@ -330,15 +327,14 @@ def run_chunked_gwas_lmm_lm(
         "lmm2": "LMM2",
         "lm": "LM",
         "lm2": "LM2",
-        "fastlmm": "FastLMM",
         "fvlmm": "FvLMM",
     }[model_key]
     # Keep output file suffixes consistent and lowercase.
     base_model_tag = base_model_label.lower()
 
-    # FastLMM route: reuse prepared streaming GRM and slice to trait samples.
+    # FvLMM route: reuse prepared streaming GRM and slice to trait samples.
     # Do NOT rebuild packed GRM here.
-    if model_key in {"fastlmm", "fvlmm"}:
+    if model_key == "fvlmm":
         _log_file_only(
             logger,
             logging.INFO,
@@ -544,7 +540,7 @@ def run_chunked_gwas_lmm_lm(
     # to reduce Python per-chunk orchestration overhead.
     use_shared_prepared_bus_single = bool(
         (
-            model_key in {"lmm", "lmm2", "fastlmm", "fvlmm"}
+            model_key in {"lmm", "lmm2", "fvlmm"}
             or (model_key == "lm" and trait_prepared_meta is not None)
         )
         and has_prepared_bed_bus
@@ -686,9 +682,9 @@ def run_chunked_gwas_lmm_lm(
         effective_model_label = str(base_model_label)
         effective_model_tag = str(base_model_tag)
         base_lmm: Optional[LMM] = None
-        if model_key in ("lmm", "lmm2", "fastlmm", "fvlmm"):
+        if model_key in ("lmm", "lmm2", "fvlmm"):
             if grm is None:
-                raise ValueError("LMM/LMM2/FastLMM/FvLMM requires GRM, but GRM was not prepared.")
+                raise ValueError("LMM/LMM2/FvLMM requires GRM, but GRM was not prepared.")
             evd_t0 = time.monotonic()
             evd_label = base_model_label
             evd_desc = f"{evd_label} Eigen-Decomposition"
@@ -733,51 +729,7 @@ def run_chunked_gwas_lmm_lm(
             evd_secs = time.monotonic() - evd_t0
             evd_elapsed = format_elapsed(evd_secs)
             init_log_message = None
-            if (not bool(force_model)) and model_key == "fastlmm" and _fastlmm_should_switch_to_lmm(header_pve):
-                prev_pve = float(header_pve) if header_pve is not None else float("nan")
-                logger.warning(
-                    f"Warning: FastLMM switch to LMM for trait {pname}: "
-                    f"null PVE={prev_pve:.4f} (>0.995)."
-                )
-                lmm_t0 = time.monotonic()
-                if base_lmm is not None:
-                    mod = LMM.from_lmm(base_lmm)
-                else:
-                    stage_threads = max(1, int(threads))
-                    with _gwas_evd_stage_ctx(stage_threads):
-                        eigvals, eigvecs, _evd_backend, _evd_elapsed = _gwas_eigh_from_grm(
-                            grm,
-                            threads=stage_threads,
-                            logger=logger,
-                            stage_label=f"lmm-stream-switch:{pname}",
-                            require_rust=True,
-                            diag_ridge=1e-6,
-                            subset_idx=keep_idx,
-                        )
-                        base_lmm = LMM.from_spectral(
-                            y=y_vec,
-                            X=X_cov,
-                            eigvals=eigvals,
-                            eigvecs=eigvecs,
-                            evd_secs=float(_evd_elapsed),
-                        )
-                        mod = LMM.from_lmm(base_lmm)
-                evd_secs += max(time.monotonic() - lmm_t0, 0.0)
-                evd_elapsed = format_elapsed(evd_secs)
-                effective_model_key = "lmm"
-                effective_model_label = "LMM"
-                effective_model_tag = "lmm"
-                try:
-                    pve_tmp = float(mod.pve)
-                    header_pve = pve_tmp if np.isfinite(pve_tmp) else None
-                except Exception:
-                    header_pve = None
-                init_log_message = (
-                    f"switched from FastLMM null to LMM: "
-                    f"PVE(null)={prev_pve:.4f} (>0.995) [{evd_elapsed}]"
-                )
-
-            if (not bool(force_model)) and effective_model_key in {"lmm", "fastlmm", "fvlmm"}:
+            if (not bool(force_model)) and effective_model_key in {"lmm", "fvlmm"}:
                 source_label = str(effective_model_label)
                 switch_to_lm, lrt_stat, lrt_p = _mixed_model_switch_to_lm_decision(
                     y_vec=y_vec,
@@ -1173,10 +1125,7 @@ def run_chunked_gwas_lmm_lm(
                     )
                     prepared_row_missing = np.ascontiguousarray(
                         np.asarray(
-                            trait_prepared_meta.get(
-                                "missing_count",
-                                trait_prepared_meta["missing_rate"],
-                            ),
+                            trait_prepared_meta["missing_rate"],
                             dtype=np.float32,
                         ).reshape(-1),
                         dtype=np.float32,
@@ -1204,7 +1153,7 @@ def run_chunked_gwas_lmm_lm(
                     row_missing=prepared_row_missing,
                     row_maf=prepared_row_maf,
                     threads=int(scan_threads),
-                    nullml=mod.ML0,
+                    nullml=None,
                     rotate_block_rows=int(model_chunk_size),
                     progress_callback=_fvlmm_unified_progress,
                     progress_every=int(
@@ -1250,10 +1199,7 @@ def run_chunked_gwas_lmm_lm(
                     )
                     prepared_row_missing = np.ascontiguousarray(
                         np.asarray(
-                            trait_prepared_meta.get(
-                                "missing_count",
-                                trait_prepared_meta["missing_rate"],
-                            ),
+                            trait_prepared_meta["missing_rate"],
                             dtype=np.float32,
                         ).reshape(-1),
                         dtype=np.float32,
@@ -1356,10 +1302,7 @@ def run_chunked_gwas_lmm_lm(
                     )
                     prepared_row_missing = np.ascontiguousarray(
                         np.asarray(
-                            trait_prepared_meta.get(
-                                "missing_count",
-                                trait_prepared_meta["missing_rate"],
-                            ),
+                            trait_prepared_meta["missing_rate"],
                             dtype=np.float32,
                         ).reshape(-1),
                         dtype=np.float32,
@@ -1697,7 +1640,7 @@ def run_chunked_gwas_lmm_lm(
         if (
             header_pve is not None
             and np.isfinite(float(header_pve))
-            and str(effective_model_label).lower() in {"lmm", "lmm2", "fastlmm", "fvlmm"}
+            and str(effective_model_label).lower() in {"lmm", "lmm2", "fvlmm"}
         ):
             done_msg = f"{effective_model_label} ...pve {float(header_pve):.3f} [{'/'.join(time_parts)}]"
         else:
@@ -1744,13 +1687,13 @@ def run_chunked_gwas_streaming_shared(
     same chunk before moving to the next chunk.
     """
     model_order = [str(m).lower() for m in model_names]
-    model_map = {"lmm": LMM, "lmm2": LMM2, "lm": LM, "fastlmm": FastLMM, "fvlmm": FvLMM}
+    model_map = {"lmm": LMM, "lmm2": LMM2, "lm": LM, "fvlmm": FvLMM}
     model_order = [m for m in model_order if m in model_map]
     if len(model_order) == 0:
         return
     if len(model_order) > 1:
         grouped_labels = "+".join(
-            ("FastLMM" if m == "fastlmm" else ("FvLMM" if m == "fvlmm" else str(m).upper()))
+            ("FvLMM" if m == "fvlmm" else str(m).upper())
             for m in model_order
         )
         if bool(getattr(logger, "_janusx_gwas_verbose", False)):
@@ -1953,8 +1896,8 @@ def run_chunked_gwas_streaming_shared(
         np.savetxt(buf, out, fmt="%s", delimiter="\t")
         return buf.getvalue(), result_cols
 
-    model_label_map = {"lmm": "LMM", "lmm2": "LMM2", "lm": "LM", "fastlmm": "FastLMM", "fvlmm": "FvLMM"}
-    kinship_model_keys = {"lmm", "lmm2", "fastlmm", "fvlmm"}
+    model_label_map = {"lmm": "LMM", "lmm2": "LMM2", "lm": "LM", "fvlmm": "FvLMM"}
+    kinship_model_keys = {"lmm", "lmm2", "fvlmm"}
     shared_lmm_model: Optional[LMM] = None
     gm_tag = str(genetic_model).lower()
 
@@ -2004,14 +1947,12 @@ def run_chunked_gwas_streaming_shared(
         init_t0 = time.monotonic()
         if mkey in kinship_model_keys:
             if grm is None:
-                raise ValueError("LMM/LMM2/FastLMM/FvLMM requires GRM, but GRM was not prepared.")
+                raise ValueError("LMM/LMM2/FvLMM requires GRM, but GRM was not prepared.")
             if shared_lmm_model is not None:
                 if mkey == "lmm":
                     mod = LMM.from_lmm(shared_lmm_model)
                 elif mkey == "lmm2":
                     mod = LMM2.from_lmm(shared_lmm_model)
-                elif mkey == "fastlmm":
-                    mod = FastLMM.from_lmm(shared_lmm_model)
                 else:
                     mod = FvLMM.from_lmm(shared_lmm_model)
                 ctx["evd_secs"] = 0.0
@@ -2048,8 +1989,6 @@ def run_chunked_gwas_streaming_shared(
                                 mod = LMM.from_lmm(shared_lmm_model)
                             elif mkey == "lmm2":
                                 mod = LMM2.from_lmm(shared_lmm_model)
-                            elif mkey == "fastlmm":
-                                mod = FastLMM.from_lmm(shared_lmm_model)
                             else:
                                 mod = FvLMM.from_lmm(shared_lmm_model)
                     except Exception:
@@ -2072,51 +2011,7 @@ def run_chunked_gwas_streaming_shared(
             except Exception:
                 pve_now = None
 
-        if (not bool(force_model)) and mkey == "fastlmm" and _fastlmm_should_switch_to_lmm(pve_now):
-            prev_pve = float(pve_now) if pve_now is not None else float("nan")
-            logger.warning(
-                f"Warning: FastLMM switch to LMM for trait {pname}: "
-                f"null PVE={prev_pve:.4f} (>0.995)."
-            )
-            if shared_lmm_model is not None:
-                mod = LMM2.from_lmm(shared_lmm_model) if mkey == "lmm2" else LMM.from_lmm(shared_lmm_model)
-            else:
-                lmm_t0 = time.monotonic()
-                stage_threads = max(1, int(threads))
-                with _gwas_evd_stage_ctx(stage_threads):
-                    eigvals, eigvecs, _evd_backend, _evd_elapsed = _gwas_eigh_from_grm(
-                        grm,
-                        threads=stage_threads,
-                        logger=logger,
-                        stage_label=f"lmm-stream-switch:{pname}",
-                        require_rust=True,
-                        diag_ridge=1e-6,
-                        subset_idx=keep_idx,
-                    )
-                    shared_lmm_model = LMM.from_spectral(
-                        y=y_vec,
-                        X=X_cov,
-                        eigvals=eigvals,
-                        eigvecs=eigvecs,
-                        evd_secs=float(_evd_elapsed),
-                    )
-                    mod = LMM2.from_lmm(shared_lmm_model) if mkey == "lmm2" else LMM.from_lmm(shared_lmm_model)
-                ctx["evd_secs"] = float(ctx["evd_secs"]) + max(time.monotonic() - lmm_t0, 0.0)
-            effective_model_key = "lmm"
-            effective_model_label = "LMM"
-            effective_model_tag = "lmm"
-            try:
-                pve_tmp = float(getattr(mod, "pve"))
-                pve_now = pve_tmp if np.isfinite(pve_tmp) else None
-            except Exception:
-                pve_now = None
-            ctx["init_log"] = (
-                f"switched from FastLMM null to LMM: "
-                f"PVE(null)={prev_pve:.4f} (>0.995) "
-                f"[{format_elapsed(float(ctx['evd_secs']))}]"
-            )
-
-        if (not bool(force_model)) and effective_model_key in {"lmm", "fastlmm", "fvlmm"}:
+        if (not bool(force_model)) and effective_model_key in {"lmm", "fvlmm"}:
             source_label = str(effective_model_label)
             switch_to_lm, lrt_stat, lrt_p = _mixed_model_switch_to_lm_decision(
                 y_vec=y_vec,
@@ -2404,10 +2299,7 @@ def run_chunked_gwas_streaming_shared(
                         row_indices=np.asarray(trait_prepared_meta["row_indices"], dtype=np.int64),
                         row_flip=np.asarray(trait_prepared_meta["row_flip"], dtype=np.bool_),
                         row_missing=np.asarray(
-                            trait_prepared_meta.get(
-                                "missing_count",
-                                trait_prepared_meta["missing_rate"],
-                            ),
+                            trait_prepared_meta["missing_rate"],
                             dtype=np.float32,
                         ),
                         row_maf=np.asarray(trait_prepared_meta["maf"], dtype=np.float32),
@@ -2561,7 +2453,7 @@ def run_chunked_gwas_streaming_shared(
         out_tsv = str(ctx["out_tsv"])
         viz_secs = 0.0
         ctx_pve: Optional[float] = None
-        if str(ctx.get("model_key", "")) in {"lmm", "lmm2", "fastlmm", "fvlmm"}:
+        if str(ctx.get("model_key", "")) in {"lmm", "lmm2", "fvlmm"}:
             mod_obj = ctx.get("mod")
             if mod_obj is not None and hasattr(mod_obj, "pve"):
                 try:
@@ -2635,7 +2527,7 @@ def run_chunked_gwas_streaming_shared(
         if (
             ctx_pve is not None
             and np.isfinite(float(ctx_pve))
-            and str(model_label).lower() in {"lmm", "lmm2", "fastlmm", "fvlmm"}
+            and str(model_label).lower() in {"lmm", "lmm2", "fvlmm"}
         ):
             done_msg = f"{model_label} ...pve {float(ctx_pve):.3f} [{'/'.join(time_parts)}]"
         else:

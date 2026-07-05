@@ -368,7 +368,7 @@ fn append_assoc_row_text(
     site: &PySiteInfo,
     snp_name: &str,
     maf: f32,
-    miss_count: i64,
+    miss_rate: f32,
     row: &[f64],
 ) {
     let (a0, a1) = transform_alleles_by_model(&site.ref_allele, &site.alt_allele, model_key);
@@ -381,14 +381,14 @@ fn append_assoc_row_text(
         AssocResultCols::Lmm2_6 => {
             let _ = writeln!(
                 text_buf,
-                "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\t{:.6e}\t{:.6e}\t{:.4e}",
+                "{}\t{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{}\t{:.4e}\t{:.6e}\t{:.6e}\t{:.4e}",
                 site.chrom,
                 site.pos,
                 snp_name,
                 a0,
                 a1,
                 maf,
-                miss_count,
+                miss_rate,
                 beta,
                 se,
                 chisq_txt,
@@ -401,14 +401,14 @@ fn append_assoc_row_text(
         AssocResultCols::Plrt4 => {
             let _ = writeln!(
                 text_buf,
-                "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\t{:.4e}",
+                "{}\t{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{}\t{:.4e}\t{:.4e}",
                 site.chrom,
                 site.pos,
                 snp_name,
                 a0,
                 a1,
                 maf,
-                miss_count,
+                miss_rate,
                 beta,
                 se,
                 chisq_txt,
@@ -419,8 +419,8 @@ fn append_assoc_row_text(
         AssocResultCols::Basic3 => {
             let _ = writeln!(
                 text_buf,
-                "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}",
-                site.chrom, site.pos, snp_name, a0, a1, maf, miss_count, beta, se, chisq_txt, pwald,
+                "{}\t{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{}\t{:.4e}",
+                site.chrom, site.pos, snp_name, a0, a1, maf, miss_rate, beta, se, chisq_txt, pwald,
             );
         }
     }
@@ -857,7 +857,7 @@ impl GwasAssocTsvWriter {
                 &sites[i],
                 &snp[i],
                 maf_arr[i],
-                miss_arr[i].round() as i64,
+                miss_arr[i],
                 row_vec,
             );
         }

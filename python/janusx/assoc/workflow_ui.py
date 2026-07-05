@@ -36,7 +36,6 @@ _GWAS_MODEL_DONE_RE = re.compile(
 _GWAS_MODEL_LABELS = {
     "LM",
     "LMM",
-    "FastLMM",
     "FvLMM",
     "SparseLMM",
     "ALGWAS",

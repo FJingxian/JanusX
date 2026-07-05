@@ -185,7 +185,6 @@ class LinearModel:
             LM as _LM,
             LMM as _LMM,
             LMM2 as _LMM2,
-            FastLMM as _FastLMM,
             FvLMM as _FvLMM,
             farmcpu as _farmcpu,
         )
@@ -231,7 +230,7 @@ class LinearModel:
                 "(PLINK/BED-backed packed route)."
             )
 
-        if model_key in {"lmm", "lmm2", "fastlmm", "fvlmm"}:
+        if model_key in {"lmm", "lmm2", "fvlmm"}:
             kinship = cfg.extra.get("kinship") if isinstance(cfg.extra, dict) else None
             if kinship is None:
                 kinship = _calc_grm(m_snp, log=False, chunksize=max(1, int(cfg.chunksize)))
@@ -288,20 +287,6 @@ class LinearModel:
                     "lambda": arr[:, 3],
                     "ml": arr[:, 4],
                     "plrt": arr[:, 5],
-                }
-                df = pd.DataFrame(cols)
-                pve = float(mod.pve) if np.isfinite(float(mod.pve)) else None
-            elif model_key == "fastlmm":
-                mod = _FastLMM(y=y_vec, X=x_cov, kinship=np.array(kinship, copy=True))
-                arr = np.asarray(mod.gwas(m_snp, threads=threads), dtype=np.float64)
-                cols = {
-                    "chrom": chrom,
-                    "pos": pos,
-                    "allele0": allele0,
-                    "allele1": allele1,
-                    "beta": arr[:, 0],
-                    "se": arr[:, 1],
-                    "pwald": arr[:, 2],
                 }
                 df = pd.DataFrame(cols)
                 pve = float(mod.pve) if np.isfinite(float(mod.pve)) else None
@@ -363,10 +348,8 @@ class LinearModel:
                 {
                     "phenotype": trait_name,
                     "model": (
-                        "FastLMM"
-                        if model_key == "fastlmm"
-                        else ("FvLMM" if model_key == "fvlmm" else ("LMM2" if model_key == "lmm2" else model_key.upper()))
-                    ),
+                    "FvLMM" if model_key == "fvlmm" else ("LMM2" if model_key == "lmm2" else model_key.upper())
+                ),
                     "nidv": int(n_samples),
                     "eff_snp": int(m),
                     "pve": pve,
@@ -455,22 +438,6 @@ class LinearModel:
     ) -> AssociationResult:
         return self._run(
             model_key="lmm2",
-            out=out,
-            prefix=prefix,
-            log=log,
-            write_files=write_files,
-        )
-
-    def fastlmm(
-        self,
-        *,
-        out: Optional[str] = None,
-        prefix: Optional[str] = None,
-        log: bool = True,
-        write_files: bool = False,
-    ) -> AssociationResult:
-        return self._run(
-            model_key="fastlmm",
             out=out,
             prefix=prefix,
             log=log,

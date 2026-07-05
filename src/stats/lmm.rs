@@ -1918,6 +1918,15 @@ fn missing_count_from_rate(v: f32, n_samples: usize) -> usize {
 }
 
 #[inline]
+fn missing_rate_from_count(v: usize, n_samples: usize) -> f32 {
+    if n_samples == 0 {
+        0.0_f32
+    } else {
+        (v as f32) / (n_samples as f32)
+    }
+}
+
+#[inline]
 fn resolve_snp_name(snp: &str, chrom: &str, pos: i32) -> String {
     if !snp.is_empty() && snp != "." {
         snp.to_string()
@@ -2554,25 +2563,13 @@ pub fn lmm_reml_assoc_bed_to_tsv_f32<'py>(
             let row_missing_vec = match row_missing.as_slice() {
                 Ok(slc) => slc
                     .iter()
-                    .map(|&v| {
-                        if !v.is_finite() || v < 0.0_f32 {
-                            0usize
-                        } else {
-                            v.round() as usize
-                        }
-                    })
+                    .map(|&v| missing_count_from_rate(v, n))
                     .collect(),
                 Err(_) => row_missing
                     .as_array()
                     .iter()
                     .copied()
-                    .map(|v| {
-                        if !v.is_finite() || v < 0.0_f32 {
-                            0usize
-                        } else {
-                            v.round() as usize
-                        }
-                    })
+                    .map(|v| missing_count_from_rate(v, n))
                     .collect(),
             };
             let row_maf_vec = match row_maf.as_slice() {
@@ -2659,6 +2656,10 @@ pub fn lmm_reml_assoc_bed_to_tsv_f32<'py>(
                 );
             },
             |text_buf, chunk, rows| {
+                let miss_rate_buf: Vec<f32> = chunk.miss_block[..rows]
+                    .iter()
+                    .map(|&v| missing_rate_from_count(v, n))
+                    .collect();
                 append_assoc_block_from_arrays(
                     text_buf,
                     AssocResultLayout::ResultCols {
@@ -2677,7 +2678,7 @@ pub fn lmm_reml_assoc_bed_to_tsv_f32<'py>(
                         allele0: &chunk.a0[..rows],
                         allele1: &chunk.a1[..rows],
                         maf: &chunk.maf[..rows],
-                        miss: AssocMissBlock::CountUsize(&chunk.miss_block[..rows]),
+                        miss: AssocMissBlock::Rate(miss_rate_buf.as_slice()),
                     },
                     &chunk.out_block[..rows * out_cols],
                 )
@@ -2830,25 +2831,13 @@ pub fn lmm_reml_lmm2_assoc_bed_to_tsv_f32<'py>(
             let row_missing_vec = match row_missing.as_slice() {
                 Ok(slc) => slc
                     .iter()
-                    .map(|&v| {
-                        if !v.is_finite() || v < 0.0_f32 {
-                            0usize
-                        } else {
-                            v.round() as usize
-                        }
-                    })
+                    .map(|&v| missing_count_from_rate(v, n))
                     .collect(),
                 Err(_) => row_missing
                     .as_array()
                     .iter()
                     .copied()
-                    .map(|v| {
-                        if !v.is_finite() || v < 0.0_f32 {
-                            0usize
-                        } else {
-                            v.round() as usize
-                        }
-                    })
+                    .map(|v| missing_count_from_rate(v, n))
                     .collect(),
             };
             let row_maf_vec = match row_maf.as_slice() {
@@ -2961,6 +2950,10 @@ pub fn lmm_reml_lmm2_assoc_bed_to_tsv_f32<'py>(
                 );
             },
             |text_buf, chunk, rows| {
+                let miss_rate_buf: Vec<f32> = chunk.miss_block[..rows]
+                    .iter()
+                    .map(|&v| missing_rate_from_count(v, n))
+                    .collect();
                 append_assoc_block_from_arrays(
                     text_buf,
                     AssocResultLayout::ResultCols {
@@ -2975,7 +2968,7 @@ pub fn lmm_reml_lmm2_assoc_bed_to_tsv_f32<'py>(
                         allele0: &chunk.a0[..rows],
                         allele1: &chunk.a1[..rows],
                         maf: &chunk.maf[..rows],
-                        miss: AssocMissBlock::CountUsize(&chunk.miss_block[..rows]),
+                        miss: AssocMissBlock::Rate(miss_rate_buf.as_slice()),
                     },
                     &chunk.out_block[..rows * out_cols],
                 )
@@ -3686,6 +3679,10 @@ pub fn lmm_reml_assoc_packed_f32_to_tsv<'py>(
                 if text_buf.capacity() < rows * 128 {
                     text_buf.reserve(rows * 128 - text_buf.capacity());
                 }
+                let miss_rate_buf: Vec<f32> = miss_sub
+                    .iter()
+                    .map(|&v| missing_rate_from_count(v, n))
+                    .collect();
                 append_assoc_block_from_arrays(
                     &mut text_buf,
                     AssocResultLayout::ResultCols {
@@ -3704,7 +3701,7 @@ pub fn lmm_reml_assoc_packed_f32_to_tsv<'py>(
                         allele0: &allele0[start..start + rows],
                         allele1: &allele1[start..start + rows],
                         maf: &row_maf[start..start + rows],
-                        miss: AssocMissBlock::CountUsize(miss_sub),
+                        miss: AssocMissBlock::Rate(miss_rate_buf.as_slice()),
                     },
                     &out_sub[..rows * out_cols],
                 )

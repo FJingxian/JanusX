@@ -39,7 +39,6 @@ from janusx.script._common.genoio import (
 from .workflow import (
     _BimSiteColumns,
     CliStatus,
-    FastLMM,
     FvLMM,
     LMM,
     _ProgressAdapter,
@@ -52,7 +51,6 @@ from .workflow import (
     _emit_trait_header,
     _emit_plain_info_line,
     _emit_warning_line,
-    _fastlmm_should_switch_to_lmm,
     _finalize_gwas_result_tsv,
     _gwas_result_tmp_path,
     _gwas_eigh_from_grm,
@@ -737,8 +735,10 @@ def _splmm_parse_sparse_cutoff(splmm_source: Optional[str]) -> tuple[float, Opti
         cutoff = float(raw)
     except Exception:
         return float(_SPLMM_SPARSE_GRM_CUTOFF), raw
-    if (not np.isfinite(cutoff)) or cutoff < 0.0:
-        raise ValueError(f"SparseLMM sparse cutoff must be a finite value >= 0, got {raw}")
+    if not np.isfinite(cutoff):
+        raise ValueError(
+            f"SparseLMM sparse cutoff must be finite; negative disables off-diagonal thresholding, got {raw}"
+        )
     return float(cutoff), None
 
 
@@ -2836,57 +2836,6 @@ def _write_splmm_assoc_tsv(
     return int(written)
 
 
-def _splmm_fastlmm_profile_vc(
-    *,
-    s_null: np.ndarray,
-    u1tx: np.ndarray,
-    u2tx: np.ndarray,
-    u1ty: np.ndarray,
-    u2ty: np.ndarray,
-    lbd: float,
-) -> tuple[float, float]:
-    lbd_f = float(lbd)
-    if not np.isfinite(lbd_f) or lbd_f <= 0.0:
-        return float("nan"), float("nan")
-    s = np.ascontiguousarray(np.asarray(s_null, dtype=np.float64).reshape(-1), dtype=np.float64)
-    x1 = np.ascontiguousarray(np.asarray(u1tx, dtype=np.float64), dtype=np.float64)
-    x2 = np.ascontiguousarray(np.asarray(u2tx, dtype=np.float64), dtype=np.float64)
-    y1 = np.ascontiguousarray(np.asarray(u1ty, dtype=np.float64).reshape(-1), dtype=np.float64)
-    y2 = np.ascontiguousarray(np.asarray(u2ty, dtype=np.float64).reshape(-1), dtype=np.float64)
-    if x1.ndim != 2 or x2.ndim != 2:
-        raise ValueError("SparseLMM FastLMM profile VC expects 2D u1tx/u2tx.")
-    k = int(s.shape[0])
-    if x1.shape[0] != k or y1.shape[0] != k:
-        raise ValueError(
-            f"SparseLMM FastLMM profile VC spectral shape mismatch: len(s)={k}, u1tx={x1.shape}, u1ty={y1.shape}"
-        )
-    n2, p = int(x2.shape[0]), int(x2.shape[1])
-    if int(x1.shape[1]) != p or y2.shape[0] != n2:
-        raise ValueError(
-            f"SparseLMM FastLMM profile VC residual shape mismatch: u1tx={x1.shape}, u2tx={x2.shape}, u2ty={y2.shape}"
-        )
-    n_minus_p = n2 - p
-    if n_minus_p <= 0:
-        return float("nan"), float("nan")
-
-    v1_inv = 1.0 / np.maximum(s + lbd_f, 1e-30)
-    xtv_inv_x = (x1.T * v1_inv) @ x1 + (x2.T @ x2) / lbd_f
-    xtv_inv_y = (x1.T * v1_inv) @ y1 + (x2.T @ y2) / lbd_f
-    try:
-        beta = np.linalg.solve(xtv_inv_x, xtv_inv_y)
-    except np.linalg.LinAlgError:
-        beta = np.linalg.lstsq(xtv_inv_x, xtv_inv_y, rcond=None)[0]
-
-    r1 = y1 - x1 @ beta
-    r2 = y2 - x2 @ beta
-    rtv_invr = float(np.dot(v1_inv, np.square(r1)) + np.dot(r2, r2) / lbd_f)
-    if not np.isfinite(rtv_invr) or rtv_invr <= 0.0:
-        return float("nan"), float("nan")
-    sigma_g2 = float(rtv_invr / float(n_minus_p))
-    sigma_e2 = float(lbd_f * sigma_g2)
-    return sigma_g2, sigma_e2
-
-
 def _splmm_exact_profile_vc(
     *,
     eigvals: np.ndarray,
@@ -3689,7 +3638,7 @@ def prepare_memmap_filtered_bed_for_gwas(
     return str(out_mm_prefix), info
 
 
-def run_fastlmm_packed_fullrank(
+def run_fvlmm_packed_fullrank(
     *,
     genofile: str,
     pheno: pd.DataFrame,
@@ -3715,15 +3664,12 @@ def run_fastlmm_packed_fullrank(
     emit_trait_header: bool = True,
     preloaded_packed: Union[dict[str, object], None] = None,
     force_model: bool = False,
-    _route_model_key: str = "fastlmm",
-    _route_model_label: str = "FastLMM",
-    _route_model_cls: object = FastLMM,
-    _allow_pve_switch: bool = True,
 ) -> None:
+    _route_model_key = "fvlmm"
+    _route_model_label = "FvLMM"
     required_symbols = [
         "grm_packed_f64_with_stats",
         "rust_eigh_from_array_f64",
-        "fastlmm_assoc_packed_f32_to_tsv",
         "fvlmm_assoc_packed_f32_to_tsv",
     ]
     missing_symbols = [s for s in required_symbols if not hasattr(jxrs, s)]
@@ -3890,127 +3836,16 @@ def run_fastlmm_packed_fullrank(
                 eigvecs=eigvecs,
                 evd_secs=float(evd_secs),
             )
-            null_fast_mod = _route_model_cls.from_lmm(shared_lmm_mod)
+            null_fv_mod = FvLMM.from_lmm(shared_lmm_mod)
 
         fixed_lbd: Optional[float] = None
-        fixed_ml0: Optional[float] = None
         try:
-            lbd0_tmp = float(getattr(null_fast_mod, "lbd_null"))
+            lbd0_tmp = float(getattr(null_fv_mod, "lbd_null"))
             if np.isfinite(lbd0_tmp) and lbd0_tmp > 0.0:
                 fixed_lbd = float(lbd0_tmp)
         except Exception:
             fixed_lbd = None
-        try:
-            ml0_tmp = float(getattr(null_fast_mod, "ML0"))
-            if np.isfinite(ml0_tmp):
-                fixed_ml0 = float(ml0_tmp)
-        except Exception:
-            fixed_ml0 = None
-        try:
-            pve_tmp = float(getattr(null_fast_mod, "pve"))
-            null_pve = pve_tmp if np.isfinite(pve_tmp) else None
-        except Exception:
-            null_pve = None
-        null_ml0: Optional[float] = None
-
-        if (not bool(force_model)) and bool(_allow_pve_switch) and _fastlmm_should_switch_to_lmm(null_pve):
-            prev_pve = float(null_pve) if null_pve is not None else float("nan")
-            logger.warning(
-                f"Warning: {_route_model_label} switch to LMM for trait {pname}: "
-                f"null PVE={prev_pve:.4f} (>0.995)."
-            )
-            _log_model_line(
-                logger,
-                "LMM",
-                (
-                    f"switched from {_route_model_label} null to LMM: "
-                    f"PVE(null)={prev_pve:.4f} (>0.995) "
-                    f"[{format_elapsed(evd_secs)}]"
-                ),
-                use_spinner=bool(use_spinner),
-            )
-            run_lmm_packed_fullrank(
-                genofile=genofile,
-                pheno=pheno,
-                ids=ids,
-                grm=grm,
-                outprefix=outprefix,
-                maf_threshold=maf_threshold,
-                max_missing_rate=max_missing_rate,
-                genetic_model=genetic_model,
-                het_threshold=het_threshold,
-                chunk_size=chunk_size,
-                qmatrix=qmatrix,
-                cov_all=cov_all,
-                plot=plot,
-                threads=threads,
-                logger=logger,
-                use_spinner=use_spinner,
-                snps_only=bool(snps_only),
-                eff_snp_by_trait=eff_snp_by_trait,
-                summary_rows=summary_rows,
-                saved_paths=saved_paths,
-                trait_names=[pname],
-                emit_trait_header=False,
-                preloaded_packed=packed_preload_ready,
-                force_model=bool(force_model),
-            )
-            if multi_trait_mode:
-                logger.info("")
-            continue
-
-        if (not bool(force_model)) and (null_ml0 is not None):
-            switch_to_lm, lrt_stat, lrt_p = _mixed_model_switch_to_lm_decision(
-                y_vec=y_vec,
-                x_cov=x_cov,
-                lmm_ml0=null_ml0,
-                alpha=0.05,
-            )
-            if switch_to_lm:
-                logger.warning(
-                    f"Warning: {_route_model_label} switch to LM for trait {pname}: "
-                    f"null LRT stat={float(lrt_stat):.4g}, p={float(lrt_p):.4g} (>=0.05)."
-                )
-                _log_model_line(
-                    logger,
-                    "LM",
-                    (
-                        f"switched from {_route_model_label} null to LM "
-                        f"(LRT stat={float(lrt_stat):.4g}, p={float(lrt_p):.4g}) "
-                        f"[{format_elapsed(evd_secs)}]"
-                    ),
-                    use_spinner=bool(use_spinner),
-                )
-                run_lm_packed_fullrank(
-                    genofile=genofile,
-                    pheno=pheno,
-                    ids=ids,
-                    outprefix=outprefix,
-                    maf_threshold=maf_threshold,
-                    max_missing_rate=max_missing_rate,
-                    genetic_model=genetic_model,
-                    het_threshold=het_threshold,
-                    chunk_size=chunk_size,
-                    qmatrix=qmatrix,
-                    cov_all=cov_all,
-                    plot=plot,
-                    threads=threads,
-                    logger=logger,
-                    use_spinner=use_spinner,
-                    snps_only=bool(snps_only),
-                    eff_snp_by_trait=eff_snp_by_trait,
-                    summary_rows=summary_rows,
-                    saved_paths=saved_paths,
-                    trait_names=[pname],
-                    emit_trait_header=False,
-                    preloaded_packed=packed_preload_ready,
-                    force_model=bool(force_model),
-                )
-                if multi_trait_mode:
-                    logger.info("")
-                continue
-
-        if bool(getattr(null_fast_mod, "lowrank", False)):
+        if bool(getattr(null_fv_mod, "lowrank", False)):
             eigvals = None
             eigvecs = None
             grm_fit = None
@@ -4029,7 +3864,7 @@ def run_fastlmm_packed_fullrank(
             logger=logger,
         )
 
-        def _fastlmm_progress(done: int, total: int) -> None:
+        def _scan_progress(done: int, total: int) -> None:
             nonlocal gwas_last_done, gwas_total, gwas_pbar
             if gwas_pbar is None:
                 return
@@ -4078,10 +3913,10 @@ def run_fastlmm_packed_fullrank(
                 else _gwas_scan_stage_ctx
             )
             with scan_stage_ctx(max(1, int(threads))):
-                if bool(getattr(null_fast_mod, "lowrank", False)):
+                if bool(getattr(null_fv_mod, "lowrank", False)):
                     sites_lowrank = _resolve_packed_sites_all(prefix, packed_row_idx, sites_all)
                     _written_rows = _packed_lowrank_scan_to_tsv(
-                        mod=null_fast_mod,
+                        mod=null_fv_mod,
                         packed=packed,
                         packed_n=int(packed_n),
                         packed_row_idx=packed_row_idx,
@@ -4094,7 +3929,7 @@ def run_fastlmm_packed_fullrank(
                         chunk_size=int(max(1, int(chunk_size))),
                         threads=int(max(1, int(threads))),
                         genetic_model=str(genetic_model),
-                        progress_callback=_fastlmm_progress if gwas_pbar is not None else None,
+                        progress_callback=_scan_progress if gwas_pbar is not None else None,
                         )
                     if int(_written_rows) != int(n_sites_active):
                         _emit_warning_line(
@@ -4102,9 +3937,9 @@ def run_fastlmm_packed_fullrank(
                             f"{_route_model_label} low-rank writer row mismatch: expected={n_sites_active} wrote={int(_written_rows)}",
                             use_spinner=bool(use_spinner),
                         )
-                    lbd = float(getattr(null_fast_mod, "lbd_null", np.nan))
-                    ml0 = float(getattr(null_fast_mod, "ML0", np.nan))
-                    reml0 = float(getattr(null_fast_mod, "LL0", np.nan))
+                    lbd = float(getattr(null_fv_mod, "lbd_null", np.nan))
+                    ml0 = float(getattr(null_fv_mod, "ML0", np.nan))
+                    reml0 = float(getattr(null_fv_mod, "LL0", np.nan))
                 else:
                     u_sub = np.ascontiguousarray(np.asarray(eigvecs, dtype=np.float32), dtype=np.float32)
                     s_trait = np.ascontiguousarray(np.maximum(eigvals, 0.0), dtype=np.float32)
@@ -4122,7 +3957,7 @@ def run_fastlmm_packed_fullrank(
                     }
                     if gwas_pbar is not None:
                         progress_kwargs = {
-                            "progress_callback": _fastlmm_progress,
+                            "progress_callback": _scan_progress,
                             "progress_every": int(
                                 max(
                                     1,
@@ -4155,7 +3990,7 @@ def run_fastlmm_packed_fullrank(
                                     "fixed_lbd": (float(fixed_lbd) if fixed_lbd is not None else None),
                                     "fixed_ml0": None,
                                     "rotate_block_rows": int(max(1, int(chunk_size))),
-                                    "scan_progress_callback": _fastlmm_progress,
+                                    "scan_progress_callback": _scan_progress,
                                     "progress_every": int(
                                         max(
                                             1,
@@ -4199,12 +4034,7 @@ def run_fastlmm_packed_fullrank(
                             )
                             unified_done = False
                     if not unified_done:
-                        packed_scan_fn = (
-                            jxrs.fvlmm_assoc_packed_f32_to_tsv
-                            if str(_route_model_key) == "fvlmm"
-                            else jxrs.fastlmm_assoc_packed_f32_to_tsv
-                        )
-                        lbd, ml0, reml0 = packed_scan_fn(
+                        lbd, ml0, reml0 = jxrs.fvlmm_assoc_packed_f32_to_tsv(
                             packed,
                             int(packed_n),
                             row_flip,
@@ -4257,9 +4087,9 @@ def run_fastlmm_packed_fullrank(
                 _cleanup_gwas_result_tmp(tmp_tsv)
 
         pve = None
-        if bool(getattr(null_fast_mod, "lowrank", False)):
+        if bool(getattr(null_fv_mod, "lowrank", False)):
             try:
-                pve_tmp = float(getattr(null_fast_mod, "pve"))
+                pve_tmp = float(getattr(null_fv_mod, "pve"))
                 if np.isfinite(pve_tmp):
                     pve = pve_tmp
             except Exception:
@@ -4328,16 +4158,6 @@ def run_fastlmm_packed_fullrank(
         )
         if multi_trait_mode:
             logger.info("")
-
-
-def run_fvlmm_packed_fullrank(*args, **kwargs) -> None:
-    kwargs.setdefault("_route_model_key", "fvlmm")
-    kwargs.setdefault("_route_model_label", "FvLMM")
-    kwargs.setdefault("_route_model_cls", FvLMM)
-    kwargs.setdefault("_allow_pve_switch", False)
-    run_fastlmm_packed_fullrank(*args, **kwargs)
-
-
 def run_lm_packed_fullrank(
     *,
     genofile: str,
@@ -6195,9 +6015,10 @@ def run_splmm_windowed_fullrank(
                 )
         else:
             splmm_sparse_cutoff = float(splmm_sparse_cutoff)
-            if (not np.isfinite(splmm_sparse_cutoff)) or float(splmm_sparse_cutoff) < 0.0:
+            if not np.isfinite(splmm_sparse_cutoff):
                 raise ValueError(
-                    f"SparseLMM sparse cutoff must be a finite value >= 0, got {splmm_sparse_cutoff}"
+                    "SparseLMM sparse cutoff must be finite; "
+                    f"negative disables off-diagonal thresholding, got {splmm_sparse_cutoff}"
                 )
         sparse_cutoff_log = f"{float(splmm_sparse_cutoff):g}"
 
@@ -6528,15 +6349,16 @@ def run_splmm_windowed_fullrank(
                 f"SparseLMM sparse GRM for trait {pname} is nearly diagonal "
                 f"(nnz={null_nnz_k}, offdiag_density={float(null_offdiag_density_k):.4g}). "
                 "Under this sparse positive-kinship model, h2 may be understated and, in more extreme cases, "
-                "LM switch can occur; this is not directly comparable to dense FastLMM h2."
+                "LM switch can occur; this is not directly comparable to dense fixed-lambda spectral h2."
             )
         pheno_trait_subset = pheno_aligned.iloc[keep_idx][[pname]].copy()
         ids_trait_subset = np.asarray(ids[keep_idx], dtype=str)
         if (
             (not bool(force_model))
             and
-            null_strategy == "fastlmm_exact_spectral"
-            and _fastlmm_should_switch_to_lmm(null_pve)
+            str(null_strategy).endswith("exact_spectral")
+            and np.isfinite(null_pve)
+            and float(null_pve) > 0.995
         ):
             prev_pve = float(null_pve) if np.isfinite(null_pve) else float("nan")
             logger.warning(

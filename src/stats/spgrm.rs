@@ -20,7 +20,9 @@
 //!
 //! where `m` is the number of retained markers after marker-level quality control.
 //! The sparse GRM is obtained by retaining all diagonal entries and those upper-triangular
-//! off-diagonal entries satisfying the user-specified threshold criterion.
+//! off-diagonal entries satisfying the user-specified threshold criterion. A negative
+//! non-absolute threshold disables off-diagonal thresholding and keeps all off-diagonal
+//! entries.
 //!
 //! Construction proceeds as follows.
 //!
@@ -1523,6 +1525,8 @@ fn spgrm_blas_threads_for_build(build: &SpgrmPreparedBuild, threads: usize) -> O
 fn spgrm_keep_value(value: f64, threshold: f64, abs_threshold: bool) -> bool {
     if abs_threshold {
         value.abs() > threshold
+    } else if threshold < 0.0 {
+        true
     } else {
         value > threshold
     }
@@ -4693,5 +4697,19 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn spgrm_negative_nonabs_threshold_keeps_all_offdiagonals() {
+        assert!(spgrm_keep_value(-1.5, -0.1, false));
+        assert!(spgrm_keep_value(0.0, -0.1, false));
+        assert!(spgrm_keep_value(2.0, -0.1, false));
+    }
+
+    #[test]
+    fn spgrm_zero_threshold_still_filters_nonpositive_offdiagonals() {
+        assert!(!spgrm_keep_value(-1e-6, 0.0, false));
+        assert!(!spgrm_keep_value(0.0, 0.0, false));
+        assert!(spgrm_keep_value(1e-6, 0.0, false));
     }
 }

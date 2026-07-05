@@ -1387,7 +1387,8 @@ def main(log: bool = True):
         "-sparse", "--sparse", nargs="?", const=0.05, default=None, type=float,
         help=(
             "Build sparse GRM in CSC `.spgrm` format and keep only off-diagonal "
-            "kinship entries >= cutoff (default cutoff when flag is present: %(const)s)."
+            "kinship entries >= cutoff. Negative cutoff disables off-diagonal "
+            "thresholding and keeps all entries (default cutoff when flag is present: %(const)s)."
         ),
     )
     add_common_variant_filter_args(
@@ -1543,9 +1544,9 @@ def main(log: bool = True):
         if args.sparse is None:
             raise RuntimeError("Dense GRM input requires `-sparse <cutoff>` to emit `.spgrm`.")
         sparse_cutoff = float(args.sparse)
-        if not np.isfinite(sparse_cutoff) or sparse_cutoff < 0.0:
+        if not np.isfinite(sparse_cutoff):
             raise RuntimeError(
-                f"Sparse GRM cutoff must be finite and >= 0, got {args.sparse}"
+                f"Sparse GRM cutoff must be finite; negative disables off-diagonal thresholding, got {args.sparse}"
             )
         if args.txt:
             logger.warning("`--txt` is ignored for sparse GRM output; writing `.spgrm` CSC.")
@@ -1736,9 +1737,9 @@ def main(log: bool = True):
 
     if args.sparse is not None:
         sparse_cutoff = float(args.sparse)
-        if not np.isfinite(sparse_cutoff) or sparse_cutoff < 0.0:
+        if not np.isfinite(sparse_cutoff):
             raise RuntimeError(
-                f"Sparse GRM cutoff must be finite and >= 0, got {args.sparse}"
+                f"Sparse GRM cutoff must be finite; negative disables off-diagonal thresholding, got {args.sparse}"
             )
         if args.txt:
             logger.warning("`--txt` is ignored for sparse GRM output; writing `.spgrm` CSC.")

@@ -36,7 +36,7 @@ KinshipLike: TypeAlias = DenseKinshipLike | SparseKinshipLike
 AssocMatrixLike: TypeAlias = pd.Series | MatrixLike
 
 AssocLayout: TypeAlias = Literal["sample_major", "snp_major"]
-AssocModelName: TypeAlias = Literal["glm", "lm", "lmm", "fastlmm", "fvlmm", "splmm", "farmcpu"]
+AssocModelName: TypeAlias = Literal["glm", "lm", "lmm", "fvlmm", "splmm", "farmcpu"]
 
 Float64Vector: TypeAlias = npt.NDArray[np.float64]
 Float64Matrix: TypeAlias = npt.NDArray[np.float64]

@@ -1326,6 +1326,15 @@ fn missing_count_from_rate(v: f32, n_samples: usize) -> usize {
     }
 }
 
+#[inline]
+fn missing_rate_from_count(v: usize, n_samples: usize) -> f32 {
+    if n_samples == 0 {
+        0.0_f32
+    } else {
+        (v as f32) / (n_samples as f32)
+    }
+}
+
 fn fill_packed_missing_block(
     miss_sub: &mut [usize],
     sample_identity: bool,
@@ -2000,6 +2009,8 @@ pub fn fvlmm_assoc_chunk_from_snp_f32<'py>(
 /// does rotate+assoc via double-buffer BLAS pipeline, and returns pre-formatted TSV
 /// text. This eliminates the numpy output array allocation and Python-side formatting
 /// overhead compared to `fvlmm_assoc_chunk_from_snp_f32`.
+#[allow(dead_code)]
+#[allow(dead_code)]
 #[pyfunction]
 #[pyo3(signature = (
     s, xcov, y_rot, log10_lbd, snp_chunk, u_t,
@@ -2158,9 +2169,6 @@ pub fn fvlmm_assoc_chunk_from_snp_to_tsv_f32<'py>(
                     nullml,
                 );
 
-                let miss_count_buf: Vec<i64> = (start..start + rows)
-                    .map(|idx| (miss_owned[idx] * n as f32) as i64)
-                    .collect();
                 text_buf.clear();
                 append_assoc_block_from_arrays(
                     &mut text_buf,
@@ -2180,7 +2188,7 @@ pub fn fvlmm_assoc_chunk_from_snp_to_tsv_f32<'py>(
                         allele0: &allele0_owned[start..start + rows],
                         allele1: &allele1_owned[start..start + rows],
                         maf: &maf_owned[start..start + rows],
-                        miss: AssocMissBlock::CountI64(miss_count_buf.as_slice()),
+                        miss: AssocMissBlock::Rate(&miss_owned[start..start + rows]),
                     },
                     &out_sub[..rows * out_cols],
                 )
@@ -2457,13 +2465,7 @@ pub fn fvlmm_assoc_bed_to_tsv_f32<'py>(
                         }
                         let miss_counts: Vec<usize> = row_missing_vec
                             .iter()
-                            .map(|&v| {
-                                if !v.is_finite() || v < 0.0_f32 {
-                                    0usize
-                                } else {
-                                    v.round() as usize
-                                }
-                            })
+                            .map(|&v| missing_count_from_rate(v, n))
                             .collect();
                         Some((
                             source_rows,
@@ -2818,6 +2820,10 @@ pub fn fvlmm_assoc_bed_to_tsv_f32<'py>(
                             text_buf.reserve(write_rows * 128 - text_buf.capacity());
                         }
                     }
+                    let miss_rate_buf: Vec<f32> = chunk.miss_block[..write_rows]
+                        .iter()
+                        .map(|&v| missing_rate_from_count(v, n))
+                        .collect();
                     append_assoc_block_from_arrays(
                         &mut text_buf,
                         AssocResultLayout::ResultCols {
@@ -2836,7 +2842,7 @@ pub fn fvlmm_assoc_bed_to_tsv_f32<'py>(
                             allele0: &chunk.a0[..write_rows],
                             allele1: &chunk.a1[..write_rows],
                             maf: &chunk.maf[..write_rows],
-                            miss: AssocMissBlock::CountUsize(&chunk.miss_block[..write_rows]),
+                            miss: AssocMissBlock::Rate(miss_rate_buf.as_slice()),
                         },
                         &chunk.out_block[..write_rows * out_cols],
                     )?;
@@ -3446,6 +3452,7 @@ impl PackedFastlmmScratch {
     }
 }
 
+#[allow(dead_code)]
 #[pyfunction]
 #[pyo3(signature = (
     packed,
@@ -4008,6 +4015,7 @@ pub fn fastlmm_assoc_packed_f32<'py>(
     Ok((lbd, ml0, reml0, out))
 }
 
+#[allow(dead_code)]
 #[pyfunction]
 pub fn fastlmm_assoc_packed_f32_to_tsv<'py>(
     py: Python<'py>,
@@ -4561,6 +4569,10 @@ pub fn fastlmm_assoc_packed_f32_to_tsv<'py>(
                 if text_buf.capacity() < rows * 128 {
                     text_buf.reserve(rows * 128 - text_buf.capacity());
                 }
+                let miss_rate_buf: Vec<f32> = miss_sub
+                    .iter()
+                    .map(|&v| missing_rate_from_count(v, n))
+                    .collect();
                 append_assoc_block_from_arrays(
                     &mut text_buf,
                     AssocResultLayout::ResultCols {
@@ -4579,7 +4591,7 @@ pub fn fastlmm_assoc_packed_f32_to_tsv<'py>(
                         allele0: &allele0[start..start + rows],
                         allele1: &allele1[start..start + rows],
                         maf: &row_maf[start..start + rows],
-                        miss: AssocMissBlock::CountUsize(miss_sub),
+                        miss: AssocMissBlock::Rate(miss_rate_buf.as_slice()),
                     },
                     &out_sub[..rows * out_cols],
                 )
@@ -4906,6 +4918,15 @@ pub fn fvlmm_assoc_packed_f32_to_tsv<'py>(
         }
     }
 
+    let with_plrt = fixed_ml0.is_some();
+    if let Some(v) = fixed_ml0 {
+        if !v.is_finite() {
+            return Err(PyRuntimeError::new_err(
+                "fixed_ml0 must be finite when provided",
+            ));
+        }
+    }
+
     let (lbd, ml0, reml0) = if let Some(lbd_fixed) = fixed_lbd {
         if !(lbd_fixed.is_finite() && lbd_fixed > 0.0) {
             return Err(PyRuntimeError::new_err(
@@ -4913,18 +4934,13 @@ pub fn fvlmm_assoc_packed_f32_to_tsv<'py>(
             ));
         }
         let log10_lbd = lbd_fixed.log10();
-        let ml = if let Some(v) = fixed_ml0 {
-            if !v.is_finite() {
-                return Err(PyRuntimeError::new_err(
-                    "fixed_ml0 must be finite when provided",
-                ));
-            }
-            v
+        let ml0 = fixed_ml0.unwrap_or(f64::NAN);
+        let reml0 = if with_plrt {
+            reml_loglike(log10_lbd, &s_vec, &x_rot, &y_rot, None, n, p)
         } else {
-            ml_loglike(log10_lbd, &s_vec, &x_rot, &y_rot, None, n, p)
+            f64::NAN
         };
-        let reml = reml_loglike(log10_lbd, &s_vec, &x_rot, &y_rot, None, n, p);
-        (lbd_fixed, ml, reml)
+        (lbd_fixed, ml0, reml0)
     } else {
         let (best_log10_lbd, best_cost) = brent_minimize(
             |x0| -reml_loglike(x0, &s_vec, &x_rot, &y_rot, None, n, p),
@@ -4934,17 +4950,7 @@ pub fn fvlmm_assoc_packed_f32_to_tsv<'py>(
             max_iter,
         );
         let lbd_tmp = 10.0_f64.powf(best_log10_lbd);
-        let ml = if let Some(v) = fixed_ml0 {
-            if !v.is_finite() {
-                return Err(PyRuntimeError::new_err(
-                    "fixed_ml0 must be finite when provided",
-                ));
-            }
-            v
-        } else {
-            ml_loglike(best_log10_lbd, &s_vec, &x_rot, &y_rot, None, n, p)
-        };
-        (lbd_tmp, ml, -best_cost)
+        (lbd_tmp, fixed_ml0.unwrap_or(f64::NAN), -best_cost)
     };
     if !lbd.is_finite() || lbd <= 0.0 {
         return Err(PyRuntimeError::new_err(
@@ -4958,7 +4964,6 @@ pub fn fvlmm_assoc_packed_f32_to_tsv<'py>(
     } else {
         progress_every.max(1)
     };
-    let with_plrt = fixed_ml0.is_some();
     let out_cols = if with_plrt { 4usize } else { 3usize };
     let stage_timing =
         env_truthy("JX_FVLMM_PACKED_STAGE_TIMING") || env_truthy("JX_FASTLMM_PACKED_STAGE_TIMING");
@@ -5081,6 +5086,10 @@ pub fn fvlmm_assoc_packed_f32_to_tsv<'py>(
                 if text_buf.capacity() < rows * 128 {
                     text_buf.reserve(rows * 128 - text_buf.capacity());
                 }
+                let miss_rate_buf: Vec<f32> = miss_sub
+                    .iter()
+                    .map(|&v| missing_rate_from_count(v, n))
+                    .collect();
                 append_assoc_block_from_arrays(
                     &mut text_buf,
                     AssocResultLayout::ResultCols {
@@ -5099,7 +5108,7 @@ pub fn fvlmm_assoc_packed_f32_to_tsv<'py>(
                         allele0: &allele0[start..start + rows],
                         allele1: &allele1[start..start + rows],
                         maf: &row_maf[start..start + rows],
-                        miss: AssocMissBlock::CountUsize(miss_sub),
+                        miss: AssocMissBlock::Rate(miss_rate_buf.as_slice()),
                     },
                     &out_sub[..rows * out_cols],
                 )

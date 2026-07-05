@@ -195,8 +195,8 @@ use farmcpu::{
 };
 use fast_math::fastlmm_prepare_lowrank_f64;
 use fvlmm::{
-    fastlmm_assoc_chunk_f32, fastlmm_assoc_from_snp_f32, fastlmm_assoc_packed_f32,
-    fastlmm_assoc_packed_f32_to_tsv, fastlmm_reml_chunk_f32, fastlmm_reml_null_f32,
+    fastlmm_assoc_chunk_f32, fastlmm_assoc_from_snp_f32, fastlmm_reml_chunk_f32,
+    fastlmm_reml_null_f32,
     fvlmm_assoc_bed_to_tsv_f32, fvlmm_assoc_chunk_f32, fvlmm_assoc_chunk_from_snp_f32,
     fvlmm_assoc_chunk_from_snp_to_tsv_f32, fvlmm_assoc_chunk_from_snp_with_cache_f32,
     fvlmm_assoc_chunk_with_cache_f32, fvlmm_assoc_packed_f32_to_tsv, fvlmm_assoc_prepare_cache_f32,
@@ -895,8 +895,6 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(lmm_reml_assoc_packed_f32_to_tsv, m)?)?;
     m.add_function(wrap_pyfunction!(fastlmm_assoc_chunk_f32, m)?)?;
     m.add_function(wrap_pyfunction!(fastlmm_assoc_from_snp_f32, m)?)?;
-    m.add_function(wrap_pyfunction!(fastlmm_assoc_packed_f32, m)?)?;
-    m.add_function(wrap_pyfunction!(fastlmm_assoc_packed_f32_to_tsv, m)?)?;
     m.add_function(wrap_pyfunction!(fvlmm_assoc_packed_f32_to_tsv, m)?)?;
     m.add_function(wrap_pyfunction!(fastlmm_reml_null_f32, m)?)?;
     m.add_function(wrap_pyfunction!(fastlmm_reml_chunk_f32, m)?)?;

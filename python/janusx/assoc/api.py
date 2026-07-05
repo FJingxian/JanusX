@@ -15,7 +15,7 @@ except Exception:  # pragma: no cover - scipy is expected in normal installs
     sp = None
 
 from janusx import janusx as _jxrs
-from janusx.pyBLUP.assoc import FastLMM, FvLMM, LM, LMM
+from janusx.pyBLUP.assoc import FvLMM, LM, LMM
 from janusx.script._common.grmio import (
     load_grm_matrix,
     read_id_file,
@@ -61,7 +61,6 @@ _MODEL_ALIASES = {
     "glm": "lm",
     "lm": "lm",
     "lmm": "lmm",
-    "fastlmm": "fastlmm",
     "fvlmm": "fvlmm",
     "splmm": "splmm",
     "farmcpu": "farmcpu",
@@ -133,7 +132,7 @@ def _normalize_model_name(model: str) -> str:
     if out is None:
         raise ValueError(
             "Unsupported ASSOC model. Expected one of: "
-            "glm/lm, lmm, fastlmm, fvlmm, splmm, farmcpu."
+            "glm/lm, lmm, fvlmm, splmm, farmcpu."
         )
     return out
 
@@ -190,7 +189,7 @@ def _clone_backend_model_for_assoc(model: Any) -> Any:
         if int(model.X.shape[1]) > 1:
             x_cov = np.ascontiguousarray(np.asarray(model.X[:, 1:], dtype=np.float64), dtype=np.float64)
         return LM(np.asarray(model.y, dtype=np.float64).reshape(-1), X=x_cov)
-    if isinstance(model, (LMM, FastLMM, FvLMM)):
+    if isinstance(model, (LMM, FvLMM)):
         return type(model).from_lmm(model)
     raise TypeError(f"Unsupported backend model for clone: {type(model).__name__}")
 
@@ -523,7 +522,6 @@ class ASSOC:
     Supported first-version routes:
       - `glm` / `lm`
       - `lmm`
-      - `fastlmm`
       - `fvlmm`
       - `splmm` exact
 
@@ -596,8 +594,10 @@ class ASSOC:
     def sparse_cutoff_(self) -> float:
         raw = self.model_args.get("sparse_cutoff", self.model_args.get("threshold", 0.05))
         val = float(raw)
-        if (not np.isfinite(val)) or val < 0.0:
-            raise ValueError(f"sparse_cutoff must be finite and >= 0, got {raw!r}")
+        if not np.isfinite(val):
+            raise ValueError(
+                f"sparse_cutoff must be finite; negative disables off-diagonal thresholding, got {raw!r}"
+            )
         return float(val)
 
     @property
@@ -692,8 +692,6 @@ class ASSOC:
             return "farmcpu"
         if self.model_name == "lm":
             return "lm"
-        if self.model_name == "fastlmm":
-            return "fastlmm"
         if self.model_name == "splmm":
             return "splmm"
         if sp is not None and sp.issparse(k):
@@ -1069,9 +1067,7 @@ class ASSOC:
             return self
 
         kinship = _coerce_dense_kinship(k, sample_index=sample_index, n_samples=self.n_samples_)
-        if route == "fastlmm":
-            self.backend_model_ = FastLMM(y_arr, x_cov, kinship)
-        elif route == "fvlmm":
+        if route == "fvlmm":
             self.backend_model_ = FvLMM(y_arr, x_cov, kinship)
         else:
             self.backend_model_ = LMM(y_arr, x_cov, kinship)

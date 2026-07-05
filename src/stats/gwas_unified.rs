@@ -5,7 +5,7 @@ use pyo3::types::{PyDict, PyList};
 
 use crate::algwas::algwas_packed_to_tsv;
 use crate::farmcpu::farmcpu_packed_to_tsv;
-use crate::fvlmm::{fastlmm_assoc_packed_f32_to_tsv, fvlmm_assoc_packed_f32_to_tsv};
+use crate::fvlmm::fvlmm_assoc_packed_f32_to_tsv;
 use crate::glm::ixx_from_x_qr;
 use crate::glm::lm_block_assoc_packed_to_tsv;
 use crate::linalg::{chi2_sf_df1, cholesky_inplace, cholesky_solve_into};
@@ -222,15 +222,13 @@ pub fn gwas_trait_model_schedule<'py>(
 }
 
 #[pyfunction]
-#[pyo3(signature = (models, traits, include_farmcpu=false, use_packed_fastlmm=true))]
+#[pyo3(signature = (models, traits, include_farmcpu=false))]
 pub fn gwas_trait_model_dispatch_v2<'py>(
     py: Python<'py>,
     models: Vec<String>,
     traits: Vec<String>,
     include_farmcpu: bool,
-    use_packed_fastlmm: bool,
 ) -> PyResult<Bound<'py, PyList>> {
-    let _ = use_packed_fastlmm;
     let out = PyList::empty(py);
     if traits.is_empty() {
         return Ok(out);
@@ -244,7 +242,6 @@ pub fn gwas_trait_model_dispatch_v2<'py>(
             "lm2" => Some("lm2"),
             "lmm" => Some("lmm"),
             "lmm2" => Some("lmm2"),
-            "fastlmm" => Some("fastlmm"),
             "fvlmm" => Some("fvlmm"),
             "algwas" => Some("algwas"),
             "splmm" => Some("splmm"),
@@ -271,7 +268,6 @@ pub fn gwas_trait_model_dispatch_v2<'py>(
                 "lm2" => "lm2_stream",
                 "lmm" => "lmm_stream",
                 "lmm2" => "lmm2_stream",
-                "fastlmm" => "fastlmm_stream",
                 "fvlmm" => "fvlmm_stream",
                 "farmcpu" => "farmcpu",
                 "algwas" => "algwas",
@@ -527,7 +523,7 @@ pub fn gwas_packed_unified_to_tsv<'py>(
                 )?;
                 result_obj.set_item("written_rows", n_written)?;
             }
-            "fastlmm" | "fvlmm" => {
+            "fvlmm" => {
                 let y: PyReadonlyArray1<'py, f64> = req_item(&job, "y")?.extract()?;
                 let u: PyReadonlyArray2<'py, f32> = req_item(&job, "u")?.extract()?;
                 let s: PyReadonlyArray1<'py, f32> = req_item(&job, "s")?.extract()?;
@@ -564,26 +560,15 @@ pub fn gwas_packed_unified_to_tsv<'py>(
                     .and_then(|v| v.extract().ok())
                     .unwrap_or_else(|| "add".to_string());
 
-                let fixed_lbd: Option<f64> = if model_lc == "fastlmm" || model_lc == "fvlmm" {
-                    opt_item(&job, "fixed_lbd")?.and_then(|v| v.extract().ok())
-                } else {
-                    None
-                };
-                let fixed_ml0: Option<f64> = if model_lc == "fastlmm" || model_lc == "fvlmm" {
-                    opt_item(&job, "fixed_ml0")?.and_then(|v| v.extract().ok())
-                } else {
-                    None
-                };
+                let fixed_lbd: Option<f64> =
+                    opt_item(&job, "fixed_lbd")?.and_then(|v| v.extract().ok());
+                let fixed_ml0: Option<f64> =
+                    opt_item(&job, "fixed_ml0")?.and_then(|v| v.extract().ok());
                 let rotate_block_rows: usize = opt_item(&job, "rotate_block_rows")?
                     .and_then(|v| v.extract().ok())
                     .unwrap_or(0usize);
 
-                let scan_fn = if model_lc == "fvlmm" {
-                    fvlmm_assoc_packed_f32_to_tsv
-                } else {
-                    fastlmm_assoc_packed_f32_to_tsv
-                };
-                let (lbd, ml0, reml0) = scan_fn(
+                let (lbd, ml0, reml0) = fvlmm_assoc_packed_f32_to_tsv(
                     py,
                     packed.clone(),
                     n_samples,
@@ -766,7 +751,7 @@ pub fn gwas_packed_unified_to_tsv<'py>(
             }
             _ => {
                 return Err(PyValueError::new_err(format!(
-                    "jobs[{i}] has unsupported model '{}'; expected one of: lm, lmm, fastlmm, fvlmm, farmcpu, algwas",
+                    "jobs[{i}] has unsupported model '{}'; expected one of: lm, lmm, fvlmm, farmcpu, algwas",
                     model_lc
                 )));
             }

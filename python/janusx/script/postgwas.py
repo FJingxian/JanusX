@@ -1298,7 +1298,7 @@ def _apply_multi_bimrange_manhattan_axis(
         x_end = float(layout[i]["x_end"])
         x_next = float(layout[i + 1]["x_start"])
         xb = 0.5 * (x_end + x_next)
-        ax.axvline(x=xb, color="black", linestyle=":", linewidth=0.7, alpha=0.9)
+        ax.axvline(x=xb, color="black", linestyle=":", linewidth=0.7, alpha=1)
         prev_end_lab = _sanitize_plot_text(
             f"{layout[i]['chrom']}:{int(layout[i]['end']) / 1_000_000:g}Mb"
         )
@@ -2654,7 +2654,7 @@ def _overlay_manhattan_threshold_points(
             color="red",
             marker=str(marker),
             s=float(base_size) * 1.5,
-            alpha=0.85,
+            alpha=1,
             rasterized=rasterized,
             zorder=6,
             **_marker_scatter_style(str(marker)),
@@ -3203,7 +3203,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                         draw_hl_y,
                         marker="D",
                         color="red",
-                        alpha=0.85,
+                        alpha=1,
                         zorder=10,
                         s=args.scatter_size,
                         **_marker_scatter_style("D"),
@@ -4326,7 +4326,7 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
                     y_keep[nonsig_keep],
                     color="lightgrey",
                     marker=series_markers[i],
-                    alpha=0.45,
+                    alpha=1,
                     s=args.scatter_size,
                     rasterized=rasterized,
                     **_marker_scatter_style(series_markers[i]),
@@ -4337,7 +4337,7 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
                     y_keep[sig_keep],
                     color=series_colors[i],
                     marker=series_markers[i],
-                    alpha=0.75,
+                    alpha=1,
                     s=args.scatter_size,
                     rasterized=rasterized,
                     **_marker_scatter_style(series_markers[i]),
@@ -4348,7 +4348,7 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
                     [],
                     color=series_colors[i],
                     marker=series_markers[i],
-                    alpha=0.75,
+                    alpha=1,
                     s=args.scatter_size,
                     label=series_labels[i],
                     **_marker_scatter_style(series_markers[i]),
@@ -4474,7 +4474,7 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
                 obs,
                 s=args.scatter_size,
                 marker=series_markers[i],
-                alpha=0.5,
+                alpha=1,
                 rasterized=rasterized,
                 color=series_colors[i],
                 **_marker_scatter_style(series_markers[i]),
@@ -4485,7 +4485,7 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
                     [],
                     s=args.scatter_size,
                     marker=series_markers[i],
-                    alpha=0.75,
+                    alpha=1,
                     color=series_colors[i],
                     label=series_labels[i],
                     **_marker_scatter_style(series_markers[i]),

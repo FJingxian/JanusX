@@ -3,6 +3,7 @@ from typing import Union
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from matplotlib.markers import MarkerStyle
 from matplotlib.gridspec import GridSpec
 from scipy.stats import beta
 from janusx.gtools.cleaner import chrom_sort_key
@@ -40,6 +41,22 @@ def _sanitize_pvalues(values) -> np.ndarray:
 def _finite_positive(values) -> np.ndarray:
     arr = np.asarray(values, dtype=np.float64).reshape(-1)
     return arr[np.isfinite(arr) & (arr > 0.0)]
+
+
+def _marker_scatter_style(marker: str) -> dict[str, object]:
+    try:
+        marker_obj = MarkerStyle(str(marker))
+        is_filled = bool(marker_obj.is_filled())
+    except Exception:
+        is_filled = True
+    if is_filled:
+        return {
+            "edgecolors": "none",
+            "linewidths": 0.0,
+        }
+    return {
+        "linewidths": 0.8,
+    }
 
 
 def _integer_tick_values(
@@ -81,18 +98,25 @@ def _integer_tick_values(
     return np.unique(ticks.astype(np.float64, copy=False))
 
 
-def apply_integer_yticks(
+def _apply_integer_ticks(
     ax: plt.Axes,
     *,
+    axis: str,
     ticks: Union[np.ndarray, list[float], None] = None,
     max_ticks: int = 7,
 ) -> np.ndarray:
-    """
-    Force y-axis ticks to integer values while preserving current limits.
-    """
-    y0, y1 = ax.get_ylim()
-    lo = float(min(y0, y1))
-    hi = float(max(y0, y1))
+    if str(axis).lower() == "x":
+        a0, a1 = ax.get_xlim()
+        setter = ax.set_xticks
+        label_setter = ax.set_xticklabels
+        restore = lambda: ax.set_xlim(a0, a1)
+    else:
+        a0, a1 = ax.get_ylim()
+        setter = ax.set_yticks
+        label_setter = ax.set_yticklabels
+        restore = lambda: ax.set_ylim(a0, a1)
+    lo = float(min(a0, a1))
+    hi = float(max(a0, a1))
 
     if ticks is None:
         tick_values = _integer_tick_values(lo, hi, max_ticks=max_ticks)
@@ -108,10 +132,34 @@ def apply_integer_yticks(
 
     if tick_values.size > 0:
         labels = [str(int(round(float(v)))) for v in tick_values]
-        ax.set_yticks(tick_values)
-        ax.set_yticklabels(labels)
-        ax.set_ylim(y0, y1)
+        setter(tick_values)
+        label_setter(labels)
+        restore()
     return tick_values
+
+
+def apply_integer_yticks(
+    ax: plt.Axes,
+    *,
+    ticks: Union[np.ndarray, list[float], None] = None,
+    max_ticks: int = 7,
+) -> np.ndarray:
+    """
+    Force y-axis ticks to integer values while preserving current limits.
+    """
+    return _apply_integer_ticks(ax, axis="y", ticks=ticks, max_ticks=max_ticks)
+
+
+def apply_integer_xticks(
+    ax: plt.Axes,
+    *,
+    ticks: Union[np.ndarray, list[float], None] = None,
+    max_ticks: int = 7,
+) -> np.ndarray:
+    """
+    Force x-axis ticks to integer values while preserving current limits.
+    """
+    return _apply_integer_ticks(ax, axis="x", ticks=ticks, max_ticks=max_ticks)
 
 
 class GWASPLOT:
@@ -311,6 +359,7 @@ class GWASPLOT:
         color_set: Union[list[str],None] = None,
         ax: Union[plt.Axes,None] = None,
         ignore: Union[list[str],None] = None,
+        marker: str = "o",
         min_logp: Union[float, None] = 0.5,
         max_logp: Union[float, None] = None,
         y_min: Union[float, None] = None,
@@ -371,8 +420,8 @@ class GWASPLOT:
         )
         plot_kwargs = dict(kwargs)
         plot_kwargs.setdefault("alpha", 0.78)
-        plot_kwargs.setdefault("edgecolors", "none")
-        plot_kwargs.setdefault("linewidths", 0.0)
+        for key, value in _marker_scatter_style(str(marker)).items():
+            plot_kwargs.setdefault(key, value)
 
         mask_ignore = ~df.index.isin(ignore)
         draw_df = df.loc[mask_ignore, ["x", "y", "z"]]
@@ -384,6 +433,7 @@ class GWASPLOT:
                 draw_df.loc[chr_mask, "x"],
                 draw_df.loc[chr_mask, "y"],
                 color=chr_color_map[chr_id],
+                marker=str(marker),
                 **plot_kwargs,
             )
 
@@ -393,12 +443,13 @@ class GWASPLOT:
             sig_mask = ~df_sig.index.isin(ignore)
             sig_kwargs = dict(kwargs)
             sig_kwargs.setdefault("alpha", 0.9)
-            sig_kwargs.setdefault("edgecolors", "none")
-            sig_kwargs.setdefault("linewidths", 0.0)
+            for key, value in _marker_scatter_style(str(marker)).items():
+                sig_kwargs.setdefault(key, value)
             ax.scatter(
                 df_sig.loc[sig_mask, "x"],
                 df_sig.loc[sig_mask, "y"],
                 color="red",
+                marker=str(marker),
                 **sig_kwargs,
             )
             ax.axhline(
@@ -457,6 +508,7 @@ class GWASPLOT:
         ax: plt.Axes = None,
         ci: int = 95,
         color_set: list[str] = None,
+        marker: str = "o",
         scatter_size: float = 8.0,
         line_color: str = "black",
         qq_mode: str = "auto",
@@ -465,6 +517,8 @@ class GWASPLOT:
         qq_band_max_points: Union[int, None] = 20_000,
         sig_p_threshold: Union[float, None] = None,
         axis_min: Union[float, None] = None,
+        axis_max: Union[float, None] = None,
+        band_color: Union[str, None] = None,
         rasterized: bool = True,
     ) -> plt.Axes:
         """
@@ -506,6 +560,10 @@ class GWASPLOT:
             If None, Bonferroni-like threshold 1/n is used.
         axis_min : float or None, default None
             If provided, force both QQ axis lower bounds (x/y) to this value.
+        axis_max : float or None, default None
+            If provided, force QQ y-axis upper bound to this value.
+        band_color : str or None, default None
+            Override the confidence-band fill color.
 
         Returns
         -------
@@ -515,10 +573,12 @@ class GWASPLOT:
             color_set = ["black", "grey"]
         if len(color_set) >= 2:
             point_color = color_set[0]
-            band_color = color_set[1]
+            band_fill_color = color_set[1]
         else:
             point_color = color_set[0]
-            band_color = color_set[0]
+            band_fill_color = color_set[0]
+        if band_color is not None:
+            band_fill_color = str(band_color)
 
         mode_key = str(qq_mode).strip().lower()
         if mode_key not in {"auto", "full", "fast"}:
@@ -611,7 +671,7 @@ class GWASPLOT:
                 x_band[band_mask],
                 lower[band_mask],
                 upper[band_mask],
-                color=band_color,
+                color=band_fill_color,
                 alpha=0.3,
                 rasterized=bool(rasterized),
             )
@@ -631,12 +691,12 @@ class GWASPLOT:
         ax.scatter(
             exp_scatter[scatter_mask],
             obs_scatter[scatter_mask],
+            marker=str(marker),
             s=scatter_size,
             alpha=0.75,
             rasterized=bool(rasterized),
             color=point_color,
-            edgecolors="none",
-            linewidths=0.0,
+            **_marker_scatter_style(str(marker)),
         )
 
         # Keep QQ axis lower bounds consistent between X/Y.
@@ -663,11 +723,15 @@ class GWASPLOT:
                 right_pad = max(0.0, float(x1) - x_data_max)
                 lo = x_data_min - right_pad
             x_hi = float(x1) if float(x1) > lo else (lo + 1.0)
-            y_hi = float(y1) if float(y1) > lo else (lo + 1.0)
+            if axis_max is not None and np.isfinite(float(axis_max)) and float(axis_max) > lo:
+                y_hi = float(axis_max)
+            else:
+                y_hi = float(y1) if float(y1) > lo else (lo + 1.0)
             ax.set_xlim(lo, x_hi)
             ax.set_ylim(lo, y_hi)
 
         ax.set_xlabel("Expected -log10(p-value)")
         ax.set_ylabel("Observed -log10(p-value)")
+        apply_integer_xticks(ax)
         apply_integer_yticks(ax)
         return ax

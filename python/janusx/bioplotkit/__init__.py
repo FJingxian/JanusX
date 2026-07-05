@@ -10,6 +10,7 @@ __version__ = "1.0"
 _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
     "PCSHOW": ("janusx.bioplotkit.pcshow", "PCSHOW"),
     "GWASPLOT": ("janusx.bioplotkit.manhanden", "GWASPLOT"),
+    "apply_integer_xticks": ("janusx.bioplotkit.manhanden", "apply_integer_xticks"),
     "apply_integer_yticks": ("janusx.bioplotkit.manhanden", "apply_integer_yticks"),
     "LDblock": ("janusx.bioplotkit.LDBlock", "LDblock"),
     "gsplot": ("janusx.bioplotkit.gsplot", None),

@@ -36,6 +36,7 @@ from ._common.pathcheck import (
     ensure_plink_prefix_exists,
 )
 from ._common.progress import (
+    CliStatus,
     log_success,
     print_success,
     print_failure,
@@ -47,7 +48,7 @@ from ._common.progress import (
 )
 from ._common.progress import build_rich_progress, rich_progress_available
 from ._common.genocache import configure_genotype_cache_from_out
-from ._common.config_render import get_config_color_styles
+from ._common.config_render import emit_cli_configuration
 from ._common.threads import (
     apply_blas_thread_env,
     detect_effective_threads,
@@ -64,18 +65,21 @@ for key in ["MPLBACKEND"]:
 
 import matplotlib as mpl
 mpl.use("Agg")
-from janusx.bioplotkit import GWASPLOT, LDblock, apply_integer_yticks
+from janusx.bioplotkit import GWASPLOT, LDblock, apply_integer_xticks, apply_integer_yticks
 from janusx.bioplotkit.geneplot import draw_gene_structure_records
 from janusx.gfreader import load_genotype_chunks, prepare_cli_input_cache
 
 import matplotlib.pyplot as plt
 from matplotlib import colors as mcolors
+from matplotlib.markers import MarkerStyle
 from matplotlib.patches import ConnectionPatch
 from matplotlib.ticker import FuncFormatter, MaxNLocator
 import pandas as pd
 import numpy as np
+from scipy.stats import beta
 import argparse
 import re
+import shlex
 import time
 import socket
 import sys
@@ -93,9 +97,22 @@ from ._common.cjk import contains_cjk as _contains_cjk, ensure_cjk_font as _ensu
 _LEAD_SNP_INFO_COLS = ["allele0", "allele1", "af", "maf", "beta", "se"]
 _QQ_FIXED_RATIO = 5.0 / 4.0
 _QQ_FAST_MAX_POINTS = 120_000
+_QQ_BAND_MAX_POINTS = 20_000
+_QQ_BAND_COLOR = "grey"
 _CONFIG_LINE_MAX_CHARS = 60
 _CONFIG_OVERFLOW_MARK = "***"
 _ANNO_DESC_KEY = "description"
+_DEFAULT_SINGLE_MARKER = "o"
+_DEFAULT_MERGE_MARKERS = ("1", "2", "3", "4", "*", "+", "x")
+_PANEL_WIDTH_IN = 8.0
+_PANEL_LEFT_IN = 0.95
+_PANEL_RIGHT_IN = 0.20
+_PANEL_TOP_IN = 0.20
+_PANEL_BOTTOM_IN = 0.65
+_PANEL_LEGEND_RIGHT_IN = 2.25
+_PANEL_STACK_VSPACE_IN = 0.10
+_POSTGWAS_PDF_BACKEND_SENTINEL = object()
+_POSTGWAS_PREFERRED_PDF_BACKEND: object = _POSTGWAS_PDF_BACKEND_SENTINEL
 
 try:
     from tqdm.auto import tqdm
@@ -104,21 +121,22 @@ except Exception:
     tqdm = None  # type: ignore[assignment]
     _HAS_TQDM = False
 
-try:
-    from rich.console import Console, Group
-    from rich.panel import Panel
-    from rich.table import Table
-    from rich.text import Text
-    from rich import box
-    _HAS_RICH_CONSOLE = True
-except Exception:
-    Console = None  # type: ignore[assignment]
-    Group = None  # type: ignore[assignment]
-    Panel = None  # type: ignore[assignment]
-    Table = None  # type: ignore[assignment]
-    Text = None  # type: ignore[assignment]
-    box = None  # type: ignore[assignment]
-    _HAS_RICH_CONSOLE = False
+def _postgwas_status_enabled(args) -> bool:
+    return not bool(getattr(args, "_postgwas_worker_mute_stream", False))
+
+
+def _postgwas_invocation_command(argv: Optional[list[str]] = None) -> str:
+    tokens = [str(x) for x in (sys.argv[1:] if argv is None else argv)]
+    prog_raw = str(sys.argv[0]).strip() if len(sys.argv) > 0 else ""
+    if prog_raw == "":
+        prog_raw = "jx postgwas"
+    try:
+        prog_parts = shlex.split(prog_raw)
+    except Exception:
+        prog_parts = [prog_raw]
+    if len(prog_parts) == 0:
+        prog_parts = ["jx", "postgwas"]
+    return shlex.join([str(x) for x in (prog_parts + tokens)])
 
 
 def _env_truthy(name: str, default: bool = False) -> bool:
@@ -322,21 +340,6 @@ def _emit_info_to_file_handlers(logger: logging.Logger, message: str) -> None:
             handler.handle(record)
 
 
-def _emit_info_to_stream_handlers(logger: logging.Logger, message: str) -> None:
-    record = logger.makeRecord(
-        logger.name,
-        logging.INFO,
-        __file__,
-        0,
-        message,
-        args=(),
-        exc_info=None,
-    )
-    for handler in logger.handlers:
-        if not isinstance(handler, logging.FileHandler):
-            handler.handle(record)
-
-
 def _detach_stream_handlers(logger: logging.Logger) -> list[logging.Handler]:
     """
     Temporarily detach non-file handlers from logger.
@@ -366,120 +369,6 @@ def _restore_handlers(logger: logging.Logger, handlers: list[logging.Handler]) -
                 logger.addHandler(handler)
     except Exception:
         return
-
-
-def _truncate_config_line(
-    text: object,
-    *,
-    max_chars: int = _CONFIG_LINE_MAX_CHARS,
-    overflow_mark: str = _CONFIG_OVERFLOW_MARK,
-) -> str:
-    s = str(text)
-    if max_chars <= 0:
-        return ""
-    if len(s) <= max_chars:
-        return s
-    mark = str(overflow_mark)
-    if mark == "":
-        return s[:max_chars]
-    if max_chars <= len(mark):
-        return mark[:max_chars]
-    keep = max_chars - len(mark)
-    return s[:keep] + mark
-
-
-def _render_postgwas_config_rich(
-    *,
-    title: str,
-    host: str,
-    base_rows: list[tuple[str, str]],
-    merge_map_rows: list[tuple[str, str]],
-    vis_rows: Optional[list[tuple[str, str]]],
-    anno_rows: Optional[list[tuple[str, str]]],
-    output_prefix: str,
-    threads_text: str,
-    key_width: int = 20,
-) -> bool:
-    if not (_HAS_RICH_CONSOLE and stdout_is_tty()):
-        return False
-
-    try:
-        assert Console is not None
-        assert Group is not None
-        assert Panel is not None
-        assert Table is not None
-        assert Text is not None
-        assert box is not None
-
-        styles = get_config_color_styles()
-
-        def _kv_table(rows: list[tuple[str, str]]) -> Any:
-            t = Table(
-                show_header=False,
-                box=box.SIMPLE,
-                pad_edge=False,
-                expand=False,
-            )
-            key_w = max(8, int(key_width))
-            t.add_column(style=styles["key"], no_wrap=True, width=key_w, justify="left")
-            t.add_column(style=styles["value"], no_wrap=True, justify="left")
-            for k, v in rows:
-                k_txt = str(k)
-                v_max = max(1, _CONFIG_LINE_MAX_CHARS - key_w - 2)
-                v_txt = _truncate_config_line(v, max_chars=v_max)
-                t.add_row(k_txt, v_txt)
-            return t
-
-        parts: list[Any] = [
-            Text(title, style=styles["title"]),
-            Text(f"Host: {host}"),
-            Text(""),
-            Text("General", style=styles["section"]),
-            _kv_table(base_rows),
-        ]
-
-        if len(merge_map_rows) > 0:
-            map_table = Table(
-                show_header=True,
-                box=box.SIMPLE,
-                pad_edge=False,
-                expand=True,
-            )
-            map_table.add_column("ID", style=styles["key"], no_wrap=True, width=6)
-            map_table.add_column("GWAS file", style=styles["value"])
-            for idx, file in merge_map_rows:
-                idx_txt = str(idx)
-                file_max = max(1, _CONFIG_LINE_MAX_CHARS - len(idx_txt) - 1)
-                map_table.add_row(idx_txt, _truncate_config_line(file, max_chars=file_max))
-            parts.extend([Text(""), Text("Merge trait-id mapping", style=styles["section"]), map_table])
-
-        parts.append(Text(""))
-        if vis_rows is None:
-            parts.extend([Text("Visualization", style=styles["section"]), Text("disabled", style=styles["value"])])
-        else:
-            parts.extend([Text("Visualization", style=styles["section"]), _kv_table(vis_rows)])
-
-        if anno_rows is not None:
-            parts.extend([Text(""), Text("Annotation", style=styles["section"]), _kv_table(anno_rows)])
-
-        parts.extend(
-            [
-                Text(""),
-                Text(_truncate_config_line(f"Output prefix: {output_prefix}"), style=styles["value"]),
-                Text(_truncate_config_line(f"Threads: {threads_text}"), style=styles["value"]),
-            ]
-        )
-
-        panel = Panel(
-            Group(*parts),
-            title="POST-GWAS CONFIG",
-            border_style=styles["border"],
-            expand=False,
-        )
-        Console().print(panel)
-        return True
-    except Exception:
-        return False
 
 
 def _parse_ratio(value: object, name: str) -> float:
@@ -875,6 +764,64 @@ def _resolve_merge_series_colors(
     return colors
 
 
+def _resolve_qq_point_color(spec: Optional[Tuple[str, Any]]) -> str:
+    colors = _resolve_merge_series_colors(spec, 1)
+    if len(colors) == 0:
+        return "black"
+    return str(colors[0])
+
+
+def _parse_marker_spec(value: object) -> Optional[list[str]]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if text == "":
+        raise ValueError("Invalid --marker: value is empty.")
+    raw_tokens = [tok.strip() for tok in re.split(r"[;,]", text) if tok.strip() != ""]
+    if len(raw_tokens) == 0:
+        raise ValueError("Invalid --marker: no marker token found.")
+    out: list[str] = []
+    for tok in raw_tokens:
+        try:
+            MarkerStyle(tok)
+        except Exception as e:
+            raise ValueError(
+                f"Invalid --marker token: {tok}. "
+                "Examples: o, x, +, *, 1, 2, 3, 4."
+            ) from e
+        out.append(str(tok))
+    return out
+
+
+def _resolve_single_marker(spec: Optional[list[str]]) -> str:
+    if spec is None or len(spec) == 0:
+        return str(_DEFAULT_SINGLE_MARKER)
+    return str(spec[0])
+
+
+def _resolve_merge_markers(spec: Optional[list[str]], n_series: int) -> list[str]:
+    if n_series <= 0:
+        return []
+    base = list(spec) if spec is not None and len(spec) > 0 else list(_DEFAULT_MERGE_MARKERS)
+    return [str(base[i % len(base)]) for i in range(n_series)]
+
+
+def _marker_scatter_style(marker: str) -> dict[str, object]:
+    try:
+        marker_obj = MarkerStyle(str(marker))
+        is_filled = bool(marker_obj.is_filled())
+    except Exception:
+        is_filled = True
+    if is_filled:
+        return {
+            "edgecolors": "none",
+            "linewidths": 0.0,
+        }
+    return {
+        "linewidths": 0.8,
+    }
+
+
 def _natural_tokens(text: str) -> tuple[tuple[int, object], ...]:
     tokens: list[tuple[int, object]] = []
     for part in re.split(r"(\d+)", text):
@@ -1184,6 +1131,18 @@ def _filter_df_by_bimranges(
 
     chr_norm = df[chr_col].astype(str).map(_normalize_chr)
     pos_num = pd.to_numeric(df[pos_col], errors="coerce")
+    chrom_max_map: dict[str, int] = {}
+    valid_pos_mask = pos_num.notna() & np.isfinite(pos_num.to_numpy(dtype=float))
+    if bool(valid_pos_mask.any()):
+        chrom_pos_df = pd.DataFrame(
+            {
+                "chrom_norm": chr_norm.loc[valid_pos_mask].to_numpy(dtype=object),
+                "pos_num": pos_num.loc[valid_pos_mask].astype(np.int64).to_numpy(),
+            }
+        )
+        if chrom_pos_df.shape[0] > 0:
+            for chrom_key, max_pos in chrom_pos_df.groupby("chrom_norm")["pos_num"].max().items():
+                chrom_max_map[str(chrom_key)] = int(max_pos)
     seg_id = np.full(n_before, -1, dtype=int)
     seg_defs: list[dict[str, object]] = []
 
@@ -1201,14 +1160,20 @@ def _filter_df_by_bimranges(
             )
         assign = (seg_id < 0) & mask.to_numpy()
         seg_id[assign] = i
+        display_end = int(end)
+        chrom_max = chrom_max_map.get(str(target_chr))
+        if chrom_max is not None:
+            display_end = min(int(end), int(chrom_max))
+        display_end = max(int(start), int(display_end))
         seg_defs.append(
             {
                 "id": i,
                 "chrom": str(chrom),
                 "chrom_norm": target_chr,
                 "start": int(start),
-                "end": int(end),
-                "length": float(max(1, int(end) - int(start))),
+                "end": int(display_end),
+                "query_end": int(end),
+                "length": float(max(1, int(display_end) - int(start))),
             }
         )
 
@@ -2644,6 +2609,7 @@ def _overlay_manhattan_threshold_points(
     *,
     threshold: float,
     base_size: float,
+    marker: str,
     rasterized: bool,
     min_logp: float = 0.5,
     max_logp: Optional[float] = None,
@@ -2686,12 +2652,12 @@ def _overlay_manhattan_threshold_points(
             dfp.loc[sig_mask, "x"],
             dfp.loc[sig_mask, "ylog"],
             color="red",
+            marker=str(marker),
             s=float(base_size) * 1.5,
             alpha=0.85,
-            edgecolors="none",
-            linewidths=0.0,
             rasterized=rasterized,
             zorder=6,
+            **_marker_scatter_style(str(marker)),
         )
     ax.axhline(
         y=thr_log,
@@ -2728,20 +2694,34 @@ def _postgwas_output_format_from_path(path: str) -> str:
 
 def _postgwas_should_rasterize_dense_layers(output_format: object) -> bool:
     fmt = str(output_format).strip().lower()
-    # Keep PDF fully vector to avoid Adobe Illustrator color-collapse issues
-    # observed on mixed-color scatter layers.
+    # Single-file PDF stays vector-friendly by default; merge mode overrides
+    # this per artist and rasterizes dense layers explicitly.
     return fmt != "pdf"
 
 
 def _postgwas_savefig_kwargs(output_format: object) -> dict[str, object]:
     fmt = str(output_format).strip().lower()
-    if fmt == "pdf":
-        return {
-            "transparent": False,
-            "facecolor": "white",
-            "edgecolor": "white",
-        }
-    return {"transparent": True}
+    return {
+        "transparent": False,
+        "facecolor": "white",
+        "edgecolor": "white",
+    }
+
+
+def _postgwas_resolve_pdf_backend() -> Optional[str]:
+    global _POSTGWAS_PREFERRED_PDF_BACKEND
+    cached = _POSTGWAS_PREFERRED_PDF_BACKEND
+    if cached is not _POSTGWAS_PDF_BACKEND_SENTINEL:
+        return cached if isinstance(cached, str) else None
+    backend_name: Optional[str]
+    try:
+        from matplotlib.backends import backend_cairo  # noqa: F401
+    except Exception:
+        backend_name = None
+    else:
+        backend_name = "cairo"
+    _POSTGWAS_PREFERRED_PDF_BACKEND = backend_name
+    return backend_name
 
 
 def _qq_select_points_with_threshold(
@@ -2788,8 +2768,187 @@ def _qq_select_points_with_threshold(
     return exp[keep], obs[keep]
 
 
+def _qq_confidence_band_from_n(
+    n_points: int,
+    *,
+    ci: int = 95,
+    max_points: Optional[int] = _QQ_BAND_MAX_POINTS,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    band_n = int(max(0, n_points))
+    if band_n <= 0:
+        return (
+            np.asarray([], dtype=float),
+            np.asarray([], dtype=float),
+            np.asarray([], dtype=float),
+        )
+    if max_points is not None and band_n > int(max_points):
+        n_band = max(2, int(max_points))
+        ranks = np.unique(
+            np.round(np.geomspace(1.0, float(band_n), num=n_band)).astype(np.int64)
+        )
+        if ranks[0] != 1:
+            ranks = np.insert(ranks, 0, 1)
+        if ranks[-1] != band_n:
+            ranks = np.append(ranks, band_n)
+    else:
+        ranks = np.arange(1, band_n + 1, dtype=np.int64)
+    ranks = np.sort(ranks)[::-1]
+    ci_frac = float(ci)
+    if ci_frac > 1.0:
+        ci_frac /= 100.0
+    ci_frac = float(np.clip(ci_frac, 1e-12, 1.0 - 1e-12))
+    alpha = 1.0 - ci_frac
+    q_lo = alpha / 2.0
+    q_hi = 1.0 - alpha / 2.0
+    x_band = -np.log10(ranks.astype(np.float64) / (band_n + 1.0))
+    p_upper = beta.ppf(q_hi, ranks, band_n - ranks + 1)
+    p_lower = beta.ppf(q_lo, ranks, band_n - ranks + 1)
+    lower = -np.log10(p_upper)
+    upper = -np.log10(p_lower)
+    keep = np.isfinite(x_band) & np.isfinite(lower) & np.isfinite(upper)
+    return x_band[keep], lower[keep], upper[keep]
+
+
+def _resolve_qq_ylim(
+    ax: plt.Axes,
+    *,
+    lower: float,
+    upper: Optional[float],
+) -> tuple[float, float]:
+    lo = float(lower)
+    _y0, _y1 = ax.get_ylim()
+    if upper is not None and np.isfinite(float(upper)):
+        hi = float(upper)
+    else:
+        hi = float(_y1)
+    if not np.isfinite(hi) or hi <= lo:
+        hi = lo + max(1.0, abs(lo) * 0.1, 1e-9)
+    return lo, hi
+
+
+def _apply_qq_axes(
+    ax: plt.Axes,
+    *,
+    y_lower: float,
+    y_upper: float,
+    x_right: float,
+    y_ticks: Optional[np.ndarray] = None,
+) -> None:
+    lo = float(y_lower)
+    hi = float(y_upper)
+    xr = float(x_right)
+    if not np.isfinite(xr) or xr <= lo:
+        xr = lo + 1.0
+    x_pad = max(1e-9, 0.02 * float(max(1e-9, xr - lo)))
+    x_upper = xr + x_pad
+    if x_upper <= lo:
+        x_upper = lo + 1.0
+    ax.set_ylim(lo, hi)
+    ax.set_xlim(lo, x_upper)
+    ax.margins(x=0.0)
+    if y_ticks is not None:
+        ticks = np.asarray(y_ticks, dtype=float)
+        keep = np.isfinite(ticks) & (ticks >= lo - 1e-9) & (ticks <= hi + 1e-9)
+        kept = ticks[keep]
+        if kept.size > 0:
+            apply_integer_yticks(ax, ticks=kept)
+            return
+    apply_integer_yticks(ax)
+
+
+def _create_ratio_panel_figure(
+    *,
+    ratio: float,
+    dpi: int,
+    panel_width_in: Optional[float] = None,
+    panel_height_in: Optional[float] = None,
+    reserve_right_in: float = 0.0,
+    left_in: float = _PANEL_LEFT_IN,
+    right_in: float = _PANEL_RIGHT_IN,
+    top_in: float = _PANEL_TOP_IN,
+    bottom_in: float = _PANEL_BOTTOM_IN,
+) -> tuple[plt.Figure, plt.Axes, float, float]:
+    use_ratio = max(0.2, float(ratio))
+    if panel_width_in is None and panel_height_in is None:
+        panel_width_in = float(_PANEL_WIDTH_IN)
+    if panel_width_in is None:
+        plot_h = max(1e-6, float(panel_height_in))
+        plot_w = plot_h * use_ratio
+    elif panel_height_in is None:
+        plot_w = max(1e-6, float(panel_width_in))
+        plot_h = plot_w / use_ratio
+    else:
+        plot_w = max(1e-6, float(panel_width_in))
+        plot_h = max(1e-6, float(panel_height_in))
+    fig_w = float(left_in) + float(plot_w) + float(right_in) + float(reserve_right_in)
+    fig_h = float(bottom_in) + float(plot_h) + float(top_in)
+    fig = plt.figure(figsize=(fig_w, fig_h), dpi=int(dpi))
+    ax = fig.add_axes(
+        [
+            float(left_in) / float(fig_w),
+            float(bottom_in) / float(fig_h),
+            float(plot_w) / float(fig_w),
+            float(plot_h) / float(fig_h),
+        ]
+    )
+    try:
+        ax.set_box_aspect(float(plot_h) / float(plot_w))
+    except Exception:
+        pass
+    return fig, ax, float(plot_w), float(plot_h)
+
+
+def _create_stacked_panel_figure(
+    *,
+    panel_width_in: float,
+    panel_heights_in: list[float],
+    dpi: int,
+    reserve_right_in: float = 0.0,
+    left_in: float = _PANEL_LEFT_IN,
+    right_in: float = _PANEL_RIGHT_IN,
+    top_in: float = _PANEL_TOP_IN,
+    bottom_in: float = _PANEL_BOTTOM_IN,
+    vspace_in: float = _PANEL_STACK_VSPACE_IN,
+) -> tuple[plt.Figure, list[plt.Axes], float, list[float]]:
+    heights = [max(1e-6, float(h)) for h in panel_heights_in]
+    plot_w = max(1e-6, float(panel_width_in))
+    gaps_h = max(0, len(heights) - 1) * max(0.0, float(vspace_in))
+    fig_w = float(left_in) + plot_w + float(right_in) + float(reserve_right_in)
+    fig_h = float(bottom_in) + float(top_in) + float(sum(heights)) + float(gaps_h)
+    fig = plt.figure(figsize=(fig_w, fig_h), dpi=int(dpi))
+    axes: list[plt.Axes] = []
+    current_top = fig_h - float(top_in)
+    for h_in in heights:
+        y0_in = current_top - float(h_in)
+        ax = fig.add_axes(
+            [
+                float(left_in) / float(fig_w),
+                float(y0_in) / float(fig_h),
+                float(plot_w) / float(fig_w),
+                float(h_in) / float(fig_h),
+            ]
+        )
+        axes.append(ax)
+        current_top = y0_in - float(vspace_in)
+    return fig, axes, float(plot_w), heights
+
+
+def _save_figure(fig: plt.Figure, path: str) -> None:
+    fmt = _postgwas_output_format_from_path(path)
+    save_kwargs = _postgwas_savefig_kwargs(fmt)
+    if fmt == "pdf":
+        backend_name = _postgwas_resolve_pdf_backend()
+        if backend_name is not None:
+            try:
+                fig.savefig(path, backend=backend_name, **save_kwargs)
+                return
+            except Exception:
+                pass
+    fig.savefig(path, **save_kwargs)
+
+
 def _save_figure_and_close(fig: plt.Figure, path: str) -> None:
-    fig.savefig(path, **_postgwas_savefig_kwargs(_postgwas_output_format_from_path(path)))
+    _save_figure(fig, path)
     plt.close(fig)
 
 
@@ -2824,17 +2983,37 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
         else None
     )
     gff_query_cache: Optional[GFFQuery] = None
+    status_enabled = _postgwas_status_enabled(args)
+    src = os.path.basename(str(file))
+    task_label = os.path.basename(str(output_stem))
+    single_marker = str(getattr(args, "_postgwas_single_marker", _DEFAULT_SINGLE_MARKER))
 
-    try:
-        header_cols = pd.read_csv(file, sep="\t", nrows=0).columns.tolist()
-    except Exception:
-        header_cols = [chr_col, pos_col, p_col]
-    lead_info_cols = [c for c in _LEAD_SNP_INFO_COLS if c in header_cols]
-    read_cols = [chr_col, pos_col, p_col] + lead_info_cols
-    read_cols = list(dict.fromkeys(read_cols))
-    df_all = pd.read_csv(file, sep="\t", usecols=read_cols)
-    full_chr_labels = df_all[chr_col].drop_duplicates().tolist()
-    df = df_all
+    if not status_enabled:
+        logger.info(f"Loading GWAS results from {src}... [{format_elapsed(0.0)}]")
+    with CliStatus(
+        f"Loading GWAS results from {src}...",
+        enabled=status_enabled,
+    ) as load_status:
+        try:
+            try:
+                header_cols = pd.read_csv(file, sep="\t", nrows=0).columns.tolist()
+            except Exception:
+                header_cols = [chr_col, pos_col, p_col]
+            lead_info_cols = [c for c in _LEAD_SNP_INFO_COLS if c in header_cols]
+            read_cols = [chr_col, pos_col, p_col] + lead_info_cols
+            read_cols = list(dict.fromkeys(read_cols))
+            df_all = pd.read_csv(file, sep="\t", usecols=read_cols)
+            full_chr_labels = df_all[chr_col].drop_duplicates().tolist()
+            df = df_all
+        except Exception:
+            load_status.fail(f"Loading GWAS results from {src} ...Failed")
+            raise
+        load_status.complete(
+            f"Loading GWAS results from {src} (nSNP={int(df_all.shape[0])})"
+        )
+    if status_enabled:
+        logger.info(f"* {task_label} (nSNP={int(df_all.shape[0])})")
+
     bim_layout: list[dict[str, object]] = []
     if args.bimrange_tuples is not None:
         df_sel, seg_defs, n_before = _filter_df_by_bimranges(
@@ -2886,7 +3065,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
     # ------------------------------------------------------------------
     if args.manh_ratio is not None or args.qq_ratio is not None or effective_ldblock_ratio is not None:
         t_plot = time.time()
-        logger.info("* Visualizing GWAS results...")
+        logger.info(f"Visualizing GWAS results from {src}...")
         ld_use_all_sites = bool(args.ldblock_all is not None)
 
         need_manh_panel = args.manh_ratio is not None or effective_ldblock_ratio is not None
@@ -2914,7 +3093,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                     0.1,
                     compression=False,
                 )
-        width_in = 8.0
+        width_in = float(_PANEL_WIDTH_IN)
         gene_panel_h_in = width_in / 20.0
         dpi = 300
         rasterized = _postgwas_should_rasterize_dense_layers(args.format)
@@ -2946,7 +3125,6 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
         pending_manh_path: Optional[str] = None
 
         plot_colors = None
-        two_color_style = _resolve_two_color_style(args.palette_spec)
         ldblock_style = _resolve_ldblock_style(args.ldblock_palette_spec)
         if plotmodel is not None:
             plot_colors = _manhattan_colors_for_subset(
@@ -2954,11 +3132,8 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                 full_chr_labels,
                 df[chr_col].drop_duplicates().tolist(),
             )
-        qq_point_color = "black"
-        qq_band_color = "grey"
-        if two_color_style is not None:
-            qq_point_color = str(two_color_style["gene_line_color"])   # dark
-            qq_band_color = str(two_color_style["gene_block_color"])   # light
+        qq_point_color = _resolve_qq_point_color(args.palette_spec)
+        qq_band_color = str(_QQ_BAND_COLOR)
 
         def _draw_manhattan_axis(
             ax: plt.Axes,
@@ -2999,6 +3174,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                         None,
                         ax=ax,
                         color_set=plot_colors,
+                        marker=single_marker,
                         min_logp=manh_min_logp,
                         max_logp=manh_max_logp,
                         y_min=manh_ymin,
@@ -3010,6 +3186,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                         plotmodel,
                         threshold=threshold,
                         base_size=args.scatter_size,
+                        marker=single_marker,
                         rasterized=rasterized,
                         min_logp=manh_min_logp,
                         max_logp=manh_max_logp,
@@ -3029,8 +3206,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                         alpha=0.85,
                         zorder=10,
                         s=args.scatter_size,
-                        edgecolors="none",
-                        linewidths=0.0,
+                        **_marker_scatter_style("D"),
                     )
                     for idx in draw_hl_idx:
                         text = _sanitize_plot_text(df_hl.loc[idx, 3])
@@ -3046,6 +3222,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                         None,
                         ax=ax,
                         color_set=plot_colors,
+                        marker=single_marker,
                         min_logp=manh_min_logp,
                         max_logp=manh_max_logp,
                         y_min=manh_ymin,
@@ -3058,6 +3235,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                         plotmodel,
                         threshold=threshold,
                         base_size=args.scatter_size,
+                        marker=single_marker,
                         rasterized=rasterized,
                         min_logp=manh_min_logp,
                         max_logp=manh_max_logp,
@@ -3068,6 +3246,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                     None,
                     ax=ax,
                     color_set=plot_colors,
+                    marker=single_marker,
                     min_logp=manh_min_logp,
                     max_logp=manh_max_logp,
                     y_min=manh_ymin,
@@ -3079,6 +3258,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                     plotmodel,
                     threshold=threshold,
                     base_size=args.scatter_size,
+                    marker=single_marker,
                     rasterized=rasterized,
                     min_logp=manh_min_logp,
                     max_logp=manh_max_logp,
@@ -3092,8 +3272,17 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                         label_fontsize=manh_loc_fontsize,
                     )
                 elif len(args.bimrange_tuples) == 1:
-                    bchrom, bstart, bend = args.bimrange_tuples[0]
-                    _apply_bimrange_manhattan_axis(ax, bchrom, bstart, bend)
+                    if len(bim_layout) == 1:
+                        seg = bim_layout[0]
+                        _apply_bimrange_manhattan_axis(
+                            ax,
+                            seg["chrom"],
+                            int(seg["start"]),
+                            int(seg["end"]),
+                        )
+                    else:
+                        bchrom, bstart, bend = args.bimrange_tuples[0]
+                        _apply_bimrange_manhattan_axis(ax, bchrom, bstart, bend)
                     _show_end_locs_without_xticks(
                         ax,
                         label_fontsize=manh_loc_fontsize,
@@ -3122,15 +3311,13 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
 
         # ----------------- Manhattan plot -----------------
         if args.manh_ratio is not None:
-            manh_h_in = width_in / args.manh_ratio
-            fig = plt.figure(
-                figsize=(width_in, manh_h_in),
+            fig, ax, _panel_w_in, manh_panel_h_in = _create_ratio_panel_figure(
+                ratio=float(args.manh_ratio),
                 dpi=dpi,
+                panel_width_in=width_in,
             )
-            ax = fig.add_subplot(111)
             manh_ylim, manh_yticks, manh_fontsize, manh_xlim = _draw_manhattan_axis(ax)
-            manh_height_in = fig.get_figheight()
-            fig.tight_layout()
+            manh_height_in = float(manh_panel_h_in)
             manh_axes_bounds = ax.get_position().bounds
             manh_path = os.path.join(args.out, f"{output_stem}.manh.{args.format}")
             if enable_pure_manhqq_parallel:
@@ -3163,18 +3350,36 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                     logger.warning("Warning: QQ plotting skipped because no SNPs are available.")
                     qq_path = None
                 else:
+                    qq_lower = (
+                        float(manh_ylim[0])
+                        if (manh_ylim is not None and len(manh_ylim) >= 1)
+                        else (
+                            float(args.ylim_min)
+                            if args.ylim_min is not None
+                            else 0.0
+                        )
+                    )
+                    qq_upper_target = (
+                        float(manh_ylim[1])
+                        if (manh_ylim is not None and len(manh_ylim) >= 2)
+                        else (
+                            float(args.ylim_max)
+                            if args.ylim_max is not None
+                            else None
+                        )
+                    )
                     qq_y_in = 4.0
                     if manh_height_in is not None:
                         qq_y_in = manh_height_in
-                    qq_x_in = qq_y_in * args.qq_ratio
-                    fig = plt.figure(
-                        figsize=(qq_x_in, qq_y_in),
+                    fig, ax2, _qq_panel_w_in, _qq_panel_h_in = _create_ratio_panel_figure(
+                        ratio=float(args.qq_ratio),
                         dpi=dpi,
+                        panel_height_in=qq_y_in,
                     )
-                    ax2 = fig.add_subplot(111)
                     plotmodel_qq.qq(
                         ax=ax2,
                         color_set=[qq_point_color, qq_band_color],
+                        marker=single_marker,
                         line_color="black",
                         scatter_size=args.scatter_size,
                         qq_mode=("full" if args.fullscatter else "auto"),
@@ -3184,11 +3389,9 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                             if (np.isfinite(threshold) and float(threshold) > 0.0)
                             else None
                         ),
-                        axis_min=(
-                            float(manh_ylim[0])
-                            if (manh_ylim is not None and len(manh_ylim) >= 1)
-                            else None
-                        ),
+                        axis_min=qq_lower,
+                        axis_max=qq_upper_target,
+                        band_color=qq_band_color,
                         rasterized=rasterized,
                     )
                     qq_xmax = float(np.log10(plotmodel_qq.df.shape[0] + 1))
@@ -3198,19 +3401,23 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                         _x_right = ax2.get_xlim()[1]
                         x_right = float(_x_right)
                     x_right = max(1.0, x_right)
-                    if manh_ylim is not None:
-                        ax2.set_ylim(manh_ylim)
-                    qq_left = float(manh_ylim[0]) if manh_ylim is not None else 0.0
-                    x_right = max(x_right, qq_left + 1e-9)
-                    x_pad = max(1e-9, 0.02 * float(max(1e-9, x_right - qq_left)))
-                    x_upper = x_right + x_pad
-                    if x_upper <= qq_left:
-                        x_upper = qq_left + 1.0
-                    ax2.set_xlim(qq_left, x_upper)
-                    if manh_yticks is not None and manh_ylim is not None:
-                        apply_integer_yticks(ax2, ticks=manh_yticks)
-                    else:
-                        apply_integer_yticks(ax2)
+                    qq_lower, qq_upper = _resolve_qq_ylim(
+                        ax2,
+                        lower=qq_lower,
+                        upper=qq_upper_target,
+                    )
+                    _apply_qq_axes(
+                        ax2,
+                        y_lower=qq_lower,
+                        y_upper=qq_upper,
+                        x_right=x_right,
+                        y_ticks=(
+                            manh_yticks
+                            if (manh_yticks is not None and manh_ylim is not None)
+                            else None
+                        ),
+                    )
+                    apply_integer_xticks(ax2)
                     if manh_fontsize is not None:
                         ax2.xaxis.label.set_size(manh_fontsize)
                         ax2.yaxis.label.set_size(manh_fontsize)
@@ -3218,10 +3425,8 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                     if hide_axis_labels:
                         ax2.set_xlabel("")
                         ax2.set_ylabel("")
-                    fig.tight_layout()
                     qq_path = os.path.join(args.out, f"{output_stem}.qq.{args.format}")
-                    fig.savefig(qq_path, **_postgwas_savefig_kwargs(args.format))
-                    plt.close(fig)
+                    _save_figure_and_close(fig, qq_path)
             finally:
                 if manh_save_future is not None:
                     manh_save_future.result()
@@ -3494,8 +3699,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                 new_w = ref_w * float(fx1 - fx0)
                 ax_ld.set_position([new_x0, cy0, new_w, ch])
                 ax_ld.set_anchor("N")
-            fig_ld.savefig(ld_path, **_postgwas_savefig_kwargs(args.format))
-            plt.close(fig_ld)
+            _save_figure_and_close(fig_ld, ld_path)
 
             if use_gene_bridge:
                 gene_h_in = gene_panel_h_in
@@ -3519,8 +3723,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                     _cx0, cy0, _cw, ch = ax_gene.get_position().bounds
                     ax_gene.set_position([mx0, cy0, mw, ch])
                 gene_path = os.path.join(args.out, f"{output_stem}.gene.{args.format}")
-                fig_gene.savefig(gene_path, **_postgwas_savefig_kwargs(args.format))
-                plt.close(fig_gene)
+                _save_figure_and_close(fig_gene, gene_path)
             else:
                 gene_path = None
 
@@ -3536,55 +3739,28 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
             mid_h_raw = gene_panel_h_in if use_gene_bridge else 0.22
             mid_h_cap = float(width_in) / 15.0
             mid_h_in = min(float(mid_h_raw), float(mid_h_cap))
-            # LD row height should follow actual LD panel width;
-            # otherwise narrowed x-span leaves large vertical blanks.
-            sub_left = 0.08
-            sub_right = 0.98
-            sub_top = 0.98
-            sub_bottom = 0.07
-            sub_hspace = 0.04
-            manh_drawable_frac = float(sub_right - sub_left)
             if ld_panel_xspan is None:
                 ld_panel_frac_in_manh = 1.0
             else:
                 ld_panel_frac_in_manh = float(ld_panel_xspan[1] - ld_panel_xspan[0])
-            # Compensate GridSpec/subplots spacing so LD axis keeps intended geometry
-            # under LDblock's fixed aspect (isosceles right triangle).
-            n_rows_combo = 3.0
-            ld_row_layout_factor = (
-                float(sub_top - sub_bottom) * n_rows_combo
-            ) / (
-                n_rows_combo + float(sub_hspace) * (n_rows_combo - 1.0)
-            )
             ld_h_in_combo = (
                 width_in
-                * manh_drawable_frac
                 * ld_panel_frac_in_manh
                 / effective_ldblock_ratio
-                / ld_row_layout_factor
             )
             ld_h_in_combo_min = (
                 width_in
-                * manh_drawable_frac
                 * ld_panel_frac_in_manh
                 * _ld_min_height_over_width(max(2, int(ld_mat.shape[0])))
-                / ld_row_layout_factor
             )
             ld_h_in_combo = max(0.5, float(ld_h_in_combo), float(ld_h_in_combo_min))
-            manhld_total_h_in = manhld_manh_h_in + mid_h_in + ld_h_in_combo
-            fig_manhld = plt.figure(
-                figsize=(width_in, manhld_total_h_in),
+            fig_manhld, combo_axes, _combo_panel_w_in, _combo_panel_heights = _create_stacked_panel_figure(
+                panel_width_in=width_in,
+                panel_heights_in=[manhld_manh_h_in, mid_h_in, ld_h_in_combo],
                 dpi=dpi,
+                vspace_in=_PANEL_STACK_VSPACE_IN,
             )
-            gs_manhld = fig_manhld.add_gridspec(
-                3,
-                1,
-                height_ratios=[manhld_manh_h_in, mid_h_in, ld_h_in_combo],
-                hspace=0.04,
-            )
-            ax_manhld_top = fig_manhld.add_subplot(gs_manhld[0, 0])
-            ax_manhld_mid = fig_manhld.add_subplot(gs_manhld[1, 0])
-            ax_manhld_bot = fig_manhld.add_subplot(gs_manhld[2, 0])
+            ax_manhld_top, ax_manhld_mid, ax_manhld_bot = combo_axes
             # Keep transition axis below Manhattan axis so loc labels remain visible.
             ax_manhld_top.set_zorder(5)
             ax_manhld_mid.set_zorder(2)
@@ -3607,13 +3783,6 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                 )
                 ax_manhld_mid.set_xlim(manhld_top_xlim)
                 ax_manhld_mid.set_ylim(mid_gene_ymin, mid_gene_ymax)
-            fig_manhld.subplots_adjust(
-                left=sub_left,
-                right=sub_right,
-                top=sub_top,
-                bottom=sub_bottom,
-                hspace=sub_hspace,
-            )
 
             # Keep the two panels strictly left/right aligned.
             # Manh/Gene keep full width; optionally narrow only LD panel width.
@@ -3661,8 +3830,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                 )
 
             manhld_path = os.path.join(args.out, f"{output_stem}.manhld.{args.format}")
-            fig_manhld.savefig(manhld_path, **_postgwas_savefig_kwargs(args.format))
-            plt.close(fig_manhld)
+            _save_figure_and_close(fig_manhld, manhld_path)
         else:
             ld_path = None
             gene_path = None
@@ -3689,176 +3857,185 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
             title = ", ".join([x[0] for x in saved_paths])
             body = "\n".join([f"  {format_path_for_display(x[1])}" for x in saved_paths])
             log_success(logger, f"{title} plots saved to:\n{body}")
-        log_success(logger, f"Visualization completed in {round(time.time() - t_plot, 2)} seconds.\n")
+        log_success(logger, f"Visualizing GWAS results from {src} ...Finished [{format_elapsed(time.time() - t_plot)}]")
 
     # ------------------------------------------------------------------
     # 2. Annotation of significant loci
     # ------------------------------------------------------------------
     if args.anno:
-        logger.info("* Annotating significant SNPs...")
-        if os.path.exists(args.anno):
-            t_anno = time.time()
-
-            # Keep SNPs passing threshold
-            lead_cols_present = [c for c in _LEAD_SNP_INFO_COLS if c in df.columns]
-            df_filter_raw = df.loc[
-                df[p_col] <= threshold,
-                [chr_col, pos_col, p_col] + lead_cols_present,
-            ].copy()
-            df_filter = df_filter_raw.set_index([chr_col, pos_col])
-
-            if args.ldclump_window_bp is not None:
-                n_before = int(df_filter_raw.shape[0])
-                logger.info(
-                    "Applying LD clump on threshold-passing SNPs for annotation: "
-                    f"window={args.ldclump_window_bp} bp, r2>={args.ldclump_r2:g}"
+        if not status_enabled:
+            logger.info(f"Annotating significant SNPs from {src}... [{format_elapsed(0.0)}]")
+        with CliStatus(
+            f"Annotating significant SNPs from {src}...",
+            enabled=status_enabled,
+        ) as anno_status:
+            if not os.path.exists(args.anno):
+                anno_status.complete(
+                    "Annotating significant SNPs ...Skipped (annotation file not found)"
                 )
-                df_filter, _clump_dict = _ldclump_significant_snps(
-                    df_filter_raw,
-                    chr_col=chr_col,
-                    pos_col=pos_col,
-                    p_col=p_col,
-                    genofile=args.genofile,
-                    window_bp=int(args.ldclump_window_bp),
-                    r2_thr=float(args.ldclump_r2),
-                    logger=logger,
-                    show_progress=(len(args.gwasfile) == 1),
-                )
-                n_after = int(df_filter.shape[0])
-                logger.info(
-                    f"LD clump completed: kept {n_after}/{n_before} threshold-passing SNPs."
-                )
-
-            # Attach lead SNP info columns (allele0/allele1/maf/beta/se) by lead index.
-            lead_map = df_filter_raw.loc[:, [chr_col, pos_col] + lead_cols_present].copy()
-            if lead_map.shape[0] > 0:
-                lead_map[chr_col] = lead_map[chr_col].astype(str)
-                lead_map[pos_col] = pd.to_numeric(lead_map[pos_col], errors="coerce")
-                lead_map = lead_map.dropna(subset=[pos_col]).copy()
-                lead_map[pos_col] = lead_map[pos_col].astype(int)
-                lead_map = lead_map.drop_duplicates(subset=[chr_col, pos_col], keep="first")
-                lead_map = lead_map.set_index([chr_col, pos_col], drop=True)
-
-                idx_chr = pd.Index(df_filter.index.get_level_values(0).astype(str))
-                idx_pos = pd.to_numeric(
-                    df_filter.index.get_level_values(1),
-                    errors="coerce",
-                ).fillna(0).astype(int)
-                df_filter.index = pd.MultiIndex.from_arrays(
-                    [idx_chr, idx_pos],
-                    names=[chr_col, pos_col],
-                )
-
-                for col in lead_cols_present:
-                    df_filter[col] = lead_map.reindex(df_filter.index)[col].values
-
-            for col in _LEAD_SNP_INFO_COLS:
-                if col not in df_filter.columns:
-                    df_filter[col] = "NA"
-
-            # Read annotation (GFF/bed) into unified annotation table
-            # After readanno:
-            #   anno[0] = chr
-            #   anno[1] = start
-            #   anno[2] = end
-            #   anno[3] = gene ID
-            #   anno[4], anno[5] = description fields
-            if anno_suffix in {"gff", "gff3"} and gff_query_cache is not None:
-                anno = readanno(args.anno, _ANNO_DESC_KEY, gff_data=gff_query_cache.gff)
             else:
-                anno = readanno(args.anno, _ANNO_DESC_KEY)
-            anno_chr = anno[0].astype(str).map(_normalize_chr)
+                try:
+                    # Keep SNPs passing threshold
+                    lead_cols_present = [c for c in _LEAD_SNP_INFO_COLS if c in df.columns]
+                    df_filter_raw = df.loc[
+                        df[p_col] <= threshold,
+                        [chr_col, pos_col, p_col] + lead_cols_present,
+                    ].copy()
+                    df_filter = df_filter_raw.set_index([chr_col, pos_col])
 
-            # Exact overlap annotation
-            desc_exact = [
-                anno.loc[
-                    (anno_chr == _normalize_chr(idx[0]))
-                    & (anno[1] <= idx[1])
-                    & (anno[2] >= idx[1])
-                ]
-                for idx in df_filter.index
-            ]
-            df_filter["desc"] = [
-                _format_gene_annotation_dict(x)
-                for x in desc_exact
-            ]
+                    if args.ldclump_window_bp is not None:
+                        n_before = int(df_filter_raw.shape[0])
+                        logger.info(
+                            "Applying LD clump on threshold-passing SNPs for annotation: "
+                            f"window={args.ldclump_window_bp} bp, r2>={args.ldclump_r2:g}"
+                        )
+                        df_filter, _clump_dict = _ldclump_significant_snps(
+                            df_filter_raw,
+                            chr_col=chr_col,
+                            pos_col=pos_col,
+                            p_col=p_col,
+                            genofile=args.genofile,
+                            window_bp=int(args.ldclump_window_bp),
+                            r2_thr=float(args.ldclump_r2),
+                            logger=logger,
+                            show_progress=(len(args.gwasfile) == 1),
+                        )
+                        n_after = int(df_filter.shape[0])
+                        logger.info(
+                            f"LD clump completed: kept {n_after}/{n_before} threshold-passing SNPs."
+                        )
 
-            # Optional broadened window around SNP (卤 annobroaden kb)
-            if args.annobroaden is not None:
-                kb = args.annobroaden * 1_000
-                desc_broad = [
-                    anno.loc[
-                        (anno_chr == _normalize_chr(idx[0]))
-                        & (anno[1] <= idx[1] + kb)
-                        & (anno[2] >= idx[1] - kb)
+                    # Attach lead SNP info columns (allele0/allele1/maf/beta/se) by lead index.
+                    lead_map = df_filter_raw.loc[:, [chr_col, pos_col] + lead_cols_present].copy()
+                    if lead_map.shape[0] > 0:
+                        lead_map[chr_col] = lead_map[chr_col].astype(str)
+                        lead_map[pos_col] = pd.to_numeric(lead_map[pos_col], errors="coerce")
+                        lead_map = lead_map.dropna(subset=[pos_col]).copy()
+                        lead_map[pos_col] = lead_map[pos_col].astype(int)
+                        lead_map = lead_map.drop_duplicates(subset=[chr_col, pos_col], keep="first")
+                        lead_map = lead_map.set_index([chr_col, pos_col], drop=True)
+
+                        idx_chr = pd.Index(df_filter.index.get_level_values(0).astype(str))
+                        idx_pos = pd.to_numeric(
+                            df_filter.index.get_level_values(1),
+                            errors="coerce",
+                        ).fillna(0).astype(int)
+                        df_filter.index = pd.MultiIndex.from_arrays(
+                            [idx_chr, idx_pos],
+                            names=[chr_col, pos_col],
+                        )
+
+                        for col in lead_cols_present:
+                            df_filter[col] = lead_map.reindex(df_filter.index)[col].values
+
+                    for col in _LEAD_SNP_INFO_COLS:
+                        if col not in df_filter.columns:
+                            df_filter[col] = "NA"
+
+                    # Read annotation (GFF/bed) into unified annotation table
+                    # After readanno:
+                    #   anno[0] = chr
+                    #   anno[1] = start
+                    #   anno[2] = end
+                    #   anno[3] = gene ID
+                    #   anno[4], anno[5] = description fields
+                    if anno_suffix in {"gff", "gff3"} and gff_query_cache is not None:
+                        anno = readanno(args.anno, _ANNO_DESC_KEY, gff_data=gff_query_cache.gff)
+                    else:
+                        anno = readanno(args.anno, _ANNO_DESC_KEY)
+                    anno_chr = anno[0].astype(str).map(_normalize_chr)
+
+                    # Exact overlap annotation
+                    desc_exact = [
+                        anno.loc[
+                            (anno_chr == _normalize_chr(idx[0]))
+                            & (anno[1] <= idx[1])
+                            & (anno[2] >= idx[1])
+                        ]
+                        for idx in df_filter.index
                     ]
-                    for idx in df_filter.index
-                ]
-                df_filter["broaden"] = [
-                    _format_gene_annotation_dict(x)
-                    for x in desc_broad
-                ]
-            else:
-                if "broaden" in df_filter.columns:
-                    df_filter = df_filter.drop(columns=["broaden"])
+                    df_filter["desc"] = [
+                        _format_gene_annotation_dict(x)
+                        for x in desc_exact
+                    ]
 
-            df_out = df_filter.reset_index()
-            if pos_col in df_out.columns:
-                df_out[pos_col] = pd.to_numeric(df_out[pos_col], errors="coerce").fillna(0).astype(int)
-            if "start" in df_out.columns:
-                df_out["start"] = pd.to_numeric(df_out["start"], errors="coerce").fillna(df_out[pos_col]).astype(int)
-            if "end" in df_out.columns:
-                df_out["end"] = pd.to_numeric(df_out["end"], errors="coerce").fillna(df_out[pos_col]).astype(int)
-            if "nsnps" in df_out.columns:
-                df_out["nsnps"] = pd.to_numeric(df_out["nsnps"], errors="coerce").fillna(0).astype(int)
-            if "MeanR2" in df_out.columns:
-                df_out["MeanR2"] = (
-                    pd.to_numeric(df_out["MeanR2"], errors="coerce")
-                    .fillna(0.0)
-                    .map(lambda x: f"{float(x):.2f}")
+                    # Optional broadened window around SNP (卤 annobroaden kb)
+                    if args.annobroaden is not None:
+                        kb = args.annobroaden * 1_000
+                        desc_broad = [
+                            anno.loc[
+                                (anno_chr == _normalize_chr(idx[0]))
+                                & (anno[1] <= idx[1] + kb)
+                                & (anno[2] >= idx[1] - kb)
+                            ]
+                            for idx in df_filter.index
+                        ]
+                        df_filter["broaden"] = [
+                            _format_gene_annotation_dict(x)
+                            for x in desc_broad
+                        ]
+                    else:
+                        if "broaden" in df_filter.columns:
+                            df_filter = df_filter.drop(columns=["broaden"])
+
+                    df_out = df_filter.reset_index()
+                    if pos_col in df_out.columns:
+                        df_out[pos_col] = pd.to_numeric(df_out[pos_col], errors="coerce").fillna(0).astype(int)
+                    if "start" in df_out.columns:
+                        df_out["start"] = pd.to_numeric(df_out["start"], errors="coerce").fillna(df_out[pos_col]).astype(int)
+                    if "end" in df_out.columns:
+                        df_out["end"] = pd.to_numeric(df_out["end"], errors="coerce").fillna(df_out[pos_col]).astype(int)
+                    if "nsnps" in df_out.columns:
+                        df_out["nsnps"] = pd.to_numeric(df_out["nsnps"], errors="coerce").fillna(0).astype(int)
+                    if "MeanR2" in df_out.columns:
+                        df_out["MeanR2"] = (
+                            pd.to_numeric(df_out["MeanR2"], errors="coerce")
+                            .fillna(0.0)
+                            .map(lambda x: f"{float(x):.2f}")
+                        )
+
+                    # Output file is sorted by chromosome and position.
+                    if chr_col in df_out.columns and pos_col in df_out.columns:
+                        df_out["_chr_sort_key"] = df_out[chr_col].map(_chrom_sort_key)
+                        df_out = df_out.sort_values(
+                            by=["_chr_sort_key", pos_col],
+                            ascending=[True, True],
+                            kind="mergesort",
+                        ).drop(columns=["_chr_sort_key"])
+
+                    col_order: list[str] = [chr_col, pos_col]
+                    for col in _LEAD_SNP_INFO_COLS:
+                        if col in df_out.columns:
+                            col_order.append(col)
+                    if "start" in df_out.columns:
+                        col_order.append("start")
+                    if "end" in df_out.columns:
+                        col_order.append("end")
+                    if "nsnps" in df_out.columns:
+                        col_order.append("nsnps")
+                    if "MeanR2" in df_out.columns:
+                        col_order.append("MeanR2")
+                    if p_col in df_out.columns:
+                        col_order.append(p_col)
+                    if "desc" in df_out.columns:
+                        col_order.append("desc")
+                    if "broaden" in df_out.columns:
+                        col_order.append("broaden")
+                    remain_cols = [c for c in df_out.columns if c not in col_order and c != "LDclump"]
+                    if "LDclump" in df_out.columns:
+                        df_out = df_out[col_order + remain_cols + ["LDclump"]]
+                    else:
+                        df_out = df_out[col_order + remain_cols]
+
+                    anno_path = os.path.join(args.out, f"{output_stem}.{threshold}.anno.tsv")
+                    df_out.to_csv(anno_path, sep="\t", index=False)
+                except Exception:
+                    anno_status.fail(f"Annotating significant SNPs from {src} ...Failed")
+                    raise
+                anno_status.complete(
+                    f"Annotating significant SNPs from {src} ...Finished (nLead={int(df_out.shape[0])})"
                 )
-
-            # Output file is sorted by chromosome and position.
-            if chr_col in df_out.columns and pos_col in df_out.columns:
-                df_out["_chr_sort_key"] = df_out[chr_col].map(_chrom_sort_key)
-                df_out = df_out.sort_values(
-                    by=["_chr_sort_key", pos_col],
-                    ascending=[True, True],
-                    kind="mergesort",
-                ).drop(columns=["_chr_sort_key"])
-
-            col_order: list[str] = [chr_col, pos_col]
-            for col in _LEAD_SNP_INFO_COLS:
-                if col in df_out.columns:
-                    col_order.append(col)
-            if "start" in df_out.columns:
-                col_order.append("start")
-            if "end" in df_out.columns:
-                col_order.append("end")
-            if "nsnps" in df_out.columns:
-                col_order.append("nsnps")
-            if "MeanR2" in df_out.columns:
-                col_order.append("MeanR2")
-            if p_col in df_out.columns:
-                col_order.append(p_col)
-            if "desc" in df_out.columns:
-                col_order.append("desc")
-            if "broaden" in df_out.columns:
-                col_order.append("broaden")
-            remain_cols = [c for c in df_out.columns if c not in col_order and c != "LDclump"]
-            if "LDclump" in df_out.columns:
-                df_out = df_out[col_order + remain_cols + ["LDclump"]]
-            else:
-                df_out = df_out[col_order + remain_cols]
-
-            logger.info(df_out)
-
-            anno_path = os.path.join(args.out, f"{output_stem}.{threshold}.anno.tsv")
-            df_out.to_csv(anno_path, sep="\t", index=False)
-            log_success(logger, f"Annotation table saved to {format_path_for_display(anno_path)}")
-            log_success(logger, f"Annotation completed in {round(time.time() - t_anno, 2)} seconds.\n")
-        else:
-            logger.info(f"Annotation file not found: {args.anno}\n")
+                log_success(logger, f"Annotation table saved to {format_path_for_display(anno_path)}")
 
 
 def _read_merge_gwas_table(
@@ -3903,18 +4080,27 @@ def _read_merge_gwas_table(
 def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
     _prepare_cjk_plotting()
     files = [str(f) for f in args.merge_files]
-    if len(files) < 2:
-        logger.warning(
-            "Warning: --merge requires at least two input GWAS files in total; "
-            "falling back to normal postgwas flow."
-        )
-        _run_postgwas_tasks(args, logger)
+    if len(files) == 0:
+        logger.warning("Warning: merged plotting requested but no GWAS input file is available.")
         return
 
     chr_col, pos_col, p_col = args.chr, args.pos, args.pvalue
-    logger.info("* Visualizing merged Manhattan plot...")
+    t_merge = time.time()
+    logger.info("Visualizing merged post-GWAS results...")
+    merge_manh_ratio = args._merge_manh_ratio
+    merge_qq_ratio = args._merge_qq_ratio
+    needs_positional_merge = bool(
+        (merge_manh_ratio is not None)
+        or (args.ldblock_ratio is not None)
+    )
 
     series_colors = _resolve_merge_series_colors(args.palette_spec, len(files))
+    series_markers = (
+        list(getattr(args, "_postgwas_merge_markers", []))
+        if len(getattr(args, "_postgwas_merge_markers", [])) == len(files)
+        else _resolve_merge_markers(args.marker_spec, len(files))
+    )
+    series_labels = [f"{i + 1}:{os.path.basename(path)}" for i, path in enumerate(files)]
     ldblock_style = _resolve_ldblock_style(args.ldblock_palette_spec)
 
     frames_raw: list[pd.DataFrame] = []
@@ -3946,7 +4132,7 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
         logger.error("No valid SNPs available for merged plotting.")
         return
 
-    if len(chrom_sets) >= 2:
+    if needs_positional_merge and len(chrom_sets) >= 2:
         ref_i, ref_file, ref_chroms = chrom_sets[0]
         mismatch_items: list[tuple[int, str, int, int]] = []
         for i, file, chroms in chrom_sets[1:]:
@@ -3969,7 +4155,13 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
                 logger.warning(
                     f"  ... {len(mismatch_items) - 3} more mismatched files omitted."
                 )
+            if bool(getattr(args, "_postgwas_single_requested", False)):
+                logger.info(
+                    "Visualizing merged post-GWAS results ...Skipped (per-file plotting will still run)"
+                )
+                return
             fallback_file = str(args.gwasfile[0]) if len(args.gwasfile) > 0 else files[0]
+            logger.info("Visualizing merged post-GWAS results ...Skipped (fallback single-file plotting)")
             logger.info(f"Fallback single GWAS plotting file: {fallback_file}")
             GWASplot(fallback_file, args, logger)
             return
@@ -4009,57 +4201,58 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
     x_separators: list[float] = []
     use_segmented_layout = len(bim_layout) > 0
 
-    if use_segmented_layout:
-        plot_df = plot_df.copy()
-        plot_df["_x"] = np.nan
-        for seg in bim_layout:
-            sid = int(seg["id"])
-            start = int(seg["start"])
-            offset = float(seg["offset"])
-            length = float(seg["length"])
-            mask = plot_df["__seg_id"].to_numpy(dtype=np.int64) == sid
-            if not bool(np.any(mask)):
-                continue
-            posv = pd.to_numeric(plot_df.loc[mask, pos_col], errors="coerce").to_numpy(dtype=float)
-            rel = np.clip(posv - float(start), 0.0, float(length))
-            plot_df.loc[mask, "_x"] = offset + rel
-        plot_df = plot_df[np.isfinite(pd.to_numeric(plot_df["_x"], errors="coerce"))].copy()
-        xticks = [0.5 * (float(seg["x_start"]) + float(seg["x_end"])) for seg in bim_layout]
-        xticklabels = [_sanitize_plot_text(seg["label"]) for seg in bim_layout]
-        for i in range(len(bim_layout) - 1):
-            x_end = float(bim_layout[i]["x_end"])
-            x_next = float(bim_layout[i + 1]["x_start"])
-            x_separators.append(0.5 * (x_end + x_next))
-    else:
-        max_pos_by_chr: dict[str, int] = {}
-        if plot_df.shape[0] > 0:
-            chr_max = plot_df.groupby(chr_col)[pos_col].max()
-            for chrom, max_pos in chr_max.items():
-                max_pos_by_chr[str(chrom)] = int(max_pos)
-        chrom_order = sorted(max_pos_by_chr.keys(), key=_chrom_sort_key)
-        if len(chrom_order) == 0:
-            logger.error("No chromosome labels available for merged Manhattan plotting.")
-            return
-        chr_lens = np.asarray(
-            [max(1, int(max_pos_by_chr[c])) for c in chrom_order],
-            dtype=float,
-        )
-        gap = int(max(1.0, float(np.nanmedian(chr_lens)) * 0.02))
-        offsets: dict[str, int] = {}
-        cursor = 0
-        for i, chrom in enumerate(chrom_order):
-            length = max(1, int(max_pos_by_chr[chrom]))
-            offsets[chrom] = cursor
-            xticks.append(float(cursor) + float(length) / 2.0)
-            xticklabels.append(_sanitize_plot_text(chrom))
-            if i < len(chrom_order) - 1:
-                x_separators.append(float(cursor) + float(length) + float(gap) / 2.0)
-            cursor += length + gap
-        plot_df = plot_df.copy()
-        plot_df["_x"] = (
-            plot_df[chr_col].astype(str).map(offsets).fillna(0).astype(float)
-            + pd.to_numeric(plot_df[pos_col], errors="coerce").fillna(0.0).astype(float)
-        )
+    if needs_positional_merge:
+        if use_segmented_layout:
+            plot_df = plot_df.copy()
+            plot_df["_x"] = np.nan
+            for seg in bim_layout:
+                sid = int(seg["id"])
+                start = int(seg["start"])
+                offset = float(seg["offset"])
+                length = float(seg["length"])
+                mask = plot_df["__seg_id"].to_numpy(dtype=np.int64) == sid
+                if not bool(np.any(mask)):
+                    continue
+                posv = pd.to_numeric(plot_df.loc[mask, pos_col], errors="coerce").to_numpy(dtype=float)
+                rel = np.clip(posv - float(start), 0.0, float(length))
+                plot_df.loc[mask, "_x"] = offset + rel
+            plot_df = plot_df[np.isfinite(pd.to_numeric(plot_df["_x"], errors="coerce"))].copy()
+            xticks = [0.5 * (float(seg["x_start"]) + float(seg["x_end"])) for seg in bim_layout]
+            xticklabels = [_sanitize_plot_text(seg["label"]) for seg in bim_layout]
+            for i in range(len(bim_layout) - 1):
+                x_end = float(bim_layout[i]["x_end"])
+                x_next = float(bim_layout[i + 1]["x_start"])
+                x_separators.append(0.5 * (x_end + x_next))
+        else:
+            max_pos_by_chr: dict[str, int] = {}
+            if plot_df.shape[0] > 0:
+                chr_max = plot_df.groupby(chr_col)[pos_col].max()
+                for chrom, max_pos in chr_max.items():
+                    max_pos_by_chr[str(chrom)] = int(max_pos)
+            chrom_order = sorted(max_pos_by_chr.keys(), key=_chrom_sort_key)
+            if len(chrom_order) == 0:
+                logger.error("No chromosome labels available for merged Manhattan plotting.")
+                return
+            chr_lens = np.asarray(
+                [max(1, int(max_pos_by_chr[c])) for c in chrom_order],
+                dtype=float,
+            )
+            gap = int(max(1.0, float(np.nanmedian(chr_lens)) * 0.02))
+            offsets: dict[str, int] = {}
+            cursor = 0
+            for i, chrom in enumerate(chrom_order):
+                length = max(1, int(max_pos_by_chr[chrom]))
+                offsets[chrom] = cursor
+                xticks.append(float(cursor) + float(length) / 2.0)
+                xticklabels.append(_sanitize_plot_text(chrom))
+                if i < len(chrom_order) - 1:
+                    x_separators.append(float(cursor) + float(length) + float(gap) / 2.0)
+                cursor += length + gap
+            plot_df = plot_df.copy()
+            plot_df["_x"] = (
+                plot_df[chr_col].astype(str).map(offsets).fillna(0).astype(float)
+                + pd.to_numeric(plot_df[pos_col], errors="coerce").fillna(0.0).astype(float)
+            )
 
     if plot_df.shape[0] > 0:
         pvals_draw = np.asarray(plot_df[p_col], dtype=float)
@@ -4067,10 +4260,10 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
     else:
         plot_df["_ylog"] = np.asarray([], dtype=float)
 
-    width_in = 8.0
-    # Keep PDF output vector-safe for Illustrator; other formats still
-    # rasterize dense scatter layers to control file size.
-    rasterized = _postgwas_should_rasterize_dense_layers(args.format)
+    width_in = float(_PANEL_WIDTH_IN)
+    # Merged plots can contain multiple dense layers; always rasterize point/band
+    # artists while keeping axes/text/legend vector-friendly.
+    rasterized = True
     manh_path = None
     manh_height_in = None
     manh_fontsize: Optional[float] = None
@@ -4079,23 +4272,42 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
     manh_xlim_pair: Optional[tuple[float, float]] = None
     manh_axes_bounds: Optional[tuple[float, float, float, float]] = None
 
-    if args.manh_ratio is not None:
-        manh_ratio = float(args.manh_ratio)
+    if merge_manh_ratio is not None:
+        manh_ratio = float(merge_manh_ratio)
         manh_fontsize = _scaled_fontsize_for_manhattan(
             manh_ratio,
             width_in=width_in,
         )
         manh_loc_fontsize = max(3.0, float(manh_fontsize) * 0.85)
-        fig = plt.figure(figsize=(width_in, width_in / manh_ratio), dpi=300)
-        ax = fig.add_subplot(111)
+        fig, ax, _manh_panel_w_in, manh_panel_h_in = _create_ratio_panel_figure(
+            ratio=manh_ratio,
+            dpi=300,
+            panel_width_in=width_in,
+            reserve_right_in=_PANEL_LEGEND_RIGHT_IN,
+        )
+        legend_handles: list[object] = []
         draw_xmins: list[float] = []
         draw_xmaxs: list[float] = []
+        thr_log = (
+            float(-np.log10(float(threshold_merge)))
+            if (np.isfinite(threshold_merge) and float(threshold_merge) > 0.0)
+            else None
+        )
+        if thr_log is not None and np.isfinite(thr_log):
+            ax.axhline(
+                y=thr_log,
+                color="grey",
+                linewidth=1.0,
+                linestyle="--",
+                zorder=0,
+            )
 
         for i, _file in enumerate(files):
             dfi = plot_df.loc[plot_df["_series_idx"] == i]
             if dfi.shape[0] == 0:
                 continue
             yy = np.asarray(dfi["_ylog"], dtype=float)
+            pvals_i = np.asarray(dfi[p_col], dtype=float)
             keep = np.isfinite(yy)
             if args.ylim_min is not None:
                 keep = keep & (yy >= float(args.ylim_min))
@@ -4104,16 +4316,43 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
             if not bool(np.any(keep)):
                 continue
             x_keep = np.asarray(dfi.loc[keep, "_x"], dtype=float)
-            ax.scatter(
-                x_keep,
-                yy[keep],
-                color=series_colors[i],
-                alpha=0.5,
-                s=args.scatter_size,
-                label=str(i),
-                edgecolors="none",
-                linewidths=0.0,
-                rasterized=rasterized,
+            y_keep = yy[keep]
+            p_keep = pvals_i[keep]
+            sig_keep = np.isfinite(p_keep) & (p_keep <= float(threshold_merge))
+            nonsig_keep = ~sig_keep
+            if bool(np.any(nonsig_keep)):
+                ax.scatter(
+                    x_keep[nonsig_keep],
+                    y_keep[nonsig_keep],
+                    color="lightgrey",
+                    marker=series_markers[i],
+                    alpha=0.45,
+                    s=args.scatter_size,
+                    rasterized=rasterized,
+                    **_marker_scatter_style(series_markers[i]),
+                )
+            if bool(np.any(sig_keep)):
+                ax.scatter(
+                    x_keep[sig_keep],
+                    y_keep[sig_keep],
+                    color=series_colors[i],
+                    marker=series_markers[i],
+                    alpha=0.75,
+                    s=args.scatter_size,
+                    rasterized=rasterized,
+                    **_marker_scatter_style(series_markers[i]),
+                )
+            legend_handles.append(
+                ax.scatter(
+                    [],
+                    [],
+                    color=series_colors[i],
+                    marker=series_markers[i],
+                    alpha=0.75,
+                    s=args.scatter_size,
+                    label=series_labels[i],
+                    **_marker_scatter_style(series_markers[i]),
+                )
             )
             if x_keep.size > 0:
                 draw_xmins.append(float(np.nanmin(x_keep)))
@@ -4163,13 +4402,17 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
         ax.yaxis.label.set_size(manh_fontsize)
         ax.tick_params(axis="both", labelsize=manh_fontsize)
 
-        ax.legend(
-            loc="upper center",
-            frameon=False,
-            ncol=min(4, max(1, len(files))),
-            markerscale=2.0,
-            fontsize=manh_fontsize,
-        )
+        if len(legend_handles) > 0:
+            ax.legend(
+                handles=legend_handles,
+                loc="center left",
+                bbox_to_anchor=(1.01, 0.5),
+                frameon=False,
+                borderaxespad=0.0,
+                ncol=1,
+                markerscale=2.0,
+                fontsize=manh_fontsize,
+            )
         _y0, _y1 = ax.get_ylim()
         lo = float(args.ylim_min) if args.ylim_min is not None else 0.0
         hi = float(args.ylim_max) if args.ylim_max is not None else float(_y1)
@@ -4181,29 +4424,38 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
         manh_ylim_pair = (float(_yy0), float(_yy1))
         manh_xlim_pair = (float(ax.get_xlim()[0]), float(ax.get_xlim()[1]))
 
-        fig.tight_layout()
         manh_axes_bounds = ax.get_position().bounds
         manh_path = os.path.join(args.out, f"{args.prefix}.merge.manh.{args.format}")
-        fig.savefig(manh_path, **_postgwas_savefig_kwargs(args.format))
-        manh_height_in = fig.get_figheight()
+        _save_figure(fig, manh_path)
+        manh_height_in = float(manh_panel_h_in)
         plt.close(fig)
 
     qq_path = None
-    if args.qq_ratio is not None:
+    if merge_qq_ratio is not None:
         qq_fontsize = float(manh_fontsize) if manh_fontsize is not None else 6.0
         qq_y_in = manh_height_in if manh_height_in is not None else 4.0
-        qq_x_in = qq_y_in * float(args.qq_ratio)
-        fig = plt.figure(figsize=(qq_x_in, qq_y_in), dpi=300)
-        ax = fig.add_subplot(111)
+        fig, ax, _qq_panel_w_in, _qq_panel_h_in = _create_ratio_panel_figure(
+            ratio=float(merge_qq_ratio),
+            dpi=300,
+            panel_height_in=qq_y_in,
+            reserve_right_in=_PANEL_LEGEND_RIGHT_IN,
+        )
+        legend_handles: list[object] = []
 
         exp_xmin = np.inf
         exp_xmax = -np.inf
+        qq_band_n = 0
         for i, _file in enumerate(files):
             pvals = pvals_by_series.get(i)
             if pvals is None or pvals.size == 0:
                 continue
+            pvals_arr = np.asarray(pvals, dtype=float)
+            qq_band_n = max(
+                int(qq_band_n),
+                int(np.sum(np.isfinite(pvals_arr) & (pvals_arr > 0.0))),
+            )
             exp, obs = _qq_select_points_with_threshold(
-                np.asarray(pvals, dtype=float),
+                pvals_arr,
                 sig_p_threshold=(
                     float(threshold_merge)
                     if (np.isfinite(threshold_merge) and float(threshold_merge) > 0.0)
@@ -4221,34 +4473,81 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
                 exp,
                 obs,
                 s=args.scatter_size,
+                marker=series_markers[i],
                 alpha=0.5,
                 rasterized=rasterized,
                 color=series_colors[i],
-                label=str(i),
-                edgecolors="none",
-                linewidths=0.0,
+                **_marker_scatter_style(series_markers[i]),
             )
+            legend_handles.append(
+                ax.scatter(
+                    [],
+                    [],
+                    s=args.scatter_size,
+                    marker=series_markers[i],
+                    alpha=0.75,
+                    color=series_colors[i],
+                    label=series_labels[i],
+                    **_marker_scatter_style(series_markers[i]),
+                )
+            )
+
+        if qq_band_n > 0:
+            x_band, lower_band, upper_band = _qq_confidence_band_from_n(
+                int(qq_band_n),
+                max_points=_QQ_BAND_MAX_POINTS,
+            )
+            if x_band.size > 0:
+                exp_xmin = min(exp_xmin, float(np.nanmin(x_band)))
+                exp_xmax = max(exp_xmax, float(np.nanmax(x_band)))
+                ax.fill_between(
+                    x_band,
+                    lower_band,
+                    upper_band,
+                    color=str(_QQ_BAND_COLOR),
+                    alpha=0.25,
+                    rasterized=rasterized,
+                    zorder=0,
+                )
 
         if not np.isfinite(exp_xmin) or not np.isfinite(exp_xmax):
             exp_xmin, exp_xmax = (0.0, 1.0)
-        if manh_ylim_pair is not None:
-            ax.set_ylim(manh_ylim_pair)
+        qq_lower = (
+            float(manh_ylim_pair[0])
+            if manh_ylim_pair is not None
+            else (
+                float(args.ylim_min)
+                if args.ylim_min is not None
+                else 0.0
+            )
+        )
+        qq_upper_target = (
+            float(manh_ylim_pair[1])
+            if manh_ylim_pair is not None
+            else (
+                float(args.ylim_max)
+                if args.ylim_max is not None
+                else None
+            )
+        )
         if exp_xmax > exp_xmin:
-            x_pad = max(1e-9, 0.02 * float(exp_xmax - exp_xmin))
-            x_right = exp_xmax + x_pad
+            x_right = float(exp_xmax)
         else:
             eps = max(1e-9, abs(exp_xmin) * 1e-9)
-            x_pad = max(1e-9, 0.02 * float(eps))
-            x_right = exp_xmax + eps + x_pad
-        qq_left = float(manh_ylim_pair[0]) if manh_ylim_pair is not None else 0.0
-        x_right = max(float(x_right), qq_left + 1e-9)
-        x_upper = max(float(x_right), qq_left + 1.0)
-        ax.set_xlim(qq_left, x_upper)
-        ax.margins(x=0.0)
-        if manh_yticks_pair is not None:
-            apply_integer_yticks(ax, ticks=manh_yticks_pair)
-        else:
-            apply_integer_yticks(ax)
+            x_right = float(exp_xmax + eps)
+        qq_lower, qq_upper = _resolve_qq_ylim(
+            ax,
+            lower=qq_lower,
+            upper=qq_upper_target,
+        )
+        _apply_qq_axes(
+            ax,
+            y_lower=qq_lower,
+            y_upper=qq_upper,
+            x_right=x_right,
+            y_ticks=manh_yticks_pair,
+        )
+        apply_integer_xticks(ax)
         line_left, line_right = ax.get_xlim()
         ax.plot([line_left, line_right], [line_left, line_right], lw=1.0, color="black")
         ax.set_xlabel("Expected -log10(p-value)")
@@ -4256,16 +4555,19 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
         ax.xaxis.label.set_size(qq_fontsize)
         ax.yaxis.label.set_size(qq_fontsize)
         ax.tick_params(axis="both", labelsize=qq_fontsize)
-        ax.legend(
-            loc="upper center",
-            frameon=False,
-            ncol=min(4, max(1, len(files))),
-            markerscale=2.0,
-            fontsize=qq_fontsize,
-        )
-        fig.tight_layout()
+        if len(legend_handles) > 0:
+            ax.legend(
+                handles=legend_handles,
+                loc="center left",
+                bbox_to_anchor=(1.01, 0.5),
+                frameon=False,
+                borderaxespad=0.0,
+                ncol=1,
+                markerscale=2.0,
+                fontsize=qq_fontsize,
+            )
         qq_path = os.path.join(args.out, f"{args.prefix}.merge.qq.{args.format}")
-        fig.savefig(qq_path, **_postgwas_savefig_kwargs(args.format))
+        _save_figure(fig, qq_path)
         plt.close(fig)
 
     ld_path = None
@@ -4361,8 +4663,7 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
             ax_ld.set_position([new_x0, cy0, new_w, ch])
             ax_ld.set_anchor("N")
         ld_path = os.path.join(args.out, f"{args.prefix}.merge.ldblock.{args.format}")
-        fig_ld.savefig(ld_path, **_postgwas_savefig_kwargs(args.format))
-        plt.close(fig_ld)
+        _save_figure_and_close(fig_ld, ld_path)
 
         if args.anno:
             if len(region_ranges) == 0:
@@ -4429,8 +4730,7 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
                         _cx0, cy0, _cw, ch = ax_gene.get_position().bounds
                         ax_gene.set_position([mx0, cy0, mw, ch])
                     gene_path = os.path.join(args.out, f"{args.prefix}.merge.gene.{args.format}")
-                    fig_gene.savefig(gene_path, **_postgwas_savefig_kwargs(args.format))
-                    plt.close(fig_gene)
+                    _save_figure_and_close(fig_gene, gene_path)
 
     saved_paths: list[tuple[str, str]] = []
     if manh_path is not None:
@@ -4453,6 +4753,10 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
         title = ", ".join([x[0] for x in saved_paths])
         body = "\n".join([f"  {format_path_for_display(x[1])}" for x in saved_paths])
         log_success(logger, f"{title} plots saved to:\n{body}\n")
+    log_success(
+        logger,
+        f"Visualizing merged post-GWAS results ...Finished [{format_elapsed(time.time() - t_merge)}]",
+    )
 
 
 def _run_one_postgwas_task(file: str, args, logger: logging.Logger) -> str:
@@ -4506,6 +4810,8 @@ def _run_postgwas_ldblock_only(args, logger: logging.Logger) -> None:
     plt.rcParams["axes.unicode_minus"] = False
     _prepare_cjk_plotting()
 
+    t_ld = time.time()
+    logger.info("Visualizing LD block...")
     width_in = 8.0
     ld_overlay_text: Optional[str] = None
 
@@ -4630,11 +4936,14 @@ def _run_postgwas_ldblock_only(args, logger: logging.Logger) -> None:
             ax_gene.set_anchor("N")
 
     ld_path = os.path.join(args.out, f"{args.prefix}.ldblock.{args.format}")
-    fig_ld.savefig(ld_path, **_postgwas_savefig_kwargs(args.format))
-    plt.close(fig_ld)
+    _save_figure_and_close(fig_ld, ld_path)
     log_success(
         logger,
         f"LD block plot saved to:\n  {format_path_for_display(ld_path)}\n",
+    )
+    log_success(
+        logger,
+        f"Visualizing LD block ...Finished [{format_elapsed(time.time() - t_ld)}]",
     )
 
 
@@ -4851,6 +5160,27 @@ def _run_postgwas_tasks(args, logger: logging.Logger) -> None:
                     skip_files=completed_files,
                 )
                 return
+            except PermissionError as exc:
+                print_warning(
+                    "PostGWAS worker pool is unavailable in this environment; "
+                    f"retrying serially ({exc})."
+                )
+                for f, tid in list(task_map.items()):
+                    try:
+                        progress.remove_task(tid)
+                    except Exception:
+                        pass
+                    task_map.pop(f, None)
+                _run_postgwas_tasks_serial(
+                    files,
+                    args,
+                    logger,
+                    total_start_ts=total_start_ts,
+                    done_count=done_count,
+                    file_to_idx=file_to_idx,
+                    skip_files=completed_files,
+                )
+                return
             except Exception:
                 for f, tid in list(task_map.items()):
                     try:
@@ -4925,6 +5255,21 @@ def _run_postgwas_tasks(args, logger: logging.Logger) -> None:
                 skip_files=completed_files,
             )
             return
+        except PermissionError as exc:
+            print_warning(
+                "PostGWAS worker pool is unavailable in this environment; "
+                f"retrying serially ({exc})."
+            )
+            _run_postgwas_tasks_serial(
+                files,
+                args,
+                logger,
+                total_start_ts=total_start_ts,
+                done_count=done_count,
+                file_to_idx=file_to_idx,
+                skip_files=completed_files,
+            )
+            return
         finally:
             pbar.close()
         total_elapsed = format_elapsed(time.monotonic() - total_start_ts)
@@ -4981,11 +5326,26 @@ def _run_postgwas_tasks(args, logger: logging.Logger) -> None:
             skip_files=completed_files,
         )
         return
+    except PermissionError as exc:
+        print_warning(
+            "PostGWAS worker pool is unavailable in this environment; "
+            f"retrying serially ({exc})."
+        )
+        _run_postgwas_tasks_serial(
+            files,
+            args,
+            logger,
+            total_start_ts=total_start_ts,
+            done_count=done_count,
+            file_to_idx=file_to_idx,
+            skip_files=completed_files,
+        )
+        return
     total_elapsed = format_elapsed(time.monotonic() - total_start_ts)
     print_success(f"Task {done_count}/{len(files)} ...Finished [{total_elapsed}]", force_color=True)
 
 
-def main():
+def main(argv: Optional[list[str]] = None):
     warn_deprecated_alias_usage(("-threshold", "--threshold"), replacement="-thr/--thr")
     t_start = time.time()
 
@@ -4994,6 +5354,7 @@ def main():
         formatter_class=cli_help_formatter(),
         epilog=minimal_help_epilog([
             "jx postgwas -gwasfile result.lmm.tsv -manh -qq",
+            "jx postgwas -i a.tsv b.tsv -manh-merge -qq-merge -marker '1,o,x'",
             "jx postgwas -gwasfile result.lmm.tsv -a genes.bed -ab 50",
             "jx postgwas -bfile test/geno -bimrange 1:1-2 -ldblock-all",
         ]),
@@ -5007,7 +5368,7 @@ def main():
         "-i", "-gwasfile", "--gwasfile", nargs="+", type=str, required=False, default=None,
         help=(
             "One or more GWAS result files (tab-delimited). "
-            "Optional when running LD block only with genotype input."
+            "Optional only when running LD block only with genotype input."
         ),
     )
     geno_group = input_group.add_mutually_exclusive_group(required=False)
@@ -5072,10 +5433,24 @@ def main():
         ),
     )
     plot_group.add_argument(
-        "-qq", "--qq", type=str, nargs="?", const="on", default=None,
+        "-qq", "--qq", type=str, nargs="?", const="5/4", default=None,
         help=(
-            "Enable QQ plotting in auto mode. "
-            "QQ width/height ratio is fixed at 5:4; user-provided ratio is ignored."
+            "Enable QQ plotting in auto mode with aspect ratio (width/height). "
+            "Examples: --qq (default 5/4), --qq 5/4, --qq 2."
+        ),
+    )
+    plot_group.add_argument(
+        "-manh-merge", "--manh-merge", dest="manh_merge", type=str, nargs="?", const="2", default=None,
+        help=(
+            "Draw one merged Manhattan plot from the GWAS files passed by -i. "
+            "Ratio parsing matches --manh."
+        ),
+    )
+    plot_group.add_argument(
+        "-qq-merge", "--qq-merge", dest="qq_merge", type=str, nargs="?", const="5/4", default=None,
+        help=(
+            "Draw one merged QQ plot from the GWAS files passed by -i. "
+            "Ratio parsing matches --qq."
         ),
     )
 
@@ -5102,13 +5477,6 @@ def main():
     optional_group.add_argument(
         "-threshold", "--threshold", dest="thr", type=float, default=argparse.SUPPRESS,
         help=argparse.SUPPRESS,
-    )
-    optional_group.add_argument(
-        "-merge", "--merge", nargs="+", action="append", type=str, default=None,
-        help=(
-            "Merge mode: add one or more GWAS files (option can be repeated) and plot all files in one Manhattan plot. "
-            "Column names follow --chr/--pos/--pvalue."
-        ),
     )
     optional_group.add_argument(
         "-LDclump", "--LDclump", dest="ldclump", nargs=2, default=None,
@@ -5144,12 +5512,12 @@ def main():
     optional_group.add_argument(
         "-palette", "--palette", dest="palette", type=str, default=None,
         help=(
-            "Manhattan color palette (QQ keeps black/grey). "
+            "Manhattan color palette and QQ scatter color palette "
+            "(QQ confidence band always stays grey). "
             "Supports cmap names (e.g. tab10, tab20) or ';'-separated colors "
             "(e.g. #1f77b4;#ff7f0e or (215,123,254);(1,1,1)). "
-            "A single color is also accepted; Manhattan keeps single-color, "
-            "and QQ auto-expands it to a light/dark pair. "
-            "If omitted, use default black/grey."
+            "A single color is also accepted. "
+            "If omitted, use default black for QQ scatter and black/grey for Manhattan."
         ),
     )
     optional_group.add_argument(
@@ -5167,6 +5535,15 @@ def main():
     optional_group.add_argument(
         "-scatter-size", "--scatter-size", type=float, default=8.0,
         help="Scatter marker size for Manhattan and QQ plots (default: %(default)s).",
+    )
+    optional_group.add_argument(
+        "-marker", "--marker", type=str, default=None,
+        help=(
+            "Scatter marker(s). Single/non-merge plotting uses the first marker only "
+            "(default: o). Merge plotting cycles markers by input GWAS file; "
+            "default cycle is 1,2,3,4,*,+,x. "
+            "Example: --marker '1,o,x'."
+        ),
     )
     optional_group.add_argument(
         "-full", "--full", "-fullscatter", "--fullscatter",
@@ -5202,7 +5579,7 @@ def main():
         help_profile="default",
     )
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     detected_threads = detect_effective_threads()
     requested_threads = int(args.thread)
     thread_capped = False
@@ -5288,12 +5665,35 @@ def main():
     if args.qq is None:
         args.qq_ratio = None
     else:
-        qq_text = str(args.qq).strip().lower()
-        if qq_text not in {"", "on"}:
-            logger.info(
-                f"QQ ratio input '{args.qq}' is ignored; fixed ratio 5:4 is used."
-            )
-        args.qq_ratio = float(_QQ_FIXED_RATIO)
+        try:
+            args.qq_ratio = _parse_ratio(args.qq, "QQ")
+        except ValueError as e:
+            logger.error(str(e))
+            raise SystemExit(1)
+    try:
+        args.manh_merge_ratio = (
+            _parse_ratio(args.manh_merge, "Merged Manhattan")
+            if args.manh_merge is not None
+            else None
+        )
+    except ValueError as e:
+        logger.error(str(e))
+        raise SystemExit(1)
+    if args.qq_merge is None:
+        args.qq_merge_ratio = None
+    else:
+        try:
+            args.qq_merge_ratio = _parse_ratio(args.qq_merge, "Merged QQ")
+        except ValueError as e:
+            logger.error(str(e))
+            raise SystemExit(1)
+    try:
+        args.marker_spec = _parse_marker_spec(args.marker)
+    except ValueError as e:
+        logger.error(str(e))
+        raise SystemExit(1)
+    args._postgwas_single_marker = _resolve_single_marker(args.marker_spec)
+    args._postgwas_merge_markers = []
 
     try:
         args.ldblock_ratio = None
@@ -5370,11 +5770,14 @@ def main():
             raise SystemExit(1)
     else:
         args.bimrange_tuples = None
-    if args.bimrange_tuples is not None and args.qq_ratio is not None:
+    if args.bimrange_tuples is not None and (
+        args.qq_ratio is not None or args.qq_merge_ratio is not None
+    ):
         logger.info(
             "QQ is disabled when --bimrange is set."
         )
         args.qq_ratio = None
+        args.qq_merge_ratio = None
     if args.ldblock_ratio is not None and args.bimrange_tuples is None:
         logger.warning(
             "Warning: --ldblock/--ldblock-all requires --bimrange; LD block and Manhattan+LD plotting are skipped."
@@ -5400,49 +5803,48 @@ def main():
         )
         args.ldclump_window_bp = None
         args.ldclump_r2 = None
-    merge_files_raw: list[str] = []
-    if args.merge is not None:
-        for item in args.merge:
-            if isinstance(item, (list, tuple)):
-                merge_files_raw.extend([str(x) for x in item])
-            elif item is not None:
-                merge_files_raw.append(str(item))
-
-    args.merge_mode = bool(len(merge_files_raw) > 0)
-    if args.merge_mode:
-        args.merge_files = [str(x) for x in list(args.gwasfile)] + merge_files_raw
-        if len(args.merge_files) < 2:
-            logger.warning(
-                "Warning: --merge requires at least two GWAS files in total; merge mode is disabled."
+    merge_plot_requested = bool(
+        (args.manh_merge_ratio is not None)
+        or (args.qq_merge_ratio is not None)
+    )
+    single_plot_requested = bool(
+        (args.manh_ratio is not None)
+        or (args.qq_ratio is not None)
+        or (args.anno is not None)
+        or ((args.ldblock_ratio is not None) and (len(args.gwasfile) > 0))
+    )
+    args.merge_mode = bool(merge_plot_requested)
+    args._postgwas_merge_requested = bool(merge_plot_requested)
+    args._postgwas_single_requested = bool(single_plot_requested)
+    if merge_plot_requested:
+        args.merge_files = [str(x) for x in list(args.gwasfile)]
+        if len(args.merge_files) == 0:
+            logger.error(
+                "Merged plotting requires at least one GWAS file from -i/--gwasfile."
             )
-            args.merge_mode = False
-            args.merge_files = []
-        else:
-            if args.manh_ratio is None:
-                logger.info("Merge mode detected; forcing --manh ratio to 2.")
-                args.manh_ratio = 2.0
-            if args.ldclump_window_bp is not None:
-                logger.warning("Warning: --LDclump is ignored in --merge mode.")
-                args.ldclump_window_bp = None
-                args.ldclump_r2 = None
+            raise SystemExit(1)
+        args._merge_manh_ratio = args.manh_merge_ratio
+        args._merge_qq_ratio = args.qq_merge_ratio
+        if args._merge_manh_ratio is None and args._merge_qq_ratio is None:
+            logger.info("Merge plotting detected; forcing merged Manhattan ratio to 2.")
+            args._merge_manh_ratio = 2.0
+        args._postgwas_merge_markers = _resolve_merge_markers(
+            args.marker_spec,
+            len(args.merge_files),
+        )
     else:
         args.merge_files = []
+        args._merge_manh_ratio = None
+        args._merge_qq_ratio = None
 
-    if (not args.merge_mode) and len(args.gwasfile) == 1 and int(args.thread) != 1:
-        logger.info(
-            "Single GWAS input detected; forcing --thread to 1."
-        )
-        args.thread = 1
     args._postgwas_outer_workers = int(
         _resolve_postgwas_worker_count(int(args.thread), len(args.gwasfile))
-    ) if len(args.gwasfile) > 1 else 1
+    ) if (single_plot_requested and len(args.gwasfile) > 1) else 1
 
     args.ldblock_only_mode = bool(
-        (not args.merge_mode)
-        and (len(args.gwasfile) == 0)
-        and (args.ldblock_ratio is not None)
+        (len(args.gwasfile) == 0) and (args.ldblock_ratio is not None)
     )
-    if (not args.merge_mode) and len(args.gwasfile) == 0:
+    if len(args.gwasfile) == 0:
         if args.manh_ratio is not None:
             logger.warning(
                 "Warning: --manh requires GWAS result file(s); it is ignored in LD-only mode."
@@ -5469,15 +5871,16 @@ def main():
                 "Use --gwasfile, or run LD-only mode with --ldblock/--ldblock-all + genotype input."
             )
             raise SystemExit(1)
+        single_plot_requested = False
+        args._postgwas_single_requested = False
 
     if not hasattr(args, "fullscatter"):
         args.fullscatter = bool(getattr(args, "full", False))
 
     no_plot_or_anno = (
-        args.manh_ratio is None
-        and args.qq_ratio is None
-        and args.ldblock_ratio is None
-        and args.anno is None
+        (not merge_plot_requested)
+        and (not single_plot_requested)
+        and (not bool(getattr(args, "ldblock_only_mode", False)))
     )
     args.disable_compression = bool(args.fullscatter or (args.bimrange_tuples is not None))
 
@@ -5486,12 +5889,23 @@ def main():
     # ------------------------------------------------------------------
     config_title = "JanusX - Post-GWAS"
     host_text = socket.gethostname()
-    input_files = args.merge_files if args.merge_mode else args.gwasfile
+    input_files = list(args.gwasfile or [])
     input_files_text = _format_input_files(input_files)
+    if bool(getattr(args, "ldblock_only_mode", False)):
+        mode_text = "ldblock-only"
+    elif merge_plot_requested and single_plot_requested:
+        mode_text = "single+merge"
+    elif merge_plot_requested:
+        mode_text = "merge"
+    else:
+        mode_text = "single-file" if len(input_files) <= 1 else "multi-file"
     threshold_text = str(args.thr if args.thr is not None else "0.05 / nSNP")
     bimrange_text = _format_bimrange_summary(args.bimrange_tuples)
-    merge_map_rows = [(str(i), str(file)) for i, file in enumerate(args.merge_files)] if args.merge_mode else []
-    output_prefix_text = outprefix_base
+    merge_map_rows = (
+        [(str(i), str(file)) for i, file in enumerate(args.merge_files)]
+        if merge_plot_requested
+        else []
+    )
     threads_text = format_requested_thread_usage(
         requested_threads=int(requested_threads),
         using_threads=int(args.thread),
@@ -5499,9 +5913,10 @@ def main():
     )
 
     base_rows: list[tuple[str, str]] = [
-        ("Input files", input_files_text),
+        ("Mode", mode_text),
+        ("GWAS files", input_files_text),
         ("Chr|Pos|Pvalue", f"{args.chr}|{args.pos}|{args.pvalue}"),
-        ("Genotype file", str(args.genofile)),
+        ("Genotype file", str(args.genofile) if args.genofile is not None else "NA"),
         ("Threshold", threshold_text),
         ("Bimrange", bimrange_text),
     ]
@@ -5510,21 +5925,25 @@ def main():
     if (
         args.manh_ratio is not None
         or args.qq_ratio is not None
+        or args._merge_manh_ratio is not None
+        or args._merge_qq_ratio is not None
         or args.ldblock_ratio is not None
     ):
-        if args.merge_mode:
-            if args.palette_spec is None:
-                merge_default_cmap = "tab10" if len(args.merge_files) <= 10 else "tab20"
-                manh_pal_text = f"default ({merge_default_cmap})"
-                qq_pal_text = f"default ({merge_default_cmap})"
-            else:
-                manh_pal_text = str(args.palette)
-                qq_pal_text = str(args.palette)
+        single_manh_pal_text = (
+            "default (black/grey)" if args.palette_spec is None else str(args.palette)
+        )
+        single_qq_pal_text = (
+            "default (black; band=grey)"
+            if args.palette_spec is None
+            else f"{args.palette} (band=grey)"
+        )
+        if args.palette_spec is None:
+            merge_default_cmap = "tab10" if len(args.merge_files) <= 10 else "tab20"
+            merge_manh_pal_text = f"default ({merge_default_cmap})"
+            merge_qq_pal_text = f"default ({merge_default_cmap}; band=grey)"
         else:
-            manh_pal_text = (
-                "default (black/grey)" if args.palette_spec is None else str(args.palette)
-            )
-            qq_pal_text = "default (black/grey)"
+            merge_manh_pal_text = str(args.palette)
+            merge_qq_pal_text = f"{args.palette} (band=grey)"
         if args.disable_compression:
             if args.fullscatter and args.bimrange_tuples is not None:
                 comp_text = "off (--full, auto for --bimrange)"
@@ -5534,23 +5953,54 @@ def main():
                 comp_text = "off (auto for --bimrange)"
         else:
             comp_text = "on"
-        manh_text = (
-            f"ratio={args.manh_ratio if args.manh_ratio is not None else 'off'}, "
-            f"palette={manh_pal_text}, "
-            f"ylim={args.ylim if args.ylim is not None else 'auto'}, "
-            f"compression={comp_text}"
-        )
-        qq_text = (
-            f"auto, palette={qq_pal_text}"
-            if args.qq_ratio is not None
-            else "off"
-        )
-        vis_rows = [
-            ("Manhattan", manh_text),
-            ("QQ", qq_text),
-            ("Scatter", f"size={args.scatter_size}"),
-            ("Format", str(args.format)),
-        ]
+        vis_rows = [("Format", str(args.format))]
+        if args.manh_ratio is not None:
+            vis_rows.append(
+                (
+                    "Single Manhattan",
+                    f"ratio={args.manh_ratio}, palette={single_manh_pal_text}, "
+                    f"ylim={args.ylim if args.ylim is not None else 'auto'}, "
+                    f"compression={comp_text}",
+                )
+            )
+        if args.qq_ratio is not None:
+            vis_rows.append(
+                (
+                    "Single QQ",
+                    f"ratio={args.qq_ratio}, palette={single_qq_pal_text}, "
+                    f"ylim={args.ylim if args.ylim is not None else 'auto'}",
+                )
+            )
+        if args.manh_ratio is not None or args.qq_ratio is not None:
+            vis_rows.append(
+                (
+                    "Single Scatter",
+                    f"size={args.scatter_size}, marker={args._postgwas_single_marker}",
+                )
+            )
+        if args._merge_manh_ratio is not None:
+            vis_rows.append(
+                (
+                    "Merged Manhattan",
+                    f"ratio={args._merge_manh_ratio}, palette={merge_manh_pal_text}, "
+                    f"ylim={args.ylim if args.ylim is not None else 'auto'}",
+                )
+            )
+        if args._merge_qq_ratio is not None:
+            vis_rows.append(
+                (
+                    "Merged QQ",
+                    f"ratio={args._merge_qq_ratio}, palette={merge_qq_pal_text}, "
+                    f"ylim={args.ylim if args.ylim is not None else 'auto'}",
+                )
+            )
+        if merge_plot_requested:
+            vis_rows.append(
+                (
+                    "Merged Scatter",
+                    f"size={args.scatter_size}, markers={','.join(args._postgwas_merge_markers)}",
+                )
+            )
         if args.ldblock_ratio is None:
             vis_rows.append(("LDBlock", "off"))
         else:
@@ -5588,97 +6038,38 @@ def main():
                 )
             )
 
-    key_width = max(
-        [len(k) for k, _ in base_rows]
-        + ([len(k) for k, _ in vis_rows] if vis_rows is not None else [])
-        + ([len(k) for k, _ in anno_rows] if anno_rows is not None else [])
-    )
-    key_width = max(8, int(key_width))
-
-    def _fmt_kv(name: str, value: str, *, truncate: bool) -> str:
-        pad = max(1, key_width - len(name))
-        line = f"  {name}:{' ' * pad}{value}"
-        return _truncate_config_line(line) if truncate else line
-
-    divider_full = "*" * 60
-    divider = "*" * _CONFIG_LINE_MAX_CHARS
-
-    config_lines_full: list[str] = [
-        divider_full,
-        "POST-GWAS CONFIG",
-        divider_full,
-        "General:",
-    ]
-    config_lines_terminal: list[str] = [
-        divider,
-        "POST-GWAS CONFIG",
-        divider,
-        "General:",
-    ]
-    for name, value in base_rows:
-        config_lines_full.append(_fmt_kv(str(name), str(value), truncate=False))
-        config_lines_terminal.append(_fmt_kv(str(name), str(value), truncate=True))
+    sections: list[tuple[str, list[tuple[str, object]]]] = [("General", base_rows)]
     if len(merge_map_rows) > 0:
-        config_lines_full.append("Merge trait-id mapping:")
-        config_lines_terminal.append("Merge trait-id mapping:")
-        for idx, file in merge_map_rows:
-            config_lines_full.append(f"  {idx}-{file}")
-            config_lines_terminal.append(_truncate_config_line(f"  {idx}-{file}"))
+        sections.append(("Merge files", merge_map_rows))
     if vis_rows is None:
-        config_lines_full.append("Visualization: disabled")
-        config_lines_terminal.append(_truncate_config_line("Visualization: disabled"))
+        sections.append(("Visualization", [("Status", "disabled")]))
     else:
-        config_lines_full.append("Visualization:")
-        config_lines_terminal.append("Visualization:")
-        for name, value in vis_rows:
-            config_lines_full.append(_fmt_kv(str(name), str(value), truncate=False))
-            config_lines_terminal.append(_fmt_kv(str(name), str(value), truncate=True))
+        sections.append(("Visualization", vis_rows))
     if anno_rows is not None:
-        config_lines_full.append("Annotation:")
-        config_lines_terminal.append("Annotation:")
-        for name, value in anno_rows:
-            config_lines_full.append(_fmt_kv(str(name), str(value), truncate=False))
-            config_lines_terminal.append(_fmt_kv(str(name), str(value), truncate=True))
-    config_lines_full.append(f"Output prefix: {output_prefix_text}")
-    config_lines_full.append(f"Threads:       {threads_text}")
-    config_lines_full.append(f"PostGWAS workers: {int(getattr(args, '_postgwas_outer_workers', 1))}")
-    config_lines_full.append(divider_full + "\n")
-    config_lines_terminal.append(_truncate_config_line(f"Output prefix: {output_prefix_text}"))
-    config_lines_terminal.append(_truncate_config_line(f"Threads:       {threads_text}"))
-    config_lines_terminal.append(_truncate_config_line(f"PostGWAS workers: {int(getattr(args, '_postgwas_outer_workers', 1))}"))
-    config_lines_terminal.append(divider + "\n")
-
-    rich_rendered = _render_postgwas_config_rich(
-        title=config_title,
+        sections.append(("Annotation", anno_rows))
+    emit_cli_configuration(
+        logger,
+        app_title=config_title,
+        config_title="POST-GWAS CONFIG",
         host=host_text,
-        base_rows=base_rows,
-        merge_map_rows=merge_map_rows,
-        vis_rows=vis_rows,
-        anno_rows=anno_rows,
-        output_prefix=output_prefix_text,
-        threads_text=threads_text,
-        key_width=key_width,
+        sections=sections,
+        footer_rows=[
+            ("Threads", threads_text),
+            ("PostGWAS workers", int(getattr(args, "_postgwas_outer_workers", 1))),
+        ],
+        emit_to_stdout=True,
+        line_max_chars=_CONFIG_LINE_MAX_CHARS,
+        overflow_mark=_CONFIG_OVERFLOW_MARK,
     )
-    if rich_rendered:
-        _emit_info_to_file_handlers(logger, config_title)
-        _emit_info_to_file_handlers(logger, f"Host: {host_text}\n")
-        for line in config_lines_full:
-            _emit_info_to_file_handlers(logger, line)
-    else:
-        _emit_info_to_stream_handlers(logger, config_title)
-        _emit_info_to_stream_handlers(logger, f"Host: {host_text}\n")
-        for line in config_lines_terminal:
-            _emit_info_to_stream_handlers(logger, line)
-        _emit_info_to_file_handlers(logger, config_title)
-        _emit_info_to_file_handlers(logger, f"Host: {host_text}\n")
-        for line in config_lines_full:
-            _emit_info_to_file_handlers(logger, line)
+    _emit_info_to_file_handlers(logger, "")
+    _emit_info_to_file_handlers(logger, "[ Command ]")
+    _emit_info_to_file_handlers(logger, f"  {_postgwas_invocation_command(argv)}")
     if no_plot_or_anno:
         logger.warning(
-            "Warning: No --manh/--qq/--ldblock/--ldblock-all/--anno provided. Nothing will be plotted or annotated."
+            "Warning: No --manh/--qq/--manh-merge/--qq-merge/--ldblock/--ldblock-all/--anno provided. Nothing will be plotted or annotated."
         )
 
-    check_gwas_files = args.merge_files if args.merge_mode else args.gwasfile
+    check_gwas_files = list(args.gwasfile or [])
     checks: list[bool] = [
         ensure_file_exists(logger, f, "GWAS result file") for f in check_gwas_files
     ]
@@ -5706,19 +6097,20 @@ def main():
     # ------------------------------------------------------------------
     # Parallel processing of all input files
     # ------------------------------------------------------------------
-    if args.merge_mode:
-        _run_postgwas_merge_manhattan(args, logger)
-    elif bool(getattr(args, "ldblock_only_mode", False)):
+    if bool(getattr(args, "ldblock_only_mode", False)):
         _run_postgwas_ldblock_only(args, logger)
     else:
-        _run_postgwas_tasks(args, logger)
+        if merge_plot_requested:
+            _run_postgwas_merge_manhattan(args, logger)
+        if single_plot_requested:
+            _run_postgwas_tasks(args, logger)
 
     # ------------------------------------------------------------------
     # Final logging
     # ------------------------------------------------------------------
     lt = time.localtime()
     endinfo = (
-        f"\nFinished post-GWAS analysis. Total wall time: "
+        f"\nFinished. Total wall time: "
         f"{round(time.time() - t_start, 2)} seconds\n"
         f"{lt.tm_year}-{lt.tm_mon}-{lt.tm_mday} "
         f"{lt.tm_hour}:{lt.tm_min}:{lt.tm_sec}"

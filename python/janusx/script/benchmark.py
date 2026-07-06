@@ -1115,14 +1115,7 @@ def _convert_to_bfile_if_needed(
         "-geno",
         str(args.geno),
     ]
-    janusx_env = _merge_env_with_updates(
-        {
-            # Benchmark-only override: keep the raw main threshold aligned as-is,
-            # but use the rMVP default late pseudoQTN gate on JanusX raw route.
-            "JX_FARMCPU_RAW_BENCH_QTN_THRESHOLD": "0.01",
-        }
-    )
-    rc, elapsed, rss = _run_timed(cmd, log_file=log_file, time_file=time_file, env=janusx_env)
+    rc, elapsed, rss = _run_timed(cmd, log_file=log_file, time_file=time_file)
     if rc != 0:
         raise RuntimeError(f"gformat conversion to PLINK failed (exit={rc}). See log: {log_file}")
     for ext in ("bed", "bim", "fam"):

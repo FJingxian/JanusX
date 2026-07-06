@@ -25,12 +25,17 @@ Raw route: `-farmcpu`
 
 This route follows the classic FEM/REM/SUPER chain.
 
-  1. FEM: compute `p_t(i)` conditional on `X_t`
-  2. REM: choose `L_t* = argmin_{s,b} REM(L_t(s,b) | X_t, y)`
-  3. SUPER update: `S_{t+1} = SUPER(S_t ∪ L_t*)`
-     with the classic rMVP-style redundancy rule `|r| >= 0.7`
-  4. Current pseudo-QTN effect p-values are fed back into the update chain
-  5. Stop when no marker passes `tau`, or `S_{t+1} == S_t`, or a 2-cycle is detected
+  1. Run the current background model `X_t = [X0, G_{S_t}]`
+  2. Use its stage1 prior p-values to build REM candidate lead sets and choose
+     `L_t* = argmin_{s,b} REM(L_t(s,b) | X_t, y)`
+  3. Apply the rMVP-style threshold / saved-QTN rules to obtain the candidate
+     union for this loop
+  4. SUPER / Remove update: `S_{t+1} = SUPER(...)` with the classic
+     redundancy rule `|r| > 0.7`
+  5. Refit the updated background model on `S_{t+1}` to produce the next-loop
+     prior p-values
+  6. Stop when stage1 reaches the same QTN set, enters a 2-cycle, or hits the
+     loop cap
 
 Unified route: `-frgwas`
 =========================
@@ -862,6 +867,146 @@ pub(crate) fn select_lead_indices(
     lead
 }
 
+fn farmcpu_raw_prepare_seq_qtn(
+    qtn_saved: &[usize],
+    opt_lead: &[usize],
+    femp: &[f64],
+    global_pos: &[i64],
+    qtn_threshold: f64,
+    keep_saved: bool,
+) -> Vec<usize> {
+    let mut union: Vec<usize> = Vec::with_capacity(opt_lead.len() + qtn_saved.len());
+    let mut seen_union: HashSet<usize> = HashSet::with_capacity(opt_lead.len() + qtn_saved.len());
+    for &idx in opt_lead.iter() {
+        if seen_union.insert(idx) {
+            union.push(idx);
+        }
+    }
+    for &idx in qtn_saved.iter() {
+        if seen_union.insert(idx) {
+            union.push(idx);
+        }
+    }
+    if union.is_empty() {
+        return Vec::new();
+    }
+
+    let saved_set: HashSet<usize> = if keep_saved {
+        qtn_saved.iter().copied().collect()
+    } else {
+        HashSet::new()
+    };
+    let threshold_enabled = qtn_threshold.is_finite() && qtn_threshold > 0.0;
+    let mut filtered: Vec<usize> = union
+        .into_iter()
+        .filter(|&idx| {
+            if keep_saved && saved_set.contains(&idx) {
+                return true;
+            }
+            if !threshold_enabled {
+                return true;
+            }
+            let p = femp.get(idx).copied().unwrap_or(1.0_f64);
+            p.is_finite() && p < qtn_threshold
+        })
+        .collect();
+    if filtered.is_empty() {
+        return Vec::new();
+    }
+
+    filtered.sort_by(|&a, &b| {
+        femp.get(a)
+            .copied()
+            .unwrap_or(1.0_f64)
+            .total_cmp(&femp.get(b).copied().unwrap_or(1.0_f64))
+            .then_with(|| a.cmp(&b))
+    });
+
+    let mut pos_seen: HashSet<i64> = HashSet::with_capacity(filtered.len());
+    let mut out: Vec<usize> = Vec::with_capacity(filtered.len());
+    for idx in filtered.into_iter() {
+        let gp = global_pos.get(idx).copied().unwrap_or(i64::MIN);
+        if pos_seen.insert(gp) {
+            out.push(idx);
+        }
+    }
+    out
+}
+
+fn farmcpu_fix_zero_pvalues(p: &mut [f64]) {
+    let min_nonzero = p
+        .iter()
+        .copied()
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .min_by(|a, b| a.total_cmp(b));
+    let Some(base) = min_nonzero else {
+        return;
+    };
+    let repl = (base * 0.01_f64).clamp(f64::MIN_POSITIVE, 1.0_f64);
+    for v in p.iter_mut() {
+        if v.is_finite() && *v <= 0.0 {
+            *v = repl;
+        }
+    }
+}
+
+fn farmcpu_sorted_intersection_len(a: &[usize], b: &[usize]) -> usize {
+    let aset: HashSet<usize> = a.iter().copied().collect();
+    b.iter().filter(|&&idx| aset.contains(&idx)).count()
+}
+
+fn farmcpu_sorted_union_len(a: &[usize], b: &[usize]) -> usize {
+    let mut aset: HashSet<usize> = a.iter().copied().collect();
+    aset.extend(b.iter().copied());
+    aset.len()
+}
+
+fn farmcpu_sorted_overlap_ratio(a: &[usize], b: &[usize]) -> f64 {
+    let denom = farmcpu_sorted_union_len(a, b);
+    if denom == 0 {
+        0.0
+    } else {
+        farmcpu_sorted_intersection_len(a, b) as f64 / denom as f64
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn farmcpu_raw_prior_from_model(
+    y: &[f64],
+    x_qtn: &[f64],
+    ixx: &[f64],
+    packed_flat: &[u8],
+    n_samples: usize,
+    row_flip: &[bool],
+    row_maf: &[f32],
+    row_indices: Option<&[usize]>,
+    sample_idx: &[usize],
+    q_base: usize,
+    qtn_idx: &[usize],
+    threads: usize,
+) -> Result<Vec<f64>, String> {
+    let (mut prior_p, qtn_min_p) = scan_packed_full_matrix_reduced(
+        y,
+        x_qtn,
+        ixx,
+        packed_flat,
+        n_samples,
+        row_flip,
+        row_maf,
+        row_indices,
+        sample_idx,
+        q_base,
+        threads,
+    )?;
+    for (j, &idx) in qtn_idx.iter().enumerate() {
+        if idx < prior_p.len() && qtn_min_p.get(j).copied().unwrap_or(1.0_f64).is_finite() {
+            prior_p[idx] = qtn_min_p[j];
+        }
+    }
+    farmcpu_fix_zero_pvalues(&mut prior_p);
+    Ok(prior_p)
+}
+
 fn farmcpu_exact_reml_log10_bounds_from_legacy_delta(
     delta_exp_start: f64,
     delta_exp_end: f64,
@@ -1394,7 +1539,7 @@ pub(crate) fn farmcpu_super_keep_from_sample_major(
     sample_major: &[f64],
     n: usize,
     k: usize,
-    pval: &[f64],
+    _pval: &[f64],
     thr: f64,
 ) -> Vec<bool> {
     let mut keep = vec![true; k];
@@ -1424,14 +1569,11 @@ pub(crate) fn farmcpu_super_keep_from_sample_major(
         };
     }
 
-    for i in 0..k {
-        if !keep[i] {
-            continue;
-        }
-        for j in (i + 1)..k {
-            if !keep[j] {
-                continue;
-            }
+    // The input candidate order is already sorted by prior P. Mirror
+    // rMVP::FarmCPU.Remove exactly: once an earlier column has |r| > threshold
+    // with the current column, drop the current column and keep the earlier one.
+    for j in 0..k {
+        for i in 0..j {
             let denom = ((n.saturating_sub(1)) as f64) * std[i] * std[j];
             let cij = if denom > 0.0 && denom.is_finite() {
                 let mut dot_ij = 0.0_f64;
@@ -1442,18 +1584,9 @@ pub(crate) fn farmcpu_super_keep_from_sample_major(
             } else {
                 f64::NAN
             };
-            if cij >= thr || cij <= -thr {
-                if pval[i] > pval[j] {
-                    keep[i] = false;
-                } else if pval[i] < pval[j] {
-                    keep[j] = false;
-                    break;
-                } else {
-                    // Tie-break exact/near-exact proxy SNPs by preserving the earlier
-                    // candidate in the current seqQTN order. This matches rMVP more
-                    // closely on duplicate-LD representatives.
-                    keep[j] = false;
-                }
+            if cij.is_finite() && cij.abs() > thr {
+                keep[j] = false;
+                break;
             }
         }
     }
@@ -1911,7 +2044,14 @@ fn farmcpu_final_ld_merge_r2_threshold() -> f64 {
 }
 
 #[inline]
-fn farmcpu_raw_benchmark_qtn_threshold_override() -> Option<f64> {
+fn farmcpu_raw_qtn_threshold_override() -> Option<f64> {
+    if let Ok(raw) = std::env::var("JX_FARMCPU_RAW_QTN_THRESHOLD") {
+        if let Ok(v) = raw.trim().parse::<f64>() {
+            if v.is_finite() && v > 0.0 {
+                return Some(v);
+            }
+        }
+    }
     if let Ok(raw) = std::env::var("JX_FARMCPU_RAW_BENCH_QTN_THRESHOLD") {
         if let Ok(v) = raw.trim().parse::<f64>() {
             if v.is_finite() && v > 0.0 {
@@ -4194,8 +4334,8 @@ pub fn farmcpu_packed_to_tsv(
     let mut qtn_prev_idx: Option<Vec<usize>> = None;
     let route = FarmcpuRoute::from_raw(raw);
     let qtn_threshold_eff = threshold;
-    let raw_qtn_threshold_eff =
-        farmcpu_raw_benchmark_qtn_threshold_override().unwrap_or(qtn_threshold_eff);
+    let raw_qtn_threshold_eff = farmcpu_raw_qtn_threshold_override()
+        .unwrap_or_else(|| qtn_threshold_eff.max(0.01_f64));
     let max_iter_i = max_iter.max(1);
     let qb = qtn_bound.unwrap_or_else(|| {
         let nf = n as f64;
@@ -4595,6 +4735,8 @@ pub fn farmcpu_packed_to_tsv(
                 qtn_idx = qtn_next;
             }
         } else {
+            let mut prior_p_opt: Option<Vec<f64>> = None;
+            let mut current_model_cache: Option<(Vec<f64>, usize, Vec<f64>)> = None;
             for it_idx in 0..max_iter_i {
                 let iter_t0 = if stage1_timing {
                     Some(Instant::now())
@@ -4608,96 +4750,111 @@ pub fn farmcpu_packed_to_tsv(
                 let mut rem_secs = 0.0_f64;
                 let mut merge_secs = 0.0_f64;
                 let mut callback_secs = 0.0_f64;
-                let (x_qtn, q_total) = build_x_with_qtn_packed(
-                    &base_x,
-                    n,
-                    q_base,
-                    &qtn_idx,
-                    &packed_flat,
-                    bytes_per_snp,
-                    row_idx.as_deref(),
-                    &sample_idx,
-                    row_flip,
-                    row_maf,
-                    Some(&mut qtn_cache),
-                )
-                .map_err(PyRuntimeError::new_err)?;
-                if let Some(t0) = iter_t0 {
-                    build_x_secs = t0.elapsed().as_secs_f64();
-                }
 
-                let t_pinv = if stage1_timing {
-                    Some(Instant::now())
+                let (x_qtn, q_total, ixx) = if let Some(cached) = current_model_cache.take() {
+                    cached
                 } else {
-                    None
-                };
-                let mut xtx = vec![0.0_f64; q_total * q_total];
-                for i in 0..n {
-                    let row = &x_qtn[i * q_total..(i + 1) * q_total];
-                    for a in 0..q_total {
-                        let va = row[a];
-                        for b in 0..q_total {
-                            xtx[a * q_total + b] += va * row[b];
+                    let t_build = if stage1_timing {
+                        Some(Instant::now())
+                    } else {
+                        None
+                    };
+                    let (x_qtn, q_total) = build_x_with_qtn_packed(
+                        &base_x,
+                        n,
+                        q_base,
+                        &qtn_idx,
+                        &packed_flat,
+                        bytes_per_snp,
+                        row_idx.as_deref(),
+                        &sample_idx,
+                        row_flip,
+                        row_maf,
+                        Some(&mut qtn_cache),
+                    )
+                    .map_err(PyRuntimeError::new_err)?;
+                    if let Some(t0) = t_build {
+                        build_x_secs += t0.elapsed().as_secs_f64();
+                    }
+                    let t_pinv = if stage1_timing {
+                        Some(Instant::now())
+                    } else {
+                        None
+                    };
+                    let mut xtx = vec![0.0_f64; q_total * q_total];
+                    for i in 0..n {
+                        let row = &x_qtn[i * q_total..(i + 1) * q_total];
+                        for a in 0..q_total {
+                            let va = row[a];
+                            for b in 0..q_total {
+                                xtx[a * q_total + b] += va * row[b];
+                            }
                         }
                     }
-                }
-                let ixx = pinv_xtx(&xtx, q_total).map_err(PyRuntimeError::new_err)?;
-                if let Some(t0) = t_pinv {
-                    pinv_secs = t0.elapsed().as_secs_f64();
-                }
-                let t_fem = if stage1_timing {
-                    Some(Instant::now())
-                } else {
-                    None
-                };
-                let (mut femp, qtn_min_p) = scan_packed_full_matrix_reduced(
-                    y,
-                    &x_qtn,
-                    &ixx,
-                    &packed_flat,
-                    n_samples,
-                    row_flip,
-                    row_maf,
-                    row_idx.as_deref(),
-                    &sample_idx,
-                    q_base,
-                    threads,
-                )
-                .map_err(PyRuntimeError::new_err)?;
-                if let Some(t0) = t_fem {
-                    fem_secs = t0.elapsed().as_secs_f64();
-                }
-                for (j, &idx) in qtn_idx.iter().enumerate() {
-                    if idx < m && qtn_min_p[j].is_finite() {
-                        femp[idx] = qtn_min_p[j];
+                    let ixx = pinv_xtx(&xtx, q_total).map_err(PyRuntimeError::new_err)?;
+                    if let Some(t0) = t_pinv {
+                        pinv_secs += t0.elapsed().as_secs_f64();
                     }
-                }
+                    (x_qtn, q_total, ixx)
+                };
 
-                let signal_count = femp
-                    .iter()
-                    .filter(|&&p| p.is_finite() && p <= raw_qtn_threshold_eff)
-                    .count();
-                if signal_count == 0 {
+                if prior_p_opt.is_none() {
+                    let t_fem = if stage1_timing {
+                        Some(Instant::now())
+                    } else {
+                        None
+                    };
+                    let prior_p_next = farmcpu_raw_prior_from_model(
+                        y,
+                        &x_qtn,
+                        &ixx,
+                        &packed_flat,
+                        n_samples,
+                        row_flip,
+                        row_maf,
+                        row_idx.as_deref(),
+                        &sample_idx,
+                        q_base,
+                        &qtn_idx,
+                        threads,
+                    )
+                    .map_err(PyRuntimeError::new_err)?;
+                    if let Some(t0) = t_fem {
+                        fem_secs += t0.elapsed().as_secs_f64();
+                    }
                     if let Some(debug) = stage1_debug.as_mut() {
                         debug
                             .write_line(&format!(
-                                "iter route=raw iter={} qtn_in_n={} signal_n=0 lead_n=0 qtn_next_n={} qtn_in_rows1={}",
+                                "iter route=raw iter={} qtn_in_n={} signal_n=0 lead_n=0 lead_outside_threshold_n=0 qtn_next_n={} qtn_in_rows1={} lead_rows1=[] lead_outside_threshold_rows1=[] qtn_next_rows1={}",
                                 it_idx + 1,
                                 qtn_in,
-                                qtn_in,
+                                qtn_idx.len(),
+                                farmcpu_debug_format_idx_list_1based(&qtn_idx, meta_row_idx),
                                 farmcpu_debug_format_idx_list_1based(&qtn_idx, meta_row_idx),
                             ))
                             .map_err(PyRuntimeError::new_err)?;
                         debug
                             .write_line(&format!(
-                            "iter_detail route=raw iter={} qtn_in={}",
-                            it_idx + 1,
-                            farmcpu_debug_format_marker_list(&qtn_idx, meta_row_idx, &chrom, &pos, &femp),
+                                "iter_detail route=raw iter={} qtn_in={} lead=[] lead_outside_threshold=[] qtn_next={}",
+                                it_idx + 1,
+                                farmcpu_debug_format_marker_list(
+                                    &qtn_idx,
+                                    meta_row_idx,
+                                    &chrom,
+                                    &pos,
+                                    &prior_p_next,
+                                ),
+                                farmcpu_debug_format_marker_list(
+                                    &qtn_idx,
+                                    meta_row_idx,
+                                    &chrom,
+                                    &pos,
+                                    &prior_p_next,
+                                ),
                             ))
                             .map_err(PyRuntimeError::new_err)?;
                         debug.flush().map_err(PyRuntimeError::new_err)?;
                     }
-                    final_model_cache = Some((x_qtn, q_total, ixx));
                     let t_cb = if stage1_timing {
                         Some(Instant::now())
                     } else {
@@ -4729,8 +4886,8 @@ pub fn farmcpu_packed_to_tsv(
                             it_idx,
                             max_iter_i,
                             qtn_in,
-                            qtn_in,
-                            signal_count,
+                            qtn_idx.len(),
+                            0usize,
                             build_x_secs,
                             pinv_secs,
                             fem_secs,
@@ -4740,8 +4897,21 @@ pub fn farmcpu_packed_to_tsv(
                             total_secs,
                         );
                     }
-                    break;
+                    if it_idx + 1 >= max_iter_i {
+                        final_model_cache = Some((x_qtn, q_total, ixx));
+                        break;
+                    }
+                    qtn_prev_idx = Some(qtn_idx.clone());
+                    current_model_cache = Some((x_qtn, q_total, ixx));
+                    prior_p_opt = Some(prior_p_next);
+                    continue;
                 }
+
+                let prior_p = prior_p_opt.take().expect("raw prior p-values missing");
+                let signal_count = prior_p
+                    .iter()
+                    .filter(|&&p| p.is_finite() && p < raw_qtn_threshold_eff)
+                    .count();
 
                 let t_rem = if stage1_timing {
                     Some(Instant::now())
@@ -4753,7 +4923,7 @@ pub fn farmcpu_packed_to_tsv(
                     y,
                     &x_qtn,
                     q_total,
-                    &femp,
+                    &prior_p,
                     &global_pos,
                     &szbin_i64,
                     &nbin_vals,
@@ -4783,21 +4953,42 @@ pub fn farmcpu_packed_to_tsv(
                         meta_row_idx,
                         &chrom,
                         &pos,
-                        &femp,
+                        &prior_p,
                     )
                     .map_err(PyRuntimeError::new_err)?;
                 }
+
                 let t_merge = if stage1_timing {
                     Some(Instant::now())
                 } else {
                     None
                 };
-                let mut qtn_union = qtn_idx.clone();
-                qtn_union.extend(opt_lead.iter().copied());
-                qtn_union.sort_unstable();
-                qtn_union.dedup();
+                let force_loop2_null = if it_idx + 1 == 2 {
+                    prior_p
+                        .iter()
+                        .copied()
+                        .filter(|p| p.is_finite())
+                        .min_by(|a, b| a.total_cmp(b))
+                        .unwrap_or(f64::INFINITY)
+                        > raw_qtn_threshold_eff
+                } else {
+                    false
+                };
+                let keep_saved = !qtn_idx.is_empty();
+                let qtn_union = if force_loop2_null {
+                    Vec::new()
+                } else {
+                    farmcpu_raw_prepare_seq_qtn(
+                        &qtn_idx,
+                        &opt_lead,
+                        &prior_p,
+                        &global_pos,
+                        raw_qtn_threshold_eff,
+                        keep_saved,
+                    )
+                };
 
-                let qtn_next: Vec<usize> = if qtn_union.is_empty() {
+                let mut qtn_next: Vec<usize> = if qtn_union.is_empty() {
                     Vec::new()
                 } else {
                     let sample_major = qtn_cache
@@ -4811,7 +5002,7 @@ pub fn farmcpu_packed_to_tsv(
                             row_maf,
                         )
                         .map_err(PyRuntimeError::new_err)?;
-                    let pvals: Vec<f64> = qtn_union.iter().map(|&ix| femp[ix]).collect();
+                    let pvals: Vec<f64> = qtn_union.iter().map(|&ix| prior_p[ix]).collect();
                     let keep = farmcpu_super_keep_from_sample_major(
                         &sample_major,
                         n,
@@ -4822,15 +5013,17 @@ pub fn farmcpu_packed_to_tsv(
                     qtn_union
                         .iter()
                         .zip(keep.iter())
-                            .filter_map(|(&ix, &k)| if k { Some(ix) } else { None })
-                            .collect()
+                        .filter_map(|(&ix, &k)| if k { Some(ix) } else { None })
+                        .collect()
                 };
+                qtn_next.sort_unstable();
+                qtn_next.dedup();
                 let opt_lead_outside_threshold: Vec<usize> = opt_lead
                     .iter()
                     .copied()
                     .filter(|&idx| {
-                        let p = femp.get(idx).copied().unwrap_or(1.0_f64);
-                        !(p.is_finite() && p <= raw_qtn_threshold_eff)
+                        let p = prior_p.get(idx).copied().unwrap_or(1.0_f64);
+                        !(p.is_finite() && p < raw_qtn_threshold_eff)
                     })
                     .collect();
                 if let Some(t0) = t_merge {
@@ -4839,13 +5032,14 @@ pub fn farmcpu_packed_to_tsv(
                 if let Some(debug) = stage1_debug.as_mut() {
                     debug
                         .write_line(&format!(
-                            "iter route=raw iter={} qtn_in_n={} signal_n={} lead_n={} lead_outside_threshold_n={} qtn_next_n={} qtn_in_rows1={} lead_rows1={} lead_outside_threshold_rows1={} qtn_next_rows1={}",
+                            "iter route=raw iter={} qtn_in_n={} signal_n={} lead_n={} lead_outside_threshold_n={} qtn_next_n={} loop2_null={} qtn_in_rows1={} lead_rows1={} lead_outside_threshold_rows1={} qtn_next_rows1={}",
                             it_idx + 1,
                             qtn_in,
                             signal_count,
                             opt_lead.len(),
                             opt_lead_outside_threshold.len(),
                             qtn_next.len(),
+                            usize::from(force_loop2_null),
                             farmcpu_debug_format_idx_list_1based(&qtn_idx, meta_row_idx),
                             farmcpu_debug_format_idx_list_1based(&opt_lead, meta_row_idx),
                             farmcpu_debug_format_idx_list_1based(&opt_lead_outside_threshold, meta_row_idx),
@@ -4856,14 +5050,139 @@ pub fn farmcpu_packed_to_tsv(
                         .write_line(&format!(
                             "iter_detail route=raw iter={} qtn_in={} lead={} lead_outside_threshold={} qtn_next={}",
                             it_idx + 1,
-                            farmcpu_debug_format_marker_list(&qtn_idx, meta_row_idx, &chrom, &pos, &femp),
-                            farmcpu_debug_format_marker_list(&opt_lead, meta_row_idx, &chrom, &pos, &femp),
-                            farmcpu_debug_format_marker_list(&opt_lead_outside_threshold, meta_row_idx, &chrom, &pos, &femp),
-                            farmcpu_debug_format_marker_list(&qtn_next, meta_row_idx, &chrom, &pos, &femp),
+                            farmcpu_debug_format_marker_list(&qtn_idx, meta_row_idx, &chrom, &pos, &prior_p),
+                            farmcpu_debug_format_marker_list(&opt_lead, meta_row_idx, &chrom, &pos, &prior_p),
+                            farmcpu_debug_format_marker_list(&opt_lead_outside_threshold, meta_row_idx, &chrom, &pos, &prior_p),
+                            farmcpu_debug_format_marker_list(&qtn_next, meta_row_idx, &chrom, &pos, &prior_p),
                         ))
                         .map_err(PyRuntimeError::new_err)?;
                     debug.flush().map_err(PyRuntimeError::new_err)?;
                 }
+
+                if force_loop2_null {
+                    let t_cb = if stage1_timing {
+                        Some(Instant::now())
+                    } else {
+                        None
+                    };
+                    if let Some(cb) = stage1_progress_callback.as_ref() {
+                        Python::attach(|py2| -> PyResult<()> {
+                            py2.check_signals()?;
+                            cb.call1(py2, (it_idx + 1, max_iter_i))?;
+                            Ok(())
+                        })?;
+                    }
+                    if let Some(t0) = t_cb {
+                        callback_secs += t0.elapsed().as_secs_f64();
+                    }
+                    if let Some(t0) = iter_t0 {
+                        let total_secs = t0.elapsed().as_secs_f64();
+                        stage1_timing_acc.add_iter(
+                            build_x_secs,
+                            pinv_secs,
+                            fem_secs,
+                            rem_secs,
+                            merge_secs,
+                            callback_secs,
+                            total_secs,
+                        );
+                        farmcpu_stage1_emit_iter_timing(
+                            route,
+                            it_idx,
+                            max_iter_i,
+                            qtn_in,
+                            qtn_idx.len(),
+                            signal_count,
+                            build_x_secs,
+                            pinv_secs,
+                            fem_secs,
+                            rem_secs,
+                            merge_secs,
+                            callback_secs,
+                            total_secs,
+                        );
+                    }
+                    final_model_cache = Some((x_qtn, q_total, ixx));
+                    break;
+                }
+
+                let converge = farmcpu_sorted_overlap_ratio(&qtn_next, &qtn_idx);
+                let circle = qtn_prev_idx
+                    .as_ref()
+                    .map(|prev| farmcpu_sorted_overlap_ratio(&qtn_next, prev) >= 1.0_f64)
+                    .unwrap_or(false);
+                let is_done = (it_idx + 1 >= max_iter_i) || converge >= 1.0_f64 || circle;
+
+                let (next_model_cache, next_prior_p) = if qtn_next == qtn_idx {
+                    ((x_qtn, q_total, ixx), prior_p)
+                } else {
+                    let t_build = if stage1_timing {
+                        Some(Instant::now())
+                    } else {
+                        None
+                    };
+                    let (next_x_qtn, next_q_total) = build_x_with_qtn_packed(
+                        &base_x,
+                        n,
+                        q_base,
+                        &qtn_next,
+                        &packed_flat,
+                        bytes_per_snp,
+                        row_idx.as_deref(),
+                        &sample_idx,
+                        row_flip,
+                        row_maf,
+                        Some(&mut qtn_cache),
+                    )
+                    .map_err(PyRuntimeError::new_err)?;
+                    if let Some(t0) = t_build {
+                        build_x_secs += t0.elapsed().as_secs_f64();
+                    }
+                    let t_pinv = if stage1_timing {
+                        Some(Instant::now())
+                    } else {
+                        None
+                    };
+                    let mut next_xtx = vec![0.0_f64; next_q_total * next_q_total];
+                    for i in 0..n {
+                        let row = &next_x_qtn[i * next_q_total..(i + 1) * next_q_total];
+                        for a in 0..next_q_total {
+                            let va = row[a];
+                            for b in 0..next_q_total {
+                                next_xtx[a * next_q_total + b] += va * row[b];
+                            }
+                        }
+                    }
+                    let next_ixx =
+                        pinv_xtx(&next_xtx, next_q_total).map_err(PyRuntimeError::new_err)?;
+                    if let Some(t0) = t_pinv {
+                        pinv_secs += t0.elapsed().as_secs_f64();
+                    }
+                    let t_fem = if stage1_timing {
+                        Some(Instant::now())
+                    } else {
+                        None
+                    };
+                    let next_prior_p = farmcpu_raw_prior_from_model(
+                        y,
+                        &next_x_qtn,
+                        &next_ixx,
+                        &packed_flat,
+                        n_samples,
+                        row_flip,
+                        row_maf,
+                        row_idx.as_deref(),
+                        &sample_idx,
+                        q_base,
+                        &qtn_next,
+                        threads,
+                    )
+                    .map_err(PyRuntimeError::new_err)?;
+                    if let Some(t0) = t_fem {
+                        fem_secs += t0.elapsed().as_secs_f64();
+                    }
+                    ((next_x_qtn, next_q_total, next_ixx), next_prior_p)
+                };
 
                 let t_cb = if stage1_timing {
                     Some(Instant::now())
@@ -4908,20 +5227,15 @@ pub fn farmcpu_packed_to_tsv(
                     );
                 }
 
-                if qtn_next == qtn_idx {
-                    final_model_cache = Some((x_qtn, q_total, ixx));
-                    break;
-                }
-                if qtn_prev_idx
-                    .as_ref()
-                    .map(|prev| *prev == qtn_next)
-                    .unwrap_or(false)
-                {
+                if is_done {
                     qtn_idx = qtn_next;
+                    final_model_cache = Some(next_model_cache);
                     break;
                 }
                 qtn_prev_idx = Some(qtn_idx.clone());
                 qtn_idx = qtn_next;
+                current_model_cache = Some(next_model_cache);
+                prior_p_opt = Some(next_prior_p);
             }
         }
 
@@ -5511,5 +5825,35 @@ mod tests {
         for (lhs, rhs) in qtn_min_p.iter().zip(qtn_ref.iter()) {
             assert_close_or_nan(*lhs, *rhs, 1e-10);
         }
+    }
+
+    #[test]
+    fn raw_prepare_seq_qtn_matches_rmvp_threshold_and_order_rules() {
+        let qtn_saved = vec![9usize, 5usize];
+        let opt_lead = vec![3usize, 7usize, 5usize, 11usize];
+        let femp = vec![
+            1.0, 1.0, 1.0, 2.0e-4, 1.0, 5.0e-1, 1.0, 8.0e-3, 1.0, 9.0e-1, 1.0, 1.0e-5,
+        ];
+        let global_pos = vec![0_i64, 1, 2, 30, 4, 50, 6, 70, 8, 90, 10, 70];
+
+        let first_iter = farmcpu_raw_prepare_seq_qtn(
+            &[],
+            &opt_lead,
+            &femp,
+            &global_pos,
+            1.0e-2,
+            false,
+        );
+        assert_eq!(first_iter, vec![11usize, 3usize]);
+
+        let later_iter = farmcpu_raw_prepare_seq_qtn(
+            &qtn_saved,
+            &opt_lead,
+            &femp,
+            &global_pos,
+            1.0e-2,
+            true,
+        );
+        assert_eq!(later_iter, vec![11usize, 3usize, 5usize, 9usize]);
     }
 }

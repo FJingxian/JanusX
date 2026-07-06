@@ -482,11 +482,12 @@ def _load_scanmeta_single_cache(
         or int(row_flip.shape[0]) != int(n_active)
     ):
         return None
+    maf_arr = np.ascontiguousarray(maf, dtype=np.float32)
     return {
         "row_indices": np.ascontiguousarray(row_idx, dtype=np.int64),
         "missing_rate": np.ascontiguousarray(miss, dtype=np.float32),
-        "af": np.ascontiguousarray(maf, dtype=np.float32),
-        "maf": np.ascontiguousarray(maf, dtype=np.float32),
+        "af": maf_arr,
+        "maf": maf_arr,
         "row_flip": np.ascontiguousarray((row_flip != 0), dtype=np.bool_),
         "site_keep": None,
         "n_samples_full": int(n_samples_full),
@@ -617,11 +618,12 @@ def _load_splmm_meta_cache(
             site_keep = None
     else:
         n_snps_total = int(meta_info.get("n_snps_total", 0) or 0)
+    maf_arr = np.ascontiguousarray(maf, dtype=np.float32)
     return {
         "row_indices": row_idx,
         "missing_rate": miss,
-        "af": maf,
-        "maf": maf,
+        "af": maf_arr,
+        "maf": maf_arr,
         "row_flip": row_flip,
         "site_keep": site_keep,
         "n_samples_full": int(meta_info.get("n_samples_full", 0) or 0),
@@ -1044,11 +1046,12 @@ def _splmm_bed_logic_meta_selected(
         mmap_window_mb=(None if mmap_window_mb is None else int(max(1, int(mmap_window_mb)))),
         threads=threads_use,
     )
+    maf_arr = np.ascontiguousarray(np.asarray(af, dtype=np.float32), dtype=np.float32)
     return {
         "row_indices": np.ascontiguousarray(np.asarray(row_idx, dtype=np.int64), dtype=np.int64),
         "missing_rate": np.ascontiguousarray(np.asarray(miss, dtype=np.float32), dtype=np.float32),
-        "af": np.ascontiguousarray(np.asarray(af, dtype=np.float32), dtype=np.float32),
-        "maf": np.ascontiguousarray(np.asarray(af, dtype=np.float32), dtype=np.float32),
+        "af": maf_arr,
+        "maf": maf_arr,
         "row_flip": np.ascontiguousarray(np.asarray(row_flip, dtype=np.bool_), dtype=np.bool_),
         "site_keep": np.ascontiguousarray(np.asarray(site_keep, dtype=np.bool_), dtype=np.bool_),
         "n_samples_full": int(n_samples_full),
@@ -1184,11 +1187,12 @@ def _build_gwas_global_logic_meta(
         row_idx_arr = np.ascontiguousarray(np.asarray(row_idx, dtype=np.int64).reshape(-1), dtype=np.int64)
         if int(row_idx_arr.shape[0]) == 0:
             raise ValueError("GWAS global scan metadata produced zero active SNPs after filtering.")
+        maf_arr = np.ascontiguousarray(np.asarray(af, dtype=np.float32).reshape(-1), dtype=np.float32)
         return {
             "row_indices": row_idx_arr,
             "missing_rate": np.ascontiguousarray(np.asarray(miss, dtype=np.float32).reshape(-1), dtype=np.float32),
-            "af": np.ascontiguousarray(np.asarray(af, dtype=np.float32).reshape(-1), dtype=np.float32),
-            "maf": np.ascontiguousarray(np.asarray(af, dtype=np.float32).reshape(-1), dtype=np.float32),
+            "af": maf_arr,
+            "maf": maf_arr,
             "row_flip": np.ascontiguousarray(np.asarray(row_flip, dtype=np.bool_).reshape(-1), dtype=np.bool_),
             "site_keep": None,
             "n_samples_full": int(n_samples_full),
@@ -1242,11 +1246,12 @@ def _build_gwas_global_logic_meta(
     )
     if int(row_idx.shape[0]) == 0:
         raise ValueError("GWAS global scan metadata produced zero active SNPs after filtering.")
+    maf_arr = np.ascontiguousarray(row_maf[row_idx], dtype=np.float32)
     return {
         "row_indices": row_idx,
         "missing_rate": np.ascontiguousarray(miss_arr[row_idx], dtype=np.float32),
-        "af": np.ascontiguousarray(row_maf[row_idx], dtype=np.float32),
-        "maf": np.ascontiguousarray(row_maf[row_idx], dtype=np.float32),
+        "af": maf_arr,
+        "maf": maf_arr,
         "row_flip": np.zeros((int(row_idx.shape[0]),), dtype=np.bool_),
         "site_keep": None,
         "n_samples_full": int(packed_n),
@@ -1349,10 +1354,6 @@ def _gwas_logic_meta_with_missing_count(
         dtype=np.float32,
     )
     out["missing_rate"] = miss_rate
-    out["missing_count"] = np.ascontiguousarray(
-        miss_rate * float(max(0, int(n_samples_used))),
-        dtype=np.float32,
-    )
     return out
 
 
@@ -1446,11 +1447,12 @@ def _gwas_logic_meta_from_packed_ctx(
         n_snps_total = int(np.max(row_idx)) + 1
     else:
         n_snps_total = 0
+    maf_arr = np.ascontiguousarray(np.asarray(maf, dtype=np.float32), dtype=np.float32)
     meta = {
         "row_indices": np.ascontiguousarray(np.asarray(row_idx, dtype=np.int64), dtype=np.int64),
         "missing_rate": np.ascontiguousarray(np.asarray(miss, dtype=np.float32), dtype=np.float32),
-        "af": np.ascontiguousarray(np.asarray(maf, dtype=np.float32), dtype=np.float32),
-        "maf": np.ascontiguousarray(np.asarray(maf, dtype=np.float32), dtype=np.float32),
+        "af": maf_arr,
+        "maf": maf_arr,
         "row_flip": np.ascontiguousarray(np.asarray(row_flip, dtype=np.bool_), dtype=np.bool_),
         "site_keep": site_keep,
         "n_samples_full": int(packed_n),

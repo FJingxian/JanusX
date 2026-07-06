@@ -12,6 +12,7 @@ import struct
 import time
 import uuid
 import json
+import threading
 from bisect import bisect_right
 from typing import Optional, Union
 
@@ -95,6 +96,8 @@ _SPLMM_META_CACHE_VERSION = 1
 _SCANMETA_CACHE_MAGIC = b"JXSMETA\0"
 _SCANMETA_CACHE_VERSION = 1
 _SCANMETA_HEADER_PREFIX = struct.Struct("<8sII")
+_GWAS_GLOBAL_SCANMETA_MEM_CACHE: dict[str, dict[str, object]] = {}
+_GWAS_GLOBAL_SCANMETA_MEM_CACHE_LOCK = threading.Lock()
 
 
 def _current_bed_memory_mb() -> float:
@@ -1263,15 +1266,6 @@ def _gwas_logic_meta_global_cached(
     use_spinner: bool = False,
     emit_status: bool = True,
 ) -> dict[str, object]:
-    cache_prefix = _gwas_global_meta_cache_prefix(
-        str(prefix),
-        maf_threshold=float(maf_threshold),
-        max_missing_rate=float(max_missing_rate),
-        het_threshold=float(het_threshold),
-        snps_only=bool(snps_only),
-        outprefix=outprefix,
-        logger=logger,
-    )
     spec = _gwas_global_meta_cache_spec(
         prefix=str(prefix),
         maf_threshold=float(maf_threshold),
@@ -1279,10 +1273,17 @@ def _gwas_logic_meta_global_cached(
         het_threshold=float(het_threshold),
         snps_only=bool(snps_only),
     )
-    cache_path = _scanmeta_single_cache_path(str(cache_prefix))
-    cached = _load_scanmeta_single_cache(
-        cache_path=str(cache_path),
-        spec=spec,
+    cache_key = json.dumps(spec, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    source_prefix = str(spec.get("source_prefix", ""))
+    current_mtime = latest_genotype_mtime(source_prefix) if source_prefix != "" else None
+
+    cached_entry = _GWAS_GLOBAL_SCANMETA_MEM_CACHE.get(cache_key)
+    cached = (
+        cached_entry.get("meta")
+        if isinstance(cached_entry, dict)
+        and cached_entry.get("source_mtime", None) == current_mtime
+        and isinstance(cached_entry.get("meta"), dict)
+        else None
     )
     if cached is not None:
         return _gwas_logic_meta_with_missing_count(
@@ -1290,10 +1291,14 @@ def _gwas_logic_meta_global_cached(
             n_samples_used=int(cached.get("n_samples_full", 0) or 0),
         )
 
-    with _cache_lock(str(cache_prefix)):
-        cached = _load_scanmeta_single_cache(
-            cache_path=str(cache_path),
-            spec=spec,
+    with _GWAS_GLOBAL_SCANMETA_MEM_CACHE_LOCK:
+        cached_entry = _GWAS_GLOBAL_SCANMETA_MEM_CACHE.get(cache_key)
+        cached = (
+            cached_entry.get("meta")
+            if isinstance(cached_entry, dict)
+            and cached_entry.get("source_mtime", None) == current_mtime
+            and isinstance(cached_entry.get("meta"), dict)
+            else None
         )
         if cached is not None:
             return _gwas_logic_meta_with_missing_count(
@@ -1315,21 +1320,10 @@ def _gwas_logic_meta_global_cached(
                     het_threshold=float(het_threshold),
                     snps_only=bool(snps_only),
                 )
-                _atomic_save_scanmeta_cache_local(
-                    str(cache_path),
-                    header={
-                        "version": int(_SCANMETA_CACHE_VERSION),
-                        "spec": spec,
-                        "source_mtime": latest_genotype_mtime(str(spec["source_prefix"])),
-                        "n_samples_full": int(built.get("n_samples_full", 0) or 0),
-                        "n_snps_total": int(built.get("n_snps_total", 0) or 0),
-                        "n_active_sites": int(np.asarray(built["row_indices"]).reshape(-1).shape[0]),
-                    },
-                    row_idx=np.asarray(built["row_indices"], dtype=np.int64),
-                    miss=np.asarray(built["missing_rate"], dtype=np.float32),
-                    maf=np.asarray(built["maf"], dtype=np.float32),
-                    row_flip=np.asarray(built["row_flip"], dtype=np.bool_),
-                )
+                _GWAS_GLOBAL_SCANMETA_MEM_CACHE[cache_key] = {
+                    "source_mtime": current_mtime,
+                    "meta": built,
+                }
             except Exception:
                 task.fail("Preparing GWAS global scan metadata ...Failed")
                 raise
@@ -2656,6 +2650,26 @@ def _splmm_component_ratio(sigma_g2: float, sigma_e2: float) -> float:
     return float("nan")
 
 
+def _splmm_pve_scales_from_components(
+    sigma_g2: float,
+    sigma_e2: float,
+    mean_diag_k: float,
+) -> tuple[float, float]:
+    pve_vc_ratio_raw = _splmm_component_ratio(sigma_g2, sigma_e2)
+    var_g_diag_scaled = (
+        float(sigma_g2) * max(float(mean_diag_k), 0.0)
+        if np.isfinite(sigma_g2) and np.isfinite(mean_diag_k)
+        else float("nan")
+    )
+    denom_diag_scaled = float(var_g_diag_scaled + sigma_e2)
+    pve_pheno_scale = (
+        float(var_g_diag_scaled / denom_diag_scaled)
+        if np.isfinite(denom_diag_scaled) and denom_diag_scaled > 0.0
+        else float("nan")
+    )
+    return pve_vc_ratio_raw, pve_pheno_scale
+
+
 def _splmm_sparse_grm_diag_stats(
     jxgrm_path: str,
     sample_idx: Union[np.ndarray, None] = None,
@@ -3233,6 +3247,12 @@ def _splmm_exact_null_fit_from_grm(
         uty=uty,
         lbd=lbd,
     )
+    mean_diag_k = float(np.mean(evals)) if evals.size > 0 else float("nan")
+    pve_vc_ratio_raw, pve_pheno_scale = _splmm_pve_scales_from_components(
+        sigma_g2=sigma_g2,
+        sigma_e2=sigma_e2,
+        mean_diag_k=mean_diag_k,
+    )
     out = {
         "strategy": "dense_grm_exact_reml",
         "backend": "dense_eigh",
@@ -3242,7 +3262,13 @@ def _splmm_exact_null_fit_from_grm(
         "log10_lambda": float(best_log10),
         "sigma_g2": float(sigma_g2),
         "sigma_e2": float(sigma_e2),
-        "pve": _splmm_component_ratio(sigma_g2, sigma_e2),
+        "pve": pve_pheno_scale,
+        "pve_pheno_scale": pve_pheno_scale,
+        "pve_vc_ratio_raw": pve_vc_ratio_raw,
+        "pve_component_ratio_raw": pve_vc_ratio_raw,
+        "pve_diag_scaled": pve_pheno_scale,
+        "mean_diag_k": mean_diag_k,
+        "grm_mean_diag": mean_diag_k,
         "reml": float(best_reml),
         "ml": float("nan"),
         "lambda_boundary": _splmm_sparse_lambda_boundary_flag(float(best_log10), float(low), float(high)),
@@ -3354,17 +3380,10 @@ def _splmm_sparse_null_fit(
         sigma_g2 = float(sigma_g2)
         sigma_e2 = float(sigma_e2)
         sigma_sum = float(sigma_g2 + sigma_e2)
-        pve = _splmm_component_ratio(sigma_g2, sigma_e2)
-        var_g_diag_scaled = (
-            float(sigma_g2) * max(mean_diag_k, 0.0)
-            if np.isfinite(sigma_g2) and np.isfinite(mean_diag_k)
-            else float("nan")
-        )
-        denom_diag_scaled = float(var_g_diag_scaled + sigma_e2)
-        pve_diag_scaled = (
-            float(var_g_diag_scaled / denom_diag_scaled)
-            if np.isfinite(denom_diag_scaled) and denom_diag_scaled > 0.0
-            else float("nan")
+        pve_vc_ratio_raw, pve_pheno_scale = _splmm_pve_scales_from_components(
+            sigma_g2=sigma_g2,
+            sigma_e2=sigma_e2,
+            mean_diag_k=mean_diag_k,
         )
         lambda_boundary = _splmm_sparse_lambda_boundary_flag(float(log10_lambda), low, high)
         out_dict = {
@@ -3373,7 +3392,8 @@ def _splmm_sparse_null_fit(
             "converged": bool(np.isfinite(float(lbd)) and np.isfinite(sigma_g2) and np.isfinite(sigma_e2)),
             "used_iter": 0,
             "h2": float(sigma_g2 / vp_fixed) if vp_fixed > 0.0 else float("nan"),
-            "pve": pve,
+            "pve": pve_pheno_scale,
+            "pve_pheno_scale": pve_pheno_scale,
             "lambda": float(lbd),
             "log10_lambda": float(log10_lambda),
             "sigma_g2": sigma_g2,
@@ -3387,7 +3407,10 @@ def _splmm_sparse_null_fit(
             "grid_sigma_g2": list(np.asarray(grid_sigma_g2, dtype=np.float64).reshape(-1)),
             "grid_sigma_e2": list(np.asarray(grid_sigma_e2, dtype=np.float64).reshape(-1)),
             "mean_diag_k": mean_diag_k,
-            "pve_diag_scaled": pve_diag_scaled,
+            "grm_mean_diag": mean_diag_k,
+            "pve_diag_scaled": pve_pheno_scale,
+            "pve_vc_ratio_raw": pve_vc_ratio_raw,
+            "pve_component_ratio_raw": pve_vc_ratio_raw,
             "min_diag_k": float(sparse_diag.get("min_diag", float("nan"))),
             "max_diag_k": float(sparse_diag.get("max_diag", float("nan"))),
             "n_samples_k": float(n_samples_k),
@@ -3430,13 +3453,18 @@ def _splmm_sparse_null_fit(
         sigma_g2 = float(sigma_g2)
         sigma_e2 = float(sigma_e2)
         sigma_sum = float(sigma_g2 + sigma_e2)
-        pve = _splmm_component_ratio(sigma_g2, sigma_e2)
+        pve_vc_ratio_raw, pve_pheno_scale = _splmm_pve_scales_from_components(
+            sigma_g2=sigma_g2,
+            sigma_e2=sigma_e2,
+            mean_diag_k=mean_diag_k,
+        )
         ypy_reml = float(sigma_g2) * float(df_reml) if np.isfinite(sigma_g2) and np.isfinite(df_reml) and df_reml > 0 else float("nan")
         out_dict = {
             "strategy": "residualized_sparse_reml_brent",
             "sigma_g2": sigma_g2,
             "sigma_e2": sigma_e2,
-            "pve": pve,
+            "pve": pve_pheno_scale,
+            "pve_pheno_scale": pve_pheno_scale,
             "lambda": float(lbd),
             "log10_lambda": float(log10_lambda),
             "ml": float(ml),
@@ -3450,7 +3478,10 @@ def _splmm_sparse_null_fit(
             "grid_sigma_g2": [],
             "grid_sigma_e2": [],
             "mean_diag_k": mean_diag_k,
-            "pve_diag_scaled": float("nan"),
+            "grm_mean_diag": mean_diag_k,
+            "pve_diag_scaled": pve_pheno_scale,
+            "pve_vc_ratio_raw": pve_vc_ratio_raw,
+            "pve_component_ratio_raw": pve_vc_ratio_raw,
             "min_diag_k": float(sparse_diag.get("min_diag", float("nan"))),
             "max_diag_k": float(sparse_diag.get("max_diag", float("nan"))),
             "n_samples_k": float(n_samples_k),
@@ -3510,23 +3541,18 @@ def _splmm_sparse_null_fit(
     ) = tuple(out)
     sigma_g2 = float(sigma_g2)
     sigma_e2 = float(sigma_e2)
-    # fastGWA-style sparse h2 is interpreted directly from the profiled
-    # variance components. Scaling by mean diag(K) can materially overstate h2
-    # for thresholded sparse GRMs whose diagonal is not normalized to 1.
-    pve = _splmm_component_ratio(sigma_g2, sigma_e2)
-    var_g_diag_scaled = float(sigma_g2) * max(mean_diag_k, 0.0) if np.isfinite(mean_diag_k) else float("nan")
-    denom_diag_scaled = var_g_diag_scaled + sigma_e2
-    pve_diag_scaled = (
-        float(var_g_diag_scaled / denom_diag_scaled)
-        if np.isfinite(denom_diag_scaled) and denom_diag_scaled > 0.0
-        else float("nan")
+    pve_vc_ratio_raw, pve_pheno_scale = _splmm_pve_scales_from_components(
+        sigma_g2=sigma_g2,
+        sigma_e2=sigma_e2,
+        mean_diag_k=mean_diag_k,
     )
     lambda_boundary = _splmm_sparse_lambda_boundary_flag(float(log10_lambda), low, high)
     out_dict = {
         "strategy": "sparse_reml_brent",
         "sigma_g2": sigma_g2,
         "sigma_e2": sigma_e2,
-        "pve": pve,
+        "pve": pve_pheno_scale,
+        "pve_pheno_scale": pve_pheno_scale,
         "lambda": float(lbd),
         "log10_lambda": float(log10_lambda),
         "ml": float(ml),
@@ -3540,7 +3566,10 @@ def _splmm_sparse_null_fit(
         "grid_sigma_g2": list(np.asarray(grid_sigma_g2, dtype=np.float64).reshape(-1)),
         "grid_sigma_e2": list(np.asarray(grid_sigma_e2, dtype=np.float64).reshape(-1)),
         "mean_diag_k": mean_diag_k,
-        "pve_diag_scaled": pve_diag_scaled,
+        "grm_mean_diag": mean_diag_k,
+        "pve_diag_scaled": pve_pheno_scale,
+        "pve_vc_ratio_raw": pve_vc_ratio_raw,
+        "pve_component_ratio_raw": pve_vc_ratio_raw,
         "min_diag_k": float(sparse_diag.get("min_diag", float("nan"))),
         "max_diag_k": float(sparse_diag.get("max_diag", float("nan"))),
         "n_samples_k": float(n_samples_k),
@@ -4087,21 +4116,12 @@ def run_fvlmm_packed_fullrank(
                 _cleanup_gwas_result_tmp(tmp_tsv)
 
         pve = None
-        if bool(getattr(null_fv_mod, "lowrank", False)):
-            try:
-                pve_tmp = float(getattr(null_fv_mod, "pve"))
-                if np.isfinite(pve_tmp):
-                    pve = pve_tmp
-            except Exception:
-                pve = None
-        else:
-            try:
-                vg = float(np.mean(np.asarray(s_trait, dtype=np.float64)))
-                lbd_v = float(lbd)
-                if np.isfinite(vg) and np.isfinite(lbd_v) and (vg + lbd_v) > 0:
-                    pve = vg / (vg + lbd_v)
-            except Exception:
-                pve = None
+        try:
+            pve_tmp = float(getattr(null_fv_mod, "pve"))
+            if np.isfinite(pve_tmp):
+                pve = pve_tmp
+        except Exception:
+            pve = None
 
         _finalize_gwas_result_tsv(tmp_tsv, out_tsv, prefix, logger=logger)
         saved_paths.append(str(out_tsv))

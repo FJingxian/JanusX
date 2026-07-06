@@ -309,7 +309,7 @@ def emit_cv_fold_table(
             r2="R2",
             mse=("MSE" if extended_metrics else ""),
             mae=("MAE" if extended_metrics else ""),
-            pve=("PVE" if extended_metrics else ""),
+            pve=("PVE(ph)" if extended_metrics else ""),
             time="time(s)",
             best="Best",
         )

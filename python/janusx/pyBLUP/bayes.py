@@ -606,11 +606,11 @@ class BAYES:
         varh2 : float
             Posterior variance of heritability.
         """
-        r2_blup_raw: float | None = None
+        r2_blup_pheno_scale: float | None = None
         if r2 is None:
             model = BLUP(y, M, cov=cov, kinship=1)
-            r2_blup_raw = float(model.pve)
-            r2 = float(r2_blup_raw)
+            r2_blup_pheno_scale = float(model.pve)
+            r2 = float(r2_blup_pheno_scale)
         r2 = 0.05 if r2 <0.05 else r2; r2 = 0.95 if r2 >0.95 else r2 # optimize r2
         X = (
             np.concatenate([np.ones((M.shape[1], 1)), cov], axis=1)
@@ -628,9 +628,9 @@ class BAYES:
         self.varpve: float | None = None
         self.r2_used: float | None = float(r2)
         self.r2_blup: float | None = (
-            float(r2_blup_raw) if r2_blup_raw is not None else float("nan")
+            float(r2_blup_pheno_scale) if r2_blup_pheno_scale is not None else float("nan")
         )
-        self.r2_source: str = "blup_auto" if r2_blup_raw is not None else "provided"
+        self.r2_source: str = "blup_auto" if r2_blup_pheno_scale is not None else "provided"
 
         method_map = {
             "BayesA": BayesA,

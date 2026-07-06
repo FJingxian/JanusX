@@ -756,7 +756,7 @@ def run_chunked_gwas_lmm_lm(
                     header_pve = None
 
             if init_log_message is None:
-                init_log_message = f"PVE(null) ~ {mod.pve:.3f}; eigen-decomposition [{evd_elapsed}]"
+                init_log_message = f"PVE(null, pheno-scale) ~ {mod.pve:.3f}; eigen-decomposition [{evd_elapsed}]"
         else:
             mod = ModelCls(y=y_vec, X=X_cov)
             init_log_message = "streaming scan initialized"
@@ -1642,7 +1642,7 @@ def run_chunked_gwas_lmm_lm(
             and np.isfinite(float(header_pve))
             and str(effective_model_label).lower() in {"lmm", "lmm2", "fvlmm"}
         ):
-            done_msg = f"{effective_model_label} ...pve {float(header_pve):.3f} [{'/'.join(time_parts)}]"
+            done_msg = f"{effective_model_label} ...pve(pheno) {float(header_pve):.3f} [{'/'.join(time_parts)}]"
         else:
             done_msg = f"{effective_model_label} ...Finished [{'/'.join(time_parts)}]"
         _rich_success(logger, done_msg, use_spinner=use_spinner)
@@ -1957,7 +1957,7 @@ def run_chunked_gwas_streaming_shared(
                     mod = FvLMM.from_lmm(shared_lmm_model)
                 ctx["evd_secs"] = 0.0
                 ctx["init_log"] = (
-                    f"PVE(null) ~ {mod.pve:.3f}; reusing shared eigen-decomposition"
+                    f"PVE(null, pheno-scale) ~ {mod.pve:.3f}; reusing shared eigen-decomposition"
                 )
             else:
                 evd_desc = f"{model_label} Eigen-Decomposition"
@@ -1997,7 +1997,7 @@ def run_chunked_gwas_streaming_shared(
                 evd_secs = max(time.monotonic() - init_t0, 0.0)
                 evd_elapsed = format_elapsed(evd_secs)
                 ctx["evd_secs"] = float(evd_secs)
-                ctx["init_log"] = f"PVE(null) ~ {mod.pve:.3f}; eigen-decomposition [{evd_elapsed}]"
+                ctx["init_log"] = f"PVE(null, pheno-scale) ~ {mod.pve:.3f}; eigen-decomposition [{evd_elapsed}]"
         else:
             mod = ModelCls(y=y_vec, X=X_cov)
             ctx["init_log"] = "streaming scan initialized"
@@ -2529,7 +2529,7 @@ def run_chunked_gwas_streaming_shared(
             and np.isfinite(float(ctx_pve))
             and str(model_label).lower() in {"lmm", "lmm2", "fvlmm"}
         ):
-            done_msg = f"{model_label} ...pve {float(ctx_pve):.3f} [{'/'.join(time_parts)}]"
+            done_msg = f"{model_label} ...pve(pheno) {float(ctx_pve):.3f} [{'/'.join(time_parts)}]"
         else:
             done_msg = f"{model_label} ...Finished [{'/'.join(time_parts)}]"
         _rich_success(logger, done_msg, use_spinner=use_spinner)

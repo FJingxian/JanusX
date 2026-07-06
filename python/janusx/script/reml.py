@@ -35,6 +35,7 @@ from scipy.sparse.linalg import spsolve
 from scipy.stats import t as student_t
 
 from janusx.assoc.workflow_model_packed import (
+    _splmm_exact_null_fit_from_grm,
     _splmm_normalize_sparse_grm_path,
     _splmm_sparse_grm_diag_stats,
     _splmm_sparse_null_fit,
@@ -633,9 +634,9 @@ def _render_summary_table(
         return ""
 
     if log_style:
-        headers = ["Trait", "N_Obs (Lines)", "Env / Fixed", "Random", "H2 (Broad)", "h2 (Narrow)", "PVEc"]
+        headers = ["Trait", "N_Obs (Lines)", "Env / Fixed", "Random", "H2 (Broad)", "h2 (Narrow)"]
     else:
-        headers = ["Trait", "N_Obs(Lines)", "Env/Fixed", "Random", "H2", "h2", "PVEc"]
+        headers = ["Trait", "N_Obs(Lines)", "Env/Fixed", "Random", "H2", "h2"]
 
     body: list[list[str]] = []
     for row in rows:
@@ -650,7 +651,6 @@ def _render_summary_table(
                 str(row.get("random_label", "None")),
                 _fmt_metric(row.get("hsqr")),
                 _fmt_metric(row.get("h2_narrow")),
-                _fmt_metric(row.get("pvec")),
             ]
         )
 
@@ -1546,14 +1546,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="FILE",
         help=(
-            "Optional precomputed Sparse GRM (.spgrm/.jxgrm). When provided, narrow-sense h2 is estimated via Sparse REML on the BLUE phenotype scale for fast debugging and narrow heritability checks."
+            "Optional precomputed Sparse GRM (.spgrm/.jxgrm). When provided, narrow-sense h2 is estimated via Sparse REML on the BLUE phenotype scale and reported as phenotype-scale PVE/h2 (GEMMA/GCTA/FvLMM-compatible); the raw variance-component ratio is retained separately for debugging."
         ),
     )
     opt.add_argument(
         "--spk-mode",
         dest="grm_sparse_mode",
         choices=("raw", "fastgwa"),
-        default="fastgwa",
+        default="raw",
         help=(
             "Sparse REML objective for -spk/--grm-sparse. "
             "`raw` uses JanusX profile REML on the sparse K directly; "
@@ -1691,7 +1691,7 @@ def main() -> None:
 
     narrow_path_label = "None"
     if grm_ctx is not None:
-        narrow_path_label = "BLUE -> GWAS null LMM"
+        narrow_path_label = "BLUE -> dense exact REML"
     elif sparse_grm_ctx is not None:
         narrow_path_label = (
             "BLUE -> Sparse REML"
@@ -1792,8 +1792,7 @@ def main() -> None:
                         "random_label": random_label,
                         "hsqr": np.nan,
                         "h2_narrow": np.nan,
-                        "pvec": np.nan,
-                        "h2_blue_raw": np.nan,
+                        "h2_narrow_vc_ratio_raw": np.nan,
                         "va_joint": np.nan,
                         "vline_joint": np.nan,
                         "noise_mean_joint": np.nan,
@@ -1809,8 +1808,7 @@ def main() -> None:
                         "narrow_lambda": np.nan,
                         "narrow_sigma_g2": np.nan,
                         "narrow_sigma_e2": np.nan,
-                        "narrow_mean_diag_k": np.nan,
-                        "narrow_pve_diag_scaled": np.nan,
+                        "narrow_grm_mean_diag": np.nan,
                         "narrow_nnz_k": np.nan,
                         "narrow_offdiag_density_k": np.nan,
                         "narrow_method": "skipped",
@@ -1989,8 +1987,7 @@ def main() -> None:
             )
 
             h2_narrow = np.nan
-            pvec = np.nan
-            h2_blue_raw = np.nan
+            h2_narrow_vc_ratio_raw = np.nan
             va_joint = np.nan
             vline_joint = np.nan
             noise_mean_joint = np.nan
@@ -1998,8 +1995,7 @@ def main() -> None:
             narrow_lambda = np.nan
             narrow_sigma_g2 = np.nan
             narrow_sigma_e2 = np.nan
-            narrow_mean_diag_k = np.nan
-            narrow_pve_diag_scaled = np.nan
+            narrow_grm_mean_diag = np.nan
             narrow_nnz_k = np.nan
             narrow_offdiag_density_k = np.nan
             narrow_method = "none"
@@ -2058,16 +2054,26 @@ def main() -> None:
                             #   exact/approx joint additive + line nonadditive REML
                             # is intentionally disabled for now. We currently use the
                             # BLUE phenotype directly in the GWAS null model.
+                            exact_null = _splmm_exact_null_fit_from_grm(
+                                grm=kinship,
+                                y_vec=kept[trait].to_numpy(dtype=float),
+                                x_cov=x_stage2,
+                                threads=int(args.thread),
+                            )
                             lmm = LMM(
                                 y=kept[trait].to_numpy(dtype=float),
                                 X=x_stage2,
                                 kinship=kinship,
                             )
-                            h2_blue_raw = float(lmm.pve) if np.isfinite(lmm.pve) else np.nan
-                            h2_narrow = h2_blue_raw
-                            pvec = np.nan
-                            narrow_lambda = float(lmm.lbd_null) if np.isfinite(float(lmm.lbd_null)) else np.nan
-                            narrow_method = "blue_null_lmm"
+                            h2_narrow_vc_ratio_raw = float(
+                                exact_null.get(
+                                    "pve_vc_ratio_raw",
+                                    exact_null.get("pve", float("nan")),
+                                )
+                            )
+                            h2_narrow = float(exact_null.get("pve", float("nan")))
+                            narrow_lambda = float(exact_null.get("lambda", float("nan")))
+                            narrow_method = "blue_null_dense_exact_reml"
                             if np.isfinite(hsqr) and np.isfinite(h2_narrow) and (h2_narrow > hsqr * 1.02):
                                 logger.warning(
                                     f"Trait {trait}: BLUE-null narrow h2 ({h2_narrow:.6g}) exceeds broad H2 ({hsqr:.6g}); broad and narrow estimators are on different effective scales."
@@ -2098,14 +2104,22 @@ def main() -> None:
                                 objective_mode=str(args.grm_sparse_mode),
                                 threads=int(args.thread),
                             )
-                            h2_blue_raw = float(sparse_null.get("pve", float("nan")))
-                            h2_narrow = h2_blue_raw
-                            pvec = float(sparse_null.get("pve_diag_scaled", float("nan")))
+                            h2_narrow = float(sparse_null.get("pve", float("nan")))
+                            h2_narrow_vc_ratio_raw = float(
+                                sparse_null.get(
+                                    "pve_vc_ratio_raw",
+                                    sparse_null.get("pve", float("nan")),
+                                )
+                            )
                             narrow_lambda = float(sparse_null.get("lambda", float("nan")))
                             narrow_sigma_g2 = float(sparse_null.get("sigma_g2", float("nan")))
                             narrow_sigma_e2 = float(sparse_null.get("sigma_e2", float("nan")))
-                            narrow_mean_diag_k = float(sparse_null.get("mean_diag_k", float("nan")))
-                            narrow_pve_diag_scaled = pvec
+                            narrow_grm_mean_diag = float(
+                                sparse_null.get(
+                                    "grm_mean_diag",
+                                    sparse_null.get("mean_diag_k", float("nan")),
+                                )
+                            )
                             narrow_nnz_k = float(sparse_null.get("nnz_k", float("nan")))
                             narrow_offdiag_density_k = float(sparse_null.get("offdiag_density_k", float("nan")))
                             narrow_method = (
@@ -2138,22 +2152,27 @@ def main() -> None:
             # logger.info(
             #     f"{success_symbol()} Trait={trait} | obs={used_obs} | lines={used_lines} | H2={_fmt_metric(hsqr)} | h2={_fmt_metric(h2_narrow)} | method={narrow_method} | elapsed={format_elapsed(time.time() - step_t0)}"
             # )
-            if np.isfinite(h2_blue_raw):
+            if np.isfinite(h2_narrow):
                 logger.info(
-                    f"  narrow(raw BLUE scale)={_fmt_metric(h2_blue_raw)}"
+                    f"  narrow(h2)={_fmt_metric(h2_narrow)}"
                 )
-            if np.isfinite(pvec):
+            if np.isfinite(h2_narrow_vc_ratio_raw) and np.isfinite(h2_narrow):
                 logger.info(
-                    f"  narrow(corrected sparse PVEc)={_fmt_metric(pvec)}"
+                    "  narrow(vc_ratio_raw)=%s%s",
+                    _fmt_metric(h2_narrow_vc_ratio_raw),
+                    (
+                        f" | grm_mean_diag={_fmt_metric(narrow_grm_mean_diag)}"
+                        if np.isfinite(narrow_grm_mean_diag)
+                        else ""
+                    ),
                 )
-            if np.isfinite(narrow_mean_diag_k) or np.isfinite(narrow_sigma_g2) or np.isfinite(narrow_sigma_e2):
+            if np.isfinite(narrow_grm_mean_diag) or np.isfinite(narrow_sigma_g2) or np.isfinite(narrow_sigma_e2):
                 logger.info(
-                    "  sparse lambda=%s | sigma_g2=%s | sigma_e2=%s | mean_diag(K)=%s | PVEc=%s | nnz(K)=%s | offdiag_density=%s",
+                    "  sparse lambda=%s | sigma_g2=%s | sigma_e2=%s | h2=%s | nnz(K)=%s | offdiag_density=%s",
                     _fmt_metric(narrow_lambda),
                     _fmt_metric(narrow_sigma_g2),
                     _fmt_metric(narrow_sigma_e2),
-                    _fmt_metric(narrow_mean_diag_k),
-                    _fmt_metric(pvec),
+                    _fmt_metric(h2_narrow),
                     _fmt_metric(narrow_nnz_k),
                     _fmt_metric(narrow_offdiag_density_k),
                 )
@@ -2173,8 +2192,11 @@ def main() -> None:
                     "random_label": random_label,
                     "hsqr": float(hsqr) if np.isfinite(hsqr) else np.nan,
                     "h2_narrow": float(h2_narrow) if np.isfinite(h2_narrow) else np.nan,
-                    "pvec": float(pvec) if np.isfinite(pvec) else np.nan,
-                    "h2_blue_raw": float(h2_blue_raw) if np.isfinite(h2_blue_raw) else np.nan,
+                    "h2_narrow_vc_ratio_raw": (
+                        float(h2_narrow_vc_ratio_raw)
+                        if np.isfinite(h2_narrow_vc_ratio_raw)
+                        else np.nan
+                    ),
                     "va_joint": float(va_joint) if np.isfinite(va_joint) else np.nan,
                     "vline_joint": float(vline_joint) if np.isfinite(vline_joint) else np.nan,
                     "noise_mean_joint": float(noise_mean_joint) if np.isfinite(noise_mean_joint) else np.nan,
@@ -2191,8 +2213,11 @@ def main() -> None:
                     "narrow_lambda": float(narrow_lambda) if np.isfinite(narrow_lambda) else np.nan,
                     "narrow_sigma_g2": float(narrow_sigma_g2) if np.isfinite(narrow_sigma_g2) else np.nan,
                     "narrow_sigma_e2": float(narrow_sigma_e2) if np.isfinite(narrow_sigma_e2) else np.nan,
-                    "narrow_mean_diag_k": float(narrow_mean_diag_k) if np.isfinite(narrow_mean_diag_k) else np.nan,
-                    "narrow_pve_diag_scaled": float(narrow_pve_diag_scaled) if np.isfinite(narrow_pve_diag_scaled) else np.nan,
+                    "narrow_grm_mean_diag": (
+                        float(narrow_grm_mean_diag)
+                        if np.isfinite(narrow_grm_mean_diag)
+                        else np.nan
+                    ),
                     "narrow_nnz_k": float(narrow_nnz_k) if np.isfinite(narrow_nnz_k) else np.nan,
                     "narrow_offdiag_density_k": float(narrow_offdiag_density_k) if np.isfinite(narrow_offdiag_density_k) else np.nan,
                     "narrow_method": narrow_method,
@@ -2217,8 +2242,7 @@ def main() -> None:
                     "random_label": random_label,
                     "hsqr": np.nan,
                     "h2_narrow": np.nan,
-                    "pvec": np.nan,
-                    "h2_blue_raw": np.nan,
+                    "h2_narrow_vc_ratio_raw": np.nan,
                     "va_joint": np.nan,
                     "vline_joint": np.nan,
                     "noise_mean_joint": np.nan,
@@ -2234,8 +2258,7 @@ def main() -> None:
                     "narrow_lambda": np.nan,
                     "narrow_sigma_g2": np.nan,
                     "narrow_sigma_e2": np.nan,
-                    "narrow_mean_diag_k": np.nan,
-                    "narrow_pve_diag_scaled": np.nan,
+                    "narrow_grm_mean_diag": np.nan,
                     "narrow_nnz_k": np.nan,
                     "narrow_offdiag_density_k": np.nan,
                     "narrow_method": "failed",

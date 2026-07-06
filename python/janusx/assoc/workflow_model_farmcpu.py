@@ -14,9 +14,7 @@ import psutil
 from janusx.script._common.genoio import (
     determine_genotype_source_force_kind_from_args,
     inspect_genotype_file,
-    packed_preload_is_disabled,
     packed_preload_is_ready,
-    prepare_packed_ctx_from_plink,
 )
 from janusx.script._common.memory import (
     bytes_to_gib,
@@ -696,130 +694,6 @@ def run_farmcpu_fullmem(
             "_qtn_stage_mode": True,
         }
 
-    def _load_bim_ref_alt_filtered(
-        prefix: str,
-        keep_mask: np.ndarray,
-        *,
-        snps_only_mode: bool,
-        return_metadata: bool = True,
-        emit_status: bool = True,
-    ) -> tuple[Union[pd.DataFrame, None], np.ndarray]:
-        bim_path = f"{prefix}.bim"
-        src = _basename_only(bim_path)
-        keep = np.ascontiguousarray(np.asarray(keep_mask, dtype=np.bool_).reshape(-1))
-        n_total = int(keep.shape[0])
-        if n_total == 0:
-            return (
-                (
-                    pd.DataFrame(columns=["chrom", "pos", "snp", "allele0", "allele1"])
-                    if bool(return_metadata)
-                    else None
-                ),
-                keep,
-            )
-
-        n_pre_keep = int(np.sum(keep))
-        if n_pre_keep == 0:
-            return (
-                (
-                    pd.DataFrame(columns=["chrom", "pos", "snp", "allele0", "allele1"])
-                    if bool(return_metadata)
-                    else None
-                ),
-                keep,
-            )
-
-        # Stream BIM and keep only SNPs that survive numeric filters, optionally
-        # applying SNP-only filtering in the same pass.
-        if bool(return_metadata):
-            chrom = np.empty(n_pre_keep, dtype=object)
-            pos = np.empty(n_pre_keep, dtype=np.int64)
-            snp = np.empty(n_pre_keep, dtype=object)
-            allele0 = np.empty(n_pre_keep, dtype=object)
-            allele1 = np.empty(n_pre_keep, dtype=object)
-        else:
-            chrom = pos = snp = allele0 = allele1 = None
-
-        pbar = (
-            _ProgressAdapter(
-                total=n_total,
-                desc=f"Loading site metadata ({src})",
-                logger=logger,
-                log_unit="row",
-            )
-            if bool(emit_status)
-            else None
-        )
-        lines = 0
-        done = 0
-        out = 0
-        try:
-            with open(bim_path, "r", encoding="utf-8", errors="replace") as fh:
-                for raw in fh:
-                    if lines >= n_total:
-                        raise ValueError(
-                            f"BIM has more rows than genotype matrix: bim>{n_total} ({src})"
-                        )
-                    idx = lines
-                    lines += 1
-
-                    if keep[idx]:
-                        parts = raw.strip().split()
-                        if len(parts) < 6:
-                            raise ValueError(
-                                f"Invalid BIM row at line {idx + 1}: expected >=6 columns."
-                            )
-                        a0 = str(parts[4])
-                        a1 = str(parts[5])
-                        if snps_only_mode and (len(a0) != 1 or len(a1) != 1):
-                            keep[idx] = False
-                        elif bool(return_metadata):
-                            chrom[out] = str(parts[0])
-                            raw_snp = str(parts[1]) if len(parts) > 1 else "."
-                            try:
-                                pval = int(parts[3])
-                            except Exception:
-                                try:
-                                    pval = int(float(parts[3]))
-                                except Exception:
-                                    pval = 0
-                            pos[out] = int(pval)
-                            snp[out] = raw_snp if raw_snp not in {"", ".", "nan", "NaN"} else f"{chrom[out]}_{int(pval)}"
-                            allele0[out] = a0
-                            allele1[out] = a1
-                            out += 1
-
-                    if (pbar is not None) and (lines - done >= 200_000):
-                        step = lines - done
-                        pbar.update(step)
-                        done = lines
-
-            if lines != n_total:
-                raise ValueError(
-                    f"BIM row count mismatch: bim={lines}, genotype={n_total} ({src})"
-                )
-            if (pbar is not None) and done < n_total:
-                pbar.update(n_total - done)
-            if pbar is not None:
-                pbar.finish()
-        finally:
-            if pbar is not None:
-                pbar.close()
-
-        if not bool(return_metadata):
-            return None, keep
-
-        ref_alt_df = pd.DataFrame(
-            {
-                "chrom": chrom[:out],
-                "pos": pos[:out].astype(int, copy=False),
-                "snp": snp[:out],
-                "allele0": allele0[:out],
-                "allele1": allele1[:out],
-            }
-        )
-        return ref_alt_df, keep
-
     def _load_farmcpu_packed_ctx(
         packed_prefix: str,
         expected_n_samples: int,
@@ -828,331 +702,81 @@ def run_farmcpu_fullmem(
         trait_prepared_meta: Union[dict[str, object], None] = None,
         emit_status: bool = True,
     ) -> tuple[dict[str, object], object]:
-        if isinstance(trait_prepared_meta, dict):
-            from janusx.assoc.workflow_model_packed import (
-                _coerce_trait_prepared_scan_meta,
-                _prepare_packed_bed_once_for_gwas,
-            )
+        from janusx.assoc.workflow_model_packed import (
+            _coerce_trait_prepared_scan_meta,
+            _gwas_logic_meta_global_cached,
+            _prepare_packed_bed_once_for_gwas,
+        )
 
-            prepared_scan_meta = _coerce_trait_prepared_scan_meta(trait_prepared_meta)
-            if prepared_scan_meta is not None:
-                row_idx_prepared, miss_rate_prepared, maf_prepared, row_flip_prepared = prepared_scan_meta
-
-                packed_ctx_full_obj = None
-                if isinstance(farmcpu_cache, dict):
-                    packed_ctx_full_candidate = farmcpu_cache.get("_packed_ctx_full")
-                    if isinstance(packed_ctx_full_candidate, dict):
-                        packed_ctx_full_obj = packed_ctx_full_candidate
-
-                if packed_ctx_full_obj is None:
-                    preloaded_packed_ready_local = (
-                        preloaded_packed if packed_preload_is_ready(preloaded_packed) else None
-                    )
-                    if (
-                        isinstance(preloaded_packed_ready_local, dict)
-                        and str(preloaded_packed_ready_local.get("prefix", "")).strip()
-                        == str(packed_prefix).strip()
-                    ):
-                        packed_ctx_preloaded_obj = preloaded_packed_ready_local.get("packed_ctx")
-                        if isinstance(packed_ctx_preloaded_obj, dict):
-                            packed_ctx_full_obj = packed_ctx_preloaded_obj
-
-                packed_ctx_prepared: Union[dict[str, object], None] = None
-                packed_rows_full = 0
-                if isinstance(packed_ctx_full_obj, dict):
-                    packed_mode_full = str(
-                        packed_ctx_full_obj.get("packed_filter_mode", "")
-                    ).strip().lower()
-                    if packed_mode_full == "lazy_full":
-                        packed_num_full = np.ascontiguousarray(
-                            np.asarray(packed_ctx_full_obj["packed"], dtype=np.uint8)
-                        )
-                        packed_rows_full = int(packed_num_full.shape[0])
-                        if (
-                            int(row_idx_prepared.shape[0]) > 0
-                            and int(row_idx_prepared.min()) >= 0
-                            and int(row_idx_prepared.max()) < packed_rows_full
-                        ):
-                            site_keep_prepared = np.zeros((packed_rows_full,), dtype=np.bool_)
-                            site_keep_prepared[row_idx_prepared] = True
-                            packed_ctx_prepared = {
-                                "packed": packed_num_full,
-                                "missing_rate": miss_rate_prepared,
-                                "af": maf_prepared,
-                                "maf": maf_prepared,
-                                "row_flip": row_flip_prepared,
-                                "site_keep": site_keep_prepared,
-                                "active_row_idx": row_idx_prepared,
-                                "row_indices": row_idx_prepared,
-                                "packed_filter_mode": "lazy_full",
-                                "packed_storage": str(
-                                    packed_ctx_full_obj.get("packed_storage", "owned")
-                                ),
-                                "n_samples": int(packed_ctx_full_obj["n_samples"]),
-                                "n_total_sites": int(packed_rows_full),
-                                "n_active_sites": int(row_idx_prepared.shape[0]),
-                                "source_prefix": str(packed_prefix),
-                            }
-                            if isinstance(farmcpu_cache, dict) and "_packed_ctx_full" not in farmcpu_cache:
-                                farmcpu_cache["_packed_ctx_full"] = packed_ctx_full_obj
-
-                if packed_ctx_prepared is None:
-                    try:
-                        if bool(emit_status):
-                            with CliStatus(f"{status_label}...", enabled=bool(use_spinner)) as task:
-                                try:
-                                    _sample_ids_packed, packed_ctx_full_loaded = prepare_packed_ctx_from_plink(
-                                        str(packed_prefix),
-                                        maf=float(args.maf),
-                                        missing_rate=float(args.geno),
-                                        snps_only=False,
-                                        expected_n_samples=int(expected_n_samples),
-                                        filter_mode="lazy_owned",
-                                    )
-                                except Exception:
-                                    task.fail(f"{status_label} ...Failed")
-                                    raise
-                                task.complete(f"{status_label} ...Finished")
-                        else:
-                            _sample_ids_packed, packed_ctx_full_loaded = prepare_packed_ctx_from_plink(
-                                str(packed_prefix),
-                                maf=float(args.maf),
-                                missing_rate=float(args.geno),
-                                snps_only=False,
-                                expected_n_samples=int(expected_n_samples),
-                                filter_mode="lazy_owned",
-                            )
-                        packed_ctx_full_obj = {
-                            "packed": np.ascontiguousarray(
-                                np.asarray(packed_ctx_full_loaded["packed"], dtype=np.uint8)
-                            ),
-                            "missing_rate": np.ascontiguousarray(
-                                np.asarray(
-                                    packed_ctx_full_loaded["missing_rate"],
-                                    dtype=np.float32,
-                                ).reshape(-1),
-                                dtype=np.float32,
-                            ),
-                            "af": np.ascontiguousarray(
-                                np.asarray(
-                                    packed_ctx_full_loaded.get(
-                                        "af",
-                                        packed_ctx_full_loaded["maf"],
-                                    ),
-                                    dtype=np.float32,
-                                ).reshape(-1),
-                                dtype=np.float32,
-                            ),
-                            "maf": np.ascontiguousarray(
-                                np.asarray(
-                                    packed_ctx_full_loaded.get(
-                                        "af",
-                                        packed_ctx_full_loaded["maf"],
-                                    ),
-                                    dtype=np.float32,
-                                ).reshape(-1),
-                                dtype=np.float32,
-                            ),
-                            "row_flip": np.ascontiguousarray(
-                                np.asarray(
-                                    packed_ctx_full_loaded["row_flip"],
-                                    dtype=np.bool_,
-                                ).reshape(-1),
-                                dtype=np.bool_,
-                            ),
-                            "site_keep": np.ascontiguousarray(
-                                np.asarray(
-                                    packed_ctx_full_loaded.get("site_keep"),
-                                    dtype=np.bool_,
-                                ).reshape(-1),
-                                dtype=np.bool_,
-                            ) if packed_ctx_full_loaded.get("site_keep", None) is not None else None,
-                            "active_row_idx": np.ascontiguousarray(
-                                np.asarray(
-                                    packed_ctx_full_loaded.get(
-                                        "active_row_idx",
-                                        np.arange(
-                                            int(np.asarray(packed_ctx_full_loaded["packed"]).shape[0]),
-                                            dtype=np.int64,
-                                        ),
-                                    ),
-                                    dtype=np.int64,
-                                ).reshape(-1),
-                                dtype=np.int64,
-                            ),
-                            "packed_filter_mode": str(
-                                packed_ctx_full_loaded.get("packed_filter_mode", "lazy_full")
-                            ),
-                            "packed_storage": str(
-                                packed_ctx_full_loaded.get("packed_storage", "owned")
-                            ),
-                            "n_samples": int(packed_ctx_full_loaded["n_samples"]),
-                            "source_prefix": str(packed_prefix),
-                        }
-                        if isinstance(farmcpu_cache, dict):
-                            farmcpu_cache["_packed_ctx_full"] = packed_ctx_full_obj
-                        packed_num_full = np.ascontiguousarray(
-                            np.asarray(packed_ctx_full_obj["packed"], dtype=np.uint8)
-                        )
-                        packed_rows_full = int(packed_num_full.shape[0])
-                        if int(row_idx_prepared.shape[0]) == 0 or int(row_idx_prepared.max()) >= packed_rows_full:
-                            raise ValueError(
-                                "FarmCPU trait-prepared row indices exceed lazy-owned packed bounds."
-                            )
-                        site_keep_prepared = np.zeros((packed_rows_full,), dtype=np.bool_)
-                        site_keep_prepared[row_idx_prepared] = True
-                        packed_ctx_prepared = {
-                            "packed": packed_num_full,
-                            "missing_rate": miss_rate_prepared,
-                            "af": maf_prepared,
-                            "maf": maf_prepared,
-                            "row_flip": row_flip_prepared,
-                            "site_keep": site_keep_prepared,
-                            "active_row_idx": row_idx_prepared,
-                            "row_indices": row_idx_prepared,
-                            "packed_filter_mode": "lazy_full",
-                            "packed_storage": "owned",
-                            "n_samples": int(packed_ctx_full_obj["n_samples"]),
-                            "n_total_sites": int(packed_rows_full),
-                            "n_active_sites": int(row_idx_prepared.shape[0]),
-                            "source_prefix": str(packed_prefix),
-                        }
-                    except Exception:
-                        packed_ctx_prepared = None
-
-                if packed_ctx_prepared is not None:
-                    ref_alt_prepared = _make_deferred_bim_metadata(
-                        str(packed_prefix),
-                        row_idx_prepared,
-                        n_markers=int(row_idx_prepared.shape[0]),
-                    )
-                    return packed_ctx_prepared, ref_alt_prepared
-
-            _prefix_loaded, _full_ids_loaded, packed_ctx_prepared, _sites_meta = _prepare_packed_bed_once_for_gwas(
-                genofile=str(packed_prefix),
+        prepared_scan_meta = _coerce_trait_prepared_scan_meta(trait_prepared_meta)
+        effective_scan_meta = (
+            trait_prepared_meta if prepared_scan_meta is not None else None
+        )
+        if effective_scan_meta is None:
+            effective_scan_meta = _gwas_logic_meta_global_cached(
+                str(packed_prefix),
                 maf_threshold=float(args.maf),
                 max_missing_rate=float(args.geno),
                 het_threshold=float(args.het),
                 snps_only=bool(snps_only),
+                outprefix=(
+                    str(outfolder)
+                    if str(outfolder).strip() != ""
+                    else None
+                ),
+                logger=logger,
                 use_spinner=bool(use_spinner),
-                preloaded_packed=None,
-                load_site_meta=False,
-                status_label=str(status_label),
-                trait_prepared_meta=trait_prepared_meta,
                 emit_status=bool(emit_status),
             )
-            row_idx_prepared = np.ascontiguousarray(
-                np.asarray(
-                    packed_ctx_prepared.get(
-                        "row_indices",
-                        packed_ctx_prepared.get("active_row_idx", []),
-                    ),
-                    dtype=np.int64,
-                ).reshape(-1),
-                dtype=np.int64,
-            )
-            if int(row_idx_prepared.shape[0]) == 0:
-                raise ValueError("FarmCPU trait-prepared packed context produced zero active SNPs.")
-            ref_alt_prepared = _make_deferred_bim_metadata(
-                str(packed_prefix),
-                row_idx_prepared,
-                n_markers=int(row_idx_prepared.shape[0]),
-            )
-            return packed_ctx_prepared, ref_alt_prepared
 
         packed_load_t0 = time.monotonic()
-        if bool(emit_status):
-            with CliStatus(f"{status_label}...", enabled=bool(use_spinner)) as task:
-                try:
-                    _sample_ids_packed, packed_ctx_raw = prepare_packed_ctx_from_plink(
-                        str(packed_prefix),
-                        maf=float(args.maf),
-                        missing_rate=float(args.geno),
-                        snps_only=False,
-                        expected_n_samples=int(expected_n_samples),
-                        filter_mode="lazy_owned",
-                    )
-                except Exception:
-                    task.fail(f"{status_label} ...Failed")
-                    raise
-                task.complete(f"{status_label} ...Finished")
-        else:
-            _sample_ids_packed, packed_ctx_raw = prepare_packed_ctx_from_plink(
-                str(packed_prefix),
-                maf=float(args.maf),
-                missing_rate=float(args.geno),
-                snps_only=False,
-                expected_n_samples=int(expected_n_samples),
-                filter_mode="lazy_owned",
+        _prefix_loaded, _full_ids_loaded, packed_ctx_loaded, _sites_meta = _prepare_packed_bed_once_for_gwas(
+            genofile=str(packed_prefix),
+            maf_threshold=float(args.maf),
+            max_missing_rate=float(args.geno),
+            het_threshold=float(args.het),
+            snps_only=bool(snps_only),
+            use_spinner=bool(use_spinner),
+            preloaded_packed=None,
+            load_site_meta=False,
+            status_label=str(status_label),
+            trait_prepared_meta=effective_scan_meta,
+            emit_status=bool(emit_status),
+        )
+        full_ids_loaded = np.asarray(_full_ids_loaded, dtype=str).reshape(-1)
+        if (
+            int(expected_n_samples) > 0
+            and int(full_ids_loaded.shape[0]) > 0
+            and int(full_ids_loaded.shape[0]) != int(expected_n_samples)
+        ):
+            raise ValueError(
+                "FarmCPU packed sample count mismatch: "
+                f"expected={int(expected_n_samples)}, loaded={int(full_ids_loaded.shape[0])}."
             )
-
         _log_file_only(
             logger,
             logging.INFO,
             f"{status_label} ({int(expected_n_samples)} samples) "
             f"[{format_elapsed(time.monotonic() - packed_load_t0)}]",
         )
-
-        keep_numeric = np.ascontiguousarray(
-            np.asarray(packed_ctx_raw["site_keep"], dtype=np.bool_).reshape(-1),
-            dtype=np.bool_,
-        )
-        _ref_alt_df, keep_final = _load_bim_ref_alt_filtered(
-            str(packed_prefix),
-            keep_numeric,
-            snps_only_mode=bool(snps_only),
-            return_metadata=False,
-            emit_status=False,
-        )
-        if not np.any(keep_final):
-            raise ValueError("After filtering, number of SNPs is zero for FarmCPU.")
-
-        packed_num = np.ascontiguousarray(np.asarray(packed_ctx_raw["packed"], dtype=np.uint8))
-        miss_num = np.ascontiguousarray(
-            np.asarray(packed_ctx_raw["missing_rate"], dtype=np.float32).reshape(-1),
-            dtype=np.float32,
-        )
-        maf_num = np.ascontiguousarray(
-            np.asarray(packed_ctx_raw.get("af", packed_ctx_raw["maf"]), dtype=np.float32).reshape(-1),
-            dtype=np.float32,
-        )
-        active_row_idx = np.ascontiguousarray(
-            np.flatnonzero(keep_final).astype(np.int64, copy=False),
+        row_idx_loaded = np.ascontiguousarray(
+            np.asarray(
+                packed_ctx_loaded.get(
+                    "row_indices",
+                    packed_ctx_loaded.get("active_row_idx", []),
+                ),
+                dtype=np.int64,
+            ).reshape(-1),
             dtype=np.int64,
         )
-        miss_arr = np.ascontiguousarray(miss_num[active_row_idx], dtype=np.float32)
-        maf_arr = np.ascontiguousarray(maf_num[active_row_idx], dtype=np.float32)
-
-        row_flip_raw = packed_ctx_raw.get("row_flip")
-        if row_flip_raw is None:
-            row_flip_raw = np.zeros(int(packed_num.shape[0]), dtype=np.bool_)
-        row_flip_full = np.ascontiguousarray(
-            np.asarray(row_flip_raw, dtype=np.bool_).reshape(-1),
-            dtype=np.bool_,
-        )
-        if int(row_flip_full.shape[0]) != int(packed_num.shape[0]):
-            raise ValueError("Packed row_flip length mismatch for FarmCPU packed context.")
-        row_flip_arr = np.ascontiguousarray(row_flip_full[active_row_idx], dtype=np.bool_)
-
-        loaded_snps = int(active_row_idx.shape[0])
-        ref_alt = _make_deferred_bim_metadata(
+        if int(row_idx_loaded.shape[0]) == 0:
+            raise ValueError("FarmCPU packed context produced zero active SNPs.")
+        ref_alt_loaded = _make_deferred_bim_metadata(
             str(packed_prefix),
-            active_row_idx,
-            n_markers=loaded_snps,
+            row_idx_loaded,
+            n_markers=int(row_idx_loaded.shape[0]),
         )
-        packed_ctx = {
-            "packed": packed_num,
-            "missing_rate": miss_arr,
-            "af": maf_arr,
-            "maf": maf_arr,
-            "row_flip": row_flip_arr,
-            "row_indices": active_row_idx,
-            "site_keep": np.ascontiguousarray(keep_final, dtype=np.bool_),
-            "packed_filter_mode": "lazy_full",
-            "n_samples": int(packed_ctx_raw["n_samples"]),
-            "source_prefix": str(packed_prefix),
-        }
-        return packed_ctx, ref_alt
+        return packed_ctx_loaded, ref_alt_loaded
 
     if farmcpu_cache is None:
         t_loading = time.time()

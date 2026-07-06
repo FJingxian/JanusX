@@ -904,6 +904,53 @@ def lmm_reml_null(
     return lbd, ml, reml
 
 
+def _lmm_profile_exact_vc(
+    S: np.ndarray,
+    Xcov: np.ndarray,
+    y_rot: np.ndarray,
+    lbd: float,
+) -> tuple[float, float]:
+    """
+    Profile REML variance components on the full-rank spectralized null model.
+    """
+    lbd_f = float(lbd)
+    if not np.isfinite(lbd_f) or lbd_f <= 0.0:
+        return float("nan"), float("nan")
+
+    s = np.ascontiguousarray(
+        np.maximum(np.asarray(S, dtype=np.float64).reshape(-1), 0.0),
+        dtype=np.float64,
+    )
+    x = np.ascontiguousarray(np.asarray(Xcov, dtype=np.float64), dtype=np.float64)
+    y = np.ascontiguousarray(np.asarray(y_rot, dtype=np.float64).reshape(-1), dtype=np.float64)
+    if x.ndim != 2:
+        raise ValueError("Exact VC profiling expects 2D rotated covariates.")
+    n, p = int(x.shape[0]), int(x.shape[1])
+    if int(s.shape[0]) != n or int(y.shape[0]) != n:
+        raise ValueError(
+            f"Exact VC profiling spectral shape mismatch: len(S)={s.shape[0]}, Xcov={x.shape}, y={y.shape}"
+        )
+    n_minus_p = n - p
+    if n_minus_p <= 0:
+        return float("nan"), float("nan")
+
+    v_inv = 1.0 / np.maximum(s + lbd_f, 1e-30)
+    xt_vinv_x = (x.T * v_inv) @ x
+    xt_vinv_y = (x.T * v_inv) @ y
+    try:
+        beta = np.linalg.solve(xt_vinv_x, xt_vinv_y)
+    except np.linalg.LinAlgError:
+        beta = np.linalg.lstsq(xt_vinv_x, xt_vinv_y, rcond=None)[0]
+    resid = y - (x @ beta)
+    rtv_invr = float(np.dot(v_inv, np.square(resid)))
+    if not np.isfinite(rtv_invr) or rtv_invr <= 0.0:
+        return float("nan"), float("nan")
+
+    sigma_g2 = float(rtv_invr / float(n_minus_p))
+    sigma_e2 = float(lbd_f * sigma_g2)
+    return sigma_g2, sigma_e2
+
+
 def lmm_ml_null(
     S: np.ndarray,
     utx: np.ndarray,
@@ -1720,6 +1767,11 @@ class LMM:
         self.u2ty = None
         self._fvlmm_assoc_cache = None
         self._fvlmm_assoc_cache_log10_lbd = None
+        self.sigma_g2_null = float("nan")
+        self.sigma_e2_null = float("nan")
+        self.pve_pheno_scale = float("nan")
+        self.pve_vc_ratio_raw = float("nan")
+        self.pve_component_ratio_raw = float("nan")
 
         if self.lowrank:
             (
@@ -1759,6 +1811,8 @@ class LMM:
                 model="add",
             )
             vg_null = float(self.trace_mean)
+            sigma_g2_null = float("nan")
+            sigma_e2_null = float("nan")
         else:
             self.S = s_full
             self.Dh = np.ascontiguousarray(u_full.T.astype(np.float32), dtype=np.float32)
@@ -1783,10 +1837,37 @@ class LMM:
                 max_iter=50,
                 tol=1e-3,
             )
+            sigma_g2_null, sigma_e2_null = _lmm_profile_exact_vc(
+                self.S,
+                self.Xcov,
+                self.y,
+                lbd_null,
+            )
             vg_null = float(np.mean(np.clip(self.S, 0.0, None)))
 
         self.lbd_null = float(lbd_null)
-        self.pve = float(vg_null / (vg_null + self.lbd_null)) if (vg_null + self.lbd_null) > 0 else float("nan")
+        self.sigma_g2_null = float(sigma_g2_null)
+        self.sigma_e2_null = float(sigma_e2_null)
+        sigma_sum_null = float(self.sigma_g2_null + self.sigma_e2_null)
+        if np.isfinite(sigma_sum_null) and sigma_sum_null > 0.0:
+            self.pve_vc_ratio_raw = float(self.sigma_g2_null / sigma_sum_null)
+            self.pve_component_ratio_raw = self.pve_vc_ratio_raw
+            var_g_diag_scaled = float(self.sigma_g2_null) * max(float(self.trace_mean), 0.0)
+            denom_diag_scaled = float(var_g_diag_scaled + self.sigma_e2_null)
+            self.pve = (
+                float(var_g_diag_scaled / denom_diag_scaled)
+                if np.isfinite(denom_diag_scaled) and denom_diag_scaled > 0.0
+                else self.pve_vc_ratio_raw
+            )
+        else:
+            self.pve = (
+                float(vg_null / (vg_null + self.lbd_null))
+                if (vg_null + self.lbd_null) > 0
+                else float("nan")
+            )
+            self.pve_vc_ratio_raw = float("nan")
+            self.pve_component_ratio_raw = float("nan")
+        self.pve_pheno_scale = float(self.pve)
         self.LL0 = float(reml)
         self.ML0 = float(ml0)
         if self.pve > 0.95 or self.pve < 0.05 or (not np.isfinite(self.lbd_null)) or self.lbd_null <= 0.0:
@@ -1807,6 +1888,11 @@ class LMM:
             "y",
             "lbd_null",
             "pve",
+            "pve_pheno_scale",
+            "pve_vc_ratio_raw",
+            "pve_component_ratio_raw",
+            "sigma_g2_null",
+            "sigma_e2_null",
             "LL0",
             "ML0",
             "bounds",

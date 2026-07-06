@@ -2615,7 +2615,7 @@ def _emit_gs_summary(
         "R2",
         "MSE",
         "MAE",
-        "PVE",
+        "PVE(ph)",
         "Time(s)",
     ]
     out_rows: list[list[str]] = []
@@ -5846,6 +5846,7 @@ def _estimate_rrblup_lambda_subsample_reml(
                     "vc_sigma_g2": float(he_sigma_g2),
                     "vc_sigma_e2": float(he_sigma_e2),
                     "vc_pve": float(he_diag.get("h2", np.nan)),
+                    "vc_pve_pheno_scale": float(he_diag.get("h2", np.nan)),
                     "m_effective_vc": int(max(1, he_m_eff if he_m_eff > 0 else int(m_effective))),
                 }
             ))
@@ -5863,6 +5864,7 @@ def _estimate_rrblup_lambda_subsample_reml(
                     "vc_sigma_g2": float(he_sigma_g2),
                     "vc_sigma_e2": float(he_sigma_e2),
                     "vc_pve": float(he_diag.get("h2", np.nan)),
+                    "vc_pve_pheno_scale": float(he_diag.get("h2", np.nan)),
                     "m_effective_vc": int(max(1, he_m_eff if he_m_eff > 0 else int(m_effective))),
                 }
             ))
@@ -5894,6 +5896,7 @@ def _estimate_rrblup_lambda_subsample_reml(
             "vc_sigma_g2": float(vc_sigma_g2),
             "vc_sigma_e2": float(vc_sigma_e2),
             "vc_pve": float(vc_pve),
+            "vc_pve_pheno_scale": float(vc_pve),
         }
         if m_effective_vc is not None and int(m_effective_vc) > 0:
             payload["m_effective_vc"] = int(m_effective_vc)
@@ -6431,12 +6434,12 @@ def _estimate_bayes_auto_r2_from_blup(
     seed_offset: int = 0,
 ) -> tuple[float, str, int, int]:
     """
-    Estimate Bayes auto-r2 (BLUP PVE) with optional large-n subsampling.
+    Estimate Bayes auto-r2 (BLUP phenotype-scale PVE) with optional large-n subsampling.
 
     Returns
     -------
     r2_blup : float
-        Estimated BLUP PVE before clipping.
+        Estimated BLUP phenotype-scale PVE before clipping.
     source : str
         Estimation source label.
     n_used : int
@@ -8263,7 +8266,7 @@ def GSapi(
         Mutable runtime state sink for packed Rust GBLUP diagnostics
         (eigh backend/time, REML lambda/likelihood).
     bayes_auto_r2 : float, optional
-        Optional precomputed BLUP PVE used as Bayes `r2` prior. When omitted,
+        Optional precomputed BLUP phenotype-scale PVE used as Bayes `r2` prior. When omitted,
         Bayes models estimate it internally from BLUP.
     bayes_runtime_state : dict, optional
         Mutable state sink for Bayes diagnostics (e.g. resolved `r2` source/value).
@@ -8413,6 +8416,7 @@ def GSapi(
                 "lambda_vc_sigma_g2",
                 "lambda_vc_sigma_e2",
                 "lambda_vc_pve",
+                "lambda_vc_pve_pheno_scale",
             )
             if lambda_info is None:
                 for k in he_keys:
@@ -8494,6 +8498,7 @@ def GSapi(
             _set_float("lambda_vc_sigma_g2", "vc_sigma_g2")
             _set_float("lambda_vc_sigma_e2", "vc_sigma_e2")
             _set_float("lambda_vc_pve", "vc_pve")
+            _set_float("lambda_vc_pve_pheno_scale", "vc_pve_pheno_scale")
 
         def _recover_trainvar_from_pve(
             pve_hint: float,
@@ -8598,6 +8603,7 @@ def GSapi(
             )
             if np.isfinite(pve_use):
                 rrblup_runtime_state["pve_trainvar"] = float(pve_use)
+                rrblup_runtime_state["pve_pheno_scale_trainvar"] = float(pve_use)
 
         def _sync_gblup_trainvar_state(
             *,
@@ -8618,6 +8624,7 @@ def GSapi(
             )
             if np.isfinite(pve_use):
                 gblup_runtime_state["pve_trainvar"] = float(pve_use)
+                gblup_runtime_state["pve_pheno_scale_trainvar"] = float(pve_use)
             var_g = _recover_trainvar_from_pve(float(pve_use), float(sigma_e2))
             if not np.isfinite(var_g):
                 return
@@ -9692,14 +9699,19 @@ def GSapi(
                     _sync_rrblup_he_state(rrblup_runtime_state, lambda_auto_info)
                     rrblup_runtime_state["pve_mode_used"] = str(pve_mode)
                     rrblup_runtime_state["pve_used"] = float(pve)
+                    rrblup_runtime_state["pve_pheno_scale"] = float(pve)
                     rrblup_runtime_state["pve_lambda"] = float(pve_lambda)
+                    rrblup_runtime_state["pve_pheno_scale_lambda"] = float(pve_lambda)
                     rrblup_runtime_state["pve_lambda_formula"] = float(pve_lambda_formula)
                     rrblup_runtime_state["pve_lambda_trace"] = float(pve_lambda_trace)
                     rrblup_runtime_state["pve_trainvar"] = float(pve_trainvar_report)
+                    rrblup_runtime_state["pve_pheno_scale_trainvar"] = float(pve_trainvar_report)
                     if np.isfinite(pve_vc):
                         rrblup_runtime_state["pve_vc"] = float(pve_vc)
+                        rrblup_runtime_state["pve_pheno_scale_vc"] = float(pve_vc)
                     else:
                         rrblup_runtime_state.pop("pve_vc", None)
+                        rrblup_runtime_state.pop("pve_pheno_scale_vc", None)
                     if np.isfinite(lambda_reml_vc):
                         rrblup_runtime_state["lambda_reml"] = float(lambda_reml_vc)
                     else:
@@ -10094,8 +10106,11 @@ def GSapi(
             if rrblup_runtime_state is not None:
                 rrblup_runtime_state["pve_mode_used"] = str(pve_mode)
                 rrblup_runtime_state["pve_used"] = float(pve)
+                rrblup_runtime_state["pve_pheno_scale"] = float(pve)
                 rrblup_runtime_state["pve_lambda"] = float(pve_lambda)
+                rrblup_runtime_state["pve_pheno_scale_lambda"] = float(pve_lambda)
                 rrblup_runtime_state["pve_trainvar"] = float(pve_trainvar)
+                rrblup_runtime_state["pve_pheno_scale_trainvar"] = float(pve_trainvar)
                 rrblup_runtime_state["lambda_equation"] = float(lambda_eq)
                 rrblup_runtime_state["m_effective"] = int(m_eff)
             if model_state is not None:
@@ -10629,9 +10644,13 @@ def GSapi(
                     rrblup_runtime_state["eigh_backend"] = str(eig_backend_exact)
                     rrblup_runtime_state["m_effective"] = int(m_effective_exact)
                     rrblup_runtime_state["pve_used"] = float(pve)
+                    rrblup_runtime_state["pve_pheno_scale"] = float(pve)
                     rrblup_runtime_state["pve_exact"] = float(pve)
+                    rrblup_runtime_state["pve_pheno_scale_exact"] = float(pve)
                     rrblup_runtime_state["pve_trainvar"] = float(pve)
+                    rrblup_runtime_state["pve_pheno_scale_trainvar"] = float(pve)
                     rrblup_runtime_state["pve_lambda"] = float("nan")
+                    rrblup_runtime_state["pve_pheno_scale_lambda"] = float("nan")
                     rrblup_runtime_state["pve_mode_used"] = "exact_reml"
                 if model_state is not None:
                     model_state["kind"] = "rrblup_linear"
@@ -10803,11 +10822,15 @@ def GSapi(
                 rrblup_runtime_state["selected_lambda"] = float(rr_exact_lambda_reml)
                 rrblup_runtime_state["lambda_source"] = "reml_exact_fast"
             rrblup_runtime_state["pve_used"] = float(model.pve)
+            rrblup_runtime_state["pve_pheno_scale"] = float(model.pve)
             rrblup_runtime_state["pve_exact"] = float(model.pve)
+            rrblup_runtime_state["pve_pheno_scale_exact"] = float(model.pve)
             # Exact rrBLUP follows REML/variance-component PVE from pyBLUP.
             # Keep trainvar slot aligned to the reported PVE for unified logging.
             rrblup_runtime_state["pve_trainvar"] = float(model.pve)
+            rrblup_runtime_state["pve_pheno_scale_trainvar"] = float(model.pve)
             rrblup_runtime_state["pve_lambda"] = float("nan")
+            rrblup_runtime_state["pve_pheno_scale_lambda"] = float("nan")
             rrblup_runtime_state["pve_mode_used"] = "exact_reml"
         if method == "rrBLUP" and model_state is not None:
             beta_fix = np.asarray(getattr(model, "beta", np.asarray([[0.0]], dtype=np.float64)), dtype=np.float64)
@@ -11512,17 +11535,25 @@ def _run_method_task(
         if solver_eff == "pcg":
             pve_candidates.extend(
                 [
+                    state.get("lambda_vc_pve_pheno_scale", np.nan),
                     state.get("lambda_vc_pve", np.nan),
+                    state.get("pve_pheno_scale_vc", np.nan),
+                    state.get("pve_pheno_scale_trainvar", np.nan),
                     state.get("pve_trainvar", np.nan),
+                    state.get("pve_pheno_scale", np.nan),
                     state.get("pve_used", np.nan),
                 ]
             )
         else:
             pve_candidates.extend(
                 [
+                    state.get("pve_pheno_scale_trainvar", np.nan),
                     state.get("pve_trainvar", np.nan),
+                    state.get("pve_pheno_scale_exact", np.nan),
                     state.get("pve_exact", np.nan),
+                    state.get("pve_pheno_scale", np.nan),
                     state.get("pve_used", np.nan),
+                    state.get("lambda_vc_pve_pheno_scale", np.nan),
                     state.get("lambda_vc_pve", np.nan),
                 ]
             )
@@ -11578,15 +11609,20 @@ def _run_method_task(
             "va",
             "vd",
             "h2",
+            "pve_pheno_scale_trainvar",
             "lambda_reml",
             "pve_trainvar",
         ):
             val = _float_or_nan(state.get(key, np.nan))
             if np.isfinite(val):
                 row[key] = float(val)
+        if "pve_pheno_scale_trainvar" not in row:
+            pve_alias = _float_or_nan(state.get("pve_trainvar", np.nan))
+            if np.isfinite(pve_alias):
+                row["pve_pheno_scale_trainvar"] = float(pve_alias)
         if "var_g" not in row:
             var_g = _trainvar_from_pve_ve(
-                row.get("pve_trainvar", row.get("h2", np.nan)),
+                row.get("pve_pheno_scale_trainvar", row.get("pve_trainvar", row.get("h2", np.nan))),
                 row.get("sigma_e2", np.nan),
             )
             if np.isfinite(var_g):
@@ -11624,6 +11660,7 @@ def _run_method_task(
             "va",
             "vd",
             "h2",
+            "pve_pheno_scale_trainvar",
             "lambda_reml",
             "pve_trainvar",
         ):
@@ -11646,7 +11683,7 @@ def _run_method_task(
             )
         if "var_g" not in out:
             var_g = _trainvar_from_pve_ve(
-                out.get("pve_trainvar", out.get("h2", np.nan)),
+                out.get("pve_pheno_scale_trainvar", out.get("pve_trainvar", out.get("h2", np.nan))),
                 out.get("sigma_e2", np.nan),
             )
             if np.isfinite(var_g):
@@ -12400,10 +12437,17 @@ def _run_method_task(
                     if rr_cfg_mode not in {"lambda", "trainvar"}:
                         rr_cfg_mode = "lambda"
                     pve_used_f = _float_or_nan(pve)
-                    pve_trainvar_f = _float_or_nan(rr_state_call.get("pve_trainvar", np.nan))
-                    pve_lambda_f = _float_or_nan(rr_state_call.get("pve_lambda", np.nan))
+                    pve_trainvar_f = _float_or_nan(
+                        rr_state_call.get("pve_pheno_scale_trainvar", rr_state_call.get("pve_trainvar", np.nan))
+                    )
+                    pve_lambda_f = _float_or_nan(
+                        rr_state_call.get("pve_pheno_scale_lambda", rr_state_call.get("pve_lambda", np.nan))
+                    )
                     pve_vc_f = _float_or_nan(
-                        rr_state_call.get("pve_vc", rr_state_call.get("pve_used", np.nan))
+                        rr_state_call.get(
+                            "pve_pheno_scale_vc",
+                            rr_state_call.get("pve_vc", rr_state_call.get("pve_pheno_scale", rr_state_call.get("pve_used", np.nan))),
+                        )
                     )
                     if (not np.isfinite(pve_trainvar_f)) and rr_cfg_mode == "trainvar":
                         pve_trainvar_f = pve_used_f
@@ -12442,10 +12486,17 @@ def _run_method_task(
                             "solver_fallback_reason": str(solver_reason_fold),
                             "pve_mode": str(rr_cfg_mode),
                             "pve_used": pve_used_f,
+                            "pve_pheno_scale": pve_used_f,
                             "pve_trainvar": pve_trainvar_f,
+                            "pve_pheno_scale_trainvar": pve_trainvar_f,
                             "pve_lambda": pve_lambda_f,
+                            "pve_pheno_scale_lambda": pve_lambda_f,
                             "pve_vc": pve_vc_f,
+                            "pve_pheno_scale_vc": pve_vc_f,
                             "pve_exact": _float_or_nan(rr_state_call.get("pve_exact", np.nan)),
+                            "pve_pheno_scale_exact": _float_or_nan(
+                                rr_state_call.get("pve_pheno_scale_exact", rr_state_call.get("pve_exact", np.nan))
+                            ),
                             "va": float(va_f),
                             "ve": float(ve_f),
                             "iter_like": iter_like,
@@ -12795,13 +12846,23 @@ def _run_method_task(
                 "solver_fallback_reason": str(solver_reason_final),
                 "pve_mode": str(rrblup_cfg_base.get("pve_mode", "lambda")).strip().lower(),
                 "pve_used": _float_or_nan(pve_final),
+                "pve_pheno_scale": _float_or_nan(pve_final),
                 "pve_trainvar": (
+                    float(np.nanmean(tv)) if int(tv.size) > 0 and np.any(np.isfinite(tv)) else float("nan")
+                ),
+                "pve_pheno_scale_trainvar": (
                     float(np.nanmean(tv)) if int(tv.size) > 0 and np.any(np.isfinite(tv)) else float("nan")
                 ),
                 "pve_lambda": (
                     float(np.nanmean(lv)) if int(lv.size) > 0 and np.any(np.isfinite(lv)) else float("nan")
                 ),
+                "pve_pheno_scale_lambda": (
+                    float(np.nanmean(lv)) if int(lv.size) > 0 and np.any(np.isfinite(lv)) else float("nan")
+                ),
                 "pve_vc": (
+                    float(np.nanmean(pv)) if int(pv.size) > 0 and np.any(np.isfinite(pv)) else float("nan")
+                ),
+                "pve_pheno_scale_vc": (
                     float(np.nanmean(pv)) if int(pv.size) > 0 and np.any(np.isfinite(pv)) else float("nan")
                 ),
                 "va": (
@@ -13183,10 +13244,17 @@ def _run_method_task(
                 "solver_fallback_reason": str(solver_reason_final),
                 "pve_mode": str(mode_used),
                 "pve_used": pve_used_f,
+                "pve_pheno_scale": pve_used_f,
                 "pve_trainvar": pve_trainvar_f,
+                "pve_pheno_scale_trainvar": pve_trainvar_f,
                 "pve_lambda": pve_lambda_f,
+                "pve_pheno_scale_lambda": pve_lambda_f,
                 "pve_vc": pve_vc_f,
+                "pve_pheno_scale_vc": pve_vc_f,
                 "pve_exact": _float_or_nan(rr_state_final.get("pve_exact", np.nan)),
+                "pve_pheno_scale_exact": _float_or_nan(
+                    rr_state_final.get("pve_pheno_scale_exact", rr_state_final.get("pve_exact", np.nan))
+                ),
                 "va": float(va_final),
                 "ve": float(ve_final),
                 "iter_like": _float_or_nan(
@@ -13768,7 +13836,7 @@ def _run_methods_parallel(
             except Exception:
                 pve_final = float("nan")
             if np.isfinite(pve_final):
-                rows.append(("PVE", f"{pve_final:.3f}"))
+                rows.append(("PVE(pheno-scale)", f"{pve_final:.3f}"))
             return rows
 
         if m == "rrBLUP":
@@ -13857,27 +13925,39 @@ def _run_methods_parallel(
                 )
                 pve_vc = float(
                     rr_pve_final.get(
-                        "pve_vc",
+                        "pve_pheno_scale_vc",
                         rr_pve_final.get(
-                            "pve_used",
+                            "pve_vc",
                             rr_pve_final.get(
-                                "pve_trainvar",
-                                rr_state.get(
-                                    "pve_vc",
-                                    rr_state.get("lambda_vc_pve", np.nan),
+                                "pve_pheno_scale",
+                                rr_pve_final.get(
+                                    "pve_used",
+                                    rr_pve_final.get(
+                                        "pve_pheno_scale_trainvar",
+                                        rr_pve_final.get(
+                                            "pve_trainvar",
+                                            rr_state.get(
+                                                "pve_pheno_scale_vc",
+                                                rr_state.get(
+                                                    "pve_vc",
+                                                    rr_state.get("lambda_vc_pve_pheno_scale", rr_state.get("lambda_vc_pve", np.nan)),
+                                                ),
+                                            ),
+                                        ),
+                                    ),
                                 ),
                             ),
                         ),
                     )
                 )
                 if not np.isfinite(pve_vc):
-                    pve_vc = float(rr_state.get("pve_used", np.nan))
+                    pve_vc = float(rr_state.get("pve_pheno_scale", rr_state.get("pve_used", np.nan)))
                 if np.isfinite(va):
                     rows.append(("Va", f"{va:.6g}"))
                 if np.isfinite(ve):
                     rows.append(("Ve", f"{ve:.6g}"))
                 if np.isfinite(pve_vc):
-                    rows.append(("PVE", f"{pve_vc:.3f}"))
+                    rows.append(("PVE(pheno-scale)", f"{pve_vc:.3f}"))
                 return rows
             elif solver_used == "adamw":
                 if solver_req != solver_used:
@@ -13952,10 +14032,13 @@ def _run_methods_parallel(
                 if np.isfinite(ve_exact):
                     rows.append(("Ve", f"{ve_exact:.6g}"))
                 pve_exact = float(
-                    rr_state.get("pve_used", result.get("pve_final", np.nan))
+                    rr_state.get(
+                        "pve_pheno_scale",
+                        rr_state.get("pve_used", result.get("pve_final", np.nan)),
+                    )
                 )
                 if np.isfinite(pve_exact):
-                    rows.append(("PVE", f"{pve_exact:.3f}"))
+                    rows.append(("PVE(pheno-scale)", f"{pve_exact:.3f}"))
             return rows
 
         if m in {"BayesA", "BayesB", "BayesCpi"}:
@@ -13967,14 +14050,14 @@ def _run_methods_parallel(
             if np.isfinite(r2_blup):
                 if r2_n_total > 0 and r2_n_used > 0 and r2_n_used < r2_n_total:
                     rows.append(
-                        ("r2", f"auto (BLUP pve={r2_blup:.3g}, n={r2_n_used}/{r2_n_total})")
+                        ("r2", f"auto (BLUP pve(pheno)={r2_blup:.3g}, n={r2_n_used}/{r2_n_total})")
                     )
                 elif r2_src.startswith("cv_shared_reuse"):
-                    rows.append(("r2", f"auto (BLUP pve={r2_blup:.6g}, cv-shared)"))
+                    rows.append(("r2", f"auto (BLUP pve(pheno)={r2_blup:.6g}, cv-shared)"))
                 else:
-                    rows.append(("r2", f"auto (BLUP pve={r2_blup:.6g})"))
+                    rows.append(("r2", f"auto (BLUP pve(pheno)={r2_blup:.6g})"))
             else:
-                rows.append(("r2", "auto (BLUP pve=NA)"))
+                rows.append(("r2", "auto (BLUP pve(pheno)=NA)"))
             if m in {"BayesB", "BayesCpi"}:
                 rows.append(("prob_in/counts", "0.5/5.0"))
             return rows
@@ -21498,7 +21581,7 @@ def _run_gs_pipeline_impl(
                         rows.append(("Ve", f"{sigma_e2:.6g}"))
                     pve_final = _detail_float_or_nan(res_obj.get("pve_final", np.nan))
                     if np.isfinite(pve_final):
-                        rows.append(("PVE", f"{pve_final:.3f}"))
+                        rows.append(("PVE(pheno-scale)", f"{pve_final:.3f}"))
                     return rows
 
                 if m == "rrBLUP":
@@ -21570,25 +21653,44 @@ def _run_gs_pipeline_impl(
                         )
                         pve_vc = _detail_float_or_nan(
                             rr_pve_final.get(
-                                "pve_vc",
+                                "pve_pheno_scale_vc",
                                 rr_pve_final.get(
-                                    "pve_used",
+                                    "pve_vc",
                                     rr_pve_final.get(
-                                        "pve_trainvar",
-                                        rr_state.get(
-                                            "pve_vc",
-                                            rr_state.get("lambda_vc_pve", rr_state.get("pve_used", np.nan)),
+                                        "pve_pheno_scale",
+                                        rr_pve_final.get(
+                                            "pve_used",
+                                            rr_pve_final.get(
+                                                "pve_pheno_scale_trainvar",
+                                                rr_pve_final.get(
+                                                    "pve_trainvar",
+                                                    rr_state.get(
+                                                        "pve_pheno_scale_vc",
+                                                        rr_state.get(
+                                                            "pve_vc",
+                                                            rr_state.get(
+                                                                "lambda_vc_pve_pheno_scale",
+                                                                rr_state.get("lambda_vc_pve", np.nan),
+                                                            ),
+                                                        ),
+                                                    ),
+                                                ),
+                                            ),
                                         ),
                                     ),
-                                ),
+                                )
                             )
                         )
+                        if not np.isfinite(pve_vc):
+                            pve_vc = _detail_float_or_nan(
+                                rr_state.get("pve_pheno_scale", rr_state.get("pve_used", np.nan))
+                            )
                         if np.isfinite(va):
                             rows.append(("Va", f"{va:.6g}"))
                         if np.isfinite(ve):
                             rows.append(("Ve", f"{ve:.6g}"))
                         if np.isfinite(pve_vc):
-                            rows.append(("PVE", f"{pve_vc:.3f}"))
+                            rows.append(("PVE(pheno-scale)", f"{pve_vc:.3f}"))
                         return rows
 
                     solver_label = solver_used.upper() if solver_used != "" else "EXACT"
@@ -21631,10 +21733,22 @@ def _run_gs_pipeline_impl(
                     )
                     pve_exact = _detail_float_or_nan(
                         rr_state.get(
-                            "pve_trainvar",
+                            "pve_pheno_scale",
                             rr_state.get(
-                                "pve_used",
-                                rr_pve_final.get("pve_trainvar", res_obj.get("pve_final", np.nan)),
+                                "pve_pheno_scale_exact",
+                                rr_state.get(
+                                    "pve_trainvar",
+                                    rr_state.get(
+                                        "pve_used",
+                                        rr_pve_final.get(
+                                            "pve_pheno_scale_trainvar",
+                                            rr_pve_final.get(
+                                                "pve_trainvar",
+                                                res_obj.get("pve_final", np.nan),
+                                            ),
+                                        ),
+                                    ),
+                                ),
                             ),
                         )
                     )
@@ -21643,7 +21757,7 @@ def _run_gs_pipeline_impl(
                     if np.isfinite(ve_exact):
                         rows.append(("Ve", f"{ve_exact:.6g}"))
                     if np.isfinite(pve_exact):
-                        rows.append(("PVE", f"{pve_exact:.3f}"))
+                        rows.append(("PVE(pheno-scale)", f"{pve_exact:.3f}"))
                     return rows
 
                 return rows

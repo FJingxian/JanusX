@@ -114,7 +114,6 @@ from janusx.script._common.genoio import (
     packed_preload_failure_state,
     packed_preload_is_disabled,
     packed_preload_is_ready,
-    prepare_packed_ctx_from_plink,
 )
 from janusx.script._common.cli_core import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 from janusx.script._common.pathcheck import (
@@ -848,7 +847,7 @@ def _emit_trait_header(
     _emit_report_major_section(report_logger, f"Task Execution: {trait}")
     sample_text = f"{int(n_idv)}"
     if pve_val is not None:
-        sample_text = f"{sample_text} | Null PVE={pve_val:.3f}"
+        sample_text = f"{sample_text} | Null PVE(pheno-scale)={pve_val:.3f}"
     _emit_report_kv(report_logger, "Trait Samples", sample_text)
     context_rows = getattr(logger, "_janusx_gwas_task_context_rows", None)
     if isinstance(context_rows, list):
@@ -863,7 +862,7 @@ def _emit_trait_header(
             if pve_val is None:
                 n_line = f"(n={int(n_idv)})"
             else:
-                n_line = f"(n={int(n_idv)}; pve={pve_val:.3f})"
+                n_line = f"(n={int(n_idv)}; pve(pheno)={pve_val:.3f})"
             prefix = "* "
             full = f"{prefix}{trait} {n_line}"
             if len(full) <= int(width):
@@ -900,7 +899,7 @@ def _emit_gwas_summary_legacy(
         "model",
         "nidv",
         "nsnp",
-        "pve",
+        "pve(ph)",
         "mem(G)",
         "Ctime(s)",
         "Vtime(s)",
@@ -963,7 +962,7 @@ def _emit_gwas_summary(
         "Model",
         "N_Indv",
         "N_SNP",
-        "PVE",
+        "PVE(ph)",
         "Mem(GB)",
         "C-Time(s)",
         "V-Time(s)",
@@ -6094,7 +6093,7 @@ def parse_args(argv: Optional[list[str]] = None):
         action="store_true",
         default=False,
         help=(
-            "Reuse a single full-sample GWAS scanmeta cache across traits/folds "
+            "Reuse a single full-sample GWAS row-stat pass in memory across traits/folds "
             "instead of recomputing row statistics on each training subset. "
             "Default is strict-train."
             if show_dev_help else argparse.SUPPRESS
@@ -6258,13 +6257,33 @@ def _prepare_qtn_packed_preload(
         use_process=True,
     ) as task:
         try:
-            full_ids, packed_ctx = prepare_packed_ctx_from_plink(
+            scan_meta = _gwas_logic_meta_global_cached(
                 str(prefix),
-                maf=float(getattr(args, "maf", 0.02)),
-                missing_rate=float(getattr(args, "geno", 0.05)),
+                maf_threshold=float(getattr(args, "maf", 0.02)),
+                max_missing_rate=float(getattr(args, "geno", 0.05)),
+                het_threshold=float(getattr(args, "het", 0.0)),
                 snps_only=bool(getattr(args, "snps_only", False)),
-                expected_n_samples=None,
-                filter_mode="lazy_owned",
+                outprefix=(
+                    str(getattr(args, "out", ""))
+                    if str(getattr(args, "out", "")).strip() != ""
+                    else None
+                ),
+                logger=logger,
+                use_spinner=False,
+                emit_status=False,
+            )
+            _prefix_loaded, full_ids, packed_ctx, _sites_meta = _prepare_packed_bed_once_for_gwas(
+                genofile=str(prefix),
+                maf_threshold=float(getattr(args, "maf", 0.02)),
+                max_missing_rate=float(getattr(args, "geno", 0.05)),
+                het_threshold=float(getattr(args, "het", 0.0)),
+                snps_only=bool(getattr(args, "snps_only", False)),
+                use_spinner=False,
+                preloaded_packed=None,
+                load_site_meta=False,
+                status_label="Loading QTN genotype (Full packed)",
+                trait_prepared_meta=scan_meta,
+                emit_status=False,
             )
         except Exception:
             task.fail("Loading QTN genotype (Full packed) ...Failed")
@@ -6801,7 +6820,7 @@ def _run_gwas_pipeline(
         _append_advanced_note("FarmCPU selected: enabling packed auto route.")
     _append_advanced_note(
         f"GWAS scan row-stat mode: {gwas_row_stat_mode} "
-        f"({'per-trait recompute without disk cache' if gwas_row_stat_mode == 'strict-train' else 'single cached full-sample reuse'})."
+        f"({'per-trait recompute without disk cache' if gwas_row_stat_mode == 'strict-train' else 'single in-memory full-sample reuse'})."
     )
     os.environ["JX_BED_BLOCK_TARGET_MB"] = f"{float(args._memory_mb):.6g}"
     try:

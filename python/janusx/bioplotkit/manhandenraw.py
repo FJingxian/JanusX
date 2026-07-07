@@ -2,7 +2,9 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
-from scipy.stats import beta
+
+_PVALUE_EPS = float(np.nextafter(0.0, 1.0))
+_QQ_SAMPLE_MAX_POINTS = 50_000
 
 
 def ppoints(n)->np.ndarray:
@@ -10,6 +12,52 @@ def ppoints(n)->np.ndarray:
     生成理论均匀分布分位数
     '''
     return np.arange(1,n+1)/(n+1)#(np.arange(1, n+1) - 0.5) / n
+
+
+def _qq_confidence_band_logp(
+    n_total: int,
+    *,
+    ci: float,
+    max_points: int | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    n = int(max(1, int(n_total)))
+    limit = _QQ_SAMPLE_MAX_POINTS if max_points is None else int(max(1, int(max_points)))
+    from janusx import janusx as _jxrs
+
+    exact = getattr(_jxrs, "qq_band_beta_logp_exact", None)
+    if not callable(exact):
+        raise RuntimeError(
+            "janusx.janusx.qq_band_beta_logp_exact is unavailable. "
+            "Rebuild/reinstall the JanusX Rust extension."
+        )
+    x_band, lower, upper = exact(n, ci=float(ci), max_points=limit)
+    return (
+        np.asarray(x_band, dtype=np.float64).reshape(-1),
+        np.asarray(lower, dtype=np.float64).reshape(-1),
+        np.asarray(upper, dtype=np.float64).reshape(-1),
+    )
+
+
+def _qq_sample_draw_indices(
+    n_total: int,
+    *,
+    max_points: int | None = None,
+) -> np.ndarray:
+    n = int(max(1, int(n_total)))
+    limit = _QQ_SAMPLE_MAX_POINTS if max_points is None else int(max(1, int(max_points)))
+    from janusx import janusx as _jxrs
+
+    sampler = getattr(_jxrs, "qq_rank_sample_zero_based", None)
+    if not callable(sampler):
+        raise RuntimeError(
+            "janusx.janusx.qq_rank_sample_zero_based is unavailable. "
+            "Rebuild/reinstall the JanusX Rust extension."
+        )
+    draw_idx = sampler(n, max_points=limit)
+    arr = np.asarray(draw_idx, dtype=np.int64).reshape(-1)
+    if arr.size == 0:
+        raise RuntimeError("Rust QQ rank sampler returned no indices.")
+    return arr
 
 class GWASPLOT:
     def __init__(self,df:pd.DataFrame, chr:str, pos:str, pvalue:str,interval_rate:int=.2):
@@ -53,7 +101,7 @@ class GWASPLOT:
         ax.set_xlim([0-self.interval,max(df['x'])+self.interval])
         ax.set_ylim([0,max(df['y'])+0.1*max(df['y'])])
         ax.set_xlabel('Chromosome')
-        ax.set_ylabel('-log$_\mathdefault{10}$(p-value)')
+        ax.set_ylabel(r'-log$_\mathdefault{10}$(p-value)')
         # ax.spines['right'].set_visible(False)
         # ax.spines['top'].set_visible(False)
         return ax
@@ -69,22 +117,19 @@ class GWASPLOT:
             ax = fig.add_subplot(gs[0:12,0])
         p = df['y'].dropna()
         n = len(p)
-        # 计算分位数
-        o = -np.log10(sorted(p))
-        # 生成理论分位数
-        e_p = ppoints(n)
-        e_theoretical = -np.log10(e_p) # 对于和性状不关联的位点，其pvalue相当于对均匀分布的随机抽样
+        p_sorted = np.sort(np.asarray(p, dtype=np.float64))
+        draw_idx = _qq_sample_draw_indices(n)
+        o = -np.log10(p_sorted[draw_idx])
+        e_theoretical = -np.log10((draw_idx.astype(np.float64) + 1.0) / (n + 1.0))
         if model is not None:
-            xi = np.ceil(10**(-e_theoretical)*n)
-            lower = -np.log10(beta.ppf(1 - ci/100,xi,n-xi+1))
-            upper = -np.log10(beta.ppf(ci/100,xi,n-xi+1))
+            e_theoretical, lower, upper = _qq_confidence_band_logp(n, ci=ci)
             # 绘制置信区间
             ax.fill_between(e_theoretical, lower, upper, color='grey', alpha=0.4)
         # 绘制理论线（y=x）和观测点
         ax.plot([0, min(o.max(),e_theoretical.max())], [0, min(o.max(),e_theoretical.max())], lw=1,)
         ax.scatter(e_theoretical, o, s=1, alpha=0.6,rasterized=True)
-        ax.set_xlabel('Expected -log$_\mathdefault{10}$(p-value)')
-        ax.set_ylabel('Observed -log$_\mathdefault{10}$(p-value)')
+        ax.set_xlabel(r'Expected -log$_\mathdefault{10}$(p-value)')
+        ax.set_ylabel(r'Observed -log$_\mathdefault{10}$(p-value)')
         return ax
     
 

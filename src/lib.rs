@@ -57,6 +57,8 @@ mod lmm;
 mod logreg;
 #[path = "stats/packed.rs"]
 mod packed;
+#[path = "stats/plot.rs"]
+mod plot;
 #[path = "stats/reml.rs"]
 mod reml;
 #[path = "stats/rrblup.rs"]
@@ -272,6 +274,7 @@ use packed::{
     bed_stream_empirical_stats_subset_f64, cross_grm_times_alpha_packed_f64, packed_malpha_f64,
     packed_malpha_mode_f64,
 };
+use plot::{qq_band_beta_logp_exact, qq_rank_sample_zero_based};
 use reml::{
     ai_reml_multi_f64, ai_reml_null_f64, lmm_reml_null_f32, lmm_rotate_x_y_with_ut_f64,
     ml_loglike_null_f32,
@@ -782,6 +785,8 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(bed_filter_stream_to_plink_rust, m)?)?;
     m.add_function(wrap_pyfunction!(bed_filter_to_plink_rust, m)?)?;
     m.add_function(wrap_pyfunction!(bed_mmap_filter_to_plink_rust, m)?)?;
+    m.add_function(wrap_pyfunction!(qq_band_beta_logp_exact, m)?)?;
+    m.add_function(wrap_pyfunction!(qq_rank_sample_zero_based, m)?)?;
     m.add_function(wrap_pyfunction!(cross_grm_times_alpha_packed_f64, m)?)?;
     m.add_function(wrap_pyfunction!(packed_malpha_f64, m)?)?;
     m.add_function(wrap_pyfunction!(packed_malpha_mode_f64, m)?)?;

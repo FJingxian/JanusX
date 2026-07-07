@@ -43,6 +43,60 @@ _GWAS_MODEL_LABELS = {
 }
 
 
+def _histogram_kde_count_curve(
+    values: np.ndarray,
+    *,
+    edges: np.ndarray,
+    n_grid: int = 256,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    vals = np.asarray(values, dtype=np.float64).reshape(-1)
+    vals = vals[np.isfinite(vals)]
+    if vals.size < 2:
+        return None
+    if np.unique(vals).size < 2:
+        return None
+
+    q75, q25 = np.percentile(vals, [75.0, 25.0])
+    iqr = float(q75 - q25)
+    std = float(np.std(vals, ddof=1))
+    robust_scale = iqr / 1.34 if iqr > 0.0 else 0.0
+    if robust_scale > 0.0 and np.isfinite(robust_scale):
+        scale = min(std, robust_scale) if std > 0.0 and np.isfinite(std) else robust_scale
+    else:
+        scale = std
+    if (not np.isfinite(scale)) or scale <= 0.0:
+        scale = float(np.ptp(vals)) / 6.0
+    if (not np.isfinite(scale)) or scale <= 0.0:
+        return None
+
+    bandwidth = 0.9 * scale * (float(vals.size) ** (-0.2))
+    if (not np.isfinite(bandwidth)) or bandwidth <= 0.0:
+        return None
+
+    x_min = float(np.min(vals))
+    x_max = float(np.max(vals))
+    if not np.isfinite(x_min) or not np.isfinite(x_max):
+        return None
+    if x_max <= x_min:
+        x_max = x_min + bandwidth
+
+    x_grid = np.linspace(x_min, x_max, int(max(32, n_grid)), dtype=np.float64)
+    z = (x_grid[:, None] - vals[None, :]) / bandwidth
+    kernel = np.exp(-0.5 * np.square(z)) / np.sqrt(2.0 * np.pi)
+    density = np.mean(kernel, axis=1) / bandwidth
+
+    edge_arr = np.asarray(edges, dtype=np.float64).reshape(-1)
+    if edge_arr.size >= 2:
+        bin_width = float(np.mean(np.diff(edge_arr)))
+    else:
+        bin_width = bandwidth
+    if (not np.isfinite(bin_width)) or bin_width <= 0.0:
+        bin_width = bandwidth
+
+    y_count = density * float(vals.size) * bin_width
+    return x_grid, y_count
+
+
 def _logger_flag(logger: Optional[logging.Logger], name: str, default: bool = False) -> bool:
     if logger is None:
         return bool(default)
@@ -423,19 +477,10 @@ def fastplot(
                 edgecolor="none",
                 alpha=1.0,
             )
-            # Overlay seaborn-like KDE curve, scaled to histogram "Count" axis.
-            if counts.size > 1 and np.unique(pheno).size > 1:
-                try:
-                    from scipy.stats import gaussian_kde
-
-                    kde = gaussian_kde(pheno)
-                    x_grid = np.linspace(float(np.min(pheno)), float(np.max(pheno)), 256)
-                    y_density = kde(x_grid)
-                    bin_width = float(np.mean(np.diff(edges)))
-                    y_count = y_density * float(n_samples) * bin_width
-                    axes["A"].plot(x_grid, y_count, color="#B3B3B3", linewidth=1.6)
-                except Exception:
-                    pass
+            kde_curve = _histogram_kde_count_curve(pheno, edges=edges)
+            if counts.size > 1 and kde_curve is not None:
+                x_grid, y_count = kde_curve
+                axes["A"].plot(x_grid, y_count, color="#B3B3B3", linewidth=1.6)
         else:
             axes["A"].text(
                 0.5,

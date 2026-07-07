@@ -5,10 +5,12 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.markers import MarkerStyle
 from matplotlib.gridspec import GridSpec
-from scipy.stats import beta
 from janusx.gtools.cleaner import chrom_sort_key
 
 _PVALUE_EPS = float(np.nextafter(0.0, 1.0))
+_QQ_SAMPLE_TRIGGER = 20_000
+_QQ_SAMPLE_KEEP_HEAD = 25_000
+_QQ_SAMPLE_MAX_POINTS = 50_000
 
 
 def ppoints(n: int) -> np.ndarray:
@@ -41,6 +43,56 @@ def _sanitize_pvalues(values) -> np.ndarray:
 def _finite_positive(values) -> np.ndarray:
     arr = np.asarray(values, dtype=np.float64).reshape(-1)
     return arr[np.isfinite(arr) & (arr > 0.0)]
+
+
+def _qq_confidence_band_logp(
+    n_total: int,
+    *,
+    ci: float,
+    max_points: Union[int, None],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    n = int(max(1, int(n_total)))
+    limit = (
+        _QQ_SAMPLE_MAX_POINTS if max_points is None else int(max(1, int(max_points)))
+    )
+    from janusx import janusx as _jxrs
+
+    exact = getattr(_jxrs, "qq_band_beta_logp_exact", None)
+    if not callable(exact):
+        raise RuntimeError(
+            "janusx.janusx.qq_band_beta_logp_exact is unavailable. "
+            "Rebuild/reinstall the JanusX Rust extension."
+        )
+    x_band, lower, upper = exact(n, ci=float(ci), max_points=limit)
+    return (
+        np.asarray(x_band, dtype=np.float64).reshape(-1),
+        np.asarray(lower, dtype=np.float64).reshape(-1),
+        np.asarray(upper, dtype=np.float64).reshape(-1),
+    )
+
+
+def _qq_sample_draw_indices(
+    n_total: int,
+    *,
+    max_points: Union[int, None],
+) -> np.ndarray:
+    n = int(max(1, int(n_total)))
+    limit = (
+        _QQ_SAMPLE_MAX_POINTS if max_points is None else int(max(1, int(max_points)))
+    )
+    from janusx import janusx as _jxrs
+
+    sampler = getattr(_jxrs, "qq_rank_sample_zero_based", None)
+    if not callable(sampler):
+        raise RuntimeError(
+            "janusx.janusx.qq_rank_sample_zero_based is unavailable. "
+            "Rebuild/reinstall the JanusX Rust extension."
+        )
+    draw_idx = sampler(n, max_points=limit)
+    arr = np.asarray(draw_idx, dtype=np.int64).reshape(-1)
+    if arr.size == 0:
+        raise RuntimeError("Rust QQ rank sampler returned no indices.")
+    return arr
 
 
 def resolve_manhattan_chr_gap(
@@ -539,9 +591,9 @@ class GWASPLOT:
         scatter_size: float = 8.0,
         line_color: str = "black",
         qq_mode: str = "auto",
-        qq_auto_threshold: int = 1_000_000,
-        qq_fast_max_points: int = 120_000,
-        qq_band_max_points: Union[int, None] = 20_000,
+        qq_auto_threshold: int = _QQ_SAMPLE_TRIGGER,
+        qq_fast_max_points: int = _QQ_SAMPLE_MAX_POINTS,
+        qq_band_max_points: Union[int, None] = _QQ_SAMPLE_MAX_POINTS,
         sig_p_threshold: Union[float, None] = None,
         axis_min: Union[float, None] = None,
         axis_max: Union[float, None] = None,
@@ -549,8 +601,10 @@ class GWASPLOT:
         rasterized: bool = True,
     ) -> plt.Axes:
         """
-        Draw a QQ plot of observed vs expected -log10(p) with a beta-based
-        confidence band.
+        Draw a QQ plot of observed vs expected -log10(p) with a confidence band.
+
+        The band is computed from exact Beta order-statistic quantiles by the
+        Rust backend. Python only handles point selection and drawing.
 
         QQ computation is independent from Manhattan compression (`self.minidx`)
         to avoid significance-enriched bias in QQ shape.
@@ -575,16 +629,15 @@ class GWASPLOT:
             - auto: use fast mode when SNP count > qq_auto_threshold
             - full: full-rank QQ using all SNPs (exact)
             - fast: rank-grid approximation from full QQ (deterministic)
-        qq_auto_threshold : int, default 1_000_000
+        qq_auto_threshold : int, default 20_000
             Threshold used when qq_mode="auto".
-        qq_fast_max_points : int, default 120_000
+        qq_fast_max_points : int, default 50_000
             Max points in fast-mode QQ scatter.
-        qq_band_max_points : int or None, default 20_000
+        qq_band_max_points : int or None, default 50_000
             Max points used for confidence band (both modes).
-            If None, use all ranks.
+            Sampling keeps the first 25,000 ranks and log-samples the rest.
         sig_p_threshold : float or None, default None
-            Significance threshold to always preserve in QQ scatter.
-            If None, Bonferroni-like threshold 1/n is used.
+            Reserved for backward compatibility with older QQ APIs.
         axis_min : float or None, default None
             If provided, force both QQ axis lower bounds (x/y) to this value.
         axis_max : float or None, default None
@@ -622,13 +675,6 @@ class GWASPLOT:
             raise ValueError("No p-values found for QQ plot.")
         p[~np.isfinite(p)] = 1.0
         p = np.clip(p, np.finfo(np.float64).tiny, 1.0)
-        if sig_p_threshold is None:
-            sig_thr = 1.0 / float(n)
-        else:
-            sig_thr = float(sig_p_threshold)
-        if not np.isfinite(sig_thr):
-            sig_thr = 1.0 / float(n)
-        sig_thr = float(np.clip(sig_thr, np.finfo(np.float64).tiny, 1.0))
 
         resolved_mode = mode_key
         if mode_key == "auto":
@@ -636,60 +682,24 @@ class GWASPLOT:
 
         # Full sorted p-values are the canonical QQ backbone.
         p_sorted = np.sort(p, kind="mergesort")
-        sig_n = int(np.searchsorted(p_sorted, sig_thr, side="right"))
 
         if resolved_mode == "full":
             # Exact QQ: all SNPs
             draw_idx = np.arange(n, dtype=np.int64)
         else:
-            # Fast QQ: deterministic rank-grid decimation from full QQ,
-            # while keeping all significant points.
-            max_points = int(max(1, qq_fast_max_points))
-            if n > max_points:
-                base_idx = np.linspace(0, n - 1, max_points, dtype=np.int64)
-                if sig_n > 0:
-                    sig_idx = np.arange(sig_n, dtype=np.int64)
-                    draw_idx = np.unique(np.concatenate([base_idx, sig_idx]))
-                else:
-                    draw_idx = np.unique(base_idx)
-            else:
-                draw_idx = np.arange(n, dtype=np.int64)
+            # Non-full QQ keeps the first 25k ranks and log-samples the rest.
+            draw_idx = _qq_sample_draw_indices(n, max_points=qq_fast_max_points)
 
         p_draw = p_sorted[draw_idx]
         ranks_draw = draw_idx.astype(np.float64) + 1.0
         obs_scatter = -np.log10(p_draw)
         exp_scatter = -np.log10(ranks_draw / (n + 1.0))
 
-        # Confidence band is always based on the full null sample size n.
-        band_n = n
-        if qq_band_max_points is not None and band_n > int(qq_band_max_points):
-            n_band = max(2, int(qq_band_max_points))
-            # Log-dense rank sampling: denser at small ranks (QQ right tail),
-            # smoother tail shape than uniform linear-rank sampling.
-            i = np.unique(np.round(np.geomspace(1.0, float(band_n), num=n_band)).astype(np.int64))
-            if i[0] != 1:
-                i = np.insert(i, 0, 1)
-            if i[-1] != band_n:
-                i = np.append(i, band_n)
-        else:
-            i = np.arange(1, band_n + 1, dtype=np.int64)
-
-        # Build confidence band on a rank grid in ascending x
-        i = np.sort(i)[::-1]
-        ci_frac = float(ci)
-        if ci_frac > 1.0:
-            ci_frac /= 100.0
-        ci_frac = float(np.clip(ci_frac, 1e-12, 1.0 - 1e-12))
-        alpha = 1.0 - ci_frac
-        q_lo = alpha / 2.0
-        q_hi = 1.0 - alpha / 2.0
-        x_band = -np.log10(i.astype(np.float64) / (band_n + 1.0))
-        # True two-sided CI on p-scale, then transformed to -log10 scale:
-        # lower_y uses upper p-quantile; upper_y uses lower p-quantile.
-        p_upper = beta.ppf(q_hi, i, band_n - i + 1)
-        p_lower = beta.ppf(q_lo, i, band_n - i + 1)
-        lower = -np.log10(p_upper)
-        upper = -np.log10(p_lower)
+        x_band, lower, upper = _qq_confidence_band_logp(
+            n,
+            ci=ci,
+            max_points=qq_band_max_points,
+        )
         band_mask = np.isfinite(x_band) & np.isfinite(lower) & np.isfinite(upper)
 
         # Draw confidence interval

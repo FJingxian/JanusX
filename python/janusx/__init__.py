@@ -10,6 +10,81 @@ from pathlib import Path
 
 _DLL_DIR_HANDLES: list[object] = []
 _NATIVE_EXT_PATTERNS = ("janusx*.so", "janusx*.pyd")
+_RUNTIME_CACHE_ROOT_ENV = "JANUSX_RUNTIME_CACHE_DIR"
+
+
+def _runtime_cache_root() -> Path:
+    explicit = str(os.environ.get(_RUNTIME_CACHE_ROOT_ENV, "")).strip()
+    if explicit != "":
+        return Path(explicit)
+    try:
+        uid = str(int(os.getuid()))
+    except Exception:
+        uid = "nouid"
+    return Path(tempfile.gettempdir()) / f"janusx-runtime-{uid}"
+
+
+def _path_writable_or_creatable(path: Path) -> bool:
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return False
+    probe = path / ".janusx-write-probe"
+    try:
+        with open(probe, "w", encoding="utf-8") as fh:
+            fh.write("1")
+        probe.unlink(missing_ok=True)
+        return True
+    except Exception:
+        return False
+
+
+def _default_xdg_cache_home() -> Path:
+    try:
+        home = Path.home()
+    except Exception:
+        return _runtime_cache_root() / "xdg-cache"
+    return home / ".cache"
+
+
+def _default_mplconfigdir() -> Path:
+    try:
+        home = Path.home()
+    except Exception:
+        return _runtime_cache_root() / "mplconfig"
+    return home / ".matplotlib"
+
+
+def _ensure_runtime_cache_dirs() -> None:
+    """
+    Keep plotting/cache-heavy imports away from unwritable home directories.
+
+    This avoids slow matplotlib/fontconfig fallback behavior in shared or
+    locked-down environments (for example conda base, HPC login nodes, or
+    read-only home mounts) before GWAS/GS modules import matplotlib.
+    """
+    cache_root = _runtime_cache_root()
+
+    raw_xdg = str(os.environ.get("XDG_CACHE_HOME", "")).strip()
+    xdg_path = Path(raw_xdg) if raw_xdg != "" else _default_xdg_cache_home()
+    if not _path_writable_or_creatable(xdg_path):
+        xdg_path = cache_root / "xdg-cache"
+        if _path_writable_or_creatable(xdg_path):
+            os.environ["XDG_CACHE_HOME"] = str(xdg_path)
+    try:
+        (xdg_path / "fontconfig").mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+    raw_mpl = str(os.environ.get("MPLCONFIGDIR", "")).strip()
+    mpl_path = Path(raw_mpl) if raw_mpl != "" else _default_mplconfigdir()
+    if not _path_writable_or_creatable(mpl_path):
+        mpl_path = xdg_path / "matplotlib"
+        if _path_writable_or_creatable(mpl_path):
+            os.environ["MPLCONFIGDIR"] = str(mpl_path)
+
+
+_ensure_runtime_cache_dirs()
 
 
 def _package_dir_has_native_extension(pkg_dir: Path) -> bool:

@@ -102,10 +102,6 @@ import pandas as pd
 import numpy as np
 from scipy.optimize import minimize_scalar
 from scipy.stats import pearsonr, spearmanr
-try:
-    from sklearn.model_selection import KFold
-except Exception:
-    KFold = None  # type: ignore[assignment]
 from janusx.bioplotkit.sci_set import color_set
 from janusx.bioplotkit import gsplot
 from janusx._optional_deps import format_missing_dependency_message
@@ -114,7 +110,7 @@ from janusx.gfreader import (
     load_genotype_chunks,
     prepare_cli_input_cache,
 )
-from janusx.pyBLUP.kfold import kfold
+from janusx.pyBLUP.kfold import KFold as _LocalKFold
 from janusx.pyBLUP.mlm import BLUP as MLMBLUP
 from janusx.pyBLUP.bayes import BAYES
 from janusx.pyBLUP.ml import (
@@ -3621,8 +3617,8 @@ def build_cv_splits(
     seed: int | None = 42,
 ) -> list[tuple[np.ndarray, np.ndarray]]:
     """
-    Build CV splits with sklearn KFold and keep legacy output order:
-    each item is (test_idx, train_idx).
+    Build reproducible shuffled K-fold splits in legacy JanusX order:
+    each item is `(test_idx, train_idx)`.
     """
     n_samples = int(n_samples)
     n_splits = int(n_splits)
@@ -3632,20 +3628,19 @@ def build_cv_splits(
         raise ValueError(f"CV folds must be >=2, got {n_splits}.")
     if n_splits > n_samples:
         raise ValueError(f"CV folds ({n_splits}) cannot exceed sample size ({n_samples}).")
-
-    try:
-        if KFold is None:
-            raise ImportError("sklearn.model_selection.KFold is unavailable")
-        splitter = KFold(
-            n_splits=n_splits,
-            shuffle=True,
-            random_state=seed,
+    splitter = _LocalKFold(
+        n_splits=n_splits,
+        shuffle=True,
+        random_state=seed,
+    )
+    row = np.arange(n_samples, dtype=np.int64)
+    return [
+        (
+            np.asarray(test_idx, dtype=np.int64),
+            np.asarray(train_idx, dtype=np.int64),
         )
-        row = np.arange(n_samples, dtype=int)
-        return [(test_idx, train_idx) for train_idx, test_idx in splitter.split(row)]
-    except Exception:
-        # Fallback keeps historical behavior if sklearn splitter is unavailable.
-        return list(kfold(n_samples, k=n_splits, seed=seed))
+        for train_idx, test_idx in splitter.split(row)
+    ]
 
 
 def _mlgs_inner_cv(n_samples: int) -> int:
@@ -4843,6 +4838,7 @@ def _tune_ml_method_once(
     Xtrain: np.ndarray,
     PCAdec: bool,
     n_jobs: int,
+    seed: int = 42,
     progress_hook: typing.Any = None,
 ) -> dict[str, typing.Any]:
     empty_test = np.zeros((Xtrain.shape[0], 0), dtype=Xtrain.dtype)
@@ -4860,7 +4856,7 @@ def _tune_ml_method_once(
         y=Y.reshape(-1),
         M=Xtrain_tuned,
         method=typing.cast(typing.Any, _ML_METHOD_MAP[method]),
-        seed=42,
+        seed=int(seed),
         cv=_mlgs_inner_cv(int(Y.shape[0])),
         n_jobs=max(1, int(n_jobs)),
         fit_on_init=False,
@@ -8213,6 +8209,7 @@ def GSapi(
     method: typing.Literal["GBLUP", "rrBLUP", "BayesA", "BayesB", "BayesCpi", "RF", "ET", "GBDT", "XGB", "SVM", "ENET"],
     PCAdec: bool = False,
     n_jobs: int = 1,
+    seed: int = 42,
     force_fast: bool = False,
     ml_fixed_params: dict[str, typing.Any] | None = None,
     need_train_pred: bool = True,
@@ -8247,6 +8244,8 @@ def GSapi(
         PCA is computed on the concatenated matrix [Xtrain, Xtest].
     n_jobs : int, optional
         Thread count for ML models. Non-ML models currently ignore this setting.
+    seed : int, optional
+        Random seed used by stochastic ML inner routines.
     need_train_pred : bool, optional
         If False, skip generating train-set predictions when the caller does not need them.
     train_pred_indices : np.ndarray, optional
@@ -11262,7 +11261,7 @@ def GSapi(
             y=Y.reshape(-1),
             M=Xtrain_ml,
             method=typing.cast(typing.Any, _ML_METHOD_MAP[method]),
-            seed=42,
+            seed=int(seed),
             cv=_mlgs_inner_cv(int(Y.shape[0])),
             n_jobs=max(1, int(n_jobs)),
             fit_on_init=False,
@@ -11334,6 +11333,7 @@ def _run_method_task(
     pca_dec: bool,
     cv_splits: typing.Optional[list[tuple[np.ndarray, np.ndarray]]],
     n_jobs: int,
+    seed: int,
     strict_cv: bool,
     force_fast: bool,
     packed_ctx: dict[str, typing.Any] | None = None,
@@ -11777,6 +11777,7 @@ def _run_method_task(
             Xtrain=train_snp_ml,
             PCAdec=pca_dec,
             n_jobs=n_jobs,
+            seed=int(seed),
             progress_hook=search_progress_hook,
         )
 
@@ -12371,6 +12372,7 @@ def _run_method_task(
                     method=method,
                     PCAdec=fold_pca,
                     n_jobs=n_jobs,
+                    seed=int(seed),
                     force_fast=force_fast,
                     ml_fixed_params=(None if ml_tuning_cache is None else ml_tuning_cache.get("params")),
                     need_train_pred=need_fold_train_pred,
@@ -13164,6 +13166,7 @@ def _run_method_task(
             method=method,
             PCAdec=final_pca,
             n_jobs=n_jobs,
+            seed=int(seed),
             force_fast=force_fast,
             ml_fixed_params=(None if ml_tuning_cache is None else ml_tuning_cache.get("params")),
             need_train_pred=False,
@@ -13723,6 +13726,7 @@ def _run_methods_parallel(
     pca_dec: bool,
     cv_splits: typing.Optional[list[tuple[np.ndarray, np.ndarray]]],
     n_jobs: int,
+    seed: int,
     strict_cv: bool,
     force_fast: bool = False,
     packed_ctx: dict[str, typing.Any] | None = None,
@@ -15225,6 +15229,7 @@ def _run_methods_parallel(
                         pca_dec,
                         cv_splits,
                         model_n_jobs,
+                        seed,
                         strict_cv,
                         force_fast,
                         packed_ctx=packed_ctx,
@@ -16191,6 +16196,7 @@ def _run_methods_parallel(
                         pca_dec,
                         cv_splits,
                         model_n_jobs,
+                        seed,
                         strict_cv,
                         force_fast,
                         packed_ctx=packed_ctx,
@@ -18242,6 +18248,15 @@ def parse_args(argv: typing.Optional[list[str]] = None):
         help="K fold of cross-validation for models. "
              "(default: %(default)s).",
     )
+    optional_group.add_argument(
+        "-seed", "--seed",
+        type=int,
+        default=42,
+        help=(
+            "Random seed for outer CV fold shuffling and GS model-side stochastic "
+            "routines (default: %(default)s)."
+        ),
+    )
     # optional_group.add_argument(
     #     "-select","--select",
     #     type=str,
@@ -18911,6 +18926,8 @@ def parse_args(argv: typing.Optional[list[str]] = None):
         parser.error("--top-lr must be a finite value > 0.")
     if int(args.top_seed) < 0:
         parser.error("--top-seed must be >= 0.")
+    if int(args.seed) < 0:
+        parser.error("--seed must be >= 0.")
     return args
 
 
@@ -19432,7 +19449,7 @@ def _run_gs_pipeline_impl(
             else ",".join(str(x) for x in args.ncol)
         )
         cv_cfg = (
-            f"{int(args.cv)}-fold, strict={bool(args.strict_cv)}"
+            f"{int(args.cv)}-fold, seed={int(args.seed)}, strict={bool(args.strict_cv)}"
             if cv_enabled
             else (
                 "off (--model: predict-only)"
@@ -21368,7 +21385,7 @@ def _run_gs_pipeline_impl(
             cv_splits = build_cv_splits(
                 n_samples=int(train_sample_idx.shape[0]),
                 n_splits=int(args.cv),
-                seed=42,
+                seed=int(args.seed),
             )
 
         if (not trait_use_packed_lmm) and (test_snp is None) and (geno is not None):
@@ -22199,6 +22216,7 @@ def _run_gs_pipeline_impl(
                 pca_dec=args.pcd,
                 cv_splits=cv_splits,
                 n_jobs=int(max(1, args.thread)),
+                seed=int(args.seed),
                 strict_cv=bool(args.strict_cv),
                 force_fast=bool(args.force_fast),
                 packed_ctx=trait_packed_ctx,

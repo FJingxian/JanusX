@@ -37,6 +37,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
     "auto_stream_grm_chunk_size": ("janusx.pyBLUP.stream_grm", "auto_stream_grm_chunk_size"),
     "build_streaming_grm_from_chunks": ("janusx.pyBLUP.stream_grm", "build_streaming_grm_from_chunks"),
     "kfold": ("janusx.pyBLUP.kfold", "kfold"),
+    "KFold": ("janusx.pyBLUP.kfold", "KFold"),
     "mlm": ("janusx.pyBLUP.mlm", None),
     "BLUP": ("janusx.pyBLUP.mlm", "BLUP"),
     "ml": ("janusx.pyBLUP.ml", None),

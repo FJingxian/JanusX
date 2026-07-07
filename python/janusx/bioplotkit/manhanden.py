@@ -1,16 +1,19 @@
 import time
+from functools import lru_cache
 from typing import Union
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.markers import MarkerStyle
 from matplotlib.gridspec import GridSpec
+from scipy.stats import beta
 from janusx.gtools.cleaner import chrom_sort_key
 
 _PVALUE_EPS = float(np.nextafter(0.0, 1.0))
 _QQ_SAMPLE_TRIGGER = 20_000
 _QQ_SAMPLE_KEEP_HEAD = 25_000
 _QQ_SAMPLE_MAX_POINTS = 50_000
+_QQ_BAND_MAX_POINTS = 512
 
 
 def ppoints(n: int) -> np.ndarray:
@@ -45,30 +48,106 @@ def _finite_positive(values) -> np.ndarray:
     return arr[np.isfinite(arr) & (arr > 0.0)]
 
 
+@lru_cache(maxsize=64)
+def _qq_confidence_band_logp_cached(
+    n: int,
+    ci: float,
+    limit: int,
+    rank_max: int | None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    band_n = int(max(1, int(n)))
+    rank_cap = band_n if rank_max is None else int(max(1, min(int(rank_max), band_n)))
+
+    if rank_cap <= limit:
+        ranks = np.arange(1, rank_cap + 1, dtype=np.int64)
+    else:
+        ranks = np.unique(
+            np.round(np.geomspace(1.0, float(rank_cap), num=int(max(2, limit)))).astype(np.int64)
+        )
+        if ranks[0] != 1:
+            ranks = np.insert(ranks, 0, 1)
+        if ranks[-1] != rank_cap:
+            ranks = np.append(ranks, rank_cap)
+    ranks = np.sort(ranks)[::-1]
+
+    ci_frac = float(ci)
+    if ci_frac > 1.0:
+        ci_frac /= 100.0
+    ci_frac = float(np.clip(ci_frac, 1e-12, 1.0 - 1e-12))
+    alpha = 1.0 - ci_frac
+    q_lo = alpha / 2.0
+    q_hi = 1.0 - alpha / 2.0
+
+    x_arr = -np.log10(ranks.astype(np.float64) / (band_n + 1.0))
+    lo_arr = -np.log10(beta.ppf(q_hi, ranks, band_n - ranks + 1))
+    hi_arr = -np.log10(beta.ppf(q_lo, ranks, band_n - ranks + 1))
+    keep = np.isfinite(x_arr) & np.isfinite(lo_arr) & np.isfinite(hi_arr)
+    x_arr = np.asarray(x_arr[keep], dtype=np.float64)
+    lo_arr = np.asarray(lo_arr[keep], dtype=np.float64)
+    hi_arr = np.asarray(hi_arr[keep], dtype=np.float64)
+    x_arr.setflags(write=False)
+    lo_arr.setflags(write=False)
+    hi_arr.setflags(write=False)
+    return (x_arr, lo_arr, hi_arr)
+
+
 def _qq_confidence_band_logp(
     n_total: int,
     *,
     ci: float,
     max_points: Union[int, None],
+    rank_max: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     n = int(max(1, int(n_total)))
-    limit = (
-        _QQ_SAMPLE_MAX_POINTS if max_points is None else int(max(1, int(max_points)))
-    )
-    from janusx import janusx as _jxrs
+    limit = _QQ_BAND_MAX_POINTS if max_points is None else int(max(1, int(max_points)))
+    rank_cap = None if rank_max is None else int(max(1, min(int(rank_max), n)))
+    return _qq_confidence_band_logp_cached(n, float(ci), limit, rank_cap)
 
-    exact = getattr(_jxrs, "qq_band_beta_logp_exact", None)
-    if not callable(exact):
-        raise RuntimeError(
-            "janusx.janusx.qq_band_beta_logp_exact is unavailable. "
-            "Rebuild/reinstall the JanusX Rust extension."
-        )
-    x_band, lower, upper = exact(n, ci=float(ci), max_points=limit)
-    return (
-        np.asarray(x_band, dtype=np.float64).reshape(-1),
-        np.asarray(lower, dtype=np.float64).reshape(-1),
-        np.asarray(upper, dtype=np.float64).reshape(-1),
+
+@lru_cache(maxsize=64)
+def _qq_sample_draw_indices_cached(
+    n: int,
+    limit: int,
+) -> np.ndarray:
+    n_total = int(max(1, int(n)))
+    keep_n = int(max(1, min(int(limit), n_total)))
+    if n_total <= keep_n:
+        arr = np.arange(n_total, dtype=np.int64)
+        arr.setflags(write=False)
+        return arr
+
+    keep_head = min(n_total, keep_n, int(_QQ_SAMPLE_KEEP_HEAD))
+    head_idx = np.arange(keep_head, dtype=np.int64)
+    tail_need = max(0, keep_n - keep_head)
+
+    if tail_need <= 0 or keep_head >= n_total:
+        arr = head_idx[:keep_n]
+        arr.setflags(write=False)
+        return arr
+
+    tail_idx = np.unique(
+        np.round(
+            np.geomspace(float(keep_head), float(n_total - 1), num=int(max(2, tail_need + 1)))
+        ).astype(np.int64)
     )
+    tail_idx = tail_idx[(tail_idx >= keep_head) & (tail_idx < n_total)]
+    if tail_idx.size == 0 or tail_idx[-1] != n_total - 1:
+        tail_idx = np.append(tail_idx, n_total - 1)
+    if tail_idx.size > tail_need:
+        select = np.linspace(0, tail_idx.size - 1, num=tail_need, dtype=np.int64)
+        tail_idx = tail_idx[np.unique(select)]
+
+    arr = np.unique(np.concatenate([head_idx, tail_idx])).astype(np.int64, copy=False)
+    if arr.size > keep_n:
+        arr = arr[:keep_n]
+    elif arr.size < keep_n:
+        fill_need = keep_n - arr.size
+        fill_idx = np.linspace(keep_head, n_total - 1, num=fill_need + 2, dtype=np.int64)[1:-1]
+        arr = np.unique(np.concatenate([arr, fill_idx])).astype(np.int64, copy=False)
+        if arr.size > keep_n:
+            arr = arr[:keep_n]
+    arr.setflags(write=False)
+    return arr
 
 
 def _qq_sample_draw_indices(
@@ -77,22 +156,8 @@ def _qq_sample_draw_indices(
     max_points: Union[int, None],
 ) -> np.ndarray:
     n = int(max(1, int(n_total)))
-    limit = (
-        _QQ_SAMPLE_MAX_POINTS if max_points is None else int(max(1, int(max_points)))
-    )
-    from janusx import janusx as _jxrs
-
-    sampler = getattr(_jxrs, "qq_rank_sample_zero_based", None)
-    if not callable(sampler):
-        raise RuntimeError(
-            "janusx.janusx.qq_rank_sample_zero_based is unavailable. "
-            "Rebuild/reinstall the JanusX Rust extension."
-        )
-    draw_idx = sampler(n, max_points=limit)
-    arr = np.asarray(draw_idx, dtype=np.int64).reshape(-1)
-    if arr.size == 0:
-        raise RuntimeError("Rust QQ rank sampler returned no indices.")
-    return arr
+    limit = _QQ_SAMPLE_MAX_POINTS if max_points is None else int(max(1, int(max_points)))
+    return _qq_sample_draw_indices_cached(n, limit)
 
 
 def resolve_manhattan_chr_gap(
@@ -593,7 +658,7 @@ class GWASPLOT:
         qq_mode: str = "auto",
         qq_auto_threshold: int = _QQ_SAMPLE_TRIGGER,
         qq_fast_max_points: int = _QQ_SAMPLE_MAX_POINTS,
-        qq_band_max_points: Union[int, None] = _QQ_SAMPLE_MAX_POINTS,
+        qq_band_max_points: Union[int, None] = _QQ_BAND_MAX_POINTS,
         sig_p_threshold: Union[float, None] = None,
         axis_min: Union[float, None] = None,
         axis_max: Union[float, None] = None,
@@ -603,8 +668,9 @@ class GWASPLOT:
         """
         Draw a QQ plot of observed vs expected -log10(p) with a confidence band.
 
-        The band is computed from exact Beta order-statistic quantiles by the
-        Rust backend. Python only handles point selection and drawing.
+        The band is computed from SciPy Beta order-statistic quantiles.
+        Point selection and drawing stay in Python to keep plotting isolated
+        from the native GWAS extension.
 
         QQ computation is independent from Manhattan compression (`self.minidx`)
         to avoid significance-enriched bias in QQ shape.
@@ -633,9 +699,10 @@ class GWASPLOT:
             Threshold used when qq_mode="auto".
         qq_fast_max_points : int, default 50_000
             Max points in fast-mode QQ scatter.
-        qq_band_max_points : int or None, default 50_000
-            Max points used for confidence band (both modes).
-            Sampling keeps the first 25,000 ranks and log-samples the rest.
+        qq_band_max_points : int or None, default 512
+            Max points used for the exact confidence band (both modes).
+            Band sampling keeps only a small exact head and log-samples the
+            remaining ranks so multi-million-SNP QQ plots stay responsive.
         sig_p_threshold : float or None, default None
             Reserved for backward compatibility with older QQ APIs.
         axis_min : float or None, default None

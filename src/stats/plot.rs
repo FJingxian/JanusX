@@ -1,22 +1,25 @@
 use numpy::{IntoPyArray, PyArray1};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
+use rayon::prelude::*;
 use statrs::distribution::{Beta, ContinuousCDF};
 
 const PVALUE_EPS: f64 = f64::from_bits(1);
 const QQ_SAMPLE_TRIGGER: usize = 20_000;
 const QQ_SAMPLE_KEEP_HEAD: usize = 25_000;
 const QQ_SAMPLE_MAX_POINTS_DEFAULT: usize = 50_000;
+const QQ_BAND_KEEP_HEAD: usize = 128;
+const QQ_BAND_MAX_POINTS_DEFAULT: usize = 512;
 
-fn qq_sample_ranks_desc(n: usize, max_points: Option<usize>) -> Vec<usize> {
+fn qq_sample_ranks_desc_with_keep_head(n: usize, limit: usize, keep_head_default: usize) -> Vec<usize> {
     if n == 0 {
         return Vec::new();
     }
-    let limit = max_points.unwrap_or(QQ_SAMPLE_MAX_POINTS_DEFAULT).max(1).min(n);
+    let limit = limit.max(1).min(n);
     if n <= QQ_SAMPLE_TRIGGER || limit >= n {
         return (1..=n).rev().collect();
     }
-    let keep_head = QQ_SAMPLE_KEEP_HEAD.min(limit).min(n);
+    let keep_head = keep_head_default.min(limit).min(n);
     if keep_head >= n {
         return (1..=n).rev().collect();
     }
@@ -60,10 +63,26 @@ fn qq_sample_ranks_desc(n: usize, max_points: Option<usize>) -> Vec<usize> {
     ranks
 }
 
+fn qq_sample_ranks_desc(n: usize, max_points: Option<usize>) -> Vec<usize> {
+    let limit = max_points.unwrap_or(QQ_SAMPLE_MAX_POINTS_DEFAULT);
+    qq_sample_ranks_desc_with_keep_head(n, limit, QQ_SAMPLE_KEEP_HEAD)
+}
+
+fn qq_band_sample_ranks_desc(
+    n: usize,
+    max_points: Option<usize>,
+    rank_max: Option<usize>,
+) -> Vec<usize> {
+    let limit = max_points.unwrap_or(QQ_BAND_MAX_POINTS_DEFAULT);
+    let rank_cap = rank_max.unwrap_or(n).max(1).min(n);
+    qq_sample_ranks_desc_with_keep_head(rank_cap, limit, QQ_BAND_KEEP_HEAD)
+}
+
 fn qq_band_beta_logp_exact_impl(
     n: usize,
     ci: f64,
     max_points: Option<usize>,
+    rank_max: Option<usize>,
 ) -> Result<(Vec<f64>, Vec<f64>, Vec<f64>), String> {
     if n == 0 {
         return Err("n must be >= 1".to_string());
@@ -83,21 +102,38 @@ fn qq_band_beta_logp_exact_impl(
     let q_hi = 1.0 - alpha / 2.0;
     let n_f = n as f64;
 
-    let ranks = qq_sample_ranks_desc(n, max_points);
-    let mut expected_logp = Vec::with_capacity(ranks.len());
-    let mut ci_low_logp = Vec::with_capacity(ranks.len());
-    let mut ci_high_logp = Vec::with_capacity(ranks.len());
-
-    for rank in ranks {
-        let a = rank as f64;
-        let b = (n - rank + 1) as f64;
-        let beta = Beta::new(a, b).map_err(|e| format!("beta({a},{b}) init failed: {e}"))?;
-        let p_upper = beta.inverse_cdf(q_hi).clamp(PVALUE_EPS, 1.0);
-        let p_lower = beta.inverse_cdf(q_lo).clamp(PVALUE_EPS, 1.0);
-        let exp_p = (a / (n_f + 1.0)).clamp(PVALUE_EPS, 1.0);
-        expected_logp.push(-exp_p.log10());
-        ci_low_logp.push(-p_upper.log10());
-        ci_high_logp.push(-p_lower.log10());
+    let ranks = qq_band_sample_ranks_desc(n, max_points, rank_max);
+    let rows: Result<Vec<(f64, f64, f64)>, String> = ranks
+        .par_iter()
+        .map(|&rank| {
+            let a = rank as f64;
+            let b = (n - rank + 1) as f64;
+            let (p_upper, p_lower) = if a <= b {
+                let beta = Beta::new(a, b).map_err(|e| format!("beta({a},{b}) init failed: {e}"))?;
+                (
+                    beta.inverse_cdf(q_hi).clamp(PVALUE_EPS, 1.0),
+                    beta.inverse_cdf(q_lo).clamp(PVALUE_EPS, 1.0),
+                )
+            } else {
+                let beta_flip = Beta::new(b, a)
+                    .map_err(|e| format!("beta({b},{a}) init failed via symmetry: {e}"))?;
+                (
+                    (1.0 - beta_flip.inverse_cdf(q_lo)).clamp(PVALUE_EPS, 1.0),
+                    (1.0 - beta_flip.inverse_cdf(q_hi)).clamp(PVALUE_EPS, 1.0),
+                )
+            };
+            let exp_p = (a / (n_f + 1.0)).clamp(PVALUE_EPS, 1.0);
+            Ok((-exp_p.log10(), -p_upper.log10(), -p_lower.log10()))
+        })
+        .collect();
+    let rows = rows?;
+    let mut expected_logp = Vec::with_capacity(rows.len());
+    let mut ci_low_logp = Vec::with_capacity(rows.len());
+    let mut ci_high_logp = Vec::with_capacity(rows.len());
+    for (exp_v, low_v, high_v) in rows {
+        expected_logp.push(exp_v);
+        ci_low_logp.push(low_v);
+        ci_high_logp.push(high_v);
     }
 
     Ok((expected_logp, ci_low_logp, ci_high_logp))
@@ -114,12 +150,13 @@ fn qq_rank_sample_zero_based_impl(n: usize, max_points: Option<usize>) -> Result
 }
 
 #[pyfunction]
-#[pyo3(signature = (n, ci=95.0, max_points=None))]
+#[pyo3(signature = (n, ci=95.0, max_points=Some(QQ_BAND_MAX_POINTS_DEFAULT), rank_max=None))]
 pub fn qq_band_beta_logp_exact<'py>(
     py: Python<'py>,
     n: usize,
     ci: f64,
     max_points: Option<usize>,
+    rank_max: Option<usize>,
 ) -> PyResult<(
     Bound<'py, PyArray1<f64>>,
     Bound<'py, PyArray1<f64>>,
@@ -129,7 +166,7 @@ pub fn qq_band_beta_logp_exact<'py>(
         return Err(PyValueError::new_err("n must be >= 1"));
     }
     let (expected_logp, ci_low_logp, ci_high_logp) = py
-        .detach(|| qq_band_beta_logp_exact_impl(n, ci, max_points))
+        .detach(|| qq_band_beta_logp_exact_impl(n, ci, max_points, rank_max))
         .map_err(PyRuntimeError::new_err)?;
     Ok((
         expected_logp.into_pyarray(py),
@@ -157,8 +194,9 @@ pub fn qq_rank_sample_zero_based<'py>(
 #[cfg(test)]
 mod tests {
     use super::{
-        qq_band_beta_logp_exact_impl, qq_rank_sample_zero_based_impl, qq_sample_ranks_desc,
-        QQ_SAMPLE_KEEP_HEAD, QQ_SAMPLE_MAX_POINTS_DEFAULT, QQ_SAMPLE_TRIGGER,
+        qq_band_beta_logp_exact_impl, qq_band_sample_ranks_desc, qq_rank_sample_zero_based_impl,
+        qq_sample_ranks_desc, QQ_BAND_KEEP_HEAD, QQ_BAND_MAX_POINTS_DEFAULT, QQ_SAMPLE_KEEP_HEAD,
+        QQ_SAMPLE_MAX_POINTS_DEFAULT, QQ_SAMPLE_TRIGGER,
     };
 
     #[test]
@@ -192,8 +230,29 @@ mod tests {
     }
 
     #[test]
+    fn band_sampler_covers_full_range_with_small_exact_head() {
+        let n = 5_000_000usize;
+        let ranks = qq_band_sample_ranks_desc(n, Some(QQ_BAND_MAX_POINTS_DEFAULT), None);
+        assert_eq!(ranks[0], n);
+        assert_eq!(ranks[ranks.len() - 1], 1);
+        assert_eq!(ranks.len(), QQ_BAND_MAX_POINTS_DEFAULT);
+        let head: Vec<usize> = ranks[ranks.len() - QQ_BAND_KEEP_HEAD..].to_vec();
+        assert_eq!(head[0], QQ_BAND_KEEP_HEAD);
+        assert_eq!(head[head.len() - 1], 1);
+    }
+
+    #[test]
+    fn band_sampler_rank_cap_limits_visible_window() {
+        let n = 5_000_000usize;
+        let ranks = qq_band_sample_ranks_desc(n, Some(QQ_BAND_MAX_POINTS_DEFAULT), Some(1_000_000));
+        assert_eq!(ranks[0], 1_000_000);
+        assert_eq!(ranks[ranks.len() - 1], 1);
+        assert!(ranks.iter().all(|&r| r <= 1_000_000));
+    }
+
+    #[test]
     fn qq_band_outputs_are_finite_and_monotone() {
-        let (exp, lo, hi) = qq_band_beta_logp_exact_impl(10_000, 95.0, Some(512)).unwrap();
+        let (exp, lo, hi) = qq_band_beta_logp_exact_impl(10_000, 95.0, Some(512), None).unwrap();
         assert_eq!(exp.len(), lo.len());
         assert_eq!(exp.len(), hi.len());
         assert!(exp.iter().all(|v| v.is_finite() && *v >= 0.0));

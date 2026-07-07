@@ -3395,7 +3395,6 @@ def render_single_svg(
             qq_mode="auto",
             qq_auto_threshold=1_000_000,
             qq_fast_max_points=120_000,
-            qq_band_max_points=20_000,
         )
         for coll in ax_qq.collections:
             try:

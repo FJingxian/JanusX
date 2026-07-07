@@ -2872,6 +2872,76 @@ def _apply_qq_axes(
     apply_integer_yticks(ax)
 
 
+def _draw_single_qq_axis(
+    ax: plt.Axes,
+    *,
+    pvals,
+    threshold: Optional[float],
+    scatter_size: float,
+    marker: str,
+    point_color: str,
+    band_color: str,
+    y_lower: float,
+    y_upper: Optional[float],
+    y_ticks: Optional[np.ndarray],
+    keep_all: bool,
+    rasterized: bool,
+) -> None:
+    pvals_arr = np.asarray(pvals, dtype=float)
+    exp, obs = _qq_select_points_with_threshold(
+        pvals_arr,
+        sig_p_threshold=(
+            float(threshold)
+            if (threshold is not None and np.isfinite(float(threshold)) and float(threshold) > 0.0)
+            else None
+        ),
+        max_points=_QQ_FAST_MAX_POINTS,
+        keep_all=bool(keep_all),
+    )
+    if exp.size > 0 and obs.size > 0:
+        ax.scatter(
+            exp,
+            obs,
+            s=scatter_size,
+            marker=str(marker),
+            alpha=0.45,
+            rasterized=rasterized,
+            color=str(point_color),
+            **_marker_scatter_style(str(marker)),
+        )
+
+    qq_band_n = int(np.sum(np.isfinite(pvals_arr) & (pvals_arr > 0.0)))
+    x_right = 1.0
+    if exp.size > 0:
+        x_right = max(x_right, float(np.nanmax(exp)))
+    if qq_band_n > 0:
+        x_band, lower_band, upper_band = _qq_confidence_band_from_n(
+            qq_band_n,
+            max_points=_QQ_BAND_MAX_POINTS,
+        )
+        if x_band.size > 0:
+            x_right = max(x_right, float(np.nanmax(x_band)))
+            ax.fill_between(
+                x_band,
+                lower_band,
+                upper_band,
+                color=str(band_color),
+                alpha=0.25,
+                rasterized=rasterized,
+                zorder=0,
+            )
+
+    qq_lo, qq_hi = _resolve_qq_ylim(ax, lower=y_lower, upper=y_upper)
+    _apply_qq_axes(
+        ax,
+        y_lower=qq_lo,
+        y_upper=qq_hi,
+        x_right=x_right,
+        y_ticks=y_ticks,
+    )
+    apply_integer_xticks(ax)
+
+
 def _create_ratio_panel_figure(
     *,
     ratio: float,
@@ -3125,8 +3195,8 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
 
         need_manh_panel = args.manh_ratio is not None or effective_ldblock_ratio is not None
         plotmodel = None
-        plotmodel_qq = None
-        if (need_manh_panel or args.qq_ratio is not None) and df.shape[0] > 0:
+        qq_pvals = None
+        if need_manh_panel and df.shape[0] > 0:
             plotmodel = GWASPLOT(
                 df,
                 chr_col,
@@ -3137,17 +3207,8 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
             )
             if args.bimrange_tuples is not None and len(bim_layout) > 1:
                 _apply_segmented_x_to_plotmodel(plotmodel, df, chr_col, pos_col, bim_layout)
-            if args.qq_ratio is not None:
-                # QQ keeps all threshold-passing SNPs and can down-sample
-                # only sub-threshold points in fast mode.
-                plotmodel_qq = GWASPLOT(
-                    df,
-                    chr_col,
-                    pos_col,
-                    p_col,
-                    float(args.interval),
-                    compression=False,
-                )
+        if args.qq_ratio is not None and df.shape[0] > 0:
+            qq_pvals = pd.to_numeric(df[p_col], errors="coerce").to_numpy(dtype=float, copy=False)
         width_in = float(_PANEL_WIDTH_IN)
         gene_panel_h_in = width_in / 20.0
         dpi = 300
@@ -3401,7 +3462,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                 pending_manh_fig = None
                 pending_manh_path = None
             try:
-                if plotmodel_qq is None:
+                if qq_pvals is None or qq_pvals.size == 0:
                     logger.warning("Warning: QQ plotting skipped because no SNPs are available.")
                     qq_path = None
                 else:
@@ -3431,48 +3492,28 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                         dpi=dpi,
                         panel_height_in=qq_y_in,
                     )
-                    plotmodel_qq.qq(
+                    _draw_single_qq_axis(
                         ax=ax2,
-                        color_set=[qq_point_color, qq_band_color],
-                        marker=single_marker,
-                        line_color="black",
-                        scatter_size=args.scatter_size,
-                        qq_mode=("full" if args.fullscatter else "auto"),
-                        qq_fast_max_points=_QQ_FAST_MAX_POINTS,
-                        sig_p_threshold=(
+                        pvals=qq_pvals,
+                        threshold=(
                             float(threshold)
                             if (np.isfinite(threshold) and float(threshold) > 0.0)
                             else None
                         ),
-                        axis_min=qq_lower,
-                        axis_max=qq_upper_target,
+                        scatter_size=args.scatter_size,
+                        marker=single_marker,
+                        point_color=qq_point_color,
                         band_color=qq_band_color,
-                        rasterized=rasterized,
-                    )
-                    qq_xmax = float(np.log10(plotmodel_qq.df.shape[0] + 1))
-                    if np.isfinite(qq_xmax) and qq_xmax > 0:
-                        x_right = float(qq_xmax)
-                    else:
-                        _x_right = ax2.get_xlim()[1]
-                        x_right = float(_x_right)
-                    x_right = max(1.0, x_right)
-                    qq_lower, qq_upper = _resolve_qq_ylim(
-                        ax2,
-                        lower=qq_lower,
-                        upper=qq_upper_target,
-                    )
-                    _apply_qq_axes(
-                        ax2,
                         y_lower=qq_lower,
-                        y_upper=qq_upper,
-                        x_right=x_right,
+                        y_upper=qq_upper_target,
                         y_ticks=(
                             manh_yticks
                             if (manh_yticks is not None and manh_ylim is not None)
                             else None
                         ),
+                        keep_all=bool(args.fullscatter),
+                        rasterized=rasterized,
                     )
-                    apply_integer_xticks(ax2)
                     if manh_fontsize is not None:
                         ax2.xaxis.label.set_size(manh_fontsize)
                         ax2.yaxis.label.set_size(manh_fontsize)

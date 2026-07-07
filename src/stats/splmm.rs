@@ -58,6 +58,8 @@ use crate::splmm_approx::{
 use crate::stats_common::{env_truthy, get_cached_pool, parse_index_vec_i64};
 
 const SPLMM_TINY: f64 = 1e-30_f64;
+const SPLMM_RESIDUAL_SSQ_REL_EPS: f64 = 1e-12_f64;
+const SPLMM_RESIDUAL_SSQ_ABS_EPS: f64 = 1e-10_f64;
 const SPLMM_DEFAULT_RHAT_MARKERS: usize = 30;
 const SPLMM_DEFAULT_RHAT_SEED: u64 = 20260527;
 const SPLMM_DEFAULT_SPARSE_CHOLESKY_MAX_L_NNZ: usize = 100_000_000;
@@ -1694,6 +1696,16 @@ fn residualized_sumsq_scalar(xtx00_inv: f64, xts0: f64, s_sq: f64) -> f64 {
 }
 
 #[inline]
+pub(crate) fn splmm_residual_sumsq_is_effectively_zero(resid_s_sq: f64, raw_s_sq: f64) -> bool {
+    if !(resid_s_sq.is_finite() && raw_s_sq.is_finite()) {
+        return true;
+    }
+    let raw_scale = raw_s_sq.abs().max(1.0_f64);
+    let tol = SPLMM_RESIDUAL_SSQ_ABS_EPS.max(SPLMM_RESIDUAL_SSQ_REL_EPS * raw_scale);
+    resid_s_sq <= tol
+}
+
+#[inline]
 fn cast_f64_slice_to_f32(input: &[f64]) -> Result<Vec<f32>, String> {
     let mut out = Vec::with_capacity(input.len());
     for &value in input {
@@ -3077,6 +3089,15 @@ fn grammar_scan_blocks_core<G: GenotypeMatrix>(
                                 let xts0 = dot_row[1] as f64;
                                 let s_m_s =
                                     residualized_sumsq_scalar(xtx00_inv, xts0, ss_slice[local_idx]);
+                                if splmm_residual_sumsq_is_effectively_zero(
+                                    s_m_s,
+                                    ss_slice[local_idx],
+                                ) {
+                                    out_row[0] = f64::NAN;
+                                    out_row[1] = f64::NAN;
+                                    out_row[2] = 1.0_f64;
+                                    continue;
+                                }
                                 let denom_scaled = denom_scale * s_m_s;
                                 if let Some((beta, se, pwald)) =
                                     splmm_wald_from_score_denom(score, denom_scaled, wald_sigma2)
@@ -3114,6 +3135,15 @@ fn grammar_scan_blocks_core<G: GenotypeMatrix>(
                                         alpha,
                                         ss_slice[local_idx],
                                     );
+                                    if splmm_residual_sumsq_is_effectively_zero(
+                                        s_m_s,
+                                        ss_slice[local_idx],
+                                    ) {
+                                        out_row[0] = f64::NAN;
+                                        out_row[1] = f64::NAN;
+                                        out_row[2] = 1.0_f64;
+                                        continue;
+                                    }
                                     let score = score_scale * (dot_row[0] as f64);
                                     let denom_scaled = denom_scale * s_m_s;
                                     if let Some((beta, se, pwald)) = splmm_wald_from_score_denom(

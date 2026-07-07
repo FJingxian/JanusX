@@ -25,8 +25,8 @@ use crate::splmm::{
     choose_rhat_rows, decode_rhat_markers_col_major, emit_progress_callback,
     emit_splmm_null_scan_core_timing, n_rhat_progress_total, scan_to_tsv_with_py_and_rhat,
     scan_with_py_and_rhat, splmm_top_level_timing_enabled, trivial_pcg_null_info,
-    trivial_pcg_rhat_info, SplmmPreparedInput, SplmmScanResult, SplmmScanToTsvResult,
-    SplmmTsvMetaInput,
+    trivial_pcg_rhat_info, splmm_residual_sumsq_is_effectively_zero, SplmmPreparedInput,
+    SplmmScanResult, SplmmScanToTsvResult, SplmmTsvMetaInput,
 };
 use pyo3::prelude::*;
 use std::time::Instant;
@@ -827,6 +827,7 @@ impl ResidualizedApproxNullFit {
         let mut n_used = 0usize;
         for marker_idx in 0..n_markers {
             let g = &markers_col_major[marker_idx * n..(marker_idx + 1) * n];
+            let g_sq = dot_f64(g, g);
             residualize_vector_with_chol(
                 x_design,
                 xtx_chol.as_slice(),
@@ -836,7 +837,7 @@ impl ResidualizedApproxNullFit {
                 &mut alpha,
             )?;
             let s_ms = dot_f64(g_resid.as_slice(), g_resid.as_slice());
-            if !s_ms.is_finite() || s_ms <= SPLMM_APPROX_TINY {
+            if splmm_residual_sumsq_is_effectively_zero(s_ms, g_sq) {
                 continue;
             }
             let residualized_v_inv_g = self.factor.solve_vec(g_resid.as_slice())?;
@@ -1021,6 +1022,9 @@ impl ResidualizedApproxScanModel {
             alpha.as_mut_slice(),
             g_sq,
         );
+        if splmm_residual_sumsq_is_effectively_zero(s_ms, g_sq) {
+            return Ok((f64::NAN, f64::NAN, 1.0_f64));
+        }
         let denom = self.gamma * s_ms;
         if !(denom.is_finite() && denom > SPLMM_APPROX_TINY) {
             return Ok((f64::NAN, f64::NAN, 1.0_f64));
@@ -1096,6 +1100,20 @@ mod tests {
         assert!((beta - beta_expected).abs() <= 1e-12_f64);
         assert!((se - se_expected).abs() <= 1e-12_f64);
         assert!((pwald - p_expected).abs() <= 1e-12_f64);
+    }
+
+    #[test]
+    fn residualized_scan_model_marks_constant_marker_as_nan() {
+        let x_design = vec![1.0_f64, 1.0_f64, 1.0_f64, 1.0_f64];
+        let a_vec = vec![1.0_f64, -1.0_f64, 0.5_f64, -0.5_f64];
+        let gamma = 0.4_f64;
+        let g = vec![1.0_f64, 1.0_f64, 1.0_f64, 1.0_f64];
+        let model = ResidualizedApproxScanModel::from_a_vec(&x_design, &a_vec, gamma).unwrap();
+        let (beta, se, pwald) = model.assoc_from_marker(&g).unwrap();
+
+        assert!(beta.is_nan());
+        assert!(se.is_nan());
+        assert_eq!(pwald, 1.0_f64);
     }
 
     #[test]

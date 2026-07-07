@@ -1,0 +1,79 @@
+name: Workflow Check
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/**"
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  lint-workflows:
+    name: Lint workflow files
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Parse workflow YAML
+        shell: bash
+        run: |
+          ruby -e 'require "yaml"; Dir[".github/workflows/*.{yml,yaml}"].sort.each { |f| YAML.load_file(f) }; puts "YAML OK"'
+
+      - name: Run actionlint
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v "$PWD:/repo" \
+            -w /repo \
+            rhysd/actionlint:latest \
+            -color
+
+      - name: Verify reusable wheel workflow wiring
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rg -n "uses: \./\.github/workflows/reusable-wheel-build.yml" \
+            .github/workflows/build-wheel.yml \
+            .github/workflows/release.yml
+
+          rg -n "matrix_preset: standard" .github/workflows/build-wheel.yml
+          rg -n "matrix_preset: release" .github/workflows/release.yml
+          rg -n "workflow_call:" .github/workflows/build-wheel.yml
+          rg -n "source_repository:" .github/workflows/build-wheel.yml
+
+          rg -n "Build wheels \(Linux\)" .github/workflows/reusable-wheel-build.yml
+          rg -n "Install OpenBLAS \(Windows ARM64 via vcpkg\)" .github/workflows/reusable-wheel-build.yml
+          rg -n "auditwheel repair" .github/workflows/reusable-wheel-build.yml
+
+          if rg -n \
+            -e "Build wheels \\(Linux\\)" \
+            -e "Install OpenBLAS \\(Windows ARM64 via vcpkg\\)" \
+            -e "auditwheel repair" \
+            .github/workflows/build-wheel.yml \
+            .github/workflows/release.yml; then
+            echo "Entry workflows should call reusable-wheel-build.yml instead of inlining wheel build logic."
+            exit 1
+          fi
+
+      - name: Verify reusable sdist workflow wiring
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rg -n "uses: \./\.github/workflows/reusable-sdist-build.yml" .github/workflows/release.yml
+          rg -n "name: Reusable sdist Build" .github/workflows/reusable-sdist-build.yml
+          rg -n "maturin sdist --out dist" .github/workflows/reusable-sdist-build.yml
+
+          if rg -n \
+            -e "maturin sdist --out dist" \
+            -e "name: Build sdist" \
+            .github/workflows/release.yml; then
+            echo "release.yml should call reusable-sdist-build.yml instead of inlining sdist build logic."
+            exit 1
+          fi

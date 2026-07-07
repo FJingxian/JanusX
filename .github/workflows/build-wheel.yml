@@ -1,11 +1,16 @@
-name: Build Wheels Only
+name: Build Wheels
 
-run-name: build-wheels/${{ github.event.inputs.target || 'all' }} @ ${{ github.event.inputs.ref || github.ref_name }}
+run-name: build-wheels/${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.target || 'all') || inputs.target || 'all' }} @ ${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.source_ref || github.ref_name) || inputs.source_ref || github.ref_name }}
 
 on:
   workflow_dispatch:
     inputs:
-      ref:
+      source_repository:
+        description: "Repository containing the source code"
+        required: false
+        default: ""
+        type: string
+      source_ref:
         description: "Git ref (tag/sha/branch) to build from"
         required: false
         default: ""
@@ -28,6 +33,36 @@ on:
         required: true
         default: "14"
         type: string
+  workflow_call:
+    inputs:
+      source_repository:
+        description: "Repository containing the source code"
+        required: false
+        default: ""
+        type: string
+      source_ref:
+        description: "Git ref (tag/sha/branch) to build from"
+        required: false
+        default: ""
+        type: string
+      target:
+        description: "Target platform to build"
+        required: false
+        default: "all"
+        type: string
+      retention_days:
+        description: "Artifact retention days"
+        required: false
+        default: "14"
+        type: string
+      package_version:
+        description: "Resolved package version override"
+        required: false
+        default: ""
+        type: string
+    secrets:
+      checkout_token:
+        required: false
 
 permissions:
   contents: read
@@ -40,65 +75,91 @@ jobs:
     name: Prepare wheel request
     runs-on: ubuntu-latest
     outputs:
-      source_ref: ${{ steps.source.outputs.source_ref }}
-      package_version: ${{ steps.version.outputs.package_version }}
+      source_repository: ${{ steps.resolve.outputs.source_repository }}
+      source_ref: ${{ steps.resolve.outputs.source_ref }}
+      package_version: ${{ steps.resolve.outputs.package_version }}
+      target: ${{ steps.resolve.outputs.target }}
+      retention_days: ${{ steps.resolve.outputs.retention_days }}
     steps:
-      - name: Resolve source ref
-        id: source
+      - name: Resolve request
+        id: resolve
         shell: bash
         env:
-          INPUT_REF: ${{ github.event.inputs.ref }}
-        run: |
-          if [[ -n "${INPUT_REF}" ]]; then
-            echo "source_ref=${INPUT_REF}" >> "$GITHUB_OUTPUT"
-          else
-            echo "source_ref=${GITHUB_REF}" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Resolve package version from tag
-        id: version
-        shell: bash
-        env:
-          RAW_REF: ${{ github.event.inputs.ref || github.ref_name }}
+          EVENT_NAME: ${{ github.event_name }}
+          DISPATCH_SOURCE_REPOSITORY: ${{ github.event.inputs.source_repository }}
+          DISPATCH_SOURCE_REF: ${{ github.event.inputs.source_ref }}
+          DISPATCH_TARGET: ${{ github.event.inputs.target }}
+          DISPATCH_RETENTION_DAYS: ${{ github.event.inputs.retention_days }}
+          CALL_SOURCE_REPOSITORY: ${{ inputs.source_repository }}
+          CALL_SOURCE_REF: ${{ inputs.source_ref }}
+          CALL_TARGET: ${{ inputs.target }}
+          CALL_RETENTION_DAYS: ${{ inputs.retention_days }}
+          CALL_PACKAGE_VERSION: ${{ inputs.package_version }}
         run: |
           python - <<'PY'
           import os
           import re
 
-          raw_ref = (os.environ.get("RAW_REF") or "").strip()
-          ref = raw_ref
-          if ref.startswith("refs/tags/"):
-              ref = ref[len("refs/tags/") :]
+          event_name = (os.environ.get("EVENT_NAME") or "").strip()
+          if event_name == "workflow_dispatch":
+              source_repository = (os.environ.get("DISPATCH_SOURCE_REPOSITORY") or "").strip()
+              source_ref = (os.environ.get("DISPATCH_SOURCE_REF") or "").strip()
+              target = (os.environ.get("DISPATCH_TARGET") or "all").strip() or "all"
+              retention_days = (os.environ.get("DISPATCH_RETENTION_DAYS") or "14").strip() or "14"
+              raw_ref = source_ref or os.environ.get("GITHUB_REF_NAME", "")
+              package_version = ""
+              ref = raw_ref
+              if ref.startswith("refs/tags/"):
+                  ref = ref[len("refs/tags/") :]
+              if ref.startswith("v"):
+                  base_version = ref[1:]
+                  if base_version == "":
+                      raise SystemExit(f"Invalid empty version from ref: {raw_ref!r}")
+                  if not re.fullmatch(r"[0-9A-Za-z][0-9A-Za-z.\\-+]*", base_version):
+                      raise SystemExit(f"Unsupported version format from ref: {raw_ref!r}")
+                  package_version = base_version
+          else:
+              source_repository = (os.environ.get("CALL_SOURCE_REPOSITORY") or "").strip()
+              source_ref = (os.environ.get("CALL_SOURCE_REF") or "").strip()
+              target = (os.environ.get("CALL_TARGET") or "all").strip() or "all"
+              retention_days = (os.environ.get("CALL_RETENTION_DAYS") or "14").strip() or "14"
+              package_version = (os.environ.get("CALL_PACKAGE_VERSION") or "").strip()
 
-          package_version = ""
-          if ref.startswith("v"):
-              base_version = ref[1:]
-              if base_version == "":
-                  raise SystemExit(f"Invalid empty version from ref: {raw_ref!r}")
-              if not re.fullmatch(r"[0-9A-Za-z][0-9A-Za-z.\-+]*", base_version):
-                  raise SystemExit(f"Unsupported version format from ref: {raw_ref!r}")
-              package_version = base_version
+          if source_ref == "":
+              source_ref = os.environ.get("GITHUB_REF", "")
 
-          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+          out = os.environ["GITHUB_OUTPUT"]
+          with open(out, "a", encoding="utf-8") as fh:
+              fh.write(f"source_repository={source_repository}\n")
+              fh.write(f"source_ref={source_ref}\n")
               fh.write(f"package_version={package_version}\n")
-          print(f"[build-wheel] package_version={package_version or '<repo-version>'}")
+              fh.write(f"target={target}\n")
+              fh.write(f"retention_days={retention_days}\n")
+          print(
+              f"[build-wheel-entry] repository={source_repository or '<current>'} "
+              f"ref={source_ref} target={target} package_version={package_version or '<repo-version>'}"
+          )
           PY
 
       - name: Write request summary
+        if: ${{ github.event_name == 'workflow_dispatch' }}
         shell: bash
         env:
-          TARGET: ${{ github.event.inputs.target || 'all' }}
-          RETENTION_DAYS: ${{ github.event.inputs.retention_days || '14' }}
-          PACKAGE_VERSION: ${{ steps.version.outputs.package_version }}
-          SOURCE_REF: ${{ steps.source.outputs.source_ref }}
+          SOURCE_REPOSITORY: ${{ steps.resolve.outputs.source_repository }}
+          SOURCE_REF: ${{ steps.resolve.outputs.source_ref }}
+          TARGET: ${{ steps.resolve.outputs.target }}
+          RETENTION_DAYS: ${{ steps.resolve.outputs.retention_days }}
+          PACKAGE_VERSION: ${{ steps.resolve.outputs.package_version }}
         run: |
           if [[ -n "${PACKAGE_VERSION}" ]]; then
             VERSION_TEXT="${PACKAGE_VERSION}"
           else
             VERSION_TEXT="repo version"
           fi
+          REPO_TEXT="${SOURCE_REPOSITORY:-${GITHUB_REPOSITORY}}"
           cat <<EOF >> "$GITHUB_STEP_SUMMARY"
           ## Wheel Build Request
+          - Source repository: \`${REPO_TEXT}\`
           - Source ref: \`${SOURCE_REF}\`
           - Target: \`${TARGET}\`
           - Package version override: \`${VERSION_TEXT}\`
@@ -111,8 +172,11 @@ jobs:
       - prepare
     uses: ./.github/workflows/reusable-wheel-build.yml
     with:
+      source_repository: ${{ needs.prepare.outputs.source_repository }}
       source_ref: ${{ needs.prepare.outputs.source_ref }}
       package_version: ${{ needs.prepare.outputs.package_version }}
       matrix_preset: standard
-      target: ${{ github.event.inputs.target || 'all' }}
-      retention_days: ${{ github.event.inputs.retention_days }}
+      target: ${{ needs.prepare.outputs.target }}
+      retention_days: ${{ needs.prepare.outputs.retention_days }}
+    secrets:
+      checkout_token: ${{ secrets.checkout_token }}

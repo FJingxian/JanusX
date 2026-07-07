@@ -1,0 +1,95 @@
+name: Reusable sdist Build
+
+on:
+  workflow_call:
+    inputs:
+      source_repository:
+        description: "Repository containing the JanusX source tree"
+        required: false
+        default: ""
+        type: string
+      source_ref:
+        description: "Git ref (tag/sha/branch) to build from"
+        required: false
+        default: ""
+        type: string
+      package_version:
+        description: "Resolved package version to sync before sdist build"
+        required: false
+        default: ""
+        type: string
+      artifact_name:
+        description: "sdist artifact name"
+        required: false
+        default: "sdist"
+        type: string
+      retention_days:
+        description: "Artifact retention days; empty uses repo default"
+        required: false
+        default: ""
+        type: string
+    secrets:
+      checkout_token:
+        required: false
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  build-sdist:
+    name: Build sdist
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ inputs.source_repository != '' && inputs.source_repository || github.repository }}
+          ref: ${{ inputs.source_ref }}
+          token: ${{ secrets.checkout_token != '' && secrets.checkout_token || github.token }}
+
+      - name: Sync version for package build
+        shell: bash
+        run: |
+          VERSION="${{ inputs.package_version }}"
+          if [[ -z "$VERSION" ]]; then
+            echo "Skip sync_version_from_tag.py (no package version override)"
+            exit 0
+          fi
+          echo "Using package version: $VERSION"
+          PY=python
+          command -v python >/dev/null 2>&1 || PY=python3
+          $PY scripts/sync_version_from_tag.py "$VERSION"
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install build tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install maturin==1.9.4
+
+      - name: Build sdist
+        run: |
+          maturin sdist --out dist
+
+      - name: Upload sdist artifact
+        if: ${{ inputs.retention_days != '' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: ${{ inputs.retention_days }}
+
+      - name: Upload sdist artifact
+        if: ${{ inputs.retention_days == '' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: dist/*.tar.gz
+          if-no-files-found: error

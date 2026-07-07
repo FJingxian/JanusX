@@ -3,9 +3,15 @@ name: Reusable Wheel Build
 on:
   workflow_call:
     inputs:
+      source_repository:
+        description: "Repository containing the JanusX source tree"
+        required: false
+        default: ""
+        type: string
       source_ref:
         description: "Git ref (tag/sha/branch) to build from"
-        required: true
+        required: false
+        default: ""
         type: string
       package_version:
         description: "Resolved package version to sync before wheel build"
@@ -26,6 +32,9 @@ on:
         required: false
         default: ""
         type: string
+    secrets:
+      checkout_token:
+        required: false
 
 permissions:
   contents: read
@@ -283,7 +292,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
         with:
+          repository: ${{ inputs.source_repository != '' && inputs.source_repository || github.repository }}
           ref: ${{ inputs.source_ref }}
+          token: ${{ secrets.checkout_token != '' && secrets.checkout_token || github.token }}
 
       - name: Sync version for package build
         shell: bash

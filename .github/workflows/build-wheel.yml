@@ -1,0 +1,580 @@
+name: Build Wheels Only
+
+run-name: build-wheels/${{ github.event.inputs.target || 'all' }} @ ${{ github.event.inputs.ref || github.ref_name }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref (tag/sha/branch) to build from"
+        required: false
+        default: ""
+        type: string
+      target:
+        description: "Target platform to build"
+        required: true
+        default: "all"
+        type: choice
+        options:
+          - all
+          - linux-x86_64
+          - linux-aarch64
+          - macos-x86_64
+          - macos-arm64
+          - windows-x86_64
+          - windows-arm64
+      retention_days:
+        description: "Artifact retention days"
+        required: true
+        default: "14"
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  prepare:
+    name: Prepare build matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.targets.outputs.matrix }}
+      package_version: ${{ steps.version.outputs.package_version }}
+      source_ref: ${{ steps.source.outputs.source_ref }}
+    steps:
+      - name: Resolve source ref
+        id: source
+        shell: bash
+        env:
+          INPUT_REF: ${{ github.event.inputs.ref }}
+        run: |
+          if [[ -n "${INPUT_REF}" ]]; then
+            echo "source_ref=${INPUT_REF}" >> "$GITHUB_OUTPUT"
+          else
+            echo "source_ref=${GITHUB_REF}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Select target matrix
+        id: targets
+        shell: bash
+        env:
+          TARGET: ${{ github.event.inputs.target || 'all' }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+
+          target = (os.environ.get("TARGET") or "all").strip() or "all"
+          entries = [
+              {
+                  "label": "linux-x86_64",
+                  "runner": "ubuntu-latest",
+                  "platform": "linux",
+                  "python-version": "3.10",
+                  "manylinux": "2014",
+                  "manylinux_image": "quay.io/pypa/manylinux2014_x86_64:latest",
+                  "interpreter": "/opt/python/cp310-cp310/bin/python",
+                  "target": "x86_64-unknown-linux-gnu",
+                  "require_openblas": "1",
+                  "prefer_accelerate": "0",
+                  "expected_backend": "openblas",
+              },
+              {
+                  "label": "linux-aarch64",
+                  "runner": "ubuntu-24.04-arm",
+                  "platform": "linux",
+                  "python-version": "3.10",
+                  "manylinux": "2014",
+                  "manylinux_image": "quay.io/pypa/manylinux2014_aarch64:latest",
+                  "interpreter": "/opt/python/cp310-cp310/bin/python",
+                  "target": "aarch64-unknown-linux-gnu",
+                  "require_openblas": "1",
+                  "prefer_accelerate": "0",
+                  "expected_backend": "openblas",
+              },
+              {
+                  "label": "macos-x86_64",
+                  "runner": "macos-15-intel",
+                  "platform": "macos",
+                  "python-version": "3.10",
+                  "target": "x86_64-apple-darwin",
+                  "blas_backend": "openblas",
+                  "require_openblas": "1",
+                  "prefer_accelerate": "0",
+                  "expected_backend": "openblas",
+              },
+              {
+                  "label": "macos-arm64",
+                  "runner": "macos-14",
+                  "platform": "macos",
+                  "python-version": "3.10",
+                  "target": "aarch64-apple-darwin",
+                  "blas_backend": "openblas",
+                  "require_openblas": "1",
+                  "prefer_accelerate": "0",
+                  "expected_backend": "openblas",
+              },
+              {
+                  "label": "windows-x86_64",
+                  "runner": "windows-2025-vs2026",
+                  "platform": "windows",
+                  "python-version": "3.10",
+                  "target": "x86_64-pc-windows-msvc",
+                  "require_openblas": "1",
+                  "prefer_accelerate": "0",
+                  "expected_backend": "openblas",
+              },
+              {
+                  "label": "windows-arm64",
+                  "runner": "windows-2025-vs2026",
+                  "platform": "windows",
+                  "python-version": "3.10",
+                  "target": "aarch64-pc-windows-msvc",
+                  "require_openblas": "1",
+                  "prefer_accelerate": "0",
+                  "expected_backend": "openblas",
+              },
+          ]
+
+          if target != "all":
+              entries = [entry for entry in entries if entry["label"] == target]
+              if not entries:
+                  raise SystemExit(f"Unsupported target: {target}")
+
+          matrix = {"include": entries}
+          out = os.environ["GITHUB_OUTPUT"]
+          with open(out, "a", encoding="utf-8") as fh:
+              fh.write("matrix<<EOF\n")
+              fh.write(json.dumps(matrix))
+              fh.write("\nEOF\n")
+          print(f"[build-wheel] selected target={target} entries={len(entries)}")
+          PY
+
+      - name: Resolve package version from tag
+        id: version
+        shell: bash
+        env:
+          RAW_REF: ${{ github.event.inputs.ref || github.ref_name }}
+        run: |
+          python - <<'PY'
+          import os
+          import re
+
+          raw_ref = (os.environ.get("RAW_REF") or "").strip()
+          ref = raw_ref
+          if ref.startswith("refs/tags/"):
+              ref = ref[len("refs/tags/") :]
+
+          package_version = ""
+          if ref.startswith("v"):
+              base_version = ref[1:]
+              if base_version == "":
+                  raise SystemExit(f"Invalid empty version from ref: {raw_ref!r}")
+              if not re.fullmatch(r"[0-9A-Za-z][0-9A-Za-z.\-+]*", base_version):
+                  raise SystemExit(f"Unsupported version format from ref: {raw_ref!r}")
+              package_version = base_version
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"package_version={package_version}\n")
+          print(f"[build-wheel] package_version={package_version or '<repo-version>'}")
+          PY
+
+      - name: Write request summary
+        shell: bash
+        env:
+          TARGET: ${{ github.event.inputs.target || 'all' }}
+          RETENTION_DAYS: ${{ github.event.inputs.retention_days || '14' }}
+          PACKAGE_VERSION: ${{ steps.version.outputs.package_version }}
+          SOURCE_REF: ${{ steps.source.outputs.source_ref }}
+        run: |
+          if [[ -n "${PACKAGE_VERSION}" ]]; then
+            VERSION_TEXT="${PACKAGE_VERSION}"
+          else
+            VERSION_TEXT="repo version"
+          fi
+          cat <<EOF >> "$GITHUB_STEP_SUMMARY"
+          ## Wheel Build Request
+          - Source ref: \`${SOURCE_REF}\`
+          - Target: \`${TARGET}\`
+          - Package version override: \`${VERSION_TEXT}\`
+          - Artifact retention: \`${RETENTION_DAYS}\` days
+          EOF
+
+  build-wheels:
+    name: Build wheels (${{ matrix.label }})
+    needs:
+      - prepare
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    env:
+      JANUSX_REQUIRE_OPENBLAS: ${{ matrix.require_openblas }}
+      JANUSX_MACOS_PREFER_ACCELERATE: ${{ matrix.prefer_accelerate }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.source_ref }}
+
+      - name: Sync version for package build
+        shell: bash
+        run: |
+          VERSION="${{ needs.prepare.outputs.package_version }}"
+          if [[ -z "$VERSION" ]]; then
+            echo "Skip sync_version_from_tag.py (non-tag ref)"
+            exit 0
+          fi
+          echo "Using package version: $VERSION"
+          PY=python
+          command -v python >/dev/null 2>&1 || PY=python3
+          $PY scripts/sync_version_from_tag.py "$VERSION"
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install build tools
+        if: ${{ matrix.platform != 'linux' }}
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install maturin==1.9.4 build "numpy>=1.23" "pybind11>=2.13" zstandard
+
+      - name: Install OpenBLAS (macOS)
+        if: ${{ matrix.platform == 'macos' }}
+        shell: bash
+        run: |
+          brew update
+          brew list --versions openblas >/dev/null 2>&1 || brew install openblas
+          command -v pkg-config >/dev/null 2>&1 || brew install pkgconf
+          OPENBLAS_PREFIX="$(brew --prefix openblas)"
+          echo "OPENBLAS_LIB_DIR=${OPENBLAS_PREFIX}/lib" >> "$GITHUB_ENV"
+          echo "OPENBLAS_INCLUDE_DIR=${OPENBLAS_PREFIX}/include" >> "$GITHUB_ENV"
+          echo "PKG_CONFIG_PATH=${OPENBLAS_PREFIX}/lib/pkgconfig:${PKG_CONFIG_PATH:-}" >> "$GITHUB_ENV"
+
+      - name: Install OpenBLAS (Windows x86_64, conda-forge threaded)
+        if: ${{ matrix.label == 'windows-x86_64' }}
+        shell: pwsh
+        run: |
+          $dest = Join-Path $env:RUNNER_TEMP "condaforge-openblas-win64"
+          python scripts/ci/install_windows_condaforge_openblas.py `
+            --subdir win-64 `
+            --flavor pthreads `
+            --dest "$dest" `
+            --github-env "$env:GITHUB_ENV" `
+            --verbose
+
+      - name: Install OpenBLAS (Windows ARM64 via vcpkg)
+        if: ${{ matrix.label == 'windows-arm64' }}
+        shell: pwsh
+        run: |
+          $vcpkgRoot = Join-Path $env:RUNNER_TEMP "vcpkg"
+          git clone --depth=1 https://github.com/microsoft/vcpkg $vcpkgRoot
+          & "$vcpkgRoot\bootstrap-vcpkg.bat" -disableMetrics
+
+          # Keep static-md for ARM64 cross-build; Rust side will detect static
+          # layout and switch OpenBLAS extern linkage to kind=static.
+          $triplet = "arm64-windows-static-md"
+
+          & "$vcpkgRoot\vcpkg.exe" install "openblas[threads]:$triplet"
+          if ($LASTEXITCODE -ne 0) {
+            throw "vcpkg install openblas[threads] failed for triplet $triplet"
+          }
+          & "$vcpkgRoot\vcpkg.exe" install "zlib:$triplet"
+          if ($LASTEXITCODE -ne 0) {
+            throw "vcpkg install zlib failed for triplet $triplet"
+          }
+
+          $installed = Join-Path $vcpkgRoot "installed\$triplet"
+          $binDir = Join-Path $installed "bin"
+          $zlibLib = Get-ChildItem -Path "$installed\lib" -Filter "z*.lib" -File | Select-Object -First 1
+          if (-not $zlibLib) {
+            throw "No zlib .lib found under $installed\\lib"
+          }
+          if (Test-Path $binDir) {
+            "OPENBLAS_BIN_DIR=$binDir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          }
+          "OPENBLAS_LIB_DIR=$installed\lib" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "OPENBLAS_INCLUDE_DIR=$installed\include" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "VCPKG_LIB_DIR=$installed\lib" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "JANUSX_ZLIB_LIB_DIR=$installed\lib" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "JANUSX_ZLIB_LIB=$($zlibLib.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Build wheels (Linux)
+        if: ${{ matrix.platform == 'linux' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMAGE="${{ matrix.manylinux_image }}"
+          TARGET="${{ matrix.target }}"
+          INTERP="${{ matrix.interpreter }}"
+
+          docker run --rm \
+            -v "$PWD:/io" \
+            -w /io \
+            "$IMAGE" \
+            bash -lc "
+              set -euo pipefail
+              yum install -y epel-release || true
+              yum install -y gcc gcc-gfortran make pkgconfig curl tar gzip
+              rm -rf dist dist_raw
+              mkdir -p dist dist_raw
+              curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal
+              source /root/.cargo/env
+              export PATH=\"$(dirname ${INTERP}):\${PATH}\"
+              ${INTERP} -m pip install -U pip
+              ${INTERP} -m pip install maturin==1.9.4 build 'numpy>=1.23' 'pybind11>=2.13' auditwheel
+              export OPENBLAS_VERSION=0.3.33
+              . /io/scripts/ci/build_linux_openblas.sh
+              export JANUSX_REQUIRE_OPENBLAS=1
+              export JANUSX_STRICT_KMC_BIND=1
+              ${INTERP} -m build --wheel --outdir dist_raw --no-isolation
+              ${INTERP} /io/scripts/ci/check_wheel_kmc.py --exactly-one dist_raw/*.whl
+              auditwheel show dist_raw/*.whl
+              auditwheel repair dist_raw/*.whl -w dist
+              ${INTERP} /io/scripts/ci/check_wheel_kmc.py --exactly-one dist/*.whl
+              ${INTERP} -m pip install --force-reinstall --no-deps dist/*.whl
+              CXX=/bin/false ${INTERP} /io/scripts/ci/check_installed_runtime.py \
+                --require-openblas \
+                --require-threaded-openblas \
+                --check-kmc-load
+            "
+
+      - name: Build wheels (macOS/Windows)
+        if: ${{ matrix.platform != 'linux' }}
+        shell: bash
+        run: |
+          if [[ "${{ matrix.platform }}" == "macos" ]]; then
+            export JANUSX_STRICT_KMC_BIND=1
+            export JANUSX_BUNDLE_OPENBLAS_DYLIB=1
+            export JANUSX_STRICT_OPENBLAS_BUNDLE=1
+            python -m build --wheel --outdir dist --no-isolation
+          elif [[ "${{ matrix.label }}" == "windows-x86_64" ]]; then
+            export JANUSX_STRICT_KMC_BIND=1
+            python -m build --wheel --outdir dist --no-isolation
+          elif [[ "${{ matrix.label }}" == "windows-arm64" ]]; then
+            # Cross-building Windows ARM64 from x64 host: avoid binding to host-arch Python import libs.
+            export PYO3_CROSS=1
+            export PYO3_CROSS_PYTHON_VERSION=3.10
+            # Skip KMC prebuild on cross target; vendored pybind11 in KMC is not
+            # Python 3.14 friendly and this path is not required for arm64 wheel sanity.
+            export JANUSX_PREBUILD_KMC_BIND=0
+            maturin build --release --out dist --target ${{ matrix.target }} --features blas-openblas,python-extension
+          else
+            maturin build --release --out dist --target ${{ matrix.target }} --interpreter python --features blas-openblas,python-extension
+          fi
+
+      - name: Probe SGEMM backend from built wheel
+        if: ${{ matrix.label != 'windows-arm64' }}
+        shell: bash
+        run: |
+          PY=python
+          command -v python >/dev/null 2>&1 || PY=python3
+          "$PY" -m pip install --upgrade pip
+          "$PY" -m pip install --force-reinstall --no-deps dist/*.whl
+          "$PY" - <<'PY'
+          import janusx.janusx as _jx
+          backend = _jx.rust_sgemm_backend()
+          expected = "${{ matrix.expected_backend }}"
+          print(f"[janusx] rust_sgemm_backend={backend}")
+          if backend != expected:
+              raise SystemExit(f"Strict mode failed: expected {expected!r} backend, got {backend!r}")
+          PY
+
+      - name: Verify bundled macOS dylib signature + load probe
+        if: ${{ matrix.platform == 'macos' }}
+        shell: bash
+        run: |
+          PY=python
+          command -v python >/dev/null 2>&1 || PY=python3
+          "$PY" scripts/ci/check_installed_runtime.py --check-macos-bundled-openblas
+
+      - name: Verify Rust eigh LAPACK backend (windows-x86_64)
+        if: ${{ matrix.label == 'windows-x86_64' }}
+        shell: bash
+        run: |
+          PY=python
+          command -v python >/dev/null 2>&1 || PY=python3
+          "$PY" - <<'PY'
+          import janusx.janusx as _jx
+          _ = _jx.rust_eigh_debug_f64(n=128, threads=4, driver="auto", jobz="V", require_lapack=True)
+          print("[janusx] rust_eigh_debug_f64(require_lapack=True) passed")
+          PY
+
+      - name: Verify bundled OpenBLAS is threaded (windows-x86_64)
+        if: ${{ matrix.label == 'windows-x86_64' }}
+        shell: bash
+        run: |
+          PY=python
+          command -v python >/dev/null 2>&1 || PY=python3
+          "$PY" scripts/ci/check_installed_runtime.py --require-openblas --require-threaded-openblas
+
+      - name: Verify OpenBLAS threading (windows-x86_64)
+        if: ${{ matrix.label == 'windows-x86_64' }}
+        shell: bash
+        run: |
+          PY=python
+          command -v python >/dev/null 2>&1 || PY=python3
+          "$PY" - <<'PY'
+          import os
+          import janusx.janusx as _jx
+
+          target = 8
+          for k in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
+              os.environ[k] = str(target)
+
+          ok = bool(_jx.rust_blas_set_num_threads(target))
+          got = int(_jx.rust_blas_get_num_threads())
+          print(f"[janusx] rust_blas_set_num_threads({target}) -> {ok}")
+          print(f"[janusx] rust_blas_get_num_threads() -> {got}")
+          if not ok:
+              raise SystemExit("Strict mode failed: rust_blas_set_num_threads returned False")
+          if got < 2:
+              raise SystemExit(
+                  "Strict mode failed: OpenBLAS thread control ineffective "
+                  f"(expected >=2, got {got})."
+              )
+          _ = _jx.rust_eigh_debug_f64(
+              n=256,
+              threads=target,
+              driver="auto",
+              jobz="V",
+              require_lapack=True,
+          )
+          print("[janusx] OpenBLAS threading self-check passed")
+          PY
+
+      - name: Verify KMC prebuilt in wheel (all except windows-arm64)
+        if: ${{ matrix.label != 'windows-arm64' }}
+        shell: bash
+        run: |
+          PY=python
+          command -v python >/dev/null 2>&1 || PY=python3
+          "$PY" -m pip install --upgrade pip
+          "$PY" -m pip install --force-reinstall --no-deps dist/*.whl
+          "$PY" scripts/ci/check_wheel_kmc.py --exactly-one
+          "$PY" scripts/ci/check_installed_runtime.py --check-kmc-load
+
+      - name: Wheel runtime smoke test (linux-x86_64)
+        if: ${{ matrix.label == 'linux-x86_64' }}
+        shell: bash
+        run: |
+          PY=python
+          command -v python >/dev/null 2>&1 || PY=python3
+          "$PY" -m pip install --upgrade pip
+          "$PY" -m pip install --force-reinstall dist/*.whl
+          "$PY" scripts/ggval.py \
+            --mode smoke \
+            --threads 2 \
+            --cv 2 \
+            --no-backend-thread-checks
+
+      - name: Verify macOS wheel links OpenBLAS only
+        if: ${{ matrix.platform == 'macos' && matrix.blas_backend == 'openblas' }}
+        shell: bash
+        run: |
+          PY=python
+          command -v python >/dev/null 2>&1 || PY=python3
+          EXT_PATH="$("$PY" - <<'PY'
+          import janusx.janusx as _jx
+          print(_jx.__file__)
+          PY
+          )"
+          echo "[janusx] extension path: ${EXT_PATH}"
+          otool -L "${EXT_PATH}"
+          if ! otool -L "${EXT_PATH}" | grep -qi "libopenblas"; then
+            echo "ERROR: Expected OpenBLAS linkage in macOS wheel."
+            exit 1
+          fi
+          if otool -L "${EXT_PATH}" | grep -q "Accelerate.framework"; then
+            echo "ERROR: Accelerate linkage detected in macOS wheel; expected OpenBLAS-only runtime path."
+            exit 1
+          fi
+
+      - name: Sanity check wheel artifact (windows-arm64 cross-build)
+        if: ${{ matrix.label == 'windows-arm64' }}
+        shell: bash
+        run: |
+          PY=python
+          command -v python >/dev/null 2>&1 || PY=python3
+          "$PY" - <<'PY'
+          import glob
+          import os
+          import zipfile
+
+          wheels = glob.glob("dist/*.whl")
+          print(f"[windows-arm64] built wheels: {wheels}")
+          if len(wheels) != 1:
+              raise SystemExit(f"Expected exactly one wheel, got {len(wheels)}")
+          wheel = wheels[0]
+          if "win_arm64" not in os.path.basename(wheel):
+              raise SystemExit(f"Expected win_arm64 wheel, got {wheel}")
+          with zipfile.ZipFile(wheel, "r") as zf:
+              names = zf.namelist()
+          if not any(name.endswith(".pyd") for name in names):
+              raise SystemExit("No .pyd extension module found inside wheel")
+          print("[windows-arm64] runtime probe skipped on x64 host; static wheel sanity check passed.")
+          PY
+
+      - name: Stage final wheel artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf wheelhouse
+          mkdir -p wheelhouse
+          LABEL="${{ matrix.label }}"
+          PY=python
+          command -v python >/dev/null 2>&1 || PY=python3
+          if [[ "${LABEL}" != "windows-arm64" ]]; then
+            "$PY" scripts/ci/check_wheel_kmc.py --exactly-one dist/*.whl
+          else
+            echo "[build-wheel] skip KMC prebuilt wheel check for ${LABEL} (cross-build path sets JANUSX_PREBUILD_KMC_BIND=0)"
+          fi
+          "$PY" - <<'PY'
+          import glob
+          import os
+          import shutil
+
+          wheels = sorted(glob.glob("dist/*.whl"))
+          if len(wheels) != 1:
+              raise SystemExit(f"Expected exactly one final wheel in dist/, got {len(wheels)}")
+          wheel = wheels[0]
+          dst = os.path.join("wheelhouse", os.path.basename(wheel))
+          shutil.copy2(wheel, dst)
+          print(f"[build-wheel] staged final wheel: {dst}")
+          PY
+
+      - name: Upload final wheel artifact
+        id: upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: wheels-${{ matrix.label }}
+          path: wheelhouse/*.whl
+          if-no-files-found: error
+          retention-days: ${{ github.event.inputs.retention_days }}
+          compression-level: 0
+
+      - name: Write artifact summary
+        shell: bash
+        env:
+          RUN_URL: ${{ format('https://github.com/{0}/actions/runs/{1}', github.repository, github.run_id) }}
+          ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
+        run: |
+          WHEEL_NAME="$(basename wheelhouse/*.whl)"
+          DOWNLOAD_URL="${ARTIFACT_URL:-$RUN_URL}"
+          cat <<EOF >> "$GITHUB_STEP_SUMMARY"
+          ### ${{ matrix.label }}
+          - Wheel: \`${WHEEL_NAME}\`
+          - Artifact: \`wheels-${{ matrix.label }}\`
+          - Download: [artifact or run link](${DOWNLOAD_URL})
+          - Run page: [workflow run](${RUN_URL})
+          - Note: artifact download requires GitHub login and remains valid until the artifact or run expires.
+          EOF

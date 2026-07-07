@@ -2,19 +2,49 @@
 from __future__ import annotations
 
 import argparse
+import csv
+import importlib.util
+import json
+import math
 import os
 import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
+TRAIT_NAME = "test"
 SIM_PREFIX_NAME = "ggval_sim"
 SIM_TXT_PREFIX_NAME = "ggval_sim_txt"
 SIM_HMP_PREFIX_NAME = "ggval_sim_hmp"
 SIM_VCF_PREFIX_NAME = "ggval_sim_vcf"
 SIM_ROUNDTRIP_PREFIX_NAME = "ggval_roundtrip"
+BENCH_PREFIX_NAME = "ggval_bench"
+GS_BFILE_PREFIX_NAME = "ggval_gs_bfile"
+GS_VCF_GS_PREFIX_NAME = "ggval_gs_vcf"
+GS_HMP_GS_PREFIX_NAME = "ggval_gs_hmp"
+GS_ML_PREFIX_NAME = "ggval_gs_ml"
+ALL_SUITES = [
+    "bench",
+    "gwas",
+    "gs-file",
+    "gs-bfile",
+    "gs-vcf",
+    "gs-hmp",
+    "gs-ml",
+    "reml",
+]
+DEFAULT_FULL_SUITES = ["gwas", "gs-file", "gs-bfile", "gs-vcf", "gs-hmp", "gs-ml", "reml"]
+DEFAULT_SMOKE_SUITES = ["gwas", "gs-file"]
+TEXT_EFFECT_HEADERS = {
+    "BLUP": ["chr", "pos", "snp", "beta"],
+    "BayesA": ["chr", "pos", "snp", "beta"],
+    "BayesB": ["chr", "pos", "snp", "beta", "pip"],
+    "BayesCpi": ["chr", "pos", "snp", "beta", "pip"],
+}
+ANSI_ESCAPE_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
 
 
 def env_str(name: str, default: str) -> str:
@@ -96,13 +126,13 @@ def require_file(path: Path, message: str = "required file not found") -> None:
 
 
 def require_any_file(message: str, candidates: Iterable[Path]) -> Path:
-    candidates = list(candidates)
-    for path in candidates:
+    items = list(candidates)
+    for path in items:
         if path.is_file():
             return path
 
     print("Missing candidates:", file=sys.stderr)
-    for path in candidates:
+    for path in items:
         print(f"  {path}", file=sys.stderr)
     fail(message)
 
@@ -121,8 +151,9 @@ def find_grm(prefix: Path) -> Path:
     candidates = [
         Path(f"{base}.cGRM.npy"),
         Path(f"{base}.grm.npy"),
+        Path(f"{base}.sGRM.npy"),
     ]
-    return require_any_file("GRM file not found for GWAS (-k).", candidates)
+    return require_any_file("GRM file not found.", candidates)
 
 
 def find_gs_summary(outdir: Path, prefix_name: str) -> Path:
@@ -147,14 +178,6 @@ def _tsv_header(path: Path) -> list[str]:
 
 
 def _looks_like_postgwas_input(path: Path) -> bool:
-    """Return True only for GWAS result tables accepted by `jx postgwas`.
-
-    The validation directory can contain other TSV files with similar names,
-    for example postGS `*.effect_top.tsv` tables, GS prediction tables, or
-    FarmCPU `*.qtn.tsv` helper outputs. Those are not the intended postgwas
-    inputs for this validation step. Valid JanusX GWAS result tables are
-    identified by chrom/pos/pwald-style columns.
-    """
     name = path.name
     if name.endswith(".gs.tsv") or name.endswith(".gebv.tsv"):
         return False
@@ -167,15 +190,9 @@ def _looks_like_postgwas_input(path: Path) -> bool:
 
     header_raw = _tsv_header(path)
     header = {h.strip().lower() for h in header_raw if h.strip()}
-
     has_chrom = bool({"chrom", "chr", "chromosome"} & header)
     has_pos = bool({"pos", "bp", "position"} & header)
     has_pvalue = "pwald" in header
-
-    # JanusX GWAS result tables typically use:
-    #   chrom, pos, allele0, allele1, maf, beta, se, pwald
-    # They may not contain an explicit SNP/marker ID column, so requiring
-    # `snp` here would incorrectly reject valid GWAS outputs.
     return has_chrom and has_pos and has_pvalue
 
 
@@ -184,20 +201,16 @@ def find_gwas_tsv_files(outdir: Path, prefix_name: str) -> list[Path]:
     files = [p for p in candidates if _looks_like_postgwas_input(p)]
     if not files:
         print("Scanned TSV candidates:", file=sys.stderr)
-        for p in candidates:
-            header = "\t".join(_tsv_header(p)[:8])
-            print(f"  {p}\t[{header}]", file=sys.stderr)
+        for path in candidates:
+            header = "\t".join(_tsv_header(path)[:8])
+            print(f"  {path}\t[{header}]", file=sys.stderr)
         fail("No valid GWAS result TSV files found for postgwas.")
     return files
 
 
-def require_no_matching_files(
-    base_dir: Path,
-    pattern: str,
-    message: str,
-) -> None:
-    matches = sorted(p for p in base_dir.glob(pattern) if p.exists())
-    if len(matches) == 0:
+def require_no_matching_files(base_dir: Path, pattern: str, message: str) -> None:
+    matches = sorted(path for path in base_dir.glob(pattern) if path.exists())
+    if not matches:
         return
     print("Unexpected files:", file=sys.stderr)
     for path in matches:
@@ -208,9 +221,45 @@ def require_no_matching_files(
 def require_tsv_columns(path: Path, expected: list[str], message: str) -> None:
     header = _tsv_header(path)
     if header != list(expected):
-        fail(
-            f"{message}: expected header={expected}, got={header} ({path})"
-        )
+        fail(f"{message}: expected header={expected}, got={header} ({path})")
+
+
+def _parse_suite_list(raw: str | None) -> list[str]:
+    if raw is None:
+        return []
+    tokens = [tok.strip().lower() for tok in re.split(r"[\s,]+", str(raw)) if tok.strip()]
+    invalid = [tok for tok in tokens if tok not in ALL_SUITES]
+    if invalid:
+        fail(f"Unknown suites: {', '.join(invalid)}. Supported: {', '.join(ALL_SUITES)}")
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for token in tokens:
+        if token in seen:
+            continue
+        seen.add(token)
+        deduped.append(token)
+    return deduped
+
+
+def _order_suites(suites: Iterable[str]) -> list[str]:
+    ordered = [suite for suite in suites if suite != "bench"]
+    if any(str(suite) == "bench" for suite in suites):
+        ordered.append("bench")
+    return ordered
+
+
+def resolve_requested_suites(mode: str, only: str | None, skip: str | None) -> list[str]:
+    only_suites = _parse_suite_list(only)
+    if only_suites:
+        base = only_suites
+    else:
+        base = list(DEFAULT_FULL_SUITES if str(mode).strip().lower() == "full" else DEFAULT_SMOKE_SUITES)
+
+    skip_set = set(_parse_suite_list(skip))
+    selected = _order_suites([suite for suite in base if suite not in skip_set])
+    if not selected:
+        fail("No validation suites selected after applying --only/--skip.")
+    return selected
 
 
 def _resolve_sim_config(mode: str) -> tuple[int, int, int]:
@@ -225,28 +274,91 @@ def _resolve_sim_config(mode: str) -> tuple[int, int, int]:
     return int(nsnp_k), int(n_individuals), int(seed)
 
 
+def _resolve_bench_config(mode: str) -> tuple[int, int, int]:
+    mode_norm = str(mode).strip().lower()
+    if mode_norm == "smoke":
+        nsnp_k = env_int("JX_GGVAL_BENCH_SMOKE_NSNP_K", 500, min_value=1)
+        n_individuals = env_int("JX_GGVAL_BENCH_SMOKE_NIND", 5000, min_value=40)
+    else:
+        nsnp_k = env_int("JX_GGVAL_BENCH_FULL_NSNP_K", 500, min_value=1)
+        n_individuals = env_int("JX_GGVAL_BENCH_FULL_NIND", 5000, min_value=80)
+    seed = env_int("JX_GGVAL_BENCH_SEED", 20260708, min_value=0)
+    return int(nsnp_k), int(n_individuals), int(seed)
+
+
+def _remove_path(path: Path) -> None:
+    try:
+        if path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
+        else:
+            path.unlink()
+    except FileNotFoundError:
+        pass
+
+
 def cleanup_validation_artifacts(outdir: Path) -> None:
-    patterns = [
-        f"{SIM_PREFIX_NAME}*",
-        f"{SIM_TXT_PREFIX_NAME}*",
-        f"{SIM_HMP_PREFIX_NAME}*",
-        f"{SIM_VCF_PREFIX_NAME}*",
-        f"{SIM_ROUNDTRIP_PREFIX_NAME}*",
-        f"~{SIM_PREFIX_NAME}*",
-        f"~{SIM_TXT_PREFIX_NAME}*",
-        f"~{SIM_HMP_PREFIX_NAME}*",
-        f"~{SIM_VCF_PREFIX_NAME}*",
-        f"~{SIM_ROUNDTRIP_PREFIX_NAME}*",
+    prefix_names = [
+        SIM_PREFIX_NAME,
+        SIM_TXT_PREFIX_NAME,
+        SIM_HMP_PREFIX_NAME,
+        SIM_VCF_PREFIX_NAME,
+        SIM_ROUNDTRIP_PREFIX_NAME,
+        BENCH_PREFIX_NAME,
+        GS_BFILE_PREFIX_NAME,
+        GS_VCF_GS_PREFIX_NAME,
+        GS_HMP_GS_PREFIX_NAME,
+        GS_ML_PREFIX_NAME,
     ]
-    for pattern in patterns:
-        for path in sorted(outdir.glob(pattern)):
-            try:
-                if path.is_dir():
-                    shutil.rmtree(path, ignore_errors=True)
-                else:
-                    path.unlink()
-            except FileNotFoundError:
-                pass
+    for prefix_name in prefix_names:
+        for pattern in [f"{prefix_name}*", f"~{prefix_name}*", f"~~{prefix_name}*"]:
+            for path in sorted(outdir.glob(pattern)):
+                _remove_path(path)
+
+    trait_dir = outdir / TRAIT_NAME
+    if trait_dir.is_dir():
+        for prefix_name in prefix_names:
+            for path in sorted(trait_dir.glob(f"{prefix_name}*")):
+                _remove_path(path)
+        try:
+            next(trait_dir.iterdir())
+        except StopIteration:
+            trait_dir.rmdir()
+        except FileNotFoundError:
+            pass
+
+
+def build_bench_dataset(
+    outdir: Path,
+    *,
+    nsnp_k: int,
+    n_individuals: int,
+    seed: int,
+) -> dict[str, Path]:
+    bench_prefix = outdir / BENCH_PREFIX_NAME
+    run(
+        [
+            "jx",
+            "sim",
+            str(int(nsnp_k)),
+            str(int(n_individuals)),
+            str(bench_prefix),
+            "-seed",
+            str(int(seed)),
+            "-trait-name",
+            TRAIT_NAME,
+        ]
+    )
+    for suffix, label in [
+        (".bed", "Benchmark BED output missing"),
+        (".bim", "Benchmark BIM output missing"),
+        (".fam", "Benchmark FAM output missing"),
+        (".pheno.txt", "Benchmark phenotype table missing"),
+    ]:
+        require_file(Path(f"{bench_prefix}{suffix}"), label)
+    return {
+        "bench_prefix": bench_prefix,
+        "pheno_txt": Path(f"{bench_prefix}.pheno.txt"),
+    }
 
 
 def build_validation_dataset(
@@ -273,7 +385,7 @@ def build_validation_dataset(
             "-seed",
             str(int(seed)),
             "-trait-name",
-            "test",
+            TRAIT_NAME,
         ]
     )
     for suffix, label in [
@@ -344,6 +456,7 @@ def build_validation_dataset(
             ]
         )
         require_file(hmp_prefix.with_suffix(".hmp"), "HMP export missing")
+
         run(
             [
                 "jx",
@@ -375,13 +488,210 @@ def build_validation_dataset(
     }
 
 
-def validate_gs_file_input_debug_outputs(
-    outdir: Path,
+def _strip_ansi(text: str) -> str:
+    return ANSI_ESCAPE_RE.sub("", text)
+
+
+def detect_effective_threads() -> int:
+    try:
+        if hasattr(os, "sched_getaffinity"):
+            return max(1, len(os.sched_getaffinity(0)))
+    except Exception:
+        pass
+    return max(1, int(os.cpu_count() or 1))
+
+
+def _resolve_bench_full_threads() -> int:
+    return env_int("JX_GGVAL_BENCH_FULL_THREADS", detect_effective_threads(), min_value=1)
+
+
+def _benchmark_thread_plan(full_threads: int) -> list[tuple[str, int]]:
+    desired = [
+        ("1c", 1),
+        ("0.25x", max(1, int(round(full_threads * 0.25)))),
+        ("0.50x", max(1, int(round(full_threads * 0.50)))),
+        ("0.75x", max(1, int(round(full_threads * 0.75)))),
+        ("full", max(1, int(full_threads))),
+    ]
+    labels_by_threads: dict[int, list[str]] = {}
+    ordered_threads: list[int] = []
+    for label, threads in desired:
+        threads = max(1, min(int(full_threads), int(threads)))
+        if threads not in labels_by_threads:
+            labels_by_threads[threads] = []
+            ordered_threads.append(threads)
+        labels_by_threads[threads].append(label)
+    return [("/".join(labels_by_threads[t]), t) for t in ordered_threads]
+
+
+def _parse_grm_stage_timing(log_path: Path) -> dict[str, float]:
+    text = _strip_ansi(log_path.read_text(encoding="utf-8", errors="replace"))
+    match = re.search(
+        r"GRM stream timing:\s*decode=([0-9.]+)s.*?gemm=([0-9.]+)s.*?other=([0-9.]+)s.*?total=([0-9.]+)s",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if match is None:
+        return {}
+    return {
+        "decode_sec": float(match.group(1)),
+        "gemm_sec": float(match.group(2)),
+        "other_sec": float(match.group(3)),
+        "total_sec": float(match.group(4)),
+    }
+
+
+def _parse_grm_kernel_backend(log_path: Path) -> str:
+    text = _strip_ansi(log_path.read_text(encoding="utf-8", errors="replace"))
+    patterns = [
+        r"GRM auto route selected backend:\s*([^\n(]+)",
+        r"GRM\s+\(Effective SNPs:\s*\d+,\s*([^)]+?)\)",
+        r"Rust SGEMM backend:\s*([A-Za-z0-9_:+.-]+)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            return str(match.group(1)).strip()
+    return "unknown"
+
+
+def _load_json(path: Path) -> dict[str, Any]:
+    require_file(path, "JSON file missing")
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as ex:
+        fail(f"Failed to parse JSON {path}: {ex}")
+    if not isinstance(loaded, dict):
+        fail(f"Expected JSON object in {path}")
+    return loaded
+
+
+def _coerce_optional_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(numeric):
+        return None
+    return int(round(numeric))
+
+
+def _count_nonempty_lines(path: Path) -> int:
+    require_file(path, "Line-count input missing")
+    count = 0
+    with path.open("r", encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            if line.strip():
+                count += 1
+    return count
+
+
+def _count_bim_rows(path: Path) -> int:
+    return _count_nonempty_lines(path)
+
+
+def _resolve_summary_artifact_path(summary_path: Path, raw_path: str | None) -> Path | None:
+    if raw_path is None:
+        return None
+    token = str(raw_path).strip()
+    if token == "":
+        return None
+    path = Path(token)
+    if path.is_absolute():
+        return path
+    return (summary_path.parent / path).resolve()
+
+
+def _summary_artifact_by_method(summary_path: Path, *, trait_name: str = TRAIT_NAME) -> dict[str, dict[str, Any]]:
+    summary = _load_json(summary_path)
+    out: dict[str, dict[str, Any]] = {}
+    for rec in list(summary.get("model_artifacts", []) or []):
+        if not isinstance(rec, dict):
+            continue
+        rec_trait = str(rec.get("trait", "")).strip()
+        if rec_trait not in {"", str(trait_name)}:
+            continue
+        method = str(rec.get("method", "")).strip()
+        if method == "":
+            continue
+        out[method] = rec
+    return out
+
+
+def _validate_text_effect_table(
+    path: Path,
     *,
-    prefix_name: str,
-    trait_name: str,
-    expected_models: Iterable[str] | None = None,
-) -> Path:
+    expected_header: list[str],
+    expected_rows: int | None,
+    method_name: str,
+) -> dict[str, int]:
+    require_tsv_columns(path, expected_header, f"{method_name} effect header mismatch")
+    row_count = 0
+    beta_non_nan_rows = 0
+    pip_non_nan_rows = 0
+    with path.open("r", encoding="utf-8", errors="replace", newline="") as fh:
+        reader = csv.DictReader(fh, delimiter="\t")
+        if list(reader.fieldnames or []) != list(expected_header):
+            fail(f"{method_name} effect header mismatch after DictReader parse: {path}")
+        for lineno, row in enumerate(reader, start=2):
+            if row is None:
+                continue
+            values = list(row.values())
+            if not any(str(v or "").strip() for v in values):
+                continue
+            row_count += 1
+
+            chr_raw = str(row.get("chr", "") or "").strip()
+            pos_raw = str(row.get("pos", "") or "").strip()
+            snp_raw = str(row.get("snp", "") or "").strip()
+            if chr_raw == "":
+                fail(f"{method_name} effect chr is empty at line {lineno}: {path}")
+            if snp_raw == "":
+                fail(f"{method_name} effect snp is empty at line {lineno}: {path}")
+            try:
+                pos_val = float(pos_raw)
+            except ValueError:
+                fail(f"{method_name} effect pos is not numeric at line {lineno}: {path}")
+            if not math.isfinite(pos_val):
+                fail(f"{method_name} effect pos is not finite at line {lineno}: {path}")
+
+            beta_raw = str(row.get("beta", "") or "").strip()
+            try:
+                beta_val = float(beta_raw)
+            except ValueError:
+                fail(f"{method_name} effect beta is not numeric at line {lineno}: {path}")
+            if not math.isfinite(beta_val):
+                fail(f"{method_name} effect beta is not finite at line {lineno}: {path}")
+            beta_non_nan_rows += 1
+
+            if "pip" in expected_header:
+                pip_raw = str(row.get("pip", "") or "").strip()
+                try:
+                    pip_val = float(pip_raw)
+                except ValueError:
+                    fail(f"{method_name} effect pip is not numeric at line {lineno}: {path}")
+                if not math.isfinite(pip_val) or pip_val < -1e-12 or pip_val > 1.0 + 1e-12:
+                    fail(f"{method_name} effect pip is outside [0, 1] at line {lineno}: {path}")
+                pip_non_nan_rows += 1
+
+    if row_count <= 0:
+        fail(f"{method_name} effect file has no data rows: {path}")
+    if beta_non_nan_rows != row_count:
+        fail(f"{method_name} beta rows mismatch: expected {row_count}, got {beta_non_nan_rows}")
+    if "pip" in expected_header and pip_non_nan_rows != row_count:
+        fail(f"{method_name} pip rows mismatch: expected {row_count}, got {pip_non_nan_rows}")
+    if expected_rows is not None and row_count != int(expected_rows):
+        fail(f"{method_name} effect row count mismatch: expected {expected_rows}, got {row_count} ({path})")
+    return {
+        "rows": row_count,
+        "beta_non_nan_rows": beta_non_nan_rows,
+        "pip_non_nan_rows": pip_non_nan_rows,
+    }
+
+
+def validate_gs_output_basics(outdir: Path, *, prefix_name: str, trait_name: str) -> Path:
     gebv_path = outdir / f"{prefix_name}.{trait_name}.gebv.tsv"
     require_file(gebv_path, "GS GEBV output missing")
     if (outdir / f"{prefix_name}.{trait_name}.gs.tsv").exists():
@@ -391,30 +701,129 @@ def validate_gs_file_input_debug_outputs(
         f"{prefix_name}.{trait_name}.gs.effect*",
         "Legacy GS effect side output should not be generated.",
     )
+    return find_gs_summary(outdir, prefix_name)
 
-    summary_path = find_gs_summary(outdir, prefix_name)
-    model_dir = outdir / f"{prefix_name}.gs.model"
-    model_headers = {
-        "BLUP": ["chr", "pos", "snp", "beta"],
-        "BayesA": ["chr", "pos", "snp", "beta"],
-        "BayesB": ["chr", "pos", "snp", "beta", "pip"],
-        "BayesCpi": ["chr", "pos", "snp", "beta", "pip"],
-    }
+
+def validate_text_effect_artifact(
+    summary_path: Path,
+    *,
+    method_name: str,
+    expected_rows: int | None = None,
+) -> None:
+    artifacts = _summary_artifact_by_method(summary_path)
+    if method_name not in artifacts:
+        fail(f"{method_name} artifact missing from summary: {summary_path}")
+    rec = artifacts[method_name]
+    artifact_format = str(rec.get("artifact_format", "")).strip()
+    if artifact_format != "text_effect":
+        fail(f"{method_name} artifact format mismatch: expected text_effect, got {artifact_format!r}")
+
+    model_path = _resolve_summary_artifact_path(summary_path, rec.get("model_file"))
+    effect_path = _resolve_summary_artifact_path(summary_path, rec.get("effect_file")) or model_path
+    if model_path is None or effect_path is None:
+        fail(f"{method_name} artifact paths are missing in {summary_path}")
+    require_file(model_path, f"{method_name} model file missing")
+    require_file(effect_path, f"{method_name} effect file missing")
+
+    expected_header = TEXT_EFFECT_HEADERS[method_name]
+    stats = _validate_text_effect_table(
+        effect_path,
+        expected_header=expected_header,
+        expected_rows=expected_rows,
+        method_name=method_name,
+    )
+    effect_col = str(rec.get("effect_column", "") or "").strip().lower()
+    if effect_col not in {"", "beta"}:
+        fail(f"{method_name} effect_column should be beta, got {effect_col!r}")
+
+    effect_meta = dict(rec.get("effect_meta", {}) or {})
+    meta_rows = _coerce_optional_int(effect_meta.get("rows"))
+    if meta_rows is not None and meta_rows != stats["rows"]:
+        fail(f"{method_name} summary effect_meta.rows mismatch: {meta_rows} vs {stats['rows']}")
+
+    meta_beta_rows = _coerce_optional_int(effect_meta.get("beta_non_nan_rows"))
+    if meta_beta_rows is not None and meta_beta_rows != stats["beta_non_nan_rows"]:
+        fail(
+            f"{method_name} summary beta_non_nan_rows mismatch: "
+            f"{meta_beta_rows} vs {stats['beta_non_nan_rows']}"
+        )
+
+    meta_pip_rows = _coerce_optional_int(effect_meta.get("pip_non_nan_rows"))
+    if "pip" in expected_header:
+        if meta_pip_rows is not None and meta_pip_rows != stats["pip_non_nan_rows"]:
+            fail(
+                f"{method_name} summary pip_non_nan_rows mismatch: "
+                f"{meta_pip_rows} vs {stats['pip_non_nan_rows']}"
+            )
+    elif meta_pip_rows not in {None, 0}:
+        fail(f"{method_name} should not report pip rows, got {meta_pip_rows}")
+
+
+def validate_binary_jxmodel_artifact(summary_path: Path, *, method_name: str) -> None:
+    artifacts = _summary_artifact_by_method(summary_path)
+    if method_name not in artifacts:
+        fail(f"{method_name} artifact missing from summary: {summary_path}")
+    rec = artifacts[method_name]
+    artifact_format = str(rec.get("artifact_format", "")).strip()
+    if artifact_format != "binary_jxmodel":
+        fail(f"{method_name} artifact format mismatch: expected binary_jxmodel, got {artifact_format!r}")
+
+    model_path = _resolve_summary_artifact_path(summary_path, rec.get("model_file"))
+    if model_path is None:
+        fail(f"{method_name} model_file missing from summary: {summary_path}")
+    require_file(model_path, f"{method_name} binary .jxmodel missing")
+    if model_path.suffix.lower() != ".jxmodel":
+        fail(f"{method_name} model_file is not .jxmodel: {model_path}")
+
+    effect_meta = dict(rec.get("effect_meta", {}) or {})
+    meta_rows = _coerce_optional_int(effect_meta.get("rows"))
+    meta_beta_rows = _coerce_optional_int(effect_meta.get("beta_non_nan_rows"))
+    if meta_rows is not None and meta_rows <= 0:
+        fail(f"{method_name} effect_meta.rows should be positive, got {meta_rows}")
+    if meta_beta_rows is not None and meta_beta_rows <= 0:
+        fail(f"{method_name} effect_meta.beta_non_nan_rows should be positive, got {meta_beta_rows}")
+
+
+def validate_postgs_outputs(
+    outdir: Path,
+    *,
+    prefix_name: str,
+    trait_name: str,
+    expect_effect_plot: bool,
+) -> None:
+    require_file(
+        outdir / trait_name / f"{prefix_name}.accuracy_runtime.png",
+        "postGS accuracy-runtime plot missing",
+    )
+    require_file(
+        outdir / trait_name / f"{prefix_name}.accuracy_violin.png",
+        "postGS accuracy-violin plot missing",
+    )
+    if expect_effect_plot:
+        require_file(
+            outdir / f"{prefix_name}.{trait_name}.effects.png",
+            "postGS effect plot missing",
+        )
+
+
+def validate_gs_file_input_debug_outputs(
+    outdir: Path,
+    *,
+    prefix_name: str,
+    trait_name: str,
+    expected_models: Iterable[str] | None = None,
+) -> Path:
+    summary_path = validate_gs_output_basics(outdir, prefix_name=prefix_name, trait_name=trait_name)
     if expected_models is None:
         expected_model_names = ["BLUP", "BayesA", "BayesB", "BayesCpi"]
     else:
         expected_model_names = [str(x).strip() for x in expected_models if str(x).strip()]
-    for model_name in expected_model_names:
-        expected_header = model_headers.get(model_name)
-        if expected_header is None:
-            fail(f"Unsupported GS model expectation: {model_name!r}")
-        model_path = model_dir / f"{trait_name}.{model_name}.jxmodel"
-        require_file(model_path, f"{model_name} text .jxmodel missing")
-        require_tsv_columns(
-            model_path,
-            expected_header,
-            f"{model_name} text .jxmodel header mismatch",
-        )
+
+    for method_name in expected_model_names:
+        if method_name not in TEXT_EFFECT_HEADERS:
+            fail(f"Unsupported GS model expectation: {method_name!r}")
+        validate_text_effect_artifact(summary_path, method_name=method_name, expected_rows=None)
+
     require_file(
         outdir / f"~{prefix_name}.snp0.bed",
         "Expected GS file-input cached PLINK BED is missing.",
@@ -441,11 +850,7 @@ def validate_gs_file_input_debug_outputs(
     return summary_path
 
 
-def validate_reml_outputs(
-    outdir: Path,
-    *,
-    prefix_name: str = SIM_PREFIX_NAME,
-) -> None:
+def validate_reml_outputs(outdir: Path, *, prefix_name: str = SIM_PREFIX_NAME) -> None:
     base = outdir / f"{prefix_name}.pheno"
     require_file(Path(f"{base}.reml.summary.tsv"), "REML summary output missing")
     require_file(Path(f"{base}.blue.txt"), "REML BLUE output missing")
@@ -458,115 +863,248 @@ def check_jx_available() -> None:
     run(["jx", "--version"])
 
 
-def smoke_flow(outdir: Path, logdir: Path, threads: int, cv_folds: int) -> None:
-    cleanup_validation_artifacts(outdir)
-    nsnp_k, n_individuals, seed = _resolve_sim_config("smoke")
+def _parse_pca_eigh_backend(log_path: Path) -> str:
+    text = log_path.read_text(encoding="utf-8", errors="replace")
+    patterns = [
+        r"EIGH backend:\s*([A-Za-z0-9_:+.-]+)",
+        r"Eigen decomposition finished \(backend=([^),\s]+)",
+        r"Rust eigh did not use LAPACK backend \(backend=([^)\s]+)\)",
+        r"backend=([A-Za-z0-9_:+.-]+)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            return str(match.group(1)).strip()
+    if re.search(r"\bnalgebra\b", text, flags=re.IGNORECASE):
+        return "nalgebra"
+    if re.search(r"\blapack_dsyevd\b", text, flags=re.IGNORECASE):
+        return "lapack_dsyevd"
+    if re.search(r"\blapack_dsyevr\b", text, flags=re.IGNORECASE):
+        return "lapack_dsyevr"
+    return "unknown"
 
-    step("SMOKE 1. Build simulated validation dataset")
-    paths = build_validation_dataset(
+
+def run_pca_with_backend_report(
+    cmd: list[str],
+    *,
+    log_path: Path,
+    label: str = "PCA/EIGH",
+) -> str:
+    try:
+        run(cmd, stdout_path=log_path, stderr_to_stdout=True)
+    except subprocess.CalledProcessError:
+        print_log(log_path)
+        raise
+
+    backend = _parse_pca_eigh_backend(log_path)
+    print(f"{label} backend         : {backend}")
+    if backend == "unknown":
+        print(f"{label} backend log     : {log_path}")
+    return backend
+
+
+def _print_benchmark_table(title: str, rows: list[dict[str, Any]], *, time_key: str, time_label: str) -> None:
+    print(title)
+    print("-" * 78)
+    print(f"{'Target':<14}{'Threads':>8}{time_label:>14}{'Speedup':>12}{'Wall(s)':>12}  Backend")
+    print("-" * 78)
+    for row in rows:
+        speed = row.get("speedup_vs_1c", float("nan"))
+        speed_text = "NA" if not math.isfinite(float(speed)) else f"{float(speed):.2f}x"
+        metric = float(row.get(time_key, float("nan")))
+        wall = float(row.get("wall_sec", float("nan")))
+        backend = str(row.get("backend", "unknown"))
+        print(
+            f"{str(row.get('target_label', '')):<14}"
+            f"{int(row.get('threads', 0)):>8}"
+            f"{metric:>14.4f}"
+            f"{speed_text:>12}"
+            f"{wall:>12.4f}  "
+            f"{backend}"
+        )
+    print("-" * 78)
+
+
+def run_multicore_benchmark_suite(outdir: Path, logdir: Path, *, mode: str) -> None:
+    nsnp_k, n_individuals, seed = _resolve_bench_config(mode)
+    full_threads = _resolve_bench_full_threads()
+    thread_plan = _benchmark_thread_plan(full_threads)
+
+    step("BENCH. Build simulated benchmark dataset")
+    bench_paths = build_bench_dataset(
         outdir,
         nsnp_k=nsnp_k,
         n_individuals=n_individuals,
         seed=seed,
-        export_debug_formats=False,
     )
+    bench_prefix = bench_paths["bench_prefix"]
+    print(
+        f"Benchmark dataset      : {bench_prefix} "
+        f"(n={n_individuals}, m≈{nsnp_k * 1000}, full_threads={full_threads})"
+    )
+    sep()
+
+    step("BENCH. Measure GRM/GEMM and PCA(-grm) multicore efficiency")
+    grm_rows: list[dict[str, Any]] = []
+    baseline_metric: float | None = None
+    baseline_grm: Path | None = None
+    for target_label, threads in thread_plan:
+        prefix_name = f"{BENCH_PREFIX_NAME}.t{threads}"
+        prefix_path = outdir / prefix_name
+        log_path = logdir / f"{prefix_name}.grm.log"
+        t0 = time.perf_counter()
+        try:
+            run(
+                [
+                    "jx",
+                    "grm",
+                    "-bfile",
+                    str(bench_prefix),
+                    "-maf",
+                    "0",
+                    "-geno",
+                    "1",
+                    "--stage-timing",
+                    "-v",
+                    "-t",
+                    str(int(threads)),
+                    "-o",
+                    str(outdir),
+                    "-prefix",
+                    prefix_name,
+                ],
+                stdout_path=log_path,
+                stderr_to_stdout=True,
+            )
+        except subprocess.CalledProcessError:
+            print_log(log_path)
+            raise
+        wall_sec = time.perf_counter() - t0
+        timing = _parse_grm_stage_timing(log_path)
+        backend = _parse_grm_kernel_backend(log_path)
+        gemm_sec = float(timing.get("gemm_sec", float("nan")))
+        metric_sec = gemm_sec if math.isfinite(gemm_sec) and gemm_sec > 0 else float(
+            timing.get("total_sec", wall_sec)
+        )
+        if baseline_metric is None:
+            baseline_metric = metric_sec
+            baseline_grm = find_grm(prefix_path)
+        speedup = (
+            float(baseline_metric) / metric_sec
+            if math.isfinite(metric_sec) and metric_sec > 0 and baseline_metric is not None
+            else float("nan")
+        )
+        grm_rows.append(
+            {
+                "task": "grm_gemm",
+                "target_label": target_label,
+                "threads": int(threads),
+                "metric_sec": float(metric_sec),
+                "stage_total_sec": float(timing.get("total_sec", wall_sec)),
+                "wall_sec": float(wall_sec),
+                "speedup_vs_1c": float(speedup),
+                "backend": backend,
+                "log_file": str(log_path),
+                "matrix_file": str(find_grm(prefix_path)),
+            }
+        )
+
+    _print_benchmark_table("GRM/GEMM speedup vs 1c", grm_rows, time_key="metric_sec", time_label="GEMM(s)")
+
+    if baseline_grm is None:
+        fail("Benchmark GRM baseline file is missing.")
+
+    pca_rows: list[dict[str, Any]] = []
+    baseline_pca: float | None = None
+    for target_label, threads in thread_plan:
+        pca_prefix_name = f"{BENCH_PREFIX_NAME}.pca.t{threads}"
+        log_path = logdir / f"{pca_prefix_name}.log"
+        t0 = time.perf_counter()
+        try:
+            run(
+                [
+                    "jx",
+                    "pca",
+                    "-k",
+                    str(baseline_grm),
+                    "-v",
+                    "-t",
+                    str(int(threads)),
+                    "-o",
+                    str(outdir),
+                    "-prefix",
+                    pca_prefix_name,
+                ],
+                stdout_path=log_path,
+                stderr_to_stdout=True,
+            )
+        except subprocess.CalledProcessError:
+            print_log(log_path)
+            raise
+        wall_sec = time.perf_counter() - t0
+        backend = _parse_pca_eigh_backend(log_path)
+        metric_sec = float(wall_sec)
+        if baseline_pca is None:
+            baseline_pca = metric_sec
+        speedup = (
+            float(baseline_pca) / metric_sec
+            if math.isfinite(metric_sec) and metric_sec > 0 and baseline_pca is not None
+            else float("nan")
+        )
+        require_file(outdir / f"{pca_prefix_name}.eigenvec", "PCA eigenvec output missing")
+        require_file(outdir / f"{pca_prefix_name}.eigenval", "PCA eigenval output missing")
+        pca_rows.append(
+            {
+                "task": "pca_grm",
+                "target_label": target_label,
+                "threads": int(threads),
+                "metric_sec": float(metric_sec),
+                "stage_total_sec": float(metric_sec),
+                "wall_sec": float(wall_sec),
+                "speedup_vs_1c": float(speedup),
+                "backend": backend,
+                "log_file": str(log_path),
+                "matrix_file": str(baseline_grm),
+            }
+        )
+
+    _print_benchmark_table("PCA(-grm) speedup vs 1c", pca_rows, time_key="metric_sec", time_label="PCA(s)")
+
+    bench_tsv = outdir / f"{BENCH_PREFIX_NAME}.multicore.tsv"
+    with bench_tsv.open("w", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(
+            fh,
+            fieldnames=[
+                "task",
+                "target_label",
+                "threads",
+                "metric_sec",
+                "stage_total_sec",
+                "wall_sec",
+                "speedup_vs_1c",
+                "backend",
+                "log_file",
+                "matrix_file",
+            ],
+            delimiter="\t",
+        )
+        writer.writeheader()
+        for row in grm_rows + pca_rows:
+            writer.writerow(row)
+    require_file(bench_tsv, "Benchmark summary TSV missing")
+    sep()
+
+
+def run_gwas_suite(paths: dict[str, Path], outdir: Path, logdir: Path, *, threads: int) -> None:
     sim_prefix = paths["sim_prefix"]
     pheno_txt = paths["pheno_txt"]
-    txt_matrix = paths["txt_matrix"]
-    sep()
 
-    step("SMOKE 2. GWAS runtime check on simulated PLINK input")
-    run(["jx", "grm", "-bfile", str(sim_prefix), "-o", str(outdir)])
-    run_pca_with_backend_report(
-        ["jx", "pca", "-bfile", str(sim_prefix), "-o", str(outdir)],
-        log_path=logdir / "jx_pca_smoke.log",
-    )
-    grm_k = find_grm(sim_prefix)
-    require_file(sim_prefix.with_suffix(".eigenvec"), "PCA eigenvec output missing")
-    run(
-        [
-            "jx",
-            "gwas",
-            "-bfile",
-            str(sim_prefix),
-            "-p",
-            str(pheno_txt),
-            "-lmm",
-            "-lm",
-            "-k",
-            str(grm_k),
-            "-c",
-            str(sim_prefix.with_suffix(".eigenvec")),
-            "-n",
-            "test",
-            "-t",
-            str(threads),
-            "-o",
-            str(outdir),
-        ]
-    )
-    find_gwas_tsv_files(outdir, SIM_PREFIX_NAME)
-    sep()
-
-    step("SMOKE 3. GS file-input runtime check")
-    run(
-        [
-            "jx",
-            "gs",
-            "-file",
-            str(txt_matrix),
-            "-p",
-            str(pheno_txt),
-            "-n",
-            "test",
-            "-BLUP",
-            "-cv",
-            str(cv_folds),
-            "-save-model",
-            "-t",
-            str(threads),
-            "-o",
-            str(outdir),
-        ]
-    )
-    validate_gs_file_input_debug_outputs(
-        outdir,
-        prefix_name=SIM_TXT_PREFIX_NAME,
-        trait_name="test",
-        expected_models=["BLUP"],
-    )
-    sep()
-
-
-def full_flow(
-    outdir: Path,
-    logdir: Path,
-    threads: int,
-    cv_folds: int,
-    postgs_enabled: bool,
-) -> None:
-    cleanup_validation_artifacts(outdir)
-    nsnp_k, n_individuals, seed = _resolve_sim_config("full")
-
-    step("STEP 1. Build simulated validation dataset")
-    paths = build_validation_dataset(
-        outdir,
-        nsnp_k=nsnp_k,
-        n_individuals=n_individuals,
-        seed=seed,
-        export_debug_formats=True,
-    )
-    sim_prefix = paths["sim_prefix"]
-    pheno_txt = paths["pheno_txt"]
-    txt_matrix = paths["txt_matrix"]
-    sep()
-
-    step("STEP 2. Validate GWAS and postGWAS on simulated data")
+    step("GWAS. Validate GWAS and postGWAS on simulated data")
     run(["jx", "grm", "-bfile", str(sim_prefix), "-o", str(outdir), "-m", "1"])
     run(["jx", "grm", "-bfile", str(sim_prefix), "-o", str(outdir), "-m", "2"])
     run_pca_with_backend_report(
         ["jx", "pca", "-bfile", str(sim_prefix), "-o", str(outdir)],
-        log_path=logdir / "jx_pca_full.log",
+        log_path=logdir / "jx_pca_gwas.log",
     )
     run(["jx", "pca", "-bfile", str(sim_prefix), "-rsvd", "-o", str(outdir)])
     grm_k = find_grm(sim_prefix)
@@ -591,21 +1129,20 @@ def full_flow(
             "-c",
             str(sim_prefix.with_suffix(".eigenvec")),
             "-n",
-            "test",
+            TRAIT_NAME,
             "-t",
             str(threads),
             "-o",
             str(outdir),
         ]
     )
-
     gwas_files = find_gwas_tsv_files(outdir, SIM_PREFIX_NAME)
     run(
         [
             "jx",
             "postgwas",
             "-gwasfile",
-            *[str(p) for p in gwas_files],
+            *[str(path) for path in gwas_files],
             "-bfile",
             str(sim_prefix),
             "-manh",
@@ -622,17 +1159,23 @@ def full_flow(
             str(outdir),
         ]
     )
-    require_any_file(
-        "postGWAS Manhattan output missing",
-        outdir.glob(f"{SIM_PREFIX_NAME}.test*.manh.pdf"),
-    )
-    require_any_file(
-        "postGWAS QQ output missing",
-        outdir.glob(f"{SIM_PREFIX_NAME}.test*.qq.pdf"),
-    )
+    require_any_file("postGWAS Manhattan output missing", outdir.glob(f"{SIM_PREFIX_NAME}.test*.manh.pdf"))
+    require_any_file("postGWAS QQ output missing", outdir.glob(f"{SIM_PREFIX_NAME}.test*.qq.pdf"))
     sep()
 
-    step("STEP 3. Validate GS and postGS on simulated TXT input")
+
+def run_gs_file_suite(
+    paths: dict[str, Path],
+    outdir: Path,
+    *,
+    threads: int,
+    cv_folds: int,
+    postgs_enabled: bool,
+) -> None:
+    txt_matrix = paths["txt_matrix"]
+    pheno_txt = paths["pheno_txt"]
+
+    step("GS-FILE. Validate GS text-input route and text .jxmodel outputs")
     run(
         [
             "jx",
@@ -642,7 +1185,7 @@ def full_flow(
             "-p",
             str(pheno_txt),
             "-n",
-            "test",
+            TRAIT_NAME,
             "-BLUP",
             "-BayesA",
             "-BayesB",
@@ -659,19 +1202,237 @@ def full_flow(
     gs_summary = validate_gs_file_input_debug_outputs(
         outdir,
         prefix_name=SIM_TXT_PREFIX_NAME,
-        trait_name="test",
+        trait_name=TRAIT_NAME,
     )
-
     if postgs_enabled:
-        step("STEP 3b. Validate postGS direct-read from .jxmodel")
         run(["jx", "postgs", "-json", str(gs_summary), "-o", str(outdir)])
-        require_file(
-            outdir / f"{SIM_TXT_PREFIX_NAME}.test.effects.png",
-            "postGS effect plot missing",
+        validate_postgs_outputs(
+            outdir,
+            prefix_name=SIM_TXT_PREFIX_NAME,
+            trait_name=TRAIT_NAME,
+            expect_effect_plot=True,
         )
-        sep()
+    sep()
 
-    step("STEP 4. Validate REML on simulated phenotype table")
+
+def run_gs_bfile_suite(
+    paths: dict[str, Path],
+    outdir: Path,
+    *,
+    threads: int,
+    cv_folds: int,
+) -> None:
+    sim_prefix = paths["sim_prefix"]
+    pheno_txt = paths["pheno_txt"]
+    expected_rows = _count_bim_rows(sim_prefix.with_suffix(".bim"))
+
+    step("GS-BFILE. Validate GS PLINK-input route and numeric effect outputs")
+    run(
+        [
+            "jx",
+            "gs",
+            "-bfile",
+            str(sim_prefix),
+            "-p",
+            str(pheno_txt),
+            "-n",
+            TRAIT_NAME,
+            "-BLUP",
+            "-BayesA",
+            "-BayesB",
+            "-BayesCpi",
+            "-maf",
+            "0",
+            "-geno",
+            "1",
+            "-cv",
+            str(cv_folds),
+            "-save-model",
+            "-t",
+            str(threads),
+            "-o",
+            str(outdir),
+            "-prefix",
+            GS_BFILE_PREFIX_NAME,
+        ]
+    )
+    summary_path = validate_gs_output_basics(
+        outdir,
+        prefix_name=GS_BFILE_PREFIX_NAME,
+        trait_name=TRAIT_NAME,
+    )
+    for method_name in ["BLUP", "BayesA", "BayesB", "BayesCpi"]:
+        validate_text_effect_artifact(summary_path, method_name=method_name, expected_rows=expected_rows)
+    sep()
+
+
+def run_gs_vcf_suite(
+    paths: dict[str, Path],
+    outdir: Path,
+    *,
+    threads: int,
+    cv_folds: int,
+) -> None:
+    vcf_path = Path(f"{paths['vcf_prefix']}.vcf.gz")
+    pheno_txt = paths["pheno_txt"]
+    sim_prefix = paths["sim_prefix"]
+    expected_rows = _count_bim_rows(sim_prefix.with_suffix(".bim"))
+
+    step("GS-VCF. Validate GS VCF-input regression")
+    require_file(vcf_path, "VCF regression input missing")
+    run(
+        [
+            "jx",
+            "gs",
+            "-vcf",
+            str(vcf_path),
+            "-p",
+            str(pheno_txt),
+            "-n",
+            TRAIT_NAME,
+            "-BLUP",
+            "-maf",
+            "0",
+            "-geno",
+            "1",
+            "-cv",
+            str(cv_folds),
+            "-save-model",
+            "-t",
+            str(threads),
+            "-o",
+            str(outdir),
+            "-prefix",
+            GS_VCF_GS_PREFIX_NAME,
+        ]
+    )
+    summary_path = validate_gs_output_basics(
+        outdir,
+        prefix_name=GS_VCF_GS_PREFIX_NAME,
+        trait_name=TRAIT_NAME,
+    )
+    validate_text_effect_artifact(summary_path, method_name="BLUP", expected_rows=expected_rows)
+    sep()
+
+
+def run_gs_hmp_suite(
+    paths: dict[str, Path],
+    outdir: Path,
+    *,
+    threads: int,
+    cv_folds: int,
+) -> None:
+    hmp_path = paths["hmp_prefix"].with_suffix(".hmp")
+    pheno_txt = paths["pheno_txt"]
+    sim_prefix = paths["sim_prefix"]
+    expected_rows = _count_bim_rows(sim_prefix.with_suffix(".bim"))
+
+    step("GS-HMP. Validate GS HapMap-input regression")
+    require_file(hmp_path, "HMP regression input missing")
+    run(
+        [
+            "jx",
+            "gs",
+            "-hmp",
+            str(hmp_path),
+            "-p",
+            str(pheno_txt),
+            "-n",
+            TRAIT_NAME,
+            "-BLUP",
+            "-maf",
+            "0",
+            "-geno",
+            "1",
+            "-cv",
+            str(cv_folds),
+            "-save-model",
+            "-t",
+            str(threads),
+            "-o",
+            str(outdir),
+            "-prefix",
+            GS_HMP_GS_PREFIX_NAME,
+        ]
+    )
+    summary_path = validate_gs_output_basics(
+        outdir,
+        prefix_name=GS_HMP_GS_PREFIX_NAME,
+        trait_name=TRAIT_NAME,
+    )
+    validate_text_effect_artifact(summary_path, method_name="BLUP", expected_rows=expected_rows)
+    sep()
+
+
+def run_gs_ml_suite(
+    paths: dict[str, Path],
+    outdir: Path,
+    *,
+    threads: int,
+    cv_folds: int,
+    postgs_enabled: bool,
+) -> str:
+    if importlib.util.find_spec("sklearn") is None:
+        print("GS-ML skipped        : scikit-learn is unavailable in current Python environment")
+        sep()
+        return "skipped (scikit-learn unavailable)"
+
+    sim_prefix = paths["sim_prefix"]
+    pheno_txt = paths["pheno_txt"]
+
+    step("GS-ML. Validate scikit-learn GS save-model/postgs compatibility")
+    run(
+        [
+            "jx",
+            "gs",
+            "-bfile",
+            str(sim_prefix),
+            "-p",
+            str(pheno_txt),
+            "-n",
+            TRAIT_NAME,
+            "-RF",
+            "-ENET",
+            "-maf",
+            "0",
+            "-geno",
+            "1",
+            "-cv",
+            str(cv_folds),
+            "-save-model",
+            "-t",
+            str(threads),
+            "-o",
+            str(outdir),
+            "-prefix",
+            GS_ML_PREFIX_NAME,
+        ]
+    )
+    summary_path = validate_gs_output_basics(
+        outdir,
+        prefix_name=GS_ML_PREFIX_NAME,
+        trait_name=TRAIT_NAME,
+    )
+    for method_name in ["RF", "ENET"]:
+        validate_binary_jxmodel_artifact(summary_path, method_name=method_name)
+    if postgs_enabled:
+        run(["jx", "postgs", "-json", str(summary_path), "-o", str(outdir)])
+        validate_postgs_outputs(
+            outdir,
+            prefix_name=GS_ML_PREFIX_NAME,
+            trait_name=TRAIT_NAME,
+            expect_effect_plot=True,
+        )
+    sep()
+    return "ok"
+
+
+def run_reml_suite(paths: dict[str, Path], outdir: Path) -> None:
+    sim_prefix = paths["sim_prefix"]
+    pheno_txt = paths["pheno_txt"]
+    grm_k = find_grm(sim_prefix)
+
+    step("REML. Validate REML outputs on simulated phenotype table")
     run(
         [
             "jx",
@@ -681,7 +1442,7 @@ def full_flow(
             "-l",
             "IID",
             "-p",
-            "test",
+            TRAIT_NAME,
             "-k",
             str(grm_k),
             "-o",
@@ -692,48 +1453,82 @@ def full_flow(
     sep()
 
 
-def _parse_pca_eigh_backend(log_path: Path) -> str:
-    text = log_path.read_text(encoding="utf-8", errors="replace")
-    patterns = [
-        r"EIGH backend:\s*([A-Za-z0-9_:+.-]+)",
-        r"Eigen decomposition finished \(backend=([^),\s]+)",
-        r"Rust eigh did not use LAPACK backend \(backend=([^)\s]+)\)",
-        r"backend=([A-Za-z0-9_:+.-]+)",
-    ]
-    for pattern in patterns:
-        m = re.search(pattern, text, flags=re.IGNORECASE)
-        if m:
-            return str(m.group(1)).strip()
-    if re.search(r"\bnalgebra\b", text, flags=re.IGNORECASE):
-        return "nalgebra"
-    if re.search(r"\blapack_dsyevd\b", text, flags=re.IGNORECASE):
-        return "lapack_dsyevd"
-    if re.search(r"\blapack_dsyevr\b", text, flags=re.IGNORECASE):
-        return "lapack_dsyevr"
-    return "unknown"
-
-
-def run_pca_with_backend_report(
-    cmd: list[str],
+def run_validation_flow(
+    outdir: Path,
+    logdir: Path,
     *,
-    log_path: Path,
-    label: str = "PCA/EIGH",
-) -> str:
-    try:
-        run(
-            cmd,
-            stdout_path=log_path,
-            stderr_to_stdout=True,
-        )
-    except subprocess.CalledProcessError:
-        print_log(log_path)
-        raise
+    mode: str,
+    suites: list[str],
+    threads: int,
+    cv_folds: int,
+    postgs_enabled: bool,
+) -> dict[str, str]:
+    cleanup_validation_artifacts(outdir)
+    suite_status: dict[str, str] = {}
+    main_paths: dict[str, Path] | None = None
+    sklearn_available = importlib.util.find_spec("sklearn") is not None
 
-    backend = _parse_pca_eigh_backend(log_path)
-    print(f"{label} backend         : {backend}")
-    if backend == "unknown":
-        print(f"{label} backend log     : {log_path}")
-    return backend
+    def ensure_main_paths() -> dict[str, Path]:
+        nonlocal main_paths
+        if main_paths is None:
+            nsnp_k, n_individuals, seed = _resolve_sim_config(mode)
+            export_debug_formats = any(suite in {"gs-vcf", "gs-hmp"} for suite in suites)
+            step("DATA. Build simulated validation dataset")
+            main_paths = build_validation_dataset(
+                outdir,
+                nsnp_k=nsnp_k,
+                n_individuals=n_individuals,
+                seed=seed,
+                export_debug_formats=export_debug_formats,
+            )
+            sep()
+        return main_paths
+
+    for suite in suites:
+        if suite == "bench":
+            run_multicore_benchmark_suite(outdir, logdir, mode=mode)
+            suite_status[suite] = "ok"
+        elif suite == "gwas":
+            run_gwas_suite(ensure_main_paths(), outdir, logdir, threads=threads)
+            suite_status[suite] = "ok"
+        elif suite == "gs-file":
+            run_gs_file_suite(
+                ensure_main_paths(),
+                outdir,
+                threads=threads,
+                cv_folds=cv_folds,
+                postgs_enabled=postgs_enabled,
+            )
+            suite_status[suite] = "ok"
+        elif suite == "gs-bfile":
+            run_gs_bfile_suite(ensure_main_paths(), outdir, threads=threads, cv_folds=cv_folds)
+            suite_status[suite] = "ok"
+        elif suite == "gs-vcf":
+            run_gs_vcf_suite(ensure_main_paths(), outdir, threads=threads, cv_folds=cv_folds)
+            suite_status[suite] = "ok"
+        elif suite == "gs-hmp":
+            run_gs_hmp_suite(ensure_main_paths(), outdir, threads=threads, cv_folds=cv_folds)
+            suite_status[suite] = "ok"
+        elif suite == "gs-ml":
+            if not sklearn_available:
+                print("GS-ML skipped        : scikit-learn is unavailable in current Python environment")
+                sep()
+                suite_status[suite] = "skipped (scikit-learn unavailable)"
+            else:
+                suite_status[suite] = run_gs_ml_suite(
+                    ensure_main_paths(),
+                    outdir,
+                    threads=threads,
+                    cv_folds=cv_folds,
+                    postgs_enabled=postgs_enabled,
+                )
+        elif suite == "reml":
+            run_reml_suite(ensure_main_paths(), outdir)
+            suite_status[suite] = "ok"
+        else:
+            fail(f"Unsupported suite: {suite}")
+
+    return suite_status
 
 
 def parse_args() -> argparse.Namespace:
@@ -745,7 +1540,7 @@ def parse_args() -> argparse.Namespace:
         "--mode",
         choices=["smoke", "full"],
         default=env_str("JX_GGVAL_MODE", "full"),
-        help="Validation mode. Can also be set by JX_GGVAL_MODE.",
+        help="Validation mode. Controls default suite set and simulated dataset size.",
     )
     parser.add_argument(
         "--outdir",
@@ -761,19 +1556,34 @@ def parse_args() -> argparse.Namespace:
         "--threads",
         type=int,
         default=env_int("JX_GGVAL_THREADS", 2, min_value=1),
-        help="Thread count for validation commands. Can also be set by JX_GGVAL_THREADS.",
+        help="Thread count for validation commands except multicore benchmark.",
     )
     parser.add_argument(
         "--cv",
         type=int,
         default=env_int("JX_GGVAL_CV", 2, min_value=2),
-        help="CV folds for smoke GS. Can also be set by JX_GGVAL_CV.",
+        help="CV folds for GS validation suites.",
     )
     parser.add_argument(
         "--no-postgs",
         action="store_true",
         default=not env_truthy("JX_GGVAL_POSTGS", True),
-        help="Skip postGS validation in full mode.",
+        help="Skip postGS validation steps.",
+    )
+    parser.add_argument(
+        "--only",
+        default=None,
+        help=f"Run only the named suites (comma or space separated). Supported: {', '.join(ALL_SUITES)}.",
+    )
+    parser.add_argument(
+        "--skip",
+        default=None,
+        help=f"Skip the named suites (comma or space separated). Supported: {', '.join(ALL_SUITES)}.",
+    )
+    parser.add_argument(
+        "--multicore",
+        action="store_true",
+        help="Run only the multicore GRM/EIGH benchmark suite with a larger benchmark dataset.",
     )
     return parser.parse_args()
 
@@ -792,22 +1602,29 @@ def main() -> int:
     logdir.mkdir(parents=True, exist_ok=True)
 
     check_jx_available()
-
-    if args.mode == "smoke":
-        smoke_flow(outdir, logdir, args.threads, args.cv)
+    if args.multicore:
+        if args.only is not None or args.skip is not None:
+            fail("--multicore cannot be combined with --only/--skip; it runs bench as a standalone suite.")
+        suites = ["bench"]
     else:
-        full_flow(
-            outdir,
-            logdir,
-            args.threads,
-            args.cv,
-            postgs_enabled=not args.no_postgs,
-        )
+        suites = resolve_requested_suites(args.mode, args.only, args.skip)
+    suite_status = run_validation_flow(
+        outdir,
+        logdir,
+        mode=args.mode,
+        suites=suites,
+        threads=args.threads,
+        cv_folds=args.cv,
+        postgs_enabled=not args.no_postgs,
+    )
 
     step("Validation completed")
     print(f"Mode      : {args.mode}")
+    print(f"Suites    : {', '.join(suites)}")
     print(f"Output dir: {outdir}")
     print(f"Log dir   : {logdir}")
+    for suite in suites:
+        print(f"Status    : {suite} -> {suite_status.get(suite, 'ok')}")
     return 0
 
 

@@ -840,7 +840,7 @@ fn bayesb_core_impl(
     df0_e: f64,
     s0_e_opt: Option<f64>,
     seed: Option<u64>,
-) -> Result<(Vec<f64>, Vec<f64>, Vec<f64>, f64, f64, f64, f64, f64), String> {
+) -> Result<(Vec<f64>, Vec<f64>, Vec<f64>, f64, f64, f64, f64, f64, Vec<f64>), String> {
     let n_f = n as f64;
     if n_f <= 1.0 {
         return Err("n must be > 1".to_string());
@@ -952,6 +952,7 @@ fn bayesb_core_impl(
 
     let mut r = y.to_vec();
     let mut beta_sum = vec![0.0; p];
+    let mut pip_sum = vec![0.0; p];
     let mut varb_sum = vec![0.0; p];
     let mut alpha_sum = vec![0.0; q];
     let mut var_e_sum = 0.0;
@@ -1075,6 +1076,7 @@ fn bayesb_core_impl(
             for j in 0..p {
                 // Posterior marker effect should be E[d_j * beta_j], not E[beta_j].
                 beta_sum[j] += (d[j] as f64) * beta[j];
+                pip_sum[j] += d[j] as f64;
                 varb_sum[j] += var_b[j];
             }
             for k in 0..q {
@@ -1098,6 +1100,7 @@ fn bayesb_core_impl(
     let inv_keep = 1.0 / n_keep as f64;
     for j in 0..p {
         beta_sum[j] *= inv_keep;
+        pip_sum[j] *= inv_keep;
         varb_sum[j] *= inv_keep;
     }
     for k in 0..q {
@@ -1121,6 +1124,7 @@ fn bayesb_core_impl(
         var_h2,
         prob_in_mean,
         n_active_mean,
+        pip_sum,
     ))
 }
 
@@ -1142,7 +1146,7 @@ fn bayescpi_core_impl(
     df0_e: f64,
     s0_e_opt: Option<f64>,
     seed: Option<u64>,
-) -> Result<(Vec<f64>, Vec<f64>, f64, f64, f64, f64, f64, f64), String> {
+) -> Result<(Vec<f64>, Vec<f64>, f64, f64, f64, f64, f64, f64, Vec<f64>), String> {
     let n_f = n as f64;
     if n_f <= 1.0 {
         return Err("n must be > 1".to_string());
@@ -1253,6 +1257,7 @@ fn bayescpi_core_impl(
 
     let mut r = y.to_vec();
     let mut beta_sum = vec![0.0; p];
+    let mut pip_sum = vec![0.0; p];
     let mut alpha_sum = vec![0.0; q];
     let mut varb_sum = 0.0;
     let mut var_e_sum = 0.0;
@@ -1363,6 +1368,7 @@ fn bayescpi_core_impl(
             for j in 0..p {
                 // Posterior marker effect should be E[d_j * beta_j], not E[beta_j].
                 beta_sum[j] += (d[j] as f64) * beta[j];
+                pip_sum[j] += d[j] as f64;
             }
             for k in 0..q {
                 alpha_sum[k] += alpha[k];
@@ -1386,6 +1392,7 @@ fn bayescpi_core_impl(
     let inv_keep = 1.0 / n_keep as f64;
     for j in 0..p {
         beta_sum[j] *= inv_keep;
+        pip_sum[j] *= inv_keep;
     }
     for k in 0..q {
         alpha_sum[k] *= inv_keep;
@@ -1409,6 +1416,7 @@ fn bayescpi_core_impl(
         var_h2,
         prob_in_mean,
         n_active_mean,
+        pip_sum,
     ))
 }
 
@@ -2005,7 +2013,7 @@ fn bayesb_packed_core_impl(
     s0_e_opt: Option<f64>,
     seed: Option<u64>,
     pool: Option<&Arc<rayon::ThreadPool>>,
-) -> Result<(Vec<f64>, Vec<f64>, Vec<f64>, f64, f64, f64, f64, f64), String> {
+) -> Result<(Vec<f64>, Vec<f64>, Vec<f64>, f64, f64, f64, f64, f64, Vec<f64>), String> {
     let n_f = n as f64;
     if n_f <= 1.0 {
         return Err("n must be > 1".to_string());
@@ -2182,6 +2190,7 @@ fn bayesb_packed_core_impl(
 
     let mut r = y.to_vec();
     let mut beta_sum = vec![0.0; p];
+    let mut pip_sum = vec![0.0; p];
     let mut varb_sum = vec![0.0; p];
     let mut alpha_sum = vec![0.0; q];
     let mut var_e_sum = 0.0;
@@ -2330,6 +2339,7 @@ fn bayesb_packed_core_impl(
             for j in 0..p {
                 // Posterior marker effect should be E[d_j * beta_j], not E[beta_j].
                 beta_sum[j] += (d[j] as f64) * beta[j];
+                pip_sum[j] += d[j] as f64;
                 varb_sum[j] += var_b[j];
             }
             for k in 0..q {
@@ -2353,6 +2363,7 @@ fn bayesb_packed_core_impl(
     let inv_keep = 1.0 / n_keep as f64;
     for j in 0..p {
         beta_sum[j] *= inv_keep;
+        pip_sum[j] *= inv_keep;
         varb_sum[j] *= inv_keep;
     }
     for k in 0..q {
@@ -2376,6 +2387,7 @@ fn bayesb_packed_core_impl(
         var_h2,
         prob_in_mean,
         n_active_mean,
+        pip_sum,
     ))
 }
 
@@ -2405,7 +2417,7 @@ fn bayescpi_packed_core_impl(
     s0_e_opt: Option<f64>,
     seed: Option<u64>,
     pool: Option<&Arc<rayon::ThreadPool>>,
-) -> Result<(Vec<f64>, Vec<f64>, f64, f64, f64, f64, f64, f64), String> {
+) -> Result<(Vec<f64>, Vec<f64>, f64, f64, f64, f64, f64, f64, Vec<f64>), String> {
     let n_f = n as f64;
     if n_f <= 1.0 {
         return Err("n must be > 1".to_string());
@@ -2578,6 +2590,7 @@ fn bayescpi_packed_core_impl(
 
     let mut r = y.to_vec();
     let mut beta_sum = vec![0.0; p];
+    let mut pip_sum = vec![0.0; p];
     let mut alpha_sum = vec![0.0; q];
     let mut varb_sum = 0.0;
     let mut var_e_sum = 0.0;
@@ -2711,6 +2724,7 @@ fn bayescpi_packed_core_impl(
             for j in 0..p {
                 // Posterior marker effect should be E[d_j * beta_j], not E[beta_j].
                 beta_sum[j] += (d[j] as f64) * beta[j];
+                pip_sum[j] += d[j] as f64;
             }
             for k in 0..q {
                 alpha_sum[k] += alpha[k];
@@ -2734,6 +2748,7 @@ fn bayescpi_packed_core_impl(
     let inv_keep = 1.0 / n_keep as f64;
     for j in 0..p {
         beta_sum[j] *= inv_keep;
+        pip_sum[j] *= inv_keep;
     }
     for k in 0..q {
         alpha_sum[k] *= inv_keep;
@@ -2757,6 +2772,7 @@ fn bayescpi_packed_core_impl(
         var_h2,
         prob_in_mean,
         n_active_mean,
+        pip_sum,
     ))
 }
 
@@ -2935,6 +2951,7 @@ pub fn bayesb(
     f64,
     f64,
     f64,
+    Py<PyArray1<f64>>,
 )> {
     if n_iter <= burnin {
         return Err(PyValueError::new_err("n_iter must be > burnin"));
@@ -3014,10 +3031,11 @@ pub fn bayesb(
     });
 
     match result {
-        Ok((beta, alpha, varb, vare, h2_mean, var_h2, prob_in_mean, n_active_mean)) => {
+        Ok((beta, alpha, varb, vare, h2_mean, var_h2, prob_in_mean, n_active_mean, pip)) => {
             let beta_py = beta.into_pyarray(py).into_bound().unbind();
             let alpha_py = alpha.into_pyarray(py).into_bound().unbind();
             let varb_py = varb.into_pyarray(py).into_bound().unbind();
+            let pip_py = pip.into_pyarray(py).into_bound().unbind();
             Ok((
                 beta_py,
                 alpha_py,
@@ -3027,6 +3045,7 @@ pub fn bayesb(
                 var_h2,
                 prob_in_mean,
                 n_active_mean,
+                pip_py,
             ))
         }
         Err(msg) => Err(PyValueError::new_err(msg)),
@@ -3075,6 +3094,7 @@ pub fn bayescpi(
     f64,
     f64,
     f64,
+    Py<PyArray1<f64>>,
 )> {
     if n_iter <= burnin {
         return Err(PyValueError::new_err("n_iter must be > burnin"));
@@ -3159,9 +3179,10 @@ pub fn bayescpi(
     });
 
     match result {
-        Ok((beta, alpha, varb_mean, vare, h2_mean, var_h2, prob_in_mean, n_active_mean)) => {
+        Ok((beta, alpha, varb_mean, vare, h2_mean, var_h2, prob_in_mean, n_active_mean, pip)) => {
             let beta_py = beta.into_pyarray(py).into_bound().unbind();
             let alpha_py = alpha.into_pyarray(py).into_bound().unbind();
+            let pip_py = pip.into_pyarray(py).into_bound().unbind();
             Ok((
                 beta_py,
                 alpha_py,
@@ -3171,6 +3192,7 @@ pub fn bayescpi(
                 var_h2,
                 prob_in_mean,
                 n_active_mean,
+                pip_py,
             ))
         }
         Err(msg) => Err(PyValueError::new_err(msg)),
@@ -3442,6 +3464,7 @@ pub fn bayesb_packed(
     f64,
     f64,
     f64,
+    Py<PyArray1<f64>>,
 )> {
     if n_iter <= burnin {
         return Err(PyValueError::new_err("n_iter must be > burnin"));
@@ -3583,10 +3606,11 @@ pub fn bayesb_packed(
     });
 
     match result {
-        Ok((beta, alpha, varb, vare, h2_mean, var_h2, prob_in_mean, n_active_mean)) => {
+        Ok((beta, alpha, varb, vare, h2_mean, var_h2, prob_in_mean, n_active_mean, pip)) => {
             let beta_py = beta.into_pyarray(py).into_bound().unbind();
             let alpha_py = alpha.into_pyarray(py).into_bound().unbind();
             let varb_py = varb.into_pyarray(py).into_bound().unbind();
+            let pip_py = pip.into_pyarray(py).into_bound().unbind();
             Ok((
                 beta_py,
                 alpha_py,
@@ -3596,6 +3620,7 @@ pub fn bayesb_packed(
                 var_h2,
                 prob_in_mean,
                 n_active_mean,
+                pip_py,
             ))
         }
         Err(msg) => Err(PyValueError::new_err(msg)),
@@ -3658,6 +3683,7 @@ pub fn bayescpi_packed(
     f64,
     f64,
     f64,
+    Py<PyArray1<f64>>,
 )> {
     if n_iter <= burnin {
         return Err(PyValueError::new_err("n_iter must be > burnin"));
@@ -3804,9 +3830,10 @@ pub fn bayescpi_packed(
     });
 
     match result {
-        Ok((beta, alpha, varb_mean, vare, h2_mean, var_h2, prob_in_mean, n_active_mean)) => {
+        Ok((beta, alpha, varb_mean, vare, h2_mean, var_h2, prob_in_mean, n_active_mean, pip)) => {
             let beta_py = beta.into_pyarray(py).into_bound().unbind();
             let alpha_py = alpha.into_pyarray(py).into_bound().unbind();
+            let pip_py = pip.into_pyarray(py).into_bound().unbind();
             Ok((
                 beta_py,
                 alpha_py,
@@ -3816,6 +3843,7 @@ pub fn bayescpi_packed(
                 var_h2,
                 prob_in_mean,
                 n_active_mean,
+                pip_py,
             ))
         }
         Err(msg) => Err(PyValueError::new_err(msg)),
@@ -4089,6 +4117,7 @@ pub fn bayesb_stream_bed(
     f64,
     f64,
     f64,
+    Py<PyArray1<f64>>,
 )> {
     if n_iter <= burnin {
         return Err(PyValueError::new_err("n_iter must be > burnin"));
@@ -4220,10 +4249,11 @@ pub fn bayesb_stream_bed(
     });
 
     match result {
-        Ok((beta, alpha, varb, vare, h2_mean, var_h2, prob_in_mean, n_active_mean)) => {
+        Ok((beta, alpha, varb, vare, h2_mean, var_h2, prob_in_mean, n_active_mean, pip)) => {
             let beta_py = beta.into_pyarray(py).into_bound().unbind();
             let alpha_py = alpha.into_pyarray(py).into_bound().unbind();
             let varb_py = varb.into_pyarray(py).into_bound().unbind();
+            let pip_py = pip.into_pyarray(py).into_bound().unbind();
             Ok((
                 beta_py,
                 alpha_py,
@@ -4233,6 +4263,7 @@ pub fn bayesb_stream_bed(
                 var_h2,
                 prob_in_mean,
                 n_active_mean,
+                pip_py,
             ))
         }
         Err(msg) => Err(PyValueError::new_err(msg)),
@@ -4301,6 +4332,7 @@ pub fn bayescpi_stream_bed(
     f64,
     f64,
     f64,
+    Py<PyArray1<f64>>,
 )> {
     if n_iter <= burnin {
         return Err(PyValueError::new_err("n_iter must be > burnin"));
@@ -4437,9 +4469,10 @@ pub fn bayescpi_stream_bed(
     });
 
     match result {
-        Ok((beta, alpha, varb_mean, vare, h2_mean, var_h2, prob_in_mean, n_active_mean)) => {
+        Ok((beta, alpha, varb_mean, vare, h2_mean, var_h2, prob_in_mean, n_active_mean, pip)) => {
             let beta_py = beta.into_pyarray(py).into_bound().unbind();
             let alpha_py = alpha.into_pyarray(py).into_bound().unbind();
+            let pip_py = pip.into_pyarray(py).into_bound().unbind();
             Ok((
                 beta_py,
                 alpha_py,
@@ -4449,6 +4482,7 @@ pub fn bayescpi_stream_bed(
                 var_h2,
                 prob_in_mean,
                 n_active_mean,
+                pip_py,
             ))
         }
         Err(msg) => Err(PyValueError::new_err(msg)),

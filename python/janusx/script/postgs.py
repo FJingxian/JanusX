@@ -5,7 +5,7 @@ JanusX: Post-GS summary and visualization
 Examples
 --------
   jx postgs -json summary.json
-  jx postgs -json summary.json -effect test/mouse_hs1940.test0.gs.effect -effect-col rrBLUP
+  jx postgs -json summary.json -effect test/mouse_hs1940.gs.model/test0.rrBLUP.jxmodel -effect-col beta
 """
 
 from __future__ import annotations
@@ -530,6 +530,8 @@ def _find_effect_path_and_col_for_best(
             m = str(rec.get("method", ""))
             if _norm_method_token(m) in aliases:
                 ef = _resolve_existing_path(str(rec.get("effect_file", "")), base_dir=summary_dir)
+                if ef is None:
+                    ef = _resolve_existing_path(str(rec.get("model_file", "")), base_dir=summary_dir)
                 ec = str(rec.get("effect_column", "")).strip() or None
                 if ef is not None:
                     return ef, ec, mk
@@ -543,7 +545,7 @@ def _find_effect_path_and_col_for_best(
     if isinstance(result_files, list):
         for rf in result_files:
             p = str(rf)
-            if p.endswith(f".{trait}.gs.effect"):
+            if p.endswith(".jxmodel"):
                 ef = _resolve_existing_path(p, base_dir=summary_dir)
                 if ef is not None:
                     return ef, None, mk
@@ -576,6 +578,8 @@ def _collect_trait_effect_specs(
                 continue
             ef = _resolve_existing_path(str(rec.get("effect_file", "")), base_dir=summary_dir)
             if ef is None:
+                ef = _resolve_existing_path(str(rec.get("model_file", "")), base_dir=summary_dir)
+            if ef is None:
                 continue
             method_key = str(rec.get("method", "")).strip()
             effect_col = str(rec.get("effect_column", "")).strip() or None
@@ -601,6 +605,8 @@ def _collect_trait_effect_specs(
                 if not isinstance(mv, dict):
                     continue
                 ef = _resolve_existing_path(str(mv.get("effect_file", "")), base_dir=summary_dir)
+                if ef is None:
+                    ef = _resolve_existing_path(str(mv.get("model_file", "")), base_dir=summary_dir)
                 if ef is None:
                     continue
                 out.setdefault(str(trait), []).append(
@@ -749,6 +755,46 @@ def _resolve_effect_col(
 
 def _load_effect_table(path: str) -> pd.DataFrame:
     ext = Path(path).suffix.lower()
+    if ext == ".jxmodel":
+        try:
+            df = pd.read_csv(path, sep="\t")
+            if df.shape[1] > 1:
+                return df
+        except Exception:
+            pass
+        try:
+            from janusx.gs.workflow import _build_method_effect_table, _load_jxmodel
+
+            payload = _load_jxmodel(path)
+            raw_state = payload.get("model_state", None)
+            if isinstance(raw_state, dict) and len(raw_state) > 0:
+                prefix_hint_raw = payload.get(
+                    "genotype_prefix_hint",
+                    raw_state.get(
+                        "genotype_prefix_hint",
+                        raw_state.get("source_prefix", None),
+                    ),
+                )
+                prefix_hint = (
+                    None
+                    if prefix_hint_raw is None or str(prefix_hint_raw).strip() == ""
+                    else str(prefix_hint_raw)
+                )
+                fallback_marker_count_raw = payload.get("fallback_marker_count", None)
+                fallback_marker_count = (
+                    None
+                    if fallback_marker_count_raw is None
+                    else int(fallback_marker_count_raw)
+                )
+                table, _meta = _build_method_effect_table(
+                    model_state=dict(raw_state),
+                    packed_ctx=None,
+                    genotype_prefix_hint=prefix_hint,
+                    fallback_marker_count=fallback_marker_count,
+                )
+                return table
+        except Exception:
+            pass
     if ext == ".csv":
         return pd.read_csv(path)
     try:
@@ -1154,9 +1200,9 @@ def _log_results_overview(
 
 def _log_missing_effect_hint(logger: Any, summary: dict[str, Any]) -> None:
     usage = summary.get("usage", {})
-    effect_pattern = str(usage.get("effect_file_pattern", "{prefix}.{trait}.gs.effect")).strip()
+    effect_pattern = str(usage.get("effect_file_pattern", "{trait}.{method}.jxmodel")).strip()
     if effect_pattern == "":
-        effect_pattern = "{prefix}.{trait}.gs.effect"
+        effect_pattern = "{trait}.{method}.jxmodel"
     logger.warning("No effect files were found in summary.json; effect plotting was skipped.")
     logger.warning(
         "Rerun `jx gs` with `-save-model` to export `%s`, or pass `-effect <file>` to `jx postgs`.",
@@ -1172,7 +1218,7 @@ def main() -> None:
             "jx postgs -json test/mouse_hs1940.gs.model/summary.json",
             "jx postgs -json summary.json -palette tab10 -fmt png",
             "jx postgs -json summary.json -pcctime 1 tab10 -violin 1 '#5ca68d' -manh 2 '#4c78a8,#f58518,#54a24b,#e45756'",
-            "jx postgs -json summary.json -effect test/mouse_hs1940.test0.gs.effect -effect-col BayesB",
+            "jx postgs -json summary.json -effect test/mouse_hs1940.gs.model/test0.BayesB.jxmodel -effect-col beta",
         ]),
     )
     req = parser.add_argument_group("Required Arguments")

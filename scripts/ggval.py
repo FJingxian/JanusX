@@ -676,7 +676,7 @@ def _looks_like_postgwas_input(path: Path) -> bool:
     identified by chrom/pos/pwald-style columns.
     """
     name = path.name
-    if name.endswith(".gs.tsv"):
+    if name.endswith(".gs.tsv") or name.endswith(".gebv.tsv"):
         return False
     if name.endswith(".effect_top.tsv"):
         return False

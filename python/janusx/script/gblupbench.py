@@ -2768,7 +2768,11 @@ def _run_engine_janusx(
                 param_rows.append({"fold": int(fd), "param": str(k), "value": str(v)})
             pve_fold = _extract_pve_from_detail_rows(detail_rows)
 
-            pred_path = run_dir / f"{fold_prefix}.{trait}.gs.tsv"
+            pred_path = run_dir / f"{fold_prefix}.{trait}.gebv.tsv"
+            if not pred_path.exists():
+                legacy_pred_path = run_dir / f"{fold_prefix}.{trait}.gs.tsv"
+                if legacy_pred_path.exists():
+                    pred_path = legacy_pred_path
             if not pred_path.exists():
                 note = f"Missing prediction file: {pred_path}"
                 task.fail(note)

@@ -373,6 +373,14 @@ def _gwas_stream_logger(logger: logging.Logger) -> Optional[logging.Logger]:
     return None
 
 
+def _format_cli_finished_timestamp(ts: Optional[float] = None) -> str:
+    lt = time.localtime(time.time() if ts is None else float(ts))
+    return (
+        f"{lt.tm_year}-{lt.tm_mon}-{lt.tm_mday} "
+        f"{lt.tm_hour:02d}:{lt.tm_min:02d}:{lt.tm_sec:02d}"
+    )
+
+
 def _gwas_terminal_rule_width(
     default: int = 60,
     *,
@@ -1015,6 +1023,73 @@ def _emit_gwas_summary(
         stream_logger = _gwas_stream_logger(logger)
         if stream_logger is not None:
             _emit_gwas_summary_legacy(stream_logger, rows)
+
+
+def _build_gwas_trait_summary_lines(
+    rows: list[dict[str, object]],
+) -> list[str]:
+    if len(rows) == 0:
+        return []
+    headers = ["Model", "N_Indv", "N_SNP", "PVE(ph)", "time(s)", "Mem(GB)"]
+    out_rows: list[list[str]] = []
+    for r in sorted(list(rows), key=lambda x: _gwas_model_sort_key(x.get("model", ""))):
+        model_text = _normalize_gwas_model_name(r.get("model", ""))
+        pve_raw = r.get("pve", None)
+        pve_text = "NA"
+        try:
+            if pve_raw is not None:
+                pve_val = float(pve_raw)
+                if np.isfinite(pve_val):
+                    pve_text = f"{pve_val:.3f}"
+        except Exception:
+            pve_text = "NA"
+        peak_rss = r.get("peak_rss_gb", None)
+        peak_footprint = r.get("peak_footprint_gb", None)
+        mem_gb = peak_footprint if peak_footprint is not None else peak_rss
+        total_time = float(r.get("gwas_time_s", 0.0)) + float(r.get("viz_time_s", 0.0))
+        out_rows.append(
+            [
+                str(model_text),
+                f"{int(r.get('nidv', 0))}",
+                f"{int(r.get('eff_snp', 0))}",
+                str(pve_text),
+                f"{float(total_time):.1f}",
+                (
+                    f"{float(mem_gb):.2f}"
+                    if mem_gb is not None and np.isfinite(float(mem_gb))
+                    else "NA"
+                ),
+            ]
+        )
+    widths = [len(h) for h in headers]
+    for row in out_rows:
+        for i, value in enumerate(row):
+            widths[i] = max(widths[i], len(value))
+    header_line = " ".join(headers[i].ljust(widths[i]) for i in range(len(headers)))
+    rule = "-" * max(len(header_line), 60)
+    lines = [rule, header_line, rule]
+    for row in out_rows:
+        lines.append(" ".join(row[i].ljust(widths[i]) for i in range(len(row))))
+    return lines
+
+
+def _emit_gwas_trait_summary(
+    logger: logging.Logger,
+    rows: list[dict[str, object]],
+) -> None:
+    lines = _build_gwas_trait_summary_lines(rows)
+    if len(lines) == 0:
+        return
+    targets: list[logging.Logger] = []
+    report_logger = _gwas_report_logger(logger)
+    targets.append(report_logger)
+    if _gwas_terminal_rich(logger):
+        stream_logger = _gwas_stream_logger(logger)
+        if isinstance(stream_logger, logging.Logger) and id(stream_logger) != id(report_logger):
+            targets.append(stream_logger)
+    for target in targets:
+        for line in lines:
+            target.info(line)
 
 
 def _align_pheno_to_sample_order(
@@ -5438,30 +5513,36 @@ def _run_file_dense_fast_once(
     multi_trait_mode = len(trait_iter) > 1
 
     if len(model_sequence) == 0 and has_farmcpu:
-        farmcpu_cache_runtime = run_farmcpu_fullmem(
-            args=args,
-            gfile=str(gfile),
-            prefix=str(prefix),
-            logger=logger,
-            pheno_preloaded=pheno_aligned,
-            ids_preloaded=ids,
-            n_snps_preloaded=n_snps,
-            qmatrix_preloaded=qmatrix,
-            cov_preloaded=None,
-            use_spinner=use_spinner,
-            context_prepared=True,
-            summary_rows=summary_rows,
-            saved_paths=saved_paths,
-            trait_names=[str(t) for t in trait_iter],
-            farmcpu_cache=farmcpu_cache_runtime,
-            prepare_only=False,
-            emit_trait_header=True,
-            preloaded_packed=None,
-        )
+        for trait_idx, pname in enumerate(trait_iter):
+            trait_summary_start = len(summary_rows)
+            farmcpu_cache_runtime = run_farmcpu_fullmem(
+                args=args,
+                gfile=str(gfile),
+                prefix=str(prefix),
+                logger=logger,
+                pheno_preloaded=pheno_aligned,
+                ids_preloaded=ids,
+                n_snps_preloaded=n_snps,
+                qmatrix_preloaded=qmatrix,
+                cov_preloaded=None,
+                use_spinner=use_spinner,
+                context_prepared=True,
+                summary_rows=summary_rows,
+                saved_paths=saved_paths,
+                trait_names=[str(pname)],
+                farmcpu_cache=farmcpu_cache_runtime,
+                prepare_only=False,
+                emit_trait_header=True,
+                preloaded_packed=None,
+            )
+            _emit_gwas_trait_summary(logger, summary_rows[trait_summary_start:])
+            if multi_trait_mode and trait_idx != (len(trait_iter) - 1):
+                logger.info("")
         _ = farmcpu_cache_runtime
         return pheno_aligned, ids, n_snps
 
     for trait_idx, pname in enumerate(trait_iter):
+        trait_summary_start = len(summary_rows)
         y_full, sameidx = _trait_values_and_mask(pheno_aligned, str(pname))
         keep_idx = np.flatnonzero(sameidx).astype(np.int64, copy=False)
         n_idv = int(keep_idx.shape[0])
@@ -5535,6 +5616,7 @@ def _run_file_dense_fast_once(
                     emit_trait_header=False,
                     preloaded_packed=None,
                 )
+            _emit_gwas_trait_summary(logger, summary_rows[trait_summary_start:])
             if multi_trait_mode and trait_idx != (len(trait_iter) - 1):
                 logger.info("")
             continue
@@ -5806,6 +5888,7 @@ def _run_file_dense_fast_once(
                 emit_trait_header=False,
                 preloaded_packed=None,
             )
+        _emit_gwas_trait_summary(logger, summary_rows[trait_summary_start:])
         if multi_trait_mode and trait_idx != (len(trait_iter) - 1):
             logger.info("")
 
@@ -7848,11 +7931,16 @@ def _run_gwas_pipeline(
                         return cached_meta
 
                     task_idx = 0
+                    current_trait_summary_name = ""
+                    current_trait_summary_start = len(gwas_summary_rows)
                     while task_idx < len(normalized_tasks):
                         task_item = normalized_tasks[task_idx]
                         mk = str(task_item.get("model", "")).lower().strip()
                         route = str(task_item.get("route", "")).lower().strip()
                         trait_name_use = str(task_item.get("trait", ""))
+                        if trait_name_use != current_trait_summary_name:
+                            current_trait_summary_name = str(trait_name_use)
+                            current_trait_summary_start = len(gwas_summary_rows)
                         emit_trait_header_model = bool(
                             task_item.get("emit_trait_header", False)
                         )
@@ -7930,6 +8018,16 @@ def _run_gwas_pipeline(
                                     emit_trait_header=bool(emit_trait_header_model),
                                     trait_prepared_meta=trait_meta_shared,
                                 )
+                                next_idx = group_end
+                                trait_done = (
+                                    next_idx >= len(normalized_tasks)
+                                    or str(normalized_tasks[next_idx].get("trait", "")) != trait_name_use
+                                )
+                                if trait_done:
+                                    _emit_gwas_trait_summary(
+                                        logger,
+                                        gwas_summary_rows[current_trait_summary_start:],
+                                    )
                                 if bool(
                                     normalized_tasks[group_end - 1].get(
                                         "emit_blank_after", False
@@ -7971,6 +8069,16 @@ def _run_gwas_pipeline(
                             raise RuntimeError(
                                 "Rust-only GWAS mode received unsupported task route: "
                                 f"route={route}, model={mk}"
+                            )
+                        next_idx = task_idx + 1
+                        trait_done = (
+                            next_idx >= len(normalized_tasks)
+                            or str(normalized_tasks[next_idx].get("trait", "")) != trait_name_use
+                        )
+                        if trait_done:
+                            _emit_gwas_trait_summary(
+                                logger,
+                                gwas_summary_rows[current_trait_summary_start:],
                             )
                         if emit_blank_after:
                             logger.info("")
@@ -8143,6 +8251,7 @@ def _run_gwas_pipeline(
                 for trait_idx_use, trait_name_use in enumerate(trait_names_seq):
                     trait_meta_single: Union[dict[str, object], None] = None
                     emit_trait_header_now = bool(emit_farmcpu_trait_header)
+                    trait_summary_start = len(gwas_summary_rows)
                     sample_idx_meta = None
                     try:
                         _, sameidx_meta = _trait_values_and_mask(pheno, trait_name_use)
@@ -8229,6 +8338,10 @@ def _run_gwas_pipeline(
                         qtn_preloaded_packed=qtn_preloaded_packed,
                         trait_prepared_meta=trait_meta_single,
                     )
+                    _emit_gwas_trait_summary(
+                        logger,
+                        gwas_summary_rows[trait_summary_start:],
+                    )
                     if trait_idx_use < (len(trait_names_seq) - 1):
                         logger.info("")
             else:
@@ -8236,33 +8349,41 @@ def _run_gwas_pipeline(
                     farmcpu_cache_runtime = _force_farmcpu_trait_prepared_deferred_load(
                         farmcpu_cache_runtime,
                     )
-                _ = run_farmcpu_fullmem(
-                    args=args,
-                    gfile=farmcpu_genofile,
-                    prefix=prefix,
-                    logger=logger,
-                    pheno_preloaded=pheno,
-                    ids_preloaded=ids,
-                    n_snps_preloaded=n_snps,
-                    qmatrix_preloaded=qmatrix,
-                    cov_preloaded=cov_all,
-                    use_spinner=use_spinner,
-                    context_prepared=context_prepared,
-                    summary_rows=gwas_summary_rows,
-                    saved_paths=saved_result_paths,
-                    trait_names=trait_names_full,
-                    farmcpu_cache=farmcpu_cache_runtime,
-                    emit_trait_header=bool(emit_farmcpu_trait_header),
-                    preloaded_packed=preloaded_packed,
-                    qtn_preloaded_packed=qtn_preloaded_packed,
-                    trait_prepared_meta=global_trait_meta_single,
-                )
+                trait_names_seq = [] if trait_names_full is None else [str(t) for t in trait_names_full]
+                for trait_idx_use, trait_name_use in enumerate(trait_names_seq):
+                    trait_summary_start = len(gwas_summary_rows)
+                    farmcpu_cache_runtime = run_farmcpu_fullmem(
+                        args=args,
+                        gfile=farmcpu_genofile,
+                        prefix=prefix,
+                        logger=logger,
+                        pheno_preloaded=pheno,
+                        ids_preloaded=ids,
+                        n_snps_preloaded=n_snps,
+                        qmatrix_preloaded=qmatrix,
+                        cov_preloaded=cov_all,
+                        use_spinner=use_spinner,
+                        context_prepared=context_prepared,
+                        summary_rows=gwas_summary_rows,
+                        saved_paths=saved_result_paths,
+                        trait_names=[str(trait_name_use)],
+                        farmcpu_cache=farmcpu_cache_runtime,
+                        emit_trait_header=bool(emit_farmcpu_trait_header),
+                        preloaded_packed=preloaded_packed,
+                        qtn_preloaded_packed=qtn_preloaded_packed,
+                        trait_prepared_meta=global_trait_meta_single,
+                    )
+                    _emit_gwas_trait_summary(
+                        logger,
+                        gwas_summary_rows[trait_summary_start:],
+                    )
+                    if trait_idx_use < (len(trait_names_seq) - 1):
+                        logger.info("")
 
         if len(gwas_summary_rows) > 0:
             for row in gwas_summary_rows:
                 pnm = str(row.get("phenotype", ""))
                 row["pheno_col_idx"] = int(trait_col_map.get(pnm, -1))
-            _emit_gwas_summary(logger, gwas_summary_rows)
         ordered_result_paths = _ordered_saved_result_paths(
             gwas_summary_rows,
             saved_result_paths,

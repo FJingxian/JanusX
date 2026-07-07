@@ -125,6 +125,31 @@ def resolve_genotype_cache_dir(
     return geno_dir
 
 
+def _normalize_genotype_cache_stem(genofile: str) -> str:
+    base = os.path.basename(str(genofile).rstrip("/\\"))
+    low = base.lower()
+    if low.endswith(".vcf.gz"):
+        base = base[: -len(".vcf.gz")]
+    elif low.endswith(".hmp.gz"):
+        base = base[: -len(".hmp.gz")]
+    else:
+        for ext in (".vcf", ".hmp", ".bed", ".bim", ".fam", ".txt", ".tsv", ".csv", ".npy", ".bin"):
+            if low.endswith(ext):
+                base = base[: -len(ext)]
+                break
+    # Cached CLI PLINK conversions from gfreader use "~stem.snp0/.snp1" to
+    # distinguish SNP-only vs full-site cache payloads. GRM cache names should
+    # stay compatible with GWAS and collapse those internal source-cache mode
+    # suffixes back to the original "~stem" namespace.
+    if base.startswith("~") and (base.endswith(".snp0") or base.endswith(".snp1")):
+        base = base[:-5]
+    # Cached JanusX inputs already use a "~stem" basename. Reusing them as a
+    # cache source must not produce a second leading tilde.
+    if base.startswith("~"):
+        base = base[1:]
+    return base
+
+
 def genotype_cache_prefix(
     genofile: str,
     *,
@@ -140,15 +165,7 @@ def genotype_cache_prefix(
     not writable, it falls back to `cache_dir` or `JANUSX_CACHE_DIR`.
     """
     del snps_only  # kept for signature compatibility with existing callers
-    base = os.path.basename(str(genofile))
-    low = base.lower()
-    if low.endswith(".vcf.gz") or low.endswith(".hmp.gz"):
-        base = base[: -len(".vcf.gz")] if low.endswith(".vcf.gz") else base[: -len(".hmp.gz")]
-    else:
-        for ext in (".vcf", ".hmp", ".txt", ".tsv", ".csv", ".npy"):
-            if low.endswith(ext):
-                base = base[: -len(ext)]
-                break
+    base = _normalize_genotype_cache_stem(genofile)
     cache_root = resolve_genotype_cache_dir(
         genofile,
         cache_dir=cache_dir,

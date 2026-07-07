@@ -135,7 +135,7 @@ def _call_bayesb(
     df0_e: float,
     s0_e: Optional[float],
     seed: Optional[int],
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, float, float, float, float]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, float, float, float, float, np.ndarray]:
     n_iter = int(n_iter)
     burnin = int(burnin)
     thin = int(thin)
@@ -199,7 +199,7 @@ def _call_bayescpi(
     df0_e: float,
     s0_e: Optional[float],
     seed: Optional[int],
-) -> Tuple[np.ndarray, np.ndarray, float, float, float, float, float, float]:
+) -> Tuple[np.ndarray, np.ndarray, float, float, float, float, float, float, np.ndarray]:
     n_iter = int(n_iter)
     burnin = int(burnin)
     thin = int(thin)
@@ -372,7 +372,7 @@ def BayesB(
     df0_e: float = 5.0,
     s0_e: Optional[float] = None,
     seed: Optional[int] = None,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, float, float, float, float]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, float, float, float, float, np.ndarray]:
     """
     Python interface for the Rust BayesB kernel (PyO3).
 
@@ -432,6 +432,8 @@ def BayesB(
         Posterior mean inclusion probability.
     n_active_mean : float
         Posterior mean number of active markers.
+    pip : np.ndarray, shape (p,)
+        Posterior inclusion probability for each marker.
     """
     y_arr = _as_1d_f64(y, "y")
     m_arr = _as_2d_f64_mxn(M, "M", y_arr.shape[0])
@@ -474,7 +476,7 @@ def BayesCpi(
     df0_e: float = 5.0,
     s0_e: Optional[float] = None,
     seed: Optional[int] = None,
-) -> Tuple[np.ndarray, np.ndarray, float, float, float, float, float, float]:
+) -> Tuple[np.ndarray, np.ndarray, float, float, float, float, float, float, np.ndarray]:
     """
     Python interface for the Rust BayesCpi kernel (PyO3).
 
@@ -530,6 +532,8 @@ def BayesCpi(
         Posterior mean inclusion probability.
     n_active_mean : float
         Posterior mean number of active markers.
+    pip : np.ndarray, shape (p,)
+        Posterior inclusion probability for each marker.
     """
     y_arr = _as_1d_f64(y, "y")
     m_arr = _as_2d_f64_mxn(M, "M", y_arr.shape[0])
@@ -626,6 +630,7 @@ class BAYES:
         self.varep_hat: float | None = None
         self.pve: float | None = None
         self.varpve: float | None = None
+        self.pip_hat: np.ndarray | None = None
         self.r2_used: float | None = float(r2)
         self.r2_blup: float | None = (
             float(r2_blup_pheno_scale) if r2_blup_pheno_scale is not None else float("nan")
@@ -640,7 +645,7 @@ class BAYES:
         if method not in method_map:
             raise ValueError(f"Unsupported Bayes method: {method}")
 
-        beta, alpha, varbeta, varep, h2_mean, varh2, *_diag = method_map[method](
+        beta, alpha, varbeta, varep, h2_mean, varh2, *diag = method_map[method](
             y,
             M,
             X,
@@ -656,6 +661,13 @@ class BAYES:
         self.alpha_hat = alpha.reshape(-1, 1)
         self.varep_hat = float(varep)
         self.pve = float(h2_mean);self.varpve = float(varh2)
+        if method in {"BayesB", "BayesCpi"} and len(diag) > 0:
+            try:
+                pip_arr = np.asarray(diag[-1], dtype=np.float64).reshape(-1)
+                if int(pip_arr.size) == int(self.beta_hat.size):
+                    self.pip_hat = np.ascontiguousarray(pip_arr.reshape(-1, 1), dtype=np.float64)
+            except Exception:
+                self.pip_hat = None
         
     def predict(self,M:np.ndarray,cov:np.ndarray=None):
         """

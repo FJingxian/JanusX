@@ -47,7 +47,7 @@ Genomic selection workflow
        - Report Pearson, Spearman, and R2 per fold.
        - Use the best fold for diagnostic plotting.
        - Refit model on full training set and predict the test set.
-  4. Write prediction results to {prefix}.{trait}.gs.tsv.
+  4. Write prediction results to {prefix}.{trait}.gebv.tsv.
 
 Citation
 --------
@@ -204,10 +204,9 @@ from janusx.script._common.genoio import (
     genotype_load_status_done,
     genotype_load_status_fail,
     genotype_load_status_open,
-    load_or_build_packed_meta_basic,
-    load_or_build_packed_meta_dom,
-    load_or_build_packed_meta_std,
-    prepare_packed_ctx_from_plink,
+    load_plink_bed_payload_owned,
+    normalize_packed_filter_mode,
+    open_plink_bed_payload_memmap,
     write_id_file,
 )
 from janusx.gs.blup import (
@@ -637,10 +636,55 @@ def _should_promote_bayes_resident_packed(
 def _packed_ctx_dom_af(packed_ctx: dict[str, typing.Any]) -> np.ndarray:
     dom_raw = packed_ctx.get("dom_af", packed_ctx.get("het_rate", None))
     if dom_raw is None:
-        raise ValueError(
-            "Packed context is missing dominance AF metadata (`dom_af`). "
-            "Rebuild the packed context with the current JanusX loader."
+        source_prefix = str(packed_ctx.get("source_prefix", "") or "").strip()
+        if source_prefix == "":
+            raise ValueError(
+                "Packed context is missing dominance AF metadata (`dom_af`) "
+                "and does not carry a source PLINK prefix for on-demand rebuild."
+            )
+        try:
+            from janusx.gfreader import scan_bed_2bit_packed_stats as _scan_bed_2bit_packed_stats
+        except Exception:
+            _scan_bed_2bit_packed_stats = None  # type: ignore[assignment]
+        try:
+            from janusx.script._common.genoio import _scan_bed_2bit_packed_stats_fallback
+        except Exception as ex:
+            raise RuntimeError(
+                "Dominance packed metadata rebuild is unavailable: missing both "
+                "Rust `scan_bed_2bit_packed_stats` and Python fallback helpers."
+            ) from ex
+
+        n_expected = int(packed_ctx.get("n_samples", 0) or 0)
+        if _scan_bed_2bit_packed_stats is not None:
+            _miss_raw, _maf_raw, _std_raw, _row_flip_raw, het_raw, packed_n = _scan_bed_2bit_packed_stats(
+                str(source_prefix)
+            )
+        else:
+            _miss_raw, _maf_raw, _std_raw, _row_flip_raw, het_raw, packed_n = _scan_bed_2bit_packed_stats_fallback(
+                str(source_prefix),
+                n_expected_samples=int(max(1, n_expected)),
+            )
+        if n_expected > 0 and int(packed_n) != int(n_expected):
+            raise ValueError(
+                "Dominance packed metadata sample count mismatch: "
+                f"expected={int(n_expected)}, got={int(packed_n)}."
+            )
+        dom_full = np.ascontiguousarray(
+            np.asarray(het_raw, dtype=np.float32).reshape(-1),
+            dtype=np.float32,
         )
+        active_row_idx = _packed_ctx_active_row_idx(packed_ctx)
+        if int(dom_full.shape[0]) == int(active_row_idx.shape[0]):
+            dom_cached = dom_full
+        else:
+            active_max = int(np.max(active_row_idx)) if int(active_row_idx.shape[0]) > 0 else -1
+            if active_max >= int(dom_full.shape[0]):
+                raise ValueError(
+                    "Dominance packed metadata row count is inconsistent with active_row_idx."
+                )
+            dom_cached = np.ascontiguousarray(dom_full[active_row_idx], dtype=np.float32)
+        packed_ctx["dom_af"] = dom_cached
+        dom_raw = dom_cached
     dom_full = np.ascontiguousarray(
         np.asarray(dom_raw, dtype=np.float32).reshape(-1),
         dtype=np.float32,
@@ -1043,14 +1087,44 @@ def _is_jxmodel_export_supported(method: str) -> bool:
     m = str(method)
     return bool(
         (m == "rrBLUP")
+        or (m in _ML_METHOD_MAP)
+    )
+
+
+def _is_binary_jxmodel_artifact_supported(method: str) -> bool:
+    m = str(method).strip()
+    return bool(_is_gblup_method(m) or (m == "rrBLUP") or (m in _ML_METHOD_MAP))
+
+
+def _is_text_effect_jxmodel_supported(method: str) -> bool:
+    m = str(method).strip()
+    return bool(_is_blup_method(m) or (m in {"BayesA", "BayesB", "BayesCpi"}))
+
+
+def _is_effect_export_supported(method: str) -> bool:
+    m = str(method)
+    return bool(
+        _is_blup_method(m)
+        or _is_gblup_method(m)
+        or (m == "rrBLUP")
         or (m in {"BayesA", "BayesB", "BayesCpi"})
         or (m in _ML_METHOD_MAP)
     )
 
 
-def _is_effect_export_supported(method: str) -> bool:
-    m = str(method)
-    return bool(_is_gblup_method(m) or _is_jxmodel_export_supported(m))
+def _resolve_save_model_artifact_kind(
+    requested_method: str,
+    effect_export_method: str,
+) -> str:
+    req = str(requested_method).strip()
+    eff = str(effect_export_method).strip()
+    if _is_text_effect_jxmodel_supported(req):
+        return "text_effect"
+    if _is_binary_jxmodel_artifact_supported(req):
+        return "binary_jxmodel"
+    if _is_binary_jxmodel_artifact_supported(eff):
+        return "binary_jxmodel"
+    return "none"
 
 
 def _resolve_effect_export_method(
@@ -1205,6 +1279,11 @@ def _save_jxmodel(path: str, payload: dict[str, typing.Any]) -> None:
         pickle.dump(payload, fh, protocol=pickle.HIGHEST_PROTOCOL)
 
 
+def _save_effect_text_jxmodel(path: str, table: pd.DataFrame) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    table.to_csv(str(path), sep="\t", index=False, float_format="%.6g")
+
+
 def _load_jxmodel(path: str) -> dict[str, typing.Any]:
     with open(path, "rb") as fh:
         obj = pickle.load(fh)
@@ -1228,7 +1307,7 @@ def _strip_plink_suffix(path_or_prefix: str) -> str:
 
 def _read_plink_bim_effect_meta(
     prefix_or_bim: str,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     prefix = _strip_plink_suffix(str(prefix_or_bim))
     bim_path = prefix if str(prefix).lower().endswith(".bim") else f"{prefix}.bim"
     if not os.path.isfile(bim_path):
@@ -1236,8 +1315,7 @@ def _read_plink_bim_effect_meta(
 
     chrom: list[str] = []
     pos: list[int] = []
-    allele0: list[str] = []
-    allele1: list[str] = []
+    snp: list[str] = []
     with open(bim_path, "r", encoding="utf-8", errors="replace") as fh:
         for line_no, line in enumerate(fh, start=1):
             s = str(line).strip()
@@ -1254,13 +1332,11 @@ def _read_plink_bim_effect_meta(
             except Exception:
                 p = int(float(parts[3]))
             pos.append(int(p))
-            allele0.append(str(parts[4]))
-            allele1.append(str(parts[5]))
+            snp.append(str(parts[1]))
     return (
         np.asarray(chrom, dtype=object),
         np.asarray(pos, dtype=np.int64),
-        np.asarray(allele0, dtype=object),
-        np.asarray(allele1, dtype=object),
+        np.asarray(snp, dtype=object),
     )
 
 
@@ -1563,6 +1639,290 @@ def _extract_effect_vector_from_model_state(
     return None, src, _infer_effect_kind_from_state(model_state, ml_source=src)
 
 
+def _extract_pip_vector_from_model_state(
+    model_state: dict[str, typing.Any],
+) -> tuple[np.ndarray | None, str]:
+    for key in ("pip", "posterior_inclusion_probability", "posterior_pip"):
+        raw = model_state.get(str(key), None)
+        if raw is None:
+            continue
+        try:
+            vec = np.asarray(raw, dtype=np.float64).reshape(-1)
+        except Exception:
+            continue
+        if int(vec.size) <= 0:
+            continue
+        return np.ascontiguousarray(vec, dtype=np.float64), f"model_state.{key}"
+    return None, "no_pip_in_model_state"
+
+
+def _attach_effect_export_hints_to_model_state(
+    *,
+    model_state: dict[str, typing.Any],
+    packed_ctx: dict[str, typing.Any] | None,
+    genotype_prefix_hint: str | None,
+) -> None:
+    prefix_hint = str(genotype_prefix_hint or "").strip()
+    if prefix_hint != "":
+        model_state["genotype_prefix_hint"] = prefix_hint
+    if not _looks_like_packed_ctx(packed_ctx):
+        return
+    packed_local = typing.cast(dict[str, typing.Any], packed_ctx)
+    source_prefix = str(packed_local.get("source_prefix", "") or "").strip()
+    if source_prefix != "":
+        model_state["source_prefix"] = source_prefix
+    site_keep_raw = packed_local.get("site_keep", None)
+    site_keep_arr: np.ndarray | None = None
+    if site_keep_raw is not None:
+        site_keep_arr = np.ascontiguousarray(
+            np.asarray(site_keep_raw, dtype=np.bool_).reshape(-1),
+            dtype=np.bool_,
+        )
+        if int(site_keep_arr.size) > 0:
+            model_state["export_site_keep"] = site_keep_arr
+    active_row_idx = _packed_ctx_active_row_idx(packed_local)
+    if int(active_row_idx.size) > 0:
+        if site_keep_arr is None:
+            model_state["export_active_row_idx"] = active_row_idx
+        else:
+            keep_idx = np.flatnonzero(site_keep_arr).astype(np.int64, copy=False)
+            if (
+                int(keep_idx.shape[0]) != int(active_row_idx.shape[0])
+                or not np.array_equal(keep_idx, active_row_idx)
+            ):
+                model_state["export_active_row_idx"] = active_row_idx
+
+
+def _pcg_trace_policy_for_export(
+    n_jobs: int,
+) -> tuple[int, int]:
+    threads = int(max(1, int(n_jobs)))
+    return threads, threads
+
+
+def _try_backsolve_gblup_effect_beta_pcg(
+    *,
+    model_state: dict[str, typing.Any],
+    packed_ctx: dict[str, typing.Any] | None,
+    train_sample_indices: np.ndarray | None,
+    train_pheno: np.ndarray,
+    gblup_final_state: dict[str, typing.Any] | None,
+    n_jobs: int,
+) -> tuple[np.ndarray | None, dict[str, typing.Any]]:
+    meta: dict[str, typing.Any] = {
+        "status": "skipped",
+        "solver": "rrblupc_pcg_bed",
+    }
+    if not _looks_like_packed_ctx(packed_ctx):
+        meta["reason"] = "packed_ctx_unavailable"
+        return None, meta
+    if (_jxrs is None) or (not hasattr(_jxrs, "rrblupc_pcg_bed")):
+        meta["reason"] = "rust_rrblupc_pcg_bed_unavailable"
+        return None, meta
+    kernel_mode = str(
+        model_state.get(
+            "kernel_mode",
+            (gblup_final_state or {}).get("kernel_mode", "a"),
+        )
+    ).strip().lower()
+    if kernel_mode not in {"a", "add", "additive"}:
+        meta["reason"] = f"kernel_mode_unsupported:{kernel_mode or 'unknown'}"
+        return None, meta
+    lambda_reml = float(
+        typing.cast(dict[str, typing.Any], gblup_final_state or {}).get("lambda_reml", np.nan)
+    )
+    if (not np.isfinite(lambda_reml)) or (lambda_reml < 0.0):
+        meta["reason"] = "lambda_reml_unavailable"
+        return None, meta
+
+    packed_local = typing.cast(dict[str, typing.Any], packed_ctx)
+    y_vec = np.ascontiguousarray(np.asarray(train_pheno, dtype=np.float64).reshape(-1), dtype=np.float64)
+    if train_sample_indices is None:
+        n_total = int(packed_local.get("n_samples", 0))
+        if n_total != int(y_vec.shape[0]):
+            meta["reason"] = "train_sample_indices_required"
+            return None, meta
+        train_abs = np.ascontiguousarray(np.arange(n_total, dtype=np.int64), dtype=np.int64)
+    else:
+        train_abs = np.ascontiguousarray(
+            np.asarray(train_sample_indices, dtype=np.int64).reshape(-1),
+            dtype=np.int64,
+        )
+    if int(train_abs.shape[0]) != int(y_vec.shape[0]):
+        meta["reason"] = "train_sample_indices_length_mismatch"
+        return None, meta
+
+    source_prefix = str(packed_local.get("source_prefix", "") or "").strip()
+    packed_raw = packed_local.get("packed", None)
+    prefer_stream = _packed_ctx_prefers_metadata_stream(packed_local)
+    active_row_idx = _packed_ctx_active_row_idx(packed_local)
+    active_row_idx_max = int(np.max(active_row_idx)) if int(active_row_idx.size) > 0 else -1
+
+    maf_full = np.ascontiguousarray(
+        np.asarray(packed_local.get("maf", np.zeros((0,), dtype=np.float32)), dtype=np.float32).reshape(-1),
+        dtype=np.float32,
+    )
+    if int(maf_full.size) <= 0:
+        meta["reason"] = "maf_unavailable"
+        return None, meta
+    row_flip_full = np.ascontiguousarray(
+        np.asarray(_ensure_packed_row_flip_cached(packed_local), dtype=np.bool_).reshape(-1),
+        dtype=np.bool_,
+    )
+    if int(row_flip_full.shape[0]) != int(maf_full.shape[0]):
+        meta["reason"] = "row_flip_maf_length_mismatch"
+        return None, meta
+
+    site_keep_arg: np.ndarray | None = None
+    site_keep_raw = packed_local.get("site_keep", None)
+    if site_keep_raw is not None:
+        site_keep_arg = np.ascontiguousarray(
+            np.asarray(site_keep_raw, dtype=np.bool_).reshape(-1),
+            dtype=np.bool_,
+        )
+    elif (
+        int(active_row_idx.shape[0]) > 0
+        and int(active_row_idx.shape[0]) < int(maf_full.shape[0])
+        and active_row_idx_max < int(maf_full.shape[0])
+    ):
+        site_keep_arg = np.zeros((int(maf_full.shape[0]),), dtype=np.bool_)
+        site_keep_arg[active_row_idx] = True
+
+    packed_arg: np.ndarray | None = None
+    maf_arg = maf_full
+    row_flip_arg = row_flip_full
+    site_keep_use = site_keep_arg
+    backend_mode = "stream"
+    if (packed_raw is not None) and (not prefer_stream):
+        packed_arr = np.ascontiguousarray(np.asarray(packed_raw, dtype=np.uint8), dtype=np.uint8)
+        if packed_arr.ndim == 2:
+            packed_rows = int(packed_arr.shape[0])
+            if int(maf_full.shape[0]) == packed_rows and int(row_flip_full.shape[0]) == packed_rows:
+                packed_arg = packed_arr
+                if site_keep_use is not None and int(site_keep_use.shape[0]) != packed_rows:
+                    site_keep_use = None
+                backend_mode = "resident"
+            elif (
+                int(active_row_idx.shape[0]) == packed_rows
+                and active_row_idx_max < int(maf_full.shape[0])
+            ):
+                maf_arg = np.ascontiguousarray(maf_full[active_row_idx], dtype=np.float32)
+                row_flip_arg = np.ascontiguousarray(row_flip_full[active_row_idx], dtype=np.bool_)
+                packed_arg = packed_arr
+                site_keep_use = None
+                backend_mode = "resident"
+    if backend_mode == "stream":
+        if source_prefix == "":
+            meta["reason"] = "source_prefix_unavailable"
+            return None, meta
+        if site_keep_use is not None and int(site_keep_use.shape[0]) != int(maf_full.shape[0]):
+            meta["reason"] = "site_keep_maf_length_mismatch"
+            return None, meta
+        if site_keep_use is None and int(active_row_idx.shape[0]) < int(maf_full.shape[0]):
+            meta["reason"] = "active_subset_requires_site_keep"
+            return None, meta
+
+    maf_used = (
+        np.ascontiguousarray(maf_arg[site_keep_use], dtype=np.float32)
+        if site_keep_use is not None
+        else np.ascontiguousarray(maf_arg, dtype=np.float32)
+    )
+    row_var = 2.0 * np.clip(np.asarray(maf_used, dtype=np.float64), 0.0, 0.5) * (
+        1.0 - np.clip(np.asarray(maf_used, dtype=np.float64), 0.0, 0.5)
+    )
+    valid = np.isfinite(row_var) & (row_var > float(np.finfo(np.float64).eps))
+    var_sum = float(np.sum(row_var[valid], dtype=np.float64))
+    if (not np.isfinite(var_sum)) or (var_sum <= 0.0):
+        meta["reason"] = "invalid_marker_variance_sum"
+        return None, meta
+    lambda_equation = float(lambda_reml * var_sum)
+    if (not np.isfinite(lambda_equation)) or (lambda_equation < 0.0):
+        meta["reason"] = "invalid_lambda_equation"
+        return None, meta
+
+    n_samples = int(packed_local.get("n_samples", 0))
+    if n_samples <= 0:
+        meta["reason"] = "packed_n_samples_invalid"
+        return None, meta
+    block_rows = int(max(1, int(packed_local.get("__gblup_grm_block_rows__", 4096))))
+    pcg_threads, blas_threads = _pcg_trace_policy_for_export(int(max(1, int(n_jobs))))
+    rrblup_fn = getattr(_jxrs, "rrblupc_pcg_bed")
+    train_pred_empty = np.zeros((0,), dtype=np.int64)
+    rr_kwargs: dict[str, typing.Any] = {
+        "progress_callback": None,
+        "progress_every": 0,
+        "compute_trainvar": False,
+        "packed": packed_arg,
+        "packed_n_samples": int(n_samples),
+        "maf": np.ascontiguousarray(maf_arg, dtype=np.float32),
+        "row_flip": np.ascontiguousarray(row_flip_arg, dtype=np.bool_),
+        "blas_threads": int(blas_threads),
+    }
+    try:
+        with runtime_thread_stage(
+            blas_threads=int(blas_threads),
+            rayon_threads=1,
+        ):
+            try:
+                rr_out = rrblup_fn(
+                    source_prefix,
+                    train_abs,
+                    y_vec,
+                    None,
+                    train_pred_empty,
+                    site_keep_use,
+                    float(max(lambda_equation, 1e-12)),
+                    float(1e-4),
+                    int(128),
+                    int(block_rows),
+                    float(1e-12),
+                    int(pcg_threads),
+                    **rr_kwargs,
+                )
+            except TypeError:
+                rr_kwargs.pop("blas_threads", None)
+                rr_out = rrblup_fn(
+                    source_prefix,
+                    train_abs,
+                    y_vec,
+                    None,
+                    train_pred_empty,
+                    site_keep_use,
+                    float(max(lambda_equation, 1e-12)),
+                    float(1e-4),
+                    int(128),
+                    int(block_rows),
+                    float(1e-12),
+                    int(pcg_threads),
+                    **rr_kwargs,
+                )
+    except Exception as ex:
+        meta["reason"] = f"pcg_failed:{type(ex).__name__}:{ex}"
+        return None, meta
+
+    rr_tuple = tuple(rr_out)
+    if len(rr_tuple) < 10:
+        meta["reason"] = f"unexpected_rrblupc_pcg_payload:{len(rr_tuple)}"
+        return None, meta
+    beta_backsolve = np.ascontiguousarray(
+        np.asarray(rr_tuple[9], dtype=np.float64).reshape(-1),
+        dtype=np.float64,
+    )
+    meta.update(
+        {
+            "status": "ok",
+            "backend": str(backend_mode),
+            "lambda_reml": float(lambda_reml),
+            "lambda_equation": float(lambda_equation),
+            "var_sum": float(var_sum),
+            "converged": bool(rr_tuple[3]),
+            "iters": int(rr_tuple[4]),
+            "rel_res": float(rr_tuple[5]),
+        }
+    )
+    return beta_backsolve, meta
+
+
 def _build_method_effect_table(
     *,
     model_state: dict[str, typing.Any],
@@ -1572,15 +1932,14 @@ def _build_method_effect_table(
 ) -> tuple[pd.DataFrame, dict[str, typing.Any]]:
     notes: list[str] = []
     beta_vec, beta_source, effect_kind = _extract_effect_vector_from_model_state(model_state)
+    pip_vec, pip_source = _extract_pip_vector_from_model_state(model_state)
     beta_len = 0 if beta_vec is None else int(beta_vec.shape[0])
+    pip_len = 0 if pip_vec is None else int(pip_vec.shape[0])
 
     metadata_source = "placeholder"
     chrom_meta = np.zeros((0,), dtype=object)
     pos_meta = np.zeros((0,), dtype=np.int64)
-    allele0_meta = np.zeros((0,), dtype=object)
-    allele1_meta = np.zeros((0,), dtype=object)
-    maf_vec = np.zeros((0,), dtype=np.float64)
-    row_flip = np.zeros((0,), dtype=np.bool_)
+    snp_meta = np.zeros((0,), dtype=object)
 
     packed_local = (
         typing.cast(dict[str, typing.Any], packed_ctx)
@@ -1588,68 +1947,13 @@ def _build_method_effect_table(
         else None
     )
 
-    if packed_local is not None:
-        active_row_idx = _packed_ctx_active_row_idx(packed_local)
-        packed_raw = packed_local.get("packed", None)
-        compact_from_active = False
-        active_row_idx_max = int(np.max(active_row_idx)) if int(active_row_idx.shape[0]) > 0 else -1
-        try:
-            maf_full = np.ascontiguousarray(
-                np.asarray(
-                    packed_local.get("maf", np.zeros((0,), dtype=np.float32)),
-                    dtype=np.float64,
-                ).reshape(-1),
-                dtype=np.float64,
-            )
-            compact_from_active = bool(
-                _packed_ctx_is_lazy_full(packed_local)
-                or (
-                    (packed_raw is None)
-                    and (int(maf_full.shape[0]) != int(active_row_idx.shape[0]))
-                )
-            )
-            if compact_from_active:
-                if int(maf_full.shape[0]) > active_row_idx_max:
-                    maf_vec = np.ascontiguousarray(
-                        np.asarray(maf_full[active_row_idx], dtype=np.float64).reshape(-1),
-                        dtype=np.float64,
-                    )
-                else:
-                    notes.append("maf length shorter than active_row_idx; skipped active-row subsetting")
-                    maf_vec = maf_full
-            else:
-                maf_vec = maf_full
-        except Exception as ex:
-            notes.append(f"maf metadata unavailable: {ex}")
-            maf_vec = np.zeros((0,), dtype=np.float64)
-        try:
-            row_flip_raw = packed_local.get("row_flip", None)
-            if row_flip_raw is not None:
-                row_flip_full = np.ascontiguousarray(
-                    np.asarray(row_flip_raw, dtype=np.bool_).reshape(-1),
-                    dtype=np.bool_,
-                )
-            elif packed_raw is not None:
-                row_flip_full = _ensure_packed_row_flip_cached(packed_local)
-            else:
-                row_flip_full = np.zeros((0,), dtype=np.bool_)
-            if int(row_flip_full.shape[0]) > 0:
-                if compact_from_active and int(row_flip_full.shape[0]) != int(active_row_idx.shape[0]):
-                    if int(row_flip_full.shape[0]) > active_row_idx_max:
-                        row_flip = np.ascontiguousarray(
-                            np.asarray(row_flip_full[active_row_idx], dtype=np.bool_).reshape(-1),
-                            dtype=np.bool_,
-                        )
-                    else:
-                        notes.append("row_flip length shorter than active_row_idx; skipped active-row subsetting")
-                        row_flip = row_flip_full
-                else:
-                    row_flip = row_flip_full
-        except Exception as ex:
-            notes.append(f"row_flip metadata unavailable: {ex}")
-            row_flip = np.zeros((0,), dtype=np.bool_)
-
     prefix_candidates: list[str] = []
+    state_prefix_hint = str(model_state.get("genotype_prefix_hint", "") or "").strip()
+    if state_prefix_hint != "":
+        prefix_candidates.append(_strip_plink_suffix(state_prefix_hint))
+    source_prefix_hint = str(model_state.get("source_prefix", "") or "").strip()
+    if source_prefix_hint != "":
+        prefix_candidates.append(_strip_plink_suffix(source_prefix_hint))
     if packed_local is not None:
         src_prefix = str(packed_local.get("source_prefix", "") or "").strip()
         if src_prefix != "":
@@ -1658,76 +1962,64 @@ def _build_method_effect_table(
         prefix_candidates.append(_strip_plink_suffix(str(genotype_prefix_hint)))
 
     prefix_candidates = list(dict.fromkeys(prefix_candidates))
+    active_row_idx = np.zeros((0,), dtype=np.int64)
+    site_keep = None
+    if packed_local is not None:
+        active_row_idx = _packed_ctx_active_row_idx(packed_local)
+        site_keep_raw = packed_local.get("site_keep", None)
+        if site_keep_raw is not None:
+            site_keep = np.ascontiguousarray(
+                np.asarray(site_keep_raw, dtype=np.bool_).reshape(-1),
+                dtype=np.bool_,
+            )
+    else:
+        site_keep_raw = model_state.get("export_site_keep", None)
+        if site_keep_raw is not None:
+            try:
+                site_keep = np.ascontiguousarray(
+                    np.asarray(site_keep_raw, dtype=np.bool_).reshape(-1),
+                    dtype=np.bool_,
+                )
+            except Exception:
+                site_keep = None
+        active_row_idx_raw = model_state.get("export_active_row_idx", None)
+        if active_row_idx_raw is not None:
+            try:
+                active_row_idx = np.ascontiguousarray(
+                    np.asarray(active_row_idx_raw, dtype=np.int64).reshape(-1),
+                    dtype=np.int64,
+                )
+            except Exception:
+                active_row_idx = np.zeros((0,), dtype=np.int64)
+        elif site_keep is not None:
+            active_row_idx = np.ascontiguousarray(
+                np.flatnonzero(site_keep).astype(np.int64, copy=False),
+                dtype=np.int64,
+            )
+    active_row_idx_max = int(np.max(active_row_idx)) if int(active_row_idx.shape[0]) > 0 else -1
     for cand in prefix_candidates:
         if not _is_plink_prefix(cand):
             continue
         try:
-            chrom_meta, pos_meta, allele0_meta, allele1_meta = _read_plink_bim_effect_meta(cand)
+            chrom_meta, pos_meta, snp_meta = _read_plink_bim_effect_meta(cand)
             metadata_source = str(cand)
-            if packed_local is not None:
-                site_keep_raw = packed_local.get("site_keep", None)
-                active_row_idx = _packed_ctx_active_row_idx(packed_local)
-                if site_keep_raw is not None:
-                    site_keep = np.ascontiguousarray(
-                        np.asarray(site_keep_raw, dtype=np.bool_).reshape(-1),
-                        dtype=np.bool_,
-                    )
-                    if int(site_keep.shape[0]) == int(chrom_meta.shape[0]):
-                        chrom_meta = np.asarray(chrom_meta[site_keep], dtype=object)
-                        pos_meta = np.asarray(pos_meta[site_keep], dtype=np.int64)
-                        allele0_meta = np.asarray(allele0_meta[site_keep], dtype=object)
-                        allele1_meta = np.asarray(allele1_meta[site_keep], dtype=object)
-                    else:
-                        notes.append("site_keep length mismatch with BIM rows; skipped site_keep alignment")
-                elif (
-                    int(active_row_idx.shape[0]) > 0
-                    and int(active_row_idx.shape[0]) < int(chrom_meta.shape[0])
-                ):
-                    if active_row_idx_max < int(chrom_meta.shape[0]):
-                        chrom_meta = np.asarray(chrom_meta[active_row_idx], dtype=object)
-                        pos_meta = np.asarray(pos_meta[active_row_idx], dtype=np.int64)
-                        allele0_meta = np.asarray(allele0_meta[active_row_idx], dtype=object)
-                        allele1_meta = np.asarray(allele1_meta[active_row_idx], dtype=object)
-                    else:
-                        notes.append("active_row_idx exceeds BIM rows; skipped active-row alignment")
-                maf_meta = maf_vec
-                if int(maf_meta.shape[0]) != int(chrom_meta.shape[0]):
-                    if site_keep_raw is not None:
-                        site_keep = np.ascontiguousarray(
-                            np.asarray(site_keep_raw, dtype=np.bool_).reshape(-1),
-                            dtype=np.bool_,
-                        )
-                        if int(maf_meta.shape[0]) == int(site_keep.shape[0]):
-                            maf_meta = np.ascontiguousarray(maf_meta[site_keep], dtype=np.float64)
-                    elif (
-                        int(maf_meta.shape[0]) > active_row_idx_max
-                        and int(active_row_idx.shape[0]) == int(chrom_meta.shape[0])
-                    ):
-                        maf_meta = np.ascontiguousarray(maf_meta[active_row_idx], dtype=np.float64)
-                maf_vec = maf_meta
-
-                row_flip_meta = row_flip
-                if int(row_flip_meta.shape[0]) != int(chrom_meta.shape[0]):
-                    if site_keep_raw is not None:
-                        site_keep = np.ascontiguousarray(
-                            np.asarray(site_keep_raw, dtype=np.bool_).reshape(-1),
-                            dtype=np.bool_,
-                        )
-                        if int(row_flip_meta.shape[0]) == int(site_keep.shape[0]):
-                            row_flip_meta = np.ascontiguousarray(row_flip_meta[site_keep], dtype=np.bool_)
-                    elif (
-                        int(row_flip_meta.shape[0]) > active_row_idx_max
-                        and int(active_row_idx.shape[0]) == int(chrom_meta.shape[0])
-                    ):
-                        row_flip_meta = np.ascontiguousarray(row_flip_meta[active_row_idx], dtype=np.bool_)
-                row_flip = row_flip_meta
-
-                if int(row_flip.shape[0]) == int(chrom_meta.shape[0]) and int(row_flip.shape[0]) > 0:
-                    swap = np.asarray(row_flip, dtype=np.bool_)
-                    if np.any(swap):
-                        a0_tmp = allele0_meta.copy()
-                        allele0_meta[swap] = allele1_meta[swap]
-                        allele1_meta[swap] = a0_tmp[swap]
+            if site_keep is not None:
+                if int(site_keep.shape[0]) == int(chrom_meta.shape[0]):
+                    chrom_meta = np.asarray(chrom_meta[site_keep], dtype=object)
+                    pos_meta = np.asarray(pos_meta[site_keep], dtype=np.int64)
+                    snp_meta = np.asarray(snp_meta[site_keep], dtype=object)
+                else:
+                    notes.append("site_keep length mismatch with BIM rows; skipped site_keep alignment")
+            elif (
+                int(active_row_idx.shape[0]) > 0
+                and int(active_row_idx.shape[0]) < int(chrom_meta.shape[0])
+            ):
+                if active_row_idx_max < int(chrom_meta.shape[0]):
+                    chrom_meta = np.asarray(chrom_meta[active_row_idx], dtype=object)
+                    pos_meta = np.asarray(pos_meta[active_row_idx], dtype=np.int64)
+                    snp_meta = np.asarray(snp_meta[active_row_idx], dtype=object)
+                else:
+                    notes.append("active_row_idx exceeds BIM rows; skipped active-row alignment")
             break
         except Exception as ex:
             notes.append(f"failed to read BIM metadata from {cand}: {ex}")
@@ -1735,8 +2027,8 @@ def _build_method_effect_table(
     n_rows = 0
     if beta_len > 0:
         n_rows = int(beta_len)
-    elif int(maf_vec.shape[0]) > 0:
-        n_rows = int(maf_vec.shape[0])
+    elif pip_len > 0:
+        n_rows = int(pip_len)
     elif int(chrom_meta.shape[0]) > 0:
         n_rows = int(chrom_meta.shape[0])
     elif fallback_marker_count is not None and int(fallback_marker_count) > 0:
@@ -1744,47 +2036,52 @@ def _build_method_effect_table(
 
     chrom = np.full((n_rows,), ".", dtype=object)
     pos = np.full((n_rows,), -1, dtype=np.int64)
-    allele0 = np.full((n_rows,), "N", dtype=object)
-    allele1 = np.full((n_rows,), "N", dtype=object)
-    maf = np.full((n_rows,), np.nan, dtype=np.float64)
-    effect_col = _primary_effect_col_for_kind(effect_kind)
+    snp = np.array([f"SNP{i + 1}" for i in range(n_rows)], dtype=object)
     effect_values = np.full((n_rows,), np.nan, dtype=np.float64)
+    pip_values = np.full((n_rows,), np.nan, dtype=np.float64)
 
     if int(chrom_meta.shape[0]) > 0 and n_rows > 0:
         use_n = min(n_rows, int(chrom_meta.shape[0]))
         chrom[:use_n] = chrom_meta[:use_n]
         pos[:use_n] = pos_meta[:use_n]
-        allele0[:use_n] = allele0_meta[:use_n]
-        allele1[:use_n] = allele1_meta[:use_n]
+        snp[:use_n] = snp_meta[:use_n]
         if int(chrom_meta.shape[0]) != n_rows:
             notes.append(f"metadata rows={int(chrom_meta.shape[0])}, effect rows={int(n_rows)}")
-    if int(maf_vec.shape[0]) > 0 and n_rows > 0:
-        use_n = min(n_rows, int(maf_vec.shape[0]))
-        maf[:use_n] = np.asarray(maf_vec[:use_n], dtype=np.float64)
-        if int(maf_vec.shape[0]) != n_rows:
-            notes.append(f"maf rows={int(maf_vec.shape[0])}, effect rows={int(n_rows)}")
     if beta_vec is not None and n_rows > 0:
         use_n = min(n_rows, int(beta_vec.shape[0]))
         effect_values[:use_n] = np.asarray(beta_vec[:use_n], dtype=np.float64)
         if int(beta_vec.shape[0]) != n_rows:
             notes.append(f"beta rows={int(beta_vec.shape[0])}, effect rows={int(n_rows)}")
+    if pip_vec is not None and n_rows > 0:
+        use_n = min(n_rows, int(pip_vec.shape[0]))
+        pip_values[:use_n] = np.asarray(pip_vec[:use_n], dtype=np.float64)
+        if int(pip_vec.shape[0]) != n_rows:
+            notes.append(f"pip rows={int(pip_vec.shape[0])}, effect rows={int(n_rows)}")
     for note in list(model_state.get("export_conversion_notes", []) or []):
         n = str(note).strip()
         if n != "":
             notes.append(f"model_export:{n}")
+    if isinstance(model_state.get("gblup_effect_compare", None), dict):
+        compare_meta = typing.cast(dict[str, typing.Any], model_state.get("gblup_effect_compare"))
+        try:
+            notes.append(
+                "gblup_backsolve_compare:"
+                f"max_abs_diff={float(compare_meta.get('max_abs_diff', np.nan)):.6g},"
+                f"mean_abs_diff={float(compare_meta.get('mean_abs_diff', np.nan)):.6g},"
+                f"corr={float(compare_meta.get('corr', np.nan)):.6g}"
+            )
+        except Exception:
+            pass
 
-    table = pd.DataFrame(
-        {
-            "chrom": chrom,
-            "pos": pos,
-            "allele0": allele0,
-            "allele1": allele1,
-            "maf": maf,
-            effect_col: effect_values,
-            # Backward-compatible alias for older downstream code.
-            "beta": effect_values,
-        }
-    )
+    table_dict: dict[str, typing.Any] = {
+        "chr": chrom,
+        "pos": pos,
+        "snp": snp,
+        "beta": effect_values,
+    }
+    if pip_vec is not None:
+        table_dict["pip"] = pip_values
+    table = pd.DataFrame(table_dict)
     alpha_meta: float | None = None
     try:
         alpha_val = float(model_state.get("export_alpha_raw_012", np.nan))
@@ -1796,10 +2093,13 @@ def _build_method_effect_table(
         "rows": int(n_rows),
         "effect_kind": str(effect_kind),
         "effect_source": str(beta_source),
-        "effect_column": str(effect_col),
+        "effect_column": "beta",
         "beta_source": str(beta_source),
         "beta_available": bool(beta_vec is not None),
         "beta_non_nan_rows": int(np.sum(np.isfinite(effect_values))),
+        "pip_source": str(pip_source),
+        "pip_available": bool(pip_vec is not None),
+        "pip_non_nan_rows": int(np.sum(np.isfinite(pip_values))),
         "beta_scale": (
             str(model_state.get("export_scale", "raw_012")).strip()
             if (not bool(model_state.get("standardized", True)))
@@ -2439,6 +2739,37 @@ def _gs_stream_logger(logger: logging.Logger) -> logging.Logger | None:
     except Exception:
         pass
     return None
+
+
+def _format_cli_finished_timestamp(ts: float | None = None) -> str:
+    lt = time.localtime(time.time() if ts is None else float(ts))
+    return (
+        f"{lt.tm_year}-{lt.tm_mon}-{lt.tm_mday} "
+        f"{lt.tm_hour:02d}:{lt.tm_min:02d}:{lt.tm_sec:02d}"
+    )
+
+
+def _emit_gs_finished_lines(
+    logger: logging.Logger,
+    *,
+    elapsed_sec: float,
+    finished_unix: float | None = None,
+) -> None:
+    lines = [
+        "",
+        f"Finished. Total wall time: {float(max(elapsed_sec, 0.0)):.2f} seconds",
+        _format_cli_finished_timestamp(finished_unix),
+    ]
+    targets: list[logging.Logger] = []
+    report_logger = _gs_report_logger(logger)
+    targets.append(report_logger)
+    if _gs_terminal_rich(logger):
+        stream_logger = _gs_stream_logger(logger)
+        if isinstance(stream_logger, logging.Logger) and id(stream_logger) != id(report_logger):
+            targets.append(stream_logger)
+    for target in targets:
+        for line in lines:
+            target.info(line)
 
 
 def _gs_terminal_rule_width(
@@ -11103,6 +11434,15 @@ def GSapi(
             bayes_beta = np.ascontiguousarray(np.asarray(beta_raw, dtype=np.float64).reshape(-1), dtype=np.float64)
             bayes_alpha = np.ascontiguousarray(np.asarray(alpha_raw, dtype=np.float64).reshape(-1), dtype=np.float64)
             bayes_alpha0 = float(bayes_alpha[0]) if int(bayes_alpha.shape[0]) > 0 else 0.0
+            bayes_pip: np.ndarray | None = None
+            if str(method) in {"BayesB", "BayesCpi"} and len(diag_tail) >= 3:
+                try:
+                    bayes_pip = np.ascontiguousarray(
+                        np.asarray(diag_tail[-1], dtype=np.float64).reshape(-1),
+                        dtype=np.float64,
+                    )
+                except Exception:
+                    bayes_pip = None
 
             if bayes_runtime_state is not None:
                 bayes_runtime_state["r2_used"] = float(r2_used)
@@ -11180,6 +11520,11 @@ def GSapi(
                 model_state["snp_block_size"] = int(max(1, int(bayes_snp_block)))
                 model_state["sample_chunk_size"] = int(max(1, int(bayes_sample_chunk)))
                 model_state["pve"] = float(pve)
+                if bayes_pip is not None:
+                    model_state["pip"] = np.ascontiguousarray(
+                        np.asarray(bayes_pip, dtype=np.float64).reshape(-1),
+                        dtype=np.float64,
+                    )
             return (
                 np.asarray(train_pred, dtype=float).reshape(-1, 1),
                 np.asarray(test_pred, dtype=float).reshape(-1, 1),
@@ -11248,6 +11593,12 @@ def GSapi(
             model_state["snp_block_size"] = 2048
             model_state["sample_chunk_size"] = 4096
             model_state["pve"] = float(pve)
+            pip_hat = getattr(model, "pip_hat", None)
+            if pip_hat is not None:
+                model_state["pip"] = np.ascontiguousarray(
+                    np.asarray(pip_hat, dtype=np.float64).reshape(-1),
+                    dtype=np.float64,
+                )
         return (
             np.asarray(train_pred, dtype=float).reshape(-1, 1),
             np.asarray(model.predict(Xtest), dtype=float).reshape(-1, 1),
@@ -12768,10 +13119,7 @@ def _run_method_task(
             )
     want_export_state = bool(
         bool(save_model_artifact)
-        and (
-            _is_effect_export_supported(method)
-            or _is_jxmodel_export_supported(method)
-        )
+        and _is_effect_export_supported(method)
     )
     if want_export_state:
         skip_final_fit = False
@@ -16719,13 +17067,130 @@ def _load_plink_packed_for_lmm(
     packed_ctx : dict
         Keys: packed(uint8), missing_rate(float32), maf(float32), n_samples(int)
     """
-    sample_ids_arr, packed_ctx = prepare_packed_ctx_from_plink(
+    from janusx.assoc.workflow_model_packed import _gwas_logic_meta_global_cached
+
+    filter_mode_key = normalize_packed_filter_mode(filter_mode)
+    sample_ids_raw, n_snps_total = inspect_genotype_file(str(genotype_prefix))
+    sample_ids_arr = np.asarray(sample_ids_raw, dtype=str)
+    meta = _gwas_logic_meta_global_cached(
         str(genotype_prefix),
-        maf=float(maf),
-        missing_rate=float(missing_rate),
+        maf_threshold=float(maf),
+        max_missing_rate=float(missing_rate),
+        het_threshold=0.0,
         snps_only=False,
-        filter_mode=str(filter_mode),
+        outprefix=None,
+        logger=None,
+        use_spinner=False,
+        emit_status=False,
     )
+    row_idx = np.ascontiguousarray(
+        np.asarray(meta["row_indices"], dtype=np.int64).reshape(-1),
+        dtype=np.int64,
+    )
+    miss_arr = np.ascontiguousarray(
+        np.asarray(meta["missing_rate"], dtype=np.float32).reshape(-1),
+        dtype=np.float32,
+    )
+    maf_arr = np.ascontiguousarray(
+        np.asarray(meta.get("af", meta["maf"]), dtype=np.float32).reshape(-1),
+        dtype=np.float32,
+    )
+    row_flip_arr = np.ascontiguousarray(
+        np.asarray(meta["row_flip"], dtype=np.bool_).reshape(-1),
+        dtype=np.bool_,
+    )
+    n_samples = int(sample_ids_arr.shape[0])
+    n_total_sites = int(meta.get("n_snps_total", n_snps_total))
+    if int(n_total_sites) != int(n_snps_total):
+        raise ValueError(
+            "Packed BED metadata site count mismatch: "
+            f"inspect={int(n_snps_total)}, meta={int(n_total_sites)}."
+        )
+    site_keep = np.zeros((int(n_total_sites),), dtype=np.bool_)
+    site_keep[row_idx] = True
+
+    keep_ratio = (
+        float(row_idx.shape[0]) / float(site_keep.shape[0])
+        if int(site_keep.shape[0]) > 0
+        else 0.0
+    )
+    use_lazy = False
+    if filter_mode_key in {"lazy", "lazy_owned"}:
+        use_lazy = True
+    elif filter_mode_key == "auto":
+        lazy_keep_ratio = float(
+            os.environ.get("JX_PACKED_LAZY_KEEP_RATIO", "0.98").strip() or "0.98"
+        )
+        if not np.isfinite(lazy_keep_ratio):
+            lazy_keep_ratio = 0.98
+        lazy_keep_ratio = min(1.0, max(0.0, lazy_keep_ratio))
+        use_lazy = bool(keep_ratio >= lazy_keep_ratio)
+
+    if use_lazy:
+        if filter_mode_key == "lazy_owned":
+            packed_payload = load_plink_bed_payload_owned(
+                str(genotype_prefix),
+                n_samples=n_samples,
+                n_snps=int(n_total_sites),
+            )
+            packed_storage = "owned"
+        else:
+            packed_payload = open_plink_bed_payload_memmap(
+                str(genotype_prefix),
+                n_samples=n_samples,
+                n_snps=int(n_total_sites),
+            )
+            packed_storage = "memmap"
+        packed_ctx: dict[str, typing.Any] = {
+            "packed": packed_payload,
+            "missing_rate": miss_arr,
+            "af": maf_arr,
+            "maf": maf_arr,
+            "row_flip": row_flip_arr,
+            "site_keep": site_keep,
+            "active_row_idx": row_idx,
+            "row_indices": row_idx,
+            "packed_filter_mode": "lazy_full",
+            "packed_storage": packed_storage,
+            "n_samples": n_samples,
+            "n_total_sites": int(n_total_sites),
+            "n_active_sites": int(row_idx.shape[0]),
+            "source_prefix": str(genotype_prefix),
+        }
+        return sample_ids_arr, packed_ctx
+
+    packed_memmap = open_plink_bed_payload_memmap(
+        str(genotype_prefix),
+        n_samples=n_samples,
+        n_snps=int(n_total_sites),
+    )
+    if bool(np.all(site_keep)):
+        packed = load_plink_bed_payload_owned(
+            str(genotype_prefix),
+            n_samples=n_samples,
+            n_snps=int(n_total_sites),
+        )
+    else:
+        packed = np.ascontiguousarray(
+            np.asarray(packed_memmap[site_keep], dtype=np.uint8),
+            dtype=np.uint8,
+        )
+    packed_ctx = {
+        "packed": packed,
+        "missing_rate": miss_arr,
+        "af": maf_arr,
+        "maf": maf_arr,
+        "row_flip": row_flip_arr,
+        "site_keep": site_keep,
+        "active_row_idx": row_idx,
+        "row_indices": row_idx,
+        "packed_filter_mode": "compact",
+        "packed_storage": "owned",
+        "n_samples": n_samples,
+        "n_total_sites": int(n_total_sites),
+        "n_active_sites": int(row_idx.shape[0]),
+        "source_prefix": str(genotype_prefix),
+    }
     return sample_ids_arr, packed_ctx
 
 
@@ -16737,34 +17202,63 @@ def _load_plink_stats_for_lmm(
     meta_layer: str = "basic",
 ) -> tuple[np.ndarray, dict[str, typing.Any]]:
     """
-    Load PLINK BED filter metadata for streaming packed-BED kernels.
+    Load PLINK BED scan metadata for streaming packed-BED kernels.
 
-    Unlike `_load_plink_packed_for_lmm`, this keeps only GWAS-consistent
-    marker statistics and row filters, and defers actual BED payload access.
+    This follows the newer FarmCPU-style packed route: keep scan metadata in
+    memory and defer actual BED payload access to stream/memmap kernels,
+    instead of writing legacy `*.pmeta.*.npy` side caches.
     """
     layer_key = str(meta_layer).strip().lower()
-    if layer_key == "basic":
-        return load_or_build_packed_meta_basic(
-            str(genotype_prefix),
-            maf=float(maf),
-            missing_rate=float(missing_rate),
-            snps_only=False,
-        )
-    if layer_key == "std":
-        return load_or_build_packed_meta_std(
-            str(genotype_prefix),
-            maf=float(maf),
-            missing_rate=float(missing_rate),
-            snps_only=False,
-        )
-    if layer_key == "dom":
-        return load_or_build_packed_meta_dom(
-            str(genotype_prefix),
-            maf=float(maf),
-            missing_rate=float(missing_rate),
-            snps_only=False,
-        )
-    raise ValueError(f"Unsupported packed meta layer: {meta_layer!r}")
+    if layer_key not in {"basic", "std", "dom"}:
+        raise ValueError(f"Unsupported packed meta layer: {meta_layer!r}")
+
+    from janusx.assoc.workflow_model_packed import _gwas_logic_meta_global_cached
+
+    sample_ids_raw, _ = inspect_genotype_file(str(genotype_prefix))
+    sample_ids_arr = np.asarray(sample_ids_raw, dtype=str)
+    meta = _gwas_logic_meta_global_cached(
+        str(genotype_prefix),
+        maf_threshold=float(maf),
+        max_missing_rate=float(missing_rate),
+        het_threshold=0.0,
+        snps_only=False,
+        outprefix=None,
+        logger=None,
+        use_spinner=False,
+        emit_status=False,
+    )
+    row_idx = np.ascontiguousarray(
+        np.asarray(meta["row_indices"], dtype=np.int64).reshape(-1),
+        dtype=np.int64,
+    )
+    miss_arr = np.ascontiguousarray(
+        np.asarray(meta["missing_rate"], dtype=np.float32).reshape(-1),
+        dtype=np.float32,
+    )
+    maf_arr = np.ascontiguousarray(
+        np.asarray(meta.get("af", meta["maf"]), dtype=np.float32).reshape(-1),
+        dtype=np.float32,
+    )
+    row_flip_arr = np.ascontiguousarray(
+        np.asarray(meta["row_flip"], dtype=np.bool_).reshape(-1),
+        dtype=np.bool_,
+    )
+    packed_ctx: dict[str, typing.Any] = {
+        "missing_rate": miss_arr,
+        "af": maf_arr,
+        "maf": maf_arr,
+        "row_flip": row_flip_arr,
+        "site_keep": None,
+        "active_row_idx": row_idx,
+        "row_indices": row_idx,
+        "packed_filter_mode": "stats_only",
+        "packed_storage": "metadata",
+        "n_samples": int(meta.get("n_samples_full", sample_ids_arr.shape[0])),
+        "n_total_sites": int(meta.get("n_snps_total", row_idx.shape[0])),
+        "n_active_sites": int(row_idx.shape[0]),
+        "source_prefix": str(genotype_prefix),
+    }
+    return sample_ids_arr, packed_ctx
 
 
 def _decode_packed_ctx_to_dense(
@@ -19359,7 +19853,7 @@ def _run_gs_pipeline_impl(
         ]
         if len(unsupported) > 0:
             logger.error(
-                "Loaded-model mode currently supports rrBLUP/Bayes/RF/ET/GBDT/XGB/SVM/ENET "
+                "Loaded-model mode currently supports rrBLUP/RF/ET/GBDT/XGB/SVM/ENET "
                 "and BLUP inside TOP bundles. "
                 "Unsupported: " + ", ".join(unsupported)
             )
@@ -21491,12 +21985,10 @@ def _run_gs_pipeline_impl(
             top_enabled=bool(top_enabled),
         )
         method_display_map = {str(m): _method_display_name(str(m)) for m in trait_methods}
-        out_tsv = f"{outprefix}.{trait_name}.gs.tsv"
-        out_effect_merged = f"{outprefix}.{trait_name}.gs.effect"
+        out_tsv = f"{outprefix}.{trait_name}.gebv.tsv"
         expected_test_n = int(np.sum(testmask))
         pred_by_method: dict[str, np.ndarray] = {}
         trait_method_summary[str(trait_name)] = {}
-        trait_effect_tables: dict[str, pd.DataFrame] = {}
         trait_effect_meta_by_method: dict[str, dict[str, typing.Any]] = {}
 
         def _detail_float_or_nan(value: typing.Any) -> float:
@@ -21886,10 +22378,10 @@ def _run_gs_pipeline_impl(
             effect_out_export: str | None = None
             effect_meta: dict[str, typing.Any] | None = None
             model_export_meta: dict[str, typing.Any] | None = None
-            can_model_export = bool(_is_jxmodel_export_supported(m_key))
             effect_export_method = _resolve_effect_export_method(m_key, res_obj)
             can_effect_export = bool(_is_effect_export_supported(effect_export_method))
-            want_model_export = bool(args.save_model) and can_model_export
+            artifact_kind = _resolve_save_model_artifact_kind(m_key, effect_export_method)
+            want_model_export = bool(args.save_model) and (artifact_kind != "none")
             want_effect_export = bool(args.save_model) and can_effect_export
             if (args.model is None) and (not top_enabled) and (want_model_export or want_effect_export):
                 state_raw = res_obj.get("model_state", None)
@@ -21899,15 +22391,113 @@ def _run_gs_pipeline_impl(
                         if _looks_like_packed_ctx(trait_packed_ctx)
                         else None
                     )
-                    if want_model_export or (want_effect_export and can_model_export):
-                        state_export, model_export_meta = _prepare_model_state_for_export_raw_012(
-                            model_state=dict(state_raw),
+                    state_export, model_export_meta = _prepare_model_state_for_export_raw_012(
+                        model_state=dict(state_raw),
+                        packed_ctx=packed_ctx_for_export,
+                    )
+                    genotype_prefix_hint = (
+                        str(gfile)
+                        if _is_plink_prefix(_strip_plink_suffix(str(gfile)))
+                        else None
+                    )
+                    _attach_effect_export_hints_to_model_state(
+                        model_state=state_export,
+                        packed_ctx=packed_ctx_for_export,
+                        genotype_prefix_hint=genotype_prefix_hint,
+                    )
+                    if str(effect_export_method) == _GBLUP_METHOD_ADD:
+                        beta_backsolve, gblup_backsolve_meta = _try_backsolve_gblup_effect_beta_pcg(
+                            model_state=state_export,
                             packed_ctx=packed_ctx_for_export,
+                            train_sample_indices=np.ascontiguousarray(train_sample_idx, dtype=np.int64),
+                            train_pheno=np.asarray(train_pheno, dtype=np.float64).reshape(-1),
+                            gblup_final_state=typing.cast(
+                                dict[str, typing.Any] | None,
+                                res_obj.get("gblup_final_state"),
+                            ),
+                            n_jobs=int(max(1, int(args.thread))),
                         )
-                    else:
-                        state_export = dict(state_raw)
-                        model_export_meta = {}
-                    if want_model_export:
+                        state_export["gblup_pcg_effect"] = dict(gblup_backsolve_meta)
+                        if beta_backsolve is not None:
+                            kernel_projection_vec = _as_opt_f64_vector(
+                                state_export.get("kernel_projection", None)
+                            )
+                            compare_meta: dict[str, typing.Any] = {}
+                            if (
+                                kernel_projection_vec is not None
+                                and int(kernel_projection_vec.shape[0]) == int(beta_backsolve.shape[0])
+                            ):
+                                diff_vec = np.asarray(beta_backsolve - kernel_projection_vec, dtype=np.float64)
+                                compare_meta["max_abs_diff"] = float(
+                                    np.nanmax(np.abs(diff_vec))
+                                ) if int(diff_vec.size) > 0 else float("nan")
+                                compare_meta["mean_abs_diff"] = float(
+                                    np.nanmean(np.abs(diff_vec))
+                                ) if int(diff_vec.size) > 0 else float("nan")
+                                if (
+                                    int(diff_vec.size) > 1
+                                    and np.isfinite(beta_backsolve).sum() > 1
+                                    and np.isfinite(kernel_projection_vec).sum() > 1
+                                ):
+                                    try:
+                                        compare_meta["corr"] = float(
+                                            np.corrcoef(
+                                                np.asarray(beta_backsolve, dtype=np.float64),
+                                                np.asarray(kernel_projection_vec, dtype=np.float64),
+                                            )[0, 1]
+                                        )
+                                    except Exception:
+                                        compare_meta["corr"] = float("nan")
+                            compare_meta.update(dict(gblup_backsolve_meta))
+                            state_export["gblup_effect_compare"] = compare_meta
+                            state_export["beta"] = np.ascontiguousarray(beta_backsolve, dtype=np.float64)
+                            state_export["effect_kind"] = "signed_beta"
+                            state_export["effect_source"] = "pcg_backsolve"
+                    model_out = os.path.join(gs_model_dir, f"{trait_name}.{m_key}.jxmodel")
+                    fallback_marker_count = None
+                    if _looks_like_packed_ctx(trait_packed_ctx):
+                        fallback_marker_count = _packed_ctx_active_rows(
+                            typing.cast(dict[str, typing.Any], trait_packed_ctx)
+                        )
+                    elif train_snp is not None:
+                        fallback_marker_count = int(np.asarray(train_snp).shape[0])
+                    if want_effect_export:
+                        try:
+                            effect_table, effect_meta = _build_method_effect_table(
+                                model_state=dict(state_export),
+                                packed_ctx=packed_ctx_for_export,
+                                genotype_prefix_hint=genotype_prefix_hint,
+                                fallback_marker_count=fallback_marker_count,
+                            )
+                            trait_effect_meta_by_method[str(m_key)] = dict(effect_meta or {})
+                            effect_out_export = str(model_out)
+                            if artifact_kind == "text_effect":
+                                _save_effect_text_jxmodel(model_out, effect_table)
+                                saved_result_paths.append(str(model_out))
+                                model_out_export = str(model_out)
+                        except Exception as ex:
+                            logger.warning(
+                                f"Effect table build failed for trait={trait_name}, method={m_key}: {ex}"
+                            )
+                            effect_meta = {
+                                "effect_file": str(model_out),
+                                "rows": 0,
+                                "effect_kind": "unknown",
+                                "effect_column": "unknown",
+                                "effect_source": "export_failed",
+                                "beta_available": False,
+                                "beta_source": "export_failed",
+                                "beta_non_nan_rows": 0,
+                                "pip_available": False,
+                                "pip_source": "export_failed",
+                                "pip_non_nan_rows": 0,
+                                "beta_scale": "unknown",
+                                "metadata_source": "unknown",
+                                "notes": [f"export_failed: {ex}"],
+                            }
+                            trait_effect_meta_by_method[str(m_key)] = dict(effect_meta)
+                            effect_out_export = (str(model_out) if artifact_kind == "text_effect" else None)
+                    if want_model_export and artifact_kind == "binary_jxmodel":
                         payload = {
                             "format": _JXMODEL_FORMAT,
                             "method": str(m_key),
@@ -21917,54 +22507,34 @@ def _run_gs_pipeline_impl(
                             "pve_final": float(res_obj.get("pve_final", np.nan)),
                             "model_state": dict(state_export),
                             "export_scale_meta": dict(model_export_meta or {}),
+                            "genotype_prefix_hint": (
+                                None
+                                if genotype_prefix_hint is None
+                                else str(genotype_prefix_hint)
+                            ),
+                            "fallback_marker_count": (
+                                None
+                                if fallback_marker_count is None
+                                else int(fallback_marker_count)
+                            ),
                         }
-                        model_out = os.path.join(gs_model_dir, f"{trait_name}.{m_key}.jxmodel")
                         _save_jxmodel(model_out, payload)
                         saved_result_paths.append(str(model_out))
                         model_out_export = str(model_out)
-                    if want_effect_export:
-                        try:
-                            fallback_marker_count = None
-                            if _looks_like_packed_ctx(trait_packed_ctx):
-                                fallback_marker_count = _packed_ctx_active_rows(
-                                    typing.cast(dict[str, typing.Any], trait_packed_ctx)
-                                )
-                            elif train_snp is not None:
-                                fallback_marker_count = int(np.asarray(train_snp).shape[0])
-                            effect_table, effect_meta = _build_method_effect_table(
-                                model_state=dict(state_export),
-                                packed_ctx=packed_ctx_for_export,
-                                genotype_prefix_hint=(str(gfile) if _is_plink_prefix(_strip_plink_suffix(str(gfile))) else None),
-                                fallback_marker_count=fallback_marker_count,
-                            )
-                            trait_effect_tables[str(m_key)] = pd.DataFrame(effect_table)
-                            trait_effect_meta_by_method[str(m_key)] = dict(effect_meta or {})
-                            effect_out_export = str(out_effect_merged)
-                        except Exception as ex:
-                            logger.warning(
-                                f"Effect table build failed for trait={trait_name}, method={m_key}: {ex}"
-                            )
-                            effect_meta = {
-                                "effect_file": str(out_effect_merged),
-                                "rows": 0,
-                                "effect_kind": "unknown",
-                                "effect_column": "unknown",
-                                "effect_source": "export_failed",
-                                "beta_available": False,
-                                "beta_source": "export_failed",
-                                "beta_non_nan_rows": 0,
-                                "beta_scale": "unknown",
-                                "metadata_source": "unknown",
-                                "notes": [f"export_failed: {ex}"],
-                            }
-                            trait_effect_meta_by_method[str(m_key)] = dict(effect_meta)
-                            effect_out_export = str(out_effect_merged)
+                        if want_effect_export and effect_out_export is None:
+                            effect_out_export = str(model_out)
                     exported_model_artifacts.append(
                         {
                             "trait": str(trait_name),
                             "method": str(m_key),
                             "model_file": str(model_out_export or ""),
                             "effect_file": str(effect_out_export or ""),
+                            "effect_column": (
+                                None
+                                if not isinstance(effect_meta, dict)
+                                else str(effect_meta.get("effect_column", "") or "")
+                            ),
+                            "artifact_format": str(artifact_kind),
                             "model_export_meta": dict(model_export_meta or {}),
                             "effect_meta": dict(effect_meta or {}),
                         }
@@ -22240,106 +22810,13 @@ def _run_gs_pipeline_impl(
                 f"elapsed={time.time() - t_stage:.3f}s"
             )
         method_result_map = {str(x["method"]): x for x in method_results}
-        trait_method_keys = {str(m) for m in trait_methods}
-        merged_effect_written = False
-        merged_effect_method_keys: list[str] = []
-        if (args.model is None) and (not top_enabled) and (len(trait_effect_tables) > 0):
-            try:
-                merge_method_order: list[str] = []
-                for m in trait_methods:
-                    m_key = str(m)
-                    tb = trait_effect_tables.get(m_key, None)
-                    if tb is None:
-                        continue
-                    has_finite_effect = False
-                    eff_col = _resolve_effect_col_from_table(tb)
-                    if eff_col is not None:
-                        try:
-                            beta_vec = np.asarray(tb[eff_col], dtype=np.float64).reshape(-1)
-                            has_finite_effect = bool(np.any(np.isfinite(beta_vec)))
-                        except Exception:
-                            has_finite_effect = False
-                    if not has_finite_effect:
-                        meta_skip = dict(trait_effect_meta_by_method.get(m_key, {}) or {})
-                        notes_skip = list(meta_skip.get("notes", []) or [])
-                        notes_skip.append("excluded_from_merged_effect:effect_unavailable")
-                        meta_skip["notes"] = notes_skip
-                        meta_skip["merged_effect_included"] = False
-                        trait_effect_meta_by_method[m_key] = meta_skip
-                        _log_file_only(
-                            "Merged effect export: skip method "
-                            f"{m_key} for trait={trait_name} (effect unavailable)."
-                        )
-                        continue
-                    merge_method_order.append(m_key)
-                    meta_keep = dict(trait_effect_meta_by_method.get(m_key, {}) or {})
-                    meta_keep["merged_effect_included"] = True
-                    trait_effect_meta_by_method[m_key] = meta_keep
-
-                merged_effect_method_keys = list(merge_method_order)
-                if len(merged_effect_method_keys) > 0:
-                    merged_effect_tbl = _build_trait_merged_effect_table(
-                        method_tables=dict(trait_effect_tables),
-                        method_order=list(merge_method_order),
-                        method_display_map=dict(method_display_map),
+        for m in trait_methods:
+            m_key = str(m)
+            if m_key in trait_method_summary.get(str(trait_name), {}):
+                if m_key in trait_effect_meta_by_method:
+                    trait_method_summary[str(trait_name)][m_key]["effect_meta"] = dict(
+                        trait_effect_meta_by_method[m_key]
                     )
-                    os.makedirs(os.path.dirname(out_effect_merged), exist_ok=True)
-                    merged_effect_tbl.to_csv(
-                        out_effect_merged,
-                        sep="\t",
-                        index=False,
-                        float_format="%.6g",
-                    )
-                    saved_result_paths.append(str(out_effect_merged))
-                    merged_effect_written = True
-            except Exception as ex:
-                logger.warning(
-                    f"Merged effect export failed for trait={trait_name}: {ex}"
-                )
-        if merged_effect_written:
-            merged_effect_method_set = set(merged_effect_method_keys)
-            for m in trait_methods:
-                m_key = str(m)
-                if m_key in trait_method_summary.get(str(trait_name), {}):
-                    if m_key in merged_effect_method_set:
-                        trait_method_summary[str(trait_name)][m_key]["effect_file"] = str(
-                            out_effect_merged
-                        )
-                    else:
-                        trait_method_summary[str(trait_name)][m_key]["effect_file"] = None
-                    if m_key in trait_effect_meta_by_method:
-                        trait_method_summary[str(trait_name)][m_key]["effect_meta"] = dict(
-                            trait_effect_meta_by_method[m_key]
-                        )
-            for art in exported_model_artifacts:
-                trait_art = str(art.get("trait", "")).strip()
-                method_art = str(art.get("method", "")).strip()
-                if (trait_art != str(trait_name)) or (method_art not in trait_method_keys):
-                    continue
-                if method_art in merged_effect_method_set:
-                    art["effect_file"] = str(out_effect_merged)
-                    art["effect_column"] = str(
-                        method_display_map.get(method_art, method_art)
-                    )
-                else:
-                    art["effect_file"] = ""
-                    art["effect_column"] = ""
-                if method_art in trait_effect_meta_by_method:
-                    art["effect_meta"] = dict(trait_effect_meta_by_method[method_art])
-        else:
-            for m in trait_methods:
-                m_key = str(m)
-                if m_key in trait_method_summary.get(str(trait_name), {}):
-                    cur_eff = trait_method_summary[str(trait_name)][m_key].get("effect_file", None)
-                    if str(cur_eff or "").strip() == str(out_effect_merged):
-                        trait_method_summary[str(trait_name)][m_key]["effect_file"] = None
-            for art in exported_model_artifacts:
-                trait_art = str(art.get("trait", "")).strip()
-                method_art = str(art.get("method", "")).strip()
-                if (trait_art != str(trait_name)) or (method_art not in trait_method_keys):
-                    continue
-                if str(art.get("effect_file", "")).strip() == str(out_effect_merged):
-                    art["effect_file"] = ""
         top_selected_method = ""
         top_metric_scores: dict[str, dict[str, float]] = {}
         if top_enabled:
@@ -22970,11 +23447,12 @@ def _run_gs_pipeline_impl(
         "usage": {
             "model_directory": str(gs_model_dir),
             "single_trait_model_file_pattern": "{trait}.{method}.jxmodel",
-            "effect_file_pattern": "{prefix}.{trait}.gs.effect",
+            "effect_file_pattern": "{trait}.{method}.jxmodel",
             "summary_file": "summary.json",
             "loaded_model_hint": (
-                "Use --model <model_dir> with the target trait and method. "
-                "Both new ({trait}.{method}.jxmodel) and legacy (*.gs.{method}.jxmodel) names are supported."
+                "Use --model <model_dir> with loadable binary artifacts "
+                "(rrBLUP and ML methods). BLUP/Bayes .jxmodel files are effect-table text artifacts "
+                "for jx postgs."
             ),
         },
     }
@@ -22987,26 +23465,17 @@ def _run_gs_pipeline_impl(
     except Exception as ex:
         logger.warning(f"Failed to write GS summary.json: {ex}")
     saved_result_paths = _order_gs_saved_result_paths([str(x) for x in saved_result_paths])
-    if len(gs_summary_rows) > 0:
-        _emit_gs_summary(logger, gs_summary_rows)
     _emit_gs_resource_report(logger, resource_metrics)
     if len(saved_result_paths) > 0:
         report_logger.info("")
         _emit_report_block(report_logger, "Outputs Generated")
         for path in saved_result_paths:
             report_logger.info(f"  * {format_path_for_display(str(path))}")
-
-    # ----------------------------------------------------------------------
-    # Final summary
-    # ----------------------------------------------------------------------
-    report_logger.info("")
-    _emit_report_kv(report_logger, "Total Wall Time", f"{max(time.time() - t_start, 0.0):.2f}s")
-    _emit_report_kv(
-        report_logger,
-        "Finished At",
-        time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+    _emit_gs_finished_lines(
+        logger,
+        elapsed_sec=float(max(time.time() - t_start, 0.0)),
+        finished_unix=float(time.time()),
     )
-    report_logger.info(_REPORT_RULE)
     if bool(return_result):
         return {
             "status": "done",
@@ -23088,15 +23557,11 @@ def _run_gs_pipeline(
     resource_metrics = _collect_gs_resource_metrics()
     try:
         _emit_gs_resource_report(logger, resource_metrics)
-        report_logger = _gs_report_logger(logger)
-        report_logger.info("")
-        _emit_report_kv(report_logger, "Total Wall Time", f"{max(time.time() - t_start, 0.0):.2f}s")
-        _emit_report_kv(
-            report_logger,
-            "Finished At",
-            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+        _emit_gs_finished_lines(
+            logger,
+            elapsed_sec=float(max(time.time() - t_start, 0.0)),
+            finished_unix=float(time.time()),
         )
-        report_logger.info(_REPORT_RULE)
     except Exception:
         pass
 

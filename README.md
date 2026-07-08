@@ -40,6 +40,8 @@ JanusX (Joint Association and Novel Utility for Selection) is a GWAS and genomic
 * Linux | MacOS
 ```bash
 curl -fsSL https://raw.githubusercontent.com/FJingxian/JanusX/main/scripts/install.sh | sh
+# Dev version
+# curl -fsSL https://raw.githubusercontent.com/FJingxian/JanusX/main/scripts/install.sh | DEV=1 sh
 ```
 
 * Windows

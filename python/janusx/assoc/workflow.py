@@ -453,6 +453,17 @@ def _normalize_gwas_model_name(model_name: object) -> str:
     return str(model_name or "").strip()
 
 
+def _gwas_splmm_run_configs(args) -> list[dict[str, object]]:
+    raw = getattr(args, "_splmm_run_configs", None)
+    if isinstance(raw, list):
+        return [dict(x) for x in raw if isinstance(x, dict)]
+    return []
+
+
+def _gwas_splmm_requested(args) -> bool:
+    return len(_gwas_splmm_run_configs(args)) > 0
+
+
 def _format_gwas_models_executed(args) -> str:
     models: list[str] = []
     if bool(args.lm):
@@ -473,8 +484,10 @@ def _format_gwas_models_executed(args) -> str:
         models.append("LMM2")
     if bool(args.fvlmm):
         models.append("FvLMM")
-    if bool(args.splmm):
-        models.append("SparseLMM")
+    for splmm_cfg in _gwas_splmm_run_configs(args):
+        label = str(splmm_cfg.get("model_label", "")).strip()
+        if label != "":
+            models.append(label)
     if bool(args.farmcpu):
         models.append("FarmCPU")
     if bool(args.algwas):
@@ -645,6 +658,26 @@ def _format_gwas_sparse_status(
     else:
         cutoff_text = "" if sparse_cutoff is None else f" | cutoff={float(sparse_cutoff):g}"
     return f"{src_label} ({_display_path(str(sparse_grm_path))}{cutoff_text})"
+
+
+def _format_gwas_sparse_status_multi(
+    run_cfgs: list[dict[str, object]],
+    *,
+    sparse_source: object,
+) -> str:
+    if len(run_cfgs) <= 0:
+        return "Not requested"
+    parts: list[str] = []
+    for cfg in run_cfgs:
+        model_key = str(cfg.get("result_stem", cfg.get("model_token", "splmm"))).strip() or "splmm"
+        status = _format_gwas_sparse_status(
+            cfg.get("sparse_jxgrm_path", None),
+            sparse_requested=True,
+            sparse_cutoff=cfg.get("sparse_cutoff", None),
+            sparse_source=sparse_source,
+        )
+        parts.append(f"{model_key}={status}")
+    return "; ".join(parts)
 
 
 def _format_gwas_thread_plan(
@@ -4553,7 +4586,7 @@ def _gwas_model_working_buffers(model_key: str) -> int:
     key = str(model_key).strip().lower()
     if key in {"lmm", "lmm2", "fvlmm"}:
         return int(_GWAS_WORKING_BUFFERS_COPY)
-    if key in {"splmm", "algwas", "farmcpu"}:
+    if key in {"splmm", "splmm2", "algwas", "farmcpu"}:
         return int(_GWAS_WORKING_BUFFERS_PACKED)
     if key in {"lm", "lm2"}:
         return int(_GWAS_WORKING_BUFFERS_LM)
@@ -4642,7 +4675,7 @@ def _resolve_gwas_auto_decode_memory_gb(
             ),
         )
 
-    packed_models = sorted(models & {"splmm", "algwas", "farmcpu"})
+    packed_models = sorted(models & {"splmm", "splmm2", "algwas", "farmcpu"})
     if len(packed_models) > 0:
         packed_rows = int(min(m_total, int(_GWAS_AUTO_MEM_PACKED_BLOCK_ROWS)))
         packed_label = "/".join(packed_models)
@@ -6022,7 +6055,7 @@ def parse_args(argv: Optional[list[str]] = None):
     )
     models_group.add_argument(
         "-splmm-approx", "--splmm-approx",
-        dest="splmm_exact",
+        dest="splmm",
         nargs="?",
         const="__SELF__",
         default=argparse.SUPPRESS,
@@ -6243,21 +6276,37 @@ def parse_args(argv: Optional[list[str]] = None):
         parser.error("--farmcpu-nbin must be >= 1.")
     if args.farmcpu_qtn_bound is not None and int(args.farmcpu_qtn_bound) < 1:
         parser.error("--farmcpu-qtn-bound must be >= 1.")
-    # Normalise SparseLMM mode flags: exactly one of -splmm / -splmm-exact.
-    _splmm_modes = [
-        (args.splmm, "approx"),  # -splmm → GRAMMAR-gamma scan
-        (getattr(args, "splmm_exact", None), "exact"),
-    ]
-    _active_splmm_modes = [(val, mode) for val, mode in _splmm_modes if val is not None]
-    if len(_active_splmm_modes) > 1:
-        parser.error("Only one of -splmm / -splmm-exact may be specified.")
-    if _active_splmm_modes:
-        args.splmm, args._splmm_denom_mode = _active_splmm_modes[0]
-        args._splmm_null_objective_mode = (
-            "raw"
-            if str(args._splmm_denom_mode) == "exact"
-            else "fastgwa"
+    args._splmm_run_configs = []
+    if args.splmm is not None:
+        args._splmm_run_configs.append(
+            {
+                "cli_flag": "splmm",
+                "model_token": "splmm",
+                "result_stem": "splmm",
+                "model_label": "SparseLMM",
+                "scan_mode": "approx",
+                "null_objective_mode": "fastgwa",
+                "source": args.splmm,
+            }
         )
+    if getattr(args, "splmm_exact", None) is not None:
+        args._splmm_run_configs.append(
+            {
+                "cli_flag": "splmm_exact",
+                "model_token": "splmm2",
+                "result_stem": "splmm2",
+                "model_label": "SparseLMM2",
+                "scan_mode": "exact",
+                "null_objective_mode": "raw",
+                "source": getattr(args, "splmm_exact", None),
+            }
+        )
+    if len(args._splmm_run_configs) == 1:
+        args._splmm_denom_mode = str(args._splmm_run_configs[0]["scan_mode"])
+        args._splmm_null_objective_mode = str(args._splmm_run_configs[0]["null_objective_mode"])
+    elif len(args._splmm_run_configs) > 1:
+        args._splmm_denom_mode = "mixed"
+        args._splmm_null_objective_mode = "mixed"
     else:
         args._splmm_denom_mode = None
         args._splmm_null_objective_mode = None
@@ -6543,8 +6592,10 @@ def _run_gwas_pipeline(
         requested_stream_models.append("lmm2")
     if args.fvlmm:
         requested_stream_models.append("fvlmm")
-    if args.splmm:
-        requested_stream_models.append("splmm")
+    for splmm_cfg in _gwas_splmm_run_configs(args):
+        model_token = str(splmm_cfg.get("model_token", "")).strip().lower()
+        if model_token != "":
+            requested_stream_models.append(model_token)
     if args.algwas:
         requested_stream_models.append("algwas")
     requested_memory_models = list(requested_stream_models)
@@ -6558,7 +6609,7 @@ def _run_gwas_pipeline(
         or args.lmm
         or getattr(args, "lmm2", False)
         or args.fvlmm
-        or args.splmm
+        or _gwas_splmm_requested(args)
     )
     farmcpu_auto_fast = bool(args.farmcpu)
     algwas_auto_fast = bool(args.algwas)
@@ -6588,12 +6639,12 @@ def _run_gwas_pipeline(
         or args.lmm
         or getattr(args, "lmm2", False)
         or args.fvlmm
-        or args.splmm
+        or _gwas_splmm_requested(args)
         or args.algwas
         or args.farmcpu
     ):
         logger.error(
-            "No model selected. Use -lm, -lm2, -lmm, -lmm2, -fvlmm, -splmm, -farmcpu, and/or -algwas."
+            "No model selected. Use -lm, -lm2, -lmm, -lmm2, -fvlmm, -splmm, -splmm-exact, -farmcpu, and/or -algwas."
         )
         raise SystemExit(1)
     if args.memory is None:
@@ -6700,7 +6751,7 @@ def _run_gwas_pipeline(
             )
         if args.cov:
             cfg_rows.append(("Covariates", "; ".join(str(x) for x in args.cov)))
-        if args.splmm:
+        if _gwas_splmm_requested(args):
             cfg_rows.append(("SparseLMM sparse", True))
         footer_rows: list[tuple[str, object]] = [
             (
@@ -6782,18 +6833,16 @@ def _run_gwas_pipeline(
             )
         if args.cov:
             advanced_config_rows.append(("Covariates", "; ".join(str(x) for x in args.cov)))
-        if args.splmm:
-            splmm_mode = str(getattr(args, "_splmm_denom_mode", "exact") or "exact")
-            splmm_mode_display = {"approx": "grammar_gamma", "exact": "exact"}.get(
-                splmm_mode,
-                splmm_mode,
+        if _gwas_splmm_requested(args):
+            splmm_run_desc = "; ".join(
+                (
+                    f"{str(cfg.get('result_stem', 'splmm'))}="
+                    f"{'grammar_gamma' if str(cfg.get('scan_mode', '')).lower() == 'approx' else 'exact'}"
+                    f"/{str(cfg.get('null_objective_mode', '')).lower()}"
+                )
+                for cfg in _gwas_splmm_run_configs(args)
             )
-            advanced_config_rows.append(
-                ("SparseLMM Mode", splmm_mode_display)
-            )
-            advanced_config_rows.append(
-                ("SparseLMM Null Objective", str(getattr(args, "_splmm_null_objective_mode", "fastgwa") or "fastgwa"))
-            )
+            advanced_config_rows.append(("SparseLMM Runs", splmm_run_desc))
             advanced_config_rows.append(("Sparse GRM Input", str(getattr(args, "grm_sparse", "1"))))
         if args.farmcpu:
             advanced_config_rows.extend(
@@ -6859,7 +6908,7 @@ def _run_gwas_pipeline(
         _append_advanced_note(
             "Input is not direct PLINK BED; memmap route will apply after source conversion/cache to BED."
         )
-    if bool(args.splmm) and (not bool(fast_mode)):
+    if _gwas_splmm_requested(args) and (not bool(fast_mode)):
         _append_advanced_note(
             "SparseLMM default backend: BED memmap/streaming metadata."
         )
@@ -6925,8 +6974,12 @@ def _run_gwas_pipeline(
         has_farmcpu = bool(args.farmcpu)
         farmcpu_handled_in_trait_loop = False
         preloaded_packed: Union[dict[str, object], None] = None
-        prepared_splmm_sparse_jxgrm_path: Union[str, None] = None
-        prepared_splmm_sparse_cutoff: Union[float, None] = None
+        prepared_splmm_sparse_method: int = 1
+        splmm_prepared_run_cfgs: dict[str, dict[str, object]] = {
+            str(cfg.get("model_token", "")).strip().lower(): dict(cfg)
+            for cfg in _gwas_splmm_run_configs(args)
+            if str(cfg.get("model_token", "")).strip() != ""
+        }
         splmm_post_grm_hook: Optional[Callable[[str, Optional[str]], None]] = None
 
         if file_fast_dense_mode:
@@ -6951,41 +7004,41 @@ def _run_gwas_pipeline(
         else:
             stream_selected = bool(len(stream_models) > 0)
             shared_context_needed = bool(stream_selected or fast_mode)
-            if args.splmm:
-                prepared_splmm_sparse_cutoff, ignored_splmm_arg = _splmm_parse_sparse_cutoff(
-                    args.splmm
-                )
-                splmm_cutoff_explicit = False
-                splmm_raw = str(args.splmm).strip() if args.splmm is not None else ""
-                if splmm_raw not in {"", "__SELF__"}:
-                    try:
-                        float(splmm_raw)
-                    except Exception:
-                        splmm_cutoff_explicit = False
-                    else:
-                        splmm_cutoff_explicit = True
-                if ignored_splmm_arg is not None:
-                    _emit_warning_line(
-                        logger,
-                        (
-                            "SparseLMM only accepts an optional numeric sparse cutoff via "
-                            "-splmm / -splmm-exact; "
-                            f"ignoring non-numeric argument: {ignored_splmm_arg}"
-                        ),
-                        use_spinner=bool(use_spinner),
-                    )
+            if _gwas_splmm_requested(args):
+                for run_cfg in splmm_prepared_run_cfgs.values():
+                    raw_source = run_cfg.get("source", None)
+                    sparse_cutoff, ignored_splmm_arg = _splmm_parse_sparse_cutoff(raw_source)
+                    run_cfg["sparse_cutoff"] = sparse_cutoff
+                    run_cfg["sparse_jxgrm_path"] = None
+                    run_cfg["_cutoff_explicit"] = False
+                    raw_text = str(raw_source).strip() if raw_source is not None else ""
+                    if raw_text not in {"", "__SELF__"}:
+                        try:
+                            float(raw_text)
+                        except Exception:
+                            run_cfg["_cutoff_explicit"] = False
+                        else:
+                            run_cfg["_cutoff_explicit"] = True
+                    if ignored_splmm_arg is not None:
+                        _emit_warning_line(
+                            logger,
+                            (
+                                "SparseLMM only accepts an optional numeric sparse cutoff via "
+                                "-splmm / -splmm-exact; "
+                                f"ignoring non-numeric argument: {ignored_splmm_arg}"
+                            ),
+                            use_spinner=bool(use_spinner),
+                        )
 
-                # Determine sparse GRM: method (1=centering, 2=standardization) or
-                # precomputed path.
                 spk_val = str(getattr(args, "grm_sparse", "1")).strip()
-                prepared_splmm_sparse_method: int = 1
                 spk_is_path = False
                 if spk_val in ("1", "2"):
                     prepared_splmm_sparse_method = int(spk_val)
                 else:
                     spk_path = _splmm_normalize_sparse_grm_path(spk_val)
                     if os.path.exists(spk_path):
-                        prepared_splmm_sparse_jxgrm_path = spk_path
+                        for run_cfg in splmm_prepared_run_cfgs.values():
+                            run_cfg["sparse_jxgrm_path"] = spk_path
                         spk_is_path = True
                     else:
                         raise ValueError(
@@ -6993,24 +7046,38 @@ def _run_gwas_pipeline(
                             f"(normalized candidate: {spk_path})"
                         )
 
-                # Always use the post-GRM hook so the loading message appears
-                # at the right time (after genotype/GRM, before trait scanning).
                 if spk_is_path:
-                    if splmm_cutoff_explicit:
+                    explicit_runs = [
+                        str(cfg.get("result_stem", "splmm"))
+                        for cfg in splmm_prepared_run_cfgs.values()
+                        if bool(cfg.get("_cutoff_explicit", False))
+                    ]
+                    if len(explicit_runs) > 0:
                         _emit_warning_line(
                             logger,
                             (
-                                "SparseLMM received both `-spk <path>` and a SparseLMM cutoff "
-                                "(`-splmm` / `-splmm-exact`); "
+                                "SparseLMM received both `-spk <path>` and SparseLMM cutoffs "
+                                f"for {', '.join(explicit_runs)}; "
                                 "the cutoff is ignored when a precomputed sparse GRM path is supplied."
                             ),
                             use_spinner=bool(use_spinner),
                         )
+
                     def _prepare_splmm_sparse_after_grm(
                         _stream_genofile_ready: str,
                         _loaded_dense_grm_path: Optional[str],
                     ) -> None:
-                        src = os.path.basename(str(prepared_splmm_sparse_jxgrm_path))
+                        path_any = next(
+                            (
+                                str(cfg.get("sparse_jxgrm_path", "")).strip()
+                                for cfg in splmm_prepared_run_cfgs.values()
+                                if str(cfg.get("sparse_jxgrm_path", "")).strip() != ""
+                            ),
+                            "",
+                        )
+                        if path_any == "":
+                            return
+                        src = os.path.basename(path_any)
                         with CliStatus(
                             f"Loading sparse GRM from {src}...",
                             enabled=bool(use_spinner),
@@ -7023,38 +7090,47 @@ def _run_gwas_pipeline(
                         stream_genofile_ready: str,
                         loaded_dense_grm_path: Optional[str],
                     ) -> None:
-                        nonlocal prepared_splmm_sparse_jxgrm_path
                         splmm_sparse_prefix = _as_plink_prefix(stream_genofile_ready)
                         if splmm_sparse_prefix is None:
                             return
                         dense_grm_path = None
-                        sparse_out_prefix = str(splmm_sparse_prefix)
                         if loaded_dense_grm_path is not None and str(loaded_dense_grm_path).strip() != "":
                             dense_grm_path = str(loaded_dense_grm_path)
                         elif str(getattr(args, "grm", "1")).strip() not in {"", "1", "2"}:
                             dense_grm_path = str(getattr(args, "grm"))
-                        sparse_out_prefix = _splmm_sparse_out_prefix_for_gwas(
-                            str(splmm_sparse_prefix),
-                            None,
-                            outprefix=str(outprefix),
-                            dense_grm_path=dense_grm_path,
-                            logger=logger,
-                        )
-                        prepared_splmm_sparse_jxgrm_path = _ensure_splmm_sparse_grm(
-                            str(splmm_sparse_prefix),
-                            sample_indices=None,
-                            out_prefix=str(sparse_out_prefix),
-                            dense_grm_path=dense_grm_path,
-                            cutoff=float(prepared_splmm_sparse_cutoff),
-                            maf_threshold=float(maf_threshold_scan),
-                            max_missing_rate=float(max_missing_rate_scan),
-                            het_threshold=float(het_threshold_scan),
-                            snps_only=bool(args.snps_only),
-                            threads=int(args.thread),
-                            logger=logger,
-                            use_spinner=bool(use_spinner),
-                            method=prepared_splmm_sparse_method,
-                        )
+                        sparse_cutoff_keys = {
+                            float(cfg.get("sparse_cutoff", 0.05))
+                            for cfg in splmm_prepared_run_cfgs.values()
+                        }
+                        needs_distinct_sparse_paths = len(sparse_cutoff_keys) > 1
+                        for run_cfg in splmm_prepared_run_cfgs.values():
+                            sparse_out_prefix = _splmm_sparse_out_prefix_for_gwas(
+                                str(splmm_sparse_prefix),
+                                None,
+                                outprefix=str(outprefix),
+                                dense_grm_path=dense_grm_path,
+                                logger=logger,
+                            )
+                            if needs_distinct_sparse_paths:
+                                sparse_out_prefix = (
+                                    f"{str(sparse_out_prefix)}."
+                                    f"{str(run_cfg.get('result_stem', 'splmm')).strip() or 'splmm'}"
+                                )
+                            run_cfg["sparse_jxgrm_path"] = _ensure_splmm_sparse_grm(
+                                str(splmm_sparse_prefix),
+                                sample_indices=None,
+                                out_prefix=str(sparse_out_prefix),
+                                dense_grm_path=dense_grm_path,
+                                cutoff=float(run_cfg.get("sparse_cutoff", 0.05)),
+                                maf_threshold=float(maf_threshold_scan),
+                                max_missing_rate=float(max_missing_rate_scan),
+                                het_threshold=float(het_threshold_scan),
+                                snps_only=bool(args.snps_only),
+                                threads=int(args.thread),
+                                logger=logger,
+                                use_spinner=bool(use_spinner),
+                                method=prepared_splmm_sparse_method,
+                            )
 
                     splmm_post_grm_hook = _prepare_splmm_sparse_after_grm
             post_grm_hook: Optional[Callable[[str, Optional[str]], None]] = splmm_post_grm_hook
@@ -7214,14 +7290,12 @@ def _run_gwas_pipeline(
                     ("Q Matrix", _format_gwas_q_status(qmatrix)),
                     ("Covariates", _format_gwas_cov_status(cov_all)),
                 ]
-                if bool(args.splmm):
+                if _gwas_splmm_requested(args):
                     logger_task_rows.append(
                         (
                             "Sparse GRM",
-                            _format_gwas_sparse_status(
-                                prepared_splmm_sparse_jxgrm_path,
-                                sparse_requested=bool(args.splmm),
-                                sparse_cutoff=prepared_splmm_sparse_cutoff,
+                            _format_gwas_sparse_status_multi(
+                                list(splmm_prepared_run_cfgs.values()),
                                 sparse_source=getattr(args, "grm_sparse", "1"),
                             ),
                         )
@@ -7394,9 +7468,15 @@ def _run_gwas_pipeline(
                         requested_models = {
                             str(m).lower().strip() for m in stream_models if str(m).strip() != ""
                         }
-                        if ("lm2" in requested_models) and ("lm2" not in plan_models):
+                        missing_plan_models = sorted(
+                            model_name
+                            for model_name in requested_models
+                            if model_name not in plan_models
+                        )
+                        if len(missing_plan_models) > 0:
                             rust_plan_errors.append(
-                                "rust task planner returned no lm2 tasks; falling back to Python task plan"
+                                "rust task planner returned no tasks for "
+                                f"{', '.join(missing_plan_models)}; falling back to Python task plan"
                             )
                             task_plan = None
                         elif (len(requested_models) > 0) and (len(plan_models) == 0):
@@ -7457,14 +7537,22 @@ def _run_gwas_pipeline(
                     def _run_route_splmm_windowed(
                         trait_one: list[str],
                         emit_trait_header_model: bool,
+                        splmm_model_token: str = "splmm",
                         preloaded_packed: Union[dict[str, object], None] = None,
                         trait_prepared_meta: Union[dict[str, object], None] = None,
                     ) -> None:
+                        run_cfg = splmm_prepared_run_cfgs.get(
+                            str(splmm_model_token).strip().lower()
+                        )
+                        if run_cfg is None:
+                            raise RuntimeError(
+                                f"Missing SparseLMM run configuration for model token: {splmm_model_token}"
+                            )
                         run_splmm_windowed_fullrank(
                             genofile=genofile_stream,
-                            splmm_source=args.splmm,
-                            splmm_sparse_cutoff=prepared_splmm_sparse_cutoff,
-                            splmm_sparse_jxgrm_path=prepared_splmm_sparse_jxgrm_path,
+                            splmm_source=run_cfg.get("source", None),
+                            splmm_sparse_cutoff=run_cfg.get("sparse_cutoff", None),
+                            splmm_sparse_jxgrm_path=run_cfg.get("sparse_jxgrm_path", None),
                             splmm_sparse_method=prepared_splmm_sparse_method,
                             pheno=pheno,
                             ids=ids,
@@ -7489,8 +7577,12 @@ def _run_gwas_pipeline(
                             preloaded_packed=preloaded_packed,
                             trait_prepared_meta=trait_prepared_meta,
                             force_model=bool(args.force_model),
-                            scan_mode=str(args._splmm_denom_mode or "exact"),
-                            null_objective_mode=str(args._splmm_null_objective_mode or "fastgwa"),
+                            scan_mode=str(run_cfg.get("scan_mode", "exact") or "exact"),
+                            null_objective_mode=str(
+                                run_cfg.get("null_objective_mode", "fastgwa") or "fastgwa"
+                            ),
+                            result_stem=str(run_cfg.get("result_stem", "splmm") or "splmm"),
+                            model_label=str(run_cfg.get("model_label", "SparseLMM") or "SparseLMM"),
                         )
 
                     def _run_route_fvlmm_stream(
@@ -7764,7 +7856,7 @@ def _run_gwas_pipeline(
                                 route = "lmm2_stream"
                             elif mk == "fvlmm":
                                 route = "fvlmm_stream"
-                            elif mk == "splmm":
+                            elif mk in {"splmm", "splmm2"}:
                                 route = "splmm"
                             elif mk == "algwas":
                                 route = "algwas"
@@ -8049,6 +8141,7 @@ def _run_gwas_pipeline(
                                 route_handler(
                                     trait_one,
                                     bool(emit_trait_header_model),
+                                    splmm_model_token=mk,
                                     preloaded_packed=None,
                                     trait_prepared_meta=trait_meta_shared,
                                 )

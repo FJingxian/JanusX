@@ -127,7 +127,7 @@ class AssociationConfig:
             raise ValueError("build_gwas_argv is only valid for file-mode config.")
         self.validate()
         mk = str(model_key).strip().lower()
-        if mk not in {"lm", "lm2", "lmm", "lmm2", "fvlmm", "farmcpu", "algwas", "splmm"}:
+        if mk not in {"lm", "lm2", "lmm", "lmm2", "fvlmm", "farmcpu", "algwas", "splmm", "splmm2"}:
             raise ValueError(f"unsupported model_key: {model_key}")
 
         flag, src = _detect_genotype_cli_flag(str(self.genotype))
@@ -157,6 +157,10 @@ class AssociationConfig:
             if str(self.model).strip().lower() != "add":
                 raise ValueError("SparseLMM currently supports only additive coding (model='add').")
             argv.append("-splmm")
+        elif mk == "splmm2":
+            if str(self.model).strip().lower() != "add":
+                raise ValueError("SparseLMM currently supports only additive coding (model='add').")
+            argv.append("-splmm-exact")
         argv.extend(["-model", str(self.model).strip().lower()])
         argv.extend(["-maf", str(float(self.maf))])
         argv.extend(["-geno", str(float(self.geno))])

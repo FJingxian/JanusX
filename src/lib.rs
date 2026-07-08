@@ -198,11 +198,10 @@ use farmcpu::{
 use fast_math::fastlmm_prepare_lowrank_f64;
 use fvlmm::{
     fastlmm_assoc_chunk_f32, fastlmm_assoc_from_snp_f32, fastlmm_reml_chunk_f32,
-    fastlmm_reml_null_f32,
-    fvlmm_assoc_bed_to_tsv_f32, fvlmm_assoc_chunk_f32, fvlmm_assoc_chunk_from_snp_f32,
-    fvlmm_assoc_chunk_from_snp_to_tsv_f32, fvlmm_assoc_chunk_from_snp_with_cache_f32,
-    fvlmm_assoc_chunk_with_cache_f32, fvlmm_assoc_packed_f32_to_tsv, fvlmm_assoc_prepare_cache_f32,
-    FvLmmAssocCache,
+    fastlmm_reml_null_f32, fvlmm_assoc_bed_to_tsv_f32, fvlmm_assoc_chunk_f32,
+    fvlmm_assoc_chunk_from_snp_f32, fvlmm_assoc_chunk_from_snp_to_tsv_f32,
+    fvlmm_assoc_chunk_from_snp_with_cache_f32, fvlmm_assoc_chunk_with_cache_f32,
+    fvlmm_assoc_packed_f32_to_tsv, fvlmm_assoc_prepare_cache_f32, FvLmmAssocCache,
 };
 use garfield::{
     garfield_compare_score_cont_centered_gain_batch_metal_vs_cpu_py,
@@ -299,8 +298,9 @@ use spgrm::{
 use splmm::{
     splmm_assoc_pcg_bed, splmm_assoc_pcg_bed_to_tsv, splmm_assoc_pcg_dense_f32,
     splmm_load_sparse_grm_subset_dense, splmm_residualized_approx_null_fit_from_jxgrm,
-    splmm_scan_exact_packed, splmm_scan_grammar_packed, splmm_sparse_grm_diag_stats,
-    splmm_sparse_null_model_debug,
+    splmm_residualized_approx_sample_state_from_jxgrm,
+    splmm_residualized_approx_sample_state_from_jxgrm_lambda, splmm_scan_exact_packed,
+    splmm_scan_grammar_packed, splmm_sparse_grm_diag_stats, splmm_sparse_null_model_debug,
 };
 use spreml::{
     spreml_sparse_fastgwa_fixed_vp_brent_from_jxgrm, spreml_sparse_reml_brent_from_jxgrm,
@@ -807,6 +807,14 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(splmm_sparse_null_model_debug, m)?)?;
     m.add_function(wrap_pyfunction!(
         splmm_residualized_approx_null_fit_from_jxgrm,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        splmm_residualized_approx_sample_state_from_jxgrm,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        splmm_residualized_approx_sample_state_from_jxgrm_lambda,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(

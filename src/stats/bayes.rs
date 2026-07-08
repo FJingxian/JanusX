@@ -840,7 +840,20 @@ fn bayesb_core_impl(
     df0_e: f64,
     s0_e_opt: Option<f64>,
     seed: Option<u64>,
-) -> Result<(Vec<f64>, Vec<f64>, Vec<f64>, f64, f64, f64, f64, f64, Vec<f64>), String> {
+) -> Result<
+    (
+        Vec<f64>,
+        Vec<f64>,
+        Vec<f64>,
+        f64,
+        f64,
+        f64,
+        f64,
+        f64,
+        Vec<f64>,
+    ),
+    String,
+> {
     let n_f = n as f64;
     if n_f <= 1.0 {
         return Err("n must be > 1".to_string());
@@ -2013,7 +2026,20 @@ fn bayesb_packed_core_impl(
     s0_e_opt: Option<f64>,
     seed: Option<u64>,
     pool: Option<&Arc<rayon::ThreadPool>>,
-) -> Result<(Vec<f64>, Vec<f64>, Vec<f64>, f64, f64, f64, f64, f64, Vec<f64>), String> {
+) -> Result<
+    (
+        Vec<f64>,
+        Vec<f64>,
+        Vec<f64>,
+        f64,
+        f64,
+        f64,
+        f64,
+        f64,
+        Vec<f64>,
+    ),
+    String,
+> {
     let n_f = n as f64;
     if n_f <= 1.0 {
         return Err("n must be > 1".to_string());

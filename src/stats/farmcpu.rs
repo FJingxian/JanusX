@@ -4334,8 +4334,8 @@ pub fn farmcpu_packed_to_tsv(
     let mut qtn_prev_idx: Option<Vec<usize>> = None;
     let route = FarmcpuRoute::from_raw(raw);
     let qtn_threshold_eff = threshold;
-    let raw_qtn_threshold_eff = farmcpu_raw_qtn_threshold_override()
-        .unwrap_or_else(|| qtn_threshold_eff.max(0.01_f64));
+    let raw_qtn_threshold_eff =
+        farmcpu_raw_qtn_threshold_override().unwrap_or_else(|| qtn_threshold_eff.max(0.01_f64));
     let max_iter_i = max_iter.max(1);
     let qb = qtn_bound.unwrap_or_else(|| {
         let nf = n as f64;
@@ -5836,24 +5836,12 @@ mod tests {
         ];
         let global_pos = vec![0_i64, 1, 2, 30, 4, 50, 6, 70, 8, 90, 10, 70];
 
-        let first_iter = farmcpu_raw_prepare_seq_qtn(
-            &[],
-            &opt_lead,
-            &femp,
-            &global_pos,
-            1.0e-2,
-            false,
-        );
+        let first_iter =
+            farmcpu_raw_prepare_seq_qtn(&[], &opt_lead, &femp, &global_pos, 1.0e-2, false);
         assert_eq!(first_iter, vec![11usize, 3usize]);
 
-        let later_iter = farmcpu_raw_prepare_seq_qtn(
-            &qtn_saved,
-            &opt_lead,
-            &femp,
-            &global_pos,
-            1.0e-2,
-            true,
-        );
+        let later_iter =
+            farmcpu_raw_prepare_seq_qtn(&qtn_saved, &opt_lead, &femp, &global_pos, 1.0e-2, true);
         assert_eq!(later_iter, vec![11usize, 3usize, 5usize, 9usize]);
     }
 }

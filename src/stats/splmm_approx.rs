@@ -20,19 +20,24 @@
 use crate::brent::brent_minimize_with_init;
 use crate::cholesky::{SparseJxgrmCholesky, SparseJxgrmCholeskyAnalysis};
 use crate::decode::PackedGeneticModel;
+use crate::gfcore::read_fam;
 use crate::linalg::{chi2_sf_df1, cholesky_inplace, cholesky_solve_into};
 use crate::splmm::{
     choose_rhat_rows, decode_rhat_markers_col_major, emit_progress_callback,
     emit_splmm_null_scan_core_timing, n_rhat_progress_total, scan_to_tsv_with_py_and_rhat,
-    scan_with_py_and_rhat, splmm_top_level_timing_enabled, trivial_pcg_null_info,
-    trivial_pcg_rhat_info, splmm_residual_sumsq_is_effectively_zero, SplmmPreparedInput,
-    SplmmScanResult, SplmmScanToTsvResult, SplmmTsvMetaInput,
+    scan_with_py_and_rhat, splmm_residual_sumsq_is_effectively_zero,
+    splmm_top_level_timing_enabled, trivial_pcg_null_info, trivial_pcg_rhat_info,
+    SplmmPreparedInput, SplmmScanResult, SplmmScanToTsvResult, SplmmTsvMetaInput,
 };
 use pyo3::prelude::*;
+use std::fs::{create_dir_all, File};
+use std::io::{BufWriter, Write};
+use std::path::Path;
 use std::time::Instant;
 
 const SPLMM_APPROX_TINY: f64 = 1e-30_f64;
 const SPLMM_APPROX_FASTGWA_NULL_CHISQ_MAX: f64 = 5.0_f64;
+const SPLMM_APPROX_SAMPLE_DEBUG_PATH_ENV: &str = "JX_SPLMM_APPROX_SAMPLE_DEBUG_PATH";
 
 #[derive(Clone, Debug)]
 struct ResidualizedApproxEval {
@@ -157,6 +162,114 @@ impl ResidualizedApproxEvaluator {
             self.rhs.clone(),
         ))
     }
+}
+
+fn splmm_approx_sample_debug_path() -> Option<String> {
+    std::env::var(SPLMM_APPROX_SAMPLE_DEBUG_PATH_ENV)
+        .ok()
+        .map(|raw| raw.trim().to_string())
+        .filter(|raw| !raw.is_empty())
+}
+
+fn maybe_write_residualized_approx_sample_debug_tsv(
+    bed_prefix: Option<&str>,
+    scan_sample_idx: &[usize],
+    y: &[f64],
+    fit: &ResidualizedApproxNullFit,
+    model: &ResidualizedApproxScanModel,
+) -> Result<(), String> {
+    let Some(path) = splmm_approx_sample_debug_path() else {
+        return Ok(());
+    };
+    if scan_sample_idx.len() != y.len() {
+        return Err(format!(
+            "SparseLMM approx sample debug requires sample_indices/y length match: sample_indices={}, y={}",
+            scan_sample_idx.len(),
+            y.len()
+        ));
+    }
+    if fit.y_resid.len() != y.len()
+        || fit.a_vec.len() != y.len()
+        || model.score_vec().len() != y.len()
+    {
+        return Err(format!(
+            "SparseLMM approx sample debug length mismatch: y={}, y_resid={}, a_vec={}, a_resid={}",
+            y.len(),
+            fit.y_resid.len(),
+            fit.a_vec.len(),
+            model.score_vec().len()
+        ));
+    }
+
+    let maybe_ids = if let Some(prefix) = bed_prefix {
+        match read_fam(prefix) {
+            Ok(ids) => Some(ids),
+            Err(err) => {
+                eprintln!(
+                    "SparseLMM approx sample debug: failed to read FAM IDs from {prefix}.fam ({err}); falling back to row/sample indices."
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let out_path = Path::new(&path);
+    if let Some(parent) = out_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            create_dir_all(parent).map_err(|e| {
+                format!(
+                    "create approx sample debug parent {}: {e}",
+                    parent.display()
+                )
+            })?;
+        }
+    }
+    let file = File::create(out_path)
+        .map_err(|e| format!("create approx sample debug TSV {}: {e}", out_path.display()))?;
+    let mut writer = BufWriter::with_capacity(256 * 1024, file);
+    writeln!(
+        writer,
+        "row_order\tsample_idx_full\tiid\ty\ty_resid\ta_vec\ta_resid\ta_adjust\tlambda\tsigma_g2\tsigma_e2\tgamma\tgamma_scale_correction"
+    )
+    .map_err(|e| format!("write approx sample debug header {}: {e}", out_path.display()))?;
+    for (row_order, &sid) in scan_sample_idx.iter().enumerate() {
+        let iid = maybe_ids
+            .as_ref()
+            .and_then(|ids| ids.get(sid))
+            .cloned()
+            .unwrap_or_else(|| format!("idx_{sid}"));
+        let a_resid = model.score_vec()[row_order];
+        let a_vec = fit.a_vec[row_order];
+        writeln!(
+            writer,
+            "{}\t{}\t{}\t{:.16e}\t{:.16e}\t{:.16e}\t{:.16e}\t{:.16e}\t{:.16e}\t{:.16e}\t{:.16e}\t{:.16e}\t{:.16e}",
+            row_order,
+            sid,
+            iid,
+            y[row_order],
+            fit.y_resid[row_order],
+            a_vec,
+            a_resid,
+            a_vec - a_resid,
+            fit.lambda,
+            fit.sigma_g2,
+            fit.sigma_e2,
+            model.gamma(),
+            fit.gamma_scale_correction,
+        )
+        .map_err(|e| format!("write approx sample debug row {}: {e}", out_path.display()))?;
+    }
+    writer
+        .flush()
+        .map_err(|e| format!("flush approx sample debug TSV {}: {e}", out_path.display()))?;
+    eprintln!(
+        "SparseLMM approx sample debug: wrote {} rows to {}",
+        y.len(),
+        out_path.display()
+    );
+    Ok(())
 }
 
 #[inline]
@@ -647,6 +760,13 @@ pub(crate) fn estimate_residualized_approx_scan_sparse(
         emit_progress_callback(stage1_cb, 8, rhat_progress_total, rhat_progress_total)?;
     }
     let model = fit.build_scan_model(x_design.as_slice(), gamma)?;
+    maybe_write_residualized_approx_sample_debug_tsv(
+        scan_prepared.bed_prefix(),
+        scan_sample_idx.as_slice(),
+        y_vec.as_slice(),
+        &fit,
+        &model,
+    )?;
     let out = scan_with_py_and_rhat(
         &scan_prepared,
         x_design.as_slice(),
@@ -739,6 +859,13 @@ pub(crate) fn estimate_residualized_approx_scan_to_tsv_sparse(
         emit_progress_callback(stage1_cb, 8, rhat_progress_total, rhat_progress_total)?;
     }
     let model = fit.build_scan_model(x_design.as_slice(), gamma)?;
+    maybe_write_residualized_approx_sample_debug_tsv(
+        scan_prepared.bed_prefix(),
+        scan_sample_idx.as_slice(),
+        y_vec.as_slice(),
+        &fit,
+        &model,
+    )?;
     let scan_prepare_secs = prepare_t0.elapsed().as_secs_f64();
     let scan_exec_t0 = Instant::now();
     let (written_rows, tsv_timing) = scan_to_tsv_with_py_and_rhat(
@@ -1044,6 +1171,7 @@ mod tests {
     use super::*;
     use crate::cholesky::sparse_cholesky_analyze_jxgrm_csc;
     use crate::spgrm::SparseGrmCsc;
+    use std::fs;
 
     fn assert_close(lhs: &[f64], rhs: &[f64], tol: f64) {
         assert_eq!(lhs.len(), rhs.len());
@@ -1259,5 +1387,56 @@ mod tests {
         }
         let gamma_ref = ratio_sum / 2.0_f64;
         assert!((gamma - gamma_ref).abs() <= 1e-12_f64);
+    }
+
+    #[test]
+    fn approx_sample_debug_tsv_writes_expected_columns() {
+        let analysis = make_diag_analysis(&[1.0_f64, 1.5_f64, 2.0_f64]);
+        let x_design = vec![1.0_f64, 1.0_f64, 1.0_f64];
+        let y = vec![1.0_f64, -0.25_f64, 0.75_f64];
+        let fit = build_residualized_approx_scan_null_from_lambda_and_factor(
+            analysis.factorize_k_plus_lambda_i(0.8_f64).unwrap(),
+            &x_design,
+            &y,
+            0.8_f64,
+        )
+        .unwrap();
+        let model = fit.build_scan_model(&x_design, 0.5_f64).unwrap();
+        let scan_sample_idx = vec![2usize, 0usize, 1usize];
+        let out_dir = std::env::temp_dir().join(format!(
+            "janusx_splmm_approx_debug_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let out_path = out_dir.join("samples.tsv");
+        std::env::set_var(
+            SPLMM_APPROX_SAMPLE_DEBUG_PATH_ENV,
+            out_path.to_string_lossy().to_string(),
+        );
+        maybe_write_residualized_approx_sample_debug_tsv(
+            None,
+            scan_sample_idx.as_slice(),
+            y.as_slice(),
+            &fit,
+            &model,
+        )
+        .unwrap();
+        std::env::remove_var(SPLMM_APPROX_SAMPLE_DEBUG_PATH_ENV);
+
+        let text = fs::read_to_string(&out_path).unwrap();
+        let mut lines = text.lines();
+        let header = lines.next().unwrap();
+        assert_eq!(
+            header,
+            "row_order\tsample_idx_full\tiid\ty\ty_resid\ta_vec\ta_resid\ta_adjust\tlambda\tsigma_g2\tsigma_e2\tgamma\tgamma_scale_correction"
+        );
+        let first = lines.next().unwrap();
+        assert!(first.starts_with("0\t2\tidx_2\t"));
+        assert_eq!(lines.count(), 2);
+        fs::remove_file(&out_path).unwrap();
+        fs::remove_dir(&out_dir).unwrap();
     }
 }

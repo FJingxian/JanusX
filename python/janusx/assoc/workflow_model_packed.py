@@ -5911,6 +5911,8 @@ def run_splmm_windowed_fullrank(
     force_model: bool = False,
     scan_mode: str = "exact",
     null_objective_mode: Optional[str] = None,
+    result_stem: str = "splmm",
+    model_label: str = "SparseLMM",
 ) -> None:
     if str(genetic_model).lower() != "add":
         raise ValueError("SparseLMM windowed BED route supports additive coding only.")
@@ -6064,6 +6066,8 @@ def run_splmm_windowed_fullrank(
         summary_rows = []
     if saved_paths is None:
         saved_paths = []
+    result_stem_norm = str(result_stem).strip().lower() or "splmm"
+    model_label_norm = str(model_label).strip() or "SparseLMM"
 
     trait_iter = _resolve_trait_iter(pheno_aligned, trait_names)
     multi_trait_mode = len(trait_iter) > 1
@@ -6103,7 +6107,7 @@ def run_splmm_windowed_fullrank(
         if dropped_missing_kin > 0:
             _log_model_line(
                 logger,
-                "SparseLMM",
+                model_label_norm,
                 f"Trait {pname}: dropped {dropped_missing_kin} sample(s) absent from kinship source.",
                 use_spinner=bool(use_spinner),
             )
@@ -6155,7 +6159,7 @@ def run_splmm_windowed_fullrank(
             sparse_kinship_cache[sparse_cache_key] = str(trait_sparse_kinship_path)
         prepare_handle = (
             _start_indeterminate_progress_bar(
-                "Prepare for SparseLMM...",
+                f"Prepare for {model_label_norm}...",
                 use_process=True,
             )
             if bool(use_spinner)
@@ -6339,11 +6343,11 @@ def run_splmm_windowed_fullrank(
             f"backend={null_backend} [null_fit={format_elapsed(null_fit_secs)}]"
         )
         if bool(use_spinner):
-            _log_file_only(logger, logging.INFO, f"SparseLMM: {_null_fit_msg}")
+            _log_file_only(logger, logging.INFO, f"{model_label_norm}: {_null_fit_msg}")
         else:
             _log_model_line(
                 logger,
-                "SparseLMM",
+                model_label_norm,
                 _null_fit_msg,
                 use_spinner=False,
             )
@@ -6353,12 +6357,12 @@ def run_splmm_windowed_fullrank(
                 _log_file_only(
                     logger,
                     logging.INFO,
-                    f"SparseLMM: sparse REML grid local log10(lambda): {grid_local_summary}",
+                    f"{model_label_norm}: sparse REML grid local log10(lambda): {grid_local_summary}",
                 )
             else:
                 _log_model_line(
                     logger,
-                    "SparseLMM",
+                    model_label_norm,
                     f"sparse REML grid local log10(lambda): {grid_local_summary}",
                     use_spinner=False,
                 )
@@ -6521,7 +6525,7 @@ def run_splmm_windowed_fullrank(
                     current_total = total_use
                     current_pbar = _ProgressAdapter(
                         total=total_use,
-                        desc="SparseLMM",
+                        desc=model_label_norm,
                         force_animate=True,
                         logger=logger,
                     )
@@ -6626,7 +6630,7 @@ def run_splmm_windowed_fullrank(
         )
         sparse_progress, sparse_finish = _make_splmm_scan_progress()
         pname_tag = _safe_trait_file_label(pname)
-        out_tsv = f"{outprefix}.{pname_tag}.splmm.tsv"
+        out_tsv = f"{outprefix}.{pname_tag}.{result_stem_norm}.tsv"
         tmp_tsv = _gwas_result_tmp_path(out_tsv)
         try:
             with _gwas_scan_stage_ctx(max(1, int(threads))):
@@ -6868,15 +6872,15 @@ def run_splmm_windowed_fullrank(
         )
         if _rust_top_level_timing_msg is not None:
             if bool(use_spinner):
-                _log_file_only(
-                    logger,
-                    logging.INFO,
-                    f"SparseLMM: {_rust_top_level_timing_msg}",
-                )
+                    _log_file_only(
+                        logger,
+                        logging.INFO,
+                        f"{model_label_norm}: {_rust_top_level_timing_msg}",
+                    )
             else:
                 _emit_plain_info_line(
                     logger,
-                    f"SparseLMM: {_rust_top_level_timing_msg}",
+                    f"{model_label_norm}: {_rust_top_level_timing_msg}",
                     use_spinner=False,
                 )
         if _factor_nnz_msg is not None:
@@ -6884,35 +6888,35 @@ def run_splmm_windowed_fullrank(
                 _log_file_only(
                     logger,
                     logging.INFO,
-                    f"SparseLMM: {_factor_nnz_msg}",
+                    f"{model_label_norm}: {_factor_nnz_msg}",
                 )
             else:
                 _log_model_line(
                     logger,
-                    "SparseLMM",
+                    model_label_norm,
                     _factor_nnz_msg,
                     use_spinner=False,
                 )
         if bool(use_spinner):
-            _log_file_only(logger, logging.INFO, f"SparseLMM: {_timing_diag_msg}")
-            _log_file_only(logger, logging.INFO, f"SparseLMM: {_scan_diag_msg}")
-            _log_file_only(logger, logging.INFO, f"SparseLMM: {_assoc_test_msg}")
+            _log_file_only(logger, logging.INFO, f"{model_label_norm}: {_timing_diag_msg}")
+            _log_file_only(logger, logging.INFO, f"{model_label_norm}: {_scan_diag_msg}")
+            _log_file_only(logger, logging.INFO, f"{model_label_norm}: {_assoc_test_msg}")
         else:
             _log_model_line(
                 logger,
-                "SparseLMM",
+                model_label_norm,
                 _timing_diag_msg,
                 use_spinner=False,
             )
             _log_model_line(
                 logger,
-                "SparseLMM",
+                model_label_norm,
                 _scan_diag_msg,
                 use_spinner=False,
             )
             _log_model_line(
                 logger,
-                "SparseLMM",
+                model_label_norm,
                 _assoc_test_msg,
                 use_spinner=False,
             )
@@ -6920,18 +6924,18 @@ def run_splmm_windowed_fullrank(
             _log_file_only(
                 logger,
                 logging.INFO,
-                f"SparseLMM: avg CPU ~ {avg_cpu:.1f}% of {n_cores} c, peak RSS ~ {peak_rss_gb:.2f} G",
+                f"{model_label_norm}: avg CPU ~ {avg_cpu:.1f}% of {n_cores} c, peak RSS ~ {peak_rss_gb:.2f} G",
             )
         else:
             _log_model_line(
                 logger,
-                "SparseLMM",
+                model_label_norm,
                 f"avg CPU ~ {avg_cpu:.1f}% of {n_cores} c, peak RSS ~ {peak_rss_gb:.2f} G",
                 use_spinner=False,
             )
         _log_model_line(
             logger,
-            "SparseLMM",
+            model_label_norm,
             f"Results saved to {_display_path(str(out_tsv))}",
             use_spinner=bool(use_spinner),
         )
@@ -6941,7 +6945,7 @@ def run_splmm_windowed_fullrank(
         summary_rows.append(
             {
                 "phenotype": str(pname),
-                "model": "SparseLMM",
+                "model": str(model_label_norm),
                 "nidv": int(n_idv),
                 "eff_snp": int(eff_snp),
                 "pve": (float(null_pve) if np.isfinite(null_pve) else None),
@@ -6998,10 +7002,10 @@ def run_splmm_windowed_fullrank(
         _rich_success(
             logger,
             (
-                f"SparseLMM ...pve {float(null_pve):.3f} [{'/'.join(done_times)}]"
+                f"{model_label_norm} ...pve {float(null_pve):.3f} [{'/'.join(done_times)}]"
                 # f"SparseLMM ...r_hat {r_hat:.4g} h2 {float(null_pve):.3f} [{'/'.join(done_times)}]"
                 if np.isfinite(null_pve)
-                else f"SparseLMM ...r_hat {r_hat:.4g} [{'/'.join(done_times)}]"
+                else f"{model_label_norm} ...r_hat {r_hat:.4g} [{'/'.join(done_times)}]"
                 # else f"SparseLMM ...r_hat {r_hat:.4g} [{'/'.join(done_times)}]"
             ),
             use_spinner=bool(use_spinner),

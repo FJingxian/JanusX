@@ -11,7 +11,11 @@ const QQ_SAMPLE_MAX_POINTS_DEFAULT: usize = 50_000;
 const QQ_BAND_KEEP_HEAD: usize = 128;
 const QQ_BAND_MAX_POINTS_DEFAULT: usize = 512;
 
-fn qq_sample_ranks_desc_with_keep_head(n: usize, limit: usize, keep_head_default: usize) -> Vec<usize> {
+fn qq_sample_ranks_desc_with_keep_head(
+    n: usize,
+    limit: usize,
+    keep_head_default: usize,
+) -> Vec<usize> {
     if n == 0 {
         return Vec::new();
     }
@@ -109,7 +113,8 @@ fn qq_band_beta_logp_exact_impl(
             let a = rank as f64;
             let b = (n - rank + 1) as f64;
             let (p_upper, p_lower) = if a <= b {
-                let beta = Beta::new(a, b).map_err(|e| format!("beta({a},{b}) init failed: {e}"))?;
+                let beta =
+                    Beta::new(a, b).map_err(|e| format!("beta({a},{b}) init failed: {e}"))?;
                 (
                     beta.inverse_cdf(q_hi).clamp(PVALUE_EPS, 1.0),
                     beta.inverse_cdf(q_lo).clamp(PVALUE_EPS, 1.0),

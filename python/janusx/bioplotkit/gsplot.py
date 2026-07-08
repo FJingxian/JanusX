@@ -8,7 +8,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from matplotlib.patches import Patch
-from scipy.stats import gaussian_kde
 
 
 def mse(tparray: np.ndarray) -> float:
@@ -83,6 +82,35 @@ def _adjust_lightness(color: Any, factor: float) -> tuple[float, float, float, f
     l2 = max(0.0, min(1.0, l * factor))
     r2, g2, b2 = colorsys.hls_to_rgb(h, l2, s)
     return (r2, g2, b2, a)
+
+
+def _gaussian_kde_eval_1d(values: np.ndarray, y_grid: np.ndarray, *, span_hint: float) -> np.ndarray:
+    vals = np.asarray(values, dtype=float).reshape(-1)
+    vals = vals[np.isfinite(vals)]
+    grid = np.asarray(y_grid, dtype=float).reshape(-1)
+    if vals.size == 0:
+        return np.zeros_like(grid, dtype=float)
+    if vals.size == 1:
+        bw = max(0.05 * max(float(span_hint), 1e-6), 1e-3)
+        z = (grid - float(vals[0])) / bw
+        return np.exp(-0.5 * z * z) / (bw * np.sqrt(2.0 * np.pi))
+
+    sd = float(np.nanstd(vals, ddof=1))
+    if (not np.isfinite(sd)) or sd < 1e-12:
+        bw = max(0.05 * max(float(span_hint), 1e-6), 1e-3)
+        mu = float(np.nanmean(vals))
+        z = (grid - mu) / bw
+        return np.exp(-0.5 * z * z) / (bw * np.sqrt(2.0 * np.pi))
+
+    # Silverman's rule-of-thumb bandwidth, with a conservative floor so
+    # small-CV-fold violins remain smooth without depending on SciPy kernels.
+    bw = 1.06 * sd * float(vals.size) ** (-0.2)
+    bw = max(float(bw), max(0.01 * max(float(span_hint), 1e-6), 1e-3))
+    z = (grid[:, None] - vals[None, :]) / bw
+    dens = np.exp(-0.5 * z * z).sum(axis=1) / (float(vals.size) * bw * np.sqrt(2.0 * np.pi))
+    dens = np.asarray(dens, dtype=float)
+    dens[~np.isfinite(dens)] = 0.0
+    return dens
 
 
 def scatterh(
@@ -248,26 +276,7 @@ def plot_accuracy_runtime_scatter(
             tx = fx
             t_smooth = np.linspace(float(np.min(tx)), float(np.max(tx)), 300)
             x_smooth = t_smooth
-        y_smooth: np.ndarray
-        used_spline = False
-        if len(tx) >= 3:
-            try:
-                from scipy.interpolate import PchipInterpolator  # type: ignore
-
-                pchip = PchipInterpolator(tx, fy, extrapolate=False)
-                y_smooth = pchip(t_smooth)
-                used_spline = True
-            except Exception:
-                y_smooth = np.interp(t_smooth, tx, fy)
-        else:
-            y_smooth = np.interp(t_smooth, tx, fy)
-
-        # Guard against spline ringing around narrow y-ranges.
-        if used_spline:
-            y_min = float(np.nanmin(fy))
-            y_max = float(np.nanmax(fy))
-            pad = max(0.05 * (y_max - y_min), 5e-4)
-            y_smooth = np.clip(y_smooth, y_min - pad, y_max + pad)
+        y_smooth = np.interp(t_smooth, tx, fy)
 
         ax.plot(x_smooth, y_smooth, color="#457B9D", linewidth=2.2, zorder=1, alpha=0.85)
 
@@ -411,10 +420,7 @@ def _kde_density_1d(values: np.ndarray, y_grid: np.ndarray, *, span_hint: float)
         z = (y_grid - float(vals[0])) / bw
         return np.exp(-0.5 * z * z) / (bw * np.sqrt(2.0 * np.pi))
     try:
-        kde = gaussian_kde(vals)
-        dens = np.asarray(kde(y_grid), dtype=float)
-        dens[~np.isfinite(dens)] = 0.0
-        return dens
+        return _gaussian_kde_eval_1d(vals, y_grid, span_hint=span_hint)
     except Exception:
         mu = float(np.nanmean(vals))
         sd = float(np.nanstd(vals))

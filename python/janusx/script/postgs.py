@@ -36,6 +36,7 @@ from janusx.script._common.pathcheck import (
     ensure_file_exists,
 )
 from janusx.script._common.log import setup_logging
+from janusx.script._common.threads import runtime_thread_stage
 
 
 class _SilentLogger:
@@ -1382,194 +1383,195 @@ def main() -> None:
     trait_eval_items = sorted(df["trait"].astype(str).unique().tolist(), key=str)
     ui = _PostGsCliUI(stream=sys.stdout)
 
-    if do_pcctime or do_violin:
-        phase1 = ui.start_phase("[1/2] Generating trait-wise evaluation plots...")
-        for trait in trait_eval_items:
-            trait_s = str(trait)
-            trait_df = df[df["trait"].astype(str) == trait_s].copy()
-            if trait_df.shape[0] == 0:
-                continue
-            trait_model_rank = _aggregate_model_ranking(trait_df)
-            trait_cv_err = _model_cv_error_frame(summary, trait=trait_s)
-            if trait_cv_err.shape[0] > 0:
-                trait_model_rank = trait_model_rank.merge(trait_cv_err, on="model", how="left")
+    with runtime_thread_stage(blas_threads=1, rayon_threads=1):
+        if do_pcctime or do_violin:
+            phase1 = ui.start_phase("[1/2] Generating trait-wise evaluation plots...")
+            for trait in trait_eval_items:
+                trait_s = str(trait)
+                trait_df = df[df["trait"].astype(str) == trait_s].copy()
+                if trait_df.shape[0] == 0:
+                    continue
+                trait_model_rank = _aggregate_model_ranking(trait_df)
+                trait_cv_err = _model_cv_error_frame(summary, trait=trait_s)
+                if trait_cv_err.shape[0] > 0:
+                    trait_model_rank = trait_model_rank.merge(trait_cv_err, on="model", how="left")
 
-            if cv_long.shape[0] > 0:
-                trait_cv_long = cv_long[cv_long["Trait"].astype(str) == trait_s].copy()
+                if cv_long.shape[0] > 0:
+                    trait_cv_long = cv_long[cv_long["Trait"].astype(str) == trait_s].copy()
+                else:
+                    trait_cv_long = cv_long
+
+                trait_out_dir = os.path.join(args.out, _sanitize_token(trait_s))
+                os.makedirs(trait_out_dir, mode=0o755, exist_ok=True)
+                trait_outprefix = os.path.join(trait_out_dir, prefix)
+
+                # Accuracy-runtime
+                if do_pcctime:
+                    step_t0 = time.time()
+                    fig = plt.figure(figsize=pcctime_fig_size, dpi=300)
+                    ax = fig.add_subplot(111)
+                    gsplot.plot_accuracy_runtime_scatter(
+                        trait_model_rank,
+                        ax=ax,
+                        palette=pcctime_palette,
+                        x_col="time_cv_mean_sec",
+                        y_col="pearsonr_cv_mean",
+                        label_col="model",
+                        point_size=runtime_point_size,
+                    )
+                    ax.set_title("")
+                    for fmt in fmts:
+                        p = f"{trait_outprefix}.accuracy_runtime.{fmt}"
+                        _save_fig(fig, p, fmt)
+                        saved_paths.append(str(p))
+                    plt.close(fig)
+                    phase1.ok(f"{trait_s} accuracy-runtime scatter", time.time() - step_t0)
+
+                # Split violin
+                if do_violin and trait_cv_long.shape[0] > 0:
+                    step_t0 = time.time()
+                    fig = plt.figure(figsize=violin_fig_size, dpi=300)
+                    ax = fig.add_subplot(111)
+                    gsplot.plot_accuracy_split_violin(
+                        trait_cv_long,
+                        ax=ax,
+                        palette=violin_palette,
+                        model_order=trait_model_rank["model"].astype(str).tolist(),
+                        model_col="Model",
+                        metric_col="Metric",
+                        value_col="Accuracy",
+                    )
+                    ax.set_title("")
+                    for fmt in fmts:
+                        p = f"{trait_outprefix}.accuracy_violin.{fmt}"
+                        _save_fig(fig, p, fmt)
+                        saved_paths.append(str(p))
+                    plt.close(fig)
+                    phase1.ok(f"{trait_s} split violin (Pearson/Spearman)", time.time() - step_t0)
+            phase1.complete()
+
+        trait_items = sorted(effect_specs_by_trait.keys(), key=str) if do_manh else []
+        if len(trait_items) == 0:
+            ui.plain("")
+            phase2_empty = ui.start_phase("[2/2] Plotting marker effects...")
+            if do_manh:
+                phase2_empty.note("  - no effect files")
+                if args.effect is None:
+                    _log_missing_effect_hint(logger, summary)
             else:
-                trait_cv_long = cv_long
+                phase2_empty.note("  - disabled")
+            phase2_empty.complete()
 
-            trait_out_dir = os.path.join(args.out, _sanitize_token(trait_s))
-            os.makedirs(trait_out_dir, mode=0o755, exist_ok=True)
-            trait_outprefix = os.path.join(trait_out_dir, prefix)
-
-            # Accuracy-runtime
-            if do_pcctime:
-                step_t0 = time.time()
-                fig = plt.figure(figsize=pcctime_fig_size, dpi=300)
-                ax = fig.add_subplot(111)
-                gsplot.plot_accuracy_runtime_scatter(
-                    trait_model_rank,
-                    ax=ax,
-                    palette=pcctime_palette,
-                    x_col="time_cv_mean_sec",
-                    y_col="pearsonr_cv_mean",
-                    label_col="model",
-                    point_size=runtime_point_size,
-                )
-                ax.set_title("")
-                for fmt in fmts:
-                    p = f"{trait_outprefix}.accuracy_runtime.{fmt}"
-                    _save_fig(fig, p, fmt)
-                    saved_paths.append(str(p))
-                plt.close(fig)
-                phase1.ok(f"{trait_s} accuracy-runtime scatter", time.time() - step_t0)
-
-            # Split violin
-            if do_violin and trait_cv_long.shape[0] > 0:
-                step_t0 = time.time()
-                fig = plt.figure(figsize=violin_fig_size, dpi=300)
-                ax = fig.add_subplot(111)
-                gsplot.plot_accuracy_split_violin(
-                    trait_cv_long,
-                    ax=ax,
-                    palette=violin_palette,
-                    model_order=trait_model_rank["model"].astype(str).tolist(),
-                    model_col="Model",
-                    metric_col="Metric",
-                    value_col="Accuracy",
-                )
-                ax.set_title("")
-                for fmt in fmts:
-                    p = f"{trait_outprefix}.accuracy_violin.{fmt}"
-                    _save_fig(fig, p, fmt)
-                    saved_paths.append(str(p))
-                plt.close(fig)
-                phase1.ok(f"{trait_s} split violin (Pearson/Spearman)", time.time() - step_t0)
-        phase1.complete()
-
-    trait_items = sorted(effect_specs_by_trait.keys(), key=str) if do_manh else []
-    if len(trait_items) == 0:
-        ui.plain("")
-        phase2_empty = ui.start_phase("[2/2] Plotting marker effects...")
-        if do_manh:
-            phase2_empty.note("  - no effect files")
-            if args.effect is None:
-                _log_missing_effect_hint(logger, summary)
-        else:
-            phase2_empty.note("  - disabled")
-        phase2_empty.complete()
-
-    for trait in trait_items:
-        specs = effect_specs_by_trait[trait]
-        if len(specs) == 0:
-            continue
-        ui.plain("")
-        phase2 = ui.start_phase(f"[2/2] Plotting marker effects (Trait: {trait})...")
-        trait_xlabel = _trait_xlabel_text(summary, trait)
-        signed_panels: list[dict[str, Any]] = []
-        merged_parts: list[pd.DataFrame] = []
-
-        for spec in specs:
-            model_name = str(spec.get("model_display", "")).strip() or str(spec.get("method_key", "model"))
-            method_key = str(spec.get("method_key", "")).strip()
-            eff_path = str(spec.get("effect_file", "")).strip()
-            eff_col_hint = spec.get("effect_col", None)
-            label = f"{model_name} (signed effect)"
-            if eff_path == "":
-                phase2.note(f"  - {label:<34} [no effect path]")
+        for trait in trait_items:
+            specs = effect_specs_by_trait[trait]
+            if len(specs) == 0:
                 continue
+            ui.plain("")
+            phase2 = ui.start_phase(f"[2/2] Plotting marker effects (Trait: {trait})...")
+            trait_xlabel = _trait_xlabel_text(summary, trait)
+            signed_panels: list[dict[str, Any]] = []
+            merged_parts: list[pd.DataFrame] = []
 
-            step_t0 = time.time()
-            if eff_path not in effect_table_cache:
-                effect_table_cache[eff_path] = _load_effect_table(eff_path)
-            df_eff = effect_table_cache[eff_path]
-            hint_cols = [eff_col_hint, model_name, method_key]
-            guess_col = _guess_effect_col_by_hints(df_eff, hint_cols=hint_cols)
-            if guess_col is None:
-                phase2.note(f"  - {label:<34} [effect column not found]")
-                continue
-            used_col = str(guess_col)
-            signed_panels.append(
-                {
-                    "model_name": model_name,
-                    "effect_df": df_eff,
-                    "effect_col": used_col,
-                }
-            )
-            chr_col, pos_col = _resolve_chr_pos_cols(df_eff)
-            if chr_col is not None and pos_col is not None and used_col in df_eff.columns:
-                part = pd.DataFrame(
+            for spec in specs:
+                model_name = str(spec.get("model_display", "")).strip() or str(spec.get("method_key", "model"))
+                method_key = str(spec.get("method_key", "")).strip()
+                eff_path = str(spec.get("effect_file", "")).strip()
+                eff_col_hint = spec.get("effect_col", None)
+                label = f"{model_name} (signed effect)"
+                if eff_path == "":
+                    phase2.note(f"  - {label:<34} [no effect path]")
+                    continue
+
+                step_t0 = time.time()
+                if eff_path not in effect_table_cache:
+                    effect_table_cache[eff_path] = _load_effect_table(eff_path)
+                df_eff = effect_table_cache[eff_path]
+                hint_cols = [eff_col_hint, model_name, method_key]
+                guess_col = _guess_effect_col_by_hints(df_eff, hint_cols=hint_cols)
+                if guess_col is None:
+                    phase2.note(f"  - {label:<34} [effect column not found]")
+                    continue
+                used_col = str(guess_col)
+                signed_panels.append(
                     {
-                        "Model": model_name,
-                        "chrom": df_eff[chr_col].astype(str),
-                        "pos": pd.to_numeric(df_eff[pos_col], errors="coerce"),
-                        "Effect": pd.to_numeric(df_eff[used_col], errors="coerce"),
+                        "model_name": model_name,
+                        "effect_df": df_eff,
+                        "effect_col": used_col,
                     }
                 )
-                part = part[
-                    np.isfinite(part["pos"].to_numpy(dtype=float))
-                    & np.isfinite(part["Effect"].to_numpy(dtype=float))
-                ]
-                if part.shape[0] > 0:
-                    scaled_eff, max_abs = _max_abs_scale(part["Effect"])
-                    part["Effect"] = scaled_eff
-                    if np.isfinite(max_abs):
-                        part["ScaleMaxAbs"] = float(max_abs)
-                    merged_parts.append(part)
-            phase2.ok(label, time.time() - step_t0)
+                chr_col, pos_col = _resolve_chr_pos_cols(df_eff)
+                if chr_col is not None and pos_col is not None and used_col in df_eff.columns:
+                    part = pd.DataFrame(
+                        {
+                            "Model": model_name,
+                            "chrom": df_eff[chr_col].astype(str),
+                            "pos": pd.to_numeric(df_eff[pos_col], errors="coerce"),
+                            "Effect": pd.to_numeric(df_eff[used_col], errors="coerce"),
+                        }
+                    )
+                    part = part[
+                        np.isfinite(part["pos"].to_numpy(dtype=float))
+                        & np.isfinite(part["Effect"].to_numpy(dtype=float))
+                    ]
+                    if part.shape[0] > 0:
+                        scaled_eff, max_abs = _max_abs_scale(part["Effect"])
+                        part["Effect"] = scaled_eff
+                        if np.isfinite(max_abs):
+                            part["ScaleMaxAbs"] = float(max_abs)
+                        merged_parts.append(part)
+                phase2.ok(label, time.time() - step_t0)
 
-        merged_df: Optional[pd.DataFrame] = None
-        if len(merged_parts) > 0:
-            step_t0 = time.time()
-            merged_df = pd.concat(merged_parts, axis=0, ignore_index=True)
-            phase2.ok("Merged layered effect", time.time() - step_t0)
-        else:
-            phase2.note("  - Merged layered effect              [no valid points]")
+            merged_df: Optional[pd.DataFrame] = None
+            if len(merged_parts) > 0:
+                step_t0 = time.time()
+                merged_df = pd.concat(merged_parts, axis=0, ignore_index=True)
+                phase2.ok("Merged layered effect", time.time() - step_t0)
+            else:
+                phase2.note("  - Merged layered effect              [no valid points]")
 
-        if len(signed_panels) > 0 or (merged_df is not None and merged_df.shape[0] > 0):
+            if len(signed_panels) > 0 or (merged_df is not None and merged_df.shape[0] > 0):
+                step_t0 = time.time()
+                _plot_and_save_trait_effect_panels(
+                    trait=trait,
+                    signed_panels=signed_panels,
+                    merged_df=merged_df,
+                    palette=manh_palette,
+                    point_size=effect_point_size,
+                    subplot_size=manh_fig_size,
+                    out_prefix=outprefix,
+                    fmts=fmts,
+                    saved_paths=saved_paths,
+                    x_label=trait_xlabel,
+                    fullscatter=bool(args.fullscatter),
+                )
+                phase2.ok("Combined effect panel", time.time() - step_t0)
+            else:
+                phase2.note("  - Combined effect panel              [no valid panels]")
+            phase2.complete()
+
+        if args.effect is not None and do_manh:
+            logger.info("")
+            logger.info("[extra] Plotting standalone effect file...")
             step_t0 = time.time()
-            _plot_and_save_trait_effect_panels(
-                trait=trait,
-                signed_panels=signed_panels,
-                merged_df=merged_df,
+            eff_path = _resolve_existing_path(str(args.effect), base_dir=os.getcwd())
+            if eff_path is None:
+                raise FileNotFoundError(f"effect file not found: {args.effect}")
+            df_eff = _load_effect_table(eff_path)
+            tag = f"{outprefix}.manual"
+            _plot_and_save_effect(
+                effect_df=df_eff,
+                effect_hint=args.effect_col,
                 palette=manh_palette,
                 point_size=effect_point_size,
-                subplot_size=manh_fig_size,
-                out_prefix=outprefix,
+                fig_size=manh_fig_size,
+                out_prefix=tag,
                 fmts=fmts,
                 saved_paths=saved_paths,
-                x_label=trait_xlabel,
+                x_label="manual (n=NA, m=NA)",
                 fullscatter=bool(args.fullscatter),
             )
-            phase2.ok("Combined effect panel", time.time() - step_t0)
-        else:
-            phase2.note("  - Combined effect panel              [no valid panels]")
-        phase2.complete()
-
-    if args.effect is not None and do_manh:
-        logger.info("")
-        logger.info("[extra] Plotting standalone effect file...")
-        step_t0 = time.time()
-        eff_path = _resolve_existing_path(str(args.effect), base_dir=os.getcwd())
-        if eff_path is None:
-            raise FileNotFoundError(f"effect file not found: {args.effect}")
-        df_eff = _load_effect_table(eff_path)
-        tag = f"{outprefix}.manual"
-        _plot_and_save_effect(
-            effect_df=df_eff,
-            effect_hint=args.effect_col,
-            palette=manh_palette,
-            point_size=effect_point_size,
-            fig_size=manh_fig_size,
-            out_prefix=tag,
-            fmts=fmts,
-            saved_paths=saved_paths,
-            x_label="manual (n=NA, m=NA)",
-            fullscatter=bool(args.fullscatter),
-        )
-        _log_step_ok(logger, "Standalone signed effect", time.time() - step_t0)
-    elif args.effect is not None and not do_manh:
+            _log_step_ok(logger, "Standalone signed effect", time.time() - step_t0)
+    if args.effect is not None and not do_manh:
         logger.info("")
         _log_step_skip(logger, "Standalone signed effect", "disabled by plot selector")
 

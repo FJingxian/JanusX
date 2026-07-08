@@ -93,6 +93,37 @@ def sh_quote(s: str) -> str:
     return "'" + s.replace("'", "'\"'\"'") + "'"
 
 
+def _is_plotting_subcommand(cmd: list[str]) -> bool:
+    if len(cmd) < 2:
+        return False
+    prog = Path(str(cmd[0])).name.lower()
+    sub = str(cmd[1]).strip().lower()
+    if prog in {"jx", "janusx"} and sub in {"postgs", "postgwas"}:
+        return True
+    if len(cmd) >= 3 and str(cmd[1]).strip() == "-m":
+        mod = str(cmd[2]).strip().lower()
+        if mod in {"janusx.script.postgs", "janusx.script.postgwas"}:
+            return True
+    return False
+
+
+def _apply_plotting_subprocess_env(proc_env: dict[str, str], cmd: list[str]) -> None:
+    if not _is_plotting_subcommand(cmd):
+        return
+    for key in (
+        "OMP_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "BLIS_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+        "VECLIB_MAXIMUM_THREADS",
+        "RAYON_NUM_THREADS",
+        "JX_MLM_BLAS_THREADS",
+        "JX_MLM_RUST_THREADS",
+    ):
+        proc_env.setdefault(key, "1")
+
+
 def run(
     cmd: list[str],
     *,
@@ -102,6 +133,7 @@ def run(
 ) -> subprocess.CompletedProcess[str]:
     print(f"+ {cmd_to_text(cmd)}")
     proc_env = os.environ.copy()
+    _apply_plotting_subprocess_env(proc_env, cmd)
     cwd_use = Path.cwd() if cwd is None else Path(cwd)
 
     if stdout_path is not None:

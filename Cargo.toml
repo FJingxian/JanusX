@@ -1,6 +1,6 @@
 [package]
 name = "janusx"
-version = "1.0.25"
+version = "1.0.26"
 edition = "2021"
 rust-version = "1.74"
 description = "A suite of genotyping tools for genome-wide association study and genomic selection"

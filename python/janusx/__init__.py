@@ -238,6 +238,19 @@ def _init_macos_openblas_path() -> None:
     if explicit:
         return
 
+    def _preferred_candidate(cands: list[Path]) -> Path | None:
+        if len(cands) == 0:
+            return None
+        preferred_order = [
+            "libopenblas.0.dylib",
+            "libopenblas.dylib",
+        ]
+        for name in preferred_order:
+            for cand in cands:
+                if cand.name == name:
+                    return cand
+        return cands[0]
+
     pkg_dirs: list[Path] = []
     for raw in globals().get("__path__", [Path(__file__).resolve().parent]):
         try:
@@ -246,37 +259,37 @@ def _init_macos_openblas_path() -> None:
             continue
     if len(pkg_dirs) == 0:
         pkg_dirs = [Path(__file__).resolve().parent]
-    cands: list[Path] = []
-    for pkg_dir in pkg_dirs:
-        cands.extend(sorted((pkg_dir / ".dylibs").glob("libopenblas*.dylib")))
-        cands.extend(sorted((pkg_dir.parent / "janusx.libs").glob("libopenblas*.dylib")))
-        cands.extend(sorted((pkg_dir / ".libs").glob("libopenblas*.dylib")))
+
+    # On macOS + conda, prefer the environment's own OpenBLAS runtime so JanusX
+    # reuses the same BLAS/OpenMP stack as SciPy/scikit-learn instead of
+    # forcing a wheel-local copy into the process.
+    candidate_groups: list[list[Path]] = []
     conda_prefix = str(os.environ.get("CONDA_PREFIX", "")).strip()
     if conda_prefix:
-        cands.extend(sorted((Path(conda_prefix) / "lib").glob("libopenblas*.dylib")))
+        candidate_groups.append(
+            sorted((Path(conda_prefix) / "lib").glob("libopenblas*.dylib"))
+        )
+    wheel_local_cands: list[Path] = []
+    for pkg_dir in pkg_dirs:
+        wheel_local_cands.extend(sorted((pkg_dir / ".dylibs").glob("libopenblas*.dylib")))
+        wheel_local_cands.extend(sorted((pkg_dir.parent / "janusx.libs").glob("libopenblas*.dylib")))
+        wheel_local_cands.extend(sorted((pkg_dir / ".libs").glob("libopenblas*.dylib")))
+    candidate_groups.append(wheel_local_cands)
+    system_cands: list[Path] = []
     for root in (
         Path("/opt/homebrew/opt/openblas/lib"),
         Path("/usr/local/opt/openblas/lib"),
     ):
-        cands.extend(sorted(root.glob("libopenblas*.dylib")))
-    if len(cands) == 0:
-        return
+        system_cands.extend(sorted(root.glob("libopenblas*.dylib")))
+    candidate_groups.append(system_cands)
 
-    # Prefer canonical soname-style names first.
-    preferred_order = [
-        "libopenblas.0.dylib",
-        "libopenblas.dylib",
-    ]
     picked: Path | None = None
-    for name in preferred_order:
-        for cand in cands:
-            if cand.name == name:
-                picked = cand
-                break
+    for group in candidate_groups:
+        picked = _preferred_candidate(group)
         if picked is not None:
             break
     if picked is None:
-        picked = cands[0]
+        return
 
     os.environ.setdefault("JX_OPENBLAS_LIB_PATH", str(picked))
 

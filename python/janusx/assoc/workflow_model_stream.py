@@ -73,6 +73,66 @@ def _current_bed_memory_mb() -> float:
     return mb if np.isfinite(mb) and mb > 0.0 else 512.0
 
 
+def _finite_optional_float(value: object) -> Optional[float]:
+    try:
+        out = float(value)
+    except Exception:
+        return None
+    return out if np.isfinite(out) else None
+
+
+def _mixed_model_null_pve_stats(
+    mod: object,
+    *,
+    null_pvalue: Optional[float] = None,
+) -> tuple[Optional[float], Optional[float], Optional[float]]:
+    pve = _finite_optional_float(getattr(mod, "pve", None))
+    pve_se = None
+    for attr in (
+        "pve_se",
+        "pve_pheno_scale_se",
+        "h2_se",
+        "heritability_se",
+    ):
+        pve_se = _finite_optional_float(getattr(mod, attr, None))
+        if pve_se is not None:
+            break
+
+    pve_p = _finite_optional_float(null_pvalue)
+    if pve_p is None:
+        for attr in (
+            "pve_pvalue",
+            "pve_p",
+            "h2_pvalue",
+            "h2_p",
+            "heritability_pvalue",
+        ):
+            pve_p = _finite_optional_float(getattr(mod, attr, None))
+            if pve_p is not None:
+                break
+    return pve, pve_se, pve_p
+
+
+def _format_mixed_model_null_pve_log(
+    mod: object,
+    *,
+    null_pvalue: Optional[float] = None,
+    include_se_placeholder: bool = False,
+    include_pvalue: bool = True,
+) -> str:
+    pve, pve_se, pve_p = _mixed_model_null_pve_stats(mod, null_pvalue=null_pvalue)
+    parts: list[str] = []
+    if pve is not None:
+        parts.append(f"PVE(null, pheno-scale)={pve:.4g}")
+    if pve_se is not None:
+        parts.append(f"SE={pve_se:.4g}")
+    elif include_se_placeholder and pve is not None:
+        parts.append("SE=NA")
+    if include_pvalue and pve_p is not None:
+        parts.append(f"p={pve_p:.4g}")
+    return "; ".join(parts)
+
+
 def _stream_site_parts(site: object) -> tuple[str, int, str, str]:
     chrom = str(getattr(site, "chrom", "."))
     try:
@@ -729,7 +789,8 @@ def run_chunked_gwas_lmm_lm(
             evd_secs = time.monotonic() - evd_t0
             evd_elapsed = format_elapsed(evd_secs)
             init_log_message = None
-            if (not bool(force_model)) and effective_model_key in {"lmm", "fvlmm"}:
+            null_lrt_p: Optional[float] = None
+            if (not bool(force_model)) and effective_model_key in {"lmm", "lmm2", "fvlmm"}:
                 source_label = str(effective_model_label)
                 switch_to_lm, lrt_stat, lrt_p = _mixed_model_switch_to_lm_decision(
                     y_vec=y_vec,
@@ -737,17 +798,26 @@ def run_chunked_gwas_lmm_lm(
                     lmm_ml0=getattr(mod, "ML0", None),
                     alpha=0.05,
                 )
+                null_lrt_p = float(lrt_p)
+                null_pve_log = _format_mixed_model_null_pve_log(
+                    mod,
+                    null_pvalue=null_lrt_p,
+                    include_se_placeholder=True,
+                    include_pvalue=False,
+                )
                 if switch_to_lm:
                     logger.warning(
                         f"Warning: {source_label} switch to LM for trait {pname}: "
-                        f"null LRT stat={float(lrt_stat):.4g}, p={float(lrt_p):.4g} (>=0.05)."
+                        f"null LRT stat={float(lrt_stat):.4g}, p={float(lrt_p):.4g} (>=0.05)"
+                        f"{'; ' + null_pve_log if null_pve_log else ''}."
                     )
                     stage_threads = max(1, int(threads))
                     with _gwas_evd_stage_ctx(stage_threads):
                         mod = LM(y=y_vec, X=X_cov)
                     init_log_message = (
                         f"switched from {source_label} null to LM "
-                        f"(LRT stat={float(lrt_stat):.4g}, p={float(lrt_p):.4g}) "
+                        f"(LRT stat={float(lrt_stat):.4g}, p={float(lrt_p):.4g}"
+                        f"{'; ' + null_pve_log if null_pve_log else ''}) "
                         f"[{evd_elapsed}]"
                     )
                     effective_model_key = "lm"
@@ -756,7 +826,16 @@ def run_chunked_gwas_lmm_lm(
                     header_pve = None
 
             if init_log_message is None:
-                init_log_message = f"PVE(null, pheno-scale) ~ {mod.pve:.3f}; eigen-decomposition [{evd_elapsed}]"
+                null_log = _format_mixed_model_null_pve_log(
+                    mod,
+                    null_pvalue=null_lrt_p,
+                    include_se_placeholder=(null_lrt_p is not None),
+                    include_pvalue=(null_lrt_p is not None),
+                )
+                if null_log != "":
+                    init_log_message = f"{null_log}; eigen-decomposition [{evd_elapsed}]"
+                else:
+                    init_log_message = f"PVE(null, pheno-scale) ~ {mod.pve:.3f}; eigen-decomposition [{evd_elapsed}]"
         else:
             mod = ModelCls(y=y_vec, X=X_cov)
             init_log_message = "streaming scan initialized"
@@ -1915,8 +1994,10 @@ def run_chunked_gwas_streaming_shared(
         effective_model_key = str(mkey)
         effective_model_label = str(model_label)
         effective_model_tag = str(model_tag)
-        out_base = _stream_model_outbase(model_tag)
         ctx: dict[str, object] = {
+            "requested_model_key": mkey,
+            "requested_model_label": model_label,
+            "requested_model_tag": model_tag,
             "model_key": mkey,
             "model_label": model_label,
             "model_tag": model_tag,
@@ -1933,15 +2014,15 @@ def run_chunked_gwas_streaming_shared(
             "memory_until_tick": 0,
             "pbar": None,
             "task_id": None,
-            "tmp_tsv": _gwas_result_tmp_path(f"{out_base}.tsv"),
-            "out_tsv": f"{out_base}.tsv",
+            "tmp_tsv": "",
+            "out_tsv": "",
             "writer": None,
             "init_log": None,
+            "skip_scan": False,
+            "skip_note": "",
+            "skip_done_msg": "",
+            "null_pve": None,
         }
-        ctx["writer"] = jxrs.GwasAssocTsvWriter(
-            str(ctx["tmp_tsv"]),
-            genetic_model=str(genetic_model),
-        )
 
         cpu_before = process.cpu_times()
         init_t0 = time.monotonic()
@@ -1956,9 +2037,6 @@ def run_chunked_gwas_streaming_shared(
                 else:
                     mod = FvLMM.from_lmm(shared_lmm_model)
                 ctx["evd_secs"] = 0.0
-                ctx["init_log"] = (
-                    f"PVE(null, pheno-scale) ~ {mod.pve:.3f}; reusing shared eigen-decomposition"
-                )
             else:
                 evd_desc = f"{model_label} Eigen-Decomposition"
                 with CliStatus(
@@ -1995,12 +2073,9 @@ def run_chunked_gwas_streaming_shared(
                         task.fail(f"{evd_desc} ...Failed")
                         raise
                 evd_secs = max(time.monotonic() - init_t0, 0.0)
-                evd_elapsed = format_elapsed(evd_secs)
                 ctx["evd_secs"] = float(evd_secs)
-                ctx["init_log"] = f"PVE(null, pheno-scale) ~ {mod.pve:.3f}; eigen-decomposition [{evd_elapsed}]"
         else:
             mod = ModelCls(y=y_vec, X=X_cov)
-            ctx["init_log"] = "streaming scan initialized"
 
         pve_now: Optional[float] = None
         if mkey in kinship_model_keys:
@@ -2010,8 +2085,10 @@ def run_chunked_gwas_streaming_shared(
                     pve_now = pve_tmp
             except Exception:
                 pve_now = None
+        ctx["null_pve"] = pve_now
 
-        if (not bool(force_model)) and effective_model_key in {"lmm", "fvlmm"}:
+        null_lrt_p: Optional[float] = None
+        if (not bool(force_model)) and effective_model_key in {"lmm", "lmm2", "fvlmm"}:
             source_label = str(effective_model_label)
             switch_to_lm, lrt_stat, lrt_p = _mixed_model_switch_to_lm_decision(
                 y_vec=y_vec,
@@ -2019,23 +2096,100 @@ def run_chunked_gwas_streaming_shared(
                 lmm_ml0=getattr(mod, "ML0", None),
                 alpha=0.05,
             )
+            null_lrt_p = float(lrt_p)
+            null_pve_log = _format_mixed_model_null_pve_log(
+                mod,
+                null_pvalue=null_lrt_p,
+                include_se_placeholder=True,
+                include_pvalue=False,
+            )
             if switch_to_lm:
                 logger.warning(
                     f"Warning: {source_label} switch to LM for trait {pname}: "
-                    f"null LRT stat={float(lrt_stat):.4g}, p={float(lrt_p):.4g} (>=0.05)."
+                    f"null LRT stat={float(lrt_stat):.4g}, p={float(lrt_p):.4g} (>=0.05)"
+                    f"{'; ' + null_pve_log if null_pve_log else ''}."
                 )
-                stage_threads = max(1, int(threads))
-                with _gwas_evd_stage_ctx(stage_threads):
-                    mod = LM(y=y_vec, X=X_cov)
                 ctx["init_log"] = (
                     f"switched from {source_label} null to LM "
-                    f"(LRT stat={float(lrt_stat):.4g}, p={float(lrt_p):.4g}) "
+                    f"(LRT stat={float(lrt_stat):.4g}, p={float(lrt_p):.4g}"
+                    f"{'; ' + null_pve_log if null_pve_log else ''}) "
                     f"[{format_elapsed(float(ctx['evd_secs']))}]"
                 )
                 effective_model_key = "lm"
                 effective_model_label = "LM"
                 effective_model_tag = "lm"
-                pve_now = None
+        if ctx["init_log"] is None:
+            if mkey in kinship_model_keys:
+                null_log = _format_mixed_model_null_pve_log(
+                    mod,
+                    null_pvalue=null_lrt_p,
+                    include_se_placeholder=(null_lrt_p is not None),
+                    include_pvalue=(null_lrt_p is not None),
+                )
+                if null_log != "":
+                    if float(ctx["evd_secs"]) > 0.0:
+                        ctx["init_log"] = (
+                            f"{null_log}; eigen-decomposition "
+                            f"[{format_elapsed(float(ctx['evd_secs']))}]"
+                        )
+                    else:
+                        ctx["init_log"] = f"{null_log}; reusing shared eigen-decomposition"
+                elif float(ctx["evd_secs"]) > 0.0:
+                    ctx["init_log"] = (
+                        f"PVE(null, pheno-scale) ~ {mod.pve:.3f}; "
+                        f"eigen-decomposition [{format_elapsed(float(ctx['evd_secs']))}]"
+                    )
+                else:
+                    ctx["init_log"] = (
+                        f"PVE(null, pheno-scale) ~ {mod.pve:.3f}; "
+                        "reusing shared eigen-decomposition"
+                    )
+            else:
+                ctx["init_log"] = "streaming scan initialized"
+
+        reuse_lm_idx: Optional[int] = None
+        if effective_model_key == "lm":
+            for idx, prev in enumerate(model_ctxs):
+                if str(prev.get("model_key", "")) == "lm" and (not bool(prev.get("skip_scan", False))):
+                    reuse_lm_idx = idx
+                    break
+
+        if reuse_lm_idx is not None:
+            reuse_ctx = model_ctxs[int(reuse_lm_idx)]
+            reuse_label = str(reuse_ctx.get("model_label", "LM"))
+            reuse_path = _display_path(str(reuse_ctx.get("out_tsv", "")))
+            if str(mkey) == "lm":
+                ctx["init_log"] = None
+                ctx["skip_note"] = (
+                    f"duplicate LM run skipped; reusing earlier {reuse_label} output "
+                    f"{reuse_path}."
+                )
+            else:
+                ctx["skip_note"] = (
+                    f"duplicate LM fallback skipped; reusing earlier {reuse_label} output "
+                    f"{reuse_path}."
+                )
+            ctx["skip_done_msg"] = f"{model_label} ...Skipped [reuse {reuse_label}]"
+            ctx["skip_scan"] = True
+            ctx["reuse_ctx_index"] = int(reuse_lm_idx)
+            ctx["out_tsv"] = str(reuse_ctx.get("out_tsv", ""))
+            ctx["model_key"] = str(mkey)
+            ctx["model_label"] = str(model_label)
+            ctx["model_tag"] = str(model_tag)
+            ctx["mod"] = mod
+            cpu_after = process.cpu_times()
+            ctx["cpu_used"] = float(
+                (cpu_after.user + cpu_after.system) - (cpu_before.user + cpu_before.system)
+            )
+            model_ctxs.append(ctx)
+            continue
+
+        if effective_model_key == "lm" and str(mkey) != "lm":
+            stage_threads = max(1, int(threads))
+            with _gwas_evd_stage_ctx(stage_threads):
+                mod = LM(y=y_vec, X=X_cov)
+            pve_now = None
+            ctx["null_pve"] = None
 
         cpu_after = process.cpu_times()
         ctx["cpu_used"] = float(
@@ -2044,18 +2198,23 @@ def run_chunked_gwas_streaming_shared(
         ctx["model_key"] = effective_model_key
         ctx["model_label"] = effective_model_label
         ctx["model_tag"] = effective_model_tag
+
+        out_base = _stream_model_outbase(effective_model_tag)
         if effective_model_tag != model_tag:
-            out_base = _stream_model_outbase(effective_model_tag)
-            existing_out = {str(prev.get("out_tsv", "")) for prev in model_ctxs}
+            existing_out = {
+                str(prev.get("out_tsv", ""))
+                for prev in model_ctxs
+                if str(prev.get("out_tsv", "")).strip() != ""
+            }
             candidate_out = f"{out_base}.tsv"
             if candidate_out in existing_out:
                 out_base = _stream_model_outbase(f"{model_tag}_to_{effective_model_tag}")
-            ctx["tmp_tsv"] = _gwas_result_tmp_path(f"{out_base}.tsv")
-            ctx["out_tsv"] = f"{out_base}.tsv"
-            ctx["writer"] = jxrs.GwasAssocTsvWriter(
-                str(ctx["tmp_tsv"]),
-                genetic_model=str(genetic_model),
-            )
+        ctx["tmp_tsv"] = _gwas_result_tmp_path(f"{out_base}.tsv")
+        ctx["out_tsv"] = f"{out_base}.tsv"
+        ctx["writer"] = jxrs.GwasAssocTsvWriter(
+            str(ctx["tmp_tsv"]),
+            genetic_model=str(genetic_model),
+        )
         ctx["mod"] = mod
         model_ctxs.append(ctx)
 
@@ -2218,6 +2377,8 @@ def run_chunked_gwas_streaming_shared(
         snp_chunk = _resolve_stream_chunk_snp_names(list(sites))
 
         for ctx in model_ctxs:
+            if bool(ctx.get("skip_scan", False)):
+                continue
             cpu_before = process.cpu_times()
             t0 = time.monotonic()
             results = ctx["mod"].gwas(geno_center, threads=threads_per_model)
@@ -2431,8 +2592,12 @@ def run_chunked_gwas_streaming_shared(
         scan_secs = float(ctx["scan_secs"])
         cpu_used = float(ctx["cpu_used"])
         peak_rss_gb = float(int(ctx["peak_rss"]) / 1024**3)
-        denom = max(evd_secs + scan_secs, 1e-9)
-        avg_cpu_pct = 100.0 * cpu_used / denom / max(1, int(n_cores))
+        denom = evd_secs + scan_secs
+        avg_cpu_pct = (
+            100.0 * cpu_used / denom / max(1, int(n_cores))
+            if denom > 0.0
+            else 0.0
+        )
         init_log = str(ctx.get("init_log", "") or "").strip()
         if init_log != "":
             _log_model_line(
@@ -2441,6 +2606,56 @@ def run_chunked_gwas_streaming_shared(
                 init_log,
                 use_spinner=bool(use_spinner),
             )
+
+        if bool(ctx.get("skip_scan", False)):
+            reuse_ctx = None
+            reuse_idx = ctx.get("reuse_ctx_index", None)
+            if reuse_idx is not None:
+                try:
+                    reuse_ctx = model_ctxs[int(reuse_idx)]
+                except Exception:
+                    reuse_ctx = None
+            if reuse_ctx is not None:
+                done_snps = int(reuse_ctx.get("done_snps", done_snps))
+            skip_note = str(ctx.get("skip_note", "") or "").strip()
+            if skip_note != "":
+                _log_model_line(
+                    logger,
+                    model_label,
+                    skip_note,
+                    use_spinner=bool(use_spinner),
+                )
+            reused_out = str(
+                ctx.get("out_tsv", "")
+                or ("" if reuse_ctx is None else str(reuse_ctx.get("out_tsv", "")))
+            )
+            reused_has_results = bool(
+                (False if reuse_ctx is None else reuse_ctx.get("has_results", False))
+            )
+            summary_rows.append(
+                {
+                    "phenotype": str(pname),
+                    "model": model_label,
+                    "nidv": int(n_idv),
+                    "eff_snp": int(done_snps),
+                    "pve": (
+                        float(ctx["null_pve"])
+                        if _finite_optional_float(ctx.get("null_pve", None)) is not None
+                        else None
+                    ),
+                    "avg_cpu": float(avg_cpu_pct),
+                    "peak_rss_gb": float(peak_rss_gb),
+                    "gwas_time_s": float(evd_secs + scan_secs),
+                    "viz_time_s": 0.0,
+                    "result_file": (reused_out if reused_has_results else ""),
+                }
+            )
+            done_msg = str(ctx.get("skip_done_msg", "") or "").strip()
+            if done_msg == "":
+                done_msg = f"{model_label} ...Skipped"
+            _rich_success(logger, done_msg, use_spinner=use_spinner)
+            continue
+
         _log_model_line(
             logger,
             model_label,
@@ -2462,6 +2677,8 @@ def run_chunked_gwas_streaming_shared(
                         ctx_pve = pve_tmp
                 except Exception:
                     ctx_pve = None
+        elif _finite_optional_float(ctx.get("null_pve", None)) is not None:
+            ctx_pve = float(ctx["null_pve"])
         if not has_results:
             logger.info(f"{model_label}: no SNPs passed filters for trait {pname}.")
             summary_rows.append(

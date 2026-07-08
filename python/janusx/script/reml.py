@@ -1546,7 +1546,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="FILE",
         help=(
-            "Optional precomputed Sparse GRM (.spgrm/.jxgrm). When provided, narrow-sense h2 is estimated via Sparse REML on the BLUE phenotype scale and reported as phenotype-scale PVE/h2 (GEMMA/GCTA/FvLMM-compatible); the raw variance-component ratio is retained separately for debugging."
+            "Optional precomputed Sparse GRM (.spgrm/.jxgrm or GCTA/fastGWA prefix/.grm.sp). When provided, narrow-sense h2 is estimated via Sparse REML on the BLUE phenotype scale and reported as phenotype-scale PVE/h2 (GEMMA/GCTA/FvLMM-compatible); the raw variance-component ratio is retained separately for debugging."
         ),
     )
     opt.add_argument(

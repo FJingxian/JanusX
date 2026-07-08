@@ -51,7 +51,9 @@ use crate::linalg::{chi2_sf_df1, cholesky_inplace, cholesky_solve_into};
 use crate::pcg::{
     PcgMatrixSolveInfo, PcgSolveInfo, PcgSplmmNullModel, PcgSplmmNullModelInfo, PcgSplmmRHatResult,
 };
+use crate::spgrm::resolve_sparse_grm_input_path;
 use crate::splmm_approx::{
+    build_residualized_approx_scan_null_from_lambda_and_factor,
     estimate_residualized_approx_scan_sparse, estimate_residualized_approx_scan_to_tsv_sparse,
     fit_sparse_reml_on_residualized_response,
 };
@@ -845,6 +847,11 @@ impl SplmmPreparedInput {
     #[inline]
     pub(crate) fn n_rows(&self) -> usize {
         self.row_flip.len()
+    }
+
+    #[inline]
+    pub(crate) fn bed_prefix(&self) -> Option<&str> {
+        self.bed_prefix.as_deref()
     }
 
     #[inline]
@@ -2057,7 +2064,7 @@ fn sparse_splmm_resolve_path(
     prefix: &str,
     sparse_jxgrm_path: Option<&str>,
 ) -> Result<String, String> {
-    let path = sparse_jxgrm_path.map(|s| s.to_string()).unwrap_or_else(|| {
+    let raw_path = sparse_jxgrm_path.map(|s| s.to_string()).unwrap_or_else(|| {
         let spgrm_path = format!("{prefix}.spgrm");
         let jxgrm_path = format!("{prefix}.jxgrm");
         if std::path::Path::new(&jxgrm_path).exists() && !std::path::Path::new(&spgrm_path).exists()
@@ -2067,6 +2074,7 @@ fn sparse_splmm_resolve_path(
             spgrm_path
         }
     });
+    let path = resolve_sparse_grm_input_path(&raw_path)?;
     if !Path::new(&path).exists() {
         return Err(format!(
             "SparseLMM requires a sparse kinship file, but none was found at: {path}"
@@ -4320,6 +4328,277 @@ pub fn splmm_residualized_approx_null_fit_from_jxgrm<'py>(
         ))
     })
     .map_err(|e: String| PyRuntimeError::new_err(e))
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    jxgrm_path,
+    y,
+    x_cov=None,
+    sample_indices=None,
+    low=-5.0,
+    high=5.0,
+    grid_size=7,
+    tol=1e-3,
+    max_iter=200,
+    threads=1
+))]
+pub fn splmm_residualized_approx_sample_state_from_jxgrm<'py>(
+    py: Python<'py>,
+    jxgrm_path: String,
+    y: PyReadonlyArray1<'py, f64>,
+    x_cov: Option<PyReadonlyArray2<'py, f64>>,
+    sample_indices: Option<PyReadonlyArray1<'py, i64>>,
+    low: f64,
+    high: f64,
+    grid_size: usize,
+    tol: f64,
+    max_iter: usize,
+    threads: usize,
+) -> PyResult<(
+    f64,
+    f64,
+    f64,
+    Bound<'py, PyArray1<i64>>,
+    Bound<'py, PyArray1<f64>>,
+    Bound<'py, PyArray1<f64>>,
+    Bound<'py, PyArray1<f64>>,
+)> {
+    let y_vec = y.as_slice()?.to_vec();
+    let n = y_vec.len();
+    if n == 0 {
+        return Err(PyRuntimeError::new_err("y must not be empty"));
+    }
+    let sparse_n = sparse_jxgrm_header_n_samples(&jxgrm_path).map_err(PyRuntimeError::new_err)?;
+    let sample_idx = if let Some(raw) = sample_indices.as_ref() {
+        parse_index_vec_i64(raw.as_slice()?, sparse_n, "sample_indices")
+            .map_err(PyRuntimeError::new_err)?
+    } else {
+        if n != sparse_n {
+            return Err(PyRuntimeError::new_err(format!(
+                "SparseLMM residualized approx sample-state debug requires y length to match sparse n when sample_indices is omitted: y={n}, sparse_n={sparse_n}"
+            )));
+        }
+        (0..sparse_n).collect::<Vec<_>>()
+    };
+    if sample_idx.len() != n {
+        return Err(PyRuntimeError::new_err(format!(
+            "SparseLMM residualized approx sample-state debug sample/y mismatch: sample_indices={}, y={n}",
+            sample_idx.len()
+        )));
+    }
+
+    let (x_cov_owned, p_cov) = if let Some(x_cov) = &x_cov {
+        let x_arr = x_cov.as_array();
+        if x_arr.ndim() != 2 {
+            return Err(PyRuntimeError::new_err("x_cov must be 2D (n, p_cov)"));
+        }
+        let (xn, xp) = (x_arr.shape()[0], x_arr.shape()[1]);
+        if xn != n {
+            return Err(PyRuntimeError::new_err(format!(
+                "x_cov row count mismatch: got {xn}, expected {n}"
+            )));
+        }
+        let owned = match x_cov.as_slice() {
+            Ok(s) => s.to_vec(),
+            Err(_) => x_arr.iter().copied().collect(),
+        };
+        (Some(owned), xp)
+    } else {
+        (None, 0usize)
+    };
+    let x_design = build_design_with_intercept(x_cov_owned.as_deref(), n, p_cov);
+    let p = p_cov + 1;
+    if n <= p {
+        return Err(PyRuntimeError::new_err(format!(
+            "n must be > p for SparseLMM residualized approx sample-state debug: n={n}, p={p}"
+        )));
+    }
+
+    let sample_idx_for_fit = sample_idx.clone();
+    let x_design_for_fit = x_design.clone();
+    let y_vec_for_fit = y_vec.clone();
+    let jxgrm_path_for_fit = jxgrm_path.clone();
+    let (lambda, sigma_g2, sigma_e2, y_resid, a_vec, a_resid) = py
+        .detach(move || {
+            let analysis = sparse_splmm_load_analysis(
+                &jxgrm_path_for_fit,
+                n,
+                sample_idx_for_fit.as_slice(),
+                None,
+            )?;
+            let fit = fit_sparse_reml_on_residualized_response(
+                analysis.as_ref(),
+                x_design_for_fit.as_slice(),
+                y_vec_for_fit.as_slice(),
+                low,
+                high,
+                grid_size,
+                tol,
+                max_iter,
+                threads.max(1),
+            )?;
+            let model = fit.build_scan_model(x_design_for_fit.as_slice(), 1.0_f64)?;
+            Ok((
+                fit.lambda,
+                fit.sigma_g2,
+                fit.sigma_e2,
+                fit.y_resid,
+                fit.a_vec,
+                model.score_vec().to_vec(),
+            ))
+        })
+        .map_err(|e: String| PyRuntimeError::new_err(e))?;
+
+    let sample_idx_i64 = sample_idx
+        .iter()
+        .map(|&v| {
+            i64::try_from(v)
+                .map_err(|_| PyRuntimeError::new_err("sample index does not fit into i64"))
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    Ok((
+        lambda,
+        sigma_g2,
+        sigma_e2,
+        PyArray1::from_owned_array(py, numpy::ndarray::Array1::from_vec(sample_idx_i64)),
+        PyArray1::from_owned_array(py, numpy::ndarray::Array1::from_vec(y_resid)),
+        PyArray1::from_owned_array(py, numpy::ndarray::Array1::from_vec(a_vec)),
+        PyArray1::from_owned_array(py, numpy::ndarray::Array1::from_vec(a_resid)),
+    ))
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    jxgrm_path,
+    y,
+    lbd,
+    x_cov=None,
+    sample_indices=None,
+    threads=1
+))]
+pub fn splmm_residualized_approx_sample_state_from_jxgrm_lambda<'py>(
+    py: Python<'py>,
+    jxgrm_path: String,
+    y: PyReadonlyArray1<'py, f64>,
+    lbd: f64,
+    x_cov: Option<PyReadonlyArray2<'py, f64>>,
+    sample_indices: Option<PyReadonlyArray1<'py, i64>>,
+    threads: usize,
+) -> PyResult<(
+    f64,
+    f64,
+    f64,
+    Bound<'py, PyArray1<i64>>,
+    Bound<'py, PyArray1<f64>>,
+    Bound<'py, PyArray1<f64>>,
+    Bound<'py, PyArray1<f64>>,
+)> {
+    let y_vec = y.as_slice()?.to_vec();
+    let n = y_vec.len();
+    if n == 0 {
+        return Err(PyRuntimeError::new_err("y must not be empty"));
+    }
+    if !(lbd.is_finite() && lbd >= 0.0) {
+        return Err(PyRuntimeError::new_err(format!(
+            "lbd must be finite and >= 0 for SparseLMM residualized approx sample-state debug, got {lbd}"
+        )));
+    }
+    let sparse_n = sparse_jxgrm_header_n_samples(&jxgrm_path).map_err(PyRuntimeError::new_err)?;
+    let sample_idx = if let Some(raw) = sample_indices.as_ref() {
+        parse_index_vec_i64(raw.as_slice()?, sparse_n, "sample_indices")
+            .map_err(PyRuntimeError::new_err)?
+    } else {
+        if n != sparse_n {
+            return Err(PyRuntimeError::new_err(format!(
+                "SparseLMM residualized approx sample-state lambda debug requires y length to match sparse n when sample_indices is omitted: y={n}, sparse_n={sparse_n}"
+            )));
+        }
+        (0..sparse_n).collect::<Vec<_>>()
+    };
+    if sample_idx.len() != n {
+        return Err(PyRuntimeError::new_err(format!(
+            "SparseLMM residualized approx sample-state lambda debug sample/y mismatch: sample_indices={}, y={n}",
+            sample_idx.len()
+        )));
+    }
+
+    let (x_cov_owned, p_cov) = if let Some(x_cov) = &x_cov {
+        let x_arr = x_cov.as_array();
+        if x_arr.ndim() != 2 {
+            return Err(PyRuntimeError::new_err("x_cov must be 2D (n, p_cov)"));
+        }
+        let (xn, xp) = (x_arr.shape()[0], x_arr.shape()[1]);
+        if xn != n {
+            return Err(PyRuntimeError::new_err(format!(
+                "x_cov row count mismatch: got {xn}, expected {n}"
+            )));
+        }
+        let owned = match x_cov.as_slice() {
+            Ok(s) => s.to_vec(),
+            Err(_) => x_arr.iter().copied().collect(),
+        };
+        (Some(owned), xp)
+    } else {
+        (None, 0usize)
+    };
+    let x_design = build_design_with_intercept(x_cov_owned.as_deref(), n, p_cov);
+    let p = p_cov + 1;
+    if n <= p {
+        return Err(PyRuntimeError::new_err(format!(
+            "n must be > p for SparseLMM residualized approx sample-state lambda debug: n={n}, p={p}"
+        )));
+    }
+
+    let sample_idx_for_fit = sample_idx.clone();
+    let x_design_for_fit = x_design.clone();
+    let y_vec_for_fit = y_vec.clone();
+    let jxgrm_path_for_fit = jxgrm_path.clone();
+    let (lambda, sigma_g2, sigma_e2, y_resid, a_vec, a_resid) = py
+        .detach(move || {
+            let factor = sparse_splmm_load_factor(
+                "",
+                Some(&jxgrm_path_for_fit),
+                n,
+                sample_idx_for_fit.as_slice(),
+                lbd,
+                threads.max(1),
+                None,
+            )?;
+            let fit = build_residualized_approx_scan_null_from_lambda_and_factor(
+                factor,
+                x_design_for_fit.as_slice(),
+                y_vec_for_fit.as_slice(),
+                lbd,
+            )?;
+            let model = fit.build_scan_model(x_design_for_fit.as_slice(), 1.0_f64)?;
+            Ok((
+                fit.lambda,
+                fit.sigma_g2,
+                fit.sigma_e2,
+                fit.y_resid,
+                fit.a_vec,
+                model.score_vec().to_vec(),
+            ))
+        })
+        .map_err(|e: String| PyRuntimeError::new_err(e))?;
+
+    let sample_idx_i64 = sample_idx
+        .iter()
+        .map(|&v| {
+            i64::try_from(v)
+                .map_err(|_| PyRuntimeError::new_err("sample index does not fit into i64"))
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    Ok((
+        lambda,
+        sigma_g2,
+        sigma_e2,
+        PyArray1::from_owned_array(py, numpy::ndarray::Array1::from_vec(sample_idx_i64)),
+        PyArray1::from_owned_array(py, numpy::ndarray::Array1::from_vec(y_resid)),
+        PyArray1::from_owned_array(py, numpy::ndarray::Array1::from_vec(a_vec)),
+        PyArray1::from_owned_array(py, numpy::ndarray::Array1::from_vec(a_resid)),
+    ))
 }
 
 #[pyfunction]

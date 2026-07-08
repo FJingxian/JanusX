@@ -6055,7 +6055,8 @@ def parse_args(argv: Optional[list[str]] = None):
         "-spk", "--grm-sparse", type=str, default="1", dest="grm_sparse",
         help="Sparse GRM option for SparseLMM (-splmm / -splmm-exact): "
              "1 (centering), 2 (standardization), "
-             "or a path to a precomputed Sparse GRM file (default: %(default)s).",
+             "or a path to a precomputed Sparse GRM file "
+             "(.spgrm/.jxgrm or GCTA/fastGWA prefix/.grm.sp; default: %(default)s).",
     )
     optional_group.add_argument(
         "-q", "--qcov", type=str, default="0",

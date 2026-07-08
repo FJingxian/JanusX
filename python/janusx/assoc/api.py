@@ -698,8 +698,8 @@ class ASSOC:
             return "splmm"
         path = _maybe_path(k)
         if path is not None:
-            low = str(path).lower()
-            if low.endswith(".spgrm") or low.endswith(".jxgrm"):
+            low = _splmm_normalize_sparse_grm_path(path).lower()
+            if low.endswith(".spgrm") or low.endswith(".jxgrm") or low.endswith(".grm.sp"):
                 return "splmm"
         if self.model_name == "fvlmm" or bool(self.model_args.get("fv", False)):
             return "fvlmm"
@@ -810,8 +810,8 @@ class ASSOC:
     ) -> tuple[str, np.ndarray | None]:
         path = _maybe_path(k)
         if path is not None:
-            low = str(path).lower()
-            if low.endswith(".spgrm") or low.endswith(".jxgrm"):
+            low = _splmm_normalize_sparse_grm_path(path).lower()
+            if low.endswith(".spgrm") or low.endswith(".jxgrm") or low.endswith(".grm.sp"):
                 return self._prepare_sparse_grm_from_path(path, sample_index=sample_index, n_samples=n_samples)
             return self._build_sparse_grm_from_dense_path(path, sample_index=sample_index, n_samples=n_samples)
         if sp is not None and sp.issparse(k):

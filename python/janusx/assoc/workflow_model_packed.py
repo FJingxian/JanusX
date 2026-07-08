@@ -194,12 +194,19 @@ def _splmm_sparse_meta_path(sparse_path: str) -> str:
     return f"{sparse_path}.meta.json"
 
 
+_SPLMM_SPARSE_GRM_BUILD_REV = "f64_accum_v2"
+
+
 def _splmm_normalize_sparse_grm_path(path_or_prefix: str) -> str:
     raw = str(path_or_prefix).strip()
     if raw == "":
         return raw
-    if raw.lower().endswith(".spgrm") or raw.lower().endswith(".jxgrm"):
+    low = raw.lower()
+    if low.endswith(".spgrm") or low.endswith(".jxgrm") or low.endswith(".grm.sp"):
         return raw
+    gcta_sparse = f"{raw}.grm.sp"
+    if os.path.exists(gcta_sparse):
+        return gcta_sparse
     spgrm = f"{raw}.spgrm"
     jxgrm = f"{raw}.jxgrm"
     if os.path.exists(jxgrm) and not os.path.exists(spgrm):
@@ -720,6 +727,7 @@ def _splmm_sparse_spec(
     method: int = 1,
 ) -> dict[str, object]:
     return {
+        "builder_revision": _SPLMM_SPARSE_GRM_BUILD_REV,
         "cutoff": float(cutoff),
         "abs_threshold": bool(abs_threshold),
         "maf_threshold": float(maf_threshold),

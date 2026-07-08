@@ -14,7 +14,7 @@ use faer::sparse::{SparseColMatRef, SymbolicSparseColMatRef};
 use faer::{mat, Conj, Index, Parallelism, Side};
 use memmap2::Mmap;
 
-use crate::spgrm::SparseGrmCsc;
+use crate::spgrm::{resolve_sparse_grm_input_path, SparseGrmCsc};
 
 const JXGRM_HEADER_BYTES: usize = 16;
 const JXGRM_VALUES_ALIGN_BYTES: usize = size_of::<f64>();
@@ -88,9 +88,10 @@ fn sparse_analysis_cache_key(
     path: &str,
     sample_idx: Option<&[usize]>,
 ) -> Result<SparseAnalysisCacheKey, String> {
-    let meta = fs::metadata(path)
+    let resolved_path = resolve_sparse_grm_input_path(path)?;
+    let meta = fs::metadata(&resolved_path)
         .map_err(|e| format!("read sparse JXGRM metadata for cache key failed: {e}"))?;
-    let file_key = sparse_file_cache_key_from_meta(path, &meta);
+    let file_key = sparse_file_cache_key_from_meta(&resolved_path, &meta);
     let (sample_len, sample_hash) = sparse_sample_hash(sample_idx);
     Ok(SparseAnalysisCacheKey {
         path: file_key.path,
@@ -244,14 +245,16 @@ impl MmapSparseGrmCsc {
     where
         F: FnMut(usize, usize) -> Result<(), String>,
     {
-        let file = File::open(path)
-            .map_err(|e| format!("failed to open sparse GRM CSC file {path}: {e}"))?;
+        let resolved_path = resolve_sparse_grm_input_path(path)?;
+        let file = File::open(&resolved_path).map_err(|e| {
+            format!("failed to open sparse GRM CSC file {resolved_path}: {e}")
+        })?;
         let file_meta = file
             .metadata()
-            .map_err(|e| format!("failed to read sparse GRM CSC metadata {path}: {e}"))?;
-        let validation_key = sparse_file_cache_key_from_meta(path, &file_meta);
-        let mmap =
-            unsafe { Mmap::map(&file) }.map_err(|e| format!("failed to mmap {path}: {e}"))?;
+            .map_err(|e| format!("failed to read sparse GRM CSC metadata {resolved_path}: {e}"))?;
+        let validation_key = sparse_file_cache_key_from_meta(&resolved_path, &file_meta);
+        let mmap = unsafe { Mmap::map(&file) }
+            .map_err(|e| format!("failed to mmap {resolved_path}: {e}"))?;
         if mmap.len() < JXGRM_HEADER_BYTES {
             return Err(format!(
                 "Sparse GRM CSC file is too short: got {} bytes, need at least {JXGRM_HEADER_BYTES}",
@@ -309,7 +312,7 @@ impl MmapSparseGrmCsc {
             let pad = &mmap[row_indices_end..values_offset];
             if pad.iter().any(|&b| b != 0) {
                 return Err(format!(
-                    "Sparse GRM padded layout contains non-zero alignment bytes before values payload in {path}"
+                    "Sparse GRM padded layout contains non-zero alignment bytes before values payload in {resolved_path}"
                 ));
             }
         }
@@ -319,7 +322,7 @@ impl MmapSparseGrmCsc {
         ) {
             if !padded_layout && values_offset != values_offset_padded {
                 return Err(format!(
-                    "Sparse GRM uses legacy unpadded values layout that cannot be mmap-aligned for zero-copy load: {path}. Rebuild this .spgrm with the current JanusX writer. Detail: {err}"
+                    "Sparse GRM uses legacy unpadded values layout that cannot be mmap-aligned for zero-copy load: {resolved_path}. Rebuild this .spgrm with the current JanusX writer. Detail: {err}"
                 ));
             }
             return Err(err);
@@ -366,11 +369,12 @@ impl MmapSparseGrmCsc {
 }
 
 pub(crate) fn sparse_jxgrm_header_n_samples(path: &str) -> Result<usize, String> {
-    let mut file =
-        File::open(path).map_err(|e| format!("open sparse JXGRM header {path} failed: {e}"))?;
+    let resolved_path = resolve_sparse_grm_input_path(path)?;
+    let mut file = File::open(&resolved_path)
+        .map_err(|e| format!("open sparse JXGRM header {resolved_path} failed: {e}"))?;
     let mut header = [0u8; JXGRM_HEADER_BYTES];
     file.read_exact(&mut header)
-        .map_err(|e| format!("read sparse JXGRM header {path} failed: {e}"))?;
+        .map_err(|e| format!("read sparse JXGRM header {resolved_path} failed: {e}"))?;
     usize::try_from(read_le_u64(&header, 0, "n_samples")?)
         .map_err(|_| "Sparse JXGRM header n_samples does not fit into usize".to_string())
 }

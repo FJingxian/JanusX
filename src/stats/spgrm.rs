@@ -69,9 +69,9 @@ use rayon::prelude::*;
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
-use std::fs::{File, OpenOptions};
-use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
-use std::path::PathBuf;
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicU64, Ordering as AtomicOrdering},
     Arc, Mutex,
@@ -111,6 +111,7 @@ const SPGRM_DEFAULT_BATCH_MIN_ACCUM_BYTES: usize = 8 * 1024 * 1024;
 const SPGRM_JXGRM_VALUE_ALIGN_BYTES: usize = std::mem::size_of::<f64>();
 const SPGRM_DEFAULT_STREAMING_MERGE_MIN_BYTES: usize = 2 * 1024 * 1024 * 1024;
 const SPGRM_DECODE_STRIPE_ESTIMATE: usize = 2;
+const SPGRM_GCTA_IMPORT_SUFFIX: &str = ".gcta.spgrm";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SpgrmNpyFloatDtype {
@@ -179,7 +180,8 @@ struct SpgrmEntry {
 struct SpgrmWorkerScratch {
     row_block_f32: Vec<f32>,
     col_block_f32: Vec<f32>,
-    accum_f32: Vec<f32>,
+    accum_f64: Vec<f64>,
+    accum_tmp_f32: Vec<f32>,
     dummy_row_varsum: Vec<f64>,
     dummy_col_varsum: Vec<f64>,
 }
@@ -189,7 +191,8 @@ impl SpgrmWorkerScratch {
         Self {
             row_block_f32: vec![0.0_f32; row_step.saturating_mul(sample_step)],
             col_block_f32: vec![0.0_f32; row_step.saturating_mul(sample_step)],
-            accum_f32: vec![0.0_f32; sample_step.saturating_mul(sample_step)],
+            accum_f64: vec![0.0_f64; sample_step.saturating_mul(sample_step)],
+            accum_tmp_f32: vec![0.0_f32; sample_step.saturating_mul(sample_step)],
             dummy_row_varsum: vec![0.0_f64; row_step],
             dummy_col_varsum: vec![0.0_f64; row_step],
         }
@@ -377,7 +380,8 @@ struct SpgrmBatchTaskAccum {
     row_offset_in_stripe: usize,
     col_offset_in_stripe: usize,
     accum_row_major: bool,
-    accum: Vec<f32>,
+    accum: Vec<f64>,
+    accum_tmp_f32: Vec<f32>,
 }
 
 #[derive(Debug)]
@@ -460,6 +464,329 @@ fn normalize_spgrm_path(prefix: &str) -> String {
         return path_jxgrm;
     }
     path_spgrm
+}
+
+#[inline]
+fn strip_ascii_suffix_case_insensitive(value: &str, suffix: &str) -> Option<String> {
+    if value.len() < suffix.len() {
+        return None;
+    }
+    let split = value.len() - suffix.len();
+    if value[split..].eq_ignore_ascii_case(suffix) {
+        Some(value[..split].to_string())
+    } else {
+        None
+    }
+}
+
+#[derive(Clone, Debug)]
+struct GctaSparseImportPaths {
+    input_sp_path: PathBuf,
+    input_id_path: PathBuf,
+    output_spgrm_path: PathBuf,
+}
+
+#[inline]
+fn resolve_gcta_sparse_import_paths(path: &str) -> Option<GctaSparseImportPaths> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let prefix = strip_ascii_suffix_case_insensitive(trimmed, ".grm.sp")
+        .unwrap_or_else(|| trimmed.to_string());
+    let input_sp_path = if trimmed.len() >= ".grm.sp".len()
+        && trimmed[trimmed.len() - ".grm.sp".len()..].eq_ignore_ascii_case(".grm.sp")
+    {
+        PathBuf::from(trimmed)
+    } else {
+        PathBuf::from(format!("{prefix}.grm.sp"))
+    };
+    let input_id_path = PathBuf::from(format!("{prefix}.grm.id"));
+    if !input_sp_path.is_file() || !input_id_path.is_file() {
+        return None;
+    }
+    let output_spgrm_path = PathBuf::from(format!("{prefix}{SPGRM_GCTA_IMPORT_SUFFIX}"));
+    Some(GctaSparseImportPaths {
+        input_sp_path,
+        input_id_path,
+        output_spgrm_path,
+    })
+}
+
+#[inline]
+fn sparse_file_modified_ns(path: &Path) -> Option<u128> {
+    fs::metadata(path)
+        .ok()
+        .and_then(|meta| meta.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+}
+
+#[inline]
+fn gcta_import_output_is_fresh(paths: &GctaSparseImportPaths) -> bool {
+    let out_path = paths.output_spgrm_path.as_path();
+    let out_id = PathBuf::from(format!("{}.id", out_path.display()));
+    if !out_path.is_file() || !out_id.is_file() {
+        return false;
+    }
+    let out_ns = sparse_file_modified_ns(out_path);
+    let out_id_ns = sparse_file_modified_ns(out_id.as_path());
+    let input_sp_ns = sparse_file_modified_ns(paths.input_sp_path.as_path());
+    let input_id_ns = sparse_file_modified_ns(paths.input_id_path.as_path());
+    match (out_ns, out_id_ns, input_sp_ns, input_id_ns) {
+        (Some(out_ns), Some(out_id_ns), Some(input_sp_ns), Some(input_id_ns)) => {
+            out_ns >= input_sp_ns && out_ns >= input_id_ns && out_id_ns >= input_id_ns
+        }
+        _ => false,
+    }
+}
+
+fn gcta_sparse_id_count(id_path: &Path) -> Result<usize, String> {
+    let file = File::open(id_path)
+        .map_err(|e| format!("failed to open GCTA sparse GRM id file {}: {e}", id_path.display()))?;
+    let reader = BufReader::new(file);
+    let mut n = 0usize;
+    for line in reader.lines() {
+        let line = line.map_err(|e| {
+            format!(
+                "failed to read GCTA sparse GRM id file {}: {e}",
+                id_path.display()
+            )
+        })?;
+        if !line.trim().is_empty() {
+            n = n.saturating_add(1);
+        }
+    }
+    if n == 0 {
+        return Err(format!("empty GCTA sparse GRM id file: {}", id_path.display()));
+    }
+    Ok(n)
+}
+
+#[inline]
+fn parse_gcta_sparse_triplet(
+    sp_path: &Path,
+    line_no: usize,
+    line: &str,
+    n_samples: usize,
+) -> Result<(usize, usize, f64), String> {
+    let mut fields = line.split_whitespace();
+    let row = fields
+        .next()
+        .ok_or_else(|| {
+            format!(
+                "{}:{line_no}: expected 3 columns in GCTA sparse GRM",
+                sp_path.display()
+            )
+        })?
+        .parse::<usize>()
+        .map_err(|e| format!("{}:{line_no}: invalid row index: {e}", sp_path.display()))?;
+    let col = fields
+        .next()
+        .ok_or_else(|| {
+            format!(
+                "{}:{line_no}: expected 3 columns in GCTA sparse GRM",
+                sp_path.display()
+            )
+        })?
+        .parse::<usize>()
+        .map_err(|e| format!("{}:{line_no}: invalid column index: {e}", sp_path.display()))?;
+    let value = fields
+        .next()
+        .ok_or_else(|| {
+            format!(
+                "{}:{line_no}: expected 3 columns in GCTA sparse GRM",
+                sp_path.display()
+            )
+        })?
+        .parse::<f64>()
+        .map_err(|e| format!("{}:{line_no}: invalid value: {e}", sp_path.display()))?;
+    if fields.next().is_some() {
+        return Err(format!(
+            "{}:{line_no}: expected 3 columns in GCTA sparse GRM",
+            sp_path.display()
+        ));
+    }
+    if !(col <= row && row < n_samples) {
+        return Err(format!(
+            "{}:{line_no}: invalid lower-triangle index row={row} col={col} for n_samples={n_samples}",
+            sp_path.display()
+        ));
+    }
+    if !value.is_finite() {
+        return Err(format!(
+            "{}:{line_no}: non-finite value in GCTA sparse GRM",
+            sp_path.display()
+        ));
+    }
+    Ok((row, col, value))
+}
+
+fn convert_gcta_sparse_to_spgrm(paths: &GctaSparseImportPaths) -> Result<String, String> {
+    let n_samples = gcta_sparse_id_count(paths.input_id_path.as_path())?;
+    let mut col_counts = vec![0u64; n_samples + 1];
+    let mut nnz = 0usize;
+    {
+        let file = File::open(paths.input_sp_path.as_path()).map_err(|e| {
+            format!(
+                "failed to open GCTA sparse GRM {}: {e}",
+                paths.input_sp_path.display()
+            )
+        })?;
+        let reader = BufReader::new(file);
+        for (line_no0, line) in reader.lines().enumerate() {
+            let line = line.map_err(|e| {
+                format!(
+                    "failed to read GCTA sparse GRM {}: {e}",
+                    paths.input_sp_path.display()
+                )
+            })?;
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let (_row, col, _value) = parse_gcta_sparse_triplet(
+                paths.input_sp_path.as_path(),
+                line_no0 + 1,
+                trimmed,
+                n_samples,
+            )?;
+            col_counts[col + 1] = col_counts[col + 1].saturating_add(1);
+            nnz = nnz.saturating_add(1);
+        }
+    }
+    if nnz == 0 {
+        return Err(format!(
+            "empty GCTA sparse GRM file: {}",
+            paths.input_sp_path.display()
+        ));
+    }
+    for idx in 0..n_samples {
+        col_counts[idx + 1] = col_counts[idx + 1].saturating_add(col_counts[idx]);
+    }
+    let mut row_indices = vec![0u32; nnz];
+    let mut values = vec![0.0_f64; nnz];
+    let mut next_ptr = col_counts[..n_samples]
+        .iter()
+        .map(|&v| v as usize)
+        .collect::<Vec<_>>();
+    let mut prev_row_by_col = vec![None::<usize>; n_samples];
+    {
+        let file = File::open(paths.input_sp_path.as_path()).map_err(|e| {
+            format!(
+                "failed to reopen GCTA sparse GRM {}: {e}",
+                paths.input_sp_path.display()
+            )
+        })?;
+        let reader = BufReader::new(file);
+        for (line_no0, line) in reader.lines().enumerate() {
+            let line = line.map_err(|e| {
+                format!(
+                    "failed to read GCTA sparse GRM {}: {e}",
+                    paths.input_sp_path.display()
+                )
+            })?;
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let (row, col, value) = parse_gcta_sparse_triplet(
+                paths.input_sp_path.as_path(),
+                line_no0 + 1,
+                trimmed,
+                n_samples,
+            )?;
+            if let Some(prev_row) = prev_row_by_col[col] {
+                if row <= prev_row {
+                    return Err(format!(
+                        "{}:{}: row indices within column {col} must be strictly increasing; got prev_row={prev_row}, row={row}",
+                        paths.input_sp_path.display(),
+                        line_no0 + 1
+                    ));
+                }
+            }
+            prev_row_by_col[col] = Some(row);
+            let dst = next_ptr[col];
+            row_indices[dst] = row as u32;
+            values[dst] = value;
+            next_ptr[col] = dst.saturating_add(1);
+        }
+    }
+    let csc = SparseGrmCsc {
+        n_samples,
+        nnz,
+        col_ptr: col_counts,
+        row_indices,
+        values,
+    };
+    let out_path = paths.output_spgrm_path.to_string_lossy().to_string();
+    let tmp_path = format!(
+        "{out_path}.tmp.{}.{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
+    write_sparse_grm_csc(&tmp_path, &csc)?;
+    let tmp_id = format!("{tmp_path}.id");
+    fs::copy(paths.input_id_path.as_path(), &tmp_id).map_err(|e| {
+        format!(
+            "failed to copy GCTA sparse GRM id file {} -> {}: {e}",
+            paths.input_id_path.display(),
+            tmp_id
+        )
+    })?;
+    let meta_path = format!("{tmp_path}.meta.json");
+    let meta = serde_json::json!({
+        "source": "gcta_sparse_import",
+        "input_grm_sp": paths.input_sp_path,
+        "input_grm_id": paths.input_id_path,
+        "n_samples": n_samples,
+        "nnz": nnz,
+    });
+    let meta_file = File::create(&meta_path)
+        .map_err(|e| format!("failed to create sparse GRM meta file {meta_path}: {e}"))?;
+    serde_json::to_writer(meta_file, &meta)
+        .map_err(|e| format!("failed to write sparse GRM meta file {meta_path}: {e}"))?;
+    fs::rename(&tmp_path, &out_path)
+        .map_err(|e| format!("failed to finalize imported sparse GRM {out_path}: {e}"))?;
+    fs::rename(&tmp_id, format!("{out_path}.id")).map_err(|e| {
+        format!(
+            "failed to finalize imported sparse GRM id {}.id: {e}",
+            out_path
+        )
+    })?;
+    fs::rename(&meta_path, format!("{out_path}.meta.json")).map_err(|e| {
+        format!(
+            "failed to finalize imported sparse GRM meta {}.meta.json: {e}",
+            out_path
+        )
+    })?;
+    Ok(out_path)
+}
+
+pub(crate) fn resolve_sparse_grm_input_path(path: &str) -> Result<String, String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err("Sparse GRM path must not be empty".to_string());
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.ends_with(".spgrm") || lower.ends_with(".jxgrm") {
+        return Ok(trimmed.to_string());
+    }
+    let candidate_spgrm = format!("{trimmed}.spgrm");
+    let candidate_jxgrm = format!("{trimmed}.jxgrm");
+    if Path::new(&candidate_spgrm).exists() || Path::new(&candidate_jxgrm).exists() {
+        return Ok(normalize_spgrm_path(trimmed));
+    }
+    if let Some(paths) = resolve_gcta_sparse_import_paths(trimmed) {
+        if gcta_import_output_is_fresh(&paths) {
+            return Ok(paths.output_spgrm_path.to_string_lossy().to_string());
+        }
+        return convert_gcta_sparse_to_spgrm(&paths);
+    }
+    Ok(trimmed.to_string())
 }
 
 #[inline]
@@ -880,6 +1207,7 @@ fn spgrm_streaming_merge_min_bytes() -> usize {
 
 #[inline]
 fn spgrm_batch_max_accum_bytes(sample_step: usize, threads: usize) -> usize {
+    let cell_bytes = std::mem::size_of::<f64>() + std::mem::size_of::<f32>();
     if let Some(mb) = std::env::var("JANUSX_SPGRM_BATCH_MAX_ACCUM_MB")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
@@ -888,16 +1216,16 @@ fn spgrm_batch_max_accum_bytes(sample_step: usize, threads: usize) -> usize {
         return mb
             .saturating_mul(1024)
             .saturating_mul(1024)
-            .max(std::mem::size_of::<f32>());
+            .max(cell_bytes);
     }
     let tile_bytes = sample_step
         .saturating_mul(sample_step)
-        .saturating_mul(std::mem::size_of::<f32>());
+        .saturating_mul(cell_bytes);
     tile_bytes
         .saturating_mul(threads.max(1))
         .saturating_mul(SPGRM_DEFAULT_BATCH_ACCUM_TILE_FACTOR)
         .max(SPGRM_DEFAULT_BATCH_MIN_ACCUM_BYTES)
-        .max(std::mem::size_of::<f32>())
+        .max(cell_bytes)
 }
 
 fn spgrm_batch_max_decoded_bytes(
@@ -1787,7 +2115,7 @@ fn build_spgrm_tasks(n_use: usize, sample_step: usize) -> Vec<SpgrmTask> {
 fn spgrm_task_accum_bytes(task: SpgrmTask) -> usize {
     (task.row_end - task.row_start)
         .saturating_mul(task.col_end - task.col_start)
-        .saturating_mul(std::mem::size_of::<f32>())
+        .saturating_mul(std::mem::size_of::<f64>() + std::mem::size_of::<f32>())
 }
 
 #[inline]
@@ -2004,7 +2332,8 @@ fn spgrm_build_stream_batch(
                     row_offset_in_stripe,
                     col_offset_in_stripe,
                     accum_row_major,
-                    accum: vec![0.0_f32; n_row.saturating_mul(n_col)],
+                    accum: vec![0.0_f64; n_row.saturating_mul(n_col)],
+                    accum_tmp_f32: vec![0.0_f32; n_row.saturating_mul(n_col)],
                 }
             },
         )
@@ -2111,7 +2440,7 @@ fn spgrm_consume_stream_batch_buffer(
     if buf.cur_rows == 0 {
         return Ok(());
     }
-    let beta = if buf.row_start == 0 { 0.0_f32 } else { 1.0_f32 };
+    let is_first_block = buf.row_start == 0;
     if threads > 1 && task_accum.len() > 1 {
         let timing_ref = timing;
         let stripe_scratch = buf.stripe_scratch.as_slice();
@@ -2121,7 +2450,7 @@ fn spgrm_consume_stream_batch_buffer(
                     task_acc,
                     stripe_scratch,
                     buf.cur_rows,
-                    beta,
+                    is_first_block,
                     timing_ref,
                 );
             });
@@ -2137,7 +2466,7 @@ fn spgrm_consume_stream_batch_buffer(
                 task_acc,
                 buf.stripe_scratch.as_slice(),
                 buf.cur_rows,
-                beta,
+                is_first_block,
                 timing,
             );
         }
@@ -2239,7 +2568,7 @@ fn spgrm_collect_batch_entries(
                 } else {
                     local_row + local_col * n_row
                 };
-                let scaled = (task_acc.accum[accum_idx] as f64) * inv_scale;
+                let scaled = task_acc.accum[accum_idx] * inv_scale;
                 if !scaled.is_finite() {
                     return Err(format!(
                         "Sparse GRM produced non-finite value at pair ({global_row}, {global_col})"
@@ -2470,6 +2799,94 @@ fn pair_block_accumulate_sgemm(
 }
 
 #[inline]
+fn spgrm_merge_col_major_tmp_f32_into_f64(
+    accum_f64: &mut [f64],
+    tmp_f32: &[f32],
+    n_row: usize,
+    n_col: usize,
+    lower_only: bool,
+    is_first_block: bool,
+) {
+    if is_first_block {
+        for col in 0..n_col {
+            let row_start = if lower_only { col } else { 0usize };
+            for row in row_start..n_row {
+                let idx = row + col * n_row;
+                accum_f64[idx] = tmp_f32[idx] as f64;
+            }
+        }
+    } else {
+        for col in 0..n_col {
+            let row_start = if lower_only { col } else { 0usize };
+            for row in row_start..n_row {
+                let idx = row + col * n_row;
+                accum_f64[idx] += tmp_f32[idx] as f64;
+            }
+        }
+    }
+}
+
+#[inline]
+fn spgrm_merge_row_major_tmp_f32_into_f64(
+    accum_f64: &mut [f64],
+    tmp_f32: &[f32],
+    n_row: usize,
+    n_col: usize,
+    lower_only: bool,
+    is_first_block: bool,
+) {
+    if is_first_block {
+        for row in 0..n_row {
+            let col_end = if lower_only { (row + 1).min(n_col) } else { n_col };
+            for col in 0..col_end {
+                let idx = row * n_col + col;
+                accum_f64[idx] = tmp_f32[idx] as f64;
+            }
+        }
+    } else {
+        for row in 0..n_row {
+            let col_end = if lower_only { (row + 1).min(n_col) } else { n_col };
+            for col in 0..col_end {
+                let idx = row * n_col + col;
+                accum_f64[idx] += tmp_f32[idx] as f64;
+            }
+        }
+    }
+}
+
+#[inline]
+fn pair_block_accumulate_sgemm_tmp_into_f64(
+    left_f32: &[f32],
+    right_f32: &[f32],
+    rows: usize,
+    n_left: usize,
+    n_right: usize,
+    accum_f64: &mut [f64],
+    tmp_f32: &mut [f32],
+    is_first_block: bool,
+) {
+    let tmp = &mut tmp_f32[..n_left.saturating_mul(n_right)];
+    tmp.fill(0.0_f32);
+    pair_block_accumulate_sgemm(
+        left_f32,
+        right_f32,
+        rows,
+        n_left,
+        n_right,
+        tmp,
+        0.0_f32,
+    );
+    spgrm_merge_col_major_tmp_f32_into_f64(
+        accum_f64,
+        tmp,
+        n_left,
+        n_right,
+        false,
+        is_first_block,
+    );
+}
+
+#[inline]
 fn pair_block_accumulate_sgemm_rowmajor_strided(
     left_f32: &[f32],
     left_stride: usize,
@@ -2501,6 +2918,47 @@ fn pair_block_accumulate_sgemm_rowmajor_strided(
             n_right as CblasInt,
         );
     }
+}
+
+#[inline]
+fn pair_block_accumulate_sgemm_rowmajor_strided_tmp_into_f64(
+    left_f32: &[f32],
+    left_stride: usize,
+    left_col_start: usize,
+    right_f32: &[f32],
+    right_stride: usize,
+    right_col_start: usize,
+    rows: usize,
+    n_left: usize,
+    n_right: usize,
+    accum_f64: &mut [f64],
+    tmp_f32: &mut [f32],
+    lower_only: bool,
+    is_first_block: bool,
+) {
+    let tmp = &mut tmp_f32[..n_left.saturating_mul(n_right)];
+    tmp.fill(0.0_f32);
+    pair_block_accumulate_sgemm_rowmajor_strided(
+        left_f32,
+        left_stride,
+        left_col_start,
+        right_f32,
+        right_stride,
+        right_col_start,
+        rows,
+        n_left,
+        n_right,
+        tmp,
+        0.0_f32,
+    );
+    spgrm_merge_row_major_tmp_f32_into_f64(
+        accum_f64,
+        tmp,
+        n_left,
+        n_right,
+        lower_only,
+        is_first_block,
+    );
 }
 
 /// Runtime probe: benchmark ssyrk vs sgemm for self-block (C = A * A^T).
@@ -2591,6 +3049,7 @@ fn spgrm_probe_self_accum_syrk_faster(n_cols: usize, rows: usize) -> bool {
     faster
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 #[inline]
 fn self_block_accumulate_ssyrk(
     block_f32: &[f32],
@@ -2616,6 +3075,57 @@ fn self_block_accumulate_ssyrk(
     }
 }
 
+#[inline]
+fn self_block_accumulate_mixed_f32_to_f64(
+    block_f32: &[f32],
+    rows: usize,
+    n_cols: usize,
+    accum_f64: &mut [f64],
+    tmp_f32: &mut [f32],
+    is_first_block: bool,
+) {
+    let tmp = &mut tmp_f32[..n_cols.saturating_mul(n_cols)];
+    tmp.fill(0.0_f32);
+    if spgrm_probe_self_accum_syrk_faster(n_cols, rows) {
+        unsafe {
+            cblas_ssyrk_dispatch(
+                CBLAS_COL_MAJOR,
+                CBLAS_LOWER,
+                CBLAS_NO_TRANS,
+                n_cols as CblasInt,
+                rows as CblasInt,
+                1.0_f32,
+                block_f32.as_ptr(),
+                n_cols as CblasInt,
+                0.0_f32,
+                tmp.as_mut_ptr(),
+                n_cols as CblasInt,
+            );
+        }
+    } else {
+        unsafe {
+            cblas_sgemm_dispatch(
+                CBLAS_COL_MAJOR,
+                CBLAS_NO_TRANS,
+                CBLAS_TRANS,
+                n_cols as CblasInt,
+                n_cols as CblasInt,
+                rows as CblasInt,
+                1.0_f32,
+                block_f32.as_ptr(),
+                n_cols as CblasInt,
+                block_f32.as_ptr(),
+                n_cols as CblasInt,
+                0.0_f32,
+                tmp.as_mut_ptr(),
+                n_cols as CblasInt,
+            );
+        }
+    }
+    spgrm_merge_col_major_tmp_f32_into_f64(accum_f64, tmp, n_cols, n_cols, true, is_first_block);
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 #[inline]
 fn self_block_accumulate_sgemm(
     block_f32: &[f32],
@@ -2653,7 +3163,7 @@ fn spgrm_accumulate_task_gemm(
     task_acc: &mut SpgrmBatchTaskAccum,
     stripe_scratch: &[SpgrmStreamStripeScratch],
     cur_rows: usize,
-    beta: f32,
+    is_first_block: bool,
     timing: Option<&SpgrmStageTiming>,
 ) {
     let row_block = &stripe_scratch[task_acc.row_stripe_idx];
@@ -2662,9 +3172,10 @@ fn spgrm_accumulate_task_gemm(
     let col_stride = col_block.width();
     let n_row = task_acc.task.row_end - task_acc.task.row_start;
     let n_col = task_acc.task.col_end - task_acc.task.col_start;
+    let diagonal_tile = task_acc.task.row_start == task_acc.task.col_start;
     let t_gemm = Instant::now();
     if task_acc.accum_row_major {
-        pair_block_accumulate_sgemm_rowmajor_strided(
+        pair_block_accumulate_sgemm_rowmajor_strided_tmp_into_f64(
             &row_block.decoded[..cur_rows * row_stride],
             row_stride,
             task_acc.row_offset_in_stripe,
@@ -2675,25 +3186,29 @@ fn spgrm_accumulate_task_gemm(
             n_row,
             n_col,
             task_acc.accum.as_mut_slice(),
-            beta,
+            task_acc.accum_tmp_f32.as_mut_slice(),
+            diagonal_tile,
+            is_first_block,
         );
     } else if task_acc.row_stripe_idx == task_acc.col_stripe_idx {
-        self_block_accumulate_sgemm(
+        self_block_accumulate_mixed_f32_to_f64(
             &row_block.decoded[..cur_rows * n_row],
             cur_rows,
             n_row,
             task_acc.accum.as_mut_slice(),
-            beta,
+            task_acc.accum_tmp_f32.as_mut_slice(),
+            is_first_block,
         );
     } else {
-        pair_block_accumulate_sgemm(
+        pair_block_accumulate_sgemm_tmp_into_f64(
             &row_block.decoded[..cur_rows * n_row],
             &col_block.decoded[..cur_rows * n_col],
             cur_rows,
             n_row,
             n_col,
             task_acc.accum.as_mut_slice(),
-            beta,
+            task_acc.accum_tmp_f32.as_mut_slice(),
+            is_first_block,
         );
     }
     if let Some(timing) = timing {
@@ -2758,12 +3273,13 @@ fn compute_spgrm_task_entries(
         decode_ns = decode_ns.saturating_add(spgrm_elapsed_ns(t_decode));
         if diagonal_tile {
             let t_gemm = Instant::now();
-            self_block_accumulate_sgemm(
+            self_block_accumulate_mixed_f32_to_f64(
                 &scratch.row_block_f32[..cur_rows * n_row],
                 cur_rows,
                 n_row,
-                &mut scratch.accum_f32[..accum_len],
-                if first_block { 0.0_f32 } else { 1.0_f32 },
+                &mut scratch.accum_f64[..accum_len],
+                &mut scratch.accum_tmp_f32[..accum_len],
+                first_block,
             );
             gemm_ns = gemm_ns.saturating_add(spgrm_elapsed_ns(t_gemm));
         } else {
@@ -2788,14 +3304,15 @@ fn compute_spgrm_task_entries(
             )?;
             decode_ns = decode_ns.saturating_add(spgrm_elapsed_ns(t_decode));
             let t_gemm = Instant::now();
-            pair_block_accumulate_sgemm(
+            pair_block_accumulate_sgemm_tmp_into_f64(
                 &scratch.row_block_f32[..cur_rows * n_row],
                 &scratch.col_block_f32[..cur_rows * n_col],
                 cur_rows,
                 n_row,
                 n_col,
-                &mut scratch.accum_f32[..accum_len],
-                if first_block { 0.0_f32 } else { 1.0_f32 },
+                &mut scratch.accum_f64[..accum_len],
+                &mut scratch.accum_tmp_f32[..accum_len],
+                first_block,
             );
             gemm_ns = gemm_ns.saturating_add(spgrm_elapsed_ns(t_gemm));
         }
@@ -2809,7 +3326,7 @@ fn compute_spgrm_task_entries(
         let row_begin = if diagonal_tile { local_col } else { 0usize };
         for local_row in row_begin..n_row {
             let global_row = task.row_start + local_row;
-            let scaled = (scratch.accum_f32[local_row + local_col * n_row] as f64) * inv_scale;
+            let scaled = scratch.accum_f64[local_row + local_col * n_row] * inv_scale;
             if !scaled.is_finite() {
                 return Err(format!(
                     "Sparse GRM produced non-finite value at pair ({global_row}, {global_col})"

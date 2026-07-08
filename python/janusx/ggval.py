@@ -1653,6 +1653,14 @@ def parse_args() -> argparse.Namespace:
         help=f"Skip the named suites (comma or space separated). Supported: {', '.join(ALL_SUITES)}.",
     )
     parser.add_argument(
+        "--no-backend-thread-checks",
+        action="store_true",
+        help=(
+            "Compatibility no-op. Backend/OpenBLAS thread self-checks now run in dedicated CI steps "
+            "before invoking ggval."
+        ),
+    )
+    parser.add_argument(
         "--multicore",
         action="store_true",
         help="Run only the multicore GRM/EIGH benchmark suite with a larger benchmark dataset.",

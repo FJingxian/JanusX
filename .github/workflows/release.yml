@@ -67,6 +67,7 @@ jobs:
           use_dev_suffix = not (event_name == "workflow_dispatch" and publish_pypi)
           package_version = base_version
           is_dev = False
+          force_dev_suffix = False
 
           if use_dev_suffix:
               def version_exists(ver: str) -> bool:
@@ -81,12 +82,23 @@ jobs:
                   except Exception:
                       raise
 
+              def next_available_dev_version() -> str:
+                  next_dev = 1
+                  while next_dev <= 9999 and version_exists(f"{base_version}.dev{next_dev}"):
+                      next_dev += 1
+                  if next_dev > 9999:
+                      raise SystemExit(
+                          f"Exhausted TestPyPI dev suffixes for base version {base_version}"
+                      )
+                  return f"{base_version}.dev{next_dev}"
+
+              if re.fullmatch(r"\d+\.\d+\.\d+", base_version):
+                  release_parts = tuple(int(part) for part in base_version.split("."))
+                  force_dev_suffix = release_parts >= (1, 0, 26)
+
               try:
-                  if version_exists(base_version):
-                      next_dev = 1
-                      while next_dev <= 9999 and version_exists(f"{base_version}.dev{next_dev}"):
-                          next_dev += 1
-                      package_version = f"{base_version}.dev{next_dev}"
+                  if force_dev_suffix or version_exists(base_version):
+                      package_version = next_available_dev_version()
                       is_dev = True
               except Exception as exc:
                   raise SystemExit(f"Failed to query TestPyPI version index: {exc}")
@@ -97,7 +109,7 @@ jobs:
               f.write(f"is_dev={'true' if is_dev else 'false'}\n")
           print(
               f"[version-resolve] base={base_version} package={package_version} "
-              f"use_dev_suffix={use_dev_suffix}"
+              f"use_dev_suffix={use_dev_suffix} force_dev_suffix={force_dev_suffix}"
           )
           PY
 

@@ -23,7 +23,10 @@ echo "[4/4] Installing janusx..."
 DEV="${DEV:-0}"
 if [ "$DEV" = "1" ]; then
   echo "Installing janusx from TestPyPI..."
-    uv pip install --python "$ENV_PATH/bin/python" --pre $PACKAGE \
+    uv pip install --python "$ENV_PATH/bin/python" \
+    --prerelease allow \
+    --index-strategy unsafe-best-match \
+    $PACKAGE \
     --index-url https://test.pypi.org/simple/ \
     --extra-index-url https://pypi.org/simple/
 else

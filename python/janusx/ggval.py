@@ -107,8 +107,19 @@ def _is_plotting_subcommand(cmd: list[str]) -> bool:
     return False
 
 
+def _is_ml_gs_subcommand(cmd: list[str]) -> bool:
+    if len(cmd) < 2:
+        return False
+    prog = Path(str(cmd[0])).name.lower()
+    sub = str(cmd[1]).strip().lower()
+    if prog not in {"jx", "janusx"} or sub != "gs":
+        return False
+    ml_flags = {"-RF", "--RF", "-ET", "--ET", "-GBDT", "--GBDT", "-XGB", "--XGB", "-SVM", "--SVM", "-ENET", "--ENET"}
+    return any(str(tok) in ml_flags for tok in cmd[2:])
+
+
 def _apply_plotting_subprocess_env(proc_env: dict[str, str], cmd: list[str]) -> None:
-    if not _is_plotting_subcommand(cmd):
+    if (not _is_plotting_subcommand(cmd)) and (not _is_ml_gs_subcommand(cmd)):
         return
     for key in (
         "OMP_NUM_THREADS",
@@ -1442,48 +1453,48 @@ def run_gs_ml_suite(
     pheno_txt = paths["pheno_txt"]
 
     step("GS-ML. Validate scikit-learn GS save-model/postgs compatibility")
-    run(
-        [
-            "jx",
-            "gs",
-            "-bfile",
-            str(sim_prefix),
-            "-p",
-            str(pheno_txt),
-            "-n",
-            TRAIT_NAME,
-            "-RF",
-            "-ENET",
-            "-maf",
-            "0",
-            "-geno",
-            "1",
-            "-cv",
-            str(cv_folds),
-            "-save-model",
-            "-t",
-            str(threads),
-            "-o",
-            str(outdir),
-            "-prefix",
-            GS_ML_PREFIX_NAME,
-        ]
-    )
-    summary_path = validate_gs_output_basics(
-        outdir,
-        prefix_name=GS_ML_PREFIX_NAME,
-        trait_name=TRAIT_NAME,
-    )
     for method_name in ["RF", "ENET"]:
-        validate_binary_jxmodel_artifact(summary_path, method_name=method_name)
-    if postgs_enabled:
-        run(["jx", "postgs", "-json", str(summary_path), "-o", str(outdir)])
-        validate_postgs_outputs(
-            outdir,
-            prefix_name=GS_ML_PREFIX_NAME,
-            trait_name=TRAIT_NAME,
-            expect_effect_plot=True,
+        method_prefix = f"{GS_ML_PREFIX_NAME}_{method_name.lower()}"
+        run(
+            [
+                "jx",
+                "gs",
+                "-bfile",
+                str(sim_prefix),
+                "-p",
+                str(pheno_txt),
+                "-n",
+                TRAIT_NAME,
+                f"-{method_name}",
+                "-maf",
+                "0",
+                "-geno",
+                "1",
+                "-cv",
+                str(cv_folds),
+                "-save-model",
+                "-t",
+                str(threads),
+                "-o",
+                str(outdir),
+                "-prefix",
+                method_prefix,
+            ]
         )
+        summary_path = validate_gs_output_basics(
+            outdir,
+            prefix_name=method_prefix,
+            trait_name=TRAIT_NAME,
+        )
+        validate_binary_jxmodel_artifact(summary_path, method_name=method_name)
+        if postgs_enabled:
+            run(["jx", "postgs", "-json", str(summary_path), "-o", str(outdir)])
+            validate_postgs_outputs(
+                outdir,
+                prefix_name=method_prefix,
+                trait_name=TRAIT_NAME,
+                expect_effect_plot=True,
+            )
     sep()
     return "ok"
 

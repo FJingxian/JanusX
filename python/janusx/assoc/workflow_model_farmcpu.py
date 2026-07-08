@@ -1096,7 +1096,7 @@ def run_farmcpu_fullmem(
     trait_iter = _resolve_trait_iter(pheno_aligned, trait_names)
     multi_trait_mode = len(trait_iter) > 1
     for trait_idx, phename in enumerate(trait_iter):
-        y_full, famidretain = _trait_values_and_mask(pheno_aligned, str(phename))
+        y_full, famidretain = _trait_values_and_mask(pheno_aligned, phename)
         keep_idx = np.flatnonzero(famidretain).astype(np.int64, copy=False)
         if keep_idx.size == 0:
             logger.warning(f"{phename}: no overlapping samples, skipped.")

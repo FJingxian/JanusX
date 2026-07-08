@@ -617,7 +617,7 @@ def run_chunked_gwas_lmm_lm(
         for trait_idx, pname in enumerate(trait_iter):
             run_chunked_gwas_streaming_shared(
                 model_names=[model_key],
-                trait_name=str(pname),
+                trait_name=pname,
                 genofile=genofile,
                 pheno=pheno_aligned,
                 ids=ids,
@@ -677,7 +677,7 @@ def run_chunked_gwas_lmm_lm(
         peak_rss = rss0
         evd_secs = 0.0
 
-        y_full, sameidx = _trait_values_and_mask(pheno_aligned, str(pname))
+        y_full, sameidx = _trait_values_and_mask(pheno_aligned, pname)
         keep_idx = np.flatnonzero(sameidx).astype(np.int64, copy=False)
         n_idv = int(keep_idx.shape[0])
         if n_idv == 0:
@@ -1797,7 +1797,7 @@ def run_chunked_gwas_streaming_shared(
     pheno_aligned = pheno
     ids = np.asarray(ids, dtype=str).reshape(-1)
     pname = str(trait_name)
-    y_full, sameidx = _trait_values_and_mask(pheno_aligned, pname)
+    y_full, sameidx = _trait_values_and_mask(pheno_aligned, trait_name)
     keep_idx = np.flatnonzero(sameidx).astype(np.int64, copy=False)
     n_idv = int(keep_idx.shape[0])
     if n_idv == 0:
@@ -2019,8 +2019,6 @@ def run_chunked_gwas_streaming_shared(
             "writer": None,
             "init_log": None,
             "skip_scan": False,
-            "skip_note": "",
-            "skip_done_msg": "",
             "null_pve": None,
         }
 
@@ -2156,20 +2154,7 @@ def run_chunked_gwas_streaming_shared(
 
         if reuse_lm_idx is not None:
             reuse_ctx = model_ctxs[int(reuse_lm_idx)]
-            reuse_label = str(reuse_ctx.get("model_label", "LM"))
-            reuse_path = _display_path(str(reuse_ctx.get("out_tsv", "")))
-            if str(mkey) == "lm":
-                ctx["init_log"] = None
-                ctx["skip_note"] = (
-                    f"duplicate LM run skipped; reusing earlier {reuse_label} output "
-                    f"{reuse_path}."
-                )
-            else:
-                ctx["skip_note"] = (
-                    f"duplicate LM fallback skipped; reusing earlier {reuse_label} output "
-                    f"{reuse_path}."
-                )
-            ctx["skip_done_msg"] = f"{model_label} ...Skipped [reuse {reuse_label}]"
+            ctx["init_log"] = None
             ctx["skip_scan"] = True
             ctx["reuse_ctx_index"] = int(reuse_lm_idx)
             ctx["out_tsv"] = str(reuse_ctx.get("out_tsv", ""))
@@ -2608,52 +2593,6 @@ def run_chunked_gwas_streaming_shared(
             )
 
         if bool(ctx.get("skip_scan", False)):
-            reuse_ctx = None
-            reuse_idx = ctx.get("reuse_ctx_index", None)
-            if reuse_idx is not None:
-                try:
-                    reuse_ctx = model_ctxs[int(reuse_idx)]
-                except Exception:
-                    reuse_ctx = None
-            if reuse_ctx is not None:
-                done_snps = int(reuse_ctx.get("done_snps", done_snps))
-            skip_note = str(ctx.get("skip_note", "") or "").strip()
-            if skip_note != "":
-                _log_model_line(
-                    logger,
-                    model_label,
-                    skip_note,
-                    use_spinner=bool(use_spinner),
-                )
-            reused_out = str(
-                ctx.get("out_tsv", "")
-                or ("" if reuse_ctx is None else str(reuse_ctx.get("out_tsv", "")))
-            )
-            reused_has_results = bool(
-                (False if reuse_ctx is None else reuse_ctx.get("has_results", False))
-            )
-            summary_rows.append(
-                {
-                    "phenotype": str(pname),
-                    "model": model_label,
-                    "nidv": int(n_idv),
-                    "eff_snp": int(done_snps),
-                    "pve": (
-                        float(ctx["null_pve"])
-                        if _finite_optional_float(ctx.get("null_pve", None)) is not None
-                        else None
-                    ),
-                    "avg_cpu": float(avg_cpu_pct),
-                    "peak_rss_gb": float(peak_rss_gb),
-                    "gwas_time_s": float(evd_secs + scan_secs),
-                    "viz_time_s": 0.0,
-                    "result_file": (reused_out if reused_has_results else ""),
-                }
-            )
-            done_msg = str(ctx.get("skip_done_msg", "") or "").strip()
-            if done_msg == "":
-                done_msg = f"{model_label} ...Skipped"
-            _rich_success(logger, done_msg, use_spinner=use_spinner)
             continue
 
         _log_model_line(

@@ -55,6 +55,7 @@ import warnings
 import multiprocessing as mp
 import concurrent.futures as cf
 import textwrap
+from dataclasses import dataclass
 from shutil import get_terminal_size
 from datetime import datetime
 from typing import Any, Iterator, Union, Optional, Callable
@@ -1156,6 +1157,73 @@ def _looks_sample_header_token(token: object) -> bool:
     }
 
 
+@dataclass(frozen=True)
+class _TraitRef:
+    col_idx: int
+    label: str
+
+    def __str__(self) -> str:
+        return str(self.label)
+
+
+_TRAIT_TOKEN_PREFIX = "__jx_trait_"
+_TRAIT_TOKEN_SUFFIX = "__"
+
+
+def _trait_ref_from_selector(
+    pheno_aligned: pd.DataFrame,
+    trait_name: object,
+) -> Optional[_TraitRef]:
+    if isinstance(trait_name, _TraitRef):
+        idx = int(trait_name.col_idx)
+        if 0 <= idx < int(pheno_aligned.shape[1]):
+            return trait_name
+        raise KeyError(
+            f"Trait selector '{trait_name}' points to column index {idx}, "
+            f"but phenotype has {int(pheno_aligned.shape[1])} columns."
+        )
+    if isinstance(trait_name, str):
+        raw = trait_name.strip()
+        if raw.startswith(_TRAIT_TOKEN_PREFIX) and raw.endswith(_TRAIT_TOKEN_SUFFIX):
+            middle = raw[len(_TRAIT_TOKEN_PREFIX):-len(_TRAIT_TOKEN_SUFFIX)]
+            if middle.isdigit():
+                idx = int(middle)
+                if 0 <= idx < int(pheno_aligned.shape[1]):
+                    return _TraitRef(col_idx=idx, label=str(pheno_aligned.columns[idx]))
+                raise KeyError(
+                    f"Trait selector '{trait_name}' points to column index {idx}, "
+                    f"but phenotype has {int(pheno_aligned.shape[1])} columns."
+                )
+    return None
+
+
+def _trait_exact_match_indices(
+    cols: list[object],
+    selector: object,
+) -> list[int]:
+    out: list[int] = []
+    for idx, col in enumerate(cols):
+        if col is selector:
+            out.append(int(idx))
+            continue
+        same = False
+        try:
+            eq = (col == selector)
+            if isinstance(eq, (bool, np.bool_)):
+                same = bool(eq)
+        except Exception:
+            same = False
+        if not same:
+            try:
+                if bool(pd.isna(col)) and bool(pd.isna(selector)):
+                    same = True
+            except Exception:
+                same = False
+        if same:
+            out.append(int(idx))
+    return out
+
+
 def _trait_values_and_mask(
     pheno_aligned: pd.DataFrame,
     trait_name: object,
@@ -1163,34 +1231,85 @@ def _trait_values_and_mask(
     """
     Return trait values in aligned sample order and a non-missing mask.
     """
-    col_key: object
-    if trait_name in pheno_aligned.columns:
-        col_key = trait_name
+    trait_ref = _trait_ref_from_selector(pheno_aligned, trait_name)
+    if trait_ref is not None:
+        col = pheno_aligned.iloc[:, int(trait_ref.col_idx)]
     else:
-        tkey = str(trait_name)
-        if tkey in pheno_aligned.columns:
-            col_key = tkey
+        col_key: object
+        if trait_name in pheno_aligned.columns:
+            col_key = trait_name
         else:
-            matched = [c for c in pheno_aligned.columns if str(c) == tkey]
-            if len(matched) == 1:
-                col_key = matched[0]
-            elif len(matched) > 1:
-                raise KeyError(
-                    f"Ambiguous trait selector '{tkey}': multiple columns share this string form."
-                )
+            tkey = str(trait_name)
+            if tkey in pheno_aligned.columns:
+                col_key = tkey
             else:
-                raise KeyError(
-                    f"Trait '{tkey}' not found in phenotype columns: "
-                    + ", ".join(str(c) for c in list(pheno_aligned.columns)[:10])
-                    + (" ..." if len(pheno_aligned.columns) > 10 else "")
-                )
-    col = pheno_aligned[col_key]
+                matched = [c for c in pheno_aligned.columns if str(c) == tkey]
+                if len(matched) == 1:
+                    col_key = matched[0]
+                elif len(matched) > 1:
+                    raise KeyError(
+                        f"Ambiguous trait selector '{tkey}': multiple columns share this string form."
+                    )
+                else:
+                    raise KeyError(
+                        f"Trait '{tkey}' not found in phenotype columns: "
+                        + ", ".join(str(c) for c in list(pheno_aligned.columns)[:10])
+                        + (" ..." if len(pheno_aligned.columns) > 10 else "")
+                    )
+        col = pheno_aligned[col_key]
+        if isinstance(col, pd.DataFrame):
+            raise KeyError(
+                f"Ambiguous trait selector '{str(trait_name)}': matched duplicate phenotype columns. "
+                "Rename phenotype columns to unique labels."
+            )
     if pd.api.types.is_numeric_dtype(col.dtype):
         y_full = col.to_numpy(dtype=np.float64, copy=False)
     else:
         y_full = pd.to_numeric(col, errors="coerce").to_numpy(dtype=np.float64, copy=False)
     keep = ~np.isnan(y_full)
     return y_full, keep
+
+
+def _trait_single_column_frame(
+    pheno_aligned: pd.DataFrame,
+    trait_name: object,
+    *,
+    row_indexer: Optional[np.ndarray] = None,
+) -> pd.DataFrame:
+    trait_ref = _trait_ref_from_selector(pheno_aligned, trait_name)
+    if trait_ref is not None:
+        series = pheno_aligned.iloc[:, int(trait_ref.col_idx)]
+    else:
+        col_key: object
+        if trait_name in pheno_aligned.columns:
+            col_key = trait_name
+        else:
+            tkey = str(trait_name)
+            if tkey in pheno_aligned.columns:
+                col_key = tkey
+            else:
+                matched = [c for c in pheno_aligned.columns if str(c) == tkey]
+                if len(matched) == 1:
+                    col_key = matched[0]
+                elif len(matched) > 1:
+                    raise KeyError(
+                        f"Ambiguous trait selector '{tkey}': multiple columns share this string form."
+                    )
+                else:
+                    raise KeyError(
+                        f"Trait '{tkey}' not found in phenotype columns: "
+                        + ", ".join(str(c) for c in list(pheno_aligned.columns)[:10])
+                        + (" ..." if len(pheno_aligned.columns) > 10 else "")
+                    )
+        series = pheno_aligned[col_key]
+        if isinstance(series, pd.DataFrame):
+            raise KeyError(
+                f"Ambiguous trait selector '{str(trait_name)}': matched duplicate phenotype columns. "
+                "Rename phenotype columns to unique labels."
+            )
+    if row_indexer is not None:
+        series = series.iloc[np.asarray(row_indexer, dtype=np.int64)]
+    return series.to_frame().copy()
 
 
 def _resolve_trait_iter(
@@ -1207,7 +1326,7 @@ def _resolve_trait_iter(
     """
     cols = list(pheno_aligned.columns)
     if trait_names is None:
-        return cols
+        return [_TraitRef(col_idx=idx, label=str(col)) for idx, col in enumerate(cols)]
 
     requested = list(trait_names)
     resolved: list[object] = []
@@ -1217,16 +1336,44 @@ def _resolve_trait_iter(
         by_str.setdefault(str(col), []).append(col)
 
     for trait_name in requested:
+        trait_ref = _trait_ref_from_selector(pheno_aligned, trait_name)
+        if trait_ref is not None:
+            resolved.append(trait_ref)
+            continue
+        identity_matches = [idx for idx, col in enumerate(cols) if col is trait_name]
+        if len(identity_matches) == 1:
+            idx = int(identity_matches[0])
+            resolved.append(_TraitRef(col_idx=idx, label=str(cols[idx])))
+            continue
         if trait_name in pheno_aligned.columns:
+            matched_idx = _trait_exact_match_indices(cols, trait_name)
+            if len(matched_idx) == 1:
+                idx = int(matched_idx[0])
+                resolved.append(_TraitRef(col_idx=idx, label=str(cols[idx])))
+                continue
+            if len(matched_idx) > 1:
+                raise KeyError(
+                    f"Ambiguous trait selector '{str(trait_name)}': multiple columns share this exact label."
+                )
             resolved.append(trait_name)
             continue
         tkey = str(trait_name)
         if tkey in pheno_aligned.columns:
+            matched_idx = _trait_exact_match_indices(cols, tkey)
+            if len(matched_idx) == 1:
+                idx = int(matched_idx[0])
+                resolved.append(_TraitRef(col_idx=idx, label=str(cols[idx])))
+                continue
+            if len(matched_idx) > 1:
+                raise KeyError(
+                    f"Ambiguous trait selector '{tkey}': multiple columns share this exact label."
+                )
             resolved.append(tkey)
             continue
         matched = by_str.get(tkey, [])
         if len(matched) == 1:
-            resolved.append(matched[0])
+            idx = int(cols.index(matched[0]))
+            resolved.append(_TraitRef(col_idx=idx, label=str(cols[idx])))
             continue
         if len(matched) > 1:
             raise KeyError(
@@ -5562,7 +5709,7 @@ def _run_file_dense_fast_once(
                 context_prepared=True,
                 summary_rows=summary_rows,
                 saved_paths=saved_paths,
-                trait_names=[str(pname)],
+                trait_names=[pname],
                 farmcpu_cache=farmcpu_cache_runtime,
                 prepare_only=False,
                 emit_trait_header=True,
@@ -5576,7 +5723,7 @@ def _run_file_dense_fast_once(
 
     for trait_idx, pname in enumerate(trait_iter):
         trait_summary_start = len(summary_rows)
-        y_full, sameidx = _trait_values_and_mask(pheno_aligned, str(pname))
+        y_full, sameidx = _trait_values_and_mask(pheno_aligned, pname)
         keep_idx = np.flatnonzero(sameidx).astype(np.int64, copy=False)
         n_idv = int(keep_idx.shape[0])
         if n_idv == 0:
@@ -5643,7 +5790,7 @@ def _run_file_dense_fast_once(
                     context_prepared=True,
                     summary_rows=summary_rows,
                     saved_paths=saved_paths,
-                    trait_names=[str(pname)],
+                    trait_names=[pname],
                     farmcpu_cache=farmcpu_cache_runtime,
                     prepare_only=False,
                     emit_trait_header=False,
@@ -5915,7 +6062,7 @@ def _run_file_dense_fast_once(
                 context_prepared=True,
                 summary_rows=summary_rows,
                 saved_paths=saved_paths,
-                trait_names=[str(pname)],
+                trait_names=[pname],
                 farmcpu_cache=farmcpu_cache_runtime,
                 prepare_only=False,
                 emit_trait_header=False,
@@ -7317,6 +7464,23 @@ def _run_gwas_pipeline(
                     )
 
         trait_order = list(pheno.columns) if pheno is not None else []
+        trait_refs = [
+            _TraitRef(col_idx=idx, label=str(trait_name))
+            for idx, trait_name in enumerate(trait_order)
+        ]
+        trait_tokens = [
+            f"__jx_trait_{idx}__" for idx in range(len(trait_order))
+        ]
+        trait_token_to_key = {
+            str(token): trait_ref
+            for token, trait_ref in zip(trait_tokens, trait_refs)
+        }
+
+        def _trait_key_from_selector(selector: object) -> object:
+            if isinstance(selector, str) and selector in trait_token_to_key:
+                return trait_token_to_key[selector]
+            return selector
+
         trait_col_map: dict[str, int] = {}
         selected_ncol = []
         if pheno is not None:
@@ -7415,7 +7579,7 @@ def _run_gwas_pipeline(
                             context_prepared=context_prepared,
                             summary_rows=gwas_summary_rows,
                             saved_paths=saved_result_paths,
-                            trait_names=[str(t) for t in trait_order] if len(trait_order) > 0 else None,
+                            trait_names=(list(trait_refs) if len(trait_refs) > 0 else None),
                             farmcpu_cache=farmcpu_cache_prefill,
                             prepare_only=True,
                             emit_trait_header=False,
@@ -7429,7 +7593,7 @@ def _run_gwas_pipeline(
                         try:
                             task_plan = jxrs.gwas_trait_model_dispatch_v2(
                                 [str(m) for m in stream_models],
-                                [str(t) for t in trait_order],
+                                list(trait_tokens),
                                 bool(has_farmcpu),
                             )
                         except Exception as ex:
@@ -7448,7 +7612,7 @@ def _run_gwas_pipeline(
                         try:
                             task_plan = jxrs.gwas_trait_model_schedule(
                                 [str(m) for m in stream_models],
-                                [str(t) for t in trait_order],
+                                list(trait_tokens),
                                 bool(has_farmcpu),
                             )
                         except Exception as ex:
@@ -7491,7 +7655,7 @@ def _run_gwas_pipeline(
                                 task_plan.append(
                                     {
                                         "model": str(model_name_use),
-                                        "trait": str(trait_name_use),
+                                        "trait": str(trait_tokens[ti]),
                                         "emit_trait_header": bool(mi == 0),
                                         "emit_blank_after": bool(mi == (len(stream_models) - 1) and ti < (len(trait_order) - 1)),
                                     }
@@ -7845,6 +8009,9 @@ def _run_gwas_pipeline(
                     for task_item in task_plan:
                         mk = str(task_item.get("model", "")).lower().strip()
                         route = str(task_item.get("route", "")).lower().strip()
+                        trait_selector = task_item.get("trait", "")
+                        trait_token = str(trait_selector)
+                        trait_key = _trait_key_from_selector(trait_selector)
                         if not route:
                             if mk == "lm":
                                 route = "lm_stream"
@@ -7869,7 +8036,9 @@ def _run_gwas_pipeline(
                             {
                                 "model": mk,
                                 "route": route,
-                                "trait": str(task_item.get("trait", "")),
+                                "trait": trait_key,
+                                "trait_token": trait_token,
+                                "trait_label": str(trait_key),
                                 "emit_trait_header": bool(
                                     task_item.get("emit_trait_header", False)
                                 ),
@@ -7910,10 +8079,10 @@ def _run_gwas_pipeline(
                         )
                     )
 
-                    def _trait_meta_needed_later(start_idx: int, trait_name: str) -> bool:
+                    def _trait_meta_needed_later(start_idx: int, trait_token: str) -> bool:
                         for idx in range(int(start_idx), len(normalized_tasks)):
-                            future_trait = str(normalized_tasks[idx].get("trait", ""))
-                            if future_trait != trait_name:
+                            future_trait = str(normalized_tasks[idx].get("trait_token", ""))
+                            if future_trait != trait_token:
                                 continue
                             future_route = str(
                                 normalized_tasks[idx].get("route", "")
@@ -7922,7 +8091,7 @@ def _run_gwas_pipeline(
                                 return True
                         return False
 
-                    def _build_trait_sample_indices(trait_name: str) -> Union[np.ndarray, None]:
+                    def _build_trait_sample_indices(trait_name: object) -> Union[np.ndarray, None]:
                         if pheno is None or ids_arr_meta is None or id_to_full_meta is None:
                             return None
                         _, sameidx_meta = _trait_values_and_mask(pheno, trait_name)
@@ -7942,7 +8111,8 @@ def _run_gwas_pipeline(
                             return None
 
                     def _trait_prepared_meta_needs_build(
-                        trait_name: str,
+                        trait_token: str,
+                        trait_name: object,
                         route_name: str,
                     ) -> tuple[bool, Union[np.ndarray, None]]:
                         route_key = str(route_name).lower().strip()
@@ -7953,7 +8123,7 @@ def _run_gwas_pipeline(
                             or gwas_row_stat_mode != "strict-train"
                         ):
                             return False, None
-                        cached_meta = trait_shared_meta_cache.get(trait_name)
+                        cached_meta = trait_shared_meta_cache.get(trait_token)
                         if cached_meta is not None:
                             return False, None
                         sample_idx_meta = _build_trait_sample_indices(trait_name)
@@ -7962,7 +8132,8 @@ def _run_gwas_pipeline(
                         return True, sample_idx_meta
 
                     def _resolve_trait_prepared_meta(
-                        trait_name: str,
+                        trait_token: str,
+                        trait_name: object,
                         route_name: str,
                         sample_idx_meta_prefetched: Union[np.ndarray, None] = None,
                     ) -> Union[dict[str, object], None]:
@@ -7989,7 +8160,7 @@ def _run_gwas_pipeline(
                             )
                             return global_trait_meta_shared
 
-                        cached_meta = trait_shared_meta_cache.get(trait_name)
+                        cached_meta = trait_shared_meta_cache.get(trait_token)
                         if cached_meta is not None:
                             return cached_meta
                         sample_idx_meta = sample_idx_meta_prefetched
@@ -8020,7 +8191,7 @@ def _run_gwas_pipeline(
                                 task.fail("Computing trait-subset row statistics ...Failed")
                                 raise
                             task.complete("Computing trait-subset row statistics ...Finished")
-                        trait_shared_meta_cache[trait_name] = cached_meta
+                        trait_shared_meta_cache[trait_token] = cached_meta
                         return cached_meta
 
                     task_idx = 0
@@ -8030,9 +8201,11 @@ def _run_gwas_pipeline(
                         task_item = normalized_tasks[task_idx]
                         mk = str(task_item.get("model", "")).lower().strip()
                         route = str(task_item.get("route", "")).lower().strip()
-                        trait_name_use = str(task_item.get("trait", ""))
-                        if trait_name_use != current_trait_summary_name:
-                            current_trait_summary_name = str(trait_name_use)
+                        trait_name_use = task_item.get("trait", "")
+                        trait_token_use = str(task_item.get("trait_token", ""))
+                        trait_label_use = str(task_item.get("trait_label", trait_name_use))
+                        if trait_token_use != current_trait_summary_name:
+                            current_trait_summary_name = trait_token_use
                             current_trait_summary_start = len(gwas_summary_rows)
                         emit_trait_header_model = bool(
                             task_item.get("emit_trait_header", False)
@@ -8042,6 +8215,7 @@ def _run_gwas_pipeline(
                         if bool(emit_trait_header_model):
                             meta_build_needed, prefetched_trait_meta_indices = (
                                 _trait_prepared_meta_needs_build(
+                                    trait_token_use,
                                     trait_name_use,
                                     route,
                                 )
@@ -8049,7 +8223,7 @@ def _run_gwas_pipeline(
                             if meta_build_needed:
                                 _emit_trait_header(
                                     logger,
-                                    trait_name_use,
+                                    trait_label_use,
                                     int(prefetched_trait_meta_indices.shape[0]),
                                     pve=None,
                                     use_spinner=bool(use_spinner),
@@ -8057,6 +8231,7 @@ def _run_gwas_pipeline(
                                 )
                                 emit_trait_header_model = False
                         trait_meta_shared = _resolve_trait_prepared_meta(
+                            trait_token_use,
                             trait_name_use,
                             route,
                             sample_idx_meta_prefetched=prefetched_trait_meta_indices,
@@ -8068,11 +8243,11 @@ def _run_gwas_pipeline(
                             while group_end < len(normalized_tasks):
                                 next_item = normalized_tasks[group_end]
                                 next_route = str(next_item.get("route", "")).lower().strip()
-                                next_trait = str(next_item.get("trait", ""))
+                                next_trait = str(next_item.get("trait_token", ""))
                                 next_model = str(next_item.get("model", "")).lower().strip()
                                 if (
                                     next_route not in stream_group_routes
-                                    or next_trait != trait_name_use
+                                    or next_trait != trait_token_use
                                     or next_model == "lm2"
                                 ):
                                     break
@@ -8114,7 +8289,7 @@ def _run_gwas_pipeline(
                                 next_idx = group_end
                                 trait_done = (
                                     next_idx >= len(normalized_tasks)
-                                    or str(normalized_tasks[next_idx].get("trait", "")) != trait_name_use
+                                    or str(normalized_tasks[next_idx].get("trait_token", "")) != trait_token_use
                                 )
                                 if trait_done:
                                     _emit_gwas_trait_summary(
@@ -8128,9 +8303,9 @@ def _run_gwas_pipeline(
                                 ):
                                     logger.info("")
                                 if not _trait_meta_needed_later(
-                                    group_end, trait_name_use
+                                    group_end, trait_token_use
                                 ) and gwas_row_stat_mode == "strict-train":
-                                    trait_shared_meta_cache.pop(trait_name_use, None)
+                                    trait_shared_meta_cache.pop(trait_token_use, None)
                                 task_idx = group_end
                                 continue
 
@@ -8167,7 +8342,7 @@ def _run_gwas_pipeline(
                         next_idx = task_idx + 1
                         trait_done = (
                             next_idx >= len(normalized_tasks)
-                            or str(normalized_tasks[next_idx].get("trait", "")) != trait_name_use
+                            or str(normalized_tasks[next_idx].get("trait_token", "")) != trait_token_use
                         )
                         if trait_done:
                             _emit_gwas_trait_summary(
@@ -8177,9 +8352,9 @@ def _run_gwas_pipeline(
                         if emit_blank_after:
                             logger.info("")
                         if not _trait_meta_needed_later(
-                            task_idx + 1, trait_name_use
+                            task_idx + 1, trait_token_use
                         ) and gwas_row_stat_mode == "strict-train":
-                            trait_shared_meta_cache.pop(trait_name_use, None)
+                            trait_shared_meta_cache.pop(trait_token_use, None)
                         task_idx += 1
             else:
                 raise RuntimeError(
@@ -8190,7 +8365,7 @@ def _run_gwas_pipeline(
         if has_farmcpu and (not farmcpu_handled_in_trait_loop):
             context_prepared = bool(pheno is not None and ids is not None and n_snps is not None)
             emit_farmcpu_trait_header = len(stream_models) == 0
-            trait_names_full = [str(t) for t in trait_order] if len(trait_order) > 0 else None
+            trait_names_full = list(trait_refs) if len(trait_refs) > 0 else None
             farmcpu_cache_prefill: Union[dict[str, object], None] = None
             def _force_farmcpu_trait_prepared_deferred_load(
                 cache_obj: Union[dict[str, object], None],
@@ -8288,9 +8463,9 @@ def _run_gwas_pipeline(
             if terminal_rich:
                 _phase_split(terminal_logger)
             trait_names_seq = (
-                [str(t) for t in trait_names_full]
+                list(trait_names_full)
                 if trait_names_full is not None
-                else [str(t) for t in trait_order]
+                else list(trait_refs)
             )
             strict_trait_meta_ready = False
             strict_prefix_meta = None
@@ -8374,7 +8549,7 @@ def _run_gwas_pipeline(
                         if emit_trait_header_now:
                             _emit_trait_header(
                                 logger,
-                                trait_name_use,
+                                str(trait_name_use),
                                 int(sample_idx_meta.shape[0]),
                                 pve=None,
                                 use_spinner=bool(use_spinner),
@@ -8425,7 +8600,7 @@ def _run_gwas_pipeline(
                         context_prepared=context_prepared,
                         summary_rows=gwas_summary_rows,
                         saved_paths=saved_result_paths,
-                        trait_names=[str(trait_name_use)],
+                        trait_names=[trait_name_use],
                         farmcpu_cache=farmcpu_cache_runtime,
                         emit_trait_header=bool(emit_trait_header_now),
                         preloaded_packed=preloaded_packed,
@@ -8443,7 +8618,7 @@ def _run_gwas_pipeline(
                     farmcpu_cache_runtime = _force_farmcpu_trait_prepared_deferred_load(
                         farmcpu_cache_runtime,
                     )
-                trait_names_seq = [] if trait_names_full is None else [str(t) for t in trait_names_full]
+                trait_names_seq = [] if trait_names_full is None else list(trait_names_full)
                 for trait_idx_use, trait_name_use in enumerate(trait_names_seq):
                     trait_summary_start = len(gwas_summary_rows)
                     farmcpu_cache_runtime = run_farmcpu_fullmem(
@@ -8460,7 +8635,7 @@ def _run_gwas_pipeline(
                         context_prepared=context_prepared,
                         summary_rows=gwas_summary_rows,
                         saved_paths=saved_result_paths,
-                        trait_names=[str(trait_name_use)],
+                        trait_names=[trait_name_use],
                         farmcpu_cache=farmcpu_cache_runtime,
                         emit_trait_header=bool(emit_farmcpu_trait_header),
                         preloaded_packed=preloaded_packed,

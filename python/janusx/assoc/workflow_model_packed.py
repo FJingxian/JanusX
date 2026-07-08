@@ -76,6 +76,7 @@ from .workflow import (
     _safe_trait_file_label,
     _site_tuple_parts,
     _subset_square_matrix_identity_aware,
+    _trait_single_column_frame,
     _trait_values_and_mask,
     detect_effective_threads,
     format_elapsed,
@@ -3770,7 +3771,7 @@ def run_fvlmm_packed_fullrank(
         t0 = time.time()
         peak_rss = process.memory_info().rss
 
-        y_full, sameidx = _trait_values_and_mask(pheno_aligned, str(pname))
+        y_full, sameidx = _trait_values_and_mask(pheno_aligned, pname)
         keep_idx_nonmissing = np.flatnonzero(sameidx).astype(np.int64, copy=False)
         n_nonmissing = int(keep_idx_nonmissing.shape[0])
         if n_nonmissing == 0:
@@ -4277,7 +4278,7 @@ def run_lm_packed_fullrank(
         t0 = time.time()
         peak_rss = process.memory_info().rss
 
-        y_full, sameidx = _trait_values_and_mask(pheno_aligned, str(pname))
+        y_full, sameidx = _trait_values_and_mask(pheno_aligned, pname)
         keep_idx_nonmissing = np.flatnonzero(sameidx).astype(np.int64, copy=False)
         n_nonmissing = int(keep_idx_nonmissing.shape[0])
         if n_nonmissing == 0:
@@ -4528,7 +4529,7 @@ def run_lm_stream_bed_single_entry(
         t0 = time.time()
         peak_rss = process.memory_info().rss
 
-        y_full, sameidx = _trait_values_and_mask(pheno_aligned, str(pname))
+        y_full, sameidx = _trait_values_and_mask(pheno_aligned, pname)
         keep_idx_nonmissing = np.flatnonzero(sameidx).astype(np.int64, copy=False)
         n_nonmissing = int(keep_idx_nonmissing.shape[0])
         n_missing = int(np.asarray(y_full).shape[0] - n_nonmissing)
@@ -5023,7 +5024,7 @@ def run_lmm_packed_fullrank(
         t0 = time.time()
         peak_rss = process.memory_info().rss
 
-        y_full, sameidx = _trait_values_and_mask(pheno_aligned, str(pname))
+        y_full, sameidx = _trait_values_and_mask(pheno_aligned, pname)
         keep_idx_nonmissing = np.flatnonzero(sameidx).astype(np.int64, copy=False)
         n_nonmissing = int(keep_idx_nonmissing.shape[0])
         if n_nonmissing == 0:
@@ -5129,7 +5130,7 @@ def run_lmm_packed_fullrank(
                     eff_snp_by_trait=eff_snp_by_trait,
                     summary_rows=summary_rows,
                     saved_paths=saved_paths,
-                    trait_names=[str(pname)],
+                    trait_names=[pname],
                     emit_trait_header=False,
                     preloaded_packed=packed_preload_ready,
                     force_model=bool(force_model),
@@ -5495,7 +5496,7 @@ def run_algwas_packed_fullrank(
         t0 = time.time()
         peak_rss = process.memory_info().rss
 
-        y_full, sameidx = _trait_values_and_mask(pheno_aligned, str(pname))
+        y_full, sameidx = _trait_values_and_mask(pheno_aligned, pname)
         keep_idx_nonmissing = np.flatnonzero(sameidx).astype(np.int64, copy=False)
         n_nonmissing = int(keep_idx_nonmissing.shape[0])
         if n_nonmissing == 0:
@@ -6091,7 +6092,7 @@ def run_splmm_windowed_fullrank(
         t0 = time.time()
         peak_rss = process.memory_info().rss
 
-        y_full, sameidx = _trait_values_and_mask(pheno_aligned, str(pname))
+        y_full, sameidx = _trait_values_and_mask(pheno_aligned, pname)
         keep_idx_nonmissing = np.flatnonzero(
             np.asarray(sameidx, dtype=np.bool_) & kinship_present_mask
         ).astype(np.int64, copy=False)
@@ -6225,6 +6226,32 @@ def run_splmm_windowed_fullrank(
                 threads=int(threads),
             )
             return out, max(time.monotonic() - task_t0, 0.0)
+
+        def _run_sparse_raw_lrt_null_fit_task() -> tuple[dict[str, object], float]:
+            task_t0 = time.monotonic()
+            out = _splmm_sparse_null_fit(
+                jxgrm_path=str(trait_sparse_kinship_path),
+                sample_idx=kinship_sample_idx_trait,
+                y_vec=y_vec,
+                x_cov=x_arg,
+                progress_callback=None,
+                residualized_approx=False,
+                objective_mode="raw",
+                threads=int(threads),
+            )
+            return dict(out), max(time.monotonic() - task_t0, 0.0)
+
+        def _trait_has_existing_lm_result() -> bool:
+            pname_label = str(pname)
+            for row in reversed(summary_rows):
+                if str(row.get("phenotype", "")) != pname_label:
+                    continue
+                if str(row.get("model", "")).strip().upper() != "LM":
+                    continue
+                result_file = str(row.get("result_file", "") or "").strip()
+                if result_file == "" or os.path.exists(result_file):
+                    return True
+            return False
 
         if not bool(use_preloaded_scan_meta):
             with cf.ThreadPoolExecutor(max_workers=2, thread_name_prefix="jx-splmm-prepare") as ex:
@@ -6367,10 +6394,20 @@ def run_splmm_windowed_fullrank(
                     use_spinner=False,
                 )
         if null_lambda_boundary in {"low", "high"}:
-            logger.warning(
-                f"Warning: SparseLMM sparse REML optimum for trait {pname} is near the {null_lambda_boundary} "
+            warn_key = (str(pname), str(null_lambda_boundary))
+            warn_cache = getattr(logger, "_janusx_splmm_lambda_boundary_warned", None)
+            if not isinstance(warn_cache, set):
+                warn_cache = set()
+                setattr(logger, "_janusx_splmm_lambda_boundary_warned", warn_cache)
+            warn_msg = (
+                f"Warning: {model_label_norm} sparse REML optimum for trait {pname} is near the {null_lambda_boundary} "
                 f"log10(lambda) search boundary; inspect sparse cutoff or widen the search range."
             )
+            if warn_key not in warn_cache:
+                warn_cache.add(warn_key)
+                logger.warning(warn_msg)
+            else:
+                _log_file_only(logger, logging.WARNING, warn_msg)
         if (
             null_strategy == "sparse_reml_brent"
             and null_n_samples_k > 1
@@ -6385,7 +6422,11 @@ def run_splmm_windowed_fullrank(
                 "Under this sparse positive-kinship model, h2 may be understated and, in more extreme cases, "
                 "LM switch can occur; this is not directly comparable to dense fixed-lambda spectral h2."
             )
-        pheno_trait_subset = pheno_aligned.iloc[keep_idx][[pname]].copy()
+        pheno_trait_subset = _trait_single_column_frame(
+            pheno_aligned,
+            pname,
+            row_indexer=keep_idx,
+        )
         ids_trait_subset = np.asarray(ids[keep_idx], dtype=str)
         if (
             (not bool(force_model))
@@ -6396,14 +6437,14 @@ def run_splmm_windowed_fullrank(
         ):
             prev_pve = float(null_pve) if np.isfinite(null_pve) else float("nan")
             logger.warning(
-                f"Warning: SparseLMM switch to LMM for trait {pname}: "
+                f"Warning: {model_label_norm} switch to LMM for trait {pname}: "
                 f"null PVE={prev_pve:.4f} (>0.995)."
             )
             _log_model_line(
                 logger,
                 "LMM",
                 (
-                    f"switched from SparseLMM null to LMM: "
+                    f"switched from {model_label_norm} null to LMM: "
                     f"PVE(null)={prev_pve:.4f} (>0.995) "
                     f"[{format_elapsed(null_secs)}]"
                 ),
@@ -6437,7 +6478,7 @@ def run_splmm_windowed_fullrank(
                 eff_snp_by_trait=eff_snp_by_trait,
                 summary_rows=summary_rows,
                 saved_paths=saved_paths,
-                trait_names=[str(pname)],
+                trait_names=None,
                 emit_trait_header=False,
                 chunk_size_user_set=True,
                 force_model=bool(force_model),
@@ -6450,6 +6491,33 @@ def run_splmm_windowed_fullrank(
             continue
 
         null_ml0 = null_fit.get("ml", None)
+        if (
+            (not bool(force_model))
+            and (null_ml0 is None or not np.isfinite(float(null_ml0)))
+            and str(null_objective_label).strip().lower() == "fastgwa"
+        ):
+            try:
+                raw_lrt_fit, raw_lrt_secs = _run_sparse_raw_lrt_null_fit_task()
+                raw_ml0 = raw_lrt_fit.get("ml", None)
+                if raw_ml0 is not None and np.isfinite(float(raw_ml0)):
+                    null_ml0 = float(raw_ml0)
+                    _log_file_only(
+                        logger,
+                        logging.INFO,
+                        (
+                            f"{model_label_norm}: supplemental raw sparse null fit for LRT "
+                            f"completed for trait {pname} [{format_elapsed(raw_lrt_secs)}]."
+                        ),
+                    )
+            except Exception as ex:
+                _log_file_only(
+                    logger,
+                    logging.INFO,
+                    (
+                        f"{model_label_norm}: supplemental raw sparse null fit for LRT failed "
+                        f"for trait {pname}; retaining approx route without null LRT. reason={ex}"
+                    ),
+                )
         if (not bool(force_model)) and null_ml0 is not None and np.isfinite(float(null_ml0)):
             switch_to_lm, lrt_stat, lrt_p = _mixed_model_switch_to_lm_decision(
                 y_vec=y_vec,
@@ -6459,50 +6527,74 @@ def run_splmm_windowed_fullrank(
             )
             if switch_to_lm:
                 logger.warning(
-                    f"Warning: SparseLMM switch to LM for trait {pname}: "
+                    f"Warning: {model_label_norm} switch to LM for trait {pname}: "
                     f"null LRT stat={float(lrt_stat):.4g}, p={float(lrt_p):.4g} (>=0.05)."
                 )
                 _log_model_line(
                     logger,
                     "LM",
                     (
-                        f"switched from SparseLMM null to LM "
+                        f"switched from {model_label_norm} null to LM "
                         f"(LRT stat={float(lrt_stat):.4g}, p={float(lrt_p):.4g}) "
                         f"[{format_elapsed(null_secs)}]"
                     ),
                     use_spinner=bool(use_spinner),
                 )
                 _stop_prepare_handle()
-                run_lm_stream_bed_single_entry(
-                    genofile=genofile,
-                    pheno=pheno_trait_subset,
-                    ids=ids_trait_subset,
-                    n_snps=int(n_scan_sites_hint),
-                    outprefix=outprefix,
-                    maf_threshold=maf_threshold,
-                    max_missing_rate=max_missing_rate,
-                    genetic_model=genetic_model,
-                    het_threshold=het_threshold,
-                    chunk_size=chunk_size,
-                    qmatrix=qmatrix[keep_idx],
-                    cov_all=(None if cov_all is None else np.ascontiguousarray(cov_all[keep_idx], dtype=np.float64)),
-                    plot=plot,
-                    threads=threads,
-                    logger=logger,
-                    use_spinner=use_spinner,
-                    snps_only=bool(snps_only),
-                    eff_snp_by_trait=eff_snp_by_trait,
-                    summary_rows=summary_rows,
-                    saved_paths=saved_paths,
-                    trait_names=[str(pname)],
-                    emit_trait_header=False,
-                )
+                if _trait_has_existing_lm_result():
+                    _log_file_only(
+                        logger,
+                        logging.INFO,
+                        f"LM: reusing prior LM result for trait {pname} after {model_label_norm} fallback.",
+                    )
+                else:
+                    run_lm_stream_bed_single_entry(
+                        genofile=genofile,
+                        pheno=pheno_trait_subset,
+                        ids=ids_trait_subset,
+                        n_snps=int(n_scan_sites_hint),
+                        outprefix=outprefix,
+                        maf_threshold=maf_threshold,
+                        max_missing_rate=max_missing_rate,
+                        genetic_model=genetic_model,
+                        het_threshold=het_threshold,
+                        chunk_size=chunk_size,
+                        qmatrix=qmatrix[keep_idx],
+                        cov_all=(None if cov_all is None else np.ascontiguousarray(cov_all[keep_idx], dtype=np.float64)),
+                        plot=plot,
+                        threads=threads,
+                        logger=logger,
+                        use_spinner=use_spinner,
+                        snps_only=bool(snps_only),
+                        eff_snp_by_trait=eff_snp_by_trait,
+                        summary_rows=summary_rows,
+                        saved_paths=saved_paths,
+                        trait_names=None,
+                        emit_trait_header=False,
+                    )
                 if multi_trait_mode:
                     logger.info("")
                 scan_meta = None
                 null_fit = None
                 _stop_prepare_handle()
                 continue
+            _log_file_only(
+                logger,
+                logging.INFO,
+                (
+                    f"{model_label_norm}: null LRT retained {model_label_norm} "
+                    f"for trait {pname} (stat={float(lrt_stat):.4g}, p={float(lrt_p):.4g})."
+                ),
+            )
+        elif not bool(force_model):
+            _log_file_only(
+                logger,
+                logging.INFO,
+                (
+                    f"{model_label_norm}: null LRT skipped for trait {pname} "
+                    "because sparse null ML log-likelihood was unavailable or non-finite."
+                ),
+            )
 
         for _buf_key in ("grm", "eigvals", "eigvecs"):
             null_fit.pop(_buf_key, None)

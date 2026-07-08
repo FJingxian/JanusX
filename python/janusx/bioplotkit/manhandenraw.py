@@ -6,8 +6,8 @@ from functools import lru_cache
 from scipy.stats import beta
 
 _PVALUE_EPS = float(np.nextafter(0.0, 1.0))
-_QQ_SAMPLE_MAX_POINTS = 50_000
-_QQ_BAND_MAX_POINTS = 512
+_QQ_SAMPLE_MAX_POINTS = 120_000
+_QQ_BAND_MAX_POINTS = 20_000
 
 
 def ppoints(n)->np.ndarray:
@@ -67,7 +67,7 @@ def _qq_confidence_band_logp(
     rank_max: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     n = int(max(1, int(n_total)))
-    limit = _QQ_BAND_MAX_POINTS if max_points is None else int(max(1, int(max_points)))
+    limit = n if max_points is None else int(max(1, int(max_points)))
     rank_cap = None if rank_max is None else int(max(1, min(int(rank_max), n)))
     return _qq_confidence_band_logp_cached(n, float(ci), limit, rank_cap)
 
@@ -84,37 +84,18 @@ def _qq_sample_draw_indices_cached(
         arr.setflags(write=False)
         return arr
 
-    head_n = keep_n // 2
-    head_n = max(1, min(head_n, keep_n, n_total))
-    head_idx = np.arange(head_n, dtype=np.int64)
-    tail_need = max(0, keep_n - head_n)
-
-    if tail_need <= 0 or head_n >= n_total:
-        arr = head_idx[:keep_n]
-        arr.setflags(write=False)
-        return arr
-
-    tail_idx = np.unique(
-        np.round(
-            np.geomspace(float(head_n), float(n_total - 1), num=int(max(2, tail_need + 1)))
-        ).astype(np.int64)
-    )
-    tail_idx = tail_idx[(tail_idx >= head_n) & (tail_idx < n_total)]
-    if tail_idx.size == 0 or tail_idx[-1] != n_total - 1:
-        tail_idx = np.append(tail_idx, n_total - 1)
-    if tail_idx.size > tail_need:
-        select = np.linspace(0, tail_idx.size - 1, num=tail_need, dtype=np.int64)
-        tail_idx = tail_idx[np.unique(select)]
-
-    arr = np.unique(np.concatenate([head_idx, tail_idx])).astype(np.int64, copy=False)
-    if arr.size > keep_n:
-        arr = arr[:keep_n]
-    elif arr.size < keep_n:
+    arr = np.linspace(0, n_total - 1, num=keep_n, dtype=np.int64)
+    arr = np.unique(arr.astype(np.int64, copy=False))
+    if arr.size < keep_n:
+        fill_pool = np.setdiff1d(np.arange(n_total, dtype=np.int64), arr, assume_unique=True)
         fill_need = keep_n - arr.size
-        fill_idx = np.linspace(head_n, n_total - 1, num=fill_need + 2, dtype=np.int64)[1:-1]
-        arr = np.unique(np.concatenate([arr, fill_idx])).astype(np.int64, copy=False)
-        if arr.size > keep_n:
-            arr = arr[:keep_n]
+        if fill_pool.size > fill_need:
+            fill_take = np.linspace(0, fill_pool.size - 1, num=fill_need, dtype=np.int64)
+            fill_pool = fill_pool[fill_take]
+        arr = np.sort(np.concatenate([arr, fill_pool[:fill_need]])).astype(np.int64, copy=False)
+    elif arr.size > keep_n:
+        take = np.linspace(0, arr.size - 1, num=keep_n, dtype=np.int64)
+        arr = arr[np.unique(take)]
     arr.setflags(write=False)
     return arr
 
@@ -186,17 +167,17 @@ class GWASPLOT:
             ax = fig.add_subplot(gs[0:12,0])
         p = df['y'].dropna()
         n = len(p)
-        p_sorted = np.sort(np.asarray(p, dtype=np.float64))
+        p_sorted = np.sort(np.clip(np.asarray(p, dtype=np.float64), _PVALUE_EPS, 1.0))
         draw_idx = _qq_sample_draw_indices(n)
-        o = -np.log10(p_sorted[draw_idx])
-        e_theoretical = -np.log10((draw_idx.astype(np.float64) + 1.0) / (n + 1.0))
+        obs_scatter = -np.log10(p_sorted[draw_idx])
+        exp_scatter = -np.log10((draw_idx.astype(np.float64) + 1.0) / (n + 1.0))
         if model is not None:
-            e_theoretical, lower, upper = _qq_confidence_band_logp(n, ci=ci)
+            x_band, lower, upper = _qq_confidence_band_logp(n, ci=ci)
             # 绘制置信区间
-            ax.fill_between(e_theoretical, lower, upper, color='grey', alpha=0.4)
+            ax.fill_between(x_band, lower, upper, color='grey', alpha=0.4)
         # 绘制理论线（y=x）和观测点
-        ax.plot([0, min(o.max(),e_theoretical.max())], [0, min(o.max(),e_theoretical.max())], lw=1,)
-        ax.scatter(e_theoretical, o, s=1, alpha=0.6,rasterized=True)
+        ax.plot([0, min(obs_scatter.max(),exp_scatter.max())], [0, min(obs_scatter.max(),exp_scatter.max())], lw=1,)
+        ax.scatter(exp_scatter, obs_scatter, s=1, alpha=0.6,rasterized=True)
         ax.set_xlabel(r'Expected -log$_\mathdefault{10}$(p-value)')
         ax.set_ylabel(r'Observed -log$_\mathdefault{10}$(p-value)')
         return ax

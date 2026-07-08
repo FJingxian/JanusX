@@ -42,13 +42,10 @@ _GWAS_MODEL_LABELS = {
     "ALGWAS",
     "FarmCPU",
 }
-_FASTPLOT_FIGSIZE = (14.0, 3.4)
-_FASTPLOT_DPI = 180
-_FASTPLOT_SCATTER_SIZE = 5.0
-_FASTPLOT_HIST_BINS = 12
-_FASTPLOT_MANH_TARGET_POINTS = 60_000
-_FASTPLOT_QQ_FAST_MAX_POINTS = 1_024
-_FASTPLOT_QQ_BAND_MAX_POINTS = 256
+_FASTPLOT_FIGSIZE = (16.0, 4.0)
+_FASTPLOT_DPI = 300
+_FASTPLOT_SCATTER_SIZE = 8.0
+_FASTPLOT_HIST_BINS = 15
 
 
 def _histogram_kde_count_curve(
@@ -103,160 +100,6 @@ def _histogram_kde_count_curve(
 
     y_count = density * float(vals.size) * bin_width
     return x_grid, y_count
-
-
-def _fastplot_sanitize_pvalues(values) -> np.ndarray:
-    arr = pd.to_numeric(values, errors="coerce")
-    if isinstance(arr, pd.Series):
-        out = arr.to_numpy(dtype=np.float64, copy=False)
-    else:
-        out = np.asarray(arr, dtype=np.float64)
-    out = np.array(out, dtype=np.float64, copy=True).reshape(-1)
-    out[~np.isfinite(out)] = 1.0
-    return np.clip(out, np.nextafter(0.0, 1.0), 1.0)
-
-
-def _fastplot_downsample_results(
-    gwasresult: pd.DataFrame,
-    *,
-    p_col: str = "pwald",
-    target_points: int = _FASTPLOT_MANH_TARGET_POINTS,
-) -> pd.DataFrame:
-    n = int(gwasresult.shape[0])
-    target = int(max(1, target_points))
-    if n <= target:
-        return gwasresult
-
-    pvals = _fastplot_sanitize_pvalues(gwasresult[p_col])
-    sig_thresh = 10_000.0 / float(max(1, n))
-    sig_idx = np.flatnonzero(pvals <= sig_thresh)
-    nonsig_idx = np.flatnonzero(pvals > sig_thresh)
-
-    if sig_idx.size >= target or nonsig_idx.size == 0:
-        keep_idx = sig_idx if sig_idx.size > 0 else np.arange(0, n, max(1, n // target), dtype=np.int64)
-        return gwasresult.iloc[np.sort(np.unique(keep_idx[:target]))]
-
-    nonsig_budget = max(1, target - int(sig_idx.size))
-    step = max(1, int(np.ceil(float(nonsig_idx.size) / float(nonsig_budget))))
-    sample_idx = nonsig_idx[::step]
-    if sample_idx.size == 0 or sample_idx[-1] != nonsig_idx[-1]:
-        sample_idx = np.append(sample_idx, nonsig_idx[-1])
-    if sample_idx.size > nonsig_budget:
-        step2 = max(1, int(np.ceil(float(sample_idx.size) / float(nonsig_budget))))
-        sample_idx = sample_idx[::step2]
-        if sample_idx[-1] != nonsig_idx[-1]:
-            sample_idx = np.append(sample_idx, nonsig_idx[-1])
-
-    keep_idx = np.sort(np.unique(np.concatenate([sig_idx, sample_idx]).astype(np.int64, copy=False)))
-    return gwasresult.iloc[keep_idx]
-
-
-def _fastplot_draw_qq(
-    ax: plt.Axes,
-    pvalues,
-    *,
-    scatter_size: float,
-    axis_min: float,
-    qq_fast_max_points: int = _FASTPLOT_QQ_FAST_MAX_POINTS,
-    qq_band_max_points: int = _FASTPLOT_QQ_BAND_MAX_POINTS,
-) -> None:
-    from janusx.bioplotkit.manhanden import (
-        _marker_scatter_style,
-        _qq_confidence_band_logp,
-        _qq_sample_draw_indices,
-    )
-
-    p = _fastplot_sanitize_pvalues(pvalues)
-    n = int(p.size)
-    if n <= 0:
-        raise ValueError("No p-values found for QQ plot.")
-
-    if np.isfinite(float(axis_min)) and float(axis_min) > 0.0:
-        visible_rank_cap = int(np.floor((n + 1.0) * (10.0 ** (-float(axis_min)))))
-        visible_rank_cap = max(1, min(n, visible_rank_cap))
-    else:
-        visible_rank_cap = n
-
-    draw_idx = _qq_sample_draw_indices(
-        visible_rank_cap,
-        max_points=int(max(1, qq_fast_max_points)),
-    )
-    draw_idx = np.asarray(draw_idx, dtype=np.int64).reshape(-1)
-    draw_idx_asc = np.sort(draw_idx)
-    if draw_idx_asc.size == visible_rank_cap:
-        p_ordered = np.sort(p, kind="mergesort")
-    else:
-        p_ordered = np.array(p, dtype=np.float64, copy=True)
-        p_ordered.partition(draw_idx_asc)
-    p_draw = p_ordered[draw_idx]
-    ranks_draw = draw_idx.astype(np.float64) + 1.0
-    obs_scatter = -np.log10(p_draw)
-    exp_scatter = -np.log10(ranks_draw / (n + 1.0))
-
-    x_band, lower, upper = _qq_confidence_band_logp(
-        n,
-        ci=95,
-        max_points=int(max(1, qq_band_max_points)),
-        rank_max=visible_rank_cap,
-    )
-    band_mask = np.isfinite(x_band) & np.isfinite(lower) & np.isfinite(upper)
-    if np.any(band_mask):
-        ax.fill_between(
-            x_band[band_mask],
-            lower[band_mask],
-            upper[band_mask],
-            color="grey",
-            alpha=0.3,
-            rasterized=True,
-        )
-
-    finite_obs = obs_scatter[np.isfinite(obs_scatter)]
-    finite_exp = exp_scatter[np.isfinite(exp_scatter)]
-    if finite_obs.size == 0 or finite_exp.size == 0:
-        max_lim = 1.0
-    else:
-        max_lim = float(min(np.max(finite_obs), np.max(finite_exp)))
-        if not np.isfinite(max_lim) or max_lim <= 0.0:
-            max_lim = 1.0
-    ax.plot([0.0, max_lim], [0.0, max_lim], lw=1, color="black")
-
-    scatter_mask = np.isfinite(exp_scatter) & np.isfinite(obs_scatter)
-    ax.scatter(
-        exp_scatter[scatter_mask],
-        obs_scatter[scatter_mask],
-        marker="o",
-        s=float(scatter_size),
-        alpha=0.75,
-        rasterized=True,
-        color="black",
-        **_marker_scatter_style("o"),
-    )
-
-    x0, x1 = ax.get_xlim()
-    y0, y1 = ax.get_ylim()
-    x_data_min = 0.0
-    x_data_max = float(max_lim)
-    if scatter_mask.any():
-        exp_valid = exp_scatter[scatter_mask]
-        exp_valid = exp_valid[np.isfinite(exp_valid)]
-        if exp_valid.size > 0:
-            x_data_min = min(x_data_min, float(np.min(exp_valid)))
-            x_data_max = max(x_data_max, float(np.max(exp_valid)))
-    if np.any(band_mask):
-        x_band_valid = x_band[band_mask]
-        x_band_valid = x_band_valid[np.isfinite(x_band_valid)]
-        if x_band_valid.size > 0:
-            x_data_min = min(x_data_min, float(np.min(x_band_valid)))
-            x_data_max = max(x_data_max, float(np.max(x_band_valid)))
-    if np.isfinite([x0, x1, y0, y1]).all():
-        lo = float(axis_min) if np.isfinite(float(axis_min)) else x_data_min
-        x_hi = float(x1) if float(x1) > lo else (lo + 1.0)
-        y_hi = float(y1) if float(y1) > lo else (lo + 1.0)
-        ax.set_xlim(lo, x_hi)
-        ax.set_ylim(lo, y_hi)
-
-    ax.set_xlabel("Expected -log10(p-value)")
-    ax.set_ylabel("Observed -log10(p-value)")
 
 
 def _logger_flag(logger: Optional[logging.Logger], name: str, default: bool = False) -> bool:
@@ -613,12 +456,11 @@ def fastplot(
     """
     Generate diagnostic plots for GWAS results: phenotype histogram, Manhattan, and QQ.
     """
-    mpl.rcParams["font.size"] = 11
+    mpl.rcParams["font.size"] = 12
     results = gwasresult
     if "pos" in results.columns and not pd.api.types.is_integer_dtype(results["pos"]):
         results = results.copy()
         results["pos"] = pd.to_numeric(results["pos"], errors="coerce").fillna(0).astype(np.int64)
-    plot_results = _fastplot_downsample_results(results)
     fig = plt.figure(figsize=_FASTPLOT_FIGSIZE, dpi=_FASTPLOT_DPI)
     try:
         layout = [["A", "B", "B", "C"]]
@@ -626,7 +468,7 @@ def fastplot(
 
         from janusx.bioplotkit import GWASPLOT, apply_integer_yticks
 
-        gwasplot = GWASPLOT(plot_results)
+        gwasplot = GWASPLOT(results)
         scatter_size = _FASTPLOT_SCATTER_SIZE
 
         # A: phenotype distribution
@@ -684,13 +526,10 @@ def fastplot(
 
         # C: QQ plot
         manh_ymin, manh_ymax = axes["B"].get_ylim()
-        _fastplot_draw_qq(
+        gwasplot.qq(
             ax=axes["C"],
-            pvalues=results["pwald"],
             scatter_size=scatter_size,
             axis_min=float(manh_ymin),
-            qq_fast_max_points=_FASTPLOT_QQ_FAST_MAX_POINTS,
-            qq_band_max_points=_FASTPLOT_QQ_BAND_MAX_POINTS,
         )
 
         # Align QQ with Manhattan:
@@ -711,13 +550,7 @@ def fastplot(
             axes["C"].set_xlim(qq_left, qq_left + 1.0)
         apply_integer_yticks(axes["C"], ticks=manh_yticks)
 
-        fig.subplots_adjust(
-            left=0.055,
-            right=0.995,
-            bottom=0.23,
-            top=0.94,
-            wspace=0.26,
-        )
+        fig.tight_layout()
         fig.savefig(outpdf, transparent=False, facecolor="white")
     finally:
         plt.close(fig)

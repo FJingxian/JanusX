@@ -10,10 +10,9 @@ from scipy.stats import beta
 from janusx.gtools.cleaner import chrom_sort_key
 
 _PVALUE_EPS = float(np.nextafter(0.0, 1.0))
-_QQ_SAMPLE_TRIGGER = 20_000
-_QQ_SAMPLE_KEEP_HEAD = 25_000
-_QQ_SAMPLE_MAX_POINTS = 50_000
-_QQ_BAND_MAX_POINTS = 512
+_QQ_SAMPLE_TRIGGER = 1_000_000
+_QQ_SAMPLE_MAX_POINTS = 120_000
+_QQ_BAND_MAX_POINTS = 20_000
 
 
 def ppoints(n: int) -> np.ndarray:
@@ -99,7 +98,7 @@ def _qq_confidence_band_logp(
     rank_max: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     n = int(max(1, int(n_total)))
-    limit = _QQ_BAND_MAX_POINTS if max_points is None else int(max(1, int(max_points)))
+    limit = n if max_points is None else int(max(1, int(max_points)))
     rank_cap = None if rank_max is None else int(max(1, min(int(rank_max), n)))
     return _qq_confidence_band_logp_cached(n, float(ci), limit, rank_cap)
 
@@ -116,36 +115,18 @@ def _qq_sample_draw_indices_cached(
         arr.setflags(write=False)
         return arr
 
-    keep_head = min(n_total, keep_n, int(_QQ_SAMPLE_KEEP_HEAD))
-    head_idx = np.arange(keep_head, dtype=np.int64)
-    tail_need = max(0, keep_n - keep_head)
-
-    if tail_need <= 0 or keep_head >= n_total:
-        arr = head_idx[:keep_n]
-        arr.setflags(write=False)
-        return arr
-
-    tail_idx = np.unique(
-        np.round(
-            np.geomspace(float(keep_head), float(n_total - 1), num=int(max(2, tail_need + 1)))
-        ).astype(np.int64)
-    )
-    tail_idx = tail_idx[(tail_idx >= keep_head) & (tail_idx < n_total)]
-    if tail_idx.size == 0 or tail_idx[-1] != n_total - 1:
-        tail_idx = np.append(tail_idx, n_total - 1)
-    if tail_idx.size > tail_need:
-        select = np.linspace(0, tail_idx.size - 1, num=tail_need, dtype=np.int64)
-        tail_idx = tail_idx[np.unique(select)]
-
-    arr = np.unique(np.concatenate([head_idx, tail_idx])).astype(np.int64, copy=False)
-    if arr.size > keep_n:
-        arr = arr[:keep_n]
-    elif arr.size < keep_n:
+    arr = np.linspace(0, n_total - 1, num=keep_n, dtype=np.int64)
+    arr = np.unique(arr.astype(np.int64, copy=False))
+    if arr.size < keep_n:
+        fill_pool = np.setdiff1d(np.arange(n_total, dtype=np.int64), arr, assume_unique=True)
         fill_need = keep_n - arr.size
-        fill_idx = np.linspace(keep_head, n_total - 1, num=fill_need + 2, dtype=np.int64)[1:-1]
-        arr = np.unique(np.concatenate([arr, fill_idx])).astype(np.int64, copy=False)
-        if arr.size > keep_n:
-            arr = arr[:keep_n]
+        if fill_pool.size > fill_need:
+            fill_take = np.linspace(0, fill_pool.size - 1, num=fill_need, dtype=np.int64)
+            fill_pool = fill_pool[fill_take]
+        arr = np.sort(np.concatenate([arr, fill_pool[:fill_need]])).astype(np.int64, copy=False)
+    elif arr.size > keep_n:
+        take = np.linspace(0, arr.size - 1, num=keep_n, dtype=np.int64)
+        arr = arr[np.unique(take)]
     arr.setflags(write=False)
     return arr
 
@@ -695,16 +676,16 @@ class GWASPLOT:
             - auto: use fast mode when SNP count > qq_auto_threshold
             - full: full-rank QQ using all SNPs (exact)
             - fast: rank-grid approximation from full QQ (deterministic)
-        qq_auto_threshold : int, default 20_000
+        qq_auto_threshold : int, default 1_000_000
             Threshold used when qq_mode="auto".
-        qq_fast_max_points : int, default 50_000
+        qq_fast_max_points : int, default 120_000
             Max points in fast-mode QQ scatter.
-        qq_band_max_points : int or None, default 512
-            Max points used for the exact confidence band (both modes).
-            Band sampling keeps only a small exact head and log-samples the
-            remaining ranks so multi-million-SNP QQ plots stay responsive.
+        qq_band_max_points : int or None, default 20_000
+            Max points used for confidence band (both modes).
+            If None, use all ranks.
         sig_p_threshold : float or None, default None
-            Reserved for backward compatibility with older QQ APIs.
+            Significance threshold to always preserve in QQ scatter.
+            If None, Bonferroni-like threshold 1/n is used.
         axis_min : float or None, default None
             If provided, force both QQ axis lower bounds (x/y) to this value.
         axis_max : float or None, default None
@@ -742,6 +723,13 @@ class GWASPLOT:
             raise ValueError("No p-values found for QQ plot.")
         p[~np.isfinite(p)] = 1.0
         p = np.clip(p, np.finfo(np.float64).tiny, 1.0)
+        if sig_p_threshold is None:
+            sig_thr = 1.0 / float(n)
+        else:
+            sig_thr = float(sig_p_threshold)
+        if not np.isfinite(sig_thr):
+            sig_thr = 1.0 / float(n)
+        sig_thr = float(np.clip(sig_thr, np.finfo(np.float64).tiny, 1.0))
 
         resolved_mode = mode_key
         if mode_key == "auto":
@@ -749,13 +737,24 @@ class GWASPLOT:
 
         # Full sorted p-values are the canonical QQ backbone.
         p_sorted = np.sort(p, kind="mergesort")
+        sig_n = int(np.searchsorted(p_sorted, sig_thr, side="right"))
 
         if resolved_mode == "full":
             # Exact QQ: all SNPs
             draw_idx = np.arange(n, dtype=np.int64)
         else:
-            # Non-full QQ keeps the first 25k ranks and log-samples the rest.
-            draw_idx = _qq_sample_draw_indices(n, max_points=qq_fast_max_points)
+            # Fast QQ uses a dense linear-rank grid and always preserves the
+            # most significant tail to avoid visible gaps near the top.
+            max_points = int(max(1, qq_fast_max_points))
+            if n > max_points:
+                base_idx = _qq_sample_draw_indices(n, max_points=max_points)
+                if sig_n > 0:
+                    sig_idx = np.arange(sig_n, dtype=np.int64)
+                    draw_idx = np.unique(np.concatenate([base_idx, sig_idx]))
+                else:
+                    draw_idx = base_idx
+            else:
+                draw_idx = np.arange(n, dtype=np.int64)
 
         p_draw = p_sorted[draw_idx]
         ranks_draw = draw_idx.astype(np.float64) + 1.0

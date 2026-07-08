@@ -1124,6 +1124,7 @@ def run_gwas_suite(paths: dict[str, Path], outdir: Path, logdir: Path, *, thread
             "-lm",
             "-fvlmm",
             "-splmm",
+            "-splmm-exact",
             "-k",
             str(grm_k),
             "-c",
@@ -1134,6 +1135,34 @@ def run_gwas_suite(paths: dict[str, Path], outdir: Path, logdir: Path, *, thread
             str(threads),
             "-o",
             str(outdir),
+        ]
+    )
+    run(
+        [
+            "jx",
+            "gwas",
+            "-bfile",
+            str(sim_prefix),
+            "-p",
+            str(pheno_txt),
+            "-farmcpu",
+            "-lmm",
+            "-lmm2",
+            "-lm",
+            "-fvlmm",
+            "-splmm",
+            "-splmm-exact",
+            "-k",
+            str(grm_k),
+            "-c",
+            str(sim_prefix.with_suffix(".eigenvec")),
+            "-n",
+            TRAIT_NAME,
+            "-t",
+            str(threads),
+            "-o",
+            str(outdir),
+            "-force-model",
         ]
     )
     gwas_files = find_gwas_tsv_files(outdir, SIM_PREFIX_NAME)

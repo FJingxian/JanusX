@@ -246,9 +246,8 @@ impl MmapSparseGrmCsc {
         F: FnMut(usize, usize) -> Result<(), String>,
     {
         let resolved_path = resolve_sparse_grm_input_path(path)?;
-        let file = File::open(&resolved_path).map_err(|e| {
-            format!("failed to open sparse GRM CSC file {resolved_path}: {e}")
-        })?;
+        let file = File::open(&resolved_path)
+            .map_err(|e| format!("failed to open sparse GRM CSC file {resolved_path}: {e}"))?;
         let file_meta = file
             .metadata()
             .map_err(|e| format!("failed to read sparse GRM CSC metadata {resolved_path}: {e}"))?;

@@ -146,6 +146,7 @@ from janusx.script._common.memory import (
 from janusx.script._common.threads import (
     apply_outer_thread_cap,
     detect_effective_threads,
+    detect_rust_blas_backend,
     detect_thread_budget_info,
     format_affinity_cpu_summary,
     format_requested_thread_usage,
@@ -4997,8 +4998,12 @@ def _resolve_fvlmm_scan_stage_mode() -> str:
         return "full"
     if raw in {"generic", "scan", "blas_1_rayon_t"}:
         return "generic"
-    # Keep legacy behavior as the initial default so we can benchmark apples-to-apples
-    # and only flip the default after validating on real workloads.
+    # Backend-aware default:
+    # - OpenBLAS keeps the outer scan stage conservative; the Rust kernel still
+    #   applies its own backend-specific inner scheduling.
+    # - Accelerate and other backends keep the legacy full mode by default.
+    if str(detect_rust_blas_backend()).strip().lower() == "openblas":
+        return "generic"
     return "full"
 
 

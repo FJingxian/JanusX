@@ -542,8 +542,12 @@ fn gcta_import_output_is_fresh(paths: &GctaSparseImportPaths) -> bool {
 }
 
 fn gcta_sparse_id_count(id_path: &Path) -> Result<usize, String> {
-    let file = File::open(id_path)
-        .map_err(|e| format!("failed to open GCTA sparse GRM id file {}: {e}", id_path.display()))?;
+    let file = File::open(id_path).map_err(|e| {
+        format!(
+            "failed to open GCTA sparse GRM id file {}: {e}",
+            id_path.display()
+        )
+    })?;
     let reader = BufReader::new(file);
     let mut n = 0usize;
     for line in reader.lines() {
@@ -558,7 +562,10 @@ fn gcta_sparse_id_count(id_path: &Path) -> Result<usize, String> {
         }
     }
     if n == 0 {
-        return Err(format!("empty GCTA sparse GRM id file: {}", id_path.display()));
+        return Err(format!(
+            "empty GCTA sparse GRM id file: {}",
+            id_path.display()
+        ));
     }
     Ok(n)
 }
@@ -1213,10 +1220,7 @@ fn spgrm_batch_max_accum_bytes(sample_step: usize, threads: usize) -> usize {
         .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|&v| v > 0)
     {
-        return mb
-            .saturating_mul(1024)
-            .saturating_mul(1024)
-            .max(cell_bytes);
+        return mb.saturating_mul(1024).saturating_mul(1024).max(cell_bytes);
     }
     let tile_bytes = sample_step
         .saturating_mul(sample_step)
@@ -2837,7 +2841,11 @@ fn spgrm_merge_row_major_tmp_f32_into_f64(
 ) {
     if is_first_block {
         for row in 0..n_row {
-            let col_end = if lower_only { (row + 1).min(n_col) } else { n_col };
+            let col_end = if lower_only {
+                (row + 1).min(n_col)
+            } else {
+                n_col
+            };
             for col in 0..col_end {
                 let idx = row * n_col + col;
                 accum_f64[idx] = tmp_f32[idx] as f64;
@@ -2845,7 +2853,11 @@ fn spgrm_merge_row_major_tmp_f32_into_f64(
         }
     } else {
         for row in 0..n_row {
-            let col_end = if lower_only { (row + 1).min(n_col) } else { n_col };
+            let col_end = if lower_only {
+                (row + 1).min(n_col)
+            } else {
+                n_col
+            };
             for col in 0..col_end {
                 let idx = row * n_col + col;
                 accum_f64[idx] += tmp_f32[idx] as f64;
@@ -2867,23 +2879,8 @@ fn pair_block_accumulate_sgemm_tmp_into_f64(
 ) {
     let tmp = &mut tmp_f32[..n_left.saturating_mul(n_right)];
     tmp.fill(0.0_f32);
-    pair_block_accumulate_sgemm(
-        left_f32,
-        right_f32,
-        rows,
-        n_left,
-        n_right,
-        tmp,
-        0.0_f32,
-    );
-    spgrm_merge_col_major_tmp_f32_into_f64(
-        accum_f64,
-        tmp,
-        n_left,
-        n_right,
-        false,
-        is_first_block,
-    );
+    pair_block_accumulate_sgemm(left_f32, right_f32, rows, n_left, n_right, tmp, 0.0_f32);
+    spgrm_merge_col_major_tmp_f32_into_f64(accum_f64, tmp, n_left, n_right, false, is_first_block);
 }
 
 #[inline]

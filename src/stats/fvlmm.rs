@@ -27,7 +27,8 @@ use crate::assoc2tsv::{
 };
 use crate::bedmath::packed_row_missing_count_selected;
 use crate::blas::{
-    cblas_sgemm_dispatch, BlasThreadGuard, CblasInt, CBLAS_NO_TRANS, CBLAS_ROW_MAJOR, CBLAS_TRANS,
+    cblas_sgemm_dispatch, rust_sgemm_backend_tag, BlasThreadGuard, CblasInt, CBLAS_NO_TRANS,
+    CBLAS_ROW_MAJOR, CBLAS_TRANS,
 };
 use crate::brent::brent_minimize;
 use crate::decode::{
@@ -671,6 +672,78 @@ fn elapsed_nanos_since(t0: Instant) -> u64 {
     t0.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
 }
 
+#[inline]
+fn normalize_default_assoc_threads_for_backend(
+    backend_tag: &str,
+    proj_threads: usize,
+    assoc_threads: usize,
+) -> usize {
+    let proj = proj_threads.max(1);
+    let assoc = assoc_threads.max(1);
+    if backend_tag == "openblas" {
+        assoc.min(proj)
+    } else {
+        assoc
+    }
+}
+
+#[inline]
+fn rotate_finalize_pipeline_default_for_backend(
+    backend_tag: &str,
+    prefers_rayon_rotate: bool,
+    block_rows: usize,
+    total_rows: usize,
+    proj_threads: usize,
+    assoc_threads: usize,
+) -> bool {
+    if backend_tag == "openblas" {
+        return false;
+    }
+    !prefers_rayon_rotate && block_rows < total_rows && assoc_threads > 1 && proj_threads > 1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        normalize_default_assoc_threads_for_backend, rotate_finalize_pipeline_default_for_backend,
+    };
+
+    #[test]
+    fn openblas_caps_default_assoc_threads_to_proj_threads() {
+        assert_eq!(
+            normalize_default_assoc_threads_for_backend("openblas", 1, 8),
+            1
+        );
+        assert_eq!(
+            normalize_default_assoc_threads_for_backend("openblas", 8, 8),
+            8
+        );
+    }
+
+    #[test]
+    fn non_openblas_keeps_default_assoc_threads() {
+        assert_eq!(
+            normalize_default_assoc_threads_for_backend("accelerate", 1, 8),
+            8
+        );
+    }
+
+    #[test]
+    fn openblas_disables_rotate_finalize_pipeline_by_default() {
+        assert!(!rotate_finalize_pipeline_default_for_backend(
+            "openblas", false, 8192, 1_000_000, 8, 8
+        ));
+        assert!(rotate_finalize_pipeline_default_for_backend(
+            "accelerate",
+            false,
+            8192,
+            1_000_000,
+            8,
+            8,
+        ));
+    }
+}
+
 struct FvlmmChunkProfileStats {
     calls: AtomicU64,
     rows: AtomicU64,
@@ -1204,10 +1277,16 @@ fn stage_proj_threads_or(requested_threads: usize) -> usize {
 }
 
 #[inline]
-fn stage_assoc_threads_or(requested_threads: usize) -> usize {
-    env_positive_usize("JX_FVLMM_ASSOC_THREADS")
-        .or_else(|| env_positive_usize("JX_MLM_RUST_THREADS"))
-        .unwrap_or(requested_threads)
+fn stage_assoc_threads_or(requested_threads: usize, proj_threads: usize) -> usize {
+    if let Some(explicit) = env_positive_usize("JX_FVLMM_ASSOC_THREADS") {
+        return explicit;
+    }
+    let default_threads = env_positive_usize("JX_MLM_RUST_THREADS").unwrap_or(requested_threads);
+    normalize_default_assoc_threads_for_backend(
+        rust_sgemm_backend_tag(),
+        proj_threads,
+        default_threads,
+    )
 }
 
 fn build_u_t_sub_from_sample_idx(
@@ -1631,7 +1710,7 @@ fn fvlmm_assoc_chunk_with_cache_impl<'py>(
         Ok(slc) => Cow::Borrowed(slc),
         Err(_) => Cow::Owned(g_arr.iter().copied().collect()),
     };
-    let assoc_threads = stage_assoc_threads_or(threads);
+    let assoc_threads = stage_assoc_threads_or(threads, threads);
     let pool = get_cached_pool(assoc_threads)?;
 
     py.detach(move || {
@@ -1792,17 +1871,19 @@ pub fn fvlmm_assoc_chunk_from_snp_with_cache_f32<'py>(
     };
 
     let proj_threads = stage_proj_threads_or(threads);
-    let assoc_threads = stage_assoc_threads_or(threads);
+    let assoc_threads = stage_assoc_threads_or(threads, proj_threads);
     let proj_pool = get_cached_pool(proj_threads)?;
     let assoc_pool = get_cached_pool(assoc_threads)?;
     let block_rows = rotate_block_rows.max(1);
     let cache_arc = Arc::clone(&cache.cache);
-    let use_pipeline = use_rotate_finalize_pipeline(
-        !assoc_rotate_prefers_rayon_rowmajor_f32_kernel()
-            && block_rows < m
-            && assoc_threads > 1
-            && proj_threads > 1,
-    );
+    let use_pipeline = use_rotate_finalize_pipeline(rotate_finalize_pipeline_default_for_backend(
+        rust_sgemm_backend_tag(),
+        assoc_rotate_prefers_rayon_rowmajor_f32_kernel(),
+        block_rows,
+        m,
+        proj_threads,
+        assoc_threads,
+    ));
 
     py.detach(|| {
         let total_t0 = Instant::now();
@@ -1933,16 +2014,18 @@ pub fn fvlmm_assoc_chunk_from_snp_f32<'py>(
     let cache = prepare_fixed_lambda_assoc_cache_f32(s, xcov_slice, y, n, p, lbd)?;
     let prep_nanos = elapsed_nanos_since(prep_t0);
     let proj_threads = stage_proj_threads_or(threads);
-    let assoc_threads = stage_assoc_threads_or(threads);
+    let assoc_threads = stage_assoc_threads_or(threads, proj_threads);
     let proj_pool = get_cached_pool(proj_threads)?;
     let assoc_pool = get_cached_pool(assoc_threads)?;
     let block_rows = rotate_block_rows.max(1);
-    let use_pipeline = use_rotate_finalize_pipeline(
-        !assoc_rotate_prefers_rayon_rowmajor_f32_kernel()
-            && block_rows < m
-            && assoc_threads > 1
-            && proj_threads > 1,
-    );
+    let use_pipeline = use_rotate_finalize_pipeline(rotate_finalize_pipeline_default_for_backend(
+        rust_sgemm_backend_tag(),
+        assoc_rotate_prefers_rayon_rowmajor_f32_kernel(),
+        block_rows,
+        m,
+        proj_threads,
+        assoc_threads,
+    ));
 
     py.detach(|| {
         let total_t0 = Instant::now();
@@ -2104,16 +2187,18 @@ pub fn fvlmm_assoc_chunk_from_snp_to_tsv_f32<'py>(
     let p = p_cov;
     let cache = prepare_fixed_lambda_assoc_cache_f32(s_slice, xcov_slice, y, n, p, lbd)?;
     let proj_threads = stage_proj_threads_or(threads);
-    let assoc_threads = stage_assoc_threads_or(threads);
+    let assoc_threads = stage_assoc_threads_or(threads, proj_threads);
     let proj_pool = get_cached_pool(proj_threads)?;
     let assoc_pool = get_cached_pool(assoc_threads)?;
     let block_rows = rotate_block_rows.max(1);
-    let use_pipeline = use_rotate_finalize_pipeline(
-        !assoc_rotate_prefers_rayon_rowmajor_f32_kernel()
-            && block_rows < m
-            && assoc_threads > 1
-            && proj_threads > 1,
-    );
+    let use_pipeline = use_rotate_finalize_pipeline(rotate_finalize_pipeline_default_for_backend(
+        rust_sgemm_backend_tag(),
+        assoc_rotate_prefers_rayon_rowmajor_f32_kernel(),
+        block_rows,
+        m,
+        proj_threads,
+        assoc_threads,
+    ));
 
     let progress_block = if progress_every == 0 {
         m.max(1)
@@ -2499,7 +2584,7 @@ pub fn fvlmm_assoc_bed_to_tsv_f32<'py>(
             let log_det_v_out = cache.log_det_v;
 
             let proj_threads = stage_proj_threads_or(threads);
-            let assoc_threads = stage_assoc_threads_or(threads);
+            let assoc_threads = stage_assoc_threads_or(threads, proj_threads);
             let proj_pool = get_cached_pool(proj_threads).map_err(|e| format!("{e}"))?;
             let assoc_pool = get_cached_pool(assoc_threads).map_err(|e| format!("{e}"))?;
             let sample_subset_plan = decode_plan.subset_decode_plan();
@@ -5000,7 +5085,7 @@ pub fn fvlmm_assoc_packed_f32_to_tsv<'py>(
         let mut text_buf = String::with_capacity(rotate_block_rows * 128);
         let mut next_progress_emit = progress_block.min(m).max(1);
         let proj_threads = stage_proj_threads_or(threads);
-        let assoc_threads = stage_assoc_threads_or(threads);
+        let assoc_threads = stage_assoc_threads_or(threads, proj_threads);
         let proj_pool = get_cached_pool(proj_threads)?;
         let assoc_pool = get_cached_pool(assoc_threads)?;
         let packed_pipeline_default = !assoc_rotate_prefers_rayon_rowmajor_f32_kernel()

@@ -28,7 +28,8 @@ use crate::assoc2tsv::{
 };
 use crate::bedmath::packed_row_missing_count_selected;
 use crate::blas::{
-    cblas_sgemm_dispatch, BlasThreadGuard, CblasInt, CBLAS_NO_TRANS, CBLAS_ROW_MAJOR, CBLAS_TRANS,
+    cblas_sgemm_dispatch, rust_sgemm_backend_tag, BlasThreadGuard, CblasInt, CBLAS_NO_TRANS,
+    CBLAS_ROW_MAJOR, CBLAS_TRANS,
 };
 use crate::brent::{brent_minimize, brent_minimize_with_init};
 use crate::decode::{
@@ -1112,7 +1113,7 @@ where
     let dense_subset_pos = decode_plan.dense_subset_pos();
 
     let proj_threads = stage_proj_threads_or(threads);
-    let assoc_threads = stage_assoc_threads_or(threads);
+    let assoc_threads = stage_assoc_threads_or(threads, proj_threads);
     let proj_pool = get_cached_pool(proj_threads).map_err(|e| format!("{e}"))?;
 
     let writer = AsyncTsvWriter::with_config(out_tsv, header, 64 * 1024 * 1024, 16)?;
@@ -1902,10 +1903,31 @@ fn stage_proj_threads_or(requested_threads: usize) -> usize {
 }
 
 #[inline]
-fn stage_assoc_threads_or(requested_threads: usize) -> usize {
-    env_positive_usize("JX_FVLMM_ASSOC_THREADS")
-        .or_else(|| env_positive_usize("JX_MLM_RUST_THREADS"))
-        .unwrap_or(requested_threads)
+fn normalize_default_assoc_threads_for_backend(
+    backend_tag: &str,
+    proj_threads: usize,
+    assoc_threads: usize,
+) -> usize {
+    let proj = proj_threads.max(1);
+    let assoc = assoc_threads.max(1);
+    if backend_tag == "openblas" {
+        assoc.min(proj)
+    } else {
+        assoc
+    }
+}
+
+#[inline]
+fn stage_assoc_threads_or(requested_threads: usize, proj_threads: usize) -> usize {
+    if let Some(explicit) = env_positive_usize("JX_FVLMM_ASSOC_THREADS") {
+        return explicit;
+    }
+    let default_threads = env_positive_usize("JX_MLM_RUST_THREADS").unwrap_or(requested_threads);
+    normalize_default_assoc_threads_for_backend(
+        rust_sgemm_backend_tag(),
+        proj_threads,
+        default_threads,
+    )
 }
 
 #[inline]
@@ -2605,7 +2627,7 @@ pub fn lmm_reml_assoc_bed_to_tsv_f32<'py>(
     let use_warm_start = !env_truthy("JX_LMM_UNIFIED_NO_WARM_START");
 
     py.detach(move || -> Result<usize, String> {
-        let assoc_threads = stage_assoc_threads_or(threads);
+        let assoc_threads = stage_assoc_threads_or(threads, threads);
         let assoc_pool = get_cached_pool(assoc_threads).map_err(|e| format!("{e}"))?;
         let header: &[u8] = if with_plrt {
             b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n"
@@ -2904,7 +2926,7 @@ pub fn lmm_reml_lmm2_assoc_bed_to_tsv_f32<'py>(
 
         let header: &[u8] =
             b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\tlambda\tml\tplrt\n";
-        let assoc_threads = stage_assoc_threads_or(threads);
+        let assoc_threads = stage_assoc_threads_or(threads, threads);
         let assoc_pool = get_cached_pool(assoc_threads).map_err(|e| format!("{e}"))?;
 
         let summary = run_unified_bed_scan_to_tsv_common(

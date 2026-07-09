@@ -955,6 +955,13 @@ impl InputIter {
         }
     }
 
+    fn n_sites_hint(&self) -> usize {
+        match self {
+            InputIter::Bed(it) => it.sites.len(),
+            InputIter::Vcf(_) | InputIter::Hmp(_) => 0usize,
+        }
+    }
+
     fn next_snp(&mut self) -> Option<(Vec<f32>, SiteInfo)> {
         match self {
             InputIter::Bed(it) => it.next_snp(),
@@ -1282,18 +1289,61 @@ fn process_hmp_line_for_plink_output(
     }
 }
 
+fn advance_merge_inputs_with_progress(
+    py: Python<'_>,
+    iters: &mut [InputIter],
+    cur: &mut [Option<(Vec<f32>, SiteInfo)>],
+    idxs: &[usize],
+    progress_callback: Option<&Py<PyAny>>,
+    progress_total: u64,
+    progress_every: u64,
+    progress_done: &mut u64,
+    last_report: &mut u64,
+) -> PyResult<()> {
+    for &i in idxs.iter() {
+        cur[i] = iters[i].next_snp();
+    }
+
+    if progress_callback.is_none() || progress_every == 0 {
+        return Ok(());
+    }
+
+    *progress_done = (*progress_done).saturating_add(idxs.len() as u64);
+    if (*progress_done).saturating_sub(*last_report) >= progress_every {
+        if let Some(cb) = progress_callback {
+            cb.call1(py, (*progress_done, progress_total))?;
+        }
+        *last_report = *progress_done;
+    }
+    Ok(())
+}
+
 // ============================================================
 // Main merge API (PyO3)
 // ============================================================
 
-#[pyfunction(signature = (inputs, out, out_fmt=None, sample_prefix=false, maf=0.0, geno=1.0))]
+#[pyfunction(signature = (
+    inputs,
+    out,
+    out_fmt=None,
+    sample_prefix=false,
+    maf=0.0,
+    geno=1.0,
+    progress_callback=None,
+    progress_total=0,
+    progress_every=10000
+))]
 pub fn merge_genotypes(
+    py: Python<'_>,
     inputs: Vec<String>,
     out: String,
     out_fmt: Option<String>,
     sample_prefix: bool,
     maf: f64,
     geno: f64,
+    progress_callback: Option<Py<PyAny>>,
+    progress_total: usize,
+    progress_every: usize,
 ) -> PyResult<PyMergeStats> {
     if inputs.len() < 2 {
         return Err(pyo3::exceptions::PyValueError::new_err(
@@ -1320,6 +1370,20 @@ pub fn merge_genotypes(
     for p in inputs.iter() {
         let it = InputIter::new(p).map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
         iters.push(it);
+    }
+
+    let report_progress = progress_callback.is_some() && progress_every > 0;
+    let progress_total_hint = if progress_total > 0 {
+        progress_total as u64
+    } else {
+        iters.iter().map(|it| it.n_sites_hint() as u64).sum()
+    };
+    let mut progress_done: u64 = 0;
+    let mut last_report: u64 = 0;
+    if report_progress {
+        if let Some(cb) = progress_callback.as_ref() {
+            cb.call1(py, (0u64, progress_total_hint))?;
+        }
     }
 
     // merged samples
@@ -1443,10 +1507,12 @@ pub fn merge_genotypes(
 
         // inputs present at this position
         let mut idxs: Vec<usize> = Vec::new();
+        let mut present_mask: Vec<bool> = vec![false; iters.len()];
         for (i, item) in cur.iter().enumerate() {
             if let Some((_row, site)) = item {
                 if site.chrom == min_site.chrom && site.pos == min_site.pos {
                     idxs.push(i);
+                    present_mask[i] = true;
                 }
             }
         }
@@ -1475,10 +1541,17 @@ pub fn merge_genotypes(
         let (cand_ref, cand_alt) = match (cand_ref, cand_alt) {
             (Some(r), Some(a)) => (r, a),
             _ => {
-                // advance all idxs
-                for &i in idxs.iter() {
-                    cur[i] = iters[i].next_snp();
-                }
+                advance_merge_inputs_with_progress(
+                    py,
+                    &mut iters,
+                    &mut cur,
+                    &idxs,
+                    progress_callback.as_ref(),
+                    progress_total_hint,
+                    progress_every as u64,
+                    &mut progress_done,
+                    &mut last_report,
+                )?;
                 continue;
             }
         };
@@ -1524,9 +1597,9 @@ pub fn merge_genotypes(
         let mut merged_row: Vec<i8> = Vec::with_capacity(stats.n_samples_total);
 
         for ds_i in 0..iters.len() {
-            let ns = iters[ds_i].n_samples();
+            let ns = stats.sample_counts[ds_i];
 
-            if idxs.contains(&ds_i) {
+            if present_mask[ds_i] {
                 stats.per_input_present_sites[ds_i] += 1;
 
                 if let (Some((row, _site)), Some(amap)) = (&cur[ds_i], maps[ds_i]) {
@@ -1588,9 +1661,17 @@ pub fn merge_genotypes(
         };
         if missing_rate > geno {
             stats.n_sites_dropped_geno += 1;
-            for &i in idxs.iter() {
-                cur[i] = iters[i].next_snp();
-            }
+            advance_merge_inputs_with_progress(
+                py,
+                &mut iters,
+                &mut cur,
+                &idxs,
+                progress_callback.as_ref(),
+                progress_total_hint,
+                progress_every as u64,
+                &mut progress_done,
+                &mut last_report,
+            )?;
             continue;
         }
         if maf > 0.0 {
@@ -1606,9 +1687,17 @@ pub fn merge_genotypes(
             };
             if maf_obs < maf {
                 stats.n_sites_dropped_maf += 1;
-                for &i in idxs.iter() {
-                    cur[i] = iters[i].next_snp();
-                }
+                advance_merge_inputs_with_progress(
+                    py,
+                    &mut iters,
+                    &mut cur,
+                    &idxs,
+                    progress_callback.as_ref(),
+                    progress_total_hint,
+                    progress_every as u64,
+                    &mut progress_done,
+                    &mut last_report,
+                )?;
                 continue;
             }
         }
@@ -1617,9 +1706,17 @@ pub fn merge_genotypes(
         let site_key = (min_site.chrom.clone(), min_site.pos);
         if written_site_keys.contains(&site_key) {
             // duplicated coordinate, skip writing this record
-            for &i in idxs.iter() {
-                cur[i] = iters[i].next_snp();
-            }
+            advance_merge_inputs_with_progress(
+                py,
+                &mut iters,
+                &mut cur,
+                &idxs,
+                progress_callback.as_ref(),
+                progress_total_hint,
+                progress_every as u64,
+                &mut progress_done,
+                &mut last_report,
+            )?;
             continue;
         }
         match fmt {
@@ -1650,8 +1747,22 @@ pub fn merge_genotypes(
         stats.n_sites_written += 1;
 
         // advance participating inputs
-        for &i in idxs.iter() {
-            cur[i] = iters[i].next_snp();
+        advance_merge_inputs_with_progress(
+            py,
+            &mut iters,
+            &mut cur,
+            &idxs,
+            progress_callback.as_ref(),
+            progress_total_hint,
+            progress_every as u64,
+            &mut progress_done,
+            &mut last_report,
+        )?;
+    }
+
+    if report_progress && progress_done != last_report {
+        if let Some(cb) = progress_callback.as_ref() {
+            cb.call1(py, (progress_done, progress_total_hint))?;
         }
     }
 

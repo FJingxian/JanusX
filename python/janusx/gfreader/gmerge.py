@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Iterable, Union, Optional, Dict, Any, List, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 from ..janusx import merge_genotypes
 
@@ -65,6 +65,9 @@ def merge(
     sample_prefix: bool = False,
     maf: float = 0.0,
     geno: float = 1.0,
+    progress_callback: Optional[Callable[[int, int], None]] = None,
+    progress_total: int = 0,
+    progress_every: int = 10000,
     check_exists: bool = True,
     return_dict: bool = True,
 ) -> Tuple[object, Dict[str, Any]] | object:
@@ -112,6 +115,15 @@ def merge(
     geno : float
         Drop merged sites with missing rate greater than this threshold.
         Valid range: [0, 1]. Default 1.0.
+    progress_callback : callable, optional
+        Callback receiving `(done, total)` updates during merge. `done` counts
+        consumed input sites across datasets; `total` is the provided
+        `progress_total` hint or a backend-derived PLINK-only hint.
+    progress_total : int
+        Optional progress total hint. Passing the sum of prepared input site
+        counts yields an accurate bounded merge progress bar.
+    progress_every : int
+        Emit merge progress after this many consumed input sites.
     check_exists : bool
         If True, validate inputs exist before calling Rust.
     return_dict : bool
@@ -144,7 +156,17 @@ def merge(
     _ensure_outdir(out_s)
 
     # Call Rust
-    stats = merge_genotypes(xs, out_s, out_fmt, sample_prefix, float(maf), float(geno))
+    stats = merge_genotypes(
+        xs,
+        out_s,
+        out_fmt,
+        sample_prefix,
+        float(maf),
+        float(geno),
+        progress_callback,
+        int(max(0, progress_total)),
+        int(max(0, progress_every)),
+    )
 
     if not return_dict:
         return stats

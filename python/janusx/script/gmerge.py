@@ -5,6 +5,7 @@ JanusX: Efficient Genotype Merger (gmerge)
 Supported inputs
 ----------------
 - `-vcf/--vcf`   : one or more VCF / VCF.GZ files
+- `-hmp/--hmp`   : one or more HMP / HMP.GZ files
 - `-bfile/--bfile`: one or more PLINK prefixes
 - `-file/--file` : one or more text / npy genotype matrices
 
@@ -17,11 +18,13 @@ Notes
 
 from __future__ import annotations
 
+import hashlib
 import os
 import socket
 import sys
 import tempfile
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterator, Sequence
@@ -50,8 +53,14 @@ from ._common.pathcheck import (
     format_path_for_display,
     safe_expanduser,
 )
-from ._common.progress import CliStatus, log_success, stdout_is_tty
-from janusx.gfreader import SiteInfo, inspect_genotype_file, load_genotype_chunks, save_genotype_streaming
+from ._common.progress import CliStatus, ProgressAdapter, log_success, stdout_is_tty
+from janusx.gfreader import (
+    SiteInfo,
+    inspect_genotype_file,
+    load_genotype_chunks,
+    prepare_cli_input_cache,
+    save_genotype_streaming,
+)
 from janusx.gfreader.gmerge import merge
 
 
@@ -146,7 +155,13 @@ class SiteProvider:
 
     def slice(self, start: int, end: int) -> list[SiteInfo]:
         return [
-            SiteInfo(str(self.chrom[i]), int(self.pos[i]), str(self.ref[i]), str(self.alt[i]))
+            SiteInfo(
+                str(self.chrom[i]),
+                int(self.pos[i]),
+                f"{self.chrom[i]}_{self.pos[i]}",
+                str(self.ref[i]),
+                str(self.alt[i]),
+            )
             for i in range(start, end)
         ]
 
@@ -156,6 +171,7 @@ class PreparedInput:
     original: str
     merge_path: str
     display_kind: str
+    n_sites: int
 
 
 @dataclass
@@ -325,8 +341,13 @@ def _check_file_input_resolvable(logger, src: str) -> bool:
         return False
 
 
-def _infer_default_prefix(vcf_inputs: Sequence[str], bfile_inputs: Sequence[str], file_inputs: Sequence[str]) -> str:
-    all_inputs = list(vcf_inputs) + list(bfile_inputs) + list(file_inputs)
+def _infer_default_prefix(
+    vcf_inputs: Sequence[str],
+    hmp_inputs: Sequence[str],
+    bfile_inputs: Sequence[str],
+    file_inputs: Sequence[str],
+) -> str:
+    all_inputs = list(vcf_inputs) + list(hmp_inputs) + list(bfile_inputs) + list(file_inputs)
     if not all_inputs:
         return "merged"
     return f"{_basename_no_suffix(all_inputs[0])}.merge"
@@ -364,32 +385,235 @@ def _read_fam_sample_names(prefix: str) -> list[str]:
 
 def _prepare_file_inputs(
     file_inputs: Sequence[str],
-    tmpdir: str,
+    cache_dir: str,
     logger,
+    status_enabled: bool,
 ) -> list[PreparedInput]:
+    def _plink_prefix_complete(prefix: str) -> bool:
+        return all(Path(f"{prefix}.{ext}").is_file() for ext in ("bed", "bim", "fam"))
+
+    def _remove_plink_prefix(prefix: str) -> None:
+        for ext in ("bed", "bim", "fam"):
+            path = Path(f"{prefix}.{ext}")
+            if path.exists():
+                path.unlink()
+
+    def _file_cache_prefix(
+        src: str,
+        matrix_path: str,
+        site_path: str,
+        id_path: str,
+    ) -> str:
+        base = _basename_no_suffix(src) or "file"
+        key = "||".join(
+            os.path.abspath(p)
+            for p in (matrix_path, site_path, id_path)
+        )
+        digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:12]
+        return os.path.join(cache_dir, f"~{base}.gmergefile.{digest}")
+
     prepared: list[PreparedInput] = []
     for idx, src in enumerate(file_inputs, start=1):
         logger.info(f"Preparing -file input {idx}/{len(file_inputs)}: {src}")
         file_source = _build_file_source(src)
-        temp_prefix = os.path.join(tmpdir, f"file_input_{idx}")
-        desc = f"Converting -file input {idx}/{len(file_inputs)}"
-        save_genotype_streaming(
-            temp_prefix,
-            file_source.sample_ids,
-            file_source.iter_selected_chunks(50_000),
-            fmt="plink",
-            total_snps=int(file_source.n_sites),
-            desc=desc,
+        _matrix_kind, matrix_path, prefixes = _discover_file_matrix(src)
+        site_path = discover_site_path(prefixes)
+        if site_path is None:
+            raise ValueError(f"-file input requires real site metadata (.site or .bim): {src}")
+        id_path = discover_id_sidecar_path(matrix_path, prefixes)
+        if id_path is None:
+            raise FileNotFoundError(
+                f"Unable to find sample IDs for matrix {matrix_path}. "
+                "Provide a matching prefix.id sidecar."
+            )
+
+        cache_prefix = _file_cache_prefix(src, matrix_path, site_path, id_path)
+        source_mtime = max(
+            os.path.getmtime(path)
+            for path in (matrix_path, site_path, id_path)
         )
-        logger.info(f"{desc} finished.")
+        cache_files = [f"{cache_prefix}.bed", f"{cache_prefix}.bim", f"{cache_prefix}.fam"]
+        cache_exists = any(Path(path).exists() for path in cache_files)
+        cache_ready = _plink_prefix_complete(cache_prefix)
+        cache_fresh = cache_ready and min(os.path.getmtime(path) for path in cache_files) >= source_mtime
+
+        if cache_fresh:
+            with CliStatus(
+                f"Preparing FILE input {idx}/{len(file_inputs)}...",
+                enabled=status_enabled,
+            ) as task:
+                task.complete(f"Preparing FILE input {idx}/{len(file_inputs)} ...Finished")
+            logger.info(
+                "Reusing FILE PLINK cache: "
+                f"{format_path_for_display(src)} -> {format_path_for_display(cache_prefix)}"
+            )
+        else:
+            if cache_exists:
+                logger.info(
+                    "Rebuilding stale/incomplete FILE PLINK cache: "
+                    f"{format_path_for_display(cache_prefix)}"
+                )
+                _remove_plink_prefix(cache_prefix)
+            desc = f"Caching FILE input {idx}/{len(file_inputs)} as PLINK"
+            save_genotype_streaming(
+                cache_prefix,
+                file_source.sample_ids,
+                file_source.iter_selected_chunks(50_000),
+                fmt="plink",
+                total_snps=int(file_source.n_sites),
+                desc=desc,
+            )
+            logger.info(f"{desc} finished.")
         prepared.append(
             PreparedInput(
                 original=src,
-                merge_path=temp_prefix,
-                display_kind=f"file:{file_source.matrix_kind}",
+                merge_path=cache_prefix,
+                display_kind=f"file:{file_source.matrix_kind}:cache",
+                n_sites=int(file_source.n_sites),
             )
         )
     return prepared
+
+
+def _prepare_cache_backed_inputs(
+    inputs: Sequence[str],
+    *,
+    force_kind: str,
+    label: str,
+    threads: int,
+    logger,
+    status_enabled: bool,
+) -> list[PreparedInput]:
+    prepared: list[PreparedInput] = []
+    for idx, src in enumerate(inputs, start=1):
+        desc = f"Preparing {label} input {idx}/{len(inputs)}"
+        with CliStatus(f"{desc}...", enabled=status_enabled) as task:
+            try:
+                cache_prefix = str(
+                    prepare_cli_input_cache(
+                        src,
+                        force_kind=force_kind,
+                        snps_only=False,
+                        threads=int(max(0, threads)),
+                    )
+                )
+                _, n_sites = inspect_genotype_file(cache_prefix)
+            except Exception:
+                task.fail(f"{desc} ...Failed")
+                raise
+            task.complete(f"{desc} ...Finished")
+        logger.info(
+            f"{label} input normalized to PLINK cache: "
+            f"{format_path_for_display(src)} -> {format_path_for_display(cache_prefix)}"
+        )
+        prepared.append(
+            PreparedInput(
+                original=src,
+                merge_path=cache_prefix,
+                display_kind=f"{force_kind}:cache",
+                n_sites=int(n_sites),
+            )
+        )
+    return prepared
+
+
+def _prepare_bfile_inputs(inputs: Sequence[str]) -> list[PreparedInput]:
+    prepared: list[PreparedInput] = []
+    for src in inputs:
+        _, n_sites = inspect_genotype_file(src)
+        prepared.append(
+            PreparedInput(
+                original=src,
+                merge_path=src,
+                display_kind="bfile",
+                n_sites=int(n_sites),
+            )
+        )
+    return prepared
+
+
+def _merge_progress_every(total_sites: int) -> int:
+    return int(max(1, max(1, int(total_sites)) // 200))
+
+
+def _run_merge_with_progress(
+    *,
+    merge_inputs: Sequence[str],
+    merge_out: str,
+    merge_fmt: str,
+    sample_prefix: bool,
+    maf: float,
+    geno: float,
+    status_enabled: bool,
+    progress_total: int,
+):
+    if (not status_enabled) or progress_total <= 0:
+        with CliStatus("Merging genotype datasets...", enabled=status_enabled) as task:
+            try:
+                stats, d = merge(
+                    inputs=merge_inputs,
+                    out=merge_out,
+                    out_fmt=merge_fmt,
+                    sample_prefix=bool(sample_prefix),
+                    maf=float(maf),
+                    geno=float(geno),
+                    check_exists=True,
+                    return_dict=True,
+                )
+            except Exception:
+                task.fail("Merging genotype datasets ...Failed")
+                raise
+            task.complete("Merging genotype datasets ...Finished")
+        return stats, d
+
+    pbar = ProgressAdapter(
+        total=max(1, int(progress_total)),
+        desc="Merging genotype datasets",
+        force_animate=True,
+        keep_display=False,
+        show_remaining=True,
+        emit_done=False,
+        log_unit="site",
+    )
+    merge_done = 0
+    merge_total = max(1, int(progress_total))
+
+    def _on_merge_progress(done: int, total: int) -> None:
+        nonlocal merge_done, merge_total
+        try:
+            d = int(done)
+            t = int(total)
+        except Exception:
+            return
+        if t > 0 and t != merge_total and merge_done == 0:
+            merge_total = max(1, t)
+            pbar.set_total(merge_total)
+        d = max(0, d)
+        d = min(d, merge_total)
+        if d > merge_done:
+            pbar.update(d - merge_done)
+            merge_done = d
+
+    try:
+        stats, d = merge(
+            inputs=merge_inputs,
+            out=merge_out,
+            out_fmt=merge_fmt,
+            sample_prefix=bool(sample_prefix),
+            maf=float(maf),
+            geno=float(geno),
+            progress_callback=_on_merge_progress,
+            progress_total=int(progress_total),
+            progress_every=_merge_progress_every(progress_total),
+            check_exists=True,
+            return_dict=True,
+        )
+        if merge_done < merge_total:
+            pbar.update(merge_total - merge_done)
+        pbar.finish()
+        return stats, d
+    finally:
+        pbar.close()
 
 
 def build_parser() -> CliArgumentParser:
@@ -399,6 +623,7 @@ def build_parser() -> CliArgumentParser:
         epilog=minimal_help_epilog(
             [
                 "jx gmerge -vcf a.vcf.gz b.vcf.gz -fmt vcf",
+                "jx gmerge -hmp a.hmp.gz b.hmp.gz -fmt plink",
                 "jx gmerge -bfile A B -o merged_dir -prefix panel -fmt plink",
                 "jx gmerge -vcf a.vcf.gz -file matrix_prefix -fmt txt",
             ]
@@ -413,6 +638,14 @@ def build_parser() -> CliArgumentParser:
         action="extend",
         default=None,
         help="Input VCF / VCF.GZ files (repeatable).",
+    )
+    req.add_argument(
+        "-hmp",
+        "--hmp",
+        nargs="+",
+        action="extend",
+        default=None,
+        help="Input HMP / HMP.GZ files (repeatable).",
     )
     req.add_argument(
         "-bfile",
@@ -477,6 +710,16 @@ def build_parser() -> CliArgumentParser:
         default=1.0,
         help="Drop merged sites with missing rate above this threshold (range: 0-1; default: %(default)s).",
     )
+    opt.add_argument(
+        "-thread",
+        "--thread",
+        type=int,
+        default=0,
+        help=(
+            "Threads used while preparing reusable PLINK caches for VCF/HMP inputs "
+            "(default: %(default)s)."
+        ),
+    )
     return parser
 
 
@@ -486,17 +729,21 @@ def main(log: bool = True) -> None:
     args = build_parser().parse_args()
 
     vcf_inputs = [str(x) for x in (args.vcf or [])]
+    hmp_inputs = [str(x) for x in (args.hmp or [])]
     bfile_inputs = [str(x) for x in (args.bfile or [])]
     file_inputs = [str(x) for x in (args.file or [])]
+    threads = int(max(0, int(args.thread or 0)))
 
-    total_inputs = len(vcf_inputs) + len(bfile_inputs) + len(file_inputs)
+    total_inputs = len(vcf_inputs) + len(hmp_inputs) + len(bfile_inputs) + len(file_inputs)
     if total_inputs < 2:
         raise ValueError(
-            "At least 2 inputs are required across -vcf/-bfile/-file."
+            "At least 2 inputs are required across -vcf/-hmp/-bfile/-file."
         )
 
     outdir = os.path.normpath(str(args.out or "."))
-    prefix = str(args.prefix or _infer_default_prefix(vcf_inputs, bfile_inputs, file_inputs))
+    prefix = str(
+        args.prefix or _infer_default_prefix(vcf_inputs, hmp_inputs, bfile_inputs, file_inputs)
+    )
     os.makedirs(outdir, mode=0o755, exist_ok=True)
     configure_genotype_cache_from_out(outdir)
 
@@ -509,6 +756,8 @@ def main(log: bool = True) -> None:
         input_rows: list[tuple[str, str]] = []
         for idx, src in enumerate(vcf_inputs, start=1):
             input_rows.append((f"VCF {idx}", src))
+        for idx, src in enumerate(hmp_inputs, start=1):
+            input_rows.append((f"HMP {idx}", src))
         for idx, src in enumerate(bfile_inputs, start=1):
             input_rows.append((f"BFILE {idx}", src))
         for idx, src in enumerate(file_inputs, start=1):
@@ -529,6 +778,7 @@ def main(log: bool = True) -> None:
                         ("Sample prefix", bool(args.sample_prefix)),
                         ("MAF", args.maf),
                         ("GENO", args.geno),
+                        ("Threads", threads),
                         ("Log file", log_path),
                     ],
                 ),
@@ -540,6 +790,8 @@ def main(log: bool = True) -> None:
     checks: list[bool] = []
     for src in vcf_inputs:
         checks.append(ensure_file_exists(logger, src, "Input VCF file"))
+    for src in hmp_inputs:
+        checks.append(ensure_file_exists(logger, src, "Input HMP file"))
     for src in bfile_inputs:
         checks.append(ensure_plink_prefix_exists(logger, src, "Input PLINK prefix"))
     for src in file_inputs:
@@ -547,48 +799,70 @@ def main(log: bool = True) -> None:
     if not ensure_all_true(checks):
         raise SystemExit(1)
 
-    with tempfile.TemporaryDirectory(prefix=f".janusx_gmerge_{prefix}_", dir=outdir) as tmpdir:
+    needs_tmpdir = final_format in {"txt", "npy"}
+    tmp_ctx = (
+        tempfile.TemporaryDirectory(prefix=f".janusx_gmerge_{prefix}_", dir=outdir)
+        if needs_tmpdir
+        else nullcontext(None)
+    )
+
+    with tmp_ctx as tmpdir:
         prepared_inputs: list[PreparedInput] = []
         prepared_inputs.extend(
-            PreparedInput(original=x, merge_path=x, display_kind="vcf") for x in vcf_inputs
+            _prepare_cache_backed_inputs(
+                vcf_inputs,
+                force_kind="vcf",
+                label="VCF",
+                threads=threads,
+                logger=logger,
+                status_enabled=use_spinner,
+            )
         )
         prepared_inputs.extend(
-            PreparedInput(original=x, merge_path=x, display_kind="bfile") for x in bfile_inputs
+            _prepare_cache_backed_inputs(
+                hmp_inputs,
+                force_kind="hmp",
+                label="HMP",
+                threads=threads,
+                logger=logger,
+                status_enabled=use_spinner,
+            )
+        )
+        prepared_inputs.extend(
+            _prepare_bfile_inputs(bfile_inputs)
         )
         prepared_inputs.extend(
             _prepare_file_inputs(
                 file_inputs,
-                tmpdir,
+                outdir,
                 logger,
+                use_spinner,
             )
         )
 
         merge_inputs = [item.merge_path for item in prepared_inputs]
+        merge_progress_total = int(sum(int(item.n_sites) for item in prepared_inputs))
 
         merge_out = final_output
         merge_fmt = final_format
         postconvert_source: str | None = None
         if final_format in {"txt", "npy"}:
+            if tmpdir is None:
+                raise RuntimeError("Temporary directory is required for text/npy merge output.")
             merge_out = os.path.join(tmpdir, "merged_tmp")
             merge_fmt = "plink"
             postconvert_source = merge_out
 
-        with CliStatus("Merging genotype datasets...", enabled=use_spinner) as task:
-            try:
-                stats, d = merge(
-                    inputs=merge_inputs,
-                    out=merge_out,
-                    out_fmt=merge_fmt,
-                    sample_prefix=bool(args.sample_prefix),
-                    maf=float(args.maf),
-                    geno=float(args.geno),
-                    check_exists=True,
-                    return_dict=True,
-                )
-            except Exception:
-                task.fail("Merging genotype datasets ...Failed")
-                raise
-            task.complete("Merging genotype datasets ...Finished")
+        stats, d = _run_merge_with_progress(
+            merge_inputs=merge_inputs,
+            merge_out=merge_out,
+            merge_fmt=merge_fmt,
+            sample_prefix=bool(args.sample_prefix),
+            maf=float(args.maf),
+            geno=float(args.geno),
+            status_enabled=use_spinner,
+            progress_total=merge_progress_total,
+        )
 
         if final_format == "txt":
             sample_ids = _read_fam_sample_names(postconvert_source)

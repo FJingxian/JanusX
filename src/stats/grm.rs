@@ -2396,6 +2396,36 @@ fn grm_stream_decode_batch_rows(row_step: usize, n_samples: usize, elem_bytes: u
 }
 
 #[inline]
+fn grm_decode_backend_tag() -> &'static str {
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    {
+        return crate::blas::rust_sgemm_backend_tag();
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        "unsupported"
+    }
+}
+
+#[inline]
+fn grm_decode_threads_default_for_backend(total_threads: usize, backend: &str) -> usize {
+    match backend {
+        // OpenBLAS-backed GRM on large real datasets tends to be GEMM/SYRK-bound,
+        // so dedicating extra cores to decode usually steals time from BLAS.
+        "openblas" => 1,
+        _ => {
+            if total_threads >= 8 {
+                (total_threads / 4).max(2).min(4)
+            } else if total_threads >= 4 {
+                2
+            } else {
+                1
+            }
+        }
+    }
+}
+
+#[inline]
 fn grm_decode_threads(total_threads: usize, overlap_enabled: bool) -> usize {
     if !overlap_enabled {
         return 1;
@@ -2405,13 +2435,7 @@ fn grm_decode_threads(total_threads: usize, overlap_enabled: bool) -> usize {
             return v.max(1).min(total_threads.max(1));
         }
     }
-    if total_threads >= 8 {
-        (total_threads / 4).max(2).min(4)
-    } else if total_threads >= 4 {
-        2
-    } else {
-        1
-    }
+    grm_decode_threads_default_for_backend(total_threads, grm_decode_backend_tag())
 }
 
 #[inline]
@@ -4060,7 +4084,7 @@ pub fn grm_stream_bed_f64<'py>(
         .and_then(|s| s.trim().parse::<usize>().ok())
         .filter(|v| *v > 0)
         .unwrap_or(1_000_000usize);
-    let parallel_decode = if !can_parallel_decode {
+    let parallel_decode = if !can_parallel_decode || decode_threads_hint <= 1 {
         false
     } else {
         match parallel_decode_pref_lc.as_str() {
@@ -4828,7 +4852,7 @@ pub fn grm_stream_bed_f32<'py>(
         .and_then(|s| s.trim().parse::<usize>().ok())
         .filter(|v| *v > 0)
         .unwrap_or(1_000_000usize);
-    let parallel_decode = if !can_parallel_decode {
+    let parallel_decode = if !can_parallel_decode || decode_threads_hint <= 1 {
         false
     } else {
         match parallel_decode_pref_lc.as_str() {
@@ -5946,4 +5970,25 @@ pub fn grm_sim_bench_f32(
         )
         .map_err(map_err_string_to_py)?;
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::grm_decode_threads_default_for_backend;
+
+    #[test]
+    fn grm_decode_threads_accelerate_keeps_legacy_defaults() {
+        assert_eq!(grm_decode_threads_default_for_backend(1, "accelerate"), 1);
+        assert_eq!(grm_decode_threads_default_for_backend(4, "accelerate"), 2);
+        assert_eq!(grm_decode_threads_default_for_backend(8, "accelerate"), 2);
+        assert_eq!(grm_decode_threads_default_for_backend(16, "accelerate"), 4);
+    }
+
+    #[test]
+    fn grm_decode_threads_openblas_prefers_single_decode_thread() {
+        assert_eq!(grm_decode_threads_default_for_backend(1, "openblas"), 1);
+        assert_eq!(grm_decode_threads_default_for_backend(4, "openblas"), 1);
+        assert_eq!(grm_decode_threads_default_for_backend(8, "openblas"), 1);
+        assert_eq!(grm_decode_threads_default_for_backend(32, "openblas"), 1);
+    }
 }

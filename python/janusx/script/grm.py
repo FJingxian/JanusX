@@ -43,7 +43,6 @@ from ._common.cli_args import (
     add_common_memory_arg,
     add_common_out_arg,
     add_common_prefix_arg,
-    add_common_snps_only_arg,
     add_common_thread_arg,
     add_common_variant_filter_args,
 )
@@ -91,6 +90,9 @@ from ._common.memory import (
 try:
     from janusx.janusx import (
         gblup_grm_from_meta_to_npy as _gblup_grm_from_meta_to_npy,
+        grm_bed_f32_row_band_from_meta as _grm_bed_f32_row_band_from_meta,
+        grm_bed_f32_row_band_from_meta_to_npy as _grm_bed_f32_row_band_from_meta_to_npy,
+        grm_bed_f32_tiled_from_meta_to_npy as _grm_bed_f32_tiled_from_meta_to_npy,
         grm_bed_f64_from_meta as _grm_bed_f64_from_meta,
         grm_packed_bed_f32 as _grm_packed_bed_f32,
         grm_stream_bed_f32 as _grm_stream_bed_f32,
@@ -98,6 +100,9 @@ try:
     )
 except Exception:
     _gblup_grm_from_meta_to_npy = None
+    _grm_bed_f32_row_band_from_meta = None
+    _grm_bed_f32_row_band_from_meta_to_npy = None
+    _grm_bed_f32_tiled_from_meta_to_npy = None
     _grm_bed_f64_from_meta = None
     _grm_packed_bed_f32 = None
     _grm_stream_bed_f32 = None
@@ -316,8 +321,11 @@ def _emit_grm_configuration(
             ("MAF threshold", args.maf),
             ("Missing rate", args.geno),
             ("Het threshold", args.het),
-            ("SNP-only", bool(args.snps_only)),
             ("Memory", memory_cfg),
+            (
+                "Experimental part",
+                getattr(args, "part_display", None) or "disabled",
+            ),
             ("Stage timing", bool(args.stage_timing or spgrm_timing_enabled)),
             (
                 "Threads",
@@ -500,6 +508,480 @@ def _grm_stream_meta_payload(
         row_maf_arg,
         mmap_window_mb_resolved,
     )
+
+
+def _parse_grm_part_cli(
+    raw_part: object,
+    raw_part_group: object,
+) -> tuple[tuple[int, int | None] | None, tuple[str, int] | None, str | None]:
+    part_spec: tuple[int, int | None] | None = None
+    part_group_spec: tuple[str, int] | None = None
+    display: str | None = None
+
+    if raw_part is not None:
+        vals = [str(x).strip() for x in list(raw_part)]
+        if len(vals) <= 0 or len(vals) > 2:
+            raise ValueError("`-part/--part` expects `N` or `N IDX`.")
+        try:
+            n_parts = int(vals[0])
+        except Exception as ex:
+            raise ValueError(f"Invalid `-part` count: {vals[0]!r}") from ex
+        if n_parts <= 0:
+            raise ValueError("`-part` count must be positive.")
+        idx: int | None = None
+        if len(vals) >= 2:
+            try:
+                idx = int(vals[1])
+            except Exception as ex:
+                raise ValueError(f"Invalid `-part` index: {vals[1]!r}") from ex
+            if idx <= 0:
+                raise ValueError("`-part` index must be positive.")
+        part_spec = (n_parts, idx)
+        display = f"{n_parts}/{idx}" if idx is not None else f"{n_parts}/all"
+
+    if raw_part_group is not None:
+        vals = [str(x).strip() for x in list(raw_part_group)]
+        if len(vals) != 2:
+            raise ValueError("`-part-group/--part-group` expects `GROUPS.txt IDX`.")
+        group_path = vals[0]
+        if group_path == "":
+            raise ValueError("`-part-group` group file path must not be empty.")
+        try:
+            group_idx = int(vals[1])
+        except Exception as ex:
+            raise ValueError(f"Invalid `-part-group` index: {vals[1]!r}") from ex
+        if group_idx <= 0:
+            raise ValueError("`-part-group` index must be positive.")
+        part_group_spec = (group_path, group_idx)
+        display_group = f"{os.path.basename(group_path)}#{group_idx}"
+        if display is not None:
+            raise ValueError("Please provide only one of `-part` or `-part-group`.")
+        display = display_group
+
+    return part_spec, part_group_spec, display
+
+
+def _triangular_work_prefix(row_count: int) -> int:
+    n = int(max(0, int(row_count)))
+    return (n * (n + 1)) // 2
+
+
+def _equal_work_row_ranges(n_samples: int, n_parts: int) -> list[tuple[int, int]]:
+    n = int(n_samples)
+    p = int(n_parts)
+    if n <= 0:
+        raise ValueError("Sample count must be positive for GRM part partitioning.")
+    if p <= 0:
+        raise ValueError("Part count must be positive.")
+    if p > n:
+        raise ValueError(f"Part count {p} exceeds sample count {n}.")
+
+    total = _triangular_work_prefix(n)
+    out: list[tuple[int, int]] = []
+    start = 0
+    for part_idx in range(1, p + 1):
+        min_end = start + 1
+        max_end = n - (p - part_idx)
+        if part_idx == p:
+            end = n
+        else:
+            target = (part_idx * total) / float(p)
+            lo = min_end
+            hi = max_end
+            while lo < hi:
+                mid = (lo + hi) // 2
+                if _triangular_work_prefix(mid) < target:
+                    lo = mid + 1
+                else:
+                    hi = mid
+            end_hi = max(min_end, min(max_end, lo))
+            end_lo = max(min_end, min(max_end, end_hi - 1))
+            diff_hi = abs(_triangular_work_prefix(end_hi) - target)
+            diff_lo = abs(_triangular_work_prefix(end_lo) - target)
+            end = end_lo if diff_lo <= diff_hi else end_hi
+        out.append((start, end))
+        start = end
+    if start != n:
+        out[-1] = (out[-1][0], n)
+    return out
+
+
+def _load_group_part_order(
+    groups_path: str,
+    sample_ids: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, list[tuple[int, int]], list[str]]:
+    sample_ids_arr = np.asarray(sample_ids, dtype=str).reshape(-1)
+    if int(sample_ids_arr.shape[0]) <= 0:
+        raise ValueError("Sample IDs are empty; cannot resolve `-part-group`.")
+    if not os.path.isfile(str(groups_path)):
+        raise FileNotFoundError(f"Group file not found: {groups_path}")
+
+    group_by_sample: dict[str, str] = {}
+    with open(str(groups_path), "r", encoding="utf-8") as fh:
+        for line_no, raw_line in enumerate(fh, start=1):
+            text = str(raw_line).strip()
+            if text == "" or text.startswith("#"):
+                continue
+            parts = text.split()
+            if len(parts) < 2:
+                raise ValueError(
+                    f"{groups_path}:{line_no}: expected at least 2 columns: sample_id group_id"
+                )
+            sample_id = str(parts[0]).strip()
+            group_id = str(parts[1]).strip()
+            if sample_id == "" or group_id == "":
+                raise ValueError(
+                    f"{groups_path}:{line_no}: sample_id/group_id must not be empty."
+                )
+            if sample_id in group_by_sample:
+                raise ValueError(f"{groups_path}:{line_no}: duplicate sample_id: {sample_id}")
+            group_by_sample[sample_id] = group_id
+
+    sample_to_idx = {str(sid): i for i, sid in enumerate(sample_ids_arr.tolist())}
+    unknown = sorted([sid for sid in group_by_sample.keys() if sid not in sample_to_idx])
+    if len(unknown) > 0:
+        preview = ", ".join(unknown[:5])
+        raise ValueError(
+            f"`-part-group` file contains samples absent from genotype IDs: {preview}"
+        )
+    missing = [str(sid) for sid in sample_ids_arr.tolist() if str(sid) not in group_by_sample]
+    if len(missing) > 0:
+        preview = ", ".join(missing[:5])
+        raise ValueError(
+            f"`-part-group` file is missing genotype samples: {preview}"
+        )
+
+    group_to_indices: dict[str, list[int]] = {}
+    for idx, sid in enumerate(sample_ids_arr.tolist()):
+        gid = group_by_sample[str(sid)]
+        group_to_indices.setdefault(gid, []).append(int(idx))
+
+    sorted_groups = sorted(
+        group_to_indices.keys(),
+        key=lambda gid: (
+            -len(group_to_indices[gid]),
+            min(group_to_indices[gid]),
+            str(gid),
+        ),
+    )
+    ordered_indices: list[int] = []
+    row_ranges: list[tuple[int, int]] = []
+    start = 0
+    for gid in sorted_groups:
+        idxs = list(group_to_indices[gid])
+        ordered_indices.extend(idxs)
+        end = start + len(idxs)
+        row_ranges.append((start, end))
+        start = end
+
+    ordered_idx_arr = np.ascontiguousarray(np.asarray(ordered_indices, dtype=np.int64))
+    ordered_ids = np.asarray(sample_ids_arr[ordered_idx_arr], dtype=str)
+    return ordered_ids, ordered_idx_arr, row_ranges, [str(gid) for gid in sorted_groups]
+
+
+def _prepare_grm_part_meta_payload(
+    *,
+    genofile: str,
+    n_samples: int,
+    maf_threshold: float,
+    max_missing_rate: float,
+    het_threshold: float,
+    snps_only: bool,
+    block_rows: int,
+    mmap_window_mb: Union[int, None],
+) -> dict[str, object]:
+    _sample_ids_meta, packed_meta_ctx = load_or_build_packed_meta_basic(
+        str(genofile),
+        maf=float(maf_threshold),
+        missing_rate=float(max_missing_rate),
+        het_threshold=float(het_threshold),
+        snps_only=bool(snps_only),
+        expected_n_samples=int(n_samples),
+    )
+    (
+        source_prefix,
+        row_source_indices,
+        row_flip,
+        row_maf,
+        mmap_window_mb_resolved,
+    ) = _grm_stream_meta_payload(
+        packed_meta_ctx,
+        block_rows=int(block_rows),
+        mmap_window_mb=mmap_window_mb,
+    )
+    n_total_sites = int(packed_meta_ctx.get("n_total_sites", 0) or 0)
+    if n_total_sites <= 0:
+        raise RuntimeError("GRM part meta route resolved invalid n_total_sites.")
+    return {
+        "source_prefix": str(source_prefix),
+        "row_source_indices": row_source_indices,
+        "row_flip": row_flip,
+        "row_maf": row_maf,
+        "mmap_window_mb": int(mmap_window_mb_resolved),
+        "n_total_sites": int(n_total_sites),
+        "eff_m_hint": int(row_source_indices.shape[0]),
+    }
+
+
+@contextmanager
+def _spgrm_timing_env(enabled: bool):
+    prev = os.environ.get("JANUSX_SPGRM_TIMING")
+    if bool(enabled):
+        os.environ["JANUSX_SPGRM_TIMING"] = "1"
+    try:
+        yield
+    finally:
+        if bool(enabled):
+            if prev is None:
+                os.environ.pop("JANUSX_SPGRM_TIMING", None)
+            else:
+                os.environ["JANUSX_SPGRM_TIMING"] = prev
+
+
+def build_grm_row_band_from_meta_payload(
+    *,
+    payload: dict[str, object],
+    row_start: int,
+    row_end: int,
+    sample_indices: np.ndarray | None,
+    method: int,
+    block_rows: int,
+    threads: int,
+    stage_timing: bool,
+    desc: str,
+    logger,
+) -> tuple[np.ndarray, int]:
+    if _grm_bed_f32_row_band_from_meta is None:
+        raise RuntimeError(
+            "Rust GRM part meta kernel is unavailable. Rebuild JanusX extension to export "
+            "`grm_bed_f32_row_band_from_meta`."
+        )
+    eff_m_hint = int(payload["eff_m_hint"])
+    pbar = ProgressAdapter(
+        total=max(1, eff_m_hint),
+        desc=str(desc),
+        emit_done=False,
+        force_animate=True,
+    )
+    build_t0 = time.monotonic()
+    last_done = 0
+    last_total = max(1, eff_m_hint)
+
+    def _progress_cb(done: int, total: int) -> None:
+        nonlocal last_done, last_total
+        d = max(0, int(done))
+        t = max(1, int(total))
+        if t != last_total:
+            pbar.set_total(t)
+            last_total = t
+        d = min(d, t)
+        if d > last_done:
+            pbar.update(d - last_done)
+            last_done = d
+
+    try:
+        with _spgrm_timing_env(bool(stage_timing)):
+            part_raw, eff_m_raw, n_use = _grm_bed_f32_row_band_from_meta(
+                str(payload["source_prefix"]),
+                np.asarray(payload["row_source_indices"], dtype=np.int64),
+                np.asarray(payload["row_flip"], dtype=np.bool_),
+                np.asarray(payload["row_maf"], dtype=np.float32),
+                int(payload["n_total_sites"]),
+                int(row_start),
+                int(row_end),
+                sample_indices=(
+                    None
+                    if sample_indices is None
+                    else np.ascontiguousarray(
+                        np.asarray(sample_indices, dtype=np.int64).reshape(-1),
+                        dtype=np.int64,
+                    )
+                ),
+                method=int(method),
+                block_rows=max(1, int(block_rows)),
+                sample_block=0,
+                threads=max(1, int(threads)),
+                mmap_window_mb=int(payload["mmap_window_mb"]),
+                progress_callback=_progress_cb,
+                progress_every=max(1, int(block_rows)),
+            )
+    finally:
+        pbar.finish()
+        pbar.close()
+    build_elapsed = max(0.0, time.monotonic() - build_t0)
+    part_arr = np.ascontiguousarray(np.asarray(part_raw, dtype=np.float32))
+    eff_m = int(eff_m_raw)
+    log_success(
+        logger,
+        f"{str(desc)} (Effective SNPs: {eff_m}, n={int(n_use)}) ...Finished "
+        f"[{format_elapsed(build_elapsed)}]",
+        force_color=True,
+    )
+    return part_arr, eff_m
+
+
+def build_grm_row_band_to_npy_from_meta_payload(
+    *,
+    payload: dict[str, object],
+    out_npy_path: str,
+    row_start: int,
+    row_end: int,
+    sample_indices: np.ndarray | None,
+    method: int,
+    block_rows: int,
+    sample_block: int,
+    threads: int,
+    stage_timing: bool,
+    desc: str,
+    logger,
+) -> int:
+    if _grm_bed_f32_row_band_from_meta_to_npy is None:
+        raise RuntimeError(
+            "Rust GRM part NPY kernel is unavailable. Rebuild JanusX extension to export "
+            "`grm_bed_f32_row_band_from_meta_to_npy`."
+        )
+    eff_m_hint = int(payload["eff_m_hint"])
+    pbar = ProgressAdapter(
+        total=max(1, eff_m_hint),
+        desc=str(desc),
+        emit_done=False,
+        force_animate=True,
+    )
+    build_t0 = time.monotonic()
+    last_done = 0
+    last_total = max(1, eff_m_hint)
+
+    def _progress_cb(done: int, total: int) -> None:
+        nonlocal last_done, last_total
+        d = max(0, int(done))
+        t = max(1, int(total))
+        if t != last_total:
+            pbar.set_total(t)
+            last_total = t
+        d = min(d, t)
+        if d > last_done:
+            pbar.update(d - last_done)
+            last_done = d
+
+    try:
+        with _spgrm_timing_env(bool(stage_timing)):
+            eff_m_raw, n_use = _grm_bed_f32_row_band_from_meta_to_npy(
+                str(payload["source_prefix"]),
+                str(out_npy_path),
+                np.asarray(payload["row_source_indices"], dtype=np.int64),
+                np.asarray(payload["row_flip"], dtype=np.bool_),
+                np.asarray(payload["row_maf"], dtype=np.float32),
+                int(payload["n_total_sites"]),
+                int(row_start),
+                int(row_end),
+                sample_indices=(
+                    None
+                    if sample_indices is None
+                    else np.ascontiguousarray(
+                        np.asarray(sample_indices, dtype=np.int64).reshape(-1),
+                        dtype=np.int64,
+                    )
+                ),
+                method=int(method),
+                block_rows=max(1, int(block_rows)),
+                sample_block=max(1, int(sample_block)),
+                threads=max(1, int(threads)),
+                mmap_window_mb=int(payload["mmap_window_mb"]),
+                progress_callback=_progress_cb,
+                progress_every=max(1, int(block_rows)),
+            )
+    finally:
+        pbar.finish()
+        pbar.close()
+    build_elapsed = max(0.0, time.monotonic() - build_t0)
+    eff_m = int(eff_m_raw)
+    log_success(
+        logger,
+        f"{str(desc)} (Effective SNPs: {eff_m}, n={int(n_use)}) ...Finished "
+        f"[{format_elapsed(build_elapsed)}]",
+        force_color=True,
+    )
+    return eff_m
+
+
+def build_grm_tiled_to_npy_from_meta_payload(
+    *,
+    payload: dict[str, object],
+    out_npy_path: str,
+    sample_indices: np.ndarray | None,
+    method: int,
+    block_rows: int,
+    sample_block: int,
+    threads: int,
+    stage_timing: bool,
+    desc: str,
+    logger,
+) -> int:
+    if _grm_bed_f32_tiled_from_meta_to_npy is None:
+        raise RuntimeError(
+            "Rust GRM tiled NPY kernel is unavailable. Rebuild JanusX extension to export "
+            "`grm_bed_f32_tiled_from_meta_to_npy`."
+        )
+    eff_m_hint = int(payload["eff_m_hint"])
+    pbar = ProgressAdapter(
+        total=max(1, eff_m_hint),
+        desc=str(desc),
+        emit_done=False,
+        force_animate=True,
+    )
+    build_t0 = time.monotonic()
+    last_done = 0
+    last_total = max(1, eff_m_hint)
+
+    def _progress_cb(done: int, total: int) -> None:
+        nonlocal last_done, last_total
+        d = max(0, int(done))
+        t = max(1, int(total))
+        if t != last_total:
+            pbar.set_total(t)
+            last_total = t
+        d = min(d, t)
+        if d > last_done:
+            pbar.update(d - last_done)
+            last_done = d
+
+    try:
+        with _spgrm_timing_env(bool(stage_timing)):
+            eff_m_raw, n_use = _grm_bed_f32_tiled_from_meta_to_npy(
+                str(payload["source_prefix"]),
+                str(out_npy_path),
+                np.asarray(payload["row_source_indices"], dtype=np.int64),
+                np.asarray(payload["row_flip"], dtype=np.bool_),
+                np.asarray(payload["row_maf"], dtype=np.float32),
+                int(payload["n_total_sites"]),
+                sample_indices=(
+                    None
+                    if sample_indices is None
+                    else np.ascontiguousarray(
+                        np.asarray(sample_indices, dtype=np.int64).reshape(-1),
+                        dtype=np.int64,
+                    )
+                ),
+                method=int(method),
+                block_rows=max(1, int(block_rows)),
+                sample_block=max(1, int(sample_block)),
+                threads=max(1, int(threads)),
+                mmap_window_mb=int(payload["mmap_window_mb"]),
+                progress_callback=_progress_cb,
+                progress_every=max(1, int(block_rows)),
+            )
+    finally:
+        pbar.finish()
+        pbar.close()
+    build_elapsed = max(0.0, time.monotonic() - build_t0)
+    eff_m = int(eff_m_raw)
+    log_success(
+        logger,
+        f"{str(desc)} (Effective SNPs: {eff_m}, n={int(n_use)}) ...Finished "
+        f"[{format_elapsed(build_elapsed)}]",
+        force_color=True,
+    )
+    return eff_m
 
 
 def _grm_method_tag(method: int) -> str:
@@ -1354,6 +1836,7 @@ def main(log: bool = True):
             "jx grm -bfile geno_prefix -m 1 --txt",
         ]),
     )
+    parser.set_defaults(snps_only=False)
 
     # ------------------------------------------------------------------
     # Required arguments
@@ -1401,7 +1884,6 @@ def main(log: bool = True):
         geno_default=0.05,
         het_default=0.0,
     )
-    add_common_snps_only_arg(optional_group, default=False, help_profile="default")
     add_common_memory_arg(
         optional_group,
         default=None,
@@ -1428,8 +1910,34 @@ def main(log: bool = True):
         "-txt", "--txt", action="store_true", default=False,
         help="Write dense GRM as plain text instead of the default NPY output.",
     )
+    optional_group.add_argument(
+        "-part", "--part", nargs="+", default=None,
+        help=(
+            "Experimental dense lower-triangle partitioning. "
+            "Use `-part N IDX` to build only part IDX of N GCTA-like work-balanced parts, "
+            "or `-part N` to build all N parts sequentially and materialize the final `.npy`."
+        ),
+    )
+    optional_group.add_argument(
+        "-part-group", "--part-group", nargs=2, default=None,
+        help=(
+            "Experimental dense lower-triangle group strip build. "
+            "Input file must contain two whitespace-delimited columns: sample_id and group_id. "
+            "Groups are sorted by descending size and `IDX` selects the 1-based strip to build."
+        ),
+    )
 
     args = parser.parse_args()
+    try:
+        part_spec, part_group_spec, part_display = _parse_grm_part_cli(
+            getattr(args, "part", None),
+            getattr(args, "part_group", None),
+        )
+    except Exception as ex:
+        parser.error(str(ex))
+    args.part = part_spec
+    args.part_group = part_group_spec
+    args.part_display = part_display
     detected_threads = detect_effective_threads()
     requested_threads = int(args.thread)
     memory_auto_requested = bool(args.memory is None)
@@ -1458,6 +1966,14 @@ def main(log: bool = True):
 
     args.out = os.path.normpath(args.out if args.out is not None else ".")
     outprefix = os.path.join(args.out, args.prefix)
+
+    if args.part is not None or args.part_group is not None:
+        if getattr(args, "dense_grm", None):
+            raise RuntimeError("`-part`/`-part-group` is only supported for genotype-driven GRM builds, not `-k/--dense-grm` input.")
+        if args.sparse is not None:
+            raise RuntimeError("`-part`/`-part-group` cannot be combined with `-sparse/--sparse`.")
+        if bool(args.txt):
+            raise RuntimeError("`-part`/`-part-group` currently writes binary `.npy` output only; `--txt` is not supported.")
 
     # ------------------------------------------------------------------
     # Logging
@@ -1734,6 +2250,145 @@ def main(log: bool = True):
             ("auto" if mmap_window_mb is None else int(mmap_window_mb)),
         ),
     )
+
+    if args.part_group is not None or args.part is not None:
+        _log_verbose_or_file_only(
+            logger,
+            verbose=bool(getattr(args, "verbose", False)),
+            msg=(
+                "GRM experimental part route selected backend: dense-meta-row-band "
+                "(cached filter metadata + stream-batch/tile lower-triangle rows)."
+            ),
+        )
+        payload = _prepare_grm_part_meta_payload(
+            genofile=grm_input,
+            n_samples=n_samples,
+            maf_threshold=maf_threshold,
+            max_missing_rate=max_missing_rate,
+            het_threshold=het_threshold,
+            snps_only=bool(args.snps_only),
+            block_rows=stream_block_rows,
+            mmap_window_mb=mmap_window_mb,
+        )
+        method_tag = _grm_method_tag(args.method)
+
+        if args.part_group is not None:
+            groups_path, group_part_idx = args.part_group
+            ordered_ids, sample_perm, row_ranges, sorted_groups = _load_group_part_order(
+                str(groups_path),
+                sample_ids,
+            )
+            if group_part_idx > len(row_ranges):
+                raise RuntimeError(
+                    f"`-part-group` index {group_part_idx} exceeds group strip count {len(row_ranges)}."
+                )
+            row_start, row_end = row_ranges[group_part_idx - 1]
+            part_path = (
+                f"{outprefix}.{method_tag}.partgroup{len(row_ranges)}.{group_part_idx}.lower.npy"
+            )
+            part_desc = f"GRM group-part {group_part_idx}/{len(row_ranges)}"
+            eff_m = build_grm_row_band_to_npy_from_meta_payload(
+                payload=payload,
+                out_npy_path=part_path,
+                row_start=row_start,
+                row_end=row_end,
+                sample_indices=sample_perm,
+                method=args.method,
+                block_rows=stream_block_rows,
+                sample_block=(row_end - row_start),
+                threads=int(args.thread),
+                stage_timing=bool(args.stage_timing),
+                desc=part_desc,
+                logger=logger,
+            )
+            np.savetxt(f"{part_path}.id", ordered_ids, fmt="%s")
+            log_success(
+                logger,
+                f"Saved dense GRM lower-row part (Effective SNPs: {int(eff_m)}):\n"
+                f"  {format_path_for_display(f'{part_path}.id')}\n"
+                f"  {format_path_for_display(part_path)}",
+            )
+            lt = time.localtime()
+            endinfo = (
+                f"\nFinished GRM calculation. Total wall time: "
+                f"{round(time.time() - t_start, 2)} seconds\n"
+                f"{lt.tm_year}-{lt.tm_mon}-{lt.tm_mday} "
+                f"{lt.tm_hour}:{lt.tm_min}:{lt.tm_sec}"
+            )
+            log_success(logger, endinfo)
+            return
+
+        n_parts, selected_part_idx = args.part
+        row_ranges = _equal_work_row_ranges(n_samples, n_parts)
+        if selected_part_idx is not None and selected_part_idx > len(row_ranges):
+            raise RuntimeError(
+                f"`-part` index {selected_part_idx} exceeds part count {len(row_ranges)}."
+            )
+
+        if selected_part_idx is not None:
+            row_start, row_end = row_ranges[selected_part_idx - 1]
+            part_path = f"{outprefix}.{method_tag}.part{n_parts}.{selected_part_idx}.lower.npy"
+            part_desc = f"GRM part {selected_part_idx}/{n_parts}"
+            eff_m = build_grm_row_band_to_npy_from_meta_payload(
+                payload=payload,
+                out_npy_path=part_path,
+                row_start=row_start,
+                row_end=row_end,
+                sample_indices=None,
+                method=args.method,
+                block_rows=stream_block_rows,
+                sample_block=(row_end - row_start),
+                threads=int(args.thread),
+                stage_timing=bool(args.stage_timing),
+                desc=part_desc,
+                logger=logger,
+            )
+            np.savetxt(f"{part_path}.id", sample_ids, fmt="%s")
+            log_success(
+                logger,
+                f"Saved dense GRM lower-row part (Effective SNPs: {int(eff_m)}):\n"
+                f"  {format_path_for_display(f'{part_path}.id')}\n"
+                f"  {format_path_for_display(part_path)}",
+            )
+            lt = time.localtime()
+            endinfo = (
+                f"\nFinished GRM calculation. Total wall time: "
+                f"{round(time.time() - t_start, 2)} seconds\n"
+                f"{lt.tm_year}-{lt.tm_mon}-{lt.tm_mday} "
+                f"{lt.tm_hour}:{lt.tm_min}:{lt.tm_sec}"
+            )
+            log_success(logger, endinfo)
+            return
+
+        grm_path = f"{outprefix}.{method_tag}.npy"
+        eff_m_final = build_grm_tiled_to_npy_from_meta_payload(
+            payload=payload,
+            out_npy_path=grm_path,
+            sample_indices=None,
+            method=args.method,
+            block_rows=stream_block_rows,
+            sample_block=0,
+            threads=int(args.thread),
+            stage_timing=bool(args.stage_timing),
+            desc=f"GRM part 1..{n_parts} (single-pass)",
+            logger=logger,
+        )
+        np.savetxt(f"{grm_path}.id", sample_ids, fmt="%s")
+        log_success(
+            logger,
+            f"Saved GRM in NPY format (single-pass streamed `-part {int(n_parts)}` merge; Effective SNPs: {int(eff_m_final or 0)}):\n"
+            f"  {format_path_for_display(f'{grm_path}.id')}\n"
+            f"  {format_path_for_display(grm_path)}",
+        )
+        lt = time.localtime()
+        endinfo = (
+            f"\nFinished GRM calculation. Total wall time: "
+            f"{round(time.time() - t_start, 2)} seconds\n"
+            f"{lt.tm_year}-{lt.tm_mon}-{lt.tm_mday} "
+            f"{lt.tm_hour}:{lt.tm_min}:{lt.tm_sec}"
+        )
+        log_success(logger, endinfo)
+        return
 
     if args.sparse is not None:
         sparse_cutoff = float(args.sparse)

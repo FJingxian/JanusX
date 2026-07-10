@@ -50,6 +50,7 @@ from janusx.gfreader import (
     inspect_genotype_file,
     load_bed_2bit_packed,
     load_genotype_chunks,
+    prepare_bed_2bit_packed,
     save_genotype_streaming,
     SiteInfo,
 )
@@ -146,6 +147,12 @@ def _normalize_site_allele(value: object) -> str:
     return str(value).strip().upper()
 
 
+def _simple_snp_only_requested(*, snps_only: bool, biallelic_only: bool) -> bool:
+    # `--biallelic-only` is a historical flag name. The intended behavior here is
+    # to keep only simple single-base A/C/G/T sites.
+    return bool(snps_only) or bool(biallelic_only)
+
+
 def _site_is_biallelic(site: SiteInfo) -> bool:
     ref_allele = _normalize_site_allele(site.ref_allele)
     alt_allele = _normalize_site_allele(site.alt_allele)
@@ -181,14 +188,16 @@ def _apply_site_type_filters(
     snps_only: bool,
     biallelic_only: bool,
 ) -> tuple[np.ndarray, list[SiteInfo]]:
-    if not snps_only and not biallelic_only:
+    if not _simple_snp_only_requested(
+        snps_only=bool(snps_only),
+        biallelic_only=bool(biallelic_only),
+    ):
         return np.asarray(geno), list(sites)
 
-    pred = _site_is_simple_snp if snps_only else _site_is_biallelic
     keep_idx: list[int] = []
     keep_sites: list[SiteInfo] = []
     for i, site in enumerate(sites):
-        if pred(site):
+        if _site_is_simple_snp(site):
             keep_idx.append(i)
             keep_sites.append(site)
 
@@ -764,6 +773,55 @@ def _site_passes_direct_expr(
     return True
 
 
+def _build_site_metadata_keep_mask(
+    sites: Sequence[SiteInfo],
+    *,
+    snp_sites: list[tuple[str, int]] | None,
+    bim_range: tuple[str, int, int] | None,
+    chr_keys: list[str] | set[str] | None,
+    bp_min: int | None,
+    bp_max: int | None,
+    ranges: list[tuple[str, int, int]] | None,
+) -> np.ndarray:
+    n_sites = int(len(sites))
+    if n_sites <= 0:
+        return np.zeros((0,), dtype=np.bool_)
+    if (
+        not snp_sites
+        and bim_range is None
+        and not chr_keys
+        and bp_min is None
+        and bp_max is None
+        and not ranges
+    ):
+        return np.ones((n_sites,), dtype=np.bool_)
+
+    site_set, bim_norm, chr_set, bp_lo, bp_hi, ranges_norm = _prepare_direct_filter_expr(
+        snp_sites=snp_sites,
+        bim_range=bim_range,
+        chr_keys=(set(chr_keys) if chr_keys is not None else None),
+        bp_min=bp_min,
+        bp_max=bp_max,
+        ranges=ranges,
+    )
+    return np.fromiter(
+        (
+            _site_passes_direct_expr(
+                site,
+                site_set=site_set,
+                bim_range=bim_norm,
+                chr_set=chr_set,
+                bp_min=bp_lo,
+                bp_max=bp_hi,
+                ranges=ranges_norm,
+            )
+            for site in sites
+        ),
+        dtype=np.bool_,
+        count=n_sites,
+    )
+
+
 def _filter_chunk_by_site(
     geno: np.ndarray,
     sites: list[SiteInfo],
@@ -1041,11 +1099,43 @@ def _ld_prune_with_maf_priority_packed_plink(
             f"packed_rows={packed.shape[0]}, bim_rows={len(sites_all)}"
         )
 
+    keep = _ld_prune_with_maf_priority_packed_sites(
+        packed=packed,
+        sites=sites_all,
+        n_samples=int(n_samples),
+        spec=spec,
+        threads=int(threads),
+    )
+    return keep, sites_all, packed, int(n_samples)
+
+
+def _ld_prune_with_maf_priority_packed_sites(
+    *,
+    packed: np.ndarray,
+    sites: Sequence[SiteInfo],
+    n_samples: int,
+    spec: PruneSpec,
+    threads: int = 0,
+) -> np.ndarray:
+    if _bed_packed_ld_prune_maf_priority is None:
+        raise RuntimeError(
+            "Rust packed LD prune kernel is unavailable. Rebuild JanusX extension."
+        )
+    packed_arr = np.ascontiguousarray(np.asarray(packed, dtype=np.uint8))
+    if packed_arr.ndim != 2:
+        raise ValueError(f"Invalid packed BED matrix shape: {packed_arr.shape}")
+    site_list = list(sites)
+    if int(packed_arr.shape[0]) != len(site_list):
+        raise ValueError(
+            "Packed prune input mismatch: "
+            f"packed_rows={packed_arr.shape[0]}, sites={len(site_list)}"
+        )
+
     chrom_code_map: dict[str, int] = {}
-    chrom_codes = np.zeros((len(sites_all),), dtype=np.int32)
-    positions = np.zeros((len(sites_all),), dtype=np.int64)
+    chrom_codes = np.zeros((len(site_list),), dtype=np.int32)
+    positions = np.zeros((len(site_list),), dtype=np.int64)
     next_code = 0
-    for i, s in enumerate(sites_all):
+    for i, s in enumerate(site_list):
         c = str(s.chrom)
         if c not in chrom_code_map:
             chrom_code_map[c] = int(next_code)
@@ -1055,7 +1145,7 @@ def _ld_prune_with_maf_priority_packed_plink(
 
     keep = np.asarray(
         _bed_packed_ld_prune_maf_priority(
-            packed=packed,
+            packed=packed_arr,
             n_samples=int(n_samples),
             chrom_codes=chrom_codes,
             positions=positions,
@@ -1075,11 +1165,11 @@ def _ld_prune_with_maf_priority_packed_plink(
         ),
         dtype=bool,
     ).reshape(-1)
-    if int(keep.size) != len(sites_all):
+    if int(keep.size) != len(site_list):
         raise ValueError(
-            f"Rust prune keep-mask mismatch: got {keep.size}, expected {len(sites_all)}"
+            f"Rust prune keep-mask mismatch: got {keep.size}, expected {len(site_list)}"
         )
-    return keep, sites_all, packed, int(n_samples)
+    return keep
 
 
 def _write_plink_subset_from_packed(
@@ -1088,6 +1178,7 @@ def _write_plink_subset_from_packed(
     out_prefix: str,
     packed: np.ndarray,
     keep_mask: np.ndarray,
+    source_row_idx: np.ndarray | None = None,
     max_output_sites: int | None = None,
 ) -> None:
     src = str(src_prefix)
@@ -1110,15 +1201,34 @@ def _write_plink_subset_from_packed(
         raise ValueError(
             f"Packed rows/keep mask mismatch: rows={x.shape[0]}, keep={keep.size}"
         )
+    if source_row_idx is None:
+        selected_source_idx = np.flatnonzero(keep).astype(np.int64, copy=False)
+    else:
+        source_idx = np.ascontiguousarray(
+            np.asarray(source_row_idx, dtype=np.int64).reshape(-1),
+            dtype=np.int64,
+        )
+        if int(source_idx.shape[0]) != int(keep.size):
+            raise ValueError(
+                "Packed rows/source row index mismatch: "
+                f"rows={x.shape[0]}, source_idx={source_idx.shape[0]}"
+            )
+        selected_source_idx = source_idx[np.flatnonzero(keep).astype(np.int64, copy=False)]
+        if selected_source_idx.size > 1 and bool(
+            np.any(selected_source_idx[1:] < selected_source_idx[:-1])
+        ):
+            raise ValueError("Selected PLINK source rows must remain in ascending order.")
+    if max_output_sites is not None:
+        selected_source_idx = selected_source_idx[: max(0, int(max_output_sites))]
+    keep_idx = np.flatnonzero(keep).astype(np.int64, copy=False)
+    if max_output_sites is not None:
+        keep_idx = keep_idx[: max(0, int(max_output_sites))]
 
     Path(out_bed).parent.mkdir(parents=True, exist_ok=True)
 
     # Write SNP-major BED directly from packed rows.
     with open(out_bed, "wb") as fw:
         fw.write(bytes([0x6C, 0x1B, 0x01]))
-        keep_idx = np.flatnonzero(keep)
-        if max_output_sites is not None:
-            keep_idx = keep_idx[: max(0, int(max_output_sites))]
         for i in keep_idx.tolist():
             fw.write(memoryview(x[int(i)]))
 
@@ -1126,17 +1236,130 @@ def _write_plink_subset_from_packed(
     with open(src_bim, "r", encoding="utf-8", errors="replace") as fr, open(
         out_bim, "w", encoding="utf-8"
     ) as fw:
-        written = 0
-        max_rows = None if max_output_sites is None else max(0, int(max_output_sites))
+        row_ptr = 0
+        n_selected = int(selected_source_idx.shape[0])
         for i, line in enumerate(fr):
-            if i < int(keep.size) and bool(keep[i]):
-                if max_rows is not None and written >= max_rows:
-                    break
+            if row_ptr >= n_selected:
+                break
+            if int(selected_source_idx[row_ptr]) == int(i):
                 fw.write(line)
-                written += 1
+                row_ptr += 1
 
     # FAM is unchanged when sample filtering is absent.
     shutil.copyfile(src_fam, out_fam)
+
+
+def _ld_prune_with_mask_first_packed_pipeline(
+    *,
+    src_prefix: str,
+    out_prefix: str,
+    spec: PruneSpec,
+    threads: int,
+    maf_threshold: float,
+    max_missing_rate: float,
+    het_threshold: float,
+    snps_only: bool,
+    biallelic_only: bool,
+    snp_sites: list[tuple[str, int]] | None,
+    bim_range: tuple[str, int, int] | None,
+    chr_keys: list[str] | None,
+    bp_min: int | None,
+    bp_max: int | None,
+    ranges: list[tuple[str, int, int]] | None,
+    max_output_sites: int | None = None,
+) -> tuple[int, int, float]:
+    t0 = time.time()
+    packed_raw, _miss_raw, _maf_raw, _std_raw, _row_flip_raw, site_keep_raw, n_samples, total_sites = (
+        prepare_bed_2bit_packed(
+            str(src_prefix),
+            maf_threshold=float(maf_threshold),
+            max_missing_rate=float(max_missing_rate),
+            het_threshold=float(het_threshold),
+            snps_only=_simple_snp_only_requested(
+                snps_only=bool(snps_only),
+                biallelic_only=bool(biallelic_only),
+            ),
+        )
+    )
+    packed = np.ascontiguousarray(np.asarray(packed_raw, dtype=np.uint8))
+    site_keep = np.ascontiguousarray(
+        np.asarray(site_keep_raw, dtype=np.bool_).reshape(-1),
+        dtype=np.bool_,
+    )
+    total_sites_i = int(total_sites)
+    if int(site_keep.shape[0]) != total_sites_i:
+        raise ValueError(
+            "Packed site-keep mask mismatch: "
+            f"mask={site_keep.shape[0]}, total_sites={total_sites_i}"
+        )
+
+    source_row_idx = np.ascontiguousarray(
+        np.flatnonzero(site_keep).astype(np.int64, copy=False),
+        dtype=np.int64,
+    )
+    if int(packed.shape[0]) != int(source_row_idx.shape[0]):
+        raise ValueError(
+            "Packed rows/site-keep mismatch: "
+            f"packed_rows={packed.shape[0]}, kept_rows={source_row_idx.shape[0]}"
+        )
+
+    sites_all = _read_plink_bim_sites(str(src_prefix))
+    if len(sites_all) != total_sites_i:
+        raise ValueError(
+            "BED/BIM row count mismatch for mask-first prune: "
+            f"bim_rows={len(sites_all)}, total_sites={total_sites_i}"
+        )
+    candidate_sites = [sites_all[int(i)] for i in source_row_idx.tolist()]
+
+    metadata_keep = _build_site_metadata_keep_mask(
+        candidate_sites,
+        snp_sites=snp_sites,
+        bim_range=bim_range,
+        chr_keys=chr_keys,
+        bp_min=bp_min,
+        bp_max=bp_max,
+        ranges=ranges,
+    )
+    if int(metadata_keep.shape[0]) != int(source_row_idx.shape[0]):
+        raise ValueError(
+            "Metadata site mask mismatch in mask-first prune: "
+            f"mask={metadata_keep.shape[0]}, sites={source_row_idx.shape[0]}"
+        )
+    if not bool(np.all(metadata_keep)):
+        keep_local_idx = np.flatnonzero(metadata_keep).astype(np.int64, copy=False)
+        source_row_idx = np.ascontiguousarray(source_row_idx[keep_local_idx], dtype=np.int64)
+        packed = np.ascontiguousarray(np.asarray(packed[metadata_keep], dtype=np.uint8), dtype=np.uint8)
+        candidate_sites = [candidate_sites[int(i)] for i in keep_local_idx.tolist()]
+
+    pre_n = int(source_row_idx.shape[0])
+    if pre_n <= 0:
+        raise ValueError(
+            "All variants were filtered out before LD prune "
+            "(-extract/-chr/-from-bp/-to-bp/-maf/-geno/-het/--snps-only/--biallelic-only)."
+        )
+
+    keep_mask = _ld_prune_with_maf_priority_packed_sites(
+        packed=packed,
+        sites=candidate_sites,
+        n_samples=int(n_samples),
+        spec=spec,
+        threads=int(threads),
+    )
+    keep_n = int(np.sum(keep_mask))
+    if keep_n <= 0:
+        raise ValueError(
+            "All variants were filtered out by LD prune; "
+            "try a looser --prune r^2 threshold or larger window."
+        )
+    _write_plink_subset_from_packed(
+        src_prefix=str(src_prefix),
+        out_prefix=str(out_prefix),
+        packed=packed,
+        keep_mask=keep_mask,
+        source_row_idx=source_row_idx,
+        max_output_sites=max_output_sites,
+    )
+    return keep_n, pre_n, float(time.time() - t0)
 
 
 def _ld_prune_with_external_plink(
@@ -1886,7 +2109,7 @@ def build_parser() -> CliArgumentParser:
         default=False,
         help=(
             "Keep only simple A/C/G/T single-base SNP sites. "
-            "This is stricter than --biallelic-only."
+            "Retained as a compatibility alias of --biallelic-only."
         ),
     )
     opt.add_argument(
@@ -1895,8 +2118,8 @@ def build_parser() -> CliArgumentParser:
         action="store_true",
         default=False,
         help=(
-            "Keep only sites with exactly one REF allele and one ALT allele "
-            "(drops multiallelic rows; retains non-SNP biallelic sites such as indels)."
+            "Keep only simple A/C/G/T single-base SNP sites. "
+            "Despite the historical flag name, indels and other non-ATCG alleles are removed."
         ),
     )
     opt.add_argument(
@@ -2045,8 +2268,8 @@ def main() -> None:
                     ),
                     ("Chr filter", ",".join(sorted(chr_keys)) if chr_keys else "None"),
                     ("BP range", f"{args.from_bp if args.from_bp is not None else '-'}..{args.to_bp if args.to_bp is not None else '-'}"),
-                    ("ATCG SNP only", bool(args.snps_only)),
-                    ("Biallelic only", bool(args.biallelic_only)),
+                    ("ATCG SNP only (--snps-only)", bool(args.snps_only)),
+                    ("ATCG SNP only alias (--biallelic-only)", bool(args.biallelic_only)),
                     ("MAF threshold", float(args.maf)),
                     ("Miss threshold", float(args.geno)),
                     ("Het threshold", float(args.het)),
@@ -2129,6 +2352,10 @@ def main() -> None:
 
     reader_model = "het" if float(args.het) > 0.0 else "add"
     reader_het = float(args.het) if float(args.het) > 0.0 else 0.02
+    site_type_snps_only = _simple_snp_only_requested(
+        snps_only=bool(args.snps_only),
+        biallelic_only=bool(args.biallelic_only),
+    )
 
     # Direct Rust packed path for PLINK -> PLINK conversion with all non-prune filters.
     # This keeps Python-side object construction minimal and sinks filtering/writing into Rust.
@@ -2328,7 +2555,6 @@ def main() -> None:
         and prune_spec is None
         and source_kind in {"plink", "vcf", "hmp"}
         and out_fmt in {"plink", "vcf", "hmp"}
-        and (not bool(args.biallelic_only))
         and push_snp_sites is None
         and push_bim_range is None
         and (not post_filter.active())
@@ -2379,7 +2605,7 @@ def main() -> None:
                     progress_callback=_on_convert_progress,
                     progress_every=int(progress_every),
                     threads=int(args.thread),
-                    snps_only=bool(args.snps_only),
+                    snps_only=bool(site_type_snps_only),
                     maf=float(args.maf),
                     geno=float(args.geno),
                     impute=False,
@@ -2403,7 +2629,7 @@ def main() -> None:
                 direct_output,
                 out_fmt=str(out_fmt),
                 threads=int(args.thread),
-                snps_only=bool(args.snps_only),
+                snps_only=bool(site_type_snps_only),
                 maf=float(args.maf),
                 geno=float(args.geno),
                 impute=False,
@@ -2493,7 +2719,7 @@ def main() -> None:
                 impute=False,
                 model=reader_model,
                 het=reader_het,
-                snps_only=bool(args.snps_only),
+                snps_only=bool(site_type_snps_only),
                 sample_ids=keep_sample_ids,
                 snp_sites=push_snp_sites,
                 bim_range=push_bim_range,
@@ -2551,6 +2777,7 @@ def main() -> None:
             or push_snp_sites is not None
             or push_bim_range is not None
             or post_filter.active()
+            or bool(site_type_snps_only)
             or float(args.maf) > 0.0
             or float(args.geno) < 1.0
             or float(args.het) > 0.0
@@ -2563,6 +2790,7 @@ def main() -> None:
             and push_snp_sites is None
             and push_bim_range is None
             and (not post_filter.active())
+            and (not bool(site_type_snps_only))
             and float(args.maf) <= 0.0
             and float(args.geno) >= 1.0
             and float(args.het) <= 0.0
@@ -2574,12 +2802,20 @@ def main() -> None:
             and push_snp_sites is None
             and push_bim_range is None
             and (not post_filter.active())
+            and (not bool(site_type_snps_only))
             and float(args.maf) <= 0.0
             and float(args.geno) >= 1.0
             and float(args.het) <= 0.0
         )
+        use_masked_packed_prune_direct = bool(
+            source_kind == "plink"
+            and out_fmt == "plink"
+            and keep_sample_ids is None
+            and has_prune_prefilters
+            and _bed_packed_ld_prune_maf_priority is not None
+        )
         if (
-            use_packed_prune_fastpath
+            (use_packed_prune_fastpath or use_masked_packed_prune_direct)
             and (not use_external_plink_prune)
             and _packed_prune_kernel_stats is not None
         ):
@@ -2598,6 +2834,11 @@ def main() -> None:
             source_kind == "plink"
             and out_fmt == "plink"
             and has_prune_prefilters
+            and (not bool(site_type_snps_only))
+            and (
+                keep_sample_ids is not None
+                or (not use_masked_packed_prune_direct)
+            )
             and _bed_filter_to_plink_rust is not None
             and _bed_prune_to_plink_rust is not None
         )
@@ -2827,7 +3068,35 @@ def main() -> None:
         else:
             with CliStatus(prune_desc, enabled=status_enabled) as task:
                 try:
-                    if use_rust_prune_filtered_direct:
+                    if use_masked_packed_prune_direct:
+                        keep_n, pre_n, wall = _ld_prune_with_mask_first_packed_pipeline(
+                            src_prefix=str(gfile),
+                            out_prefix=str(out_prefix),
+                            spec=prune_spec,
+                            threads=int(args.thread),
+                            maf_threshold=float(args.maf),
+                            max_missing_rate=float(args.geno),
+                            het_threshold=float(args.het),
+                            snps_only=bool(args.snps_only),
+                            biallelic_only=bool(args.biallelic_only),
+                            snp_sites=push_snp_sites,
+                            bim_range=push_bim_range,
+                            chr_keys=(
+                                sorted(list(post_filter.chr_keys))
+                                if post_filter.chr_keys
+                                else None
+                            ),
+                            bp_min=(int(post_filter.bp_min) if post_filter.bp_min is not None else None),
+                            bp_max=(int(post_filter.bp_max) if post_filter.bp_max is not None else None),
+                            ranges=post_filter.ranges,
+                            max_output_sites=output_site_limit,
+                        )
+                        rust_prune_direct_wall = float(wall)
+                        prune_pre_sites = int(pre_n)
+                        selected_n_sites = int(keep_n)
+                        rust_prune_direct_done = True
+                        prune_direct_backend = "rust-packed-mask-first-io"
+                    elif use_rust_prune_filtered_direct:
                         keep_n, total_n, pre_n, wall, out_n = _ld_prune_with_rust_filtered_pipeline(
                             src_prefix=str(gfile),
                             out_prefix=str(out_prefix),
@@ -2961,7 +3230,7 @@ def main() -> None:
                     f"(backend={backend}, kept={selected_n_sites}, dropped={int(prune_pre_sites - selected_n_sites)})",
                 )
         if (
-            use_packed_prune_fastpath
+            (use_packed_prune_fastpath or use_masked_packed_prune_direct)
             and (not use_external_plink_prune)
             and _packed_prune_kernel_stats is not None
         ):

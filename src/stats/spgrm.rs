@@ -61,8 +61,9 @@
 //!   filtered marker metadata are prepared first, after which BED payload blocks are fetched
 //!   through full mmap or windowed mmap and reused across sample-tile tasks within a batch.
 //!
-use memmap2::{Mmap, MmapOptions};
-use numpy::{PyReadonlyArray1, PyReadonlyArray2};
+use memmap2::{Mmap, MmapMut, MmapOptions};
+use numpy::ndarray::Array2;
+use numpy::{PyArray2, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use rayon::prelude::*;
@@ -1114,6 +1115,104 @@ fn spgrm_npy_read_value(
     }
 }
 
+struct SpgrmNpyF32Writer {
+    _file: File,
+    mmap: MmapMut,
+    data_offset: usize,
+    len_f32: usize,
+}
+
+impl SpgrmNpyF32Writer {
+    fn create(path: &str, rows: usize, cols: usize) -> Result<Self, String> {
+        let mut header =
+            format!("{{'descr': '<f4', 'fortran_order': False, 'shape': ({rows}, {cols}), }}");
+        while (10 + header.len() + 1) % 16 != 0 {
+            header.push(' ');
+        }
+        header.push('\n');
+        let header_len_u16 = u16::try_from(header.len())
+            .map_err(|_| "npy header too long for v1.0 format".to_string())?;
+        let data_offset = 10usize
+            .checked_add(header.len())
+            .ok_or_else(|| "npy payload offset overflow".to_string())?;
+        let len_f32 = rows
+            .checked_mul(cols)
+            .ok_or_else(|| "npy matrix element count overflow".to_string())?;
+        let payload_bytes = len_f32
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| "npy payload byte size overflow".to_string())?;
+        let total_bytes = data_offset
+            .checked_add(payload_bytes)
+            .ok_or_else(|| "npy total byte size overflow".to_string())?;
+
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(|e| format!("create npy file failed: {e}"))?;
+        file.set_len(total_bytes as u64)
+            .map_err(|e| format!("resize npy file failed: {e}"))?;
+        file.seek(SeekFrom::Start(0))
+            .map_err(|e| format!("seek npy file failed: {e}"))?;
+        file.write_all(b"\x93NUMPY")
+            .map_err(|e| format!("write npy magic failed: {e}"))?;
+        file.write_all(&[1_u8, 0_u8])
+            .map_err(|e| format!("write npy version failed: {e}"))?;
+        file.write_all(&header_len_u16.to_le_bytes())
+            .map_err(|e| format!("write npy header length failed: {e}"))?;
+        file.write_all(header.as_bytes())
+            .map_err(|e| format!("write npy header failed: {e}"))?;
+        file.flush()
+            .map_err(|e| format!("flush npy header failed: {e}"))?;
+
+        let mmap = unsafe { MmapOptions::new().len(total_bytes).map_mut(&file) }
+            .map_err(|e| format!("map npy file failed: {e}"))?;
+        Ok(Self {
+            _file: file,
+            mmap,
+            data_offset,
+            len_f32,
+        })
+    }
+
+    fn payload_mut(&mut self) -> Result<&mut [f32], String> {
+        if self.data_offset % std::mem::align_of::<f32>() != 0 {
+            return Err("npy payload offset is not f32-aligned".to_string());
+        }
+        let payload = &mut self.mmap[self.data_offset..];
+        let expected_bytes = self
+            .len_f32
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| "npy payload byte size overflow".to_string())?;
+        if payload.len() != expected_bytes {
+            return Err(format!(
+                "npy payload size mismatch: got {}, expected {}",
+                payload.len(),
+                expected_bytes
+            ));
+        }
+        #[cfg(target_endian = "little")]
+        unsafe {
+            Ok(std::slice::from_raw_parts_mut(
+                payload.as_mut_ptr() as *mut f32,
+                self.len_f32,
+            ))
+        }
+        #[cfg(not(target_endian = "little"))]
+        {
+            Err("direct NPY writer requires little-endian host".to_string())
+        }
+    }
+
+    fn flush(&mut self) -> Result<(), String> {
+        self.mmap
+            .flush()
+            .map_err(|e| format!("flush npy mmap failed: {e}"))
+    }
+}
+
 #[inline]
 fn spgrm_row_block_rows(
     requested: usize,
@@ -2116,6 +2215,19 @@ fn build_spgrm_tasks(n_use: usize, sample_step: usize) -> Vec<SpgrmTask> {
 }
 
 #[inline]
+fn build_spgrm_row_band_tasks(
+    n_use: usize,
+    sample_step: usize,
+    row_band_start: usize,
+    row_band_end: usize,
+) -> Vec<SpgrmTask> {
+    build_spgrm_tasks(n_use, sample_step)
+        .into_iter()
+        .filter(|task| task.row_end > row_band_start && task.row_start < row_band_end)
+        .collect()
+}
+
+#[inline]
 fn spgrm_task_accum_bytes(task: SpgrmTask) -> usize {
     (task.row_end - task.row_start)
         .saturating_mul(task.col_end - task.col_start)
@@ -2589,6 +2701,99 @@ fn spgrm_collect_batch_entries(
         }
     }
     Ok(out)
+}
+
+fn spgrm_collect_batch_dense_rows(
+    task_accum: &[SpgrmBatchTaskAccum],
+    row_band_start: usize,
+    row_band_end: usize,
+    inv_scale: f64,
+    n_use: usize,
+    out: &mut [f32],
+) -> Result<(), String> {
+    let n_rows_band = row_band_end.saturating_sub(row_band_start);
+    let expected_len = n_rows_band.saturating_mul(n_use);
+    if out.len() != expected_len {
+        return Err(format!(
+            "dense GRM part output length mismatch: got {}, expected {}",
+            out.len(),
+            expected_len
+        ));
+    }
+    for task_acc in task_accum {
+        let task = task_acc.task;
+        let n_col = task.col_end - task.col_start;
+        let n_row = task.row_end - task.row_start;
+        let diagonal_tile = task.row_start == task.col_start;
+        for local_col in 0..n_col {
+            let global_col = task.col_start + local_col;
+            let row_begin = if diagonal_tile { local_col } else { 0usize };
+            for local_row in row_begin..n_row {
+                let global_row = task.row_start + local_row;
+                if global_row < row_band_start || global_row >= row_band_end {
+                    continue;
+                }
+                let accum_idx = if task_acc.accum_row_major {
+                    local_row * n_col + local_col
+                } else {
+                    local_row + local_col * n_row
+                };
+                let scaled = task_acc.accum[accum_idx] * inv_scale;
+                if !scaled.is_finite() {
+                    return Err(format!(
+                        "Dense GRM part produced non-finite value at pair ({global_row}, {global_col})"
+                    ));
+                }
+                let out_row = global_row - row_band_start;
+                out[out_row * n_use + global_col] = scaled as f32;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn spgrm_collect_batch_dense_full_matrix(
+    task_accum: &[SpgrmBatchTaskAccum],
+    inv_scale: f64,
+    n_use: usize,
+    out: &mut [f32],
+) -> Result<(), String> {
+    let expected_len = n_use.saturating_mul(n_use);
+    if out.len() != expected_len {
+        return Err(format!(
+            "dense GRM full output length mismatch: got {}, expected {}",
+            out.len(),
+            expected_len
+        ));
+    }
+    for task_acc in task_accum {
+        let task = task_acc.task;
+        let n_col = task.col_end - task.col_start;
+        let n_row = task.row_end - task.row_start;
+        let diagonal_tile = task.row_start == task.col_start;
+        for local_col in 0..n_col {
+            let global_col = task.col_start + local_col;
+            let row_begin = if diagonal_tile { local_col } else { 0usize };
+            for local_row in row_begin..n_row {
+                let global_row = task.row_start + local_row;
+                let accum_idx = if task_acc.accum_row_major {
+                    local_row * n_col + local_col
+                } else {
+                    local_row + local_col * n_row
+                };
+                let scaled = task_acc.accum[accum_idx] * inv_scale;
+                if !scaled.is_finite() {
+                    return Err(format!(
+                        "Dense GRM full writer produced non-finite value at pair ({global_row}, {global_col})"
+                    ));
+                }
+                let scaled_f32 = scaled as f32;
+                out[global_row * n_use + global_col] = scaled_f32;
+                out[global_col * n_use + global_row] = scaled_f32;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn write_sorted_entries_to_jxgrm(
@@ -4057,6 +4262,678 @@ fn spgrm_stream_bed_to_jxgrm_core(
     Ok((out_path, n_samples, nnz))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn grm_stream_bed_row_band_f32_fill_core(
+    bed_prefix: &str,
+    sample_idx: &[usize],
+    meta: &crate::gfreader::PreparedBedLogicMetaOwned,
+    row_band_start: usize,
+    row_band_end: usize,
+    method: usize,
+    block_rows: usize,
+    sample_block: usize,
+    threads: usize,
+    mmap_window_mb: Option<usize>,
+    progress_callback: Option<&Py<PyAny>>,
+    progress_every: usize,
+    out: &mut [f32],
+) -> Result<(usize, usize), String> {
+    let n_samples_full = meta.n_samples;
+    if n_samples_full == 0 {
+        return Err("Dense GRM part requires n_samples > 0".to_string());
+    }
+    if method != 1 && method != 2 {
+        return Err(format!(
+            "Dense GRM part method must be 1 (centered) or 2 (standardized); got {method}"
+        ));
+    }
+    if sample_idx.is_empty() {
+        return Err("Dense GRM part sample_indices must not be empty".to_string());
+    }
+    if let Some(&bad) = sample_idx.iter().find(|&&sid| sid >= n_samples_full) {
+        return Err(format!(
+            "Dense GRM part sample index out of range: {bad} >= {n_samples_full}"
+        ));
+    }
+    let m = meta.row_source_indices.len();
+    if m == 0 {
+        return Err("Dense GRM part requires at least one SNP row".to_string());
+    }
+    if meta.row_flip.len() != m || meta.maf.len() != m {
+        return Err("Dense GRM part metadata length mismatch".to_string());
+    }
+    let n_use = sample_idx.len();
+    if row_band_start >= row_band_end || row_band_end > n_use {
+        return Err(format!(
+            "Dense GRM part row band is invalid: start={}, end={}, n_samples={n_use}",
+            row_band_start, row_band_end
+        ));
+    }
+
+    let stream_double_buffer = spgrm_stream_double_buffer_requested(threads);
+    let decode_buffers = if stream_double_buffer { 2usize } else { 1usize };
+    let memory_plan = spgrm_resolve_stream_memory_plan(
+        m,
+        n_use,
+        n_samples_full,
+        block_rows,
+        sample_block,
+        threads,
+        decode_buffers,
+    );
+    let row_band_len = row_band_end - row_band_start;
+    let sample_step = memory_plan.sample_step.max(1);
+    let row_step = memory_plan.row_step;
+    let denom = if method == 1 {
+        let acc = meta
+            .maf
+            .iter()
+            .map(|&maf| {
+                let p = maf as f64;
+                2.0_f64 * p * (1.0_f64 - p)
+            })
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .sum::<f64>();
+        if !(acc.is_finite() && acc > 0.0) {
+            return Err("Dense GRM part centered denominator is not positive".to_string());
+        }
+        acc
+    } else {
+        m as f64
+    };
+    let inv_scale = 1.0_f64 / denom;
+    let tasks = build_spgrm_row_band_tasks(n_use, sample_step, row_band_start, row_band_end);
+    if tasks.is_empty() {
+        return Err("Dense GRM part row band resolved no tasks".to_string());
+    }
+    let task_batches = build_spgrm_task_batches(
+        tasks.as_slice(),
+        row_step,
+        spgrm_batch_limits(
+            row_step,
+            sample_step,
+            memory_plan.max_decoded_bytes,
+            threads,
+        ),
+    );
+    let total_batches = task_batches.len().max(1);
+    let total_progress = total_batches.saturating_mul(m).max(1);
+    let notify_step = if progress_every == 0 {
+        row_step.max(1)
+    } else {
+        progress_every.max(1)
+    };
+    let timing = if spgrm_stage_timing_enabled() {
+        Some(Arc::new(SpgrmStageTiming::default()))
+    } else {
+        None
+    };
+    let (row_mean, row_inv_sd) = spgrm_row_mean_and_inv_sd(meta.maf.as_slice(), method);
+    let mut bed_window = if let Some(window_mb) = mmap_window_mb {
+        if window_mb == 0 {
+            return Err("Dense GRM part mmap_window_mb must be > 0".to_string());
+        }
+        Some(WindowedBedMatrix::open(bed_prefix, window_mb)?)
+    } else {
+        None
+    };
+    let full_mmap = if bed_window.is_none() {
+        Some(spgrm_open_bed_payload_mmap(
+            bed_prefix,
+            meta.n_samples,
+            meta.n_snps_total,
+            meta.bytes_per_snp,
+        )?)
+    } else {
+        None
+    };
+    let code4_lut = &packed_byte_lut().code4;
+    let pool = get_cached_pool(threads).map_err(|e| e.to_string())?;
+    let use_double_buffer = stream_double_buffer && m > row_step;
+    let stream_split_single_task =
+        spgrm_single_diag_task_subtile_step(tasks.as_slice(), threads).is_some();
+    let blas_threads = if threads <= 1 {
+        None
+    } else if tasks.len() > 1 || stream_split_single_task {
+        Some(1usize)
+    } else {
+        Some(threads.max(1))
+    };
+    let _blas_guard = blas_threads.map(BlasThreadGuard::enter);
+    let expected_len = row_band_len.saturating_mul(n_use);
+    if out.len() != expected_len {
+        return Err(format!(
+            "dense GRM part output length mismatch: got {}, expected {}",
+            out.len(),
+            expected_len
+        ));
+    }
+    out.fill(0.0_f32);
+    let mut last_notified = 0usize;
+
+    spgrm_progress_notify(
+        progress_callback,
+        0usize,
+        total_progress,
+        notify_step,
+        &mut last_notified,
+        true,
+    )?;
+
+    for (batch_idx, batch) in task_batches.iter().enumerate() {
+        let task_batch = &tasks[batch.start..batch.end];
+        let (stripe_template, mut task_accum) =
+            spgrm_build_stream_batch(task_batch, row_step, sample_idx, n_samples_full, threads);
+
+        if use_double_buffer {
+            let decode_error = Arc::new(Mutex::new(None::<String>));
+            let producer_error = decode_error.clone();
+            let mut next_row_start = 0usize;
+            let mut rel_row_indices = Vec::<usize>::new();
+            let make_buffer = || SpgrmDecodedBatchBuffer {
+                stripe_scratch: stripe_template.clone(),
+                row_start: 0usize,
+                cur_rows: 0usize,
+            };
+            let producer = |buf: &mut SpgrmDecodedBatchBuffer| -> bool {
+                if next_row_start >= m {
+                    buf.row_start = 0usize;
+                    buf.cur_rows = 0usize;
+                    return false;
+                }
+                let row_start = next_row_start;
+                match spgrm_decode_stream_batch_buffer(
+                    buf,
+                    row_start,
+                    row_step,
+                    m,
+                    sample_idx,
+                    &meta,
+                    row_mean.as_slice(),
+                    row_inv_sd.as_slice(),
+                    bed_window.as_mut(),
+                    full_mmap.as_ref(),
+                    &mut rel_row_indices,
+                    code4_lut,
+                    pool.as_ref(),
+                    timing.as_deref(),
+                ) {
+                    Ok(()) => {
+                        next_row_start = row_start + buf.cur_rows;
+                        next_row_start < m
+                    }
+                    Err(err) => {
+                        *producer_error.lock().unwrap() = Some(err);
+                        buf.row_start = usize::MAX;
+                        buf.cur_rows = 0usize;
+                        false
+                    }
+                }
+            };
+            let consumer_error = decode_error.clone();
+            let consumer = |buf: &mut SpgrmDecodedBatchBuffer| -> Result<(), String> {
+                if buf.cur_rows == 0 {
+                    if buf.row_start == usize::MAX {
+                        return Err(consumer_error
+                            .lock()
+                            .unwrap()
+                            .take()
+                            .unwrap_or_else(|| "Dense GRM part decode failed".to_string()));
+                    }
+                    return Ok(());
+                }
+                spgrm_consume_stream_batch_buffer(
+                    buf,
+                    task_accum.as_mut_slice(),
+                    batch_idx,
+                    m,
+                    0usize,
+                    total_progress,
+                    notify_step,
+                    &mut last_notified,
+                    progress_callback,
+                    threads,
+                    pool.as_ref(),
+                    timing.as_deref(),
+                )
+            };
+            run_double_buffer(2usize, make_buffer, producer, consumer)?;
+            let decode_err = decode_error.lock().unwrap().take();
+            if let Some(err) = decode_err {
+                return Err(err);
+            }
+        } else {
+            let mut decoded = SpgrmDecodedBatchBuffer {
+                stripe_scratch: stripe_template,
+                row_start: 0usize,
+                cur_rows: 0usize,
+            };
+            let mut rel_row_indices = Vec::<usize>::new();
+            for row_start in (0..m).step_by(row_step) {
+                spgrm_decode_stream_batch_buffer(
+                    &mut decoded,
+                    row_start,
+                    row_step,
+                    m,
+                    sample_idx,
+                    &meta,
+                    row_mean.as_slice(),
+                    row_inv_sd.as_slice(),
+                    bed_window.as_mut(),
+                    full_mmap.as_ref(),
+                    &mut rel_row_indices,
+                    code4_lut,
+                    pool.as_ref(),
+                    timing.as_deref(),
+                )?;
+                spgrm_consume_stream_batch_buffer(
+                    &decoded,
+                    task_accum.as_mut_slice(),
+                    batch_idx,
+                    m,
+                    0usize,
+                    total_progress,
+                    notify_step,
+                    &mut last_notified,
+                    progress_callback,
+                    threads,
+                    pool.as_ref(),
+                    timing.as_deref(),
+                )?;
+            }
+        }
+
+        spgrm_collect_batch_dense_rows(
+            task_accum.as_slice(),
+            row_band_start,
+            row_band_end,
+            inv_scale,
+            n_use,
+            out,
+        )?;
+    }
+
+    spgrm_progress_notify(
+        progress_callback,
+        total_progress,
+        total_progress,
+        notify_step,
+        &mut last_notified,
+        true,
+    )?;
+    if let Some(timing) = timing.as_deref() {
+        spgrm_emit_timing_summary("dense-row-band", n_use, m, sample_step, row_step, timing);
+    }
+    Ok((m, n_use))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn grm_stream_bed_row_band_f32_core(
+    bed_prefix: &str,
+    sample_idx: &[usize],
+    meta: crate::gfreader::PreparedBedLogicMetaOwned,
+    row_band_start: usize,
+    row_band_end: usize,
+    method: usize,
+    block_rows: usize,
+    sample_block: usize,
+    threads: usize,
+    mmap_window_mb: Option<usize>,
+    progress_callback: Option<&Py<PyAny>>,
+    progress_every: usize,
+) -> Result<(Vec<f32>, usize, usize), String> {
+    let n_use = sample_idx.len();
+    let row_band_len = row_band_end.saturating_sub(row_band_start);
+    let mut out = vec![0.0_f32; row_band_len.saturating_mul(n_use)];
+    let (eff_m, n_use_out) = grm_stream_bed_row_band_f32_fill_core(
+        bed_prefix,
+        sample_idx,
+        &meta,
+        row_band_start,
+        row_band_end,
+        method,
+        block_rows,
+        sample_block,
+        threads,
+        mmap_window_mb,
+        progress_callback,
+        progress_every,
+        out.as_mut_slice(),
+    )?;
+    Ok((out, eff_m, n_use_out))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn grm_stream_bed_row_band_f32_to_npy_core(
+    bed_prefix: &str,
+    sample_idx: &[usize],
+    meta: crate::gfreader::PreparedBedLogicMetaOwned,
+    row_band_start: usize,
+    row_band_end: usize,
+    out_npy_path: &str,
+    method: usize,
+    block_rows: usize,
+    sample_block: usize,
+    threads: usize,
+    mmap_window_mb: Option<usize>,
+    progress_callback: Option<&Py<PyAny>>,
+    progress_every: usize,
+) -> Result<(usize, usize), String> {
+    let n_use = sample_idx.len();
+    let row_band_len = row_band_end.saturating_sub(row_band_start);
+    let mut writer = SpgrmNpyF32Writer::create(out_npy_path, row_band_len, n_use)?;
+    {
+        let out = writer.payload_mut()?;
+        let expected_len = row_band_len.saturating_mul(n_use);
+        if out.len() != expected_len {
+            return Err(format!(
+                "dense GRM part npy payload length mismatch: got {}, expected {}",
+                out.len(),
+                expected_len
+            ));
+        }
+        out.fill(0.0_f32);
+        let _ = grm_stream_bed_row_band_f32_fill_core(
+            bed_prefix,
+            sample_idx,
+            &meta,
+            row_band_start,
+            row_band_end,
+            method,
+            block_rows,
+            sample_block,
+            threads,
+            mmap_window_mb,
+            progress_callback,
+            progress_every,
+            out,
+        )?;
+    }
+    writer.flush()?;
+    Ok((meta.row_source_indices.len(), n_use))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn grm_stream_bed_full_f32_to_npy_core(
+    bed_prefix: &str,
+    sample_idx: &[usize],
+    meta: crate::gfreader::PreparedBedLogicMetaOwned,
+    out_npy_path: &str,
+    method: usize,
+    block_rows: usize,
+    sample_block: usize,
+    threads: usize,
+    mmap_window_mb: Option<usize>,
+    progress_callback: Option<&Py<PyAny>>,
+    progress_every: usize,
+) -> Result<(usize, usize), String> {
+    let n_samples_full = meta.n_samples;
+    if n_samples_full == 0 {
+        return Err("Dense GRM full writer requires n_samples > 0".to_string());
+    }
+    if method != 1 && method != 2 {
+        return Err(format!(
+            "Dense GRM full writer method must be 1 (centered) or 2 (standardized); got {method}"
+        ));
+    }
+    if sample_idx.is_empty() {
+        return Err("Dense GRM full writer sample_indices must not be empty".to_string());
+    }
+    if let Some(&bad) = sample_idx.iter().find(|&&sid| sid >= n_samples_full) {
+        return Err(format!(
+            "Dense GRM full writer sample index out of range: {bad} >= {n_samples_full}"
+        ));
+    }
+    let m = meta.row_source_indices.len();
+    if m == 0 {
+        return Err("Dense GRM full writer requires at least one SNP row".to_string());
+    }
+    if meta.row_flip.len() != m || meta.maf.len() != m {
+        return Err("Dense GRM full writer metadata length mismatch".to_string());
+    }
+    let n_use = sample_idx.len();
+
+    let stream_double_buffer = spgrm_stream_double_buffer_requested(threads);
+    let decode_buffers = if stream_double_buffer { 2usize } else { 1usize };
+    let memory_plan = spgrm_resolve_stream_memory_plan(
+        m,
+        n_use,
+        n_samples_full,
+        block_rows,
+        sample_block,
+        threads,
+        decode_buffers,
+    );
+    let sample_step = memory_plan.sample_step.max(1);
+    let row_step = memory_plan.row_step;
+    let denom = if method == 1 {
+        let acc = meta
+            .maf
+            .iter()
+            .map(|&maf| {
+                let p = maf as f64;
+                2.0_f64 * p * (1.0_f64 - p)
+            })
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .sum::<f64>();
+        if !(acc.is_finite() && acc > 0.0) {
+            return Err("Dense GRM full writer centered denominator is not positive".to_string());
+        }
+        acc
+    } else {
+        m as f64
+    };
+    let inv_scale = 1.0_f64 / denom;
+    let tasks = build_spgrm_tasks(n_use, sample_step);
+    let task_batches = build_spgrm_task_batches(
+        tasks.as_slice(),
+        row_step,
+        spgrm_batch_limits(
+            row_step,
+            sample_step,
+            memory_plan.max_decoded_bytes,
+            threads,
+        ),
+    );
+    let total_batches = task_batches.len().max(1);
+    let total_progress = total_batches.saturating_mul(m).max(1);
+    let notify_step = if progress_every == 0 {
+        row_step.max(1)
+    } else {
+        progress_every.max(1)
+    };
+    let timing = if spgrm_stage_timing_enabled() {
+        Some(Arc::new(SpgrmStageTiming::default()))
+    } else {
+        None
+    };
+    let (row_mean, row_inv_sd) = spgrm_row_mean_and_inv_sd(meta.maf.as_slice(), method);
+    let mut bed_window = if let Some(window_mb) = mmap_window_mb {
+        if window_mb == 0 {
+            return Err("Dense GRM full writer mmap_window_mb must be > 0".to_string());
+        }
+        Some(WindowedBedMatrix::open(bed_prefix, window_mb)?)
+    } else {
+        None
+    };
+    let full_mmap = if bed_window.is_none() {
+        Some(spgrm_open_bed_payload_mmap(
+            bed_prefix,
+            meta.n_samples,
+            meta.n_snps_total,
+            meta.bytes_per_snp,
+        )?)
+    } else {
+        None
+    };
+    let code4_lut = &packed_byte_lut().code4;
+    let pool = get_cached_pool(threads).map_err(|e| e.to_string())?;
+    let use_double_buffer = stream_double_buffer && m > row_step;
+    let stream_split_single_task =
+        spgrm_single_diag_task_subtile_step(tasks.as_slice(), threads).is_some();
+    let blas_threads = if threads <= 1 {
+        None
+    } else if tasks.len() > 1 || stream_split_single_task {
+        Some(1usize)
+    } else {
+        Some(threads.max(1))
+    };
+    let _blas_guard = blas_threads.map(BlasThreadGuard::enter);
+    let mut writer = SpgrmNpyF32Writer::create(out_npy_path, n_use, n_use)?;
+    {
+        let out = writer.payload_mut()?;
+        out.fill(0.0_f32);
+        let mut last_notified = 0usize;
+
+        spgrm_progress_notify(
+            progress_callback,
+            0usize,
+            total_progress,
+            notify_step,
+            &mut last_notified,
+            true,
+        )?;
+
+        for (batch_idx, batch) in task_batches.iter().enumerate() {
+            let task_batch = &tasks[batch.start..batch.end];
+            let (stripe_template, mut task_accum) =
+                spgrm_build_stream_batch(task_batch, row_step, sample_idx, n_samples_full, threads);
+
+            if use_double_buffer {
+                let decode_error = Arc::new(Mutex::new(None::<String>));
+                let producer_error = decode_error.clone();
+                let mut next_row_start = 0usize;
+                let mut rel_row_indices = Vec::<usize>::new();
+                let make_buffer = || SpgrmDecodedBatchBuffer {
+                    stripe_scratch: stripe_template.clone(),
+                    row_start: 0usize,
+                    cur_rows: 0usize,
+                };
+                let producer = |buf: &mut SpgrmDecodedBatchBuffer| -> bool {
+                    if next_row_start >= m {
+                        buf.row_start = 0usize;
+                        buf.cur_rows = 0usize;
+                        return false;
+                    }
+                    let row_start = next_row_start;
+                    match spgrm_decode_stream_batch_buffer(
+                        buf,
+                        row_start,
+                        row_step,
+                        m,
+                        sample_idx,
+                        &meta,
+                        row_mean.as_slice(),
+                        row_inv_sd.as_slice(),
+                        bed_window.as_mut(),
+                        full_mmap.as_ref(),
+                        &mut rel_row_indices,
+                        code4_lut,
+                        pool.as_ref(),
+                        timing.as_deref(),
+                    ) {
+                        Ok(()) => {
+                            next_row_start = row_start + buf.cur_rows;
+                            next_row_start < m
+                        }
+                        Err(err) => {
+                            *producer_error.lock().unwrap() = Some(err);
+                            buf.row_start = usize::MAX;
+                            buf.cur_rows = 0usize;
+                            false
+                        }
+                    }
+                };
+                let consumer_error = decode_error.clone();
+                let consumer = |buf: &mut SpgrmDecodedBatchBuffer| -> Result<(), String> {
+                    if buf.cur_rows == 0 {
+                        if buf.row_start == usize::MAX {
+                            return Err(consumer_error.lock().unwrap().take().unwrap_or_else(
+                                || "Dense GRM full writer decode failed".to_string(),
+                            ));
+                        }
+                        return Ok(());
+                    }
+                    spgrm_consume_stream_batch_buffer(
+                        buf,
+                        task_accum.as_mut_slice(),
+                        batch_idx,
+                        m,
+                        0usize,
+                        total_progress,
+                        notify_step,
+                        &mut last_notified,
+                        progress_callback,
+                        threads,
+                        pool.as_ref(),
+                        timing.as_deref(),
+                    )
+                };
+                run_double_buffer(2usize, make_buffer, producer, consumer)?;
+                let decode_err = decode_error.lock().unwrap().take();
+                if let Some(err) = decode_err {
+                    return Err(err);
+                }
+            } else {
+                let mut decoded = SpgrmDecodedBatchBuffer {
+                    stripe_scratch: stripe_template,
+                    row_start: 0usize,
+                    cur_rows: 0usize,
+                };
+                let mut rel_row_indices = Vec::<usize>::new();
+                for row_start in (0..m).step_by(row_step) {
+                    spgrm_decode_stream_batch_buffer(
+                        &mut decoded,
+                        row_start,
+                        row_step,
+                        m,
+                        sample_idx,
+                        &meta,
+                        row_mean.as_slice(),
+                        row_inv_sd.as_slice(),
+                        bed_window.as_mut(),
+                        full_mmap.as_ref(),
+                        &mut rel_row_indices,
+                        code4_lut,
+                        pool.as_ref(),
+                        timing.as_deref(),
+                    )?;
+                    spgrm_consume_stream_batch_buffer(
+                        &decoded,
+                        task_accum.as_mut_slice(),
+                        batch_idx,
+                        m,
+                        0usize,
+                        total_progress,
+                        notify_step,
+                        &mut last_notified,
+                        progress_callback,
+                        threads,
+                        pool.as_ref(),
+                        timing.as_deref(),
+                    )?;
+                }
+            }
+
+            spgrm_collect_batch_dense_full_matrix(task_accum.as_slice(), inv_scale, n_use, out)?;
+        }
+
+        spgrm_progress_notify(
+            progress_callback,
+            total_progress,
+            total_progress,
+            notify_step,
+            &mut last_notified,
+            true,
+        )?;
+        if let Some(timing) = timing.as_deref() {
+            spgrm_emit_timing_summary("dense-full", n_use, m, sample_step, row_step, timing);
+        }
+    }
+    writer.flush()?;
+    Ok((m, n_use))
+}
+
 pub fn spgrm_bed_to_jxgrm_core(
     prefix: &str,
     sample_idx: Option<&[usize]>,
@@ -4607,6 +5484,434 @@ pub fn spgrm_bed_to_jxgrm_from_meta<'py>(
             progress_callback.as_ref(),
             progress_every,
             0usize,
+        )
+    })
+    .map_err(map_err_string_to_py)
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    prefix,
+    row_source_indices,
+    row_flip,
+    row_maf,
+    n_total_sites,
+    row_part_start,
+    row_part_end,
+    sample_indices=None,
+    method=1,
+    block_rows=0,
+    sample_block=0,
+    threads=0,
+    mmap_window_mb=None,
+    progress_callback=None,
+    progress_every=0
+))]
+pub fn grm_bed_f32_row_band_from_meta<'py>(
+    py: Python<'py>,
+    prefix: String,
+    row_source_indices: PyReadonlyArray1<'py, i64>,
+    row_flip: PyReadonlyArray1<'py, bool>,
+    row_maf: PyReadonlyArray1<'py, f32>,
+    n_total_sites: usize,
+    row_part_start: usize,
+    row_part_end: usize,
+    sample_indices: Option<PyReadonlyArray1<'py, i64>>,
+    method: usize,
+    block_rows: usize,
+    sample_block: usize,
+    threads: usize,
+    mmap_window_mb: Option<usize>,
+    progress_callback: Option<Py<PyAny>>,
+    progress_every: usize,
+) -> PyResult<(Bound<'py, PyArray2<f32>>, usize, usize)> {
+    let bed_prefix = normalize_plink_prefix_local(&prefix);
+    let n_samples_full = read_fam(&bed_prefix)
+        .map_err(PyRuntimeError::new_err)?
+        .len();
+    if n_samples_full == 0 {
+        return Err(PyRuntimeError::new_err("No samples found in BED input."));
+    }
+    if n_total_sites == 0 {
+        return Err(PyRuntimeError::new_err(
+            "n_total_sites must be positive for dense GRM part meta route.",
+        ));
+    }
+
+    let sample_idx_vec: Option<Vec<usize>> = if let Some(sample_indices) = sample_indices {
+        Some(parse_index_vec_i64(
+            sample_indices.as_slice()?,
+            n_samples_full,
+            "sample_indices",
+        )?)
+    } else {
+        None
+    };
+    let row_source_vec: Vec<usize> = row_source_indices
+        .as_slice()
+        .map_err(|_| PyRuntimeError::new_err("row_source_indices must be contiguous int64"))?
+        .iter()
+        .map(|&rid| {
+            if rid < 0 {
+                Err(PyRuntimeError::new_err(format!(
+                    "row_source_indices must be non-negative, got {rid}"
+                )))
+            } else {
+                Ok(rid as usize)
+            }
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    let row_flip_vec: Vec<bool> = match row_flip.as_slice() {
+        Ok(s) => s.to_vec(),
+        Err(_) => row_flip.as_array().iter().copied().collect(),
+    };
+    let row_maf_vec: Vec<f32> = match row_maf.as_slice() {
+        Ok(s) => s.to_vec(),
+        Err(_) => row_maf.as_array().iter().copied().collect(),
+    };
+    if row_source_vec.is_empty() {
+        return Err(PyRuntimeError::new_err(
+            "row_source_indices must not be empty",
+        ));
+    }
+    if row_flip_vec.len() != row_source_vec.len() || row_maf_vec.len() != row_source_vec.len() {
+        return Err(PyRuntimeError::new_err(format!(
+            "row meta length mismatch: row_source_indices={}, row_flip={}, row_maf={}",
+            row_source_vec.len(),
+            row_flip_vec.len(),
+            row_maf_vec.len(),
+        )));
+    }
+    if let Some(&bad) = row_source_vec.iter().find(|&&rid| rid >= n_total_sites) {
+        return Err(PyRuntimeError::new_err(format!(
+            "row_source index out of range: {bad} >= n_total_sites={n_total_sites}"
+        )));
+    }
+
+    let selected_idx: Vec<usize> = match sample_idx_vec {
+        Some(idx) => idx,
+        None => (0..n_samples_full).collect(),
+    };
+    if row_part_start >= row_part_end || row_part_end > selected_idx.len() {
+        return Err(PyRuntimeError::new_err(format!(
+            "row band is invalid: start={}, end={}, n_samples={}",
+            row_part_start,
+            row_part_end,
+            selected_idx.len()
+        )));
+    }
+    let part_rows = row_part_end - row_part_start;
+    let meta = crate::gfreader::PreparedBedLogicMetaOwned {
+        site_keep: Vec::new(),
+        row_flip: row_flip_vec,
+        row_source_indices: row_source_vec,
+        missing_rate: Vec::new(),
+        maf: row_maf_vec,
+        sites: Vec::new(),
+        n_samples: n_samples_full,
+        n_snps_total: n_total_sites,
+        bytes_per_snp: n_samples_full.div_ceil(4),
+    };
+
+    let (part_vec, eff_m, n_use) = py
+        .detach(move || {
+            grm_stream_bed_row_band_f32_core(
+                &bed_prefix,
+                selected_idx.as_slice(),
+                meta,
+                row_part_start,
+                row_part_end,
+                method,
+                block_rows,
+                sample_block,
+                threads,
+                mmap_window_mb,
+                progress_callback.as_ref(),
+                progress_every,
+            )
+        })
+        .map_err(map_err_string_to_py)?;
+    let out_arr = Array2::from_shape_vec((part_rows, n_use), part_vec)
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    Ok((PyArray2::from_owned_array(py, out_arr), eff_m, n_use))
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    prefix,
+    out_npy_path,
+    row_source_indices,
+    row_flip,
+    row_maf,
+    n_total_sites,
+    row_part_start,
+    row_part_end,
+    sample_indices=None,
+    method=1,
+    block_rows=0,
+    sample_block=0,
+    threads=0,
+    mmap_window_mb=None,
+    progress_callback=None,
+    progress_every=0
+))]
+pub fn grm_bed_f32_row_band_from_meta_to_npy<'py>(
+    py: Python<'py>,
+    prefix: String,
+    out_npy_path: String,
+    row_source_indices: PyReadonlyArray1<'py, i64>,
+    row_flip: PyReadonlyArray1<'py, bool>,
+    row_maf: PyReadonlyArray1<'py, f32>,
+    n_total_sites: usize,
+    row_part_start: usize,
+    row_part_end: usize,
+    sample_indices: Option<PyReadonlyArray1<'py, i64>>,
+    method: usize,
+    block_rows: usize,
+    sample_block: usize,
+    threads: usize,
+    mmap_window_mb: Option<usize>,
+    progress_callback: Option<Py<PyAny>>,
+    progress_every: usize,
+) -> PyResult<(usize, usize)> {
+    let bed_prefix = normalize_plink_prefix_local(&prefix);
+    let n_samples_full = read_fam(&bed_prefix)
+        .map_err(PyRuntimeError::new_err)?
+        .len();
+    if n_samples_full == 0 {
+        return Err(PyRuntimeError::new_err("No samples found in BED input."));
+    }
+    if n_total_sites == 0 {
+        return Err(PyRuntimeError::new_err(
+            "n_total_sites must be positive for dense GRM part meta route.",
+        ));
+    }
+
+    let sample_idx_vec: Option<Vec<usize>> = if let Some(sample_indices) = sample_indices {
+        Some(parse_index_vec_i64(
+            sample_indices.as_slice()?,
+            n_samples_full,
+            "sample_indices",
+        )?)
+    } else {
+        None
+    };
+    let row_source_vec: Vec<usize> = row_source_indices
+        .as_slice()
+        .map_err(|_| PyRuntimeError::new_err("row_source_indices must be contiguous int64"))?
+        .iter()
+        .map(|&rid| {
+            if rid < 0 {
+                Err(PyRuntimeError::new_err(format!(
+                    "row_source_indices must be non-negative, got {rid}"
+                )))
+            } else {
+                Ok(rid as usize)
+            }
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    let row_flip_vec: Vec<bool> = match row_flip.as_slice() {
+        Ok(s) => s.to_vec(),
+        Err(_) => row_flip.as_array().iter().copied().collect(),
+    };
+    let row_maf_vec: Vec<f32> = match row_maf.as_slice() {
+        Ok(s) => s.to_vec(),
+        Err(_) => row_maf.as_array().iter().copied().collect(),
+    };
+    if row_source_vec.is_empty() {
+        return Err(PyRuntimeError::new_err(
+            "row_source_indices must not be empty",
+        ));
+    }
+    if row_flip_vec.len() != row_source_vec.len() || row_maf_vec.len() != row_source_vec.len() {
+        return Err(PyRuntimeError::new_err(format!(
+            "row meta length mismatch: row_source_indices={}, row_flip={}, row_maf={}",
+            row_source_vec.len(),
+            row_flip_vec.len(),
+            row_maf_vec.len(),
+        )));
+    }
+    if let Some(&bad) = row_source_vec.iter().find(|&&rid| rid >= n_total_sites) {
+        return Err(PyRuntimeError::new_err(format!(
+            "row_source index out of range: {bad} >= n_total_sites={n_total_sites}"
+        )));
+    }
+
+    let selected_idx: Vec<usize> = match sample_idx_vec {
+        Some(idx) => idx,
+        None => (0..n_samples_full).collect(),
+    };
+    if row_part_start >= row_part_end || row_part_end > selected_idx.len() {
+        return Err(PyRuntimeError::new_err(format!(
+            "row band is invalid: start={}, end={}, n_samples={}",
+            row_part_start,
+            row_part_end,
+            selected_idx.len()
+        )));
+    }
+    let meta = crate::gfreader::PreparedBedLogicMetaOwned {
+        site_keep: Vec::new(),
+        row_flip: row_flip_vec,
+        row_source_indices: row_source_vec,
+        missing_rate: Vec::new(),
+        maf: row_maf_vec,
+        sites: Vec::new(),
+        n_samples: n_samples_full,
+        n_snps_total: n_total_sites,
+        bytes_per_snp: n_samples_full.div_ceil(4),
+    };
+
+    py.detach(move || {
+        grm_stream_bed_row_band_f32_to_npy_core(
+            &bed_prefix,
+            selected_idx.as_slice(),
+            meta,
+            row_part_start,
+            row_part_end,
+            &out_npy_path,
+            method,
+            block_rows,
+            sample_block,
+            threads,
+            mmap_window_mb,
+            progress_callback.as_ref(),
+            progress_every,
+        )
+    })
+    .map_err(map_err_string_to_py)
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    prefix,
+    out_npy_path,
+    row_source_indices,
+    row_flip,
+    row_maf,
+    n_total_sites,
+    sample_indices=None,
+    method=1,
+    block_rows=0,
+    sample_block=0,
+    threads=0,
+    mmap_window_mb=None,
+    progress_callback=None,
+    progress_every=0
+))]
+pub fn grm_bed_f32_tiled_from_meta_to_npy<'py>(
+    py: Python<'py>,
+    prefix: String,
+    out_npy_path: String,
+    row_source_indices: PyReadonlyArray1<'py, i64>,
+    row_flip: PyReadonlyArray1<'py, bool>,
+    row_maf: PyReadonlyArray1<'py, f32>,
+    n_total_sites: usize,
+    sample_indices: Option<PyReadonlyArray1<'py, i64>>,
+    method: usize,
+    block_rows: usize,
+    sample_block: usize,
+    threads: usize,
+    mmap_window_mb: Option<usize>,
+    progress_callback: Option<Py<PyAny>>,
+    progress_every: usize,
+) -> PyResult<(usize, usize)> {
+    let bed_prefix = normalize_plink_prefix_local(&prefix);
+    let n_samples_full = read_fam(&bed_prefix)
+        .map_err(PyRuntimeError::new_err)?
+        .len();
+    if n_samples_full == 0 {
+        return Err(PyRuntimeError::new_err("No samples found in BED input."));
+    }
+    if n_total_sites == 0 {
+        return Err(PyRuntimeError::new_err(
+            "n_total_sites must be positive for dense GRM tiled meta route.",
+        ));
+    }
+
+    let sample_idx_vec: Option<Vec<usize>> = if let Some(sample_indices) = sample_indices {
+        Some(parse_index_vec_i64(
+            sample_indices.as_slice()?,
+            n_samples_full,
+            "sample_indices",
+        )?)
+    } else {
+        None
+    };
+    let row_source_vec: Vec<usize> = row_source_indices
+        .as_slice()
+        .map_err(|_| PyRuntimeError::new_err("row_source_indices must be contiguous int64"))?
+        .iter()
+        .map(|&rid| {
+            if rid < 0 {
+                Err(PyRuntimeError::new_err(format!(
+                    "row_source_indices must be non-negative, got {rid}"
+                )))
+            } else {
+                Ok(rid as usize)
+            }
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    let row_flip_vec: Vec<bool> = match row_flip.as_slice() {
+        Ok(s) => s.to_vec(),
+        Err(_) => row_flip.as_array().iter().copied().collect(),
+    };
+    let row_maf_vec: Vec<f32> = match row_maf.as_slice() {
+        Ok(s) => s.to_vec(),
+        Err(_) => row_maf.as_array().iter().copied().collect(),
+    };
+    if row_source_vec.is_empty() {
+        return Err(PyRuntimeError::new_err(
+            "row_source_indices must not be empty",
+        ));
+    }
+    if row_flip_vec.len() != row_source_vec.len() || row_maf_vec.len() != row_source_vec.len() {
+        return Err(PyRuntimeError::new_err(format!(
+            "row meta length mismatch: row_source_indices={}, row_flip={}, row_maf={}",
+            row_source_vec.len(),
+            row_flip_vec.len(),
+            row_maf_vec.len(),
+        )));
+    }
+    if let Some(&bad) = row_source_vec.iter().find(|&&rid| rid >= n_total_sites) {
+        return Err(PyRuntimeError::new_err(format!(
+            "row_source index out of range: {bad} >= n_total_sites={n_total_sites}"
+        )));
+    }
+
+    let selected_idx: Vec<usize> = match sample_idx_vec {
+        Some(idx) => idx,
+        None => (0..n_samples_full).collect(),
+    };
+    if selected_idx.is_empty() {
+        return Err(PyRuntimeError::new_err(
+            "sample_indices must not be empty for dense GRM tiled meta route.",
+        ));
+    }
+    let meta = crate::gfreader::PreparedBedLogicMetaOwned {
+        site_keep: Vec::new(),
+        row_flip: row_flip_vec,
+        row_source_indices: row_source_vec,
+        missing_rate: Vec::new(),
+        maf: row_maf_vec,
+        sites: Vec::new(),
+        n_samples: n_samples_full,
+        n_snps_total: n_total_sites,
+        bytes_per_snp: n_samples_full.div_ceil(4),
+    };
+
+    py.detach(move || {
+        grm_stream_bed_full_f32_to_npy_core(
+            &bed_prefix,
+            selected_idx.as_slice(),
+            meta,
+            &out_npy_path,
+            method,
+            block_rows,
+            sample_block,
+            threads,
+            mmap_window_mb,
+            progress_callback.as_ref(),
+            progress_every,
         )
     })
     .map_err(map_err_string_to_py)

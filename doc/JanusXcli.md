@@ -205,6 +205,8 @@ to also print them to the terminal.
 
 ```bash
 jx postgwas -gwasfile result.lmm.tsv -manh -qq -o demo/postgwas
+jx postgwas -i a.tsv b.tsv -manh-merge -qq-merge -fontsize 11 -fontstyle arial -o demo/postgwas
+jx postgwas -i a.tsv b.tsv c.tsv -manh-merge -qq-merge -scatter-size 4 10 -alpha 0.2 0.5 -ylim 2 10 -o demo/postgwas
 jx postgwas -bfile example/~mouse_hs1940 -bimrange 1:1-2 -ldblock-all -o demo/postgwas
 
 jx postgs -json demo/mouse_hs1940.gs.model/summary.json -o demo/postgs

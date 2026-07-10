@@ -96,6 +96,8 @@ jx gwas -vcf example/mouse_hs1940.vcf.gz -p example/mouse_hs1940.pheno -farmcpu 
 
 ```bash
 jx postgwas -i test/mouse_hs1940.test0.lmm.tsv -manh -qq -thr 1e-6 -o testpost
+jx postgwas -i test/mouse_hs1940.test0.lmm.tsv a.tsv -manh-merge -qq-merge -fontsize 11 -fontstyle arial -o testpost
+jx postgwas -i a.tsv b.tsv c.tsv -manh-merge -qq-merge -scatter-size 4 10 -alpha 0.2 0.5 -ylim 2 10 -o testpost
 ```
 
 <p align="center">

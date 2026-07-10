@@ -4,7 +4,7 @@ from importlib import import_module
 from types import ModuleType
 from typing import Any
 
-__name__ = "bioplotkit"
+PACKAGE_NAME = "bioplotkit"
 __version__ = "1.0"
 
 _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {

@@ -40,7 +40,6 @@ from ._common.cli_args import (
     add_common_memory_arg,
     add_common_out_arg,
     add_common_prefix_arg,
-    add_common_snps_only_arg,
     add_common_thread_arg,
     add_common_variant_filter_args,
 )
@@ -1268,7 +1267,6 @@ def _run_single_k(
                     [
                         ("Genotype", genotype_path),
                         ("Input type", source_label),
-                        ("SNPs only", bool(args.snps_only)),
                         ("MAF threshold", float(args.maf)),
                         ("Miss threshold", float(args.geno)),
                         ("Output dir", outdir),
@@ -1527,6 +1525,7 @@ def _build_parser() -> CliArgumentParser:
             f"{cli} -vcf data/geno.vcf.gz -k 1..10 -t 16",
         ]),
     )
+    parser.set_defaults(snps_only=False)
 
     req_geno = parser.add_argument_group("Required Genotype Input (Choose one)")
     geno = req_geno.add_mutually_exclusive_group(required=True)
@@ -1560,12 +1559,6 @@ def _build_parser() -> CliArgumentParser:
         action="store_true",
         default=False,
         help="Skip structure plot rendering and only write Q/P/site/log outputs.",
-    )
-    add_common_snps_only_arg(
-        input_output,
-        dest="snps_only",
-        default=False,
-        help_profile="loading_stage",
     )
     add_common_variant_filter_args(
         input_output,

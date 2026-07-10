@@ -218,7 +218,7 @@ def het_filter_help_text() -> str:
 
 
 def snps_only_help_text() -> str:
-    return "Exclude non-SNP variants."
+    return "Keep only simple single-base A/C/G/T SNP sites."
 
 
 def _resolve_variant_filter_help(

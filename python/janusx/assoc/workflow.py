@@ -100,7 +100,6 @@ from janusx.script._common.cli_args import (
     add_common_out_arg,
     add_common_pheno_arg,
     add_common_prefix_arg,
-    add_common_snps_only_arg,
     add_common_thread_arg,
     add_common_trait_selector_args,
     add_common_variant_filter_args,
@@ -6128,6 +6127,7 @@ def parse_args(argv: Optional[list[str]] = None):
             "jx gwas -h -dev",
         ]),
     )
+    parser.set_defaults(snps_only=False)
     parser.add_argument(
         "-dev", "--dev", action="store_true", default=False, help=argparse.SUPPRESS
     )
@@ -6279,12 +6279,6 @@ def parse_args(argv: Optional[list[str]] = None):
             "Optional QTN-search numeric FILE matrix for FarmCPU/ALGWAS stage1. "
             "Ignored by other models."
         ),
-    )
-    add_common_snps_only_arg(
-        optional_group,
-        dest="snps_only",
-        default=False,
-        include_legacy_only_snps_aliases=True,
     )
     add_common_variant_filter_args(
         optional_group,
@@ -6875,7 +6869,6 @@ def _run_gwas_pipeline(
             ("BED backend", bed_backend_policy),
             ("Packed auto route", packed_auto_mode),
             ("Models", _format_gwas_models_executed(args)),
-            ("SNPs only", args.snps_only),
             ("GRM option", args.grm),
             ("Q option", args.qcov),
             ("MAF threshold", args.maf),
@@ -6976,7 +6969,6 @@ def _run_gwas_pipeline(
             ("GRM Option", args.grm),
             ("Q Option", args.qcov),
             ("Memory", memory_cfg),
-            ("SNPs Only", bool(args.snps_only)),
             ("Force Model", bool(args.force_model)),
         ]
         if float(args.het) > 0.0:

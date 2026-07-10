@@ -46,7 +46,6 @@ from ._common.cli_args import (
     add_common_het_arg,
     add_common_out_arg,
     add_common_prefix_arg,
-    add_common_snps_only_arg,
     add_common_thread_arg,
 )
 from ._common.genoio import determine_genotype_source_from_args
@@ -461,6 +460,7 @@ def _add_tree_optional_args(
     include_hidden_approx_legacy: bool,
     include_ml_options: bool,
 ) -> None:
+    parser.set_defaults(snps_only=False)
     optional_group = parser.add_argument_group("Optional arguments")
     optional_group.add_argument(
         "-chunksize", "--chunksize", dest="chunksize", type=int, default=10_000,
@@ -469,7 +469,6 @@ def _add_tree_optional_args(
     add_common_maf_arg(optional_group, default=0.02, help_profile="default")
     add_common_geno_arg(optional_group, default=0.05, help_profile="default")
     add_common_het_arg(optional_group, default=0.02, help_profile="default")
-    add_common_snps_only_arg(optional_group, default=False, help_profile="default")
     if include_hidden_approx_legacy:
         optional_group.add_argument(
             "--approx", dest="approx_legacy", action="store_true", default=False,

@@ -139,6 +139,69 @@ def _split_tokens(line: str) -> list[str]:
     return [x for x in re.split(r"[,\s]+", line.strip()) if x]
 
 
+_SIMPLE_SNP_ALLELES = frozenset({"A", "C", "G", "T"})
+
+
+def _normalize_site_allele(value: object) -> str:
+    return str(value).strip().upper()
+
+
+def _site_is_biallelic(site: SiteInfo) -> bool:
+    ref_allele = _normalize_site_allele(site.ref_allele)
+    alt_allele = _normalize_site_allele(site.alt_allele)
+    if (
+        not ref_allele
+        or not alt_allele
+        or ref_allele == "."
+        or alt_allele == "."
+        or "," in ref_allele
+        or "," in alt_allele
+    ):
+        return False
+    return ref_allele != alt_allele
+
+
+def _site_is_simple_snp(site: SiteInfo) -> bool:
+    if not _site_is_biallelic(site):
+        return False
+    ref_allele = _normalize_site_allele(site.ref_allele)
+    alt_allele = _normalize_site_allele(site.alt_allele)
+    return (
+        len(ref_allele) == 1
+        and len(alt_allele) == 1
+        and ref_allele in _SIMPLE_SNP_ALLELES
+        and alt_allele in _SIMPLE_SNP_ALLELES
+    )
+
+
+def _apply_site_type_filters(
+    geno: np.ndarray,
+    sites: Sequence[SiteInfo],
+    *,
+    snps_only: bool,
+    biallelic_only: bool,
+) -> tuple[np.ndarray, list[SiteInfo]]:
+    if not snps_only and not biallelic_only:
+        return np.asarray(geno), list(sites)
+
+    pred = _site_is_simple_snp if snps_only else _site_is_biallelic
+    keep_idx: list[int] = []
+    keep_sites: list[SiteInfo] = []
+    for i, site in enumerate(sites):
+        if pred(site):
+            keep_idx.append(i)
+            keep_sites.append(site)
+
+    arr = np.asarray(geno)
+    if len(keep_idx) == len(sites):
+        return arr, list(sites)
+    if len(keep_idx) == 0:
+        if arr.ndim == 2:
+            return np.empty((0, arr.shape[1]), dtype=arr.dtype), []
+        return np.empty((0, 0), dtype=np.float32), []
+    return np.ascontiguousarray(arr[keep_idx]), keep_sites
+
+
 def _log_status_file_only(logger, message: str) -> None:
     if not _emit_to_file_handlers(logger, 20, str(message)):
         logger.info(str(message))
@@ -1817,6 +1880,26 @@ def build_parser() -> CliArgumentParser:
         ),
     )
     opt.add_argument(
+        "-snps-only",
+        "--snps-only",
+        action="store_true",
+        default=False,
+        help=(
+            "Keep only simple A/C/G/T single-base SNP sites. "
+            "This is stricter than --biallelic-only."
+        ),
+    )
+    opt.add_argument(
+        "-biallelic-only",
+        "--biallelic-only",
+        action="store_true",
+        default=False,
+        help=(
+            "Keep only sites with exactly one REF allele and one ALT allele "
+            "(drops multiallelic rows; retains non-SNP biallelic sites such as indels)."
+        ),
+    )
+    opt.add_argument(
         "-prune",
         "--prune",
         nargs=3,
@@ -1962,6 +2045,8 @@ def main() -> None:
                     ),
                     ("Chr filter", ",".join(sorted(chr_keys)) if chr_keys else "None"),
                     ("BP range", f"{args.from_bp if args.from_bp is not None else '-'}..{args.to_bp if args.to_bp is not None else '-'}"),
+                    ("ATCG SNP only", bool(args.snps_only)),
+                    ("Biallelic only", bool(args.biallelic_only)),
                     ("MAF threshold", float(args.maf)),
                     ("Miss threshold", float(args.geno)),
                     ("Het threshold", float(args.het)),
@@ -2051,6 +2136,8 @@ def main() -> None:
         prune_spec is None
         and source_kind == "plink"
         and out_fmt == "plink"
+        and (not bool(args.snps_only))
+        and (not bool(args.biallelic_only))
         and _bed_filter_to_plink_rust is not None
     ):
         direct_keep_sample_ids: list[str] | None = None
@@ -2241,6 +2328,7 @@ def main() -> None:
         and prune_spec is None
         and source_kind in {"plink", "vcf", "hmp"}
         and out_fmt in {"plink", "vcf", "hmp"}
+        and (not bool(args.biallelic_only))
         and push_snp_sites is None
         and push_bim_range is None
         and (not post_filter.active())
@@ -2291,7 +2379,7 @@ def main() -> None:
                     progress_callback=_on_convert_progress,
                     progress_every=int(progress_every),
                     threads=int(args.thread),
-                    snps_only=True,
+                    snps_only=bool(args.snps_only),
                     maf=float(args.maf),
                     geno=float(args.geno),
                     impute=False,
@@ -2315,7 +2403,7 @@ def main() -> None:
                 direct_output,
                 out_fmt=str(out_fmt),
                 threads=int(args.thread),
-                snps_only=True,
+                snps_only=bool(args.snps_only),
                 maf=float(args.maf),
                 geno=float(args.geno),
                 impute=False,
@@ -2405,6 +2493,7 @@ def main() -> None:
                 impute=False,
                 model=reader_model,
                 het=reader_het,
+                snps_only=bool(args.snps_only),
                 sample_ids=keep_sample_ids,
                 snp_sites=push_snp_sites,
                 bim_range=push_bim_range,
@@ -2421,12 +2510,23 @@ def main() -> None:
                     else None
                 ),
             )
-        return c
+        for geno, sites in c:
+            filtered_geno, filtered_sites = _apply_site_type_filters(
+                geno,
+                sites,
+                snps_only=bool(args.snps_only),
+                biallelic_only=bool(args.biallelic_only),
+            )
+            if len(filtered_sites) == 0:
+                continue
+            yield filtered_geno, filtered_sites
 
     need_selected_count = (
         bool(push_snp_sites)
         or (push_bim_range is not None)
         or post_filter.active()
+        or bool(args.snps_only)
+        or bool(args.biallelic_only)
         or (float(args.maf) > 0.0)
         or (float(args.geno) < 1.0)
         or (float(args.het) > 0.0)

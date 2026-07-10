@@ -69,7 +69,6 @@ from janusx.script._common.cli_args import (  # noqa: E402
     add_common_out_arg,
     add_common_pheno_arg,
     add_common_prefix_arg,
-    add_common_snps_only_arg,
     add_common_thread_arg,
     add_common_trait_selector_args,
     add_common_variant_filter_args,
@@ -2064,8 +2063,6 @@ def _run_kernel_janusx(
         cmd += ["-q", str(args.qcov)]
     for c in args.cov or []:
         cmd += ["-c", str(c)]
-    if args.snps_only:
-        cmd += ["-snps-only"]
     if args.mmap_limit:
         cmd += ["-mmap-limit"]
 
@@ -2958,6 +2955,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
             ]
         ),
     )
+    p.set_defaults(snps_only=False)
     p.add_argument("-dev", "--dev", action="store_true", default=False, help=argparse.SUPPRESS)
 
     required_group = p.add_argument_group("Required arguments")
@@ -2999,12 +2997,6 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         optional_group,
         dest="cov",
         default=None,
-        help_profile="benchmark",
-    )
-    add_common_snps_only_arg(
-        optional_group,
-        dest="snps_only",
-        default=False,
         help_profile="benchmark",
     )
     optional_group.add_argument("-mmap-limit", "--mmap-limit", action="store_true", default=False, help="Enable JanusX mmap-limit.")

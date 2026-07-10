@@ -59,7 +59,6 @@ from janusx.script._common.cli_core import (  # noqa: E402
 )
 from janusx.script._common.cli_args import (  # noqa: E402
     add_common_genotype_source_args,
-    add_common_snps_only_arg,
     add_common_variant_filter_args,
     parse_trait_selector_specs,
     resolve_trait_selectors,
@@ -2355,6 +2354,7 @@ def _build_parser() -> argparse.ArgumentParser:
         ("compare", "Run JanusX vs BGLR/HIBayes long-chain posterior / prediction comparison."),
     ):
         sp = sub.add_parser(name, help=help_text, formatter_class=cli_help_formatter())
+        sp.set_defaults(snps_only=False)
         geno = sp.add_argument_group("Genotype Input")
         add_common_genotype_source_args(geno, help_profile="admixture")
         sp.add_argument("--builtin", choices=["wheat"], default=None, help="Use built-in BGLR benchmark dataset instead of genotype/pheno files.")
@@ -2389,12 +2389,6 @@ def _build_parser() -> argparse.ArgumentParser:
             include_het=False,
             maf_default=0.02,
             geno_default=0.05,
-        )
-        add_common_snps_only_arg(
-            sp,
-            dest="snps_only",
-            default=False,
-            help_profile="packed_filter",
         )
         sp.add_argument("--cache-input", action="store_true", default=True, help=argparse.SUPPRESS)
         sp.add_argument("--max-snps", type=int, default=None, help="Optional random cap on active SNPs after QC (0 disables).")

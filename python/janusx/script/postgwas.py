@@ -84,6 +84,7 @@ import pandas as pd
 import numpy as np
 from scipy.stats import beta
 import argparse
+import difflib
 import re
 import shlex
 import time
@@ -94,11 +95,13 @@ import concurrent.futures as cf
 import multiprocessing as mp
 from concurrent.futures.process import BrokenProcessPool
 from contextlib import nullcontext, redirect_stdout, redirect_stderr
+from functools import lru_cache
 from typing import Any, Optional, Tuple
 from janusx import janusx as jxrs
 from janusx.gtools.reader import GFFQuery, bedreader, readanno
 import warnings
 from ._common.cjk import contains_cjk as _contains_cjk, ensure_cjk_font as _ensure_cjk_font
+from matplotlib import font_manager as mpl_font_manager
 
 _LEAD_SNP_INFO_COLS = ["allele0", "allele1", "af", "maf", "beta", "se"]
 _QQ_FIXED_RATIO = 5.0 / 4.0
@@ -110,6 +113,11 @@ _CONFIG_OVERFLOW_MARK = "***"
 _ANNO_DESC_KEY = "description"
 _DEFAULT_SINGLE_MARKER = "o"
 _DEFAULT_MERGE_MARKERS = ("1", "2", "3", "4", "*", "+", "x")
+_DEFAULT_SCATTER_SIZE = 8.0
+_DEFAULT_MERGE_ALPHA = 0.45
+_POSTGWAS_LEGEND_SIZE_SCALE = 1.35
+_POSTGWAS_LEGEND_SIZE_MIN_BONUS = 2.0
+_POSTGWAS_LD_LINK_Y = 0.0
 _PANEL_WIDTH_IN = 8.0
 _PANEL_LEFT_IN = 0.95
 _PANEL_RIGHT_IN = 0.20
@@ -119,6 +127,18 @@ _PANEL_LEGEND_RIGHT_IN = 2.25
 _PANEL_STACK_VSPACE_IN = 0.10
 _POSTGWAS_PDF_BACKEND_SENTINEL = object()
 _POSTGWAS_PREFERRED_PDF_BACKEND: object = _POSTGWAS_PDF_BACKEND_SENTINEL
+_POSTGWAS_DEFAULT_FONT_SIZE = 9.0
+_POSTGWAS_MIN_FONT_SCALE = 0.80
+_POSTGWAS_FONT_FILE_EXTENSIONS = frozenset({".ttf", ".otf", ".ttc", ".otc"})
+_POSTGWAS_GENERIC_FONT_FAMILIES = {
+    "serif": "serif",
+    "sans": "sans-serif",
+    "sansserif": "sans-serif",
+    "monospace": "monospace",
+    "mono": "monospace",
+    "cursive": "cursive",
+    "fantasy": "fantasy",
+}
 
 try:
     from tqdm.auto import tqdm
@@ -329,6 +349,232 @@ def _prepare_cjk_plotting() -> None:
             category=UserWarning,
             message=r"Glyph .* missing from font\(s\).*",
         )
+
+
+def _postgwas_font_key(text: object) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(text).strip().lower())
+
+
+def _postgwas_looks_like_font_path(text: str) -> bool:
+    token = str(text).strip()
+    if token == "":
+        return False
+    if os.path.sep in token:
+        return True
+    if os.path.altsep is not None and os.path.altsep in token:
+        return True
+    return os.path.splitext(token)[1].lower() in _POSTGWAS_FONT_FILE_EXTENSIONS
+
+
+@lru_cache(maxsize=1)
+def _list_postgwas_font_names() -> tuple[str, ...]:
+    names: list[str] = []
+    seen: set[str] = set()
+    for entry in mpl_font_manager.fontManager.ttflist:
+        name = str(getattr(entry, "name", "")).strip()
+        if name == "":
+            continue
+        lower = name.lower()
+        if lower in seen:
+            continue
+        seen.add(lower)
+        names.append(name)
+    names.sort(key=lambda x: x.lower())
+    return tuple(names)
+
+
+def _resolve_postgwas_fontstyle(value: object) -> tuple[str, str, str]:
+    text = str(value).strip()
+    if text == "":
+        raise ValueError("-fontstyle/--fontstyle/--fontstype cannot be empty.")
+
+    norm = _postgwas_font_key(text)
+    if norm == "":
+        raise ValueError(f"Invalid font selector: {text!r}")
+
+    generic = _POSTGWAS_GENERIC_FONT_FAMILIES.get(norm)
+    if generic is not None:
+        return generic, generic, "generic"
+
+    font_path = os.path.abspath(os.path.expanduser(text))
+    if os.path.isfile(font_path):
+        try:
+            mpl_font_manager.fontManager.addfont(font_path)
+            _list_postgwas_font_names.cache_clear()
+            font_name = str(mpl_font_manager.FontProperties(fname=font_path).get_name()).strip()
+        except Exception as e:
+            raise ValueError(f"Failed to load font file: {text}") from e
+        if font_name == "":
+            raise ValueError(f"Unable to resolve font name from file: {text}")
+        return font_name, font_path, "file"
+
+    if _postgwas_looks_like_font_path(text):
+        raise ValueError(f"Font file not found: {text}")
+
+    names = list(_list_postgwas_font_names())
+    if len(names) == 0:
+        raise ValueError("No matplotlib fonts are available in the current environment.")
+
+    lower_map = {name.lower(): name for name in names}
+    if text.lower() in lower_map:
+        chosen = lower_map[text.lower()]
+        return chosen, chosen, "exact"
+
+    key_map: dict[str, str] = {}
+    for name in names:
+        key = _postgwas_font_key(name)
+        if key != "" and key not in key_map:
+            key_map[key] = name
+    if norm in key_map:
+        chosen = key_map[norm]
+        return chosen, chosen, "exact"
+
+    prefix_matches = [
+        name for name in names if _postgwas_font_key(name).startswith(norm)
+    ]
+    if len(prefix_matches) > 0:
+        chosen = sorted(
+            prefix_matches,
+            key=lambda name: (len(_postgwas_font_key(name)), len(name), name.lower()),
+        )[0]
+        return chosen, chosen, "prefix"
+
+    contains_matches = [
+        name for name in names if norm in _postgwas_font_key(name)
+    ]
+    if len(contains_matches) > 0:
+        chosen = sorted(
+            contains_matches,
+            key=lambda name: (len(_postgwas_font_key(name)), len(name), name.lower()),
+        )[0]
+        return chosen, chosen, "contains"
+
+    fuzzy_keys = difflib.get_close_matches(
+        norm,
+        list(key_map.keys()),
+        n=5,
+        cutoff=0.45,
+    )
+    if len(fuzzy_keys) > 0:
+        chosen = key_map[fuzzy_keys[0]]
+        return chosen, chosen, "fuzzy"
+
+    suggestions = difflib.get_close_matches(
+        text.lower(),
+        list(lower_map.keys()),
+        n=5,
+        cutoff=0.35,
+    )
+    if len(suggestions) > 0:
+        tips = ", ".join(lower_map[x] for x in suggestions[:5])
+        raise ValueError(f"Unknown font: {text}. Close matches: {tips}")
+    raise ValueError(f"Unknown font: {text}")
+
+
+def _postgwas_resolve_fontsize(
+    args,
+    *,
+    manh_ratio: Optional[float] = None,
+) -> float:
+    manual_size = getattr(args, "fontsize", None)
+    if manual_size is not None:
+        return float(manual_size)
+    base_size = float(
+        getattr(args, "_postgwas_base_fontsize", _POSTGWAS_DEFAULT_FONT_SIZE)
+    )
+    if manh_ratio is None:
+        return base_size
+    return _scaled_fontsize_for_manhattan(
+        manh_ratio,
+        width_in=_PANEL_WIDTH_IN,
+        base_font=base_size,
+        min_scale=_POSTGWAS_MIN_FONT_SCALE,
+    )
+
+
+def _apply_postgwas_matplotlib_style(args) -> None:
+    base_fontsize = float(
+        getattr(args, "_postgwas_base_fontsize", _POSTGWAS_DEFAULT_FONT_SIZE)
+    )
+    mpl.rcParams["pdf.fonttype"] = 42
+    mpl.rcParams["ps.fonttype"] = 42
+    mpl.rcParams["svg.fonttype"] = "none"
+    mpl.rcParams["axes.unicode_minus"] = False
+    mpl.rcParams["font.size"] = base_fontsize
+    mpl.rcParams["axes.labelsize"] = base_fontsize
+    mpl.rcParams["xtick.labelsize"] = base_fontsize
+    mpl.rcParams["ytick.labelsize"] = base_fontsize
+    mpl.rcParams["legend.fontsize"] = base_fontsize
+    plt.rcParams["svg.fonttype"] = "none"
+    plt.rcParams["axes.unicode_minus"] = False
+    _prepare_cjk_plotting()
+
+    font_family = str(getattr(args, "_postgwas_font_family", "") or "").strip()
+    if font_family == "":
+        return
+
+    current_sans = mpl.rcParams.get("font.sans-serif", [])
+    if not isinstance(current_sans, list):
+        current_sans = [str(current_sans)]
+
+    family_list = [font_family]
+    if font_family != "sans-serif":
+        family_list.append("sans-serif")
+    mpl.rcParams["font.family"] = family_list
+    if font_family not in _POSTGWAS_GENERIC_FONT_FAMILIES.values():
+        mpl.rcParams["font.sans-serif"] = [
+            font_family
+        ] + [str(x) for x in current_sans if str(x) != font_family]
+
+
+def _resolve_postgwas_gene_panel_height_in(
+    font_size: float,
+    *,
+    width_in: float = _PANEL_WIDTH_IN,
+) -> float:
+    base_height = float(width_in) / 20.0
+    text_height = max(0.0, float(font_size)) / 72.0
+    return max(base_height, text_height * 3.6)
+
+
+def _apply_postgwas_gene_panel_layout(
+    fig: plt.Figure,
+    ax: plt.Axes,
+    *,
+    x_align_bounds: Optional[tuple[float, float, float, float]] = None,
+) -> None:
+    # Gene-only panels have no regular axis decorations and are often very short;
+    # use deterministic vertical padding instead of tight_layout to avoid spurious
+    # margin warnings when larger fonts or edge labels are present.
+    fig.subplots_adjust(left=0.08, right=0.98, top=0.88, bottom=0.18)
+    if x_align_bounds is None:
+        return
+    mx0, _my0, mw, _mh = x_align_bounds
+    _cx0, cy0, _cw, ch = ax.get_position().bounds
+    ax.set_position([float(mx0), cy0, float(mw), ch])
+    ax.set_anchor("N")
+
+
+def _set_postgwas_axis_transparent(ax: plt.Axes) -> None:
+    ax.set_facecolor("none")
+    ax.patch.set_facecolor("none")
+    ax.patch.set_alpha(0.0)
+    ax.patch.set_visible(False)
+
+
+def _resolve_postgwas_bridge_panel_height_in(
+    font_size: float,
+    *,
+    width_in: float = _PANEL_WIDTH_IN,
+    use_gene_bridge: bool = True,
+) -> float:
+    if not bool(use_gene_bridge):
+        return 0.24
+    gene_h_in = _resolve_postgwas_gene_panel_height_in(font_size, width_in=width_in)
+    return max(
+        min(gene_h_in, float(width_in) / 9.0),
+        float(width_in) / 15.0,
+    )
 
 
 def _emit_info_to_file_handlers(logger: logging.Logger, message: str) -> None:
@@ -777,6 +1023,77 @@ def _resolve_qq_point_color(spec: Optional[Tuple[str, Any]]) -> str:
     return str(colors[0])
 
 
+def _split_cli_series_tokens(value: object, *, name: str) -> list[str]:
+    if value is None:
+        return []
+    raw_items = list(value) if isinstance(value, (list, tuple)) else [value]
+    out: list[str] = []
+    for item in raw_items:
+        text = str(item).strip()
+        if text == "":
+            continue
+        parts = [tok.strip() for tok in re.split(r"[;,]", text) if tok.strip() != ""]
+        if len(parts) == 0:
+            continue
+        out.extend(parts)
+    if len(out) == 0:
+        raise ValueError(f"Invalid {name}: no value provided.")
+    return out
+
+
+def _parse_scatter_size_spec(value: object) -> Optional[list[float]]:
+    if value is None:
+        return None
+    tokens = _split_cli_series_tokens(value, name="--scatter-size")
+    out: list[float] = []
+    for tok in tokens:
+        try:
+            num = float(tok)
+        except (TypeError, ValueError) as e:
+            raise ValueError(f"Invalid --scatter-size token: {tok}") from e
+        if (not np.isfinite(num)) or num <= 0.0:
+            raise ValueError("--scatter-size values must be finite numbers > 0.")
+        out.append(float(num))
+    return out
+
+
+def _parse_alpha_spec(value: object) -> Optional[list[float]]:
+    if value is None:
+        return None
+    tokens = _split_cli_series_tokens(value, name="--alpha")
+    out: list[float] = []
+    for tok in tokens:
+        try:
+            num = float(tok)
+        except (TypeError, ValueError) as e:
+            raise ValueError(f"Invalid --alpha token: {tok}") from e
+        if (not np.isfinite(num)) or num < 0.0 or num > 1.0:
+            raise ValueError("--alpha values must be within [0, 1].")
+        out.append(float(num))
+    return out
+
+
+def _resolve_single_series_value(
+    spec: Optional[list[float]],
+    default: float,
+) -> float:
+    if spec is None or len(spec) == 0:
+        return float(default)
+    return float(spec[0])
+
+
+def _resolve_merge_series_values(
+    spec: Optional[list[float]],
+    n_series: int,
+    *,
+    default: float,
+) -> list[float]:
+    if n_series <= 0:
+        return []
+    base = list(spec) if spec is not None and len(spec) > 0 else [float(default)]
+    return [float(base[i % len(base)]) for i in range(n_series)]
+
+
 def _parse_marker_spec(value: object) -> Optional[list[str]]:
     if value is None:
         return None
@@ -1019,35 +1336,50 @@ def _parse_ylim_spec(value: object) -> tuple[Optional[float], Optional[float]]:
     """
     if value is None:
         raise ValueError("--ylim is None.")
-    text = str(value).strip()
-    if text == "":
+    raw_items = list(value) if isinstance(value, (list, tuple)) else [value]
+    tokens = [str(x).strip() for x in raw_items if str(x).strip() != ""]
+    if len(tokens) == 0:
         raise ValueError("--ylim is empty.")
-    if text.startswith("[") and text.endswith("]"):
-        text = text[1:-1].strip()
-
-    # Range form: <lo:hi>, <lo:>, <:hi> (also accepts '-')
-    if (":" in text) or ("-" in text):
-        m = re.match(r"^\s*([0-9]*\.?[0-9]*)\s*(?:-|:)\s*([0-9]*\.?[0-9]*)\s*$", text)
-        if m is None:
-            raise ValueError(
-                f"Invalid --ylim format: {value}. Use <max>, <min:max>, <min:>, or <:max> "
-                "(e.g. 6, 0:6, 2:, :6)."
-            )
-        lo_txt = m.group(1).strip()
-        hi_txt = m.group(2).strip()
-        if lo_txt == "" and hi_txt == "":
-            raise ValueError("Invalid --ylim: at least one bound must be provided.")
-        lo = float(lo_txt) if lo_txt != "" else None
-        hi = float(hi_txt) if hi_txt != "" else None
-    else:
-        # Single number means [0, max]
+    if len(tokens) == 2:
         try:
-            hi = float(text)
+            lo = float(tokens[0])
+            hi = float(tokens[1])
         except (TypeError, ValueError) as e:
             raise ValueError(
-                f"Invalid --ylim format: {value}. Use <max>, <min:max>, <min:>, or <:max>."
+                f"Invalid --ylim format: {' '.join(tokens)}. Use <max>, <min:max>, <min:>, <:max>, or <min> <max>."
             ) from e
-        lo = 0.0
+    elif len(tokens) > 2:
+        raise ValueError(
+            "Invalid --ylim format: too many values. Use <max>, <min:max>, <min:>, <:max>, or <min> <max>."
+        )
+    else:
+        text = tokens[0]
+        if text.startswith("[") and text.endswith("]"):
+            text = text[1:-1].strip()
+
+        # Range form: <lo:hi>, <lo:>, <:hi> (also accepts '-')
+        if (":" in text) or ("-" in text):
+            m = re.match(r"^\s*([0-9]*\.?[0-9]*)\s*(?:-|:)\s*([0-9]*\.?[0-9]*)\s*$", text)
+            if m is None:
+                raise ValueError(
+                    f"Invalid --ylim format: {value}. Use <max>, <min:max>, <min:>, <:max>, or <min> <max> "
+                    "(e.g. 6, 0:6, 2:, :6, 2 10)."
+                )
+            lo_txt = m.group(1).strip()
+            hi_txt = m.group(2).strip()
+            if lo_txt == "" and hi_txt == "":
+                raise ValueError("Invalid --ylim: at least one bound must be provided.")
+            lo = float(lo_txt) if lo_txt != "" else None
+            hi = float(hi_txt) if hi_txt != "" else None
+        else:
+            # Single number means [0, max]
+            try:
+                hi = float(text)
+            except (TypeError, ValueError) as e:
+                raise ValueError(
+                    f"Invalid --ylim format: {value}. Use <max>, <min:max>, <min:>, <:max>, or <min> <max>."
+                ) from e
+            lo = 0.0
 
     if lo is not None:
         if not np.isfinite(lo):
@@ -1062,6 +1394,32 @@ def _parse_ylim_spec(value: object) -> tuple[Optional[float], Optional[float]]:
     if lo is not None and hi is not None and hi <= lo:
         raise ValueError("--ylim upper bound must be greater than lower bound.")
     return (float(lo) if lo is not None else None, float(hi) if hi is not None else None)
+
+
+def _format_ylim_spec_text(
+    source: object,
+    lo: Optional[float],
+    hi: Optional[float],
+) -> Optional[str]:
+    if source is None:
+        return None
+    raw_items = list(source) if isinstance(source, (list, tuple)) else [source]
+    tokens = [str(x).strip() for x in raw_items if str(x).strip() != ""]
+    if len(tokens) == 1:
+        text = tokens[0]
+        if ":" not in text and "-" not in text and "," not in text:
+            return f"{float(hi):g}" if hi is not None else text
+    if lo is not None and hi is not None:
+        return f"{float(lo):g}:{float(hi):g}"
+    if lo is not None:
+        return f"{float(lo):g}:"
+    if hi is not None:
+        return f":{float(hi):g}"
+    return None
+
+
+def _format_float_series(values: list[float]) -> str:
+    return ",".join(f"{float(x):g}" for x in values)
 
 
 def _format_bimrange_tuple(item: tuple[str, int, int]) -> str:
@@ -1881,7 +2239,7 @@ def _draw_ld_bimrange_titles(
     spans: list[dict[str, object]],
     *,
     enabled: bool,
-    font_size: float = 5.5,
+    font_size: float = _POSTGWAS_DEFAULT_FONT_SIZE,
 ) -> None:
     if not enabled or len(spans) == 0:
         return
@@ -2293,6 +2651,7 @@ def _draw_empty_ldblock(
     *,
     n_sites: int = 2,
     text: Optional[str] = None,
+    font_size: float = _POSTGWAS_DEFAULT_FONT_SIZE,
 ) -> None:
     n = max(2, int(n_sites))
     LDblock(np.zeros((n, n), dtype=np.float32), ax=ax, vmin=0, vmax=1, cmap="Greys")
@@ -2300,7 +2659,14 @@ def _draw_empty_ldblock(
     ax.set_xlim(0.5, float(n) - 0.5)
     ax.margins(x=0.0)
     if text:
-        ax.text(n / 2.0, -n / 2.0, text, ha="center", va="center", fontsize=6)
+        ax.text(
+            n / 2.0,
+            -n / 2.0,
+            text,
+            ha="center",
+            va="center",
+            fontsize=float(font_size),
+        )
 
 
 def _ld_min_height_over_width(n_sites: int) -> float:
@@ -2508,6 +2874,7 @@ def _draw_gene_structure_axis(
     arrow_step: float = 1_000.0,
     thickness_scale: float = 1.0,
     y_offset: float = 0.0,
+    gene_text_size: float = _POSTGWAS_DEFAULT_FONT_SIZE,
 ) -> None:
     """
     Draw gene/CDS/UTR structure into `ax` using projected x coordinates.
@@ -2523,7 +2890,7 @@ def _draw_gene_structure_axis(
         block_color=block_color,
         line_width=line_width,
         arrow_step=arrow_step,
-        gene_text_size=5,
+        gene_text_size=float(gene_text_size),
         thickness_scale=thickness_scale,
         y_offset=y_offset,
         unknown_strand_as_plus=False,
@@ -2543,20 +2910,21 @@ def _draw_manh_gene_ld_links(
     ax_ld: plt.Axes,
     pairs: list[tuple[float, float, bool]],
     *,
-    gene_cds_bottom: float = -0.05,
+    gene_route_y: float = -0.08,
     force_line_color: Optional[str] = None,
     nonsig_line_color: str = "grey",
 ) -> None:
     """
     Draw connectors:
-      1) y=0.2 -> y=gene_cds_bottom vertical line at Manhattan SNP x
-      2) y=gene_cds_bottom -> y=-0.2 diagonal line from gene x to LD-mapped x
+      1) Manhattan bottom -> routing lane below gene structure
+      2) gene bottom routing lane -> LD triangle at the same SNP / LD x
     Significant SNP lines are red; non-significant SNP lines use
     `nonsig_line_color`.
     """
     if len(pairs) == 0:
         return
     gx0, gx1 = ax_gene.get_xlim()
+    y_manh_ref = float(ax_manh.get_ylim()[0])
     tx0, tx1 = ax_manh.get_xlim()
     dt = float(tx1 - tx0)
     if np.isclose(dt, 0.0):
@@ -2576,29 +2944,34 @@ def _draw_manh_gene_ld_links(
             line_color = str(force_line_color)
         else:
             line_color = "red" if bool(is_sig) else str(nonsig_line_color)
-        ax_gene.plot(
-            [x_top_g, x_top_g],
-            [0.2, float(gene_cds_bottom)],
+        upper = ConnectionPatch(
+            xyA=(float(x_top), y_manh_ref),
+            xyB=(x_top_g, float(gene_route_y)),
+            coordsA=ax_manh.transData,
+            coordsB=ax_gene.transData,
             color=line_color,
-            linewidth=0.25,
-            alpha=0.8,
+            linewidth=0.35,
+            alpha=0.9,
             clip_on=False,
-            zorder=-20,
+            zorder=0.2,
         )
+        ax_gene.add_artist(upper)
         # Draw diagonal segment in real cross-axes geometry so mapping
         # remains correct even if LD panel width is narrower than middle panel.
+        # Start from a dedicated routing lane below the gene structure so
+        # connectors do not cover the gene body/label.
         diag = ConnectionPatch(
-            xyA=(x_top_g, float(gene_cds_bottom)),
-            xyB=(float(x_ld), 0.0),
+            xyA=(x_top_g, float(gene_route_y)),
+            xyB=(float(x_ld), float(_POSTGWAS_LD_LINK_Y)),
             coordsA=ax_gene.transData,
             coordsB=ax_ld.transData,
             color=line_color,
-            linewidth=0.25,
-            alpha=0.8,
+            linewidth=0.35,
+            alpha=0.9,
             clip_on=False,
-            zorder=-20,
+            zorder=10.0,
         )
-        fig.add_artist(diag)
+        ax_ld.add_artist(diag)
 
 
 def _format_input_files(files: list[str]) -> str:
@@ -2627,6 +3000,7 @@ def _overlay_manhattan_threshold_points(
     base_size: float,
     marker: str,
     rasterized: bool,
+    alpha_override: Optional[float] = None,
     min_logp: float = 0.5,
     max_logp: Optional[float] = None,
     ignore: Optional[list[object]] = None,
@@ -2670,7 +3044,11 @@ def _overlay_manhattan_threshold_points(
             color="red",
             marker=str(marker),
             s=float(base_size) * 1.5,
-            alpha=0.85,
+            alpha=(
+                float(alpha_override)
+                if alpha_override is not None
+                else 0.85
+            ),
             rasterized=rasterized,
             zorder=6,
             **_marker_scatter_style(str(marker)),
@@ -3009,12 +3387,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
     Plot Manhattan/QQ figures and optionally annotate significant hits
     for a single GWAS result file.
     """
-    mpl.rcParams["pdf.fonttype"] = 42
-    mpl.rcParams["ps.fonttype"] = 42
-    mpl.rcParams["font.size"] = 6
-    plt.rcParams["svg.fonttype"] = "none"
-    plt.rcParams["axes.unicode_minus"] = False
-    _prepare_cjk_plotting()
+    _apply_postgwas_matplotlib_style(args)
 
     # Silence pandas chained-assignment warnings in this script
     warnings.filterwarnings(
@@ -3039,6 +3412,10 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
     src = os.path.basename(str(file))
     task_label = os.path.basename(str(output_stem))
     single_marker = str(getattr(args, "_postgwas_single_marker", _DEFAULT_SINGLE_MARKER))
+    single_scatter_size = float(
+        getattr(args, "_postgwas_single_scatter_size", _DEFAULT_SCATTER_SIZE)
+    )
+    single_alpha = getattr(args, "_postgwas_single_alpha", None)
 
     if not status_enabled:
         logger.info(f"Loading GWAS results from {src}... [{format_elapsed(0.0)}]")
@@ -3108,7 +3485,11 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
         if args.thr is not None
         else (0.05 / df.shape[0] if df.shape[0] > 0 else np.nan)
     )
-    effective_ldblock_ratio = args.ldblock_ratio
+    effective_ldblock_ratio = (
+        args.ldblock_ratio
+        if bool(getattr(args, "_postgwas_single_ldblock_requested", False))
+        else None
+    )
     if effective_ldblock_ratio is not None and args.bimrange_tuples is None:
         logger.warning(
             "Warning: --ldblock/--ldblock-all requires --bimrange; LD block and Manhattan+LD plotting are skipped."
@@ -3147,15 +3528,18 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                     compression=False,
                 )
         width_in = float(_PANEL_WIDTH_IN)
-        gene_panel_h_in = width_in / 20.0
         dpi = 300
         rasterized = _postgwas_should_rasterize_dense_layers(args.format)
         manh_ratio_for_font = float(args.manh_ratio) if args.manh_ratio is not None else 2.0
-        manh_fontsize_target = _scaled_fontsize_for_manhattan(
-            manh_ratio_for_font,
+        manh_fontsize_target = _postgwas_resolve_fontsize(
+            args,
+            manh_ratio=manh_ratio_for_font,
+        )
+        gene_panel_h_in = _resolve_postgwas_gene_panel_height_in(
+            float(manh_fontsize_target),
             width_in=width_in,
         )
-        manh_loc_fontsize = max(3.0, float(manh_fontsize_target) * 0.85)
+        manh_loc_fontsize = float(manh_fontsize_target)
         manh_ylim = None
         manh_height_in = None
         manh_fontsize = None
@@ -3231,16 +3615,18 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                         min_logp=manh_min_logp,
                         max_logp=manh_max_logp,
                         y_min=manh_ymin,
-                        s=args.scatter_size,
+                        s=single_scatter_size,
+                        alpha=(float(single_alpha) if single_alpha is not None else 0.78),
                         rasterized=rasterized,
                     )
                     _overlay_manhattan_threshold_points(
                         ax,
                         plotmodel,
                         threshold=threshold,
-                        base_size=args.scatter_size,
+                        base_size=single_scatter_size,
                         marker=single_marker,
                         rasterized=rasterized,
+                        alpha_override=(float(single_alpha) if single_alpha is not None else None),
                         min_logp=manh_min_logp,
                         max_logp=manh_max_logp,
                     )
@@ -3256,9 +3642,9 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                         draw_hl_y,
                         marker="D",
                         color="red",
-                        alpha=0.85,
+                        alpha=(float(single_alpha) if single_alpha is not None else 0.85),
                         zorder=10,
-                        s=args.scatter_size,
+                        s=single_scatter_size,
                         **_marker_scatter_style("D"),
                     )
                     for idx in draw_hl_idx:
@@ -3279,7 +3665,8 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                         min_logp=manh_min_logp,
                         max_logp=manh_max_logp,
                         y_min=manh_ymin,
-                        s=args.scatter_size,
+                        s=single_scatter_size,
+                        alpha=(float(single_alpha) if single_alpha is not None else 0.78),
                         ignore=df_hl_idx,
                         rasterized=rasterized,
                     )
@@ -3287,9 +3674,10 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                         ax,
                         plotmodel,
                         threshold=threshold,
-                        base_size=args.scatter_size,
+                        base_size=single_scatter_size,
                         marker=single_marker,
                         rasterized=rasterized,
+                        alpha_override=(float(single_alpha) if single_alpha is not None else None),
                         min_logp=manh_min_logp,
                         max_logp=manh_max_logp,
                         ignore=list(df_hl_idx),
@@ -3303,16 +3691,18 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                     min_logp=manh_min_logp,
                     max_logp=manh_max_logp,
                     y_min=manh_ymin,
-                    s=args.scatter_size,
+                    s=single_scatter_size,
+                    alpha=(float(single_alpha) if single_alpha is not None else 0.78),
                     rasterized=rasterized,
                 )
                 _overlay_manhattan_threshold_points(
                     ax,
                     plotmodel,
                     threshold=threshold,
-                    base_size=args.scatter_size,
+                    base_size=single_scatter_size,
                     marker=single_marker,
                     rasterized=rasterized,
+                    alpha_override=(float(single_alpha) if single_alpha is not None else None),
                     min_logp=manh_min_logp,
                     max_logp=manh_max_logp,
                 )
@@ -3434,7 +3824,12 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                         color_set=[qq_point_color, qq_band_color],
                         marker=single_marker,
                         line_color="black",
-                        scatter_size=args.scatter_size,
+                        scatter_size=single_scatter_size,
+                        scatter_alpha=(
+                            float(single_alpha)
+                            if single_alpha is not None
+                            else 0.75
+                        ),
                         qq_mode=("full" if args.fullscatter else "auto"),
                         qq_fast_max_points=_QQ_FAST_MAX_POINTS,
                         sig_p_threshold=(
@@ -3607,7 +4002,14 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                 ax.set_xlim(0.5, float(n_ld) - 0.5)
                 ax.margins(x=0.0)
                 if ld_overlay_text:
-                    ax.text(n_ld / 2.0, -n_ld / 2.0, ld_overlay_text, ha="center", va="center", fontsize=6)
+                    ax.text(
+                        n_ld / 2.0,
+                        -n_ld / 2.0,
+                        ld_overlay_text,
+                        ha="center",
+                        va="center",
+                        fontsize=float(manh_fontsize_target),
+                    )
 
             def _build_manh_ld_pairs(
                 ax_manh: plt.Axes,
@@ -3656,7 +4058,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                     if meta is None:
                         continue
                     x_top, is_sig = meta
-                    # In LDblock, SNP i is centered around x=i+0.5 on the top border.
+                    # In LDblock, SNP i is centered around x=i+0.5 near the top edge.
                     x_ld = float(i) + 0.5
                     pairs.append((x_top, x_ld, bool(is_sig)))
                 return pairs
@@ -3682,7 +4084,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                 slashes_x: list[float] = []
                 edge_margin_n = 0.006
                 y_manh_ref = float(ax_manh.get_ylim()[0])
-                y_ld_ref = 0.0
+                y_ld_ref = float(_POSTGWAS_LD_LINK_Y)
                 to_bridge = ax_bridge.transAxes.inverted()
                 for x_top, x_ld, is_sig in pairs:
                     p_top_disp = ax_manh.transData.transform((float(x_top), y_manh_ref))
@@ -3775,122 +4177,126 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                     block_color=gene_block_color,
                     line_width=1.0,
                     arrow_step=1_000.0,
+                    gene_text_size=manh_fontsize_target,
                 )
                 ax_gene.set_xlim(gene_plot_xlim)
-                fig_gene.tight_layout()
-                if manh_axes_bounds is not None:
-                    mx0, _my0, mw, _mh = manh_axes_bounds
-                    _cx0, cy0, _cw, ch = ax_gene.get_position().bounds
-                    ax_gene.set_position([mx0, cy0, mw, ch])
+                _apply_postgwas_gene_panel_layout(
+                    fig_gene,
+                    ax_gene,
+                    x_align_bounds=manh_axes_bounds,
+                )
                 gene_path = os.path.join(args.out, f"{output_stem}.gene.{args.format}")
                 _save_figure_and_close(fig_gene, gene_path)
             else:
                 gene_path = None
 
-            # Combined Manhattan + LD panel
-            manhld_manh_ratio = args.manh_ratio if args.manh_ratio is not None else 2.0
-            manhld_manh_h_in = width_in / manhld_manh_ratio
-            gene_bridge_scale = 0.5
-            mid_gene_y_offset = 0.03
-            mid_gene_ymin = -0.15
-            mid_gene_ymax = 0.2
-            # Keep Manhattan<->LD transition layer from becoming too tall:
-            # cap middle layer height at width/15.
-            mid_h_raw = gene_panel_h_in if use_gene_bridge else 0.22
-            mid_h_cap = float(width_in) / 15.0
-            mid_h_in = min(float(mid_h_raw), float(mid_h_cap))
-            if ld_panel_xspan is None:
-                ld_panel_frac_in_manh = 1.0
+            if args.manh_ratio is not None:
+                # Combined Manhattan + LD panel
+                manhld_manh_ratio = float(args.manh_ratio)
+                manhld_manh_h_in = width_in / manhld_manh_ratio
+                gene_bridge_scale = 0.8
+                mid_gene_y_offset = 0.03
+                mid_gene_ymin = -0.18
+                mid_gene_ymax = 0.22
+                mid_h_in = _resolve_postgwas_bridge_panel_height_in(
+                    float(manh_fontsize_target),
+                    width_in=width_in,
+                    use_gene_bridge=use_gene_bridge,
+                )
+                if ld_panel_xspan is None:
+                    ld_panel_frac_in_manh = 1.0
+                else:
+                    ld_panel_frac_in_manh = float(ld_panel_xspan[1] - ld_panel_xspan[0])
+                ld_h_in_combo = (
+                    width_in
+                    * ld_panel_frac_in_manh
+                    / effective_ldblock_ratio
+                )
+                ld_h_in_combo_min = (
+                    width_in
+                    * ld_panel_frac_in_manh
+                    * _ld_min_height_over_width(max(2, int(ld_mat.shape[0])))
+                )
+                ld_h_in_combo = max(0.5, float(ld_h_in_combo), float(ld_h_in_combo_min))
+                fig_manhld, combo_axes, _combo_panel_w_in, _combo_panel_heights = _create_stacked_panel_figure(
+                    panel_width_in=width_in,
+                    panel_heights_in=[manhld_manh_h_in, mid_h_in, ld_h_in_combo],
+                    dpi=dpi,
+                    vspace_in=_PANEL_STACK_VSPACE_IN,
+                )
+                ax_manhld_top, ax_manhld_mid, ax_manhld_bot = combo_axes
+                # Keep transition axis below Manhattan axis so loc labels remain visible.
+                ax_manhld_top.set_zorder(5)
+                ax_manhld_mid.set_zorder(2)
+                ax_manhld_bot.set_zorder(1)
+                _set_postgwas_axis_transparent(ax_manhld_mid)
+
+                _tmp_ylim, _tmp_yticks, _tmp_fontsize, manhld_top_xlim = _draw_manhattan_axis(ax_manhld_top)
+                _draw_ld_axis(ax_manhld_bot)
+                if use_gene_bridge:
+                    _draw_gene_structure_axis(
+                        ax_manhld_mid,
+                        gene_track_df,
+                        arrow_color=gene_line_color,
+                        block_color=gene_block_color,
+                        line_width=0.8,
+                        arrow_step=1_000.0,
+                        thickness_scale=gene_bridge_scale,
+                        y_offset=mid_gene_y_offset,
+                        gene_text_size=float(_tmp_fontsize),
+                    )
+                    ax_manhld_mid.set_xlim(manhld_top_xlim)
+                    ax_manhld_mid.set_ylim(mid_gene_ymin, mid_gene_ymax)
+
+                # Keep the two panels strictly left/right aligned.
+                # Manh/Gene keep full width; optionally narrow only LD panel width.
+                fig_manhld.canvas.draw()
+                bx0, by0, bw, bh = ax_manhld_bot.get_position().bounds
+                tx0, _ty0, tw, _th = ax_manhld_top.get_position().bounds
+                if ld_panel_xspan is None:
+                    ld_panel_width_scale = 1.0
+                    new_bw = bw * float(ld_panel_width_scale)
+                    new_bx0 = bx0 + 0.5 * (bw - new_bw)
+                else:
+                    fx0, fx1 = ld_panel_xspan
+                    new_bw = float(tw) * float(fx1 - fx0)
+                    new_bx0 = float(tx0) + float(tw) * float(fx0)
+                ax_manhld_bot.set_position([new_bx0, by0, new_bw, bh])
+                ax_manhld_bot.set_anchor("N")
+                fig_manhld.canvas.draw()
+
+                bridge_pairs = _build_manh_ld_pairs(ax_manhld_top, ax_manhld_bot)
+                if use_gene_bridge:
+                    ax_manhld_mid.set_xlim(ax_manhld_top.get_xlim())
+                    ax_manhld_mid.set_ylim(mid_gene_ymin, mid_gene_ymax)
+                    _draw_manh_gene_ld_links(
+                        fig_manhld,
+                        ax_manhld_mid,
+                        ax_manhld_top,
+                        ax_manhld_bot,
+                        bridge_pairs,
+                        gene_route_y=-0.17 * gene_bridge_scale + mid_gene_y_offset,
+                        nonsig_line_color="grey",
+                    )
+                else:
+                    _draw_bridge_axis(
+                        ax_manhld_mid,
+                        ax_manhld_top,
+                        ax_manhld_bot,
+                        bridge_pairs,
+                        line_color="grey",
+                        sig_line_color="red",
+                    )
+                if not (args.bimrange_tuples is not None and len(args.bimrange_tuples) == 1):
+                    _show_end_locs_without_xticks(
+                        ax_manhld_top,
+                        label_fontsize=float(_tmp_fontsize),
+                    )
+
+                manhld_path = os.path.join(args.out, f"{output_stem}.manhld.{args.format}")
+                _save_figure_and_close(fig_manhld, manhld_path)
             else:
-                ld_panel_frac_in_manh = float(ld_panel_xspan[1] - ld_panel_xspan[0])
-            ld_h_in_combo = (
-                width_in
-                * ld_panel_frac_in_manh
-                / effective_ldblock_ratio
-            )
-            ld_h_in_combo_min = (
-                width_in
-                * ld_panel_frac_in_manh
-                * _ld_min_height_over_width(max(2, int(ld_mat.shape[0])))
-            )
-            ld_h_in_combo = max(0.5, float(ld_h_in_combo), float(ld_h_in_combo_min))
-            fig_manhld, combo_axes, _combo_panel_w_in, _combo_panel_heights = _create_stacked_panel_figure(
-                panel_width_in=width_in,
-                panel_heights_in=[manhld_manh_h_in, mid_h_in, ld_h_in_combo],
-                dpi=dpi,
-                vspace_in=_PANEL_STACK_VSPACE_IN,
-            )
-            ax_manhld_top, ax_manhld_mid, ax_manhld_bot = combo_axes
-            # Keep transition axis below Manhattan axis so loc labels remain visible.
-            ax_manhld_top.set_zorder(5)
-            ax_manhld_mid.set_zorder(2)
-            ax_manhld_bot.set_zorder(1)
-            if not use_gene_bridge:
-                ax_manhld_mid.patch.set_visible(False)
-
-            _tmp_ylim, _tmp_yticks, _tmp_fontsize, manhld_top_xlim = _draw_manhattan_axis(ax_manhld_top)
-            _draw_ld_axis(ax_manhld_bot)
-            if use_gene_bridge:
-                _draw_gene_structure_axis(
-                    ax_manhld_mid,
-                    gene_track_df,
-                    arrow_color=gene_line_color,
-                    block_color=gene_block_color,
-                    line_width=0.8,
-                    arrow_step=1_000.0,
-                    thickness_scale=gene_bridge_scale,
-                    y_offset=mid_gene_y_offset,
-                )
-                ax_manhld_mid.set_xlim(manhld_top_xlim)
-                ax_manhld_mid.set_ylim(mid_gene_ymin, mid_gene_ymax)
-
-            # Keep the two panels strictly left/right aligned.
-            # Manh/Gene keep full width; optionally narrow only LD panel width.
-            fig_manhld.canvas.draw()
-            bx0, by0, bw, bh = ax_manhld_bot.get_position().bounds
-            tx0, _ty0, tw, _th = ax_manhld_top.get_position().bounds
-            if ld_panel_xspan is None:
-                ld_panel_width_scale = 1.0
-                new_bw = bw * float(ld_panel_width_scale)
-                new_bx0 = bx0 + 0.5 * (bw - new_bw)
-            else:
-                fx0, fx1 = ld_panel_xspan
-                new_bw = float(tw) * float(fx1 - fx0)
-                new_bx0 = float(tx0) + float(tw) * float(fx0)
-            ax_manhld_bot.set_position([new_bx0, by0, new_bw, bh])
-            ax_manhld_bot.set_anchor("N")
-            fig_manhld.canvas.draw()
-
-            bridge_pairs = _build_manh_ld_pairs(ax_manhld_top, ax_manhld_bot)
-            if use_gene_bridge:
-                ax_manhld_mid.set_xlim(ax_manhld_top.get_xlim())
-                ax_manhld_mid.set_ylim(mid_gene_ymin, mid_gene_ymax)
-                _draw_manh_gene_ld_links(
-                    fig_manhld,
-                    ax_manhld_mid,
-                    ax_manhld_top,
-                    ax_manhld_bot,
-                    bridge_pairs,
-                    gene_cds_bottom=-0.1 * gene_bridge_scale + mid_gene_y_offset,
-                    nonsig_line_color="grey",
-                )
-            else:
-                _draw_bridge_axis(
-                    ax_manhld_mid,
-                    ax_manhld_top,
-                    ax_manhld_bot,
-                    bridge_pairs,
-                    line_color="grey",
-                    sig_line_color="red",
-                )
-            if not (args.bimrange_tuples is not None and len(args.bimrange_tuples) == 1):
-                _show_end_locs_without_xticks(
-                    ax_manhld_top,
-                    label_fontsize=max(3.0, float(_tmp_fontsize) * 0.85),
-                )
-
-            manhld_path = os.path.join(args.out, f"{output_stem}.manhld.{args.format}")
-            _save_figure_and_close(fig_manhld, manhld_path)
+                manhld_path = None
         else:
             ld_path = None
             gene_path = None
@@ -4138,7 +4544,7 @@ def _read_merge_gwas_table(
 
 
 def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
-    _prepare_cjk_plotting()
+    _apply_postgwas_matplotlib_style(args)
     files = [str(f) for f in args.merge_files]
     if len(files) == 0:
         logger.warning("Warning: merged plotting requested but no GWAS input file is available.")
@@ -4159,6 +4565,34 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
         list(getattr(args, "_postgwas_merge_markers", []))
         if len(getattr(args, "_postgwas_merge_markers", [])) == len(files)
         else _resolve_merge_markers(args.marker_spec, len(files))
+    )
+    series_sizes = (
+        [float(x) for x in list(getattr(args, "_postgwas_merge_scatter_sizes", []))]
+        if len(getattr(args, "_postgwas_merge_scatter_sizes", [])) == len(files)
+        else _resolve_merge_series_values(
+            getattr(args, "scatter_size_spec", None),
+            len(files),
+            default=float(getattr(args, "_postgwas_single_scatter_size", _DEFAULT_SCATTER_SIZE)),
+        )
+    )
+    series_alphas = (
+        [float(x) for x in list(getattr(args, "_postgwas_merge_alphas", []))]
+        if len(getattr(args, "_postgwas_merge_alphas", [])) == len(files)
+        else _resolve_merge_series_values(
+            getattr(args, "alpha_spec", None),
+            len(files),
+            default=float(_DEFAULT_MERGE_ALPHA),
+        )
+    )
+    legend_alpha = max(series_alphas) if len(series_alphas) > 0 else float(_DEFAULT_MERGE_ALPHA)
+    legend_size_base = (
+        max(series_sizes)
+        if len(series_sizes) > 0
+        else float(getattr(args, "_postgwas_single_scatter_size", _DEFAULT_SCATTER_SIZE))
+    )
+    legend_size = max(
+        float(legend_size_base) * float(_POSTGWAS_LEGEND_SIZE_SCALE),
+        float(legend_size_base) + float(_POSTGWAS_LEGEND_SIZE_MIN_BONUS),
     )
     series_labels = [f"{i + 1}:{os.path.basename(path)}" for i, path in enumerate(files)]
     ldblock_style = _resolve_ldblock_style(args.ldblock_palette_spec)
@@ -4357,27 +4791,13 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
     # Merged plots can contain multiple dense layers; always rasterize point/band
     # artists while keeping axes/text/legend vector-friendly.
     rasterized = True
-    manh_path = None
-    manh_height_in = None
-    manh_fontsize: Optional[float] = None
-    manh_ylim_pair: Optional[tuple[float, float]] = None
-    manh_yticks_pair: Optional[np.ndarray] = None
-    manh_xlim_pair: Optional[tuple[float, float]] = None
-    manh_axes_bounds: Optional[tuple[float, float, float, float]] = None
 
-    if merge_manh_ratio is not None:
-        manh_ratio = float(merge_manh_ratio)
-        manh_fontsize = _scaled_fontsize_for_manhattan(
-            manh_ratio,
-            width_in=width_in,
-        )
-        manh_loc_fontsize = max(3.0, float(manh_fontsize) * 0.85)
-        fig, ax, _manh_panel_w_in, manh_panel_h_in = _create_ratio_panel_figure(
-            ratio=manh_ratio,
-            dpi=300,
-            panel_width_in=width_in,
-            reserve_right_in=_PANEL_LEGEND_RIGHT_IN,
-        )
+    def _draw_merge_manhattan_axis(
+        ax: plt.Axes,
+        *,
+        font_size: float,
+        include_legend: bool,
+    ) -> tuple[tuple[float, float], np.ndarray, tuple[float, float]]:
         legend_handles: list[object] = []
         draw_xmins: list[float] = []
         draw_xmaxs: list[float] = []
@@ -4413,14 +4833,16 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
             p_keep = pvals_i[keep]
             sig_keep = np.isfinite(p_keep) & (p_keep <= float(threshold_merge))
             nonsig_keep = ~sig_keep
+            alpha_i = float(series_alphas[i])
+            size_i = float(series_sizes[i])
             if bool(np.any(nonsig_keep)):
                 ax.scatter(
                     x_keep[nonsig_keep],
                     y_keep[nonsig_keep],
                     color="lightgrey",
                     marker=series_markers[i],
-                    alpha=0.45,
-                    s=args.scatter_size,
+                    alpha=alpha_i,
+                    s=size_i,
                     rasterized=rasterized,
                     **_marker_scatter_style(series_markers[i]),
                 )
@@ -4430,23 +4852,24 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
                     y_keep[sig_keep],
                     color=series_colors[i],
                     marker=series_markers[i],
-                    alpha=0.45,
-                    s=args.scatter_size,
+                    alpha=alpha_i,
+                    s=size_i,
                     rasterized=rasterized,
                     **_marker_scatter_style(series_markers[i]),
                 )
-            legend_handles.append(
-                ax.scatter(
-                    [],
-                    [],
-                    color=series_colors[i],
-                    marker=series_markers[i],
-                    alpha=0.45,
-                    s=args.scatter_size,
-                    label=series_labels[i],
-                    **_marker_scatter_style(series_markers[i]),
+            if include_legend:
+                legend_handles.append(
+                    ax.scatter(
+                        [],
+                        [],
+                        color=series_colors[i],
+                        marker=series_markers[i],
+                        alpha=float(legend_alpha),
+                        s=float(legend_size),
+                        label=series_labels[i],
+                        **_marker_scatter_style(series_markers[i]),
+                    )
                 )
-            )
             if x_keep.size > 0:
                 draw_xmins.append(float(np.nanmin(x_keep)))
                 draw_xmaxs.append(float(np.nanmax(x_keep)))
@@ -4483,7 +4906,7 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
             _apply_multi_bimrange_manhattan_axis(
                 ax,
                 bim_layout,
-                label_fontsize=manh_loc_fontsize,
+                label_fontsize=float(font_size),
             )
             if (
                 x_axis_left is not None
@@ -4509,11 +4932,11 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
                 )
             ax.set_xticks(xticks)
             ax.set_xticklabels(xticklabels, rotation=0)
-        ax.xaxis.label.set_size(manh_fontsize)
-        ax.yaxis.label.set_size(manh_fontsize)
-        ax.tick_params(axis="both", labelsize=manh_fontsize)
+        ax.xaxis.label.set_size(font_size)
+        ax.yaxis.label.set_size(font_size)
+        ax.tick_params(axis="both", labelsize=font_size)
 
-        if len(legend_handles) > 0:
+        if include_legend and len(legend_handles) > 0:
             ax.legend(
                 handles=legend_handles,
                 loc="center left",
@@ -4521,8 +4944,8 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
                 frameon=False,
                 borderaxespad=0.0,
                 ncol=1,
-                markerscale=2.0,
-                fontsize=manh_fontsize,
+                markerscale=1.0,
+                fontsize=font_size,
             )
         _y0, _y1 = ax.get_ylim()
         lo = float(args.ylim_min) if args.ylim_min is not None else 0.0
@@ -4530,10 +4953,132 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
         if not (hi > lo):
             hi = lo + max(1e-9, abs(lo) * 1e-9)
         ax.set_ylim(lo, hi)
-        manh_yticks_pair = apply_integer_yticks(ax)
-        _yy0, _yy1 = ax.get_ylim()
-        manh_ylim_pair = (float(_yy0), float(_yy1))
-        manh_xlim_pair = (float(ax.get_xlim()[0]), float(ax.get_xlim()[1]))
+        manh_tick_values = apply_integer_yticks(ax)
+        return (
+            (float(ax.get_ylim()[0]), float(ax.get_ylim()[1])),
+            np.asarray(manh_tick_values, dtype=float),
+            (float(ax.get_xlim()[0]), float(ax.get_xlim()[1])),
+        )
+
+    def _draw_merge_ld_axis(ax: plt.Axes, *, font_size: float) -> None:
+        LDblock(ld_mat, ax=ax, vmin=0, vmax=1, cmap=ld_cmap, rasterize_threshold=100)
+        n_ld = max(2, int(ld_mat.shape[0]))
+        ax.set_xlim(0.5, float(n_ld) - 0.5)
+        ax.margins(x=0.0)
+        if ld_overlay_text:
+            ax.text(
+                n_ld / 2.0,
+                -n_ld / 2.0,
+                ld_overlay_text,
+                ha="center",
+                va="center",
+                fontsize=float(font_size),
+            )
+
+    def _build_merge_ld_bridge_pairs(
+        ld_keys: list[tuple[str, int]],
+    ) -> list[tuple[float, float, bool]]:
+        if len(ld_keys) == 0 or plot_df.shape[0] == 0:
+            return []
+        chr_vals = plot_df[chr_col].astype(str).map(_normalize_chr).to_numpy(dtype=object)
+        pos_vals = pd.to_numeric(plot_df[pos_col], errors="coerce").to_numpy(dtype=float)
+        x_vals = pd.to_numeric(plot_df["_x"], errors="coerce").to_numpy(dtype=float)
+        p_vals = pd.to_numeric(plot_df[p_col], errors="coerce").to_numpy(dtype=float)
+        key_to_meta: dict[tuple[str, int], tuple[float, bool]] = {}
+        for chrom_norm, posv, xv, pv in zip(chr_vals, pos_vals, x_vals, p_vals):
+            if not (
+                np.isfinite(posv)
+                and np.isfinite(xv)
+                and np.isfinite(pv)
+                and float(pv) > 0.0
+            ):
+                continue
+            key = (str(chrom_norm), int(round(float(posv))))
+            is_sig = bool(float(pv) <= float(threshold_merge))
+            if key not in key_to_meta:
+                key_to_meta[key] = (float(xv), is_sig)
+            else:
+                old_x, old_sig = key_to_meta[key]
+                key_to_meta[key] = (old_x, bool(old_sig or is_sig))
+        pairs: list[tuple[float, float, bool]] = []
+        n_ld = int(ld_mat.shape[0])
+        for i, key in enumerate(ld_keys[:n_ld]):
+            meta = key_to_meta.get((str(key[0]), int(key[1])))
+            if meta is None:
+                continue
+            x_top, is_sig = meta
+            pairs.append((float(x_top), float(i) + 0.5, bool(is_sig)))
+        return pairs
+
+    def _draw_merge_bridge_axis(
+        ax_bridge: plt.Axes,
+        ax_manh: plt.Axes,
+        ax_ld: plt.Axes,
+        pairs: list[tuple[float, float, bool]],
+        *,
+        line_color: str = "grey",
+        sig_line_color: str = "red",
+    ) -> None:
+        ax_bridge.set_xlim(0.0, 1.0)
+        ax_bridge.set_ylim(0.0, 1.0)
+        ax_bridge.set_xticks([])
+        ax_bridge.set_yticks([])
+        for spine in ax_bridge.spines.values():
+            spine.set_visible(False)
+        if len(pairs) == 0:
+            return
+
+        edge_margin_n = 0.006
+        y_manh_ref = float(ax_manh.get_ylim()[0])
+        y_ld_ref = float(_POSTGWAS_LD_LINK_Y)
+        to_bridge = ax_bridge.transAxes.inverted()
+        for x_top, x_ld, is_sig in pairs:
+            p_top_disp = ax_manh.transData.transform((float(x_top), y_manh_ref))
+            p_ld_disp = ax_ld.transData.transform((float(x_ld), y_ld_ref))
+            x_top_n = float(to_bridge.transform(p_top_disp)[0])
+            x_ld_n = float(to_bridge.transform(p_ld_disp)[0])
+            if not (np.isfinite(x_top_n) and np.isfinite(x_ld_n)):
+                continue
+            x_top_n = float(np.clip(x_top_n, edge_margin_n, 1.0 - edge_margin_n))
+            x_ld_n = float(np.clip(x_ld_n, edge_margin_n, 1.0 - edge_margin_n))
+            joint_y = 0.84
+            bottom_y = 0.06
+            poly_color = str(sig_line_color) if bool(is_sig) else str(line_color)
+            ax_bridge.plot(
+                [x_top_n, x_top_n, x_ld_n],
+                [1.04, joint_y, bottom_y],
+                color=poly_color,
+                linewidth=0.25,
+                alpha=0.8,
+                clip_on=False,
+                solid_joinstyle="round",
+            )
+
+    manh_path = None
+    manh_height_in = None
+    manh_fontsize: Optional[float] = None
+    manh_ylim_pair: Optional[tuple[float, float]] = None
+    manh_yticks_pair: Optional[np.ndarray] = None
+    manh_xlim_pair: Optional[tuple[float, float]] = None
+    manh_axes_bounds: Optional[tuple[float, float, float, float]] = None
+
+    if merge_manh_ratio is not None:
+        manh_ratio = float(merge_manh_ratio)
+        manh_fontsize = _postgwas_resolve_fontsize(
+            args,
+            manh_ratio=manh_ratio,
+        )
+        fig, ax, _manh_panel_w_in, manh_panel_h_in = _create_ratio_panel_figure(
+            ratio=manh_ratio,
+            dpi=300,
+            panel_width_in=width_in,
+            reserve_right_in=_PANEL_LEGEND_RIGHT_IN,
+        )
+        manh_ylim_pair, manh_yticks_pair, manh_xlim_pair = _draw_merge_manhattan_axis(
+            ax,
+            font_size=float(manh_fontsize),
+            include_legend=True,
+        )
 
         manh_axes_bounds = ax.get_position().bounds
         manh_path = os.path.join(args.out, f"{args.prefix}.merge.manh.{args.format}")
@@ -4543,7 +5088,14 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
 
     qq_path = None
     if merge_qq_ratio is not None:
-        qq_fontsize = float(manh_fontsize) if manh_fontsize is not None else 6.0
+        qq_fontsize = (
+            float(manh_fontsize)
+            if manh_fontsize is not None
+            else _postgwas_resolve_fontsize(
+                args,
+                manh_ratio=float(merge_qq_ratio),
+            )
+        )
         qq_y_in = manh_height_in if manh_height_in is not None else 4.0
         fig, ax, _qq_panel_w_in, _qq_panel_h_in = _create_ratio_panel_figure(
             ratio=float(merge_qq_ratio),
@@ -4583,9 +5135,9 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
             ax.scatter(
                 exp,
                 obs,
-                s=args.scatter_size,
+                s=float(series_sizes[i]),
                 marker=series_markers[i],
-                alpha=0.45,
+                alpha=float(series_alphas[i]),
                 rasterized=rasterized,
                 color=series_colors[i],
                 **_marker_scatter_style(series_markers[i]),
@@ -4594,9 +5146,9 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
                 ax.scatter(
                     [],
                     [],
-                    s=args.scatter_size,
+                    s=float(legend_size),
                     marker=series_markers[i],
-                    alpha=0.45,
+                    alpha=float(legend_alpha),
                     color=series_colors[i],
                     label=series_labels[i],
                     **_marker_scatter_style(series_markers[i]),
@@ -4674,7 +5226,7 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
                 frameon=False,
                 borderaxespad=0.0,
                 ncol=1,
-                markerscale=2.0,
+                markerscale=1.0,
                 fontsize=qq_fontsize,
             )
         qq_path = os.path.join(args.out, f"{args.prefix}.merge.qq.{args.format}")
@@ -4683,7 +5235,12 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
 
     ld_path = None
     gene_path = None
-    effective_ldblock_ratio = args.ldblock_ratio
+    manhld_path = None
+    effective_ldblock_ratio = (
+        args.ldblock_ratio
+        if bool(getattr(args, "_postgwas_merge_ldblock_requested", False))
+        else None
+    )
     region_ranges = args.bimrange_tuples if args.bimrange_tuples is not None else []
     if effective_ldblock_ratio is not None:
         ld_use_all_sites = bool(args.ldblock_all is not None)
@@ -4750,32 +5307,10 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
             gene_block_color = str(ldblock_style["gene_block_color"])
             gene_line_color = str(ldblock_style["gene_line_color"])
 
-        ld_h_in = width_in / effective_ldblock_ratio
-        ld_h_in = max(float(ld_h_in), float(width_in * _ld_min_height_over_width(max(2, int(ld_mat.shape[0])))))
-        fig_ld = plt.figure(figsize=(width_in, ld_h_in), dpi=300)
-        ax_ld = fig_ld.add_subplot(111)
-        LDblock(ld_mat, ax=ax_ld, vmin=0, vmax=1, cmap=ld_cmap, rasterize_threshold=100)
-        n_ld = max(2, int(ld_mat.shape[0]))
-        # Keep LD triangle body filling the whole panel width.
-        ax_ld.set_xlim(0.5, float(n_ld) - 0.5)
-        ax_ld.margins(x=0.0)
-        if ld_overlay_text:
-            ax_ld.text(n_ld / 2.0, -n_ld / 2.0, ld_overlay_text, ha="center", va="center", fontsize=6)
-        fig_ld.subplots_adjust(left=0.08, right=0.98, top=0.98, bottom=0.08)
-        if manh_axes_bounds is not None:
-            _cx0, cy0, _cw, ch = ax_ld.get_position().bounds
-            mx0, _my0, mw, _mh = manh_axes_bounds
-            if args.ldblock_xspan is None:
-                fx0, fx1 = (0.0, 1.0)
-            else:
-                fx0, fx1 = args.ldblock_xspan
-            new_x0 = float(mx0) + float(mw) * float(fx0)
-            new_w = float(mw) * float(fx1 - fx0)
-            ax_ld.set_position([new_x0, cy0, new_w, ch])
-            ax_ld.set_anchor("N")
-        ld_path = os.path.join(args.out, f"{args.prefix}.merge.ldblock.{args.format}")
-        _save_figure_and_close(fig_ld, ld_path)
-
+        gene_track_df = pd.DataFrame(
+            columns=["feature", "strand", "attribute", "x_start", "x_end"]
+        )
+        use_gene_bridge = False
         if args.anno_file:
             if len(region_ranges) == 0:
                 logger.warning(
@@ -4800,7 +5335,7 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
                         interval_ratio=float(args.interval),
                     )
                 )
-                use_segmented_gene_x = len(region_layout) > 1
+                use_segmented_gene_x = len(region_layout) > 0
                 gene_track_df = _project_gene_records_to_plot_x(
                     gene_raw,
                     region_ranges,
@@ -4812,6 +5347,7 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
                         "Warning: No gene-structure records found in selected --bimrange; gene plot is skipped."
                     )
                 else:
+                    use_gene_bridge = True
                     if len(region_layout) > 0:
                         gene_xlim = (
                             float(region_layout[0]["x_start"]),
@@ -4823,9 +5359,18 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
                             float(max(int(x[2]) for x in region_ranges)),
                         )
                     gene_plot_xlim = manh_xlim_pair if manh_xlim_pair is not None else gene_xlim
+                    gene_fontsize = float(
+                        manh_fontsize
+                        if manh_fontsize is not None
+                        else _postgwas_resolve_fontsize(args, manh_ratio=float(effective_ldblock_ratio))
+                    )
+                    gene_h_in = _resolve_postgwas_gene_panel_height_in(
+                        gene_fontsize,
+                        width_in=width_in,
+                    )
 
                     fig_gene = plt.figure(
-                        figsize=(width_in, width_in / 20.0),
+                        figsize=(width_in, gene_h_in),
                         dpi=300,
                     )
                     ax_gene = fig_gene.add_subplot(111)
@@ -4836,15 +5381,159 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
                         block_color=gene_block_color,
                         line_width=1.0,
                         arrow_step=1_000.0,
+                        gene_text_size=gene_fontsize,
                     )
                     ax_gene.set_xlim(gene_plot_xlim)
-                    fig_gene.tight_layout()
-                    if manh_axes_bounds is not None:
-                        mx0, _my0, mw, _mh = manh_axes_bounds
-                        _cx0, cy0, _cw, ch = ax_gene.get_position().bounds
-                        ax_gene.set_position([mx0, cy0, mw, ch])
+                    _apply_postgwas_gene_panel_layout(
+                        fig_gene,
+                        ax_gene,
+                        x_align_bounds=manh_axes_bounds,
+                    )
                     gene_path = os.path.join(args.out, f"{args.prefix}.merge.gene.{args.format}")
                     _save_figure_and_close(fig_gene, gene_path)
+
+        ld_h_in = width_in / effective_ldblock_ratio
+        ld_h_in = max(float(ld_h_in), float(width_in * _ld_min_height_over_width(max(2, int(ld_mat.shape[0])))))
+        fig_ld = plt.figure(figsize=(width_in, ld_h_in), dpi=300)
+        ax_ld = fig_ld.add_subplot(111)
+        ld_fontsize = float(
+            manh_fontsize
+            if manh_fontsize is not None
+            else _postgwas_resolve_fontsize(args, manh_ratio=float(effective_ldblock_ratio))
+        )
+        _draw_merge_ld_axis(
+            ax_ld,
+            font_size=ld_fontsize,
+        )
+        fig_ld.subplots_adjust(left=0.08, right=0.98, top=0.98, bottom=0.08)
+        if manh_axes_bounds is not None:
+            _cx0, cy0, _cw, ch = ax_ld.get_position().bounds
+            mx0, _my0, mw, _mh = manh_axes_bounds
+            if args.ldblock_xspan is None:
+                fx0, fx1 = (0.0, 1.0)
+            else:
+                fx0, fx1 = args.ldblock_xspan
+            new_x0 = float(mx0) + float(mw) * float(fx0)
+            new_w = float(mw) * float(fx1 - fx0)
+            ax_ld.set_position([new_x0, cy0, new_w, ch])
+            ax_ld.set_anchor("N")
+        ld_path = os.path.join(args.out, f"{args.prefix}.merge.ldblock.{args.format}")
+        _save_figure_and_close(fig_ld, ld_path)
+
+        manhld_ratio = (
+            float(merge_manh_ratio)
+            if merge_manh_ratio is not None
+            else 2.0
+        )
+        manhld_fontsize = float(
+            manh_fontsize
+            if manh_fontsize is not None
+            else _postgwas_resolve_fontsize(args, manh_ratio=manhld_ratio)
+        )
+        manhld_manh_h_in = width_in / float(manhld_ratio)
+        gene_bridge_scale = 0.8
+        mid_gene_y_offset = 0.03
+        mid_gene_ymin = -0.18
+        mid_gene_ymax = 0.22
+        mid_h_in = _resolve_postgwas_bridge_panel_height_in(
+            manhld_fontsize,
+            width_in=width_in,
+            use_gene_bridge=use_gene_bridge,
+        )
+        if args.ldblock_xspan is None:
+            ld_panel_frac_in_manh = 1.0
+        else:
+            ld_panel_frac_in_manh = float(args.ldblock_xspan[1] - args.ldblock_xspan[0])
+        ld_h_in_combo = (
+            width_in
+            * ld_panel_frac_in_manh
+            / effective_ldblock_ratio
+        )
+        ld_h_in_combo_min = (
+            width_in
+            * ld_panel_frac_in_manh
+            * _ld_min_height_over_width(max(2, int(ld_mat.shape[0])))
+        )
+        ld_h_in_combo = max(0.5, float(ld_h_in_combo), float(ld_h_in_combo_min))
+        fig_manhld, combo_axes, _combo_panel_w_in, _combo_panel_heights = _create_stacked_panel_figure(
+            panel_width_in=width_in,
+            panel_heights_in=[manhld_manh_h_in, mid_h_in, ld_h_in_combo],
+            dpi=300,
+            vspace_in=_PANEL_STACK_VSPACE_IN,
+        )
+        ax_manhld_top, ax_manhld_mid, ax_manhld_bot = combo_axes
+        ax_manhld_top.set_zorder(5)
+        ax_manhld_mid.set_zorder(2)
+        ax_manhld_bot.set_zorder(1)
+        _set_postgwas_axis_transparent(ax_manhld_mid)
+
+        _tmp_ylim, _tmp_yticks, manhld_top_xlim = _draw_merge_manhattan_axis(
+            ax_manhld_top,
+            font_size=manhld_fontsize,
+            include_legend=False,
+        )
+        _draw_merge_ld_axis(
+            ax_manhld_bot,
+            font_size=ld_fontsize,
+        )
+        if use_gene_bridge:
+            _draw_gene_structure_axis(
+                ax_manhld_mid,
+                gene_track_df,
+                arrow_color=gene_line_color,
+                block_color=gene_block_color,
+                line_width=1.0,
+                arrow_step=1_000.0,
+                thickness_scale=gene_bridge_scale,
+                y_offset=mid_gene_y_offset,
+                gene_text_size=manhld_fontsize,
+            )
+            ax_manhld_mid.set_xlim(manhld_top_xlim)
+            ax_manhld_mid.set_ylim(mid_gene_ymin, mid_gene_ymax)
+
+        fig_manhld.canvas.draw()
+        bx0, by0, bw, bh = ax_manhld_bot.get_position().bounds
+        tx0, _ty0, tw, _th = ax_manhld_top.get_position().bounds
+        if args.ldblock_xspan is None:
+            new_bw = bw
+            new_bx0 = bx0
+        else:
+            fx0, fx1 = args.ldblock_xspan
+            new_bw = float(tw) * float(fx1 - fx0)
+            new_bx0 = float(tx0) + float(tw) * float(fx0)
+        ax_manhld_bot.set_position([new_bx0, by0, new_bw, bh])
+        ax_manhld_bot.set_anchor("N")
+        fig_manhld.canvas.draw()
+
+        bridge_pairs = _build_merge_ld_bridge_pairs(ld_site_keys)
+        if use_gene_bridge:
+            ax_manhld_mid.set_xlim(ax_manhld_top.get_xlim())
+            ax_manhld_mid.set_ylim(mid_gene_ymin, mid_gene_ymax)
+            _draw_manh_gene_ld_links(
+                fig_manhld,
+                ax_manhld_mid,
+                ax_manhld_top,
+                ax_manhld_bot,
+                bridge_pairs,
+                gene_route_y=-0.17 * gene_bridge_scale + mid_gene_y_offset,
+                nonsig_line_color="grey",
+            )
+        else:
+            _draw_merge_bridge_axis(
+                ax_manhld_mid,
+                ax_manhld_top,
+                ax_manhld_bot,
+                bridge_pairs,
+                line_color="grey",
+                sig_line_color="red",
+            )
+        if not (args.bimrange_tuples is not None and len(args.bimrange_tuples) == 1):
+            _show_end_locs_without_xticks(
+                ax_manhld_top,
+                label_fontsize=float(manhld_fontsize),
+            )
+        manhld_path = os.path.join(args.out, f"{args.prefix}.merge.manhld.{args.format}")
+        _save_figure_and_close(fig_manhld, manhld_path)
 
     saved_paths: list[tuple[str, str]] = []
     if manh_path is not None:
@@ -4855,6 +5544,8 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
         saved_paths.append(("Merged LD block", ld_path))
     if gene_path is not None:
         saved_paths.append(("Merged Gene structure", gene_path))
+    if manhld_path is not None:
+        saved_paths.append(("Merged Manhattan+LD", manhld_path))
 
     if len(saved_paths) == 0:
         logger.warning("Warning: no merged figure was generated (both --manh and --qq are off).")
@@ -4917,17 +5608,16 @@ def _run_postgwas_ldblock_only(args, logger: logging.Logger) -> None:
             "without --gwasfile it falls back to all SNPs in --bimrange."
         )
 
-    mpl.rcParams["pdf.fonttype"] = 42
-    mpl.rcParams["ps.fonttype"] = 42
-    mpl.rcParams["font.size"] = 6
-    plt.rcParams["svg.fonttype"] = "none"
-    plt.rcParams["axes.unicode_minus"] = False
-    _prepare_cjk_plotting()
+    _apply_postgwas_matplotlib_style(args)
 
     t_ld = time.time()
     logger.info("Visualizing LD block...")
     width_in = 8.0
     ld_overlay_text: Optional[str] = None
+    ld_fontsize = _postgwas_resolve_fontsize(
+        args,
+        manh_ratio=float(args.ldblock_ratio),
+    )
 
     if args.genofile is None:
         logger.warning(
@@ -5004,7 +5694,10 @@ def _run_postgwas_ldblock_only(args, logger: logging.Logger) -> None:
         float(width_in * _ld_min_height_over_width(max(2, int(ld_mat.shape[0])))),
     )
     if use_gene_panel:
-        gene_h_in = width_in / 20.0
+        gene_h_in = _resolve_postgwas_gene_panel_height_in(
+            float(ld_fontsize),
+            width_in=width_in,
+        )
         fig_ld = plt.figure(figsize=(width_in, gene_h_in + ld_h_in), dpi=300)
         gs = fig_ld.add_gridspec(2, 1, height_ratios=[gene_h_in, ld_h_in], hspace=0.03)
         ax_gene = fig_ld.add_subplot(gs[0, 0])
@@ -5016,6 +5709,7 @@ def _run_postgwas_ldblock_only(args, logger: logging.Logger) -> None:
             block_color=gene_block_color,
             line_width=0.9,
             arrow_step=1.0,
+            gene_text_size=ld_fontsize,
         )
     else:
         fig_ld = plt.figure(figsize=(width_in, ld_h_in), dpi=300)
@@ -5027,8 +5721,20 @@ def _run_postgwas_ldblock_only(args, logger: logging.Logger) -> None:
     ax_ld.set_xlim(0.5, float(n_ld) - 0.5)
     ax_ld.margins(x=0.0)
     if ld_overlay_text:
-        ax_ld.text(n_ld / 2.0, -n_ld / 2.0, ld_overlay_text, ha="center", va="center", fontsize=6)
-    _draw_ld_bimrange_titles(ax_ld, ld_spans, enabled=show_ld_titles)
+        ax_ld.text(
+            n_ld / 2.0,
+            -n_ld / 2.0,
+            ld_overlay_text,
+            ha="center",
+            va="center",
+            fontsize=ld_fontsize,
+        )
+    _draw_ld_bimrange_titles(
+        ax_ld,
+        ld_spans,
+        enabled=show_ld_titles,
+        font_size=ld_fontsize,
+    )
 
     if ax_gene is not None:
         ax_gene.set_xlim(0.5, float(n_ld) - 0.5)
@@ -5666,18 +6372,27 @@ def main(argv: Optional[list[str]] = None):
         ),
     )
     common_group.add_argument(
-        "-ylim", "--ylim", type=str, default=None,
+        "-ylim", "--ylim", nargs="+", type=str, default=None,
         help=(
             "Shared y-range control for Manhattan, merged Manhattan, QQ, and merged QQ "
-            "as <max>, <min:max>, <min:>, or <:max> (also accepts '-' as separator). "
-            "Examples: --ylim 6, --ylim 0:6, --ylim 2:, --ylim :6."
+            "as <max>, <min:max>, <min:>, <:max>, or <min> <max> "
+            "(also accepts '-' as separator). "
+            "Examples: --ylim 6, --ylim 0:6, --ylim 2:, --ylim :6, --ylim 2 10."
         ),
     )
     common_group.add_argument(
-        "-scatter-size", "--scatter-size", type=float, default=8.0,
+        "-scatter-size", "--scatter-size", nargs="+", type=str, default=None,
         help=(
             "Shared scatter marker size for Manhattan, merged Manhattan, QQ, and merged QQ "
-            "(default: %(default)s)."
+            "Single/non-merge uses the first value only; merge mode cycles values by GWAS file. "
+            f"Default: {_DEFAULT_SCATTER_SIZE:g}."
+        ),
+    )
+    common_group.add_argument(
+        "-alpha", "--alpha", nargs="+", type=str, default=None,
+        help=(
+            "Shared scatter alpha in [0,1] for Manhattan, merged Manhattan, QQ, and merged QQ. "
+            "Single/non-merge uses the first value only; merge mode cycles values by GWAS file."
         ),
     )
     common_group.add_argument(
@@ -5687,6 +6402,23 @@ def main(argv: Optional[list[str]] = None):
             "Single/non-merge uses the first marker only (default: o). "
             "Merge plotting cycles markers by input GWAS file; default cycle is 1,2,3,4,*,+,x. "
             "Example: --marker '1,o,x'."
+        ),
+    )
+    common_group.add_argument(
+        "-fontsize", "--fontsize", type=float, default=None,
+        help=(
+            "Unified plot font size. If omitted, postgwas uses a larger readable base size "
+            "with ratio-aware auto scaling for Manhattan-style layouts."
+        ),
+    )
+    common_group.add_argument(
+        "-fontstyle", "--fontstyle", "-fontstype", "--fontstype",
+        dest="fontstyle",
+        type=str,
+        default=None,
+        help=(
+            "Unified plot font family or font file path (.ttf/.otf/.ttc/.otc). "
+            "Font family names support fuzzy matching, for example --fontstyle arial."
         ),
     )
     common_group.add_argument(
@@ -5783,9 +6515,65 @@ def main(argv: Optional[list[str]] = None):
             "If you need to edit the PDF in Adobe Illustrator, please run: "
             "`pip install pycairo`."
         )
+    try:
+        args.scatter_size_spec = _parse_scatter_size_spec(args.scatter_size)
+    except ValueError as e:
+        logger.error(str(e))
+        raise SystemExit(1)
+    args.scatter_size = _resolve_single_series_value(
+        args.scatter_size_spec,
+        _DEFAULT_SCATTER_SIZE,
+    )
+    args._postgwas_single_scatter_size = float(args.scatter_size)
+    try:
+        args.alpha_spec = _parse_alpha_spec(args.alpha)
+    except ValueError as e:
+        logger.error(str(e))
+        raise SystemExit(1)
+    args._postgwas_single_alpha = (
+        float(args.alpha_spec[0])
+        if args.alpha_spec is not None and len(args.alpha_spec) > 0
+        else None
+    )
     if args.scatter_size <= 0:
         logger.error("scatter-size must be > 0.")
         raise SystemExit(1)
+    if args.fontsize is not None:
+        try:
+            args.fontsize = float(args.fontsize)
+        except Exception:
+            logger.error("fontsize must be a finite number > 0.")
+            raise SystemExit(1)
+        if (not np.isfinite(args.fontsize)) or float(args.fontsize) <= 0.0:
+            logger.error("fontsize must be > 0.")
+            raise SystemExit(1)
+    args._postgwas_base_fontsize = (
+        float(args.fontsize)
+        if args.fontsize is not None
+        else float(_POSTGWAS_DEFAULT_FONT_SIZE)
+    )
+    if args.fontstyle is not None:
+        try:
+            font_family, font_display, font_match_mode = _resolve_postgwas_fontstyle(
+                args.fontstyle
+            )
+        except ValueError as e:
+            logger.error(str(e))
+            raise SystemExit(1)
+        args._postgwas_font_family = str(font_family)
+        args._postgwas_font_display = str(font_display)
+        args._postgwas_font_match_mode = str(font_match_mode)
+        if font_match_mode == "file":
+            logger.info(
+                f"Loaded font file {format_path_for_display(font_display)} "
+                f"as family '{font_family}'."
+            )
+        elif font_match_mode not in {"exact", "generic"}:
+            logger.info(f"Resolved fontstyle '{args.fontstyle}' -> '{font_family}'.")
+    else:
+        args._postgwas_font_family = ""
+        args._postgwas_font_display = "auto"
+        args._postgwas_font_match_mode = "auto"
     try:
         args.interval = float(args.interval)
     except Exception:
@@ -5800,6 +6588,7 @@ def main(argv: Optional[list[str]] = None):
     try:
         if args.ylim is not None:
             args.ylim_min, args.ylim_max = _parse_ylim_spec(args.ylim)
+            args.ylim = _format_ylim_spec_text(args.ylim, args.ylim_min, args.ylim_max)
         else:
             args.ylim_min, args.ylim_max = (None, None)
     except ValueError as e:
@@ -5967,15 +6756,30 @@ def main(argv: Optional[list[str]] = None):
         (args.manh_merge_ratio is not None)
         or (args.qq_merge_ratio is not None)
     )
+    single_ldblock_requested = bool(
+        (args.ldblock_ratio is not None)
+        and (len(args.gwasfile) > 0)
+        and (
+            (args.manh_ratio is not None)
+            or (args.manh_merge_ratio is None)
+        )
+    )
+    merge_ldblock_requested = bool(
+        (args.ldblock_ratio is not None)
+        and (args.manh_merge_ratio is not None)
+        and (len(args.gwasfile) > 0)
+    )
     single_plot_requested = bool(
         (args.manh_ratio is not None)
         or (args.qq_ratio is not None)
         or bool(args.anno)
-        or ((args.ldblock_ratio is not None) and (len(args.gwasfile) > 0))
+        or bool(single_ldblock_requested)
     )
     args.merge_mode = bool(merge_plot_requested)
     args._postgwas_merge_requested = bool(merge_plot_requested)
     args._postgwas_single_requested = bool(single_plot_requested)
+    args._postgwas_single_ldblock_requested = bool(single_ldblock_requested)
+    args._postgwas_merge_ldblock_requested = bool(merge_ldblock_requested)
     if merge_plot_requested:
         args.merge_files = [str(x) for x in list(args.gwasfile)]
         if len(args.merge_files) == 0:
@@ -5992,10 +6796,22 @@ def main(argv: Optional[list[str]] = None):
             args.marker_spec,
             len(args.merge_files),
         )
+        args._postgwas_merge_scatter_sizes = _resolve_merge_series_values(
+            args.scatter_size_spec,
+            len(args.merge_files),
+            default=float(args._postgwas_single_scatter_size),
+        )
+        args._postgwas_merge_alphas = _resolve_merge_series_values(
+            args.alpha_spec,
+            len(args.merge_files),
+            default=float(_DEFAULT_MERGE_ALPHA),
+        )
     else:
         args.merge_files = []
         args._merge_manh_ratio = None
         args._merge_qq_ratio = None
+        args._postgwas_merge_scatter_sizes = []
+        args._postgwas_merge_alphas = []
 
     args._postgwas_outer_workers = int(
         _resolve_postgwas_worker_count(int(args.thread), len(args.gwasfile))
@@ -6089,6 +6905,16 @@ def main(argv: Optional[list[str]] = None):
         or args._merge_qq_ratio is not None
         or args.ldblock_ratio is not None
     ):
+        font_size_text = (
+            f"{float(args.fontsize):g} (manual)"
+            if args.fontsize is not None
+            else f"auto (base={float(args._postgwas_base_fontsize):g}, ratio-aware)"
+        )
+        font_family_text = (
+            str(getattr(args, "_postgwas_font_display", "auto"))
+            if str(getattr(args, "_postgwas_font_display", "auto")) != "auto"
+            else "auto (matplotlib + CJK fallback)"
+        )
         single_manh_pal_text = (
             "default (black/grey)" if args.palette_spec is None else str(args.palette)
         )
@@ -6113,7 +6939,25 @@ def main(argv: Optional[list[str]] = None):
                 comp_text = "off (auto for --bimrange)"
         else:
             comp_text = "on"
-        vis_rows = [("Format", str(args.format))]
+        single_alpha_text = (
+            f"{float(args._postgwas_single_alpha):g}"
+            if getattr(args, "_postgwas_single_alpha", None) is not None
+            else "default(auto)"
+        )
+        merge_size_text = (
+            _format_float_series([float(x) for x in list(getattr(args, "_postgwas_merge_scatter_sizes", []))])
+            if len(getattr(args, "_postgwas_merge_scatter_sizes", [])) > 0
+            else f"{float(args.scatter_size):g}"
+        )
+        merge_alpha_text = (
+            _format_float_series([float(x) for x in list(getattr(args, "_postgwas_merge_alphas", []))])
+            if len(getattr(args, "_postgwas_merge_alphas", [])) > 0
+            else f"{float(_DEFAULT_MERGE_ALPHA):g}"
+        )
+        vis_rows = [
+            ("Format", str(args.format)),
+            ("Font", f"size={font_size_text}, family={font_family_text}"),
+        ]
         if args.manh_ratio is not None:
             vis_rows.append(
                 (
@@ -6136,7 +6980,8 @@ def main(argv: Optional[list[str]] = None):
             vis_rows.append(
                 (
                     "Single Scatter",
-                    f"size={args.scatter_size}, marker={args._postgwas_single_marker}",
+                    f"size={float(args.scatter_size):g}, alpha={single_alpha_text}, "
+                    f"marker={args._postgwas_single_marker}",
                 )
             )
         if args._merge_manh_ratio is not None:
@@ -6160,7 +7005,8 @@ def main(argv: Optional[list[str]] = None):
             vis_rows.append(
                 (
                     "Merged Scatter",
-                    f"size={args.scatter_size}, markers={','.join(args._postgwas_merge_markers)}",
+                    f"sizes={merge_size_text}, alphas={merge_alpha_text}, "
+                    f"markers={','.join(args._postgwas_merge_markers)}",
                 )
             )
         if args.ldblock_ratio is None:

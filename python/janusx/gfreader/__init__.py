@@ -3,5 +3,5 @@ from .base import *
 from .gfreader import *
 
 
-__name__ = "Genotype Reader"
+PACKAGE_NAME = "Genotype Reader"
 __version__ = "1.0.1"

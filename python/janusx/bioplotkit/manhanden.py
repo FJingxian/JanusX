@@ -635,6 +635,7 @@ class GWASPLOT:
         color_set: list[str] = None,
         marker: str = "o",
         scatter_size: float = 8.0,
+        scatter_alpha: float = 0.75,
         line_color: str = "black",
         qq_mode: str = "auto",
         qq_auto_threshold: int = _QQ_SAMPLE_TRIGGER,
@@ -669,6 +670,8 @@ class GWASPLOT:
             If only one color is provided, it is used for both.
         scatter_size : float, default 8.0
             Marker size for QQ scatter points.
+        scatter_alpha : float, default 0.75
+            Marker alpha for QQ scatter points.
         line_color : str, default "black"
             Color of the ideal diagonal line y=x.
         qq_mode : {"auto","full","fast"}, default "auto"
@@ -796,7 +799,7 @@ class GWASPLOT:
             obs_scatter[scatter_mask],
             marker=str(marker),
             s=scatter_size,
-            alpha=0.75,
+            alpha=float(scatter_alpha),
             rasterized=bool(rasterized),
             color=point_color,
             **_marker_scatter_style(str(marker)),

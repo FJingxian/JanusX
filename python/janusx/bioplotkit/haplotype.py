@@ -234,6 +234,31 @@ def _resolve_palette(palette: Optional[Union[str, dict]]) -> dict[str, object]:
     return cfg
 
 
+def _apply_palette_overrides(
+    palette_cfg: dict[str, object],
+    *,
+    color: Optional[object] = None,
+    scatter_alpha: Optional[float] = None,
+) -> dict[str, object]:
+    cfg = dict(palette_cfg)
+    if color is not None:
+        base_color = _safe_rgba(color, "#4C78A8")
+        edge_color = _mix_rgb(base_color, (0.0, 0.0, 0.0, 1.0), 0.62, 0.38)
+        cfg["violin_face"] = base_color
+        cfg["violin_edge"] = edge_color
+        cfg["box_edge"] = edge_color
+        cfg["point_edge"] = edge_color
+        cfg["letter_color"] = edge_color
+    if scatter_alpha is not None:
+        cfg["point_alpha"] = _clamp_float(
+            scatter_alpha,
+            float(cfg.get("point_alpha", 0.85)),
+            0.0,
+            1.0,
+        )
+    return cfg
+
+
 def _normalize_phenotype(phenotype: pd.DataFrame) -> pd.Series:
     if not isinstance(phenotype, pd.DataFrame):
         raise TypeError("`phenotype` must be a pandas DataFrame.")
@@ -670,6 +695,102 @@ def _site_to_tuple(site: object) -> Tuple[str, int]:
     return s, 0
 
 
+def _normalize_site_specs(
+    site_specs: Optional[Sequence[object]],
+) -> list[tuple[str, int]]:
+    if site_specs is None:
+        return []
+    if isinstance(site_specs, (str, bytes)):
+        items: list[object] = [site_specs]
+    elif (
+        isinstance(site_specs, tuple)
+        and len(site_specs) >= 2
+        and not isinstance(site_specs[0], (list, tuple, dict, set))
+    ):
+        items = [site_specs]
+    else:
+        items = list(site_specs)
+
+    out: list[tuple[str, int]] = []
+    seen: set[tuple[str, int]] = set()
+    for raw in items:
+        chrom, pos = _site_to_tuple(raw)
+        chrom = str(chrom).strip()
+        pos = int(pos)
+        if chrom == "" or pos <= 0:
+            raise ValueError(
+                "Each site must be a valid ('chr', pos) tuple or 'chr:pos' string."
+            )
+        key = (chrom, pos)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(key)
+    return out
+
+
+def _subset_sample_site_by_sites(
+    geno_sample_site: pd.DataFrame,
+    site_specs: Optional[Sequence[object]],
+) -> pd.DataFrame:
+    requested_sites = _normalize_site_specs(site_specs)
+    if len(requested_sites) == 0:
+        return geno_sample_site
+
+    col_map = {_site_to_tuple(col): col for col in geno_sample_site.columns}
+    keep_cols: list[object] = []
+    missing_sites: list[str] = []
+    for key in requested_sites:
+        col = col_map.get(key)
+        if col is None:
+            missing_sites.append(f"{key[0]}:{key[1]}")
+            continue
+        keep_cols.append(col)
+    if len(keep_cols) == 0:
+        raise ValueError(
+            "None of the requested sites were found in genotype input: "
+            + ", ".join(missing_sites[:10])
+        )
+    if len(missing_sites) > 0:
+        raise ValueError(
+            "Some requested sites were not found in genotype input: "
+            + ", ".join(missing_sites[:10])
+        )
+    return geno_sample_site.loc[:, keep_cols]
+
+
+def _load_sample_site_from_bfile(
+    bfile: str,
+    phenotype_samples: Sequence[str],
+    site_specs: Sequence[object],
+    *,
+    chunk_size: Optional[int] = None,
+) -> pd.DataFrame:
+    requested_sites = _normalize_site_specs(site_specs)
+    if len(requested_sites) == 0:
+        raise ValueError("`snp_sites` must be provided when using `bfile`.")
+
+    from janusx.gfreader import load_genotype_chunks
+
+    sample_ids = [str(x) for x in phenotype_samples]
+    req_chunk_size = (
+        int(chunk_size)
+        if chunk_size is not None
+        else max(1, min(50_000, len(requested_sites)))
+    )
+    chunks = load_genotype_chunks(
+        str(bfile),
+        chunk_size=req_chunk_size,
+        maf=0.0,
+        missing_rate=1.0,
+        impute=False,
+        snp_sites=requested_sites,
+        sample_ids=sample_ids,
+    )
+    geno_sample_site = _chunks_to_sample_site(chunks, phenotype_samples, sample_ids)
+    return _subset_sample_site_by_sites(geno_sample_site, requested_sites)
+
+
 def _infer_adv_alleles(
     merged: pd.DataFrame,
     site_cols: Sequence[object],
@@ -817,7 +938,7 @@ def _build_haplotype_matrix_from_summary(
 
 def plot_haplotype(
     phenotype: pd.DataFrame,
-    genotype: GenotypeInput,
+    genotype: Optional[GenotypeInput] = None,
     draw_letters: bool = False,
     draw_bar: bool = False,
     draw_matrix: bool = False,
@@ -829,6 +950,11 @@ def plot_haplotype(
     alpha: float = 0.05,
     orient: Literal['vertical','horizontal'] = "horizontal",
     ax: Optional[plt.Axes] = None,
+    color: Optional[object] = None,
+    scatter_alpha: Optional[float] = None,
+    bfile: Optional[str] = None,
+    snp_sites: Optional[Sequence[object]] = None,
+    load_chunk_size: Optional[int] = None,
     **kwargs: Any,
 ) -> Tuple[plt.Axes, pd.DataFrame]:
     """
@@ -847,6 +973,7 @@ def plot_haplotype(
              (or MultiIndex index=(chr,pos) + REF/A0 ALT/A1 columns),
           2) chunks iterator from `load_genotype_chunks`,
           3) (chunks, sample_ids) tuple.
+        Optional when `bfile` + `snp_sites` are provided.
     draw_letters
         Draw annotations:
         - continuous mode: compact-letter-display;
@@ -880,6 +1007,22 @@ def plot_haplotype(
         'horizontal'/'h' or 'vertical'/'v'.
     ax
         Matplotlib Axes. If None, create a new figure and axis.
+    color
+        Optional main color override for violin/bar/scatter theme, for example
+        `'#C44E52'` or `'tomato'`.
+    scatter_alpha
+        Optional scatter-point alpha override in [0, 1]. Useful when points
+        obscure the boxplot.
+    bfile
+        Optional PLINK prefix / genotype prefix to load directly inside
+        `plot_haplotype`. Requires `snp_sites`.
+    snp_sites
+        Optional site list such as `[('1', 8018093), ('1', 8019732)]` or
+        `['1:8018093', '1:8019732']`. When `bfile` is provided, only these
+        sites are loaded. When `genotype` is already provided, it is subset to
+        these sites in the requested order.
+    load_chunk_size
+        Optional chunk size used only for internal `bfile` loading.
 
     Returns
     -------
@@ -908,7 +1051,11 @@ def plot_haplotype(
         )
     if int(min_haplotype_n) < 1:
         raise ValueError("`min_haplotype_n` must be >= 1.")
-    palette_cfg = _resolve_palette(palette)
+    palette_cfg = _apply_palette_overrides(
+        _resolve_palette(palette),
+        color=color,
+        scatter_alpha=scatter_alpha,
+    )
 
     orient = _normalize_orient(orient)
     vert = orient == "vertical"
@@ -919,14 +1066,26 @@ def plot_haplotype(
     pheno_name = pheno.name if pheno.name is not None else "phenotype"
     phenotype_samples = pheno.index.tolist()
 
-    if isinstance(genotype, pd.DataFrame):
+    if bfile is not None:
+        if genotype is not None:
+            raise ValueError("Use either `genotype` or `bfile`, not both.")
+        geno_sample_site = _load_sample_site_from_bfile(
+            str(bfile),
+            phenotype_samples,
+            snp_sites or [],
+            chunk_size=load_chunk_size,
+        )
+    elif isinstance(genotype, pd.DataFrame):
         geno_sample_site = _genotype_dataframe_to_sample_site(genotype, phenotype_samples)
     elif isinstance(genotype, tuple) and len(genotype) == 2:
         geno_sample_site = _chunks_to_sample_site(
             genotype[0], phenotype_samples, genotype[1]
         )
+    elif genotype is None:
+        raise ValueError("Provide `genotype`, or use `bfile` together with `snp_sites`.")
     else:
         geno_sample_site = _chunks_to_sample_site(genotype, phenotype_samples, None)
+    geno_sample_site = _subset_sample_site_by_sites(geno_sample_site, snp_sites)
 
     merged = pd.concat([pheno.rename("_pheno"), geno_sample_site], axis=1, join="inner")
     merged = merged.dropna()

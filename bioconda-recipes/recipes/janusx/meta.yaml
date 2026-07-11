@@ -15,7 +15,7 @@ build:
   script_env:
     - CARGO_BUILD_JOBS
   run_exports:
-    - {{ pin_subpackage('janusx', max_pin='x') }}
+    - {{ pin_subpackage('janusx', max_pin='x.x') }}
 
 requirements:
   build:
@@ -27,13 +27,13 @@ requirements:
   host:
     - python
     - pip
-    - maturin >=1.9.4,<2
-    - numpy >=1.23,!=2.4.3
+    - maturin >=1.7,<2
+    - numpy >=1.23
     - zlib
     - openblas
   run:
     - python
-    - numpy !=2.4.3
+    - {{ pin_compatible('numpy') }}
     - libopenblas
     - scipy
     - pandas >=1.5
@@ -52,7 +52,7 @@ test:
     - jx -h
     - jxpy -h
     - python -c "import janusx.janusx"
-    - python -c "import janusx.janusx as _jx; assert _jx.rust_sgemm_backend() == 'openblas'"
+    - python -c "import janusx.janusx as _jx; assert str(_jx.rust_sgemm_backend()) == 'openblas'"
     - python -c "import janusx.script.JanusX as jx; assert callable(jx.main)"
 
 about:

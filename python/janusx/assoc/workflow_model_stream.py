@@ -81,6 +81,134 @@ def _finite_optional_float(value: object) -> Optional[float]:
     return out if np.isfinite(out) else None
 
 
+def _resolve_trait_prepared_meta_for_current_filters(
+    trait_prepared_meta: Optional[dict[str, object]],
+    *,
+    maf_threshold: float,
+    max_missing_rate: float,
+    het_threshold: float,
+    snps_only: bool,
+    logger: Optional[logging.Logger] = None,
+    route_label: str = "GWAS",
+) -> Optional[dict[str, object]]:
+    if not isinstance(trait_prepared_meta, dict):
+        return None
+
+    try:
+        row_idx = np.ascontiguousarray(
+            np.asarray(trait_prepared_meta["row_indices"], dtype=np.int64).reshape(-1),
+            dtype=np.int64,
+        )
+        miss_rate = np.ascontiguousarray(
+            np.asarray(trait_prepared_meta["missing_rate"], dtype=np.float32).reshape(-1),
+            dtype=np.float32,
+        )
+        maf = np.ascontiguousarray(
+            np.asarray(trait_prepared_meta["maf"], dtype=np.float32).reshape(-1),
+            dtype=np.float32,
+        )
+        row_flip = np.ascontiguousarray(
+            np.asarray(trait_prepared_meta["row_flip"], dtype=np.bool_).reshape(-1),
+            dtype=np.bool_,
+        )
+    except Exception:
+        return None
+
+    n_rows = int(row_idx.shape[0])
+    if (
+        n_rows == 0
+        or int(miss_rate.shape[0]) != n_rows
+        or int(maf.shape[0]) != n_rows
+        or int(row_flip.shape[0]) != n_rows
+    ):
+        return None
+
+    curr_maf = float(maf_threshold)
+    curr_miss = float(max_missing_rate)
+    curr_het = float(het_threshold)
+    curr_snps_only = bool(snps_only)
+    eps = 1e-8
+
+    stored_maf = _finite_optional_float(trait_prepared_meta.get("maf_threshold", None))
+    stored_miss = _finite_optional_float(
+        trait_prepared_meta.get("max_missing_rate", None)
+    )
+    stored_het = _finite_optional_float(trait_prepared_meta.get("het_threshold", None))
+    stored_snps_only_raw = trait_prepared_meta.get("snps_only", None)
+    stored_snps_only = (
+        bool(stored_snps_only_raw) if stored_snps_only_raw is not None else None
+    )
+
+    incompatible_reasons: list[str] = []
+    if stored_maf is not None and curr_maf + eps < stored_maf:
+        incompatible_reasons.append(
+            f"maf current={curr_maf:g} < prepared={stored_maf:g}"
+        )
+    if stored_miss is not None and curr_miss > stored_miss + eps:
+        incompatible_reasons.append(
+            f"geno current={curr_miss:g} > prepared={stored_miss:g}"
+        )
+    if stored_het is not None and not np.isclose(curr_het, stored_het, atol=eps, rtol=0.0):
+        incompatible_reasons.append(
+            f"het current={curr_het:g} != prepared={stored_het:g}"
+        )
+    if stored_snps_only is not None and curr_snps_only != stored_snps_only:
+        incompatible_reasons.append(
+            f"snps_only current={int(curr_snps_only)} != prepared={int(stored_snps_only)}"
+        )
+    if len(incompatible_reasons) > 0:
+        if logger is not None:
+            _log_file_only(
+                logger,
+                logging.INFO,
+                (
+                    f"{route_label}: ignoring prepared scan metadata because current "
+                    f"filters are incompatible ({'; '.join(incompatible_reasons)})."
+                ),
+            )
+        return None
+
+    keep = np.ones((n_rows,), dtype=np.bool_)
+    if curr_miss < 1.0:
+        keep &= miss_rate <= (curr_miss + eps)
+    if curr_maf > 0.0:
+        maf_minor = np.minimum(maf, 1.0 - maf)
+        keep &= maf_minor >= (curr_maf - eps)
+
+    if not np.any(keep):
+        raise ValueError(
+            "No SNPs left after applying current --maf/--geno thresholds to prepared scan metadata. "
+            "Please relax --maf/--geno thresholds."
+        )
+
+    out = dict(trait_prepared_meta)
+    if not np.all(keep):
+        keep_idx = np.flatnonzero(keep).astype(np.int64, copy=False)
+        out["row_indices"] = np.ascontiguousarray(row_idx[keep_idx], dtype=np.int64)
+        out["missing_rate"] = np.ascontiguousarray(
+            miss_rate[keep_idx], dtype=np.float32
+        )
+        out["maf"] = np.ascontiguousarray(maf[keep_idx], dtype=np.float32)
+        out["af"] = out["maf"]
+        out["row_flip"] = np.ascontiguousarray(row_flip[keep_idx], dtype=np.bool_)
+        site_keep_raw = trait_prepared_meta.get("site_keep", None)
+        if site_keep_raw is not None:
+            site_keep_arr = np.ascontiguousarray(
+                np.asarray(site_keep_raw, dtype=np.bool_).reshape(-1),
+                dtype=np.bool_,
+            )
+            if int(site_keep_arr.shape[0]) > 0:
+                site_keep_new = np.zeros_like(site_keep_arr, dtype=np.bool_)
+                site_keep_new[np.asarray(out["row_indices"], dtype=np.int64)] = True
+                out["site_keep"] = site_keep_new
+
+    out["maf_threshold"] = curr_maf
+    out["max_missing_rate"] = curr_miss
+    out["het_threshold"] = curr_het
+    out["snps_only"] = curr_snps_only
+    return out
+
+
 def _mixed_model_null_pve_stats(
     mod: object,
     *,
@@ -391,6 +519,15 @@ def run_chunked_gwas_lmm_lm(
     }[model_key]
     # Keep output file suffixes consistent and lowercase.
     base_model_tag = base_model_label.lower()
+    trait_prepared_meta = _resolve_trait_prepared_meta_for_current_filters(
+        trait_prepared_meta,
+        maf_threshold=float(maf_threshold),
+        max_missing_rate=float(max_missing_rate),
+        het_threshold=float(het_threshold),
+        snps_only=bool(snps_only),
+        logger=logger,
+        route_label=base_model_label,
+    )
 
     # FvLMM route: reuse prepared streaming GRM and slice to trait samples.
     # Do NOT rebuild packed GRM here.
@@ -1770,6 +1907,15 @@ def run_chunked_gwas_streaming_shared(
     model_order = [m for m in model_order if m in model_map]
     if len(model_order) == 0:
         return
+    trait_prepared_meta = _resolve_trait_prepared_meta_for_current_filters(
+        trait_prepared_meta,
+        maf_threshold=float(maf_threshold),
+        max_missing_rate=float(max_missing_rate),
+        het_threshold=float(het_threshold),
+        snps_only=bool(snps_only),
+        logger=logger,
+        route_label="Shared GWAS stream",
+    )
     if len(model_order) > 1:
         grouped_labels = "+".join(
             ("FvLMM" if m == "fvlmm" else str(m).upper())

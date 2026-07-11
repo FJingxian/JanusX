@@ -37,6 +37,14 @@ try:
     from janusx.janusx import prepare_bed_2bit_packed as _prepare_bed_2bit_packed
 except Exception:
     _prepare_bed_2bit_packed = None
+try:
+    from janusx.janusx import prepare_bed_logic_keep_mask as _prepare_bed_logic_keep_mask
+except Exception:
+    _prepare_bed_logic_keep_mask = None
+try:
+    from janusx.janusx import prepare_bed_logic_meta_selected as _prepare_bed_logic_meta_selected
+except Exception:
+    _prepare_bed_logic_meta_selected = None
 
 try:
     from janusx.script._common.progress import build_rich_progress as _build_rich_progress
@@ -195,6 +203,97 @@ def prepare_bed_2bit_packed(
             max_missing_rate=float(max_missing_rate),
             snps_only=bool(snps_only),
         )
+
+
+def prepare_bed_logic_meta_selected(
+    prefix: str,
+    *,
+    sample_indices=None,
+    maf_threshold: float = 0.0,
+    max_missing_rate: float = 1.0,
+    het_threshold: float = 0.0,
+    snps_only: bool = False,
+    mmap_window_mb=None,
+    threads: int = 1,
+):
+    """
+    Scan PLINK BED once and return lightweight per-site filter metadata only.
+
+    Returns
+    -------
+    row_source_indices : np.ndarray[int64], shape (n_kept,)
+        Source BED/BIM row indices that passed Rust-side filters.
+    missing_rate : np.ndarray[float32], shape (n_kept,)
+    maf : np.ndarray[float32], shape (n_kept,)
+    row_flip : np.ndarray[bool], shape (n_kept,)
+    site_keep : np.ndarray[bool], shape (n_total_sites,)
+    n_samples : int
+    n_total_sites : int
+    """
+    if _prepare_bed_logic_meta_selected is None:
+        raise RuntimeError(
+            "prepare_bed_logic_meta_selected is unavailable in Rust extension. "
+            "Please rebuild/install JanusX."
+        )
+    sample_idx_arr = None
+    if sample_indices is not None:
+        sample_idx_arr = np.ascontiguousarray(
+            np.asarray(sample_indices, dtype=np.int64).reshape(-1),
+            dtype=np.int64,
+        )
+    return _prepare_bed_logic_meta_selected(
+        str(prefix),
+        sample_indices=sample_idx_arr,
+        maf_threshold=float(maf_threshold),
+        max_missing_rate=float(max_missing_rate),
+        het_threshold=float(het_threshold),
+        snps_only=bool(snps_only),
+        mmap_window_mb=mmap_window_mb,
+        threads=max(1, int(threads)),
+    )
+
+
+def prepare_bed_logic_keep_mask(
+    prefix: str,
+    *,
+    sample_indices=None,
+    maf_threshold: float = 0.0,
+    max_missing_rate: float = 1.0,
+    het_threshold: float = 0.0,
+    snps_only: bool = False,
+    mmap_window_mb=None,
+    threads: int = 1,
+):
+    """
+    Scan PLINK BED once and return only the full-source boolean keep mask.
+
+    Returns
+    -------
+    site_keep : np.ndarray[bool], shape (n_total_sites,)
+    n_samples : int
+    n_total_sites : int
+    """
+    if _prepare_bed_logic_keep_mask is None:
+        raise RuntimeError(
+            "prepare_bed_logic_keep_mask is unavailable in Rust extension. "
+            "Please rebuild/install JanusX."
+        )
+    sample_idx_arr = None
+    if sample_indices is not None:
+        sample_idx_arr = np.ascontiguousarray(
+            np.asarray(sample_indices, dtype=np.int64).reshape(-1),
+            dtype=np.int64,
+        )
+    return _prepare_bed_logic_keep_mask(
+        str(prefix),
+        sample_indices=sample_idx_arr,
+        maf_threshold=float(maf_threshold),
+        max_missing_rate=float(max_missing_rate),
+        het_threshold=float(het_threshold),
+        snps_only=bool(snps_only),
+        mmap_window_mb=mmap_window_mb,
+        threads=max(1, int(threads)),
+    )
 
 
 def set_genotype_cache_dir(cache_dir: Union[str, None]) -> Union[str, None]:

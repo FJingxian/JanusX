@@ -5789,6 +5789,110 @@ pub fn prepare_bed_logic_meta_selected<'py>(
     ))
 }
 
+#[pyfunction]
+#[pyo3(signature = (
+    prefix,
+    sample_indices=None,
+    maf_threshold=0.0,
+    max_missing_rate=1.0,
+    het_threshold=0.0,
+    snps_only=false,
+    mmap_window_mb=None,
+    threads=1,
+))]
+pub fn prepare_bed_logic_keep_mask<'py>(
+    py: Python<'py>,
+    prefix: String,
+    sample_indices: Option<PyReadonlyArray1<'py, i64>>,
+    maf_threshold: f32,
+    max_missing_rate: f32,
+    het_threshold: f32,
+    snps_only: bool,
+    mmap_window_mb: Option<usize>,
+    threads: usize,
+) -> PyResult<(
+    Bound<'py, PyArray1<bool>>,
+    usize,
+    usize,
+)> {
+    if !(0.0..=0.5).contains(&maf_threshold) {
+        return Err(PyValueError::new_err(
+            "maf_threshold must be within [0, 0.5]",
+        ));
+    }
+    if !(0.0..=1.0).contains(&max_missing_rate) {
+        return Err(PyValueError::new_err(
+            "max_missing_rate must be within [0, 1.0]",
+        ));
+    }
+    if !(0.0..=1.0).contains(&het_threshold) {
+        return Err(PyValueError::new_err(
+            "het_threshold must be within [0, 1.0]",
+        ));
+    }
+    let total_t0 = Instant::now();
+
+    let bed_prefix = normalize_plink_prefix_local(&prefix);
+    let n_samples_full = core::read_fam(&bed_prefix)
+        .map_err(PyRuntimeError::new_err)?
+        .len();
+    if n_samples_full == 0 {
+        return Err(PyRuntimeError::new_err("no samples found in PLINK input"));
+    }
+    let sample_idx: Option<Vec<usize>> = if let Some(sample_indices) = sample_indices {
+        let idx64 = sample_indices
+            .as_slice()
+            .map_err(|_| PyRuntimeError::new_err("sample_indices must be contiguous int64"))?;
+        let mut out = Vec::with_capacity(idx64.len());
+        for &sid in idx64 {
+            if sid < 0 || (sid as usize) >= n_samples_full {
+                return Err(PyValueError::new_err(format!(
+                    "sample index out of range: {sid} for n_samples={n_samples_full}"
+                )));
+            }
+            out.push(sid as usize);
+        }
+        Some(out)
+    } else {
+        None
+    };
+
+    let rust_core_t0 = Instant::now();
+    let prepared = py
+        .detach(move || {
+            prepare_bed_logic_meta_owned_for_stats_samples_with_mmap_window(
+                &bed_prefix,
+                maf_threshold,
+                max_missing_rate,
+                het_threshold,
+                snps_only,
+                sample_idx.as_deref(),
+                true, // stats_only: skip Vec<SiteInfo> allocation
+                mmap_window_mb.filter(|&v| v > 0),
+                threads.max(1),
+            )
+        })
+        .map_err(PyRuntimeError::new_err)?;
+    let rust_core_secs = rust_core_t0.elapsed().as_secs_f64();
+
+    let kept_n = prepared.site_keep.iter().filter(|&&x| x).count();
+    let py_arrays_t0 = Instant::now();
+    #[allow(deprecated)]
+    let site_keep_arr =
+        PyArray1::from_owned_array(py, Array1::from_vec(prepared.site_keep)).into_bound();
+    let py_arrays_secs = py_arrays_t0.elapsed().as_secs_f64();
+    emit_bed_logic_meta_py_timing(
+        "prepare_bed_logic_keep_mask_py",
+        rust_core_secs,
+        py_arrays_secs,
+        total_t0.elapsed().as_secs_f64(),
+        n_samples_full,
+        prepared.n_snps_total,
+        kept_n,
+    );
+    Ok((site_keep_arr, prepared.n_samples, prepared.n_snps_total))
+}
+
 #[pyclass]
 pub struct BedChunkReaderFromMeta {
     matrix: WindowedBedMatrix,

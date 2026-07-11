@@ -13,6 +13,7 @@ use crate::vcfout::VcfOut;
 pub(crate) trait SiteRecord {
     fn chrom(&self) -> &str;
     fn pos(&self) -> i32;
+    fn snp(&self) -> &str;
     fn ref_allele(&self) -> &str;
     fn alt_allele(&self) -> &str;
 }
@@ -26,6 +27,11 @@ impl SiteRecord for CoreSiteInfo {
     #[inline]
     fn pos(&self) -> i32 {
         self.pos
+    }
+
+    #[inline]
+    fn snp(&self) -> &str {
+        &self.snp
     }
 
     #[inline]
@@ -48,6 +54,11 @@ impl SiteRecord for PySiteInfo {
     #[inline]
     fn pos(&self) -> i32 {
         self.pos
+    }
+
+    #[inline]
+    fn snp(&self) -> &str {
+        &self.snp
     }
 
     #[inline]
@@ -98,7 +109,12 @@ pub(crate) fn write_fam_simple(
 
 #[inline]
 fn site_row_id<S: SiteRecord>(site: &S) -> String {
-    format!("{}_{}", site.chrom(), site.pos())
+    let snp = site.snp().trim();
+    if snp.is_empty() || snp == "." {
+        format!("{}_{}", site.chrom(), site.pos())
+    } else {
+        snp.to_string()
+    }
 }
 
 #[inline]

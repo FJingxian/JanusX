@@ -50,7 +50,7 @@ from janusx.gfreader import (
     inspect_genotype_file,
     load_bed_2bit_packed,
     load_genotype_chunks,
-    prepare_bed_2bit_packed,
+    prepare_bed_logic_keep_mask,
     save_genotype_streaming,
     SiteInfo,
 )
@@ -72,6 +72,11 @@ try:
     from janusx.janusx import bed_prune_to_plink_rust as _bed_prune_to_plink_rust
 except Exception:
     _bed_prune_to_plink_rust = None
+
+try:
+    from janusx.janusx import bed_prune_mask_to_plink_rust as _bed_prune_mask_to_plink_rust
+except Exception:
+    _bed_prune_mask_to_plink_rust = None
 
 try:
     from janusx.janusx import bed_filter_to_plink_rust as _bed_filter_to_plink_rust
@@ -145,6 +150,92 @@ _SIMPLE_SNP_ALLELES = frozenset({"A", "C", "G", "T"})
 
 def _normalize_site_allele(value: object) -> str:
     return str(value).strip().upper()
+
+
+def _normalize_snp_name_template(value: object | None) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if text == "":
+        raise ValueError("--snp-name cannot be empty.")
+    if any(ch.isspace() for ch in text):
+        raise ValueError("--snp-name cannot contain whitespace.")
+    has_brace_chr = "{chr}" in text
+    has_brace_pos = "{pos}" in text
+    if has_brace_chr or has_brace_pos:
+        if not (has_brace_chr and has_brace_pos):
+            raise ValueError("--snp-name must contain both {chr} and {pos}.")
+        return text
+    if "chr" not in text or "pos" not in text:
+        raise ValueError("--snp-name must contain both chr and pos placeholders.")
+    return text
+
+
+def _format_snp_name(template: str, chrom: object, pos: object) -> str:
+    chrom_s = str(chrom).strip()
+    try:
+        pos_s = str(int(pos))
+    except Exception:
+        pos_s = str(pos).strip()
+    if "{chr}" in template or "{pos}" in template:
+        return template.replace("{chr}", chrom_s).replace("{pos}", pos_s)
+    return template.replace("chr", chrom_s).replace("pos", pos_s)
+
+
+def _rename_sites_for_snp_name(
+    sites: Sequence[SiteInfo],
+    snp_name_template: str | None,
+) -> list[SiteInfo]:
+    if snp_name_template is None:
+        return list(sites)
+    out: list[SiteInfo] = []
+    for site in sites:
+        try:
+            pos_i = int(site.pos)
+        except Exception:
+            pos_i = int(float(site.pos))
+        out.append(
+            SiteInfo(
+                str(site.chrom),
+                pos_i,
+                _format_snp_name(snp_name_template, site.chrom, pos_i),
+                str(site.ref_allele),
+                str(site.alt_allele),
+            )
+        )
+    return out
+
+
+def _iter_snp_named_chunks(
+    chunks: Iterator[tuple[np.ndarray, list[SiteInfo]]],
+    snp_name_template: str | None,
+) -> Iterator[tuple[np.ndarray, list[SiteInfo]]]:
+    if snp_name_template is None:
+        yield from chunks
+        return
+    for geno, sites in chunks:
+        yield geno, _rename_sites_for_snp_name(sites, snp_name_template)
+
+
+def _rewrite_plink_bim_snp_names(prefix: str, snp_name_template: str | None) -> None:
+    if snp_name_template is None:
+        return
+    bim_path = f"{str(prefix)}.bim"
+    tmp_path = f"{bim_path}.jxsnprename.tmp"
+    with open(bim_path, "r", encoding="utf-8", errors="replace") as fr, open(
+        tmp_path, "w", encoding="utf-8"
+    ) as fw:
+        for line_no, line in enumerate(fr, start=1):
+            tok = _split_tokens(line)
+            if len(tok) < 6:
+                raise ValueError(
+                    f"Invalid BIM row at {bim_path}:{line_no} while applying --snp-name."
+                )
+            chrom = str(tok[0])
+            pos = int(float(tok[3]))
+            tok[1] = _format_snp_name(snp_name_template, chrom, pos)
+            fw.write("\t".join(tok) + "\n")
+    os.replace(tmp_path, bim_path)
 
 
 def _simple_snp_only_requested(*, snps_only: bool, biallelic_only: bool) -> bool:
@@ -590,6 +681,25 @@ def _resolve_max_output_sites_env() -> int | None:
     return int(value)
 
 
+def _resolve_prune_mask_mmap_window_mb() -> int | None:
+    raw = os.getenv("JX_GFORMAT_PRUNE_MASK_MMAP_WINDOW_MB")
+    if raw is None:
+        return 128
+    text = str(raw).strip().lower()
+    if text in {"", "none", "off", "false", "disable", "disabled", "full"}:
+        return None
+    try:
+        value = int(text)
+    except Exception as e:
+        raise ValueError(
+            "JX_GFORMAT_PRUNE_MASK_MMAP_WINDOW_MB must be a positive integer "
+            "or one of none/off/full."
+        ) from e
+    if value <= 0:
+        raise ValueError("JX_GFORMAT_PRUNE_MASK_MMAP_WINDOW_MB must be > 0 when set.")
+    return int(value)
+
+
 def _resolve_ld_prune_backend() -> str:
     raw = str(os.getenv("JX_LD_PRUNE_BACKEND", "")).strip().lower()
     if raw in {"", "auto", "default", "rust"}:
@@ -773,8 +883,9 @@ def _site_passes_direct_expr(
     return True
 
 
-def _build_site_metadata_keep_mask(
-    sites: Sequence[SiteInfo],
+def _refine_plink_source_keep_mask(
+    prefix: str,
+    keep_mask: np.ndarray,
     *,
     snp_sites: list[tuple[str, int]] | None,
     bim_range: tuple[str, int, int] | None,
@@ -782,8 +893,13 @@ def _build_site_metadata_keep_mask(
     bp_min: int | None,
     bp_max: int | None,
     ranges: list[tuple[str, int, int]] | None,
+    require_simple_snp: bool = False,
 ) -> np.ndarray:
-    n_sites = int(len(sites))
+    keep = np.ascontiguousarray(
+        np.asarray(keep_mask, dtype=np.bool_).reshape(-1),
+        dtype=np.bool_,
+    )
+    n_sites = int(keep.shape[0])
     if n_sites <= 0:
         return np.zeros((0,), dtype=np.bool_)
     if (
@@ -793,8 +909,9 @@ def _build_site_metadata_keep_mask(
         and bp_min is None
         and bp_max is None
         and not ranges
+        and (not require_simple_snp)
     ):
-        return np.ones((n_sites,), dtype=np.bool_)
+        return keep
 
     site_set, bim_norm, chr_set, bp_lo, bp_hi, ranges_norm = _prepare_direct_filter_expr(
         snp_sites=snp_sites,
@@ -804,9 +921,28 @@ def _build_site_metadata_keep_mask(
         bp_max=bp_max,
         ranges=ranges,
     )
-    return np.fromiter(
-        (
-            _site_passes_direct_expr(
+    bim_path = f"{str(prefix)}.bim"
+    resolved_rows = 0
+    with open(bim_path, "r", encoding="utf-8", errors="replace") as f:
+        for row_idx, line in enumerate(f):
+            if row_idx >= n_sites:
+                break
+            resolved_rows = row_idx + 1
+            if not bool(keep[row_idx]):
+                continue
+            s = line.strip()
+            tok = _split_tokens(s)
+            if len(tok) < 6:
+                raise ValueError(
+                    f"Invalid BIM row at {bim_path}:{row_idx + 1} (need >=6 columns)."
+                )
+            chrom = str(tok[0])
+            pos = int(float(tok[3]))
+            snp = str(tok[1]).strip()
+            if snp == "" or snp == ".":
+                snp = f"{chrom}_{pos}"
+            site = SiteInfo(chrom, int(pos), snp, str(tok[4]), str(tok[5]))
+            ok = _site_passes_direct_expr(
                 site,
                 site_set=site_set,
                 bim_range=bim_norm,
@@ -815,11 +951,15 @@ def _build_site_metadata_keep_mask(
                 bp_max=bp_hi,
                 ranges=ranges_norm,
             )
-            for site in sites
-        ),
-        dtype=np.bool_,
-        count=n_sites,
-    )
+            if ok and require_simple_snp:
+                ok = _site_is_simple_snp(site)
+            if not ok:
+                keep[row_idx] = False
+    if resolved_rows != n_sites:
+        raise ValueError(
+            f"BIM row count mismatch while refining source keep mask: resolved={resolved_rows}, expected={n_sites}"
+        )
+    return keep
 
 
 def _filter_chunk_by_site(
@@ -1249,7 +1389,7 @@ def _write_plink_subset_from_packed(
     shutil.copyfile(src_fam, out_fam)
 
 
-def _ld_prune_with_mask_first_packed_pipeline(
+def _ld_prune_with_mask_first_streaming_pipeline(
     *,
     src_prefix: str,
     out_prefix: str,
@@ -1268,20 +1408,25 @@ def _ld_prune_with_mask_first_packed_pipeline(
     ranges: list[tuple[str, int, int]] | None,
     max_output_sites: int | None = None,
 ) -> tuple[int, int, float]:
-    t0 = time.time()
-    packed_raw, _miss_raw, _maf_raw, _std_raw, _row_flip_raw, site_keep_raw, n_samples, total_sites = (
-        prepare_bed_2bit_packed(
-            str(src_prefix),
-            maf_threshold=float(maf_threshold),
-            max_missing_rate=float(max_missing_rate),
-            het_threshold=float(het_threshold),
-            snps_only=_simple_snp_only_requested(
-                snps_only=bool(snps_only),
-                biallelic_only=bool(biallelic_only),
-            ),
+    if _bed_prune_mask_to_plink_rust is None:
+        raise RuntimeError(
+            "Rust mask-stream prune backend is unavailable. Rebuild JanusX extension."
         )
+    t0 = time.time()
+    mmap_window_mb = _resolve_prune_mask_mmap_window_mb()
+    site_keep_raw, _n_samples, total_sites = prepare_bed_logic_keep_mask(
+        str(src_prefix),
+        sample_indices=None,
+        maf_threshold=float(maf_threshold),
+        max_missing_rate=float(max_missing_rate),
+        het_threshold=float(het_threshold),
+        snps_only=_simple_snp_only_requested(
+            snps_only=bool(snps_only),
+            biallelic_only=bool(biallelic_only),
+        ),
+        mmap_window_mb=mmap_window_mb,
+        threads=max(1, int(threads)),
     )
-    packed = np.ascontiguousarray(np.asarray(packed_raw, dtype=np.uint8))
     site_keep = np.ascontiguousarray(
         np.asarray(site_keep_raw, dtype=np.bool_).reshape(-1),
         dtype=np.bool_,
@@ -1289,76 +1434,50 @@ def _ld_prune_with_mask_first_packed_pipeline(
     total_sites_i = int(total_sites)
     if int(site_keep.shape[0]) != total_sites_i:
         raise ValueError(
-            "Packed site-keep mask mismatch: "
+            "BED logic site-keep mask mismatch: "
             f"mask={site_keep.shape[0]}, total_sites={total_sites_i}"
         )
-
-    source_row_idx = np.ascontiguousarray(
-        np.flatnonzero(site_keep).astype(np.int64, copy=False),
-        dtype=np.int64,
-    )
-    if int(packed.shape[0]) != int(source_row_idx.shape[0]):
-        raise ValueError(
-            "Packed rows/site-keep mismatch: "
-            f"packed_rows={packed.shape[0]}, kept_rows={source_row_idx.shape[0]}"
-        )
-
-    sites_all = _read_plink_bim_sites(str(src_prefix))
-    if len(sites_all) != total_sites_i:
-        raise ValueError(
-            "BED/BIM row count mismatch for mask-first prune: "
-            f"bim_rows={len(sites_all)}, total_sites={total_sites_i}"
-        )
-    candidate_sites = [sites_all[int(i)] for i in source_row_idx.tolist()]
-
-    metadata_keep = _build_site_metadata_keep_mask(
-        candidate_sites,
+    site_keep = _refine_plink_source_keep_mask(
+        str(src_prefix),
+        site_keep,
         snp_sites=snp_sites,
         bim_range=bim_range,
         chr_keys=chr_keys,
         bp_min=bp_min,
         bp_max=bp_max,
         ranges=ranges,
+        require_simple_snp=False,
     )
-    if int(metadata_keep.shape[0]) != int(source_row_idx.shape[0]):
-        raise ValueError(
-            "Metadata site mask mismatch in mask-first prune: "
-            f"mask={metadata_keep.shape[0]}, sites={source_row_idx.shape[0]}"
-        )
-    if not bool(np.all(metadata_keep)):
-        keep_local_idx = np.flatnonzero(metadata_keep).astype(np.int64, copy=False)
-        source_row_idx = np.ascontiguousarray(source_row_idx[keep_local_idx], dtype=np.int64)
-        packed = np.ascontiguousarray(np.asarray(packed[metadata_keep], dtype=np.uint8), dtype=np.uint8)
-        candidate_sites = [candidate_sites[int(i)] for i in keep_local_idx.tolist()]
-
-    pre_n = int(source_row_idx.shape[0])
+    pre_n = int(np.sum(site_keep, dtype=np.int64))
     if pre_n <= 0:
         raise ValueError(
             "All variants were filtered out before LD prune "
             "(-extract/-chr/-from-bp/-to-bp/-maf/-geno/-het/--snps-only/--biallelic-only)."
         )
-
-    keep_mask = _ld_prune_with_maf_priority_packed_sites(
-        packed=packed,
-        sites=candidate_sites,
-        n_samples=int(n_samples),
-        spec=spec,
+    keep_n, total_n = _bed_prune_mask_to_plink_rust(
+        src_prefix=str(src_prefix),
+        out_prefix=str(out_prefix),
+        keep_mask=np.ascontiguousarray(site_keep, dtype=np.bool_),
+        window_bp=(int(spec.window_bp) if spec.window_bp is not None else None),
+        window_variants=(
+            int(spec.window_variants) if spec.window_variants is not None else None
+        ),
+        step_variants=int(spec.step_variants),
+        r2_threshold=float(spec.r2_threshold),
         threads=int(threads),
+        max_output_sites=max_output_sites,
     )
-    keep_n = int(np.sum(keep_mask))
+    keep_n = int(keep_n)
+    total_n = int(total_n)
+    if total_n != pre_n:
+        raise ValueError(
+            f"Rust mask-stream prune pre-count mismatch: got {total_n}, expected {pre_n}"
+        )
     if keep_n <= 0:
         raise ValueError(
             "All variants were filtered out by LD prune; "
             "try a looser --prune r^2 threshold or larger window."
         )
-    _write_plink_subset_from_packed(
-        src_prefix=str(src_prefix),
-        out_prefix=str(out_prefix),
-        packed=packed,
-        keep_mask=keep_mask,
-        source_row_idx=source_row_idx,
-        max_output_sites=max_output_sites,
-    )
     return keep_n, pre_n, float(time.time() - t0)
 
 
@@ -2123,6 +2242,17 @@ def build_parser() -> CliArgumentParser:
         ),
     )
     opt.add_argument(
+        "-snp-name",
+        "--snp-name",
+        type=str,
+        default=None,
+        help=(
+            "Override output SNP names with a CHR/POS template. "
+            "Examples: 'chr_pos', 'chr*pos', '{chr}_{pos}', 'chr{chr}_{pos}'. "
+            "Omit to inherit source names."
+        ),
+    )
+    opt.add_argument(
         "-prune",
         "--prune",
         nargs=3,
@@ -2186,6 +2316,10 @@ def main() -> None:
     prune_backend = _resolve_ld_prune_backend()
     try:
         output_site_limit = _resolve_max_output_sites_env()
+    except ValueError as e:
+        parser.error(str(e))
+    try:
+        snp_name_template = _normalize_snp_name_template(args.snp_name)
     except ValueError as e:
         parser.error(str(e))
     prune_streaming_io = _env_truthy("JX_GFORMAT_PRUNE_STREAMING_IO", "1")
@@ -2268,6 +2402,7 @@ def main() -> None:
                     ),
                     ("Chr filter", ",".join(sorted(chr_keys)) if chr_keys else "None"),
                     ("BP range", f"{args.from_bp if args.from_bp is not None else '-'}..{args.to_bp if args.to_bp is not None else '-'}"),
+                    ("SNP name template", snp_name_template or "inherit"),
                     ("ATCG SNP only (--snps-only)", bool(args.snps_only)),
                     ("ATCG SNP only alias (--biallelic-only)", bool(args.biallelic_only)),
                     ("MAF threshold", float(args.maf)),
@@ -2300,6 +2435,12 @@ def main() -> None:
         raise ValueError(
             f"{out_fmt.upper()} output from -file input requires real site metadata. "
             "Please provide a matching prefix.bsite/prefix.site or prefix.bim sidecar."
+        )
+    if snp_name_template is not None and out_fmt in {"txt", "npy", "gfd"}:
+        logger.warning(
+            "--snp-name only affects outputs carrying SNP IDs (PLINK/VCF/HMP); "
+            "it has no effect for %s output.",
+            out_fmt.upper(),
         )
 
     source_kind, _source_prefix, source_path = _resolve_input(gfile)
@@ -2474,6 +2615,7 @@ def main() -> None:
             raise ValueError(
                 "All variants were filtered out by filters (-extract/-chr/-from-bp/-to-bp/-maf/-geno/-het)."
             )
+        _rewrite_plink_bim_snp_names(str(out_prefix), snp_name_template)
         print(f"Genotype source: {format_path_for_display(gfile)}")
         print(f"Samples: {int(out_n)}, sites: {selected_n_sites}")
         log_success(logger, f"Format conversion completed in {rust_filter_direct_wall:.2f} s")
@@ -2612,6 +2754,7 @@ def main() -> None:
                     model=reader_model,
                     het=reader_het,
                     sample_ids=keep_sample_ids,
+                    snp_name_template=snp_name_template,
                 )
                 seen_n = int(getattr(convert_stats, "n_sites_seen", 0))
                 if seen_n > 0 and convert_done < seen_n:
@@ -2636,6 +2779,7 @@ def main() -> None:
                 model=reader_model,
                 het=reader_het,
                 sample_ids=keep_sample_ids,
+                snp_name_template=snp_name_template,
             )
 
         kept_n = int(getattr(convert_stats, "n_sites_written", 0))
@@ -2807,15 +2951,16 @@ def main() -> None:
             and float(args.geno) >= 1.0
             and float(args.het) <= 0.0
         )
-        use_masked_packed_prune_direct = bool(
+        use_masked_stream_prune_direct = bool(
             source_kind == "plink"
             and out_fmt == "plink"
             and keep_sample_ids is None
             and has_prune_prefilters
-            and _bed_packed_ld_prune_maf_priority is not None
+            and _bed_prune_mask_to_plink_rust is not None
+            and prune_streaming_io
         )
         if (
-            (use_packed_prune_fastpath or use_masked_packed_prune_direct)
+            use_packed_prune_fastpath
             and (not use_external_plink_prune)
             and _packed_prune_kernel_stats is not None
         ):
@@ -2837,7 +2982,7 @@ def main() -> None:
             and (not bool(site_type_snps_only))
             and (
                 keep_sample_ids is not None
-                or (not use_masked_packed_prune_direct)
+                or (not use_masked_stream_prune_direct)
             )
             and _bed_filter_to_plink_rust is not None
             and _bed_prune_to_plink_rust is not None
@@ -3068,8 +3213,8 @@ def main() -> None:
         else:
             with CliStatus(prune_desc, enabled=status_enabled) as task:
                 try:
-                    if use_masked_packed_prune_direct:
-                        keep_n, pre_n, wall = _ld_prune_with_mask_first_packed_pipeline(
+                    if use_masked_stream_prune_direct:
+                        keep_n, pre_n, wall = _ld_prune_with_mask_first_streaming_pipeline(
                             src_prefix=str(gfile),
                             out_prefix=str(out_prefix),
                             spec=prune_spec,
@@ -3095,7 +3240,7 @@ def main() -> None:
                         prune_pre_sites = int(pre_n)
                         selected_n_sites = int(keep_n)
                         rust_prune_direct_done = True
-                        prune_direct_backend = "rust-packed-mask-first-io"
+                        prune_direct_backend = "rust-mask+stream-io"
                     elif use_rust_prune_filtered_direct:
                         keep_n, total_n, pre_n, wall, out_n = _ld_prune_with_rust_filtered_pipeline(
                             src_prefix=str(gfile),
@@ -3124,7 +3269,7 @@ def main() -> None:
                         prune_pre_sites = int(pre_n)
                         selected_n_sites = int(keep_n)
                         rust_prune_direct_done = True
-                        prune_direct_backend = "rust-filter+prune-packed-io"
+                        prune_direct_backend = "rust-filter+temp-stream-io"
                         if keep_sample_ids is not None and int(out_n) != int(len(keep_sample_ids)):
                             logger.warning(
                                 "Rust filtered-prune sample count mismatch: "
@@ -3230,7 +3375,7 @@ def main() -> None:
                     f"(backend={backend}, kept={selected_n_sites}, dropped={int(prune_pre_sites - selected_n_sites)})",
                 )
         if (
-            (use_packed_prune_fastpath or use_masked_packed_prune_direct)
+            use_packed_prune_fastpath
             and (not use_external_plink_prune)
             and _packed_prune_kernel_stats is not None
         ):
@@ -3282,10 +3427,14 @@ def main() -> None:
 
     def _make_output_chunks() -> Iterator[tuple[np.ndarray, list[SiteInfo]]]:
         if pruned_geno is not None and pruned_sites is not None:
-            return _iter_chunks_from_matrix(pruned_geno, pruned_sites, chunk_size=50_000)
-        return _make_chunks()
+            return _iter_snp_named_chunks(
+                _iter_chunks_from_matrix(pruned_geno, pruned_sites, chunk_size=50_000),
+                snp_name_template,
+            )
+        return _iter_snp_named_chunks(_make_chunks(), snp_name_template)
 
     if rust_prune_direct_done:
+        _rewrite_plink_bim_snp_names(str(out_prefix), snp_name_template)
         log_success(logger, f"Format conversion completed in {rust_prune_direct_wall:.2f} s")
         log_success(logger, f"Output written: {output_display}")
         return
@@ -3307,6 +3456,7 @@ def main() -> None:
             keep_mask=np.asarray(packed_prune_keep_mask, dtype=bool),
             max_output_sites=output_site_limit,
         )
+        _rewrite_plink_bim_snp_names(str(out_prefix), snp_name_template)
         log_success(logger, f"Format conversion completed in {time.time() - t0:.2f} s")
         log_success(logger, f"Output written: {output_display}")
         return

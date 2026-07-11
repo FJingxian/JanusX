@@ -222,7 +222,7 @@ use gfreader::{
     bed_filter_stream_to_plink_rust, bed_filter_to_plink_rust, bed_mmap_filter_to_plink_rust,
     count_hmp_snps, count_vcf_snps, gfd_packbits_from_dosage_block, load_bed_2bit_packed,
     load_bed_u8_matrix, load_bim_columns, load_site_info, prepare_bed_2bit_packed,
-    prepare_bed_logic_meta_selected, scan_bed_2bit_packed_stats, BedChunkReader,
+    prepare_bed_logic_keep_mask, prepare_bed_logic_meta_selected, scan_bed_2bit_packed_stats, BedChunkReader,
     BedChunkReaderFromMeta, BedMmapReader, HmpChunkReader, NpyMmapReader, SiteInfo, TxtChunkReader,
     VcfChunkReader,
 };
@@ -254,8 +254,8 @@ use heritability::{
 };
 use kmer::{kmer_count_run_py, kmer_resolve_inputs_py, kmerge_run_py, kstats_run_py};
 use ld::{
-    bed_ldblock_r2_rust, bed_packed_ld_prune_maf_priority, bed_prune_to_plink_rust,
-    packed_prune_kernel_stats,
+    bed_ldblock_r2_rust, bed_packed_ld_prune_maf_priority, bed_prune_mask_to_plink_rust, bed_prune_selected_to_plink_rust,
+    bed_prune_to_plink_rust, packed_prune_kernel_stats,
 };
 use lmm::{
     lmm_assoc_chunk_f32, lmm_assoc_chunk_from_snp_f32, lmm_reml_assoc_bed_to_tsv_f32,
@@ -755,6 +755,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(garfield_metal_runtime_status_py, m)?)?;
     m.add_function(wrap_pyfunction!(scan_bed_2bit_packed_stats, m)?)?;
     m.add_function(wrap_pyfunction!(prepare_bed_2bit_packed, m)?)?;
+    m.add_function(wrap_pyfunction!(prepare_bed_logic_keep_mask, m)?)?;
     m.add_function(wrap_pyfunction!(prepare_bed_logic_meta_selected, m)?)?;
     m.add_function(wrap_pyfunction!(load_bed_u8_matrix, m)?)?;
     m.add_function(wrap_pyfunction!(load_site_info, m)?)?;
@@ -782,6 +783,8 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(bed_packed_ld_prune_maf_priority, m)?)?;
     m.add_function(wrap_pyfunction!(bed_ldblock_r2_rust, m)?)?;
     m.add_function(wrap_pyfunction!(packed_prune_kernel_stats, m)?)?;
+    m.add_function(wrap_pyfunction!(bed_prune_mask_to_plink_rust, m)?)?;
+    m.add_function(wrap_pyfunction!(bed_prune_selected_to_plink_rust, m)?)?;
     m.add_function(wrap_pyfunction!(bed_prune_to_plink_rust, m)?)?;
     m.add_function(wrap_pyfunction!(bed_packed_signed_hash_f32, m)?)?;
     m.add_function(wrap_pyfunction!(bed_packed_signed_hash_ztz_stats_f64, m)?)?;

@@ -72,6 +72,56 @@ fn infer_out_fmt(out: &str, out_fmt: &str) -> Result<OutFmt, String> {
     }
 }
 
+fn normalize_snp_name_template(template: Option<String>) -> Result<Option<String>, String> {
+    let Some(raw) = template else {
+        return Ok(None);
+    };
+    let text = raw.trim().to_string();
+    if text.is_empty() {
+        return Err("snp_name_template must not be empty".to_string());
+    }
+    if text.chars().any(|ch| ch.is_whitespace()) {
+        return Err("snp_name_template must not contain whitespace".to_string());
+    }
+    let has_brace_chr = text.contains("{chr}");
+    let has_brace_pos = text.contains("{pos}");
+    if has_brace_chr || has_brace_pos {
+        if !(has_brace_chr && has_brace_pos) {
+            return Err(
+                "snp_name_template must contain both {chr} and {pos}".to_string(),
+            );
+        }
+        return Ok(Some(text));
+    }
+    if !(text.contains("chr") && text.contains("pos")) {
+        return Err(
+            "snp_name_template must contain both chr and pos placeholders".to_string(),
+        );
+    }
+    Ok(Some(text))
+}
+
+#[inline]
+fn format_snp_name(template: &str, chrom: &str, pos: i32) -> String {
+    let pos_txt = pos.to_string();
+    if template.contains("{chr}") || template.contains("{pos}") {
+        template
+            .replace("{chr}", chrom)
+            .replace("{pos}", pos_txt.as_str())
+    } else {
+        template
+            .replace("chr", chrom)
+            .replace("pos", pos_txt.as_str())
+    }
+}
+
+#[inline]
+fn apply_snp_name_template(site: &mut SiteInfo, snp_name_template: Option<&str>) {
+    if let Some(template) = snp_name_template {
+        site.snp = format_snp_name(template, &site.chrom, site.pos);
+    }
+}
+
 // ============================================================
 // Sample identity: (FID, IID)
 // ============================================================
@@ -1812,7 +1862,8 @@ pub fn merge_genotypes(
     model="add",
     het=0.02,
     sample_ids=None,
-    sample_indices=None
+    sample_indices=None,
+    snp_name_template=None
 ))]
 pub fn convert_genotypes(
     py: Python<'_>,
@@ -1830,6 +1881,7 @@ pub fn convert_genotypes(
     het: f64,
     sample_ids: Option<Vec<String>>,
     sample_indices: Option<Vec<usize>>,
+    snp_name_template: Option<String>,
 ) -> PyResult<PyConvertStats> {
     if !(0.0..=0.5).contains(&maf) {
         return Err(pyo3::exceptions::PyValueError::new_err(
@@ -1859,6 +1911,9 @@ pub fn convert_genotypes(
 
     let fmt = infer_out_fmt(&out, out_fmt.as_deref().unwrap_or("auto"))
         .map_err(pyo3::exceptions::PyValueError::new_err)?;
+    let snp_name_template = normalize_snp_name_template(snp_name_template)
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+    let snp_name_template_ref = snp_name_template.as_deref();
 
     let mut it = InputIter::new(&input).map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
     let (selected_indices, selected_sample_ids) =
@@ -2024,6 +2079,8 @@ pub fn convert_genotypes(
                         galt,
                         row_i8,
                     } => {
+                        let mut site = site;
+                        apply_snp_name_template(&mut site, snp_name_template_ref);
                         match fmt {
                             OutFmt::Vcf => {
                                 vcf_w
@@ -2131,6 +2188,8 @@ pub fn convert_genotypes(
                         galt,
                         row_bed,
                     } => {
+                        let mut site = site;
+                        apply_snp_name_template(&mut site, snp_name_template_ref);
                         stats.n_sites_seen += 1;
                         if report_progress
                             && stats.n_sites_seen - last_report >= progress_every as u64
@@ -2235,6 +2294,9 @@ pub fn convert_genotypes(
 
             row_i8.clear();
             row_i8.extend(row_sel.iter().map(|&g| dosage_to_i8_rounded(g)));
+
+            let mut site = site;
+            apply_snp_name_template(&mut site, snp_name_template_ref);
 
             match fmt {
                 OutFmt::Vcf => {

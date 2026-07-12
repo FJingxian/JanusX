@@ -13,6 +13,7 @@ import pandas as pd
 from janusx.gfreader import (
     SiteInfo,
     inspect_genotype_file,
+    prepare_bed_logic_meta_selected,
     prepare_cli_input_cache,
 )
 try:
@@ -1089,6 +1090,131 @@ def load_or_build_packed_meta_basic(
     )
 
 
+def build_packed_meta_basic_uncached(
+    prefix: str,
+    *,
+    maf: float,
+    missing_rate: float,
+    het_threshold: float = 0.0,
+    snps_only: bool = False,
+    expected_n_samples: int | None = None,
+    mmap_window_mb: int | None = None,
+    threads: int | None = None,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """
+    Prepare basic packed BED filter metadata entirely in memory.
+
+    This avoids the `.pmeta.*` cache files and is intended for workflows that
+    prefer a fresh precompute per run.
+    """
+    plink_prefix = normalize_plink_prefix(prefix)
+    sample_ids, _ = inspect_genotype_file(str(plink_prefix))
+    sample_ids_arr = np.asarray(sample_ids, dtype=str)
+    if expected_n_samples is not None and int(expected_n_samples) != int(sample_ids_arr.shape[0]):
+        raise ValueError(
+            packed_expected_sample_size_mismatch_message(
+                expected_n=int(expected_n_samples),
+                got_n=int(sample_ids_arr.shape[0]),
+                source_prefix=str(plink_prefix),
+            )
+        )
+
+    try:
+        row_idx, miss, maf_arr, row_flip, site_keep, packed_n, n_total_sites = prepare_bed_logic_meta_selected(
+            str(plink_prefix),
+            sample_indices=None,
+            maf_threshold=float(maf),
+            max_missing_rate=float(missing_rate),
+            het_threshold=float(het_threshold),
+            snps_only=bool(snps_only),
+            mmap_window_mb=(
+                None if mmap_window_mb is None else int(max(1, int(mmap_window_mb)))
+            ),
+            threads=(
+                1
+                if threads is None
+                else int(max(1, int(threads)))
+            ),
+        )
+        if int(packed_n) != int(sample_ids_arr.shape[0]):
+            raise ValueError(
+                packed_sample_size_mismatch_message(
+                    expected_n=int(sample_ids_arr.shape[0]),
+                    got_n=int(packed_n),
+                )
+            )
+
+        active_row_idx = np.ascontiguousarray(
+            np.asarray(row_idx, dtype=np.int64).reshape(-1),
+            dtype=np.int64,
+        )
+        missing_arr = np.ascontiguousarray(
+            np.asarray(miss, dtype=np.float32).reshape(-1),
+            dtype=np.float32,
+        )
+        maf_selected = np.ascontiguousarray(
+            np.asarray(maf_arr, dtype=np.float32).reshape(-1),
+            dtype=np.float32,
+        )
+        row_flip_arr = np.ascontiguousarray(
+            np.asarray(row_flip, dtype=np.bool_).reshape(-1),
+            dtype=np.bool_,
+        )
+        site_keep_arr = np.ascontiguousarray(
+            np.asarray(site_keep, dtype=np.bool_).reshape(-1),
+            dtype=np.bool_,
+        )
+        n_total = int(n_total_sites)
+        if int(site_keep_arr.shape[0]) != n_total:
+            raise ValueError(
+                f"Packed metadata site_keep length mismatch: got {int(site_keep_arr.shape[0])}, "
+                f"expected {n_total}."
+            )
+        n_active = int(active_row_idx.shape[0])
+        if (
+            int(missing_arr.shape[0]) != n_active
+            or int(maf_selected.shape[0]) != n_active
+            or int(row_flip_arr.shape[0]) != n_active
+        ):
+            raise ValueError(
+                "Packed metadata length mismatch: "
+                f"row_indices={n_active}, missing={int(missing_arr.shape[0])}, "
+                f"maf={int(maf_selected.shape[0])}, row_flip={int(row_flip_arr.shape[0])}."
+            )
+        if n_active <= 0:
+            raise ValueError(packed_no_snps_after_filter_message())
+        if int(np.count_nonzero(site_keep_arr)) != n_active:
+            raise ValueError(
+                "Packed metadata keep-mask mismatch: "
+                f"row_indices={n_active}, site_keep_true={int(np.count_nonzero(site_keep_arr))}."
+            )
+        return sample_ids_arr, {
+            "missing_rate": missing_arr,
+            "af": maf_selected,
+            "maf": maf_selected,
+            "row_flip": row_flip_arr,
+            "site_keep": site_keep_arr,
+            "active_row_idx": active_row_idx,
+            "n_samples": int(packed_n),
+            "n_total_sites": n_total,
+            "n_active_sites": n_active,
+            "packed_filter_mode": "stats_only",
+            "packed_storage": "metadata",
+            "source_prefix": str(plink_prefix),
+        }
+    except Exception:
+        built = _build_packed_meta_layer(
+            str(plink_prefix),
+            sample_ids_arr=sample_ids_arr,
+            maf=float(maf),
+            missing_rate=float(missing_rate),
+            het_threshold=float(het_threshold),
+            snps_only=bool(snps_only),
+            layer="basic",
+        )
+        return sample_ids_arr, built
+
+
 def load_or_build_packed_meta_std(
     prefix: str,
     *,
@@ -1368,17 +1494,31 @@ def prepare_packed_stats_ctx_from_plink(
     het_threshold: float = 0.0,
     snps_only: bool = False,
     expected_n_samples: int | None = None,
+    use_cache: bool = True,
+    mmap_window_mb: int | None = None,
+    threads: int | None = None,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     """
     Prepare packed BED filter metadata without attaching the packed payload.
     """
-    return load_or_build_packed_meta_basic(
+    if bool(use_cache):
+        return load_or_build_packed_meta_basic(
+            str(normalize_plink_prefix(prefix)),
+            maf=float(maf),
+            missing_rate=float(missing_rate),
+            het_threshold=float(het_threshold),
+            snps_only=bool(snps_only),
+            expected_n_samples=expected_n_samples,
+        )
+    return build_packed_meta_basic_uncached(
         str(normalize_plink_prefix(prefix)),
         maf=float(maf),
         missing_rate=float(missing_rate),
         het_threshold=float(het_threshold),
         snps_only=bool(snps_only),
         expected_n_samples=expected_n_samples,
+        mmap_window_mb=mmap_window_mb,
+        threads=threads,
     )
 
 

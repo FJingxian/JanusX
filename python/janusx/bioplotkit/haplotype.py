@@ -1,6 +1,57 @@
 from __future__ import annotations
 
+"""
+Haplotype plotting + groupwise significance notes
+=================================================
+
+This module visualizes phenotype distributions across haplotypes and annotates
+group differences. The actual statistical tests used by `plot_haplotype(...)`
+are:
+
+1. Continuous phenotype mode (`mode='continuous'`)
+   - Exactly 2 haplotype groups:
+     Welch's two-sample t-test via
+     `scipy.stats.ttest_ind(..., equal_var=False)`.
+   - 3 or more haplotype groups:
+     Tukey's honestly significant difference (Tukey HSD) multiple comparison
+     via `statsmodels.stats.multicomp.pairwise_tukeyhsd`, delegated through
+     `janusx.bioplotkit.stat.multiple_comparison_groupby(...)`.
+   - Compact-letter-display labels are derived from the pairwise significance
+     matrix returned by the above tests.
+   - Notes:
+     `plot_haplotype(...)` currently calls the Tukey-HSD path directly for
+     >=3 groups; the optional omnibus helpers in `janusx.bioplotkit.stat`
+     (ANOVA / Kruskal-Wallis) are available there but are not enabled here by
+     default (`check_omnibus=False`).
+
+2. Binary phenotype mode (`mode='binomial'`)
+   - Exactly 2 haplotype groups:
+     Fisher's exact test via `scipy.stats.fisher_exact`.
+   - 3 or more haplotype groups:
+     an omnibus chi-square test via
+     `scipy.stats.chi2_contingency(..., correction=False)` is run first; if
+     significant, pairwise Fisher's exact tests are performed and corrected by
+     Holm's method (implemented locally in `_holm_adjust`).
+   - Proportion confidence intervals:
+     Wilson score intervals, implemented locally in `_wilson_ci`.
+
+3. Plotting / data handling backends
+   - Plotting: `matplotlib`
+   - Array/numerics: `numpy`
+   - Tabular wrangling: `pandas`
+   - Continuous-group tests: `scipy`, `statsmodels`
+   - Binary-group tests: `scipy`
+
+Short manuscript-ready wording for continuous phenotypes:
+"For continuous phenotypes, differences between two haplotype groups were
+tested using Welch's two-sample t-test; when three or more haplotype groups
+were present, pairwise differences were assessed using Tukey's HSD and
+summarized by compact-letter displays."
+"""
+
 from typing import Any, Iterable, Literal, Optional, Sequence, Tuple, Union
+import re
+import warnings
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -599,6 +650,7 @@ def _build_binomial_summary(
     out["letters"] = ""
     out["sem"] = np.nan
     out = out.sort_values("mean", ascending=bool(ascending))
+    order = list(out.index)
 
     if out.shape[0] >= 2:
         try:
@@ -618,6 +670,9 @@ def _build_binomial_summary(
             p_omnibus = np.nan
 
         sig = pd.DataFrame(False, index=gidx, columns=gidx, dtype=bool)
+        pairwise_pvalues = pd.DataFrame(np.nan, index=gidx, columns=gidx, dtype=float)
+        for g in gidx:
+            pairwise_pvalues.loc[g, g] = 0.0
         means = out["mean"].astype(float)
 
         if len(gidx) == 2:
@@ -625,10 +680,13 @@ def _build_binomial_summary(
             _, p = fisher_exact(
                 [[int(succ.loc[g1]), int(fail.loc[g1])], [int(succ.loc[g2]), int(fail.loc[g2])]]
             )
+            if np.isfinite(p):
+                pairwise_pvalues.loc[g1, g2] = float(p)
+                pairwise_pvalues.loc[g2, g1] = float(p)
             reject = bool(np.isfinite(p) and float(p) < float(alpha))
             sig.at[g1, g2] = reject
             sig.at[g2, g1] = reject
-        elif np.isfinite(p_omnibus) and float(p_omnibus) < float(alpha):
+        else:
             pairs: list[tuple[object, object]] = []
             pvals: list[float] = []
             for i in range(len(gidx)):
@@ -645,13 +703,21 @@ def _build_binomial_summary(
 
             p_adj = _holm_adjust(np.asarray(pvals, dtype=float))
             for (gi, gj), pv in zip(pairs, p_adj):
-                reject = bool(np.isfinite(pv) and float(pv) < float(alpha))
-                sig.at[gi, gj] = reject
-                sig.at[gj, gi] = reject
+                if np.isfinite(pv):
+                    pairwise_pvalues.loc[gi, gj] = float(pv)
+                    pairwise_pvalues.loc[gj, gi] = float(pv)
+                if np.isfinite(p_omnibus) and float(p_omnibus) < float(alpha):
+                    reject = bool(np.isfinite(pv) and float(pv) < float(alpha))
+                    sig.at[gi, gj] = reject
+                    sig.at[gj, gi] = reject
 
         letters_map = _compact_letter_display_local(sig, means)
         out["letters"] = [letters_map.get(g, "") for g in out.index]
         out.attrs["p_omnibus"] = float(p_omnibus) if np.isfinite(p_omnibus) else np.nan
+        out.attrs["pairwise_pvalues"] = pairwise_pvalues.reindex(index=order, columns=order)
+        out.attrs["significance_matrix"] = sig.reindex(index=order, columns=order)
+        out.attrs["test"] = "fisher_exact" if len(gidx) == 2 else "chi2_plus_pairwise_fisher_holm"
+        out.attrs["alpha"] = float(alpha)
 
     return out
 
@@ -759,6 +825,55 @@ def _subset_sample_site_by_sites(
     return geno_sample_site.loc[:, keep_cols]
 
 
+def _canonicalize_sample_id(raw: object) -> str:
+    s = str(raw).strip().upper()
+    s = re.sub(r"[^A-Z0-9]", "", s)
+    if len(s) > 1 and s.endswith("X"):
+        s = s[:-1]
+    return s
+
+
+def _resolve_bfile_sample_matches(
+    phenotype_samples: Sequence[str],
+    bfile_sample_ids: Sequence[str],
+) -> tuple[list[str], list[str], list[tuple[str, str]], list[str], list[tuple[str, str, str]]]:
+    phenotype_ids = [str(x) for x in phenotype_samples]
+    fam_ids = [str(x) for x in bfile_sample_ids]
+    fam_exact = set(fam_ids)
+    fam_by_canon: dict[str, list[str]] = {}
+    for fid in fam_ids:
+        fam_by_canon.setdefault(_canonicalize_sample_id(fid), []).append(fid)
+
+    matched_pheno: list[str] = []
+    matched_fam: list[str] = []
+    auto_matched: list[tuple[str, str]] = []
+    unresolved: list[str] = []
+    ambiguous: list[tuple[str, str, str]] = []
+    used_fam: set[str] = set()
+
+    for pid in phenotype_ids:
+        if pid in fam_exact and pid not in used_fam:
+            matched_pheno.append(pid)
+            matched_fam.append(pid)
+            used_fam.add(pid)
+            continue
+
+        canon = _canonicalize_sample_id(pid)
+        hits = [fid for fid in fam_by_canon.get(canon, []) if fid not in used_fam]
+        if len(hits) == 1:
+            fid = hits[0]
+            matched_pheno.append(pid)
+            matched_fam.append(fid)
+            used_fam.add(fid)
+            auto_matched.append((pid, fid))
+        elif len(hits) > 1:
+            ambiguous.append((pid, canon, ", ".join(hits[:5])))
+        else:
+            unresolved.append(pid)
+
+    return matched_pheno, matched_fam, auto_matched, unresolved, ambiguous
+
+
 def _load_sample_site_from_bfile(
     bfile: str,
     phenotype_samples: Sequence[str],
@@ -771,8 +886,53 @@ def _load_sample_site_from_bfile(
         raise ValueError("`snp_sites` must be provided when using `bfile`.")
 
     from janusx.gfreader import load_genotype_chunks
+    from janusx.gfreader.gfreader import _read_plink_fam_sample_ids
 
-    sample_ids = [str(x) for x in phenotype_samples]
+    bfile_sample_ids = _read_plink_fam_sample_ids(str(bfile))
+    matched_pheno_ids, sample_ids, auto_matched, missing_ids, ambiguous_ids = (
+        _resolve_bfile_sample_matches(phenotype_samples, bfile_sample_ids)
+    )
+    if auto_matched:
+        shown = ", ".join(f"{src}->{dst}" for src, dst in auto_matched[:8])
+        extra = "" if len(auto_matched) <= 8 else f" ... (+{len(auto_matched) - 8} more)"
+        warnings.warn(
+            (
+                "Auto-matched phenotype sample IDs to PLINK FAM IDs using normalized name "
+                f"matching (case/punctuation/trailing-X insensitive): {shown}{extra}"
+            ),
+            RuntimeWarning,
+            stacklevel=3,
+        )
+    if ambiguous_ids:
+        shown = ", ".join(
+            f"{pid}[{canon}] -> {hits}" for pid, canon, hits in ambiguous_ids[:5]
+        )
+        extra = (
+            ""
+            if len(ambiguous_ids) <= 5
+            else f" ... (+{len(ambiguous_ids) - 5} more ambiguous IDs)"
+        )
+        warnings.warn(
+            (
+                "Some phenotype samples matched multiple PLINK FAM IDs under normalized name "
+                f"matching and were ignored: {shown}{extra}"
+            ),
+            RuntimeWarning,
+            stacklevel=3,
+        )
+    if missing_ids:
+        shown = ", ".join(missing_ids[:10])
+        extra = "" if len(missing_ids) <= 10 else f" ... (+{len(missing_ids) - 10} more)"
+        warnings.warn(
+            (
+                "Some phenotype samples could not be matched to the PLINK FAM file and will be "
+                f"ignored in haplotype plotting: {shown}{extra}"
+            ),
+            RuntimeWarning,
+            stacklevel=3,
+        )
+    if len(sample_ids) == 0:
+        raise ValueError("No overlapping samples between phenotype and bfile genotype.")
     req_chunk_size = (
         int(chunk_size)
         if chunk_size is not None
@@ -787,7 +947,11 @@ def _load_sample_site_from_bfile(
         snp_sites=requested_sites,
         sample_ids=sample_ids,
     )
-    geno_sample_site = _chunks_to_sample_site(chunks, phenotype_samples, sample_ids)
+    geno_sample_site = _chunks_to_sample_site(chunks, sample_ids, sample_ids)
+    if matched_pheno_ids != sample_ids:
+        geno_sample_site = geno_sample_site.rename(
+            index={fam: pheno for pheno, fam in zip(matched_pheno_ids, sample_ids)}
+        )
     return _subset_sample_site_by_sites(geno_sample_site, requested_sites)
 
 
@@ -1029,6 +1193,11 @@ def plot_haplotype(
     (ax, summary_df)
         continuous columns: ['mean', 'n', 'letters', 'sem'].
         binomial adds: ['k', 'ci_low', 'ci_high', 'label'].
+        Common attrs may include:
+          - summary_df.attrs['pvalue'] for continuous two-group Welch test
+          - summary_df.attrs['p_omnibus'] for binomial multi-group omnibus chi-square
+          - summary_df.attrs['pairwise_pvalues'] as a symmetric DataFrame
+          - summary_df.attrs['significance_matrix'] as a symmetric boolean DataFrame
     """
     legacy_draw_violin = kwargs.pop("draw_violin", None)
     legacy_draw_box = kwargs.pop("draw_box", None)
@@ -1101,6 +1270,24 @@ def plot_haplotype(
     hap_counts_all = merged.groupby("_hap_key")["_pheno"].size()
     keep_keys = hap_counts_all[hap_counts_all >= int(min_haplotype_n)].index
     removed_counts = hap_counts_all[hap_counts_all < int(min_haplotype_n)]
+    if not removed_counts.empty:
+        shown = ", ".join(
+            f"{key}(n={int(count)})"
+            for key, count in removed_counts.iloc[:8].items()
+        )
+        extra = (
+            ""
+            if removed_counts.shape[0] <= 8
+            else f" ... (+{removed_counts.shape[0] - 8} more)"
+        )
+        warnings.warn(
+            (
+                f"Filtered out haplotype groups below min_haplotype_n={int(min_haplotype_n)}: "
+                f"{shown}{extra}"
+            ),
+            RuntimeWarning,
+            stacklevel=2,
+        )
     merged = merged.loc[merged["_hap_key"].isin(keep_keys)].copy()
     if merged.empty:
         raise ValueError(
@@ -1137,6 +1324,7 @@ def plot_haplotype(
     summary.attrs["min_haplotype_n"] = int(min_haplotype_n)
     summary.attrs["removed_haplotype_groups"] = int(removed_counts.shape[0])
     summary.attrs["removed_haplotype_samples"] = int(removed_counts.sum())
+    summary.attrs["removed_haplotype_detail"] = removed_counts.to_dict()
     summary.attrs["mode"] = mode_key
 
     group_values = _group_values_by_index(

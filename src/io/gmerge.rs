@@ -87,16 +87,12 @@ fn normalize_snp_name_template(template: Option<String>) -> Result<Option<String
     let has_brace_pos = text.contains("{pos}");
     if has_brace_chr || has_brace_pos {
         if !(has_brace_chr && has_brace_pos) {
-            return Err(
-                "snp_name_template must contain both {chr} and {pos}".to_string(),
-            );
+            return Err("snp_name_template must contain both {chr} and {pos}".to_string());
         }
         return Ok(Some(text));
     }
     if !(text.contains("chr") && text.contains("pos")) {
-        return Err(
-            "snp_name_template must contain both chr and pos placeholders".to_string(),
-        );
+        return Err("snp_name_template must contain both chr and pos placeholders".to_string());
     }
     Ok(Some(text))
 }

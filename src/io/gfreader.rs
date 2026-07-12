@@ -5810,11 +5810,7 @@ pub fn prepare_bed_logic_keep_mask<'py>(
     snps_only: bool,
     mmap_window_mb: Option<usize>,
     threads: usize,
-) -> PyResult<(
-    Bound<'py, PyArray1<bool>>,
-    usize,
-    usize,
-)> {
+) -> PyResult<(Bound<'py, PyArray1<bool>>, usize, usize)> {
     if !(0.0..=0.5).contains(&maf_threshold) {
         return Err(PyValueError::new_err(
             "maf_threshold must be within [0, 0.5]",

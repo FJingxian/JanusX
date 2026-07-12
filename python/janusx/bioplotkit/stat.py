@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Dict, Hashable, List, Sequence, Union, Optional
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -67,9 +68,29 @@ def _tukey_significance_matrix(df: pd.DataFrame, alpha: float = 0.05) -> pd.Data
     Return a symmetric boolean matrix:
     sig.loc[g1, g2] == True means g1 and g2 are significantly different.
     """
+    sig, _pvals = _tukey_test_matrices(df, alpha=alpha)
+    return sig
+
+
+def _tukey_test_matrices(
+    df: pd.DataFrame,
+    alpha: float = 0.05,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Return symmetric matrices for Tukey HSD results.
+
+    Returns
+    -------
+    sig_matrix, pvalue_matrix
+        - sig_matrix.loc[g1, g2] == True means g1 and g2 are significantly different.
+        - pvalue_matrix.loc[g1, g2] is the Tukey adjusted p-value.
+    """
     _require_statsmodels()
     groups = list(pd.unique(df["group"]))
     sig = pd.DataFrame(False, index=groups, columns=groups, dtype=bool)
+    pvals = pd.DataFrame(np.nan, index=groups, columns=groups, dtype=float)
+    for g in groups:
+        pvals.loc[g, g] = 0.0
 
     tukey = pairwise_tukeyhsd(
         endog=df["value"].values,
@@ -81,11 +102,17 @@ def _tukey_significance_matrix(df: pd.DataFrame, alpha: float = 0.05) -> pd.Data
     # group1, group2, meandiff, p-adj, lower, upper, reject
     summary_data = tukey.summary().data[1:]
     for row in summary_data:
-        g1, g2, *_rest, reject = row
+        g1, g2, _meandiff, p_adj, _lower, _upper, reject = row
+        try:
+            p_adj_f = float(p_adj)
+        except (TypeError, ValueError):
+            p_adj_f = np.nan
         sig.loc[g1, g2] = bool(reject)
         sig.loc[g2, g1] = bool(reject)
+        pvals.loc[g1, g2] = p_adj_f
+        pvals.loc[g2, g1] = p_adj_f
 
-    return sig
+    return sig, pvals
 
 
 def _compact_letter_display(
@@ -270,6 +297,26 @@ def multiple_comparison_groupby(
 
     # Special case: exactly two groups -> fallback to Welch's t-test.
     unique_groups = list(pd.unique(df["_group_key"]))
+    if len(unique_groups) < 2:
+        means = df.groupby("_group_key")[value_col].mean()
+        counts = df.groupby("_group_key")[value_col].size()
+        out = pd.DataFrame({"mean": means, "n": counts})
+        out["letters"] = "a"
+        out = out.sort_values("mean", ascending=False)
+        order = list(out.index)
+        pairwise_pvalues = pd.DataFrame(0.0, index=order, columns=order, dtype=float)
+        significance_matrix = pd.DataFrame(False, index=order, columns=order, dtype=bool)
+        out.attrs["pairwise_pvalues"] = pairwise_pvalues
+        out.attrs["significance_matrix"] = significance_matrix
+        out.attrs["test"] = "single_group"
+        out.attrs["alpha"] = float(alpha)
+        out.attrs["pvalue"] = np.nan
+        warnings.warn(
+            "Only one haplotype group remains after filtering; significance testing was skipped.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+        return out
     if len(unique_groups) == 2:
         g1, g2 = unique_groups
         x1 = df.loc[df["_group_key"] == g1, value_col].astype(float).values
@@ -286,15 +333,32 @@ def multiple_comparison_groupby(
             ranked = means.sort_values(ascending=False).index.tolist()
             letters = {ranked[0]: "a", ranked[1]: "b"}
 
+        pairwise_pvalues = pd.DataFrame(np.nan, index=out.index, columns=out.index, dtype=float)
+        significance_matrix = pd.DataFrame(False, index=out.index, columns=out.index, dtype=bool)
+        for g in out.index:
+            pairwise_pvalues.loc[g, g] = 0.0
+        if np.isfinite(pvalue):
+            pairwise_pvalues.loc[g1, g2] = float(pvalue)
+            pairwise_pvalues.loc[g2, g1] = float(pvalue)
+            is_sig = bool(float(pvalue) < alpha)
+            significance_matrix.loc[g1, g2] = is_sig
+            significance_matrix.loc[g2, g1] = is_sig
+
         out["letters"] = [letters.get(g, "") for g in out.index]
         out = out.sort_values("mean", ascending=False)
         out.attrs["pvalue"] = float(pvalue) if np.isfinite(pvalue) else np.nan
+        order = list(out.index)
+        out.attrs["pairwise_pvalues"] = pairwise_pvalues.reindex(index=order, columns=order)
+        out.attrs["significance_matrix"] = significance_matrix.reindex(index=order, columns=order)
+        out.attrs["test"] = "welch_ttest"
+        out.attrs["alpha"] = float(alpha)
         return out
 
     # statsmodels Tukey expects 1D group labels; tuple-like keys can be
     # expanded into 2D arrays internally. Factorize to stable integer labels.
     group_labels, group_uniques = pd.factorize(df["_group_key"], sort=False)
     mc_df = pd.DataFrame({"value": df[value_col].values, "group": group_labels})
+    sig_by_label, pvals_by_label = _tukey_test_matrices(mc_df, alpha=alpha)
     letters_by_label = multiple_comparison_letters(
         mc_df,
         value_col="value",
@@ -309,6 +373,9 @@ def multiple_comparison_groupby(
         for k, v in letters_by_label.items()
         if int(k) < len(group_uniques)
     }
+    label_to_group = {int(i): group_uniques[int(i)] for i in range(len(group_uniques))}
+    sig_by_group = sig_by_label.rename(index=label_to_group, columns=label_to_group)
+    pvals_by_group = pvals_by_label.rename(index=label_to_group, columns=label_to_group)
 
     means = df.groupby("_group_key")[value_col].mean()
     counts = df.groupby("_group_key")[value_col].size()
@@ -316,4 +383,9 @@ def multiple_comparison_groupby(
     out = pd.DataFrame({"mean": means, "n": counts})
     out["letters"] = [letters.get(g, "") for g in out.index]
     out = out.sort_values("mean", ascending=False)
+    order = list(out.index)
+    out.attrs["pairwise_pvalues"] = pvals_by_group.reindex(index=order, columns=order)
+    out.attrs["significance_matrix"] = sig_by_group.reindex(index=order, columns=order)
+    out.attrs["test"] = "tukey_hsd"
+    out.attrs["alpha"] = float(alpha)
     return out

@@ -6102,29 +6102,6 @@ def run_splmm_windowed_fullrank(
         if shared_sparse_kinship_path is not None
         else {}
     )
-    if (
-        scan_mode_norm == "exact"
-        and splmm_sparse_jxgrm_path is None
-        and sparse_cutoff_log not in {None, "precomputed"}
-    ):
-        try:
-            sparse_cutoff_warn = float(sparse_cutoff_log)
-        except Exception:
-            sparse_cutoff_warn = None
-        if sparse_cutoff_warn is not None and np.isfinite(sparse_cutoff_warn) and sparse_cutoff_warn >= 0.0:
-            _emit_warning_line(
-                logger,
-                (
-                    f"{model_label_norm} exact scan is using a non-negative sparse cutoff "
-                    f"({sparse_cutoff_warn:g}), so SparseLMM keeps only off-diagonal entries with "
-                    "K_ij > cutoff and drops all negative kinship values. This changes the null "
-                    "covariance relative to dense FvLMM and can shift h2/lambda or inflate QQ; "
-                    "use a negative cutoff such as --splmm-exact=-1e-12 when you need "
-                    "dense-equivalent calibration."
-                ),
-                use_spinner=bool(use_spinner),
-            )
-
     for pname in trait_iter:
         cpu_t0 = process.cpu_times()
         t0 = time.time()
@@ -6460,28 +6437,6 @@ def run_splmm_windowed_fullrank(
                 "Under this sparse positive-kinship model, h2 may be understated and, in more extreme cases, "
                 "LM switch can occur; this is not directly comparable to dense fixed-lambda spectral h2."
             )
-        if (
-            effective_scan_mode == "exact"
-            and null_n_samples_k > 1
-            and np.isfinite(null_offdiag_density_k)
-            and float(null_offdiag_density_k) < 0.999999
-        ):
-            warn_cache = getattr(logger, "_janusx_splmm_exact_sparse_model_warned", None)
-            if not isinstance(warn_cache, set):
-                warn_cache = set()
-                setattr(logger, "_janusx_splmm_exact_sparse_model_warned", warn_cache)
-            warn_key = str(model_label_norm)
-            warn_msg = (
-                f"Warning: {model_label_norm} exact scan for trait {pname} is solving the sparse "
-                f"covariance model actually stored in the GRM (offdiag_density={float(null_offdiag_density_k):.4g}), "
-                "not the original dense FvLMM covariance. With JanusX's built-in non-negative sparse cutoff, "
-                "only K_ij > cutoff is kept and all negative kinship values are dropped, which can shift h2/lambda "
-                "or inflate QQ. Use a negative cutoff such as --splmm-exact=-1e-12 when you need "
-                "dense-equivalent calibration."
-            )
-            if warn_key not in warn_cache:
-                warn_cache.add(warn_key)
-                logger.warning(warn_msg)
         pheno_trait_subset = _trait_single_column_frame(
             pheno_aligned,
             pname,

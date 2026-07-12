@@ -58,11 +58,11 @@ from ._common.pathcheck import (
 from ._common.progress import CliStatus, ProgressAdapter, format_elapsed, log_success
 from ._common.genocache import configure_genotype_cache_from_out
 from ._common.genoio import (
+    build_packed_meta_basic_uncached,
     determine_genotype_source as _determine_genotype_source,
     genotype_load_status_done,
     genotype_load_status_fail,
     genotype_load_status_open,
-    load_or_build_packed_meta_basic,
     packed_meta_active_row_idx,
 )
 from ._common.threads import (
@@ -689,14 +689,17 @@ def _prepare_grm_part_meta_payload(
     snps_only: bool,
     block_rows: int,
     mmap_window_mb: Union[int, None],
+    threads: int,
 ) -> dict[str, object]:
-    _sample_ids_meta, packed_meta_ctx = load_or_build_packed_meta_basic(
-        str(genofile),
-        maf=float(maf_threshold),
-        missing_rate=float(max_missing_rate),
+    packed_meta_ctx = _prepare_grm_stats_meta_ctx(
+        genofile=str(genofile),
+        n_samples=int(n_samples),
+        maf_threshold=float(maf_threshold),
+        max_missing_rate=float(max_missing_rate),
         het_threshold=float(het_threshold),
         snps_only=bool(snps_only),
-        expected_n_samples=int(n_samples),
+        mmap_window_mb=mmap_window_mb,
+        threads=int(threads),
     )
     (
         source_prefix,
@@ -721,6 +724,37 @@ def _prepare_grm_part_meta_payload(
         "n_total_sites": int(n_total_sites),
         "eff_m_hint": int(row_source_indices.shape[0]),
     }
+
+
+def _prepare_grm_stats_meta_ctx(
+    *,
+    genofile: str,
+    n_samples: int,
+    maf_threshold: float,
+    max_missing_rate: float,
+    het_threshold: float,
+    snps_only: bool,
+    mmap_window_mb: Union[int, None],
+    threads: int,
+) -> dict[str, object]:
+    status_desc = "Computing GRM row statistics..."
+    with CliStatus(status_desc, enabled=True, use_process=True) as task:
+        try:
+            _sample_ids_meta, packed_meta_ctx = build_packed_meta_basic_uncached(
+                str(genofile),
+                maf=float(maf_threshold),
+                missing_rate=float(max_missing_rate),
+                het_threshold=float(het_threshold),
+                snps_only=bool(snps_only),
+                expected_n_samples=int(n_samples),
+                mmap_window_mb=mmap_window_mb,
+                threads=max(1, int(threads)),
+            )
+        except Exception:
+            task.fail(status_desc)
+            raise
+        task.complete(status_desc)
+    return packed_meta_ctx
 
 
 @contextmanager
@@ -1281,13 +1315,15 @@ def build_grm_streaming_from_meta(
             "Rust GRM meta kernel is unavailable. Rebuild JanusX extension to export "
             "`grm_bed_f64_from_meta`."
         )
-    _sample_ids_meta, packed_meta_ctx = load_or_build_packed_meta_basic(
-        str(genofile),
-        maf=float(maf_threshold),
-        missing_rate=float(max_missing_rate),
+    packed_meta_ctx = _prepare_grm_stats_meta_ctx(
+        genofile=str(genofile),
+        n_samples=int(n_samples),
+        maf_threshold=float(maf_threshold),
+        max_missing_rate=float(max_missing_rate),
         het_threshold=float(het_threshold),
         snps_only=bool(snps_only),
-        expected_n_samples=int(n_samples),
+        mmap_window_mb=mmap_window_mb,
+        threads=int(threads),
     )
     (
         source_prefix,
@@ -1371,13 +1407,15 @@ def build_grm_streaming_from_meta_to_npy(
             "Rust GRM meta->NPY kernel is unavailable. Rebuild JanusX extension to export "
             "`gblup_grm_from_meta_to_npy`."
         )
-    _sample_ids_meta, packed_meta_ctx = load_or_build_packed_meta_basic(
-        str(genofile),
-        maf=float(maf_threshold),
-        missing_rate=float(max_missing_rate),
+    packed_meta_ctx = _prepare_grm_stats_meta_ctx(
+        genofile=str(genofile),
+        n_samples=int(n_samples),
+        maf_threshold=float(maf_threshold),
+        max_missing_rate=float(max_missing_rate),
         het_threshold=float(het_threshold),
         snps_only=bool(snps_only),
-        expected_n_samples=int(n_samples),
+        mmap_window_mb=mmap_window_mb,
+        threads=int(threads),
     )
     (
         source_prefix,
@@ -1654,13 +1692,15 @@ def build_sparse_grm_from_meta(
             "Sparse GRM meta kernel is unavailable. Rebuild JanusX extension to export "
             "`spgrm_bed_to_jxgrm_from_meta`."
         )
-    _sample_ids_meta, packed_meta_ctx = load_or_build_packed_meta_basic(
-        str(genofile),
-        maf=float(maf_threshold),
-        missing_rate=float(max_missing_rate),
+    packed_meta_ctx = _prepare_grm_stats_meta_ctx(
+        genofile=str(genofile),
+        n_samples=int(n_samples),
+        maf_threshold=float(maf_threshold),
+        max_missing_rate=float(max_missing_rate),
         het_threshold=float(het_threshold),
         snps_only=bool(snps_only),
-        expected_n_samples=int(n_samples),
+        mmap_window_mb=mmap_window_mb,
+        threads=int(threads),
     )
     (
         source_prefix,
@@ -1682,7 +1722,7 @@ def build_sparse_grm_from_meta(
         verbose=bool(verbose),
         msg=(
             "Sparse GRM route selected meta-stream: "
-            f"n={n_samples}, m={int(row_source_indices.shape[0])}, cached filter metadata + prepared BED decode."
+            f"n={n_samples}, m={int(row_source_indices.shape[0])}, in-memory row statistics + prepared BED decode."
         ),
     )
     _log_verbose_or_file_only(
@@ -2257,7 +2297,7 @@ def main(log: bool = True):
             verbose=bool(getattr(args, "verbose", False)),
             msg=(
                 "GRM experimental part route selected backend: dense-meta-row-band "
-                "(cached filter metadata + stream-batch/tile lower-triangle rows)."
+                "(in-memory row statistics + stream-batch/tile lower-triangle rows)."
             ),
         )
         payload = _prepare_grm_part_meta_payload(
@@ -2269,6 +2309,7 @@ def main(log: bool = True):
             snps_only=bool(args.snps_only),
             block_rows=stream_block_rows,
             mmap_window_mb=mmap_window_mb,
+            threads=int(args.thread),
         )
         method_tag = _grm_method_tag(args.method)
 
@@ -2403,7 +2444,7 @@ def main(log: bool = True):
             verbose=bool(getattr(args, "verbose", False)),
             msg=(
                 "GRM auto route selected backend: sparse-meta-stream "
-                "(cached filter metadata + blockwise streaming sparse CSC writer)."
+                "(in-memory row statistics + blockwise streaming sparse CSC writer)."
             ),
         )
         sparse_prefix = f"{outprefix}.{_grm_method_tag(args.method)}"

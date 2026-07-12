@@ -51,6 +51,7 @@ from janusx.gfreader import (
     load_bed_2bit_packed,
     load_genotype_chunks,
     prepare_bed_logic_keep_mask,
+    prepare_bed_logic_meta_selected,
     save_genotype_streaming,
     SiteInfo,
 )
@@ -77,6 +78,16 @@ try:
     from janusx.janusx import bed_prune_mask_to_plink_rust as _bed_prune_mask_to_plink_rust
 except Exception:
     _bed_prune_mask_to_plink_rust = None
+
+try:
+    from janusx.janusx import bed_prune_selected_to_plink_rust as _bed_prune_selected_to_plink_rust
+except Exception:
+    _bed_prune_selected_to_plink_rust = None
+
+try:
+    from janusx.janusx import scan_plink_selected_snp_indices_from_bim_rust as _scan_plink_selected_snp_indices_from_bim_rust
+except Exception:
+    _scan_plink_selected_snp_indices_from_bim_rust = None
 
 try:
     from janusx.janusx import bed_filter_to_plink_rust as _bed_filter_to_plink_rust
@@ -962,6 +973,229 @@ def _refine_plink_source_keep_mask(
     return keep
 
 
+def _scan_plink_selected_snp_indices_from_bim(
+    prefix: str,
+    *,
+    snp_sites: list[tuple[str, int]] | None,
+    bim_range: tuple[str, int, int] | None,
+    chr_keys: list[str] | set[str] | None,
+    bp_min: int | None,
+    bp_max: int | None,
+    ranges: list[tuple[str, int, int]] | None,
+    require_simple_snp: bool = False,
+) -> np.ndarray:
+    if _scan_plink_selected_snp_indices_from_bim_rust is not None:
+        return np.ascontiguousarray(
+            np.asarray(
+                _scan_plink_selected_snp_indices_from_bim_rust(
+                    str(prefix),
+                    snp_sites=snp_sites,
+                    bim_range=bim_range,
+                    chr_keys=(sorted(set(chr_keys)) if chr_keys is not None else None),
+                    bp_min=(int(bp_min) if bp_min is not None else None),
+                    bp_max=(int(bp_max) if bp_max is not None else None),
+                    ranges=ranges,
+                    require_simple_snp=bool(require_simple_snp),
+                ),
+                dtype=np.int64,
+            ).reshape(-1),
+            dtype=np.int64,
+        )
+
+    site_set, bim_norm, chr_set, bp_lo, bp_hi, ranges_norm = _prepare_direct_filter_expr(
+        snp_sites=snp_sites,
+        bim_range=bim_range,
+        chr_keys=(set(chr_keys) if chr_keys is not None else None),
+        bp_min=bp_min,
+        bp_max=bp_max,
+        ranges=ranges,
+    )
+    out_idx: list[int] = []
+    bim_path = f"{str(prefix)}.bim"
+    with open(bim_path, "r", encoding="utf-8", errors="replace") as f:
+        for row_idx, line in enumerate(f):
+            tok = _split_tokens(line.strip())
+            if len(tok) < 6:
+                raise ValueError(
+                    f"Invalid BIM row at {bim_path}:{row_idx + 1} (need >=6 columns)."
+                )
+            chrom = str(tok[0])
+            pos = int(float(tok[3]))
+            snp = str(tok[1]).strip()
+            if snp == "" or snp == ".":
+                snp = f"{chrom}_{pos}"
+            site = SiteInfo(chrom, int(pos), snp, str(tok[4]), str(tok[5]))
+            ok = _site_passes_direct_expr(
+                site,
+                site_set=site_set,
+                bim_range=bim_norm,
+                chr_set=chr_set,
+                bp_min=bp_lo,
+                bp_max=bp_hi,
+                ranges=ranges_norm,
+            )
+            if ok and require_simple_snp:
+                ok = _site_is_simple_snp(site)
+            if ok:
+                out_idx.append(int(row_idx))
+    return np.ascontiguousarray(np.asarray(out_idx, dtype=np.int64), dtype=np.int64)
+
+
+def _refine_plink_selected_snp_indices(
+    prefix: str,
+    selected_snp_indices: np.ndarray,
+    *,
+    snp_sites: list[tuple[str, int]] | None,
+    bim_range: tuple[str, int, int] | None,
+    chr_keys: list[str] | set[str] | None,
+    bp_min: int | None,
+    bp_max: int | None,
+    ranges: list[tuple[str, int, int]] | None,
+    require_simple_snp: bool = False,
+) -> np.ndarray:
+    selected = np.ascontiguousarray(
+        np.asarray(selected_snp_indices, dtype=np.int64).reshape(-1),
+        dtype=np.int64,
+    )
+    n_selected = int(selected.shape[0])
+    if n_selected <= 0:
+        return np.zeros((0,), dtype=np.int64)
+    if np.any(selected < 0):
+        raise ValueError("Selected PLINK source rows must be non-negative.")
+    if n_selected > 1 and bool(np.any(selected[1:] <= selected[:-1])):
+        raise ValueError("Selected PLINK source rows must be strictly increasing.")
+    if (
+        not snp_sites
+        and bim_range is None
+        and not chr_keys
+        and bp_min is None
+        and bp_max is None
+        and not ranges
+        and (not require_simple_snp)
+    ):
+        return selected
+
+    site_set, bim_norm, chr_set, bp_lo, bp_hi, ranges_norm = _prepare_direct_filter_expr(
+        snp_sites=snp_sites,
+        bim_range=bim_range,
+        chr_keys=(set(chr_keys) if chr_keys is not None else None),
+        bp_min=bp_min,
+        bp_max=bp_max,
+        ranges=ranges,
+    )
+    out_idx: list[int] = []
+    row_ptr = 0
+    bim_path = f"{str(prefix)}.bim"
+    with open(bim_path, "r", encoding="utf-8", errors="replace") as f:
+        for row_idx, line in enumerate(f):
+            if row_ptr >= n_selected:
+                break
+            target_idx = int(selected[row_ptr])
+            if row_idx < target_idx:
+                continue
+            if row_idx > target_idx:
+                raise ValueError(
+                    "BIM row count mismatch while refining selected SNP rows: "
+                    f"missing source row {target_idx} before {row_idx}."
+                )
+            tok = _split_tokens(line.strip())
+            if len(tok) < 6:
+                raise ValueError(
+                    f"Invalid BIM row at {bim_path}:{row_idx + 1} (need >=6 columns)."
+                )
+            chrom = str(tok[0])
+            pos = int(float(tok[3]))
+            snp = str(tok[1]).strip()
+            if snp == "" or snp == ".":
+                snp = f"{chrom}_{pos}"
+            site = SiteInfo(chrom, int(pos), snp, str(tok[4]), str(tok[5]))
+            ok = _site_passes_direct_expr(
+                site,
+                site_set=site_set,
+                bim_range=bim_norm,
+                chr_set=chr_set,
+                bp_min=bp_lo,
+                bp_max=bp_hi,
+                ranges=ranges_norm,
+            )
+            if ok and require_simple_snp:
+                ok = _site_is_simple_snp(site)
+            if ok:
+                out_idx.append(target_idx)
+            row_ptr += 1
+    if row_ptr != n_selected:
+        raise ValueError(
+            "BIM row count mismatch while refining selected SNP rows: "
+            f"resolved={row_ptr}, expected={n_selected}."
+        )
+    return np.ascontiguousarray(np.asarray(out_idx, dtype=np.int64), dtype=np.int64)
+
+
+def _resolve_plink_selected_snp_indices_for_prune(
+    *,
+    src_prefix: str,
+    maf_threshold: float,
+    max_missing_rate: float,
+    het_threshold: float,
+    snps_only: bool,
+    biallelic_only: bool,
+    snp_sites: list[tuple[str, int]] | None,
+    bim_range: tuple[str, int, int] | None,
+    chr_keys: list[str] | None,
+    bp_min: int | None,
+    bp_max: int | None,
+    ranges: list[tuple[str, int, int]] | None,
+    threads: int,
+) -> np.ndarray:
+    require_simple_snp = _simple_snp_only_requested(
+        snps_only=bool(snps_only),
+        biallelic_only=bool(biallelic_only),
+    )
+    needs_bed_stats = bool(
+        float(maf_threshold) > 0.0
+        or float(max_missing_rate) < 1.0
+        or float(het_threshold) > 0.0
+    )
+    if not needs_bed_stats:
+        return _scan_plink_selected_snp_indices_from_bim(
+            str(src_prefix),
+            snp_sites=snp_sites,
+            bim_range=bim_range,
+            chr_keys=chr_keys,
+            bp_min=bp_min,
+            bp_max=bp_max,
+            ranges=ranges,
+            require_simple_snp=require_simple_snp,
+        )
+
+    mmap_window_mb = _resolve_prune_mask_mmap_window_mb()
+    row_idx_raw, _miss, _maf, _row_flip, _site_keep, _n_samples, _n_total_sites = prepare_bed_logic_meta_selected(
+        str(src_prefix),
+        sample_indices=None,
+        maf_threshold=float(maf_threshold),
+        max_missing_rate=float(max_missing_rate),
+        het_threshold=float(het_threshold),
+        snps_only=bool(require_simple_snp),
+        mmap_window_mb=mmap_window_mb,
+        threads=max(1, int(threads)),
+    )
+    selected = np.ascontiguousarray(
+        np.asarray(row_idx_raw, dtype=np.int64).reshape(-1),
+        dtype=np.int64,
+    )
+    return _refine_plink_selected_snp_indices(
+        str(src_prefix),
+        selected,
+        snp_sites=snp_sites,
+        bim_range=bim_range,
+        chr_keys=chr_keys,
+        bp_min=bp_min,
+        bp_max=bp_max,
+        ranges=ranges,
+        require_simple_snp=False,
+    )
+
+
 def _filter_chunk_by_site(
     geno: np.ndarray,
     sites: list[SiteInfo],
@@ -1472,6 +1706,78 @@ def _ld_prune_with_mask_first_streaming_pipeline(
     if total_n != pre_n:
         raise ValueError(
             f"Rust mask-stream prune pre-count mismatch: got {total_n}, expected {pre_n}"
+        )
+    if keep_n <= 0:
+        raise ValueError(
+            "All variants were filtered out by LD prune; "
+            "try a looser --prune r^2 threshold or larger window."
+        )
+    return keep_n, pre_n, float(time.time() - t0)
+
+
+def _ld_prune_with_selected_first_streaming_pipeline(
+    *,
+    src_prefix: str,
+    out_prefix: str,
+    spec: PruneSpec,
+    threads: int,
+    maf_threshold: float,
+    max_missing_rate: float,
+    het_threshold: float,
+    snps_only: bool,
+    biallelic_only: bool,
+    snp_sites: list[tuple[str, int]] | None,
+    bim_range: tuple[str, int, int] | None,
+    chr_keys: list[str] | None,
+    bp_min: int | None,
+    bp_max: int | None,
+    ranges: list[tuple[str, int, int]] | None,
+    max_output_sites: int | None = None,
+) -> tuple[int, int, float]:
+    if _bed_prune_selected_to_plink_rust is None:
+        raise RuntimeError(
+            "Rust selected-stream prune backend is unavailable. Rebuild JanusX extension."
+        )
+    t0 = time.time()
+    selected_snp_indices = _resolve_plink_selected_snp_indices_for_prune(
+        src_prefix=str(src_prefix),
+        maf_threshold=float(maf_threshold),
+        max_missing_rate=float(max_missing_rate),
+        het_threshold=float(het_threshold),
+        snps_only=bool(snps_only),
+        biallelic_only=bool(biallelic_only),
+        snp_sites=snp_sites,
+        bim_range=bim_range,
+        chr_keys=chr_keys,
+        bp_min=bp_min,
+        bp_max=bp_max,
+        ranges=ranges,
+        threads=max(1, int(threads)),
+    )
+    pre_n = int(selected_snp_indices.shape[0])
+    if pre_n <= 0:
+        raise ValueError(
+            "All variants were filtered out before LD prune "
+            "(-extract/-chr/-from-bp/-to-bp/-maf/-geno/-het/--snps-only/--biallelic-only)."
+        )
+    keep_n, total_n = _bed_prune_selected_to_plink_rust(
+        src_prefix=str(src_prefix),
+        out_prefix=str(out_prefix),
+        selected_snp_indices=np.ascontiguousarray(selected_snp_indices, dtype=np.int64),
+        window_bp=(int(spec.window_bp) if spec.window_bp is not None else None),
+        window_variants=(
+            int(spec.window_variants) if spec.window_variants is not None else None
+        ),
+        step_variants=int(spec.step_variants),
+        r2_threshold=float(spec.r2_threshold),
+        threads=int(threads),
+        max_output_sites=max_output_sites,
+    )
+    keep_n = int(keep_n)
+    total_n = int(total_n)
+    if total_n != pre_n:
+        raise ValueError(
+            f"Rust selected-stream prune pre-count mismatch: got {total_n}, expected {pre_n}"
         )
     if keep_n <= 0:
         raise ValueError(
@@ -2951,11 +3257,20 @@ def main() -> None:
             and float(args.geno) >= 1.0
             and float(args.het) <= 0.0
         )
+        use_selected_stream_prune_direct = bool(
+            source_kind == "plink"
+            and out_fmt == "plink"
+            and keep_sample_ids is None
+            and has_prune_prefilters
+            and _bed_prune_selected_to_plink_rust is not None
+            and prune_streaming_io
+        )
         use_masked_stream_prune_direct = bool(
             source_kind == "plink"
             and out_fmt == "plink"
             and keep_sample_ids is None
             and has_prune_prefilters
+            and (not use_selected_stream_prune_direct)
             and _bed_prune_mask_to_plink_rust is not None
             and prune_streaming_io
         )
@@ -2982,7 +3297,10 @@ def main() -> None:
             and (not bool(site_type_snps_only))
             and (
                 keep_sample_ids is not None
-                or (not use_masked_stream_prune_direct)
+                or (
+                    (not use_selected_stream_prune_direct)
+                    and (not use_masked_stream_prune_direct)
+                )
             )
             and _bed_filter_to_plink_rust is not None
             and _bed_prune_to_plink_rust is not None
@@ -3213,7 +3531,35 @@ def main() -> None:
         else:
             with CliStatus(prune_desc, enabled=status_enabled) as task:
                 try:
-                    if use_masked_stream_prune_direct:
+                    if use_selected_stream_prune_direct:
+                        keep_n, pre_n, wall = _ld_prune_with_selected_first_streaming_pipeline(
+                            src_prefix=str(gfile),
+                            out_prefix=str(out_prefix),
+                            spec=prune_spec,
+                            threads=int(args.thread),
+                            maf_threshold=float(args.maf),
+                            max_missing_rate=float(args.geno),
+                            het_threshold=float(args.het),
+                            snps_only=bool(args.snps_only),
+                            biallelic_only=bool(args.biallelic_only),
+                            snp_sites=push_snp_sites,
+                            bim_range=push_bim_range,
+                            chr_keys=(
+                                sorted(list(post_filter.chr_keys))
+                                if post_filter.chr_keys
+                                else None
+                            ),
+                            bp_min=(int(post_filter.bp_min) if post_filter.bp_min is not None else None),
+                            bp_max=(int(post_filter.bp_max) if post_filter.bp_max is not None else None),
+                            ranges=post_filter.ranges,
+                            max_output_sites=output_site_limit,
+                        )
+                        rust_prune_direct_wall = float(wall)
+                        prune_pre_sites = int(pre_n)
+                        selected_n_sites = int(keep_n)
+                        rust_prune_direct_done = True
+                        prune_direct_backend = "rust-selected+stream-io"
+                    elif use_masked_stream_prune_direct:
                         keep_n, pre_n, wall = _ld_prune_with_mask_first_streaming_pipeline(
                             src_prefix=str(gfile),
                             out_prefix=str(out_prefix),

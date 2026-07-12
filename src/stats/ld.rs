@@ -627,6 +627,169 @@ fn normalize_chr_token(s: &str) -> String {
     }
 }
 
+#[inline]
+fn normalize_direct_filter_chr_key(s: &str) -> String {
+    let mut t = normalize_chr_token(s).trim().to_ascii_uppercase();
+    if t == "M" {
+        t = "MT".to_string();
+    }
+    t
+}
+
+#[inline]
+fn is_simple_snp_allele_local(allele: &str) -> bool {
+    let a = allele.trim().to_ascii_uppercase();
+    matches!(a.as_str(), "A" | "C" | "G" | "T")
+}
+
+#[inline]
+fn is_simple_biallelic_snp_local(ref_allele: &str, alt_allele: &str) -> bool {
+    let ref_a = ref_allele.trim().to_ascii_uppercase();
+    let alt_a = alt_allele.trim().to_ascii_uppercase();
+    if ref_a.is_empty()
+        || alt_a.is_empty()
+        || ref_a == "."
+        || alt_a == "."
+        || ref_a.contains(',')
+        || alt_a.contains(',')
+        || ref_a == alt_a
+    {
+        return false;
+    }
+    ref_a.len() == 1
+        && alt_a.len() == 1
+        && is_simple_snp_allele_local(&ref_a)
+        && is_simple_snp_allele_local(&alt_a)
+}
+
+fn parse_bim_line_direct_filter_site(
+    line: &str,
+    line_no: usize,
+    path: &str,
+) -> Result<(String, i64, String, String), String> {
+    let trimmed = line.trim_end_matches(&['\r', '\n'][..]);
+    let cols: Vec<&str> = trimmed.split_whitespace().collect();
+    if cols.len() < 6 {
+        return Err(format!(
+            "{path}:{line_no}: invalid BIM row (need >= 6 columns)"
+        ));
+    }
+    let chrom = normalize_direct_filter_chr_key(cols[0]);
+    let pos = cols[3]
+        .parse::<f64>()
+        .map_err(|e| format!("{path}:{line_no}: invalid BIM position: {e}"))? as i64;
+    Ok((chrom, pos, cols[4].to_string(), cols[5].to_string()))
+}
+
+fn build_direct_filter_range_map(
+    ranges: &[(String, i64, i64)],
+) -> Result<HashMap<String, Vec<(i64, i64)>>, String> {
+    let mut out: HashMap<String, Vec<(i64, i64)>> = HashMap::new();
+    for (i, (chrom_raw, start_raw, end_raw)) in ranges.iter().enumerate() {
+        let chrom = normalize_direct_filter_chr_key(chrom_raw);
+        let mut start = *start_raw;
+        let mut end = *end_raw;
+        if start < 0 || end < 0 {
+            return Err(format!(
+                "ranges[{i}] start/end must be >= 0, got ({start}, {end})"
+            ));
+        }
+        if start > end {
+            std::mem::swap(&mut start, &mut end);
+        }
+        out.entry(chrom).or_default().push((start, end));
+    }
+    Ok(out)
+}
+
+fn scan_selected_snp_indices_from_bim(
+    prefix: &str,
+    snp_sites: Option<&[(String, i64)]>,
+    bim_range: Option<&(String, i64, i64)>,
+    chr_keys: Option<&[String]>,
+    bp_min: Option<i64>,
+    bp_max: Option<i64>,
+    ranges: Option<&[(String, i64, i64)]>,
+    require_simple_snp: bool,
+) -> Result<Vec<i64>, String> {
+    let bim_path = format!("{prefix}.bim");
+    let file = File::open(&bim_path).map_err(|e| format!("{bim_path}: {e}"))?;
+    let reader = BufReader::with_capacity(8 * 1024 * 1024, file);
+
+    let selected_sites: Option<HashSet<(String, i64)>> = snp_sites.map(|pairs| {
+        let mut set = HashSet::with_capacity(pairs.len());
+        for (chrom, pos) in pairs.iter() {
+            set.insert((normalize_direct_filter_chr_key(chrom), *pos));
+        }
+        set
+    });
+    let normalized_bim_range: Option<(String, i64, i64)> = bim_range.map(|(chrom, start, end)| {
+        let mut start2 = *start;
+        let mut end2 = *end;
+        if start2 > end2 {
+            std::mem::swap(&mut start2, &mut end2);
+        }
+        (normalize_direct_filter_chr_key(chrom), start2, end2)
+    });
+    let normalized_chr_keys: Option<HashSet<String>> = chr_keys.map(|keys| {
+        keys.iter()
+            .map(|k| normalize_direct_filter_chr_key(k))
+            .collect()
+    });
+    let normalized_ranges = match ranges {
+        Some(v) => Some(build_direct_filter_range_map(v)?),
+        None => None,
+    };
+
+    let mut out_idx: Vec<i64> = Vec::new();
+    for (line_no0, line_res) in reader.lines().enumerate() {
+        let line_no = line_no0 + 1;
+        let line = line_res.map_err(|e| format!("{bim_path}:{line_no}: {e}"))?;
+        let (chrom, pos, ref_allele, alt_allele) =
+            parse_bim_line_direct_filter_site(&line, line_no, &bim_path)?;
+
+        if let Some(site_set) = selected_sites.as_ref() {
+            if !site_set.contains(&(chrom.clone(), pos)) {
+                continue;
+            }
+        }
+        if let Some((range_chr, range_start, range_end)) = normalized_bim_range.as_ref() {
+            if chrom != *range_chr || pos < *range_start || pos > *range_end {
+                continue;
+            }
+        }
+        if let Some(chr_set) = normalized_chr_keys.as_ref() {
+            if !chr_set.contains(&chrom) {
+                continue;
+            }
+        }
+        if let Some(min_bp) = bp_min {
+            if pos < min_bp {
+                continue;
+            }
+        }
+        if let Some(max_bp) = bp_max {
+            if pos > max_bp {
+                continue;
+            }
+        }
+        if let Some(range_map) = normalized_ranges.as_ref() {
+            let Some(chrom_ranges) = range_map.get(&chrom) else {
+                continue;
+            };
+            if !pos_in_ranges(pos, chrom_ranges.as_slice()) {
+                continue;
+            }
+        }
+        if require_simple_snp && !is_simple_biallelic_snp_local(&ref_allele, &alt_allele) {
+            continue;
+        }
+        out_idx.push(line_no0 as i64);
+    }
+
+    Ok(out_idx)
+}
+
 fn build_bimrange_map(
     chrom_ranges: &[String],
     start_bp: &[i64],
@@ -659,6 +822,49 @@ fn build_bimrange_map(
         out.entry(chrom).or_default().push((s, e));
     }
     Ok(out)
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    prefix,
+    snp_sites=None,
+    bim_range=None,
+    chr_keys=None,
+    bp_min=None,
+    bp_max=None,
+    ranges=None,
+    require_simple_snp=false
+))]
+pub fn scan_plink_selected_snp_indices_from_bim_rust<'py>(
+    py: Python<'py>,
+    prefix: String,
+    snp_sites: Option<Vec<(String, i64)>>,
+    bim_range: Option<(String, i64, i64)>,
+    chr_keys: Option<Vec<String>>,
+    bp_min: Option<i64>,
+    bp_max: Option<i64>,
+    ranges: Option<Vec<(String, i64, i64)>>,
+    require_simple_snp: bool,
+) -> PyResult<Bound<'py, PyArray1<i64>>> {
+    let normalized_prefix = normalize_plink_prefix(&prefix);
+    if normalized_prefix.is_empty() {
+        return Err(PyRuntimeError::new_err("prefix must not be empty"));
+    }
+    let out = py
+        .detach(|| {
+            scan_selected_snp_indices_from_bim(
+                &normalized_prefix,
+                snp_sites.as_deref(),
+                bim_range.as_ref(),
+                chr_keys.as_deref(),
+                bp_min,
+                bp_max,
+                ranges.as_deref(),
+                require_simple_snp,
+            )
+        })
+        .map_err(map_err_string_to_py)?;
+    Ok(PyArray1::from_vec(py, out).into_bound())
 }
 
 #[inline]
@@ -1358,10 +1564,7 @@ fn build_selected_bim_stream_scan(
     if selected_source_indices.is_empty() {
         return Err("selected_snp_indices is empty".to_string());
     }
-    if selected_source_indices
-        .windows(2)
-        .any(|w| w[0] >= w[1])
-    {
+    if selected_source_indices.windows(2).any(|w| w[0] >= w[1]) {
         return Err("selected_snp_indices must be strictly increasing".to_string());
     }
 
@@ -2652,8 +2855,7 @@ fn process_stream_selected_chrom_block(
         }
         bim_source_idx = bim_source_idx.saturating_add(1);
         let bim_line_trimmed = line_buf.trim_end_matches(&['\r', '\n'][..]);
-        let (_chrom, pos) =
-            parse_bim_line_chrom_pos(bim_line_trimmed, source_idx + 1, &src_bim)?;
+        let (_chrom, pos) = parse_bim_line_chrom_pos(bim_line_trimmed, source_idx + 1, &src_bim)?;
 
         match prev_source_idx_opt {
             None => {}

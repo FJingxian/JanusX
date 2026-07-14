@@ -42,6 +42,7 @@ import subprocess
 import importlib
 import os
 import re
+import shutil
 import difflib
 import textwrap
 from datetime import date
@@ -366,6 +367,25 @@ def _print_help() -> None:
     _print_cli_help()
 
 
+def _resolve_launcher_executable() -> str:
+    argv0 = str(sys.argv[0] if len(sys.argv) > 0 else "").strip()
+    if argv0 == "":
+        return ""
+    prog = Path(argv0).name.strip()
+    if prog == "":
+        return ""
+    prog_lower = prog.lower()
+    if not (prog_lower == "jx" or prog_lower.startswith("jxpy")):
+        return ""
+    which = shutil.which(prog)
+    if which:
+        return str(Path(which).resolve())
+    cand = Path(argv0).expanduser()
+    if cand.exists() and cand.is_file():
+        return str(cand.resolve())
+    return ""
+
+
 def main():
     install_interrupt_handlers()
     if sys.version_info < (3, 10):
@@ -379,6 +399,10 @@ def main():
         prog = Path(sys.argv[0]).name.lower() if len(sys.argv) > 0 else ""
         if prog.startswith("jxpy"):
             os.environ["JANUSX_ENTRYPOINT"] = "jxpy"
+    if str(os.environ.get("JANUSX_EXECUTABLE", "")).strip() == "":
+        launcher_exe = _resolve_launcher_executable()
+        if launcher_exe:
+            os.environ["JANUSX_EXECUTABLE"] = launcher_exe
     if len(sys.argv) > 1:
         if sys.argv[1] == '-h' or sys.argv[1] == '--help':
             _print_help()

@@ -897,15 +897,46 @@ def _is_executable_file(path: Path) -> bool:
     return path.exists() and path.is_file() and os.access(str(path), os.X_OK)
 
 
+def _append_subcmd_candidate(
+    cands: list[list[str]],
+    seen: set[tuple[str, ...]],
+    cmd: list[str],
+) -> None:
+    key = tuple(str(part) for part in cmd)
+    if key in seen:
+        return
+    seen.add(key)
+    cands.append([str(part) for part in cmd])
+
+
 def _resolve_jx_subcmd_candidates(subcmd: str) -> list[list[str]]:
     cands: list[list[str]] = []
+    seen: set[tuple[str, ...]] = set()
+    launcher_exe = str(os.environ.get("JANUSX_EXECUTABLE", "")).strip()
+    if launcher_exe:
+        launcher_path = Path(launcher_exe).expanduser()
+        if _is_executable_file(launcher_path):
+            _append_subcmd_candidate(cands, seen, [str(launcher_path), subcmd])
     env_bin = Path(sys.executable).resolve().parent
     jx = env_bin / "jx"
     jxpy = env_bin / "jxpy"
     if _is_executable_file(jx):
-        cands.append([str(jx), subcmd])
+        _append_subcmd_candidate(cands, seen, [str(jx), subcmd])
     if _is_executable_file(jxpy):
-        cands.append([str(jxpy), subcmd])
+        _append_subcmd_candidate(cands, seen, [str(jxpy), subcmd])
+    for prog in ("jx", "jxpy"):
+        which = shutil.which(prog)
+        if which:
+            cand = Path(which).expanduser()
+            if _is_executable_file(cand):
+                _append_subcmd_candidate(cands, seen, [str(cand.resolve()), subcmd])
+    py_exe = str(sys.executable or "").strip()
+    if py_exe != "":
+        _append_subcmd_candidate(
+            cands,
+            seen,
+            [py_exe, "-m", "janusx.script.JanusX", subcmd],
+        )
     return cands
 
 
@@ -914,7 +945,11 @@ def _pick_working_subcmd_cmd(subcmd: str) -> list[str]:
     if len(cands) > 0:
         return cands[0]
     env_bin = Path(sys.executable).resolve().parent
-    raise RuntimeError(f"No jx/jxpy executable found in current env: {env_bin}")
+    launcher_exe = str(os.environ.get("JANUSX_EXECUTABLE", "")).strip() or "unset"
+    raise RuntimeError(
+        "No working JanusX subcommand launcher candidate found. "
+        f"launcher_env={launcher_exe}, sys_executable={sys.executable}, env_bin={env_bin}"
+    )
 
 
 def _resolve_jx_gwas_cmd() -> list[str]:
@@ -1004,7 +1039,11 @@ def _collect_env_checks(args: argparse.Namespace, kernels: list[str]) -> list[En
             items.append(EnvCheck("janusx.gwas_cli", True, f"OK via `{used_cmd}`"))
         else:
             env_bin = Path(sys.executable).resolve().parent
-            detail = f"No jx/jxpy executable found in current env: {env_bin}"
+            launcher_exe = str(os.environ.get("JANUSX_EXECUTABLE", "")).strip() or "unset"
+            detail = (
+                "No working JanusX subcommand launcher candidate found. "
+                f"launcher_env={launcher_exe}, sys_executable={sys.executable}, env_bin={env_bin}"
+            )
             items.append(EnvCheck("janusx.gwas_cli", False, detail))
         if str(getattr(args, "pseudo_qtn_match", "exact")).strip().lower() == "ld":
             items.append(

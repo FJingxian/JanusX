@@ -11,7 +11,8 @@ source:
 
 build:
   number: 0
-  skip: true  # [win or py<310]
+  python_version_independent: true  # [py == 310]
+  skip: true  # [win or py<310 or py>310]
   script_env:
     - CARGO_BUILD_JOBS
   run_exports:
@@ -25,14 +26,15 @@ requirements:
     - {{ compiler('rust') }}
     - cargo-bundle-licenses
   host:
-    - python
+    - python 3.10.*
+    - python-abi3  # [py == 310]
     - pip
     - maturin >=1.7,<2
     - numpy >=1.23
     - zlib
     - openblas
   run:
-    - python
+    - python >=3.10
     - {{ pin_compatible('numpy') }}
     - libopenblas
     - scipy

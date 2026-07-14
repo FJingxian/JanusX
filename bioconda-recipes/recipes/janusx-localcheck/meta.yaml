@@ -10,7 +10,8 @@ source:
 
 build:
   number: 0
-  skip: true  # [py<310]
+  python_version_independent: true  # [py == 310]
+  skip: true  # [py<310 or py>310]
   script_env:
     - JANUSX_NET_MODE
     - JANUSX_CARGO_REGISTRY
@@ -39,13 +40,14 @@ requirements:
     - {{ compiler('rust') }}
     - cargo-bundle-licenses
   host:
-    - python
+    - python 3.10.*
+    - python-abi3  # [py == 310]
     - pip
     - maturin >=1.7,<2
     - numpy >=1.23
     - openblas
   run:
-    - python
+    - python >=3.10
     - {{ pin_compatible('numpy') }}
     - scipy
     - pandas >=1.5

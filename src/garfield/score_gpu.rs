@@ -4,6 +4,7 @@ use super::score::{
     score_cont_centered_gain_from_sum_and_n_hit, score_cont_centered_gain_packed_with_n_hit,
     validate_continuous_y, ContinuousRuleScore,
 };
+use crate::stats_common::{check_ctrlc, interrupt_requested, INTERRUPTED_MSG};
 use numpy::ndarray::Array1;
 use numpy::{PyArray1, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods};
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
@@ -99,14 +100,17 @@ fn build_score_parts_from_sum_hit(
     n_samples: usize,
     total_sum: f64,
     row_words: usize,
-) -> BatchScoreParts {
+) -> Result<BatchScoreParts, String> {
     let n_rows = sum_hit.len();
     let mut raw_score = Vec::with_capacity(n_rows);
     let mut mean_hit = Vec::with_capacity(n_rows);
     let mut mean_miss = Vec::with_capacity(n_rows);
     let mut support_frac = Vec::with_capacity(n_rows);
     let mut n_miss = Vec::with_capacity(n_rows);
-    for (&sum_hit_i, &n_hit_i) in sum_hit.iter().zip(n_hit.iter()) {
+    for (idx, (&sum_hit_i, &n_hit_i)) in sum_hit.iter().zip(n_hit.iter()).enumerate() {
+        if (idx & 255) == 0 {
+            check_interrupt_fast()?;
+        }
         let sc = score_cont_centered_gain_from_sum_and_n_hit(
             total_sum,
             sum_hit_i,
@@ -119,7 +123,7 @@ fn build_score_parts_from_sum_hit(
         support_frac.push(sc.support_frac);
         n_miss.push(sc.n_miss as u32);
     }
-    BatchScoreParts {
+    Ok(BatchScoreParts {
         raw_score,
         mean_hit,
         mean_miss,
@@ -131,7 +135,7 @@ fn build_score_parts_from_sum_hit(
         n_rows,
         row_words,
         n_samples,
-    }
+    })
 }
 
 fn score_cont_centered_gain_batch_packed_cpu_impl(
@@ -142,6 +146,7 @@ fn score_cont_centered_gain_batch_packed_cpu_impl(
     n_samples: usize,
 ) -> Result<BatchScoreParts, String> {
     const CTX: &str = "garfield_score_cont_centered_gain_batch_packed_cpu";
+    check_ctrlc()?;
     validate_batch_shape(y, row_words, n_rows, n_samples, CTX)?;
     if bits_flat.len() != row_words.saturating_mul(n_rows) {
         return Err(format!(
@@ -156,14 +161,15 @@ fn score_cont_centered_gain_batch_packed_cpu_impl(
     let mut sum_hit = Vec::with_capacity(n_rows);
     let mut n_hit = Vec::with_capacity(n_rows);
     for rid in 0..n_rows {
+        if (rid & 63) == 0 {
+            check_interrupt_fast()?;
+        }
         let row = &bits_flat[rid * row_words..(rid + 1) * row_words];
         let (n1, s1) = count_sum_y_where_bit1_row(row, y, n_samples);
         n_hit.push(n1);
         sum_hit.push(s1);
     }
-    Ok(build_score_parts_from_sum_hit(
-        sum_hit, n_hit, n_samples, total_sum, row_words,
-    ))
+    build_score_parts_from_sum_hit(sum_hit, n_hit, n_samples, total_sum, row_words)
 }
 
 fn batch_score_parts_to_pydict<'py>(
@@ -281,9 +287,14 @@ fn batch_parts_row_to_score(parts: &BatchScoreParts, row_idx: usize) -> Continuo
 }
 
 #[inline]
-fn singleton_scores_from_positive_parts(parts: &BatchScoreParts) -> Vec<ContinuousRuleScore> {
+fn singleton_scores_from_positive_parts(
+    parts: &BatchScoreParts,
+) -> Result<Vec<ContinuousRuleScore>, String> {
     let mut out = Vec::with_capacity(parts.n_rows.saturating_mul(2));
     for row_idx in 0..parts.n_rows {
+        if (row_idx & 255) == 0 {
+            check_interrupt_fast()?;
+        }
         out.push(batch_parts_row_to_score(parts, row_idx));
         out.push(score_cont_centered_gain_from_sum_and_n_hit(
             parts.total_sum,
@@ -294,7 +305,7 @@ fn singleton_scores_from_positive_parts(parts: &BatchScoreParts) -> Vec<Continuo
                 .saturating_sub(parts.n_hit[row_idx] as usize),
         ));
     }
-    out
+    Ok(out)
 }
 
 pub(crate) fn score_cont_centered_gain_singletons_packed_legacy_impl(
@@ -305,6 +316,7 @@ pub(crate) fn score_cont_centered_gain_singletons_packed_legacy_impl(
     n_samples: usize,
 ) -> Result<Vec<ContinuousRuleScore>, String> {
     const CTX: &str = "garfield_score_cont_centered_gain_singletons_packed_legacy";
+    check_ctrlc()?;
     validate_batch_shape(y, row_words, n_rows, n_samples, CTX)?;
     if bits_flat.len() != row_words.saturating_mul(n_rows) {
         return Err(format!(
@@ -319,6 +331,9 @@ pub(crate) fn score_cont_centered_gain_singletons_packed_legacy_impl(
     let needed_words = words_for_samples(n_samples);
     let mut out = Vec::with_capacity(n_rows.saturating_mul(2));
     for row_idx in 0..n_rows {
+        if (row_idx & 63) == 0 {
+            check_interrupt_fast()?;
+        }
         let start = row_idx * row_words;
         let row = &bits_flat[start..start + needed_words];
         let n_hit = count_sum_y_where_bit1_row(row, y, n_samples).0 as usize;
@@ -338,6 +353,15 @@ pub(crate) fn score_cont_centered_gain_singletons_packed_legacy_impl(
     Ok(out)
 }
 
+#[inline]
+fn check_interrupt_fast() -> Result<(), String> {
+    if interrupt_requested() {
+        Err(INTERRUPTED_MSG.to_string())
+    } else {
+        Ok(())
+    }
+}
+
 pub(crate) fn score_cont_centered_gain_singletons_packed_cpu_impl(
     y: &[f64],
     bits_flat: &[u64],
@@ -345,11 +369,9 @@ pub(crate) fn score_cont_centered_gain_singletons_packed_cpu_impl(
     n_rows: usize,
     n_samples: usize,
 ) -> Result<Vec<ContinuousRuleScore>, String> {
-    Ok(singleton_scores_from_positive_parts(
-        &score_cont_centered_gain_batch_packed_cpu_impl(
-            y, bits_flat, row_words, n_rows, n_samples,
-        )?,
-    ))
+    singleton_scores_from_positive_parts(&score_cont_centered_gain_batch_packed_cpu_impl(
+        y, bits_flat, row_words, n_rows, n_samples,
+    )?)
 }
 
 fn score_cont_centered_gain_singletons_packed_gpu_impl(
@@ -362,7 +384,7 @@ fn score_cont_centered_gain_singletons_packed_gpu_impl(
     let (parts, _device_name, _meta) = score_cont_centered_gain_batch_packed_metal_impl(
         y, bits_flat, row_words, n_rows, n_samples, None,
     )?;
-    Ok(singleton_scores_from_positive_parts(&parts))
+    singleton_scores_from_positive_parts(&parts)
 }
 
 #[inline]
@@ -1466,7 +1488,7 @@ fn score_cont_centered_gain_batch_packed_metal_impl(
                     Ok((sum_hit, n_hit, total_sum, device_name, meta))
                 })?;
             let parts =
-                build_score_parts_from_sum_hit(sum_hit, n_hit, n_samples, total_sum, row_words);
+                build_score_parts_from_sum_hit(sum_hit, n_hit, n_samples, total_sum, row_words)?;
             Ok((parts, device_name, meta))
         });
     }
@@ -1604,7 +1626,7 @@ pub fn garfield_compare_score_cont_centered_gain_batch_metal_vs_cpu_py<'py>(
                         n_samples,
                         total_sum,
                         row_words,
-                    );
+                    )?;
                     let (sum_hit_opt, n_hit_opt, _opt_total_sum, _opt_meta) = scanner
                         .run_sum_hit_n_hit_optimized_from_f64(
                             yv, bits_flat, row_words, n_rows, n_samples,
@@ -1615,7 +1637,7 @@ pub fn garfield_compare_score_cont_centered_gain_batch_metal_vs_cpu_py<'py>(
                         n_samples,
                         total_sum,
                         row_words,
-                    );
+                    )?;
                 }
             }
 
@@ -1659,7 +1681,7 @@ pub fn garfield_compare_score_cont_centered_gain_batch_metal_vs_cpu_py<'py>(
                     n_samples,
                     total_sum,
                     row_words,
-                ));
+                )?);
                 legacy_meta_last = Some(legacy_meta);
 
                 let t2 = Instant::now();
@@ -1686,7 +1708,7 @@ pub fn garfield_compare_score_cont_centered_gain_batch_metal_vs_cpu_py<'py>(
                     n_samples,
                     total_sum,
                     row_words,
-                ));
+                )?);
                 opt_meta_last = Some(opt_meta);
             }
 

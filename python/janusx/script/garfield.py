@@ -1,22 +1,29 @@
 import argparse
 import json
+import logging
 import os
 import re
 import socket
+import threading
 import time
 from typing import Optional
 
 import numpy as np
 import pandas as pd
+import psutil
 
 from janusx.assoc.workflow import (
+    _format_cli_finished_timestamp,
+    _gwas_terminal_config_line_max_chars,
     _inspect_genotype_with_status,
     _load_covariates_for_models,
     _load_phenotype_with_status,
+    _terminal_saved_result_paths,
     load_or_build_grm_with_cache,
     run_fvlmm_packed_fullrank,
 )
 from janusx.assoc.workflow_cache import _gwas_cache_prefix_with_params
+from janusx.gfreader import prepare_bed_logic_keep_mask_pure_line
 from janusx.gtools.reader import readanno
 from janusx.script._common.cli_args import (
     add_common_covariate_file_or_site_arg,
@@ -36,6 +43,9 @@ from janusx.script._common.genocache import configure_genotype_cache_from_out
 from janusx.script._common.grmio import load_and_align_grm
 from janusx.script._common.cli_core import CliArgumentParser, cli_help_formatter
 from janusx.script._common.log import setup_logging
+from janusx.script._common.memory import (
+    resolve_decode_mmap_window_mb as _common_resolve_decode_mmap_window_mb,
+)
 from janusx.script._common.pathcheck import (
     ensure_all_true,
     ensure_file_exists,
@@ -46,7 +56,6 @@ from janusx.script._common.progress import (
     CliStatus,
     ProgressAdapter,
     build_rich_progress,
-    log_success,
     print_failure,
     rich_progress_available,
     stdout_is_tty,
@@ -57,7 +66,7 @@ from janusx.script._common.threads import (
     detect_effective_threads,
     format_requested_thread_usage,
 )
-from janusx.assoc.workflow_ui import _emit_plain_info_line
+from janusx.assoc.workflow_ui import _emit_plain_info_line, _rich_success
 
 
 try:
@@ -70,6 +79,135 @@ else:
 
 # Python 仅负责 CLI 调度；训练/测试划分、null-model 残差化、ML 候选筛选、
 # beam search 与最终导出都由 Rust 端统一完成。
+
+
+def _current_bed_memory_mb() -> float:
+    try:
+        mb = float(os.environ.get("JX_BED_BLOCK_TARGET_MB", "512"))
+    except Exception:
+        return 512.0
+    return mb if np.isfinite(mb) and mb > 0.0 else 512.0
+
+
+def _env_truthy(name: str) -> bool:
+    raw = str(os.environ.get(name, "")).strip().lower()
+    return raw in {"1", "true", "yes", "y", "on"}
+
+
+def _garfield_rss_debug_enabled() -> bool:
+    return _env_truthy("JX_GARFIELD_RSS_DEBUG")
+
+
+def _format_mem_bytes(value: object) -> str:
+    if value is None:
+        return "NA"
+    try:
+        b = int(value)
+    except Exception:
+        return "NA"
+    if b <= 0:
+        return "NA"
+    kib = 1024.0
+    mib = kib * 1024.0
+    gib = mib * 1024.0
+    if b >= gib:
+        return f"{b / gib:.2f} GiB"
+    if b >= mib:
+        return f"{b / mib:.1f} MiB"
+    if b >= kib:
+        return f"{b / kib:.1f} KiB"
+    return f"{b} B"
+
+
+class _GarfieldRssSampler:
+    def __init__(self, interval_s: float = 0.05):
+        self._process = psutil.Process(os.getpid())
+        self._interval_s = max(0.01, float(interval_s))
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._start_rss_bytes: Optional[int] = None
+        self._end_rss_bytes: Optional[int] = None
+        self._observed_peak_rss_bytes: Optional[int] = None
+        self._samples = 0
+
+    def _sample_once(self) -> None:
+        try:
+            rss_now = int(self._process.memory_info().rss)
+        except Exception:
+            return
+        if rss_now <= 0:
+            return
+        self._samples += 1
+        if self._start_rss_bytes is None:
+            self._start_rss_bytes = rss_now
+        self._end_rss_bytes = rss_now
+        self._observed_peak_rss_bytes = max(
+            int(self._observed_peak_rss_bytes or 0),
+            rss_now,
+        )
+
+    def __enter__(self):
+        self._sample_once()
+
+        def _worker() -> None:
+            while not self._stop.wait(self._interval_s):
+                self._sample_once()
+
+        self._thread = threading.Thread(target=_worker, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=max(0.2, self._interval_s * 4.0))
+            self._thread = None
+        self._sample_once()
+
+    def summary(self) -> dict[str, object]:
+        return {
+            "metric": "rss",
+            "samples": int(self._samples),
+            "start_current_bytes": self._start_rss_bytes,
+            "start_rss_bytes": self._start_rss_bytes,
+            "start_footprint_bytes": None,
+            "end_current_bytes": self._end_rss_bytes,
+            "end_rss_bytes": self._end_rss_bytes,
+            "end_footprint_bytes": None,
+            "observed_peak_current_bytes": self._observed_peak_rss_bytes,
+            "observed_peak_rss_bytes": self._observed_peak_rss_bytes,
+            "observed_peak_footprint_bytes": None,
+        }
+
+
+def _emit_garfield_rss_checkpoint(
+    logger,
+    stage: str,
+    payload: object,
+) -> None:
+    if not isinstance(payload, dict):
+        return
+    samples = int(payload.get("samples") or 0)
+    start_rss = payload.get("start_rss_bytes") or payload.get("start_current_bytes")
+    end_rss = payload.get("end_rss_bytes") or payload.get("end_current_bytes")
+    peak_rss = payload.get("observed_peak_rss_bytes") or payload.get(
+        "observed_peak_current_bytes"
+    )
+    peak_footprint = payload.get("observed_peak_footprint_bytes")
+    if start_rss is None and end_rss is None and peak_rss is None and peak_footprint is None:
+        return
+    metric = payload.get("metric") or "rss"
+    parts = [
+        f"[GARFIELD-RSS] stage={stage}",
+        f"metric={metric}",
+        f"rss_start={_format_mem_bytes(start_rss)}",
+        f"rss_end={_format_mem_bytes(end_rss)}",
+        f"rss_peak={_format_mem_bytes(peak_rss)}",
+    ]
+    if peak_footprint is not None:
+        parts.append(f"footprint_peak={_format_mem_bytes(peak_footprint)}")
+    parts.append(f"samples={samples}")
+    logger.info(" ".join(parts))
 
 
 class _GarfieldPhenoLogger:
@@ -284,6 +422,72 @@ def _ensure_followup_grm(
     )
 
 
+def _prepare_site_keep(
+    *,
+    genofile: str,
+    sample_ids: list[str],
+    sample_index_map: dict[str, int],
+    n_snps: int,
+    maf_threshold: float,
+    max_missing_rate: float,
+    snps_only: bool,
+    threads: int,
+    use_spinner: bool,
+    global_stats: bool,
+) -> np.ndarray:
+    if len(sample_ids) == 0:
+        raise ValueError("GARFIELD metadata statistics require at least one sample.")
+    sample_indices = np.asarray(
+        [int(sample_index_map[str(sid)]) for sid in sample_ids],
+        dtype=np.int64,
+    )
+    if bool(global_stats):
+        task_label = "Computing global row statistics..."
+        fail_label = "Computing global row statistics ...Failed"
+        done_label = "Computing global row statistics ...Finished"
+    else:
+        task_label = "Computing trait-subset row statistics..."
+        fail_label = "Computing trait-subset row statistics ...Failed"
+        done_label = "Computing trait-subset row statistics ...Finished"
+    mmap_window_mb = _common_resolve_decode_mmap_window_mb(
+        str(genofile),
+        int(len(sample_ids)),
+        int(max(1, int(n_snps))),
+        _current_bed_memory_mb(),
+        needs_copy=False,
+        buffers=1,
+    )
+    with CliStatus(task_label, enabled=bool(use_spinner), use_process=True) as task:
+        try:
+            site_keep_raw, _n_samples, n_total_sites = prepare_bed_logic_keep_mask_pure_line(
+                str(genofile),
+                sample_indices=sample_indices,
+                maf_threshold=float(maf_threshold),
+                max_missing_rate=float(max_missing_rate),
+                snps_only=bool(snps_only),
+                mmap_window_mb=(int(mmap_window_mb) if mmap_window_mb is not None else None),
+                threads=max(1, int(threads)),
+            )
+            site_keep = np.ascontiguousarray(
+                np.asarray(site_keep_raw, dtype=np.bool_).reshape(-1),
+                dtype=np.bool_,
+            )
+            if int(site_keep.shape[0]) != int(n_total_sites):
+                raise ValueError(
+                    "GARFIELD site_keep length mismatch: "
+                    f"mask={int(site_keep.shape[0])}, total={int(n_total_sites)}"
+                )
+            kept_n = int(np.count_nonzero(site_keep))
+            if kept_n <= 0:
+                raise ValueError("GARFIELD metadata statistics produced zero active SNPs.")
+        except BaseException:
+            task.fail(fail_label)
+            raise
+        suffix = "; reused across traits" if bool(global_stats) else ""
+        task.complete(f"{done_label} (nSNP={kept_n}{suffix})")
+    return site_keep
+
+
 def _run_garfield_pseudo_fastlmm(
     *,
     pseudo_prefix: str,
@@ -456,17 +660,66 @@ def _describe_rank_schedule(rank_score_runtime: str) -> str:
         return f"raw through layer {gain_start - 1}, gain from layer {gain_start}"
     return mode
 
+
+def _dedupe_saved_paths(paths: list[object]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for path in paths:
+        text = str(path or "").strip()
+        if text == "" or text in seen:
+            continue
+        seen.add(text)
+        out.append(text)
+    return out
+
+
+def _emit_garfield_saved_paths(
+    logger,
+    paths: list[object],
+    *,
+    use_spinner: bool,
+) -> None:
+    saved = _terminal_saved_result_paths(_dedupe_saved_paths(paths))
+    if len(saved) == 0:
+        return
+    if len(saved) == 1:
+        _rich_success(
+            logger,
+            f"Results saved to {format_path_for_display(saved[0])}",
+            use_spinner=bool(use_spinner),
+        )
+        return
+    body = "\n".join(f"  {format_path_for_display(path)}" for path in saved)
+    _rich_success(
+        logger,
+        f"Results saved:\n{body}",
+        use_spinner=bool(use_spinner),
+    )
+
+
 def _emit_garfield_summary_to_log(logger, summary_rows: list[dict[str, object]]) -> None:
     if len(summary_rows) == 0:
         return
-    logger.info("")
-    logger.info("GARFIELD summary")
-    logger.info("trait\tn_samples\tbest_score\troute")
+    headers = ["trait", "n_samples", "best_score", "route"]
+    rows: list[list[str]] = []
     for row in summary_rows:
-        logger.info(
-            f"{row['trait']}\t{int(row['n_samples'])}\t"
-            f"{float(row['best_score']):.12g}\t{row['route']}"
+        rows.append(
+            [
+                str(row.get("trait", "")),
+                f"{int(row.get('n_samples', 0))}",
+                f"{float(row.get('best_score', float('nan'))):.12g}",
+                str(row.get("route", "")),
+            ]
         )
+    widths = [len(x) for x in headers]
+    for row in rows:
+        for idx, value in enumerate(row):
+            widths[idx] = max(widths[idx], len(value))
+    logger.info("")
+    logger.info("[ GARFIELD Summary ]")
+    logger.info("  ".join(headers[idx].ljust(widths[idx]) for idx in range(len(headers))))
+    for row in rows:
+        logger.info("  ".join(row[idx].ljust(widths[idx]) for idx in range(len(row))))
 
 
 def _load_json_if_exists(path: Optional[str]):
@@ -502,6 +755,10 @@ def _split_structure_prior_payload(payload):
 
 class _GarfieldStageProgress:
     _HIDDEN_STAGES = {"null_prep", "structure_prep"}
+
+    @classmethod
+    def is_hidden_stage(cls, stage: object) -> bool:
+        return str(stage).strip().lower() in cls._HIDDEN_STAGES
 
     def __init__(self, *, scan_desc: str, enabled: bool) -> None:
         self.scan_desc = str(scan_desc)
@@ -614,27 +871,62 @@ def _run_scan_with_progress(
         with CliStatus(f"{desc}...", enabled=False, timeout=0.1):
             return invoke(None)
 
-    stage_progress = _GarfieldStageProgress(scan_desc=desc, enabled=bool(use_spinner))
+    prepare_desc = "Preparing GARFIELD input"
+    prepare_status = CliStatus(
+        f"{prepare_desc}...",
+        enabled=bool(use_spinner),
+        timeout=0.08,
+        show_elapsed=True,
+        force_animate=True,
+    )
+    stage_progress: _GarfieldStageProgress | None = None
+    prepare_done = False
+
+    def _finish_prepare() -> None:
+        nonlocal prepare_done
+        if prepare_done:
+            return
+        prepare_status.complete(f"{prepare_desc} ...Finished")
+        prepare_done = True
+
+    def _ensure_stage_progress() -> _GarfieldStageProgress:
+        nonlocal stage_progress
+        if stage_progress is None:
+            _finish_prepare()
+            stage_progress = _GarfieldStageProgress(
+                scan_desc=desc,
+                enabled=bool(use_spinner),
+            )
+        return stage_progress
 
     def _progress_cb(*event) -> None:
         if len(event) == 4:
             stage, done, total, meta = event
-            stage_progress.update(str(stage), int(done), int(total), meta)
+            stage_name = str(stage)
+            if stage_progress is None and _GarfieldStageProgress.is_hidden_stage(stage_name):
+                return
+            _ensure_stage_progress().update(stage_name, int(done), int(total), meta)
             return
         if len(event) == 2:
             done, total = event
-            stage_progress.update("scan", int(done), int(total), None)
+            _ensure_stage_progress().update("scan", int(done), int(total), None)
             return
         raise ValueError(f"unexpected GARFIELD progress event: {event!r}")
 
     try:
-        out = invoke(_progress_cb)
-    except Exception:
-        stage_progress.close()
-        print_failure(f"{desc} ...Failed", force_color=True)
+        with prepare_status:
+            out = invoke(_progress_cb)
+            _finish_prepare()
+    except BaseException:
+        if stage_progress is not None:
+            stage_progress.close()
+            print_failure(f"{desc} ...Failed", force_color=True)
+        else:
+            prepare_status.fail(f"{prepare_desc} ...Failed")
         raise
 
-    stage_progress.close()
+    if stage_progress is not None:
+        stage_progress.close()
     return out
 
 
@@ -747,6 +1039,17 @@ def main() -> None:
         action="store_true",
         dest="no_clean",
         help="Disable structured beam pruning and fall back to the legacy unfiltered fixed-width search.",
+    )
+    optional_group.add_argument(
+        "-global",
+        "--global",
+        dest="global_stats",
+        action="store_true",
+        default=False,
+        help=(
+            "Compute GARFIELD pure-line row statistics once on the full overlapping sample pool "
+            "and reuse the keep mask across traits. Default is per-trait row statistics."
+        ),
     )
     optional_group.add_argument("--prior-not", type=float, default=None, help=argparse.SUPPRESS)
     optional_group.add_argument("-layer", "--layer", type=int, default=None, help="Maximum beam-search rule depth (default: 4).")
@@ -936,6 +1239,14 @@ def main() -> None:
         ("Genotype input", gfile),
         ("Input kind", input_kind),
         ("Execution route", "direct Rust BED pipeline"),
+        (
+            "Prepare reuse",
+            (
+                "global site_keep once + trait-local load"
+                if bool(args.global_stats)
+                else "trait-specific site_keep + trait-local load"
+            ),
+        ),
         ("Encoding", feature_source),
         ("Residualization GRM", args.grm if args.grm else "auto from genotype"),
         ("Covariates", None if not args.cov_inputs else ",".join(str(x) for x in args.cov_inputs)),
@@ -965,7 +1276,7 @@ def main() -> None:
 
     emit_cli_configuration(
         logger,
-        app_title="JanusX - GARFIELD (Rust)",
+        app_title="JanusX - GARFIELD",
         config_title="GARFIELD CONFIG",
         host=socket.gethostname(),
         sections=[("General", general_rows)],
@@ -980,7 +1291,7 @@ def main() -> None:
             ),
             ("Output prefix", outprefix),
         ],
-        line_max_chars=60,
+        line_max_chars=_gwas_terminal_config_line_max_chars(60),
     )
     # logger.info(
     #     "Rule-ranking resolution: logic_gate=%s, source=%s -> %s",
@@ -1023,7 +1334,7 @@ def main() -> None:
                     grm_id_path=None,
                     label="GARFIELD GRM",
                 )
-            except Exception:
+            except BaseException:
                 task.fail(f"Loading GRM from {grm_src} ...Failed")
                 raise
             task.complete(f"Loading GRM from {grm_src} (n={aligned_grm.shape[0]})")
@@ -1083,6 +1394,20 @@ def main() -> None:
 
     group_labels: list[str] = []
     group_intervals: list[list[tuple[str, int, int]]] = []
+    global_site_keep: Optional[np.ndarray] = None
+    if bool(args.global_stats):
+        global_site_keep = _prepare_site_keep(
+            genofile=gfile,
+            sample_ids=list(sample_pool),
+            sample_index_map=sample_index_map,
+            n_snps=int(_n_snps),
+            maf_threshold=float(args.maf),
+            max_missing_rate=float(args.geno),
+            snps_only=False,
+            threads=int(args.thread),
+            use_spinner=use_spinner,
+            global_stats=True,
+        )
     if args.scan_mode in {"gene", "geneset"}:
         if not args.genefile or not args.gff3:
             raise ValueError(f"scan-mode={args.scan_mode} requires both --genefile and --gff3.")
@@ -1115,7 +1440,25 @@ def main() -> None:
 
         y_raw = pheno_col.loc[common_ids].to_numpy(dtype=float)
         response_mode, y_common, response_note = _detect_response_mode(y_raw)
-        logger.info(f"{trait_name} (n={len(common_ids)}, response={response_mode}{response_note})")
+        _emit_plain_info_line(
+            logger,
+            f"{trait_name} (n={len(common_ids)}, response={response_mode}{response_note})",
+            use_spinner=use_spinner,
+        )
+        site_keep_trait = global_site_keep
+        if site_keep_trait is None:
+            site_keep_trait = _prepare_site_keep(
+                genofile=gfile,
+                sample_ids=list(common_ids),
+                sample_index_map=sample_index_map,
+                n_snps=int(_n_snps),
+                maf_threshold=float(args.maf),
+                max_missing_rate=float(args.geno),
+                snps_only=False,
+                threads=int(args.thread),
+                use_spinner=use_spinner,
+                global_stats=False,
+            )
         # Binary traits are accepted: LMM residualization produces continuous residuals,
         # and centered-gain scoring is valid on any finite y (including 0/1).
         base_trait = _safe_trait_label(trait_name)
@@ -1159,6 +1502,7 @@ def main() -> None:
                 grm=trait_grm,
                 x_cov=trait_cov,
                 sample_ids=list(common_ids),
+                site_keep=site_keep_trait,
                 unit_kind=logic_unit_kind,
                 groups=rust_groups,
                 group_names=rust_group_names,
@@ -1208,6 +1552,19 @@ def main() -> None:
                 progress_every=0,
             ),
         )
+        rust_memory_debug = result.get("memory_debug")
+        if _garfield_rss_debug_enabled() and isinstance(rust_memory_debug, dict):
+            for stage_name in (
+                "global_bits_loaded",
+                "scan",
+                "null_penalty",
+                "structure_prior",
+            ):
+                _emit_garfield_rss_checkpoint(
+                    logger,
+                    stage_name,
+                    rust_memory_debug.get(stage_name),
+                )
 
         pseudo_path = f"{trait_logic_prefix}.pseudo"
         posterior_tsv_path = f"{trait_logic_prefix}.posterior.tsv"
@@ -1236,48 +1593,106 @@ def main() -> None:
             _load_json_if_exists(posterior_json_path)
         )
         pseudo_gwas_payload = None
+        followup_memory_debug = None
         pseudo_prefix = result.get("pseudo_prefix")
         if pseudo_prefix:
-            if followup_grm_full is None:
-                followup_grm_full = _ensure_followup_grm(
-                    existing_grm=None,
-                    genofile=gfile,
-                    sample_ids=sample_ids,
-                    n_snps=_n_snps,
+            followup_sampler = (
+                _GarfieldRssSampler() if _garfield_rss_debug_enabled() else None
+            )
+            if followup_sampler is None:
+                if followup_grm_full is None:
+                    followup_grm_full = _ensure_followup_grm(
+                        existing_grm=None,
+                        genofile=gfile,
+                        sample_ids=sample_ids,
+                        n_snps=_n_snps,
+                        maf_threshold=float(args.maf),
+                        max_missing_rate=float(args.geno),
+                        threads=int(args.thread),
+                        cache_dir=args.out,
+                        logger=logger,
+                        use_spinner=use_spinner,
+                    )
+                common_positions = np.asarray(
+                    [sample_index_map[sid] for sid in common_ids],
+                    dtype=np.intp,
+                )
+                trait_grm_followup = np.asarray(
+                    followup_grm_full[np.ix_(common_positions, common_positions)],
+                    dtype=np.float64,
+                    order="C",
+                )
+                logger.info(
+                    f"Running pseudo FvLMM follow-up for '{trait_name}' on {int(n_rules)} GARFIELD rule(s)."
+                )
+                pseudo_gwas_payload = _run_garfield_pseudo_fastlmm(
+                    pseudo_prefix=str(pseudo_prefix),
+                    trait_label=suffix,
+                    pheno_values=np.asarray(y_common, dtype=np.float64),
+                    sample_ids=list(common_ids),
+                    trait_grm=trait_grm_followup,
+                    trait_cov=trait_cov,
                     maf_threshold=float(args.maf),
                     max_missing_rate=float(args.geno),
                     threads=int(args.thread),
-                    cache_dir=args.out,
                     logger=logger,
                     use_spinner=use_spinner,
                 )
-            common_positions = np.asarray(
-                [sample_index_map[sid] for sid in common_ids],
-                dtype=np.intp,
-            )
-            trait_grm_followup = np.asarray(
-                followup_grm_full[np.ix_(common_positions, common_positions)],
-                dtype=np.float64,
-                order="C",
-            )
-            logger.info(
-                f"Running pseudo FvLMM follow-up for '{trait_name}' on {int(n_rules)} GARFIELD rule(s)."
-            )
-            pseudo_gwas_payload = _run_garfield_pseudo_fastlmm(
-                pseudo_prefix=str(pseudo_prefix),
-                trait_label=suffix,
-                pheno_values=np.asarray(y_common, dtype=np.float64),
-                sample_ids=list(common_ids),
-                trait_grm=trait_grm_followup,
-                trait_cov=trait_cov,
-                maf_threshold=float(args.maf),
-                max_missing_rate=float(args.geno),
-                threads=int(args.thread),
-                logger=logger,
-                use_spinner=use_spinner,
-            )
+            else:
+                with followup_sampler:
+                    if followup_grm_full is None:
+                        followup_grm_full = _ensure_followup_grm(
+                            existing_grm=None,
+                            genofile=gfile,
+                            sample_ids=sample_ids,
+                            n_snps=_n_snps,
+                            maf_threshold=float(args.maf),
+                            max_missing_rate=float(args.geno),
+                            threads=int(args.thread),
+                            cache_dir=args.out,
+                            logger=logger,
+                            use_spinner=use_spinner,
+                        )
+                    common_positions = np.asarray(
+                        [sample_index_map[sid] for sid in common_ids],
+                        dtype=np.intp,
+                    )
+                    trait_grm_followup = np.asarray(
+                        followup_grm_full[np.ix_(common_positions, common_positions)],
+                        dtype=np.float64,
+                        order="C",
+                    )
+                    logger.info(
+                        f"Running pseudo FvLMM follow-up for '{trait_name}' on {int(n_rules)} GARFIELD rule(s)."
+                    )
+                    pseudo_gwas_payload = _run_garfield_pseudo_fastlmm(
+                        pseudo_prefix=str(pseudo_prefix),
+                        trait_label=suffix,
+                        pheno_values=np.asarray(y_common, dtype=np.float64),
+                        sample_ids=list(common_ids),
+                        trait_grm=trait_grm_followup,
+                        trait_cov=trait_cov,
+                        maf_threshold=float(args.maf),
+                        max_missing_rate=float(args.geno),
+                        threads=int(args.thread),
+                        logger=logger,
+                        use_spinner=use_spinner,
+                    )
+                followup_memory_debug = followup_sampler.summary()
+                _emit_garfield_rss_checkpoint(
+                    logger,
+                    "follow-up",
+                    followup_memory_debug,
+                )
         _remove_file_if_exists(run_config_path)
         _remove_file_if_exists(posterior_json_path)
+        trait_memory_debug = (
+            dict(rust_memory_debug) if isinstance(rust_memory_debug, dict) else None
+        )
+        if followup_memory_debug is not None:
+            if trait_memory_debug is None:
+                trait_memory_debug = {}
+            trait_memory_debug["follow_up"] = followup_memory_debug
         trait_manifest = {
             "trait": trait_name,
             "trait_output_prefix": trait_outprefix,
@@ -1346,6 +1761,7 @@ def main() -> None:
             "train_sigma_e2": float(result.get("train_sigma_e2", float("nan"))),
             "test_sigma_g2": float(result.get("test_sigma_g2", float("nan"))),
             "test_sigma_e2": float(result.get("test_sigma_e2", float("nan"))),
+            "memory_debug": trait_memory_debug,
             "outputs": {
                 "rules_tsv": result.get("rules_tsv"),
                 "pseudo_fastlmm_tsv": (
@@ -1364,11 +1780,20 @@ def main() -> None:
             "pseudo_fastlmm": pseudo_gwas_payload,
         }
         garfield_manifest_traits.append(trait_manifest)
-        logger.info(f"GARFIELD null-model PVE for '{trait_name}': full={float(result.get('train_pve', float('nan'))):.4g}")
+        _emit_plain_info_line(
+            logger,
+            (
+                f"GARFIELD null-model PVE for '{trait_name}': "
+                f"full={float(result.get('train_pve', float('nan'))):.4g}"
+            ),
+            use_spinner=use_spinner,
+        )
         if args.simbench:
-            logger.info(
+            _emit_plain_info_line(
+                logger,
                 f"GARFIELD simbench rows appended for '{trait_name}': "
-                f"{int(result.get('n_simbench', 0))}"
+                f"{int(result.get('n_simbench', 0))}",
+                use_spinner=use_spinner,
             )
         rank_scores = [
             float(x)
@@ -1388,10 +1813,14 @@ def main() -> None:
                 "route": "rust-bed",
             }
         )
-        log_success(
+        trait_saved_paths: list[object] = [result.get("rules_tsv")]
+        if pseudo_gwas_payload is not None:
+            trait_saved_paths.extend(pseudo_gwas_payload.get("tsv_paths") or [])
+            trait_saved_paths.extend(pseudo_gwas_payload.get("figure_paths") or [])
+        _emit_garfield_saved_paths(
             logger,
-            f"Saved GARFIELD output for trait: "
-            f"\n\t{format_path_for_display(trait_logic_prefix)}",
+            trait_saved_paths,
+            use_spinner=use_spinner,
         )
         saved += 1
 
@@ -1436,14 +1865,18 @@ def main() -> None:
             indent=2,
             ensure_ascii=False,
         )
-    logger.info(f"GARFIELD JSON: {format_path_for_display(aggregate_json_path)}")
+    _emit_garfield_saved_paths(
+        logger,
+        [aggregate_json_path],
+        use_spinner=use_spinner,
+    )
     _emit_garfield_summary_to_log(logger, summary_rows)
 
-    lt = time.localtime()
-    log_success(
+    _rich_success(
         logger,
-        f"\nFinished GARFIELD. Total wall time: {round(time.time() - t_start, 2)} seconds\n"
-        f"{lt.tm_year}-{lt.tm_mon}-{lt.tm_mday} {lt.tm_hour}:{lt.tm_min}:{lt.tm_sec}",
+        f"\nFinished. Total wall time: {round(time.time() - t_start, 2)} seconds\n"
+        f"{_format_cli_finished_timestamp()}",
+        use_spinner=use_spinner,
     )
 
 
@@ -1451,4 +1884,19 @@ if __name__ == "__main__":
     from janusx.script._common.interrupt import install_interrupt_handlers
 
     install_interrupt_handlers()
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        logging.getLogger().info("Interrupted by user (Ctrl+C).")
+        if os.name == "nt":
+            try:
+                logging.getLogger().info(
+                    "Terminating all GARFIELD workers immediately on Windows."
+                )
+            except Exception:
+                pass
+            try:
+                logging.shutdown()
+            finally:
+                os._exit(130)
+        raise SystemExit(130)

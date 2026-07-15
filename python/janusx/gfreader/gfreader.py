@@ -42,6 +42,12 @@ try:
 except Exception:
     _prepare_bed_logic_keep_mask = None
 try:
+    from janusx.janusx import (
+        prepare_bed_logic_keep_mask_pure_line as _prepare_bed_logic_keep_mask_pure_line,
+    )
+except Exception:
+    _prepare_bed_logic_keep_mask_pure_line = None
+try:
     from janusx.janusx import prepare_bed_logic_meta_selected as _prepare_bed_logic_meta_selected
 except Exception:
     _prepare_bed_logic_meta_selected = None
@@ -290,6 +296,47 @@ def prepare_bed_logic_keep_mask(
         maf_threshold=float(maf_threshold),
         max_missing_rate=float(max_missing_rate),
         het_threshold=float(het_threshold),
+        snps_only=bool(snps_only),
+        mmap_window_mb=mmap_window_mb,
+        threads=max(1, int(threads)),
+    )
+
+
+def prepare_bed_logic_keep_mask_pure_line(
+    prefix: str,
+    *,
+    sample_indices=None,
+    maf_threshold: float = 0.0,
+    max_missing_rate: float = 1.0,
+    snps_only: bool = False,
+    mmap_window_mb: int | None = None,
+    threads: int = 1,
+):
+    """
+    Scan PLINK BED once under pure-line logic and return only the full-source keep mask.
+
+    Returns
+    -------
+    site_keep : np.ndarray[bool], shape (n_total_sites,)
+    n_samples : int
+    n_total_sites : int
+    """
+    if _prepare_bed_logic_keep_mask_pure_line is None:
+        raise RuntimeError(
+            "prepare_bed_logic_keep_mask_pure_line is unavailable in Rust extension. "
+            "Please rebuild/install JanusX."
+        )
+    sample_idx_arr = None
+    if sample_indices is not None:
+        sample_idx_arr = np.ascontiguousarray(
+            np.asarray(sample_indices, dtype=np.int64).reshape(-1),
+            dtype=np.int64,
+        )
+    return _prepare_bed_logic_keep_mask_pure_line(
+        str(prefix),
+        sample_indices=sample_idx_arr,
+        maf_threshold=float(maf_threshold),
+        max_missing_rate=float(max_missing_rate),
         snps_only=bool(snps_only),
         mmap_window_mb=mmap_window_mb,
         threads=max(1, int(threads)),

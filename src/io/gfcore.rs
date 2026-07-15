@@ -2437,6 +2437,11 @@ impl BedSnpIter {
         self.n_snps
     }
 
+    #[inline]
+    pub fn bytes_per_snp(&self) -> usize {
+        self.bytes_per_snp
+    }
+
     pub fn cursor(&self) -> usize {
         self.cur
     }
@@ -2476,6 +2481,14 @@ impl BedSnpIter {
         } else {
             self.n_snps.saturating_sub(snp_idx)
         }
+    }
+
+    #[inline]
+    pub fn packed_snp_bytes_at(&self, snp_idx: usize) -> Option<&[u8]> {
+        if snp_idx >= self.n_snps {
+            return None;
+        }
+        self.snp_bytes(snp_idx)
     }
 
     /// Decode next SNP row into caller-provided buffer (len >= n_samples)

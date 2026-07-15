@@ -6,15 +6,73 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufWriter, Write};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
 pub(crate) const INTERRUPTED_MSG: &str = "Interrupted by user (Ctrl+C).";
+static INTERRUPT_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(unix)]
+static PREV_SIGINT_HANDLER: AtomicUsize = AtomicUsize::new(0);
+#[cfg(unix)]
+static PREV_SIGTERM_HANDLER: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(unix)]
+extern "C" {
+    fn signal(signum: libc::c_int, handler: usize) -> usize;
+}
+
+#[cfg(unix)]
+extern "C" fn janusx_native_interrupt_handler(sig: i32) {
+    INTERRUPT_REQUESTED.store(true, Ordering::SeqCst);
+    let prev = match sig {
+        libc::SIGINT => PREV_SIGINT_HANDLER.load(Ordering::SeqCst),
+        libc::SIGTERM => PREV_SIGTERM_HANDLER.load(Ordering::SeqCst),
+        _ => 0usize,
+    };
+    let self_handler = janusx_native_interrupt_handler as *const () as usize;
+    if prev <= 1 || prev == self_handler || prev == usize::MAX {
+        return;
+    }
+    let chained: extern "C" fn(i32) = unsafe { std::mem::transmute(prev) };
+    chained(sig);
+}
+
+#[inline]
+pub(crate) fn arm_interrupt_trap() {
+    INTERRUPT_REQUESTED.store(false, Ordering::SeqCst);
+    #[cfg(unix)]
+    unsafe {
+        let handler = janusx_native_interrupt_handler as *const () as usize;
+        let prev_int = signal(libc::SIGINT, handler);
+        if prev_int > 1 && prev_int != handler && prev_int != usize::MAX {
+            PREV_SIGINT_HANDLER.store(prev_int, Ordering::SeqCst);
+        }
+        let prev_term = signal(libc::SIGTERM, handler);
+        if prev_term > 1 && prev_term != handler && prev_term != usize::MAX {
+            PREV_SIGTERM_HANDLER.store(prev_term, Ordering::SeqCst);
+        }
+    }
+}
+
+#[inline]
+pub(crate) fn interrupt_requested() -> bool {
+    INTERRUPT_REQUESTED.load(Ordering::SeqCst)
+}
 
 #[inline]
 pub(crate) fn check_ctrlc() -> Result<(), String> {
-    Python::attach(|py| py.check_signals()).map_err(|_| INTERRUPTED_MSG.to_string())
+    if interrupt_requested() {
+        return Err(INTERRUPTED_MSG.to_string());
+    }
+    Python::attach(|py| py.check_signals()).map_err(|_| INTERRUPTED_MSG.to_string())?;
+    if interrupt_requested() {
+        Err(INTERRUPTED_MSG.to_string())
+    } else {
+        Ok(())
+    }
 }
 
 #[inline]

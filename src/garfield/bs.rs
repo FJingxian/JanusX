@@ -17,6 +17,7 @@ use super::score_gpu::{
     score_cont_centered_gain_singletons_packed_with_backend,
 };
 use crate::bitwise::{and_popcount, bitand_assign, bitnot_masked, popcount};
+use crate::stats_common::{check_ctrlc, interrupt_requested, INTERRUPTED_MSG};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -58,6 +59,15 @@ static GARFIELD_PROFILE_PARENT_BASELINE_NS: AtomicU64 = AtomicU64::new(0);
 #[inline]
 fn elapsed_ns_saturating(start: Instant) -> u64 {
     start.elapsed().as_nanos().min(u64::MAX as u128) as u64
+}
+
+#[inline]
+fn check_interrupt_fast() -> Result<(), String> {
+    if interrupt_requested() {
+        Err(INTERRUPTED_MSG.to_string())
+    } else {
+        Ok(())
+    }
 }
 
 pub(crate) fn reset_garfield_beam_profile() {
@@ -2512,6 +2522,7 @@ fn build_initial_beam(
     literal_scores: &[LiteralSingletonScore],
     params: &BeamSearchParams,
 ) -> Result<Vec<BeamState>, String> {
+    check_interrupt_fast()?;
     let layer_cap = params.beam_width.min(n_rows);
     let total_cands = n_rows;
     let beam = if should_parallel(total_cands, params.allow_parallel) {
@@ -2523,11 +2534,14 @@ fn build_initial_beam(
             work.push((start, end));
             start = end;
         }
-        let local_tops: Vec<Vec<BeamState>> = work
+        let local_tops: Vec<Result<Vec<BeamState>, String>> = work
             .into_par_iter()
             .map(|(start, end)| {
                 let mut local = Vec::<BeamState>::with_capacity(layer_cap);
                 for row_idx in start..end {
+                    if ((row_idx - start) & 255) == 0 {
+                        check_interrupt_fast()?;
+                    }
                     let row = row_prefix(bits_train, row_words_train, row_idx, needed_words_train);
                     // Layer 1 seeds both positive and negated singletons.
                     // Both are needed so that !i & !j can be reached in layer 2.
@@ -2574,12 +2588,12 @@ fn build_initial_beam(
                         );
                     }
                 }
-                local
+                Ok(local)
             })
             .collect();
         let mut merged = Vec::<BeamState>::with_capacity(layer_cap);
         for local in local_tops {
-            for cand in local {
+            for cand in local? {
                 push_top_k_states(&mut merged, cand, layer_cap);
             }
         }
@@ -2587,6 +2601,9 @@ fn build_initial_beam(
     } else {
         let mut seq = Vec::<BeamState>::with_capacity(layer_cap);
         for row_idx in 0..n_rows {
+            if (row_idx & 255) == 0 {
+                check_interrupt_fast()?;
+            }
             let row = row_prefix(bits_train, row_words_train, row_idx, needed_words_train);
             for &negated in GARFIELD_INITIAL_SINGLETON_NEGATIONS.iter() {
                 let literal = BeamLiteral {
@@ -2643,8 +2660,12 @@ fn build_initial_states_exhaustive(
     literal_scores: &[LiteralSingletonScore],
     params: &BeamSearchParams,
 ) -> Result<Vec<BeamState>, String> {
+    check_interrupt_fast()?;
     let mut all = Vec::<BeamState>::with_capacity(n_rows);
     for row_idx in 0..n_rows {
+        if (row_idx & 255) == 0 {
+            check_interrupt_fast()?;
+        }
         let row = row_prefix(bits_train, row_words_train, row_idx, needed_words_train);
         for &negated in GARFIELD_INITIAL_SINGLETON_NEGATIONS.iter() {
             let literal = BeamLiteral {
@@ -2700,6 +2721,7 @@ fn expand_beam_once(
     literal_scores: &[LiteralSingletonScore],
     params: &BeamSearchParams,
 ) -> Result<Vec<BeamState>, String> {
+    check_interrupt_fast()?;
     let next_cap = params.beam_width.min(n_rows.saturating_mul(4).max(1));
     let op_count = 1usize; // AND only
     let base_rule_raws = Arc::new(collect_known_rule_raw_scores(beam));
@@ -2735,6 +2757,9 @@ fn expand_beam_once(
                     HashMap::with_capacity(next_cap);
                 let mut parent_raw_cache = RuleRawScoreCache::new();
                 for cand in start..end {
+                    if ((cand - start) & 127) == 0 {
+                        check_interrupt_fast()?;
+                    }
                     let gid = group_ids[cand];
                     if node.rule.uses_group(gid) {
                         continue;
@@ -2885,6 +2910,9 @@ fn expand_beam_once(
             let (start, end) = expansion_row_bounds(&node.rule, n_rows);
             let blind_scan = child_rule_uses_blind_scan(node.rule.len());
             for cand in start..end {
+                if ((cand - start) & 127) == 0 {
+                    check_interrupt_fast()?;
+                }
                 let gid = group_ids[cand];
                 if node.rule.uses_group(gid) {
                     continue;
@@ -3118,11 +3146,16 @@ fn expand_states_exhaustive(
     literal_scores: &[LiteralSingletonScore],
     params: &BeamSearchParams,
 ) -> Result<Vec<BeamState>, String> {
+    check_interrupt_fast()?;
     let mut best = HashMap::<RuleLexKey, BeamState>::new();
     let base_rule_raws = collect_known_rule_raw_scores(frontier);
     let mut parent_raw_cache = RuleRawScoreCache::new();
     for node in frontier.iter() {
-        for cand in (node.rule.last_row_index() + 1)..n_rows {
+        let cand_start = node.rule.last_row_index() + 1;
+        for cand in cand_start..n_rows {
+            if ((cand - cand_start) & 127) == 0 {
+                check_interrupt_fast()?;
+            }
             let gid = group_ids[cand];
             if node.rule.uses_group(gid) {
                 continue;
@@ -3897,6 +3930,7 @@ fn beam_search_train_test_continuous_impl(
 ) -> Result<Vec<BeamRuleCandidate>, String> {
     let beam_t0 = Instant::now();
     let out = (|| {
+        check_ctrlc()?;
         let (needed_words_train, needed_words_test) = validate_search_inputs(
             y_train,
             bits_train,
@@ -3960,6 +3994,7 @@ fn beam_search_train_test_continuous_impl(
             kept_all.extend(exhaustive_initial.iter().cloned());
             let mut frontier = exhaustive_initial;
             for _depth in 2..=exhaustive_depth {
+                check_ctrlc()?;
                 let next = expand_states_exhaustive(
                     frontier.as_slice(),
                     y_train,
@@ -3998,6 +4033,7 @@ fn beam_search_train_test_continuous_impl(
         };
 
         for _depth in (exhaustive_depth + 1)..=max_depth {
+            check_ctrlc()?;
             let next = expand_beam_once(
                 &beam,
                 y_train,
@@ -4040,6 +4076,7 @@ fn beam_search_train_test_continuous_impl(
         let mut best_by_rule =
             HashMap::<Vec<(usize, bool, u8)>, BeamRuleCandidate>::with_capacity(retained.len());
         for state in retained.into_iter() {
+            check_interrupt_fast()?;
             let cand = collapse_surrogate_candidate(
                 &state,
                 y_train,

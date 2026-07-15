@@ -53,7 +53,7 @@ irm https://raw.githubusercontent.com/FJingxian/JanusX/main/scripts/install.ps1 
 ### Option A: Python package install
 
 ```bash
-pip install janusx==1.0.25
+pip install janusx
 ```
 
 ### Option B: Conda / Bioconda

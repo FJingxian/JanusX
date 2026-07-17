@@ -52,7 +52,7 @@ use crate::gfreader::{
 use crate::gload::WindowedBedMatrix;
 use crate::he::{row_major_block_mul_mat_f32, row_major_block_mul_mat_f32_small_rhs};
 use crate::linalg::sanitize_assoc_pvalue;
-use crate::stats_common::{get_cached_pool, parse_index_vec_i64, AsyncTsvWriter};
+use crate::stats_common::{check_ctrlc, get_cached_pool, parse_index_vec_i64, AsyncTsvWriter};
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 struct LmMemmapMetaCacheKey {
@@ -360,6 +360,11 @@ impl LmQrProjection {
     }
 
     #[inline]
+    pub(crate) fn q_f32(&self) -> &[f32] {
+        self.q_f32.as_slice()
+    }
+
+    #[inline]
     pub(crate) fn y_resid(&self) -> &[f64] {
         self.y_resid.as_slice()
     }
@@ -566,7 +571,11 @@ fn cast_f64_slice_to_f32(input: &[f64]) -> Result<Vec<f32>, String> {
 }
 
 #[inline]
-fn pack_lm_scan_rhs_f32(y: &[f64], x_rhs: Option<&[f32]>, q: usize) -> Result<Vec<f32>, String> {
+pub(crate) fn pack_lm_scan_rhs_f32(
+    y: &[f64],
+    x_rhs: Option<&[f32]>,
+    q: usize,
+) -> Result<Vec<f32>, String> {
     let n = y.len();
     let rhs_cols = q
         .checked_add(1)
@@ -1239,7 +1248,7 @@ fn lm_stage2_compact_assoc_from_gx(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn lm_stream_bed_additive_windowed_unified(
+pub(crate) fn lm_stream_bed_additive_windowed_unified(
     norm_prefix: &str,
     y_raw: &[f64],
     qr_ctx: &LmQrProjection,
@@ -1338,6 +1347,10 @@ fn lm_stream_bed_additive_windowed_unified(
     let producer_err = Arc::new(OnceLock::<String>::new());
     let producer_err_bg = Arc::clone(&producer_err);
     let producer = |chunk: &mut LmUnifiedStreamingChunk| -> bool {
+        if let Err(err) = check_ctrlc() {
+            let _ = producer_err_bg.set(err);
+            return false;
+        }
         if chunk_start >= n_snps {
             return false;
         }
@@ -1546,6 +1559,8 @@ fn lm_stream_bed_additive_windowed_unified(
                     cb.call1(py2, (chunk.scanned_to.min(n_snps), n_snps))?;
                     Ok(())
                 });
+            } else {
+                check_ctrlc()?;
             }
             next_progress_emit = (chunk.scanned_to / progress_block + 1)
                 .saturating_mul(progress_block)
@@ -2029,7 +2044,7 @@ fn lm_stream_bed_segments_compact_windowed_unified(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn lm_stream_bed_additive_prepared_unified(
+pub(crate) fn lm_stream_bed_additive_prepared_unified(
     norm_prefix: &str,
     qr_ctx: &LmQrProjection,
     rhs_add_f32: &[f32],
@@ -2166,6 +2181,7 @@ fn lm_stream_bed_additive_prepared_unified(
     let mut kept_total = 0usize;
 
     while row_start < total_scan_units {
+        check_ctrlc()?;
         let row_end = (row_start + scan_block_rows).min(total_scan_units);
         let rows_here = row_end - row_start;
         let source_rows_batch = &source_rows[row_start..row_end];
@@ -2294,6 +2310,14 @@ fn lm_stream_bed_additive_prepared_unified(
                     Ok(())
                 });
             }
+        } else if row_end >= next_progress_emit || row_end == total_scan_units {
+            while next_progress_emit <= row_end {
+                next_progress_emit = next_progress_emit.saturating_add(progress_block);
+                if next_progress_emit == 0 {
+                    break;
+                }
+            }
+            check_ctrlc()?;
         }
         kept_total = kept_total.saturating_add(rows_here);
         row_start = row_end;

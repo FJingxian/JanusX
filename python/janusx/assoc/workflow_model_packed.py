@@ -42,6 +42,8 @@ from .workflow import (
     CliStatus,
     FvLMM,
     LMM,
+    _TraitRef,
+    _build_shared_trait_fast_context,
     _ProgressAdapter,
     _start_indeterminate_progress_bar,
     _stop_indeterminate_progress_bar,
@@ -99,6 +101,9 @@ _SCANMETA_CACHE_VERSION = 1
 _SCANMETA_HEADER_PREFIX = struct.Struct("<8sII")
 _GWAS_GLOBAL_SCANMETA_MEM_CACHE: dict[str, dict[str, object]] = {}
 _GWAS_GLOBAL_SCANMETA_MEM_CACHE_LOCK = threading.Lock()
+_MIXED_TRAIT_AGG_HEADER = (
+    "chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\tphenotype\n"
+)
 
 
 def _current_bed_memory_mb() -> float:
@@ -4947,6 +4952,1728 @@ def run_lm_stream_bed_single_entry(
         )
         if multi_trait_mode:
             logger.info("")
+
+
+def run_lm_trait_bed_multi_entry(
+    *,
+    genofile: str,
+    pheno: pd.DataFrame,
+    ids: np.ndarray,
+    n_snps: int,
+    outprefix: str,
+    maf_threshold: float,
+    max_missing_rate: float,
+    genetic_model: str,
+    het_threshold: float,
+    chunk_size: int,
+    qmatrix: np.ndarray,
+    cov_all: Union[np.ndarray, None],
+    plot: bool,
+    threads: int,
+    logger: logging.Logger,
+    use_spinner: bool = False,
+    snps_only: bool = True,
+    eff_snp_by_trait: Union[dict[str, int], None] = None,
+    summary_rows: Union[list[dict[str, object]], None] = None,
+    saved_paths: Union[list[str], None] = None,
+    trait_names: Union[list[str], None] = None,
+    emit_trait_header: bool = True,
+    chunk_size_user_set: bool = True,
+    mmap_limit: bool = False,
+    trait_prepared_meta_by_trait: Union[dict[str, dict[str, object]], None] = None,
+    precomputed_shared_input: Union[dict[str, object], None] = None,
+) -> None:
+    if not hasattr(jxrs, "lm_trait_assoc_bed_to_tsv"):
+        raise RuntimeError(
+            "Rust extension missing lm_trait_assoc_bed_to_tsv. "
+            "Rebuild/install JanusX extension first."
+        )
+    prefix = _as_plink_prefix(genofile)
+    if prefix is None:
+        raise ValueError("LM trait-level route requires PLINK BED input.")
+    if str(genetic_model).lower() != "add":
+        raise ValueError("LM trait-level route currently supports additive model only.")
+    if plot:
+        raise ValueError("LM trait-level route does not support per-trait plotting.")
+
+    process = psutil.Process()
+    n_cores = detect_effective_threads()
+    if eff_snp_by_trait is None:
+        eff_snp_by_trait = {}
+    if summary_rows is None:
+        summary_rows = []
+    if saved_paths is None:
+        saved_paths = []
+
+    pheno_aligned, ids = _align_pheno_to_sample_order(pheno, ids)
+    trait_iter = _resolve_trait_iter(pheno_aligned, trait_names)
+    if len(trait_iter) <= 1:
+        raise ValueError("LM trait-level route requires at least 2 traits.")
+
+    shared_trait_matrix_t: Union[np.ndarray, None] = None
+    shared_keep_idx: Union[np.ndarray, None] = None
+    shared_x_design: Union[np.ndarray, None] = None
+    shared_trait_row_by_pos: dict[int, int] = {}
+    shared_n_idv = 0
+    try:
+        if isinstance(precomputed_shared_input, dict):
+            pre_labels = [
+                str(x)
+                for x in list(precomputed_shared_input.get("trait_labels", []))
+            ]
+            trait_labels = [str(pname) for pname in trait_iter]
+            if pre_labels == trait_labels and len(pre_labels) == len(trait_iter):
+                shared_trait_matrix_t = np.ascontiguousarray(
+                    np.asarray(
+                        precomputed_shared_input.get("trait_matrix_t"),
+                        dtype=np.float64,
+                    ),
+                    dtype=np.float64,
+                )
+                shared_keep_idx = np.ascontiguousarray(
+                    np.asarray(
+                        precomputed_shared_input.get("keep_idx"),
+                        dtype=np.int64,
+                    ).reshape(-1),
+                    dtype=np.int64,
+                )
+                shared_x_design = np.ascontiguousarray(
+                    np.asarray(
+                        precomputed_shared_input.get("x_design"),
+                        dtype=np.float64,
+                    ),
+                    dtype=np.float64,
+                )
+                shared_n_idv = int(precomputed_shared_input.get("n_idv", 0) or 0)
+                if (
+                    shared_trait_matrix_t.ndim == 2
+                    and shared_x_design.ndim == 2
+                    and int(shared_trait_matrix_t.shape[0]) == len(trait_iter)
+                    and int(shared_trait_matrix_t.shape[1]) == int(shared_n_idv)
+                    and int(shared_keep_idx.shape[0]) == int(shared_n_idv)
+                    and int(shared_x_design.shape[0]) == int(shared_n_idv)
+                ):
+                    shared_trait_row_by_pos = {
+                        int(row_idx): int(row_idx)
+                        for row_idx in range(len(trait_iter))
+                    }
+        if shared_trait_matrix_t is None:
+            trait_col_idx = [int(tr.col_idx) for tr in trait_iter if isinstance(tr, _TraitRef)]
+            if len(trait_col_idx) == len(trait_iter):
+                pheno_block = pheno_aligned.iloc[:, trait_col_idx].to_numpy(
+                    dtype=np.float64,
+                    copy=False,
+                )
+                pheno_block = np.asarray(pheno_block, dtype=np.float64)
+                finite_mask = np.isfinite(pheno_block)
+                nonempty_trait_pos = np.flatnonzero(np.any(finite_mask, axis=0))
+                if int(nonempty_trait_pos.shape[0]) > 0:
+                    ref_trait_pos = int(nonempty_trait_pos[0])
+                    shared_sameidx = np.ascontiguousarray(
+                        np.asarray(finite_mask[:, ref_trait_pos], dtype=np.bool_).reshape(-1),
+                        dtype=np.bool_,
+                    )
+                    shared_trait_pos = nonempty_trait_pos[
+                        np.all(
+                            finite_mask[:, nonempty_trait_pos] == shared_sameidx[:, None],
+                            axis=0,
+                        )
+                    ]
+                    shared_keep_idx = np.ascontiguousarray(
+                        np.flatnonzero(shared_sameidx),
+                        dtype=np.int64,
+                    )
+                    shared_n_idv = int(shared_keep_idx.shape[0])
+                    if int(shared_trait_pos.shape[0]) > 1 and shared_n_idv > 0:
+                        shared_trait_matrix_t = np.ascontiguousarray(
+                            pheno_block[np.ix_(shared_keep_idx, shared_trait_pos)].T,
+                            dtype=np.float64,
+                        )
+                        shared_trait_row_by_pos = {
+                            int(trait_pos): int(row_idx)
+                            for row_idx, trait_pos in enumerate(shared_trait_pos.tolist())
+                        }
+                        x_cov_shared = qmatrix[shared_keep_idx]
+                        if cov_all is not None:
+                            x_cov_shared = np.concatenate(
+                                [x_cov_shared, cov_all[shared_keep_idx]],
+                                axis=1,
+                            )
+                        x_cov_shared = np.ascontiguousarray(
+                            x_cov_shared,
+                            dtype=np.float64,
+                        )
+                        shared_x_design = np.ascontiguousarray(
+                            np.concatenate(
+                                [
+                                    np.ones(
+                                        (int(x_cov_shared.shape[0]), 1),
+                                        dtype=np.float64,
+                                    ),
+                                    x_cov_shared,
+                                ],
+                                axis=1,
+                            ),
+                            dtype=np.float64,
+                        )
+        if shared_trait_matrix_t is not None and shared_keep_idx is not None and shared_x_design is not None:
+            _log_file_only(
+                logger,
+                logging.INFO,
+                f"LM trait-level shared-mask fast path: {len(shared_trait_row_by_pos)} / "
+                f"{int(len(trait_iter))} traits x {int(shared_n_idv)} samples.",
+            )
+    except Exception:
+        shared_trait_matrix_t = None
+        shared_keep_idx = None
+        shared_x_design = None
+        shared_trait_row_by_pos = {}
+        shared_n_idv = 0
+
+    direct_matrix_meta: Union[
+        tuple[list[str], np.ndarray, np.ndarray, np.ndarray, np.ndarray],
+        None,
+    ] = None
+    if (
+        shared_trait_matrix_t is not None
+        and shared_keep_idx is not None
+        and shared_x_design is not None
+        and len(shared_trait_row_by_pos) == int(len(trait_iter))
+        and hasattr(jxrs, "lm_trait_assoc_bed_matrix_to_tsv")
+        and isinstance(trait_prepared_meta_by_trait, dict)
+        and int(len(trait_iter)) > 1
+    ):
+        trait_labels_direct = [str(pname) for pname in trait_iter]
+        meta0 = trait_prepared_meta_by_trait.get(trait_labels_direct[0])
+        if isinstance(meta0, dict) and all(
+            trait_prepared_meta_by_trait.get(label) is meta0
+            for label in trait_labels_direct
+        ):
+            row_missing_src = meta0.get("missing_count", meta0.get("missing_rate"))
+            if row_missing_src is not None:
+                direct_matrix_meta = (
+                    trait_labels_direct,
+                    np.ascontiguousarray(
+                        np.asarray(meta0["row_indices"], dtype=np.int64).reshape(-1),
+                        dtype=np.int64,
+                    ),
+                    np.ascontiguousarray(
+                        np.asarray(meta0["row_flip"], dtype=np.bool_).reshape(-1),
+                        dtype=np.bool_,
+                    ),
+                    np.ascontiguousarray(
+                        np.asarray(row_missing_src, dtype=np.float32).reshape(-1),
+                        dtype=np.float32,
+                    ),
+                    np.ascontiguousarray(
+                        np.asarray(meta0["maf"], dtype=np.float32).reshape(-1),
+                        dtype=np.float32,
+                    ),
+                )
+                _log_file_only(
+                    logger,
+                    logging.INFO,
+                    f"LM trait-level direct shared-matrix Rust path: {int(len(trait_labels_direct))} traits x "
+                    f"{int(shared_n_idv)} samples.",
+                )
+
+    if direct_matrix_meta is not None:
+        trait_order = list(direct_matrix_meta[0])
+        trait_nidv = {str(pname): int(shared_n_idv) for pname in trait_order}
+        if bool(emit_trait_header):
+            for pname in trait_order:
+                _emit_trait_header(
+                    logger,
+                    str(pname),
+                    int(shared_n_idv),
+                    pve=None,
+                    use_spinner=bool(use_spinner),
+                    width=60,
+                )
+
+        model_chunk_size = _resolve_stream_scan_chunk_size(
+            int(chunk_size),
+            int(n_snps),
+            use_spinner=bool(use_spinner),
+            n_samples_hint=int(shared_n_idv),
+            model_keys="lm",
+            user_specified=bool(chunk_size_user_set),
+        )
+        mmap_window_mb = (
+            _common_resolve_decode_mmap_window_mb(
+                genofile,
+                len(ids),
+                n_snps,
+                _current_bed_memory_mb(),
+                needs_copy=False,
+            )
+            if bool(mmap_limit)
+            else None
+        )
+        if (not bool(chunk_size_user_set)) and int(model_chunk_size) != int(chunk_size):
+            _log_file_only(
+                logger,
+                logging.INFO,
+                f"LM trait-level auto chunk-size: {int(chunk_size)} -> {int(model_chunk_size)} "
+                f"(max n={int(shared_n_idv)}).",
+            )
+
+        out_tsv = f"{outprefix}.lm.tsv"
+        tmp_tsv = _gwas_result_tmp_path(out_tsv)
+        scan_threads = int(threads)
+        if scan_threads <= 0:
+            scan_threads = int(n_cores)
+
+        cpu_t0 = process.cpu_times()
+        peak_rss = process.memory_info().rss
+        t0 = time.time()
+        trait_total = len(trait_order)
+        pbar: Optional[_ProgressAdapter] = None
+        warm_task: Optional[CliStatus] = None
+        warm_active = False
+        if not bool(use_spinner):
+            pbar = _ProgressAdapter(
+                total=int(max(1, trait_total)),
+                desc="LM(trait)",
+                force_animate=True,
+                logger=logger,
+            )
+        else:
+            warm_task = CliStatus(
+                "Waiting for LM trait-level GWAS",
+                enabled=True,
+                use_process=True,
+            )
+            warm_task.__enter__()
+            warm_active = True
+        pbar_done = 0
+
+        def _trait_progress(done_traits: int, total_traits: int, _trait_name: str) -> None:
+            nonlocal pbar, pbar_done, warm_active
+            try:
+                d = int(done_traits)
+                t = int(total_traits)
+            except Exception:
+                return
+            total_use = int(max(1, t if t > 0 else trait_total))
+            if pbar is None:
+                if warm_active and warm_task is not None:
+                    try:
+                        warm_task.__exit__(None, None, None)
+                    except Exception:
+                        pass
+                    warm_active = False
+                pbar = _ProgressAdapter(
+                    total=total_use,
+                    desc="LM(trait)",
+                    force_animate=True,
+                    logger=logger,
+                )
+            d = int(max(0, min(d, int(max(1, pbar.total)))))
+            stepv = int(max(0, d - int(pbar_done)))
+            if stepv > 0:
+                pbar.update(stepv)
+                pbar_done = d
+
+        _trait_names_direct, row_indices_arr, row_flip_arr, row_missing_arr, row_maf_arr = direct_matrix_meta
+        trait_stats: list[tuple[str, int, int, int, float]] = []
+        scan_ok = False
+        try:
+            with _gwas_scan_stage_ctx(int(max(1, scan_threads))):
+                trait_stats = list(
+                    jxrs.lm_trait_assoc_bed_matrix_to_tsv(
+                        str(prefix),
+                        _trait_names_direct,
+                        shared_trait_matrix_t,
+                        shared_x_design,
+                        shared_keep_idx,
+                        row_indices_arr,
+                        row_flip_arr,
+                        row_missing_arr,
+                        row_maf_arr,
+                        str(tmp_tsv),
+                        chunk_size=int(max(1, int(model_chunk_size))),
+                        threads=int(max(1, scan_threads)),
+                        progress_callback=_trait_progress,
+                        mmap_window_mb=(
+                            int(max(1, int(mmap_window_mb)))
+                            if mmap_window_mb is not None
+                            else None
+                        ),
+                    )
+                )
+            scan_ok = True
+        finally:
+            if warm_active and warm_task is not None:
+                try:
+                    warm_task.__exit__(None, None, None)
+                except Exception:
+                    pass
+                warm_active = False
+            if pbar is not None:
+                try:
+                    if scan_ok and int(pbar_done) < int(max(1, pbar.total)):
+                        pbar.update(int(max(1, pbar.total)) - int(pbar_done))
+                        pbar.finish()
+                except Exception:
+                    pass
+                pbar.close(show_done=False)
+            if not scan_ok:
+                _cleanup_gwas_result_tmp(tmp_tsv)
+
+        peak_rss = max(peak_rss, process.memory_info().rss)
+        cpu_t1 = process.cpu_times()
+        wall = max(time.time() - t0, 1e-12)
+        cpu_used = (cpu_t1.user - cpu_t0.user) + (cpu_t1.system - cpu_t0.system)
+        avg_cpu = 100.0 * cpu_used / (wall * max(1, n_cores))
+        peak_rss_gb = peak_rss / (1024 ** 3)
+
+        _log_model_line(
+            logger,
+            "LM",
+            f"trait-level rust multi-trait scan ({int(trait_total)} traits)",
+            use_spinner=bool(use_spinner),
+        )
+        _log_model_line(
+            logger,
+            "LM",
+            f"avg CPU ~ {avg_cpu:.1f}% of {n_cores} c, peak RSS ~ {peak_rss_gb:.2f} G",
+            use_spinner=bool(use_spinner),
+        )
+
+        stats_by_trait = {
+            str(name): (int(nidv), int(kept), int(scanned), float(elapsed))
+            for name, nidv, kept, scanned, elapsed in trait_stats
+        }
+        any_rows = any(int(vals[1]) > 0 for vals in stats_by_trait.values())
+        if any_rows:
+            _finalize_gwas_result_tsv(tmp_tsv, out_tsv, prefix, logger=logger)
+            saved_paths.append(str(out_tsv))
+            _log_model_line(
+                logger,
+                "LM",
+                f"Results saved to {_display_path(str(out_tsv))}",
+                use_spinner=bool(use_spinner),
+            )
+        else:
+            _cleanup_gwas_result_tmp(tmp_tsv)
+
+        for pname in trait_order:
+            stat_row = stats_by_trait.get(str(pname))
+            if stat_row is None:
+                continue
+            _nidv, done_snps, _scan_all_rows, gwas_secs = stat_row
+            eff_snp_by_trait[str(pname)] = int(done_snps)
+            if int(done_snps) <= 0 and bool(emit_trait_header):
+                logger.info(f"LM: no SNPs passed filters for trait {pname}.")
+            summary_rows.append(
+                {
+                    "phenotype": str(pname),
+                    "model": "LM",
+                    "nidv": int(trait_nidv.get(str(pname), shared_n_idv)),
+                    "eff_snp": int(done_snps),
+                    "pve": None,
+                    "avg_cpu": float(avg_cpu),
+                    "peak_rss_gb": float(peak_rss_gb),
+                    "gwas_time_s": float(gwas_secs),
+                    "viz_time_s": 0.0,
+                    "result_file": (str(out_tsv) if any_rows and int(done_snps) > 0 else ""),
+                }
+            )
+
+        _rich_success(
+            logger,
+            f"LM ...Finished [{format_elapsed(wall)}]",
+            use_spinner=bool(use_spinner),
+        )
+        return
+
+    specs: list[dict[str, object]] = []
+    trait_order: list[str] = []
+    trait_nidv: dict[str, int] = {}
+    max_n_idv = 0
+    meta_array_cache: dict[
+        int,
+        tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray],
+    ] = {}
+
+    for trait_pos, pname in enumerate(trait_iter):
+        if (
+            shared_trait_matrix_t is not None
+            and shared_keep_idx is not None
+            and shared_x_design is not None
+            and trait_pos in shared_trait_row_by_pos
+        ):
+            keep_idx = shared_keep_idx
+            n_idv = int(shared_n_idv)
+            y_vec = np.ascontiguousarray(
+                np.asarray(
+                    shared_trait_matrix_t[shared_trait_row_by_pos[trait_pos]],
+                    dtype=np.float64,
+                ).reshape(-1),
+                dtype=np.float64,
+            )
+            x_design = shared_x_design
+        else:
+            y_full, sameidx = _trait_values_and_mask(pheno_aligned, pname)
+            keep_idx = np.flatnonzero(sameidx).astype(np.int64, copy=False)
+            n_idv = int(keep_idx.shape[0])
+            y_vec = np.ascontiguousarray(y_full[keep_idx], dtype=np.float64)
+            x_cov = qmatrix[keep_idx]
+            if cov_all is not None:
+                x_cov = np.concatenate([x_cov, cov_all[keep_idx]], axis=1)
+            x_cov = np.ascontiguousarray(x_cov, dtype=np.float64)
+            x_design = np.ascontiguousarray(
+                np.concatenate(
+                    [np.ones((int(x_cov.shape[0]), 1), dtype=np.float64), x_cov],
+                    axis=1,
+                ),
+                dtype=np.float64,
+            )
+        if n_idv == 0:
+            logger.warning(f"{pname}: no overlapping samples, skipped.")
+            eff_snp_by_trait[str(pname)] = 0
+            continue
+        meta = None
+        if isinstance(trait_prepared_meta_by_trait, dict):
+            meta = trait_prepared_meta_by_trait.get(str(pname))
+        if not isinstance(meta, dict):
+            raise RuntimeError(
+                f"LM trait-level route requires prepared row metadata for trait {pname}."
+            )
+
+        if bool(emit_trait_header):
+            _emit_trait_header(
+                logger,
+                str(pname),
+                int(n_idv),
+                pve=None,
+                use_spinner=bool(use_spinner),
+                width=60,
+            )
+
+        meta_key = id(meta)
+        cached_meta = meta_array_cache.get(meta_key)
+        if cached_meta is None:
+            row_missing_src = meta.get("missing_count", meta.get("missing_rate"))
+            if row_missing_src is None:
+                raise RuntimeError(
+                    f"Trait prepared metadata missing row_missing for trait {pname}."
+                )
+            cached_meta = (
+                np.ascontiguousarray(
+                    np.asarray(meta["row_indices"], dtype=np.int64).reshape(-1),
+                    dtype=np.int64,
+                ),
+                np.ascontiguousarray(
+                    np.asarray(meta["row_flip"], dtype=np.bool_).reshape(-1),
+                    dtype=np.bool_,
+                ),
+                np.ascontiguousarray(
+                    np.asarray(row_missing_src, dtype=np.float32).reshape(-1),
+                    dtype=np.float32,
+                ),
+                np.ascontiguousarray(
+                    np.asarray(meta["maf"], dtype=np.float32).reshape(-1),
+                    dtype=np.float32,
+                ),
+            )
+            meta_array_cache[meta_key] = cached_meta
+        row_indices_arr, row_flip_arr, row_missing_arr, row_maf_arr = cached_meta
+        specs.append(
+            {
+                "trait_name": str(pname),
+                "n_idv": int(n_idv),
+                "y": y_vec,
+                "x": x_design,
+                "sample_indices": keep_idx,
+                "row_indices": row_indices_arr,
+                "row_flip": row_flip_arr,
+                "row_missing": row_missing_arr,
+                "row_maf": row_maf_arr,
+            }
+        )
+        trait_order.append(str(pname))
+        trait_nidv[str(pname)] = int(n_idv)
+        max_n_idv = max(max_n_idv, int(n_idv))
+
+    if len(specs) == 0:
+        return
+
+    model_chunk_size = _resolve_stream_scan_chunk_size(
+        int(chunk_size),
+        int(n_snps),
+        use_spinner=bool(use_spinner),
+        n_samples_hint=int(max_n_idv),
+        model_keys="lm",
+        user_specified=bool(chunk_size_user_set),
+    )
+    mmap_window_mb = (
+        _common_resolve_decode_mmap_window_mb(
+            genofile,
+            len(ids),
+            n_snps,
+            _current_bed_memory_mb(),
+            needs_copy=False,
+        )
+        if bool(mmap_limit)
+        else None
+    )
+    if (not bool(chunk_size_user_set)) and int(model_chunk_size) != int(chunk_size):
+        _log_file_only(
+            logger,
+            logging.INFO,
+            f"LM trait-level auto chunk-size: {int(chunk_size)} -> {int(model_chunk_size)} "
+            f"(max n={int(max_n_idv)}).",
+        )
+
+    out_tsv = f"{outprefix}.lm.tsv"
+    tmp_tsv = _gwas_result_tmp_path(out_tsv)
+    scan_threads = int(threads)
+    if scan_threads <= 0:
+        scan_threads = int(n_cores)
+
+    cpu_t0 = process.cpu_times()
+    peak_rss = process.memory_info().rss
+    t0 = time.time()
+    trait_total = len(specs)
+    pbar: Optional[_ProgressAdapter] = None
+    warm_task: Optional[CliStatus] = None
+    warm_active = False
+    if not bool(use_spinner):
+        pbar = _ProgressAdapter(
+            total=int(max(1, trait_total)),
+            desc="LM(trait)",
+            force_animate=True,
+            logger=logger,
+        )
+    else:
+        warm_task = CliStatus(
+            "Waiting for LM trait-level GWAS",
+            enabled=True,
+            use_process=True,
+        )
+        warm_task.__enter__()
+        warm_active = True
+    pbar_done = 0
+
+    def _trait_progress(done_traits: int, total_traits: int, _trait_name: str) -> None:
+        nonlocal pbar, pbar_done, warm_active
+        try:
+            d = int(done_traits)
+            t = int(total_traits)
+        except Exception:
+            return
+        total_use = int(max(1, t if t > 0 else trait_total))
+        if pbar is None:
+            if warm_active and warm_task is not None:
+                try:
+                    warm_task.__exit__(None, None, None)
+                except Exception:
+                    pass
+                warm_active = False
+            pbar = _ProgressAdapter(
+                total=total_use,
+                desc="LM(trait)",
+                force_animate=True,
+                logger=logger,
+            )
+        d = int(max(0, min(d, int(max(1, pbar.total)))))
+        stepv = int(max(0, d - int(pbar_done)))
+        if stepv > 0:
+            pbar.update(stepv)
+            pbar_done = d
+
+    trait_stats: list[tuple[str, int, int, int, float]] = []
+    scan_ok = False
+    try:
+        with _gwas_scan_stage_ctx(int(max(1, scan_threads))):
+            trait_stats = list(
+                jxrs.lm_trait_assoc_bed_to_tsv(
+                    str(prefix),
+                    specs,
+                    str(tmp_tsv),
+                    chunk_size=int(max(1, int(model_chunk_size))),
+                    threads=int(max(1, scan_threads)),
+                    progress_callback=_trait_progress,
+                    mmap_window_mb=(
+                        int(max(1, int(mmap_window_mb)))
+                        if mmap_window_mb is not None
+                        else None
+                    ),
+                )
+            )
+        scan_ok = True
+    finally:
+        if warm_active and warm_task is not None:
+            try:
+                warm_task.__exit__(None, None, None)
+            except Exception:
+                pass
+            warm_active = False
+        if pbar is not None:
+            try:
+                if scan_ok and int(pbar_done) < int(max(1, pbar.total)):
+                    pbar.update(int(max(1, pbar.total)) - int(pbar_done))
+                    pbar.finish()
+            except Exception:
+                pass
+            pbar.close(show_done=False)
+        if not scan_ok:
+            _cleanup_gwas_result_tmp(tmp_tsv)
+
+    peak_rss = max(peak_rss, process.memory_info().rss)
+    cpu_t1 = process.cpu_times()
+    wall = max(time.time() - t0, 1e-12)
+    cpu_used = (cpu_t1.user - cpu_t0.user) + (cpu_t1.system - cpu_t0.system)
+    avg_cpu = 100.0 * cpu_used / (wall * max(1, n_cores))
+    peak_rss_gb = peak_rss / (1024 ** 3)
+
+    _log_model_line(
+        logger,
+        "LM",
+        f"trait-level rust multi-trait scan ({int(trait_total)} traits)",
+        use_spinner=bool(use_spinner),
+    )
+    _log_model_line(
+        logger,
+        "LM",
+        f"avg CPU ~ {avg_cpu:.1f}% of {n_cores} c, peak RSS ~ {peak_rss_gb:.2f} G",
+        use_spinner=bool(use_spinner),
+    )
+
+    stats_by_trait = {
+        str(name): (int(nidv), int(kept), int(scanned), float(elapsed))
+        for name, nidv, kept, scanned, elapsed in trait_stats
+    }
+    any_rows = any(int(vals[1]) > 0 for vals in stats_by_trait.values())
+    if any_rows:
+        _finalize_gwas_result_tsv(tmp_tsv, out_tsv, prefix, logger=logger)
+        saved_paths.append(str(out_tsv))
+        _log_model_line(
+            logger,
+            "LM",
+            f"Results saved to {_display_path(str(out_tsv))}",
+            use_spinner=bool(use_spinner),
+        )
+    else:
+        _cleanup_gwas_result_tmp(tmp_tsv)
+
+    for pname in trait_order:
+        stat_row = stats_by_trait.get(str(pname))
+        if stat_row is None:
+            continue
+        _nidv, done_snps, _scan_all_rows, gwas_secs = stat_row
+        eff_snp_by_trait[str(pname)] = int(done_snps)
+        if int(done_snps) <= 0 and bool(emit_trait_header):
+            logger.info(f"LM: no SNPs passed filters for trait {pname}.")
+        summary_rows.append(
+            {
+                "phenotype": str(pname),
+                "model": "LM",
+                "nidv": int(trait_nidv.get(str(pname), stat_row[0])),
+                "eff_snp": int(done_snps),
+                "pve": None,
+                "avg_cpu": float(avg_cpu),
+                "peak_rss_gb": float(peak_rss_gb),
+                "gwas_time_s": float(gwas_secs),
+                "viz_time_s": 0.0,
+                "result_file": (str(out_tsv) if any_rows and int(done_snps) > 0 else ""),
+            }
+        )
+
+    _rich_success(
+        logger,
+        f"LM ...Finished [{format_elapsed(wall)}]",
+        use_spinner=bool(use_spinner),
+    )
+
+
+def _append_trait_tmp_rows_with_phenotype(
+    tmp_tsv: str,
+    out_fh,
+    trait_name: str,
+) -> int:
+    rows_written = 0
+    with open(tmp_tsv, "r", encoding="utf-8", errors="replace") as fh:
+        _ = fh.readline()
+        for line in fh:
+            row = line.rstrip("\n")
+            if row == "":
+                continue
+            out_fh.write(row)
+            out_fh.write("\t")
+            out_fh.write(str(trait_name))
+            out_fh.write("\n")
+            rows_written += 1
+    return int(rows_written)
+
+
+def _mixed_trait_site_meta_preload_max_rows() -> int:
+    raw = str(os.environ.get("JX_MIXED_TRAIT_SITE_META_PRELOAD_MAX_ROWS", "")).strip()
+    try:
+        value = int(raw)
+    except Exception:
+        return 200_000
+    return int(max(0, value))
+
+
+def _lmm_trait_direct_result_max_rows() -> int:
+    raw = str(os.environ.get("JX_LMM_TRAIT_DIRECT_MAX_ROWS", "")).strip()
+    try:
+        value = int(raw)
+    except Exception:
+        return 256
+    return int(max(0, value))
+
+
+def _format_assoc_sci_text(value: object) -> str:
+    try:
+        value_f = float(value)
+    except Exception:
+        return "nan"
+    if not np.isfinite(value_f):
+        return "nan"
+    text = f"{value_f:.4e}"
+    text = text.replace("e+0", "e").replace("e-0", "e-").replace("e+", "e")
+    return text
+
+
+def _build_lmm_trait_rows_text(
+    trait_name: str,
+    results: np.ndarray,
+    chrom: list[str],
+    pos: list[int],
+    snp: list[str],
+    allele0: list[str],
+    allele1: list[str],
+    maf: np.ndarray,
+    miss: np.ndarray,
+) -> tuple[str, int]:
+    res = np.asarray(results, dtype=np.float64)
+    if res.ndim != 2 or int(res.shape[1]) < 3:
+        raise ValueError(
+            f"LMM trait direct result array must be 2D with >=3 columns, got shape={res.shape}"
+        )
+    rows = int(res.shape[0])
+    if not (
+        len(chrom) == rows
+        and len(pos) == rows
+        and len(snp) == rows
+        and len(allele0) == rows
+        and len(allele1) == rows
+        and int(np.asarray(maf).shape[0]) == rows
+        and int(np.asarray(miss).shape[0]) == rows
+    ):
+        raise ValueError(
+            "LMM trait direct result metadata length mismatch: "
+            f"rows={rows}, chrom={len(chrom)}, pos={len(pos)}, snp={len(snp)}, "
+            f"allele0={len(allele0)}, allele1={len(allele1)}, "
+            f"maf={int(np.asarray(maf).shape[0])}, miss={int(np.asarray(miss).shape[0])}"
+        )
+
+    lines: list[str] = []
+    lines_extend = lines.append
+    maf_arr = np.asarray(maf, dtype=np.float32).reshape(-1)
+    miss_arr = np.asarray(miss, dtype=np.float32).reshape(-1)
+    for row_idx in range(rows):
+        beta = float(res[row_idx, 0])
+        se = float(res[row_idx, 1])
+        pwald = float(res[row_idx, 2])
+        chisq = float("nan")
+        if np.isfinite(beta) and np.isfinite(se) and se > 0.0:
+            z = beta / se
+            chisq = float(z * z)
+        lines_extend(
+            (
+                f"{chrom[row_idx]}\t{int(pos[row_idx])}\t{snp[row_idx]}\t"
+                f"{allele0[row_idx]}\t{allele1[row_idx]}\t"
+                f"{float(maf_arr[row_idx]):.4f}\t{float(miss_arr[row_idx]):.4f}\t"
+                f"{beta:.4f}\t{se:.4f}\t{_format_assoc_sci_text(chisq)}\t"
+                f"{_format_assoc_sci_text(pwald)}\t{trait_name}\n"
+            )
+        )
+    return "".join(lines), rows
+
+
+def _mixed_trait_profile_exact_vc(
+    s: np.ndarray,
+    x_rot: np.ndarray,
+    y_rot: np.ndarray,
+    lbd: float,
+) -> tuple[float, float]:
+    lbd_f = float(lbd)
+    if not np.isfinite(lbd_f) or lbd_f <= 0.0:
+        return float("nan"), float("nan")
+
+    s_vec = np.ascontiguousarray(
+        np.maximum(np.asarray(s, dtype=np.float64).reshape(-1), 0.0),
+        dtype=np.float64,
+    )
+    x_mat = np.ascontiguousarray(np.asarray(x_rot, dtype=np.float64), dtype=np.float64)
+    y_vec = np.ascontiguousarray(
+        np.asarray(y_rot, dtype=np.float64).reshape(-1),
+        dtype=np.float64,
+    )
+    if x_mat.ndim != 2:
+        raise ValueError("Mixed trait exact VC profiling expects 2D rotated covariates.")
+    n, p = int(x_mat.shape[0]), int(x_mat.shape[1])
+    if int(s_vec.shape[0]) != n or int(y_vec.shape[0]) != n:
+        raise ValueError(
+            f"Mixed trait exact VC spectral shape mismatch: len(S)={s_vec.shape[0]}, "
+            f"Xcov={x_mat.shape}, y={y_vec.shape}"
+        )
+    n_minus_p = n - p
+    if n_minus_p <= 0:
+        return float("nan"), float("nan")
+
+    v_inv = 1.0 / np.maximum(s_vec + lbd_f, 1e-30)
+    xt_vinv_x = (x_mat.T * v_inv) @ x_mat
+    xt_vinv_y = (x_mat.T * v_inv) @ y_vec
+    try:
+        beta = np.linalg.solve(xt_vinv_x, xt_vinv_y)
+    except np.linalg.LinAlgError:
+        beta = np.linalg.lstsq(xt_vinv_x, xt_vinv_y, rcond=None)[0]
+    resid = y_vec - (x_mat @ beta)
+    rtv_invr = float(np.dot(v_inv, np.square(resid)))
+    if not np.isfinite(rtv_invr) or rtv_invr <= 0.0:
+        return float("nan"), float("nan")
+
+    sigma_g2 = float(rtv_invr / float(n_minus_p))
+    sigma_e2 = float(lbd_f * sigma_g2)
+    return sigma_g2, sigma_e2
+
+
+def _mixed_trait_pve_from_null(
+    s: np.ndarray,
+    sigma_g2: float,
+    sigma_e2: float,
+    lbd: float,
+) -> Union[float, None]:
+    sigma_g2_f = float(sigma_g2)
+    sigma_e2_f = float(sigma_e2)
+    sigma_sum = float(sigma_g2_f + sigma_e2_f)
+    trace_mean = float(
+        np.sum(
+            np.maximum(np.asarray(s, dtype=np.float64).reshape(-1), 0.0),
+            dtype=np.float64,
+        )
+        / float(max(1, int(np.asarray(s).shape[0])))
+    )
+    if np.isfinite(sigma_sum) and sigma_sum > 0.0:
+        pve_raw = float(sigma_g2_f / sigma_sum)
+        var_g_diag_scaled = float(sigma_g2_f) * max(trace_mean, 0.0)
+        denom_diag_scaled = float(var_g_diag_scaled + sigma_e2_f)
+        if np.isfinite(denom_diag_scaled) and denom_diag_scaled > 0.0:
+            return float(var_g_diag_scaled / denom_diag_scaled)
+        return float(pve_raw) if np.isfinite(pve_raw) else None
+
+    lbd_f = float(lbd)
+    if np.isfinite(lbd_f) and lbd_f > 0.0 and np.isfinite(trace_mean):
+        denom = float(trace_mean + lbd_f)
+        if denom > 0.0:
+            return float(trace_mean / denom)
+    return None
+
+
+def _run_mixed_trait_packed_multi_entry(
+    *,
+    genofile: str,
+    pheno: pd.DataFrame,
+    ids: np.ndarray,
+    grm: Union[np.ndarray, None],
+    outprefix: str,
+    maf_threshold: float,
+    max_missing_rate: float,
+    genetic_model: str,
+    het_threshold: float,
+    chunk_size: int,
+    qmatrix: np.ndarray,
+    cov_all: Union[np.ndarray, None],
+    plot: bool,
+    threads: int,
+    logger: logging.Logger,
+    use_spinner: bool = False,
+    snps_only: bool = True,
+    eff_snp_by_trait: Union[dict[str, int], None] = None,
+    summary_rows: Union[list[dict[str, object]], None] = None,
+    saved_paths: Union[list[str], None] = None,
+    trait_names: Union[list[str], None] = None,
+    emit_trait_header: bool = True,
+    preloaded_packed: Union[dict[str, object], None] = None,
+    force_model: bool = False,
+    trait_prepared_meta_by_trait: Union[dict[str, dict[str, object]], None] = None,
+    precomputed_shared_input: Union[dict[str, object], None] = None,
+) -> None:
+    model_label = "LMM"
+    if str(genetic_model).lower() != "add":
+        raise ValueError(f"{model_label} trait-level route supports additive coding only.")
+    if plot:
+        raise ValueError(f"{model_label} trait-level route does not support per-trait plotting.")
+    if grm is None:
+        raise ValueError("LMM trait-level route requires a prepared GRM.")
+
+    if eff_snp_by_trait is None:
+        eff_snp_by_trait = {}
+    if summary_rows is None:
+        summary_rows = []
+    if saved_paths is None:
+        saved_paths = []
+
+    pheno_aligned, ids = _align_pheno_to_sample_order(pheno, ids)
+    trait_iter = _resolve_trait_iter(pheno_aligned, trait_names)
+    if len(trait_iter) <= 1:
+        raise ValueError(f"{model_label} trait-level route requires at least 2 traits.")
+
+    trait_labels = [str(pname) for pname in trait_iter]
+    fallback_serial = run_lmm_packed_fullrank
+
+    shared_ctx: Union[dict[str, object], None] = None
+    if isinstance(precomputed_shared_input, dict):
+        pre_labels = [str(x) for x in list(precomputed_shared_input.get("trait_labels", []))]
+        if pre_labels == trait_labels:
+            shared_ctx = {
+                "trait_labels": list(pre_labels),
+                "trait_row_by_pos": {int(i): int(i) for i in range(len(pre_labels))},
+                "trait_matrix_t": np.ascontiguousarray(
+                    np.asarray(precomputed_shared_input.get("trait_matrix_t"), dtype=np.float64),
+                    dtype=np.float64,
+                ),
+                "keep_idx_local": np.ascontiguousarray(
+                    np.asarray(precomputed_shared_input.get("keep_idx"), dtype=np.int64).reshape(-1),
+                    dtype=np.int64,
+                ),
+                "sample_idx_full": np.ascontiguousarray(
+                    np.asarray(precomputed_shared_input.get("sample_idx_full"), dtype=np.int64).reshape(-1),
+                    dtype=np.int64,
+                ) if precomputed_shared_input.get("sample_idx_full", None) is not None else None,
+                "x_cov": np.ascontiguousarray(
+                    np.asarray(precomputed_shared_input.get("x_cov"), dtype=np.float64),
+                    dtype=np.float64,
+                ) if precomputed_shared_input.get("x_cov", None) is not None else None,
+                "n_idv": int(precomputed_shared_input.get("n_idv", 0) or 0),
+            }
+    if shared_ctx is None:
+        id_to_full = {str(sid): i for i, sid in enumerate(np.asarray(ids, dtype=str))}
+        shared_ctx = _build_shared_trait_fast_context(
+            pheno_aligned,
+            list(trait_iter),
+            ids_aligned=np.asarray(ids, dtype=str),
+            id_to_full_index=id_to_full,
+            qmatrix=qmatrix,
+            cov_all=cov_all,
+        )
+    if not isinstance(shared_ctx, dict):
+        _log_file_only(
+            logger,
+            logging.INFO,
+            f"{model_label} trait-level fast path disabled: traits are not aligned on a shared non-missing mask; falling back to serial packed route.",
+        )
+        fallback_serial(
+            genofile=genofile,
+            pheno=pheno,
+            ids=ids,
+            grm=grm,
+            outprefix=outprefix,
+            maf_threshold=maf_threshold,
+            max_missing_rate=max_missing_rate,
+            genetic_model=genetic_model,
+            het_threshold=het_threshold,
+            chunk_size=chunk_size,
+            qmatrix=qmatrix,
+            cov_all=cov_all,
+            plot=plot,
+            threads=threads,
+            logger=logger,
+            use_spinner=use_spinner,
+            snps_only=bool(snps_only),
+            eff_snp_by_trait=eff_snp_by_trait,
+            summary_rows=summary_rows,
+            saved_paths=saved_paths,
+            trait_names=trait_labels,
+            emit_trait_header=False,
+            preloaded_packed=preloaded_packed,
+            force_model=bool(force_model),
+        )
+        return
+
+    shared_trait_matrix_t = np.ascontiguousarray(
+        np.asarray(shared_ctx["trait_matrix_t"], dtype=np.float64),
+        dtype=np.float64,
+    )
+    shared_keep_idx = np.ascontiguousarray(
+        np.asarray(shared_ctx["keep_idx_local"], dtype=np.int64).reshape(-1),
+        dtype=np.int64,
+    )
+    shared_x_cov = np.ascontiguousarray(
+        np.asarray(shared_ctx["x_cov"], dtype=np.float64),
+        dtype=np.float64,
+    )
+    shared_n_idv = int(shared_ctx.get("n_idv", shared_keep_idx.shape[0]) or 0)
+    if (
+        shared_trait_matrix_t.ndim != 2
+        or int(shared_trait_matrix_t.shape[0]) != len(trait_labels)
+        or int(shared_trait_matrix_t.shape[1]) != int(shared_n_idv)
+        or int(shared_keep_idx.shape[0]) != int(shared_n_idv)
+        or shared_x_cov.ndim != 2
+        or int(shared_x_cov.shape[0]) != int(shared_n_idv)
+    ):
+        _log_file_only(
+            logger,
+            logging.INFO,
+            f"{model_label} trait-level fast path disabled: invalid shared trait context; falling back to serial packed route.",
+        )
+        fallback_serial(
+            genofile=genofile,
+            pheno=pheno,
+            ids=ids,
+            grm=grm,
+            outprefix=outprefix,
+            maf_threshold=maf_threshold,
+            max_missing_rate=max_missing_rate,
+            genetic_model=genetic_model,
+            het_threshold=het_threshold,
+            chunk_size=chunk_size,
+            qmatrix=qmatrix,
+            cov_all=cov_all,
+            plot=plot,
+            threads=threads,
+            logger=logger,
+            use_spinner=use_spinner,
+            snps_only=bool(snps_only),
+            eff_snp_by_trait=eff_snp_by_trait,
+            summary_rows=summary_rows,
+            saved_paths=saved_paths,
+            trait_names=trait_labels,
+            emit_trait_header=False,
+            preloaded_packed=preloaded_packed,
+            force_model=bool(force_model),
+        )
+        return
+
+    meta0 = None
+    if isinstance(trait_prepared_meta_by_trait, dict) and len(trait_labels) > 0:
+        meta0 = trait_prepared_meta_by_trait.get(trait_labels[0])
+    if not isinstance(meta0, dict) or any(
+        trait_prepared_meta_by_trait.get(label) is not meta0  # type: ignore[union-attr]
+        for label in trait_labels
+    ):
+        _log_file_only(
+            logger,
+            logging.INFO,
+            f"{model_label} trait-level fast path disabled: prepared SNP metadata is not shared across aligned traits; falling back to serial packed route.",
+        )
+        fallback_serial(
+            genofile=genofile,
+            pheno=pheno,
+            ids=ids,
+            grm=grm,
+            outprefix=outprefix,
+            maf_threshold=maf_threshold,
+            max_missing_rate=max_missing_rate,
+            genetic_model=genetic_model,
+            het_threshold=het_threshold,
+            chunk_size=chunk_size,
+            qmatrix=qmatrix,
+            cov_all=cov_all,
+            plot=plot,
+            threads=threads,
+            logger=logger,
+            use_spinner=use_spinner,
+            snps_only=bool(snps_only),
+            eff_snp_by_trait=eff_snp_by_trait,
+            summary_rows=summary_rows,
+            saved_paths=saved_paths,
+            trait_names=trait_labels,
+            emit_trait_header=False,
+            preloaded_packed=preloaded_packed,
+            force_model=bool(force_model),
+        )
+        return
+
+    prefix, full_ids, packed_ctx, sites_all = _prepare_packed_bed_once_for_gwas(
+        genofile=genofile,
+        maf_threshold=float(maf_threshold),
+        max_missing_rate=float(max_missing_rate),
+        het_threshold=float(het_threshold),
+        snps_only=bool(snps_only),
+        use_spinner=bool(use_spinner),
+        preloaded_packed=preloaded_packed,
+        load_site_meta=False,
+        status_label=f"Loading BED genotype of {model_label} trait-level subset",
+        trait_prepared_meta=meta0,
+        emit_status=False,
+    )
+    packed_preload_ready = _packed_preload_ready_state(
+        prefix=prefix,
+        full_ids=full_ids,
+        packed_ctx=packed_ctx,
+        sites_all=sites_all,
+    )
+    id_to_idx = {sid: i for i, sid in enumerate(full_ids)}
+    try:
+        sample_map = np.asarray(
+            [id_to_idx[str(sid)] for sid in np.asarray(ids, dtype=str)],
+            dtype=np.int64,
+        )
+    except KeyError as e:
+        raise ValueError("Some aligned sample IDs are not present in packed BED sample order.") from e
+    shared_sample_idx_trait = np.ascontiguousarray(
+        sample_map[shared_keep_idx],
+        dtype=np.int64,
+    )
+
+    packed, packed_n, packed_row_idx, maf, miss, row_flip = _packed_ctx_active_view_for_gwas(
+        packed_ctx
+    )
+    if packed_n <= 0:
+        raise ValueError("Packed BED reported invalid sample count.")
+    n_sites_active = int(packed_row_idx.shape[0])
+    if n_sites_active <= 0:
+        _log_file_only(
+            logger,
+            logging.INFO,
+            f"{model_label} trait-level packed route has 0 active SNPs after filtering.",
+        )
+        return
+
+    process = psutil.Process()
+    n_cores = detect_effective_threads()
+    peak_rss = process.memory_info().rss
+    cpu_t0 = process.cpu_times()
+    t0 = time.time()
+
+    grm_secs = 0.0
+    shared_grm = grm
+
+    evd_t0 = time.monotonic()
+    eigvals, eigvecs, _evd_backend, evd_secs = _gwas_eigh_from_grm(
+        shared_grm,
+        threads=max(1, int(threads)),
+        logger=logger,
+        stage_label="lmm-trait-level",
+        require_rust=True,
+        diag_ridge=1e-6,
+        subset_idx=shared_keep_idx,
+    )
+    evd_secs = max(float(evd_secs), max(time.monotonic() - evd_t0, 0.0))
+    eigvals = np.asarray(eigvals, dtype=np.float64)
+    eigvecs = np.asarray(eigvecs, dtype=np.float64)
+    if eigvecs.shape != (shared_n_idv, shared_n_idv):
+        raise ValueError(
+            f"{model_label} eigenvector shape mismatch: got {eigvecs.shape}, expected ({shared_n_idv}, {shared_n_idv})."
+        )
+
+    _log_file_only(
+        logger,
+        logging.INFO,
+        f"{model_label} trait-level shared-mask fast path: {len(trait_labels)} / {len(trait_labels)} traits x {int(shared_n_idv)} samples.",
+    )
+    _log_model_line(
+        logger,
+        model_label,
+        f"trait-level shared eigen-decomposition ({int(len(trait_labels))} traits x {int(shared_n_idv)} samples) [{format_elapsed(evd_secs)}]",
+        use_spinner=bool(use_spinner),
+    )
+
+    if not hasattr(jxrs, "lmm_rotate_y_with_ut_f64"):
+        raise RuntimeError(
+            "Rust extension missing lmm_rotate_y_with_ut_f64. "
+            "Rebuild/install JanusX extension first."
+        )
+
+    trait_total = int(len(trait_labels))
+    thread_budget = int(threads)
+    if thread_budget <= 0:
+        thread_budget = int(max(1, n_cores))
+    outer_workers = int(min(max(1, trait_total), max(1, thread_budget)))
+    inner_threads = int(max(1, thread_budget // max(1, outer_workers)))
+
+    dh_shared = np.ascontiguousarray(np.asarray(eigvecs.T, dtype=np.float32), dtype=np.float32)
+    s_shared64 = np.ascontiguousarray(np.maximum(eigvals, 0.0), dtype=np.float64)
+    shared_x_design = np.ascontiguousarray(
+        np.concatenate(
+            [
+                np.ones((int(shared_n_idv), 1), dtype=np.float64),
+                shared_x_cov,
+            ],
+            axis=1,
+        ),
+        dtype=np.float64,
+    )
+    x_rot_shared_raw, _shared_zero_y = jxrs.lmm_rotate_x_y_with_ut_f64(
+        dh_shared,
+        shared_x_design,
+        np.zeros(int(shared_n_idv), dtype=np.float64),
+        int(max(1, thread_budget)),
+    )
+    x_rot_shared = np.ascontiguousarray(np.asarray(x_rot_shared_raw, dtype=np.float64), dtype=np.float64)
+
+    direct_result_max_rows = int(_lmm_trait_direct_result_max_rows())
+    use_direct_result_agg = (
+        direct_result_max_rows > 0 and int(n_sites_active) <= direct_result_max_rows
+    )
+    preload_site_meta = (
+        int(n_sites_active) > 0
+        and (
+            use_direct_result_agg
+            or int(n_sites_active) <= int(_mixed_trait_site_meta_preload_max_rows())
+        )
+    )
+    chrom_meta: list[str] = []
+    pos_meta: list[int] = []
+    snp_meta: list[str] = []
+    allele0_meta: list[str] = []
+    allele1_meta: list[str] = []
+    bed_prefix_arg: Union[str, None] = str(prefix)
+    if preload_site_meta:
+        site_cols = _resolve_packed_sites_all(prefix, packed_row_idx, sites_all)
+        chrom_meta = list(site_cols.chrom)
+        pos_meta = [int(v) for v in site_cols.pos]
+        snp_meta = list(site_cols.snp)
+        allele0_meta = list(site_cols.allele0)
+        allele1_meta = list(site_cols.allele1)
+        bed_prefix_arg = None
+
+    _log_file_only(
+        logger,
+        logging.INFO,
+        f"{model_label} trait-level parallel layout: workers={outer_workers}, "
+        f"inner_threads={inner_threads}, shared_x_rotated=yes, "
+        f"shared_bim_cached={'yes' if bed_prefix_arg is None else 'no'}, "
+        f"direct_agg={'yes' if use_direct_result_agg else 'no'}.",
+    )
+
+    trait_states_raw: list[Union[dict[str, object], None]] = [None] * trait_total
+
+    def _fit_trait_null(trait_idx: int) -> tuple[int, dict[str, object]]:
+        null_t0 = time.monotonic()
+        trait_name = str(trait_labels[trait_idx])
+        y_vec = np.ascontiguousarray(
+            np.asarray(shared_trait_matrix_t[trait_idx], dtype=np.float64).reshape(-1),
+            dtype=np.float64,
+        )
+        y_rot_raw = jxrs.lmm_rotate_y_with_ut_f64(
+            dh_shared,
+            y_vec,
+            int(max(1, inner_threads)),
+        )
+        y_rot = np.ascontiguousarray(
+            np.asarray(y_rot_raw, dtype=np.float64).reshape(-1),
+            dtype=np.float64,
+        )
+        lbd0, ml0, reml0 = jxrs.lmm_reml_null_f32(
+            s_shared64,
+            x_rot_shared,
+            y_rot,
+            -5.0,
+            5.0,
+            50,
+            1e-3,
+        )
+        sigma_g2, sigma_e2 = _mixed_trait_profile_exact_vc(
+            s_shared64,
+            x_rot_shared,
+            y_rot,
+            float(lbd0),
+        )
+        pve = _mixed_trait_pve_from_null(
+            s_shared64,
+            float(sigma_g2),
+            float(sigma_e2),
+            float(lbd0),
+        )
+
+        state: dict[str, object] = {
+            "trait": trait_name,
+            "null_lbd": float(lbd0),
+            "ml0": float(ml0),
+            "reml0": float(reml0),
+            "pve": (float(pve) if pve is not None and np.isfinite(float(pve)) else None),
+            "null_secs": max(time.monotonic() - null_t0, 0.0),
+            "y_rot": y_rot,
+            "init_log10_lbd": (
+                float(np.log10(float(lbd0)))
+                if np.isfinite(float(lbd0)) and float(lbd0) > 0.0
+                else None
+            ),
+        }
+        switch_to_lm = False
+        lrt_stat = float("nan")
+        lrt_p = float("nan")
+        if not bool(force_model):
+            switch_to_lm, lrt_stat, lrt_p = _mixed_model_switch_to_lm_decision(
+                y_vec=y_vec,
+                x_cov=shared_x_cov,
+                lmm_ml0=float(ml0),
+                alpha=0.05,
+            )
+        state.update(
+            {
+                "switch_to_lm": bool(switch_to_lm),
+                "lrt_stat": float(lrt_stat),
+                "lrt_p": float(lrt_p),
+            }
+        )
+        return trait_idx, state
+
+    if outer_workers <= 1:
+        for trait_idx in range(trait_total):
+            idx_done, state_done = _fit_trait_null(trait_idx)
+            trait_states_raw[idx_done] = state_done
+    else:
+        with cf.ThreadPoolExecutor(
+            max_workers=outer_workers,
+            thread_name_prefix="jx-lmm-trait-null",
+        ) as ex:
+            future_map = {
+                ex.submit(_fit_trait_null, trait_idx): trait_idx
+                for trait_idx in range(trait_total)
+            }
+            for fut in cf.as_completed(future_map):
+                idx_done, state_done = fut.result()
+                trait_states_raw[idx_done] = state_done
+                try:
+                    peak_rss = max(peak_rss, process.memory_info().rss)
+                except Exception:
+                    pass
+
+    trait_states: list[dict[str, object]] = []
+    for state in trait_states_raw:
+        if not isinstance(state, dict):
+            raise RuntimeError(f"{model_label} trait-level null fit produced an empty state.")
+        trait_states.append(state)
+
+    if not bool(force_model):
+        switch_state = next(
+            (state for state in trait_states if bool(state.get("switch_to_lm", False))),
+            None,
+        )
+        if switch_state is not None:
+            _emit_warning_line(
+                logger,
+                (
+                    f"{model_label} trait-level fast path disabled: trait {switch_state['trait']} would switch to LM "
+                    f"(null LRT stat={float(switch_state.get('lrt_stat', float('nan'))):.4g}, "
+                    f"p={float(switch_state.get('lrt_p', float('nan'))):.4g}); falling back to serial packed route."
+                ),
+                use_spinner=bool(use_spinner),
+            )
+            fallback_serial(
+                genofile=genofile,
+                pheno=pheno,
+                ids=ids,
+                grm=grm,
+                outprefix=outprefix,
+                maf_threshold=maf_threshold,
+                max_missing_rate=max_missing_rate,
+                genetic_model=genetic_model,
+                het_threshold=het_threshold,
+                chunk_size=chunk_size,
+                qmatrix=qmatrix,
+                cov_all=cov_all,
+                plot=plot,
+                threads=threads,
+                logger=logger,
+                use_spinner=use_spinner,
+                snps_only=bool(snps_only),
+                eff_snp_by_trait=eff_snp_by_trait,
+                summary_rows=summary_rows,
+                saved_paths=saved_paths,
+                trait_names=trait_labels,
+                emit_trait_header=False,
+                preloaded_packed=packed_preload_ready,
+                force_model=bool(force_model),
+            )
+            return
+
+    out_tsv = f"{outprefix}.lmm.tsv"
+    agg_tmp_tsv = _gwas_result_tmp_path(out_tsv)
+    scan_secs_by_trait = [0.0] * trait_total
+    any_rows = False
+    pbar = _ProgressAdapter(
+        total=int(max(1, trait_total)),
+        desc=f"{model_label}(trait)",
+        force_animate=True,
+        logger=logger,
+    )
+    pbar_done = 0
+
+    trait_tmp_paths = (
+        [
+            f"{agg_tmp_tsv}.{trait_idx:06d}.trait.tsv"
+            for trait_idx in range(trait_total)
+        ]
+        if not use_direct_result_agg
+        else []
+    )
+
+    def _scan_trait(tmp_trait_idx: int):
+        state = trait_states[tmp_trait_idx]
+        scan_t0 = time.monotonic()
+        y_rot_trait = np.ascontiguousarray(
+            np.asarray(state["y_rot"], dtype=np.float64).reshape(-1),
+            dtype=np.float64,
+        )
+        if use_direct_result_agg:
+            result_arr = np.asarray(
+                jxrs.lmm_reml_assoc_packed_f32(
+                    packed,
+                    int(packed_n),
+                    row_flip,
+                    maf,
+                    s_shared64,
+                    x_rot_shared,
+                    y_rot_trait,
+                    dh_shared,
+                    shared_sample_idx_trait,
+                    row_indices=packed_row_idx,
+                    low=-5.0,
+                    high=5.0,
+                    max_iter=50,
+                    tol=1e-2,
+                    threads=int(max(1, inner_threads)),
+                    model="add",
+                    nullml=None,
+                    init_log10_lbd=state.get("init_log10_lbd", None),
+                    rotate_block_rows=int(max(1, int(chunk_size))),
+                ),
+                dtype=np.float64,
+            )
+            rows_text, rows_written = _build_lmm_trait_rows_text(
+                str(state["trait"]),
+                result_arr,
+                chrom_meta,
+                pos_meta,
+                snp_meta,
+                allele0_meta,
+                allele1_meta,
+                maf,
+                miss,
+            )
+            return (
+                tmp_trait_idx,
+                max(time.monotonic() - scan_t0, 0.0),
+                rows_text,
+                int(rows_written),
+            )
+
+        tmp_tsv = trait_tmp_paths[tmp_trait_idx]
+        _ = jxrs.lmm_reml_assoc_packed_f32_to_tsv(
+            packed,
+            int(packed_n),
+            row_flip,
+            maf,
+            miss,
+            s_shared64,
+            x_rot_shared,
+            y_rot_trait,
+            dh_shared,
+            chrom_meta if bed_prefix_arg is None else [],
+            pos_meta if bed_prefix_arg is None else [],
+            snp_meta if bed_prefix_arg is None else [],
+            allele0_meta if bed_prefix_arg is None else [],
+            allele1_meta if bed_prefix_arg is None else [],
+            tmp_tsv,
+            shared_sample_idx_trait,
+            row_indices=packed_row_idx,
+            low=-5.0,
+            high=5.0,
+            max_iter=50,
+            tol=1e-2,
+            threads=int(max(1, inner_threads)),
+            model="add",
+            nullml=None,
+            init_log10_lbd=state.get("init_log10_lbd", None),
+            rotate_block_rows=int(max(1, int(chunk_size))),
+            bed_prefix=bed_prefix_arg,
+        )
+        return tmp_trait_idx, max(time.monotonic() - scan_t0, 0.0)
+
+    scan_completed = False
+    try:
+        with open(
+            agg_tmp_tsv,
+            "w",
+            encoding="utf-8",
+            buffering=16 * 1024 * 1024,
+            newline="",
+        ) as agg_fh:
+            agg_fh.write(_MIXED_TRAIT_AGG_HEADER)
+            if use_direct_result_agg:
+                pending_rows_text: dict[int, tuple[str, int]] = {}
+                next_write_idx = 0
+                if outer_workers <= 1:
+                    for trait_idx in range(trait_total):
+                        idx_done, scan_secs, rows_text, rows_written = _scan_trait(trait_idx)
+                        scan_secs_by_trait[idx_done] = float(scan_secs)
+                        pending_rows_text[idx_done] = (str(rows_text), int(rows_written))
+                        while next_write_idx in pending_rows_text:
+                            rows_text_now, rows_written_now = pending_rows_text.pop(next_write_idx)
+                            if rows_text_now:
+                                agg_fh.write(rows_text_now)
+                            any_rows = bool(any_rows or rows_written_now > 0)
+                            trait_states[next_write_idx]["scan_secs"] = float(
+                                scan_secs_by_trait[next_write_idx]
+                            )
+                            next_write_idx += 1
+                        pbar.update(1)
+                        pbar_done += 1
+                        try:
+                            peak_rss = max(peak_rss, process.memory_info().rss)
+                        except Exception:
+                            pass
+                else:
+                    with cf.ThreadPoolExecutor(
+                        max_workers=outer_workers,
+                        thread_name_prefix="jx-lmm-trait-scan",
+                    ) as ex:
+                        future_map = {
+                            ex.submit(_scan_trait, trait_idx): trait_idx
+                            for trait_idx in range(trait_total)
+                        }
+                        for fut in cf.as_completed(future_map):
+                            idx_done, scan_secs, rows_text, rows_written = fut.result()
+                            scan_secs_by_trait[idx_done] = float(scan_secs)
+                            pending_rows_text[idx_done] = (str(rows_text), int(rows_written))
+                            while next_write_idx in pending_rows_text:
+                                rows_text_now, rows_written_now = pending_rows_text.pop(next_write_idx)
+                                if rows_text_now:
+                                    agg_fh.write(rows_text_now)
+                                any_rows = bool(any_rows or rows_written_now > 0)
+                                trait_states[next_write_idx]["scan_secs"] = float(
+                                    scan_secs_by_trait[next_write_idx]
+                                )
+                                next_write_idx += 1
+                            pbar.update(1)
+                            pbar_done += 1
+                            try:
+                                peak_rss = max(peak_rss, process.memory_info().rss)
+                            except Exception:
+                                pass
+            else:
+                if outer_workers <= 1:
+                    for trait_idx in range(trait_total):
+                        idx_done, scan_secs = _scan_trait(trait_idx)
+                        scan_secs_by_trait[idx_done] = float(scan_secs)
+                        pbar.update(1)
+                        pbar_done += 1
+                        try:
+                            peak_rss = max(peak_rss, process.memory_info().rss)
+                        except Exception:
+                            pass
+                else:
+                    with cf.ThreadPoolExecutor(
+                        max_workers=outer_workers,
+                        thread_name_prefix="jx-lmm-trait-scan",
+                    ) as ex:
+                        future_map = {
+                            ex.submit(_scan_trait, trait_idx): trait_idx
+                            for trait_idx in range(trait_total)
+                        }
+                        for fut in cf.as_completed(future_map):
+                            idx_done, scan_secs = fut.result()
+                            scan_secs_by_trait[idx_done] = float(scan_secs)
+                            pbar.update(1)
+                            pbar_done += 1
+                            try:
+                                peak_rss = max(peak_rss, process.memory_info().rss)
+                            except Exception:
+                                pass
+
+                for trait_idx, trait_name in enumerate(trait_labels):
+                    rows_here = _append_trait_tmp_rows_with_phenotype(
+                        trait_tmp_paths[trait_idx],
+                        agg_fh,
+                        trait_name,
+                    )
+                    any_rows = bool(any_rows or rows_here > 0)
+                    trait_states[trait_idx]["scan_secs"] = float(scan_secs_by_trait[trait_idx])
+        scan_completed = True
+    finally:
+        try:
+            if int(pbar_done) < int(max(1, pbar.total)):
+                pbar.update(int(max(1, pbar.total)) - int(pbar_done))
+            pbar.finish()
+        except Exception:
+            pass
+        pbar.close(show_done=False)
+        if not use_direct_result_agg:
+            for tmp_tsv in trait_tmp_paths:
+                _cleanup_gwas_result_tmp(tmp_tsv)
+        if not scan_completed:
+            _cleanup_gwas_result_tmp(agg_tmp_tsv)
+
+    if any_rows:
+        _finalize_gwas_result_tsv(agg_tmp_tsv, out_tsv, prefix, logger=logger)
+        saved_paths.append(str(out_tsv))
+        _log_model_line(
+            logger,
+            model_label,
+            f"Results saved to {_display_path(str(out_tsv))}",
+            use_spinner=bool(use_spinner),
+        )
+    else:
+        _cleanup_gwas_result_tmp(agg_tmp_tsv)
+
+    peak_rss = max(peak_rss, process.memory_info().rss)
+    cpu_t1 = process.cpu_times()
+    wall = max(time.time() - t0, 1e-12)
+    cpu_used = (cpu_t1.user - cpu_t0.user) + (cpu_t1.system - cpu_t0.system)
+    avg_cpu = 100.0 * cpu_used / (wall * max(1, n_cores))
+    peak_rss_gb = peak_rss / (1024 ** 3)
+    avg_shared_overhead = (float(evd_secs) + float(grm_secs)) / float(max(1, len(trait_states)))
+
+    _log_model_line(
+        logger,
+        model_label,
+        f"trait-level shared packed scan ({int(len(trait_states))} traits)",
+        use_spinner=bool(use_spinner),
+    )
+    _log_model_line(
+        logger,
+        model_label,
+        f"avg CPU ~ {avg_cpu:.1f}% of {n_cores} c, peak RSS ~ {peak_rss_gb:.2f} G",
+        use_spinner=bool(use_spinner),
+    )
+
+    for state in trait_states:
+        trait_name = str(state["trait"])
+        eff_snp_by_trait[trait_name] = int(n_sites_active)
+        summary_rows.append(
+            {
+                "phenotype": trait_name,
+                "model": str(model_label),
+                "nidv": int(shared_n_idv),
+                "eff_snp": int(n_sites_active),
+                "pve": (
+                    float(state["pve"])
+                    if state.get("pve", None) is not None
+                    else None
+                ),
+                "avg_cpu": float(avg_cpu),
+                "peak_rss_gb": float(peak_rss_gb),
+                "gwas_time_s": float(
+                    avg_shared_overhead
+                    + float(state.get("null_secs", 0.0))
+                    + float(state.get("scan_secs", 0.0))
+                ),
+                "viz_time_s": 0.0,
+                "result_file": (str(out_tsv) if any_rows else ""),
+            }
+        )
+
+    _rich_success(
+        logger,
+        f"{model_label} ...Finished [{format_elapsed(wall)}]",
+        use_spinner=bool(use_spinner),
+    )
+
+
+def run_lmm_trait_packed_multi_entry(**kwargs) -> None:
+    _run_mixed_trait_packed_multi_entry(
+        **kwargs,
+    )
 
 
 def run_lmm_packed_fullrank(

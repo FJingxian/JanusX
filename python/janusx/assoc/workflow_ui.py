@@ -46,6 +46,7 @@ _FASTPLOT_FIGSIZE = (16.0, 4.0)
 _FASTPLOT_DPI = 300
 _FASTPLOT_SCATTER_SIZE = 8.0
 _FASTPLOT_HIST_BINS = 15
+_FASTPLOT_SINGLETON_COLOR = "#C7CCD3"
 
 
 def _histogram_kde_count_curve(
@@ -100,6 +101,163 @@ def _histogram_kde_count_curve(
 
     y_count = density * float(vals.size) * bin_width
     return x_grid, y_count
+
+
+def _fastplot_sanitize_pvalues(values: object) -> np.ndarray:
+    p = pd.to_numeric(values, errors="coerce")
+    if isinstance(p, pd.Series):
+        arr = p.to_numpy(dtype=np.float64, copy=False)
+    else:
+        arr = np.asarray(p, dtype=np.float64)
+    arr = np.array(arr, dtype=np.float64, copy=True).reshape(-1)
+    arr[~np.isfinite(arr)] = 1.0
+    return np.clip(arr, np.nextafter(0.0, 1.0), 1.0)
+
+
+def _prepare_role_layered_manhattan_df(
+    results: pd.DataFrame,
+    gwasplot,
+) -> pd.DataFrame | None:
+    if "row_role" not in results.columns:
+        return None
+    results_df = results.reset_index(drop=True).copy()
+    if results_df.shape[0] == 0:
+        return pd.DataFrame(columns=["x", "y", "z", "row_role"])
+    results_df["chrom"] = results_df["chrom"].astype(str)
+    results_df["pos"] = pd.to_numeric(results_df["pos"], errors="coerce").fillna(0).astype(np.int64)
+    results_df["row_role"] = results_df["row_role"].astype(str).str.strip().str.lower()
+    chr_map = {str(label): i + 1 for i, label in enumerate(getattr(gwasplot, "chr_labels", []))}
+    results_df["__chr_code"] = results_df["chrom"].map(chr_map)
+    if results_df["__chr_code"].isna().any():
+        return None
+    results_sorted = (
+        results_df.sort_values(by=["__chr_code", "pos"], kind="mergesort")
+        .reset_index(drop=True)
+    )
+    if results_sorted.shape[0] != int(gwasplot.df.shape[0]):
+        return None
+    keep_idx = np.asarray(getattr(gwasplot, "minidx", []), dtype=np.int64)
+    if keep_idx.size == 0:
+        return pd.DataFrame(columns=["x", "y", "z", "row_role"])
+    kept_roles = results_sorted.iloc[keep_idx]["row_role"].to_numpy(dtype=object, copy=False)
+    plot_df = gwasplot.df.iloc[keep_idx].copy().reset_index(drop=True)
+    plot_df = plot_df.loc[:, ["x", "y", "z"]].copy()
+    plot_df["y"] = -np.log10(_fastplot_sanitize_pvalues(plot_df["y"]))
+    plot_df["row_role"] = kept_roles
+    plot_df = plot_df[np.isfinite(plot_df["x"]) & np.isfinite(plot_df["y"]) & np.isfinite(plot_df["z"])]
+    return plot_df.reset_index(drop=True)
+
+
+def _draw_role_layered_manhattan(
+    results: pd.DataFrame,
+    gwasplot,
+    *,
+    ax: plt.Axes,
+    threshold: float | None,
+    scatter_size: float,
+    min_logp: float = 0.5,
+) -> bool:
+    layered_df = _prepare_role_layered_manhattan_df(results, gwasplot)
+    if layered_df is None:
+        return False
+
+    from janusx.bioplotkit import apply_integer_yticks, color_set as _bioplotkit_color_set
+
+    plot_df = layered_df.copy()
+    plot_df = plot_df[plot_df["y"] >= float(min_logp)]
+    if plot_df.shape[0] == 0:
+        ax.text(0.5, 0.5, "No SNPs", ha="center", va="center", transform=ax.transAxes)
+        ax.set_xticks(gwasplot.ticks_loc, gwasplot.chr_labels)
+        ax.set_xlabel("Chromosome")
+        ax.set_ylabel("-log10(p-value)")
+        return True
+
+    singleton_mask = plot_df["row_role"] == "singleton"
+    combo_mask = plot_df["row_role"] == "combo"
+    combo_palette = list(_bioplotkit_color_set.get(6, []))
+    if len(combo_palette) == 0:
+        combo_palette = ["#3E4F94", "#3E90BF"]
+    chr_color_map = dict(
+        zip(
+            gwasplot.chr_ids,
+            [combo_palette[i % len(combo_palette)] for i in range(len(gwasplot.chr_ids))],
+        )
+    )
+
+    if bool(np.any(singleton_mask)):
+        single_df = plot_df.loc[singleton_mask, ["x", "y"]]
+        ax.scatter(
+            single_df["x"],
+            single_df["y"],
+            color=_FASTPLOT_SINGLETON_COLOR,
+            s=max(1.0, float(scatter_size) * 0.95),
+            alpha=0.55,
+            linewidths=0.0,
+            rasterized=True,
+            zorder=1,
+        )
+
+    if bool(np.any(combo_mask)):
+        combo_df = plot_df.loc[combo_mask, ["x", "y", "z"]]
+        for chr_id in gwasplot.chr_ids:
+            chr_mask = combo_df["z"] == chr_id
+            if not bool(np.any(chr_mask)):
+                continue
+            ax.scatter(
+                combo_df.loc[chr_mask, "x"],
+                combo_df.loc[chr_mask, "y"],
+                color=chr_color_map[chr_id],
+                s=max(1.0, float(scatter_size) * 1.05),
+                alpha=0.88,
+                linewidths=0.0,
+                rasterized=True,
+                zorder=3,
+            )
+
+    if threshold is not None:
+        ax.axhline(
+            y=float(threshold),
+            color="grey",
+            linewidth=1,
+            linestyle="--",
+        )
+
+    if gwasplot._chr_separators.size > 0:
+        for xsep in gwasplot._chr_separators:
+            if np.isfinite(xsep):
+                ax.axvline(
+                    float(xsep),
+                    ymin=0.0,
+                    ymax=1.0 / 3.0,
+                    linestyle="--",
+                    color="lightgrey",
+                    linewidth=0.6,
+                    alpha=0.8,
+                    zorder=0,
+                )
+
+    ax.set_xticks(gwasplot.ticks_loc, gwasplot.chr_labels)
+    if gwasplot._chr_bounds_min.size > 0 and gwasplot._chr_bounds_max.size > 0:
+        xmin = float(gwasplot._chr_bounds_min[0]) - float(gwasplot._edge_padding_x)
+        xmax = float(gwasplot._chr_bounds_max[-1]) + float(gwasplot._edge_padding_x)
+    else:
+        xmin = float(plot_df["x"].min())
+        xmax = float(plot_df["x"].max())
+    if xmax > xmin:
+        ax.set_xlim(xmin, xmax)
+    else:
+        eps = max(1e-9, abs(xmin) * 1e-9)
+        ax.set_xlim(xmin - eps, xmax + eps)
+    ax.margins(x=0.0)
+    ymax = float(plot_df["y"].max())
+    top = ymax + 0.1 * ymax if ymax > 0.0 else (float(min_logp) + 1.0)
+    if top <= float(min_logp):
+        top = float(min_logp) + 1.0
+    ax.set_ylim([float(min_logp), top])
+    ax.set_xlabel("Chromosome")
+    ax.set_ylabel("-log10(p-value)")
+    apply_integer_yticks(ax)
+    return True
 
 
 def _logger_flag(logger: Optional[logging.Logger], name: str, default: bool = False) -> bool:
@@ -507,12 +665,20 @@ def fastplot(
         axes["A"].set_ylabel("Count")
 
         # B: Manhattan plot
-        gwasplot.manhattan(
-            -np.log10(1 / max(1, results.shape[0])),
+        threshold = -np.log10(1 / max(1, results.shape[0]))
+        if not _draw_role_layered_manhattan(
+            results,
+            gwasplot,
             ax=axes["B"],
-            rasterized=True,
-            s=scatter_size,
-        )
+            threshold=threshold,
+            scatter_size=scatter_size,
+        ):
+            gwasplot.manhattan(
+                threshold,
+                ax=axes["B"],
+                rasterized=True,
+                s=scatter_size,
+            )
         manh_yticks = apply_integer_yticks(axes["B"])
         snp_n = int(results.shape[0])
         if snp_n >= 1_000_000:
@@ -592,14 +758,21 @@ def _run_fastplot_from_tsv_with_status(
     emit_done_line: bool = False,
 ) -> float:
     viz_t0 = time.time()
+    header_df = pd.read_csv(out_tsv, sep="\t", nrows=0)
+    usecols = ["chrom", "pos", "pwald"]
+    if "row_role" in header_df.columns:
+        usecols.append("row_role")
+    dtype_map: dict[str, object] = {"chrom": str, "pos": "int64"}
+    if "row_role" in usecols:
+        dtype_map["row_role"] = str
     if bool(use_spinner):
         with CliStatus("Visualizing ...", enabled=True, use_process=False) as task:
             try:
                 plot_df = pd.read_csv(
                     out_tsv,
                     sep="\t",
-                    usecols=["chrom", "pos", "pwald"],
-                    dtype={"chrom": str, "pos": "int64"},
+                    usecols=usecols,
+                    dtype=dtype_map,
                 )
                 plot_df["pwald"] = pd.to_numeric(plot_df["pwald"], errors="coerce")
                 with runtime_thread_stage(blas_threads=1, rayon_threads=1):
@@ -613,8 +786,8 @@ def _run_fastplot_from_tsv_with_status(
         plot_df = pd.read_csv(
             out_tsv,
             sep="\t",
-            usecols=["chrom", "pos", "pwald"],
-            dtype={"chrom": str, "pos": "int64"},
+            usecols=usecols,
+            dtype=dtype_map,
         )
         plot_df["pwald"] = pd.to_numeric(plot_df["pwald"], errors="coerce")
         with runtime_thread_stage(blas_threads=1, rayon_threads=1):

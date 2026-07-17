@@ -31,6 +31,8 @@ mod farmcpu;
 mod fastlmm_lowrank;
 #[path = "stats/fvlmm.rs"]
 mod fvlmm;
+#[path = "stats/fvlmm2.rs"]
+mod fvlmm2;
 #[path = "garfield/mod.rs"]
 pub(crate) mod garfield;
 #[path = "stats/gblup.rs"]
@@ -53,6 +55,8 @@ mod heritability;
 mod ld;
 #[path = "stats/lmm.rs"]
 mod lmm;
+#[path = "stats/lm_trait.rs"]
+mod lm_trait;
 #[path = "stats/logreg.rs"]
 mod logreg;
 #[path = "stats/packed.rs"]
@@ -196,6 +200,7 @@ use farmcpu::{
     farmcpu_packed_to_tsv, farmcpu_rem_packed, farmcpu_super_packed, farmcpu_write_assoc_tsv,
 };
 use fast_math::fastlmm_prepare_lowrank_f64;
+use fvlmm2::fvlmm2_assoc_chunk_f32;
 use fvlmm::{
     fastlmm_assoc_chunk_f32, fastlmm_assoc_from_snp_f32, fastlmm_reml_chunk_f32,
     fastlmm_reml_null_f32, fvlmm_assoc_bed_to_tsv_f32, fvlmm_assoc_chunk_f32,
@@ -231,6 +236,7 @@ use glm::{
     lm_block_assoc_f32, lm_block_assoc_packed, lm_block_assoc_packed_to_tsv,
     lm_stream_bed_segments_compact_to_tsv, lm_stream_bed_to_tsv,
 };
+use lm_trait::{lm_trait_assoc_bed_matrix_to_tsv, lm_trait_assoc_bed_to_tsv};
 use glm2::lm2_stream_bed_to_tsv;
 use gmerge::{convert_genotypes, merge_genotypes, PyConvertStats, PyMergeStats};
 use grm::{
@@ -278,6 +284,7 @@ use packed::{
 use plot::{qq_band_beta_logp_exact, qq_rank_sample_zero_based};
 use reml::{
     ai_reml_multi_f64, ai_reml_null_f64, lmm_reml_null_f32, lmm_rotate_x_y_with_ut_f64,
+    lmm_rotate_y_with_ut_f64,
     ml_loglike_null_f32,
 };
 use rrblup::{
@@ -770,6 +777,8 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(lm_block_assoc_f32, m)?)?;
     m.add_function(wrap_pyfunction!(algwas_packed_to_tsv, m)?)?;
     m.add_function(wrap_pyfunction!(lm_stream_bed_to_tsv, m)?)?;
+    m.add_function(wrap_pyfunction!(lm_trait_assoc_bed_to_tsv, m)?)?;
+    m.add_function(wrap_pyfunction!(lm_trait_assoc_bed_matrix_to_tsv, m)?)?;
     m.add_function(wrap_pyfunction!(lm2_stream_bed_to_tsv, m)?)?;
     m.add_function(wrap_pyfunction!(lm_stream_bed_segments_compact_to_tsv, m)?)?;
     m.add_function(wrap_pyfunction!(lm_block_assoc_packed, m)?)?;
@@ -915,7 +924,9 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
         fvlmm_assoc_chunk_from_snp_with_cache_f32,
         m
     )?)?;
+    m.add_function(wrap_pyfunction!(fvlmm2_assoc_chunk_f32, m)?)?;
     m.add_function(wrap_pyfunction!(lmm_rotate_x_y_with_ut_f64, m)?)?;
+    m.add_function(wrap_pyfunction!(lmm_rotate_y_with_ut_f64, m)?)?;
     m.add_function(wrap_pyfunction!(lmm_reml_assoc_bed_to_tsv_f32, m)?)?;
     m.add_function(wrap_pyfunction!(lmm_reml_lmm2_assoc_bed_to_tsv_f32, m)?)?;
     m.add_function(wrap_pyfunction!(lmm_reml_assoc_packed_f32, m)?)?;

@@ -139,6 +139,7 @@ _POSTGWAS_GENERIC_FONT_FAMILIES = {
     "cursive": "cursive",
     "fantasy": "fantasy",
 }
+_ANNOTATION_APPEND_BASE_COLS = ("start", "end", "nsnps", "MeanR2", "desc", "broaden", "LDclump")
 
 try:
     from tqdm.auto import tqdm
@@ -2378,6 +2379,97 @@ def _format_clump_sites(sites: list[tuple[str, int]]) -> str:
     return ";".join([f"{str(chrom)}_{int(pos)}" for chrom, pos in sites])
 
 
+def _resolve_annotation_append_colnames(original_columns: list[str]) -> dict[str, str]:
+    taken = {str(col) for col in original_columns}
+    resolved: dict[str, str] = {}
+    for base in _ANNOTATION_APPEND_BASE_COLS:
+        candidate = str(base)
+        if candidate in taken:
+            candidate = f"anno_{base}"
+            suffix = 2
+            while candidate in taken:
+                candidate = f"anno_{base}_{suffix}"
+                suffix += 1
+        resolved[str(base)] = candidate
+        taken.add(candidate)
+    return resolved
+
+
+def _prepare_annotation_base_rows(
+    df_sig_raw: pd.DataFrame,
+    *,
+    chr_col: str,
+    pos_col: str,
+) -> pd.DataFrame:
+    if chr_col not in df_sig_raw.columns or pos_col not in df_sig_raw.columns:
+        raise KeyError(f"Annotation output requires columns {chr_col!r} and {pos_col!r}.")
+    base = df_sig_raw.copy()
+    base[chr_col] = base[chr_col].astype(str)
+    base[pos_col] = pd.to_numeric(base[pos_col], errors="coerce")
+    base = base.dropna(subset=[pos_col]).copy()
+    if base.shape[0] == 0:
+        return base.set_index([chr_col, pos_col], drop=True)
+    base[pos_col] = base[pos_col].astype(int)
+    base = base.drop_duplicates(subset=[chr_col, pos_col], keep="first")
+    return base.set_index([chr_col, pos_col], drop=True)
+
+
+def _finalize_annotation_output_df(
+    df_filter: pd.DataFrame,
+    *,
+    chr_col: str,
+    pos_col: str,
+    original_columns: list[str],
+    annotation_col_map: dict[str, str],
+) -> pd.DataFrame:
+    df_out = df_filter.reset_index()
+    if pos_col in df_out.columns:
+        df_out[pos_col] = pd.to_numeric(df_out[pos_col], errors="coerce").fillna(0).astype(int)
+
+    start_col = annotation_col_map["start"]
+    end_col = annotation_col_map["end"]
+    nsnps_col = annotation_col_map["nsnps"]
+    meanr2_col = annotation_col_map["MeanR2"]
+
+    if start_col in df_out.columns:
+        df_out[start_col] = (
+            pd.to_numeric(df_out[start_col], errors="coerce")
+            .fillna(df_out[pos_col] if pos_col in df_out.columns else 0)
+            .astype(int)
+        )
+    if end_col in df_out.columns:
+        df_out[end_col] = (
+            pd.to_numeric(df_out[end_col], errors="coerce")
+            .fillna(df_out[pos_col] if pos_col in df_out.columns else 0)
+            .astype(int)
+        )
+    if nsnps_col in df_out.columns:
+        df_out[nsnps_col] = pd.to_numeric(df_out[nsnps_col], errors="coerce").fillna(0).astype(int)
+    if meanr2_col in df_out.columns:
+        df_out[meanr2_col] = (
+            pd.to_numeric(df_out[meanr2_col], errors="coerce")
+            .fillna(0.0)
+            .map(lambda x: f"{float(x):.2f}")
+        )
+
+    if chr_col in df_out.columns and pos_col in df_out.columns:
+        df_out["_chr_sort_key"] = df_out[chr_col].map(_chrom_sort_key)
+        df_out = df_out.sort_values(
+            by=["_chr_sort_key", pos_col],
+            ascending=[True, True],
+            kind="mergesort",
+        ).drop(columns=["_chr_sort_key"])
+
+    orig_cols = [str(col) for col in original_columns if str(col) in df_out.columns]
+    append_cols = [
+        annotation_col_map[base]
+        for base in _ANNOTATION_APPEND_BASE_COLS
+        if annotation_col_map.get(base) in df_out.columns
+    ]
+    remain_cols = [c for c in df_out.columns if c not in orig_cols and c not in append_cols]
+    return df_out.loc[:, orig_cols + remain_cols + append_cols]
+
+
 def _ldclump_significant_snps(
     df_sig: pd.DataFrame,
     *,
@@ -4342,12 +4434,16 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
             else:
                 try:
                     # Keep SNPs passing threshold
-                    lead_cols_present = [c for c in _LEAD_SNP_INFO_COLS if c in df.columns]
-                    df_filter_raw = df.loc[
-                        df[p_col] <= threshold,
-                        [chr_col, pos_col, p_col] + lead_cols_present,
-                    ].copy()
-                    df_filter = df_filter_raw.set_index([chr_col, pos_col])
+                    df_filter_raw = df.loc[df[p_col] <= threshold].copy()
+                    original_columns = df_filter_raw.columns.tolist()
+                    annotation_col_map = _resolve_annotation_append_colnames(
+                        [str(col) for col in original_columns]
+                    )
+                    df_filter = _prepare_annotation_base_rows(
+                        df_filter_raw,
+                        chr_col=chr_col,
+                        pos_col=pos_col,
+                    )
 
                     if args.ldclump_window_bp is not None:
                         n_before = int(df_filter_raw.shape[0])
@@ -4355,8 +4451,8 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                             "Applying LD clump on threshold-passing SNPs for annotation: "
                             f"window={args.ldclump_window_bp} bp, r2>={args.ldclump_r2:g}"
                         )
-                        df_filter, _clump_dict = _ldclump_significant_snps(
-                            df_filter_raw,
+                        df_clump_meta, _clump_dict = _ldclump_significant_snps(
+                            df_filter_raw.loc[:, [chr_col, pos_col, p_col]].copy(),
                             chr_col=chr_col,
                             pos_col=pos_col,
                             p_col=p_col,
@@ -4366,37 +4462,23 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                             logger=logger,
                             show_progress=(len(args.gwasfile) == 1),
                         )
+                        idx_chr = pd.Index(df_clump_meta.index.get_level_values(0).astype(str))
+                        idx_pos = pd.to_numeric(
+                            df_clump_meta.index.get_level_values(1),
+                            errors="coerce",
+                        ).fillna(0).astype(int)
+                        df_clump_meta.index = pd.MultiIndex.from_arrays(
+                            [idx_chr, idx_pos],
+                            names=[chr_col, pos_col],
+                        )
+                        df_filter = df_filter.reindex(df_clump_meta.index).copy()
+                        for src_col in ("start", "end", "nsnps", "MeanR2", "LDclump"):
+                            if src_col in df_clump_meta.columns:
+                                df_filter[annotation_col_map[src_col]] = df_clump_meta[src_col].values
                         n_after = int(df_filter.shape[0])
                         logger.info(
                             f"LD clump completed: kept {n_after}/{n_before} threshold-passing SNPs."
                         )
-
-                    # Attach lead SNP info columns (allele0/allele1/maf/beta/se) by lead index.
-                    lead_map = df_filter_raw.loc[:, [chr_col, pos_col] + lead_cols_present].copy()
-                    if lead_map.shape[0] > 0:
-                        lead_map[chr_col] = lead_map[chr_col].astype(str)
-                        lead_map[pos_col] = pd.to_numeric(lead_map[pos_col], errors="coerce")
-                        lead_map = lead_map.dropna(subset=[pos_col]).copy()
-                        lead_map[pos_col] = lead_map[pos_col].astype(int)
-                        lead_map = lead_map.drop_duplicates(subset=[chr_col, pos_col], keep="first")
-                        lead_map = lead_map.set_index([chr_col, pos_col], drop=True)
-
-                        idx_chr = pd.Index(df_filter.index.get_level_values(0).astype(str))
-                        idx_pos = pd.to_numeric(
-                            df_filter.index.get_level_values(1),
-                            errors="coerce",
-                        ).fillna(0).astype(int)
-                        df_filter.index = pd.MultiIndex.from_arrays(
-                            [idx_chr, idx_pos],
-                            names=[chr_col, pos_col],
-                        )
-
-                        for col in lead_cols_present:
-                            df_filter[col] = lead_map.reindex(df_filter.index)[col].values
-
-                    for col in _LEAD_SNP_INFO_COLS:
-                        if col not in df_filter.columns:
-                            df_filter[col] = "NA"
 
                     # Read annotation (GFF/bed) into unified annotation table
                     # After readanno:
@@ -4420,7 +4502,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                         ]
                         for idx in df_filter.index
                     ]
-                    df_filter["desc"] = [
+                    df_filter[annotation_col_map["desc"]] = [
                         _format_gene_annotation_dict(x)
                         for x in desc_exact
                     ]
@@ -4436,62 +4518,22 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                             ]
                             for idx in df_filter.index
                         ]
-                        df_filter["broaden"] = [
+                        df_filter[annotation_col_map["broaden"]] = [
                             _format_gene_annotation_dict(x)
                             for x in desc_broad
                         ]
                     else:
-                        if "broaden" in df_filter.columns:
-                            df_filter = df_filter.drop(columns=["broaden"])
+                        broaden_col = annotation_col_map["broaden"]
+                        if broaden_col in df_filter.columns:
+                            df_filter = df_filter.drop(columns=[broaden_col])
 
-                    df_out = df_filter.reset_index()
-                    if pos_col in df_out.columns:
-                        df_out[pos_col] = pd.to_numeric(df_out[pos_col], errors="coerce").fillna(0).astype(int)
-                    if "start" in df_out.columns:
-                        df_out["start"] = pd.to_numeric(df_out["start"], errors="coerce").fillna(df_out[pos_col]).astype(int)
-                    if "end" in df_out.columns:
-                        df_out["end"] = pd.to_numeric(df_out["end"], errors="coerce").fillna(df_out[pos_col]).astype(int)
-                    if "nsnps" in df_out.columns:
-                        df_out["nsnps"] = pd.to_numeric(df_out["nsnps"], errors="coerce").fillna(0).astype(int)
-                    if "MeanR2" in df_out.columns:
-                        df_out["MeanR2"] = (
-                            pd.to_numeric(df_out["MeanR2"], errors="coerce")
-                            .fillna(0.0)
-                            .map(lambda x: f"{float(x):.2f}")
-                        )
-
-                    # Output file is sorted by chromosome and position.
-                    if chr_col in df_out.columns and pos_col in df_out.columns:
-                        df_out["_chr_sort_key"] = df_out[chr_col].map(_chrom_sort_key)
-                        df_out = df_out.sort_values(
-                            by=["_chr_sort_key", pos_col],
-                            ascending=[True, True],
-                            kind="mergesort",
-                        ).drop(columns=["_chr_sort_key"])
-
-                    col_order: list[str] = [chr_col, pos_col]
-                    for col in _LEAD_SNP_INFO_COLS:
-                        if col in df_out.columns:
-                            col_order.append(col)
-                    if "start" in df_out.columns:
-                        col_order.append("start")
-                    if "end" in df_out.columns:
-                        col_order.append("end")
-                    if "nsnps" in df_out.columns:
-                        col_order.append("nsnps")
-                    if "MeanR2" in df_out.columns:
-                        col_order.append("MeanR2")
-                    if p_col in df_out.columns:
-                        col_order.append(p_col)
-                    if "desc" in df_out.columns:
-                        col_order.append("desc")
-                    if "broaden" in df_out.columns:
-                        col_order.append("broaden")
-                    remain_cols = [c for c in df_out.columns if c not in col_order and c != "LDclump"]
-                    if "LDclump" in df_out.columns:
-                        df_out = df_out[col_order + remain_cols + ["LDclump"]]
-                    else:
-                        df_out = df_out[col_order + remain_cols]
+                    df_out = _finalize_annotation_output_df(
+                        df_filter,
+                        chr_col=chr_col,
+                        pos_col=pos_col,
+                        original_columns=[str(col) for col in original_columns],
+                        annotation_col_map=annotation_col_map,
+                    )
 
                     anno_path = os.path.join(args.out, f"{output_stem}.{threshold}.anno.tsv")
                     df_out.to_csv(anno_path, sep="\t", index=False)

@@ -579,8 +579,12 @@ def _resolve_lm2_covariate_indices(
 
 def _format_gwas_packed_route_status(
     *,
+    gfile: str,
+    args,
     farmcpu_auto_fast: bool,
     algwas_auto_fast: bool,
+    requested_stream_models: list[str],
+    qtn_input_requested: bool,
 ) -> str:
     auto_tags: list[str] = []
     if bool(farmcpu_auto_fast):
@@ -589,7 +593,58 @@ def _format_gwas_packed_route_status(
         auto_tags.append("ALGWAS Auto-selected")
     if len(auto_tags) > 0:
         return f"Enabled ({'; '.join(auto_tags)})"
+    trait_level_packed_candidate = bool(
+        getattr(args, "trait_level", False)
+        and str(getattr(args, "model", "")).lower() == "add"
+        and (
+            bool(getattr(args, "lm", False))
+            or bool(getattr(args, "lmm", False))
+        )
+    )
+    if trait_level_packed_candidate:
+        source_is_bed = bool(_as_plink_prefix(str(gfile)) is not None)
+        if source_is_bed:
+            return "Candidate (trait-level shared packed scan)"
+        if bool(len(requested_stream_models) > 0 or qtn_input_requested):
+            return "Deferred (trait-level shared packed scan; PLINK cache on demand)"
+        return "Deferred (trait-level shared packed scan)"
     return "Disabled"
+
+
+def _format_gwas_packed_route_resolution(
+    *,
+    original_genofile: str,
+    stream_genofile: str,
+    preloaded_packed: Union[dict[str, object], None],
+    args,
+) -> Union[str, None]:
+    tags: list[str] = []
+    original_prefix = _as_plink_prefix(str(original_genofile))
+    stream_prefix = _as_plink_prefix(str(stream_genofile))
+    if stream_prefix is not None:
+        same_prefix = bool(
+            original_prefix is not None
+            and os.path.abspath(str(original_prefix)) == os.path.abspath(str(stream_prefix))
+        )
+        tags.append("BED input ready" if same_prefix else "PLINK cache ready")
+    if packed_preload_is_ready(preloaded_packed):
+        tags.append("packed preload ready")
+    trait_level_packed_candidate = bool(
+        getattr(args, "trait_level", False)
+        and str(getattr(args, "model", "")).lower() == "add"
+        and (
+            bool(getattr(args, "lm", False))
+            or bool(getattr(args, "lmm", False))
+        )
+    )
+    if trait_level_packed_candidate:
+        if packed_preload_is_ready(preloaded_packed):
+            tags.append("trait-level shared packed path ready")
+        elif stream_prefix is not None:
+            tags.append("trait-level shared packed candidate")
+    if len(tags) == 0:
+        return None
+    return "; ".join(tags)
 
 
 def _format_gwas_grm_status(grm, grm_arg: object) -> str:
@@ -1110,6 +1165,8 @@ def _build_gwas_trait_summary_lines(
 def _emit_gwas_trait_summary(
     logger: logging.Logger,
     rows: list[dict[str, object]],
+    *,
+    trait_label: Optional[str] = None,
 ) -> None:
     lines = _build_gwas_trait_summary_lines(rows)
     if len(lines) == 0:
@@ -1122,6 +1179,8 @@ def _emit_gwas_trait_summary(
         if isinstance(stream_logger, logging.Logger) and id(stream_logger) != id(report_logger):
             targets.append(stream_logger)
     for target in targets:
+        if trait_label is not None and str(trait_label).strip() != "":
+            target.info(f"Trait: {trait_label}")
         for line in lines:
             target.info(line)
 
@@ -1392,6 +1451,122 @@ def _resolve_trait_iter(
             )
         )
     return resolved
+
+
+def _build_shared_trait_fast_context(
+    pheno_aligned: pd.DataFrame,
+    trait_names: list[object],
+    *,
+    ids_aligned: Optional[np.ndarray] = None,
+    id_to_full_index: Optional[dict[str, int]] = None,
+    qmatrix: Optional[np.ndarray] = None,
+    cov_all: Optional[np.ndarray] = None,
+) -> Optional[dict[str, object]]:
+    """
+    Build one shared trait-mask context for trait-level fast paths.
+    """
+    if len(trait_names) <= 1:
+        return None
+    trait_col_idx = [
+        int(tr.col_idx)
+        for tr in trait_names
+        if isinstance(tr, _TraitRef)
+    ]
+    if len(trait_col_idx) != len(trait_names):
+        return None
+    try:
+        pheno_block = pheno_aligned.iloc[:, trait_col_idx].to_numpy(
+            dtype=np.float64,
+            copy=False,
+        )
+    except Exception:
+        return None
+    pheno_block = np.asarray(pheno_block, dtype=np.float64)
+    if pheno_block.ndim != 2 or int(pheno_block.shape[1]) != len(trait_names):
+        return None
+
+    finite_mask = np.isfinite(pheno_block)
+    nonempty_trait_pos = np.flatnonzero(np.any(finite_mask, axis=0)).astype(
+        np.int64,
+        copy=False,
+    )
+    if int(nonempty_trait_pos.shape[0]) == 0:
+        return None
+    ref_trait_pos = int(nonempty_trait_pos[0])
+    shared_keep = np.ascontiguousarray(
+        np.asarray(finite_mask[:, ref_trait_pos], dtype=np.bool_).reshape(-1),
+        dtype=np.bool_,
+    )
+    shared_trait_mask = np.all(
+        finite_mask[:, nonempty_trait_pos] == shared_keep[:, None],
+        axis=0,
+    )
+    shared_trait_pos = np.ascontiguousarray(
+        nonempty_trait_pos[shared_trait_mask],
+        dtype=np.int64,
+    )
+    keep_idx_local = np.ascontiguousarray(
+        np.flatnonzero(shared_keep).astype(np.int64, copy=False),
+        dtype=np.int64,
+    )
+    if int(shared_trait_pos.shape[0]) <= 1 or int(keep_idx_local.shape[0]) == 0:
+        return None
+
+    trait_matrix_t = np.ascontiguousarray(
+        pheno_block[np.ix_(keep_idx_local, shared_trait_pos)].T,
+        dtype=np.float64,
+    )
+    trait_labels = [
+        str(trait_names[int(trait_pos)])
+        for trait_pos in shared_trait_pos.tolist()
+    ]
+    out: dict[str, object] = {
+        "trait_labels": trait_labels,
+        "trait_row_by_pos": {
+            int(trait_pos): int(row_idx)
+            for row_idx, trait_pos in enumerate(shared_trait_pos.tolist())
+        },
+        "trait_matrix_t": trait_matrix_t,
+        "keep_idx_local": keep_idx_local,
+        "n_idv": int(keep_idx_local.shape[0]),
+    }
+
+    if ids_aligned is not None and id_to_full_index is not None:
+        trait_ids = np.asarray(ids_aligned, dtype=str).reshape(-1)[keep_idx_local]
+        try:
+            out["sample_idx_full"] = np.ascontiguousarray(
+                np.asarray(
+                    [id_to_full_index[str(sid)] for sid in trait_ids],
+                    dtype=np.int64,
+                ),
+                dtype=np.int64,
+            )
+        except KeyError:
+            return None
+
+    if qmatrix is not None:
+        x_cov = np.ascontiguousarray(
+            np.asarray(qmatrix[keep_idx_local], dtype=np.float64),
+            dtype=np.float64,
+        )
+        if cov_all is not None:
+            x_cov = np.ascontiguousarray(
+                np.concatenate([x_cov, cov_all[keep_idx_local]], axis=1),
+                dtype=np.float64,
+            )
+        out["x_cov"] = x_cov
+        out["x_design"] = np.ascontiguousarray(
+            np.concatenate(
+                [
+                    np.ones((int(x_cov.shape[0]), 1), dtype=np.float64),
+                    x_cov,
+                ],
+                axis=1,
+            ),
+            dtype=np.float64,
+        )
+
+    return out
 
 
 def _safe_trait_file_label(label: object) -> str:
@@ -5459,8 +5634,16 @@ def run_lm_stream_bed_single_entry(*args, **kwargs):
     from janusx.assoc.workflow_model_packed import run_lm_stream_bed_single_entry as _impl
     return _impl(*args, **kwargs)
 
+def run_lm_trait_bed_multi_entry(*args, **kwargs):
+    from janusx.assoc.workflow_model_packed import run_lm_trait_bed_multi_entry as _impl
+    return _impl(*args, **kwargs)
+
 def run_lmm_packed_fullrank(*args, **kwargs):
     from janusx.assoc.workflow_model_packed import run_lmm_packed_fullrank as _impl
+    return _impl(*args, **kwargs)
+
+def run_lmm_trait_packed_multi_entry(*args, **kwargs):
+    from janusx.assoc.workflow_model_packed import run_lmm_trait_packed_multi_entry as _impl
     return _impl(*args, **kwargs)
 
 def run_algwas_packed_fullrank(*args, **kwargs):
@@ -6343,6 +6526,18 @@ def parse_args(argv: Optional[list[str]] = None):
         ),
     )
     optional_group.add_argument(
+        "-trait-level", "--trait-level",
+        dest="trait_level",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable additive multi-trait trait-level fast paths for LM/LMM "
+            "with a single combined TSV output. When traits share the same "
+            "non-missing sample mask, JanusX reuses shared metadata and "
+            "mixed-model eigendecomposition across traits."
+        ),
+    )
+    optional_group.add_argument(
         "-strict-train", "--strict-train",
         "-strict-trait", "--strict-trait",
         dest="strict_train",
@@ -6389,6 +6584,11 @@ def parse_args(argv: Optional[list[str]] = None):
         )
     if not has_pheno:
         parser.error("the following arguments are required: -p/--pheno")
+    if bool(getattr(args, "trait_level", False)) and bool(getattr(args, "fvlmm", False)):
+        parser.error(
+            "`-trait-level` currently supports only `-lm` and `-lmm`; "
+            "`-fvlmm` is not supported on the trait-level search path."
+        )
     if not has_genotype:
         parser.error(
             "the following arguments are required: "
@@ -6848,6 +7048,14 @@ def _run_gwas_pipeline(
 
     if log:
         packed_auto_mode = bool(fast_mode)
+        packed_route_status_preflight = _format_gwas_packed_route_status(
+            gfile=str(gfile),
+            args=args,
+            farmcpu_auto_fast=bool(farmcpu_auto_fast),
+            algwas_auto_fast=bool(algwas_auto_fast),
+            requested_stream_models=list(requested_stream_models),
+            qtn_input_requested=bool(qtn_input_requested),
+        )
         memory_cfg = _format_gwas_memory_cfg(
             args.memory,
             auto_requested=bool(getattr(args, "_memory_auto_requested", False)),
@@ -6867,7 +7075,7 @@ def _run_gwas_pipeline(
             ("Phenotype file", args.pheno),
             ("Phenotype cols", args.ncol if args.ncol is not None else "All"),
             ("BED backend", bed_backend_policy),
-            ("Packed auto route", packed_auto_mode),
+            ("Packed route", packed_route_status_preflight),
             ("Models", _format_gwas_models_executed(args)),
             ("GRM option", args.grm),
             ("Q option", args.qcov),
@@ -6955,10 +7163,7 @@ def _run_gwas_pipeline(
         _emit_report_kv(
             report_logger,
             "Packed Route",
-            _format_gwas_packed_route_status(
-                farmcpu_auto_fast=bool(farmcpu_auto_fast),
-                algwas_auto_fast=bool(algwas_auto_fast),
-            ),
+            packed_route_status_preflight,
         )
         report_logger.info("")
         _emit_report_block(report_logger, "Command")
@@ -7350,6 +7555,18 @@ def _run_gwas_pipeline(
                     ),
                     scanmeta_outprefix=str(outprefix),
                 )
+                packed_route_status_resolved = _format_gwas_packed_route_resolution(
+                    original_genofile=str(gfile),
+                    stream_genofile=str(genofile_stream),
+                    preloaded_packed=preloaded_packed,
+                    args=args,
+                )
+                if packed_route_status_resolved is not None:
+                    _log_file_only(
+                        logger,
+                        logging.INFO,
+                        f"Packed route resolved: {packed_route_status_resolved}",
+                    )
                 if getattr(args, "lm2", None) is not None:
                     lm2_selector = list(getattr(args, "lm2_cov_cols", []) or [])
                     if cov_all is None:
@@ -8107,6 +8324,64 @@ def _run_gwas_pipeline(
                         except KeyError:
                             return None
 
+                    def _build_shared_trait_sample_indices(
+                        trait_names_shared: list[object],
+                    ) -> Union[np.ndarray, None]:
+                        if (
+                            pheno is None
+                            or ids_arr_meta is None
+                            or id_to_full_meta is None
+                            or len(trait_names_shared) <= 1
+                        ):
+                            return None
+                        trait_col_idx = [
+                            int(tr.col_idx)
+                            for tr in trait_names_shared
+                            if isinstance(tr, _TraitRef)
+                        ]
+                        if len(trait_col_idx) != len(trait_names_shared):
+                            return None
+                        block_df = pheno.iloc[:, trait_col_idx]
+                        shared_keep: Union[np.ndarray, None] = None
+                        saw_nonempty = False
+                        for col_pos in range(int(block_df.shape[1])):
+                            col = block_df.iloc[:, col_pos]
+                            if pd.api.types.is_numeric_dtype(col.dtype):
+                                arr = col.to_numpy(dtype=np.float64, copy=False)
+                            else:
+                                arr = pd.to_numeric(col, errors="coerce").to_numpy(
+                                    dtype=np.float64,
+                                    copy=False,
+                                )
+                            keep = np.isfinite(np.asarray(arr, dtype=np.float64))
+                            if not bool(np.any(keep)):
+                                return None
+                            if shared_keep is None:
+                                shared_keep = np.asarray(keep, dtype=np.bool_)
+                                saw_nonempty = True
+                                continue
+                            if not np.array_equal(shared_keep, keep):
+                                return None
+                        if (not saw_nonempty) or shared_keep is None:
+                            return None
+                        keep_idx_meta = np.flatnonzero(shared_keep).astype(
+                            np.int64,
+                            copy=False,
+                        )
+                        if int(keep_idx_meta.shape[0]) == 0:
+                            return None
+                        trait_ids_meta = np.asarray(ids_arr_meta[keep_idx_meta], dtype=str)
+                        try:
+                            return np.ascontiguousarray(
+                                np.asarray(
+                                    [id_to_full_meta[str(sid)] for sid in trait_ids_meta],
+                                    dtype=np.int64,
+                                ),
+                                dtype=np.int64,
+                            )
+                        except KeyError:
+                            return None
+
                     def _trait_prepared_meta_needs_build(
                         trait_token: str,
                         trait_name: object,
@@ -8191,10 +8466,506 @@ def _run_gwas_pipeline(
                         trait_shared_meta_cache[trait_token] = cached_meta
                         return cached_meta
 
-                    task_idx = 0
-                    current_trait_summary_name = ""
-                    current_trait_summary_start = len(gwas_summary_rows)
-                    while task_idx < len(normalized_tasks):
+                    trait_level_lm_requested = bool(getattr(args, "trait_level", False))
+                    trait_level_lm_handled = False
+                    if trait_level_lm_requested:
+                        unique_trait_tasks: list[dict[str, object]] = []
+                        seen_trait_tokens_fastpath: set[str] = set()
+                        for task_item in normalized_tasks:
+                            trait_tok_fast = str(task_item.get("trait_token", ""))
+                            if trait_tok_fast in seen_trait_tokens_fastpath:
+                                continue
+                            seen_trait_tokens_fastpath.add(trait_tok_fast)
+                            unique_trait_tasks.append(task_item)
+                        trait_level_same_model = (
+                            len(unique_trait_tasks) > 1
+                            and len(normalized_tasks) == len(unique_trait_tasks)
+                            and len(
+                                {
+                                    (
+                                        str(item.get("route", "")).lower().strip(),
+                                        str(item.get("model", "")).lower().strip(),
+                                    )
+                                    for item in normalized_tasks
+                                }
+                            )
+                            == 1
+                        )
+                        trait_level_route_key = (
+                            str(unique_trait_tasks[0].get("route", "")).lower().strip()
+                            if len(unique_trait_tasks) > 0
+                            else ""
+                        )
+                        trait_level_model_key = (
+                            str(unique_trait_tasks[0].get("model", "")).lower().strip()
+                            if len(unique_trait_tasks) > 0
+                            else ""
+                        )
+                        trait_level_shared_route_eligible = bool(
+                            prefix_meta is not None
+                            and str(args.model).lower() == "add"
+                            and (not bool(args.plot))
+                            and len(unique_trait_tasks) > 1
+                            and trait_level_same_model
+                            and (
+                                (trait_level_route_key == "lm_stream" and trait_level_model_key == "lm")
+                                or (trait_level_route_key == "lmm_stream" and trait_level_model_key == "lmm")
+                            )
+                        )
+                        trait_level_lm_eligible = bool(
+                            trait_level_shared_route_eligible
+                            and trait_level_route_key == "lm_stream"
+                            and trait_level_model_key == "lm"
+                        )
+                        trait_level_lmm_eligible = bool(
+                            trait_level_shared_route_eligible
+                            and trait_level_route_key == "lmm_stream"
+                            and trait_level_model_key == "lmm"
+                        )
+                        if trait_level_shared_route_eligible:
+                            trait_level_task_specs: list[dict[str, object]] = []
+                            trait_level_meta_map: dict[str, dict[str, object]] = {}
+                            shared_sample_idx_meta_fast: Union[np.ndarray, None] = None
+                            shared_trait_fast_ctx: Union[dict[str, object], None] = (
+                                _build_shared_trait_fast_context(
+                                    pheno,
+                                    [
+                                        task_item.get("trait", "")
+                                        for task_item in unique_trait_tasks
+                                    ],
+                                    ids_aligned=ids_arr_meta,
+                                    id_to_full_index=id_to_full_meta,
+                                    qmatrix=qmatrix,
+                                    cov_all=cov_all,
+                                )
+                            )
+                            if isinstance(shared_trait_fast_ctx, dict):
+                                shared_sample_idx_meta_fast = shared_trait_fast_ctx.get(
+                                    "sample_idx_full"
+                                )
+                            if shared_sample_idx_meta_fast is None:
+                                shared_sample_idx_meta_fast = _build_shared_trait_sample_indices(
+                                    [
+                                        task_item.get("trait", "")
+                                        for task_item in unique_trait_tasks
+                                    ]
+                                )
+                            if (
+                                shared_sample_idx_meta_fast is not None
+                                and int(shared_sample_idx_meta_fast.shape[0]) > 0
+                            ):
+                                _log_file_only(
+                                    logger,
+                                    logging.INFO,
+                                    f"{str(trait_level_model_key).upper()} trait-level shared sample-index fast path active "
+                                    f"(n={int(shared_sample_idx_meta_fast.shape[0])}).",
+                                )
+                            shared_trait_row_by_pos_fast = (
+                                shared_trait_fast_ctx.get("trait_row_by_pos", {})
+                                if isinstance(shared_trait_fast_ctx, dict)
+                                else {}
+                            )
+                            shared_trait_full_cover = bool(
+                                isinstance(shared_trait_fast_ctx, dict)
+                                and len(shared_trait_row_by_pos_fast) == len(unique_trait_tasks)
+                            )
+                            shared_sample_idx_meta_global = bool(
+                                shared_sample_idx_meta_fast is not None
+                                and not isinstance(shared_trait_fast_ctx, dict)
+                            )
+                            for task_pos, task_item in enumerate(unique_trait_tasks):
+                                trait_name_use = task_item.get("trait", "")
+                                trait_token_use = str(task_item.get("trait_token", ""))
+                                trait_label_use = str(
+                                    task_item.get("trait_label", trait_name_use)
+                                )
+                                sample_idx_meta = None
+                                if (
+                                    shared_sample_idx_meta_fast is not None
+                                    and int(task_pos) in shared_trait_row_by_pos_fast
+                                ):
+                                    sample_idx_meta = np.asarray(
+                                        shared_sample_idx_meta_fast,
+                                        dtype=np.int64,
+                                    )
+                                elif shared_sample_idx_meta_global:
+                                    sample_idx_meta = np.asarray(
+                                        shared_sample_idx_meta_fast,
+                                        dtype=np.int64,
+                                    )
+                                else:
+                                    sample_idx_meta = _build_trait_sample_indices(
+                                        trait_name_use
+                                    )
+                                if (
+                                    sample_idx_meta is None
+                                    or int(sample_idx_meta.shape[0]) == 0
+                                ):
+                                    logger.warning(
+                                        f"{trait_label_use}: no overlapping samples, skipped."
+                                    )
+                                    eff_snp_by_trait[str(trait_name_use)] = 0
+                                    continue
+                                trait_level_task_specs.append(
+                                    {
+                                        "task": task_item,
+                                        "trait_name": trait_name_use,
+                                        "trait_token": trait_token_use,
+                                        "trait_label": trait_label_use,
+                                        "sample_idx_meta": sample_idx_meta,
+                                    }
+                                )
+
+                            if trait_level_shared_route_eligible and len(trait_level_task_specs) > 1:
+                                if gwas_row_stat_mode != "strict-train":
+                                    shared_meta = _resolve_trait_prepared_meta(
+                                        str(trait_level_task_specs[0]["trait_token"]),
+                                        trait_level_task_specs[0]["trait_name"],
+                                        str(trait_level_route_key),
+                                        sample_idx_meta_prefetched=np.asarray(
+                                            trait_level_task_specs[0]["sample_idx_meta"],
+                                            dtype=np.int64,
+                                        ),
+                                    )
+                                    if shared_meta is None:
+                                        trait_level_shared_route_eligible = False
+                                        trait_level_lm_eligible = False
+                                        trait_level_lmm_eligible = False
+                                        _log_file_only(
+                                            logger,
+                                            logging.INFO,
+                                            f"{str(trait_level_model_key).upper()} trait-level fast path disabled: "
+                                            "prepared row metadata unavailable; falling back to serial per-trait stream.",
+                                        )
+                                    else:
+                                        for spec_item in trait_level_task_specs:
+                                            trait_level_meta_map[
+                                                str(spec_item["trait_name"])
+                                            ] = shared_meta
+                                else:
+                                    meta_pending_specs: list[dict[str, object]] = []
+                                    for spec_item in trait_level_task_specs:
+                                        cached_meta = trait_shared_meta_cache.get(
+                                            str(spec_item["trait_token"])
+                                        )
+                                        if cached_meta is not None:
+                                            trait_level_meta_map[
+                                                str(spec_item["trait_name"])
+                                            ] = cached_meta
+                                        else:
+                                            meta_pending_specs.append(spec_item)
+                                    if len(meta_pending_specs) > 0:
+                                        if (
+                                            shared_sample_idx_meta_fast is not None
+                                            and shared_trait_full_cover
+                                        ):
+                                            with CliStatus(
+                                                "Computing trait-level row statistics...",
+                                                enabled=bool(use_spinner),
+                                                use_process=True,
+                                            ) as task:
+                                                try:
+                                                    meta_local = _gwas_logic_meta_selected_cached(
+                                                        str(prefix_meta),
+                                                        sample_indices=np.asarray(
+                                                            shared_sample_idx_meta_fast,
+                                                            dtype=np.int64,
+                                                        ),
+                                                        maf_threshold=float(
+                                                            maf_threshold_scan
+                                                        ),
+                                                        max_missing_rate=float(
+                                                            max_missing_rate_scan
+                                                        ),
+                                                        het_threshold=float(
+                                                            het_threshold_scan
+                                                        ),
+                                                        snps_only=bool(args.snps_only),
+                                                        mmap_window_mb=int(
+                                                            gwas_meta_window_mb
+                                                        ),
+                                                        outprefix=str(outprefix),
+                                                        logger=logger,
+                                                        threads=int(max(1, int(args.thread))),
+                                                        use_cache=False,
+                                                    )
+                                                except Exception:
+                                                    task.fail(
+                                                        "Computing trait-level row statistics ...Failed"
+                                                    )
+                                                    raise
+                                                task.complete(
+                                                    "Computing trait-level row statistics ...Finished"
+                                                )
+                                            for spec_item in trait_level_task_specs:
+                                                trait_token_local = str(
+                                                    spec_item["trait_token"]
+                                                )
+                                                trait_name_local = str(
+                                                    spec_item["trait_name"]
+                                                )
+                                                trait_shared_meta_cache[
+                                                    trait_token_local
+                                                ] = meta_local
+                                                trait_level_meta_map[
+                                                    trait_name_local
+                                                ] = meta_local
+                                        else:
+                                            meta_workers = min(
+                                                len(meta_pending_specs),
+                                                max(1, int(args.thread)),
+                                            )
+                                            meta_threads_per_worker = max(
+                                                1,
+                                                int(max(1, int(args.thread))) // max(1, meta_workers),
+                                            )
+
+                                            def _build_trait_meta_fastpath(
+                                                spec_item: dict[str, object],
+                                            ) -> tuple[str, str, dict[str, object]]:
+                                                trait_token_local = str(
+                                                    spec_item["trait_token"]
+                                                )
+                                                trait_name_local = str(
+                                                    spec_item["trait_name"]
+                                                )
+                                                meta_local = _gwas_logic_meta_selected_cached(
+                                                    str(prefix_meta),
+                                                    sample_indices=np.asarray(
+                                                        spec_item["sample_idx_meta"],
+                                                        dtype=np.int64,
+                                                    ),
+                                                    maf_threshold=float(
+                                                        maf_threshold_scan
+                                                    ),
+                                                    max_missing_rate=float(
+                                                        max_missing_rate_scan
+                                                    ),
+                                                    het_threshold=float(
+                                                        het_threshold_scan
+                                                    ),
+                                                    snps_only=bool(args.snps_only),
+                                                    mmap_window_mb=int(
+                                                        gwas_meta_window_mb
+                                                    ),
+                                                    outprefix=str(outprefix),
+                                                    logger=logger,
+                                                    threads=int(
+                                                        meta_threads_per_worker
+                                                    ),
+                                                    use_cache=False,
+                                                )
+                                                return (
+                                                    trait_token_local,
+                                                    trait_name_local,
+                                                    meta_local,
+                                                )
+
+                                            with CliStatus(
+                                                "Computing trait-level row statistics...",
+                                                enabled=bool(use_spinner),
+                                                use_process=True,
+                                            ) as task:
+                                                try:
+                                                    if meta_workers <= 1:
+                                                        for spec_item in meta_pending_specs:
+                                                            (
+                                                                trait_token_local,
+                                                                trait_name_local,
+                                                                meta_local,
+                                                            ) = _build_trait_meta_fastpath(
+                                                                spec_item
+                                                            )
+                                                            trait_shared_meta_cache[
+                                                                trait_token_local
+                                                            ] = meta_local
+                                                            trait_level_meta_map[
+                                                                trait_name_local
+                                                            ] = meta_local
+                                                    else:
+                                                        with cf.ThreadPoolExecutor(
+                                                            max_workers=int(
+                                                                meta_workers
+                                                            ),
+                                                            thread_name_prefix="jx-gwas-meta",
+                                                        ) as ex:
+                                                            future_map = {
+                                                                ex.submit(
+                                                                    _build_trait_meta_fastpath,
+                                                                    spec_item,
+                                                                ): spec_item
+                                                                for spec_item in meta_pending_specs
+                                                            }
+                                                            try:
+                                                                for fut in cf.as_completed(
+                                                                    future_map
+                                                                ):
+                                                                    (
+                                                                        trait_token_local,
+                                                                        trait_name_local,
+                                                                        meta_local,
+                                                                    ) = fut.result()
+                                                                    trait_shared_meta_cache[
+                                                                        trait_token_local
+                                                                    ] = meta_local
+                                                                    trait_level_meta_map[
+                                                                        trait_name_local
+                                                                    ] = meta_local
+                                                            except Exception:
+                                                                for fut in future_map:
+                                                                    fut.cancel()
+                                                                raise
+                                                except Exception:
+                                                    task.fail(
+                                                        "Computing trait-level row statistics ...Failed"
+                                                    )
+                                                    raise
+                                                task.complete(
+                                                    "Computing trait-level row statistics ...Finished"
+                                                )
+
+                                trait_level_names = [
+                                    spec_item["trait_name"]
+                                    for spec_item in trait_level_task_specs
+                                    if str(spec_item["trait_name"])
+                                    in trait_level_meta_map
+                                ]
+                            else:
+                                trait_level_names = []
+
+                            if trait_level_shared_route_eligible and len(trait_level_names) > 1:
+                                precomputed_shared_input = None
+                                if isinstance(shared_trait_fast_ctx, dict):
+                                    shared_labels = list(
+                                        shared_trait_fast_ctx.get("trait_labels", [])
+                                    )
+                                    if shared_labels == [
+                                        str(x) for x in trait_level_names
+                                    ]:
+                                        precomputed_shared_input = {
+                                            "trait_labels": list(shared_labels),
+                                            "trait_matrix_t": np.ascontiguousarray(
+                                                np.asarray(
+                                                    shared_trait_fast_ctx[
+                                                        "trait_matrix_t"
+                                                    ],
+                                                    dtype=np.float64,
+                                                ),
+                                                dtype=np.float64,
+                                            ),
+                                            "keep_idx": np.ascontiguousarray(
+                                                np.asarray(
+                                                    shared_trait_fast_ctx[
+                                                        "keep_idx_local"
+                                                    ],
+                                                    dtype=np.int64,
+                                                ),
+                                                dtype=np.int64,
+                                            ),
+                                            "sample_idx_full": np.ascontiguousarray(
+                                                np.asarray(
+                                                    shared_trait_fast_ctx[
+                                                        "sample_idx_full"
+                                                    ],
+                                                    dtype=np.int64,
+                                                ),
+                                                dtype=np.int64,
+                                            ) if shared_trait_fast_ctx.get("sample_idx_full", None) is not None else None,
+                                            "x_cov": np.ascontiguousarray(
+                                                np.asarray(
+                                                    shared_trait_fast_ctx[
+                                                        "x_cov"
+                                                    ],
+                                                    dtype=np.float64,
+                                                ),
+                                                dtype=np.float64,
+                                            ),
+                                            "x_design": np.ascontiguousarray(
+                                                np.asarray(
+                                                    shared_trait_fast_ctx[
+                                                        "x_design"
+                                                    ],
+                                                    dtype=np.float64,
+                                                ),
+                                                dtype=np.float64,
+                                            ),
+                                            "n_idv": int(
+                                                shared_trait_fast_ctx["n_idv"]
+                                            ),
+                                        }
+                                if trait_level_lm_eligible:
+                                    run_lm_trait_bed_multi_entry(
+                                        genofile=genofile_stream,
+                                        pheno=pheno,
+                                        ids=ids,
+                                        n_snps=n_snps,
+                                        outprefix=outprefix,
+                                        maf_threshold=maf_threshold_scan,
+                                        max_missing_rate=max_missing_rate_scan,
+                                        genetic_model=args.model,
+                                        het_threshold=het_threshold_scan,
+                                        chunk_size=args.chunksize,
+                                        qmatrix=qmatrix,
+                                        cov_all=cov_all,
+                                        plot=False,
+                                        threads=args.thread,
+                                        logger=logger,
+                                        use_spinner=use_spinner,
+                                        snps_only=bool(args.snps_only),
+                                        eff_snp_by_trait=eff_snp_by_trait,
+                                        summary_rows=gwas_summary_rows,
+                                        saved_paths=saved_result_paths,
+                                        trait_names=list(trait_level_names),
+                                        emit_trait_header=False,
+                                        chunk_size_user_set=bool(
+                                            getattr(args, "_chunksize_user_set", True)
+                                        ),
+                                        mmap_limit=mmap_limit_effective,
+                                        trait_prepared_meta_by_trait=trait_level_meta_map,
+                                        precomputed_shared_input=precomputed_shared_input,
+                                    )
+                                elif trait_level_lmm_eligible:
+                                    run_lmm_trait_packed_multi_entry(
+                                        genofile=genofile_stream,
+                                        pheno=pheno,
+                                        ids=ids,
+                                        grm=grm,
+                                        outprefix=outprefix,
+                                        maf_threshold=maf_threshold_scan,
+                                        max_missing_rate=max_missing_rate_scan,
+                                        genetic_model=args.model,
+                                        het_threshold=het_threshold_scan,
+                                        chunk_size=args.chunksize,
+                                        qmatrix=qmatrix,
+                                        cov_all=cov_all,
+                                        plot=False,
+                                        threads=args.thread,
+                                        logger=logger,
+                                        use_spinner=use_spinner,
+                                        snps_only=bool(args.snps_only),
+                                        eff_snp_by_trait=eff_snp_by_trait,
+                                        summary_rows=gwas_summary_rows,
+                                        saved_paths=saved_result_paths,
+                                        trait_names=list(trait_level_names),
+                                        emit_trait_header=False,
+                                        preloaded_packed=preloaded_packed,
+                                        force_model=bool(args.force_model),
+                                        trait_prepared_meta_by_trait=trait_level_meta_map,
+                                        precomputed_shared_input=precomputed_shared_input,
+                                    )
+                                if gwas_row_stat_mode == "strict-train":
+                                    for task_item in unique_trait_tasks:
+                                        trait_shared_meta_cache.pop(
+                                            str(task_item.get("trait_token", "")),
+                                            None,
+                                        )
+                                trait_level_lm_handled = True
+
+                    if not trait_level_lm_handled:
+                        task_idx = 0
+                        current_trait_summary_name = ""
+                        current_trait_summary_start = len(gwas_summary_rows)
+                    while (not trait_level_lm_handled) and task_idx < len(normalized_tasks):
                         task_item = normalized_tasks[task_idx]
                         mk = str(task_item.get("model", "")).lower().strip()
                         route = str(task_item.get("route", "")).lower().strip()

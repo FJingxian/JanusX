@@ -16,6 +16,7 @@ Modules:
     pca           Principal component analysis for population structure
     gstats        Genotype basic statistics and LD score
     gwas          Run genome-wide association analysis
+    fvlmm2        Joint FvLMM recheck for specified pseudo/interaction loci
     postgwas      Post-process GWAS results and downstream plots
 
     Genomic Selection (GS):
@@ -117,6 +118,7 @@ _CLI_MODULE_SECTIONS = [
             ("grm", "Build genomic relationship matrix"),
             ("pca", "Principal component analysis for population structure"),
             ("gwas", "Run genome-wide association analysis"),
+            ("fvlmm2", "Joint FvLMM recheck for specified pseudo/interaction loci"),
             ("postgwas", "Post-process GWAS results and downstream plots"),
         ],
     ),
@@ -148,7 +150,7 @@ _CLI_MODULE_SECTIONS = [
 ]
 
 _MODULE_NAMES = [
-    "gwas", "postgwas", "postgarfield", "postbsa",
+    "gwas", "fvlmm2", "postgwas", "postgarfield", "postbsa",
     "garfield", "grm", "pca", "gstats", "gs", "reml", "postgs",
     "sim", "simulation", "benchmark", "gblupbench", "bayesbench", "garfieldbench", "fastpop", "adamixture", "tree", "gformat", "gmerge", "hybrid", "webui",
     "fastq2vcf", "fastq2count", "kmer", "kmerge", "kstats", "view", "treeplot", "refcheck",

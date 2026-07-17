@@ -197,6 +197,60 @@ pub fn lmm_rotate_x_y_with_ut_f64<'py>(
     ))
 }
 
+#[pyfunction]
+#[pyo3(signature = (u_t, y, threads=0))]
+pub fn lmm_rotate_y_with_ut_f64<'py>(
+    py: Python<'py>,
+    u_t: PyReadonlyArray2<'py, f32>,
+    y: PyReadonlyArray1<'py, f64>,
+    threads: usize,
+) -> PyResult<Bound<'py, PyArray1<f64>>> {
+    let y_slice = y.as_slice()?;
+    let n = y_slice.len();
+    if n == 0 {
+        return Err(PyRuntimeError::new_err("y must not be empty"));
+    }
+
+    let ut_arr = u_t.as_array();
+    if ut_arr.ndim() != 2 {
+        return Err(PyRuntimeError::new_err("u_t must be 2D (n, n)"));
+    }
+    if ut_arr.shape()[0] != n || ut_arr.shape()[1] != n {
+        return Err(PyRuntimeError::new_err(
+            "u_t must be shape (n, n) and row-major U^T",
+        ));
+    }
+
+    let ut_flat: Cow<[f32]> = match u_t.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(ut_arr.iter().copied().collect()),
+    };
+    let pool = get_cached_pool(threads)?;
+    let y_rot = py.detach(|| {
+        let mut out = vec![0.0_f64; n];
+        let mut run = || {
+            out.par_iter_mut().enumerate().for_each(|(i, dst)| {
+                let ut_row = &ut_flat[i * n..(i + 1) * n];
+                let mut acc = 0.0_f64;
+                for j in 0..n {
+                    acc += (ut_row[j] as f64) * y_slice[j];
+                }
+                *dst = acc;
+            });
+        };
+        if let Some(p) = &pool {
+            p.install(run);
+        } else {
+            run();
+        }
+        out
+    });
+
+    Ok(
+        PyArray1::from_owned_array(py, numpy::ndarray::Array1::from_vec(y_rot)).into_bound(),
+    )
+}
+
 // LMM REML chunk (lmm_reml_chunk_f32)
 // =============================================================================
 

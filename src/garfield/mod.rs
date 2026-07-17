@@ -1354,6 +1354,7 @@ fn normalize_chrom(chrom: &str) -> String {
 trait GarfieldChromPosSite {
     fn garfield_chrom(&self) -> &str;
     fn garfield_pos(&self) -> i32;
+    fn garfield_snp_name(&self) -> &str;
 }
 
 trait GarfieldDisplaySite: GarfieldChromPosSite {
@@ -1887,6 +1888,7 @@ impl GarfieldLogicSiteMode {
 struct GarfieldLogicSite {
     chrom: Arc<str>,
     pos: i32,
+    snp: Arc<str>,
     ref_allele: Arc<str>,
     alt_allele: Arc<str>,
     mode: GarfieldLogicSiteMode,
@@ -1901,6 +1903,11 @@ impl GarfieldChromPosSite for SiteInfo {
     #[inline]
     fn garfield_pos(&self) -> i32 {
         self.pos
+    }
+
+    #[inline]
+    fn garfield_snp_name(&self) -> &str {
+        self.snp.as_str()
     }
 }
 
@@ -1947,6 +1954,11 @@ impl GarfieldChromPosSite for GarfieldLogicSite {
     #[inline]
     fn garfield_pos(&self) -> i32 {
         self.pos
+    }
+
+    #[inline]
+    fn garfield_snp_name(&self) -> &str {
+        self.snp.as_ref()
     }
 }
 
@@ -2053,15 +2065,26 @@ fn build_logic_sites_from_metadata(
     };
     let mut out = Vec::<GarfieldLogicSite>::with_capacity(sites.len().saturating_mul(row_mul));
     let mut chrom_pool = HashMap::<String, Arc<str>>::new();
+    let mut snp_pool = HashMap::<String, Arc<str>>::new();
     let mut allele_pool = HashMap::<String, Arc<str>>::new();
+    let use_inherited_snp_names = garfield_sites_have_distinct_snp_names(sites);
     for site in sites.iter() {
         let chrom = intern_logic_site_text(&mut chrom_pool, site.chrom.as_str());
+        let snp_name = if use_inherited_snp_names {
+            intern_logic_site_text(&mut snp_pool, site.snp.trim())
+        } else {
+            intern_logic_site_text(
+                &mut snp_pool,
+                format!("{}_{}", site.chrom, site.pos).as_str(),
+            )
+        };
         let ref_allele = intern_logic_site_text(&mut allele_pool, site.ref_allele.as_str());
         let alt_allele = intern_logic_site_text(&mut allele_pool, site.alt_allele.as_str());
         let push_mode = |out: &mut Vec<GarfieldLogicSite>, mode_one: GarfieldLogicSiteMode| {
             out.push(GarfieldLogicSite {
                 chrom: chrom.clone(),
                 pos: site.pos,
+                snp: snp_name.clone(),
                 ref_allele: ref_allele.clone(),
                 alt_allele: alt_allele.clone(),
                 mode: mode_one,
@@ -2077,6 +2100,29 @@ fn build_logic_sites_from_metadata(
         }
     }
     out
+}
+
+#[inline]
+fn garfield_snp_name_missing(raw_name: &str) -> bool {
+    let text = raw_name.trim();
+    text.is_empty() || text == "." || text.eq_ignore_ascii_case("nan")
+}
+
+fn garfield_sites_have_distinct_snp_names(sites: &[SiteInfo]) -> bool {
+    if sites.is_empty() {
+        return false;
+    }
+    let mut seen = HashSet::<String>::with_capacity(sites.len());
+    for site in sites.iter() {
+        let snp_name = site.snp.trim();
+        if garfield_snp_name_missing(snp_name) {
+            return false;
+        }
+        if !seen.insert(snp_name.to_string()) {
+            return false;
+        }
+    }
+    true
 }
 
 fn materialize_prepared_bit_matrices(
@@ -3813,7 +3859,12 @@ fn subset_cov_f64(
 
 #[inline]
 fn site_base_label<S: GarfieldChromPosSite>(site: &S) -> String {
-    format!("{}_{}", site.garfield_chrom(), site.garfield_pos())
+    let snp_name = site.garfield_snp_name().trim();
+    if garfield_snp_name_missing(snp_name) {
+        format!("{}_{}", site.garfield_chrom(), site.garfield_pos())
+    } else {
+        snp_name.to_string()
+    }
 }
 
 #[inline]
@@ -6383,10 +6434,94 @@ fn plink2bits_from_logic_g(g: i8) -> u8 {
     }
 }
 
+#[derive(Clone, Debug)]
+struct GarfieldPseudoLiteralExport {
+    chrom: String,
+    pos: i32,
+    snp_name: String,
+    allele0: String,
+    allele1: String,
+    selected_row_index: usize,
+    display_negated: bool,
+}
+
+fn split_logic_display_tokens(text: &str) -> Vec<String> {
+    text.split(|c| c == '&' || c == '|')
+        .map(|tok| tok.trim().to_string())
+        .filter(|tok| !tok.is_empty())
+        .collect()
+}
+
+fn split_logic_allele_tokens(text: &str) -> Vec<String> {
+    text.split(',')
+        .map(|tok| tok.trim().to_string())
+        .collect()
+}
+
+fn collect_logic_pseudo_literal_exports(
+    rec: &GarfieldLogicRuleRecord,
+    logic_bits: &GarfieldLogicBits,
+) -> Result<Vec<GarfieldPseudoLiteralExport>, String> {
+    let snp_tokens = split_logic_display_tokens(rec.bim_snp_name.as_str());
+    let allele0_tokens = split_logic_allele_tokens(rec.bim_allele0.as_str());
+    let allele1_tokens = split_logic_allele_tokens(rec.bim_allele1.as_str());
+    let expected = rec.selected_row_indices.len();
+    if snp_tokens.len() != expected || allele0_tokens.len() != expected || allele1_tokens.len() != expected {
+        return Err(format!(
+            "GARFIELD pseudo export token mismatch for {}: rows={}, snp={}, allele0={}, allele1={}",
+            rec.bim_snp_name,
+            expected,
+            snp_tokens.len(),
+            allele0_tokens.len(),
+            allele1_tokens.len()
+        ));
+    }
+    let mut out = Vec::<GarfieldPseudoLiteralExport>::with_capacity(expected);
+    for idx in 0..expected {
+        let row_idx = rec.selected_row_indices[idx];
+        let site = logic_bits
+            .sites
+            .get(row_idx)
+            .ok_or_else(|| format!("GARFIELD pseudo export row index out of range: {row_idx}"))?;
+        let snp_name = snp_tokens[idx].clone();
+        out.push(GarfieldPseudoLiteralExport {
+            chrom: site.chrom.as_ref().to_string(),
+            pos: site.pos,
+            snp_name: snp_name.clone(),
+            allele0: allele0_tokens[idx].clone(),
+            allele1: allele1_tokens[idx].clone(),
+            selected_row_index: row_idx,
+            display_negated: snp_name.starts_with('!'),
+        });
+    }
+    Ok(out)
+}
+
+#[inline]
+fn write_logic_bits_as_plink_row<W: Write>(
+    w: &mut W,
+    row_buf: &mut [u8],
+    bits: &[u64],
+    n_samples: usize,
+    complement: bool,
+) -> Result<(), String> {
+    row_buf.fill(0u8);
+    for s in 0..n_samples {
+        let mut hit = ((bits[s >> 6] >> (s & 63)) & 1u64) != 0;
+        if complement {
+            hit = !hit;
+        }
+        let g = if hit { 2i8 } else { 0i8 };
+        row_buf[s >> 2] |= plink2bits_from_logic_g(g) << ((s & 3) * 2);
+    }
+    w.write_all(row_buf).map_err(|e| e.to_string())
+}
+
 fn write_logic_pseudo_plink(
     prefix: &str,
     sample_ids: &[String],
     records: &[GarfieldLogicRuleRecord],
+    logic_bits: &GarfieldLogicBits,
 ) -> Result<(), String> {
     let bed_path = format!("{prefix}.bed");
     let bim_path = format!("{prefix}.bim");
@@ -6412,20 +6547,75 @@ fn write_logic_pseudo_plink(
     let mut row_buf = vec![0u8; bytes_per_snp];
     let mut ordered = records.iter().collect::<Vec<_>>();
     ordered.sort_by(|a, b| cmp_logic_rule_records_plink_order(a, b));
+    let mut emitted_singletons = HashSet::<(String, i32, String)>::new();
     for rec in ordered.into_iter() {
-        writeln!(
-            bim,
-            "{}\t{}\t0\t{}\t{}\t{}",
-            rec.chrom_field, rec.bim_snp_name, rec.pos, rec.bim_allele0, rec.bim_allele1
-        )
-        .map_err(|e| e.to_string())?;
-        row_buf.fill(0u8);
-        for s in 0..sample_ids.len() {
-            let hit = ((rec.full_bits[s >> 6] >> (s & 63)) & 1u64) != 0;
-            let g = if hit { 2i8 } else { 0i8 };
-            row_buf[s >> 2] |= plink2bits_from_logic_g(g) << ((s & 3) * 2);
+        let literals = collect_logic_pseudo_literal_exports(rec, logic_bits)?;
+        if literals.len() <= 1 {
+            let singleton_key = (
+                rec.chrom_field.clone(),
+                rec.pos,
+                rec.bim_snp_name.clone(),
+            );
+            if emitted_singletons.insert(singleton_key) {
+                writeln!(
+                    bim,
+                    "{}\t{}\t0\t{}\t{}\t{}",
+                    rec.chrom_field, rec.bim_snp_name, rec.pos, rec.bim_allele0, rec.bim_allele1
+                )
+                .map_err(|e| e.to_string())?;
+                write_logic_bits_as_plink_row(
+                    &mut bed,
+                    row_buf.as_mut_slice(),
+                    rec.full_bits.as_slice(),
+                    sample_ids.len(),
+                    false,
+                )?;
+            }
+            continue;
         }
-        bed.write_all(&row_buf).map_err(|e| e.to_string())?;
+
+        for lit in literals.iter() {
+            let singleton_key = (lit.chrom.clone(), lit.pos, lit.snp_name.clone());
+            if emitted_singletons.insert(singleton_key) {
+                writeln!(
+                    bim,
+                    "{}\t{}\t0\t{}\t{}\t{}",
+                    lit.chrom, lit.snp_name, lit.pos, lit.allele0, lit.allele1
+                )
+                .map_err(|e| e.to_string())?;
+                let row_start = lit.selected_row_index.saturating_mul(logic_bits.row_words);
+                let row_end = row_start.saturating_add(logic_bits.row_words);
+                let bits = logic_bits.bits_flat.get(row_start..row_end).ok_or_else(|| {
+                    format!(
+                        "GARFIELD pseudo export literal row slice out of range: row={} row_words={}",
+                        lit.selected_row_index, logic_bits.row_words
+                    )
+                })?;
+                write_logic_bits_as_plink_row(
+                    &mut bed,
+                    row_buf.as_mut_slice(),
+                    bits,
+                    sample_ids.len(),
+                    lit.display_negated,
+                )?;
+            }
+        }
+
+        for lit in literals.iter() {
+            writeln!(
+                bim,
+                "{}\t{}\t0\t{}\t{}\t{}",
+                lit.chrom, rec.bim_snp_name, lit.pos, rec.bim_allele0, rec.bim_allele1
+            )
+            .map_err(|e| e.to_string())?;
+            write_logic_bits_as_plink_row(
+                &mut bed,
+                row_buf.as_mut_slice(),
+                rec.full_bits.as_slice(),
+                sample_ids.len(),
+                false,
+            )?;
+        }
     }
     bim.flush().map_err(|e| e.to_string())?;
     bed.flush().map_err(|e| e.to_string())?;
@@ -7783,6 +7973,7 @@ fn garfield_logic_search_bed_owned(
             prefix_out,
             logic_bits.sample_ids.as_slice(),
             records.as_slice(),
+            &logic_bits,
         )?;
         let rules_tsv = format!("{prefix_out}.rules.tsv");
         write_logic_rules_tsv(&rules_tsv, records.as_slice())?;
@@ -9442,6 +9633,72 @@ mod tests {
     }
 
     #[test]
+    fn test_logic_sites_prefer_inherited_unique_snp_names() {
+        let logic_sites = build_logic_sites_from_metadata(
+            &vec![
+                test_named_site("1", 100, "rsA"),
+                test_named_site("1", 200, "rsB"),
+            ],
+            GarfieldBinMode::Bin,
+        );
+        let rule = BeamRule {
+            first: BeamLiteral {
+                row_index: 0,
+                group_id: 0,
+                negated: false,
+            },
+            rest: vec![(
+                BeamBinaryOp::And,
+                BeamLiteral {
+                    row_index: 1,
+                    group_id: 1,
+                    negated: false,
+                },
+            )],
+        };
+        let polarity = GarfieldRuleDisplayPolarity::OriginalAnd;
+        let expr = rule_expr_with_polarity(&rule, logic_sites.as_slice(), polarity).unwrap();
+        let snp_name = rule_snp_name_with_polarity(&rule, logic_sites.as_slice(), polarity).unwrap();
+        let bim_name = rule_bim_name_with_polarity(&rule, logic_sites.as_slice(), polarity).unwrap();
+
+        assert_eq!(expr, "BIN(rsA) AND BIN(rsB)");
+        assert_eq!(snp_name, "rsA&rsB");
+        assert_eq!(bim_name, "rsA&rsB");
+    }
+
+    #[test]
+    fn test_logic_sites_fall_back_to_coordinates_when_snp_names_duplicate() {
+        let logic_sites = build_logic_sites_from_metadata(
+            &vec![
+                test_named_site("1", 100, "dup"),
+                test_named_site("1", 200, "dup"),
+            ],
+            GarfieldBinMode::Bin,
+        );
+        let rule = BeamRule {
+            first: BeamLiteral {
+                row_index: 0,
+                group_id: 0,
+                negated: false,
+            },
+            rest: vec![(
+                BeamBinaryOp::And,
+                BeamLiteral {
+                    row_index: 1,
+                    group_id: 1,
+                    negated: false,
+                },
+            )],
+        };
+        let polarity = GarfieldRuleDisplayPolarity::OriginalAnd;
+        let expr = rule_expr_with_polarity(&rule, logic_sites.as_slice(), polarity).unwrap();
+        let snp_name = rule_snp_name_with_polarity(&rule, logic_sites.as_slice(), polarity).unwrap();
+
+        assert_eq!(expr, "BIN(1_100) AND BIN(1_200)");
+        assert_eq!(snp_name, "1_100&1_200");
+    }
+
+    #[test]
     fn test_dedup_logic_rule_records_prefers_canonical_fewer_not_same_support() {
         let full_bits = vec![0b1010u64];
         let records = vec![
@@ -9500,11 +9757,92 @@ mod tests {
         assert_eq!(deduped[0].expr, "BIN(1_100) OR BIN(1_200)");
     }
 
+    #[test]
+    fn test_write_logic_pseudo_plink_expands_singletons_and_multi_pos_children() {
+        let dir = make_temp_dir("pseudo_export_expand");
+        let prefix = dir.join("pseudo");
+        let prefix_str = prefix.to_string_lossy().to_string();
+        let sample_ids = vec![
+            "S1".to_string(),
+            "S2".to_string(),
+            "S3".to_string(),
+            "S4".to_string(),
+        ];
+        let sites = build_logic_sites_from_metadata(
+            &vec![test_site("1", 100), test_site("1", 200)],
+            GarfieldBinMode::Bin,
+        );
+        let logic_bits = GarfieldLogicBits {
+            bits_flat: vec![0b0101u64, 0b0110u64],
+            row_words: 1,
+            sample_ids: sample_ids.clone(),
+            sites,
+            group_ids: vec![0, 1],
+            n_samples: 4,
+        };
+        let records = vec![GarfieldLogicRuleRecord {
+            unit_name: "u1".to_string(),
+            unit_kind: "window".to_string(),
+            unit_index: 1,
+            region_size: 2,
+            ml_feature_count: 2,
+            ml_rank: "1&!2".to_string(),
+            selected_row_indices: vec![0, 1],
+            snp_name: "1_100&!1_200".to_string(),
+            expr: "BIN(1_100) AND NOT BIN(1_200)".to_string(),
+            chrom_field: "1".to_string(),
+            bim_snp_name: "1_100&!1_200".to_string(),
+            bim_allele0: "A,C".to_string(),
+            bim_allele1: "G,T".to_string(),
+            pos: 100,
+            beta: 0.5,
+            se: 0.1,
+            chisq: 25.0,
+            pwald: 1e-6,
+            score: 10.0,
+            delta_score: "0.1&!0.2->10".to_string(),
+            delta_pwald: "0.1&!0.2->1e-6".to_string(),
+            full_bits: vec![0b0100u64],
+        }];
+
+        write_logic_pseudo_plink(
+            prefix_str.as_str(),
+            sample_ids.as_slice(),
+            records.as_slice(),
+            &logic_bits,
+        )
+        .unwrap();
+
+        let bim_txt = fs::read_to_string(format!("{prefix_str}.bim")).unwrap();
+        assert_eq!(
+            bim_txt.lines().collect::<Vec<_>>(),
+            vec![
+                "1\t1_100\t0\t100\tA\tG",
+                "1\t!1_200\t0\t200\tC\tT",
+                "1\t1_100&!1_200\t0\t100\tA,C\tG,T",
+                "1\t1_100&!1_200\t0\t200\tA,C\tG,T",
+            ]
+        );
+
+        let bed_bytes = fs::read(format!("{prefix_str}.bed")).unwrap();
+        assert_eq!(bed_bytes, vec![0x6C, 0x1B, 0x01, 0x33, 0xC3, 0x30, 0x30]);
+    }
+
     fn test_site(chrom: &str, pos: i32) -> SiteInfo {
         SiteInfo {
             chrom: chrom.to_string(),
             pos,
-            snp: format!("{chrom}:{pos}"),
+            snp: format!("{chrom}_{pos}"),
+            ref_allele: "A".to_string(),
+            alt_allele: "G".to_string(),
+        }
+    }
+
+    fn test_named_site(chrom: &str, pos: i32, snp: &str) -> SiteInfo {
+        SiteInfo {
+            chrom: chrom.to_string(),
+            pos,
+            snp: snp.to_string(),
             ref_allele: "A".to_string(),
             alt_allele: "G".to_string(),
         }

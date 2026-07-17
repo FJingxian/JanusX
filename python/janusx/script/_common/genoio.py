@@ -1276,6 +1276,7 @@ def prepare_packed_ctx_from_plink(
     snps_only: bool = False,
     expected_n_samples: int | None = None,
     filter_mode: str = "compact",
+    use_cache: bool = True,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     """
     Load/filter PLINK BED into a packed context for packed/full-Rust GWAS routes.
@@ -1283,7 +1284,8 @@ def prepare_packed_ctx_from_plink(
     The metadata/filter semantics are shared with the layered packed-meta cache in
     this module. When the Rust-side compact loader is unavailable or when lazy
     payload modes are requested, this function materializes the packed payload on
-    top of the same cached metadata layer.
+    top of the same metadata layer. Set `use_cache=False` to keep that metadata
+    entirely in memory and avoid writing `.pmeta.*` sidecar files.
     """
     filter_mode_key = normalize_packed_filter_mode(filter_mode)
     plink_prefix = normalize_plink_prefix(prefix)
@@ -1376,14 +1378,25 @@ def prepare_packed_ctx_from_plink(
             attempt_errors.append(("prepare_bed_2bit_packed", ex))
 
     try:
-        _sample_ids_meta, meta_ctx = load_or_build_packed_meta_dom(
-            str(plink_prefix),
-            maf=float(maf),
-            missing_rate=float(missing_rate),
-            het_threshold=float(het_threshold),
-            snps_only=bool(snps_only),
-            expected_n_samples=int(sample_ids_arr.shape[0]),
-        )
+        if bool(use_cache):
+            _sample_ids_meta, meta_ctx = load_or_build_packed_meta_dom(
+                str(plink_prefix),
+                maf=float(maf),
+                missing_rate=float(missing_rate),
+                het_threshold=float(het_threshold),
+                snps_only=bool(snps_only),
+                expected_n_samples=int(sample_ids_arr.shape[0]),
+            )
+        else:
+            meta_ctx = _build_packed_meta_layer(
+                str(plink_prefix),
+                sample_ids_arr=sample_ids_arr,
+                maf=float(maf),
+                missing_rate=float(missing_rate),
+                het_threshold=float(het_threshold),
+                snps_only=bool(snps_only),
+                layer="dom",
+            )
         site_keep = np.ascontiguousarray(
             np.asarray(meta_ctx["site_keep"], dtype=np.bool_).reshape(-1),
             dtype=np.bool_,

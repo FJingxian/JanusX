@@ -60,9 +60,7 @@ pub fn fvlmm2_assoc_chunk_f32<'py>(
     }
     let (xc_n, p_cov) = (xcov_arr.shape()[0], xcov_arr.shape()[1]);
     if xc_n != n {
-        return Err(PyRuntimeError::new_err(
-            "xcov.n_rows must equal len(y_rot)",
-        ));
+        return Err(PyRuntimeError::new_err("xcov.n_rows must equal len(y_rot)"));
     }
     if s.len() != n {
         return Err(PyRuntimeError::new_err("len(S) must equal len(y_rot)"));

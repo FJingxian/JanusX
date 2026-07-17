@@ -75,7 +75,6 @@ from janusx.assoc.workflow_ui import _emit_plain_info_line, _rich_success
 from janusx.assoc.workflow_ui import _run_fastplot_from_tsv_with_status
 from janusx.script.fvlmm2 import (
     InteractionSpec as _Fvlmm2InteractionSpec,
-    _compact_fvlmm2_output_df as _fvlmm2_compact_output_df,
     _format_fvlmm2_output_df_for_tsv as _fvlmm2_format_output_df_for_tsv,
     _load_active_sites as _fvlmm2_load_active_sites,
     _require_rust_backend as _fvlmm2_require_rust_backend,
@@ -744,6 +743,66 @@ def _garfield_followup_meta_or_fallback(
     }
 
 
+def _garfield_compact_fvlmm2_output_df(full_df: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "chrom",
+        "pos",
+        "combo_id",
+        "combo_af",
+        "unit_name",
+        "beta_combo_joint",
+        "se_combo_joint",
+        "p_combo_joint",
+        "p_lit1_joint",
+        "p_lit2_joint",
+    ]
+    if full_df.shape[0] == 0:
+        return pd.DataFrame(columns=columns)
+
+    out_rows: list[dict[str, object]] = []
+    for rec in full_df.itertuples(index=False):
+        unit_name = "."
+        if hasattr(rec, "garfield_unit_name"):
+            raw_unit_name = str(getattr(rec, "garfield_unit_name", "")).strip()
+            if raw_unit_name != "" and raw_unit_name.lower() != "nan":
+                unit_name = raw_unit_name
+        shared = {
+            "combo_id": str(rec.combo),
+            "combo_af": pd.to_numeric(getattr(rec, "combo_af", float("nan")), errors="coerce"),
+            "unit_name": unit_name,
+            "beta_combo_joint": pd.to_numeric(
+                getattr(rec, "beta_combo_joint", float("nan")),
+                errors="coerce",
+            ),
+            "se_combo_joint": pd.to_numeric(
+                getattr(rec, "se_combo_joint", float("nan")),
+                errors="coerce",
+            ),
+            "p_combo_joint": pd.to_numeric(
+                getattr(rec, "p_combo_joint", float("nan")),
+                errors="coerce",
+            ),
+            "p_lit1_joint": pd.to_numeric(getattr(rec, "p1_joint", float("nan")), errors="coerce"),
+            "p_lit2_joint": pd.to_numeric(getattr(rec, "p2_joint", float("nan")), errors="coerce"),
+        }
+        out_rows.append(
+            {
+                "chrom": str(rec.chrom1),
+                "pos": pd.to_numeric(getattr(rec, "pos1", float("nan")), errors="coerce"),
+                **shared,
+            }
+        )
+        out_rows.append(
+            {
+                "chrom": str(rec.chrom2),
+                "pos": pd.to_numeric(getattr(rec, "pos2", float("nan")), errors="coerce"),
+                **shared,
+            }
+        )
+
+    return pd.DataFrame(out_rows, columns=columns)
+
+
 def _build_garfield_fvlmm2_expanded_df(
     *,
     raw_df: pd.DataFrame,
@@ -821,10 +880,10 @@ def _build_garfield_fvlmm2_expanded_df(
                     "allele1": str(meta["allele1"]),
                     "af": float(meta["af"]),
                     "miss": float(meta["miss"]),
-                    "beta": float(beta_lit),
-                    "se": float(se_lit),
-                    "chisq": _garfield_followup_chisq(beta_lit, se_lit),
-                    "pwald": float(p_lit),
+                    "beta": float(beta_j),
+                    "se": float(se_j),
+                    "chisq": _garfield_followup_chisq(beta_j, se_j),
+                    "pwald": float(p_j),
                     "row_role": "singleton",
                     "component_index": int(component_index),
                     "parent_combo": str(rec.combo),
@@ -1006,7 +1065,7 @@ def _run_garfield_pseudo_fvlmm2(
     )
     if rule_meta_df.shape[0] > 0:
         full_df = full_df.merge(rule_meta_df, on="combo", how="left", sort=False)
-    tsv_df = _fvlmm2_format_output_df_for_tsv(_fvlmm2_compact_output_df(full_df))
+    tsv_df = _fvlmm2_format_output_df_for_tsv(_garfield_compact_fvlmm2_output_df(full_df))
     tsv_df.to_csv(tsv_path, sep="\t", index=False)
     saved_paths.append(tsv_path)
 
@@ -1624,6 +1683,17 @@ def main() -> None:
     optional_group.add_argument("--prior-not", type=float, default=None, help=argparse.SUPPRESS)
     optional_group.add_argument("-layer", "--layer", type=int, default=None, help="Maximum beam-search rule depth (default: 4).")
     optional_group.add_argument(
+        "-topk",
+        "--topk",
+        dest="rule_topk",
+        type=int,
+        default=1,
+        help=(
+            "Keep top-k de-duplicated candidate combinations per scan unit after beam search "
+            "(default: 1)."
+        ),
+    )
+    optional_group.add_argument(
         "-bimrange",
         "--bimrange",
         type=str,
@@ -1713,6 +1783,8 @@ def main() -> None:
     )
     if int(args.layer) <= 0:
         parser.error("-layer must be > 0")
+    if int(args.rule_topk) <= 0:
+        parser.error("-topk/--topk must be > 0")
     args.exhaustive_depth_runtime = 2 if int(args.layer) >= 2 else 1
     if args.prior_not is not None:
         try:
@@ -1727,8 +1799,8 @@ def main() -> None:
             args.engine = "CORR"
 
     ml_skip_tokens = {"NONE", "SKIP", "DIRECT"}
-    args.topk = int(args.width) if args.engine not in ml_skip_tokens else 0
-    args.top_rules_runtime = 1
+    args.ml_top_k_runtime = int(args.width) if args.engine not in ml_skip_tokens else 0
+    args.top_rules_runtime = int(args.rule_topk)
     args.max_output_rules_runtime = 0
     args.max_output_ratio_runtime = 0.0
 
@@ -2091,7 +2163,7 @@ def main() -> None:
                 bin_mode=feature_source,
                 ml_method=str(engine_runtime).lower(),
                 ml_importance="imp",
-                ml_top_k=int(args.topk),
+                ml_top_k=int(args.ml_top_k_runtime),
                 ml_top_frac=0.0,
                 permutation_repeats=20,
                 permutation_scoring="auto",
@@ -2313,7 +2385,7 @@ def main() -> None:
             "rank_schedule_runtime": rank_schedule_runtime,
             "rank_score": rank_score_runtime,
             "rank_score_runtime": rank_score_runtime,
-            "ml_top_k": (None if ml_skipped else int(args.topk)),
+            "ml_top_k": (None if ml_skipped else int(args.ml_top_k_runtime)),
             "extension": int(args.extension),
             "step": int(args.step),
             "bimrange": (list(args.bimrange) if args.bimrange else None),

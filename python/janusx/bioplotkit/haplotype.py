@@ -344,6 +344,46 @@ def _normalize_phenotype(phenotype: pd.DataFrame) -> pd.Series:
     return value
 
 
+def _load_phenotype_from_file(
+    phenotype_file: str,
+    *,
+    value_col: Optional[object] = None,
+    sample_col: Optional[object] = None,
+    sep: Optional[str] = None,
+) -> pd.DataFrame:
+    read_kwargs: dict[str, object] = {"engine": "python"}
+    if sep is None:
+        read_kwargs["sep"] = None
+    else:
+        read_kwargs["sep"] = sep
+    df = pd.read_csv(str(phenotype_file), **read_kwargs)
+    if df.shape[0] == 0 or df.shape[1] == 0:
+        raise ValueError(f"Empty phenotype file: {phenotype_file}")
+
+    work = df.copy()
+    if sample_col is not None:
+        if sample_col not in work.columns:
+            raise ValueError(
+                f"Phenotype sample column `{sample_col}` was not found in file: {phenotype_file}"
+            )
+        work = work.set_index(sample_col)
+    elif isinstance(work.index, pd.RangeIndex) and work.shape[1] >= 2:
+        first_col = work.columns[0]
+        first_name = str(first_col).strip().lower()
+        first_is_numeric = pd.api.types.is_numeric_dtype(work[first_col])
+        if (not first_is_numeric) or first_name.startswith("unnamed:"):
+            work = work.set_index(first_col)
+
+    if value_col is not None:
+        if value_col not in work.columns:
+            raise ValueError(
+                f"Phenotype value column `{value_col}` was not found in file: {phenotype_file}"
+            )
+        work = work.loc[:, [value_col]].copy()
+
+    return work
+
+
 def _detect_genotype_columns(df: pd.DataFrame) -> Tuple[str, str, str, str, Sequence[str]]:
     def pick(candidates: Sequence[str]) -> Optional[str]:
         lower_map = {str(c).lower(): c for c in df.columns}
@@ -955,6 +995,96 @@ def _load_sample_site_from_bfile(
     return _subset_sample_site_by_sites(geno_sample_site, requested_sites)
 
 
+def _load_sample_site_from_genotype_file(
+    genotype_file: str,
+    phenotype_samples: Sequence[str],
+    site_specs: Sequence[object],
+    *,
+    chunk_size: Optional[int] = None,
+    delimiter: Optional[str] = None,
+    force_kind: Optional[str] = None,
+) -> pd.DataFrame:
+    requested_sites = _normalize_site_specs(site_specs)
+    if len(requested_sites) == 0:
+        raise ValueError("`snp_sites` must be provided when using `genotype_file`.")
+
+    from janusx.gfreader import inspect_genotype_file, load_genotype_chunks
+
+    genotype_sample_ids, _ = inspect_genotype_file(
+        str(genotype_file),
+        delimiter=delimiter,
+        force_kind=force_kind,
+    )
+    genotype_sample_ids = [str(x) for x in genotype_sample_ids]
+    matched_pheno_ids, sample_ids, auto_matched, missing_ids, ambiguous_ids = (
+        _resolve_bfile_sample_matches(phenotype_samples, genotype_sample_ids)
+    )
+    if auto_matched:
+        shown = ", ".join(f"{src}->{dst}" for src, dst in auto_matched[:8])
+        extra = "" if len(auto_matched) <= 8 else f" ... (+{len(auto_matched) - 8} more)"
+        warnings.warn(
+            (
+                "Auto-matched phenotype sample IDs to genotype-file sample IDs using normalized "
+                f"name matching (case/punctuation/trailing-X insensitive): {shown}{extra}"
+            ),
+            RuntimeWarning,
+            stacklevel=3,
+        )
+    if ambiguous_ids:
+        shown = ", ".join(
+            f"{pid}[{canon}] -> {hits}" for pid, canon, hits in ambiguous_ids[:5]
+        )
+        extra = (
+            ""
+            if len(ambiguous_ids) <= 5
+            else f" ... (+{len(ambiguous_ids) - 5} more ambiguous IDs)"
+        )
+        warnings.warn(
+            (
+                "Some phenotype samples matched multiple genotype-file sample IDs under normalized "
+                f"name matching and were ignored: {shown}{extra}"
+            ),
+            RuntimeWarning,
+            stacklevel=3,
+        )
+    if missing_ids:
+        shown = ", ".join(missing_ids[:10])
+        extra = "" if len(missing_ids) <= 10 else f" ... (+{len(missing_ids) - 10} more)"
+        warnings.warn(
+            (
+                "Some phenotype samples could not be matched to the genotype file and will be "
+                f"ignored in haplotype plotting: {shown}{extra}"
+            ),
+            RuntimeWarning,
+            stacklevel=3,
+        )
+    if len(sample_ids) == 0:
+        raise ValueError("No overlapping samples between phenotype and genotype file.")
+
+    req_chunk_size = (
+        int(chunk_size)
+        if chunk_size is not None
+        else max(1, min(50_000, len(requested_sites)))
+    )
+    chunks = load_genotype_chunks(
+        str(genotype_file),
+        chunk_size=req_chunk_size,
+        maf=0.0,
+        missing_rate=1.0,
+        impute=False,
+        snp_sites=requested_sites,
+        sample_ids=sample_ids,
+        delimiter=delimiter,
+        force_kind=force_kind,
+    )
+    geno_sample_site = _chunks_to_sample_site(chunks, sample_ids, sample_ids)
+    if matched_pheno_ids != sample_ids:
+        geno_sample_site = geno_sample_site.rename(
+            index={src: dst for src, dst in zip(sample_ids, matched_pheno_ids)}
+        )
+    return _subset_sample_site_by_sites(geno_sample_site, requested_sites)
+
+
 def _infer_adv_alleles(
     merged: pd.DataFrame,
     site_cols: Sequence[object],
@@ -1101,7 +1231,7 @@ def _build_haplotype_matrix_from_summary(
 
 
 def plot_haplotype(
-    phenotype: pd.DataFrame,
+    phenotype: Optional[pd.DataFrame] = None,
     genotype: Optional[GenotypeInput] = None,
     draw_letters: bool = False,
     draw_bar: bool = False,
@@ -1117,6 +1247,13 @@ def plot_haplotype(
     color: Optional[object] = None,
     scatter_alpha: Optional[float] = None,
     bfile: Optional[str] = None,
+    phenotype_file: Optional[str] = None,
+    genotype_file: Optional[str] = None,
+    phenotype_value_col: Optional[object] = None,
+    phenotype_sample_col: Optional[object] = None,
+    phenotype_sep: Optional[str] = None,
+    genotype_force_kind: Optional[str] = None,
+    genotype_delimiter: Optional[str] = None,
     snp_sites: Optional[Sequence[object]] = None,
     load_chunk_size: Optional[int] = None,
     **kwargs: Any,
@@ -1131,6 +1268,7 @@ def plot_haplotype(
         Preferred format:
           - one value column with sample IDs in index; or
           - first column sample IDs, second column phenotype values.
+        Optional when `phenotype_file` is provided.
     genotype
         Either:
           1) DataFrame with columns like [chr, pos, ref, alt, sample...]
@@ -1180,11 +1318,30 @@ def plot_haplotype(
     bfile
         Optional PLINK prefix / genotype prefix to load directly inside
         `plot_haplotype`. Requires `snp_sites`.
+    phenotype_file
+        Optional phenotype table path read internally by pandas. When provided,
+        `phenotype` must be None.
+    genotype_file
+        Optional genotype source path/prefix read internally via
+        `janusx.gfreader.load_genotype_chunks`. Supports the same unified input
+        types as gfreader: PLINK prefix, VCF/VCF.GZ, HMP/HMP.GZ, and FILE/TXT/NPY/BIN.
+        When provided, `genotype` and `bfile` must be None.
+    phenotype_value_col
+        Optional phenotype value column name used only with `phenotype_file`.
+    phenotype_sample_col
+        Optional phenotype sample-ID column name used only with `phenotype_file`.
+    phenotype_sep
+        Optional delimiter used only with `phenotype_file`.
+    genotype_force_kind
+        Optional gfreader `force_kind` override used only with `genotype_file`.
+    genotype_delimiter
+        Optional delimiter hint used only with `genotype_file` for FILE/TXT inputs.
     snp_sites
         Optional site list such as `[('1', 8018093), ('1', 8019732)]` or
         `['1:8018093', '1:8019732']`. When `bfile` is provided, only these
-        sites are loaded. When `genotype` is already provided, it is subset to
-        these sites in the requested order.
+        sites are loaded. When `genotype_file` is provided, the same early site
+        filtering is applied during loading. When `genotype` is already provided,
+        it is subset to these sites in the requested order.
     load_chunk_size
         Optional chunk size used only for internal `bfile` loading.
 
@@ -1231,9 +1388,26 @@ def plot_haplotype(
     if ax is None:
         _, ax = plt.subplots(figsize=(6, 4))
 
+    if phenotype is not None and phenotype_file is not None:
+        raise ValueError("Use either `phenotype` or `phenotype_file`, not both.")
+    if phenotype is None:
+        if phenotype_file is None:
+            raise ValueError("Provide `phenotype`, or use `phenotype_file`.")
+        phenotype = _load_phenotype_from_file(
+            str(phenotype_file),
+            value_col=phenotype_value_col,
+            sample_col=phenotype_sample_col,
+            sep=phenotype_sep,
+        )
+
     pheno = _normalize_phenotype(phenotype)
     pheno_name = pheno.name if pheno.name is not None else "phenotype"
     phenotype_samples = pheno.index.tolist()
+
+    if genotype_file is not None and bfile is not None:
+        raise ValueError("Use either `genotype_file` or `bfile`, not both.")
+    if genotype_file is not None and genotype is not None:
+        raise ValueError("Use either `genotype` or `genotype_file`, not both.")
 
     if bfile is not None:
         if genotype is not None:
@@ -1243,6 +1417,15 @@ def plot_haplotype(
             phenotype_samples,
             snp_sites or [],
             chunk_size=load_chunk_size,
+        )
+    elif genotype_file is not None:
+        geno_sample_site = _load_sample_site_from_genotype_file(
+            str(genotype_file),
+            phenotype_samples,
+            snp_sites or [],
+            chunk_size=load_chunk_size,
+            delimiter=genotype_delimiter,
+            force_kind=genotype_force_kind,
         )
     elif isinstance(genotype, pd.DataFrame):
         geno_sample_site = _genotype_dataframe_to_sample_site(genotype, phenotype_samples)

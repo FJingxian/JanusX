@@ -246,9 +246,7 @@ pub fn lmm_rotate_y_with_ut_f64<'py>(
         out
     });
 
-    Ok(
-        PyArray1::from_owned_array(py, numpy::ndarray::Array1::from_vec(y_rot)).into_bound(),
-    )
+    Ok(PyArray1::from_owned_array(py, numpy::ndarray::Array1::from_vec(y_rot)).into_bound())
 }
 
 // LMM REML chunk (lmm_reml_chunk_f32)

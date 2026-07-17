@@ -20,8 +20,8 @@ use crate::decode::AdditiveDecodePlan;
 use crate::gfcore;
 use crate::gfcore::{BimChunkReader, SiteInfo};
 use crate::glm::{
-    lm_stream_bed_additive_prepared_unified, normalize_plink_prefix_local,
-    student_t_p_two_sided, LmQrProjection,
+    lm_stream_bed_additive_prepared_unified, normalize_plink_prefix_local, student_t_p_two_sided,
+    LmQrProjection,
 };
 use crate::gload::WindowedBedMatrix;
 use crate::he::row_major_block_mul_mat_f32;
@@ -85,9 +85,9 @@ fn opt_item<'py>(d: &Bound<'py, PyDict>, key: &str) -> PyResult<Option<Bound<'py
 }
 
 fn array1_f64(obj: Bound<'_, PyAny>, label: &str) -> PyResult<Vec<f64>> {
-    let arr = obj.extract::<PyReadonlyArray1<'_, f64>>().map_err(|_| {
-        PyValueError::new_err(format!("{label} must be a 1D float64 numpy array"))
-    })?;
+    let arr = obj
+        .extract::<PyReadonlyArray1<'_, f64>>()
+        .map_err(|_| PyValueError::new_err(format!("{label} must be a 1D float64 numpy array")))?;
     match arr.as_slice() {
         Ok(slc) => Ok(slc.to_vec()),
         Err(_) => Ok(arr.as_array().iter().copied().collect()),
@@ -95,9 +95,9 @@ fn array1_f64(obj: Bound<'_, PyAny>, label: &str) -> PyResult<Vec<f64>> {
 }
 
 fn array2_f64(obj: Bound<'_, PyAny>, label: &str) -> PyResult<(Vec<f64>, usize, usize)> {
-    let arr = obj.extract::<PyReadonlyArray2<'_, f64>>().map_err(|_| {
-        PyValueError::new_err(format!("{label} must be a 2D float64 numpy array"))
-    })?;
+    let arr = obj
+        .extract::<PyReadonlyArray2<'_, f64>>()
+        .map_err(|_| PyValueError::new_err(format!("{label} must be a 2D float64 numpy array")))?;
     let view = arr.as_array();
     let rows = view.shape()[0];
     let cols = view.shape()[1];
@@ -109,9 +109,9 @@ fn array2_f64(obj: Bound<'_, PyAny>, label: &str) -> PyResult<(Vec<f64>, usize, 
 }
 
 fn array1_i64(obj: Bound<'_, PyAny>, label: &str) -> PyResult<Vec<i64>> {
-    let arr = obj.extract::<PyReadonlyArray1<'_, i64>>().map_err(|_| {
-        PyValueError::new_err(format!("{label} must be a 1D int64 numpy array"))
-    })?;
+    let arr = obj
+        .extract::<PyReadonlyArray1<'_, i64>>()
+        .map_err(|_| PyValueError::new_err(format!("{label} must be a 1D int64 numpy array")))?;
     match arr.as_slice() {
         Ok(slc) => Ok(slc.to_vec()),
         Err(_) => Ok(arr.as_array().iter().copied().collect()),
@@ -119,9 +119,9 @@ fn array1_i64(obj: Bound<'_, PyAny>, label: &str) -> PyResult<Vec<i64>> {
 }
 
 fn array1_bool(obj: Bound<'_, PyAny>, label: &str) -> PyResult<Vec<bool>> {
-    let arr = obj.extract::<PyReadonlyArray1<'_, bool>>().map_err(|_| {
-        PyValueError::new_err(format!("{label} must be a 1D bool numpy array"))
-    })?;
+    let arr = obj
+        .extract::<PyReadonlyArray1<'_, bool>>()
+        .map_err(|_| PyValueError::new_err(format!("{label} must be a 1D bool numpy array")))?;
     match arr.as_slice() {
         Ok(slc) => Ok(slc.to_vec()),
         Err(_) => Ok(arr.as_array().iter().copied().collect()),
@@ -129,9 +129,9 @@ fn array1_bool(obj: Bound<'_, PyAny>, label: &str) -> PyResult<Vec<bool>> {
 }
 
 fn array1_f32(obj: Bound<'_, PyAny>, label: &str) -> PyResult<Vec<f32>> {
-    let arr = obj.extract::<PyReadonlyArray1<'_, f32>>().map_err(|_| {
-        PyValueError::new_err(format!("{label} must be a 1D float32 numpy array"))
-    })?;
+    let arr = obj
+        .extract::<PyReadonlyArray1<'_, f32>>()
+        .map_err(|_| PyValueError::new_err(format!("{label} must be a 1D float32 numpy array")))?;
     match arr.as_slice() {
         Ok(slc) => Ok(slc.to_vec()),
         Err(_) => Ok(arr.as_array().iter().copied().collect()),
@@ -401,16 +401,15 @@ fn decode_prepared_additive_matrix(
             .ok_or_else(|| "internal error: missing BED source".to_string())?;
         (mmap.len() - 3) / bytes_per_snp
     };
-    let source_rows = parse_index_vec_i64_result(
-        prepared.row_indices.as_slice(),
-        n_snps,
-        "row_indices",
-    )?;
+    let source_rows =
+        parse_index_vec_i64_result(prepared.row_indices.as_slice(), n_snps, "row_indices")?;
     let mut prev_src = None::<usize>;
     for &src_row in source_rows.iter() {
         if let Some(prev) = prev_src {
             if src_row < prev {
-                return Err("prepared row_indices must be sorted in ascending BED order".to_string());
+                return Err(
+                    "prepared row_indices must be sorted in ascending BED order".to_string()
+                );
             }
         }
         prev_src = Some(src_row);
@@ -499,8 +498,12 @@ fn lm_trait_assoc_bed_to_tsv_shared_fast(
     }
 
     let zero_y = vec![0.0_f64; n];
-    let design_ctx =
-        LmQrProjection::from_design(reference.x.as_slice(), zero_y.as_slice(), n, reference.x_cols)?;
+    let design_ctx = LmQrProjection::from_design(
+        reference.x.as_slice(),
+        zero_y.as_slice(),
+        n,
+        reference.x_cols,
+    )?;
     let rank = design_ctx.rank();
     let pool = get_cached_pool(threads).map_err(|e| e.to_string())?;
     let _blas_guard = BlasThreadGuard::enter(threads.max(1));
@@ -949,7 +952,9 @@ pub fn lm_trait_assoc_bed_matrix_to_tsv(
         return Ok(Vec::new());
     }
     if trait_names.iter().any(|name| name.trim().is_empty()) {
-        return Err(PyValueError::new_err("trait_names must not contain empty values"));
+        return Err(PyValueError::new_err(
+            "trait_names must not contain empty values",
+        ));
     }
 
     let (y_flat, y_rows, y_cols) = array2_f64(y_trait_major, "y_trait_major")?;
@@ -1016,34 +1021,36 @@ pub fn lm_trait_assoc_bed_matrix_to_tsv(
         row_maf: row_maf_vec,
     };
     arm_interrupt_trap();
-    py.detach(move || -> PyResult<Vec<(String, usize, usize, usize, f64)>> {
-        check_ctrlc().map_err(map_err_string_to_py)?;
-        let total_threads = if threads > 0 {
-            threads
-        } else {
-            thread::available_parallelism()
-                .map(|v| v.get())
-                .unwrap_or(1usize)
-        };
-        lm_trait_assoc_bed_matrix_shared_fast(
-            trait_names.as_slice(),
-            y_flat.as_slice(),
-            y_rows,
-            y_cols,
-            y_cols,
-            x_flat.as_slice(),
-            x_cols,
-            sample_idx.as_slice(),
-            &prepared,
-            norm_prefix.as_str(),
-            out_tsv.as_str(),
-            chunk_size,
-            total_threads.max(1),
-            progress_callback.as_ref(),
-            mmap_window_mb,
-        )
-        .map_err(map_err_string_to_py)
-    })
+    py.detach(
+        move || -> PyResult<Vec<(String, usize, usize, usize, f64)>> {
+            check_ctrlc().map_err(map_err_string_to_py)?;
+            let total_threads = if threads > 0 {
+                threads
+            } else {
+                thread::available_parallelism()
+                    .map(|v| v.get())
+                    .unwrap_or(1usize)
+            };
+            lm_trait_assoc_bed_matrix_shared_fast(
+                trait_names.as_slice(),
+                y_flat.as_slice(),
+                y_rows,
+                y_cols,
+                y_cols,
+                x_flat.as_slice(),
+                x_cols,
+                sample_idx.as_slice(),
+                &prepared,
+                norm_prefix.as_str(),
+                out_tsv.as_str(),
+                chunk_size,
+                total_threads.max(1),
+                progress_callback.as_ref(),
+                mmap_window_mb,
+            )
+            .map_err(map_err_string_to_py)
+        },
+    )
 }
 
 #[pyfunction]
@@ -1218,107 +1225,110 @@ pub fn lm_trait_assoc_bed_to_tsv(
     let n_traits = jobs.len();
     let out_path = out_tsv.clone();
 
-    py.detach(move || -> PyResult<Vec<(String, usize, usize, usize, f64)>> {
-        check_ctrlc().map_err(map_err_string_to_py)?;
-        let total_threads = if threads > 0 {
-            threads
-        } else {
-            thread::available_parallelism()
-                .map(|v| v.get())
-                .unwrap_or(1usize)
-        };
-        if jobs_support_shared_fast_path(jobs.as_slice()) {
-            return lm_trait_assoc_bed_to_tsv_shared_fast(
-                jobs.as_slice(),
-                norm_prefix.as_str(),
-                out_path.as_str(),
-                chunk_size,
-                total_threads.max(1),
-                progress_callback.as_ref(),
-                mmap_window_mb,
-            )
-            .map_err(map_err_string_to_py);
-        }
-
-        let worker_count = n_traits.min(total_threads.max(1));
-        let inner_threads = std::cmp::max(1usize, total_threads.max(1) / worker_count.max(1));
-        let jobs_arc = Arc::new(jobs);
-        let next_idx = Arc::new(AtomicUsize::new(0));
-        let stop_flag = Arc::new(AtomicBool::new(false));
-        let (tx, rx) = mpsc::channel::<Result<TraitResult, String>>();
-
-        let mut handles = Vec::with_capacity(worker_count);
-        let mut tmp_paths = Vec::<String>::with_capacity(worker_count);
-        for worker_idx in 0..worker_count {
-            let jobs_ref = Arc::clone(&jobs_arc);
-            let next_ref = Arc::clone(&next_idx);
-            let stop_ref = Arc::clone(&stop_flag);
-            let tx_ref = tx.clone();
-            let prefix_ref = norm_prefix.clone();
-            let mmap_window_mb_ref = mmap_window_mb;
-            let worker_tmp_tsv = temp_worker_path(out_path.as_str(), worker_idx);
-            tmp_paths.push(worker_tmp_tsv.clone());
-            let handle = thread::spawn(move || loop {
-                if stop_ref.load(Ordering::SeqCst) {
-                    break;
-                }
-                let idx = next_ref.fetch_add(1, Ordering::SeqCst);
-                if idx >= jobs_ref.len() {
-                    break;
-                }
-                let job = &jobs_ref[idx];
-                let start = Instant::now();
-                let qr_ctx = match LmQrProjection::from_design(
-                    job.x.as_slice(),
-                    job.y.as_slice(),
-                    job.y.len(),
-                    job.x_cols,
-                ) {
-                    Ok(v) => v,
-                    Err(err) => {
-                        stop_ref.store(true, Ordering::SeqCst);
-                        let _ = tx_ref.send(Err(err));
-                        break;
-                    }
-                };
-                let rhs_add_f32 = match crate::glm::pack_lm_scan_rhs_f32(
-                    job.y.as_slice(),
-                    if qr_ctx.rank() > 0 {
-                        Some(qr_ctx.q_f32())
-                    } else {
-                        None
-                    },
-                    qr_ctx.rank(),
-                ) {
-                    Ok(v) => v,
-                    Err(err) => {
-                        stop_ref.store(true, Ordering::SeqCst);
-                        let _ = tx_ref.send(Err(err));
-                        break;
-                    }
-                };
-                let run = lm_stream_bed_additive_prepared_unified(
-                    prefix_ref.as_str(),
-                    &qr_ctx,
-                    rhs_add_f32.as_slice(),
-                    worker_tmp_tsv.as_str(),
-                    job.sample_indices.as_slice(),
-                    (
-                        job.prepared.row_indices.clone(),
-                        job.prepared.row_flip.clone(),
-                        job.prepared.row_missing.clone(),
-                        job.prepared.row_maf.clone(),
-                    ),
+    py.detach(
+        move || -> PyResult<Vec<(String, usize, usize, usize, f64)>> {
+            check_ctrlc().map_err(map_err_string_to_py)?;
+            let total_threads = if threads > 0 {
+                threads
+            } else {
+                thread::available_parallelism()
+                    .map(|v| v.get())
+                    .unwrap_or(1usize)
+            };
+            if jobs_support_shared_fast_path(jobs.as_slice()) {
+                return lm_trait_assoc_bed_to_tsv_shared_fast(
+                    jobs.as_slice(),
+                    norm_prefix.as_str(),
+                    out_path.as_str(),
                     chunk_size,
-                    inner_threads,
-                    None,
-                    0usize,
-                    mmap_window_mb_ref,
-                );
-                match run {
-                    Ok((kept_rows, scanned_rows)) => {
-                        let rows_text =
-                            match read_trait_rows_with_phenotype(worker_tmp_tsv.as_str(), job.name.as_str()) {
+                    total_threads.max(1),
+                    progress_callback.as_ref(),
+                    mmap_window_mb,
+                )
+                .map_err(map_err_string_to_py);
+            }
+
+            let worker_count = n_traits.min(total_threads.max(1));
+            let inner_threads = std::cmp::max(1usize, total_threads.max(1) / worker_count.max(1));
+            let jobs_arc = Arc::new(jobs);
+            let next_idx = Arc::new(AtomicUsize::new(0));
+            let stop_flag = Arc::new(AtomicBool::new(false));
+            let (tx, rx) = mpsc::channel::<Result<TraitResult, String>>();
+
+            let mut handles = Vec::with_capacity(worker_count);
+            let mut tmp_paths = Vec::<String>::with_capacity(worker_count);
+            for worker_idx in 0..worker_count {
+                let jobs_ref = Arc::clone(&jobs_arc);
+                let next_ref = Arc::clone(&next_idx);
+                let stop_ref = Arc::clone(&stop_flag);
+                let tx_ref = tx.clone();
+                let prefix_ref = norm_prefix.clone();
+                let mmap_window_mb_ref = mmap_window_mb;
+                let worker_tmp_tsv = temp_worker_path(out_path.as_str(), worker_idx);
+                tmp_paths.push(worker_tmp_tsv.clone());
+                let handle = thread::spawn(move || loop {
+                    if stop_ref.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let idx = next_ref.fetch_add(1, Ordering::SeqCst);
+                    if idx >= jobs_ref.len() {
+                        break;
+                    }
+                    let job = &jobs_ref[idx];
+                    let start = Instant::now();
+                    let qr_ctx = match LmQrProjection::from_design(
+                        job.x.as_slice(),
+                        job.y.as_slice(),
+                        job.y.len(),
+                        job.x_cols,
+                    ) {
+                        Ok(v) => v,
+                        Err(err) => {
+                            stop_ref.store(true, Ordering::SeqCst);
+                            let _ = tx_ref.send(Err(err));
+                            break;
+                        }
+                    };
+                    let rhs_add_f32 = match crate::glm::pack_lm_scan_rhs_f32(
+                        job.y.as_slice(),
+                        if qr_ctx.rank() > 0 {
+                            Some(qr_ctx.q_f32())
+                        } else {
+                            None
+                        },
+                        qr_ctx.rank(),
+                    ) {
+                        Ok(v) => v,
+                        Err(err) => {
+                            stop_ref.store(true, Ordering::SeqCst);
+                            let _ = tx_ref.send(Err(err));
+                            break;
+                        }
+                    };
+                    let run = lm_stream_bed_additive_prepared_unified(
+                        prefix_ref.as_str(),
+                        &qr_ctx,
+                        rhs_add_f32.as_slice(),
+                        worker_tmp_tsv.as_str(),
+                        job.sample_indices.as_slice(),
+                        (
+                            job.prepared.row_indices.clone(),
+                            job.prepared.row_flip.clone(),
+                            job.prepared.row_missing.clone(),
+                            job.prepared.row_maf.clone(),
+                        ),
+                        chunk_size,
+                        inner_threads,
+                        None,
+                        0usize,
+                        mmap_window_mb_ref,
+                    );
+                    match run {
+                        Ok((kept_rows, scanned_rows)) => {
+                            let rows_text = match read_trait_rows_with_phenotype(
+                                worker_tmp_tsv.as_str(),
+                                job.name.as_str(),
+                            ) {
                                 Ok(text) => text,
                                 Err(err) => {
                                     let _ = fs::remove_file(&worker_tmp_tsv);
@@ -1327,116 +1337,126 @@ pub fn lm_trait_assoc_bed_to_tsv(
                                     break;
                                 }
                             };
-                        let _ = fs::remove_file(&worker_tmp_tsv);
-                        let _ = tx_ref.send(Ok(TraitResult {
-                            idx,
-                            name: job.name.clone(),
-                            n_idv: job.n_idv,
-                            kept_rows,
-                            scanned_rows,
-                            elapsed_secs: start.elapsed().as_secs_f64(),
-                            rows_text,
-                        }));
-                    }
-                    Err(err) => {
-                        let _ = fs::remove_file(&worker_tmp_tsv);
-                        stop_ref.store(true, Ordering::SeqCst);
-                        let _ = tx_ref.send(Err(err));
-                        break;
-                    }
-                }
-            });
-            handles.push(handle);
-        }
-        drop(tx);
-
-        let mut ordered_results: Vec<Option<TraitResult>> = (0..n_traits).map(|_| None).collect();
-        let mut final_stats: Vec<Option<(String, usize, usize, usize, f64)>> =
-            (0..n_traits).map(|_| None).collect();
-        let mut done_traits = 0usize;
-        let mut next_write_idx = 0usize;
-        let run_result: PyResult<Vec<(String, usize, usize, usize, f64)>> = (|| {
-            let mut writer: Option<AsyncTsvWriter> = None;
-            let mut wrote_rows = false;
-            while done_traits < n_traits {
-                check_ctrlc().map_err(map_err_string_to_py)?;
-                match rx.recv_timeout(Duration::from_millis(100)) {
-                    Ok(Ok(result)) => {
-                        let result_idx = result.idx;
-                        let trait_name_done = result.name.clone();
-                        ordered_results[result_idx] = Some(result);
-                        done_traits = done_traits.saturating_add(1);
-                        if let Some(cb) = progress_callback.as_ref() {
-                            Python::attach(|py2| -> PyResult<()> {
-                                py2.check_signals()?;
-                                cb.call1(py2, (done_traits, n_traits, trait_name_done.as_str()))?;
-                                Ok(())
-                            })?;
+                            let _ = fs::remove_file(&worker_tmp_tsv);
+                            let _ = tx_ref.send(Ok(TraitResult {
+                                idx,
+                                name: job.name.clone(),
+                                n_idv: job.n_idv,
+                                kept_rows,
+                                scanned_rows,
+                                elapsed_secs: start.elapsed().as_secs_f64(),
+                                rows_text,
+                            }));
                         }
-                        while next_write_idx < n_traits {
-                            let Some(result_ready) = ordered_results[next_write_idx].take() else {
-                                break;
-                            };
-                            if !result_ready.rows_text.is_empty() {
-                                if writer.is_none() {
-                                    writer = Some(AsyncTsvWriter::with_config(
-                                        out_path.as_str(),
-                                        LM_TRAIT_AGG_HEADER.as_bytes(),
-                                        64 * 1024 * 1024,
-                                        16,
-                                    )
-                                    .map_err(map_err_string_to_py)?);
-                                }
-                                if let Some(out) = writer.as_ref() {
-                                    out.send(result_ready.rows_text.into_bytes())
-                                        .map_err(map_err_string_to_py)?;
-                                }
-                                wrote_rows = true;
+                        Err(err) => {
+                            let _ = fs::remove_file(&worker_tmp_tsv);
+                            stop_ref.store(true, Ordering::SeqCst);
+                            let _ = tx_ref.send(Err(err));
+                            break;
+                        }
+                    }
+                });
+                handles.push(handle);
+            }
+            drop(tx);
+
+            let mut ordered_results: Vec<Option<TraitResult>> =
+                (0..n_traits).map(|_| None).collect();
+            let mut final_stats: Vec<Option<(String, usize, usize, usize, f64)>> =
+                (0..n_traits).map(|_| None).collect();
+            let mut done_traits = 0usize;
+            let mut next_write_idx = 0usize;
+            let run_result: PyResult<Vec<(String, usize, usize, usize, f64)>> = (|| {
+                let mut writer: Option<AsyncTsvWriter> = None;
+                let mut wrote_rows = false;
+                while done_traits < n_traits {
+                    check_ctrlc().map_err(map_err_string_to_py)?;
+                    match rx.recv_timeout(Duration::from_millis(100)) {
+                        Ok(Ok(result)) => {
+                            let result_idx = result.idx;
+                            let trait_name_done = result.name.clone();
+                            ordered_results[result_idx] = Some(result);
+                            done_traits = done_traits.saturating_add(1);
+                            if let Some(cb) = progress_callback.as_ref() {
+                                Python::attach(|py2| -> PyResult<()> {
+                                    py2.check_signals()?;
+                                    cb.call1(
+                                        py2,
+                                        (done_traits, n_traits, trait_name_done.as_str()),
+                                    )?;
+                                    Ok(())
+                                })?;
                             }
-                            final_stats[next_write_idx] = Some((
-                                result_ready.name,
-                                result_ready.n_idv,
-                                result_ready.kept_rows,
-                                result_ready.scanned_rows,
-                                result_ready.elapsed_secs,
-                            ));
-                            next_write_idx = next_write_idx.saturating_add(1);
+                            while next_write_idx < n_traits {
+                                let Some(result_ready) = ordered_results[next_write_idx].take()
+                                else {
+                                    break;
+                                };
+                                if !result_ready.rows_text.is_empty() {
+                                    if writer.is_none() {
+                                        writer = Some(
+                                            AsyncTsvWriter::with_config(
+                                                out_path.as_str(),
+                                                LM_TRAIT_AGG_HEADER.as_bytes(),
+                                                64 * 1024 * 1024,
+                                                16,
+                                            )
+                                            .map_err(map_err_string_to_py)?,
+                                        );
+                                    }
+                                    if let Some(out) = writer.as_ref() {
+                                        out.send(result_ready.rows_text.into_bytes())
+                                            .map_err(map_err_string_to_py)?;
+                                    }
+                                    wrote_rows = true;
+                                }
+                                final_stats[next_write_idx] = Some((
+                                    result_ready.name,
+                                    result_ready.n_idv,
+                                    result_ready.kept_rows,
+                                    result_ready.scanned_rows,
+                                    result_ready.elapsed_secs,
+                                ));
+                                next_write_idx = next_write_idx.saturating_add(1);
+                            }
+                        }
+                        Ok(Err(err)) => {
+                            stop_flag.store(true, Ordering::SeqCst);
+                            return Err(map_err_string_to_py(err));
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            continue;
+                        }
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            break;
                         }
                     }
-                    Ok(Err(err)) => {
-                        stop_flag.store(true, Ordering::SeqCst);
-                        return Err(map_err_string_to_py(err));
-                    }
-                    Err(mpsc::RecvTimeoutError::Timeout) => {
-                        continue;
-                    }
-                    Err(mpsc::RecvTimeoutError::Disconnected) => {
-                        break;
-                    }
                 }
-            }
 
-            if let Some(out) = writer {
-                out.finish().map_err(map_err_string_to_py)?;
-            }
-            if !wrote_rows && Path::new(&out_path).exists() {
-                let _ = fs::remove_file(&out_path);
-            }
+                if let Some(out) = writer {
+                    out.finish().map_err(map_err_string_to_py)?;
+                }
+                if !wrote_rows && Path::new(&out_path).exists() {
+                    let _ = fs::remove_file(&out_path);
+                }
 
-            final_stats
-                .into_iter()
-                .map(|item| item.ok_or_else(|| "trait worker exited without a result".to_string()))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(map_err_string_to_py)
-        })();
+                final_stats
+                    .into_iter()
+                    .map(|item| {
+                        item.ok_or_else(|| "trait worker exited without a result".to_string())
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(map_err_string_to_py)
+            })();
 
-        if run_result.is_err() {
-            stop_flag.store(true, Ordering::SeqCst);
-        }
-        for handle in handles {
-            let _ = handle.join();
-        }
-        cleanup_trait_tmp_paths(tmp_paths.as_slice());
-        run_result
-    })
+            if run_result.is_err() {
+                stop_flag.store(true, Ordering::SeqCst);
+            }
+            for handle in handles {
+                let _ = handle.join();
+            }
+            cleanup_trait_tmp_paths(tmp_paths.as_slice());
+            run_result
+        },
+    )
 }

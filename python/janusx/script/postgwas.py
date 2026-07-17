@@ -85,6 +85,7 @@ import numpy as np
 from scipy.stats import beta
 import argparse
 import difflib
+import heapq
 import re
 import shlex
 import time
@@ -111,6 +112,7 @@ _QQ_BAND_COLOR = "grey"
 _CONFIG_LINE_MAX_CHARS = 60
 _CONFIG_OVERFLOW_MARK = "***"
 _ANNO_DESC_KEY = "description"
+_POSTGWAS_GFF_BATCH_ANNOTATION_MIN_SITES = 64
 _DEFAULT_SINGLE_MARKER = "o"
 _DEFAULT_MERGE_MARKERS = ("1", "2", "3", "4", "*", "+", "x")
 _DEFAULT_SCATTER_SIZE = 8.0
@@ -130,6 +132,9 @@ _POSTGWAS_PREFERRED_PDF_BACKEND: object = _POSTGWAS_PDF_BACKEND_SENTINEL
 _POSTGWAS_DEFAULT_FONT_SIZE = 9.0
 _POSTGWAS_MIN_FONT_SCALE = 0.80
 _POSTGWAS_FONT_FILE_EXTENSIONS = frozenset({".ttf", ".otf", ".ttc", ".otc"})
+_POSTGWAS_SHARED_GFF_KEY: Optional[tuple[str, int, int]] = None
+_POSTGWAS_SHARED_GFF_QUERY: Optional[GFFQuery] = None
+_POSTGWAS_SHARED_GFF_ANNOTATION_CTX: Optional[dict[str, object]] = None
 _POSTGWAS_GENERIC_FONT_FAMILIES = {
     "serif": "serif",
     "sans": "sans-serif",
@@ -169,6 +174,144 @@ def _postgwas_invocation_command(argv: Optional[list[str]] = None) -> str:
 def _env_truthy(name: str, default: bool = False) -> bool:
     raw = str(os.environ.get(name, "1" if default else "0")).strip().lower()
     return raw in {"1", "true", "yes", "y", "on"}
+
+
+def _postgwas_annotation_suffix(path: Optional[str]) -> str:
+    if path is None:
+        return ""
+    text = str(path).strip()
+    if text == "":
+        return ""
+    return text.replace(".gz", "").split(".")[-1].lower()
+
+
+def _postgwas_gff_cache_key(gff_path: str) -> tuple[str, int, int]:
+    real = os.path.realpath(str(gff_path))
+    st = os.stat(real)
+    return (real, int(st.st_size), int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9))))
+
+
+def _postgwas_read_minimal_gff(gff_path: str) -> pd.DataFrame:
+    col_names = [
+        "chrom",
+        "source",
+        "feature",
+        "start",
+        "end",
+        "score",
+        "strand",
+        "phase",
+        "attributes",
+    ]
+    try:
+        gff = pd.read_csv(
+            gff_path,
+            sep="\t",
+            comment="#",
+            header=None,
+            names=col_names,
+            usecols=["chrom", "feature", "start", "end", "strand", "attributes"],
+            compression="infer",
+            dtype={
+                "chrom": "string",
+                "feature": "string",
+                "strand": "string",
+                "attributes": "string",
+            },
+            na_filter=False,
+            low_memory=False,
+            on_bad_lines="skip",
+        )
+    except Exception:
+        # Fallback to the more permissive reader for malformed GFF variants.
+        fallback_q = GFFQuery.from_file(gff_path, copy_df=False)
+        fallback_gff = fallback_q.gff
+        gff = fallback_gff.loc[
+            :,
+            [
+                x
+                for x in ("feature", "start", "end", "strand", "attributes", "chrom_norm")
+                if x in fallback_gff.columns
+            ],
+        ].copy()
+        return gff
+
+    if gff.shape[0] == 0:
+        raise ValueError(f"No valid GFF rows found in file: {gff_path}")
+
+    gff["start"] = pd.to_numeric(gff["start"], errors="coerce")
+    gff["end"] = pd.to_numeric(gff["end"], errors="coerce")
+    gff = gff.dropna(subset=["feature", "start", "end"]).copy()
+    if gff.shape[0] == 0:
+        raise ValueError(f"No valid GFF rows found in file: {gff_path}")
+    gff["start"] = gff["start"].astype(np.int64)
+    gff["end"] = gff["end"].astype(np.int64)
+    gff["chrom_norm"] = gff["chrom"].map(_normalize_chr).astype("category")
+    gff["feature"] = gff["feature"].astype("string").str.strip().astype("category")
+    gff["strand"] = gff["strand"].astype("string").str.strip().astype("category")
+    gff["attributes"] = gff["attributes"].astype("string")
+    gff = gff.drop(columns=["chrom"])
+    gff = gff.sort_values(["chrom_norm", "start", "end"]).reset_index(drop=True)
+    return gff
+
+
+def _postgwas_get_shared_gff_query(gff_path: str) -> GFFQuery:
+    global _POSTGWAS_SHARED_GFF_KEY
+    global _POSTGWAS_SHARED_GFF_QUERY
+    global _POSTGWAS_SHARED_GFF_ANNOTATION_CTX
+
+    key = _postgwas_gff_cache_key(gff_path)
+    if _POSTGWAS_SHARED_GFF_QUERY is None or _POSTGWAS_SHARED_GFF_KEY != key:
+        _POSTGWAS_SHARED_GFF_QUERY = GFFQuery(
+            _postgwas_read_minimal_gff(gff_path),
+            copy_df=False,
+        )
+        _POSTGWAS_SHARED_GFF_KEY = key
+        _POSTGWAS_SHARED_GFF_ANNOTATION_CTX = None
+    return _POSTGWAS_SHARED_GFF_QUERY
+
+
+def _postgwas_get_shared_gff_annotation_context(gff_path: str) -> dict[str, object]:
+    global _POSTGWAS_SHARED_GFF_ANNOTATION_CTX
+    gff_query = _postgwas_get_shared_gff_query(gff_path)
+    if _POSTGWAS_SHARED_GFF_ANNOTATION_CTX is None:
+        _POSTGWAS_SHARED_GFF_ANNOTATION_CTX = _build_postgwas_gff_annotation_context(gff_query)
+    return _POSTGWAS_SHARED_GFF_ANNOTATION_CTX
+
+
+def _postgwas_get_gff_query(
+    anno_file: Optional[str],
+    *,
+    use_shared: bool,
+    current: Optional[GFFQuery] = None,
+) -> Optional[GFFQuery]:
+    if current is not None:
+        return current
+    if anno_file is None:
+        return None
+    if bool(use_shared):
+        return _postgwas_get_shared_gff_query(str(anno_file))
+    return GFFQuery.from_file(str(anno_file))
+
+
+def _postgwas_get_gff_annotation_context(
+    anno_file: Optional[str],
+    *,
+    use_shared: bool,
+    gff_query: Optional[GFFQuery] = None,
+) -> Optional[dict[str, object]]:
+    if anno_file is None:
+        return None
+    if bool(use_shared):
+        return _postgwas_get_shared_gff_annotation_context(str(anno_file))
+    query = _postgwas_get_gff_query(
+        anno_file,
+        use_shared=False,
+        current=gff_query,
+    )
+    if query is None:
+        return None
+    return _build_postgwas_gff_annotation_context(query)
 
 
 def _allow_windows_postgwas_process_pool() -> bool:
@@ -2373,6 +2516,734 @@ def _format_gene_annotation_dict(hits: pd.DataFrame) -> str:
     )
 
 
+def _extract_gff_attr_series(attr_series: pd.Series, key: str) -> pd.Series:
+    key_pat = re.escape(str(key))
+    pattern = rf"(?:^|;|\s){key_pat}=([^;]*?)(?=;|\s+[^\s;=]+=|$)"
+    out = attr_series.astype(str).str.extract(pattern, expand=False).fillna("NA")
+    return out.map(_clean_anno_token)
+
+
+def _normalize_gff_entity_id(value: object) -> str:
+    text = _clean_anno_token(value)
+    if text == "NA":
+        return "NA"
+    return re.sub(r"^[^:]*:", "", text)
+
+
+def _split_gff_entity_ids(value: object) -> tuple[str, ...]:
+    text = _clean_anno_token(value)
+    if text == "NA":
+        return tuple()
+    out: list[str] = []
+    seen: set[str] = set()
+    for token in str(text).split(","):
+        norm = _normalize_gff_entity_id(token)
+        if norm == "NA" or norm in seen:
+            continue
+        seen.add(norm)
+        out.append(norm)
+    return tuple(out)
+
+
+def _build_postgwas_gff_annotation_context(gff_query: GFFQuery) -> dict[str, object]:
+    gff = gff_query.gff
+    if gff.shape[0] == 0:
+        return {
+            "gene_meta": {},
+            "row_gene_ids": {},
+            "feature_index_by_chr": {},
+            "gene_index_by_chr": {},
+        }
+
+    attrs = gff["attributes"].astype(str)
+    ids = _extract_gff_attr_series(attrs, "ID").map(_normalize_gff_entity_id)
+    parents = _extract_gff_attr_series(attrs, "Parent").map(_split_gff_entity_ids)
+    descs = _extract_gff_attr_series(attrs, _ANNO_DESC_KEY)
+    names = _extract_gff_attr_series(attrs, "Name")
+    features = gff["feature"].astype(str).str.strip().str.lower()
+
+    gene_meta: dict[str, dict[str, object]] = {}
+    id_to_parents: dict[str, tuple[str, ...]] = {}
+
+    for idx in gff.index:
+        feature = str(features.loc[idx]).strip().lower()
+        feature_id = str(ids.loc[idx]).strip()
+        parent_ids = tuple(parents.loc[idx]) if idx in parents.index else tuple()
+        if feature_id != "NA":
+            if len(parent_ids) > 0:
+                id_to_parents[feature_id] = parent_ids
+        if feature != "gene" or feature_id == "NA":
+            continue
+        desc = str(descs.loc[idx]).strip()
+        if desc == "NA":
+            desc = str(names.loc[idx]).strip()
+        gene_meta[feature_id] = {
+            "chrom_norm": _normalize_chr(gff.loc[idx, "chrom_norm"]),
+            "start": int(gff.loc[idx, "start"]),
+            "end": int(gff.loc[idx, "end"]),
+            "strand": _clean_anno_token(gff.loc[idx, "strand"]),
+            "desc": _clean_anno_token(desc),
+        }
+
+    _resolve_gene_ids = _build_postgwas_gene_id_resolver(
+        gene_meta=gene_meta,
+        id_to_parents=id_to_parents,
+    )
+
+    row_gene_ids: dict[int, tuple[str, ...]] = {}
+    for idx in gff.index:
+        feature = str(features.loc[idx]).strip().lower()
+        feature_id = str(ids.loc[idx]).strip()
+        candidate_ids: list[str] = []
+        if feature == "gene" and feature_id in gene_meta:
+            row_gene_ids[int(idx)] = (feature_id,)
+            continue
+        if feature_id != "NA":
+            candidate_ids.append(feature_id)
+        candidate_ids.extend(list(parents.loc[idx]) if idx in parents.index else [])
+        out: list[str] = []
+        seen: set[str] = set()
+        for candidate in candidate_ids:
+            for gene_id in _resolve_gene_ids(candidate):
+                if gene_id in seen or gene_id not in gene_meta:
+                    continue
+                seen.add(gene_id)
+                out.append(gene_id)
+        row_gene_ids[int(idx)] = tuple(out)
+
+    feature_index_by_chr: dict[str, dict[str, np.ndarray]] = {}
+    for chrom_norm, block in gff.groupby("chrom_norm", sort=False):
+        block_sorted = block.sort_values(["start", "end"], kind="mergesort")
+        block_idx = block_sorted.index.to_numpy(dtype=np.int64, copy=False)
+        block_gene_ids = np.empty((int(block_sorted.shape[0]),), dtype=object)
+        for arr_idx, row_idx in enumerate(block_idx.tolist()):
+            block_gene_ids[int(arr_idx)] = row_gene_ids.get(int(row_idx), tuple())
+        feature_index_by_chr[str(chrom_norm)] = {
+            "starts": block_sorted["start"].to_numpy(dtype=np.int64, copy=False),
+            "ends": block_sorted["end"].to_numpy(dtype=np.int64, copy=False),
+            "features": (
+                block_sorted["feature"].astype(str).str.strip().str.lower().to_numpy(dtype=object, copy=False)
+            ),
+            "row_gene_ids": block_gene_ids,
+        }
+
+    gene_index_by_chr: dict[str, dict[str, np.ndarray]] = {}
+    genes_by_chr: dict[str, list[tuple[int, int, str, str, str]]] = {}
+    for gene_id, meta in gene_meta.items():
+        chrom_norm = str(meta.get("chrom_norm", "")).strip()
+        genes_by_chr.setdefault(chrom_norm, []).append(
+            (
+                int(meta.get("start", 0)),
+                int(meta.get("end", 0)),
+                str(gene_id),
+                _clean_anno_token(meta.get("strand", ".")),
+                _clean_anno_token(meta.get("desc", "NA")),
+            )
+        )
+    for chrom_norm, records in genes_by_chr.items():
+        records_sorted = sorted(records, key=lambda x: (int(x[0]), int(x[1]), str(x[2])))
+        gene_index_by_chr[str(chrom_norm)] = {
+            "starts": np.asarray([int(x[0]) for x in records_sorted], dtype=np.int64),
+            "ends": np.asarray([int(x[1]) for x in records_sorted], dtype=np.int64),
+            "gene_ids": np.asarray([str(x[2]) for x in records_sorted], dtype=object),
+            "strands": np.asarray([str(x[3]) for x in records_sorted], dtype=object),
+            "descs": np.asarray([str(x[4]) for x in records_sorted], dtype=object),
+        }
+
+    return {
+        "gene_meta": gene_meta,
+        "row_gene_ids": row_gene_ids,
+        "feature_index_by_chr": feature_index_by_chr,
+        "gene_index_by_chr": gene_index_by_chr,
+    }
+
+
+def _postgwas_choose_exact_gff_label(features: set[str]) -> str:
+    feature_set = {str(x).strip().lower() for x in features if str(x).strip() != ""}
+    if "cds" in feature_set:
+        return "CDS"
+    if "five_prime_utr" in feature_set:
+        return "FivePrimeUTR"
+    if "three_prime_utr" in feature_set:
+        return "ThreePrimeUTR"
+    if "exon" in feature_set:
+        return "Exon"
+    if "intron" in feature_set:
+        return "Intron"
+    return "Intron"
+
+
+def _postgwas_annotation_triplet(label: object, gene_id: object, desc: object) -> str:
+    return (
+        f"{_clean_anno_token(label)};"
+        f"{_normalize_gff_entity_id(gene_id)};"
+        f"{_clean_anno_token(desc)}"
+    )
+
+
+def _join_postgwas_annotation_entries(entries: list[str]) -> str:
+    out: list[str] = []
+    seen: set[str] = set()
+    for entry in entries:
+        text = str(entry).strip()
+        if text == "" or text in seen:
+            continue
+        seen.add(text)
+        out.append(text)
+    if len(out) == 0:
+        return "Intergenic;NA;NA"
+    return " | ".join(out)
+
+
+def _postgwas_attr_list_value(values: object, idx: int) -> str:
+    if isinstance(values, (list, tuple)) and len(values) > int(idx):
+        return _clean_anno_token(values[int(idx)])
+    return "NA"
+
+
+def _build_postgwas_gene_id_resolver(
+    *,
+    gene_meta: dict[str, dict[str, object]],
+    id_to_parents: dict[str, tuple[str, ...]],
+):
+    @lru_cache(maxsize=None)
+    def _resolve_gene_ids(feature_id: str) -> tuple[str, ...]:
+        norm_id = _normalize_gff_entity_id(feature_id)
+        if norm_id == "NA":
+            return tuple()
+        if norm_id in gene_meta:
+            return (norm_id,)
+
+        out: list[str] = []
+        seen_genes: set[str] = set()
+        seen_nodes: set[str] = set()
+        stack: list[str] = [norm_id]
+
+        while len(stack) > 0:
+            node_id = _normalize_gff_entity_id(stack.pop())
+            if node_id == "NA":
+                continue
+            if node_id in gene_meta:
+                if node_id not in seen_genes:
+                    seen_genes.add(node_id)
+                    out.append(node_id)
+                continue
+            if node_id in seen_nodes:
+                continue
+            seen_nodes.add(node_id)
+
+            parent_ids = tuple(id_to_parents.get(node_id, tuple()))
+            for parent_id in reversed(parent_ids):
+                parent_norm = _normalize_gff_entity_id(parent_id)
+                if parent_norm == "NA":
+                    continue
+                if parent_norm in seen_nodes:
+                    continue
+                stack.append(parent_norm)
+
+        return tuple(out)
+
+    return _resolve_gene_ids
+
+
+def _build_postgwas_local_gff_context(hit: pd.DataFrame) -> tuple[
+    dict[str, dict[str, object]],
+    dict[int, tuple[str, ...]],
+]:
+    if hit is None or hit.shape[0] == 0 or "attribute" not in hit.columns:
+        return {}, {}
+
+    features = hit["feature"].astype(str).str.strip().str.lower()
+    attrs = hit["attribute"]
+    ids = attrs.map(lambda x: _normalize_gff_entity_id(_postgwas_attr_list_value(x, 0)))
+    parents = attrs.map(lambda x: _split_gff_entity_ids(_postgwas_attr_list_value(x, 1)))
+    descs = attrs.map(lambda x: _clean_anno_token(_postgwas_attr_list_value(x, 2)))
+    names = attrs.map(lambda x: _clean_anno_token(_postgwas_attr_list_value(x, 3)))
+
+    gene_meta: dict[str, dict[str, object]] = {}
+    id_to_parents: dict[str, tuple[str, ...]] = {}
+    for idx in hit.index:
+        feature = str(features.loc[idx]).strip().lower()
+        feature_id = str(ids.loc[idx]).strip()
+        parent_ids = tuple(parents.loc[idx]) if idx in parents.index else tuple()
+        if feature_id != "NA" and len(parent_ids) > 0:
+            id_to_parents[feature_id] = parent_ids
+        if feature != "gene" or feature_id == "NA":
+            continue
+        desc = str(descs.loc[idx]).strip()
+        if desc == "NA":
+            desc = str(names.loc[idx]).strip()
+        gene_meta[feature_id] = {
+            "start": int(hit.loc[idx, "start"]),
+            "end": int(hit.loc[idx, "end"]),
+            "strand": _clean_anno_token(hit.loc[idx, "strand"]),
+            "desc": _clean_anno_token(desc),
+        }
+
+    _resolve_gene_ids_local = _build_postgwas_gene_id_resolver(
+        gene_meta=gene_meta,
+        id_to_parents=id_to_parents,
+    )
+
+    row_gene_ids: dict[int, tuple[str, ...]] = {}
+    for idx in hit.index:
+        feature = str(features.loc[idx]).strip().lower()
+        feature_id = str(ids.loc[idx]).strip()
+        if feature == "gene" and feature_id in gene_meta:
+            row_gene_ids[int(idx)] = (feature_id,)
+            continue
+        candidate_ids: list[str] = []
+        if feature_id != "NA":
+            candidate_ids.append(feature_id)
+        candidate_ids.extend(list(parents.loc[idx]) if idx in parents.index else [])
+        out: list[str] = []
+        seen: set[str] = set()
+        for candidate in candidate_ids:
+            for gene_id in _resolve_gene_ids_local(candidate):
+                if gene_id in seen or gene_id not in gene_meta:
+                    continue
+                seen.add(gene_id)
+                out.append(gene_id)
+        row_gene_ids[int(idx)] = tuple(out)
+    return gene_meta, row_gene_ids
+
+
+def _format_postgwas_gff_site_desc_direct(
+    *,
+    chrom: object,
+    pos: object,
+    gff_query: GFFQuery,
+    flank_bp: int = 2_000,
+) -> str:
+    try:
+        pos_int = int(pos)
+    except Exception:
+        return "Intergenic;NA;NA"
+
+    exact_hit = gff_query.query_range(
+        chrom,
+        pos_int,
+        pos_int,
+        features=None,
+        attr=("ID", "Parent", _ANNO_DESC_KEY, "Name"),
+    )
+    gene_meta, row_gene_ids = _build_postgwas_local_gff_context(exact_hit)
+    gene_features: dict[str, set[str]] = {}
+    gene_order: list[str] = []
+    for idx, row in exact_hit.iterrows():
+        feature = str(row.get("feature", "")).strip().lower()
+        if feature == "":
+            continue
+        for gene_id in row_gene_ids.get(int(idx), tuple()):
+            if gene_id not in gene_meta:
+                continue
+            if gene_id not in gene_features:
+                gene_features[gene_id] = set()
+                gene_order.append(gene_id)
+            gene_features[gene_id].add(feature)
+
+    entries: list[str] = []
+    exact_gene_ids = set(gene_features)
+    for gene_id in gene_order:
+        meta = gene_meta.get(gene_id, {})
+        entries.append(
+            _postgwas_annotation_triplet(
+                _postgwas_choose_exact_gff_label(gene_features.get(gene_id, set())),
+                gene_id,
+                meta.get("desc", "NA"),
+            )
+        )
+
+    nearby_hit = gff_query.query_range(
+        chrom,
+        max(0, pos_int - max(0, int(flank_bp))),
+        pos_int + max(0, int(flank_bp)),
+        features=None,
+        attr=("ID", _ANNO_DESC_KEY, "Name"),
+    )
+    nearby_hit = nearby_hit.loc[
+        nearby_hit["feature"].astype(str).str.strip().str.lower() == "gene"
+    ].copy()
+    nearby_records: list[tuple[int, int, str, str]] = []
+    for _, row in nearby_hit.iterrows():
+        attrs = row.get("attribute", [])
+        gene_id = _normalize_gff_entity_id(_postgwas_attr_list_value(attrs, 0))
+        if gene_id == "NA" or gene_id in exact_gene_ids:
+            continue
+        start = int(row["start"])
+        end = int(row["end"])
+        strand = _clean_anno_token(row.get("strand", "."))
+        if pos_int < start:
+            dist = int(start - pos_int)
+            if dist > int(flank_bp):
+                continue
+            label = "Upstream2kb" if strand != "-" else "Downstream2kb"
+        elif pos_int > end:
+            dist = int(pos_int - end)
+            if dist > int(flank_bp):
+                continue
+            label = "Downstream2kb" if strand != "-" else "Upstream2kb"
+        else:
+            continue
+        nearby_records.append((int(dist), int(start), gene_id, str(label)))
+
+    nearby_records.sort(key=lambda x: (int(x[0]), int(x[1]), str(x[2])))
+    for _dist, _start, gene_id, label in nearby_records:
+        entries.append(_postgwas_annotation_triplet(label, gene_id, "NA"))
+    return _join_postgwas_annotation_entries(entries)
+
+
+def _format_postgwas_gff_broaden_direct(
+    *,
+    chrom: object,
+    pos: object,
+    gff_query: GFFQuery,
+    window_bp: int,
+) -> str:
+    try:
+        pos_int = int(pos)
+    except Exception:
+        return "NA"
+    window = max(0, int(window_bp))
+    hit = gff_query.query_range(
+        chrom,
+        max(0, pos_int - window),
+        pos_int + window,
+        features=None,
+        attr=("ID", _ANNO_DESC_KEY, "Name"),
+    )
+    hit = hit.loc[
+        hit["feature"].astype(str).str.strip().str.lower() == "gene"
+    ].copy()
+    if hit.shape[0] == 0:
+        return "NA"
+    out: list[str] = []
+    seen: set[str] = set()
+    for _, row in hit.iterrows():
+        attrs = row.get("attribute", [])
+        gene_id = _normalize_gff_entity_id(_postgwas_attr_list_value(attrs, 0))
+        if gene_id == "NA" or gene_id in seen:
+            continue
+        seen.add(gene_id)
+        desc = _clean_anno_token(_postgwas_attr_list_value(attrs, 1))
+        if desc == "NA":
+            desc = _clean_anno_token(_postgwas_attr_list_value(attrs, 2))
+        out.append(f"{gene_id}:{desc}/NA")
+    if len(out) == 0:
+        return "NA"
+    return ";".join(out)
+
+
+def _group_postgwas_sites_by_chr(
+    site_index: pd.MultiIndex,
+) -> dict[str, list[tuple[int, int]]]:
+    out: dict[str, list[tuple[int, int]]] = {}
+    for out_idx, key in enumerate(site_index.tolist()):
+        if not isinstance(key, tuple) or len(key) < 2:
+            continue
+        chrom = _normalize_chr(key[0])
+        try:
+            pos = int(key[1])
+        except Exception:
+            continue
+        out.setdefault(chrom, []).append((int(out_idx), int(pos)))
+    return out
+
+
+def _collect_postgwas_exact_gff_hits_sorted(
+    positions_sorted: np.ndarray,
+    feature_block: Optional[dict[str, np.ndarray]],
+    *,
+    gene_meta: dict[str, dict[str, object]],
+) -> tuple[list[list[str]], list[dict[str, set[str]]]]:
+    n_pos = int(positions_sorted.shape[0])
+    empty_orders = [[] for _ in range(n_pos)]
+    empty_maps: list[dict[str, set[str]]] = [dict() for _ in range(n_pos)]
+    if feature_block is None:
+        return empty_orders, empty_maps
+
+    starts = np.asarray(feature_block.get("starts", np.asarray([], dtype=np.int64)), dtype=np.int64)
+    ends = np.asarray(feature_block.get("ends", np.asarray([], dtype=np.int64)), dtype=np.int64)
+    features = np.asarray(feature_block.get("features", np.asarray([], dtype=object)), dtype=object)
+    row_gene_ids = np.asarray(feature_block.get("row_gene_ids", np.asarray([], dtype=object)), dtype=object)
+    if starts.size == 0:
+        return empty_orders, empty_maps
+
+    active_heap: list[tuple[int, int]] = []
+    active_rows: dict[int, None] = {}
+    add_ptr = 0
+    n_feat = int(starts.shape[0])
+    for pos_idx, pos in enumerate(positions_sorted.tolist()):
+        pos_int = int(pos)
+        while add_ptr < n_feat and int(starts[add_ptr]) <= pos_int:
+            active_rows[int(add_ptr)] = None
+            heapq.heappush(active_heap, (int(ends[add_ptr]), int(add_ptr)))
+            add_ptr += 1
+        while len(active_heap) > 0 and int(active_heap[0][0]) < pos_int:
+            _end, feat_idx = heapq.heappop(active_heap)
+            active_rows.pop(int(feat_idx), None)
+        gene_order: list[str] = []
+        gene_features: dict[str, set[str]] = {}
+        for feat_idx in active_rows.keys():
+            feature = str(features[int(feat_idx)]).strip().lower()
+            if feature == "":
+                continue
+            gene_ids = row_gene_ids[int(feat_idx)]
+            if gene_ids is None:
+                continue
+            for gene_id in tuple(gene_ids):
+                gene_id_text = str(gene_id).strip()
+                if gene_id_text == "" or gene_id_text not in gene_meta:
+                    continue
+                if gene_id_text not in gene_features:
+                    gene_features[gene_id_text] = set()
+                    gene_order.append(gene_id_text)
+                gene_features[gene_id_text].add(feature)
+        empty_orders[pos_idx] = gene_order
+        empty_maps[pos_idx] = gene_features
+    return empty_orders, empty_maps
+
+
+def _collect_postgwas_nearby_gene_hits_sorted(
+    positions_sorted: np.ndarray,
+    gene_block: Optional[dict[str, np.ndarray]],
+    *,
+    exact_gene_sets: list[set[str]],
+    flank_bp: int,
+) -> list[list[tuple[int, int, str, str]]]:
+    out: list[list[tuple[int, int, str, str]]] = [[] for _ in range(int(positions_sorted.shape[0]))]
+    if gene_block is None:
+        return out
+
+    starts = np.asarray(gene_block.get("starts", np.asarray([], dtype=np.int64)), dtype=np.int64)
+    ends = np.asarray(gene_block.get("ends", np.asarray([], dtype=np.int64)), dtype=np.int64)
+    gene_ids = np.asarray(gene_block.get("gene_ids", np.asarray([], dtype=object)), dtype=object)
+    strands = np.asarray(gene_block.get("strands", np.asarray([], dtype=object)), dtype=object)
+    if starts.size == 0:
+        return out
+
+    flank = max(0, int(flank_bp))
+    active_heap: list[tuple[int, int]] = []
+    active_genes: dict[int, None] = {}
+    add_ptr = 0
+    n_gene = int(starts.shape[0])
+    for pos_idx, pos in enumerate(positions_sorted.tolist()):
+        pos_int = int(pos)
+        add_limit = pos_int + flank
+        while add_ptr < n_gene and int(starts[add_ptr]) <= add_limit:
+            active_genes[int(add_ptr)] = None
+            heapq.heappush(active_heap, (int(ends[add_ptr]), int(add_ptr)))
+            add_ptr += 1
+        keep_min_end = pos_int - flank
+        while len(active_heap) > 0 and int(active_heap[0][0]) < keep_min_end:
+            _end, gene_idx = heapq.heappop(active_heap)
+            active_genes.pop(int(gene_idx), None)
+
+        exact_genes = exact_gene_sets[pos_idx]
+        records: list[tuple[int, int, str, str]] = []
+        for gene_idx in active_genes.keys():
+            gene_id = str(gene_ids[int(gene_idx)]).strip()
+            if gene_id == "" or gene_id in exact_genes:
+                continue
+            start = int(starts[int(gene_idx)])
+            end = int(ends[int(gene_idx)])
+            strand = _clean_anno_token(strands[int(gene_idx)])
+            if pos_int < start:
+                dist = int(start - pos_int)
+                if dist > flank:
+                    continue
+                label = "Upstream2kb" if strand != "-" else "Downstream2kb"
+            elif pos_int > end:
+                dist = int(pos_int - end)
+                if dist > flank:
+                    continue
+                label = "Downstream2kb" if strand != "-" else "Upstream2kb"
+            else:
+                continue
+            records.append((int(dist), int(start), gene_id, str(label)))
+        records.sort(key=lambda x: (int(x[0]), int(x[1]), str(x[2])))
+        out[pos_idx] = records
+    return out
+
+
+def _collect_postgwas_gene_window_hits_sorted(
+    positions_sorted: np.ndarray,
+    gene_block: Optional[dict[str, np.ndarray]],
+    *,
+    window_bp: int,
+) -> list[list[str]]:
+    out: list[list[str]] = [[] for _ in range(int(positions_sorted.shape[0]))]
+    if gene_block is None:
+        return out
+
+    starts = np.asarray(gene_block.get("starts", np.asarray([], dtype=np.int64)), dtype=np.int64)
+    ends = np.asarray(gene_block.get("ends", np.asarray([], dtype=np.int64)), dtype=np.int64)
+    gene_ids = np.asarray(gene_block.get("gene_ids", np.asarray([], dtype=object)), dtype=object)
+    if starts.size == 0:
+        return out
+
+    window = max(0, int(window_bp))
+    active_heap: list[tuple[int, int]] = []
+    active_genes: dict[int, None] = {}
+    add_ptr = 0
+    n_gene = int(starts.shape[0])
+    for pos_idx, pos in enumerate(positions_sorted.tolist()):
+        pos_int = int(pos)
+        add_limit = pos_int + window
+        while add_ptr < n_gene and int(starts[add_ptr]) <= add_limit:
+            active_genes[int(add_ptr)] = None
+            heapq.heappush(active_heap, (int(ends[add_ptr]), int(add_ptr)))
+            add_ptr += 1
+        keep_min_end = pos_int - window
+        while len(active_heap) > 0 and int(active_heap[0][0]) < keep_min_end:
+            _end, gene_idx = heapq.heappop(active_heap)
+            active_genes.pop(int(gene_idx), None)
+
+        seen: set[str] = set()
+        gene_list: list[str] = []
+        for gene_idx in active_genes.keys():
+            gene_id = str(gene_ids[int(gene_idx)]).strip()
+            if gene_id == "" or gene_id in seen:
+                continue
+            seen.add(gene_id)
+            gene_list.append(gene_id)
+        out[pos_idx] = gene_list
+    return out
+
+
+def _format_postgwas_gene_annotation_from_ids(
+    gene_ids: list[str],
+    *,
+    gene_meta: dict[str, dict[str, object]],
+) -> str:
+    if gene_ids is None or len(gene_ids) == 0:
+        return "NA"
+    out: list[str] = []
+    seen: set[str] = set()
+    for gene_id in gene_ids:
+        gene_id_text = str(gene_id).strip()
+        if gene_id_text == "" or gene_id_text in seen or gene_id_text not in gene_meta:
+            continue
+        seen.add(gene_id_text)
+        out.append(
+            f"{gene_id_text}:{_clean_anno_token(gene_meta[gene_id_text].get('desc', 'NA'))}/NA"
+        )
+    if len(out) == 0:
+        return "NA"
+    return ";".join(out)
+
+
+def _format_postgwas_gff_site_desc_many(
+    site_index: pd.MultiIndex,
+    *,
+    annotation_ctx: dict[str, object],
+    flank_bp: int = 2_000,
+) -> list[str]:
+    out = ["Intergenic;NA;NA"] * len(site_index)
+    if len(site_index) == 0:
+        return out
+
+    gene_meta = annotation_ctx.get("gene_meta", {})
+    feature_index_by_chr = annotation_ctx.get("feature_index_by_chr", {})
+    gene_index_by_chr = annotation_ctx.get("gene_index_by_chr", {})
+    if not isinstance(gene_meta, dict):
+        return out
+
+    grouped = _group_postgwas_sites_by_chr(site_index)
+    for chrom_norm, items in grouped.items():
+        items_sorted = sorted(items, key=lambda x: int(x[1]))
+        positions_sorted = np.asarray([int(pos) for _, pos in items_sorted], dtype=np.int64)
+        feature_block = None
+        if isinstance(feature_index_by_chr, dict):
+            feature_block = feature_index_by_chr.get(str(chrom_norm))
+        gene_block = None
+        if isinstance(gene_index_by_chr, dict):
+            gene_block = gene_index_by_chr.get(str(chrom_norm))
+
+        exact_orders, exact_maps = _collect_postgwas_exact_gff_hits_sorted(
+            positions_sorted,
+            feature_block,
+            gene_meta=gene_meta,
+        )
+        exact_gene_sets = [set(order) for order in exact_orders]
+        nearby_records = _collect_postgwas_nearby_gene_hits_sorted(
+            positions_sorted,
+            gene_block,
+            exact_gene_sets=exact_gene_sets,
+            flank_bp=int(flank_bp),
+        )
+        for local_idx, (out_idx, _pos) in enumerate(items_sorted):
+            entries: list[str] = []
+            for gene_id in exact_orders[local_idx]:
+                meta = gene_meta.get(gene_id, {})
+                entries.append(
+                    _postgwas_annotation_triplet(
+                        _postgwas_choose_exact_gff_label(
+                            exact_maps[local_idx].get(gene_id, set())
+                        ),
+                        gene_id,
+                        meta.get("desc", "NA"),
+                    )
+                )
+            for _dist, _start, gene_id, label in nearby_records[local_idx]:
+                entries.append(_postgwas_annotation_triplet(label, gene_id, "NA"))
+            out[int(out_idx)] = _join_postgwas_annotation_entries(entries)
+    return out
+
+
+def _format_postgwas_gff_broaden_many(
+    site_index: pd.MultiIndex,
+    *,
+    annotation_ctx: dict[str, object],
+    window_bp: int,
+) -> list[str]:
+    out = ["NA"] * len(site_index)
+    if len(site_index) == 0:
+        return out
+
+    gene_meta = annotation_ctx.get("gene_meta", {})
+    gene_index_by_chr = annotation_ctx.get("gene_index_by_chr", {})
+    if not isinstance(gene_meta, dict) or not isinstance(gene_index_by_chr, dict):
+        return out
+
+    grouped = _group_postgwas_sites_by_chr(site_index)
+    for chrom_norm, items in grouped.items():
+        items_sorted = sorted(items, key=lambda x: int(x[1]))
+        positions_sorted = np.asarray([int(pos) for _, pos in items_sorted], dtype=np.int64)
+        gene_block = gene_index_by_chr.get(str(chrom_norm))
+        gene_hits = _collect_postgwas_gene_window_hits_sorted(
+            positions_sorted,
+            gene_block,
+            window_bp=int(window_bp),
+        )
+        for local_idx, (out_idx, _pos) in enumerate(items_sorted):
+            out[int(out_idx)] = _format_postgwas_gene_annotation_from_ids(
+                gene_hits[local_idx],
+                gene_meta=gene_meta,
+            )
+    return out
+
+
+def _format_postgwas_gff_site_desc(
+    *,
+    chrom: object,
+    pos: object,
+    gff_query: GFFQuery,
+    annotation_ctx: dict[str, object],
+    flank_bp: int = 2_000,
+) -> str:
+    _ = gff_query
+    one_index = pd.MultiIndex.from_tuples([(chrom, pos)])
+    descs = _format_postgwas_gff_site_desc_many(
+        one_index,
+        annotation_ctx=annotation_ctx,
+        flank_bp=int(flank_bp),
+    )
+    if len(descs) == 0:
+        return "Intergenic;NA;NA"
+    return str(descs[0])
+
+
 def _format_clump_sites(sites: list[tuple[str, int]]) -> str:
     if sites is None or len(sites) == 0:
         return ""
@@ -2468,6 +3339,29 @@ def _finalize_annotation_output_df(
     ]
     remain_cols = [c for c in df_out.columns if c not in orig_cols and c not in append_cols]
     return df_out.loc[:, orig_cols + remain_cols + append_cols]
+
+
+def _load_postgwas_input_table(
+    file: str,
+    *,
+    chr_col: str,
+    pos_col: str,
+    p_col: str,
+    keep_all_columns: bool = False,
+) -> tuple[pd.DataFrame, list[object]]:
+    try:
+        header_cols = pd.read_csv(file, sep="\t", nrows=0).columns.tolist()
+    except Exception:
+        header_cols = [chr_col, pos_col, p_col]
+    lead_info_cols = [c for c in _LEAD_SNP_INFO_COLS if c in header_cols]
+    read_cols = [chr_col, pos_col, p_col] + lead_info_cols
+    read_cols = list(dict.fromkeys(read_cols))
+    if bool(keep_all_columns):
+        df_all = pd.read_csv(file, sep="\t")
+    else:
+        df_all = pd.read_csv(file, sep="\t", usecols=read_cols)
+    full_chr_labels = df_all[chr_col].drop_duplicates().tolist()
+    return df_all, full_chr_labels
 
 
 def _ldclump_significant_snps(
@@ -3494,12 +4388,12 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
     )
 
     chr_col, pos_col, p_col = args.chr, args.pos, args.pvalue
-    anno_suffix = (
-        str(args.anno_file).replace(".gz", "").split(".")[-1].lower()
-        if args.anno_file
-        else None
-    )
-    gff_query_cache: Optional[GFFQuery] = None
+    anno_suffix = _postgwas_annotation_suffix(args.anno_file)
+    use_shared_gff = bool(getattr(args, "_postgwas_use_shared_gff", False))
+    gff_query_cache: Optional[GFFQuery] = _postgwas_get_gff_query(
+        args.anno_file,
+        use_shared=use_shared_gff,
+    ) if anno_suffix in {"gff", "gff3"} else None
     status_enabled = _postgwas_status_enabled(args)
     src = os.path.basename(str(file))
     task_label = os.path.basename(str(output_stem))
@@ -3516,15 +4410,13 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
         enabled=status_enabled,
     ) as load_status:
         try:
-            try:
-                header_cols = pd.read_csv(file, sep="\t", nrows=0).columns.tolist()
-            except Exception:
-                header_cols = [chr_col, pos_col, p_col]
-            lead_info_cols = [c for c in _LEAD_SNP_INFO_COLS if c in header_cols]
-            read_cols = [chr_col, pos_col, p_col] + lead_info_cols
-            read_cols = list(dict.fromkeys(read_cols))
-            df_all = pd.read_csv(file, sep="\t", usecols=read_cols)
-            full_chr_labels = df_all[chr_col].drop_duplicates().tolist()
+            df_all, full_chr_labels = _load_postgwas_input_table(
+                str(file),
+                chr_col=chr_col,
+                pos_col=pos_col,
+                p_col=p_col,
+                keep_all_columns=bool(args.anno),
+            )
             df = df_all
         except Exception:
             load_status.fail(f"Loading GWAS results from {src} ...Failed")
@@ -4051,7 +4943,11 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
             use_gene_bridge = False
             if args.anno_file:
                 if anno_suffix in {"gff", "gff3"} and gff_query_cache is None:
-                    gff_query_cache = GFFQuery.from_file(args.anno_file)
+                    gff_query_cache = _postgwas_get_gff_query(
+                        args.anno_file,
+                        use_shared=use_shared_gff,
+                        current=gff_query_cache,
+                    )
                 gene_raw = _load_gene_like_records_from_anno(
                     args.anno_file,
                     region_ranges,
@@ -4433,6 +5329,9 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                 )
             else:
                 try:
+                    gff_annotation_ctx: Optional[dict[str, object]] = None
+                    use_gff_batch_annotation = False
+
                     # Keep SNPs passing threshold
                     df_filter_raw = df.loc[df[p_col] <= threshold].copy()
                     original_columns = df_filter_raw.columns.tolist()
@@ -4480,48 +5379,95 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                             f"LD clump completed: kept {n_after}/{n_before} threshold-passing SNPs."
                         )
 
-                    # Read annotation (GFF/bed) into unified annotation table
-                    # After readanno:
-                    #   anno[0] = chr
-                    #   anno[1] = start
-                    #   anno[2] = end
-                    #   anno[3] = gene ID
-                    #   anno[4], anno[5] = description fields
-                    if anno_suffix in {"gff", "gff3"} and gff_query_cache is not None:
-                        anno = readanno(args.anno_file, _ANNO_DESC_KEY, gff_data=gff_query_cache.gff)
-                    else:
-                        anno = readanno(args.anno_file, _ANNO_DESC_KEY)
-                    anno_chr = anno[0].astype(str).map(_normalize_chr)
+                    if anno_suffix in {"gff", "gff3"} and int(df_filter.shape[0]) > 0:
+                        if gff_query_cache is None:
+                            gff_query_cache = _postgwas_get_gff_query(
+                                args.anno_file,
+                                use_shared=use_shared_gff,
+                                current=gff_query_cache,
+                            )
+                        use_gff_batch_annotation = (
+                            int(df_filter.shape[0]) >= int(_POSTGWAS_GFF_BATCH_ANNOTATION_MIN_SITES)
+                        )
+                        if use_gff_batch_annotation:
+                            gff_annotation_ctx = _postgwas_get_gff_annotation_context(
+                                args.anno_file,
+                                use_shared=use_shared_gff,
+                                gff_query=gff_query_cache,
+                            )
 
-                    # Exact overlap annotation
-                    desc_exact = [
-                        anno.loc[
-                            (anno_chr == _normalize_chr(idx[0]))
-                            & (anno[1] <= idx[1])
-                            & (anno[2] >= idx[1])
+                    if anno_suffix in {"gff", "gff3"} and gff_annotation_ctx is not None:
+                        df_filter[annotation_col_map["desc"]] = _format_postgwas_gff_site_desc_many(
+                            df_filter.index,
+                            annotation_ctx=gff_annotation_ctx,
+                        )
+                    elif anno_suffix in {"gff", "gff3"} and gff_query_cache is not None:
+                        df_filter[annotation_col_map["desc"]] = [
+                            _format_postgwas_gff_site_desc_direct(
+                                chrom=idx[0],
+                                pos=idx[1],
+                                gff_query=gff_query_cache,
+                            )
+                            for idx in df_filter.index
                         ]
-                        for idx in df_filter.index
-                    ]
-                    df_filter[annotation_col_map["desc"]] = [
-                        _format_gene_annotation_dict(x)
-                        for x in desc_exact
-                    ]
+                    else:
+                        # Read annotation (GFF/bed) into unified annotation table
+                        # After readanno:
+                        #   anno[0] = chr
+                        #   anno[1] = start
+                        #   anno[2] = end
+                        #   anno[3] = gene ID
+                        #   anno[4], anno[5] = description fields
+                        anno = readanno(args.anno_file, _ANNO_DESC_KEY)
+                        anno_chr = anno[0].astype(str).map(_normalize_chr)
+
+                        # Exact overlap annotation
+                        desc_exact = [
+                            anno.loc[
+                                (anno_chr == _normalize_chr(idx[0]))
+                                & (anno[1] <= idx[1])
+                                & (anno[2] >= idx[1])
+                            ]
+                            for idx in df_filter.index
+                        ]
+                        df_filter[annotation_col_map["desc"]] = [
+                            _format_gene_annotation_dict(x)
+                            for x in desc_exact
+                        ]
 
                     # Optional broadened window around SNP (卤 annobroaden kb)
                     if args.annobroaden is not None:
                         kb = args.annobroaden * 1_000
-                        desc_broad = [
-                            anno.loc[
-                                (anno_chr == _normalize_chr(idx[0]))
-                                & (anno[1] <= idx[1] + kb)
-                                & (anno[2] >= idx[1] - kb)
+                        if anno_suffix in {"gff", "gff3"} and gff_annotation_ctx is not None:
+                            df_filter[annotation_col_map["broaden"]] = _format_postgwas_gff_broaden_many(
+                                df_filter.index,
+                                annotation_ctx=gff_annotation_ctx,
+                                window_bp=int(kb),
+                            )
+                        elif anno_suffix in {"gff", "gff3"} and gff_query_cache is not None:
+                            df_filter[annotation_col_map["broaden"]] = [
+                                _format_postgwas_gff_broaden_direct(
+                                    chrom=idx[0],
+                                    pos=idx[1],
+                                    gff_query=gff_query_cache,
+                                    window_bp=int(kb),
+                                )
+                                for idx in df_filter.index
                             ]
-                            for idx in df_filter.index
-                        ]
-                        df_filter[annotation_col_map["broaden"]] = [
-                            _format_gene_annotation_dict(x)
-                            for x in desc_broad
-                        ]
+                        else:
+                            anno_chr = anno[0].astype(str).map(_normalize_chr)
+                            desc_broad = [
+                                anno.loc[
+                                    (anno_chr == _normalize_chr(idx[0]))
+                                    & (anno[1] <= idx[1] + kb)
+                                    & (anno[2] >= idx[1] - kb)
+                                ]
+                                for idx in df_filter.index
+                            ]
+                            df_filter[annotation_col_map["broaden"]] = [
+                                _format_gene_annotation_dict(x)
+                                for x in desc_broad
+                            ]
                     else:
                         broaden_col = annotation_col_map["broaden"]
                         if broaden_col in df_filter.columns:
@@ -5359,10 +6305,14 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
                     "Warning: annotation source in merge mode requires --bimrange for gene-structure plotting; gene plot skipped."
                 )
             else:
-                anno_suffix = str(args.anno_file).replace(".gz", "").split(".")[-1].lower()
+                anno_suffix = _postgwas_annotation_suffix(args.anno_file)
+                use_shared_gff = bool(getattr(args, "_postgwas_use_shared_gff", False))
                 gff_query_cache: Optional[GFFQuery] = None
                 if anno_suffix in {"gff", "gff3"}:
-                    gff_query_cache = GFFQuery.from_file(args.anno_file)
+                    gff_query_cache = _postgwas_get_gff_query(
+                        args.anno_file,
+                        use_shared=use_shared_gff,
+                    )
                 gene_raw = _load_gene_like_records_from_anno(
                     args.anno_file,
                     region_ranges,
@@ -5707,10 +6657,14 @@ def _run_postgwas_ldblock_only(args, logger: logging.Logger) -> None:
     gene_track_df = pd.DataFrame(columns=["feature", "strand", "attribute", "x_start", "x_end"])
     use_gene_panel = False
     if args.anno_file:
-        anno_suffix = str(args.anno_file).replace(".gz", "").split(".")[-1].lower()
+        anno_suffix = _postgwas_annotation_suffix(args.anno_file)
+        use_shared_gff = bool(getattr(args, "_postgwas_use_shared_gff", False))
         gff_query_cache: Optional[GFFQuery] = None
         if anno_suffix in {"gff", "gff3"}:
-            gff_query_cache = GFFQuery.from_file(args.anno_file)
+            gff_query_cache = _postgwas_get_gff_query(
+                args.anno_file,
+                use_shared=use_shared_gff,
+            )
         gene_raw = _load_gene_like_records_from_anno(
             args.anno_file,
             region_ranges,
@@ -5866,7 +6820,19 @@ def _run_postgwas_tasks(args, logger: logging.Logger) -> None:
     total_start_ts = time.monotonic()
     done_count = 0
     req_threads = int(args.thread)
-    logical_workers = _resolve_postgwas_worker_count(req_threads, len(files))
+    logical_workers = int(
+        max(
+            1,
+            int(
+                getattr(
+                    args,
+                    "_postgwas_outer_workers",
+                    _resolve_postgwas_worker_count(req_threads, len(files)),
+                )
+            ),
+        )
+    )
+    serial_reason = str(getattr(args, "_postgwas_serial_reason", "") or "").strip()
 
     if (len(files) > 1) and (os.name == "nt") and (not _allow_windows_postgwas_process_pool()):
         logger.warning(
@@ -5875,6 +6841,18 @@ def _run_postgwas_tasks(args, logger: logging.Logger) -> None:
             "Set JANUSX_POSTGWAS_WINDOWS_PROCESS_POOL=1 to force experimental "
             "process-pool mode."
         )
+        _run_postgwas_tasks_serial(
+            files,
+            args,
+            logger,
+            total_start_ts=total_start_ts,
+            done_count=done_count,
+        )
+        return
+
+    if logical_workers <= 1:
+        if serial_reason != "":
+            logger.info(serial_reason)
         _run_postgwas_tasks_serial(
             files,
             args,
@@ -6822,6 +7800,10 @@ def main(argv: Optional[list[str]] = None):
     args._postgwas_single_requested = bool(single_plot_requested)
     args._postgwas_single_ldblock_requested = bool(single_ldblock_requested)
     args._postgwas_merge_ldblock_requested = bool(merge_ldblock_requested)
+    args._postgwas_use_shared_gff = bool(
+        _postgwas_annotation_suffix(args.anno_file) in {"gff", "gff3"}
+    )
+    args._postgwas_serial_reason = ""
     if merge_plot_requested:
         args.merge_files = [str(x) for x in list(args.gwasfile)]
         if len(args.merge_files) == 0:
@@ -6858,6 +7840,17 @@ def main(argv: Optional[list[str]] = None):
     args._postgwas_outer_workers = int(
         _resolve_postgwas_worker_count(int(args.thread), len(args.gwasfile))
     ) if (single_plot_requested and len(args.gwasfile) > 1) else 1
+    if (
+        bool(args._postgwas_use_shared_gff)
+        and bool(single_plot_requested)
+        and len(args.gwasfile) > 1
+    ):
+        args._postgwas_outer_workers = 1
+        args._postgwas_serial_reason = (
+            "GFF/GFF3 annotation source detected across multiple GWAS files; "
+            "using serial shared-GFF mode to avoid per-worker GFF duplication "
+            "and reduce memory pressure."
+        )
 
     args.ldblock_only_mode = bool(
         (len(args.gwasfile) == 0) and (args.ldblock_ratio is not None)
@@ -7144,6 +8137,22 @@ def main(argv: Optional[list[str]] = None):
         checks.append(ensure_plink_prefix_exists(logger, args.bfile, "Genotype PLINK prefix"))
     if not ensure_all_true(checks):
         raise SystemExit(1)
+
+    if (
+        bool(getattr(args, "_postgwas_use_shared_gff", False))
+        and args.anno_file is not None
+        and int(getattr(args, "_postgwas_outer_workers", 1)) <= 1
+        and (
+            bool(args.anno)
+            or bool(getattr(args, "ldblock_only_mode", False))
+            or (args.ldblock_ratio is not None)
+        )
+    ):
+        _postgwas_get_shared_gff_query(args.anno_file)
+        logger.info(
+            "Preloaded shared GFF annotation index: "
+            f"{format_path_for_display(args.anno_file)}"
+        )
 
     # ------------------------------------------------------------------
     # Parallel processing of all input files

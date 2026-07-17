@@ -339,13 +339,13 @@ class GFFQuery:
     Indexed query helper for repeated range lookups on GFF data.
     """
 
-    def __init__(self, gff: pd.DataFrame):
+    def __init__(self, gff: pd.DataFrame, *, copy_df: bool = True):
         required = {"chrom_norm", "start", "end", "feature"}
         missing = required.difference(gff.columns)
         if missing:
             raise ValueError(f"Missing required columns in GFF DataFrame: {sorted(missing)}")
 
-        self.gff = gff.copy()
+        self.gff = gff.copy() if bool(copy_df) else gff
         self._empty = self.gff.iloc[0:0].copy()
         self._use_iloc = (
             isinstance(self.gff.index, pd.RangeIndex)
@@ -368,11 +368,11 @@ class GFFQuery:
             }
 
     @classmethod
-    def from_file(cls, gffpath: pathlike) -> "GFFQuery":
+    def from_file(cls, gffpath: pathlike, *, copy_df: bool = True) -> "GFFQuery":
         """
         Build a `GFFQuery` index directly from GFF/GFF3 file.
         """
-        return cls(gffreader(gffpath))
+        return cls(gffreader(gffpath), copy_df=copy_df)
 
     def query_range(
         self,

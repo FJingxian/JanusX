@@ -27,7 +27,7 @@ use crate::bincore::{
     discover_id_sidecar, discover_site_sidecar, parse_bin01_header, resolve_bin01_path, BinWindow,
 };
 use crate::binwriter::{Bin01SiteMode, Bin01SiteRecordRef, Bin01Writer};
-use crate::bitwise::{bitand_assign, bitnot_masked};
+use crate::bitwise::{and_popcount, bitand_assign, bitnot_masked, popcount};
 use crate::breader::{
     gather_rows_by_indices, gather_rows_by_range, load_bin01_as_u64_words,
     load_bin01_packed_payload_owned, load_bin01_selected_rows_as_u64_words,
@@ -109,6 +109,7 @@ const GARFIELD_SCAN_PAIR_PARENT_ABS_GAIN_MIN: f64 = 0.01;
 const GARFIELD_SCAN_SURROGATE_TEST_GAIN_MAX: f64 = 0.02;
 const GARFIELD_SCAN_SURROGATE_HAMMING_FRAC_MAX: f64 = 0.02;
 const GARFIELD_DISABLE_STRUCTURE_PRIOR: bool = true;
+const GARFIELD_GENESET_LD_PRUNE_R2_DEFAULT: f64 = 0.80;
 static GARFIELD_ML_SELECT_NS: AtomicU64 = AtomicU64::new(0);
 
 const GARFIELD_SCAN_UNIT_COALESCE_MAX_UNITS_DEFAULT: usize = 64;
@@ -154,6 +155,14 @@ fn parse_env_mb_usize(name: &str) -> Option<usize> {
 }
 
 #[inline]
+fn parse_env_f64(name: &str) -> Option<f64> {
+    env::var(name)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<f64>().ok())
+        .filter(|v| v.is_finite())
+}
+
+#[inline]
 fn garfield_scan_unit_coalesce_max_units() -> usize {
     parse_env_usize("JX_GARFIELD_SCAN_UNIT_COALESCE_MAX_UNITS")
         .unwrap_or(GARFIELD_SCAN_UNIT_COALESCE_MAX_UNITS_DEFAULT)
@@ -173,6 +182,13 @@ fn garfield_logic_mmap_window_mb() -> usize {
         .or_else(|| parse_env_mb_usize("JX_BED_BLOCK_TARGET_MB"))
         .unwrap_or(GARFIELD_LOGIC_MMAP_WINDOW_MB_DEFAULT)
         .max(1)
+}
+
+#[inline]
+fn garfield_geneset_ld_prune_r2() -> f64 {
+    parse_env_f64("JX_GARFIELD_GENESET_LD_PRUNE_R2")
+        .filter(|v| *v > 0.0 && *v <= 1.0)
+        .unwrap_or(GARFIELD_GENESET_LD_PRUNE_R2_DEFAULT)
 }
 
 #[inline]
@@ -4879,6 +4895,141 @@ fn packed_rows_subset_from_full_bits(
 }
 
 #[inline]
+fn binary_row_var_from_support(support: usize, n_samples: usize) -> f64 {
+    if n_samples == 0 {
+        return 0.0;
+    }
+    let p = (support as f64) / (n_samples as f64);
+    p * (1.0 - p)
+}
+
+#[inline]
+fn binary_pair_r2_from_bit_rows(
+    row_i: &[u64],
+    support_i: usize,
+    row_j: &[u64],
+    support_j: usize,
+    n_samples: usize,
+) -> f64 {
+    if n_samples == 0 {
+        return 0.0;
+    }
+    let ss_i = (n_samples as f64) * binary_row_var_from_support(support_i, n_samples);
+    let ss_j = (n_samples as f64) * binary_row_var_from_support(support_j, n_samples);
+    if !(ss_i > 0.0 && ss_j > 0.0) {
+        return 0.0;
+    }
+    let both_one = and_popcount(row_i, row_j) as f64;
+    let p_i = (support_i as f64) / (n_samples as f64);
+    let p_j = (support_j as f64) / (n_samples as f64);
+    let cov = both_one - (n_samples as f64) * p_i * p_j;
+    let denom = (ss_i * ss_j).sqrt();
+    if !(denom > 0.0) || !cov.is_finite() {
+        return 0.0;
+    }
+    let corr = cov / denom;
+    (corr * corr).clamp(0.0, 1.0)
+}
+
+fn maybe_prune_geneset_unit_rows_by_ld(
+    unit: &GarfieldLogicUnit,
+    candidate_global_rows: &[usize],
+    unit_kind_lc: &str,
+    logic_bits: &GarfieldLogicBits,
+    sample_indices: &[usize],
+) -> Result<Vec<usize>, String> {
+    let r2_threshold = garfield_geneset_ld_prune_r2();
+    if unit_kind_lc != "geneset"
+        || unit.spans.len() <= 1
+        || candidate_global_rows.len() <= 1
+        || !(r2_threshold.is_finite() && r2_threshold > 0.0 && r2_threshold <= 1.0)
+    {
+        return Ok(candidate_global_rows.to_vec());
+    }
+    let n_samples = sample_indices.len();
+    if n_samples <= 1 {
+        return Ok(candidate_global_rows.to_vec());
+    }
+    let (packed_rows, row_words) = packed_rows_subset_from_full_bits(
+        logic_bits.bits_flat.as_slice(),
+        logic_bits.row_words,
+        candidate_global_rows,
+        sample_indices,
+        logic_bits.sites.len(),
+        logic_bits.n_samples,
+    )?;
+    let mut support = vec![0usize; candidate_global_rows.len()];
+    let mut var = vec![0.0_f64; candidate_global_rows.len()];
+    let mut variable_local = Vec::<usize>::with_capacity(candidate_global_rows.len());
+    for local_idx in 0..candidate_global_rows.len() {
+        let row = &packed_rows[local_idx * row_words..(local_idx + 1) * row_words];
+        let cnt = popcount(row) as usize;
+        support[local_idx] = cnt;
+        let row_var = binary_row_var_from_support(cnt, n_samples);
+        var[local_idx] = row_var;
+        if row_var > 0.0 {
+            variable_local.push(local_idx);
+        }
+    }
+    if variable_local.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    variable_local.sort_by(|&a, &b| {
+        let ga = candidate_global_rows[a];
+        let gb = candidate_global_rows[b];
+        var[b].total_cmp(&var[a]).then_with(|| {
+            let sa = &logic_bits.sites[ga];
+            let sb = &logic_bits.sites[gb];
+            chrom_sort_key(sa.garfield_chrom())
+                .cmp(&chrom_sort_key(sb.garfield_chrom()))
+                .then_with(|| sa.garfield_pos().cmp(&sb.garfield_pos()))
+                .then_with(|| ga.cmp(&gb))
+        })
+    });
+
+    let mut kept_local = Vec::<usize>::with_capacity(variable_local.len());
+    for &local_idx in variable_local.iter() {
+        check_ctrlc()?;
+        let row_i = &packed_rows[local_idx * row_words..(local_idx + 1) * row_words];
+        let mut conflict_pos = Vec::<usize>::new();
+        for (kp, &kept_idx) in kept_local.iter().enumerate() {
+            let row_j = &packed_rows[kept_idx * row_words..(kept_idx + 1) * row_words];
+            let r2 = binary_pair_r2_from_bit_rows(
+                row_i,
+                support[local_idx],
+                row_j,
+                support[kept_idx],
+                n_samples,
+            );
+            if r2 >= r2_threshold {
+                conflict_pos.push(kp);
+            }
+        }
+        if conflict_pos.is_empty() {
+            kept_local.push(local_idx);
+            continue;
+        }
+        let best_conflict_var = conflict_pos
+            .iter()
+            .map(|&kp| var[kept_local[kp]])
+            .fold(f64::NEG_INFINITY, f64::max);
+        if var[local_idx] > best_conflict_var {
+            for &kp in conflict_pos.iter().rev() {
+                kept_local.remove(kp);
+            }
+            kept_local.push(local_idx);
+        }
+    }
+
+    kept_local.sort_unstable();
+    Ok(kept_local
+        .into_iter()
+        .map(|local_idx| candidate_global_rows[local_idx])
+        .collect::<Vec<_>>())
+}
+
+#[inline]
 fn resolve_ml_keep_k(n_region: usize, ml_top_k: usize, ml_top_frac: f64) -> usize {
     if n_region == 0 {
         return 0;
@@ -5105,8 +5256,18 @@ fn select_logic_unit_global_rows(
     if unit.indices.is_empty() {
         return Ok(None);
     }
+    let candidate_global_rows = maybe_prune_geneset_unit_rows_by_ld(
+        unit,
+        unit.indices.as_slice(),
+        unit_kind_lc,
+        logic_bits,
+        train_idx_local,
+    )?;
+    if candidate_global_rows.is_empty() {
+        return Ok(None);
+    }
     let selected_global_rows = if let Some(engine_one) = engine {
-        let n_region = unit.indices.len();
+        let n_region = candidate_global_rows.len();
         let keep_k = resolve_ml_keep_k(n_region, ml_top_k, ml_top_frac);
 
         // ---- PairwiseAnd fast path: packed subset + cached stage-1 stats ----
@@ -5116,7 +5277,7 @@ fn select_logic_unit_global_rows(
                 packed_rows_subset_from_full_bits_with_stage1(
                     logic_bits.bits_flat.as_slice(),
                     logic_bits.row_words,
-                    unit.indices.as_slice(),
+                    candidate_global_rows.as_slice(),
                     train_idx_local,
                     y_train,
                     logic_bits.sites.len(),
@@ -5142,7 +5303,7 @@ fn select_logic_unit_global_rows(
             return Ok(Some(
                 top_local
                     .iter()
-                    .map(|&idx| unit.indices[idx])
+                    .map(|&idx| candidate_global_rows[idx])
                     .collect::<Vec<_>>(),
             ));
         }
@@ -5151,7 +5312,7 @@ fn select_logic_unit_global_rows(
         let dense_train = dense_binary_rows_from_full_bits(
             logic_bits.bits_flat.as_slice(),
             logic_bits.row_words,
-            unit.indices.as_slice(),
+            candidate_global_rows.as_slice(),
             train_idx_local,
             logic_bits.sites.len(),
             logic_bits.n_samples,
@@ -5161,7 +5322,7 @@ fn select_logic_unit_global_rows(
         }
         let ml_group_ids = build_unit_window_group_ids(
             unit,
-            unit.indices.as_slice(),
+            candidate_global_rows.as_slice(),
             logic_bits.sites.as_slice(),
             unit_kind_lc,
         );
@@ -5186,10 +5347,10 @@ fn select_logic_unit_global_rows(
         }
         top_local
             .iter()
-            .map(|&idx| unit.indices[idx])
+            .map(|&idx| candidate_global_rows[idx])
             .collect::<Vec<_>>()
     } else {
-        unit.indices.clone()
+        candidate_global_rows
     };
     if selected_global_rows.is_empty() {
         return Ok(None);
@@ -6453,9 +6614,7 @@ fn split_logic_display_tokens(text: &str) -> Vec<String> {
 }
 
 fn split_logic_allele_tokens(text: &str) -> Vec<String> {
-    text.split(',')
-        .map(|tok| tok.trim().to_string())
-        .collect()
+    text.split(',').map(|tok| tok.trim().to_string()).collect()
 }
 
 fn collect_logic_pseudo_literal_exports(
@@ -6466,7 +6625,10 @@ fn collect_logic_pseudo_literal_exports(
     let allele0_tokens = split_logic_allele_tokens(rec.bim_allele0.as_str());
     let allele1_tokens = split_logic_allele_tokens(rec.bim_allele1.as_str());
     let expected = rec.selected_row_indices.len();
-    if snp_tokens.len() != expected || allele0_tokens.len() != expected || allele1_tokens.len() != expected {
+    if snp_tokens.len() != expected
+        || allele0_tokens.len() != expected
+        || allele1_tokens.len() != expected
+    {
         return Err(format!(
             "GARFIELD pseudo export token mismatch for {}: rows={}, snp={}, allele0={}, allele1={}",
             rec.bim_snp_name,
@@ -6551,11 +6713,7 @@ fn write_logic_pseudo_plink(
     for rec in ordered.into_iter() {
         let literals = collect_logic_pseudo_literal_exports(rec, logic_bits)?;
         if literals.len() <= 1 {
-            let singleton_key = (
-                rec.chrom_field.clone(),
-                rec.pos,
-                rec.bim_snp_name.clone(),
-            );
+            let singleton_key = (rec.chrom_field.clone(), rec.pos, rec.bim_snp_name.clone());
             if emitted_singletons.insert(singleton_key) {
                 writeln!(
                     bim,
@@ -9255,6 +9413,21 @@ mod tests {
         (bits_flat, row_words, group_ids)
     }
 
+    fn pack_test_binary_rows(rows: &[Vec<u8>]) -> (Vec<u64>, usize) {
+        let n_samples = rows.first().map(|row| row.len()).unwrap_or(0);
+        let row_words = words_for_samples(n_samples);
+        let mut bits_flat = vec![0u64; rows.len().saturating_mul(row_words)];
+        for (row_idx, row) in rows.iter().enumerate() {
+            assert_eq!(row.len(), n_samples);
+            for (sample_idx, &v) in row.iter().enumerate() {
+                if v != 0 {
+                    bits_flat[row_idx * row_words + (sample_idx >> 6)] |= 1u64 << (sample_idx & 63);
+                }
+            }
+        }
+        (bits_flat, row_words)
+    }
+
     #[test]
     fn test_group_exclusion_parallel_matches_serial() {
         let n_rows = 1024usize;
@@ -9658,8 +9831,10 @@ mod tests {
         };
         let polarity = GarfieldRuleDisplayPolarity::OriginalAnd;
         let expr = rule_expr_with_polarity(&rule, logic_sites.as_slice(), polarity).unwrap();
-        let snp_name = rule_snp_name_with_polarity(&rule, logic_sites.as_slice(), polarity).unwrap();
-        let bim_name = rule_bim_name_with_polarity(&rule, logic_sites.as_slice(), polarity).unwrap();
+        let snp_name =
+            rule_snp_name_with_polarity(&rule, logic_sites.as_slice(), polarity).unwrap();
+        let bim_name =
+            rule_bim_name_with_polarity(&rule, logic_sites.as_slice(), polarity).unwrap();
 
         assert_eq!(expr, "BIN(rsA) AND BIN(rsB)");
         assert_eq!(snp_name, "rsA&rsB");
@@ -9692,7 +9867,8 @@ mod tests {
         };
         let polarity = GarfieldRuleDisplayPolarity::OriginalAnd;
         let expr = rule_expr_with_polarity(&rule, logic_sites.as_slice(), polarity).unwrap();
-        let snp_name = rule_snp_name_with_polarity(&rule, logic_sites.as_slice(), polarity).unwrap();
+        let snp_name =
+            rule_snp_name_with_polarity(&rule, logic_sites.as_slice(), polarity).unwrap();
 
         assert_eq!(expr, "BIN(1_100) AND BIN(1_200)");
         assert_eq!(snp_name, "1_100&1_200");
@@ -9945,6 +10121,176 @@ mod tests {
                 bp_end: 111_250_000,
             }]
         ));
+    }
+
+    #[test]
+    fn test_geneset_ld_prune_drops_cross_chrom_high_ld_rows() {
+        let (bits_flat, row_words) =
+            pack_test_binary_rows(&[vec![1u8, 1, 0, 0], vec![1u8, 1, 0, 0], vec![1u8, 0, 1, 0]]);
+        let logic_bits = GarfieldLogicBits {
+            bits_flat,
+            row_words,
+            sample_ids: vec![
+                "s1".to_string(),
+                "s2".to_string(),
+                "s3".to_string(),
+                "s4".to_string(),
+            ],
+            sites: vec![
+                GarfieldLogicSite {
+                    chrom: "1".into(),
+                    pos: 100,
+                    snp: "chr1.s_100".into(),
+                    ref_allele: "A".into(),
+                    alt_allele: "G".into(),
+                    mode: GarfieldLogicSiteMode::Bin,
+                },
+                GarfieldLogicSite {
+                    chrom: "2".into(),
+                    pos: 200,
+                    snp: "chr2.s_200".into(),
+                    ref_allele: "A".into(),
+                    alt_allele: "G".into(),
+                    mode: GarfieldLogicSiteMode::Bin,
+                },
+                GarfieldLogicSite {
+                    chrom: "3".into(),
+                    pos: 300,
+                    snp: "chr3.s_300".into(),
+                    ref_allele: "A".into(),
+                    alt_allele: "G".into(),
+                    mode: GarfieldLogicSiteMode::Bin,
+                },
+            ],
+            group_ids: vec![0, 1, 2],
+            n_samples: 4,
+        };
+        let unit = GarfieldLogicUnit {
+            label: "triad".to_string(),
+            indices: vec![0, 1, 2],
+            spans: vec![
+                GarfieldUnitSpan {
+                    chrom: "1".to_string(),
+                    bp_start: 90,
+                    bp_end: 110,
+                },
+                GarfieldUnitSpan {
+                    chrom: "2".to_string(),
+                    bp_start: 190,
+                    bp_end: 210,
+                },
+                GarfieldUnitSpan {
+                    chrom: "3".to_string(),
+                    bp_start: 290,
+                    bp_end: 310,
+                },
+            ],
+        };
+        let kept = maybe_prune_geneset_unit_rows_by_ld(
+            &unit,
+            unit.indices.as_slice(),
+            "geneset",
+            &logic_bits,
+            &[0, 1, 2, 3],
+        )
+        .unwrap();
+        assert_eq!(kept, vec![0usize, 2usize]);
+    }
+
+    #[test]
+    fn test_select_logic_unit_global_rows_applies_geneset_ld_prune_without_ml() {
+        let (bits_flat, row_words) =
+            pack_test_binary_rows(&[vec![1u8, 1, 0, 0], vec![1u8, 1, 0, 0], vec![1u8, 0, 1, 0]]);
+        let logic_bits = GarfieldLogicBits {
+            bits_flat,
+            row_words,
+            sample_ids: vec![
+                "s1".to_string(),
+                "s2".to_string(),
+                "s3".to_string(),
+                "s4".to_string(),
+            ],
+            sites: vec![
+                GarfieldLogicSite {
+                    chrom: "1".into(),
+                    pos: 100,
+                    snp: "chr1.s_100".into(),
+                    ref_allele: "A".into(),
+                    alt_allele: "G".into(),
+                    mode: GarfieldLogicSiteMode::Bin,
+                },
+                GarfieldLogicSite {
+                    chrom: "2".into(),
+                    pos: 200,
+                    snp: "chr2.s_200".into(),
+                    ref_allele: "A".into(),
+                    alt_allele: "G".into(),
+                    mode: GarfieldLogicSiteMode::Bin,
+                },
+                GarfieldLogicSite {
+                    chrom: "3".into(),
+                    pos: 300,
+                    snp: "chr3.s_300".into(),
+                    ref_allele: "A".into(),
+                    alt_allele: "G".into(),
+                    mode: GarfieldLogicSiteMode::Bin,
+                },
+            ],
+            group_ids: vec![0, 1, 2],
+            n_samples: 4,
+        };
+        let unit = GarfieldLogicUnit {
+            label: "triad".to_string(),
+            indices: vec![0, 1, 2],
+            spans: vec![
+                GarfieldUnitSpan {
+                    chrom: "1".to_string(),
+                    bp_start: 90,
+                    bp_end: 110,
+                },
+                GarfieldUnitSpan {
+                    chrom: "2".to_string(),
+                    bp_start: 190,
+                    bp_end: 210,
+                },
+                GarfieldUnitSpan {
+                    chrom: "3".to_string(),
+                    bp_start: 290,
+                    bp_end: 310,
+                },
+            ],
+        };
+        let selected = select_logic_unit_global_rows(
+            &unit,
+            "geneset",
+            ResponseKind::Continuous,
+            None,
+            ImportanceKind::Imp,
+            PermutationConfig {
+                n_repeats: 1,
+                scoring: crate::ml::common::PermutationScoring::Auto,
+                seed: 1,
+            },
+            64,
+            0.0,
+            ExtraTreesConfig {
+                n_estimators: 1,
+                max_depth: 1,
+                min_samples_leaf: 1,
+                min_samples_split: 2,
+                bootstrap: false,
+                feature_subsample: 0.0,
+                seed: 1,
+                allow_parallel: false,
+            },
+            &logic_bits,
+            &[0, 1, 2, 3],
+            &[0.1, 0.2, 0.3, 0.4],
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(selected, vec![0usize, 2usize]);
     }
 
     #[test]

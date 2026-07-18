@@ -52,7 +52,7 @@ use crate::ml::common::{
 use crate::ml::engine::{compute_feature_scores_grouped, parse_ml_engine, MlEngine};
 use crate::ml::extra_trees::ExtraTreesConfig;
 use crate::ml::pairwise_and::{
-    feature_scores_pairwise_and_packed_with_stage1, reset_pairwise_profile,
+    feature_scores_pairwise_and_packed_dual_with_stage1, reset_pairwise_profile,
     snapshot_pairwise_profile,
 };
 use crate::stats_common::{
@@ -3280,8 +3280,9 @@ fn build_simbench_ml_contexts(
         if unit.indices.is_empty() {
             continue;
         }
-        let dense_train = dense_binary_rows_from_full_bits(
+        let dense_train = dense_dosage_rows_from_full_bits(
             logic_bits.bits_flat.as_slice(),
+            logic_bits.bits_hi_flat.as_deref(),
             logic_bits.row_words,
             unit.indices.as_slice(),
             train_idx_local,
@@ -4960,8 +4961,9 @@ fn convert_bed_prefix_to_logic_bits(
     })
 }
 
-fn dense_binary_rows_from_full_bits_range(
+fn dense_dosage_rows_from_full_bits_range(
     bits_flat: &[u64],
+    bits_hi_flat: Option<&[u64]>,
     row_words: usize,
     row_start: usize,
     row_end: usize,
@@ -4986,23 +4988,34 @@ fn dense_binary_rows_from_full_bits_range(
     if bits_flat.len() != n_rows_all.saturating_mul(row_words) {
         return Err("full bit matrix length mismatch".to_string());
     }
+    if let Some(bits_hi_flat) = bits_hi_flat {
+        if bits_hi_flat.len() != n_rows_all.saturating_mul(row_words) {
+            return Err("full high-bit matrix length mismatch".to_string());
+        }
+    }
     let mut out = Vec::<Vec<u8>>::with_capacity(row_end.saturating_sub(row_start));
     for row_idx in row_start..row_end {
-        let row = &bits_flat[row_idx * row_words..(row_idx + 1) * row_words];
+        let row_ge1 = &bits_flat[row_idx * row_words..(row_idx + 1) * row_words];
+        let row_ge2 = bits_hi_flat.map(|bits| &bits[row_idx * row_words..(row_idx + 1) * row_words]);
         let mut dense = vec![0u8; sample_indices.len()];
         for (j, &sid) in sample_indices.iter().enumerate() {
             if sid >= n_samples_all {
                 return Err(format!("sample index out of range while densifying: {sid}"));
             }
-            dense[j] = ((row[sid >> 6] >> (sid & 63)) & 1u64) as u8;
+            let ge1 = ((row_ge1[sid >> 6] >> (sid & 63)) & 1u64) as u8;
+            let ge2 = row_ge2
+                .map(|row| ((row[sid >> 6] >> (sid & 63)) & 1u64) as u8)
+                .unwrap_or(0);
+            dense[j] = ge1.saturating_add(ge2);
         }
         out.push(dense);
     }
     Ok(out)
 }
 
-fn dense_binary_rows_from_full_bits(
+fn dense_dosage_rows_from_full_bits(
     bits_flat: &[u64],
+    bits_hi_flat: Option<&[u64]>,
     row_words: usize,
     row_indices: &[usize],
     sample_indices: &[usize],
@@ -5018,6 +5031,11 @@ fn dense_binary_rows_from_full_bits(
     if bits_flat.len() != n_rows_all.saturating_mul(row_words) {
         return Err("full bit matrix length mismatch".to_string());
     }
+    if let Some(bits_hi_flat) = bits_hi_flat {
+        if bits_hi_flat.len() != n_rows_all.saturating_mul(row_words) {
+            return Err("full high-bit matrix length mismatch".to_string());
+        }
+    }
     let mut out = Vec::<Vec<u8>>::with_capacity(row_indices.len());
     for &row_idx in row_indices.iter() {
         if row_idx >= n_rows_all {
@@ -5025,13 +5043,18 @@ fn dense_binary_rows_from_full_bits(
                 "row index out of range while densifying: {row_idx}"
             ));
         }
-        let row = &bits_flat[row_idx * row_words..(row_idx + 1) * row_words];
+        let row_ge1 = &bits_flat[row_idx * row_words..(row_idx + 1) * row_words];
+        let row_ge2 = bits_hi_flat.map(|bits| &bits[row_idx * row_words..(row_idx + 1) * row_words]);
         let mut dense = vec![0u8; sample_indices.len()];
         for (j, &sid) in sample_indices.iter().enumerate() {
             if sid >= n_samples_all {
                 return Err(format!("sample index out of range while densifying: {sid}"));
             }
-            dense[j] = ((row[sid >> 6] >> (sid & 63)) & 1u64) as u8;
+            let ge1 = ((row_ge1[sid >> 6] >> (sid & 63)) & 1u64) as u8;
+            let ge2 = row_ge2
+                .map(|row| ((row[sid >> 6] >> (sid & 63)) & 1u64) as u8)
+                .unwrap_or(0);
+            dense[j] = ge1.saturating_add(ge2);
         }
         out.push(dense);
     }
@@ -5045,15 +5068,16 @@ fn elapsed_ns_saturating(start: Instant) -> u64 {
     start.elapsed().as_nanos().min(u64::MAX as u128) as u64
 }
 
-fn packed_rows_subset_from_full_bits_with_stage1(
+fn packed_dosage_rows_subset_from_full_bits_with_stage1(
     bits_flat: &[u64],
+    bits_hi_flat: Option<&[u64]>,
     row_words_full: usize,
     row_indices: &[usize],
     sample_indices: &[usize],
     y: &[f64],
     n_rows_all: usize,
     n_samples_all: usize,
-) -> Result<(Vec<u64>, usize, Vec<usize>, Vec<f64>), String> {
+) -> Result<(Vec<u64>, Vec<u64>, usize, Vec<f64>, Vec<f64>, Vec<f64>), String> {
     let _t = Instant::now();
     if row_words_full != words_for_samples(n_samples_all) {
         return Err(format!(
@@ -5064,6 +5088,11 @@ fn packed_rows_subset_from_full_bits_with_stage1(
     if bits_flat.len() != n_rows_all.saturating_mul(row_words_full) {
         return Err("full bit matrix length mismatch".to_string());
     }
+    if let Some(bits_hi_flat) = bits_hi_flat {
+        if bits_hi_flat.len() != n_rows_all.saturating_mul(row_words_full) {
+            return Err("full high-bit matrix length mismatch".to_string());
+        }
+    }
     if sample_indices.len() != y.len() {
         return Err(format!(
             "sample_indices length ({}) != y length ({}) while subsetting packed rows",
@@ -5072,39 +5101,61 @@ fn packed_rows_subset_from_full_bits_with_stage1(
         ));
     }
     let row_words_sub = words_for_samples(sample_indices.len());
-    let mut out = vec![0u64; row_indices.len().saturating_mul(row_words_sub)];
-    let mut feat_n_hit = vec![0usize; row_indices.len()];
-    let mut feat_sum_hit = vec![0.0f64; row_indices.len()];
+    let mut out_ge1 = vec![0u64; row_indices.len().saturating_mul(row_words_sub)];
+    let mut out_ge2 = vec![0u64; row_indices.len().saturating_mul(row_words_sub)];
+    let mut feat_sum_x = vec![0.0f64; row_indices.len()];
+    let mut feat_sum_x2 = vec![0.0f64; row_indices.len()];
+    let mut feat_sum_xy = vec![0.0f64; row_indices.len()];
     for (dst_r, &src_r) in row_indices.iter().enumerate() {
         if src_r >= n_rows_all {
             return Err(format!("row index out of range while subsetting: {src_r}"));
         }
-        let src = &bits_flat[src_r * row_words_full..(src_r + 1) * row_words_full];
+        let src_ge1 = &bits_flat[src_r * row_words_full..(src_r + 1) * row_words_full];
+        let src_ge2 =
+            bits_hi_flat.map(|bits| &bits[src_r * row_words_full..(src_r + 1) * row_words_full]);
         let dst_base = dst_r * row_words_sub;
-        let mut n_hit = 0usize;
-        let mut sum_hit = 0.0f64;
+        let mut sum_x = 0.0f64;
+        let mut sum_x2 = 0.0f64;
+        let mut sum_xy = 0.0f64;
         for (dst_s, &src_s) in sample_indices.iter().enumerate() {
             if src_s >= n_samples_all {
                 return Err(format!(
                     "sample index out of range while subsetting: {src_s}"
                 ));
             }
-            let bit = (src[src_s >> 6] >> (src_s & 63)) & 1u64;
-            if bit != 0 {
-                out[dst_base + (dst_s >> 6)] |= 1u64 << (dst_s & 63);
-                n_hit += 1;
-                sum_hit += y[dst_s];
+            let ge1 = ((src_ge1[src_s >> 6] >> (src_s & 63)) & 1u64) as u8;
+            let ge2 = src_ge2
+                .map(|row| ((row[src_s >> 6] >> (src_s & 63)) & 1u64) as u8)
+                .unwrap_or(0);
+            if ge1 != 0 {
+                out_ge1[dst_base + (dst_s >> 6)] |= 1u64 << (dst_s & 63);
             }
+            if ge2 != 0 {
+                out_ge2[dst_base + (dst_s >> 6)] |= 1u64 << (dst_s & 63);
+            }
+            let dosage = f64::from(ge1.saturating_add(ge2));
+            sum_x += dosage;
+            sum_x2 += dosage * dosage;
+            sum_xy += dosage * y[dst_s];
         }
-        feat_n_hit[dst_r] = n_hit;
-        feat_sum_hit[dst_r] = sum_hit;
+        feat_sum_x[dst_r] = sum_x;
+        feat_sum_x2[dst_r] = sum_x2;
+        feat_sum_xy[dst_r] = sum_xy;
     }
     PACKED_EXTRACT_FLAT_NS.fetch_add(elapsed_ns_saturating(_t), Ordering::Relaxed);
-    Ok((out, row_words_sub, feat_n_hit, feat_sum_hit))
+    Ok((
+        out_ge1,
+        out_ge2,
+        row_words_sub,
+        feat_sum_x,
+        feat_sum_x2,
+        feat_sum_xy,
+    ))
 }
 
-fn packed_rows_subset_from_full_bits_range_with_stage1(
+fn packed_dosage_rows_subset_from_full_bits_range_with_stage1(
     bits_flat: &[u64],
+    bits_hi_flat: Option<&[u64]>,
     row_words_full: usize,
     row_start: usize,
     row_end: usize,
@@ -5112,12 +5163,14 @@ fn packed_rows_subset_from_full_bits_range_with_stage1(
     y: &[f64],
     n_rows_all: usize,
     n_samples_all: usize,
-) -> Result<(Vec<u64>, usize, Vec<usize>, Vec<f64>), String> {
+) -> Result<(Vec<u64>, Vec<u64>, usize, Vec<f64>, Vec<f64>, Vec<f64>), String> {
     let _t = Instant::now();
     if row_end <= row_start {
         return Ok((
             Vec::new(),
+            Vec::new(),
             words_for_samples(sample_indices.len()),
+            Vec::new(),
             Vec::new(),
             Vec::new(),
         ));
@@ -5136,6 +5189,11 @@ fn packed_rows_subset_from_full_bits_range_with_stage1(
     if bits_flat.len() != n_rows_all.saturating_mul(row_words_full) {
         return Err("full bit matrix length mismatch".to_string());
     }
+    if let Some(bits_hi_flat) = bits_hi_flat {
+        if bits_hi_flat.len() != n_rows_all.saturating_mul(row_words_full) {
+            return Err("full high-bit matrix length mismatch".to_string());
+        }
+    }
     if sample_indices.len() != y.len() {
         return Err(format!(
             "sample_indices length ({}) != y length ({}) while subsetting packed range",
@@ -5145,32 +5203,53 @@ fn packed_rows_subset_from_full_bits_range_with_stage1(
     }
     let row_words_sub = words_for_samples(sample_indices.len());
     let n_rows_sub = row_end.saturating_sub(row_start);
-    let mut out = vec![0u64; n_rows_sub.saturating_mul(row_words_sub)];
-    let mut feat_n_hit = vec![0usize; n_rows_sub];
-    let mut feat_sum_hit = vec![0.0f64; n_rows_sub];
+    let mut out_ge1 = vec![0u64; n_rows_sub.saturating_mul(row_words_sub)];
+    let mut out_ge2 = vec![0u64; n_rows_sub.saturating_mul(row_words_sub)];
+    let mut feat_sum_x = vec![0.0f64; n_rows_sub];
+    let mut feat_sum_x2 = vec![0.0f64; n_rows_sub];
+    let mut feat_sum_xy = vec![0.0f64; n_rows_sub];
     for (dst_r, src_r) in (row_start..row_end).enumerate() {
-        let src = &bits_flat[src_r * row_words_full..(src_r + 1) * row_words_full];
+        let src_ge1 = &bits_flat[src_r * row_words_full..(src_r + 1) * row_words_full];
+        let src_ge2 =
+            bits_hi_flat.map(|bits| &bits[src_r * row_words_full..(src_r + 1) * row_words_full]);
         let dst_base = dst_r * row_words_sub;
-        let mut n_hit = 0usize;
-        let mut sum_hit = 0.0f64;
+        let mut sum_x = 0.0f64;
+        let mut sum_x2 = 0.0f64;
+        let mut sum_xy = 0.0f64;
         for (dst_s, &src_s) in sample_indices.iter().enumerate() {
             if src_s >= n_samples_all {
                 return Err(format!(
                     "sample index out of range while subsetting: {src_s}"
                 ));
             }
-            let bit = (src[src_s >> 6] >> (src_s & 63)) & 1u64;
-            if bit != 0 {
-                out[dst_base + (dst_s >> 6)] |= 1u64 << (dst_s & 63);
-                n_hit += 1;
-                sum_hit += y[dst_s];
+            let ge1 = ((src_ge1[src_s >> 6] >> (src_s & 63)) & 1u64) as u8;
+            let ge2 = src_ge2
+                .map(|row| ((row[src_s >> 6] >> (src_s & 63)) & 1u64) as u8)
+                .unwrap_or(0);
+            if ge1 != 0 {
+                out_ge1[dst_base + (dst_s >> 6)] |= 1u64 << (dst_s & 63);
             }
+            if ge2 != 0 {
+                out_ge2[dst_base + (dst_s >> 6)] |= 1u64 << (dst_s & 63);
+            }
+            let dosage = f64::from(ge1.saturating_add(ge2));
+            sum_x += dosage;
+            sum_x2 += dosage * dosage;
+            sum_xy += dosage * y[dst_s];
         }
-        feat_n_hit[dst_r] = n_hit;
-        feat_sum_hit[dst_r] = sum_hit;
+        feat_sum_x[dst_r] = sum_x;
+        feat_sum_x2[dst_r] = sum_x2;
+        feat_sum_xy[dst_r] = sum_xy;
     }
     PACKED_EXTRACT_FLAT_NS.fetch_add(elapsed_ns_saturating(_t), Ordering::Relaxed);
-    Ok((out, row_words_sub, feat_n_hit, feat_sum_hit))
+    Ok((
+        out_ge1,
+        out_ge2,
+        row_words_sub,
+        feat_sum_x,
+        feat_sum_x2,
+        feat_sum_xy,
+    ))
 }
 
 fn packed_rows_subset_from_full_bits_range(
@@ -5637,9 +5716,10 @@ fn select_logic_unit_global_rows(
         // ---- PairwiseAnd fast path: packed subset + cached stage-1 stats ----
         if engine_one == MlEngine::PairwiseAnd {
             let t0 = Instant::now();
-            let (packed_bits, row_words_sub, feat_n_hit, feat_sum_hit) =
-                packed_rows_subset_from_full_bits_with_stage1(
+            let (packed_bits_ge1, packed_bits_ge2, row_words_sub, feat_sum_x, feat_sum_x2, feat_sum_xy) =
+                packed_dosage_rows_subset_from_full_bits_with_stage1(
                     logic_bits.bits_flat.as_slice(),
+                    logic_bits.bits_hi_flat.as_deref(),
                     logic_bits.row_words,
                     candidate_global_rows.as_slice(),
                     train_idx_local,
@@ -5647,14 +5727,16 @@ fn select_logic_unit_global_rows(
                     logic_bits.sites.len(),
                     logic_bits.n_samples,
                 )?;
-            let scores = feature_scores_pairwise_and_packed_with_stage1(
-                packed_bits.as_slice(),
+            let scores = feature_scores_pairwise_and_packed_dual_with_stage1(
+                packed_bits_ge1.as_slice(),
+                packed_bits_ge2.as_slice(),
                 row_words_sub,
                 n_region,
                 y_train,
                 train_idx_local.len(),
-                feat_n_hit.as_slice(),
-                feat_sum_hit.as_slice(),
+                feat_sum_x.as_slice(),
+                feat_sum_x2.as_slice(),
+                feat_sum_xy.as_slice(),
             );
             let top_local = topk_indices(&scores, keep_k);
             GARFIELD_ML_SELECT_NS.fetch_add(
@@ -5673,8 +5755,9 @@ fn select_logic_unit_global_rows(
         }
 
         // ---- General ML path (Vec<Vec<u8>>) ----
-        let dense_train = dense_binary_rows_from_full_bits(
+        let dense_train = dense_dosage_rows_from_full_bits(
             logic_bits.bits_flat.as_slice(),
+            logic_bits.bits_hi_flat.as_deref(),
             logic_bits.row_words,
             candidate_global_rows.as_slice(),
             train_idx_local,
@@ -5815,9 +5898,10 @@ fn prepare_logic_chunk_continuous(
     let selected_global_rows = if let Some(engine_one) = engine {
         // ---- PairwiseAnd fast path: packed subset + cached stage-1 stats ----
         if engine_one == MlEngine::PairwiseAnd {
-            let (packed_bits, row_words_sub, feat_n_hit, feat_sum_hit) =
-                packed_rows_subset_from_full_bits_range_with_stage1(
+            let (packed_bits_ge1, packed_bits_ge2, row_words_sub, feat_sum_x, feat_sum_x2, feat_sum_xy) =
+                packed_dosage_rows_subset_from_full_bits_range_with_stage1(
                     logic_bits.bits_flat.as_slice(),
+                    logic_bits.bits_hi_flat.as_deref(),
                     logic_bits.row_words,
                     row_start,
                     row_end,
@@ -5826,14 +5910,16 @@ fn prepare_logic_chunk_continuous(
                     logic_bits.sites.len(),
                     logic_bits.n_samples,
                 )?;
-            let scores = feature_scores_pairwise_and_packed_with_stage1(
-                packed_bits.as_slice(),
+            let scores = feature_scores_pairwise_and_packed_dual_with_stage1(
+                packed_bits_ge1.as_slice(),
+                packed_bits_ge2.as_slice(),
                 row_words_sub,
                 n_region,
                 y_train,
                 train_idx_local.len(),
-                feat_n_hit.as_slice(),
-                feat_sum_hit.as_slice(),
+                feat_sum_x.as_slice(),
+                feat_sum_x2.as_slice(),
+                feat_sum_xy.as_slice(),
             );
             let (top_keep, rand_keep) =
                 resolve_ml_top_random_counts(keep_k, GARFIELD_NULL_ML_TOP_FRAC);
@@ -5870,8 +5956,9 @@ fn prepare_logic_chunk_continuous(
                 .collect::<Vec<_>>()
         } else {
             // ---- General ML path ----
-            let dense_train = dense_binary_rows_from_full_bits_range(
+            let dense_train = dense_dosage_rows_from_full_bits_range(
                 logic_bits.bits_flat.as_slice(),
+                logic_bits.bits_hi_flat.as_deref(),
                 logic_bits.row_words,
                 row_start,
                 row_end,

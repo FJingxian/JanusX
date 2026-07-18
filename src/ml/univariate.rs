@@ -11,7 +11,7 @@ fn mcc_from_confusion(tp: u64, tn: u64, fp: u64, fnv: u64) -> f64 {
     }
 }
 
-pub fn feature_scores_abs_corr_binary_x(x_rows: &[Vec<u8>], y: &[f64]) -> Vec<f64> {
+pub fn feature_scores_abs_corr_dosage_x(x_rows: &[Vec<u8>], y: &[f64]) -> Vec<f64> {
     let n = y.len() as f64;
     let sumy: f64 = y.iter().sum();
     let sumy2: f64 = y.iter().map(|v| v * v).sum();
@@ -23,22 +23,23 @@ pub fn feature_scores_abs_corr_binary_x(x_rows: &[Vec<u8>], y: &[f64]) -> Vec<f6
 
     let mut out = vec![0.0f64; x_rows.len()];
     for (r, row) in x_rows.iter().enumerate() {
-        let mut n1 = 0usize;
-        let mut sum1 = 0.0f64;
+        let mut sumx = 0.0f64;
+        let mut sumx2 = 0.0f64;
+        let mut sumxy = 0.0f64;
         for i in 0..row.len() {
-            if row[i] != 0 {
-                n1 += 1;
-                sum1 += y[i];
-            }
+            let x = f64::from(row[i]);
+            sumx += x;
+            sumx2 += x * x;
+            sumxy += x * y[i];
         }
-        let p = (n1 as f64) / n;
-        let varx = p * (1.0 - p);
-        if varx <= 0.0 {
+        let meanx = sumx / n;
+        let varx = (sumx2 / n) - meanx * meanx;
+        if !varx.is_finite() || varx <= 0.0 {
             out[r] = 0.0;
             continue;
         }
-        let exy = sum1 / n;
-        let cov = exy - p * meany;
+        let exy = sumxy / n;
+        let cov = exy - meanx * meany;
         let corr = cov / (varx * vary).sqrt();
         out[r] = corr.abs();
     }

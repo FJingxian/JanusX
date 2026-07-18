@@ -20,6 +20,7 @@ enum GbdtNode {
     Leaf(f64),
     Split {
         feat: usize,
+        threshold: u8,
         left: Box<GbdtNode>,
         right: Box<GbdtNode>,
     },
@@ -87,55 +88,78 @@ fn compute_mtry(n_features: usize, feature_subsample: f64) -> usize {
     ((n_features as f64).sqrt().round() as usize).clamp(1, n_features)
 }
 
+#[derive(Clone, Copy, Debug)]
+struct SplitCandidate {
+    threshold: u8,
+    gain: f64,
+}
+
 fn split_gain_for_feature(
     feat_row: &[u8],
     samples: &[usize],
     target: &[f64],
     min_leaf: usize,
     parent: RegStats,
-) -> Option<f64> {
-    let mut left_n = 0usize;
-    let mut left_sum = 0.0f64;
+) -> Option<SplitCandidate> {
+    let mut left_n_le0 = 0usize;
+    let mut left_sum_le0 = 0.0f64;
+    let mut left_n_le1 = 0usize;
+    let mut left_sum_le1 = 0.0f64;
 
     for &si in samples {
-        if feat_row[si] == 0 {
-            left_n += 1;
-            let v = target[si];
-            left_sum += v;
+        let v = target[si];
+        match feat_row[si] {
+            0 => {
+                left_n_le0 += 1;
+                left_sum_le0 += v;
+                left_n_le1 += 1;
+                left_sum_le1 += v;
+            }
+            1 => {
+                left_n_le1 += 1;
+                left_sum_le1 += v;
+            }
+            _ => {}
         }
     }
 
-    let right_n = parent.n.saturating_sub(left_n);
-    if left_n < min_leaf || right_n < min_leaf {
-        return None;
+    let mut best = None::<SplitCandidate>;
+    for (threshold, left_n, left_sum) in [(0u8, left_n_le0, left_sum_le0), (1u8, left_n_le1, left_sum_le1)] {
+        let right_n = parent.n.saturating_sub(left_n);
+        if left_n < min_leaf || right_n < min_leaf {
+            continue;
+        }
+        let left = RegStats {
+            n: left_n,
+            sum: left_sum,
+        };
+        let right = RegStats {
+            n: right_n,
+            sum: parent.sum - left_sum,
+        };
+        let parent_term = (parent.sum * parent.sum) / (parent.n as f64);
+        let left_term = (left.sum * left.sum) / (left.n as f64);
+        let right_term = (right.sum * right.sum) / (right.n as f64);
+        let gain = left_term + right_term - parent_term;
+        if gain.is_finite() && gain > 0.0 {
+            let cand = SplitCandidate { threshold, gain };
+            if best.map(|cur| cand.gain > cur.gain).unwrap_or(true) {
+                best = Some(cand);
+            }
+        }
     }
-
-    let left = RegStats {
-        n: left_n,
-        sum: left_sum,
-    };
-    let right = RegStats {
-        n: right_n,
-        sum: parent.sum - left_sum,
-    };
-    // Closed-form SSE reduction for binary 0/1 splits; this matches the
-    // ET/RF continuous split score and avoids per-candidate sumsq work.
-    let parent_term = (parent.sum * parent.sum) / (parent.n as f64);
-    let left_term = (left.sum * left.sum) / (left.n as f64);
-    let right_term = (right.sum * right.sum) / (right.n as f64);
-    let gain = left_term + right_term - parent_term;
-    if gain.is_finite() && gain > 0.0 {
-        Some(gain)
-    } else {
-        None
-    }
+    best
 }
 
-fn split_samples_by_feature(feat_row: &[u8], samples: &[usize]) -> (Vec<usize>, Vec<usize>) {
+fn split_samples_by_feature(
+    feat_row: &[u8],
+    samples: &[usize],
+    threshold: u8,
+) -> (Vec<usize>, Vec<usize>) {
     let mut left = Vec::<usize>::with_capacity(samples.len());
     let mut right = Vec::<usize>::with_capacity(samples.len());
     for &si in samples {
-        if feat_row[si] == 0 {
+        if feat_row[si] <= threshold {
             left.push(si);
         } else {
             right.push(si);
@@ -176,6 +200,7 @@ fn grow_tree(
     }
 
     let mut best_feat: Option<usize> = None;
+    let mut best_threshold = 0u8;
     let mut best_gain = f64::NEG_INFINITY;
     for feat in feat_candidates {
         if let Some(group_ids) = feature_group_ids {
@@ -183,12 +208,13 @@ fn grow_tree(
                 continue;
             }
         }
-        if let Some(gain) =
+        if let Some(split) =
             split_gain_for_feature(&x_rows[feat], samples, target, cfg.min_samples_leaf, parent)
         {
-            if gain > best_gain {
-                best_gain = gain;
+            if split.gain > best_gain {
+                best_gain = split.gain;
                 best_feat = Some(feat);
+                best_threshold = split.threshold;
             }
         }
     }
@@ -200,7 +226,8 @@ fn grow_tree(
         return leaf;
     }
 
-    let (left_samples, right_samples) = split_samples_by_feature(&x_rows[feat], samples);
+    let (left_samples, right_samples) =
+        split_samples_by_feature(&x_rows[feat], samples, best_threshold);
     if left_samples.len() < cfg.min_samples_leaf || right_samples.len() < cfg.min_samples_leaf {
         return leaf;
     }
@@ -212,6 +239,7 @@ fn grow_tree(
     }
     GbdtNode::Split {
         feat,
+        threshold: best_threshold,
         left: Box::new(grow_tree(
             x_rows,
             target,
@@ -256,7 +284,12 @@ fn predict_tree(
 ) -> f64 {
     match node {
         GbdtNode::Leaf(v) => *v,
-        GbdtNode::Split { feat, left, right } => {
+        GbdtNode::Split {
+            feat,
+            threshold,
+            left,
+            right,
+        } => {
             let bit = if override_feat == Some(*feat) {
                 override_row
                     .map(|r| r[sample_idx])
@@ -264,7 +297,7 @@ fn predict_tree(
             } else {
                 x_rows[*feat][sample_idx]
             };
-            if bit == 0 {
+            if bit <= *threshold {
                 predict_tree(left, x_rows, sample_idx, override_feat, override_row)
             } else {
                 predict_tree(right, x_rows, sample_idx, override_feat, override_row)
@@ -629,6 +662,7 @@ mod tests {
         let gain =
             split_gain_for_feature(feat.as_slice(), samples.as_slice(), y.as_slice(), 1, parent)
                 .unwrap();
+        assert_eq!(gain.threshold, 0);
         let old_gain = {
             let y = y.as_slice();
             let mean_parent = y.iter().copied().sum::<f64>() / (y.len() as f64);
@@ -648,7 +682,20 @@ mod tests {
                 .sum::<f64>();
             parent_sse - left_sse - right_sse
         };
-        assert!((gain - old_gain).abs() < 1e-12);
-        assert!((gain - 36.0).abs() < 1e-12);
+        assert!((gain.gain - old_gain).abs() < 1e-12);
+        assert!((gain.gain - 36.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn gbdt_dosage_split_can_choose_threshold_one() {
+        let feat = vec![0u8, 1, 2, 2];
+        let y = vec![3.0, 2.0, -3.0, -4.0];
+        let samples = vec![0usize, 1, 2, 3];
+        let parent = make_reg_stats(&samples, &y);
+        let split =
+            split_gain_for_feature(feat.as_slice(), samples.as_slice(), y.as_slice(), 1, parent)
+                .unwrap();
+        assert_eq!(split.threshold, 1);
+        assert!(split.gain > 0.0);
     }
 }

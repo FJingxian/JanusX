@@ -104,6 +104,24 @@ fn pack_dense(row: &[u8], n_words: usize) -> Vec<u64> {
     out
 }
 
+/// Pack a dense dosage row into dual bitplanes:
+///   - `ge1`: dosage >= 1
+///   - `ge2`: dosage >= 2
+#[inline]
+fn pack_dense_dual(row: &[u8], n_words: usize) -> (Vec<u64>, Vec<u64>) {
+    let mut ge1 = vec![0u64; n_words];
+    let mut ge2 = vec![0u64; n_words];
+    for (i, &v) in row.iter().enumerate() {
+        if v > 0 {
+            ge1[i >> 6] |= 1u64 << (i & 63);
+        }
+        if v > 1 {
+            ge2[i >> 6] |= 1u64 << (i & 63);
+        }
+    }
+    (ge1, ge2)
+}
+
 /// Pre-compute per-word y sums: `y_word_sums[w] = Σ y[w*64 .. w*64+64]`.
 #[inline]
 fn build_y_word_sums(y: &[f64], n_samples: usize, n_words: usize) -> Vec<f64> {
@@ -229,6 +247,155 @@ fn centered_gain_from_counts(total_sum: f64, sum_hit: f64, n_samples: usize, n_h
     let raw = (n_samples as f64) * centered_sum_hit * centered_sum_hit
         / ((n_hit as f64) * (n_miss as f64));
     raw.max(0.0)
+}
+
+#[inline]
+fn dosage_centered_gain(
+    total_sum: f64,
+    sum_x: f64,
+    sum_x2: f64,
+    sum_xy: f64,
+    n_samples: usize,
+) -> f64 {
+    if n_samples == 0 {
+        return 0.0;
+    }
+    let n = n_samples as f64;
+    let ss_x = sum_x2 - (sum_x * sum_x) / n;
+    if !ss_x.is_finite() || ss_x <= 0.0 {
+        return 0.0;
+    }
+    let centered_xy = sum_xy - (sum_x * total_sum) / n;
+    let raw = centered_xy * centered_xy / ss_x;
+    if raw.is_finite() {
+        raw.max(0.0)
+    } else {
+        0.0
+    }
+}
+
+#[inline]
+fn dosage_stats_from_dense(row: &[u8], y: &[f64]) -> (f64, f64, f64) {
+    let mut sum_x = 0.0f64;
+    let mut sum_x2 = 0.0f64;
+    let mut sum_xy = 0.0f64;
+    for (i, &dose) in row.iter().enumerate() {
+        let x = f64::from(dose);
+        sum_x += x;
+        sum_x2 += x * x;
+        sum_xy += x * y[i];
+    }
+    (sum_x, sum_x2, sum_xy)
+}
+
+#[inline]
+fn dosage_stats_from_dual_packed(
+    ge1: &[u64],
+    ge2: &[u64],
+    y: &[f64],
+    y_word_sums: &[f64],
+    n_words: usize,
+    tail_mask: u64,
+) -> (f64, f64, f64) {
+    let (n_ge1, s_ge1) = count_sum_packed(ge1, y, y_word_sums, n_words, tail_mask);
+    let (n_ge2, s_ge2) = count_sum_packed(ge2, y, y_word_sums, n_words, tail_mask);
+    let sum_x = (n_ge1 + n_ge2) as f64;
+    let sum_x2 = (n_ge1 + 3 * n_ge2) as f64;
+    let sum_xy = s_ge1 + s_ge2;
+    (sum_x, sum_x2, sum_xy)
+}
+
+#[inline]
+fn dosage_score_from_dual_packed(
+    ge1: &[u64],
+    ge2: &[u64],
+    y: &[f64],
+    y_word_sums: &[f64],
+    n_words: usize,
+    tail_mask: u64,
+    total_sum: f64,
+    n_samples: usize,
+) -> f64 {
+    let (sum_x, sum_x2, sum_xy) =
+        dosage_stats_from_dual_packed(ge1, ge2, y, y_word_sums, n_words, tail_mask);
+    dosage_centered_gain(total_sum, sum_x, sum_x2, sum_xy, n_samples)
+}
+
+fn pair_scores_packed_dual(
+    pi_ge1: &[u64],
+    pi_ge2: &[u64],
+    pj_ge1: &[u64],
+    pj_ge2: &[u64],
+    scratch_ge1: &mut [u64],
+    scratch_ge2: &mut [u64],
+    y: &[f64],
+    y_word_sums: &[f64],
+    n_words: usize,
+    tail_mask: u64,
+    n_samples: usize,
+    total_sum: f64,
+) -> (f64, f64, f64, f64) {
+    for w in 0..n_words {
+        scratch_ge1[w] = pi_ge1[w] & pj_ge1[w];
+        scratch_ge2[w] = pi_ge2[w] & pj_ge2[w];
+    }
+    let gain_and = dosage_score_from_dual_packed(
+        scratch_ge1,
+        scratch_ge2,
+        y,
+        y_word_sums,
+        n_words,
+        tail_mask,
+        total_sum,
+        n_samples,
+    );
+
+    for w in 0..n_words {
+        scratch_ge1[w] = pi_ge1[w] | pj_ge1[w];
+        scratch_ge2[w] = pi_ge2[w] | pj_ge2[w];
+    }
+    let gain_or = dosage_score_from_dual_packed(
+        scratch_ge1,
+        scratch_ge2,
+        y,
+        y_word_sums,
+        n_words,
+        tail_mask,
+        total_sum,
+        n_samples,
+    );
+
+    for w in 0..n_words {
+        scratch_ge1[w] = pi_ge1[w] & !pj_ge2[w];
+        scratch_ge2[w] = pi_ge2[w] & !pj_ge1[w];
+    }
+    let gain_ij = dosage_score_from_dual_packed(
+        scratch_ge1,
+        scratch_ge2,
+        y,
+        y_word_sums,
+        n_words,
+        tail_mask,
+        total_sum,
+        n_samples,
+    );
+
+    for w in 0..n_words {
+        scratch_ge1[w] = !pi_ge2[w] & pj_ge1[w];
+        scratch_ge2[w] = !pi_ge1[w] & pj_ge2[w];
+    }
+    let gain_ji = dosage_score_from_dual_packed(
+        scratch_ge1,
+        scratch_ge2,
+        y,
+        y_word_sums,
+        n_words,
+        tail_mask,
+        total_sum,
+        n_samples,
+    );
+
+    (gain_and, gain_or, gain_ij, gain_ji)
 }
 
 /// All 4 AND-family subgroups for a feature pair:
@@ -474,6 +641,142 @@ fn feature_scores_pairwise_and_packed_core(
     final_scores
 }
 
+fn feature_scores_pairwise_and_packed_dual_core(
+    bits_ge1_flat: &[u64],
+    bits_ge2_flat: &[u64],
+    row_words: usize,
+    n_features: usize,
+    y: &[f64],
+    n_samples: usize,
+    precomputed_stage1: Option<(&[f64], &[f64], &[f64])>,
+) -> Vec<f64> {
+    if n_features == 0 {
+        return Vec::new();
+    }
+    let total_sum: f64 = y.iter().sum();
+    let n_words = row_words;
+    let rem = n_samples & 63;
+    let tail_mask = if rem == 0 {
+        u64::MAX
+    } else {
+        (1u64 << rem) - 1
+    };
+    let y_word_sums = build_y_word_sums(y, n_samples, n_words);
+
+    let t_marg = Instant::now();
+    let mut marginal_gain = vec![0.0f64; n_features];
+    let precomputed_stage1 = precomputed_stage1.and_then(|(sum_x, sum_x2, sum_xy)| {
+        if sum_x.len() >= n_features && sum_x2.len() >= n_features && sum_xy.len() >= n_features {
+            Some((sum_x, sum_x2, sum_xy))
+        } else {
+            None
+        }
+    });
+    if let Some((sum_x, sum_x2, sum_xy)) = precomputed_stage1 {
+        for i in 0..n_features {
+            marginal_gain[i] =
+                dosage_centered_gain(total_sum, sum_x[i], sum_x2[i], sum_xy[i], n_samples);
+        }
+    } else {
+        for i in 0..n_features {
+            let row_ge1 = &bits_ge1_flat[i * row_words..(i + 1) * row_words];
+            let row_ge2 = &bits_ge2_flat[i * row_words..(i + 1) * row_words];
+            let (sum_x, sum_x2, sum_xy) =
+                dosage_stats_from_dual_packed(row_ge1, row_ge2, y, &y_word_sums, n_words, tail_mask);
+            marginal_gain[i] = dosage_centered_gain(total_sum, sum_x, sum_x2, sum_xy, n_samples);
+        }
+    }
+
+    let max_candidates = pairwise_and_max_candidates();
+    let keep_n = max_candidates.min(n_features);
+    if keep_n < 2 {
+        return marginal_gain;
+    }
+    PW_MARGINAL_NS.fetch_add(elapsed_ns_sat(t_marg), Ordering::Relaxed);
+
+    let t_pack = Instant::now();
+    let top = topk_indices(&marginal_gain, keep_n);
+    let alpha = pairwise_and_alpha();
+    PW_PACK_NS.fetch_add(elapsed_ns_sat(t_pack), Ordering::Relaxed);
+
+    let t_kern = Instant::now();
+    let pairs: Vec<(usize, usize)> = (0..keep_n)
+        .flat_map(|a| ((a + 1)..keep_n).map(move |b| (a, b)))
+        .collect();
+    let grain = (pairs.len() / rayon::current_num_threads().max(1)).max(1);
+
+    let interaction_max: Vec<f64> = pairs
+        .par_chunks(grain)
+        .map(|chunk| {
+            let mut local_max = vec![0.0f64; n_features];
+            let mut scratch_ge1 = vec![0u64; n_words];
+            let mut scratch_ge2 = vec![0u64; n_words];
+            for &(a, b) in chunk {
+                let i = top[a];
+                let j = top[b];
+                let pi_ge1 = &bits_ge1_flat[i * row_words..(i + 1) * row_words];
+                let pi_ge2 = &bits_ge2_flat[i * row_words..(i + 1) * row_words];
+                let pj_ge1 = &bits_ge1_flat[j * row_words..(j + 1) * row_words];
+                let pj_ge2 = &bits_ge2_flat[j * row_words..(j + 1) * row_words];
+                let (gain_and, gain_or, gain_ij, gain_ji) = pair_scores_packed_dual(
+                    pi_ge1,
+                    pi_ge2,
+                    pj_ge1,
+                    pj_ge2,
+                    &mut scratch_ge1,
+                    &mut scratch_ge2,
+                    y,
+                    &y_word_sums,
+                    n_words,
+                    tail_mask,
+                    n_samples,
+                    total_sum,
+                );
+                let baseline = marginal_gain[i].max(marginal_gain[j]);
+                let best = (gain_and - baseline)
+                    .max(gain_or - baseline)
+                    .max(gain_ij - baseline)
+                    .max(gain_ji - baseline);
+                if best > local_max[i] {
+                    local_max[i] = best;
+                }
+                if best > local_max[j] {
+                    local_max[j] = best;
+                }
+            }
+            local_max
+        })
+        .reduce(
+            || vec![0.0f64; n_features],
+            |mut a, b| {
+                for i in 0..n_features {
+                    if b[i] > a[i] {
+                        a[i] = b[i];
+                    }
+                }
+                a
+            },
+        );
+
+    PW_KERNEL_NS.fetch_add(elapsed_ns_sat(t_kern), Ordering::Relaxed);
+    let t_comb = Instant::now();
+    let max_marginal = marginal_gain.iter().cloned().fold(0.0f64, f64::max);
+    let max_interaction = interaction_max.iter().cloned().fold(0.0f64, f64::max);
+    let scale = if max_interaction > 0.0 && max_marginal > 0.0 {
+        max_marginal / max_interaction
+    } else {
+        1.0
+    };
+
+    let mut final_scores = vec![0.0f64; n_features];
+    for i in 0..n_features {
+        let interaction_scaled = interaction_max[i] * scale;
+        final_scores[i] = (1.0 - alpha) * marginal_gain[i] + alpha * interaction_scaled;
+    }
+    PW_COMBINE_NS.fetch_add(elapsed_ns_sat(t_comb), Ordering::Relaxed);
+    final_scores
+}
+
 // ---------------------------------------------------------------------------
 // Packed-native entry point (used from Garfield fast path — no dense allocs)
 // ---------------------------------------------------------------------------
@@ -487,6 +790,25 @@ pub fn feature_scores_pairwise_and_packed(
     n_samples: usize,
 ) -> Vec<f64> {
     feature_scores_pairwise_and_packed_core(bits_flat, row_words, n_features, y, n_samples, None)
+}
+
+pub fn feature_scores_pairwise_and_packed_dual(
+    bits_ge1_flat: &[u64],
+    bits_ge2_flat: &[u64],
+    row_words: usize,
+    n_features: usize,
+    y: &[f64],
+    n_samples: usize,
+) -> Vec<f64> {
+    feature_scores_pairwise_and_packed_dual_core(
+        bits_ge1_flat,
+        bits_ge2_flat,
+        row_words,
+        n_features,
+        y,
+        n_samples,
+        None,
+    )
 }
 
 pub fn feature_scores_pairwise_and_packed_with_stage1(
@@ -505,6 +827,28 @@ pub fn feature_scores_pairwise_and_packed_with_stage1(
         y,
         n_samples,
         Some((feat_n_hit, feat_sum_hit)),
+    )
+}
+
+pub fn feature_scores_pairwise_and_packed_dual_with_stage1(
+    bits_ge1_flat: &[u64],
+    bits_ge2_flat: &[u64],
+    row_words: usize,
+    n_features: usize,
+    y: &[f64],
+    n_samples: usize,
+    feat_sum_x: &[f64],
+    feat_sum_x2: &[f64],
+    feat_sum_xy: &[f64],
+) -> Vec<f64> {
+    feature_scores_pairwise_and_packed_dual_core(
+        bits_ge1_flat,
+        bits_ge2_flat,
+        row_words,
+        n_features,
+        y,
+        n_samples,
+        Some((feat_sum_x, feat_sum_x2, feat_sum_xy)),
     )
 }
 
@@ -529,17 +873,13 @@ pub fn feature_scores_pairwise_and_flat(
     }
     let total_sum: f64 = y.iter().sum();
 
-    // ---- Stage 1: marginal from flat dense + cache counts -----------------
+    // ---- Stage 1: dosage-aware marginal from flat dense -------------------
     let t_marg = Instant::now();
     let mut marginal_gain = vec![0.0f64; n_features];
-    let mut feat_n_hit = vec![0usize; n_features];
-    let mut feat_sum_hit = vec![0.0f64; n_features];
     for i in 0..n_features {
         let row = &data[i * row_stride..][..n_samples];
-        let (n_hit, sum_hit) = count_sum_y_dense(row, y);
-        marginal_gain[i] = centered_gain_from_counts(total_sum, sum_hit, n_samples, n_hit);
-        feat_n_hit[i] = n_hit;
-        feat_sum_hit[i] = sum_hit;
+        let (sum_x, sum_x2, sum_xy) = dosage_stats_from_dense(row, y);
+        marginal_gain[i] = dosage_centered_gain(total_sum, sum_x, sum_x2, sum_xy, n_samples);
     }
     PW_MARGINAL_NS.fetch_add(elapsed_ns_sat(t_marg), Ordering::Relaxed);
 
@@ -564,14 +904,17 @@ pub fn feature_scores_pairwise_and_flat(
     };
     let y_word_sums = build_y_word_sums(y, n_samples, n_words);
 
-    let mut packed_top: Vec<Vec<u64>> = Vec::with_capacity(keep_n);
+    let mut packed_top_ge1: Vec<Vec<u64>> = Vec::with_capacity(keep_n);
+    let mut packed_top_ge2: Vec<Vec<u64>> = Vec::with_capacity(keep_n);
     for &fi in top.iter() {
         let row = &data[fi * row_stride..][..n_samples];
-        packed_top.push(pack_dense(row, n_words));
+        let (ge1, ge2) = pack_dense_dual(row, n_words);
+        packed_top_ge1.push(ge1);
+        packed_top_ge2.push(ge2);
     }
     PW_PACK_NS.fetch_add(elapsed_ns_sat(t_pack), Ordering::Relaxed);
 
-    // ---- Stage 2: pairwise via packed u64 (parallel, cached counts) --------
+    // ---- Stage 2: pairwise via dual packed u64 (parallel) -----------------
     let t_kern = Instant::now();
     let pairs: Vec<(usize, usize)> = (0..keep_n)
         .flat_map(|a| ((a + 1)..keep_n).map(move |b| (a, b)))
@@ -582,30 +925,32 @@ pub fn feature_scores_pairwise_and_flat(
         .par_chunks(grain)
         .map(|chunk| {
             let mut local_max = vec![0.0f64; n_features];
-            let mut local_scratch = vec![0u64; n_words];
+            let mut local_scratch_ge1 = vec![0u64; n_words];
+            let mut local_scratch_ge2 = vec![0u64; n_words];
             for &(a, b) in chunk {
                 let i = top[a];
                 let j = top[b];
-                let pi = &packed_top[a];
-                let pj = &packed_top[b];
-                let (gain_and, gain_nij, gain_ij, gain_ji) = pair_gains_packed_fast(
-                    pi,
-                    pj,
-                    &mut local_scratch,
+                let pi_ge1 = &packed_top_ge1[a];
+                let pi_ge2 = &packed_top_ge2[a];
+                let pj_ge1 = &packed_top_ge1[b];
+                let pj_ge2 = &packed_top_ge2[b];
+                let (gain_and, gain_or, gain_ij, gain_ji) = pair_scores_packed_dual(
+                    pi_ge1,
+                    pi_ge2,
+                    pj_ge1,
+                    pj_ge2,
+                    &mut local_scratch_ge1,
+                    &mut local_scratch_ge2,
                     y,
                     &y_word_sums,
                     n_words,
                     tail_mask,
                     n_samples,
                     total_sum,
-                    feat_n_hit[i],
-                    feat_sum_hit[i],
-                    feat_n_hit[j],
-                    feat_sum_hit[j],
                 );
                 let baseline = marginal_gain[i].max(marginal_gain[j]);
                 let best = (gain_and - baseline)
-                    .max(gain_nij - baseline)
+                    .max(gain_or - baseline)
                     .max(gain_ij - baseline)
                     .max(gain_ji - baseline);
                 if best > local_max[i] {
@@ -682,15 +1027,11 @@ pub fn feature_scores_pairwise_and_grouped(
     let n_samples = y.len();
     let total_sum: f64 = y.iter().sum();
 
-    // ---- Stage 1: marginal via dense scan + cache counts ------------------
+    // ---- Stage 1: dosage-aware marginal via dense scan --------------------
     let mut marginal_gain = vec![0.0f64; n_features];
-    let mut feat_n_hit = vec![0usize; n_features];
-    let mut feat_sum_hit = vec![0.0f64; n_features];
     for i in 0..n_features {
-        let (n_hit, sum_hit) = count_sum_y_dense(&x_rows[i], y);
-        marginal_gain[i] = centered_gain_from_counts(total_sum, sum_hit, n_samples, n_hit);
-        feat_n_hit[i] = n_hit;
-        feat_sum_hit[i] = sum_hit;
+        let (sum_x, sum_x2, sum_xy) = dosage_stats_from_dense(&x_rows[i], y);
+        marginal_gain[i] = dosage_centered_gain(total_sum, sum_x, sum_x2, sum_xy, n_samples);
     }
 
     let max_candidates = pairwise_and_max_candidates();
@@ -713,12 +1054,15 @@ pub fn feature_scores_pairwise_and_grouped(
     };
     let y_word_sums = build_y_word_sums(y, n_samples, n_words);
 
-    let mut packed_top: Vec<Vec<u64>> = Vec::with_capacity(keep_n);
+    let mut packed_top_ge1: Vec<Vec<u64>> = Vec::with_capacity(keep_n);
+    let mut packed_top_ge2: Vec<Vec<u64>> = Vec::with_capacity(keep_n);
     for &fi in top.iter() {
-        packed_top.push(pack_dense(&x_rows[fi], n_words));
+        let (ge1, ge2) = pack_dense_dual(&x_rows[fi], n_words);
+        packed_top_ge1.push(ge1);
+        packed_top_ge2.push(ge2);
     }
 
-    // ---- Stage 2: pairwise AND / OR / AND_NOT via packed u64 (parallel) ---
+    // ---- Stage 2: pairwise AND / OR / AND_NOT via dual packed u64 ---------
     let pairs: Vec<(usize, usize)> = (0..keep_n)
         .flat_map(|a| ((a + 1)..keep_n).map(move |b| (a, b)))
         .collect();
@@ -728,30 +1072,32 @@ pub fn feature_scores_pairwise_and_grouped(
         .par_chunks(grain)
         .map(|chunk| {
             let mut local_max = vec![0.0f64; n_features];
-            let mut local_scratch = vec![0u64; n_words];
+            let mut local_scratch_ge1 = vec![0u64; n_words];
+            let mut local_scratch_ge2 = vec![0u64; n_words];
             for &(a, b) in chunk {
                 let i = top[a];
                 let j = top[b];
-                let pi = &packed_top[a];
-                let pj = &packed_top[b];
-                let (gain_and, gain_nij, gain_ij, gain_ji) = pair_gains_packed_fast(
-                    pi,
-                    pj,
-                    &mut local_scratch,
+                let pi_ge1 = &packed_top_ge1[a];
+                let pi_ge2 = &packed_top_ge2[a];
+                let pj_ge1 = &packed_top_ge1[b];
+                let pj_ge2 = &packed_top_ge2[b];
+                let (gain_and, gain_or, gain_ij, gain_ji) = pair_scores_packed_dual(
+                    pi_ge1,
+                    pi_ge2,
+                    pj_ge1,
+                    pj_ge2,
+                    &mut local_scratch_ge1,
+                    &mut local_scratch_ge2,
                     y,
                     &y_word_sums,
                     n_words,
                     tail_mask,
                     n_samples,
                     total_sum,
-                    feat_n_hit[i],
-                    feat_sum_hit[i],
-                    feat_n_hit[j],
-                    feat_sum_hit[j],
                 );
                 let baseline = marginal_gain[i].max(marginal_gain[j]);
                 let best = (gain_and - baseline)
-                    .max(gain_nij - baseline)
+                    .max(gain_or - baseline)
                     .max(gain_ij - baseline)
                     .max(gain_ji - baseline);
                 if best > local_max[i] {
@@ -889,6 +1235,52 @@ mod tests {
         assert!(scores.len() == 2);
         assert!(scores[0].is_finite());
         assert!(scores[1].is_finite());
+    }
+
+    #[test]
+    fn test_pairwise_dual_packed_matches_dense_dosage() {
+        let y = vec![4.0, 1.0, -3.0, -2.0, 2.0, -4.0, 3.0, -1.0];
+        let x_rows = vec![
+            vec![0u8, 1, 2, 0, 1, 2, 0, 2],
+            vec![0u8, 0, 2, 1, 1, 2, 0, 1],
+        ];
+        let cfg = test_cfg();
+        let dense_scores =
+            feature_scores_pairwise_and_grouped(&x_rows, &y, ResponseKind::Continuous, cfg, None);
+
+        let n_samples = y.len();
+        let n_words = words_for_samples(n_samples);
+        let mut bits_ge1 = Vec::<u64>::new();
+        let mut bits_ge2 = Vec::<u64>::new();
+        let mut feat_sum_x = Vec::<f64>::new();
+        let mut feat_sum_x2 = Vec::<f64>::new();
+        let mut feat_sum_xy = Vec::<f64>::new();
+        for row in x_rows.iter() {
+            let (ge1, ge2) = pack_dense_dual(row, n_words);
+            bits_ge1.extend_from_slice(ge1.as_slice());
+            bits_ge2.extend_from_slice(ge2.as_slice());
+            let (sum_x, sum_x2, sum_xy) = dosage_stats_from_dense(row, &y);
+            feat_sum_x.push(sum_x);
+            feat_sum_x2.push(sum_x2);
+            feat_sum_xy.push(sum_xy);
+        }
+
+        let packed_scores = feature_scores_pairwise_and_packed_dual_with_stage1(
+            bits_ge1.as_slice(),
+            bits_ge2.as_slice(),
+            n_words,
+            x_rows.len(),
+            &y,
+            n_samples,
+            feat_sum_x.as_slice(),
+            feat_sum_x2.as_slice(),
+            feat_sum_xy.as_slice(),
+        );
+
+        assert_eq!(dense_scores.len(), packed_scores.len());
+        for i in 0..dense_scores.len() {
+            assert!((dense_scores[i] - packed_scores[i]).abs() < 1e-12);
+        }
     }
 
     #[test]

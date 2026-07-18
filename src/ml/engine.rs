@@ -6,7 +6,7 @@ use crate::ml::rf::{
     feature_scores_random_forest_grouped, feature_scores_random_forest_permutation_grouped,
 };
 use crate::ml::univariate::{
-    feature_scores_abs_corr_binary_x, feature_scores_abs_mcc_binary_x,
+    feature_scores_abs_corr_dosage_x, feature_scores_abs_mcc_binary_x,
     feature_scores_abs_mean_diff_binary_x, feature_scores_fisher_binary_x,
 };
 
@@ -129,7 +129,7 @@ pub fn compute_feature_scores_grouped(
             )
         }
         (MlEngine::Corr, ImportanceKind::Imp) | (MlEngine::Corr, ImportanceKind::Permutation) => {
-            feature_scores_abs_corr_binary_x(x_rows, y)
+            feature_scores_abs_corr_dosage_x(x_rows, y)
         }
         (MlEngine::Mcc, ImportanceKind::Imp) | (MlEngine::Mcc, ImportanceKind::Permutation) => {
             feature_scores_abs_mcc_binary_x(x_rows, y)

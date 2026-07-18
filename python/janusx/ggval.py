@@ -914,6 +914,10 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+def _garfield_avx2_bench_manifest(repo_root: Path) -> Path:
+    return repo_root / "bench" / "garfield_avx2" / "Cargo.toml"
+
+
 def _garfield_bench_env() -> dict[str, str]:
     proc_env: dict[str, str] = {}
     if sys.platform != "darwin" or os.environ.get("DYLD_FALLBACK_LIBRARY_PATH"):
@@ -955,25 +959,28 @@ def run_garfield_avx2_benchmark(outdir: Path, logdir: Path) -> None:
         fail("cargo command not found in PATH")
 
     repo_root = _repo_root()
-    if not (repo_root / "Cargo.toml").is_file():
-        fail(f"Cargo.toml not found at repository root: {repo_root}")
+    manifest_path = _garfield_avx2_bench_manifest(repo_root)
+    if not manifest_path.is_file():
+        fail(f"GARFIELD AVX2 benchmark manifest not found: {manifest_path}")
 
-    step("BENCH. Measure GARFIELD AVX2 sum_y hotspot")
+    step("BENCH. Measure GARFIELD AVX2 sum_y hotspot (standalone microbenchmark)")
     log_path = logdir / "garfield_avx2.bench.log"
+    target_dir = repo_root / "target" / "garfield_avx2_bench"
     cmd = [
         "cargo",
-        "test",
+        "run",
         "-q",
-        "garfield::score::tests::bench_sum_y_where_both1_backends",
+        "--release",
+        "--manifest-path",
+        str(manifest_path),
+        "--target-dir",
+        str(target_dir),
         "--",
-        "--ignored",
-        "--exact",
-        "--nocapture",
     ]
     try:
         run(
             cmd,
-            cwd=repo_root,
+            cwd=manifest_path.parent,
             stdout_path=log_path,
             stderr_to_stdout=True,
             env_overrides=_garfield_bench_env(),

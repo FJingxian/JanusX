@@ -1844,8 +1844,9 @@ def main() -> None:
     apply_outer_thread_cap(int(args.thread))
     if args.feature_source_requested == "mbin":
         logger.warning(
-            "MBIN encoding is deprecated for GARFIELD pure-line mode; using BIN instead "
-            "(heterozygotes and NA are both treated as missing before binary decoding)."
+            "MBIN encoding is deprecated for GARFIELD pure-line mode; using BIN instead. "
+            "Current BIN beam search preserves 0/1/2 dosage with fuzzy min/max/not logic; "
+            "only true missing calls are imputed during decoding."
         )
     if int(args.fold) < 2:
         logger.warning(

@@ -7,6 +7,7 @@ import importlib.util
 import json
 import math
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -141,10 +142,13 @@ def run(
     cwd: Path | None = None,
     stdout_path: Path | None = None,
     stderr_to_stdout: bool = False,
+    env_overrides: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     print(f"+ {cmd_to_text(cmd)}")
     proc_env = os.environ.copy()
     _apply_plotting_subprocess_env(proc_env, cmd)
+    if env_overrides:
+        proc_env.update(env_overrides)
     cwd_use = Path.cwd() if cwd is None else Path(cwd)
 
     if stdout_path is not None:
@@ -906,6 +910,96 @@ def check_jx_available() -> None:
     run(["jx", "--version"])
 
 
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def _garfield_bench_env() -> dict[str, str]:
+    proc_env: dict[str, str] = {}
+    if sys.platform != "darwin" or os.environ.get("DYLD_FALLBACK_LIBRARY_PATH"):
+        return proc_env
+
+    candidates: list[Path] = []
+    conda_prefix = os.environ.get("CONDA_PREFIX")
+    if conda_prefix:
+        candidates.append(Path(conda_prefix) / "lib")
+    candidates.extend(
+        [
+            Path(sys.prefix) / "lib",
+            Path.home() / "miniconda3" / "lib",
+            Path.home() / "anaconda3" / "lib",
+            Path.home() / "mambaforge" / "lib",
+        ]
+    )
+    seen: set[str] = set()
+    existing: list[str] = []
+    for candidate in candidates:
+        text = str(candidate)
+        if text in seen or not candidate.is_dir():
+            continue
+        seen.add(text)
+        existing.append(text)
+    if existing:
+        proc_env["DYLD_FALLBACK_LIBRARY_PATH"] = ":".join(existing)
+    return proc_env
+
+
+def run_garfield_avx2_benchmark(outdir: Path, logdir: Path) -> None:
+    arch = platform.machine().strip().lower()
+    if arch not in {"x86_64", "amd64"}:
+        fail(
+            "GARFIELD AVX2 benchmark requires a real x86_64 host. "
+            f"Current machine: {arch or 'unknown'}."
+        )
+    if shutil.which("cargo") is None:
+        fail("cargo command not found in PATH")
+
+    repo_root = _repo_root()
+    if not (repo_root / "Cargo.toml").is_file():
+        fail(f"Cargo.toml not found at repository root: {repo_root}")
+
+    step("BENCH. Measure GARFIELD AVX2 sum_y hotspot")
+    log_path = logdir / "garfield_avx2.bench.log"
+    cmd = [
+        "cargo",
+        "test",
+        "-q",
+        "garfield::score::tests::bench_sum_y_where_both1_backends",
+        "--",
+        "--ignored",
+        "--exact",
+        "--nocapture",
+    ]
+    try:
+        run(
+            cmd,
+            cwd=repo_root,
+            stdout_path=log_path,
+            stderr_to_stdout=True,
+            env_overrides=_garfield_bench_env(),
+        )
+    except subprocess.CalledProcessError:
+        print_log(log_path)
+        raise
+
+    text = ANSI_ESCAPE_RE.sub("", log_path.read_text(encoding="utf-8", errors="replace"))
+    bench_lines = [line.strip() for line in text.splitlines() if "[sum_y bench]" in line]
+    if not bench_lines:
+        print_log(log_path)
+        fail("GARFIELD AVX2 benchmark completed but produced no [sum_y bench] lines.")
+    if not any("avx2=" in line.lower() for line in bench_lines):
+        print_log(log_path)
+        fail(
+            "GARFIELD benchmark did not exercise the AVX2 path. "
+            "Confirm the host CPU exposes AVX2 and rerun on x86_64."
+        )
+
+    for line in bench_lines:
+        print(line)
+    print(f"Benchmark log: {log_path}")
+    sep()
+
+
 def _parse_pca_eigh_backend(log_path: Path) -> str:
     text = log_path.read_text(encoding="utf-8", errors="replace")
     patterns = [
@@ -1665,6 +1759,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Run only the multicore GRM/EIGH benchmark suite with a larger benchmark dataset.",
     )
+    parser.add_argument(
+        "-tgarfield-avx2",
+        "--garfield-avx2",
+        action="store_true",
+        help="Run only the GARFIELD AVX2 microbenchmark on x86_64 and print the scalar-vs-AVX2 timing summary.",
+    )
     return parser.parse_args()
 
 
@@ -1680,6 +1780,18 @@ def main() -> int:
 
     outdir.mkdir(parents=True, exist_ok=True)
     logdir.mkdir(parents=True, exist_ok=True)
+
+    if args.garfield_avx2:
+        if args.multicore or args.only is not None or args.skip is not None:
+            fail("-tgarfield-avx2 cannot be combined with --multicore, --only, or --skip.")
+        run_garfield_avx2_benchmark(outdir, logdir)
+        step("Validation completed")
+        print("Mode      : garfield-avx2")
+        print("Suites    : garfield-avx2")
+        print(f"Output dir: {outdir}")
+        print(f"Log dir   : {logdir}")
+        print("Status    : garfield-avx2 -> ok")
+        return 0
 
     check_jx_available()
     if args.multicore:

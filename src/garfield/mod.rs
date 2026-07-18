@@ -7,6 +7,8 @@ mod score_gpu;
 
 use self::bs::{beam_search_and_binary_mcc, beam_search_and_continuous_abs_corr, BeamAndResult};
 use self::bs::{
+    beam_search_train_test_continuous_fuzzy, evaluate_rule_continuous_dual,
+    materialize_rule_bits_dual,
     beam_search_train_test_continuous_with_literal_scores,
     precompute_literal_singleton_scores_batched, LiteralScoreBatchRequest, LiteralSingletonScore,
 };
@@ -2005,6 +2007,7 @@ struct GarfieldLogicUnit {
 #[derive(Clone, Debug)]
 struct GarfieldLogicBits {
     bits_flat: Vec<u64>,
+    bits_hi_flat: Option<Vec<u64>>,
     row_words: usize,
     sample_ids: Vec<String>,
     sites: Vec<GarfieldLogicSite>,
@@ -2021,10 +2024,13 @@ struct GarfieldUnitPrepared {
 #[derive(Clone, Debug)]
 struct GarfieldUnitBitMatrices {
     train_bits: Vec<u64>,
+    train_bits_hi: Option<Vec<u64>>,
     row_words_train: usize,
     test_bits: Option<Vec<u64>>,
+    test_bits_hi: Option<Vec<u64>>,
     row_words_test: usize,
     selected_bits_full: Option<Vec<u64>>,
+    selected_bits_full_hi: Option<Vec<u64>>,
 }
 
 impl GarfieldUnitBitMatrices {
@@ -2033,6 +2039,63 @@ impl GarfieldUnitBitMatrices {
         self.test_bits
             .as_deref()
             .unwrap_or(self.train_bits.as_slice())
+    }
+
+    #[inline]
+    fn test_bits_hi(&self) -> Option<&[u64]> {
+        self.test_bits_hi
+            .as_deref()
+            .or(self.train_bits_hi.as_deref())
+    }
+
+    #[inline]
+    fn has_fuzzy_bin(&self) -> bool {
+        self.train_bits_hi.is_some()
+    }
+}
+
+fn beam_search_train_test_continuous_dispatch(
+    y_train: &[f64],
+    prepared_bits: &GarfieldUnitBitMatrices,
+    n_rows: usize,
+    y_test: &[f64],
+    group_ids: &[usize],
+    params: BeamSearchParams,
+) -> Result<Vec<BeamRuleCandidate>, String> {
+    if let Some(train_hi) = prepared_bits.train_bits_hi.as_deref() {
+        let test_hi = prepared_bits.test_bits_hi().ok_or_else(|| {
+            "internal error: fuzzy GARFIELD prepared bits are missing test high bitplane"
+                .to_string()
+        })?;
+        beam_search_train_test_continuous_fuzzy(
+            y_train,
+            prepared_bits.train_bits.as_slice(),
+            train_hi,
+            prepared_bits.row_words_train,
+            n_rows,
+            y_train.len(),
+            y_test,
+            prepared_bits.test_bits(),
+            test_hi,
+            prepared_bits.row_words_test,
+            y_test.len(),
+            group_ids,
+            params,
+        )
+    } else {
+        beam_search_train_test_continuous(
+            y_train,
+            prepared_bits.train_bits.as_slice(),
+            prepared_bits.row_words_train,
+            n_rows,
+            y_train.len(),
+            y_test,
+            prepared_bits.test_bits(),
+            prepared_bits.row_words_test,
+            y_test.len(),
+            group_ids,
+            params,
+        )
     }
 }
 
@@ -2169,6 +2232,32 @@ fn materialize_prepared_bit_matrices(
             logic_bits.n_samples,
         )?
     };
+    let train_bits_hi = if let Some(bits_hi_flat) = logic_bits.bits_hi_flat.as_ref() {
+        Some(if let Some((row_start, row_end)) = contiguous {
+            packed_rows_subset_from_full_bits_range(
+                bits_hi_flat.as_slice(),
+                logic_bits.row_words,
+                row_start,
+                row_end,
+                train_idx_local,
+                logic_bits.sites.len(),
+                logic_bits.n_samples,
+            )?
+            .0
+        } else {
+            packed_rows_subset_from_full_bits(
+                bits_hi_flat.as_slice(),
+                logic_bits.row_words,
+                prepared.selected_global_rows.as_slice(),
+                train_idx_local,
+                logic_bits.sites.len(),
+                logic_bits.n_samples,
+            )?
+            .0
+        })
+    } else {
+        None
+    };
     let (test_bits, row_words_test) = if train_idx_local == test_idx_local {
         (None, row_words_train)
     } else if let Some((row_start, row_end)) = contiguous {
@@ -2193,6 +2282,34 @@ fn materialize_prepared_bit_matrices(
         )?;
         (Some(bits), row_words_test)
     };
+    let test_bits_hi = if let Some(bits_hi_flat) = logic_bits.bits_hi_flat.as_ref() {
+        if train_idx_local == test_idx_local {
+            None
+        } else if let Some((row_start, row_end)) = contiguous {
+            let (bits, _) = packed_rows_subset_from_full_bits_range(
+                bits_hi_flat.as_slice(),
+                logic_bits.row_words,
+                row_start,
+                row_end,
+                test_idx_local,
+                logic_bits.sites.len(),
+                logic_bits.n_samples,
+            )?;
+            Some(bits)
+        } else {
+            let (bits, _) = packed_rows_subset_from_full_bits(
+                bits_hi_flat.as_slice(),
+                logic_bits.row_words,
+                prepared.selected_global_rows.as_slice(),
+                test_idx_local,
+                logic_bits.sites.len(),
+                logic_bits.n_samples,
+            )?;
+            Some(bits)
+        }
+    } else {
+        None
+    };
     let selected_bits_full = if include_full_bits {
         Some(if let Some((row_start, row_end)) = contiguous {
             gather_rows_by_range(
@@ -2213,12 +2330,39 @@ fn materialize_prepared_bit_matrices(
     } else {
         None
     };
+    let selected_bits_full_hi = if include_full_bits {
+        if let Some(bits_hi_flat) = logic_bits.bits_hi_flat.as_ref() {
+            Some(if let Some((row_start, row_end)) = contiguous {
+                gather_rows_by_range(
+                    bits_hi_flat.as_slice(),
+                    logic_bits.row_words,
+                    row_start,
+                    row_end,
+                    "garfield::unit_bits_hi_range",
+                )?
+            } else {
+                gather_rows_by_indices(
+                    bits_hi_flat.as_slice(),
+                    logic_bits.row_words,
+                    prepared.selected_global_rows.as_slice(),
+                    "garfield::unit_bits_hi_indices",
+                )?
+            })
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     Ok(GarfieldUnitBitMatrices {
         train_bits,
+        train_bits_hi,
         row_words_train,
         test_bits,
+        test_bits_hi,
         row_words_test,
         selected_bits_full,
+        selected_bits_full_hi,
     })
 }
 
@@ -2253,12 +2397,13 @@ struct GarfieldLogicRuleRecord {
     delta_score: String,
     delta_pwald: String,
     full_bits: Vec<u64>,
+    full_ge2_bits: Option<Vec<u64>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GarfieldRuleDisplayPolarity {
-    OriginalAnd,
-    ComplementOr,
+    Original,
+    Complement,
 }
 
 #[derive(Clone, Debug)]
@@ -2431,31 +2576,35 @@ fn literal_metric_token(value: f64, negated: bool) -> String {
 
 #[inline]
 fn logic_symbol_for_display(
-    _op: BeamBinaryOp,
+    op: BeamBinaryOp,
     polarity: GarfieldRuleDisplayPolarity,
 ) -> &'static str {
-    match polarity {
-        GarfieldRuleDisplayPolarity::OriginalAnd => "&",
-        GarfieldRuleDisplayPolarity::ComplementOr => "|",
+    match (op, polarity) {
+        (BeamBinaryOp::And, GarfieldRuleDisplayPolarity::Original)
+        | (BeamBinaryOp::Or, GarfieldRuleDisplayPolarity::Complement) => "&",
+        (BeamBinaryOp::Or, GarfieldRuleDisplayPolarity::Original)
+        | (BeamBinaryOp::And, GarfieldRuleDisplayPolarity::Complement) => "|",
     }
 }
 
 #[inline]
 fn expr_symbol_for_display(
-    _op: BeamBinaryOp,
+    op: BeamBinaryOp,
     polarity: GarfieldRuleDisplayPolarity,
 ) -> &'static str {
-    match polarity {
-        GarfieldRuleDisplayPolarity::OriginalAnd => "AND",
-        GarfieldRuleDisplayPolarity::ComplementOr => "OR",
+    match (op, polarity) {
+        (BeamBinaryOp::And, GarfieldRuleDisplayPolarity::Original)
+        | (BeamBinaryOp::Or, GarfieldRuleDisplayPolarity::Complement) => "AND",
+        (BeamBinaryOp::Or, GarfieldRuleDisplayPolarity::Original)
+        | (BeamBinaryOp::And, GarfieldRuleDisplayPolarity::Complement) => "OR",
     }
 }
 
 #[inline]
 fn display_literal_negated(literal_negated: bool, polarity: GarfieldRuleDisplayPolarity) -> bool {
     match polarity {
-        GarfieldRuleDisplayPolarity::OriginalAnd => literal_negated,
-        GarfieldRuleDisplayPolarity::ComplementOr => !literal_negated,
+        GarfieldRuleDisplayPolarity::Original => literal_negated,
+        GarfieldRuleDisplayPolarity::Complement => !literal_negated,
     }
 }
 
@@ -2465,25 +2614,45 @@ fn complement_bits_in_place(bits: &mut [u64], n_samples: usize) {
 }
 
 #[inline]
+fn complement_dual_bits_in_place(ge1_bits: &mut [u64], ge2_bits: &mut [u64], n_samples: usize) {
+    let orig_ge1 = ge1_bits.to_vec();
+    let orig_ge2 = ge2_bits.to_vec();
+    for (dst, &src) in ge1_bits.iter_mut().zip(orig_ge2.iter()) {
+        *dst = src;
+    }
+    for (dst, &src) in ge2_bits.iter_mut().zip(orig_ge1.iter()) {
+        *dst = src;
+    }
+    bitnot_masked(ge1_bits, n_samples);
+    bitnot_masked(ge2_bits, n_samples);
+}
+
+#[inline]
 fn preferred_display_polarity(
     rule: &BeamRule,
     full_bits: &[u64],
     n_samples: usize,
 ) -> GarfieldRuleDisplayPolarity {
+    if rule.rest.len() > 1 {
+        let first_op = rule.rest[0].0;
+        if !rule.rest.iter().all(|(op, _)| *op == first_op) {
+            return GarfieldRuleDisplayPolarity::Original;
+        }
+    }
     let orig_not = rule.not_count();
     let comp_not = rule.len().saturating_sub(orig_not);
     if comp_not < orig_not {
-        return GarfieldRuleDisplayPolarity::ComplementOr;
+        return GarfieldRuleDisplayPolarity::Complement;
     }
     if comp_not > orig_not {
-        return GarfieldRuleDisplayPolarity::OriginalAnd;
+        return GarfieldRuleDisplayPolarity::Original;
     }
     let n_hit = support_size_packed(full_bits, n_samples);
     let n_miss = n_samples.saturating_sub(n_hit);
     if n_miss < n_hit {
-        GarfieldRuleDisplayPolarity::ComplementOr
+        GarfieldRuleDisplayPolarity::Complement
     } else {
-        GarfieldRuleDisplayPolarity::OriginalAnd
+        GarfieldRuleDisplayPolarity::Original
     }
 }
 
@@ -2590,9 +2759,11 @@ fn build_rule_delta_annotations(
     child_pwald: f64,
     y_test: &[f64],
     bits_test: &[u64],
+    bits_test_hi: Option<&[u64]>,
     row_words_test: usize,
     assoc_y: &[f64],
     bits_full: &[u64],
+    bits_full_hi: Option<&[u64]>,
     row_words_full: usize,
     n_rows: usize,
     n_test: usize,
@@ -2615,16 +2786,30 @@ fn build_rule_delta_annotations(
             ..lit
         };
         let singleton = singleton_rule_from_literal(display_lit);
-        let test_sc = evaluate_rule_continuous(
-            &singleton,
-            y_test,
-            bits_test,
-            row_words_test,
-            n_rows,
-            n_test,
-            params.lambda_len,
-            params.lambda_not,
-        )?;
+        let test_sc = if let Some(bits_test_hi_use) = bits_test_hi {
+            evaluate_rule_continuous_dual(
+                &singleton,
+                y_test,
+                bits_test,
+                bits_test_hi_use,
+                row_words_test,
+                n_rows,
+                n_test,
+                params.lambda_len,
+                params.lambda_not,
+            )?
+        } else {
+            evaluate_rule_continuous(
+                &singleton,
+                y_test,
+                bits_test,
+                row_words_test,
+                n_rows,
+                n_test,
+                params.lambda_len,
+                params.lambda_not,
+            )?
+        };
         let bucket = bucket_from_rule(&singleton, test_sc.support_frac);
         let single_score = rank_rule_score_components_with_bucket(
             bucket,
@@ -2635,13 +2820,30 @@ fn build_rule_delta_annotations(
             params,
             false,
         );
-        let singleton_bits =
-            materialize_rule_bits(&singleton, bits_full, row_words_full, n_rows, n_full)?;
-        let single_assoc = fit_binary_rule_wald_from_bits(
-            assoc_y,
-            singleton_bits.as_slice(),
-            assoc_sample_indices,
-        );
+        let single_assoc = if let Some(bits_full_hi_use) = bits_full_hi {
+            let (singleton_ge1, singleton_ge2) = materialize_rule_bits_dual(
+                &singleton,
+                bits_full,
+                bits_full_hi_use,
+                row_words_full,
+                n_rows,
+                n_full,
+            )?;
+            fit_additive_rule_wald_from_dual_bits(
+                assoc_y,
+                singleton_ge1.as_slice(),
+                singleton_ge2.as_slice(),
+                assoc_sample_indices,
+            )
+        } else {
+            let singleton_bits =
+                materialize_rule_bits(&singleton, bits_full, row_words_full, n_rows, n_full)?;
+            fit_binary_rule_wald_from_bits(
+                assoc_y,
+                singleton_bits.as_slice(),
+                assoc_sample_indices,
+            )
+        };
         score_txt.push_str(&literal_metric_token(single_score, display_lit.negated));
         pwald_txt.push_str(&literal_metric_token(
             single_assoc.pwald,
@@ -3587,6 +3789,7 @@ fn evaluate_simbench_terms(
                 format_delta_metric_value(assoc.pwald)
             ),
             full_bits,
+            full_ge2_bits: None,
         });
     }
     Ok(out)
@@ -3635,6 +3838,73 @@ fn fit_binary_rule_wald_from_bits(
     let sse_miss = (ss_miss - (sum_miss * sum_miss) / n_miss as f64).max(0.0);
     let sigma2 = (sse_hit + sse_miss) / (df as f64);
     let se2 = sigma2 * ((1.0 / n_hit as f64) + (1.0 / n_miss as f64));
+    if !se2.is_finite() || se2 < 0.0 {
+        return nan_garfield_rule_wald();
+    }
+    if se2 == 0.0 {
+        if beta.abs() <= 1e-15 {
+            return GarfieldRuleWald {
+                beta,
+                se: 0.0,
+                chisq: 0.0,
+                pwald: 1.0,
+            };
+        }
+        return GarfieldRuleWald {
+            beta,
+            se: 0.0,
+            chisq: f64::INFINITY,
+            pwald: f64::MIN_POSITIVE,
+        };
+    }
+    let se = se2.sqrt();
+    let t = beta / se;
+    GarfieldRuleWald {
+        beta,
+        se,
+        chisq: t * t,
+        pwald: student_t_p_two_sided(t, df),
+    }
+}
+
+fn fit_additive_rule_wald_from_dual_bits(
+    y: &[f64],
+    ge1_bits: &[u64],
+    ge2_bits: &[u64],
+    sample_indices: &[usize],
+) -> GarfieldRuleWald {
+    if y.len() != sample_indices.len() || y.len() < 3 {
+        return nan_garfield_rule_wald();
+    }
+    let n = y.len() as f64;
+    let mut sx = 0.0_f64;
+    let mut sy = 0.0_f64;
+    let mut sxx = 0.0_f64;
+    let mut sxy = 0.0_f64;
+    let mut syy = 0.0_f64;
+    for (&yv, &idx) in y.iter().zip(sample_indices.iter()) {
+        let ge1 = ((ge1_bits[idx >> 6] >> (idx & 63)) & 1u64) as f64;
+        let ge2 = ((ge2_bits[idx >> 6] >> (idx & 63)) & 1u64) as f64;
+        let x = ge1 + ge2;
+        sx += x;
+        sy += yv;
+        sxx += x * x;
+        sxy += x * yv;
+        syy += yv * yv;
+    }
+    let sxx_centered = sxx - (sx * sx) / n;
+    if !(sxx_centered > 0.0) {
+        return nan_garfield_rule_wald();
+    }
+    let beta = (sxy - (sx * sy) / n) / sxx_centered;
+    let alpha = (sy - beta * sx) / n;
+    let sse = (syy - alpha * sy - beta * sxy).max(0.0);
+    let df = (y.len() as i32) - 2;
+    if df <= 0 {
+        return nan_garfield_rule_wald();
+    }
+    let sigma2 = sse / (df as f64);
+    let se2 = sigma2 / sxx_centered;
     if !se2.is_finite() || se2 < 0.0 {
         return nan_garfield_rule_wald();
     }
@@ -4292,6 +4562,7 @@ fn fill_bin_logic_row_bits(
 }
 
 #[inline]
+#[allow(dead_code)]
 fn fill_bin_logic_row_bits_pure_line(
     row: &[u8],
     flip: bool,
@@ -4305,6 +4576,50 @@ fn fill_bin_logic_row_bits_pure_line(
             let is_one = if flip { code == 0b00 } else { code == 0b11 };
             if is_one {
                 dst_words[entry.dst_word_idx[lane]] |= entry.dst_bit[lane];
+            }
+        }
+    }
+}
+
+#[inline]
+fn fill_bin_logic_row_bits_fuzzy(
+    row: &[u8],
+    flip: bool,
+    sample_plan: &[LogicSamplePlanEntry],
+    ge1_words: &mut [u64],
+    ge2_words: &mut [u64],
+) {
+    let mut c0 = 0usize;
+    let mut c1 = 0usize;
+    let mut c2 = 0usize;
+    for entry in sample_plan.iter() {
+        let byte = row[entry.src_byte_idx];
+        for lane in 0..entry.n_lanes as usize {
+            match decode_logic_bin_genotype((byte >> entry.src_shifts[lane]) & 0b11, flip) {
+                Some(0) => c0 += 1,
+                Some(1) => c1 += 1,
+                Some(2) => c2 += 1,
+                _ => {}
+            }
+        }
+    }
+    let mode3 = if c2 >= c1 && c2 >= c0 {
+        2u8
+    } else if c1 >= c0 {
+        1u8
+    } else {
+        0u8
+    };
+    for entry in sample_plan.iter() {
+        let byte = row[entry.src_byte_idx];
+        for lane in 0..entry.n_lanes as usize {
+            let g = decode_logic_bin_genotype((byte >> entry.src_shifts[lane]) & 0b11, flip)
+                .unwrap_or(mode3);
+            if g >= 1 {
+                ge1_words[entry.dst_word_idx[lane]] |= entry.dst_bit[lane];
+            }
+            if g >= 2 {
+                ge2_words[entry.dst_word_idx[lane]] |= entry.dst_bit[lane];
             }
         }
     }
@@ -4415,21 +4730,47 @@ fn convert_prepared_bed_to_logic_bits(
     let out_sites = build_logic_sites_from_metadata(sites, mode);
     let n_rows = out_sites.len();
     let mut bits_flat = vec![0u64; n_rows.saturating_mul(row_words)];
-    bits_flat
-        .par_chunks_mut(row_mul * row_words)
-        .zip(row_flip.par_iter().copied())
-        .zip(packed.par_chunks(bytes_per_snp))
-        .for_each(|((dst_rows, flip), row)| match mode {
-            GarfieldBinMode::Bin => {
-                fill_bin_logic_row_bits_pure_line(row, flip, sample_plan.as_slice(), dst_rows)
-            }
-            GarfieldBinMode::Mbin => {
-                fill_mbin_logic_row_bits(row, flip, sample_plan.as_slice(), row_words, dst_rows)
-            }
-        });
+    let mut bits_hi_flat = match mode {
+        GarfieldBinMode::Bin => Some(vec![0u64; n_rows.saturating_mul(row_words)]),
+        GarfieldBinMode::Mbin => None,
+    };
+    match bits_hi_flat.as_mut() {
+        Some(bits_hi) => {
+            bits_flat
+                .par_chunks_mut(row_words)
+                .zip(bits_hi.par_chunks_mut(row_words))
+                .zip(row_flip.par_iter().copied())
+                .zip(packed.par_chunks(bytes_per_snp))
+                .for_each(|(((dst_rows, dst_hi_rows), flip), row)| {
+                    fill_bin_logic_row_bits_fuzzy(
+                        row,
+                        flip,
+                        sample_plan.as_slice(),
+                        dst_rows,
+                        dst_hi_rows,
+                    )
+                });
+        }
+        None => {
+            bits_flat
+                .par_chunks_mut(row_mul * row_words)
+                .zip(row_flip.par_iter().copied())
+                .zip(packed.par_chunks(bytes_per_snp))
+                .for_each(|((dst_rows, flip), row)| {
+                    fill_mbin_logic_row_bits(
+                        row,
+                        flip,
+                        sample_plan.as_slice(),
+                        row_words,
+                        dst_rows,
+                    )
+                });
+        }
+    }
 
     Ok(GarfieldLogicBits {
         bits_flat,
+        bits_hi_flat,
         row_words,
         sample_ids: sample_ids.to_vec(),
         sites: out_sites,
@@ -4497,6 +4838,10 @@ fn convert_bed_prefix_to_logic_bits(
     drop(sites);
     let n_rows = out_sites.len();
     let mut bits_flat = vec![0u64; n_rows.saturating_mul(row_words)];
+    let mut bits_hi_flat = match mode {
+        GarfieldBinMode::Bin => Some(vec![0u64; n_rows.saturating_mul(row_words)]),
+        GarfieldBinMode::Mbin => None,
+    };
     if let Some(tracker) = mem_tracker {
         tracker.sample_now();
     }
@@ -4554,32 +4899,50 @@ fn convert_bed_prefix_to_logic_bits(
         }
 
         let bed_ref: &BedSnpIter = &bed_iter;
-        bits_flat[kept_start * row_mul * row_words..kept_end * row_mul * row_words]
-            .par_chunks_mut(row_mul * row_words)
-            .enumerate()
-            .for_each(|(off, dst_rows)| {
-                let kept_idx = kept_start + off;
-                let src_row = row_source_indices[kept_idx];
-                let flip = row_flip[kept_idx];
-                let row = bed_ref
-                    .packed_snp_bytes_at(src_row)
-                    .expect("windowed BED logic conversion row should be mapped");
-                match mode {
-                    GarfieldBinMode::Bin => fill_bin_logic_row_bits_pure_line(
+        let dst_lo = &mut bits_flat[kept_start * row_mul * row_words..kept_end * row_mul * row_words];
+        let dst_hi_opt = bits_hi_flat.as_mut().map(|v| {
+            &mut v[kept_start * row_mul * row_words..kept_end * row_mul * row_words]
+        });
+        if let Some(dst_hi) = dst_hi_opt {
+            dst_lo
+                .par_chunks_mut(row_mul * row_words)
+                .zip(dst_hi.par_chunks_mut(row_words))
+                .enumerate()
+                .for_each(|(off, (dst_rows, dst_hi_rows))| {
+                    let kept_idx = kept_start + off;
+                    let src_row = row_source_indices[kept_idx];
+                    let flip = row_flip[kept_idx];
+                    let row = bed_ref
+                        .packed_snp_bytes_at(src_row)
+                        .expect("windowed BED logic conversion row should be mapped");
+                    fill_bin_logic_row_bits_fuzzy(
                         row,
                         flip,
                         sample_plan.as_slice(),
                         dst_rows,
-                    ),
-                    GarfieldBinMode::Mbin => fill_mbin_logic_row_bits(
+                        dst_hi_rows,
+                    );
+                });
+        } else {
+            dst_lo
+                .par_chunks_mut(row_mul * row_words)
+                .enumerate()
+                .for_each(|(off, dst_rows)| {
+                    let kept_idx = kept_start + off;
+                    let src_row = row_source_indices[kept_idx];
+                    let flip = row_flip[kept_idx];
+                    let row = bed_ref
+                        .packed_snp_bytes_at(src_row)
+                        .expect("windowed BED logic conversion row should be mapped");
+                    fill_mbin_logic_row_bits(
                         row,
                         flip,
                         sample_plan.as_slice(),
                         row_words,
                         dst_rows,
-                    ),
-                }
-            });
+                    );
+                });
+        }
         if let Some(tracker) = mem_tracker {
             tracker.sample_now();
         }
@@ -4588,6 +4951,7 @@ fn convert_bed_prefix_to_logic_bits(
 
     Ok(GarfieldLogicBits {
         bits_flat,
+        bits_hi_flat,
         row_words,
         sample_ids: sample_ids.to_vec(),
         sites: out_sites,
@@ -5583,16 +5947,11 @@ fn collect_rule_permutation_nulls_for_repeat(
     } else {
         perm_train.clone()
     };
-    let perm_hits = beam_search_train_test_continuous(
+    let perm_hits = beam_search_train_test_continuous_dispatch(
         perm_train.as_slice(),
-        prepared_bits.train_bits.as_slice(),
-        prepared_bits.row_words_train,
+        prepared_bits,
         prepared.selected_global_rows.len(),
-        y_train.len(),
         perm_test.as_slice(),
-        prepared_bits.test_bits(),
-        prepared_bits.row_words_test,
-        y_test.len(),
         prepared.local_groups.as_slice(),
         beam_params,
     )?;
@@ -5747,9 +6106,23 @@ fn collect_rule_structure_posterior_for_repeat(
         )?;
         bits
     };
+    let boot_train_bits_hi = if let Some(train_bits_hi) = prepared_bits.train_bits_hi.as_deref() {
+        let row_indices = (0..prepared.selected_global_rows.len()).collect::<Vec<_>>();
+        let (bits, _) = packed_rows_subset_from_full_bits(
+            train_bits_hi,
+            prepared_bits.row_words_train,
+            row_indices.as_slice(),
+            boot_train_idx.as_slice(),
+            prepared.selected_global_rows.len(),
+            y_train.len(),
+        )?;
+        Some(bits)
+    } else {
+        None
+    };
     let boot_row_words_train = words_for_samples(boot_y_train.len());
 
-    let (boot_y_test, boot_test_bits, boot_row_words_test) = if split_applied {
+    let (boot_y_test, boot_test_bits, boot_test_bits_hi, boot_row_words_test) = if split_applied {
         if y_test.is_empty() {
             return Ok(Vec::new());
         }
@@ -5765,29 +6138,64 @@ fn collect_rule_structure_posterior_for_repeat(
             prepared.selected_global_rows.len(),
             y_test.len(),
         )?;
+        let bits_hi = if let Some(test_bits_hi) = prepared_bits.test_bits_hi() {
+            let (bits_hi, _) = packed_rows_subset_from_full_bits(
+                test_bits_hi,
+                prepared_bits.row_words_test,
+                row_indices.as_slice(),
+                boot_test_idx.as_slice(),
+                prepared.selected_global_rows.len(),
+                y_test.len(),
+            )?;
+            Some(bits_hi)
+        } else {
+            None
+        };
         let boot_row_words_test = words_for_samples(boot_y_test.len());
-        (boot_y_test, bits, boot_row_words_test)
+        (boot_y_test, bits, bits_hi, boot_row_words_test)
     } else {
         (
             boot_y_train.clone(),
             boot_train_bits.clone(),
+            boot_train_bits_hi.clone(),
             boot_row_words_train,
         )
     };
 
-    let perm_hits = beam_search_train_test_continuous(
-        boot_y_train.as_slice(),
-        boot_train_bits.as_slice(),
-        boot_row_words_train,
-        prepared.selected_global_rows.len(),
-        boot_y_train.len(),
-        boot_y_test.as_slice(),
-        boot_test_bits.as_slice(),
-        boot_row_words_test,
-        boot_y_test.len(),
-        prepared.local_groups.as_slice(),
-        beam_params,
-    )?;
+    let perm_hits = if let Some(boot_train_hi) = boot_train_bits_hi.as_ref() {
+        let boot_test_hi = boot_test_bits_hi.as_ref().ok_or_else(|| {
+            "internal error: fuzzy bootstrap test bitplane missing".to_string()
+        })?;
+        beam_search_train_test_continuous_fuzzy(
+            boot_y_train.as_slice(),
+            boot_train_bits.as_slice(),
+            boot_train_hi.as_slice(),
+            boot_row_words_train,
+            prepared.selected_global_rows.len(),
+            boot_y_train.len(),
+            boot_y_test.as_slice(),
+            boot_test_bits.as_slice(),
+            boot_test_hi.as_slice(),
+            boot_row_words_test,
+            boot_y_test.len(),
+            prepared.local_groups.as_slice(),
+            beam_params,
+        )?
+    } else {
+        beam_search_train_test_continuous(
+            boot_y_train.as_slice(),
+            boot_train_bits.as_slice(),
+            boot_row_words_train,
+            prepared.selected_global_rows.len(),
+            boot_y_train.len(),
+            boot_y_test.as_slice(),
+            boot_test_bits.as_slice(),
+            boot_row_words_test,
+            boot_y_test.len(),
+            prepared.local_groups.as_slice(),
+            beam_params,
+        )?
+    };
 
     if perm_hits.is_empty() {
         return Ok(Vec::new());
@@ -5964,7 +6372,16 @@ fn evaluate_logic_unit_prepared_continuous(
     unit_kind_lc: &str,
     literal_scores: Option<&[LiteralSingletonScore]>,
 ) -> Result<Vec<GarfieldLogicRuleRecord>, String> {
-    let beam_hits = if let Some(scores) = literal_scores {
+    let beam_hits = if prepared_bits.has_fuzzy_bin() {
+        beam_search_train_test_continuous_dispatch(
+            y_train,
+            prepared_bits,
+            prepared.selected_global_rows.len(),
+            y_test,
+            prepared.local_groups.as_slice(),
+            beam_params.clone(),
+        )?
+    } else if let Some(scores) = literal_scores {
         beam_search_train_test_continuous_with_literal_scores(
             y_train,
             prepared_bits.train_bits.as_slice(),
@@ -6002,6 +6419,7 @@ fn evaluate_logic_unit_prepared_continuous(
     let selected_bits_full = prepared_bits.selected_bits_full.as_deref().ok_or_else(|| {
         "internal error: selected_bits_full missing for GARFIELD evaluation".to_string()
     })?;
+    let selected_bits_full_hi = prepared_bits.selected_bits_full_hi.as_deref();
 
     let keep_rules = if top_rules_per_unit == 0 {
         beam_hits.len()
@@ -6025,17 +6443,40 @@ fn evaluate_logic_unit_prepared_continuous(
         let first_site = local_sites
             .get(cand.rule.first.row_index)
             .ok_or_else(|| "beam result first row index out of range".to_string())?;
-        let mut full_bits = materialize_rule_bits(
-            &cand.rule,
-            selected_bits_full,
-            logic_bits.row_words,
-            prepared.selected_global_rows.len(),
-            logic_bits.n_samples,
-        )?;
+        let (mut full_bits, mut full_ge2_bits) = if let Some(bits_hi) = selected_bits_full_hi {
+            let (ge1, ge2) = materialize_rule_bits_dual(
+                &cand.rule,
+                selected_bits_full,
+                bits_hi,
+                logic_bits.row_words,
+                prepared.selected_global_rows.len(),
+                logic_bits.n_samples,
+            )?;
+            (ge1, Some(ge2))
+        } else {
+            (
+                materialize_rule_bits(
+                    &cand.rule,
+                    selected_bits_full,
+                    logic_bits.row_words,
+                    prepared.selected_global_rows.len(),
+                    logic_bits.n_samples,
+                )?,
+                None,
+            )
+        };
         let polarity =
             preferred_display_polarity(&cand.rule, full_bits.as_slice(), logic_bits.n_samples);
-        if matches!(polarity, GarfieldRuleDisplayPolarity::ComplementOr) {
-            complement_bits_in_place(full_bits.as_mut_slice(), logic_bits.n_samples);
+        if matches!(polarity, GarfieldRuleDisplayPolarity::Complement) {
+            if let Some(ge2_bits) = full_ge2_bits.as_mut() {
+                complement_dual_bits_in_place(
+                    full_bits.as_mut_slice(),
+                    ge2_bits.as_mut_slice(),
+                    logic_bits.n_samples,
+                );
+            } else {
+                complement_bits_in_place(full_bits.as_mut_slice(), logic_bits.n_samples);
+            }
         }
         let expr = rule_expr_with_polarity(&cand.rule, local_sites.as_slice(), polarity)?;
         let snp_name = rule_snp_name_with_polarity(&cand.rule, local_sites.as_slice(), polarity)?;
@@ -6043,17 +6484,27 @@ fn evaluate_logic_unit_prepared_continuous(
             rule_bim_name_with_polarity(&cand.rule, local_sites.as_slice(), polarity)?;
         let (bim_allele0, bim_allele1) =
             rule_bim_alleles_with_polarity(&cand.rule, local_sites.as_slice(), polarity)?;
-        let assoc =
-            fit_binary_rule_wald_from_bits(assoc_y, full_bits.as_slice(), assoc_sample_indices);
+        let assoc = if let Some(ge2_bits) = full_ge2_bits.as_ref() {
+            fit_additive_rule_wald_from_dual_bits(
+                assoc_y,
+                full_bits.as_slice(),
+                ge2_bits.as_slice(),
+                assoc_sample_indices,
+            )
+        } else {
+            fit_binary_rule_wald_from_bits(assoc_y, full_bits.as_slice(), assoc_sample_indices)
+        };
         let (delta_score, delta_pwald) = build_rule_delta_annotations(
             &cand.rule,
             cand.test_score,
             assoc.pwald,
             y_test,
             prepared_bits.test_bits(),
+            prepared_bits.test_bits_hi(),
             prepared_bits.row_words_test,
             assoc_y,
             selected_bits_full,
+            selected_bits_full_hi,
             logic_bits.row_words,
             prepared.selected_global_rows.len(),
             test_idx_local.len(),
@@ -6087,6 +6538,7 @@ fn evaluate_logic_unit_prepared_continuous(
             delta_score,
             delta_pwald,
             full_bits,
+            full_ge2_bits,
         });
     }
     Ok(out)
@@ -6246,12 +6698,16 @@ fn process_scan_unit_chunk_continuous(
             if let Some(tracker) = mem_tracker {
                 tracker.sample_now();
             }
-            let literal_scores = precompute_literal_singleton_scores_for_unit(
-                &prepared,
-                &prepared_bits,
-                y_train,
-                y_test,
-            )?;
+            let literal_scores = if prepared_bits.has_fuzzy_bin() {
+                None
+            } else {
+                Some(precompute_literal_singleton_scores_for_unit(
+                    &prepared,
+                    &prepared_bits,
+                    y_train,
+                    y_test,
+                )?)
+            };
             let unit_out = match evaluate_logic_unit_prepared_continuous(
                 ui,
                 unit,
@@ -6266,7 +6722,7 @@ fn process_scan_unit_chunk_continuous(
                 beam_params.clone(),
                 top_rules_per_unit,
                 unit_kind_lc,
-                Some(literal_scores.as_slice()),
+                literal_scores.as_ref().map(|v| v.as_slice()),
             ) {
                 Ok(v) => v,
                 Err(err) if is_no_valid_initial_literals_error(&err) => {
@@ -6679,6 +7135,28 @@ fn write_logic_bits_as_plink_row<W: Write>(
     w.write_all(row_buf).map_err(|e| e.to_string())
 }
 
+#[inline]
+fn write_logic_dual_bits_as_plink_row<W: Write>(
+    w: &mut W,
+    row_buf: &mut [u8],
+    ge1_bits: &[u64],
+    ge2_bits: &[u64],
+    n_samples: usize,
+    complement: bool,
+) -> Result<(), String> {
+    row_buf.fill(0u8);
+    for s in 0..n_samples {
+        let ge1 = ((ge1_bits[s >> 6] >> (s & 63)) & 1u64) as i8;
+        let ge2 = ((ge2_bits[s >> 6] >> (s & 63)) & 1u64) as i8;
+        let mut g = ge1 + ge2;
+        if complement {
+            g = 2 - g;
+        }
+        row_buf[s >> 2] |= plink2bits_from_logic_g(g) << ((s & 3) * 2);
+    }
+    w.write_all(row_buf).map_err(|e| e.to_string())
+}
+
 fn write_logic_pseudo_plink(
     prefix: &str,
     sample_ids: &[String],
@@ -6721,13 +7199,24 @@ fn write_logic_pseudo_plink(
                     rec.chrom_field, rec.bim_snp_name, rec.pos, rec.bim_allele0, rec.bim_allele1
                 )
                 .map_err(|e| e.to_string())?;
-                write_logic_bits_as_plink_row(
-                    &mut bed,
-                    row_buf.as_mut_slice(),
-                    rec.full_bits.as_slice(),
-                    sample_ids.len(),
-                    false,
-                )?;
+                if let Some(full_ge2_bits) = rec.full_ge2_bits.as_ref() {
+                    write_logic_dual_bits_as_plink_row(
+                        &mut bed,
+                        row_buf.as_mut_slice(),
+                        rec.full_bits.as_slice(),
+                        full_ge2_bits.as_slice(),
+                        sample_ids.len(),
+                        false,
+                    )?;
+                } else {
+                    write_logic_bits_as_plink_row(
+                        &mut bed,
+                        row_buf.as_mut_slice(),
+                        rec.full_bits.as_slice(),
+                        sample_ids.len(),
+                        false,
+                    )?;
+                }
             }
             continue;
         }
@@ -6749,13 +7238,30 @@ fn write_logic_pseudo_plink(
                         lit.selected_row_index, logic_bits.row_words
                     )
                 })?;
-                write_logic_bits_as_plink_row(
-                    &mut bed,
-                    row_buf.as_mut_slice(),
-                    bits,
-                    sample_ids.len(),
-                    lit.display_negated,
-                )?;
+                if let Some(bits_hi_flat) = logic_bits.bits_hi_flat.as_ref() {
+                    let bits_hi = bits_hi_flat.get(row_start..row_end).ok_or_else(|| {
+                        format!(
+                            "GARFIELD pseudo export literal high-bit row slice out of range: row={} row_words={}",
+                            lit.selected_row_index, logic_bits.row_words
+                        )
+                    })?;
+                    write_logic_dual_bits_as_plink_row(
+                        &mut bed,
+                        row_buf.as_mut_slice(),
+                        bits,
+                        bits_hi,
+                        sample_ids.len(),
+                        lit.display_negated,
+                    )?;
+                } else {
+                    write_logic_bits_as_plink_row(
+                        &mut bed,
+                        row_buf.as_mut_slice(),
+                        bits,
+                        sample_ids.len(),
+                        lit.display_negated,
+                    )?;
+                }
             }
         }
 
@@ -6766,13 +7272,24 @@ fn write_logic_pseudo_plink(
                 lit.chrom, rec.bim_snp_name, lit.pos, rec.bim_allele0, rec.bim_allele1
             )
             .map_err(|e| e.to_string())?;
-            write_logic_bits_as_plink_row(
-                &mut bed,
-                row_buf.as_mut_slice(),
-                rec.full_bits.as_slice(),
-                sample_ids.len(),
-                false,
-            )?;
+            if let Some(full_ge2_bits) = rec.full_ge2_bits.as_ref() {
+                write_logic_dual_bits_as_plink_row(
+                    &mut bed,
+                    row_buf.as_mut_slice(),
+                    rec.full_bits.as_slice(),
+                    full_ge2_bits.as_slice(),
+                    sample_ids.len(),
+                    false,
+                )?;
+            } else {
+                write_logic_bits_as_plink_row(
+                    &mut bed,
+                    row_buf.as_mut_slice(),
+                    rec.full_bits.as_slice(),
+                    sample_ids.len(),
+                    false,
+                )?;
+            }
         }
     }
     bim.flush().map_err(|e| e.to_string())?;
@@ -9632,6 +10149,7 @@ mod tests {
                 delta_score: format!("{}->{}", 20.0 - i as f64, 20.0 - i as f64),
                 delta_pwald: format!("{}->{}", 1e-4 * (i as f64 + 1.0), 1e-4 * (i as f64 + 1.0)),
                 full_bits: vec![i as u64 + 1],
+                full_ge2_bits: None,
             })
             .collect::<Vec<_>>();
         apply_logic_rule_output_limit(&mut records, 0, 0.3).unwrap();
@@ -9671,6 +10189,7 @@ mod tests {
                 delta_score: "10->10".to_string(),
                 delta_pwald: "0.0001->0.0001".to_string(),
                 full_bits: vec![1],
+                full_ge2_bits: None,
             },
             GarfieldLogicRuleRecord {
                 unit_name: "u2".to_string(),
@@ -9695,6 +10214,7 @@ mod tests {
                 delta_score: "9->9".to_string(),
                 delta_pwald: "0.0002->0.0002".to_string(),
                 full_bits: vec![2],
+                full_ge2_bits: None,
             },
             GarfieldLogicRuleRecord {
                 unit_name: "u3".to_string(),
@@ -9719,6 +10239,7 @@ mod tests {
                 delta_score: "9->9".to_string(),
                 delta_pwald: "0.0003->0.0003".to_string(),
                 full_bits: vec![3],
+                full_ge2_bits: None,
             },
             GarfieldLogicRuleRecord {
                 unit_name: "u4".to_string(),
@@ -9743,6 +10264,7 @@ mod tests {
                 delta_score: "8->8".to_string(),
                 delta_pwald: "0.0004->0.0004".to_string(),
                 full_bits: vec![4],
+                full_ge2_bits: None,
             },
         ];
         apply_logic_rule_output_limit(&mut records, 2, 0.0).unwrap();
@@ -9769,7 +10291,7 @@ mod tests {
         };
         let full_bits = vec![0b0011u64];
         let polarity = preferred_display_polarity(&rule, full_bits.as_slice(), 4);
-        assert_eq!(polarity, GarfieldRuleDisplayPolarity::ComplementOr);
+        assert_eq!(polarity, GarfieldRuleDisplayPolarity::Complement);
     }
 
     #[test]
@@ -9790,7 +10312,7 @@ mod tests {
                 },
             )],
         };
-        let polarity = GarfieldRuleDisplayPolarity::ComplementOr;
+        let polarity = GarfieldRuleDisplayPolarity::Complement;
         let expr = rule_expr_with_polarity(&rule, sites.as_slice(), polarity).unwrap();
         let snp_name = rule_snp_name_with_polarity(&rule, sites.as_slice(), polarity).unwrap();
         let bim_name = rule_bim_name_with_polarity(&rule, sites.as_slice(), polarity).unwrap();
@@ -9803,6 +10325,36 @@ mod tests {
         assert_eq!(ml_rank, "1|2");
         assert_eq!(a0, "A,A");
         assert_eq!(a1, "G,G");
+    }
+
+    #[test]
+    fn test_rule_display_polarity_preserves_original_or_rule() {
+        let sites = vec![test_site("1", 100), test_site("1", 200)];
+        let rule = BeamRule {
+            first: BeamLiteral {
+                row_index: 0,
+                group_id: 0,
+                negated: false,
+            },
+            rest: vec![(
+                BeamBinaryOp::Or,
+                BeamLiteral {
+                    row_index: 1,
+                    group_id: 1,
+                    negated: false,
+                },
+            )],
+        };
+        let polarity = GarfieldRuleDisplayPolarity::Original;
+        let expr = rule_expr_with_polarity(&rule, sites.as_slice(), polarity).unwrap();
+        let snp_name = rule_snp_name_with_polarity(&rule, sites.as_slice(), polarity).unwrap();
+        let bim_name = rule_bim_name_with_polarity(&rule, sites.as_slice(), polarity).unwrap();
+        let ml_rank = rule_ml_rank_name_with_polarity(&rule, polarity);
+
+        assert_eq!(expr, "BIN(1_100) OR BIN(1_200)");
+        assert_eq!(snp_name, "1_100|1_200");
+        assert_eq!(bim_name, "1_100|1_200");
+        assert_eq!(ml_rank, "1|2");
     }
 
     #[test]
@@ -9829,7 +10381,7 @@ mod tests {
                 },
             )],
         };
-        let polarity = GarfieldRuleDisplayPolarity::OriginalAnd;
+        let polarity = GarfieldRuleDisplayPolarity::Original;
         let expr = rule_expr_with_polarity(&rule, logic_sites.as_slice(), polarity).unwrap();
         let snp_name =
             rule_snp_name_with_polarity(&rule, logic_sites.as_slice(), polarity).unwrap();
@@ -9865,7 +10417,7 @@ mod tests {
                 },
             )],
         };
-        let polarity = GarfieldRuleDisplayPolarity::OriginalAnd;
+        let polarity = GarfieldRuleDisplayPolarity::Original;
         let expr = rule_expr_with_polarity(&rule, logic_sites.as_slice(), polarity).unwrap();
         let snp_name =
             rule_snp_name_with_polarity(&rule, logic_sites.as_slice(), polarity).unwrap();
@@ -9901,6 +10453,7 @@ mod tests {
                 delta_score: "0.1&0.2->5.0".to_string(),
                 delta_pwald: "0.1&0.2->1e-3".to_string(),
                 full_bits: full_bits.clone(),
+                full_ge2_bits: None,
             },
             GarfieldLogicRuleRecord {
                 unit_name: "u_pos".to_string(),
@@ -9925,6 +10478,7 @@ mod tests {
                 delta_score: "0.1|0.2->5.0".to_string(),
                 delta_pwald: "0.1|0.2->1e-3".to_string(),
                 full_bits,
+                full_ge2_bits: None,
             },
         ];
         let deduped = dedup_logic_rule_records(records);
@@ -9950,6 +10504,7 @@ mod tests {
         );
         let logic_bits = GarfieldLogicBits {
             bits_flat: vec![0b0101u64, 0b0110u64],
+            bits_hi_flat: None,
             row_words: 1,
             sample_ids: sample_ids.clone(),
             sites,
@@ -9979,6 +10534,7 @@ mod tests {
             delta_score: "0.1&!0.2->10".to_string(),
             delta_pwald: "0.1&!0.2->1e-6".to_string(),
             full_bits: vec![0b0100u64],
+            full_ge2_bits: None,
         }];
 
         write_logic_pseudo_plink(
@@ -10002,6 +10558,34 @@ mod tests {
 
         let bed_bytes = fs::read(format!("{prefix_str}.bed")).unwrap();
         assert_eq!(bed_bytes, vec![0x6C, 0x1B, 0x01, 0x33, 0xC3, 0x30, 0x30]);
+    }
+
+    #[test]
+    fn test_write_logic_dual_bits_as_plink_row_preserves_heterozygotes() {
+        let mut row_buf = vec![0u8; 1];
+        let mut out = Vec::<u8>::new();
+        write_logic_dual_bits_as_plink_row(
+            &mut out,
+            row_buf.as_mut_slice(),
+            &[0b1110u64],
+            &[0b0100u64],
+            4,
+            false,
+        )
+        .unwrap();
+        assert_eq!(out, vec![0x74u8]);
+
+        out.clear();
+        write_logic_dual_bits_as_plink_row(
+            &mut out,
+            row_buf.as_mut_slice(),
+            &[0b1110u64],
+            &[0b0100u64],
+            4,
+            true,
+        )
+        .unwrap();
+        assert_eq!(out, vec![0x47u8]);
     }
 
     fn test_site(chrom: &str, pos: i32) -> SiteInfo {
@@ -10129,6 +10713,7 @@ mod tests {
             pack_test_binary_rows(&[vec![1u8, 1, 0, 0], vec![1u8, 1, 0, 0], vec![1u8, 0, 1, 0]]);
         let logic_bits = GarfieldLogicBits {
             bits_flat,
+            bits_hi_flat: None,
             row_words,
             sample_ids: vec![
                 "s1".to_string(),
@@ -10203,6 +10788,7 @@ mod tests {
             pack_test_binary_rows(&[vec![1u8, 1, 0, 0], vec![1u8, 1, 0, 0], vec![1u8, 0, 1, 0]]);
         let logic_bits = GarfieldLogicBits {
             bits_flat,
+            bits_hi_flat: None,
             row_words,
             sample_ids: vec![
                 "s1".to_string(),

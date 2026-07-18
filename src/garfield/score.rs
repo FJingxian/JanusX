@@ -6,8 +6,37 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use rayon::prelude::*;
 use std::borrow::Cow;
+#[cfg(target_arch = "x86_64")]
+use std::sync::OnceLock;
 
 const BATCH_PAR_MIN_ROWS: usize = 64;
+#[cfg(target_arch = "x86_64")]
+const SUM_Y_MASKLOAD_MIN_POPCNT: u32 = 10;
+#[cfg(target_arch = "aarch64")]
+const SUM_Y_NEON_MIN_POPCNT: u32 = 14;
+
+#[cfg(target_arch = "x86_64")]
+const SUM_Y_MASK4_LUT: [[i64; 4]; 16] = [
+    [0, 0, 0, 0],
+    [-1, 0, 0, 0],
+    [0, -1, 0, 0],
+    [-1, -1, 0, 0],
+    [0, 0, -1, 0],
+    [-1, 0, -1, 0],
+    [0, -1, -1, 0],
+    [-1, -1, -1, 0],
+    [0, 0, 0, -1],
+    [-1, 0, 0, -1],
+    [0, -1, 0, -1],
+    [-1, -1, 0, -1],
+    [0, 0, -1, -1],
+    [-1, 0, -1, -1],
+    [0, -1, -1, -1],
+    [-1, -1, -1, -1],
+];
+
+#[cfg(target_arch = "aarch64")]
+const SUM_Y_MASK2_LUT: [[u64; 2]; 4] = [[0, 0], [u64::MAX, 0], [0, u64::MAX], [u64::MAX, u64::MAX]];
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ContinuousRuleScore {
@@ -28,6 +57,13 @@ fn words_for_samples(n: usize) -> usize {
 #[inline]
 fn should_parallel_rows(n_rows: usize) -> bool {
     n_rows >= BATCH_PAR_MIN_ROWS && rayon::current_num_threads() > 1
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn score_avx2_runtime_available() -> bool {
+    static AVX2: OnceLock<bool> = OnceLock::new();
+    *AVX2.get_or_init(|| std::arch::is_x86_feature_detected!("avx2"))
 }
 
 #[inline]
@@ -227,6 +263,28 @@ fn sum_y_where_bit1(bits: &[u64], y: &[f64], n_samples: usize) -> f64 {
 }
 
 #[inline]
+fn count_sum_y_where_dual_packed(
+    ge1_bits: &[u64],
+    ge2_bits: &[u64],
+    y: &[f64],
+    n_samples: usize,
+) -> (usize, usize, f64, f64) {
+    let (n_ge1, sum_ge1) = count_sum_y_where_bit1(ge1_bits, y, n_samples);
+    let (n_ge2, sum_ge2) = count_sum_y_where_bit1(ge2_bits, y, n_samples);
+    (n_ge1, n_ge2, sum_ge1, sum_ge2)
+}
+
+#[inline]
+pub fn dual_packed_summary(
+    ge1_bits: &[u64],
+    ge2_bits: &[u64],
+    y: &[f64],
+    n_samples: usize,
+) -> (usize, usize, f64, f64) {
+    count_sum_y_where_dual_packed(ge1_bits, ge2_bits, y, n_samples)
+}
+
+#[inline]
 fn cont_mean_diff_corr_from_row(
     y: &[f64],
     bits: &[u64],
@@ -282,34 +340,189 @@ pub fn support_size_packed(bits: &[u64], n_samples: usize) -> usize {
 }
 
 #[inline]
-pub fn sum_y_where_both1(lhs: &[u64], rhs: &[u64], y: &[f64], n_samples: usize) -> f64 {
+fn sum_y_from_word_scalar(y: &[f64], base: usize, mut word: u64) -> f64 {
+    let mut s = 0.0_f64;
+    while word != 0 {
+        let tz = word.trailing_zeros() as usize;
+        s += y[base + tz];
+        word &= word - 1;
+    }
+    s
+}
+
+#[inline]
+fn sum_y_where_both1_scalar(lhs: &[u64], rhs: &[u64], y: &[f64], n_samples: usize) -> f64 {
     let full_words = n_samples >> 6;
     let rem = n_samples & 63;
 
     let mut s1 = 0.0_f64;
 
     for w_idx in 0..full_words {
-        let mut w = lhs[w_idx] & rhs[w_idx];
         let base = w_idx << 6;
-        while w != 0 {
-            let tz = w.trailing_zeros() as usize;
-            s1 += y[base + tz];
-            w &= w - 1;
+        s1 += sum_y_from_word_scalar(y, base, lhs[w_idx] & rhs[w_idx]);
+    }
+
+    if rem != 0 {
+        let mask = (1u64 << rem) - 1u64;
+        let base = full_words << 6;
+        s1 += sum_y_from_word_scalar(y, base, (lhs[full_words] & rhs[full_words]) & mask);
+    }
+
+    s1
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn sum_y_where_both1_avx2(lhs: &[u64], rhs: &[u64], y: &[f64], n_samples: usize) -> f64 {
+    use core::arch::x86_64::{
+        __m256d, __m256i, _mm256_add_pd, _mm256_loadu_pd, _mm256_loadu_si256, _mm256_maskload_pd,
+        _mm256_setzero_pd, _mm256_storeu_pd,
+    };
+
+    let full_words = n_samples >> 6;
+    let rem = n_samples & 63;
+    let y_ptr = y.as_ptr();
+    let mut scalar_tail = 0.0_f64;
+    let mut acc0: __m256d = _mm256_setzero_pd();
+    let mut acc1: __m256d = _mm256_setzero_pd();
+    let mut acc2: __m256d = _mm256_setzero_pd();
+    let mut acc3: __m256d = _mm256_setzero_pd();
+
+    let mut accumulate_word = |base: usize, word: u64, valid_bits: usize| {
+        if word == 0 {
+            return;
+        }
+        if word.count_ones() <= SUM_Y_MASKLOAD_MIN_POPCNT {
+            scalar_tail += sum_y_from_word_scalar(y, base, word);
+            return;
+        }
+        let blocks = valid_bits.div_ceil(4);
+        for block_idx in 0..blocks {
+            let nib = ((word >> (block_idx << 2)) & 0xFu64) as usize;
+            if nib == 0 {
+                continue;
+            }
+            let ptr = unsafe { y_ptr.add(base + (block_idx << 2)) };
+            let vals = if nib == 0xF {
+                unsafe { _mm256_loadu_pd(ptr) }
+            } else {
+                let mask =
+                    unsafe { _mm256_loadu_si256(SUM_Y_MASK4_LUT[nib].as_ptr().cast::<__m256i>()) };
+                unsafe { _mm256_maskload_pd(ptr, mask) }
+            };
+            match block_idx & 3 {
+                0 => acc0 = _mm256_add_pd(acc0, vals),
+                1 => acc1 = _mm256_add_pd(acc1, vals),
+                2 => acc2 = _mm256_add_pd(acc2, vals),
+                _ => acc3 = _mm256_add_pd(acc3, vals),
+            }
+        }
+    };
+
+    for w_idx in 0..full_words {
+        accumulate_word(w_idx << 6, lhs[w_idx] & rhs[w_idx], 64);
+    }
+
+    if rem != 0 {
+        let mask = (1u64 << rem) - 1u64;
+        accumulate_word(
+            full_words << 6,
+            (lhs[full_words] & rhs[full_words]) & mask,
+            rem,
+        );
+    }
+
+    let acc = _mm256_add_pd(_mm256_add_pd(acc0, acc1), _mm256_add_pd(acc2, acc3));
+    let mut lanes = [0.0_f64; 4];
+    unsafe { _mm256_storeu_pd(lanes.as_mut_ptr(), acc) };
+    scalar_tail + lanes[0] + lanes[1] + lanes[2] + lanes[3]
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn sum_y_where_both1_neon(lhs: &[u64], rhs: &[u64], y: &[f64], n_samples: usize) -> f64 {
+    use core::arch::aarch64::{
+        float64x2_t, uint64x2_t, vaddq_f64, vandq_u64, vdupq_n_f64, vld1q_f64, vld1q_u64,
+        vreinterpretq_f64_u64, vreinterpretq_u64_f64, vst1q_f64,
+    };
+
+    let full_words = n_samples >> 6;
+    let rem = n_samples & 63;
+    let y_ptr = y.as_ptr();
+    let mut scalar_tail = 0.0_f64;
+    let mut acc0: float64x2_t = vdupq_n_f64(0.0);
+    let mut acc1: float64x2_t = vdupq_n_f64(0.0);
+    let mut acc2: float64x2_t = vdupq_n_f64(0.0);
+    let mut acc3: float64x2_t = vdupq_n_f64(0.0);
+
+    let mut accumulate_pair = |pair_idx: usize, ptr: *const f64, bits2: usize| {
+        if bits2 == 0 {
+            return;
+        }
+        let vals = if bits2 == 0x3 {
+            unsafe { vld1q_f64(ptr) }
+        } else {
+            let mask: uint64x2_t = unsafe { vld1q_u64(SUM_Y_MASK2_LUT[bits2].as_ptr()) };
+            let raw = unsafe { vld1q_f64(ptr) };
+            vreinterpretq_f64_u64(vandq_u64(vreinterpretq_u64_f64(raw), mask))
+        };
+        match pair_idx & 3 {
+            0 => acc0 = vaddq_f64(acc0, vals),
+            1 => acc1 = vaddq_f64(acc1, vals),
+            2 => acc2 = vaddq_f64(acc2, vals),
+            _ => acc3 = vaddq_f64(acc3, vals),
+        }
+    };
+
+    for w_idx in 0..full_words {
+        let word = lhs[w_idx] & rhs[w_idx];
+        if word == 0 {
+            continue;
+        }
+        let base = w_idx << 6;
+        if word.count_ones() <= SUM_Y_NEON_MIN_POPCNT {
+            scalar_tail += sum_y_from_word_scalar(y, base, word);
+            continue;
+        }
+        for block_idx in 0..16usize {
+            let nib = ((word >> (block_idx << 2)) & 0xFu64) as usize;
+            if nib == 0 {
+                continue;
+            }
+            let block_ptr = unsafe { y_ptr.add(base + (block_idx << 2)) };
+            let low2 = nib & 0x3;
+            let high2 = nib >> 2;
+            accumulate_pair(block_idx << 1, block_ptr, low2);
+            if high2 != 0 {
+                accumulate_pair((block_idx << 1) + 1, unsafe { block_ptr.add(2) }, high2);
+            }
         }
     }
 
     if rem != 0 {
         let mask = (1u64 << rem) - 1u64;
-        let mut w = (lhs[full_words] & rhs[full_words]) & mask;
-        let base = full_words << 6;
-        while w != 0 {
-            let tz = w.trailing_zeros() as usize;
-            s1 += y[base + tz];
-            w &= w - 1;
-        }
+        scalar_tail += sum_y_from_word_scalar(
+            y,
+            full_words << 6,
+            (lhs[full_words] & rhs[full_words]) & mask,
+        );
     }
 
-    s1
+    let acc = vaddq_f64(vaddq_f64(acc0, acc1), vaddq_f64(acc2, acc3));
+    let mut lanes = [0.0_f64; 2];
+    unsafe { vst1q_f64(lanes.as_mut_ptr(), acc) };
+    scalar_tail + lanes[0] + lanes[1]
+}
+
+#[inline]
+pub fn sum_y_where_both1(lhs: &[u64], rhs: &[u64], y: &[f64], n_samples: usize) -> f64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if score_avx2_runtime_available() {
+            return unsafe { sum_y_where_both1_avx2(lhs, rhs, y, n_samples) };
+        }
+    }
+    sum_y_where_both1_scalar(lhs, rhs, y, n_samples)
 }
 
 /// Balanced Accuracy for binary `y` (0/1) vs packed 0/1 bit-vector.
@@ -578,6 +791,89 @@ pub fn score_cont_weighted_mean_diff_packed(
 }
 
 #[inline]
+pub fn score_cont_centered_gain_dual_from_summary(
+    total_sum: f64,
+    n_samples: usize,
+    n_ge1: usize,
+    n_ge2: usize,
+    sum_ge1: f64,
+    sum_ge2: f64,
+) -> ContinuousRuleScore {
+    let n_hit = n_ge1;
+    let n_miss = n_samples.saturating_sub(n_hit);
+    let support_frac = (n_hit as f64) / (n_samples as f64);
+    let mean_hit = if n_hit == 0 {
+        f64::NAN
+    } else {
+        sum_ge1 / (n_hit as f64)
+    };
+    let mean_miss = if n_miss == 0 {
+        f64::NAN
+    } else {
+        (total_sum - sum_ge1) / (n_miss as f64)
+    };
+
+    let n = n_samples as f64;
+    let sx = (n_ge1 + n_ge2) as f64;
+    let sx2 = (n_ge1 + 3usize.saturating_mul(n_ge2)) as f64;
+    let sxy = sum_ge1 + sum_ge2;
+    let vxx_num = n * sx2 - sx * sx;
+    let raw = if !(vxx_num > 0.0) {
+        0.0
+    } else {
+        let cov_num = n * sxy - sx * total_sum;
+        (cov_num * cov_num) / (n * vxx_num)
+    };
+
+    ContinuousRuleScore {
+        score: raw,
+        raw_score: raw,
+        mean_hit,
+        mean_miss,
+        support_frac,
+        n_hit,
+        n_miss,
+    }
+}
+
+pub fn score_cont_centered_gain_dual_packed_with_sum(
+    y: &[f64],
+    ge1_bits: &[u64],
+    ge2_bits: &[u64],
+    n_samples: usize,
+    total_sum: f64,
+) -> ContinuousRuleScore {
+    const CTX: &str = "score_cont_centered_gain_dual_packed_with_sum";
+    if n_samples == 0
+        || require_n_valid(n_samples, y.len(), ge1_bits.len(), CTX).is_err()
+        || require_n_valid(n_samples, y.len(), ge2_bits.len(), CTX).is_err()
+    {
+        return invalid_rule_score();
+    }
+    if validate_continuous_y(y, n_samples, CTX).is_err() {
+        return invalid_rule_score();
+    }
+
+    let (n_ge1, n_ge2, sum_ge1, sum_ge2) = dual_packed_summary(ge1_bits, ge2_bits, y, n_samples);
+    score_cont_centered_gain_dual_from_summary(total_sum, n_samples, n_ge1, n_ge2, sum_ge1, sum_ge2)
+}
+
+pub fn score_cont_centered_gain_dual_packed(
+    y: &[f64],
+    ge1_bits: &[u64],
+    ge2_bits: &[u64],
+    n_samples: usize,
+) -> ContinuousRuleScore {
+    score_cont_centered_gain_dual_packed_with_sum(
+        y,
+        ge1_bits,
+        ge2_bits,
+        n_samples,
+        total_y_sum(y, n_samples),
+    )
+}
+
+#[inline]
 fn readonly_u8_to_cow<'a>(arr: &'a PyReadonlyArray1<'a, u8>) -> Cow<'a, [u8]> {
     match arr.as_slice() {
         Ok(s) => Cow::Borrowed(s),
@@ -781,6 +1077,8 @@ pub fn score_cont_mean_diff_corr_batch_py<'py>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::hint::black_box;
+    use std::time::Instant;
 
     fn pack01(v: &[u8]) -> Vec<u64> {
         let words = v.len().div_ceil(64);
@@ -791,6 +1089,59 @@ mod tests {
             }
         }
         out
+    }
+
+    fn median_ns_per_call(samples_ns: &mut [f64]) -> f64 {
+        samples_ns.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        samples_ns[samples_ns.len() / 2]
+    }
+
+    fn make_sum_y_bench_inputs<F>(n_samples: usize, pred: F) -> (Vec<u64>, Vec<u64>, Vec<f64>)
+    where
+        F: Fn(usize) -> (bool, bool),
+    {
+        let mut lhs = vec![0u64; words_for_samples(n_samples).max(1)];
+        let mut rhs = vec![0u64; words_for_samples(n_samples).max(1)];
+        let mut y = Vec::<f64>::with_capacity(n_samples);
+        for i in 0..n_samples {
+            let (a, b) = pred(i);
+            if a {
+                lhs[i >> 6] |= 1u64 << (i & 63);
+            }
+            if b {
+                rhs[i >> 6] |= 1u64 << (i & 63);
+            }
+            y.push(((i as f64) * 0.03125) - 7.0 + ((i % 13) as f64) * 0.0075);
+        }
+        (lhs, rhs, y)
+    }
+
+    fn bench_sum_y_backend<F>(
+        lhs: &[u64],
+        rhs: &[u64],
+        y: &[f64],
+        n_samples: usize,
+        iters: usize,
+        mut f: F,
+    ) -> (f64, f64)
+    where
+        F: FnMut(&[u64], &[u64], &[f64], usize) -> f64,
+    {
+        black_box(f(lhs, rhs, y, n_samples));
+        let mut samples = [0.0_f64; 5];
+        let mut sink = 0.0_f64;
+        for slot in samples.iter_mut() {
+            let t0 = Instant::now();
+            for _ in 0..iters {
+                sink += black_box(f(lhs, rhs, y, n_samples));
+            }
+            let elapsed = t0.elapsed().as_secs_f64();
+            *slot = elapsed * 1e9 / (iters as f64);
+        }
+        black_box(sink);
+        let median = median_ns_per_call(samples.as_mut_slice());
+        let checksum = f(lhs, rhs, y, n_samples);
+        (median, checksum)
     }
 
     #[test]
@@ -854,6 +1205,151 @@ mod tests {
         let b = pack01(&x);
         assert_eq!(score_cont_corr_packed(&y, &b, y.len()), 0.0);
         assert!(score_cont_mean_diff_packed(&y, &b, y.len()).is_nan());
+    }
+
+    #[test]
+    fn test_sum_y_where_both1_matches_scalar_reference() {
+        let n = 137usize;
+        let y = (0..n)
+            .map(|i| ((i as f64) * 0.125) - 3.0 + ((i % 7) as f64) * 0.05)
+            .collect::<Vec<_>>();
+        let lhs_raw = (0..n)
+            .map(|i| ((i % 3) == 0 || (i % 11) == 1 || (i >= 96 && i < 128)) as u8)
+            .collect::<Vec<_>>();
+        let rhs_raw = (0..n)
+            .map(|i| ((i % 5) <= 1 || (i % 17) == 4 || (i >= 64 && i < 120)) as u8)
+            .collect::<Vec<_>>();
+        let lhs = pack01(lhs_raw.as_slice());
+        let rhs = pack01(rhs_raw.as_slice());
+        let expected = sum_y_where_both1_scalar(lhs.as_slice(), rhs.as_slice(), y.as_slice(), n);
+        let got = sum_y_where_both1(lhs.as_slice(), rhs.as_slice(), y.as_slice(), n);
+        assert!((got - expected).abs() < 1e-12);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_sum_y_where_both1_avx2_matches_scalar_reference() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let n = 130usize;
+        let y = (0..n)
+            .map(|i| ((i as f64) * 0.2) - 5.0 + ((i % 9) as f64) * 0.03)
+            .collect::<Vec<_>>();
+        let lhs_raw = (0..n)
+            .map(|i| ((i % 2) == 0 || (i >= 32 && i < 96)) as u8)
+            .collect::<Vec<_>>();
+        let rhs_raw = (0..n)
+            .map(|i| ((i % 4) != 1 || (i >= 80 && i < 128)) as u8)
+            .collect::<Vec<_>>();
+        let lhs = pack01(lhs_raw.as_slice());
+        let rhs = pack01(rhs_raw.as_slice());
+        let expected = sum_y_where_both1_scalar(lhs.as_slice(), rhs.as_slice(), y.as_slice(), n);
+        let got =
+            unsafe { sum_y_where_both1_avx2(lhs.as_slice(), rhs.as_slice(), y.as_slice(), n) };
+        assert!((got - expected).abs() < 1e-12);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_sum_y_where_both1_neon_matches_scalar_reference() {
+        if !std::arch::is_aarch64_feature_detected!("neon") {
+            return;
+        }
+        let n = 130usize;
+        let y = (0..n)
+            .map(|i| ((i as f64) * 0.2) - 5.0 + ((i % 9) as f64) * 0.03)
+            .collect::<Vec<_>>();
+        let lhs_raw = (0..n)
+            .map(|i| ((i % 2) == 0 || (i >= 32 && i < 96)) as u8)
+            .collect::<Vec<_>>();
+        let rhs_raw = (0..n)
+            .map(|i| ((i % 4) != 1 || (i >= 80 && i < 128)) as u8)
+            .collect::<Vec<_>>();
+        let lhs = pack01(lhs_raw.as_slice());
+        let rhs = pack01(rhs_raw.as_slice());
+        let expected = sum_y_where_both1_scalar(lhs.as_slice(), rhs.as_slice(), y.as_slice(), n);
+        let got =
+            unsafe { sum_y_where_both1_neon(lhs.as_slice(), rhs.as_slice(), y.as_slice(), n) };
+        assert!((got - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_sum_y_where_both1_backends() {
+        let n_samples = 65_536usize;
+        let sparse = make_sum_y_bench_inputs(n_samples, |i| {
+            let lhs = (i % 29) == 0 || (i % 31) == 1 || (i % 37) == 3;
+            let rhs = (i % 41) == 0 || (i % 43) == 2 || (i % 47) == 4;
+            (lhs, rhs)
+        });
+        let dense = make_sum_y_bench_inputs(n_samples, |i| {
+            let lhs = ((i & 1) == 0) || ((i % 7) <= 2) || ((i % 19) <= 6);
+            let rhs = ((i % 3) != 1) || ((i % 11) <= 4) || ((i % 23) <= 7);
+            (lhs, rhs)
+        });
+        let iters = 512usize;
+
+        let run_case = |label: &str, lhs: &[u64], rhs: &[u64], y: &[f64]| {
+            let (scalar_ns, scalar_sum) =
+                bench_sum_y_backend(lhs, rhs, y, n_samples, iters, sum_y_where_both1_scalar);
+            #[cfg(target_arch = "aarch64")]
+            {
+                if std::arch::is_aarch64_feature_detected!("neon") {
+                    let (neon_ns, neon_sum) =
+                        bench_sum_y_backend(lhs, rhs, y, n_samples, iters, |a, b, c, n| unsafe {
+                            sum_y_where_both1_neon(a, b, c, n)
+                        });
+                    let diff = (scalar_sum - neon_sum).abs();
+                    let tol = scalar_sum.abs().max(1.0) * 1e-10;
+                    assert!(
+                        diff <= tol,
+                        "checksum drift too large: diff={diff} tol={tol}"
+                    );
+                    eprintln!(
+                        "[sum_y bench][{label}] scalar={scalar_ns:.1} ns/call neon={neon_ns:.1} ns/call speedup={:.2}x diff={diff:.3e}",
+                        scalar_ns / neon_ns,
+                    );
+                    return;
+                }
+            }
+            #[cfg(target_arch = "x86_64")]
+            {
+                if std::arch::is_x86_feature_detected!("avx2") {
+                    let (avx2_ns, avx2_sum) =
+                        bench_sum_y_backend(lhs, rhs, y, n_samples, iters, |a, b, c, n| unsafe {
+                            sum_y_where_both1_avx2(a, b, c, n)
+                        });
+                    let diff = (scalar_sum - avx2_sum).abs();
+                    let tol = scalar_sum.abs().max(1.0) * 1e-10;
+                    assert!(
+                        diff <= tol,
+                        "checksum drift too large: diff={diff} tol={tol}"
+                    );
+                    eprintln!(
+                        "[sum_y bench][{label}] scalar={scalar_ns:.1} ns/call avx2={avx2_ns:.1} ns/call speedup={:.2}x diff={diff:.3e}",
+                        scalar_ns / avx2_ns,
+                    );
+                    return;
+                }
+            }
+            eprintln!(
+                "[sum_y bench][{label}] simd backend unavailable; scalar={scalar_ns:.1} ns/call"
+            );
+        };
+
+        run_case(
+            "sparse",
+            sparse.0.as_slice(),
+            sparse.1.as_slice(),
+            sparse.2.as_slice(),
+        );
+        run_case(
+            "dense",
+            dense.0.as_slice(),
+            dense.1.as_slice(),
+            dense.2.as_slice(),
+        );
     }
 
     #[test]

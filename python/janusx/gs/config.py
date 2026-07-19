@@ -42,6 +42,7 @@ class GsConfig:
     traits: Optional[Sequence[int]] = None
     maf: float = 0.02
     geno: float = 0.05
+    het: float = 1.0
     cv: Optional[int] = 5
     threads: int = 0
     out: str = "."
@@ -69,6 +70,8 @@ class GsConfig:
             raise ValueError("maf must be within [0, 0.5].")
         if not (0.0 <= float(self.geno) <= 1.0):
             raise ValueError("geno must be within [0, 1].")
+        if not (0.0 <= float(self.het) <= 1.0):
+            raise ValueError("het must be within [0, 1].")
         if self.cv is not None and int(self.cv) < 2:
             raise ValueError("cv must be >= 2 when set.")
         if self.traits is not None:
@@ -112,6 +115,7 @@ class GsConfig:
         argv: list[str] = [flag, src, "-p", _normalize_path_text(self.phenotype)]
         argv.extend(["-maf", str(float(self.maf))])
         argv.extend(["-geno", str(float(self.geno))])
+        argv.extend(["-het", str(float(self.het))])
         if self.cv is not None:
             argv.extend(["-cv", str(int(self.cv))])
 

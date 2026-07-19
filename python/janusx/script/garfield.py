@@ -45,7 +45,7 @@ from janusx.script._common.genoio import (
     prepare_packed_ctx_from_plink,
 )
 from janusx.script._common.genocache import configure_genotype_cache_from_out
-from janusx.script._common.grmio import load_and_align_grm
+from janusx.script._common.grmio import format_grm_cache_num, load_and_align_grm
 from janusx.script._common.cli_core import CliArgumentParser, cli_help_formatter
 from janusx.script._common.log import setup_logging
 from janusx.script._common.memory import (
@@ -73,8 +73,11 @@ from janusx.script._common.threads import (
 )
 from janusx.assoc.workflow_ui import _emit_plain_info_line, _rich_success
 from janusx.assoc.workflow_ui import _run_fastplot_from_tsv_with_status
+from janusx.pyBLUP.assoc import FvLMM
 from janusx.script.fvlmm2 import (
     InteractionSpec as _Fvlmm2InteractionSpec,
+    _decode_rows as _fvlmm2_decode_rows,
+    _attach_combo_joint_fdr as _fvlmm2_attach_combo_joint_fdr,
     _format_fvlmm2_output_df_for_tsv as _fvlmm2_format_output_df_for_tsv,
     _load_active_sites as _fvlmm2_load_active_sites,
     _require_rust_backend as _fvlmm2_require_rust_backend,
@@ -395,6 +398,7 @@ def _ensure_followup_grm(
     n_snps: int,
     maf_threshold: float,
     max_missing_rate: float,
+    het_threshold: float,
     threads: int,
     cache_dir: str,
     logger,
@@ -411,13 +415,14 @@ def _ensure_followup_grm(
         cache_dir=cache_dir,
         logger=logger,
     )
+    cache_prefix = f"{cache_prefix}.het{format_grm_cache_num(float(het_threshold))}"
     grm_all, _eff_m, grm_ids, _grm_cache_path = load_or_build_grm_with_cache(
         genofile=genofile,
         cache_prefix=cache_prefix,
         mgrm="1",
         maf_threshold=float(maf_threshold),
         max_missing_rate=float(max_missing_rate),
-        het_threshold=0.0,
+        het_threshold=float(het_threshold),
         chunk_size=65536,
         threads=int(threads),
         memory_mb=1024.0,
@@ -444,6 +449,7 @@ def _prepare_site_keep(
     n_snps: int,
     maf_threshold: float,
     max_missing_rate: float,
+    het_threshold: float,
     snps_only: bool,
     threads: int,
     use_spinner: bool,
@@ -478,6 +484,7 @@ def _prepare_site_keep(
                 sample_indices=sample_indices,
                 maf_threshold=float(maf_threshold),
                 max_missing_rate=float(max_missing_rate),
+                het_threshold=float(het_threshold),
                 snps_only=bool(snps_only),
                 mmap_window_mb=(int(mmap_window_mb) if mmap_window_mb is not None else None),
                 threads=max(1, int(threads)),
@@ -523,6 +530,80 @@ def _garfield_followup_chisq(beta: object, se: object) -> float:
     return float(z * z)
 
 
+def _garfield_followup_row_role(snp: object) -> str:
+    token = str(snp).strip()
+    return "combo" if any(op in token for op in ("&", "|", "*")) else "singleton"
+
+
+def _attach_garfield_logic_padj(
+    df: pd.DataFrame,
+    *,
+    p_col: str = "pwald",
+    snp_col: str = "snp",
+    role_col: str = "row_role",
+    out_col: str = "padj",
+    n_tests: int | None = None,
+) -> pd.DataFrame:
+    out = df.copy()
+    out[out_col] = np.nan
+    if out.shape[0] == 0 or p_col not in out.columns or snp_col not in out.columns:
+        return out
+
+    if role_col not in out.columns:
+        out[role_col] = out[snp_col].map(_garfield_followup_row_role)
+    role = out[role_col].astype(str).str.strip().str.lower()
+    combo_mask = role.eq("combo")
+    if not bool(combo_mask.any()):
+        return out
+
+    combo_df = out.loc[combo_mask, [snp_col, p_col]].copy()
+    combo_df[p_col] = pd.to_numeric(combo_df[p_col], errors="coerce")
+    combo_df[snp_col] = combo_df[snp_col].astype(str)
+    combo_unique = (
+        combo_df.drop_duplicates(subset=[snp_col], keep="first")
+        .dropna(subset=[p_col])
+        .sort_values(by=[p_col, snp_col], kind="mergesort")
+        .reset_index(drop=True)
+    )
+    if combo_unique.shape[0] == 0:
+        return out
+
+    m_eff = int(n_tests) if n_tests is not None and int(n_tests) > 0 else int(combo_unique.shape[0])
+    ranks = np.arange(1, combo_unique.shape[0] + 1, dtype=np.float64)
+    pvals = np.asarray(combo_unique[p_col], dtype=np.float64)
+    padj = np.clip((float(m_eff) / ranks) * pvals, 0.0, 1.0)
+    combo_unique[out_col] = padj
+    padj_map = dict(zip(combo_unique[snp_col].tolist(), combo_unique[out_col].tolist()))
+    out.loc[combo_mask, out_col] = (
+        out.loc[combo_mask, snp_col].astype(str).map(padj_map).to_numpy(dtype=np.float64, copy=False)
+    )
+    return out
+
+
+def _format_garfield_fvlmm_output_df_for_tsv(df: pd.DataFrame) -> pd.DataFrame:
+    ordered = [
+        "chrom",
+        "pos",
+        "snp",
+        "allele0",
+        "allele1",
+        "af",
+        "miss",
+        "beta",
+        "se",
+        "chisq",
+        "pwald",
+        "padj",
+        "row_role",
+    ]
+    if df.shape[0] == 0:
+        return pd.DataFrame(columns=ordered)
+    out = df.copy()
+    ordered_present = [col for col in ordered if col in out.columns]
+    ordered_present.extend([col for col in out.columns if col not in ordered_present])
+    return out.loc[:, ordered_present]
+
+
 def _resolve_garfield_followup_snp_token(
     token: str,
     name_map: dict[str, list[int]],
@@ -543,12 +624,13 @@ def _load_garfield_pseudo_row_meta(
     expected_sample_ids: list[str],
     maf_threshold: float,
     max_missing_rate: float,
+    het_threshold: float,
 ) -> dict[tuple[str, int, str], dict[str, object]]:
     pseudo_ids, pseudo_ctx = prepare_packed_ctx_from_plink(
         str(pseudo_prefix),
         maf=float(maf_threshold),
         missing_rate=float(max_missing_rate),
-        het_threshold=0.0,
+        het_threshold=float(het_threshold),
         snps_only=False,
         filter_mode="compact",
         use_cache=False,
@@ -753,6 +835,7 @@ def _garfield_compact_fvlmm2_output_df(full_df: pd.DataFrame) -> pd.DataFrame:
         "beta_combo_joint",
         "se_combo_joint",
         "p_combo_joint",
+        "p_combo_joint_fdr",
         "p_lit1_joint",
         "p_lit2_joint",
     ]
@@ -780,6 +863,10 @@ def _garfield_compact_fvlmm2_output_df(full_df: pd.DataFrame) -> pd.DataFrame:
             ),
             "p_combo_joint": pd.to_numeric(
                 getattr(rec, "p_combo_joint", float("nan")),
+                errors="coerce",
+            ),
+            "p_combo_joint_fdr": pd.to_numeric(
+                getattr(rec, "p_combo_joint_fdr", float("nan")),
                 errors="coerce",
             ),
             "p_lit1_joint": pd.to_numeric(getattr(rec, "p1_joint", float("nan")), errors="coerce"),
@@ -896,6 +983,9 @@ def _build_garfield_fvlmm2_expanded_df(
                     "combo_beta_joint": float(rec.beta_combo_joint),
                     "combo_se_joint": float(rec.se_combo_joint),
                     "combo_pwald_joint": float(rec.p_combo_joint),
+                    "combo_pwald_joint_fdr": float(
+                        getattr(rec, "p_combo_joint_fdr", float("nan"))
+                    ),
                 }
             )
             out_rows.append(row)
@@ -936,6 +1026,7 @@ def _build_garfield_fvlmm2_expanded_df(
                     "se": float(rec.se_combo_joint),
                     "chisq": _garfield_followup_chisq(rec.beta_combo_joint, rec.se_combo_joint),
                     "pwald": float(rec.p_combo_joint),
+                    "pwald_fdr": float(getattr(rec, "p_combo_joint_fdr", float("nan"))),
                     "row_role": "combo",
                     "component_index": int(component_index),
                     "parent_combo": str(rec.combo),
@@ -948,6 +1039,9 @@ def _build_garfield_fvlmm2_expanded_df(
                     "combo_beta_joint": float(rec.beta_combo_joint),
                     "combo_se_joint": float(rec.se_combo_joint),
                     "combo_pwald_joint": float(rec.p_combo_joint),
+                    "combo_pwald_joint_fdr": float(
+                        getattr(rec, "p_combo_joint_fdr", float("nan"))
+                    ),
                 }
             )
             out_rows.append(row)
@@ -965,6 +1059,7 @@ def _build_garfield_fvlmm2_expanded_df(
         "se",
         "chisq",
         "pwald",
+        "pwald_fdr",
         "row_role",
         "component_index",
         "parent_combo",
@@ -977,10 +1072,201 @@ def _build_garfield_fvlmm2_expanded_df(
         "combo_beta_joint",
         "combo_se_joint",
         "combo_pwald_joint",
+        "combo_pwald_joint_fdr",
     ]
     ordered = [col for col in preferred if col in out_df.columns]
     ordered.extend([col for col in out_df.columns if col not in ordered])
     return out_df.loc[:, ordered]
+
+
+def _run_garfield_pseudo_fvlmm(
+    *,
+    pseudo_prefix: str,
+    trait_label: str,
+    pheno_values: np.ndarray,
+    sample_ids: list[str],
+    trait_grm: np.ndarray,
+    trait_cov: Optional[np.ndarray],
+    logic_maf_threshold: float,
+    max_missing_rate: float,
+    het_threshold: float,
+    total_windows: int | None,
+    threads: int,
+    logger,
+    use_spinner: bool,
+    batch_size: int = 4096,
+) -> dict[str, object]:
+    pseudo_ids, pseudo_ctx = prepare_packed_ctx_from_plink(
+        str(pseudo_prefix),
+        maf=float(logic_maf_threshold),
+        missing_rate=float(max_missing_rate),
+        het_threshold=float(het_threshold),
+        snps_only=False,
+        filter_mode="compact",
+        use_cache=False,
+    )
+    pseudo_ids_arr = np.asarray(pseudo_ids, dtype=str)
+    expected_ids_arr = np.asarray(sample_ids, dtype=str)
+    if (
+        int(pseudo_ids_arr.shape[0]) != int(expected_ids_arr.shape[0])
+        or not np.array_equal(pseudo_ids_arr, expected_ids_arr)
+    ):
+        raise ValueError(
+            "GARFIELD pseudo follow-up sample mismatch between pseudo BED and aligned trait samples."
+        )
+
+    keep = np.isfinite(np.asarray(pheno_values, dtype=np.float64).reshape(-1))
+    if trait_cov is not None:
+        keep &= np.all(np.isfinite(np.asarray(trait_cov, dtype=np.float64)), axis=1)
+    keep_idx = np.flatnonzero(keep).astype(np.int64, copy=False)
+    n_keep = int(np.count_nonzero(keep))
+    cov_dim = 0 if trait_cov is None else int(np.asarray(trait_cov).shape[1])
+    if n_keep <= cov_dim + 4:
+        raise ValueError(
+            f"GARFIELD pseudo FvLMM has too few usable samples after alignment/filtering: n={n_keep}, cov={cov_dim}."
+        )
+
+    y_trait = np.ascontiguousarray(
+        np.asarray(pheno_values, dtype=np.float64).reshape(-1)[keep],
+        dtype=np.float64,
+    )
+    cov_trait = (
+        None
+        if trait_cov is None
+        else np.ascontiguousarray(np.asarray(trait_cov, dtype=np.float64)[keep, :], dtype=np.float64)
+    )
+    grm_trait = np.asarray(
+        np.asarray(trait_grm, dtype=np.float64)[np.ix_(keep_idx, keep_idx)],
+        dtype=np.float64,
+        order="C",
+    )
+    sample_indices_full = np.ascontiguousarray(keep_idx, dtype=np.int64)
+
+    pseudo_sites, _ = _fvlmm2_load_active_sites(str(pseudo_prefix), pseudo_ctx)
+    af = np.ascontiguousarray(
+        np.asarray(pseudo_ctx.get("af", pseudo_ctx["maf"]), dtype=np.float32).reshape(-1),
+        dtype=np.float32,
+    )
+    miss = np.ascontiguousarray(
+        np.asarray(pseudo_ctx["missing_rate"], dtype=np.float32).reshape(-1),
+        dtype=np.float32,
+    )
+    if int(af.shape[0]) != len(pseudo_sites) or int(miss.shape[0]) != len(pseudo_sites):
+        raise ValueError(
+            "GARFIELD pseudo FvLMM metadata length mismatch: "
+            f"sites={len(pseudo_sites)}, af={int(af.shape[0])}, miss={int(miss.shape[0])}."
+        )
+
+    model = FvLMM(y_trait, cov_trait, grm_trait)
+    rows: list[dict[str, object]] = []
+    step = max(1, int(batch_size))
+    n_sites = len(pseudo_sites)
+    for start in range(0, n_sites, step):
+        end = min(start + step, n_sites)
+        local_rows = np.arange(start, end, dtype=np.int64)
+        decoded = _fvlmm2_decode_rows(
+            pseudo_ctx,
+            row_indices_local=local_rows,
+            sample_indices_full=sample_indices_full,
+        )
+        stats = np.asarray(model.gwas(decoded, threads=int(threads)), dtype=np.float64)
+        for idx_local, stat in enumerate(stats, start=start):
+            site = pseudo_sites[idx_local]
+            snp = str(site.snp)
+            rows.append(
+                {
+                    "chrom": str(site.chrom),
+                    "pos": int(site.pos),
+                    "snp": snp,
+                    "allele0": str(site.allele0),
+                    "allele1": str(site.allele1),
+                    "af": float(af[idx_local]),
+                    "miss": float(miss[idx_local]),
+                    "beta": float(stat[0]),
+                    "se": float(stat[1]),
+                    "chisq": _garfield_followup_chisq(stat[0], stat[1]),
+                    "pwald": float(stat[2]),
+                    "row_role": _garfield_followup_row_role(snp),
+                }
+            )
+
+    full_df = pd.DataFrame(rows)
+    full_df = _attach_garfield_logic_padj(
+        full_df,
+        p_col="pwald",
+        snp_col="snp",
+        role_col="row_role",
+        out_col="padj",
+        n_tests=total_windows,
+    )
+    tsv_df = _format_garfield_fvlmm_output_df_for_tsv(full_df)
+
+    out_base = f"{pseudo_prefix}.{trait_label}.fvlmm"
+    tsv_path = f"{out_base}.tsv"
+    figure_path = f"{out_base}.svg"
+    tsv_df.to_csv(tsv_path, sep="\t", index=False)
+    saved_paths = [tsv_path]
+
+    if tsv_df.shape[0] > 0:
+        _run_fastplot_from_tsv_with_status(
+            tsv_path,
+            y_trait,
+            xlabel=str(trait_label),
+            outpdf=figure_path,
+            use_spinner=bool(use_spinner),
+            emit_done_line=False,
+        )
+        saved_paths.append(figure_path)
+
+    combo_unique = pd.DataFrame(columns=["snp", "pwald", "padj"])
+    if full_df.shape[0] > 0:
+        combo_unique = (
+            full_df.loc[full_df["row_role"].astype(str).str.lower().eq("combo"), ["snp", "pwald", "padj"]]
+            .drop_duplicates(subset=["snp"], keep="first")
+            .copy()
+        )
+        combo_unique["pwald"] = pd.to_numeric(combo_unique["pwald"], errors="coerce")
+        combo_unique["padj"] = pd.to_numeric(combo_unique["padj"], errors="coerce")
+        combo_unique = combo_unique.sort_values(by=["pwald", "snp"], kind="mergesort").reset_index(drop=True)
+
+    best_combo = None
+    best_combo_p = float("nan")
+    best_combo_padj = float("nan")
+    if combo_unique.shape[0] > 0:
+        best_row = combo_unique.iloc[0]
+        best_combo = str(best_row.get("snp", ""))
+        best_combo_p = float(best_row.get("pwald", float("nan")))
+        best_combo_padj = float(best_row.get("padj", float("nan")))
+
+    summary_rows = [
+        {
+            "trait": str(trait_label),
+            "n_rows_tested": int(full_df.shape[0]),
+            "n_combo_tested": int(combo_unique.shape[0]),
+            "fdr_n_tests": (
+                int(total_windows)
+                if total_windows is not None and int(total_windows) > 0
+                else int(combo_unique.shape[0])
+            ),
+            "best_combo": best_combo,
+            "best_combo_p": best_combo_p,
+            "best_combo_padj": best_combo_padj,
+            "route": "fvlmm",
+        }
+    ]
+    return {
+        "saved_paths": saved_paths,
+        "tsv_paths": [tsv_path],
+        "figure_paths": [figure_path] if tsv_df.shape[0] > 0 else [],
+        "summary_rows": summary_rows,
+        "tsv_path": tsv_path,
+        "raw_tsv_path": None,
+        "expanded_tsv_path": None,
+        "skipped_tsv_path": None,
+        "figure_path": figure_path if tsv_df.shape[0] > 0 else None,
+        "n_rules_supported": int(combo_unique.shape[0]),
+        "n_rules_skipped": 0,
+    }
 
 
 def _run_garfield_pseudo_fvlmm2(
@@ -999,6 +1285,8 @@ def _run_garfield_pseudo_fvlmm2(
     source_name_map: dict[str, list[int]],
     maf_threshold: float,
     max_missing_rate: float,
+    het_threshold: float,
+    fdr_n_tests: int | None,
     threads: int,
     logger,
     use_spinner: bool,
@@ -1065,6 +1353,13 @@ def _run_garfield_pseudo_fvlmm2(
     )
     if rule_meta_df.shape[0] > 0:
         full_df = full_df.merge(rule_meta_df, on="combo", how="left", sort=False)
+    full_df = _fvlmm2_attach_combo_joint_fdr(
+        full_df,
+        p_col="p_combo_joint",
+        out_col="p_combo_joint_fdr",
+        group_col="garfield_unit_name",
+        n_tests=fdr_n_tests,
+    )
     tsv_df = _fvlmm2_format_output_df_for_tsv(_garfield_compact_fvlmm2_output_df(full_df))
     tsv_df.to_csv(tsv_path, sep="\t", index=False)
     saved_paths.append(tsv_path)
@@ -1074,6 +1369,7 @@ def _run_garfield_pseudo_fvlmm2(
         expected_sample_ids=list(sample_ids),
         maf_threshold=float(maf_threshold),
         max_missing_rate=float(max_missing_rate),
+        het_threshold=float(het_threshold),
     )
     expanded_df = _build_garfield_fvlmm2_expanded_df(
         raw_df=full_df,
@@ -1106,6 +1402,7 @@ def _run_garfield_pseudo_fvlmm2(
     summary_rows: list[dict[str, object]] = []
     best_combo = None
     best_combo_joint_p = float("nan")
+    best_combo_joint_fdr = float("nan")
     best_combo_marginal_p = float("nan")
     if full_df.shape[0] > 0 and "p_combo_joint" in full_df.columns:
         p_joint = pd.to_numeric(full_df["p_combo_joint"], errors="coerce")
@@ -1114,14 +1411,23 @@ def _run_garfield_pseudo_fvlmm2(
             best_row = full_df.loc[best_idx]
             best_combo = str(best_row.get("combo", ""))
             best_combo_joint_p = float(best_row.get("p_combo_joint", float("nan")))
+            best_combo_joint_fdr = float(best_row.get("p_combo_joint_fdr", float("nan")))
             best_combo_marginal_p = float(best_row.get("p_combo_marginal", float("nan")))
     summary_rows.append(
         {
             "trait": str(trait_label),
             "n_pairs_tested": int(full_df.shape[0]),
+            "fdr_n_tests": (
+                int(fdr_n_tests)
+                if fdr_n_tests is not None and int(fdr_n_tests) > 0
+                else int(full_df["garfield_unit_name"].nunique())
+                if "garfield_unit_name" in full_df.columns
+                else int(full_df.shape[0])
+            ),
             "n_rules_skipped": int(len(skipped)),
             "best_combo": best_combo,
             "best_combo_joint_p": best_combo_joint_p,
+            "best_combo_joint_fdr": best_combo_joint_fdr,
             "best_combo_marginal_p": best_combo_marginal_p,
             "route": "fvlmm2",
         }
@@ -1343,12 +1649,13 @@ def _garfield_pseudo_pmeta_paths(
     pseudo_prefix: str,
     maf_threshold: float,
     max_missing_rate: float,
+    het_threshold: float,
 ) -> list[str]:
     cache_prefix = packed_meta_cache_prefix(
         str(pseudo_prefix),
         maf=float(maf_threshold),
         missing_rate=float(max_missing_rate),
-        het_threshold=0.0,
+        het_threshold=float(het_threshold),
         snps_only=False,
     )
     stem = f"{cache_prefix}.pmeta"
@@ -1603,9 +1910,20 @@ def main() -> None:
         help_profile="pureline",
         include_maf=True,
         include_geno=True,
-        include_het=False,
+        include_het=True,
         maf_default=0.02,
         geno_default=0.05,
+        het_default=1.0,
+    )
+    optional_group.add_argument(
+        "-lmaf",
+        "--lmaf",
+        type=float,
+        default=0.02,
+        help=(
+            "MAF threshold for logic/pseudo SNPs generated by GARFIELD "
+            "(default: %(default)s). Input genotype filtering still uses -maf/--maf."
+        ),
     )
     optional_group.add_argument(
         "-dev",
@@ -1749,8 +2067,12 @@ def main() -> None:
         parser.error("-step/--step must be > 0")
     if not (0.0 <= float(args.maf) <= 0.5):
         parser.error("-maf/--maf must be in [0, 0.5]")
+    if not (0.0 <= float(args.lmaf) <= 0.5):
+        parser.error("-lmaf/--lmaf must be in [0, 0.5]")
     if not (0.0 <= float(args.geno) <= 1.0):
         parser.error("-geno/--geno must be in [0, 1]")
+    if not (0.0 <= float(args.het) <= 1.0):
+        parser.error("-het/--het must be in [0, 1]")
     if (
         args.grm is not None
         and str(args.grm).strip().isdigit()
@@ -1903,8 +2225,10 @@ def main() -> None:
         ("Scan mode", args.scan_mode),
         ("Gene file", args.genefile),
         ("GFF3", gff3_effective if gff3_effective else ("ignored" if args.gff3 else None)),
-        ("MAF", float(args.maf)),
-        ("Missing max (1+NA)", float(args.geno)),
+        ("Input MAF", float(args.maf)),
+        ("Logic MAF", float(args.lmaf)),
+        ("Missing max (NA only)", float(args.geno)),
+        ("Het max", float(args.het)),
         ("Extension", int(args.extension)),
         ("Step", int(args.step)),
         ("Bimrange", None if not args.bimrange else ",".join(str(x) for x in args.bimrange)),
@@ -1964,7 +2288,7 @@ def main() -> None:
         snps_only=False,
         maf_threshold=float(args.maf),
         max_missing_rate=float(args.geno),
-        het_threshold=0.0,
+        het_threshold=float(args.het),
     )
     sample_ids = np.asarray(sample_ids, dtype=str)
     if len(sample_ids) == 0:
@@ -2040,9 +2364,6 @@ def main() -> None:
         if aligned_grm is None
         else np.asarray(aligned_grm, dtype=np.float64, order="C")
     )
-    followup_source_packed_ctx: dict[str, object] | None = None
-    followup_source_sites: list[object] | None = None
-    followup_source_name_map: dict[str, list[int]] | None = None
 
     group_labels: list[str] = []
     group_intervals: list[list[tuple[str, int, int]]] = []
@@ -2055,6 +2376,7 @@ def main() -> None:
             n_snps=int(_n_snps),
             maf_threshold=float(args.maf),
             max_missing_rate=float(args.geno),
+            het_threshold=float(args.het),
             snps_only=False,
             threads=int(args.thread),
             use_spinner=use_spinner,
@@ -2106,6 +2428,7 @@ def main() -> None:
                 n_snps=int(_n_snps),
                 maf_threshold=float(args.maf),
                 max_missing_rate=float(args.geno),
+                het_threshold=float(args.het),
                 snps_only=False,
                 threads=int(args.thread),
                 use_spinner=use_spinner,
@@ -2181,7 +2504,9 @@ def main() -> None:
                 beam_width=int(args.beam_width),
                 rank_score=str(args.rank_score),
                 maf_threshold=float(args.maf),
+                logic_maf_threshold=float(args.lmaf),
                 max_missing_rate=float(args.geno),
+                het_threshold=float(args.het),
                 snps_only=False,
                 block_cols=65536,
                 threads=int(args.thread),
@@ -2248,12 +2573,9 @@ def main() -> None:
         followup_memory_debug = None
         pseudo_prefix = result.get("pseudo_prefix")
         rules_tsv = result.get("rules_tsv")
-        if pseudo_prefix and rules_tsv:
+        if pseudo_prefix:
             def _run_followup() -> dict[str, object]:
                 nonlocal followup_grm_full
-                nonlocal followup_source_packed_ctx
-                nonlocal followup_source_sites
-                nonlocal followup_source_name_map
                 if followup_grm_full is None:
                     followup_grm_full = _ensure_followup_grm(
                         existing_grm=None,
@@ -2262,28 +2584,11 @@ def main() -> None:
                         n_snps=_n_snps,
                         maf_threshold=float(args.maf),
                         max_missing_rate=float(args.geno),
+                        het_threshold=float(args.het),
                         threads=int(args.thread),
                         cache_dir=args.out,
                         logger=logger,
                         use_spinner=use_spinner,
-                    )
-                if (
-                    followup_source_packed_ctx is None
-                    or followup_source_sites is None
-                    or followup_source_name_map is None
-                ):
-                    _followup_ids, followup_source_packed_ctx = prepare_packed_ctx_from_plink(
-                        str(gfile),
-                        maf=float(args.maf),
-                        missing_rate=float(args.geno),
-                        het_threshold=0.0,
-                        snps_only=False,
-                        filter_mode="compact",
-                        use_cache=False,
-                    )
-                    followup_source_sites, followup_source_name_map = _fvlmm2_load_active_sites(
-                        str(gfile),
-                        followup_source_packed_ctx,
                     )
                 common_positions = np.asarray(
                     [sample_index_map[sid] for sid in common_ids],
@@ -2295,23 +2600,25 @@ def main() -> None:
                     order="C",
                 )
                 logger.info(
-                    f"Running pseudo FvLMM2 follow-up for '{trait_name}' on {int(n_rules)} GARFIELD rule(s)."
+                    f"Running pseudo FvLMM follow-up for '{trait_name}' on {int(n_rules)} GARFIELD rule(s)."
                 )
-                return _run_garfield_pseudo_fvlmm2(
-                    genofile=str(gfile),
+                return _run_garfield_pseudo_fvlmm(
                     pseudo_prefix=str(pseudo_prefix),
-                    rules_tsv=str(rules_tsv),
                     trait_label=suffix,
                     pheno_values=np.asarray(y_common, dtype=np.float64),
                     sample_ids=list(common_ids),
-                    sample_indices_full=common_positions,
                     trait_grm=trait_grm_followup,
                     trait_cov=trait_cov,
-                    source_packed_ctx=followup_source_packed_ctx,
-                    source_sites=followup_source_sites,
-                    source_name_map=followup_source_name_map,
-                    maf_threshold=float(args.maf),
+                    logic_maf_threshold=float(args.lmaf),
                     max_missing_rate=float(args.geno),
+                    het_threshold=float(args.het),
+                    total_windows=(
+                        int(result.get("units_scanned", 0))
+                        if int(result.get("units_scanned", 0)) > 0
+                        else int(result.get("units_total", 0))
+                        if int(result.get("units_total", 0)) > 0
+                        else None
+                    ),
                     threads=int(args.thread),
                     logger=logger,
                     use_spinner=use_spinner,
@@ -2330,9 +2637,9 @@ def main() -> None:
                     "follow-up",
                     followup_memory_debug,
                 )
-        elif pseudo_prefix and not rules_tsv:
+        elif not pseudo_prefix:
             logger.warning(
-                "GARFIELD pseudo follow-up skipped for '%s' because rules.tsv is missing.",
+                "GARFIELD pseudo follow-up skipped for '%s' because pseudo BED is missing.",
                 trait_name,
             )
         _remove_file_if_exists(run_config_path)
@@ -2395,8 +2702,11 @@ def main() -> None:
             "grm_path": args.grm,
             "grm_id_path": resolved_grm_id,
             "maf": float(args.maf),
+            "logic_maf": float(args.lmaf),
             "geno": float(args.geno),
-            "pure_line_missing_rule": "heterozygote_or_na",
+            "het": float(args.het),
+            "pure_line_missing_rule": "na_only",
+            "pure_line_het_rule": "drop_if_het_rate_gt_threshold",
             "simbench_path": args.simbench,
             "simbench_rows": int(result.get("n_simbench", 0)),
             "seed": trait_seed,
@@ -2415,6 +2725,22 @@ def main() -> None:
             "memory_debug": trait_memory_debug,
             "outputs": {
                 "rules_tsv": result.get("rules_tsv"),
+                "pseudo_fvlmm_raw_tsv": None,
+                "pseudo_fvlmm_tsv": (
+                    None
+                    if pseudo_gwas_payload is None
+                    else pseudo_gwas_payload.get("tsv_path")
+                ),
+                "pseudo_fvlmm_skipped_tsv": (
+                    None
+                    if pseudo_gwas_payload is None
+                    else pseudo_gwas_payload.get("skipped_tsv_path")
+                ),
+                "pseudo_fvlmm_figure": (
+                    None
+                    if pseudo_gwas_payload is None
+                    else pseudo_gwas_payload.get("figure_path")
+                ),
                 "pseudo_fvlmm2_raw_tsv": None,
                 "pseudo_fvlmm2_tsv": (
                     None
@@ -2444,6 +2770,7 @@ def main() -> None:
             },
             "prior": prior_payload,
             "posterior": posterior_payload,
+            "pseudo_fvlmm": pseudo_gwas_payload,
             "pseudo_fvlmm2": pseudo_gwas_payload,
             "pseudo_fastlmm": pseudo_gwas_payload,
         }

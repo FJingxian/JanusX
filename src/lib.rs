@@ -101,6 +101,8 @@ mod binwriter;
 mod breader;
 #[path = "io/gfcore.rs"]
 mod gfcore;
+#[path = "io/gffanno.rs"]
+mod gffanno;
 #[path = "io/gfreader.rs"]
 mod gfreader;
 #[path = "io/gload.rs"]
@@ -223,6 +225,7 @@ use gblup::{
     farmcpu_q_packed_grm_pca_f32, gblup_effect_from_meta_stream, gblup_grm_from_meta_to_npy,
     gblup_reml_npy_grm, gblup_reml_packed_bed, packed_mtm_f64,
 };
+use gffanno::GffAnnotationIndex;
 use gfreader::{
     bed_filter_stream_to_plink_rust, bed_filter_to_plink_rust, bed_mmap_filter_to_plink_rust,
     count_hmp_snps, count_vcf_snps, gfd_packbits_from_dosage_block, load_bed_2bit_packed,
@@ -705,6 +708,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_class::<SimEngine>()?;
     m.add_class::<SimTraitAccumulator>()?;
     m.add_class::<SiteInfo>()?;
+    m.add_class::<GffAnnotationIndex>()?;
     m.add_class::<FvLmmAssocCache>()?;
     m.add_class::<RrblupExactSnpCache>()?;
     m.add_class::<RrblupCenteredExactSnpCache>()?;

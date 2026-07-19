@@ -396,6 +396,66 @@ def _delta_pwald_orders_of_magnitude(
     return float(np.log10(best_parent) - np.log10(child))
 
 
+def _bh_adjust(pvalues: object, *, n_tests: int | None = None) -> np.ndarray:
+    arr = np.asarray(pvalues, dtype=np.float64).reshape(-1)
+    out = np.full(arr.shape, np.nan, dtype=np.float64)
+    valid = np.isfinite(arr) & (arr >= 0.0)
+    if not bool(np.any(valid)):
+        return out
+    pv = np.clip(arr[valid], 0.0, 1.0)
+    m_valid = int(pv.shape[0])
+    m_total = m_valid if n_tests is None else max(m_valid, int(n_tests))
+    order = np.argsort(pv, kind="mergesort")
+    ranked = pv[order]
+    ranks = np.arange(1, m_valid + 1, dtype=np.float64)
+    adjusted_sorted = np.minimum.accumulate((ranked * (float(m_total) / ranks))[::-1])[::-1]
+    adjusted_sorted = np.maximum(adjusted_sorted, ranked)
+    adjusted_sorted = np.clip(adjusted_sorted, 0.0, 1.0)
+    adjusted_valid = np.empty_like(pv)
+    adjusted_valid[order] = adjusted_sorted
+    out[valid] = adjusted_valid
+    return out
+
+
+def _attach_combo_joint_fdr(
+    df: pd.DataFrame,
+    *,
+    p_col: str = "p_combo_joint",
+    out_col: str = "p_combo_joint_fdr",
+    group_col: str | None = None,
+    n_tests: int | None = None,
+) -> pd.DataFrame:
+    out = df.copy()
+    if out.shape[0] == 0:
+        out[out_col] = pd.Series(dtype=np.float64)
+        return out
+    if p_col not in out.columns:
+        out[out_col] = np.full((int(out.shape[0]),), np.nan, dtype=np.float64)
+        return out
+
+    pvals = pd.to_numeric(out[p_col], errors="coerce")
+    if group_col is not None and group_col in out.columns:
+        groups = out[group_col].fillna("").astype(str).str.strip()
+        row_groups = groups.copy()
+        missing_mask = (row_groups == "") | (row_groups == ".") | (row_groups.str.lower() == "nan")
+        if bool(np.any(missing_mask.to_numpy(dtype=np.bool_))):
+            row_groups.loc[missing_mask] = [f"__row_{int(i)}" for i in row_groups.index[missing_mask]]
+        grouped = pd.DataFrame({"group": row_groups, "pvalue": pvals}, index=out.index)
+        group_min = grouped.groupby("group", sort=False)["pvalue"].min()
+        m_total = int(group_min.shape[0]) if n_tests is None else max(int(group_min.shape[0]), int(n_tests))
+        group_adj = pd.Series(
+            _bh_adjust(group_min.to_numpy(dtype=np.float64), n_tests=m_total),
+            index=group_min.index,
+            dtype=np.float64,
+        )
+        out[out_col] = grouped["group"].map(group_adj).to_numpy(dtype=np.float64, copy=False)
+        return out
+
+    m_total = int(pvals.notna().sum()) if n_tests is None else max(int(pvals.notna().sum()), int(n_tests))
+    out[out_col] = _bh_adjust(pvals.to_numpy(dtype=np.float64, copy=False), n_tests=m_total)
+    return out
+
+
 def _compact_fvlmm2_output_df(full_df: pd.DataFrame) -> pd.DataFrame:
     columns = [
         "chrom",
@@ -406,6 +466,7 @@ def _compact_fvlmm2_output_df(full_df: pd.DataFrame) -> pd.DataFrame:
         "beta_combo_joint",
         "se_combo_joint",
         "p_combo_joint",
+        "p_combo_joint_fdr",
         "p_lit1_joint",
         "p_lit2_joint",
     ]
@@ -427,6 +488,10 @@ def _compact_fvlmm2_output_df(full_df: pd.DataFrame) -> pd.DataFrame:
             "beta_combo_joint": pd.to_numeric(full_df["beta_combo_joint"], errors="coerce"),
             "se_combo_joint": pd.to_numeric(full_df["se_combo_joint"], errors="coerce"),
             "p_combo_joint": pd.to_numeric(full_df["p_combo_joint"], errors="coerce"),
+            "p_combo_joint_fdr": pd.to_numeric(
+                full_df.get("p_combo_joint_fdr", np.nan),
+                errors="coerce",
+            ),
             "p_lit1_joint": pd.to_numeric(full_df["p1_joint"], errors="coerce"),
             "p_lit2_joint": pd.to_numeric(full_df["p2_joint"], errors="coerce"),
         },
@@ -482,6 +547,7 @@ def _format_fvlmm2_output_df_for_tsv(df: pd.DataFrame) -> pd.DataFrame:
         out[col] = [_format_fixed4(v) for v in out[col]]
     for col in (
         "p_combo_joint",
+        "p_combo_joint_fdr",
         "p_lit1_joint",
         "p_lit2_joint",
     ):
@@ -763,7 +829,7 @@ def build_parser() -> argparse.ArgumentParser:
         include_het=True,
         maf_default=0.02,
         geno_default=0.05,
-        het_default=0.0,
+        het_default=1.0,
     )
     add_common_snps_only_arg(filt, default=False)
 
@@ -774,6 +840,15 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=4096,
         help="Number of interaction rows processed per batch (default: %(default)s).",
+    )
+    run.add_argument(
+        "--n-tests",
+        type=int,
+        default=0,
+        help=(
+            "Optional total hypothesis count for BH-FDR adjustment of p_combo_joint. "
+            "Default: use the number of tested interaction rows."
+        ),
     )
 
     out = parser.add_argument_group("Output")
@@ -790,6 +865,8 @@ def main(argv: list[str] | None = None) -> int:
         args.ncol = parse_trait_selector_specs(args.ncol, label="-n/--n")
     except ValueError as ex:
         parser.error(str(ex))
+    if int(args.n_tests) < 0:
+        parser.error("--n-tests must be >= 0")
 
     detected_threads = int(detect_effective_threads())
     requested_threads = int(args.thread)
@@ -885,6 +962,7 @@ def main(argv: list[str] | None = None) -> int:
                         ),
                     ),
                     ("Batch size", int(args.batch_size)),
+                    ("FDR tests", (int(args.n_tests) if int(args.n_tests) > 0 else "auto")),
                 ],
             ),
         ],
@@ -989,6 +1067,13 @@ def main(argv: list[str] | None = None) -> int:
             specs=specs,
             threads=int(args.thread),
             batch_size=int(args.batch_size),
+        )
+        full_df = _attach_combo_joint_fdr(
+            full_df,
+            p_col="p_combo_joint",
+            out_col="p_combo_joint_fdr",
+            group_col=None,
+            n_tests=(int(args.n_tests) if int(args.n_tests) > 0 else None),
         )
         df = _format_fvlmm2_output_df_for_tsv(_compact_fvlmm2_output_df(full_df))
         tsv_path = f"{outprefix}.{trait_tag}.fvlmm2.tsv"

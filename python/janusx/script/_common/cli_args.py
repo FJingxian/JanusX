@@ -212,7 +212,7 @@ def missing_rate_filter_help_text() -> str:
 def het_filter_help_text() -> str:
     return (
         "Maximum allowed heterozygosity rate threshold. "
-        "Sites with het rate greater than this threshold are removed; 0 disables this filter "
+        "Sites with het rate greater than this threshold are removed; 1 keeps all sites by het "
         "(default: %(default)s)."
     )
 
@@ -239,10 +239,8 @@ def _resolve_variant_filter_help(
         },
         "pureline": {
             "maf": "Minor allele frequency threshold.",
-            "geno": (
-                "Maximum pure-line missing rate threshold; heterozygotes (1) and true missing (NA) "
-                "are both counted as missing."
-            ),
+            "geno": "Maximum true-missing rate threshold under pure-line GARFIELD.",
+            "het": "Maximum heterozygosity rate threshold under pure-line GARFIELD.",
         },
         "packed_filter": {
             "maf": "MAF threshold for packed filtering.",
@@ -259,7 +257,10 @@ def _resolve_variant_filter_help(
         "simulation": {
             "maf": "Exclude variants with minor allele frequency lower than a threshold (default: 0.02).",
             "geno": "Exclude variants with missing call frequencies greater than a threshold (default: 0.05).",
-            "het": "Optional maximum heterozygosity rate per variant in [0,1]. Disabled by default.",
+            "het": (
+                "Maximum heterozygosity rate per variant in [0,1]. "
+                "Sites with het rate above this threshold are removed."
+            ),
         },
     }
     selected = table.get(key, table["default"])
@@ -424,7 +425,7 @@ def add_common_geno_arg(
 def add_common_het_arg(
     group: argparse._ArgumentGroup,
     *,
-    default: float | None = 0.0,
+    default: float | None = 1.0,
     help_profile: str = "default",
     help_text: str | None = None,
 ) -> None:
@@ -450,7 +451,7 @@ def add_common_variant_filter_args(
     include_het: bool = False,
     maf_default: float = 0.02,
     geno_default: float = 0.05,
-    het_default: float | None = 0.0,
+    het_default: float | None = 1.0,
     maf_help_text: str | None = None,
     geno_help_text: str | None = None,
     het_help_text: str | None = None,

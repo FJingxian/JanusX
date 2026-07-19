@@ -1922,7 +1922,7 @@ def main(log: bool = True):
         include_het=True,
         maf_default=0.02,
         geno_default=0.05,
-        het_default=0.0,
+        het_default=1.0,
     )
     add_common_memory_arg(
         optional_group,

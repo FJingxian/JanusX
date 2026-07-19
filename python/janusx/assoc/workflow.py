@@ -2377,7 +2377,7 @@ def _cache_prefix_tilde(
     snps_only: bool = True,
     maf: float = 0.02,
     max_missing_rate: float = 0.05,
-    het_threshold: float = 0.01,
+    het_threshold: float = 1.0,
 ) -> str:
     """
     Cache prefix used by gfreader for VCF/HMP/TXT temporary converted files.
@@ -2392,7 +2392,7 @@ def _detect_cache_need(
     snps_only: bool = True,
     maf: float = 0.02,
     max_missing_rate: float = 0.05,
-    het_threshold: float = 0.01,
+    het_threshold: float = 1.0,
     force_kind: Optional[str] = None,
 ) -> tuple[bool, str, list[str]]:
     """
@@ -2495,7 +2495,7 @@ def _inspect_genotype_file_with_warnings(
     snps_only: bool = True,
     maf_threshold: float = 0.02,
     max_missing_rate: float = 0.05,
-    het_threshold: float = 0.01,
+    het_threshold: float = 1.0,
     force_kind: Optional[str] = None,
 ) -> tuple[np.ndarray, int, list[str]]:
     """
@@ -2543,7 +2543,7 @@ def _inspect_genotype_with_status(
     snps_only: bool = True,
     maf_threshold: float = 0.02,
     max_missing_rate: float = 0.05,
-    het_threshold: float = 0.01,
+    het_threshold: float = 1.0,
     warning_collector: Union[list[str], None] = None,
     force_kind: Optional[str] = None,
     emit_complete: bool = True,
@@ -6470,7 +6470,7 @@ def parse_args(argv: Optional[list[str]] = None):
         include_het=True,
         maf_default=0.02,
         geno_default=0.05,
-        het_default=0.0,
+        het_default=1.0,
     )
     optional_group.add_argument(
         "--farmcpu-iter", type=int, default=30,
@@ -6740,7 +6740,7 @@ def _prepare_qtn_packed_preload(
                 str(prefix),
                 maf_threshold=float(getattr(args, "maf", 0.02)),
                 max_missing_rate=float(getattr(args, "geno", 0.05)),
-                het_threshold=float(getattr(args, "het", 0.0)),
+                het_threshold=float(getattr(args, "het", 1.0)),
                 snps_only=bool(getattr(args, "snps_only", False)),
                 outprefix=(
                     str(getattr(args, "out", ""))
@@ -6755,7 +6755,7 @@ def _prepare_qtn_packed_preload(
                 genofile=str(prefix),
                 maf_threshold=float(getattr(args, "maf", 0.02)),
                 max_missing_rate=float(getattr(args, "geno", 0.05)),
-                het_threshold=float(getattr(args, "het", 0.0)),
+                het_threshold=float(getattr(args, "het", 1.0)),
                 snps_only=bool(getattr(args, "snps_only", False)),
                 use_spinner=False,
                 preloaded_packed=None,
@@ -6820,8 +6820,8 @@ def _run_gwas_pipeline(
     if int(args.thread) > int(detected_threads):
         thread_capped = True
         args.thread = int(detected_threads)
-    if not (0.0 <= args.het <= 0.5):
-        raise ValueError("--het must be within [0, 0.5].")
+    if not (0.0 <= args.het <= 1.0):
+        raise ValueError("--het must be within [0, 1].")
 
     gfile, prefix = determine_genotype_source(args)
 
@@ -7086,8 +7086,8 @@ def _run_gwas_pipeline(
         if qtn_input_requested and (args.farmcpu or args.algwas):
             _qtn_kind, _qtn_path, _ = _qtn_source_from_args(args) or ("", "", None)
             cfg_rows.append(("QTN stage1 input", f"{_qtn_kind}:{_qtn_path}"))
-        if float(args.het) > 0.0:
-            cfg_rows.append(("Het filter", f"{float(args.het):g} (keep [{float(args.het):g}, {1.0 - float(args.het):g}])"))
+        if float(args.het) < 1.0:
+            cfg_rows.append(("Het filter", f"het<={float(args.het):g}"))
         if args.farmcpu:
             cfg_rows.extend(
                 [
@@ -7176,9 +7176,9 @@ def _run_gwas_pipeline(
             ("Memory", memory_cfg),
             ("Force Model", bool(args.force_model)),
         ]
-        if float(args.het) > 0.0:
+        if float(args.het) < 1.0:
             advanced_config_rows.append(
-                ("Het Filter", f"{float(args.het):g} (keep [{float(args.het):g}, {1.0 - float(args.het):g}])")
+                ("Het Filter", f"het<={float(args.het):g}")
             )
         if args.cov:
             advanced_config_rows.append(("Covariates", "; ".join(str(x) for x in args.cov)))

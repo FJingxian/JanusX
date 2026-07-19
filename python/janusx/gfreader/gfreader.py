@@ -167,7 +167,7 @@ def prepare_bed_2bit_packed(
     *,
     maf_threshold: float = 0.0,
     max_missing_rate: float = 1.0,
-    het_threshold: float = 0.0,
+    het_threshold: float = 1.0,
     snps_only: bool = False,
 ):
     """
@@ -217,7 +217,7 @@ def prepare_bed_logic_meta_selected(
     sample_indices=None,
     maf_threshold: float = 0.0,
     max_missing_rate: float = 1.0,
-    het_threshold: float = 0.0,
+    het_threshold: float = 1.0,
     snps_only: bool = False,
     mmap_window_mb=None,
     threads: int = 1,
@@ -265,7 +265,7 @@ def prepare_bed_logic_keep_mask(
     sample_indices=None,
     maf_threshold: float = 0.0,
     max_missing_rate: float = 1.0,
-    het_threshold: float = 0.0,
+    het_threshold: float = 1.0,
     snps_only: bool = False,
     mmap_window_mb=None,
     threads: int = 1,
@@ -308,6 +308,7 @@ def prepare_bed_logic_keep_mask_pure_line(
     sample_indices=None,
     maf_threshold: float = 0.0,
     max_missing_rate: float = 1.0,
+    het_threshold: float = 1.0,
     snps_only: bool = False,
     mmap_window_mb: int | None = None,
     threads: int = 1,
@@ -337,6 +338,7 @@ def prepare_bed_logic_keep_mask_pure_line(
         sample_indices=sample_idx_arr,
         maf_threshold=float(maf_threshold),
         max_missing_rate=float(max_missing_rate),
+        het_threshold=float(het_threshold),
         snps_only=bool(snps_only),
         mmap_window_mb=mmap_window_mb,
         threads=max(1, int(threads)),
@@ -1498,7 +1500,7 @@ def bed_chunk_reader(
     missing_rate: float = 1.0,
     impute: bool = True,
     model: str = "add",
-    het: float = 0.02,
+    het: float = 1.0,
     *,
     snp_range: Union[tuple[int, int] , None] = None,
     snp_indices: Union[list[int],None ]= None,
@@ -1564,7 +1566,7 @@ def bed_chunk_reader(
                 "BedChunkReader extension does not support chr/bp/ranges filtering. "
                 "Please rebuild/reinstall janusx Rust extension."
             )
-        if (str(model).strip().lower() != "add") or (abs(float(het) - 0.02) > 1e-12):
+        if (str(model).strip().lower() != "add") or (abs(float(het) - 1.0) > 1e-12):
             raise RuntimeError(
                 "BedChunkReader extension does not support model/het_threshold filtering. "
                 "Please rebuild/reinstall janusx Rust extension."
@@ -1660,8 +1662,8 @@ def _process_txt_like_chunk(
     model_key = str(model).lower()
     if model_key not in {"add", "dom", "rec", "het"}:
         raise ValueError("model must be one of: add, dom, rec, het")
-    if not (0.0 <= float(het) <= 0.5):
-        raise ValueError("het must be within [0, 0.5]")
+    if not (0.0 <= float(het) <= 1.0):
+        raise ValueError("het must be within [0, 1.0]")
 
     n_samples = int(g.shape[1])
     if n_samples <= 0:
@@ -1687,7 +1689,7 @@ def _process_txt_like_chunk(
     if maf_thr > 0.0:
         keep &= has_obs
 
-    apply_het = model_key != "add"
+    apply_het = float(het) < 1.0
     if apply_het:
         het_count = np.sum(np.isclose(g, 1.0, atol=1e-6) & valid, axis=1).astype(
             np.int64, copy=False
@@ -1757,7 +1759,7 @@ def load_genotype_chunks(
     missing_rate: float = 1.0,
     impute: bool = True,
     model: str = "add",
-    het: float = 0.02,
+    het: float = 1.0,
     *,
     snps_only: bool = True,
     snp_range: Union[tuple[int, int] , None] = None,
@@ -1814,12 +1816,12 @@ def load_genotype_chunks(
         If False, missing values remain negative (e.g. -9).
 
     model : {"add", "dom", "rec", "het"}
-        Genetic effect model flag used by Rust-side SNP filtering.
-        Non-additive models enable heterozygosity filtering.
+        Genetic effect model flag used for output coding in specialized readers.
+        Variant QC thresholds are applied independently of this choice.
 
     het : float
-        Heterozygosity filter threshold for non-additive models.
-        SNPs with het rate outside [het, 1-het] are filtered.
+        Maximum allowed heterozygosity rate per SNP.
+        SNPs with het rate greater than this threshold are filtered.
 
     Yields
     ------
@@ -2154,7 +2156,7 @@ def inspect_genotype_file(
     snps_only: bool = True,
     maf: float = 0.02,
     missing_rate: float = 0.05,
-    het: float = 0.01,
+    het: float = 1.0,
     delimiter: Union[str , None] = None,
     force_kind: Union[str, None] = None,
 ):

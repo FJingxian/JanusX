@@ -1277,7 +1277,7 @@ def _iter_filtered_chunks(
     chunks: Iterator[tuple[np.ndarray, list[SiteInfo]]],
     flt: SiteFilterSpec,
     *,
-    het_threshold: float = 0.0,
+    het_threshold: float = 1.0,
 ) -> Iterator[tuple[np.ndarray, list[SiteInfo]]]:
     for geno, sites in chunks:
         g2 = np.asarray(geno, dtype=np.float32)
@@ -1288,7 +1288,7 @@ def _iter_filtered_chunks(
         if len(s2) == 0:
             continue
 
-        if float(het_threshold) > 0.0:
+        if float(het_threshold) < 1.0:
             keep_mask = _heter_keep_mask(g2, float(het_threshold))
             if not np.any(keep_mask):
                 continue
@@ -2233,7 +2233,7 @@ def _iter_vcf_direct_chunks(
     maf_threshold: float,
     max_missing_rate: float,
     model: str = "add",
-    het_threshold: float = 0.02,
+    het_threshold: float = 1.0,
     snp_sites: list[tuple[str, int]] | None = None,
     bim_range: tuple[str, int, int] | None = None,
     chr_keys: set[str] | None = None,
@@ -2288,7 +2288,7 @@ def _iter_hmp_direct_chunks(
     maf_threshold: float,
     max_missing_rate: float,
     model: str = "add",
-    het_threshold: float = 0.02,
+    het_threshold: float = 1.0,
     snp_sites: list[tuple[str, int]] | None = None,
     bim_range: tuple[str, int, int] | None = None,
     chr_keys: set[str] | None = None,
@@ -2345,7 +2345,7 @@ def _iter_txt_direct_chunks(
     maf_threshold: float,
     max_missing_rate: float,
     model: str = "add",
-    het_threshold: float = 0.02,
+    het_threshold: float = 1.0,
     snp_sites: list[tuple[str, int]] | None = None,
     bim_range: tuple[str, int, int] | None = None,
     chr_keys: set[str] | None = None,
@@ -2410,8 +2410,8 @@ def _count_selected_sites(
     het_threshold: float,
 ) -> int:
     cnt = 0
-    reader_model = "het" if float(het_threshold) > 0.0 else "add"
-    reader_het = float(het_threshold) if float(het_threshold) > 0.0 else 0.02
+    reader_model = "add"
+    reader_het = float(het_threshold)
     chunks = load_genotype_chunks(
         gfile,
         chunk_size=50_000,
@@ -2502,10 +2502,10 @@ def build_parser() -> CliArgumentParser:
         "-het",
         "--het",
         type=float,
-        default=0.0,
+        default=1.0,
         help=(
             "Filter variants by maximum heterozygosity rate. Drop variants with het rate "
-            "greater than this threshold (default: %(default)s; no filtering)."
+            "greater than this threshold (default: %(default)s; keep all sites by het)."
         ),
     )
     opt.add_argument(
@@ -2603,8 +2603,8 @@ def main() -> None:
         parser.error("-maf must be within [0, 0.5].")
     if not (0.0 <= float(args.geno) <= 1.0):
         parser.error("-geno must be within [0, 1.0].")
-    if not (0.0 <= float(args.het) <= 0.5):
-        parser.error("-het must be within [0, 0.5].")
+    if not (0.0 <= float(args.het) <= 1.0):
+        parser.error("-het must be within [0, 1.0].")
     detected_threads = int(detect_effective_threads())
     requested_threads = int(args.thread)
     if requested_threads <= 0:
@@ -2797,8 +2797,8 @@ def main() -> None:
         push_bim_range = (c, start, end)
         post_filter = SiteFilterSpec()
 
-    reader_model = "het" if float(args.het) > 0.0 else "add"
-    reader_het = float(args.het) if float(args.het) > 0.0 else 0.02
+    reader_model = "add"
+    reader_het = float(args.het)
     site_type_snps_only = _simple_snp_only_requested(
         snps_only=bool(args.snps_only),
         biallelic_only=bool(args.biallelic_only),

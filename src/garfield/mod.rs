@@ -2373,6 +2373,15 @@ struct GarfieldUnitMlContext {
     ranked_global_rows: Vec<usize>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum GarfieldRuleSupportBits {
+    Binary(Box<[u64]>),
+    Dual {
+        ge1: Box<[u64]>,
+        ge2: Box<[u64]>,
+    },
+}
+
 #[derive(Clone, Debug)]
 struct GarfieldLogicRuleRecord {
     unit_name: String,
@@ -2382,6 +2391,8 @@ struct GarfieldLogicRuleRecord {
     ml_feature_count: usize,
     ml_rank: String,
     selected_row_indices: Vec<usize>,
+    display_ops: Vec<BeamBinaryOp>,
+    display_negated: Vec<bool>,
     snp_name: String,
     expr: String,
     chrom_field: String,
@@ -2396,8 +2407,7 @@ struct GarfieldLogicRuleRecord {
     score: f64,
     delta_score: String,
     delta_pwald: String,
-    full_bits: Vec<u64>,
-    full_ge2_bits: Option<Vec<u64>>,
+    support_bits: Option<GarfieldRuleSupportBits>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2606,6 +2616,41 @@ fn display_literal_negated(literal_negated: bool, polarity: GarfieldRuleDisplayP
         GarfieldRuleDisplayPolarity::Original => literal_negated,
         GarfieldRuleDisplayPolarity::Complement => !literal_negated,
     }
+}
+
+#[inline]
+fn display_binary_op(op: BeamBinaryOp, polarity: GarfieldRuleDisplayPolarity) -> BeamBinaryOp {
+    match polarity {
+        GarfieldRuleDisplayPolarity::Original => op,
+        GarfieldRuleDisplayPolarity::Complement => match op {
+            BeamBinaryOp::And => BeamBinaryOp::Or,
+            BeamBinaryOp::Or => BeamBinaryOp::And,
+        },
+    }
+}
+
+fn rule_display_negated_with_polarity(
+    rule: &BeamRule,
+    polarity: GarfieldRuleDisplayPolarity,
+) -> Vec<bool> {
+    let mut out = Vec::<bool>::with_capacity(rule.len());
+    out.push(display_literal_negated(rule.first.negated, polarity));
+    out.extend(
+        rule.rest
+            .iter()
+            .map(|(_, lit)| display_literal_negated(lit.negated, polarity)),
+    );
+    out
+}
+
+fn rule_display_ops_with_polarity(
+    rule: &BeamRule,
+    polarity: GarfieldRuleDisplayPolarity,
+) -> Vec<BeamBinaryOp> {
+    rule.rest
+        .iter()
+        .map(|(op, _)| display_binary_op(*op, polarity))
+        .collect()
 }
 
 #[inline]
@@ -3767,6 +3812,10 @@ fn evaluate_simbench_terms(
             ml_feature_count,
             ml_rank,
             selected_row_indices,
+            display_ops: simbench_logic_to_beam_op(term.logic)
+                .map(|op| vec![op; bench_sites.len().saturating_sub(1)])
+                .unwrap_or_default(),
+            display_negated: vec![false; bench_sites.len()],
             snp_name: simbench_rule_name(term.logic, bench_sites.as_slice(), &term.label),
             expr: sim_expr_txt,
             chrom_field: first_site.chrom.clone(),
@@ -3789,8 +3838,7 @@ fn evaluate_simbench_terms(
                 format_delta_metric_value(assoc.pwald),
                 format_delta_metric_value(assoc.pwald)
             ),
-            full_bits,
-            full_ge2_bits: None,
+            support_bits: Some(GarfieldRuleSupportBits::Binary(full_bits.into_boxed_slice())),
         });
     }
     Ok(out)
@@ -3954,7 +4002,7 @@ fn cmp_logic_rule_records(
 
 #[inline]
 fn logic_rule_not_count(rec: &GarfieldLogicRuleRecord) -> usize {
-    rec.snp_name.matches('!').count()
+    rec.display_negated.iter().filter(|&&neg| neg).count()
 }
 
 #[inline]
@@ -4009,10 +4057,14 @@ fn cmp_logic_rule_records_output(
         .then_with(|| a.unit_name.cmp(&b.unit_name))
 }
 
-fn dedup_logic_rule_records(records: Vec<GarfieldLogicRuleRecord>) -> Vec<GarfieldLogicRuleRecord> {
-    let mut best_by_bits = HashMap::<Vec<u64>, GarfieldLogicRuleRecord>::new();
+fn dedup_logic_rule_records(
+    records: Vec<GarfieldLogicRuleRecord>,
+    logic_bits: &GarfieldLogicBits,
+) -> Result<Vec<GarfieldLogicRuleRecord>, String> {
+    let mut best_by_bits = HashMap::<GarfieldRuleSupportBits, GarfieldLogicRuleRecord>::new();
     for rec in records.into_iter() {
-        match best_by_bits.entry(rec.full_bits.clone()) {
+        let support = materialize_logic_rule_record_support_bits(&rec, logic_bits)?;
+        match best_by_bits.entry(support) {
             std::collections::hash_map::Entry::Vacant(slot) => {
                 slot.insert(rec);
             }
@@ -4026,7 +4078,7 @@ fn dedup_logic_rule_records(records: Vec<GarfieldLogicRuleRecord>) -> Vec<Garfie
     }
     let mut out = best_by_bits.into_values().collect::<Vec<_>>();
     out.sort_by(cmp_logic_rule_records);
-    out
+    Ok(out)
 }
 
 #[inline]
@@ -4187,6 +4239,15 @@ fn simbench_logic_symbol_compact(logic: SimBenchLogic) -> &'static str {
 }
 
 #[inline]
+fn simbench_logic_to_beam_op(logic: SimBenchLogic) -> Option<BeamBinaryOp> {
+    match logic {
+        SimBenchLogic::Single => None,
+        SimBenchLogic::And => Some(BeamBinaryOp::And),
+        SimBenchLogic::Or => Some(BeamBinaryOp::Or),
+    }
+}
+
+#[inline]
 fn clean_logic_allele_label(allele: &str) -> String {
     allele
         .split('|')
@@ -4233,6 +4294,108 @@ fn rule_selected_global_rows(
         out.push(idx);
     }
     Ok(out)
+}
+
+fn logic_rule_record_local_rule(rec: &GarfieldLogicRuleRecord) -> Result<BeamRule, String> {
+    let expected = rec.selected_row_indices.len();
+    if expected == 0 {
+        return Err(format!(
+            "GARFIELD stored rule '{}' has no selected row indices",
+            rec.snp_name
+        ));
+    }
+    if rec.display_negated.len() != expected {
+        return Err(format!(
+            "GARFIELD stored rule '{}' negation length mismatch: rows={}, negated={}",
+            rec.snp_name,
+            expected,
+            rec.display_negated.len()
+        ));
+    }
+    if rec.display_ops.len() + 1 != expected {
+        return Err(format!(
+            "GARFIELD stored rule '{}' operator length mismatch: rows={}, ops={}",
+            rec.snp_name,
+            expected,
+            rec.display_ops.len()
+        ));
+    }
+    let first = BeamLiteral {
+        row_index: 0,
+        group_id: 0,
+        negated: rec.display_negated[0],
+    };
+    let mut rest = Vec::<(BeamBinaryOp, BeamLiteral)>::with_capacity(expected.saturating_sub(1));
+    for idx in 1..expected {
+        rest.push((
+            rec.display_ops[idx - 1],
+            BeamLiteral {
+                row_index: idx,
+                group_id: idx,
+                negated: rec.display_negated[idx],
+            },
+        ));
+    }
+    Ok(BeamRule { first, rest })
+}
+
+fn materialize_logic_rule_record_support_bits(
+    rec: &GarfieldLogicRuleRecord,
+    logic_bits: &GarfieldLogicBits,
+) -> Result<GarfieldRuleSupportBits, String> {
+    if let Some(bits) = rec.support_bits.as_ref() {
+        return Ok(bits.clone());
+    }
+    let local_rule = logic_rule_record_local_rule(rec)?;
+    let n_rows = rec.selected_row_indices.len();
+    let row_words = logic_bits.row_words;
+    let mut bits_flat = Vec::<u64>::with_capacity(n_rows.saturating_mul(row_words));
+    for &global_row_idx in rec.selected_row_indices.iter() {
+        let row_start = global_row_idx.saturating_mul(row_words);
+        let row_end = row_start.saturating_add(row_words);
+        let row = logic_bits.bits_flat.get(row_start..row_end).ok_or_else(|| {
+            format!(
+                "GARFIELD stored rule '{}' row slice out of range: row={} row_words={}",
+                rec.snp_name, global_row_idx, row_words
+            )
+        })?;
+        bits_flat.extend_from_slice(row);
+    }
+    if let Some(bits_hi_flat) = logic_bits.bits_hi_flat.as_ref() {
+        let mut bits_hi = Vec::<u64>::with_capacity(n_rows.saturating_mul(row_words));
+        for &global_row_idx in rec.selected_row_indices.iter() {
+            let row_start = global_row_idx.saturating_mul(row_words);
+            let row_end = row_start.saturating_add(row_words);
+            let row = bits_hi_flat.get(row_start..row_end).ok_or_else(|| {
+                format!(
+                    "GARFIELD stored rule '{}' high-bit row slice out of range: row={} row_words={}",
+                    rec.snp_name, global_row_idx, row_words
+                )
+            })?;
+            bits_hi.extend_from_slice(row);
+        }
+        let (ge1, ge2) = materialize_rule_bits_dual(
+            &local_rule,
+            bits_flat.as_slice(),
+            bits_hi.as_slice(),
+            row_words,
+            n_rows,
+            logic_bits.n_samples,
+        )?;
+        Ok(GarfieldRuleSupportBits::Dual {
+            ge1: ge1.into_boxed_slice(),
+            ge2: ge2.into_boxed_slice(),
+        })
+    } else {
+        let bits = materialize_rule_bits(
+            &local_rule,
+            bits_flat.as_slice(),
+            row_words,
+            n_rows,
+            logic_bits.n_samples,
+        )?;
+        Ok(GarfieldRuleSupportBits::Binary(bits.into_boxed_slice()))
+    }
 }
 
 fn build_logic_units_from_groups<S: GarfieldChromPosSite>(
@@ -6571,6 +6734,8 @@ fn evaluate_logic_unit_prepared_continuous(
             rule_bim_name_with_polarity(&cand.rule, local_sites.as_slice(), polarity)?;
         let (bim_allele0, bim_allele1) =
             rule_bim_alleles_with_polarity(&cand.rule, local_sites.as_slice(), polarity)?;
+        let display_ops = rule_display_ops_with_polarity(&cand.rule, polarity);
+        let display_negated = rule_display_negated_with_polarity(&cand.rule, polarity);
         let assoc = if let Some(ge2_bits) = full_ge2_bits.as_ref() {
             fit_additive_rule_wald_from_dual_bits(
                 assoc_y,
@@ -6610,6 +6775,8 @@ fn evaluate_logic_unit_prepared_continuous(
             ml_feature_count: prepared.selected_global_rows.len(),
             ml_rank: rule_ml_rank_name_with_polarity(&cand.rule, polarity),
             selected_row_indices,
+            display_ops,
+            display_negated,
             snp_name,
             expr,
             chrom_field: first_site.chrom.as_ref().to_string(),
@@ -6624,8 +6791,7 @@ fn evaluate_logic_unit_prepared_continuous(
             score: cand.test_score,
             delta_score,
             delta_pwald,
-            full_bits,
-            full_ge2_bits,
+            support_bits: None,
         });
     }
     Ok(out)
@@ -7149,36 +7315,17 @@ struct GarfieldPseudoLiteralExport {
     display_negated: bool,
 }
 
-fn split_logic_display_tokens(text: &str) -> Vec<String> {
-    text.split(|c| c == '&' || c == '|')
-        .map(|tok| tok.trim().to_string())
-        .filter(|tok| !tok.is_empty())
-        .collect()
-}
-
-fn split_logic_allele_tokens(text: &str) -> Vec<String> {
-    text.split(',').map(|tok| tok.trim().to_string()).collect()
-}
-
 fn collect_logic_pseudo_literal_exports(
     rec: &GarfieldLogicRuleRecord,
     logic_bits: &GarfieldLogicBits,
 ) -> Result<Vec<GarfieldPseudoLiteralExport>, String> {
-    let snp_tokens = split_logic_display_tokens(rec.bim_snp_name.as_str());
-    let allele0_tokens = split_logic_allele_tokens(rec.bim_allele0.as_str());
-    let allele1_tokens = split_logic_allele_tokens(rec.bim_allele1.as_str());
     let expected = rec.selected_row_indices.len();
-    if snp_tokens.len() != expected
-        || allele0_tokens.len() != expected
-        || allele1_tokens.len() != expected
-    {
+    if rec.display_negated.len() != expected {
         return Err(format!(
-            "GARFIELD pseudo export token mismatch for {}: rows={}, snp={}, allele0={}, allele1={}",
-            rec.bim_snp_name,
+            "GARFIELD pseudo export negation mismatch for {}: rows={}, negated={}",
+            rec.snp_name,
             expected,
-            snp_tokens.len(),
-            allele0_tokens.len(),
-            allele1_tokens.len()
+            rec.display_negated.len()
         ));
     }
     let mut out = Vec::<GarfieldPseudoLiteralExport>::with_capacity(expected);
@@ -7188,15 +7335,17 @@ fn collect_logic_pseudo_literal_exports(
             .sites
             .get(row_idx)
             .ok_or_else(|| format!("GARFIELD pseudo export row index out of range: {row_idx}"))?;
-        let snp_name = snp_tokens[idx].clone();
+        let negated = rec.display_negated[idx];
+        let snp_name = literal_name(site, negated);
+        let (allele0, allele1) = literal_bim_alleles(site, negated);
         out.push(GarfieldPseudoLiteralExport {
             chrom: site.chrom.as_ref().to_string(),
             pos: site.pos,
-            snp_name: snp_name.clone(),
-            allele0: allele0_tokens[idx].clone(),
-            allele1: allele1_tokens[idx].clone(),
+            snp_name,
+            allele0,
+            allele1,
             selected_row_index: row_idx,
-            display_negated: snp_name.starts_with('!'),
+            display_negated: negated,
         });
     }
     Ok(out)
@@ -7276,6 +7425,7 @@ fn write_logic_pseudo_plink(
     ordered.sort_by(|a, b| cmp_logic_rule_records_plink_order(a, b));
     let mut emitted_singletons = HashSet::<(String, i32, String)>::new();
     for rec in ordered.into_iter() {
+        let support = materialize_logic_rule_record_support_bits(rec, logic_bits)?;
         let literals = collect_logic_pseudo_literal_exports(rec, logic_bits)?;
         if literals.len() <= 1 {
             let singleton_key = (rec.chrom_field.clone(), rec.pos, rec.bim_snp_name.clone());
@@ -7286,23 +7436,26 @@ fn write_logic_pseudo_plink(
                     rec.chrom_field, rec.bim_snp_name, rec.pos, rec.bim_allele0, rec.bim_allele1
                 )
                 .map_err(|e| e.to_string())?;
-                if let Some(full_ge2_bits) = rec.full_ge2_bits.as_ref() {
-                    write_logic_dual_bits_as_plink_row(
-                        &mut bed,
-                        row_buf.as_mut_slice(),
-                        rec.full_bits.as_slice(),
-                        full_ge2_bits.as_slice(),
-                        sample_ids.len(),
-                        false,
-                    )?;
-                } else {
-                    write_logic_bits_as_plink_row(
-                        &mut bed,
-                        row_buf.as_mut_slice(),
-                        rec.full_bits.as_slice(),
-                        sample_ids.len(),
-                        false,
-                    )?;
+                match &support {
+                    GarfieldRuleSupportBits::Binary(bits) => {
+                        write_logic_bits_as_plink_row(
+                            &mut bed,
+                            row_buf.as_mut_slice(),
+                            bits.as_ref(),
+                            sample_ids.len(),
+                            false,
+                        )?;
+                    }
+                    GarfieldRuleSupportBits::Dual { ge1, ge2 } => {
+                        write_logic_dual_bits_as_plink_row(
+                            &mut bed,
+                            row_buf.as_mut_slice(),
+                            ge1.as_ref(),
+                            ge2.as_ref(),
+                            sample_ids.len(),
+                            false,
+                        )?;
+                    }
                 }
             }
             continue;
@@ -7359,23 +7512,26 @@ fn write_logic_pseudo_plink(
                 lit.chrom, rec.bim_snp_name, lit.pos, rec.bim_allele0, rec.bim_allele1
             )
             .map_err(|e| e.to_string())?;
-            if let Some(full_ge2_bits) = rec.full_ge2_bits.as_ref() {
-                write_logic_dual_bits_as_plink_row(
-                    &mut bed,
-                    row_buf.as_mut_slice(),
-                    rec.full_bits.as_slice(),
-                    full_ge2_bits.as_slice(),
-                    sample_ids.len(),
-                    false,
-                )?;
-            } else {
-                write_logic_bits_as_plink_row(
-                    &mut bed,
-                    row_buf.as_mut_slice(),
-                    rec.full_bits.as_slice(),
-                    sample_ids.len(),
-                    false,
-                )?;
+            match &support {
+                GarfieldRuleSupportBits::Binary(bits) => {
+                    write_logic_bits_as_plink_row(
+                        &mut bed,
+                        row_buf.as_mut_slice(),
+                        bits.as_ref(),
+                        sample_ids.len(),
+                        false,
+                    )?;
+                }
+                GarfieldRuleSupportBits::Dual { ge1, ge2 } => {
+                    write_logic_dual_bits_as_plink_row(
+                        &mut bed,
+                        row_buf.as_mut_slice(),
+                        ge1.as_ref(),
+                        ge2.as_ref(),
+                        sample_ids.len(),
+                        false,
+                    )?;
+                }
             }
         }
     }
@@ -7556,7 +7712,9 @@ fn garfield_logic_search_bed_owned(
     beam_width: usize,
     rank_score: String,
     maf_threshold: f32,
+    logic_maf_threshold: f32,
     max_missing_rate: f32,
+    het_threshold: f32,
     snps_only: bool,
     block_cols: usize,
     threads: usize,
@@ -7621,6 +7779,7 @@ fn garfield_logic_search_bed_owned(
             &prefix,
             maf_threshold,
             max_missing_rate,
+            het_threshold,
             snps_only,
             Some(selected_sample_indices.as_slice()),
         )?;
@@ -7684,7 +7843,8 @@ fn garfield_logic_search_bed_owned(
     let y_test = subset_vec_f64(&y, &test_idx_local)?;
     let x_train = subset_cov_f64(x_cov.as_deref(), n_selected, q_cov, &train_idx_local)?;
     let x_test = subset_cov_f64(x_cov.as_deref(), n_selected, q_cov, &test_idx_local)?;
-    let ml_min_samples_leaf = strict_maf_support_count(train_idx_local.len(), maf_threshold).max(1);
+    let ml_min_samples_leaf =
+        strict_maf_support_count(train_idx_local.len(), logic_maf_threshold).max(1);
     let tree_cfg = ExtraTreesConfig {
         min_samples_leaf: tree_cfg.min_samples_leaf.max(ml_min_samples_leaf),
         min_samples_split: tree_cfg
@@ -7943,7 +8103,7 @@ fn garfield_logic_search_bed_owned(
         surrogate_test_gain_max: 0.0,
         surrogate_hamming_frac_max: 0.0,
         enable_diversity_pruning: false,
-        maf_threshold: maf_threshold.clamp(0.0, 0.5) as f64,
+        maf_threshold: logic_maf_threshold.clamp(0.0, 0.5) as f64,
         lambda_len: 0.0,
         lambda_not: 0.0,
         exhaustive_depth: exhaustive_depth.max(1),
@@ -8666,7 +8826,7 @@ fn garfield_logic_search_bed_owned(
     let scan_beam_profile = snapshot_garfield_beam_profile();
     let (pw_marg, pw_pack, pw_kern, pw_comb) = snapshot_pairwise_profile();
 
-    records = dedup_logic_rule_records(records);
+    records = dedup_logic_rule_records(records, &logic_bits)?;
     apply_logic_rule_output_limit(&mut records, max_output_rules, max_output_ratio)?;
     let simbench_count = if let Some(path) = simbench_path.as_ref() {
         let simbench_terms = parse_simbench_terms(path)?;
@@ -8839,7 +8999,9 @@ fn garfield_logic_search_bed_owned(
     beam_width=100,
     rank_score="interaction_gain",
     maf_threshold=0.02,
+    logic_maf_threshold=0.02,
     max_missing_rate=0.05,
+    het_threshold=1.0,
     snps_only=false,
     block_cols=65536,
     threads=0,
@@ -8896,7 +9058,9 @@ pub fn garfield_logic_search_bed_py<'py>(
     beam_width: usize,
     rank_score: &str,
     maf_threshold: f32,
+    logic_maf_threshold: f32,
     max_missing_rate: f32,
+    het_threshold: f32,
     snps_only: bool,
     block_cols: usize,
     threads: usize,
@@ -9000,7 +9164,9 @@ pub fn garfield_logic_search_bed_py<'py>(
                 beam_width,
                 rank_score.to_string(),
                 maf_threshold,
+                logic_maf_threshold,
                 max_missing_rate,
+                het_threshold,
                 snps_only,
                 block_cols,
                 threads,
@@ -9225,7 +9391,7 @@ pub fn load_mbin_packed_py<'py>(
     maf=0.0,
     geno=1.0,
     impute=false,
-    het=0.05,
+    het=1.0,
     sample_ids=None,
     sample_indices=None
 ))]
@@ -10221,6 +10387,8 @@ mod tests {
                 ml_feature_count: 4,
                 ml_rank: ".".to_string(),
                 selected_row_indices: vec![i],
+                display_ops: Vec::new(),
+                display_negated: vec![false],
                 snp_name: format!("snp{i}"),
                 expr: format!("expr{i}"),
                 chrom_field: "1".to_string(),
@@ -10235,8 +10403,7 @@ mod tests {
                 score: 20.0 - i as f64,
                 delta_score: format!("{}->{}", 20.0 - i as f64, 20.0 - i as f64),
                 delta_pwald: format!("{}->{}", 1e-4 * (i as f64 + 1.0), 1e-4 * (i as f64 + 1.0)),
-                full_bits: vec![i as u64 + 1],
-                full_ge2_bits: None,
+                support_bits: None,
             })
             .collect::<Vec<_>>();
         apply_logic_rule_output_limit(&mut records, 0, 0.3).unwrap();
@@ -10261,6 +10428,8 @@ mod tests {
                 ml_feature_count: 4,
                 ml_rank: ".".to_string(),
                 selected_row_indices: vec![1],
+                display_ops: Vec::new(),
+                display_negated: vec![false],
                 snp_name: "snp1".to_string(),
                 expr: "expr1".to_string(),
                 chrom_field: "1".to_string(),
@@ -10275,8 +10444,7 @@ mod tests {
                 score: 10.0,
                 delta_score: "10->10".to_string(),
                 delta_pwald: "0.0001->0.0001".to_string(),
-                full_bits: vec![1],
-                full_ge2_bits: None,
+                support_bits: None,
             },
             GarfieldLogicRuleRecord {
                 unit_name: "u2".to_string(),
@@ -10286,6 +10454,8 @@ mod tests {
                 ml_feature_count: 4,
                 ml_rank: ".".to_string(),
                 selected_row_indices: vec![2],
+                display_ops: Vec::new(),
+                display_negated: vec![false],
                 snp_name: "snp2".to_string(),
                 expr: "expr2".to_string(),
                 chrom_field: "1".to_string(),
@@ -10300,8 +10470,7 @@ mod tests {
                 score: 9.0,
                 delta_score: "9->9".to_string(),
                 delta_pwald: "0.0002->0.0002".to_string(),
-                full_bits: vec![2],
-                full_ge2_bits: None,
+                support_bits: None,
             },
             GarfieldLogicRuleRecord {
                 unit_name: "u3".to_string(),
@@ -10311,6 +10480,8 @@ mod tests {
                 ml_feature_count: 4,
                 ml_rank: ".".to_string(),
                 selected_row_indices: vec![3],
+                display_ops: Vec::new(),
+                display_negated: vec![false],
                 snp_name: "snp3".to_string(),
                 expr: "expr3".to_string(),
                 chrom_field: "1".to_string(),
@@ -10325,8 +10496,7 @@ mod tests {
                 score: 9.0,
                 delta_score: "9->9".to_string(),
                 delta_pwald: "0.0003->0.0003".to_string(),
-                full_bits: vec![3],
-                full_ge2_bits: None,
+                support_bits: None,
             },
             GarfieldLogicRuleRecord {
                 unit_name: "u4".to_string(),
@@ -10336,6 +10506,8 @@ mod tests {
                 ml_feature_count: 4,
                 ml_rank: ".".to_string(),
                 selected_row_indices: vec![4],
+                display_ops: Vec::new(),
+                display_negated: vec![false],
                 snp_name: "snp4".to_string(),
                 expr: "expr4".to_string(),
                 chrom_field: "1".to_string(),
@@ -10350,8 +10522,7 @@ mod tests {
                 score: 8.0,
                 delta_score: "8->8".to_string(),
                 delta_pwald: "0.0004->0.0004".to_string(),
-                full_bits: vec![4],
-                full_ge2_bits: None,
+                support_bits: None,
             },
         ];
         apply_logic_rule_output_limit(&mut records, 2, 0.0).unwrap();
@@ -10525,6 +10696,8 @@ mod tests {
                 ml_feature_count: 2,
                 ml_rank: "!1&!2".to_string(),
                 selected_row_indices: vec![0, 1],
+                display_ops: vec![BeamBinaryOp::And],
+                display_negated: vec![true, true],
                 snp_name: "!1_100&!1_200".to_string(),
                 expr: "NOT BIN(1_100) AND NOT BIN(1_200)".to_string(),
                 chrom_field: "1".to_string(),
@@ -10539,8 +10712,9 @@ mod tests {
                 score: 5.0,
                 delta_score: "0.1&0.2->5.0".to_string(),
                 delta_pwald: "0.1&0.2->1e-3".to_string(),
-                full_bits: full_bits.clone(),
-                full_ge2_bits: None,
+                support_bits: Some(GarfieldRuleSupportBits::Binary(
+                    full_bits.clone().into_boxed_slice(),
+                )),
             },
             GarfieldLogicRuleRecord {
                 unit_name: "u_pos".to_string(),
@@ -10550,6 +10724,8 @@ mod tests {
                 ml_feature_count: 2,
                 ml_rank: "1|2".to_string(),
                 selected_row_indices: vec![0, 1],
+                display_ops: vec![BeamBinaryOp::Or],
+                display_negated: vec![false, false],
                 snp_name: "1_100|1_200".to_string(),
                 expr: "BIN(1_100) OR BIN(1_200)".to_string(),
                 chrom_field: "1".to_string(),
@@ -10564,11 +10740,21 @@ mod tests {
                 score: 5.0,
                 delta_score: "0.1|0.2->5.0".to_string(),
                 delta_pwald: "0.1|0.2->1e-3".to_string(),
-                full_bits,
-                full_ge2_bits: None,
+                support_bits: Some(GarfieldRuleSupportBits::Binary(
+                    full_bits.into_boxed_slice(),
+                )),
             },
         ];
-        let deduped = dedup_logic_rule_records(records);
+        let empty_logic_bits = GarfieldLogicBits {
+            bits_flat: Vec::new(),
+            bits_hi_flat: None,
+            row_words: 0,
+            sample_ids: Vec::new(),
+            sites: Vec::new(),
+            group_ids: Vec::new(),
+            n_samples: 0,
+        };
+        let deduped = dedup_logic_rule_records(records, &empty_logic_bits).unwrap();
         assert_eq!(deduped.len(), 1);
         assert_eq!(deduped[0].snp_name, "1_100|1_200");
         assert_eq!(deduped[0].expr, "BIN(1_100) OR BIN(1_200)");
@@ -10606,6 +10792,8 @@ mod tests {
             ml_feature_count: 2,
             ml_rank: "1&!2".to_string(),
             selected_row_indices: vec![0, 1],
+            display_ops: vec![BeamBinaryOp::And],
+            display_negated: vec![false, true],
             snp_name: "1_100&!1_200".to_string(),
             expr: "BIN(1_100) AND NOT BIN(1_200)".to_string(),
             chrom_field: "1".to_string(),
@@ -10620,8 +10808,7 @@ mod tests {
             score: 10.0,
             delta_score: "0.1&!0.2->10".to_string(),
             delta_pwald: "0.1&!0.2->1e-6".to_string(),
-            full_bits: vec![0b0100u64],
-            full_ge2_bits: None,
+            support_bits: None,
         }];
 
         write_logic_pseudo_plink(

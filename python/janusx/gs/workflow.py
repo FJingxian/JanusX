@@ -2505,6 +2505,7 @@ def _build_memmap_cache_from_chunks(
     genotype_path: str,
     maf: float,
     missing_rate: float,
+    het_threshold: float,
     cache_root: str,
     chunk_size: int = 50_000,
 ) -> tuple[np.ndarray, np.memmap]:
@@ -2513,6 +2514,7 @@ def _build_memmap_cache_from_chunks(
         snps_only=False,
         maf=float(maf),
         missing_rate=float(missing_rate),
+        het=float(het_threshold),
     )
     sample_ids = np.asarray(sample_ids_raw, dtype=str)
     n_samples = int(sample_ids.shape[0])
@@ -2524,7 +2526,10 @@ def _build_memmap_cache_from_chunks(
     abs_src = os.path.abspath(str(genotype_path))
     src_tag = os.path.basename(str(genotype_path).rstrip("/\\")).replace(" ", "_")
     key = hashlib.sha1(
-        f"{abs_src}|maf={float(maf):.8g}|miss={float(missing_rate):.8g}".encode("utf-8")
+        (
+            f"{abs_src}|maf={float(maf):.8g}|miss={float(missing_rate):.8g}"
+            f"|het={float(het_threshold):.8g}"
+        ).encode("utf-8")
     ).hexdigest()[:16]
     mm_path = os.path.join(cache_root, f"{src_tag}.gs.filtered.{key}.npy")
 
@@ -2563,6 +2568,7 @@ def _build_memmap_cache_from_chunks(
             maf=float(maf),
             missing_rate=float(missing_rate),
             impute=True,
+            het=float(het_threshold),
         )
         for geno_chunk, _sites in chunks:
             arr = np.asarray(geno_chunk, dtype=np.float32)
@@ -17015,6 +17021,7 @@ def _load_genotype_with_rust_gfreader(
     *,
     maf: float,
     missing_rate: float,
+    het_threshold: float,
     chunk_size: int = 50_000,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
@@ -17032,6 +17039,7 @@ def _load_genotype_with_rust_gfreader(
         maf=float(maf),
         missing_rate=float(missing_rate),
         impute=True,
+        het=float(het_threshold),
     )
 
     blocks: list[np.ndarray] = []
@@ -17056,6 +17064,7 @@ def _load_plink_packed_for_lmm(
     *,
     maf: float,
     missing_rate: float,
+    het_threshold: float,
     filter_mode: str = "compact",
 ) -> tuple[np.ndarray, dict[str, typing.Any]]:
     """
@@ -17076,7 +17085,7 @@ def _load_plink_packed_for_lmm(
         str(genotype_prefix),
         maf_threshold=float(maf),
         max_missing_rate=float(missing_rate),
-        het_threshold=0.0,
+        het_threshold=float(het_threshold),
         snps_only=False,
         outprefix=None,
         logger=None,
@@ -17199,6 +17208,7 @@ def _load_plink_stats_for_lmm(
     *,
     maf: float,
     missing_rate: float,
+    het_threshold: float,
     meta_layer: str = "basic",
 ) -> tuple[np.ndarray, dict[str, typing.Any]]:
     """
@@ -17220,7 +17230,7 @@ def _load_plink_stats_for_lmm(
         str(genotype_prefix),
         maf_threshold=float(maf),
         max_missing_rate=float(missing_rate),
-        het_threshold=0.0,
+        het_threshold=float(het_threshold),
         snps_only=False,
         outprefix=None,
         logger=None,
@@ -18730,9 +18740,10 @@ def parse_args(argv: typing.Optional[list[str]] = None):
         optional_group,
         include_maf=True,
         include_geno=True,
-        include_het=False,
+        include_het=True,
         maf_default=0.02,
         geno_default=0.05,
+        het_default=1.0,
     )
     add_common_trait_selector_args(optional_group, dest="ncol")
     optional_group.add_argument(
@@ -20367,6 +20378,7 @@ def _run_gs_pipeline_impl(
                         str(gfile),
                         maf=float(args.maf),
                         missing_rate=float(args.geno),
+                        het_threshold=float(args.het),
                         meta_layer=str(packed_meta_layer),
                     )
                 else:
@@ -20374,6 +20386,7 @@ def _run_gs_pipeline_impl(
                         str(gfile),
                         maf=float(args.maf),
                         missing_rate=float(args.geno),
+                        het_threshold=float(args.het),
                         filter_mode="compact",
                     )
             except Exception:
@@ -20414,6 +20427,7 @@ def _run_gs_pipeline_impl(
                         str(gfile),
                         maf=float(args.maf),
                         missing_rate=float(args.geno),
+                        het_threshold=float(args.het),
                         filter_mode="compact",
                     )
                     if int(sample_ids_reload.shape[0]) != int(sample_ids.shape[0]):
@@ -20603,6 +20617,7 @@ def _run_gs_pipeline_impl(
                     str(gfile),
                     maf=float(args.maf),
                     missing_rate=float(args.geno),
+                    het_threshold=float(args.het),
                     filter_mode="compact",
                 )
             except Exception:
@@ -20776,6 +20791,7 @@ def _run_gs_pipeline_impl(
                     str(gfile),
                     maf=float(args.maf),
                     missing_rate=float(args.geno),
+                    het_threshold=float(args.het),
                     filter_mode="compact",
                 )
             except Exception:
@@ -20895,6 +20911,7 @@ def _run_gs_pipeline_impl(
                         genotype_path=str(gfile),
                         maf=float(args.maf),
                         missing_rate=float(args.geno),
+                        het_threshold=float(args.het),
                         cache_root=os.path.join(args.out, ".janusx_gs_memmap"),
                         chunk_size=50_000,
                     )
@@ -20904,6 +20921,7 @@ def _run_gs_pipeline_impl(
                         gfile,
                         maf=args.maf,
                         missing_rate=args.geno,
+                        het_threshold=float(args.het),
                     )
             except Exception:
                 task.fail(genotype_load_status_fail(gsrc))

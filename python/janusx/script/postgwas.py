@@ -24,6 +24,7 @@ Citation
 
 import logging
 import os
+import gzip
 from ._common.cli_args import add_common_out_arg, add_common_prefix_arg, add_common_thread_arg
 from ._common.log import setup_logging
 from ._common.cli_core import CliArgumentParser, cli_help_formatter, minimal_help_epilog
@@ -98,8 +99,9 @@ from concurrent.futures.process import BrokenProcessPool
 from contextlib import nullcontext, redirect_stdout, redirect_stderr
 from functools import lru_cache
 from typing import Any, Optional, Tuple
+from urllib.parse import unquote
 from janusx import janusx as jxrs
-from janusx.gtools.reader import GFFQuery, bedreader, readanno
+from janusx.gtools.reader import GFFQuery, bedreader, readanno, _gff_prefetched_attr_colname
 import warnings
 from ._common.cjk import contains_cjk as _contains_cjk, ensure_cjk_font as _ensure_cjk_font
 from matplotlib import font_manager as mpl_font_manager
@@ -117,6 +119,10 @@ _DEFAULT_SINGLE_MARKER = "o"
 _DEFAULT_MERGE_MARKERS = ("1", "2", "3", "4", "*", "+", "x")
 _DEFAULT_SCATTER_SIZE = 8.0
 _DEFAULT_MERGE_ALPHA = 0.45
+_DEFAULT_CIRCLE_SIZE_IN = 8.5
+_DEFAULT_CIRCLE_TRACK_RATIO = 0.5
+_DEFAULT_CIRCLE_INTERVAL = 1.0
+_DEFAULT_CIRCLE_LW = 1.0
 _POSTGWAS_LEGEND_SIZE_SCALE = 1.35
 _POSTGWAS_LEGEND_SIZE_MIN_BONUS = 2.0
 _POSTGWAS_LD_LINK_Y = 0.0
@@ -135,6 +141,8 @@ _POSTGWAS_FONT_FILE_EXTENSIONS = frozenset({".ttf", ".otf", ".ttc", ".otc"})
 _POSTGWAS_SHARED_GFF_KEY: Optional[tuple[str, int, int]] = None
 _POSTGWAS_SHARED_GFF_QUERY: Optional[GFFQuery] = None
 _POSTGWAS_SHARED_GFF_ANNOTATION_CTX: Optional[dict[str, object]] = None
+_POSTGWAS_SHARED_GFF_RUST_KEY: Optional[tuple[str, int, int]] = None
+_POSTGWAS_SHARED_GFF_RUST_INDEX: Optional[object] = None
 _POSTGWAS_GENERIC_FONT_FAMILIES = {
     "serif": "serif",
     "sans": "sans-serif",
@@ -191,37 +199,161 @@ def _postgwas_gff_cache_key(gff_path: str) -> tuple[str, int, int]:
     return (real, int(st.st_size), int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9))))
 
 
+def _postgwas_has_rust_gff_index() -> bool:
+    return hasattr(jxrs, "GffAnnotationIndex")
+
+
+def _postgwas_rust_gff_cache_path(gff_path: str) -> str:
+    real, size, mtime_ns = _postgwas_gff_cache_key(gff_path)
+    cache_root = os.path.join(os.path.expanduser("~"), ".janusx", "cache", "gff")
+    safe_base = re.sub(r"[^A-Za-z0-9._-]+", "_", os.path.basename(real))
+    return os.path.join(
+        cache_root,
+        f"{safe_base}.{int(size)}.{int(mtime_ns)}.jxgff.bin",
+    )
+
+
+@lru_cache(maxsize=None)
+def _postgwas_attr_pair_regex() -> re.Pattern[str]:
+    return re.compile(r"(?:^|;|\s)([^;=\s]+)=([^;]*?)(?=;|\s+[^\s;=]+=|$)")
+
+
+def _postgwas_clean_attr_text(value: object) -> str:
+    text = unquote(str(value)).strip()
+    text = re.sub(r"\s+", " ", text)
+    if text == "" or text.lower() == "nan":
+        return "NA"
+    return text
+
+
+def _postgwas_normalize_gff_ref_text(value: object, *, split_multi: bool) -> str:
+    text = _postgwas_clean_attr_text(value)
+    if text == "NA":
+        return "NA"
+    if not bool(split_multi):
+        return re.sub(r"^[^:]*:", "", text)
+    out: list[str] = []
+    seen: set[str] = set()
+    for token in str(text).split(","):
+        norm = re.sub(r"^[^:]*:", "", str(token).strip())
+        if norm == "" or norm.lower() == "nan" or norm in seen:
+            continue
+        seen.add(norm)
+        out.append(norm)
+    return ",".join(out) if len(out) > 0 else "NA"
+
+
+def _postgwas_extract_attr_subset(attr_text: object, *, include_gene_meta: bool) -> dict[str, str]:
+    need = {"ID", "Parent"}
+    if bool(include_gene_meta):
+        need.update({_ANNO_DESC_KEY, "Name"})
+    out = {key: "NA" for key in need}
+    text = str(attr_text).strip()
+    if text == "":
+        return out
+    missing = set(need)
+
+    # Fast path for standard semicolon-delimited GFF attributes.
+    if ";" in text:
+        for token in text.split(";"):
+            if len(missing) == 0:
+                break
+            if "=" not in token:
+                continue
+            key, raw_value = token.split("=", 1)
+            key = str(key).strip()
+            if key not in missing:
+                continue
+            if key == "ID":
+                out[key] = _postgwas_normalize_gff_ref_text(raw_value, split_multi=False)
+            elif key == "Parent":
+                out[key] = _postgwas_normalize_gff_ref_text(raw_value, split_multi=True)
+            else:
+                out[key] = _postgwas_clean_attr_text(raw_value)
+            missing.discard(key)
+
+    # Fallback for malformed space-delimited payloads or any missing keys.
+    if len(missing) > 0:
+        for match in _postgwas_attr_pair_regex().finditer(text):
+            key = str(match.group(1)).strip()
+            if key not in missing:
+                continue
+            raw_value = match.group(2)
+            if key == "ID":
+                out[key] = _postgwas_normalize_gff_ref_text(raw_value, split_multi=False)
+            elif key == "Parent":
+                out[key] = _postgwas_normalize_gff_ref_text(raw_value, split_multi=True)
+            else:
+                out[key] = _postgwas_clean_attr_text(raw_value)
+            missing.discard(key)
+            if len(missing) == 0:
+                break
+    return out
+
+
 def _postgwas_read_minimal_gff(gff_path: str) -> pd.DataFrame:
-    col_names = [
-        "chrom",
-        "source",
-        "feature",
-        "start",
-        "end",
-        "score",
-        "strand",
-        "phase",
-        "attributes",
-    ]
     try:
-        gff = pd.read_csv(
-            gff_path,
-            sep="\t",
-            comment="#",
-            header=None,
-            names=col_names,
-            usecols=["chrom", "feature", "start", "end", "strand", "attributes"],
-            compression="infer",
-            dtype={
-                "chrom": "string",
-                "feature": "string",
-                "strand": "string",
-                "attributes": "string",
-            },
-            na_filter=False,
-            low_memory=False,
-            on_bad_lines="skip",
-        )
+        opener = gzip.open if str(gff_path).lower().endswith(".gz") else open
+        chroms: list[str] = []
+        features: list[str] = []
+        starts: list[int] = []
+        ends: list[int] = []
+        strands: list[str] = []
+        attr_ids: list[str] = []
+        attr_parents: list[str] = []
+        attr_descs: list[str] = []
+        attr_names: list[str] = []
+
+        skipped_too_short = 0
+        with opener(gff_path, "rt", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                if not line or line.startswith("#"):
+                    continue
+                line = line.rstrip("\r\n")
+                if line == "":
+                    continue
+                parts = line.split("\t")
+                if len(parts) < 9:
+                    parts = re.split(r"\s+", line, maxsplit=8)
+                if len(parts) < 9:
+                    skipped_too_short += 1
+                    continue
+                if len(parts) > 9:
+                    attr_head = parts[8].replace(";", " ")
+                    attr_tail = " ".join(parts[9:]).strip()
+                    merged_attr = f"{attr_head} {attr_tail}".strip() if attr_tail else attr_head
+                    parts = parts[:8] + [re.sub(r"\s+", " ", merged_attr).strip()]
+
+                try:
+                    start_int = int(parts[3])
+                    end_int = int(parts[4])
+                except Exception:
+                    continue
+
+                feature = str(parts[2]).strip()
+                if feature == "":
+                    continue
+                strand = str(parts[6]).strip()
+                attr_text = str(parts[8]).strip()
+                feature_lc = feature.lower()
+
+                chroms.append(_normalize_chr(parts[0]))
+                features.append(feature)
+                starts.append(start_int)
+                ends.append(end_int)
+                strands.append(strand)
+                attr_map = _postgwas_extract_attr_subset(
+                    attr_text,
+                    include_gene_meta=(feature_lc == "gene"),
+                )
+                attr_ids.append(attr_map.get("ID", "NA"))
+                attr_parents.append(attr_map.get("Parent", "NA"))
+                if feature_lc == "gene":
+                    attr_descs.append(attr_map.get(_ANNO_DESC_KEY, "NA"))
+                    attr_names.append(attr_map.get("Name", "NA"))
+                else:
+                    attr_descs.append("NA")
+                    attr_names.append("NA")
     except Exception:
         # Fallback to the more permissive reader for malformed GFF variants.
         fallback_q = GFFQuery.from_file(gff_path, copy_df=False)
@@ -236,21 +368,30 @@ def _postgwas_read_minimal_gff(gff_path: str) -> pd.DataFrame:
         ].copy()
         return gff
 
-    if gff.shape[0] == 0:
+    if len(starts) == 0:
         raise ValueError(f"No valid GFF rows found in file: {gff_path}")
 
-    gff["start"] = pd.to_numeric(gff["start"], errors="coerce")
-    gff["end"] = pd.to_numeric(gff["end"], errors="coerce")
-    gff = gff.dropna(subset=["feature", "start", "end"]).copy()
-    if gff.shape[0] == 0:
-        raise ValueError(f"No valid GFF rows found in file: {gff_path}")
-    gff["start"] = gff["start"].astype(np.int64)
-    gff["end"] = gff["end"].astype(np.int64)
-    gff["chrom_norm"] = gff["chrom"].map(_normalize_chr).astype("category")
-    gff["feature"] = gff["feature"].astype("string").str.strip().astype("category")
-    gff["strand"] = gff["strand"].astype("string").str.strip().astype("category")
-    gff["attributes"] = gff["attributes"].astype("string")
-    gff = gff.drop(columns=["chrom"])
+    if skipped_too_short > 0:
+        warnings.warn(
+            f"Warning: shared GFF parser skipped malformed rows in {gff_path} "
+            f"(<9 columns: {int(skipped_too_short)}).",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
+    gff = pd.DataFrame(
+        {
+            "feature": pd.Categorical(features),
+            "start": np.asarray(starts, dtype=np.int64),
+            "end": np.asarray(ends, dtype=np.int64),
+            "strand": pd.Categorical(strands),
+            "chrom_norm": pd.Categorical(chroms),
+            _gff_prefetched_attr_colname("ID"): pd.Categorical(attr_ids),
+            _gff_prefetched_attr_colname("Parent"): pd.Categorical(attr_parents),
+            _gff_prefetched_attr_colname(_ANNO_DESC_KEY): pd.Categorical(attr_descs),
+            _gff_prefetched_attr_colname("Name"): pd.Categorical(attr_names),
+        }
+    )
     gff = gff.sort_values(["chrom_norm", "start", "end"]).reset_index(drop=True)
     return gff
 
@@ -269,6 +410,22 @@ def _postgwas_get_shared_gff_query(gff_path: str) -> GFFQuery:
         _POSTGWAS_SHARED_GFF_KEY = key
         _POSTGWAS_SHARED_GFF_ANNOTATION_CTX = None
     return _POSTGWAS_SHARED_GFF_QUERY
+
+
+def _postgwas_get_shared_gff_rust_index(gff_path: str) -> Optional[object]:
+    global _POSTGWAS_SHARED_GFF_RUST_KEY
+    global _POSTGWAS_SHARED_GFF_RUST_INDEX
+
+    if not _postgwas_has_rust_gff_index():
+        return None
+    key = _postgwas_gff_cache_key(gff_path)
+    if _POSTGWAS_SHARED_GFF_RUST_INDEX is None or _POSTGWAS_SHARED_GFF_RUST_KEY != key:
+        _POSTGWAS_SHARED_GFF_RUST_INDEX = jxrs.GffAnnotationIndex.from_gff(
+            str(gff_path),
+            _postgwas_rust_gff_cache_path(gff_path),
+        )
+        _POSTGWAS_SHARED_GFF_RUST_KEY = key
+    return _POSTGWAS_SHARED_GFF_RUST_INDEX
 
 
 def _postgwas_get_shared_gff_annotation_context(gff_path: str) -> dict[str, object]:
@@ -292,6 +449,24 @@ def _postgwas_get_gff_query(
     if bool(use_shared):
         return _postgwas_get_shared_gff_query(str(anno_file))
     return GFFQuery.from_file(str(anno_file))
+
+
+def _postgwas_get_gff_rust_index(
+    anno_file: Optional[str],
+    *,
+    use_shared: bool,
+    current: Optional[object] = None,
+) -> Optional[object]:
+    if current is not None:
+        return current
+    if anno_file is None or not _postgwas_has_rust_gff_index():
+        return None
+    if bool(use_shared):
+        return _postgwas_get_shared_gff_rust_index(str(anno_file))
+    return jxrs.GffAnnotationIndex.from_gff(
+        str(anno_file),
+        _postgwas_rust_gff_cache_path(str(anno_file)),
+    )
 
 
 def _postgwas_get_gff_annotation_context(
@@ -2523,6 +2698,16 @@ def _extract_gff_attr_series(attr_series: pd.Series, key: str) -> pd.Series:
     return out.map(_clean_anno_token)
 
 
+def _get_gff_attr_series(gff: pd.DataFrame, key: str) -> pd.Series:
+    col = _gff_prefetched_attr_colname(key)
+    if col != "" and col in gff.columns:
+        base = pd.Series(gff[col].astype(object), index=gff.index, copy=False)
+        return base.map(_clean_anno_token)
+    if "attributes" not in gff.columns:
+        return pd.Series("NA", index=gff.index, dtype=object)
+    return _extract_gff_attr_series(gff["attributes"], key)
+
+
 def _normalize_gff_entity_id(value: object) -> str:
     text = _clean_anno_token(value)
     if text == "NA":
@@ -2555,11 +2740,10 @@ def _build_postgwas_gff_annotation_context(gff_query: GFFQuery) -> dict[str, obj
             "gene_index_by_chr": {},
         }
 
-    attrs = gff["attributes"].astype(str)
-    ids = _extract_gff_attr_series(attrs, "ID").map(_normalize_gff_entity_id)
-    parents = _extract_gff_attr_series(attrs, "Parent").map(_split_gff_entity_ids)
-    descs = _extract_gff_attr_series(attrs, _ANNO_DESC_KEY)
-    names = _extract_gff_attr_series(attrs, "Name")
+    ids = _get_gff_attr_series(gff, "ID").map(_normalize_gff_entity_id)
+    parents = _get_gff_attr_series(gff, "Parent").map(_split_gff_entity_ids)
+    descs = _get_gff_attr_series(gff, _ANNO_DESC_KEY)
+    names = _get_gff_attr_series(gff, "Name")
     features = gff["feature"].astype(str).str.strip().str.lower()
 
     gene_meta: dict[str, dict[str, object]] = {}
@@ -2612,7 +2796,7 @@ def _build_postgwas_gff_annotation_context(gff_query: GFFQuery) -> dict[str, obj
         row_gene_ids[int(idx)] = tuple(out)
 
     feature_index_by_chr: dict[str, dict[str, np.ndarray]] = {}
-    for chrom_norm, block in gff.groupby("chrom_norm", sort=False):
+    for chrom_norm, block in gff.groupby("chrom_norm", sort=False, observed=False):
         block_sorted = block.sort_values(["start", "end"], kind="mergesort")
         block_idx = block_sorted.index.to_numpy(dtype=np.int64, copy=False)
         block_gene_ids = np.empty((int(block_sorted.shape[0]),), dtype=object)
@@ -2808,7 +2992,102 @@ def _build_postgwas_local_gff_context(hit: pd.DataFrame) -> tuple[
     return gene_meta, row_gene_ids
 
 
-def _format_postgwas_gff_site_desc_direct(
+def _postgwas_take_row_values_object(
+    gff: pd.DataFrame,
+    column: str,
+    rowids: np.ndarray,
+    *,
+    na_value: object = "NA",
+) -> np.ndarray:
+    rowids_arr = np.asarray(rowids, dtype=np.int64)
+    if rowids_arr.size == 0:
+        return np.empty((0,), dtype=object)
+    series = gff[column]
+    values = getattr(series, "_values", None)
+    if isinstance(values, pd.Categorical):
+        codes = values.codes[rowids_arr]
+        cats = np.asarray(values.categories, dtype=object)
+        out = np.empty((int(rowids_arr.size),), dtype=object)
+        valid = codes >= 0
+        if bool(np.any(valid)):
+            out[valid] = cats[codes[valid]]
+        if bool(np.any(~valid)):
+            out[~valid] = na_value
+        return out
+    arr = series.to_numpy(dtype=object, na_value=na_value)
+    out = arr[rowids_arr]
+    if na_value is not None and out.size > 0:
+        empty_mask = out == ""
+        if bool(np.any(empty_mask)):
+            out = out.copy()
+            out[empty_mask] = na_value
+    return out
+
+
+def _build_postgwas_local_gff_context_arrays(
+    *,
+    features: np.ndarray,
+    feature_ids: np.ndarray,
+    parents_text: np.ndarray,
+    descs: np.ndarray,
+    names: np.ndarray,
+    starts: np.ndarray,
+    ends: np.ndarray,
+    strands: np.ndarray,
+) -> tuple[dict[str, dict[str, object]], list[tuple[str, ...]]]:
+    gene_meta: dict[str, dict[str, object]] = {}
+    id_to_parents: dict[str, tuple[str, ...]] = {}
+    parent_tuples: list[tuple[str, ...]] = []
+
+    n_rows = int(features.shape[0])
+    for idx in range(n_rows):
+        feature = str(features[idx]).strip().lower()
+        feature_id = _normalize_gff_entity_id(feature_ids[idx])
+        parent_ids = _split_gff_entity_ids(parents_text[idx])
+        parent_tuples.append(parent_ids)
+        if feature_id != "NA" and len(parent_ids) > 0:
+            id_to_parents[feature_id] = parent_ids
+        if feature != "gene" or feature_id == "NA":
+            continue
+        desc = _clean_anno_token(descs[idx])
+        if desc == "NA":
+            desc = _clean_anno_token(names[idx])
+        gene_meta[feature_id] = {
+            "start": int(starts[idx]),
+            "end": int(ends[idx]),
+            "strand": _clean_anno_token(strands[idx]),
+            "desc": _clean_anno_token(desc),
+        }
+
+    resolve_gene_ids = _build_postgwas_gene_id_resolver(
+        gene_meta=gene_meta,
+        id_to_parents=id_to_parents,
+    )
+
+    row_gene_ids: list[tuple[str, ...]] = [tuple() for _ in range(n_rows)]
+    for idx in range(n_rows):
+        feature = str(features[idx]).strip().lower()
+        feature_id = _normalize_gff_entity_id(feature_ids[idx])
+        if feature == "gene" and feature_id in gene_meta:
+            row_gene_ids[idx] = (feature_id,)
+            continue
+        candidate_ids: list[str] = []
+        if feature_id != "NA":
+            candidate_ids.append(feature_id)
+        candidate_ids.extend(list(parent_tuples[idx]))
+        out: list[str] = []
+        seen: set[str] = set()
+        for candidate in candidate_ids:
+            for gene_id in resolve_gene_ids(candidate):
+                if gene_id in seen or gene_id not in gene_meta:
+                    continue
+                seen.add(gene_id)
+                out.append(gene_id)
+        row_gene_ids[idx] = tuple(out)
+    return gene_meta, row_gene_ids
+
+
+def _format_postgwas_gff_site_desc_direct_slow(
     *,
     chrom: object,
     pos: object,
@@ -2893,16 +3172,209 @@ def _format_postgwas_gff_site_desc_direct(
     return _join_postgwas_annotation_entries(entries)
 
 
+def _format_postgwas_gff_site_desc_direct(
+    *,
+    chrom: object,
+    pos: object,
+    gff_query: Optional[GFFQuery] = None,
+    gff_rust_index: Optional[object] = None,
+    flank_bp: int = 2_000,
+) -> str:
+    try:
+        pos_int = int(pos)
+    except Exception:
+        return "Intergenic;NA;NA"
+    if gff_rust_index is not None:
+        try:
+            return str(
+                gff_rust_index.annotate_site_desc(
+                    str(chrom),
+                    int(pos_int),
+                    int(flank_bp),
+                )
+            )
+        except Exception:
+            pass
+    if gff_query is None:
+        return "Intergenic;NA;NA"
+
+    chrom_norm = _normalize_chr(chrom)
+    hit = getattr(gff_query, "_chr_index", {}).get(chrom_norm)
+    gff = getattr(gff_query, "gff", None)
+    required_cols = (
+        _gff_prefetched_attr_colname("ID"),
+        _gff_prefetched_attr_colname("Parent"),
+        _gff_prefetched_attr_colname(_ANNO_DESC_KEY),
+        _gff_prefetched_attr_colname("Name"),
+        "strand",
+    )
+    if (
+        hit is None
+        or gff is None
+        or any(str(col) not in gff.columns for col in required_cols)
+    ):
+        return _format_postgwas_gff_site_desc_direct_slow(
+            chrom=chrom,
+            pos=pos,
+            gff_query=gff_query,
+            flank_bp=flank_bp,
+        )
+
+    starts = np.asarray(hit.get("starts", np.asarray([], dtype=np.int64)), dtype=np.int64)
+    ends = np.asarray(hit.get("ends", np.asarray([], dtype=np.int64)), dtype=np.int64)
+    features = np.asarray(hit.get("features", np.asarray([], dtype=object)), dtype=object)
+    rowids = np.asarray(hit.get("rowids", np.asarray([], dtype=np.int64)), dtype=np.int64)
+    if starts.size == 0 or ends.size == 0 or features.size == 0 or rowids.size == 0:
+        return "Intergenic;NA;NA"
+
+    hi_exact = int(np.searchsorted(starts, pos_int, side="right"))
+    exact_entries: list[str] = []
+    exact_gene_ids: set[str] = set()
+    if hi_exact > 0:
+        exact_mask = ends[:hi_exact] >= pos_int
+        if bool(np.any(exact_mask)):
+            exact_rowids = rowids[:hi_exact][exact_mask]
+            exact_features = features[:hi_exact][exact_mask]
+            exact_starts = starts[:hi_exact][exact_mask]
+            exact_ends = ends[:hi_exact][exact_mask]
+            exact_feature_ids = _postgwas_take_row_values_object(
+                gff,
+                _gff_prefetched_attr_colname("ID"),
+                exact_rowids,
+            )
+            exact_parents = _postgwas_take_row_values_object(
+                gff,
+                _gff_prefetched_attr_colname("Parent"),
+                exact_rowids,
+            )
+            exact_descs = _postgwas_take_row_values_object(
+                gff,
+                _gff_prefetched_attr_colname(_ANNO_DESC_KEY),
+                exact_rowids,
+            )
+            exact_names = _postgwas_take_row_values_object(
+                gff,
+                _gff_prefetched_attr_colname("Name"),
+                exact_rowids,
+            )
+            exact_strands = _postgwas_take_row_values_object(
+                gff,
+                "strand",
+                exact_rowids,
+                na_value=".",
+            )
+
+            gene_meta, row_gene_ids = _build_postgwas_local_gff_context_arrays(
+                features=exact_features,
+                feature_ids=exact_feature_ids,
+                parents_text=exact_parents,
+                descs=exact_descs,
+                names=exact_names,
+                starts=exact_starts,
+                ends=exact_ends,
+                strands=exact_strands,
+            )
+            gene_features: dict[str, set[str]] = {}
+            gene_order: list[str] = []
+            for idx in range(int(exact_features.shape[0])):
+                feature = str(exact_features[idx]).strip().lower()
+                if feature == "":
+                    continue
+                for gene_id in row_gene_ids[idx]:
+                    if gene_id not in gene_meta:
+                        continue
+                    if gene_id not in gene_features:
+                        gene_features[gene_id] = set()
+                        gene_order.append(gene_id)
+                    gene_features[gene_id].add(feature)
+
+            exact_gene_ids = set(gene_features)
+            for gene_id in gene_order:
+                meta = gene_meta.get(gene_id, {})
+                exact_entries.append(
+                    _postgwas_annotation_triplet(
+                        _postgwas_choose_exact_gff_label(gene_features.get(gene_id, set())),
+                        gene_id,
+                        meta.get("desc", "NA"),
+                    )
+                )
+
+    flank = max(0, int(flank_bp))
+    hi_near = int(np.searchsorted(starts, pos_int + flank, side="right"))
+    nearby_records: list[tuple[int, int, str, str]] = []
+    if hi_near > 0:
+        nearby_mask = (ends[:hi_near] >= pos_int - flank) & (features[:hi_near] == "gene")
+        if bool(np.any(nearby_mask)):
+            nearby_rowids = rowids[:hi_near][nearby_mask]
+            nearby_starts = starts[:hi_near][nearby_mask]
+            nearby_ends = ends[:hi_near][nearby_mask]
+            nearby_gene_ids = _postgwas_take_row_values_object(
+                gff,
+                _gff_prefetched_attr_colname("ID"),
+                nearby_rowids,
+            )
+            nearby_strands = _postgwas_take_row_values_object(
+                gff,
+                "strand",
+                nearby_rowids,
+                na_value=".",
+            )
+            for gene_id_raw, start_raw, end_raw, strand_raw in zip(
+                nearby_gene_ids.tolist(),
+                nearby_starts.tolist(),
+                nearby_ends.tolist(),
+                nearby_strands.tolist(),
+            ):
+                gene_id = _normalize_gff_entity_id(gene_id_raw)
+                if gene_id == "NA" or gene_id in exact_gene_ids:
+                    continue
+                start_i = int(start_raw)
+                end_i = int(end_raw)
+                strand = _clean_anno_token(strand_raw)
+                if pos_int < start_i:
+                    dist = int(start_i - pos_int)
+                    if dist > flank:
+                        continue
+                    label = "Upstream2kb" if strand != "-" else "Downstream2kb"
+                elif pos_int > end_i:
+                    dist = int(pos_int - end_i)
+                    if dist > flank:
+                        continue
+                    label = "Downstream2kb" if strand != "-" else "Upstream2kb"
+                else:
+                    continue
+                nearby_records.append((int(dist), int(start_i), gene_id, str(label)))
+
+    nearby_records.sort(key=lambda x: (int(x[0]), int(x[1]), str(x[2])))
+    for _dist, _start, gene_id, label in nearby_records:
+        exact_entries.append(_postgwas_annotation_triplet(label, gene_id, "NA"))
+    return _join_postgwas_annotation_entries(exact_entries)
+
+
 def _format_postgwas_gff_broaden_direct(
     *,
     chrom: object,
     pos: object,
-    gff_query: GFFQuery,
+    gff_query: Optional[GFFQuery] = None,
+    gff_rust_index: Optional[object] = None,
     window_bp: int,
 ) -> str:
     try:
         pos_int = int(pos)
     except Exception:
+        return "NA"
+    if gff_rust_index is not None:
+        try:
+            return str(
+                gff_rust_index.annotate_site_broaden(
+                    str(chrom),
+                    int(pos_int),
+                    int(window_bp),
+                )
+            )
+        except Exception:
+            pass
+    if gff_query is None:
         return "NA"
     window = max(0, int(window_bp))
     hit = gff_query.query_range(
@@ -3131,6 +3603,48 @@ def _format_postgwas_gene_annotation_from_ids(
     if len(out) == 0:
         return "NA"
     return ";".join(out)
+
+
+def _postgwas_site_index_to_rust_query_arrays(
+    site_index: pd.MultiIndex,
+) -> tuple[list[str], list[int]]:
+    chroms: list[str] = []
+    poss: list[int] = []
+    for key in site_index.tolist():
+        if not isinstance(key, tuple) or len(key) < 2:
+            chroms.append("")
+            poss.append(0)
+            continue
+        chroms.append(str(key[0]))
+        try:
+            poss.append(int(key[1]))
+        except Exception:
+            poss.append(0)
+    return chroms, poss
+
+
+def _format_postgwas_gff_site_desc_many_rust(
+    site_index: pd.MultiIndex,
+    *,
+    gff_rust_index: object,
+    flank_bp: int = 2_000,
+) -> list[str]:
+    if len(site_index) == 0:
+        return []
+    chroms, poss = _postgwas_site_index_to_rust_query_arrays(site_index)
+    return [str(x) for x in gff_rust_index.annotate_many_desc(chroms, poss, int(flank_bp))]
+
+
+def _format_postgwas_gff_broaden_many_rust(
+    site_index: pd.MultiIndex,
+    *,
+    gff_rust_index: object,
+    window_bp: int,
+) -> list[str]:
+    if len(site_index) == 0:
+        return []
+    chroms, poss = _postgwas_site_index_to_rust_query_arrays(site_index)
+    return [str(x) for x in gff_rust_index.annotate_many_broaden(chroms, poss, int(window_bp))]
 
 
 def _format_postgwas_gff_site_desc_many(
@@ -3362,6 +3876,248 @@ def _load_postgwas_input_table(
         df_all = pd.read_csv(file, sep="\t", usecols=read_cols)
     full_chr_labels = df_all[chr_col].drop_duplicates().tolist()
     return df_all, full_chr_labels
+
+
+def _postgwas_first_present_column(
+    columns: object,
+    candidates: list[object],
+) -> Optional[str]:
+    if columns is None:
+        return None
+    colset = {str(col) for col in list(columns)}
+    for candidate in candidates:
+        text = str(candidate).strip()
+        if text != "" and text in colset:
+            return text
+    return None
+
+
+def _postgwas_parse_interact_spec(spec_text: object | None) -> dict[str, object]:
+    defaults = {
+        "snp_col": "snp",
+        "chr_col": "chrom",
+        "pos_col": "pos",
+        "p_col": "pwald",
+        "group_tokens": ["|", "&", "*"],
+    }
+    if spec_text is None:
+        return dict(defaults)
+    text = str(spec_text).strip()
+    if text == "":
+        return dict(defaults)
+    parts = [str(x).strip() for x in text.split(";")]
+    parts = [x for x in parts if x != ""]
+    if len(parts) < 4:
+        raise ValueError(
+            "interact spec must be 'snp;chrom;pos;pvalue;group1;group2;...'"
+        )
+    out = {
+        "snp_col": parts[0],
+        "chr_col": parts[1],
+        "pos_col": parts[2],
+        "p_col": parts[3],
+        "group_tokens": [
+            re.sub(r"\\(.)", r"\1", str(x))
+            for x in (parts[4:] if len(parts) > 4 else list(defaults["group_tokens"]))
+        ],
+    }
+    return out
+
+
+def _postgwas_load_circle_interact_df(
+    interact_path: str,
+    *,
+    group_col: str,
+    chr_col: str,
+    pos_col: str,
+    p_col: Optional[str],
+) -> pd.DataFrame:
+    header = pd.read_csv(interact_path, sep="\t", nrows=0)
+    present_cols = [str(col) for col in list(header.columns)]
+    needed = [str(group_col), str(chr_col), str(pos_col)]
+    if p_col is not None:
+        needed.append(str(p_col))
+    if "row_role" in present_cols:
+        needed.append("row_role")
+    usecols = [col for col in dict.fromkeys(needed) if col in present_cols]
+    return pd.read_csv(interact_path, sep="\t", usecols=usecols)
+
+
+def _postgwas_build_circle_link_table_from_groups(
+    df: pd.DataFrame,
+    *,
+    group_col: str,
+    chr_col: str,
+    pos_col: str,
+    p_col: Optional[str],
+    type_col: Optional[str] = None,
+    group_tokens: Optional[list[str]] = None,
+) -> tuple[Optional[pd.DataFrame], dict[str, Optional[str]]]:
+    if df.shape[0] == 0:
+        return None, {
+            "group_col": group_col,
+            "type_col": type_col,
+            "pvalue_col": p_col,
+            "score_col": None,
+        }
+
+    if group_col not in df.columns:
+        raise ValueError(f"Interaction group column '{group_col}' was not found in the input table.")
+    if chr_col not in df.columns:
+        raise ValueError(f"Interaction chromosome column '{chr_col}' was not found in the input table.")
+    if pos_col not in df.columns:
+        raise ValueError(f"Interaction position column '{pos_col}' was not found in the input table.")
+    if p_col is not None and p_col not in df.columns:
+        raise ValueError(f"Interaction p-value column '{p_col}' was not found in the input table.")
+    if type_col is not None and type_col not in df.columns:
+        raise ValueError(f"Interaction type column '{type_col}' was not found in the input table.")
+
+    work = df.copy()
+    work[group_col] = work[group_col].astype(str).str.strip()
+    work[chr_col] = work[chr_col].astype(str)
+    work[pos_col] = pd.to_numeric(work[pos_col], errors="coerce")
+    work = work[(work[group_col] != "") & work[pos_col].notna()].copy()
+    if work.shape[0] == 0:
+        return None, {
+            "group_col": group_col,
+            "type_col": type_col,
+            "pvalue_col": p_col,
+            "score_col": None,
+        }
+
+    if "row_role" in work.columns:
+        row_role = work["row_role"].astype(str).str.strip().str.lower()
+        combo_mask = row_role.eq("combo")
+        if bool(combo_mask.any()):
+            work = work.loc[combo_mask].copy()
+
+    tokens = [str(x) for x in list(group_tokens or []) if str(x) != ""]
+    if len(tokens) > 0:
+        token_mask = work[group_col].map(lambda text: any(tok in str(text) for tok in tokens))
+        if bool(token_mask.any()):
+            work = work.loc[token_mask].copy()
+    if work.shape[0] == 0:
+        return None, {
+            "group_col": group_col,
+            "type_col": type_col,
+            "pvalue_col": p_col,
+            "score_col": None,
+        }
+
+    records: list[dict[str, object]] = []
+    for group_name, grp in work.groupby(group_col, sort=False):
+        endpoints = grp[[chr_col, pos_col]].copy()
+        endpoints[pos_col] = pd.to_numeric(endpoints[pos_col], errors="coerce")
+        endpoints = endpoints.dropna(subset=[pos_col]).copy()
+        if endpoints.shape[0] == 0:
+            continue
+        endpoints[pos_col] = endpoints[pos_col].astype(np.int64)
+        endpoints = endpoints.drop_duplicates(subset=[chr_col, pos_col], keep="first").reset_index(drop=True)
+        if endpoints.shape[0] < 2:
+            continue
+        if type_col is not None and type_col in grp.columns:
+            type_values = grp[type_col].dropna().astype(str)
+            type_value = str(type_values.iloc[0]).strip() if type_values.shape[0] > 0 else str(group_name)
+        else:
+            type_value = str(group_name)
+        if p_col is not None and p_col in grp.columns:
+            pvals = pd.to_numeric(grp[p_col], errors="coerce")
+            pvals = pvals[np.isfinite(pvals)]
+            pvalue_value = float(pvals.min()) if pvals.shape[0] > 0 else float("nan")
+        else:
+            pvalue_value = float("nan")
+
+        n_endpoints = int(endpoints.shape[0])
+        for i in range(n_endpoints - 1):
+            row_i = endpoints.iloc[i]
+            for j in range(i + 1, n_endpoints):
+                row_j = endpoints.iloc[j]
+                records.append(
+                    {
+                        "chrom1": str(row_i[chr_col]),
+                        "pos1": int(row_i[pos_col]),
+                        "chrom2": str(row_j[chr_col]),
+                        "pos2": int(row_j[pos_col]),
+                        "combo_id": str(group_name),
+                        "link_type": str(type_value),
+                        "link_pvalue": float(pvalue_value),
+                    }
+                )
+
+    if len(records) == 0:
+        return None, {
+            "group_col": group_col,
+            "type_col": type_col,
+            "pvalue_col": p_col,
+            "score_col": None,
+        }
+    return pd.DataFrame.from_records(records), {
+        "group_col": group_col,
+        "type_col": type_col,
+        "pvalue_col": p_col,
+        "score_col": None,
+    }
+
+
+def _postgwas_build_circle_link_table(
+    df: pd.DataFrame,
+    *,
+    chr_col: str,
+    pos_col: str,
+    p_col: str,
+) -> tuple[Optional[pd.DataFrame], dict[str, Optional[str]]]:
+    group_col = _postgwas_first_present_column(
+        df.columns,
+        ["combo_id", "parent_combo", "combo"],
+    )
+    resolved_type_col = _postgwas_first_present_column(
+        df.columns,
+        ["logic", "gate", "type", "interaction_type", group_col] if group_col is not None else ["logic", "gate", "type", "interaction_type"],
+    )
+
+    resolved_p_col = _postgwas_first_present_column(
+        df.columns,
+        [
+            "p_combo_joint",
+            "combo_pwald_joint",
+            "p_combo_marginal",
+            "combo_pwald_joint_fdr",
+            p_col,
+            "pwald",
+            "p",
+        ],
+    )
+
+    if group_col is not None:
+        link_df, meta = _postgwas_build_circle_link_table_from_groups(
+            df,
+            group_col=str(group_col),
+            chr_col=chr_col,
+            pos_col=pos_col,
+            p_col=resolved_p_col,
+            type_col=resolved_type_col,
+            group_tokens=None,
+        )
+        if link_df is not None and link_df.shape[0] > 0:
+            return link_df, meta
+
+    snp_col = _postgwas_first_present_column(df.columns, ["snp"])
+    if snp_col is not None:
+        return _postgwas_build_circle_link_table_from_groups(
+            df,
+            group_col=str(snp_col),
+            chr_col=chr_col,
+            pos_col=pos_col,
+            p_col=resolved_p_col,
+            type_col=str(snp_col),
+            group_tokens=["|", "&", "*"],
+        )
+    return None, {
+        "group_col": None,
+        "type_col": None,
+        "pvalue_col": resolved_p_col,
+        "score_col": None,
+    }
 
 
 def _ldclump_significant_snps(
@@ -3691,6 +4447,7 @@ def _load_gene_like_records_from_anno(
     bimrange_tuples: list[tuple[str, int, int]],
     logger: logging.Logger,
     gff_query: Optional[GFFQuery] = None,
+    gff_rust_index: Optional[object] = None,
 ) -> pd.DataFrame:
     """
     Load gene-structure-like records from GFF/BED for selected bimranges.
@@ -3706,6 +4463,41 @@ def _load_gene_like_records_from_anno(
     features = ["gene", "five_prime_UTR", "three_prime_UTR", "CDS"]
 
     if suffix in {"gff", "gff3"}:
+        if gff_rust_index is not None:
+            try:
+                chroms = [str(x[0]) for x in bimrange_tuples]
+                starts = [int(x[1]) for x in bimrange_tuples]
+                ends = [int(x[2]) for x in bimrange_tuples]
+                (
+                    out_chroms,
+                    out_features,
+                    out_starts,
+                    out_ends,
+                    out_strands,
+                    out_ids,
+                ) = gff_rust_index.fetch_gene_panel_ranges(
+                    chroms,
+                    starts,
+                    ends,
+                )
+                if len(out_starts) == 0:
+                    return pd.DataFrame(columns=out_cols)
+                out = pd.DataFrame(
+                    {
+                        "chrom_norm": pd.Series(out_chroms, dtype=object).map(_normalize_chr),
+                        "feature": pd.Series(out_features, dtype=object),
+                        "start": np.asarray(out_starts, dtype=np.int64),
+                        "end": np.asarray(out_ends, dtype=np.int64),
+                        "strand": pd.Series(out_strands, dtype=object),
+                        "attribute": [[str(x)] for x in out_ids],
+                    }
+                )
+                return out.loc[:, out_cols]
+            except Exception as e:
+                logger.warning(
+                    "Warning: Rust GFF gene-panel range query failed; "
+                    f"falling back to Python GFFQuery ({e})."
+                )
         q = gff_query if gff_query is not None else GFFQuery.from_file(annofile)
         chunks: list[pd.DataFrame] = []
         for chrom, start, end in bimrange_tuples:
@@ -4390,10 +5182,15 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
     chr_col, pos_col, p_col = args.chr, args.pos, args.pvalue
     anno_suffix = _postgwas_annotation_suffix(args.anno_file)
     use_shared_gff = bool(getattr(args, "_postgwas_use_shared_gff", False))
-    gff_query_cache: Optional[GFFQuery] = _postgwas_get_gff_query(
-        args.anno_file,
-        use_shared=use_shared_gff,
-    ) if anno_suffix in {"gff", "gff3"} else None
+    gff_query_cache: Optional[GFFQuery] = None
+    gff_rust_index_cache: Optional[object] = (
+        _postgwas_get_gff_rust_index(
+            args.anno_file,
+            use_shared=use_shared_gff,
+        )
+        if anno_suffix in {"gff", "gff3"}
+        else None
+    )
     status_enabled = _postgwas_status_enabled(args)
     src = os.path.basename(str(file))
     task_label = os.path.basename(str(output_stem))
@@ -4415,7 +5212,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                 chr_col=chr_col,
                 pos_col=pos_col,
                 p_col=p_col,
-                keep_all_columns=bool(args.anno),
+                keep_all_columns=bool(args.anno or (args.circle_size is not None)),
             )
             df = df_all
         except Exception:
@@ -4483,12 +5280,21 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
     # ------------------------------------------------------------------
     # 1. Visualization: Manhattan & QQ
     # ------------------------------------------------------------------
-    if args.manh_ratio is not None or args.qq_ratio is not None or effective_ldblock_ratio is not None:
+    if (
+        args.manh_ratio is not None
+        or args.circle_size is not None
+        or args.qq_ratio is not None
+        or effective_ldblock_ratio is not None
+    ):
         t_plot = time.time()
         logger.info(f"Visualizing GWAS results from {src}...")
         ld_use_all_sites = bool(args.ldblock_all is not None)
 
-        need_manh_panel = args.manh_ratio is not None or effective_ldblock_ratio is not None
+        need_manh_panel = (
+            args.manh_ratio is not None
+            or args.circle_size is not None
+            or effective_ldblock_ratio is not None
+        )
         plotmodel = None
         plotmodel_qq = None
         if (need_manh_panel or args.qq_ratio is not None) and df.shape[0] > 0:
@@ -4555,6 +5361,75 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
             )
         qq_point_color = _resolve_qq_point_color(args.palette_spec)
         qq_band_color = str(_QQ_BAND_COLOR)
+        circle_links_df: Optional[pd.DataFrame] = None
+        circle_link_meta: dict[str, Optional[str]] = {
+            "group_col": None,
+            "type_col": None,
+            "pvalue_col": None,
+            "score_col": None,
+        }
+        if args.circle_size is not None and plotmodel is not None:
+            interact_path = getattr(args, "_circle_interact_path", None)
+            interact_spec = getattr(args, "_circle_interact_spec", None)
+            if interact_path is not None:
+                spec = dict(interact_spec or _postgwas_parse_interact_spec(None))
+                group_col = str(spec["snp_col"])
+                interact_chr_col = str(spec["chr_col"])
+                interact_pos_col = str(spec["pos_col"])
+                interact_p_col = str(spec["p_col"])
+                if os.path.abspath(str(interact_path)) == os.path.abspath(str(file)):
+                    interact_df = df_all
+                else:
+                    interact_df = _postgwas_load_circle_interact_df(
+                        str(interact_path),
+                        group_col=group_col,
+                        chr_col=interact_chr_col,
+                        pos_col=interact_pos_col,
+                        p_col=interact_p_col,
+                    )
+                circle_links_df, circle_link_meta = _postgwas_build_circle_link_table_from_groups(
+                    interact_df,
+                    group_col=group_col,
+                    chr_col=interact_chr_col,
+                    pos_col=interact_pos_col,
+                    p_col=interact_p_col,
+                    type_col=group_col,
+                    group_tokens=[str(x) for x in list(spec.get("group_tokens", []))],
+                )
+            else:
+                circle_links_df, circle_link_meta = _postgwas_build_circle_link_table(
+                    df,
+                    chr_col=chr_col,
+                    pos_col=pos_col,
+                    p_col=p_col,
+                )
+            if (
+                circle_links_df is not None
+                and circle_links_df.shape[0] > 0
+                and np.isfinite(threshold)
+                and float(threshold) > 0.0
+                and "link_pvalue" in circle_links_df.columns
+            ):
+                before_n = int(circle_links_df.shape[0])
+                circle_links_df = circle_links_df.loc[
+                    pd.to_numeric(circle_links_df["link_pvalue"], errors="coerce") <= float(threshold)
+                ].copy()
+                after_n = int(circle_links_df.shape[0])
+                logger.info(
+                    "Circular Manhattan: "
+                    f"kept {after_n}/{before_n} interaction link(s) with p<=thr ({float(threshold):.4g})."
+                )
+            if circle_links_df is None or circle_links_df.shape[0] == 0:
+                logger.info("Circular Manhattan: no interaction links were detected; drawing track only.")
+            else:
+                link_p_col = circle_link_meta.get("pvalue_col")
+                logger.info(
+                    "Circular Manhattan: "
+                    f"detected {int(circle_links_df.shape[0])} link(s) "
+                    f"(group={circle_link_meta.get('group_col') or 'NA'}, "
+                    f"pvalue={link_p_col or 'NA'}, "
+                    f"source={os.path.basename(str(interact_path)) if interact_path is not None else 'auto'})."
+                )
 
         def _draw_manhattan_axis(
             ax: plt.Axes,
@@ -4755,6 +5630,46 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
         else:
             manh_path = None
 
+        # ----------------- Circle Manhattan plot -----------------
+        if args.circle_size is not None:
+            if plotmodel is None:
+                logger.warning("Warning: circular Manhattan skipped because no SNPs are available.")
+                circle_path = None
+            else:
+                fig_circle, ax_circle = plt.subplots(
+                    figsize=(float(args.circle_size), float(args.circle_size)),
+                    dpi=dpi,
+                )
+                plotmodel.circle_manhattan(
+                    threshold=(
+                        float(_safe_neglog10_p([threshold])[0])
+                        if (np.isfinite(threshold) and float(threshold) > 0.0)
+                        else None
+                    ),
+                    color_set=plot_colors,
+                    ax=ax_circle,
+                    links_df=circle_links_df,
+                    link_type_col="link_type",
+                    link_pvalue_col="link_pvalue",
+                    marker=single_marker,
+                    scatter_size=single_scatter_size,
+                    scatter_alpha=(
+                        float(single_alpha) if single_alpha is not None else 0.76
+                    ),
+                    track_ratio=float(args.circle_track_ratio),
+                    link_interval=float(args.circle_interval),
+                    link_linewidth=float(args.circle_lw),
+                    min_logp=manh_min_logp,
+                    max_logp=manh_max_logp,
+                    y_min=manh_ymin,
+                    circle_direction=str(args.circle_direction),
+                    rasterized=rasterized,
+                )
+                circle_path = os.path.join(args.out, f"{output_stem}.circle.{args.format}")
+                _save_figure_and_close(fig_circle, circle_path)
+        else:
+            circle_path = None
+
         # ----------------- QQ plot -----------------
         if args.qq_ratio is not None:
             manh_save_executor: Optional[cf.ThreadPoolExecutor] = None
@@ -4942,7 +5857,11 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
             )
             use_gene_bridge = False
             if args.anno_file:
-                if anno_suffix in {"gff", "gff3"} and gff_query_cache is None:
+                if (
+                    anno_suffix in {"gff", "gff3"}
+                    and gff_rust_index_cache is None
+                    and gff_query_cache is None
+                ):
                     gff_query_cache = _postgwas_get_gff_query(
                         args.anno_file,
                         use_shared=use_shared_gff,
@@ -4953,6 +5872,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                     region_ranges,
                     logger,
                     gff_query=gff_query_cache,
+                    gff_rust_index=gff_rust_index_cache,
                 )
                 gene_track_df = _project_gene_records_to_plot_x(
                     gene_raw,
@@ -5293,6 +6213,8 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
         saved_paths: list[tuple[str, str]] = []
         if manh_path is not None:
             saved_paths.append(("Manhattan", manh_path))
+        if circle_path is not None:
+            saved_paths.append(("Circle Manhattan", circle_path))
         if qq_path is not None:
             saved_paths.append(("QQ", qq_path))
         if ld_path is not None:
@@ -5380,23 +6302,29 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                         )
 
                     if anno_suffix in {"gff", "gff3"} and int(df_filter.shape[0]) > 0:
-                        if gff_query_cache is None:
-                            gff_query_cache = _postgwas_get_gff_query(
-                                args.anno_file,
-                                use_shared=use_shared_gff,
-                                current=gff_query_cache,
+                        if gff_rust_index_cache is None:
+                            if gff_query_cache is None:
+                                gff_query_cache = _postgwas_get_gff_query(
+                                    args.anno_file,
+                                    use_shared=use_shared_gff,
+                                    current=gff_query_cache,
+                                )
+                            use_gff_batch_annotation = (
+                                int(df_filter.shape[0]) >= int(_POSTGWAS_GFF_BATCH_ANNOTATION_MIN_SITES)
                             )
-                        use_gff_batch_annotation = (
-                            int(df_filter.shape[0]) >= int(_POSTGWAS_GFF_BATCH_ANNOTATION_MIN_SITES)
-                        )
-                        if use_gff_batch_annotation:
-                            gff_annotation_ctx = _postgwas_get_gff_annotation_context(
-                                args.anno_file,
-                                use_shared=use_shared_gff,
-                                gff_query=gff_query_cache,
-                            )
+                            if use_gff_batch_annotation:
+                                gff_annotation_ctx = _postgwas_get_gff_annotation_context(
+                                    args.anno_file,
+                                    use_shared=use_shared_gff,
+                                    gff_query=gff_query_cache,
+                                )
 
-                    if anno_suffix in {"gff", "gff3"} and gff_annotation_ctx is not None:
+                    if anno_suffix in {"gff", "gff3"} and gff_rust_index_cache is not None:
+                        df_filter[annotation_col_map["desc"]] = _format_postgwas_gff_site_desc_many_rust(
+                            df_filter.index,
+                            gff_rust_index=gff_rust_index_cache,
+                        )
+                    elif anno_suffix in {"gff", "gff3"} and gff_annotation_ctx is not None:
                         df_filter[annotation_col_map["desc"]] = _format_postgwas_gff_site_desc_many(
                             df_filter.index,
                             annotation_ctx=gff_annotation_ctx,
@@ -5438,7 +6366,13 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                     # Optional broadened window around SNP (卤 annobroaden kb)
                     if args.annobroaden is not None:
                         kb = args.annobroaden * 1_000
-                        if anno_suffix in {"gff", "gff3"} and gff_annotation_ctx is not None:
+                        if anno_suffix in {"gff", "gff3"} and gff_rust_index_cache is not None:
+                            df_filter[annotation_col_map["broaden"]] = _format_postgwas_gff_broaden_many_rust(
+                                df_filter.index,
+                                gff_rust_index=gff_rust_index_cache,
+                                window_bp=int(kb),
+                            )
+                        elif anno_suffix in {"gff", "gff3"} and gff_annotation_ctx is not None:
                             df_filter[annotation_col_map["broaden"]] = _format_postgwas_gff_broaden_many(
                                 df_filter.index,
                                 annotation_ctx=gff_annotation_ctx,
@@ -5450,6 +6384,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                                     chrom=idx[0],
                                     pos=idx[1],
                                     gff_query=gff_query_cache,
+                                    gff_rust_index=gff_rust_index_cache,
                                     window_bp=int(kb),
                                 )
                                 for idx in df_filter.index
@@ -6308,16 +7243,23 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
                 anno_suffix = _postgwas_annotation_suffix(args.anno_file)
                 use_shared_gff = bool(getattr(args, "_postgwas_use_shared_gff", False))
                 gff_query_cache: Optional[GFFQuery] = None
+                gff_rust_index_cache: Optional[object] = None
                 if anno_suffix in {"gff", "gff3"}:
-                    gff_query_cache = _postgwas_get_gff_query(
+                    gff_rust_index_cache = _postgwas_get_gff_rust_index(
                         args.anno_file,
                         use_shared=use_shared_gff,
                     )
+                    if gff_rust_index_cache is None:
+                        gff_query_cache = _postgwas_get_gff_query(
+                            args.anno_file,
+                            use_shared=use_shared_gff,
+                        )
                 gene_raw = _load_gene_like_records_from_anno(
                     args.anno_file,
                     region_ranges,
                     logger,
                     gff_query=gff_query_cache,
+                    gff_rust_index=gff_rust_index_cache,
                 )
                 region_layout = (
                     bim_layout
@@ -6660,16 +7602,23 @@ def _run_postgwas_ldblock_only(args, logger: logging.Logger) -> None:
         anno_suffix = _postgwas_annotation_suffix(args.anno_file)
         use_shared_gff = bool(getattr(args, "_postgwas_use_shared_gff", False))
         gff_query_cache: Optional[GFFQuery] = None
+        gff_rust_index_cache: Optional[object] = None
         if anno_suffix in {"gff", "gff3"}:
-            gff_query_cache = _postgwas_get_gff_query(
+            gff_rust_index_cache = _postgwas_get_gff_rust_index(
                 args.anno_file,
                 use_shared=use_shared_gff,
             )
+            if gff_rust_index_cache is None:
+                gff_query_cache = _postgwas_get_gff_query(
+                    args.anno_file,
+                    use_shared=use_shared_gff,
+                )
         gene_raw = _load_gene_like_records_from_anno(
             args.anno_file,
             region_ranges,
             logger,
             gff_query=gff_query_cache,
+            gff_rust_index=gff_rust_index_cache,
         )
         gene_track_df = _project_gene_records_to_ld_spans(
             gene_raw,
@@ -7249,6 +8198,69 @@ def main(argv: Optional[list[str]] = None):
             "Default: %(default)s."
         ),
     )
+    manh_group.add_argument(
+        "-circle", "--circle", dest="circle", type=float, nargs="*", default=None,
+        help=(
+            "Enable circular Manhattan/Circos plotting. "
+            "Accepts 0, 1, or 2 values: "
+            "--circle uses defaults; "
+            "--circle <size_in> sets the square figure size; "
+            "--circle <size_in> <track_ratio> also sets the Manhattan scatter-track share in [0,1]. "
+            f"Defaults: size={_DEFAULT_CIRCLE_SIZE_IN:g} in, track_ratio={_DEFAULT_CIRCLE_TRACK_RATIO:g}."
+        ),
+    )
+    manh_group.add_argument(
+        "-circle-interval",
+        "--circle-interval",
+        dest="circle_interval",
+        type=float,
+        default=_DEFAULT_CIRCLE_INTERVAL,
+        help=(
+            "Relative gap between the Manhattan scatter ring and interaction links in [0,1]. "
+            f"1 keeps the current farthest spacing; 0 moves links closest to the scatter ring. Default: {_DEFAULT_CIRCLE_INTERVAL:g}."
+        ),
+    )
+    manh_group.add_argument(
+        "-circle-lw",
+        "--circle-lw",
+        dest="circle_lw",
+        type=float,
+        default=_DEFAULT_CIRCLE_LW,
+        help=(
+            "Interaction curve line width for circular Manhattan. "
+            f"Default: {_DEFAULT_CIRCLE_LW:g}."
+        ),
+    )
+    circle_dir_group = manh_group.add_mutually_exclusive_group(required=False)
+    circle_dir_group.add_argument(
+        "-circle-in",
+        "--circle-in",
+        dest="circle_direction",
+        action="store_const",
+        const="in",
+        help="Draw circular Manhattan values toward the center (0 at the outer ring edge).",
+    )
+    circle_dir_group.add_argument(
+        "-circle-out",
+        "--circle-out",
+        dest="circle_direction",
+        action="store_const",
+        const="out",
+        help="Draw circular Manhattan values away from the center (current default).",
+    )
+    manh_group.add_argument(
+        "-interact",
+        "--interact",
+        dest="interact",
+        nargs="+",
+        default=None,
+        help=(
+            "Optional interaction source for circular Manhattan. "
+            "Usage: --interact <file> ['snp;chrom;pos;pvalue;group1;group2;...']. "
+            "If spec is omitted, defaults are GARFIELD-compatible: "
+            "'snp;chrom;pos;pwald;|;&;*'."
+        ),
+    )
 
     # ------------------------------------------------------------------
     # QQ Plot
@@ -7602,6 +8614,80 @@ def main(argv: Optional[list[str]] = None):
     if (not np.isfinite(args.interval)) or (args.interval < 0.0) or (args.interval > 1.0):
         logger.error("interval must be in [0,1].")
         raise SystemExit(1)
+    if args.circle is not None:
+        circle_items = list(args.circle)
+        if len(circle_items) > 2:
+            logger.error("circle accepts at most two values: <size_in> <track_ratio>.")
+            raise SystemExit(1)
+        if len(circle_items) == 0:
+            args.circle_size = float(_DEFAULT_CIRCLE_SIZE_IN)
+            args.circle_track_ratio = float(_DEFAULT_CIRCLE_TRACK_RATIO)
+        else:
+            try:
+                args.circle_size = float(circle_items[0])
+            except Exception:
+                logger.error("circle size must be a finite number > 0.")
+                raise SystemExit(1)
+            if (not np.isfinite(args.circle_size)) or float(args.circle_size) <= 0.0:
+                logger.error("circle size must be > 0.")
+                raise SystemExit(1)
+            if len(circle_items) >= 2:
+                try:
+                    args.circle_track_ratio = float(circle_items[1])
+                except Exception:
+                    logger.error("circle track ratio must be a finite number in [0,1].")
+                    raise SystemExit(1)
+            else:
+                args.circle_track_ratio = float(_DEFAULT_CIRCLE_TRACK_RATIO)
+        if (
+            (not np.isfinite(args.circle_track_ratio))
+            or float(args.circle_track_ratio) < 0.0
+            or float(args.circle_track_ratio) > 1.0
+        ):
+            logger.error("circle track ratio must be in [0,1].")
+            raise SystemExit(1)
+    else:
+        args.circle_size = None
+        args.circle_track_ratio = float(_DEFAULT_CIRCLE_TRACK_RATIO)
+    try:
+        args.circle_interval = float(args.circle_interval)
+    except Exception:
+        logger.error("circle-interval must be a finite number in [0,1].")
+        raise SystemExit(1)
+    if (not np.isfinite(args.circle_interval)) or float(args.circle_interval) < 0.0 or float(args.circle_interval) > 1.0:
+        logger.error("circle-interval must be in [0,1].")
+        raise SystemExit(1)
+    try:
+        args.circle_lw = float(args.circle_lw)
+    except Exception:
+        logger.error("circle-lw must be a finite number > 0.")
+        raise SystemExit(1)
+    if (not np.isfinite(args.circle_lw)) or float(args.circle_lw) <= 0.0:
+        logger.error("circle-lw must be > 0.")
+        raise SystemExit(1)
+    args.circle_direction = str(getattr(args, "circle_direction", "out") or "out").strip().lower()
+    if args.circle_direction not in {"in", "out"}:
+        logger.error("circle direction must be either circle-in or circle-out.")
+        raise SystemExit(1)
+    if args.interact is None:
+        args._circle_interact_path = None
+        args._circle_interact_spec = None
+    else:
+        interact_items = list(args.interact)
+        if len(interact_items) < 1 or len(interact_items) > 2:
+            logger.error("interact expects 1 or 2 values: <file> ['snp;chrom;pos;pvalue;group1;group2;...']")
+            raise SystemExit(1)
+        args._circle_interact_path = str(interact_items[0]).strip()
+        if args._circle_interact_path == "":
+            logger.error("interact file path cannot be empty.")
+            raise SystemExit(1)
+        try:
+            args._circle_interact_spec = _postgwas_parse_interact_spec(
+                interact_items[1] if len(interact_items) >= 2 else None
+            )
+        except ValueError as e:
+            logger.error(str(e))
+            raise SystemExit(1)
     if bool(args.anno) and args.anno_file is None:
         logger.error("Variant annotation requires one annotation source from --gff or --bed.")
         raise SystemExit(1)
@@ -7792,6 +8878,7 @@ def main(argv: Optional[list[str]] = None):
     single_plot_requested = bool(
         (args.manh_ratio is not None)
         or (args.qq_ratio is not None)
+        or (args.circle_size is not None)
         or bool(args.anno)
         or bool(single_ldblock_requested)
     )
@@ -7936,6 +9023,7 @@ def main(argv: Optional[list[str]] = None):
     if (
         args.manh_ratio is not None
         or args.qq_ratio is not None
+        or args.circle_size is not None
         or args._merge_manh_ratio is not None
         or args._merge_qq_ratio is not None
         or args.ldblock_ratio is not None
@@ -8001,6 +9089,29 @@ def main(argv: Optional[list[str]] = None):
                     f"interval={args.interval:g}, "
                     f"ylim={args.ylim if args.ylim is not None else 'auto'}, "
                     f"compression={comp_text}",
+                )
+            )
+        if args.circle_size is not None:
+            circle_desc = (
+                f"size={float(args.circle_size):g}in, links use p<=thr, track=scatter, "
+                f"track_ratio={float(args.circle_track_ratio):g}, "
+                f"gap={float(args.circle_interval):g}, lw={float(args.circle_lw):g}, "
+                f"dir={str(args.circle_direction)}"
+            )
+            if getattr(args, "_circle_interact_path", None) is not None:
+                interact_file = os.path.basename(str(args._circle_interact_path))
+                interact_spec = getattr(args, "_circle_interact_spec", None) or {}
+                circle_desc += (
+                    f", interact={interact_file}"
+                    f" [{interact_spec.get('snp_col', 'snp')};"
+                    f"{interact_spec.get('chr_col', 'chrom')};"
+                    f"{interact_spec.get('pos_col', 'pos')};"
+                    f"{interact_spec.get('p_col', 'pwald')}]"
+                )
+            vis_rows.append(
+                (
+                    "Circle Manhattan",
+                    circle_desc,
                 )
             )
         if args.qq_ratio is not None:
@@ -8110,13 +9221,21 @@ def main(argv: Optional[list[str]] = None):
     _emit_info_to_file_handlers(logger, f"  {_postgwas_invocation_command(argv)}")
     if no_plot_or_anno:
         logger.warning(
-            "Warning: No --manh/--qq/--manh-merge/--qq-merge/--ldblock/--ldblock-all/--anno provided. Nothing will be plotted or annotated."
+            "Warning: No --manh/--circle/--qq/--manh-merge/--qq-merge/--ldblock/--ldblock-all/--anno provided. Nothing will be plotted or annotated."
         )
 
     check_gwas_files = list(args.gwasfile or [])
     checks: list[bool] = [
         ensure_file_exists(logger, f, "GWAS result file") for f in check_gwas_files
     ]
+    if args._circle_interact_path is not None:
+        checks.append(
+            ensure_file_exists(
+                logger,
+                args._circle_interact_path,
+                "Interaction file",
+            )
+        )
     if args.anno_file is not None:
         checks.append(ensure_file_exists(logger, args.anno_file, "Annotation file"))
     if args.vcf:
@@ -8148,7 +9267,9 @@ def main(argv: Optional[list[str]] = None):
             or (args.ldblock_ratio is not None)
         )
     ):
-        _postgwas_get_shared_gff_query(args.anno_file)
+        preloaded = _postgwas_get_shared_gff_rust_index(args.anno_file)
+        if preloaded is None:
+            _postgwas_get_shared_gff_query(args.anno_file)
         logger.info(
             "Preloaded shared GFF annotation index: "
             f"{format_path_for_display(args.anno_file)}"

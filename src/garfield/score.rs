@@ -6,8 +6,6 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use rayon::prelude::*;
 use std::borrow::Cow;
-#[cfg(target_arch = "x86_64")]
-use std::sync::OnceLock;
 
 const BATCH_PAR_MIN_ROWS: usize = 64;
 #[cfg(target_arch = "x86_64")]
@@ -57,13 +55,6 @@ fn words_for_samples(n: usize) -> usize {
 #[inline]
 fn should_parallel_rows(n_rows: usize) -> bool {
     n_rows >= BATCH_PAR_MIN_ROWS && rayon::current_num_threads() > 1
-}
-
-#[cfg(target_arch = "x86_64")]
-#[inline]
-fn score_avx2_runtime_available() -> bool {
-    static AVX2: OnceLock<bool> = OnceLock::new();
-    *AVX2.get_or_init(|| std::arch::is_x86_feature_detected!("avx2"))
 }
 
 #[inline]
@@ -516,12 +507,6 @@ unsafe fn sum_y_where_both1_neon(lhs: &[u64], rhs: &[u64], y: &[f64], n_samples:
 
 #[inline]
 pub fn sum_y_where_both1(lhs: &[u64], rhs: &[u64], y: &[f64], n_samples: usize) -> f64 {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if score_avx2_runtime_available() {
-            return unsafe { sum_y_where_both1_avx2(lhs, rhs, y, n_samples) };
-        }
-    }
     sum_y_where_both1_scalar(lhs, rhs, y, n_samples)
 }
 

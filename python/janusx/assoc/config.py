@@ -54,7 +54,7 @@ class AssociationConfig:
     traits: Optional[Sequence[int]] = None
     maf: float = 0.02
     geno: float = 0.05
-    het: float = 0.02
+    het: float = 1.0
     snps_only: bool = False
     threads: int = 0
     chunksize: int = 10000
@@ -93,8 +93,8 @@ class AssociationConfig:
             raise ValueError("maf must be within [0, 0.5].")
         if not (0.0 <= float(self.geno) <= 1.0):
             raise ValueError("geno must be within [0, 1].")
-        if not (0.0 <= float(self.het) <= 0.5):
-            raise ValueError("het must be within [0, 0.5].")
+        if not (0.0 <= float(self.het) <= 1.0):
+            raise ValueError("het must be within [0, 1].")
         if (not np.isfinite(float(self.memory))) or float(self.memory) <= 0.0:
             raise ValueError("memory must be a finite value > 0.")
 

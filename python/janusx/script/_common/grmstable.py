@@ -59,7 +59,7 @@ def build_stable_packed_grm_f64(
         str(prefix),
         maf_threshold=float(maf_threshold),
         max_missing_rate=float(max_missing_rate),
-        het_threshold=0.0,
+        het_threshold=1.0,
         snps_only=bool(snps_only),
     )
 

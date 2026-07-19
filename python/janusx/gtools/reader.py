@@ -91,6 +91,39 @@ def _normalize_attr_keys(attr: Optional[Iterable[str]]) -> list[str]:
     return out
 
 
+def _gff_prefetched_attr_colname(key: object) -> str:
+    """
+    Normalize a GFF attribute key into the compact pre-extracted column name.
+    """
+    text = str(key).strip()
+    if text == "":
+        return ""
+    safe = re.sub(r"[^0-9A-Za-z_]+", "_", text)
+    return f"attr_{safe}"
+
+
+def _prefetched_attr_series_from_column(series: pd.Series) -> pd.Series:
+    """
+    Fast path for shared-GFF pre-extracted attribute columns.
+    Avoid expensive categorical->str conversion on every query.
+    """
+    values = series.to_numpy(dtype=object, na_value="NA")
+    copied = False
+    if values.size > 0:
+        empty_mask = values == ""
+        if bool(np.any(empty_mask)):
+            values = values.copy()
+            copied = True
+            values[empty_mask] = "NA"
+        nan_text_mask = values == "nan"
+        if bool(np.any(nan_text_mask)):
+            if not bool(copied):
+                values = values.copy()
+                copied = True
+            values[nan_text_mask] = "NA"
+    return pd.Series(values, index=series.index, copy=False)
+
+
 def _extract_attr_value(attr_series: pd.Series, key: str) -> pd.Series:
     """
     Extract one attribute value from GFF attribute text by key.
@@ -353,7 +386,7 @@ class GFFQuery:
             and self.gff.index.step == 1
         )
         self._chr_index: dict[str, dict[str, np.ndarray]] = {}
-        for chrom, block in self.gff.groupby("chrom_norm", sort=False):
+        for chrom, block in self.gff.groupby("chrom_norm", sort=False, observed=False):
             # Build per-chromosome numpy arrays for fast range filtering.
             block = block.sort_values(["start", "end"], kind="mergesort")
             rowids = block.index.to_numpy()
@@ -506,7 +539,31 @@ class GFFQuery:
         else:
             out = self.gff.loc[hit_rowids].copy()
         if attr_keys is not None:
-            out["attribute"] = _extract_attr_list(out["attributes"], attr_keys)
+            attr_data: dict[str, pd.Series] = {}
+            missing_keys: list[str] = []
+            for key in attr_keys:
+                col = _gff_prefetched_attr_colname(key)
+                if col != "" and col in out.columns:
+                    attr_data[str(key)] = _prefetched_attr_series_from_column(out[col])
+                else:
+                    missing_keys.append(str(key))
+            if len(missing_keys) > 0:
+                if "attributes" not in out.columns:
+                    for key in missing_keys:
+                        attr_data[str(key)] = pd.Series("NA", index=out.index, dtype=object)
+                else:
+                    parsed_missing = _extract_attr_values(out["attributes"], missing_keys)
+                    for key in missing_keys:
+                        attr_data[str(key)] = parsed_missing[str(key)]
+            attr_arrays = [
+                attr_data[str(key)].to_numpy(dtype=object, copy=False)
+                for key in attr_keys
+            ]
+            if len(attr_arrays) == 1:
+                attr_values = [[value] for value in attr_arrays[0].tolist()]
+            else:
+                attr_values = np.column_stack(attr_arrays).tolist()
+            out["attribute"] = pd.Series(attr_values, index=out.index)
             out.attrs["attribute_keys"] = attr_keys
         return out
 

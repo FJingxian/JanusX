@@ -43,7 +43,9 @@ pub struct ContinuousRuleScore {
     pub mean_hit: f64,
     pub mean_miss: f64,
     pub support_frac: f64,
+    pub dosage_maf: f64,
     pub n_hit: usize,
+    pub n_ge2: usize,
     pub n_miss: usize,
 }
 
@@ -110,9 +112,36 @@ fn invalid_rule_score() -> ContinuousRuleScore {
         mean_hit: f64::NAN,
         mean_miss: f64::NAN,
         support_frac: f64::NAN,
+        dosage_maf: f64::NAN,
         n_hit: 0,
+        n_ge2: 0,
         n_miss: 0,
     }
+}
+
+#[inline]
+fn minor_allele_frac(af: f64) -> f64 {
+    if !af.is_finite() {
+        return 0.0;
+    }
+    let af = af.clamp(0.0, 1.0);
+    af.min(1.0 - af)
+}
+
+#[inline]
+pub fn binary_maf_from_n_hit(n_samples: usize, n_hit: usize) -> f64 {
+    if n_samples == 0 {
+        return 0.0;
+    }
+    minor_allele_frac((n_hit as f64) / (n_samples as f64))
+}
+
+#[inline]
+pub fn dosage_maf_from_dual_counts(n_samples: usize, n_ge1: usize, n_ge2: usize) -> f64 {
+    if n_samples == 0 {
+        return 0.0;
+    }
+    minor_allele_frac(((n_ge1.saturating_add(n_ge2)) as f64) / (2.0 * (n_samples as f64)))
 }
 
 #[inline]
@@ -704,7 +733,9 @@ pub fn score_cont_centered_gain_from_sum_and_n_hit(
             mean_hit: f64::NAN,
             mean_miss: f64::NAN,
             support_frac: (n_hit as f64) / (n_samples as f64),
+            dosage_maf: binary_maf_from_n_hit(n_samples, n_hit),
             n_hit,
+            n_ge2: 0,
             n_miss,
         };
     }
@@ -722,7 +753,9 @@ pub fn score_cont_centered_gain_from_sum_and_n_hit(
         mean_hit,
         mean_miss,
         support_frac: p,
+        dosage_maf: binary_maf_from_n_hit(n_samples, n_hit),
         n_hit,
+        n_ge2: 0,
         n_miss,
     }
 }
@@ -787,6 +820,7 @@ pub fn score_cont_centered_gain_dual_from_summary(
     let n_hit = n_ge1;
     let n_miss = n_samples.saturating_sub(n_hit);
     let support_frac = (n_hit as f64) / (n_samples as f64);
+    let dosage_maf = dosage_maf_from_dual_counts(n_samples, n_ge1, n_ge2);
     let mean_hit = if n_hit == 0 {
         f64::NAN
     } else {
@@ -816,7 +850,9 @@ pub fn score_cont_centered_gain_dual_from_summary(
         mean_hit,
         mean_miss,
         support_frac,
+        dosage_maf,
         n_hit,
+        n_ge2,
         n_miss,
     }
 }

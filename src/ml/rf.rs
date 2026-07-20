@@ -108,7 +108,12 @@ fn accumulate_node_stats(stats: &mut NodeStats, y_val: f64, response: ResponseKi
 }
 
 #[inline]
-fn split_gain_from_stats(parent: NodeStats, left: NodeStats, right: NodeStats, response: ResponseKind) -> Option<f64> {
+fn split_gain_from_stats(
+    parent: NodeStats,
+    left: NodeStats,
+    right: NodeStats,
+    response: ResponseKind,
+) -> Option<f64> {
     let gain = match response {
         ResponseKind::Continuous => {
             let parent_term = (parent.sum * parent.sum) / (parent.n as f64);

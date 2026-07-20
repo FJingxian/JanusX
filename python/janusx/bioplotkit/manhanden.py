@@ -1096,10 +1096,10 @@ class GWASPLOT:
                         x_max=circle_plot_xmax,
                     )[0]
                 )
-                label_radius = plot_outer_r + 0.11
+                label_radius = plot_outer_r + 0.055
                 delta_to_gap = abs(float(np.arctan2(np.sin(label_theta - lead_gap_theta), np.cos(label_theta - lead_gap_theta))))
                 if delta_to_gap <= 0.42:
-                    label_radius = plot_outer_r + 0.15
+                    label_radius = plot_outer_r + 0.085
                 lx, ly = _polar_to_cartesian(label_theta, label_radius)
                 text_rotation = float(np.degrees(label_theta) - 90.0)
                 if text_rotation < -90.0:

@@ -230,7 +230,12 @@ impl GffAnnotationIndexInner {
         annotate_site_broaden_on_chrom(&self.chroms[chrom_idx], pos, window_bp)
     }
 
-    fn annotate_many_desc(&self, chroms: &[String], poss: &[i64], flank_bp: i64) -> Result<Vec<String>, String> {
+    fn annotate_many_desc(
+        &self,
+        chroms: &[String],
+        poss: &[i64],
+        flank_bp: i64,
+    ) -> Result<Vec<String>, String> {
         if chroms.len() != poss.len() {
             return Err(format!(
                 "chroms and poss length mismatch: {} vs {}",
@@ -321,11 +326,7 @@ impl GffAnnotationIndexInner {
             let Some(&chrom_idx) = self.chrom_lookup.get(&chrom_norm) else {
                 continue;
             };
-            fetch_gene_panel_ranges_on_chrom(
-                &self.chroms[chrom_idx],
-                &items,
-                &mut buckets,
-            );
+            fetch_gene_panel_ranges_on_chrom(&self.chroms[chrom_idx], &items, &mut buckets);
         }
 
         let total_rows: usize = buckets.iter().map(|x| x.len()).sum();
@@ -422,7 +423,12 @@ impl GffAnnotationIndex {
     }
 
     #[pyo3(signature = (chroms, poss, flank_bp=DESC_GENE_FLANK_BP_DEFAULT))]
-    fn annotate_many_desc(&self, chroms: Vec<String>, poss: Vec<i64>, flank_bp: i64) -> PyResult<Vec<String>> {
+    fn annotate_many_desc(
+        &self,
+        chroms: Vec<String>,
+        poss: Vec<i64>,
+        flank_bp: i64,
+    ) -> PyResult<Vec<String>> {
         self.inner
             .annotate_many_desc(&chroms, &poss, flank_bp)
             .map_err(PyRuntimeError::new_err)
@@ -451,7 +457,10 @@ impl GffAnnotationIndex {
     }
 }
 
-fn build_or_load_gff_index(gff_path: &str, cache_path: Option<&str>) -> Result<GffAnnotationIndexInner, String> {
+fn build_or_load_gff_index(
+    gff_path: &str,
+    cache_path: Option<&str>,
+) -> Result<GffAnnotationIndexInner, String> {
     let source = gff_source_meta(gff_path)?;
     if let Some(cache) = cache_path {
         let cache_file = Path::new(cache);
@@ -484,7 +493,10 @@ fn save_gff_index(index: &GffAnnotationIndexInner, cache_path: &str) -> Result<(
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent).map_err(|e| {
-                format!("Failed to create GFF cache directory {}: {e}", parent.display())
+                format!(
+                    "Failed to create GFF cache directory {}: {e}",
+                    parent.display()
+                )
             })?;
         }
     }
@@ -536,9 +548,11 @@ fn parse_gff_annotation_index(
         let Some(id) = raw.id.as_ref() else {
             continue;
         };
-        let desc = clean_or_na(raw.gene_desc.as_deref().unwrap_or(
-            raw.gene_name.as_deref().unwrap_or("NA"),
-        ));
+        let desc = clean_or_na(
+            raw.gene_desc
+                .as_deref()
+                .unwrap_or(raw.gene_name.as_deref().unwrap_or("NA")),
+        );
         genes_by_chrom
             .entry(raw.chrom.clone())
             .or_default()
@@ -560,9 +574,7 @@ fn parse_gff_annotation_index(
 
     for chrom_name in chrom_names.iter() {
         let mut genes = genes_by_chrom.remove(chrom_name).unwrap_or_default();
-        genes.sort_by(|a, b| {
-            (a.start, a.end, a.id.as_str()).cmp(&(b.start, b.end, b.id.as_str()))
-        });
+        genes.sort_by(|a, b| (a.start, a.end, a.id.as_str()).cmp(&(b.start, b.end, b.id.as_str())));
         let chrom_idx = chroms.len();
         for (gene_idx, gene) in genes.iter().enumerate() {
             gene_lookup.insert(
@@ -640,7 +652,9 @@ fn parse_gff_annotation_index(
     let mut n_genes = 0usize;
     let mut n_features = 0usize;
     for chrom in chroms.iter_mut() {
-        chrom.features.sort_by(|a, b| (a.start, a.end).cmp(&(b.start, b.end)));
+        chrom
+            .features
+            .sort_by(|a, b| (a.start, a.end).cmp(&(b.start, b.end)));
         n_genes = n_genes.saturating_add(chrom.genes.len());
         n_features = n_features.saturating_add(chrom.features.len());
     }
@@ -834,9 +848,13 @@ fn annotate_many_desc_on_chrom(
     let mut gene_add_ptr = 0usize;
 
     for &(out_idx, pos) in items.iter() {
-        while feature_add_ptr < chrom.features.len() && chrom.features[feature_add_ptr].start <= pos {
+        while feature_add_ptr < chrom.features.len() && chrom.features[feature_add_ptr].start <= pos
+        {
             active_features.insert(feature_add_ptr);
-            feature_heap.push(Reverse((chrom.features[feature_add_ptr].end, feature_add_ptr)));
+            feature_heap.push(Reverse((
+                chrom.features[feature_add_ptr].end,
+                feature_add_ptr,
+            )));
             feature_add_ptr += 1;
         }
         while let Some(Reverse((end, idx))) = feature_heap.peek().copied() {
@@ -894,7 +912,8 @@ fn annotate_many_desc_on_chrom(
         let mut entries: Vec<String> = Vec::new();
         for gene_idx in gene_order.iter().copied() {
             let gene = &chrom.genes[gene_idx];
-            let label = GffFeatureKind::exact_label_from_rank(*gene_best_rank.get(&gene_idx).unwrap_or(&5));
+            let label =
+                GffFeatureKind::exact_label_from_rank(*gene_best_rank.get(&gene_idx).unwrap_or(&5));
             entries.push(format_annotation_triplet(label, &gene.id, &gene.desc));
         }
 
@@ -1005,9 +1024,13 @@ fn fetch_gene_panel_ranges_on_chrom(
     let mut feature_add_ptr = 0usize;
 
     for (order_idx, start, end) in sorted_items.into_iter() {
-        while feature_add_ptr < chrom.features.len() && chrom.features[feature_add_ptr].start <= end {
+        while feature_add_ptr < chrom.features.len() && chrom.features[feature_add_ptr].start <= end
+        {
             active_features.insert(feature_add_ptr);
-            feature_heap.push(Reverse((chrom.features[feature_add_ptr].end, feature_add_ptr)));
+            feature_heap.push(Reverse((
+                chrom.features[feature_add_ptr].end,
+                feature_add_ptr,
+            )));
             feature_add_ptr += 1;
         }
         while let Some(Reverse((feature_end, feature_idx))) = feature_heap.peek().copied() {
@@ -1208,8 +1231,10 @@ chr1\tsrc\tCDS\t320\t340\t.\t-\t0\tID=cds:Cdsb;Parent=transcript:TxB\n";
         );
         assert_eq!(
             index.annotate_site_desc("chr1", 250, 2_000),
-            "Downstream2kb;GeneA;NA | Downstream2kb;GeneB;NA"
-                .replace("Downstream2kb;GeneA;NA | Downstream2kb;GeneB;NA", "Downstream2kb;GeneA;NA | Downstream2kb;GeneB;NA")
+            "Downstream2kb;GeneA;NA | Downstream2kb;GeneB;NA".replace(
+                "Downstream2kb;GeneA;NA | Downstream2kb;GeneB;NA",
+                "Downstream2kb;GeneA;NA | Downstream2kb;GeneB;NA"
+            )
         );
         assert_eq!(
             index.annotate_site_broaden("1", 250, 80),
@@ -1229,7 +1254,10 @@ chr1\tsrc\tCDS\t320\t340\t.\t-\t0\tID=cds:Cdsb;Parent=transcript:TxB\n";
         .unwrap();
         let loaded = load_gff_index(cache_path.to_str().unwrap()).unwrap();
         assert_eq!(built.source, loaded.source);
-        assert_eq!(built.annotate_site_desc("1", 130, 2_000), loaded.annotate_site_desc("1", 130, 2_000));
+        assert_eq!(
+            built.annotate_site_desc("1", 130, 2_000),
+            loaded.annotate_site_desc("1", 130, 2_000)
+        );
         let _ = fs::remove_file(gff_path);
         let _ = fs::remove_file(cache_path);
     }

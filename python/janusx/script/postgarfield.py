@@ -14,7 +14,9 @@ import argparse
 import logging
 import os
 import re
+import shlex
 import socket
+import sys
 import time
 from functools import lru_cache
 from typing import Optional
@@ -23,6 +25,12 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+from janusx.assoc.workflow import (
+    _format_cli_finished_timestamp,
+    _gwas_terminal_config_line_max_chars,
+    _terminal_saved_result_paths,
+)
+from janusx.assoc.workflow_ui import _rich_success
 from janusx.script._common.cli_args import (
     add_common_out_arg,
     add_common_prefix_arg,
@@ -38,8 +46,9 @@ from janusx.script._common.log import setup_logging
 from janusx.script._common.pathcheck import (
     ensure_all_true,
     ensure_file_exists,
+    format_path_for_display,
 )
-from janusx.script._common.progress import log_success, warn_deprecated_alias_usage
+from janusx.script._common.progress import warn_deprecated_alias_usage
 from janusx.script._common.threads import (
     apply_blas_thread_env,
     detect_effective_threads,
@@ -161,6 +170,90 @@ def _postgarfield_format_output_frame(df: pd.DataFrame) -> pd.DataFrame:
         if col in out.columns:
             out[col] = pd.to_numeric(out[col], errors="coerce").map(_postgarfield_format_sci_text)
     return out
+
+
+def _postgarfield_dedupe_saved_paths(paths: list[object]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for path in paths:
+        text = str(path or "").strip()
+        if text == "" or text in seen:
+            continue
+        seen.add(text)
+        out.append(text)
+    return out
+
+
+def _postgarfield_emit_saved_paths(logger: logging.Logger, paths: list[object]) -> None:
+    saved = _terminal_saved_result_paths(_postgarfield_dedupe_saved_paths(paths))
+    if len(saved) == 0:
+        return
+    if len(saved) == 1:
+        _rich_success(
+            logger,
+            f"Results saved to {format_path_for_display(saved[0])}",
+            use_spinner=False,
+        )
+        return
+    body = "\n".join(f"  {format_path_for_display(path)}" for path in saved)
+    _rich_success(
+        logger,
+        f"Results saved:\n{body}",
+        use_spinner=False,
+    )
+
+
+def _postgarfield_emit_finished_lines(
+    logger: logging.Logger,
+    *,
+    elapsed_sec: float,
+    finished_unix: float | None = None,
+) -> None:
+    _rich_success(
+        logger,
+        "\n".join(
+            [
+                "",
+                f"Finished. Total wall time: {float(max(elapsed_sec, 0.0)):.2f} seconds",
+                _format_cli_finished_timestamp(finished_unix),
+            ]
+        ),
+        use_spinner=False,
+    )
+
+
+def _postgarfield_invocation_command(argv: Optional[list[str]] = None) -> str:
+    tokens = [str(x) for x in (sys.argv[1:] if argv is None else argv)]
+    prog_raw = str(sys.argv[0]).strip() if len(sys.argv) > 0 else ""
+    if prog_raw == "":
+        prog_raw = "jx postgarfield"
+    try:
+        prog_parts = shlex.split(prog_raw)
+    except Exception:
+        prog_parts = [prog_raw]
+    if len(prog_parts) == 0:
+        prog_parts = ["jx", "postgarfield"]
+    return shlex.join([str(x) for x in (prog_parts + tokens)])
+
+
+def _emit_postgarfield_command_to_log(
+    logger: logging.Logger,
+    argv: Optional[list[str]] = None,
+) -> None:
+    lines = ["", "[ Command ]", f"  {_postgarfield_invocation_command(argv)}"]
+    for message in lines:
+        record = logger.makeRecord(
+            logger.name,
+            logging.INFO,
+            __file__,
+            0,
+            message,
+            args=(),
+            exc_info=None,
+        )
+        for handler in logger.handlers:
+            if isinstance(handler, logging.FileHandler):
+                handler.handle(record)
 
 
 def _postgarfield_expand_optional_files(
@@ -704,7 +797,8 @@ def _postgarfield_write_category_outputs(
     thr_p: Optional[float],
     args,
     logger: logging.Logger,
-) -> None:
+) -> list[str]:
+    saved_paths: list[str] = []
     background_snapshot, plotmodel = _postgarfield_snapshot_circle_background(
         background_df=background_df,
         full_chr_labels=full_chr_labels,
@@ -733,6 +827,7 @@ def _postgarfield_write_category_outputs(
         circle_path = os.path.join(outdir, f"{output_stem}.sig.{category}.circle.{fmt}")
         df_cat_out = _postgarfield_format_output_frame(df_cat)
         df_cat_out.to_csv(out_tsv, sep="\t", index=False)
+        saved_paths.append(out_tsv)
         logger.info(
             f"{os.path.basename(out_tsv)}: wrote {int(df_cat_out.shape[0])} row(s) for {category_desc}."
         )
@@ -772,9 +867,11 @@ def _postgarfield_write_category_outputs(
             show_link_colorbar=True,
         )
         _save_figure(fig_circle, circle_path)
+        saved_paths.append(circle_path)
         _postgarfield_clear_circle_overlay(ax_circle)
         plt.close(fig_circle)
         logger.info(f"{os.path.basename(circle_path)}: circle plot saved.")
+    return saved_paths
 
 
 def main(argv: Optional[list[str]] = None) -> None:
@@ -990,8 +1087,9 @@ def main(argv: Optional[list[str]] = None) -> None:
             )
         ],
         footer_rows=[("Output dir", args.out)],
-        line_max_chars=60,
+        line_max_chars=_gwas_terminal_config_line_max_chars(60),
     )
+    _emit_postgarfield_command_to_log(logger, argv)
 
     _apply_postgwas_matplotlib_style(args)
     gff_rust_index = _postgwas_get_gff_rust_index(
@@ -1006,6 +1104,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         logger.error(f"Failed to build GFF annotation index: {args.gff}")
         raise SystemExit(1)
 
+    saved_paths: list[str] = []
     for idx, garfield_file in enumerate(list(args.garfield), start=1):
         background_file = bg_files[idx - 1]
         output_stem = _resolve_postgwas_output_stem(str(garfield_file), args.prefix)
@@ -1061,29 +1160,29 @@ def main(argv: Optional[list[str]] = None) -> None:
             f"background={bg_desc}."
         )
 
-        _postgarfield_write_category_outputs(
-            category_frames,
-            output_stem=output_stem,
-            outdir=args.out,
+        saved_paths.extend(
+            _postgarfield_write_category_outputs(
+                category_frames,
+                output_stem=output_stem,
+                outdir=args.out,
             fmt=str(args.format),
             background_df=background_df,
             full_chr_labels=full_chr_labels,
             chr_col=str(args.chr),
             pos_col=str(args.pos),
             p_col=str(args.pvalue),
-            thr_p=sig_thr_p,
-            args=args,
-            logger=logger,
+                thr_p=sig_thr_p,
+                args=args,
+                logger=logger,
+            )
         )
 
-    lt = time.localtime()
-    endinfo = (
-        f"\nFinished post-GARFIELD. Total wall time: "
-        f"{round(time.time() - t_start, 2)} seconds\n"
-        f"{lt.tm_year}-{lt.tm_mon}-{lt.tm_mday} "
-        f"{lt.tm_hour}:{lt.tm_min}:{lt.tm_sec}"
+    _postgarfield_emit_saved_paths(logger, saved_paths)
+    _postgarfield_emit_finished_lines(
+        logger,
+        elapsed_sec=(time.time() - t_start),
+        finished_unix=time.time(),
     )
-    log_success(logger, endinfo)
 
 
 if __name__ == "__main__":

@@ -124,7 +124,10 @@ fn split_gain_for_feature(
     }
 
     let mut best = None::<SplitCandidate>;
-    for (threshold, left_n, left_sum) in [(0u8, left_n_le0, left_sum_le0), (1u8, left_n_le1, left_sum_le1)] {
+    for (threshold, left_n, left_sum) in [
+        (0u8, left_n_le0, left_sum_le0),
+        (1u8, left_n_le1, left_sum_le1),
+    ] {
         let right_n = parent.n.saturating_sub(left_n);
         if left_n < min_leaf || right_n < min_leaf {
             continue;

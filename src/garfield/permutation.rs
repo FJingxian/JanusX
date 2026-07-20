@@ -20,61 +20,22 @@ pub const DEFAULT_RULE_STRUCTURE_BOOTSTRAP_KL_THRESHOLD: f64 = 0.005;
 pub const DEFAULT_RULE_STRUCTURE_DENSITY_TOPK: usize = 10;
 const DEFAULT_RULE_NULL_QUANTILE: f64 = 0.99;
 const DEFAULT_RULE_NULL_Q99_REL_TOL: f64 = 0.05;
-// Minimum samples per exact bucket before falling back to collapsed.
+// Minimum samples per exact bucket before falling back to the global null.
 const NULL_EXACT_MIN_SAMPLES: usize = 10;
 // Top-k per repeat: how many extreme null scores to keep per bucket.
-const DEFAULT_RULE_NULL_TOPK_POS_L2: usize = 3;
-const DEFAULT_RULE_NULL_TOPK_POS_L3P: usize = 2;
-const DEFAULT_RULE_NULL_TOPK_MIXED: usize = 2;
-const DEFAULT_RULE_NULL_TOPK_NEG: usize = 2;
+const DEFAULT_RULE_NULL_TOPK_LEN2: usize = 3;
+const DEFAULT_RULE_NULL_TOPK_LEN3P: usize = 2;
 const DEFAULT_RULE_NULL_TOPK_DEFAULT: usize = 1;
-// Shrinkage weights: (exact, collapse_1, collapse_2, global).
-const DEFAULT_RULE_NULL_SHRINK_POS_L2: (f64, f64, f64, f64) = (0.20, 0.35, 0.30, 0.15);
-const DEFAULT_RULE_NULL_SHRINK_POS_L3P: (f64, f64, f64, f64) = (0.20, 0.30, 0.35, 0.15);
-const DEFAULT_RULE_NULL_SHRINK_MIXED: (f64, f64, f64, f64) = (0.15, 0.35, 0.35, 0.15);
-const DEFAULT_RULE_NULL_SHRINK_NEG: (f64, f64, f64, f64) = (0.15, 0.35, 0.35, 0.15);
-const PSEUDO_SNP_MAF_BOUNDARY: f64 = 0.05;
+const DEFAULT_RULE_NULL_BUCKET_MAX_RULE_LEN: usize = 5;
 
 // ---------------------------------------------------------------------------
 // Bucket types
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum MafBucket {
-    Low,
-    High,
-}
-
-/// Sign class: whether NOT literals appear in the rule.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum CombMode {
-    PosOnly, // not_count == 0
-    Mixed,   // 0 < not_count < rule_len
-    NegOnly, // not_count == rule_len (every literal negated)
-}
-
-/// Rule-length bin (collapsed to keep bucket count bounded).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum LenBin {
-    L1,  // rule_len == 1
-    L2,  // rule_len == 2
-    L3p, // rule_len >= 3
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct RuleNullBucket {
-    pub comb: CombMode,
-    pub maf: MafBucket,
-    pub len_bin: LenBin,
+    pub rule_len: usize,
 }
-
-// Total: 3 (comb) × 2 (maf) × 3 (len_bin) = 18 slots.
-//   rule_len=1 + Mixed is impossible → 2 empty slots, 16 effective.
-const NULL_BUCKET_EXACT: usize = 18;
-// collapse_sign_len: comb × len_bin
-const NULL_BUCKET_SIGN_LEN: usize = 9;
-// collapse_maf_len: maf × len_bin
-const NULL_BUCKET_MAF_LEN: usize = 6;
 const STRUCTURE_PRIOR_LEN_ALPHA: [f64; 5] = [16.0, 8.0, 4.0, 2.0, 1.0];
 const STRUCTURE_PRIOR_TARGET_ESS: f64 = 24.0;
 const STRUCTURE_PRIOR_LEN_TEMPER: f64 = 0.72;
@@ -87,20 +48,14 @@ struct RuleNullScores {
 
 #[derive(Clone, Debug)]
 pub struct RuleNullCalibrator {
-    exact: Vec<RuleNullScores>,
-    collapse_sign_len: Vec<RuleNullScores>,
-    collapse_maf_len: Vec<RuleNullScores>,
+    by_len: Vec<RuleNullScores>,
     global: RuleNullScores,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RuleNullPenaltyLookup {
-    exact_train: Vec<Option<f64>>,
-    exact_test: Vec<Option<f64>>,
-    cs_train: Vec<Option<f64>>,
-    cs_test: Vec<Option<f64>>,
-    cm_train: Vec<Option<f64>>,
-    cm_test: Vec<Option<f64>>,
+    len_train: Vec<Option<f64>>,
+    len_test: Vec<Option<f64>>,
     global_train: Option<f64>,
     global_test: Option<f64>,
 }
@@ -134,116 +89,8 @@ pub struct RuleStructurePriorCalibrator {
 
 impl RuleNullBucket {
     #[inline]
-    fn exact_index(self) -> usize {
-        let comb = match self.comb {
-            CombMode::PosOnly => 0usize,
-            CombMode::Mixed => 1usize,
-            CombMode::NegOnly => 2usize,
-        };
-        let maf = match self.maf {
-            MafBucket::Low => 0usize,
-            MafBucket::High => 1usize,
-        };
-        let lb = match self.len_bin {
-            LenBin::L1 => 0usize,
-            LenBin::L2 => 1usize,
-            LenBin::L3p => 2usize,
-        };
-        (comb * 2 + maf) * 3 + lb
-    }
-
-    /// collapse_sign_len: comb × len_bin → 9 slots.
-    #[inline]
-    fn collapse_sign_len_index(self) -> usize {
-        let comb = match self.comb {
-            CombMode::PosOnly => 0usize,
-            CombMode::Mixed => 1usize,
-            CombMode::NegOnly => 2usize,
-        };
-        let lb = match self.len_bin {
-            LenBin::L1 => 0usize,
-            LenBin::L2 => 1usize,
-            LenBin::L3p => 2usize,
-        };
-        comb * 3 + lb
-    }
-
-    /// collapse_maf_len: maf × len_bin → 6 slots.
-    #[inline]
-    fn collapse_maf_len_index(self) -> usize {
-        let maf = match self.maf {
-            MafBucket::Low => 0usize,
-            MafBucket::High => 1usize,
-        };
-        let lb = match self.len_bin {
-            LenBin::L1 => 0usize,
-            LenBin::L2 => 1usize,
-            LenBin::L3p => 2usize,
-        };
-        maf * 3 + lb
-    }
-
-    #[inline]
-    fn from_exact_index(idx: usize) -> Self {
-        let lb = match idx % 3 {
-            0 => LenBin::L1,
-            1 => LenBin::L2,
-            _ => LenBin::L3p,
-        };
-        let rest = idx / 3;
-        let maf = if (rest & 1) == 0 {
-            MafBucket::Low
-        } else {
-            MafBucket::High
-        };
-        let comb = match rest / 2 {
-            0 => CombMode::PosOnly,
-            1 => CombMode::Mixed,
-            _ => CombMode::NegOnly,
-        };
-        Self {
-            comb,
-            maf,
-            len_bin: lb,
-        }
-    }
-
-    #[inline]
-    fn from_collapse_sign_len_index(idx: usize) -> Self {
-        let lb = match idx % 3 {
-            0 => LenBin::L1,
-            1 => LenBin::L2,
-            _ => LenBin::L3p,
-        };
-        let comb = match idx / 3 {
-            0 => CombMode::PosOnly,
-            1 => CombMode::Mixed,
-            _ => CombMode::NegOnly,
-        };
-        Self {
-            comb,
-            maf: MafBucket::Low,
-            len_bin: lb,
-        }
-    }
-
-    #[inline]
-    fn from_collapse_maf_len_index(idx: usize) -> Self {
-        let lb = match idx % 3 {
-            0 => LenBin::L1,
-            1 => LenBin::L2,
-            _ => LenBin::L3p,
-        };
-        let maf = if idx / 3 == 0 {
-            MafBucket::Low
-        } else {
-            MafBucket::High
-        };
-        Self {
-            comb: CombMode::PosOnly,
-            maf,
-            len_bin: lb,
-        }
+    fn index(self) -> usize {
+        self.rule_len.saturating_sub(1)
     }
 }
 
@@ -252,127 +99,49 @@ impl RuleNullBucket {
 // ---------------------------------------------------------------------------
 
 #[inline]
-fn len_bin_from_rule_len(rule_len: usize) -> LenBin {
-    if rule_len <= 1 {
-        LenBin::L1
-    } else if rule_len == 2 {
-        LenBin::L2
-    } else {
-        LenBin::L3p
-    }
-}
-
-#[inline]
-fn comb_mode_from_not_count(not_count: usize, rule_len: usize) -> CombMode {
-    if not_count == 0 {
-        CombMode::PosOnly
-    } else if not_count >= rule_len {
-        CombMode::NegOnly
-    } else {
-        CombMode::Mixed
-    }
-}
-
-#[inline]
 pub fn null_topk_per_repeat_for_bucket(bucket: RuleNullBucket) -> usize {
-    match (bucket.comb, bucket.len_bin) {
-        (CombMode::PosOnly, LenBin::L2) => DEFAULT_RULE_NULL_TOPK_POS_L2,
-        (CombMode::PosOnly, LenBin::L3p) => DEFAULT_RULE_NULL_TOPK_POS_L3P,
-        (CombMode::Mixed, _) => DEFAULT_RULE_NULL_TOPK_MIXED,
-        (CombMode::NegOnly, _) => DEFAULT_RULE_NULL_TOPK_NEG,
-        _ => DEFAULT_RULE_NULL_TOPK_DEFAULT,
-    }
-}
-
-/// 4-component shrinkage weights: (exact, collapse_sign_len, collapse_maf_len, global).
-#[inline]
-fn null_shrinkage_weights(bucket: RuleNullBucket) -> Option<(f64, f64, f64, f64)> {
-    if matches!(bucket.len_bin, LenBin::L1) {
-        return None; // length-1 rules don't shrink
-    }
-    match bucket.comb {
-        CombMode::PosOnly => {
-            if matches!(bucket.len_bin, LenBin::L2) {
-                Some(DEFAULT_RULE_NULL_SHRINK_POS_L2)
-            } else {
-                Some(DEFAULT_RULE_NULL_SHRINK_POS_L3P)
-            }
-        }
-        CombMode::Mixed => Some(DEFAULT_RULE_NULL_SHRINK_MIXED),
-        CombMode::NegOnly => Some(DEFAULT_RULE_NULL_SHRINK_NEG),
+    match bucket.rule_len {
+        2 => DEFAULT_RULE_NULL_TOPK_LEN2,
+        0 | 1 => DEFAULT_RULE_NULL_TOPK_DEFAULT,
+        _ => DEFAULT_RULE_NULL_TOPK_LEN3P,
     }
 }
 
 #[inline]
-fn null_quantile_for_bucket(bucket: RuleNullBucket) -> f64 {
-    let _ = bucket;
+fn null_quantile_for_bucket() -> f64 {
     DEFAULT_RULE_NULL_QUANTILE
-}
-
-/// 4-component blended penalty.
-#[inline]
-fn blended_penalty_4(
-    exact: Option<f64>,
-    c1: Option<f64>,
-    c2: Option<f64>,
-    global: Option<f64>,
-    weights: (f64, f64, f64, f64),
-) -> Option<f64> {
-    let mut numer = 0.0_f64;
-    let mut denom = 0.0_f64;
-    for (val, w) in &[
-        (exact, weights.0),
-        (c1, weights.1),
-        (c2, weights.2),
-        (global, weights.3),
-    ] {
-        if let Some(v) = val {
-            if v.is_finite() {
-                numer += v * w;
-                denom += w;
-            }
-        }
-    }
-    if denom > 0.0 {
-        Some(numer / denom)
-    } else {
-        None
-    }
 }
 
 #[allow(dead_code)]
 pub fn rule_null_bucket_count_exact() -> usize {
-    NULL_BUCKET_EXACT
+    DEFAULT_RULE_NULL_BUCKET_MAX_RULE_LEN
 }
 #[allow(dead_code)]
 pub fn rule_null_bucket_count_sign_len() -> usize {
-    NULL_BUCKET_SIGN_LEN
+    0
 }
 #[allow(dead_code)]
 pub fn rule_null_bucket_count_maf_len() -> usize {
-    NULL_BUCKET_MAF_LEN
+    0
 }
 
-/// Legacy wrapper — used by callers that still reference the old signature.
 #[inline]
 #[allow(dead_code)]
-pub fn rule_null_bucket_count(_max_rule_len: usize) -> usize {
-    NULL_BUCKET_EXACT
+pub fn rule_null_bucket_count(max_rule_len: usize) -> usize {
+    max_rule_len.max(1)
 }
 
 impl RuleNullCalibrator {
     pub fn with_max_rule_len(max_rule_len: usize) -> Self {
-        let _mrl = max_rule_len.max(1);
+        let bucket_count = rule_null_bucket_count(max_rule_len);
         Self {
-            exact: vec![RuleNullScores::default(); NULL_BUCKET_EXACT],
-            collapse_sign_len: vec![RuleNullScores::default(); NULL_BUCKET_SIGN_LEN],
-            collapse_maf_len: vec![RuleNullScores::default(); NULL_BUCKET_MAF_LEN],
+            by_len: vec![RuleNullScores::default(); bucket_count],
             global: RuleNullScores::default(),
         }
     }
 
     pub fn new() -> Self {
-        Self::with_max_rule_len(5)
+        Self::with_max_rule_len(DEFAULT_RULE_NULL_BUCKET_MAX_RULE_LEN)
     }
 
     /// Push a paired (train, test) null score.  NaN-safe: finite-only values
@@ -388,45 +157,26 @@ impl RuleNullCalibrator {
 
     /// Push a train-only null score without touching the test side.
     pub fn insert_train(&mut self, bucket: RuleNullBucket, score: f64) {
-        let ei = bucket.exact_index();
-        self.exact[ei].train.push(score);
-        let si = bucket.collapse_sign_len_index();
-        self.collapse_sign_len[si].train.push(score);
-        let mi = bucket.collapse_maf_len_index();
-        self.collapse_maf_len[mi].train.push(score);
+        if let Some(slot) = self.by_len.get_mut(bucket.index()) {
+            slot.train.push(score);
+        }
         self.global.train.push(score);
     }
 
     /// Push a test-only null score without touching the train side.
     pub fn insert_test(&mut self, bucket: RuleNullBucket, score: f64) {
-        let ei = bucket.exact_index();
-        self.exact[ei].test.push(score);
-        let si = bucket.collapse_sign_len_index();
-        self.collapse_sign_len[si].test.push(score);
-        let mi = bucket.collapse_maf_len_index();
-        self.collapse_maf_len[mi].test.push(score);
+        if let Some(slot) = self.by_len.get_mut(bucket.index()) {
+            slot.test.push(score);
+        }
         self.global.test.push(score);
     }
 
     pub fn finalize(&self) -> RuleNullPenaltyLookup {
-        let mut out = RuleNullPenaltyLookup::new();
-        for (idx, scores) in self.exact.iter().enumerate() {
-            let bucket = RuleNullBucket::from_exact_index(idx);
-            let q = null_quantile_for_bucket(bucket);
-            out.exact_train[idx] = sample_min_safe(scores.train.as_slice(), q);
-            out.exact_test[idx] = sample_min_safe(scores.test.as_slice(), q);
-        }
-        for (idx, scores) in self.collapse_sign_len.iter().enumerate() {
-            let bucket = RuleNullBucket::from_collapse_sign_len_index(idx);
-            let q = null_quantile_for_bucket(bucket);
-            out.cs_train[idx] = sample_min_safe(scores.train.as_slice(), q);
-            out.cs_test[idx] = sample_min_safe(scores.test.as_slice(), q);
-        }
-        for (idx, scores) in self.collapse_maf_len.iter().enumerate() {
-            let bucket = RuleNullBucket::from_collapse_maf_len_index(idx);
-            let q = null_quantile_for_bucket(bucket);
-            out.cm_train[idx] = sample_min_safe(scores.train.as_slice(), q);
-            out.cm_test[idx] = sample_min_safe(scores.test.as_slice(), q);
+        let mut out = RuleNullPenaltyLookup::with_max_rule_len(self.by_len.len());
+        for (idx, scores) in self.by_len.iter().enumerate() {
+            let q = null_quantile_for_bucket();
+            out.len_train[idx] = sample_min_safe(scores.train.as_slice(), q);
+            out.len_test[idx] = sample_min_safe(scores.test.as_slice(), q);
         }
         out.global_train =
             sample_min_safe(self.global.train.as_slice(), DEFAULT_RULE_NULL_QUANTILE);
@@ -450,96 +200,46 @@ impl Default for RuleNullCalibrator {
 }
 
 impl RuleNullPenaltyLookup {
-    pub fn with_max_rule_len(_max_rule_len: usize) -> Self {
+    pub fn with_max_rule_len(max_rule_len: usize) -> Self {
+        let bucket_count = rule_null_bucket_count(max_rule_len);
         Self {
-            exact_train: vec![None; NULL_BUCKET_EXACT],
-            exact_test: vec![None; NULL_BUCKET_EXACT],
-            cs_train: vec![None; NULL_BUCKET_SIGN_LEN],
-            cs_test: vec![None; NULL_BUCKET_SIGN_LEN],
-            cm_train: vec![None; NULL_BUCKET_MAF_LEN],
-            cm_test: vec![None; NULL_BUCKET_MAF_LEN],
+            len_train: vec![None; bucket_count],
+            len_test: vec![None; bucket_count],
             global_train: None,
             global_test: None,
         }
     }
 
     pub fn new() -> Self {
-        Self::with_max_rule_len(5)
+        Self::with_max_rule_len(DEFAULT_RULE_NULL_BUCKET_MAX_RULE_LEN)
     }
 
     fn penalty_with_fallback(&self, bucket: RuleNullBucket, is_train: bool) -> Option<f64> {
         let exact = if is_train {
-            self.exact_train
-                .get(bucket.exact_index())
-                .copied()
-                .flatten()
+            self.len_train.get(bucket.index()).copied().flatten()
         } else {
-            self.exact_test.get(bucket.exact_index()).copied().flatten()
-        };
-        let cs = if is_train {
-            self.cs_train
-                .get(bucket.collapse_sign_len_index())
-                .copied()
-                .flatten()
-        } else {
-            self.cs_test
-                .get(bucket.collapse_sign_len_index())
-                .copied()
-                .flatten()
-        };
-        let cm = if is_train {
-            self.cm_train
-                .get(bucket.collapse_maf_len_index())
-                .copied()
-                .flatten()
-        } else {
-            self.cm_test
-                .get(bucket.collapse_maf_len_index())
-                .copied()
-                .flatten()
+            self.len_test.get(bucket.index()).copied().flatten()
         };
         let global = if is_train {
             self.global_train
         } else {
             self.global_test
         };
-        if let Some(weights) = null_shrinkage_weights(bucket) {
-            if let Some(ep) = exact {
-                let shrunk = blended_penalty_4(Some(ep), cs, cm, global, weights).unwrap_or(ep);
-                return Some(ep.min(shrunk));
-            }
-        }
-        exact.or(cs).or(cm).or(global)
+        exact.or(global)
     }
 
     pub fn q99_converged_against(&self, prev: &Self) -> bool {
         let mut saw_signal = false;
-        // collapse_sign_len (9 slots)
-        for idx in 0..NULL_BUCKET_SIGN_LEN {
-            let pt = prev.cs_train.get(idx).copied().flatten();
-            let ct = self.cs_train.get(idx).copied().flatten();
+        let n_len = self.len_train.len().max(prev.len_train.len());
+        for idx in 0..n_len {
+            let pt = prev.len_train.get(idx).copied().flatten();
+            let ct = self.len_train.get(idx).copied().flatten();
             saw_signal |= pt.is_some() || ct.is_some();
             if !penalty_value_converged(pt, ct) {
                 return false;
             }
-            let pte = prev.cs_test.get(idx).copied().flatten();
-            let cte = self.cs_test.get(idx).copied().flatten();
-            saw_signal |= pte.is_some() || cte.is_some();
-            if !penalty_value_converged(pte, cte) {
-                return false;
-            }
-        }
-        // collapse_maf_len (6 slots) — previously unchecked, causing
-        // early-stop when maf×len was still fluctuating.
-        for idx in 0..NULL_BUCKET_MAF_LEN {
-            let pt = prev.cm_train.get(idx).copied().flatten();
-            let ct = self.cm_train.get(idx).copied().flatten();
-            saw_signal |= pt.is_some() || ct.is_some();
-            if !penalty_value_converged(pt, ct) {
-                return false;
-            }
-            let pte = prev.cm_test.get(idx).copied().flatten();
-            let cte = self.cm_test.get(idx).copied().flatten();
+            let pte = prev.len_test.get(idx).copied().flatten();
+            let cte = self.len_test.get(idx).copied().flatten();
             saw_signal |= pte.is_some() || cte.is_some();
             if !penalty_value_converged(pte, cte) {
                 return false;
@@ -562,24 +262,15 @@ impl RuleNullPenaltyLookup {
     }
 }
 
-pub fn bucket_from_rule(rule: &BeamRule, support_frac: f64) -> RuleNullBucket {
+pub fn bucket_from_rule(rule: &BeamRule, _maf: f64) -> RuleNullBucket {
     RuleNullBucket {
-        comb: comb_mode_from_not_count(rule.not_count(), rule.len()),
-        maf: maf_bucket_from_frac(support_frac),
-        len_bin: len_bin_from_rule_len(rule.len()),
+        rule_len: rule.len().max(1),
     }
 }
 
-pub fn bucket_from_expr(expr: &str, rule_len: usize, support_frac: f64) -> RuleNullBucket {
-    // Count "NOT " followed by a word char — catches BIN, MBIN, and any
-    // future label that literal_expr() may emit.  Clamp to rule_len so a
-    // fully-negated rule is correctly classified as NegOnly.
-    let upper = expr.to_ascii_uppercase();
-    let nc = upper.matches("NOT ").count().min(rule_len);
+pub fn bucket_from_expr(_expr: &str, rule_len: usize, _maf: f64) -> RuleNullBucket {
     RuleNullBucket {
-        comb: comb_mode_from_not_count(nc, rule_len),
-        maf: maf_bucket_from_frac(support_frac),
-        len_bin: len_bin_from_rule_len(rule_len),
+        rule_len: rule_len.max(1),
     }
 }
 
@@ -818,23 +509,6 @@ fn penalty_value_converged(prev: Option<f64>, curr: Option<f64>) -> bool {
         _ => false,
     }
 }
-#[inline]
-fn support_minor_frac(support_frac: f64) -> f64 {
-    if !support_frac.is_finite() {
-        return 0.0;
-    }
-    let p = support_frac.clamp(0.0, 1.0);
-    p.min(1.0 - p)
-}
-
-pub fn maf_bucket_from_frac(support_frac: f64) -> MafBucket {
-    let minor = support_minor_frac(support_frac);
-    if minor <= PSEUDO_SNP_MAF_BOUNDARY {
-        MafBucket::Low
-    } else {
-        MafBucket::High
-    }
-}
 
 pub fn choose_representative_indices(region_sizes: &[usize], target_count: usize) -> Vec<usize> {
     if region_sizes.is_empty() || target_count == 0 {
@@ -872,12 +546,8 @@ pub fn shuffled_copy_f64(values: &[f64], seed: u64) -> Vec<f64> {
 mod tests {
     use super::*;
 
-    fn b(comb: CombMode, lb: LenBin, maf: MafBucket) -> RuleNullBucket {
-        RuleNullBucket {
-            comb,
-            len_bin: lb,
-            maf,
-        }
+    fn b(rule_len: usize) -> RuleNullBucket {
+        RuleNullBucket { rule_len }
     }
 
     #[test]
@@ -908,24 +578,18 @@ mod tests {
             ],
         };
         let bk = bucket_from_rule(&rule, 0.25);
-        assert_eq!(bk.comb, CombMode::Mixed);
-        assert_eq!(bk.len_bin, LenBin::L3p);
-        assert_eq!(bk.maf, MafBucket::High);
-
+        assert_eq!(bk.rule_len, 3);
         let bk2 = bucket_from_rule(&rule, 0.01);
-        assert_eq!(bk2.maf, MafBucket::Low);
+        assert_eq!(bk2.rule_len, 3);
     }
 
     #[test]
     fn test_bucket_from_expr_new() {
         let bk = bucket_from_expr("BIN(1) AND NOT BIN(2) AND NOT BIN(3)", 3, 0.01);
-        assert_eq!(bk.comb, CombMode::Mixed);
-        assert_eq!(bk.len_bin, LenBin::L3p);
-        assert_eq!(bk.maf, MafBucket::Low);
+        assert_eq!(bk.rule_len, 3);
 
         let bk2 = bucket_from_expr("NOT BIN(1) AND NOT BIN(2)", 2, 0.20);
-        assert_eq!(bk2.comb, CombMode::NegOnly);
-        assert_eq!(bk2.len_bin, LenBin::L2);
+        assert_eq!(bk2.rule_len, 2);
     }
 
     #[test]
@@ -939,14 +603,13 @@ mod tests {
             rest: vec![],
         };
         let sb = bucket_from_rule(&s, 0.10);
-        assert_eq!(sb.comb, CombMode::PosOnly);
-        assert_eq!(sb.len_bin, LenBin::L1);
+        assert_eq!(sb.rule_len, 1);
     }
 
     #[test]
     fn test_q99_nearest_rank() {
         let mut cal = RuleNullCalibrator::new();
-        let bk = b(CombMode::PosOnly, LenBin::L2, MafBucket::High);
+        let bk = b(2);
         // Need >= NULL_EXACT_MIN_SAMPLES (10) for exact bucket to be used.
         for v in 1..=20 {
             cal.insert(bk, v as f64, v as f64);
@@ -957,80 +620,33 @@ mod tests {
     }
 
     #[test]
-    fn test_pos_l2_and_neg_buckets() {
+    fn test_length_buckets_are_separate() {
         let mut cal = RuleNullCalibrator::new();
-        let pos = b(CombMode::PosOnly, LenBin::L2, MafBucket::High);
-        let neg = b(CombMode::NegOnly, LenBin::L2, MafBucket::High);
+        let len2 = b(2);
+        let len3 = b(3);
         for v in 1..=40 {
-            cal.insert(pos, v as f64, v as f64);
-            cal.insert(neg, v as f64, v as f64);
+            cal.insert(len2, v as f64, v as f64);
+            cal.insert(len3, (v * 2) as f64, (v * 2) as f64);
         }
         let lookup = cal.finalize();
-        assert_eq!(lookup.train_penalty(pos).unwrap(), 40.0);
-        assert_eq!(lookup.train_penalty(neg).unwrap(), 40.0);
+        assert_eq!(lookup.train_penalty(len2).unwrap(), 40.0);
+        assert_eq!(lookup.train_penalty(len3).unwrap(), 80.0);
     }
 
     #[test]
     fn test_topk_values() {
-        assert_eq!(
-            null_topk_per_repeat_for_bucket(b(CombMode::PosOnly, LenBin::L2, MafBucket::High)),
-            3
-        );
-        assert_eq!(
-            null_topk_per_repeat_for_bucket(b(CombMode::PosOnly, LenBin::L3p, MafBucket::High)),
-            2
-        );
-        assert_eq!(
-            null_topk_per_repeat_for_bucket(b(CombMode::Mixed, LenBin::L2, MafBucket::High)),
-            2
-        );
-        assert_eq!(
-            null_topk_per_repeat_for_bucket(b(CombMode::NegOnly, LenBin::L2, MafBucket::High)),
-            2
-        );
-        assert_eq!(
-            null_topk_per_repeat_for_bucket(b(CombMode::PosOnly, LenBin::L1, MafBucket::High)),
-            1
-        );
+        assert_eq!(null_topk_per_repeat_for_bucket(b(2)), 3);
+        assert_eq!(null_topk_per_repeat_for_bucket(b(3)), 2);
+        assert_eq!(null_topk_per_repeat_for_bucket(b(4)), 2);
+        assert_eq!(null_topk_per_repeat_for_bucket(b(1)), 1);
     }
 
     #[test]
-    fn test_penalty_shrinks_toward_cs() {
+    fn test_fallback_to_global() {
         let mut lookup = RuleNullPenaltyLookup::new();
-        let bk = b(CombMode::PosOnly, LenBin::L2, MafBucket::High);
-        lookup.exact_train[bk.exact_index()] = Some(100.0);
-        lookup.cs_train[bk.collapse_sign_len_index()] = Some(60.0);
-        lookup.cm_train[bk.collapse_maf_len_index()] = Some(50.0);
-        lookup.global_train = Some(20.0);
-        let p = lookup.train_penalty(bk).unwrap();
-        // 4-component blend: 0.20*100 + 0.35*60 + 0.30*50 + 0.15*20 = 59
-        // min(100, 59) = 59
-        assert!((p - 59.0).abs() < 1e-9, "got {p}");
-    }
-
-    #[test]
-    fn test_neg_penalty_shrinks_to_blended() {
-        let mut lookup = RuleNullPenaltyLookup::new();
-        let bk = b(CombMode::NegOnly, LenBin::L2, MafBucket::High);
-        lookup.exact_train[bk.exact_index()] = Some(100.0);
-        lookup.cs_train[bk.collapse_sign_len_index()] = Some(60.0);
-        lookup.cm_train[bk.collapse_maf_len_index()] = Some(50.0);
-        lookup.global_train = Some(20.0);
-        // NegOnly: 0.15*100 + 0.35*60 + 0.35*50 + 0.15*20 = 15+21+17.5+3 = 56.5
-        // min(100, 56.5) = 56.5
-        let p = lookup.train_penalty(bk).unwrap();
-        assert!((p - 56.5).abs() < 1e-9, "got {p}");
-    }
-
-    #[test]
-    fn test_fallback_to_cs_then_cm() {
-        let mut lookup = RuleNullPenaltyLookup::new();
-        let bk = b(CombMode::PosOnly, LenBin::L2, MafBucket::High);
-        // exact is None, cs is set, cm is set → fallback to cs
-        lookup.cs_train[bk.collapse_sign_len_index()] = Some(70.0);
-        lookup.cm_train[bk.collapse_maf_len_index()] = Some(60.0);
+        let bk = b(2);
         lookup.global_train = Some(30.0);
-        assert_eq!(lookup.train_penalty(bk).unwrap(), 70.0);
+        assert_eq!(lookup.train_penalty(bk).unwrap(), 30.0);
     }
 
     #[test]
@@ -1040,13 +656,13 @@ mod tests {
         // Both empty → no signal → NOT converged
         assert!(!cur.q99_converged_against(&prev));
         // Set matching values → converged
-        cur.cs_train[0] = Some(50.0);
-        prev.cs_train[0] = Some(50.0);
+        cur.len_train[0] = Some(50.0);
+        prev.len_train[0] = Some(50.0);
         cur.global_train = Some(10.0);
         prev.global_train = Some(10.0);
         assert!(cur.q99_converged_against(&prev));
-        // cm mismatches → not converged
-        cur.cm_train[0] = Some(100.0);
+        // exact-length mismatch → not converged
+        cur.len_train[0] = Some(100.0);
         assert!(!cur.q99_converged_against(&prev));
     }
 
@@ -1059,7 +675,7 @@ mod tests {
 
     #[test]
     fn test_rule_null_bucket_count() {
-        assert_eq!(rule_null_bucket_count(5), NULL_BUCKET_EXACT);
+        assert_eq!(rule_null_bucket_count(5), 5);
     }
 
     #[test]

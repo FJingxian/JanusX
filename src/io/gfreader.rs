@@ -8201,7 +8201,10 @@ mod tests {
     fn pure_line_filter_keeps_het_out_of_missing_rate() {
         let (status, missing_rate, alt_freq) =
             pure_line_filter_status_from_counts(10, 1, 4, 2, 0.02, 0.11, 1.0);
-        assert_eq!(pure_line_filter_status_reason(status), PURE_LINE_FILTER_KEEP);
+        assert_eq!(
+            pure_line_filter_status_reason(status),
+            PURE_LINE_FILTER_KEEP
+        );
         assert!((missing_rate - 0.1).abs() < 1e-6);
         assert!((alt_freq - (8.0_f32 / 18.0_f32)).abs() < 1e-6);
     }
@@ -8210,7 +8213,10 @@ mod tests {
     fn pure_line_filter_can_fail_on_het_rate_independently() {
         let (status, _missing_rate, _alt_freq) =
             pure_line_filter_status_from_counts(10, 1, 4, 2, 0.02, 0.11, 0.4);
-        assert_eq!(pure_line_filter_status_reason(status), PURE_LINE_FILTER_FAIL_HET);
+        assert_eq!(
+            pure_line_filter_status_reason(status),
+            PURE_LINE_FILTER_FAIL_HET
+        );
     }
 
     #[test]

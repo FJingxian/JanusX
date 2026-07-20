@@ -1,8 +1,8 @@
 #![allow(dead_code)]
 
 use super::score::{
-    score_cont_centered_gain_from_sum_and_n_hit, score_cont_centered_gain_packed_with_n_hit,
-    validate_continuous_y, ContinuousRuleScore,
+    binary_maf_from_n_hit, score_cont_centered_gain_from_sum_and_n_hit,
+    score_cont_centered_gain_packed_with_n_hit, validate_continuous_y, ContinuousRuleScore,
 };
 use crate::stats_common::{check_ctrlc, interrupt_requested, INTERRUPTED_MSG};
 use numpy::ndarray::Array1;
@@ -281,7 +281,9 @@ fn batch_parts_row_to_score(parts: &BatchScoreParts, row_idx: usize) -> Continuo
         mean_hit: parts.mean_hit[row_idx],
         mean_miss: parts.mean_miss[row_idx],
         support_frac: parts.support_frac[row_idx],
+        dosage_maf: binary_maf_from_n_hit(parts.n_samples, parts.n_hit[row_idx] as usize),
         n_hit: parts.n_hit[row_idx] as usize,
+        n_ge2: 0,
         n_miss: parts.n_miss[row_idx] as usize,
     }
 }

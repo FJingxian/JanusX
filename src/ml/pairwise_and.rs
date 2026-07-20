@@ -681,8 +681,14 @@ fn feature_scores_pairwise_and_packed_dual_core(
         for i in 0..n_features {
             let row_ge1 = &bits_ge1_flat[i * row_words..(i + 1) * row_words];
             let row_ge2 = &bits_ge2_flat[i * row_words..(i + 1) * row_words];
-            let (sum_x, sum_x2, sum_xy) =
-                dosage_stats_from_dual_packed(row_ge1, row_ge2, y, &y_word_sums, n_words, tail_mask);
+            let (sum_x, sum_x2, sum_xy) = dosage_stats_from_dual_packed(
+                row_ge1,
+                row_ge2,
+                y,
+                &y_word_sums,
+                n_words,
+                tail_mask,
+            );
             marginal_gain[i] = dosage_centered_gain(total_sum, sum_x, sum_x2, sum_xy, n_samples);
         }
     }
